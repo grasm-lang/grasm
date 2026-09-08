@@ -11,16 +11,19 @@
 //! and no libffi: the enumeration below is the whole of what can be called,
 //! and anything outside it is reported rather than guessed at.
 
-use std::ffi::{c_char, c_void, CString};
+#[cfg(not(target_arch = "wasm32"))]
+use std::ffi::{c_char, CString};
+use std::ffi::c_void;
 
+#[cfg(not(target_arch = "wasm32"))]
 unsafe extern "C" {
     fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
 }
 
 /// Search every symbol already loaded into this process.
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", not(target_arch = "wasm32")))]
 const SELF: *mut c_void = -2isize as *mut c_void;
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), not(target_arch = "wasm32")))]
 const SELF: *mut c_void = std::ptr::null_mut();
 
 /// One argument's kind. `bool` is not here on purpose — see the checker.
@@ -45,6 +48,7 @@ pub enum CRet {
 }
 
 /// Looks up `name` in the running process.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn find(name: &str) -> Option<*mut c_void> {
     let c = CString::new(name).ok()?;
     // SAFETY: `c` is a valid NUL-terminated string for the duration of the
@@ -55,6 +59,18 @@ pub fn find(name: &str) -> Option<*mut c_void> {
     } else {
         Some(p)
     }
+}
+
+/// A wasm module has no process symbol table to search, so no `extern fn`
+/// resolves there and every lookup answers "not found" — the same answer a
+/// missing symbol gets natively, and the one a caller already handles.
+///
+/// Declaring `dlsym` anyway left it as an undefined symbol in the module, and
+/// `wasm32-unknown-unknown` stopped tolerating those: the link failed with
+/// "undefined symbol: dlsym" and the whole wasm engine went unbuildable.
+#[cfg(target_arch = "wasm32")]
+pub fn find(_name: &str) -> Option<*mut c_void> {
+    None
 }
 
 macro_rules! call {

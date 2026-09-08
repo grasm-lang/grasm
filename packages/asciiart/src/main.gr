@@ -1,0 +1,256 @@
+// Images rendered as characters.
+//
+// Useful for the same three reasons it always was: a terminal has no image
+// protocol most of the time, a log or a commit message is text, and a
+// diagnostic you can paste into a bug report beats one you have to attach.
+//
+// The one thing that decides whether the result is legible is the **aspect
+// ratio**. A terminal cell is about twice as tall as it is wide, so an image
+// sampled one character per pixel comes out stretched to twice its height.
+// Every function here takes that into account and the ratio is a parameter,
+// because it differs between terminals and is 1 for a proportional font.
+//
+// The other choice is the ramp. A ramp is a run of characters ordered by how
+// much ink they put on the page, and how well it works depends on the font:
+// the seventy-character ramp is finer but assumes a font where all seventy
+// really do differ in weight, while the ten-character one is safe anywhere.
+
+pub fn ramp_short() -> str {
+    return "@%#*+=-:. "
+}
+
+pub fn ramp_long() -> str {
+    return "$@B%8&WM#*oahkbdpqwmZO0QLCJUYXzcvunxrjft/\\|()1\{}[]?-_+~<>i!lI;:,\"^`'. "
+}
+
+/// Half-blocks: two vertical pixels to a character, so the result is square
+/// without discarding half the rows.
+pub fn ramp_blocks() -> str {
+    return " " + (9617).to_char() + (9618).to_char() + (9619).to_char() +
+    (9608).to_char()
+}
+
+/// One grey value to a character from the ramp.
+///
+/// The ramp is ordered darkest-looking first, so a dark pixel picks the
+/// character with the most ink — right for a page, and for a terminal with a
+/// pale background. `invert` is what a dark terminal wants.
+pub fn character_for(grey: i64, ramp: str) -> str {
+    let cs = ramp.chars()
+    var v = grey
+    if v < 0 {
+        v = 0
+    }
+    if v > 255 {
+        v = 255
+    }
+    // The last index must be reachable, so the divisor is 256 rather than 255.
+    let at = v * cs.len() / 256
+    return cs[at]
+}
+
+/// The luminance of an RGB triple.
+///
+/// Not the average: the eye is about six times more sensitive to green than
+/// to blue, and averaging makes a pure blue as bright as a mid grey.
+pub fn luminance(r: i64, g: i64, b: i64) -> i64 {
+    return (r * 299 + g * 587 + b * 114) / 1000
+}
+
+pub fn to_grey(sample: [i64], channels: i64) -> [i64] {
+    var out: [i64] = []
+    if channels == 1 {
+        return sample
+    }
+    var i = 0
+    while i + channels <= sample.len() {
+        out.push(luminance(sample[i], sample[i + 1], sample[i + 2]))
+        i = i + channels
+    }
+    return out
+}
+
+/// Resample a greyscale image by averaging over each destination cell.
+///
+/// Averaging rather than picking the nearest pixel: a nearest-neighbour
+/// shrink of text or a line drawing drops whole strokes, and the result is
+/// unreadable in a way that looks like the algorithm is wrong.
+pub fn resize(grey: [i64], width: i64, height: i64, to_width: i64,
+    to_height: i64) -> [i64] {
+    var out: [i64] = []
+    if to_width <= 0 or to_height <= 0 or width <= 0 or height <= 0 {
+        return out
+    }
+    for y in 0..to_height {
+        for x in 0..to_width {
+            let x0 = x * width / to_width
+            let x1 = if (x + 1) * width / to_width > x0 {
+                (x + 1) * width / to_width
+            } else {
+                x0 + 1
+            }
+            let y0 = y * height / to_height
+            let y1 = if (y + 1) * height / to_height > y0 {
+                (y + 1) * height / to_height
+            } else {
+                y0 + 1
+            }
+            var total = 0
+            var count = 0
+            for sy in y0..y1 {
+                for sx in x0..x1 {
+                    if sy < height and sx < width {
+                        total = total + grey[sy * width + sx]
+                        count = count + 1
+                    }
+                }
+            }
+            out.push(if count > 0 { total / count } else { 0 })
+        }
+    }
+    return out
+}
+
+/// The height that keeps the picture's proportions in a terminal.
+///
+/// `cell_ratio_tenths` is how many tenths of a cell's height its width is —
+/// 5 for a typical terminal, 10 for a square cell.
+pub fn fitted_height(width: i64, height: i64, to_width: i64,
+    cell_ratio_tenths: i64) -> i64 {
+    let h = to_width * height * cell_ratio_tenths / (width * 10)
+    if h < 1 {
+        return 1
+    }
+    return h
+}
+
+/// A greyscale image as lines of characters.
+pub fn render_grey(grey: [i64], width: i64, height: i64, to_width: i64,
+    ramp: str, cell_ratio_tenths: i64) -> [str] {
+    let to_height = fitted_height(width, height, to_width, cell_ratio_tenths)
+    let small = resize(grey, width, height, to_width, to_height)
+    var out: [str] = []
+    for y in 0..to_height {
+        var line = ""
+        for x in 0..to_width {
+            line = line + character_for(small[y * to_width + x], ramp)
+        }
+        out.push(line)
+    }
+    return out
+}
+
+pub fn render(sample: [i64], channels: i64, width: i64, height: i64,
+    to_width: i64, ramp: str) -> [str] {
+    return render_grey(to_grey(sample, channels), width, height, to_width,
+        ramp, 5)
+}
+
+/// Two rows to a character, using the upper-half block.
+///
+/// Twice the vertical resolution and a square result, at the cost of needing
+/// a font with block characters — which every terminal from this century has.
+pub fn render_halfblocks(grey: [i64], width: i64, height: i64,
+    to_width: i64) -> [str] {
+    // Two sample rows to a character line, so the *sample* height is what a
+    // square cell would need and the line count is half of it.
+    var to_height = fitted_height(width, height, to_width, 10)
+    if to_height % 2 == 1 {
+        to_height = to_height + 1
+    }
+    let small = resize(grey, width, height, to_width, to_height)
+    var out: [str] = []
+    var y = 0
+    while y < to_height {
+        var line = ""
+        for x in 0..to_width {
+            let top = small[y * to_width + x] > 127
+            let bottom = if y + 1 < to_height {
+                small[(y + 1) * to_width + x] > 127
+            } else {
+                false
+            }
+            if top and bottom {
+                line = line + (9608).to_char()
+            } else if top {
+                line = line + (9600).to_char()
+            } else if bottom {
+                line = line + (9604).to_char()
+            } else {
+                line = line + " "
+            }
+        }
+        out.push(line)
+        y = y + 2
+    }
+    return out
+}
+
+/// Stretch the range so the darkest pixel is 0 and the lightest 255.
+///
+/// A photograph that never reaches either end renders as a uniform mush of
+/// mid-ramp characters; this is what makes it legible.
+pub fn normalise(grey: [i64]) -> [i64] {
+    var low = 255
+    var high = 0
+    for v in grey {
+        if v < low {
+            low = v
+        }
+        if v > high {
+            high = v
+        }
+    }
+    if high <= low {
+        return grey
+    }
+    var out: [i64] = []
+    for v in grey {
+        out.push((v - low) * 255 / (high - low))
+    }
+    return out
+}
+
+/// Invert, for a light terminal background.
+pub fn invert(grey: [i64]) -> [i64] {
+    var out: [i64] = []
+    for v in grey {
+        out.push(255 - v)
+    }
+    return out
+}
+
+/// A 24-bit colour escape around each character, for a terminal that has it.
+pub fn colourise(lines: [str], sample: [i64], channels: i64, width: i64,
+    height: i64) -> [str] {
+    var out: [str] = []
+    let esc = (27).to_char()
+    let to_height = lines.len()
+    let to_width = if to_height > 0 { lines[0].len() } else { 0 }
+    for y in 0..to_height {
+        var line = ""
+        let cs = lines[y].chars()
+        for x in 0..to_width {
+            let sx = x * width / to_width
+            let sy = y * height / to_height
+            let at = (sy * width + sx) * channels
+            var r = 255
+            var g = 255
+            var b = 255
+            if at + channels <= sample.len() {
+                if channels == 1 {
+                    r = sample[at]
+                    g = sample[at]
+                    b = sample[at]
+                } else {
+                    r = sample[at]
+                    g = sample[at + 1]
+                    b = sample[at + 2]
+                }
+            }
+            line = line + esc + "[38;2;{r};{g};{b}m" + cs[x]
+        }
+        out.push(line + esc + "[0m")
+    }
+    return out
+}

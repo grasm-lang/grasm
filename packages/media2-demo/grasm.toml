@@ -1,0 +1,28 @@
+[package]
+name = "media2_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.png]
+path = "../png"
+version = "^1.0.0"
+
+[dependencies.wav]
+path = "../wav"
+version = "^1.0.0"
+
+[dependencies.qrcode]
+path = "../qrcode"
+version = "^1.0.0"
+
+[dependencies.perlin]
+path = "../perlin"
+version = "^1.0.0"
+
+[dependencies.dither]
+path = "../dither"
+version = "^1.0.0"
+
+[dependencies.asciiart]
+path = "../asciiart"
+version = "^1.0.0"

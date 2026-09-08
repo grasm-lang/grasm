@@ -1,0 +1,6 @@
+[package]
+name = "qrcode"
+version = "1.0.0"
+
+# Arithmetic over a finite field and a grid of bits. Opens nothing.
+capabilities = []

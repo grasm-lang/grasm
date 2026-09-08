@@ -1,0 +1,14 @@
+[package]
+name = "png"
+version = "1.0.0"
+
+# Bytes in, bytes out. The caller decides whether they touch a disk.
+capabilities = []
+
+[dependencies.zlib]
+path = "../zlib"
+version = "^1.0.0"
+
+[dependencies.crc32]
+path = "../crc32"
+version = "^1.0.0"

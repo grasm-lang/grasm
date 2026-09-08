@@ -29,9 +29,9 @@ honest and a stub is a promise nobody kept.
 | | |
 |---|---|
 | Started at | 78 |
-| Now | 183 |
+| Now | 189 |
 | Target | 200 |
-| Remaining | 17 |
+| Remaining | 11 |
 
 ## Batches
 
@@ -55,6 +55,7 @@ asserts against it.
 - [x] **System files** — `atomicfile` `pidfile` `lockfile` `shutdown`
   `envcfg`
 - [x] **Formats II** — `msgpack` `cbor` `yamlish` `markdown` `template`
+- [x] **Media II** — `png` `wav` `qrcode` `perlin` `dither` `asciiart`
 
 ### Planned
 

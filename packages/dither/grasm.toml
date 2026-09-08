@@ -1,0 +1,6 @@
+[package]
+name = "dither"
+version = "1.0.0"
+
+# Fewer colours, without the banding. Opens nothing.
+capabilities = []

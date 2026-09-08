@@ -111,6 +111,7 @@ and the entries disagree.
 | [F93](#f93) | `bytes` was the one type not equal to itself | S1, semantics | **fixed** |
 | [F94](#f94) | base32 decoding overflowed after thirteen characters | S2, package | **fixed** |
 | [F95](#f95) | two packages, one variant name, and the backend picked the wrong payload | S1, backend | **fixed** |
+| [F96](#f96) | the wasm engine stopped linking, and nothing said so | S2, build | **fixed** |
 
 <!-- end index -->
 ## F1 — a wrapped condition must end the line with the operator (S4) — **fixed**
@@ -4137,3 +4138,37 @@ packages declaring one variant name with different payload types, built and
 run under the interpreter, the native backend and the source bundle, in three
 type pairings. The interpreter was right all along, so a gate that only ran
 `grasm run` would still miss it.
+
+## F96 — the wasm engine stopped linking, and nothing said so (S2, build) — **fixed**
+
+`cargo build --target wasm32-unknown-unknown -p grasm_wasm` failed:
+
+```
+rust-lld: error: undefined symbol: grasm_now_millis
+rust-lld: error: undefined symbol: grasm_sleep_millis
+rust-lld: error: undefined symbol: grasm_monotonic_millis
+rust-lld: error: undefined symbol: dlsym
+```
+
+Two separate causes, both of which had been latent and became errors when
+`wasm32-unknown-unknown` stopped passing `--allow-undefined` to the linker by
+default.
+
+**The three clocks** were declared in a bare `extern "C"` block. That is an
+*undefined symbol*, not an import, and the linker used to tolerate one and
+leave the embedder to supply it. Annotating the block
+`#[link(wasm_import_module = "env")]` says what was always meant — these come
+from the host — and produces a real import entry.
+
+**`dlsym`** was worse: `ffi.rs` declared and called it unconditionally, on a
+target that has no process symbol table to search. A wasm module cannot
+resolve an `extern fn` at all, so the honest answer is the one a missing
+symbol already gets — `None` — and that is now what `find` returns there,
+with no `dlsym` in the module.
+
+**Why it went unnoticed.** `wasmtest.sh` refuses to run against a stale
+module, which is right, and reports the build failure, which is also right —
+but the gate had not been run since the change that introduced the clocks.
+This is the second time that gate has been skipped and the second entry it has
+produced (F85 was the first). Nothing new is needed here; the gate works. It
+has to be run.

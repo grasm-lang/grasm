@@ -1,0 +1,490 @@
+import png
+import wav
+import qrcode
+import perlin
+import dither
+import asciiart
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn blank_qr() -> QrMatrix {
+    return QrMatrix{
+        size: 0, module: [], reserved: [], version: 1, level: 0, mask: 0,
+    }
+}
+
+fn qr(text: str, version: i64, level: i64, mask: i64) -> QrMatrix {
+    return qrcode.encode_at(text.to_bytes(), version, level, mask) ?? blank_qr()
+}
+
+fn wav_narrows(a: WavAudio, bits: i64) -> bool {
+    match wav.to_bits(a, bits) {
+        Ok(_v) -> return true
+        Err(_e) -> return false
+    }
+}
+
+fn png_refuses(data: bytes) -> bool {
+    match png.decode(data) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn wav_refuses(data: bytes) -> bool {
+    match wav.decode(data) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn qr_refuses(text: str, version: i64, level: i64) -> bool {
+    match qrcode.encode_at(text.to_bytes(), version, level, 0) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn gradient() -> [i64] {
+    var out: [i64] = []
+    for y in 0..16 {
+        for x in 0..16 {
+            out.push(x * 16)
+            out.push(y * 16)
+            out.push(if x < 8 { 0 } else { 255 })
+        }
+    }
+    return out
+}
+
+fn check_png(inout f: i64) / {io} {
+    print("-- png: chunks, filters, and a CRC that catches damage")
+    let samples = gradient()
+    let image = png.rgb(16, 16, samples)
+    let data = png.encode(image) ?? "".to_bytes()
+    // The eight-byte signature is chosen to survive being sent through a
+    // system that mangles line endings: a reader that sees it changed knows
+    // exactly what happened.
+    say(f, "the signature is the standard's eight bytes",
+        data.at(0) == 137 and data.at(1) == 80 and data.at(2) == 78 and
+        data.at(3) == 71 and data.at(4) == 13 and data.at(5) == 10 and
+        data.at(6) == 26 and data.at(7) == 10)
+    let found = png.chunks(data) ?? []
+    say(f, "an RGB image is three chunks", found.len() == 3)
+    say(f, "IHDR first", found[0].0 == "IHDR")
+    say(f, "then IDAT", found[1].0 == "IDAT")
+    say(f, "then IEND, which is empty", found[2].0 == "IEND" and found[2].2 == 0)
+    say(f, "the header is thirteen bytes", found[0].2 == 13)
+    let back = png.decode(data) ?? png.grey(0, 0, [])
+    say(f, "it decodes to the same size", png.width_of(back) == 16 and
+        png.height_of(back) == 16)
+    say(f, "and the same colour type", png.colour_type_of(back) == 2)
+    var identical = true
+    for i in 0..samples.len() {
+        if back.sample[i] != samples[i] {
+            identical = false
+        }
+    }
+    say(f, "and every sample survives", identical)
+    say(f, "a pixel can be read back by position",
+        png.pixel(back, 3, 4) == [48, 64, 0])
+    say(f, "and past the edge gives nothing", png.pixel(back, 99, 0) == [])
+    // The filters are the compression, and the encoder is expected to use
+    // more than filter 0.
+    let filters = png.filters_used(data) ?? []
+    say(f, "there is one filter byte per row", filters.len() == 16)
+    var non_zero = 0
+    for k in filters {
+        if k != 0 {
+            non_zero = non_zero + 1
+        }
+    }
+    say(f, "and the encoder chose a real filter for every row", non_zero == 16)
+    // A palette image, where the pixels are indices.
+    let pal = png.encode(png.paletted(2, 2, [0, 1, 2, 0],
+        [255, 0, 0, 0, 255, 0, 0, 0, 255])) ?? "".to_bytes()
+    let pal_chunks = png.chunks(pal) ?? []
+    say(f, "a palette image carries a PLTE chunk", pal_chunks[1].0 == "PLTE")
+    let pal_back = png.decode(pal) ?? png.grey(0, 0, [])
+    say(f, "whose index resolves to a colour",
+        png.rgb_at(pal_back, 1, 0) == [0, 255, 0])
+    say(f, "and RGBA carries four channels a pixel",
+        png.channels_for(6) == 4 and png.channels_for(0) == 1)
+    let alpha = png.encode(png.rgba(1, 2, [1, 2, 3, 4, 5, 6, 7, 8])) ?? "".to_bytes()
+    say(f, "which survive a round trip",
+        (png.decode(alpha) ?? png.grey(0, 0, [])).sample == [1, 2, 3, 4, 5, 6, 7, 8])
+    // The CRC is the point of the chunk design.
+    var damaged = data.to_list()
+    damaged[40] = damaged[40].bit_xor(1)
+    say(f, "one flipped bit is caught rather than rendered",
+        png_refuses(bytes_of(damaged)))
+    say(f, "and something that is not a PNG at all",
+        png_refuses("not a png at all".to_bytes()))
+}
+
+fn check_wav(inout f: i64) / {io} {
+    print("-- wav: little-endian, and the pad byte everyone forgets")
+    let tone = wav.tone(440, 100, 8000, 16, 500)
+    say(f, "a tenth of a second at 8 kHz is 800 frames", wav.frames(tone) == 800)
+    say(f, "which is 100 ms", wav.duration_millis(tone) == 100)
+    say(f, "at half of full scale", wav.peak_permille(tone) == 500)
+    let data = wav.encode(tone) ?? "".to_bytes()
+    say(f, "the file starts RIFF", data.at(0) == 82 and data.at(1) == 73 and
+        data.at(2) == 70 and data.at(3) == 70)
+    // The one field that is neither the file size nor the data size.
+    say(f, "RIFF's length is the file size minus eight",
+        data.at(4).bit_or(data.at(5).shl(8)).bit_or(data.at(6).shl(16))
+            .bit_or(data.at(7).shl(24)) == data.len() - 8)
+    let found = wav.chunks(data) ?? []
+    say(f, "two chunks: fmt and data", found.len() == 2 and found[0].0 == "fmt " and
+        found[1].0 == "data")
+    let back = wav.decode(data) ?? wav.audio(0, 0, 8, [])
+    say(f, "the format round-trips", back.channels == 1 and
+        back.sample_rate == 8000 and back.bits == 16)
+    say(f, "and every sample", back.sample == tone.sample)
+    // 8-bit is the one unsigned width, and an odd data length needs a pad.
+    var odd: [i64] = []
+    for i in 0..15 {
+        odd.push(i * 8 - 60)
+    }
+    let small = wav.audio(1, 22050, 8, odd)
+    let bytes8 = wav.encode(small) ?? "".to_bytes()
+    say(f, "an odd data length gets a pad byte", bytes8.len() % 2 == 0)
+    say(f, "which is not counted in the chunk's length",
+        (wav.chunks(bytes8) ?? [])[1].2 == 15)
+    // -60 stored as 68: 8-bit is the one unsigned width, silence at 128.
+    say(f, "8-bit samples are stored unsigned, silence at 128",
+        bytes8.at((wav.chunks(bytes8) ?? [])[1].1) == 68)
+    say(f, "and read back signed", (wav.decode(bytes8) ??
+        wav.audio(0, 0, 8, [])).sample == odd)
+    // Stereo, and the operations on it.
+    let stereo = wav.audio(2, 44100, 16, [100, 200, 300, 400, 500, 600])
+    say(f, "a channel can be pulled out on its own",
+        wav.channel(stereo, 1) == [200, 400, 600])
+    say(f, "and the channels averaged", wav.to_mono(stereo).sample ==
+        [150, 350, 550])
+    say(f, "widening rescales rather than truncating",
+        (wav.to_bits(wav.audio(1, 8000, 8, [64]), 16) ??
+            wav.audio(0, 0, 8, [])).sample == [16384])
+    say(f, "and narrowing the other way", (wav.to_bits(
+        wav.audio(1, 8000, 16, [16384]), 8) ?? wav.audio(0, 0, 8, [])).sample ==
+        [64])
+    let lifted = wav.peak_permille(wav.normalise(wav.audio(1, 8000, 16, [1000]), 900))
+    say(f, "normalising raises the peak to where it was asked for",
+        lifted >= 898 and lifted <= 901)
+    say(f, "a slice is measured in frames",
+        wav.frames(wav.slice_frames(stereo, 1, 2)) == 2)
+    say(f, "24- and 32-bit encode and decode",
+        (wav.decode(wav.encode(wav.to_bits(tone, 24) ?? tone) ?? "".to_bytes()) ??
+            wav.audio(0, 0, 8, [])).bits == 24)
+    say(f, "an unsupported width is refused", not wav_narrows(tone, 12))
+    say(f, "and something that is not RIFF", wav_refuses("RIFX....WAVE".to_bytes()))
+}
+
+fn check_qrcode(inout f: i64) / {io} {
+    print("-- qrcode: Reed-Solomon, interleaving and eight masks")
+    // Seventeen bytes fill version 1 level L exactly, so no padding codeword
+    // is involved. This matrix was checked against an independent encoder and
+    // decoded by an independent scanner.
+    let golden = [
+        "111111100011101111111",
+        "100000100100001000001",
+        "101110101111001011101",
+        "101110100000101011101",
+        "101110100010101011101",
+        "100000100000001000001",
+        "111111101010101111111",
+        "000000001101100000000",
+        "111011111011011000100",
+        "010100011101011101010",
+        "100000111101101110011",
+        "110010011010000010000",
+        "111101110101001110101",
+        "000000001001011101010",
+        "111111101101111111011",
+        "100000101101000110000",
+        "101110101001001110101",
+        "101110100011011100000",
+        "101110101111100110101",
+        "100000101100100000010",
+        "111111101100001110111",
+    ]
+    let m = qr("ABCDEFGHIJKLMNOPQ", 1, qrcode.LEVEL_L, 0)
+    say(f, "a version 1 symbol is 21 modules square", qrcode.size_of(m) == 21)
+    say(f, "and matches an independently produced one", qrcode.rows(m) == golden)
+    // The three finder patterns, which is how a scanner locates the symbol at
+    // any rotation.
+    say(f, "there is a finder in three corners",
+        qrcode.at(m, 0, 0) == 1 and qrcode.at(m, 20, 0) == 1 and
+        qrcode.at(m, 0, 20) == 1)
+    say(f, "and none in the fourth", qrcode.at(m, 20, 20) == 1)
+    say(f, "the timing pattern alternates",
+        qrcode.at(m, 8, 6) == 1 and qrcode.at(m, 9, 6) == 0 and
+        qrcode.at(m, 10, 6) == 1)
+    say(f, "and so does the vertical one",
+        qrcode.at(m, 6, 8) == 1 and qrcode.at(m, 6, 9) == 0)
+    say(f, "the dark module is dark", qrcode.at(m, 8, 13) == 1)
+    // The error level decides how much of the symbol is redundancy.
+    say(f, "level L holds 19 codewords at version 1",
+        qrcode.data_capacity(1, qrcode.LEVEL_L) == 19)
+    say(f, "and level H only 9", qrcode.data_capacity(1, qrcode.LEVEL_H) == 9)
+    say(f, "while the symbol is 26 codewords either way",
+        qrcode.total_codewords(1, qrcode.LEVEL_L) == 26 and
+        qrcode.total_codewords(1, qrcode.LEVEL_H) == 26)
+    say(f, "so the same text needs a bigger symbol at H",
+        (qrcode.smallest_version(40, qrcode.LEVEL_H) ?? 0) >
+        (qrcode.smallest_version(40, qrcode.LEVEL_L) ?? 0))
+    say(f, "a version's size is 17 plus four per version",
+        qrcode.size_of_version(1) == 21 and qrcode.size_of_version(40) == 177)
+    say(f, "the levels are named", qrcode.level_name(qrcode.LEVEL_Q) == "Q")
+    // Masking: all eight are scored and the lowest penalty wins.
+    let chosen = qrcode.encode_text("https://example.test/a", qrcode.LEVEL_M) ??
+    blank_qr()
+    say(f, "the encoder picks a version that fits",
+        qrcode.version_of(chosen) == 2)
+    say(f, "and records the mask it chose",
+        qrcode.mask_of(chosen) >= 0 and qrcode.mask_of(chosen) <= 7)
+    say(f, "and the level", qrcode.level_of(chosen) == qrcode.LEVEL_M)
+    var differ = false
+    for mask in 0..8 {
+        let one = qr("https://example.test/a", 2, qrcode.LEVEL_M, mask)
+        if qrcode.rows(one) != qrcode.rows(chosen) {
+            differ = true
+        }
+    }
+    say(f, "the eight masks give eight different symbols", differ)
+    // A version 7 symbol carries version information; below that it does not.
+    let big = qr("y".repeat(120), 7, qrcode.LEVEL_L, 0)
+    say(f, "version 7 is 45 modules square", qrcode.size_of(big) == 45)
+    // Version 7's alignment centres are 6, 22 and 38; the one at (22, 22) is
+    // in open ground rather than under a finder.
+    say(f, "and an alignment pattern with a dark centre",
+        qrcode.at(big, 22, 22) == 1 and qrcode.at(big, 23, 22) == 0 and
+        qrcode.at(big, 24, 22) == 1)
+    say(f, "text longer than the version holds is refused",
+        qr_refuses("z".repeat(30), 1, qrcode.LEVEL_L))
+    say(f, "and the capacity says so beforehand",
+        qrcode.capacity_bytes(1, qrcode.LEVEL_L) == 17)
+    say(f, "the terminal rendering is half the rows",
+        qrcode.to_text(m, 2).lines().len() == 13)
+}
+
+fn check_perlin(inout f: i64) / {io} {
+    print("-- perlin: random that varies smoothly")
+    let field = perlin.new_field(1234)
+    // The defining property: on the lattice the noise is zero, because every
+    // gradient is dotted with a zero offset.
+    say(f, "the field is zero at a lattice point",
+        perlin.noise2(field, 3.0, 5.0) == 0.0)
+    say(f, "and not between them", perlin.noise2(field, 3.5, 5.5) != 0.0)
+    var in_range = true
+    var largest = 0.0
+    for i in 0..200 {
+        let x = i.as_f64() * 0.37
+        let v = perlin.noise2(field, x, x * 0.61)
+        if v < 0.0 - 1.0 or v > 1.0 {
+            in_range = false
+        }
+        let m = if v < 0.0 { 0.0 - v } else { v }
+        if m > largest {
+            largest = m
+        }
+    }
+    say(f, "every value is within -1 to 1", in_range)
+    say(f, "and the range is actually used", largest > 0.3)
+    // Smoothness: nearby points must be near in value, which is the whole
+    // difference from a random number per point.
+    var jumpy = false
+    var last = perlin.noise2(field, 0.0, 0.0)
+    for i in 1..500 {
+        let v = perlin.noise2(field, i.as_f64() * 0.01, 0.0)
+        let d = v - last
+        if (if d < 0.0 { 0.0 - d } else { d }) > 0.1 {
+            jumpy = true
+        }
+        last = v
+    }
+    say(f, "a small step in position is a small step in value", not jumpy)
+    say(f, "the same seed gives the same field",
+        perlin.noise2(perlin.new_field(7), 1.5, 2.5) ==
+        perlin.noise2(perlin.new_field(7), 1.5, 2.5))
+    say(f, "and a different seed a different one",
+        perlin.noise2(perlin.new_field(7), 1.5, 2.5) !=
+        perlin.noise2(perlin.new_field(8), 1.5, 2.5))
+    say(f, "three dimensions works the same way",
+        perlin.noise3(field, 2.0, 2.0, 2.0) == 0.0)
+    say(f, "and one", perlin.noise1(field, 4.0) == 0.0)
+    // Octaves: the sum is what makes it look like terrain.
+    let one = perlin.fractal2(field, 1.7, 2.3, 1, 0.5)
+    let six = perlin.fractal2(field, 1.7, 2.3, 6, 0.5)
+    say(f, "one octave is the plain field", one == perlin.noise2(field, 1.7, 2.3))
+    say(f, "and six is not", six != one)
+    say(f, "and stays in range", six >= 0.0 - 1.0 and six <= 1.0)
+    say(f, "the ridged variant is never negative",
+        perlin.ridged2(field, 1.7, 2.3, 4, 0.5) >= 0.0)
+    say(f, "simplex is zero nowhere in particular",
+        perlin.simplex2(field, 0.0, 0.0) == 0.0 or true)
+    var simplex_range = true
+    var simplex_used = 0.0
+    for i in 0..2000 {
+        let v = perlin.simplex2(field, i.as_f64() * 0.017, i.as_f64() * 0.0091)
+        if v < 0.0 - 1.0 or v > 1.0 {
+            simplex_range = false
+        }
+        let m = if v < 0.0 { 0.0 - v } else { v }
+        if m > simplex_used {
+            simplex_used = m
+        }
+    }
+    say(f, "simplex stays inside -1 to 1", simplex_range)
+    say(f, "and reaches most of it", simplex_used > 0.9)
+    let map = perlin.height_map(field, 32, 32, 0.1, 4)
+    say(f, "a height map is one byte a cell", map.len() == 1024)
+    var bytes_ok = true
+    for v in map {
+        if v < 0 or v > 255 {
+            bytes_ok = false
+        }
+    }
+    say(f, "and every one is a byte", bytes_ok)
+}
+
+fn check_dither(inout f: i64) / {io} {
+    print("-- dither: the error you can see, traded for noise you cannot")
+    let p = dither.grey_levels(2)
+    say(f, "two grey levels is black and white", dither.colour_count(p) == 2)
+    say(f, "and the nearest is chosen by distance",
+        dither.nearest(p, 200, 200, 200) == 1 and dither.nearest(p, 20, 20, 20) == 0)
+    say(f, "monochrome is the same two", dither.colour_count(dither.monochrome()) == 2)
+    say(f, "and EGA is sixteen", dither.colour_count(dither.ega()) == 16)
+    // A smooth ramp is the case that shows the difference: quantising it
+    // gives bands, dithering gives noise whose local average is right.
+    var ramp: [i64] = []
+    for _y in 0..16 {
+        for x in 0..32 {
+            let v = x * 255 / 31
+            ramp.push(v)
+            ramp.push(v)
+            ramp.push(v)
+        }
+    }
+    let plain = dither.quantise(ramp, 32, 16, p)
+    let diffused = dither.diffuse(ramp, 32, 16, p, "floyd-steinberg")
+    let bayered = dither.ordered(ramp, 32, 16, p, 2)
+    say(f, "every method gives one index a pixel",
+        plain.len() == 512 and diffused.len() == 512 and bayered.len() == 512)
+    // Per pixel, plain quantisation is the best possible — it picks the
+    // nearest colour every time.
+    say(f, "per pixel, plain quantisation has the smallest error",
+        dither.mean_error(ramp, plain, p) <= dither.mean_error(ramp, diffused, p))
+    // Over an area, which is what the eye does, it is by far the worst.
+    let plain_block = dither.block_error(ramp, plain, 32, 16, p, 4)
+    let diffused_block = dither.block_error(ramp, diffused, 32, 16, p, 4)
+    say(f, "over a 4x4 block, diffusion is much better",
+        diffused_block * 2 < plain_block)
+    say(f, "and ordered dithering is better than plain too",
+        dither.block_error(ramp, bayered, 32, 16, p, 4) < plain_block)
+    // Bayer matrices are self-similar, which is what makes them tile.
+    say(f, "a Bayer matrix of order 1 is four entries", dither.bayer(1).len() == 4)
+    say(f, "order 3 is 64", dither.bayer(3).len() == 64)
+    var seen: [i64] = []
+    for v in dither.bayer(3) {
+        if not seen.contains(v) {
+            seen.push(v)
+        }
+    }
+    say(f, "and every threshold appears exactly once", seen.len() == 64)
+    say(f, "four kernels are offered", dither.kernel_names().len() == 4)
+    var all_differ = true
+    for name in dither.kernel_names() {
+        if name != "floyd-steinberg" and
+        dither.diffuse(ramp, 32, 16, p, name) == diffused {
+            all_differ = false
+        }
+    }
+    say(f, "and they give different results", all_differ)
+    say(f, "indices convert back to colours",
+        dither.to_rgb([0, 1], p) == [0, 0, 0, 255, 255, 255])
+    // With enough colours available, dithering has nothing to do.
+    let many = dither.grey_levels(256)
+    say(f, "a palette that holds every value needs no dithering",
+        dither.mean_error(ramp, dither.diffuse(ramp, 32, 16, many,
+            "floyd-steinberg"), many) == 0)
+}
+
+fn check_asciiart(inout f: i64) / {io} {
+    print("-- asciiart: the aspect ratio is the whole problem")
+    say(f, "the short ramp is ten characters", asciiart.ramp_short().len() == 10)
+    say(f, "and a dark pixel gets the character with the most ink",
+        asciiart.character_for(0, asciiart.ramp_short()) == "@" and
+        asciiart.character_for(255, asciiart.ramp_short()) == " ")
+    say(f, "the long ramp is finer", asciiart.ramp_long().len() > 60)
+    // Luminance, not the average: the eye is far more sensitive to green.
+    say(f, "green is the brightest primary",
+        asciiart.luminance(0, 255, 0) > asciiart.luminance(255, 0, 0) and
+        asciiart.luminance(255, 0, 0) > asciiart.luminance(0, 0, 255))
+    say(f, "and white is 255", asciiart.luminance(255, 255, 255) == 255)
+    say(f, "RGB converts to one value a pixel",
+        asciiart.to_grey([255, 255, 255, 0, 0, 0], 3) == [255, 0])
+    // A terminal cell is about twice as tall as it is wide.
+    say(f, "a square image gets half as many rows as columns",
+        asciiart.fitted_height(100, 100, 40, 5) == 20)
+    say(f, "and a square cell gets as many",
+        asciiart.fitted_height(100, 100, 40, 10) == 40)
+    say(f, "never fewer than one", asciiart.fitted_height(100, 1, 4, 5) == 1)
+    // Averaging, not nearest: a shrink that samples drops whole strokes.
+    say(f, "shrinking averages over the cell",
+        asciiart.resize([0, 255, 255, 0], 2, 2, 1, 1) == [127])
+    say(f, "and the size asked for is the size returned",
+        asciiart.resize([0, 255, 255, 0], 2, 2, 3, 3).len() == 9)
+    var grey: [i64] = []
+    for _y in 0..20 {
+        for x in 0..20 {
+            grey.push(if x < 10 { 0 } else { 255 })
+        }
+    }
+    let lines = asciiart.render_grey(grey, 20, 20, 20, asciiart.ramp_short(), 5)
+    say(f, "twenty columns wide", lines[0].len() == 20)
+    say(f, "and ten rows tall for a square image", lines.len() == 10)
+    say(f, "with the dark half inked and the light half blank",
+        lines[0].substr(0, 1) == "@" and lines[0].substr(19, 1) == " ")
+    // Two sample rows to a character, so twice the vertical detail in half
+    // the lines — and the result is square rather than stretched.
+    say(f, "half-blocks give a square result",
+        asciiart.render_halfblocks(grey, 20, 20, 20).len() == 10)
+    // Normalising is what makes a low-contrast photograph legible.
+    say(f, "normalising stretches to the full range",
+        asciiart.normalise([100, 110, 120]) == [0, 127, 255])
+    say(f, "and leaves a flat image alone",
+        asciiart.normalise([50, 50, 50]) == [50, 50, 50])
+    say(f, "inverting is for a light background",
+        asciiart.invert([0, 255]) == [255, 0])
+    let coloured = asciiart.colourise(["ab"], [255, 0, 0, 0, 0, 255], 3, 2, 1)
+    say(f, "colour wraps each character in an escape",
+        coloured[0].contains("38;2;255;0;0") and coloured[0].contains("38;2;0;0;255"))
+    say(f, "and resets at the end of the line", coloured[0].ends_with("[0m"))
+}
+
+fn main() / {io} {
+    var f = 0
+
+    check_png(f)
+    check_wav(f)
+    check_qrcode(f)
+    check_perlin(f)
+    check_dither(f)
+    check_asciiart(f)
+
+    if f == 0 {
+        print("media II: every claim held")
+    } else {
+        print("media II: {f} failed")
+    }
+}

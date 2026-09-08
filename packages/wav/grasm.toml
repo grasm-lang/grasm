@@ -1,0 +1,6 @@
+[package]
+name = "wav"
+version = "1.0.0"
+
+# RIFF/WAVE audio, both directions. Opens nothing.
+capabilities = []

@@ -1,0 +1,303 @@
+// Reducing an image's colours without it looking reduced.
+//
+// Round each pixel to the nearest available colour and a photograph becomes
+// bands: the gradient that was 200 shades becomes eight, and the boundaries
+// between them are visible as contour lines the original never had.
+//
+// Dithering trades that spatial error for noise, which the eye is far more
+// forgiving of. Two families, and they fail differently:
+//
+//   - **Error diffusion** (Floyd-Steinberg and its relatives) pushes each
+//     pixel's rounding error onto its not-yet-processed neighbours, so the
+//     average over any small area is right. It looks best, and it is
+//     sequential: pixel *n* depends on pixel *n-1*, so it cannot be done in
+//     parallel and it cannot be done a tile at a time without seams.
+//   - **Ordered dithering** compares each pixel against a threshold that
+//     varies by position, from a Bayer matrix. It is parallel, tileable and
+//     stable under animation — a video dithered with error diffusion
+//     crawls, because a one-value change at the top propagates everywhere —
+//     but it leaves a visible crosshatch.
+//
+// Both are here because the choice between them is real and depends on
+// whether the output moves.
+
+type DitherPalette = {
+    /// RGB triples.
+    colour: [i64],
+}
+
+pub fn grey_levels(count: i64) -> DitherPalette {
+    var out: [i64] = []
+    let n = if count < 2 { 2 } else { count }
+    for i in 0..n {
+        let v = i * 255 / (n - 1)
+        out.push(v)
+        out.push(v)
+        out.push(v)
+    }
+    return DitherPalette{ colour: out }
+}
+
+pub fn palette(colour: [i64]) -> DitherPalette {
+    return DitherPalette{ colour: colour }
+}
+
+/// Black and white, which is what a receipt printer and an e-ink screen have.
+pub fn monochrome() -> DitherPalette {
+    return DitherPalette{ colour: [0, 0, 0, 255, 255, 255] }
+}
+
+/// The classic 16, in the order the IBM PC had them.
+pub fn ega() -> DitherPalette {
+    return DitherPalette{ colour: [
+        0, 0, 0, 0, 0, 170, 0, 170, 0, 0, 170, 170,
+        170, 0, 0, 170, 0, 170, 170, 85, 0, 170, 170, 170,
+        85, 85, 85, 85, 85, 255, 85, 255, 85, 85, 255, 255,
+        255, 85, 85, 255, 85, 255, 255, 255, 85, 255, 255, 255,
+    ] }
+}
+
+pub fn colour_count(p: DitherPalette) -> i64 {
+    return p.colour.len() / 3
+}
+
+/// The nearest palette entry, by squared distance in RGB.
+///
+/// RGB distance is not perceptual distance — two colours the eye finds equally
+/// far apart can differ by very different amounts here — but it is what every
+/// dithering algorithm in practice uses, and swapping in a perceptual metric
+/// changes which artefacts appear rather than removing them.
+pub fn nearest(p: DitherPalette, r: i64, g: i64, b: i64) -> i64 {
+    var best = 0
+    var best_distance = 0 - 1
+    for i in 0..colour_count(p) {
+        let dr = p.colour[i * 3] - r
+        let dg = p.colour[i * 3 + 1] - g
+        let db = p.colour[i * 3 + 2] - b
+        let d = dr * dr + dg * dg + db * db
+        if best_distance < 0 or d < best_distance {
+            best_distance = d
+            best = i
+        }
+    }
+    return best
+}
+
+fn clamp(v: i64) -> i64 {
+    if v < 0 {
+        return 0
+    }
+    if v > 255 {
+        return 255
+    }
+    return v
+}
+
+/// The error-diffusion kernels, as (dx, dy, weight) with a divisor.
+fn kernel_of(name: str) -> ([i64], i64) {
+    if name == "atkinson" {
+        // Atkinson keeps only 6/8 of the error, which lightens the image and
+        // is why the original Macintosh's dithering looks the way it does.
+        return ([1, 0, 1, 2, 0, 1, 0 - 1, 1, 1, 0, 1, 1, 1, 1, 1, 0, 2, 1], 8)
+    }
+    if name == "jarvis" {
+        return ([1, 0, 7, 2, 0, 5,
+            0 - 2, 1, 3, 0 - 1, 1, 5, 0, 1, 7, 1, 1, 5, 2, 1, 3,
+            0 - 2, 2, 1, 0 - 1, 2, 3, 0, 2, 5, 1, 2, 3, 2, 2, 1], 48)
+    }
+    if name == "sierra" {
+        return ([1, 0, 2, 0 - 1, 1, 1, 0, 1, 1], 4)
+    }
+    // Floyd-Steinberg: the one everybody means by "dithering".
+    return ([1, 0, 7, 0 - 1, 1, 3, 0, 1, 5, 1, 1, 1], 16)
+}
+
+pub fn kernel_names() -> [str] {
+    return ["floyd-steinberg", "jarvis", "atkinson", "sierra"]
+}
+
+/// Error-diffusion dithering. Returns one palette index per pixel.
+///
+/// `sample` is RGB triples, row-major.
+pub fn diffuse(sample: [i64], width: i64, height: i64, p: DitherPalette,
+    kernel: str) -> [i64] {
+    let spec = kernel_of(kernel)
+    let weights = spec.0
+    let divisor = spec.1
+    // A working copy in which the accumulated error lives. Errors go into
+    // this, never into the output, or the diffusion would feed on its own
+    // quantised result.
+    var work: [i64] = []
+    for v in sample {
+        work.push(v)
+    }
+    var out: [i64] = []
+    for _i in 0..(width * height) {
+        out.push(0)
+    }
+    for y in 0..height {
+        for x in 0..width {
+            let at = (y * width + x) * 3
+            let r = clamp(work[at])
+            let g = clamp(work[at + 1])
+            let b = clamp(work[at + 2])
+            let index = nearest(p, r, g, b)
+            out[y * width + x] = index
+            let er = r - p.colour[index * 3]
+            let eg = g - p.colour[index * 3 + 1]
+            let eb = b - p.colour[index * 3 + 2]
+            var k = 0
+            while k + 2 < weights.len() {
+                let dx = weights[k]
+                let dy = weights[k + 1]
+                let w = weights[k + 2]
+                let nx = x + dx
+                let ny = y + dy
+                if nx >= 0 and nx < width and ny >= 0 and ny < height {
+                    let to = (ny * width + nx) * 3
+                    work[to] = work[to] + er * w / divisor
+                    work[to + 1] = work[to + 1] + eg * w / divisor
+                    work[to + 2] = work[to + 2] + eb * w / divisor
+                }
+                k = k + 3
+            }
+        }
+    }
+    return out
+}
+
+/// A Bayer threshold matrix of side 2^n, built by recursion.
+///
+/// Each level quadruples the previous: the pattern is self-similar, which is
+/// what makes it tile without a seam at any size.
+pub fn bayer(order: i64) -> [i64] {
+    var matrix: [i64] = [0, 2, 3, 1]
+    var side = 2
+    for _i in 1..order {
+        var next: [i64] = []
+        let bigger = side * 2
+        for _j in 0..(bigger * bigger) {
+            next.push(0)
+        }
+        for y in 0..side {
+            for x in 0..side {
+                let v = matrix[y * side + x] * 4
+                next[y * bigger + x] = v
+                next[y * bigger + x + side] = v + 2
+                next[(y + side) * bigger + x] = v + 3
+                next[(y + side) * bigger + x + side] = v + 1
+            }
+        }
+        matrix = next
+        side = bigger
+    }
+    return matrix
+}
+
+/// Ordered dithering against a Bayer matrix of side 2^`order`.
+///
+/// Parallel, tileable and stable frame to frame — which is why an animation
+/// or a tiled render uses this and not error diffusion.
+pub fn ordered(sample: [i64], width: i64, height: i64, p: DitherPalette,
+    order: i64) -> [i64] {
+    let matrix = bayer(order)
+    let side = 2 ^ order
+    let levels = matrix.len()
+    // How far a threshold may push a value: about one step of the palette.
+    let spread = 255 / (colour_count(p) - 1)
+    var out: [i64] = []
+    for y in 0..height {
+        for x in 0..width {
+            let at = (y * width + x) * 3
+            let t = matrix[(y % side) * side + (x % side)]
+            let bias = (t * 2 + 1) * spread / (levels * 2) - spread / 2
+            out.push(nearest(p, clamp(sample[at] + bias),
+                clamp(sample[at + 1] + bias), clamp(sample[at + 2] + bias)))
+        }
+    }
+    return out
+}
+
+/// Nearest-colour with no dithering, for the comparison that shows why the
+/// other two exist.
+pub fn quantise(sample: [i64], width: i64, height: i64,
+    p: DitherPalette) -> [i64] {
+    var out: [i64] = []
+    for i in 0..(width * height) {
+        out.push(nearest(p, sample[i * 3], sample[i * 3 + 1], sample[i * 3 + 2]))
+    }
+    return out
+}
+
+/// Palette indices back to RGB triples.
+pub fn to_rgb(index: [i64], p: DitherPalette) -> [i64] {
+    var out: [i64] = []
+    for i in index {
+        out.push(p.colour[i * 3])
+        out.push(p.colour[i * 3 + 1])
+        out.push(p.colour[i * 3 + 2])
+    }
+    return out
+}
+
+/// The mean absolute error between an image and its dithered form.
+///
+/// The number that shows what dithering buys: error diffusion's per-pixel
+/// error is *larger* than plain quantisation's, and the result looks better,
+/// because the eye integrates over an area rather than a pixel.
+pub fn mean_error(sample: [i64], index: [i64], p: DitherPalette) -> i64 {
+    if index.len() == 0 {
+        return 0
+    }
+    var total = 0
+    for i in 0..index.len() {
+        for c in 0..3 {
+            let d = sample[i * 3 + c] - p.colour[index[i] * 3 + c]
+            total = total + (if d < 0 { 0 - d } else { d })
+        }
+    }
+    return total / (index.len() * 3)
+}
+
+/// The mean error over blocks of `block` pixels square — the measure that
+/// matches what the eye does, and where diffusion wins.
+pub fn block_error(sample: [i64], index: [i64], width: i64, height: i64,
+    p: DitherPalette, block: i64) -> i64 {
+    var total = 0
+    var blocks = 0
+    var by = 0
+    while by < height {
+        var bx = 0
+        while bx < width {
+            var want = [0, 0, 0]
+            var got = [0, 0, 0]
+            var count = 0
+            for y in by..(by + block) {
+                for x in bx..(bx + block) {
+                    if y >= height or x >= width {
+                        continue
+                    }
+                    let at = y * width + x
+                    for c in 0..3 {
+                        want[c] = want[c] + sample[at * 3 + c]
+                        got[c] = got[c] + p.colour[index[at] * 3 + c]
+                    }
+                    count = count + 1
+                }
+            }
+            if count > 0 {
+                for c in 0..3 {
+                    let d = (want[c] - got[c]) / count
+                    total = total + (if d < 0 { 0 - d } else { d })
+                }
+                blocks = blocks + 1
+            }
+            bx = bx + block
+        }
+        by = by + block
+    }
+    if blocks == 0 {
+        return 0
+    }
+    return total / (blocks * 3)
+}

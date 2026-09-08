@@ -584,6 +584,11 @@ enum PathSeg {
 /// not do is pretend the time is zero.
 #[cfg(target_arch = "wasm32")]
 fn host_now_millis() -> i64 {
+    // Named as an import of module `env` rather than left as a bare
+    // undefined symbol: `wasm32-unknown-unknown` no longer links a module
+    // with undefined symbols in it, and the failure is at link time with
+    // no mention of which engine broke.
+    #[link(wasm_import_module = "env")]
     extern "C" {
         /// Supplied by the embedder as `env.grasm_now_millis`.
         fn grasm_now_millis() -> f64;
@@ -621,6 +626,11 @@ fn host_monotonic_millis() -> i64 {
 /// one — `performance.now()` in a browser, which is exactly this.
 #[cfg(target_arch = "wasm32")]
 fn host_monotonic_millis() -> i64 {
+    // Named as an import of module `env` rather than left as a bare
+    // undefined symbol: `wasm32-unknown-unknown` no longer links a module
+    // with undefined symbols in it, and the failure is at link time with
+    // no mention of which engine broke.
+    #[link(wasm_import_module = "env")]
     extern "C" {
         /// Supplied by the embedder as `env.grasm_monotonic_millis`.
         fn grasm_monotonic_millis() -> f64;
@@ -641,6 +651,11 @@ fn host_sleep_millis(ms: i64) {
 /// the wait is the embedder's, like the clock beside it.
 #[cfg(target_arch = "wasm32")]
 fn host_sleep_millis(ms: i64) {
+    // Named as an import of module `env` rather than left as a bare
+    // undefined symbol: `wasm32-unknown-unknown` no longer links a module
+    // with undefined symbols in it, and the failure is at link time with
+    // no mention of which engine broke.
+    #[link(wasm_import_module = "env")]
     extern "C" {
         /// Supplied by the embedder as `env.grasm_sleep_millis`.
         fn grasm_sleep_millis(ms: f64);

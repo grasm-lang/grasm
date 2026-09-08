@@ -1,0 +1,6 @@
+[package]
+name = "perlin"
+version = "1.0.0"
+
+# Gradient noise. Opens nothing.
+capabilities = []

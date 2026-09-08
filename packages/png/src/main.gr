@@ -1,0 +1,442 @@
+// PNG, both directions.
+//
+// The format is four ideas and each is worth knowing:
+//
+//   1. **Chunks.** Length, four-letter type, data, CRC. A reader skips any
+//      chunk it does not know, and the case of the four letters says whether
+//      that is safe — a lowercase first letter means "not critical". That is
+//      why a PNG written in 1996 still opens.
+//   2. **Filters.** Every scanline is prefixed with one of five byte-wise
+//      predictors, chosen per line. They compress nothing on their own; they
+//      turn a photograph's smooth gradients into small numbers so that DEFLATE
+//      afterwards has something to work with. A PNG written with filter 0
+//      everywhere is typically twice the size.
+//   3. **DEFLATE**, over the filtered rows as one stream — not per row, which
+//      is why a PNG cannot be decoded a row at a time without keeping the
+//      whole zlib state.
+//   4. **CRC per chunk**, so corruption is found rather than rendered.
+//
+// The Paeth predictor in point 2 is the one worth reading: it picks whichever
+// of left, above and above-left is closest to their linear combination, which
+// is a one-line edge detector that happens to be exactly right for images.
+import zlib
+import crc32
+
+type PngImage = {
+    width: i64,
+    height: i64,
+    /// 0 grey, 2 RGB, 3 palette, 4 grey+alpha, 6 RGBA.
+    colour_type: i64,
+    bit_depth: i64,
+    /// Row-major samples, `channels` per pixel.
+    sample: [i64],
+    /// RGB triples, for a palette image.
+    palette: [i64],
+}
+
+type PngError =
+    | NotAPng(why: str)
+    | BadChunk(kind: str, at: i64)
+    | BadCrc(kind: str, at: i64)
+    | Unsupported(what: str)
+    | Corrupt(why: str)
+
+fn signature() -> [i64] {
+    return [137, 80, 78, 71, 13, 10, 26, 10]
+}
+
+/// How many samples a pixel has, for each colour type.
+pub fn channels_for(colour_type: i64) -> i64 {
+    if colour_type == 0 {
+        return 1
+    }
+    if colour_type == 2 {
+        return 3
+    }
+    if colour_type == 3 {
+        return 1
+    }
+    if colour_type == 4 {
+        return 2
+    }
+    return 4
+}
+
+pub fn grey(width: i64, height: i64, sample: [i64]) -> PngImage {
+    return PngImage{
+        width: width, height: height, colour_type: 0, bit_depth: 8,
+        sample: sample, palette: [],
+    }
+}
+
+pub fn rgb(width: i64, height: i64, sample: [i64]) -> PngImage {
+    return PngImage{
+        width: width, height: height, colour_type: 2, bit_depth: 8,
+        sample: sample, palette: [],
+    }
+}
+
+pub fn rgba(width: i64, height: i64, sample: [i64]) -> PngImage {
+    return PngImage{
+        width: width, height: height, colour_type: 6, bit_depth: 8,
+        sample: sample, palette: [],
+    }
+}
+
+pub fn paletted(width: i64, height: i64, index: [i64], palette: [i64]) -> PngImage {
+    return PngImage{
+        width: width, height: height, colour_type: 3, bit_depth: 8,
+        sample: index, palette: palette,
+    }
+}
+
+fn push_be32(inout out: [i64], v: i64) {
+    out.push(v.ushr(24).bit_and(255))
+    out.push(v.ushr(16).bit_and(255))
+    out.push(v.ushr(8).bit_and(255))
+    out.push(v.bit_and(255))
+}
+
+/// One chunk: length, type, data, and a CRC over the type *and* the data.
+///
+/// Over both, not just the data — a CRC that skips the type cannot tell an
+/// `IDAT` from a `PLTE` with the same bytes in it.
+fn chunk(inout out: [i64], kind: str, data: [i64]) {
+    push_be32(out, data.len())
+    var covered: [i64] = []
+    for c in kind.chars() {
+        covered.push(c.code_at(0))
+    }
+    for b in data {
+        covered.push(b)
+    }
+    for b in covered {
+        out.push(b)
+    }
+    push_be32(out, crc32.of(bytes_of(covered)))
+}
+
+fn paeth(a: i64, b: i64, c: i64) -> i64 {
+    // The predictor is a + b - c; whichever of the three is nearest it wins.
+    let p = a + b - c
+    let pa = if p > a { p - a } else { a - p }
+    let pb = if p > b { p - b } else { b - p }
+    let pc = if p > c { p - c } else { c - p }
+    if pa <= pb and pa <= pc {
+        return a
+    }
+    if pb <= pc {
+        return b
+    }
+    return c
+}
+
+fn filtered_row(row: [i64], previous: [i64], kind: i64, bpp: i64) -> [i64] {
+    var out: [i64] = []
+    for i in 0..row.len() {
+        let left = if i >= bpp { row[i - bpp] } else { 0 }
+        let above = if previous.len() > 0 { previous[i] } else { 0 }
+        let corner = if i >= bpp and previous.len() > 0 { previous[i - bpp] } else { 0 }
+        var v = row[i]
+        if kind == 1 {
+            v = row[i] - left
+        } else if kind == 2 {
+            v = row[i] - above
+        } else if kind == 3 {
+            v = row[i] - (left + above) / 2
+        } else if kind == 4 {
+            v = row[i] - paeth(left, above, corner)
+        }
+        out.push(v.bit_and(255))
+    }
+    return out
+}
+
+/// The heuristic from the PNG specification: pick the filter whose output has
+/// the smallest sum of absolute values, treating each byte as signed.
+///
+/// It is not optimal and does not claim to be. What it is, is cheap and
+/// almost always within a few percent of the best choice.
+fn best_filter(row: [i64], previous: [i64], bpp: i64) -> i64 {
+    var best = 0
+    var best_score = 0 - 1
+    for kind in 0..5 {
+        let candidate = filtered_row(row, previous, kind, bpp)
+        var score = 0
+        for b in candidate {
+            score = score + (if b < 128 { b } else { 256 - b })
+        }
+        if best_score < 0 or score < best_score {
+            best_score = score
+            best = kind
+        }
+    }
+    return best
+}
+
+/// The scanlines, each with its filter byte in front.
+fn filtered(image: PngImage) -> bytes {
+    let bpp = channels_for(image.colour_type)
+    let stride = image.width * bpp
+    var out: [i64] = []
+    var previous: [i64] = []
+    for y in 0..image.height {
+        var row: [i64] = []
+        for x in 0..stride {
+            row.push(image.sample[y * stride + x])
+        }
+        let kind = best_filter(row, previous, bpp)
+        out.push(kind)
+        for b in filtered_row(row, previous, kind, bpp) {
+            out.push(b)
+        }
+        previous = row
+    }
+    return bytes_of(out)
+}
+
+pub fn encode(image: PngImage) -> bytes ! PngError {
+    if image.bit_depth != 8 {
+        fail(Unsupported("bit depths other than 8"))
+    }
+    let bpp = channels_for(image.colour_type)
+    if image.sample.len() != image.width * image.height * bpp {
+        fail(Corrupt("sample count does not match the dimensions"))
+    }
+    var out: [i64] = []
+    for b in signature() {
+        out.push(b)
+    }
+    var header: [i64] = []
+    push_be32(header, image.width)
+    push_be32(header, image.height)
+    header.push(image.bit_depth)
+    header.push(image.colour_type)
+    // Compression 0 (DEFLATE), filter method 0 (the five above), interlace 0.
+    header.push(0)
+    header.push(0)
+    header.push(0)
+    chunk(out, "IHDR", header)
+    if image.colour_type == 3 {
+        if image.palette.len() == 0 or image.palette.len() % 3 != 0 {
+            fail(Corrupt("a palette image needs RGB triples"))
+        }
+        chunk(out, "PLTE", image.palette)
+    }
+    chunk(out, "IDAT", zlib.compress_stored(filtered(image)).to_list())
+    chunk(out, "IEND", [])
+    return bytes_of(out)
+}
+
+fn read_be32(data: bytes, at: i64) -> i64 {
+    return data.at(at).shl(24).bit_or(data.at(at + 1).shl(16))
+        .bit_or(data.at(at + 2).shl(8)).bit_or(data.at(at + 3))
+}
+
+fn chunk_kind(data: bytes, at: i64) -> str {
+    var out = ""
+    for i in 0..4 {
+        out = out + data.at(at + i).to_char()
+    }
+    return out
+}
+
+/// Every chunk in the file, as (kind, start of data, length).
+///
+/// Exposed because a caller may want a chunk this package does not
+/// interpret — a `tEXt` comment, a `gAMA`, an `sRGB` — and the whole point of
+/// the chunk design is that reading one does not require understanding it.
+pub fn chunks(data: bytes) -> [(str, i64, i64)] ! PngError {
+    if data.len() < 8 {
+        fail(NotAPng("shorter than the signature"))
+    }
+    for i in 0..8 {
+        if data.at(i) != signature()[i] {
+            fail(NotAPng("signature does not match"))
+        }
+    }
+    var out: [(str, i64, i64)] = []
+    var at = 8
+    while at + 8 <= data.len() {
+        let length = read_be32(data, at)
+        let kind = chunk_kind(data, at + 4)
+        if at + 12 + length > data.len() {
+            fail(BadChunk(kind, at))
+        }
+        let want = read_be32(data, at + 8 + length)
+        if crc32.of(data.slice(at + 4, length + 4)) != want {
+            fail(BadCrc(kind, at))
+        }
+        out.push((kind, at + 8, length))
+        at = at + 12 + length
+        if kind == "IEND" {
+            break
+        }
+    }
+    return out
+}
+
+fn unfilter(rows: bytes, width: i64, height: i64, bpp: i64) -> [i64] ! PngError {
+    let stride = width * bpp
+    var out: [i64] = []
+    var previous: [i64] = []
+    var at = 0
+    for _y in 0..height {
+        if at >= rows.len() {
+            fail(Corrupt("the pixel data ends before the last row"))
+        }
+        let kind = rows.at(at)
+        at = at + 1
+        var row: [i64] = []
+        for x in 0..stride {
+            if at + x >= rows.len() {
+                fail(Corrupt("a row is short"))
+            }
+            let raw = rows.at(at + x)
+            let left = if x >= bpp { row[x - bpp] } else { 0 }
+            let above = if previous.len() > 0 { previous[x] } else { 0 }
+            let corner = if x >= bpp and previous.len() > 0 { previous[x - bpp] } else { 0 }
+            var v = raw
+            if kind == 1 {
+                v = raw + left
+            } else if kind == 2 {
+                v = raw + above
+            } else if kind == 3 {
+                v = raw + (left + above) / 2
+            } else if kind == 4 {
+                v = raw + paeth(left, above, corner)
+            } else if kind != 0 {
+                fail(Corrupt("filter type {kind} is not one of the five"))
+            }
+            row.push(v.bit_and(255))
+        }
+        for b in row {
+            out.push(b)
+        }
+        previous = row
+        at = at + stride
+    }
+    return out
+}
+
+pub fn decode(data: bytes) -> PngImage ! PngError {
+    let found = try chunks(data)
+    var width = 0
+    var height = 0
+    var colour_type = 0
+    var depth = 0
+    var palette: [i64] = []
+    var compressed: [i64] = []
+    var seen_header = false
+    for c in found {
+        if c.0 == "IHDR" {
+            if c.2 != 13 {
+                fail(BadChunk("IHDR", c.1))
+            }
+            width = read_be32(data, c.1)
+            height = read_be32(data, c.1 + 4)
+            depth = data.at(c.1 + 8)
+            colour_type = data.at(c.1 + 9)
+            if data.at(c.1 + 12) != 0 {
+                fail(Unsupported("interlaced images"))
+            }
+            seen_header = true
+        } else if c.0 == "PLTE" {
+            palette = data.slice(c.1, c.2).to_list()
+        } else if c.0 == "IDAT" {
+            // Several IDAT chunks are one DEFLATE stream, split wherever the
+            // writer felt like it. Joining them before inflating is the only
+            // way that works.
+            for b in data.slice(c.1, c.2).to_list() {
+                compressed.push(b)
+            }
+        }
+    }
+    if not seen_header {
+        fail(NotAPng("no IHDR"))
+    }
+    if depth != 8 {
+        fail(Unsupported("bit depth {depth}"))
+    }
+    if colour_type == 1 or colour_type == 5 or colour_type > 6 {
+        fail(NotAPng("colour type {colour_type} does not exist"))
+    }
+    let bpp = channels_for(colour_type)
+    let limit = height * (width * bpp + 1) + 64
+    match zlib.decompress(bytes_of(compressed), limit) {
+        Ok(rows) -> {
+            let samples = try unfilter(rows, width, height, bpp)
+            return PngImage{
+                width: width, height: height, colour_type: colour_type,
+                bit_depth: depth, sample: samples, palette: palette,
+            }
+        }
+        Err(_e) -> fail(Corrupt("the pixel stream does not inflate"))
+    }
+}
+
+/// One pixel, as up to four samples.
+pub fn pixel(image: PngImage, x: i64, y: i64) -> [i64] {
+    let bpp = channels_for(image.colour_type)
+    var out: [i64] = []
+    if x < 0 or y < 0 or x >= image.width or y >= image.height {
+        return out
+    }
+    let at = (y * image.width + x) * bpp
+    for i in 0..bpp {
+        out.push(image.sample[at + i])
+    }
+    return out
+}
+
+/// A palette image's pixel, resolved through its palette.
+pub fn rgb_at(image: PngImage, x: i64, y: i64) -> [i64] {
+    let raw = pixel(image, x, y)
+    if image.colour_type != 3 or raw.len() == 0 {
+        return raw
+    }
+    let at = raw[0] * 3
+    if at + 2 >= image.palette.len() {
+        return []
+    }
+    return [image.palette[at], image.palette[at + 1], image.palette[at + 2]]
+}
+
+pub fn width_of(image: PngImage) -> i64 {
+    return image.width
+}
+
+pub fn height_of(image: PngImage) -> i64 {
+    return image.height
+}
+
+pub fn colour_type_of(image: PngImage) -> i64 {
+    return image.colour_type
+}
+
+/// The filter each row was written with — the number that says whether an
+/// encoder bothered.
+pub fn filters_used(data: bytes) -> [i64] ! PngError {
+    let image = try decode(data)
+    let found = try chunks(data)
+    var compressed: [i64] = []
+    for c in found {
+        if c.0 == "IDAT" {
+            for b in data.slice(c.1, c.2).to_list() {
+                compressed.push(b)
+            }
+        }
+    }
+    let bpp = channels_for(image.colour_type)
+    let stride = image.width * bpp + 1
+    var out: [i64] = []
+    match zlib.decompress(bytes_of(compressed), image.height * stride + 64) {
+        Ok(rows) -> {
+            for y in 0..image.height {
+                out.push(rows.at(y * stride))
+            }
+            return out
+        }
+        Err(_e) -> fail(Corrupt("the pixel stream does not inflate"))
+    }
+}

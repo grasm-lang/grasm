@@ -1,0 +1,6 @@
+[package]
+name = "asciiart"
+version = "1.0.0"
+
+# Images as text. Opens nothing.
+capabilities = []

@@ -1,0 +1,375 @@
+// WAV: PCM audio in a RIFF container.
+//
+// The format is old enough to be simple and old enough to have traps:
+//
+//   - Everything is **little-endian**, unlike almost every other container.
+//   - 8-bit samples are **unsigned** (0..255, silence at 128) and everything
+//     wider is **signed** (silence at 0). Reading 16-bit as if it were 8-bit
+//     signed gives audible noise rather than an error, which is why this
+//     package converts both to one signed representation and back.
+//   - A chunk with an odd length is followed by a **pad byte** that is not
+//     counted in its length. Skipping the pad is the single most common bug
+//     in WAV readers, and it makes every chunk after the first odd one land
+//     one byte out.
+//   - `RIFF`'s length field counts everything after it, so it is the file
+//     size minus eight — not the file size, and not the data size.
+//
+// Samples are handled as signed integers at their natural width, so a caller
+// mixing or generating audio never has to know which convention the file
+// uses.
+
+type WavAudio = {
+    channels: i64,
+    sample_rate: i64,
+    /// 8, 16, 24 or 32.
+    bits: i64,
+    /// Interleaved by channel, signed at the file's width.
+    sample: [i64],
+}
+
+type WavError =
+    | NotRiff(why: str)
+    | NoChunk(kind: str)
+    | Unsupported(what: str)
+    | Truncated(at: i64)
+
+pub fn audio(channels: i64, sample_rate: i64, bits: i64, sample: [i64]) -> WavAudio {
+    return WavAudio{
+        channels: channels, sample_rate: sample_rate, bits: bits, sample: sample,
+    }
+}
+
+/// Frames: one frame is one sample per channel.
+pub fn frames(a: WavAudio) -> i64 {
+    if a.channels <= 0 {
+        return 0
+    }
+    return a.sample.len() / a.channels
+}
+
+pub fn duration_millis(a: WavAudio) -> i64 {
+    if a.sample_rate <= 0 {
+        return 0
+    }
+    return frames(a) * 1000 / a.sample_rate
+}
+
+/// The largest magnitude a sample of this width can hold.
+pub fn full_scale(bits: i64) -> i64 {
+    return 2 ^ (bits - 1)
+}
+
+fn push_le(inout out: [i64], value: i64, width: i64) {
+    for i in 0..width {
+        out.push(value.ushr(i * 8).bit_and(255))
+    }
+}
+
+fn push_tag(inout out: [i64], tag: str) {
+    for c in tag.chars() {
+        out.push(c.code_at(0))
+    }
+}
+
+fn read_le(data: bytes, at: i64, width: i64) -> i64 {
+    var v = 0
+    for i in 0..width {
+        v = v.bit_or(data.at(at + i).shl(i * 8))
+    }
+    return v
+}
+
+fn read_tag(data: bytes, at: i64) -> str {
+    var out = ""
+    for i in 0..4 {
+        out = out + data.at(at + i).to_char()
+    }
+    return out
+}
+
+/// A signed sample, written the way this width is written on disk.
+fn encode_sample(v: i64, bits: i64) -> i64 {
+    if bits == 8 {
+        // The one unsigned width. 128 is silence.
+        var b = v + 128
+        if b < 0 {
+            b = 0
+        }
+        if b > 255 {
+            b = 255
+        }
+        return b
+    }
+    if v < 0 {
+        return v + (2 ^ bits)
+    }
+    return v
+}
+
+fn decode_sample(raw: i64, bits: i64) -> i64 {
+    if bits == 8 {
+        return raw - 128
+    }
+    let half = 2 ^ (bits - 1)
+    if raw >= half {
+        return raw - half * 2
+    }
+    return raw
+}
+
+pub fn encode(a: WavAudio) -> bytes ! WavError {
+    if a.bits != 8 and a.bits != 16 and a.bits != 24 and a.bits != 32 {
+        fail(Unsupported("{a.bits}-bit samples"))
+    }
+    if a.channels < 1 {
+        fail(Unsupported("{a.channels} channels"))
+    }
+    let width = a.bits / 8
+    let data_len = a.sample.len() * width
+    var out: [i64] = []
+    push_tag(out, "RIFF")
+    // Everything after this field: 4 for "WAVE", 24 for fmt, 8 + data.
+    push_le(out, 4 + 24 + 8 + data_len + (data_len % 2), 4)
+    push_tag(out, "WAVE")
+    push_tag(out, "fmt ")
+    push_le(out, 16, 4)
+    // Format 1 is uncompressed PCM.
+    push_le(out, 1, 2)
+    push_le(out, a.channels, 2)
+    push_le(out, a.sample_rate, 4)
+    // Byte rate and block align are derived, and a reader is entitled to
+    // trust them, so they have to be right.
+    push_le(out, a.sample_rate * a.channels * width, 4)
+    push_le(out, a.channels * width, 2)
+    push_le(out, a.bits, 2)
+    push_tag(out, "data")
+    push_le(out, data_len, 4)
+    for v in a.sample {
+        push_le(out, encode_sample(v, a.bits), width)
+    }
+    // A chunk of odd length is followed by a pad byte, outside its length.
+    if data_len % 2 == 1 {
+        out.push(0)
+    }
+    return bytes_of(out)
+}
+
+/// Every chunk in the file, as (kind, data start, length).
+pub fn chunks(data: bytes) -> [(str, i64, i64)] ! WavError {
+    if data.len() < 12 {
+        fail(NotRiff("shorter than a header"))
+    }
+    if read_tag(data, 0) != "RIFF" {
+        fail(NotRiff("does not begin with RIFF"))
+    }
+    if read_tag(data, 8) != "WAVE" {
+        fail(NotRiff("RIFF, but not WAVE"))
+    }
+    var out: [(str, i64, i64)] = []
+    var at = 12
+    while at + 8 <= data.len() {
+        let kind = read_tag(data, at)
+        let length = read_le(data, at + 4, 4)
+        if at + 8 + length > data.len() {
+            // A truncated final chunk is common in the wild; report it rather
+            // than reading past the end.
+            fail(Truncated(at))
+        }
+        out.push((kind, at + 8, length))
+        at = at + 8 + length + (length % 2)
+    }
+    return out
+}
+
+pub fn decode(data: bytes) -> WavAudio ! WavError {
+    let found = try chunks(data)
+    var channels = 0
+    var rate = 0
+    var bits = 0
+    var format = 0
+    var start = 0 - 1
+    var length = 0
+    for c in found {
+        if c.0 == "fmt " {
+            if c.2 < 16 {
+                fail(NotRiff("fmt chunk is too short"))
+            }
+            format = read_le(data, c.1, 2)
+            channels = read_le(data, c.1 + 2, 2)
+            rate = read_le(data, c.1 + 4, 4)
+            bits = read_le(data, c.1 + 14, 2)
+        } else if c.0 == "data" {
+            start = c.1
+            length = c.2
+        }
+    }
+    if channels == 0 {
+        fail(NoChunk("fmt "))
+    }
+    if start < 0 {
+        fail(NoChunk("data"))
+    }
+    // 1 is PCM; 0xFFFE is WAVE_FORMAT_EXTENSIBLE, whose real format lives in
+    // a sub-chunk this does not read.
+    if format != 1 {
+        fail(Unsupported("format tag {format}"))
+    }
+    if bits != 8 and bits != 16 and bits != 24 and bits != 32 {
+        fail(Unsupported("{bits}-bit samples"))
+    }
+    let width = bits / 8
+    var samples: [i64] = []
+    var at = 0
+    while at + width <= length {
+        samples.push(decode_sample(read_le(data, start + at, width), bits))
+        at = at + width
+    }
+    return WavAudio{
+        channels: channels, sample_rate: rate, bits: bits, sample: samples,
+    }
+}
+
+/// One channel on its own.
+pub fn channel(a: WavAudio, which: i64) -> [i64] {
+    var out: [i64] = []
+    if which < 0 or which >= a.channels {
+        return out
+    }
+    var i = which
+    while i < a.sample.len() {
+        out.push(a.sample[i])
+        i = i + a.channels
+    }
+    return out
+}
+
+/// Channels averaged into one.
+pub fn to_mono(a: WavAudio) -> WavAudio {
+    if a.channels <= 1 {
+        return a
+    }
+    var out: [i64] = []
+    var i = 0
+    while i + a.channels <= a.sample.len() {
+        var total = 0
+        for c in 0..a.channels {
+            total = total + a.sample[i + c]
+        }
+        out.push(total / a.channels)
+        i = i + a.channels
+    }
+    return WavAudio{
+        channels: 1, sample_rate: a.sample_rate, bits: a.bits, sample: out,
+    }
+}
+
+/// The same audio at a different sample width, rescaled rather than truncated.
+pub fn to_bits(a: WavAudio, bits: i64) -> WavAudio ! WavError {
+    if bits != 8 and bits != 16 and bits != 24 and bits != 32 {
+        fail(Unsupported("{bits}-bit samples"))
+    }
+    var out: [i64] = []
+    let from = full_scale(a.bits)
+    let to = full_scale(bits)
+    for v in a.sample {
+        out.push(v * to / from)
+    }
+    return WavAudio{
+        channels: a.channels, sample_rate: a.sample_rate, bits: bits, sample: out,
+    }
+}
+
+/// The loudest sample, as a fraction of full scale in tenths of a percent.
+///
+/// Integers, because a level meter that needs a float is a level meter that
+/// disagrees between machines.
+pub fn peak_permille(a: WavAudio) -> i64 {
+    var peak = 0
+    for v in a.sample {
+        let m = if v < 0 { 0 - v } else { v }
+        if m > peak {
+            peak = m
+        }
+    }
+    if a.sample.len() == 0 {
+        return 0
+    }
+    return peak * 1000 / full_scale(a.bits)
+}
+
+/// Scale so the loudest sample sits at `permille` of full scale.
+pub fn normalise(a: WavAudio, permille: i64) -> WavAudio {
+    // Scaled from the raw peak sample rather than from `peak_permille`,
+    // whose thousandths round: a peak of 1000 in a 16-bit file is 30.5
+    // permille, and scaling by the rounded 30 overshoots by 1.5%.
+    var peak = 0
+    for v in a.sample {
+        let m = if v < 0 { 0 - v } else { v }
+        if m > peak {
+            peak = m
+        }
+    }
+    if peak == 0 {
+        return a
+    }
+    let target = full_scale(a.bits) * permille / 1000
+    var out: [i64] = []
+    for v in a.sample {
+        var scaled = v * target / peak
+        let limit = full_scale(a.bits) - 1
+        if scaled > limit {
+            scaled = limit
+        }
+        if scaled < 0 - limit - 1 {
+            scaled = 0 - limit - 1
+        }
+        out.push(scaled)
+    }
+    return WavAudio{
+        channels: a.channels, sample_rate: a.sample_rate, bits: a.bits,
+        sample: out,
+    }
+}
+
+/// A slice of the audio, in frames.
+pub fn slice_frames(a: WavAudio, from: i64, count: i64) -> WavAudio {
+    var out: [i64] = []
+    let total = frames(a)
+    var start = from
+    if start < 0 {
+        start = 0
+    }
+    var stop = start + count
+    if stop > total {
+        stop = total
+    }
+    var f = start
+    while f < stop {
+        for c in 0..a.channels {
+            out.push(a.sample[f * a.channels + c])
+        }
+        f = f + 1
+    }
+    return WavAudio{
+        channels: a.channels, sample_rate: a.sample_rate, bits: a.bits,
+        sample: out,
+    }
+}
+
+/// A sine tone, for a test signal that does not need a file.
+///
+/// The amplitude is in permille of full scale, so the same call gives the
+/// same relative level at any bit depth.
+pub fn tone(hz: i64, millis: i64, sample_rate: i64, bits: i64,
+    permille: i64) -> WavAudio {
+    var out: [i64] = []
+    let count = sample_rate * millis / 1000
+    let amplitude = full_scale(bits).as_f64() * permille.as_f64() / 1000.0
+    for i in 0..count {
+        let phase = 2.0 * pi() * hz.as_f64() * i.as_f64() / sample_rate.as_f64()
+        out.push((amplitude * phase.sin()).as_i64())
+    }
+    return WavAudio{
+        channels: 1, sample_rate: sample_rate, bits: bits, sample: out,
+    }
+}
