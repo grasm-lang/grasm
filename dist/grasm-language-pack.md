@@ -453,6 +453,12 @@ statement that yields nothing).
 `usize`, and `int` are currently aliases for `i64`; `f32` and `float` are
 aliases for `f64`. Distinct fixed-width types are designed but unimplemented.
 
+**[T-UNIT-RETURN]** A function whose result type is `()` may say so
+explicitly and may `return ()` from anywhere in its body, including from a
+branch. The unit value carries no information, so a backend is free to give
+such a function no return value at all; what it may not do is treat the
+explicit form as different from falling off the end.
+
 ## 2. Composite types
 
 **[T-LIST]** `[T]` is a homogeneous, growable sequence of `T`.
@@ -2970,7 +2976,7 @@ cannot emit an object file.
 | `b.len()` | `(bytes) -> i64` | count of bytes |
 | `b.is_empty()` | `(bytes) -> bool` | |
 | `b.at(i)` | `(bytes, i64) -> i64` | one byte, `0..255`; out of range panics |
-| `b.slice(from, count)` | `(bytes, i64, i64) -> bytes` | out of range panics |
+| `b.slice(from, end)` | `(bytes, i64, i64) -> bytes` | `end` exclusive, as `list.slice`; out of range panics rather than clamping |
 | `b.concat(other)` | `(bytes, bytes) -> bytes` | |
 | `b.to_list()` | `(bytes) -> [i64]` | |
 | `read_bytes(path)` | `(str) -> bytes ! IoError` | the whole file |

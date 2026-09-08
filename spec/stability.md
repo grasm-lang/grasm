@@ -17,7 +17,7 @@ meaning changed; the listing was wrong about how settled the area is, and
 saying so is cheaper than defending it. See `docs/release-scope.md` for what
 that means for a release.
 
-Today: 113 stable, 79 provisional, 46 experimental, of 238.
+Today: 114 stable, 79 provisional, 46 experimental, of 239.
 
 ## Stable
 
@@ -134,6 +134,7 @@ Will not change incompatibly before 2.0.
 - `T-TRY` — stable
 - `T-TUPLE` — stable
 - `T-TYPE-NO-PUB` — stable
+- `T-UNIT-RETURN` — stable
 - `T-USE-AFTER-MOVE` — stable
 - `T-VAR-MUTABLE` — stable
 

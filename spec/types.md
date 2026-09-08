@@ -14,6 +14,12 @@ statement that yields nothing).
 `usize`, and `int` are currently aliases for `i64`; `f32` and `float` are
 aliases for `f64`. Distinct fixed-width types are designed but unimplemented.
 
+**[T-UNIT-RETURN]** A function whose result type is `()` may say so
+explicitly and may `return ()` from anywhere in its body, including from a
+branch. The unit value carries no information, so a backend is free to give
+such a function no return value at all; what it may not do is treat the
+explicit form as different from falling off the end.
+
 ## 2. Composite types
 
 **[T-LIST]** `[T]` is a homogeneous, growable sequence of `T`.

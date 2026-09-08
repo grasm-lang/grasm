@@ -1,6 +1,6 @@
 # Grasm — conformance programs: types
 
-The type and effect system — what a program means before it runs. 96 executable program(s), one per normative clause of
+The type and effect system — what a program means before it runs. 97 executable program(s), one per normative clause of
 `grasm-language-pack.md`. Each header states the tag it demonstrates and the
 exact expected behaviour, and every one is run by `cargo test -p grasm_spec`, so
 a program here cannot describe behaviour the implementation does not have.
@@ -3205,6 +3205,38 @@ pub type Point = { x: i64, y: i64 }
 
 fn main() {
     print("{Point{ x: 1, y: 2 }.x}")
+}
+```
+
+## `T-UNIT-RETURN.gr`
+
+```grasm
+//! tag: T-UNIT-RETURN
+//! expect: output
+//! n is 2 and nothing came back
+fn nothing() -> () {
+    return ()
+}
+
+fn effectful(inout n: i64) -> () {
+    n = n + 1
+    return ()
+}
+
+fn conditional(n: i64) -> () {
+    if n > 0 {
+        return ()
+    }
+    return ()
+}
+
+fn main() {
+    let _v = nothing()
+    var n = 0
+    effectful(n)
+    effectful(n)
+    conditional(n)
+    print("n is {n} and nothing came back")
 }
 ```
 

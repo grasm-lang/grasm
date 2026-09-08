@@ -530,6 +530,8 @@ fn hex(v: i64) -> str {
 //! written and read back identically: true
 //! empty is empty, seven bytes are not: true false
 //! last byte and last slice: 0 0x00
+//! slice means the same on bytes as on a list: true true true true
+//! and refuses the end a list would clamp: true
 //! index 7 out of bounds (len 7)
 // `bytes` is the type `str` deliberately is not ([L-LIB-BYTES]).
 //
@@ -568,8 +570,27 @@ fn main() / {io} {
     // `at` and `slice` are specified to panic out of range, and the index
     // worth testing is the first one that is. The last byte and the last
     // one-byte slice must work; one past must not.
-    print("last byte and last slice: {code.at(code.len() - 1)} {code.slice(code.len() - 1, 1)}")
+    print("last byte and last slice: {code.at(code.len() - 1)} {code.slice(code.len() - 1, code.len())}")
+
+    // The two `slice` methods take the same pair of indices and mean the same
+    // thing by them. They did not until F97 — `bytes` took a length where a
+    // list takes an end — and the two are identical enough to write side by
+    // side that nothing pointed it out.
+    print("slice means the same on bytes as on a list: " +
+        "{same_slice(code, 0, 3)} {same_slice(code, 2, 5)} " +
+        "{same_slice(code, 3, 3)} {same_slice(code, 0, code.len())}")
+
+    // Where they part company, deliberately: a list clamps a too-large end
+    // because it is usually being trimmed, and `bytes` refuses one because it
+    // is usually being parsed, where a short read is a truncated message.
+    print("and refuses the end a list would clamp: " +
+        "{code.to_list().slice(0, 99).len() == 7}")
+
     print("{code.at(code.len())}")
+}
+
+fn same_slice(b: bytes, from: i64, to: i64) -> bool {
+    return b.slice(from, to).to_list() == b.to_list().slice(from, to)
 }
 ```
 
