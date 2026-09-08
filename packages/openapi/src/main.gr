@@ -1,0 +1,437 @@
+// OpenAPI 3: reading a description, and finding the mistakes in it.
+//
+// The parts a program actually needs from an API description are: what
+// operations exist, which one a request matches, what a client must send, and
+// whether the document itself is coherent. The last one is where most of the
+// value is, because an OpenAPI document is usually hand-written and the
+// commonest mistakes are silent:
+//
+// **A path template variable with no parameter object.** `/users/{id}` with
+// no `id` parameter declared. Every generator produces a client that cannot
+// fill the URL, and the document validates against the JSON Schema of
+// OpenAPI itself — the rule is prose in the specification, not schema.
+//
+// **A declared path parameter that is not in the template.** The reverse, and
+// equally silent.
+//
+// **A path parameter that is not `required`.** The specification says it must
+// be; a URL cannot have a hole in it.
+//
+// **An operation with no responses.** `responses` is required and a document
+// with an empty one describes an endpoint nobody can call correctly.
+//
+// **Two paths that match the same request.** `/users/{id}` and `/users/{name}`
+// are the same path as far as routing goes, and which operation a request
+// reaches is then undefined.
+//
+// **A `$ref` that does not resolve.** Checked here at load time rather than
+// discovered by a generator halfway through.
+//
+// Path matching follows the specification's rule: a concrete segment wins over
+// a template one, so `/users/me` beats `/users/{id}` however they are ordered
+// in the document.
+
+import json
+import jsonschema
+
+type OpenApiOperation = {
+    method: str,
+    path: str,
+    operation_id: str,
+    summary: str,
+    /// The operation object itself, for anything this does not lift out.
+    node: ref Json,
+}
+
+type OpenApiParameter = {
+    name: str,
+    location: str,
+    required: bool,
+    schema: ref Json,
+}
+
+/// A request matched against the document.
+type OpenApiMatch = {
+    operation: OpenApiOperation,
+    values: [OpenApiParameter],
+}
+
+type OpenApiError =
+    | OpenApiNotJson(why: str)
+    | OpenApiNoPaths
+    | OpenApiBadVersion(version: str)
+    | OpenApiBadRef(target: str)
+
+    /// The methods an OpenAPI path item may carry.
+pub fn methods() -> [str] {
+    return ["get", "put", "post", "delete", "options", "head", "patch",
+        "trace"]
+}
+
+/// Parse a document.
+pub fn parse(text: str) -> ref Json ! OpenApiError {
+    match json.parse(text) {
+        Err(e) -> fail(OpenApiNotJson(e.why))
+        Ok(doc) -> {
+            let node = json.get(doc, "openapi") ?? json.null()
+            let version = json.as_str(node) ?? ""
+            if not version.starts_with("3.") {
+                fail(OpenApiBadVersion(version))
+            }
+            if json.get(doc, "paths") == None {
+                fail(OpenApiNoPaths)
+            }
+            return doc
+        }
+    }
+}
+
+/// Every operation in the document, in path then method order.
+pub fn operations(doc: ref Json) -> [OpenApiOperation] {
+    var out: [OpenApiOperation] = []
+    let paths = json.get(doc, "paths") ?? json.null()
+    for path in json.keys_of(paths) {
+        let item = json.get(paths, path) ?? json.null()
+        for method in methods() {
+            match json.get(item, method) {
+                Some(node) -> out.push(OpenApiOperation{
+                    method: method.to_upper(),
+                    path: path,
+                    operation_id: json.as_str(json.get(node, "operationId") ??
+                        json.null()) ?? "",
+                    summary: json.as_str(json.get(node, "summary") ??
+                        json.null()) ?? "",
+                    node: node })
+                None -> {}
+            }
+        }
+    }
+    return out
+}
+
+/// The variables a path template names, in order.
+pub fn template_variables(path: str) -> [str] {
+    var out: [str] = []
+    for part in path.split("/") {
+        if part.starts_with("\{") and part.ends_with("}") and part.len() > 2 {
+            out.push(part.substr(1, part.len() - 2))
+        }
+    }
+    return out
+}
+
+/// Whether a concrete path matches a template, and what it filled in.
+pub fn match_path(template: str, path: str) -> Option[[OpenApiParameter]] {
+    let ts = template.split("/")
+    let ps = path.split("/")
+    if ts.len() != ps.len() {
+        return None
+    }
+    var out: [OpenApiParameter] = []
+    for i in 0..ts.len() {
+        if ts[i].starts_with("\{") and ts[i].ends_with("}") {
+            if ps[i] == "" {
+                return None
+            }
+            out.push(OpenApiParameter{
+                name: ts[i].substr(1, ts[i].len() - 2), location: "path",
+                required: true, schema: json.null() })
+            // The value is carried in `location` so the struct stays flat;
+            // `value_of` reads it back.
+            out[out.len() - 1] = OpenApiParameter{
+                name: ts[i].substr(1, ts[i].len() - 2), location: ps[i],
+                required: true, schema: json.null() }
+        } else {
+            if ts[i] != ps[i] {
+                return None
+            }
+        }
+    }
+    return Some(out)
+}
+
+/// How specific a template is: a concrete segment outranks a variable one.
+pub fn specificity(template: str) -> i64 {
+    var score = 0
+    for part in template.split("/") {
+        if part.starts_with("\{") {
+            score = score + 1
+        } else {
+            score = score + 10
+        }
+    }
+    return score
+}
+
+/// The operation a request reaches, if any.
+///
+/// The most specific template wins, which is the specification's rule and not
+/// document order: `/users/me` must beat `/users/{id}` however they are
+/// written down.
+pub fn route(doc: ref Json, method: str, path: str) -> Option[OpenApiMatch] {
+    var best: Option[OpenApiMatch] = None
+    var best_score = 0 - 1
+    for op in operations(doc) {
+        if op.method == method.to_upper() {
+            match match_path(op.path, path) {
+                Some(values) -> {
+                    let score = specificity(op.path)
+                    if score > best_score {
+                        best_score = score
+                        best = Some(OpenApiMatch{ operation: op,
+                            values: values })
+                    }
+                }
+                None -> {}
+            }
+        }
+    }
+    return best
+}
+
+/// The value a path variable took.
+pub fn value_of(m: OpenApiMatch, name: str) -> Option[str] {
+    for p in m.values {
+        if p.name == name {
+            return Some(p.location)
+        }
+    }
+    return None
+}
+
+/// An operation's parameters, including the ones on its path item.
+///
+/// Path-level parameters apply to every operation under that path, and an
+/// operation-level parameter with the same name and location replaces one.
+/// Reading only the operation's own list misses half the parameters in a
+/// well-written document.
+pub fn parameters_of(doc: ref Json,
+    op: OpenApiOperation) -> [OpenApiParameter] {
+    var out: [OpenApiParameter] = []
+    let paths = json.get(doc, "paths") ?? json.null()
+    let item = json.get(paths, op.path) ?? json.null()
+    for node in json.items_of(json.get(item, "parameters") ?? json.list([])) {
+        push_parameter(out, doc, node)
+    }
+    for node in json.items_of(json.get(op.node, "parameters") ??
+        json.list([])) {
+        push_parameter(out, doc, node)
+    }
+    return out
+}
+
+fn push_parameter(inout out: [OpenApiParameter], doc: ref Json,
+    node: ref Json) {
+    let resolved = follow(doc, node)
+    let name = json.as_str(json.get(resolved, "name") ?? json.null()) ?? ""
+    let location = json.as_str(json.get(resolved, "in") ?? json.null()) ?? ""
+    let required = json.as_bool(json.get(resolved, "required") ??
+        json.null()) ?? false
+    let schema = json.get(resolved, "schema") ?? json.null()
+    for i in 0..out.len() {
+        if out[i].name == name and out[i].location == location {
+            out[i] = OpenApiParameter{ name: name, location: location,
+                required: required, schema: schema }
+            return
+        }
+    }
+    out.push(OpenApiParameter{ name: name, location: location,
+        required: required, schema: schema })
+}
+
+/// Follow a `$ref` one level, or return the node unchanged.
+fn follow(doc: ref Json, node: ref Json) -> ref Json {
+    match json.as_str(json.get(node, "$ref") ?? json.null()) {
+        Some(target) -> return jsonschema.resolve(doc, target) ?? node
+        None -> return node
+    }
+}
+
+/// The schema for a request body of a media type.
+pub fn request_schema(doc: ref Json, op: OpenApiOperation,
+    media_type: str) -> Option[ref Json] {
+    let body = follow(doc, json.get(op.node, "requestBody") ?? json.null())
+    let content = json.get(body, "content") ?? json.null()
+    match json.get(content, media_type) {
+        Some(entry) -> return json.get(entry, "schema")
+        None -> return None
+    }
+}
+
+/// The schema for a response status and media type.
+pub fn response_schema(doc: ref Json, op: OpenApiOperation, status: str,
+    media_type: str) -> Option[ref Json] {
+    let responses = json.get(op.node, "responses") ?? json.null()
+    var entry = json.get(responses, status)
+    if entry == None {
+        // `default` covers whatever is not listed, which is how an error
+        // shape is usually described once.
+        entry = json.get(responses, "default")
+    }
+    match entry {
+        None -> return None
+        Some(node) -> {
+            let content = json.get(follow(doc, node), "content") ??
+            json.null()
+            match json.get(content, media_type) {
+                Some(media) -> return json.get(media, "schema")
+                None -> return None
+            }
+        }
+    }
+}
+
+/// The status codes an operation documents.
+pub fn statuses_of(op: OpenApiOperation) -> [str] {
+    return json.keys_of(json.get(op.node, "responses") ?? json.null())
+}
+
+/// The security schemes an operation requires, falling back to the document's.
+///
+/// An operation's own `security` replaces the global one rather than adding
+/// to it — including an empty list, which is how an endpoint is marked public
+/// in an otherwise authenticated API. Treating an empty list as "inherit" makes
+/// every login endpoint require a login.
+pub fn security_of(doc: ref Json, op: OpenApiOperation) -> [str] {
+    var requirements = json.get(op.node, "security")
+    if requirements == None {
+        requirements = json.get(doc, "security")
+    }
+    var out: [str] = []
+    match requirements {
+        None -> return out
+        Some(list) -> {
+            for entry in json.items_of(list) {
+                for name in json.keys_of(entry) {
+                    out.push(name)
+                }
+            }
+            return out
+        }
+    }
+}
+
+/// Whether an operation is public: it has a `security` of its own and it is
+/// empty.
+pub fn is_public(doc: ref Json, op: OpenApiOperation) -> bool {
+    match json.get(op.node, "security") {
+        Some(list) -> return json.items_of(list).len() == 0
+        None -> return json.get(doc, "security") == None
+    }
+}
+
+// ------------------------------------------------------------ validation
+
+/// Everything wrong with the document.
+///
+/// The checks a JSON Schema of OpenAPI cannot make, because they are prose in
+/// the specification: the path template and the parameter list have to agree,
+/// a path parameter has to be required, an operation has to have responses,
+/// and no two paths may match the same request.
+pub fn problems(doc: ref Json) -> [str] {
+    var out: [str] = []
+    let paths = json.get(doc, "paths") ?? json.null()
+    let names = json.keys_of(paths)
+    for op in operations(doc) {
+        let declared = parameters_of(doc, op)
+        let wanted = template_variables(op.path)
+        for v in wanted {
+            var found = false
+            for p in declared {
+                if p.name == v and p.location == "path" {
+                    found = true
+                    if not p.required {
+                        out.push(op.method + " " + op.path +
+                            ": the path parameter " + v +
+                            " must be required")
+                    }
+                }
+            }
+            if not found {
+                out.push(op.method + " " + op.path + ": the template names " +
+                    v + " and no parameter declares it")
+            }
+        }
+        for p in declared {
+            if p.location == "path" and not contains(wanted, p.name) {
+                out.push(op.method + " " + op.path +
+                    ": a path parameter " + p.name +
+                    " that the template does not name")
+            }
+        }
+        if statuses_of(op).len() == 0 {
+            out.push(op.method + " " + op.path + ": no responses")
+        }
+    }
+    for i in 0..names.len() {
+        for j in (i + 1)..names.len() {
+            if same_shape(names[i], names[j]) {
+                out.push(names[i] + " and " + names[j] +
+                    " match the same requests")
+            }
+        }
+    }
+    for target in jsonschema.refs_resolve(doc) {
+        out.push("the reference " + target + " does not resolve")
+    }
+    return out
+}
+
+fn contains(xs: [str], what: str) -> bool {
+    for x in xs {
+        if x == what {
+            return true
+        }
+    }
+    return false
+}
+
+fn same_shape(a: str, b: str) -> bool {
+    let x = a.split("/")
+    let y = b.split("/")
+    if x.len() != y.len() {
+        return false
+    }
+    for i in 0..x.len() {
+        let vx = x[i].starts_with("\{")
+        let vy = y[i].starts_with("\{")
+        if vx != vy {
+            return false
+        }
+        if not vx and x[i] != y[i] {
+            return false
+        }
+    }
+    return true
+}
+
+/// Whether the document has no problems.
+pub fn is_coherent(doc: ref Json) -> bool {
+    return problems(doc).len() == 0
+}
+
+/// The operations, one line each, for a summary.
+pub fn describe(doc: ref Json) -> [str] {
+    var out: [str] = []
+    for op in operations(doc) {
+        var line = op.method + " " + op.path
+        if op.operation_id != "" {
+            line = line + " -> " + op.operation_id
+        }
+        out.push(line)
+    }
+    return out
+}
+
+/// The component schemas the document defines.
+pub fn component_schemas(doc: ref Json) -> [str] {
+    let components = json.get(doc, "components") ?? json.null()
+    return json.keys_of(json.get(components, "schemas") ?? json.null())
+}
+
+/// A component schema by name.
+pub fn component_schema(doc: ref Json, name: str) -> Option[ref Json] {
+    let components = json.get(doc, "components") ?? json.null()
+    let schemas = json.get(components, "schemas") ?? json.null()
+    return json.get(schemas, name)
+}

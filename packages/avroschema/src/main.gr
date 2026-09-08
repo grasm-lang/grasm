@@ -1,0 +1,325 @@
+// Avro schema resolution: whether a reader can read what a writer wrote.
+//
+// `packages/avro` encodes and decodes against one schema. This answers the
+// question Avro was designed around and that a single schema cannot: a
+// producer is on version 4 and a consumer is still on version 3 — does the
+// consumer get the right answer, a wrong answer, or an error?
+//
+// The specification's resolution rules, all of which are implemented here:
+//
+// **Fields are matched by name, not by position.** Adding a field in the
+// middle is safe; reordering is safe. This is the opposite of Protocol
+// Buffers, where the number is identity and the name is not.
+//
+// **A reader field the writer does not have needs a default.** Without one
+// the reader has nothing to put there and resolution fails — which is the
+// single most common reason a deployment breaks, and it is a property of the
+// *reader's* schema, so it is the consumer that has to be fixed.
+//
+// **A writer field the reader does not have is skipped**, and the bytes still
+// have to be read to get past them. That is why dropping a field is safe and
+// why the writer's schema is carried in the file.
+//
+// **Promotion is one-way and specified**: `int` to `long`, `float` or
+// `double`; `long` to `float` or `double`; `float` to `double`; `string` to
+// `bytes` and back. Nothing else.
+//
+// **A union resolves branch by branch**, and a non-union reader can read a
+// union writer if it matches one branch — which is how a nullable field
+// becomes non-nullable.
+//
+// **An enum symbol the reader does not know is an error**, unless the reader
+// declares a default — which is why adding a symbol to an enum breaks old
+// consumers and is the second commonest deployment failure.
+//
+// Checked against `fastavro`, which implements the same rules.
+
+import avro
+
+/// Why a reader cannot read a writer.
+type AvroIncompatibility = {
+    path: str,
+    reason: str,
+}
+
+type AvroCompatError =
+    | AvroSchemaUnreadable(why: str)
+
+    /// Whether a reader schema can read data written with a writer schema.
+pub fn can_read(writer: ref AvroSchema, reader: ref AvroSchema) -> bool {
+    return incompatibilities(writer, reader).len() == 0
+}
+
+/// Every reason a reader cannot read a writer, with the path to each.
+pub fn incompatibilities(writer: ref AvroSchema,
+    reader: ref AvroSchema) -> [AvroIncompatibility] {
+    var out: [AvroIncompatibility] = []
+    compare(writer, reader, "", out, 0)
+    return out
+}
+
+fn problem(inout out: [AvroIncompatibility], path: str, reason: str) {
+    out.push(AvroIncompatibility{
+        path: if path == "" { "(root)" } else { path }, reason: reason })
+}
+
+/// Whether a writer's type may be read as a reader's, by promotion.
+///
+/// One-way, and exactly this list. `long` to `int` is not here: it is the
+/// direction that loses data, and a resolution that allowed it would truncate
+/// silently.
+pub fn promotes(from: str, to: str) -> bool {
+    if from == to {
+        return true
+    }
+    if from == "int" {
+        return to == "long" or to == "float" or to == "double"
+    }
+    if from == "long" {
+        return to == "float" or to == "double"
+    }
+    if from == "float" {
+        return to == "double"
+    }
+    if from == "string" {
+        return to == "bytes"
+    }
+    if from == "bytes" {
+        return to == "string"
+    }
+    return false
+}
+
+fn compare(writer: ref AvroSchema, reader: ref AvroSchema, path: str,
+    inout out: [AvroIncompatibility], depth: i64) {
+    if depth > 32 {
+        return
+    }
+    match reader {
+        AvroUnion(options) -> {
+            // A union reader accepts anything one of its branches accepts.
+            var ok = false
+            for option in options {
+                if incompatibilities(writer, option).len() == 0 {
+                    ok = true
+                }
+            }
+            if not ok {
+                problem(out, path, "no branch of the reader's union can read " +
+                    avro.schema_kind(writer))
+            }
+            return
+        }
+        _ -> {}
+    }
+    match writer {
+        AvroUnion(options) -> {
+            // A non-union reader must be able to read *every* branch the
+            // writer might have written, because the writer chose at runtime.
+            for option in options {
+                compare(option, reader, path, out, depth + 1)
+            }
+            return
+        }
+        _ -> {}
+    }
+    compare_same(writer, reader, path, out, depth)
+}
+
+fn compare_same(writer: ref AvroSchema, reader: ref AvroSchema, path: str,
+    inout out: [AvroIncompatibility], depth: i64) {
+    let writer_kind = avro.schema_kind(writer)
+    let reader_kind = avro.schema_kind(reader)
+    match reader {
+        AvroRecord(_rn, reader_names, reader_types) -> {
+            match writer {
+                AvroRecord(_wn, writer_names, writer_types) -> {
+                    compare_records(writer_names, writer_types, reader_names,
+                        reader_types, path, out, depth)
+                }
+                _ -> problem(out, path, "a record reader cannot read " +
+                    writer_kind)
+            }
+            return
+        }
+        AvroArray(reader_items) -> {
+            match writer {
+                AvroArray(writer_items) -> compare(writer_items, reader_items,
+                    path + "[]", out, depth + 1)
+                _ -> problem(out, path, "an array reader cannot read " +
+                    writer_kind)
+            }
+            return
+        }
+        AvroMap(reader_values) -> {
+            match writer {
+                AvroMap(writer_values) -> compare(writer_values,
+                    reader_values, path + "\{}", out, depth + 1)
+                _ -> problem(out, path, "a map reader cannot read " +
+                    writer_kind)
+            }
+            return
+        }
+        AvroEnum(_rn, reader_symbols) -> {
+            match writer {
+                AvroEnum(_wn, writer_symbols) -> {
+                    for s in writer_symbols {
+                        if not contains(reader_symbols, s) {
+                            // Adding a symbol breaks every old consumer, which
+                            // is why a schema registry rejects it under a
+                            // backward-compatibility policy.
+                            problem(out, path, "the writer may send the " +
+                                "symbol " + s + ", which the reader does " +
+                                "not know")
+                        }
+                    }
+                }
+                _ -> problem(out, path, "an enum reader cannot read " +
+                    writer_kind)
+            }
+            return
+        }
+        AvroFixed(_rn, reader_size) -> {
+            match writer {
+                AvroFixed(_wn, writer_size) -> {
+                    if writer_size != reader_size {
+                        problem(out, path, "fixed sizes differ: " +
+                            "{writer_size} against {reader_size}")
+                    }
+                }
+                _ -> problem(out, path, "a fixed reader cannot read " +
+                    writer_kind)
+            }
+            return
+        }
+        _ -> {}
+    }
+    if not promotes(writer_kind, reader_kind) {
+        problem(out, path, writer_kind + " cannot be read as " + reader_kind)
+    }
+}
+
+fn compare_records(writer_names: [str], writer_types: [ref AvroSchema],
+    reader_names: [str], reader_types: [ref AvroSchema], path: str,
+    inout out: [AvroIncompatibility], depth: i64) {
+    for i in 0..reader_names.len() {
+        let name = reader_names[i]
+        var found = 0 - 1
+        for j in 0..writer_names.len() {
+            if writer_names[j] == name {
+                found = j
+            }
+        }
+        if found < 0 {
+            // The reader wants a field the writer never sends. Without a
+            // default there is nothing to put there — and the default lives in
+            // the reader's schema, so the consumer is what has to change.
+            problem(out, child(path, name),
+                "the reader has a field the writer does not, and it needs a " +
+                "default")
+        } else {
+            compare(writer_types[found], reader_types[i], child(path, name),
+                out, depth + 1)
+        }
+    }
+}
+
+fn child(path: str, name: str) -> str {
+    if path == "" {
+        return name
+    }
+    return path + "." + name
+}
+
+fn contains(xs: [str], what: str) -> bool {
+    for x in xs {
+        if x == what {
+            return true
+        }
+    }
+    return false
+}
+
+// -------------------------------------------------------- the policies
+
+/// Whether a new schema can read data written with the old one.
+///
+/// The policy a registry calls "backward": deploy the consumer first, and it
+/// can still read what the old producers are sending.
+pub fn is_backward_compatible(old_schema: ref AvroSchema,
+    new_schema: ref AvroSchema) -> bool {
+    return can_read(old_schema, new_schema)
+}
+
+/// Whether the old schema can read data written with the new one.
+///
+/// "Forward": deploy the producer first, and the consumers that have not been
+/// updated still work. Adding a field with a default is forward compatible;
+/// removing one is not.
+pub fn is_forward_compatible(old_schema: ref AvroSchema,
+    new_schema: ref AvroSchema) -> bool {
+    return can_read(new_schema, old_schema)
+}
+
+/// Both directions, which is what lets producer and consumer be deployed in
+/// any order.
+pub fn is_fully_compatible(old_schema: ref AvroSchema,
+    new_schema: ref AvroSchema) -> bool {
+    return is_backward_compatible(old_schema, new_schema) and
+    is_forward_compatible(old_schema, new_schema)
+}
+
+/// Which policy a change satisfies, as a word.
+pub fn compatibility_of(old_schema: ref AvroSchema,
+    new_schema: ref AvroSchema) -> str {
+    let backward = is_backward_compatible(old_schema, new_schema)
+    let forward = is_forward_compatible(old_schema, new_schema)
+    if backward and forward {
+        return "full"
+    }
+    if backward {
+        return "backward"
+    }
+    if forward {
+        return "forward"
+    }
+    return "none"
+}
+
+/// The field names a record schema declares.
+pub fn field_names(s: ref AvroSchema) -> [str] {
+    match s {
+        AvroRecord(_n, names, _t) -> return names
+        _ -> return []
+    }
+}
+
+/// The fields a reader would need a default for, against a writer.
+///
+/// The list to hand a developer whose deployment failed: each of these is a
+/// field to give a default, and nothing else has to change.
+pub fn fields_needing_defaults(writer: ref AvroSchema,
+    reader: ref AvroSchema) -> [str] {
+    var out: [str] = []
+    for problem in incompatibilities(writer, reader) {
+        if problem.reason.contains("needs a default") {
+            out.push(problem.path)
+        }
+    }
+    return out
+}
+
+/// One incompatibility as a sentence.
+pub fn describe(p: AvroIncompatibility) -> str {
+    return p.path + ": " + p.reason
+}
+
+/// The name a schema goes by, for a message.
+pub fn name_of(s: ref AvroSchema) -> str {
+    match s {
+        AvroRecord(name, _f, _t) -> return name
+        AvroEnum(name, _s) -> return name
+        AvroFixed(name, _s) -> return name
+        _ -> return avro.schema_kind(s)
+    }
+}

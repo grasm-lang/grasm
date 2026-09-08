@@ -14,7 +14,7 @@ plan that discovers them 300 packages in.
 | | |
 |---|---|
 | Started | 78 |
-| Now | 249 |
+| Now | 254 |
 | Tier 1 target | 200 |
 | Tier 2 target | 500 |
 | Tier 3 target | 800 |
@@ -173,7 +173,7 @@ outside implementation wherever one exists.
 | ~~SQL~~ | ~~`sqlbuild` `sqlparse` `sqlescape` `sqlitefile` `dbschema`~~ — done |
 | ~~Web routing~~ | ~~`router` `middleware` `session` `csrf` `etag`~~ — done |
 | ~~Web content~~ | ~~`htmlparse` `cssparse` `xpath` `staticfiles` `rangeheader`~~ — done |
-| Schemas | `jsonschema` `openapi` `graphqlparse` `protoschema` `avroschema` |
+| ~~Schemas~~ | ~~`jsonschema` `openapi` `graphqlparse` `protoschema` `avroschema`~~ — done |
 | ~~Time~~ | ~~`calendar` `recurrence` `workdays` `iso8601` `humanize`~~ — done |
 | ~~Geography~~ | ~~`geojson` `geohash` `haversine` `polyline` `wkt`~~ — done |
 | ~~Linear algebra~~ | ~~`linalg` `fft` `polynomial` `quaternion` `bezier`~~ — done |

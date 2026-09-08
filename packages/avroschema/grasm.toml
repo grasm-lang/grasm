@@ -1,0 +1,10 @@
+[package]
+name = "avroschema"
+version = "1.0.0"
+
+# Comparing two schemas. Opens nothing.
+capabilities = []
+
+[dependencies.avro]
+path = "../avro"
+version = "^1.0.0"

@@ -1,0 +1,32 @@
+[package]
+name = "schema_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.jsonschema]
+path = "../jsonschema"
+version = "^1.0.0"
+
+[dependencies.openapi]
+path = "../openapi"
+version = "^1.0.0"
+
+[dependencies.graphqlparse]
+path = "../graphqlparse"
+version = "^1.0.0"
+
+[dependencies.protoschema]
+path = "../protoschema"
+version = "^1.0.0"
+
+[dependencies.avroschema]
+path = "../avroschema"
+version = "^1.0.0"
+
+[dependencies.avro]
+path = "../avro"
+version = "^1.0.0"
+
+[dependencies.json]
+path = "../json"
+version = "^1.0.0"

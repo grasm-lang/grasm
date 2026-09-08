@@ -1,0 +1,11 @@
+[package]
+name = "protoschema"
+version = "1.0.0"
+
+# Text in, a description out. Opens nothing — an `import` is recorded, not
+# followed.
+capabilities = []
+
+[dependencies.protobuf]
+path = "../protobuf"
+version = "^1.0.0"

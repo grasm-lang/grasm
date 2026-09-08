@@ -1,0 +1,869 @@
+// GraphQL: parsing a document, and the two things that make one dangerous.
+//
+// A GraphQL endpoint takes an arbitrary query, which means the client decides
+// how much work the server does. Two controls are not optional, and both need
+// a parser rather than a regular expression:
+//
+// **Depth.** `{ a { b { a { b { ... } } } } }` nested two hundred deep is one
+// small request and an enormous response. Every production endpoint limits
+// depth, and the limit has to be computed *through fragments*, because a
+// shallow-looking query that spreads a deep fragment is a deep query.
+//
+// **Fragment cycles.** A fragment that spreads itself, directly or through
+// another, makes a naive expander loop forever. The specification forbids it;
+// a parser that does not check it hands an infinite loop to anyone who asks.
+// `fragment_cycles` finds them, and `depth` refuses rather than looping.
+//
+// Also here because they are the same parse: the operations in a document,
+// the variables each one declares against the ones it uses, and a complexity
+// estimate — the field count through fragments, which is the other number a
+// rate limiter wants.
+//
+// The lexer follows the specification's oddities: a comma is whitespace, `#`
+// starts a comment, and a `"""` block string has its common indentation
+// stripped the way the specification describes. That last rule is why a
+// description in an SDL file does not carry the file's indentation into the
+// schema.
+//
+// Checked against `graphql-core`.
+
+type GqlValue =
+    | GqlInt(n: i64)
+    | GqlFloat(f: f64)
+    | GqlString(s: str)
+    | GqlBool(b: bool)
+    | GqlNull
+    | GqlEnum(name: str)
+    | GqlVariable(name: str)
+    | GqlList(items: [ref GqlValue])
+    | GqlObject(keys: [str], values: [ref GqlValue])
+
+type GqlArgument = {
+    name: str,
+    value: ref GqlValue,
+}
+
+type GqlSelection =
+    | GqlField(alias: str, name: str, arguments: [GqlArgument],
+    selections: [ref GqlSelection])
+    | GqlSpread(fragment: str)
+    | GqlInline(on_type: str, selections: [ref GqlSelection])
+
+type GqlVariableDefinition = {
+    name: str,
+    kind: str,
+    has_default: bool,
+}
+
+type GqlOperation = {
+    /// "query", "mutation" or "subscription".
+    kind: str,
+    name: str,
+    variables: [GqlVariableDefinition],
+    selections: [ref GqlSelection],
+}
+
+type GqlFragment = {
+    name: str,
+    on_type: str,
+    selections: [ref GqlSelection],
+}
+
+type GqlDocument = {
+    operations: [GqlOperation],
+    fragments: [GqlFragment],
+}
+
+type GqlError =
+    | GqlUnexpected(found: str, at: i64)
+    | GqlUnterminatedString(at: i64)
+    | GqlExpected(wanted: str, found: str, at: i64)
+    | GqlTooDeep(depth: i64)
+    | GqlFragmentCycle(name: str)
+
+type GqlLexer = {
+    source: str,
+    at: i64,
+}
+
+fn is_space(c: str) -> bool {
+    // A comma is whitespace in GraphQL, which is why `{a, b}` and `{a b}` are
+    // the same document.
+    return c == " " or c == "\t" or c == "\n" or c == "\r" or c == ","
+}
+
+fn is_name_start(c: str) -> bool {
+    return (c >= "a" and c <= "z") or (c >= "A" and c <= "Z") or c == "_"
+}
+
+fn is_name(c: str) -> bool {
+    return is_name_start(c) or (c >= "0" and c <= "9")
+}
+
+fn is_digit(c: str) -> bool {
+    return c >= "0" and c <= "9"
+}
+
+fn skip_ignored(inout l: GqlLexer) {
+    while l.at < l.source.len() {
+        let c = l.source.substr(l.at, 1)
+        if is_space(c) {
+            l.at = l.at + 1
+            continue
+        }
+        if c == "#" {
+            while l.at < l.source.len() and l.source.substr(l.at, 1) != "\n" {
+                l.at = l.at + 1
+            }
+            continue
+        }
+        return
+    }
+}
+
+fn peek(inout l: GqlLexer) -> str {
+    skip_ignored(l)
+    if l.at >= l.source.len() {
+        return ""
+    }
+    return l.source.substr(l.at, 1)
+}
+
+fn take_name(inout l: GqlLexer) -> str {
+    skip_ignored(l)
+    let start = l.at
+    while l.at < l.source.len() and is_name(l.source.substr(l.at, 1)) {
+        l.at = l.at + 1
+    }
+    return l.source.substr(start, l.at - start)
+}
+
+fn expect(inout l: GqlLexer, what: str) ! GqlError {
+    skip_ignored(l)
+    if l.source.substr(l.at, what.len()) != what {
+        fail(GqlExpected(what, l.source.substr(l.at, 1), l.at))
+    }
+    l.at = l.at + what.len()
+}
+
+fn accept(inout l: GqlLexer, what: str) -> bool {
+    skip_ignored(l)
+    if l.source.substr(l.at, what.len()) == what {
+        l.at = l.at + what.len()
+        return true
+    }
+    return false
+}
+
+/// Parse a document: its operations and its fragments.
+pub fn parse(source: str) -> GqlDocument ! GqlError {
+    var l = GqlLexer{ source: source, at: 0 }
+    var operations: [GqlOperation] = []
+    var fragments: [GqlFragment] = []
+    while peek(l) != "" {
+        if peek(l) == "\{" {
+            // A bare selection set is an anonymous query, which is what the
+            // shorthand form means.
+            operations.push(GqlOperation{ kind: "query", name: "",
+                variables: [], selections: try selection_set(l, 0) })
+            continue
+        }
+        let word = take_name(l)
+        if word == "fragment" {
+            fragments.push(try fragment(l))
+            continue
+        }
+        if word == "query" or word == "mutation" or word == "subscription" {
+            operations.push(try operation(l, word))
+            continue
+        }
+        if word == "" {
+            fail(GqlUnexpected(peek(l), l.at))
+        }
+        // Anything else at the top level is a type-system definition, which
+        // this skips rather than refuses: a document may hold both.
+        try skip_definition(l)
+    }
+    return GqlDocument{ operations: operations, fragments: fragments }
+}
+
+fn operation(inout l: GqlLexer, kind: str) -> GqlOperation ! GqlError {
+    var name = ""
+    if peek(l) != "(" and peek(l) != "\{" and peek(l) != "@" {
+        name = take_name(l)
+    }
+    var variables: [GqlVariableDefinition] = []
+    if accept(l, "(") {
+        while peek(l) != ")" and peek(l) != "" {
+            try expect(l, "$")
+            let variable_name = take_name(l)
+            try expect(l, ":")
+            let kind_text = try type_name(l)
+            var has_default = false
+            if accept(l, "=") {
+                let _v = try value(l, 0)
+                has_default = true
+            }
+            variables.push(GqlVariableDefinition{ name: variable_name,
+                kind: kind_text, has_default: has_default })
+        }
+        try expect(l, ")")
+    }
+    try skip_directives(l)
+    return GqlOperation{ kind: kind, name: name, variables: variables,
+        selections: try selection_set(l, 0) }
+}
+
+fn fragment(inout l: GqlLexer) -> GqlFragment ! GqlError {
+    let name = take_name(l)
+    let on_word = take_name(l)
+    if on_word != "on" {
+        fail(GqlExpected("on", on_word, l.at))
+    }
+    let on_type = take_name(l)
+    try skip_directives(l)
+    return GqlFragment{ name: name, on_type: on_type,
+        selections: try selection_set(l, 0) }
+}
+
+fn type_name(inout l: GqlLexer) -> str ! GqlError {
+    skip_ignored(l)
+    var out = ""
+    if accept(l, "[") {
+        out = "[" + (try type_name(l))
+        try expect(l, "]")
+        out = out + "]"
+    } else {
+        out = take_name(l)
+        if out == "" {
+            fail(GqlUnexpected(peek(l), l.at))
+        }
+    }
+    if accept(l, "!") {
+        out = out + "!"
+    }
+    return out
+}
+
+fn selection_set(inout l: GqlLexer,
+    depth: i64) -> [ref GqlSelection] ! GqlError {
+    if depth > 128 {
+        fail(GqlTooDeep(depth))
+    }
+    try expect(l, "\{")
+    var out: [ref GqlSelection] = []
+    while peek(l) != "}" and peek(l) != "" {
+        out.push(try selection(l, depth))
+    }
+    try expect(l, "}")
+    return out
+}
+
+fn selection(inout l: GqlLexer, depth: i64) -> ref GqlSelection ! GqlError {
+    if accept(l, "...") {
+        skip_ignored(l)
+        if peek(l) == "\{" {
+            return ref(GqlInline("", try selection_set(l, depth + 1)))
+        }
+        let word = take_name(l)
+        if word == "on" {
+            let on_type = take_name(l)
+            try skip_directives(l)
+            return ref(GqlInline(on_type, try selection_set(l, depth + 1)))
+        }
+        try skip_directives(l)
+        return ref(GqlSpread(word))
+    }
+    var alias = ""
+    var name = take_name(l)
+    if name == "" {
+        fail(GqlUnexpected(peek(l), l.at))
+    }
+    if accept(l, ":") {
+        alias = name
+        name = take_name(l)
+    }
+    var arguments: [GqlArgument] = []
+    if accept(l, "(") {
+        while peek(l) != ")" and peek(l) != "" {
+            let argument_name = take_name(l)
+            try expect(l, ":")
+            arguments.push(GqlArgument{ name: argument_name,
+                value: try value(l, 0) })
+        }
+        try expect(l, ")")
+    }
+    try skip_directives(l)
+    var selections: [ref GqlSelection] = []
+    skip_ignored(l)
+    if peek(l) == "\{" {
+        selections = try selection_set(l, depth + 1)
+    }
+    return ref(GqlField(alias, name, arguments, selections))
+}
+
+fn skip_directives(inout l: GqlLexer) ! GqlError {
+    while accept(l, "@") {
+        let _name = take_name(l)
+        if accept(l, "(") {
+            while peek(l) != ")" and peek(l) != "" {
+                let _argument = take_name(l)
+                try expect(l, ":")
+                let _v = try value(l, 0)
+            }
+            try expect(l, ")")
+        }
+    }
+}
+
+fn skip_definition(inout l: GqlLexer) ! GqlError {
+    // Walk to the end of the next brace-delimited block, or to the next
+    // top-level word if there is none — a `scalar Foo` has no block.
+    var depth = 0
+    while l.at < l.source.len() {
+        skip_ignored(l)
+        if l.at >= l.source.len() {
+            return
+        }
+        let c = l.source.substr(l.at, 1)
+        if c == "\"" {
+            let _s = try string_value(l)
+            continue
+        }
+        if c == "\{" {
+            depth = depth + 1
+        }
+        if c == "}" {
+            depth = depth - 1
+            l.at = l.at + 1
+            if depth == 0 {
+                return
+            }
+            continue
+        }
+        if depth == 0 and is_name_start(c) {
+            let start = l.at
+            let word = take_name(l)
+            if word == "query" or word == "mutation" or
+            word == "subscription" or word == "fragment" {
+                l.at = start
+                return
+            }
+            continue
+        }
+        l.at = l.at + 1
+    }
+}
+
+fn value(inout l: GqlLexer, depth: i64) -> ref GqlValue ! GqlError {
+    if depth > 32 {
+        fail(GqlTooDeep(depth))
+    }
+    skip_ignored(l)
+    let c = peek(l)
+    if c == "$" {
+        l.at = l.at + 1
+        return ref(GqlVariable(take_name(l)))
+    }
+    if c == "\"" {
+        return ref(GqlString(try string_value(l)))
+    }
+    if c == "[" {
+        l.at = l.at + 1
+        var items: [ref GqlValue] = []
+        while peek(l) != "]" and peek(l) != "" {
+            items.push(try value(l, depth + 1))
+        }
+        try expect(l, "]")
+        return ref(GqlList(items))
+    }
+    if c == "\{" {
+        l.at = l.at + 1
+        var keys: [str] = []
+        var values: [ref GqlValue] = []
+        while peek(l) != "}" and peek(l) != "" {
+            keys.push(take_name(l))
+            try expect(l, ":")
+            values.push(try value(l, depth + 1))
+        }
+        try expect(l, "}")
+        return ref(GqlObject(keys, values))
+    }
+    if is_digit(c) or c == "-" {
+        return try number_value(l)
+    }
+    let word = take_name(l)
+    if word == "true" {
+        return ref(GqlBool(true))
+    }
+    if word == "false" {
+        return ref(GqlBool(false))
+    }
+    if word == "null" {
+        return ref(GqlNull)
+    }
+    if word == "" {
+        fail(GqlUnexpected(c, l.at))
+    }
+    return ref(GqlEnum(word))
+}
+
+fn number_value(inout l: GqlLexer) -> ref GqlValue ! GqlError {
+    let start = l.at
+    if l.source.substr(l.at, 1) == "-" {
+        l.at = l.at + 1
+    }
+    while l.at < l.source.len() and is_digit(l.source.substr(l.at, 1)) {
+        l.at = l.at + 1
+    }
+    var floating = false
+    if l.at < l.source.len() and l.source.substr(l.at, 1) == "." {
+        floating = true
+        l.at = l.at + 1
+        while l.at < l.source.len() and is_digit(l.source.substr(l.at, 1)) {
+            l.at = l.at + 1
+        }
+    }
+    if l.at < l.source.len() and (l.source.substr(l.at, 1) == "e" or
+        l.source.substr(l.at, 1) == "E") {
+        floating = true
+        l.at = l.at + 1
+        if l.at < l.source.len() and (l.source.substr(l.at, 1) == "+" or
+            l.source.substr(l.at, 1) == "-") {
+            l.at = l.at + 1
+        }
+        while l.at < l.source.len() and is_digit(l.source.substr(l.at, 1)) {
+            l.at = l.at + 1
+        }
+    }
+    let text = l.source.substr(start, l.at - start)
+    if floating {
+        return ref(GqlFloat(text.parse_float() ?? 0.0))
+    }
+    return ref(GqlInt(text.parse_int() ?? 0))
+}
+
+/// A string, either the ordinary form or a `"""` block.
+fn string_value(inout l: GqlLexer) -> str ! GqlError {
+    skip_ignored(l)
+    if l.source.substr(l.at, 3) == "\"\"\"" {
+        let start = l.at + 3
+        var i = start
+        while i + 2 < l.source.len() + 1 {
+            if l.source.substr(i, 3) == "\"\"\"" {
+                let raw = l.source.substr(start, i - start)
+                l.at = i + 3
+                return block_string(raw)
+            }
+            i = i + 1
+        }
+        fail(GqlUnterminatedString(l.at))
+    }
+    if l.source.substr(l.at, 1) != "\"" {
+        fail(GqlExpected("a string", l.source.substr(l.at, 1), l.at))
+    }
+    var out = ""
+    var i = l.at + 1
+    while i < l.source.len() {
+        let c = l.source.substr(i, 1)
+        if c == "\\" and i + 1 < l.source.len() {
+            let next = l.source.substr(i + 1, 1)
+            if next == "n" {
+                out = out + "\n"
+            } else {
+                if next == "t" {
+                    out = out + "\t"
+                } else {
+                    if next == "u" and i + 5 < l.source.len() {
+                        let hex = l.source.substr(i + 2, 4)
+                        let code = hex.parse_int_base(16) ?? 63
+                        out = out + code.to_char()
+                        i = i + 6
+                        continue
+                    } else {
+                        out = out + next
+                    }
+                }
+            }
+            i = i + 2
+            continue
+        }
+        if c == "\"" {
+            l.at = i + 1
+            return out
+        }
+        out = out + c
+        i = i + 1
+    }
+    fail(GqlUnterminatedString(l.at))
+}
+
+/// A block string with its common indentation removed.
+///
+/// The specification's own algorithm: the first line is exempt, the smallest
+/// indentation of the remaining non-blank lines is removed from all of them,
+/// and leading and trailing blank lines go. Without it, a description written
+/// inside an indented schema carries that indentation into the API.
+pub fn block_string(raw: str) -> str {
+    let lines = raw.split("\n")
+    var common = 0 - 1
+    for i in 1..lines.len() {
+        let indent = leading_spaces(lines[i])
+        if indent < lines[i].len() {
+            if common < 0 or indent < common {
+                common = indent
+            }
+        }
+    }
+    var out: [str] = []
+    for i in 0..lines.len() {
+        if i == 0 or common <= 0 {
+            out.push(lines[i])
+        } else {
+            if lines[i].len() >= common {
+                out.push(lines[i].substr(common, lines[i].len() - common))
+            } else {
+                out.push("")
+            }
+        }
+    }
+    while out.len() > 0 and out[0].trim() == "" {
+        out.remove(0)
+    }
+    while out.len() > 0 and out[out.len() - 1].trim() == "" {
+        out.pop()
+    }
+    return out.join("\n")
+}
+
+fn leading_spaces(line: str) -> i64 {
+    var i = 0
+    while i < line.len() and (line.substr(i, 1) == " " or
+        line.substr(i, 1) == "\t") {
+        i = i + 1
+    }
+    return i
+}
+
+// ------------------------------------------------------------- analysis
+
+/// The names of the operations, with `""` for an anonymous one.
+pub fn operation_names(doc: GqlDocument) -> [str] {
+    var out: [str] = []
+    for op in doc.operations {
+        out.push(op.name)
+    }
+    return out
+}
+
+fn find_fragment(doc: GqlDocument, name: str) -> Option[GqlFragment] {
+    for f in doc.fragments {
+        if f.name == name {
+            return Some(f)
+        }
+    }
+    return None
+}
+
+/// The depth of an operation, counted through fragments.
+///
+/// Through fragments, because a two-line query that spreads a fragment which
+/// spreads another is as deep as the chain — and a depth limit that stops at
+/// the spread is a limit that does nothing.
+pub fn depth(doc: GqlDocument, op: GqlOperation) -> i64 ! GqlError {
+    var seen: [str] = []
+    return try selections_depth(doc, op.selections, seen, 0)
+}
+
+fn selections_depth(doc: GqlDocument, selections: [ref GqlSelection],
+    inout seen: [str], level: i64) -> i64 ! GqlError {
+    if level > 256 {
+        fail(GqlTooDeep(level))
+    }
+    var best = level
+    for s in selections {
+        match s {
+            GqlField(_a, _n, _args, children) -> {
+                let inner = try selections_depth(doc, children, seen,
+                    level + 1)
+                if inner > best {
+                    best = inner
+                }
+            }
+            GqlInline(_t, children) -> {
+                let inner = try selections_depth(doc, children, seen, level)
+                if inner > best {
+                    best = inner
+                }
+            }
+            GqlSpread(name) -> {
+                for s2 in seen {
+                    if s2 == name {
+                        fail(GqlFragmentCycle(name))
+                    }
+                }
+                match find_fragment(doc, name) {
+                    Some(f) -> {
+                        seen.push(name)
+                        let inner = try selections_depth(doc, f.selections,
+                            seen, level)
+                        let _done = seen.pop()
+                        if inner > best {
+                            best = inner
+                        }
+                    }
+                    None -> {}
+                }
+            }
+        }
+    }
+    return best
+}
+
+/// How many fields an operation asks for, through fragments.
+///
+/// The other number a rate limiter wants: depth bounds nesting, and this
+/// bounds breadth. A query one level deep with four hundred fields is cheap
+/// by depth and expensive to serve.
+pub fn field_count(doc: GqlDocument, op: GqlOperation) -> i64 ! GqlError {
+    var seen: [str] = []
+    return try count_fields(doc, op.selections, seen, 0)
+}
+
+fn count_fields(doc: GqlDocument, selections: [ref GqlSelection],
+    inout seen: [str], level: i64) -> i64 ! GqlError {
+    if level > 256 {
+        fail(GqlTooDeep(level))
+    }
+    var total = 0
+    for s in selections {
+        match s {
+            GqlField(_a, _n, _args, children) -> {
+                total = total + 1 +
+                (try count_fields(doc, children, seen, level + 1))
+            }
+            GqlInline(_t, children) -> total = total +
+            (try count_fields(doc, children, seen, level + 1))
+            GqlSpread(name) -> {
+                for s2 in seen {
+                    if s2 == name {
+                        fail(GqlFragmentCycle(name))
+                    }
+                }
+                match find_fragment(doc, name) {
+                    Some(f) -> {
+                        seen.push(name)
+                        total = total + (try count_fields(doc, f.selections,
+                            seen, level + 1))
+                        let _done = seen.pop()
+                    }
+                    None -> {}
+                }
+            }
+        }
+    }
+    return total
+}
+
+/// The fragments that spread themselves, directly or through others.
+///
+/// The specification forbids these, and an expander that does not check hands
+/// an infinite loop to anyone who sends one.
+pub fn fragment_cycles(doc: GqlDocument) -> [str] {
+    var out: [str] = []
+    for f in doc.fragments {
+        var seen: [str] = [f.name]
+        if reaches(doc, f.selections, f.name, seen, 0) {
+            out.push(f.name)
+        }
+    }
+    return out
+}
+
+fn reaches(doc: GqlDocument, selections: [ref GqlSelection], target: str,
+    inout seen: [str], level: i64) -> bool {
+    if level > 64 {
+        return true
+    }
+    for s in selections {
+        match s {
+            GqlField(_a, _n, _args, children) -> {
+                if reaches(doc, children, target, seen, level + 1) {
+                    return true
+                }
+            }
+            GqlInline(_t, children) -> {
+                if reaches(doc, children, target, seen, level + 1) {
+                    return true
+                }
+            }
+            GqlSpread(name) -> {
+                if name == target {
+                    return true
+                }
+                var already = false
+                for s2 in seen {
+                    if s2 == name {
+                        already = true
+                    }
+                }
+                if not already {
+                    match find_fragment(doc, name) {
+                        Some(f) -> {
+                            seen.push(name)
+                            if reaches(doc, f.selections, target, seen,
+                                level + 1) {
+                                return true
+                            }
+                        }
+                        None -> {}
+                    }
+                }
+            }
+        }
+    }
+    return false
+}
+
+/// The variables an operation uses, which is not the same as what it declares.
+pub fn variables_used(doc: GqlDocument, op: GqlOperation) -> [str] {
+    var out: [str] = []
+    var seen: [str] = []
+    gather_variables(doc, op.selections, out, seen, 0)
+    return out
+}
+
+fn gather_variables(doc: GqlDocument, selections: [ref GqlSelection],
+    inout out: [str], inout seen: [str], level: i64) {
+    if level > 64 {
+        return
+    }
+    for s in selections {
+        match s {
+            GqlField(_a, _n, arguments, children) -> {
+                for a in arguments {
+                    gather_value_variables(a.value, out)
+                }
+                gather_variables(doc, children, out, seen, level + 1)
+            }
+            GqlInline(_t, children) -> gather_variables(doc, children, out,
+                seen, level + 1)
+            GqlSpread(name) -> {
+                var already = false
+                for s2 in seen {
+                    if s2 == name {
+                        already = true
+                    }
+                }
+                if not already {
+                    seen.push(name)
+                    match find_fragment(doc, name) {
+                        Some(f) -> gather_variables(doc, f.selections, out,
+                            seen, level + 1)
+                        None -> {}
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn gather_value_variables(v: ref GqlValue, inout out: [str]) {
+    match v {
+        GqlVariable(name) -> {
+            for existing in out {
+                if existing == name {
+                    return
+                }
+            }
+            out.push(name)
+        }
+        GqlList(items) -> {
+            for item in items {
+                gather_value_variables(item, out)
+            }
+        }
+        GqlObject(_k, values) -> {
+            for value in values {
+                gather_value_variables(value, out)
+            }
+        }
+        _ -> {}
+    }
+}
+
+/// Variables declared and never used, which the specification forbids.
+pub fn unused_variables(doc: GqlDocument, op: GqlOperation) -> [str] {
+    let used = variables_used(doc, op)
+    var out: [str] = []
+    for v in op.variables {
+        var found = false
+        for u in used {
+            if u == v.name {
+                found = true
+            }
+        }
+        if not found {
+            out.push(v.name)
+        }
+    }
+    return out
+}
+
+/// Variables used and never declared, which the specification also forbids.
+pub fn undeclared_variables(doc: GqlDocument, op: GqlOperation) -> [str] {
+    var out: [str] = []
+    for u in variables_used(doc, op) {
+        var found = false
+        for v in op.variables {
+            if v.name == u {
+                found = true
+            }
+        }
+        if not found {
+            out.push(u)
+        }
+    }
+    return out
+}
+
+/// The top-level field names of an operation.
+pub fn top_fields(op: GqlOperation) -> [str] {
+    var out: [str] = []
+    for s in op.selections {
+        match s {
+            GqlField(_a, name, _args, _c) -> out.push(name)
+            _ -> {}
+        }
+    }
+    return out
+}
+
+/// An argument's value by name.
+pub fn argument(field: ref GqlSelection, name: str) -> Option[ref GqlValue] {
+    match field {
+        GqlField(_a, _n, arguments, _c) -> {
+            for a in arguments {
+                if a.name == name {
+                    return Some(a.value)
+                }
+            }
+            return None
+        }
+        _ -> return None
+    }
+}
+
+pub fn value_kind(v: ref GqlValue) -> str {
+    match v {
+        GqlInt(_n) -> return "int"
+        GqlFloat(_f) -> return "float"
+        GqlString(_s) -> return "string"
+        GqlBool(_b) -> return "boolean"
+        GqlNull -> return "null"
+        GqlEnum(_n) -> return "enum"
+        GqlVariable(_n) -> return "variable"
+        GqlList(_i) -> return "list"
+        GqlObject(_k, _v) -> return "object"
+    }
+}

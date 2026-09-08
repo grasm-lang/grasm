@@ -1,0 +1,630 @@
+// JSON Schema validation, and the parts of it that are counter-intuitive.
+//
+// Five rules that a hand-written validator almost always gets wrong, and that
+// this implements:
+//
+// **An absent keyword allows everything.** `{}` is a schema that accepts any
+// value. A validator that treats a missing `type` as "must be an object"
+// rejects valid documents, and one that treats a missing `required` as "no
+// properties allowed" rejects more.
+//
+// **`required` does not imply a type.** `{"required": ["a"]}` constrains only
+// objects; a string is valid against it, because the keyword says nothing
+// about anything that is not an object. Every keyword is like this — it
+// applies to one type and is silent about the others.
+//
+// **`additionalProperties: false` interacts with `patternProperties`.** A
+// property is "additional" only if it is matched by neither `properties` nor
+// `patternProperties`. Checking against `properties` alone rejects documents
+// the schema allows.
+//
+// **`oneOf` is exactly one, not at least one.** A value matching two branches
+// fails `oneOf` and passes `anyOf`, and using them interchangeably produces a
+// validator that accepts what it should reject.
+//
+// **An integer is a number whose value has no fractional part.** `1.0`
+// validates against `"type": "integer"`. JSON has one number type and the
+// schema's `integer` is a constraint on the value, not on the spelling.
+//
+// `$ref` resolves inside the document only: `#/$defs/name` and `#/path/to`.
+// Fetching a remote schema is a network operation, which would make every
+// validation a network call and this package a network client. A `$ref` that
+// points outside is refused by name.
+//
+// Checked against the Python `jsonschema` package, draft 2020-12.
+
+import json
+import regex
+
+/// One reason a value failed.
+type SchemaProblem = {
+    /// A JSON pointer to the offending value.
+    path: str,
+    keyword: str,
+    message: str,
+}
+
+type SchemaError =
+    | SchemaNotJson(why: str)
+    | SchemaRemoteRef(target: str)
+    | SchemaBadRef(target: str)
+    | SchemaBadPattern(pattern: str)
+    | SchemaTooDeep(depth: i64)
+
+    /// Validate a value against a schema, returning every problem.
+    ///
+    /// Every problem, not the first: a form with four bad fields should show four
+    /// messages, and a validator that stops at the first turns one round trip into
+    /// four.
+pub fn validate(schema: ref Json,
+    value: ref Json) -> [SchemaProblem] ! SchemaError {
+    var out: [SchemaProblem] = []
+    try check(schema, value, "", schema, out, 0)
+    return out
+}
+
+/// Whether a value is valid, when the reasons are not wanted.
+pub fn is_valid(schema: ref Json, value: ref Json) -> bool {
+    match validate(schema, value) {
+        Ok(problems) -> return problems.len() == 0
+        Err(_e) -> return false
+    }
+}
+
+/// Validate the text of a value against the text of a schema.
+pub fn validate_text(schema_text: str,
+    value_text: str) -> [SchemaProblem] ! SchemaError {
+    let schema = match json.parse(schema_text) {
+        Ok(v) -> v
+        Err(e) -> fail(SchemaNotJson(e.why))
+    }
+    let value = match json.parse(value_text) {
+        Ok(v) -> v
+        Err(e) -> fail(SchemaNotJson(e.why))
+    }
+    return try validate(schema, value)
+}
+
+fn problem(inout out: [SchemaProblem], path: str, keyword: str,
+    message: str) {
+    out.push(SchemaProblem{ path: if path == "" { "#" } else { path },
+        keyword: keyword, message: message })
+}
+
+fn child_path(path: str, part: str) -> str {
+    if path == "" {
+        return "#/" + part
+    }
+    return path + "/" + part
+}
+
+/// The type name JSON Schema uses for a value.
+pub fn type_of(value: ref Json) -> str {
+    match value {
+        JNull -> return "null"
+        JBool(_b) -> return "boolean"
+        JNum(_n) -> return "number"
+        JStr(_s) -> return "string"
+        JList(_i) -> return "array"
+        JObj(_k, _v) -> return "object"
+    }
+}
+
+fn is_integer(value: ref Json) -> bool {
+    match value {
+        JNum(n) -> return n == n.floor()
+        _ -> return false
+    }
+}
+
+fn type_matches(wanted: str, value: ref Json) -> bool {
+    if wanted == "integer" {
+        // `1.0` is an integer: JSON has one number type, and `integer` is a
+        // constraint on the value rather than on how it was written.
+        return is_integer(value)
+    }
+    return type_of(value) == wanted
+}
+
+fn check(schema: ref Json, value: ref Json, path: str, root: ref Json,
+    inout out: [SchemaProblem], depth: i64) ! SchemaError {
+    if depth > 64 {
+        fail(SchemaTooDeep(depth))
+    }
+    match schema {
+        JBool(allowed) -> {
+            // `true` and `false` are schemas: `false` rejects everything.
+            if not allowed {
+                problem(out, path, "false", "this schema accepts nothing")
+            }
+            return
+        }
+        JObj(_k, _v) -> {}
+        _ -> return
+    }
+    match json.get(schema, "$ref") {
+        Some(target) -> {
+            let resolved = try resolve(root, json.as_str(target) ?? "")
+            try check(resolved, value, path, root, out, depth + 1)
+            return
+        }
+        None -> {}
+    }
+    try check_type(schema, value, path, out)
+    try check_value(schema, value, path, out)
+    try check_object(schema, value, path, root, out, depth)
+    try check_array(schema, value, path, root, out, depth)
+    try check_combinators(schema, value, path, root, out, depth)
+}
+
+fn check_type(schema: ref Json, value: ref Json, path: str,
+    inout out: [SchemaProblem]) ! SchemaError {
+    match json.get(schema, "type") {
+        None -> {}
+        Some(wanted) -> {
+            match wanted {
+                JStr(name) -> {
+                    if not type_matches(name, value) {
+                        problem(out, path, "type",
+                            "expected " + name + ", found " + type_of(value))
+                    }
+                }
+                JList(names) -> {
+                    var ok = false
+                    for n in names {
+                        if type_matches(json.as_str(n) ?? "", value) {
+                            ok = true
+                        }
+                    }
+                    if not ok {
+                        problem(out, path, "type",
+                            "no listed type matches " + type_of(value))
+                    }
+                }
+                _ -> {}
+            }
+        }
+    }
+}
+
+fn check_value(schema: ref Json, value: ref Json, path: str,
+    inout out: [SchemaProblem]) ! SchemaError {
+    match json.get(schema, "const") {
+        Some(wanted) -> {
+            if not json.equal(wanted, value) {
+                problem(out, path, "const", "not the constant value")
+            }
+        }
+        None -> {}
+    }
+    match json.get(schema, "enum") {
+        Some(options) -> {
+            var ok = false
+            for o in json.items_of(options) {
+                if json.equal(o, value) {
+                    ok = true
+                }
+            }
+            if not ok {
+                problem(out, path, "enum", "not one of the allowed values")
+            }
+        }
+        None -> {}
+    }
+    match value {
+        JNum(n) -> try check_number(schema, n, path, out)
+        JStr(s) -> try check_string(schema, s, path, out)
+        _ -> {}
+    }
+}
+
+fn check_number(schema: ref Json, n: f64, path: str,
+    inout out: [SchemaProblem]) ! SchemaError {
+    match json.as_num(json.get(schema, "minimum") ?? json.null()) {
+        Some(low) -> {
+            if n < low {
+                problem(out, path, "minimum", "below the minimum")
+            }
+        }
+        None -> {}
+    }
+    match json.as_num(json.get(schema, "maximum") ?? json.null()) {
+        Some(high) -> {
+            if n > high {
+                problem(out, path, "maximum", "above the maximum")
+            }
+        }
+        None -> {}
+    }
+    match json.as_num(json.get(schema, "exclusiveMinimum") ?? json.null()) {
+        Some(low) -> {
+            if n <= low {
+                problem(out, path, "exclusiveMinimum",
+                    "at or below the exclusive minimum")
+            }
+        }
+        None -> {}
+    }
+    match json.as_num(json.get(schema, "exclusiveMaximum") ?? json.null()) {
+        Some(high) -> {
+            if n >= high {
+                problem(out, path, "exclusiveMaximum",
+                    "at or above the exclusive maximum")
+            }
+        }
+        None -> {}
+    }
+    match json.as_num(json.get(schema, "multipleOf") ?? json.null()) {
+        Some(step) -> {
+            if step > 0.0 {
+                let ratio = n / step
+                if ratio != ratio.floor() {
+                    problem(out, path, "multipleOf", "not a multiple")
+                }
+            }
+        }
+        None -> {}
+    }
+}
+
+fn check_string(schema: ref Json, s: str, path: str,
+    inout out: [SchemaProblem]) ! SchemaError {
+    match json.as_int(json.get(schema, "minLength") ?? json.null()) {
+        Some(low) -> {
+            if s.len() < low {
+                problem(out, path, "minLength", "shorter than the minimum")
+            }
+        }
+        None -> {}
+    }
+    match json.as_int(json.get(schema, "maxLength") ?? json.null()) {
+        Some(high) -> {
+            if s.len() > high {
+                problem(out, path, "maxLength", "longer than the maximum")
+            }
+        }
+        None -> {}
+    }
+    match json.as_str(json.get(schema, "pattern") ?? json.null()) {
+        Some(pattern) -> {
+            // A pattern is a *search*, not an anchored match: `"pattern":
+            // "a"` accepts `"bab"`. Anchoring it is the single most common
+            // mistake in a hand-written validator.
+            match regex.compile(pattern) {
+                Err(_e) -> fail(SchemaBadPattern(pattern))
+                Ok(r) -> {
+                    if not regex.matches(r, s) {
+                        problem(out, path, "pattern",
+                            "does not match " + pattern)
+                    }
+                }
+            }
+        }
+        None -> {}
+    }
+}
+
+fn check_object(schema: ref Json, value: ref Json, path: str, root: ref Json,
+    inout out: [SchemaProblem], depth: i64) ! SchemaError {
+    match value {
+        JObj(_k, _v) -> {}
+        _ -> return
+    }
+    let keys = json.keys_of(value)
+    match json.get(schema, "required") {
+        Some(names) -> {
+            for n in json.items_of(names) {
+                let wanted = json.as_str(n) ?? ""
+                if json.get(value, wanted) == None {
+                    problem(out, path, "required",
+                        "the property " + wanted + " is missing")
+                }
+            }
+        }
+        None -> {}
+    }
+    match json.as_int(json.get(schema, "minProperties") ?? json.null()) {
+        Some(low) -> {
+            if keys.len() < low {
+                problem(out, path, "minProperties", "too few properties")
+            }
+        }
+        None -> {}
+    }
+    match json.as_int(json.get(schema, "maxProperties") ?? json.null()) {
+        Some(high) -> {
+            if keys.len() > high {
+                problem(out, path, "maxProperties", "too many properties")
+            }
+        }
+        None -> {}
+    }
+    try check_properties(schema, value, path, root, out, depth)
+}
+
+fn check_properties(schema: ref Json, value: ref Json, path: str,
+    root: ref Json, inout out: [SchemaProblem], depth: i64) ! SchemaError {
+    let properties = json.get(schema, "properties")
+    let patterns = json.get(schema, "patternProperties")
+    for key in json.keys_of(value) {
+        let child = json.get(value, key) ?? json.null()
+        var covered = false
+        match properties {
+            Some(p) -> {
+                match json.get(p, key) {
+                    Some(sub) -> {
+                        covered = true
+                        try check(sub, child, child_path(path, key), root,
+                            out, depth + 1)
+                    }
+                    None -> {}
+                }
+            }
+            None -> {}
+        }
+        match patterns {
+            Some(p) -> {
+                for pattern in json.keys_of(p) {
+                    match regex.compile(pattern) {
+                        Err(_e) -> fail(SchemaBadPattern(pattern))
+                        Ok(r) -> {
+                            if regex.matches(r, key) {
+                                covered = true
+                                try check(json.get(p, pattern) ?? json.null(),
+                                    child, child_path(path, key), root, out,
+                                    depth + 1)
+                            }
+                        }
+                    }
+                }
+            }
+            None -> {}
+        }
+        if not covered {
+            // "Additional" means matched by neither `properties` nor
+            // `patternProperties` — checking only the first rejects documents
+            // the schema allows.
+            match json.get(schema, "additionalProperties") {
+                Some(rule) -> {
+                    // `additionalProperties: false` is a `false` schema, and
+                    // reporting it as one says "this schema accepts nothing"
+                    // where the reader wants to know which keyword rejected
+                    // the property.
+                    match rule {
+                        JBool(allowed) -> {
+                            if not allowed {
+                                problem(out, child_path(path, key),
+                                    "additionalProperties",
+                                    "the property " + key +
+                                    " is not allowed here")
+                            }
+                        }
+                        _ -> try check(rule, child, child_path(path, key),
+                            root, out, depth + 1)
+                    }
+                }
+                None -> {}
+            }
+        }
+    }
+}
+
+fn check_array(schema: ref Json, value: ref Json, path: str, root: ref Json,
+    inout out: [SchemaProblem], depth: i64) ! SchemaError {
+    match value {
+        JList(_i) -> {}
+        _ -> return
+    }
+    let items = json.items_of(value)
+    match json.as_int(json.get(schema, "minItems") ?? json.null()) {
+        Some(low) -> {
+            if items.len() < low {
+                problem(out, path, "minItems", "too few items")
+            }
+        }
+        None -> {}
+    }
+    match json.as_int(json.get(schema, "maxItems") ?? json.null()) {
+        Some(high) -> {
+            if items.len() > high {
+                problem(out, path, "maxItems", "too many items")
+            }
+        }
+        None -> {}
+    }
+    match json.get(schema, "uniqueItems") {
+        Some(flag) -> {
+            if (json.as_bool(flag) ?? false) and has_duplicate(items) {
+                problem(out, path, "uniqueItems", "the items are not unique")
+            }
+        }
+        None -> {}
+    }
+    var prefix_count = 0
+    match json.get(schema, "prefixItems") {
+        Some(prefix) -> {
+            let schemas = json.items_of(prefix)
+            prefix_count = schemas.len()
+            for i in 0..items.len() {
+                if i < schemas.len() {
+                    try check(schemas[i], items[i], child_path(path, "{i}"),
+                        root, out, depth + 1)
+                }
+            }
+        }
+        None -> {}
+    }
+    match json.get(schema, "items") {
+        Some(rule) -> {
+            // With `prefixItems` present, `items` applies to what is left —
+            // which is the 2020-12 rule, and is not what `items` meant in
+            // draft 7.
+            for i in prefix_count..items.len() {
+                try check(rule, items[i], child_path(path, "{i}"), root, out,
+                    depth + 1)
+            }
+        }
+        None -> {}
+    }
+}
+
+fn has_duplicate(items: [ref Json]) -> bool {
+    for i in 0..items.len() {
+        for j in (i + 1)..items.len() {
+            if json.equal(items[i], items[j]) {
+                return true
+            }
+        }
+    }
+    return false
+}
+
+fn check_combinators(schema: ref Json, value: ref Json, path: str,
+    root: ref Json, inout out: [SchemaProblem], depth: i64) ! SchemaError {
+    match json.get(schema, "allOf") {
+        Some(list) -> {
+            for sub in json.items_of(list) {
+                try check(sub, value, path, root, out, depth + 1)
+            }
+        }
+        None -> {}
+    }
+    match json.get(schema, "anyOf") {
+        Some(list) -> {
+            var matched = 0
+            for sub in json.items_of(list) {
+                if try matches_sub(sub, value, root, depth) {
+                    matched = matched + 1
+                }
+            }
+            if matched == 0 {
+                problem(out, path, "anyOf", "no branch matched")
+            }
+        }
+        None -> {}
+    }
+    match json.get(schema, "oneOf") {
+        Some(list) -> {
+            var matched = 0
+            for sub in json.items_of(list) {
+                if try matches_sub(sub, value, root, depth) {
+                    matched = matched + 1
+                }
+            }
+            // Exactly one. A value matching two branches fails `oneOf` and
+            // passes `anyOf`, which is the whole difference between them.
+            if matched != 1 {
+                problem(out, path, "oneOf",
+                    "{matched} branches matched, and exactly one must")
+            }
+        }
+        None -> {}
+    }
+    match json.get(schema, "not") {
+        Some(sub) -> {
+            if try matches_sub(sub, value, root, depth) {
+                problem(out, path, "not", "matched a schema it must not")
+            }
+        }
+        None -> {}
+    }
+}
+
+fn matches_sub(schema: ref Json, value: ref Json, root: ref Json,
+    depth: i64) -> bool ! SchemaError {
+    var inner: [SchemaProblem] = []
+    try check(schema, value, "", root, inner, depth + 1)
+    return inner.len() == 0
+}
+
+// ------------------------------------------------------------------ refs
+
+/// Resolve a `$ref` inside the document.
+///
+/// Only inside: a remote `$ref` is a network fetch, and a validator that made
+/// one would turn every validation into a request to somebody else's server —
+/// which is a availability dependency, a privacy leak, and an injection point
+/// all at once.
+pub fn resolve(root: ref Json, target: str) -> ref Json ! SchemaError {
+    if target == "" {
+        fail(SchemaBadRef(target))
+    }
+    if not target.starts_with("#") {
+        fail(SchemaRemoteRef(target))
+    }
+    if target == "#" {
+        return root
+    }
+    if not target.starts_with("#/") {
+        fail(SchemaBadRef(target))
+    }
+    var current = root
+    for raw in target.substr(2, target.len() - 2).split("/") {
+        let part = raw.replace("~1", "/").replace("~0", "~")
+        match json.get(current, part) {
+            Some(next) -> current = next
+            None -> {
+                match part.parse_int() {
+                    Some(index) -> {
+                        match json.at(current, index) {
+                            Some(next) -> current = next
+                            None -> fail(SchemaBadRef(target))
+                        }
+                    }
+                    None -> fail(SchemaBadRef(target))
+                }
+            }
+        }
+    }
+    return current
+}
+
+/// Every `$ref` in a schema, so they can be checked before any data arrives.
+pub fn refs_of(schema: ref Json) -> [str] {
+    var out: [str] = []
+    gather_refs(schema, out)
+    return out
+}
+
+fn gather_refs(node: ref Json, inout out: [str]) {
+    match node {
+        JObj(keys, values) -> {
+            for i in 0..keys.len() {
+                if keys[i] == "$ref" {
+                    match json.as_str(values[i]) {
+                        Some(target) -> out.push(target)
+                        None -> {}
+                    }
+                } else {
+                    gather_refs(values[i], out)
+                }
+            }
+        }
+        JList(items) -> {
+            for item in items {
+                gather_refs(item, out)
+            }
+        }
+        _ -> {}
+    }
+}
+
+/// Whether every `$ref` in a schema resolves.
+///
+/// Worth running once at start-up: a broken `$ref` otherwise surfaces only
+/// when a document happens to reach that branch.
+pub fn refs_resolve(schema: ref Json) -> [str] {
+    var out: [str] = []
+    for target in refs_of(schema) {
+        match resolve(schema, target) {
+            Ok(_v) -> {}
+            Err(_e) -> out.push(target)
+        }
+    }
+    return out
+}
+
+/// A problem rendered as one line.
+pub fn describe(p: SchemaProblem) -> str {
+    return p.path + ": " + p.keyword + ": " + p.message
+}

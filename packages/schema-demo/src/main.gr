@@ -1,0 +1,595 @@
+import jsonschema
+import openapi
+import graphqlparse
+import protoschema
+import avroschema
+import avro
+import json
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn b() -> str {
+    return (123).to_char()
+}
+
+fn e() -> str {
+    return (125).to_char()
+}
+
+// --------------------------------------------------------- jsonschema
+
+/// Whether a value is valid against a schema, both given as text.
+fn valid(schema: str, value: str) -> bool {
+    match jsonschema.validate_text(schema, value) {
+        Ok(problems) -> return problems.len() == 0
+        Err(_x) -> return false
+    }
+}
+
+fn keyword(schema: str, value: str) -> str {
+    match jsonschema.validate_text(schema, value) {
+        Ok(problems) -> {
+            if problems.len() == 0 {
+                return ""
+            }
+            return problems[0].keyword
+        }
+        Err(_x) -> return "<refused>"
+    }
+}
+
+fn check_jsonschema(inout f: i64) / {io} {
+    print("-- jsonschema: an absent keyword allows everything")
+    // Every verdict here is the one Python's `jsonschema` gives for the same
+    // pair, draft 2020-12.
+    say(f, "the empty schema accepts anything", valid(b() + e(), "42"))
+    say(f, "`false` accepts nothing", not valid("false", "42"))
+    say(f, "a type is checked", valid(b() + "\"type\": \"string\"" + e(),
+        "\"x\"") and keyword(b() + "\"type\": \"string\"" + e(), "42") ==
+        "type")
+    say(f, "1.0 is an integer, because JSON has one number type",
+        valid(b() + "\"type\": \"integer\"" + e(), "1.0"))
+    say(f, "and 1.5 is not",
+        keyword(b() + "\"type\": \"integer\"" + e(), "1.5") == "type")
+    say(f, "`required` says nothing about a string",
+        valid(b() + "\"required\": [\"a\"]" + e(), "\"x\""))
+    say(f, "and everything about an object missing the property",
+        keyword(b() + "\"type\": \"object\", \"required\": [\"a\"]" + e(),
+            b() + e()) == "required")
+    say(f, "a property's schema applies to that property",
+        keyword(b() + "\"properties\": " + b() + "\"a\": " + b() +
+            "\"type\": \"integer\"" + e() + e() + e(),
+            b() + "\"a\": \"no\"" + e()) == "type")
+    say(f, "`additionalProperties: false` refuses what is not listed",
+        keyword(b() + "\"properties\": " + b() + "\"a\": true" + e() +
+            ", \"additionalProperties\": false" + e(),
+            b() + "\"a\": 1, \"b\": 2" + e()) == "additionalProperties")
+    say(f, "but a property matched by `patternProperties` is not additional",
+        valid(b() + "\"patternProperties\": " + b() + "\"^x\": " + b() +
+            "\"type\": \"integer\"" + e() + e() + ", " +
+            "\"additionalProperties\": false" + e(), b() + "\"xa\": 1" + e()))
+    check_jsonschema_more(f)
+}
+
+fn check_jsonschema_more(inout f: i64) / {io} {
+    let two_branches = b() + "\"oneOf\": [" + b() + "\"type\": \"integer\"" +
+    e() + ", " + b() + "\"minimum\": 0" + e() + "]" + e()
+    let any_branches = b() + "\"anyOf\": [" + b() + "\"type\": \"integer\"" +
+    e() + ", " + b() + "\"minimum\": 0" + e() + "]" + e()
+    say(f, "`oneOf` is exactly one, so two matching branches fail",
+        keyword(two_branches, "1") == "oneOf")
+    say(f, "and `anyOf` is at least one, so the same value passes",
+        valid(any_branches, "1"))
+    say(f, "`not` inverts", keyword(b() + "\"not\": " + b() +
+        "\"type\": \"string\"" + e() + e(), "\"x\"") == "not")
+    say(f, "a pattern is a search, not an anchored match",
+        valid(b() + "\"pattern\": \"a\"" + e(), "\"bab\""))
+    say(f, "`enum` and `const` compare the whole value",
+        keyword(b() + "\"enum\": [1, 2]" + e(), "3") == "enum" and
+        keyword(b() + "\"const\": \"a\"" + e(), "\"b\"") == "const")
+    say(f, "a numeric bound is checked",
+        keyword(b() + "\"multipleOf\": 0.5" + e(), "1.25") == "multipleOf")
+    say(f, "`prefixItems` covers the front and `items` the rest",
+        keyword(b() + "\"prefixItems\": [" + b() + "\"type\": \"integer\"" +
+            e() + "], \"items\": " + b() + "\"type\": \"string\"" + e() + e(),
+            "[1, \"a\", 2]") == "type")
+    say(f, "`uniqueItems` compares by value, not by identity",
+        keyword(b() + "\"uniqueItems\": true" + e(), "[1, 2, 1]") ==
+        "uniqueItems")
+    // References.
+    let with_ref = b() + "\"$defs\": " + b() + "\"n\": " + b() +
+    "\"type\": \"integer\"" + e() + e() + ", \"properties\": " + b() +
+    "\"a\": " + b() + "\"$ref\": \"#/$defs/n\"" + e() + e() + e()
+    say(f, "a local `$ref` resolves and is applied",
+        keyword(with_ref, b() + "\"a\": \"no\"" + e()) == "type")
+    say(f, "a remote `$ref` is refused rather than fetched",
+        keyword(b() + "\"$ref\": \"https://example.com/s.json\"" + e(),
+            "1") == "<refused>")
+    let broken = json.parse(b() + "\"$ref\": \"#/$defs/missing\"" + e()) ??
+    json.null()
+    say(f, "and a `$ref` that does not resolve is found before any data " +
+        "arrives", jsonschema.refs_resolve(broken) == ["#/$defs/missing"])
+    say(f, "the problems come back all at once, not one at a time",
+        problem_count(b() + "\"type\": \"object\", \"required\": " +
+            "[\"a\", \"b\", \"c\"]" + e(), b() + e()) == 3)
+}
+
+fn problem_count(schema: str, value: str) -> i64 {
+    match jsonschema.validate_text(schema, value) {
+        Ok(problems) -> return problems.len()
+        Err(_x) -> return 0 - 1
+    }
+}
+
+// ------------------------------------------------------------- openapi
+
+fn api_text() -> str {
+    return b() + "\"openapi\": \"3.1.0\", \"info\": " + b() +
+    "\"title\": \"t\", \"version\": \"1\"" + e() + ", " +
+    "\"paths\": " + b() +
+    "\"/users\": " + b() + "\"get\": " + b() +
+    "\"operationId\": \"listUsers\", \"responses\": " + b() +
+    "\"200\": " + b() + "\"content\": " + b() +
+    "\"application/json\": " + b() + "\"schema\": " + b() +
+    "\"$ref\": \"#/components/schemas/User\"" + e() + e() + e() + e() +
+    e() + e() + e() + ", " +
+    "\"/users/me\": " + b() + "\"get\": " + b() +
+    "\"operationId\": \"me\", \"security\": [], \"responses\": " + b() +
+    "\"200\": " + b() + e() + e() + e() + e() + ", " +
+    "\"/users/\{id}\": " + b() +
+    "\"parameters\": [" + b() + "\"name\": \"id\", \"in\": \"path\", " +
+    "\"required\": true, \"schema\": " + b() + "\"type\": \"string\"" +
+    e() + e() + "], " +
+    "\"get\": " + b() + "\"operationId\": \"getUser\", " +
+    "\"responses\": " + b() + "\"200\": " + b() + e() + e() + e() + ", " +
+    "\"delete\": " + b() + "\"operationId\": \"deleteUser\", " +
+    "\"responses\": " + b() + "\"204\": " + b() + e() + e() + e() + e() +
+    e() + ", \"components\": " + b() + "\"schemas\": " + b() +
+    "\"User\": " + b() + "\"type\": \"object\"" + e() + e() + e() +
+    ", \"security\": [" + b() + "\"bearer\": []" + e() + "]" + e()
+}
+
+fn broken_api_text() -> str {
+    return b() + "\"openapi\": \"3.0.0\", \"paths\": " + b() +
+    "\"/items/\{id}\": " + b() + "\"get\": " + b() +
+    "\"responses\": " + b() + "\"200\": " + b() + e() + e() + e() + e() +
+    ", \"/items/\{name}\": " + b() + "\"get\": " + b() +
+    "\"parameters\": [" + b() + "\"name\": \"name\", " +
+    "\"in\": \"path\", \"schema\": " + b() + e() + e() + "], " +
+    "\"responses\": " + b() + e() + e() + e() + e() + e()
+}
+
+fn check_openapi(inout f: i64) / {io} {
+    print("-- openapi: the rules that are prose, not schema")
+    let doc = openapi.parse(api_text()) ?? json.null()
+    say(f, "the operations come out in path then method order",
+        openapi.describe(doc).len() == 4)
+    say(f, "each carries its operationId",
+        openapi.operations(doc)[0].operation_id == "listUsers")
+    // Routing.
+    say(f, "a concrete path beats a templated one, however they are ordered",
+        route_id(doc, "GET", "/users/me") == "me" and
+        route_id(doc, "GET", "/users/7") == "getUser")
+    say(f, "and the template variable's value comes back",
+        route_value(doc, "GET", "/users/7", "id") == "7")
+    say(f, "a method that is not there does not route",
+        route_id(doc, "PATCH", "/users/7") == "")
+    say(f, "a path-item parameter applies to every operation under it",
+        openapi.parameters_of(doc, operation_named(doc,
+            "deleteUser")).len() == 1)
+    say(f, "a response schema resolves through its `$ref`",
+        response_type(doc) == "object")
+    say(f, "the documented statuses are listed",
+        openapi.statuses_of(operation_named(doc, "deleteUser")) == ["204"])
+    // Security.
+    say(f, "an operation inherits the document's security",
+        openapi.security_of(doc, operation_named(doc, "listUsers")) ==
+        ["bearer"])
+    say(f, "and an empty `security` of its own makes it public, rather than " +
+        "inheriting",
+        openapi.is_public(doc, operation_named(doc, "me")) and
+        not openapi.is_public(doc, operation_named(doc, "listUsers")))
+    say(f, "a coherent document has no problems",
+        openapi.is_coherent(doc))
+    check_openapi_problems(f)
+}
+
+fn route_id(doc: ref Json, method: str, path: str) -> str {
+    match openapi.route(doc, method, path) {
+        Some(m) -> return m.operation.operation_id
+        None -> return ""
+    }
+}
+
+fn route_value(doc: ref Json, method: str, path: str, name: str) -> str {
+    match openapi.route(doc, method, path) {
+        Some(m) -> return openapi.value_of(m, name) ?? ""
+        None -> return ""
+    }
+}
+
+fn operation_named(doc: ref Json, id: str) -> OpenApiOperation {
+    for op in openapi.operations(doc) {
+        if op.operation_id == id {
+            return op
+        }
+    }
+    return OpenApiOperation{ method: "", path: "", operation_id: "",
+        summary: "", node: json.null() }
+}
+
+fn response_type(doc: ref Json) -> str {
+    let op = operation_named(doc, "listUsers")
+    match openapi.response_schema(doc, op, "200", "application/json") {
+        Some(schema) -> {
+            let target = json.as_str(json.get(schema, "$ref") ??
+                json.null()) ?? ""
+            let resolved = jsonschema.resolve(doc, target) ?? json.null()
+            return json.as_str(json.get(resolved, "type") ?? json.null()) ?? ""
+        }
+        None -> return ""
+    }
+}
+
+fn has_problem(problems: [str], fragment: str) -> bool {
+    for p in problems {
+        if p.contains(fragment) {
+            return true
+        }
+    }
+    return false
+}
+
+fn check_openapi_problems(inout f: i64) / {io} {
+    let broken = openapi.parse(broken_api_text()) ?? json.null()
+    let problems = openapi.problems(broken)
+    say(f, "a template variable with no parameter object is found",
+        has_problem(problems, "the template names id"))
+    say(f, "a path parameter that is not required is found",
+        has_problem(problems, "must be required"))
+    say(f, "an operation with no responses is found",
+        has_problem(problems, "no responses"))
+    say(f, "and two paths that match the same request are found",
+        has_problem(problems, "match the same requests"))
+    say(f, "a document that is not OpenAPI 3 is refused",
+        parse_refuses(b() + "\"swagger\": \"2.0\"" + e()))
+    say(f, "and one with no paths is refused",
+        parse_refuses(b() + "\"openapi\": \"3.0.0\"" + e()))
+}
+
+fn parse_refuses(text: str) -> bool {
+    match openapi.parse(text) {
+        Ok(_v) -> return false
+        Err(_x) -> return true
+    }
+}
+
+// -------------------------------------------------------- graphqlparse
+
+fn query_text() -> str {
+    return "# a comment\n" +
+    "query GetUser($id: ID!, $unused: Int = 3) " + b() + "\n" +
+    "  user(id: $id, tags: [\"a\", \"b\"], filter: " + b() +
+    "active: true" + e() + ") " + b() + "\n" +
+    "    id\n" +
+    "    alias: name\n" +
+    "    ...UserBits\n" +
+    "    ... on Admin " + b() + " level " + e() + "\n" +
+    "    friends " + b() + " id name " + e() + "\n" +
+    "  " + e() + "\n" + e() + "\n" +
+    "fragment UserBits on User " + b() + "\n" +
+    "  email\n" +
+    "  profile " + b() + " avatar " + b() + " url " + e() + " " + e() +
+    "\n" + e() + "\n" +
+    "mutation " + b() + " ping " + e() + "\n"
+}
+
+fn cyclic_text() -> str {
+    return "query Q " + b() + " ...A " + e() + "\n" +
+    "fragment A on T " + b() + " x ...B " + e() + "\n" +
+    "fragment B on T " + b() + " y ...A " + e() + "\n"
+}
+
+fn check_graphql(inout f: i64) / {io} {
+    print("-- graphqlparse: depth and fragment cycles are the two controls")
+    let doc = graphqlparse.parse(query_text()) ??
+    GqlDocument{ operations: [], fragments: [] }
+    // Every number here is what `graphql-core` produces for the same query.
+    say(f, "the operations are named, and an anonymous one is empty",
+        graphqlparse.operation_names(doc) == ["GetUser", ""])
+    say(f, "the second is a mutation",
+        doc.operations[1].kind == "mutation")
+    say(f, "the fragment is separate from the operations",
+        doc.fragments.len() == 1 and doc.fragments[0].on_type == "User")
+    say(f, "variable definitions carry their type and whether they defaulted",
+        doc.operations[0].variables[0].kind == "ID!" and
+        not doc.operations[0].variables[0].has_default and
+        doc.operations[0].variables[1].has_default)
+    say(f, "a comma is whitespace and `#` is a comment",
+        graphqlparse.top_fields(doc.operations[0]) == ["user"])
+    // The controls.
+    say(f, "depth counts through fragments, and is 4 here",
+        (graphqlparse.depth(doc, doc.operations[0]) ?? 0) == 4)
+    say(f, "field count is 11, which is what a complexity limit uses",
+        (graphqlparse.field_count(doc, doc.operations[0]) ?? 0) == 11)
+    let cyclic = graphqlparse.parse(cyclic_text()) ??
+    GqlDocument{ operations: [], fragments: [] }
+    say(f, "a fragment cycle is found by name",
+        graphqlparse.fragment_cycles(cyclic) == ["A", "B"])
+    say(f, "and computing depth over one refuses rather than looping forever",
+        depth_refuses(cyclic))
+    // Variables.
+    say(f, "the variables used are not the variables declared",
+        graphqlparse.variables_used(doc, doc.operations[0]) == ["id"])
+    say(f, "an unused variable is reported, which the specification forbids",
+        graphqlparse.unused_variables(doc, doc.operations[0]) == ["unused"])
+    say(f, "and an undeclared one would be too",
+        graphqlparse.undeclared_variables(doc, doc.operations[0]).len() == 0)
+    // The block-string rule.
+    say(f, "a block string loses its common indentation, as the " +
+        "specification says",
+        graphqlparse.block_string("\n    a line\n      indented\n\n" +
+            "    last\n    ") == "a line\n  indented\n\nlast")
+    say(f, "an unterminated string is refused",
+        graphql_refuses("query " + b() + " a(x: \"never ends) " + e()))
+}
+
+fn depth_refuses(doc: GqlDocument) -> bool {
+    match graphqlparse.depth(doc, doc.operations[0]) {
+        Ok(_v) -> return false
+        Err(_x) -> return true
+    }
+}
+
+fn graphql_refuses(text: str) -> bool {
+    match graphqlparse.parse(text) {
+        Ok(_v) -> return false
+        Err(_x) -> return true
+    }
+}
+
+// --------------------------------------------------------- protoschema
+
+fn proto_text() -> str {
+    return "syntax = \"proto3\";\n" +
+    "package demo;\n" +
+    "import \"other.proto\";\n" +
+    "// a comment\n" +
+    "message User " + b() + "\n" +
+    "  int32 id = 1;\n" +
+    "  string name = 2;\n" +
+    "  repeated string tags = 3;\n" +
+    "  map<string, int32> counts = 4;\n" +
+    "  reserved 5, 6;\n" +
+    "  reserved \"old_name\";\n" +
+    "  oneof contact " + b() + "\n" +
+    "    string email = 7;\n" +
+    "    string phone = 8;\n" +
+    "  " + e() + "\n" +
+    "  Address address = 20;\n" +
+    "  message Address " + b() + " string city = 1; " + e() + "\n" +
+    e() + "\n" +
+    "enum Colour " + b() + " UNKNOWN = 0; RED = 1; " + e() + "\n" +
+    "service Users " + b() + " rpc Get(User) returns (User); " + e() + "\n"
+}
+
+fn hex_of(data: bytes) -> str {
+    let digits = "0123456789abcdef"
+    var out = ""
+    for i in 0..data.len() {
+        out = out + digits.substr(data.at(i).ushr(4), 1) +
+        digits.substr(data.at(i).bit_and(15), 1)
+    }
+    return out
+}
+
+fn empty_proto_file() -> ProtoFile {
+    return ProtoFile{ syntax: "", package_name: "", imports: [], messages: [],
+        enums: [], services: [] }
+}
+
+fn empty_proto_message() -> ProtoMessage {
+    return ProtoMessage{ name: "", fields: [], reserved_numbers: [],
+        reserved_names: [], nested: [] }
+}
+
+fn user_message() -> ProtoMessage {
+    let file = protoschema.parse(proto_text()) ?? empty_proto_file()
+    return protoschema.message_by_name(file, "User") ?? empty_proto_message()
+}
+
+fn check_proto(inout f: i64) / {io} {
+    print("-- protoschema: the number is the identity, and the name is not")
+    let file = protoschema.parse(proto_text()) ?? empty_proto_file()
+    say(f, "the file's header is read",
+        file.syntax == "proto3" and file.package_name == "demo" and
+        file.imports == ["other.proto"])
+    let user = user_message()
+    say(f, "seven fields, a oneof among them",
+        user.fields.len() == 7 and user.fields[4].oneof == "contact")
+    say(f, "a repeated field and a map are labelled",
+        user.fields[2].label == "repeated" and
+        user.fields[3].map_key == "string")
+    say(f, "a nested message is recorded and parsed as its own",
+        user.nested == ["Address"] and
+        protoschema.message_by_name(file, "User.Address") != None)
+    say(f, "reserved numbers and names are kept apart",
+        user.reserved_numbers == [5, 6] and
+        user.reserved_names == ["old_name"])
+    // The tags, which are exactly specified.
+    say(f, "field 1 as a varint is 0x08 and field 2 as a string is 0x12",
+        hex_of(protoschema.tag_bytes(1, "int32")) == "08" and
+        hex_of(protoschema.tag_bytes(2, "string")) == "12")
+    say(f, "field 15 still fits in one byte and field 16 does not",
+        hex_of(protoschema.tag_bytes(15, "int32")) == "78" and
+        hex_of(protoschema.tag_bytes(16, "int32")) == "8001")
+    say(f, "so a hot field numbered above 15 costs a byte on every message",
+        protoschema.wide_tags(user) == ["address"])
+    say(f, "the implementation's own range is refused",
+        proto_refuses("message M " + b() + " int32 a = 19500; " + e()))
+    say(f, "so is a duplicated number",
+        proto_refuses("message M " + b() + " int32 a = 1; int32 b = 1; " +
+            e()))
+    say(f, "and a number outside the legal range",
+        proto_refuses("message M " + b() + " int32 a = 0; " + e()))
+    say(f, "a proto3 enum needs a zero value first",
+        protoschema.enum_has_zero(protoschema.enum_by_name(file, "Colour") ??
+            ProtoEnum{ name: "", values: [] }))
+    check_proto_compatibility(f)
+}
+
+fn proto_refuses(text: str) -> bool {
+    match protoschema.parse(text) {
+        Ok(_v) -> return false
+        Err(_x) -> return true
+    }
+}
+
+fn changed_message(source: str) -> ProtoMessage {
+    let file = protoschema.parse("syntax = \"proto3\";\n" + source) ??
+    empty_proto_file()
+    return protoschema.message_by_name(file, "M") ?? empty_proto_message()
+}
+
+fn original() -> ProtoMessage {
+    return changed_message("message M " + b() + " int32 a = 1; " +
+        "string b = 2; repeated int32 c = 3; " + e())
+}
+
+fn check_proto_compatibility(inout f: i64) / {io} {
+    say(f, "renaming a field is safe, because the name is not on the wire",
+        protoschema.is_compatible(original(), changed_message(
+            "message M " + b() + " int32 renamed = 1; string b = 2; " +
+            "repeated int32 c = 3; " + e())))
+    say(f, "widening an int is safe, because the wire type is the same",
+        protoschema.is_compatible(original(), changed_message(
+            "message M " + b() + " int64 a = 1; string b = 2; " +
+            "repeated int32 c = 3; " + e())))
+    say(f, "swapping string for bytes is safe",
+        protoschema.is_compatible(original(), changed_message(
+            "message M " + b() + " int32 a = 1; bytes b = 2; " +
+            "repeated int32 c = 3; " + e())))
+    say(f, "changing int32 to sint32 is not, because zigzag is a different " +
+        "encoding",
+        not protoschema.is_compatible(original(), changed_message(
+            "message M " + b() + " sint32 a = 1; string b = 2; " +
+            "repeated int32 c = 3; " + e())))
+    say(f, "changing a field between singular and repeated is not",
+        not protoschema.is_compatible(original(), changed_message(
+            "message M " + b() + " int32 a = 1; string b = 2; " +
+            "int32 c = 3; " + e())))
+    say(f, "removing a field without reserving its number is not",
+        not protoschema.is_compatible(original(), changed_message(
+            "message M " + b() + " int32 a = 1; string b = 2; " + e())))
+    say(f, "and removing it with the number reserved is",
+        protoschema.is_compatible(original(), changed_message(
+            "message M " + b() + " int32 a = 1; string b = 2; " +
+            "reserved 3; " + e())))
+    say(f, "the type groups are the specification's",
+        protoschema.types_compatible("int32", "uint64") and
+        protoschema.types_compatible("sint32", "sint64") and
+        not protoschema.types_compatible("int64", "sint64") and
+        not protoschema.types_compatible("fixed32", "int32"))
+}
+
+// ---------------------------------------------------------- avroschema
+
+fn schema_of(fields: str) -> ref AvroSchema {
+    return avro.parse_schema("\{\"type\": \"record\", \"name\": \"U\", " +
+        "\"fields\": [" + fields + "]}") ?? ref(AvroNull)
+}
+
+fn v1() -> ref AvroSchema {
+    return schema_of("\{\"name\": \"id\", \"type\": \"int\"}, " +
+        "\{\"name\": \"name\", \"type\": \"string\"}")
+}
+
+fn v2() -> ref AvroSchema {
+    return schema_of("\{\"name\": \"id\", \"type\": \"long\"}, " +
+        "\{\"name\": \"name\", \"type\": \"string\"}, " +
+        "\{\"name\": \"age\", \"type\": \"int\"}")
+}
+
+fn v3() -> ref AvroSchema {
+    return schema_of("\{\"name\": \"id\", \"type\": \"long\"}")
+}
+
+fn check_avroschema(inout f: i64) / {io} {
+    print("-- avroschema: fields are matched by name, and a new one needs a " +
+        "default")
+    // `fastavro` gives the same verdicts, with the same reasons.
+    say(f, "dropping a field is backward compatible: the reader skips it",
+        avroschema.can_read(v1(), v3()))
+    say(f, "adding one without a default is not",
+        not avroschema.can_read(v1(), v2()))
+    say(f, "and the field that needs the default is named",
+        avroschema.fields_needing_defaults(v1(), v2()) == ["age"])
+    say(f, "which is the same message fastavro gives",
+        avroschema.incompatibilities(v1(), v2())[0].reason.contains(
+            "needs a default"))
+    say(f, "int promotes to long, and long does not promote to int",
+        avroschema.promotes("int", "long") and
+        not avroschema.promotes("long", "int"))
+    say(f, "so v1 cannot read v3's wider id",
+        not avroschema.can_read(v3(), v1()))
+    // The policies.
+    say(f, "v1 to v3 is backward but not forward",
+        avroschema.compatibility_of(v1(), v3()) == "backward")
+    say(f, "v1 to v2 is neither",
+        avroschema.compatibility_of(v1(), v2()) == "none")
+    say(f, "and a schema is fully compatible with itself",
+        avroschema.compatibility_of(v1(), v1()) == "full")
+    // Enums, unions and the rest.
+    let enum_two = avro.parse_schema("\{\"type\": \"enum\", " +
+        "\"name\": \"C\", \"symbols\": [\"a\", \"b\"]}") ?? ref(AvroNull)
+    let enum_one = avro.parse_schema("\{\"type\": \"enum\", " +
+        "\"name\": \"C\", \"symbols\": [\"a\"]}") ?? ref(AvroNull)
+    say(f, "adding an enum symbol breaks every old reader",
+        avroschema.can_read(enum_one, enum_two) and
+        not avroschema.can_read(enum_two, enum_one))
+    let nullable = avro.parse_schema("[\"null\", \"string\"]") ?? ref(AvroNull)
+    let plain = avro.parse_schema("\"string\"") ?? ref(AvroNull)
+    say(f, "a union reader can read a non-union writer",
+        avroschema.can_read(plain, nullable))
+    say(f, "and a non-union reader cannot read a union writer, because the " +
+        "writer chose at run time",
+        not avroschema.can_read(nullable, plain))
+    say(f, "an array's element type is compared",
+        avroschema.can_read(array_of("int"), array_of("long")) and
+        not avroschema.can_read(array_of("long"), array_of("int")))
+    say(f, "and a fixed of a different size is refused",
+        not avroschema.can_read(fixed_of(4), fixed_of(8)))
+}
+
+fn array_of(kind: str) -> ref AvroSchema {
+    return avro.parse_schema("\{\"type\": \"array\", \"items\": \"" + kind +
+        "\"}") ?? ref(AvroNull)
+}
+
+fn fixed_of(size: i64) -> ref AvroSchema {
+    return avro.parse_schema("\{\"type\": \"fixed\", \"name\": \"F\", " +
+        "\"size\": {size}}") ?? ref(AvroNull)
+}
+
+fn main() / {io} {
+    var f = 0
+
+    check_jsonschema(f)
+    check_openapi(f)
+    check_graphql(f)
+    check_proto(f)
+    check_avroschema(f)
+
+    if f == 0 {
+        print("schemas: every claim held")
+    } else {
+        print("schemas: {f} failed")
+    }
+}

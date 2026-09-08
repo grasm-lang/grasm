@@ -240,5 +240,5 @@ pub fn provisioning_uri(issuer: str, account: str, secret: bytes,
     let key = encode_secret(secret)
     let label = "{issuer}:{account}"
     return "otpauth://totp/{label}?secret={key}&issuer={issuer}" +
-        "&algorithm={algorithm}&digits={digits}&period={step}"
+    "&algorithm={algorithm}&digits={digits}&period={step}"
 }

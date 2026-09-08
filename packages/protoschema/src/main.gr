@@ -1,0 +1,652 @@
+// `.proto` files: reading them, and answering the question they exist to
+// answer — is this change safe to deploy?
+//
+// `packages/protobuf` writes and reads the wire format. This reads the
+// schema, which is the other half: a field number, a wire type and a
+// compatibility rule are properties of the `.proto` file and cannot be
+// recovered from the bytes.
+//
+// The compatibility check is the point. Protocol Buffers exists so that a
+// producer and a consumer can be deployed separately, and that only works if
+// the schema changes are the safe ones. The rules are precise and almost
+// nobody remembers them:
+//
+// - **Renaming a field is safe.** The name is not on the wire.
+// - **Changing a field's number is not.** The number *is* the wire identity,
+//   and an old reader will put the new field's value into whatever used to
+//   have that number.
+// - **`int32`, `int64`, `uint32`, `uint64` and `bool` are interchangeable**,
+//   because they share a wire type and a varint encoding — but a value that
+//   does not fit truncates, and `int32` to `uint32` reinterprets a negative.
+// - **`sint32` and `sint64` are compatible with each other and with nothing
+//   else**, because zigzag is a different encoding in the same wire type: an
+//   `int32` read as `sint32` comes back halved.
+// - **`string` and `bytes` are compatible** when the bytes are valid UTF-8.
+// - **Changing between `optional` and `repeated` is not safe** for a scalar,
+//   because a repeated scalar may be packed.
+// - **Deleting a field is safe only if its number is reserved afterwards**,
+//   or a later change reuses it and every stored message is misread.
+//
+// Field numbers 19000 to 19999 are reserved by the implementation and are
+// refused here, which is the rule that produces a confusing `protoc` error
+// the first time someone picks a round number.
+
+import protobuf
+
+type ProtoField = {
+    name: str,
+    number: i64,
+    /// "optional", "repeated", "required" or "" for a proto3 singular field.
+    label: str,
+    kind: str,
+    /// For a `map<k, v>`, the key type; `""` otherwise.
+    map_key: str,
+    /// The `oneof` this belongs to, or `""`.
+    oneof: str,
+}
+
+type ProtoEnumValue = {
+    name: str,
+    number: i64,
+}
+
+type ProtoEnum = {
+    name: str,
+    values: [ProtoEnumValue],
+}
+
+type ProtoMessage = {
+    name: str,
+    fields: [ProtoField],
+    reserved_numbers: [i64],
+    reserved_names: [str],
+    nested: [str],
+}
+
+type ProtoFile = {
+    syntax: str,
+    package_name: str,
+    imports: [str],
+    messages: [ProtoMessage],
+    enums: [ProtoEnum],
+    services: [str],
+}
+
+type ProtoError =
+    | ProtoUnexpected(found: str, at: i64)
+    | ProtoBadNumber(name: str, number: i64)
+    | ProtoReservedNumber(name: str, number: i64)
+    | ProtoDuplicateNumber(name: str, number: i64)
+    | ProtoUnterminated(at: i64)
+
+    /// The largest field number the format allows.
+pub fn max_field_number() -> i64 {
+    return 536870911
+}
+
+/// Whether a number is one the implementation keeps for itself.
+///
+/// 19000 to 19999. Picking 19999 for a new field produces an error from
+/// `protoc` that names no reason, and this is the reason.
+pub fn is_implementation_reserved(number: i64) -> bool {
+    return number >= 19000 and number <= 19999
+}
+
+/// The wire type a declared type uses.
+pub fn wire_type_of(kind: str) -> WireType {
+    if kind == "fixed64" or kind == "sfixed64" or kind == "double" {
+        return Fixed64
+    }
+    if kind == "fixed32" or kind == "sfixed32" or kind == "float" {
+        return Fixed32
+    }
+    if kind == "string" or kind == "bytes" {
+        return Delimited
+    }
+    if is_scalar(kind) {
+        return Varint
+    }
+    // A message, a map and a packed repeated field are all length-delimited.
+    return Delimited
+}
+
+pub fn is_scalar(kind: str) -> bool {
+    let scalars = ["double", "float", "int32", "int64", "uint32", "uint64",
+        "sint32", "sint64", "fixed32", "fixed64", "sfixed32", "sfixed64",
+        "bool", "string", "bytes"]
+    for s in scalars {
+        if s == kind {
+            return true
+        }
+    }
+    return false
+}
+
+/// The tag byte sequence a field is written with.
+///
+/// `(number << 3) | wire_type`, as a varint. Field 1 as a varint is `0x08`,
+/// field 2 length-delimited is `0x12`, and field 16 needs two bytes — which is
+/// why the first fifteen numbers are worth saving for the fields that appear
+/// in every message.
+pub fn tag_bytes(number: i64, kind: str) -> bytes {
+    let key = number.shl(3).bit_or(protobuf.wire_number(wire_type_of(kind)))
+    return bytes_of(protobuf.write_varint(key))
+}
+
+/// How many bytes a field's tag costs.
+pub fn tag_size(number: i64) -> i64 {
+    return protobuf.write_varint(number.shl(3)).len()
+}
+
+// -------------------------------------------------------------- parsing
+
+type ProtoLexer = {
+    source: str,
+    at: i64,
+}
+
+fn is_space(c: str) -> bool {
+    return c == " " or c == "\t" or c == "\n" or c == "\r"
+}
+
+fn is_word(c: str) -> bool {
+    return (c >= "a" and c <= "z") or (c >= "A" and c <= "Z") or
+    (c >= "0" and c <= "9") or c == "_" or c == "." or c == "-"
+}
+
+fn skip_ignored(inout l: ProtoLexer) {
+    while l.at < l.source.len() {
+        let c = l.source.substr(l.at, 1)
+        if is_space(c) {
+            l.at = l.at + 1
+            continue
+        }
+        if l.source.substr(l.at, 2) == "//" {
+            while l.at < l.source.len() and l.source.substr(l.at, 1) != "\n" {
+                l.at = l.at + 1
+            }
+            continue
+        }
+        if l.source.substr(l.at, 2) == "/*" {
+            var i = l.at + 2
+            while i + 1 < l.source.len() and l.source.substr(i, 2) != "*/" {
+                i = i + 1
+            }
+            l.at = i + 2
+            continue
+        }
+        return
+    }
+}
+
+fn peek(inout l: ProtoLexer) -> str {
+    skip_ignored(l)
+    if l.at >= l.source.len() {
+        return ""
+    }
+    return l.source.substr(l.at, 1)
+}
+
+fn word(inout l: ProtoLexer) -> str {
+    skip_ignored(l)
+    let start = l.at
+    if l.at < l.source.len() and l.source.substr(l.at, 1) == "\"" {
+        var i = l.at + 1
+        while i < l.source.len() and l.source.substr(i, 1) != "\"" {
+            i = i + 1
+        }
+        let text = l.source.substr(l.at + 1, i - l.at - 1)
+        l.at = i + 1
+        return text
+    }
+    while l.at < l.source.len() and is_word(l.source.substr(l.at, 1)) {
+        l.at = l.at + 1
+    }
+    if l.at == start and l.at < l.source.len() {
+        l.at = l.at + 1
+        return l.source.substr(start, 1)
+    }
+    return l.source.substr(start, l.at - start)
+}
+
+/// Parse a `.proto` file.
+pub fn parse(source: str) -> ProtoFile ! ProtoError {
+    var l = ProtoLexer{ source: source, at: 0 }
+    var out = ProtoFile{ syntax: "proto2", package_name: "", imports: [],
+        messages: [], enums: [], services: [] }
+    while peek(l) != "" {
+        let w = word(l)
+        if w == "syntax" {
+            let _eq = word(l)
+            out.syntax = word(l)
+            let _semi = word(l)
+            continue
+        }
+        if w == "package" {
+            out.package_name = word(l)
+            let _semi = word(l)
+            continue
+        }
+        if w == "import" {
+            var target = word(l)
+            if target == "public" or target == "weak" {
+                target = word(l)
+            }
+            out.imports.push(target)
+            let _semi = word(l)
+            continue
+        }
+        if w == "message" {
+            try read_message(l, word(l), out)
+            continue
+        }
+        if w == "enum" {
+            out.enums.push(try read_enum(l, word(l)))
+            continue
+        }
+        if w == "service" {
+            out.services.push(word(l))
+            try skip_block(l)
+            continue
+        }
+        if w == "option" {
+            while peek(l) != ";" and peek(l) != "" {
+                let _t = word(l)
+            }
+            let _semi = word(l)
+            continue
+        }
+        if w == "" {
+            return out
+        }
+    }
+    return out
+}
+
+fn skip_block(inout l: ProtoLexer) ! ProtoError {
+    while peek(l) != "\{" and peek(l) != "" {
+        let _t = word(l)
+    }
+    if peek(l) == "" {
+        fail(ProtoUnterminated(l.at))
+    }
+    var depth = 0
+    while l.at < l.source.len() {
+        let c = peek(l)
+        if c == "" {
+            fail(ProtoUnterminated(l.at))
+        }
+        if c == "\{" {
+            depth = depth + 1
+        }
+        if c == "}" {
+            depth = depth - 1
+        }
+        l.at = l.at + 1
+        if depth == 0 {
+            return
+        }
+    }
+    fail(ProtoUnterminated(l.at))
+}
+
+fn read_message(inout l: ProtoLexer, name: str,
+    inout file: ProtoFile) ! ProtoError {
+    var message = ProtoMessage{ name: name, fields: [], reserved_numbers: [],
+        reserved_names: [], nested: [] }
+    if peek(l) != "\{" {
+        fail(ProtoUnexpected(peek(l), l.at))
+    }
+    l.at = l.at + 1
+    var oneof = ""
+    while peek(l) != "" {
+        if peek(l) == "}" {
+            l.at = l.at + 1
+            if oneof != "" {
+                oneof = ""
+                continue
+            }
+            file.messages.push(message)
+            return
+        }
+        if peek(l) == ";" {
+            l.at = l.at + 1
+            continue
+        }
+        let w = word(l)
+        if w == "message" {
+            let inner = word(l)
+            message.nested.push(inner)
+            try read_message(l, name + "." + inner, file)
+            continue
+        }
+        if w == "enum" {
+            file.enums.push(try read_enum(l, name + "." + word(l)))
+            continue
+        }
+        if w == "reserved" {
+            try read_reserved(l, message)
+            continue
+        }
+        if w == "oneof" {
+            oneof = word(l)
+            if peek(l) == "\{" {
+                l.at = l.at + 1
+            }
+            continue
+        }
+        if w == "option" {
+            while peek(l) != ";" and peek(l) != "" {
+                let _t = word(l)
+            }
+            continue
+        }
+        try read_field(l, w, oneof, message)
+    }
+    fail(ProtoUnterminated(l.at))
+}
+
+fn read_reserved(inout l: ProtoLexer,
+    inout message: ProtoMessage) ! ProtoError {
+    while peek(l) != ";" and peek(l) != "" {
+        let t = word(l)
+        if t == "," or t == "to" {
+            continue
+        }
+        match t.parse_int() {
+            Some(n) -> message.reserved_numbers.push(n)
+            None -> message.reserved_names.push(t)
+        }
+    }
+    if peek(l) == ";" {
+        l.at = l.at + 1
+    }
+}
+
+fn read_field(inout l: ProtoLexer, first: str, oneof: str,
+    inout message: ProtoMessage) ! ProtoError {
+    var label = ""
+    var kind = first
+    if first == "repeated" or first == "optional" or first == "required" {
+        label = first
+        kind = word(l)
+    }
+    var map_key = ""
+    if kind == "map" {
+        // `map<string, int32>` is a repeated message of key/value pairs on
+        // the wire, which is why its wire type is length-delimited and why a
+        // map field cannot be packed.
+        if peek(l) == "<" {
+            l.at = l.at + 1
+        }
+        map_key = word(l)
+        if peek(l) == "," {
+            l.at = l.at + 1
+        }
+        kind = word(l)
+        if peek(l) == ">" {
+            l.at = l.at + 1
+        }
+    }
+    let name = word(l)
+    if peek(l) == "=" {
+        l.at = l.at + 1
+    }
+    let number_text = word(l)
+    let number = number_text.parse_int() ?? 0
+    if number < 1 or number > max_field_number() {
+        fail(ProtoBadNumber(name, number))
+    }
+    if is_implementation_reserved(number) {
+        fail(ProtoReservedNumber(name, number))
+    }
+    for f in message.fields {
+        if f.number == number {
+            fail(ProtoDuplicateNumber(name, number))
+        }
+    }
+    // Field options in `[...]` are skipped.
+    if peek(l) == "[" {
+        while peek(l) != "]" and peek(l) != "" {
+            l.at = l.at + 1
+        }
+        l.at = l.at + 1
+    }
+    if peek(l) == ";" {
+        l.at = l.at + 1
+    }
+    message.fields.push(ProtoField{ name: name, number: number, label: label,
+        kind: kind, map_key: map_key, oneof: oneof })
+}
+
+fn read_enum(inout l: ProtoLexer, name: str) -> ProtoEnum ! ProtoError {
+    if peek(l) != "\{" {
+        fail(ProtoUnexpected(peek(l), l.at))
+    }
+    l.at = l.at + 1
+    var values: [ProtoEnumValue] = []
+    while peek(l) != "" {
+        if peek(l) == "}" {
+            l.at = l.at + 1
+            return ProtoEnum{ name: name, values: values }
+        }
+        if peek(l) == ";" {
+            l.at = l.at + 1
+            continue
+        }
+        let value_name = word(l)
+        if value_name == "option" or value_name == "reserved" {
+            while peek(l) != ";" and peek(l) != "" {
+                let _t = word(l)
+            }
+            continue
+        }
+        if peek(l) == "=" {
+            l.at = l.at + 1
+        }
+        let number = word(l).parse_int() ?? 0
+        if peek(l) == "[" {
+            while peek(l) != "]" and peek(l) != "" {
+                l.at = l.at + 1
+            }
+            l.at = l.at + 1
+        }
+        values.push(ProtoEnumValue{ name: value_name, number: number })
+    }
+    fail(ProtoUnterminated(l.at))
+}
+
+// -------------------------------------------------------- compatibility
+
+/// Whether two declared types can be swapped without breaking the wire.
+///
+/// The groups are the specification's: the varint scalars are interchangeable,
+/// the zigzag pair is its own group, the fixed widths are theirs, and
+/// `string` and `bytes` are one another's. Anything else is a different
+/// encoding and an old reader will misread it.
+pub fn types_compatible(before: str, after: str) -> bool {
+    if before == after {
+        return true
+    }
+    let varints = ["int32", "int64", "uint32", "uint64", "bool"]
+    if contains(varints, before) and contains(varints, after) {
+        return true
+    }
+    let zigzag = ["sint32", "sint64"]
+    if contains(zigzag, before) and contains(zigzag, after) {
+        return true
+    }
+    if (before == "fixed32" and after == "sfixed32") or
+    (before == "sfixed32" and after == "fixed32") {
+        return true
+    }
+    if (before == "fixed64" and after == "sfixed64") or
+    (before == "sfixed64" and after == "fixed64") {
+        return true
+    }
+    if (before == "string" and after == "bytes") or
+    (before == "bytes" and after == "string") {
+        return true
+    }
+    return false
+}
+
+fn contains(xs: [str], what: str) -> bool {
+    for x in xs {
+        if x == what {
+            return true
+        }
+    }
+    return false
+}
+
+/// What breaks between two versions of a message.
+///
+/// The check that decides whether a schema change can be deployed. Every
+/// entry is a sentence naming the field and the reason.
+pub fn incompatibilities(before: ProtoMessage,
+    after: ProtoMessage) -> [str] {
+    var out: [str] = []
+    for old in before.fields {
+        match field_by_number(after, old.number) {
+            None -> {
+                if not reserved(after, old.number) {
+                    out.push("field " + old.name + " (" + "{old.number}" +
+                        ") was removed and its number is not reserved, so a " +
+                        "later field can take it and misread old messages")
+                }
+            }
+            Some(fresh) -> {
+                if not types_compatible(old.kind, fresh.kind) {
+                    out.push("field " + "{old.number}" + " changed from " +
+                        old.kind + " to " + fresh.kind +
+                        ", which is a different encoding")
+                }
+                if (old.label == "repeated") != (fresh.label == "repeated") {
+                    out.push("field " + "{old.number}" + " changed between " +
+                        "singular and repeated, which changes how it is " +
+                        "framed")
+                }
+                if old.oneof != fresh.oneof {
+                    out.push("field " + "{old.number}" +
+                        " moved into or out of a oneof, which changes " +
+                        "which fields it clears")
+                }
+            }
+        }
+    }
+    for fresh in after.fields {
+        if field_by_number(before, fresh.number) == None and
+        reserved(before, fresh.number) {
+            out.push("field " + fresh.name + " (" + "{fresh.number}" +
+                ") uses a number the previous version reserved")
+        }
+    }
+    return out
+}
+
+/// Whether a change is safe to deploy.
+pub fn is_compatible(before: ProtoMessage, after: ProtoMessage) -> bool {
+    return incompatibilities(before, after).len() == 0
+}
+
+fn field_by_number(m: ProtoMessage, number: i64) -> Option[ProtoField] {
+    for f in m.fields {
+        if f.number == number {
+            return Some(f)
+        }
+    }
+    return None
+}
+
+fn reserved(m: ProtoMessage, number: i64) -> bool {
+    for n in m.reserved_numbers {
+        if n == number {
+            return true
+        }
+    }
+    return false
+}
+
+// ------------------------------------------------------------- reading
+
+pub fn message_by_name(file: ProtoFile, name: str) -> Option[ProtoMessage] {
+    for m in file.messages {
+        if m.name == name {
+            return Some(m)
+        }
+    }
+    return None
+}
+
+pub fn field_by_name(m: ProtoMessage, name: str) -> Option[ProtoField] {
+    for f in m.fields {
+        if f.name == name {
+            return Some(f)
+        }
+    }
+    return None
+}
+
+pub fn enum_by_name(file: ProtoFile, name: str) -> Option[ProtoEnum] {
+    for e in file.enums {
+        if e.name == name {
+            return Some(e)
+        }
+    }
+    return None
+}
+
+/// Whether an enum is usable in proto3, which requires a zero value first.
+///
+/// The zero value is what an absent field decodes to, so an enum without one
+/// has no representation for "not set" — and proto3 refuses it for that
+/// reason rather than as a style rule.
+pub fn enum_has_zero(e: ProtoEnum) -> bool {
+    return e.values.len() > 0 and e.values[0].number == 0
+}
+
+/// The field numbers a message uses, in order.
+pub fn numbers_of(m: ProtoMessage) -> [i64] {
+    var out: [i64] = []
+    for f in m.fields {
+        out.push(f.number)
+    }
+    return out
+}
+
+/// Fields numbered above 15, whose tag costs an extra byte.
+///
+/// Worth knowing for a message sent millions of times: the first fifteen
+/// numbers have a one-byte tag and everything above has two, so a hot field
+/// numbered 20 costs a byte on every message forever.
+pub fn wide_tags(m: ProtoMessage) -> [str] {
+    var out: [str] = []
+    for f in m.fields {
+        if tag_size(f.number) > 1 {
+            out.push(f.name)
+        }
+    }
+    return out
+}
+
+/// A message, one line a field.
+pub fn describe(m: ProtoMessage) -> [str] {
+    var out: [str] = []
+    for f in m.fields {
+        var line = "{f.number} " + f.name + ": "
+        if f.label != "" {
+            line = line + f.label + " "
+        }
+        if f.map_key != "" {
+            line = line + "map<" + f.map_key + ", " + f.kind + ">"
+        } else {
+            line = line + f.kind
+        }
+        if f.oneof != "" {
+            line = line + " (oneof " + f.oneof + ")"
+        }
+        out.push(line)
+    }
+    return out
+}

@@ -1,0 +1,6 @@
+[package]
+name = "graphqlparse"
+version = "1.0.0"
+
+# Text in, a tree out. Opens nothing.
+capabilities = []

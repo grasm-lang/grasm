@@ -1,0 +1,14 @@
+[package]
+name = "openapi"
+version = "1.0.0"
+
+# Reading a document. Opens nothing — a `$ref` may only point inside it.
+capabilities = []
+
+[dependencies.json]
+path = "../json"
+version = "^1.0.0"
+
+[dependencies.jsonschema]
+path = "../jsonschema"
+version = "^1.0.0"
