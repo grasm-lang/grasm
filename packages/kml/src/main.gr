@@ -1,0 +1,355 @@
+// KML, and the coordinate order that catches everybody.
+//
+// KML is Google Earth's format and now an OGC standard, and it is what a
+// great deal of published geographic data arrives in: council boundaries,
+// flight paths, survey plots, the layer somebody exported from a GIS.
+//
+// ## Longitude first
+//
+// A KML coordinate is `longitude,latitude,altitude`. GPX writes
+// `lat="..." lon="..."`. GeoJSON writes `[longitude, latitude]`. Almost every
+// mapping API takes latitude first. So half the formats in use put longitude
+// first and half put latitude first, and swapping them silently produces a
+// point that is usually still on Earth — the Gulf of Guinea, if both are
+// small — and occasionally in the sea off Somalia.
+//
+// It is the single most common bug in geographic software and it does not
+// crash. `(51.5, -0.1)` swapped is a point in Antarctica, which is at least
+// obvious; `(45, 45)` swapped is a different valid place entirely.
+//
+// ## The altitude that is optional and the comma that is not
+//
+// A coordinate tuple is two or three numbers separated by commas with **no
+// spaces**, and tuples are separated by whitespace. So
+// `-0.1,51.5 -0.2,51.6` is two points and `-0.1, 51.5` is a parse error in
+// every conformant reader and an accepted typo in most real ones.
+//
+// ## Polygons have holes and a winding rule nobody enforces
+//
+// A polygon is an outer boundary and any number of inner ones. The
+// specification says nothing about winding order, so a renderer cannot use it
+// to tell an outer ring from an inner one — which is why the holes are in a
+// separate element rather than inferred, and why converting KML to a format
+// that *does* use winding needs the rings reordered.
+//
+// ## What this is not
+//
+// Styles, network links, time spans, ground overlays and the rest of KML's
+// enormous surface. This reads and writes the geometry, which is what a
+// program consuming published data actually needs.
+//
+// Checked against Python's own XML parser reading the same documents.
+
+type KmlError =
+    | NotKml(text: str)
+    | BadCoordinate(text: str)
+    | Truncated(at: i64)
+
+type KmlPoint = {
+    longitude: f64,
+    latitude: f64,
+    altitude: f64,
+    has_altitude: bool,
+}
+
+type KmlGeometry = {
+    /// `Point`, `LineString`, `Polygon`, or the empty string for none.
+    kind: str,
+    /// A point's single coordinate, a line's vertices, or a polygon's outer
+    /// ring.
+    coordinates: [KmlPoint],
+    /// A polygon's holes, one list each.
+    holes: [[KmlPoint]],
+}
+
+type Placemark = {
+    name: str,
+    description: str,
+    geometry: KmlGeometry,
+}
+
+type KmlDocument = {
+    name: str,
+    placemarks: [Placemark],
+}
+
+fn find_from(text: str, needle: str, at: i64) -> i64 {
+    var i = at
+    while i + needle.len() <= text.len() {
+        if text.substr(i, needle.len()) == needle {
+            return i
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+fn find(text: str, needle: str) -> i64 {
+    return find_from(text, needle, 0)
+}
+
+/// The text of the first named element, or the empty string.
+pub fn element(text: str, name: str) -> str {
+    return element_from(text, name, 0).0
+}
+
+fn element_from(text: str, name: str, at: i64) -> (str, i64) {
+    let open = find_from(text, "<" + name, at)
+    if open < 0 {
+        return ("", 0 - 1)
+    }
+    let head = find_from(text, ">", open)
+    if head < 0 {
+        return ("", 0 - 1)
+    }
+    if head > open and text.substr(head - 1, 1) == "/" {
+        return ("", head + 1)
+    }
+    let close = find_from(text, "</" + name + ">", head)
+    if close < 0 {
+        return ("", 0 - 1)
+    }
+    return (text.substr(head + 1, close - head - 1),
+        close + name.len() + 3)
+}
+
+/// A coordinate list parsed.
+///
+/// Tuples separated by whitespace, numbers within a tuple separated by commas
+/// and nothing else. Longitude first — which is the opposite of GPX and of
+/// most mapping APIs, and swapping them gives a point that is usually still
+/// on Earth.
+pub fn coordinates(text: str) -> [KmlPoint] ! KmlError {
+    var out: [KmlPoint] = []
+    for chunk in split_whitespace(text) {
+        if chunk == "" {
+            continue
+        }
+        let parts = chunk.split(",")
+        if parts.len() < 2 {
+            fail(BadCoordinate(chunk))
+        }
+        var point = KmlPoint{
+            longitude: parts[0].parse_float() ?? 0.0,
+            latitude: parts[1].parse_float() ?? 0.0,
+            altitude: 0.0, has_altitude: false }
+        if parts.len() > 2 and parts[2] != "" {
+            point.altitude = parts[2].parse_float() ?? 0.0
+            point.has_altitude = true
+        }
+        out.push(point)
+    }
+    return out
+}
+
+fn split_whitespace(text: str) -> [str] {
+    var out: [str] = []
+    var current = ""
+    for code in text.codes() {
+        if code == 32 or code == 9 or code == 10 or code == 13 {
+            if current != "" {
+                out.push(current)
+                current = ""
+            }
+            continue
+        }
+        current = current + code.to_char()
+    }
+    if current != "" {
+        out.push(current)
+    }
+    return out
+}
+
+/// A document parsed.
+pub fn parse(text: str) -> KmlDocument ! KmlError {
+    if find(text, "<kml") < 0 {
+        fail(NotKml(head_of(text)))
+    }
+    var out = KmlDocument{ name: element(text, "name"), placemarks: [] }
+    var at = 0
+    while true {
+        let open = find_from(text, "<Placemark", at)
+        if open < 0 {
+            return out
+        }
+        let close = find_from(text, "</Placemark>", open)
+        if close < 0 {
+            return out
+        }
+        let body = text.substr(open, close - open)
+        out.placemarks.push(Placemark{ name: element(body, "name"),
+            description: element(body, "description"),
+            geometry: try geometry_of(body) })
+        at = close + 1
+    }
+    return out
+}
+
+fn head_of(text: str) -> str {
+    if text.len() < 20 {
+        return text
+    }
+    return text.substr(0, 20)
+}
+
+fn geometry_of(body: str) -> KmlGeometry ! KmlError {
+    if find(body, "<Point") >= 0 {
+        return KmlGeometry{ kind: "Point",
+            coordinates: try coordinates(element(body, "coordinates")),
+            holes: [] }
+    }
+    if find(body, "<LineString") >= 0 {
+        return KmlGeometry{ kind: "LineString",
+            coordinates: try coordinates(element(body, "coordinates")),
+            holes: [] }
+    }
+    if find(body, "<Polygon") >= 0 {
+        return try polygon_of(body)
+    }
+    return KmlGeometry{ kind: "", coordinates: [], holes: [] }
+}
+
+fn polygon_of(body: str) -> KmlGeometry ! KmlError {
+    let outer = element(body, "outerBoundaryIs")
+    var out = KmlGeometry{ kind: "Polygon",
+        coordinates: try coordinates(element(outer, "coordinates")),
+        holes: [] }
+    // Holes are a separate element rather than inferred from winding, because
+    // the specification says nothing about winding order and a renderer
+    // cannot use it.
+    var at = 0
+    while true {
+        let found = element_from(body, "innerBoundaryIs", at)
+        if found.1 < 0 {
+            return out
+        }
+        if found.0 != "" {
+            out.holes.push(try coordinates(element(found.0, "coordinates")))
+        }
+        at = found.1
+    }
+    return out
+}
+
+/// How many placemarks the document holds.
+pub fn placemark_count(document: KmlDocument) -> i64 {
+    return document.placemarks.len()
+}
+
+/// The placemarks of one geometry kind.
+pub fn of_kind(document: KmlDocument, kind: str) -> [Placemark] {
+    var out: [Placemark] = []
+    for placemark in document.placemarks {
+        if placemark.geometry.kind == kind {
+            out.push(placemark)
+        }
+    }
+    return out
+}
+
+/// A ring's area in square degrees, signed — positive anticlockwise.
+///
+/// Not an area on the Earth: it is the shoelace formula on raw degrees, which
+/// is meaningless as a quantity and exactly right as a *sign*, which is what
+/// tells one winding from the other.
+pub fn signed_ring_area(ring: [KmlPoint]) -> f64 {
+    if ring.len() < 3 {
+        return 0.0
+    }
+    var total = 0.0
+    var i = 0
+    while i < ring.len() {
+        let a = ring[i]
+        let b = ring[(i + 1) % ring.len()]
+        total = total + (a.longitude * b.latitude - b.longitude * a.latitude)
+        i = i + 1
+    }
+    return total / 2.0
+}
+
+/// Whether a ring is wound anticlockwise.
+pub fn is_anticlockwise(ring: [KmlPoint]) -> bool {
+    return signed_ring_area(ring) > 0.0
+}
+
+/// A ring reversed, which is how a converter fixes winding for a format that
+/// cares.
+pub fn reverse_ring(ring: [KmlPoint]) -> [KmlPoint] {
+    return ring.rev()
+}
+
+/// Whether a ring's first and last points are the same, which KML requires
+/// and real documents sometimes omit.
+pub fn is_closed(ring: [KmlPoint]) -> bool {
+    if ring.len() < 2 {
+        return false
+    }
+    let first = ring[0]
+    let last = ring[ring.len() - 1]
+    return first.longitude == last.longitude and
+    first.latitude == last.latitude
+}
+
+/// A ring with its first point repeated at the end, if it was not already.
+pub fn close_ring(ring: [KmlPoint]) -> [KmlPoint] {
+    if ring.len() < 2 or is_closed(ring) {
+        return ring
+    }
+    var out = ring
+    out.push(ring[0])
+    return out
+}
+
+/// A coordinate written the way KML writes it.
+pub fn show_point(point: KmlPoint) -> str {
+    if point.has_altitude {
+        return "{point.longitude},{point.latitude},{point.altitude}"
+    }
+    return "{point.longitude},{point.latitude}"
+}
+
+/// A document written back out.
+pub fn write(document: KmlDocument) -> str {
+    var out = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+    out = out + "<kml xmlns=\"http://www.opengis.net/kml/2.2\">\n"
+    out = out + "  <Document>\n    <name>" + document.name + "</name>\n"
+    for placemark in document.placemarks {
+        out = out + "    <Placemark>\n      <name>" + placemark.name +
+        "</name>\n"
+        out = out + write_geometry(placemark.geometry)
+        out = out + "    </Placemark>\n"
+    }
+    return out + "  </Document>\n</kml>\n"
+}
+
+fn write_geometry(geometry: KmlGeometry) -> str {
+    if geometry.kind == "" {
+        return ""
+    }
+    if geometry.kind == "Polygon" {
+        var out = "      <Polygon>\n        <outerBoundaryIs>\n" +
+        "          <LinearRing>\n            <coordinates>" +
+        joined(geometry.coordinates) +
+        "</coordinates>\n          </LinearRing>\n" +
+        "        </outerBoundaryIs>\n"
+        for hole in geometry.holes {
+            out = out + "        <innerBoundaryIs>\n" +
+            "          <LinearRing>\n            <coordinates>" +
+            joined(hole) + "</coordinates>\n" +
+            "          </LinearRing>\n        </innerBoundaryIs>\n"
+        }
+        return out + "      </Polygon>\n"
+    }
+    return "      <" + geometry.kind + ">\n        <coordinates>" +
+    joined(geometry.coordinates) + "</coordinates>\n      </" +
+    geometry.kind + ">\n"
+}
+
+fn joined(points: [KmlPoint]) -> str {
+    var parts: [str] = []
+    for point in points {
+        parts.push(show_point(point))
+    }
+    return parts.join(" ")
+}

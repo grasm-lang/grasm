@@ -1,0 +1,24 @@
+[package]
+name = "geo2_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.geodesic]
+path = "../geodesic"
+version = "^1.0.0"
+
+[dependencies.utm]
+path = "../utm"
+version = "^1.0.0"
+
+[dependencies.mgrs]
+path = "../mgrs"
+version = "^1.0.0"
+
+[dependencies.gpx]
+path = "../gpx"
+version = "^1.0.0"
+
+[dependencies.kml]
+path = "../kml"
+version = "^1.0.0"

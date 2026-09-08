@@ -1,0 +1,261 @@
+// UTM: sixty flat maps instead of one round one.
+//
+// A map is flat and the Earth is not, so every projection distorts something.
+// UTM's answer is to give up on one map: cut the world into sixty north-south
+// strips six degrees wide, project each onto its own cylinder, and accept that
+// the strips do not join up. Inside a strip the distortion is under one part
+// in a thousand, which is why every military map, most national grids and
+// every surveyor's total station work in UTM.
+//
+// The price is that a coordinate is meaningless without its zone, and that
+// two points a kilometre apart across a zone boundary have completely
+// different numbers. Software that drops the zone — and a great deal does,
+// because the numbers look self-sufficient — produces positions hundreds of
+// kilometres out.
+//
+// ## The scale factor that is not one
+//
+// Each zone's central meridian is scaled by **0.9996**, not 1. Making the
+// cylinder slightly too small trades a maximum error of 1/2500 at the
+// meridian for the same error at the zone edge instead of double it at the
+// edge and none in the middle. It is a deliberate, uniform compromise, and it
+// is why a UTM easting of exactly 500,000 is not exactly on the central
+// meridian's true scale.
+//
+// ## The false easting and northing
+//
+// Eastings are offset by 500,000 metres so a coordinate inside a zone is
+// never negative. Northings in the southern hemisphere are offset by
+// 10,000,000 for the same reason — which means the same northing occurs twice
+// on Earth and a coordinate needs its hemisphere as well as its zone.
+//
+// ## The zones that are wrong on purpose
+//
+// Zone 32 is widened at Norway's latitude so that southwestern Norway is not
+// split, and zones 31, 33, 35 and 37 are rearranged around Svalbard. Both
+// exceptions date from the 1950s, both are in the standard, and software that
+// computes the zone from the longitude alone is wrong in exactly those two
+// places — which are, inconveniently, places with a lot of survey activity.
+//
+// Checked against `pyproj`.
+
+import geodesic
+
+type UtmError =
+    | OutOfRange(latitude: f64)
+    | BadZone(zone: i64)
+
+type UtmPoint = {
+    zone: i64,
+    /// True for the northern hemisphere.
+    north: bool,
+    easting: f64,
+    northing: f64,
+}
+
+fn pi() -> f64 {
+    return 3.141592653589793
+}
+
+fn radians(d: f64) -> f64 {
+    return d * pi() / 180.0
+}
+
+fn to_degrees(r: f64) -> f64 {
+    return r * 180.0 / pi()
+}
+
+/// The scale applied along each zone's central meridian.
+pub fn scale_factor() -> f64 {
+    return 0.9996
+}
+
+/// The offset added to every easting so none is negative.
+pub fn false_easting() -> f64 {
+    return 500000.0
+}
+
+/// The offset added to southern northings, for the same reason.
+pub fn false_northing() -> f64 {
+    return 10000000.0
+}
+
+/// The zone a longitude falls in, with Norway's and Svalbard's exceptions.
+///
+/// Computing this from the longitude alone is right everywhere except two
+/// places, and both of them are in the standard.
+pub fn zone_for(latitude: f64, longitude: f64) -> i64 {
+    var lon = longitude
+    while lon < 0.0 - 180.0 {
+        lon = lon + 360.0
+    }
+    while lon >= 180.0 {
+        lon = lon - 360.0
+    }
+    var zone = ((lon + 180.0) / 6.0).as_i64() + 1
+    // Southwestern Norway: zone 32 is widened so Bergen is not split.
+    if latitude >= 56.0 and latitude < 64.0 and lon >= 3.0 and lon < 12.0 {
+        zone = 32
+    }
+    // Svalbard: four zones rearranged.
+    if latitude >= 72.0 and latitude < 84.0 {
+        if lon >= 0.0 and lon < 9.0 {
+            zone = 31
+        } else if lon >= 9.0 and lon < 21.0 {
+            zone = 33
+        } else if lon >= 21.0 and lon < 33.0 {
+            zone = 35
+        } else if lon >= 33.0 and lon < 42.0 {
+            zone = 37
+        }
+    }
+    return zone
+}
+
+/// A zone's central meridian, in degrees.
+pub fn central_meridian(zone: i64) -> f64 {
+    return (zone - 1).as_f64() * 6.0 - 180.0 + 3.0
+}
+
+/// The latitude band letter, which MGRS uses and UTM does not need.
+///
+/// Twenty bands of eight degrees from C at 80 south to X at 84 north, with I
+/// and O left out because they look like 1 and 0. X is twelve degrees rather
+/// than eight so that the whole of northern Europe fits in it.
+pub fn band_for(latitude: f64) -> str {
+    let letters = ["C", "D", "E", "F", "G", "H", "J", "K", "L", "M", "N",
+        "P", "Q", "R", "S", "T", "U", "V", "W", "X"]
+    if latitude < 0.0 - 80.0 or latitude > 84.0 {
+        return ""
+    }
+    if latitude >= 72.0 {
+        return "X"
+    }
+    let index = ((latitude + 80.0) / 8.0).as_i64()
+    if index >= letters.len() {
+        return "X"
+    }
+    return letters[index]
+}
+
+/// A latitude and longitude projected into UTM.
+pub fn from_latlon(latitude: f64, longitude: f64) -> UtmPoint ! UtmError {
+    if latitude < 0.0 - 80.0 or latitude > 84.0 {
+        fail(OutOfRange(latitude))
+    }
+    let zone = zone_for(latitude, longitude)
+    return try project(latitude, longitude, zone)
+}
+
+/// The same, forced into a chosen zone.
+///
+/// Which is what a survey spanning a zone boundary needs: one of the two
+/// halves is projected into the other's zone, at slightly worse accuracy, so
+/// that the whole thing is in one coordinate system.
+pub fn project(latitude: f64, longitude: f64,
+    zone: i64) -> UtmPoint ! UtmError {
+    if zone < 1 or zone > 60 {
+        fail(BadZone(zone))
+    }
+    let a = geodesic.semi_major()
+    let f = geodesic.flattening()
+    let e_sq = f * (2.0 - f)
+    let e_prime_sq = e_sq / (1.0 - e_sq)
+    let lat = radians(latitude)
+    let lon = radians(longitude)
+    let lon0 = radians(central_meridian(zone))
+    let n = a / (1.0 - e_sq * lat.sin() * lat.sin()).sqrt()
+    let t = lat.tan() * lat.tan()
+    let c = e_prime_sq * lat.cos() * lat.cos()
+    let big_a = (lon - lon0) * lat.cos()
+    let m = meridional_arc(lat, a, e_sq)
+    let easting = scale_factor() * n * (big_a + (1.0 - t + c) *
+        big_a * big_a * big_a / 6.0 +
+        (5.0 - 18.0 * t + t * t + 72.0 * c - 58.0 * e_prime_sq) *
+        big_a * big_a * big_a * big_a * big_a / 120.0) + false_easting()
+    var northing = scale_factor() * (m + n * lat.tan() *
+        (big_a * big_a / 2.0 + (5.0 - t + 9.0 * c + 4.0 * c * c) *
+            big_a * big_a * big_a * big_a / 24.0 +
+            (61.0 - 58.0 * t + t * t + 600.0 * c - 330.0 * e_prime_sq) *
+            big_a * big_a * big_a * big_a * big_a * big_a / 720.0))
+    let north = latitude >= 0.0
+    if not north {
+        northing = northing + false_northing()
+    }
+    return UtmPoint{ zone: zone, north: north, easting: easting,
+        northing: northing }
+}
+
+/// The distance along a meridian from the equator, in metres.
+fn meridional_arc(lat: f64, a: f64, e_sq: f64) -> f64 {
+    return a * ((1.0 - e_sq / 4.0 - 3.0 * e_sq * e_sq / 64.0 -
+        5.0 * e_sq * e_sq * e_sq / 256.0) * lat -
+        (3.0 * e_sq / 8.0 + 3.0 * e_sq * e_sq / 32.0 +
+            45.0 * e_sq * e_sq * e_sq / 1024.0) * (2.0 * lat).sin() +
+        (15.0 * e_sq * e_sq / 256.0 +
+            45.0 * e_sq * e_sq * e_sq / 1024.0) * (4.0 * lat).sin() -
+        (35.0 * e_sq * e_sq * e_sq / 3072.0) * (6.0 * lat).sin())
+}
+
+/// A UTM point back to latitude and longitude.
+pub fn to_latlon(point: UtmPoint) -> (f64, f64) ! UtmError {
+    if point.zone < 1 or point.zone > 60 {
+        fail(BadZone(point.zone))
+    }
+    let a = geodesic.semi_major()
+    let f = geodesic.flattening()
+    let e_sq = f * (2.0 - f)
+    let e1 = (1.0 - (1.0 - e_sq).sqrt()) / (1.0 + (1.0 - e_sq).sqrt())
+    let e_prime_sq = e_sq / (1.0 - e_sq)
+    var y = point.northing
+    if not point.north {
+        y = y - false_northing()
+    }
+    let x = point.easting - false_easting()
+    let m = y / scale_factor()
+    let mu = m / (a * (1.0 - e_sq / 4.0 - 3.0 * e_sq * e_sq / 64.0 -
+        5.0 * e_sq * e_sq * e_sq / 256.0))
+    let phi1 = mu + (3.0 * e1 / 2.0 - 27.0 * e1 * e1 * e1 / 32.0) *
+    (2.0 * mu).sin() +
+    (21.0 * e1 * e1 / 16.0 - 55.0 * e1 * e1 * e1 * e1 / 32.0) *
+    (4.0 * mu).sin() + (151.0 * e1 * e1 * e1 / 96.0) * (6.0 * mu).sin() +
+    (1097.0 * e1 * e1 * e1 * e1 / 512.0) * (8.0 * mu).sin()
+    let c1 = e_prime_sq * phi1.cos() * phi1.cos()
+    let t1 = phi1.tan() * phi1.tan()
+    let n1 = a / (1.0 - e_sq * phi1.sin() * phi1.sin()).sqrt()
+    let r1 = a * (1.0 - e_sq) /
+    ((1.0 - e_sq * phi1.sin() * phi1.sin()) *
+        (1.0 - e_sq * phi1.sin() * phi1.sin()).sqrt())
+    let d = x / (n1 * scale_factor())
+    let latitude = phi1 - (n1 * phi1.tan() / r1) *
+    (d * d / 2.0 - (5.0 + 3.0 * t1 + 10.0 * c1 - 4.0 * c1 * c1 -
+        9.0 * e_prime_sq) * d * d * d * d / 24.0 +
+        (61.0 + 90.0 * t1 + 298.0 * c1 + 45.0 * t1 * t1 -
+            252.0 * e_prime_sq - 3.0 * c1 * c1) *
+        d * d * d * d * d * d / 720.0)
+    let longitude = (d - (1.0 + 2.0 * t1 + c1) * d * d * d / 6.0 +
+        (5.0 - 2.0 * c1 + 28.0 * t1 - 3.0 * c1 * c1 + 8.0 * e_prime_sq +
+            24.0 * t1 * t1) * d * d * d * d * d / 120.0) / phi1.cos()
+    return (to_degrees(latitude),
+        central_meridian(point.zone) + to_degrees(longitude))
+}
+
+/// A UTM point written the way a map margin writes it.
+pub fn show(point: UtmPoint) -> str {
+    var hemisphere = "S"
+    if point.north {
+        hemisphere = "N"
+    }
+    return "{point.zone}{hemisphere} {round_metres(point.easting)}E " +
+    "{round_metres(point.northing)}N"
+}
+
+fn round_metres(v: f64) -> i64 {
+    return (v + 0.5).as_i64()
+}
+
+/// Whether two points are in the same zone and hemisphere, which is the
+/// condition for their eastings and northings being comparable at all.
+pub fn same_grid(a: UtmPoint, b: UtmPoint) -> bool {
+    return a.zone == b.zone and a.north == b.north
+}

@@ -1,0 +1,372 @@
+import geodesic
+import utm
+import mgrs
+import gpx
+import kml
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn near(a: f64, b: f64, tolerance: f64) -> bool {
+    var d = a - b
+    if d < 0.0 {
+        d = 0.0 - d
+    }
+    return d < tolerance
+}
+
+fn london_lat() -> f64 {
+    return 51.5074
+}
+
+fn london_lon() -> f64 {
+    return 0.0 - 0.1278
+}
+
+fn newyork_lat() -> f64 {
+    return 40.7128
+}
+
+fn newyork_lon() -> f64 {
+    return 0.0 - 74.006
+}
+
+// ------------------------------------------------------------- geodesic
+
+fn check_geodesic(inout f: i64) / {io} {
+    print("-- geodesic: half a per cent is a lot when it is systematic")
+    // geographiclib's own answer, to the micrometre.
+    let d = geodesic.distance(london_lat(), london_lon(), newyork_lat(),
+        newyork_lon()) ?? 0.0
+    say(f, "London to New York is 5,585,233.579 metres on the ellipsoid",
+        near(d, 5585233.5789313, 0.001))
+    // The sphere is 0.28 per cent short on this route.
+    let sphere = geodesic.haversine(london_lat(), london_lon(),
+        newyork_lat(), newyork_lon())
+    say(f, "and the spherical answer is out by fifteen kilometres",
+        sphere < d and d - sphere > 14000.0 and d - sphere < 16000.0)
+    say(f, "a quarter of a per cent, and systematic rather than random",
+        near(geodesic.sphere_error(london_lat(), london_lon(),
+            newyork_lat(), newyork_lon()) ?? 0.0, 0.0027, 0.0005))
+    // A great circle changes direction along its length.
+    say(f, "the bearing there is 288 and the bearing back is not 108",
+        near(geodesic.bearing(london_lat(), london_lon(), newyork_lat(),
+            newyork_lon()) ?? 0.0, 288.36899811, 1.0e-6) and
+        near(geodesic.final_bearing(london_lat(), london_lon(),
+            newyork_lat(), newyork_lon()) ?? 0.0, 231.24122912, 1.0e-6))
+    // The direct problem: go a distance on a bearing.
+    let arrived = geodesic.destination(london_lat(), london_lon(), 90.0,
+        1000.0)
+    say(f, "a kilometre due east arrives where geographiclib says",
+        near(arrived.0, 51.507399115775385, 1.0e-9) and
+        near(arrived.1, 0.0 - 0.11339685301207582, 1.0e-9))
+    // WGS 84's numbers are definitions, not measurements.
+    say(f, "WGS 84's axis and flattening are exact by definition",
+        geodesic.semi_major() == 6378137.0 and
+        near(geodesic.flattening(), 1.0 / 298.257223563, 1.0e-18) and
+        near(geodesic.semi_minor(), 6356752.314245, 1.0e-6))
+    say(f, "and a point to itself is zero, not a rounding error",
+        (geodesic.distance(51.5, 0.0 - 0.1, 51.5, 0.0 - 0.1) ?? 1.0) == 0.0)
+    say(f, "the mean radius is the one a haversine should use",
+        near(geodesic.mean_radius(), 6371008.8, 0.1) and
+        geodesic.mean_radius() < geodesic.semi_major())
+    say(f, "a latitude outside the poles is refused",
+        latitude_refused(91.0) and not latitude_refused(90.0))
+}
+
+fn latitude_refused(latitude: f64) -> bool {
+    match geodesic.distance(latitude, 0.0, 0.0, 0.0) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+// ------------------------------------------------------------------- utm
+
+fn check_utm(inout f: i64) / {io} {
+    print("-- utm: sixty flat maps instead of one round one")
+    let point = utm.from_latlon(london_lat(), london_lon()) ??
+    UtmPoint{ zone: 0, north: true, easting: 0.0, northing: 0.0 }
+    // pyproj's own numbers, to the millimetre.
+    say(f, "London projects to where pyproj projects it",
+        point.zone == 30 and point.north and
+        near(point.easting, 699316.2343119299, 0.002) and
+        near(point.northing, 5710163.758080996, 0.002))
+    let back = utm.to_latlon(point) ?? (0.0, 0.0)
+    say(f, "and comes back to within a centimetre",
+        near(back.0, london_lat(), 1.0e-7) and
+        near(back.1, london_lon(), 1.0e-7))
+    // The scale factor is 0.9996, not 1, and that is deliberate.
+    say(f, "the central meridian is scaled slightly small on purpose",
+        utm.scale_factor() == 0.9996 and
+        utm.false_easting() == 500000.0 and
+        utm.false_northing() == 10000000.0)
+    say(f, "so a zone's numbers are never negative, at the cost of repeating",
+        (utm.from_latlon(0.0 - 33.8688, 151.2093) ??
+            point).northing > 6000000.0 and
+        not (utm.from_latlon(0.0 - 33.8688, 151.2093) ?? point).north)
+    // The two exceptions that a longitude-only calculation gets wrong.
+    say(f, "Norway widens zone 32 so Bergen is not split in half",
+        utm.zone_for(60.39, 5.32) == 32 and utm.zone_for(50.0, 5.32) == 31)
+    say(f, "and Svalbard rearranges four zones, which is also in the standard",
+        utm.zone_for(78.22, 15.63) == 33 and utm.zone_for(60.0, 15.63) == 33
+        and utm.zone_for(78.22, 25.0) == 35 and
+        utm.zone_for(60.0, 25.0) == 35)
+    say(f, "a zone's central meridian is three degrees in from its edge",
+        utm.central_meridian(30) == 0.0 - 3.0 and
+        utm.central_meridian(31) == 3.0 and
+        utm.central_meridian(1) == 0.0 - 177.0)
+    // The band letters skip I and O and X is twelve degrees tall.
+    say(f, "the band letters skip I and O, and X is twelve degrees tall",
+        utm.band_for(51.5) == "U" and utm.band_for(0.0) == "N" and
+        utm.band_for(78.2) == "X" and utm.band_for(83.9) == "X" and
+        utm.band_for(85.0) == "")
+    say(f, "and a latitude past the projection's range is refused",
+        projection_refused(85.0) and not projection_refused(83.0))
+    say(f, "a survey across a boundary can be forced into one zone",
+        (utm.project(51.5074, 3.5, 30) ?? UtmPoint{ zone: 0, north: true,
+            easting: 0.0, northing: 0.0 }).zone == 30 and
+        utm.zone_for(51.5074, 3.5) == 31 and zone_refused(0) and
+        zone_refused(61))
+    say(f, "two points are only comparable in the same zone and hemisphere",
+        not utm.same_grid(point, utm.from_latlon(0.0 - 33.8688, 151.2093) ??
+            point))
+}
+
+fn zone_refused(zone: i64) -> bool {
+    match utm.project(51.5, 0.0, zone) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn projection_refused(latitude: f64) -> bool {
+    match utm.from_latlon(latitude, 0.0) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+// ------------------------------------------------------------------ mgrs
+
+fn check_mgrs(inout f: i64) / {io} {
+    print("-- mgrs: a position you can read out over a radio")
+    // The Python `mgrs` package's own answers.
+    say(f, "London to one metre is what the reference produces",
+        (mgrs.from_latlon(london_lat(), london_lon(), 5) ?? "") ==
+        "30UXC9931610163" and
+        (mgrs.from_latlon(newyork_lat(), newyork_lon(), 5) ?? "") ==
+        "18TWL8395907350")
+    say(f, "and so is the southern hemisphere and the equator",
+        (mgrs.from_latlon(0.0 - 33.8688, 151.2093, 5) ?? "") ==
+        "56HLH3436850948" and
+        (mgrs.from_latlon(0.0, 0.0, 5) ?? "") == "31NAA6602100000")
+    // The zone is two digits, which is where a naive formatter goes wrong.
+    say(f, "a single-digit zone is written with a leading zero",
+        (mgrs.from_latlon(43.2116, 0.0 - 164.0578, 5) ?? "") ==
+        "03TWH7653384743")
+    // Truncation is a zoom out, not a corruption.
+    let full = mgrs.from_latlon(london_lat(), london_lon(), 5) ?? ""
+    say(f, "dropping digits gives a coarser reference containing the finer",
+        (mgrs.coarsen(full, 2) ?? "") == "30UXC9910" and
+        (mgrs.coarsen(full, 0) ?? "") == "30UXC" and
+        (mgrs.coarsen(full, 5) ?? "") == full)
+    say(f, "and the precision is readable off the reference itself",
+        (mgrs.precision_of(full) ?? 0) == 1 and
+        (mgrs.precision_of("30UXC9910") ?? 0) == 1000 and
+        (mgrs.precision_of("30UXC") ?? 0) == 100000)
+    say(f, "the zone, band and square come apart again",
+        (mgrs.zone_of(full) ?? 0) == 30 and
+        (mgrs.band_of_reference(full) ?? "") == "U" and
+        (mgrs.square_of_reference(full) ?? "") == "XC")
+    // The letters skip I and O, and the row alphabet stops at V.
+    say(f, "the letter alphabets skip I and O, and rows stop at V",
+        mgrs.column_letters().len() == 24 and
+        mgrs.row_letters().len() == 20 and
+        not mgrs.column_letters().contains("I") and
+        not mgrs.row_letters().contains("O"))
+    say(f, "a reference too short to hold a square is refused",
+        reference_refused("30U") and reference_refused("3"))
+    say(f, "a precision outside nought to five is refused",
+        precision_refused(6) and precision_refused(0 - 1))
+}
+
+fn reference_refused(text: str) -> bool {
+    match mgrs.zone_of(text) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn precision_refused(digits: i64) -> bool {
+    match mgrs.from_latlon(51.5, 0.0 - 0.1, digits) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+// ------------------------------------------------------------------- gpx
+
+fn sample_gpx() -> str {
+    return "<?xml version=\"1.0\"?>\n" +
+    "<gpx version=\"1.1\" creator=\"a watch\">\n" +
+    "<wpt lat=\"51.5\" lon=\"-0.12\"><ele>35</ele>" +
+    "<name>Start</name></wpt>\n" +
+    "<trk><name>A run</name>\n" +
+    "<trkseg>\n" +
+    "<trkpt lat=\"51.500\" lon=\"-0.120\"><ele>35</ele></trkpt>\n" +
+    "<trkpt lat=\"51.501\" lon=\"-0.120\"><ele>38</ele></trkpt>\n" +
+    "<trkpt lat=\"51.502\" lon=\"-0.120\"><ele>36</ele></trkpt>\n" +
+    "</trkseg>\n" +
+    "<trkseg>\n" +
+    "<trkpt lat=\"51.600\" lon=\"-0.120\"><ele>40</ele></trkpt>\n" +
+    "<trkpt lat=\"51.601\" lon=\"-0.120\"><ele>44</ele></trkpt>\n" +
+    "</trkseg>\n</trk>\n</gpx>\n"
+}
+
+fn check_gpx(inout f: i64) / {io} {
+    print("-- gpx: the segment boundary that is not a distance")
+    let file = gpx.parse(sample_gpx()) ?? GpxFile{ version: "", creator: "",
+        waypoints: [], routes: [], tracks: [] }
+    say(f, "the header, the waypoint and the track all come out",
+        file.version == "1.1" and file.creator == "a watch" and
+        file.waypoints.len() == 1 and file.waypoints[0].name == "Start" and
+        file.tracks.len() == 1 and file.tracks[0].name == "A run")
+    let track = file.tracks[0]
+    say(f, "a track is segments, and a new segment means recording stopped",
+        track.segments.len() == 2 and gpx.point_count(track) == 5)
+    // The gap between segments is not a distance travelled. Eleven kilometres
+    // of it, here.
+    say(f, "so the length is summed within segments and not across them",
+        gpx.length(track) < 500.0 and
+        gpx.length_ignoring_gaps(track) > 10000.0)
+    say(f, "and the ellipsoidal length differs from the spherical one",
+        gpx.length_exact(track) > gpx.length(track))
+    // Ascent depends entirely on the threshold, which is why two apps
+    // disagree about the same file.
+    say(f, "ascent with no threshold sums the noise as well as the hills",
+        near(gpx.ascent(track, 0.0), 7.0, 0.001) and
+        near(gpx.ascent(track, 3.5), 4.0, 0.001) and
+        near(gpx.ascent(track, 10.0), 0.0, 0.001))
+    say(f, "and gpxpy's smoothing filter is a third answer again",
+        gpx.smoothed_ascent(track) != gpx.ascent(track, 0.0) and
+        gpx.smoothed_descent(track) > 0.0)
+    say(f, "the bounding box is the extent of every point",
+        gpx.bounds(track) == (51.5, 0.0 - 0.12, 51.601, 0.0 - 0.12))
+    // A track recorded once a second is mostly redundant.
+    say(f, "a straight stretch thins to its endpoints",
+        gpx.thin(track.segments[0], 5.0).len() == 2 and
+        gpx.thin(track.segments[0], 0.0).len() == 3)
+    let written = gpx.write(file)
+    say(f, "and a file written out parses back to the same track",
+        gpx.point_count((gpx.parse(written) ?? file).tracks[0]) == 5 and
+        (gpx.parse(written) ?? file).tracks[0].segments.len() == 2)
+    say(f, "something that is not GPX is refused",
+        gpx_refused("<html><body>no</body></html>"))
+}
+
+fn gpx_refused(text: str) -> bool {
+    match gpx.parse(text) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+// ------------------------------------------------------------------- kml
+
+fn sample_kml() -> str {
+    return "<?xml version=\"1.0\"?>\n" +
+    "<kml xmlns=\"http://www.opengis.net/kml/2.2\"><Document>\n" +
+    "<name>Test layer</name>\n" +
+    "<Placemark><name>A place</name>" +
+    "<Point><coordinates>-0.1281,51.5080,12</coordinates></Point>" +
+    "</Placemark>\n" +
+    "<Placemark><name>A park</name><Polygon>" +
+    "<outerBoundaryIs><LinearRing><coordinates>" +
+    "-0.17,51.50 -0.15,51.50 -0.15,51.52 -0.17,51.52 -0.17,51.50" +
+    "</coordinates></LinearRing></outerBoundaryIs>" +
+    "<innerBoundaryIs><LinearRing><coordinates>" +
+    "-0.165,51.505 -0.160,51.505 -0.160,51.510 -0.165,51.510" +
+    "</coordinates></LinearRing></innerBoundaryIs>" +
+    "</Polygon></Placemark>\n</Document></kml>\n"
+}
+
+fn check_kml(inout f: i64) / {io} {
+    print("-- kml: longitude first, which is the opposite of everything else")
+    let document = kml.parse(sample_kml()) ?? KmlDocument{ name: "",
+        placemarks: [] }
+    say(f, "the document and its placemarks come out",
+        document.name == "Test layer" and
+        kml.placemark_count(document) == 2 and
+        document.placemarks[0].name == "A place")
+    // The order that catches everybody.
+    let point = document.placemarks[0].geometry.coordinates[0]
+    say(f, "a coordinate is longitude, latitude, altitude — in that order",
+        near(point.longitude, 0.0 - 0.1281, 1.0e-12) and
+        near(point.latitude, 51.508, 1.0e-12) and
+        near(point.altitude, 12.0, 1.0e-12) and point.has_altitude)
+    say(f, "and the altitude is optional while the commas are not",
+        (kml.coordinates("1,2") ?? [])[0].has_altitude == false and
+        coordinates_refused("1 2"))
+    // Polygons: an outer ring and separately-declared holes.
+    let park = document.placemarks[1].geometry
+    say(f, "a polygon's holes are declared, not inferred from winding",
+        park.kind == "Polygon" and park.coordinates.len() == 5 and
+        park.holes.len() == 1 and park.holes[0].len() == 4)
+    say(f, "which is why winding order is a fact rather than a meaning",
+        kml.is_anticlockwise(park.coordinates) and
+        not kml.is_anticlockwise(kml.reverse_ring(park.coordinates)))
+    say(f, "a ring must close, and one that does not can be closed",
+        kml.is_closed(park.coordinates) and
+        not kml.is_closed(park.holes[0]) and
+        kml.is_closed(kml.close_ring(park.holes[0])) and
+        kml.close_ring(park.holes[0]).len() == 5)
+    say(f, "the placemarks of one kind are separable from the rest",
+        kml.of_kind(document, "Point").len() == 1 and
+        kml.of_kind(document, "Polygon").len() == 1 and
+        kml.of_kind(document, "LineString").len() == 0)
+    let written = kml.write(document)
+    say(f, "and a document written out parses back to the same geometry",
+        (kml.parse(written) ?? document).placemarks.len() == 2 and
+        (kml.parse(written) ?? document).placemarks[1].geometry.holes.len()
+        == 1)
+    say(f, "a ring's signed area is meaningless as a size and right as a sign",
+        kml.signed_ring_area(park.coordinates) > 0.0 and
+        kml.signed_ring_area(kml.reverse_ring(park.coordinates)) < 0.0)
+    say(f, "something that is not KML is refused",
+        kml_refused("<html><body>no</body></html>"))
+}
+
+fn coordinates_refused(text: str) -> bool {
+    match kml.coordinates(text) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn kml_refused(text: str) -> bool {
+    match kml.parse(text) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn main() / {io} {
+    var f = 0
+    check_geodesic(f)
+    check_utm(f)
+    check_mgrs(f)
+    check_gpx(f)
+    check_kml(f)
+    if f == 0 {
+        print("geospatial: every claim held")
+    } else {
+        print("geospatial: {f} claims failed")
+    }
+}

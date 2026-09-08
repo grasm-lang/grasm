@@ -1,0 +1,228 @@
+// MGRS: a position you can read out over a radio.
+//
+// `30UXC9931610163` is a point in London to one metre. It is UTM underneath —
+// zone 30, band U — with the six-figure easting and northing replaced by two
+// letters naming a 100 km square and then as many digits as the precision
+// needs. The point of the letters is that a grid reference can be spoken
+// aloud without transposing a digit, and that dropping digits off the end
+// gives a coarser reference rather than a wrong one.
+//
+// That last property is the design: `30UXC` is a 100 km square, `30UXC98` is
+// 10 km, `30UXC9011` is 1 km, and each is a valid reference containing the
+// last. A coordinate system where truncation is a *zoom out* rather than a
+// corruption is rare and extremely useful over a radio.
+//
+// ## The three-letter alphabet that skips I and O
+//
+// Column letters cycle A to Z in groups of eight, skipping I and O because
+// they look like 1 and 0. Row letters cycle A to V, skipping I and O as well,
+// and the row alphabet is offset by five letters in even-numbered zones —
+// a rule with no purpose beyond making adjacent zones' squares distinguishable
+// and no way to remember it except to look it up.
+//
+// ## The digits are truncated, not rounded
+//
+// `9084` means the easting is between 90,400 and 90,500 metres — the square
+// whose corner is at 90,400. Rounding instead would put a point in the square
+// next door half the time, which is exactly wrong for something meant to name
+// an area.
+//
+// Checked against `pyproj` for the underlying UTM and against the standard's
+// own examples for the lettering.
+
+import utm
+
+type MgrsError =
+    | OutOfRange(latitude: f64)
+    | BadPrecision(digits: i64)
+    | BadReference(text: str)
+
+    /// The column letters, in the order the standard cycles them.
+pub fn column_letters() -> str {
+    return "ABCDEFGHJKLMNPQRSTUVWXYZ"
+}
+
+/// The row letters, which stop at V.
+pub fn row_letters() -> str {
+    return "ABCDEFGHJKLMNPQRSTUV"
+}
+
+fn letter_at(alphabet: str, index: i64) -> str {
+    let n = alphabet.len()
+    var i = index % n
+    if i < 0 {
+        i = i + n
+    }
+    return alphabet.substr(i, 1)
+}
+
+fn index_of(alphabet: str, letter: str) -> i64 {
+    var i = 0
+    while i < alphabet.len() {
+        if alphabet.substr(i, 1) == letter {
+            return i
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+/// The two letters naming the 100 km square a UTM point falls in.
+pub fn square_of(point: UtmPoint) -> str {
+    let column = (point.easting / 100000.0).as_i64()
+    // Columns cycle in groups of eight per zone, so zone 1 starts at A, zone
+    // 2 at J, zone 3 at S, and zone 4 back at A.
+    let column_index = (point.zone - 1) % 3 * 8 + column - 1
+    var northing = point.northing
+    while northing >= 2000000.0 {
+        northing = northing - 2000000.0
+    }
+    var row_index = (northing / 100000.0).as_i64()
+    // The row alphabet is offset by five in even-numbered zones. There is no
+    // reason for this beyond telling neighbouring zones apart.
+    if point.zone % 2 == 0 {
+        row_index = row_index + 5
+    }
+    return letter_at(column_letters(), column_index) +
+    letter_at(row_letters(), row_index)
+}
+
+/// A UTM point as a grid reference, to a given number of digits each way.
+///
+/// Five digits is one metre, four is ten, three is a hundred, two is a
+/// kilometre, one is ten kilometres, and zero is the 100 km square alone.
+pub fn from_utm(point: UtmPoint, digits: i64) -> str ! MgrsError {
+    if digits < 0 or digits > 5 {
+        fail(BadPrecision(digits))
+    }
+    // The zone is two digits, zero-padded. Writing zone 3 as `3` produces a
+    // reference one character short, which every parser reads as a different
+    // place rather than as an error.
+    let band = band_of(point)
+    var out = padded(point.zone, 2) + band + square_of(point)
+    if digits == 0 {
+        return out
+    }
+    let divisor = divisor_for(digits)
+    // Truncated, not rounded: the digits name the square a point is in, and
+    // rounding would name the one next door half the time.
+    let east = ((point.easting % 100000.0) / divisor).as_i64()
+    let north = ((point.northing % 100000.0) / divisor).as_i64()
+    return out + padded(east, digits) + padded(north, digits)
+}
+
+fn divisor_for(digits: i64) -> f64 {
+    var out = 100000.0
+    var i = 0
+    while i < digits {
+        out = out / 10.0
+        i = i + 1
+    }
+    return out
+}
+
+fn padded(value: i64, digits: i64) -> str {
+    var out = "{value}"
+    while out.len() < digits {
+        out = "0" + out
+    }
+    return out
+}
+
+fn band_of(point: UtmPoint) -> str {
+    match utm.to_latlon(point) {
+        Ok(where) -> return utm.band_for(where.0)
+        Err(_e) -> return "?"
+    }
+}
+
+/// A latitude and longitude as a grid reference.
+pub fn from_latlon(latitude: f64, longitude: f64,
+    digits: i64) -> str ! MgrsError {
+    if latitude < 0.0 - 80.0 or latitude > 84.0 {
+        fail(OutOfRange(latitude))
+    }
+    match utm.from_latlon(latitude, longitude) {
+        Ok(point) -> return try from_utm(point, digits)
+        Err(_e) -> fail(OutOfRange(latitude))
+    }
+}
+
+/// The size of the square a reference names, in metres.
+///
+/// The property that makes MGRS worth using: dropping digits gives a coarser
+/// reference rather than a wrong one, so a truncated grid reference is still
+/// a valid one.
+pub fn precision_of(reference: str) -> i64 ! MgrsError {
+    let digits = digit_count(reference)
+    if digits % 2 != 0 {
+        fail(BadReference(reference))
+    }
+    var size = 100000
+    var i = 0
+    while i < digits / 2 {
+        size = size / 10
+        i = i + 1
+    }
+    return size
+}
+
+fn digit_count(reference: str) -> i64 {
+    // Everything past the two zone digits, the band letter and the two square
+    // letters.
+    if reference.len() <= 5 {
+        return 0
+    }
+    return reference.len() - 5
+}
+
+fn is_digit(ch: str) -> bool {
+    return ch >= "0" and ch <= "9"
+}
+
+/// The zone a reference names.
+pub fn zone_of(reference: str) -> i64 ! MgrsError {
+    if reference.len() < 5 {
+        fail(BadReference(reference))
+    }
+    let digits = reference.substr(0, 2)
+    if not is_digit(digits.substr(0, 1)) or not is_digit(digits.substr(1, 1)) {
+        fail(BadReference(reference))
+    }
+    return digits.parse_int() ?? 0
+}
+
+/// The band letter a reference names.
+pub fn band_of_reference(reference: str) -> str ! MgrsError {
+    let _zone = try zone_of(reference)
+    return reference.substr(2, 1)
+}
+
+/// The 100 km square a reference names.
+pub fn square_of_reference(reference: str) -> str ! MgrsError {
+    let _zone = try zone_of(reference)
+    return reference.substr(3, 2)
+}
+
+/// A reference truncated to a coarser precision.
+///
+/// Which is a zoom out and not a corruption: the coarser reference names the
+/// square containing the finer one.
+pub fn coarsen(reference: str, digits: i64) -> str ! MgrsError {
+    if digits < 0 or digits > 5 {
+        fail(BadPrecision(digits))
+    }
+    let _zone = try zone_of(reference)
+    let head = 5
+    if reference.len() < head {
+        fail(BadReference(reference))
+    }
+    let have = digit_count(reference) / 2
+    if digits > have {
+        fail(BadPrecision(digits))
+    }
+    let east = reference.substr(head, have)
+    let north = reference.substr(head + have, have)
+    return reference.substr(0, head) + east.substr(0, digits) +
+    north.substr(0, digits)
+}

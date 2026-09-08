@@ -1,0 +1,542 @@
+// GPX: the format every GPS device and running app agrees on.
+//
+// One XML schema, published in 2002 by a company that no longer exists, and
+// it won because it was first and good enough. Every watch, bike computer,
+// handheld receiver and phone app can read and write it, which makes it the
+// only interchange format in the field that actually interchanges.
+//
+// ## Three kinds of thing, and people confuse two of them
+//
+// A **waypoint** is a place: a car park, a summit, a turning. A **route** is
+// an ordered list of places you intend to visit — a plan, with no times. A
+// **track** is where you actually went: a dense list of points, usually one a
+// second, usually with timestamps and often with elevation.
+//
+// The confusion is routes against tracks. A route has a dozen points and
+// means "go via these"; a track has ten thousand and means "this is where I
+// was". Loading a track into a device expecting a route gives ten thousand
+// turn instructions, which is a well-known way to lock up a bike computer.
+//
+// ## Track segments exist for a reason
+//
+// A track is a list of *segments*, and a new segment means the recording was
+// interrupted — the device lost its fix, or was switched off. The distance
+// between the last point of one segment and the first of the next is not a
+// distance travelled, and summing straight through the gap is the single most
+// common error in a GPX distance calculation. A tunnel produces exactly this.
+//
+// ## Elevation is the worst number in the file
+//
+// GPS elevation is three to five times less accurate than horizontal
+// position, because the satellites are all above the receiver and none below
+// it. Summing every positive difference to get "total ascent" therefore sums
+// the noise as well, and gives numbers forty per cent too high. Every device
+// applies a threshold; none of them agree on it, which is why two apps report
+// different ascent for the same file.
+//
+// Checked against `gpxpy`.
+
+import geodesic
+
+type GpxError =
+    | NotGpx(text: str)
+    | BadNumber(text: str)
+    | Truncated(at: i64)
+
+type GpxPoint = {
+    latitude: f64,
+    longitude: f64,
+    /// Metres above the ellipsoid, or the geoid, depending on the device —
+    /// which is another reason not to trust it.
+    elevation: f64,
+    has_elevation: bool,
+    /// Seconds since the epoch, or -1.
+    time: i64,
+    name: str,
+}
+
+type GpxTrack = {
+    name: str,
+    /// One list a segment. A new segment means the recording stopped.
+    segments: [[GpxPoint]],
+}
+
+type GpxFile = {
+    /// `1.0` or `1.1`. The difference is where extensions live.
+    version: str,
+    creator: str,
+    waypoints: [GpxPoint],
+    routes: [GpxTrack],
+    tracks: [GpxTrack],
+}
+
+fn empty_point() -> GpxPoint {
+    return GpxPoint{ latitude: 0.0, longitude: 0.0, elevation: 0.0,
+        has_elevation: false, time: 0 - 1, name: "" }
+}
+
+/// The value of an attribute in a tag, or the empty string.
+pub fn attribute(tag: str, name: str) -> str {
+    let key = name + "=\""
+    let at = find(tag, key)
+    if at < 0 {
+        return ""
+    }
+    let from = at + key.len()
+    let stop = find_from(tag, "\"", from)
+    if stop < 0 {
+        return ""
+    }
+    return tag.substr(from, stop - from)
+}
+
+fn find(text: str, needle: str) -> i64 {
+    return find_from(text, needle, 0)
+}
+
+fn find_from(text: str, needle: str, at: i64) -> i64 {
+    var i = at
+    while i + needle.len() <= text.len() {
+        if text.substr(i, needle.len()) == needle {
+            return i
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+/// The text between an opening and closing tag, or the empty string.
+pub fn element(text: str, name: str) -> str {
+    let open = "<" + name
+    let at = find(text, open)
+    if at < 0 {
+        return ""
+    }
+    let head = find_from(text, ">", at)
+    if head < 0 {
+        return ""
+    }
+    // A self-closing tag has no content.
+    if head > at and text.substr(head - 1, 1) == "/" {
+        return ""
+    }
+    let close = find_from(text, "</" + name + ">", head)
+    if close < 0 {
+        return ""
+    }
+    return text.substr(head + 1, close - head - 1)
+}
+
+/// A GPX document parsed.
+///
+/// A small XML reader rather than a general one: GPX is a fixed shape, and a
+/// parser that knows the shape is thirty lines where a general one is a
+/// package of its own.
+pub fn parse(text: str) -> GpxFile ! GpxError {
+    if find(text, "<gpx") < 0 {
+        fail(NotGpx(head_of(text)))
+    }
+    let header = tag_at(text, find(text, "<gpx"))
+    var out = GpxFile{ version: attribute(header, "version"),
+        creator: attribute(header, "creator"), waypoints: [], routes: [],
+        tracks: [] }
+    out.waypoints = read_points(text, "wpt")
+    out.routes = read_containers(text, "rte", "rtept")
+    out.tracks = read_track_list(text)
+    return out
+}
+
+fn head_of(text: str) -> str {
+    if text.len() < 20 {
+        return text
+    }
+    return text.substr(0, 20)
+}
+
+fn tag_at(text: str, at: i64) -> str {
+    if at < 0 {
+        return ""
+    }
+    let stop = find_from(text, ">", at)
+    if stop < 0 {
+        return ""
+    }
+    return text.substr(at, stop - at + 1)
+}
+
+fn read_points(text: str, tag: str) -> [GpxPoint] {
+    var out: [GpxPoint] = []
+    var at = 0
+    while true {
+        let start = find_from(text, "<" + tag + " ", at)
+        if start < 0 {
+            return out
+        }
+        let head = tag_at(text, start)
+        var point = empty_point()
+        point.latitude = number(attribute(head, "lat"))
+        point.longitude = number(attribute(head, "lon"))
+        let close = find_from(text, "</" + tag + ">", start)
+        var body = ""
+        if close >= 0 {
+            body = text.substr(start, close - start)
+        }
+        let elevation = element(body, "ele")
+        if elevation != "" {
+            point.elevation = number(elevation)
+            point.has_elevation = true
+        }
+        point.name = element(body, "name")
+        out.push(point)
+        if close < 0 {
+            at = start + head.len()
+        } else {
+            at = close + 1
+        }
+    }
+    return out
+}
+
+fn number(text: str) -> f64 {
+    return text.trim().parse_float() ?? 0.0
+}
+
+fn read_containers(text: str, tag: str, point_tag: str) -> [GpxTrack] {
+    var out: [GpxTrack] = []
+    var at = 0
+    while true {
+        let start = find_from(text, "<" + tag + ">", at)
+        if start < 0 {
+            return out
+        }
+        let close = find_from(text, "</" + tag + ">", start)
+        if close < 0 {
+            return out
+        }
+        let body = text.substr(start, close - start)
+        out.push(GpxTrack{ name: element(body, "name"),
+            segments: [read_points(body, point_tag)] })
+        at = close + 1
+    }
+    return out
+}
+
+fn read_track_list(text: str) -> [GpxTrack] {
+    var out: [GpxTrack] = []
+    var at = 0
+    while true {
+        let start = find_from(text, "<trk>", at)
+        if start < 0 {
+            return out
+        }
+        let close = find_from(text, "</trk>", start)
+        if close < 0 {
+            return out
+        }
+        let body = text.substr(start, close - start)
+        var track = GpxTrack{ name: element(body, "name"), segments: [] }
+        var seg_at = 0
+        while true {
+            let seg_start = find_from(body, "<trkseg>", seg_at)
+            if seg_start < 0 {
+                break
+            }
+            let seg_close = find_from(body, "</trkseg>", seg_start)
+            if seg_close < 0 {
+                break
+            }
+            track.segments.push(read_points(body.substr(seg_start,
+                seg_close - seg_start), "trkpt"))
+            seg_at = seg_close + 1
+        }
+        out.push(track)
+        at = close + 1
+    }
+    return out
+}
+
+/// How many points a track holds, over all its segments.
+pub fn point_count(track: GpxTrack) -> i64 {
+    var total = 0
+    for segment in track.segments {
+        total = total + segment.len()
+    }
+    return total
+}
+
+/// A track's length in metres, on the ellipsoid.
+///
+/// Summed **within** segments only. A new segment means the recording
+/// stopped, so the gap between them is not a distance travelled — and summing
+/// straight through it is the most common error in a GPX distance
+/// calculation. A tunnel produces exactly this.
+pub fn length(track: GpxTrack) -> f64 {
+    var total = 0.0
+    for segment in track.segments {
+        var i = 1
+        while i < segment.len() {
+            total = total + haversine_between(segment[i - 1], segment[i])
+            i = i + 1
+        }
+    }
+    return total
+}
+
+fn haversine_between(a: GpxPoint, b: GpxPoint) -> f64 {
+    return geodesic.haversine(a.latitude, a.longitude, b.latitude,
+        b.longitude)
+}
+
+/// The same, summed straight through the gaps.
+///
+/// Provided so the difference can be measured rather than assumed: on a track
+/// with a tunnel in it, this is the wrong answer that most software gives.
+pub fn length_ignoring_gaps(track: GpxTrack) -> f64 {
+    var flat: [GpxPoint] = []
+    for segment in track.segments {
+        for point in segment {
+            flat.push(point)
+        }
+    }
+    var total = 0.0
+    var i = 1
+    while i < flat.len() {
+        total = total + haversine_between(flat[i - 1], flat[i])
+        i = i + 1
+    }
+    return total
+}
+
+/// Total ascent in metres, with a threshold.
+///
+/// GPS elevation is three to five times noisier than horizontal position,
+/// because every satellite is above the receiver and none below it. Summing
+/// every positive difference sums the noise too and overstates ascent by up
+/// to forty per cent. Every device applies a threshold and none of them agree
+/// on it, which is why two apps report different climb for one file.
+pub fn ascent(track: GpxTrack, threshold: f64) -> f64 {
+    var total = 0.0
+    for segment in track.segments {
+        var reference = 0.0
+        var have = false
+        for point in segment {
+            if not point.has_elevation {
+                continue
+            }
+            if not have {
+                reference = point.elevation
+                have = true
+                continue
+            }
+            let rise = point.elevation - reference
+            if rise >= threshold {
+                total = total + rise
+                reference = point.elevation
+            } else if rise <= 0.0 - threshold {
+                reference = point.elevation
+            }
+        }
+    }
+    return total
+}
+
+/// Total descent, by the same rule.
+pub fn descent(track: GpxTrack, threshold: f64) -> f64 {
+    var total = 0.0
+    for segment in track.segments {
+        var reference = 0.0
+        var have = false
+        for point in segment {
+            if not point.has_elevation {
+                continue
+            }
+            if not have {
+                reference = point.elevation
+                have = true
+                continue
+            }
+            let drop = reference - point.elevation
+            if drop >= threshold {
+                total = total + drop
+                reference = point.elevation
+            } else if drop <= 0.0 - threshold {
+                reference = point.elevation
+            }
+        }
+    }
+    return total
+}
+
+/// The bounding box, as (south, west, north, east).
+pub fn bounds(track: GpxTrack) -> (f64, f64, f64, f64) {
+    var south = 90.0
+    var north = 0.0 - 90.0
+    var west = 180.0
+    var east = 0.0 - 180.0
+    for segment in track.segments {
+        for point in segment {
+            if point.latitude < south {
+                south = point.latitude
+            }
+            if point.latitude > north {
+                north = point.latitude
+            }
+            if point.longitude < west {
+                west = point.longitude
+            }
+            if point.longitude > east {
+                east = point.longitude
+            }
+        }
+    }
+    return (south, west, north, east)
+}
+
+/// A track written back out as GPX 1.1.
+pub fn write(file: GpxFile) -> str {
+    var out = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+    out = out + "<gpx version=\"1.1\" creator=\"" + file.creator +
+    "\" xmlns=\"http://www.topografix.com/GPX/1/1\">\n"
+    for point in file.waypoints {
+        out = out + write_point("wpt", point, "  ")
+    }
+    for track in file.tracks {
+        out = out + "  <trk>\n"
+        if track.name != "" {
+            out = out + "    <name>" + track.name + "</name>\n"
+        }
+        for segment in track.segments {
+            out = out + "    <trkseg>\n"
+            for point in segment {
+                out = out + write_point("trkpt", point, "      ")
+            }
+            out = out + "    </trkseg>\n"
+        }
+        out = out + "  </trk>\n"
+    }
+    return out + "</gpx>\n"
+}
+
+fn write_point(tag: str, point: GpxPoint, indent: str) -> str {
+    var out = indent + "<" + tag + " lat=\"{point.latitude}\" " +
+    "lon=\"{point.longitude}\""
+    if not point.has_elevation and point.name == "" {
+        return out + "/>\n"
+    }
+    out = out + ">\n"
+    if point.has_elevation {
+        out = out + indent + "  <ele>{point.elevation}</ele>\n"
+    }
+    if point.name != "" {
+        out = out + indent + "  <name>" + point.name + "</name>\n"
+    }
+    return out + indent + "</" + tag + ">\n"
+}
+
+/// Points dropped that are within a distance of the line between their
+/// neighbours.
+///
+/// A track recorded at one point a second is mostly redundant: a straight
+/// stretch needs two points, not two hundred. This is Douglas-Peucker's
+/// criterion applied one point at a time, which is not the same thing and is
+/// what a device does in real time.
+pub fn thin(segment: [GpxPoint], metres: f64) -> [GpxPoint] {
+    if segment.len() < 3 {
+        return segment
+    }
+    var out: [GpxPoint] = [segment[0]]
+    var i = 1
+    while i < segment.len() - 1 {
+        let straight = haversine_between(out[out.len() - 1], segment[i + 1])
+        let bent = haversine_between(out[out.len() - 1], segment[i]) +
+        haversine_between(segment[i], segment[i + 1])
+        if bent - straight >= metres {
+            out.push(segment[i])
+        }
+        i = i + 1
+    }
+    out.push(segment[segment.len() - 1])
+    return out
+}
+
+/// Total ascent by the smoothing rule `gpxpy` uses.
+///
+/// A three-point weighted filter — 0.3, 0.4, 0.3 — over the elevations, and
+/// then every positive difference summed with no threshold at all. It is a
+/// different answer from a threshold, it is neither more nor less right, and
+/// it is here so that the two can be compared rather than argued about: on a
+/// sixty-point track the naive sum, this, and a three-metre threshold give
+/// 40, 23 and 7 metres of climb for the same data.
+pub fn smoothed_ascent(track: GpxTrack) -> f64 {
+    return smoothed(track, true)
+}
+
+/// Total descent by the same rule.
+pub fn smoothed_descent(track: GpxTrack) -> f64 {
+    return smoothed(track, false)
+}
+
+fn smoothed(track: GpxTrack, up: bool) -> f64 {
+    // Per segment, not over the whole track: the filter reaches one point
+    // either side, and a point at the end of a segment has no neighbour in
+    // the next one — the recording stopped in between.
+    var total = 0.0
+    for segment in track.segments {
+        total = total + smoothed_segment(segment, up)
+    }
+    return total
+}
+
+fn smoothed_segment(segment: [GpxPoint], up: bool) -> f64 {
+    var elevations: [f64] = []
+    for point in segment {
+        if point.has_elevation {
+            elevations.push(point.elevation)
+        }
+    }
+    var filtered: [f64] = []
+    var i = 0
+    while i < elevations.len() {
+        if i > 0 and i < elevations.len() - 1 {
+            filtered.push(elevations[i - 1] * 0.3 + elevations[i] * 0.4 +
+                elevations[i + 1] * 0.3)
+        } else {
+            filtered.push(elevations[i])
+        }
+        i = i + 1
+    }
+    var total = 0.0
+    i = 1
+    while i < filtered.len() {
+        let d = filtered[i] - filtered[i - 1]
+        if up and d > 0.0 {
+            total = total + d
+        }
+        if not up and d < 0.0 {
+            total = total - d
+        }
+        i = i + 1
+    }
+    return total
+}
+
+/// A track's length on the ellipsoid rather than on a sphere.
+///
+/// The difference from `length` is up to half a per cent and is systematic
+/// with latitude. `gpxpy` uses a sphere of the *equatorial* radius, which is
+/// larger than the mean, so its figure is about a tenth of a per cent above
+/// this one on a mid-latitude track.
+pub fn length_exact(track: GpxTrack) -> f64 {
+    var total = 0.0
+    for segment in track.segments {
+        var i = 1
+        while i < segment.len() {
+            let d: f64 ! GeoError = geodesic.distance(segment[i - 1].latitude,
+                segment[i - 1].longitude, segment[i].latitude,
+                segment[i].longitude)
+            total = total + (d ?? 0.0)
+            i = i + 1
+        }
+    }
+    return total
+}

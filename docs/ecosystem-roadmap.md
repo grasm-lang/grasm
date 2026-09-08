@@ -14,7 +14,7 @@ plan that discovers them 300 packages in.
 | | |
 |---|---|
 | Started | 78 |
-| Now | 375 |
+| Now | 380 |
 | Tier 1 target | 200 |
 | Tier 2 target | 500 |
 | Tier 3 target | 800 |
@@ -241,7 +241,7 @@ says where the data came from and under what licence, which is the condition.
 | Security III | `passwordpolicy` `entropy` `secretscan` `keyderive` `saltedhash` | zxcvbn, gitleaks rules |
 | Web III | `formdata` `csp` `hsts` `preflight` `webfinger` | the specifications |
 | Serialisation IV | `flatbuffers` `capnp` `ubjson` `smile` `amf` | the reference encoders |
-| Geospatial II | `mgrs` `utm` `gpx` `kml` `geodesic` | pyproj, geographiclib |
+| ~~Geospatial II~~ | ~~`mgrs` `utm` `gpx` `kml` `geodesic`~~ | pyproj, geographiclib, the Python `mgrs` package, gpxpy |
 
 That is a hundred, in twenty batches, and the same rhythm as the first: five
 or six packages to a group demo, every claim an assertion, every batch checked

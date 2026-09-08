@@ -1,0 +1,296 @@
+// Distance on an ellipsoid, and why the sphere is not good enough.
+//
+// The great-circle formula treats the Earth as a sphere and is wrong by up to
+// half a per cent — 22 kilometres on a 4,000 kilometre flight. For a "how far
+// is it" label that is fine. For a survey boundary, an aviation route or a
+// geofence it is not, and the difference is not random: it is systematic with
+// latitude, so it never averages out.
+//
+// The Earth is an oblate spheroid, flattened by about one part in 298 because
+// it is spinning. WGS 84 — the datum GPS reports in — defines it as an
+// ellipsoid with a semi-major axis of exactly 6,378,137 metres and a
+// flattening of exactly 1/298.257223563. Both are definitions rather than
+// measurements, like the metre.
+//
+// ## Vincenty, and where it fails
+//
+// Vincenty's 1975 formulae solve the problem by iterating, and converge to
+// under a millimetre over any distance. Except for nearly antipodal points,
+// where the iteration oscillates and never converges — which is not a rare
+// edge case in a geofence that spans the planet, and is why Vincenty needs a
+// fallback and an iteration cap.
+//
+// Karney's 2013 algorithm converges everywhere and is what `geographiclib`
+// implements. This is Vincenty with the cap and the honest failure, because
+// Vincenty is what is short enough to read.
+//
+// ## Bearings are not symmetric
+//
+// The bearing from London to New York is 288 degrees; the bearing from New
+// York back to London is 51, not 108. A great circle's direction changes
+// along its length, which is why a long flight's path looks curved on a
+// Mercator map and why an aircraft's heading changes all the way.
+//
+// ## The haversine is still worth having
+//
+// It is exact on a sphere, it never fails to converge, and it is fast. For
+// anything where half a per cent does not matter — nearest-shop, ranking by
+// distance, a rough radius filter — it is the right answer, and knowing when
+// it is right is worth more than always using the expensive one.
+//
+// Checked against `geographiclib`.
+
+type GeoError =
+    | NoConvergence(iterations: i64)
+    | BadLatitude(value: f64)
+
+fn pi() -> f64 {
+    return 3.141592653589793
+}
+
+fn radians(d: f64) -> f64 {
+    return d * pi() / 180.0
+}
+
+fn to_degrees(r: f64) -> f64 {
+    return r * 180.0 / pi()
+}
+
+/// WGS 84's semi-major axis, in metres. Exact by definition.
+pub fn semi_major() -> f64 {
+    return 6378137.0
+}
+
+/// WGS 84's flattening. Exact by definition.
+pub fn flattening() -> f64 {
+    return 1.0 / 298.257223563
+}
+
+/// The semi-minor axis, which follows from the other two.
+pub fn semi_minor() -> f64 {
+    return semi_major() * (1.0 - flattening())
+}
+
+/// The radius of a sphere with the same volume, which is what a haversine
+/// should use.
+pub fn mean_radius() -> f64 {
+    return 6371008.8
+}
+
+fn atan2(y: f64, x: f64) -> f64 {
+    if x > 0.0 {
+        return (y / x).atan()
+    }
+    if x < 0.0 {
+        if y >= 0.0 {
+            return (y / x).atan() + pi()
+        }
+        return (y / x).atan() - pi()
+    }
+    if y > 0.0 {
+        return pi() / 2.0
+    }
+    if y < 0.0 {
+        return 0.0 - pi() / 2.0
+    }
+    return 0.0
+}
+
+/// Great-circle distance in metres, treating the Earth as a sphere.
+///
+/// Wrong by up to half a per cent, systematically with latitude. Right when
+/// half a per cent does not matter, which is most of the time.
+pub fn haversine(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
+    let p1 = radians(lat1)
+    let p2 = radians(lat2)
+    let dp = radians(lat2 - lat1)
+    let dl = radians(lon2 - lon1)
+    let a = (dp / 2.0).sin() * (dp / 2.0).sin() +
+    p1.cos() * p2.cos() * (dl / 2.0).sin() * (dl / 2.0).sin()
+    return 2.0 * mean_radius() * atan2(a.sqrt(), (1.0 - a).sqrt())
+}
+
+/// Distance in metres on the WGS 84 ellipsoid, by Vincenty's inverse
+/// formula.
+///
+/// Converges to under a millimetre, except between nearly antipodal points
+/// where it does not converge at all — which is reported rather than
+/// approximated, because a wrong distance that looks right is worse than an
+/// error.
+pub fn distance(lat1: f64, lon1: f64, lat2: f64,
+    lon2: f64) -> f64 ! GeoError {
+    return (try inverse(lat1, lon1, lat2, lon2)).0
+}
+
+/// The initial bearing in degrees from the first point to the second.
+pub fn bearing(lat1: f64, lon1: f64, lat2: f64,
+    lon2: f64) -> f64 ! GeoError {
+    return wrap_degrees((try inverse(lat1, lon1, lat2, lon2)).1)
+}
+
+/// The bearing on arrival, which is not the reverse of the departure one.
+pub fn final_bearing(lat1: f64, lon1: f64, lat2: f64,
+    lon2: f64) -> f64 ! GeoError {
+    return wrap_degrees((try inverse(lat1, lon1, lat2, lon2)).2)
+}
+
+fn wrap_degrees(value: f64) -> f64 {
+    var v = value % 360.0
+    if v < 0.0 {
+        v = v + 360.0
+    }
+    return v
+}
+
+/// Distance and both bearings at once, which is what the formula computes.
+pub fn inverse(lat1: f64, lon1: f64, lat2: f64,
+    lon2: f64) -> (f64, f64, f64) ! GeoError {
+    if lat1 > 90.0 or lat1 < 0.0 - 90.0 {
+        fail(BadLatitude(lat1))
+    }
+    if lat2 > 90.0 or lat2 < 0.0 - 90.0 {
+        fail(BadLatitude(lat2))
+    }
+    let a = semi_major()
+    let b = semi_minor()
+    let f = flattening()
+    let l = radians(lon2 - lon1)
+    // The reduced latitude: where the point would be on a sphere of radius a
+    // if the ellipsoid were squashed onto it. Every term below is on that
+    // sphere, which is what makes the formula tractable.
+    let u1 = ((1.0 - f) * radians(lat1).tan()).atan()
+    let u2 = ((1.0 - f) * radians(lat2).tan()).atan()
+    let sin_u1 = u1.sin()
+    let cos_u1 = u1.cos()
+    let sin_u2 = u2.sin()
+    let cos_u2 = u2.cos()
+    var lambda = l
+    var iterations = 0
+    var sin_sigma = 0.0
+    var cos_sigma = 0.0
+    var sigma = 0.0
+    var sin_alpha = 0.0
+    var cos_sq_alpha = 0.0
+    var cos_2sigma_m = 0.0
+    var going = true
+    while going {
+        iterations = iterations + 1
+        if iterations > 200 {
+            fail(NoConvergence(iterations))
+        }
+        let sin_lambda = lambda.sin()
+        let cos_lambda = lambda.cos()
+        sin_sigma = (cos_u2 * sin_lambda * (cos_u2 * sin_lambda) +
+            (cos_u1 * sin_u2 - sin_u1 * cos_u2 * cos_lambda) *
+            (cos_u1 * sin_u2 - sin_u1 * cos_u2 * cos_lambda)).sqrt()
+        if sin_sigma == 0.0 {
+            return (0.0, 0.0, 0.0)
+        }
+        cos_sigma = sin_u1 * sin_u2 + cos_u1 * cos_u2 * cos_lambda
+        sigma = atan2(sin_sigma, cos_sigma)
+        sin_alpha = cos_u1 * cos_u2 * sin_lambda / sin_sigma
+        cos_sq_alpha = 1.0 - sin_alpha * sin_alpha
+        cos_2sigma_m = 0.0
+        if cos_sq_alpha != 0.0 {
+            cos_2sigma_m = cos_sigma - 2.0 * sin_u1 * sin_u2 / cos_sq_alpha
+        }
+        let c = f / 16.0 * cos_sq_alpha *
+        (4.0 + f * (4.0 - 3.0 * cos_sq_alpha))
+        let previous = lambda
+        lambda = l + (1.0 - c) * f * sin_alpha * (sigma + c * sin_sigma *
+            (cos_2sigma_m + c * cos_sigma *
+                (0.0 - 1.0 + 2.0 * cos_2sigma_m * cos_2sigma_m)))
+        if magnitude(lambda - previous) < 1.0e-12 {
+            going = false
+        }
+    }
+    let u_sq = cos_sq_alpha * (a * a - b * b) / (b * b)
+    let big_a = 1.0 + u_sq / 16384.0 * (4096.0 + u_sq *
+        (0.0 - 768.0 + u_sq * (320.0 - 175.0 * u_sq)))
+    let big_b = u_sq / 1024.0 * (256.0 + u_sq *
+        (0.0 - 128.0 + u_sq * (74.0 - 47.0 * u_sq)))
+    let delta = big_b * sin_sigma * (cos_2sigma_m + big_b / 4.0 *
+        (cos_sigma * (0.0 - 1.0 + 2.0 * cos_2sigma_m * cos_2sigma_m) -
+            big_b / 6.0 * cos_2sigma_m *
+            (0.0 - 3.0 + 4.0 * sin_sigma * sin_sigma) *
+            (0.0 - 3.0 + 4.0 * cos_2sigma_m * cos_2sigma_m)))
+    let sin_lambda = lambda.sin()
+    let cos_lambda = lambda.cos()
+    let start = to_degrees(atan2(cos_u2 * sin_lambda,
+        cos_u1 * sin_u2 - sin_u1 * cos_u2 * cos_lambda))
+    let finish = to_degrees(atan2(cos_u1 * sin_lambda,
+        0.0 - sin_u1 * cos_u2 + cos_u1 * sin_u2 * cos_lambda))
+    return (b * big_a * (sigma - delta), start, finish)
+}
+
+fn magnitude(v: f64) -> f64 {
+    if v < 0.0 {
+        return 0.0 - v
+    }
+    return v
+}
+
+/// Where you arrive going a distance on a bearing: Vincenty's direct
+/// formula.
+pub fn destination(lat: f64, lon: f64, bearing_degrees: f64,
+    metres: f64) -> (f64, f64) {
+    let a = semi_major()
+    let b = semi_minor()
+    let f = flattening()
+    let alpha1 = radians(bearing_degrees)
+    let u1 = ((1.0 - f) * radians(lat).tan()).atan()
+    let sin_u1 = u1.sin()
+    let cos_u1 = u1.cos()
+    let tan_u1 = sin_u1 / cos_u1
+    let sigma1 = atan2(tan_u1, alpha1.cos())
+    let sin_alpha = cos_u1 * alpha1.sin()
+    let cos_sq_alpha = 1.0 - sin_alpha * sin_alpha
+    let u_sq = cos_sq_alpha * (a * a - b * b) / (b * b)
+    let big_a = 1.0 + u_sq / 16384.0 * (4096.0 + u_sq *
+        (0.0 - 768.0 + u_sq * (320.0 - 175.0 * u_sq)))
+    let big_b = u_sq / 1024.0 * (256.0 + u_sq *
+        (0.0 - 128.0 + u_sq * (74.0 - 47.0 * u_sq)))
+    var sigma = metres / (b * big_a)
+    var cos_2sigma_m = 0.0
+    var i = 0
+    while i < 100 {
+        cos_2sigma_m = (2.0 * sigma1 + sigma).cos()
+        let delta = big_b * sigma.sin() * (cos_2sigma_m + big_b / 4.0 *
+            (sigma.cos() *
+                (0.0 - 1.0 + 2.0 * cos_2sigma_m * cos_2sigma_m) -
+                big_b / 6.0 * cos_2sigma_m *
+                (0.0 - 3.0 + 4.0 * sigma.sin() * sigma.sin()) *
+                (0.0 - 3.0 + 4.0 * cos_2sigma_m * cos_2sigma_m)))
+        let previous = sigma
+        sigma = metres / (b * big_a) + delta
+        if magnitude(sigma - previous) < 1.0e-12 {
+            i = 100
+        } else {
+            i = i + 1
+        }
+    }
+    let tmp = sin_u1 * sigma.sin() - cos_u1 * sigma.cos() * alpha1.cos()
+    let lat2 = atan2(sin_u1 * sigma.cos() +
+        cos_u1 * sigma.sin() * alpha1.cos(),
+        (1.0 - f) * (sin_alpha * sin_alpha + tmp * tmp).sqrt())
+    let lambda = atan2(sigma.sin() * alpha1.sin(),
+        cos_u1 * sigma.cos() - sin_u1 * sigma.sin() * alpha1.cos())
+    let c = f / 16.0 * cos_sq_alpha * (4.0 + f * (4.0 - 3.0 * cos_sq_alpha))
+    let l = lambda - (1.0 - c) * f * sin_alpha * (sigma + c * sigma.sin() *
+        (cos_2sigma_m + c * sigma.cos() *
+            (0.0 - 1.0 + 2.0 * cos_2sigma_m * cos_2sigma_m)))
+    return (to_degrees(lat2), lon + to_degrees(l))
+}
+
+/// How far the haversine is from the ellipsoidal answer, as a fraction.
+///
+/// Up to about half a per cent, and systematic with latitude rather than
+/// random — so it never averages out over a set of routes.
+pub fn sphere_error(lat1: f64, lon1: f64, lat2: f64,
+    lon2: f64) -> f64 ! GeoError {
+    let exact = try distance(lat1, lon1, lat2, lon2)
+    if exact == 0.0 {
+        return 0.0
+    }
+    return magnitude(haversine(lat1, lon1, lat2, lon2) - exact) / exact
+}

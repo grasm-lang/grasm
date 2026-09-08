@@ -1,0 +1,10 @@
+[package]
+name = "gpx"
+version = "1.0.0"
+
+# Parses and writes a track. Opens nothing.
+capabilities = []
+
+[dependencies.geodesic]
+path = "../geodesic"
+version = "^1.0.0"

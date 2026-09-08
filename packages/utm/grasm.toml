@@ -1,0 +1,10 @@
+[package]
+name = "utm"
+version = "1.0.0"
+
+# Arithmetic on coordinates. Opens nothing.
+capabilities = []
+
+[dependencies.geodesic]
+path = "../geodesic"
+version = "^1.0.0"

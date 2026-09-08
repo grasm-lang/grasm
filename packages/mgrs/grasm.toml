@@ -1,0 +1,10 @@
+[package]
+name = "mgrs"
+version = "1.0.0"
+
+# Formats a grid reference. Opens nothing.
+capabilities = []
+
+[dependencies.utm]
+path = "../utm"
+version = "^1.0.0"

@@ -1,0 +1,6 @@
+[package]
+name = "geodesic"
+version = "1.0.0"
+
+# Arithmetic on coordinates. Opens nothing.
+capabilities = []
