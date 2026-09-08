@@ -1,0 +1,698 @@
+// From a regular expression to a table: what lex actually does.
+//
+// A regular expression is not matched by backtracking. It is *compiled*, into
+// a machine with one state per position and a table saying where each
+// character goes, and then matching is one array lookup a character — no
+// stack, no backtracking, and a running time that depends on the input's
+// length and nothing else.
+//
+// That is what `lex` and `flex` produce, and it is why a lexer generated in
+// 1975 still outruns a hand-written one. It is also why a regular expression
+// engine that *does* backtrack — Perl's, Python's, JavaScript's — can take
+// exponential time on `(a+)+b`, and a compiled one cannot.
+//
+// ## The three steps
+//
+// **Thompson's construction** turns the expression into a non-deterministic
+// machine: one small gadget per operator, glued together, with epsilon
+// transitions doing the gluing. It is linear in the expression's size and it
+// is beautiful — each operator's gadget is three lines.
+//
+// **Subset construction** turns that into a deterministic one: each DFA state
+// is a *set* of NFA states, and the transition is the set you reach. This is
+// the step that can blow up — some expressions have exponentially many
+// subsets — and in practice almost none do.
+//
+// **Minimisation** merges states nothing can tell apart. Two states are
+// equivalent when no string leads one to an accepting state and the other
+// somewhere else; the algorithm starts by splitting accepting from
+// non-accepting and refines until nothing splits. The minimal DFA is unique,
+// which is a genuinely surprising theorem: any two minimal DFAs for the same
+// language are the same machine with the states renamed.
+//
+// ## Longest match, and why order matters
+//
+// A lexer does not ask "does this match" but "how much of this matches". It
+// runs the DFA until it dies and backs up to the last accepting state — the
+// **maximal munch** rule, which is why `>=` lexes as one token and not two,
+// and why `intx` is an identifier rather than a keyword and a variable.
+//
+// When two rules match the same longest string, the one written first wins.
+// That is the only reason keyword rules go above the identifier rule in every
+// lexer specification ever written.
+//
+// ## What is here
+//
+// Concatenation, alternation, `*`, `+`, `?`, character classes with ranges
+// and negation, `.`, and escapes. Not backreferences or lookahead — those are
+// not regular, cannot be compiled to a DFA, and are the reason a backtracking
+// engine exists at all.
+//
+// Checked against Python's `re` on thousands of strings.
+
+type LexError =
+    | UnexpectedEnd(at: i64)
+    | UnexpectedChar(at: i64, code: i64)
+    | EmptyExpression()
+    | NoRules()
+
+    /// One NFA state: transitions on a character range, and epsilon moves.
+type NfaState = {
+    /// Character ranges and where they go, as (low, high, target).
+    moves: [(i64, i64, i64)],
+    /// Where an epsilon transition goes.
+    epsilons: [i64],
+    /// Which rule accepts here, or -1.
+    accepts: i64,
+}
+
+type Nfa = {
+    states: [NfaState],
+    start: i64,
+}
+
+type DfaState = {
+    /// One target a character, 0..255; -1 for no transition.
+    moves: [i64],
+    accepts: i64,
+}
+
+type Dfa = {
+    states: [DfaState],
+    start: i64,
+}
+
+fn empty_state() -> NfaState {
+    return NfaState{ moves: [], epsilons: [], accepts: 0 - 1 }
+}
+
+fn add_state(inout nfa: Nfa) -> i64 {
+    nfa.states.push(empty_state())
+    return nfa.states.len() - 1
+}
+
+// ------------------------------------------------------- the expression
+
+type LexNode = {
+    /// `char`, `class`, `concat`, `alt`, `star`, `plus`, `opt`, `empty`.
+    kind: str,
+    /// For `class`: the ranges, as (low, high). For `char`: one range.
+    ranges: [(i64, i64)],
+    negated: bool,
+    children: [i64],
+}
+
+type LexRegex = {
+    nodes: [LexNode],
+    root: i64,
+}
+
+fn push_node(inout out: [LexNode], node: LexNode) -> i64 {
+    out.push(node)
+    return out.len() - 1
+}
+
+/// A regular expression parsed into a tree.
+pub fn parse(pattern: str) -> LexRegex ! LexError {
+    var nodes: [LexNode] = []
+    let codes = pattern.codes()
+    if codes.len() == 0 {
+        fail(EmptyExpression())
+    }
+    let parsed = try parse_alt(nodes, codes, 0)
+    if parsed.1 != codes.len() {
+        fail(UnexpectedChar(parsed.1, codes[parsed.1]))
+    }
+    return LexRegex{ nodes: nodes, root: parsed.0 }
+}
+
+fn parse_alt(inout nodes: [LexNode], codes: [i64],
+    at: i64) -> (i64, i64) ! LexError {
+    var left = try parse_concat(nodes, codes, at)
+    while left.1 < codes.len() and codes[left.1] == 124 {
+        let right = try parse_concat(nodes, codes, left.1 + 1)
+        let node = push_node(nodes, LexNode{ kind: "alt", ranges: [],
+            negated: false, children: [left.0, right.0] })
+        left = (node, right.1)
+    }
+    return left
+}
+
+fn parse_concat(inout nodes: [LexNode], codes: [i64],
+    at: i64) -> (i64, i64) ! LexError {
+    var parts: [i64] = []
+    var i = at
+    while i < codes.len() and codes[i] != 124 and codes[i] != 41 {
+        let piece = try parse_repeat(nodes, codes, i)
+        parts.push(piece.0)
+        i = piece.1
+    }
+    if parts.len() == 0 {
+        return (push_node(nodes, LexNode{ kind: "empty", ranges: [],
+            negated: false, children: [] }), i)
+    }
+    if parts.len() == 1 {
+        return (parts[0], i)
+    }
+    return (push_node(nodes, LexNode{ kind: "concat", ranges: [],
+        negated: false, children: parts }), i)
+}
+
+fn parse_repeat(inout nodes: [LexNode], codes: [i64],
+    at: i64) -> (i64, i64) ! LexError {
+    var atom = try parse_atom(nodes, codes, at)
+    var going = true
+    while going and atom.1 < codes.len() {
+        let code = codes[atom.1]
+        if code == 42 {
+            atom = (push_node(nodes, LexNode{ kind: "star", ranges: [],
+                negated: false, children: [atom.0] }), atom.1 + 1)
+        } else if code == 43 {
+            atom = (push_node(nodes, LexNode{ kind: "plus", ranges: [],
+                negated: false, children: [atom.0] }), atom.1 + 1)
+        } else if code == 63 {
+            atom = (push_node(nodes, LexNode{ kind: "opt", ranges: [],
+                negated: false, children: [atom.0] }), atom.1 + 1)
+        } else {
+            going = false
+        }
+    }
+    return atom
+}
+
+fn parse_atom(inout nodes: [LexNode], codes: [i64],
+    at: i64) -> (i64, i64) ! LexError {
+    if at >= codes.len() {
+        fail(UnexpectedEnd(at))
+    }
+    let code = codes[at]
+    if code == 40 {
+        let inner = try parse_alt(nodes, codes, at + 1)
+        if inner.1 >= codes.len() or codes[inner.1] != 41 {
+            fail(UnexpectedEnd(inner.1))
+        }
+        return (inner.0, inner.1 + 1)
+    }
+    if code == 91 {
+        return try parse_class(nodes, codes, at + 1)
+    }
+    if code == 46 {
+        return (push_node(nodes, LexNode{ kind: "class",
+            ranges: [(0, 255)], negated: false, children: [] }), at + 1)
+    }
+    if code == 92 {
+        if at + 1 >= codes.len() {
+            fail(UnexpectedEnd(at))
+        }
+        return (escape_node(nodes, codes[at + 1]), at + 2)
+    }
+    if code == 42 or code == 43 or code == 63 or code == 41 {
+        fail(UnexpectedChar(at, code))
+    }
+    return (push_node(nodes, LexNode{ kind: "char",
+        ranges: [(code, code)], negated: false, children: [] }), at + 1)
+}
+
+fn escape_node(inout nodes: [LexNode], code: i64) -> i64 {
+    if code == 100 {
+        return push_node(nodes, LexNode{ kind: "class",
+            ranges: [(48, 57)], negated: false, children: [] })
+    }
+    if code == 119 {
+        return push_node(nodes, LexNode{ kind: "class",
+            ranges: [(48, 57), (65, 90), (95, 95), (97, 122)],
+            negated: false, children: [] })
+    }
+    if code == 115 {
+        return push_node(nodes, LexNode{ kind: "class",
+            ranges: [(9, 13), (32, 32)], negated: false, children: [] })
+    }
+    if code == 110 {
+        return push_node(nodes, LexNode{ kind: "char",
+            ranges: [(10, 10)], negated: false, children: [] })
+    }
+    if code == 116 {
+        return push_node(nodes, LexNode{ kind: "char",
+            ranges: [(9, 9)], negated: false, children: [] })
+    }
+    return push_node(nodes, LexNode{ kind: "char", ranges: [(code, code)],
+        negated: false, children: [] })
+}
+
+fn parse_class(inout nodes: [LexNode], codes: [i64],
+    at: i64) -> (i64, i64) ! LexError {
+    var i = at
+    var negated = false
+    if i < codes.len() and codes[i] == 94 {
+        negated = true
+        i = i + 1
+    }
+    var ranges: [(i64, i64)] = []
+    while i < codes.len() and codes[i] != 93 {
+        var low = codes[i]
+        if low == 92 and i + 1 < codes.len() {
+            i = i + 1
+            low = class_escape(codes[i], ranges)
+            if low < 0 {
+                i = i + 1
+                continue
+            }
+        }
+        i = i + 1
+        if i + 1 < codes.len() and codes[i] == 45 and codes[i + 1] != 93 {
+            ranges.push((low, codes[i + 1]))
+            i = i + 2
+            continue
+        }
+        ranges.push((low, low))
+    }
+    if i >= codes.len() {
+        fail(UnexpectedEnd(i))
+    }
+    return (push_node(nodes, LexNode{ kind: "class", ranges: ranges,
+        negated: negated, children: [] }), i + 1)
+}
+
+fn class_escape(code: i64, inout ranges: [(i64, i64)]) -> i64 {
+    if code == 100 {
+        ranges.push((48, 57))
+        return 0 - 1
+    }
+    if code == 119 {
+        ranges.push((48, 57))
+        ranges.push((65, 90))
+        ranges.push((95, 95))
+        ranges.push((97, 122))
+        return 0 - 1
+    }
+    if code == 115 {
+        ranges.push((9, 13))
+        ranges.push((32, 32))
+        return 0 - 1
+    }
+    if code == 110 {
+        return 10
+    }
+    if code == 116 {
+        return 9
+    }
+    return code
+}
+
+// ------------------------------------------------- Thompson's construction
+
+/// The NFA for a regular expression.
+///
+/// One gadget an operator, glued with epsilon transitions. Linear in the
+/// expression's size, which is why it is the construction everyone uses.
+pub fn build_nfa(regex: LexRegex, accepts: i64) -> Nfa {
+    var nfa = Nfa{ states: [], start: 0 }
+    let start = add_state(nfa)
+    nfa.start = start
+    let end = emit(nfa, regex, regex.root, start)
+    nfa.states[end].accepts = accepts
+    return nfa
+}
+
+fn emit(inout nfa: Nfa, regex: LexRegex, node: i64, from: i64) -> i64 {
+    let n = regex.nodes[node]
+    if n.kind == "empty" {
+        return from
+    }
+    if n.kind == "char" or n.kind == "class" {
+        let to = add_state(nfa)
+        for range in expand(n) {
+            nfa.states[from].moves.push((range.0, range.1, to))
+        }
+        return to
+    }
+    if n.kind == "concat" {
+        var at = from
+        for child in n.children {
+            at = emit(nfa, regex, child, at)
+        }
+        return at
+    }
+    if n.kind == "alt" {
+        let end = add_state(nfa)
+        for child in n.children {
+            let branch = add_state(nfa)
+            nfa.states[from].epsilons.push(branch)
+            let stop = emit(nfa, regex, child, branch)
+            nfa.states[stop].epsilons.push(end)
+        }
+        return end
+    }
+    if n.kind == "star" {
+        let loop_start = add_state(nfa)
+        let end = add_state(nfa)
+        nfa.states[from].epsilons.push(loop_start)
+        nfa.states[from].epsilons.push(end)
+        let stop = emit(nfa, regex, n.children[0], loop_start)
+        nfa.states[stop].epsilons.push(loop_start)
+        nfa.states[stop].epsilons.push(end)
+        return end
+    }
+    if n.kind == "plus" {
+        let loop_start = add_state(nfa)
+        let end = add_state(nfa)
+        nfa.states[from].epsilons.push(loop_start)
+        let stop = emit(nfa, regex, n.children[0], loop_start)
+        nfa.states[stop].epsilons.push(loop_start)
+        nfa.states[stop].epsilons.push(end)
+        return end
+    }
+    // `opt`: the body, or nothing.
+    let end = add_state(nfa)
+    nfa.states[from].epsilons.push(end)
+    let branch = add_state(nfa)
+    nfa.states[from].epsilons.push(branch)
+    let stop = emit(nfa, regex, n.children[0], branch)
+    nfa.states[stop].epsilons.push(end)
+    return end
+}
+
+/// A character class's ranges, negation applied.
+pub fn expand(node: LexNode) -> [(i64, i64)] {
+    if not node.negated {
+        return node.ranges
+    }
+    var allowed: [bool] = []
+    for _i in 0..256 {
+        allowed.push(true)
+    }
+    for range in node.ranges {
+        var c = range.0
+        while c <= range.1 and c < 256 {
+            allowed[c] = false
+            c = c + 1
+        }
+    }
+    var out: [(i64, i64)] = []
+    var c = 0
+    while c < 256 {
+        if not allowed[c] {
+            c = c + 1
+            continue
+        }
+        let low = c
+        while c < 256 and allowed[c] {
+            c = c + 1
+        }
+        out.push((low, c - 1))
+    }
+    return out
+}
+
+/// Several rules in one NFA, each with its own accepting state.
+///
+/// One start state with an epsilon into each rule. The rule number is what
+/// makes the earlier rule win when two match the same length.
+pub fn build_rules(patterns: [str]) -> Nfa ! LexError {
+    if patterns.len() == 0 {
+        fail(NoRules())
+    }
+    var nfa = Nfa{ states: [], start: 0 }
+    let start = add_state(nfa)
+    nfa.start = start
+    var rule = 0
+    while rule < patterns.len() {
+        let regex = try parse(patterns[rule])
+        let branch = add_state(nfa)
+        nfa.states[start].epsilons.push(branch)
+        let end = emit(nfa, regex, regex.root, branch)
+        nfa.states[end].accepts = rule
+        rule = rule + 1
+    }
+    return nfa
+}
+
+/// Everything reachable from a set of states without consuming anything.
+pub fn epsilon_closure(nfa: Nfa, states: [i64]) -> [i64] {
+    var out = states
+    var queue = states
+    while queue.len() > 0 {
+        var next: [i64] = []
+        for state in queue {
+            for target in nfa.states[state].epsilons {
+                if not has(out, target) {
+                    out.push(target)
+                    next.push(target)
+                }
+            }
+        }
+        queue = next
+    }
+    out.sort()
+    return out
+}
+
+fn has(values: [i64], wanted: i64) -> bool {
+    for value in values {
+        if value == wanted {
+            return true
+        }
+    }
+    return false
+}
+
+// -------------------------------------------------- the subset construction
+
+/// The deterministic machine for an NFA.
+///
+/// Each DFA state is a *set* of NFA states. This is the step that can blow up
+/// — some expressions have exponentially many reachable subsets — and in
+/// practice almost none do, which is why every lexer generator does it
+/// anyway.
+///
+/// A DFA state accepts the *lowest* rule number among the NFA states in it,
+/// which is what makes a rule written earlier win a tie.
+pub fn to_dfa(nfa: Nfa) -> Dfa {
+    var sets: [[i64]] = [epsilon_closure(nfa, [nfa.start])]
+    var states: [DfaState] = []
+    var at = 0
+    while at < sets.len() {
+        var moves: [i64] = []
+        for _c in 0..256 {
+            moves.push(0 - 1)
+        }
+        var c = 0
+        while c < 256 {
+            let target = step(nfa, sets[at], c)
+            if target.len() > 0 {
+                moves[c] = index_of_set(sets, target)
+            }
+            c = c + 1
+        }
+        states.push(DfaState{ moves: moves,
+            accepts: best_accept(nfa, sets[at]) })
+        at = at + 1
+    }
+    return Dfa{ states: states, start: 0 }
+}
+
+fn step(nfa: Nfa, states: [i64], code: i64) -> [i64] {
+    var out: [i64] = []
+    for state in states {
+        for move in nfa.states[state].moves {
+            if code >= move.0 and code <= move.1 and not has(out, move.2) {
+                out.push(move.2)
+            }
+        }
+    }
+    if out.len() == 0 {
+        return out
+    }
+    return epsilon_closure(nfa, out)
+}
+
+fn index_of_set(inout sets: [[i64]], wanted: [i64]) -> i64 {
+    var i = 0
+    while i < sets.len() {
+        if same(sets[i], wanted) {
+            return i
+        }
+        i = i + 1
+    }
+    sets.push(wanted)
+    return sets.len() - 1
+}
+
+fn same(left: [i64], right: [i64]) -> bool {
+    if left.len() != right.len() {
+        return false
+    }
+    var i = 0
+    while i < left.len() {
+        if left[i] != right[i] {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn best_accept(nfa: Nfa, states: [i64]) -> i64 {
+    var best = 0 - 1
+    for state in states {
+        let rule = nfa.states[state].accepts
+        if rule >= 0 and (best < 0 or rule < best) {
+            best = rule
+        }
+    }
+    return best
+}
+
+/// States nothing can tell apart, merged.
+///
+/// Split accepting from non-accepting, then refine: two states in a group
+/// stay together only while every character sends them to the same group.
+/// The result is unique — any two minimal DFAs for one language are the same
+/// machine with the states renamed, which is a genuinely surprising theorem.
+pub fn minimise(dfa: Dfa) -> Dfa {
+    var group: [i64] = []
+    for state in dfa.states {
+        group.push(state.accepts + 1)
+    }
+    var changed = true
+    while changed {
+        changed = false
+        var signatures: [str] = []
+        var next: [i64] = []
+        var i = 0
+        while i < dfa.states.len() {
+            let signature = signature_of(dfa, group, i)
+            var at = 0 - 1
+            var k = 0
+            while k < signatures.len() {
+                if signatures[k] == signature {
+                    at = k
+                }
+                k = k + 1
+            }
+            if at < 0 {
+                signatures.push(signature)
+                at = signatures.len() - 1
+            }
+            next.push(at)
+            i = i + 1
+        }
+        if not same(next, group) {
+            group = next
+            changed = true
+        }
+    }
+    return rebuild(dfa, group)
+}
+
+fn signature_of(dfa: Dfa, group: [i64], state: i64) -> str {
+    var out = "{group[state]}"
+    var c = 0
+    while c < 256 {
+        let target = dfa.states[state].moves[c]
+        if target < 0 {
+            out = out + ",-"
+        } else {
+            out = out + ",{group[target]}"
+        }
+        c = c + 1
+    }
+    return out
+}
+
+fn rebuild(dfa: Dfa, group: [i64]) -> Dfa {
+    var count = 0
+    for g in group {
+        if g + 1 > count {
+            count = g + 1
+        }
+    }
+    var states: [DfaState] = []
+    for _i in 0..count {
+        var moves: [i64] = []
+        for _c in 0..256 {
+            moves.push(0 - 1)
+        }
+        states.push(DfaState{ moves: moves, accepts: 0 - 1 })
+    }
+    var i = 0
+    while i < dfa.states.len() {
+        let g = group[i]
+        states[g].accepts = dfa.states[i].accepts
+        var c = 0
+        while c < 256 {
+            let target = dfa.states[i].moves[c]
+            if target >= 0 {
+                states[g].moves[c] = group[target]
+            }
+            c = c + 1
+        }
+        i = i + 1
+    }
+    return Dfa{ states: states, start: group[dfa.start] }
+}
+
+/// Whether the machine accepts the whole string.
+pub fn matches(dfa: Dfa, text: bytes) -> bool {
+    var at = dfa.start
+    for i in 0..text.len() {
+        at = dfa.states[at].moves[text.at(i)]
+        if at < 0 {
+            return false
+        }
+    }
+    return dfa.states[at].accepts >= 0
+}
+
+/// How much of the string matches, and which rule.
+///
+/// Runs until the machine dies and backs up to the last accepting state —
+/// the maximal munch rule, which is why `>=` lexes as one token and why
+/// `intx` is an identifier rather than a keyword followed by a variable.
+pub fn longest_match(dfa: Dfa, text: bytes, from: i64) -> (i64, i64) {
+    var at = dfa.start
+    var best_length = 0 - 1
+    var best_rule = 0 - 1
+    if dfa.states[at].accepts >= 0 {
+        best_length = 0
+        best_rule = dfa.states[at].accepts
+    }
+    var i = from
+    while i < text.len() {
+        at = dfa.states[at].moves[text.at(i)]
+        if at < 0 {
+            return (best_length, best_rule)
+        }
+        i = i + 1
+        if dfa.states[at].accepts >= 0 {
+            best_length = i - from
+            best_rule = dfa.states[at].accepts
+        }
+    }
+    return (best_length, best_rule)
+}
+
+/// A string split into tokens, as (rule, start, length).
+pub fn tokenise(dfa: Dfa, text: bytes) -> [(i64, i64, i64)] ! LexError {
+    var out: [(i64, i64, i64)] = []
+    var at = 0
+    while at < text.len() {
+        let found = longest_match(dfa, text, at)
+        if found.0 <= 0 {
+            fail(UnexpectedChar(at, text.at(at)))
+        }
+        out.push((found.1, at, found.0))
+        at = at + found.0
+    }
+    return out
+}
+
+/// How many states the machine has.
+pub fn state_count(dfa: Dfa) -> i64 {
+    return dfa.states.len()
+}
+
+/// The whole pipeline: patterns to a minimal machine.
+pub fn compile(patterns: [str]) -> Dfa ! LexError {
+    return minimise(to_dfa(try build_rules(patterns)))
+}

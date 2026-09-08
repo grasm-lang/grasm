@@ -1,0 +1,6 @@
+[package]
+name = "firstfollow"
+version = "1.0.0"
+
+# Analyses a grammar. Opens nothing.
+capabilities = []

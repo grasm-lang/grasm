@@ -1,0 +1,508 @@
+// LL and LR: the two ways to build a parser, and why one of them won.
+//
+// A top-down parser starts at the start symbol and guesses which production
+// to use from the next token. A bottom-up parser starts at the tokens and
+// works out which production it has just finished. LL is the first, LR the
+// second, and the difference decides which grammars you can write.
+//
+// ## Why LR handles more
+//
+// An LL parser has to choose a production *before* seeing what it produces.
+// So `E -> E + T` is impossible: choosing it means calling `E` to parse `E`
+// with nothing consumed, for ever. Left recursion has to be rewritten away,
+// which is why every LL grammar in a textbook has primed non-terminals in it.
+//
+// An LR parser decides *after*. It shifts tokens onto a stack and reduces
+// when the top of the stack matches a production's whole right-hand side — so
+// it sees the entire production before committing, and left recursion is not
+// merely allowed but *preferred*, because it keeps the stack shallow.
+//
+// That is why yacc, bison, and every serious parser generator since 1970 are
+// LR, and why the grammars in language specifications are written
+// left-recursively.
+//
+// ## The item set, which is the whole idea
+//
+// An LR parser's state is a set of **items** — productions with a dot marking
+// how much has been seen. `E -> E . + T` says "we have an E and could be part
+// way through that production". A state is every item that could apply, and
+// the closure operation is what adds them: if the dot is before a
+// non-terminal, every production of that non-terminal could be starting here.
+//
+// The states are then the reachable item sets, and the table says what to do
+// with each token in each state. That is the entire construction.
+//
+// ## The conflicts
+//
+// **Shift/reduce**: the parser could consume the token or finish a
+// production. The dangling else is the famous one — `if a then if b then c
+// else d` — and every generator resolves it by shifting, which attaches the
+// else to the nearer if, which is what everyone wants and nobody specified.
+//
+// **Reduce/reduce**: two productions both finish here. Always a real
+// ambiguity in the grammar and never resolvable by a default.
+//
+// SLR — the construction here — decides a reduction by FOLLOW. LALR looks at
+// where the state was reached from and is what bison builds; it accepts more
+// grammars for the same table size, at the cost of a construction nobody can
+// do on paper.
+//
+// Checked against `lark`, which parses the same grammars.
+
+import firstfollow
+
+type LrParseError =
+    | NoTable()
+    | Unexpected(at: i64, token: str)
+    | UnexpectedEnd()
+    | Conflict(state: i64, token: str)
+    | LeftRecursive(name: str)
+    | TooManySteps(steps: i64)
+
+    /// A production with a dot in it.
+type Item = {
+    /// Which production, by index.
+    production: i64,
+    /// How many symbols are behind the dot.
+    dot: i64,
+}
+
+/// One row of an LR table.
+type LrAction = {
+    state: i64,
+    token: str,
+    /// `shift`, `reduce`, `accept`, or `goto`.
+    kind: str,
+    /// The state to move to, or the production to reduce by.
+    target: i64,
+}
+
+// ------------------------------------------------------------------- LL(1)
+
+/// A string parsed by a predictive table and a stack.
+///
+/// The whole parser: push the start symbol, and while the stack is not empty,
+/// either match a terminal or look the next production up in the table. No
+/// recursion, no backtracking, and it fits on a page — which is why LL(1) is
+/// what a hand-written parser aims at.
+pub fn parse_ll1(g: Grammar, tokens: [str]) -> [i64] ! LrParseError {
+    // Refused rather than run. A predictive parser on a left-recursive
+    // grammar does not fail: it chooses the recursive production, puts the
+    // same non-terminal back on the stack having consumed nothing, and does
+    // it again for ever. Saying so is the only useful behaviour.
+    let recursive = firstfollow.left_recursive(g)
+    if recursive.len() > 0 {
+        fail(LeftRecursive(recursive[0]))
+    }
+    let entries = firstfollow.table(g)
+    if entries.len() == 0 {
+        fail(NoTable())
+    }
+    var stack: [str] = [g.start]
+    var used: [i64] = []
+    var at = 0
+    while stack.len() > 0 {
+        let top = stack[stack.len() - 1]
+        stack = drop_last(stack)
+        if not firstfollow.is_nonterminal(g, top) {
+            if at >= tokens.len() {
+                fail(UnexpectedEnd())
+            }
+            if tokens[at] != top {
+                fail(Unexpected(at, tokens[at]))
+            }
+            at = at + 1
+            continue
+        }
+        var next = firstfollow.end_marker()
+        if at < tokens.len() {
+            next = tokens[at]
+        }
+        let choice = firstfollow.choose(entries, top, next)
+        if choice < 0 {
+            fail(Unexpected(at, next))
+        }
+        used.push(choice)
+        // The body goes on backwards, so the leftmost symbol comes off first.
+        let body = g.productions[choice].body
+        var i = body.len() - 1
+        while i >= 0 {
+            stack.push(body[i])
+            i = i - 1
+        }
+    }
+    if at != tokens.len() {
+        fail(Unexpected(at, tokens[at]))
+    }
+    return used
+}
+
+fn drop_last(values: [str]) -> [str] {
+    var out: [str] = []
+    var i = 0
+    while i < values.len() - 1 {
+        out.push(values[i])
+        i = i + 1
+    }
+    return out
+}
+
+/// Whether a token string is in the language, by the LL(1) table.
+pub fn accepts_ll1(g: Grammar, tokens: [str]) -> bool {
+    match parse_ll1(g, tokens) {
+        Ok(_v) -> return true
+        Err(_e) -> return false
+    }
+}
+
+// ------------------------------------------------------------------ LR(0)
+
+/// The augmented grammar: a new start symbol with one production.
+///
+/// Without it the parser cannot tell "the start symbol is finished" from "the
+/// start symbol appears inside something else", and the accept action has
+/// nowhere to live.
+pub fn augment(g: Grammar) -> Grammar {
+    var productions: [Production] = [Production{ head: g.start + "'",
+        body: [g.start] }]
+    for production in g.productions {
+        productions.push(production)
+    }
+    return firstfollow.grammar(g.start + "'", productions)
+}
+
+/// Every item that could apply, given the ones that do.
+///
+/// If the dot is before a non-terminal, every production of that
+/// non-terminal could be starting here — so they join the state. That is the
+/// closure, and it is what makes an LR state a *set*.
+pub fn closure(g: Grammar, items: [Item]) -> [Item] {
+    var out = items
+    var changed = true
+    while changed {
+        changed = false
+        var i = 0
+        while i < out.len() {
+            let item = out[i]
+            let body = g.productions[item.production].body
+            i = i + 1
+            if item.dot >= body.len() {
+                continue
+            }
+            let symbol = body[item.dot]
+            if not firstfollow.is_nonterminal(g, symbol) {
+                continue
+            }
+            var k = 0
+            while k < g.productions.len() {
+                if g.productions[k].head == symbol and
+                not has_item(out, k, 0) {
+                    out.push(Item{ production: k, dot: 0 })
+                    changed = true
+                }
+                k = k + 1
+            }
+        }
+    }
+    return sorted_items(out)
+}
+
+fn has_item(items: [Item], production: i64, dot: i64) -> bool {
+    for item in items {
+        if item.production == production and item.dot == dot {
+            return true
+        }
+    }
+    return false
+}
+
+fn sorted_items(items: [Item]) -> [Item] {
+    var keys: [i64] = []
+    for item in items {
+        keys.push(item.production * 1000 + item.dot)
+    }
+    keys.sort()
+    var out: [Item] = []
+    for key in keys {
+        out.push(Item{ production: key / 1000, dot: key % 1000 })
+    }
+    return out
+}
+
+/// The state reached by consuming one symbol.
+pub fn goto_state(g: Grammar, items: [Item], symbol: str) -> [Item] {
+    var moved: [Item] = []
+    for item in items {
+        let body = g.productions[item.production].body
+        if item.dot < body.len() and body[item.dot] == symbol {
+            moved.push(Item{ production: item.production,
+                dot: item.dot + 1 })
+        }
+    }
+    if moved.len() == 0 {
+        return []
+    }
+    return closure(g, moved)
+}
+
+/// Every reachable item set, which are the parser's states.
+pub fn states(g: Grammar) -> [[Item]] {
+    var out: [[Item]] = [closure(g, [Item{ production: 0, dot: 0 }])]
+    var at = 0
+    while at < out.len() {
+        for symbol in symbols(g) {
+            let next = goto_state(g, out[at], symbol)
+            if next.len() == 0 {
+                continue
+            }
+            if index_of(out, next) < 0 {
+                out.push(next)
+            }
+        }
+        at = at + 1
+    }
+    return out
+}
+
+fn symbols(g: Grammar) -> [str] {
+    var out: [str] = []
+    for production in g.productions {
+        for symbol in production.body {
+            if not contains(out, symbol) {
+                out.push(symbol)
+            }
+        }
+    }
+    return out
+}
+
+fn contains(values: [str], wanted: str) -> bool {
+    for value in values {
+        if value == wanted {
+            return true
+        }
+    }
+    return false
+}
+
+fn index_of(sets: [[Item]], wanted: [Item]) -> i64 {
+    var i = 0
+    while i < sets.len() {
+        if same_items(sets[i], wanted) {
+            return i
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+fn same_items(left: [Item], right: [Item]) -> bool {
+    if left.len() != right.len() {
+        return false
+    }
+    var i = 0
+    while i < left.len() {
+        if left[i].production != right[i].production or
+        left[i].dot != right[i].dot {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+/// The SLR table: shift, reduce, accept and goto for every state.
+///
+/// SLR decides a reduction by FOLLOW — reduce by `A -> α` on every token that
+/// can follow `A`. That is the cheapest of the LR constructions and rejects
+/// some grammars LALR accepts, because FOLLOW is a property of the whole
+/// grammar and not of the state the parser is actually in.
+pub fn slr_table(g: Grammar) -> [LrAction] {
+    let all = states(g)
+    let follows = firstfollow.follow(g)
+    var out: [LrAction] = []
+    var s = 0
+    while s < all.len() {
+        for symbol in symbols(g) {
+            let next = goto_state(g, all[s], symbol)
+            if next.len() == 0 {
+                continue
+            }
+            var kind = "shift"
+            if firstfollow.is_nonterminal(g, symbol) {
+                kind = "goto"
+            }
+            out.push(LrAction{ state: s, token: symbol, kind: kind,
+                target: index_of(all, next) })
+        }
+        add_reductions(g, out, all[s], s, follows)
+        s = s + 1
+    }
+    return out
+}
+
+fn add_reductions(g: Grammar, inout out: [LrAction], items: [Item], state: i64,
+    follows: [(str, [str])]) {
+    for item in items {
+        if item.dot < g.productions[item.production].body.len() {
+            continue
+        }
+        if item.production == 0 {
+            out.push(LrAction{ state: state, token: firstfollow.end_marker(),
+                kind: "accept", target: 0 })
+            continue
+        }
+        for token in follow_of(follows, g.productions[item.production].head) {
+            out.push(LrAction{ state: state, token: token, kind: "reduce",
+                target: item.production })
+        }
+    }
+}
+
+fn follow_of(follows: [(str, [str])], name: str) -> [str] {
+    for entry in follows {
+        if entry.0 == name {
+            return entry.1
+        }
+    }
+    return []
+}
+
+/// Where the table says two things at once.
+pub fn table_conflicts(entries: [LrAction]) -> [(i64, str)] {
+    var out: [(i64, str)] = []
+    var i = 0
+    while i < entries.len() {
+        var k = i + 1
+        while k < entries.len() {
+            if entries[i].state == entries[k].state and
+            entries[i].token == entries[k].token and
+            entries[i].kind != "goto" and entries[k].kind != "goto" and
+            (entries[i].kind != entries[k].kind or
+                entries[i].target != entries[k].target) {
+                out.push((entries[i].state, entries[i].token))
+            }
+            k = k + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+/// Whether the grammar is SLR(1).
+pub fn is_slr1(g: Grammar) -> bool {
+    return table_conflicts(slr_table(g)).len() == 0
+}
+
+fn action_for(entries: [LrAction], state: i64, token: str) -> LrAction {
+    for entry in entries {
+        if entry.state == state and entry.token == token and
+        entry.kind != "goto" {
+            return entry
+        }
+    }
+    return LrAction{ state: state, token: token, kind: "", target: 0 - 1 }
+}
+
+fn goto_for(entries: [LrAction], state: i64, symbol: str) -> i64 {
+    for entry in entries {
+        if entry.state == state and entry.token == symbol and
+        entry.kind == "goto" {
+            return entry.target
+        }
+    }
+    return 0 - 1
+}
+
+/// A string parsed bottom-up, answering the reductions in the order they
+/// happened.
+///
+/// Shift the token, or reduce when the top of the stack is a whole
+/// production. The reductions in order are a rightmost derivation read
+/// backwards, which is what "LR" stands for.
+pub fn parse_slr(g: Grammar, tokens: [str]) -> [i64] ! LrParseError {
+    let entries = slr_table(g)
+    var stack: [i64] = [0]
+    var used: [i64] = []
+    var at = 0
+    // Bounded, because a table with a conflict can be walked into a cycle: a
+    // reduction by an empty production consumes nothing, and if the goto
+    // leads back it reduces for ever. A parser that hangs is worse than one
+    // that says how far it got.
+    let limit = (tokens.len() + 1) * (g.productions.len() + 1) * 64 + 1024
+    var steps = 0
+    while steps < limit {
+        steps = steps + 1
+        var token = firstfollow.end_marker()
+        if at < tokens.len() {
+            token = tokens[at]
+        }
+        let action = action_for(entries, stack[stack.len() - 1], token)
+        if action.kind == "accept" {
+            return used
+        }
+        if action.kind == "shift" {
+            stack.push(action.target)
+            at = at + 1
+            continue
+        }
+        if action.kind != "reduce" {
+            fail(Unexpected(at, token))
+        }
+        used.push(action.target)
+        let body = g.productions[action.target].body
+        var i = 0
+        while i < body.len() {
+            stack = drop_last_int(stack)
+            i = i + 1
+        }
+        let next = goto_for(entries, stack[stack.len() - 1],
+            g.productions[action.target].head)
+        if next < 0 {
+            fail(Unexpected(at, token))
+        }
+        stack.push(next)
+    }
+    fail(TooManySteps(steps))
+}
+
+fn drop_last_int(values: [i64]) -> [i64] {
+    var out: [i64] = []
+    var i = 0
+    while i < values.len() - 1 {
+        out.push(values[i])
+        i = i + 1
+    }
+    return out
+}
+
+/// Whether a token string is in the language, by the SLR table.
+pub fn accepts_slr(g: Grammar, tokens: [str]) -> bool {
+    match parse_slr(g, tokens) {
+        Ok(_v) -> return true
+        Err(_e) -> return false
+    }
+}
+
+/// How many states the LR(0) machine has.
+pub fn state_count(g: Grammar) -> i64 {
+    return states(g).len()
+}
+
+/// An item printed the way a textbook prints it.
+pub fn show_item(g: Grammar, item: Item) -> str {
+    var out = g.productions[item.production].head + " ->"
+    var i = 0
+    let body = g.productions[item.production].body
+    while i < body.len() {
+        if i == item.dot {
+            out = out + " ."
+        }
+        out = out + " " + body[i]
+        i = i + 1
+    }
+    if item.dot >= body.len() {
+        out = out + " ."
+    }
+    return out
+}

@@ -1,0 +1,10 @@
+[package]
+name = "parsegen"
+version = "1.0.0"
+
+# Builds parser tables. Opens nothing.
+capabilities = []
+
+[dependencies.firstfollow]
+path = "../firstfollow"
+version = "^1.0.0"

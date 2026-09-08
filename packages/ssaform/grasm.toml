@@ -1,0 +1,6 @@
+[package]
+name = "ssaform"
+version = "1.0.0"
+
+# Analyses a control-flow graph. Opens nothing.
+capabilities = []

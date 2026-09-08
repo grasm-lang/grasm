@@ -1,0 +1,6 @@
+[package]
+name = "lexgen"
+version = "1.0.0"
+
+# Builds automata. Opens nothing.
+capabilities = []

@@ -1,0 +1,6 @@
+[package]
+name = "regalloc"
+version = "1.0.0"
+
+# Assigns registers. Opens nothing.
+capabilities = []

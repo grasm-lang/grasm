@@ -1,0 +1,495 @@
+// Register allocation: fitting an unbounded program into sixteen registers.
+//
+// A compiler's intermediate form has as many values as it likes. A machine
+// has sixteen registers, or thirty-two, and everything else lives in memory
+// at roughly a hundred times the cost. Deciding which values get registers is
+// the last big decision a compiler makes and often the one worth the most.
+//
+// ## It is graph colouring, and that is bad news
+//
+// Two values **interfere** when both are live at the same point: they cannot
+// share a register. Build a graph with an edge for every interference, and
+// allocating *k* registers is colouring it with *k* colours — which Chaitin
+// proved in 1981 is NP-complete, and worse, proved that every graph is some
+// program's interference graph, so no special structure saves you.
+//
+// So allocators are heuristics, and there are two that matter.
+//
+// ## Chaitin-Briggs: simplify, spill, select
+//
+// Repeatedly remove a node with fewer than *k* neighbours and push it on a
+// stack — such a node can always be coloured, whatever its neighbours get.
+// When every remaining node has *k* or more, pick one to spill and carry on.
+// Then pop the stack, giving each node a colour none of its neighbours has.
+//
+// Briggs's improvement in 1992: do not spill immediately. Push the node
+// anyway — **optimistic colouring** — because its neighbours may share
+// colours and leave one free. It often does, and this is what production
+// allocators do.
+//
+// ## Linear scan: worse allocations, much faster
+//
+// Poletto and Sarkar, 1999. Order the instructions, give each value one
+// interval from its first definition to its last use, and sweep: when an
+// interval starts, take a free register; when one ends, give it back; when
+// none is free, spill the interval that ends last.
+//
+// It ignores holes — a value dead in the middle of its interval still holds
+// its register — so it allocates worse. It is linear rather than quadratic,
+// which is why every just-in-time compiler used it for fifteen years and why
+// JavaScript engines still do for their fast tier.
+//
+// ## Spilling is not free and is not uniform
+//
+// A spilled value costs a store and a load *every time it is used*. Spilling
+// a value used once in cold code is nearly free; spilling one used inside a
+// loop is a catastrophe. So the spill choice weighs uses by loop depth —
+// usually ten to the depth — which is why a value in a triple-nested loop is
+// the last thing an allocator gives up.
+
+type AllocError =
+    | NoRegisters(count: i64)
+    | BadInterval(value: i64)
+    | Uncolourable(value: i64)
+
+type LiveRange = {
+    /// The value's number.
+    value: i64,
+    /// First definition and last use, both inclusive.
+    start: i64,
+    stop: i64,
+    /// How often it is used, weighted by loop depth.
+    weight: i64,
+}
+
+/// An allocation: a register a value, or -1 for a spill.
+type Allocation = {
+    registers: [i64],
+    spilled: [i64],
+}
+
+/// Whether two intervals overlap.
+pub fn overlaps(left: LiveRange, right: LiveRange) -> bool {
+    return left.start <= right.stop and right.start <= left.stop
+}
+
+/// The interference graph as adjacency lists.
+///
+/// One edge per pair of values live at the same time. Chaitin's result is
+/// that every graph is some program's interference graph, so no structure
+/// can be assumed and no algorithm can be exact.
+pub fn interference(intervals: [LiveRange], count: i64) -> [[i64]] {
+    var out: [[i64]] = []
+    for _i in 0..count {
+        out.push([])
+    }
+    var i = 0
+    while i < intervals.len() {
+        var k = i + 1
+        while k < intervals.len() {
+            if overlaps(intervals[i], intervals[k]) {
+                out[intervals[i].value].push(intervals[k].value)
+                out[intervals[k].value].push(intervals[i].value)
+            }
+            k = k + 1
+        }
+        i = i + 1
+    }
+    var v = 0
+    while v < out.len() {
+        out[v].sort()
+        v = v + 1
+    }
+    return out
+}
+
+/// The most values live at any one point.
+///
+/// The lower bound on how many registers are needed, and — for a program
+/// whose values each have one contiguous interval — the exact answer, because
+/// such an interference graph is an interval graph and interval graphs colour
+/// optimally by a greedy sweep. Real programs' values have holes, which is
+/// what makes the general problem hard.
+pub fn max_pressure(intervals: [LiveRange]) -> i64 {
+    var best = 0
+    for probe in intervals {
+        var live = 0
+        for other in intervals {
+            if other.start <= probe.start and probe.start <= other.stop {
+                live = live + 1
+            }
+        }
+        if live > best {
+            best = live
+        }
+    }
+    return best
+}
+
+/// Linear scan, as Poletto and Sarkar described it.
+///
+/// Sweep the intervals in order of their start. Free the registers of
+/// intervals that have ended, take one for the new interval, and when none is
+/// free spill whichever of the live intervals ends last — because it is the
+/// one that would hold a register longest.
+pub fn linear_scan(intervals: [LiveRange],
+    registers: i64) -> Allocation ! AllocError {
+    if registers < 1 {
+        fail(NoRegisters(registers))
+    }
+    var assigned: [i64] = []
+    for _i in 0..value_count(intervals) {
+        assigned.push(0 - 1)
+    }
+    var spilled: [i64] = []
+    var active: [LiveRange] = []
+    for interval in by_start(intervals) {
+        if interval.stop < interval.start {
+            fail(BadInterval(interval.value))
+        }
+        expire(active, interval.start)
+        if active.len() < registers {
+            assigned[interval.value] = free_register(assigned, active,
+                registers)
+            active.push(interval)
+            active = by_stop(active)
+            continue
+        }
+        // The last active interval ends latest, so it is the one holding a
+        // register longest — the cheapest thing to give up.
+        let victim = active[active.len() - 1]
+        if victim.stop > interval.stop {
+            assigned[interval.value] = assigned[victim.value]
+            assigned[victim.value] = 0 - 1
+            spilled.push(victim.value)
+            active = drop_last(active)
+            active.push(interval)
+            active = by_stop(active)
+        } else {
+            spilled.push(interval.value)
+        }
+    }
+    spilled.sort()
+    return Allocation{ registers: assigned, spilled: spilled }
+}
+
+fn value_count(intervals: [LiveRange]) -> i64 {
+    var count = 0
+    for interval in intervals {
+        if interval.value + 1 > count {
+            count = interval.value + 1
+        }
+    }
+    return count
+}
+
+fn expire(inout active: [LiveRange], at: i64) {
+    var kept: [LiveRange] = []
+    for interval in active {
+        if interval.stop >= at {
+            kept.push(interval)
+        }
+    }
+    active = kept
+}
+
+fn free_register(assigned: [i64], active: [LiveRange],
+    registers: i64) -> i64 {
+    var used: [bool] = []
+    for _i in 0..registers {
+        used.push(false)
+    }
+    for interval in active {
+        let r = assigned[interval.value]
+        if r >= 0 and r < registers {
+            used[r] = true
+        }
+    }
+    var i = 0
+    while i < registers {
+        if not used[i] {
+            return i
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+fn by_start(intervals: [LiveRange]) -> [LiveRange] {
+    return sort_by(intervals, true)
+}
+
+fn by_stop(intervals: [LiveRange]) -> [LiveRange] {
+    return sort_by(intervals, false)
+}
+
+fn sort_by(intervals: [LiveRange], on_start: bool) -> [LiveRange] {
+    var keys: [i64] = []
+    for interval in intervals {
+        if on_start {
+            keys.push(interval.start * 10000 + interval.value)
+        } else {
+            keys.push(interval.stop * 10000 + interval.value)
+        }
+    }
+    keys.sort()
+    var out: [LiveRange] = []
+    for key in keys {
+        for interval in intervals {
+            if interval.value == key % 10000 {
+                out.push(interval)
+            }
+        }
+    }
+    return out
+}
+
+fn drop_last(intervals: [LiveRange]) -> [LiveRange] {
+    var out: [LiveRange] = []
+    var i = 0
+    while i < intervals.len() - 1 {
+        out.push(intervals[i])
+        i = i + 1
+    }
+    return out
+}
+
+// ------------------------------------------------------- graph colouring
+
+/// Chaitin-Briggs colouring of an interference graph.
+///
+/// Simplify: remove any node with fewer than `k` neighbours — it can always
+/// be coloured whatever its neighbours get — and push it. When every node has
+/// `k` or more, push the cheapest to spill **anyway** rather than spilling it
+/// at once: that is Briggs's optimistic colouring, and it works because the
+/// node's neighbours often share colours and leave one free. Then pop and
+/// colour.
+pub fn colour(graph: [[i64]], weights: [i64],
+    registers: i64) -> Allocation ! AllocError {
+    if registers < 1 {
+        fail(NoRegisters(registers))
+    }
+    var removed: [bool] = []
+    for _i in 0..graph.len() {
+        removed.push(false)
+    }
+    var stack: [i64] = []
+    var left = graph.len()
+    while left > 0 {
+        let easy = lowest_degree(graph, removed, registers)
+        if easy >= 0 {
+            removed[easy] = true
+            stack.push(easy)
+            left = left - 1
+            continue
+        }
+        // Nothing is trivially colourable. Push the cheapest anyway.
+        let victim = cheapest(graph, removed, weights)
+        removed[victim] = true
+        stack.push(victim)
+        left = left - 1
+    }
+    return assign(graph, stack, registers)
+}
+
+fn lowest_degree(graph: [[i64]], removed: [bool], registers: i64) -> i64 {
+    var i = 0
+    while i < graph.len() {
+        if not removed[i] and degree(graph, removed, i) < registers {
+            return i
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+fn degree(graph: [[i64]], removed: [bool], node: i64) -> i64 {
+    var count = 0
+    for neighbour in graph[node] {
+        if not removed[neighbour] {
+            count = count + 1
+        }
+    }
+    return count
+}
+
+/// The node whose spill costs least per unit of relief.
+///
+/// Uses divided by degree: a value used once that conflicts with everything
+/// buys a lot of room for very little, and one used inside a loop buys the
+/// same room for a great deal. Real allocators weight uses by ten to the loop
+/// depth, which is why a value in a triple-nested loop is the last thing to
+/// go.
+fn cheapest(graph: [[i64]], removed: [bool], weights: [i64]) -> i64 {
+    var best = 0 - 1
+    var best_cost = 0.0
+    var i = 0
+    while i < graph.len() {
+        if removed[i] {
+            i = i + 1
+            continue
+        }
+        let d = degree(graph, removed, i)
+        var cost = weights[i].as_f64()
+        if d > 0 {
+            cost = cost / d.as_f64()
+        }
+        if best < 0 or cost < best_cost {
+            best = i
+            best_cost = cost
+        }
+        i = i + 1
+    }
+    return best
+}
+
+fn assign(graph: [[i64]], stack: [i64], registers: i64) -> Allocation {
+    var colours: [i64] = []
+    for _i in 0..graph.len() {
+        colours.push(0 - 1)
+    }
+    var spilled: [i64] = []
+    var at = stack.len() - 1
+    while at >= 0 {
+        let node = stack[at]
+        var used: [bool] = []
+        for _i in 0..registers {
+            used.push(false)
+        }
+        for neighbour in graph[node] {
+            if colours[neighbour] >= 0 and colours[neighbour] < registers {
+                used[colours[neighbour]] = true
+            }
+        }
+        var chosen = 0 - 1
+        var r = 0
+        while r < registers {
+            if not used[r] {
+                chosen = r
+                r = registers
+            } else {
+                r = r + 1
+            }
+        }
+        if chosen < 0 {
+            spilled.push(node)
+        }
+        colours[node] = chosen
+        at = at - 1
+    }
+    spilled.sort()
+    return Allocation{ registers: colours, spilled: spilled }
+}
+
+/// Whether an allocation is legal: no two interfering values share a
+/// register.
+///
+/// The property that matters. An allocator that spills everything is legal
+/// and useless; one that shares a register between two live values is fast
+/// and wrong, and the wrongness shows up as a variable changing value on its
+/// own.
+pub fn is_valid(graph: [[i64]], allocation: Allocation) -> bool {
+    var node = 0
+    while node < graph.len() {
+        if allocation.registers[node] < 0 {
+            node = node + 1
+            continue
+        }
+        for neighbour in graph[node] {
+            if allocation.registers[neighbour] ==
+            allocation.registers[node] {
+                return false
+            }
+        }
+        node = node + 1
+    }
+    return true
+}
+
+/// How many distinct registers an allocation uses.
+pub fn registers_used(allocation: Allocation) -> i64 {
+    var seen: [i64] = []
+    for r in allocation.registers {
+        if r >= 0 and not has(seen, r) {
+            seen.push(r)
+        }
+    }
+    return seen.len()
+}
+
+fn has(values: [i64], wanted: i64) -> bool {
+    for value in values {
+        if value == wanted {
+            return true
+        }
+    }
+    return false
+}
+
+/// The cost of an allocation's spills, in memory accesses.
+pub fn spill_cost(allocation: Allocation, weights: [i64]) -> i64 {
+    var total = 0
+    for value in allocation.spilled {
+        total = total + weights[value]
+    }
+    return total
+}
+
+/// A use count weighted by loop depth.
+///
+/// Ten to the depth, which is the number every textbook and most compilers
+/// use. It has no theoretical basis and it is roughly right: a loop usually
+/// runs about ten times.
+pub fn weight_for(uses: i64, loop_depth: i64) -> i64 {
+    var factor = 1
+    for _i in 0..loop_depth {
+        factor = factor * 10
+    }
+    return uses * factor
+}
+
+/// The largest degree in the graph, which bounds how many registers a greedy
+/// colouring can need.
+///
+/// Brooks's theorem says a connected graph that is neither complete nor an
+/// odd cycle needs at most this many colours, and a greedy order never needs
+/// more than one past it.
+pub fn max_degree(graph: [[i64]]) -> i64 {
+    var best = 0
+    for neighbours in graph {
+        if neighbours.len() > best {
+            best = neighbours.len()
+        }
+    }
+    return best
+}
+
+/// The size of the largest set of values that all interfere with each other.
+///
+/// A clique of size *n* needs *n* registers, whatever the allocator does, so
+/// this is a lower bound on the answer. Finding the largest is itself
+/// NP-hard, so this looks for one greedily and answers a bound rather than
+/// the bound.
+pub fn clique_bound(graph: [[i64]]) -> i64 {
+    var best = 1
+    var start = 0
+    while start < graph.len() {
+        var clique: [i64] = [start]
+        for candidate in graph[start] {
+            var joins = true
+            for member in clique {
+                if not has(graph[candidate], member) {
+                    joins = false
+                }
+            }
+            if joins {
+                clique.push(candidate)
+            }
+        }
+        if clique.len() > best {
+            best = clique.len()
+        }
+        start = start + 1
+    }
+    return best
+}

@@ -1,0 +1,388 @@
+import firstfollow
+import lexgen
+import parsegen
+import ssaform
+import regalloc
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn p(head: str, body: [str]) -> Production {
+    return Production{ head: head, body: body }
+}
+
+/// The expression grammar from the Dragon Book, in its LL(1) form.
+fn ll_grammar() -> Grammar {
+    return firstfollow.grammar("E", [
+        p("E", ["T", "E2"]),
+        p("E2", ["+", "T", "E2"]),
+        p("E2", []),
+        p("T", ["F", "T2"]),
+        p("T2", ["*", "F", "T2"]),
+        p("T2", []),
+        p("F", ["(", "E", ")"]),
+        p("F", ["id"])])
+}
+
+/// The same language, written left-recursively, which is how a specification
+/// writes it and how an LL parser cannot read it.
+fn lr_grammar() -> Grammar {
+    return firstfollow.grammar("E", [
+        p("E", ["E", "+", "T"]),
+        p("E", ["T"]),
+        p("T", ["T", "*", "F"]),
+        p("T", ["F"]),
+        p("F", ["(", "E", ")"]),
+        p("F", ["id"])])
+}
+
+fn set_of(sets: [(str, [str])], name: str) -> [str] {
+    for entry in sets {
+        if entry.0 == name {
+            return entry.1
+        }
+    }
+    return []
+}
+
+fn check_firstfollow(inout f: i64) / {io} {
+    print("-- firstfollow: the sets every parser generator computes first")
+    let g = ll_grammar()
+    // The Dragon Book's own example 4.30, and Lark computes the same.
+    say(f, "FIRST is what a symbol can start with",
+        set_of(firstfollow.first(g), "E") == ["(", "id"] and
+        set_of(firstfollow.first(g), "E2") == ["+"] and
+        set_of(firstfollow.first(g), "T2") == ["*"])
+    say(f, "FOLLOW is what can come after it, anywhere in the grammar",
+        set_of(firstfollow.follow(g), "E") == ["$", ")"] and
+        set_of(firstfollow.follow(g), "T") == ["$", ")", "+"] and
+        set_of(firstfollow.follow(g), "F") == ["$", ")", "*", "+"])
+    // Nullable has to come first: FIRST of `A B` includes FIRST of B exactly
+    // when A is nullable.
+    say(f, "and nullable has to be known before either of them",
+        firstfollow.nullable(g) == ["E2", "T2"])
+    // The predict set is the answer to "given this token, which production?"
+    say(f, "a production is chosen on FIRST, or on FOLLOW when it is empty",
+        firstfollow.predict(g, p("E2", ["+", "T", "E2"])) == ["+"] and
+        firstfollow.predict(g, p("E2", [])) == ["$", ")"])
+    say(f, "with no two productions answering to the same token",
+        firstfollow.is_ll1(g) and firstfollow.conflicts(g).len() == 0)
+    // The left-recursive form is the one a specification writes.
+    say(f, "the left-recursive form of the same language is not LL(1)",
+        not firstfollow.is_ll1(lr_grammar()) and
+        firstfollow.left_recursive(lr_grammar()) == ["E", "T"] and
+        firstfollow.left_recursive(g).len() == 0)
+    // The dangling else, which is not LL(1) and never will be.
+    let dangling = firstfollow.grammar("S", [
+        p("S", ["i", "E", "t", "S", "S2"]), p("S2", ["e", "S"]),
+        p("S2", []), p("S", ["a"]), p("E", ["b"])])
+    say(f, "and the dangling else is not either, which is why it is famous",
+        not firstfollow.is_ll1(dangling) and
+        firstfollow.conflicts(dangling)[0].1 == "e")
+    // A grammar with a rule nothing can finish, and one nothing can reach.
+    let broken = firstfollow.grammar("S", [p("S", ["a"]), p("A", ["A", "b"]),
+        p("B", ["c"])])
+    // The table is what a generated parser ships: one production per
+    // (non-terminal, token) pair, and nothing else.
+    let entries = firstfollow.table(g)
+    say(f, "the table is one production a non-terminal and token",
+        firstfollow.choose(entries, "E", "id") == 0 and
+        firstfollow.choose(entries, "E2", "+") == 1 and
+        firstfollow.choose(entries, "E2", ")") == 2 and
+        firstfollow.choose(entries, "E", "+") == 0 - 1)
+    say(f, "a non-terminal that produces no string of terminals is named",
+        firstfollow.unproductive(broken) == ["A"] and
+        firstfollow.unreachable(broken) == ["A", "B"])
+}
+
+// ---------------------------------------------------------------- lexgen
+
+fn dfa_for(patterns: [str]) -> Dfa {
+    return lexgen.compile(patterns) ?? Dfa{ states: [], start: 0 }
+}
+
+fn check_lexgen(inout f: i64) / {io} {
+    print("-- lexgen: a regular expression is compiled, not backtracked")
+    // Python's `re` agrees with all of these.
+    let identifier = dfa_for(["[a-zA-Z_][a-zA-Z0-9_]*"])
+    say(f, "an identifier matches what an identifier matches",
+        lexgen.matches(identifier, "x".to_bytes()) and
+        lexgen.matches(identifier, "_a1".to_bytes()) and
+        not lexgen.matches(identifier, "1a".to_bytes()) and
+        not lexgen.matches(identifier, "".to_bytes()))
+    say(f, "and the classic (a|b)*abb does too",
+        lexgen.matches(dfa_for(["(a|b)*abb"]), "aabb".to_bytes()) and
+        lexgen.matches(dfa_for(["(a|b)*abb"]), "babb".to_bytes()) and
+        not lexgen.matches(dfa_for(["(a|b)*abb"]), "abba".to_bytes()))
+    // Minimisation: the minimal DFA is unique, so two ways of writing one
+    // language give the same machine.
+    say(f, "two spellings of one language minimise to the same machine",
+        lexgen.state_count(dfa_for(["a|ab|abc"])) ==
+        lexgen.state_count(dfa_for(["a(b(c)?)?"])) and
+        lexgen.state_count(dfa_for(["(a|b)*abb"])) == 4)
+    say(f, "an empty pattern is refused rather than matching everything",
+        refused("") and refused("(a") and refused("*a"))
+    // Longest match, which is what a lexer does and a matcher does not.
+    let lexer = dfa_for(["if|else|while|return",
+        "[a-zA-Z_][a-zA-Z0-9_]*", "[0-9]+\\.[0-9]+", "[0-9]+",
+        ">=|<=|==|!=|[-+*/<>=]", "[ \t]+"])
+    say(f, "a lexer takes the longest match, not the first",
+        lexgen.longest_match(lexer, ">=x".to_bytes(), 0) == (2, 4) and
+        lexgen.longest_match(lexer, ">x".to_bytes(), 0) == (1, 4))
+    // `return_value` is one identifier, not a keyword and a variable — the
+    // rule everyone finds out about by getting it wrong.
+    say(f, "so return_value is an identifier and return is a keyword",
+        lexgen.longest_match(lexer, "return_value".to_bytes(), 0) ==
+        (12, 1) and lexgen.longest_match(lexer, "return x".to_bytes(), 0) ==
+        (6, 0))
+    say(f, "and where two rules tie, the one written first wins",
+        first_rule(lexer, "if") == 0 and first_rule(lexer, "iff") == 1)
+    say(f, "a number with a point is one token and not three",
+        first_rule(lexer, "3.14") == 2 and
+        lexgen.longest_match(lexer, "3.14".to_bytes(), 0) == (4, 2))
+    let tokens: [(i64, i64, i64)] ! LexError =
+    lexgen.tokenise(lexer, "if x >= 10".to_bytes())
+    say(f, "and a whole line splits into the tokens Python's re finds",
+        (tokens ?? []).len() == 7 and (tokens ?? [])[0] == (0, 0, 2) and
+        (tokens ?? [])[4] == (4, 5, 2))
+    say(f, "a negated class is every byte the class does not name",
+        lexgen.matches(dfa_for(["[^a-z]+"]), "ABC".to_bytes()) and
+        not lexgen.matches(dfa_for(["[^a-z]+"]), "abc".to_bytes()))
+    say(f, "a character no rule matches stops the lexer where it is",
+        not tokenises(lexer, "x @ y"))
+}
+
+fn refused(pattern: str) -> bool {
+    match lexgen.compile([pattern]) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn first_rule(dfa: Dfa, text: str) -> i64 {
+    return lexgen.longest_match(dfa, text.to_bytes(), 0).1
+}
+
+fn tokenises(dfa: Dfa, text: str) -> bool {
+    match lexgen.tokenise(dfa, text.to_bytes()) {
+        Ok(_v) -> return true
+        Err(_e) -> return false
+    }
+}
+
+// --------------------------------------------------------------- parsegen
+
+fn tokens_of(text: str) -> [str] {
+    var out: [str] = []
+    for token in text.split(" ") {
+        if token != "" {
+            out.push(token)
+        }
+    }
+    return out
+}
+
+fn check_parsegen(inout f: i64) / {io} {
+    print("-- parsegen: LL guesses before, LR decides after")
+    let ll = ll_grammar()
+    let lr = parsegen.augment(lr_grammar())
+    // Lark's Earley parser accepts exactly these.
+    say(f, "a predictive table and a stack parse the LL(1) form",
+        parsegen.accepts_ll1(ll, tokens_of("id + id * id")) and
+        parsegen.accepts_ll1(ll, tokens_of("( id + id ) * id")) and
+        not parsegen.accepts_ll1(ll, tokens_of("id +")) and
+        not parsegen.accepts_ll1(ll, tokens_of("id id")))
+    // The left-recursive grammar is refused rather than run: a predictive
+    // parser on one does not fail, it loops for ever.
+    say(f, "and refuses the left-recursive form rather than looping on it",
+        not parsegen.accepts_ll1(lr_grammar(), tokens_of("id")))
+    say(f, "which the LR parser handles, because it decides afterwards",
+        parsegen.accepts_slr(lr, tokens_of("id + id * id")) and
+        parsegen.accepts_slr(lr, tokens_of("( id + id ) * id")) and
+        not parsegen.accepts_slr(lr, tokens_of("+ id")))
+    // The LR(0) automaton for this grammar is the Dragon Book's figure 4.31.
+    say(f, "the LR(0) machine for it has the twelve states the book draws",
+        parsegen.state_count(lr) == 12 and parsegen.is_slr1(lr))
+    // An item is a production with a dot in it.
+    let start = parsegen.closure(lr, [Item{ production: 0, dot: 0 }])
+    say(f, "a state is every item that could apply, which is the closure",
+        start.len() == 7 and
+        parsegen.show_item(lr, start[0]) == "E' -> . E")
+    say(f, "and consuming a symbol moves the dot",
+        parsegen.show_item(lr, Item{ production: 1, dot: 1 }) ==
+        "E -> E . + T" and
+        parsegen.show_item(lr, Item{ production: 1, dot: 3 }) ==
+        "E -> E + T .")
+    // The reductions in order are a rightmost derivation, backwards.
+    let derivation = parsegen.parse_slr(lr, tokens_of("id + id")) ?? []
+    say(f, "the reductions in order are a rightmost derivation reversed",
+        derivation == [6, 4, 2, 6, 4, 1])
+    // The dangling else: a shift/reduce conflict, and the reason every
+    // generator resolves it by shifting.
+    let dangling = parsegen.augment(firstfollow.grammar("S", [
+        p("S", ["i", "S", "e", "S"]), p("S", ["i", "S"]), p("S", ["a"])]))
+    say(f, "the dangling else is a shift/reduce conflict in the table",
+        not parsegen.is_slr1(dangling) and
+        parsegen.table_conflicts(parsegen.slr_table(dangling))[0].1 == "e")
+    say(f, "and a grammar with no start production has no table at all",
+        parsegen.state_count(parsegen.augment(ll)) > 0)
+}
+
+// ---------------------------------------------------------------- ssaform
+
+/// The diamond: `if c { x = 1 } else { x = 2 }` and then a use.
+fn diamond() -> Cfg {
+    return ssaform.cfg([[1, 2], [3], [3], []],
+        [["x"], ["x"], ["x"], []])
+}
+
+/// A loop: a header with a back edge into it.
+fn loop_graph() -> Cfg {
+    return ssaform.cfg([[1], [2, 3], [1], []], [["i"], [], ["i"], []])
+}
+
+fn check_ssaform(inout f: i64) / {io} {
+    print("-- ssaform: a phi goes exactly on the dominance frontier")
+    let idom = ssaform.immediate_dominators(diamond())
+    // networkx computes the same dominators for all of these.
+    say(f, "the entry has no dominator and everything else has one",
+        idom == [0 - 1, 0, 0, 0])
+    say(f, "and dominance is the whole path, not just the edge",
+        ssaform.dominates(idom, 0, 3) and not ssaform.dominates(idom, 1, 3)
+        and ssaform.dominator_depth(idom, 3) == 1)
+    // The join is where two definitions of x meet, and nowhere else.
+    let frontiers = ssaform.dominance_frontiers(diamond())
+    say(f, "the frontier of each arm is the join, and the join has none",
+        frontiers[1] == [3] and frontiers[2] == [3] and
+        frontiers[3].len() == 0 and frontiers[0].len() == 0)
+    say(f, "so one phi is needed, at the join, for x",
+        ssaform.phi_placements(diamond()) == [(3, "x")] and
+        ssaform.phi_count(diamond()) == 1)
+    // A loop header is its own frontier, which is why a phi goes at the top
+    // of every loop that assigns anything.
+    say(f, "a loop header is on its own frontier, so the phi goes at the top",
+        ssaform.dominance_frontiers(loop_graph())[2] == [1] and
+        ssaform.phi_placements(loop_graph()) == [(1, "i")])
+    say(f, "and the back edge is the edge into a block that dominates it",
+        ssaform.back_edges(loop_graph()) == [(2, 1)] and
+        ssaform.back_edges(diamond()).len() == 0 and
+        ssaform.is_reducible(loop_graph()))
+    // Renaming: one number a definition, in dominator-tree order.
+    let names = ssaform.rename(diamond())
+    say(f, "renaming numbers each definition once, top down",
+        names.len() == 3 and names[0] == (0, "x", "x1") and
+        names[1].2 == "x2" and names[2].2 == "x3")
+    // Unreachable code has no dominator and no place in the tree.
+    let orphan = ssaform.cfg([[1], [], [1], []], [["x"], [], ["x"], []])
+    say(f, "unreachable blocks have no dominator and are named as such",
+        ssaform.unreachable(orphan) == [2, 3] and
+        ssaform.immediate_dominators(orphan)[2] == 0 - 1)
+    say(f, "and an unreachable definition puts no phi anywhere",
+        ssaform.phi_count(orphan) == 0)
+    say(f, "an irreducible graph is one a loop is entered around",
+        not ssaform.is_reducible(ssaform.cfg([[1, 2], [2], [1], []],
+            [[], [], [], []])))
+    say(f, "the variables a graph assigns are found without being told",
+        ssaform.variables(diamond()) == ["x"] and
+        ssaform.dominator_children(idom)[0] == [1, 2, 3])
+}
+
+// --------------------------------------------------------------- regalloc
+
+fn interval(value: i64, start: i64, stop: i64, weight: i64) -> LiveRange {
+    return LiveRange{ value: value, start: start, stop: stop,
+        weight: weight }
+}
+
+/// Three values, two of which overlap everything.
+fn program() -> [LiveRange] {
+    return [interval(0, 0, 3, 1), interval(1, 1, 2, 1),
+        interval(2, 2, 5, 1)]
+}
+
+fn check_regalloc(inout f: i64) / {io} {
+    print("-- regalloc: colouring a graph nobody can colour exactly")
+    let graph = regalloc.interference(program(), 3)
+    say(f, "two values interfere when both are live at once",
+        graph[0] == [1, 2] and graph[1] == [0, 2] and graph[2] == [0, 1] and
+        regalloc.max_degree(graph) == 2)
+    // For values with one contiguous interval each, the largest set of
+    // mutually interfering values is exactly the most live at any point —
+    // interval graphs are perfect, which is why linear scan is optimal on
+    // them.
+    say(f, "the most live at once is the number of registers really needed",
+        regalloc.max_pressure(program()) == 3 and
+        regalloc.clique_bound(graph) == 3)
+    let plenty = regalloc.linear_scan(program(), 3) ??
+    Allocation{ registers: [], spilled: [] }
+    say(f, "with enough registers nothing spills and nothing shares",
+        plenty.spilled.len() == 0 and
+        regalloc.is_valid(graph, plenty) and
+        regalloc.registers_used(plenty) == 3)
+    // One short: something has to go, and it is the interval ending last.
+    let tight = regalloc.linear_scan(program(), 2) ??
+    Allocation{ registers: [], spilled: [] }
+    say(f, "one register short spills the interval that ends last",
+        tight.spilled == [2] and regalloc.is_valid(graph, tight))
+    let painted = regalloc.colour(graph, [1, 1, 1], 2) ??
+    Allocation{ registers: [], spilled: [] }
+    say(f, "and the colouring spills one too, on a triangle it must",
+        painted.spilled.len() == 1 and regalloc.is_valid(graph, painted))
+    // The spill choice weighs uses by loop depth: ten to the depth.
+    say(f, "a use inside a loop is worth ten of one outside it",
+        regalloc.weight_for(1, 0) == 1 and regalloc.weight_for(1, 1) == 10 and
+        regalloc.weight_for(3, 2) == 300)
+    let weighted = regalloc.colour(graph, [100, 1, 100], 2) ??
+    Allocation{ registers: [], spilled: [] }
+    say(f, "so the cheapest value is the one given up",
+        weighted.spilled == [1] and
+        regalloc.spill_cost(weighted, [100, 1, 100]) == 1)
+    // A chain interferes only with its neighbours, so two registers do.
+    let chain = [interval(0, 0, 1, 1), interval(1, 1, 2, 1),
+        interval(2, 2, 3, 1), interval(3, 3, 4, 1)]
+    let chain_graph = regalloc.interference(chain, 4)
+    let scanned = regalloc.linear_scan(chain, 2) ??
+    Allocation{ registers: [], spilled: [] }
+    say(f, "a chain of overlapping values needs only two registers",
+        regalloc.max_pressure(chain) == 2 and
+        scanned.spilled.len() == 0 and
+        regalloc.is_valid(chain_graph, scanned))
+    say(f, "an interval that ends before it starts is refused",
+        bad_interval())
+    say(f, "and an allocator with no registers at all is an error",
+        no_registers())
+}
+
+fn bad_interval() -> bool {
+    match regalloc.linear_scan([interval(0, 5, 1, 1)], 2) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn no_registers() -> bool {
+    match regalloc.linear_scan(program(), 0) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn main() / {io} {
+    var f = 0
+    check_firstfollow(f)
+    check_lexgen(f)
+    check_parsegen(f)
+    check_ssaform(f)
+    check_regalloc(f)
+    if f == 0 {
+        print("compiler: every claim held")
+    } else {
+        print("compiler: {f} claims failed")
+    }
+}

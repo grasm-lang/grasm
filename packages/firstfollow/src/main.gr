@@ -1,0 +1,488 @@
+// FIRST and FOLLOW, and what they actually tell you.
+//
+// Every parser generator computes these two sets, every compilers course
+// teaches them, and the reason is one question: **given the next token, which
+// production should I use?** FIRST answers it when the production produces
+// something; FOLLOW answers it when the production produces nothing.
+//
+// A grammar where that question has one answer for every (non-terminal,
+// token) pair is LL(1), and a predictive parser for it is a table lookup and
+// a stack. A grammar where it does not is where the error messages come from:
+// "shift/reduce conflict" and "ambiguity" are both this question having two
+// answers.
+//
+// ## Nullable, which has to come first
+//
+// A non-terminal is nullable if it can produce the empty string — directly,
+// or through a chain of non-terminals that all can. That has to be computed
+// before FIRST, because FIRST of `A B` includes FIRST of `B` exactly when `A`
+// is nullable.
+//
+// All three sets are computed the same way: start empty, apply the rules
+// until nothing changes. It is a fixed point, and the reason the algorithm
+// looks like a loop with a "changed" flag in every textbook.
+//
+// ## Why FOLLOW is the subtle one
+//
+// FIRST is about what a symbol *starts* with, which is local. FOLLOW is about
+// what can come *after* a non-terminal anywhere in the grammar, which is not:
+// it depends on every place the non-terminal is used. The rule that catches
+// people is that when `A -> α B` — `B` at the end — everything that can
+// follow `A` can follow `B`, so FOLLOW propagates backwards through the
+// grammar and a single new production can change FOLLOW for half of it.
+//
+// ## Left recursion
+//
+// `E -> E + T` cannot be parsed top-down: the parser would call `E` to parse
+// `E`, forever. The fix is mechanical — rewrite it as `E -> T E'` with
+// `E' -> + T E' | ε` — and it is why every LL grammar in a textbook has those
+// primed non-terminals in it and why LR parsers, which handle left recursion
+// natively, won.
+//
+// Checked against `lark`'s own grammar analysis and against the textbook
+// grammars whose sets are published.
+
+type GrammarError =
+    | NoStart()
+    | UnknownSymbol(name: str)
+    | LeftRecursive(name: str)
+
+type Production = {
+    /// The non-terminal on the left.
+    head: str,
+    /// The symbols on the right; empty for an epsilon production.
+    body: [str],
+}
+
+type Grammar = {
+    start: str,
+    productions: [Production],
+    /// Every symbol that is a production's head. Everything else in a body is
+    /// a terminal.
+    nonterminals: [str],
+}
+
+/// A grammar from its productions.
+pub fn grammar(start: str, productions: [Production]) -> Grammar {
+    var heads: [str] = []
+    for production in productions {
+        if not contains(heads, production.head) {
+            heads.push(production.head)
+        }
+    }
+    return Grammar{ start: start, productions: productions,
+        nonterminals: heads }
+}
+
+fn contains(names: [str], wanted: str) -> bool {
+    for name in names {
+        if name == wanted {
+            return true
+        }
+    }
+    return false
+}
+
+/// Whether a symbol is a non-terminal, which is to say whether anything
+/// produces it.
+pub fn is_nonterminal(g: Grammar, symbol: str) -> bool {
+    return contains(g.nonterminals, symbol)
+}
+
+/// Every terminal the grammar mentions, in the order it first appears.
+pub fn terminals(g: Grammar) -> [str] {
+    var out: [str] = []
+    for production in g.productions {
+        for symbol in production.body {
+            if not is_nonterminal(g, symbol) and not contains(out, symbol) {
+                out.push(symbol)
+            }
+        }
+    }
+    return out
+}
+
+/// The non-terminals that can produce nothing at all.
+///
+/// A fixed point: start with the ones that have an empty production, then add
+/// any whose whole body is nullable, and repeat until a pass adds nothing.
+pub fn nullable(g: Grammar) -> [str] {
+    var out: [str] = []
+    var changed = true
+    while changed {
+        changed = false
+        for production in g.productions {
+            if contains(out, production.head) {
+                continue
+            }
+            var all = true
+            for symbol in production.body {
+                if not contains(out, symbol) {
+                    all = false
+                }
+            }
+            if all {
+                out.push(production.head)
+                changed = true
+            }
+        }
+    }
+    return out
+}
+
+/// What a string of symbols can start with.
+///
+/// Walks the symbols and stops at the first that is not nullable — which is
+/// why a nullable prefix contributes its own FIRST *and* lets the next symbol
+/// contribute too.
+pub fn first_of_body(g: Grammar, sets: [(str, [str])], nulls: [str],
+    body: [str]) -> [str] {
+    var out: [str] = []
+    for symbol in body {
+        if not is_nonterminal(g, symbol) {
+            push_new(out, symbol)
+            return out
+        }
+        for token in lookup(sets, symbol) {
+            push_new(out, token)
+        }
+        if not contains(nulls, symbol) {
+            return out
+        }
+    }
+    return out
+}
+
+fn push_new(inout out: [str], value: str) {
+    if not contains(out, value) {
+        out.push(value)
+    }
+}
+
+fn lookup(sets: [(str, [str])], name: str) -> [str] {
+    for entry in sets {
+        if entry.0 == name {
+            return entry.1
+        }
+    }
+    return []
+}
+
+fn store(inout sets: [(str, [str])], name: str, values: [str]) {
+    var i = 0
+    while i < sets.len() {
+        if sets[i].0 == name {
+            sets[i] = (name, values)
+            return
+        }
+        i = i + 1
+    }
+    sets.push((name, values))
+}
+
+/// FIRST for every non-terminal.
+pub fn first(g: Grammar) -> [(str, [str])] {
+    let nulls = nullable(g)
+    var sets: [(str, [str])] = []
+    for name in g.nonterminals {
+        store(sets, name, [])
+    }
+    var changed = true
+    while changed {
+        changed = false
+        for production in g.productions {
+            var current = lookup(sets, production.head)
+            let before = current.len()
+            for token in first_of_body(g, sets, nulls, production.body) {
+                push_new(current, token)
+            }
+            if current.len() != before {
+                store(sets, production.head, current)
+                changed = true
+            }
+        }
+    }
+    return sorted_sets(sets)
+}
+
+fn sorted_sets(sets: [(str, [str])]) -> [(str, [str])] {
+    var out: [(str, [str])] = []
+    for entry in sets {
+        var values = entry.1
+        values.sort()
+        out.push((entry.0, values))
+    }
+    return out
+}
+
+/// The end-of-input marker, which is in FOLLOW of the start symbol and
+/// nowhere else to begin with.
+pub fn end_marker() -> str {
+    return "$"
+}
+
+/// FOLLOW for every non-terminal.
+///
+/// The rule that catches people: when a non-terminal is at the *end* of a
+/// production, everything that can follow the head can follow it — so FOLLOW
+/// propagates backwards, and one new production can change FOLLOW for half
+/// the grammar.
+pub fn follow(g: Grammar) -> [(str, [str])] {
+    let nulls = nullable(g)
+    let firsts = first(g)
+    var sets: [(str, [str])] = []
+    for name in g.nonterminals {
+        store(sets, name, [])
+    }
+    store(sets, g.start, [end_marker()])
+    var changed = true
+    while changed {
+        changed = false
+        for production in g.productions {
+            if propagate(g, sets, firsts, nulls, production) {
+                changed = true
+            }
+        }
+    }
+    return sorted_sets(sets)
+}
+
+fn propagate(g: Grammar, inout sets: [(str, [str])], firsts: [(str, [str])],
+    nulls: [str], production: Production) -> bool {
+    var changed = false
+    var i = 0
+    while i < production.body.len() {
+        let symbol = production.body[i]
+        if not is_nonterminal(g, symbol) {
+            i = i + 1
+            continue
+        }
+        var current = lookup(sets, symbol)
+        let before = current.len()
+        let rest = tail(production.body, i + 1)
+        for token in first_of_body(g, firsts, nulls, rest) {
+            push_new(current, token)
+        }
+        // Everything after it is nullable, so whatever follows the head
+        // follows this symbol too. This is the backwards propagation.
+        if all_nullable(g, nulls, rest) {
+            for token in lookup(sets, production.head) {
+                push_new(current, token)
+            }
+        }
+        if current.len() != before {
+            store(sets, symbol, current)
+            changed = true
+        }
+        i = i + 1
+    }
+    return changed
+}
+
+fn tail(body: [str], from: i64) -> [str] {
+    var out: [str] = []
+    var i = from
+    while i < body.len() {
+        out.push(body[i])
+        i = i + 1
+    }
+    return out
+}
+
+fn all_nullable(g: Grammar, nulls: [str], body: [str]) -> bool {
+    for symbol in body {
+        if not is_nonterminal(g, symbol) or not contains(nulls, symbol) {
+            return false
+        }
+    }
+    return true
+}
+
+/// The tokens a production may be chosen on.
+///
+/// FIRST of the body, plus FOLLOW of the head when the body can produce
+/// nothing. This is the set an LL(1) table is built from, and the answer to
+/// "given the next token, which production?".
+pub fn predict(g: Grammar, production: Production) -> [str] {
+    let nulls = nullable(g)
+    let firsts = first(g)
+    var out = first_of_body(g, firsts, nulls, production.body)
+    if all_nullable(g, nulls, production.body) {
+        for token in lookup(follow(g), production.head) {
+            push_new(out, token)
+        }
+    }
+    out.sort()
+    return out
+}
+
+/// Where two productions for the same non-terminal could both be chosen.
+///
+/// A grammar with none of these is LL(1) and parses with a table and a stack.
+/// A grammar with one is where "shift/reduce conflict" comes from — the same
+/// question with two answers.
+pub fn conflicts(g: Grammar) -> [(str, str)] {
+    var out: [(str, str)] = []
+    var i = 0
+    while i < g.productions.len() {
+        var k = i + 1
+        while k < g.productions.len() {
+            if g.productions[i].head == g.productions[k].head {
+                for token in predict(g, g.productions[i]) {
+                    if contains(predict(g, g.productions[k]), token) {
+                        out.push((g.productions[i].head, token))
+                    }
+                }
+            }
+            k = k + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+/// Whether the grammar can be parsed by a predictive table.
+pub fn is_ll1(g: Grammar) -> bool {
+    return conflicts(g).len() == 0
+}
+
+/// The non-terminals that are left recursive, directly or through others.
+///
+/// `E -> E + T` cannot be parsed top-down: the parser calls `E` to parse `E`,
+/// for ever. The fix is mechanical and is why every LL grammar in a textbook
+/// has primed non-terminals in it.
+pub fn left_recursive(g: Grammar) -> [str] {
+    let nulls = nullable(g)
+    // A begins with B when some production of A starts with B, possibly after
+    // nullable symbols.
+    var begins: [(str, str)] = []
+    for production in g.productions {
+        for symbol in production.body {
+            if not is_nonterminal(g, symbol) {
+                break
+            }
+            begins.push((production.head, symbol))
+            if not contains(nulls, symbol) {
+                break
+            }
+        }
+    }
+    // Then close it: A is left recursive when it can begin with itself.
+    var changed = true
+    while changed {
+        changed = false
+        for edge in begins {
+            for other in begins {
+                if edge.1 == other.0 and not has_edge(begins, edge.0,
+                    other.1) {
+                    begins.push((edge.0, other.1))
+                    changed = true
+                }
+            }
+        }
+    }
+    var out: [str] = []
+    for edge in begins {
+        if edge.0 == edge.1 {
+            push_new(out, edge.0)
+        }
+    }
+    out.sort()
+    return out
+}
+
+fn has_edge(edges: [(str, str)], from: str, to: str) -> bool {
+    for edge in edges {
+        if edge.0 == from and edge.1 == to {
+            return true
+        }
+    }
+    return false
+}
+
+/// The LL(1) table: which production to use for each non-terminal and token.
+pub fn table(g: Grammar) -> [(str, str, i64)] {
+    var out: [(str, str, i64)] = []
+    var i = 0
+    while i < g.productions.len() {
+        for token in predict(g, g.productions[i]) {
+            out.push((g.productions[i].head, token, i))
+        }
+        i = i + 1
+    }
+    return out
+}
+
+/// The production to use, or -1.
+pub fn choose(entries: [(str, str, i64)], head: str, token: str) -> i64 {
+    for entry in entries {
+        if entry.0 == head and entry.1 == token {
+            return entry.2
+        }
+    }
+    return 0 - 1
+}
+
+/// The non-terminals that can never produce a string of terminals.
+///
+/// A production referring to one is dead, and a grammar with one is almost
+/// always a typo — a non-terminal named in a body and never given a rule.
+pub fn unproductive(g: Grammar) -> [str] {
+    var productive: [str] = []
+    var changed = true
+    while changed {
+        changed = false
+        for production in g.productions {
+            if contains(productive, production.head) {
+                continue
+            }
+            var all = true
+            for symbol in production.body {
+                if is_nonterminal(g, symbol) and not contains(productive,
+                    symbol) {
+                    all = false
+                }
+            }
+            if all {
+                productive.push(production.head)
+                changed = true
+            }
+        }
+    }
+    var out: [str] = []
+    for name in g.nonterminals {
+        if not contains(productive, name) {
+            out.push(name)
+        }
+    }
+    out.sort()
+    return out
+}
+
+/// The non-terminals the start symbol can never reach.
+pub fn unreachable(g: Grammar) -> [str] {
+    var seen: [str] = [g.start]
+    var changed = true
+    while changed {
+        changed = false
+        for production in g.productions {
+            if not contains(seen, production.head) {
+                continue
+            }
+            for symbol in production.body {
+                if is_nonterminal(g, symbol) and not contains(seen, symbol) {
+                    seen.push(symbol)
+                    changed = true
+                }
+            }
+        }
+    }
+    var out: [str] = []
+    for name in g.nonterminals {
+        if not contains(seen, name) {
+            out.push(name)
+        }
+    }
+    out.sort()
+    return out
+}

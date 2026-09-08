@@ -1,0 +1,467 @@
+// Static single assignment: every variable written once, and why that helps.
+//
+// In SSA each variable has exactly one definition. `x = 1; x = 2` becomes
+// `x1 = 1; x2 = 2`, and every use says which definition it means by naming
+// it. That one change makes most optimisations trivial: constant propagation
+// is following a name to its definition, dead code elimination is a name with
+// no uses, and common subexpression elimination is two definitions with the
+// same right-hand side.
+//
+// Every serious compiler since about 1995 uses it. LLVM's whole intermediate
+// representation is SSA; so are GCC's GIMPLE, V8's Turbofan, and the JVM's
+// C2.
+//
+// ## The problem SSA has to solve
+//
+// ```
+// if c { x = 1 } else { x = 2 }
+// print(x)
+// ```
+//
+// Which definition does the `print` mean? Neither, and both. SSA answers with
+// a **phi function**: `x3 = phi(x1, x2)` at the join, meaning "whichever
+// predecessor we came from". A phi is not an instruction — no machine has
+// one — it is a note saying that two names have merged, and the register
+// allocator turns it into a copy, or into nothing when both names already
+// live in the same register.
+//
+// ## Where the phis go
+//
+// Not everywhere: that would be quadratic and most would be useless. A phi
+// for `x` is needed exactly at the **dominance frontier** of every block that
+// defines `x`.
+//
+// A block *dominates* another when every path from the entry to it goes
+// through the first. Block D's dominance frontier is the blocks that D does
+// *not* dominate but whose predecessor D does — the first place where control
+// that went through D meets control that did not. Which is precisely where
+// two definitions can meet, and precisely where a phi is needed.
+//
+// That is Cytron's 1991 result, and it is the reason "dominance frontier"
+// appears in every compiler textbook written since.
+//
+// ## Computing dominators
+//
+// The obvious way is a fixed point over sets, which is simple and slow.
+// Cooper, Harvey and Kennedy's 1999 algorithm keeps only each block's
+// *immediate* dominator and walks up the tree to intersect — which is what is
+// here, because it is short, fast in practice, and the one people actually
+// implement.
+//
+// Checked against `networkx`'s own dominator computation.
+
+type SsaError =
+    | NoEntry()
+    | UnreachableBlock(block: i64)
+    | UnknownVariable(name: str)
+
+type Cfg = {
+    /// One entry a block, listing its successors.
+    successors: [[i64]],
+    /// Which variables each block assigns.
+    defines: [[str]],
+    entry: i64,
+}
+
+/// A graph from its successor lists.
+pub fn cfg(successors: [[i64]], defines: [[str]]) -> Cfg {
+    return Cfg{ successors: successors, defines: defines, entry: 0 }
+}
+
+/// Each block's predecessors.
+pub fn predecessors(g: Cfg) -> [[i64]] {
+    var out: [[i64]] = []
+    for _i in 0..g.successors.len() {
+        out.push([])
+    }
+    var i = 0
+    while i < g.successors.len() {
+        for target in g.successors[i] {
+            out[target].push(i)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+/// The blocks in reverse post-order, which is the order the dominator
+/// algorithm needs.
+///
+/// A block's dominator can only be computed once its predecessors have been,
+/// and reverse post-order visits a block before everything it can reach — so
+/// one pass usually settles the whole graph and the loop runs twice.
+pub fn reverse_postorder(g: Cfg) -> [i64] {
+    var seen: [bool] = []
+    for _i in 0..g.successors.len() {
+        seen.push(false)
+    }
+    var order: [i64] = []
+    visit(g, g.entry, seen, order)
+    return order.rev()
+}
+
+fn visit(g: Cfg, at: i64, inout seen: [bool], inout order: [i64]) {
+    if seen[at] {
+        return
+    }
+    seen[at] = true
+    for target in g.successors[at] {
+        visit(g, target, seen, order)
+    }
+    order.push(at)
+}
+
+/// Each block's immediate dominator, or -1 for the entry and for anything
+/// unreachable.
+///
+/// Cooper, Harvey and Kennedy: keep only the immediate dominator and
+/// intersect by walking up the tree. Shorter than the set-based fixed point
+/// and faster on every graph anyone has measured.
+pub fn immediate_dominators(g: Cfg) -> [i64] {
+    let order = reverse_postorder(g)
+    var position: [i64] = []
+    for _i in 0..g.successors.len() {
+        position.push(0 - 1)
+    }
+    var i = 0
+    while i < order.len() {
+        position[order[i]] = i
+        i = i + 1
+    }
+    var idom: [i64] = []
+    for _k in 0..g.successors.len() {
+        idom.push(0 - 1)
+    }
+    idom[g.entry] = g.entry
+    let preds = predecessors(g)
+    var changed = true
+    while changed {
+        changed = false
+        for block in order {
+            if block == g.entry {
+                continue
+            }
+            var new_idom = 0 - 1
+            for pred in preds[block] {
+                if idom[pred] < 0 {
+                    continue
+                }
+                if new_idom < 0 {
+                    new_idom = pred
+                } else {
+                    new_idom = intersect(idom, position, pred, new_idom)
+                }
+            }
+            if new_idom >= 0 and idom[block] != new_idom {
+                idom[block] = new_idom
+                changed = true
+            }
+        }
+    }
+    idom[g.entry] = 0 - 1
+    return idom
+}
+
+fn intersect(idom: [i64], position: [i64], left: i64, right: i64) -> i64 {
+    var a = left
+    var b = right
+    // Walk the deeper one up until they meet. Reverse post-order numbers make
+    // "deeper" a comparison rather than a search.
+    while a != b {
+        while position[a] > position[b] {
+            a = idom[a]
+        }
+        while position[b] > position[a] {
+            b = idom[b]
+        }
+    }
+    return a
+}
+
+/// Whether one block dominates another.
+pub fn dominates(idom: [i64], ancestor: i64, block: i64) -> bool {
+    var at = block
+    while at >= 0 {
+        if at == ancestor {
+            return true
+        }
+        at = idom[at]
+    }
+    return false
+}
+
+/// Each block's dominance frontier.
+///
+/// The first place where control that went through a block meets control
+/// that did not — which is exactly where two definitions can meet, and
+/// exactly where a phi is needed.
+pub fn dominance_frontiers(g: Cfg) -> [[i64]] {
+    let idom = immediate_dominators(g)
+    let preds = predecessors(g)
+    let reachable = reverse_postorder(g)
+    var out: [[i64]] = []
+    for _i in 0..g.successors.len() {
+        out.push([])
+    }
+    var block = 0
+    while block < g.successors.len() {
+        if not has(reachable, block) {
+            block = block + 1
+            continue
+        }
+        // Join points, and the entry. A block with one predecessor merges
+        // nothing — except the entry, which merges the function's own
+        // arrival with whatever loops back to it, and is on the frontier of
+        // everything on that path. Leaving the entry out is the mistake that
+        // makes a phi go missing at the top of a loop that starts the
+        // function.
+        if block == g.entry or preds[block].len() >= 2 {
+            for pred in preds[block] {
+                if not has(reachable, pred) {
+                    continue
+                }
+                var runner = pred
+                while runner >= 0 and runner != idom[block] {
+                    if not has(out[runner], block) {
+                        out[runner].push(block)
+                    }
+                    runner = idom[runner]
+                }
+            }
+        }
+        block = block + 1
+    }
+    var i = 0
+    while i < out.len() {
+        out[i].sort()
+        i = i + 1
+    }
+    return out
+}
+
+fn has(values: [i64], wanted: i64) -> bool {
+    for value in values {
+        if value == wanted {
+            return true
+        }
+    }
+    return false
+}
+
+/// Where a phi is needed for each variable, as (block, variable).
+///
+/// Cytron's rule: a phi for `x` goes at the dominance frontier of every block
+/// that defines `x` — and a phi is itself a definition, so the frontier of the
+/// block it lands in needs one too. That closure is the "iterated dominance
+/// frontier", and it is why the loop runs until nothing is added.
+pub fn phi_placements(g: Cfg) -> [(i64, str)] {
+    var out: [(i64, str)] = []
+    for name in variables(g) {
+        var work: [i64] = []
+        var block = 0
+        while block < g.defines.len() {
+            if has_name(g.defines[block], name) {
+                work.push(block)
+            }
+            block = block + 1
+        }
+        place(g, out, name, work)
+    }
+    return out
+}
+
+fn place(g: Cfg, inout out: [(i64, str)], name: str, start: [i64]) {
+    let frontiers = dominance_frontiers(g)
+    var work = start
+    var placed: [i64] = []
+    while work.len() > 0 {
+        var next: [i64] = []
+        for block in work {
+            for target in frontiers[block] {
+                if has(placed, target) {
+                    continue
+                }
+                placed.push(target)
+                out.push((target, name))
+                // The phi is a definition, so it may need phis of its own
+                // further on. This closure is what "iterated" means.
+                next.push(target)
+            }
+        }
+        work = next
+    }
+}
+
+fn has_name(names: [str], wanted: str) -> bool {
+    for name in names {
+        if name == wanted {
+            return true
+        }
+    }
+    return false
+}
+
+/// Every variable the graph assigns, in order of first appearance.
+pub fn variables(g: Cfg) -> [str] {
+    var out: [str] = []
+    for block in g.defines {
+        for name in block {
+            if not has_name(out, name) {
+                out.push(name)
+            }
+        }
+    }
+    return out
+}
+
+/// How many phis the graph needs.
+pub fn phi_count(g: Cfg) -> i64 {
+    return phi_placements(g).len()
+}
+
+/// The dominator tree's children, one list a block.
+pub fn dominator_children(idom: [i64]) -> [[i64]] {
+    var out: [[i64]] = []
+    for _i in 0..idom.len() {
+        out.push([])
+    }
+    var i = 0
+    while i < idom.len() {
+        if idom[i] >= 0 {
+            out[idom[i]].push(i)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+/// How deep a block sits in the dominator tree, entry at zero.
+pub fn dominator_depth(idom: [i64], block: i64) -> i64 {
+    var depth = 0
+    var at = block
+    while idom[at] >= 0 {
+        at = idom[at]
+        depth = depth + 1
+    }
+    return depth
+}
+
+/// The blocks the entry cannot reach.
+///
+/// Unreachable code has no dominator and no place in the tree, and every
+/// analysis has to drop it first — which is why "unreachable code
+/// elimination" runs before everything else in a real compiler.
+pub fn unreachable(g: Cfg) -> [i64] {
+    let order = reverse_postorder(g)
+    var out: [i64] = []
+    var block = 0
+    while block < g.successors.len() {
+        if not has(order, block) {
+            out.push(block)
+        }
+        block = block + 1
+    }
+    return out
+}
+
+/// The back edges, which are what make a loop.
+///
+/// An edge from a block to one that dominates it. Every loop in a reducible
+/// graph has exactly one, and its target is the loop header — which is what
+/// a compiler hoists invariants out of.
+pub fn back_edges(g: Cfg) -> [(i64, i64)] {
+    let idom = immediate_dominators(g)
+    var out: [(i64, i64)] = []
+    var block = 0
+    while block < g.successors.len() {
+        for target in g.successors[block] {
+            if dominates(idom, target, block) {
+                out.push((block, target))
+            }
+        }
+        block = block + 1
+    }
+    return out
+}
+
+/// Whether the graph is reducible: every loop entered only through its
+/// header.
+///
+/// Structured code always is. Irreducible graphs come from `goto` into a
+/// loop, and from some optimisers' own output, and they are why compilers
+/// carry a node-splitting pass nobody wants to think about.
+pub fn is_reducible(g: Cfg) -> bool {
+    let idom = immediate_dominators(g)
+    var block = 0
+    while block < g.successors.len() {
+        if idom[block] < 0 and block != g.entry {
+            block = block + 1
+            continue
+        }
+        for target in g.successors[block] {
+            // A retreating edge whose target does not dominate its source is
+            // an entry into a loop that is not its header.
+            if is_retreating(g, block, target) and
+            not dominates(idom, target, block) {
+                return false
+            }
+        }
+        block = block + 1
+    }
+    return true
+}
+
+fn is_retreating(g: Cfg, from: i64, to: i64) -> bool {
+    let order = reverse_postorder(g)
+    var from_at = 0 - 1
+    var to_at = 0 - 1
+    var i = 0
+    while i < order.len() {
+        if order[i] == from {
+            from_at = i
+        }
+        if order[i] == to {
+            to_at = i
+        }
+        i = i + 1
+    }
+    return to_at >= 0 and from_at >= 0 and to_at <= from_at
+}
+
+/// The names a renaming pass would produce, as `x1`, `x2` and so on.
+///
+/// One number a definition, in dominator-tree order, which is the order a
+/// real renaming pass walks so that every use sees the nearest definition
+/// above it.
+pub fn rename(g: Cfg) -> [(i64, str, str)] {
+    let idom = immediate_dominators(g)
+    let children = dominator_children(idom)
+    var counters: [(str, i64)] = []
+    var out: [(i64, str, str)] = []
+    walk(g, children, g.entry, counters, out)
+    return out
+}
+
+fn walk(g: Cfg, children: [[i64]], block: i64, inout counters: [(str, i64)],
+    inout out: [(i64, str, str)]) {
+    for name in g.defines[block] {
+        let number = bump(counters, name)
+        out.push((block, name, name + "{number}"))
+    }
+    for child in children[block] {
+        walk(g, children, child, counters, out)
+    }
+}
+
+fn bump(inout counters: [(str, i64)], name: str) -> i64 {
+    var i = 0
+    while i < counters.len() {
+        if counters[i].0 == name {
+            counters[i] = (name, counters[i].1 + 1)
+            return counters[i].1
+        }
+        i = i + 1
+    }
+    counters.push((name, 1))
+    return 1
+}

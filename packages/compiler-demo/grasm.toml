@@ -1,0 +1,24 @@
+[package]
+name = "compiler_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.firstfollow]
+path = "../firstfollow"
+version = "^1.0.0"
+
+[dependencies.lexgen]
+path = "../lexgen"
+version = "^1.0.0"
+
+[dependencies.parsegen]
+path = "../parsegen"
+version = "^1.0.0"
+
+[dependencies.ssaform]
+path = "../ssaform"
+version = "^1.0.0"
+
+[dependencies.regalloc]
+path = "../regalloc"
+version = "^1.0.0"
