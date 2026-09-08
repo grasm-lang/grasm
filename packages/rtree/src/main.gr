@@ -1,0 +1,289 @@
+// An R-tree: an index over *boxes* rather than points.
+//
+// A k-d tree indexes points. Most spatial data is not points — a road, a
+// building outline, a country border — and the question is "which of these
+// hundred thousand shapes might touch this window". The R-tree answers it by
+// storing each shape's bounding box in a tree of bounding boxes, so a
+// subtree whose box misses the window is skipped entirely.
+//
+// ## Bulk loading, not repeated insertion
+//
+// Inserting one box at a time needs a rule for which subtree to grow and when
+// to split it, and the classic rules — least enlargement, quadratic split —
+// produce trees whose boxes overlap badly on real data. **Sort-Tile-Recursive**
+// packing builds the tree from all the boxes at once: sort by x, cut into
+// vertical slices, sort each slice by y, cut into tiles. It is one sort and
+// two passes, and the result has less overlap than anything incremental.
+//
+// The trade is that the tree is static. Adding a box means rebuilding, which
+// is the right shape for the usual case — an index built once over a dataset
+// and queried a million times.
+//
+// ## What a query returns, and what it does not
+//
+// **Candidates.** A box overlapping the window does not mean the shape does:
+// a diagonal road's bounding box covers a great deal of ground the road does
+// not touch. Every R-tree query is a filter step, and the caller has to
+// follow it with an exact test against the real geometry. A library that
+// hides that is a library returning wrong answers for L-shaped things.
+//
+// Checked against `shapely.STRtree` — the same algorithm, the same packing —
+// for the candidate sets it returns on random and clustered boxes.
+
+import geometry
+
+type RtreeEntry = {
+    box: Rect,
+    /// The caller's own identifier for the shape this box came from.
+    tag: i64,
+}
+
+type RtreeNode = {
+    box: Rect,
+    /// Entries, for a leaf.
+    entries: [RtreeEntry],
+    /// Indices of child nodes, for a branch.
+    children: [i64],
+    leaf: bool,
+}
+
+type Rtree = { nodes: [RtreeNode], root: i64, node_size: i64 }
+
+type RtreeError = | EmptyIndex()
+
+pub fn empty() -> Rtree {
+    return Rtree{ nodes: [], root: 0 - 1, node_size: 9 }
+}
+
+pub fn entry(box: Rect, tag: i64) -> RtreeEntry {
+    return RtreeEntry{ box: box, tag: tag }
+}
+
+fn union_of(a: Rect, b: Rect) -> Rect {
+    let x = if a.x < b.x { a.x } else { b.x }
+    let y = if a.y < b.y { a.y } else { b.y }
+    let right = if a.x + a.w > b.x + b.w { a.x + a.w } else { b.x + b.w }
+    let top = if a.y + a.h > b.y + b.h { a.y + a.h } else { b.y + b.h }
+    return geometry.rect(x, y, right - x, top - y)
+}
+
+fn box_of_entries(entries: [RtreeEntry]) -> Rect {
+    var out = entries[0].box
+    for e in entries {
+        out = union_of(out, e.box)
+    }
+    return out
+}
+
+fn centre_x(r: Rect) -> f64 {
+    return r.x + r.w / 2.0
+}
+
+fn centre_y(r: Rect) -> f64 {
+    return r.y + r.h / 2.0
+}
+
+fn integer_sqrt(n: i64) -> i64 {
+    if n < 2 {
+        return n
+    }
+    var x = n
+    var y = (x + 1) / 2
+    while y < x {
+        x = y
+        y = (x + n / x) / 2
+    }
+    return x
+}
+
+/// Build an index over the entries, packed sort-tile-recursively.
+pub fn build(entries: [RtreeEntry], node_size: i64) -> Rtree {
+    var t = empty()
+    if node_size > 1 {
+        t.node_size = node_size
+    }
+    if entries.len() == 0 {
+        return t
+    }
+    var leaves: [i64] = []
+    for group in tile(entries, t.node_size) {
+        t.nodes.push(RtreeNode{ box: box_of_entries(group), entries: group,
+            children: [], leaf: true })
+        leaves.push(t.nodes.len() - 1)
+    }
+    var level = leaves
+    while level.len() > 1 {
+        level = pack_level(t, level)
+    }
+    t.root = level[0]
+    return t
+}
+
+/// Sort by x, cut into vertical slices, sort each slice by y, cut into tiles.
+///
+/// The slice count is the square root of the number of tiles, which is what
+/// makes the tiles roughly square — long thin tiles are what make an R-tree's
+/// boxes overlap and its queries slow.
+fn tile(entries: [RtreeEntry], node_size: i64) -> [[RtreeEntry]] {
+    var sorted = entries
+    sorted.sort_by(|e| centre_x(e.box))
+    let tiles = (entries.len() + node_size - 1) / node_size
+    let slices = integer_sqrt(tiles)
+    let per_slice = (entries.len() + slices - 1) / slices
+    var out: [[RtreeEntry]] = []
+    var i = 0
+    while i < sorted.len() {
+        var slice_end = i + per_slice
+        if slice_end > sorted.len() {
+            slice_end = sorted.len()
+        }
+        var slice = sorted.slice(i, slice_end)
+        slice.sort_by(|e| centre_y(e.box))
+        var j = 0
+        while j < slice.len() {
+            var end = j + node_size
+            if end > slice.len() {
+                end = slice.len()
+            }
+            out.push(slice.slice(j, end))
+            j = end
+        }
+        i = slice_end
+    }
+    return out
+}
+
+fn pack_level(inout t: Rtree, level: [i64]) -> [i64] {
+    var sorted = level
+    let nodes = t.nodes
+    sorted.sort_by(|i| centre_x(nodes[i].box))
+    var out: [i64] = []
+    var i = 0
+    while i < sorted.len() {
+        var end = i + t.node_size
+        if end > sorted.len() {
+            end = sorted.len()
+        }
+        let group = sorted.slice(i, end)
+        var box = t.nodes[group[0]].box
+        for child in group {
+            box = union_of(box, t.nodes[child].box)
+        }
+        t.nodes.push(RtreeNode{ box: box, entries: [], children: group,
+            leaf: false })
+        out.push(t.nodes.len() - 1)
+        i = end
+    }
+    return out
+}
+
+/// The tags whose boxes overlap the window — candidates, not answers.
+pub fn search(t: Rtree, window: Rect) -> [i64] {
+    var out: [i64] = []
+    if t.root < 0 {
+        return out
+    }
+    walk(t, t.root, window, out)
+    out.sort()
+    return out
+}
+
+fn walk(t: Rtree, at: i64, window: Rect, inout out: [i64]) {
+    let node = t.nodes[at]
+    if not geometry.rects_overlap(node.box, window) {
+        return
+    }
+    if node.leaf {
+        for e in node.entries {
+            if geometry.rects_overlap(e.box, window) {
+                out.push(e.tag)
+            }
+        }
+        return
+    }
+    for child in node.children {
+        walk(t, child, window, out)
+    }
+}
+
+/// The tags whose boxes hold a point.
+pub fn search_point(t: Rtree, p: Vec2) -> [i64] {
+    return search(t, geometry.rect(p.x, p.y, 0.0, 0.0))
+}
+
+/// The box that contains everything in the index.
+pub fn bounds(t: Rtree) -> Rect ! RtreeError {
+    if t.root < 0 {
+        fail(EmptyIndex())
+    }
+    return t.nodes[t.root].box
+}
+
+pub fn size(t: Rtree) -> i64 {
+    var n = 0
+    for node in t.nodes {
+        if node.leaf {
+            n = n + node.entries.len()
+        }
+    }
+    return n
+}
+
+pub fn depth(t: Rtree) -> i64 {
+    if t.root < 0 {
+        return 0
+    }
+    var n = 0
+    var at = t.root
+    while not t.nodes[at].leaf {
+        n = n + 1
+        at = t.nodes[at].children[0]
+    }
+    return n + 1
+}
+
+/// How much of the index's area is covered more than once.
+///
+/// The number that says whether the tree is any good. Overlap between sibling
+/// boxes is what forces a query into more than one subtree, and a packing
+/// that produces long thin tiles has a lot of it. Worth measuring once on
+/// real data; a value near zero means the index will do what it promises.
+pub fn overlap_ratio(t: Rtree) -> f64 {
+    if t.root < 0 {
+        return 0.0
+    }
+    var total = 0.0
+    var overlapping = 0.0
+    for node in t.nodes {
+        if node.leaf {
+            continue
+        }
+        var i = 0
+        while i < node.children.len() {
+            let a = t.nodes[node.children[i]].box
+            total = total + geometry.rect_area(a)
+            var j = i + 1
+            while j < node.children.len() {
+                let b = t.nodes[node.children[j]].box
+                overlapping = overlapping + intersection_area(a, b)
+                j = j + 1
+            }
+            i = i + 1
+        }
+    }
+    if total == 0.0 {
+        return 0.0
+    }
+    return overlapping / total
+}
+
+fn intersection_area(a: Rect, b: Rect) -> f64 {
+    let left = if a.x > b.x { a.x } else { b.x }
+    let right = if a.x + a.w < b.x + b.w { a.x + a.w } else { b.x + b.w }
+    let bottom = if a.y > b.y { a.y } else { b.y }
+    let top = if a.y + a.h < b.y + b.h { a.y + a.h } else { b.y + b.h }
+    if right <= left or top <= bottom {
+        return 0.0
+    }
+    return (right - left) * (top - bottom)
+}

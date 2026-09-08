@@ -1,0 +1,24 @@
+[package]
+name = "fonts_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.sfnt]
+path = "../sfnt"
+version = "^1.0.0"
+
+[dependencies.cmap]
+path = "../cmap"
+version = "^1.0.0"
+
+[dependencies.glyf]
+path = "../glyf"
+version = "^1.0.0"
+
+[dependencies.fontmetrics]
+path = "../fontmetrics"
+version = "^1.0.0"
+
+[dependencies.woff]
+path = "../woff"
+version = "^1.0.0"

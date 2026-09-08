@@ -1,0 +1,10 @@
+[package]
+name = "cmap"
+version = "1.0.0"
+
+# Reads and writes bytes the caller supplies. Opens nothing.
+capabilities = []
+
+[dependencies.sfnt]
+path = "../sfnt"
+version = "^1.0.0"

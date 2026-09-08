@@ -1,0 +1,6 @@
+[package]
+name = "maxflow"
+version = "1.0.0"
+
+# Arithmetic on a graph the caller supplies. Opens nothing.
+capabilities = []

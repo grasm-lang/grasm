@@ -1,0 +1,24 @@
+[package]
+name = "numeric3_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.rootfind]
+path = "../rootfind"
+version = "^1.0.0"
+
+[dependencies.quadrature]
+path = "../quadrature"
+version = "^1.0.0"
+
+[dependencies.ode]
+path = "../ode"
+version = "^1.0.0"
+
+[dependencies.optimise]
+path = "../optimise"
+version = "^1.0.0"
+
+[dependencies.autodiff]
+path = "../autodiff"
+version = "^1.0.0"

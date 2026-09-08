@@ -1,0 +1,383 @@
+// Finding a minimum, and being honest about which one.
+//
+// ## Every method here finds a local minimum
+//
+// That is not a limitation to be worked around; it is what minimisation is
+// without extra information. A method that claims a global minimum for an
+// arbitrary function is either exhaustively searching or wrong. The realistic
+// approaches are to start from several points and take the best — which
+// `multi_start` does — or to know something about the function that rules the
+// other minima out.
+//
+// ## Golden section, and why the ratio
+//
+// For a function of one variable with a single minimum in an interval,
+// narrowing the bracket needs two interior points. Placing them at the golden
+// ratio means one of them can be *reused* as an interior point of the next,
+// smaller bracket — so each step costs one evaluation instead of two. That is
+// the entire reason for the ratio, and it halves the cost of the search.
+//
+// ## Nelder-Mead, and what it is for
+//
+// A simplex of n+1 points crawls downhill by reflecting its worst vertex
+// through the others, expanding when that helps and contracting when it does
+// not. It needs no derivatives at all, which makes it the method for a
+// function that is noisy, discontinuous, or the output of a simulation.
+//
+// It is also slow, it has no convergence proof in more than one dimension,
+// and it collapses into a degenerate simplex on some problems and stops. When
+// a gradient is available, use it — and if it is available cheaply and
+// exactly, `autodiff` provides it.
+//
+// ## The stopping rule is not the answer
+//
+// Stopping when the step is small says the *search* has stopped moving, not
+// that the minimum is there. On a flat valley floor the steps are tiny and
+// the minimum may be far along it. Every result here carries the number of
+// evaluations and whether the tolerance was met, so a caller can tell a
+// converged answer from an exhausted one.
+//
+// Checked against `scipy.optimize.minimize_scalar` and `minimize` with
+// Nelder-Mead, on convex functions, on Rosenbrock's valley, and on a function
+// with two minima.
+
+type MinimumResult = {
+    /// Where the minimum is.
+    x: [f64],
+    /// The value there.
+    value: f64,
+    evaluations: i64,
+    converged: bool,
+}
+
+type OptimiseError =
+    | EmptyStart()
+    | BadBracket(low: f64, high: f64)
+
+fn absolute(x: f64) -> f64 {
+    if x < 0.0 {
+        return 0.0 - x
+    }
+    return x
+}
+
+/// The golden ratio's reciprocal, which is where the interior points go.
+fn inverse_golden() -> f64 {
+    return 0.6180339887498949
+}
+
+/// Golden-section search on a unimodal function.
+///
+/// Unimodal means one minimum in the bracket. Given two, the search converges
+/// to one of them and gives no hint that the other exists — which is not a
+/// bug and is why `multi_start` is next door.
+pub fn golden_section(f: fn(f64) -> f64, low: f64, high: f64,
+    tolerance: f64, max_iterations: i64) -> MinimumResult ! OptimiseError {
+    if high <= low {
+        fail(BadBracket(low, high))
+    }
+    var a = low
+    var b = high
+    let ratio = inverse_golden()
+    var c = b - ratio * (b - a)
+    var d = a + ratio * (b - a)
+    var fc = f(c)
+    var fd = f(d)
+    var evaluations = 2
+    var i = 0
+    while i < max_iterations {
+        if absolute(b - a) < tolerance {
+            let x = (a + b) / 2.0
+            return MinimumResult{ x: [x], value: f(x),
+                evaluations: evaluations + 1, converged: true }
+        }
+        if fc < fd {
+            b = d
+            d = c
+            fd = fc
+            c = b - ratio * (b - a)
+            fc = f(c)
+        } else {
+            a = c
+            c = d
+            fc = fd
+            d = a + ratio * (b - a)
+            fd = f(d)
+        }
+        evaluations = evaluations + 1
+        i = i + 1
+    }
+    let x = (a + b) / 2.0
+    return MinimumResult{ x: [x], value: f(x),
+        evaluations: evaluations + 1, converged: false }
+}
+
+/// Nelder-Mead in any number of dimensions.
+///
+/// The four moves — reflect, expand, contract, shrink — with the coefficients
+/// from the 1965 paper. They are the ones every implementation uses and the
+/// ones scipy's default matches.
+pub fn nelder_mead(f: fn([f64]) -> f64, start: [f64], step: f64,
+    tolerance: f64, max_iterations: i64) -> MinimumResult ! OptimiseError {
+    let n = start.len()
+    if n == 0 {
+        fail(EmptyStart())
+    }
+    var points: [[f64]] = [start]
+    var i = 0
+    while i < n {
+        var p = start
+        p[i] = p[i] + step
+        points.push(p)
+        i = i + 1
+    }
+    var values: [f64] = []
+    for p in points {
+        values.push(f(p))
+    }
+    var evaluations = points.len()
+    var iteration = 0
+    while iteration < max_iterations {
+        // Order the simplex: best first, worst last.
+        var order: [i64] = []
+        var k = 0
+        while k < points.len() {
+            order.push(k)
+            k = k + 1
+        }
+        let scores = values
+        order.sort_by(|j| scores[j])
+        var sorted_points: [[f64]] = []
+        var sorted_values: [f64] = []
+        for j in order {
+            sorted_points.push(points[j])
+            sorted_values.push(values[j])
+        }
+        points = sorted_points
+        values = sorted_values
+
+        if absolute(values[values.len() - 1] - values[0]) < tolerance {
+            return MinimumResult{ x: points[0], value: values[0],
+                evaluations: evaluations, converged: true }
+        }
+        move_simplex(f, points, values, evaluations, n)
+        iteration = iteration + 1
+    }
+    var best = 0
+    var i2 = 1
+    while i2 < values.len() {
+        if values[i2] < values[best] {
+            best = i2
+        }
+        i2 = i2 + 1
+    }
+    return MinimumResult{ x: points[best], value: values[best],
+        evaluations: evaluations, converged: false }
+}
+
+
+/// One Nelder-Mead move: reflect the worst vertex, and take the best of the
+/// four outcomes.
+///
+/// Reflect; if that beats the best, try going twice as far; if it does not
+/// even beat the second worst, contract halfway back; and if nothing helped,
+/// pull the whole simplex towards the best point. The coefficients — 1, 2,
+/// 0.5, 0.5 — are the ones from the 1965 paper.
+fn move_simplex(f: fn([f64]) -> f64, inout points: [[f64]],
+    inout values: [f64], inout evaluations: i64, n: i64) {
+    var centroid: [f64] = []
+    var d = 0
+    while d < n {
+        var total = 0.0
+        var j = 0
+        while j < points.len() - 1 {
+            total = total + points[j][d]
+            j = j + 1
+        }
+        centroid.push(total / (points.len() - 1).as_f64())
+        d = d + 1
+    }
+    let worst = points[points.len() - 1]
+    let reflected = along(centroid, worst, 1.0)
+    let f_reflected = f(reflected)
+    evaluations = evaluations + 1
+    if f_reflected < values[0] {
+        let expanded = along(centroid, worst, 2.0)
+        let f_expanded = f(expanded)
+        evaluations = evaluations + 1
+        if f_expanded < f_reflected {
+            points[points.len() - 1] = expanded
+            values[values.len() - 1] = f_expanded
+        } else {
+            points[points.len() - 1] = reflected
+            values[values.len() - 1] = f_reflected
+        }
+        return
+    }
+    if f_reflected < values[values.len() - 2] {
+        points[points.len() - 1] = reflected
+        values[values.len() - 1] = f_reflected
+        return
+    }
+    let contracted = along(centroid, worst, 0.0 - 0.5)
+    let f_contracted = f(contracted)
+    evaluations = evaluations + 1
+    if f_contracted < values[values.len() - 1] {
+        points[points.len() - 1] = contracted
+        values[values.len() - 1] = f_contracted
+        return
+    }
+    // Nothing worked: pull everything towards the best.
+    var j = 1
+    while j < points.len() {
+        points[j] = midpoint(points[0], points[j])
+        values[j] = f(points[j])
+        evaluations = evaluations + 1
+        j = j + 1
+    }
+}
+
+/// `centroid + factor * (centroid - worst)`.
+fn along(centroid: [f64], worst: [f64], factor: f64) -> [f64] {
+    var out: [f64] = []
+    var i = 0
+    while i < centroid.len() {
+        out.push(centroid[i] + factor * (centroid[i] - worst[i]))
+        i = i + 1
+    }
+    return out
+}
+
+fn midpoint(a: [f64], b: [f64]) -> [f64] {
+    var out: [f64] = []
+    var i = 0
+    while i < a.len() {
+        out.push((a[i] + b[i]) / 2.0)
+        i = i + 1
+    }
+    return out
+}
+
+/// Gradient descent with a backtracking line search.
+///
+/// The fixed step size everyone writes first is the problem: too large and it
+/// diverges, too small and it never arrives, and the right value depends on
+/// the function's curvature. Backtracking halves the step until the value
+/// actually decreases, which cannot diverge and needs no tuning.
+pub fn gradient_descent(f: fn([f64]) -> f64, gradient: fn([f64]) -> [f64],
+    start: [f64], tolerance: f64,
+    max_iterations: i64) -> MinimumResult ! OptimiseError {
+    if start.len() == 0 {
+        fail(EmptyStart())
+    }
+    var x = start
+    var value = f(x)
+    var evaluations = 1
+    var i = 0
+    while i < max_iterations {
+        let g = gradient(x)
+        var norm = 0.0
+        for component in g {
+            norm = norm + component * component
+        }
+        norm = norm.sqrt()
+        if norm < tolerance {
+            return MinimumResult{ x: x, value: value,
+                evaluations: evaluations, converged: true }
+        }
+        var step = 1.0
+        var moved = false
+        var tries = 0
+        while tries < 60 {
+            var candidate: [f64] = []
+            var j = 0
+            while j < x.len() {
+                candidate.push(x[j] - step * g[j])
+                j = j + 1
+            }
+            let f_candidate = f(candidate)
+            evaluations = evaluations + 1
+            if f_candidate < value {
+                x = candidate
+                value = f_candidate
+                moved = true
+                break
+            }
+            step = step / 2.0
+            tries = tries + 1
+        }
+        if not moved {
+            return MinimumResult{ x: x, value: value,
+                evaluations: evaluations, converged: true }
+        }
+        i = i + 1
+    }
+    return MinimumResult{ x: x, value: value, evaluations: evaluations,
+        converged: false }
+}
+
+/// The best minimum found from several starting points.
+///
+/// Not a global optimiser — nothing that evaluates a function a finite number
+/// of times is. It is the honest thing to do when the function may have more
+/// than one minimum, and `distinct_minima` says how many different ones the
+/// starts actually found, which is the useful signal.
+pub fn multi_start(f: fn([f64]) -> f64, starts: [[f64]], step: f64,
+    tolerance: f64, max_iterations: i64) -> MinimumResult ! OptimiseError {
+    if starts.len() == 0 {
+        fail(EmptyStart())
+    }
+    var best = try nelder_mead(f, starts[0], step, tolerance, max_iterations)
+    var i = 1
+    while i < starts.len() {
+        let candidate = try nelder_mead(f, starts[i], step, tolerance,
+            max_iterations)
+        if candidate.value < best.value {
+            best = candidate
+        }
+        i = i + 1
+    }
+    return best
+}
+
+/// How many different minima a set of starting points reached.
+///
+/// Two results are the same minimum when every coordinate agrees to within
+/// the tolerance. A count above one is proof the function is multimodal, and
+/// proof that any single-start answer was luck.
+pub fn distinct_minima(f: fn([f64]) -> f64, starts: [[f64]], step: f64,
+    tolerance: f64, max_iterations: i64) -> i64 {
+    var found: [[f64]] = []
+    for start in starts {
+        match nelder_mead(f, start, step, tolerance, max_iterations) {
+            Ok(result) -> {
+                var seen = false
+                for earlier in found {
+                    if close_enough(earlier, result.x, tolerance * 100.0) {
+                        seen = true
+                    }
+                }
+                if not seen {
+                    found.push(result.x)
+                }
+            }
+            Err(_e) -> {
+            }
+        }
+    }
+    return found.len()
+}
+
+fn close_enough(a: [f64], b: [f64], tolerance: f64) -> bool {
+    if a.len() != b.len() {
+        return false
+    }
+    var i = 0
+    while i < a.len() {
+        if absolute(a[i] - b[i]) > tolerance {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}

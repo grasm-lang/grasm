@@ -57,7 +57,7 @@ page is regenerated from that record. None of them is typed by hand.</p>
 
 <h2>What holds</h2>
 <div class="figures">
-  <div class="fig"><b>275</b><span>programs, three engines</span></div>
+  <div class="fig"><b>362</b><span>programs, three engines</span></div>
   <div class="fig"><b>189</b><span>identical in wasm</span></div>
   <div class="fig"><b>227</b><span>cross-compiled, agreeing</span></div>
   <div class="fig"><b>0</b><span>open defects</span></div>
@@ -65,8 +65,8 @@ page is regenerated from that record. None of them is typed by hand.</p>
   <div class="fig"><b>14</b><span>generators</span></div>
 </div>
 <p>Interpreter, bundle and native builds agree byte for byte on stdout, exit
-code and diagnostics. A wasm build agrees on the 236 programs that do not
-need a filesystem, a socket, a process or threads. The same 275 cross-compile to
+code and diagnostics. A wasm build agrees on the 297 programs that do not
+need a filesystem, a socket, a process or threads. The same 362 cross-compile to
 x86_64 and agree there. Every generated program is checked for what it keeps as
 well as for what it prints.</p>
 
@@ -90,7 +90,7 @@ working session — falling, but not zero, and a language with zero known defect
 and no users has told you more about its test suite than about itself.</p>
 
 <h2>How that is kept honest</h2>
-<p>All 92 findings are written down in <code>ProjectGold/FINDINGS.md</code>,
+<p>All 97 findings are written down in <code>ProjectGold/FINDINGS.md</code>,
 including the ones that were the test harness's fault, the ones withdrawn as
 wrong, and the ones caught before they shipped. Every gate is verified by
 breaking the thing it guards and confirming it fails.</p>

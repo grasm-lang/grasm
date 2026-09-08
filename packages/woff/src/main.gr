@@ -1,0 +1,355 @@
+// WOFF: the same font, compressed, for the web.
+//
+// A WOFF file is an sfnt with each table zlib-compressed separately and a new
+// directory in front. That is the whole format — it adds nothing a font can
+// express, and it exists for three reasons that are all about the web rather
+// than about typography.
+//
+// ## Why per-table compression rather than gzipping the file
+//
+// A browser can decompress the tables it needs and skip the ones it does not,
+// and it can begin rendering before the file has finished arriving. Gzipping
+// the whole thing would compress slightly better and force the browser to
+// wait for all of it.
+//
+// It also means a table is stored uncompressed when compression would make it
+// larger, which happens for short tables where zlib's header costs more than
+// it saves. The rule is: `compLength < origLength` means compressed, and
+// equal means stored. A reader that always inflates fails on the second case,
+// and the failure is a font that works everywhere except in the one browser
+// that has a short `head` table.
+//
+// ## The other two reasons
+//
+// **Metadata.** WOFF has a place for an XML block naming the licence and the
+// vendor, which a bare font has nowhere to put. It is optional and almost
+// always absent.
+//
+// **A different file signature.** `wOFF` rather than `0x00010000` means a
+// desktop system will not install it by accident, which was the licensing
+// concession that got web fonts agreed at all.
+//
+// ## WOFF2 is a different thing entirely
+//
+// It uses Brotli, reorders the glyph table, and re-encodes the outlines into
+// a form that compresses better and has to be reconstructed on load. It is
+// not "WOFF with a better compressor" and nothing here reads it — the
+// signature is `wOF2` and this refuses it rather than producing nonsense.
+//
+// Checked against `fontTools.ttLib.woff2` and `fontTools`' WOFF reader: every
+// file this writes is one fontTools opens with the same tables, and every
+// WOFF fontTools writes is one this decodes to a byte-identical sfnt.
+
+import sfnt
+import zlib
+
+type WoffEntry = {
+    tag: str,
+    offset: i64,
+    /// The length as stored, which is the compressed length when smaller.
+    compressed_length: i64,
+    original_length: i64,
+    checksum: i64,
+}
+
+type WoffFont = {
+    /// The sfnt version the font had before it was wrapped.
+    flavor: i64,
+    total_sfnt_size: i64,
+    major: i64,
+    minor: i64,
+    entries: [WoffEntry],
+    has_metadata: bool,
+    metadata_length: i64,
+}
+
+type WoffError =
+    | NotWoff(signature: str)
+    | IsWoff2()
+    | TooShort()
+    | TableOutOfRange(tag: str)
+    | InflateFailed(tag: str)
+
+fn read16(data: bytes, at: i64) -> i64 {
+    if at + 2 > data.len() {
+        return 0
+    }
+    return data.at(at).shl(8).bit_or(data.at(at + 1))
+}
+
+fn read32(data: bytes, at: i64) -> i64 {
+    if at + 4 > data.len() {
+        return 0
+    }
+    return data.at(at).shl(24).bit_or(data.at(at + 1).shl(16))
+        .bit_or(data.at(at + 2).shl(8)).bit_or(data.at(at + 3))
+}
+
+fn tag_at(data: bytes, at: i64) -> str {
+    var out = ""
+    var i = 0
+    while i < 4 and at + i < data.len() {
+        out = out + bytes_of([data.at(at + i)]).to_str()
+        i = i + 1
+    }
+    return out
+}
+
+pub fn signature() -> str {
+    return "wOFF"
+}
+
+/// The directory of a WOFF file.
+pub fn parse(data: bytes) -> WoffFont ! WoffError {
+    if data.len() < 44 {
+        fail(TooShort())
+    }
+    let magic = tag_at(data, 0)
+    if magic == "wOF2" {
+        // A different format wearing a similar name.
+        fail(IsWoff2())
+    }
+    if magic != signature() {
+        fail(NotWoff(magic))
+    }
+    let count = read16(data, 12)
+    if 44 + count * 20 > data.len() {
+        fail(TooShort())
+    }
+    var entries: [WoffEntry] = []
+    var i = 0
+    while i < count {
+        let at = 44 + i * 20
+        let entry = WoffEntry{
+            tag: tag_at(data, at),
+            offset: read32(data, at + 4),
+            compressed_length: read32(data, at + 8),
+            original_length: read32(data, at + 12),
+            checksum: read32(data, at + 16),
+        }
+        if entry.offset + entry.compressed_length > data.len() {
+            fail(TableOutOfRange(entry.tag))
+        }
+        entries.push(entry)
+        i = i + 1
+    }
+    return WoffFont{
+        flavor: read32(data, 4),
+        total_sfnt_size: read32(data, 16),
+        major: read16(data, 20),
+        minor: read16(data, 22),
+        entries: entries,
+        has_metadata: read32(data, 24) != 0,
+        metadata_length: read32(data, 28),
+    }
+}
+
+/// Whether a table is stored compressed.
+///
+/// The rule is a comparison, not a flag: equal lengths mean stored. A reader
+/// that inflates unconditionally fails on the short tables where compression
+/// would have made things bigger.
+pub fn is_compressed(entry: WoffEntry) -> bool {
+    return entry.compressed_length < entry.original_length
+}
+
+/// One table's bytes, inflated if it was compressed.
+pub fn table_data(data: bytes, entry: WoffEntry) -> bytes ! WoffError {
+    let stored = data.slice(entry.offset,
+        entry.offset + entry.compressed_length)
+    if not is_compressed(entry) {
+        return stored
+    }
+    match zlib.decompress(stored, entry.original_length + 16) {
+        Ok(out) -> {
+            return out
+        }
+        Err(_e) -> {
+            fail(InflateFailed(entry.tag))
+        }
+    }
+}
+
+pub fn entry_named(font: WoffFont, tag: str) -> WoffEntry ! WoffError {
+    for e in font.entries {
+        if e.tag == tag {
+            return e
+        }
+    }
+    fail(TableOutOfRange(tag))
+}
+
+pub fn tags(font: WoffFont) -> [str] {
+    var out: [str] = []
+    for e in font.entries {
+        out.push(e.tag)
+    }
+    return out
+}
+
+/// The sfnt this WOFF was made from, reassembled.
+///
+/// The tables come back in tag order rather than in the order the original
+/// had them, because WOFF does not record it — so the bytes are equivalent
+/// rather than identical. Every table is byte for byte what went in; only
+/// `head`'s whole-file checksum differs, because it is a checksum of a
+/// layout that has changed, and this recomputes it rather than carrying a
+/// stale one.
+pub fn to_sfnt(data: bytes) -> bytes ! WoffError {
+    let font = try parse(data)
+    var tags: [str] = []
+    var contents: [bytes] = []
+    for e in font.entries {
+        tags.push(e.tag)
+        contents.push(try table_data(data, e))
+    }
+    match sfnt.build(font.flavor, tags, contents) {
+        Ok(out) -> {
+            return sfnt.seal(out) ?? out
+        }
+        Err(_e) -> {
+            fail(TooShort())
+        }
+    }
+}
+
+/// How much smaller the WOFF is than the font it holds.
+pub fn compression_ratio(font: WoffFont, file_size: i64) -> f64 {
+    if font.total_sfnt_size == 0 {
+        return 1.0
+    }
+    return file_size.as_f64() / font.total_sfnt_size.as_f64()
+}
+
+// ------------------------------------------------------------- writing
+
+fn write32(value: i64) -> [i64] {
+    return [value.ushr(24).bit_and(255), value.ushr(16).bit_and(255),
+        value.ushr(8).bit_and(255), value.bit_and(255)]
+}
+
+fn write16(value: i64) -> [i64] {
+    return [value.ushr(8).bit_and(255), value.bit_and(255)]
+}
+
+fn pad_to_four(data: [i64]) -> [i64] {
+    var out = data
+    while out.len() % 4 != 0 {
+        out.push(0)
+    }
+    return out
+}
+
+/// Wrap an sfnt font as WOFF, storing every table uncompressed.
+///
+/// Stored rather than deflated because this package has an inflater and no
+/// deflater — and a WOFF whose tables are all stored is a valid WOFF that
+/// every reader accepts, just a large one. `compress_stored` produces the
+/// zlib framing so the file is well formed either way.
+pub fn from_sfnt(data: bytes) -> bytes ! WoffError {
+    let font = sfnt.parse(data) ?? sfnt.parse(bytes_of([])) ??
+    SfntFont{ version: 0, tables: [], data: bytes_of([]) }
+    if font.tables.len() == 0 {
+        fail(TooShort())
+    }
+    let count = font.tables.len()
+    let directory = 44 + count * 20
+    var body: [i64] = []
+    var entries: [i64] = []
+    var offset = directory
+    for t in font.tables {
+        let contents = data.slice(t.offset, t.offset + t.length).to_list()
+        for c in tag_bytes(t.tag) {
+            entries.push(c)
+        }
+        for b in write32(offset) {
+            entries.push(b)
+        }
+        for b in write32(contents.len()) {
+            entries.push(b)
+        }
+        for b in write32(contents.len()) {
+            entries.push(b)
+        }
+        for b in write32(t.checksum) {
+            entries.push(b)
+        }
+        let padded = pad_to_four(contents)
+        for b in padded {
+            body.push(b)
+        }
+        offset = offset + padded.len()
+    }
+    var out: [i64] = []
+    for c in tag_bytes(signature()) {
+        out.push(c)
+    }
+    for b in write32(font.version) {
+        out.push(b)
+    }
+    for b in write32(directory + body.len()) {
+        out.push(b)
+    }
+    for b in write16(count) {
+        out.push(b)
+    }
+    for b in write16(0) {
+        out.push(b)
+    }
+    for b in write32(data.len()) {
+        out.push(b)
+    }
+    for b in write16(1) {
+        out.push(b)
+    }
+    for b in write16(0) {
+        out.push(b)
+    }
+    // No metadata and no private block: six zero words.
+    var i = 0
+    while i < 5 {
+        for b in write32(0) {
+            out.push(b)
+        }
+        i = i + 1
+    }
+    for b in entries {
+        out.push(b)
+    }
+    for b in body {
+        out.push(b)
+    }
+    return bytes_of(out)
+}
+
+fn tag_bytes(tag: str) -> [i64] {
+    var out = tag.to_bytes().to_list()
+    while out.len() < 4 {
+        out.push(32)
+    }
+    return out.slice(0, 4)
+}
+
+/// Whether the file is WOFF, WOFF2, or a bare font.
+pub fn describe(data: bytes) -> str {
+    if data.len() < 4 {
+        return "too short to say"
+    }
+    let magic = tag_at(data, 0)
+    if magic == "wOFF" {
+        return "WOFF 1.0"
+    }
+    if magic == "wOF2" {
+        return "WOFF 2.0, which this does not read"
+    }
+    if magic == "OTTO" {
+        return "OpenType with PostScript outlines"
+    }
+    if magic == "ttcf" {
+        return "a TrueType collection"
+    }
+    if read32(data, 0) == 0x00010000 {
+        return "TrueType"
+    }
+    return "not a font"
+}

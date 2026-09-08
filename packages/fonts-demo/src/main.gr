@@ -1,0 +1,525 @@
+// Five font packages, against the tables of a real font and against a font
+// this program builds.
+//
+// The tables below were taken out of Andale Mono with `fontTools`, and every
+// number asserted about them is one fontTools reports for the same table.
+import sfnt
+import cmap
+import glyf
+import fontmetrics
+import woff
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn unhex(text: str) -> bytes {
+    var out: [i64] = []
+    let digits = "0123456789abcdef"
+    var i = 0
+    while i + 2 <= text.len() {
+        let hi = digits.index_of(text.substr(i, 1)) ?? 0
+        let lo = digits.index_of(text.substr(i + 1, 1)) ?? 0
+        out.push(hi * 16 + lo)
+        i = i + 2
+    }
+    return bytes_of(out)
+}
+
+// ------------------------------------------------------------------ sfnt
+
+fn assembled() -> bytes {
+    let tags = ["head", "hhea", "maxp", "OS/2", "cmap"]
+    let contents = [table_head(), table_hhea(), table_maxp(), table_os_2(),
+        table_cmap()]
+    let built: bytes ! SfntError = sfnt.build(sfnt.truetype_version(), tags,
+        contents)
+    let font = built ?? bytes_of([])
+    let sealed: bytes ! SfntError = sfnt.seal(font)
+    return sealed ?? font
+}
+
+fn check_sfnt(inout f: i64) / {io} {
+    print("-- sfnt: a directory of tables, and a checksum with a hole in it")
+    let data = assembled()
+    let parsed: SfntFont ! SfntError = sfnt.parse(data)
+    let font = parsed ?? SfntFont{ version: 0, tables: [],
+        data: bytes_of([]) }
+    say(f, "a font assembled here parses back with its five tables",
+        font.tables.len() == 5 and font.version == sfnt.truetype_version())
+    say(f, "the directory is sorted by tag, as the format requires",
+        sfnt.table_tags(font).join(",") == "OS/2,cmap,head,hhea,maxp")
+    say(f, "every table's bytes come back exactly",
+        (sfnt.table_data(font, "head") ?? bytes_of([])).len() ==
+        table_head().len() and
+        (sfnt.table_data(font, "cmap") ?? bytes_of([])).to_list() ==
+        table_cmap().to_list())
+    say(f, "and every checksum in the directory is the one its bytes give",
+        sfnt.bad_checksums(font).len() == 0)
+    // The whole-file checksum is computed with its own field zeroed, which
+    // is the one rule nobody implements right the first time.
+    say(f, "the file checksum in `head` is the one the file gives",
+        sfnt.is_sealed(font))
+    say(f, "a table nobody added is an error, not an empty one",
+        refuses_missing(font))
+    say(f, "the required tables are named, and the missing ones listed",
+        sfnt.required_tables().len() == 6 and
+        sfnt.missing_required(font).join(",") == "hmtx,name")
+    say(f, "quadratic and cubic outlines are told apart by their tables",
+        not sfnt.has_truetype_outlines(font) and
+        not sfnt.has_postscript_outlines(font))
+    say(f, "a tag that is not four characters is refused",
+        refuses_tag())
+    say(f, "and a file too short to hold a directory is too",
+        refuses_short())
+}
+
+fn refuses_missing(font: SfntFont) -> bool {
+    match sfnt.table_data(font, "glyf") {
+        Ok(_d) -> {
+            return false
+        }
+        Err(_e) -> {
+            return true
+        }
+    }
+}
+
+fn refuses_tag() -> bool {
+    match sfnt.build(sfnt.truetype_version(), ["hd"], [bytes_of([1])]) {
+        Ok(_d) -> {
+            return false
+        }
+        Err(_e) -> {
+            return true
+        }
+    }
+}
+
+fn refuses_short() -> bool {
+    match sfnt.parse(bytes_of([0, 1, 0, 0])) {
+        Ok(_d) -> {
+            return false
+        }
+        Err(_e) -> {
+            return true
+        }
+    }
+}
+
+// ------------------------------------------------------------------ cmap
+
+fn check_cmap(inout f: i64) / {io} {
+    print("-- cmap: prefer the widest subtable, or lose everything above BMP")
+    let data = table_cmap()
+    let subs = cmap.subtables(data) ?? []
+    say(f, "the font has the usual pair: MacRoman and Windows Unicode",
+        subs.len() == 2 and subs[0].platform == 1 and subs[0].format == 0 and
+        subs[1].platform == 3 and subs[1].format == 4)
+    let best: CmapSubtable ! CmapError = cmap.best_subtable(data)
+    let b = best ?? subs[0]
+    say(f, "and the format 4 one is chosen, not the first listed",
+        b.format == 4 and b.platform == 3)
+    // Every glyph number here is `fontTools`' for the same character.
+    say(f, "letters map to the glyphs fontTools reports",
+        glyph(data, b, 65) == 36 and glyph(data, b, 90) == 61 and
+        glyph(data, b, 97) == 68 and glyph(data, b, 122) == 93)
+    say(f, "and so do digits, punctuation and a space",
+        glyph(data, b, 48) == 19 and glyph(data, b, 32) == 3 and
+        glyph(data, b, 126) == 97)
+    say(f, "an accented letter and a ligature are glyphs like any other",
+        glyph(data, b, 233) == 112 and glyph(data, b, 64257) == 192)
+    say(f, "a character the font has not got is glyph zero, not an error",
+        glyph(data, b, 19968) == 0)
+    say(f, "the missing characters of a string can be listed before drawing",
+        cmap.missing_characters(data, "hello").len() == 0 and
+        cmap.missing_characters(data, "\u{4e00}\u{4e01}").len() == 2)
+    say(f, "the font maps six hundred and fifty-four characters",
+        (cmap.all_mappings(data, b) ?? []).len() == 654)
+
+    // A format 4 subtable built here, which fontTools reads unchanged.
+    var mappings: [(i64, i64)] = []
+    for pair in [[65, 1], [66, 2], [67, 3], [200, 10], [1000, 50],
+        [1001, 51]] {
+        mappings.push((pair[0], pair[1]))
+    }
+    let built: bytes ! CmapError = cmap.build_format4(mappings)
+    let table = cmap.build_table(built ?? bytes_of([]))
+    say(f, "a table built here maps what went into it",
+        lookup(table, 65) == 1 and lookup(table, 67) == 3 and
+        lookup(table, 200) == 10 and lookup(table, 1001) == 51)
+    say(f, "and nothing else",
+        lookup(table, 199) == 0 and lookup(table, 1002) == 0)
+    say(f, "unsorted mappings are refused rather than encoded wrongly",
+        refuses_unsorted())
+}
+
+fn glyph(data: bytes, subtable: CmapSubtable, codepoint: i64) -> i64 {
+    let g: i64 ! CmapError = cmap.glyph_for(data, subtable, codepoint)
+    return g ?? (0 - 1)
+}
+
+fn lookup(data: bytes, codepoint: i64) -> i64 {
+    let g: i64 ! CmapError = cmap.glyph_of(data, codepoint)
+    return g ?? (0 - 1)
+}
+
+fn refuses_unsorted() -> bool {
+    match cmap.build_format4([(66, 1), (65, 2)]) {
+        Ok(_t) -> {
+            return false
+        }
+        Err(_e) -> {
+            return true
+        }
+    }
+}
+
+// ----------------------------------------------------------- fontmetrics
+
+fn head_info() -> FontHead {
+    let h: FontHead ! MetricsError = fontmetrics.parse_head(table_head())
+    return h ?? FontHead{ units_per_em: 0, x_min: 0, y_min: 0, x_max: 0,
+        y_max: 0, long_loca: false }
+}
+
+fn check_fontmetrics(inout f: i64) / {io} {
+    print("-- fontmetrics: three line heights, and no correct one")
+    let head = head_info()
+    // fontTools reports exactly these for Andale Mono.
+    say(f, "the design grid is 2048 units to the em",
+        head.units_per_em == 2048 and head.long_loca == false)
+    say(f, "and the font's bounding box is the one in the file",
+        head.x_min == 0 and head.y_min == 0 - 447 and
+        head.x_max == 1229 and head.y_max == 2038)
+    let hhea: LineMetrics ! MetricsError =
+    fontmetrics.parse_hhea(table_hhea())
+    let line = hhea ?? LineMetrics{ ascender: 0, descender: 0, line_gap: 0 }
+    say(f, "hhea gives one set of vertical metrics",
+        line.ascender == 1858 and line.descender == 0 - 446 and
+        line.line_gap == 0)
+    let typo: LineMetrics ! MetricsError =
+    fontmetrics.parse_typo_metrics(table_os_2())
+    let t = typo ?? line
+    say(f, "OS/2 gives a different one",
+        t.ascender == 1436 and t.descender == 0 - 412 and
+        t.line_gap == 343)
+    let all_heights: (i64, i64, i64) ! MetricsError =
+    fontmetrics.all_line_heights(table_hhea(), table_os_2())
+    let heights = all_heights ?? (0, 0, 0)
+    say(f, "so the same font has three line heights, and they differ",
+        heights.0 == 2304 and heights.1 == 2191 and heights.2 == 2304)
+    // Bit 7 of fsSelection is clear in this font, so hhea wins.
+    say(f, "which one a renderer uses is a flag in OS/2",
+        not fontmetrics.uses_typo_metrics(table_os_2()) and
+        (fontmetrics.preferred_metrics(table_hhea(), table_os_2())
+            ?? t).ascender == 1858)
+    say(f, "the glyph count is in maxp",
+        fontmetrics.glyph_count(table_maxp()) == 659)
+    let count = fontmetrics.number_of_h_metrics(table_hhea())
+    say(f, "every glyph has its own advance in this font",
+        count == 659)
+    say(f, "and the advances are the ones fontTools reports",
+        advance(0) == 1229 and advance(36) == 1229 and
+        bearing(36) == 57 and bearing(68) == 215)
+    say(f, "a monospaced font is one measured to be, not one that says so",
+        fontmetrics.is_monospaced(table_hmtx_head(), count, 100))
+    say(f, "design units become points by dividing by the em",
+        fontmetrics.scale_to(1229, 2048, 12.0) > 7.2 and
+        fontmetrics.scale_to(1229, 2048, 12.0) < 7.21)
+    say(f, "a glyph past the table is an error, not a silent zero",
+        refuses_glyph(count))
+}
+
+fn advance(glyph: i64) -> i64 {
+    let a: i64 ! MetricsError = fontmetrics.advance_width(
+        table_hmtx_head(), 659, glyph)
+    return a ?? (0 - 1)
+}
+
+fn bearing(glyph: i64) -> i64 {
+    let m: (i64, i64) ! MetricsError = fontmetrics.glyph_metrics(
+        table_hmtx_head(), 659, glyph)
+    return (m ?? (0 - 1, 0 - 1)).1
+}
+
+fn refuses_glyph(count: i64) -> bool {
+    match fontmetrics.glyph_metrics(table_hmtx_head(), count, 5000) {
+        Ok(_m) -> {
+            return false
+        }
+        Err(_e) -> {
+            return true
+        }
+    }
+}
+
+// ------------------------------------------------------------------ glyf
+
+fn letter_a() -> Glyph {
+    let g: Glyph ! GlyfError = glyf.parse_glyph(glyph_a_outline(),
+        glyph_a_loca(), false, 0)
+    return g ?? glyf.empty_glyph()
+}
+
+fn check_glyf(inout f: i64) / {io} {
+    print("-- glyf: the on-curve point that is not in the file")
+    let a = letter_a()
+    // fontTools reports two contours, eleven points, all on the curve.
+    say(f, "the letter A has two contours and eleven points",
+        glyf.contour_count(a) == 2 and glyf.point_count(a) == 11 and
+        glyf.on_curve_count(a) == 11)
+    say(f, "its contours end where fontTools says",
+        a.contour_ends.len() == 2 and a.contour_ends[0] == 7 and
+        a.contour_ends[1] == 10)
+    say(f, "and its bounding box is the one in the glyph header",
+        a.x_min == 57 and a.y_min == 0 and a.x_max == 1176 and
+        a.y_max == 1411)
+    say(f, "which agrees with the points it actually has",
+        glyf.bounds_agree(a))
+    say(f, "the first points are the deltas unpacked in order",
+        a.points[0].x == 1176 and a.points[0].y == 0 and
+        a.points[2].x == 848 and a.points[2].y == 494)
+    say(f, "a straight-sided letter needs no implied points",
+        glyf.contour_with_implied(a, 0).len() == 8)
+    say(f, "it is not a composite, so it refers to no other glyph",
+        not glyf.is_composite(a) and a.components.len() == 0)
+    say(f, "an empty glyph is a space and not an error",
+        glyf.is_empty(unhex("00000000"), false, 0))
+    say(f, "a glyph past the end of loca is refused",
+        refuses_range())
+    // Two off-curve points in a row imply one between them, which no file
+    // stores and every renderer must insert.
+    let curved = curved_glyph()
+    // Four off-curve points in a ring imply four more, one in each gap.
+    say(f, "two off-curve points in a row imply one between them",
+        glyf.point_count(curved) == 4 and
+        glyf.contour_with_implied(curved, 0).len() == 8)
+}
+
+/// A square with every corner off the curve, which is a circle-ish shape and
+/// the smallest thing that exercises the implied point.
+fn curved_glyph() -> Glyph {
+    return Glyph{ contour_count: 1, x_min: 0, y_min: 0, x_max: 100,
+        y_max: 100, contour_ends: [3],
+        points: [
+            GlyphPoint{ x: 0, y: 0, on_curve: false },
+            GlyphPoint{ x: 100, y: 0, on_curve: false },
+            GlyphPoint{ x: 100, y: 100, on_curve: false },
+            GlyphPoint{ x: 0, y: 100, on_curve: false },
+        ],
+        components: [] }
+}
+
+fn refuses_range() -> bool {
+    match glyf.parse_glyph(glyph_a_outline(), glyph_a_loca(), false, 5) {
+        Ok(_g) -> {
+            return false
+        }
+        Err(_e) -> {
+            return true
+        }
+    }
+}
+
+// ------------------------------------------------------------------ woff
+
+fn check_woff(inout f: i64) / {io} {
+    print("-- woff: the same font, compressed a table at a time")
+    let font = assembled()
+    let wrapped: bytes ! WoffError = woff.from_sfnt(font)
+    let file = wrapped ?? bytes_of([])
+    say(f, "a font wraps into a WOFF that says what it is",
+        woff.describe(file) == "WOFF 1.0" and
+        woff.describe(font) == "TrueType")
+    let parsed: WoffFont ! WoffError = woff.parse(file)
+    let w = parsed ?? WoffFont{ flavor: 0, total_sfnt_size: 0, major: 0,
+        minor: 0, entries: [], has_metadata: false, metadata_length: 0 }
+    say(f, "the wrapper records the flavour and the original size",
+        w.flavor == sfnt.truetype_version() and
+        w.total_sfnt_size == font.len() and w.entries.len() == 5)
+    say(f, "a table stored rather than deflated is not compressed",
+        not woff.is_compressed(w.entries[0]))
+    say(f, "and its bytes come back unchanged",
+        (woff.table_data(file, woff.entry_named(w, "cmap")
+            ?? w.entries[0]) ?? bytes_of([])).to_list() ==
+        table_cmap().to_list())
+    let back: bytes ! WoffError = woff.to_sfnt(file)
+    let rebuilt = back ?? bytes_of([])
+    say(f, "unwrapping gives a font of the same size with the same tables",
+        rebuilt.len() == font.len() and
+        (sfnt.parse(rebuilt) ?? sfnt.parse(font)
+            ?? SfntFont{ version: 0, tables: [], data: bytes_of([]) })
+            .tables.len() == 5)
+    say(f, "whose checksums are all correct",
+        sfnt.bad_checksums(sfnt.parse(rebuilt) ??
+            SfntFont{ version: 0, tables: [], data: bytes_of([]) })
+            .len() == 0)
+    say(f, "WOFF2 is a different format and is refused rather than guessed",
+        refuses_woff2() and
+        woff.describe(unhex("774f4632")) ==
+        "WOFF 2.0, which this does not read")
+    say(f, "a file that is not a font at all is named as such",
+        woff.describe(unhex("deadbeef")) == "not a font")
+    say(f, "and the compression ratio is measurable",
+        woff.compression_ratio(w, file.len()) > 1.0)
+}
+
+fn refuses_woff2() -> bool {
+    match woff.parse(unhex("774f4632000000000000002c0000000000000000")) {
+        Ok(_w) -> {
+            return false
+        }
+        Err(_e) -> {
+            return true
+        }
+    }
+}
+
+fn main() / {io} {
+    var f = 0
+    check_sfnt(f)
+    check_cmap(f)
+    check_fontmetrics(f)
+    check_glyf(f)
+    check_woff(f)
+    if f == 0 {
+        print("fonts: every claim held")
+    } else {
+        print("fonts: {f} claims failed")
+    }
+}
+
+// ------------------------------------------------------- the font tables
+/// The `head` table of Andale Mono, exactly as the file has it.
+fn table_head() -> bytes {
+    let hex = "00010000000200001a3694785f0f3cf5000b080000000000af2e0c8d00000000" +
+    "c1ed5fef0000fe4104cd07f600000008000100000000"
+    return unhex(hex)
+}
+
+/// The `hhea` table of Andale Mono, exactly as the file has it.
+fn table_hhea() -> bytes {
+    let hex = "000100000742fe42000004cd0000000004cd0001000000000000000000000000" +
+    "00000293"
+    return unhex(hex)
+}
+
+/// The `maxp` table of Andale Mono, exactly as the file has it.
+fn table_maxp() -> bytes {
+    let hex = "000100000293012200490051000500020010001b003b0000020f06b700030002"
+    return unhex(hex)
+}
+
+/// The `OS/2` table of Andale Mono, exactly as the file has it.
+fn table_os_2() -> bytes {
+    let hex = "000104cd019000050008059a053300000090059a0533000001f70066026e0000" +
+    "020b0509000000000004000002870000000000000000000000004d4f4e4f0040" +
+    "0020fb02059cfe640157074201be6000009fdfd70000"
+    return unhex(hex)
+}
+
+/// Andale Mono's `cmap`: a MacRoman format 0 subtable and a Windows
+/// Unicode format 4 one, which is the usual pair.
+fn table_cmap() -> bytes {
+    let hex = "000000020001000000000014000300010000011a000001060000010000000000" +
+    "0000010200000002000000000000000000000000000000010000030405060708" +
+    "090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728" +
+    "292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748" +
+    "494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606100626364656667" +
+    "68696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f8081828384858687" +
+    "88898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7" +
+    "a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7" +
+    "c8c9cacbcccdcecfd0d100d2d3d4d5d6d7d8d9dadbdcdddedfe00004051e0000" +
+    "00bc00800006003c007e017f019201ff02c702c902dd037e038a038c03a103ce" +
+    "040c044f045c045f04911e851ef32015201e2022202620302033203a203c203e" +
+    "2044207f20a420a720ac21052113211621222126212e215e219521a822022206" +
+    "220f22122215221a221f2229222b22482261226523022310232125002502250c" +
+    "251025142518251c2524252c2534253c256c258025842588258c259325a125ac" +
+    "25b225ba25bc25c425cb25cf25d925e6263c26402642266026632666266bf005" +
+    "fb02ffff0000002000a0019201fa02c602c902d8037e0384038c038e03a30401" +
+    "040e0451045e04901e801ef22013201720202026203020322039203c203e2044" +
+    "207f20a320a720ac21052113211621222126212e215b219021a822022206220f" +
+    "221122152219221e2229222b22482260226423022310232025002502250c2510" +
+    "25142518251c2524252c2534253c2550258025842588258c259025a025aa25b2" +
+    "25ba25bc25c425ca25cf25d825e6263a26402642266026632665266af004fb01" +
+    "ffffffe30000ff1400560000fe100000fdf2fdedfdecfdebfdeafdb8fdb7fdb6" +
+    "fdb5fd850000e366000000000000e085e096e21ae085e209e21de078e1c70000" +
+    "e1a0e011e149e13ce14cdf6adf79e160e102e0d3e0c1de96dea2de8b0000dea7" +
+    "00000000e01fde71de5f0000de30df48df3bdf4bdd1bdd1add11dd0edd0bdd08" +
+    "dd05dcfedcf7dcf0dce9dcd6dceddceadce7dce4dce100000000dcc5dcbedcbd" +
+    "dcb60000dcbddca4dca7dc44dc41dc40dc23dc21dc20dc1d000005bf00010000" +
+    "00ba000000000274000002740000000000000000000000000000000000000000" +
+    "026a000002720276028400000000000000000000000000000000027800000000" +
+    "000000000000000000000000000000000000000000000000025e0000025e0260" +
+    "000000000000025c000000000000000000000000000000000000000000000000" +
+    "0000000000000000000000000000000000000234023600000000000000000232" +
+    "000000000000000000000000000000000000000002200000000000ac00a30084" +
+    "00850292009600e70086008e008b009d00a900a400f6008a00f70083009300f1" +
+    "00f2008d0097008800c300dd00f0009e00aa00f400f300f500a200ad00c900c7" +
+    "00ae006200630090006400cb006500c800ca00cf00cc00cd00ce00e8006600d2" +
+    "00d000d100af006700ef009100d500d300d4006800ea00ec0089006a0069006b" +
+    "006d006c006e00a0006f0071007000720073007500740076007700e90078007a" +
+    "0079007b007d007c00b800a1007f007e0080008100eb00ed00ba00fa00fb00fc" +
+    "00fd00fe00ff0100010101020103010401050106010701080109010a010b010c" +
+    "010d010e010f0110011101120113011401150116011701180119011a011b011c" +
+    "011d011e011f0120012101220123012401250126012701280129012a00d6012b" +
+    "012c012d012e012f013001310132013301340135013601370138013900e100e2" +
+    "013a013b013c013d013e013f01400141014201430144014501460147014800b0" +
+    "00b10149014a014b014c014d014e014f0150015101520153015400e300e40155" +
+    "0156015701580159015a015b015c015d015e015f016001610162016301640165" +
+    "0166016701680169016a00bb016b016c016d016e00e500e6016f00d700e000da" +
+    "00db00dc00df00d800de02170218025602570219021a00b200b30261024400b6" +
+    "00b700c4025a00b400b500c5008200c200870243025c009900ee00c300a50092" +
+    "026a008f024902750289028a028b027600b9027b00f900f9"
+    return unhex(hex)
+}
+
+/// The first hundred and twenty advance widths of Andale Mono's `hmtx`.
+///
+/// Truncated: the demo only asks about glyphs inside it, and the whole
+/// table is five kilobytes of the same number.
+fn table_hmtx_head() -> bytes {
+    let hex = "04cd00d80000000004cd000004cd000004cd01df04cd016404cd005804cd00e3" +
+    "04cd002f04cd005004cd021b04cd01b804cd010e04cd010404cd008d04cd01ee" +
+    "04cd013304cd01e504cd00d704cd009304cd011404cd00cd04cd00c704cd0079" +
+    "04cd00e104cd00bc04cd00c704cd00a404cd00b204cd01e704cd01ee04cd00e3" +
+    "04cd008d04cd010a04cd00f004cd006204cd003904cd00d104cd007f04cd00d1" +
+    "04cd010004cd010004cd007f04cd00d104cd011f04cd009c04cd00d104cd0100" +
+    "04cd00ac04cd00bc04cd007f04cd010004cd007f04cd00d104cd00e304cd0062" +
+    "04cd00d104cd003504cd002b04cd005604cd005e04cd00b604cd020a04cd00d5" +
+    "04cd011704cd006f04cd000004cd015c04cd00d704cd00d704cd00b004cd0091" +
+    "04cd00aa04cd00df04cd00b204cd00d704cd012704cd00d704cd00d704cd00f4" +
+    "04cd008104cd00d704cd009104cd00d704cd009104cd014604cd00e904cd00f0" +
+    "04cd00d504cd008704cd007304cd009104cd007504cd00cb04cd016604cd0214" +
+    "04cd013504cd003b04cd003904cd003904cd007f04cd010004cd00bc04cd007f" +
+    "04cd00d104cd00d704cd00d704cd00d704cd00d704cd00d704cd00d704cd00b0" +
+    "04cd00aa04cd00aa04cd00aa04cd00aa04cd012704cd012704cd011904cd0127"
+    return unhex(hex)
+}
+
+/// The outline of `A` in Andale Mono, taken out of its `glyf` table.
+fn glyph_a_outline() -> bytes {
+    let hex = "000200390000049805830007000a00d3408002080909010a0304040906090738" +
+    "0901090a018100071400000709040908048105061405050608061806280603e8" +
+    "06f80602020806011301060907370906080a9340023703470367037703040003" +
+    "0307a70601060305040100120705010802a70501030800010900080201070400" +
+    "04030a060405090900050c0077020b0576022b2b01111239192f121739121739" +
+    "5f5e5d5f5d5f5e5d00183f3c3c3c3f5d3c392f5f5d3c1a4dfd3c11392b015f5e" +
+    "5d5f5d71872e184d2b087d10c487052e182b087d10c42b0705103c7dc407103c" +
+    "3c31302123032103230133130b010498ac9cfe319eaa01cdc556b9b801eefe12" +
+    "0583fcfa0248fdb8"
+    return unhex(hex)
+}
+
+/// A two-entry short `loca` describing that one glyph.
+fn glyph_a_loca() -> bytes {
+    let hex = "00000084"
+    return unhex(hex)
+}
+

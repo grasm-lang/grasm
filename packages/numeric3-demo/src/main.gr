@@ -1,0 +1,356 @@
+import rootfind
+import quadrature
+import ode
+import optimise
+import autodiff
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn close_to(a: f64, b: f64, tolerance: f64) -> bool {
+    var d = a - b
+    if d < 0.0 {
+        d = 0.0 - d
+    }
+    return d <= tolerance
+}
+
+fn pi() -> f64 {
+    return 3.141592653589793
+}
+
+// -------------------------------------------------------------- rootfind
+
+fn cubic(x: f64) -> f64 {
+    return x * x * x - 2.0 * x - 5.0
+}
+
+fn cubic_slope(x: f64) -> f64 {
+    return 3.0 * x * x - 2.0
+}
+
+fn check_rootfind(inout f: i64) / {io} {
+    print("-- rootfind: the bracket is the guarantee")
+    // `scipy.optimize.brentq` gives 2.094551481542327 for this cubic.
+    let brent_result: RootResult ! RootError =
+    rootfind.brent(cubic, 2.0, 3.0, 0.0000000000001, 100)
+    let brent = brent_result ?? failed()
+    say(f, "Brent finds Wallis's root of the classic cubic",
+        brent.converged and close_to(brent.root, 2.094551481542327,
+            0.000000000001))
+    let bisect_result: RootResult ! RootError =
+    rootfind.bisect(cubic, 2.0, 3.0, 0.0000000000001, 200)
+    let bisected = bisect_result ?? failed()
+    say(f, "bisection finds the same root, taking many more steps",
+        close_to(bisected.root, 2.094551481542327, 0.000000000001) and
+        bisected.iterations > brent.iterations * 3)
+    let newton = rootfind.newton(cubic, cubic_slope, 2.0, 0.0000000000001,
+        100) ?? failed()
+    say(f, "and Newton finds it in a handful",
+        close_to(newton.root, 2.094551481542327, 0.000000000001) and
+        newton.iterations < 10)
+    let secant_result: RootResult ! RootError =
+    rootfind.secant(cubic, 2.0, 3.0, 0.0000000000001, 100)
+    let secant = secant_result ?? failed()
+    say(f, "the secant method needs no derivative and few more steps",
+        close_to(secant.root, 2.094551481542327, 0.000000000001))
+    // scipy's brentq on cos(x) - x gives 0.7390851332151612.
+    let fixed = rootfind.brent(|x| x.cos() - x, 0.0, 1.0, 0.0000000000001,
+        100) ?? failed()
+    say(f, "the cosine fixed point is where scipy puts it",
+        close_to(fixed.root, 0.7390851332151612, 0.000000000001))
+    say(f, "an interval with no sign change is refused, not searched",
+        refuses_bracket())
+    say(f, "a derivative of zero is an error rather than a leap to infinity",
+        refuses_flat())
+    let bracket = rootfind.find_bracket(cubic, 0.0, 0.5, 40) ?? (0.0, 0.0)
+    say(f, "a bracket can be found by walking outwards from a guess",
+        bracket.0 < 2.094551481542327 and bracket.1 > 2.094551481542327)
+    let roots = rootfind.all_roots(|x| (x - 1.0) * (x - 2.0) * (x - 3.0),
+        0.0, 4.0, 40, 0.000000000001)
+    say(f, "scanning for sign changes finds all three roots of a cubic",
+        roots.len() == 3 and close_to(roots[0], 1.0, 0.000001) and
+        close_to(roots[2], 3.0, 0.000001))
+}
+
+fn failed() -> RootResult {
+    return RootResult{ root: 0.0, residual: 0.0, iterations: 0,
+        converged: false }
+}
+
+fn refuses_bracket() -> bool {
+    match rootfind.brent(cubic, 10.0, 20.0, 0.001, 10) {
+        Ok(_r) -> {
+            return false
+        }
+        Err(_e) -> {
+            return true
+        }
+    }
+}
+
+fn refuses_flat() -> bool {
+    match rootfind.newton(|x| x * x + 1.0, |x| 2.0 * x, 0.0, 0.000001, 10) {
+        Ok(_r) -> {
+            return false
+        }
+        Err(_e) -> {
+            return true
+        }
+    }
+}
+
+// ------------------------------------------------------------ quadrature
+
+fn check_quadrature(inout f: i64) / {io} {
+    print("-- quadrature: order beats step size, and adaptivity beats both")
+    // `scipy.integrate.quad` gives exactly 2.0 for sin over 0 to pi.
+    say(f, "Simpson's rule integrates a sine to twelve digits",
+        close_to(quadrature.simpson(|x| x.sin(), 0.0, pi(), 1000) ?? 0.0,
+            2.0, 0.00000000001))
+    // The trapezoid rule's error falls as h squared, Simpson's as h to the
+    // fourth: with the same thousand intervals it is seven orders worse.
+    say(f, "the trapezoid rule needs far more intervals for the same",
+        not close_to(quadrature.trapezoid(|x| x.sin(), 0.0, pi(), 1000),
+            2.0, 0.00000000001))
+    say(f, "sixteen Gauss points do it to the last bit",
+        close_to(quadrature.gauss(|x| x.sin(), 0.0, pi()), 2.0,
+            0.000000000001))
+    // scipy gives 0.7468241328124271 for the Gaussian over 0 to 1.
+    say(f, "and agree with scipy on a Gaussian",
+        close_to(quadrature.gauss(|x| (0.0 - x * x).exp(), 0.0, 1.0),
+            0.7468241328124271, 0.000000000001))
+    let kink = quadrature.adaptive_simpson(|x| (x - 0.3).abs(), 0.0, 1.0,
+        0.0000000001, 50)
+    say(f, "an adaptive rule handles a kink a fixed one cannot",
+        close_to(kink.value, 0.29, 0.0000001) and kink.evaluations > 50)
+    say(f, "and it spends nothing extra on a function without one",
+        quadrature.adaptive_simpson(|x| x * x, 0.0, 1.0, 0.0000000001, 50)
+            .evaluations < 20)
+    say(f, "Romberg squeezes a smooth function dry from trapezoid rules",
+        close_to(quadrature.romberg(|x| x.sin(), 0.0, pi(), 8), 2.0,
+            0.000000000001))
+    say(f, "an odd number of Simpson intervals is refused",
+        refuses_odd())
+    let infinite = quadrature.to_infinity(|x| (0.0 - x).exp(), 0.0,
+        0.000000001, 50)
+    say(f, "a half-infinite range is a substitution away from a finite one",
+        close_to(infinite.value, 1.0, 0.000001))
+}
+
+fn refuses_odd() -> bool {
+    match quadrature.simpson(|x| x, 0.0, 1.0, 3) {
+        Ok(_v) -> {
+            return false
+        }
+        Err(_e) -> {
+            return true
+        }
+    }
+}
+
+// -------------------------------------------------------------------- ode
+
+fn decay(_t: f64, y: [f64]) -> [f64] {
+    return [0.0 - 0.5 * y[0]]
+}
+
+fn oscillator(_t: f64, y: [f64]) -> [f64] {
+    return [y[1], 0.0 - y[0]]
+}
+
+fn check_ode(inout f: i64) / {io} {
+    print("-- ode: four evaluations buy three orders")
+    let exact = 2.0 * (0.0 - 5.0).exp()
+    let e = ode.euler(decay, 0.0, [2.0], 10.0, 1000) ?? no_solution()
+    let r = ode.rk4(decay, 0.0, [2.0], 10.0, 100) ?? no_solution()
+    // RK4 at a hundred steps is out by 4e-9; Euler at a thousand by 2e-4.
+    say(f, "RK4 with a hundred steps beats Euler with a thousand",
+        close_to(ode.final_state(r)[0], exact, 0.00000001) and
+        not close_to(ode.final_state(e)[0], exact, 0.00000001))
+    // `solve_ivp` with RK45 gives 0.013475893999794398 here.
+    let adaptive_result: OdeResult ! OdeError =
+    ode.rk45(decay, 0.0, [2.0], 10.0, 0.0000000001, 0.1, 5000)
+    let adaptive = adaptive_result ?? no_solution()
+    say(f, "and the adaptive solver lands where solve_ivp lands",
+        adaptive.converged and
+        close_to(ode.final_state(adaptive)[0], exact, 0.000000001))
+    let harmonic = ode.rk45(oscillator, 0.0, [1.0, 0.0], 10.0,
+        0.0000000001, 0.1, 20000) ?? no_solution()
+    say(f, "the harmonic oscillator ends where the cosine says",
+        close_to(ode.final_state(harmonic)[0], (10.0).cos(), 0.0000001))
+    // Energy is what catches a solver that tracks the path and drifts.
+    say(f, "and its energy is conserved, which is the real test",
+        ode.conserved_drift(harmonic, |y| y[0] * y[0] + y[1] * y[1]) <
+        0.000001)
+    say(f, "a fixed-step method drifts the energy where the adaptive does not",
+        ode.conserved_drift(ode.rk4(oscillator, 0.0, [1.0, 0.0], 100.0, 200)
+            ?? no_solution(), |y| y[0] * y[0] + y[1] * y[1]) > 0.0001)
+    say(f, "the adaptive solver reports the steps it threw away",
+        adaptive.steps > 0 and adaptive.rejected >= 0)
+    say(f, "and says when the step size collapsed",
+        not ode.looks_stiff(adaptive))
+    say(f, "an empty state is an error rather than an empty answer",
+        refuses_no_state())
+    let sampled = ode.sample(adaptive, [0.0, 5.0, 10.0])
+    say(f, "a solution can be resampled at the times a caller wants",
+        sampled.len() == 3 and close_to(sampled[0][0], 2.0, 0.000001))
+}
+
+fn no_solution() -> OdeResult {
+    return OdeResult{ t: [0.0], y: [[0.0]], steps: 0, rejected: 0,
+        converged: false }
+}
+
+fn refuses_no_state() -> bool {
+    match ode.rk4(decay, 0.0, [], 1.0, 10) {
+        Ok(_r) -> {
+            return false
+        }
+        Err(_e) -> {
+            return true
+        }
+    }
+}
+
+// --------------------------------------------------------------- optimise
+
+fn rosenbrock(v: [f64]) -> f64 {
+    let a = 1.0 - v[0]
+    let b = v[1] - v[0] * v[0]
+    return a * a + 100.0 * b * b
+}
+
+fn check_optimise(inout f: i64) / {io} {
+    print("-- optimise: every one of these finds a local minimum")
+    let one = optimise.golden_section(|x| (x - 2.0) * (x - 2.0), 0.0, 5.0,
+        0.00000001, 200) ?? no_minimum()
+    say(f, "golden section finds the minimum scipy finds",
+        one.converged and close_to(one.x[0], 2.0, 0.0000001))
+    // scipy's Nelder-Mead reaches (1, 1) on Rosenbrock in about 220 calls.
+    let valley = optimise.nelder_mead(rosenbrock, [0.0 - 1.2, 1.0], 0.5,
+        0.000000000001, 5000) ?? no_minimum()
+    say(f, "Nelder-Mead crawls down Rosenbrock's valley to (1, 1)",
+        close_to(valley.x[0], 1.0, 0.0001) and
+        close_to(valley.x[1], 1.0, 0.0001))
+    say(f, "and it needs no derivative to do it",
+        valley.evaluations > 100 and valley.value < 0.0000001)
+    let descended = optimise.gradient_descent(rosenbrock,
+            |v| [0.0 - 2.0 * (1.0 - v[0]) -
+            400.0 * v[0] * (v[1] - v[0] * v[0]),
+            200.0 * (v[1] - v[0] * v[0])], [0.0 - 1.2, 1.0],
+        0.0000001, 20000) ?? no_minimum()
+    say(f, "gradient descent gets there too, with a line search",
+        descended.value < 0.0001)
+    // Two minima at -1 and 1; a single start finds whichever is nearer.
+    let bumpy = |v| (v[0] * v[0] - 1.0) * (v[0] * v[0] - 1.0)
+    say(f, "a function with two minima has two, and one start finds one",
+        optimise.distinct_minima(bumpy, [[0.0 - 2.0], [2.0]], 0.3,
+            0.000000001, 500) == 2)
+    let best = optimise.multi_start(bumpy, [[0.0 - 2.0], [2.0]], 0.3,
+        0.000000001, 500) ?? no_minimum()
+    say(f, "and several starts take the best of what they find",
+        best.value < 0.000000001)
+    say(f, "a bracket the wrong way round is refused",
+        refuses_bad_bracket())
+    say(f, "and so is a start with no dimensions",
+        refuses_empty_start())
+    say(f, "the result says whether it converged or ran out",
+        one.converged and
+        not (optimise.nelder_mead(rosenbrock, [0.0 - 1.2, 1.0], 0.5,
+            0.0000000000001, 3) ?? no_minimum()).converged)
+}
+
+fn no_minimum() -> MinimumResult {
+    return MinimumResult{ x: [0.0], value: 0.0, evaluations: 0,
+        converged: false }
+}
+
+fn refuses_bad_bracket() -> bool {
+    match optimise.golden_section(|x| x, 5.0, 0.0, 0.001, 10) {
+        Ok(_r) -> {
+            return false
+        }
+        Err(_e) -> {
+            return true
+        }
+    }
+}
+
+fn refuses_empty_start() -> bool {
+    match optimise.nelder_mead(|_v| 0.0, [], 0.1, 0.001, 10) {
+        Ok(_r) -> {
+            return false
+        }
+        Err(_e) -> {
+            return true
+        }
+    }
+}
+
+// --------------------------------------------------------------- autodiff
+
+fn check_autodiff(inout f: i64) / {io} {
+    print("-- autodiff: exact derivatives, one pass, no step size")
+    // d/dx of x^3 - 2x - 5 at 2 is 3*4 - 2 = 10.
+    say(f, "the derivative of a polynomial is exact",
+        autodiff.derivative(|x| autodiff.sub(autodiff.sub(
+            autodiff.power(x, 3), autodiff.scale(x, 2.0)),
+            autodiff.constant(5.0)), 2.0) == 10.0)
+    // d/dx sin(x) at 0 is 1, exactly.
+    say(f, "and so is the derivative of a sine at zero",
+        autodiff.derivative(|x| autodiff.sin(x), 0.0) == 1.0)
+    say(f, "the chain rule falls out of the arithmetic",
+        close_to(autodiff.derivative(|x| autodiff.sin(autodiff.mul(x, x)),
+            1.0), 2.0 * (1.0).cos(), 0.0000000000001))
+    say(f, "the product rule too",
+        close_to(autodiff.derivative(|x| autodiff.mul(autodiff.sin(x),
+            autodiff.exp(x)), 1.0),
+            (1.0).cos() * (1.0).exp() + (1.0).sin() * (1.0).exp(),
+            0.0000000000001))
+    say(f, "the quotient rule too",
+        close_to(autodiff.derivative(|x| autodiff.div(autodiff.constant(1.0),
+            x), 2.0), 0.0 - 0.25, 0.0000000000001))
+    let pair = autodiff.value_and_derivative(|x| autodiff.exp(x), 1.0)
+    say(f, "the value and the derivative come from the same evaluation",
+        close_to(pair.0, (1.0).exp(), 0.0000000000001) and
+        close_to(pair.1, (1.0).exp(), 0.0000000000001))
+    // A central difference at the best possible step still loses six digits.
+    let numeric = autodiff.numerical_derivative(|x| x.sin(), 1.0,
+        autodiff.best_step(1.0))
+    let exact = autodiff.derivative(|x| autodiff.sin(x), 1.0)
+    say(f, "a central difference is close and not exact, whatever the step",
+        close_to(numeric, exact, 0.0000001) and numeric != exact)
+    say(f, "and the exact one is the cosine, to the last bit",
+        exact == (1.0).cos())
+    let g = autodiff.gradient(|v| autodiff.add(autodiff.mul(v[0], v[0]),
+        autodiff.mul(autodiff.scale(v[1], 3.0), v[1])), [2.0, 4.0])
+    say(f, "a gradient costs one pass per variable",
+        g.len() == 2 and g[0] == 4.0 and g[1] == 24.0)
+    say(f, "the second derivative of a square is two",
+        close_to(autodiff.second_derivative(|x| autodiff.mul(x, x), 3.0,
+            0.0001), 2.0, 0.00000001))
+    say(f, "a constant has no derivative and a variable has one",
+        autodiff.constant(5.0).slope == 0.0 and
+        autodiff.variable(5.0).slope == 1.0)
+}
+
+fn main() / {io} {
+    var f = 0
+    check_rootfind(f)
+    check_quadrature(f)
+    check_ode(f)
+    check_optimise(f)
+    check_autodiff(f)
+    if f == 0 {
+        print("numerics: every claim held")
+    } else {
+        print("numerics: {f} claims failed")
+    }
+}

@@ -1,0 +1,323 @@
+// Cutting a polygon into triangles, because that is all a graphics card
+// draws.
+//
+// Every filled shape on a screen is triangles. A font glyph, a country on a
+// map, a UI panel with rounded corners — something turned each outline into
+// triangles first, and this is that something.
+//
+// ## Ear clipping, and what an ear is
+//
+// A vertex is an **ear** when the triangle it makes with its two neighbours
+// lies entirely inside the polygon and contains no other vertex. Cut it off
+// and the polygon has one vertex fewer; repeat until three are left. Every
+// simple polygon has at least two ears — Meisters proved it in 1975 — so the
+// loop always terminates.
+//
+// Two tests decide an ear and both are needed. The triangle must turn the
+// same way as the polygon, which rules out a reflex vertex; and no other
+// vertex may lie inside it, which rules out a notch that would be swallowed.
+// Implementations that check only the first produce triangles outside the
+// shape on any polygon with a concavity, which is every interesting one.
+//
+// ## Holes
+//
+// A polygon with a hole is cut into one with none: find the hole's rightmost
+// vertex, find a point on the outer ring visible from it, and join them with
+// a pair of coincident edges. The result is a simple polygon whose boundary
+// walks into the hole and back out, and ear clipping handles it unchanged.
+// That bridge is why a triangulated shape with holes has two edges lying on
+// top of each other — it is not a defect.
+//
+// ## What this refuses
+//
+// A self-intersecting outline. There is no triangulation of one, because it
+// does not enclose a well-defined area — ask which side of a figure eight's
+// crossing is inside. `triangles` returns an error rather than the plausible
+// nonsense every renderer produces for it.
+//
+// ## Complexity
+//
+// O(n^2), which is what ear clipping costs. Faster algorithms exist —
+// monotone decomposition is O(n log n) — and for the polygon sizes anyone
+// actually triangulates, a few hundred vertices, the simple one wins on
+// constant factors and is the one that can be read against its own tests.
+//
+// Checked against `mapbox_earcut` — the library every map renderer uses — on
+// convex, concave, and holed polygons, comparing the triangle count and the
+// total area covered.
+
+import geometry
+
+type TriangulateError =
+    | TooFewPoints(count: i64)
+    | SelfIntersecting()
+    | NoEarFound(remaining: i64)
+
+    /// Whether the vertices are listed counter-clockwise.
+pub fn is_counter_clockwise(polygon: [Vec2]) -> bool {
+    return signed_area(polygon) > 0.0
+}
+
+pub fn signed_area(polygon: [Vec2]) -> f64 {
+    var total = 0.0
+    var i = 0
+    while i < polygon.len() {
+        let a = polygon[i]
+        let b = polygon[(i + 1) % polygon.len()]
+        total = total + (a.x * b.y - b.x * a.y)
+        i = i + 1
+    }
+    return total / 2.0
+}
+
+fn turn(a: Vec2, b: Vec2, c: Vec2) -> f64 {
+    return (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)
+}
+
+/// Whether `p` is inside or on the triangle, by the sign of three turns.
+fn in_triangle(a: Vec2, b: Vec2, c: Vec2, p: Vec2) -> bool {
+    let d1 = turn(a, b, p)
+    let d2 = turn(b, c, p)
+    let d3 = turn(c, a, p)
+    let negative = d1 < 0.0 or d2 < 0.0 or d3 < 0.0
+    let positive = d1 > 0.0 or d2 > 0.0 or d3 > 0.0
+    return not (negative and positive)
+}
+
+/// The triangles, as triples of indices into the polygon.
+///
+/// Indices rather than points, because that is what a vertex buffer wants and
+/// because it keeps whatever else the caller attached to each vertex —
+/// texture coordinates, colours — attached.
+pub fn triangles(polygon: [Vec2]) -> [(i64, i64, i64)] ! TriangulateError {
+    if not is_simple(polygon) {
+        fail(SelfIntersecting())
+    }
+    return try triangles_unchecked(polygon)
+}
+
+/// The same, without the self-intersection check.
+///
+/// For a polygon from `bridge_hole`, which is deliberately not simple: the
+/// bridge is a pair of coincident edges, and any honest crossing test reports
+/// them. Ear clipping handles them correctly — the triangle on a bridge
+/// vertex is degenerate and gets skipped — so the check is the only thing in
+/// the way.
+///
+/// Use this only for a polygon already known to be well formed. On a genuinely
+/// self-intersecting outline it produces triangles that overlap, which is the
+/// nonsense `triangles` refuses.
+pub fn triangles_unchecked(
+    polygon: [Vec2]) -> [(i64, i64, i64)] ! TriangulateError {
+    if polygon.len() < 3 {
+        fail(TooFewPoints(polygon.len()))
+    }
+    var indices: [i64] = []
+    var i = 0
+    while i < polygon.len() {
+        indices.push(i)
+        i = i + 1
+    }
+    // Work counter-clockwise so one sign convention holds throughout.
+    if not is_counter_clockwise(polygon) {
+        indices = indices.rev()
+    }
+    var out: [(i64, i64, i64)] = []
+    var guard = 0
+    while indices.len() > 3 {
+        var cut = 0 - 1
+        var k = 0
+        while k < indices.len() {
+            if is_ear(polygon, indices, k) {
+                cut = k
+                break
+            }
+            k = k + 1
+        }
+        if cut < 0 {
+            fail(NoEarFound(indices.len()))
+        }
+        let previous = indices[(cut + indices.len() - 1) % indices.len()]
+        let here = indices[cut]
+        let next = indices[(cut + 1) % indices.len()]
+        out.push((previous, here, next))
+        var reduced: [i64] = []
+        var j = 0
+        while j < indices.len() {
+            if j != cut {
+                reduced.push(indices[j])
+            }
+            j = j + 1
+        }
+        indices = reduced
+        guard = guard + 1
+        if guard > polygon.len() + 2 {
+            fail(NoEarFound(indices.len()))
+        }
+    }
+    out.push((indices[0], indices[1], indices[2]))
+    return out
+}
+
+fn is_ear(polygon: [Vec2], indices: [i64], at: i64) -> bool {
+    let n = indices.len()
+    let a = polygon[indices[(at + n - 1) % n]]
+    let b = polygon[indices[at]]
+    let c = polygon[indices[(at + 1) % n]]
+    // A reflex vertex is not an ear, whatever else is true.
+    if turn(a, b, c) <= 0.0 {
+        return false
+    }
+    var i = 0
+    while i < n {
+        if i == at or i == (at + n - 1) % n or i == (at + 1) % n {
+            i = i + 1
+            continue
+        }
+        let q = polygon[indices[i]]
+        // A vertex sitting exactly on a corner of the candidate is not
+        // *inside* it. Bridged holes put two vertices at the same
+        // coordinates on purpose, and a test that counts those as blocking
+        // finds no ear at all and gives up on a perfectly good polygon.
+        if same_point(q, a) or same_point(q, b) or same_point(q, c) {
+            i = i + 1
+            continue
+        }
+        if in_triangle(a, b, c, q) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn same_point(a: Vec2, b: Vec2) -> bool {
+    return a.x == b.x and a.y == b.y
+}
+
+/// Whether the outline crosses itself.
+pub fn is_simple(polygon: [Vec2]) -> bool {
+    let n = polygon.len()
+    if n < 4 {
+        return true
+    }
+    var i = 0
+    while i < n {
+        var j = i + 1
+        while j < n {
+            // Adjacent edges share a vertex and always touch.
+            if j == i + 1 or (i == 0 and j == n - 1) {
+                j = j + 1
+                continue
+            }
+            if geometry.segments_cross(polygon[i], polygon[(i + 1) % n],
+                polygon[j], polygon[(j + 1) % n]) {
+                return false
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return true
+}
+
+/// The triangles as points, for a caller that wants them directly.
+pub fn triangle_points(polygon: [Vec2]) -> [[Vec2]] ! TriangulateError {
+    var out: [[Vec2]] = []
+    for t in try triangles(polygon) {
+        out.push([polygon[t.0], polygon[t.1], polygon[t.2]])
+    }
+    return out
+}
+
+/// The area the triangles cover, which must equal the polygon's.
+///
+/// The check worth running on any triangulation: if the areas differ, a
+/// triangle is outside the shape or one is missing, and both look plausible
+/// on screen until somebody notices a hole.
+pub fn covered_area(polygon: [Vec2],
+    ts: [(i64, i64, i64)]) -> f64 {
+    var total = 0.0
+    for t in ts {
+        var area = turn(polygon[t.0], polygon[t.1], polygon[t.2]) / 2.0
+        if area < 0.0 {
+            area = 0.0 - area
+        }
+        total = total + area
+    }
+    return total
+}
+
+/// A polygon with a hole, cut into one without.
+///
+/// The bridge runs from the hole's rightmost vertex to a vertex of the outer
+/// ring, and the boundary is walked into the hole and back out along it. The
+/// two coincident edges that leaves are what makes the result a simple
+/// polygon rather than two rings, which is the whole trick.
+pub fn bridge_hole(outer: [Vec2], hole: [Vec2]) -> [Vec2] {
+    if hole.len() == 0 {
+        return outer
+    }
+    var rightmost = 0
+    var i = 1
+    while i < hole.len() {
+        if hole[i].x > hole[rightmost].x {
+            rightmost = i
+        }
+        i = i + 1
+    }
+    // The nearest outer vertex to the right of it, which is visible from it
+    // for any hole that lies wholly inside.
+    var best = 0 - 1
+    var best_distance = 0.0
+    i = 0
+    while i < outer.len() {
+        if outer[i].x >= hole[rightmost].x {
+            let d = geometry.distance_squared(outer[i], hole[rightmost])
+            if best < 0 or d < best_distance {
+                best = i
+                best_distance = d
+            }
+        }
+        i = i + 1
+    }
+    if best < 0 {
+        best = 0
+    }
+    var out: [Vec2] = []
+    i = 0
+    while i <= best {
+        out.push(outer[i])
+        i = i + 1
+    }
+    // Walk the hole the other way round, so it does not cancel the outer
+    // ring's orientation.
+    var reversed = hole
+    if is_counter_clockwise(hole) {
+        reversed = hole.rev()
+    }
+    let start = index_of_point(reversed, hole[rightmost])
+    var k = 0
+    while k <= reversed.len() {
+        out.push(reversed[(start + k) % reversed.len()])
+        k = k + 1
+    }
+    out.push(outer[best])
+    i = best + 1
+    while i < outer.len() {
+        out.push(outer[i])
+        i = i + 1
+    }
+    return out
+}
+
+fn index_of_point(points: [Vec2], p: Vec2) -> i64 {
+    var i = 0
+    while i < points.len() {
+        if points[i].x == p.x and points[i].y == p.y {
+            return i
+        }
+        i = i + 1
+    }
+    return 0
+}

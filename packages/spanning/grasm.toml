@@ -1,0 +1,10 @@
+[package]
+name = "spanning"
+version = "1.0.0"
+
+# Arithmetic on a graph the caller supplies. Opens nothing.
+capabilities = []
+
+[dependencies.unionfind]
+path = "../unionfind"
+version = "^1.0.0"

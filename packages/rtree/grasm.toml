@@ -1,0 +1,10 @@
+[package]
+name = "rtree"
+version = "1.0.0"
+
+# Arithmetic on boxes the caller supplies. Opens nothing.
+capabilities = []
+
+[dependencies.geometry]
+path = "../geometry"
+version = "^1.0.0"

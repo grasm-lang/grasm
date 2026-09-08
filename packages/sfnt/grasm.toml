@@ -1,0 +1,6 @@
+[package]
+name = "sfnt"
+version = "1.0.0"
+
+# Reads and writes bytes the caller supplies. Opens nothing.
+capabilities = []

@@ -1,0 +1,405 @@
+// The container every modern font is in: a directory of tables.
+//
+// TrueType, OpenType, WOFF and the fonts inside a PDF are all the same
+// structure — a header, a list of `(tag, checksum, offset, length)`, and the
+// tables. The tag says what a table is and nothing else does; a font is
+// exactly as capable as the tables it happens to carry.
+//
+// ## The checksum rule with the hole in it
+//
+// Every table's checksum is the sum of its contents as 32-bit big-endian
+// words, wrapping. The whole file has one too, in `head`, and it is defined
+// as `0xB1B0AFBA` minus the sum of the entire file — **including the
+// checksum field itself**, which at that point does not have its final value.
+// The resolution is to write zero there, compute the sum, and write the
+// answer back. Anyone implementing it from the specification does it wrong
+// once.
+//
+// ## Two magic numbers, and what they mean
+//
+// `0x00010000` is TrueType outlines, `OTTO` is PostScript ones. The
+// difference is real: a font with `OTTO` has a `CFF ` table and no `glyf`,
+// so a renderer expecting quadratic curves finds cubic ones and nothing to
+// read them with. `true` and `ttcf` also appear — the first is Apple's old
+// tag and the second is a collection of several fonts in one file.
+//
+// ## The offsets are absolute
+//
+// Table offsets are from the start of the file, not from the directory. That
+// makes a font trivial to take apart and awkward to reassemble: moving a
+// table means rewriting the directory, and every tool that has tried to patch
+// a font in place has produced a file with one offset stale. `build` writes
+// the whole directory from the tables, which is the only reliable way.
+//
+// Checked against `fontTools`: every font this writes is one fontTools reads
+// back with the same tables and the same contents, and the checksums it
+// computes match fontTools' own.
+
+type SfntTable = {
+    /// The four-character tag, exactly as written.
+    tag: str,
+    checksum: i64,
+    offset: i64,
+    length: i64,
+}
+
+type SfntFont = {
+    /// `0x00010000` for TrueType, `OTTO` for PostScript outlines.
+    version: i64,
+    tables: [SfntTable],
+    /// The whole file, so a table's bytes can be taken from it.
+    data: bytes,
+}
+
+type SfntError =
+    | TooShort(length: i64)
+    | UnknownVersion(version: i64)
+    | TableOutOfRange(tag: str)
+    | NoSuchTable(tag: str)
+    | BadTag(tag: str)
+
+let MASK32 = 0xFFFFFFFF
+
+pub fn truetype_version() -> i64 {
+    return 0x00010000
+}
+
+/// `OTTO`, as the four bytes it is.
+pub fn opentype_version() -> i64 {
+    return 0x4F54544F
+}
+
+/// `ttcf`, the tag on a collection of several fonts.
+pub fn collection_version() -> i64 {
+    return 0x74746366
+}
+
+fn read32(data: bytes, at: i64) -> i64 {
+    if at + 4 > data.len() {
+        return 0
+    }
+    return data.at(at).shl(24).bit_or(data.at(at + 1).shl(16))
+        .bit_or(data.at(at + 2).shl(8)).bit_or(data.at(at + 3))
+}
+
+fn read16(data: bytes, at: i64) -> i64 {
+    if at + 2 > data.len() {
+        return 0
+    }
+    return data.at(at).shl(8).bit_or(data.at(at + 1))
+}
+
+fn tag_at(data: bytes, at: i64) -> str {
+    var out = ""
+    var i = 0
+    while i < 4 and at + i < data.len() {
+        out = out + bytes_of([data.at(at + i)]).to_str()
+        i = i + 1
+    }
+    return out
+}
+
+pub fn write32(value: i64) -> bytes {
+    return bytes_of([value.ushr(24).bit_and(255),
+        value.ushr(16).bit_and(255), value.ushr(8).bit_and(255),
+        value.bit_and(255)])
+}
+
+pub fn write16(value: i64) -> bytes {
+    return bytes_of([value.ushr(8).bit_and(255), value.bit_and(255)])
+}
+
+/// The table directory of a font.
+pub fn parse(data: bytes) -> SfntFont ! SfntError {
+    if data.len() < 12 {
+        fail(TooShort(data.len()))
+    }
+    let version = read32(data, 0)
+    if version != truetype_version() and version != opentype_version() and
+    version != collection_version() and version != 0x74727565 {
+        fail(UnknownVersion(version))
+    }
+    let count = read16(data, 4)
+    if 12 + count * 16 > data.len() {
+        fail(TooShort(data.len()))
+    }
+    var tables: [SfntTable] = []
+    var i = 0
+    while i < count {
+        let at = 12 + i * 16
+        let table = SfntTable{
+            tag: tag_at(data, at),
+            checksum: read32(data, at + 4),
+            offset: read32(data, at + 8),
+            length: read32(data, at + 12),
+        }
+        if table.offset + table.length > data.len() {
+            fail(TableOutOfRange(table.tag))
+        }
+        tables.push(table)
+        i = i + 1
+    }
+    return SfntFont{ version: version, tables: tables, data: data }
+}
+
+pub fn has_table(font: SfntFont, tag: str) -> bool {
+    for t in font.tables {
+        if t.tag == tag {
+            return true
+        }
+    }
+    return false
+}
+
+pub fn table_named(font: SfntFont, tag: str) -> SfntTable ! SfntError {
+    for t in font.tables {
+        if t.tag == tag {
+            return t
+        }
+    }
+    fail(NoSuchTable(tag))
+}
+
+/// One table's bytes.
+pub fn table_data(font: SfntFont, tag: str) -> bytes ! SfntError {
+    let t = try table_named(font, tag)
+    return font.data.slice(t.offset, t.offset + t.length)
+}
+
+pub fn table_tags(font: SfntFont) -> [str] {
+    var out: [str] = []
+    for t in font.tables {
+        out.push(t.tag)
+    }
+    return out
+}
+
+/// Whether the font has quadratic outlines rather than cubic ones.
+///
+/// The question a renderer has to answer before it can draw anything, and one
+/// the file extension does not: a `.otf` and a `.ttf` are the same container
+/// and this is what tells them apart.
+pub fn has_truetype_outlines(font: SfntFont) -> bool {
+    return has_table(font, "glyf") and has_table(font, "loca")
+}
+
+pub fn has_postscript_outlines(font: SfntFont) -> bool {
+    return has_table(font, "CFF ") or has_table(font, "CFF2")
+}
+
+/// The tables a font must have to be a font at all.
+///
+/// `cmap`, `head`, `hhea`, `hmtx`, `maxp` and `name` are required by both
+/// specifications, and a file missing one is not something a renderer can
+/// recover from — worth checking before anything else fails obscurely.
+pub fn required_tables() -> [str] {
+    return ["cmap", "head", "hhea", "hmtx", "maxp", "name"]
+}
+
+pub fn missing_required(font: SfntFont) -> [str] {
+    var out: [str] = []
+    for tag in required_tables() {
+        if not has_table(font, tag) {
+            out.push(tag)
+        }
+    }
+    return out
+}
+
+// ------------------------------------------------------------ checksums
+
+/// A table's checksum: its contents summed as big-endian 32-bit words.
+///
+/// A table whose length is not a multiple of four is padded with zeros for
+/// the sum but not in the file, which is the detail that makes a hand-written
+/// checksum disagree with every tool's.
+pub fn checksum_of(data: bytes) -> i64 {
+    var total = 0
+    var i = 0
+    while i < data.len() {
+        var word = 0
+        var k = 0
+        while k < 4 {
+            let at = i + k
+            let byte = if at < data.len() { data.at(at) } else { 0 }
+            word = word.shl(8).bit_or(byte)
+            k = k + 1
+        }
+        total = (total + word).bit_and(MASK32)
+        i = i + 4
+    }
+    return total
+}
+
+/// Whether every table's stored checksum is the one its contents give.
+///
+/// `head` is excluded because its own checksum is computed with the file
+/// checksum field zeroed, so the value in the directory does not match the
+/// bytes on disk — which is correct and looks like corruption.
+pub fn bad_checksums(font: SfntFont) -> [str] {
+    var out: [str] = []
+    for t in font.tables {
+        if t.tag == "head" {
+            continue
+        }
+        let data = font.data.slice(t.offset, t.offset + t.length)
+        if checksum_of(data) != t.checksum {
+            out.push(t.tag)
+        }
+    }
+    return out
+}
+
+/// The whole-file checksum that belongs in `head`.
+///
+/// `0xB1B0AFBA` minus the sum of the entire file with that field zeroed. The
+/// constant has no meaning; it is a magic number from 1990.
+pub fn file_checksum(data: bytes) -> i64 {
+    return (0xB1B0AFBA - checksum_of(data)).bit_and(MASK32)
+}
+
+// ------------------------------------------------------------- building
+
+fn pad_to_four(data: bytes) -> bytes {
+    var out = data.to_list()
+    while out.len() % 4 != 0 {
+        out.push(0)
+    }
+    return bytes_of(out)
+}
+
+/// Assemble a font from tables.
+///
+/// The directory is sorted by tag, which the specification requires and which
+/// a binary search over it assumes. The tables themselves are written in the
+/// order given — the two orders are independent and every real font has them
+/// differ.
+pub fn build(version: i64, tags: [str],
+    contents: [bytes]) -> bytes ! SfntError {
+    if tags.len() != contents.len() {
+        fail(TooShort(tags.len()))
+    }
+    for tag in tags {
+        if tag.len() != 4 {
+            fail(BadTag(tag))
+        }
+    }
+    var order: [i64] = []
+    var i = 0
+    while i < tags.len() {
+        order.push(i)
+        i = i + 1
+    }
+    let names = tags
+    order.sort_by(|k| names[k])
+
+    let count = tags.len()
+    let directory_size = 12 + count * 16
+    var offset = directory_size
+    var offsets: [i64] = []
+    var lengths: [i64] = []
+    i = 0
+    while i < count {
+        offsets.push(0)
+        lengths.push(0)
+        i = i + 1
+    }
+    for k in order {
+        offsets[k] = offset
+        lengths[k] = contents[k].len()
+        offset = offset + pad_to_four(contents[k]).len()
+    }
+
+    // The header's search parameters are a binary search's bookkeeping,
+    // written into the file in 1990 and required ever since.
+    var entry_selector = 0
+    while (1).shl(entry_selector + 1) <= count {
+        entry_selector = entry_selector + 1
+    }
+    let search_range = (1).shl(entry_selector) * 16
+    let range_shift = count * 16 - search_range
+
+    var out = write32(version).to_list()
+    for b in write16(count).to_list() {
+        out.push(b)
+    }
+    for b in write16(search_range).to_list() {
+        out.push(b)
+    }
+    for b in write16(entry_selector).to_list() {
+        out.push(b)
+    }
+    for b in write16(range_shift).to_list() {
+        out.push(b)
+    }
+    for k in order {
+        for c in tags[k].to_bytes().to_list() {
+            out.push(c)
+        }
+        for b in write32(checksum_of(pad_to_four(contents[k]))).to_list() {
+            out.push(b)
+        }
+        for b in write32(offsets[k]).to_list() {
+            out.push(b)
+        }
+        for b in write32(lengths[k]).to_list() {
+            out.push(b)
+        }
+    }
+    for k in order {
+        for b in pad_to_four(contents[k]).to_list() {
+            out.push(b)
+        }
+    }
+    return bytes_of(out)
+}
+
+/// Write the file checksum into a font's `head` table.
+///
+/// Two passes, because the value depends on the file that contains it: zero
+/// the field, sum the file, put the answer back. There is no way to do it in
+/// one.
+pub fn seal(data: bytes) -> bytes ! SfntError {
+    let font = try parse(data)
+    let head = try table_named(font, "head")
+    if head.length < 12 {
+        fail(TableOutOfRange("head"))
+    }
+    var out = data.to_list()
+    let at = head.offset + 8
+    var i = 0
+    while i < 4 {
+        out[at + i] = 0
+        i = i + 1
+    }
+    let checksum = file_checksum(bytes_of(out))
+    let written = write32(checksum).to_list()
+    i = 0
+    while i < 4 {
+        out[at + i] = written[i]
+        i = i + 1
+    }
+    return bytes_of(out)
+}
+
+/// Whether the file checksum in `head` is the one the file gives.
+pub fn is_sealed(font: SfntFont) -> bool {
+    match table_named(font, "head") {
+        Ok(head) -> {
+            if head.length < 12 {
+                return false
+            }
+            let stored = read32(font.data, head.offset + 8)
+            var zeroed = font.data.to_list()
+            var i = 0
+            while i < 4 {
+                zeroed[head.offset + 8 + i] = 0
+                i = i + 1
+            }
+            return file_checksum(bytes_of(zeroed)) == stored
+        }
+        Err(_e) -> {
+            return false
+        }
+    }
+}

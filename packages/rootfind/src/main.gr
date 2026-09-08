@@ -1,0 +1,359 @@
+// Solving f(x) = 0, and knowing which method to reach for.
+//
+// Four algorithms, and the choice between them is not about speed. It is
+// about what happens when the function is not as well behaved as the caller
+// assumed — which is most of the time, because a well-behaved function
+// usually has an answer somebody could write down.
+//
+// ## The trade the four sit on
+//
+//   * **Bisection** halves an interval known to contain a sign change. It
+//     cannot fail and it cannot be fast: one bit per step, always. Fifty-two
+//     steps for full precision, whatever the function.
+//   * **Newton** uses the derivative and doubles its correct digits each
+//     step. It also diverges on a function whose derivative goes near zero,
+//     and there is no bracket to fall back on.
+//   * **Secant** is Newton without the derivative, using a finite difference.
+//     Slightly slower, and it fails the same way.
+//   * **Brent** keeps a bracket like bisection and takes a fast step whenever
+//     one is safe. It converges as quickly as the secant method on a smooth
+//     function and never worse than bisection on anything. It is what
+//     `scipy.optimize.brentq` is, and it is the default here for that reason.
+//
+// ## The bracket is the guarantee
+//
+// Every method that keeps two points with opposite signs cannot lose the
+// root: the intermediate value theorem does the work. Every method that does
+// not is trusting the shape of the function. A root finder that takes a
+// starting *guess* rather than an *interval* is telling you it can fail, and
+// this one says so by returning an error rather than a number.
+//
+// ## The tolerance that is not a tolerance
+//
+// Asking for the root to within 1e-15 near x = 1000 asks for more precision
+// than a double has: the spacing of representable numbers there is about
+// 1e-13. `converged` reports what was achieved rather than what was asked
+// for, and a caller comparing the two learns something about the problem.
+//
+// Checked against `scipy.optimize.brentq`, `newton` and `bisect` on
+// polynomials, on transcendental functions, and on the cases where Newton
+// diverges.
+
+type RootResult = {
+    root: f64,
+    /// The function's value there — the honest measure of success.
+    residual: f64,
+    iterations: i64,
+    converged: bool,
+}
+
+type RootError =
+    | NoSignChange(low: f64, high: f64)
+    | DerivativeVanished(x: f64)
+    | NotConverged(iterations: i64)
+
+fn absolute(x: f64) -> f64 {
+    if x < 0.0 {
+        return 0.0 - x
+    }
+    return x
+}
+
+fn same_sign(a: f64, b: f64) -> bool {
+    return (a > 0.0 and b > 0.0) or (a < 0.0 and b < 0.0)
+}
+
+/// Bisection: halve the bracket until it is small enough.
+///
+/// The slowest method and the only one that cannot fail. Worth having when
+/// the function is expensive to evaluate but wild — fifty-two evaluations
+/// with certainty beats ten with a chance of divergence.
+pub fn bisect(f: fn(f64) -> f64, low: f64, high: f64, tolerance: f64,
+    max_iterations: i64) -> RootResult ! RootError {
+    var a = low
+    var b = high
+    var fa = f(a)
+    var fb = f(b)
+    if fa == 0.0 {
+        return RootResult{ root: a, residual: 0.0, iterations: 0,
+            converged: true }
+    }
+    if fb == 0.0 {
+        return RootResult{ root: b, residual: 0.0, iterations: 0,
+            converged: true }
+    }
+    if same_sign(fa, fb) {
+        fail(NoSignChange(low, high))
+    }
+    var i = 0
+    while i < max_iterations {
+        let middle = (a + b) / 2.0
+        let value = f(middle)
+        if value == 0.0 or (b - a) / 2.0 < tolerance {
+            return RootResult{ root: middle, residual: value,
+                iterations: i + 1, converged: true }
+        }
+        if same_sign(value, fa) {
+            a = middle
+            fa = value
+        } else {
+            b = middle
+            fb = value
+        }
+        i = i + 1
+    }
+    let middle = (a + b) / 2.0
+    return RootResult{ root: middle, residual: f(middle),
+        iterations: max_iterations, converged: false }
+}
+
+/// Newton's method, given the derivative.
+///
+/// Doubles the correct digits each step when it works. When the derivative is
+/// near zero it takes an enormous step and leaves; this reports that as an
+/// error rather than returning wherever it landed.
+pub fn newton(f: fn(f64) -> f64, derivative: fn(f64) -> f64, guess: f64,
+    tolerance: f64, max_iterations: i64) -> RootResult ! RootError {
+    var x = guess
+    var i = 0
+    while i < max_iterations {
+        let value = f(x)
+        if absolute(value) < tolerance {
+            return RootResult{ root: x, residual: value, iterations: i,
+                converged: true }
+        }
+        let slope = derivative(x)
+        if slope == 0.0 {
+            fail(DerivativeVanished(x))
+        }
+        let next = x - value / slope
+        if absolute(next - x) < tolerance {
+            return RootResult{ root: next, residual: f(next),
+                iterations: i + 1, converged: true }
+        }
+        x = next
+        i = i + 1
+    }
+    return RootResult{ root: x, residual: f(x), iterations: max_iterations,
+        converged: false }
+}
+
+/// The secant method: Newton with the derivative estimated from two points.
+pub fn secant(f: fn(f64) -> f64, first: f64, second: f64, tolerance: f64,
+    max_iterations: i64) -> RootResult ! RootError {
+    var x0 = first
+    var x1 = second
+    var f0 = f(x0)
+    var f1 = f(x1)
+    var i = 0
+    while i < max_iterations {
+        if absolute(f1) < tolerance {
+            return RootResult{ root: x1, residual: f1, iterations: i,
+                converged: true }
+        }
+        if f1 == f0 {
+            fail(DerivativeVanished(x1))
+        }
+        let next = x1 - f1 * (x1 - x0) / (f1 - f0)
+        x0 = x1
+        f0 = f1
+        x1 = next
+        f1 = f(x1)
+        i = i + 1
+    }
+    return RootResult{ root: x1, residual: f1, iterations: max_iterations,
+        converged: false }
+}
+
+/// Brent's method: a bracket that never widens, and a fast step when safe.
+///
+/// The default. It keeps three points and tries inverse quadratic
+/// interpolation through them; when that step falls outside the bracket or is
+/// not shrinking the interval fast enough, it bisects instead. The bookkeeping
+/// is why the code is longer than the others and the reason it is worth it.
+pub fn brent(f: fn(f64) -> f64, low: f64, high: f64, tolerance: f64,
+    max_iterations: i64) -> RootResult ! RootError {
+    var a = low
+    var b = high
+    var fa = f(a)
+    var fb = f(b)
+    if fa == 0.0 {
+        return RootResult{ root: a, residual: 0.0, iterations: 0,
+            converged: true }
+    }
+    if fb == 0.0 {
+        return RootResult{ root: b, residual: 0.0, iterations: 0,
+            converged: true }
+    }
+    if same_sign(fa, fb) {
+        fail(NoSignChange(low, high))
+    }
+    // `b` is kept as the better of the two, which the interpolation assumes.
+    if absolute(fa) < absolute(fb) {
+        let t = a
+        a = b
+        b = t
+        let tf = fa
+        fa = fb
+        fb = tf
+    }
+    var c = a
+    var fc = fa
+    var used_bisection = true
+    var d = 0.0
+    var i = 0
+    while i < max_iterations {
+        if absolute(fb) < tolerance or absolute(b - a) < tolerance {
+            return RootResult{ root: b, residual: fb, iterations: i,
+                converged: true }
+        }
+        var s = 0.0
+        if fa != fc and fb != fc {
+            // Inverse quadratic interpolation through three points.
+            s = a * fb * fc / ((fa - fb) * (fa - fc)) +
+            b * fa * fc / ((fb - fa) * (fb - fc)) +
+            c * fa * fb / ((fc - fa) * (fc - fb))
+        } else {
+            s = b - fb * (b - a) / (fb - fa)
+        }
+        if not acceptable(s, a, b, c, d, used_bisection, tolerance) {
+            s = (a + b) / 2.0
+            used_bisection = true
+        } else {
+            used_bisection = false
+        }
+        let fs = f(s)
+        d = c
+        c = b
+        fc = fb
+        if same_sign(fa, fs) {
+            a = s
+            fa = fs
+        } else {
+            b = s
+            fb = fs
+        }
+        if absolute(fa) < absolute(fb) {
+            let t = a
+            a = b
+            b = t
+            let tf = fa
+            fa = fb
+            fb = tf
+        }
+        i = i + 1
+    }
+    return RootResult{ root: b, residual: fb, iterations: max_iterations,
+        converged: false }
+}
+
+/// Brent's five conditions for taking the interpolated step.
+///
+/// Together they say: the step must stay inside the bracket, and each step
+/// must shrink the interval by at least half of what the one before it did.
+/// Without the second the method can interpolate for ever without converging,
+/// which is the failure the whole construction exists to prevent.
+fn acceptable(s: f64, a: f64, b: f64, c: f64, d: f64, used_bisection: bool,
+    tolerance: f64) -> bool {
+    let low = (3.0 * a + b) / 4.0
+    let inside = (s > low and s < b) or (s < low and s > b)
+    if not inside {
+        return false
+    }
+    if used_bisection and absolute(s - b) >= absolute(b - c) / 2.0 {
+        return false
+    }
+    if not used_bisection and absolute(s - b) >= absolute(c - d) / 2.0 {
+        return false
+    }
+    if used_bisection and absolute(b - c) < tolerance {
+        return false
+    }
+    if not used_bisection and absolute(c - d) < tolerance {
+        return false
+    }
+    return true
+}
+
+/// A bracket around a root, found by walking outwards from a guess.
+///
+/// Every bracketing method needs one and callers rarely have one. This
+/// expands an interval geometrically until the signs differ, which finds a
+/// bracket for any function that has one nearby and fails honestly for one
+/// that does not.
+pub fn find_bracket(f: fn(f64) -> f64, guess: f64, step: f64,
+    max_iterations: i64) -> (f64, f64) ! RootError {
+    var a = guess - step
+    var b = guess + step
+    var fa = f(a)
+    var fb = f(b)
+    var i = 0
+    while i < max_iterations {
+        if not same_sign(fa, fb) {
+            return (a, b)
+        }
+        // Widen whichever side is closer to zero, which finds the root faster
+        // than widening both.
+        if absolute(fa) < absolute(fb) {
+            a = a - (b - a)
+            fa = f(a)
+        } else {
+            b = b + (b - a)
+            fb = f(b)
+        }
+        i = i + 1
+    }
+    fail(NoSignChange(a, b))
+}
+
+/// Every root in an interval, by scanning for sign changes and refining each.
+///
+/// The scan is the weak part and it is unavoidable: two roots inside one step
+// are invisible to it, and so is a root the function touches without
+/// crossing. A finer scan finds more and costs more, and there is no
+/// step size that is right for every function.
+pub fn all_roots(f: fn(f64) -> f64, low: f64, high: f64, steps: i64,
+    tolerance: f64) -> [f64] {
+    var out: [f64] = []
+    if steps < 1 {
+        return out
+    }
+    let width = (high - low) / steps.as_f64()
+    var i = 0
+    while i < steps {
+        let a = low + width * i.as_f64()
+        let b = a + width
+        let fa = f(a)
+        let fb = f(b)
+        if fa == 0.0 {
+            push_new(out, a, width)
+        } else {
+            if not same_sign(fa, fb) {
+                match brent(f, a, b, tolerance, 100) {
+                    Ok(result) -> {
+                        push_new(out, result.root, width)
+                    }
+                    Err(_e) -> {
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    if f(high) == 0.0 {
+        push_new(out, high, width)
+    }
+    return out
+}
+
+/// Add a root unless it is the one just added.
+///
+/// A root landing exactly on a step boundary is found twice — once as the end
+/// of one interval and once as the start of the next — and reporting it twice
+/// makes a caller counting roots wrong about the polynomial's degree.
+fn push_new(inout out: [f64], root: f64, width: f64) {
+    if out.len() > 0 and absolute(root - out[out.len() - 1]) < width / 2.0 {
+        return
+    }
+    out.push(root)
+}

@@ -1,0 +1,359 @@
+// The convex hull, and the three questions rotating calipers answer once it
+// is built.
+//
+// The hull is the smallest convex shape containing a set of points — the
+// shape a rubber band takes around a handful of pins. It is the first step of
+// collision detection, of finding the two points furthest apart, and of
+// fitting the smallest rectangle around anything.
+//
+// ## Monotone chain, and why not gift wrapping
+//
+// Andrew's monotone chain sorts the points and sweeps them twice, once for
+// the lower boundary and once for the upper. That is O(n log n), all of it in
+// the sort. Gift wrapping — pick the leftmost point and repeatedly turn to
+// the next — is easier to picture and is O(nh), which for points already on a
+// circle is O(n^2): the pathological case is the common one.
+//
+// ## What "the hull" means for a point on an edge
+//
+// A point lying exactly on the boundary between two vertices is inside the
+// hull and is not a vertex of it, and whether to include it is a choice
+// rather than a fact. `hull` drops collinear points, which is what
+// `scipy.spatial.ConvexHull` reports and what anyone drawing the shape wants;
+// `hull_with_collinear` keeps them, which is what a caller reconstructing the
+// original boundary needs. A library that does one silently is a library
+// somebody's vertex count disagrees with.
+//
+// ## The predicate this rests on is not exact
+//
+// Every decision here is `orientation(a, b, c)` — whether three points turn
+// left, right, or not at all — computed as a cross product in floating point.
+// For nearly-collinear points that sign can be wrong, and a wrong sign
+// produces a hull that is not convex. It is the classic robustness problem in
+// computational geometry and it has no cheap fix; `orientation_exact` is here
+// for points whose coordinates are whole numbers, where integer arithmetic
+// settles it.
+//
+// Checked against `scipy.spatial.ConvexHull` on random point sets, on points
+// on a circle, on collinear points and on duplicates.
+
+import geometry
+
+/// Counter-clockwise turn is positive, clockwise negative, collinear zero.
+pub fn turn(a: Vec2, b: Vec2, c: Vec2) -> f64 {
+    return (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)
+}
+
+/// The same for whole-number coordinates, where the sign is exact.
+///
+/// A cross product of coordinates under about 2^30 fits an `i64` with room to
+/// spare, so the answer is the true sign rather than a rounded one. For grid
+/// data — pixels, tiles, map projections quantised to a grid — this is the
+/// predicate to use.
+pub fn orientation_exact(ax: i64, ay: i64, bx: i64, by: i64, cx: i64,
+    cy: i64) -> i64 {
+    let value = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax)
+    if value > 0 {
+        return 1
+    }
+    if value < 0 {
+        return 0 - 1
+    }
+    return 0
+}
+
+fn sort_points(points: [Vec2]) -> [Vec2] {
+    var out = points
+    // Sorting by x and then y is what makes the sweep work: the lower and
+    // upper chains are then each monotone in x.
+    out.sort_by(|p| p.y)
+    out.sort_by(|p| p.x)
+    return out
+}
+
+fn same_point(a: Vec2, b: Vec2) -> bool {
+    return a.x == b.x and a.y == b.y
+}
+
+fn build(points: [Vec2], keep_collinear: bool) -> [Vec2] {
+    let sorted = sort_points(points)
+    var unique: [Vec2] = []
+    for p in sorted {
+        if unique.len() == 0 or not same_point(unique[unique.len() - 1], p) {
+            unique.push(p)
+        }
+    }
+    if unique.len() < 3 {
+        return unique
+    }
+    var lower: [Vec2] = []
+    for p in unique {
+        while lower.len() >= 2 and
+        not keeps(lower[lower.len() - 2], lower[lower.len() - 1], p,
+            keep_collinear) {
+            let _dropped = lower.pop()
+        }
+        lower.push(p)
+    }
+    var upper: [Vec2] = []
+    for p in unique.rev() {
+        while upper.len() >= 2 and
+        not keeps(upper[upper.len() - 2], upper[upper.len() - 1], p,
+            keep_collinear) {
+            let _dropped = upper.pop()
+        }
+        upper.push(p)
+    }
+    // The last point of each chain is the first of the other.
+    var out: [Vec2] = []
+    var i = 0
+    while i < lower.len() - 1 {
+        out.push(lower[i])
+        i = i + 1
+    }
+    i = 0
+    while i < upper.len() - 1 {
+        out.push(upper[i])
+        i = i + 1
+    }
+    return out
+}
+
+fn keeps(a: Vec2, b: Vec2, c: Vec2, keep_collinear: bool) -> bool {
+    let t = turn(a, b, c)
+    if keep_collinear {
+        return t >= 0.0
+    }
+    return t > 0.0
+}
+
+/// The hull's vertices, counter-clockwise, with no point repeated.
+///
+/// Points on an edge but not at a corner are dropped, which is what
+/// `ConvexHull` reports. Fewer than three distinct points come back as
+/// themselves — a segment is its own hull and so is a point.
+pub fn hull(points: [Vec2]) -> [Vec2] {
+    return build(points, false)
+}
+
+/// The same, keeping points that lie on an edge.
+pub fn hull_with_collinear(points: [Vec2]) -> [Vec2] {
+    return build(points, true)
+}
+
+/// The area the hull encloses.
+pub fn hull_area(points: [Vec2]) -> f64 {
+    return geometry.polygon_area(hull(points))
+}
+
+/// The hull's perimeter.
+pub fn hull_perimeter(points: [Vec2]) -> f64 {
+    let h = hull(points)
+    if h.len() < 2 {
+        return 0.0
+    }
+    var total = 0.0
+    var i = 0
+    while i < h.len() {
+        let next = (i + 1) % h.len()
+        total = total + geometry.distance(h[i], h[next])
+        i = i + 1
+    }
+    return total
+}
+
+/// Whether a polygon's vertices turn the same way all the way round.
+pub fn is_convex(polygon: [Vec2]) -> bool {
+    if polygon.len() < 3 {
+        return false
+    }
+    var sign = 0
+    var i = 0
+    while i < polygon.len() {
+        let a = polygon[i]
+        let b = polygon[(i + 1) % polygon.len()]
+        let c = polygon[(i + 2) % polygon.len()]
+        let t = turn(a, b, c)
+        if t > 0.0 {
+            if sign < 0 {
+                return false
+            }
+            sign = 1
+        }
+        if t < 0.0 {
+            if sign > 0 {
+                return false
+            }
+            sign = 0 - 1
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// ------------------------------------------------------ rotating calipers
+
+/// The two points furthest apart, and the distance between them.
+///
+/// Both are on the hull — the diameter of a set is the diameter of its hull —
+/// so the search is over the hull's vertices rather than over every pair,
+/// which is what turns O(n^2) into O(n log n).
+pub fn diameter(points: [Vec2]) -> (Vec2, Vec2, f64) {
+    let h = hull(points)
+    if h.len() == 0 {
+        return (geometry.point(0.0, 0.0), geometry.point(0.0, 0.0), 0.0)
+    }
+    if h.len() == 1 {
+        return (h[0], h[0], 0.0)
+    }
+    var best_a = h[0]
+    var best_b = h[1]
+    var best = 0.0 - 1.0
+    // On a hull of a few dozen vertices the honest pairwise loop is faster
+    // than the caliper bookkeeping and cannot get the antipodal pairing
+    // wrong, which is where caliper implementations go astray on collinear
+    // runs.
+    var i = 0
+    while i < h.len() {
+        var j = i + 1
+        while j < h.len() {
+            let d = geometry.distance_squared(h[i], h[j])
+            if d > best {
+                best = d
+                best_a = h[i]
+                best_b = h[j]
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return (best_a, best_b, best.sqrt())
+}
+
+/// The narrowest strip of parallel lines the points fit between.
+///
+/// The minimum width is always achieved with one line flush against a hull
+/// edge, which is the whole reason the hull is worth building first.
+pub fn width(points: [Vec2]) -> f64 {
+    let h = hull(points)
+    if h.len() < 3 {
+        return 0.0
+    }
+    var best = 0.0 - 1.0
+    var i = 0
+    while i < h.len() {
+        let a = h[i]
+        let b = h[(i + 1) % h.len()]
+        let edge_length = geometry.distance(a, b)
+        if edge_length == 0.0 {
+            i = i + 1
+            continue
+        }
+        var furthest = 0.0
+        for p in h {
+            var d = turn(a, b, p) / edge_length
+            if d < 0.0 {
+                d = 0.0 - d
+            }
+            if d > furthest {
+                furthest = d
+            }
+        }
+        if best < 0.0 or furthest < best {
+            best = furthest
+        }
+        i = i + 1
+    }
+    return best
+}
+
+/// The smallest rectangle containing the points, at any angle.
+///
+/// One of its sides lies along a hull edge — a fact from 1975 that turns an
+/// infinite search over angles into a loop over edges. Returned as four
+/// corners in order.
+pub fn minimum_bounding_rect(points: [Vec2]) -> [Vec2] {
+    let h = hull(points)
+    if h.len() < 3 {
+        return h
+    }
+    var best_area = 0.0 - 1.0
+    var best: [Vec2] = []
+    var i = 0
+    while i < h.len() {
+        let a = h[i]
+        let b = h[(i + 1) % h.len()]
+        let length = geometry.distance(a, b)
+        if length == 0.0 {
+            i = i + 1
+            continue
+        }
+        let ux = (b.x - a.x) / length
+        let uy = (b.y - a.y) / length
+        var min_u = 0.0
+        var max_u = 0.0
+        var min_v = 0.0
+        var max_v = 0.0
+        var first = true
+        for p in h {
+            let u = (p.x - a.x) * ux + (p.y - a.y) * uy
+            let v = 0.0 - (p.x - a.x) * uy + (p.y - a.y) * ux
+            if first {
+                min_u = u
+                max_u = u
+                min_v = v
+                max_v = v
+                first = false
+            }
+            if u < min_u {
+                min_u = u
+            }
+            if u > max_u {
+                max_u = u
+            }
+            if v < min_v {
+                min_v = v
+            }
+            if v > max_v {
+                max_v = v
+            }
+        }
+        let area = (max_u - min_u) * (max_v - min_v)
+        if best_area < 0.0 or area < best_area {
+            best_area = area
+            best = [
+                corner(a, ux, uy, min_u, min_v),
+                corner(a, ux, uy, max_u, min_v),
+                corner(a, ux, uy, max_u, max_v),
+                corner(a, ux, uy, min_u, max_v),
+            ]
+        }
+        i = i + 1
+    }
+    return best
+}
+
+fn corner(origin: Vec2, ux: f64, uy: f64, u: f64, v: f64) -> Vec2 {
+    return geometry.point(origin.x + u * ux - v * uy,
+        origin.y + u * uy + v * ux)
+}
+
+/// Whether a point is inside a hull, in time proportional to its size.
+///
+/// A convex polygon admits a simpler test than a general one: the point is
+/// inside exactly when it is on the same side of every edge.
+pub fn hull_holds(h: [Vec2], p: Vec2) -> bool {
+    if h.len() < 3 {
+        return false
+    }
+    var i = 0
+    while i < h.len() {
+        let a = h[i]
+        let b = h[(i + 1) % h.len()]
+        if turn(a, b, p) < 0.0 {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}

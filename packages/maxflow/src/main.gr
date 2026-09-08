@@ -1,0 +1,320 @@
+// Maximum flow, and the minimum cut that comes free with it.
+//
+// The question is: how much can move from here to there through a network of
+// pipes with capacities. The answer is worth more than it looks, because a
+// surprising number of problems are this question wearing a hat — bipartite
+// matching, project selection, image segmentation, and scheduling all reduce
+// to it.
+//
+// ## Dinic's algorithm, and why not the obvious one
+//
+// Ford-Fulkerson says: find any path with spare capacity, push flow along it,
+// repeat. It is correct and its running time depends on the *capacities* — on
+// a four-node graph with capacity a million it can take a million steps, which
+// is the standard example everyone meets and nobody forgets.
+//
+// Dinic's fixes it with two ideas. Build a **level graph** by breadth-first
+// search, so only edges going one level deeper are usable; then push flow
+// along every shortest path at once before rebuilding. Each rebuild strictly
+// increases the shortest path length, so there are at most V of them, and the
+// running time stops depending on the numbers.
+//
+// ## The residual edge is the whole trick
+//
+// Pushing flow along an edge adds capacity to a **reverse** edge that was not
+// in the original graph. That is what lets a later path undo an earlier bad
+// decision without any backtracking, and it is why max-flow works at all. An
+// implementation without it is a greedy algorithm that gets the wrong answer
+// on the smallest interesting graph.
+//
+// ## The cut
+//
+// When no more flow fits, the vertices still reachable from the source in the
+// residual graph are one side of a minimum cut, and the edges leaving them are
+// the bottleneck. Max-flow min-cut is a theorem from 1956 and it means the
+// answer to "how much" always comes with the answer to "what is stopping
+// more" — which is the one a human wanted.
+//
+// Checked against `networkx.maximum_flow` and `minimum_cut` on random
+// networks, on the capacity-scaling worst case, and on bipartite graphs.
+
+type FlowEdge = {
+    to: i64,
+    capacity: i64,
+    flow: i64,
+    /// Index of the paired reverse edge, in the same list.
+    partner: i64,
+}
+
+type FlowNetwork = {
+    /// `edges[v]` is the list of edge indices leaving `v`.
+    out: [[i64]],
+    edges: [FlowEdge],
+}
+
+type FlowError =
+    | NoSuchVertex(v: i64)
+    | NegativeCapacity(capacity: i64)
+
+pub fn new_network(vertices: i64) -> FlowNetwork {
+    var out: [[i64]] = []
+    for _i in 0..vertices {
+        out.push([])
+    }
+    return FlowNetwork{ out: out, edges: [] }
+}
+
+pub fn order(n: FlowNetwork) -> i64 {
+    return n.out.len()
+}
+
+/// Add a directed edge, and the reverse edge that makes the algorithm work.
+///
+/// The reverse edge starts at zero capacity. Pushing flow forwards raises it,
+/// which is how a later augmenting path can send flow back and re-route an
+/// earlier choice.
+pub fn add_edge(inout n: FlowNetwork, from: i64, to: i64,
+    capacity: i64) ! FlowError {
+    if from < 0 or from >= n.out.len() or to < 0 or to >= n.out.len() {
+        fail(NoSuchVertex(from))
+    }
+    if capacity < 0 {
+        fail(NegativeCapacity(capacity))
+    }
+    let forward = n.edges.len()
+    n.edges.push(FlowEdge{ to: to, capacity: capacity, flow: 0,
+        partner: forward + 1 })
+    n.edges.push(FlowEdge{ to: from, capacity: 0, flow: 0,
+        partner: forward })
+    n.out[from].push(forward)
+    n.out[to].push(forward + 1)
+}
+
+/// An undirected edge, which is two directed ones at full capacity each.
+pub fn add_undirected(inout n: FlowNetwork, a: i64, b: i64,
+    capacity: i64) ! FlowError {
+    if a < 0 or a >= n.out.len() or b < 0 or b >= n.out.len() {
+        fail(NoSuchVertex(a))
+    }
+    if capacity < 0 {
+        fail(NegativeCapacity(capacity))
+    }
+    let forward = n.edges.len()
+    n.edges.push(FlowEdge{ to: b, capacity: capacity, flow: 0,
+        partner: forward + 1 })
+    n.edges.push(FlowEdge{ to: a, capacity: capacity, flow: 0,
+        partner: forward })
+    n.out[a].push(forward)
+    n.out[b].push(forward + 1)
+}
+
+fn spare(e: FlowEdge) -> i64 {
+    return e.capacity - e.flow
+}
+
+/// How far each vertex is from the source using only unsaturated edges.
+fn levels(n: FlowNetwork, source: i64, sink: i64) -> ([i64], bool) {
+    var level: [i64] = []
+    for _i in 0..n.out.len() {
+        level.push(0 - 1)
+    }
+    level[source] = 0
+    var queue = [source]
+    var at = 0
+    while at < queue.len() {
+        let v = queue[at]
+        at = at + 1
+        for index in n.out[v] {
+            let e = n.edges[index]
+            if spare(e) > 0 and level[e.to] < 0 {
+                level[e.to] = level[v] + 1
+                queue.push(e.to)
+            }
+        }
+    }
+    return (level, level[sink] >= 0)
+}
+
+/// Push as much as possible from `v` along edges going one level deeper.
+///
+/// `next` remembers how far down each vertex's edge list the search has got,
+/// so an edge that turned out to be useless is never examined twice in one
+/// phase. Without it the phase is quadratic and Dinic's bound does not hold.
+fn push(inout n: FlowNetwork, v: i64, sink: i64, limit: i64, level: [i64],
+    inout next: [i64]) -> i64 {
+    if v == sink {
+        return limit
+    }
+    while next[v] < n.out[v].len() {
+        let index = n.out[v][next[v]]
+        let e = n.edges[index]
+        if spare(e) > 0 and level[e.to] == level[v] + 1 {
+            var room = spare(e)
+            if limit < room {
+                room = limit
+            }
+            let sent = push(n, e.to, sink, room, level, next)
+            if sent > 0 {
+                var forward = n.edges[index]
+                forward.flow = forward.flow + sent
+                n.edges[index] = forward
+                var back = n.edges[e.partner]
+                back.flow = back.flow - sent
+                n.edges[e.partner] = back
+                return sent
+            }
+        }
+        next[v] = next[v] + 1
+    }
+    return 0
+}
+
+/// The maximum flow from `source` to `sink`, leaving the flows on the edges.
+pub fn max_flow(inout n: FlowNetwork, source: i64,
+    sink: i64) -> i64 ! FlowError {
+    if source < 0 or source >= n.out.len() or sink < 0 or
+    sink >= n.out.len() {
+        fail(NoSuchVertex(source))
+    }
+    if source == sink {
+        return 0
+    }
+    var total = 0
+    var phase = levels(n, source, sink)
+    while phase.1 {
+        var next: [i64] = []
+        for _i in 0..n.out.len() {
+            next.push(0)
+        }
+        var sent = push(n, source, sink, 1000000000000, phase.0, next)
+        while sent > 0 {
+            total = total + sent
+            sent = push(n, source, sink, 1000000000000, phase.0, next)
+        }
+        phase = levels(n, source, sink)
+    }
+    return total
+}
+
+/// The vertices on the source's side of a minimum cut.
+///
+/// Run after `max_flow`: they are the vertices still reachable through
+/// unsaturated edges, and the theorem says the edges leaving them are a
+/// minimum cut.
+pub fn source_side(n: FlowNetwork, source: i64) -> [i64] {
+    var seen: [bool] = []
+    for _i in 0..n.out.len() {
+        seen.push(false)
+    }
+    seen[source] = true
+    var queue = [source]
+    var at = 0
+    while at < queue.len() {
+        let v = queue[at]
+        at = at + 1
+        for index in n.out[v] {
+            let e = n.edges[index]
+            if spare(e) > 0 and not seen[e.to] {
+                seen[e.to] = true
+                queue.push(e.to)
+            }
+        }
+    }
+    var out: [i64] = []
+    var i = 0
+    while i < seen.len() {
+        if seen[i] {
+            out.push(i)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+/// The edges of a minimum cut, as `(from, to, capacity)`.
+///
+/// The bottleneck itself: the pipes that would have to be widened for more to
+/// get through. Their capacities sum to the maximum flow, which is the
+/// theorem stated as an equation and a good assertion to keep.
+pub fn min_cut(n: FlowNetwork, source: i64) -> [(i64, i64, i64)] {
+    let side = source_side(n, source)
+    var inside: [bool] = []
+    for _i in 0..n.out.len() {
+        inside.push(false)
+    }
+    for v in side {
+        inside[v] = true
+    }
+    var out: [(i64, i64, i64)] = []
+    var v = 0
+    while v < n.out.len() {
+        if inside[v] {
+            for index in n.out[v] {
+                let e = n.edges[index]
+                // Only the original edges, not the reverse ones added
+                // alongside them.
+                if e.capacity > 0 and not inside[e.to] {
+                    out.push((v, e.to, e.capacity))
+                }
+            }
+        }
+        v = v + 1
+    }
+    return out
+}
+
+/// The flow on each original edge, in the order they were added.
+pub fn flows(n: FlowNetwork) -> [(i64, i64, i64)] {
+    var out: [(i64, i64, i64)] = []
+    var v = 0
+    while v < n.out.len() {
+        for index in n.out[v] {
+            let e = n.edges[index]
+            if e.capacity > 0 and index % 2 == 0 {
+                out.push((v, e.to, e.flow))
+            }
+        }
+        v = v + 1
+    }
+    return out
+}
+
+/// Whether the flow is a valid one: conserved everywhere but the ends, and
+/// never over capacity.
+///
+/// Worth asserting rather than trusting. A max-flow implementation with a
+/// residual bug produces a number that is too large and a flow that does not
+/// conserve, and only the second is visible.
+pub fn is_valid_flow(n: FlowNetwork, source: i64, sink: i64) -> bool {
+    var balance: [i64] = []
+    for _i in 0..n.out.len() {
+        balance.push(0)
+    }
+    var index = 0
+    while index < n.edges.len() {
+        let e = n.edges[index]
+        if e.flow > e.capacity {
+            return false
+        }
+        index = index + 1
+    }
+    var v = 0
+    while v < n.out.len() {
+        for i in n.out[v] {
+            let e = n.edges[i]
+            if e.capacity > 0 {
+                balance[v] = balance[v] - e.flow
+                balance[e.to] = balance[e.to] + e.flow
+            }
+        }
+        v = v + 1
+    }
+    v = 0
+    while v < n.out.len() {
+        if v != source and v != sink and balance[v] != 0 {
+            return false
+        }
+        v = v + 1
+    }
+    return true
+}

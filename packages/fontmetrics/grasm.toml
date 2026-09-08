@@ -1,0 +1,7 @@
+[package]
+name = "fontmetrics"
+version = "1.0.0"
+
+# Reads bytes the caller supplies. Opens nothing.
+capabilities = []
+

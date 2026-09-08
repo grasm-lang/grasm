@@ -1,0 +1,277 @@
+// A k-d tree over points in the plane: nearest neighbour, k nearest, and
+// everything inside a box or a circle.
+//
+// The problem it solves is "which of these ten thousand points is closest to
+// here", asked a million times. Linear search answers it in time proportional
+// to the point count each time; a k-d tree answers it in log time after one
+// sort, which is the difference between a map that responds and one that
+// does not.
+//
+// ## How it prunes, which is the whole idea
+//
+// Each level of the tree splits on one axis, alternating. Searching for a
+// nearest neighbour, the tree descends to the leaf the query falls in, and
+// then — on the way back up — asks of each sibling subtree: *could* anything
+// in it be closer than the best found so far? The answer is the distance
+// from the query to the splitting line, and if that is already further than
+// the current best, the whole subtree is skipped without looking inside.
+//
+// That test is the entire performance argument. Skip it and the search is a
+// slow linear scan with extra allocation.
+//
+// ## Where it stops helping
+//
+// In two dimensions a k-d tree is excellent. Past about ten dimensions it is
+// not: the volume of the query ball grows so fast relative to the cells that
+// almost no subtree can be pruned, and the search degenerates to a full scan
+// with pointer chasing on top. This is the curse of dimensionality and it is
+// not an implementation problem, which is why this one is two-dimensional and
+// says so rather than pretending to generalise.
+//
+// ## Building
+//
+// Split at the **median**, not the mean, and not the midpoint of the range.
+// The median gives a balanced tree whatever the distribution; the midpoint
+// gives a tree of depth n on clustered data, which is every real dataset.
+//
+// Checked against `scipy.spatial.KDTree` for nearest, k-nearest and radius
+// queries on random and clustered point sets.
+
+import geometry
+
+type KdNode = {
+    point: Vec2,
+    /// The caller's own index for the point, so a result can be traced back.
+    tag: i64,
+    /// 0 splits on x, 1 on y.
+    axis: i64,
+    /// Indices into the tree's node list; -1 for none.
+    left: i64,
+    right: i64,
+}
+
+type KdTree = { nodes: [KdNode], root: i64 }
+
+type KdError = | NoPoints()
+
+pub fn empty() -> KdTree {
+    return KdTree{ nodes: [], root: 0 - 1 }
+}
+
+pub fn size(t: KdTree) -> i64 {
+    return t.nodes.len()
+}
+
+/// Build a tree over the points, tagged by their position in the list.
+pub fn build(points: [Vec2]) -> KdTree {
+    var indices: [i64] = []
+    var i = 0
+    while i < points.len() {
+        indices.push(i)
+        i = i + 1
+    }
+    var t = empty()
+    t.root = insert_range(t, points, indices, 0)
+    return t
+}
+
+/// One level: take the median on this axis, then recurse either side.
+fn insert_range(inout t: KdTree, points: [Vec2], indices: [i64],
+    depth: i64) -> i64 {
+    if indices.len() == 0 {
+        return 0 - 1
+    }
+    let axis = depth % 2
+    var sorted = indices
+    if axis == 0 {
+        sorted.sort_by(|i| points[i].x)
+    } else {
+        sorted.sort_by(|i| points[i].y)
+    }
+    let middle = sorted.len() / 2
+    let here = sorted[middle]
+    t.nodes.push(KdNode{ point: points[here], tag: here, axis: axis,
+        left: 0 - 1, right: 0 - 1 })
+    let at = t.nodes.len() - 1
+    let left = insert_range(t, points, sorted.slice(0, middle), depth + 1)
+    let right = insert_range(t, points,
+        sorted.slice(middle + 1, sorted.len()), depth + 1)
+    var node = t.nodes[at]
+    node.left = left
+    node.right = right
+    t.nodes[at] = node
+    return at
+}
+
+fn coordinate(p: Vec2, axis: i64) -> f64 {
+    if axis == 0 {
+        return p.x
+    }
+    return p.y
+}
+
+/// The nearest point to `query`, and its squared distance.
+///
+/// Squared, because comparing distances never needs the square root and
+/// taking it in the inner loop is the commonest way a nearest-neighbour
+/// search ends up slower than the scan it replaced.
+pub fn nearest(t: KdTree, query: Vec2) -> (i64, f64) {
+    if t.root < 0 {
+        return (0 - 1, 0.0)
+    }
+    var best = 0 - 1
+    var best_distance = 0.0
+    search_nearest(t, t.root, query, best, best_distance)
+    return (best, best_distance)
+}
+
+fn search_nearest(t: KdTree, at: i64, query: Vec2, inout best: i64,
+    inout best_distance: f64) {
+    if at < 0 {
+        return
+    }
+    let node = t.nodes[at]
+    let d = geometry.distance_squared(node.point, query)
+    if best < 0 or d < best_distance {
+        best = node.tag
+        best_distance = d
+    }
+    let offset = coordinate(query, node.axis) -
+    coordinate(node.point, node.axis)
+    var near = node.left
+    var far = node.right
+    if offset > 0.0 {
+        near = node.right
+        far = node.left
+    }
+    search_nearest(t, near, query, best, best_distance)
+    // The far side can only hold something closer if the splitting line
+    // itself is closer than the best so far.
+    if offset * offset < best_distance or best < 0 {
+        search_nearest(t, far, query, best, best_distance)
+    }
+}
+
+/// The `k` nearest points, closest first, as tags with squared distances.
+pub fn nearest_k(t: KdTree, query: Vec2, k: i64) -> [(i64, f64)] {
+    var found: [(i64, f64)] = []
+    if t.root < 0 or k <= 0 {
+        return found
+    }
+    search_k(t, t.root, query, k, found)
+    found.sort_by(|p| p.1)
+    if found.len() > k {
+        return found.slice(0, k)
+    }
+    return found
+}
+
+fn search_k(t: KdTree, at: i64, query: Vec2, k: i64,
+    inout found: [(i64, f64)]) {
+    if at < 0 {
+        return
+    }
+    let node = t.nodes[at]
+    let d = geometry.distance_squared(node.point, query)
+    found.push((node.tag, d))
+    // Keeping the list trimmed is what bounds the pruning radius; letting it
+    // grow turns the search into a scan.
+    if found.len() > k * 2 {
+        found.sort_by(|p| p.1)
+        found = found.slice(0, k)
+    }
+    let offset = coordinate(query, node.axis) -
+    coordinate(node.point, node.axis)
+    var near = node.left
+    var far = node.right
+    if offset > 0.0 {
+        near = node.right
+        far = node.left
+    }
+    search_k(t, near, query, k, found)
+    var bound = 0.0 - 1.0
+    if found.len() >= k {
+        var sorted = found
+        sorted.sort_by(|p| p.1)
+        bound = sorted[k - 1].1
+    }
+    if bound < 0.0 or offset * offset <= bound {
+        search_k(t, far, query, k, found)
+    }
+}
+
+/// Every point within `radius` of the query, in no particular order.
+pub fn within_radius(t: KdTree, query: Vec2, radius: f64) -> [i64] {
+    var out: [i64] = []
+    search_radius(t, t.root, query, radius * radius, out)
+    out.sort()
+    return out
+}
+
+fn search_radius(t: KdTree, at: i64, query: Vec2, radius_squared: f64,
+    inout out: [i64]) {
+    if at < 0 {
+        return
+    }
+    let node = t.nodes[at]
+    if geometry.distance_squared(node.point, query) <= radius_squared {
+        out.push(node.tag)
+    }
+    let offset = coordinate(query, node.axis) -
+    coordinate(node.point, node.axis)
+    if offset <= 0.0 or offset * offset <= radius_squared {
+        search_radius(t, node.left, query, radius_squared, out)
+    }
+    if offset >= 0.0 or offset * offset <= radius_squared {
+        search_radius(t, node.right, query, radius_squared, out)
+    }
+}
+
+/// Every point inside an axis-aligned box.
+pub fn within_rect(t: KdTree, box: Rect) -> [i64] {
+    var out: [i64] = []
+    search_rect(t, t.root, box, out)
+    out.sort()
+    return out
+}
+
+fn search_rect(t: KdTree, at: i64, box: Rect, inout out: [i64]) {
+    if at < 0 {
+        return
+    }
+    let node = t.nodes[at]
+    if geometry.rect_holds(box, node.point) {
+        out.push(node.tag)
+    }
+    let low = if node.axis == 0 { box.x } else { box.y }
+    let high = low + (if node.axis == 0 { box.w } else { box.h })
+    let split = coordinate(node.point, node.axis)
+    if low <= split {
+        search_rect(t, node.left, box, out)
+    }
+    if high >= split {
+        search_rect(t, node.right, box, out)
+    }
+}
+
+/// How deep the tree is — a balanced tree over n points is about log2(n).
+///
+/// Worth checking once on real data: a depth far above that means the points
+/// are degenerate in a way the median split could not fix, and the queries
+/// will be slow for a reason no profile makes obvious.
+pub fn depth(t: KdTree) -> i64 {
+    return depth_from(t, t.root)
+}
+
+fn depth_from(t: KdTree, at: i64) -> i64 {
+    if at < 0 {
+        return 0
+    }
+    let node = t.nodes[at]
+    let left = depth_from(t, node.left)
+    let right = depth_from(t, node.right)
+    if left > right {
+        return left + 1
+    }
+    return right + 1
+}

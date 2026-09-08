@@ -1,0 +1,273 @@
+// How wide a glyph is, how tall a line is, and where the baseline sits.
+//
+// Everything a layout engine needs before it can place anything, spread
+// across four tables because the format grew: `head` has the design grid,
+// `hhea` and `hmtx` the widths, and `OS/2` a second and contradictory set of
+// vertical metrics.
+//
+// ## Units per em, and why every number is relative
+//
+// A font's coordinates are in design units, and `unitsPerEm` says how many of
+// them make one em. It is 1000 in a PostScript font and 2048 in a TrueType
+// one, and it is not always a power of two. A width in design units means
+// nothing until it is divided by it: the same advance of 1229 is half an em
+// in one font and most of an em in another.
+//
+// ## The three answers to "how tall is a line"
+//
+// `hhea` has an ascender, a descender and a line gap. `OS/2` has
+// `sTypoAscender`, `sTypoDescender` and `sTypoLineGap` — and *also*
+// `usWinAscent` and `usWinDescent`, which are a clipping box rather than
+// metrics. The three disagree in most fonts, sometimes by a lot.
+//
+// There is no correct one; there is only what a given renderer uses.
+// Historically Windows used the `usWin` pair, macOS used `hhea`, and modern
+// engines use the `sTypo` values when the `USE_TYPO_METRICS` flag is set.
+// That flag is bit 7 of `fsSelection`, and reading it is the difference
+// between a line height that matches the designer's intent and one that does
+// not. `line_height` reports all three so a caller can see the spread.
+//
+// ## The last advance width, repeated
+//
+// `hmtx` stores `numberOfHMetrics` advance widths and then *only* left side
+// bearings for the remaining glyphs, which all share the final advance. It is
+// a compression trick for monospaced tails, and a reader that indexes the
+// array directly runs off the end for any glyph past the count.
+//
+// Checked against `fontTools` for the metrics of system fonts: units per em,
+// every advance width, the three line heights and the flag that chooses
+// between them.
+
+type FontHead = {
+    units_per_em: i64,
+    /// The bounding box of every glyph, in design units.
+    x_min: i64,
+    y_min: i64,
+    x_max: i64,
+    y_max: i64,
+    /// 0 for short `loca` offsets, 1 for long — which the `glyf` reader
+    /// needs and which nothing else says.
+    long_loca: bool,
+}
+
+type LineMetrics = {
+    ascender: i64,
+    descender: i64,
+    line_gap: i64,
+}
+
+type MetricsError =
+    | MissingTable(tag: str)
+    | TooShort(tag: str)
+    | NoSuchGlyph(glyph: i64)
+
+fn read16(data: bytes, at: i64) -> i64 {
+    if at + 2 > data.len() {
+        return 0
+    }
+    return data.at(at).shl(8).bit_or(data.at(at + 1))
+}
+
+/// A signed 16-bit value, which most metrics are.
+fn read_signed16(data: bytes, at: i64) -> i64 {
+    let value = read16(data, at)
+    if value >= 32768 {
+        return value - 65536
+    }
+    return value
+}
+
+fn read32(data: bytes, at: i64) -> i64 {
+    if at + 4 > data.len() {
+        return 0
+    }
+    return data.at(at).shl(24).bit_or(data.at(at + 1).shl(16))
+        .bit_or(data.at(at + 2).shl(8)).bit_or(data.at(at + 3))
+}
+
+pub fn parse_head(data: bytes) -> FontHead ! MetricsError {
+    if data.len() < 54 {
+        fail(TooShort("head"))
+    }
+    return FontHead{
+        units_per_em: read16(data, 18),
+        x_min: read_signed16(data, 36),
+        y_min: read_signed16(data, 38),
+        x_max: read_signed16(data, 40),
+        y_max: read_signed16(data, 42),
+        long_loca: read16(data, 50) == 1,
+    }
+}
+
+/// The vertical metrics from `hhea`.
+pub fn parse_hhea(data: bytes) -> LineMetrics ! MetricsError {
+    if data.len() < 36 {
+        fail(TooShort("hhea"))
+    }
+    return LineMetrics{
+        ascender: read_signed16(data, 4),
+        descender: read_signed16(data, 6),
+        line_gap: read_signed16(data, 8),
+    }
+}
+
+/// How many glyphs have their own advance width in `hmtx`.
+pub fn number_of_h_metrics(hhea: bytes) -> i64 {
+    return read16(hhea, 34)
+}
+
+/// The typographic metrics from `OS/2`, which are a different set.
+pub fn parse_typo_metrics(os2: bytes) -> LineMetrics ! MetricsError {
+    if os2.len() < 78 {
+        fail(TooShort("OS/2"))
+    }
+    return LineMetrics{
+        ascender: read_signed16(os2, 68),
+        descender: read_signed16(os2, 70),
+        line_gap: read_signed16(os2, 72),
+    }
+}
+
+/// The Windows clipping box from `OS/2`, which is not metrics.
+pub fn parse_win_metrics(os2: bytes) -> LineMetrics ! MetricsError {
+    if os2.len() < 78 {
+        fail(TooShort("OS/2"))
+    }
+    return LineMetrics{
+        ascender: read16(os2, 74),
+        descender: 0 - read16(os2, 76),
+        line_gap: 0,
+    }
+}
+
+/// Whether the font asks renderers to use its typographic metrics.
+///
+/// Bit 7 of `fsSelection`. When it is set the `sTypo` values are the
+/// designer's intent and the `usWin` pair is a clipping box; when it is
+/// clear, most engines fall back to `usWin` and the line height changes.
+pub fn uses_typo_metrics(os2: bytes) -> bool {
+    if os2.len() < 64 {
+        return false
+    }
+    return read16(os2, 62).bit_and(128) != 0
+}
+
+/// The advance width and left side bearing of one glyph.
+///
+/// Past `numberOfHMetrics` the advance is the last one listed and only the
+/// bearing is stored — the compression that catches every reader that indexes
+/// the array directly.
+pub fn glyph_metrics(hmtx: bytes, count: i64,
+    glyph: i64) -> (i64, i64) ! MetricsError {
+    if glyph < 0 or count <= 0 {
+        fail(NoSuchGlyph(glyph))
+    }
+    if glyph < count {
+        return (read16(hmtx, glyph * 4),
+            read_signed16(hmtx, glyph * 4 + 2))
+    }
+    let advance = read16(hmtx, (count - 1) * 4)
+    let at = count * 4 + (glyph - count) * 2
+    if at + 2 > hmtx.len() {
+        fail(NoSuchGlyph(glyph))
+    }
+    return (advance, read_signed16(hmtx, at))
+}
+
+pub fn advance_width(hmtx: bytes, count: i64,
+    glyph: i64) -> i64 ! MetricsError {
+    let pair = try glyph_metrics(hmtx, count, glyph)
+    return pair.0
+}
+
+/// The width of a run of glyphs, in design units.
+pub fn run_width(hmtx: bytes, count: i64, glyphs: [i64]) -> i64 {
+    var total = 0
+    for g in glyphs {
+        total = total + (advance_width(hmtx, count, g) ?? 0)
+    }
+    return total
+}
+
+/// The same at a point size, which is what a layout wants.
+///
+/// Design units divided by units per em, times the size. Everything about a
+/// font's measurements is this division, and doing it once at the end rather
+/// than per glyph is what keeps the rounding out of the total.
+pub fn scale_to(value: i64, units_per_em: i64, size: f64) -> f64 {
+    if units_per_em == 0 {
+        return 0.0
+    }
+    return value.as_f64() * size / units_per_em.as_f64()
+}
+
+/// Line height from a set of metrics: ascender minus descender plus gap.
+///
+/// The descender is negative in every well-formed font, which is why this is
+/// a subtraction and why a font with a positive descender produces lines that
+/// overlap.
+pub fn line_height(metrics: LineMetrics) -> i64 {
+    return metrics.ascender - metrics.descender + metrics.line_gap
+}
+
+/// The three line heights a font offers, which usually differ.
+///
+/// Returned together because the disagreement is the point: a caller seeing
+/// three different numbers knows why the same text is a different height in
+/// two browsers.
+pub fn all_line_heights(hhea: bytes,
+    os2: bytes) -> (i64, i64, i64) ! MetricsError {
+    let h = try parse_hhea(hhea)
+    let typo = try parse_typo_metrics(os2)
+    let win = try parse_win_metrics(os2)
+    return (line_height(h), line_height(typo), line_height(win))
+}
+
+/// The metrics a modern renderer will use.
+pub fn preferred_metrics(hhea: bytes,
+    os2: bytes) -> LineMetrics ! MetricsError {
+    if uses_typo_metrics(os2) {
+        return try parse_typo_metrics(os2)
+    }
+    return try parse_hhea(hhea)
+}
+
+/// Whether every glyph has the same advance — a monospaced font.
+///
+/// Not the same as the `post` table's `isFixedPitch` flag, which is set by
+/// hand and is wrong in plenty of fonts. This measures it.
+pub fn is_monospaced(hmtx: bytes, count: i64, glyphs: i64) -> bool {
+    if glyphs < 2 or count < 2 {
+        return false
+    }
+    var first = 0 - 1
+    var g = 0
+    while g < glyphs {
+        let advance = advance_width(hmtx, count, g) ?? 0
+        // Glyph 0 is `.notdef` and a zero-width glyph is a combining mark;
+        // neither says anything about the font's pitch.
+        if advance == 0 {
+            g = g + 1
+            continue
+        }
+        if first < 0 {
+            first = advance
+        } else {
+            if advance != first {
+                return false
+            }
+        }
+        g = g + 1
+    }
+    return first > 0
+}
+
+/// The number of glyphs, from `maxp`.
+pub fn glyph_count(maxp: bytes) -> i64 {
+    return read16(maxp, 4)
+}
+
+/// The font's revision, as the fixed-point number `head` stores.
+pub fn font_revision(head: bytes) -> f64 {
+    return read32(head, 4).as_f64() / 65536.0
+}

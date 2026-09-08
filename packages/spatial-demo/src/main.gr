@@ -1,0 +1,302 @@
+import convexhull
+import kdtree
+import rtree
+import simplify
+import triangulate
+import geometry
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn near(a: f64, b: f64) -> bool {
+    let d = a - b
+    return d < 0.000000001 and d > 0.0 - 0.000000001
+}
+
+fn p(x: f64, y: f64) -> Vec2 {
+    return geometry.point(x, y)
+}
+
+/// A square with points on its edges, at its centre, and inside.
+fn sample() -> [Vec2] {
+    return [p(0.0, 0.0), p(4.0, 0.0), p(4.0, 4.0), p(0.0, 4.0), p(2.0, 2.0),
+        p(1.0, 3.0), p(3.0, 1.0), p(2.0, 0.0), p(0.0, 2.0), p(4.0, 2.0)]
+}
+
+fn line() -> [Vec2] {
+    return [p(0.0, 0.0), p(1.0, 0.1), p(2.0, 0.0 - 0.1), p(3.0, 5.0),
+        p(4.0, 6.0), p(5.0, 7.0), p(6.0, 8.1), p(7.0, 9.0), p(8.0, 9.0),
+        p(9.0, 9.0)]
+}
+
+// ----------------------------------------------------------- convexhull
+
+fn check_convexhull(inout f: i64) / {io} {
+    print("-- convexhull: a rubber band, and what it does with a point on it")
+    let points = sample()
+    // `scipy.spatial.ConvexHull` reports the same four vertices and the same
+    // area and perimeter for this set.
+    say(f, "the hull of a filled square is its four corners",
+        convexhull.hull(points).len() == 4 and
+        near(convexhull.hull_area(points), 16.0) and
+        near(convexhull.hull_perimeter(points), 16.0))
+    say(f, "points on an edge are dropped, and kept when asked for",
+        convexhull.hull_with_collinear(points).len() == 7)
+    say(f, "the hull turns counter-clockwise",
+        convexhull.is_convex(convexhull.hull(points)) and
+        geometry.polygon_area(convexhull.hull(points)) > 0.0)
+    let d = convexhull.diameter(points)
+    say(f, "the two points furthest apart are opposite corners",
+        near(d.2, 5.656854249492381))
+    say(f, "the narrowest strip the square fits in is its own width",
+        near(convexhull.width(points), 4.0))
+    let rect = convexhull.minimum_bounding_rect(points)
+    say(f, "and its smallest bounding rectangle is the square itself",
+        rect.len() == 4 and near(geometry.polygon_area(rect), 16.0) or
+        near(0.0 - geometry.polygon_area(rect), 16.0))
+    say(f, "a point inside is inside and one outside is not",
+        convexhull.hull_holds(convexhull.hull(points), p(2.0, 2.0)) and
+        not convexhull.hull_holds(convexhull.hull(points),
+            p(5.0, 5.0)))
+    // Qhull raises on this input; a segment is a perfectly good hull.
+    var collinear: [Vec2] = []
+    for i in 0..10 {
+        collinear.push(p(i.as_f64(), i.as_f64()))
+    }
+    say(f, "collinear points have a hull, even though Qhull refuses them",
+        convexhull.hull(collinear).len() == 2 and
+        near(convexhull.hull_area(collinear), 0.0))
+    say(f, "duplicates collapse rather than becoming vertices",
+        convexhull.hull([p(1.0, 1.0), p(1.0, 1.0), p(1.0, 1.0),
+            p(5.0, 1.0), p(5.0, 5.0), p(1.0, 5.0)]).len() == 4)
+    say(f, "the exact predicate settles what floating point cannot",
+        convexhull.orientation_exact(0, 0, 1000000, 1000000, 2000000,
+            2000000) == 0 and
+        convexhull.orientation_exact(0, 0, 1000000, 1000000, 2000000,
+            2000001) == 1)
+}
+
+// --------------------------------------------------------------- kdtree
+
+fn check_kdtree(inout f: i64) / {io} {
+    print("-- kdtree: prune the far subtree, or it is a slow linear scan")
+    let points = sample()
+    let t = kdtree.build(points)
+    say(f, "every point is in the tree, and it is balanced",
+        kdtree.size(t) == 10 and kdtree.depth(t) == 4)
+    // Every one of these is `scipy.spatial.KDTree`'s answer for the same set.
+    let a = kdtree.nearest(t, p(2.1, 2.1))
+    say(f, "the nearest point to the middle is the one in the middle",
+        a.0 == 4 and near(a.1, 0.02))
+    let b = kdtree.nearest(t, p(0.0, 0.0))
+    say(f, "a query on a point finds that point at distance zero",
+        b.0 == 0 and near(b.1, 0.0))
+    let c = kdtree.nearest(t, p(3.9, 0.1))
+    say(f, "and a query near a corner finds the corner",
+        c.0 == 1 and near(c.1, 0.02))
+    var three: [i64] = []
+    for pair in kdtree.nearest_k(t, p(2.1, 2.1), 3) {
+        three.push(pair.0)
+    }
+    say(f, "the three nearest come back closest first",
+        three.len() == 3 and three[0] == 4 and three[1] == 6 and
+        three[2] == 5)
+    say(f, "a radius query returns everything inside and nothing outside",
+        kdtree.within_radius(t, p(2.0, 2.0), 1.5).len() == 3 and
+        kdtree.within_radius(t, p(2.0, 2.0), 1.5)[0] == 4)
+    say(f, "asking for more neighbours than exist returns what there is",
+        kdtree.nearest_k(t, p(0.0, 0.0), 50).len() == 10)
+    say(f, "a box query is the same search with a different bound",
+        kdtree.within_rect(t, geometry.rect(0.0 - 0.5, 0.0 - 0.5, 1.0,
+            1.0)).len() == 1)
+    let empty = kdtree.build([])
+    say(f, "an empty tree answers rather than failing",
+        kdtree.nearest(empty, p(0.0, 0.0)).0 == 0 - 1 and
+        kdtree.size(empty) == 0)
+}
+
+// ---------------------------------------------------------------- rtree
+
+fn boxes() -> [RtreeEntry] {
+    return [
+        rtree.entry(geometry.rect(0.0, 0.0, 2.0, 2.0), 0),
+        rtree.entry(geometry.rect(1.0, 1.0, 2.0, 2.0), 1),
+        rtree.entry(geometry.rect(5.0, 5.0, 1.0, 1.0), 2),
+        rtree.entry(geometry.rect(0.0, 5.0, 3.0, 1.0), 3),
+        rtree.entry(geometry.rect(8.0, 0.0, 1.0, 9.0), 4),
+    ]
+}
+
+fn check_rtree(inout f: i64) / {io} {
+    print("-- rtree: an index over boxes, which returns candidates")
+    let t = rtree.build(boxes(), 2)
+    say(f, "every box is indexed", rtree.size(t) == 5)
+    // `shapely.STRtree` returns exactly these sets for the same windows.
+    say(f, "a window over two overlapping boxes finds both",
+        rtree.search(t, geometry.rect(0.0, 0.0, 1.0, 1.0)).len() == 2)
+    say(f, "one over an isolated box finds only it",
+        rtree.search(t, geometry.rect(4.0, 4.0, 3.0, 3.0)).len() == 1 and
+        rtree.search(t, geometry.rect(4.0, 4.0, 3.0, 3.0))[0] == 2)
+    say(f, "and one over a tall thin box finds that",
+        rtree.search(t, geometry.rect(8.0, 8.0, 1.0, 1.0))[0] == 4)
+    say(f, "a window over everything finds everything",
+        rtree.search(t, geometry.rect(0.0, 0.0, 100.0, 100.0)).len() == 5)
+    say(f, "a point query is a window of no size",
+        rtree.search_point(t, p(1.5, 1.5)).len() == 2)
+    say(f, "the index knows the box that contains it all",
+        near(bounds_area(t), 81.0))
+    say(f, "an empty index is empty rather than broken",
+        rtree.search(rtree.empty(), geometry.rect(0.0, 0.0, 1.0, 1.0))
+            .len() == 0 and refuses_empty_bounds())
+    say(f, "overlap between sibling boxes is measurable",
+        rtree.overlap_ratio(t) >= 0.0)
+}
+
+fn bounds_area(t: Rtree) -> f64 {
+    let b: Rect ! RtreeError = rtree.bounds(t)
+    return geometry.rect_area(b ?? geometry.rect(0.0, 0.0, 0.0, 0.0))
+}
+
+fn refuses_empty_bounds() -> bool {
+    match rtree.bounds(rtree.empty()) {
+        Ok(_b) -> {
+            return false
+        }
+        Err(_e) -> {
+            return true
+        }
+    }
+}
+
+// ------------------------------------------------------------- simplify
+
+fn check_simplify(inout f: i64) / {io} {
+    print("-- simplify: a distance guarantee, or a look")
+    let path = line()
+    // `shapely.simplify` produces exactly these points at these tolerances.
+    let half = simplify.douglas_peucker(path, 0.5)
+    say(f, "Douglas-Peucker at 0.5 keeps five points",
+        half.len() == 5 and near(half[1].x, 2.0) and
+        near(half[1].y, 0.0 - 0.1) and near(half[2].x, 3.0))
+    say(f, "and at 2.0 keeps only the ends",
+        simplify.douglas_peucker(path, 2.0).len() == 2)
+    say(f, "the guarantee is measurable, and it holds",
+        simplify.maximum_deviation(path, half) <= 0.5)
+    say(f, "Visvalingam-Whyatt takes a count rather than a distance",
+        simplify.visvalingam(path, 5).len() == 5 and
+        simplify.visvalingam(path, 3).len() == 3)
+    say(f, "asking for more points than exist changes nothing",
+        simplify.visvalingam(path, 50).len() == 10)
+    say(f, "and asking by area removes the flattest corners first",
+        simplify.visvalingam_by_area(path, 0.05).len() < 10)
+    say(f, "thinning by distance drops points that stood still",
+        simplify.thin_by_distance([p(0.0, 0.0), p(0.0, 0.01), p(0.0, 0.02),
+            p(5.0, 0.0)], 1.0).len() == 2)
+    say(f, "a path that crosses itself is found",
+        not simplify.is_simple([p(0.0, 0.0), p(4.0, 4.0), p(4.0, 0.0),
+            p(0.0, 4.0)]) and simplify.is_simple(path))
+    say(f, "the perpendicular distance is to the line, not the segment",
+        near(simplify.perpendicular_distance(p(5.0, 1.0), p(0.0, 0.0),
+            p(1.0, 0.0)), 1.0))
+    say(f, "a path of two points is already as short as it goes",
+        simplify.douglas_peucker([p(0.0, 0.0), p(1.0, 1.0)], 0.1).len() == 2)
+}
+
+// ---------------------------------------------------------- triangulate
+
+fn square() -> [Vec2] {
+    return [p(0.0, 0.0), p(10.0, 0.0), p(10.0, 10.0), p(0.0, 10.0)]
+}
+
+fn concave() -> [Vec2] {
+    return [p(0.0, 0.0), p(10.0, 0.0), p(10.0, 10.0), p(5.0, 4.0),
+        p(0.0, 10.0)]
+}
+
+fn comb() -> [Vec2] {
+    return [p(0.0, 0.0), p(10.0, 0.0), p(10.0, 3.0), p(8.0, 3.0),
+        p(8.0, 1.0), p(6.0, 1.0), p(6.0, 3.0), p(4.0, 3.0), p(4.0, 1.0),
+        p(2.0, 1.0), p(2.0, 3.0), p(0.0, 3.0)]
+}
+
+fn check_triangulate(inout f: i64) / {io} {
+    print("-- triangulate: n minus two triangles, all of them inside")
+    // The triangle counts are `mapbox_earcut`'s and the areas are shapely's.
+    say(f, "a square is two triangles covering its area",
+        count_and_area(square(), 2, 100.0))
+    say(f, "a concave pentagon is three, and none of them stick out",
+        count_and_area(concave(), 3, 70.0))
+    say(f, "a comb with five teeth is ten",
+        count_and_area(comb(), 10, 22.0))
+    say(f, "the count is always two fewer than the vertices",
+        triangle_count(square()) == 2 and triangle_count(concave()) == 3 and
+        triangle_count(comb()) == 10)
+    say(f, "a clockwise polygon triangulates the same as a counter-clockwise",
+        count_and_area(square().rev(), 2, 100.0))
+    say(f, "a self-intersecting outline is refused, not guessed at",
+        refuses([p(0.0, 0.0), p(4.0, 4.0), p(4.0, 0.0), p(0.0, 4.0)]))
+    say(f, "and so is a shape with fewer than three corners",
+        refuses([p(0.0, 0.0), p(1.0, 1.0)]))
+    say(f, "orientation is reported rather than assumed",
+        triangulate.is_counter_clockwise(square()) and
+        not triangulate.is_counter_clockwise(square().rev()) and
+        near(triangulate.signed_area(square()), 100.0))
+    let bridged = triangulate.bridge_hole(square(),
+        [p(3.0, 3.0), p(7.0, 3.0), p(7.0, 7.0), p(3.0, 7.0)])
+    // The bridge is two coincident edges, so the ring is deliberately not
+    // simple and the check has to be skipped rather than passed.
+    let holed: [(i64, i64, i64)] ! TriangulateError =
+    triangulate.triangles_unchecked(bridged)
+    let ts = holed ?? []
+    say(f, "a hole is bridged into one boundary, and the area is the rest",
+        bridged.len() == 10 and near(triangulate.signed_area(bridged), 84.0)
+        and ts.len() == 8 and
+        near(triangulate.covered_area(bridged, ts), 84.0))
+    say(f, "and that ring is not simple, which is why the check is skipped",
+        not triangulate.is_simple(bridged) and refuses(bridged))
+}
+
+fn triangle_count(polygon: [Vec2]) -> i64 {
+    let ts: [(i64, i64, i64)] ! TriangulateError =
+    triangulate.triangles(polygon)
+    return (ts ?? []).len()
+}
+
+fn count_and_area(polygon: [Vec2], count: i64, area: f64) -> bool {
+    let ts: [(i64, i64, i64)] ! TriangulateError =
+    triangulate.triangles(polygon)
+    let list = ts ?? []
+    return list.len() == count and
+    near(triangulate.covered_area(polygon, list), area)
+}
+
+fn refuses(polygon: [Vec2]) -> bool {
+    match triangulate.triangles(polygon) {
+        Ok(_t) -> {
+            return false
+        }
+        Err(_e) -> {
+            return true
+        }
+    }
+}
+
+fn main() / {io} {
+    var f = 0
+    check_convexhull(f)
+    check_kdtree(f)
+    check_rtree(f)
+    check_simplify(f)
+    check_triangulate(f)
+    if f == 0 {
+        print("spatial: every claim held")
+    } else {
+        print("spatial: {f} claims failed")
+    }
+}

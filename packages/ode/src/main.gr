@@ -1,0 +1,333 @@
+// Solving y' = f(t, y): stepping a differential equation forward in time.
+//
+// Orbits, populations, circuits, chemical reactions, anything with a rate.
+// The equation says how fast the state changes and the solver turns that into
+// where the state goes.
+//
+// ## Why Euler's method is only ever a teaching aid
+//
+// Euler takes the slope at the current point and follows it for a whole step.
+// Its error per step is proportional to h², so over a fixed interval the
+// total error is proportional to h: halving the step halves the error. To get
+// six digits it needs a million steps, and each one adds rounding.
+//
+// Runge-Kutta of fourth order evaluates the slope four times per step —
+// beginning, twice in the middle, end — and combines them so that four orders
+// of the Taylor expansion cancel. The error is proportional to h⁴: halving the
+// step improves it *sixteenfold*. Four evaluations buy three extra orders,
+// which is why RK4 is the classical default and Euler is not a default at all.
+//
+// ## Adaptive stepping, and the free error estimate
+//
+// A fixed step is either wasteful where the solution is smooth or wrong where
+// it is not. Dormand-Prince computes a fifth-order answer *and* a
+// fourth-order one from the same seven evaluations; their difference
+// estimates the error, and the step is shrunk or grown to keep it near a
+// target. Almost all of an adaptive solver's evaluations end up where the
+// solution is doing something.
+//
+// ## Stiffness, which none of these handle
+//
+// A stiff system has processes on wildly different timescales — a fast
+// transient that dies out and a slow evolution that matters. An explicit
+// method has to keep taking steps small enough for the *fast* process long
+// after it has stopped mattering, or the solution explodes. Cutting the step
+// by a thousand does not fix it; it is a property of the method, and the
+// answer is an implicit solver, which needs a Jacobian and a nonlinear solve
+// at every step. Everything here is explicit. `looks_stiff` exists to say so
+// rather than to let a caller watch the step size collapse and wonder.
+//
+// Checked against `scipy.integrate.solve_ivp` with RK45 on exponential decay,
+// on the harmonic oscillator, and on a two-body orbit where the conserved
+// energy is the real test.
+
+type OdeResult = {
+    /// The times reached.
+    t: [f64],
+    /// The state at each time.
+    y: [[f64]],
+    steps: i64,
+    /// Steps whose error was too large and were tried again smaller.
+    rejected: i64,
+    converged: bool,
+}
+
+type OdeError =
+    | StepTooSmall(t: f64)
+    | NoState()
+
+fn absolute(x: f64) -> f64 {
+    if x < 0.0 {
+        return 0.0 - x
+    }
+    return x
+}
+
+fn add_scaled(y: [f64], k: [f64], factor: f64) -> [f64] {
+    var out: [f64] = []
+    var i = 0
+    while i < y.len() {
+        out.push(y[i] + factor * k[i])
+        i = i + 1
+    }
+    return out
+}
+
+/// Euler's method, for comparison.
+pub fn euler(f: fn(f64, [f64]) -> [f64], t0: f64, y0: [f64], t1: f64,
+    steps: i64) -> OdeResult ! OdeError {
+    if y0.len() == 0 {
+        fail(NoState())
+    }
+    let h = (t1 - t0) / steps.as_f64()
+    var t = t0
+    var y = y0
+    var ts = [t]
+    var ys = [y]
+    var i = 0
+    while i < steps {
+        y = add_scaled(y, f(t, y), h)
+        t = t + h
+        ts.push(t)
+        ys.push(y)
+        i = i + 1
+    }
+    return OdeResult{ t: ts, y: ys, steps: steps, rejected: 0,
+        converged: true }
+}
+
+/// Classical fourth-order Runge-Kutta at a fixed step.
+pub fn rk4(f: fn(f64, [f64]) -> [f64], t0: f64, y0: [f64], t1: f64,
+    steps: i64) -> OdeResult ! OdeError {
+    if y0.len() == 0 {
+        fail(NoState())
+    }
+    let h = (t1 - t0) / steps.as_f64()
+    var t = t0
+    var y = y0
+    var ts = [t]
+    var ys = [y]
+    var i = 0
+    while i < steps {
+        // Four slopes: the ends and the middle twice, weighted 1:2:2:1.
+        let k1 = f(t, y)
+        let k2 = f(t + h / 2.0, add_scaled(y, k1, h / 2.0))
+        let k3 = f(t + h / 2.0, add_scaled(y, k2, h / 2.0))
+        let k4 = f(t + h, add_scaled(y, k3, h))
+        var next: [f64] = []
+        var j = 0
+        while j < y.len() {
+            next.push(y[j] + h / 6.0 *
+                (k1[j] + 2.0 * k2[j] + 2.0 * k3[j] + k4[j]))
+            j = j + 1
+        }
+        y = next
+        t = t + h
+        ts.push(t)
+        ys.push(y)
+        i = i + 1
+    }
+    return OdeResult{ t: ts, y: ys, steps: steps, rejected: 0,
+        converged: true }
+}
+
+/// Dormand-Prince 5(4): seven slopes, two answers, one error estimate.
+///
+/// The step is accepted when the difference between the two answers is under
+/// tolerance and rejected otherwise; either way the next step size is chosen
+/// from the same number. The 0.9 safety factor stops it oscillating between
+/// accepting and rejecting the same step.
+pub fn rk45(f: fn(f64, [f64]) -> [f64], t0: f64, y0: [f64], t1: f64,
+    tolerance: f64, first_step: f64,
+    max_steps: i64) -> OdeResult ! OdeError {
+    if y0.len() == 0 {
+        fail(NoState())
+    }
+    var t = t0
+    var y = y0
+    var h = first_step
+    var ts = [t]
+    var ys = [y]
+    var accepted = 0
+    var rejected = 0
+    var converged = false
+    var guard = 0
+    while guard < max_steps {
+        guard = guard + 1
+        if t + h > t1 {
+            h = t1 - t
+        }
+        if h <= 0.0 {
+            converged = true
+            break
+        }
+        let k1 = f(t, y)
+        let k2 = f(t + h / 5.0, add_scaled(y, k1, h / 5.0))
+        let k3 = f(t + 3.0 * h / 10.0,
+            combine(y, [k1, k2], [3.0 * h / 40.0, 9.0 * h / 40.0]))
+        let k4 = f(t + 4.0 * h / 5.0, combine(y, [k1, k2, k3],
+            [44.0 * h / 45.0, 0.0 - 56.0 * h / 15.0, 32.0 * h / 9.0]))
+        let k5 = f(t + 8.0 * h / 9.0, combine(y, [k1, k2, k3, k4],
+            [19372.0 * h / 6561.0, 0.0 - 25360.0 * h / 2187.0,
+                64448.0 * h / 6561.0, 0.0 - 212.0 * h / 729.0]))
+        let k6 = f(t + h, combine(y, [k1, k2, k3, k4, k5],
+            [9017.0 * h / 3168.0, 0.0 - 355.0 * h / 33.0,
+                46732.0 * h / 5247.0, 49.0 * h / 176.0,
+                0.0 - 5103.0 * h / 18656.0]))
+        let fifth = combine(y, [k1, k3, k4, k5, k6],
+            [35.0 * h / 384.0, 500.0 * h / 1113.0, 125.0 * h / 192.0,
+                0.0 - 2187.0 * h / 6784.0, 11.0 * h / 84.0])
+        let k7 = f(t + h, fifth)
+        let fourth = combine(y, [k1, k3, k4, k5, k6, k7],
+            [5179.0 * h / 57600.0, 7571.0 * h / 16695.0,
+                393.0 * h / 640.0, 0.0 - 92097.0 * h / 339200.0,
+                187.0 * h / 2100.0, h / 40.0])
+        var error = 0.0
+        var j = 0
+        while j < y.len() {
+            let d = absolute(fifth[j] - fourth[j])
+            if d > error {
+                error = d
+            }
+            j = j + 1
+        }
+        if error <= tolerance or h < 0.000000000001 {
+            t = t + h
+            y = fifth
+            ts.push(t)
+            ys.push(y)
+            accepted = accepted + 1
+            if t >= t1 - 0.000000000001 {
+                converged = true
+                break
+            }
+        } else {
+            rejected = rejected + 1
+        }
+        // The exponent is one over the order of the *lower* method plus one.
+        var factor = 5.0
+        if error > 0.0 {
+            factor = 0.9 * (tolerance / error).sqrt().sqrt().sqrt()
+            if factor < 0.2 {
+                factor = 0.2
+            }
+            if factor > 5.0 {
+                factor = 5.0
+            }
+        }
+        h = h * factor
+    }
+    return OdeResult{ t: ts, y: ys, steps: accepted, rejected: rejected,
+        converged: converged }
+}
+
+fn combine(y: [f64], ks: [[f64]], factors: [f64]) -> [f64] {
+    var out: [f64] = []
+    var i = 0
+    while i < y.len() {
+        var total = y[i]
+        var j = 0
+        while j < ks.len() and j < factors.len() {
+            total = total + factors[j] * ks[j][i]
+            j = j + 1
+        }
+        out.push(total)
+        i = i + 1
+    }
+    return out
+}
+
+/// The state at the end of a solution.
+pub fn final_state(result: OdeResult) -> [f64] {
+    if result.y.len() == 0 {
+        return []
+    }
+    return result.y[result.y.len() - 1]
+}
+
+/// A quantity the equation should conserve, sampled along the solution.
+///
+/// Energy, momentum, mass. The test that actually catches a wrong solver: a
+/// method can track the trajectory closely for a while and still drift a
+/// conserved quantity, and the drift is visible long before the trajectory
+/// looks wrong.
+pub fn conserved_drift(result: OdeResult,
+    quantity: fn([f64]) -> f64) -> f64 {
+    if result.y.len() == 0 {
+        return 0.0
+    }
+    let first = quantity(result.y[0])
+    var worst = 0.0
+    for state in result.y {
+        let d = absolute(quantity(state) - first)
+        if d > worst {
+            worst = d
+        }
+    }
+    return worst
+}
+
+/// Whether the step sizes collapsed, which is what stiffness looks like.
+///
+/// A solver spending most of its steps rejected, or taking steps orders of
+/// magnitude smaller than the interval, is not converging slowly — it is
+/// being held back by a fast process that stopped mattering. No explicit
+/// method fixes that.
+pub fn looks_stiff(result: OdeResult) -> bool {
+    if result.steps == 0 {
+        return true
+    }
+    if result.rejected > result.steps {
+        return true
+    }
+    if result.t.len() < 2 {
+        return false
+    }
+    let span = result.t[result.t.len() - 1] - result.t[0]
+    if span == 0.0 {
+        return false
+    }
+    return span / result.steps.as_f64() < span / 1000000.0
+}
+
+/// A solution sampled at even intervals, by linear interpolation.
+///
+/// An adaptive solver returns the times it chose, which are not the times
+/// anyone wants to plot. Interpolating linearly is cruder than the
+/// interpolant the method could provide, and is honest about it.
+pub fn sample(result: OdeResult, times: [f64]) -> [[f64]] {
+    var out: [[f64]] = []
+    for want in times {
+        out.push(interpolate(result, want))
+    }
+    return out
+}
+
+fn interpolate(result: OdeResult, want: f64) -> [f64] {
+    if result.t.len() == 0 {
+        return []
+    }
+    if want <= result.t[0] {
+        return result.y[0]
+    }
+    var i = 1
+    while i < result.t.len() {
+        if result.t[i] >= want {
+            let span = result.t[i] - result.t[i - 1]
+            if span == 0.0 {
+                return result.y[i]
+            }
+            let fraction = (want - result.t[i - 1]) / span
+            var out: [f64] = []
+            var j = 0
+            while j < result.y[i].len() {
+                out.push(result.y[i - 1][j] +
+                    fraction * (result.y[i][j] - result.y[i - 1][j]))
+                j = j + 1
+            }
+            return out
+        }
+        i = i + 1
+    }
+    return result.y[result.y.len() - 1]
+}

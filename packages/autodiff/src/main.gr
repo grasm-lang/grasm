@@ -1,0 +1,209 @@
+// Derivatives that are exact, by carrying them alongside the value.
+//
+// ## The three ways to get a derivative, and why this is the good one
+//
+// **Symbolically** — differentiate the expression and evaluate the result.
+// Correct, and the expression grows: differentiating a product twice gives
+// four terms, three times gives eight, and a moderately sized formula becomes
+// unusable.
+//
+// **Numerically** — evaluate at x and x+h and divide. Simple, and wrong in a
+// way that cannot be fixed: too large an h and the difference quotient is not
+// the derivative; too small and the subtraction cancels almost every
+// significant digit. The best possible h gives about half the digits of a
+// double, and finding it needs the second derivative you were trying to
+// avoid computing.
+//
+// **Automatically** — carry the derivative through every operation as the
+// value is computed. Exact to the last bit, one pass, and the code is the
+// chain rule written out once per operation. That is this.
+//
+// ## How it works
+//
+// A **dual number** is `a + b·e` where `e² = 0`. Multiply two of them and the
+// `e²` term vanishes, leaving `ac + (ad + bc)e` — which is the product rule.
+// Every differentiation rule falls out of the arithmetic the same way, which
+// is why the implementation is short and why there is nothing to get wrong
+// beyond typing the rules.
+//
+// Evaluating a function on `x + 1·e` gives `f(x) + f'(x)·e`: the value and
+// the derivative, from one evaluation, exactly.
+//
+// ## What forward mode is and is not for
+//
+// One pass gives the derivative with respect to **one** variable. For a
+// function of n variables the gradient costs n passes, which is fine for
+// small n and hopeless for the millions of parameters a neural network has.
+// That is what reverse mode — backpropagation — is for, and it is a different
+// and much more intricate construction. This is forward mode and says so.
+//
+// Checked against analytic derivatives and against `scipy`'s numerical
+// differentiation, on polynomials, trigonometry, exponentials and their
+// compositions.
+
+type Dual = {
+    /// The value.
+    value: f64,
+    /// The derivative with respect to whichever variable was seeded.
+    slope: f64,
+}
+
+/// A constant: its derivative is zero.
+pub fn constant(x: f64) -> Dual {
+    return Dual{ value: x, slope: 0.0 }
+}
+
+/// The variable being differentiated with respect to: its derivative is one.
+pub fn variable(x: f64) -> Dual {
+    return Dual{ value: x, slope: 1.0 }
+}
+
+pub fn add(a: Dual, b: Dual) -> Dual {
+    return Dual{ value: a.value + b.value, slope: a.slope + b.slope }
+}
+
+pub fn sub(a: Dual, b: Dual) -> Dual {
+    return Dual{ value: a.value - b.value, slope: a.slope - b.slope }
+}
+
+/// The product rule, which is what dropping the `e²` term leaves.
+pub fn mul(a: Dual, b: Dual) -> Dual {
+    return Dual{ value: a.value * b.value,
+        slope: a.slope * b.value + a.value * b.slope }
+}
+
+pub fn div(a: Dual, b: Dual) -> Dual {
+    return Dual{ value: a.value / b.value,
+        slope: (a.slope * b.value - a.value * b.slope) /
+        (b.value * b.value) }
+}
+
+pub fn negate(a: Dual) -> Dual {
+    return Dual{ value: 0.0 - a.value, slope: 0.0 - a.slope }
+}
+
+pub fn scale(a: Dual, k: f64) -> Dual {
+    return Dual{ value: a.value * k, slope: a.slope * k }
+}
+
+/// An integer power, by repeated multiplication.
+///
+/// Not `exp(n * ln(x))`, which is what a general power would do and which is
+/// undefined for a negative base — `pow(-2, 3)` is -8 and the logarithm has
+/// nothing to say about it.
+pub fn power(a: Dual, n: i64) -> Dual {
+    if n == 0 {
+        return constant(1.0)
+    }
+    var out = a
+    var i = 1
+    while i < n {
+        out = mul(out, a)
+        i = i + 1
+    }
+    if n < 0 {
+        return div(constant(1.0), power(a, 0 - n))
+    }
+    return out
+}
+
+pub fn sqrt(a: Dual) -> Dual {
+    let root = a.value.sqrt()
+    return Dual{ value: root, slope: a.slope / (2.0 * root) }
+}
+
+pub fn exp(a: Dual) -> Dual {
+    let e = a.value.exp()
+    return Dual{ value: e, slope: a.slope * e }
+}
+
+pub fn ln(a: Dual) -> Dual {
+    return Dual{ value: a.value.ln(), slope: a.slope / a.value }
+}
+
+pub fn sin(a: Dual) -> Dual {
+    return Dual{ value: a.value.sin(), slope: a.slope * a.value.cos() }
+}
+
+pub fn cos(a: Dual) -> Dual {
+    return Dual{ value: a.value.cos(), slope: 0.0 - a.slope * a.value.sin() }
+}
+
+pub fn tan(a: Dual) -> Dual {
+    let c = a.value.cos()
+    return Dual{ value: a.value.tan(), slope: a.slope / (c * c) }
+}
+
+pub fn tanh(a: Dual) -> Dual {
+    let t = a.value.tanh()
+    return Dual{ value: t, slope: a.slope * (1.0 - t * t) }
+}
+
+/// The derivative of `f` at `x`, exactly.
+pub fn derivative(f: fn(Dual) -> Dual, x: f64) -> f64 {
+    return f(variable(x)).slope
+}
+
+/// The value and the derivative together, from one evaluation.
+pub fn value_and_derivative(f: fn(Dual) -> Dual, x: f64) -> (f64, f64) {
+    let out = f(variable(x))
+    return (out.value, out.slope)
+}
+
+/// The second derivative, by differentiating the derivative numerically.
+///
+/// Forward mode gives one derivative per pass, so a second one needs either a
+/// second-order dual number or a difference of first derivatives. This does
+/// the second, which loses about half the digits — and is still far better
+/// than differencing the *values* twice, which loses three quarters.
+pub fn second_derivative(f: fn(Dual) -> Dual, x: f64, h: f64) -> f64 {
+    return (derivative(f, x + h) - derivative(f, x - h)) / (2.0 * h)
+}
+
+/// The gradient of a function of several variables, one pass per variable.
+///
+/// n passes for n variables, which is the cost of forward mode and the reason
+/// reverse mode exists. For a handful of variables it is the right answer and
+/// far simpler.
+pub fn gradient(f: fn([Dual]) -> Dual, x: [f64]) -> [f64] {
+    var out: [f64] = []
+    var i = 0
+    while i < x.len() {
+        var args: [Dual] = []
+        var j = 0
+        while j < x.len() {
+            if i == j {
+                args.push(variable(x[j]))
+            } else {
+                args.push(constant(x[j]))
+            }
+            j = j + 1
+        }
+        out.push(f(args).slope)
+        i = i + 1
+    }
+    return out
+}
+
+/// A central difference, for comparison.
+///
+/// Here to be measured against `derivative` rather than used. Its error is
+/// the sum of a truncation term proportional to h² and a rounding term
+/// proportional to 1/h, so it is least bad around the cube root of machine
+/// epsilon — about 6e-6 — and even there it gives about ten digits where
+/// automatic differentiation gives sixteen.
+pub fn numerical_derivative(f: fn(f64) -> f64, x: f64, h: f64) -> f64 {
+    return (f(x + h) - f(x - h)) / (2.0 * h)
+}
+
+/// The step size a central difference should use.
+pub fn best_step(x: f64) -> f64 {
+    var scale = x
+    if scale < 0.0 {
+        scale = 0.0 - scale
+    }
+    if scale < 1.0 {
+        scale = 1.0
+    }
+    return 0.0000061 * scale
+}

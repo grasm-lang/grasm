@@ -1,0 +1,24 @@
+[package]
+name = "graph2_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.maxflow]
+path = "../maxflow"
+version = "^1.0.0"
+
+[dependencies.matching]
+path = "../matching"
+version = "^1.0.0"
+
+[dependencies.pagerank]
+path = "../pagerank"
+version = "^1.0.0"
+
+[dependencies.centrality]
+path = "../centrality"
+version = "^1.0.0"
+
+[dependencies.spanning]
+path = "../spanning"
+version = "^1.0.0"

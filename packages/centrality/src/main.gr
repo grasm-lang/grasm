@@ -1,0 +1,308 @@
+// Which vertex matters, for four different meanings of "matters".
+//
+// A network has no single most important node. There are several honest
+// answers and they disagree, which is the point of having more than one:
+//
+//   * **Degree** — how many neighbours. The obvious answer, and the right one
+//     when influence is local: a person with fifty contacts.
+//   * **Closeness** — how near everything else is on average. The right one
+//     for placing a warehouse or a server.
+//   * **Betweenness** — how many shortest paths run through it. The right one
+//     for finding the vertex whose removal disconnects things: a bridge, a
+//     translator, a single router.
+//   * **Eigenvector** — how important the neighbours are. The right one when
+//     influence is transitive; PageRank is a variant of it.
+//
+// The classic demonstration is a barbell: two clusters joined by one vertex.
+// That vertex has low degree and the highest betweenness in the graph, and
+// which measure is used decides whether it is invisible or the answer.
+//
+// ## Brandes' algorithm, and why betweenness used to be unusable
+//
+// Betweenness counts, for every pair of vertices, the fraction of shortest
+// paths between them that pass through a third. Done directly that is
+// O(V^3) and needs every pair's path count stored. Brandes' 2001 insight is
+// that the contribution of one source to every vertex's score can be
+// accumulated in one backward pass over the search tree, which makes it O(VE)
+// and O(V) memory. It is the difference between betweenness being a
+// theoretical measure and a computable one.
+//
+// ## Normalisation
+//
+// The raw scores depend on the graph's size, so comparing two graphs needs
+// them scaled. `betweenness` returns raw counts and `normalised_betweenness`
+// divides by the number of pairs — which is the convention `networkx` uses
+// and the one two results can be compared under.
+//
+// Checked against `networkx`'s `degree_centrality`, `closeness_centrality`,
+// `betweenness_centrality` and `eigenvector_centrality` on random graphs and
+// on a barbell.
+
+type CentralityError = | NoVertices()
+
+fn neighbours_or_empty(adjacency: [[i64]], v: i64) -> [i64] {
+    if v < 0 or v >= adjacency.len() {
+        return []
+    }
+    return adjacency[v]
+}
+
+/// Degree, scaled by the largest it could be.
+///
+/// Dividing by `n - 1` is what makes it comparable between graphs: a raw
+/// degree of ten means something different in a graph of twelve and a graph
+/// of a million.
+pub fn degree(adjacency: [[i64]]) -> [f64] ! CentralityError {
+    let n = adjacency.len()
+    if n == 0 {
+        fail(NoVertices())
+    }
+    var out: [f64] = []
+    if n == 1 {
+        out.push(0.0)
+        return out
+    }
+    let scale = (n - 1).as_f64()
+    var v = 0
+    while v < n {
+        out.push(adjacency[v].len().as_f64() / scale)
+        v = v + 1
+    }
+    return out
+}
+
+/// Distances from one vertex, by breadth-first search; -1 for unreachable.
+pub fn distances_from(adjacency: [[i64]], source: i64) -> [i64] {
+    var distance: [i64] = []
+    for _i in 0..adjacency.len() {
+        distance.push(0 - 1)
+    }
+    if source < 0 or source >= adjacency.len() {
+        return distance
+    }
+    distance[source] = 0
+    var queue = [source]
+    var at = 0
+    while at < queue.len() {
+        let v = queue[at]
+        at = at + 1
+        for w in neighbours_or_empty(adjacency, v) {
+            if distance[w] < 0 {
+                distance[w] = distance[v] + 1
+                queue.push(w)
+            }
+        }
+    }
+    return distance
+}
+
+/// Closeness: the reciprocal of the mean distance to everything reachable.
+///
+/// Scaled by the fraction of the graph that *is* reachable, which is what
+/// stops a vertex in a tiny isolated component from scoring perfectly. An
+/// implementation without that scaling reports the least connected vertex in
+/// a disconnected graph as the most central one.
+pub fn closeness(adjacency: [[i64]]) -> [f64] ! CentralityError {
+    let n = adjacency.len()
+    if n == 0 {
+        fail(NoVertices())
+    }
+    var out: [f64] = []
+    var v = 0
+    while v < n {
+        let distance = distances_from(adjacency, v)
+        var total = 0
+        var reached = 0
+        var w = 0
+        while w < n {
+            if w != v and distance[w] >= 0 {
+                total = total + distance[w]
+                reached = reached + 1
+            }
+            w = w + 1
+        }
+        if total == 0 or reached == 0 {
+            out.push(0.0)
+        } else {
+            let average = reached.as_f64() / total.as_f64()
+            out.push(average * reached.as_f64() / (n - 1).as_f64())
+        }
+        v = v + 1
+    }
+    return out
+}
+
+/// Betweenness by Brandes' algorithm: one search per source, one backward
+/// accumulation each.
+pub fn betweenness(adjacency: [[i64]]) -> [f64] ! CentralityError {
+    let n = adjacency.len()
+    if n == 0 {
+        fail(NoVertices())
+    }
+    var score: [f64] = []
+    for _i in 0..n {
+        score.push(0.0)
+    }
+    var source = 0
+    while source < n {
+        accumulate(adjacency, source, score)
+        source = source + 1
+    }
+    // Every path is found from both ends in an undirected graph.
+    var v = 0
+    while v < n {
+        score[v] = score[v] / 2.0
+        v = v + 1
+    }
+    return score
+}
+
+fn accumulate(adjacency: [[i64]], source: i64, inout score: [f64]) {
+    let n = adjacency.len()
+    var predecessors: [[i64]] = []
+    var paths: [f64] = []
+    var distance: [i64] = []
+    var dependency: [f64] = []
+    for _i in 0..n {
+        predecessors.push([])
+        paths.push(0.0)
+        distance.push(0 - 1)
+        dependency.push(0.0)
+    }
+    paths[source] = 1.0
+    distance[source] = 0
+    var order: [i64] = []
+    var queue = [source]
+    var at = 0
+    while at < queue.len() {
+        let v = queue[at]
+        at = at + 1
+        order.push(v)
+        for w in neighbours_or_empty(adjacency, v) {
+            if distance[w] < 0 {
+                distance[w] = distance[v] + 1
+                queue.push(w)
+            }
+            // Every shortest path to `w` through `v` counts once.
+            if distance[w] == distance[v] + 1 {
+                paths[w] = paths[w] + paths[v]
+                predecessors[w].push(v)
+            }
+        }
+    }
+    // Backwards: a vertex's dependency is built from its successors', which
+    // is the whole saving over counting pairs.
+    var i = order.len() - 1
+    while i >= 0 {
+        let w = order[i]
+        for v in predecessors[w] {
+            dependency[v] = dependency[v] +
+            paths[v] / paths[w] * (1.0 + dependency[w])
+        }
+        if w != source {
+            score[w] = score[w] + dependency[w]
+        }
+        i = i - 1
+    }
+}
+
+/// Betweenness divided by the number of pairs it could have counted.
+pub fn normalised_betweenness(adjacency: [[i64]]) -> [f64] ! CentralityError {
+    let n = adjacency.len()
+    var out = try betweenness(adjacency)
+    if n <= 2 {
+        return out
+    }
+    let scale = ((n - 1) * (n - 2)).as_f64() / 2.0
+    var v = 0
+    while v < out.len() {
+        out[v] = out[v] / scale
+        v = v + 1
+    }
+    return out
+}
+
+/// Eigenvector centrality by power iteration.
+///
+/// A vertex is important when its neighbours are, which is circular and is
+/// resolved by iterating to a fixed point. On a disconnected graph the answer
+/// is dominated by the largest component and the rest score near zero — which
+/// is correct and often surprising.
+pub fn eigenvector(adjacency: [[i64]], iterations: i64,
+    tolerance: f64) -> [f64] ! CentralityError {
+    let n = adjacency.len()
+    if n == 0 {
+        fail(NoVertices())
+    }
+    var x: [f64] = []
+    for _i in 0..n {
+        x.push(1.0 / n.as_f64())
+    }
+    var round = 0
+    while round < iterations {
+        var next: [f64] = []
+        for _i in 0..n {
+            next.push(0.0)
+        }
+        var v = 0
+        while v < n {
+            for w in adjacency[v] {
+                next[w] = next[w] + x[v]
+            }
+            v = v + 1
+        }
+        // Normalising each round is what keeps the numbers from growing
+        // without bound; the direction is the answer, not the magnitude.
+        var norm = 0.0
+        for value in next {
+            norm = norm + value * value
+        }
+        norm = norm.sqrt()
+        if norm == 0.0 {
+            return x
+        }
+        var change = 0.0
+        v = 0
+        while v < n {
+            next[v] = next[v] / norm
+            var d = next[v] - x[v]
+            if d < 0.0 {
+                d = 0.0 - d
+            }
+            change = change + d
+            v = v + 1
+        }
+        x = next
+        if change < tolerance {
+            return x
+        }
+        round = round + 1
+    }
+    return x
+}
+
+/// The vertex each measure calls the most central.
+///
+/// Returned together because the interesting thing is when they disagree —
+/// which they do on any graph with a bridge, and which is the reason to
+/// compute more than one.
+pub fn most_central(adjacency: [[i64]]) -> (i64, i64, i64) ! CentralityError {
+    let d = try degree(adjacency)
+    let c = try closeness(adjacency)
+    let b = try betweenness(adjacency)
+    return (argmax(d), argmax(c), argmax(b))
+}
+
+fn argmax(values: [f64]) -> i64 {
+    var best = 0 - 1
+    var top = 0.0
+    var i = 0
+    while i < values.len() {
+        if best < 0 or values[i] > top {
+            best = i
+            top = values[i]
+        }
+        i = i + 1
+    }
+    return best
+}

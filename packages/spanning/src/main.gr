@@ -1,0 +1,256 @@
+// Minimum spanning trees, and the two algorithms that find them.
+//
+// The cheapest set of edges connecting everything: the shortest cable run,
+// the cheapest road network, the clustering that a dendrogram is drawn from.
+//
+// ## Kruskal and Prim answer the same question differently
+//
+// **Kruskal** sorts every edge and adds each one whose ends are not already
+// connected. The connectivity test is what union-find exists for, and the
+// cost is dominated by the sort — O(E log E), independent of how the graph is
+// laid out. It is the one to use on a sparse graph and the one that gives a
+// *forest* for free when the graph is disconnected.
+//
+// **Prim** grows one tree from a starting vertex, always taking the cheapest
+// edge leaving it. On a dense graph that is O(V^2) with no sort at all, which
+// beats Kruskal when the edge count approaches V^2.
+//
+// Both are greedy and both are correct, which is unusual and is the cut
+// property: for any way of splitting the vertices into two, the cheapest edge
+// crossing the split is in some minimum spanning tree. Every step of both
+// algorithms is an application of it.
+//
+// ## Ties, and why the tree is not unique
+//
+// With equal weights there are several minimum spanning trees and they have
+// the same total. Kruskal and Prim will generally return different ones, and
+// so will Kruskal with the edges listed in a different order. Anything
+// depending on *which* tree — a layout, a clustering's tie-breaks — is
+// depending on something the problem does not determine. The **total** is
+// unique and is what to compare.
+//
+// ## What it is used for that is not a network
+//
+// Single-linkage clustering is exactly this: build the minimum spanning tree
+// and cut the k-1 longest edges, and the components are the clusters. That is
+// why `cut_longest` is here, and why an MST is worth having in a library that
+// has nothing to do with cables.
+//
+// Checked against `networkx.minimum_spanning_tree` for the total weight and
+// the edge set, on random graphs, on graphs with ties, and on disconnected
+// ones.
+
+import unionfind
+
+type SpanEdge = {
+    from: i64,
+    to: i64,
+    weight: i64,
+}
+
+type SpanError =
+    | NoSuchVertex(v: i64)
+    | Disconnected(components: i64)
+
+pub fn edge(from: i64, to: i64, weight: i64) -> SpanEdge {
+    return SpanEdge{ from: from, to: to, weight: weight }
+}
+
+/// Kruskal's algorithm: cheapest first, skipping edges that would close a
+/// cycle.
+///
+/// Returns a spanning *forest* when the graph is disconnected, which is the
+/// honest answer — the alternative is to fail, and a caller clustering points
+/// wants the forest.
+pub fn minimum_forest(vertices: i64, edges: [SpanEdge]) -> [SpanEdge] {
+    var sorted = edges
+    // Sorted by the ends as well as the weight, so equal weights are broken
+    // the same way on every run and the tree is reproducible.
+    sorted.sort_by(|e| e.to)
+    sorted.sort_by(|e| e.from)
+    sorted.sort_by(|e| e.weight)
+    var sets = unionfind.new_sets(vertices)
+    var out: [SpanEdge] = []
+    for e in sorted {
+        if e.from < 0 or e.from >= vertices or e.to < 0 or e.to >= vertices {
+            continue
+        }
+        if unionfind.find(sets, e.from) != unionfind.find(sets, e.to) {
+            let _joined = unionfind.union(sets, e.from, e.to)
+            out.push(e)
+        }
+    }
+    return out
+}
+
+/// The same, refusing a graph that is not connected.
+pub fn minimum_tree(vertices: i64,
+    edges: [SpanEdge]) -> [SpanEdge] ! SpanError {
+    let forest = minimum_forest(vertices, edges)
+    if vertices > 0 and forest.len() != vertices - 1 {
+        fail(Disconnected(vertices - forest.len()))
+    }
+    return forest
+}
+
+/// Prim's algorithm from a starting vertex, over an adjacency structure.
+///
+/// The right shape for a dense graph, where sorting the edges costs more than
+/// scanning the frontier does.
+pub fn prim(vertices: i64, edges: [SpanEdge],
+    start: i64) -> [SpanEdge] ! SpanError {
+    if start < 0 or start >= vertices {
+        fail(NoSuchVertex(start))
+    }
+    var adjacency: [[SpanEdge]] = []
+    for _i in 0..vertices {
+        adjacency.push([])
+    }
+    for e in edges {
+        if e.from < 0 or e.from >= vertices or e.to < 0 or e.to >= vertices {
+            continue
+        }
+        adjacency[e.from].push(e)
+        adjacency[e.to].push(edge(e.to, e.from, e.weight))
+    }
+    var inside: [bool] = []
+    for _i in 0..vertices {
+        inside.push(false)
+    }
+    inside[start] = true
+    var out: [SpanEdge] = []
+    var added = 1
+    while added < vertices {
+        var best = 0 - 1
+        var best_weight = 0
+        var best_from = 0 - 1
+        var best_to = 0 - 1
+        var v = 0
+        while v < vertices {
+            if inside[v] {
+                for e in adjacency[v] {
+                    if not inside[e.to] and
+                    (best < 0 or e.weight < best_weight or
+                        (e.weight == best_weight and e.to < best_to)) {
+                        best = 1
+                        best_weight = e.weight
+                        best_from = v
+                        best_to = e.to
+                    }
+                }
+            }
+            v = v + 1
+        }
+        if best < 0 {
+            fail(Disconnected(vertices - added))
+        }
+        inside[best_to] = true
+        out.push(edge(best_from, best_to, best_weight))
+        added = added + 1
+    }
+    return out
+}
+
+/// The total weight of a set of edges.
+///
+/// The number to compare between algorithms: the trees may differ and this
+/// may not.
+pub fn total_weight(edges: [SpanEdge]) -> i64 {
+    var total = 0
+    for e in edges {
+        total = total + e.weight
+    }
+    return total
+}
+
+/// The components a forest connects, as a label per vertex.
+pub fn components(vertices: i64, edges: [SpanEdge]) -> [i64] {
+    var sets = unionfind.new_sets(vertices)
+    for e in edges {
+        if e.from >= 0 and e.from < vertices and e.to >= 0 and
+        e.to < vertices {
+            let _joined = unionfind.union(sets, e.from, e.to)
+        }
+    }
+    var out: [i64] = []
+    var v = 0
+    while v < vertices {
+        out.push(unionfind.find(sets, v))
+        v = v + 1
+    }
+    return out
+}
+
+pub fn component_count(vertices: i64, edges: [SpanEdge]) -> i64 {
+    var seen = map()
+    for label in components(vertices, edges) {
+        seen.set(label, true)
+    }
+    return seen.len()
+}
+
+/// Single-linkage clustering: the spanning forest with its longest edges cut.
+///
+/// Removing the `k - 1` heaviest edges of a minimum spanning tree leaves
+/// exactly the `k` clusters single-linkage would produce, which is a fact
+/// worth knowing because the direct algorithm is quadratic and this is not.
+pub fn cut_longest(vertices: i64, edges: [SpanEdge],
+    clusters: i64) -> [i64] {
+    var tree = minimum_forest(vertices, edges)
+    tree.sort_by(|e| e.weight)
+    var keep = tree.len() - (clusters - 1)
+    if keep < 0 {
+        keep = 0
+    }
+    if keep > tree.len() {
+        keep = tree.len()
+    }
+    return components(vertices, tree.slice(0, keep))
+}
+
+/// The heaviest edge on the tree path between two vertices.
+///
+/// The **bottleneck**: the widest path between two points is the one
+/// minimising this, and the minimum spanning tree contains it for every pair
+/// — so one tree answers the question for all of them.
+pub fn bottleneck(vertices: i64, edges: [SpanEdge], from: i64,
+    to: i64) -> i64 ! SpanError {
+    if from < 0 or from >= vertices or to < 0 or to >= vertices {
+        fail(NoSuchVertex(from))
+    }
+    let tree = minimum_forest(vertices, edges)
+    var adjacency: [[SpanEdge]] = []
+    for _i in 0..vertices {
+        adjacency.push([])
+    }
+    for e in tree {
+        adjacency[e.from].push(e)
+        adjacency[e.to].push(edge(e.to, e.from, e.weight))
+    }
+    var seen: [bool] = []
+    var worst: [i64] = []
+    for _i in 0..vertices {
+        seen.push(false)
+        worst.push(0)
+    }
+    seen[from] = true
+    var queue = [from]
+    var at = 0
+    while at < queue.len() {
+        let v = queue[at]
+        at = at + 1
+        for e in adjacency[v] {
+            if not seen[e.to] {
+                seen[e.to] = true
+                worst[e.to] = if worst[v] > e.weight { worst[v] } else {
+                    e.weight
+                }
+                queue.push(e.to)
+            }
+        }
+    }
+    if not seen[to] {
+        fail(Disconnected(2))
+    }
+    return worst[to]
+}

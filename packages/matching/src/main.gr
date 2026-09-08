@@ -1,0 +1,465 @@
+// Pairing things up: maximum bipartite matching, and cheapest assignment.
+//
+// Doctors to hospitals, students to projects, delivery drivers to routes,
+// pixels to pixels. Two problems that look the same and are not:
+//
+//   * **Maximum matching** — pair as many as possible, given who *may* be
+//     paired with whom.
+//   * **Assignment** — everyone can be paired with everyone, at a cost; find
+//     the pairing with the smallest total.
+//
+// The first is a flow problem. The second is not, and the greedy answer to it
+// — repeatedly take the cheapest available pair — is wrong on a two-by-two
+// example, which is the thing worth knowing before writing one.
+//
+// ## Hopcroft-Karp, and why not the simple augmenting search
+//
+// The simple algorithm takes each unmatched vertex in turn and looks for an
+// augmenting path — a path alternating between unmatched and matched edges
+// that starts and ends unmatched. Flipping it along its length matches one
+// more pair. That is O(VE).
+//
+// Hopcroft-Karp finds a *maximal set of shortest* augmenting paths at once,
+// which needs only O(sqrt(V)) rounds. On the graphs where matching matters —
+// thousands of vertices, sparse — that is the difference between a second and
+// a minute.
+//
+// ## The Hungarian algorithm's one subtlety
+//
+// It works on the cost matrix rather than on the graph, and it works by
+// subtracting constants from rows and columns until enough zeros appear. The
+// subtlety is *why* that is allowed: subtracting a constant from a row changes
+// every assignment's total by the same amount, so it cannot change which
+// assignment is cheapest. Every step preserves the answer while making it
+// easier to see.
+//
+// ## What "maximum" does not mean
+//
+// Not "maximal". A maximal matching is one nothing can be added to; a maximum
+// matching is the largest there is, and a greedy pairing gives the first
+// while people assume it gave the second. On a path of four vertices the
+// greedy middle edge is maximal and half the size of the maximum.
+//
+// Checked against `networkx.hopcroft_karp_matching` and
+// `scipy.optimize.linear_sum_assignment` on random and adversarial inputs.
+
+type MatchError =
+    | RaggedCosts(row: i64)
+    | NoRows()
+
+    /// Maximum bipartite matching by Hopcroft-Karp.
+    ///
+    /// `adjacency[i]` lists the right-hand vertices the left-hand vertex `i` may
+    /// pair with. The result maps each left vertex to its partner, or -1.
+pub fn maximum_matching(adjacency: [[i64]], right_size: i64) -> [i64] {
+    let left_size = adjacency.len()
+    var pair_left: [i64] = []
+    for _i in 0..left_size {
+        pair_left.push(0 - 1)
+    }
+    var pair_right: [i64] = []
+    for _i in 0..right_size {
+        pair_right.push(0 - 1)
+    }
+    var improved = true
+    while improved {
+        // A round: measure how far each free left vertex is from a free
+        // right one, then flip every shortest augmenting path found.
+        let distance = layer(adjacency, pair_left, pair_right)
+        improved = false
+        var v = 0
+        while v < left_size {
+            if pair_left[v] < 0 {
+                if augment(adjacency, v, pair_left, pair_right, distance) {
+                    improved = true
+                }
+            }
+            v = v + 1
+        }
+    }
+    return pair_left
+}
+
+fn layer(adjacency: [[i64]], pair_left: [i64], pair_right: [i64]) -> [i64] {
+    var distance: [i64] = []
+    var queue: [i64] = []
+    var v = 0
+    while v < adjacency.len() {
+        if pair_left[v] < 0 {
+            distance.push(0)
+            queue.push(v)
+        } else {
+            distance.push(0 - 1)
+        }
+        v = v + 1
+    }
+    var at = 0
+    while at < queue.len() {
+        let u = queue[at]
+        at = at + 1
+        for w in adjacency[u] {
+            let partner = pair_right[w]
+            if partner >= 0 and distance[partner] < 0 {
+                distance[partner] = distance[u] + 1
+                queue.push(partner)
+            }
+        }
+    }
+    return distance
+}
+
+fn augment(adjacency: [[i64]], v: i64, inout pair_left: [i64],
+    inout pair_right: [i64], distance: [i64]) -> bool {
+    for w in adjacency[v] {
+        let partner = pair_right[w]
+        if partner < 0 or (distance[partner] == distance[v] + 1 and
+            augment(adjacency, partner, pair_left, pair_right, distance)) {
+            pair_left[v] = w
+            pair_right[w] = v
+            return true
+        }
+    }
+    return false
+}
+
+/// How many pairs a matching contains.
+pub fn matching_size(pairing: [i64]) -> i64 {
+    var n = 0
+    for p in pairing {
+        if p >= 0 {
+            n = n + 1
+        }
+    }
+    return n
+}
+
+/// The pairs, as `(left, right)`.
+pub fn pairs(pairing: [i64]) -> [(i64, i64)] {
+    var out: [(i64, i64)] = []
+    var i = 0
+    while i < pairing.len() {
+        if pairing[i] >= 0 {
+            out.push((i, pairing[i]))
+        }
+        i = i + 1
+    }
+    return out
+}
+
+/// A matching nothing can be added to, found greedily.
+///
+/// Here to be compared against `maximum_matching` rather than used: on a path
+/// of four vertices this finds one pair and the maximum is two, which is the
+/// example worth having in front of anyone who says greedy is good enough.
+pub fn greedy_matching(adjacency: [[i64]], right_size: i64) -> [i64] {
+    var pair_left: [i64] = []
+    for _i in 0..adjacency.len() {
+        pair_left.push(0 - 1)
+    }
+    var taken: [bool] = []
+    for _i in 0..right_size {
+        taken.push(false)
+    }
+    var v = 0
+    while v < adjacency.len() {
+        for w in adjacency[v] {
+            if not taken[w] {
+                pair_left[v] = w
+                taken[w] = true
+                break
+            }
+        }
+        v = v + 1
+    }
+    return pair_left
+}
+
+/// A minimum vertex cover, from a maximum matching.
+///
+/// König's theorem: in a bipartite graph the smallest set of vertices
+/// touching every edge is the same size as the largest matching. The proof is
+/// constructive and this is the construction — which means "how few people
+/// can cover every task" is answered by the same computation as "how many
+/// tasks can be done at once".
+pub fn minimum_vertex_cover(adjacency: [[i64]], right_size: i64,
+    pairing: [i64]) -> ([i64], [i64]) {
+    var pair_right: [i64] = []
+    for _i in 0..right_size {
+        pair_right.push(0 - 1)
+    }
+    var i = 0
+    while i < pairing.len() {
+        if pairing[i] >= 0 {
+            pair_right[pairing[i]] = i
+        }
+        i = i + 1
+    }
+    // Reachable from an unmatched left vertex by alternating edges.
+    var left_seen: [bool] = []
+    for _k in 0..adjacency.len() {
+        left_seen.push(false)
+    }
+    var right_seen: [bool] = []
+    for _k in 0..right_size {
+        right_seen.push(false)
+    }
+    var queue: [i64] = []
+    i = 0
+    while i < adjacency.len() {
+        if pairing[i] < 0 {
+            left_seen[i] = true
+            queue.push(i)
+        }
+        i = i + 1
+    }
+    var at = 0
+    while at < queue.len() {
+        let v = queue[at]
+        at = at + 1
+        for w in adjacency[v] {
+            if pairing[v] == w or right_seen[w] {
+                continue
+            }
+            right_seen[w] = true
+            let partner = pair_right[w]
+            if partner >= 0 and not left_seen[partner] {
+                left_seen[partner] = true
+                queue.push(partner)
+            }
+        }
+    }
+    var left_cover: [i64] = []
+    i = 0
+    while i < adjacency.len() {
+        if not left_seen[i] {
+            left_cover.push(i)
+        }
+        i = i + 1
+    }
+    var right_cover: [i64] = []
+    i = 0
+    while i < right_size {
+        if right_seen[i] {
+            right_cover.push(i)
+        }
+        i = i + 1
+    }
+    return (left_cover, right_cover)
+}
+
+// ------------------------------------------------------------- assignment
+
+/// The cheapest one-to-one assignment, by the Hungarian algorithm.
+///
+/// `cost[i][j]` is what it costs to give job `j` to worker `i`. The result
+/// maps each row to a column. The matrix must be square; a rectangular
+/// problem is squared by padding with the largest cost, which is what a
+/// caller with more jobs than workers wants and is worth doing deliberately.
+///
+/// This is the O(n^3) shortest-augmenting-path form, which is the one that is
+/// short enough to read. The classical row-and-column-covering presentation
+/// is the same algorithm and twice the code.
+pub fn assign(cost: [[i64]]) -> [i64] ! MatchError {
+    let n = cost.len()
+    if n == 0 {
+        fail(NoRows())
+    }
+    for row in cost {
+        if row.len() != n {
+            fail(RaggedCosts(row.len()))
+        }
+    }
+    let infinity = 4611686018427387904
+    // Potentials: `u` on rows and `v` on columns, kept so that every reduced
+    // cost stays non-negative. That invariant is what makes each round a
+    // shortest-path search rather than a search for negative cycles.
+    var u: [i64] = []
+    var v: [i64] = []
+    var assigned: [i64] = []
+    for _i in 0..n + 1 {
+        u.push(0)
+        v.push(0)
+        assigned.push(0)
+    }
+    var way: [i64] = []
+    for _i in 0..n + 1 {
+        way.push(0)
+    }
+    var i = 1
+    while i <= n {
+        assigned[0] = i
+        var j0 = 0
+        var minimum: [i64] = []
+        var used: [bool] = []
+        for _k in 0..n + 1 {
+            minimum.push(infinity)
+            used.push(false)
+        }
+        var searching = true
+        while searching {
+            j0 = step(cost, n, u, v, assigned, way, minimum, used, j0)
+            if assigned[j0] == 0 {
+                searching = false
+            }
+        }
+        // Walk the augmenting path back, moving each assignment along it.
+        var done = false
+        while not done {
+            let j1 = way[j0]
+            assigned[j0] = assigned[j1]
+            j0 = j1
+            if j0 == 0 {
+                done = true
+            }
+        }
+        i = i + 1
+    }
+    var out: [i64] = []
+    for _k in 0..n {
+        out.push(0 - 1)
+    }
+    var j = 1
+    while j <= n {
+        if assigned[j] > 0 {
+            out[assigned[j] - 1] = j - 1
+        }
+        j = j + 1
+    }
+    return out
+}
+
+
+/// One step of the shortest-path search: find the closest unused column,
+/// then shift the potentials so its reduced cost becomes zero.
+///
+/// Shifting is what keeps every reduced cost non-negative, which is the
+/// invariant that lets each round be a shortest-path search rather than a
+/// hunt for negative cycles.
+fn step(cost: [[i64]], n: i64, inout u: [i64], inout v: [i64],
+    assigned: [i64], inout way: [i64], inout minimum: [i64],
+    inout used: [bool], j0: i64) -> i64 {
+    let infinity = 4611686018427387904
+    used[j0] = true
+    let i0 = assigned[j0]
+    var delta = infinity
+    var j1 = 0
+    var j = 1
+    while j <= n {
+        if not used[j] {
+            let current = cost[i0 - 1][j - 1] - u[i0] - v[j]
+            if current < minimum[j] {
+                minimum[j] = current
+                way[j] = j0
+            }
+            if minimum[j] < delta {
+                delta = minimum[j]
+                j1 = j
+            }
+        }
+        j = j + 1
+    }
+    j = 0
+    while j <= n {
+        if used[j] {
+            u[assigned[j]] = u[assigned[j]] + delta
+            v[j] = v[j] - delta
+        } else {
+            minimum[j] = minimum[j] - delta
+        }
+        j = j + 1
+    }
+    return j1
+}
+
+/// What an assignment costs.
+pub fn assignment_cost(cost: [[i64]], columns: [i64]) -> i64 {
+    var total = 0
+    var i = 0
+    while i < columns.len() {
+        if columns[i] >= 0 {
+            total = total + cost[i][columns[i]]
+        }
+        i = i + 1
+    }
+    return total
+}
+
+/// The assignment a greedy pass would produce.
+///
+/// Repeatedly take the cheapest remaining pair. It is wrong, and the
+/// two-by-two matrix `[[1, 2], [2, 100]]` shows it: greedy takes the 1 and is
+/// left with the 100.
+pub fn greedy_assignment(cost: [[i64]]) -> [i64] {
+    let n = cost.len()
+    var out: [i64] = []
+    var taken: [bool] = []
+    for _i in 0..n {
+        out.push(0 - 1)
+        taken.push(false)
+    }
+    var placed = 0
+    while placed < n {
+        var best_row = 0 - 1
+        var best_column = 0 - 1
+        var best = 0
+        var i = 0
+        while i < n {
+            if out[i] < 0 {
+                var j = 0
+                while j < n {
+                    if not taken[j] and
+                    (best_row < 0 or cost[i][j] < best) {
+                        best = cost[i][j]
+                        best_row = i
+                        best_column = j
+                    }
+                    j = j + 1
+                }
+            }
+            i = i + 1
+        }
+        if best_row < 0 {
+            break
+        }
+        out[best_row] = best_column
+        taken[best_column] = true
+        placed = placed + 1
+    }
+    return out
+}
+
+/// A rectangular cost matrix squared off with a padding cost.
+///
+/// Padding with a cost higher than any real one means the padded rows are
+/// assigned last and to nothing that matters — but the padding must be
+/// *finite*, because an infinity makes every total infinite and the algorithm
+/// cannot tell the assignments apart.
+pub fn square_off(cost: [[i64]], padding: i64) -> [[i64]] {
+    var width = 0
+    for row in cost {
+        if row.len() > width {
+            width = row.len()
+        }
+    }
+    var size = cost.len()
+    if width > size {
+        size = width
+    }
+    var out: [[i64]] = []
+    var i = 0
+    while i < size {
+        var row: [i64] = []
+        var j = 0
+        while j < size {
+            if i < cost.len() and j < cost[i].len() {
+                row.push(cost[i][j])
+            } else {
+                row.push(padding)
+            }
+            j = j + 1
+        }
+        out.push(row)
+        i = i + 1
+    }
+    return out
+}

@@ -14,7 +14,7 @@ plan that discovers them 300 packages in.
 | | |
 |---|---|
 | Started | 78 |
-| Now | 305 |
+| Now | 325 |
 | Tier 1 target | 200 |
 | Tier 2 target | 500 |
 | Tier 3 target | 800 |
@@ -189,9 +189,63 @@ outside implementation wherever one exists.
 | ~~Build tooling~~ | ~~`changelog` `spdx` `codeowners` `patchfile` `coveragefmt`~~ — done |
 | ~~Money and tax~~ | ~~`vatid` `taxrate` `invoice` `ledgerfmt` `fx`~~ — done |
 
-That is a hundred, in twenty batches. The second hundred is deliberately not
-listed: the first will change what the second should be, and a list written
-now would be a list written before anything was learnt.
+That is a hundred, in twenty batches.
+
+### The second hundred — about 100, and what the first taught
+
+The first hundred is done, so this list can be written from evidence rather
+than from a guess. Four things changed how it was chosen.
+
+**Check against somebody else's implementation, always.** It found something
+in every batch. Usually the expectation was wrong and the code right — a
+colour-blindness matrix applied in the wrong space, a Bezier arc length out in
+the ninth digit, a `both_ways` VAT total that agreed when it should not — and
+once it was the code: `vatid` had six real defects that 3,267 generated
+numbers found and no amount of reading would have. So every batch below names
+the implementation it will be checked against, and a package with no reference
+has to justify itself.
+
+**The demo's running time is a design constraint.** `crypto4-demo` takes 18
+seconds in the interpreter because Ed25519 and bcrypt are meant to be slow,
+and it runs four times in the gates. That is acceptable once. It is not
+acceptable in every batch, so the expensive ones are spread out below rather
+than grouped.
+
+**Packages that pair up are worth more than packages that stand alone.**
+`patchfile.changed_lines` feeding `coveragefmt.changed_line_rate` says
+something neither says by itself. Batches below are grouped so that at least
+one pair meets inside the group demo.
+
+**Data is fine; unsourced data is not.** `hyphenate` carries 39 KB of TeX
+patterns and `spdx` 13 KB of identifiers, and both are better for it. Each
+says where the data came from and under what licence, which is the condition.
+
+| batch | packages | checked against |
+|---|---|---|
+| ~~Spatial~~ | ~~`convexhull` `kdtree` `rtree` `simplify` `triangulate`~~ — done | scipy, shapely, earcut |
+| ~~Graph algorithms II~~ | ~~`maxflow` `matching` `pagerank` `centrality` `spanning`~~ — done | networkx, scipy |
+| Numerical methods | `rootfind` `quadrature` `ode` `optimise` `autodiff` | scipy |
+| Fonts | `sfnt` `cmap` `glyf` `woff` `fontmetrics` | fontTools |
+| Barcodes | `code128` `ean` `itf` `codabar` `barcodetext` | python-barcode |
+| Audio metadata | `id3` `flacmeta` `midi` `wavmeta` `loudness` | mutagen |
+| Images II | `gif` `ico` `jpegmeta` `resample` `bmpwrite` | Pillow |
+| Text encodings | `codepage` `shiftjis` `gb18030` `big5` `euckr` | Python codecs |
+| Compression II | `bzip2` `lzw` `huffman` `rangecoder` `deltacodec` | Python bz2, reference LZW |
+| Protocols II | `mqtt` `coap` `stomp` `amqpframe` `wsextension` | paho, aiocoap |
+| Database internals | `bplustree` `heapfile` `queryplan` `costmodel` `bitmapindex` | SQLite's own plans |
+| Compiler tooling | `lexgen` `parsegen` `firstfollow` `ssaform` `regalloc` | Lark, textbook grammars |
+| Scientific units | `siunits` `constants` `uncertainty` `dimension` `unitparse` | pint, CODATA |
+| Time zones | `tzfile` `tzrule` `sunrise` `solar` `leapsecond` | zoneinfo, astral |
+| Statistics III | `bootstrap` `anova` `survival` `timeseries` `changepoint` | scipy, statsmodels |
+| Machine learning basics | `kmeans` `naivebayes` `decisiontree` `knn` `mlmetrics` | scikit-learn |
+| Security III | `passwordpolicy` `entropy` `secretscan` `keyderive` `saltedhash` | zxcvbn, gitleaks rules |
+| Web III | `formdata` `csp` `hsts` `preflight` `webfinger` | the specifications |
+| Serialisation IV | `flatbuffers` `capnp` `ubjson` `smile` `amf` | the reference encoders |
+| Geospatial II | `mgrs` `utm` `gpx` `kml` `geodesic` | pyproj, geographiclib |
+
+That is a hundred, in twenty batches, and the same rhythm as the first: five
+or six packages to a group demo, every claim an assertion, every batch checked
+against the tool that owns its format before it lands.
 
 ### Needs P1 — a TLS client. About 120, and none of them can start.
 

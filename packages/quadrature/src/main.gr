@@ -1,0 +1,253 @@
+// Numerical integration: the area under a function nobody can integrate.
+//
+// ## Why the obvious method is bad and the next one is excellent
+//
+// The trapezoid rule joins the points with straight lines and its error falls
+// as the square of the step. Simpson's rule fits a parabola through each pair
+// of intervals and its error falls as the **fourth** power — for the same
+// number of function evaluations, halving the step improves a trapezoid
+// answer by four times and a Simpson answer by sixteen. There is almost never
+// a reason to use the trapezoid rule, and it is here only to show the
+// difference.
+//
+// Gauss-Legendre goes further still: rather than sampling at even intervals,
+// it chooses both the points *and* their weights so that the rule is exact
+// for every polynomial up to degree 2n-1. Sixteen points integrate a
+// thirty-first degree polynomial exactly. That is the rule to use on a smooth
+// function, and it is the one this package's `gauss` implements.
+//
+// ## Where all of them fail
+//
+// Every fixed rule assumes the function is smooth across the whole interval.
+// A kink, a spike or a near-singularity breaks that assumption in one place
+// and ruins the whole answer, because the error estimate is derived from a
+// Taylor expansion that does not exist there.
+//
+// The answer is **adaptivity**: integrate a piece, integrate its two halves,
+// and if the two disagree, recurse into the half where the disagreement is.
+// Effort goes where the function is difficult and nowhere else, which is why
+// `adaptive_simpson` costs a hundred evaluations on a smooth function and ten
+// thousand on one with a spike — and gets both right.
+//
+// ## The error estimate is a guess
+//
+// The difference between a rule and the same rule at half the step is an
+// *estimate* of the error, not a bound. A function that oscillates faster
+// than the sampling can see returns a confident wrong answer, and no amount
+// of adaptivity notices — every sample agrees. That is aliasing, and the only
+// defence is knowing something about the function.
+//
+// Checked against `scipy.integrate.quad` on smooth functions, on a function
+// with a kink, and on one with an integrable singularity.
+
+type QuadratureResult = {
+    value: f64,
+    /// An estimate of the error, not a bound.
+    error: f64,
+    /// How many times the function was called.
+    evaluations: i64,
+    converged: bool,
+}
+
+type QuadratureError = | TooFewIntervals(n: i64)
+
+fn absolute(x: f64) -> f64 {
+    if x < 0.0 {
+        return 0.0 - x
+    }
+    return x
+}
+
+/// The trapezoid rule, for comparison.
+pub fn trapezoid(f: fn(f64) -> f64, a: f64, b: f64, n: i64) -> f64 {
+    if n < 1 {
+        return 0.0
+    }
+    let h = (b - a) / n.as_f64()
+    var total = (f(a) + f(b)) / 2.0
+    var i = 1
+    while i < n {
+        total = total + f(a + h * i.as_f64())
+        i = i + 1
+    }
+    return total * h
+}
+
+/// Simpson's rule over `n` intervals, which must be even.
+pub fn simpson(f: fn(f64) -> f64, a: f64, b: f64,
+    n: i64) -> f64 ! QuadratureError {
+    if n < 2 or n % 2 != 0 {
+        fail(TooFewIntervals(n))
+    }
+    let h = (b - a) / n.as_f64()
+    var total = f(a) + f(b)
+    var i = 1
+    while i < n {
+        let x = a + h * i.as_f64()
+        // Odd points weigh four and even points two: the parabola through
+        // each pair of intervals, written as one sum.
+        if i % 2 == 1 {
+            total = total + 4.0 * f(x)
+        } else {
+            total = total + 2.0 * f(x)
+        }
+        i = i + 1
+    }
+    return total * h / 3.0
+}
+
+/// Adaptive Simpson: recurse where the halves disagree.
+///
+/// The comparison is between Simpson over a piece and Simpson over its two
+/// halves; the difference over fifteen is an estimate of the error, from the
+/// fourth-order term the two share. Adding that correction to the finer
+/// answer is Richardson extrapolation and comes free.
+pub fn adaptive_simpson(f: fn(f64) -> f64, a: f64, b: f64, tolerance: f64,
+    max_depth: i64) -> QuadratureResult {
+    let fa = f(a)
+    let fb = f(b)
+    let middle = (a + b) / 2.0
+    let fm = f(middle)
+    let whole = (b - a) / 6.0 * (fa + 4.0 * fm + fb)
+    var evaluations = 3
+    var converged = true
+    let value = refine(f, a, b, fa, fm, fb, whole, tolerance, max_depth,
+        evaluations, converged)
+    return QuadratureResult{ value: value,
+        error: absolute(value - whole), evaluations: evaluations,
+        converged: converged }
+}
+
+fn refine(f: fn(f64) -> f64, a: f64, b: f64, fa: f64, fm: f64, fb: f64,
+    whole: f64, tolerance: f64, depth: i64, inout evaluations: i64,
+    inout converged: bool) -> f64 {
+    let middle = (a + b) / 2.0
+    let left_middle = (a + middle) / 2.0
+    let right_middle = (middle + b) / 2.0
+    let flm = f(left_middle)
+    let frm = f(right_middle)
+    evaluations = evaluations + 2
+    let left = (middle - a) / 6.0 * (fa + 4.0 * flm + fm)
+    let right = (b - middle) / 6.0 * (fm + 4.0 * frm + fb)
+    let both = left + right
+    if depth <= 0 {
+        converged = false
+        return both + (both - whole) / 15.0
+    }
+    if absolute(both - whole) <= 15.0 * tolerance {
+        // Richardson: the finer answer plus a fifteenth of the difference is
+        // two orders better than either.
+        return both + (both - whole) / 15.0
+    }
+    return refine(f, a, middle, fa, flm, fm, left, tolerance / 2.0,
+        depth - 1, evaluations, converged) +
+    refine(f, middle, b, fm, frm, fb, right, tolerance / 2.0,
+        depth - 1, evaluations, converged)
+}
+
+/// Sixteen-point Gauss-Legendre, exact for polynomials to degree 31.
+///
+/// The nodes and weights are the roots of the sixteenth Legendre polynomial
+/// and the integrals of the corresponding Lagrange bases — constants of the
+/// method rather than anything computed here. Only eight of each are listed
+/// because both are symmetric about the middle.
+fn gauss_nodes() -> [f64] {
+    return [0.0950125098376374, 0.2816035507792589, 0.4580167776572274,
+        0.6178762444026438, 0.7554044083550030, 0.8656312023878318,
+        0.9445750230732326, 0.9894009349916499]
+}
+
+fn gauss_weights() -> [f64] {
+    return [0.1894506104550685, 0.1826034150449236, 0.1691565193950025,
+        0.1495959888165767, 0.1246289712555339, 0.0951585116824928,
+        0.0622535239386479, 0.0271524594117541]
+}
+
+/// Gauss-Legendre over one interval.
+pub fn gauss(f: fn(f64) -> f64, a: f64, b: f64) -> f64 {
+    let half = (b - a) / 2.0
+    let centre = (a + b) / 2.0
+    let nodes = gauss_nodes()
+    let weights = gauss_weights()
+    var total = 0.0
+    var i = 0
+    while i < nodes.len() {
+        let offset = half * nodes[i]
+        total = total + weights[i] * (f(centre - offset) +
+            f(centre + offset))
+        i = i + 1
+    }
+    return total * half
+}
+
+/// Gauss-Legendre over `panels` equal pieces.
+///
+/// One panel is exact for a polynomial and merely very good for anything
+/// else; several panels is how a smooth but not polynomial function is
+/// integrated to full precision without adaptivity.
+pub fn gauss_panels(f: fn(f64) -> f64, a: f64, b: f64,
+    panels: i64) -> f64 ! QuadratureError {
+    if panels < 1 {
+        fail(TooFewIntervals(panels))
+    }
+    let width = (b - a) / panels.as_f64()
+    var total = 0.0
+    var i = 0
+    while i < panels {
+        let left = a + width * i.as_f64()
+        total = total + gauss(f, left, left + width)
+        i = i + 1
+    }
+    return total
+}
+
+/// Romberg integration: trapezoid rules at halving steps, extrapolated.
+///
+/// Each column of the table cancels one more order of the error, so the
+/// corner of a five-row table is as good as a trapezoid rule with a thousand
+/// times as many points. It is the classical way to squeeze a smooth function
+/// dry, and it fails completely on one that is not smooth — every
+/// extrapolation assumes the error has a series expansion.
+pub fn romberg(f: fn(f64) -> f64, a: f64, b: f64, rows: i64) -> f64 {
+    if rows < 1 {
+        return 0.0
+    }
+    var table: [[f64]] = []
+    var i = 0
+    while i < rows {
+        var row: [f64] = []
+        let n = (1).shl(i)
+        row.push(trapezoid(f, a, b, n))
+        var j = 1
+        while j <= i {
+            let power = (1).shl(2 * j).as_f64()
+            let better = (power * row[j - 1] - table[i - 1][j - 1]) /
+            (power - 1.0)
+            row.push(better)
+            j = j + 1
+        }
+        table.push(row)
+        i = i + 1
+    }
+    let last = table[rows - 1]
+    return last[last.len() - 1]
+}
+
+/// An improper integral over a half-infinite range, by substitution.
+///
+/// `x = a + t/(1-t)` maps `[0, 1)` onto `[a, infinity)`, and the integrand
+/// picks up a factor of `1/(1-t)^2`. The substitution is the whole technique:
+/// no quadrature rule handles an infinite range, and every one handles the
+/// unit interval.
+pub fn to_infinity(f: fn(f64) -> f64, a: f64, tolerance: f64,
+    max_depth: i64) -> QuadratureResult {
+    let transformed = |t| {
+        let d = 1.0 - t
+        if d <= 0.0 {
+            return 0.0
+        }
+        return f(a + t / d) / (d * d)
+    }
+    return adaptive_simpson(transformed, 0.0, 0.9999999999, tolerance,
+        max_depth)
+}

@@ -1,0 +1,320 @@
+// Throwing away points from a line without changing what it looks like.
+//
+// A GPS track has a point a second and a map shows it two pixels wide. A
+// coastline in a dataset has ten million vertices and a thumbnail has ten
+// thousand pixels. Simplification is the step between, and which algorithm is
+// used decides what the result looks like.
+//
+// ## Two algorithms that answer different questions
+//
+// **Douglas-Peucker** keeps the shape within a distance. Draw a line from the
+// first point to the last, find the point furthest from it; if that distance
+// is under the tolerance, the whole run becomes one segment. Otherwise split
+// there and repeat. The guarantee is geometric — no point of the original is
+// further than the tolerance from the result — and it is the algorithm to use
+// when the question is "how far may this move".
+//
+// **Visvalingam-Whyatt** keeps the shape's *character*. Give every point the
+// area of the triangle it makes with its neighbours, repeatedly remove the
+// smallest, and stop when enough are gone. The guarantee is about how much
+// detail is lost rather than how far anything moved, and the results look
+// better on a coastline: Douglas-Peucker leaves long straight runs and sharp
+// corners, Visvalingam-Whyatt thins evenly.
+//
+// Use Douglas-Peucker when a tolerance is specified — a rendering budget, a
+// coordinate precision. Use Visvalingam-Whyatt when a *count* is specified:
+// "give me a thousand points".
+//
+// ## What neither of them does
+//
+// Keep the line simple. Both can produce a result that crosses itself where
+// the original did not, because both consider one run of points at a time and
+// neither looks at the rest of the line. For a polygon boundary that matters —
+// a self-intersecting outline is not a polygon — and the fix is to check
+// afterwards and reduce the tolerance, which is what `is_simple` is for.
+//
+// Checked against `shapely.simplify` for Douglas-Peucker on random and real
+// paths, including the preserve-topology cases where the two disagree.
+
+import geometry
+
+/// The perpendicular distance from a point to a line through two others.
+///
+/// Perpendicular to the infinite line, not to the segment: that is what
+/// Douglas-Peucker's guarantee is stated over, and using the segment distance
+/// instead keeps points the algorithm should drop.
+pub fn perpendicular_distance(p: Vec2, a: Vec2, b: Vec2) -> f64 {
+    let dx = b.x - a.x
+    let dy = b.y - a.y
+    let length = (dx * dx + dy * dy).sqrt()
+    if length == 0.0 {
+        return geometry.distance(p, a)
+    }
+    var area = (b.x - a.x) * (p.y - a.y) - (b.y - a.y) * (p.x - a.x)
+    if area < 0.0 {
+        area = 0.0 - area
+    }
+    return area / length
+}
+
+/// Douglas-Peucker: no point of the original moves further than `tolerance`.
+pub fn douglas_peucker(points: [Vec2], tolerance: f64) -> [Vec2] {
+    if points.len() < 3 {
+        return points
+    }
+    var keep: [bool] = []
+    for _p in points {
+        keep.push(false)
+    }
+    keep[0] = true
+    keep[points.len() - 1] = true
+    mark(points, 0, points.len() - 1, tolerance, keep)
+    var out: [Vec2] = []
+    var i = 0
+    while i < points.len() {
+        if keep[i] {
+            out.push(points[i])
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn mark(points: [Vec2], from: i64, to: i64, tolerance: f64,
+    inout keep: [bool]) {
+    if to <= from + 1 {
+        return
+    }
+    var furthest = 0.0
+    var at = 0 - 1
+    var i = from + 1
+    while i < to {
+        let d = perpendicular_distance(points[i], points[from], points[to])
+        if d > furthest {
+            furthest = d
+            at = i
+        }
+        i = i + 1
+    }
+    if at < 0 or furthest <= tolerance {
+        return
+    }
+    keep[at] = true
+    mark(points, from, at, tolerance, keep)
+    mark(points, at, to, tolerance, keep)
+}
+
+/// The area of the triangle a point makes with its neighbours.
+pub fn effective_area(a: Vec2, b: Vec2, c: Vec2) -> f64 {
+    var value = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)
+    if value < 0.0 {
+        value = 0.0 - value
+    }
+    return value / 2.0
+}
+
+/// Visvalingam-Whyatt, keeping `wanted` points.
+///
+/// Removing a point changes its neighbours' areas, so the areas are
+/// recomputed as the line shrinks — a version that scores every point once
+/// and then removes the smallest scores is a different and worse algorithm
+/// that produces visible flat spots.
+pub fn visvalingam(points: [Vec2], wanted: i64) -> [Vec2] {
+    if points.len() <= 2 or wanted >= points.len() {
+        return points
+    }
+    var alive: [bool] = []
+    for _p in points {
+        alive.push(true)
+    }
+    var remaining = points.len()
+    let target = if wanted < 2 { 2 } else { wanted }
+    while remaining > target {
+        var smallest = 0.0 - 1.0
+        var at = 0 - 1
+        var previous = 0 - 1
+        var i = 0
+        while i < points.len() {
+            if not alive[i] {
+                i = i + 1
+                continue
+            }
+            let next = next_alive(alive, i)
+            if previous >= 0 and next >= 0 {
+                let area = effective_area(points[previous], points[i],
+                    points[next])
+                if smallest < 0.0 or area < smallest {
+                    smallest = area
+                    at = i
+                }
+            }
+            previous = i
+            i = i + 1
+        }
+        if at < 0 {
+            break
+        }
+        alive[at] = false
+        remaining = remaining - 1
+    }
+    var out: [Vec2] = []
+    var i = 0
+    while i < points.len() {
+        if alive[i] {
+            out.push(points[i])
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn next_alive(alive: [bool], from: i64) -> i64 {
+    var i = from + 1
+    while i < alive.len() {
+        if alive[i] {
+            return i
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+/// Visvalingam-Whyatt to an area threshold rather than a count.
+pub fn visvalingam_by_area(points: [Vec2], minimum_area: f64) -> [Vec2] {
+    if points.len() <= 2 {
+        return points
+    }
+    var current = points
+    while current.len() > 2 {
+        var smallest = 0.0 - 1.0
+        var at = 0 - 1
+        var i = 1
+        while i < current.len() - 1 {
+            let area = effective_area(current[i - 1], current[i],
+                current[i + 1])
+            if smallest < 0.0 or area < smallest {
+                smallest = area
+                at = i
+            }
+            i = i + 1
+        }
+        if at < 0 or smallest >= minimum_area {
+            break
+        }
+        var next: [Vec2] = []
+        var k = 0
+        while k < current.len() {
+            if k != at {
+                next.push(current[k])
+            }
+            k = k + 1
+        }
+        current = next
+    }
+    return current
+}
+
+/// Drop points closer together than `spacing`, keeping the ends.
+///
+/// The cheapest thinning there is, and the one to reach for when the input is
+/// a GPS track that stood still for ten minutes: a hundred points in one
+/// place is not detail, and neither of the algorithms above removes them
+/// particularly well.
+pub fn thin_by_distance(points: [Vec2], spacing: f64) -> [Vec2] {
+    if points.len() < 2 {
+        return points
+    }
+    var out = [points[0]]
+    var i = 1
+    while i < points.len() - 1 {
+        if geometry.distance(out[out.len() - 1], points[i]) >= spacing {
+            out.push(points[i])
+        }
+        i = i + 1
+    }
+    out.push(points[points.len() - 1])
+    return out
+}
+
+/// Whether an open path crosses itself.
+///
+/// The check to run after simplifying a boundary: both algorithms can
+/// introduce a crossing, and a self-intersecting outline is not a polygon
+/// however good it looks.
+///
+/// The path is treated as open — the first and last points are not joined —
+/// so only segments two apart or more are compared, which is exactly the
+/// pairs that do not already share a vertex. For a closed ring the last
+/// segment has to be compared with the first as well, and that is
+/// `triangulate.is_simple`.
+pub fn is_simple(points: [Vec2]) -> bool {
+    var i = 0
+    while i + 1 < points.len() {
+        var j = i + 2
+        while j + 1 < points.len() {
+            if geometry.segments_cross(points[i], points[i + 1], points[j],
+                points[j + 1]) {
+                return false
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return true
+}
+
+/// The length of a path.
+pub fn path_length(points: [Vec2]) -> f64 {
+    var total = 0.0
+    var i = 1
+    while i < points.len() {
+        total = total + geometry.distance(points[i - 1], points[i])
+        i = i + 1
+    }
+    return total
+}
+
+/// The furthest any point of the original is from the simplified line.
+///
+/// The number that says whether a simplification was acceptable, measured
+/// rather than assumed. Douglas-Peucker guarantees it is under the tolerance;
+/// Visvalingam-Whyatt guarantees nothing about it, and this is how to find
+/// out what it did.
+pub fn maximum_deviation(original: [Vec2], simplified: [Vec2]) -> f64 {
+    if simplified.len() < 2 {
+        return 0.0
+    }
+    var worst = 0.0
+    for p in original {
+        var nearest = 0.0 - 1.0
+        var i = 1
+        while i < simplified.len() {
+            let d = segment_distance(p, simplified[i - 1], simplified[i])
+            if nearest < 0.0 or d < nearest {
+                nearest = d
+            }
+            i = i + 1
+        }
+        if nearest > worst {
+            worst = nearest
+        }
+    }
+    return worst
+}
+
+fn segment_distance(p: Vec2, a: Vec2, b: Vec2) -> f64 {
+    let dx = b.x - a.x
+    let dy = b.y - a.y
+    let length_squared = dx * dx + dy * dy
+    if length_squared == 0.0 {
+        return geometry.distance(p, a)
+    }
+    var t = ((p.x - a.x) * dx + (p.y - a.y) * dy) / length_squared
+    if t < 0.0 {
+        t = 0.0
+    }
+    if t > 1.0 {
+        t = 1.0
+    }
+    return geometry.distance(p, geometry.point(a.x + t * dx, a.y + t * dy))
+}

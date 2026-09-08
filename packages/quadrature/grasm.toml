@@ -1,0 +1,6 @@
+[package]
+name = "quadrature"
+version = "1.0.0"
+
+# Arithmetic on a function the caller supplies. Opens nothing.
+capabilities = []

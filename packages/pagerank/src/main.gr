@@ -1,0 +1,263 @@
+// PageRank, and the two corrections that make it converge.
+//
+// The idea is a random surfer: follow links at random for ever, and a page's
+// rank is the fraction of time spent on it. Two things break that as stated,
+// and both fixes are in the original 1998 paper for a reason.
+//
+// ## Dangling nodes
+//
+// A page with no outgoing links is a hole the surfer falls into and never
+// leaves. Rank accumulates there and drains out of everything else. The fix
+// is to treat a page with no links as linking to *everywhere* — the surfer
+// gets bored and jumps. An implementation that skips this loses mass on every
+// iteration and produces ranks that do not sum to one, which is the symptom
+// worth checking for.
+//
+// ## The damping factor
+//
+// With probability 0.15 the surfer jumps to a random page instead of
+// following a link. Without it, a group of pages linking only to each other
+// absorbs all the rank — the "rank sink" — and the answer is dominated by
+// whatever cluster happens to be most inward-looking. The 0.85 is not
+// derived from anything; it is the number the paper used and everyone kept.
+//
+// ## Why power iteration and not solving the system
+//
+// PageRank is the leading eigenvector of a matrix, and for a web-sized graph
+// that matrix has no chance of being formed, let alone inverted. Power
+// iteration only ever needs one multiplication by the adjacency structure,
+// which is a pass over the edges. It converges quickly — the rate is the
+// damping factor, so about fifty iterations gets six digits — and each is
+// linear in the edge count.
+//
+// ## Convergence, measured rather than assumed
+//
+// The loop stops when the total change across a pass falls below a tolerance,
+// and `iterations_taken` reports how many it needed. A run that hits the
+// iteration cap has not converged and the ranks are not the answer, which is
+// worth knowing rather than discovering.
+//
+// Checked against `networkx.pagerank` on random graphs, on graphs with
+// dangling nodes, and on a rank sink.
+
+type RankResult = {
+    rank: [f64],
+    iterations: i64,
+    /// The total change on the last pass.
+    residual: f64,
+    converged: bool,
+}
+
+type RankError = | NoVertices()
+
+pub fn default_damping() -> f64 {
+    return 0.85
+}
+
+/// The ranks, given who links to whom.
+///
+/// `links[v]` is the list of vertices `v` points at. Ranks sum to one, which
+/// is worth asserting: a sum below one means mass leaked, and the usual cause
+/// is a dangling node nobody handled.
+pub fn rank_of(links: [[i64]], damping: f64, tolerance: f64,
+    max_iterations: i64) -> RankResult ! RankError {
+    let n = links.len()
+    if n == 0 {
+        fail(NoVertices())
+    }
+    let size = n.as_f64()
+    var rank: [f64] = []
+    for _i in 0..n {
+        rank.push(1.0 / size)
+    }
+    var iterations = 0
+    var residual = 0.0
+    var converged = false
+    while iterations < max_iterations {
+        var next: [f64] = []
+        for _i in 0..n {
+            next.push(0.0)
+        }
+        // A page with no links sends its rank everywhere, which is what
+        // stops it draining the graph.
+        var dangling = 0.0
+        var v = 0
+        while v < n {
+            if links[v].len() == 0 {
+                dangling = dangling + rank[v]
+            } else {
+                let share = rank[v] / links[v].len().as_f64()
+                for w in links[v] {
+                    next[w] = next[w] + share
+                }
+            }
+            v = v + 1
+        }
+        let jump = (1.0 - damping) / size + damping * dangling / size
+        var change = 0.0
+        v = 0
+        while v < n {
+            let updated = jump + damping * next[v]
+            var d = updated - rank[v]
+            if d < 0.0 {
+                d = 0.0 - d
+            }
+            change = change + d
+            next[v] = updated
+            v = v + 1
+        }
+        rank = next
+        residual = change
+        iterations = iterations + 1
+        if change < tolerance {
+            converged = true
+            break
+        }
+    }
+    return RankResult{ rank: rank, iterations: iterations,
+        residual: residual, converged: converged }
+}
+
+/// The same with the parameters everyone uses.
+pub fn rank(links: [[i64]]) -> RankResult ! RankError {
+    return try rank_of(links, default_damping(), 0.000001, 100)
+}
+
+/// The vertices in rank order, highest first.
+pub fn ranking(result: RankResult) -> [i64] {
+    var order: [i64] = []
+    var i = 0
+    while i < result.rank.len() {
+        order.push(i)
+        i = i + 1
+    }
+    let ranks = result.rank
+    // Sorted by index first so equal ranks come out in a stable order rather
+    // than in whatever order the sort happened to leave them.
+    order.sort()
+    order.sort_by(|v| 0.0 - ranks[v])
+    return order
+}
+
+/// Whether the ranks still sum to one.
+///
+/// The assertion that catches a leak. It should be one to within rounding,
+/// and if it is not, a dangling node is draining the graph.
+pub fn total_rank(result: RankResult) -> f64 {
+    var total = 0.0
+    for r in result.rank {
+        total = total + r
+    }
+    return total
+}
+
+/// The reverse of a link structure: who points at each vertex.
+///
+/// Useful on its own — "what links here" — and the shape a different
+/// formulation of the same computation wants.
+pub fn incoming(links: [[i64]]) -> [[i64]] {
+    var out: [[i64]] = []
+    for _i in 0..links.len() {
+        out.push([])
+    }
+    var v = 0
+    while v < links.len() {
+        for w in links[v] {
+            if w >= 0 and w < out.len() {
+                out[w].push(v)
+            }
+        }
+        v = v + 1
+    }
+    return out
+}
+
+/// Vertices with no outgoing links.
+pub fn dangling_nodes(links: [[i64]]) -> [i64] {
+    var out: [i64] = []
+    var v = 0
+    while v < links.len() {
+        if links[v].len() == 0 {
+            out.push(v)
+        }
+        v = v + 1
+    }
+    return out
+}
+
+/// PageRank biased towards a set of vertices.
+///
+/// The jump goes to those vertices rather than uniformly, which makes the
+/// ranks mean "important *relative to these*". It is what a recommendation
+/// or a topic-sensitive search actually runs, and it is the same loop with
+/// one vector changed.
+pub fn personalised(links: [[i64]], sources: [i64], damping: f64,
+    tolerance: f64, max_iterations: i64) -> RankResult ! RankError {
+    let n = links.len()
+    if n == 0 {
+        fail(NoVertices())
+    }
+    var preference: [f64] = []
+    for _i in 0..n {
+        preference.push(0.0)
+    }
+    if sources.len() == 0 {
+        var i = 0
+        while i < n {
+            preference[i] = 1.0 / n.as_f64()
+            i = i + 1
+        }
+    } else {
+        let share = 1.0 / sources.len().as_f64()
+        for v in sources {
+            if v >= 0 and v < n {
+                preference[v] = preference[v] + share
+            }
+        }
+    }
+    var rank = preference
+    var iterations = 0
+    var residual = 0.0
+    var converged = false
+    while iterations < max_iterations {
+        var next: [f64] = []
+        for _i in 0..n {
+            next.push(0.0)
+        }
+        var dangling = 0.0
+        var v = 0
+        while v < n {
+            if links[v].len() == 0 {
+                dangling = dangling + rank[v]
+            } else {
+                let share = rank[v] / links[v].len().as_f64()
+                for w in links[v] {
+                    next[w] = next[w] + share
+                }
+            }
+            v = v + 1
+        }
+        var change = 0.0
+        v = 0
+        while v < n {
+            let updated = (1.0 - damping) * preference[v] +
+            damping * (next[v] + dangling * preference[v])
+            var d = updated - rank[v]
+            if d < 0.0 {
+                d = 0.0 - d
+            }
+            change = change + d
+            next[v] = updated
+            v = v + 1
+        }
+        rank = next
+        residual = change
+        iterations = iterations + 1
+        if change < tolerance {
+            converged = true
+            break
+        }
+    }
+    return RankResult{ rank: rank, iterations: iterations,
+        residual: residual, converged: converged }
+}

@@ -1,0 +1,10 @@
+[package]
+name = "triangulate"
+version = "1.0.0"
+
+# Arithmetic on a polygon the caller supplies. Opens nothing.
+capabilities = []
+
+[dependencies.geometry]
+path = "../geometry"
+version = "^1.0.0"

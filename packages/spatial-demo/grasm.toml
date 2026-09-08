@@ -1,0 +1,28 @@
+[package]
+name = "spatial_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.convexhull]
+path = "../convexhull"
+version = "^1.0.0"
+
+[dependencies.kdtree]
+path = "../kdtree"
+version = "^1.0.0"
+
+[dependencies.rtree]
+path = "../rtree"
+version = "^1.0.0"
+
+[dependencies.simplify]
+path = "../simplify"
+version = "^1.0.0"
+
+[dependencies.triangulate]
+path = "../triangulate"
+version = "^1.0.0"
+
+[dependencies.geometry]
+path = "../geometry"
+version = "^1.0.0"

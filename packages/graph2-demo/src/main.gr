@@ -1,0 +1,354 @@
+import maxflow
+import matching
+import pagerank
+import centrality
+import spanning
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn near(a: f64, b: f64) -> bool {
+    let d = a - b
+    return d < 0.000001 and d > 0.0 - 0.000001
+}
+
+// --------------------------------------------------------------- maxflow
+
+/// The network from Cormen, Leiserson, Rivest and Stein, chapter 26.
+fn clrs() -> FlowNetwork {
+    var n = maxflow.new_network(6)
+    for e in [[0, 1, 16], [0, 2, 13], [1, 2, 10], [2, 1, 4], [1, 3, 12],
+        [3, 2, 9], [2, 4, 14], [4, 3, 7], [3, 5, 20], [4, 5, 4]] {
+        let _r: () ! FlowError = maxflow.add_edge(n, e[0], e[1], e[2])
+    }
+    return n
+}
+
+fn check_maxflow(inout f: i64) / {io} {
+    print("-- maxflow: the residual edge is what lets it change its mind")
+    var n = clrs()
+    let flow: i64 ! FlowError = maxflow.max_flow(n, 0, 5)
+    // `networkx.maximum_flow` gives 23 for this network.
+    say(f, "the textbook network carries twenty-three", (flow ?? 0) == 23)
+    say(f, "and the flow it found conserves and respects capacity",
+        maxflow.is_valid_flow(n, 0, 5))
+    var cut = 0
+    for e in maxflow.min_cut(n, 0) {
+        cut = cut + e.2
+    }
+    say(f, "the minimum cut equals it, which is the theorem", cut == 23)
+    say(f, "and the source side is the one networkx names",
+        maxflow.source_side(n, 0).len() == 4 and
+        maxflow.source_side(n, 0)[3] == 4)
+    // Ford-Fulkerson takes two million steps here; Dinic's takes four.
+    var w = maxflow.new_network(4)
+    for e in [[0, 1, 1000000], [0, 2, 1000000], [1, 2, 1],
+        [1, 3, 1000000], [2, 3, 1000000]] {
+        let _r: () ! FlowError = maxflow.add_edge(w, e[0], e[1], e[2])
+    }
+    let big: i64 ! FlowError = maxflow.max_flow(w, 0, 3)
+    say(f, "the capacity-scaling worst case runs in phases, not in units",
+        (big ?? 0) == 2000000)
+    var empty = maxflow.new_network(2)
+    let none: i64 ! FlowError = maxflow.max_flow(empty, 0, 1)
+    say(f, "a network with no edges carries nothing", (none ?? 0 - 1) == 0)
+    var self_flow = clrs()
+    let same: i64 ! FlowError = maxflow.max_flow(self_flow, 3, 3)
+    say(f, "source and sink together is zero, not an error",
+        (same ?? 0 - 1) == 0)
+    say(f, "a vertex that does not exist is an error",
+        refuses_vertex())
+    say(f, "and so is a negative capacity", refuses_capacity())
+}
+
+fn refuses_vertex() -> bool {
+    var n = maxflow.new_network(2)
+    match maxflow.add_edge(n, 0, 5, 1) {
+        Ok(_v) -> {
+            return false
+        }
+        Err(_e) -> {
+            return true
+        }
+    }
+}
+
+fn refuses_capacity() -> bool {
+    var n = maxflow.new_network(2)
+    match maxflow.add_edge(n, 0, 1, 0 - 5) {
+        Ok(_v) -> {
+            return false
+        }
+        Err(_e) -> {
+            return true
+        }
+    }
+}
+
+// -------------------------------------------------------------- matching
+
+fn check_matching(inout f: i64) / {io} {
+    print("-- matching: maximal is not maximum, and greedy is not cheapest")
+    let adjacency = [[0, 1], [0], [1, 2], [2, 3], [3]]
+    let pairing = matching.maximum_matching(adjacency, 4)
+    // `networkx.hopcroft_karp_matching` finds four pairs here too.
+    say(f, "all five workers but one get a job",
+        matching.matching_size(pairing) == 4)
+    // Greedy takes 0's first option and leaves 1 with nothing.
+    let tiny = [[0, 1], [0]]
+    say(f, "greedy finds a maximal matching, not a maximum one",
+        matching.matching_size(matching.greedy_matching(tiny, 2)) == 1 and
+        matching.matching_size(matching.maximum_matching(tiny, 2)) == 2)
+    let cover = matching.minimum_vertex_cover(adjacency, 4, pairing)
+    say(f, "and König says the smallest cover is the size of the matching",
+        cover.0.len() + cover.1.len() == 4)
+    say(f, "a graph with no edges has an empty matching",
+        matching.matching_size(matching.maximum_matching([[], []], 2)) == 0)
+
+    // `scipy.optimize.linear_sum_assignment` gives columns 1, 0, 2 at cost 5.
+    let cost = [[4, 1, 3], [2, 0, 5], [3, 2, 2]]
+    let columns = matching.assign(cost) ?? []
+    say(f, "the cheapest assignment is the one scipy finds",
+        columns.len() == 3 and columns[0] == 1 and columns[1] == 0 and
+        columns[2] == 2 and
+        matching.assignment_cost(cost, columns) == 5)
+    // Greedy takes the 1 and is left with the 100.
+    let trap = [[1, 2], [2, 100]]
+    say(f, "greedy assignment is wrong on a two-by-two matrix",
+        matching.assignment_cost(trap, matching.assign(trap) ?? []) == 4 and
+        matching.assignment_cost(trap,
+            matching.greedy_assignment(trap)) == 101)
+    let padded = matching.square_off([[1, 2, 3], [4, 5, 6]], 99)
+    say(f, "a rectangular problem is squared off with a finite padding",
+        padded.len() == 3 and padded[2][0] == 99)
+    say(f, "a ragged cost matrix is an error rather than a guess",
+        refuses_ragged())
+}
+
+fn refuses_ragged() -> bool {
+    match matching.assign([[1, 2], [3]]) {
+        Ok(_c) -> {
+            return false
+        }
+        Err(_e) -> {
+            return true
+        }
+    }
+}
+
+// -------------------------------------------------------------- pagerank
+
+fn check_pagerank(inout f: i64) / {io} {
+    print("-- pagerank: the dangling node is where the rank leaks")
+    let links = [[1, 2], [2], [0], []]
+    let r: RankResult ! RankError =
+    pagerank.rank_of(links, 0.85, 0.0000000001, 200)
+    let result = r ?? empty_result()
+    // `networkx.pagerank` gives these to eight decimal places.
+    say(f, "the ranks are the ones networkx computes",
+        near(result.rank[0], 0.36932353) and
+        near(result.rank[1], 0.20458155) and
+        near(result.rank[2], 0.37847587) and
+        near(result.rank[3], 0.04761905))
+    say(f, "and they sum to one, so nothing leaked out of the dangling node",
+        near(pagerank.total_rank(result), 1.0))
+    say(f, "it converged, and says how many passes it took",
+        result.converged and result.iterations < 100 and
+        result.residual < 0.0000000001)
+    say(f, "the dangling node is found and reported",
+        pagerank.dangling_nodes(links).len() == 1 and
+        pagerank.dangling_nodes(links)[0] == 3)
+    say(f, "the ranking puts the most linked-to first",
+        pagerank.ranking(result)[0] == 2 and
+        pagerank.ranking(result)[3] == 3)
+    say(f, "reversing the links says who points at whom",
+        pagerank.incoming(links)[2].len() == 2)
+    let biased: RankResult ! RankError =
+    pagerank.personalised(links, [3], 0.85, 0.0000000001, 200)
+    let towards = biased ?? empty_result()
+    say(f, "a personalised jump moves the mass towards its sources",
+        towards.rank[3] > result.rank[3] and
+        near(pagerank.total_rank(towards), 1.0))
+    say(f, "a graph with no vertices is an error, not a division by zero",
+        refuses_empty_graph())
+}
+
+fn empty_result() -> RankResult {
+    return RankResult{ rank: [], iterations: 0, residual: 0.0,
+        converged: false }
+}
+
+fn refuses_empty_graph() -> bool {
+    match pagerank.rank([]) {
+        Ok(_r) -> {
+            return false
+        }
+        Err(_e) -> {
+            return true
+        }
+    }
+}
+
+// ------------------------------------------------------------ centrality
+
+/// Two four-cliques joined by a single edge — the graph where the four
+/// measures disagree.
+fn barbell() -> [[i64]] {
+    return [[1, 2, 3], [0, 2, 3], [0, 1, 3], [0, 1, 2, 4], [3, 5, 6, 7],
+        [4, 6, 7], [4, 5, 7], [4, 5, 6]]
+}
+
+fn check_centrality(inout f: i64) / {io} {
+    print("-- centrality: four honest answers that disagree")
+    let g = barbell()
+    // Every value below is `networkx`'s for the same graph.
+    let d = centrality.degree(g) ?? []
+    say(f, "degree barely separates the bridge from the rest",
+        near(d[0], 0.428571) and near(d[3], 0.571429))
+    let c = centrality.closeness(g) ?? []
+    say(f, "closeness separates it a little more",
+        near(c[0], 0.5) and near(c[3], 0.7))
+    let b = centrality.betweenness(g) ?? []
+    say(f, "and betweenness separates it completely",
+        near(b[0], 0.0) and near(b[3], 12.0) and near(b[4], 12.0))
+    let bn = centrality.normalised_betweenness(g) ?? []
+    say(f, "normalised, so two graphs can be compared",
+        near(bn[3], 0.571429))
+    let e = centrality.eigenvector(g, 1000, 0.0000000001) ?? []
+    say(f, "eigenvector centrality agrees with networkx to six places",
+        near(e[0], 0.32626) and near(e[3], 0.425044))
+    let winners = centrality.most_central(g) ?? (0 - 1, 0 - 1, 0 - 1)
+    say(f, "the three measures name the same vertex on this graph",
+        winners.0 == 3 and winners.1 == 3 and winners.2 == 3)
+    say(f, "a path's ends are the least central by every measure",
+        least_central_is_end())
+    say(f, "an empty graph is an error rather than an empty answer",
+        refuses_no_vertices())
+    say(f, "distances from a vertex mark the unreachable as -1",
+        centrality.distances_from([[1], [0], []], 0)[2] == 0 - 1)
+}
+
+fn least_central_is_end() -> bool {
+    let path = [[1], [0, 2], [1, 2 + 1], [2]]
+    let b = centrality.betweenness(path) ?? []
+    return b[0] == 0.0 and b[3] == 0.0 and b[1] > 0.0
+}
+
+fn refuses_no_vertices() -> bool {
+    match centrality.degree([]) {
+        Ok(_d) -> {
+            return false
+        }
+        Err(_e) -> {
+            return true
+        }
+    }
+}
+
+// -------------------------------------------------------------- spanning
+
+fn weighted() -> [SpanEdge] {
+    var out: [SpanEdge] = []
+    for e in [[0, 1, 4], [0, 2, 8], [1, 2, 11], [1, 3, 8], [2, 4, 7],
+        [3, 4, 2], [3, 5, 7], [4, 5, 6], [0, 3, 9]] {
+        out.push(spanning.edge(e[0], e[1], e[2]))
+    }
+    return out
+}
+
+fn check_spanning(inout f: i64) / {io} {
+    print("-- spanning: the tree is not unique and the total is")
+    let edges = weighted()
+    let tree = spanning.minimum_forest(6, edges)
+    // `networkx.minimum_spanning_tree` gives the same weight and edge set.
+    say(f, "five edges connect six vertices, at a total of twenty-seven",
+        tree.len() == 5 and spanning.total_weight(tree) == 27)
+    let prim: [SpanEdge] ! SpanError = spanning.prim(6, edges, 0)
+    say(f, "and Prim finds a tree of the same total from the other end",
+        spanning.total_weight(prim ?? []) == 27)
+    say(f, "a disconnected graph gives a forest, and says so when asked",
+        spanning.minimum_forest(4, [spanning.edge(0, 1, 1)]).len() == 1 and
+        refuses_disconnected())
+    say(f, "the components a forest connects are countable",
+        spanning.component_count(4, [spanning.edge(0, 1, 1),
+            spanning.edge(2, 3, 1)]) == 2)
+    // Cutting the two longest edges of the tree is single-linkage clustering.
+    let clusters = spanning.cut_longest(6, edges, 3)
+    say(f, "cutting the longest edges is single-linkage clustering",
+        distinct(clusters) == 3)
+    let widest: i64 ! SpanError = spanning.bottleneck(6, edges, 0, 5)
+    say(f, "the widest path's bottleneck is on the spanning tree",
+        (widest ?? 0 - 1) == 8)
+    say(f, "a vertex outside the graph is an error",
+        refuses_bad_vertex())
+    say(f, "ties are broken the same way twice, so the tree is reproducible",
+        same_twice())
+}
+
+fn distinct(labels: [i64]) -> i64 {
+    var seen = map()
+    for l in labels {
+        seen.set(l, true)
+    }
+    return seen.len()
+}
+
+fn refuses_disconnected() -> bool {
+    match spanning.minimum_tree(4, [spanning.edge(0, 1, 1)]) {
+        Ok(_t) -> {
+            return false
+        }
+        Err(_e) -> {
+            return true
+        }
+    }
+}
+
+fn refuses_bad_vertex() -> bool {
+    match spanning.prim(3, [spanning.edge(0, 1, 1)], 9) {
+        Ok(_t) -> {
+            return false
+        }
+        Err(_e) -> {
+            return true
+        }
+    }
+}
+
+fn same_twice() -> bool {
+    let ties = [spanning.edge(0, 1, 1), spanning.edge(1, 2, 1),
+        spanning.edge(0, 2, 1)]
+    let a = spanning.minimum_forest(3, ties)
+    let b = spanning.minimum_forest(3, ties)
+    if a.len() != b.len() {
+        return false
+    }
+    var i = 0
+    while i < a.len() {
+        if a[i].from != b[i].from or a[i].to != b[i].to {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn main() / {io} {
+    var f = 0
+    check_maxflow(f)
+    check_matching(f)
+    check_pagerank(f)
+    check_centrality(f)
+    check_spanning(f)
+    if f == 0 {
+        print("graphs: every claim held")
+    } else {
+        print("graphs: {f} claims failed")
+    }
+}

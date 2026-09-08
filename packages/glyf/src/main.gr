@@ -1,0 +1,389 @@
+// Glyph outlines: quadratic curves, packed as tightly as 1990 allowed.
+//
+// A TrueType glyph is a set of closed contours of points, and every point is
+// either **on** the curve or **off** it. Two on-curve points with an off-curve
+// one between them are a quadratic Bézier; two on-curve points in a row are a
+// straight line. That is the whole geometry, and it is why TrueType outlines
+// are quadratic where PostScript ones are cubic.
+//
+// ## The implied on-curve point
+//
+// Two consecutive off-curve points imply an on-curve point exactly halfway
+// between them. It is not stored, it is not flagged, and a renderer that does
+// not insert it draws a corner where the font has a smooth curve. This is the
+// single detail that makes TrueType outlines look wrong when implemented from
+// a casual reading, and it exists purely to save two bytes per occurrence.
+//
+// ## The packing
+//
+// Coordinates are deltas, and each may be one byte or two depending on a flag
+// bit — and a *third* bit means "the same as the last one", storing nothing at
+// all. Flags themselves repeat: a flag with bit 3 set is followed by a count
+// of how many more points share it. So the arrays cannot be indexed; they must
+// be walked, and the x coordinates must be walked completely before the y
+// coordinates can even be found.
+//
+// ## `loca`, and the two formats
+//
+// Where a glyph's data starts is in `loca`, as either 16-bit offsets divided
+// by two or 32-bit offsets — and which one is a flag in `head`, three tables
+// away. A glyph whose offset equals the next one has no outline at all: that
+// is a space, and it is not an error.
+//
+// ## Composite glyphs
+//
+// `é` is usually not an outline. It is a reference to `e` and a reference to
+// an acute accent, each with a placement. That saves a great deal of space
+// and means a renderer must resolve components recursively — and a font can
+// nest them, so the recursion needs a depth limit that this provides.
+//
+// Checked against `fontTools`' own glyph outlines for system fonts: the same
+// contours, the same points, and the same on-curve flags.
+
+type GlyphPoint = {
+    x: i64,
+    y: i64,
+    /// False for a control point of a quadratic curve.
+    on_curve: bool,
+}
+
+type Glyph = {
+    /// Negative for a composite glyph.
+    contour_count: i64,
+    x_min: i64,
+    y_min: i64,
+    x_max: i64,
+    y_max: i64,
+    /// The index of the last point of each contour.
+    contour_ends: [i64],
+    points: [GlyphPoint],
+    /// Glyph indices this one is built from, for a composite.
+    components: [i64],
+}
+
+type GlyfError =
+    | NoSuchGlyph(glyph: i64)
+    | Truncated(glyph: i64)
+    | TooDeep(glyph: i64)
+
+fn read16(data: bytes, at: i64) -> i64 {
+    if at + 2 > data.len() {
+        return 0
+    }
+    return data.at(at).shl(8).bit_or(data.at(at + 1))
+}
+
+fn read_signed16(data: bytes, at: i64) -> i64 {
+    let value = read16(data, at)
+    if value >= 32768 {
+        return value - 65536
+    }
+    return value
+}
+
+fn read32(data: bytes, at: i64) -> i64 {
+    if at + 4 > data.len() {
+        return 0
+    }
+    return data.at(at).shl(24).bit_or(data.at(at + 1).shl(16))
+        .bit_or(data.at(at + 2).shl(8)).bit_or(data.at(at + 3))
+}
+
+pub fn empty_glyph() -> Glyph {
+    return Glyph{ contour_count: 0, x_min: 0, y_min: 0, x_max: 0, y_max: 0,
+        contour_ends: [], points: [], components: [] }
+}
+
+/// Where a glyph's outline starts and ends, from `loca`.
+///
+/// The short format stores half the offset, because every glyph is padded to
+/// an even length — a doubling that saves half the table and catches every
+/// reader that forgets it.
+pub fn glyph_range(loca: bytes, long_format: bool,
+    glyph: i64) -> (i64, i64) ! GlyfError {
+    if glyph < 0 {
+        fail(NoSuchGlyph(glyph))
+    }
+    if long_format {
+        if (glyph + 2) * 4 > loca.len() {
+            fail(NoSuchGlyph(glyph))
+        }
+        return (read32(loca, glyph * 4), read32(loca, glyph * 4 + 4))
+    }
+    if (glyph + 2) * 2 > loca.len() {
+        fail(NoSuchGlyph(glyph))
+    }
+    return (read16(loca, glyph * 2) * 2, read16(loca, glyph * 2 + 2) * 2)
+}
+
+/// Whether a glyph has any outline. A space does not, and that is normal.
+pub fn is_empty(loca: bytes, long_format: bool, glyph: i64) -> bool {
+    match glyph_range(loca, long_format, glyph) {
+        Ok(span) -> {
+            return span.1 <= span.0
+        }
+        Err(_e) -> {
+            return true
+        }
+    }
+}
+
+/// One glyph's outline.
+pub fn parse_glyph(glyf: bytes, loca: bytes, long_format: bool,
+    glyph: i64) -> Glyph ! GlyfError {
+    let span = try glyph_range(loca, long_format, glyph)
+    if span.1 <= span.0 {
+        return empty_glyph()
+    }
+    if span.1 > glyf.len() {
+        fail(Truncated(glyph))
+    }
+    let at = span.0
+    var out = empty_glyph()
+    out.contour_count = read_signed16(glyf, at)
+    out.x_min = read_signed16(glyf, at + 2)
+    out.y_min = read_signed16(glyf, at + 4)
+    out.x_max = read_signed16(glyf, at + 6)
+    out.y_max = read_signed16(glyf, at + 8)
+    if out.contour_count < 0 {
+        out.components = read_components(glyf, at + 10)
+        return out
+    }
+    var cursor = at + 10
+    var i = 0
+    while i < out.contour_count {
+        out.contour_ends.push(read16(glyf, cursor))
+        cursor = cursor + 2
+        i = i + 1
+    }
+    let point_count = if out.contour_ends.len() == 0 { 0 } else {
+        out.contour_ends[out.contour_ends.len() - 1] + 1
+    }
+    // Skip the hinting instructions, which are a program this does not run.
+    let instruction_length = read16(glyf, cursor)
+    cursor = cursor + 2 + instruction_length
+
+    let flags = read_flags(glyf, cursor, point_count)
+    if flags.len() < point_count {
+        fail(Truncated(glyph))
+    }
+    // Then every x, then every y — the arrays are not interleaved, and the
+    // y array cannot be found without walking the x one.
+    let xs = read_coordinates(glyf, cursor, flags, 2, 16)
+    let ys = read_coordinates(glyf, cursor, flags, 4, 32)
+    var i2 = 0
+    while i2 < point_count {
+        out.points.push(GlyphPoint{ x: xs[i2], y: ys[i2],
+            on_curve: flags[i2].bit_and(1) != 0 })
+        i2 = i2 + 1
+    }
+    return out
+}
+
+/// The per-point flags, with the repeat counts expanded.
+///
+/// A flag with bit 3 set is followed by a count of how many more points share
+/// it, so the array in the file is shorter than the point count and cannot be
+/// indexed.
+fn read_flags(glyf: bytes, inout cursor: i64, point_count: i64) -> [i64] {
+    var flags: [i64] = []
+    while flags.len() < point_count and cursor < glyf.len() {
+        let flag = glyf.at(cursor)
+        cursor = cursor + 1
+        flags.push(flag)
+        if flag.bit_and(8) != 0 and cursor < glyf.len() {
+            let repeats = glyf.at(cursor)
+            cursor = cursor + 1
+            var k = 0
+            while k < repeats and flags.len() < point_count {
+                flags.push(flag)
+                k = k + 1
+            }
+        }
+    }
+    return flags
+}
+
+/// One coordinate array, as running deltas.
+///
+/// `short_bit` says the delta is one byte and `same_bit` means two things at
+/// once: with the short bit it is the sign, and without it the delta is zero
+/// and nothing at all is stored. That overloading is what makes the arrays
+/// unindexable and is where two bytes per point were saved in 1990.
+fn read_coordinates(glyf: bytes, inout cursor: i64, flags: [i64],
+    short_bit: i64, same_bit: i64) -> [i64] {
+    var out: [i64] = []
+    var value = 0
+    var i = 0
+    while i < flags.len() {
+        let flag = flags[i]
+        if flag.bit_and(short_bit) != 0 {
+            let delta = glyf.at(cursor)
+            cursor = cursor + 1
+            if flag.bit_and(same_bit) != 0 {
+                value = value + delta
+            } else {
+                value = value - delta
+            }
+        } else {
+            if flag.bit_and(same_bit) == 0 {
+                value = value + read_signed16(glyf, cursor)
+                cursor = cursor + 2
+            }
+        }
+        out.push(value)
+        i = i + 1
+    }
+    return out
+}
+
+fn read_components(glyf: bytes, from: i64) -> [i64] {
+    var out: [i64] = []
+    var cursor = from
+    var more = true
+    while more and cursor + 4 <= glyf.len() {
+        let flags = read16(glyf, cursor)
+        out.push(read16(glyf, cursor + 2))
+        cursor = cursor + 4
+        // ARG_1_AND_2_ARE_WORDS
+        if flags.bit_and(1) != 0 {
+            cursor = cursor + 4
+        } else {
+            cursor = cursor + 2
+        }
+        if flags.bit_and(8) != 0 {
+            cursor = cursor + 2
+        }
+        if flags.bit_and(64) != 0 {
+            cursor = cursor + 4
+        }
+        if flags.bit_and(128) != 0 {
+            cursor = cursor + 8
+        }
+        // MORE_COMPONENTS
+        more = flags.bit_and(32) != 0
+    }
+    return out
+}
+
+pub fn is_composite(g: Glyph) -> bool {
+    return g.contour_count < 0
+}
+
+/// Every glyph a composite is built from, following nesting.
+pub fn resolve_components(glyf: bytes, loca: bytes, long_format: bool,
+    glyph: i64, depth: i64) -> [i64] ! GlyfError {
+    if depth <= 0 {
+        fail(TooDeep(glyph))
+    }
+    let g = try parse_glyph(glyf, loca, long_format, glyph)
+    if not is_composite(g) {
+        return [glyph]
+    }
+    var out: [i64] = []
+    for component in g.components {
+        for inner in try resolve_components(glyf, loca, long_format,
+            component, depth - 1) {
+            out.push(inner)
+        }
+    }
+    return out
+}
+
+/// The points of one contour, with the implied on-curve points inserted.
+///
+/// Two off-curve points in a row imply an on-curve point midway between them.
+/// It is not in the file and a renderer that leaves it out draws a corner
+/// where the design has a curve — the mistake every first implementation
+/// makes.
+pub fn contour_with_implied(g: Glyph, contour: i64) -> [GlyphPoint] {
+    var out: [GlyphPoint] = []
+    if contour < 0 or contour >= g.contour_ends.len() {
+        return out
+    }
+    let start = if contour == 0 { 0 } else { g.contour_ends[contour - 1] + 1 }
+    let end = g.contour_ends[contour]
+    if end < start {
+        return out
+    }
+    let count = end - start + 1
+    var i = 0
+    while i < count {
+        let here = g.points[start + i]
+        let next = g.points[start + (i + 1) % count]
+        out.push(here)
+        if not here.on_curve and not next.on_curve {
+            out.push(GlyphPoint{ x: (here.x + next.x) / 2,
+                y: (here.y + next.y) / 2, on_curve: true })
+        }
+        i = i + 1
+    }
+    return out
+}
+
+/// How many contours a glyph has.
+pub fn contour_count(g: Glyph) -> i64 {
+    if g.contour_count < 0 {
+        return 0
+    }
+    return g.contour_ends.len()
+}
+
+/// The bounding box the glyph declares.
+pub fn bounds(g: Glyph) -> (i64, i64, i64, i64) {
+    return (g.x_min, g.y_min, g.x_max, g.y_max)
+}
+
+/// The bounding box its points actually occupy.
+///
+/// The two should agree. When they do not the font has been edited by
+/// something that moved points and did not update the header, and a renderer
+/// caching by the declared box will clip the glyph.
+pub fn measured_bounds(g: Glyph) -> (i64, i64, i64, i64) {
+    if g.points.len() == 0 {
+        return (0, 0, 0, 0)
+    }
+    var x_min = g.points[0].x
+    var y_min = g.points[0].y
+    var x_max = x_min
+    var y_max = y_min
+    for p in g.points {
+        if p.x < x_min {
+            x_min = p.x
+        }
+        if p.x > x_max {
+            x_max = p.x
+        }
+        if p.y < y_min {
+            y_min = p.y
+        }
+        if p.y > y_max {
+            y_max = p.y
+        }
+    }
+    return (x_min, y_min, x_max, y_max)
+}
+
+pub fn bounds_agree(g: Glyph) -> bool {
+    if g.points.len() == 0 {
+        return true
+    }
+    let measured = measured_bounds(g)
+    return measured.0 == g.x_min and measured.1 == g.y_min and
+    measured.2 == g.x_max and measured.3 == g.y_max
+}
+
+/// How many points a glyph has, on and off the curve.
+pub fn point_count(g: Glyph) -> i64 {
+    return g.points.len()
+}
+
+pub fn on_curve_count(g: Glyph) -> i64 {
+    var n = 0
+    for p in g.points {
+        if p.on_curve {
+            n = n + 1
+        }
+    }
+    return n
+}

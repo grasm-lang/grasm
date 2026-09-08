@@ -1,0 +1,10 @@
+[package]
+name = "simplify"
+version = "1.0.0"
+
+# Arithmetic on a line the caller supplies. Opens nothing.
+capabilities = []
+
+[dependencies.geometry]
+path = "../geometry"
+version = "^1.0.0"
