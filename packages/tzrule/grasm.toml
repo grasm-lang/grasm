@@ -1,0 +1,6 @@
+[package]
+name = "tzrule"
+version = "1.0.0"
+
+# Evaluates a rule string. Opens nothing.
+capabilities = []

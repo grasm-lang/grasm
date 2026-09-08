@@ -14,7 +14,7 @@ plan that discovers them 300 packages in.
 | | |
 |---|---|
 | Started | 78 |
-| Now | 370 |
+| Now | 375 |
 | Tier 1 target | 200 |
 | Tier 2 target | 500 |
 | Tier 3 target | 800 |
@@ -235,7 +235,7 @@ says where the data came from and under what licence, which is the condition.
 | ~~Database internals~~ | ~~`bplustree` `heapfile` `queryplan` `costmodel` `bitmapindex`~~ — done | SQLite's own plans |
 | ~~Compiler tooling~~ | ~~`lexgen` `parsegen` `firstfollow` `ssaform` `regalloc`~~ — done | Lark, networkx, Python re |
 | ~~Scientific units~~ | ~~`siunits` `constants` `uncertainty` `dimension` `unitparse`~~ — done | pint, CODATA via scipy, uncertainties |
-| Time zones | `tzfile` `tzrule` `sunrise` `solar` `leapsecond` | zoneinfo, astral |
+| ~~Time zones~~ | ~~`tzfile` `tzrule` `sunrise` `solar` `leapsecond`~~ — done | zoneinfo, astral, IERS |
 | Statistics III | `bootstrap` `anova` `survival` `timeseries` `changepoint` | scipy, statsmodels |
 | Machine learning basics | `kmeans` `naivebayes` `decisiontree` `knn` `mlmetrics` | scikit-learn |
 | Security III | `passwordpolicy` `entropy` `secretscan` `keyderive` `saltedhash` | zxcvbn, gitleaks rules |

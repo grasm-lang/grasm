@@ -1,0 +1,336 @@
+import tzfile
+import tzrule
+import leapsecond
+import solar
+import sunrise
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn near(a: f64, b: f64, tolerance: f64) -> bool {
+    var d = a - b
+    if d < 0.0 {
+        d = 0.0 - d
+    }
+    return d < tolerance
+}
+
+// The system's own `Asia/Kolkata`, which is small, has a half-hour offset,
+// and carries the wartime daylight saving nobody remembers.
+fn kolkata() -> bytes {
+    return bytes_of([
+        84, 90, 105, 102, 50, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 6, 0, 0, 0, 4, 0,
+        0, 0, 18, 128, 0, 0, 0, 135, 157, 188, 186, 202, 219, 140, 40,
+        204, 5, 113, 24, 204, 149, 50, 168, 210, 116, 18, 152, 1, 2, 3,
+        2, 3, 2, 0, 0, 82, 216, 0, 0, 0, 0, 75, 70, 0, 4, 0, 0, 77, 88,
+        0, 8, 0, 0, 91, 104, 1, 12, 76, 77, 84, 0, 77, 77, 84, 0, 73, 83,
+        84, 0, 43, 48, 54, 51, 48, 0, 84, 90, 105, 102, 50, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 7, 0, 0, 0, 5, 0, 0, 0, 22, 255, 255, 255, 255, 38,
+        186, 24, 40, 255, 255, 255, 255, 67, 231, 235, 48, 255, 255, 255,
+        255, 135, 157, 188, 186, 255, 255, 255, 255, 202, 219, 140, 40,
+        255, 255, 255, 255, 204, 5, 113, 24, 255, 255, 255, 255, 204,
+        149, 50, 168, 255, 255, 255, 255, 210, 116, 18, 152, 1, 2, 3, 4,
+        3, 4, 3, 0, 0, 82, 216, 0, 0, 0, 0, 82, 208, 0, 4, 0, 0, 75, 70,
+        0, 8, 0, 0, 77, 88, 0, 12, 0, 0, 91, 104, 1, 16, 76, 77, 84, 0,
+        72, 77, 84, 0, 77, 77, 84, 0, 73, 83, 84, 0, 43, 48, 54, 51, 48,
+        0, 10, 73, 83, 84, 45, 53, 58, 51, 48, 10])
+}
+
+fn zone() -> TzData {
+    return tzfile.parse(kolkata()) ?? TzData{ version: 0, transitions: [],
+        type_of: [], types: [], leaps: [], footer: "" }
+}
+
+fn check_tzfile(inout f: i64) / {io} {
+    print("-- tzfile: the binary file behind every timezone name")
+    let tz = zone()
+    say(f, "a TZif file says its own version, and this one is 2",
+        tzfile.is_tzif(kolkata()) and tzfile.version(kolkata()) == 2 and
+        tz.version == 2)
+    // Python's zoneinfo agrees with all of these.
+    say(f, "India is five and a half hours ahead, which is not an hour",
+        (tzfile.offset_at(tz, 0) ?? 0) == 19800 and
+        (tzfile.abbreviation_at_instant(tz, 0) ?? "") == "IST" and
+        not tzfile.is_dst_at(tz, 0))
+    // Wartime daylight saving, which is in the file and in nobody's memory.
+    say(f, "and it had daylight saving during the war, at half past six",
+        (tzfile.offset_at(tz, 0 - 850824000) ?? 0) == 23400 and
+        (tzfile.abbreviation_at_instant(tz, 0 - 850824000) ?? "") ==
+        "+0630" and tzfile.is_dst_at(tz, 0 - 850824000) and
+        tzfile.uses_dst(tz))
+    say(f, "which had ended by 1946",
+        (tzfile.offset_at(tz, 0 - 756129600) ?? 0) == 19800 and
+        not tzfile.is_dst_at(tz, 0 - 756129600))
+    // Before the first transition the file's first *standard* type applies,
+    // which is not necessarily type zero.
+    say(f, "before the first transition the first standard type applies",
+        (tzfile.offset_at(tz, 0 - 4000000000) ?? 0) != 19800 and
+        tzfile.transition_count(tz) == 7)
+    say(f, "the abbreviations are every name the zone has ever used",
+        tzfile.abbreviations(tz) == ["LMT", "HMT", "MMT", "IST", "+0630"])
+    // The footer is the rule for everything past the last transition.
+    say(f, "and the footer is the rule that governs the future",
+        tz.footer == "IST-5:30")
+    say(f, "an ordinary zone carries no leap seconds, and that is deliberate",
+        tz.leaps.len() == 0 and tzfile.leap_correction(tz, 0) == 0)
+    say(f, "the next transition after an instant is findable without a scan",
+        tzfile.next_transition(tz, 0 - 1000000000) > 0 - 1000000000 and
+        tzfile.next_transition(tz, 4000000000) == 0 - 1)
+    say(f, "something that is not a TZif file is refused",
+        not tzfile.is_tzif("PK\u{03}\u{04}".to_bytes()) and
+        parse_refused("PK\u{03}\u{04}".to_bytes()))
+}
+
+fn parse_refused(data: bytes) -> bool {
+    match tzfile.parse(data) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+// ---------------------------------------------------------------- tzrule
+
+fn rule_of(text: str) -> TimezoneRule {
+    return tzrule.parse(text) ?? TimezoneRule{ standard_name: "",
+        standard_offset: 0, daylight_name: "", daylight_offset: 0,
+        has_daylight: false,
+        start: RuleDate{ kind: "", month: 0, week: 0, day: 0,
+            at_second: 0 },
+        stop: RuleDate{ kind: "", month: 0, week: 0, day: 0,
+            at_second: 0 } }
+}
+
+fn check_tzrule(inout f: i64) / {io} {
+    print("-- tzrule: a whole timezone in twenty characters")
+    let london = rule_of("GMT0BST,M3.5.0/1,M10.5.0")
+    // The offset in a TZ string is west-positive, which is backwards from
+    // everything else and is the mistake that costs twice the offset.
+    say(f, "the offset in the string is west-positive and is flipped on entry",
+        london.standard_offset == 0 and london.daylight_offset == 3600 and
+        rule_of("EST5EDT,M3.2.0,M11.1.0").standard_offset == 0 - 18000)
+    say(f, "a daylight name with no offset means one hour ahead",
+        rule_of("EST5EDT,M3.2.0,M11.1.0").daylight_offset == 0 - 14400)
+    // M3.5.0 is the *last* Sunday in March, not the fifth.
+    say(f, "week five means the last such weekday, not the fifth one",
+        london.start.week == 5 and london.start.month == 3 and
+        london.start.day == 0 and london.start.at_second == 3600)
+    say(f, "and the default changeover is two in the morning",
+        london.stop.at_second == 7200)
+    // Python's zoneinfo agrees on the dates these rules govern.
+    say(f, "Britain in January is GMT and in July is BST",
+        tzrule.offset_at(london, 2084011200) == 0 and
+        tzrule.abbreviation_at(london, 2084011200) == "GMT" and
+        tzrule.offset_at(london, 2099736000) == 3600 and
+        tzrule.is_dst_at(london, 2099736000))
+    // The southern hemisphere is the case a northern-only implementation
+    // gets exactly backwards.
+    let sydney = rule_of("AEST-10AEDT,M10.1.0,M4.1.0/3")
+    say(f, "and Australia is the other way round, which is not a special case",
+        tzrule.is_southern(sydney) and
+        tzrule.offset_at(sydney, 2084011200) == 39600 and
+        tzrule.offset_at(sydney, 2099736000) == 36000)
+    // A zone with no letter abbreviation writes it in angle brackets.
+    let chatham = rule_of("<+1245>-12:45<+1345>,M9.5.0/2:45,M4.1.0/3:45")
+    say(f, "a name in angle brackets may be digits and a sign",
+        chatham.standard_name == "+1245" and
+        chatham.standard_offset == 45900 and
+        chatham.daylight_offset == 49500)
+    say(f, "and its changeover is at a quarter to three in the morning",
+        chatham.start.at_second == 9900 and chatham.stop.at_second == 13500)
+    // The calendar arithmetic everything rests on.
+    say(f, "the last Sunday in March 2026 is the twenty-ninth",
+        tzrule.day_of(london.start, 2026) == (3, 29) and
+        tzrule.day_of(london.stop, 2026) == (10, 25))
+    say(f, "and the weekday of a date is four divisions, not a table",
+        tzrule.weekday(1970, 1, 1) == 4 and
+        tzrule.weekday(2000, 2, 29) == 2 and
+        tzrule.weekday(2026, 9, 9) == 3)
+    say(f, "leap years are the Gregorian rule and not the divisible-by-four one",
+        tzrule.is_leap(2000) and not tzrule.is_leap(1900) and
+        tzrule.is_leap(2024) and not tzrule.is_leap(2026))
+    say(f, "a Julian day rule skips the leap day, so day sixty is 1 March",
+        tzrule.day_of(RuleDate{ kind: "J", month: 0, week: 0, day: 60,
+            at_second: 7200 }, 2024) == (3, 1) and
+        tzrule.day_of(RuleDate{ kind: "J", month: 0, week: 0, day: 60,
+            at_second: 7200 }, 2026) == (3, 1))
+    say(f, "and a zero-based day of the year counts it",
+        tzrule.day_of(RuleDate{ kind: "n", month: 0, week: 0, day: 59,
+            at_second: 7200 }, 2024) == (2, 29) and
+        tzrule.day_of(RuleDate{ kind: "n", month: 0, week: 0, day: 59,
+            at_second: 7200 }, 2026) == (3, 1))
+    say(f, "a rule with no daylight part is one offset for ever",
+        not rule_of("IST-5:30").has_daylight and
+        rule_of("IST-5:30").standard_offset == 19800)
+}
+
+// ------------------------------------------------------------ leapsecond
+
+fn check_leapsecond(inout f: i64) / {io} {
+    print("-- leapsecond: why a timestamp difference is not an elapsed time")
+    // The system's own IERS-derived table.
+    say(f, "there have been twenty-seven, all of them insertions",
+        leapsecond.count() == 27 and not leapsecond.any_negative())
+    say(f, "and TAI is now thirty-seven seconds ahead of UTC",
+        (leapsecond.tai_minus_utc(1700000000) ?? 0) == 37 and
+        (leapsecond.tai_minus_utc(63072000) ?? 0) == 10)
+    // The last one was at the end of 2016 and none since.
+    say(f, "the most recent was at the end of 2016",
+        leapsecond.is_leap_instant(1483228800) and
+        (leapsecond.tai_minus_utc(1483228799) ?? 0) == 36 and
+        (leapsecond.tai_minus_utc(1483228800) ?? 0) == 37)
+    say(f, "so that day had eighty-six thousand four hundred and one seconds",
+        leapsecond.day_length(2016, 12, 31) == 86401 and
+        leapsecond.day_length(2017, 12, 31) == 86400)
+    // The consequence nobody expects.
+    say(f, "twenty-seven more seconds elapsed than the timestamps say",
+        (leapsecond.elapsed_between(63072000, 1700000000) ?? 0) ==
+        1700000000 - 63072000 + 27)
+    say(f, "GPS time has never had one, so it is a fixed distance from TAI",
+        leapsecond.gps_behind_tai() == 19 and
+        (leapsecond.gps_minus_utc(1700000000) ?? 0) == 18)
+    say(f, "and TAI and UTC convert both ways",
+        (leapsecond.utc_to_tai(1700000000) ?? 0) == 1700000037 and
+        (leapsecond.tai_to_utc(1700000037) ?? 0) == 1700000000)
+    // Only June and December have ever been used, though March and September
+    // are allowed.
+    say(f, "only June and December have ever been used",
+        leapsecond.months_used() == [6, 12])
+    say(f, "the table starts on the first of January 1972",
+        leapsecond.table_start() == 63072000 and
+        leapsecond.table()[0].year == 1972 and
+        leapsecond.table()[0].month == 6)
+    say(f, "before 1972 there is no integer answer, so it is refused",
+        before_table() and leapsecond.last_year() == 2035)
+}
+
+fn before_table() -> bool {
+    match leapsecond.tai_minus_utc(0) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+// ----------------------------------------------------------------- solar
+
+fn check_solar(inout f: i64) / {io} {
+    print("-- solar: where the sun is, to a hundredth of a degree")
+    // astral agrees with these to eight decimal places.
+    let midsummer = 1782043200
+    say(f, "the sun is highest at the June solstice, at 23.44 degrees",
+        near(solar.declination(1782000000), 23.4377, 0.001) and
+        solar.declination(1766000000) < 0.0 - 23.3)
+    say(f, "and crosses the equator at the equinoxes",
+        near(solar.declination(1774094400), 0.0, 0.5))
+    // The equation of time: why a sundial and a watch disagree.
+    say(f, "the equation of time is minutes, and changes sign through the year",
+        solar.equation_of_time(1770000000) < 0.0 - 10.0 and
+        solar.equation_of_time(1762000000) > 10.0)
+    say(f, "the sun at London noon in June is sixty-two degrees up",
+        near(solar.true_altitude(midsummer, 51.5074, 0.0 - 0.1278),
+            61.93, 0.1))
+    say(f, "and due south, which is an azimuth of a hundred and seventy-nine",
+        near(solar.azimuth(midsummer, 51.5074, 0.0 - 0.1278), 178.9, 0.5))
+    // Refraction, which is why sunrise is not at zero degrees.
+    say(f, "refraction lifts the sun half a degree at the horizon",
+        near(solar.refraction(0.0), 0.48, 0.02) and
+        solar.refraction(90.0) == 0.0)
+    say(f, "so sunrise is at minus 0.833 degrees, not at zero",
+        solar.sunrise_altitude() == 0.0 - 0.833 and
+        solar.civil_twilight() == 0.0 - 6.0 and
+        solar.astronomical_twilight() == 0.0 - 18.0)
+    // The Julian day, which every astronomical formula counts from.
+    say(f, "the Julian day of the Unix epoch is 2440587.5",
+        near(solar.julian_day(0), 2440587.5, 1.0e-9) and
+        near(solar.julian_century(946728000), 0.0, 1.0e-4))
+    say(f, "and the tilt of the axis is 23.44 degrees, slowly decreasing",
+        near(solar.obliquity(0.0), 23.4378, 0.001) and
+        solar.obliquity(1.0) < solar.obliquity(0.0))
+}
+
+// --------------------------------------------------------------- sunrise
+
+fn check_sunrise(inout f: i64) / {io} {
+    print("-- sunrise: and the days when it does not happen")
+    // astral's own answers for London, within a minute.
+    let rise = sunrise.sunrise(2026, 6, 21, 51.5074, 0.0 - 0.1278) ?? 0
+    let set = sunrise.sunset(2026, 6, 21, 51.5074, 0.0 - 0.1278) ?? 0
+    // astral says 1782013407; the closed-form solution is 22 seconds early,
+    // which is what the two methods differ by at this latitude.
+    say(f, "London's midsummer sunrise is within a minute of astral's",
+        near(rise.as_f64(), 1782013407.0, 60.0))
+    say(f, "and the day is sixteen hours and thirty-eight minutes long",
+        near((set - rise).as_f64(), 59864.0, 90.0))
+    // Midwinter, for the contrast.
+    let winter = sunrise.day_length(2026, 12, 21, 51.5074,
+        0.0 - 0.1278) ?? 0
+    say(f, "where midwinter's is under eight hours",
+        winter < 28800 and winter > 28000)
+    // Solar noon is not at twelve, and by a different amount every day.
+    let noon = sunrise.solar_noon(2026, 6, 21, 0.0 - 0.1278)
+    say(f, "solar noon is two minutes past twelve, not twelve",
+        noon % 86400 > 43200 and noon % 86400 < 43400)
+    // Twilight is the same equation at a different altitude.
+    let dawn = sunrise.dawn(2026, 6, 21, 51.5074, 0.0 - 0.1278) ?? 0
+    say(f, "civil twilight starts about fifty minutes before sunrise",
+        rise - dawn > 2700 and rise - dawn < 3300)
+    // Inside the polar circles the equation has no solution, and that is the
+    // answer rather than an error.
+    say(f, "Tromso has no sunrise in December and no sunset in June",
+        sunrise.is_polar_night(2026, 12, 21, 69.6492) and
+        sunrise.is_polar_day(2026, 6, 21, 69.6492) and
+        polar_refused(2026, 12, 21, 69.6492))
+    say(f, "and London has neither, being south of the circle",
+        not sunrise.is_polar_night(2026, 12, 21, 51.5074) and
+        not sunrise.is_polar_day(2026, 6, 21, 51.5074) and
+        near(sunrise.polar_circle(), 66.5622, 0.001))
+    // Above about sixty degrees the sky never goes properly dark in June.
+    say(f, "Scotland has no true night in June, which is not polar day",
+        sunrise.has_no_true_night(2026, 6, 21, 57.0) and
+        not sunrise.is_polar_day(2026, 6, 21, 57.0) and
+        not sunrise.has_no_true_night(2026, 6, 21, 45.0))
+    // The date is a UTC date, which matters four minutes per degree.
+    say(f, "the date is a UTC date, so Sydney's sunrise falls inside it",
+        (sunrise.sunrise(2026, 1, 5, 0.0 - 33.8688, 151.2093) ?? 0) >
+        sunrise.midnight(2026, 1, 5) and
+        (sunrise.sunrise(2026, 1, 5, 0.0 - 33.8688, 151.2093) ?? 0) <
+        sunrise.midnight(2026, 1, 6))
+    say(f, "and the hour angle has no solution when the sun never gets there",
+        angle_refused(80.0, 23.0, 0.0 - 0.833) and
+        not angle_refused(51.5, 23.0, 0.0 - 0.833))
+}
+
+fn polar_refused(year: i64, month: i64, day: i64, latitude: f64) -> bool {
+    match sunrise.sunrise(year, month, day, latitude, 18.9553) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn angle_refused(latitude: f64, declination: f64, altitude: f64) -> bool {
+    match sunrise.hour_angle_at(latitude, declination, altitude) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn main() / {io} {
+    var f = 0
+    check_tzfile(f)
+    check_tzrule(f)
+    check_leapsecond(f)
+    check_solar(f)
+    check_sunrise(f)
+    if f == 0 {
+        print("timezones: every claim held")
+    } else {
+        print("timezones: {f} claims failed")
+    }
+}

@@ -1,0 +1,288 @@
+// Where the sun is, by NOAA's algorithm.
+//
+// Given an instant and a place, this answers how high the sun is and which
+// way. That question is behind sunrise tables, solar panel aiming, the
+// daylight terminator on a map, and every "is it dark there" check a piece of
+// software has ever made.
+//
+// The algorithm is NOAA's, which is Jean Meeus's *Astronomical Algorithms*
+// simplified to the terms that matter below a hundredth of a degree. It is
+// accurate to about a minute of arc for dates between 1800 and 2100, which is
+// far better than the atmosphere allows anyone to observe.
+//
+// ## The equation of time, which is why sundials are wrong
+//
+// Solar noon is not at 12:00, and it is not even at the same wrong time all
+// year. The Earth's orbit is elliptical, so it moves faster in January than
+// July; and its axis is tilted, so the sun's apparent motion is not parallel
+// to the equator. The two effects together shift solar noon by up to sixteen
+// minutes either way over the year.
+//
+// Plot the sun's position at clock noon every day and you get a figure of
+// eight — the analemma — and the equation of time is its horizontal axis.
+// This is why a sundial and a watch disagree, by a different amount every
+// day, in a pattern that repeats annually.
+//
+// ## The declination
+//
+// How far north or south of the equator the sun is: +23.44 degrees at the
+// June solstice, -23.44 at December, zero at the equinoxes. Everything about
+// seasons and day lengths follows from this one number and the observer's
+// latitude.
+//
+// ## Refraction, and why sunrise is early
+//
+// The atmosphere bends light, so the sun is visible when it is still half a
+// degree below the true horizon. Add the sun's own radius — sunrise is when
+// the *upper limb* appears, not the centre — and the standard sunrise
+// altitude is **-0.833 degrees**, not zero. Using zero puts sunrise about
+// three minutes late everywhere, and much more than that near the poles.
+//
+// Checked against `astral`, which implements the same NOAA algorithm.
+
+fn pi() -> f64 {
+    return 3.141592653589793
+}
+
+fn radians(degrees: f64) -> f64 {
+    return degrees * pi() / 180.0
+}
+
+fn degrees(radians_value: f64) -> f64 {
+    return radians_value * 180.0 / pi()
+}
+
+/// The Julian day number for a POSIX instant.
+///
+/// 2440587.5 is 1970-01-01T00:00Z. The half arises because a Julian day
+/// starts at noon, which is an eighteenth-century convention that survives
+/// because astronomers observe at night and did not want the date changing
+/// mid-session.
+pub fn julian_day(instant: i64) -> f64 {
+    return instant.as_f64() / 86400.0 + 2440587.5
+}
+
+/// Julian centuries since J2000.0, which is what every term below is in.
+pub fn julian_century(instant: i64) -> f64 {
+    return (julian_day(instant) - 2451545.0) / 36525.0
+}
+
+/// The sun's mean longitude, in degrees.
+pub fn mean_longitude(t: f64) -> f64 {
+    return wrap_degrees(280.46646 + t * (36000.76983 + t * 0.0003032))
+}
+
+fn wrap_degrees(value: f64) -> f64 {
+    var v = value % 360.0
+    if v < 0.0 {
+        v = v + 360.0
+    }
+    return v
+}
+
+/// The sun's mean anomaly, in degrees.
+pub fn mean_anomaly(t: f64) -> f64 {
+    return 357.52911 + t * (35999.05029 - 0.0001537 * t)
+}
+
+/// The eccentricity of the Earth's orbit, which is slowly decreasing.
+pub fn eccentricity(t: f64) -> f64 {
+    return 0.016708634 - t * (0.000042037 + 0.0000001267 * t)
+}
+
+/// The difference between the true and mean anomaly, in degrees.
+///
+/// The correction for the orbit being an ellipse rather than a circle: the
+/// Earth moves fastest at perihelion in early January, so the sun appears to
+/// run ahead of its mean position for half the year and behind for the other.
+pub fn equation_of_centre(t: f64) -> f64 {
+    let m = radians(mean_anomaly(t))
+    return m.sin() * (1.914602 - t * (0.004817 + 0.000014 * t)) +
+    (2.0 * m).sin() * (0.019993 - 0.000101 * t) +
+    (3.0 * m).sin() * 0.000289
+}
+
+/// The sun's apparent longitude, in degrees.
+pub fn apparent_longitude(t: f64) -> f64 {
+    let true_longitude = mean_longitude(t) + equation_of_centre(t)
+    let omega = 125.04 - 1934.136 * t
+    return true_longitude - 0.00569 - 0.00478 * radians(omega).sin()
+}
+
+/// The tilt of the Earth's axis, in degrees, corrected for nutation.
+///
+/// 23.44 degrees and slowly decreasing, by about half a second of arc a year.
+/// The nutation term is the Moon wobbling it by up to nine seconds of arc
+/// over an eighteen-year cycle.
+pub fn obliquity(t: f64) -> f64 {
+    let mean = 23.0 + (26.0 + (21.448 - t * (46.815 + t * (0.00059 -
+        t * 0.001813))) / 60.0) / 60.0
+    let omega = 125.04 - 1934.136 * t
+    return mean + 0.00256 * radians(omega).cos()
+}
+
+/// The sun's declination at an instant, in degrees.
+///
+/// How far north or south of the equator it is: +23.44 at the June solstice,
+/// -23.44 at December. Every fact about seasons follows from this and the
+/// observer's latitude.
+pub fn declination(instant: i64) -> f64 {
+    let t = julian_century(instant)
+    let sine = radians(obliquity(t)).sin() *
+    radians(apparent_longitude(t)).sin()
+    return degrees(arcsin(sine))
+}
+
+fn arcsin(x: f64) -> f64 {
+    if x >= 1.0 {
+        return pi() / 2.0
+    }
+    if x <= 0.0 - 1.0 {
+        return 0.0 - pi() / 2.0
+    }
+    return (x / (1.0 - x * x).sqrt()).atan()
+}
+
+fn arccos(x: f64) -> f64 {
+    return pi() / 2.0 - arcsin(x)
+}
+
+/// The equation of time in minutes: apparent solar time minus mean solar
+/// time.
+///
+/// Between about -14 minutes in February and +16 in November. This is the
+/// horizontal axis of the analemma and the reason a sundial and a watch
+/// disagree by a different amount every day.
+pub fn equation_of_time(instant: i64) -> f64 {
+    let t = julian_century(instant)
+    let epsilon = radians(obliquity(t))
+    let l = radians(mean_longitude(t))
+    let e = eccentricity(t)
+    let m = radians(mean_anomaly(t))
+    let y = (epsilon / 2.0).tan() * (epsilon / 2.0).tan()
+    let value = y * (2.0 * l).sin() - 2.0 * e * m.sin() +
+    4.0 * e * y * m.sin() * (2.0 * l).cos() -
+    0.5 * y * y * (4.0 * l).sin() - 1.25 * e * e * (2.0 * m).sin()
+    return 4.0 * degrees(value)
+}
+
+/// The sun's altitude above the horizon, in degrees, ignoring refraction.
+pub fn true_altitude(instant: i64, latitude: f64,
+    longitude: f64) -> f64 {
+    let dec = radians(declination(instant))
+    let lat = radians(latitude)
+    let hour = radians(hour_angle(instant, longitude))
+    let sine = lat.sin() * dec.sin() + lat.cos() * dec.cos() * hour.cos()
+    return degrees(arcsin(sine))
+}
+
+/// The hour angle: how far the sun is past the local meridian, in degrees.
+///
+/// Zero at solar noon, fifteen degrees an hour after. This is what makes the
+/// sun's position a function of longitude as well as time.
+pub fn hour_angle(instant: i64, longitude: f64) -> f64 {
+    let seconds = ((instant % 86400) + 86400) % 86400
+    var true_solar = seconds.as_f64() / 60.0 + equation_of_time(instant) +
+    4.0 * longitude
+    // Four minutes a degree of longitude, so a place far east pushes the
+    // apparent solar time past a whole day and it has to come back. Leaving
+    // it out only breaks the *sign* of the hour angle, which the elevation
+    // does not notice — it uses the cosine — and the azimuth does, by putting
+    // the sun on the wrong side of the sky.
+    while true_solar > 1440.0 {
+        true_solar = true_solar - 1440.0
+    }
+    while true_solar < 0.0 {
+        true_solar = true_solar + 1440.0
+    }
+    var angle = true_solar / 4.0 - 180.0
+    if angle < 0.0 - 180.0 {
+        angle = angle + 360.0
+    }
+    return angle
+}
+
+/// The sun's altitude corrected for atmospheric refraction.
+///
+/// The atmosphere bends light down, so the sun looks higher than it is — by
+/// about half a degree at the horizon and almost nothing overhead. That
+/// half-degree is the whole reason sunrise is earlier than geometry says.
+pub fn altitude(instant: i64, latitude: f64, longitude: f64) -> f64 {
+    let true_value = true_altitude(instant, latitude, longitude)
+    return true_value + refraction(true_value)
+}
+
+/// The refraction correction at an altitude, in degrees.
+pub fn refraction(altitude_degrees: f64) -> f64 {
+    if altitude_degrees > 85.0 {
+        return 0.0
+    }
+    let te = radians(altitude_degrees).tan()
+    if altitude_degrees > 5.0 {
+        return (58.1 / te - 0.07 / (te * te * te) +
+            0.000086 / (te * te * te * te * te)) / 3600.0
+    }
+    if altitude_degrees > 0.0 - 0.575 {
+        return (1735.0 + altitude_degrees * (0.0 - 518.2 +
+            altitude_degrees * (103.4 + altitude_degrees *
+                (0.0 - 12.79 + altitude_degrees * 0.711)))) / 3600.0
+    }
+    return (0.0 - 20.774 / te) / 3600.0
+}
+
+/// The sun's azimuth in degrees clockwise from north.
+///
+/// The arccosine gives an angle from 0 to 180 and cannot tell east from west,
+/// so the hour angle decides the half: before solar noon the sun is in the
+/// east, after it in the west. Getting that branch wrong mirrors the answer
+/// about north, which looks right at noon and is 170 degrees out at dawn.
+pub fn azimuth(instant: i64, latitude: f64, longitude: f64) -> f64 {
+    let dec = radians(declination(instant))
+    let lat = radians(latitude)
+    let hour = hour_angle(instant, longitude)
+    let zenith = radians(90.0 - true_altitude(instant, latitude, longitude))
+    let cosine = (lat.sin() * zenith.cos() - dec.sin()) /
+    (lat.cos() * zenith.sin())
+    var a = 180.0 - degrees(arccos(clamp(cosine)))
+    if hour > 0.0 {
+        a = 0.0 - a
+    }
+    return wrap_degrees(a)
+}
+
+fn clamp(x: f64) -> f64 {
+    if x > 1.0 {
+        return 1.0
+    }
+    if x < 0.0 - 1.0 {
+        return 0.0 - 1.0
+    }
+    return x
+}
+
+/// The altitude the sun is at when it is said to be rising.
+///
+/// -0.833 degrees: half a degree of refraction plus the sun's own radius,
+/// because sunrise is when the upper limb appears and not the centre. Using
+/// zero puts sunrise three minutes late everywhere and much worse near the
+/// poles.
+pub fn sunrise_altitude() -> f64 {
+    return 0.0 - 0.833
+}
+
+/// Civil, nautical and astronomical twilight, in degrees below the horizon.
+///
+/// Civil is when you can still read outdoors; nautical is when the horizon is
+/// still visible at sea, which is what a sextant needs; astronomical is when
+/// the sky is dark enough that the faintest stars are not washed out.
+pub fn civil_twilight() -> f64 {
+    return 0.0 - 6.0
+}
+
+pub fn nautical_twilight() -> f64 {
+    return 0.0 - 12.0
+}
+
+pub fn astronomical_twilight() -> f64 {
+    return 0.0 - 18.0
+}

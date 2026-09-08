@@ -1,0 +1,256 @@
+// Leap seconds: the reason a day is not always 86,400 seconds.
+//
+// The Earth's rotation is slowing, irregularly, by a couple of milliseconds a
+// century plus whatever the weather and the core are doing this decade. Atomic
+// time does not slow. So UTC — which is atomic seconds but is required to stay
+// within 0.9 seconds of the Earth's actual angle — has a second inserted every
+// few years to keep up.
+//
+// Twenty-seven of them since 1972, all positive, the most recent at the end of
+// 2016. TAI is now 37 seconds ahead of UTC.
+//
+// ## Why POSIX time cannot represent one
+//
+// A POSIX `time_t` is *defined* as days since the epoch times 86,400 plus
+// seconds into the day. There is no room in that arithmetic for a 61-second
+// minute. So at a leap second the counter either repeats a value or is
+// smeared across a day, and every implementation chooses differently: Google
+// and Amazon smear it over 24 hours, the Linux kernel repeats it, and NTP
+// clients do something else again.
+//
+// The consequence: **a POSIX timestamp difference is not a count of elapsed
+// seconds.** Between 1 January 1972 and today, 27 more seconds elapsed than
+// the difference of the timestamps says. Almost nothing cares, and the things
+// that do — satellite navigation, radio astronomy, financial timestamping —
+// carry TAI or GPS time instead.
+//
+// ## The 2035 decision
+//
+// In November 2022 the General Conference on Weights and Measures resolved to
+// stop inserting leap seconds by 2035, letting UTC drift from the Earth's
+// rotation and dealing with it later. The immediate reason was that a
+// *negative* leap second — removing a second, never yet needed — would break
+// far more software than adding one, and the Earth had recently begun
+// speeding up.
+//
+// ## GPS time
+//
+// GPS started on 6 January 1980 with TAI-UTC at 19 and has never had a leap
+// second since, so GPS time is exactly 19 seconds behind TAI and now 18
+// seconds ahead of UTC. A receiver has to be told the current difference,
+// which is broadcast in the navigation message, and a receiver that has not
+// heard it yet reports a time 18 seconds out.
+//
+// The table is the system's own `leapseconds` file, which comes from the
+// IERS bulletin.
+
+type LeapError =
+    | BeforeTable(instant: i64)
+    | UnknownDate(year: i64, month: i64)
+
+type LeapSecond = {
+    year: i64,
+    month: i64,
+    day: i64,
+    /// 1 for an inserted second, -1 for a removed one. All 27 so far are 1.
+    sign: i64,
+    /// The first POSIX second of the new period.
+    instant: i64,
+    /// TAI minus UTC, in seconds, from this instant.
+    tai_minus_utc: i64,
+}
+
+/// Every leap second so far.
+pub fn table() -> [LeapSecond] {
+    return [
+        LeapSecond{ year: 1972, month: 6, day: 30, sign: 1,
+            instant: 78796800, tai_minus_utc: 11 },
+        LeapSecond{ year: 1972, month: 12, day: 31, sign: 1,
+            instant: 94694400, tai_minus_utc: 12 },
+        LeapSecond{ year: 1973, month: 12, day: 31, sign: 1,
+            instant: 126230400, tai_minus_utc: 13 },
+        LeapSecond{ year: 1974, month: 12, day: 31, sign: 1,
+            instant: 157766400, tai_minus_utc: 14 },
+        LeapSecond{ year: 1975, month: 12, day: 31, sign: 1,
+            instant: 189302400, tai_minus_utc: 15 },
+        LeapSecond{ year: 1976, month: 12, day: 31, sign: 1,
+            instant: 220924800, tai_minus_utc: 16 },
+        LeapSecond{ year: 1977, month: 12, day: 31, sign: 1,
+            instant: 252460800, tai_minus_utc: 17 },
+        LeapSecond{ year: 1978, month: 12, day: 31, sign: 1,
+            instant: 283996800, tai_minus_utc: 18 },
+        LeapSecond{ year: 1979, month: 12, day: 31, sign: 1,
+            instant: 315532800, tai_minus_utc: 19 },
+        LeapSecond{ year: 1981, month: 6, day: 30, sign: 1,
+            instant: 362793600, tai_minus_utc: 20 },
+        LeapSecond{ year: 1982, month: 6, day: 30, sign: 1,
+            instant: 394329600, tai_minus_utc: 21 },
+        LeapSecond{ year: 1983, month: 6, day: 30, sign: 1,
+            instant: 425865600, tai_minus_utc: 22 },
+        LeapSecond{ year: 1985, month: 6, day: 30, sign: 1,
+            instant: 489024000, tai_minus_utc: 23 },
+        LeapSecond{ year: 1987, month: 12, day: 31, sign: 1,
+            instant: 567993600, tai_minus_utc: 24 },
+        LeapSecond{ year: 1989, month: 12, day: 31, sign: 1,
+            instant: 631152000, tai_minus_utc: 25 },
+        LeapSecond{ year: 1990, month: 12, day: 31, sign: 1,
+            instant: 662688000, tai_minus_utc: 26 },
+        LeapSecond{ year: 1992, month: 6, day: 30, sign: 1,
+            instant: 709948800, tai_minus_utc: 27 },
+        LeapSecond{ year: 1993, month: 6, day: 30, sign: 1,
+            instant: 741484800, tai_minus_utc: 28 },
+        LeapSecond{ year: 1994, month: 6, day: 30, sign: 1,
+            instant: 773020800, tai_minus_utc: 29 },
+        LeapSecond{ year: 1995, month: 12, day: 31, sign: 1,
+            instant: 820454400, tai_minus_utc: 30 },
+        LeapSecond{ year: 1997, month: 6, day: 30, sign: 1,
+            instant: 867715200, tai_minus_utc: 31 },
+        LeapSecond{ year: 1998, month: 12, day: 31, sign: 1,
+            instant: 915148800, tai_minus_utc: 32 },
+        LeapSecond{ year: 2005, month: 12, day: 31, sign: 1,
+            instant: 1136073600, tai_minus_utc: 33 },
+        LeapSecond{ year: 2008, month: 12, day: 31, sign: 1,
+            instant: 1230768000, tai_minus_utc: 34 },
+        LeapSecond{ year: 2012, month: 6, day: 30, sign: 1,
+            instant: 1341100800, tai_minus_utc: 35 },
+        LeapSecond{ year: 2015, month: 6, day: 30, sign: 1,
+            instant: 1435708800, tai_minus_utc: 36 },
+        LeapSecond{ year: 2016, month: 12, day: 31, sign: 1,
+            instant: 1483228800, tai_minus_utc: 37 },
+    ]
+}
+
+/// How many leap seconds there have been.
+pub fn count() -> i64 {
+    return table().len()
+}
+
+/// The first instant the table covers.
+///
+/// 1 January 1972, when UTC was redefined to be atomic seconds with leap
+/// seconds. Before that it ran at a different rate from TAI, with fractional
+/// offsets, and no integer answer exists.
+pub fn table_start() -> i64 {
+    return 63072000
+}
+
+/// TAI minus UTC at an instant, in seconds.
+pub fn tai_minus_utc(instant: i64) -> i64 ! LeapError {
+    if instant < table_start() {
+        fail(BeforeTable(instant))
+    }
+    var out = 10
+    for leap in table() {
+        if leap.instant <= instant {
+            out = leap.tai_minus_utc
+        }
+    }
+    return out
+}
+
+/// A UTC instant as a TAI one.
+pub fn utc_to_tai(instant: i64) -> i64 ! LeapError {
+    return instant + (try tai_minus_utc(instant))
+}
+
+/// A TAI instant as a UTC one.
+pub fn tai_to_utc(instant: i64) -> i64 ! LeapError {
+    // The difference has to be found by the TAI value, so the search runs
+    // over shifted instants rather than raw ones.
+    var out = 10
+    for leap in table() {
+        if leap.instant + leap.tai_minus_utc <= instant {
+            out = leap.tai_minus_utc
+        }
+    }
+    if instant - out < table_start() {
+        fail(BeforeTable(instant))
+    }
+    return instant - out
+}
+
+/// How many seconds GPS time is behind TAI, which has never changed.
+pub fn gps_behind_tai() -> i64 {
+    return 19
+}
+
+/// GPS time minus UTC at an instant.
+///
+/// Broadcast in the navigation message, because a receiver cannot work it out
+/// from the signal. One that has not heard it yet is eighteen seconds out.
+pub fn gps_minus_utc(instant: i64) -> i64 ! LeapError {
+    return (try tai_minus_utc(instant)) - gps_behind_tai()
+}
+
+/// How many seconds actually elapsed between two UTC instants.
+///
+/// The difference of the timestamps plus the leap seconds between them. A
+/// POSIX timestamp difference is not an elapsed time and never has been.
+pub fn elapsed_between(from_instant: i64,
+    to_instant: i64) -> i64 ! LeapError {
+    return to_instant - from_instant + (try tai_minus_utc(to_instant)) -
+    (try tai_minus_utc(from_instant))
+}
+
+/// Whether a UTC instant is the moment a leap second was inserted.
+pub fn is_leap_instant(instant: i64) -> bool {
+    for leap in table() {
+        if leap.instant == instant {
+            return true
+        }
+    }
+    return false
+}
+
+/// Whether a day had 86,401 seconds.
+pub fn day_length(year: i64, month: i64, day: i64) -> i64 {
+    for leap in table() {
+        if leap.year == year and leap.month == month and leap.day == day {
+            return 86400 + leap.sign
+        }
+    }
+    return 86400
+}
+
+/// The months a leap second has ever been inserted in.
+///
+/// June and December only, so far. The rules allow March and September as
+/// second and third preferences and neither has ever been used.
+pub fn months_used() -> [i64] {
+    var out: [i64] = []
+    for leap in table() {
+        if not has(out, leap.month) {
+            out.push(leap.month)
+        }
+    }
+    out.sort()
+    return out
+}
+
+fn has(values: [i64], wanted: i64) -> bool {
+    for value in values {
+        if value == wanted {
+            return true
+        }
+    }
+    return false
+}
+
+/// Whether a negative leap second has ever happened.
+///
+/// None has. It would remove a second rather than add one, and it would break
+/// far more software than an insertion does — which is one of the reasons the
+/// practice is being abandoned in 2035.
+pub fn any_negative() -> bool {
+    for leap in table() {
+        if leap.sign < 0 {
+            return true
+        }
+    }
+    return false
+}
+
+/// The year the practice is due to stop.
+pub fn last_year() -> i64 {
+    return 2035
+}

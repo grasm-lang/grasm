@@ -1,0 +1,6 @@
+[package]
+name = "leapsecond"
+version = "1.0.0"
+
+# A table of dates. Opens nothing.
+capabilities = []

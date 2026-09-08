@@ -1,0 +1,24 @@
+[package]
+name = "timezone_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.tzfile]
+path = "../tzfile"
+version = "^1.0.0"
+
+[dependencies.tzrule]
+path = "../tzrule"
+version = "^1.0.0"
+
+[dependencies.leapsecond]
+path = "../leapsecond"
+version = "^1.0.0"
+
+[dependencies.solar]
+path = "../solar"
+version = "^1.0.0"
+
+[dependencies.sunrise]
+path = "../sunrise"
+version = "^1.0.0"

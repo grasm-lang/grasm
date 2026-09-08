@@ -1,0 +1,394 @@
+// TZif: the binary file behind every timezone name.
+//
+// `Europe/London` is a file. It holds a list of instants at which the offset
+// from UTC changed, and what it changed to, going back to 1847 when London
+// stopped using local solar time and forward to 2037. Every program that
+// converts a timestamp to a wall clock reads one of these, and they are
+// updated several times a year because governments keep changing their minds.
+//
+// ## Why it is a list and not a rule
+//
+// Because the rules have changed. Britain has used GMT, BST, British Standard
+// Time (year-round summer time, 1968 to 1971) and double summer time
+// (1941-1945). No rule describes all of that. So the file lists the
+// transitions, and only the *future* is described by a rule — a POSIX TZ
+// string at the end of the file, which `tzrule` in this set evaluates.
+//
+// ## The two copies
+//
+// A version 2 file contains the whole thing twice: once with 32-bit
+// transition times, then a second header and the same data with 64-bit ones.
+// The first copy is there so that a program written before 2005 still works;
+// the second is the one to read, because the 32-bit times run out in 2038.
+//
+// A parser that reads the first copy and stops gets the right answer for
+// every date it is likely to be given and the wrong one in 2038 — which is
+// the kind of bug that is found in production, once.
+//
+// ## The three kinds of local time
+//
+// Transitions are stored in UTC. The file also says, for each local time
+// type, whether the original rule was written in wall clock, standard, or
+// UTC — because "the last Sunday in March at 01:00" has to know which clock
+// that 01:00 was on. Nothing but a timezone compiler uses these, and they are
+// in every file.
+//
+// ## The leap seconds
+//
+// A TZif file may carry the leap-second table, and the `right/` zones do. The
+// ordinary ones do not, because a `time_t` that counted leap seconds would
+// disagree with every other system. That is why POSIX time is not a count of
+// elapsed seconds and never has been.
+//
+// Checked against Python's `zoneinfo` on the system's own tzdata.
+
+type TzFileError =
+    | NotTzif(magic: str)
+    | BadVersion(version: i64)
+    | Truncated(at: i64)
+    | NoTransitions()
+
+type TzType = {
+    /// Seconds east of UTC.
+    offset: i64,
+    /// Whether this type is a daylight-saving one.
+    is_dst: bool,
+    /// `GMT`, `BST`, `+0530`.
+    abbreviation: str,
+    /// 0 wall clock, 1 standard, 2 UTC — which clock the original rule meant.
+    wall_or_standard: i64,
+    ut_or_local: i64,
+}
+
+type TzData = {
+    version: i64,
+    /// The instants at which the offset changed, as POSIX seconds.
+    transitions: [i64],
+    /// Which type applies after each transition.
+    type_of: [i64],
+    types: [TzType],
+    /// The leap-second table, as (instant, cumulative correction).
+    leaps: [(i64, i64)],
+    /// The POSIX rule for dates past the last transition.
+    footer: str,
+}
+
+fn read32(data: bytes, at: i64) -> i64 {
+    var value = 0
+    for i in 0..4 {
+        value = value * 256 + data.at(at + i)
+    }
+    if value >= 2147483648 {
+        return value - 4294967296
+    }
+    return value
+}
+
+fn read64(data: bytes, at: i64) -> i64 {
+    // The top byte carries the sign, so it is taken as signed and the rest
+    // accumulated on top of it. Building an unsigned value first and
+    // correcting afterwards overflows: the correction is 2^64, which does not
+    // fit in the type doing the correcting.
+    var value = data.at(at)
+    if value >= 128 {
+        value = value - 256
+    }
+    for i in 1..8 {
+        value = value * 256 + data.at(at + i)
+    }
+    return value
+}
+
+/// Whether the bytes start with a TZif header.
+pub fn is_tzif(data: bytes) -> bool {
+    if data.len() < 5 {
+        return false
+    }
+    return data.at(0) == 84 and data.at(1) == 90 and data.at(2) == 105 and
+    data.at(3) == 102
+}
+
+/// The file's version: 1, 2, 3 or 4.
+pub fn version(data: bytes) -> i64 {
+    if not is_tzif(data) {
+        return 0
+    }
+    let byte = data.at(4)
+    if byte == 0 {
+        return 1
+    }
+    return byte - 48
+}
+
+/// A whole file.
+///
+/// A version 2 or later file is read from its **second** block, which has
+/// 64-bit transition times. Reading the first is right until 2038 and wrong
+/// after it.
+pub fn parse(data: bytes) -> TzData ! TzFileError {
+    if not is_tzif(data) {
+        fail(NotTzif(magic_of(data)))
+    }
+    let v = version(data)
+    if v < 1 or v > 4 {
+        fail(BadVersion(v))
+    }
+    if v == 1 {
+        return try parse_block(data, 0, 4, v)
+    }
+    let first = try block_size(data, 0, 4)
+    return try parse_block(data, first, 8, v)
+}
+
+fn magic_of(data: bytes) -> str {
+    if data.len() < 4 {
+        return ""
+    }
+    return bytes_of([data.at(0), data.at(1), data.at(2),
+        data.at(3)]).to_str()
+}
+
+/// The counts in a block's header, in the order the format lists them.
+fn counts(data: bytes, at: i64) -> [i64] {
+    var out: [i64] = []
+    for i in 0..6 {
+        out.push(read32(data, at + 20 + i * 4))
+    }
+    return out
+}
+
+fn block_size(data: bytes, at: i64, width: i64) -> i64 ! TzFileError {
+    if at + 44 > data.len() {
+        fail(Truncated(at))
+    }
+    let c = counts(data, at)
+    // isutcnt, isstdcnt, leapcnt, timecnt, typecnt, charcnt
+    return at + 44 + c[3] * (width + 1) + c[4] * 6 + c[5] +
+    c[2] * (width + 4) + c[1] + c[0]
+}
+
+fn parse_block(data: bytes, at: i64, width: i64,
+    v: i64) -> TzData ! TzFileError {
+    if at + 44 > data.len() {
+        fail(Truncated(at))
+    }
+    let c = counts(data, at)
+    let ut_count = c[0]
+    let std_count = c[1]
+    let leap_count = c[2]
+    let time_count = c[3]
+    let type_count = c[4]
+    let char_count = c[5]
+    var out = TzData{ version: v, transitions: [], type_of: [], types: [],
+        leaps: [], footer: "" }
+    var i = at + 44
+    for _k in 0..time_count {
+        if width == 4 {
+            out.transitions.push(read32(data, i))
+        } else {
+            out.transitions.push(read64(data, i))
+        }
+        i = i + width
+    }
+    for _k in 0..time_count {
+        out.type_of.push(data.at(i))
+        i = i + 1
+    }
+    let types_at = i
+    i = i + type_count * 6
+    let chars_at = i
+    i = i + char_count
+    for _k in 0..leap_count {
+        var when = 0
+        if width == 4 {
+            when = read32(data, i)
+        } else {
+            when = read64(data, i)
+        }
+        i = i + width
+        out.leaps.push((when, read32(data, i)))
+        i = i + 4
+    }
+    let std_at = i
+    i = i + std_count
+    let ut_at = i
+    i = i + ut_count
+    try read_types(out, data, types_at, chars_at, type_count, std_at, ut_at,
+        std_count, ut_count)
+    out.footer = read_footer(data, i)
+    return out
+}
+
+fn read_types(inout out: TzData, data: bytes, types_at: i64, chars_at: i64,
+    count: i64, std_at: i64, ut_at: i64, std_count: i64,
+    ut_count: i64) ! TzFileError {
+    var k = 0
+    while k < count {
+        let base = types_at + k * 6
+        if base + 5 >= data.len() {
+            fail(Truncated(base))
+        }
+        var standard = 0
+        if k < std_count {
+            standard = data.at(std_at + k)
+        }
+        var universal = 0
+        if k < ut_count {
+            universal = data.at(ut_at + k)
+        }
+        out.types.push(TzType{
+            offset: read32(data, base),
+            is_dst: data.at(base + 4) != 0,
+            abbreviation: abbreviation_at(data, chars_at + data.at(base + 5)),
+            wall_or_standard: standard,
+            ut_or_local: universal })
+        k = k + 1
+    }
+}
+
+fn abbreviation_at(data: bytes, at: i64) -> str {
+    var out: [i64] = []
+    var i = at
+    while i < data.len() and data.at(i) != 0 {
+        out.push(data.at(i))
+        i = i + 1
+    }
+    return bytes_of(out).to_str()
+}
+
+fn read_footer(data: bytes, at: i64) -> str {
+    // A newline, the POSIX rule, and another newline.
+    if at >= data.len() or data.at(at) != 10 {
+        return ""
+    }
+    var out: [i64] = []
+    var i = at + 1
+    while i < data.len() and data.at(i) != 10 {
+        out.push(data.at(i))
+        i = i + 1
+    }
+    return bytes_of(out).to_str()
+}
+
+/// The type in force at an instant.
+///
+/// A binary search over the transition list, which is what every
+/// implementation does and why converting a timestamp is logarithmic rather
+/// than constant.
+pub fn type_at(tz: TzData, instant: i64) -> TzType ! TzFileError {
+    if tz.types.len() == 0 {
+        fail(NoTransitions())
+    }
+    if tz.transitions.len() == 0 or instant < tz.transitions[0] {
+        return tz.types[first_standard(tz)]
+    }
+    var low = 0
+    var high = tz.transitions.len() - 1
+    while low < high {
+        let middle = (low + high + 1) / 2
+        if tz.transitions[middle] <= instant {
+            low = middle
+        } else {
+            high = middle - 1
+        }
+    }
+    return tz.types[tz.type_of[low]]
+}
+
+/// The type used before the first transition.
+///
+/// The first non-daylight type, which is what the specification says and not
+/// simply type zero — a file whose first type is a summer one exists, and
+/// using it makes every date before 1901 an hour out.
+fn first_standard(tz: TzData) -> i64 {
+    var i = 0
+    while i < tz.types.len() {
+        if not tz.types[i].is_dst {
+            return i
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+/// Seconds east of UTC at an instant.
+pub fn offset_at(tz: TzData, instant: i64) -> i64 ! TzFileError {
+    return (try type_at(tz, instant)).offset
+}
+
+/// The abbreviation in force at an instant.
+pub fn abbreviation_at_instant(tz: TzData, instant: i64) -> str ! TzFileError {
+    return (try type_at(tz, instant)).abbreviation
+}
+
+/// Whether daylight saving is in force at an instant.
+pub fn is_dst_at(tz: TzData, instant: i64) -> bool {
+    match type_at(tz, instant) {
+        Ok(t) -> return t.is_dst
+        Err(_e) -> return false
+    }
+}
+
+/// The next transition at or after an instant, or -1.
+pub fn next_transition(tz: TzData, instant: i64) -> i64 {
+    for when in tz.transitions {
+        if when > instant {
+            return when
+        }
+    }
+    return 0 - 1
+}
+
+/// How many transitions the file records.
+pub fn transition_count(tz: TzData) -> i64 {
+    return tz.transitions.len()
+}
+
+/// The distinct abbreviations the zone has ever used.
+///
+/// London's are GMT, BST, BDST and LMT — the last being the local mean solar
+// time it kept until 1847, which is in the file as the type before the first
+/// transition.
+pub fn abbreviations(tz: TzData) -> [str] {
+    var out: [str] = []
+    for t in tz.types {
+        if not has(out, t.abbreviation) {
+            out.push(t.abbreviation)
+        }
+    }
+    return out
+}
+
+fn has(values: [str], wanted: str) -> bool {
+    for value in values {
+        if value == wanted {
+            return true
+        }
+    }
+    return false
+}
+
+/// The cumulative leap-second correction at an instant.
+///
+/// Zero for every ordinary zone, because a `time_t` that counted leap seconds
+/// would disagree with every other system's. Only the `right/` zones carry
+/// the table, and that is why POSIX time is not a count of elapsed seconds.
+pub fn leap_correction(tz: TzData, instant: i64) -> i64 {
+    var out = 0
+    for leap in tz.leaps {
+        if leap.0 <= instant {
+            out = leap.1
+        }
+    }
+    return out
+}
+
+/// Whether the zone has ever used daylight saving.
+pub fn uses_dst(tz: TzData) -> bool {
+    for t in tz.types {
+        if t.is_dst {
+            return true
+        }
+    }
+    return false
+}

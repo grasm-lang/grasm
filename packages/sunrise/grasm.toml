@@ -1,0 +1,10 @@
+[package]
+name = "sunrise"
+version = "1.0.0"
+
+# Arithmetic on a date and a place. Opens nothing.
+capabilities = []
+
+[dependencies.solar]
+path = "../solar"
+version = "^1.0.0"

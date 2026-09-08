@@ -1,0 +1,427 @@
+// The POSIX TZ string: a timezone in twenty characters.
+//
+// `GMT0BST,M3.5.0/1,M10.5.0` is Britain. Standard time is GMT at offset zero;
+// summer time is BST; it starts on the last Sunday of March at 01:00 and ends
+// on the last Sunday of October. That is the whole rule, and it is what a
+// TZif file's footer holds for every date past its last transition.
+//
+// It is also what `TZ=EST5EDT` in an environment variable means, and what an
+// embedded system with no room for a tzdata file uses instead.
+//
+// ## What it cannot say
+//
+// Anything that is not an annual rule. Britain's double summer time, Brazil
+// abolishing DST in 2019, Egypt reinstating it in 2023 — none of those fit,
+// which is why the file has a transition list as well and why the rule
+// governs only the future.
+//
+// It also cannot say *when the rule changes*, so a TZif file's footer is
+// today's rule projected forward for ever. Every timestamp your program
+// computes for 2050 is a guess, and it is a guess that governments have
+// invalidated dozens of times.
+//
+// ## The sign that is backwards
+//
+// **The offset in a TZ string is west-positive.** `EST5EDT` is UTC minus
+// five, not plus five. It is the opposite of ISO 8601, the opposite of what a
+// TZif file stores, and the opposite of what anyone expects — it comes from
+// the offset being what you *add to local time to get UTC*.
+//
+// Getting it backwards produces a time that is wrong by twice the offset,
+// which is ten hours in New York and looks like a date bug rather than a sign
+// bug.
+//
+// ## The hour that happens twice
+//
+// When the clocks go back, one local hour occurs twice, and a local time in
+// it is ambiguous. When they go forward, an hour does not exist at all. A
+// rule evaluated for a UTC instant never meets either problem — which is why
+// every correct program stores UTC and converts on the way out.
+//
+// Checked against Python's `zoneinfo` on dates past the last transition its
+// files carry, which is exactly where the rule governs.
+
+type RuleError =
+    | BadFormat(at: i64)
+    | NoStandard()
+    | BadDate(at: i64)
+
+type RuleDate = {
+    /// `M` for month-week-day, `J` for a Julian day skipping 29 February,
+    /// `n` for a zero-based day of the year that counts it.
+    kind: str,
+    month: i64,
+    /// 1 to 5, where 5 means the last such weekday in the month.
+    week: i64,
+    /// 0 is Sunday.
+    day: i64,
+    /// Seconds after local midnight; 2:00 by default.
+    at_second: i64,
+}
+
+type TimezoneRule = {
+    standard_name: str,
+    /// Seconds **east** of UTC, converted from the string's west-positive
+    /// form on the way in so that nothing downstream has to remember.
+    standard_offset: i64,
+    daylight_name: str,
+    daylight_offset: i64,
+    has_daylight: bool,
+    start: RuleDate,
+    stop: RuleDate,
+}
+
+/// A TZ string parsed.
+pub fn parse(text: str) -> TimezoneRule ! RuleError {
+    let codes = text.codes()
+    var at = 0
+    let std = try read_name(codes, at)
+    at = std.1
+    if std.0 == "" {
+        fail(NoStandard())
+    }
+    let std_offset = try read_offset(codes, at)
+    at = std_offset.1
+    var rule = TimezoneRule{ standard_name: std.0,
+        standard_offset: 0 - std_offset.0, daylight_name: "",
+        daylight_offset: 0, has_daylight: false,
+        start: default_date(), stop: default_date() }
+    if at >= codes.len() {
+        return rule
+    }
+    let dst = try read_name(codes, at)
+    at = dst.1
+    if dst.0 == "" {
+        return rule
+    }
+    rule.daylight_name = dst.0
+    rule.has_daylight = true
+    // A daylight name with no offset means one hour ahead of standard, which
+    // is the case for almost every zone and is why the offset is usually
+    // absent.
+    rule.daylight_offset = rule.standard_offset + 3600
+    if at < codes.len() and codes[at] != 44 {
+        let dst_offset = try read_offset(codes, at)
+        at = dst_offset.1
+        rule.daylight_offset = 0 - dst_offset.0
+    }
+    if at < codes.len() and codes[at] == 44 {
+        let from = try read_date(codes, at + 1)
+        rule.start = from.0
+        at = from.1
+        if at < codes.len() and codes[at] == 44 {
+            let to = try read_date(codes, at + 1)
+            rule.stop = to.0
+            at = to.1
+        }
+    }
+    return rule
+}
+
+fn default_date() -> RuleDate {
+    return RuleDate{ kind: "", month: 0, week: 0, day: 0,
+        at_second: 7200 }
+}
+
+fn read_name(codes: [i64], at: i64) -> (str, i64) ! RuleError {
+    var i = at
+    var out = ""
+    // A name in angle brackets may contain digits and signs, which is how a
+    // zone with no letter abbreviation writes `<+0530>`.
+    if i < codes.len() and codes[i] == 60 {
+        i = i + 1
+        while i < codes.len() and codes[i] != 62 {
+            out = out + codes[i].to_char()
+            i = i + 1
+        }
+        if i >= codes.len() {
+            fail(BadFormat(at))
+        }
+        return (out, i + 1)
+    }
+    while i < codes.len() and is_letter(codes[i]) {
+        out = out + codes[i].to_char()
+        i = i + 1
+    }
+    return (out, i)
+}
+
+fn is_letter(code: i64) -> bool {
+    return (code >= 65 and code <= 90) or (code >= 97 and code <= 122)
+}
+
+fn is_digit(code: i64) -> bool {
+    return code >= 48 and code <= 57
+}
+
+/// An offset in the string's own west-positive seconds.
+fn read_offset(codes: [i64], at: i64) -> (i64, i64) ! RuleError {
+    var i = at
+    var negative = false
+    if i < codes.len() and (codes[i] == 43 or codes[i] == 45) {
+        negative = codes[i] == 45
+        i = i + 1
+    }
+    if i >= codes.len() or not is_digit(codes[i]) {
+        fail(BadFormat(at))
+    }
+    let parts = try read_time(codes, i)
+    var seconds = parts.0
+    if negative {
+        seconds = 0 - seconds
+    }
+    return (seconds, parts.1)
+}
+
+fn read_time(codes: [i64], at: i64) -> (i64, i64) ! RuleError {
+    var i = at
+    var fields: [i64] = []
+    var current = ""
+    while i < codes.len() and (is_digit(codes[i]) or codes[i] == 58) {
+        if codes[i] == 58 {
+            fields.push(current.parse_int() ?? 0)
+            current = ""
+        } else {
+            current = current + codes[i].to_char()
+        }
+        i = i + 1
+    }
+    if current != "" {
+        fields.push(current.parse_int() ?? 0)
+    }
+    if fields.len() == 0 {
+        fail(BadFormat(at))
+    }
+    var seconds = fields[0] * 3600
+    if fields.len() > 1 {
+        seconds = seconds + fields[1] * 60
+    }
+    if fields.len() > 2 {
+        seconds = seconds + fields[2]
+    }
+    return (seconds, i)
+}
+
+fn read_date(codes: [i64], at: i64) -> (RuleDate, i64) ! RuleError {
+    var i = at
+    if i >= codes.len() {
+        fail(BadDate(at))
+    }
+    var out = default_date()
+    if codes[i] == 77 {
+        i = i + 1
+        let month = try read_number(codes, i)
+        i = month.1
+        if i >= codes.len() or codes[i] != 46 {
+            fail(BadDate(i))
+        }
+        let week = try read_number(codes, i + 1)
+        i = week.1
+        if i >= codes.len() or codes[i] != 46 {
+            fail(BadDate(i))
+        }
+        let day = try read_number(codes, i + 1)
+        i = day.1
+        out = RuleDate{ kind: "M", month: month.0, week: week.0,
+            day: day.0, at_second: 7200 }
+    } else if codes[i] == 74 {
+        let day = try read_number(codes, i + 1)
+        i = day.1
+        out = RuleDate{ kind: "J", month: 0, week: 0, day: day.0,
+            at_second: 7200 }
+    } else {
+        let day = try read_number(codes, i)
+        i = day.1
+        out = RuleDate{ kind: "n", month: 0, week: 0, day: day.0,
+            at_second: 7200 }
+    }
+    if i < codes.len() and codes[i] == 47 {
+        let when = try read_time(codes, i + 1)
+        out.at_second = when.0
+        i = when.1
+    }
+    return (out, i)
+}
+
+fn read_number(codes: [i64], at: i64) -> (i64, i64) ! RuleError {
+    var i = at
+    var out = ""
+    while i < codes.len() and is_digit(codes[i]) {
+        out = out + codes[i].to_char()
+        i = i + 1
+    }
+    if out == "" {
+        fail(BadDate(at))
+    }
+    return (out.parse_int() ?? 0, i)
+}
+
+// ------------------------------------------------------------- evaluation
+
+/// Whether a year is a leap year in the proleptic Gregorian calendar.
+pub fn is_leap(year: i64) -> bool {
+    return year % 4 == 0 and (year % 100 != 0 or year % 400 == 0)
+}
+
+/// The days in a month.
+pub fn days_in_month(year: i64, month: i64) -> i64 {
+    let lengths = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    if month == 2 and is_leap(year) {
+        return 29
+    }
+    return lengths[month - 1]
+}
+
+/// Days from 1970-01-01 to a date, which is the calendar arithmetic
+/// everything else rests on.
+pub fn days_from_epoch(year: i64, month: i64, day: i64) -> i64 {
+    // Howard Hinnant's civil-from-days, run backwards. Shifting the year to
+    // start in March puts the leap day at the end, so no month length depends
+    // on the leap rule and the whole thing is four divisions.
+    var y = year
+    if month <= 2 {
+        y = y - 1
+    }
+    let era = divide_floor(y, 400)
+    let year_of_era = y - era * 400
+    var m = month
+    if m > 2 {
+        m = m - 3
+    } else {
+        m = m + 9
+    }
+    let day_of_year = (153 * m + 2) / 5 + day - 1
+    let day_of_era = year_of_era * 365 + year_of_era / 4 -
+    year_of_era / 100 + day_of_year
+    return era * 146097 + day_of_era - 719468
+}
+
+fn divide_floor(a: i64, b: i64) -> i64 {
+    var q = a / b
+    if a % b != 0 and (a < 0) != (b < 0) {
+        q = q - 1
+    }
+    return q
+}
+
+/// The day of the week, 0 for Sunday.
+pub fn weekday(year: i64, month: i64, day: i64) -> i64 {
+    let days = days_from_epoch(year, month, day)
+    // 1970-01-01 was a Thursday, which is 4.
+    var w = (days + 4) % 7
+    if w < 0 {
+        w = w + 7
+    }
+    return w
+}
+
+/// The day of the month a rule date falls on in a year.
+///
+/// `M3.5.0` is the *last* Sunday in March, not the fifth: week 5 means the
+/// last one, and a month with only four Sundays still has one.
+pub fn day_of(date: RuleDate, year: i64) -> (i64, i64) {
+    if date.kind == "J" {
+        // A Julian day that skips 29 February, so day 60 is 1 March in every
+        // year and the rule means the same date whatever the leap rule says.
+        var remaining = date.day
+        var month = 1
+        while remaining > days_in_month(2001, month) {
+            remaining = remaining - days_in_month(2001, month)
+            month = month + 1
+        }
+        return (month, remaining)
+    }
+    if date.kind == "n" {
+        var remaining = date.day
+        var month = 1
+        while remaining >= days_in_month(year, month) {
+            remaining = remaining - days_in_month(year, month)
+            month = month + 1
+        }
+        return (month, remaining + 1)
+    }
+    let first = weekday(year, date.month, 1)
+    var day = 1 + (date.day - first + 7) % 7
+    var week = 1
+    while week < date.week and day + 7 <= days_in_month(year, date.month) {
+        day = day + 7
+        week = week + 1
+    }
+    return (date.month, day)
+}
+
+/// The instant a rule date falls at in a year, in UTC seconds.
+///
+/// The rule's time is on the clock in force *before* the change, which is
+/// standard time in spring and daylight time in autumn — so the two use
+/// different offsets and a program that uses one for both is an hour out for
+/// half the year.
+pub fn transition_at(date: RuleDate, year: i64, offset: i64) -> i64 {
+    let where = day_of(date, year)
+    return days_from_epoch(year, where.0, where.1) * 86400 +
+    date.at_second - offset
+}
+
+/// The year an instant falls in.
+pub fn year_of(instant: i64) -> i64 {
+    var days = divide_floor(instant, 86400)
+    var z = days + 719468
+    let era = divide_floor(z, 146097)
+    let day_of_era = z - era * 146097
+    let year_of_era = (day_of_era - day_of_era / 1460 + day_of_era / 36524 -
+        day_of_era / 146096) / 365
+    var y = year_of_era + era * 400
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 -
+        year_of_era / 100)
+    let mp = (5 * day_of_year + 2) / 153
+    if mp < 10 {
+        return y
+    }
+    return y + 1
+}
+
+/// Seconds east of UTC at an instant, by the rule alone.
+pub fn offset_at(rule: TimezoneRule, instant: i64) -> i64 {
+    if not rule.has_daylight {
+        return rule.standard_offset
+    }
+    let year = year_of(instant)
+    let start = transition_at(rule.start, year, rule.standard_offset)
+    let stop = transition_at(rule.stop, year, rule.daylight_offset)
+    if start <= stop {
+        // Northern hemisphere: summer is in the middle of the year.
+        if instant >= start and instant < stop {
+            return rule.daylight_offset
+        }
+        return rule.standard_offset
+    }
+    // Southern hemisphere: summer straddles the new year, so the rule is
+    // inverted and a program that only handles the northern case is an hour
+    // out for the whole of Australia.
+    if instant >= start or instant < stop {
+        return rule.daylight_offset
+    }
+    return rule.standard_offset
+}
+
+/// Whether daylight saving is in force at an instant.
+pub fn is_dst_at(rule: TimezoneRule, instant: i64) -> bool {
+    return rule.has_daylight and
+    offset_at(rule, instant) == rule.daylight_offset
+}
+
+/// The abbreviation in force at an instant.
+pub fn abbreviation_at(rule: TimezoneRule, instant: i64) -> str {
+    if is_dst_at(rule, instant) {
+        return rule.daylight_name
+    }
+    return rule.standard_name
+}
+
+/// Whether the rule's summer straddles the new year.
+pub fn is_southern(rule: TimezoneRule) -> bool {
+    if not rule.has_daylight {
+        return false
+    }
+    return rule.start.month > rule.stop.month
+}

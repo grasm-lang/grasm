@@ -1,0 +1,6 @@
+[package]
+name = "tzfile"
+version = "1.0.0"
+
+# Parses a TZif file's bytes. Opens nothing itself.
+capabilities = []
