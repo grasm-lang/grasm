@@ -1,0 +1,10 @@
+[package]
+name = "taxrate"
+version = "1.0.0"
+
+# Arithmetic. Opens nothing.
+capabilities = []
+
+[dependencies.money]
+path = "../money"
+version = "^1.0.0"

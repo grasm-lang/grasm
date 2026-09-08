@@ -1,0 +1,308 @@
+// Currency conversion, and the rules that make it reproducible.
+//
+// ## Why a rate is not a float
+//
+// A rate is a number somebody published, and two systems converting the same
+// amount at the same published rate must produce the same answer or the
+// reconciliation fails. So a rate here is an integer numerator over an
+// integer denominator: 1.234567 is 1234567 over 1000000, exactly, and stays
+// exact through the arithmetic. A float rate is off in the last place and
+// the difference shows up as a penny once every few thousand transactions —
+// which is precisely often enough to be a recurring ticket and rare enough
+// never to be reproduced.
+//
+// ## The three rules the euro conversion has in law
+//
+// Council Regulation 1103/97 is unusually specific, and every rule in it
+// exists because somebody would otherwise have done the obvious thing:
+//
+//   * **The rate is six significant figures and must not be shortened.**
+//     1 EUR is 1.95583 DEM, never 1.9558 and never 1.955830 rounded up
+//     from something.
+//   * **The inverse must not be used.** To go from marks to euros you divide
+//     by 1.95583. You do not multiply by 0.511292, because that number is a
+//     rounding of the reciprocal and the two disagree.
+//   * **Two national units convert through the euro.** Marks to francs is
+//     marks to euros to francs, with the intermediate rounded to no fewer
+//     than three decimal places — not by a single made-up cross rate.
+//
+// Those currencies are gone from daily use and the rules are not: the same
+// three questions come up for every fixed peg, every internal accounting
+// currency, and every conversion table someone is about to build out of
+// pre-computed cross rates.
+//
+// ## What this does not do
+//
+// Fetch rates. It has no capabilities and never will; a rate comes from the
+// caller, with the date it was published, because "the rate" without a date
+// is not a rate and an audit will ask.
+//
+// Checked against the official conversion rates in Regulation 2866/98 and
+// the worked triangulation examples in the Commission's guidance.
+
+import money
+
+type FxRate = {
+    from_code: str,
+    to_code: str,
+    /// The rate as `numerator / denominator`, kept exact.
+    numerator: i64,
+    denominator: i64,
+    /// The day the rate was published, ISO 8601. Empty means the caller did
+    /// not say, which is worth being able to see.
+    published: str,
+}
+
+type FxError =
+    | NoRate(from_code: str, to_code: str)
+    | ZeroDenominator()
+    | CurrencyMismatch(expected: str, found: str)
+
+    /// A rate from a decimal written as digits and a scale.
+    ///
+    /// `rate("EUR", "DEM", 195583, 5)` is 1.95583 exactly. The scale is the
+    /// number of decimal places, so no float ever touches the number.
+pub fn rate(from_code: str, to_code: str, digits: i64,
+    scale: i64) -> FxRate {
+    var denominator = 1
+    var i = 0
+    while i < scale {
+        denominator = denominator * 10
+        i = i + 1
+    }
+    return FxRate{ from_code: from_code, to_code: to_code,
+        numerator: digits, denominator: denominator, published: "" }
+}
+
+pub fn dated(r: FxRate, published: str) -> FxRate {
+    var out = r
+    out.published = published
+    return out
+}
+
+/// The irrevocable euro conversion rates, from Regulation 2866/98 and its
+/// amendments.
+///
+/// These are not market rates and never move again. Every one is six
+/// significant figures, which is why the scales below differ: 1936.27 has two
+/// decimal places and 0.585274 has six, and both are exactly six figures.
+pub fn euro_rates() -> [FxRate] {
+    return [
+        rate("EUR", "ATS", 137603, 4), rate("EUR", "BEF", 403399, 4),
+        rate("EUR", "CYP", 585274, 6), rate("EUR", "DEM", 195583, 5),
+        rate("EUR", "EEK", 156466, 4), rate("EUR", "ESP", 166386, 3),
+        rate("EUR", "FIM", 594573, 5), rate("EUR", "FRF", 655957, 5),
+        rate("EUR", "GRD", 340750, 3), rate("EUR", "HRK", 753450, 5),
+        rate("EUR", "IEP", 787564, 6), rate("EUR", "ITL", 193627, 2),
+        rate("EUR", "LTL", 345280, 5), rate("EUR", "LUF", 403399, 4),
+        rate("EUR", "LVL", 702804, 6), rate("EUR", "MTL", 429300, 6),
+        rate("EUR", "NLG", 220371, 5), rate("EUR", "PTE", 200482, 3),
+        rate("EUR", "SIT", 239640, 3), rate("EUR", "SKK", 301260, 4),
+    ]
+}
+
+pub fn euro_rate(code: str) -> FxRate ! FxError {
+    for r in euro_rates() {
+        if r.to_code == code {
+            return r
+        }
+    }
+    fail(NoRate("EUR", code))
+}
+
+fn round_half_up(numerator: i64, denominator: i64) -> i64 {
+    if denominator == 0 {
+        return 0
+    }
+    let negative = (numerator < 0) != (denominator < 0)
+    var n = numerator
+    if n < 0 {
+        n = 0 - n
+    }
+    var d = denominator
+    if d < 0 {
+        d = 0 - d
+    }
+    let result = (2 * n + d) / (2 * d)
+    if negative {
+        return 0 - result
+    }
+    return result
+}
+
+fn power_of_ten(n: i64) -> i64 {
+    var out = 1
+    var i = 0
+    while i < n {
+        out = out * 10
+        i = i + 1
+    }
+    return out
+}
+
+/// Convert an amount at a rate, rounding to the target currency's own
+/// precision.
+///
+/// The exponent of the target decides where the rounding happens: the same
+/// conversion into yen rounds to the whole unit and into dinars to three
+/// places, and using two everywhere is wrong in a hundred and fifty
+/// countries.
+pub fn convert(amount: Money, r: FxRate) -> Money ! FxError {
+    if amount.code != r.from_code {
+        fail(CurrencyMismatch(r.from_code, amount.code))
+    }
+    if r.denominator == 0 {
+        fail(ZeroDenominator())
+    }
+    let target_exponent = money.exponent_of(r.to_code)
+    // Move between the two currencies' precisions as part of the same exact
+    // fraction, so there is one rounding and not two.
+    let scale_up = power_of_ten(target_exponent)
+    let scale_down = power_of_ten(amount.exponent)
+    let numerator = amount.amount * r.numerator * scale_up
+    let denominator = r.denominator * scale_down
+    return money.of_minor(round_half_up(numerator, denominator), r.to_code)
+}
+
+/// Convert *against* a rate — dividing rather than multiplying by an inverse.
+///
+/// This is the rule the euro regulation states, and the reason for it is that
+/// the inverse of a six-figure rate is not a six-figure number: multiplying
+/// by a rounded reciprocal and dividing by the rate give different answers,
+/// and only one of them is the legal one.
+pub fn convert_back(amount: Money, r: FxRate) -> Money ! FxError {
+    if amount.code != r.to_code {
+        fail(CurrencyMismatch(r.to_code, amount.code))
+    }
+    if r.numerator == 0 {
+        fail(ZeroDenominator())
+    }
+    let target_exponent = money.exponent_of(r.from_code)
+    let scale_up = power_of_ten(target_exponent)
+    let scale_down = power_of_ten(amount.exponent)
+    let numerator = amount.amount * r.denominator * scale_up
+    let denominator = r.numerator * scale_down
+    return money.of_minor(round_half_up(numerator, denominator), r.from_code)
+}
+
+/// The inverse of a rate, for a caller who genuinely wants one.
+///
+/// It is here so that the choice to use one is visible in the code. Under the
+/// euro rules it is not permitted, and in general a rate and its inverse
+/// round differently — `convert_back` is what a caller almost always means.
+pub fn inverse(r: FxRate) -> FxRate {
+    return FxRate{ from_code: r.to_code, to_code: r.from_code,
+        numerator: r.denominator, denominator: r.numerator,
+        published: r.published }
+}
+
+/// Convert between two national units through the euro.
+///
+/// The intermediate is kept to `intermediate_places` decimal places — the
+/// regulation says no fewer than three — and the second conversion works from
+/// that, not from a cross rate somebody multiplied out in advance.
+pub fn triangulate(amount: Money, from_rate: FxRate, to_rate: FxRate,
+    intermediate_places: i64) -> Money ! FxError {
+    if amount.code != from_rate.to_code {
+        fail(CurrencyMismatch(from_rate.to_code, amount.code))
+    }
+    let scale = power_of_ten(intermediate_places)
+    // Into euros, at `intermediate_places` decimals, rounded once.
+    let euros = round_half_up(
+        amount.amount * from_rate.denominator * scale,
+        from_rate.numerator * power_of_ten(amount.exponent))
+    let target_exponent = money.exponent_of(to_rate.to_code)
+    let out = round_half_up(euros * to_rate.numerator *
+        power_of_ten(target_exponent),
+        to_rate.denominator * scale)
+    return money.of_minor(out, to_rate.to_code)
+}
+
+/// A cross rate computed from two rates against a common currency.
+///
+/// Offered with a warning attached: a table of pre-computed cross rates is
+/// where a rounding error becomes permanent, because every conversion using
+/// it inherits the same wrong last digit. Convert through the base instead
+/// wherever the rules allow it.
+pub fn cross(from_rate: FxRate, to_rate: FxRate) -> FxRate ! FxError {
+    if from_rate.from_code != to_rate.from_code {
+        fail(CurrencyMismatch(from_rate.from_code, to_rate.from_code))
+    }
+    return FxRate{
+        from_code: from_rate.to_code,
+        to_code: to_rate.to_code,
+        numerator: to_rate.numerator * from_rate.denominator,
+        denominator: to_rate.denominator * from_rate.numerator,
+        published: from_rate.published,
+    }
+}
+
+/// The rate as a decimal string with `places` digits after the point.
+pub fn rate_text(r: FxRate, places: i64) -> str {
+    let scale = power_of_ten(places)
+    let scaled = round_half_up(r.numerator * scale, r.denominator)
+    let whole = scaled / scale
+    var fraction = "{scaled % scale}"
+    while fraction.len() < places {
+        fraction = "0" + fraction
+    }
+    if places == 0 {
+        return "{whole}"
+    }
+    return "{whole}.{fraction}"
+}
+
+/// How many significant figures a rate carries.
+///
+/// The euro rates are six by law, and a rate quoted with fewer is a rate
+/// somebody has already rounded.
+pub fn significant_figures(r: FxRate) -> i64 {
+    var digits = 0
+    var v = r.numerator
+    while v > 0 {
+        digits = digits + 1
+        v = v / 10
+    }
+    // Trailing zeroes in the numerator are not significant unless the
+    // denominator puts them after the point.
+    var trailing = 0
+    var w = r.numerator
+    while w > 0 and w % 10 == 0 {
+        trailing = trailing + 1
+        w = w / 10
+    }
+    var scale_digits = 0
+    var d = r.denominator
+    while d > 1 {
+        scale_digits = scale_digits + 1
+        d = d / 10
+    }
+    if trailing > scale_digits {
+        return digits - (trailing - scale_digits)
+    }
+    return digits
+}
+
+/// A rate looked up in a table, or a refusal that names the pair.
+pub fn find(rates: [FxRate], from_code: str,
+    to_code: str) -> FxRate ! FxError {
+    for r in rates {
+        if r.from_code == from_code and r.to_code == to_code {
+            return r
+        }
+    }
+    fail(NoRate(from_code, to_code))
+}
+
+/// Whether a rate is stale, given the date it was published and today.
+///
+/// A market rate is good for a day; a rate an accounting system has been
+/// using for three weeks is a bug nobody has noticed. Comparison is textual
+/// because ISO 8601 dates sort correctly as text, which is the whole point of
+/// the format.
+pub fn is_older_than(r: FxRate, date: str) -> bool {
+    if r.published == "" {
+        return true
+    }
+    return r.published < date
+}

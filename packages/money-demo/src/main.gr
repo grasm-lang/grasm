@@ -1,0 +1,389 @@
+import vatid
+import taxrate
+import invoice
+import ledgerfmt
+import fx
+import money
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn eur(minor: i64) -> Money {
+    return money.of_minor(minor, "EUR")
+}
+
+// ----------------------------------------------------------------- vatid
+
+fn check_vatid(inout f: i64) / {io} {
+    print("-- vatid: twenty-seven countries, twenty-seven algorithms")
+    // Every number here is a published example, and every rejection was
+    // checked against `python-stdnum`.
+    say(f, "the published example for each country validates",
+        vatid.is_valid("DE136695976") and vatid.is_valid("ATU13585627") and
+        vatid.is_valid("BE0776091951") and
+        vatid.is_valid("FR40303265045") and
+        vatid.is_valid("NL004495445B01"))
+    say(f, "and the rest of them too",
+        vatid.is_valid("IT00743110157") and vatid.is_valid("ES B85905495") and
+        vatid.is_valid("IE8473625E") and
+        vatid.is_valid("SE123456789701") and
+        vatid.is_valid("PL8567346215"))
+    say(f, "one digit changed and the checksum catches it",
+        not vatid.is_valid("DE136695977") and
+        not vatid.is_valid("ATU13585628") and
+        not vatid.is_valid("IT00743110158"))
+    say(f, "and so does a transposition",
+        not vatid.is_valid("DE136695967") and
+        not vatid.is_valid("PL8567346251"))
+    say(f, "spaces and case are how people type them",
+        vatid.is_valid("de 136 695 976") and
+        vatid.is_valid("DE-136-695-976"))
+    say(f, "Greece uses EL and not its own country code",
+        vatid.is_valid("EL094259216") and not vatid.is_known_country("GR") and
+        vatid.greek_prefix() == "EL")
+    say(f, "an unknown prefix is refused rather than guessed at",
+        not vatid.is_valid("XX123456789") and
+        not vatid.is_valid("US123456789"))
+    say(f, "a number too short to have a country is refused",
+        not vatid.is_valid("D1"))
+    // Italy's tax office code is a range, so a passing checksum is not
+    // enough — `stdnum` rejects this one for the same reason.
+    say(f, "a checksum that passes is still not always a number",
+        not vatid.is_valid("IT05092133627"))
+    say(f, "the description says which country and what happened",
+        vatid.describe("DE136695976") == "Germany: checksum passes" and
+        vatid.describe("DE136695977") == "Germany: checksum fails")
+    say(f, "a cross-border supply between two businesses is reverse-charged",
+        vatid.is_reverse_charge("DE136695976", "FR40303265045") and
+        not vatid.is_reverse_charge("DE136695976", "DE136695976"))
+    say(f, "twenty-seven member states are covered",
+        vatid.countries().len() == 27)
+}
+
+// --------------------------------------------------------------- taxrate
+
+fn check_taxrate(inout f: i64) / {io} {
+    print("-- taxrate: the VAT in a price, and where the rounding lands")
+    let twenty = taxrate.rate("GB", "standard", 2000)
+    let nineteen = taxrate.rate("DE", "standard", 1900)
+    let finnish = taxrate.rate("FI", "standard", 2550)
+    say(f, "the VAT in a gross price of 120.00 at 20% is 20.00, not 24.00",
+        taxrate.vat_within(eur(12000), twenty).amount == 2000 and
+        taxrate.net_within(eur(12000), twenty).amount == 10000)
+    say(f, "and on a net price of 100.00 it is 20.00",
+        taxrate.vat_on(eur(10000), twenty).amount == 2000 and
+        taxrate.add_vat(eur(10000), twenty).amount == 12000)
+    // Both of these are Python's `decimal` with ROUND_HALF_UP.
+    say(f, "halves round away from zero, as the tax rules say",
+        taxrate.vat_on(eur(999), nineteen).amount == 190 and
+        taxrate.vat_on(eur(999), finnish).amount == 255)
+    // 1.50 at 19% is 0.285 exactly: half away from zero gives 0.29 and half
+    // to even gives 0.28, because 28 is even.
+    say(f, "banker's rounding gives a different penny, which is why it is "
+        + "not the default",
+        taxrate.vat_on(eur(150), nineteen).amount == 29 and
+        taxrate.vat_on_half_even(eur(150), nineteen).amount == 28)
+    // Five lines of 0.50: rounded per line the VAT is 0.50, rounded once it
+    // is 0.48. Both are permitted and they differ.
+    let lines = [eur(50), eur(50), eur(50), eur(50), eur(50)]
+    let ways = taxrate.both_ways(lines, nineteen) ?? (eur(0), eur(0), 0)
+    say(f, "per line and per invoice are two different legal answers",
+        ways.0.amount == 50 and ways.1.amount == 48 and ways.2 == 2)
+    say(f, "a rate that is not a whole number prints as one anyway",
+        taxrate.rate_text(finnish) == "25.5%" and
+        taxrate.rate_text(twenty) == "20%")
+    say(f, "the standard rate of each state is in the table",
+        rate_of("DE") == 1900 and rate_of("HU") == 2700 and
+        rate_of("LU") == 1700)
+    say(f, "and the table says when it was last checked",
+        taxrate.rates_as_of() == "2026-01-01")
+    say(f, "a country nobody listed is an error rather than a zero rate",
+        refuses_country("XX"))
+    say(f, "a business abroad is reverse-charged and a consumer is not",
+        taxrate.is_reverse_charge("DE", "FR", true) and
+        not taxrate.is_reverse_charge("DE", "FR", false) and
+        not taxrate.is_reverse_charge("DE", "DE", true))
+    say(f, "and the invoice has to carry the article that says why",
+        taxrate.reverse_charge_note().contains("Article 196"))
+}
+
+fn rate_of(country: str) -> i64 {
+    let r: VatRate ! TaxError = taxrate.standard_rate(country)
+    return (r ?? taxrate.rate("", "", 0 - 1)).basis_points
+}
+
+fn refuses_country(code: str) -> bool {
+    match taxrate.standard_rate(code) {
+        Ok(_r) -> {
+            return false
+        }
+        Err(_e) -> {
+            return true
+        }
+    }
+}
+
+// --------------------------------------------------------------- invoice
+
+fn sample_lines() -> [InvoiceLine] {
+    let twenty = taxrate.rate("GB", "standard", 2000)
+    let zero = taxrate.rate("GB", "zero", 0)
+    return [
+        invoice.line("widget", 2000, eur(1250), twenty),
+        invoice.line("gadget", 3500, eur(999), twenty),
+        invoice.line("book", 1000, eur(1500), zero),
+    ]
+}
+
+fn check_invoice(inout f: i64) / {io} {
+    print("-- invoice: the standard writes its rules as arithmetic")
+    let lines = sample_lines()
+    say(f, "a fractional quantity rounds once, at the line",
+        invoice.line_net(lines[0]).amount == 2500 and
+        invoice.line_net(lines[1]).amount == 3497)
+    let totals = totals_of(lines)
+    say(f, "and the totals are the sums the standard defines",
+        totals.line_net.amount == 7497 and totals.vat.amount == 1199 and
+        totals.with_vat.amount == 8696)
+    let rows = invoice.breakdown(lines)
+    say(f, "VAT is per rate, so a zero-rated line has its own row",
+        rows.len() == 2 and rows[0].taxable.amount == 5997 and
+        rows[0].tax.amount == 1199 and rows[1].tax.amount == 0)
+    say(f, "an invoice whose totals follow from its lines breaks no rule",
+        invoice.violations(lines, totals).len() == 0)
+    var wrong = totals
+    wrong.vat = eur(1200)
+    say(f, "and one whose VAT is a penny out names the rule it breaks",
+        invoice.violations(lines, wrong).contains("BR-CO-14") and
+        invoice.violations(lines, wrong).contains("BR-CO-15"))
+    var short_total = totals
+    short_total.line_net = eur(7000)
+    say(f, "a line total that is not the sum of the lines is BR-CO-10",
+        invoice.violations(lines, short_total).contains("BR-CO-10"))
+    let discounted = invoice.with_discount(lines[0], eur(500))
+    say(f, "a discount is part of the line, not a negative line",
+        invoice.line_net(discounted).amount == 2000)
+    let with_allowance = invoice.totals(lines, eur(1000), eur(250), eur(2000),
+        eur(0)) ?? totals
+    say(f, "an allowance and a charge move the total without VAT",
+        with_allowance.without_vat.amount == 7497 - 1000 + 250)
+    say(f, "and what is due is the total less what was already paid",
+        with_allowance.due.amount == with_allowance.with_vat.amount - 2000)
+    say(f, "the printed VAT table has a row for each rate",
+        invoice.breakdown_text(lines).contains("20%") and
+        invoice.breakdown_text(lines).contains("0%"))
+    say(f, "an invoice with no lines is an error, not a zero",
+        refuses_empty())
+    say(f, "and the rounding to a whole unit is its own amount",
+        invoice.rounding_to_whole(totals).amount == 4)
+}
+
+fn totals_of(lines: [InvoiceLine]) -> InvoiceTotals {
+    let zero = eur(0)
+    let empty = InvoiceTotals{ line_net: zero, allowances: zero,
+        charges: zero, without_vat: zero, vat: zero, with_vat: zero,
+        prepaid: zero, rounding: zero, due: zero }
+    let t: InvoiceTotals ! InvoiceError = invoice.simple_totals(lines)
+    return t ?? empty
+}
+
+fn refuses_empty() -> bool {
+    match invoice.simple_totals([]) {
+        Ok(_t) -> {
+            return false
+        }
+        Err(_e) -> {
+            return true
+        }
+    }
+}
+
+// ------------------------------------------------------------- ledgerfmt
+
+fn journal() -> str {
+    return "2026-01-05 * Coffee roasters\n" +
+    "    Expenses:Food:Coffee    12.50 EUR\n" +
+    "    Assets:Cash\n\n" +
+    "2026-01-06 ! Rent  ; paid early\n" +
+    "    Expenses:Rent  1,200.00 EUR\n" +
+    "    Assets:Bank Current Account  -1200.00 EUR\n\n" +
+    "2026-01-07 Broken\n" +
+    "    Expenses:Food  10.00 EUR\n" +
+    "    Assets:Cash  -9.00 EUR\n"
+}
+
+fn check_ledgerfmt(inout f: i64) / {io} {
+    print("-- ledgerfmt: double entry in five lines of text")
+    let txns = ledgerfmt.parse(journal()) ?? []
+    say(f, "three transactions, with their dates and their status",
+        txns.len() == 3 and txns[0].status == "*" and
+        txns[1].status == "!" and txns[2].status == "" and
+        txns[0].date == "2026-01-05")
+    say(f, "the elided amount is whatever makes the transaction balance",
+        elided_amount(txns[0]) == 0 - 1250)
+    say(f, "an account name may contain single spaces, so the split is two",
+        txns[1].postings[1].account == "Assets:Bank Current Account")
+    say(f, "thousands separators are how the number was written",
+        txns[1].postings[0].amount.amount == 120000)
+    say(f, "a comment after the payee is the transaction's note",
+        txns[1].note == "paid early")
+    say(f, "balances roll up through the account hierarchy",
+        balance_of(txns, "Expenses:Food:Coffee") == 1250 and
+        balance_of(txns, "Expenses:Food") == 2250 and
+        balance_of(txns, "Expenses") == 122250)
+    say(f, "a transaction that does not balance is found and measured",
+        not ledgerfmt.is_balanced(txns[2]) and
+        ledgerfmt.imbalance(txns[2]) == 100 and
+        ledgerfmt.unbalanced(txns).len() == 1)
+    say(f, "two elided amounts have no unique answer, so it is refused",
+        refuses_two_elided())
+    say(f, "transactions can be found by account or by any account below it",
+        ledgerfmt.transactions_for(txns, "Expenses:Food").len() == 2 and
+        ledgerfmt.transactions_for(txns, "Assets").len() == 3)
+    say(f, "the check lists exactly what is wrong with the journal",
+        ledgerfmt.check(txns).len() == 1 and
+        ledgerfmt.check(txns)[0].contains("does not balance"))
+    let rendered = ledgerfmt.render(txns)
+    say(f, "and rendering it produces a journal that parses the same way",
+        (ledgerfmt.parse(rendered) ?? []).len() == 3 and
+        reparsed_balance(rendered) == 122250)
+}
+
+fn elided_amount(t: LedgerTransaction) -> i64 {
+    let filled: LedgerTransaction ! LedgerError = ledgerfmt.infer_elided(t)
+    let out = filled ?? t
+    return out.postings[out.postings.len() - 1].amount.amount
+}
+
+fn balance_of(txns: [LedgerTransaction], account: str) -> i64 {
+    return ledgerfmt.rolled_up_balances(txns).get(account) ?? 0
+}
+
+fn refuses_two_elided() -> bool {
+    let text = "2026-01-01 x\n    A  10.00 EUR\n    B\n    C\n"
+    let txns = ledgerfmt.parse(text) ?? []
+    if txns.len() != 1 {
+        return false
+    }
+    match ledgerfmt.infer_elided(txns[0]) {
+        Ok(_t) -> {
+            return false
+        }
+        Err(_e) -> {
+            return true
+        }
+    }
+}
+
+fn reparsed_balance(text: str) -> i64 {
+    let txns = ledgerfmt.parse(text) ?? []
+    return ledgerfmt.rolled_up_balances(txns).get("Expenses") ?? 0
+}
+
+// -------------------------------------------------------------------- fx
+
+fn check_fx(inout f: i64) / {io} {
+    print("-- fx: six figures, no inverse, through the euro")
+    let dem = euro("DEM")
+    let frf = euro("FRF")
+    say(f, "the irrevocable rates are the ones the regulation lists",
+        fx.rate_text(dem, 5) == "1.95583" and
+        fx.rate_text(frf, 5) == "6.55957" and
+        fx.rate_text(euro("ITL"), 2) == "1936.27")
+    say(f, "and every one of them is six significant figures",
+        fx.significant_figures(dem) == 6 and
+        fx.significant_figures(euro("ITL")) == 6 and
+        fx.significant_figures(euro("GRD")) == 6 and
+        fx.significant_figures(euro("CYP")) == 6)
+    say(f, "converting 100 euros gives 195.58 marks",
+        converted(eur(10000), dem) == 19558)
+    // Dividing by the rate, not multiplying by a rounded reciprocal.
+    say(f, "and converting back divides rather than using an inverse",
+        converted_back(money.of_minor(19558, "DEM"), dem) == 10000)
+    say(f, "the inverse rate exists but gives a different answer",
+        fx.inverse(dem).numerator == 100000 and
+        fx.inverse(dem).denominator == 195583)
+    // 100 DEM is 51.129 EUR to three places, and 51.129 x 6.55957 is 335.38.
+    say(f, "marks to francs goes through the euro, three places in between",
+        triangulated(money.of_minor(10000, "DEM"), dem, frf, 3) == 33538)
+    say(f, "a rate for a pair nobody supplied is an error, not a one",
+        refuses_missing_rate())
+    say(f, "converting the wrong currency at a rate is refused",
+        refuses_wrong_currency(dem))
+    say(f, "the target currency's own precision decides the rounding",
+        money.exponent_of("JPY") == 0 and money.exponent_of("EUR") == 2)
+    say(f, "a rate with no date is treated as stale",
+        fx.is_older_than(dem, "2026-01-01") and
+        not fx.is_older_than(fx.dated(dem, "2026-06-01"), "2026-01-01"))
+    say(f, "a cross rate can be computed, and carries both roundings",
+        cross_numerator(dem, frf) > 0)
+}
+
+fn euro(code: str) -> FxRate {
+    let r: FxRate ! FxError = fx.euro_rate(code)
+    return r ?? fx.rate("EUR", code, 1, 0)
+}
+
+fn converted(amount: Money, r: FxRate) -> i64 {
+    let out: Money ! FxError = fx.convert(amount, r)
+    return (out ?? money.of_minor(0 - 1, r.to_code)).amount
+}
+
+fn converted_back(amount: Money, r: FxRate) -> i64 {
+    let out: Money ! FxError = fx.convert_back(amount, r)
+    return (out ?? money.of_minor(0 - 1, r.from_code)).amount
+}
+
+fn triangulated(amount: Money, from_rate: FxRate, to_rate: FxRate,
+    places: i64) -> i64 {
+    let out: Money ! FxError = fx.triangulate(amount, from_rate, to_rate,
+        places)
+    return (out ?? money.of_minor(0 - 1, to_rate.to_code)).amount
+}
+
+fn refuses_missing_rate() -> bool {
+    match fx.find(fx.euro_rates(), "USD", "JPY") {
+        Ok(_r) -> {
+            return false
+        }
+        Err(_e) -> {
+            return true
+        }
+    }
+}
+
+fn refuses_wrong_currency(r: FxRate) -> bool {
+    match fx.convert(money.of_minor(100, "USD"), r) {
+        Ok(_m) -> {
+            return false
+        }
+        Err(_e) -> {
+            return true
+        }
+    }
+}
+
+fn cross_numerator(a: FxRate, b: FxRate) -> i64 {
+    let r: FxRate ! FxError = fx.cross(a, b)
+    return (r ?? fx.rate("", "", 0, 0)).numerator
+}
+
+fn main() / {io} {
+    var f = 0
+    check_vatid(f)
+    check_taxrate(f)
+    check_invoice(f)
+    check_ledgerfmt(f)
+    check_fx(f)
+    if f == 0 {
+        print("money and tax: every claim held")
+    } else {
+        print("money and tax: {f} claims failed")
+    }
+}

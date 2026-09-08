@@ -1,0 +1,28 @@
+[package]
+name = "money_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.vatid]
+path = "../vatid"
+version = "^1.0.0"
+
+[dependencies.taxrate]
+path = "../taxrate"
+version = "^1.0.0"
+
+[dependencies.invoice]
+path = "../invoice"
+version = "^1.0.0"
+
+[dependencies.ledgerfmt]
+path = "../ledgerfmt"
+version = "^1.0.0"
+
+[dependencies.fx]
+path = "../fx"
+version = "^1.0.0"
+
+[dependencies.money]
+path = "../money"
+version = "^1.0.0"

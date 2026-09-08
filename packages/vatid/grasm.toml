@@ -1,0 +1,6 @@
+[package]
+name = "vatid"
+version = "1.0.0"
+
+# Arithmetic on a string. Opens nothing.
+capabilities = []

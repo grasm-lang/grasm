@@ -1,0 +1,14 @@
+[package]
+name = "invoice"
+version = "1.0.0"
+
+# Arithmetic. Opens nothing.
+capabilities = []
+
+[dependencies.money]
+path = "../money"
+version = "^1.0.0"
+
+[dependencies.taxrate]
+path = "../taxrate"
+version = "^1.0.0"

@@ -1,0 +1,290 @@
+// Invoice totals, by the rules EN 16931 states as equations.
+//
+// The European e-invoicing standard is unusual and useful: it writes its
+// business rules as arithmetic a program can check. BR-CO-13 says the total
+// without VAT is the sum of the lines minus the allowances plus the charges;
+// BR-CO-15 says the total with VAT is that plus the VAT. An invoice failing
+// one of those is rejected by every public authority in the EU, and the
+// rejection is a code — `BR-CO-13` — rather than a sentence.
+//
+// So this computes the totals *and* checks them, and `violations` returns the
+// rule codes rather than prose, because those are the codes the receiving
+// system will quote back.
+//
+// ## The two things that make the arithmetic non-obvious
+//
+// **A discount is not a negative line.** An allowance at document level
+// reduces the taxable amount for a specific VAT rate, and putting it in as a
+// negative line changes the line count, the line sum and every rule that
+// mentions them. The standard separates them and so does this.
+//
+// **VAT is per rate, not per invoice.** An invoice with lines at 20% and 5%
+// has two taxable amounts and two VAT amounts, and the total VAT is their
+// sum — computed from the per-rate subtotals, never from the grand total
+// times an average rate. `breakdown` produces that table, which is also what
+// the invoice has to print.
+//
+// Checked against EN 16931's own worked examples and the arithmetic in its
+// rule definitions.
+
+import money
+import taxrate
+
+type InvoiceLine = {
+    description: str,
+    /// Thousandths, so 2.5 hours is 2500 — a quantity is not always whole
+    /// and a float one reintroduces the problem `money` avoids.
+    quantity: i64,
+    unit_price: Money,
+    /// A discount on this line, already an amount rather than a percentage.
+    discount: Money,
+    vat: VatRate,
+}
+
+type VatBreakdown = {
+    vat: VatRate,
+    taxable: Money,
+    tax: Money,
+}
+
+type InvoiceTotals = {
+    /// BT-106: the sum of the line net amounts.
+    line_net: Money,
+    /// BT-107 and BT-108.
+    allowances: Money,
+    charges: Money,
+    /// BT-109: total without VAT.
+    without_vat: Money,
+    /// BT-110: total VAT.
+    vat: Money,
+    /// BT-112: total with VAT.
+    with_vat: Money,
+    /// BT-113 and BT-114.
+    prepaid: Money,
+    rounding: Money,
+    /// BT-115: amount due for payment.
+    due: Money,
+}
+
+type InvoiceError =
+    | NoLines()
+    | MixedCurrencies(a: str, b: str)
+
+pub fn line(description: str, quantity: i64, unit_price: Money,
+    vat: VatRate) -> InvoiceLine {
+    return InvoiceLine{ description: description, quantity: quantity,
+        unit_price: unit_price, discount: money.of_minor(0, unit_price.code),
+        vat: vat }
+}
+
+pub fn with_discount(l: InvoiceLine, discount: Money) -> InvoiceLine {
+    var out = l
+    out.discount = discount
+    return out
+}
+
+fn round_half_up(numerator: i64, denominator: i64) -> i64 {
+    let negative = (numerator < 0) != (denominator < 0)
+    var n = numerator
+    if n < 0 {
+        n = 0 - n
+    }
+    var d = denominator
+    if d < 0 {
+        d = 0 - d
+    }
+    let result = (2 * n + d) / (2 * d)
+    if negative {
+        return 0 - result
+    }
+    return result
+}
+
+/// BT-131: the net amount of one line, quantity times price less discount.
+///
+/// Rounded once, here, because the standard defines the line amount as a
+/// rounded value and every later rule adds those rounded amounts. Carrying
+/// full precision to the end gives a total that fails BR-CO-10.
+pub fn line_net(l: InvoiceLine) -> Money {
+    let raw = round_half_up(l.quantity * l.unit_price.amount, 1000)
+    return money.of_minor(raw - l.discount.amount, l.unit_price.code)
+}
+
+fn currency_of(lines: [InvoiceLine]) -> str {
+    if lines.len() == 0 {
+        return "EUR"
+    }
+    return lines[0].unit_price.code
+}
+
+/// The taxable amount and the tax for each rate on the invoice.
+///
+/// One row per rate, in the order the rates first appear — which is the order
+/// the standard expects on the printed document, and stable so two runs
+/// produce the same file.
+pub fn breakdown(lines: [InvoiceLine]) -> [VatBreakdown] {
+    var out: [VatBreakdown] = []
+    for l in lines {
+        var found = 0 - 1
+        var i = 0
+        while i < out.len() {
+            if out[i].vat.basis_points == l.vat.basis_points and
+            out[i].vat.country == l.vat.country {
+                found = i
+            }
+            i = i + 1
+        }
+        let net = line_net(l)
+        if found >= 0 {
+            var row = out[found]
+            row.taxable = money.of_minor(row.taxable.amount + net.amount,
+                net.code)
+            out[found] = row
+        } else {
+            out.push(VatBreakdown{ vat: l.vat, taxable: net,
+                tax: money.of_minor(0, net.code) })
+        }
+    }
+    var i = 0
+    while i < out.len() {
+        var row = out[i]
+        row.tax = taxrate.vat_on(row.taxable, row.vat)
+        out[i] = row
+        i = i + 1
+    }
+    return out
+}
+
+/// Every total the standard names.
+pub fn totals(lines: [InvoiceLine], allowances: Money, charges: Money,
+    prepaid: Money, rounding: Money) -> InvoiceTotals ! InvoiceError {
+    if lines.len() == 0 {
+        fail(NoLines())
+    }
+    let code = currency_of(lines)
+    var net = 0
+    for l in lines {
+        if l.unit_price.code != code {
+            fail(MixedCurrencies(code, l.unit_price.code))
+        }
+        net = net + line_net(l).amount
+    }
+    var tax = 0
+    for row in breakdown(lines) {
+        tax = tax + row.tax.amount
+    }
+    let without = net - allowances.amount + charges.amount
+    let with_vat = without + tax
+    return InvoiceTotals{
+        line_net: money.of_minor(net, code),
+        allowances: allowances,
+        charges: charges,
+        without_vat: money.of_minor(without, code),
+        vat: money.of_minor(tax, code),
+        with_vat: money.of_minor(with_vat, code),
+        prepaid: prepaid,
+        rounding: rounding,
+        due: money.of_minor(with_vat - prepaid.amount + rounding.amount,
+            code),
+    }
+}
+
+/// Totals for an invoice with nothing at document level.
+pub fn simple_totals(lines: [InvoiceLine]) -> InvoiceTotals ! InvoiceError {
+    let zero = money.of_minor(0, currency_of(lines))
+    return try totals(lines, zero, zero, zero, zero)
+}
+
+/// The rule codes an invoice breaks, empty when it is well formed.
+///
+/// These are EN 16931's own identifiers. A receiving system quotes them back
+/// on rejection, so producing them here means a sender can see the same words
+/// before the invoice leaves.
+pub fn violations(lines: [InvoiceLine],
+    stated: InvoiceTotals) -> [str] {
+    var out: [str] = []
+    var net = 0
+    for l in lines {
+        net = net + line_net(l).amount
+    }
+    if stated.line_net.amount != net {
+        out.push("BR-CO-10")
+    }
+    var tax = 0
+    for row in breakdown(lines) {
+        tax = tax + row.tax.amount
+    }
+    if stated.vat.amount != tax {
+        out.push("BR-CO-14")
+    }
+    if stated.without_vat.amount != stated.line_net.amount -
+    stated.allowances.amount + stated.charges.amount {
+        out.push("BR-CO-13")
+    }
+    if stated.with_vat.amount != stated.without_vat.amount +
+    stated.vat.amount {
+        out.push("BR-CO-15")
+    }
+    if stated.due.amount != stated.with_vat.amount - stated.prepaid.amount +
+    stated.rounding.amount {
+        out.push("BR-CO-16")
+    }
+    // BR-S-08: each rate's taxable amount is the sum of its own lines.
+    for row in breakdown(lines) {
+        var expected = 0
+        for l in lines {
+            if l.vat.basis_points == row.vat.basis_points {
+                expected = expected + line_net(l).amount
+            }
+        }
+        if row.taxable.amount != expected {
+            out.push("BR-S-08")
+        }
+    }
+    return out
+}
+
+/// Whether the invoice's own totals are the ones its lines produce.
+pub fn is_consistent(lines: [InvoiceLine], stated: InvoiceTotals) -> bool {
+    return violations(lines, stated).len() == 0
+}
+
+/// A printed VAT table, which the standard requires on the document.
+pub fn breakdown_text(lines: [InvoiceLine]) -> str {
+    var out = ""
+    for row in breakdown(lines) {
+        out = out + taxrate.rate_text(row.vat) + "  net " +
+        money.render(row.taxable) + "  VAT " + money.render(row.tax) +
+        "\n"
+    }
+    return out
+}
+
+/// A one-line summary of what is owed.
+pub fn summary(t: InvoiceTotals) -> str {
+    return "net " + money.render(t.without_vat) + ", VAT " +
+    money.render(t.vat) + ", due " + money.render(t.due)
+}
+
+/// The rounding amount that would make the total a whole unit.
+///
+/// BT-114 exists because some countries' cash payments round to the nearest
+/// five cents and the invoice has to say so as its own line rather than by
+/// quietly adjusting a total.
+pub fn rounding_to_whole(t: InvoiceTotals) -> Money {
+    let scale = money.exponent_of(t.with_vat.code)
+    var unit = 1
+    var i = 0
+    while i < scale {
+        unit = unit * 10
+        i = i + 1
+    }
+    let remainder = t.with_vat.amount % unit
+    if remainder == 0 {
+        return money.of_minor(0, t.with_vat.code)
+    }
+    if remainder * 2 >= unit {
+        return money.of_minor(unit - remainder, t.with_vat.code)
+    }
+    return money.of_minor(0 - remainder, t.with_vat.code)
+}

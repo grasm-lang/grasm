@@ -1,0 +1,1043 @@
+// EU VAT identification numbers, and the checksum each country invented.
+//
+// A business selling across the EU has to know whether its customer's VAT
+// number is real, because that decides whether the invoice carries VAT or is
+// reverse-charged — and getting it wrong means paying the VAT itself.
+//
+// ## Why there are twenty-eight algorithms and not one
+//
+// Every member state brought its own existing company register into the
+// system in 1993 and kept its own check digit. So Germany's is ISO 7064
+// MOD 11,10, Belgium's is a modulo 97, Malta's is a modulo 37, France's is a
+// modulo 97 over a *different* number, and Ireland's check digit is a letter.
+// There is no unifying rule and no shortcut; a validator is twenty-eight
+// small pieces of arithmetic.
+//
+// ## What a checksum can and cannot tell you
+//
+// It catches a typo, a transposition and an invented number. It does **not**
+// tell you the number is registered, that it belongs to the company on the
+// invoice, or that it is valid today — only the VIES service can, and it is
+// the answer a tax authority will ask for. This package exists to reject the
+// obviously wrong before anyone calls VIES, and to say so rather than imply
+// more.
+//
+// The one place that distinction has money attached: a reverse-charged
+// invoice is only correct if the customer's number was valid **at the time
+// of supply**. A checksum passing today says nothing about that, and the
+// evidence a tax authority accepts is a VIES consultation number, not a
+// calculation.
+//
+// Checked against `python-stdnum`, which implements every member state's
+// rule, on each country's published example and on a thousand generated
+// numbers per country.
+
+type VatCountry = {
+    /// The two-letter prefix, which is the ISO code except for Greece.
+    code: str,
+    name: str,
+    /// Whether the check digit is verified, or only the shape.
+    checksummed: bool,
+}
+
+type VatError =
+    | TooShort(text: str)
+    | UnknownCountry(code: str)
+    | BadFormat(country: str, number: str)
+    | BadChecksum(country: str, number: str)
+
+    /// The prefix Greece uses is `EL`, not `GR`.
+    ///
+    /// It is the one country whose VAT prefix is not its ISO 3166 code, and every
+    /// system that assumed otherwise has a special case for it somewhere.
+pub fn greek_prefix() -> str {
+    return "EL"
+}
+
+/// Strip spaces, dots and hyphens and upper-case what is left.
+///
+/// Numbers arrive from invoices typed by people: `DE 136 695 976` and
+/// `de136695976` are the same number and both have to validate.
+pub fn compact(text: str) -> str {
+    var out = ""
+    for c in text.to_upper().chars() {
+        if c == " " or c == "-" or c == "." or c == "/" {
+            continue
+        }
+        out = out + c
+    }
+    return out
+}
+
+fn digits_of(text: str) -> [i64] {
+    var out: [i64] = []
+    for c in text.chars() {
+        out.push(c.parse_int() ?? (0 - 1))
+    }
+    return out
+}
+
+fn all_digits(text: str) -> bool {
+    if text == "" {
+        return false
+    }
+    for c in text.chars() {
+        if c < "0" or c > "9" {
+            return false
+        }
+    }
+    return true
+}
+
+fn to_number(text: str) -> i64 {
+    return text.parse_int() ?? (0 - 1)
+}
+
+fn weighted(ds: [i64], weights: [i64]) -> i64 {
+    var sum = 0
+    var i = 0
+    while i < weights.len() and i < ds.len() {
+        sum = sum + ds[i] * weights[i]
+        i = i + 1
+    }
+    return sum
+}
+
+/// The country part and the number part of a full VAT identifier.
+pub fn split(text: str) -> (str, str) ! VatError {
+    let t = compact(text)
+    if t.len() < 3 {
+        fail(TooShort(text))
+    }
+    return (t.substr(0, 2), t.substr(2, t.len() - 2))
+}
+
+/// Whether a full identifier — country prefix included — is well formed and
+/// passes its country's checksum.
+pub fn is_valid(text: str) -> bool {
+    match validate(text) {
+        Ok(_v) -> {
+            return true
+        }
+        Err(_e) -> {
+            return false
+        }
+    }
+}
+
+/// The same, with a reason when it is not.
+pub fn validate(text: str) -> str ! VatError {
+    let parts = try split(text)
+    let country = parts.0
+    let number = parts.1
+    if not is_known_country(country) {
+        fail(UnknownCountry(country))
+    }
+    if not check(country, number) {
+        fail(BadChecksum(country, number))
+    }
+    return country + number
+}
+
+pub fn is_known_country(code: str) -> bool {
+    for c in countries() {
+        if c.code == code {
+            return true
+        }
+    }
+    return false
+}
+
+pub fn country_named(code: str) -> Option[VatCountry] {
+    for c in countries() {
+        if c.code == code {
+            return Some(c)
+        }
+    }
+    return None
+}
+
+fn country(code: str, name: str) -> VatCountry {
+    return VatCountry{ code: code, name: name, checksummed: true }
+}
+
+pub fn countries() -> [VatCountry] {
+    return [
+        country("AT", "Austria"), country("BE", "Belgium"),
+        country("BG", "Bulgaria"), country("CY", "Cyprus"),
+        country("CZ", "Czechia"), country("DE", "Germany"),
+        country("DK", "Denmark"), country("EE", "Estonia"),
+        country("EL", "Greece"), country("ES", "Spain"),
+        country("FI", "Finland"), country("FR", "France"),
+        country("HR", "Croatia"), country("HU", "Hungary"),
+        country("IE", "Ireland"), country("IT", "Italy"),
+        country("LT", "Lithuania"), country("LU", "Luxembourg"),
+        country("LV", "Latvia"), country("MT", "Malta"),
+        country("NL", "Netherlands"), country("PL", "Poland"),
+        country("PT", "Portugal"), country("RO", "Romania"),
+        country("SE", "Sweden"), country("SI", "Slovenia"),
+        country("SK", "Slovakia"),
+    ]
+}
+
+/// One country's rule.
+pub fn check(code: str, number: str) -> bool {
+    if code == "AT" {
+        return check_at(number)
+    }
+    if code == "BE" {
+        return check_be(number)
+    }
+    if code == "BG" {
+        return check_bg(number)
+    }
+    if code == "CY" {
+        return check_cy(number)
+    }
+    if code == "CZ" {
+        return check_cz(number)
+    }
+    if code == "DE" {
+        return check_de(number)
+    }
+    if code == "DK" {
+        return check_dk(number)
+    }
+    if code == "EE" {
+        return check_ee(number)
+    }
+    if code == "EL" {
+        return check_el(number)
+    }
+    if code == "ES" {
+        return check_es(number)
+    }
+    if code == "FI" {
+        return check_fi(number)
+    }
+    if code == "FR" {
+        return check_fr(number)
+    }
+    return check_more(code, number)
+}
+
+fn check_more(code: str, number: str) -> bool {
+    if code == "HR" {
+        return mod_11_10(number, 11)
+    }
+    if code == "HU" {
+        return check_hu(number)
+    }
+    if code == "IE" {
+        return check_ie(number)
+    }
+    if code == "IT" {
+        return check_it(number)
+    }
+    if code == "LT" {
+        return check_lt(number)
+    }
+    if code == "LU" {
+        return check_lu(number)
+    }
+    if code == "LV" {
+        return check_lv(number)
+    }
+    if code == "MT" {
+        return check_mt(number)
+    }
+    if code == "NL" {
+        return check_nl(number)
+    }
+    if code == "PL" {
+        return check_pl(number)
+    }
+    if code == "PT" {
+        return check_pt(number)
+    }
+    if code == "RO" {
+        return check_ro(number)
+    }
+    if code == "SE" {
+        return check_se(number)
+    }
+    if code == "SI" {
+        return check_si(number)
+    }
+    if code == "SK" {
+        return check_sk(number)
+    }
+    return false
+}
+
+// ---------------------------------------------------------- the algorithms
+
+/// Austria: `U` and eight digits, with a Luhn-like sum.
+fn check_at(n: str) -> bool {
+    if n.len() != 9 or n.substr(0, 1) != "U" {
+        return false
+    }
+    let body = n.substr(1, 8)
+    if not all_digits(body) {
+        return false
+    }
+    let ds = digits_of(body)
+    var sum = 0
+    var i = 0
+    while i < 7 {
+        var v = ds[i]
+        if i % 2 == 1 {
+            v = v * 2
+            if v > 9 {
+                v = v - 9
+            }
+        }
+        sum = sum + v
+        i = i + 1
+    }
+    return (96 - sum) % 10 == ds[7]
+}
+
+/// Belgium: ten digits, the last two being 97 minus the rest modulo 97.
+fn check_be(n: str) -> bool {
+    // Nine digits is the older form of the same number with the leading
+    // zero left off, and both are written on real invoices.
+    var full = n
+    if full.len() == 9 {
+        full = "0" + full
+    }
+    if full.len() != 10 or not all_digits(full) {
+        return false
+    }
+    if full.substr(0, 1) != "0" and full.substr(0, 1) != "1" {
+        return false
+    }
+    let head = to_number(full.substr(0, 8))
+    let tail = to_number(full.substr(8, 2))
+    return 97 - head % 97 == tail
+}
+
+/// Bulgaria: nine digits for a company, ten for a person, and the two are
+/// different algorithms that a validator has to try in turn.
+fn check_bg(n: str) -> bool {
+    if not all_digits(n) {
+        return false
+    }
+    if n.len() == 9 {
+        let ds = digits_of(n)
+        var sum = weighted(ds, [1, 2, 3, 4, 5, 6, 7, 8])
+        var check = sum % 11
+        if check == 10 {
+            sum = weighted(ds, [3, 4, 5, 6, 7, 8, 9, 10])
+            check = sum % 11 % 10
+        }
+        return check == ds[8]
+    }
+    if n.len() == 10 {
+        return check_bg_person(n) or check_bg_foreigner(n) or
+        check_bg_other(n)
+    }
+    return false
+}
+
+fn check_bg_person(n: str) -> bool {
+    let ds = digits_of(n)
+    var month = ds[2] * 10 + ds[3]
+    if month > 40 {
+        month = month - 40
+    } else {
+        if month > 20 {
+            month = month - 20
+        }
+    }
+    if month < 1 or month > 12 {
+        return false
+    }
+    let sum = weighted(ds, [2, 4, 8, 5, 10, 9, 7, 3, 6])
+    return sum % 11 % 10 == ds[9]
+}
+
+fn check_bg_foreigner(n: str) -> bool {
+    let ds = digits_of(n)
+    let sum = weighted(ds, [21, 19, 17, 13, 11, 9, 7, 3, 1])
+    return sum % 10 == ds[9]
+}
+
+fn check_bg_other(n: str) -> bool {
+    let ds = digits_of(n)
+    let sum = weighted(ds, [4, 3, 2, 7, 6, 5, 4, 3, 2])
+    var check = 11 - sum % 11
+    if check == 10 {
+        return false
+    }
+    if check == 11 {
+        check = 0
+    }
+    return check == ds[9]
+}
+
+/// Cyprus: eight digits and a letter, with the odd positions transformed
+/// through a table rather than doubled.
+fn check_cy(n: str) -> bool {
+    if n.len() != 9 {
+        return false
+    }
+    let body = n.substr(0, 8)
+    if not all_digits(body) {
+        return false
+    }
+    if body.substr(0, 2) == "12" {
+        return false
+    }
+    let ds = digits_of(body)
+    let odd_table = [1, 0, 5, 7, 9, 13, 15, 17, 19, 21]
+    var sum = 0
+    var i = 0
+    while i < 8 {
+        if i % 2 == 0 {
+            sum = sum + odd_table[ds[i]]
+        } else {
+            sum = sum + ds[i]
+        }
+        i = i + 1
+    }
+    let letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    return letters.substr(sum % 26, 1) == n.substr(8, 1)
+}
+
+/// Czechia: eight digits for a company, nine or ten for a person, and four
+/// algorithms between them.
+fn check_cz(n: str) -> bool {
+    if not all_digits(n) {
+        return false
+    }
+    if n.len() == 8 {
+        let ds = digits_of(n)
+        let sum = weighted(ds, [8, 7, 6, 5, 4, 3, 2])
+        var check = 11 - sum % 11
+        if check == 10 {
+            check = 0
+        }
+        if check == 11 {
+            check = 1
+        }
+        return check == ds[7]
+    }
+    if n.len() == 9 and n.substr(0, 1) == "6" {
+        let ds = digits_of(n)
+        let sum = weighted(ds.slice(1, 9), [8, 7, 6, 5, 4, 3, 2])
+        var check = 11 - sum % 11
+        if check == 10 {
+            check = 0
+        }
+        if check == 11 {
+            check = 1
+        }
+        let table = [8, 7, 6, 5, 4, 3, 2, 1, 0, 9, 10]
+        return table[check] == ds[8]
+    }
+    if n.len() == 9 or n.len() == 10 {
+        return check_cz_person(n)
+    }
+    return false
+}
+
+fn check_cz_person(n: str) -> bool {
+    let ds = digits_of(n)
+    var month = ds[2] * 10 + ds[3]
+    if month > 70 {
+        month = month - 70
+    } else {
+        if month > 50 {
+            month = month - 50
+        } else {
+            if month > 20 {
+                month = month - 20
+            }
+        }
+    }
+    if month < 1 or month > 12 {
+        return false
+    }
+    let day = ds[4] * 10 + ds[5]
+    if day < 1 or day > 31 {
+        return false
+    }
+    if n.len() == 9 {
+        return ds[0] * 10 + ds[1] < 54
+    }
+    var whole = 0
+    var i = 0
+    while i < 10 {
+        whole = whole * 10 + ds[i]
+        i = i + 1
+    }
+    return whole % 11 == 0
+}
+
+/// Germany: ISO 7064 MOD 11,10 — a running product rather than a weighted
+/// sum, which is what makes it catch transpositions the simple schemes miss.
+fn check_de(n: str) -> bool {
+    if n.len() != 9 or not all_digits(n) {
+        return false
+    }
+    if n.substr(0, 1) == "0" {
+        return false
+    }
+    return mod_11_10(n, 9)
+}
+
+fn mod_11_10(n: str, length: i64) -> bool {
+    if n.len() != length or not all_digits(n) {
+        return false
+    }
+    var check = 10
+    for d in digits_of(n.substr(0, length - 1)) {
+        var next = (d + check) % 10
+        if next == 0 {
+            next = 10
+        }
+        check = next * 2 % 11
+    }
+    var expected = 11 - check
+    if expected == 10 {
+        expected = 0
+    }
+    return expected == digits_of(n)[length - 1]
+}
+
+fn check_dk(n: str) -> bool {
+    if n.len() != 8 or not all_digits(n) {
+        return false
+    }
+    if n.substr(0, 1) == "0" {
+        return false
+    }
+    return weighted(digits_of(n), [2, 7, 6, 5, 4, 3, 2, 1]) % 11 == 0
+}
+
+fn check_ee(n: str) -> bool {
+    if n.len() != 9 or not all_digits(n) {
+        return false
+    }
+    let ds = digits_of(n)
+    let sum = weighted(ds, [3, 7, 1, 3, 7, 1, 3, 7])
+    return (10 - sum % 10) % 10 == ds[8]
+}
+
+/// Greece: powers of two as weights, and a modulo taken twice.
+fn check_el(n: str) -> bool {
+    var full = n
+    if full.len() == 8 {
+        full = "0" + full
+    }
+    if full.len() != 9 or not all_digits(full) {
+        return false
+    }
+    let ds = digits_of(full)
+    let sum = weighted(ds, [256, 128, 64, 32, 16, 8, 4, 2])
+    return sum % 11 % 10 == ds[8]
+}
+
+/// Spain: three shapes — a company, a person, and a foreign national — each
+/// with its own check character.
+fn check_es(n: str) -> bool {
+    if n.len() != 9 {
+        return false
+    }
+    let first = n.substr(0, 1)
+    let last = n.substr(8, 1)
+    let middle = n.substr(1, 7)
+    if all_digits(n) {
+        return false
+    }
+    let letters = "JABCDEFGHI"
+    if "ABCDEFGHJNPQRSUVW".contains(first) {
+        if not all_digits(middle) {
+            return false
+        }
+        var sum = 0
+        var i = 0
+        let ds = digits_of(middle)
+        while i < 7 {
+            var v = ds[i]
+            if i % 2 == 0 {
+                v = v * 2
+                if v > 9 {
+                    v = v - 9
+                }
+            }
+            sum = sum + v
+            i = i + 1
+        }
+        let check = (10 - sum % 10) % 10
+        if "KLMNPQRSW".contains(first) {
+            return letters.substr(check, 1) == last
+        }
+        if all_digits(last) {
+            return to_number(last) == check
+        }
+        return letters.substr(check, 1) == last
+    }
+    // A person: eight digits and a letter, or a foreign national's X/Y/Z.
+    let table = "TRWAGMYFPDXBNJZSQVHLCKE"
+    if all_digits(n.substr(0, 8)) and not all_digits(last) {
+        return table.substr(to_number(n.substr(0, 8)) % 23, 1) == last
+    }
+    if "XYZ".contains(first) and all_digits(middle) and
+    not all_digits(last) {
+        let prefix = "XYZ".index_of(first) ?? 0
+        let value = to_number("{prefix}" + middle)
+        return table.substr(value % 23, 1) == last
+    }
+    return false
+}
+
+fn check_fi(n: str) -> bool {
+    if n.len() != 8 or not all_digits(n) {
+        return false
+    }
+    let ds = digits_of(n)
+    let sum = weighted(ds, [7, 9, 10, 5, 8, 4, 2])
+    let remainder = sum % 11
+    if remainder == 1 {
+        return false
+    }
+    let check = if remainder == 0 { 0 } else { 11 - remainder }
+    return check == ds[7]
+}
+
+/// France: two check characters in front of a nine-digit company number, and
+/// the check is over *that* number rather than over the whole thing.
+fn check_fr(n: str) -> bool {
+    if n.len() != 11 {
+        return false
+    }
+    let head = n.substr(0, 2)
+    let siren = n.substr(2, 9)
+    if not all_digits(siren) {
+        return false
+    }
+    let alphabet = "0123456789ABCDEFGHJKLMNPQRSTUVWXYZ"
+    if not alphabet.contains(head.substr(0, 1)) or
+    not alphabet.contains(head.substr(1, 1)) {
+        return false
+    }
+    if all_digits(head) {
+        return to_number(head) == (12 + 3 * (to_number(siren) % 97)) % 97
+    }
+    // A letter in the key means the older scheme, which is not checkable
+    // from the number alone.
+    return true
+}
+
+fn check_hu(n: str) -> bool {
+    if n.len() != 8 or not all_digits(n) {
+        return false
+    }
+    let ds = digits_of(n)
+    let sum = weighted(ds, [9, 7, 3, 1, 9, 7, 3])
+    return (10 - sum % 10) % 10 == ds[7]
+}
+
+/// Ireland: the check digit is a letter, and there are two layouts because
+/// the format changed in 2013 without the old numbers being reissued.
+fn check_ie(n: str) -> bool {
+    let letters = "WABCDEFGHIJKLMNOPQRSTUV"
+    if n.len() == 8 and all_digits(n.substr(0, 7)) {
+        let sum = weighted(digits_of(n.substr(0, 7)), [8, 7, 6, 5, 4, 3, 2])
+        return letters.substr(sum % 23, 1) == n.substr(7, 1)
+    }
+    if n.len() == 8 and all_digits(n.substr(0, 1)) and
+    not all_digits(n.substr(1, 1)) and all_digits(n.substr(2, 5)) {
+        // The old format put a letter second; it is scored as if it were a
+        // zero and the whole thing shifted right.
+        let body = "0" + n.substr(2, 5) + n.substr(0, 1)
+        let sum = weighted(digits_of(body), [8, 7, 6, 5, 4, 3, 2])
+        return letters.substr(sum % 23, 1) == n.substr(7, 1)
+    }
+    if n.len() == 9 and all_digits(n.substr(0, 7)) {
+        var extra = 0
+        let tail = n.substr(8, 1)
+        if tail != "W" {
+            extra = (("ABCDEFGHIJKLMNOPQRSTUVW".index_of(tail) ?? (0 - 1)) +
+                1) * 9
+            if extra < 9 {
+                return false
+            }
+        }
+        let sum = weighted(digits_of(n.substr(0, 7)),
+            [8, 7, 6, 5, 4, 3, 2]) + extra
+        return letters.substr(sum % 23, 1) == n.substr(7, 1)
+    }
+    return false
+}
+
+fn check_it(n: str) -> bool {
+    if n.len() != 11 or not all_digits(n) {
+        return false
+    }
+    if to_number(n.substr(0, 7)) == 0 {
+        return false
+    }
+    // Digits eight to ten are the tax office, and only some of them exist:
+    // 001 to 100, plus four codes for the offices added later. A checksum
+    // alone passes numbers naming an office that never existed.
+    let office = to_number(n.substr(7, 3))
+    let special = office == 120 or office == 121 or office == 888 or
+    office == 999
+    if not ((office >= 1 and office <= 100) or special) {
+        return false
+    }
+    let ds = digits_of(n)
+    var sum = 0
+    var i = 0
+    while i < 10 {
+        var v = ds[i]
+        if i % 2 == 1 {
+            v = v * 2
+            if v > 9 {
+                v = v - 9
+            }
+        }
+        sum = sum + v
+        i = i + 1
+    }
+    return (10 - sum % 10) % 10 == ds[10]
+}
+
+fn check_lt(n: str) -> bool {
+    if not all_digits(n) {
+        return false
+    }
+    if n.len() != 9 and n.len() != 12 {
+        return false
+    }
+    if n.len() == 9 and n.substr(7, 1) != "1" {
+        return false
+    }
+    if n.len() == 12 and n.substr(10, 1) != "1" {
+        return false
+    }
+    let ds = digits_of(n)
+    let last = ds.len() - 1
+    var sum = 0
+    var i = 0
+    while i < last {
+        sum = sum + ds[i] * (i % 9 + 1)
+        i = i + 1
+    }
+    if sum % 11 == 10 {
+        sum = 0
+        i = 0
+        while i < last {
+            sum = sum + ds[i] * ((i + 2) % 9 + 1)
+            i = i + 1
+        }
+    }
+    return sum % 11 % 10 == ds[last]
+}
+
+fn check_lu(n: str) -> bool {
+    if n.len() != 8 or not all_digits(n) {
+        return false
+    }
+    return to_number(n.substr(0, 6)) % 89 == to_number(n.substr(6, 2))
+}
+
+fn check_lv(n: str) -> bool {
+    if n.len() != 11 or not all_digits(n) {
+        return false
+    }
+    let ds = digits_of(n)
+    if ds[0] > 3 {
+        // A company: a weighted sum with an offset that makes the arithmetic
+        // land differently from every other country's.
+        let sum = weighted(ds, [9, 1, 4, 8, 3, 10, 2, 5, 7, 6])
+        var check = 0
+        let remainder = sum % 11
+        if remainder == 4 and ds[0] == 9 {
+            check = (sum - 45) % 11
+        } else {
+            if remainder > 4 {
+                check = 14 - remainder
+            } else {
+                check = 3 - remainder
+            }
+        }
+        if check < 0 {
+            check = check + 11
+        }
+        return check == ds[10]
+    }
+    // A person: a date and a serial, whose check is the classic mod 11.
+    let day = ds[0] * 10 + ds[1]
+    let month = ds[2] * 10 + ds[3]
+    if day < 1 or day > 31 or month < 1 or month > 12 {
+        return false
+    }
+    let sum = weighted(ds, [1, 6, 3, 7, 9, 10, 5, 8, 4, 2])
+    return (1101 - sum) % 11 % 10 == ds[10]
+}
+
+fn check_mt(n: str) -> bool {
+    if n.len() != 8 or not all_digits(n) {
+        return false
+    }
+    let ds = digits_of(n)
+    let sum = weighted(ds, [3, 4, 6, 7, 8, 9])
+    return 37 - sum % 37 == ds[6] * 10 + ds[7]
+}
+
+/// The Netherlands: a nine-digit number, a `B`, and two more digits — and
+/// since 2020 a second algorithm, because sole traders' numbers used to
+/// contain their national identity number and had to be replaced.
+fn check_nl(n: str) -> bool {
+    if n.len() < 4 {
+        return false
+    }
+    // The first part is a nine-digit citizen number, and a leading zero on
+    // it is routinely dropped in writing.
+    var head = n.substr(0, n.len() - 3)
+    while head.len() < 9 {
+        head = "0" + head
+    }
+    let full = head + n.substr(n.len() - 3, 3)
+    if full.len() != 12 or full.substr(9, 1) != "B" {
+        return false
+    }
+    let body = full.substr(0, 9)
+    let suffix = full.substr(10, 2)
+    if not all_digits(body) or not all_digits(suffix) {
+        return false
+    }
+    if to_number(suffix) < 1 {
+        return false
+    }
+    let ds = digits_of(body)
+    let sum = weighted(ds, [9, 8, 7, 6, 5, 4, 3, 2])
+    if sum % 11 == ds[8] and sum % 11 != 10 {
+        return true
+    }
+    return mod_97_10("NL" + full)
+}
+
+/// ISO 7064 MOD 97,10 over letters and digits, with a letter scored as its
+/// position in the alphabet plus nine.
+fn mod_97_10(text: str) -> bool {
+    var total = 0
+    for c in text.chars() {
+        if c >= "0" and c <= "9" {
+            total = (total * 10 + (c.parse_int() ?? 0)) % 97
+        } else {
+            let at = "ABCDEFGHIJKLMNOPQRSTUVWXYZ".index_of(c) ?? (0 - 1)
+            if at < 0 {
+                return false
+            }
+            total = (total * 100 + at + 10) % 97
+        }
+    }
+    return total == 1
+}
+
+fn check_pl(n: str) -> bool {
+    if n.len() != 10 or not all_digits(n) {
+        return false
+    }
+    let ds = digits_of(n)
+    let sum = weighted(ds, [6, 5, 7, 2, 3, 4, 5, 6, 7])
+    let check = sum % 11
+    if check == 10 {
+        return false
+    }
+    return check == ds[9]
+}
+
+fn check_pt(n: str) -> bool {
+    if n.len() != 9 or not all_digits(n) {
+        return false
+    }
+    if n.substr(0, 1) == "0" {
+        return false
+    }
+    let ds = digits_of(n)
+    let sum = weighted(ds, [9, 8, 7, 6, 5, 4, 3, 2])
+    var check = 11 - sum % 11
+    if check > 9 {
+        check = 0
+    }
+    return check == ds[8]
+}
+
+fn check_ro(n: str) -> bool {
+    if n.len() < 2 or n.len() > 10 or not all_digits(n) {
+        return false
+    }
+    if n.substr(0, 1) == "0" {
+        return false
+    }
+    var padded = n
+    while padded.len() < 10 {
+        padded = "0" + padded
+    }
+    let ds = digits_of(padded)
+    let sum = weighted(ds, [7, 5, 3, 2, 1, 7, 5, 3, 2])
+    return sum * 10 % 11 % 10 == ds[9]
+}
+
+/// Sweden: twelve digits ending in a group number, with Luhn over the first
+/// ten — the same check the organisation number carries on its own.
+fn check_se(n: str) -> bool {
+    if n.len() != 12 or not all_digits(n) {
+        return false
+    }
+    if n.substr(10, 2) != "01" {
+        return false
+    }
+    let ds = digits_of(n.substr(0, 10))
+    var sum = 0
+    var i = 0
+    while i < 10 {
+        var v = ds[i]
+        if i % 2 == 0 {
+            v = v * 2
+            if v > 9 {
+                v = v - 9
+            }
+        }
+        sum = sum + v
+        i = i + 1
+    }
+    return sum % 10 == 0
+}
+
+fn check_si(n: str) -> bool {
+    if n.len() != 8 or not all_digits(n) {
+        return false
+    }
+    if n.substr(0, 1) == "0" {
+        return false
+    }
+    let ds = digits_of(n)
+    let sum = weighted(ds, [8, 7, 6, 5, 4, 3, 2])
+    var check = 11 - sum % 11
+    if check == 10 {
+        check = 0
+    }
+    if check == 11 {
+        return false
+    }
+    return check == ds[7]
+}
+
+/// Slovakia: a VAT number, or a personal birth number used as one.
+///
+/// The two are different arithmetic on the same ten digits and it has never
+/// been settled which of them a business may quote, so a validator that
+/// implements only the VAT rule rejects numbers the tax authority accepts.
+fn check_sk(n: str) -> bool {
+    if n.len() != 10 or not all_digits(n) {
+        return false
+    }
+    if check_sk_birth_number(n) {
+        return true
+    }
+    if n.substr(0, 1) == "0" {
+        return false
+    }
+    let third = n.substr(2, 1)
+    if third != "2" and third != "3" and third != "4" and third != "7" and
+    third != "8" and third != "9" {
+        return false
+    }
+    var value = 0
+    for d in digits_of(n) {
+        value = value * 10 + d
+    }
+    return value % 11 == 0
+}
+
+fn check_sk_birth_number(n: str) -> bool {
+    let ds = digits_of(n)
+    // The month carries two flags: fifty is added for a woman, and twenty
+    // more when a day's serial numbers ran out — so the month is recovered
+    // by taking it modulo fifty and then modulo twenty, and only then is it
+    // a month.
+    let raw_month = (ds[2] * 10 + ds[3]) % 50 % 20
+    var year = 1900 + ds[0] * 10 + ds[1]
+    if year < 1954 {
+        year = year + 100
+    }
+    let day = ds[4] * 10 + ds[5]
+    if raw_month < 1 or raw_month > 12 {
+        return false
+    }
+    if day < 1 or day > days_in_month(year, raw_month) {
+        return false
+    }
+    let head = to_number(n.substr(0, 9))
+    if head < 0 {
+        return false
+    }
+    return head % 11 % 10 == ds[9]
+}
+
+fn days_in_month(year: i64, month: i64) -> i64 {
+    let lengths = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    if month == 2 and is_leap_year(year) {
+        return 29
+    }
+    return lengths[month - 1]
+}
+
+fn is_leap_year(year: i64) -> bool {
+    if year % 400 == 0 {
+        return true
+    }
+    if year % 100 == 0 {
+        return false
+    }
+    return year % 4 == 0
+}
+
+// ------------------------------------------------------------- reporting
+
+/// A description of a number, whether or not it is valid.
+pub fn describe(text: str) -> str {
+    match split(text) {
+        Ok(parts) -> {
+            match country_named(parts.0) {
+                Some(c) -> {
+                    let verdict = if check(parts.0, parts.1) {
+                        "checksum passes"
+                    } else {
+                        "checksum fails"
+                    }
+                    return c.name + ": " + verdict
+                }
+                None -> {
+                    return "unknown country prefix `" + parts.0 + "`"
+                }
+            }
+        }
+        Err(_e) -> {
+            return "too short to be a VAT number"
+        }
+    }
+}
+
+/// Whether a supply between these two countries is reverse-charged.
+///
+/// Between businesses in two different member states, the customer accounts
+/// for the VAT and the invoice carries none — and it is only correct if the
+/// customer's number was valid at the time of supply, which no checksum can
+/// tell you. This answers the question about *place*; the question about
+/// validity needs VIES.
+pub fn is_reverse_charge(supplier: str, customer: str) -> bool {
+    if not is_valid(supplier) or not is_valid(customer) {
+        return false
+    }
+    let a = split(supplier) ?? ("", "")
+    let b = split(customer) ?? ("", "")
+    return a.0 != b.0
+}

@@ -1,0 +1,10 @@
+[package]
+name = "ledgerfmt"
+version = "1.0.0"
+
+# Reads and writes a journal the caller supplies. Opens nothing.
+capabilities = []
+
+[dependencies.money]
+path = "../money"
+version = "^1.0.0"

@@ -1,0 +1,480 @@
+// Plain-text accounting: the Ledger journal format.
+//
+//     2026-01-05 * Coffee roasters
+//         Expenses:Food:Coffee    12.50 EUR
+//         Assets:Cash
+//
+// A transaction is a date, a payee and two or more postings, and the postings
+// must sum to zero. That is double-entry bookkeeping in five lines of text,
+// and the reason people keep their books this way is that the file is
+// readable, diffable, and checkable by a program — which a spreadsheet is
+// not.
+//
+// ## The elided amount, and why only one
+//
+// The last posting above has no amount. It takes whatever makes the
+// transaction balance: −12.50 EUR. That is the format's best idea, because
+// the amount is derivable and typing it twice is how a journal gets a
+// transposed digit that balances to something wrong.
+//
+// **Exactly one posting may be elided.** With two, there is no unique answer
+// — any pair summing to the remainder would do — and a parser that picks one
+// has invented a number. `infer_elided` refuses instead.
+//
+// ## What a balanced transaction does not prove
+//
+// That it is right. `Expenses:Food 12.50 / Assets:Cash −12.50` balances just
+// as well as the same amounts posted to `Expenses:Rent`, and so does an
+// invented transaction. The check catches arithmetic, not accounting; the
+// value of it is that it catches *every* arithmetic error, immediately, which
+// is more than a spreadsheet does.
+//
+// ## Accounts are a hierarchy
+//
+// `Expenses:Food:Coffee` is inside `Expenses:Food` is inside `Expenses`, and
+// the balance of a parent includes its children. That is what makes a report
+// possible without a schema — the tree is in the names.
+//
+// Checked by round-tripping journals through parse and render, by verifying
+// every transaction balances, and against balances computed independently in
+// Python for the same journal.
+
+import money
+
+type LedgerPosting = {
+    account: str,
+    amount: Money,
+    /// False when the posting's amount was left out to be inferred.
+    stated: bool,
+    note: str,
+}
+
+type LedgerTransaction = {
+    /// ISO 8601, as written.
+    date: str,
+    /// `*` for cleared, `!` for pending, empty for neither.
+    status: str,
+    payee: str,
+    note: str,
+    postings: [LedgerPosting],
+}
+
+type LedgerError =
+    | BadDate(text: str)
+    | TwoElidedPostings(payee: str)
+    | Unbalanced(payee: str, difference: i64)
+    | NoPostings(payee: str)
+    | MixedCurrencies(a: str, b: str)
+
+fn is_digit(c: str) -> bool {
+    return c >= "0" and c <= "9"
+}
+
+fn looks_like_date(text: str) -> bool {
+    if text.len() < 8 {
+        return false
+    }
+    let cs = text.chars()
+    return is_digit(cs[0]) and is_digit(cs[1]) and is_digit(cs[2]) and
+    is_digit(cs[3])
+}
+
+/// An amount like `-1,234.56 EUR` or `EUR 12.50`.
+///
+/// Thousands separators are stripped, which every real journal has, and the
+/// currency may lead or follow because both are written.
+pub fn parse_amount(text: str) -> Option[Money] {
+    var t = text.trim()
+    if t == "" {
+        return None
+    }
+    var code = ""
+    // The code may lead.
+    let space = t.index_of(" ") ?? (0 - 1)
+    if space > 0 and not is_numeric_start(t.substr(0, 1)) {
+        code = t.substr(0, space)
+        t = t.substr(space + 1, t.len() - space - 1).trim()
+    }
+    var digits = ""
+    var sign = 1
+    var seen_point = false
+    var decimals = 0
+    var i = 0
+    let cs = t.chars()
+    while i < cs.len() {
+        let c = cs[i]
+        if c == "-" and digits == "" {
+            sign = 0 - 1
+            i = i + 1
+            continue
+        }
+        if c == "+" and digits == "" {
+            i = i + 1
+            continue
+        }
+        if c == "," {
+            i = i + 1
+            continue
+        }
+        if c == "." {
+            if seen_point {
+                return None
+            }
+            seen_point = true
+            i = i + 1
+            continue
+        }
+        if is_digit(c) {
+            digits = digits + c
+            if seen_point {
+                decimals = decimals + 1
+            }
+            i = i + 1
+            continue
+        }
+        break
+    }
+    if digits == "" {
+        return None
+    }
+    // Whatever follows the number is the currency, when it did not lead.
+    let rest = t.substr(i, t.len() - i).trim()
+    if code == "" {
+        code = rest
+    }
+    if code == "" {
+        return None
+    }
+    let exponent = money.exponent_of(code)
+    var value = digits.parse_int() ?? 0
+    // Scale the written decimals up or down to the currency's own precision.
+    var d = decimals
+    while d < exponent {
+        value = value * 10
+        d = d + 1
+    }
+    while d > exponent {
+        value = value / 10
+        d = d - 1
+    }
+    return Some(money.of_minor(sign * value, code))
+}
+
+fn is_numeric_start(c: str) -> bool {
+    return is_digit(c) or c == "-" or c == "+" or c == "."
+}
+
+/// Every transaction in a journal, in the order written.
+pub fn parse(text: str) -> [LedgerTransaction] ! LedgerError {
+    var out: [LedgerTransaction] = []
+    var current = LedgerTransaction{ date: "", status: "", payee: "",
+        note: "", postings: [] }
+    var open = false
+    for raw in text.split("\n") {
+        var line = raw
+        // A semicolon starts a comment, wherever it appears.
+        let comment = line.index_of(";") ?? (0 - 1)
+        var note = ""
+        if comment >= 0 {
+            note = line.substr(comment + 1, line.len() - comment - 1).trim()
+            line = line.substr(0, comment)
+        }
+        if line.trim() == "" and note == "" {
+            if open {
+                out.push(current)
+                open = false
+            }
+            continue
+        }
+        if line.trim() == "" {
+            continue
+        }
+        if not line.starts_with(" ") and not line.starts_with("\t") {
+            if open {
+                out.push(current)
+            }
+            current = try transaction_header(line.trim())
+            current.note = note
+            open = true
+            continue
+        }
+        if not open {
+            continue
+        }
+        current.postings.push(posting_of(line.trim(), note))
+    }
+    if open {
+        out.push(current)
+    }
+    return out
+}
+
+fn transaction_header(line: str) -> LedgerTransaction ! LedgerError {
+    let space = line.index_of(" ") ?? (0 - 1)
+    if space < 0 {
+        fail(BadDate(line))
+    }
+    let date = line.substr(0, space)
+    if not looks_like_date(date) {
+        fail(BadDate(date))
+    }
+    var rest = line.substr(space + 1, line.len() - space - 1).trim()
+    var status = ""
+    if rest.starts_with("*") or rest.starts_with("!") {
+        status = rest.substr(0, 1)
+        rest = rest.substr(1, rest.len() - 1).trim()
+    }
+    return LedgerTransaction{ date: date, status: status, payee: rest,
+        note: "", postings: [] }
+}
+
+/// One posting: an account, and an amount separated from it by two spaces.
+///
+/// Two spaces, not one — an account name may contain single spaces, and
+/// `Assets:Bank Current Account  100.00 EUR` is one account and one amount.
+/// A parser splitting on the first space produces an account called `Assets:Bank`
+/// and never notices.
+fn posting_of(line: str, note: str) -> LedgerPosting {
+    var account = line
+    var amount_text = ""
+    let two = line.index_of("  ") ?? (0 - 1)
+    let tab = line.index_of("\t") ?? (0 - 1)
+    var at = two
+    if tab >= 0 and (at < 0 or tab < at) {
+        at = tab
+    }
+    if at > 0 {
+        account = line.substr(0, at).trim()
+        amount_text = line.substr(at, line.len() - at).trim()
+    }
+    match parse_amount(amount_text) {
+        Some(m) -> {
+            return LedgerPosting{ account: account, amount: m, stated: true,
+                note: note }
+        }
+        None -> {
+            return LedgerPosting{ account: account,
+                amount: money.of_minor(0, ""), stated: false, note: note }
+        }
+    }
+}
+
+// -------------------------------------------------------------- balancing
+
+/// The transaction with its one elided amount filled in.
+pub fn infer_elided(t: LedgerTransaction) -> LedgerTransaction ! LedgerError {
+    if t.postings.len() == 0 {
+        fail(NoPostings(t.payee))
+    }
+    var missing = 0
+    var at = 0 - 1
+    var i = 0
+    while i < t.postings.len() {
+        if not t.postings[i].stated {
+            missing = missing + 1
+            at = i
+        }
+        i = i + 1
+    }
+    if missing == 0 {
+        return t
+    }
+    if missing > 1 {
+        // Two unknowns and one equation.
+        fail(TwoElidedPostings(t.payee))
+    }
+    var code = ""
+    var total = 0
+    for p in t.postings {
+        if not p.stated {
+            continue
+        }
+        if code == "" {
+            code = p.amount.code
+        }
+        if p.amount.code != code {
+            fail(MixedCurrencies(code, p.amount.code))
+        }
+        total = total + p.amount.amount
+    }
+    var out = t
+    var filled = out.postings[at]
+    filled.amount = money.of_minor(0 - total, code)
+    filled.stated = true
+    out.postings[at] = filled
+    return out
+}
+
+/// Whether the postings sum to zero, once any elision is filled in.
+pub fn is_balanced(t: LedgerTransaction) -> bool {
+    match infer_elided(t) {
+        Ok(filled) -> {
+            var total = 0
+            for p in filled.postings {
+                total = total + p.amount.amount
+            }
+            return total == 0
+        }
+        Err(_e) -> {
+            return false
+        }
+    }
+}
+
+/// The amount by which a transaction fails to balance, in minor units.
+pub fn imbalance(t: LedgerTransaction) -> i64 {
+    var total = 0
+    for p in t.postings {
+        if p.stated {
+            total = total + p.amount.amount
+        }
+    }
+    return total
+}
+
+/// Every transaction that does not balance, with its difference.
+pub fn unbalanced(transactions: [LedgerTransaction]) -> [(str, i64)] {
+    var out: [(str, i64)] = []
+    for t in transactions {
+        if not is_balanced(t) {
+            out.push((t.date + " " + t.payee, imbalance(t)))
+        }
+    }
+    return out
+}
+
+// -------------------------------------------------------------- reporting
+
+/// The balance of every account named, in minor units.
+pub fn balances(transactions: [LedgerTransaction]) -> Map[str, i64] {
+    var out = map()
+    for t in transactions {
+        let filled = infer_elided(t) ?? t
+        for p in filled.postings {
+            if not p.stated {
+                continue
+            }
+            out.set(p.account, (out.get(p.account) ?? 0) + p.amount.amount)
+        }
+    }
+    return out
+}
+
+/// The same, with every parent account carrying its children's balances.
+///
+/// `Expenses` is the sum of everything under it, which is what a report shows
+/// and what makes the colon-separated names a structure rather than a naming
+/// convention.
+pub fn rolled_up_balances(
+    transactions: [LedgerTransaction]) -> Map[str, i64] {
+    var out = map()
+    for entry in balances(transactions).entries() {
+        var prefix = ""
+        for part in entry.0.split(":") {
+            prefix = if prefix == "" { part } else { prefix + ":" + part }
+            out.set(prefix, (out.get(prefix) ?? 0) + entry.1)
+        }
+    }
+    return out
+}
+
+pub fn accounts(transactions: [LedgerTransaction]) -> [str] {
+    var seen = map()
+    for t in transactions {
+        for p in t.postings {
+            seen.set(p.account, true)
+        }
+    }
+    var out: [str] = []
+    for k in seen.keys() {
+        out.push(k)
+    }
+    return out
+}
+
+/// Transactions mentioning an account or any account below it.
+pub fn transactions_for(transactions: [LedgerTransaction],
+    account: str) -> [LedgerTransaction] {
+    var out: [LedgerTransaction] = []
+    for t in transactions {
+        var found = false
+        for p in t.postings {
+            if p.account == account or
+            p.account.starts_with(account + ":") {
+                found = true
+            }
+        }
+        if found {
+            out.push(t)
+        }
+    }
+    return out
+}
+
+// ------------------------------------------------------------- rendering
+
+pub fn render(transactions: [LedgerTransaction]) -> str {
+    var out = ""
+    var first = true
+    for t in transactions {
+        if not first {
+            out = out + "\n"
+        }
+        first = false
+        out = out + render_transaction(t)
+    }
+    return out
+}
+
+pub fn render_transaction(t: LedgerTransaction) -> str {
+    var out = t.date
+    if t.status != "" {
+        out = out + " " + t.status
+    }
+    if t.payee != "" {
+        out = out + " " + t.payee
+    }
+    if t.note != "" {
+        out = out + "  ; " + t.note
+    }
+    out = out + "\n"
+    for p in t.postings {
+        out = out + "    " + p.account
+        if p.stated {
+            out = out + "  " + money.render(p.amount) + " " + p.amount.code
+        }
+        if p.note != "" {
+            out = out + "  ; " + p.note
+        }
+        out = out + "\n"
+    }
+    return out
+}
+
+/// Everything wrong with a journal, as lines a caller can print.
+///
+/// The check worth running before committing a journal: an unbalanced
+/// transaction is a typo, and finding it now is the whole reason for keeping
+/// books in a text file.
+pub fn check(transactions: [LedgerTransaction]) -> [str] {
+    var out: [str] = []
+    for t in transactions {
+        if t.postings.len() < 2 {
+            out.push(t.date + " " + t.payee + ": fewer than two postings")
+            continue
+        }
+        match infer_elided(t) {
+            Ok(_filled) -> {
+                if not is_balanced(t) {
+                    out.push(t.date + " " + t.payee +
+                        ": does not balance by {imbalance(t)}")
+                }
+            }
+            Err(_e) -> {
+                out.push(t.date + " " + t.payee +
+                    ": more than one posting without an amount")
+            }
+        }
+    }
+    return out
+}

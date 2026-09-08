@@ -1,0 +1,10 @@
+[package]
+name = "fx"
+version = "1.0.0"
+
+# Arithmetic. Opens nothing; a caller supplies the rates.
+capabilities = []
+
+[dependencies.money]
+path = "../money"
+version = "^1.0.0"

@@ -1,0 +1,252 @@
+// VAT arithmetic, and the two places it is usually got wrong.
+//
+// ## Extracting VAT from a price that includes it
+//
+// At 20%, the VAT inside a gross price of 120.00 is 20.00, and it is
+// **not** 24.00. The formula is `gross * rate / (100 + rate)`, not
+// `gross * rate / 100` — the second is the tax on the gross rather than the
+// tax in it, and it is the commonest arithmetic mistake in retail software
+// because it looks right and is out by the rate squared.
+//
+// ## Where the rounding happens
+//
+// An invoice of thirty lines at 19% can be totalled two ways: round the VAT
+// on each line and add, or add the net lines and round once. They differ by
+// pennies, both are permitted, and every accounting department has been
+// through a reconciliation caused by two systems choosing differently. So
+// the choice is an argument here rather than a default, and `both_ways`
+// exists to show the difference before somebody discovers it.
+//
+// Rounding is half away from zero, which is what tax authorities specify and
+// what a spreadsheet does. Banker's rounding — half to even — is right for
+// long sums of measurements and wrong here: it is not what the rule says, and
+// a tax return that disagrees with the invoice by a penny is a tax return
+// somebody has to explain.
+//
+// ## The rates in this file will go out of date
+//
+// They are correct as of the date `rates_as_of` returns and they change by
+// national budget. Ireland's standard rate moved twice during 2020 alone. A
+// system charging VAT should read its rates from something it can update
+// without a release; this table is here to be a starting point and a sanity
+// check, and it says its own date so nobody has to guess how stale it is.
+//
+// Checked against the arithmetic in HMRC's and the European Commission's own
+// worked examples.
+
+import money
+
+type VatRate = {
+    country: str,
+    /// `standard`, `reduced`, `super-reduced` or `zero`.
+    kind: str,
+    /// Hundredths of a percent, so 19.6% is 1960 — because some rates are
+    /// not whole numbers and a float rate reintroduces the problem `money`
+    /// exists to avoid.
+    basis_points: i64,
+}
+
+type TaxError =
+    | NoSuchCountry(code: str)
+    | NegativeRate(basis_points: i64)
+
+    /// When this table was last checked against the Commission's published list.
+pub fn rates_as_of() -> str {
+    return "2026-01-01"
+}
+
+pub fn rate(country: str, kind: str, basis_points: i64) -> VatRate {
+    return VatRate{ country: country, kind: kind,
+        basis_points: basis_points }
+}
+
+/// The standard rate in each member state, as of `rates_as_of`.
+pub fn standard_rates() -> [VatRate] {
+    return [
+        rate("AT", "standard", 2000), rate("BE", "standard", 2100),
+        rate("BG", "standard", 2000), rate("CY", "standard", 1900),
+        rate("CZ", "standard", 2100), rate("DE", "standard", 1900),
+        rate("DK", "standard", 2500), rate("EE", "standard", 2200),
+        rate("EL", "standard", 2400), rate("ES", "standard", 2100),
+        rate("FI", "standard", 2550), rate("FR", "standard", 2000),
+        rate("HR", "standard", 2500), rate("HU", "standard", 2700),
+        rate("IE", "standard", 2300), rate("IT", "standard", 2200),
+        rate("LT", "standard", 2100), rate("LU", "standard", 1700),
+        rate("LV", "standard", 2100), rate("MT", "standard", 1800),
+        rate("NL", "standard", 2100), rate("PL", "standard", 2300),
+        rate("PT", "standard", 2300), rate("RO", "standard", 1900),
+        rate("SE", "standard", 2500), rate("SI", "standard", 2200),
+        rate("SK", "standard", 2300), rate("GB", "standard", 2000),
+    ]
+}
+
+pub fn standard_rate(country: str) -> VatRate ! TaxError {
+    for r in standard_rates() {
+        if r.country == country {
+            return r
+        }
+    }
+    fail(NoSuchCountry(country))
+}
+
+/// A rate as text, without trailing zeroes on a whole number.
+pub fn rate_text(r: VatRate) -> str {
+    let whole = r.basis_points / 100
+    let fraction = r.basis_points % 100
+    if fraction == 0 {
+        return "{whole}%"
+    }
+    if fraction % 10 == 0 {
+        return "{whole}.{fraction / 10}%"
+    }
+    if fraction < 10 {
+        return "{whole}.0{fraction}%"
+    }
+    return "{whole}.{fraction}%"
+}
+
+/// Divide, rounding halves away from zero — the rule tax authorities give.
+fn divide_half_up(numerator: i64, denominator: i64) -> i64 {
+    if denominator == 0 {
+        return 0
+    }
+    let negative = (numerator < 0) != (denominator < 0)
+    var n = numerator
+    if n < 0 {
+        n = 0 - n
+    }
+    var d = denominator
+    if d < 0 {
+        d = 0 - d
+    }
+    let result = (2 * n + d) / (2 * d)
+    if negative {
+        return 0 - result
+    }
+    return result
+}
+
+/// The same, rounding halves to the nearest even — offered because some
+/// jurisdictions and most spreadsheets-turned-into-systems use it, and
+/// because the difference is worth being able to measure.
+fn divide_half_even(numerator: i64, denominator: i64) -> i64 {
+    if denominator == 0 {
+        return 0
+    }
+    let negative = (numerator < 0) != (denominator < 0)
+    var n = numerator
+    if n < 0 {
+        n = 0 - n
+    }
+    var d = denominator
+    if d < 0 {
+        d = 0 - d
+    }
+    let quotient = n / d
+    let twice = (n % d) * 2
+    var result = quotient
+    if twice > d {
+        result = quotient + 1
+    }
+    if twice == d and quotient % 2 == 1 {
+        result = quotient + 1
+    }
+    if negative {
+        return 0 - result
+    }
+    return result
+}
+
+/// The VAT on a net amount.
+pub fn vat_on(net: Money, r: VatRate) -> Money {
+    return money.of_minor(divide_half_up(net.amount * r.basis_points, 10000),
+        net.code)
+}
+
+/// The same with banker's rounding, for a caller who has to match a system
+/// that uses it.
+pub fn vat_on_half_even(net: Money, r: VatRate) -> Money {
+    return money.of_minor(
+        divide_half_even(net.amount * r.basis_points, 10000), net.code)
+}
+
+/// A net amount plus its VAT.
+pub fn add_vat(net: Money, r: VatRate) -> Money {
+    return money.of_minor(net.amount + vat_on(net, r).amount, net.code)
+}
+
+/// The VAT *inside* a gross amount.
+///
+/// `gross * rate / (100 + rate)`. At 20% the VAT in 120.00 is 20.00, and the
+/// wrong formula gives 24.00 — which is the tax on the gross rather than the
+/// tax in it.
+pub fn vat_within(gross: Money, r: VatRate) -> Money {
+    return money.of_minor(
+        divide_half_up(gross.amount * r.basis_points, 10000 + r.basis_points),
+        gross.code)
+}
+
+/// A gross amount with its VAT taken out.
+pub fn net_within(gross: Money, r: VatRate) -> Money {
+    return money.of_minor(gross.amount - vat_within(gross, r).amount,
+        gross.code)
+}
+
+/// The VAT on a set of lines, rounded once at the end.
+pub fn vat_on_total(lines: [Money], r: VatRate) -> Money ! TaxError {
+    if lines.len() == 0 {
+        fail(NegativeRate(0))
+    }
+    var total = 0
+    for l in lines {
+        total = total + l.amount
+    }
+    return money.of_minor(divide_half_up(total * r.basis_points, 10000),
+        lines[0].code)
+}
+
+/// The VAT on a set of lines, rounded on each and added.
+pub fn vat_per_line(lines: [Money], r: VatRate) -> Money ! TaxError {
+    if lines.len() == 0 {
+        fail(NegativeRate(0))
+    }
+    var total = 0
+    for l in lines {
+        total = total + vat_on(l, r).amount
+    }
+    return money.of_minor(total, lines[0].code)
+}
+
+/// Both answers and the gap between them, in minor units.
+///
+/// A caller should look at this once for a representative invoice before
+/// choosing, because the gap is where the reconciliation goes.
+pub fn both_ways(lines: [Money], r: VatRate) -> (Money, Money, i64) ! TaxError {
+    let per_line = try vat_per_line(lines, r)
+    let on_total = try vat_on_total(lines, r)
+    return (per_line, on_total, per_line.amount - on_total.amount)
+}
+
+/// Whether a supply is VAT-free because the customer accounts for it.
+///
+/// Two businesses in different member states: the invoice carries no VAT and
+/// says why. A supply to a consumer, or within one country, carries VAT
+/// normally — and getting this wrong means the supplier owes the VAT it did
+/// not charge.
+pub fn is_reverse_charge(supplier_country: str, customer_country: str,
+    customer_is_business: bool) -> bool {
+    if not customer_is_business {
+        return false
+    }
+    return supplier_country != customer_country
+}
+
+/// The note an invoice must carry when the VAT is reverse-charged.
+///
+/// The wording is required by the VAT Directive; an invoice with no VAT and
+/// no explanation is one a tax inspector treats as an invoice that should
+/// have had VAT on it.
+pub fn reverse_charge_note() -> str {
+    return "Reverse charge: VAT to be accounted for by the recipient under " +
+    "Article 196 of Council Directive 2006/112/EC"
+}
