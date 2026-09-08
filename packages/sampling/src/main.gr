@@ -1,0 +1,529 @@
+// Drawing from data and from distributions, and answering questions by
+// resampling rather than by a formula.
+//
+// Three parts, and each exists because the obvious version is wrong.
+//
+// **Weighted choice.** Scanning a cumulative array is `O(n)` per draw, and
+// building the array again per draw is `O(n)` more. The alias method spends
+// `O(n)` once and then answers every draw with one comparison and two array
+// reads, which is what makes drawing a million times from a thousand weights
+// finish. `alias_table` then `alias_draw`.
+//
+// **Sampling without replacement, weighted.** The natural loop — pick one,
+// remove it, renormalise, repeat — is `O(nk)` and, more importantly, most
+// implementations of it are subtly wrong about what the weights then mean.
+// `weighted_without_replacement` uses Efraimidis-Spirakis keys, which is one
+// pass and provably draws each subset with the right probability.
+//
+// **Bootstrap and permutation.** A confidence interval for a median, or for a
+// ratio, or for anything else with no closed form, is a resampling away. A
+// permutation test answers "could this difference have come from chance
+// alone?" without assuming a distribution at all. Both are here because the
+// formula-based alternative usually does not exist for the statistic anyone
+// actually cares about.
+//
+// Every function takes the generator by reference so a run can be reproduced:
+// nothing here reaches for a clock or an entropy source, and the same seed
+// gives the same answer on every engine.
+//
+// Checked by drawing at scale and comparing the empirical distribution against
+// `scipy.stats` — a Kolmogorov-Smirnov test against the exact CDF for the
+// continuous draws, and a chi-square goodness-of-fit for the discrete ones.
+
+import random
+
+/// An alias table: `O(1)` weighted draws after an `O(n)` build.
+type SampleAlias = {
+    probability: [f64],
+    alternative: [i64],
+}
+
+/// A resampled interval, by the percentile method.
+type SampleInterval = {
+    low: f64,
+    high: f64,
+    level: f64,
+    rounds: i64,
+}
+
+/// The result of a permutation test.
+type SampleTest = {
+    observed: f64,
+    p_value: f64,
+    rounds: i64,
+}
+
+type SampleError =
+    | SampleEmpty
+    | SampleBadCount(wanted: i64, available: i64)
+    | SampleNegativeWeight(index: i64, value: f64)
+    | SampleZeroWeight
+    | SampleBadLevel(level: f64)
+    | SampleBadParameter(name: str, value: f64)
+
+fn abs_of(x: f64) -> f64 {
+    if x < 0.0 {
+        return 0.0 - x
+    }
+    return x
+}
+
+/// A unit value that is never exactly zero, for the logarithms below.
+fn open_unit(inout r: Rng) -> f64 {
+    var u = random.unit(r)
+    while u <= 0.0 {
+        u = random.unit(r)
+    }
+    return u
+}
+
+// ------------------------------------------------------ drawing from data
+
+/// `count` items drawn with replacement — the same item can come up twice.
+pub fn with_replacement[T](inout r: Rng, xs: [T],
+    count: i64) -> [T] ! SampleError {
+    if xs.len() == 0 {
+        fail(SampleEmpty)
+    }
+    var out: [T] = []
+    for _i in 0..count {
+        out.push(xs[random.below(r, xs.len())])
+    }
+    return out
+}
+
+/// `count` distinct items, by a partial Fisher-Yates shuffle.
+///
+/// Partial: only `count` positions are settled, so drawing 10 from a million
+/// costs 10 swaps and not a million. The alternative — shuffling everything
+/// and taking a prefix — is correct and does a hundred thousand times the work.
+pub fn without_replacement[T](inout r: Rng, xs: [T],
+    count: i64) -> [T] ! SampleError {
+    if count < 0 or count > xs.len() {
+        fail(SampleBadCount(count, xs.len()))
+    }
+    var pool = xs
+    var out: [T] = []
+    for i in 0..count {
+        let j = i + random.below(r, pool.len() - i)
+        let t = pool[i]
+        pool[i] = pool[j]
+        pool[j] = t
+        out.push(pool[i])
+    }
+    return out
+}
+
+/// Every `step`-th item from a random start — a systematic sample.
+///
+/// Cheap and, unlike a simple random sample, guaranteed to spread across the
+/// whole list. It has one failure mode worth knowing: if the data has a period
+/// that matches `step`, this samples the same phase every time and the sample
+/// is not representative at all.
+pub fn systematic[T](inout r: Rng, xs: [T],
+    count: i64) -> [T] ! SampleError {
+    if xs.len() == 0 {
+        fail(SampleEmpty)
+    }
+    if count < 1 or count > xs.len() {
+        fail(SampleBadCount(count, xs.len()))
+    }
+    let step = xs.len() / count
+    var at = random.below(r, step)
+    var out: [T] = []
+    while out.len() < count and at < xs.len() {
+        out.push(xs[at])
+        at = at + step
+    }
+    return out
+}
+
+/// A fixed number from each group, keeping every group represented.
+pub fn stratified[T](inout r: Rng, groups: [[T]],
+    per_group: i64) -> [T] ! SampleError {
+    var out: [T] = []
+    for g in groups {
+        for item in try without_replacement(r, g, per_group.min(g.len())) {
+            out.push(item)
+        }
+    }
+    return out
+}
+
+// --------------------------------------------------------------- weights
+
+/// Build an alias table from weights, which need not sum to one.
+///
+/// Vose's construction: split the weights into those above and below the
+/// average, and pair each light one with a heavy one until every column holds
+/// at most two outcomes. That pairing is what makes a draw `O(1)`.
+pub fn alias_table(weights: [f64]) -> SampleAlias ! SampleError {
+    if weights.len() == 0 {
+        fail(SampleEmpty)
+    }
+    var total = 0.0
+    for i in 0..weights.len() {
+        if weights[i] < 0.0 {
+            fail(SampleNegativeWeight(i, weights[i]))
+        }
+        total = total + weights[i]
+    }
+    if total <= 0.0 {
+        fail(SampleZeroWeight)
+    }
+    let n = weights.len()
+    var scaled: [f64] = []
+    for w in weights {
+        scaled.push(w * n.as_f64() / total)
+    }
+    var small: [i64] = []
+    var large: [i64] = []
+    for i in 0..n {
+        if scaled[i] < 1.0 {
+            small.push(i)
+        } else {
+            large.push(i)
+        }
+    }
+    var probability = scaled
+    var alternative: [i64] = []
+    for i in 0..n {
+        alternative.push(i)
+    }
+    while small.len() > 0 and large.len() > 0 {
+        let l = small.pop() ?? 0
+        let g = large.pop() ?? 0
+        alternative[l] = g
+        scaled[g] = scaled[g] - (1.0 - scaled[l])
+        if scaled[g] < 1.0 {
+            small.push(g)
+        } else {
+            large.push(g)
+        }
+    }
+    // Anything left is 1 to within rounding; setting it exactly stops a draw
+    // from falling through a column that is `0.9999999999`.
+    while large.len() > 0 {
+        probability[large.pop() ?? 0] = 1.0
+    }
+    while small.len() > 0 {
+        probability[small.pop() ?? 0] = 1.0
+    }
+    for i in 0..n {
+        if scaled[i] < 1.0 {
+            probability[i] = scaled[i]
+        }
+    }
+    return SampleAlias{ probability: probability, alternative: alternative }
+}
+
+/// One index from an alias table.
+pub fn alias_draw(inout r: Rng, table: SampleAlias) -> i64 {
+    let column = random.below(r, table.probability.len())
+    if random.unit(r) < table.probability[column] {
+        return column
+    }
+    return table.alternative[column]
+}
+
+/// One index, weighted, without building a table first.
+///
+/// For a handful of draws this is cheaper than a table; past about `log n`
+/// draws the table wins, and past a thousand it is not close.
+pub fn weighted_index(inout r: Rng, weights: [f64]) -> i64 ! SampleError {
+    var total = 0.0
+    for i in 0..weights.len() {
+        if weights[i] < 0.0 {
+            fail(SampleNegativeWeight(i, weights[i]))
+        }
+        total = total + weights[i]
+    }
+    if total <= 0.0 {
+        fail(SampleZeroWeight)
+    }
+    let target = random.unit(r) * total
+    var running = 0.0
+    for i in 0..weights.len() {
+        running = running + weights[i]
+        if target < running {
+            return i
+        }
+    }
+    return weights.len() - 1
+}
+
+/// `count` distinct indices, drawn with the given weights.
+///
+/// Efraimidis-Spirakis: give item `i` the key `u^(1/w_i)` for a uniform `u`,
+/// and take the `count` largest keys. One pass, no renormalising, and the
+/// resulting subset has exactly the intended probability — which the
+/// pick-and-remove loop does not, for any definition of "the intended
+/// probability" that survives being written down.
+pub fn weighted_without_replacement(inout r: Rng, weights: [f64],
+    count: i64) -> [i64] ! SampleError {
+    if count < 0 or count > weights.len() {
+        fail(SampleBadCount(count, weights.len()))
+    }
+    var keys: [f64] = []
+    var index: [i64] = []
+    for i in 0..weights.len() {
+        if weights[i] < 0.0 {
+            fail(SampleNegativeWeight(i, weights[i]))
+        }
+        index.push(i)
+        if weights[i] == 0.0 {
+            keys.push(0.0 - 1.0)
+        } else {
+            // The key in logs: `u^(1/w)` underflows for a small weight, and
+            // `ln(u)/w` does not.
+            keys.push(open_unit(r).ln() / weights[i])
+        }
+    }
+    for i in 0..count {
+        var best = i
+        for j in (i + 1)..index.len() {
+            if keys[j] > keys[best] {
+                best = j
+            }
+        }
+        let ti = index[i]
+        index[i] = index[best]
+        index[best] = ti
+        let tk = keys[i]
+        keys[i] = keys[best]
+        keys[best] = tk
+    }
+    var out: [i64] = []
+    for i in 0..count {
+        out.push(index[i])
+    }
+    return out
+}
+
+// ------------------------------------------------------------- variates
+
+/// A normal variate, by the polar form of the Box-Muller transform.
+///
+/// Polar rather than the trigonometric form: no sine or cosine, and no loss of
+/// precision when the uniform lands very close to zero. It rejects about 21%
+/// of pairs, which is cheaper than the two trig calls it avoids.
+pub fn normal(inout r: Rng, mean: f64, deviation: f64) -> f64 ! SampleError {
+    if deviation <= 0.0 {
+        fail(SampleBadParameter("deviation", deviation))
+    }
+    var u = 0.0
+    var v = 0.0
+    var s = 0.0
+    while s <= 0.0 or s >= 1.0 {
+        u = 2.0 * random.unit(r) - 1.0
+        v = 2.0 * random.unit(r) - 1.0
+        s = u * u + v * v
+    }
+    return mean + deviation * u * (0.0 - 2.0 * s.ln() / s).sqrt()
+}
+
+/// An exponential variate, by inverting the CDF.
+pub fn exponential(inout r: Rng, rate: f64) -> f64 ! SampleError {
+    if rate <= 0.0 {
+        fail(SampleBadParameter("rate", rate))
+    }
+    return 0.0 - open_unit(r).ln() / rate
+}
+
+/// A gamma variate, by Marsaglia and Tsang's method.
+///
+/// Shapes below one are handled by drawing at `shape + 1` and scaling, which
+/// is the boost step their paper describes — the squeeze itself needs a shape
+/// of at least one.
+pub fn gamma(inout r: Rng, shape: f64, scale: f64) -> f64 ! SampleError {
+    if shape <= 0.0 or scale <= 0.0 {
+        fail(SampleBadParameter("shape", shape))
+    }
+    if shape < 1.0 {
+        let boosted = try gamma(r, shape + 1.0, scale)
+        return boosted * (open_unit(r).ln() / shape).exp()
+    }
+    let d = shape - 1.0 / 3.0
+    let c = 1.0 / (9.0 * d).sqrt()
+    for _i in 0..1000 {
+        var x = 0.0
+        var v = 0.0
+        while v <= 0.0 {
+            x = try normal(r, 0.0, 1.0)
+            v = 1.0 + c * x
+        }
+        v = v * v * v
+        let u = open_unit(r)
+        if u < 1.0 - 0.0331 * x * x * x * x {
+            return d * v * scale
+        }
+        if u.ln() < 0.5 * x * x + d * (1.0 - v + v.ln()) {
+            return d * v * scale
+        }
+    }
+    return d * scale
+}
+
+/// A Poisson variate. Knuth's product below a rate of 30, and a normal
+/// approximation with a continuity correction above it, where Knuth's loop
+/// would run for hundreds of iterations and `exp(-rate)` underflows.
+pub fn poisson(inout r: Rng, rate: f64) -> i64 ! SampleError {
+    if rate < 0.0 {
+        fail(SampleBadParameter("rate", rate))
+    }
+    if rate == 0.0 {
+        return 0
+    }
+    if rate < 30.0 {
+        let limit = (0.0 - rate).exp()
+        var product = 1.0
+        var k = 0
+        while true {
+            product = product * random.unit(r)
+            if product <= limit {
+                return k
+            }
+            k = k + 1
+        }
+        return k
+    }
+    var draw = (try normal(r, rate, rate.sqrt())) + 0.5
+    if draw < 0.0 {
+        draw = 0.0
+    }
+    return draw.as_i64()
+}
+
+/// A binomial variate, by counting Bernoulli trials.
+pub fn binomial(inout r: Rng, trials: i64, p: f64) -> i64 ! SampleError {
+    if p < 0.0 or p > 1.0 {
+        fail(SampleBadParameter("p", p))
+    }
+    var count = 0
+    for _i in 0..trials {
+        if random.unit(r) < p {
+            count = count + 1
+        }
+    }
+    return count
+}
+
+// ------------------------------------------------------------ resampling
+
+/// One bootstrap resample of a list of numbers.
+pub fn resample(inout r: Rng, xs: [f64]) -> [f64] ! SampleError {
+    return try with_replacement(r, xs, xs.len())
+}
+
+/// A confidence interval for any statistic, by the percentile bootstrap.
+///
+/// The statistic is a function the caller supplies, which is the point: the
+/// median, a trimmed mean, a ratio of two counts and the 95th percentile all
+/// go through the same code, and none of them has a usable closed-form
+/// interval.
+pub fn bootstrap_interval(inout r: Rng, xs: [f64], statistic: fn([f64]) -> f64,
+    rounds: i64, level: f64) -> SampleInterval ! SampleError {
+    if xs.len() == 0 {
+        fail(SampleEmpty)
+    }
+    if level <= 0.0 or level >= 1.0 {
+        fail(SampleBadLevel(level))
+    }
+    if rounds < 2 {
+        fail(SampleBadCount(rounds, 2))
+    }
+    var values: [f64] = []
+    for _i in 0..rounds {
+        values.push(statistic(try resample(r, xs)))
+    }
+    values.sort()
+    let tail = (1.0 - level) / 2.0
+    return SampleInterval{
+        low: percentile_of(values, tail),
+        high: percentile_of(values, 1.0 - tail),
+        level: level,
+        rounds: rounds,
+    }
+}
+
+/// The standard error of a statistic, as the spread of its bootstrap values.
+pub fn bootstrap_error(inout r: Rng, xs: [f64], statistic: fn([f64]) -> f64,
+    rounds: i64) -> f64 ! SampleError {
+    if rounds < 2 {
+        fail(SampleBadCount(rounds, 2))
+    }
+    var values: [f64] = []
+    for _i in 0..rounds {
+        values.push(statistic(try resample(r, xs)))
+    }
+    var total = 0.0
+    for v in values {
+        total = total + v
+    }
+    let m = total / values.len().as_f64()
+    var spread = 0.0
+    for v in values {
+        spread = spread + (v - m) * (v - m)
+    }
+    return (spread / (values.len() - 1).as_f64()).sqrt()
+}
+
+/// A permutation test: could this difference have come from chance alone?
+///
+/// The labels are shuffled `rounds` times and the statistic recomputed. The
+/// p-value adds one to both the count and the rounds — the observed
+/// arrangement is itself one of the arrangements under the null, and leaving
+/// it out lets a test report `p = 0`, which is never true.
+pub fn permutation_test(inout r: Rng, a: [f64], b: [f64],
+    statistic: fn([f64], [f64]) -> f64,
+    rounds: i64) -> SampleTest ! SampleError {
+    if a.len() == 0 or b.len() == 0 {
+        fail(SampleEmpty)
+    }
+    if rounds < 1 {
+        fail(SampleBadCount(rounds, 1))
+    }
+    let observed = statistic(a, b)
+    var joined = a
+    for x in b {
+        joined.push(x)
+    }
+    var extreme = 0
+    for _i in 0..rounds {
+        let shuffled = random.shuffled(r, joined)
+        var left: [f64] = []
+        var right: [f64] = []
+        for j in 0..shuffled.len() {
+            if j < a.len() {
+                left.push(shuffled[j])
+            } else {
+                right.push(shuffled[j])
+            }
+        }
+        if abs_of(statistic(left, right)) >= abs_of(observed) {
+            extreme = extreme + 1
+        }
+    }
+    return SampleTest{
+        observed: observed,
+        p_value: (extreme + 1).as_f64() / (rounds + 1).as_f64(),
+        rounds: rounds,
+    }
+}
+
+/// A percentile of an already-sorted list, by linear interpolation.
+fn percentile_of(sorted: [f64], q: f64) -> f64 {
+    if sorted.len() == 1 {
+        return sorted[0]
+    }
+    let position = q * (sorted.len() - 1).as_f64()
+    var low = position.floor().as_i64()
+    if low < 0 {
+        low = 0
+    }
+    if low >= sorted.len() - 1 {
+        return sorted[sorted.len() - 1]
+    }
+    let fraction = position - low.as_f64()
+    return sorted[low] + fraction * (sorted[low + 1] - sorted[low])
+}

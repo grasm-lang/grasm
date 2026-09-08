@@ -1,0 +1,686 @@
+// Fitting a line, a plane, and a probability — with the uncertainty attached.
+//
+// A slope on its own is not a result. Every fit here comes back with standard
+// errors, t statistics and p-values, because the difference between "the
+// effect is 0.8" and "the effect is 0.8 give or take 0.9" is the whole
+// finding, and a package that returns only the coefficient makes the second
+// case indistinguishable from the first.
+//
+// Four things worth knowing before using any of it.
+//
+// **A confidence interval and a prediction interval are not the same.** The
+// first says where the *average* response lies at some `x`; the second says
+// where the *next observation* will lie. The second is always wider — it
+// carries the residual scatter as well as the uncertainty in the line — and
+// using the first where the second is meant understates the range by a factor
+// that grows with the sample size. Both are here, named apart.
+//
+// **Multiple regression goes through a QR factorisation.** Not through
+// `inverse(X^T X) X^T y`, which is the formula every derivation writes down:
+// forming `X^T X` squares the condition number, and with two correlated
+// predictors that is the difference between correct coefficients and
+// confident nonsense.
+//
+// **Logistic regression can fail to converge, and says so.** When the classes
+// are perfectly separable the maximum-likelihood coefficients are infinite —
+// the fit does not settle, it runs away — and a package that returns the last
+// iterate without comment hands back a number that means nothing. `converged`
+// is part of the result.
+//
+// **Theil-Sen is here for when the data has outliers.** Least squares gives
+// every point equal leverage over the answer, so one bad measurement moves the
+// line. The median of pairwise slopes does not move until nearly a third of
+// the data is bad.
+//
+// Checked against `scipy.stats.linregress`, `statsmodels`' OLS and Logit, and
+// `scipy.stats.theilslopes`.
+
+import linalg
+import matrix
+import distributions
+
+/// A straight line, and how well it is known.
+type RegLine = {
+    slope: f64,
+    intercept: f64,
+    correlation: f64,
+    r_squared: f64,
+    slope_error: f64,
+    intercept_error: f64,
+    p_value: f64,
+    freedom: f64,
+    residual_deviation: f64,
+}
+
+/// A fit against several predictors.
+///
+/// `coefficient[0]` is the intercept when one was asked for, so the
+/// coefficient for predictor `i` is `coefficient[i + 1]`.
+type RegModel = {
+    coefficient: [f64],
+    standard_error: [f64],
+    t_statistic: [f64],
+    p_value: [f64],
+    r_squared: f64,
+    adjusted_r_squared: f64,
+    residual_deviation: f64,
+    freedom: f64,
+    has_intercept: bool,
+}
+
+/// A logistic fit, and whether it actually settled.
+///
+/// The standard errors are Wald errors, from the inverse of the observed
+/// information. They are meaningless when `converged` is false — an infinite
+/// coefficient has an infinite error — which is the other reason that flag is
+/// returned rather than assumed.
+type RegLogistic = {
+    coefficient: [f64],
+    standard_error: [f64],
+    z_statistic: [f64],
+    p_value: [f64],
+    iterations: i64,
+    converged: bool,
+    log_likelihood: f64,
+    has_intercept: bool,
+}
+
+/// An interval around a prediction.
+type RegInterval = {
+    low: f64,
+    high: f64,
+    level: f64,
+}
+
+type RegError =
+    | RegTooFewPoints(given: i64, needed: i64)
+    | RegLengthMismatch(a: i64, b: i64)
+    | RegNoVariance
+    | RegRaggedRows(row: i64)
+    | RegSingular
+    | RegBadLevel(level: f64)
+    | RegNotBinary(index: i64, value: f64)
+
+fn abs_of(x: f64) -> f64 {
+    if x < 0.0 {
+        return 0.0 - x
+    }
+    return x
+}
+
+fn mean_of(xs: [f64]) -> f64 {
+    var total = 0.0
+    for x in xs {
+        total = total + x
+    }
+    return total / xs.len().as_f64()
+}
+
+fn two_sided_t(t: f64, freedom: f64) -> f64 {
+    match distributions.t_survival(abs_of(t), freedom) {
+        Ok(p) -> return 2.0 * p
+        Err(_e) -> return 1.0
+    }
+}
+
+// -------------------------------------------------------- simple linear
+
+/// Least squares through `(x, y)`, with the inference that goes with it.
+pub fn linear(xs: [f64], ys: [f64]) -> RegLine ! RegError {
+    if xs.len() != ys.len() {
+        fail(RegLengthMismatch(xs.len(), ys.len()))
+    }
+    if xs.len() < 3 {
+        fail(RegTooFewPoints(xs.len(), 3))
+    }
+    let n = xs.len().as_f64()
+    let mx = mean_of(xs)
+    let my = mean_of(ys)
+    var sxx = 0.0
+    var syy = 0.0
+    var sxy = 0.0
+    for i in 0..xs.len() {
+        let dx = xs[i] - mx
+        let dy = ys[i] - my
+        sxx = sxx + dx * dx
+        syy = syy + dy * dy
+        sxy = sxy + dx * dy
+    }
+    if sxx == 0.0 {
+        fail(RegNoVariance)
+    }
+    let slope = sxy / sxx
+    let intercept = my - slope * mx
+    let freedom = n - 2.0
+    // The residual sum of squares, without re-evaluating the line: the
+    // algebraic form costs one pass instead of two and cannot disagree with
+    // the coefficients it came from.
+    var residual = syy - slope * sxy
+    if residual < 0.0 {
+        residual = 0.0
+    }
+    let variance = residual / freedom
+    let slope_error = (variance / sxx).sqrt()
+    var correlation = 0.0
+    if syy > 0.0 {
+        correlation = sxy / (sxx * syy).sqrt()
+    }
+    var p = 0.0
+    if slope_error > 0.0 {
+        p = two_sided_t(slope / slope_error, freedom)
+    }
+    return RegLine{
+        slope: slope,
+        intercept: intercept,
+        correlation: correlation,
+        r_squared: correlation * correlation,
+        slope_error: slope_error,
+        intercept_error: (variance * (1.0 / n + mx * mx / sxx)).sqrt(),
+        p_value: p,
+        freedom: freedom,
+        residual_deviation: variance.sqrt(),
+    }
+}
+
+pub fn predict(line: RegLine, x: f64) -> f64 {
+    return line.intercept + line.slope * x
+}
+
+/// Where the *mean* response lies at `x`.
+pub fn mean_interval(line: RegLine, xs: [f64], x: f64,
+    level: f64) -> RegInterval ! RegError {
+    return try interval_at(line, xs, x, level, false)
+}
+
+/// Where the *next observation* will lie at `x`. Always the wider of the two.
+pub fn prediction_interval(line: RegLine, xs: [f64], x: f64,
+    level: f64) -> RegInterval ! RegError {
+    return try interval_at(line, xs, x, level, true)
+}
+
+fn interval_at(line: RegLine, xs: [f64], x: f64, level: f64,
+    single: bool) -> RegInterval ! RegError {
+    if level <= 0.0 or level >= 1.0 {
+        fail(RegBadLevel(level))
+    }
+    let n = xs.len().as_f64()
+    let mx = mean_of(xs)
+    var sxx = 0.0
+    for v in xs {
+        sxx = sxx + (v - mx) * (v - mx)
+    }
+    if sxx == 0.0 {
+        fail(RegNoVariance)
+    }
+    // The `1 +` is the entire difference between the two intervals: it adds
+    // the scatter of a single observation about the line.
+    var factor = 1.0 / n + (x - mx) * (x - mx) / sxx
+    if single {
+        factor = 1.0 + factor
+    }
+    match distributions.t_quantile(1.0 - (1.0 - level) / 2.0, line.freedom) {
+        Ok(critical) -> {
+            let half = critical * line.residual_deviation * factor.sqrt()
+            let centre = predict(line, x)
+            return RegInterval{ low: centre - half, high: centre + half,
+                level: level }
+        }
+        Err(_e) -> fail(RegBadLevel(level))
+    }
+}
+
+/// The Theil-Sen slope: the median of the slopes between every pair of points.
+///
+/// Resistant to about 29% of the data being wrong, against zero for least
+/// squares. It costs `n^2` pairs, which is why it is not the default.
+pub fn theil_sen(xs: [f64], ys: [f64]) -> RegLine ! RegError {
+    if xs.len() != ys.len() {
+        fail(RegLengthMismatch(xs.len(), ys.len()))
+    }
+    if xs.len() < 2 {
+        fail(RegTooFewPoints(xs.len(), 2))
+    }
+    var slopes: [f64] = []
+    for i in 0..xs.len() {
+        for j in (i + 1)..xs.len() {
+            if xs[j] != xs[i] {
+                slopes.push((ys[j] - ys[i]) / (xs[j] - xs[i]))
+            }
+        }
+    }
+    if slopes.len() == 0 {
+        fail(RegNoVariance)
+    }
+    let slope = median_of(slopes)
+    // The intercept is the median of `y - slope * x`, which is what makes the
+    // whole line robust rather than only its slope.
+    var offsets: [f64] = []
+    for i in 0..xs.len() {
+        offsets.push(ys[i] - slope * xs[i])
+    }
+    return RegLine{
+        slope: slope,
+        intercept: median_of(offsets),
+        correlation: 0.0,
+        r_squared: 0.0,
+        slope_error: 0.0,
+        intercept_error: 0.0,
+        p_value: 1.0,
+        freedom: (xs.len() - 2).as_f64(),
+        residual_deviation: 0.0,
+    }
+}
+
+fn median_of(xs: [f64]) -> f64 {
+    var sorted = xs
+    sorted.sort()
+    let n = sorted.len()
+    if n % 2 == 1 {
+        return sorted[n / 2]
+    }
+    return (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0
+}
+
+// ------------------------------------------------------ multiple linear
+
+/// The design matrix: the predictors, with a column of ones if wanted.
+fn design(rows: [[f64]], with_intercept: bool) -> Mat ! RegError {
+    let predictors = rows[0].len()
+    var cells: [f64] = []
+    for r in 0..rows.len() {
+        if rows[r].len() != predictors {
+            fail(RegRaggedRows(r))
+        }
+        if with_intercept {
+            cells.push(1.0)
+        }
+        for v in rows[r] {
+            cells.push(v)
+        }
+    }
+    var width = predictors
+    if with_intercept {
+        width = width + 1
+    }
+    return matrix.of(rows.len(), width, cells)
+}
+
+/// Least squares against several predictors, with per-coefficient inference.
+pub fn multiple(rows: [[f64]], y: [f64],
+    with_intercept: bool) -> RegModel ! RegError {
+    if rows.len() != y.len() {
+        fail(RegLengthMismatch(rows.len(), y.len()))
+    }
+    if rows.len() < 2 {
+        fail(RegTooFewPoints(rows.len(), 2))
+    }
+    let x = try design(rows, with_intercept)
+    let width = x.cols
+    if rows.len() <= width {
+        fail(RegTooFewPoints(rows.len(), width + 1))
+    }
+    let coefficient = match linalg.least_squares(x, y) {
+        Ok(c) -> c
+        Err(_e) -> fail(RegSingular)
+    }
+    let freedom = (rows.len() - width).as_f64()
+    var residual = 0.0
+    for i in 0..rows.len() {
+        var fitted = 0.0
+        for j in 0..width {
+            fitted = fitted + coefficient[j] * x.cell[i * width + j]
+        }
+        let d = y[i] - fitted
+        residual = residual + d * d
+    }
+    let variance = residual / freedom
+    // The standard errors come from the diagonal of `(X^T X) inverse`. The
+    // matrix is formed only here, where it is inverted once for a variance
+    // rather than used to solve for the coefficients.
+    let xtx = match matrix.multiply(matrix.transpose(x), x) {
+        Ok(m) -> m
+        Err(_e) -> fail(RegSingular)
+    }
+    let inverted = match linalg.inverse(xtx) {
+        Ok(m) -> m
+        Err(_e) -> fail(RegSingular)
+    }
+    var errors: [f64] = []
+    var statistics: [f64] = []
+    var probabilities: [f64] = []
+    for j in 0..width {
+        let e = (variance * inverted.cell[j * width + j]).sqrt()
+        errors.push(e)
+        if e > 0.0 {
+            statistics.push(coefficient[j] / e)
+            probabilities.push(two_sided_t(coefficient[j] / e, freedom))
+        } else {
+            statistics.push(0.0)
+            probabilities.push(1.0)
+        }
+    }
+    return finish_model(coefficient, errors, statistics, probabilities,
+        residual, y, freedom, width, with_intercept)
+}
+
+fn finish_model(coefficient: [f64], errors: [f64], statistics: [f64],
+    probabilities: [f64], residual: f64, y: [f64], freedom: f64, width: i64,
+    with_intercept: bool) -> RegModel {
+    let my = mean_of(y)
+    var total = 0.0
+    for v in y {
+        total = total + (v - my) * (v - my)
+    }
+    var r2 = 0.0
+    if total > 0.0 {
+        r2 = 1.0 - residual / total
+    }
+    // Adjusted for the number of predictors, because plain R-squared cannot
+    // go down when a predictor is added — including a column of noise raises
+    // it, every time.
+    var adjusted = r2
+    let predictors = if with_intercept { width - 1 } else { width }
+    if freedom > 0.0 and predictors > 0 {
+        adjusted = 1.0 - (1.0 - r2) * (y.len() - 1).as_f64() / freedom
+    }
+    return RegModel{
+        coefficient: coefficient,
+        standard_error: errors,
+        t_statistic: statistics,
+        p_value: probabilities,
+        r_squared: r2,
+        adjusted_r_squared: adjusted,
+        residual_deviation: (residual / freedom).sqrt(),
+        freedom: freedom,
+        has_intercept: with_intercept,
+    }
+}
+
+pub fn predict_multiple(model: RegModel, row: [f64]) -> f64 ! RegError {
+    var expected = row.len()
+    if model.has_intercept {
+        expected = expected + 1
+    }
+    if expected != model.coefficient.len() {
+        fail(RegLengthMismatch(row.len(), model.coefficient.len()))
+    }
+    var total = 0.0
+    var offset = 0
+    if model.has_intercept {
+        total = model.coefficient[0]
+        offset = 1
+    }
+    for i in 0..row.len() {
+        total = total + model.coefficient[i + offset] * row[i]
+    }
+    return total
+}
+
+/// What the fit missed, point by point.
+pub fn residuals(model: RegModel, rows: [[f64]],
+    y: [f64]) -> [f64] ! RegError {
+    if rows.len() != y.len() {
+        fail(RegLengthMismatch(rows.len(), y.len()))
+    }
+    var out: [f64] = []
+    for i in 0..rows.len() {
+        out.push(y[i] - (try predict_multiple(model, rows[i])))
+    }
+    return out
+}
+
+/// The Durbin-Watson statistic: are the residuals correlated with each other?
+///
+/// Near 2 means they are not. Below about 1.5 means each residual predicts the
+/// next one, which means the model is missing something the ordering carries —
+/// usually time. Every standard error above assumes this does not happen.
+pub fn durbin_watson(residual: [f64]) -> f64 ! RegError {
+    if residual.len() < 2 {
+        fail(RegTooFewPoints(residual.len(), 2))
+    }
+    var top = 0.0
+    var bottom = residual[0] * residual[0]
+    for i in 1..residual.len() {
+        let d = residual[i] - residual[i - 1]
+        top = top + d * d
+        bottom = bottom + residual[i] * residual[i]
+    }
+    if bottom == 0.0 {
+        fail(RegNoVariance)
+    }
+    return top / bottom
+}
+
+/// The variance inflation factor for one predictor.
+///
+/// How much that coefficient's variance is inflated by its correlation with
+/// the other predictors. Above about 5 the coefficient is barely determined,
+/// and above 10 its sign can flip on a change to the data too small to see.
+pub fn variance_inflation(rows: [[f64]], column: i64) -> f64 ! RegError {
+    if rows.len() < 3 {
+        fail(RegTooFewPoints(rows.len(), 3))
+    }
+    if rows[0].len() < 2 {
+        fail(RegTooFewPoints(rows[0].len(), 2))
+    }
+    var others: [[f64]] = []
+    var target: [f64] = []
+    for row in rows {
+        var rest: [f64] = []
+        for j in 0..row.len() {
+            if j != column {
+                rest.push(row[j])
+            }
+        }
+        others.push(rest)
+        target.push(row[column])
+    }
+    let model = try multiple(others, target, true)
+    if model.r_squared >= 1.0 {
+        fail(RegSingular)
+    }
+    return 1.0 / (1.0 - model.r_squared)
+}
+
+// -------------------------------------------------------------- logistic
+
+/// Logistic regression by iteratively reweighted least squares.
+///
+/// `y` must be 0 or 1. The result carries `converged`, and it can be false:
+/// when the two classes can be separated by a straight line the likelihood has
+/// no maximum, the coefficients grow without limit, and every iteration makes
+/// them larger. That is a property of the data and not a bug in the solver,
+/// and it is why the flag is returned rather than a silent last iterate.
+pub fn logistic(rows: [[f64]], y: [f64],
+    with_intercept: bool) -> RegLogistic ! RegError {
+    if rows.len() != y.len() {
+        fail(RegLengthMismatch(rows.len(), y.len()))
+    }
+    if rows.len() < 2 {
+        fail(RegTooFewPoints(rows.len(), 2))
+    }
+    for i in 0..y.len() {
+        if y[i] != 0.0 and y[i] != 1.0 {
+            fail(RegNotBinary(i, y[i]))
+        }
+    }
+    let x = try design(rows, with_intercept)
+    let width = x.cols
+    var beta: [f64] = []
+    for _j in 0..width {
+        beta.push(0.0)
+    }
+    var iterations = 0
+    var converged = false
+    while iterations < 100 and not converged {
+        let step = try irls_step(x, y, beta, width)
+        var moved = 0.0
+        for j in 0..width {
+            beta[j] = beta[j] + step[j]
+            moved = moved.max(abs_of(step[j]))
+        }
+        iterations = iterations + 1
+        if moved < 0.000000001 {
+            converged = true
+        }
+        // A coefficient this large means separation, and no further iteration
+        // will do anything but double it.
+        if moved > 1000000.0 {
+            iterations = 100
+        }
+    }
+    let errors = wald_errors(x, y, beta, width)
+    var statistics: [f64] = []
+    var probabilities: [f64] = []
+    for j in 0..width {
+        if errors[j] > 0.0 {
+            let z = beta[j] / errors[j]
+            statistics.push(z)
+            match distributions.normal_survival(abs_of(z), 0.0, 1.0) {
+                Ok(tail) -> probabilities.push(2.0 * tail)
+                Err(_e) -> probabilities.push(1.0)
+            }
+        } else {
+            statistics.push(0.0)
+            probabilities.push(1.0)
+        }
+    }
+    return RegLogistic{ coefficient: beta, standard_error: errors,
+        z_statistic: statistics, p_value: probabilities,
+        iterations: iterations, converged: converged,
+        log_likelihood: log_likelihood(x, y, beta, width),
+        has_intercept: with_intercept }
+}
+
+/// The square roots of the diagonal of the inverse observed information.
+///
+/// A logistic coefficient without one of these cannot be read: on the log-odds
+/// scale there is no size that is obviously large, so the only way to know
+/// whether `0.12` means anything is to know what it is give or take.
+fn wald_errors(x: Mat, y: [f64], beta: [f64], width: i64) -> [f64] {
+    var information = matrix.zeros(width, width)
+    for i in 0..y.len() {
+        var z = 0.0
+        for j in 0..width {
+            z = z + beta[j] * x.cell[i * width + j]
+        }
+        let p = 1.0 / (1.0 + (0.0 - z).exp())
+        let w = p * (1.0 - p)
+        for j in 0..width {
+            for k in 0..width {
+                information.cell[j * width + k] =
+                information.cell[j * width + k] +
+                w * x.cell[i * width + j] * x.cell[i * width + k]
+            }
+        }
+    }
+    var out: [f64] = []
+    match linalg.inverse(information) {
+        Ok(inverted) -> {
+            for j in 0..width {
+                let v = inverted.cell[j * width + j]
+                if v > 0.0 {
+                    out.push(v.sqrt())
+                } else {
+                    out.push(0.0)
+                }
+            }
+        }
+        Err(_e) -> {
+            for _j in 0..width {
+                out.push(0.0)
+            }
+        }
+    }
+    return out
+}
+
+/// One Newton step, solved as a weighted least-squares problem.
+fn irls_step(x: Mat, y: [f64], beta: [f64], width: i64) -> [f64] ! RegError {
+    var gradient: [f64] = []
+    for _j in 0..width {
+        gradient.push(0.0)
+    }
+    var hessian = matrix.zeros(width, width)
+    for i in 0..y.len() {
+        var z = 0.0
+        for j in 0..width {
+            z = z + beta[j] * x.cell[i * width + j]
+        }
+        let p = 1.0 / (1.0 + (0.0 - z).exp())
+        let w = p * (1.0 - p)
+        for j in 0..width {
+            gradient[j] = gradient[j] + (y[i] - p) * x.cell[i * width + j]
+            for k in 0..width {
+                hessian.cell[j * width + k] = hessian.cell[j * width + k] +
+                w * x.cell[i * width + j] * x.cell[i * width + k]
+            }
+        }
+    }
+    // A tiny ridge on the diagonal: without it a perfectly separated dataset
+    // makes the Hessian singular and the solve fails instead of reporting
+    // that the fit did not converge.
+    for j in 0..width {
+        hessian.cell[j * width + j] = hessian.cell[j * width + j] +
+        0.000000001
+    }
+    match linalg.solve(hessian, gradient) {
+        Ok(step) -> return step
+        Err(_e) -> fail(RegSingular)
+    }
+}
+
+fn log_likelihood(x: Mat, y: [f64], beta: [f64], width: i64) -> f64 {
+    var total = 0.0
+    for i in 0..y.len() {
+        var z = 0.0
+        for j in 0..width {
+            z = z + beta[j] * x.cell[i * width + j]
+        }
+        // Through `log(1 + exp(-|z|))` rather than `log(p)`: at `z = 40` the
+        // probability rounds to exactly 1 and its log to zero, losing the
+        // whole term.
+        let size = abs_of(z)
+        let stable = 0.0 - (1.0 + (0.0 - size).exp()).ln()
+        if z >= 0.0 {
+            total = total + y[i] * stable + (1.0 - y[i]) * (stable - z)
+        } else {
+            total = total + y[i] * (stable + z) + (1.0 - y[i]) * stable
+        }
+    }
+    return total
+}
+
+/// The probability this model gives a row.
+pub fn logistic_probability(model: RegLogistic,
+    row: [f64]) -> f64 ! RegError {
+    var expected = row.len()
+    if model.has_intercept {
+        expected = expected + 1
+    }
+    if expected != model.coefficient.len() {
+        fail(RegLengthMismatch(row.len(), model.coefficient.len()))
+    }
+    var z = 0.0
+    var offset = 0
+    if model.has_intercept {
+        z = model.coefficient[0]
+        offset = 1
+    }
+    for i in 0..row.len() {
+        z = z + model.coefficient[i + offset] * row[i]
+    }
+    return 1.0 / (1.0 + (0.0 - z).exp())
+}
+
+/// The odds ratio for a coefficient: what a one-unit change multiplies the
+/// odds by.
+///
+/// The coefficients of a logistic fit are on the log-odds scale, where nobody
+/// has an intuition. `exp` of one is a number that can be read out loud.
+pub fn odds_ratio(model: RegLogistic, index: i64) -> f64 ! RegError {
+    if index < 0 or index >= model.coefficient.len() {
+        fail(RegLengthMismatch(index, model.coefficient.len()))
+    }
+    return model.coefficient[index].exp()
+}

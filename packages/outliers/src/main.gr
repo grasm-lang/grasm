@@ -1,0 +1,490 @@
+// Finding the points that do not belong, and the reasons the obvious method
+// fails.
+//
+// **The z-score problem: an outlier hides itself.** A z-score divides by the
+// standard deviation, and one large outlier inflates the standard deviation it
+// is being measured against. With a single bad point in ten, the point's own
+// z-score can be under 3 while it is plainly wrong — and in a sample of `n`,
+// no z-score can ever exceed `(n-1)/sqrt(n)`, so with `n = 10` nothing can
+// ever reach 3 at all. This is called masking, and it is why `by_modified_z`
+// and `tukey` exist here alongside `by_z`.
+//
+// **Masking again, worse, with several outliers.** Grubbs' test finds one
+// outlier. Running it repeatedly does not find several: two outliers close
+// together each hide the other, and the first application often finds
+// nothing. `generalised_esd` — Rosner's test — is the right tool: it removes
+// up to `k` points *before* deciding how many were real, so a cluster of
+// outliers cannot conceal itself.
+//
+// **The median absolute deviation is scaled for a reason.** `mad` alone is
+// about 0.6745 times the standard deviation of normal data. The constant here
+// converts it, so `modified_z` and `deviation_robust` are on the same scale as
+// a z-score and thresholds transfer between them.
+//
+// Quartiles use linear interpolation between the two nearest ranks, which is
+// what `numpy.percentile` and `scipy.stats.iqr` do by default. There are nine
+// definitions of a quartile in common use; two of them put the fences in
+// visibly different places on a small sample, so this says which one it is.
+//
+// Checked against `scipy.stats` for the descriptive parts, and against the
+// worked example in the NIST/SEMATECH e-Handbook for the ESD test.
+
+import distributions
+
+/// Where the fences are, and what they were built from.
+type OutFence = {
+    low: f64,
+    high: f64,
+    first_quartile: f64,
+    third_quartile: f64,
+    multiplier: f64,
+}
+
+/// A single-outlier test result.
+type OutTest = {
+    statistic: f64,
+    critical: f64,
+    index: i64,
+    value: f64,
+    is_outlier: bool,
+    alpha: f64,
+}
+
+/// One step of the generalised ESD test.
+type OutStep = {
+    removed: i64,
+    statistic: f64,
+    critical: f64,
+    index: i64,
+    value: f64,
+}
+
+type OutError =
+    | OutTooFewValues(given: i64, needed: i64)
+    | OutNoVariance
+    | OutBadAlpha(alpha: f64)
+    | OutBadQuantile(q: f64)
+
+fn abs_of(x: f64) -> f64 {
+    if x < 0.0 {
+        return 0.0 - x
+    }
+    return x
+}
+
+fn sorted_copy(xs: [f64]) -> [f64] {
+    var out = xs
+    out.sort()
+    return out
+}
+
+pub fn mean_of(xs: [f64]) -> f64 {
+    var total = 0.0
+    for x in xs {
+        total = total + x
+    }
+    return total / xs.len().as_f64()
+}
+
+/// The sample standard deviation, dividing by `n - 1`.
+pub fn deviation_of(xs: [f64]) -> f64 ! OutError {
+    if xs.len() < 2 {
+        fail(OutTooFewValues(xs.len(), 2))
+    }
+    let m = mean_of(xs)
+    var total = 0.0
+    for x in xs {
+        total = total + (x - m) * (x - m)
+    }
+    return (total / (xs.len() - 1).as_f64()).sqrt()
+}
+
+/// A quantile by linear interpolation between the two nearest ranks.
+pub fn quantile(xs: [f64], q: f64) -> f64 ! OutError {
+    if xs.len() == 0 {
+        fail(OutTooFewValues(0, 1))
+    }
+    if q < 0.0 or q > 1.0 {
+        fail(OutBadQuantile(q))
+    }
+    let sorted = sorted_copy(xs)
+    if sorted.len() == 1 {
+        return sorted[0]
+    }
+    let position = q * (sorted.len() - 1).as_f64()
+    let low = position.floor().as_i64()
+    if low >= sorted.len() - 1 {
+        return sorted[sorted.len() - 1]
+    }
+    return sorted[low] + (position - low.as_f64()) *
+    (sorted[low + 1] - sorted[low])
+}
+
+pub fn median_of(xs: [f64]) -> f64 ! OutError {
+    return try quantile(xs, 0.5)
+}
+
+/// The interquartile range.
+pub fn interquartile_range(xs: [f64]) -> f64 ! OutError {
+    return (try quantile(xs, 0.75)) - (try quantile(xs, 0.25))
+}
+
+/// The median absolute deviation from the median, unscaled.
+pub fn mad(xs: [f64]) -> f64 ! OutError {
+    if xs.len() == 0 {
+        fail(OutTooFewValues(0, 1))
+    }
+    let centre = try median_of(xs)
+    var spread: [f64] = []
+    for x in xs {
+        spread.push(abs_of(x - centre))
+    }
+    return try median_of(spread)
+}
+
+/// The constant that puts the MAD on the same scale as a standard deviation.
+///
+/// The reciprocal of the normal distribution's 0.75 quantile. For normal data
+/// `mad * this` estimates the same quantity as `deviation_of`, which is what
+/// makes a modified z-score comparable to a plain one.
+pub fn mad_scale() -> f64 {
+    return 1.4826022185056018
+}
+
+/// A standard-deviation estimate that a few bad points cannot move.
+pub fn deviation_robust(xs: [f64]) -> f64 ! OutError {
+    return (try mad(xs)) * mad_scale()
+}
+
+// --------------------------------------------------------------- z-scores
+
+/// The z-score of each value, against the mean and standard deviation.
+pub fn z_scores(xs: [f64]) -> [f64] ! OutError {
+    let s = try deviation_of(xs)
+    if s == 0.0 {
+        fail(OutNoVariance)
+    }
+    let m = mean_of(xs)
+    var out: [f64] = []
+    for x in xs {
+        out.push((x - m) / s)
+    }
+    return out
+}
+
+/// The indices whose z-score exceeds `threshold` in size.
+///
+/// Prone to masking: see the header. Kept because it is what a reader expects
+/// to find, and because with a large clean sample and a single stray point it
+/// is the right answer.
+pub fn by_z(xs: [f64], threshold: f64) -> [i64] ! OutError {
+    var out: [i64] = []
+    let scores = try z_scores(xs)
+    for i in 0..scores.len() {
+        if abs_of(scores[i]) > threshold {
+            out.push(i)
+        }
+    }
+    return out
+}
+
+/// The largest z-score any value can have in a sample of this size.
+///
+/// `(n - 1) / sqrt(n)`. Worth computing before choosing a threshold: at
+/// `n = 10` the bound is 2.85, so a threshold of 3 finds nothing, ever, no
+/// matter how wrong a point is.
+pub fn z_ceiling(n: i64) -> f64 {
+    if n < 2 {
+        return 0.0
+    }
+    return (n - 1).as_f64() / n.as_f64().sqrt()
+}
+
+/// The modified z-score: distance from the median, in scaled MADs.
+///
+/// Neither the centre nor the spread can be moved by an outlier, so a bad
+/// point cannot hide behind its own effect on the statistic. Iglewicz and
+/// Hoaglin's suggested threshold is 3.5.
+pub fn modified_z(xs: [f64]) -> [f64] ! OutError {
+    let spread = try deviation_robust(xs)
+    if spread == 0.0 {
+        fail(OutNoVariance)
+    }
+    let centre = try median_of(xs)
+    var out: [f64] = []
+    for x in xs {
+        out.push((x - centre) / spread)
+    }
+    return out
+}
+
+pub fn by_modified_z(xs: [f64], threshold: f64) -> [i64] ! OutError {
+    var out: [i64] = []
+    let scores = try modified_z(xs)
+    for i in 0..scores.len() {
+        if abs_of(scores[i]) > threshold {
+            out.push(i)
+        }
+    }
+    return out
+}
+
+// ----------------------------------------------------------------- fences
+
+/// Tukey's fences: `multiplier` interquartile ranges beyond the quartiles.
+///
+/// `1.5` is the conventional multiplier and marks about 0.7% of normal data;
+/// `3.0` is the conventional mark for a "far out" point. Neither is derived
+/// from anything — they are Tukey's choices, and they are conventions rather
+/// than results.
+pub fn tukey_fences(xs: [f64], multiplier: f64) -> OutFence ! OutError {
+    let q1 = try quantile(xs, 0.25)
+    let q3 = try quantile(xs, 0.75)
+    let span = q3 - q1
+    return OutFence{
+        low: q1 - multiplier * span,
+        high: q3 + multiplier * span,
+        first_quartile: q1,
+        third_quartile: q3,
+        multiplier: multiplier,
+    }
+}
+
+pub fn by_tukey(xs: [f64], multiplier: f64) -> [i64] ! OutError {
+    let fence = try tukey_fences(xs, multiplier)
+    var out: [i64] = []
+    for i in 0..xs.len() {
+        if xs[i] < fence.low or xs[i] > fence.high {
+            out.push(i)
+        }
+    }
+    return out
+}
+
+// ------------------------------------------------------------ Grubbs, ESD
+
+/// The critical value for Grubbs' test at `n` points and level `alpha`.
+///
+/// Two-sided: the `alpha` is split across both tails and then across the `n`
+/// values, because the test asks about the most extreme point rather than
+/// about a point chosen in advance.
+pub fn grubbs_critical(n: i64, alpha: f64) -> f64 ! OutError {
+    if n < 3 {
+        fail(OutTooFewValues(n, 3))
+    }
+    if alpha <= 0.0 or alpha >= 1.0 {
+        fail(OutBadAlpha(alpha))
+    }
+    let nf = n.as_f64()
+    match distributions.t_quantile(1.0 - alpha / (2.0 * nf), nf - 2.0) {
+        Ok(t) -> {
+            let t2 = t * t
+            return (nf - 1.0) / nf.sqrt() * (t2 / (nf - 2.0 + t2)).sqrt()
+        }
+        Err(_e) -> fail(OutBadAlpha(alpha))
+    }
+}
+
+/// Grubbs' test: is the single most extreme point an outlier?
+///
+/// It assumes the rest of the data is normal, and it finds at most one point.
+/// With two outliers it usually finds neither — which is what
+/// `generalised_esd` is for.
+pub fn grubbs(xs: [f64], alpha: f64) -> OutTest ! OutError {
+    if xs.len() < 3 {
+        fail(OutTooFewValues(xs.len(), 3))
+    }
+    let s = try deviation_of(xs)
+    if s == 0.0 {
+        fail(OutNoVariance)
+    }
+    let m = mean_of(xs)
+    var index = 0
+    var largest = 0.0
+    for i in 0..xs.len() {
+        let d = abs_of(xs[i] - m)
+        if d > largest {
+            largest = d
+            index = i
+        }
+    }
+    let statistic = largest / s
+    let critical = try grubbs_critical(xs.len(), alpha)
+    return OutTest{
+        statistic: statistic,
+        critical: critical,
+        index: index,
+        value: xs[index],
+        is_outlier: statistic > critical,
+        alpha: alpha,
+    }
+}
+
+/// The generalised extreme studentised deviate test: up to `most` outliers.
+///
+/// Rosner's procedure. It computes `most` test statistics, each on the data
+/// with the previous extremes removed, and only then decides: the answer is
+/// the largest `i` whose statistic exceeded its critical value, and everything
+/// removed up to that point is an outlier. Deciding after all the removals
+/// rather than during them is exactly what stops one outlier from masking
+/// another.
+///
+/// The steps are returned as well as the verdict, because the table of `R_i`
+/// against `lambda_i` is the thing a reader checks.
+pub fn generalised_esd(xs: [f64], most: i64,
+    alpha: f64) -> [OutStep] ! OutError {
+    if xs.len() < 3 {
+        fail(OutTooFewValues(xs.len(), 3))
+    }
+    if most < 1 or most >= xs.len() - 1 {
+        fail(OutTooFewValues(most, 1))
+    }
+    if alpha <= 0.0 or alpha >= 1.0 {
+        fail(OutBadAlpha(alpha))
+    }
+    let n = xs.len()
+    var working = xs
+    var original: [i64] = []
+    for i in 0..n {
+        original.push(i)
+    }
+    var steps: [OutStep] = []
+    for removed in 1..(most + 1) {
+        let s = try deviation_of(working)
+        if s == 0.0 {
+            return steps
+        }
+        let m = mean_of(working)
+        var at = 0
+        var largest = 0.0
+        for i in 0..working.len() {
+            let d = abs_of(working[i] - m)
+            if d > largest {
+                largest = d
+                at = i
+            }
+        }
+        steps.push(OutStep{
+            removed: removed,
+            statistic: largest / s,
+            critical: try esd_critical(n, removed, alpha),
+            index: original[at],
+            value: working[at],
+        })
+        working.remove(at)
+        original.remove(at)
+    }
+    return steps
+}
+
+/// `lambda_i` for the ESD test: the critical value for the `i`-th removal.
+pub fn esd_critical(n: i64, removed: i64, alpha: f64) -> f64 ! OutError {
+    let nf = n.as_f64()
+    let i = removed.as_f64()
+    let freedom = nf - i - 1.0
+    if freedom <= 0.0 {
+        fail(OutTooFewValues(n, removed + 2))
+    }
+    let p = 1.0 - alpha / (2.0 * (nf - i + 1.0))
+    match distributions.t_quantile(p, freedom) {
+        Ok(t) -> {
+            let top = (nf - i) * t
+            let bottom = ((freedom + t * t) * (nf - i + 1.0)).sqrt()
+            return top / bottom
+        }
+        Err(_e) -> fail(OutBadAlpha(alpha))
+    }
+}
+
+/// How many of the ESD steps were real, and which points they were.
+///
+/// The last step whose statistic beat its critical value decides the count;
+/// every earlier removal is then an outlier too, including any whose own
+/// statistic did not beat its own critical value. That last part is the whole
+/// method and it is the part that gets left out.
+pub fn esd_outliers(xs: [f64], most: i64, alpha: f64) -> [i64] ! OutError {
+    let steps = try generalised_esd(xs, most, alpha)
+    var count = 0
+    for i in 0..steps.len() {
+        if steps[i].statistic > steps[i].critical {
+            count = i + 1
+        }
+    }
+    var out: [i64] = []
+    for i in 0..count {
+        out.push(steps[i].index)
+    }
+    return out
+}
+
+// ------------------------------------------------------------- treatment
+
+/// The values with the extremes replaced by the nearest value that was kept.
+///
+/// Winsorising keeps the sample size, which matters when the next step is a
+/// paired test or anything else that needs the same `n`. Trimming does not.
+///
+/// The limits are order statistics, not interpolated quantiles: with
+/// `proportion = 0.1` on ten points, the smallest becomes the second smallest
+/// and the largest becomes the second largest, and every value in the result
+/// is a value that was in the input. An interpolated quantile would clip to a
+/// number the data never contained — which for a sample with one large outlier
+/// can leave the outlier barely reduced. This is what
+/// `scipy.stats.mstats.winsorize` does, and it is the definition Winsor gave.
+pub fn winsorise(xs: [f64], proportion: f64) -> [f64] ! OutError {
+    if proportion < 0.0 or proportion >= 0.5 {
+        fail(OutBadQuantile(proportion))
+    }
+    if xs.len() == 0 {
+        fail(OutTooFewValues(0, 1))
+    }
+    let sorted = sorted_copy(xs)
+    let drop = (proportion * sorted.len().as_f64()).floor().as_i64()
+    let low = sorted[drop]
+    let high = sorted[sorted.len() - 1 - drop]
+    var out: [f64] = []
+    for x in xs {
+        out.push(x.max(low).min(high))
+    }
+    return out
+}
+
+/// The values with the most extreme `proportion` at each end dropped.
+pub fn trim(xs: [f64], proportion: f64) -> [f64] ! OutError {
+    if proportion < 0.0 or proportion >= 0.5 {
+        fail(OutBadQuantile(proportion))
+    }
+    let sorted = sorted_copy(xs)
+    let drop = (proportion * sorted.len().as_f64()).floor().as_i64()
+    var out: [f64] = []
+    for i in drop..(sorted.len() - drop) {
+        out.push(sorted[i])
+    }
+    return out
+}
+
+/// The mean of the trimmed values.
+pub fn trimmed_mean(xs: [f64], proportion: f64) -> f64 ! OutError {
+    let kept = try trim(xs, proportion)
+    if kept.len() == 0 {
+        fail(OutTooFewValues(0, 1))
+    }
+    return mean_of(kept)
+}
+
+/// The values at the given indices removed.
+pub fn without(xs: [f64], indices: [i64]) -> [f64] {
+    var out: [f64] = []
+    for i in 0..xs.len() {
+        var drop = false
+        for k in indices {
+            if k == i {
+                drop = true
+            }
+        }
+        if not drop {
+            out.push(xs[i])
+        }
+    }
+    return out
+}

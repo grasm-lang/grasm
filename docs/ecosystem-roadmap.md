@@ -14,7 +14,7 @@ plan that discovers them 300 packages in.
 | | |
 |---|---|
 | Started | 78 |
-| Now | 224 |
+| Now | 229 |
 | Tier 1 target | 200 |
 | Tier 2 target | 500 |
 | Tier 3 target | 800 |
@@ -177,7 +177,7 @@ outside implementation wherever one exists.
 | ~~Time~~ | ~~`calendar` `recurrence` `workdays` `iso8601` `humanize`~~ — done |
 | ~~Geography~~ | ~~`geojson` `geohash` `haversine` `polyline` `wkt`~~ — done |
 | ~~Linear algebra~~ | ~~`linalg` `fft` `polynomial` `quaternion` `bezier`~~ — done |
-| Statistics | `regression` `distributions` `hypothesis` `sampling` `outliers` |
+| ~~Statistics~~ | ~~`regression` `distributions` `hypothesis` `sampling` `outliers`~~ — done |
 | Game and graphics | `collision` `quadtree` `astar` `tilemap` `palette` |
 | Networking | `whois` `tftp` `socks5` `gopher` `netdiscovery` |
 | Observability | `otelspan` `prometheus` `logsample` `errorgroup` `slo` |

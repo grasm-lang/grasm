@@ -1,0 +1,673 @@
+// Probability distributions: density, cumulative probability, and quantiles.
+//
+// Everything here rests on three special functions — `lgamma`, the regularised
+// incomplete gamma `P(a, x)`, and the regularised incomplete beta `I_x(a, b)`
+// — because every distribution below is one of those in disguise. The chi-
+// square CDF is `P(k/2, x/2)`; Student's t is `I` with a change of variable;
+// the binomial CDF is `I` again. Writing them once means one place to be
+// accurate rather than eight, and it is why the tails here hold up where a
+// series expansion per distribution would not.
+//
+// Three decisions worth stating.
+//
+// **The tail is computed, not subtracted.** `survival` is not `1 - cdf`. For
+// `z = 6` the CDF is `0.999999999013`, and subtracting that from one leaves
+// four correct digits out of sixteen — every digit that mattered is gone. The
+// survival functions here go through the complement of the underlying special
+// function instead, which keeps full precision out to the far tail. This is
+// the difference between a p-value of `9.87e-10` and a p-value of `1e-9`.
+//
+// **Quantiles are inverted properly.** Each starts from a rational
+// approximation and then refines with Newton's method against the exact CDF
+// and PDF, so the answer is right to the last few bits rather than to the
+// three digits the approximation gives.
+//
+// **Discrete CDFs are inclusive.** `binomial_cdf(k, ...)` is `P(X <= k)`. The
+// other convention exists, and an off-by-one here is a p-value that is wrong
+// by exactly one term — large enough to change a conclusion and small enough
+// to look plausible.
+//
+// Checked against `scipy.stats` at the centre and in both tails.
+
+type DistError =
+    | DistBadParameter(name: str, value: f64)
+    | DistBadProbability(p: f64)
+
+fn abs_of(x: f64) -> f64 {
+    if x < 0.0 {
+        return 0.0 - x
+    }
+    return x
+}
+
+/// `x^y` for positive `x`, which the language has no operator for.
+fn powf(x: f64, y: f64) -> f64 {
+    if x == 0.0 {
+        if y == 0.0 {
+            return 1.0
+        }
+        return 0.0
+    }
+    return (y * x.ln()).exp()
+}
+
+/// The smallest number this treats as different from zero in an iteration.
+fn tiny() -> f64 {
+    return 0.000000000000000000000000000001
+}
+
+// --------------------------------------------------- the special functions
+
+/// The Lanczos coefficients for `g = 7`, `n = 9`.
+fn lanczos() -> [f64] {
+    return [0.99999999999980993, 676.5203681218851, 0.0 - 1259.1392167224028,
+        771.32342877765313, 0.0 - 176.61502916214059, 12.507343278686905,
+        0.0 - 0.13857109526572012, 0.0000099843695780195716,
+        0.00000015056327351493116]
+}
+
+/// The natural log of the gamma function.
+///
+/// The log and not the function: `gamma(171)` overflows a double, while
+/// `lgamma(171)` is about 707, and every use here is inside an exponential
+/// where the log is what was wanted anyway.
+pub fn lgamma(x: f64) -> f64 {
+    if x < 0.5 {
+        // Reflection, which moves the argument out of the region where the
+        // series is poor and handles the negative half at the same time.
+        return (pi() / (pi() * x).sin().abs()).ln() - lgamma(1.0 - x)
+    }
+    let z = x - 1.0
+    let c = lanczos()
+    var series = c[0]
+    for i in 1..c.len() {
+        series = series + c[i] / (z + i.as_f64())
+    }
+    let t = z + 7.5
+    return 0.5 * (2.0 * pi()).ln() + (z + 0.5) * t.ln() - t + series.ln()
+}
+
+/// The log of the beta function, `B(a, b)`.
+pub fn lbeta(a: f64, b: f64) -> f64 {
+    return lgamma(a) + lgamma(b) - lgamma(a + b)
+}
+
+/// `n` choose `k`, through logs so it does not overflow.
+pub fn log_choose(n: f64, k: f64) -> f64 {
+    return lgamma(n + 1.0) - lgamma(k + 1.0) - lgamma(n - k + 1.0)
+}
+
+/// The regularised lower incomplete gamma `P(a, x)`.
+///
+/// Series below `x < a + 1` and the complement of a continued fraction above:
+/// the series converges quickly on the left and slowly on the right, and the
+/// fraction does the reverse. Using either alone is accurate over half its
+/// range and quietly wrong over the other half.
+pub fn gamma_p(a: f64, x: f64) -> f64 {
+    if x <= 0.0 {
+        return 0.0
+    }
+    if x < a + 1.0 {
+        return gamma_series(a, x)
+    }
+    return 1.0 - gamma_fraction(a, x)
+}
+
+/// The regularised upper incomplete gamma `Q(a, x) = 1 - P(a, x)`.
+///
+/// Computed directly rather than as `1 - gamma_p`, which is where the tail
+/// precision comes from.
+pub fn gamma_q(a: f64, x: f64) -> f64 {
+    if x <= 0.0 {
+        return 1.0
+    }
+    if x < a + 1.0 {
+        return 1.0 - gamma_series(a, x)
+    }
+    return gamma_fraction(a, x)
+}
+
+fn gamma_series(a: f64, x: f64) -> f64 {
+    var term = 1.0 / a
+    var total = term
+    var n = a
+    for _i in 0..1000 {
+        n = n + 1.0
+        term = term * x / n
+        total = total + term
+        if abs_of(term) < abs_of(total) * 0.0000000000000001 {
+            return total * (0.0 - x + a * x.ln() - lgamma(a)).exp()
+        }
+    }
+    return total * (0.0 - x + a * x.ln() - lgamma(a)).exp()
+}
+
+/// `Q(a, x)` by the modified Lentz evaluation of its continued fraction.
+fn gamma_fraction(a: f64, x: f64) -> f64 {
+    var b = x + 1.0 - a
+    var c = 1.0 / tiny()
+    var d = 1.0 / b
+    var h = d
+    for i in 1..1000 {
+        let an = 0.0 - i.as_f64() * (i.as_f64() - a)
+        b = b + 2.0
+        d = an * d + b
+        if abs_of(d) < tiny() {
+            d = tiny()
+        }
+        c = b + an / c
+        if abs_of(c) < tiny() {
+            c = tiny()
+        }
+        d = 1.0 / d
+        let step = d * c
+        h = h * step
+        if abs_of(step - 1.0) < 0.0000000000000001 {
+            return (0.0 - x + a * x.ln() - lgamma(a)).exp() * h
+        }
+    }
+    return (0.0 - x + a * x.ln() - lgamma(a)).exp() * h
+}
+
+/// The regularised incomplete beta `I_x(a, b)`.
+pub fn beta_i(x: f64, a: f64, b: f64) -> f64 {
+    if x <= 0.0 {
+        return 0.0
+    }
+    if x >= 1.0 {
+        return 1.0
+    }
+    let front = (a * x.ln() + b * (1.0 - x).ln() - lbeta(a, b)).exp()
+    // The fraction converges only on one side of the mode, so the symmetry
+    // `I_x(a, b) = 1 - I_{1-x}(b, a)` is used to get there.
+    if x < (a + 1.0) / (a + b + 2.0) {
+        return front * beta_fraction(x, a, b) / a
+    }
+    return 1.0 - front * beta_fraction(1.0 - x, b, a) / b
+}
+
+fn beta_fraction(x: f64, a: f64, b: f64) -> f64 {
+    let qab = a + b
+    let qap = a + 1.0
+    let qam = a - 1.0
+    var c = 1.0
+    var d = 1.0 - qab * x / qap
+    if abs_of(d) < tiny() {
+        d = tiny()
+    }
+    d = 1.0 / d
+    var h = d
+    for m in 1..500 {
+        let mf = m.as_f64()
+        let two = 2.0 * mf
+        var aa = mf * (b - mf) * x / ((qam + two) * (a + two))
+        d = 1.0 + aa * d
+        if abs_of(d) < tiny() {
+            d = tiny()
+        }
+        c = 1.0 + aa / c
+        if abs_of(c) < tiny() {
+            c = tiny()
+        }
+        d = 1.0 / d
+        h = h * d * c
+        aa = 0.0 - (a + mf) * (qab + mf) * x / ((a + two) * (qap + two))
+        d = 1.0 + aa * d
+        if abs_of(d) < tiny() {
+            d = tiny()
+        }
+        c = 1.0 + aa / c
+        if abs_of(c) < tiny() {
+            c = tiny()
+        }
+        d = 1.0 / d
+        let step = d * c
+        h = h * step
+        if abs_of(step - 1.0) < 0.00000000000001 {
+            return h
+        }
+    }
+    return h
+}
+
+/// The error function.
+pub fn erf(x: f64) -> f64 {
+    if x < 0.0 {
+        return 0.0 - erf(0.0 - x)
+    }
+    return gamma_p(0.5, x * x)
+}
+
+/// The complementary error function, `1 - erf(x)`, computed as itself.
+pub fn erfc(x: f64) -> f64 {
+    if x < 0.0 {
+        return 1.0 + gamma_p(0.5, x * x)
+    }
+    return gamma_q(0.5, x * x)
+}
+
+// ---------------------------------------------------------------- normal
+
+pub fn normal_pdf(x: f64, mean: f64, deviation: f64) -> f64 ! DistError {
+    if deviation <= 0.0 {
+        fail(DistBadParameter("deviation", deviation))
+    }
+    let z = (x - mean) / deviation
+    return (0.0 - z * z / 2.0).exp() / (deviation * (2.0 * pi()).sqrt())
+}
+
+pub fn normal_cdf(x: f64, mean: f64, deviation: f64) -> f64 ! DistError {
+    if deviation <= 0.0 {
+        fail(DistBadParameter("deviation", deviation))
+    }
+    return 0.5 * erfc((mean - x) / (deviation * (2.0).sqrt()))
+}
+
+/// `P(X > x)`, without going through `1 - cdf`.
+pub fn normal_survival(x: f64, mean: f64, deviation: f64) -> f64 ! DistError {
+    if deviation <= 0.0 {
+        fail(DistBadParameter("deviation", deviation))
+    }
+    return 0.5 * erfc((x - mean) / (deviation * (2.0).sqrt()))
+}
+
+/// The value below which a proportion `p` of the distribution lies.
+pub fn normal_quantile(p: f64, mean: f64, deviation: f64) -> f64 ! DistError {
+    if deviation <= 0.0 {
+        fail(DistBadParameter("deviation", deviation))
+    }
+    if p <= 0.0 or p >= 1.0 {
+        fail(DistBadProbability(p))
+    }
+    return mean + deviation * standard_quantile(p)
+}
+
+/// The standard normal quantile: Acklam's approximation, then Halley's method.
+///
+/// The approximation alone is good to about `1.15e-9`, which is enough for a
+/// chart and not enough for a critical value that someone will compare against
+/// a published table. One Halley step against the exact CDF takes it to the
+/// last bit.
+fn standard_quantile(p: f64) -> f64 {
+    let a = [0.0 - 39.69683028665376, 220.9460984245205, 0.0 - 275.9285104469687,
+        138.3577518672690, 0.0 - 30.66479806614716, 2.506628277459239]
+    let b = [0.0 - 54.47609879822406, 161.5858368580409,
+        0.0 - 155.6989798598866, 66.80131188771972, 0.0 - 13.28068155288572]
+    let c = [0.0 - 0.007784894002430293, 0.0 - 0.3223964580411365,
+        0.0 - 2.400758277161838, 0.0 - 2.549732539343734, 4.374664141464968,
+        2.938163982698783]
+    let d = [0.007784695709041462, 0.3224671290700398, 2.445134137142996,
+        3.754408661907416]
+    let low = 0.02425
+    var x = 0.0
+    if p < low {
+        let q = (0.0 - 2.0 * p.ln()).sqrt()
+        x = (((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q +
+            c[5]) / ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1.0)
+    } else {
+        if p > 1.0 - low {
+            let q = (0.0 - 2.0 * (1.0 - p).ln()).sqrt()
+            x = 0.0 - (((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q +
+                c[4]) * q + c[5]) /
+            ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1.0)
+        } else {
+            let q = p - 0.5
+            let r = q * q
+            x = (((((a[0] * r + a[1]) * r + a[2]) * r + a[3]) * r + a[4]) * r +
+                a[5]) * q /
+            (((((b[0] * r + b[1]) * r + b[2]) * r + b[3]) * r + b[4]) * r +
+                1.0)
+        }
+    }
+    for _i in 0..2 {
+        let e = 0.5 * erfc(0.0 - x / (2.0).sqrt()) - p
+        let u = e * (2.0 * pi()).sqrt() * (x * x / 2.0).exp()
+        x = x - u / (1.0 + x * u / 2.0)
+    }
+    return x
+}
+
+// ------------------------------------------------------------ Student's t
+
+pub fn t_pdf(x: f64, freedom: f64) -> f64 ! DistError {
+    if freedom <= 0.0 {
+        fail(DistBadParameter("freedom", freedom))
+    }
+    let norm = (lgamma((freedom + 1.0) / 2.0) - lgamma(freedom / 2.0) -
+        0.5 * (freedom * pi()).ln()).exp()
+    return norm * powf(1.0 + x * x / freedom, 0.0 - (freedom + 1.0) / 2.0)
+}
+
+pub fn t_cdf(x: f64, freedom: f64) -> f64 ! DistError {
+    if freedom <= 0.0 {
+        fail(DistBadParameter("freedom", freedom))
+    }
+    let half = 0.5 * beta_i(freedom / (freedom + x * x), freedom / 2.0, 0.5)
+    if x >= 0.0 {
+        return 1.0 - half
+    }
+    return half
+}
+
+/// `P(T > x)`, which is the one-sided p-value of a t statistic.
+pub fn t_survival(x: f64, freedom: f64) -> f64 ! DistError {
+    if freedom <= 0.0 {
+        fail(DistBadParameter("freedom", freedom))
+    }
+    let half = 0.5 * beta_i(freedom / (freedom + x * x), freedom / 2.0, 0.5)
+    if x >= 0.0 {
+        return half
+    }
+    return 1.0 - half
+}
+
+pub fn t_quantile(p: f64, freedom: f64) -> f64 ! DistError {
+    if freedom <= 0.0 {
+        fail(DistBadParameter("freedom", freedom))
+    }
+    if p <= 0.0 or p >= 1.0 {
+        fail(DistBadProbability(p))
+    }
+    // The normal quantile is the right shape and too narrow; a few Newton
+    // steps against the exact CDF close the gap at any degrees of freedom.
+    var x = standard_quantile(p)
+    for _i in 0..40 {
+        let f = try t_cdf(x, freedom)
+        let d = try t_pdf(x, freedom)
+        if d < tiny() {
+            return x
+        }
+        let step = (f - p) / d
+        x = x - step
+        if abs_of(step) < 0.0000000000001 {
+            return x
+        }
+    }
+    return x
+}
+
+// ------------------------------------------------------------ chi-square
+
+pub fn chi2_pdf(x: f64, freedom: f64) -> f64 ! DistError {
+    if freedom <= 0.0 {
+        fail(DistBadParameter("freedom", freedom))
+    }
+    if x <= 0.0 {
+        return 0.0
+    }
+    let k = freedom / 2.0
+    return ((k - 1.0) * x.ln() - x / 2.0 - k * (2.0).ln() - lgamma(k)).exp()
+}
+
+pub fn chi2_cdf(x: f64, freedom: f64) -> f64 ! DistError {
+    if freedom <= 0.0 {
+        fail(DistBadParameter("freedom", freedom))
+    }
+    return gamma_p(freedom / 2.0, x / 2.0)
+}
+
+/// `P(X > x)`, which is the p-value of a chi-square statistic.
+pub fn chi2_survival(x: f64, freedom: f64) -> f64 ! DistError {
+    if freedom <= 0.0 {
+        fail(DistBadParameter("freedom", freedom))
+    }
+    return gamma_q(freedom / 2.0, x / 2.0)
+}
+
+pub fn chi2_quantile(p: f64, freedom: f64) -> f64 ! DistError {
+    if freedom <= 0.0 {
+        fail(DistBadParameter("freedom", freedom))
+    }
+    if p <= 0.0 or p >= 1.0 {
+        fail(DistBadProbability(p))
+    }
+    var x = freedom
+    if x < 1.0 {
+        x = 1.0
+    }
+    for _i in 0..200 {
+        let f = try chi2_cdf(x, freedom)
+        let d = try chi2_pdf(x, freedom)
+        if d < tiny() {
+            return x
+        }
+        var step = (f - p) / d
+        // Halving a step that would go negative keeps Newton inside the
+        // support without giving up its convergence.
+        while x - step <= 0.0 {
+            step = step / 2.0
+        }
+        x = x - step
+        if abs_of(step) < 0.000000000001 {
+            return x
+        }
+    }
+    return x
+}
+
+// --------------------------------------------------------------------- F
+
+pub fn f_cdf(x: f64, d1: f64, d2: f64) -> f64 ! DistError {
+    if d1 <= 0.0 or d2 <= 0.0 {
+        fail(DistBadParameter("freedom", d1.min(d2)))
+    }
+    if x <= 0.0 {
+        return 0.0
+    }
+    return beta_i(d1 * x / (d1 * x + d2), d1 / 2.0, d2 / 2.0)
+}
+
+/// `P(F > x)`, which is the p-value of an F statistic — an ANOVA's answer.
+pub fn f_survival(x: f64, d1: f64, d2: f64) -> f64 ! DistError {
+    if d1 <= 0.0 or d2 <= 0.0 {
+        fail(DistBadParameter("freedom", d1.min(d2)))
+    }
+    if x <= 0.0 {
+        return 1.0
+    }
+    return beta_i(d2 / (d1 * x + d2), d2 / 2.0, d1 / 2.0)
+}
+
+pub fn f_quantile(p: f64, d1: f64, d2: f64) -> f64 ! DistError {
+    if d1 <= 0.0 or d2 <= 0.0 {
+        fail(DistBadParameter("freedom", d1.min(d2)))
+    }
+    if p <= 0.0 or p >= 1.0 {
+        fail(DistBadProbability(p))
+    }
+    // No usable closed form to start from, so bisection, which cannot fail.
+    var low = 0.0
+    var high = 1.0
+    while (try f_cdf(high, d1, d2)) < p and high < 1000000000.0 {
+        high = high * 2.0
+    }
+    for _i in 0..200 {
+        let mid = (low + high) / 2.0
+        if (try f_cdf(mid, d1, d2)) < p {
+            low = mid
+        } else {
+            high = mid
+        }
+    }
+    return (low + high) / 2.0
+}
+
+// -------------------------------------------------------------- discrete
+
+/// `P(X = k)` for `n` trials at probability `p`.
+pub fn binomial_pmf(k: i64, n: i64, p: f64) -> f64 ! DistError {
+    if p < 0.0 or p > 1.0 {
+        fail(DistBadProbability(p))
+    }
+    if k < 0 or k > n {
+        return 0.0
+    }
+    if p == 0.0 {
+        if k == 0 {
+            return 1.0
+        }
+        return 0.0
+    }
+    if p == 1.0 {
+        if k == n {
+            return 1.0
+        }
+        return 0.0
+    }
+    return (log_choose(n.as_f64(), k.as_f64()) + k.as_f64() * p.ln() +
+        (n - k).as_f64() * (1.0 - p).ln()).exp()
+}
+
+/// `P(X <= k)`, inclusive.
+pub fn binomial_cdf(k: i64, n: i64, p: f64) -> f64 ! DistError {
+    if p < 0.0 or p > 1.0 {
+        fail(DistBadProbability(p))
+    }
+    if k < 0 {
+        return 0.0
+    }
+    if k >= n {
+        return 1.0
+    }
+    // Through the incomplete beta, not by summing terms: the sum needs `k`
+    // exponentials and loses accuracy for large `n`, and this is one call.
+    return beta_i(1.0 - p, (n - k).as_f64(), (k + 1).as_f64())
+}
+
+/// `P(X > k)`, the upper tail of a binomial.
+pub fn binomial_survival(k: i64, n: i64, p: f64) -> f64 ! DistError {
+    if p < 0.0 or p > 1.0 {
+        fail(DistBadProbability(p))
+    }
+    if k < 0 {
+        return 1.0
+    }
+    if k >= n {
+        return 0.0
+    }
+    return beta_i(p, (k + 1).as_f64(), (n - k).as_f64())
+}
+
+pub fn poisson_pmf(k: i64, rate: f64) -> f64 ! DistError {
+    if rate < 0.0 {
+        fail(DistBadParameter("rate", rate))
+    }
+    if k < 0 {
+        return 0.0
+    }
+    return (0.0 - rate + k.as_f64() * rate.ln() -
+        lgamma(k.as_f64() + 1.0)).exp()
+}
+
+/// `P(X <= k)`, inclusive.
+pub fn poisson_cdf(k: i64, rate: f64) -> f64 ! DistError {
+    if rate < 0.0 {
+        fail(DistBadParameter("rate", rate))
+    }
+    if k < 0 {
+        return 0.0
+    }
+    return gamma_q(k.as_f64() + 1.0, rate)
+}
+
+/// `P(X > k)`, computed as itself rather than as a subtraction.
+pub fn poisson_survival(k: i64, rate: f64) -> f64 ! DistError {
+    if rate < 0.0 {
+        fail(DistBadParameter("rate", rate))
+    }
+    if k < 0 {
+        return 1.0
+    }
+    return gamma_p(k.as_f64() + 1.0, rate)
+}
+
+// ------------------------------------------------------------ continuous
+
+pub fn exponential_pdf(x: f64, rate: f64) -> f64 ! DistError {
+    if rate <= 0.0 {
+        fail(DistBadParameter("rate", rate))
+    }
+    if x < 0.0 {
+        return 0.0
+    }
+    return rate * (0.0 - rate * x).exp()
+}
+
+pub fn exponential_cdf(x: f64, rate: f64) -> f64 ! DistError {
+    if rate <= 0.0 {
+        fail(DistBadParameter("rate", rate))
+    }
+    if x <= 0.0 {
+        return 0.0
+    }
+    return 1.0 - (0.0 - rate * x).exp()
+}
+
+pub fn exponential_quantile(p: f64, rate: f64) -> f64 ! DistError {
+    if rate <= 0.0 {
+        fail(DistBadParameter("rate", rate))
+    }
+    if p < 0.0 or p >= 1.0 {
+        fail(DistBadProbability(p))
+    }
+    return 0.0 - (1.0 - p).ln() / rate
+}
+
+pub fn uniform_pdf(x: f64, low: f64, high: f64) -> f64 ! DistError {
+    if high <= low {
+        fail(DistBadParameter("high", high))
+    }
+    if x < low or x > high {
+        return 0.0
+    }
+    return 1.0 / (high - low)
+}
+
+pub fn uniform_cdf(x: f64, low: f64, high: f64) -> f64 ! DistError {
+    if high <= low {
+        fail(DistBadParameter("high", high))
+    }
+    if x <= low {
+        return 0.0
+    }
+    if x >= high {
+        return 1.0
+    }
+    return (x - low) / (high - low)
+}
+
+pub fn gamma_pdf(x: f64, shape: f64, scale: f64) -> f64 ! DistError {
+    if shape <= 0.0 or scale <= 0.0 {
+        fail(DistBadParameter("shape", shape))
+    }
+    if x <= 0.0 {
+        return 0.0
+    }
+    return ((shape - 1.0) * x.ln() - x / scale - shape * scale.ln() -
+        lgamma(shape)).exp()
+}
+
+pub fn gamma_cdf(x: f64, shape: f64, scale: f64) -> f64 ! DistError {
+    if shape <= 0.0 or scale <= 0.0 {
+        fail(DistBadParameter("shape", shape))
+    }
+    return gamma_p(shape, x / scale)
+}
+
+pub fn beta_pdf(x: f64, a: f64, b: f64) -> f64 ! DistError {
+    if a <= 0.0 or b <= 0.0 {
+        fail(DistBadParameter("shape", a.min(b)))
+    }
+    if x <= 0.0 or x >= 1.0 {
+        return 0.0
+    }
+    return ((a - 1.0) * x.ln() + (b - 1.0) * (1.0 - x).ln() -
+        lbeta(a, b)).exp()
+}
+
+pub fn beta_cdf(x: f64, a: f64, b: f64) -> f64 ! DistError {
+    if a <= 0.0 or b <= 0.0 {
+        fail(DistBadParameter("shape", a.min(b)))
+    }
+    return beta_i(x, a, b)
+}

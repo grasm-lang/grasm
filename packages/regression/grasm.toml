@@ -1,0 +1,18 @@
+[package]
+name = "regression"
+version = "1.0.0"
+
+# Arithmetic. Opens nothing.
+capabilities = []
+
+[dependencies.linalg]
+path = "../linalg"
+version = "^1.0.0"
+
+[dependencies.matrix]
+path = "../matrix"
+version = "^1.0.0"
+
+[dependencies.distributions]
+path = "../distributions"
+version = "^1.0.0"

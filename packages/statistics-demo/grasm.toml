@@ -1,0 +1,28 @@
+[package]
+name = "statistics_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.distributions]
+path = "../distributions"
+version = "^1.0.0"
+
+[dependencies.hypothesis]
+path = "../hypothesis"
+version = "^1.0.0"
+
+[dependencies.regression]
+path = "../regression"
+version = "^1.0.0"
+
+[dependencies.sampling]
+path = "../sampling"
+version = "^1.0.0"
+
+[dependencies.outliers]
+path = "../outliers"
+version = "^1.0.0"
+
+[dependencies.random]
+path = "../random"
+version = "^1.0.0"

@@ -1,0 +1,629 @@
+// Significance tests, and the assumptions each of them makes.
+//
+// Every test here returns the same three things: the statistic, the degrees of
+// freedom it was compared against, and a two-sided p-value. The statistic is
+// returned and not hidden, because a p-value alone cannot be checked against
+// anything and a statistic can.
+//
+// Four things this package is deliberate about.
+//
+// **Welch is the default for two samples.** `t_two_sample` does not pool the
+// variances unless asked. Pooling assumes the two groups have the same
+// variance, which is an assumption nobody tests and which is usually false;
+// Welch's version costs nothing, is barely less powerful when the variances do
+// match, and is correct when they do not. The pooled form is here under
+// `t_two_sample_pooled` for when a result has to be reproduced.
+//
+// **A p-value near zero keeps its digits.** Every p-value goes through a
+// survival function rather than through `1 - cdf`, so `p = 3.4e-12` comes back
+// as `3.4e-12` rather than as `0`. A test that reports zero has thrown away
+// the difference between "unlikely" and "impossible".
+//
+// **The rank tests average tied ranks and correct for them.** Ties shrink the
+// variance of a rank statistic; ignoring that makes every p-value too large,
+// which is the safe direction and still wrong.
+//
+// **Multiple comparisons are a first-class function, not a footnote.** Twenty
+// tests at `alpha = 0.05` produce one false positive on average. `bonferroni`
+// and `benjamini_hochberg` are here because the alternative is that nobody
+// applies either.
+//
+// Checked against `scipy.stats`.
+
+import distributions
+
+/// What every test returns.
+type HypResult = {
+    statistic: f64,
+    freedom: f64,
+    p_value: f64,
+}
+
+/// A confidence interval, and the level it was computed at.
+type HypInterval = {
+    low: f64,
+    high: f64,
+    level: f64,
+}
+
+type HypError =
+    | HypTooFewValues(given: i64, needed: i64)
+    | HypLengthMismatch(a: i64, b: i64)
+    | HypNoVariance
+    | HypBadLevel(level: f64)
+    | HypBadExpected(index: i64, value: f64)
+    | HypRaggedTable(row: i64)
+
+fn abs_of(x: f64) -> f64 {
+    if x < 0.0 {
+        return 0.0 - x
+    }
+    return x
+}
+
+pub fn mean_of(xs: [f64]) -> f64 {
+    if xs.len() == 0 {
+        return 0.0
+    }
+    var total = 0.0
+    for x in xs {
+        total = total + x
+    }
+    return total / xs.len().as_f64()
+}
+
+/// The sample variance, dividing by `n - 1`.
+///
+/// `n - 1` and not `n`: dividing by `n` gives the variance of the sample
+/// treated as the whole population, which is biased low, and every test below
+/// is about a population the sample was drawn from.
+pub fn variance_of(xs: [f64]) -> f64 ! HypError {
+    if xs.len() < 2 {
+        fail(HypTooFewValues(xs.len(), 2))
+    }
+    let m = mean_of(xs)
+    var total = 0.0
+    for x in xs {
+        total = total + (x - m) * (x - m)
+    }
+    return total / (xs.len() - 1).as_f64()
+}
+
+pub fn deviation_of(xs: [f64]) -> f64 ! HypError {
+    return (try variance_of(xs)).sqrt()
+}
+
+/// The two-sided p-value of a t statistic.
+fn two_sided_t(t: f64, freedom: f64) -> f64 ! HypError {
+    match distributions.t_survival(abs_of(t), freedom) {
+        Ok(p) -> return 2.0 * p
+        Err(_e) -> fail(HypNoVariance)
+    }
+}
+
+// -------------------------------------------------------------- t-tests
+
+/// Is the mean of `xs` different from `expected`?
+pub fn t_one_sample(xs: [f64], expected: f64) -> HypResult ! HypError {
+    if xs.len() < 2 {
+        fail(HypTooFewValues(xs.len(), 2))
+    }
+    let n = xs.len().as_f64()
+    let s = try deviation_of(xs)
+    if s == 0.0 {
+        fail(HypNoVariance)
+    }
+    let t = (mean_of(xs) - expected) / (s / n.sqrt())
+    let freedom = n - 1.0
+    return HypResult{ statistic: t, freedom: freedom,
+        p_value: try two_sided_t(t, freedom) }
+}
+
+/// Are the two means different? Welch's test, which does not pool variances.
+///
+/// The degrees of freedom are fractional — the Welch-Satterthwaite value —
+/// which is the price of not assuming equal variances and the reason the
+/// answer is trustworthy when they differ.
+pub fn t_two_sample(a: [f64], b: [f64]) -> HypResult ! HypError {
+    if a.len() < 2 {
+        fail(HypTooFewValues(a.len(), 2))
+    }
+    if b.len() < 2 {
+        fail(HypTooFewValues(b.len(), 2))
+    }
+    let na = a.len().as_f64()
+    let nb = b.len().as_f64()
+    let va = (try variance_of(a)) / na
+    let vb = (try variance_of(b)) / nb
+    if va + vb == 0.0 {
+        fail(HypNoVariance)
+    }
+    let t = (mean_of(a) - mean_of(b)) / (va + vb).sqrt()
+    let freedom = (va + vb) * (va + vb) /
+    (va * va / (na - 1.0) + vb * vb / (nb - 1.0))
+    return HypResult{ statistic: t, freedom: freedom,
+        p_value: try two_sided_t(t, freedom) }
+}
+
+/// The same question, assuming the two groups share a variance.
+///
+/// Here for reproducing a published result. When the variances differ and the
+/// group sizes differ too, this is anti-conservative — it reports significance
+/// that is not there — and the direction of the error depends on which group
+/// is larger.
+pub fn t_two_sample_pooled(a: [f64], b: [f64]) -> HypResult ! HypError {
+    if a.len() < 2 {
+        fail(HypTooFewValues(a.len(), 2))
+    }
+    if b.len() < 2 {
+        fail(HypTooFewValues(b.len(), 2))
+    }
+    let na = a.len().as_f64()
+    let nb = b.len().as_f64()
+    let freedom = na + nb - 2.0
+    let pooled = ((na - 1.0) * (try variance_of(a)) +
+        (nb - 1.0) * (try variance_of(b))) / freedom
+    if pooled == 0.0 {
+        fail(HypNoVariance)
+    }
+    let t = (mean_of(a) - mean_of(b)) /
+    (pooled * (1.0 / na + 1.0 / nb)).sqrt()
+    return HypResult{ statistic: t, freedom: freedom,
+        p_value: try two_sided_t(t, freedom) }
+}
+
+/// Paired measurements: the same subjects, twice.
+///
+/// A one-sample test on the differences, which is what makes it much more
+/// powerful than the two-sample test on the same data — the between-subject
+/// variation cancels instead of being counted as noise.
+pub fn t_paired(a: [f64], b: [f64]) -> HypResult ! HypError {
+    if a.len() != b.len() {
+        fail(HypLengthMismatch(a.len(), b.len()))
+    }
+    var differences: [f64] = []
+    for i in 0..a.len() {
+        differences.push(a[i] - b[i])
+    }
+    return try t_one_sample(differences, 0.0)
+}
+
+/// A confidence interval for the mean, from the t distribution.
+pub fn mean_interval(xs: [f64], level: f64) -> HypInterval ! HypError {
+    if level <= 0.0 or level >= 1.0 {
+        fail(HypBadLevel(level))
+    }
+    if xs.len() < 2 {
+        fail(HypTooFewValues(xs.len(), 2))
+    }
+    let n = xs.len().as_f64()
+    let m = mean_of(xs)
+    let s = try deviation_of(xs)
+    match distributions.t_quantile(1.0 - (1.0 - level) / 2.0, n - 1.0) {
+        Ok(critical) -> {
+            let half = critical * s / n.sqrt()
+            return HypInterval{ low: m - half, high: m + half, level: level }
+        }
+        Err(_e) -> fail(HypBadLevel(level))
+    }
+}
+
+// --------------------------------------------------------- chi-square
+
+/// Does the observed distribution match the expected one?
+pub fn chi2_goodness(observed: [f64], expected: [f64]) -> HypResult ! HypError {
+    if observed.len() != expected.len() {
+        fail(HypLengthMismatch(observed.len(), expected.len()))
+    }
+    if observed.len() < 2 {
+        fail(HypTooFewValues(observed.len(), 2))
+    }
+    var total = 0.0
+    for i in 0..observed.len() {
+        if expected[i] <= 0.0 {
+            fail(HypBadExpected(i, expected[i]))
+        }
+        let d = observed[i] - expected[i]
+        total = total + d * d / expected[i]
+    }
+    let freedom = (observed.len() - 1).as_f64()
+    match distributions.chi2_survival(total, freedom) {
+        Ok(p) -> return HypResult{ statistic: total, freedom: freedom,
+            p_value: p }
+        Err(_e) -> fail(HypNoVariance)
+    }
+}
+
+/// Are the row and column variables of a contingency table independent?
+pub fn chi2_independence(table: [[f64]]) -> HypResult ! HypError {
+    if table.len() < 2 {
+        fail(HypTooFewValues(table.len(), 2))
+    }
+    let cols = table[0].len()
+    if cols < 2 {
+        fail(HypTooFewValues(cols, 2))
+    }
+    var row_total: [f64] = []
+    var col_total: [f64] = []
+    for _c in 0..cols {
+        col_total.push(0.0)
+    }
+    var grand = 0.0
+    for r in 0..table.len() {
+        if table[r].len() != cols {
+            fail(HypRaggedTable(r))
+        }
+        var sum = 0.0
+        for c in 0..cols {
+            sum = sum + table[r][c]
+            col_total[c] = col_total[c] + table[r][c]
+        }
+        row_total.push(sum)
+        grand = grand + sum
+    }
+    var total = 0.0
+    for r in 0..table.len() {
+        for c in 0..cols {
+            let expected = row_total[r] * col_total[c] / grand
+            if expected <= 0.0 {
+                fail(HypBadExpected(r, expected))
+            }
+            let d = table[r][c] - expected
+            total = total + d * d / expected
+        }
+    }
+    let freedom = (table.len() - 1).as_f64() * (cols - 1).as_f64()
+    match distributions.chi2_survival(total, freedom) {
+        Ok(p) -> return HypResult{ statistic: total, freedom: freedom,
+            p_value: p }
+        Err(_e) -> fail(HypNoVariance)
+    }
+}
+
+// ------------------------------------------------------------- ANOVA
+
+/// One-way ANOVA: is any of these groups different from the others?
+///
+/// It does not say which. A significant F means the groups are not all the
+/// same, and finding the pair that differs is a second question that needs a
+/// correction for multiple comparisons — which is what `benjamini_hochberg`
+/// below is for.
+pub fn anova_one_way(groups: [[f64]]) -> HypResult ! HypError {
+    if groups.len() < 2 {
+        fail(HypTooFewValues(groups.len(), 2))
+    }
+    var total = 0.0
+    var count = 0.0
+    for g in groups {
+        if g.len() < 1 {
+            fail(HypTooFewValues(0, 1))
+        }
+        for x in g {
+            total = total + x
+            count = count + 1.0
+        }
+    }
+    let grand = total / count
+    var between = 0.0
+    var within = 0.0
+    for g in groups {
+        let m = mean_of(g)
+        between = between + g.len().as_f64() * (m - grand) * (m - grand)
+        for x in g {
+            within = within + (x - m) * (x - m)
+        }
+    }
+    let d1 = (groups.len() - 1).as_f64()
+    let d2 = count - groups.len().as_f64()
+    if within == 0.0 or d2 <= 0.0 {
+        fail(HypNoVariance)
+    }
+    let f = (between / d1) / (within / d2)
+    match distributions.f_survival(f, d1, d2) {
+        Ok(p) -> return HypResult{ statistic: f, freedom: d2, p_value: p }
+        Err(_e) -> fail(HypNoVariance)
+    }
+}
+
+// ------------------------------------------------------------- ranks
+
+/// Ranks from 1, with tied values sharing the average of the ranks they span.
+pub fn ranks_of(xs: [f64]) -> [f64] {
+    // Value first so the sort key is the value, index second so the original
+    // position survives the reordering.
+    var pairs: [(f64, i64)] = []
+    for i in 0..xs.len() {
+        pairs.push((xs[i], i))
+    }
+    pairs.sort_by(|p| p.0)
+    var order: [i64] = []
+    for p in pairs {
+        order.push(p.1)
+    }
+    var out: [f64] = []
+    for _i in 0..xs.len() {
+        out.push(0.0)
+    }
+    var i = 0
+    while i < order.len() {
+        var j = i
+        while j + 1 < order.len() and xs[order[j + 1]] == xs[order[i]] {
+            j = j + 1
+        }
+        let shared = ((i + j).as_f64() / 2.0) + 1.0
+        for k in i..(j + 1) {
+            out[order[k]] = shared
+        }
+        i = j + 1
+    }
+    return out
+}
+
+/// The tie correction term: the sum of `t^3 - t` over each run of equal values.
+fn tie_term(xs: [f64]) -> f64 {
+    var sorted = xs
+    sorted.sort()
+    var total = 0.0
+    var i = 0
+    while i < sorted.len() {
+        var j = i
+        while j + 1 < sorted.len() and sorted[j + 1] == sorted[i] {
+            j = j + 1
+        }
+        let run = (j - i + 1).as_f64()
+        total = total + run * run * run - run
+        i = j + 1
+    }
+    return total
+}
+
+/// Mann-Whitney U: do two samples come from the same distribution?
+///
+/// The rank alternative to a two-sample t-test. It does not assume normality
+/// and it is not a test of means — it asks whether a value drawn from one
+/// group tends to exceed one drawn from the other, which is a different
+/// question and often the one actually being asked.
+///
+/// The normal approximation with a continuity correction and a tie correction,
+/// which is `scipy`'s `method="asymptotic"`.
+pub fn mann_whitney(a: [f64], b: [f64]) -> HypResult ! HypError {
+    if a.len() < 1 or b.len() < 1 {
+        fail(HypTooFewValues(a.len().min(b.len()), 1))
+    }
+    var joined = a
+    for x in b {
+        joined.push(x)
+    }
+    let ranked = ranks_of(joined)
+    var ra = 0.0
+    for i in 0..a.len() {
+        ra = ra + ranked[i]
+    }
+    let na = a.len().as_f64()
+    let nb = b.len().as_f64()
+    let u = ra - na * (na + 1.0) / 2.0
+    let mean = na * nb / 2.0
+    let n = na + nb
+    let ties = tie_term(joined)
+    let variance = na * nb / 12.0 * ((n + 1.0) - ties / (n * (n - 1.0)))
+    if variance <= 0.0 {
+        fail(HypNoVariance)
+    }
+    // The continuity correction: `U` is discrete and the normal is not.
+    var z = abs_of(u - mean) - 0.5
+    if z < 0.0 {
+        z = 0.0
+    }
+    z = z / variance.sqrt()
+    match distributions.normal_survival(z, 0.0, 1.0) {
+        Ok(p) -> return HypResult{ statistic: u, freedom: n, p_value: 2.0 * p }
+        Err(_e) -> fail(HypNoVariance)
+    }
+}
+
+/// Wilcoxon signed-rank: the paired, non-parametric counterpart of `t_paired`.
+///
+/// Pairs whose difference is exactly zero are dropped, which is Wilcoxon's own
+/// rule and reduces the sample size — a detail that changes the answer and is
+/// left out of most descriptions.
+pub fn wilcoxon(a: [f64], b: [f64]) -> HypResult ! HypError {
+    if a.len() != b.len() {
+        fail(HypLengthMismatch(a.len(), b.len()))
+    }
+    var sizes: [f64] = []
+    var signs: [f64] = []
+    for i in 0..a.len() {
+        let d = a[i] - b[i]
+        if d != 0.0 {
+            sizes.push(abs_of(d))
+            if d > 0.0 {
+                signs.push(1.0)
+            } else {
+                signs.push(0.0 - 1.0)
+            }
+        }
+    }
+    if sizes.len() < 1 {
+        fail(HypTooFewValues(0, 1))
+    }
+    let ranked = ranks_of(sizes)
+    var positive = 0.0
+    var negative = 0.0
+    for i in 0..ranked.len() {
+        if signs[i] > 0.0 {
+            positive = positive + ranked[i]
+        } else {
+            negative = negative + ranked[i]
+        }
+    }
+    let n = sizes.len().as_f64()
+    let w = positive.min(negative)
+    let mean = n * (n + 1.0) / 4.0
+    let ties = tie_term(sizes)
+    let variance = (n * (n + 1.0) * (2.0 * n + 1.0) - ties / 2.0) / 24.0
+    if variance <= 0.0 {
+        fail(HypNoVariance)
+    }
+    var z = abs_of(w - mean) - 0.5
+    if z < 0.0 {
+        z = 0.0
+    }
+    z = z / variance.sqrt()
+    match distributions.normal_survival(z, 0.0, 1.0) {
+        Ok(p) -> return HypResult{ statistic: w, freedom: n, p_value: 2.0 * p }
+        Err(_e) -> fail(HypNoVariance)
+    }
+}
+
+// ------------------------------------------------------- correlation
+
+/// Pearson's correlation and its p-value.
+pub fn pearson(xs: [f64], ys: [f64]) -> HypResult ! HypError {
+    if xs.len() != ys.len() {
+        fail(HypLengthMismatch(xs.len(), ys.len()))
+    }
+    if xs.len() < 3 {
+        fail(HypTooFewValues(xs.len(), 3))
+    }
+    let mx = mean_of(xs)
+    let my = mean_of(ys)
+    var top = 0.0
+    var sx = 0.0
+    var sy = 0.0
+    for i in 0..xs.len() {
+        let dx = xs[i] - mx
+        let dy = ys[i] - my
+        top = top + dx * dy
+        sx = sx + dx * dx
+        sy = sy + dy * dy
+    }
+    if sx == 0.0 or sy == 0.0 {
+        fail(HypNoVariance)
+    }
+    let r = top / (sx * sy).sqrt()
+    let freedom = (xs.len() - 2).as_f64()
+    if abs_of(r) >= 1.0 {
+        return HypResult{ statistic: r, freedom: freedom, p_value: 0.0 }
+    }
+    let t = r * (freedom / (1.0 - r * r)).sqrt()
+    return HypResult{ statistic: r, freedom: freedom,
+        p_value: try two_sided_t(t, freedom) }
+}
+
+/// Spearman's rank correlation: Pearson's, on the ranks.
+///
+/// Which is what makes it robust to outliers and to any monotonic
+/// transformation of either variable — a relationship that is strong but
+/// curved shows up here and not in Pearson's.
+pub fn spearman(xs: [f64], ys: [f64]) -> HypResult ! HypError {
+    if xs.len() != ys.len() {
+        fail(HypLengthMismatch(xs.len(), ys.len()))
+    }
+    return try pearson(ranks_of(xs), ranks_of(ys))
+}
+
+// --------------------------------------------------------- proportions
+
+/// An exact two-sided binomial test.
+///
+/// Two-sided by summing every outcome at most as likely as the observed one,
+/// which is the definition `scipy.stats.binomtest` uses. Doubling the one-
+/// sided p-value is the common shortcut and gives a different answer whenever
+/// the distribution is not symmetric — that is, whenever `p` is not `0.5`.
+pub fn binomial_test(successes: i64, trials: i64,
+    p: f64) -> HypResult ! HypError {
+    if trials < 1 {
+        fail(HypTooFewValues(trials, 1))
+    }
+    match distributions.binomial_pmf(successes, trials, p) {
+        Ok(observed) -> {
+            var total = 0.0
+            for k in 0..(trials + 1) {
+                match distributions.binomial_pmf(k, trials, p) {
+                    Ok(term) -> {
+                        // The relative slack absorbs the rounding that makes
+                        // two mathematically equal terms compare unequal.
+                        if term <= observed * 1.0000000001 {
+                            total = total + term
+                        }
+                    }
+                    Err(_e) -> fail(HypNoVariance)
+                }
+            }
+            if total > 1.0 {
+                total = 1.0
+            }
+            return HypResult{ statistic: successes.as_f64(),
+                freedom: trials.as_f64(), p_value: total }
+        }
+        Err(_e) -> fail(HypNoVariance)
+    }
+}
+
+// ------------------------------------------------- multiple comparisons
+
+/// Bonferroni: multiply every p-value by the number of tests.
+///
+/// Controls the chance of even one false positive, and is severe — with 100
+/// tests, a p-value of `0.0004` is no longer significant at `0.05`. Correct,
+/// and it costs real power.
+pub fn bonferroni(p_values: [f64]) -> [f64] {
+    var out: [f64] = []
+    for p in p_values {
+        out.push((p * p_values.len().as_f64()).min(1.0))
+    }
+    return out
+}
+
+/// Benjamini-Hochberg: control the *proportion* of discoveries that are false.
+///
+/// A different promise from Bonferroni's, and usually the one wanted: it
+/// accepts that some findings will be wrong and bounds how many, rather than
+/// insisting none are. Far more power when many hypotheses are true.
+///
+/// The returned values are adjusted p-values in the original order, each
+/// forced to be no smaller than the one below it — without that monotonic
+/// step, a smaller raw p-value can come out with a larger adjusted one.
+pub fn benjamini_hochberg(p_values: [f64]) -> [f64] {
+    let n = p_values.len()
+    if n == 0 {
+        return []
+    }
+    var order: [i64] = []
+    for i in 0..n {
+        order.push(i)
+    }
+    for i in 0..n {
+        var best = i
+        for j in (i + 1)..n {
+            if p_values[order[j]] > p_values[order[best]] {
+                best = j
+            }
+        }
+        let t = order[i]
+        order[i] = order[best]
+        order[best] = t
+    }
+    var out: [f64] = []
+    for _i in 0..n {
+        out.push(0.0)
+    }
+    var running = 1.0
+    for position in 0..n {
+        let rank = (n - position).as_f64()
+        let index = order[position]
+        let adjusted = p_values[index] * n.as_f64() / rank
+        running = running.min(adjusted)
+        out[index] = running.min(1.0)
+    }
+    return out
+}
+
+/// Which of these p-values survive a correction at the given level.
+pub fn significant(adjusted: [f64], alpha: f64) -> [bool] {
+    var out: [bool] = []
+    for p in adjusted {
+        out.push(p <= alpha)
+    }
+    return out
+}

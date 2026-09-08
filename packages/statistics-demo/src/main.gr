@@ -1,0 +1,722 @@
+import distributions
+import hypothesis
+import regression
+import sampling
+import outliers
+import random
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn near(a: f64, b: f64, tolerance: f64) -> bool {
+    let d = a - b
+    return (if d < 0.0 { 0.0 - d } else { d }) <= tolerance
+}
+
+/// Two values agree to this many significant figures.
+fn near_relative(a: f64, b: f64, tolerance: f64) -> bool {
+    if b == 0.0 {
+        return near(a, 0.0, tolerance)
+    }
+    return near(a / b, 1.0, tolerance)
+}
+
+fn near_all(a: [f64], b: [f64], tolerance: f64) -> bool {
+    if a.len() != b.len() {
+        return false
+    }
+    for i in 0..a.len() {
+        if not near(a[i], b[i], tolerance) {
+            return false
+        }
+    }
+    return true
+}
+
+fn check_distributions(inout f: i64) / {io} {
+    print("-- distributions: the tail is computed, not subtracted")
+    // Every value here is scipy.stats' for the same arguments.
+    say(f, "lgamma of 5 is ln(24)",
+        near(distributions.lgamma(5.0), 3.1780538303479458, 0.0000000001))
+    say(f, "lgamma of a half is ln(sqrt(pi))",
+        near(distributions.lgamma(0.5), 0.5723649429247, 0.0000000001))
+    say(f, "and lgamma of 171, where gamma itself overflows",
+        near(distributions.lgamma(171.0), 706.5730622457875, 0.0000001))
+    say(f, "erf(1) is scipy's",
+        near(distributions.erf(1.0), 0.8427007929497148, 0.000000000001))
+    // The claim in the header, made testable: `1 - cdf` would give 0 here.
+    say(f, "erfc(6) keeps every digit at 2.15e-17",
+        near_relative(distributions.erfc(6.0), 0.00000000000000002151973671249891,
+            0.0000001))
+    say(f, "and 1 - erf(6) would have thrown them all away",
+        1.0 - distributions.erf(6.0) == 0.0)
+    say(f, "the normal CDF at 1.96 is 0.975",
+        near(distributions.normal_cdf(1.96, 0.0, 1.0) ?? 0.0,
+            0.9750021048517795, 0.0000000000001))
+    say(f, "its survival at 6 sigma is 9.87e-10, not zero",
+        near_relative(distributions.normal_survival(6.0, 0.0, 1.0) ?? 0.0,
+            0.0000000009865876450376944, 0.0000001))
+    say(f, "the density at 1 is scipy's",
+        near(distributions.normal_pdf(1.0, 0.0, 1.0) ?? 0.0,
+            0.24197072451914337, 0.0000000000001))
+    say(f, "the 97.5th percentile is 1.959963984540054",
+        near(distributions.normal_quantile(0.975, 0.0, 1.0) ?? 0.0,
+            1.959963984540054, 0.0000000001))
+    say(f, "and the quantile holds out at p = 1e-10",
+        near(distributions.normal_quantile(0.0000000001, 0.0, 1.0) ?? 0.0,
+            0.0 - 6.361340902404056, 0.0000001))
+    say(f, "a deviation of zero is refused",
+        normal_cdf_refuses(0.0) and not normal_cdf_refuses(1.0))
+    say(f, "and a probability outside 0..1 has no quantile",
+        quantile_refuses(1.0) and quantile_refuses(0.0))
+    check_distributions_more(f)
+}
+
+fn normal_cdf_refuses(deviation: f64) -> bool {
+    match distributions.normal_cdf(1.0, 0.0, deviation) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn quantile_refuses(p: f64) -> bool {
+    match distributions.normal_quantile(p, 0.0, 1.0) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn check_distributions_more(inout f: i64) / {io} {
+    say(f, "Student's t at 10 degrees of freedom is scipy's",
+        near(distributions.t_cdf(2.1, 10.0) ?? 0.0, 0.9689613778988907,
+            0.0000000000001) and
+        near(distributions.t_pdf(2.1, 10.0) ?? 0.0, 0.05216974260435501,
+            0.0000000000001))
+    say(f, "and its 97.5th percentile is the 2.228 of every table",
+        near(distributions.t_quantile(0.975, 10.0) ?? 0.0, 2.228138851986274,
+            0.0000000001))
+    say(f, "at one degree of freedom the tails are enormous",
+        near(distributions.t_quantile(0.975, 1.0) ?? 0.0, 12.706204736174694,
+            0.0000001))
+    say(f, "with many, t is the normal",
+        near(distributions.t_quantile(0.975, 100000.0) ?? 0.0,
+            distributions.normal_quantile(0.975, 0.0, 1.0) ?? 0.0, 0.0001))
+    say(f, "chi-square at one degree of freedom puts 3.8415 at 95%",
+        near(distributions.chi2_quantile(0.95, 1.0) ?? 0.0,
+            3.8414588206941205, 0.0000001) and
+        near(distributions.chi2_quantile(0.99, 7.0) ?? 0.0, 18.47530690658236,
+            0.0000001))
+    say(f, "and its far tail keeps its digits",
+        near_relative(distributions.chi2_survival(50.0, 10.0) ?? 0.0,
+            0.0000002669083424904495, 0.0000001))
+    say(f, "the F distribution's 95th percentile at (3, 12) is 3.4903",
+        near(distributions.f_quantile(0.95, 3.0, 12.0) ?? 0.0,
+            3.490294819497605, 0.000001))
+    say(f, "and its survival is the p-value an ANOVA reports",
+        near(distributions.f_survival(3.5, 3.0, 12.0) ?? 0.0,
+            0.04964053797988685, 0.0000000001))
+    say(f, "the binomial mass at 3 of 10 is scipy's",
+        near(distributions.binomial_pmf(3, 10, 0.3) ?? 0.0,
+            0.2668279319999998, 0.0000000000001))
+    say(f, "its CDF is inclusive of k",
+        near(distributions.binomial_cdf(3, 10, 0.3) ?? 0.0,
+            0.6496107184000002, 0.0000000000001))
+    say(f, "so the CDF and the survival add to one",
+        near((distributions.binomial_cdf(3, 10, 0.3) ?? 0.0) +
+            (distributions.binomial_survival(3, 10, 0.3) ?? 0.0), 1.0,
+            0.0000000000001))
+    say(f, "and 90 heads in 100 fair tosses is 1.66e-18",
+        near_relative(distributions.binomial_survival(90, 100, 0.5) ?? 0.0,
+            0.0000000000000000016610244897268262, 0.0000001))
+    say(f, "the Poisson tail at 30 for a rate of 2.5 is 2.35e-23",
+        near_relative(distributions.poisson_survival(30, 2.5) ?? 0.0,
+            0.000000000000000000000023475600844315997, 0.0000001))
+    say(f, "the exponential, gamma and beta CDFs are scipy's too",
+        near(distributions.exponential_cdf(2.0, 0.5) ?? 0.0,
+            0.6321205588285577, 0.0000000000001) and
+        near(distributions.gamma_cdf(3.0, 2.0, 1.5) ?? 0.0,
+            0.5939941502901616, 0.0000000000001) and
+        near(distributions.beta_cdf(0.3, 2.0, 5.0) ?? 0.0,
+            0.5798250000000003, 0.0000000000001))
+    say(f, "a chi-square is a gamma with scale 2",
+        near(distributions.chi2_cdf(7.0, 4.0) ?? 0.0,
+            distributions.gamma_cdf(7.0, 2.0, 2.0) ?? 0.0, 0.0000000000001))
+}
+
+fn left() -> [f64] {
+    return [5.1, 4.9, 6.2, 5.7, 5.5, 4.8, 6.0, 5.3, 5.9, 5.2]
+}
+
+fn right() -> [f64] {
+    return [6.1, 5.9, 7.0, 6.5, 6.2, 5.5, 6.8, 6.1, 7.1, 6.0]
+}
+
+fn empty_result() -> HypResult {
+    return HypResult{ statistic: 0.0, freedom: 0.0, p_value: 0.0 }
+}
+
+fn check_hypothesis(inout f: i64) / {io} {
+    print("-- hypothesis: Welch by default, and p-values that keep their digits")
+    let one = hypothesis.t_one_sample(left(), 5.0) ?? empty_result()
+    say(f, "a one-sample t-test is scipy's, statistic and p",
+        near(one.statistic, 3.037555626823401, 0.0000000001) and
+        near(one.p_value, 0.014073477032628593, 0.0000000001))
+    say(f, "with n - 1 degrees of freedom", one.freedom == 9.0)
+    let welch = hypothesis.t_two_sample(left(), right()) ?? empty_result()
+    say(f, "Welch's two-sample test matches scipy exactly",
+        near(welch.statistic, 0.0 - 3.8632452261188424, 0.0000000001) and
+        near(welch.p_value, 0.0011489396720418003, 0.0000000000001))
+    say(f, "and its degrees of freedom are fractional, as they should be",
+        near(welch.freedom, 17.90080744636089, 0.0000000001))
+    let pooled = hypothesis.t_two_sample_pooled(left(), right()) ??
+    empty_result()
+    say(f, "the pooled test gives whole degrees of freedom",
+        pooled.freedom == 18.0)
+    say(f, "and a different p-value from Welch's on the same data",
+        near(pooled.p_value, 0.0011389910988171949, 0.0000000000001) and
+        pooled.p_value != welch.p_value)
+    let paired = hypothesis.t_paired(left(), right()) ?? empty_result()
+    say(f, "the paired test is far more powerful on paired data",
+        near_relative(paired.p_value, 0.00000003352649678082065, 0.0000001) and
+        paired.p_value < welch.p_value / 1000.0)
+    let ci = hypothesis.mean_interval(left(), 0.95) ??
+    HypInterval{ low: 0.0, high: 0.0, level: 0.0 }
+    say(f, "the 95% interval for the mean is scipy's",
+        near(ci.low, 5.117424448231291, 0.0000000001) and
+        near(ci.high, 5.802575551768709, 0.0000000001))
+    say(f, "two values are too few for a variance-based test",
+        t_refuses([1.0]))
+    check_hypothesis_more(f)
+}
+
+fn t_refuses(xs: [f64]) -> bool {
+    match hypothesis.t_one_sample(xs, 0.0) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn check_hypothesis_more(inout f: i64) / {io} {
+    let good = hypothesis.chi2_goodness([16.0, 18.0, 16.0, 14.0, 12.0, 12.0],
+        [16.0, 16.0, 16.0, 16.0, 16.0, 8.0]) ?? empty_result()
+    say(f, "a chi-square goodness-of-fit is scipy's",
+        near(good.statistic, 3.5, 0.0000000001) and
+        near(good.p_value, 0.6233876277495822, 0.0000000001))
+    let table = hypothesis.chi2_independence([[10.0, 20.0, 30.0],
+        [6.0, 9.0, 17.0]]) ?? empty_result()
+    say(f, "and a contingency table matches scipy without Yates' correction",
+        near(table.statistic, 0.27157465150403504, 0.0000000001) and
+        near(table.p_value, 0.873028283380073, 0.0000000001) and
+        table.freedom == 2.0)
+    let anova = hypothesis.anova_one_way([[1.0, 2.0, 3.0, 4.0],
+        [2.0, 3.0, 4.0, 5.5], [5.0, 6.0, 7.0, 8.0]]) ?? empty_result()
+    say(f, "one-way ANOVA is scipy's f_oneway",
+        near(anova.statistic, 9.179775280898886, 0.0000000001) and
+        near(anova.p_value, 0.006715849843667261, 0.0000000001))
+    let mwu = hypothesis.mann_whitney(left(), right()) ?? empty_result()
+    say(f, "Mann-Whitney matches scipy's asymptotic method",
+        near(mwu.statistic, 11.0, 0.0000000001) and
+        near(mwu.p_value, 0.0035476368385179754, 0.0000000001))
+    let wil = hypothesis.wilcoxon(left(), right()) ?? empty_result()
+    say(f, "and Wilcoxon's signed rank does too",
+        near(wil.statistic, 0.0, 0.0000000001) and
+        near(wil.p_value, 0.005233909190788299, 0.0000000001))
+    say(f, "ties share the average of the ranks they span",
+        near_all(hypothesis.ranks_of([3.0, 1.0, 4.0, 1.0, 5.0, 9.0, 2.0, 6.0]),
+            [4.0, 1.5, 5.0, 1.5, 6.0, 8.0, 3.0, 7.0], 0.0000000001))
+    let pear = hypothesis.pearson(left(), right()) ?? empty_result()
+    say(f, "Pearson's r and its p-value are scipy's",
+        near(pear.statistic, 0.9524182363606257, 0.0000000001) and
+        near_relative(pear.p_value, 0.00002117016518649724, 0.0000001))
+    let spear = hypothesis.spearman(left(), right()) ?? empty_result()
+    say(f, "so are Spearman's",
+        near(spear.statistic, 0.9422535927041001, 0.0000000001) and
+        near_relative(spear.p_value, 0.0000453586982271117, 0.0000001))
+    say(f, "an exact binomial test is not a doubled one-sided one",
+        near((hypothesis.binomial_test(3, 10, 0.1) ?? empty_result()).p_value,
+            0.0701908264, 0.0000000001))
+    say(f, "and at p = 0.5 it is symmetric",
+        near((hypothesis.binomial_test(7, 20, 0.5) ?? empty_result()).p_value,
+            0.26317596435546875, 0.0000000001))
+    // The correction nobody applies.
+    say(f, "Bonferroni multiplies by the number of tests",
+        near_all(hypothesis.bonferroni([0.01, 0.02, 0.9]), [0.03, 0.06, 1.0],
+            0.0000000001))
+    say(f, "Benjamini-Hochberg is scipy's false_discovery_control",
+        near_all(hypothesis.benjamini_hochberg([0.01, 0.02, 0.03, 0.04, 0.05,
+            0.9]), [0.06, 0.06, 0.06, 0.06, 0.06, 0.9], 0.0000000001))
+    say(f, "and it keeps five findings where Bonferroni keeps none",
+        count_true(hypothesis.significant(
+            hypothesis.benjamini_hochberg([0.001, 0.002, 0.003, 0.004, 0.005,
+                0.9]), 0.05)) == 5 and
+        count_true(hypothesis.significant(
+            hypothesis.bonferroni([0.02, 0.03, 0.04, 0.045, 0.048, 0.9]),
+            0.05)) == 0)
+}
+
+fn count_true(xs: [bool]) -> i64 {
+    var n = 0
+    for x in xs {
+        if x {
+            n = n + 1
+        }
+    }
+    return n
+}
+
+fn xs() -> [f64] {
+    return [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]
+}
+
+fn ys() -> [f64] {
+    return [2.1, 4.2, 5.9, 8.4, 9.8, 12.5, 13.9, 16.2, 18.4, 19.9]
+}
+
+fn rows() -> [[f64]] {
+    return [[1.0, 2.0], [2.0, 1.0], [3.0, 4.0], [4.0, 3.0], [5.0, 7.0],
+        [6.0, 5.0], [7.0, 9.0], [8.0, 6.0], [9.0, 11.0], [10.0, 8.0]]
+}
+
+fn empty_line() -> RegLine {
+    return RegLine{ slope: 0.0, intercept: 0.0, correlation: 0.0,
+        r_squared: 0.0, slope_error: 0.0, intercept_error: 0.0, p_value: 0.0,
+        freedom: 0.0, residual_deviation: 0.0 }
+}
+
+fn empty_model() -> RegModel {
+    return RegModel{ coefficient: [], standard_error: [], t_statistic: [],
+        p_value: [], r_squared: 0.0, adjusted_r_squared: 0.0,
+        residual_deviation: 0.0, freedom: 0.0, has_intercept: true }
+}
+
+fn check_regression(inout f: i64) / {io} {
+    print("-- regression: a slope on its own is not a result")
+    let line = regression.linear(xs(), ys()) ?? empty_line()
+    say(f, "the slope and intercept are scipy's linregress",
+        near(line.slope, 2.0018181818181815, 0.0000000001) and
+        near(line.intercept, 0.12000000000000277, 0.0000000001))
+    say(f, "so is the standard error of the slope",
+        near(line.slope_error, 0.029147671894331435, 0.0000000001))
+    say(f, "and the p-value, at 2.25e-12",
+        near_relative(line.p_value, 0.000000000002249067068499342, 0.0000001))
+    say(f, "and the intercept's own error",
+        near(line.intercept_error, 0.18085654787453662, 0.0000000001))
+    say(f, "the residual deviation is statsmodels'",
+        near(line.residual_deviation, 0.2647468773959553, 0.0000000001))
+    say(f, "the correlation squared is R squared",
+        near(line.r_squared, line.correlation * line.correlation,
+            0.0000000000001))
+    let mean_band = regression.mean_interval(line, xs(), 5.0, 0.95) ??
+    RegInterval{ low: 0.0, high: 0.0, level: 0.0 }
+    let single = regression.prediction_interval(line, xs(), 5.0, 0.95) ??
+    RegInterval{ low: 0.0, high: 0.0, level: 0.0 }
+    say(f, "the interval for the mean response is statsmodels'",
+        near(mean_band.low, 9.933128208104055, 0.0000000001) and
+        near(mean_band.high, 10.325053610077756, 0.0000000001))
+    say(f, "and so is the interval for the next observation",
+        near(single.low, 9.487903995331044, 0.0000000001) and
+        near(single.high, 10.770277822850767, 0.0000000001))
+    say(f, "which is the wider of the two, always",
+        single.high - single.low > mean_band.high - mean_band.low)
+    // Robustness, made visible.
+    let dirty = [2.1, 4.2, 5.9, 8.4, 9.8, 12.5, 13.9, 16.2, 18.4, 90.0]
+    say(f, "one bad point triples the least-squares slope",
+        near((regression.linear(xs(), dirty) ?? empty_line()).slope,
+            5.825454545454546, 0.0000000001))
+    say(f, "and moves Theil-Sen's by four percent",
+        near((regression.theil_sen(xs(), dirty) ?? empty_line()).slope, 2.075,
+            0.0000000001))
+    say(f, "which on clean data agrees with scipy's theilslopes",
+        near((regression.theil_sen(xs(), ys()) ?? empty_line()).slope, 2.0,
+            0.0000000001) and
+        near((regression.theil_sen(xs(), ys()) ?? empty_line()).intercept,
+            0.15000000000000036, 0.0000000001))
+    check_regression_more(f)
+}
+
+fn check_regression_more(inout f: i64) / {io} {
+    let model = regression.multiple(rows(), ys(), true) ?? empty_model()
+    say(f, "multiple regression matches statsmodels' OLS coefficients",
+        near_all(model.coefficient, [0.150135135135138, 2.047477477477477,
+            0.0 - 0.050225225225224], 0.0000000001))
+    say(f, "and its standard errors",
+        near_all(model.standard_error, [0.18539150536426, 0.057453396633067,
+            0.054288356952519], 0.0000000001))
+    say(f, "and its t statistics and p-values",
+        near(model.t_statistic[1], 35.637187659311444, 0.0000000001) and
+        near_relative(model.p_value[1], 0.000000003556510567867486, 0.0000001))
+    say(f, "R squared and its adjusted form are statsmodels'",
+        near(model.r_squared, 0.9984912621500264, 0.0000000000001) and
+        near(model.adjusted_r_squared, 0.998060194192891, 0.0000000000001))
+    say(f, "adjusted R squared is the smaller of the two",
+        model.adjusted_r_squared < model.r_squared)
+    say(f, "a prediction runs the row through the coefficients",
+        near(regression.predict_multiple(model, [5.0, 7.0]) ?? 0.0,
+            model.coefficient[0] + model.coefficient[1] * 5.0 +
+            model.coefficient[2] * 7.0, 0.0000000001))
+    say(f, "the Durbin-Watson statistic is statsmodels'",
+        near(regression.durbin_watson(
+            regression.residuals(model, rows(), ys()) ?? []) ?? 0.0,
+            3.132179703572353, 0.0000000001))
+    say(f, "and the variance inflation factor is too",
+        near(regression.variance_inflation(rows(), 0) ?? 0.0,
+            3.8153153153153148, 0.0000000001))
+    // Logistic.
+    let labels = [0.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0]
+    let fit = regression.logistic(rows(), labels, true) ?? empty_logistic()
+    say(f, "logistic regression matches statsmodels' Logit coefficients",
+        near_all(fit.coefficient, [0.0 - 1.742696797467127, 0.123507536538016,
+            0.189932302778389], 0.0000001))
+    say(f, "its log-likelihood",
+        near(fit.log_likelihood, 0.0 - 6.071548412536085, 0.0000001))
+    say(f, "its Wald standard errors",
+        near_all(fit.standard_error, [1.607534481126031, 0.4649838003187,
+            0.449277434174707], 0.0000001))
+    say(f, "and the probability it gives a row",
+        near(regression.logistic_probability(fit, [5.0, 6.0]) ?? 0.0,
+            0.5036086128158064, 0.0000001))
+    say(f, "it converged, and says how many steps it took",
+        fit.converged and fit.iterations < 20)
+    // The failure that has to be reported rather than hidden.
+    let separable = [0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+    let runaway = regression.logistic(rows(), separable, true) ??
+    empty_logistic()
+    say(f, "perfectly separable classes have no finite fit, and it says so",
+        not runaway.converged)
+    say(f, "even though the likelihood looks perfect",
+        runaway.log_likelihood > 0.0 - 0.001)
+    say(f, "and a label that is not 0 or 1 is refused",
+        logistic_refuses([0.0, 2.0, 1.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0]))
+    say(f, "the odds ratio is the coefficient out of the log-odds scale",
+        near(regression.odds_ratio(fit, 1) ?? 0.0,
+            fit.coefficient[1].exp(), 0.0000000001))
+}
+
+fn empty_logistic() -> RegLogistic {
+    return RegLogistic{ coefficient: [], standard_error: [], z_statistic: [],
+        p_value: [], iterations: 0, converged: false, log_likelihood: 0.0,
+        has_intercept: true }
+}
+
+fn logistic_refuses(labels: [f64]) -> bool {
+    match regression.logistic(rows(), labels, true) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn mean_of(vs: [f64]) -> f64 {
+    var t = 0.0
+    for v in vs {
+        t = t + v
+    }
+    return t / vs.len().as_f64()
+}
+
+fn median_of(vs: [f64]) -> f64 {
+    return outliers.median_of(vs) ?? 0.0
+}
+
+fn mean_gap(a: [f64], b: [f64]) -> f64 {
+    return mean_of(a) - mean_of(b)
+}
+
+fn check_sampling(inout f: i64) / {io} {
+    print("-- sampling: an alias table, and resampling instead of a formula")
+    var r = random.seeded(20260908)
+    let table = sampling.alias_table([1.0, 2.0, 3.0, 4.0]) ??
+    SampleAlias{ probability: [], alternative: [] }
+    var counts = [0, 0, 0, 0]
+    for _i in 0..40000 {
+        let k = sampling.alias_draw(r, table)
+        counts[k] = counts[k] + 1
+    }
+    say(f, "40,000 alias draws land within half a percent of 1:2:3:4",
+        within(counts[0], 4000, 400) and within(counts[1], 8000, 500) and
+        within(counts[2], 12000, 600) and within(counts[3], 16000, 700))
+    say(f, "a scan-based draw agrees with the table",
+        within(scan_count(r, 20000), 8000, 400))
+    say(f, "weights that are all zero have no distribution",
+        alias_refuses([0.0, 0.0]) and alias_refuses([]))
+    say(f, "and a negative weight is refused",
+        alias_refuses([1.0, 0.0 - 1.0]))
+    // The generators, against their own distributions.
+    var normals: [f64] = []
+    for _i in 0..20000 {
+        normals.push(sampling.normal(r, 3.0, 2.0) ?? 0.0)
+    }
+    say(f, "20,000 normal draws have the mean and variance asked for",
+        near(mean_of(normals), 3.0, 0.05) and
+        near(variance_of(normals), 4.0, 0.15))
+    say(f, "and their median sits at the mean, as a normal's does",
+        near(median_of(normals), 3.0, 0.06))
+    var exponentials: [f64] = []
+    for _i in 0..20000 {
+        exponentials.push(sampling.exponential(r, 0.4) ?? 0.0)
+    }
+    say(f, "exponential draws have mean 1/rate and variance 1/rate squared",
+        near(mean_of(exponentials), 2.5, 0.06) and
+        near(variance_of(exponentials), 6.25, 0.5))
+    var gammas: [f64] = []
+    for _i in 0..20000 {
+        gammas.push(sampling.gamma(r, 2.5, 1.5) ?? 0.0)
+    }
+    say(f, "gamma draws have mean shape*scale and variance shape*scale squared",
+        near(mean_of(gammas), 3.75, 0.06) and
+        near(variance_of(gammas), 5.625, 0.3))
+    say(f, "and a shape below one is handled by the boost step",
+        near(mean_of(small_shape(r)), 0.75, 0.05))
+    check_sampling_more(f, r)
+}
+
+fn small_shape(inout r: Rng) -> [f64] {
+    var out: [f64] = []
+    for _i in 0..20000 {
+        out.push(sampling.gamma(r, 0.5, 1.5) ?? 0.0)
+    }
+    return out
+}
+
+fn scan_count(inout r: Rng, rounds: i64) -> i64 {
+    var n = 0
+    for _i in 0..rounds {
+        if (sampling.weighted_index(r, [1.0, 2.0, 3.0, 4.0]) ?? 0) == 3 {
+            n = n + 1
+        }
+    }
+    return n
+}
+
+fn within(got: i64, want: i64, slack: i64) -> bool {
+    let d = got - want
+    return (if d < 0 { 0 - d } else { d }) <= slack
+}
+
+fn variance_of(vs: [f64]) -> f64 {
+    let m = mean_of(vs)
+    var total = 0.0
+    for v in vs {
+        total = total + (v - m) * (v - m)
+    }
+    return total / (vs.len() - 1).as_f64()
+}
+
+fn alias_refuses(weights: [f64]) -> bool {
+    match sampling.alias_table(weights) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn check_sampling_more(inout f: i64, inout r: Rng) / {io} {
+    var poissons: [f64] = []
+    for _i in 0..20000 {
+        poissons.push((sampling.poisson(r, 4.0) ?? 0).as_f64())
+    }
+    say(f, "a Poisson's variance equals its mean, which is its signature",
+        near(mean_of(poissons), 4.0, 0.06) and
+        near(variance_of(poissons), 4.0, 0.15))
+    var binomials: [f64] = []
+    for _i in 0..20000 {
+        binomials.push((sampling.binomial(r, 10, 0.3) ?? 0).as_f64())
+    }
+    say(f, "a binomial's are n*p and n*p*(1-p)",
+        near(mean_of(binomials), 3.0, 0.05) and
+        near(variance_of(binomials), 2.1, 0.08))
+    // Without replacement.
+    let drawn = sampling.without_replacement(r, [1, 2, 3, 4, 5, 6, 7, 8], 4) ??
+    []
+    say(f, "four drawn without replacement are four distinct items",
+        drawn.len() == 4 and all_distinct(drawn))
+    say(f, "asking for more than there are is refused",
+        without_refuses(9))
+    say(f, "a systematic sample spreads across the whole list",
+        (sampling.systematic(r, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 5) ??
+            []).len() == 5)
+    say(f, "a stratified sample takes from every group",
+        (sampling.stratified(r, [[1, 2, 3], [4, 5, 6], [7, 8, 9]], 2) ??
+            []).len() == 6)
+    // Weighted, without replacement: the heavy item is in most samples.
+    var heavy = 0
+    for _i in 0..4000 {
+        for k in sampling.weighted_without_replacement(r,
+            [1.0, 1.0, 1.0, 1.0, 6.0], 2) ?? [] {
+            if k == 4 {
+                heavy = heavy + 1
+            }
+        }
+    }
+    say(f, "the heavy item appears in 87% of weighted pairs, as the design says",
+        within(heavy, 3467, 120))
+    // Resampling, which is why this package exists.
+    let data = [2.0, 3.0, 5.0, 7.0, 11.0, 13.0, 17.0, 19.0, 23.0, 29.0]
+    let band = sampling.bootstrap_interval(r, data, median_of, 4000, 0.95) ??
+    SampleInterval{ low: 0.0, high: 0.0, level: 0.0, rounds: 0 }
+    say(f, "a bootstrap gives the median an interval it has no formula for",
+        band.low >= 3.0 and band.high <= 23.0 and band.low < band.high)
+    say(f, "and a standard error for the mean close to the textbook one",
+        near(sampling.bootstrap_error(r, data, mean_of, 4000) ?? 0.0,
+            (variance_of(data) / data.len().as_f64()).sqrt(), 0.4))
+    let perm = sampling.permutation_test(r, [1.0, 2.0, 3.0, 4.0, 5.0],
+        [6.0, 7.0, 8.0, 9.0, 10.0], mean_gap, 2000) ??
+    SampleTest{ observed: 0.0, p_value: 0.0, rounds: 0 }
+    say(f, "a permutation test finds the separation it should",
+        near(perm.observed, 0.0 - 5.0, 0.0000000001) and perm.p_value < 0.02)
+    say(f, "and can never report exactly zero", perm.p_value > 0.0)
+}
+
+fn all_distinct(xs: [i64]) -> bool {
+    for i in 0..xs.len() {
+        for j in (i + 1)..xs.len() {
+            if xs[i] == xs[j] {
+                return false
+            }
+        }
+    }
+    return true
+}
+
+fn without_refuses(count: i64) -> bool {
+    var r = random.seeded(1)
+    match sampling.without_replacement(r, [1, 2, 3, 4, 5, 6, 7, 8], count) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn dirty_sample() -> [f64] {
+    return [2.0, 3.0, 4.0, 4.0, 5.0, 5.0, 6.0, 6.0, 7.0, 40.0]
+}
+
+/// The 54 measurements from the NIST/SEMATECH e-Handbook's ESD example.
+fn nist() -> [f64] {
+    return [0.0 - 0.25, 0.68, 0.94, 1.15, 1.20, 1.26, 1.26, 1.34, 1.38, 1.43,
+        1.49, 1.49, 1.55, 1.56, 1.58, 1.65, 1.69, 1.70, 1.76, 1.77, 1.81,
+        1.91, 1.94, 1.96, 1.99, 2.06, 2.09, 2.10, 2.14, 2.15, 2.23, 2.24,
+        2.26, 2.35, 2.37, 2.40, 2.47, 2.54, 2.62, 2.64, 2.90, 2.92, 2.92,
+        2.93, 3.21, 3.26, 3.30, 3.59, 3.68, 4.30, 4.64, 5.34, 5.42, 6.01]
+}
+
+fn check_outliers(inout f: i64) / {io} {
+    print("-- outliers: a z-score cannot see the point inflating it")
+    say(f, "the quartiles are numpy's linear-interpolation ones",
+        near(outliers.quantile(dirty_sample(), 0.25) ?? 0.0, 4.0, 0.0000000001)
+        and near(outliers.quantile(dirty_sample(), 0.75) ?? 0.0, 6.0,
+            0.0000000001) and
+        near(outliers.interquartile_range(dirty_sample()) ?? 0.0, 2.0,
+            0.0000000001))
+    say(f, "the MAD is scipy's median_abs_deviation",
+        near(outliers.mad(dirty_sample()) ?? 0.0, 1.0, 0.0000000001))
+    say(f, "and its normal scaling is scipy's too",
+        near(outliers.deviation_robust(dirty_sample()) ?? 0.0,
+            1.482602218505602, 0.0000000001))
+    say(f, "which is a tenth of the standard deviation the outlier produced",
+        near(outliers.deviation_of(dirty_sample()) ?? 0.0,
+            11.272385136547928, 0.0000000001))
+    // The masking claim, made testable.
+    say(f, "the outlier's own z-score is 2.82",
+        near((outliers.z_scores(dirty_sample()) ?? [])[9], 2.82105336, 0.000001))
+    say(f, "so a threshold of 3 finds nothing",
+        (outliers.by_z(dirty_sample(), 3.0) ?? [0]).len() == 0)
+    say(f, "and at n = 10 no z-score can ever reach 3",
+        near(outliers.z_ceiling(10), 2.846049894151541, 0.0000000001) and
+        outliers.z_ceiling(10) < 3.0)
+    say(f, "the modified z-score sees it at 23.6",
+        near((outliers.modified_z(dirty_sample()) ?? [])[9], 23.60714125686286,
+            0.0000001))
+    say(f, "and flags it at the conventional 3.5",
+        (outliers.by_modified_z(dirty_sample(), 3.5) ?? []) == [9])
+    let fence = outliers.tukey_fences(dirty_sample(), 1.5) ??
+    OutFence{ low: 0.0, high: 0.0, first_quartile: 0.0,
+        third_quartile: 0.0, multiplier: 0.0 }
+    say(f, "Tukey's fences sit at 1 and 9",
+        near(fence.low, 1.0, 0.0000000001) and
+        near(fence.high, 9.0, 0.0000000001))
+    say(f, "and catch it too", (outliers.by_tukey(dirty_sample(), 1.5) ?? []) ==
+        [9])
+    check_outliers_more(f)
+}
+
+fn check_outliers_more(inout f: i64) / {io} {
+    let g = outliers.grubbs(dirty_sample(), 0.05) ??
+    OutTest{ statistic: 0.0, critical: 0.0, index: 0, value: 0.0,
+        is_outlier: false, alpha: 0.0 }
+    say(f, "Grubbs' test finds the single outlier",
+        g.is_outlier and g.index == 9 and near(g.value, 40.0, 0.0000000001))
+    say(f, "against the critical value for ten points at 5%",
+        near(g.critical, 2.2899540844796022, 0.0000000001))
+    say(f, "which for 54 points is 3.1588",
+        near(outliers.grubbs_critical(54, 0.05) ?? 0.0, 3.1587939408875045,
+            0.0000000001))
+    // The NIST worked example, statistic by statistic.
+    let steps = outliers.generalised_esd(nist(), 10, 0.05) ?? []
+    say(f, "the ESD test runs ten removals on the NIST data", steps.len() == 10)
+    say(f, "R1 is 3.118 against a lambda of 3.159 — not significant alone",
+        near(steps[0].statistic, 3.1189, 0.0001) and
+        near(steps[0].critical, 3.1588, 0.0001) and
+        steps[0].statistic < steps[0].critical)
+    say(f, "R2 is 2.943, further below its lambda",
+        near(steps[1].statistic, 2.9430, 0.0001) and
+        steps[1].statistic < steps[1].critical)
+    say(f, "and R3 is 3.179, which finally clears 3.144",
+        near(steps[2].statistic, 3.1794, 0.0001) and
+        near(steps[2].critical, 3.1439, 0.0001) and
+        steps[2].statistic > steps[2].critical)
+    say(f, "so the answer is three outliers — the NIST handbook's answer",
+        (outliers.esd_outliers(nist(), 10, 0.05) ?? []).len() == 3)
+    say(f, "and they are the three largest values",
+        near(nist()[(outliers.esd_outliers(nist(), 10, 0.05) ?? [0])[0]], 6.01,
+            0.0000000001))
+    say(f, "which includes the two whose own statistic never cleared its bar",
+        steps[0].statistic < steps[0].critical and
+        steps[1].statistic < steps[1].critical)
+    say(f, "Grubbs alone would have found none of them",
+        not (outliers.grubbs(nist(), 0.05) ??
+            OutTest{ statistic: 0.0, critical: 0.0, index: 0, value: 0.0,
+                is_outlier: true, alpha: 0.0 }).is_outlier)
+    // Treatment.
+    say(f, "winsorising replaces the extremes with values that were there",
+        near_all(outliers.winsorise(dirty_sample(), 0.1) ?? [],
+            [3.0, 3.0, 4.0, 4.0, 5.0, 5.0, 6.0, 6.0, 7.0, 7.0], 0.0000000001))
+    say(f, "and keeps the sample size",
+        (outliers.winsorise(dirty_sample(), 0.1) ?? []).len() == 10)
+    say(f, "trimming drops them and does not",
+        (outliers.trim(dirty_sample(), 0.1) ?? []).len() == 8)
+    say(f, "the trimmed mean is scipy's trim_mean",
+        near(outliers.trimmed_mean(dirty_sample(), 0.1) ?? 0.0, 5.0,
+            0.0000000001))
+    say(f, "and dropping the flagged index leaves nine clean values",
+        (outliers.without(dirty_sample(),
+            outliers.by_tukey(dirty_sample(), 1.5) ?? [])).len() == 9)
+    say(f, "a constant list has no spread to measure against",
+        modified_z_refuses([2.0, 2.0, 2.0, 2.0]))
+}
+
+fn modified_z_refuses(xs: [f64]) -> bool {
+    match outliers.modified_z(xs) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn main() / {io} {
+    var f = 0
+
+    check_distributions(f)
+    check_hypothesis(f)
+    check_regression(f)
+    check_sampling(f)
+    check_outliers(f)
+
+    if f == 0 {
+        print("statistics: every claim held")
+    } else {
+        print("statistics: {f} failed")
+    }
+}
