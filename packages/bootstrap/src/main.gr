@@ -1,0 +1,369 @@
+// The bootstrap: what a statistic would have done on the samples you did
+// not take.
+//
+// You have one sample and one number computed from it — a median, a
+// correlation, the 90th percentile of a latency. You want an interval. For a
+// mean there is a formula; for a median there is not, and for "the ratio of
+// the 95th percentile to the median" there certainly is not.
+//
+// The bootstrap's answer is to treat the sample as the population: draw from
+// it with replacement, recompute the statistic, and do that a few thousand
+// times. The spread of those numbers stands in for the spread the statistic
+// would have had across real samples.
+//
+// ## Why the naive interval is wrong, and by how much
+//
+// Taking the 2.5th and 97.5th percentiles of the bootstrap distribution —
+// the percentile interval — is the obvious move and is biased whenever the
+// statistic is skewed or its standard error depends on its value. For a
+// variance or a correlation that is always. The error does not shrink at the
+// usual rate: it is O(1/sqrt(n)) rather than O(1/n).
+//
+// BCa fixes both with two numbers computed from the data. The bias
+// correction `z0` measures how far the bootstrap distribution sits from the
+// observed value; the acceleration `a` measures how fast the standard error
+// changes with the value, estimated by jackknife. The interval is then read
+// off at shifted percentiles.
+//
+// ## What it cannot do
+//
+// The bootstrap resamples the sample, so it inherits everything the sample
+// got wrong. A biased sample bootstraps to a confident, biased interval. It
+// also fails for statistics that depend on the extreme order statistics —
+// the maximum most of all, whose bootstrap distribution is a spike at the
+// sample maximum and has nothing to do with the population's.
+//
+// ## What this package holds
+//
+// The interval arithmetic is separated from the resampling on purpose: given
+// a bootstrap distribution from anywhere, the intervals can be computed and
+// compared against another implementation exactly, which is how the numbers
+// here were checked.
+
+import distributions
+import random
+
+type BootError =
+    | Empty()
+    | TooFewResamples(count: i64)
+    | BadLevel(level: f64)
+    | Degenerate(reason: str)
+
+    /// An interval and how it was arrived at.
+type BootInterval = {
+    low: f64,
+    high: f64,
+    /// `percentile`, `basic`, `bca` or `normal`.
+    method: str,
+    /// The two percentiles actually read off the distribution, which for
+    /// BCa are not symmetric.
+    low_percentile: f64,
+    high_percentile: f64,
+}
+
+/// The pieces BCa needs, kept separate so each can be checked on its own.
+type BootSample = {
+    observed: f64,
+    distribution: [f64],
+    /// Leave-one-out values of the statistic, for the acceleration.
+    jackknife: [f64],
+}
+
+/// The percentile of a sorted sample, interpolating linearly between the two
+/// neighbouring order statistics.
+///
+/// This is the "linear" method, the default nearly everywhere, and the
+/// choice matters: the seven other definitions in common use disagree by up
+/// to one whole order statistic in the tails, which is exactly where a
+/// bootstrap interval is read.
+pub fn percentile_of(xs: [f64], q: f64) -> f64 ! BootError {
+    if xs.len() == 0 {
+        fail(Empty())
+    }
+    if q < 0.0 or q > 100.0 {
+        fail(BadLevel(q))
+    }
+    let sorted = sorted_of(xs)
+    let position = q / 100.0 * (sorted.len() - 1).as_f64()
+    let below = position.floor()
+    let above = position.ceil()
+    if below == above {
+        return sorted[below.as_i64()]
+    }
+    let weight = position - below
+    return sorted[below.as_i64()] * (1.0 - weight) +
+    sorted[above.as_i64()] * weight
+}
+
+fn sorted_of(xs: [f64]) -> [f64] {
+    var out = xs
+    var i = 1
+    while i < out.len() {
+        let value = out[i]
+        var j = i - 1
+        while j >= 0 and out[j] > value {
+            out[j + 1] = out[j]
+            j = j - 1
+        }
+        out[j + 1] = value
+        i = i + 1
+    }
+    return out
+}
+
+/// The mean of a list, or zero for an empty one.
+pub fn mean_of(xs: [f64]) -> f64 {
+    if xs.len() == 0 {
+        return 0.0
+    }
+    var total = 0.0
+    for x in xs {
+        total = total + x
+    }
+    return total / xs.len().as_f64()
+}
+
+/// The standard error of a statistic: the standard deviation of its
+/// bootstrap distribution, with the n-1 divisor.
+pub fn standard_error(distribution: [f64]) -> f64 ! BootError {
+    if distribution.len() < 2 {
+        fail(TooFewResamples(distribution.len()))
+    }
+    let centre = mean_of(distribution)
+    var total = 0.0
+    for value in distribution {
+        total = total + (value - centre) * (value - centre)
+    }
+    return (total / (distribution.len() - 1).as_f64()).sqrt()
+}
+
+/// How far the bootstrap distribution's centre sits from the observed value.
+///
+/// A large bias is not a reason to correct the estimate by subtracting it:
+/// the correction has a variance of its own and usually costs more than it
+/// saves. It is a reason to distrust the statistic.
+pub fn bias(distribution: [f64], observed: f64) -> f64 {
+    return mean_of(distribution) - observed
+}
+
+/// Where the observed value sits in its own bootstrap distribution, put
+/// through the normal quantile: BCa's `z0`.
+///
+/// Efron wrote this as the proportion strictly below the estimate, which is
+/// right for a continuous distribution and wrong for the ones that actually
+/// arise. A median, a quantile, any statistic that reads an order statistic:
+/// its bootstrap distribution is a handful of distinct values repeated
+/// hundreds of times, and a seventh of the resamples can land exactly on the
+/// estimate. Counting those as below or as not below moves the whole
+/// interval. The mid-p convention — half of the ties — is what a discrete
+/// distribution needs and what every implementation worth comparing against
+/// does.
+pub fn bias_correction(distribution: [f64],
+    observed: f64) -> f64 ! BootError {
+    if distribution.len() == 0 {
+        fail(Empty())
+    }
+    var below = 0
+    var not_above = 0
+    for value in distribution {
+        if value < observed {
+            below = below + 1
+        }
+        if value <= observed {
+            not_above = not_above + 1
+        }
+    }
+    let proportion = (below + not_above).as_f64() /
+    (2 * distribution.len()).as_f64()
+    if proportion <= 0.0 or proportion >= 1.0 {
+        // Every resample landed on one side of the observed value, so the
+        // shift BCa wants is infinite. The usual cause is a statistic that
+        // is constant on the sample — a median of tied values, say.
+        fail(Degenerate("every resample fell on one side of the estimate"))
+    }
+    return distributions.normal_quantile(proportion, 0.0, 1.0) ?? 0.0
+}
+
+/// Leave-one-out values of a statistic.
+pub fn jackknife(sample: [f64], statistic: fn([f64]) -> f64) -> [f64] {
+    var out: [f64] = []
+    var i = 0
+    while i < sample.len() {
+        var without: [f64] = []
+        var j = 0
+        while j < sample.len() {
+            if j != i {
+                without.push(sample[j])
+            }
+            j = j + 1
+        }
+        out.push(statistic(without))
+        i = i + 1
+    }
+    return out
+}
+
+/// BCa's acceleration `a`, the skewness of the jackknife values.
+///
+/// It is zero when the statistic's standard error does not depend on its
+/// value, which is why a mean's BCa interval and its percentile interval
+/// differ only by the bias correction.
+pub fn acceleration(jackknife_values: [f64]) -> f64 ! BootError {
+    if jackknife_values.len() < 2 {
+        fail(TooFewResamples(jackknife_values.len()))
+    }
+    let centre = mean_of(jackknife_values)
+    var cubes = 0.0
+    var squares = 0.0
+    for value in jackknife_values {
+        let gap = centre - value
+        cubes = cubes + gap * gap * gap
+        squares = squares + gap * gap
+    }
+    if squares == 0.0 {
+        // Every leave-one-out value is the same, so there is no skewness to
+        // measure and no correction to make.
+        return 0.0
+    }
+    return cubes / (6.0 * (squares.sqrt() * squares.sqrt() * squares.sqrt()))
+}
+
+fn check_level(level: f64) -> f64 ! BootError {
+    if level <= 0.0 or level >= 1.0 {
+        fail(BadLevel(level))
+    }
+    return 1.0 - level
+}
+
+/// The percentile interval: the two quantiles of the bootstrap distribution.
+///
+/// The one everybody writes first, and the one that is wrong for any skewed
+/// statistic.
+pub fn percentile_interval(distribution: [f64],
+    level: f64) -> BootInterval ! BootError {
+    let alpha = try check_level(level)
+    let low = alpha / 2.0 * 100.0
+    let high = (1.0 - alpha / 2.0) * 100.0
+    return BootInterval{ low: try percentile_of(distribution, low),
+        high: try percentile_of(distribution, high), method: "percentile",
+        low_percentile: low, high_percentile: high }
+}
+
+/// The basic interval: the percentile interval reflected through the
+/// estimate.
+///
+/// It corrects for bias in the opposite direction to the percentile
+/// interval, which is why the two bracket the truth between them and why
+/// neither is trustworthy alone.
+pub fn basic_interval(distribution: [f64], observed: f64,
+    level: f64) -> BootInterval ! BootError {
+    let inner = try percentile_interval(distribution, level)
+    return BootInterval{ low: 2.0 * observed - inner.high,
+        high: 2.0 * observed - inner.low, method: "basic",
+        low_percentile: inner.low_percentile,
+        high_percentile: inner.high_percentile }
+}
+
+/// The normal-approximation interval: the estimate plus or minus a multiple
+/// of the bootstrap standard error.
+pub fn normal_interval(distribution: [f64], observed: f64,
+    level: f64) -> BootInterval ! BootError {
+    let alpha = try check_level(level)
+    let error = try standard_error(distribution)
+    let z = distributions.normal_quantile(1.0 - alpha / 2.0, 0.0, 1.0) ?? 0.0
+    return BootInterval{ low: observed - z * error,
+        high: observed + z * error, method: "normal",
+        low_percentile: alpha / 2.0 * 100.0,
+        high_percentile: (1.0 - alpha / 2.0) * 100.0 }
+}
+
+/// The bias-corrected and accelerated interval.
+///
+/// The percentiles it reads are shifted by the bias correction and stretched
+/// by the acceleration, so they are not symmetric about the middle and one
+/// of them can be pushed past the end of the distribution — which is the
+/// signal that there were too few resamples for the level asked for.
+pub fn bca_interval(sample: BootSample,
+    level: f64) -> BootInterval ! BootError {
+    let alpha = try check_level(level)
+    let z0 = try bias_correction(sample.distribution, sample.observed)
+    let a = try acceleration(sample.jackknife)
+    let low = try shifted_percentile(z0, a, alpha / 2.0)
+    let high = try shifted_percentile(z0, a, 1.0 - alpha / 2.0)
+    return BootInterval{
+        low: try percentile_of(sample.distribution, low),
+        high: try percentile_of(sample.distribution, high), method: "bca",
+        low_percentile: low, high_percentile: high }
+}
+
+fn shifted_percentile(z0: f64, a: f64, p: f64) -> f64 ! BootError {
+    let z = distributions.normal_quantile(p, 0.0, 1.0) ?? 0.0
+    let adjusted = z0 + z
+    let denominator = 1.0 - a * adjusted
+    if denominator == 0.0 {
+        fail(Degenerate("the acceleration cancels the correction exactly"))
+    }
+    let point = z0 + adjusted / denominator
+    let share = distributions.normal_cdf(point, 0.0, 1.0) ?? 0.0
+    return share * 100.0
+}
+
+/// Whether a BCa interval ran off the end of its distribution.
+///
+/// When it did the interval is not wrong so much as unmeasured: the
+/// percentile it wanted lies outside what the resamples cover, and the
+/// answer is more resamples rather than a different method.
+pub fn is_saturated(interval: BootInterval, count: i64) -> bool {
+    let step = 100.0 / count.as_f64()
+    return interval.low_percentile < step or
+    interval.high_percentile > 100.0 - step
+}
+
+/// One resample, drawn with replacement.
+pub fn resample_of(inout rng: Rng, sample: [f64]) -> [f64] ! BootError {
+    if sample.len() == 0 {
+        fail(Empty())
+    }
+    var out: [f64] = []
+    var i = 0
+    while i < sample.len() {
+        out.push(sample[random.below(rng, sample.len())])
+        i = i + 1
+    }
+    return out
+}
+
+/// A bootstrap distribution: the statistic recomputed on `count` resamples.
+pub fn distribution_of(inout rng: Rng, sample: [f64],
+    statistic: fn([f64]) -> f64, count: i64) -> [f64] ! BootError {
+    if count < 2 {
+        fail(TooFewResamples(count))
+    }
+    var out: [f64] = []
+    var i = 0
+    while i < count {
+        out.push(statistic(try resample_of(rng, sample)))
+        i = i + 1
+    }
+    return out
+}
+
+/// Everything BCa needs, in one pass over the data.
+pub fn bootstrap_of(inout rng: Rng, sample: [f64],
+    statistic: fn([f64]) -> f64, count: i64) -> BootSample ! BootError {
+    return BootSample{ observed: statistic(sample),
+        distribution: try distribution_of(rng, sample, statistic, count),
+        jackknife: jackknife(sample, statistic) }
+}
+
+/// How many resamples a level needs before its tail percentile lands on a
+/// real order statistic rather than the end of the list.
+///
+/// A 95% interval needs its 2.5th percentile, so 40 resamples put it on the
+/// very first one and nothing below it exists. The usual advice of 2000 is
+/// this bound with two orders of magnitude of margin, and the margin is for
+/// the Monte Carlo error, not the arithmetic.
+pub fn resamples_needed(level: f64) -> i64 ! BootError {
+    let alpha = try check_level(level)
+    return (2.0 / alpha).ceil().as_i64()
+}

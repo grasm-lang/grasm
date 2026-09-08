@@ -1,0 +1,787 @@
+// Analysis of variance: which of these groups is not like the others, and
+// how sure are you.
+//
+// A t-test compares two means. With three groups there are three pairs, with
+// five there are ten, and testing all of them at 5% each means a one-in-four
+// chance of finding a difference that is not there. ANOVA asks the question
+// once: is the spread *between* the group means larger than the spread
+// *within* the groups would lead you to expect?
+//
+// ## What the F statistic is
+//
+// Split the total variation into the part explained by which group a value
+// is in and the part left over. Divide each by its degrees of freedom to get
+// a mean square. Their ratio is F, and under the null hypothesis — all group
+// means equal — it follows the F distribution. A large F means the group
+// means are further apart than the within-group noise accounts for.
+//
+// ## What it does not tell you
+//
+// That some pair differs, not which. The post-hoc tests here answer that,
+// and they are not a t-test done afterwards: a t-test on the pair with the
+// largest gap, chosen because it was largest, is wrong by construction.
+// Tukey's HSD uses the studentized range, which is the distribution of the
+// largest gap among k means, and that is the whole point of it.
+//
+// ## The assumption that is usually violated
+//
+// The classical F test assumes equal variances in every group. When the
+// group sizes are also unequal the test is not merely approximate, it is
+// wrong in a direction that depends on which way the imbalance runs: bigger
+// variance in the smaller group inflates F. Welch's version does not assume
+// equal variances and should be the default; Levene's and Bartlett's tests
+// here say whether the assumption holds, and Games-Howell is the post-hoc
+// that goes with Welch.
+
+import distributions
+
+type AnovaError =
+    | TooFewGroups(count: i64)
+    | EmptyGroup(index: i64)
+    | NoVariation(reason: str)
+    | Unbalanced(reason: str)
+    | BadLevel(level: f64)
+
+    /// One line of an ANOVA table.
+type AnovaRow = {
+    /// `between`, `within`, `total`, or a factor's name.
+    source: str,
+    sum_of_squares: f64,
+    freedom: f64,
+    mean_square: f64,
+    /// Zero on the rows that carry no test.
+    f: f64,
+    p: f64,
+}
+
+type AnovaTable = {
+    rows: [AnovaRow],
+    /// Eta squared: the share of the total variation the grouping explains.
+    eta_squared: f64,
+    /// Omega squared, which subtracts the variation a grouping explains by
+    /// chance and is the one to report.
+    omega_squared: f64,
+}
+
+/// One pairwise comparison after the fact.
+type PostHoc = {
+    left: i64,
+    right: i64,
+    difference: f64,
+    /// The standard error the test used, which is what separates Tukey from
+    /// Games-Howell.
+    error: f64,
+    statistic: f64,
+    p: f64,
+    low: f64,
+    high: f64,
+    significant: bool,
+}
+
+fn mean_of(xs: [f64]) -> f64 {
+    if xs.len() == 0 {
+        return 0.0
+    }
+    var total = 0.0
+    for x in xs {
+        total = total + x
+    }
+    return total / xs.len().as_f64()
+}
+
+fn variance_of(xs: [f64]) -> f64 {
+    if xs.len() < 2 {
+        return 0.0
+    }
+    let centre = mean_of(xs)
+    var total = 0.0
+    for x in xs {
+        total = total + (x - centre) * (x - centre)
+    }
+    return total / (xs.len() - 1).as_f64()
+}
+
+fn check_groups(groups: [[f64]]) -> bool ! AnovaError {
+    if groups.len() < 2 {
+        fail(TooFewGroups(groups.len()))
+    }
+    var i = 0
+    while i < groups.len() {
+        if groups[i].len() == 0 {
+            fail(EmptyGroup(i))
+        }
+        i = i + 1
+    }
+    return true
+}
+
+/// One-way ANOVA: the table, not just the p value.
+///
+/// The table is the point. An F of 4.1 means nothing until you can see that
+/// it came from three groups of five rather than three of five hundred, and
+/// that the grouping explains four per cent of the variation.
+pub fn one_way(groups: [[f64]]) -> AnovaTable ! AnovaError {
+    try check_groups(groups)
+    var total_count = 0
+    var grand_total = 0.0
+    for group in groups {
+        total_count = total_count + group.len()
+        for value in group {
+            grand_total = grand_total + value
+        }
+    }
+    let grand_mean = grand_total / total_count.as_f64()
+    var between = 0.0
+    var within = 0.0
+    for group in groups {
+        let centre = mean_of(group)
+        between = between + group.len().as_f64() *
+        (centre - grand_mean) * (centre - grand_mean)
+        for value in group {
+            within = within + (value - centre) * (value - centre)
+        }
+    }
+    let between_freedom = (groups.len() - 1).as_f64()
+    let within_freedom = (total_count - groups.len()).as_f64()
+    if within_freedom <= 0.0 {
+        fail(NoVariation("every group holds one value, so nothing is left " +
+            "to estimate the noise with"))
+    }
+    let between_square = between / between_freedom
+    let within_square = within / within_freedom
+    if within_square == 0.0 {
+        fail(NoVariation("no variation inside any group, so F is infinite"))
+    }
+    let f = between_square / within_square
+    let p = distributions.f_survival(f, between_freedom, within_freedom) ??
+    0.0
+    let total = between + within
+    var omega = 0.0
+    if total + within_square != 0.0 {
+        omega = (between - between_freedom * within_square) /
+        (total + within_square)
+    }
+    var eta = 0.0
+    if total != 0.0 {
+        eta = between / total
+    }
+    return AnovaTable{ rows: [
+        AnovaRow{ source: "between", sum_of_squares: between,
+            freedom: between_freedom, mean_square: between_square, f: f,
+            p: p },
+        AnovaRow{ source: "within", sum_of_squares: within,
+            freedom: within_freedom, mean_square: within_square, f: 0.0,
+            p: 0.0 },
+        AnovaRow{ source: "total", sum_of_squares: total,
+            freedom: between_freedom + within_freedom, mean_square: 0.0,
+            f: 0.0, p: 0.0 }], eta_squared: eta, omega_squared: omega }
+}
+
+/// Welch's ANOVA, which does not assume the groups share a variance.
+///
+/// It weights each group by its own precision and spends degrees of freedom
+/// to pay for it, the same trick as Welch's t-test. When the variances do
+/// happen to be equal it loses almost nothing, which is the argument for
+/// making it the default rather than the fallback.
+pub fn welch(groups: [[f64]]) -> AnovaRow ! AnovaError {
+    try check_groups(groups)
+    var weights: [f64] = []
+    var means: [f64] = []
+    var weight_total = 0.0
+    var weighted_mean = 0.0
+    for group in groups {
+        if group.len() < 2 {
+            fail(EmptyGroup(means.len()))
+        }
+        let spread = variance_of(group)
+        if spread == 0.0 {
+            fail(NoVariation("a group has no variance, so its weight is " +
+                "infinite"))
+        }
+        let weight = group.len().as_f64() / spread
+        weights.push(weight)
+        means.push(mean_of(group))
+        weight_total = weight_total + weight
+        weighted_mean = weighted_mean + weight * mean_of(group)
+    }
+    weighted_mean = weighted_mean / weight_total
+    let k = groups.len().as_f64()
+    var numerator = 0.0
+    var lambda = 0.0
+    var i = 0
+    while i < groups.len() {
+        let gap = means[i] - weighted_mean
+        numerator = numerator + weights[i] * gap * gap
+        let share = 1.0 - weights[i] / weight_total
+        lambda = lambda + share * share /
+        (groups[i].len() - 1).as_f64()
+        i = i + 1
+    }
+    lambda = lambda * 3.0 / (k * k - 1.0)
+    let freedom = (k - 1.0) / (3.0 * lambda)
+    let f = numerator / (k - 1.0) / (1.0 + 2.0 * (k - 2.0) / 3.0 * lambda)
+    let p = distributions.f_survival(f, k - 1.0, freedom) ?? 0.0
+    return AnovaRow{ source: "welch", sum_of_squares: 0.0,
+        freedom: freedom, mean_square: 0.0, f: f, p: p }
+}
+
+/// Levene's test for equal variances, on the median.
+///
+/// The mean-based original is the one in the textbooks and the median-based
+/// version — Brown-Forsythe — is the one that works, because a test for
+/// spread that is itself sensitive to outliers answers the wrong question.
+pub fn levene(groups: [[f64]]) -> AnovaRow ! AnovaError {
+    try check_groups(groups)
+    var spread_groups: [[f64]] = []
+    for group in groups {
+        let middle = median_of(group)
+        var deviations: [f64] = []
+        for value in group {
+            deviations.push((value - middle).abs())
+        }
+        spread_groups.push(deviations)
+    }
+    let table = try one_way(spread_groups)
+    return AnovaRow{ source: "levene", sum_of_squares: table.rows[0]
+            .sum_of_squares, freedom: table.rows[0].freedom,
+        mean_square: table.rows[0].mean_square, f: table.rows[0].f,
+        p: table.rows[0].p }
+}
+
+fn median_of(xs: [f64]) -> f64 {
+    let sorted = sorted_of(xs)
+    let n = sorted.len()
+    if n == 0 {
+        return 0.0
+    }
+    if n % 2 == 1 {
+        return sorted[n / 2]
+    }
+    return (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0
+}
+
+fn sorted_of(xs: [f64]) -> [f64] {
+    var out = xs
+    var i = 1
+    while i < out.len() {
+        let value = out[i]
+        var j = i - 1
+        while j >= 0 and out[j] > value {
+            out[j + 1] = out[j]
+            j = j - 1
+        }
+        out[j + 1] = value
+        i = i + 1
+    }
+    return out
+}
+
+/// Bartlett's test for equal variances.
+///
+/// More powerful than Levene when the data really are normal and badly
+/// misleading when they are not, which is why it is here to be compared
+/// against rather than relied on.
+pub fn bartlett(groups: [[f64]]) -> AnovaRow ! AnovaError {
+    try check_groups(groups)
+    var pooled_top = 0.0
+    var freedom_total = 0.0
+    var log_sum = 0.0
+    var reciprocals = 0.0
+    for group in groups {
+        if group.len() < 2 {
+            fail(EmptyGroup(0))
+        }
+        let freedom = (group.len() - 1).as_f64()
+        let spread = variance_of(group)
+        if spread <= 0.0 {
+            fail(NoVariation("a group has no variance, so its logarithm " +
+                "does not exist"))
+        }
+        pooled_top = pooled_top + freedom * spread
+        freedom_total = freedom_total + freedom
+        log_sum = log_sum + freedom * spread.ln()
+        reciprocals = reciprocals + 1.0 / freedom
+    }
+    let pooled = pooled_top / freedom_total
+    let k = groups.len().as_f64()
+    let statistic = (freedom_total * pooled.ln() - log_sum) /
+    (1.0 + (reciprocals - 1.0 / freedom_total) / (3.0 * (k - 1.0)))
+    let p = distributions.chi2_survival(statistic, k - 1.0) ?? 0.0
+    return AnovaRow{ source: "bartlett", sum_of_squares: 0.0,
+        freedom: k - 1.0, mean_square: 0.0, f: statistic, p: p }
+}
+
+// --------------------------------------------------- the studentized range
+
+/// Ten-point Gauss-Legendre nodes on [-1, 1], and their weights.
+fn legendre_nodes() -> [f64] {
+    return [0.0 - 0.9739065285171717, 0.0 - 0.8650633666889845,
+        0.0 - 0.6794095682990244, 0.0 - 0.4333953941292472,
+        0.0 - 0.1488743389816312, 0.1488743389816312, 0.4333953941292472,
+        0.6794095682990244, 0.8650633666889845, 0.9739065285171717]
+}
+
+fn legendre_weights() -> [f64] {
+    return [0.0666713443086881, 0.1494513491505806, 0.2190863625159820,
+        0.2692667193099963, 0.2955242247147529, 0.2955242247147529,
+        0.2692667193099963, 0.2190863625159820, 0.1494513491505806,
+        0.0666713443086881]
+}
+
+/// The z nodes the range integral is evaluated at, with everything that
+/// depends only on z worked out once.
+///
+/// The outer integral evaluates the inner one a couple of hundred times at
+/// the same eighty positions, and `normal_cdf_of(z)` does not depend on the
+/// outer variable. Hoisting it out is worth about forty per cent of the
+/// whole calculation.
+type SrNodes = {
+    z: [f64],
+    /// The Gauss-Legendre weight already multiplied by the panel half-width
+    /// and by the normal density at `z`.
+    weight: [f64],
+    upper: [f64],
+}
+
+fn range_nodes() -> SrNodes {
+    let nodes = legendre_nodes()
+    let weights = legendre_weights()
+    let low = 0.0 - 6.5
+    let high = 6.5
+    let panels = 8
+    let width = (high - low) / panels.as_f64()
+    var out = SrNodes{ z: [], weight: [], upper: [] }
+    var panel = 0
+    while panel < panels {
+        let half = width / 2.0
+        let middle = low + width * panel.as_f64() + half
+        var i = 0
+        while i < nodes.len() {
+            let z = middle + half * nodes[i]
+            out.z.push(z)
+            out.weight.push(weights[i] * half * normal_pdf_of(z))
+            out.upper.push(normal_cdf_of(z))
+            i = i + 1
+        }
+        panel = panel + 1
+    }
+    return out
+}
+
+/// The probability that the range of `k` standard normals is below `w`.
+///
+/// `k` integrals of a normal density against the (k-1)th power of a normal
+/// difference — the chance that every one of the k values lies within `w` of
+/// the smallest.
+fn range_cdf_at(nodes: SrNodes, w: f64, k: f64) -> f64 {
+    if w <= 0.0 {
+        return 0.0
+    }
+    var total = 0.0
+    var i = 0
+    while i < nodes.z.len() {
+        let inner = nodes.upper[i] - normal_cdf_of(nodes.z[i] - w)
+        if inner > 0.0 {
+            total = total + nodes.weight[i] * ((k - 1.0) * inner.ln()).exp()
+        }
+        i = i + 1
+    }
+    return k * total
+}
+
+fn normal_cdf_of(x: f64) -> f64 {
+    let z = x.abs()
+    var tail = 0.0
+    if z <= 37.0 {
+        let density = (0.0 - z * z / 2.0).exp()
+        if z < 7.07106781186547 {
+            var top = 0.0352624965998911 * z + 0.700383064443688
+            top = top * z + 6.37396220353165
+            top = top * z + 33.912866078383
+            top = top * z + 112.079291497871
+            top = top * z + 221.213596169931
+            top = top * z + 220.206867912376
+            var bottom = 0.0883883476483184 * z + 1.75566716318264
+            bottom = bottom * z + 16.064177579207
+            bottom = bottom * z + 86.7807322029461
+            bottom = bottom * z + 296.564248779674
+            bottom = bottom * z + 637.333633378831
+            bottom = bottom * z + 793.826512519948
+            bottom = bottom * z + 440.413735824752
+            tail = density * top / bottom
+        } else {
+            var fraction = z + 0.65
+            fraction = z + 4.0 / fraction
+            fraction = z + 3.0 / fraction
+            fraction = z + 2.0 / fraction
+            fraction = z + 1.0 / fraction
+            tail = density / (fraction * 2.506628274631)
+        }
+    }
+    if x > 0.0 {
+        return 1.0 - tail
+    }
+    return tail
+}
+
+fn normal_pdf_of(x: f64) -> f64 {
+    return 0.3989422804014327 * (0.0 - x * x / 2.0).exp()
+}
+
+/// The studentized range distribution: the range of `k` normal means
+/// divided by an independent estimate of their standard deviation.
+///
+/// Tukey's test exists because this is not the t distribution. The largest
+/// of several gaps is larger than a gap chosen in advance, and by how much
+/// depends on how many gaps there were — which is exactly what `k` is doing
+/// in here.
+pub fn studentized_range_cdf(q: f64, k: f64,
+    freedom: f64) -> f64 ! AnovaError {
+    if k < 2.0 {
+        fail(TooFewGroups(k.as_i64()))
+    }
+    if q <= 0.0 {
+        return 0.0
+    }
+    if freedom <= 0.0 {
+        fail(NoVariation("no degrees of freedom for the denominator"))
+    }
+    // With enough degrees of freedom the denominator is one and the answer
+    // is the range distribution itself. The integral below would say the
+    // same thing more slowly and less accurately.
+    let table = range_nodes()
+    if freedom > 25000.0 {
+        return range_cdf_at(table, q, k)
+    }
+    let nodes = legendre_nodes()
+    let weights = legendre_weights()
+    // The density of s = sqrt(chi-square / freedom) concentrates near one,
+    // with a spread of about 1/sqrt(2 * freedom); ten of those either side
+    // covers it to well past double precision.
+    let spread = 1.0 / (2.0 * freedom).sqrt()
+    var low = 1.0 - 12.0 * spread
+    if low < 0.0 {
+        low = 0.0
+    }
+    let high = 1.0 + 12.0 * spread
+    let log_constant = freedom / 2.0 * freedom.ln() -
+    distributions.lgamma(freedom / 2.0) -
+    (freedom / 2.0 - 1.0) * 0.6931471805599453
+    // Few degrees of freedom put the denominator's density over a wide
+    // range of `s`, and the range probability inside varies fastest exactly
+    // there, so the panels are chosen by the width rather than fixed.
+    var panels = ((high - low) * 4.0).ceil().as_i64()
+    if panels < 8 {
+        panels = 8
+    }
+    let width = (high - low) / panels.as_f64()
+    var total = 0.0
+    var panel = 0
+    while panel < panels {
+        let a = low + width * panel.as_f64()
+        let half = width / 2.0
+        let middle = a + half
+        var i = 0
+        while i < nodes.len() {
+            let s = middle + half * nodes[i]
+            if s > 0.0 {
+                let density = (log_constant + (freedom - 1.0) * s.ln() -
+                    freedom * s * s / 2.0).exp()
+                total = total + weights[i] * half * density *
+                range_cdf_at(table, q * s, k)
+            }
+            i = i + 1
+        }
+        panel = panel + 1
+    }
+    return total
+}
+
+/// The chance of a studentized range at least this large.
+pub fn studentized_range_survival(q: f64, k: f64,
+    freedom: f64) -> f64 ! AnovaError {
+    return 1.0 - try studentized_range_cdf(q, k, freedom)
+}
+
+/// The studentized range that is exceeded with probability `1 - p`.
+///
+/// Found by bisection rather than a formula, because there is no formula.
+pub fn studentized_range_quantile(p: f64, k: f64,
+    freedom: f64) -> f64 ! AnovaError {
+    if p <= 0.0 or p >= 1.0 {
+        fail(BadLevel(p))
+    }
+    // Every evaluation of the distribution is a double integral, so the
+    // search counts its steps rather than running a fixed eighty of them.
+    // Regula falsi with the Illinois correction gets there in about ten
+    // where bisection wants thirty-five.
+    var low = 0.0
+    var low_value = 0.0 - p
+    var high = 8.0
+    var high_value = try studentized_range_cdf(high, k, freedom) - p
+    var widened = 0
+    while high_value < 0.0 and widened < 20 {
+        low = high
+        low_value = high_value
+        high = high * 2.0
+        high_value = try studentized_range_cdf(high, k, freedom) - p
+        widened = widened + 1
+    }
+    var side = 0
+    var i = 0
+    while i < 60 {
+        let guess = (low * high_value - high * low_value) /
+        (high_value - low_value)
+        if high - low < 0.0000000001 {
+            return guess
+        }
+        let value = try studentized_range_cdf(guess, k, freedom) - p
+        if value == 0.0 {
+            return guess
+        }
+        if value * high_value > 0.0 {
+            high = guess
+            high_value = value
+            if side == 0 - 1 {
+                low_value = low_value / 2.0
+            }
+            side = 0 - 1
+        } else {
+            low = guess
+            low_value = value
+            if side == 1 {
+                high_value = high_value / 2.0
+            }
+            side = 1
+        }
+        i = i + 1
+    }
+    return (low + high) / 2.0
+}
+
+// ---------------------------------------------------------- after the fact
+
+/// Tukey's honestly significant difference, every pair at once.
+///
+/// The "honestly" is the whole argument. Running a t-test on each pair at 5%
+/// gives a one-in-four chance of a false finding among four groups; Tukey
+/// spends the 5% across the family by referring the largest gap to the
+/// distribution of the largest gap. It assumes the equal variances the
+/// classical F test assumes, so when Levene says otherwise use
+/// `games_howell`.
+pub fn tukey_hsd(groups: [[f64]], level: f64) -> [PostHoc] ! AnovaError {
+    let table = try one_way(groups)
+    let within_square = table.rows[1].mean_square
+    let freedom = table.rows[1].freedom
+    let k = groups.len().as_f64()
+    let critical = try studentized_range_quantile(level, k, freedom)
+    var out: [PostHoc] = []
+    var i = 0
+    while i < groups.len() {
+        var j = i + 1
+        while j < groups.len() {
+            let difference = mean_of(groups[i]) - mean_of(groups[j])
+            let error = (within_square / 2.0 *
+                (1.0 / groups[i].len().as_f64() +
+                    1.0 / groups[j].len().as_f64())).sqrt()
+            let q = difference.abs() / error
+            let p = try studentized_range_survival(q, k, freedom)
+            out.push(PostHoc{ left: i, right: j, difference: difference,
+                error: error, statistic: q, p: p,
+                low: difference - critical * error,
+                high: difference + critical * error,
+                significant: p < 1.0 - level })
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+/// Games-Howell: Tukey without the equal-variance assumption.
+///
+/// Each pair gets its own standard error and its own degrees of freedom, by
+/// Welch-Satterthwaite. It is what to reach for by default, since the price
+/// when variances *are* equal is a little power and the price for assuming
+/// wrongly is a wrong answer.
+pub fn games_howell(groups: [[f64]], level: f64) -> [PostHoc] ! AnovaError {
+    try check_groups(groups)
+    let k = groups.len().as_f64()
+    var out: [PostHoc] = []
+    var i = 0
+    while i < groups.len() {
+        var j = i + 1
+        while j < groups.len() {
+            if groups[i].len() < 2 or groups[j].len() < 2 {
+                fail(EmptyGroup(i))
+            }
+            let left_n = groups[i].len().as_f64()
+            let right_n = groups[j].len().as_f64()
+            let left_var = variance_of(groups[i]) / left_n
+            let right_var = variance_of(groups[j]) / right_n
+            if left_var + right_var == 0.0 {
+                fail(NoVariation("a pair of groups has no variance at all"))
+            }
+            let error = ((left_var + right_var) / 2.0).sqrt()
+            let difference = mean_of(groups[i]) - mean_of(groups[j])
+            let q = difference.abs() / error
+            let total = left_var + right_var
+            let freedom = total * total /
+            (left_var * left_var / (left_n - 1.0) +
+                right_var * right_var / (right_n - 1.0))
+            let p = try studentized_range_survival(q, k, freedom)
+            let critical = try studentized_range_quantile(level, k, freedom)
+            out.push(PostHoc{ left: i, right: j, difference: difference,
+                error: error, statistic: q, p: p,
+                low: difference - critical * error,
+                high: difference + critical * error,
+                significant: p < 1.0 - level })
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+/// Two-way ANOVA on a balanced design, with the interaction.
+///
+/// `cells[a][b]` holds the observations at level `a` of the first factor and
+/// level `b` of the second, and every cell must hold the same number of
+/// them. The interaction row is the one to read first: when it is
+/// significant the two main effects are not separately interpretable, and
+/// reporting them as though they were is the commonest mistake in the
+/// literature this test appears in.
+pub fn two_way(cells: [[[f64]]]) -> AnovaTable ! AnovaError {
+    if cells.len() < 2 {
+        fail(TooFewGroups(cells.len()))
+    }
+    let columns = cells[0].len()
+    if columns < 2 {
+        fail(TooFewGroups(columns))
+    }
+    let per_cell = cells[0][0].len()
+    if per_cell < 2 {
+        fail(Unbalanced("a cell holds fewer than two observations, so the " +
+            "interaction has nothing to be measured against"))
+    }
+    let count = cells.len() * columns * per_cell
+    let grand_mean = try balanced_mean(cells, columns, per_cell)
+    let rows = cells.len()
+    var row_ss = 0.0
+    var i = 0
+    while i < rows {
+        var total = 0.0
+        for cell in cells[i] {
+            for value in cell {
+                total = total + value
+            }
+        }
+        let centre = total / (columns * per_cell).as_f64()
+        row_ss = row_ss + (columns * per_cell).as_f64() *
+        (centre - grand_mean) * (centre - grand_mean)
+        i = i + 1
+    }
+    var column_ss = 0.0
+    var j = 0
+    while j < columns {
+        var total = 0.0
+        var k = 0
+        while k < rows {
+            for value in cells[k][j] {
+                total = total + value
+            }
+            k = k + 1
+        }
+        let centre = total / (rows * per_cell).as_f64()
+        column_ss = column_ss + (rows * per_cell).as_f64() *
+        (centre - grand_mean) * (centre - grand_mean)
+        j = j + 1
+    }
+    var within = 0.0
+    var cell_ss = 0.0
+    for row in cells {
+        for cell in row {
+            let centre = mean_of(cell)
+            cell_ss = cell_ss + per_cell.as_f64() *
+            (centre - grand_mean) * (centre - grand_mean)
+            for value in cell {
+                within = within + (value - centre) * (value - centre)
+            }
+        }
+    }
+    let interaction = cell_ss - row_ss - column_ss
+    let row_freedom = (rows - 1).as_f64()
+    let column_freedom = (columns - 1).as_f64()
+    let interaction_freedom = row_freedom * column_freedom
+    let within_freedom = (count - rows * columns).as_f64()
+    let within_square = within / within_freedom
+    if within_square == 0.0 {
+        fail(NoVariation("no variation inside any cell, so every F is " +
+            "infinite"))
+    }
+    let total_ss = row_ss + column_ss + interaction + within
+    return AnovaTable{ rows: [
+        try effect_row("rows", row_ss, row_freedom, within_square,
+            within_freedom),
+        try effect_row("columns", column_ss, column_freedom, within_square,
+            within_freedom),
+        try effect_row("interaction", interaction, interaction_freedom,
+            within_square, within_freedom),
+        AnovaRow{ source: "within", sum_of_squares: within,
+            freedom: within_freedom, mean_square: within_square, f: 0.0,
+            p: 0.0 },
+        AnovaRow{ source: "total", sum_of_squares: total_ss,
+            freedom: (count - 1).as_f64(), mean_square: 0.0, f: 0.0,
+            p: 0.0 }],
+        eta_squared: row_ss / total_ss,
+        omega_squared: (row_ss - row_freedom * within_square) /
+        (total_ss + within_square) }
+}
+
+/// The mean of every observation, refusing a design that is not balanced.
+///
+/// The sums of squares below only add up on a balanced design; on an
+/// unbalanced one there are three different answers depending on the order
+/// the factors are entered, and a package that silently picks one is worse
+/// than a package that refuses.
+fn balanced_mean(cells: [[[f64]]], columns: i64,
+    per_cell: i64) -> f64 ! AnovaError {
+    var total = 0.0
+    var count = 0
+    for row in cells {
+        if row.len() != columns {
+            fail(Unbalanced("the rows do not all hold the same number of " +
+                "cells"))
+        }
+        for cell in row {
+            if cell.len() != per_cell {
+                fail(Unbalanced("the cells do not all hold the same number " +
+                    "of observations"))
+            }
+            for value in cell {
+                total = total + value
+                count = count + 1
+            }
+        }
+    }
+    return total / count.as_f64()
+}
+
+fn effect_row(name: str, sum_of_squares: f64, freedom: f64,
+    within_square: f64, within_freedom: f64) -> AnovaRow ! AnovaError {
+    let square = sum_of_squares / freedom
+    let f = square / within_square
+    return AnovaRow{ source: name, sum_of_squares: sum_of_squares,
+        freedom: freedom, mean_square: square, f: f,
+        p: distributions.f_survival(f, freedom, within_freedom) ?? 0.0 }
+}
+
+/// The row of a table by name, or an error naming what was there.
+pub fn row_of(table: AnovaTable, source: str) -> AnovaRow ! AnovaError {
+    for row in table.rows {
+        if row.source == source {
+            return row
+        }
+    }
+    fail(NoVariation("no row named " + source))
+}

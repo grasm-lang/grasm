@@ -1,0 +1,29 @@
+[package]
+name = "statistics3_demo"
+version = "0.1.0"
+
+capabilities = ["io"]
+
+[dependencies.bootstrap]
+path = "../bootstrap"
+version = "^1.0.0"
+
+[dependencies.anova]
+path = "../anova"
+version = "^1.0.0"
+
+[dependencies.survival]
+path = "../survival"
+version = "^1.0.0"
+
+[dependencies.timeseries]
+path = "../timeseries"
+version = "^1.0.0"
+
+[dependencies.changepoint]
+path = "../changepoint"
+version = "^1.0.0"
+
+[dependencies.random]
+path = "../random"
+version = "^1.0.0"

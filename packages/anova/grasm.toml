@@ -1,0 +1,10 @@
+[package]
+name = "anova"
+version = "1.0.0"
+
+# Arithmetic. Opens nothing.
+capabilities = []
+
+[dependencies.distributions]
+path = "../distributions"
+version = "^1.0.0"

@@ -1,0 +1,349 @@
+// Change point detection: when did the behaviour change, given only the
+// numbers.
+//
+// A latency series steps from 40 ms to 95 ms one Tuesday. Nobody watching a
+// dashboard notices, because the noise is 30 ms wide and the step is inside
+// it on any single day. Averaged over a week it is obvious, and the question
+// is which week — which means finding the split that best explains the
+// series as two stretches with different levels.
+//
+// ## The cost, and why the penalty is the whole problem
+//
+// Score a segmentation by the total squared deviation from each segment's
+// own mean. That cost falls monotonically as segments are added, so the best
+// segmentation by cost alone puts a break between every pair of points. The
+// penalty is what stops it: each break costs a fixed amount, and the answer
+// depends on that amount more than on anything else in the data. A penalty
+// of `2 sigma^2 log n` is the standard choice and is a choice.
+//
+// ## Exactly, and quickly
+//
+// The optimal segmentation is a dynamic program over every possible last
+// break — O(n^2) with prefix sums. PELT gets the same answer in roughly O(n)
+// by pruning: a candidate break that is already worse than the best by more
+// than the penalty can never come back, because the cost only goes up.
+// Pruning changes the running time and not the answer, which is why both are
+// here: the slow one is the specification of the fast one.
+//
+// ## Binary segmentation
+//
+// Find the single best split, then split each half. Fast, greedy, and
+// approximate: it commits to the first break before it knows about the
+// others, so on two changes of similar size in one series it can put the
+// first break between them and never recover. It is here because it is what
+// most tools do and because when it agrees with PELT that is worth knowing.
+//
+// ## CUSUM
+//
+// The online version. Accumulate how far each point is from the expected
+// level and signal when the running sum passes a threshold. It detects a
+// small persistent shift far sooner than a threshold on the raw value, which
+// is what makes it a monitoring tool rather than an analysis one.
+
+type CpError =
+    | TooShort(length: i64, needed: i64)
+    | BadPenalty(penalty: f64)
+    | BadCount(count: i64)
+    | BadWidth(width: i64)
+
+    /// A stretch of the series with one level.
+type CpSegment = {
+    /// The first index in the segment.
+    start: i64,
+    /// One past the last, so `end - start` is the length.
+    end: i64,
+    mean: f64,
+    /// The sum of squared deviations from that mean.
+    cost: f64,
+}
+
+/// Prefix sums of the values and of their squares, so any segment's cost is
+/// three subtractions.
+type CpPrefix = {
+    sums: [f64],
+    squares: [f64],
+}
+
+/// The prefix sums a series' segment costs are read from.
+pub fn prefix_of(values: [f64]) -> CpPrefix {
+    var sums: [f64] = [0.0]
+    var squares: [f64] = [0.0]
+    var total = 0.0
+    var square_total = 0.0
+    for value in values {
+        total = total + value
+        square_total = square_total + value * value
+        sums.push(total)
+        squares.push(square_total)
+    }
+    return CpPrefix{ sums: sums, squares: squares }
+}
+
+/// The squared-deviation cost of `values[start..end]`.
+///
+/// Computed from the prefix sums, which is exact enough for well-scaled data
+/// and loses precision when the mean is huge next to the spread — the usual
+/// caveat on the computational formula for a variance.
+pub fn segment_cost(prefix: CpPrefix, start: i64, end: i64) -> f64 {
+    let n = (end - start).as_f64()
+    if n <= 0.0 {
+        return 0.0
+    }
+    let total = prefix.sums[end] - prefix.sums[start]
+    let squares = prefix.squares[end] - prefix.squares[start]
+    let cost = squares - total * total / n
+    if cost < 0.0 {
+        return 0.0
+    }
+    return cost
+}
+
+/// The optimal segmentation under a per-break penalty, by exhaustive dynamic
+/// programming.
+///
+/// Returns the indices where a new segment starts, not counting zero. This
+/// is the definition PELT is checked against.
+pub fn optimal_breaks(values: [f64],
+    penalty: f64) -> [i64] ! CpError {
+    if values.len() < 2 {
+        fail(TooShort(values.len(), 2))
+    }
+    if penalty < 0.0 {
+        fail(BadPenalty(penalty))
+    }
+    let prefix = prefix_of(values)
+    let n = values.len()
+    var best: [f64] = [0.0]
+    var previous: [i64] = [0]
+    var end = 1
+    while end <= n {
+        var best_cost = 0.0
+        var best_start = 0
+        var start = 0
+        while start < end {
+            let cost = best[start] + segment_cost(prefix, start, end) +
+            penalty
+            if start == 0 or cost < best_cost {
+                best_cost = cost
+                best_start = start
+            }
+            start = start + 1
+        }
+        best.push(best_cost)
+        previous.push(best_start)
+        end = end + 1
+    }
+    return walk_back(previous, n)
+}
+
+fn walk_back(previous: [i64], n: i64) -> [i64] {
+    var reversed: [i64] = []
+    var at = n
+    while at > 0 {
+        let before = previous[at]
+        if before > 0 {
+            reversed.push(before)
+        }
+        at = before
+    }
+    var out: [i64] = []
+    var i = reversed.len() - 1
+    while i >= 0 {
+        out.push(reversed[i])
+        i = i - 1
+    }
+    return out
+}
+
+/// The same segmentation, by PELT.
+///
+/// The pruning rule is the one line worth reading: a candidate whose best
+/// cost plus this segment's cost already exceeds the current best by the
+/// penalty can never be optimal for any later end, because extending a
+/// segment never makes it cheaper. Dropping it is what turns the quadratic
+/// search linear.
+pub fn pelt(values: [f64], penalty: f64) -> [i64] ! CpError {
+    if values.len() < 2 {
+        fail(TooShort(values.len(), 2))
+    }
+    if penalty < 0.0 {
+        fail(BadPenalty(penalty))
+    }
+    let prefix = prefix_of(values)
+    let n = values.len()
+    var best: [f64] = [0.0]
+    var previous: [i64] = [0]
+    var live: [i64] = [0]
+    var end = 1
+    while end <= n {
+        var best_cost = 0.0
+        var best_start = 0
+        var first = true
+        for start in live {
+            let cost = best[start] + segment_cost(prefix, start, end) +
+            penalty
+            if first or cost < best_cost {
+                best_cost = cost
+                best_start = start
+                first = false
+            }
+        }
+        best.push(best_cost)
+        previous.push(best_start)
+        var kept: [i64] = []
+        for start in live {
+            if best[start] + segment_cost(prefix, start, end) <= best_cost {
+                kept.push(start)
+            }
+        }
+        kept.push(end)
+        live = kept
+        end = end + 1
+    }
+    return walk_back(previous, n)
+}
+
+/// Binary segmentation to a fixed number of breaks.
+///
+/// Greedy, and it shows: each split is chosen without knowing about the
+/// splits that follow, so a series with two steps of similar size can get a
+/// first break between them.
+pub fn binary_segmentation(values: [f64],
+    breaks: i64) -> [i64] ! CpError {
+    if breaks < 0 {
+        fail(BadCount(breaks))
+    }
+    if values.len() < 2 {
+        fail(TooShort(values.len(), 2))
+    }
+    let prefix = prefix_of(values)
+    var bounds: [i64] = [0, values.len()]
+    var found = 0
+    while found < breaks {
+        var best_gain = 0.0
+        var best_at = 0 - 1
+        var region = 0
+        while region + 1 < bounds.len() {
+            let start = bounds[region]
+            let end = bounds[region + 1]
+            let whole = segment_cost(prefix, start, end)
+            var split = start + 1
+            while split < end {
+                let gain = whole - segment_cost(prefix, start, split) -
+                segment_cost(prefix, split, end)
+                if gain > best_gain {
+                    best_gain = gain
+                    best_at = split
+                }
+                split = split + 1
+            }
+            region = region + 1
+        }
+        if best_at < 0 {
+            return without_ends(bounds)
+        }
+        bounds = inserted(bounds, best_at)
+        found = found + 1
+    }
+    return without_ends(bounds)
+}
+
+fn inserted(bounds: [i64], at: i64) -> [i64] {
+    var out: [i64] = []
+    var placed = false
+    for bound in bounds {
+        if not placed and at < bound {
+            out.push(at)
+            placed = true
+        }
+        out.push(bound)
+    }
+    if not placed {
+        out.push(at)
+    }
+    return out
+}
+
+fn without_ends(bounds: [i64]) -> [i64] {
+    var out: [i64] = []
+    var i = 1
+    while i + 1 < bounds.len() {
+        out.push(bounds[i])
+        i = i + 1
+    }
+    return out
+}
+
+/// The segments a set of break points describes.
+pub fn segments_of(values: [f64], breaks: [i64]) -> [CpSegment] {
+    let prefix = prefix_of(values)
+    var bounds: [i64] = [0]
+    for at in breaks {
+        bounds.push(at)
+    }
+    bounds.push(values.len())
+    var out: [CpSegment] = []
+    var i = 0
+    while i + 1 < bounds.len() {
+        let start = bounds[i]
+        let end = bounds[i + 1]
+        var mean = 0.0
+        if end > start {
+            mean = (prefix.sums[end] - prefix.sums[start]) /
+            (end - start).as_f64()
+        }
+        out.push(CpSegment{ start: start, end: end, mean: mean,
+            cost: segment_cost(prefix, start, end) })
+        i = i + 1
+    }
+    return out
+}
+
+/// The penalty that the literature's default rule gives for a series.
+///
+/// `2 sigma^2 log n`, with sigma estimated from the successive differences
+/// so that a step in the level does not inflate it. A level shift makes the
+/// plain standard deviation large, which raises the penalty, which hides the
+/// shift.
+pub fn default_penalty(values: [f64]) -> f64 ! CpError {
+    if values.len() < 3 {
+        fail(TooShort(values.len(), 3))
+    }
+    var total = 0.0
+    var i = 1
+    while i < values.len() {
+        let gap = values[i] - values[i - 1]
+        total = total + gap * gap
+        i = i + 1
+    }
+    let variance = total / (2.0 * (values.len() - 1).as_f64())
+    return 2.0 * variance * values.len().as_f64().ln()
+}
+
+/// A two-sided CUSUM scan: the first index at which the accumulated
+/// departure from `expected` passes `threshold`.
+///
+/// `slack` is the shift size to ignore, in the same units as the data;
+/// setting it to half the shift you care about is the textbook choice and
+/// makes the test most sensitive to exactly that shift.
+pub fn cusum(values: [f64], expected: f64, slack: f64,
+    threshold: f64) -> [i64] ! CpError {
+    if threshold <= 0.0 {
+        fail(BadPenalty(threshold))
+    }
+    var out: [i64] = []
+    var high = 0.0
+    var low = 0.0
+    var i = 0
+    while i < values.len() {
+        high = (high + values[i] - expected - slack).max(0.0)
+        low = (low + expected - values[i] - slack).max(0.0)
+        if high > threshold or low > threshold {
+            out.push(i)
+            high = 0.0
+            low = 0.0
+        }
+        i = i + 1
+    }
+    return out
+}

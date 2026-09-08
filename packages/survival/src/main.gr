@@ -1,0 +1,376 @@
+// Survival analysis: how long until the thing happens, when for some of them
+// it has not happened yet.
+//
+// The awkward observations are the ones still running. A customer who has
+// not cancelled after 400 days is not a 400-day lifetime and is not missing
+// data either: they are *censored*, and they carry the information that the
+// lifetime is longer than 400. Averaging the ones that ended throws that
+// away and gives an answer that is always too small.
+//
+// ## Kaplan-Meier
+//
+// At each moment something happens, the chance of surviving that moment is
+// (at risk - events) / at risk. Multiply those together and you have the
+// survival curve. The censored observations never contribute a drop; they
+// leave the risk set quietly, which is exactly how their information gets
+// used.
+//
+// ## What the confidence band is doing
+//
+// Greenwood's formula is a variance for the *log* of the survival, because
+// the survival itself is a product and its variance is not additive. The
+// interval is then built on the log-log scale — `log(-log S)` — because a
+// naive interval on S itself runs past 1 near the start and below 0 in the
+// tail, and a probability that is 1.04 is a package's fault rather than the
+// data's.
+//
+// ## Log-rank
+//
+// Two groups, one question: is one curve above the other by more than
+// chance? At each event time the test compares the events observed in a
+// group against the events expected if both groups had the same hazard. The
+// test is most powerful when the hazards are *proportional*; when the curves
+// cross it can return a p of 0.9 for two groups that are obviously
+// different, which is why the curves are worth looking at.
+//
+// ## Median survival, and when there is none
+//
+// The median is the first time the curve reaches 0.5. When the curve never
+// gets there — more than half the subjects are still alive at the end of
+// follow-up — there is no median, and reporting the last observed time is a
+// lie in a direction that always favours the treatment.
+
+import distributions
+
+type SurvError =
+    | LengthMismatch(times: i64, events: i64)
+    | NegativeTime(time: f64)
+    | NoObservations()
+    | NoMedian()
+    | BadLevel(level: f64)
+
+    /// One step of the curve.
+type SurvPoint = {
+    time: f64,
+    /// How many were still being followed just before this time.
+    at_risk: i64,
+    events: i64,
+    censored: i64,
+    /// The survival function after this time.
+    survival: f64,
+    /// Greenwood's variance of `log(survival)`, accumulated.
+    variance: f64,
+    /// The cumulative hazard by Nelson-Aalen, which is not
+    /// `-log(survival)` though the two agree closely.
+    cumulative_hazard: f64,
+}
+
+type SurvCurve = {
+    points: [SurvPoint],
+    /// Observations that went in, and how many of them ended.
+    observations: i64,
+    events: i64,
+}
+
+type LogRank = {
+    /// Events seen in the first group, and expected under equal hazards.
+    observed: f64,
+    expected: f64,
+    variance: f64,
+    statistic: f64,
+    p: f64,
+}
+
+fn check_input(times: [f64], events: [bool]) -> bool ! SurvError {
+    if times.len() != events.len() {
+        fail(LengthMismatch(times.len(), events.len()))
+    }
+    if times.len() == 0 {
+        fail(NoObservations())
+    }
+    for time in times {
+        if time < 0.0 {
+            fail(NegativeTime(time))
+        }
+    }
+    return true
+}
+
+/// The Kaplan-Meier estimate, with Greenwood's variance and the Nelson-Aalen
+/// hazard alongside.
+///
+/// `events[i]` is true when the subject's time is when the thing happened,
+/// false when they were still being followed. A subject censored at exactly
+/// the same time as another's event counts as at risk for that event: the
+/// convention is that events come first, and it matters at the tail where
+/// the risk set is small.
+pub fn kaplan_meier(times: [f64], events: [bool]) -> SurvCurve ! SurvError {
+    try check_input(times, events)
+    let order = order_of(times)
+    var points: [SurvPoint] = []
+    var survival = 1.0
+    var variance = 0.0
+    var hazard = 0.0
+    var event_total = 0
+    var i = 0
+    while i < order.len() {
+        let time = times[order[i]]
+        var died = 0
+        var left = 0
+        var j = i
+        while j < order.len() and times[order[j]] == time {
+            if events[order[j]] {
+                died = died + 1
+            } else {
+                left = left + 1
+            }
+            j = j + 1
+        }
+        let at_risk = order.len() - i
+        if died > 0 {
+            survival = survival * (at_risk - died).as_f64() /
+            at_risk.as_f64()
+            variance = variance + died.as_f64() /
+            (at_risk.as_f64() * (at_risk - died).as_f64())
+            hazard = hazard + died.as_f64() / at_risk.as_f64()
+            event_total = event_total + died
+        }
+        points.push(SurvPoint{ time: time, at_risk: at_risk, events: died,
+            censored: left, survival: survival, variance: variance,
+            cumulative_hazard: hazard })
+        i = j
+    }
+    return SurvCurve{ points: points, observations: times.len(),
+        events: event_total }
+}
+
+fn order_of(times: [f64]) -> [i64] {
+    var out: [i64] = []
+    var i = 0
+    while i < times.len() {
+        out.push(i)
+        i = i + 1
+    }
+    var a = 1
+    while a < out.len() {
+        let value = out[a]
+        var b = a - 1
+        while b >= 0 and times[out[b]] > times[value] {
+            out[b + 1] = out[b]
+            b = b - 1
+        }
+        out[b + 1] = value
+        a = a + 1
+    }
+    return out
+}
+
+/// The survival at a time, which is the value of the last step at or before
+/// it.
+///
+/// Before the first event the answer is 1, which is the one place a step
+/// function needs saying out loud.
+pub fn survival_at(curve: SurvCurve, time: f64) -> f64 {
+    var out = 1.0
+    for point in curve.points {
+        if point.time <= time {
+            out = point.survival
+        }
+    }
+    return out
+}
+
+/// The Nelson-Aalen cumulative hazard at a time.
+pub fn hazard_at(curve: SurvCurve, time: f64) -> f64 {
+    var out = 0.0
+    for point in curve.points {
+        if point.time <= time {
+            out = point.cumulative_hazard
+        }
+    }
+    return out
+}
+
+/// The same, with the tie correction.
+///
+/// Nelson-Aalen adds `d/n` at each event time. When `d` events fall on one
+/// recorded time they did not really happen at once — the times were rounded
+/// to the day — and the correction adds `1/n + 1/(n-1) + … + 1/(n-d+1)`
+/// instead, which is what the hazard would have been had the ties been
+/// broken. The two agree exactly when no time is repeated and differ by
+/// more than a rounding error when they are, so which one a package means
+/// is worth saying: lifelines smooths by default, and this function is that
+/// default while `hazard_at` is the textbook estimator.
+pub fn smoothed_hazard_at(curve: SurvCurve, time: f64) -> f64 {
+    var out = 0.0
+    for point in curve.points {
+        if point.time <= time and point.events > 0 {
+            var j = 0
+            while j < point.events {
+                out = out + 1.0 / (point.at_risk - j).as_f64()
+                j = j + 1
+            }
+        }
+    }
+    return out
+}
+
+/// The first time the curve is at or below one half.
+///
+/// An error when the curve never gets there, because the honest answer is
+/// "not reached" and the dishonest one is the last follow-up time.
+pub fn median_survival(curve: SurvCurve) -> f64 ! SurvError {
+    for point in curve.points {
+        if point.survival <= 0.5 {
+            return point.time
+        }
+    }
+    fail(NoMedian())
+}
+
+/// The first time the curve is at or below `1 - share`.
+pub fn quantile_survival(curve: SurvCurve, share: f64) -> f64 ! SurvError {
+    if share <= 0.0 or share >= 1.0 {
+        fail(BadLevel(share))
+    }
+    for point in curve.points {
+        if point.survival <= 1.0 - share {
+            return point.time
+        }
+    }
+    fail(NoMedian())
+}
+
+/// A confidence interval for the survival at a time, on the log-log scale.
+///
+/// The scale is the whole point: `S ± z·se` gives intervals that leave
+/// [0, 1] wherever the curve is near either end, which is most of it.
+pub fn survival_interval(curve: SurvCurve, time: f64,
+    level: f64) -> (f64, f64) ! SurvError {
+    if level <= 0.0 or level >= 1.0 {
+        fail(BadLevel(level))
+    }
+    var survival = 1.0
+    var variance = 0.0
+    for point in curve.points {
+        if point.time <= time {
+            survival = point.survival
+            variance = point.variance
+        }
+    }
+    if survival >= 1.0 or survival <= 0.0 {
+        return (survival, survival)
+    }
+    let z = distributions.normal_quantile(1.0 - (1.0 - level) / 2.0, 0.0,
+        1.0) ?? 0.0
+    let log_survival = survival.ln()
+    let scale = z * variance.sqrt() / (0.0 - log_survival)
+    let low = survival_power(survival, (scale).exp())
+    let high = survival_power(survival, (0.0 - scale).exp())
+    return (low, high)
+}
+
+fn survival_power(survival: f64, power: f64) -> f64 {
+    return (power * survival.ln()).exp()
+}
+
+/// The area under the curve up to a horizon: the restricted mean survival
+/// time.
+///
+/// The mean lifetime does not exist when the curve does not reach zero, and
+/// the median throws away everything but one crossing. The area up to a
+/// stated horizon is the summary that survives both problems, and stating
+/// the horizon is not a weakness of it — every comparison of two treatments
+/// is over some period.
+pub fn restricted_mean(curve: SurvCurve, horizon: f64) -> f64 ! SurvError {
+    if horizon <= 0.0 {
+        fail(NegativeTime(horizon))
+    }
+    var area = 0.0
+    var previous_time = 0.0
+    var previous_survival = 1.0
+    for point in curve.points {
+        if point.time >= horizon {
+            area = area + (horizon - previous_time) * previous_survival
+            return area
+        }
+        area = area + (point.time - previous_time) * previous_survival
+        previous_time = point.time
+        previous_survival = point.survival
+    }
+    return area + (horizon - previous_time) * previous_survival
+}
+
+/// The log-rank test between two groups.
+///
+/// At each time either group has an event, the events seen in the first
+/// group are compared against the number expected if both groups shared one
+/// hazard. The sum of the differences, scaled by its variance, is
+/// chi-squared on one degree of freedom.
+pub fn log_rank(times_a: [f64], events_a: [bool], times_b: [f64],
+    events_b: [bool]) -> LogRank ! SurvError {
+    try check_input(times_a, events_a)
+    try check_input(times_b, events_b)
+    var moments: [f64] = []
+    for time in times_a {
+        moments.push(time)
+    }
+    for time in times_b {
+        moments.push(time)
+    }
+    let order = order_of(moments)
+    var observed = 0.0
+    var expected = 0.0
+    var variance = 0.0
+    var i = 0
+    while i < order.len() {
+        let time = moments[order[i]]
+        var j = i
+        while j < order.len() and moments[order[j]] == time {
+            j = j + 1
+        }
+        let risk_a = at_risk_of(times_a, time)
+        let risk_b = at_risk_of(times_b, time)
+        let died_a = events_at(times_a, events_a, time)
+        let died_b = events_at(times_b, events_b, time)
+        let died = died_a + died_b
+        let risk = risk_a + risk_b
+        if died > 0.0 and risk > 1.0 {
+            observed = observed + died_a
+            expected = expected + died * risk_a / risk
+            variance = variance + died * risk_a * risk_b * (risk - died) /
+            (risk * risk * (risk - 1.0))
+        }
+        i = j
+    }
+    if variance <= 0.0 {
+        fail(NoObservations())
+    }
+    let gap = observed - expected
+    let statistic = gap * gap / variance
+    return LogRank{ observed: observed, expected: expected,
+        variance: variance, statistic: statistic,
+        p: distributions.chi2_survival(statistic, 1.0) ?? 0.0 }
+}
+
+fn at_risk_of(times: [f64], time: f64) -> f64 {
+    var count = 0
+    for value in times {
+        if value >= time {
+            count = count + 1
+        }
+    }
+    return count.as_f64()
+}
+
+fn events_at(times: [f64], events: [bool], time: f64) -> f64 {
+    var count = 0
+    var i = 0
+    while i < times.len() {
+        if times[i] == time and events[i] {
+            count = count + 1
+        }
+        i = i + 1
+    }
+    return count.as_f64()
+}

@@ -14,7 +14,7 @@ plan that discovers them 300 packages in.
 | | |
 |---|---|
 | Started | 78 |
-| Now | 385 |
+| Now | 390 |
 | Tier 1 target | 200 |
 | Tier 2 target | 500 |
 | Tier 3 target | 800 |
@@ -236,7 +236,7 @@ says where the data came from and under what licence, which is the condition.
 | ~~Compiler tooling~~ | ~~`lexgen` `parsegen` `firstfollow` `ssaform` `regalloc`~~ — done | Lark, networkx, Python re |
 | ~~Scientific units~~ | ~~`siunits` `constants` `uncertainty` `dimension` `unitparse`~~ — done | pint, CODATA via scipy, uncertainties |
 | ~~Time zones~~ | ~~`tzfile` `tzrule` `sunrise` `solar` `leapsecond`~~ — done | zoneinfo, astral, IERS |
-| Statistics III | `bootstrap` `anova` `survival` `timeseries` `changepoint` | scipy, statsmodels |
+| ~~Statistics III~~ | ~~`bootstrap` `anova` `survival` `timeseries` `changepoint`~~ | scipy, statsmodels, lifelines, pingouin, ruptures |
 | Machine learning basics | `kmeans` `naivebayes` `decisiontree` `knn` `mlmetrics` | scikit-learn |
 | Security III | `passwordpolicy` `entropy` `secretscan` `keyderive` `saltedhash` | zxcvbn, gitleaks rules |
 | ~~Web III~~ | ~~`formdata` `csp` `hsts` `preflight` `webfinger`~~ | RFC 6797's own ABNF, Python's `email`, `content-security-policy`, Flask-Cors, urllib |

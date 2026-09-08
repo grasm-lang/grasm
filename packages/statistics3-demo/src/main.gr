@@ -1,0 +1,524 @@
+import bootstrap
+import anova
+import survival
+import timeseries
+import changepoint
+import random
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn near(a: f64, b: f64, tolerance: f64) -> bool {
+    var d = a - b
+    if d < 0.0 {
+        d = 0.0 - d
+    }
+    return d < tolerance
+}
+
+// ------------------------------------------------------------- bootstrap
+
+/// Twenty latencies, right-skewed the way latencies are.
+fn latencies() -> [f64] {
+    return [12.0, 13.5, 14.0, 14.2, 15.0, 15.5, 16.0, 17.0, 18.5, 19.0,
+        20.0, 21.5, 23.0, 26.0, 31.0, 38.0, 44.0, 61.0, 88.0, 140.0]
+}
+
+fn mean_statistic(xs: [f64]) -> f64 {
+    return bootstrap.mean_of(xs)
+}
+
+fn median_statistic(xs: [f64]) -> f64 {
+    return bootstrap.percentile_of(xs, 50.0) ?? 0.0
+}
+
+fn check_bootstrap(inout f: i64) / {io} {
+    print("-- bootstrap: an interval for a statistic that has no formula")
+    // numpy's default percentile, and the one every bootstrap reads off.
+    say(f, "the percentile interpolates between the two order statistics",
+        near(bootstrap.percentile_of([1.0, 2.0, 3.0, 4.0], 30.0) ?? 0.0,
+            1.9, 0.0000000001) and
+        near(bootstrap.percentile_of([1.0, 2.0, 3.0, 4.0], 50.0) ?? 0.0,
+            2.5, 0.0000000001))
+    var rng = random.seeded(20260909)
+    let sample = bootstrap.bootstrap_of(rng, latencies(), mean_statistic,
+        600) ?? BootSample{ observed: 0.0, distribution: [],
+        jackknife: [] }
+    say(f, "the resamples surround the estimate without being centred on it",
+        sample.distribution.len() == 600 and
+        near(sample.observed, 32.36, 0.000000001) and
+        near(bootstrap.mean_of(sample.distribution), 32.36, 1.0))
+    // The bias is small for a mean and the interval is nearly symmetric.
+    let plain = bootstrap.percentile_interval(sample.distribution, 0.95) ??
+    BootInterval{ low: 0.0, high: 0.0, method: "", low_percentile: 0.0,
+        high_percentile: 0.0 }
+    say(f, "a percentile interval reads the 2.5th and 97.5th percentiles",
+        near(plain.low_percentile, 2.5, 0.0000001) and
+        near(plain.high_percentile, 97.5, 0.0000001) and
+        near(plain.low, 20.98225, 0.000001) and
+        near(plain.high, 47.385375, 0.000001))
+    // BCa reads two different percentiles, and says which.
+    let corrected = bootstrap.bca_interval(sample, 0.95) ??
+    BootInterval{ low: 0.0, high: 0.0, method: "", low_percentile: 0.0,
+        high_percentile: 0.0 }
+    say(f, "BCa reads two other percentiles, and neither is 2.5",
+        not near(corrected.low_percentile, 2.5, 0.5) and
+        not near(corrected.high_percentile, 97.5, 0.5) and
+        corrected.low_percentile < corrected.high_percentile)
+    say(f, "and it pushes the interval up, because the statistic is skewed",
+        corrected.high - corrected.low > plain.high - plain.low or
+        corrected.low > plain.low)
+    // The two numbers BCa is made of, each checkable on its own.
+    let jack = bootstrap.jackknife(latencies(), mean_statistic)
+    say(f, "the jackknife leaves each observation out exactly once",
+        jack.len() == 20 and
+        near(jack[19], 26.694736842105263, 0.000000001))
+    say(f, "the acceleration is the skewness of those, and is small here",
+        near(bootstrap.acceleration(jack) ?? 1.0, 0.08868685, 0.0000001))
+    // Ties are why the bias correction counts half of them. Two below,
+    // two above and three on the mark reads as no bias at all; counting
+    // only what is strictly below would call it a shift of half a standard
+    // deviation.
+    say(f, "the bias correction splits the ties rather than ignoring them",
+        near(bootstrap.bias_correction([1.0, 2.0, 2.0, 2.0, 3.0], 2.0) ??
+            9.0, 0.0, 0.0000000001))
+    say(f, "so even a distribution of nothing but ties has no bias",
+        near(bootstrap.bias_correction([4.0, 4.0, 4.0], 4.0) ?? 9.0, 0.0,
+            0.0000000001))
+    // A distribution entirely on one side of the estimate wants an
+    // infinite shift, and there is no honest answer to give.
+    say(f, "but one that never reaches the estimate is refused",
+        degenerate_refused())
+    // The median's bootstrap distribution is discrete, which is the case
+    // the mid-p correction exists for.
+    let medians = bootstrap.bootstrap_of(rng, latencies(),
+        median_statistic, 300) ?? BootSample{ observed: 0.0,
+        distribution: [], jackknife: [] }
+    say(f, "a median's resamples take few distinct values, and tie often",
+        distinct_of(medians.distribution) < 60 and
+        ties_of(medians.distribution, medians.observed) > 20)
+    say(f, "so its BCa interval still comes out inside the sample's range",
+        bca_inside(medians))
+    // How many resamples a level needs before its tail is a real value.
+    say(f, "a 95% interval needs forty resamples to have a 2.5th percentile",
+        (bootstrap.resamples_needed(0.95) ?? 0) == 40 and
+        (bootstrap.resamples_needed(0.99) ?? 0) == 200)
+    say(f, "and an interval that ran off the end says so",
+        bootstrap.is_saturated(BootInterval{ low: 0.0, high: 0.0,
+            method: "bca", low_percentile: 0.05, high_percentile: 99.0 }, 100)
+        and not bootstrap.is_saturated(plain, 600))
+}
+
+fn degenerate_refused() -> bool {
+    match bootstrap.bias_correction([5.0, 6.0, 7.0], 4.0) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn distinct_of(values: [f64]) -> i64 {
+    var seen: [f64] = []
+    for value in values {
+        var found = false
+        for other in seen {
+            if other == value {
+                found = true
+            }
+        }
+        if not found {
+            seen.push(value)
+        }
+    }
+    return seen.len()
+}
+
+fn ties_of(values: [f64], target: f64) -> i64 {
+    var count = 0
+    for value in values {
+        if value == target {
+            count = count + 1
+        }
+    }
+    return count
+}
+
+fn bca_inside(sample: BootSample) -> bool {
+    match bootstrap.bca_interval(sample, 0.95) {
+        Ok(interval) -> return interval.low >= 12.0 and interval.high <= 140.0
+        Err(_e) -> return false
+    }
+}
+
+// ----------------------------------------------------------------- anova
+
+/// Three groups whose means differ, from the same population spread.
+fn three_groups() -> [[f64]] {
+    return [[6.0, 8.0, 4.0, 5.0, 3.0, 4.0],
+        [8.0, 12.0, 9.0, 11.0, 6.0, 8.0],
+        [13.0, 9.0, 11.0, 8.0, 7.0, 12.0]]
+}
+
+/// Three groups whose variances differ by a factor of twenty.
+fn uneven_groups() -> [[f64]] {
+    return [[10.0, 10.2, 9.8, 10.1, 9.9, 10.0],
+        [10.0, 14.0, 6.0, 12.0, 8.0, 10.0],
+        [11.0, 25.0, 1.0, 18.0, 4.0, 11.0]]
+}
+
+fn check_anova(inout f: i64) / {io} {
+    print("-- anova: which of these is not like the others")
+    let table = anova.one_way(three_groups()) ?? empty_table()
+    let between = anova.row_of(table, "between") ?? empty_row()
+    let within = anova.row_of(table, "within") ?? empty_row()
+    // scipy's f_oneway agrees to the last bit on all of these.
+    say(f, "the table splits the variation and spends its freedom",
+        near(between.sum_of_squares, 84.0, 0.000000001) and
+        near(within.sum_of_squares, 68.0, 0.000000001) and
+        between.freedom == 2.0 and within.freedom == 15.0)
+    say(f, "and the F is the ratio of what each degree of freedom bought",
+        near(between.f, 9.26470588235294, 0.0000000001) and
+        near(between.p, 0.00239877732939291, 0.0000000001))
+    // Two effect sizes, and the reason to report the smaller one.
+    say(f, "eta squared is the share explained, and flatters every study",
+        near(table.eta_squared, 0.552632, 0.000001))
+    say(f, "omega squared takes off what a grouping explains by luck",
+        near(table.omega_squared, 0.478705, 0.000001) and
+        table.omega_squared < table.eta_squared)
+    // Welch, and what it is for.
+    let classical = anova.one_way(uneven_groups()) ?? empty_table()
+    let robust = anova.welch(uneven_groups()) ?? empty_row()
+    say(f, "Welch buys the assumption away with fractional freedom",
+        robust.freedom < 15.0 and robust.freedom > 3.0 and
+        not near(robust.freedom, robust.freedom.round(), 0.01))
+    let classical_between = anova.row_of(classical, "between") ??
+    empty_row()
+    say(f, "and it and the classical test disagree when they should",
+        not near(robust.p, classical_between.p, 0.05))
+    // The two tests for the assumption itself.
+    say(f, "Levene on the median says the variances are not equal",
+        (anova.levene(uneven_groups()) ?? empty_row()).p < 0.2 and
+        (anova.levene(three_groups()) ?? empty_row()).p > 0.5)
+    say(f, "Bartlett says so far more emphatically, and is far less safe",
+        (anova.bartlett(uneven_groups()) ?? empty_row()).p <
+        (anova.levene(uneven_groups()) ?? empty_row()).p)
+    // The studentized range, which is what makes Tukey honest.
+    say(f, "the range of k normals is not the t distribution",
+        near(anova.studentized_range_cdf(3.0, 3.0, 10.0) ?? 0.0,
+            0.8650165848, 0.0000001) and
+        near(anova.studentized_range_cdf(3.0, 6.0, 10.0) ?? 0.0,
+            0.6512280863, 0.0000001))
+    say(f, "and its 95th point is the 3.88 printed in every q table",
+        near(anova.studentized_range_quantile(0.95, 3.0, 10.0) ?? 0.0,
+            3.87676773, 0.00001))
+    // Tukey, against scipy's tukey_hsd.
+    let pairs = anova.tukey_hsd(three_groups(), 0.95) ?? []
+    say(f, "Tukey compares every pair and spends the 5% across all of them",
+        pairs.len() == 3 and pairs[0].left == 0 and pairs[0].right == 1 and
+        near(pairs[0].p, 0.013913287, 0.0000001) and
+        near(pairs[2].p, 0.700659939, 0.0000001))
+    say(f, "so the two gaps against the first group are the real ones",
+        near(pairs[1].p, 0.002732122, 0.0000001) and pairs[1].significant and
+        pairs[0].significant and not pairs[2].significant)
+    say(f, "and its interval is the difference either side of one range",
+        near(pairs[1].high - pairs[1].low,
+            2.0 * 3.67337758 * pairs[1].error, 0.0001))
+    // Games-Howell, against pingouin.
+    let howell = anova.games_howell(uneven_groups(), 0.95) ?? []
+    say(f, "Games-Howell gives each pair its own error and its own freedom",
+        howell.len() == 3 and howell[0].error != howell[2].error and
+        near(howell[0].p, 1.0, 0.00001) and
+        near(howell[2].p, 0.900668, 0.00001))
+    // Two-way, against statsmodels.
+    let two = anova.two_way(two_way_cells()) ?? empty_table()
+    let rows_row = anova.row_of(two, "rows") ?? empty_row()
+    let columns_row = anova.row_of(two, "columns") ?? empty_row()
+    let interaction_row = anova.row_of(two, "interaction") ?? empty_row()
+    say(f, "a two-way table separates the two factors and their interaction",
+        two.rows.len() == 5 and near(rows_row.f, 90.75, 0.0001) and
+        near(columns_row.f, 36.75, 0.0001) and
+        near(interaction_row.f, 0.75, 0.0001) and
+        near(interaction_row.p, 0.411694, 0.000001))
+    say(f, "and an unbalanced design is refused, not silently guessed at",
+        unbalanced_refused())
+}
+
+fn two_way_cells() -> [[[f64]]] {
+    return [[[3.0, 5.0, 4.0], [6.0, 8.0, 7.0]],
+        [[8.0, 9.0, 10.0], [14.0, 12.0, 13.0]]]
+}
+
+fn empty_table() -> AnovaTable {
+    return AnovaTable{ rows: [], eta_squared: 0.0, omega_squared: 0.0 }
+}
+
+fn empty_row() -> AnovaRow {
+    return AnovaRow{ source: "", sum_of_squares: 0.0, freedom: 0.0,
+        mean_square: 0.0, f: 0.0, p: 0.0 }
+}
+
+fn unbalanced_refused() -> bool {
+    match anova.two_way([[[1.0, 2.0], [3.0, 4.0]], [[5.0, 6.0], [7.0]]]) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+// -------------------------------------------------------------- survival
+
+/// Ten subjects: `:1` ended, `:0` was still being followed.
+fn trial_times() -> [f64] {
+    return [6.0, 6.0, 6.0, 7.0, 10.0, 13.0, 16.0, 22.0, 23.0, 6.0]
+}
+
+fn trial_events() -> [bool] {
+    return [true, true, true, true, false, true, true, true, true, false]
+}
+
+fn control_times() -> [f64] {
+    return [1.0, 1.0, 2.0, 2.0, 3.0, 4.0, 4.0, 5.0, 5.0, 8.0]
+}
+
+fn control_events() -> [bool] {
+    return [true, true, true, true, true, true, true, true, true, true]
+}
+
+fn check_survival(inout f: i64) / {io} {
+    print("-- survival: the ones that have not happened yet still count")
+    let curve = survival.kaplan_meier(trial_times(), trial_events()) ??
+    SurvCurve{ points: [], observations: 0, events: 0 }
+    // lifelines gives the same curve for the classic leukaemia data.
+    say(f, "the curve steps only where something happened",
+        curve.observations == 10 and curve.events == 8 and
+        curve.points.len() == 7)
+    say(f, "and the drop at each step is the events over those at risk",
+        near(survival.survival_at(curve, 6.0), 0.7, 0.000000001) and
+        near(survival.survival_at(curve, 7.0), 0.5833333333, 0.000000001)
+        and near(survival.survival_at(curve, 13.0), 0.4375, 0.000000001))
+    // The censored one at time 6 leaves without causing a drop, but is at
+    // risk for the three events at time 6.
+    say(f, "a censoring leaves the risk set without moving the curve",
+        first_step(curve).at_risk == 10 and
+        first_step(curve).events == 3 and
+        first_step(curve).censored == 1)
+    say(f, "before the first event the survival is one, not undefined",
+        survival.survival_at(curve, 0.0) == 1.0 and
+        survival.survival_at(curve, 5.9) == 1.0)
+    // Nelson-Aalen is a sum where Kaplan-Meier is a product, so the two
+    // are close and not equal.
+    say(f, "the cumulative hazard is a sum, so it is not minus the log",
+        near(survival.hazard_at(curve, 13.0), 0.7166666666666667,
+            0.000000001) and
+        not near(survival.hazard_at(curve, 13.0),
+            0.0 - survival.survival_at(curve, 13.0).ln(), 0.0001))
+    // Three deaths recorded on one day did not happen at one instant.
+    say(f, "and the tie correction is a different number, not a rounding",
+        near(survival.smoothed_hazard_at(curve, 13.0), 0.7527777777777778,
+            0.000000001))
+    // The interval on the log-log scale never leaves the unit interval.
+    let band = survival.survival_interval(curve, 13.0, 0.95) ?? (0.0, 0.0)
+    say(f, "the confidence band stays inside zero and one by construction",
+        band.0 > 0.0 and band.1 < 1.0 and band.0 < 0.4375 and
+        band.1 > 0.4375 and near(band.0, 0.118715218, 0.000000001) and
+        near(band.1, 0.725648792, 0.000000001))
+    // The median, and the case where reporting one is a lie.
+    say(f, "the median is where the curve first reaches one half",
+        (survival.median_survival(curve) ?? 0.0) == 13.0 and
+        (survival.quantile_survival(curve, 0.3) ?? 0.0) == 6.0)
+    say(f, "and a curve that never gets there has none to report",
+        no_median())
+    // The area up to a horizon, which is the summary that survives both.
+    say(f, "the restricted mean is the area under the curve to a horizon",
+        near(survival.restricted_mean(curve, 20.0) ?? 0.0,
+            12.679166666666667, 0.000000001))
+    // The log-rank test, against lifelines.
+    let ranked = survival.log_rank(trial_times(), trial_events(),
+        control_times(), control_events()) ??
+    LogRank{ observed: 0.0, expected: 0.0, variance: 0.0,
+        statistic: 0.0, p: 0.0 }
+    say(f, "the log-rank compares events seen against events expected",
+        ranked.expected > ranked.observed and
+        near(ranked.statistic, 15.315752611475, 0.00000001) and
+        near(ranked.p, 0.00009095488251834, 0.00000000001))
+    // The counts are not the number of subjects: censoring is why.
+    say(f, "and the mismatched lengths of two groups are refused",
+        mismatched_refused())
+}
+
+fn first_step(curve: SurvCurve) -> SurvPoint {
+    if curve.points.len() == 0 {
+        return SurvPoint{ time: 0.0, at_risk: 0, events: 0, censored: 0,
+            survival: 0.0, variance: 0.0, cumulative_hazard: 0.0 }
+    }
+    return curve.points[0]
+}
+
+fn no_median() -> bool {
+    let curve = survival.kaplan_meier([1.0, 2.0, 3.0, 4.0],
+        [true, false, false, false]) ?? SurvCurve{ points: [],
+        observations: 0, events: 0 }
+    match survival.median_survival(curve) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn mismatched_refused() -> bool {
+    match survival.kaplan_meier([1.0, 2.0], [true]) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+// ------------------------------------------------------------ timeseries
+
+/// A short series with a period of four and a rising trend.
+fn quarterly() -> [f64] {
+    return [10.0, 14.0, 9.0, 11.0, 12.0, 16.0, 11.0, 13.0, 14.0, 18.0,
+        13.0, 15.0, 16.0, 20.0, 15.0, 17.0]
+}
+
+fn check_timeseries(inout f: i64) / {io} {
+    print("-- timeseries: the observations are not independent")
+    let correlations = timeseries.autocorrelation(quarterly(), 8) ?? []
+    // statsmodels' acf agrees on every one of these.
+    say(f, "lag zero is one, and the divisor is the whole series",
+        correlations.len() == 9 and correlations[0] == 1.0 and
+        near(correlations[4], 0.45588235294117646, 0.000000001))
+    say(f, "a season shows as a spike at its own lag and a dip between",
+        correlations[4] > correlations[3] and
+        correlations[4] > correlations[5] and correlations[5] < 0.0)
+    let partials = timeseries.partial_autocorrelation(quarterly(), 8) ?? []
+    say(f, "the partial version projects the lags in between away",
+        partials.len() == 9 and near(partials[1], 0.23529411764705882,
+            0.000000001) and near(partials[4], 0.388889, 0.000001) and
+        partials[4] < correlations[4])
+    // The whole correlogram at once, rather than one bar at a time.
+    let box = timeseries.ljung_box(quarterly(), 5) ??
+    TsTest{ statistic: 0.0, freedom: 0.0, p: 0.0 }
+    say(f, "Ljung-Box asks about the first few lags together",
+        near(box.statistic, 9.612300156590813, 0.000000001) and
+        box.freedom == 5.0 and near(box.p, 0.08699609995235,
+            0.00000000001))
+    say(f, "and finds nothing in a series that really is independent",
+        near((timeseries.ljung_box([1.0, 0.0 - 1.0, 1.0, 0.0 - 1.0, 1.0,
+            0.0 - 1.0, 1.0, 0.0 - 1.0], 2) ??
+            TsTest{ statistic: 0.0, freedom: 0.0, p: 1.0 }).p,
+            0.000296044730057, 0.000000000001))
+    // Differencing, which is what makes a trending series stationary.
+    say(f, "differencing removes a trend and loses one observation",
+        (timeseries.difference(quarterly()) ?? []).len() == 15 and
+        (timeseries.seasonal_difference(quarterly(), 4) ?? []).len() == 12)
+    // The classical decomposition, against statsmodels.
+    let parts = timeseries.decompose(quarterly(), 4) ??
+    TsDecomposition{ trend: [], trend_known: [], seasonal: [],
+        remainder: [], remainder_known: [] }
+    say(f, "an even period needs a half-weighted term at each end",
+        parts.trend_known.len() == 16 and not parts.trend_known[1] and
+        parts.trend_known[2] and not parts.trend_known[14] and
+        near(parts.trend[2], 11.25, 0.000000001))
+    say(f, "the season is centred, so it moves nothing into the level",
+        near(sum_over_period(parts.seasonal, 4), 0.0, 0.000000001) and
+        near(parts.seasonal[1], 3.25, 0.000000001) and
+        near(parts.seasonal[2], 0.0 - 2.25, 0.000000001))
+    say(f, "and the three parts add back up to the series where all exist",
+        near(parts.trend[8] + parts.seasonal[8] + parts.remainder[8],
+            14.0, 0.000000001))
+    let strength = timeseries.strengths(parts) ?? (0.0, 0.0)
+    say(f, "the strengths say this one is more season than trend",
+        strength.0 > 0.9 and strength.1 > 0.9)
+    say(f, "and a series shorter than two periods is refused",
+        short_refused())
+}
+
+fn sum_over_period(values: [f64], period: i64) -> f64 {
+    var total = 0.0
+    var i = 0
+    while i < period {
+        total = total + values[i]
+        i = i + 1
+    }
+    return total
+}
+
+fn short_refused() -> bool {
+    match timeseries.decompose([1.0, 2.0, 3.0, 4.0, 5.0], 4) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+// ----------------------------------------------------------- changepoint
+
+/// Twelve at about 10, then twelve at about 20.
+fn stepped() -> [f64] {
+    return [10.2, 9.8, 10.5, 9.6, 10.1, 10.4, 9.7, 10.3, 9.9, 10.0, 10.6,
+        9.5, 20.3, 19.7, 20.1, 20.5, 19.8, 20.2, 19.6, 20.4, 20.0, 19.9,
+        20.6, 19.4]
+}
+
+fn check_changepoint(inout f: i64) / {io} {
+    print("-- changepoint: when did the behaviour change")
+    // ruptures finds the same break with the same penalty.
+    say(f, "the step is found where it is, not near it",
+        (changepoint.pelt(stepped(), 20.0) ?? []) == [12])
+    say(f, "and pruning changes the running time, not the answer",
+        (changepoint.pelt(stepped(), 20.0) ?? []) ==
+        (changepoint.optimal_breaks(stepped(), 20.0) ?? []))
+    // The penalty is the whole problem.
+    say(f, "no penalty at all puts a break between every pair of points",
+        (changepoint.pelt(stepped(), 0.0) ?? []).len() == 23)
+    say(f, "and a penalty larger than the whole cost finds nothing",
+        (changepoint.pelt(stepped(), 100000.0) ?? []).len() == 0)
+    say(f, "the default rule reads the noise off the differences",
+        near(changepoint.default_penalty(stepped()) ?? 0.0,
+            17.33559276328058, 0.0000000001))
+    // The segments the breaks describe.
+    let segments = changepoint.segments_of(stepped(),
+        changepoint.pelt(stepped(), 20.0) ?? [])
+    say(f, "the segments each carry their own level",
+        segments.len() == 2 and near(segments[0].mean, 10.05,
+            0.000000001) and near(segments[1].mean, 20.041666666666668,
+            0.000000001) and segments[0].end == segments[1].start)
+    // Binary segmentation agrees here and is not guaranteed to.
+    say(f, "binary segmentation agrees on one obvious break",
+        (changepoint.binary_segmentation(stepped(), 1) ?? []) == [12])
+    say(f, "and it is greedy, so it commits before it knows the rest",
+        (changepoint.binary_segmentation(stepped(), 2) ?? []).len() == 2)
+    // CUSUM signals a persistent shift long before a threshold on the
+    // value would.
+    let alarms = changepoint.cusum(stepped(), 10.0, 0.5, 3.0) ?? []
+    say(f, "CUSUM signals the step within a couple of observations",
+        alarms.len() > 0 and alarms[0] >= 12 and alarms[0] <= 14)
+    say(f, "and stays quiet on a series that is only noisy",
+        (changepoint.cusum([10.2, 9.8, 10.5, 9.6, 10.1, 10.4, 9.7, 10.3],
+            10.0, 0.5, 3.0) ?? []).len() == 0)
+    say(f, "a threshold that is not positive is refused",
+        threshold_refused())
+}
+
+fn threshold_refused() -> bool {
+    match changepoint.cusum([1.0, 2.0], 1.0, 0.5, 0.0) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn main() / {io} {
+    var f = 0
+    check_bootstrap(f)
+    check_anova(f)
+    check_survival(f)
+    check_timeseries(f)
+    check_changepoint(f)
+    if f == 0 {
+        print("statistics: every claim held")
+    } else {
+        print("statistics: {f} claims failed")
+    }
+}

@@ -1,0 +1,363 @@
+// Time series: the observations are not independent, and every method that
+// assumes they are gets the uncertainty wrong.
+//
+// A thousand daily measurements of a server's latency are not a thousand
+// independent samples. If today's value is close to yesterday's, the
+// effective sample size might be forty, and a confidence interval computed
+// as though it were a thousand is five times too narrow. Everything here is
+// about measuring and removing that dependence.
+//
+// ## The autocorrelation function
+//
+// The correlation of the series with itself, shifted. A slow decay means the
+// series is drifting; a spike at lag 7 in daily data means a weekly cycle;
+// alternating signs mean overcorrection. The divisor is the whole series
+// length at every lag, not the number of overlapping pairs, which makes the
+// estimate biased and the matrix it forms positive definite — a trade every
+// implementation makes in the same direction.
+//
+// ## Partial autocorrelation
+//
+// The correlation at lag k with the intervening lags projected out. If today
+// depends on yesterday and yesterday on the day before, the plain
+// correlation at lag 2 is large without there being anything at lag 2 at
+// all. The partial version asks what is left, and the Durbin-Levinson
+// recursion computes it from the plain one without fitting anything.
+//
+// ## Decomposition
+//
+// A series is a trend plus a season plus what is left. The classical
+// decomposition here estimates the trend with a centred moving average, the
+// season as the average detrended value in each period position, and the
+// remainder by subtraction. It is not the best method — STL is — but it is
+// the one everything else is compared against, and its failure modes are the
+// instructive ones: the trend is missing at each end by half a period, and a
+// season that changes shape gets averaged into one that fits neither year.
+
+import distributions
+
+type TsError =
+    | TooShort(length: i64, needed: i64)
+    | BadLag(lag: i64)
+    | BadPeriod(period: i64)
+    | Constant()
+
+type TsDecomposition = {
+    /// The trend, with a gap of half a period at each end where a centred
+    /// average cannot reach.
+    trend: [f64],
+    /// True where the trend was estimated at all.
+    trend_known: [bool],
+    seasonal: [f64],
+    remainder: [f64],
+    remainder_known: [bool],
+}
+
+type TsTest = {
+    statistic: f64,
+    freedom: f64,
+    p: f64,
+}
+
+fn mean_of(xs: [f64]) -> f64 {
+    if xs.len() == 0 {
+        return 0.0
+    }
+    var total = 0.0
+    for x in xs {
+        total = total + x
+    }
+    return total / xs.len().as_f64()
+}
+
+/// The autocorrelation at every lag from 0 up to `most`.
+///
+/// Lag 0 is 1 by construction and is kept so the indices line up with the
+/// lags, which is the convention every plot uses.
+pub fn autocorrelation(values: [f64], most: i64) -> [f64] ! TsError {
+    if most < 0 {
+        fail(BadLag(most))
+    }
+    if values.len() < 2 {
+        fail(TooShort(values.len(), 2))
+    }
+    if most >= values.len() {
+        fail(BadLag(most))
+    }
+    let centre = mean_of(values)
+    var denominator = 0.0
+    for value in values {
+        denominator = denominator + (value - centre) * (value - centre)
+    }
+    if denominator == 0.0 {
+        fail(Constant())
+    }
+    var out: [f64] = []
+    var lag = 0
+    while lag <= most {
+        var total = 0.0
+        var i = lag
+        while i < values.len() {
+            total = total + (values[i] - centre) * (values[i - lag] - centre)
+            i = i + 1
+        }
+        out.push(total / denominator)
+        lag = lag + 1
+    }
+    return out
+}
+
+/// The partial autocorrelation, by the Durbin-Levinson recursion.
+///
+/// The recursion also hands back the residual variance at each order for
+/// free, which is what makes it the way to choose an autoregressive order
+/// without fitting anything.
+pub fn partial_autocorrelation(values: [f64],
+    most: i64) -> [f64] ! TsError {
+    let correlations = try autocorrelation(values, most)
+    var out: [f64] = [1.0]
+    if most == 0 {
+        return out
+    }
+    var previous: [f64] = []
+    var variance = 1.0
+    var order = 1
+    while order <= most {
+        var top = correlations[order]
+        var i = 1
+        while i < order {
+            top = top - previous[i - 1] * correlations[order - i]
+            i = i + 1
+        }
+        if variance == 0.0 {
+            fail(Constant())
+        }
+        let reflection = top / variance
+        var current: [f64] = []
+        var j = 1
+        while j < order {
+            current.push(previous[j - 1] - reflection *
+                previous[order - j - 1])
+            j = j + 1
+        }
+        current.push(reflection)
+        out.push(reflection)
+        variance = variance * (1.0 - reflection * reflection)
+        previous = current
+        order = order + 1
+    }
+    return out
+}
+
+/// The Ljung-Box test: are the first `lags` autocorrelations, taken
+/// together, larger than noise?
+///
+/// Looking at a correlogram and finding one bar outside the band is not
+/// evidence of anything — with twenty lags one of them is expected to be.
+/// This asks the question once, which is why it is the test that belongs
+/// under the plot.
+pub fn ljung_box(values: [f64], lags: i64) -> TsTest ! TsError {
+    if lags < 1 {
+        fail(BadLag(lags))
+    }
+    let correlations = try autocorrelation(values, lags)
+    let n = values.len().as_f64()
+    var total = 0.0
+    var lag = 1
+    while lag <= lags {
+        total = total + correlations[lag] * correlations[lag] /
+        (n - lag.as_f64())
+        lag = lag + 1
+    }
+    let statistic = n * (n + 2.0) * total
+    return TsTest{ statistic: statistic, freedom: lags.as_f64(),
+        p: distributions.chi2_survival(statistic, lags.as_f64()) ?? 0.0 }
+}
+
+/// The series differenced once, which is `n - 1` long.
+pub fn difference(values: [f64]) -> [f64] ! TsError {
+    if values.len() < 2 {
+        fail(TooShort(values.len(), 2))
+    }
+    var out: [f64] = []
+    var i = 1
+    while i < values.len() {
+        out.push(values[i] - values[i - 1])
+        i = i + 1
+    }
+    return out
+}
+
+/// The series differenced at a season's lag, removing a repeating pattern
+/// rather than a trend.
+pub fn seasonal_difference(values: [f64],
+    period: i64) -> [f64] ! TsError {
+    if period < 1 {
+        fail(BadPeriod(period))
+    }
+    if values.len() <= period {
+        fail(TooShort(values.len(), period + 1))
+    }
+    var out: [f64] = []
+    var i = period
+    while i < values.len() {
+        out.push(values[i] - values[i - period])
+        i = i + 1
+    }
+    return out
+}
+
+/// A centred moving average of `window` terms.
+///
+/// An even window has no centre, so it is averaged twice with a half weight
+/// at each end — which is why a 12-month average of monthly data uses
+/// thirteen terms.
+pub fn moving_average(values: [f64],
+    window: i64) -> ([f64], [bool]) ! TsError {
+    if window < 1 {
+        fail(BadPeriod(window))
+    }
+    if values.len() < window {
+        fail(TooShort(values.len(), window))
+    }
+    var out: [f64] = []
+    var known: [bool] = []
+    let half = window / 2
+    var i = 0
+    while i < values.len() {
+        if window % 2 == 1 {
+            if i < half or i + half >= values.len() {
+                out.push(0.0)
+                known.push(false)
+            } else {
+                var total = 0.0
+                var j = i - half
+                while j <= i + half {
+                    total = total + values[j]
+                    j = j + 1
+                }
+                out.push(total / window.as_f64())
+                known.push(true)
+            }
+        } else {
+            if i < half or i + half >= values.len() {
+                out.push(0.0)
+                known.push(false)
+            } else {
+                var total = (values[i - half] + values[i + half]) / 2.0
+                var j = i - half + 1
+                while j < i + half {
+                    total = total + values[j]
+                    j = j + 1
+                }
+                out.push(total / window.as_f64())
+                known.push(true)
+            }
+        }
+        i = i + 1
+    }
+    return (out, known)
+}
+
+/// The classical additive decomposition into trend, season and remainder.
+///
+/// The seasonal component is centred so it sums to zero over a period; a
+/// decomposition whose season has a mean of 3 has silently moved part of the
+/// level into it and the three parts no longer mean what they are called.
+pub fn decompose(values: [f64],
+    period: i64) -> TsDecomposition ! TsError {
+    if period < 2 {
+        fail(BadPeriod(period))
+    }
+    if values.len() < 2 * period {
+        fail(TooShort(values.len(), 2 * period))
+    }
+    let trend = try moving_average(values, period)
+    var detrended: [f64] = []
+    var i = 0
+    while i < values.len() {
+        detrended.push(values[i] - trend.0[i])
+        i = i + 1
+    }
+    var averages: [f64] = []
+    var position = 0
+    while position < period {
+        var total = 0.0
+        var count = 0
+        var j = position
+        while j < values.len() {
+            if trend.1[j] {
+                total = total + detrended[j]
+                count = count + 1
+            }
+            j = j + period
+        }
+        if count == 0 {
+            averages.push(0.0)
+        } else {
+            averages.push(total / count.as_f64())
+        }
+        position = position + 1
+    }
+    let centre = mean_of(averages)
+    var seasonal: [f64] = []
+    var remainder: [f64] = []
+    var known: [bool] = []
+    var k = 0
+    while k < values.len() {
+        let season = averages[k % period] - centre
+        seasonal.push(season)
+        remainder.push(values[k] - trend.0[k] - season)
+        known.push(trend.1[k])
+        k = k + 1
+    }
+    return TsDecomposition{ trend: trend.0, trend_known: trend.1,
+        seasonal: seasonal, remainder: remainder, remainder_known: known }
+}
+
+/// The strength of the trend and of the season, each between 0 and 1.
+///
+/// One minus the ratio of the remainder's variance to the variance of what
+/// is left when only that component is removed. Useful for saying which of
+/// two hundred series are worth looking at.
+pub fn strengths(decomposition: TsDecomposition) -> (f64, f64) ! TsError {
+    var remainder: [f64] = []
+    var detrended: [f64] = []
+    var deseasoned: [f64] = []
+    var i = 0
+    while i < decomposition.remainder.len() {
+        if decomposition.remainder_known[i] {
+            remainder.push(decomposition.remainder[i])
+            detrended.push(decomposition.remainder[i] +
+                decomposition.seasonal[i])
+            deseasoned.push(decomposition.remainder[i] +
+                decomposition.trend[i])
+        }
+        i = i + 1
+    }
+    if remainder.len() < 2 {
+        fail(TooShort(remainder.len(), 2))
+    }
+    let noise = variance_of(remainder)
+    var trend_strength = 0.0
+    if variance_of(deseasoned) > 0.0 {
+        trend_strength = 1.0 - noise / variance_of(deseasoned)
+    }
+    var season_strength = 0.0
+    if variance_of(detrended) > 0.0 {
+        season_strength = 1.0 - noise / variance_of(detrended)
+    }
+    return (trend_strength.max(0.0), season_strength.max(0.0))
+}
+
+fn variance_of(xs: [f64]) -> f64 {
+    if xs.len() < 2 {
+        return 0.0
+    }
+    let centre = mean_of(xs)
+    var total = 0.0
+    for x in xs {
+        total = total + (x - centre) * (x - centre)
+    }
+    return total / (xs.len() - 1).as_f64()
+}
