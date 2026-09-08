@@ -1,0 +1,421 @@
+// ICO: a favicon is not one picture, and the header lies about the height.
+//
+// An .ico file is a container. It holds several pictures at several sizes,
+// and the browser picks one — which is why a favicon that looks crisp in a
+// tab and blurry in a bookmark bar is usually a file with only one size in
+// it. The format is from Windows 1.0 and the container has barely changed
+// since; what changed is what may sit inside each slot.
+//
+// ## The two things a slot may hold
+//
+// Either a whole PNG file, byte for byte, or a Windows DIB — a bitmap with
+// its info header but *without* the fourteen-byte file header that would
+// make it a .bmp. There is no field saying which. A reader has to look at the
+// first bytes and decide, and the PNG signature is the only reliable tell.
+//
+// PNG-in-ICO was added in Windows Vista for the 256-pixel size, because a
+// 256x256 uncompressed 32-bit bitmap is a quarter of a megabyte. Older
+// readers see a slot they cannot decode rather than a smaller picture, which
+// is why files still ship both.
+//
+// ## The height that is twice the height
+//
+// A DIB inside an ICO declares a height of exactly double the real one. The
+// top half is the colour data and the bottom half is a one-bit AND mask
+// saying which pixels are transparent. This predates alpha channels, and it
+// is still there in 32-bit icons that carry a perfectly good alpha channel of
+// their own — so the mask is usually all zeroes and ignored, and a reader
+// that forgets to halve the height produces an icon twice as tall with
+// garbage in the bottom half.
+//
+// ## The dimension byte that means 256
+//
+// Width and height in a directory entry are single bytes, so the largest size
+// they can express is 255. A 256-pixel icon stores zero, which is the reason
+// the format's own maximum is a special case rather than a limit.
+//
+// Checked against Pillow, which reads and writes both kinds of slot.
+
+import bmpread
+
+type IcoEntry = {
+    /// In pixels. A stored zero means 256, and is recorded here as 256.
+    width: i64,
+    height: i64,
+    /// Palette entries, or 0 when there is no palette.
+    colours: i64,
+    /// The cursor hotspot reuses these two fields, which is why they are kept
+    /// as they were read rather than as planes and depth.
+    planes: i64,
+    bit_count: i64,
+    length: i64,
+    offset: i64,
+}
+
+type IcoFile = {
+    /// 1 for an icon, 2 for a cursor. They share a format and differ in what
+    /// two of the directory fields mean.
+    kind: i64,
+    entries: [IcoEntry],
+}
+
+type IcoImage = {
+    width: i64,
+    height: i64,
+    /// Red, green, blue, alpha, row-major, top row first.
+    pixels: [i64],
+}
+
+type IcoError =
+    | NotIco(kind: i64)
+    | Truncated(at: i64)
+    | NoEntries()
+    | UnsupportedDepth(bits: i64)
+    | EmbeddedPng(index: i64)
+
+fn read16(data: bytes, at: i64) -> i64 {
+    return data.at(at) + data.at(at + 1) * 256
+}
+
+fn read32(data: bytes, at: i64) -> i64 {
+    return read16(data, at) + read16(data, at + 2) * 65536
+}
+
+fn push16(inout out: [i64], value: i64) {
+    out.push(value % 256)
+    out.push(value / 256 % 256)
+}
+
+fn push32(inout out: [i64], value: i64) {
+    push16(out, value % 65536)
+    push16(out, value / 65536 % 65536)
+}
+
+/// Whether the first bytes are an icon or cursor directory.
+pub fn is_ico(data: bytes) -> bool {
+    if data.len() < 6 {
+        return false
+    }
+    let kind = read16(data, 2)
+    return read16(data, 0) == 0 and (kind == 1 or kind == 2) and
+    read16(data, 4) > 0
+}
+
+/// The directory: what sizes the file holds and where each one starts.
+pub fn parse(data: bytes) -> IcoFile ! IcoError {
+    if data.len() < 6 {
+        fail(Truncated(data.len()))
+    }
+    let kind = read16(data, 2)
+    if read16(data, 0) != 0 or (kind != 1 and kind != 2) {
+        fail(NotIco(kind))
+    }
+    let count = read16(data, 4)
+    if count == 0 {
+        fail(NoEntries())
+    }
+    if 6 + count * 16 > data.len() {
+        fail(Truncated(6 + count * 16))
+    }
+    var entries: [IcoEntry] = []
+    for i in 0..count {
+        entries.push(read_entry(data, 6 + i * 16))
+    }
+    return IcoFile{ kind: kind, entries: entries }
+}
+
+fn read_entry(data: bytes, at: i64) -> IcoEntry {
+    return IcoEntry{
+        width: dimension(data.at(at)),
+        height: dimension(data.at(at + 1)),
+        colours: data.at(at + 2),
+        planes: read16(data, at + 4),
+        bit_count: read16(data, at + 6),
+        length: read32(data, at + 8),
+        offset: read32(data, at + 12),
+    }
+}
+
+/// A stored dimension byte as a real size: zero means 256.
+pub fn dimension(stored: i64) -> i64 {
+    if stored == 0 {
+        return 256
+    }
+    return stored
+}
+
+/// The byte a dimension is stored as: 256 becomes zero.
+pub fn dimension_byte(size: i64) -> i64 {
+    if size >= 256 {
+        return 0
+    }
+    return size
+}
+
+/// Whether a slot holds a whole PNG file rather than a bare bitmap.
+///
+/// There is no field for this. The signature is the only tell, and a reader
+/// that assumes one kind produces noise on the other.
+pub fn is_png_entry(data: bytes, entry: IcoEntry) -> bool {
+    if entry.offset + 8 > data.len() {
+        return false
+    }
+    let signature = [137, 80, 78, 71, 13, 10, 26, 10]
+    for i in 0..8 {
+        if data.at(entry.offset + i) != signature[i] {
+            return false
+        }
+    }
+    return true
+}
+
+/// The bytes of one slot, whatever kind it is.
+pub fn entry_bytes(data: bytes, entry: IcoEntry) -> bytes {
+    var out: [i64] = []
+    var i = 0
+    while i < entry.length and entry.offset + i < data.len() {
+        out.push(data.at(entry.offset + i))
+        i = i + 1
+    }
+    return bytes_of(out)
+}
+
+/// The entry closest to a wanted size, preferring the larger of two.
+///
+/// What a browser does with a favicon. Scaling down loses less than scaling
+/// up, so a tie goes to the bigger picture, and the deepest one wins among
+/// equals — a 32-bit 16-pixel icon beats a 4-bit one.
+pub fn best_for(file: IcoFile, size: i64) -> IcoEntry ! IcoError {
+    if file.entries.len() == 0 {
+        fail(NoEntries())
+    }
+    var best = file.entries[0]
+    for entry in file.entries {
+        if better(entry, best, size) {
+            best = entry
+        }
+    }
+    return best
+}
+
+fn better(entry: IcoEntry, best: IcoEntry, size: i64) -> bool {
+    let a = distance(entry.width, size)
+    let b = distance(best.width, size)
+    if a != b {
+        return a < b
+    }
+    return entry.bit_count > best.bit_count
+}
+
+fn distance(have: i64, want: i64) -> i64 {
+    if have >= want {
+        return have - want
+    }
+    // Too small is worse than too big by the same amount, so an upscale is
+    // penalised twice over.
+    return (want - have) * 2 + 1
+}
+
+/// The picture in one slot, with the mask applied.
+///
+/// Refuses a PNG slot rather than guessing: decoding a PNG is `png`'s job,
+/// and a container that silently returned an empty picture for a third of
+/// modern favicons would be worse than one that says which slot it cannot
+/// read.
+pub fn decode_entry(data: bytes, entry: IcoEntry,
+    index: i64) -> IcoImage ! IcoError {
+    if is_png_entry(data, entry) {
+        fail(EmbeddedPng(index))
+    }
+    let dib: BmpInfo ! BmpError = bmpread.dib_info(data, entry.offset)
+    var header = try or_truncated(dib, entry.offset)
+    // The declared height counts the colour rows and the mask rows together.
+    header.height = header.height / 2
+    if header.bit_count != 1 and header.bit_count != 4 and
+    header.bit_count != 8 and header.bit_count != 24 and
+    header.bit_count != 32 {
+        fail(UnsupportedDepth(header.bit_count))
+    }
+    let decoded: [i64] ! BmpError = bmpread.decode_with(data, header)
+    var pixels = try or_truncated(decoded, entry.offset)
+    apply_mask(pixels, data, header)
+    return IcoImage{ width: header.width, height: header.height,
+        pixels: pixels }
+}
+
+fn or_truncated[T](result: T ! BmpError, at: i64) -> T ! IcoError {
+    match result {
+        Ok(v) -> return v
+        Err(_e) -> fail(Truncated(at))
+    }
+}
+
+fn apply_mask(inout pixels: [i64], data: bytes, header: BmpInfo) {
+    // A 32-bit icon carries its own alpha channel in the fourth byte of every
+    // pixel, and a mask that is usually all zeroes. Where the alpha says
+    // anything at all, it wins; an icon whose alpha is zero everywhere is one
+    // written before Windows XP, and means opaque.
+    if header.bit_count == 32 {
+        let raw: [i64] ! BmpError = bmpread.raw_alpha(data, header)
+        let alpha = raw ?? []
+        if any_alpha(alpha) {
+            var i = 0
+            while i < alpha.len() and i * 4 + 3 < pixels.len() {
+                pixels[i * 4 + 3] = alpha[i]
+                i = i + 1
+            }
+            return
+        }
+    }
+    // Otherwise the mask decides: one bit a pixel, rows padded to four bytes
+    // like any other bitmap and stored bottom-up like any other bitmap. A set
+    // bit means "do not draw", which is the opposite of an alpha channel and
+    // the reason a reader that treats it as one inverts every icon it opens.
+    let colour_stride = bmpread.row_bytes(header.width, header.bit_count)
+    let mask_start = header.data_offset + colour_stride * header.height
+    let mask_stride = bmpread.row_bytes(header.width, 1)
+    for y in 0..header.height {
+        let row = header.height - 1 - y
+        for x in 0..header.width {
+            let at = mask_start + row * mask_stride + x / 8
+            let to = (y * header.width + x) * 4 + 3
+            if at >= data.len() or to >= pixels.len() {
+                continue
+            }
+            if data.at(at).ushr(7 - x % 8).bit_and(1) == 1 {
+                pixels[to] = 0
+            } else {
+                pixels[to] = 255
+            }
+        }
+    }
+}
+
+fn any_alpha(alpha: [i64]) -> bool {
+    for v in alpha {
+        if v != 0 {
+            return true
+        }
+    }
+    return false
+}
+
+/// An icon file from pictures, each written as a 32-bit DIB with an empty
+/// mask.
+///
+/// The mask is written even though every pixel's alpha already says the same
+/// thing, because a reader old enough to ignore alpha reads the mask instead,
+/// and an icon with no mask block at all is one those readers refuse.
+pub fn build(images: [IcoImage]) -> bytes ! IcoError {
+    if images.len() == 0 {
+        fail(NoEntries())
+    }
+    var out: [i64] = []
+    push16(out, 0)
+    push16(out, 1)
+    push16(out, images.len())
+    var offset = 6 + images.len() * 16
+    var bodies: [[i64]] = []
+    for image in images {
+        let body = dib_of(image)
+        bodies.push(body)
+        write_entry(out, image, body.len(), offset)
+        offset = offset + body.len()
+    }
+    for body in bodies {
+        for b in body {
+            out.push(b)
+        }
+    }
+    return bytes_of(out)
+}
+
+fn write_entry(inout out: [i64], image: IcoImage, length: i64, offset: i64) {
+    out.push(dimension_byte(image.width))
+    out.push(dimension_byte(image.height))
+    out.push(0)
+    out.push(0)
+    push16(out, 1)
+    push16(out, 32)
+    push32(out, length)
+    push32(out, offset)
+}
+
+fn dib_of(image: IcoImage) -> [i64] {
+    var out: [i64] = []
+    push32(out, 40)
+    push32(out, image.width)
+    // Twice the height: colour rows and mask rows together.
+    push32(out, image.height * 2)
+    push16(out, 1)
+    push16(out, 32)
+    push32(out, 0)
+    push32(out, image.width * image.height * 4)
+    push32(out, 2835)
+    push32(out, 2835)
+    push32(out, 0)
+    push32(out, 0)
+    write_colour_rows(out, image)
+    write_empty_mask(out, image)
+    return out
+}
+
+fn write_colour_rows(inout out: [i64], image: IcoImage) {
+    var y = image.height - 1
+    while y >= 0 {
+        for x in 0..image.width {
+            let at = (y * image.width + x) * 4
+            // Blue, green, red, alpha — the order a little-endian machine
+            // reads an integer written red, green, blue.
+            out.push(image.pixels[at + 2])
+            out.push(image.pixels[at + 1])
+            out.push(image.pixels[at])
+            out.push(image.pixels[at + 3])
+        }
+        y = y - 1
+    }
+}
+
+fn write_empty_mask(inout out: [i64], image: IcoImage) {
+    let stride = (image.width + 31) / 32 * 4
+    for _y in 0..image.height {
+        for _i in 0..stride {
+            out.push(0)
+        }
+    }
+}
+
+/// The sizes a file offers, largest first.
+pub fn sizes(file: IcoFile) -> [(i64, i64)] {
+    var out: [(i64, i64)] = []
+    for entry in file.entries {
+        out.push((entry.width, entry.height))
+    }
+    out.sort()
+    return out.rev()
+}
+
+/// Whether every slot is a picture the DIB reader can decode.
+pub fn all_bitmaps(data: bytes, file: IcoFile) -> bool {
+    for entry in file.entries {
+        if is_png_entry(data, entry) {
+            return false
+        }
+    }
+    return true
+}
+
+/// A cursor's hotspot, which reuses the planes and depth fields.
+///
+/// The same two bytes mean colour planes in an icon and an x coordinate in a
+/// cursor, which is why a cursor opened as an icon claims to have an
+/// improbable number of planes.
+pub fn hotspot(file: IcoFile, index: i64) -> (i64, i64) ! IcoError {
+    if index < 0 or index >= file.entries.len() {
+        fail(NoEntries())
+    }
+    if file.kind != 2 {
+        fail(NotIco(file.kind))
+    }
+    return (file.entries[index].planes, file.entries[index].bit_count)
+}

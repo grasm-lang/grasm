@@ -1,0 +1,10 @@
+[package]
+name = "ico"
+version = "1.0.0"
+
+# Bytes in, bytes out. Opens nothing.
+capabilities = []
+
+[dependencies.bmpread]
+path = "../bmpread"
+version = "^1.0.0"

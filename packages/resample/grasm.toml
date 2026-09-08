@@ -1,0 +1,6 @@
+[package]
+name = "resample"
+version = "1.0.0"
+
+# Arithmetic on pixels the caller supplies. Opens nothing.
+capabilities = []

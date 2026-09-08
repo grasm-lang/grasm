@@ -1,0 +1,425 @@
+// Resizing a picture, and why the naive way looks wrong.
+//
+// Scaling an image is a resampling problem, not an averaging problem. The
+// picture is a set of samples of a continuous thing; to resize it you
+// reconstruct the continuous thing and sample it again somewhere else. Which
+// reconstruction you choose is the filter, and the choice is visible.
+//
+// ## The one that everybody writes first
+//
+// Nearest neighbour: for each output pixel, take the input pixel nearest to
+// it. It is exact for an integer upscale and terrible for everything else.
+// Downscaling by three throws away eight of every nine pixels, so a page of
+// text becomes a page of noise — the fine detail does not blur, it *aliases*,
+// turning into patterns that were never there.
+//
+// ## What the good ones do differently
+//
+// A proper filter has a **support**: a radius, in input pixels, over which it
+// averages. Bilinear's is one, bicubic's is two, Lanczos's is three. Each
+// output pixel is a weighted sum of every input pixel within that radius,
+// with the weights coming from the filter's own curve.
+//
+// The part that is easy to miss: **when downscaling, the support has to grow
+// with the scale factor.** Halving a picture means each output pixel covers
+// two input pixels, so a bilinear filter must reach two away, not one.
+// Without that, a downscale samples too few pixels and aliases exactly as
+// badly as nearest neighbour — which is why "we use bicubic" is not, on its
+// own, a claim that the thumbnails look right.
+//
+// ## The filters
+//
+// **Box** averages a rectangle and nothing else — right for an integer
+// downscale, blocky otherwise. **Bilinear** is a triangle: cheap, slightly
+// soft. **Hamming** is a windowed sinc that fixes bilinear's softness without
+// ringing. **Bicubic** is the cubic with `a = -0.5`, which is what everything
+// means by "bicubic". **Lanczos** is a sinc windowed by a wider sinc: the
+// sharpest, and the one that rings — a dark halo beside a bright edge, which
+// is the filter overshooting and is not a bug.
+//
+// ## Two passes, not one
+//
+// A separable filter can be applied horizontally and then vertically, which
+// costs `w + h` weights a pixel instead of `w * h`. Every image library does
+// this. It is the reason resizing is fast enough to do on upload.
+//
+// Checked against Pillow, which uses the same construction, on float pixels
+// where neither side is rounding.
+
+type ResampleFilter =
+    | Nearest
+    | BoxFilter
+    | Bilinear
+    | Hamming
+    | Bicubic
+    | Lanczos
+
+type ResampleError =
+    | SizeMismatch(pixels: i64, expected: i64)
+    | EmptyTarget(width: i64, height: i64)
+
+fn pi() -> f64 {
+    return 3.141592653589793
+}
+
+/// The radius a filter reaches, in input pixels, before any scaling.
+pub fn support(filter: ResampleFilter) -> f64 {
+    match filter {
+        Nearest -> return 0.0
+        BoxFilter -> return 0.5
+        Bilinear -> return 1.0
+        Hamming -> return 1.0
+        Bicubic -> return 2.0
+        Lanczos -> return 3.0
+    }
+}
+
+/// A filter's weight at a distance.
+pub fn weight(filter: ResampleFilter, x: f64) -> f64 {
+    match filter {
+        Nearest -> return nearest_weight(x)
+        BoxFilter -> return box_weight(x)
+        Bilinear -> return bilinear_weight(x)
+        Hamming -> return hamming_weight(x)
+        Bicubic -> return bicubic_weight(x)
+        Lanczos -> return lanczos_weight(x)
+    }
+}
+
+fn nearest_weight(x: f64) -> f64 {
+    if x >= 0.0 - 0.5 and x < 0.5 {
+        return 1.0
+    }
+    return 0.0
+}
+
+fn box_weight(x: f64) -> f64 {
+    // Half-open at the *upper* end: a sample exactly half a pixel to the
+    // right of the centre is inside the box and one exactly half a pixel to
+    // the left is not. Choosing the other half-open interval shifts every
+    // integer-ratio downscale by one input pixel, which is invisible on a
+    // photograph and obvious on a checkerboard.
+    if x > 0.0 - 0.5 and x <= 0.5 {
+        return 1.0
+    }
+    return 0.0
+}
+
+fn bilinear_weight(x: f64) -> f64 {
+    let d = magnitude(x)
+    if d < 1.0 {
+        return 1.0 - d
+    }
+    return 0.0
+}
+
+fn hamming_weight(x: f64) -> f64 {
+    var d = magnitude(x)
+    if d == 0.0 {
+        return 1.0
+    }
+    if d >= 1.0 {
+        return 0.0
+    }
+    d = d * pi()
+    return d.sin() / d * (0.54 + 0.46 * d.cos())
+}
+
+/// The cubic with `a = -0.5`.
+///
+/// Every library's "bicubic" is this one. The parameter controls how much the
+/// curve dips below zero on either side of the peak — how much it sharpens —
+/// and -0.5 is the value that makes the interpolation reproduce a quadratic
+/// exactly, which is Keys's result from 1981 and the reason nobody argues
+/// about it any more.
+fn bicubic_weight(x: f64) -> f64 {
+    let a = 0.0 - 0.5
+    let d = magnitude(x)
+    if d < 1.0 {
+        return ((a + 2.0) * d - (a + 3.0)) * d * d + 1.0
+    }
+    if d < 2.0 {
+        return (((d - 5.0) * d + 8.0) * d - 4.0) * a
+    }
+    return 0.0
+}
+
+fn lanczos_weight(x: f64) -> f64 {
+    if x <= 0.0 - 3.0 or x >= 3.0 {
+        return 0.0
+    }
+    if x == 0.0 {
+        return 1.0
+    }
+    let d = x * pi()
+    return d.sin() * (d / 3.0).sin() / (d * d / 3.0)
+}
+
+fn magnitude(x: f64) -> f64 {
+    if x < 0.0 {
+        return 0.0 - x
+    }
+    return x
+}
+
+/// The input pixels one output pixel draws on, and their weights.
+///
+/// `xmin` is the first input index; the list holds one weight for each
+/// consecutive index from there. The weights sum to one, so the filter
+/// changes the picture's detail and not its brightness.
+pub fn coefficients(filter: ResampleFilter, in_size: i64, out_size: i64,
+    index: i64) -> (i64, [f64]) {
+    let scale = in_size.as_f64() / out_size.as_f64()
+    // Downscaling widens the filter; upscaling does not narrow it.
+    var filter_scale = scale
+    if filter_scale < 1.0 {
+        filter_scale = 1.0
+    }
+    let reach = support(filter) * filter_scale
+    let centre = (index.as_f64() + 0.5) * scale
+    var from = truncate(centre - reach + 0.5)
+    if from < 0 {
+        from = 0
+    }
+    var to = truncate(centre + reach + 0.5)
+    if to > in_size {
+        to = in_size
+    }
+    if to <= from {
+        from = clamp(truncate(centre), 0, in_size - 1)
+        return (from, [1.0])
+    }
+    var weights: [f64] = []
+    var total = 0.0
+    var i = from
+    while i < to {
+        let w = weight(filter, (i.as_f64() - centre + 0.5) / filter_scale)
+        weights.push(w)
+        total = total + w
+        i = i + 1
+    }
+    if total != 0.0 {
+        var k = 0
+        while k < weights.len() {
+            weights[k] = weights[k] / total
+            k = k + 1
+        }
+    }
+    return (from, weights)
+}
+
+fn truncate(v: f64) -> i64 {
+    return v.as_i64()
+}
+
+fn clamp(v: i64, low: i64, high: i64) -> i64 {
+    if v < low {
+        return low
+    }
+    if v > high {
+        return high
+    }
+    return v
+}
+
+/// A picture resized, one channel at a time.
+///
+/// `pixels` is `width * height * channels` values, row-major, channels
+/// interleaved. Values are not clamped or rounded: a caller working in bytes
+/// clamps afterwards, because a sharp filter legitimately overshoots and
+/// clamping between the two passes throws away detail that the second pass
+/// would have brought back.
+pub fn resize(pixels: [f64], width: i64, height: i64, channels: i64,
+    to_width: i64, to_height: i64,
+    filter: ResampleFilter) -> [f64] ! ResampleError {
+    if pixels.len() != width * height * channels {
+        fail(SizeMismatch(pixels.len(), width * height * channels))
+    }
+    if to_width <= 0 or to_height <= 0 {
+        fail(EmptyTarget(to_width, to_height))
+    }
+    // Horizontally first, then vertically, because a separable filter costs
+    // `w + h` weights a pixel that way instead of `w * h`.
+    let across = resize_horizontal(pixels, width, height, channels, to_width,
+        filter)
+    return resize_vertical(across, to_width, height, channels, to_height,
+        filter)
+}
+
+fn resize_horizontal(pixels: [f64], width: i64, height: i64, channels: i64,
+    to_width: i64, filter: ResampleFilter) -> [f64] {
+    if to_width == width {
+        return pixels
+    }
+    var out: [f64] = []
+    var plan: [(i64, [f64])] = []
+    for x in 0..to_width {
+        plan.push(coefficients(filter, width, to_width, x))
+    }
+    for y in 0..height {
+        for x in 0..to_width {
+            let step = plan[x]
+            for c in 0..channels {
+                var total = 0.0
+                var i = 0
+                while i < step.1.len() {
+                    let at = (y * width + step.0 + i) * channels + c
+                    total = total + step.1[i] * pixels[at]
+                    i = i + 1
+                }
+                out.push(total)
+            }
+        }
+    }
+    return out
+}
+
+fn resize_vertical(pixels: [f64], width: i64, height: i64, channels: i64,
+    to_height: i64, filter: ResampleFilter) -> [f64] {
+    if to_height == height {
+        return pixels
+    }
+    var out: [f64] = []
+    var plan: [(i64, [f64])] = []
+    for y in 0..to_height {
+        plan.push(coefficients(filter, height, to_height, y))
+    }
+    for y in 0..to_height {
+        let step = plan[y]
+        for x in 0..width {
+            for c in 0..channels {
+                var total = 0.0
+                var i = 0
+                while i < step.1.len() {
+                    let at = ((step.0 + i) * width + x) * channels + c
+                    total = total + step.1[i] * pixels[at]
+                    i = i + 1
+                }
+                out.push(total)
+            }
+        }
+    }
+    return out
+}
+
+/// Nearest neighbour, which is not a filter and does not go through the two
+/// passes.
+///
+/// Each output pixel is one input pixel, chosen by mapping the output pixel's
+/// centre back into the input. Exact for an integer upscale, and the reason
+/// pixel art resized by anything else turns to mush.
+pub fn resize_nearest(pixels: [f64], width: i64, height: i64, channels: i64,
+    to_width: i64, to_height: i64) -> [f64] ! ResampleError {
+    if pixels.len() != width * height * channels {
+        fail(SizeMismatch(pixels.len(), width * height * channels))
+    }
+    if to_width <= 0 or to_height <= 0 {
+        fail(EmptyTarget(to_width, to_height))
+    }
+    var out: [f64] = []
+    for y in 0..to_height {
+        let from_y = clamp(source_index(y, height, to_height), 0, height - 1)
+        for x in 0..to_width {
+            let from_x = clamp(source_index(x, width, to_width), 0, width - 1)
+            for c in 0..channels {
+                out.push(pixels[(from_y * width + from_x) * channels + c])
+            }
+        }
+    }
+    return out
+}
+
+fn source_index(index: i64, in_size: i64, out_size: i64) -> i64 {
+    return ((index.as_f64() + 0.5) * in_size.as_f64() /
+        out_size.as_f64()).as_i64()
+}
+
+/// Bytes in, bytes out, the way every image library does it.
+///
+/// This is **not** `resize` with a clamp on the end. It clamps and rounds
+/// after each of the two passes, because that is what an 8-bit pipeline does:
+/// the intermediate is an 8-bit image too. It costs precision — a sharp
+/// filter overshoots past 255 on a bright edge and the overshoot is cut off
+/// before the second pass can bring it back — and it is what Pillow, ImageMagick
+/// and every browser produce, so it is what a caller comparing against them
+/// needs.
+///
+/// A caller who would rather keep the precision resizes in floats with
+/// `resize` and rounds once, at the end.
+pub fn resize_bytes(pixels: [i64], width: i64, height: i64, channels: i64,
+    to_width: i64, to_height: i64,
+    filter: ResampleFilter) -> [i64] ! ResampleError {
+    if pixels.len() != width * height * channels {
+        fail(SizeMismatch(pixels.len(), width * height * channels))
+    }
+    if to_width <= 0 or to_height <= 0 {
+        fail(EmptyTarget(to_width, to_height))
+    }
+    var floats: [f64] = []
+    for v in pixels {
+        floats.push(v.as_f64())
+    }
+    match filter {
+        Nearest -> {
+            let near = try resize_nearest(floats, width, height, channels,
+                to_width, to_height)
+            return to_bytes(near)
+        }
+        _ -> {}
+    }
+    let across = round_between(resize_horizontal(floats, width, height,
+        channels, to_width, filter))
+    return to_bytes(resize_vertical(across, to_width, height, channels,
+        to_height, filter))
+}
+
+fn round_between(values: [f64]) -> [f64] {
+    var out: [f64] = []
+    for v in values {
+        out.push(clamp((v + 0.5).as_i64(), 0, 255).as_f64())
+    }
+    return out
+}
+
+fn to_bytes(values: [f64]) -> [i64] {
+    var out: [i64] = []
+    for v in values {
+        out.push(clamp((v + 0.5).as_i64(), 0, 255))
+    }
+    return out
+}
+
+/// The size a picture becomes when made to fit inside a box without changing
+/// its shape.
+///
+/// What "thumbnail" means everywhere. The result is at least one pixel each
+/// way, because a 1000x1 picture fitted into a 100-pixel box is 100x0
+/// otherwise, and a zero-sized picture is not a thumbnail.
+pub fn fit(width: i64, height: i64, box_width: i64, box_height: i64) -> (i64, i64) {
+    if width <= 0 or height <= 0 {
+        return (0, 0)
+    }
+    var scale = box_width.as_f64() / width.as_f64()
+    let other = box_height.as_f64() / height.as_f64()
+    if other < scale {
+        scale = other
+    }
+    if scale >= 1.0 {
+        return (width, height)
+    }
+    var w = (width.as_f64() * scale + 0.5).as_i64()
+    var h = (height.as_f64() * scale + 0.5).as_i64()
+    if w < 1 {
+        w = 1
+    }
+    if h < 1 {
+        h = 1
+    }
+    return (w, h)
+}
+
+/// Whether a scale is an exact integer downscale, where a box filter is both
+/// the fastest and the correct choice.
+pub fn is_integer_downscale(in_size: i64, out_size: i64) -> bool {
+    return out_size > 0 and in_size % out_size == 0 and in_size > out_size
+}

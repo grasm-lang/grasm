@@ -14,7 +14,7 @@ plan that discovers them 300 packages in.
 | | |
 |---|---|
 | Started | 78 |
-| Now | 335 |
+| Now | 340 |
 | Tier 1 target | 200 |
 | Tier 2 target | 500 |
 | Tier 3 target | 800 |
@@ -228,7 +228,7 @@ says where the data came from and under what licence, which is the condition.
 | ~~Fonts~~ | ~~`sfnt` `cmap` `glyf` `woff` `fontmetrics`~~ — done | fontTools |
 | ~~Barcodes~~ | ~~`code128` `ean` `itf` `codabar` `code39`~~ — done | python-barcode |
 | ~~Audio metadata~~ | ~~`id3` `flacmeta` `midi` `wavmeta` `loudness`~~ — done | mutagen, mido, pyloudnorm |
-| Images II | `gif` `ico` `jpegmeta` `resample` `bmpwrite` | Pillow |
+| ~~Images II~~ | ~~`gif` `ico` `jpegmeta` `resample`~~ and `bmpread`, because `bmp` already writes — done | Pillow |
 | Text encodings | `codepage` `shiftjis` `gb18030` `big5` `euckr` | Python codecs |
 | Compression II | `bzip2` `lzw` `huffman` `rangecoder` `deltacodec` | Python bz2, reference LZW |
 | Protocols II | `mqtt` `coap` `stomp` `amqpframe` `wsextension` | paho, aiocoap |

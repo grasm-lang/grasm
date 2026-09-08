@@ -1,0 +1,24 @@
+[package]
+name = "images2_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.gif]
+path = "../gif"
+version = "^1.0.0"
+
+[dependencies.ico]
+path = "../ico"
+version = "^1.0.0"
+
+[dependencies.jpegmeta]
+path = "../jpegmeta"
+version = "^1.0.0"
+
+[dependencies.resample]
+path = "../resample"
+version = "^1.0.0"
+
+[dependencies.bmpread]
+path = "../bmpread"
+version = "^1.0.0"

@@ -1,0 +1,6 @@
+[package]
+name = "jpegmeta"
+version = "1.0.0"
+
+# Reads a JPEG's markers. Decodes no pixels and opens nothing.
+capabilities = []

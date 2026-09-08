@@ -1,0 +1,404 @@
+// What a JPEG says about itself, without decoding a single pixel.
+//
+// Most of what a program wants from a JPEG is in the first few hundred bytes:
+// how big it is, whether it is progressive, whether the camera was held
+// sideways. Decoding the picture to find out costs a thousand times more, and
+// a thumbnail service that decodes every upload to read its dimensions is the
+// classic way to turn a small server into a slow one.
+//
+// ## The structure
+//
+// A JPEG is a chain of markers. Each is 0xFF followed by a type byte, and
+// each — except a handful that stand alone — is followed by a two-byte
+// big-endian length that **includes the length field itself** but not the
+// marker. A walker that adds two for the length has skipped two bytes too
+// many at every segment.
+//
+// The picture's size is in a start-of-frame marker, of which there are
+// thirteen: 0xC0 is baseline, 0xC2 is progressive, and the rest are
+// arithmetic-coded or hierarchical variants nothing writes. 0xC4, 0xC8 and
+// 0xCC are in the same numeric range and are *not* frames, which is the trap
+// — a reader that treats every 0xCn as a frame reads the Huffman table as a
+// picture size.
+//
+// ## Orientation, and why photographs arrive sideways
+//
+// A phone does not rotate the picture when you turn it. It writes the sensor
+// data as it comes and records a tag saying which way was up. That tag lives
+// in EXIF, which is TIFF, which is embedded whole inside an APP1 marker —
+// so reading it means parsing a second, unrelated format that has its own
+// byte order, declared by the two bytes `II` or `MM` at its start.
+//
+// Eight orientations are defined. Six of them involve a mirror. Only four
+// occur in practice, and the reason a photograph appears sideways on one
+// device and upright on another is that one of them read this tag.
+//
+// ## What is deliberately not here
+//
+// No entropy decoding. This package answers questions about the file; `jpeg`
+// would be the package that turns it into pixels, and it is a much larger
+// piece of work.
+//
+// Checked against Pillow for sizes, progressive flags, JFIF density and EXIF
+// orientation.
+
+type JpegSegment = {
+    /// The byte after 0xFF.
+    marker: i64,
+    /// Where the segment's payload starts, past the length field.
+    offset: i64,
+    length: i64,
+}
+
+type JpegFrame = {
+    /// Bits a sample; 8 in everything but medical imaging.
+    precision: i64,
+    width: i64,
+    height: i64,
+    components: i64,
+    progressive: bool,
+    /// The marker the frame was found in, so a caller can tell 0xC1 from
+    /// 0xC0 without guessing.
+    marker: i64,
+}
+
+type JpegError =
+    | NotJpeg(first: i64)
+    | Truncated(at: i64)
+    | NoFrame()
+    | NoExif()
+    | NoTag(tag: i64)
+
+fn read16(data: bytes, at: i64) -> i64 {
+    return data.at(at) * 256 + data.at(at + 1)
+}
+
+/// Whether the file starts with a start-of-image marker.
+pub fn is_jpeg(data: bytes) -> bool {
+    return data.len() > 3 and data.at(0) == 255 and data.at(1) == 216
+}
+
+/// Whether a marker stands alone, with no length and no payload.
+///
+/// The restart markers, start and end of image, and the reserved 0x01. Every
+/// other marker carries a length, and a walker that gets this list wrong
+/// reads the picture data as a segment header.
+pub fn is_standalone(marker: i64) -> bool {
+    return marker == 216 or marker == 217 or marker == 1 or
+    (marker >= 208 and marker <= 215)
+}
+
+/// Whether a marker introduces a frame — which is not every 0xCn.
+pub fn is_frame_marker(marker: i64) -> bool {
+    if marker < 192 or marker > 207 {
+        return false
+    }
+    // 0xC4 is a Huffman table, 0xC8 is reserved, 0xCC is an arithmetic
+    // coding table. All three sit in the middle of the frame markers.
+    return marker != 196 and marker != 200 and marker != 204
+}
+
+/// Every segment up to the start of scan.
+///
+/// Stops there because what follows is entropy-coded data, in which 0xFF
+/// bytes are stuffed with a following zero and every marker-looking pair is
+/// not a marker. Walking past it means implementing the stuffing rules, and
+/// nothing that wants metadata needs to.
+pub fn segments(data: bytes) -> [JpegSegment] ! JpegError {
+    if not is_jpeg(data) {
+        fail(NotJpeg(first_byte(data)))
+    }
+    var out: [JpegSegment] = []
+    var at = 2
+    while at + 1 < data.len() {
+        if data.at(at) != 255 {
+            fail(Truncated(at))
+        }
+        var marker = data.at(at + 1)
+        // Any number of 0xFF bytes may pad the space before a marker.
+        while marker == 255 and at + 2 < data.len() {
+            at = at + 1
+            marker = data.at(at + 1)
+        }
+        if is_standalone(marker) {
+            at = at + 2
+            continue
+        }
+        if at + 3 >= data.len() {
+            fail(Truncated(at))
+        }
+        let length = read16(data, at + 2)
+        out.push(JpegSegment{ marker: marker, offset: at + 4,
+            length: length - 2 })
+        // The length counts itself, so the next marker is two bytes past the
+        // marker plus the length — not two more.
+        at = at + 2 + length
+        if marker == 218 {
+            break
+        }
+    }
+    return out
+}
+
+fn first_byte(data: bytes) -> i64 {
+    if data.len() == 0 {
+        return 0 - 1
+    }
+    return data.at(0)
+}
+
+/// The picture's size, depth and component count.
+pub fn frame(data: bytes) -> JpegFrame ! JpegError {
+    for segment in try segments(data) {
+        if not is_frame_marker(segment.marker) {
+            continue
+        }
+        if segment.offset + 5 >= data.len() {
+            fail(Truncated(segment.offset))
+        }
+        return JpegFrame{
+            precision: data.at(segment.offset),
+            height: read16(data, segment.offset + 1),
+            width: read16(data, segment.offset + 3),
+            components: data.at(segment.offset + 5),
+            // 0xC2 and 0xC6 and 0xCA are the progressive ones.
+            progressive: segment.marker == 194 or segment.marker == 198 or
+            segment.marker == 202,
+            marker: segment.marker,
+        }
+    }
+    fail(NoFrame())
+}
+
+/// Whether a picture is progressive — sent in passes of increasing detail
+/// rather than top to bottom.
+pub fn is_progressive(data: bytes) -> bool {
+    let f: JpegFrame ! JpegError = frame(data)
+    match f {
+        Ok(v) -> return v.progressive
+        Err(_e) -> return false
+    }
+}
+
+/// The comment segments, which nothing writes and everything preserves.
+pub fn comments(data: bytes) -> [str] {
+    var out: [str] = []
+    let found: [JpegSegment] ! JpegError = segments(data)
+    for segment in found ?? [] {
+        if segment.marker == 254 {
+            out.push(slice(data, segment.offset, segment.length).to_str())
+        }
+    }
+    return out
+}
+
+fn slice(data: bytes, at: i64, length: i64) -> bytes {
+    var out: [i64] = []
+    var i = 0
+    while i < length and at + i < data.len() {
+        out.push(data.at(at + i))
+        i = i + 1
+    }
+    return bytes_of(out)
+}
+
+// -------------------------------------------------------------------- JFIF
+
+type JpegDensity = {
+    /// 0 no units (an aspect ratio), 1 dots an inch, 2 dots a centimetre.
+    units: i64,
+    x: i64,
+    y: i64,
+    /// Major and minor, as written: 1 and 2 is the usual 1.02.
+    major: i64,
+    minor: i64,
+}
+
+/// The JFIF header, which says how big a pixel is meant to be.
+///
+/// Units of zero mean the two numbers are an aspect ratio rather than a
+/// resolution, which is how a file claims non-square pixels without saying
+/// how big they are.
+pub fn density(data: bytes) -> JpegDensity ! JpegError {
+    for segment in try segments(data) {
+        if segment.marker != 224 or segment.length < 12 {
+            continue
+        }
+        if not tag_is(data, segment.offset, "JFIF") {
+            continue
+        }
+        return JpegDensity{
+            major: data.at(segment.offset + 5),
+            minor: data.at(segment.offset + 6),
+            units: data.at(segment.offset + 7),
+            x: read16(data, segment.offset + 8),
+            y: read16(data, segment.offset + 10),
+        }
+    }
+    fail(NoTag(224))
+}
+
+fn tag_is(data: bytes, at: i64, name: str) -> bool {
+    let want = name.to_bytes()
+    if at + want.len() >= data.len() {
+        return false
+    }
+    for i in 0..want.len() {
+        if data.at(at + i) != want.at(i) {
+            return false
+        }
+    }
+    return data.at(at + want.len()) == 0
+}
+
+// -------------------------------------------------------------------- EXIF
+
+/// Where the EXIF block's TIFF header starts, or -1.
+pub fn exif_offset(data: bytes) -> i64 {
+    let found: [JpegSegment] ! JpegError = segments(data)
+    for segment in found ?? [] {
+        if segment.marker == 225 and tag_is(data, segment.offset, "Exif") {
+            // "Exif", a zero, and a padding zero, and then a whole TIFF file
+            // whose offsets are relative to its own start.
+            return segment.offset + 6
+        }
+    }
+    return 0 - 1
+}
+
+/// Whether the embedded TIFF is little-endian.
+///
+/// EXIF is TIFF, and TIFF declares its own byte order — `II` for Intel and
+/// `MM` for Motorola. A reader that assumes either one gets a tag count of
+/// several thousand on half the world's photographs.
+pub fn exif_little_endian(data: bytes) -> bool {
+    let at = exif_offset(data)
+    if at < 0 or at + 1 >= data.len() {
+        return true
+    }
+    return data.at(at) == 73
+}
+
+fn tiff16(data: bytes, at: i64, little: bool) -> i64 {
+    if little {
+        return data.at(at) + data.at(at + 1) * 256
+    }
+    return data.at(at) * 256 + data.at(at + 1)
+}
+
+fn tiff32(data: bytes, at: i64, little: bool) -> i64 {
+    if little {
+        return tiff16(data, at, true) + tiff16(data, at + 2, true) * 65536
+    }
+    return tiff16(data, at, false) * 65536 + tiff16(data, at + 2, false)
+}
+
+/// A tag's value from the first directory, as an integer.
+///
+/// Only the short and long types, which is what every tag anyone reads for
+/// orientation, resolution or colour space actually is.
+pub fn exif_tag(data: bytes, tag: i64) -> i64 ! JpegError {
+    let base = exif_offset(data)
+    if base < 0 {
+        fail(NoExif())
+    }
+    let little = exif_little_endian(data)
+    let first = base + tiff32(data, base + 4, little)
+    if first + 1 >= data.len() {
+        fail(Truncated(first))
+    }
+    let count = tiff16(data, first, little)
+    for i in 0..count {
+        let entry = first + 2 + i * 12
+        if entry + 11 >= data.len() {
+            fail(Truncated(entry))
+        }
+        if tiff16(data, entry, little) != tag {
+            continue
+        }
+        return read_value(data, entry, little)
+    }
+    fail(NoTag(tag))
+}
+
+fn read_value(data: bytes, entry: i64, little: bool) -> i64 {
+    let kind = tiff16(data, entry + 2, little)
+    // A value of four bytes or fewer is stored in the offset field itself,
+    // which is why a short tag's value sits at the *start* of those four
+    // bytes on a big-endian file and would be read as zero otherwise.
+    if kind == 3 {
+        return tiff16(data, entry + 8, little)
+    }
+    return tiff32(data, entry + 8, little)
+}
+
+/// Which way was up, as the EXIF orientation tag.
+///
+/// 1 is upright. 3 is upside down. 6 and 8 are the two ninety-degree turns.
+/// The other four involve a mirror and essentially never occur. A file with
+/// no tag is upright, because that is what every viewer assumes.
+pub fn orientation(data: bytes) -> i64 {
+    let v: i64 ! JpegError = exif_tag(data, 274)
+    return v ?? 1
+}
+
+/// The quarter-turns clockwise an orientation asks for.
+pub fn rotation(orientation: i64) -> i64 {
+    if orientation == 3 or orientation == 4 {
+        return 2
+    }
+    if orientation == 5 or orientation == 6 {
+        return 1
+    }
+    if orientation == 7 or orientation == 8 {
+        return 3
+    }
+    return 0
+}
+
+/// Whether an orientation also asks for a mirror.
+pub fn mirrored(orientation: i64) -> bool {
+    return orientation == 2 or orientation == 4 or orientation == 5 or
+    orientation == 7
+}
+
+/// The size the picture should be displayed at, which is not the size stored
+/// in it when the camera was held sideways.
+pub fn display_size(data: bytes) -> (i64, i64) ! JpegError {
+    let f = try frame(data)
+    if rotation(orientation(data)) % 2 == 1 {
+        return (f.height, f.width)
+    }
+    return (f.width, f.height)
+}
+
+/// How many restart intervals the file declares, which is what makes a JPEG
+/// decodable in parallel.
+pub fn restart_interval(data: bytes) -> i64 {
+    let found: [JpegSegment] ! JpegError = segments(data)
+    for segment in found ?? [] {
+        if segment.marker == 221 and segment.offset + 1 < data.len() {
+            return read16(data, segment.offset)
+        }
+    }
+    return 0
+}
+
+/// The quantisation tables' identifiers, which say how many distinct
+/// qualities the file uses.
+pub fn quantisation_tables(data: bytes) -> i64 {
+    var count = 0
+    let found: [JpegSegment] ! JpegError = segments(data)
+    for segment in found ?? [] {
+        if segment.marker == 219 {
+            // One segment may hold several tables, each 65 or 129 bytes.
+            var at = 0
+            while at < segment.length {
+                let precision = data.at(segment.offset + at).ushr(4)
+                at = at + 1 + 64 * (precision + 1)
+                count = count + 1
+            }
+        }
+    }
+    return count
+}

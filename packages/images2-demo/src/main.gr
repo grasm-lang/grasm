@@ -1,0 +1,599 @@
+import gif
+import ico
+import jpegmeta
+import resample
+import bmpread
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn near(a: f64, b: f64, tolerance: f64) -> bool {
+    var d = a - b
+    if d < 0.0 {
+        d = 0.0 - d
+    }
+    return d < tolerance
+}
+
+// ------------------------------------------------------------------- gif
+
+// Written by Pillow: 4x4, four colours, GIF87a because it uses no extension.
+fn pillow_gif() -> bytes {
+    return bytes_of([71, 73, 70, 56, 55, 97, 4, 0, 4, 0, 129, 0, 0, 255, 0, 0,
+        0, 255, 0, 0, 0, 255, 255, 255, 255, 44, 0, 0, 0, 0, 4, 0, 4, 0, 0, 8,
+        15, 0, 1, 4, 16, 48, 96, 224, 0, 0, 4, 5, 30, 28, 24, 16, 0, 59])
+}
+
+fn gif_of(data: bytes) -> GifImage {
+    let parsed: GifImage ! GifError = gif.parse(data)
+    return parsed ?? GifImage{ version: "?", width: 0, height: 0,
+        background: 0, global_palette: [], frames: [], loop_count: 0 - 2,
+        comments: [] }
+}
+
+fn check_gif(inout f: i64) / {io} {
+    print("-- gif: LZW with the bits the wrong way round")
+    let image = gif_of(pillow_gif())
+    say(f, "Pillow's file reads back as Pillow wrote it",
+        image.version == "87a" and image.width == 4 and image.height == 4 and
+        image.frames.len() == 1)
+    say(f, "including the palette, in red, green, blue order",
+        image.global_palette == [255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255,
+            255])
+    say(f, "and every palette index of the picture",
+        image.frames[0].pixels == [0, 1, 2, 3, 1, 2, 3, 0, 2, 3, 0, 1, 3, 0,
+            1, 2])
+    // A palette's size is a three-bit exponent, so a picture with three
+    // colours pays for four and one with 257 cannot be stored at all.
+    say(f, "a palette size is an exponent, not a count",
+        gif.palette_entries(0) == 2 and gif.palette_entries(1) == 4 and
+        gif.palette_entries(7) == 256 and gif.size_field_for(3) == 1 and
+        gif.size_field_for(256) == 7)
+    // The bits are packed least-significant first, which is the opposite of
+    // almost every other format.
+    let codes = gif.lzw_encode([1, 1, 1, 2, 2, 1, 1, 1, 1, 2], 2)
+    let back: [i64] ! GifError = gif.lzw_decode(codes, 2)
+    say(f, "LZW round-trips, dictionary and all",
+        (back ?? []) == [1, 1, 1, 2, 2, 1, 1, 1, 1, 2])
+    say(f, "and the encoder is smaller than what it encodes",
+        codes.len() < 10)
+    // The four passes are every eighth row from 0, then from 4, then every
+    // fourth from 2, then every second from 1.
+    say(f, "an interlaced frame stores its rows in four passes",
+        gif.interlace_rows(8) == [0, 4, 2, 6, 1, 3, 5, 7])
+    say(f, "and putting them back is the inverse",
+        gif.deinterlace([0, 4, 2, 6, 1, 3, 5, 7], 1, 8) ==
+        [0, 1, 2, 3, 4, 5, 6, 7])
+    // Encoding and reading back is the round trip that matters: Pillow reads
+    // what this writes, and this reads what Pillow writes.
+    let written: bytes ! GifError = gif.encode_frame(4, 4,
+        image.frames[0].pixels, image.global_palette)
+    let again = gif_of(written ?? "".to_bytes())
+    say(f, "a file this writes reads back identically",
+        again.frames[0].pixels == image.frames[0].pixels and
+        again.global_palette == image.global_palette)
+    say(f, "and is smaller, because Pillow always declares eight-bit codes",
+        (written ?? "".to_bytes()).len() < pillow_gif().len())
+    check_gif_animation(f)
+}
+
+// Two 2x1 frames with index 0 transparent: the second frame leaves the first
+// frame's left pixel showing through.
+fn animation() -> bytes {
+    var out: [i64] = []
+    for b in [71, 73, 70, 56, 57, 97] {
+        out.push(b)
+    }
+    for b in [2, 0, 1, 0, 128, 0, 0] {
+        out.push(b)
+    }
+    for b in [255, 0, 0, 0, 0, 255] {
+        out.push(b)
+    }
+    // NETSCAPE2.0: loop three times.
+    for b in [33, 255, 11, 78, 69, 84, 83, 67, 65, 80, 69, 50, 46, 48, 3, 1,
+        3, 0, 0] {
+        out.push(b)
+    }
+    push_frame(out, 10, [1, 0])
+    push_frame(out, 20, [0, 1])
+    out.push(59)
+    return bytes_of(out)
+}
+
+fn push_frame(inout out: [i64], delay: i64, pixels: [i64]) {
+    // Graphic control: transparency on, index 0, with a delay.
+    for b in [33, 249, 4, 1, delay % 256, delay / 256, 0, 0] {
+        out.push(b)
+    }
+    for b in [44, 0, 0, 0, 0, 2, 0, 1, 0, 0] {
+        out.push(b)
+    }
+    let codes = gif.lzw_encode(pixels, 2)
+    out.push(2)
+    out.push(codes.len())
+    for i in 0..codes.len() {
+        out.push(codes.at(i))
+    }
+    out.push(0)
+}
+
+fn check_gif_animation(inout f: i64) / {io} {
+    let image = gif_of(animation())
+    say(f, "an animation is several image blocks, not a special kind of file",
+        image.frames.len() == 2 and gif.is_animated(image))
+    // The control extension sits before the image it applies to, so a
+    // parser that pairs them the other way is off by one frame throughout.
+    say(f, "each delay belongs to the frame after the extension carrying it",
+        image.frames[0].delay == 10 and image.frames[1].delay == 20)
+    say(f, "the loop count comes from a block nobody standardised",
+        image.loop_count == 3 and gif.has_transparency(image))
+    // Frame 2 draws blue on the right and leaves the left transparent, so
+    // the red from frame 1 is still there.
+    let canvases = gif.render(image)
+    say(f, "a frame is a patch over the last one, not a picture",
+        canvases[0] == [0, 0, 255, 255, 0, 0] and
+        canvases[1] == [0, 0, 255, 0, 0, 255])
+    say(f, "and the whole thing takes three tenths of a second",
+        near(gif.duration(image), 0.3, 1.0e-12))
+}
+
+// --------------------------------------------------------------- bmpread
+
+fn push16(inout out: [i64], value: i64) {
+    out.push(value % 256)
+    out.push(value / 256 % 256)
+}
+
+fn push32(inout out: [i64], value: i64) {
+    push16(out, value % 65536)
+    push16(out, value / 65536 % 65536)
+}
+
+/// A bitmap with a forty-byte header, built the way anything writes one.
+fn bitmap(width: i64, height: i64, bits: i64, palette: [i64],
+    rows: [i64]) -> bytes {
+    let entries = palette.len() / 3
+    var out: [i64] = []
+    for b in [66, 77] {
+        out.push(b)
+    }
+    push32(out, 14 + 40 + entries * 4 + rows.len())
+    push32(out, 0)
+    push32(out, 14 + 40 + entries * 4)
+    push32(out, 40)
+    push32(out, width)
+    // A negative height means the rows are stored top-first.
+    if height < 0 {
+        push32(out, 4294967296 + height)
+    } else {
+        push32(out, height)
+    }
+    push16(out, 1)
+    push16(out, bits)
+    push32(out, 0)
+    push32(out, 0)
+    push32(out, 2835)
+    push32(out, 2835)
+    push32(out, entries)
+    push32(out, 0)
+    for i in 0..entries {
+        // Stored blue, green, red, and a fourth byte nothing uses.
+        out.push(palette[i * 3 + 2])
+        out.push(palette[i * 3 + 1])
+        out.push(palette[i * 3])
+        out.push(0)
+    }
+    for b in rows {
+        out.push(b)
+    }
+    return bytes_of(out)
+}
+
+fn decoded(data: bytes) -> [i64] {
+    let pixels: [i64] ! BmpError = bmpread.decode(data)
+    return pixels ?? []
+}
+
+fn check_bmpread(inout f: i64) / {io} {
+    print("-- bmpread: four byte-padded rows, upside down, in the wrong order")
+    // Rows are padded to four bytes — not to a pixel. A 3-pixel 24-bit row is
+    // nine bytes of colour and three of padding.
+    say(f, "a row is padded to four bytes whatever the depth is",
+        bmpread.row_bytes(3, 24) == 12 and bmpread.row_bytes(1, 1) == 4 and
+        bmpread.row_bytes(9, 4) == 8 and bmpread.row_bytes(4, 32) == 16)
+    // Two rows of two pixels, stored bottom-up: the file's first row is the
+    // picture's last.
+    // Two pixels at three bytes each is six, and the row is eight: the pad
+    // is not optional and it is not in any length field.
+    let bottom_up = bitmap(2, 2, 24, [],
+        [10, 20, 30, 40, 50, 60, 0, 0,
+            70, 80, 90, 100, 110, 120, 0, 0])
+    say(f, "the first row in the file is the last row of the picture",
+        decoded(bottom_up) == [90, 80, 70, 255, 120, 110, 100, 255,
+            30, 20, 10, 255, 60, 50, 40, 255])
+    // The same rows with a negative height are stored the other way up.
+    let top_down = bitmap(2, 0 - 2, 24, [],
+        [10, 20, 30, 40, 50, 60, 0, 0,
+            70, 80, 90, 100, 110, 120, 0, 0])
+    say(f, "unless the height is negative, which reverses it",
+        decoded(top_down) == [30, 20, 10, 255, 60, 50, 40, 255,
+            90, 80, 70, 255, 120, 110, 100, 255])
+    let header: BmpInfo ! BmpError = bmpread.info(top_down)
+    say(f, "and the sign is what says so, not a flag",
+        (header ?? empty_header()).height == 2 and
+        not (header ?? empty_header()).bottom_up)
+    check_bmp_depths(f)
+}
+
+fn empty_header() -> BmpInfo {
+    return BmpInfo{ width: 0, height: 0, bit_count: 0, compression: 0,
+        palette: [], bottom_up: true, data_offset: 0, header_size: 0 }
+}
+
+fn check_bmp_depths(inout f: i64) / {io} {
+    // Four pixels at four bits: two bytes of data and two of padding.
+    let four = bitmap(4, 1, 4, [0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255],
+        [1, 35, 0, 0])
+    say(f, "four-bit pixels are two to a byte, high nibble first",
+        decoded(four) == [0, 0, 0, 255, 255, 0, 0, 255, 0, 255, 0, 255,
+            0, 0, 255, 255])
+    // One bit a pixel, most significant first, padded to four bytes.
+    let one = bitmap(8, 1, 1, [0, 0, 0, 255, 255, 255], [170, 0, 0, 0])
+    say(f, "one-bit pixels are eight to a byte, most significant first",
+        decoded(one) == [255, 255, 255, 255, 0, 0, 0, 255, 255, 255, 255, 255,
+            0, 0, 0, 255, 255, 255, 255, 255, 0, 0, 0, 255, 255, 255, 255, 255,
+            0, 0, 0, 255])
+    // Five bits a channel, top bit unused. 31 must come out as 255, which is
+    // why the expansion repeats the top bits rather than multiplying by
+    // eight — that would stop at 248.
+    say(f, "a sixteen-bit pixel expands by repeating its top bits",
+        bmpread.expand16(32767) == (255, 255, 255, 255) and
+        bmpread.expand16(0) == (0, 0, 0, 255) and
+        bmpread.expand16(31) == (0, 0, 255, 255))
+    // Pillow scales by 255/31 and truncates instead, which is never more than
+    // one away and is dimmer everywhere in between.
+    say(f, "which is at most one away from scaling and truncating",
+        bmpread.expand16(16384).0 == 132 and 16 * 255 / 31 == 131)
+    say(f, "a palette entry is four bytes, and the fourth is not used",
+        (bmpread.info(four) ?? empty_header()).palette ==
+        [0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255])
+    say(f, "something that is not a bitmap is refused",
+        not bmpread.is_bmp("PK\u{03}\u{04}some zip file".to_bytes()) and
+        decoded("PK\u{03}\u{04}some zip file".to_bytes()) == [])
+}
+
+// -------------------------------------------------------------- jpegmeta
+
+// A JPEG Pillow wrote: 30x20, with an EXIF block saying the camera was held
+// sideways. The EXIF is big-endian, which is what Pillow writes.
+fn photograph() -> bytes {
+    return bytes_of([
+        255, 216, 255, 224, 0, 16, 74, 70, 73, 70, 0, 1, 1, 0, 0, 1, 0,
+        1, 0, 0, 255, 225, 0, 34, 69, 120, 105, 102, 0, 0, 77, 77, 0, 42,
+        0, 0, 0, 8, 0, 1, 1, 18, 0, 3, 0, 0, 0, 1, 0, 6, 0, 0, 0, 0, 0,
+        0, 255, 219, 0, 67, 0, 6, 4, 5, 6, 5, 4, 6, 6, 5, 6, 7, 7, 6, 8,
+        10, 16, 10, 10, 9, 9, 10, 20, 14, 15, 12, 16, 23, 20, 24, 24, 23,
+        20, 22, 22, 26, 29, 37, 31, 26, 27, 35, 28, 22, 22, 32, 44, 32,
+        35, 38, 39, 41, 42, 41, 25, 31, 45, 48, 45, 40, 48, 37, 40, 41,
+        40, 255, 219, 0, 67, 1, 7, 7, 7, 10, 8, 10, 19, 10, 10, 19, 40,
+        26, 22, 26, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40,
+        40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40,
+        40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40,
+        40, 40, 40, 40, 40, 255, 192, 0, 17, 8, 0, 20, 0, 30, 3, 1, 34,
+        0, 2, 17, 1, 3, 17, 1, 255, 196, 0, 31, 0, 0, 1, 5, 1, 1, 1, 1,
+        1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11,
+        255, 196, 0, 181, 16, 0, 2, 1, 3, 3, 2, 4, 3, 5, 5, 4, 4, 0, 0,
+        1, 125, 1, 2, 3, 0, 4, 17, 5, 18, 33, 49, 65, 6, 19, 81, 97, 7,
+        34, 113, 20, 50, 129, 145, 161, 8, 35, 66, 177, 193, 21, 82, 209,
+        240, 36, 51, 98, 114, 130, 9, 10, 22, 23, 24, 25, 26, 37, 38, 39,
+        40, 41, 42, 52, 53, 54, 55, 56, 57, 58, 67, 68, 69, 70, 71, 72,
+        73, 74, 83, 84, 85, 86, 87, 88, 89, 90, 99, 100, 101, 102, 103,
+        104, 105, 106, 115, 116, 117, 118, 119, 120, 121, 122, 131, 132,
+        133, 134, 135, 136, 137, 138, 146, 147, 148, 149, 150, 151, 152,
+        153, 154, 162, 163, 164, 165, 166, 167, 168, 169, 170, 178, 179,
+        180, 181, 182, 183, 184, 185, 186, 194, 195, 196, 197, 198, 199,
+        200, 201, 202, 210, 211, 212, 213, 214, 215, 216, 217, 218, 225,
+        226, 227, 228, 229, 230, 231, 232, 233, 234, 241, 242, 243, 244,
+        245, 246, 247, 248, 249, 250, 255, 196, 0, 31, 1, 0, 3, 1, 1, 1,
+        1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,
+        10, 11, 255, 196, 0, 181, 17, 0, 2, 1, 2, 4, 4, 3, 4, 7, 5, 4, 4,
+        0, 1, 2, 119, 0, 1, 2, 3, 17, 4, 5, 33, 49, 6, 18, 65, 81, 7, 97,
+        113, 19, 34, 50, 129, 8, 20, 66, 145, 161, 177, 193, 9, 35, 51,
+        82, 240, 21, 98, 114, 209, 10, 22, 36, 52, 225, 37, 241, 23, 24,
+        25, 26, 38, 39, 40, 41, 42, 53, 54, 55, 56, 57, 58, 67, 68, 69,
+        70, 71, 72, 73, 74, 83, 84, 85, 86, 87, 88, 89, 90, 99, 100, 101,
+        102, 103, 104, 105, 106, 115, 116, 117, 118, 119, 120, 121, 122,
+        130, 131, 132, 133, 134, 135, 136, 137, 138, 146, 147, 148, 149,
+        150, 151, 152, 153, 154, 162, 163, 164, 165, 166, 167, 168, 169,
+        170, 178, 179, 180, 181, 182, 183, 184, 185, 186, 194, 195, 196,
+        197, 198, 199, 200, 201, 202, 210, 211, 212, 213, 214, 215, 216,
+        217, 218, 226, 227, 228, 229, 230, 231, 232, 233, 234, 242, 243,
+        244, 245, 246, 247, 248, 249, 250, 255, 218, 0, 12, 3, 1, 0, 2,
+        17, 3, 17, 0, 63, 0, 138, 138, 40, 175, 143, 62, 248, 40, 162,
+        138, 0, 40, 162, 138, 0, 40, 162, 138, 0, 255, 217])
+}
+
+fn check_jpegmeta(inout f: i64) / {io} {
+    print("-- jpegmeta: the size is free and the orientation is a second format")
+    let data = photograph()
+    let frame: JpegFrame ! JpegError = jpegmeta.frame(data)
+    let picture = frame ?? JpegFrame{ precision: 0, width: 0, height: 0,
+        components: 0, progressive: false, marker: 0 }
+    say(f, "the size comes out of the header without decoding a pixel",
+        picture.width == 30 and picture.height == 20 and
+        picture.components == 3 and picture.precision == 8)
+    say(f, "and it is baseline, not progressive",
+        not picture.progressive and picture.marker == 192)
+    // 0xC4, 0xC8 and 0xCC sit in the middle of the frame markers and are a
+    // Huffman table, a reserved marker and an arithmetic coding table. A
+    // reader that takes every 0xCn reads a table as a picture size.
+    say(f, "not every marker in the frame range introduces a frame",
+        jpegmeta.is_frame_marker(192) and jpegmeta.is_frame_marker(194) and
+        not jpegmeta.is_frame_marker(196) and
+        not jpegmeta.is_frame_marker(200) and
+        not jpegmeta.is_frame_marker(204))
+    say(f, "the restart markers carry no length and no payload",
+        jpegmeta.is_standalone(216) and jpegmeta.is_standalone(217) and
+        jpegmeta.is_standalone(208) and not jpegmeta.is_standalone(224))
+    // The length counts itself, so a segment's payload is two bytes shorter
+    // than the number in the file.
+    let segments: [JpegSegment] ! JpegError = jpegmeta.segments(data)
+    say(f, "a segment's length includes the length field itself",
+        (segments ?? [])[0].marker == 224 and
+        (segments ?? [])[0].length == 14)
+    let density: JpegDensity ! JpegError = jpegmeta.density(data)
+    let d = density ?? JpegDensity{ units: 0 - 1, x: 0, y: 0, major: 0,
+        minor: 0 }
+    say(f, "the JFIF block says a pixel's shape, not its size",
+        d.units == 0 and d.x == 1 and d.y == 1 and d.major == 1)
+    // EXIF is a whole TIFF file inside a JPEG marker, with its own byte
+    // order. Pillow writes big-endian.
+    say(f, "the orientation lives in a TIFF embedded in the JPEG",
+        jpegmeta.orientation(data) == 6 and
+        not jpegmeta.exif_little_endian(data))
+    say(f, "orientation 6 is a quarter turn, so the picture is 20 wide",
+        jpegmeta.rotation(6) == 1 and not jpegmeta.mirrored(6) and
+        (jpegmeta.display_size(data) ?? (0, 0)) == (20, 30))
+    say(f, "and the four mirrored orientations are the ones nobody produces",
+        jpegmeta.mirrored(2) and jpegmeta.mirrored(7) and
+        not jpegmeta.mirrored(1) and not jpegmeta.mirrored(3))
+    check_little_endian_exif(f)
+}
+
+// The same tag written the other way round: `II` rather than `MM`. A reader
+// that assumes one byte order reads a tag count of several thousand on half
+// the world's photographs.
+fn little_endian_jpeg() -> bytes {
+    var out: [i64] = [255, 216, 255, 225, 0, 34]
+    for b in [69, 120, 105, 102, 0, 0] {
+        out.push(b)
+    }
+    for b in [73, 73, 42, 0, 8, 0, 0, 0] {
+        out.push(b)
+    }
+    for b in [1, 0] {
+        out.push(b)
+    }
+    // Tag 274, type 3 (short), one value, 8.
+    for b in [18, 1, 3, 0, 1, 0, 0, 0, 8, 0, 0, 0] {
+        out.push(b)
+    }
+    for b in [0, 0, 0, 0] {
+        out.push(b)
+    }
+    // A minimal frame so there is a size to read.
+    for b in [255, 192, 0, 11, 8, 0, 40, 0, 60, 1, 1, 17, 0, 255, 217] {
+        out.push(b)
+    }
+    return bytes_of(out)
+}
+
+fn check_little_endian_exif(inout f: i64) / {io} {
+    let data = little_endian_jpeg()
+    say(f, "an EXIF block declares its own byte order, and may be either",
+        jpegmeta.exif_little_endian(data) and
+        jpegmeta.orientation(data) == 8)
+    say(f, "orientation 8 is the other quarter turn",
+        jpegmeta.rotation(8) == 3 and
+        (jpegmeta.display_size(data) ?? (0, 0)) == (40, 60))
+    say(f, "a file with no EXIF is upright rather than an error",
+        jpegmeta.orientation(photograph_without_exif()) == 1)
+    say(f, "and something that is not a JPEG is refused",
+        not jpegmeta.is_jpeg("GIF89a".to_bytes()) and
+        jpegmeta.orientation("GIF89a".to_bytes()) == 1)
+}
+
+fn photograph_without_exif() -> bytes {
+    return bytes_of([255, 216, 255, 192, 0, 11, 8, 0, 10, 0, 10, 1, 1, 17, 0,
+        255, 217])
+}
+
+// -------------------------------------------------------------------- ico
+
+fn check_ico(inout f: i64) / {io} {
+    print("-- ico: a favicon is several pictures and the height is doubled")
+    // The dimension fields are one byte, so 256 — the format's own maximum —
+    // is stored as zero.
+    say(f, "a stored zero means 256, which is the largest size there is",
+        ico.dimension(0) == 256 and ico.dimension(48) == 48 and
+        ico.dimension_byte(256) == 0 and ico.dimension_byte(16) == 16)
+    var small = square(8, 40)
+    var large = square(32, 8)
+    let built: bytes ! IcoError = ico.build([small, large])
+    let blob = built ?? "".to_bytes()
+    let parsed: IcoFile ! IcoError = ico.parse(blob)
+    let file = parsed ?? IcoFile{ kind: 0, entries: [] }
+    say(f, "a file this builds is an icon holding both sizes",
+        ico.is_ico(blob) and file.kind == 1 and file.entries.len() == 2)
+    say(f, "and reads back with the pixels it was given",
+        (ico.decode_entry(blob, file.entries[0], 0) ??
+            square(1, 1)).pixels == small.pixels)
+    say(f, "including the alpha, which a 32-bit icon carries itself",
+        (ico.decode_entry(blob, file.entries[1], 1) ??
+            square(1, 1)).pixels == large.pixels)
+    // A browser picks the nearest size and prefers the larger of two,
+    // because scaling down loses less than scaling up.
+    say(f, "the best entry for a size is the nearest, larger one",
+        (ico.best_for(file, 8) ?? file.entries[1]).width == 8 and
+        (ico.best_for(file, 16) ?? file.entries[0]).width == 32 and
+        (ico.best_for(file, 64) ?? file.entries[0]).width == 32)
+    say(f, "the sizes are listed largest first", ico.sizes(file) ==
+        [(32, 32), (8, 8)])
+    // A slot may hold a whole PNG file instead of a bitmap, and there is no
+    // field saying which. The signature is the only tell.
+    say(f, "a PNG slot is told from a bitmap one by its signature alone",
+        ico.all_bitmaps(blob, file) and
+        not ico.is_png_entry(blob, file.entries[0]))
+    say(f, "a cursor is the same format with two fields meaning something else",
+        (ico.hotspot(file, 0) ?? (0 - 1, 0 - 1)) == (0 - 1, 0 - 1))
+    say(f, "and something that is not an icon is refused",
+        not ico.is_ico("GIF89a".to_bytes()) and
+        not ico.is_ico(bytes_of([0, 0, 9, 0, 1, 0])))
+}
+
+fn square(size: i64, step: i64) -> IcoImage {
+    var pixels: [i64] = []
+    for y in 0..size {
+        for x in 0..size {
+            pixels.push(x * step % 256)
+            pixels.push(y * step % 256)
+            pixels.push((x + y) * step % 256)
+            pixels.push(if x == 0 { 0 } else { 255 })
+        }
+    }
+    return IcoImage{ width: size, height: size, pixels: pixels }
+}
+
+// --------------------------------------------------------------- resample
+
+fn check_resample(inout f: i64) / {io} {
+    print("-- resample: the support has to grow when the picture shrinks")
+    say(f, "each filter reaches as far as its own support",
+        resample.support(BoxFilter) == 0.5 and
+        resample.support(Bilinear) == 1.0 and
+        resample.support(Bicubic) == 2.0 and
+        resample.support(Lanczos) == 3.0)
+    // The cubic with a = -0.5: one at the centre, zero at every other
+    // integer, and negative between one and two — which is the sharpening.
+    say(f, "bicubic is the cubic with a = -0.5, and Keys said so in 1981",
+        near(resample.weight(Bicubic, 0.0), 1.0, 1.0e-12) and
+        near(resample.weight(Bicubic, 1.0), 0.0, 1.0e-12) and
+        near(resample.weight(Bicubic, 0.5), 0.5625, 1.0e-12) and
+        resample.weight(Bicubic, 1.5) < 0.0)
+    say(f, "and Lanczos is a sinc windowed by a wider one",
+        near(resample.weight(Lanczos, 0.0), 1.0, 1.0e-12) and
+        near(resample.weight(Lanczos, 1.0), 0.0, 1.0e-12) and
+        resample.weight(Lanczos, 1.5) < 0.0 and
+        resample.weight(Lanczos, 3.0) == 0.0)
+    // Upscaling: the filter keeps its own radius. Downscaling by four: it
+    // has to reach four times as far, or the result aliases exactly as
+    // badly as nearest neighbour.
+    let up = resample.coefficients(Bilinear, 4, 8, 3)
+    let down = resample.coefficients(Bilinear, 16, 4, 1)
+    say(f, "a downscale widens the filter and an upscale does not",
+        up.1.len() == 2 and down.1.len() == 8)
+    say(f, "and the weights always sum to one, so brightness is unchanged",
+        near(sum(up.1), 1.0, 1.0e-12) and near(sum(down.1), 1.0, 1.0e-12))
+    say(f, "an integer downscale is where a box filter is the right answer",
+        resample.is_integer_downscale(16, 4) and
+        not resample.is_integer_downscale(17, 4) and
+        not resample.is_integer_downscale(4, 16))
+    check_resample_values(f)
+}
+
+fn sum(values: [f64]) -> f64 {
+    var total = 0.0
+    for v in values {
+        total = total + v
+    }
+    return total
+}
+
+fn stripes() -> [f64] {
+    return [0.0, 255.0, 0.0, 255.0, 255.0, 0.0, 255.0, 0.0]
+}
+
+fn resized(filter: ResampleFilter, to_width: i64, to_height: i64) -> [f64] {
+    let out: [f64] ! ResampleError = resample.resize(stripes(), 4, 2, 1,
+        to_width, to_height, filter)
+    return out ?? []
+}
+
+fn check_resample_values(inout f: i64) / {io} {
+    // Pillow's own answers for the same 4x2 stripe pattern.
+    say(f, "shrinking a checkerboard to two pixels gives the mean of it",
+        near(resized(Bilinear, 2, 1)[0], 127.5, 1.0e-9) and
+        near(resized(Lanczos, 2, 1)[1], 127.5, 1.0e-9))
+    say(f, "and bilinear upscaling agrees with Pillow to the digit",
+        prefix(resized(Bilinear, 8, 4), 4) ==
+        [0.0, 63.75, 191.25, 191.25])
+    // A sharp filter overshoots past the ends of the range on an edge: that
+    // is the ringing, and it is not a bug.
+    let sharp = resized(Lanczos, 8, 4)
+    say(f, "a sharp filter overshoots on an edge, which is the ringing",
+        near(sharp[0], 0.0 - 102.892426, 1.0e-4) and
+        near(sharp[7], 357.892426, 1.0e-4))
+    // In eight bits the overshoot is cut off, which is what every image
+    // library produces and why the byte and float answers differ.
+    let bytes8: [i64] ! ResampleError = resample.resize_bytes(
+        [0, 255, 0, 255, 255, 0, 255, 0], 4, 2, 1, 8, 4, Lanczos)
+    say(f, "in eight bits it is clamped away, as Pillow clamps it",
+        prefix_int(bytes8 ?? [], 8) == [0, 42, 255, 251, 4, 0, 213, 255])
+    // Nearest neighbour on an integer upscale is exact: each pixel becomes a
+    // block, and nothing is invented.
+    let doubled: [i64] ! ResampleError = resample.resize_bytes([1, 2, 3, 4],
+        2, 2, 1, 4, 4, Nearest)
+    say(f, "nearest doubles a picture exactly, which is why pixel art uses it",
+        (doubled ?? []) == [1, 1, 2, 2, 1, 1, 2, 2, 3, 3, 4, 4, 3, 3, 4, 4])
+    // Fitting inside a box keeps the shape and never rounds to nothing.
+    say(f, "fitting into a box keeps the shape and never rounds to zero",
+        resample.fit(1000, 500, 100, 100) == (100, 50) and
+        resample.fit(1000, 1, 100, 100) == (100, 1) and
+        resample.fit(40, 30, 100, 100) == (40, 30))
+    say(f, "a target with no pixels in it is an error, not an empty picture",
+        empty_refused())
+}
+
+fn prefix(values: [f64], n: i64) -> [f64] {
+    var out: [f64] = []
+    for i in 0..n {
+        out.push(values[i])
+    }
+    return out
+}
+
+fn prefix_int(values: [i64], n: i64) -> [i64] {
+    var out: [i64] = []
+    for i in 0..n {
+        out.push(values[i])
+    }
+    return out
+}
+
+fn empty_refused() -> bool {
+    match resample.resize(stripes(), 4, 2, 1, 0, 4, Bilinear) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn main() / {io} {
+    var f = 0
+    check_gif(f)
+    check_bmpread(f)
+    check_jpegmeta(f)
+    check_ico(f)
+    check_resample(f)
+    if f == 0 {
+        print("images: every claim held")
+    } else {
+        print("images: {f} claims failed")
+    }
+}

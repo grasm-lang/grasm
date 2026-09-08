@@ -1,0 +1,518 @@
+// Reading a BMP, which is harder than writing one.
+//
+// `bmp` in this set writes 24-bit bitmaps, and writing is the easy half: pick
+// one layout and emit it. Reading means accepting every layout anything has
+// ever written, and BMP has accumulated a lot of them — five header versions,
+// six bit depths, four compression schemes, and rows stored bottom-up unless
+// they are not.
+//
+// It is still the format a screenshot arrives in on Windows, the format an
+// icon is made of (see `ico`), and the format every embedded framebuffer dump
+// uses, because writing one needs no library.
+//
+// ## The four things that go wrong
+//
+// **Rows are bottom-up.** The first row in the file is the *last* row of the
+// picture, unless the height is negative, in which case it is the first. A
+// negative height is stored as a signed 32-bit integer in a header that is
+// otherwise unsigned, so a reader that treats it as unsigned sees a height of
+// four billion.
+//
+// **Rows are padded to four bytes.** Not to a pixel boundary — to four bytes.
+// A 3-pixel 24-bit row is 9 bytes of colour and 3 of padding, and a reader
+// that computes the row start by multiplying gets a picture that shears
+// progressively to one side.
+//
+// **The colour order is backwards.** Blue, green, red, in that order, because
+// that is how a little-endian machine sees an integer whose bytes read red,
+// green, blue. Every BMP reader has this bug once.
+//
+// **The palette entry is four bytes, not three.** The fourth is unused. A
+// reader assuming three gets colours that drift as the index rises.
+//
+// ## The header versions
+//
+// Twelve bytes is the OS/2 version, with 16-bit dimensions and 3-byte palette
+// entries. Forty is the one everything writes. 108 and 124 add colour space
+// information nothing reads. The size field at the front says which, and a
+// reader that switches on it rather than assuming forty accepts about five
+// per cent more files.
+//
+// Checked against Pillow, on files Pillow wrote at every depth it writes.
+
+type BmpInfo = {
+    width: i64,
+    /// Always positive here; `bottom_up` records what the sign meant.
+    height: i64,
+    bit_count: i64,
+    /// 0 none, 1 RLE8, 2 RLE4, 3 bitfields.
+    compression: i64,
+    /// Flat red, green, blue triples, converted from the file's own order.
+    palette: [i64],
+    bottom_up: bool,
+    /// Where the pixel data starts.
+    data_offset: i64,
+    header_size: i64,
+}
+
+type BmpError =
+    | NotBmp(magic: str)
+    | Truncated(at: i64)
+    | UnknownHeader(size: i64)
+    | UnsupportedDepth(bits: i64)
+    | UnsupportedCompression(kind: i64)
+
+fn read16(data: bytes, at: i64) -> i64 {
+    return data.at(at) + data.at(at + 1) * 256
+}
+
+fn read32(data: bytes, at: i64) -> i64 {
+    return read16(data, at) + read16(data, at + 2) * 65536
+}
+
+fn signed32(value: i64) -> i64 {
+    if value >= 2147483648 {
+        return value - 4294967296
+    }
+    return value
+}
+
+/// The bytes a row of `width` pixels at `bits` per pixel occupies, padding
+/// included.
+///
+/// Padding is to four bytes, not to a pixel. This is the single most common
+/// BMP bug and the reason a wrongly-read bitmap shears rather than simply
+/// looking wrong.
+pub fn row_bytes(width: i64, bits: i64) -> i64 {
+    return (width * bits + 31) / 32 * 4
+}
+
+/// Whether the file starts with a bitmap file header.
+pub fn is_bmp(data: bytes) -> bool {
+    return data.len() > 14 and data.at(0) == 66 and data.at(1) == 77
+}
+
+/// The header of a whole .bmp file.
+pub fn info(data: bytes) -> BmpInfo ! BmpError {
+    if not is_bmp(data) {
+        fail(NotBmp(magic_of(data)))
+    }
+    var header = try dib_info(data, 14)
+    header.data_offset = read32(data, 10)
+    return header
+}
+
+fn magic_of(data: bytes) -> str {
+    if data.len() < 2 {
+        return ""
+    }
+    return bytes_of([data.at(0), data.at(1)]).to_str()
+}
+
+/// The header of a bare DIB — the same bitmap with the fourteen-byte file
+/// header removed, which is what lives inside an .ico and on the clipboard.
+///
+/// The pixel data starts straight after the header and the palette, because
+/// there is no offset field to say otherwise.
+pub fn dib_info(data: bytes, at: i64) -> BmpInfo ! BmpError {
+    if at + 12 > data.len() {
+        fail(Truncated(at))
+    }
+    let size = read32(data, at)
+    if size == 12 {
+        return try core_info(data, at)
+    }
+    if size != 40 and size != 52 and size != 56 and size != 108 and
+    size != 124 {
+        fail(UnknownHeader(size))
+    }
+    let height = signed32(read32(data, at + 8))
+    var header = BmpInfo{
+        width: signed32(read32(data, at + 4)),
+        height: absolute(height),
+        bit_count: read16(data, at + 14),
+        compression: read32(data, at + 16),
+        palette: [],
+        bottom_up: height > 0,
+        data_offset: 0,
+        header_size: size,
+    }
+    let entries = try palette_entries(data, at, header)
+    header.palette = read_palette(data, at + size, entries, 4)
+    header.data_offset = at + size + entries * 4
+    return header
+}
+
+fn absolute(v: i64) -> i64 {
+    if v < 0 {
+        return 0 - v
+    }
+    return v
+}
+
+fn palette_entries(data: bytes, at: i64, header: BmpInfo) -> i64 ! BmpError {
+    if header.bit_count > 8 {
+        // A bitfields header carries three masks where a palette would go.
+        if header.compression == 3 {
+            return 3
+        }
+        return 0
+    }
+    let declared = read32(data, at + 32)
+    if declared > 0 {
+        return declared
+    }
+    var n = 1
+    for _i in 0..header.bit_count {
+        n = n * 2
+    }
+    return n
+}
+
+fn core_info(data: bytes, at: i64) -> BmpInfo ! BmpError {
+    var header = BmpInfo{
+        width: read16(data, at + 4),
+        height: read16(data, at + 6),
+        bit_count: read16(data, at + 10),
+        compression: 0,
+        palette: [],
+        bottom_up: true,
+        data_offset: 0,
+        header_size: 12,
+    }
+    var entries = 0
+    if header.bit_count <= 8 {
+        entries = 1
+        for _i in 0..header.bit_count {
+            entries = entries * 2
+        }
+    }
+    // The OS/2 header's palette entries are three bytes, not four.
+    header.palette = read_palette(data, at + 12, entries, 3)
+    header.data_offset = at + 12 + entries * 3
+    return header
+}
+
+fn read_palette(data: bytes, at: i64, entries: i64, stride: i64) -> [i64] {
+    var out: [i64] = []
+    for i in 0..entries {
+        let base = at + i * stride
+        if base + 2 >= data.len() {
+            out.push(0)
+            out.push(0)
+            out.push(0)
+            continue
+        }
+        // Stored blue, green, red.
+        out.push(data.at(base + 2))
+        out.push(data.at(base + 1))
+        out.push(data.at(base))
+    }
+    return out
+}
+
+/// The pixels of a whole .bmp file, as red, green, blue, alpha, top row
+/// first.
+pub fn decode(data: bytes) -> [i64] ! BmpError {
+    let header = try info(data)
+    return try decode_with(data, header)
+}
+
+/// The pixels of a bitmap whose header has already been read.
+///
+/// Rows come back top-first whichever way they were stored, because every
+/// consumer wants them that way and the storage order is the file's problem.
+pub fn decode_with(data: bytes, header: BmpInfo) -> [i64] ! BmpError {
+    if header.compression == 1 or header.compression == 2 {
+        return try decode_rle(data, header)
+    }
+    if header.compression != 0 and header.compression != 3 {
+        fail(UnsupportedCompression(header.compression))
+    }
+    let stride = row_bytes(header.width, header.bit_count)
+    var out: [i64] = []
+    for y in 0..header.height {
+        var row = y
+        if header.bottom_up {
+            row = header.height - 1 - y
+        }
+        let start = header.data_offset + row * stride
+        try read_row(out, data, header, start)
+    }
+    return out
+}
+
+fn read_row(inout out: [i64], data: bytes, header: BmpInfo,
+    start: i64) ! BmpError {
+    for x in 0..header.width {
+        let pixel = try pixel_at(data, header, start, x)
+        out.push(pixel.0)
+        out.push(pixel.1)
+        out.push(pixel.2)
+        out.push(pixel.3)
+    }
+}
+
+fn pixel_at(data: bytes, header: BmpInfo, start: i64,
+    x: i64) -> (i64, i64, i64, i64) ! BmpError {
+    let bits = header.bit_count
+    if bits == 24 or bits == 32 {
+        let at = start + x * (bits / 8)
+        if at + 2 >= data.len() {
+            fail(Truncated(at))
+        }
+        var alpha = 255
+        // A 32-bit BMP's fourth byte is an alpha channel in everything
+        // written this century and zero in everything written before it. A
+        // file whose alpha is zero everywhere means opaque, not invisible,
+        // and treating it literally makes the picture vanish.
+        if bits == 32 and header.compression == 3 {
+            alpha = data.at(at + 3)
+        }
+        return (data.at(at + 2), data.at(at + 1), data.at(at), alpha)
+    }
+    if bits == 16 {
+        let at = start + x * 2
+        if at + 1 >= data.len() {
+            fail(Truncated(at))
+        }
+        return expand16(read16(data, at))
+    }
+    if bits == 1 or bits == 4 or bits == 8 {
+        return try palette_pixel(data, header, start, x)
+    }
+    fail(UnsupportedDepth(bits))
+}
+
+/// Five bits a channel, green in the middle, with the top bit unused.
+///
+/// The default when a 16-bit bitmap says nothing. Scaling 0..31 to 0..255 by
+/// multiplying by eight leaves white at 248; repeating the top three bits
+/// gets it to 255, which is what every decoder does.
+pub fn expand16(value: i64) -> (i64, i64, i64, i64) {
+    let red = value.ushr(10).bit_and(31)
+    let green = value.ushr(5).bit_and(31)
+    let blue = value.bit_and(31)
+    return (five_to_eight(red), five_to_eight(green), five_to_eight(blue), 255)
+}
+
+fn five_to_eight(v: i64) -> i64 {
+    return v * 8 + v.ushr(2)
+}
+
+fn palette_pixel(data: bytes, header: BmpInfo, start: i64,
+    x: i64) -> (i64, i64, i64, i64) ! BmpError {
+    let bits = header.bit_count
+    let at = start + x * bits / 8
+    if at >= data.len() {
+        fail(Truncated(at))
+    }
+    let per_byte = 8 / bits
+    let shift = (per_byte - 1 - x % per_byte) * bits
+    let mask = (1).shl(bits) - 1
+    let index = data.at(at).ushr(shift).bit_and(mask)
+    if index * 3 + 2 >= header.palette.len() {
+        return (0, 0, 0, 255)
+    }
+    return (header.palette[index * 3], header.palette[index * 3 + 1],
+        header.palette[index * 3 + 2], 255)
+}
+
+/// The palette indices rather than the colours, for a bitmap that has a
+/// palette.
+pub fn decode_indices(data: bytes, header: BmpInfo) -> [i64] ! BmpError {
+    if header.bit_count > 8 {
+        fail(UnsupportedDepth(header.bit_count))
+    }
+    let stride = row_bytes(header.width, header.bit_count)
+    let per_byte = 8 / header.bit_count
+    let mask = (1).shl(header.bit_count) - 1
+    var out: [i64] = []
+    for y in 0..header.height {
+        var row = y
+        if header.bottom_up {
+            row = header.height - 1 - y
+        }
+        for x in 0..header.width {
+            let at = header.data_offset + row * stride +
+            x * header.bit_count / 8
+            if at >= data.len() {
+                fail(Truncated(at))
+            }
+            let shift = (per_byte - 1 - x % per_byte) * header.bit_count
+            out.push(data.at(at).ushr(shift).bit_and(mask))
+        }
+    }
+    return out
+}
+
+/// Run-length encoded bitmaps: BI_RLE8 and BI_RLE4.
+///
+/// A byte pair at a time. A non-zero count repeats one colour; a zero count
+/// introduces an escape — 0 ends the row, 1 ends the picture, 2 is a delta
+/// that skips forward, and anything else is that many literal pixels padded
+/// to a word boundary. The delta is what makes this more than a simple run
+/// encoder: it lets a sprite leave holes, and a decoder that ignores it
+/// produces a picture with everything after the first hole shifted.
+pub fn decode_rle(data: bytes, header: BmpInfo) -> [i64] ! BmpError {
+    var indices = try rle_indices(data, header)
+    var out: [i64] = []
+    for y in 0..header.height {
+        var row = y
+        if header.bottom_up {
+            row = header.height - 1 - y
+        }
+        for x in 0..header.width {
+            let index = indices[row * header.width + x]
+            if index * 3 + 2 >= header.palette.len() {
+                out.push(0)
+                out.push(0)
+                out.push(0)
+            } else {
+                out.push(header.palette[index * 3])
+                out.push(header.palette[index * 3 + 1])
+                out.push(header.palette[index * 3 + 2])
+            }
+            out.push(255)
+        }
+    }
+    return out
+}
+
+fn rle_indices(data: bytes, header: BmpInfo) -> [i64] ! BmpError {
+    var out: [i64] = []
+    for _i in 0..header.width * header.height {
+        out.push(0)
+    }
+    var at = header.data_offset
+    var x = 0
+    var y = 0
+    while at + 1 < data.len() {
+        let count = data.at(at)
+        let value = data.at(at + 1)
+        at = at + 2
+        if count > 0 {
+            put_run(out, header, x, y, count, value)
+            x = x + count
+            continue
+        }
+        if value == 0 {
+            x = 0
+            y = y + 1
+            continue
+        }
+        if value == 1 {
+            break
+        }
+        if value == 2 {
+            x = x + data.at(at)
+            y = y + data.at(at + 1)
+            at = at + 2
+            continue
+        }
+        at = put_literals(out, header, data, at, x, y, value)
+        x = x + value
+    }
+    return out
+}
+
+fn put_run(inout out: [i64], header: BmpInfo, x: i64, y: i64, count: i64,
+    value: i64) {
+    for i in 0..count {
+        // BI_RLE4 packs two indices into the repeated byte, alternating.
+        var index = value
+        if header.bit_count == 4 {
+            if i % 2 == 0 {
+                index = value.ushr(4)
+            } else {
+                index = value.bit_and(15)
+            }
+        }
+        put_index(out, header, x + i, y, index)
+    }
+}
+
+fn put_literals(inout out: [i64], header: BmpInfo, data: bytes, from: i64,
+    x: i64, y: i64, count: i64) -> i64 {
+    var at = from
+    if header.bit_count == 4 {
+        for i in 0..count {
+            let byte = data.at(at + i / 2)
+            var index = byte.ushr(4)
+            if i % 2 == 1 {
+                index = byte.bit_and(15)
+            }
+            put_index(out, header, x + i, y, index)
+        }
+        at = at + (count + 1) / 2
+    } else {
+        for i in 0..count {
+            put_index(out, header, x + i, y, data.at(at + i))
+        }
+        at = at + count
+    }
+    // Runs of literals are padded to an even number of bytes.
+    if at % 2 == 1 {
+        at = at + 1
+    }
+    return at
+}
+
+fn put_index(inout out: [i64], header: BmpInfo, x: i64, y: i64, index: i64) {
+    if x < 0 or x >= header.width or y < 0 or y >= header.height {
+        return
+    }
+    out[y * header.width + x] = index
+}
+
+/// How many distinct colours a decoded picture uses.
+pub fn colours_used(pixels: [i64]) -> i64 {
+    var seen: Map[str, bool] = map()
+    var i = 0
+    while i + 2 < pixels.len() {
+        seen.set("{pixels[i]},{pixels[i + 1]},{pixels[i + 2]}", true)
+        i = i + 4
+    }
+    return seen.len()
+}
+
+/// Whether any pixel is less than fully opaque.
+pub fn has_alpha(pixels: [i64]) -> bool {
+    var i = 3
+    while i < pixels.len() {
+        if pixels[i] != 255 {
+            return true
+        }
+        i = i + 4
+    }
+    return false
+}
+
+/// The fourth byte of each pixel of a 32-bit bitmap, top row first.
+///
+/// `decode_with` reports these pixels as opaque unless the header declares
+/// bitfields, because a 32-bit BMP written before about 2005 has zero there
+/// and means opaque. A caller that knows better — an .ico reader does, since
+/// Windows has treated the byte as alpha since XP — asks for the raw values
+/// and decides for itself.
+pub fn raw_alpha(data: bytes, header: BmpInfo) -> [i64] ! BmpError {
+    if header.bit_count != 32 {
+        fail(UnsupportedDepth(header.bit_count))
+    }
+    let stride = row_bytes(header.width, 32)
+    var out: [i64] = []
+    for y in 0..header.height {
+        var row = y
+        if header.bottom_up {
+            row = header.height - 1 - y
+        }
+        for x in 0..header.width {
+            let at = header.data_offset + row * stride + x * 4 + 3
+            if at >= data.len() {
+                fail(Truncated(at))
+            }
+            out.push(data.at(at))
+        }
+    }
+    return out
+}

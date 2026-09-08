@@ -1,0 +1,6 @@
+[package]
+name = "bmpread"
+version = "1.0.0"
+
+# Bytes in, pixels out. Opens nothing.
+capabilities = []

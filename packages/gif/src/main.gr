@@ -1,0 +1,739 @@
+// GIF: a format kept alive by the one thing it does that nothing replaced.
+//
+// GIF is worse than everything that came after it. It has 256 colours a frame,
+// no alpha beyond a single transparent index, and an LZW compressor that a
+// patent kept out of free software until 2004 — which is why PNG exists at
+// all. And it is still everywhere, because it was the only format a browser
+// would animate without a plugin, and by the time video tags arrived the word
+// "gif" meant "short silent loop" rather than a file format.
+//
+// ## What is actually in the file
+//
+// A header, a screen descriptor saying how big the canvas is, an optional
+// global palette, and then a stream of blocks read until a trailer byte. Each
+// block is an image, an extension, or the end. An animation is not a special
+// kind of GIF: it is several image blocks, each with a delay attached by an
+// extension that sits *before* it.
+//
+// That "before" is the first thing that catches people. A graphic control
+// extension applies to the next image block, so a parser that reads images and
+// extensions independently gets every delay off by one frame and every
+// transparency attached to the wrong picture.
+//
+// ## The palette rules
+//
+// Each frame may carry its own palette, and falls back to the global one when
+// it does not. A palette's size is stored as a three-bit exponent: the file
+// says `n` and the table holds two-to-the-(n+1) entries, so a palette is
+// always a power of two from 2 to 256 and a picture with three colours pays
+// for four.
+//
+// ## Interlacing
+//
+// A frame may be stored in four passes — every eighth row from 0, then every
+// eighth from 4, then every fourth from 2, then every second from 1 — so that
+// a picture arriving over a modem showed something recognisable early. Nobody
+// has needed that since about 1998, and files still use it, so a decoder that
+// skips it produces a picture with the rows shuffled and no error.
+//
+// ## LZW, which is the part worth reading
+//
+// The compressor builds a dictionary as it goes: every time it emits a code it
+// adds one new entry, the string it just matched plus the next character.
+// Both sides build the same dictionary from the data alone, so none of it is
+// stored. The code width grows with the dictionary, from `minimum + 1` bits up
+// to twelve, and the bits are packed **least-significant first**, which is the
+// opposite of almost every other format and the single most common reason a
+// hand-written GIF decoder produces noise.
+//
+// Checked against Pillow, in both directions: this decodes what Pillow writes,
+// and Pillow decodes what this writes.
+
+type GifFrame = {
+    left: i64,
+    top: i64,
+    width: i64,
+    height: i64,
+    interlaced: bool,
+    /// Palette indices, row-major, `width * height` of them.
+    pixels: [i64],
+    /// The palette in force: the frame's own if it has one, else the global.
+    /// Flat red, green, blue triples.
+    palette: [i64],
+    /// Hundredths of a second. Zero means "as fast as the viewer likes",
+    /// which browsers read as a tenth of a second.
+    delay: i64,
+    /// The index that is not drawn, or -1.
+    transparent: i64,
+    /// 0 unspecified, 1 leave, 2 restore to background, 3 restore to previous.
+    disposal: i64,
+}
+
+type GifImage = {
+    /// `87a` or `89a`. Extensions are 89a only, and a file using one while
+    /// claiming 87a is common enough that this is recorded, not enforced.
+    version: str,
+    width: i64,
+    height: i64,
+    background: i64,
+    global_palette: [i64],
+    frames: [GifFrame],
+    /// -1 when the file says nothing, 0 for forever, otherwise a count.
+    loop_count: i64,
+    comments: [str],
+}
+
+type GifError =
+    | NotGif(magic: str)
+    | Truncated(at: i64)
+    | BadCode(code: i64)
+    | NoImage()
+    | TooManyColours(count: i64)
+    | SizeMismatch(pixels: i64, expected: i64)
+
+fn read16(data: bytes, at: i64) -> i64 {
+    return data.at(at) + data.at(at + 1) * 256
+}
+
+fn push16(inout out: [i64], value: i64) {
+    out.push(value % 256)
+    out.push(value / 256 % 256)
+}
+
+/// Whether the first six bytes are a GIF signature.
+pub fn is_gif(data: bytes) -> bool {
+    if data.len() < 6 {
+        return false
+    }
+    return version_of(data) == "87a" or version_of(data) == "89a"
+}
+
+fn version_of(data: bytes) -> str {
+    if data.len() < 6 or data.at(0) != 71 or data.at(1) != 73 or
+    data.at(2) != 70 {
+        return ""
+    }
+    var out = ""
+    for i in 3..6 {
+        out = out + str_of_byte(data.at(i))
+    }
+    return out
+}
+
+fn str_of_byte(b: i64) -> str {
+    return bytes_of([b]).to_str()
+}
+
+/// The number of entries a three-bit size field stands for.
+///
+/// The file stores an exponent, so the smallest palette a GIF can have is two
+/// entries and every size is a power of two.
+pub fn palette_entries(size_field: i64) -> i64 {
+    var n = 2
+    for _i in 0..size_field {
+        n = n * 2
+    }
+    return n
+}
+
+/// The size field a palette of `count` colours needs.
+pub fn size_field_for(count: i64) -> i64 {
+    var field = 0
+    while palette_entries(field) < count and field < 7 {
+        field = field + 1
+    }
+    return field
+}
+
+fn read_palette(data: bytes, at: i64, entries: i64) -> [i64] {
+    var out: [i64] = []
+    var i = 0
+    while i < entries * 3 and at + i < data.len() {
+        out.push(data.at(at + i))
+        i = i + 1
+    }
+    return out
+}
+
+/// The colour a palette index stands for, as red, green, blue.
+///
+/// An index past the end of the palette is black rather than an error: files
+/// in the wild do it, and every viewer shows them.
+pub fn colour_at(palette: [i64], index: i64) -> (i64, i64, i64) {
+    if index < 0 or index * 3 + 2 >= palette.len() {
+        return (0, 0, 0)
+    }
+    return (palette[index * 3], palette[index * 3 + 1],
+        palette[index * 3 + 2])
+}
+
+/// The rows an interlaced frame's passes land on, in storage order.
+///
+/// Four passes: every eighth row from 0, every eighth from 4, every fourth
+/// from 2, every second from 1.
+pub fn interlace_rows(height: i64) -> [i64] {
+    var out: [i64] = []
+    for pass in 0..4 {
+        var start = 0
+        var step = 8
+        if pass == 1 {
+            start = 4
+        }
+        if pass == 2 {
+            start = 2
+            step = 4
+        }
+        if pass == 3 {
+            start = 1
+            step = 2
+        }
+        var row = start
+        while row < height {
+            out.push(row)
+            row = row + step
+        }
+    }
+    return out
+}
+
+/// Rows put back where they belong.
+pub fn deinterlace(pixels: [i64], width: i64, height: i64) -> [i64] {
+    var out: [i64] = []
+    for _i in 0..pixels.len() {
+        out.push(0)
+    }
+    let rows = interlace_rows(height)
+    var source = 0
+    for row in rows {
+        for x in 0..width {
+            let to = row * width + x
+            if to < out.len() and source < pixels.len() {
+                out[to] = pixels[source]
+            }
+            source = source + 1
+        }
+    }
+    return out
+}
+
+// --------------------------------------------------------------------- LZW
+
+/// LZW as GIF uses it, with the bits packed least-significant first.
+///
+/// `minimum` is the code size the file declares — the number of bits a plain
+/// palette index needs, at least two even for a two-colour image, because the
+/// clear and end codes have to fit above it.
+///
+/// The dictionary is rebuilt from the codes alone, which is the whole trick:
+/// after emitting a code the decoder adds the previous string plus the new
+/// string's first character, and that is exactly what the encoder added a
+/// step earlier. The famous edge case is a code that has not been defined
+/// yet, which happens when the encoder matched a string it defined on the
+/// immediately preceding step; the answer is the previous string plus its own
+/// first character, and a decoder missing that case fails only on runs.
+pub fn lzw_decode(codes: bytes, minimum: i64) -> [i64] ! GifError {
+    let clear = (1).shl(minimum)
+    let stop = clear + 1
+    var table = starting_table(clear)
+    var width = minimum + 1
+    var next = stop + 1
+    var previous: [i64] = []
+    var out: [i64] = []
+    var bit = 0
+    while bit + width <= codes.len() * 8 {
+        let code = read_bits(codes, bit, width)
+        bit = bit + width
+        if code == clear {
+            table = starting_table(clear)
+            width = minimum + 1
+            next = stop + 1
+            previous = []
+            continue
+        }
+        if code == stop {
+            break
+        }
+        var entry: [i64] = []
+        if code < table.len() {
+            entry = table[code]
+        } else if code == next and previous.len() > 0 {
+            entry = previous
+            entry.push(previous[0])
+        } else {
+            fail(BadCode(code))
+        }
+        for v in entry {
+            out.push(v)
+        }
+        if previous.len() > 0 and next < 4096 {
+            var added = previous
+            added.push(entry[0])
+            while table.len() < next {
+                table.push([])
+            }
+            table.push(added)
+            next = next + 1
+            if next == (1).shl(width) and width < 12 {
+                width = width + 1
+            }
+        }
+        previous = entry
+    }
+    return out
+}
+
+fn starting_table(clear: i64) -> [[i64]] {
+    var table: [[i64]] = []
+    for i in 0..clear {
+        table.push([i])
+    }
+    // The clear and end codes occupy the next two slots and stand for no
+    // string at all.
+    table.push([])
+    table.push([])
+    return table
+}
+
+fn read_bits(data: bytes, at: i64, width: i64) -> i64 {
+    var value = 0
+    for i in 0..width {
+        let position = at + i
+        let byte = data.at(position / 8)
+        let bit = byte.ushr(position % 8).bit_and(1)
+        value = value.bit_or(bit.shl(i))
+    }
+    return value
+}
+
+fn write_bits(inout out: [i64], inout held: i64, inout bits: i64, code: i64,
+    width: i64) {
+    held = held.bit_or(code.shl(bits))
+    bits = bits + width
+    while bits >= 8 {
+        out.push(held % 256)
+        held = held.ushr(8)
+        bits = bits - 8
+    }
+}
+
+/// The same, backwards.
+///
+/// The encoder emits a clear code first — which is not required by the format
+/// but is what every encoder does, and a decoder that cannot cope with one is
+/// broken anyway — and another whenever the dictionary fills, because the code
+/// width stops at twelve bits and there is nowhere else to put new entries.
+pub fn lzw_encode(indices: [i64], minimum: i64) -> bytes {
+    let clear = (1).shl(minimum)
+    var table = encode_table(clear)
+    var width = minimum + 1
+    var next = clear + 2
+    var out: [i64] = []
+    var held = 0
+    var bits = 0
+    write_bits(out, held, bits, clear, width)
+    var current = ""
+    for index in indices {
+        let candidate = extend(current, index)
+        if table.has(candidate) {
+            current = candidate
+            continue
+        }
+        write_bits(out, held, bits, table.get(current) ?? 0, width)
+        table.set(candidate, next)
+        next = next + 1
+        if next > (1).shl(width) and width < 12 {
+            width = width + 1
+        }
+        if next == 4096 {
+            write_bits(out, held, bits, clear, width)
+            table = encode_table(clear)
+            width = minimum + 1
+            next = clear + 2
+        }
+        current = key_of(index)
+    }
+    if current != "" {
+        write_bits(out, held, bits, table.get(current) ?? 0, width)
+    }
+    write_bits(out, held, bits, clear + 1, width)
+    if bits > 0 {
+        out.push(held % 256)
+    }
+    return bytes_of(out)
+}
+
+fn encode_table(clear: i64) -> Map[str, i64] {
+    var table = map()
+    for i in 0..clear {
+        table.set(key_of(i), i)
+    }
+    return table
+}
+
+fn key_of(index: i64) -> str {
+    return "{index}"
+}
+
+fn extend(current: str, index: i64) -> str {
+    if current == "" {
+        return key_of(index)
+    }
+    return current + "," + key_of(index)
+}
+
+// ------------------------------------------------------------------ blocks
+
+/// Sub-blocks joined: GIF stores long data as a chain of runs of at most 255
+/// bytes, each preceded by its length, ending with a zero length.
+///
+/// Answers the joined bytes and the offset just past the terminator.
+pub fn read_sub_blocks(data: bytes, at: i64) -> (bytes, i64) {
+    var out: [i64] = []
+    var i = at
+    while i < data.len() {
+        let length = data.at(i)
+        i = i + 1
+        if length == 0 {
+            break
+        }
+        var k = 0
+        while k < length and i + k < data.len() {
+            out.push(data.at(i + k))
+            k = k + 1
+        }
+        i = i + length
+    }
+    return (bytes_of(out), i)
+}
+
+fn write_sub_blocks(inout out: [i64], data: bytes) {
+    var i = 0
+    while i < data.len() {
+        var run = data.len() - i
+        if run > 255 {
+            run = 255
+        }
+        out.push(run)
+        var k = 0
+        while k < run {
+            out.push(data.at(i + k))
+            k = k + 1
+        }
+        i = i + run
+    }
+    out.push(0)
+}
+
+/// Everything in a GIF file, frames and all.
+pub fn parse(data: bytes) -> GifImage ! GifError {
+    if not is_gif(data) {
+        fail(NotGif(version_of(data)))
+    }
+    if data.len() < 13 {
+        fail(Truncated(data.len()))
+    }
+    let packed = data.at(10)
+    var image = GifImage{
+        version: version_of(data),
+        width: read16(data, 6),
+        height: read16(data, 8),
+        background: data.at(11),
+        global_palette: [],
+        frames: [],
+        loop_count: 0 - 1,
+        comments: [],
+    }
+    var at = 13
+    if packed.ushr(7) == 1 {
+        let entries = palette_entries(packed.bit_and(7))
+        image.global_palette = read_palette(data, at, entries)
+        at = at + entries * 3
+    }
+    try read_blocks(image, data, at)
+    return image
+}
+
+fn read_blocks(inout image: GifImage, data: bytes, from: i64) ! GifError {
+    var at = from
+    // A graphic control extension applies to the *next* image block, so it is
+    // held here rather than attached where it was read. Every delay in the
+    // file is off by one frame if this is got wrong.
+    var delay = 0
+    var transparent = 0 - 1
+    var disposal = 0
+    while at < data.len() {
+        let marker = data.at(at)
+        if marker == 59 {
+            break
+        }
+        if marker == 44 {
+            let frame = try read_frame(image, data, at + 1, delay, transparent,
+                disposal)
+            image.frames.push(frame.0)
+            at = frame.1
+            delay = 0
+            transparent = 0 - 1
+            disposal = 0
+            continue
+        }
+        if marker != 33 {
+            fail(Truncated(at))
+        }
+        let label = data.at(at + 1)
+        if label == 249 {
+            let control = data.at(at + 3)
+            disposal = control.ushr(2).bit_and(7)
+            delay = read16(data, at + 4)
+            transparent = 0 - 1
+            if control.bit_and(1) == 1 {
+                transparent = data.at(at + 6)
+            }
+        }
+        at = try read_extension(image, data, at, label)
+    }
+    if image.frames.len() == 0 {
+        fail(NoImage())
+    }
+}
+
+fn read_extension(inout image: GifImage, data: bytes, at: i64,
+    label: i64) -> i64 ! GifError {
+    if label == 254 {
+        let block = read_sub_blocks(data, at + 2)
+        image.comments.push(block.0.to_str())
+        return block.1
+    }
+    if label == 255 {
+        // The loop count lives in an application extension nobody
+        // standardised: eleven bytes reading NETSCAPE2.0, then a sub-block
+        // whose first byte is 1 and whose next two are the count.
+        let name = data.at(at + 2)
+        let block = read_sub_blocks(data, at + 3 + name)
+        if block.0.len() >= 3 and block.0.at(0) == 1 {
+            image.loop_count = block.0.at(1) + block.0.at(2) * 256
+        }
+        return block.1
+    }
+    // Every other extension is a size byte and then sub-blocks.
+    let size = data.at(at + 2)
+    return read_sub_blocks(data, at + 3 + size).1
+}
+
+fn read_frame(image: GifImage, data: bytes, at: i64, delay: i64,
+    transparent: i64, disposal: i64) -> (GifFrame, i64) ! GifError {
+    if at + 9 > data.len() {
+        fail(Truncated(at))
+    }
+    let packed = data.at(at + 8)
+    var frame = GifFrame{
+        left: read16(data, at),
+        top: read16(data, at + 2),
+        width: read16(data, at + 4),
+        height: read16(data, at + 6),
+        interlaced: packed.ushr(6).bit_and(1) == 1,
+        pixels: [],
+        palette: image.global_palette,
+        delay: delay,
+        transparent: transparent,
+        disposal: disposal,
+    }
+    var next = at + 9
+    if packed.ushr(7) == 1 {
+        let entries = palette_entries(packed.bit_and(7))
+        frame.palette = read_palette(data, next, entries)
+        next = next + entries * 3
+    }
+    let minimum = data.at(next)
+    let block = read_sub_blocks(data, next + 1)
+    var pixels = try lzw_decode(block.0, minimum)
+    // A decoder must not trust the frame size: files exist whose LZW stream
+    // is short, and every viewer pads them rather than refusing the picture.
+    while pixels.len() < frame.width * frame.height {
+        pixels.push(0)
+    }
+    if frame.interlaced {
+        pixels = deinterlace(pixels, frame.width, frame.height)
+    }
+    frame.pixels = pixels
+    return (frame, block.1)
+}
+
+// ----------------------------------------------------------------- writing
+
+/// A single-frame GIF from palette indices and a palette.
+///
+/// The palette is padded up to the next power of two, because the format has
+/// nowhere to say "three colours".
+pub fn encode_frame(width: i64, height: i64, pixels: [i64],
+    palette: [i64]) -> bytes ! GifError {
+    if pixels.len() != width * height {
+        fail(SizeMismatch(pixels.len(), width * height))
+    }
+    let colours = palette.len() / 3
+    if colours > 256 {
+        fail(TooManyColours(colours))
+    }
+    let field = size_field_for(colours)
+    let entries = palette_entries(field)
+    var out: [i64] = []
+    write_header(out, width, height, field)
+    write_padded_palette(out, palette, entries)
+    out.push(44)
+    push16(out, 0)
+    push16(out, 0)
+    push16(out, width)
+    push16(out, height)
+    out.push(0)
+    // The minimum code size is at least two even for a two-colour image: one
+    // bit leaves no room above the palette for the clear and end codes.
+    var minimum = field + 1
+    if minimum < 2 {
+        minimum = 2
+    }
+    out.push(minimum)
+    write_sub_blocks(out, lzw_encode(pixels, minimum))
+    out.push(59)
+    return bytes_of(out)
+}
+
+fn write_header(inout out: [i64], width: i64, height: i64, field: i64) {
+    for b in [71, 73, 70, 56, 57, 97] {
+        out.push(b)
+    }
+    push16(out, width)
+    push16(out, height)
+    // Global table present, eight bits of colour resolution, unsorted.
+    out.push(128 + 112 + field)
+    out.push(0)
+    out.push(0)
+}
+
+fn write_padded_palette(inout out: [i64], palette: [i64], entries: i64) {
+    var i = 0
+    while i < entries * 3 {
+        if i < palette.len() {
+            out.push(palette[i])
+        } else {
+            out.push(0)
+        }
+        i = i + 1
+    }
+}
+
+/// Every frame's pixels as red, green, blue triples, transparency resolved to
+/// the background colour.
+pub fn frame_rgb(frame: GifFrame) -> [i64] {
+    var out: [i64] = []
+    for index in frame.pixels {
+        let colour = colour_at(frame.palette, index)
+        out.push(colour.0)
+        out.push(colour.1)
+        out.push(colour.2)
+    }
+    return out
+}
+
+/// Whether the file holds more than one picture.
+pub fn is_animated(image: GifImage) -> bool {
+    return image.frames.len() > 1
+}
+
+/// How long one pass through the animation takes, in seconds.
+///
+/// A frame with a delay of zero is written by encoders that mean "as fast as
+/// possible"; browsers show it for a tenth of a second instead, and this
+/// follows them, because the honest answer of zero makes a GIF that plainly
+/// takes two seconds measure as taking none.
+pub fn duration(image: GifImage) -> f64 {
+    var total = 0
+    for frame in image.frames {
+        if frame.delay == 0 {
+            total = total + 10
+        } else {
+            total = total + frame.delay
+        }
+    }
+    return total.as_f64() / 100.0
+}
+
+/// The colours a frame actually uses, which is usually fewer than it carries.
+pub fn colours_used(frame: GifFrame) -> i64 {
+    var seen: [bool] = []
+    for _i in 0..256 {
+        seen.push(false)
+    }
+    var count = 0
+    for index in frame.pixels {
+        if index >= 0 and index < 256 and not seen[index] {
+            seen[index] = true
+            count = count + 1
+        }
+    }
+    return count
+}
+
+/// Whether any frame draws with transparency.
+pub fn has_transparency(image: GifImage) -> bool {
+    for frame in image.frames {
+        if frame.transparent >= 0 {
+            return true
+        }
+    }
+    return false
+}
+
+/// Every frame drawn where it belongs, as red, green, blue triples.
+///
+/// A GIF frame is not a picture. It is a patch: it has its own position and
+/// size, it is drawn over whatever the frame before it left behind, and one
+/// of its palette indices may mean "do not draw this pixel". Showing frames
+/// independently is the second most common GIF bug, after the delay being off
+/// by one, and it is the one that makes an animation flicker.
+pub fn render(image: GifImage) -> [[i64]] {
+    var canvas = background_canvas(image)
+    var out: [[i64]] = []
+    for frame in image.frames {
+        let before = canvas
+        draw_frame(canvas, image, frame)
+        out.push(canvas)
+        // Disposal says what to do *after* showing this frame: 2 clears the
+        // frame's rectangle back to the background, 3 puts back what was
+        // there before it was drawn, and everything else leaves it.
+        if frame.disposal == 2 {
+            canvas = background_canvas(image)
+        } else if frame.disposal == 3 {
+            canvas = before
+        }
+    }
+    return out
+}
+
+fn background_canvas(image: GifImage) -> [i64] {
+    let colour = colour_at(image.global_palette, image.background)
+    var canvas: [i64] = []
+    for _i in 0..image.width * image.height {
+        canvas.push(colour.0)
+        canvas.push(colour.1)
+        canvas.push(colour.2)
+    }
+    return canvas
+}
+
+fn draw_frame(inout canvas: [i64], image: GifImage, frame: GifFrame) {
+    for y in 0..frame.height {
+        for x in 0..frame.width {
+            let index = frame.pixels[y * frame.width + x]
+            if index == frame.transparent {
+                continue
+            }
+            let to = ((frame.top + y) * image.width + frame.left + x) * 3
+            if to < 0 or to + 2 >= canvas.len() {
+                continue
+            }
+            let colour = colour_at(frame.palette, index)
+            canvas[to] = colour.0
+            canvas[to + 1] = colour.1
+            canvas[to + 2] = colour.2
+        }
+    }
+}
