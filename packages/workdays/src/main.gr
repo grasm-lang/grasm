@@ -1,0 +1,229 @@
+// Business days: "five working days" is not "five days".
+//
+// Every invoice term, delivery estimate and service-level agreement is
+// counted in working days, and the arithmetic is not date arithmetic:
+//
+//   - **The weekend is not always Saturday and Sunday.** It is Friday and
+//     Saturday across much of the Middle East, and Sunday only in some
+//     places. A hard-coded pair is wrong for a large part of the world, so
+//     the weekend is a set the caller gives.
+//   - **Holidays are data.** They differ by country, by region and by year,
+//     and several move — Easter is a computation, and a holiday falling on a
+//     weekend is often observed on the nearest weekday. Both are here; the
+//     list itself is the caller's.
+//   - **Counting is exclusive of the start.** "Three working days from
+//     Monday" is Thursday, not Wednesday. Getting that wrong makes every
+//     deadline a day early, consistently, which nobody notices because it is
+//     consistent.
+import time
+
+type WorkCalendar = {
+    /// Weekday numbers that are not worked, in `time`'s numbering: Monday is
+    /// 1 and Sunday is 7. Not 0 for Sunday, which is the other common
+    /// convention and the one that makes every weekend check silently wrong.
+    weekend: [i64],
+    /// Holiday dates, as days since the epoch.
+    holiday: [i64],
+}
+
+pub fn standard_weekend() -> [i64] {
+    return [6, 7]
+}
+
+/// Friday and Saturday, which is the weekend across much of the Middle East.
+pub fn friday_saturday() -> [i64] {
+    return [5, 6]
+}
+
+pub fn new_calendar(weekend: [i64], holidays: [Date]) -> WorkCalendar {
+    var days: [i64] = []
+    for d in holidays {
+        days.push(time.days_from_civil(d))
+    }
+    return WorkCalendar{ weekend: weekend, holiday: days }
+}
+
+pub fn is_weekend(c: WorkCalendar, d: Date) -> bool {
+    return c.weekend.contains(time.weekday(d))
+}
+
+pub fn is_holiday(c: WorkCalendar, d: Date) -> bool {
+    return c.holiday.contains(time.days_from_civil(d))
+}
+
+pub fn is_working_day(c: WorkCalendar, d: Date) -> bool {
+    return not is_weekend(c, d) and not is_holiday(c, d)
+}
+
+/// The next working day strictly after `d`.
+pub fn next_working_day(c: WorkCalendar, d: Date) -> Date {
+    var at = time.days_from_civil(d) + 1
+    var guard = 0
+    while guard < 400 {
+        let candidate = time.civil_from_days(at)
+        if is_working_day(c, candidate) {
+            return candidate
+        }
+        at = at + 1
+        guard = guard + 1
+    }
+    return d
+}
+
+pub fn previous_working_day(c: WorkCalendar, d: Date) -> Date {
+    var at = time.days_from_civil(d) - 1
+    var guard = 0
+    while guard < 400 {
+        let candidate = time.civil_from_days(at)
+        if is_working_day(c, candidate) {
+            return candidate
+        }
+        at = at - 1
+        guard = guard + 1
+    }
+    return d
+}
+
+/// `d` itself if it is a working day, otherwise the next one.
+pub fn roll_forward(c: WorkCalendar, d: Date) -> Date {
+    if is_working_day(c, d) {
+        return d
+    }
+    return next_working_day(c, d)
+}
+
+pub fn roll_backward(c: WorkCalendar, d: Date) -> Date {
+    if is_working_day(c, d) {
+        return d
+    }
+    return previous_working_day(c, d)
+}
+
+/// `count` working days after `d`, counting exclusively of `d` itself.
+///
+/// "Three working days from Monday" is Thursday. A loop that counts the start
+/// day makes it Wednesday, and every deadline a day early.
+pub fn add_working_days(c: WorkCalendar, d: Date, count: i64) -> Date {
+    if count == 0 {
+        return d
+    }
+    var left = if count < 0 { 0 - count } else { count }
+    var at = d
+    while left > 0 {
+        at = if count > 0 { next_working_day(c, at) } else {
+            previous_working_day(c, at)
+        }
+        left = left - 1
+    }
+    return at
+}
+
+/// Working days between two dates, counting the end and not the start.
+pub fn between(c: WorkCalendar, from: Date, to: Date) -> i64 {
+    let start = time.days_from_civil(from)
+    let stop = time.days_from_civil(to)
+    if stop == start {
+        return 0
+    }
+    let step = if stop > start { 1 } else { 0 - 1 }
+    var at = start
+    var count = 0
+    while at != stop {
+        at = at + step
+        if is_working_day(c, time.civil_from_days(at)) {
+            count = count + 1
+        }
+    }
+    return count * step
+}
+
+/// Every working day in a month.
+pub fn working_days_in_month(c: WorkCalendar, year: i64, month: i64) -> [Date] {
+    var out: [Date] = []
+    for day in 1..(time.days_in_month(year, month) + 1) {
+        let d = Date{ year: year, month: month, day: day }
+        if is_working_day(c, d) {
+            out.push(d)
+        }
+    }
+    return out
+}
+
+/// The `n`th weekday of a month — "the third Monday in January", which is how
+/// a great many public holidays are defined.
+pub fn nth_weekday(year: i64, month: i64, weekday: i64, n: i64) -> Date {
+    let first = Date{ year: year, month: month, day: 1 }
+    var day = 1 + (weekday - time.weekday(first) + 7) % 7
+    day = day + (n - 1) * 7
+    let limit = time.days_in_month(year, month)
+    if day > limit {
+        day = day - 7
+    }
+    return Date{ year: year, month: month, day: day }
+}
+
+/// The last given weekday of a month — "the last Monday in May".
+pub fn last_weekday(year: i64, month: i64, weekday: i64) -> Date {
+    let limit = time.days_in_month(year, month)
+    let last = Date{ year: year, month: month, day: limit }
+    let back = (time.weekday(last) - weekday + 7) % 7
+    return Date{ year: year, month: month, day: limit - back }
+}
+
+/// Easter Sunday, by the anonymous Gregorian algorithm.
+///
+/// Here because a surprising number of public holidays are defined relative
+/// to it — Good Friday, Easter Monday, Ascension, Whit Monday — and because
+/// it is not a rule anybody can remember, so a table of them goes stale.
+pub fn easter(year: i64) -> Date {
+    let a = year % 19
+    let b = year / 100
+    let c = year % 100
+    let d = b / 4
+    let e = b % 4
+    let f = (b + 8) / 25
+    let g = (b - f + 1) / 3
+    let h = (19 * a + b - d - g + 15) % 30
+    let i = c / 4
+    let k = c % 4
+    let l = (32 + 2 * e + 2 * i - h - k) % 7
+    let m = (a + 11 * h + 22 * l) / 451
+    let month = (h + l - 7 * m + 114) / 31
+    let day = (h + l - 7 * m + 114) % 31 + 1
+    return Date{ year: year, month: month, day: day }
+}
+
+pub fn good_friday(year: i64) -> Date {
+    return time.civil_from_days(time.days_from_civil(easter(year)) - 2)
+}
+
+pub fn easter_monday(year: i64) -> Date {
+    return time.civil_from_days(time.days_from_civil(easter(year)) + 1)
+}
+
+/// A fixed holiday moved to the nearest weekday when it falls on a weekend.
+///
+/// The rule most countries use, and the reason "the 25th of December" is not
+/// enough to know when the office is shut.
+pub fn observed(c: WorkCalendar, d: Date) -> Date {
+    if not is_weekend(c, d) {
+        return d
+    }
+    // Saturday moves back to Friday, Sunday forward to Monday.
+    if time.weekday(d) == 6 {
+        return previous_working_day(c, d)
+    }
+    return next_working_day(c, d)
+}
+
+/// Whether a deadline expressed in working days has passed.
+pub fn is_overdue(c: WorkCalendar, issued: Date, days: i64, today: Date) -> bool {
+    let due = add_working_days(c, issued, days)
+    return time.days_from_civil(today) > time.days_from_civil(due)
+}
+
+/// How many working days remain, negative when the deadline has passed.
+pub fn days_remaining(c: WorkCalendar, issued: Date, days: i64,
+    today: Date) -> i64 {
+    return between(c, today, add_working_days(c, issued, days))
+}

@@ -1,0 +1,10 @@
+[package]
+name = "iso8601"
+version = "1.0.0"
+
+# Arithmetic over text. Opens nothing.
+capabilities = []
+
+[dependencies.time]
+path = "../time"
+version = "^1.0.0"

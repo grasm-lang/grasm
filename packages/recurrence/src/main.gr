@@ -1,0 +1,464 @@
+// RRULE: "every second Tuesday", as a calendar means it.
+//
+// RFC 5545's recurrence rule is what every calendar application stores, and
+// it is a small language with several traps:
+//
+//   - **The 31st of every month.** A monthly rule on the 31st skips February,
+//     April, June, September and November entirely — it does not clamp to the
+//     28th. Clamping is what a naive implementation does and it produces an
+//     event on a day the user did not ask for.
+//   - **`BYDAY` with an ordinal.** `2TU` is the second Tuesday of the month
+//     and `-1FR` the last Friday. Both are counted within the period, not
+//     within the week.
+//   - **`COUNT` and `UNTIL` are exclusive of each other**, and `COUNT`
+//     includes the first occurrence.
+//   - **`INTERVAL` counts periods, not occurrences.** "Every other week on
+//     Monday and Wednesday" yields two dates in each included week, not
+//     alternating single days.
+//
+// The 29th of February is the case that catches everything: a yearly rule on
+// it occurs once every four years, and a rule that clamps it to the 28th
+// occurs every year and is wrong.
+import time
+
+type Recurrence = {
+    /// "daily", "weekly", "monthly", "yearly".
+    frequency: str,
+    interval: i64,
+    /// Weekday numbers in `time`'s numbering — Monday is 1 and Sunday is 7 —
+    /// rather than RFC 5545's own order. `SU` is 7 here, not 0: the codes are
+    /// translated at the edge so nothing inside compares two conventions.
+    by_day: [i64],
+    /// The ordinal for each entry in `by_day`: 2 for the second, -1 for the
+    /// last, 0 for every one.
+    by_day_ordinal: [i64],
+    by_month_day: [i64],
+    by_month: [i64],
+    /// 0 when the rule has no count.
+    count: i64,
+    /// Days since the epoch; -1 when the rule has no end.
+    until: i64,
+    /// The first day of the week, which decides where an interval falls.
+    /// Monday, which is the default RFC 5545 gives.
+    week_start: i64,
+}
+
+type RecurrenceError =
+    | UnknownFrequency(name: str)
+    | BothCountAndUntil
+    | Malformed(text: str, why: str)
+
+pub fn daily(interval: i64) -> Recurrence {
+    return base("daily", interval)
+}
+
+pub fn weekly(interval: i64, days: [i64]) -> Recurrence {
+    var r = base("weekly", interval)
+    r.by_day = days
+    var ordinals: [i64] = []
+    for _d in days {
+        ordinals.push(0)
+    }
+    r.by_day_ordinal = ordinals
+    return r
+}
+
+pub fn monthly(interval: i64, month_days: [i64]) -> Recurrence {
+    var r = base("monthly", interval)
+    r.by_month_day = month_days
+    return r
+}
+
+pub fn yearly(interval: i64) -> Recurrence {
+    return base("yearly", interval)
+}
+
+fn base(frequency: str, interval: i64) -> Recurrence {
+    return Recurrence{
+        frequency: frequency, interval: if interval < 1 { 1 } else { interval },
+        by_day: [], by_day_ordinal: [], by_month_day: [], by_month: [],
+        count: 0, until: 0 - 1, week_start: 1,
+    }
+}
+
+pub fn with_count(r: Recurrence, n: i64) -> Recurrence {
+    var out = r
+    out.count = n
+    out.until = 0 - 1
+    return out
+}
+
+pub fn with_until(r: Recurrence, d: Date) -> Recurrence {
+    var out = r
+    out.until = time.days_from_civil(d)
+    out.count = 0
+    return out
+}
+
+pub fn on_weekdays(r: Recurrence, days: [i64], ordinals: [i64]) -> Recurrence {
+    var out = r
+    out.by_day = days
+    out.by_day_ordinal = ordinals
+    return out
+}
+
+pub fn in_months(r: Recurrence, months: [i64]) -> Recurrence {
+    var out = r
+    out.by_month = months
+    return out
+}
+
+fn weekday_code(name: str) -> i64 {
+    // Monday is 1, so `SU` is 7 rather than 0.
+    let codes = ["MO", "TU", "WE", "TH", "FR", "SA", "SU"]
+    for i in 0..codes.len() {
+        if codes[i] == name {
+            return i + 1
+        }
+    }
+    return 0 - 1
+}
+
+pub fn weekday_name(n: i64) -> str {
+    return ["SU", "MO", "TU", "WE", "TH", "FR", "SA", "SU"][n % 8]
+}
+
+/// Parse an RRULE line: `FREQ=WEEKLY;INTERVAL=2;BYDAY=MO,WE`.
+pub fn parse(text: str) -> Recurrence ! RecurrenceError {
+    var body = text.trim()
+    if body.to_upper().starts_with("RRULE:") {
+        body = body.substr(6, body.len() - 6)
+    }
+    var out = base("daily", 1)
+    var frequency = ""
+    var has_count = false
+    var has_until = false
+    for piece in body.split(";") {
+        let at = piece.index_of("=") ?? 0 - 1
+        if at < 0 {
+            continue
+        }
+        let key = piece.substr(0, at).trim().to_upper()
+        let value = piece.substr(at + 1, piece.len() - at - 1).trim()
+        if key == "FREQ" {
+            frequency = value.to_lower()
+        } else if key == "INTERVAL" {
+            out.interval = value.parse_int() ?? 1
+        } else if key == "COUNT" {
+            out.count = value.parse_int() ?? 0
+            has_count = true
+        } else if key == "UNTIL" {
+            out.until = parse_until(value)
+            has_until = true
+        } else if key == "WKST" {
+            out.week_start = weekday_code(value.to_upper())
+        } else if key == "BYDAY" {
+            let parsed = parse_by_day(value)
+            out.by_day = parsed.0
+            out.by_day_ordinal = parsed.1
+        } else if key == "BYMONTHDAY" {
+            out.by_month_day = parse_numbers(value)
+        } else if key == "BYMONTH" {
+            out.by_month = parse_numbers(value)
+        }
+    }
+    if has_count and has_until {
+        fail(BothCountAndUntil)
+    }
+    if not ["daily", "weekly", "monthly", "yearly"].contains(frequency) {
+        fail(UnknownFrequency(frequency))
+    }
+    out.frequency = frequency
+    if out.interval < 1 {
+        out.interval = 1
+    }
+    return out
+}
+
+fn parse_until(value: str) -> i64 {
+    let body = value.replace("-", "")
+    if body.len() < 8 {
+        return 0 - 1
+    }
+    let year = body.substr(0, 4).parse_int() ?? 0 - 1
+    let month = body.substr(4, 2).parse_int() ?? 0 - 1
+    let day = body.substr(6, 2).parse_int() ?? 0 - 1
+    if year < 0 or month < 1 or day < 1 {
+        return 0 - 1
+    }
+    return time.days_from_civil(Date{ year: year, month: month, day: day })
+}
+
+fn parse_numbers(value: str) -> [i64] {
+    var out: [i64] = []
+    for piece in value.split(",") {
+        let n = piece.trim().parse_int() ?? 0
+        if n != 0 {
+            out.push(n)
+        }
+    }
+    return out
+}
+
+fn parse_by_day(value: str) -> ([i64], [i64]) {
+    var days: [i64] = []
+    var ordinals: [i64] = []
+    for piece in value.split(",") {
+        let entry = piece.trim().to_upper()
+        if entry.len() < 2 {
+            continue
+        }
+        let name = entry.substr(entry.len() - 2, 2)
+        let code = weekday_code(name)
+        if code < 0 {
+            continue
+        }
+        var ordinal = 0
+        if entry.len() > 2 {
+            ordinal = entry.substr(0, entry.len() - 2).parse_int() ?? 0
+        }
+        days.push(code)
+        ordinals.push(ordinal)
+    }
+    return (days, ordinals)
+}
+
+pub fn render(r: Recurrence) -> str {
+    var parts: [str] = ["FREQ=" + r.frequency.to_upper()]
+    if r.interval != 1 {
+        parts.push("INTERVAL={r.interval}")
+    }
+    if r.by_month.len() > 0 {
+        var months: [str] = []
+        for m in r.by_month {
+            months.push("{m}")
+        }
+        parts.push("BYMONTH=" + months.join(","))
+    }
+    if r.by_month_day.len() > 0 {
+        var days: [str] = []
+        for d in r.by_month_day {
+            days.push("{d}")
+        }
+        parts.push("BYMONTHDAY=" + days.join(","))
+    }
+    if r.by_day.len() > 0 {
+        var days: [str] = []
+        for i in 0..r.by_day.len() {
+            let ordinal = if i < r.by_day_ordinal.len() {
+                r.by_day_ordinal[i]
+            } else {
+                0
+            }
+            if ordinal == 0 {
+                days.push(weekday_name(r.by_day[i]))
+            } else {
+                days.push("{ordinal}" + weekday_name(r.by_day[i]))
+            }
+        }
+        parts.push("BYDAY=" + days.join(","))
+    }
+    if r.count > 0 {
+        parts.push("COUNT={r.count}")
+    }
+    if r.until >= 0 {
+        let d = time.civil_from_days(r.until)
+        var month = "{d.month}"
+        var day = "{d.day}"
+        if month.len() < 2 {
+            month = "0" + month
+        }
+        if day.len() < 2 {
+            day = "0" + day
+        }
+        parts.push("UNTIL={d.year}{month}{day}")
+    }
+    return parts.join(";")
+}
+
+fn matches_day(r: Recurrence, d: Date) -> bool {
+    if r.by_month.len() > 0 and not r.by_month.contains(d.month) {
+        return false
+    }
+    if r.by_month_day.len() > 0 {
+        let limit = time.days_in_month(d.year, d.month)
+        var found = false
+        for want in r.by_month_day {
+            let day = if want < 0 { limit + want + 1 } else { want }
+            if day == d.day {
+                found = true
+            }
+        }
+        if not found {
+            return false
+        }
+    }
+    if r.by_day.len() > 0 {
+        let weekday = time.weekday(d)
+        var found = false
+        for i in 0..r.by_day.len() {
+            if r.by_day[i] != weekday {
+                continue
+            }
+            let ordinal = if i < r.by_day_ordinal.len() {
+                r.by_day_ordinal[i]
+            } else {
+                0
+            }
+            if ordinal == 0 {
+                found = true
+            } else if ordinal > 0 {
+                if (d.day - 1) / 7 + 1 == ordinal {
+                    found = true
+                }
+            } else {
+                let limit = time.days_in_month(d.year, d.month)
+                if (limit - d.day) / 7 + 1 == 0 - ordinal {
+                    found = true
+                }
+            }
+        }
+        if not found {
+            return false
+        }
+    }
+    return true
+}
+
+fn in_period(r: Recurrence, start: Date, d: Date) -> bool {
+    if r.interval == 1 {
+        return true
+    }
+    if r.frequency == "daily" {
+        let delta = time.days_from_civil(d) - time.days_from_civil(start)
+        return delta % r.interval == 0
+    }
+    if r.frequency == "weekly" {
+        // Weeks are counted from the week containing the start, using the
+        // rule's own week start — which is what makes "every other week" fall
+        // where a calendar puts it.
+        let start_week = week_index(start, r.week_start)
+        let here = week_index(d, r.week_start)
+        return (here - start_week) % r.interval == 0
+    }
+    if r.frequency == "monthly" {
+        let months = (d.year - start.year) * 12 + (d.month - start.month)
+        return months % r.interval == 0
+    }
+    return (d.year - start.year) % r.interval == 0
+}
+
+fn week_index(d: Date, week_start: i64) -> i64 {
+    let days = time.days_from_civil(d)
+    let offset = (time.weekday(d) - week_start + 7) % 7
+    return (days - offset) / 7
+}
+
+/// The occurrences from `start`, at most `limit` of them.
+///
+/// `start` is itself the first occurrence when it matches the rule, which is
+/// what RFC 5545 says and what a caller expecting "the next one" has to
+/// account for.
+pub fn occurrences(r: Recurrence, start: Date, limit: i64) -> [Date] {
+    var out: [Date] = []
+    let wanted = if r.count > 0 and r.count < limit { r.count } else { limit }
+    var at = time.days_from_civil(start)
+    // Bounded so a rule that matches nothing — the 31st of February — stops
+    // rather than searching forever.
+    var guard = 0
+    let ceiling = 366 * 20
+    while out.len() < wanted and guard < ceiling {
+        let d = time.civil_from_days(at)
+        if r.until >= 0 and at > r.until {
+            break
+        }
+        if matches_day(r, d) and in_period(r, start, d) {
+            out.push(d)
+        }
+        at = at + 1
+        guard = guard + 1
+    }
+    return out
+}
+
+/// The next occurrence strictly after `after`.
+pub fn next_after(r: Recurrence, start: Date, after: Date) -> Option[Date] {
+    var at = time.days_from_civil(after) + 1
+    var guard = 0
+    while guard < 366 * 20 {
+        let d = time.civil_from_days(at)
+        if r.until >= 0 and at > r.until {
+            return None
+        }
+        if matches_day(r, d) and in_period(r, start, d) {
+            return Some(d)
+        }
+        at = at + 1
+        guard = guard + 1
+    }
+    return None
+}
+
+/// Whether a date is one of the rule's occurrences.
+pub fn includes(r: Recurrence, start: Date, d: Date) -> bool {
+    if time.days_from_civil(d) < time.days_from_civil(start) {
+        return false
+    }
+    if r.until >= 0 and time.days_from_civil(d) > r.until {
+        return false
+    }
+    return matches_day(r, d) and in_period(r, start, d)
+}
+
+/// A description a person can check against what they meant.
+pub fn describe(r: Recurrence) -> str {
+    var out = ""
+    if r.interval == 1 {
+        out = "every " + r.frequency.replace("ly", "")
+        if r.frequency == "daily" {
+            out = "every day"
+        } else if r.frequency == "weekly" {
+            out = "every week"
+        } else if r.frequency == "monthly" {
+            out = "every month"
+        } else {
+            out = "every year"
+        }
+    } else {
+        let unit = if r.frequency == "daily" { "days" } else {
+            if r.frequency == "weekly" { "weeks" } else {
+                if r.frequency == "monthly" { "months" } else { "years" }
+            }
+        }
+        out = "every {r.interval} {unit}"
+    }
+    if r.by_day.len() > 0 {
+        var names: [str] = []
+        for i in 0..r.by_day.len() {
+            let ordinal = if i < r.by_day_ordinal.len() { r.by_day_ordinal[i] } else { 0 }
+            let name = weekday_name(r.by_day[i])
+            if ordinal == 0 {
+                names.push(name)
+            } else if ordinal > 0 {
+                names.push("the {ordinal}th {name}")
+            } else {
+                names.push("the last {name}")
+            }
+        }
+        out = out + " on " + names.join(", ")
+    }
+    if r.by_month_day.len() > 0 {
+        var days: [str] = []
+        for d in r.by_month_day {
+            days.push("{d}")
+        }
+        out = out + " on day " + days.join(", ")
+    }
+    if r.count > 0 {
+        out = out + ", {r.count} times"
+    }
+    if r.until >= 0 {
+        out = out + ", until " + time.format_date(time.civil_from_days(r.until))
+    }
+    return out
+}

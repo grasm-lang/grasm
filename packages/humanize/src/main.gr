@@ -1,0 +1,290 @@
+// Numbers as a person would say them.
+//
+// The three that appear in every interface, and the mistake each invites:
+//
+//   - **Relative time.** "3 minutes ago" needs a *reference* time, and the
+//     only correct source of one is the caller. A function that reads the
+//     clock itself cannot be tested, cannot be rendered on a server for a
+//     client in another zone, and changes its output between two lines of the
+//     same page.
+//   - **Byte sizes.** A kilobyte is 1,000 bytes to a disk vendor and 1,024 to
+//     a file manager, and both are right about their own units. The two are
+//     separate functions here, named for what they are, rather than one
+//     function with a flag nobody sets.
+//   - **Plurals and rounding.** "1 hours ago" and "0.9 minutes" are the marks
+//     of a function that formats a number and then bolts a unit onto it. The
+//     unit and the rounding have to be chosen together.
+import time
+
+/// "3 minutes ago", "in 2 hours", "just now".
+///
+/// Both times are the caller's, in seconds. The coarsening is deliberate: a
+/// person reading "1 hour ago" does not want "1 hour, 14 minutes and 3
+/// seconds ago", and the moment the difference matters is the moment to show
+/// the timestamp instead.
+pub fn relative(then_seconds: i64, now_seconds: i64) -> str {
+    let delta = now_seconds - then_seconds
+    let past = delta >= 0
+    let magnitude = if past { delta } else { 0 - delta }
+    let body = coarse(magnitude)
+    if magnitude < 10 {
+        return "just now"
+    }
+    if past {
+        return body + " ago"
+    }
+    return "in " + body
+}
+
+fn plural(n: i64, unit: str) -> str {
+    if n == 1 {
+        return "1 {unit}"
+    }
+    return "{n} {unit}s"
+}
+
+fn coarse(seconds: i64) -> str {
+    if seconds < 60 {
+        return plural(seconds, "second")
+    }
+    if seconds < 3600 {
+        return plural(seconds / 60, "minute")
+    }
+    if seconds < 86400 {
+        return plural(seconds / 3600, "hour")
+    }
+    if seconds < 604800 {
+        return plural(seconds / 86400, "day")
+    }
+    if seconds < 2629800 {
+        return plural(seconds / 604800, "week")
+    }
+    if seconds < 31557600 {
+        // An average month, because "1 month ago" is a statement about how
+        // long ago rather than about a calendar.
+        return plural(seconds / 2629800, "month")
+    }
+    return plural(seconds / 31557600, "year")
+}
+
+/// A duration spelled out to `parts` levels: "2 hours 5 minutes".
+///
+/// Unlike `relative`, this keeps the detail — it is for a stopwatch or a
+/// build time, where the seconds are the point.
+pub fn duration(seconds: i64, parts: i64) -> str {
+    if seconds == 0 {
+        return "0 seconds"
+    }
+    let units = [(31557600, "year"), (2629800, "month"), (86400, "day"),
+        (3600, "hour"), (60, "minute"), (1, "second")]
+    var out: [str] = []
+    var left = if seconds < 0 { 0 - seconds } else { seconds }
+    for u in units {
+        if out.len() >= parts {
+            break
+        }
+        let count = left / u.0
+        if count > 0 {
+            out.push(plural(count, u.1))
+            left = left % u.0
+        }
+    }
+    let body = out.join(" ")
+    if seconds < 0 {
+        return "-" + body
+    }
+    return body
+}
+
+/// Bytes in powers of 1,024 — what a file manager and an operating system
+/// mean.
+pub fn binary_bytes(n: i64) -> str {
+    let units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"]
+    return scaled(n, 1024, units)
+}
+
+/// Bytes in powers of 1,000 — what a disk vendor and a network mean.
+///
+/// The two differ by 2.4% at a kilobyte and 10% at a terabyte, which is why a
+/// "1 TB" disk shows as 931 GiB and why the difference is worth two
+/// functions rather than a flag.
+pub fn decimal_bytes(n: i64) -> str {
+    let units = ["B", "kB", "MB", "GB", "TB", "PB"]
+    return scaled(n, 1000, units)
+}
+
+fn scaled(n: i64, step: i64, units: [str]) -> str {
+    let negative = n < 0
+    var value = if negative { 0 - n } else { n }
+    var index = 0
+    // Scaled in tenths so one decimal place is available without a float,
+    // and so two runs on two machines agree.
+    var tenths = value * 10
+    while tenths >= step * 10 and index < units.len() - 1 {
+        tenths = tenths / step
+        index = index + 1
+    }
+    var body = ""
+    if index == 0 {
+        body = "{tenths / 10} {units[0]}"
+    } else if tenths % 10 == 0 or tenths >= 100 {
+        body = "{tenths / 10} {units[index]}"
+    } else {
+        body = "{tenths / 10}.{tenths % 10} {units[index]}"
+    }
+    if negative {
+        return "-" + body
+    }
+    return body
+}
+
+/// A large count as "1.2k", "3.4M" — for a like count or a row total.
+pub fn compact_number(n: i64) -> str {
+    return scaled(n, 1000, ["", "k", "M", "B", "T"]).replace(" ", "")
+}
+
+/// "1st", "2nd", "3rd", "4th" — and the teens, which are the exception.
+pub fn ordinal(n: i64) -> str {
+    let last_two = n % 100
+    if last_two >= 11 and last_two <= 13 {
+        return "{n}th"
+    }
+    let last = n % 10
+    if last == 1 {
+        return "{n}st"
+    }
+    if last == 2 {
+        return "{n}nd"
+    }
+    if last == 3 {
+        return "{n}rd"
+    }
+    return "{n}th"
+}
+
+/// A number with thousands separators.
+pub fn grouped(n: i64, separator: str) -> str {
+    let negative = n < 0
+    let digits = "{if negative { 0 - n } else { n }}"
+    var out = ""
+    var count = 0
+    var i = digits.len() - 1
+    let cs = digits.chars()
+    while i >= 0 {
+        out = cs[i] + out
+        count = count + 1
+        if count % 3 == 0 and i > 0 {
+            out = separator + out
+        }
+        i = i - 1
+    }
+    if negative {
+        return "-" + out
+    }
+    return out
+}
+
+/// A list as a person writes one: "a, b and c".
+pub fn list(items: [str], conjunction: str) -> str {
+    if items.len() == 0 {
+        return ""
+    }
+    if items.len() == 1 {
+        return items[0]
+    }
+    if items.len() == 2 {
+        return items[0] + " " + conjunction + " " + items[1]
+    }
+    let head = items.slice(0, items.len() - 1).join(", ")
+    return head + " " + conjunction + " " + items[items.len() - 1]
+}
+
+/// A list cut to `limit`, with a count for the rest.
+pub fn list_limited(items: [str], limit: i64, conjunction: str) -> str {
+    if items.len() <= limit {
+        return list(items, conjunction)
+    }
+    let shown = items.slice(0, limit)
+    let hidden = items.len() - limit
+    return shown.join(", ") + " " + conjunction + " {hidden} more"
+}
+
+/// A calendar day as a person would name it, relative to today.
+pub fn day_name(d: Date, today: Date) -> str {
+    let delta = time.days_from_civil(d) - time.days_from_civil(today)
+    if delta == 0 {
+        return "today"
+    }
+    if delta == 1 {
+        return "tomorrow"
+    }
+    if delta == 0 - 1 {
+        return "yesterday"
+    }
+    if delta > 1 and delta < 7 {
+        return weekday_name(time.weekday(d))
+    }
+    if delta < 0 - 1 and delta > 0 - 7 {
+        return "last " + weekday_name(time.weekday(d))
+    }
+    return time.format_date(d)
+}
+
+/// A weekday's name, in `time`'s numbering: Monday is 1 and Sunday is 7.
+pub fn weekday_name(n: i64) -> str {
+    return ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday",
+        "Saturday", "Sunday"][n % 8]
+}
+
+pub fn month_name(n: i64) -> str {
+    return ["", "January", "February", "March", "April", "May", "June",
+        "July", "August", "September", "October", "November",
+        "December"][n]
+}
+
+/// "8 June 2026", which is a date a person reads rather than sorts.
+pub fn long_date(d: Date) -> str {
+    return "{d.day} {month_name(d.month)} {d.year}"
+}
+
+/// A percentage from a part and a whole, with no division by zero.
+pub fn percent(part: i64, whole: i64) -> str {
+    if whole == 0 {
+        return "0%"
+    }
+    return "{part * 100 / whole}%"
+}
+
+/// A truncation that cuts at a word rather than mid-word.
+pub fn truncate_words(text: str, width: i64, marker: str) -> str {
+    if text.len() <= width {
+        return text
+    }
+    let room = width - marker.len()
+    if room <= 0 {
+        return marker
+    }
+    var cut = text.substr(0, room)
+    // Only back up when the cut landed inside a word. Backing up
+    // unconditionally throws away the last whole word for no reason, which is
+    // how "the quick" became "the".
+    if text.substr(room, 1) != " " {
+        match last_space(cut) {
+            Some(at) -> cut = cut.substr(0, at)
+            None -> {}
+        }
+    }
+    return cut.trim_end() + marker
+}
+
+fn last_space(text: str) -> Option[i64] {
+    let cs = text.chars()
+    var i = cs.len() - 1
+    while i > 0 {
+        if cs[i] == " " {
+            return Some(i)
+        }
+        i = i - 1
+    }
+    return None
+}

@@ -1,0 +1,425 @@
+// ISO 8601, the parts beyond a timestamp.
+//
+// `packages/time` parses and formats the ordinary form. What it does not
+// cover is the rest of the standard, which real systems do emit:
+//
+//   - **Week dates**: `2026-W23-4`. The ISO week is not the calendar week —
+//     week 1 is the one containing the first Thursday of January, so the 1st
+//     of January can be in week 52 of the *previous* year, and the 31st of
+//     December in week 1 of the next. A payroll or a reporting system that
+//     computes it as "day of year over seven" is wrong for a week or two
+//     every year, in a way nobody notices until the totals disagree.
+//   - **Ordinal dates**: `2026-159`, which is what a satellite feed and a
+//     mainframe extract both use.
+//   - **Durations**: `P1Y2M3DT4H5M6S`, and the trap that `M` means months
+//     before the `T` and minutes after it.
+//   - **Intervals**: `start/end`, `start/duration`, `duration/end`.
+//   - **Offsets** other than `Z`, including `+05:30` and the `-00:00` that
+//     means "UTC, and the local offset is unknown".
+//
+// A duration in years or months is *not* a fixed number of seconds — a month
+// is 28 to 31 days — so those are kept separately rather than flattened, and
+// applying one needs a date to apply it to.
+import time
+
+type IsoDuration = {
+    years: i64,
+    months: i64,
+    days: i64,
+    hours: i64,
+    minutes: i64,
+    seconds: i64,
+    /// Weeks are exclusive of everything else in the grammar.
+    weeks: i64,
+}
+
+type IsoError =
+    | Malformed(text: str, why: str)
+    | OutOfRange(field: str, value: i64)
+    | MixedDuration(text: str)
+
+pub fn zero_duration() -> IsoDuration {
+    return IsoDuration{
+        years: 0, months: 0, days: 0, hours: 0, minutes: 0, seconds: 0,
+        weeks: 0,
+    }
+}
+
+fn digits_only(s: str) -> bool {
+    if s.len() == 0 {
+        return false
+    }
+    for c in s.chars() {
+        if c < "0" or c > "9" {
+            return false
+        }
+    }
+    return true
+}
+
+/// The ISO week-numbering year and week for a date.
+///
+/// Week 1 contains the first Thursday of January. Equivalently, it contains
+/// the 4th of January — which is the form that is easy to compute and hard to
+/// get wrong.
+pub fn week_of(year: i64, month: i64, day: i64) -> (i64, i64, i64) {
+    let date = Date{ year: year, month: month, day: day }
+    let days = time.days_from_civil(date)
+    // Monday is 1 in ISO, and `weekday` counts from Sunday.
+    var weekday = time.weekday(date)
+    if weekday == 0 {
+        weekday = 7
+    }
+    // The Thursday of this week decides which year the week belongs to.
+    let thursday = time.civil_from_days(days + (4 - weekday))
+    let january_first = time.days_from_civil(Date{
+        year: thursday.year, month: 1, day: 1,
+    })
+    let week = (time.days_from_civil(thursday) - january_first) / 7 + 1
+    return (thursday.year, week, weekday)
+}
+
+/// The date a week-numbering year, week and weekday name.
+pub fn from_week(year: i64, week: i64, weekday: i64) -> Date ! IsoError {
+    if week < 1 or week > 53 {
+        fail(OutOfRange("week", week))
+    }
+    if weekday < 1 or weekday > 7 {
+        fail(OutOfRange("weekday", weekday))
+    }
+    let january_fourth = Date{ year: year, month: 1, day: 4 }
+    var jan4_weekday = time.weekday(january_fourth)
+    if jan4_weekday == 0 {
+        jan4_weekday = 7
+    }
+    // The Monday of week 1 is the 4th of January minus its weekday offset.
+    let week1_monday = time.days_from_civil(january_fourth) - (jan4_weekday - 1)
+    return time.civil_from_days(week1_monday + (week - 1) * 7 + (weekday - 1))
+}
+
+/// How many ISO weeks a year has: 52, or 53 when it starts or ends on a
+/// Thursday.
+pub fn weeks_in_year(year: i64) -> i64 {
+    let last = week_of(year, 12, 28)
+    return last.1
+}
+
+pub fn format_week(year: i64, month: i64, day: i64) -> str {
+    let w = week_of(year, month, day)
+    var week = "{w.1}"
+    if week.len() < 2 {
+        week = "0" + week
+    }
+    return "{w.0}-W{week}-{w.2}"
+}
+
+/// The day of the year, counting from 1.
+pub fn ordinal_of(year: i64, month: i64, day: i64) -> i64 {
+    return time.day_of_year(Date{ year: year, month: month, day: day })
+}
+
+pub fn from_ordinal(year: i64, ordinal: i64) -> Date ! IsoError {
+    let limit = if time.is_leap(year) { 366 } else { 365 }
+    if ordinal < 1 or ordinal > limit {
+        fail(OutOfRange("ordinal", ordinal))
+    }
+    return time.civil_from_days(
+        time.days_from_civil(Date{ year: year, month: 1, day: 1 }) + ordinal - 1)
+}
+
+pub fn format_ordinal(year: i64, month: i64, day: i64) -> str {
+    var n = "{ordinal_of(year, month, day)}"
+    while n.len() < 3 {
+        n = "0" + n
+    }
+    return "{year}-{n}"
+}
+
+/// A date in any of the three forms.
+pub fn parse_date(text: str) -> Date ! IsoError {
+    let body = text.trim()
+    if body.contains("W") {
+        let parts = body.split("-")
+        if parts.len() < 2 {
+            fail(Malformed(text, "a week date needs a year and a week"))
+        }
+        let year = parts[0].parse_int() ?? 0 - 1
+        let week_text = parts[1].replace("W", "")
+        let week = week_text.parse_int() ?? 0 - 1
+        var weekday = 1
+        if parts.len() > 2 {
+            weekday = parts[2].parse_int() ?? 0 - 1
+        }
+        if year < 0 or week < 0 or weekday < 0 {
+            fail(Malformed(text, "not a week date"))
+        }
+        return try from_week(year, week, weekday)
+    }
+    let parts = body.split("-")
+    if parts.len() == 2 and digits_only(parts[1]) and parts[1].len() == 3 {
+        let year = parts[0].parse_int() ?? 0 - 1
+        let ordinal = parts[1].parse_int() ?? 0 - 1
+        if year < 0 or ordinal < 0 {
+            fail(Malformed(text, "not an ordinal date"))
+        }
+        return try from_ordinal(year, ordinal)
+    }
+    if parts.len() != 3 {
+        // The basic form has no hyphens: `20260608`.
+        if digits_only(body) and body.len() == 8 {
+            return Date{
+                year: body.substr(0, 4).parse_int() ?? 0,
+                month: body.substr(4, 2).parse_int() ?? 0,
+                day: body.substr(6, 2).parse_int() ?? 0,
+            }
+        }
+        fail(Malformed(text, "not a date"))
+    }
+    let year = parts[0].parse_int() ?? 0 - 1
+    let month = parts[1].parse_int() ?? 0 - 1
+    let day = parts[2].parse_int() ?? 0 - 1
+    if year < 0 or month < 1 or month > 12 or day < 1 {
+        fail(Malformed(text, "not a date"))
+    }
+    if day > time.days_in_month(year, month) {
+        fail(OutOfRange("day", day))
+    }
+    return Date{ year: year, month: month, day: day }
+}
+
+/// An offset like `+05:30`, `-0800` or `Z`, in minutes east of UTC.
+///
+/// `-00:00` is not the same as `+00:00`: it means UTC with the local offset
+/// unknown, which RFC 3339 says and every parser that returns 0 for both
+/// silently loses.
+pub fn parse_offset(text: str) -> i64 ! IsoError {
+    let body = text.trim()
+    if body == "Z" or body == "z" {
+        return 0
+    }
+    if body.len() < 3 {
+        fail(Malformed(text, "not an offset"))
+    }
+    let sign = if body.starts_with("-") { 0 - 1 } else { 1 }
+    if not body.starts_with("+") and not body.starts_with("-") {
+        fail(Malformed(text, "an offset needs a sign"))
+    }
+    let rest = body.substr(1, body.len() - 1).replace(":", "")
+    if not digits_only(rest) or (rest.len() != 2 and rest.len() != 4) {
+        fail(Malformed(text, "not an offset"))
+    }
+    let hours = rest.substr(0, 2).parse_int() ?? 0
+    var minutes = 0
+    if rest.len() == 4 {
+        minutes = rest.substr(2, 2).parse_int() ?? 0
+    }
+    if hours > 23 or minutes > 59 {
+        fail(OutOfRange("offset", hours * 60 + minutes))
+    }
+    return sign * (hours * 60 + minutes)
+}
+
+pub fn is_unknown_offset(text: str) -> bool {
+    let body = text.trim()
+    return body == "-00:00" or body == "-0000"
+}
+
+pub fn format_offset(minutes: i64) -> str {
+    if minutes == 0 {
+        return "Z"
+    }
+    let sign = if minutes < 0 { "-" } else { "+" }
+    let magnitude = if minutes < 0 { 0 - minutes } else { minutes }
+    var h = "{magnitude / 60}"
+    var m = "{magnitude % 60}"
+    if h.len() < 2 {
+        h = "0" + h
+    }
+    if m.len() < 2 {
+        m = "0" + m
+    }
+    return sign + h + ":" + m
+}
+
+/// `P1Y2M3DT4H5M6S`, and the `M` that means two different things.
+pub fn parse_duration(text: str) -> IsoDuration ! IsoError {
+    let body = text.trim().to_upper()
+    if not body.starts_with("P") {
+        fail(Malformed(text, "a duration starts with P"))
+    }
+    var out = zero_duration()
+    var number = ""
+    var in_time = false
+    var saw_any = false
+    var i = 1
+    let cs = body.chars()
+    while i < cs.len() {
+        let c = cs[i]
+        if c == "T" {
+            in_time = true
+            i = i + 1
+            continue
+        }
+        if c >= "0" and c <= "9" {
+            number = number + c
+            i = i + 1
+            continue
+        }
+        if number == "" {
+            fail(Malformed(text, "`{c}` with no number before it"))
+        }
+        let value = number.parse_int() ?? 0
+        number = ""
+        saw_any = true
+        if c == "Y" {
+            out.years = value
+        } else if c == "W" {
+            out.weeks = value
+        } else if c == "D" {
+            out.days = value
+        } else if c == "H" {
+            out.hours = value
+        } else if c == "S" {
+            out.seconds = value
+        } else if c == "M" {
+            // Before the `T` it is months; after it, minutes. Getting this
+            // backwards turns five minutes into five months.
+            if in_time {
+                out.minutes = value
+            } else {
+                out.months = value
+            }
+        } else {
+            fail(Malformed(text, "`{c}` is not a duration field"))
+        }
+        i = i + 1
+    }
+    if number != "" {
+        fail(Malformed(text, "a number with no unit after it"))
+    }
+    if not saw_any {
+        fail(Malformed(text, "a duration with no fields"))
+    }
+    if out.weeks != 0 and (out.years != 0 or out.months != 0 or out.days != 0 or
+        out.hours != 0 or out.minutes != 0 or out.seconds != 0) {
+        fail(MixedDuration(text))
+    }
+    return out
+}
+
+pub fn format_duration(d: IsoDuration) -> str {
+    if d.weeks != 0 {
+        return "P{d.weeks}W"
+    }
+    var out = "P"
+    if d.years != 0 {
+        out = out + "{d.years}Y"
+    }
+    if d.months != 0 {
+        out = out + "{d.months}M"
+    }
+    if d.days != 0 {
+        out = out + "{d.days}D"
+    }
+    if d.hours != 0 or d.minutes != 0 or d.seconds != 0 {
+        out = out + "T"
+        if d.hours != 0 {
+            out = out + "{d.hours}H"
+        }
+        if d.minutes != 0 {
+            out = out + "{d.minutes}M"
+        }
+        if d.seconds != 0 {
+            out = out + "{d.seconds}S"
+        }
+    }
+    if out == "P" {
+        return "PT0S"
+    }
+    return out
+}
+
+/// The part of a duration that *is* a fixed number of seconds.
+///
+/// Years and months are not, because a month is 28 to 31 days. A function
+/// that returns "seconds in this duration" while quietly calling a month
+/// thirty days is the reason a monthly subscription renews on the wrong day.
+pub fn fixed_seconds(d: IsoDuration) -> i64 {
+    return d.weeks * 604800 + d.days * 86400 + d.hours * 3600 +
+    d.minutes * 60 + d.seconds
+}
+
+pub fn has_calendar_part(d: IsoDuration) -> bool {
+    return d.years != 0 or d.months != 0
+}
+
+/// Add a duration to a date, which is where the calendar part is resolved.
+///
+/// Months are added first and clamped to the end of the month — the 31st of
+/// January plus one month is the 28th or 29th of February, which is what
+/// every calendar does and what adding thirty days does not.
+pub fn add_to_date(d: Date, duration: IsoDuration) -> Date {
+    var year = d.year + duration.years
+    var month = d.month + duration.months
+    while month > 12 {
+        month = month - 12
+        year = year + 1
+    }
+    while month < 1 {
+        month = month + 12
+        year = year - 1
+    }
+    var day = d.day
+    let limit = time.days_in_month(year, month)
+    if day > limit {
+        day = limit
+    }
+    let days = time.days_from_civil(Date{ year: year, month: month, day: day })
+    return time.civil_from_days(days + duration.days + duration.weeks * 7)
+}
+
+/// An interval: `start/end`, `start/duration` or `duration/end`.
+///
+/// Returned as two dates, because that is what a caller wants and because
+/// resolving a duration against a date is the only way to get one.
+pub fn parse_interval(text: str) -> (Date, Date) ! IsoError {
+    let parts = text.trim().split("/")
+    if parts.len() != 2 {
+        fail(Malformed(text, "an interval has two parts"))
+    }
+    let left_is_duration = parts[0].trim().to_upper().starts_with("P")
+    let right_is_duration = parts[1].trim().to_upper().starts_with("P")
+    if left_is_duration and right_is_duration {
+        fail(Malformed(text, "an interval cannot be two durations"))
+    }
+    if left_is_duration {
+        let end = try parse_date(parts[1])
+        let d = try parse_duration(parts[0])
+        return (subtract_from_date(end, d), end)
+    }
+    let start = try parse_date(parts[0])
+    if right_is_duration {
+        let d = try parse_duration(parts[1])
+        return (start, add_to_date(start, d))
+    }
+    return (start, try parse_date(parts[1]))
+}
+
+pub fn subtract_from_date(d: Date, duration: IsoDuration) -> Date {
+    let negated = IsoDuration{
+        years: 0 - duration.years, months: 0 - duration.months,
+        days: 0 - duration.days, hours: 0 - duration.hours,
+        minutes: 0 - duration.minutes, seconds: 0 - duration.seconds,
+        weeks: 0 - duration.weeks,
+    }
+    return add_to_date(d, negated)
+}
+
+pub fn format_date(d: Date) -> str {
+    return time.format_date(d)
+}
+
+/// Whether a year, in the ISO week-numbering sense, is a long one.
+pub fn is_long_year(year: i64) -> bool {
+    return weeks_in_year(year) == 53
+}

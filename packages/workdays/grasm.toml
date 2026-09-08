@@ -1,0 +1,10 @@
+[package]
+name = "workdays"
+version = "1.0.0"
+
+# Calendar arithmetic. Opens nothing.
+capabilities = []
+
+[dependencies.time]
+path = "../time"
+version = "^1.0.0"

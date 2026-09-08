@@ -1,0 +1,234 @@
+// A month as a grid, and the two things that make it not a loop over days.
+//
+//   - **The week does not start on Sunday everywhere.** It starts on Monday
+//     across most of Europe and in the ISO standard, on Sunday in the United
+//     States and Japan, and on Saturday in much of the Middle East. A grid
+//     built with a hard-coded start is misaligned for most of the world.
+//   - **A month spans four to six week rows.** Four only when February has 28
+//     days and begins on the first day of the week; six whenever a 31-day
+//     month starts late enough. A grid that assumes five is wrong twice a
+//     year, and the sixth row is where the layout breaks.
+//
+// The grid is returned as dates rather than as text, so a caller can render
+// it as a terminal table, an HTML table or a set of buttons without this
+// package knowing which.
+import time
+import iso8601
+
+type MonthGrid = {
+    year: i64,
+    month: i64,
+    /// Rows of seven dates each, including the days from the months either
+    /// side that fill the first and last rows.
+    row: [[Date]],
+    /// The first weekday of the week, in `time`'s numbering: Monday is 1 and
+    /// Sunday is 7.
+    week_start: i64,
+}
+
+pub fn monday_start() -> i64 {
+    return 1
+}
+
+pub fn sunday_start() -> i64 {
+    return 7
+}
+
+/// The grid for a month, padded with the days either side.
+///
+/// Padded rather than left blank, because a calendar that shows gaps at the
+/// edges cannot show that the 1st is a Thursday without the reader counting.
+pub fn grid(year: i64, month: i64, week_start: i64) -> MonthGrid {
+    let first = Date{ year: year, month: month, day: 1 }
+    let first_days = time.days_from_civil(first)
+    // Back up to the start of the week containing the 1st.
+    let lead = (time.weekday(first) - week_start + 7) % 7
+    var at = first_days - lead
+    let length = time.days_in_month(year, month)
+    let total = lead + length
+    // Round up to whole weeks: four to six rows, never a fixed five.
+    var rows = total / 7
+    if total % 7 != 0 {
+        rows = rows + 1
+    }
+    var out: [[Date]] = []
+    for _r in 0..rows {
+        var week: [Date] = []
+        for _d in 0..7 {
+            week.push(time.civil_from_days(at))
+            at = at + 1
+        }
+        out.push(week)
+    }
+    return MonthGrid{ year: year, month: month, row: out, week_start: week_start }
+}
+
+pub fn row_count(g: MonthGrid) -> i64 {
+    return g.row.len()
+}
+
+pub fn is_in_month(g: MonthGrid, d: Date) -> bool {
+    return d.year == g.year and d.month == g.month
+}
+
+/// The weekday headings in the grid's own order.
+pub fn weekday_headings(week_start: i64, width: i64) -> [str] {
+    // Monday first, because the numbering is Monday-is-1.
+    let names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday",
+        "Saturday", "Sunday"]
+    var out: [str] = []
+    for i in 0..7 {
+        let name = names[(week_start - 1 + i) % 7]
+        out.push(name.substr(0, if width > name.len() { name.len() } else { width }))
+    }
+    return out
+}
+
+pub fn month_name(month: i64) -> str {
+    return ["", "January", "February", "March", "April", "May", "June",
+        "July", "August", "September", "October", "November",
+        "December"][month]
+}
+
+/// The month rendered as lines, the way `cal` does.
+pub fn render(g: MonthGrid) -> [str] {
+    var out: [str] = []
+    let title = month_name(g.month) + " {g.year}"
+    let width = 20
+    var padding = (width - title.len()) / 2
+    if padding < 0 {
+        padding = 0
+    }
+    out.push(" ".repeat(padding) + title)
+    out.push(weekday_headings(g.week_start, 2).join(" "))
+    for week in g.row {
+        var line = ""
+        for d in week {
+            var cell = if is_in_month(g, d) { "{d.day}" } else { "" }
+            while cell.len() < 2 {
+                cell = " " + cell
+            }
+            line = line + cell + " "
+        }
+        out.push(line.trim_end())
+    }
+    return out
+}
+
+/// The ISO week number for each row, which a business calendar shows down the
+/// side.
+pub fn week_numbers(g: MonthGrid) -> [i64] {
+    var out: [i64] = []
+    for week in g.row {
+        // The Thursday of the row decides the week, which is the same rule
+        // that decides the week-numbering year.
+        var thursday = week[0]
+        for d in week {
+            if time.weekday(d) == 4 {
+                thursday = d
+            }
+        }
+        out.push(iso8601.week_of(thursday.year, thursday.month, thursday.day).1)
+    }
+    return out
+}
+
+/// Every date in the month, in order.
+pub fn days_of_month(year: i64, month: i64) -> [Date] {
+    var out: [Date] = []
+    for day in 1..(time.days_in_month(year, month) + 1) {
+        out.push(Date{ year: year, month: month, day: day })
+    }
+    return out
+}
+
+/// Every date in a span, inclusive of both ends.
+pub fn days_between(from: Date, to: Date) -> [Date] {
+    var out: [Date] = []
+    var at = time.days_from_civil(from)
+    let stop = time.days_from_civil(to)
+    if stop < at {
+        return out
+    }
+    while at <= stop {
+        out.push(time.civil_from_days(at))
+        at = at + 1
+    }
+    return out
+}
+
+/// The quarter a month is in, 1 to 4.
+pub fn quarter_of(month: i64) -> i64 {
+    return (month - 1) / 3 + 1
+}
+
+pub fn quarter_start(year: i64, quarter: i64) -> Date {
+    return Date{ year: year, month: (quarter - 1) * 3 + 1, day: 1 }
+}
+
+pub fn quarter_end(year: i64, quarter: i64) -> Date {
+    let month = quarter * 3
+    return Date{ year: year, month: month, day: time.days_in_month(year, month) }
+}
+
+/// The first and last day of the month a date is in.
+pub fn month_bounds(d: Date) -> (Date, Date) {
+    return (Date{ year: d.year, month: d.month, day: 1 },
+        Date{ year: d.year, month: d.month, day: time.days_in_month(d.year, d.month) })
+}
+
+/// The first and last day of the week a date is in.
+pub fn week_bounds(d: Date, week_start: i64) -> (Date, Date) {
+    let days = time.days_from_civil(d)
+    let lead = (time.weekday(d) - week_start + 7) % 7
+    return (time.civil_from_days(days - lead),
+        time.civil_from_days(days - lead + 6))
+}
+
+/// Whether two dates are in the same week, which depends on where the week
+/// starts.
+pub fn same_week(a: Date, b: Date, week_start: i64) -> bool {
+    let left = week_bounds(a, week_start)
+    let right = week_bounds(b, week_start)
+    return time.days_from_civil(left.0) == time.days_from_civil(right.0)
+}
+
+/// A year's worth of grids, for a wall calendar.
+pub fn year_grids(year: i64, week_start: i64) -> [MonthGrid] {
+    var out: [MonthGrid] = []
+    for month in 1..13 {
+        out.push(grid(year, month, week_start))
+    }
+    return out
+}
+
+/// How many rows the tallest month of a year needs.
+///
+/// The number a layout has to reserve: a grid sized for five rows clips
+/// whichever month needs six.
+pub fn tallest_month(year: i64, week_start: i64) -> i64 {
+    var tallest = 0
+    for g in year_grids(year, week_start) {
+        if row_count(g) > tallest {
+            tallest = row_count(g)
+        }
+    }
+    return tallest
+}
+
+/// Months of a year that need six rows.
+pub fn six_row_months(year: i64, week_start: i64) -> [i64] {
+    var out: [i64] = []
+    for month in 1..13 {
+        if row_count(grid(year, month, week_start)) == 6 {
+            out.push(month)
+        }
+    }
+    return out
+}
+
+/// The only month that can fit in four rows: a 28-day February beginning on
+/// the first day of the week.
+pub fn is_four_row_month(year: i64, month: i64, week_start: i64) -> bool {
+    return row_count(grid(year, month, week_start)) == 4
+}

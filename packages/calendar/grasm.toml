@@ -1,0 +1,14 @@
+[package]
+name = "calendar"
+version = "1.0.0"
+
+# Layout over dates. Opens nothing.
+capabilities = []
+
+[dependencies.time]
+path = "../time"
+version = "^1.0.0"
+
+[dependencies.iso8601]
+path = "../iso8601"
+version = "^1.0.0"

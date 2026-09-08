@@ -1,0 +1,385 @@
+import iso8601
+import calendar
+import recurrence
+import workdays
+import humanize
+import time
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn date(year: i64, month: i64, day: i64) -> Date {
+    return Date{ year: year, month: month, day: day }
+}
+
+fn dates_of(list: [Date]) -> [str] {
+    var out: [str] = []
+    for d in list {
+        out.push(time.format_date(d))
+    }
+    return out
+}
+
+fn iso_refuses(text: str) -> bool {
+    match iso8601.parse_date(text) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn duration_refuses(text: str) -> bool {
+    match iso8601.parse_duration(text) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn rule(text: str) -> Recurrence {
+    return recurrence.parse(text) ?? recurrence.daily(1)
+}
+
+fn rule_refuses(text: str) -> bool {
+    match recurrence.parse(text) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn check_iso8601(inout f: i64) / {io} {
+    print("-- iso8601: the week that belongs to another year")
+    // Every value here is what Python's `date.isocalendar` gives.
+    say(f, "1 January 2026 is in week 1", iso8601.format_week(2026, 1, 1) ==
+        "2026-W01-4")
+    // The cases that catch an implementation counting days over seven.
+    say(f, "1 January 2021 is in week 53 of 2020",
+        iso8601.format_week(2021, 1, 1) == "2020-W53-5")
+    say(f, "3 January 2016 is in week 53 of 2015",
+        iso8601.format_week(2016, 1, 3) == "2015-W53-7")
+    say(f, "31 December 2026 is in week 53 of 2026",
+        iso8601.format_week(2026, 12, 31) == "2026-W53-4")
+    say(f, "2015, 2020 and 2026 are 53-week years",
+        iso8601.weeks_in_year(2015) == 53 and iso8601.weeks_in_year(2020) == 53 and
+        iso8601.weeks_in_year(2026) == 53)
+    say(f, "and 2016 and 2021 are not",
+        iso8601.weeks_in_year(2016) == 52 and iso8601.weeks_in_year(2021) == 52)
+    say(f, "is_long_year says the same", iso8601.is_long_year(2026) and
+        not iso8601.is_long_year(2021))
+    // The three date forms.
+    say(f, "a week date parses back to a calendar date",
+        time.format_date(iso8601.parse_date("2026-W23-1") ?? date(0, 0, 0)) ==
+        "2026-06-01")
+    say(f, "an ordinal date too",
+        time.format_date(iso8601.parse_date("2026-159") ?? date(0, 0, 0)) ==
+        "2026-06-08")
+    say(f, "and the basic form with no hyphens",
+        time.format_date(iso8601.parse_date("20260608") ?? date(0, 0, 0)) ==
+        "2026-06-08")
+    say(f, "which agree with each other",
+        iso8601.format_ordinal(2026, 6, 8) == "2026-159")
+    say(f, "a day past the end of the month is refused",
+        iso_refuses("2026-02-30"))
+    say(f, "and a week past the end of the year", iso_refuses("2026-W54-1"))
+    // Durations, and the M that means two things.
+    let full = iso8601.parse_duration("P1Y2M3DT4H5M6S") ?? iso8601.zero_duration()
+    say(f, "a full duration reads every field", full.years == 1 and
+        full.months == 2 and full.days == 3 and full.hours == 4 and
+        full.minutes == 5 and full.seconds == 6)
+    say(f, "M before the T is months",
+        (iso8601.parse_duration("P5M") ?? iso8601.zero_duration()).months == 5)
+    say(f, "and after it is minutes",
+        (iso8601.parse_duration("PT5M") ?? iso8601.zero_duration()).minutes == 5)
+    say(f, "a duration round-trips",
+        iso8601.format_duration(full) == "P1Y2M3DT4H5M6S")
+    say(f, "an empty one is written PT0S",
+        iso8601.format_duration(iso8601.zero_duration()) == "PT0S")
+    say(f, "weeks may not be mixed with anything else",
+        duration_refuses("P1W2D"))
+    say(f, "and a number with no unit is refused", duration_refuses("P1Y2"))
+    // Years and months are not a fixed number of seconds, and saying so is
+    // the point.
+    say(f, "a month is not a number of seconds",
+        iso8601.fixed_seconds(iso8601.parse_duration("P1M") ??
+            iso8601.zero_duration()) == 0)
+    say(f, "which the caller can ask about",
+        iso8601.has_calendar_part(full) and
+        not iso8601.has_calendar_part(iso8601.parse_duration("PT1H") ??
+            iso8601.zero_duration()))
+    say(f, "a week is 604,800 seconds",
+        iso8601.fixed_seconds(iso8601.parse_duration("P1W") ??
+            iso8601.zero_duration()) == 604800)
+    // Adding a month clamps to the end of the month, which is what a calendar
+    // does and adding thirty days does not.
+    say(f, "31 January plus one month is 28 February",
+        time.format_date(iso8601.add_to_date(date(2026, 1, 31),
+            iso8601.parse_duration("P1M") ?? iso8601.zero_duration())) ==
+        "2026-02-28")
+    say(f, "and in a leap year, the 29th",
+        time.format_date(iso8601.add_to_date(date(2028, 1, 31),
+            iso8601.parse_duration("P1M") ?? iso8601.zero_duration())) ==
+        "2028-02-29")
+    // Offsets, including the one that means "unknown".
+    say(f, "+05:30 is 330 minutes", (iso8601.parse_offset("+05:30") ?? 0) == 330)
+    say(f, "-0800 is -480", (iso8601.parse_offset("-0800") ?? 0) == 0 - 480)
+    say(f, "Z is zero", (iso8601.parse_offset("Z") ?? 9) == 0)
+    say(f, "and -00:00 is zero with the local offset unknown",
+        (iso8601.parse_offset("-00:00") ?? 9) == 0 and
+        iso8601.is_unknown_offset("-00:00") and
+        not iso8601.is_unknown_offset("+00:00"))
+    say(f, "an offset formats back", iso8601.format_offset(330) == "+05:30")
+    // Intervals in all three forms.
+    let span = iso8601.parse_interval("2026-01-01/P1M") ?? (date(0, 0, 0),
+        date(0, 0, 0))
+    say(f, "a start and a duration give an end",
+        time.format_date(span.1) == "2026-02-01")
+    let back = iso8601.parse_interval("P1M/2026-03-01") ?? (date(0, 0, 0),
+        date(0, 0, 0))
+    say(f, "and a duration and an end give a start",
+        time.format_date(back.0) == "2026-02-01")
+}
+
+fn check_calendar(inout f: i64) / {io} {
+    print("-- calendar: four to six rows, never five")
+    let february = calendar.grid(2026, 2, calendar.monday_start())
+    say(f, "February 2026 needs five rows", calendar.row_count(february) == 5)
+    // The months that need six differ by where the week starts, which is the
+    // whole reason the start is a parameter.
+    say(f, "three months of 2026 need six rows on a Monday start",
+        calendar.six_row_months(2026, calendar.monday_start()) == [3, 8, 11])
+    say(f, "and two do on a Sunday start",
+        calendar.six_row_months(2026, calendar.sunday_start()) == [5, 8])
+    say(f, "so a layout must reserve six",
+        calendar.tallest_month(2026, calendar.monday_start()) == 6)
+    say(f, "the grid is padded with the days either side",
+        february.row[0][0].month == 1)
+    say(f, "and those are marked as outside the month",
+        not calendar.is_in_month(february, february.row[0][0]) and
+        calendar.is_in_month(february, february.row[1][0]))
+    say(f, "every row is a whole week", february.row[0].len() == 7)
+    say(f, "the headings follow the week start",
+        calendar.weekday_headings(calendar.monday_start(), 2)[0] == "Mo" and
+        calendar.weekday_headings(calendar.sunday_start(), 2)[0] == "Su")
+    say(f, "the ISO week number is shown per row",
+        calendar.week_numbers(calendar.grid(2026, 1, 1)) == [1, 2, 3, 4, 5])
+    say(f, "rendering gives a title, headings and the rows",
+        calendar.render(february).len() == 7)
+    say(f, "a month has as many days as it has",
+        calendar.days_of_month(2026, 2).len() == 28 and
+        calendar.days_of_month(2028, 2).len() == 29)
+    say(f, "a span includes both ends",
+        calendar.days_between(date(2026, 1, 1), date(2026, 1, 3)).len() == 3)
+    say(f, "quarters divide the year",
+        calendar.quarter_of(1) == 1 and calendar.quarter_of(12) == 4)
+    say(f, "and have a first and last day",
+        time.format_date(calendar.quarter_start(2026, 2)) == "2026-04-01" and
+        time.format_date(calendar.quarter_end(2026, 2)) == "2026-06-30")
+    let bounds = calendar.month_bounds(date(2026, 2, 14))
+    say(f, "a month's bounds are its ends",
+        time.format_date(bounds.0) == "2026-02-01" and
+        time.format_date(bounds.1) == "2026-02-28")
+    // Whether two dates are in the same week depends on where a week starts.
+    say(f, "a Sunday and the Monday after are one week apart on a Monday start",
+        not calendar.same_week(date(2026, 1, 4), date(2026, 1, 5), 1))
+    say(f, "and the same week on a Sunday start",
+        calendar.same_week(date(2026, 1, 4), date(2026, 1, 5), 0))
+}
+
+fn check_recurrence(inout f: i64) / {io} {
+    print("-- recurrence: every second Tuesday, as a calendar means it")
+    let start = date(2026, 1, 5)
+    // Every date below is what dateutil's rrule gives for the same rule.
+    let fortnightly = rule("FREQ=WEEKLY;INTERVAL=2;BYDAY=MO,WE")
+    say(f, "an interval counts periods, not occurrences",
+        dates_of(recurrence.occurrences(fortnightly, start, 8)) ==
+        ["2026-01-05", "2026-01-07", "2026-01-19", "2026-01-21",
+            "2026-02-02", "2026-02-04", "2026-02-16", "2026-02-18"])
+    say(f, "so two dates fall in each included week, not alternating single days",
+        recurrence.occurrences(fortnightly, start, 4)[1].day == 7)
+    let second_tuesday = rule("FREQ=MONTHLY;BYDAY=2TU;COUNT=4")
+    say(f, "an ordinal weekday is counted within the month",
+        dates_of(recurrence.occurrences(second_tuesday, start, 10)) ==
+        ["2026-01-13", "2026-02-10", "2026-03-10", "2026-04-14"])
+    say(f, "and COUNT includes the first occurrence",
+        recurrence.occurrences(second_tuesday, start, 10).len() == 4)
+    let last_friday = rule("FREQ=MONTHLY;BYDAY=-1FR;COUNT=3")
+    say(f, "a negative ordinal counts back from the end",
+        dates_of(recurrence.occurrences(last_friday, start, 10)) ==
+        ["2026-01-30", "2026-02-27", "2026-03-27"])
+    // The case a clamping implementation gets wrong.
+    let thirty_first = rule("FREQ=MONTHLY;BYMONTHDAY=31;COUNT=5")
+    say(f, "the 31st skips the months that have none",
+        dates_of(recurrence.occurrences(thirty_first, date(2026, 1, 31), 10)) ==
+        ["2026-01-31", "2026-03-31", "2026-05-31", "2026-07-31", "2026-08-31"])
+    say(f, "rather than clamping to the 28th",
+        not recurrence.includes(thirty_first, date(2026, 1, 31),
+            date(2026, 2, 28)))
+    say(f, "a last-day-of-month rule is written -1",
+        dates_of(recurrence.occurrences(rule("FREQ=MONTHLY;BYMONTHDAY=-1;COUNT=3"),
+            date(2026, 1, 31), 5)) ==
+        ["2026-01-31", "2026-02-28", "2026-03-31"])
+    say(f, "UNTIL stops the series",
+        recurrence.occurrences(rule("FREQ=DAILY;UNTIL=20260110"), start, 30).len() == 6)
+    say(f, "COUNT and UNTIL together are refused",
+        rule_refuses("FREQ=DAILY;COUNT=3;UNTIL=20260110"))
+    say(f, "an unknown frequency is refused", rule_refuses("FREQ=FORTNIGHTLY"))
+    say(f, "a rule round-trips through its text",
+        recurrence.render(fortnightly) == "FREQ=WEEKLY;INTERVAL=2;BYDAY=MO,WE")
+    say(f, "the next occurrence after a date is found",
+        time.format_date(recurrence.next_after(fortnightly, start,
+            date(2026, 1, 7)) ?? date(0, 0, 0)) == "2026-01-19")
+    say(f, "a description names the interval and the days",
+        recurrence.describe(fortnightly).contains("every 2 weeks"))
+    say(f, "a yearly rule on 29 February occurs once in four years",
+        dates_of(recurrence.occurrences(rule("FREQ=YEARLY;BYMONTH=2;BYMONTHDAY=29;COUNT=2"),
+            date(2028, 2, 29), 3)) == ["2028-02-29", "2032-02-29"])
+}
+
+fn check_workdays(inout f: i64) / {io} {
+    print("-- workdays: five working days is not five days")
+    let new_year = date(2026, 1, 1)
+    let cal = workdays.new_calendar(workdays.standard_weekend(), [new_year])
+    let monday = date(2026, 1, 5)
+    say(f, "a Monday is a working day", workdays.is_working_day(cal, monday))
+    say(f, "a Saturday is not", not workdays.is_working_day(cal, date(2026, 1, 3)))
+    say(f, "and neither is a holiday", not workdays.is_working_day(cal, new_year))
+    // Counting is exclusive of the start.
+    say(f, "three working days from Monday is Thursday",
+        time.format_date(workdays.add_working_days(cal, monday, 3)) ==
+        "2026-01-08")
+    say(f, "five is the next Monday",
+        time.format_date(workdays.add_working_days(cal, monday, 5)) ==
+        "2026-01-12")
+    say(f, "and the weekend is skipped rather than counted",
+        workdays.between(cal, monday, date(2026, 1, 12)) == 5)
+    say(f, "counting backwards works the same way",
+        time.format_date(workdays.add_working_days(cal, date(2026, 1, 12),
+            0 - 5)) == "2026-01-05")
+    say(f, "a working day rolls to itself", time.format_date(
+        workdays.roll_forward(cal, monday)) == "2026-01-05")
+    say(f, "and a weekend rolls to the next one",
+        time.format_date(workdays.roll_forward(cal, date(2026, 1, 3))) ==
+        "2026-01-05")
+    // The weekend is not always Saturday and Sunday.
+    let gulf = workdays.new_calendar(workdays.friday_saturday(), [])
+    say(f, "a Friday is a working day where the weekend is not",
+        workdays.is_working_day(cal, date(2026, 1, 2)) and
+        not workdays.is_working_day(gulf, date(2026, 1, 2)))
+    say(f, "and a Sunday is one where it is",
+        workdays.is_working_day(gulf, date(2026, 1, 4)))
+    // The holidays that move.
+    say(f, "Easter 2026 is 5 April",
+        time.format_date(workdays.easter(2026)) == "2026-04-05")
+    say(f, "and Easter 2027 is 28 March",
+        time.format_date(workdays.easter(2027)) == "2027-03-28")
+    say(f, "Good Friday is two days before",
+        time.format_date(workdays.good_friday(2026)) == "2026-04-03")
+    say(f, "and Easter Monday the day after",
+        time.format_date(workdays.easter_monday(2026)) == "2026-04-06")
+    say(f, "the third Monday of January 2026 is the 19th",
+        time.format_date(workdays.nth_weekday(2026, 1, 1, 3)) == "2026-01-19")
+    say(f, "and the last Monday of May is the 25th",
+        time.format_date(workdays.last_weekday(2026, 5, 1)) == "2026-05-25")
+    // A holiday on a weekend is observed on a weekday.
+    say(f, "a Saturday holiday is observed on the Friday",
+        time.format_date(workdays.observed(cal, date(2026, 1, 3))) ==
+        "2026-01-02")
+    say(f, "and a Sunday one on the Monday",
+        time.format_date(workdays.observed(cal, date(2026, 1, 4))) ==
+        "2026-01-05")
+    say(f, "a working month has the days it has",
+        workdays.working_days_in_month(cal, 2026, 1).len() == 21)
+    say(f, "a deadline in working days can be checked",
+        not workdays.is_overdue(cal, monday, 5, date(2026, 1, 12)) and
+        workdays.is_overdue(cal, monday, 5, date(2026, 1, 13)))
+    say(f, "and the days remaining counted",
+        workdays.days_remaining(cal, monday, 5, date(2026, 1, 8)) == 2)
+}
+
+fn check_humanize(inout f: i64) / {io} {
+    print("-- humanize: the reference time is the caller's")
+    let now = 1000000000
+    say(f, "a few seconds is `just now`",
+        humanize.relative(now - 5, now) == "just now")
+    say(f, "a minute is singular", humanize.relative(now - 90, now) ==
+        "1 minute ago")
+    say(f, "two minutes is not", humanize.relative(now - 150, now) ==
+        "2 minutes ago")
+    say(f, "an hour rounds down", humanize.relative(now - 4000, now) ==
+        "1 hour ago")
+    say(f, "the future reads forwards", humanize.relative(now + 7200, now) ==
+        "in 2 hours")
+    say(f, "days, weeks, months and years all appear",
+        humanize.relative(now - 200000, now) == "2 days ago" and
+        humanize.relative(now - 1000000, now) == "1 week ago" and
+        humanize.relative(now - 4000000, now) == "1 month ago" and
+        humanize.relative(now - 40000000, now) == "1 year ago")
+    say(f, "a duration keeps the detail relative time drops",
+        humanize.duration(93784, 2) == "1 day 2 hours")
+    say(f, "and can be cut to one part",
+        humanize.duration(93784, 1) == "1 day")
+    say(f, "zero is zero seconds", humanize.duration(0, 2) == "0 seconds")
+    // The two kinds of kilobyte, as two functions rather than a flag.
+    say(f, "1536 bytes is 1.5 KiB in powers of 1024",
+        humanize.binary_bytes(1536) == "1.5 KiB")
+    say(f, "and 1.5 kB in powers of 1000",
+        humanize.decimal_bytes(1536) == "1.5 kB")
+    say(f, "which is why a 1 TB disk shows as 931 GiB",
+        humanize.binary_bytes(1000000000000) == "931 GiB")
+    say(f, "and 1 TB in the units it was sold in",
+        humanize.decimal_bytes(1000000000000) == "1 TB")
+    say(f, "small values keep their unit", humanize.binary_bytes(512) == "512 B")
+    say(f, "a compact number drops the space",
+        humanize.compact_number(1234) == "1.2k" and
+        humanize.compact_number(12345678) == "12M")
+    // The teens, which are the exception every ordinal function forgets.
+    say(f, "ordinals are 1st, 2nd, 3rd, 4th",
+        humanize.ordinal(1) == "1st" and humanize.ordinal(2) == "2nd" and
+        humanize.ordinal(3) == "3rd" and humanize.ordinal(4) == "4th")
+    say(f, "and 11th, 12th, 13th, not 11st",
+        humanize.ordinal(11) == "11th" and humanize.ordinal(12) == "12th" and
+        humanize.ordinal(13) == "13th")
+    say(f, "but 21st and 113th", humanize.ordinal(21) == "21st" and
+        humanize.ordinal(113) == "113th")
+    say(f, "numbers group in threes",
+        humanize.grouped(1234567, ",") == "1,234,567")
+    say(f, "and a negative keeps its sign outside",
+        humanize.grouped(0 - 1234, ",") == "-1,234")
+    say(f, "a list reads as one", humanize.list(["a", "b", "c"], "and") ==
+        "a, b and c")
+    say(f, "a long list is cut with a count",
+        humanize.list_limited(["a", "b", "c", "d"], 2, "and") ==
+        "a, b and 2 more")
+    say(f, "a day near today has a name",
+        humanize.day_name(date(2026, 6, 8), date(2026, 6, 8)) == "today" and
+        humanize.day_name(date(2026, 6, 9), date(2026, 6, 8)) == "tomorrow" and
+        humanize.day_name(date(2026, 6, 7), date(2026, 6, 8)) == "yesterday")
+    say(f, "and one further away has a date",
+        humanize.day_name(date(2027, 6, 8), date(2026, 6, 8)) == "2027-06-08")
+    say(f, "a long date reads as a person writes it",
+        humanize.long_date(date(2026, 6, 8)) == "8 June 2026")
+    say(f, "a percentage does not divide by zero",
+        humanize.percent(1, 0) == "0%" and humanize.percent(1, 4) == "25%")
+    say(f, "truncation cuts at a word",
+        humanize.truncate_words("the quick brown fox", 12, "...") == "the quick...")
+}
+
+fn main() / {io} {
+    var f = 0
+
+    check_iso8601(f)
+    check_calendar(f)
+    check_recurrence(f)
+    check_workdays(f)
+    check_humanize(f)
+
+    if f == 0 {
+        print("time and calendars: every claim held")
+    } else {
+        print("time and calendars: {f} failed")
+    }
+}

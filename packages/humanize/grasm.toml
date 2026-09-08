@@ -1,0 +1,10 @@
+[package]
+name = "humanize"
+version = "1.0.0"
+
+# Text from numbers. Opens nothing — the current time is a parameter.
+capabilities = []
+
+[dependencies.time]
+path = "../time"
+version = "^1.0.0"
