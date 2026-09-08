@@ -1,0 +1,339 @@
+// Certificate revocation lists, RFC 5280 section 5.
+//
+// The older of the two ways to ask whether a certificate is still good, and
+// the one that still works when the responder is down: a CRL is a signed
+// list of every serial the issuer has revoked, fetched once and cached until
+// `nextUpdate`.
+//
+// ## What a caller must not skip
+//
+// **The signature.** A revocation list is exactly the document an attacker
+// wants to replace — serve an empty one and every revoked certificate works
+// again. `verify_ed25519` is here for that; a caller with an RSA or ECDSA
+// issuer needs the corresponding package and the same discipline.
+//
+// **`nextUpdate`.** A CRL that is past it is not "slightly stale", it is a
+// document the issuer has stopped standing behind, and an attacker who can
+// block the fetch will happily let you keep using the last one forever. This
+// is the whole reason `is_current` takes the time as an argument rather than
+// reading a clock: the caller decides how much drift it tolerates, and the
+// question is asked explicitly rather than forgotten.
+//
+// **A serial is not a number.** Serials are up to twenty octets, which is
+// wider than any integer here, and a CRL for a real CA has serials that
+// overflow a machine word. They are carried as uppercase hex — the form
+// OpenSSL prints — and compared as text.
+//
+// ## What "not on the list" does not mean
+//
+// A certificate absent from a CRL is not proven good. It may be from a
+// different issuer, the list may be stale, and a CRL only ever covers its own
+// issuer's certificates. `is_revoked` answers about this list, and a caller
+// deciding to trust something needs to have checked that this is the right
+// list first.
+//
+// Checked against CRLs OpenSSL generated, entry for entry and reason for
+// reason, including the Ed25519 signature over one.
+
+import asn1
+import ed25519
+import pkcs8
+
+type CrlEntry = {
+    /// Uppercase hex, no leading zeroes beyond one for zero itself.
+    serial: str,
+    revoked_at: i64,
+    /// The reason code, or -1 when the entry gives none.
+    reason: i64,
+}
+
+type CrlInfo = {
+    issuer: [(str, str)],
+    issuer_der: bytes,
+    this_update: i64,
+    next_update: i64,
+    /// The CRL number, monotonic per issuer; -1 when absent.
+    number: i64,
+    entries: [CrlEntry],
+    signature_algorithm: str,
+    signature: bytes,
+    /// The bytes the signature covers.
+    tbs_der: bytes,
+    version: i64,
+}
+
+type CrlError =
+    | NotDer()
+    | NotACrl()
+    | BadTime()
+
+pub fn crl_number_oid() -> str {
+    return "2.5.29.20"
+}
+
+pub fn reason_code_oid() -> str {
+    return "2.5.29.21"
+}
+
+pub fn empty() -> CrlInfo {
+    return CrlInfo{ issuer: [], issuer_der: bytes_of([]), this_update: 0,
+        next_update: 0, number: 0 - 1, entries: [], signature_algorithm: "",
+        signature: bytes_of([]), tbs_der: bytes_of([]), version: 1 }
+}
+
+/// RFC 5280's reason codes, by the names the RFC gives them.
+pub fn reason_name(code: i64) -> str {
+    let names = ["unspecified", "keyCompromise", "cACompromise",
+        "affiliationChanged", "superseded", "cessationOfOperation",
+        "certificateHold", "", "removeFromCRL", "privilegeWithdrawn",
+        "aACompromise"]
+    if code < 0 or code >= names.len() {
+        return "unknown"
+    }
+    // 7 is not assigned; the list is written with the hole in it so the
+    // indices are the codes.
+    if names[code] == "" {
+        return "unknown"
+    }
+    return names[code]
+}
+
+fn hex_of(raw_serial: bytes) -> str {
+    let digits = "0123456789ABCDEF"
+    var at = 0
+    // A serial is a DER INTEGER, so a positive one whose top bit is set
+    // carries a leading zero that is padding rather than value.
+    while at + 1 < raw_serial.len() and raw_serial.at(at) == 0 {
+        at = at + 1
+    }
+    var out = ""
+    var i = at
+    while i < raw_serial.len() {
+        let b = raw_serial.at(i)
+        out = out + digits.substr(b.ushr(4), 1) + digits.substr(b.bit_and(15), 1)
+        i = i + 1
+    }
+    if out == "" {
+        return "00"
+    }
+    return out
+}
+
+/// The serial of a certificate, in the same form this package compares.
+///
+/// A caller holding a certificate needs its serial in the CRL's spelling, and
+/// getting there by hand is where the leading-zero mistake happens.
+pub fn serial_text(raw_serial: bytes) -> str {
+    return hex_of(raw_serial)
+}
+
+pub fn parse(der: bytes) -> CrlInfo ! CrlError {
+    let nodes = asn1.parse(der) ?? []
+    if nodes.len() == 0 {
+        fail(NotDer())
+    }
+    let top = asn1.child_indices(nodes, 0)
+    if top.len() != 3 {
+        fail(NotACrl())
+    }
+    var out = empty()
+    out.tbs_der = asn1.raw(der, nodes[top[0]])
+    let alg_kids = asn1.child_indices(nodes, top[1])
+    if alg_kids.len() > 0 {
+        out.signature_algorithm = asn1.oid_of(der, nodes[alg_kids[0]])
+    }
+    let bits = asn1.value(der, nodes[top[2]])
+    if bits.len() > 1 {
+        out.signature = bits.slice(1, bits.len())
+    }
+
+    let tbs = asn1.child_indices(nodes, top[0])
+    if tbs.len() < 4 {
+        fail(NotACrl())
+    }
+    // The version is optional and only present for v2, so the fields that
+    // follow move by one depending on it.
+    var at = 0
+    if nodes[tbs[0]].tag == asn1.INTEGER {
+        out.version = asn1.integer_of(der, nodes[tbs[0]]) + 1
+        at = 1
+    }
+    if at + 2 >= tbs.len() {
+        fail(NotACrl())
+    }
+    out.issuer_der = asn1.raw(der, nodes[tbs[at + 1]])
+    for rdn in asn1.child_indices(nodes, tbs[at + 1]) {
+        for pair in asn1.child_indices(nodes, rdn) {
+            let parts = asn1.child_indices(nodes, pair)
+            if parts.len() == 2 {
+                out.issuer.push((asn1.oid_of(der, nodes[parts[0]]),
+                    asn1.text_of(der, nodes[parts[1]])))
+            }
+        }
+    }
+    out.this_update = asn1.time_of(der, nodes[tbs[at + 2]]) ?? 0
+    if out.this_update == 0 {
+        fail(BadTime())
+    }
+
+    var i = at + 3
+    // `nextUpdate` is optional, so what follows it is identified by shape:
+    // a time is a time, the revocation list is a SEQUENCE, the extensions
+    // are `[0]`.
+    if i < tbs.len() and is_time(nodes[tbs[i]].tag) {
+        out.next_update = asn1.time_of(der, nodes[tbs[i]]) ?? 0
+        i = i + 1
+    }
+    if i < tbs.len() and nodes[tbs[i]].tag == asn1.SEQUENCE {
+        read_entries(der, nodes, tbs[i], out)
+        i = i + 1
+    }
+    while i < tbs.len() {
+        if nodes[tbs[i]].tag == 0xA0 {
+            read_crl_extensions(der, nodes, tbs[i], out)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn is_time(tag: i64) -> bool {
+    return tag == asn1.UTC_TIME or tag == asn1.GENERALIZED_TIME
+}
+
+fn read_entries(der: bytes, nodes: [DerNode], at: i64, inout out: CrlInfo) {
+    for entry in asn1.child_indices(nodes, at) {
+        let parts = asn1.child_indices(nodes, entry)
+        if parts.len() < 2 {
+            continue
+        }
+        var row = CrlEntry{ serial: hex_of(asn1.value(der, nodes[parts[0]])),
+            revoked_at: asn1.time_of(der, nodes[parts[1]]) ?? 0,
+            reason: 0 - 1 }
+        if parts.len() > 2 {
+            row.reason = read_reason(der, nodes, parts[2])
+        }
+        out.entries.push(row)
+    }
+}
+
+/// The reason code out of an entry's extensions.
+///
+/// The value is an OCTET STRING holding an ENUMERATED — not an INTEGER, which
+/// is the tag a reader guessing from the shape would look for and not find.
+fn read_reason(der: bytes, nodes: [DerNode], at: i64) -> i64 {
+    for extension in asn1.child_indices(nodes, at) {
+        let parts = asn1.child_indices(nodes, extension)
+        if parts.len() < 2 {
+            continue
+        }
+        if asn1.oid_of(der, nodes[parts[0]]) != reason_code_oid() {
+            continue
+        }
+        let inner = asn1.value(der, nodes[parts[parts.len() - 1]])
+        if inner.len() >= 3 and inner.at(0) == 10 {
+            return inner.at(2)
+        }
+    }
+    return 0 - 1
+}
+
+fn read_crl_extensions(der: bytes, nodes: [DerNode], at: i64,
+    inout out: CrlInfo) {
+    for list in asn1.child_indices(nodes, at) {
+        for extension in asn1.child_indices(nodes, list) {
+            let parts = asn1.child_indices(nodes, extension)
+            if parts.len() < 2 {
+                continue
+            }
+            if asn1.oid_of(der, nodes[parts[0]]) != crl_number_oid() {
+                continue
+            }
+            let inner = asn1.value(der, nodes[parts[parts.len() - 1]])
+            let numbers = asn1.parse(inner) ?? []
+            if numbers.len() > 0 {
+                out.number = asn1.integer_of(inner, numbers[0])
+            }
+        }
+    }
+}
+
+// -------------------------------------------------------------- asking
+
+pub fn is_revoked(list: CrlInfo, serial: str) -> bool {
+    for entry in list.entries {
+        if entry.serial == serial {
+            return true
+        }
+    }
+    return false
+}
+
+pub fn revocation(list: CrlInfo, serial: str) -> Option[CrlEntry] {
+    for entry in list.entries {
+        if entry.serial == serial {
+            return Some(entry)
+        }
+    }
+    return None
+}
+
+/// Whether the list is one a caller should still be relying on.
+///
+/// Both ends are checked. A list whose `thisUpdate` is in the future is as
+/// wrong as one whose `nextUpdate` has passed, and a list with no
+/// `nextUpdate` at all — which RFC 5280 permits and discourages — is treated
+/// as current, because there is nothing to say otherwise.
+pub fn is_current(list: CrlInfo, now: i64) -> bool {
+    if now < list.this_update {
+        return false
+    }
+    if list.next_update == 0 {
+        return true
+    }
+    return now < list.next_update
+}
+
+pub fn seconds_until_stale(list: CrlInfo, now: i64) -> i64 {
+    if list.next_update == 0 {
+        return 0 - 1
+    }
+    return list.next_update - now
+}
+
+/// Whether the signature is the issuer's, for an Ed25519 issuer.
+pub fn verify_ed25519(list: CrlInfo, issuer_spki: bytes) -> bool {
+    if list.signature_algorithm != pkcs8.ed25519_oid() {
+        return false
+    }
+    let key = pkcs8.spki_key(issuer_spki) ?? bytes_of([])
+    if key.len() != 32 {
+        return false
+    }
+    return ed25519.verify(key, list.tbs_der, list.signature)
+}
+
+/// The issuer as one line, in OpenSSL's spelling.
+pub fn issuer_text(list: CrlInfo) -> str {
+    var parts: [str] = []
+    for pair in list.issuer {
+        parts.push(short_name(pair.0) + "=" + pair.1)
+    }
+    return parts.join(", ")
+}
+
+fn short_name(oid: str) -> str {
+    if oid == "2.5.4.3" {
+        return "CN"
+    }
+    if oid == "2.5.4.6" {
+        return "C"
+    }
+    if oid == "2.5.4.10" {
+        return "O"
+    }
+    if oid == "2.5.4.11" {
+        return "OU"
+    }
+    return oid
+}

@@ -1,0 +1,22 @@
+[package]
+name = "csr"
+version = "1.0.0"
+
+# Building and reading bytes. Opens nothing; the caller supplies the key.
+capabilities = []
+
+[dependencies.asn1]
+path = "../asn1"
+version = "^1.0.0"
+
+[dependencies.derwrite]
+path = "../derwrite"
+version = "^1.0.0"
+
+[dependencies.ed25519]
+path = "../ed25519"
+version = "^1.0.0"
+
+[dependencies.pkcs8]
+path = "../pkcs8"
+version = "^1.0.0"

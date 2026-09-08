@@ -1,0 +1,249 @@
+// PKCS#8, the private key container — RFC 5208, and RFC 5958 for version 2.
+//
+// A file called `key.pem` is one of three formats and the name says which
+// only if you read the label:
+//
+//   `-----BEGIN PRIVATE KEY-----`      PKCS#8. Any algorithm; the algorithm
+//                                      is named inside.
+//   `-----BEGIN RSA PRIVATE KEY-----`  PKCS#1. RSA only, no algorithm field.
+//   `-----BEGIN EC PRIVATE KEY-----`   SEC1. EC only, curve inside.
+//   `-----BEGIN ENCRYPTED PRIVATE KEY-----`  PKCS#8 with the key encrypted.
+//
+// This reads and writes the first, and recognises the last well enough to say
+// so rather than returning nonsense. The other two are different structures
+// and a different package's problem.
+//
+// ## The nesting people get wrong
+//
+// A PKCS#8 `privateKey` is an OCTET STRING whose contents are *themselves*
+// DER. For Ed25519 (RFC 8410) those contents are another OCTET STRING holding
+// the 32-byte seed, so the seed starts two bytes into the outer string's
+// value. A reader that takes the outer string whole gets 34 bytes beginning
+// `04 20` and calls it a key; it will then derive a public key that matches
+// nothing, and the mistake surfaces as a signature nobody can verify rather
+// than as an error.
+//
+// ## What is deliberately not here
+//
+// Decryption. An encrypted PKCS#8 wraps the key under PBES2 with a
+// password-derived key, and doing that properly needs PBKDF2, AES, and a
+// careful answer about how the password is held. `is_encrypted` says when a
+// caller has one; it is better to say so than to half-support it.
+//
+// Checked against OpenSSL: every key here is one OpenSSL wrote, and every key
+// this writes is one OpenSSL reads back with `openssl pkey`.
+
+import asn1
+import derwrite
+
+type Pkcs8Key = {
+    /// The algorithm OID, dotted: `1.3.101.112` for Ed25519,
+    /// `1.2.840.113549.1.1.1` for RSA, `1.2.840.10045.2.1` for EC.
+    algorithm: str,
+    /// The named curve for an EC key, dotted; empty otherwise.
+    curve: str,
+    /// The contents of the `privateKey` OCTET STRING, unwrapped one level
+    /// where the algorithm defines an inner structure.
+    private_key: bytes,
+    /// The optional public key from a version 2 file, or empty.
+    public_key: bytes,
+    version: i64,
+}
+
+type Pkcs8Error =
+    | NotDer()
+    | NotAPrivateKeyInfo()
+    | Encrypted()
+    | UnexpectedAlgorithm(oid: str)
+    | WrongSeedLength(len: i64)
+    | Truncated()
+
+pub fn ed25519_oid() -> str {
+    return "1.3.101.112"
+}
+
+pub fn x25519_oid() -> str {
+    return "1.3.101.110"
+}
+
+pub fn rsa_oid() -> str {
+    return "1.2.840.113549.1.1.1"
+}
+
+pub fn ec_oid() -> str {
+    return "1.2.840.10045.2.1"
+}
+
+/// Whether these bytes are an EncryptedPrivateKeyInfo rather than a plain one.
+///
+/// The two are the same shape at a glance: a SEQUENCE of three things. The
+/// difference is the first — a PrivateKeyInfo starts with an INTEGER version,
+/// an encrypted one starts with the AlgorithmIdentifier of the encryption. So
+/// the question is answered by the tag of the first child and nothing else.
+pub fn is_encrypted(der: bytes) -> bool {
+    let nodes = asn1.parse(der) ?? []
+    if nodes.len() < 2 {
+        return false
+    }
+    let kids = asn1.child_indices(nodes, 0)
+    if kids.len() < 2 {
+        return false
+    }
+    return nodes[kids[0]].tag == asn1.SEQUENCE
+}
+
+pub fn parse(der: bytes) -> Pkcs8Key ! Pkcs8Error {
+    let nodes = asn1.parse(der) ?? []
+    if nodes.len() == 0 {
+        fail(NotDer())
+    }
+    if nodes[0].tag != asn1.SEQUENCE {
+        fail(NotAPrivateKeyInfo())
+    }
+    let kids = asn1.child_indices(nodes, 0)
+    if kids.len() < 3 {
+        fail(NotAPrivateKeyInfo())
+    }
+    if nodes[kids[0]].tag == asn1.SEQUENCE {
+        fail(Encrypted())
+    }
+    if nodes[kids[0]].tag != asn1.INTEGER {
+        fail(NotAPrivateKeyInfo())
+    }
+    let version = asn1.integer_of(der, nodes[kids[0]])
+
+    let alg_kids = asn1.child_indices(nodes, kids[1])
+    if alg_kids.len() == 0 {
+        fail(NotAPrivateKeyInfo())
+    }
+    let algorithm = asn1.oid_of(der, nodes[alg_kids[0]])
+    var curve = ""
+    if alg_kids.len() > 1 and nodes[alg_kids[1]].tag == asn1.OID {
+        curve = asn1.oid_of(der, nodes[alg_kids[1]])
+    }
+
+    if nodes[kids[2]].tag != asn1.OCTET_STRING {
+        fail(NotAPrivateKeyInfo())
+    }
+    var key = asn1.value(der, nodes[kids[2]])
+    if algorithm == ed25519_oid() or algorithm == x25519_oid() {
+        // The inner CurvePrivateKey: an OCTET STRING inside the OCTET STRING.
+        if key.len() < 2 or key.at(0) != asn1.OCTET_STRING {
+            fail(Truncated())
+        }
+        let inner_len = key.at(1)
+        if 2 + inner_len > key.len() {
+            fail(Truncated())
+        }
+        key = key.slice(2, 2 + inner_len)
+    }
+
+    var public = bytes_of([])
+    var i = 3
+    while i < kids.len() {
+        // `[1] IMPLICIT BIT STRING`, which is version 2's optional public key.
+        if nodes[kids[i]].tag == 0x81 or nodes[kids[i]].tag == 0xA1 {
+            let raw_bits = asn1.value(der, nodes[kids[i]])
+            if raw_bits.len() > 1 {
+                public = raw_bits.slice(1, raw_bits.len())
+            }
+        }
+        i = i + 1
+    }
+
+    return Pkcs8Key{ algorithm: algorithm, curve: curve, private_key: key,
+        public_key: public, version: version }
+}
+
+/// The 32-byte Ed25519 seed, refusing anything else.
+pub fn ed25519_seed(k: Pkcs8Key) -> bytes ! Pkcs8Error {
+    if k.algorithm != ed25519_oid() {
+        fail(UnexpectedAlgorithm(k.algorithm))
+    }
+    if k.private_key.len() != 32 {
+        fail(WrongSeedLength(k.private_key.len()))
+    }
+    return k.private_key
+}
+
+/// A PrivateKeyInfo for an Ed25519 seed.
+///
+/// Version 0 and no public key: RFC 5958 allows one, and OpenSSL does not
+/// write it, and a file that differs from OpenSSL's for the same key is a
+/// file somebody will have to explain.
+pub fn ed25519_key(seed: bytes) -> bytes ! Pkcs8Error {
+    if seed.len() != 32 {
+        fail(WrongSeedLength(seed.len()))
+    }
+    let inner = derwrite.octet_string(seed) ?? bytes_of([])
+    let alg = derwrite.algorithm(ed25519_oid()) ?? bytes_of([])
+    let outer = derwrite.octet_string(inner) ?? bytes_of([])
+    let version = derwrite.integer(0) ?? bytes_of([])
+    return derwrite.sequence([version, alg, outer]) ?? bytes_of([])
+}
+
+/// The SubjectPublicKeyInfo for an Ed25519 public key.
+///
+/// This is what goes into a certificate or a certificate request, and what
+/// `openssl pkey -pubout` writes: an AlgorithmIdentifier with **no
+/// parameters** — not a NULL — and the key in a BIT STRING with no unused
+/// bits. RFC 8410 is explicit that the parameters field must be absent, and a
+/// NULL there is the commonest way to produce a key OpenSSL rejects.
+pub fn ed25519_spki(public: bytes) -> bytes ! Pkcs8Error {
+    if public.len() != 32 {
+        fail(WrongSeedLength(public.len()))
+    }
+    let alg = derwrite.algorithm(ed25519_oid()) ?? bytes_of([])
+    let bits = derwrite.bit_string(public, 0) ?? bytes_of([])
+    return derwrite.sequence([alg, bits]) ?? bytes_of([])
+}
+
+/// The public key out of a SubjectPublicKeyInfo, whatever the algorithm.
+pub fn spki_key(der: bytes) -> bytes ! Pkcs8Error {
+    let nodes = asn1.parse(der) ?? []
+    if nodes.len() == 0 {
+        fail(NotDer())
+    }
+    let kids = asn1.child_indices(nodes, 0)
+    if kids.len() != 2 or nodes[kids[1]].tag != asn1.BIT_STRING {
+        fail(NotAPrivateKeyInfo())
+    }
+    let bits = asn1.value(der, nodes[kids[1]])
+    if bits.len() < 1 {
+        fail(Truncated())
+    }
+    return bits.slice(1, bits.len())
+}
+
+/// The algorithm OID of a SubjectPublicKeyInfo.
+pub fn spki_algorithm(der: bytes) -> str ! Pkcs8Error {
+    let nodes = asn1.parse(der) ?? []
+    if nodes.len() == 0 {
+        fail(NotDer())
+    }
+    let kids = asn1.child_indices(nodes, 0)
+    if kids.len() != 2 {
+        fail(NotAPrivateKeyInfo())
+    }
+    let alg_kids = asn1.child_indices(nodes, kids[0])
+    if alg_kids.len() == 0 {
+        fail(NotAPrivateKeyInfo())
+    }
+    return asn1.oid_of(der, nodes[alg_kids[0]])
+}
+
+pub fn algorithm_name(oid: str) -> str {
+    if oid == ed25519_oid() {
+        return "Ed25519"
+    }
+    if oid == x25519_oid() {
+        return "X25519"
+    }
+    if oid == rsa_oid() {
+        return "RSA"
+    }
+    if oid == ec_oid() {
+        return "EC"
+    }
+    return oid
+}

@@ -1,0 +1,22 @@
+[package]
+name = "ocsp"
+version = "1.0.0"
+
+# Building and reading bytes. Opens nothing; the caller does the fetching.
+capabilities = []
+
+[dependencies.asn1]
+path = "../asn1"
+version = "^1.0.0"
+
+[dependencies.derwrite]
+path = "../derwrite"
+version = "^1.0.0"
+
+[dependencies.sha1]
+path = "../sha1"
+version = "^1.0.0"
+
+[dependencies.crypto_hash]
+path = "../crypto_hash"
+version = "^1.0.0"

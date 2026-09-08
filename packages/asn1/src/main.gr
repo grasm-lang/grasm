@@ -123,6 +123,37 @@ pub fn children(nodes: [DerNode], i: i64) -> [DerNode] {
     return out
 }
 
+/// The same, as indices into `nodes` rather than as nodes.
+///
+/// A caller walking a nested document needs to descend, and descending needs
+/// an index. Returning the nodes themselves means finding them again by
+/// offset — which every reader of a certificate ends up writing, so it is
+/// here once instead.
+pub fn child_indices(nodes: [DerNode], i: i64) -> [i64] {
+    var out: [i64] = []
+    let parent = nodes[i]
+    var k = i + 1
+    while k < nodes.len() {
+        let n = nodes[k]
+        if n.depth <= parent.depth {
+            return out
+        }
+        if n.depth == parent.depth + 1 {
+            out.push(k)
+        }
+        k = k + 1
+    }
+    return out
+}
+
+/// The whole of a node including its tag and length octets.
+///
+/// This is what a signature covers and what a re-encoder must reproduce, so
+/// it is taken from the original bytes rather than rebuilt.
+pub fn raw(der: bytes, n: DerNode) -> bytes {
+    return der.slice(n.at, n.body + n.len)
+}
+
 /// An INTEGER's value, for the small ones. DER writes them big-endian and
 /// two's complement, with a leading zero where the top bit would otherwise
 /// make a positive number look negative.
@@ -154,6 +185,68 @@ pub fn oid_of(der: bytes, n: DerNode) -> str {
         }
     }
     return parts.join(".")
+}
+
+/// A UTCTime or GeneralizedTime as seconds since 1970.
+///
+/// The two differ in the year: UTCTime writes two digits and reads them as
+/// 1950 to 2049, GeneralizedTime writes four. RFC 5280 requires both to be
+/// Zulu with seconds, and this refuses anything else by returning `None`
+/// rather than guessing a timezone — a certificate whose expiry is off by an
+/// offset is worse than one that will not parse.
+pub fn time_of(der: bytes, n: DerNode) -> Option[i64] {
+    let text = value(der, n).to_str()
+    if not text.ends_with("Z") {
+        return None
+    }
+    var digits = text.substr(0, text.len() - 1)
+    if n.tag == UTC_TIME {
+        if digits.len() != 12 {
+            return None
+        }
+        let yy = two_of(digits, 0)
+        // 1950..2049, which is the whole range two digits can name.
+        let century = if yy >= 50 { 1900 } else { 2000 }
+        return Some(seconds_of(century + yy, two_of(digits, 2),
+            two_of(digits, 4), two_of(digits, 6), two_of(digits, 8),
+            two_of(digits, 10)))
+    }
+    if n.tag == GENERALIZED_TIME {
+        if digits.len() != 14 {
+            return None
+        }
+        let year = two_of(digits, 0) * 100 + two_of(digits, 2)
+        return Some(seconds_of(year, two_of(digits, 4), two_of(digits, 6),
+            two_of(digits, 8), two_of(digits, 10), two_of(digits, 12)))
+    }
+    return None
+}
+
+fn two_of(text: str, at: i64) -> i64 {
+    return text.substr(at, 2).parse_int() ?? 0
+}
+
+/// Seconds since 1970 for a civil date, with the era starting in March.
+///
+/// Shifting the year to start in March puts the leap day at the end of it,
+/// which removes February from the arithmetic entirely — no table of month
+/// lengths and no special case for a leap year.
+pub fn seconds_of(year: i64, month: i64, day: i64, hour: i64, minute: i64,
+    second: i64) -> i64 {
+    var y = year
+    if month <= 2 {
+        y = y - 1
+    }
+    var era = y / 400
+    if y < 0 {
+        era = (y - 399) / 400
+    }
+    let yoe = y - era * 400
+    let mp = (month + 9) % 12
+    let doy = (153 * mp + 2) / 5 + day - 1
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy
+    let days = era * 146097 + doe - 719468
+    return days * 86400 + hour * 3600 + minute * 60 + second
 }
 
 /// The content of a node as text.

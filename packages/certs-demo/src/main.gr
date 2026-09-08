@@ -1,0 +1,483 @@
+// Five PKIX containers, against the documents OpenSSL wrote.
+//
+// Every sample below came out of `openssl` — a small CA, a certificate, a
+// revocation list with one entry, an OCSP exchange about it, an S/MIME
+// signature and a certificate bundle. They are embedded rather than read from
+// disk because three of the four engines have no filesystem, and a check only
+// one engine can run is not an agreement.
+import pkcs8
+import csr
+import crl
+import ocsp
+import pkcs7
+import bytes_codec
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn same(a: bytes, b: bytes) -> bool {
+    return a.to_list() == b.to_list()
+}
+
+fn differing_bytes(a: bytes, b: bytes) -> i64 {
+    if a.len() != b.len() {
+        return 0 - 1
+    }
+    var n = 0
+    var i = 0
+    while i < a.len() {
+        if a.at(i) != b.at(i) {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+fn seed_of(v: i64) -> bytes {
+    var out: [i64] = []
+    for i in 0..32 {
+        out.push((i + v) % 256)
+    }
+    return bytes_of(out)
+}
+
+fn no_key() -> Pkcs8Key {
+    return Pkcs8Key{ algorithm: "", curve: "", private_key: bytes_of([]),
+        public_key: bytes_of([]), version: 0 }
+}
+
+// ----------------------------------------------------------------- pkcs8
+
+fn check_pkcs8(inout f: i64) / {io} {
+    print("-- pkcs8: three formats, one file extension")
+    let der = issuer_private_key_der()
+    let key = pkcs8.parse(der) ?? no_key()
+    say(f, "OpenSSL's Ed25519 key is read as one",
+        key.algorithm == pkcs8.ed25519_oid() and
+        pkcs8.algorithm_name(key.algorithm) == "Ed25519")
+    say(f, "the seed is 32 bytes, not the 34 the outer string holds",
+        key.private_key.len() == 32)
+    let seed: bytes ! Pkcs8Error = pkcs8.ed25519_seed(key)
+    say(f, "and it is the seed OpenSSL wrote",
+        bytes_codec.encode_hex(seed ?? bytes_of([])) ==
+        "7f89de50f972ae9ebffe99dc45ec4668c307cfa9d2acf5d968bcef2b46c0efc6")
+    let rebuilt: bytes ! Pkcs8Error = pkcs8.ed25519_key(key.private_key)
+    say(f, "rebuilding gives OpenSSL's bytes back exactly",
+        same(rebuilt ?? bytes_of([]), der))
+    let spki: bytes ! Pkcs8Error = pkcs8.ed25519_spki(
+        pkcs8.spki_key(issuer_spki_der()) ?? bytes_of([]))
+    say(f, "and the public half matches `openssl pkey -pubout`",
+        same(spki ?? bytes_of([]), issuer_spki_der()))
+    say(f, "the SubjectPublicKeyInfo names Ed25519 with no parameters",
+        (pkcs8.spki_algorithm(issuer_spki_der()) ?? "") ==
+        pkcs8.ed25519_oid() and issuer_spki_der().len() == 44)
+    say(f, "a plain key is not reported as encrypted",
+        not pkcs8.is_encrypted(der))
+    say(f, "a 31-byte seed is refused rather than padded",
+        refuses_seed(31) and refuses_seed(33))
+}
+
+fn refuses_seed(n: i64) -> bool {
+    var out: [i64] = []
+    for _i in 0..n {
+        out.push(1)
+    }
+    match pkcs8.ed25519_key(bytes_of(out)) {
+        Ok(_v) -> {
+            return false
+        }
+        Err(_e) -> {
+            return true
+        }
+    }
+}
+
+// ------------------------------------------------------------------- csr
+
+fn check_csr(inout f: i64) / {io} {
+    print("-- csr: the proof that the requester holds the key")
+    let theirs = csr.parse(openssl_request_der()) ?? csr.empty()
+    say(f, "OpenSSL's request reads back to OpenSSL's subject",
+        csr.subject_text(theirs) == "C=GB, O=Example Ltd, CN=example.com")
+    say(f, "the names live in an extensionRequest, not in an extensions field",
+        theirs.dns_names.len() == 2 and
+        theirs.dns_names[0] == "example.com" and
+        theirs.dns_names[1] == "www.example.com")
+    say(f, "and its self-signature verifies", csr.verify(theirs))
+
+    let mine: bytes ! CsrError = csr.sign_ed25519(seed_of(1),
+        [("2.5.4.6", "GB"), ("2.5.4.10", "Grasm Ltd"),
+            ("2.5.4.3", "grasm.test")], ["grasm.test", "www.grasm.test"])
+    let built = mine ?? bytes_of([])
+    let back = csr.parse(built) ?? csr.empty()
+    say(f, "a request built here reads back to what went in",
+        csr.subject_text(back) == "C=GB, O=Grasm Ltd, CN=grasm.test" and
+        back.dns_names.len() == 2)
+    // `openssl req -verify` accepts this exact document.
+    say(f, "and verifies against the key that signed it", csr.verify(back))
+    let other: bytes ! CsrError = csr.sign_ed25519(seed_of(9),
+        [("2.5.4.3", "grasm.test")], [])
+    let other_request = csr.parse(other ?? bytes_of([])) ?? csr.empty()
+    say(f, "the key in the request is the one that signed it, not a shared one",
+        (pkcs8.spki_key(back.spki) ?? bytes_of([])).len() == 32 and
+        not same(pkcs8.spki_key(back.spki) ?? bytes_of([]),
+            pkcs8.spki_key(other_request.spki) ?? bytes_of([])))
+
+    var broken = built.to_list()
+    // Flip a byte inside the subject, which the signature covers.
+    broken[40] = broken[40].bit_xor(1)
+    let tampered = csr.parse(bytes_of(broken)) ?? csr.empty()
+    say(f, "one flipped byte in the subject and it does not",
+        not csr.verify(tampered))
+
+    say(f, "the common name comes last, after the names a browser reads",
+        csr.names(back).len() == 2 and csr.names(back)[0] == "grasm.test")
+    let odd: bytes ! CsrError = csr.sign_ed25519(seed_of(2),
+        [("2.5.4.3", "localhost")], [])
+    let odd_request = csr.parse(odd ?? bytes_of([])) ?? csr.empty()
+    say(f, "a name with no dot is flagged rather than issued",
+        csr.suspicious_names(odd_request).len() == 1)
+}
+
+// ------------------------------------------------------------------- crl
+
+fn check_crl(inout f: i64) / {io} {
+    print("-- crl: a signed list, and the two ends of its validity")
+    let list = crl.parse(revocation_list_der()) ?? crl.empty()
+    say(f, "the issuer reads as OpenSSL prints it",
+        crl.issuer_text(list) == "C=GB, O=Example CA, CN=Example Root")
+    say(f, "it is a version 2 list with OpenSSL's CRL number",
+        list.version == 2 and list.number == 4096)
+    say(f, "the times are the ones OpenSSL wrote, to the second",
+        list.this_update == 1788877395 and list.next_update == 1791469395)
+    say(f, "one entry, with its serial and its reason",
+        list.entries.len() == 1 and list.entries[0].serial == "1000" and
+        list.entries[0].reason == 1 and
+        crl.reason_name(list.entries[0].reason) == "keyCompromise")
+    say(f, "a revoked serial is found and another is not",
+        crl.is_revoked(list, "1000") and not crl.is_revoked(list, "1001"))
+    say(f, "the list is current inside its window and not outside it",
+        crl.is_current(list, list.this_update) and
+        not crl.is_current(list, list.next_update) and
+        not crl.is_current(list, list.this_update - 1))
+    say(f, "and its Ed25519 signature is the issuer's",
+        crl.verify_ed25519(list, issuer_spki_der()))
+    let other = pkcs8.ed25519_spki(bytes_codec.decode_hex(
+        "0000000000000000000000000000000000000000000000000000000000000000")
+        ?? bytes_of([])) ?? bytes_of([])
+    say(f, "a different key does not verify it",
+        not crl.verify_ed25519(list, other))
+    say(f, "a serial keeps DER's padding out of its spelling",
+        crl.serial_text(bytes_of([0, 200, 1])) == "C801" and
+        crl.serial_text(bytes_of([0])) == "00")
+    say(f, "reason 7 is unassigned and reads as unknown",
+        crl.reason_name(7) == "unknown" and crl.reason_name(0) == "unspecified")
+}
+
+// ------------------------------------------------------------------ ocsp
+
+fn check_ocsp(inout f: i64) / {io} {
+    print("-- ocsp: one question, and what its answer does not say")
+    let nonce = bytes_codec.decode_hex(
+        "d51475ab0cf0e0ddf7bb8e908e2b52bb") ?? bytes_of([])
+    let built: bytes ! OcspError = ocsp.build_request(ocsp.sha1_oid(),
+        issuer_name_der(), issuer_spki_der(), bytes_of([16, 0]), nonce)
+    say(f, "the request is byte-identical to the one OpenSSL builds",
+        same(built ?? bytes_of([]), ocsp_request_der()))
+
+    let parsed: OcspResponse ! OcspError = ocsp.parse_response(ocsp_response_der())
+    let response = parsed ?? ocsp.empty_response()
+    say(f, "the responder said successful, in a basic response",
+        response.response_status == 0 and
+        ocsp.response_status_name(0) == "successful" and
+        response.response_type == ocsp.basic_response_oid())
+    say(f, "it named itself, and attached the certificate to prove it",
+        response.responder_name.len() == 3 and
+        response.certificates.len() == 1)
+    say(f, "produced at the second OpenSSL recorded",
+        response.produced_at == 1788877395)
+    let one = ocsp.answer_for(response, "1000")
+    say(f, "the answer about serial 1000 is revoked, for key compromise",
+        answer_is(one, ocsp.REVOKED, 1))
+    say(f, "a serial the response does not mention has no answer",
+        is_none(ocsp.answer_for(response, "1001")))
+    say(f, "an answer with no nextUpdate is not fresh, whatever the clock",
+        not is_fresh_at(one, 1788877395))
+    say(f, "the nonce comes back, so the answer is to this question",
+        ocsp.nonce_matches(response, nonce))
+    say(f, "a different nonce does not match",
+        not ocsp.nonce_matches(response, bytes_of([1, 2, 3])))
+    say(f, "the CertID hashes are the issuer's name and key, not the cert's",
+        response.singles.len() == 1 and
+        ocsp.hex(response.singles[0].id.issuer_name_hash) ==
+        "16BC6C1581415E54944DB44DA5F136C5CBC90E27" and
+        ocsp.hex(response.singles[0].id.issuer_key_hash) ==
+        "62DFE8B8CAE290D5E9CB0DBE1F40AF491CA3F7FC")
+    say(f, "unknown and good are different answers",
+        ocsp.status_name(ocsp.UNKNOWN) == "unknown" and
+        ocsp.status_name(ocsp.GOOD) == "good" and
+        ocsp.UNKNOWN != ocsp.GOOD)
+}
+
+fn answer_is(answer: Option[OcspSingle], status: i64, reason: i64) -> bool {
+    match answer {
+        Some(s) -> {
+            return s.status == status and s.reason == reason
+        }
+        None -> {
+            return false
+        }
+    }
+}
+
+fn is_none(answer: Option[OcspSingle]) -> bool {
+    match answer {
+        Some(_s) -> {
+            return false
+        }
+        None -> {
+            return true
+        }
+    }
+}
+
+fn is_fresh_at(answer: Option[OcspSingle], now: i64) -> bool {
+    match answer {
+        Some(s) -> {
+            return ocsp.is_fresh(s, now)
+        }
+        None -> {
+            return false
+        }
+    }
+}
+
+// ----------------------------------------------------------------- pkcs7
+
+fn check_pkcs7(inout f: i64) / {io} {
+    print("-- pkcs7: the retagging, and the digest that binds the document")
+    let signed = pkcs7.parse(signed_message_der()) ?? pkcs7.empty()
+    say(f, "a detached signature carries no content",
+        signed.detached and signed.content.len() == 0)
+    say(f, "one signer, named by its issuer and serial",
+        signed.signers.len() == 1 and
+        pkcs7.issuer_text(signed.signers[0]) ==
+        "C=GB, O=Example Ltd, CN=rsa.example.com" and
+        signed.signers[0].serial ==
+        "4B0F5E9127FBB260582A06BA02DDDC0DC55F0E69")
+    say(f, "digesting with SHA-256 and signing with RSA",
+        signed.digest_algorithms.len() == 1 and
+        signed.signers[0].signature_algorithm ==
+        "1.2.840.113549.1.1.1" and
+        signed.signers[0].signature.len() == 256)
+    let attrs = signed.signers[0].signed_attrs_der
+    let to_sign = pkcs7.signed_bytes(signed.signers[0])
+    say(f, "what is signed is the attribute set retagged from A0 to 31",
+        attrs.at(0) == 0xA0 and to_sign.at(0) == 0x31 and
+        differing_bytes(attrs, to_sign) == 1)
+    // S/MIME canonicalises text to CRLF before hashing.
+    let crlf = "hello detached\r\n".to_bytes()
+    let lf = "hello detached\n".to_bytes()
+    say(f, "the messageDigest matches the canonicalised content",
+        pkcs7.digest_matches(signed.signers[0], crlf))
+    say(f, "and not the same text with Unix line endings",
+        not pkcs7.digest_matches(signed.signers[0], lf))
+    say(f, "the signer's contentType agrees with the encapsulated one",
+        pkcs7.content_type_agrees(signed, signed.signers[0]) and
+        signed.content_type == pkcs7.data_oid())
+    say(f, "a signing time came along with it",
+        signed.signers[0].signing_time == 1788877407)
+
+    let bundle = pkcs7.parse(certificate_bundle_der()) ?? pkcs7.empty()
+    say(f, "a `.p7b` is a SignedData with nothing signed",
+        bundle.certificates_only and bundle.signers.len() == 0 and
+        bundle.certificates.len() == 2)
+    let rebuilt: bytes ! Pkcs7Error =
+    pkcs7.certificates_only_bundle(bundle.certificates)
+    say(f, "and rebuilding one gives OpenSSL's bytes back exactly",
+        same(rebuilt ?? bytes_of([]), certificate_bundle_der()))
+}
+
+fn main() / {io} {
+    var f = 0
+    check_pkcs8(f)
+    check_csr(f)
+    check_crl(f)
+    check_ocsp(f)
+    check_pkcs7(f)
+    if f == 0 {
+        print("certificates: every claim held")
+    } else {
+        print("certificates: {f} claims failed")
+    }
+}
+
+// ---------------------------------------------------------- the samples
+fn ocsp_response_der() -> bytes {
+    let hex = "308202db0a0100a08202d4308202d006092b0601050507300101048202c13082" +
+    "02bd3081dda13b3039310b300906035504061302474231133011060355040a0c" +
+    "0a4578616d706c652043413115301306035504030c0c4578616d706c6520526f" +
+    "6f74180f32303236303930383134323331355a30683066303b300906052b0e03" +
+    "021a0500041416bc6c1581415e54944db44da5f136c5cbc90e27041462dfe8b8" +
+    "cae290d5e9cb0dbe1f40af491ca3f7fc02021000a116180f3230323630393038" +
+    "3134323331355aa0030a0101180f32303236303930383134323331355aa12330" +
+    "21301f06092b060105050730010204120410d51475ab0cf0e0ddf7bb8e908e2b" +
+    "52bb300506032b65700341007dc5b35df23fc46f99c680155b0d0800d5f64cea" +
+    "fe3f66b9ef9b34916c6161ee0f8e4eafc9e55f7ab855fc85cfccc6868fe3bd00" +
+    "df291037eb47ada208d0c308a082018f3082018b3082018730820139a0030201" +
+    "0202145e6b296cc52b24df0f9e4a73f6d2cef1a841c75d300506032b65703039" +
+    "310b300906035504061302474231133011060355040a0c0a4578616d706c6520" +
+    "43413115301306035504030c0c4578616d706c6520526f6f74301e170d323630" +
+    "3930383134323331355a170d3336303930353134323331355a3039310b300906" +
+    "035504061302474231133011060355040a0c0a4578616d706c65204341311530" +
+    "1306035504030c0c4578616d706c6520526f6f74302a300506032b6570032100" +
+    "9755f3f18508768dd7b19c57ebabb8cff0e97c20dd9ae3aca9b16f1bd8d81a6d" +
+    "a3533051301d0603551d0e0416041462dfe8b8cae290d5e9cb0dbe1f40af491c" +
+    "a3f7fc301f0603551d2304183016801462dfe8b8cae290d5e9cb0dbe1f40af49" +
+    "1ca3f7fc300f0603551d130101ff040530030101ff300506032b6570034100fb" +
+    "5d9fa5b4a22633fbfd284468b37ac185656ede88b01c9607cc2cf7918a6e2309" +
+    "b7386566cb95b0bf6c892a4a36223614561c594960cde55042370bfd812e05"
+    return bytes_codec.decode_hex(hex) ?? bytes_of([])
+}
+
+fn ocsp_request_der() -> bytes {
+    let hex = "30683066303f303d303b300906052b0e03021a0500041416bc6c1581415e5494" +
+    "4db44da5f136c5cbc90e27041462dfe8b8cae290d5e9cb0dbe1f40af491ca3f7" +
+    "fc02021000a2233021301f06092b060105050730010204120410d51475ab0cf0" +
+    "e0ddf7bb8e908e2b52bb"
+    return bytes_codec.decode_hex(hex) ?? bytes_of([])
+}
+
+fn signed_message_der() -> bytes {
+    let hex = "3082060206092a864886f70d010702a08205f3308205ef020101310f300d0609" +
+    "6086480165030402010500300b06092a864886f70d010701a082035f3082035b" +
+    "30820243a00302010202144b0f5e9127fbb260582a06ba02dddc0dc55f0e6930" +
+    "0d06092a864886f70d01010b0500303d310b3009060355040613024742311430" +
+    "12060355040a0c0b4578616d706c65204c74643118301606035504030c0f7273" +
+    "612e6578616d706c652e636f6d301e170d3236303930383134323332375a170d" +
+    "3237303930383134323332375a303d310b300906035504061302474231143012" +
+    "060355040a0c0b4578616d706c65204c74643118301606035504030c0f727361" +
+    "2e6578616d706c652e636f6d30820122300d06092a864886f70d010101050003" +
+    "82010f003082010a0282010100d24018d5a6e9fa968db53df9a1eda43013e080" +
+    "08f009581d599d38d8e65a9dc91c996b203be9cca75a66b3d167b6f74d3b9442" +
+    "22f3ce6e7f7e1ef7783fa6c50bc43e419aaebe48dc36f6b4afd8b317fa2eb612" +
+    "4a0cf52be7ede8daa95a8af167dceeec460d43dad4c3bfb3d21f3eeb5a2fe0b2" +
+    "78e0f4042f9ba5707ec7f6f02a5a4715aa8660fb15321dd1e1b7acf80c090c7f" +
+    "b16e47139ca90331259d05c0bc76371ea60569a0528998cfed57fbba7b5f2a85" +
+    "90e067b20bcb2131f125edb24167a2b4f441e3eb36514746f22b47233626a1f6" +
+    "8dd4002e73e96e7e9f24897d56e016b1ed47f8122eb06bf9ff859ee5ab6f4af2" +
+    "05f7b0e308ba25241f6f5aaae50203010001a3533051301d0603551d0e041604" +
+    "146c38f070803d56bdb2c1306a0f595d868febf472301f0603551d2304183016" +
+    "80146c38f070803d56bdb2c1306a0f595d868febf472300f0603551d130101ff" +
+    "040530030101ff300d06092a864886f70d01010b050003820101002de84bb718" +
+    "d5aadda548704774ad0a6d9a52239feb256acb350f85d77671a8a8ac1bf40c34" +
+    "946b6b74addf64f2f8316ff80bb141f5040e1bd90ae96b0a0525dc5d5aec2cbb" +
+    "46c1e2e8b182c798745d937fcc25a199ea1b84795a2a65713e655fcb3d3da53b" +
+    "f53294758da7307638793943b3623e3c236404e1194188956e22922311da503c" +
+    "ae1af7951d870652554d4f723688f8240129f7931c930fb085141de65fdc9373" +
+    "9a4155ffdbd4b5d686f1aef0b1e6e55fd7922eab7587aa65845062a2e7a5f247" +
+    "facb3b0456cdd8d61221749aeaf37c152e1f370fd83557a3bc296143d893f67c" +
+    "e6722d38afa44761e66d15f25545df4be2feaae4d9c359c93f842e3182026730" +
+    "8202630201013055303d310b300906035504061302474231143012060355040a" +
+    "0c0b4578616d706c65204c74643118301606035504030c0f7273612e6578616d" +
+    "706c652e636f6d02144b0f5e9127fbb260582a06ba02dddc0dc55f0e69300d06" +
+    "096086480165030402010500a081e4301806092a864886f70d010903310b0609" +
+    "2a864886f70d010701301c06092a864886f70d010905310f170d323630393038" +
+    "3134323332375a302f06092a864886f70d0109043122042079fabe080f60ef28" +
+    "360473382c47168ab9469ca43b7cd1654181d159cb9b0ce4307906092a864886" +
+    "f70d01090f316c306a300b060960864801650304012a300b0609608648016503" +
+    "040116300b0609608648016503040102300a06082a864886f70d0307300e0608" +
+    "2a864886f70d030202020080300d06082a864886f70d0302020140300706052b" +
+    "0e030207300d06082a864886f70d0302020128300d06092a864886f70d010101" +
+    "0500048201002ab16fd169d190e103e7e87464a15d52c3ef2468010d1ac52100" +
+    "81314f4872f0e5d4f29e0293659d5c9aa1156be4747b3c0fca40d4cfedbfc48c" +
+    "5d147d422e9181ab168ec136d4faaf447095161dd4f53ec7f7b1e028d8467f82" +
+    "c987460c5c1933d4ee712f42aea6f19ebc1b62477f93fa6325d619991bd7ad15" +
+    "a335ec830237bbcb91a920ef4d187acd7c8d9315a2fd3bb03167124f30a88574" +
+    "911c39b963418b3a3c12624aee3f2fd8db92d485be8790ed7e2ae7f2ab4838f9" +
+    "6decad0ff7bbd1ae88fe5878a9e853e666d2a5eaacc7fa78fa9399f1836b3409" +
+    "0874e5a2bd5febc6ee9ceee9e4110901011586728a4a390ca2c3f07b409e96a0" +
+    "4138c3ac1c53"
+    return bytes_codec.decode_hex(hex) ?? bytes_of([])
+}
+
+fn certificate_bundle_der() -> bytes {
+    let hex = "3082034706092a864886f70d010702a0820338308203340201013100300b0609" +
+    "2a864886f70d010701a082031c3082018730820139a00302010202145e6b296c" +
+    "c52b24df0f9e4a73f6d2cef1a841c75d300506032b65703039310b3009060355" +
+    "04061302474231133011060355040a0c0a4578616d706c652043413115301306" +
+    "035504030c0c4578616d706c6520526f6f74301e170d32363039303831343233" +
+    "31355a170d3336303930353134323331355a3039310b30090603550406130247" +
+    "4231133011060355040a0c0a4578616d706c652043413115301306035504030c" +
+    "0c4578616d706c6520526f6f74302a300506032b65700321009755f3f1850876" +
+    "8dd7b19c57ebabb8cff0e97c20dd9ae3aca9b16f1bd8d81a6da3533051301d06" +
+    "03551d0e0416041462dfe8b8cae290d5e9cb0dbe1f40af491ca3f7fc301f0603" +
+    "551d2304183016801462dfe8b8cae290d5e9cb0dbe1f40af491ca3f7fc300f06" +
+    "03551d130101ff040530030101ff300506032b6570034100fb5d9fa5b4a22633" +
+    "fbfd284468b37ac185656ede88b01c9607cc2cf7918a6e2309b7386566cb95b0" +
+    "bf6c892a4a36223614561c594960cde55042370bfd812e053082018d3082013f" +
+    "a00302010202021000300506032b65703039310b300906035504061302474231" +
+    "133011060355040a0c0a4578616d706c652043413115301306035504030c0c45" +
+    "78616d706c6520526f6f74301e170d3236303930383134323331355a170d3237" +
+    "303930383134323331355a3039310b3009060355040613024742311430120603" +
+    "55040a0c0b4578616d706c65204c74643114301206035504030c0b6578616d70" +
+    "6c652e636f6d302a300506032b65700321007fc1dd410432ad4eb6641f0b413a" +
+    "04d56f91083c90a4264cf9114a49f052d17ca36b306930270603551d11042030" +
+    "1e820b6578616d706c652e636f6d820f7777772e6578616d706c652e636f6d30" +
+    "1d0603551d0e041604146557361a447bf098676229f5d878c7071ccdad8a301f" +
+    "0603551d2304183016801462dfe8b8cae290d5e9cb0dbe1f40af491ca3f7fc30" +
+    "0506032b6570034100b974516c5aba5b3af4f8973690551e23fe8136e27e8958" +
+    "25e6da8f24b8d0dff12fa051e5851a2aa8edd5fed8eed6cd6355987074e93cc1" +
+    "1a88b39acbf40e45023100"
+    return bytes_codec.decode_hex(hex) ?? bytes_of([])
+}
+
+fn revocation_list_der() -> bytes {
+    let hex = "3081e6308199020101300506032b65703039310b300906035504061302474231" +
+    "133011060355040a0c0a4578616d706c652043413115301306035504030c0c45" +
+    "78616d706c6520526f6f74170d3236303930383134323331355a170d32363130" +
+    "30383134323331355a3023302102021000170d3236303930383134323331355a" +
+    "300c300a0603551d1504030a0101a00f300d300b0603551d1404040202100030" +
+    "0506032b6570034100757dc952d0dbe8c0ec48f1f060bf91ffe100d6aea51e9b" +
+    "cb06b68fcc146e3c09f144fa3f99bf45e1a43cea8f674752461e8acf9b1a0c02" +
+    "c5e7437739d36b0604"
+    return bytes_codec.decode_hex(hex) ?? bytes_of([])
+}
+
+fn openssl_request_der() -> bytes {
+    let hex = "3081f33081a60201003039310b30090603550406130247423114301206035504" +
+    "0a0c0b4578616d706c65204c74643114301206035504030c0b6578616d706c65" +
+    "2e636f6d302a300506032b65700321007fc1dd410432ad4eb6641f0b413a04d5" +
+    "6f91083c90a4264cf9114a49f052d17ca03a303806092a864886f70d01090e31" +
+    "2b302930270603551d110420301e820b6578616d706c652e636f6d820f777777" +
+    "2e6578616d706c652e636f6d300506032b6570034100680bde4682cc5c3a9623" +
+    "5ca2a1dafc134561690dc3249397c0614c8dbc63d430ec179080f85d89ecafbb" +
+    "0cce3629db8c3299af99c6ae882ea3ada0feaf88b503"
+    return bytes_codec.decode_hex(hex) ?? bytes_of([])
+}
+
+fn issuer_private_key_der() -> bytes {
+    let hex = "302e020100300506032b6570042204207f89de50f972ae9ebffe99dc45ec4668" +
+    "c307cfa9d2acf5d968bcef2b46c0efc6"
+    return bytes_codec.decode_hex(hex) ?? bytes_of([])
+}
+
+fn issuer_spki_der() -> bytes {
+    let hex = "302a300506032b65700321009755f3f18508768dd7b19c57ebabb8cff0e97c20" +
+    "dd9ae3aca9b16f1bd8d81a6d"
+    return bytes_codec.decode_hex(hex) ?? bytes_of([])
+}
+
+fn issuer_name_der() -> bytes {
+    let hex = "3039310b300906035504061302474231133011060355040a0c0a4578616d706c" +
+    "652043413115301306035504030c0c4578616d706c6520526f6f74"
+    return bytes_codec.decode_hex(hex) ?? bytes_of([])
+}
+

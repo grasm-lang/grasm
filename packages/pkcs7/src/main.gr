@@ -1,0 +1,409 @@
+// PKCS#7 SignedData, which is CMS — RFC 5652.
+//
+// The container an S/MIME signature, a signed firmware image, a Windows
+// Authenticode block, and a `.p7b` certificate bundle all arrive in. One
+// structure doing four jobs, which is why reading one begins by working out
+// which job this instance is doing.
+//
+// ## The retagging that breaks verifiers
+//
+// When a SignerInfo carries `signedAttrs`, the signature is **not** over the
+// content. It is over the DER encoding of the attribute set — and that
+// encoding is not the bytes as they appear in the document. In the document
+// the field is `[0] IMPLICIT`, tag `A0`; what the signature covers is the
+// same contents under the universal SET tag, `31`. RFC 5652 section 5.4 says
+// so in one sentence, and a verifier that hashes the bytes it read gets a
+// digest that is wrong by exactly one octet and a signature that never
+// verifies. `signed_bytes` does the retagging.
+//
+// The content is still bound in, one step removed: `signedAttrs` must carry a
+// `messageDigest` attribute holding the hash of the content, and a
+// `contentType` attribute. A verifier checks the signature over the
+// attributes and then checks the digest against the content it has. Skipping
+// the second half means accepting a valid signature over somebody else's
+// document.
+//
+// ## Detached, attached, and certificates-only
+//
+// A **detached** signature has no `eContent`: the data is alongside — the
+// email body, the file being signed — and a verifier must supply it. An
+// **attached** one carries the content inside. A **certificates-only**
+// SignedData has neither content nor signers, and exists purely as a
+// container for a certificate chain; that is what a `.p7b` file is, and
+// `certificates_only` builds one.
+//
+// ## The line endings
+//
+// For a **detached S/MIME** signature the content that was hashed is not the
+// file on disk. S/MIME canonicalises text to CRLF before signing, so a
+// message stored with Unix line endings hashes to something else entirely and
+// `digest_matches` says no for a signature that is perfectly good. The fix is
+// to canonicalise before asking, and the reason it is worth saying out loud
+// is that the failure looks exactly like a forged document.
+//
+// ## What is not here
+//
+// Signature verification itself, which needs the signer's public key and the
+// algorithm's own package. Everything needed for it is exposed:
+// `signed_bytes` for what to verify, `signature`, and the certificates.
+//
+// Checked against S/MIME signatures and certificate bundles OpenSSL produced,
+// including the digest of the content matching the `messageDigest` attribute
+// and the retagged attribute set matching what OpenSSL signs.
+
+import asn1
+import derwrite
+import crypto_hash
+import sha512
+
+type Pkcs7Signer = {
+    issuer: [(str, str)],
+    /// Uppercase hex.
+    serial: str,
+    /// A `[0]` subjectKeyIdentifier, when that is how the signer was named.
+    key_identifier: bytes,
+    digest_algorithm: str,
+    signature_algorithm: str,
+    signature: bytes,
+    /// The signed attributes as they appear, tag and all, or empty.
+    signed_attrs_der: bytes,
+    /// The `contentType` attribute, which must match the encapsulated one.
+    attr_content_type: str,
+    /// The `messageDigest` attribute: the hash of the content.
+    message_digest: bytes,
+    signing_time: i64,
+}
+
+type Pkcs7Info = {
+    version: i64,
+    /// The outer ContentInfo type; `1.2.840.113549.1.7.2` for SignedData.
+    outer_type: str,
+    /// The encapsulated content type; `1.2.840.113549.1.7.1` is plain data.
+    content_type: str,
+    content: bytes,
+    /// True when there is no content inside and a verifier must supply it.
+    detached: bool,
+    digest_algorithms: [str],
+    certificates: [bytes],
+    crls: [bytes],
+    signers: [Pkcs7Signer],
+    /// No signers and no content: a certificate bundle.
+    certificates_only: bool,
+}
+
+type Pkcs7Error =
+    | NotDer()
+    | NotSignedData()
+    | Malformed()
+    | UnknownDigest(oid: str)
+
+pub fn signed_data_oid() -> str {
+    return "1.2.840.113549.1.7.2"
+}
+
+pub fn data_oid() -> str {
+    return "1.2.840.113549.1.7.1"
+}
+
+pub fn content_type_attr_oid() -> str {
+    return "1.2.840.113549.1.9.3"
+}
+
+pub fn message_digest_attr_oid() -> str {
+    return "1.2.840.113549.1.9.4"
+}
+
+pub fn signing_time_attr_oid() -> str {
+    return "1.2.840.113549.1.9.5"
+}
+
+pub fn empty() -> Pkcs7Info {
+    return Pkcs7Info{ version: 0, outer_type: "", content_type: "",
+        content: bytes_of([]), detached: true, digest_algorithms: [],
+        certificates: [], crls: [], signers: [], certificates_only: false }
+}
+
+fn hex_of(raw: bytes) -> str {
+    let digits = "0123456789ABCDEF"
+    var out = ""
+    for b in raw.to_list() {
+        out = out + digits.substr(b.ushr(4), 1) + digits.substr(b.bit_and(15), 1)
+    }
+    return out
+}
+
+fn serial_hex(raw: bytes) -> str {
+    var at = 0
+    while at + 1 < raw.len() and raw.at(at) == 0 {
+        at = at + 1
+    }
+    if raw.len() == 0 {
+        return "00"
+    }
+    return hex_of(raw.slice(at, raw.len()))
+}
+
+pub fn hex(data: bytes) -> str {
+    return hex_of(data)
+}
+
+// -------------------------------------------------------------- reading
+
+pub fn parse(der: bytes) -> Pkcs7Info ! Pkcs7Error {
+    let nodes = asn1.parse(der) ?? []
+    if nodes.len() == 0 {
+        fail(NotDer())
+    }
+    let top = asn1.child_indices(nodes, 0)
+    if top.len() < 1 {
+        fail(NotSignedData())
+    }
+    var out = empty()
+    out.outer_type = asn1.oid_of(der, nodes[top[0]])
+    if out.outer_type != signed_data_oid() {
+        fail(NotSignedData())
+    }
+    if top.len() < 2 {
+        fail(NotSignedData())
+    }
+    let holder = asn1.child_indices(nodes, top[1])
+    if holder.len() == 0 {
+        fail(NotSignedData())
+    }
+    let fields = asn1.child_indices(nodes, holder[0])
+    if fields.len() < 4 {
+        fail(Malformed())
+    }
+    out.version = asn1.integer_of(der, nodes[fields[0]])
+    for alg in asn1.child_indices(nodes, fields[1]) {
+        let parts = asn1.child_indices(nodes, alg)
+        if parts.len() > 0 {
+            out.digest_algorithms.push(asn1.oid_of(der, nodes[parts[0]]))
+        }
+    }
+
+    let encap = asn1.child_indices(nodes, fields[2])
+    if encap.len() > 0 {
+        out.content_type = asn1.oid_of(der, nodes[encap[0]])
+    }
+    if encap.len() > 1 {
+        for inner in asn1.child_indices(nodes, encap[1]) {
+            out.content = asn1.value(der, nodes[inner])
+            out.detached = false
+        }
+    }
+
+    var i = 3
+    while i < fields.len() {
+        let tag = nodes[fields[i]].tag
+        if tag == 0xA0 {
+            for certificate in asn1.child_indices(nodes, fields[i]) {
+                out.certificates.push(asn1.raw(der, nodes[certificate]))
+            }
+        }
+        if tag == 0xA1 {
+            for list in asn1.child_indices(nodes, fields[i]) {
+                out.crls.push(asn1.raw(der, nodes[list]))
+            }
+        }
+        if tag == asn1.SET {
+            for signer in asn1.child_indices(nodes, fields[i]) {
+                out.signers.push(read_signer(der, nodes, signer))
+            }
+        }
+        i = i + 1
+    }
+    out.certificates_only = out.signers.len() == 0 and out.detached
+    return out
+}
+
+fn read_signer(der: bytes, nodes: [DerNode], at: i64) -> Pkcs7Signer {
+    var out = Pkcs7Signer{ issuer: [], serial: "",
+        key_identifier: bytes_of([]), digest_algorithm: "",
+        signature_algorithm: "", signature: bytes_of([]),
+        signed_attrs_der: bytes_of([]), attr_content_type: "",
+        message_digest: bytes_of([]), signing_time: 0 }
+    let fields = asn1.child_indices(nodes, at)
+    if fields.len() < 5 {
+        return out
+    }
+    // The signer is named either by issuer and serial or by key identifier.
+    if nodes[fields[1]].tag == asn1.SEQUENCE {
+        let pair = asn1.child_indices(nodes, fields[1])
+        if pair.len() == 2 {
+            for rdn in asn1.child_indices(nodes, pair[0]) {
+                for entry in asn1.child_indices(nodes, rdn) {
+                    let parts = asn1.child_indices(nodes, entry)
+                    if parts.len() == 2 {
+                        out.issuer.push((asn1.oid_of(der, nodes[parts[0]]),
+                            asn1.text_of(der, nodes[parts[1]])))
+                    }
+                }
+            }
+            out.serial = serial_hex(asn1.value(der, nodes[pair[1]]))
+        }
+    } else {
+        out.key_identifier = asn1.value(der, nodes[fields[1]])
+    }
+
+    let digest = asn1.child_indices(nodes, fields[2])
+    if digest.len() > 0 {
+        out.digest_algorithm = asn1.oid_of(der, nodes[digest[0]])
+    }
+
+    var i = 3
+    while i < fields.len() {
+        let tag = nodes[fields[i]].tag
+        if tag == 0xA0 {
+            out.signed_attrs_der = asn1.raw(der, nodes[fields[i]])
+            read_attributes(der, nodes, fields[i], out)
+        }
+        if tag == asn1.SEQUENCE {
+            let alg = asn1.child_indices(nodes, fields[i])
+            if alg.len() > 0 and out.signature_algorithm == "" {
+                out.signature_algorithm = asn1.oid_of(der, nodes[alg[0]])
+            }
+        }
+        if tag == asn1.OCTET_STRING {
+            out.signature = asn1.value(der, nodes[fields[i]])
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn read_attributes(der: bytes, nodes: [DerNode], at: i64,
+    inout out: Pkcs7Signer) {
+    for attribute in asn1.child_indices(nodes, at) {
+        let parts = asn1.child_indices(nodes, attribute)
+        if parts.len() != 2 {
+            continue
+        }
+        let oid = asn1.oid_of(der, nodes[parts[0]])
+        for value in asn1.child_indices(nodes, parts[1]) {
+            if oid == content_type_attr_oid() {
+                out.attr_content_type = asn1.oid_of(der, nodes[value])
+            }
+            if oid == message_digest_attr_oid() {
+                out.message_digest = asn1.value(der, nodes[value])
+            }
+            if oid == signing_time_attr_oid() {
+                out.signing_time = asn1.time_of(der, nodes[value]) ?? 0
+            }
+        }
+    }
+}
+
+// ------------------------------------------------------------ verifying
+
+/// The bytes a SignerInfo's signature actually covers.
+///
+/// The stored field is `[0] IMPLICIT SET OF Attribute`, tag `A0`. What is
+/// signed is the same contents under the universal SET tag, `31`. Nothing
+/// else changes — not the length, not one content octet — so the difference
+/// is one byte, and it is the difference between a signature that verifies
+/// and one that never does.
+///
+/// With no signed attributes the signature is over the content itself, and
+/// this returns empty so a caller has to decide which case it is in rather
+/// than being handed something plausible.
+pub fn signed_bytes(signer: Pkcs7Signer) -> bytes {
+    if signer.signed_attrs_der.len() == 0 {
+        return bytes_of([])
+    }
+    var out = signer.signed_attrs_der.to_list()
+    out[0] = asn1.SET
+    return bytes_of(out)
+}
+
+fn digest_of(algorithm: str, data: bytes) -> bytes ! Pkcs7Error {
+    if algorithm == "2.16.840.1.101.3.4.2.1" {
+        return crypto_hash.sha256_of(data)
+    }
+    if algorithm == "2.16.840.1.101.3.4.2.3" {
+        return sha512.sha512(data)
+    }
+    if algorithm == "2.16.840.1.101.3.4.2.2" {
+        return sha512.sha384(data)
+    }
+    fail(UnknownDigest(algorithm))
+}
+
+/// Whether the `messageDigest` attribute is the hash of this content.
+///
+/// This is the half of verification that binds the signature to the document.
+/// A caller that checks the signature and not this has checked that somebody
+/// signed *something*.
+pub fn digest_matches(signer: Pkcs7Signer, content: bytes) -> bool {
+    if signer.message_digest.len() == 0 {
+        return false
+    }
+    let want: bytes ! Pkcs7Error = digest_of(signer.digest_algorithm, content)
+    let got = want ?? bytes_of([])
+    if got.len() == 0 {
+        return false
+    }
+    return crypto_hash.equal_constant_time(got, signer.message_digest)
+}
+
+/// Whether the signer's `contentType` attribute agrees with the encapsulated
+/// one.
+///
+/// RFC 5652 requires the match. Where they differ, a signature made over one
+/// kind of document is being presented as covering another.
+pub fn content_type_agrees(info: Pkcs7Info, signer: Pkcs7Signer) -> bool {
+    if signer.signed_attrs_der.len() == 0 {
+        return true
+    }
+    return signer.attr_content_type == info.content_type
+}
+
+/// The issuer as one line, in OpenSSL's spelling.
+pub fn issuer_text(signer: Pkcs7Signer) -> str {
+    var parts: [str] = []
+    for pair in signer.issuer {
+        parts.push(short_name(pair.0) + "=" + pair.1)
+    }
+    return parts.join(", ")
+}
+
+fn short_name(oid: str) -> str {
+    if oid == "2.5.4.3" {
+        return "CN"
+    }
+    if oid == "2.5.4.6" {
+        return "C"
+    }
+    if oid == "2.5.4.10" {
+        return "O"
+    }
+    if oid == "2.5.4.11" {
+        return "OU"
+    }
+    return oid
+}
+
+// ------------------------------------------------------------- building
+
+/// A certificates-only SignedData — a `.p7b` bundle.
+///
+/// Version 1, no digest algorithms, no content, no signers. It is a signature
+/// format carrying no signature, which is odd and is what the format is used
+/// for: one file holding a chain, in an encoding every tool already reads.
+pub fn certificates_only_bundle(certificates: [bytes]) -> bytes ! Pkcs7Error {
+    let version = derwrite.integer(1) ?? bytes_of([])
+    let digests = derwrite.set_in_order([]) ?? bytes_of([])
+    let oid = derwrite.oid(data_oid()) ?? bytes_of([])
+    let encap = derwrite.sequence([oid]) ?? bytes_of([])
+    var body = bytes_of([])
+    for c in certificates {
+        body = body.concat(c)
+    }
+    let certs = derwrite.tlv(0xA0, body) ?? bytes_of([])
+    let signers = derwrite.set_in_order([]) ?? bytes_of([])
+    let parts = [version, digests, encap, certs, signers]
+    let signed = derwrite.sequence(parts) ?? bytes_of([])
+    let outer_oid = derwrite.oid(signed_data_oid()) ?? bytes_of([])
+    let wrapped = derwrite.explicit(0, signed) ?? bytes_of([])
+    return derwrite.sequence([outer_oid, wrapped]) ?? bytes_of([])
+}

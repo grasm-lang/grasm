@@ -1,0 +1,357 @@
+// PKCS#10 certificate requests, RFC 2986 — building one and reading one.
+//
+// A CSR is a subject, a public key, and a promise: the signature over the two
+// proves the requester holds the private key for the key they are asking a CA
+// to certify. That proof is the whole reason the format has a signature at
+// all — nothing else in it is secret, and a CA that skips the check will
+// happily certify somebody else's key to your name.
+//
+// ## What actually names the certificate
+//
+// Not the common name. Every browser since 2017 ignores CN entirely and reads
+// the subjectAltName extension, so a CSR with `CN=example.com` and no SAN
+// produces a certificate no browser accepts. The names go in a
+// **extensionRequest attribute** — a CSR has no extensions field of its own,
+// so the extensions travel inside an attribute whose value is the extension
+// list a certificate would carry. `build` puts them there and `names` reads
+// them from there, and `common_name` exists to be compared against them.
+//
+// ## Signing
+//
+// `sign_ed25519` completes a request from a seed. Ed25519 because it is the
+// one signature this project can produce — the RSA and ECDSA support here
+// verifies and does not sign, so a request for one of those has to be signed
+// by whatever holds the key and assembled with `assemble`.
+//
+// Checked against OpenSSL both ways: every request this builds is one
+// `openssl req -verify` accepts, and OpenSSL's own requests parse here to the
+// subject, key and names OpenSSL prints.
+
+import asn1
+import derwrite
+import ed25519
+import pkcs8
+
+type CsrInfo = {
+    /// Attribute OID and value, in the order written.
+    subject: [(str, str)],
+    /// The subject Name as it was encoded, which is what a CA copies.
+    subject_der: bytes,
+    /// The SubjectPublicKeyInfo, whole.
+    spki: bytes,
+    /// The signature algorithm OID.
+    signature_algorithm: str,
+    signature: bytes,
+    /// The CertificationRequestInfo as encoded — the bytes the signature
+    /// covers, taken from the document rather than rebuilt.
+    info_der: bytes,
+    /// dNSName entries from the subjectAltName in the extension request.
+    dns_names: [str],
+    ip_addresses: [str],
+    email_addresses: [str],
+}
+
+type CsrError =
+    | NotDer()
+    | NotARequest()
+    | UnsupportedVersion(version: i64)
+    | NoSuchAlgorithm(oid: str)
+    | BadSeedLength(len: i64)
+
+pub fn extension_request_oid() -> str {
+    return "1.2.840.113549.1.9.14"
+}
+
+pub fn subject_alt_name_oid() -> str {
+    return "2.5.29.17"
+}
+
+pub fn empty() -> CsrInfo {
+    return CsrInfo{ subject: [], subject_der: bytes_of([]),
+        spki: bytes_of([]), signature_algorithm: "", signature: bytes_of([]),
+        info_der: bytes_of([]), dns_names: [], ip_addresses: [],
+        email_addresses: [] }
+}
+
+// ------------------------------------------------------------- building
+
+/// The subjectAltName extension for a list of DNS names.
+///
+/// A dNSName is `[2] IMPLICIT IA5String` inside a GeneralNames SEQUENCE, and
+/// the whole thing is wrapped in an OCTET STRING because that is what an
+/// extension value is — DER inside an opaque string, so a reader that does
+/// not know the extension can still skip it.
+pub fn san_extension(dns_names: [str]) -> bytes ! CsrError {
+    var entries: [bytes] = []
+    for name in dns_names {
+        let ia5 = derwrite.ia5_string(name) ?? bytes_of([])
+        entries.push(derwrite.implicit(2, ia5) ?? bytes_of([]))
+    }
+    let names = derwrite.sequence(entries) ?? bytes_of([])
+    let wrapped = derwrite.octet_string(names) ?? bytes_of([])
+    let oid = derwrite.oid(subject_alt_name_oid()) ?? bytes_of([])
+    return derwrite.sequence([oid, wrapped]) ?? bytes_of([])
+}
+
+/// The `[0]` attributes field: an extensionRequest holding the extensions.
+///
+/// With no extensions the field is still written, empty. It is not optional —
+/// `[0] IMPLICIT SET OF Attribute` with nothing in it is a zero-length set,
+/// and leaving the field out entirely produces a request some parsers accept
+/// and OpenSSL does not.
+pub fn attributes(extensions: [bytes]) -> bytes ! CsrError {
+    if extensions.len() == 0 {
+        return derwrite.implicit(0, derwrite.set_in_order([])
+            ?? bytes_of([])) ?? bytes_of([])
+    }
+    let list = derwrite.sequence(extensions) ?? bytes_of([])
+    let oid = derwrite.oid(extension_request_oid()) ?? bytes_of([])
+    let value = derwrite.set_in_order([list]) ?? bytes_of([])
+    let attribute = derwrite.sequence([oid, value]) ?? bytes_of([])
+    let set = derwrite.set_in_order([attribute]) ?? bytes_of([])
+    return derwrite.implicit(0, set) ?? bytes_of([])
+}
+
+/// The CertificationRequestInfo — everything the signature covers.
+pub fn build_info(subject: [(str, str)], spki: bytes,
+    dns_names: [str]) -> bytes ! CsrError {
+    let version = derwrite.integer(0) ?? bytes_of([])
+    let name = derwrite.name_of(subject) ?? bytes_of([])
+    var extensions: [bytes] = []
+    if dns_names.len() > 0 {
+        extensions.push(try san_extension(dns_names))
+    }
+    let attrs = try attributes(extensions)
+    return derwrite.sequence([version, name, spki, attrs]) ?? bytes_of([])
+}
+
+/// A request from an info block, an algorithm and a signature over it.
+pub fn assemble(info: bytes, algorithm: bytes,
+    signature: bytes) -> bytes ! CsrError {
+    let bits = derwrite.bit_string(signature, 0) ?? bytes_of([])
+    return derwrite.sequence([info, algorithm, bits]) ?? bytes_of([])
+}
+
+/// A complete Ed25519 request from a seed.
+///
+/// The public key is derived rather than taken as an argument, because a
+/// request whose subjectPKInfo does not match the key that signed it is a
+/// request that will be rejected — and deriving it is the only way to be sure
+/// they match.
+pub fn sign_ed25519(seed: bytes, subject: [(str, str)],
+    dns_names: [str]) -> bytes ! CsrError {
+    if seed.len() != 32 {
+        fail(BadSeedLength(seed.len()))
+    }
+    let public = ed25519.public_key(seed) ?? bytes_of([])
+    let spki = pkcs8.ed25519_spki(public) ?? bytes_of([])
+    let info = try build_info(subject, spki, dns_names)
+    let signature = ed25519.sign(seed, info) ?? bytes_of([])
+    let alg = derwrite.algorithm(pkcs8.ed25519_oid()) ?? bytes_of([])
+    return try assemble(info, alg, signature)
+}
+
+// -------------------------------------------------------------- reading
+
+fn attribute_name(oid: str) -> str {
+    if oid == "2.5.4.3" {
+        return "CN"
+    }
+    if oid == "2.5.4.6" {
+        return "C"
+    }
+    if oid == "2.5.4.7" {
+        return "L"
+    }
+    if oid == "2.5.4.8" {
+        return "ST"
+    }
+    if oid == "2.5.4.10" {
+        return "O"
+    }
+    if oid == "2.5.4.11" {
+        return "OU"
+    }
+    if oid == "1.2.840.113549.1.9.1" {
+        return "emailAddress"
+    }
+    return oid
+}
+
+pub fn parse(der: bytes) -> CsrInfo ! CsrError {
+    let nodes = asn1.parse(der) ?? []
+    if nodes.len() == 0 {
+        fail(NotDer())
+    }
+    let top = asn1.child_indices(nodes, 0)
+    if top.len() != 3 {
+        fail(NotARequest())
+    }
+    let info_kids = asn1.child_indices(nodes, top[0])
+    if info_kids.len() < 3 {
+        fail(NotARequest())
+    }
+    let version = asn1.integer_of(der, nodes[info_kids[0]])
+    if version != 0 {
+        fail(UnsupportedVersion(version))
+    }
+
+    var out = empty()
+    out.info_der = asn1.raw(der, nodes[top[0]])
+    out.subject_der = asn1.raw(der, nodes[info_kids[1]])
+    out.spki = asn1.raw(der, nodes[info_kids[2]])
+
+    let alg_kids = asn1.child_indices(nodes, top[1])
+    if alg_kids.len() > 0 {
+        out.signature_algorithm = asn1.oid_of(der, nodes[alg_kids[0]])
+    }
+    let sig_bits = asn1.value(der, nodes[top[2]])
+    if sig_bits.len() > 1 {
+        out.signature = sig_bits.slice(1, sig_bits.len())
+    }
+
+    // The subject: a SEQUENCE of SETs of one attribute each.
+    for rdn in asn1.child_indices(nodes, info_kids[1]) {
+        for pair in asn1.child_indices(nodes, rdn) {
+            let parts = asn1.child_indices(nodes, pair)
+            if parts.len() == 2 {
+                out.subject.push((asn1.oid_of(der, nodes[parts[0]]),
+                    asn1.text_of(der, nodes[parts[1]])))
+            }
+        }
+    }
+
+    if info_kids.len() > 3 {
+        read_attributes(der, nodes, info_kids[3], out)
+    }
+    return out
+}
+
+/// Walk the attributes for an extensionRequest and pull the names out of it.
+fn read_attributes(der: bytes, nodes: [DerNode], at: i64, inout out: CsrInfo) {
+    for attribute in asn1.child_indices(nodes, at) {
+        let parts = asn1.child_indices(nodes, attribute)
+        if parts.len() != 2 {
+            continue
+        }
+        if asn1.oid_of(der, nodes[parts[0]]) != extension_request_oid() {
+            continue
+        }
+        for list in asn1.child_indices(nodes, parts[1]) {
+            for extension in asn1.child_indices(nodes, list) {
+                read_extension(der, nodes, extension, out)
+            }
+        }
+    }
+}
+
+fn read_extension(der: bytes, nodes: [DerNode], at: i64, inout out: CsrInfo) {
+    let parts = asn1.child_indices(nodes, at)
+    if parts.len() < 2 {
+        return
+    }
+    if asn1.oid_of(der, nodes[parts[0]]) != subject_alt_name_oid() {
+        return
+    }
+    // The extension value is an OCTET STRING holding more DER, so it is
+    // parsed a second time rather than walked from here.
+    let last = parts[parts.len() - 1]
+    let inner = asn1.value(der, nodes[last])
+    let names = asn1.parse(inner) ?? []
+    if names.len() == 0 {
+        return
+    }
+    for entry in asn1.child_indices(names, 0) {
+        let tag = names[entry].tag
+        let text = asn1.value(inner, names[entry])
+        if tag == 0x82 {
+            out.dns_names.push(text.to_str())
+        }
+        if tag == 0x81 {
+            out.email_addresses.push(text.to_str())
+        }
+        if tag == 0x87 {
+            out.ip_addresses.push(dotted(text))
+        }
+    }
+}
+
+fn dotted(raw_ip: bytes) -> str {
+    var parts: [str] = []
+    for b in raw_ip.to_list() {
+        parts.push("{b}")
+    }
+    return parts.join(".")
+}
+
+// ------------------------------------------------------------ checking
+
+/// Whether the request's signature is the key's over the info block.
+///
+/// Only Ed25519 is checked here, and an unknown algorithm is `false` rather
+/// than an error: a caller asking "is this request self-signed" wants one
+/// answer, and "I cannot tell" is not a reason to treat it as signed.
+pub fn verify(request: CsrInfo) -> bool {
+    if request.signature_algorithm != pkcs8.ed25519_oid() {
+        return false
+    }
+    let key = pkcs8.spki_key(request.spki) ?? bytes_of([])
+    if key.len() != 32 {
+        return false
+    }
+    return ed25519.verify(key, request.info_der, request.signature)
+}
+
+pub fn common_name(request: CsrInfo) -> str {
+    for pair in request.subject {
+        if pair.0 == "2.5.4.3" {
+            return pair.1
+        }
+    }
+    return ""
+}
+
+/// The names the certificate would actually be trusted for.
+///
+/// The common name is included only when it is not already in the SAN list,
+/// and it comes last, because that is the order of decreasing authority — a
+/// CN a browser will ignore should not be the first answer.
+pub fn names(request: CsrInfo) -> [str] {
+    var out: [str] = []
+    for name in request.dns_names {
+        out.push(name)
+    }
+    let cn = common_name(request)
+    if cn != "" and not out.contains(cn) {
+        out.push(cn)
+    }
+    return out
+}
+
+/// A one-line description of the subject, in OpenSSL's order and spelling.
+pub fn subject_text(request: CsrInfo) -> str {
+    var parts: [str] = []
+    for pair in request.subject {
+        parts.push(attribute_name(pair.0) + "=" + pair.1)
+    }
+    return parts.join(", ")
+}
+
+/// Whether a request asks for a name a CA should refuse without asking twice.
+///
+/// A wildcard covering a public suffix, or a name with no dot at all, is
+/// almost always a mistake rather than a request — and the CA that issues it
+/// finds out afterwards.
+pub fn suspicious_names(request: CsrInfo) -> [str] {
+    var out: [str] = []
+    for name in names(request) {
+        if not name.contains(".") {
+            out.push(name)
+            continue
+        }
+        if name.starts_with("*.") and name.split(".").len() < 3 {
+            out.push(name)
+        }
+    }
+    return out
+}

@@ -1,0 +1,14 @@
+[package]
+name = "pkcs8"
+version = "1.0.0"
+
+# Parsing and building bytes. Opens nothing.
+capabilities = []
+
+[dependencies.asn1]
+path = "../asn1"
+version = "^1.0.0"
+
+[dependencies.derwrite]
+path = "../derwrite"
+version = "^1.0.0"

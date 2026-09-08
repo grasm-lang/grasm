@@ -1,0 +1,22 @@
+[package]
+name = "pkcs7"
+version = "1.0.0"
+
+# Reading and building bytes. Opens nothing.
+capabilities = []
+
+[dependencies.asn1]
+path = "../asn1"
+version = "^1.0.0"
+
+[dependencies.derwrite]
+path = "../derwrite"
+version = "^1.0.0"
+
+[dependencies.crypto_hash]
+path = "../crypto_hash"
+version = "^1.0.0"
+
+[dependencies.sha512]
+path = "../sha512"
+version = "^1.0.0"

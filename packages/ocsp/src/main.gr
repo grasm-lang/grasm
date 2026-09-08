@@ -1,0 +1,487 @@
+// OCSP, RFC 6960 — asking an issuer about one certificate instead of
+// downloading every revocation it has ever made.
+//
+// A CRL for a large CA is megabytes and a client wants to know about one
+// serial. OCSP is that question and its signed answer.
+//
+// ## What names the certificate in the question
+//
+// Not the certificate. A CertID is the hash of the issuer's **name**, the
+// hash of the issuer's **public key**, and the serial. Hashing the name alone
+// would let one issuer answer for another with the same name; hashing the key
+// alone would not distinguish two certificates that share it. Both, plus the
+// serial, name a certificate uniquely without carrying it.
+//
+// The hash is SHA-1 by default, and this is one of the few places where that
+// is not a defect: the algorithm identifies rather than authenticates, and a
+// collision would have to be between two issuer names an attacker also
+// controls certificates under. RFC 6960 permits SHA-256 and a responder may
+// not implement it, which is why `certid` takes the algorithm.
+//
+// ## What a client must not do with the answer
+//
+// **Treat "unknown" as good.** A responder that has never heard of a serial
+// is not saying the certificate is fine; for a CA that issues everything it
+// knows about, "unknown" means the certificate was not issued by it at all.
+//
+// **Skip `nextUpdate`.** A signed "good" from last year is still correctly
+// signed, and replaying it is the cheapest attack on OCSP there is. So is
+// skipping the nonce: `nonce_of` reads it back so a caller that sent one can
+// check the response answers *this* question.
+//
+// This package builds requests and reads responses. It does not verify the
+// responder's signature — that needs the responder's certificate, its
+// delegation from the issuer, and a policy about which delegations to accept,
+// which is a chain-building problem and `certchain`'s. `signature` and
+// `tbs_der` are exposed so a caller can do it.
+//
+// Checked against requests and responses OpenSSL generated, field for field,
+// including the revoked case with its reason and the nonce extension.
+
+import asn1
+import derwrite
+import sha1
+import crypto_hash
+
+/// The three response statuses a client acts on.
+pub let GOOD = 0
+pub let REVOKED = 1
+pub let UNKNOWN = 2
+
+type OcspCertId = {
+    hash_algorithm: str,
+    issuer_name_hash: bytes,
+    issuer_key_hash: bytes,
+    /// Uppercase hex, as `crl` spells it.
+    serial: str,
+}
+
+type OcspSingle = {
+    id: OcspCertId,
+    /// `GOOD`, `REVOKED` or `UNKNOWN`.
+    status: i64,
+    revoked_at: i64,
+    /// The revocation reason, or -1.
+    reason: i64,
+    this_update: i64,
+    /// 0 when the responder gave none, which is a response a client should
+    /// not cache.
+    next_update: i64,
+}
+
+type OcspResponse = {
+    /// 0 is `successful`; the rest are refusals, not answers.
+    response_status: i64,
+    response_type: str,
+    produced_at: i64,
+    /// The responder's name, when it identified itself by name.
+    responder_name: [(str, str)],
+    /// The responder's key hash, when it identified itself by key.
+    responder_key_hash: bytes,
+    singles: [OcspSingle],
+    signature_algorithm: str,
+    signature: bytes,
+    tbs_der: bytes,
+    /// Certificates the responder attached, DER, in order.
+    certificates: [bytes],
+    nonce: bytes,
+}
+
+type OcspError =
+    | NotDer()
+    | NotAResponse()
+    | NotARequest()
+    | UnknownHash(oid: str)
+    | Malformed()
+
+pub fn sha1_oid() -> str {
+    return "1.3.14.3.2.26"
+}
+
+pub fn sha256_oid() -> str {
+    return "2.16.840.1.101.3.4.2.1"
+}
+
+pub fn basic_response_oid() -> str {
+    return "1.3.6.1.5.5.7.48.1.1"
+}
+
+pub fn nonce_oid() -> str {
+    return "1.3.6.1.5.5.7.48.1.2"
+}
+
+pub fn status_name(status: i64) -> str {
+    if status == GOOD {
+        return "good"
+    }
+    if status == REVOKED {
+        return "revoked"
+    }
+    return "unknown"
+}
+
+/// RFC 6960's response statuses, which are about the *request* rather than
+/// the certificate.
+pub fn response_status_name(status: i64) -> str {
+    let names = ["successful", "malformedRequest", "internalError", "tryLater",
+        "", "sigRequired", "unauthorized"]
+    if status < 0 or status >= names.len() or names[status] == "" {
+        return "unassigned"
+    }
+    return names[status]
+}
+
+pub fn empty_response() -> OcspResponse {
+    return OcspResponse{ response_status: 0 - 1, response_type: "",
+        produced_at: 0, responder_name: [], responder_key_hash: bytes_of([]),
+        singles: [], signature_algorithm: "", signature: bytes_of([]),
+        tbs_der: bytes_of([]), certificates: [], nonce: bytes_of([]) }
+}
+
+fn hex_of(raw: bytes) -> str {
+    let digits = "0123456789ABCDEF"
+    var out = ""
+    for b in raw.to_list() {
+        out = out + digits.substr(b.ushr(4), 1) + digits.substr(b.bit_and(15), 1)
+    }
+    return out
+}
+
+fn serial_hex(raw: bytes) -> str {
+    var at = 0
+    while at + 1 < raw.len() and raw.at(at) == 0 {
+        at = at + 1
+    }
+    if raw.len() == 0 {
+        return "00"
+    }
+    return hex_of(raw.slice(at, raw.len()))
+}
+
+// ------------------------------------------------------------ building
+
+fn digest(algorithm: str, data: bytes) -> bytes ! OcspError {
+    if algorithm == sha1_oid() {
+        return sha1.hash(data)
+    }
+    if algorithm == sha256_oid() {
+        return crypto_hash.sha256_of(data)
+    }
+    fail(UnknownHash(algorithm))
+}
+
+/// A CertID from the issuer's own bytes.
+///
+/// `issuer_name_der` is the issuer's Name exactly as it appears in the
+/// certificate being asked about — its *issuer* field, not the issuer
+/// certificate's subject re-encoded. The two are usually the same bytes and
+/// occasionally are not, and when they differ it is the certificate's copy
+/// the responder hashed.
+///
+/// `issuer_spki` is the issuer's SubjectPublicKeyInfo; the hash is over the
+/// public key BIT STRING's contents, without the unused-bits octet.
+pub fn certid(algorithm: str, issuer_name_der: bytes, issuer_spki: bytes,
+    serial: bytes) -> OcspCertId ! OcspError {
+    let key = try spki_bits(issuer_spki)
+    return OcspCertId{
+        hash_algorithm: algorithm,
+        issuer_name_hash: try digest(algorithm, issuer_name_der),
+        issuer_key_hash: try digest(algorithm, key),
+        serial: serial_hex(serial),
+    }
+}
+
+fn spki_bits(spki: bytes) -> bytes ! OcspError {
+    let nodes = asn1.parse(spki) ?? []
+    if nodes.len() == 0 {
+        fail(NotDer())
+    }
+    let kids = asn1.child_indices(nodes, 0)
+    if kids.len() != 2 or nodes[kids[1]].tag != asn1.BIT_STRING {
+        fail(Malformed())
+    }
+    let bits = asn1.value(spki, nodes[kids[1]])
+    if bits.len() < 1 {
+        fail(Malformed())
+    }
+    return bits.slice(1, bits.len())
+}
+
+fn certid_der(id: OcspCertId, serial_raw: bytes) -> bytes ! OcspError {
+    // SHA-1's AlgorithmIdentifier carries an explicit NULL; leaving it out
+    // gives a CertID a responder will not match against its own.
+    let alg = derwrite.algorithm_with_null(id.hash_algorithm) ?? bytes_of([])
+    let name = derwrite.octet_string(id.issuer_name_hash) ?? bytes_of([])
+    let key = derwrite.octet_string(id.issuer_key_hash) ?? bytes_of([])
+    let serial = derwrite.integer_unsigned(serial_raw) ?? bytes_of([])
+    return derwrite.sequence([alg, name, key, serial]) ?? bytes_of([])
+}
+
+/// An OCSPRequest for one certificate, with an optional nonce.
+///
+/// The nonce binds the answer to the question. Without one, a response is a
+/// standalone signed document an attacker can hold on to and replay for as
+/// long as its `nextUpdate` allows — and many responders sign week-long
+/// answers.
+pub fn build_request(algorithm: str, issuer_name_der: bytes,
+    issuer_spki: bytes, serial: bytes, nonce: bytes) -> bytes ! OcspError {
+    let id = try certid(algorithm, issuer_name_der, issuer_spki, serial)
+    let one = try certid_der(id, serial)
+    let single = derwrite.sequence([one]) ?? bytes_of([])
+    let list = derwrite.sequence([single]) ?? bytes_of([])
+    var fields = [list]
+    if nonce.len() > 0 {
+        let value = derwrite.octet_string(nonce) ?? bytes_of([])
+        let wrapped = derwrite.octet_string(value) ?? bytes_of([])
+        let oid = derwrite.oid(nonce_oid()) ?? bytes_of([])
+        let extension = derwrite.sequence([oid, wrapped]) ?? bytes_of([])
+        let extensions = derwrite.sequence([extension]) ?? bytes_of([])
+        fields.push(derwrite.explicit(2, extensions) ?? bytes_of([]))
+    }
+    let tbs = derwrite.sequence(fields) ?? bytes_of([])
+    return derwrite.sequence([tbs]) ?? bytes_of([])
+}
+
+// -------------------------------------------------------------- reading
+
+pub fn parse_response(der: bytes) -> OcspResponse ! OcspError {
+    let nodes = asn1.parse(der) ?? []
+    if nodes.len() == 0 {
+        fail(NotDer())
+    }
+    let top = asn1.child_indices(nodes, 0)
+    if top.len() == 0 {
+        fail(NotAResponse())
+    }
+    var out = empty_response()
+    // The status is an ENUMERATED, tag 10 — not an INTEGER.
+    if nodes[top[0]].tag != 10 {
+        fail(NotAResponse())
+    }
+    out.response_status = asn1.integer_of(der, nodes[top[0]])
+    if top.len() < 2 {
+        // A refusal carries no bytes, and that is a complete response.
+        return out
+    }
+    let holder = asn1.child_indices(nodes, top[1])
+    if holder.len() == 0 {
+        fail(NotAResponse())
+    }
+    let parts = asn1.child_indices(nodes, holder[0])
+    if parts.len() < 2 {
+        fail(NotAResponse())
+    }
+    out.response_type = asn1.oid_of(der, nodes[parts[0]])
+    if out.response_type != basic_response_oid() {
+        return out
+    }
+    let inner = asn1.value(der, nodes[parts[1]])
+    read_basic(inner, out)
+    return out
+}
+
+fn read_basic(der: bytes, inout out: OcspResponse) {
+    let nodes = asn1.parse(der) ?? []
+    if nodes.len() == 0 {
+        return
+    }
+    let top = asn1.child_indices(nodes, 0)
+    if top.len() < 3 {
+        return
+    }
+    out.tbs_der = asn1.raw(der, nodes[top[0]])
+    let alg = asn1.child_indices(nodes, top[1])
+    if alg.len() > 0 {
+        out.signature_algorithm = asn1.oid_of(der, nodes[alg[0]])
+    }
+    let bits = asn1.value(der, nodes[top[2]])
+    if bits.len() > 1 {
+        out.signature = bits.slice(1, bits.len())
+    }
+    if top.len() > 3 {
+        for list in asn1.child_indices(nodes, top[3]) {
+            for certificate in asn1.child_indices(nodes, list) {
+                out.certificates.push(asn1.raw(der, nodes[certificate]))
+            }
+        }
+    }
+    read_response_data(der, nodes, top[0], out)
+}
+
+fn read_response_data(der: bytes, nodes: [DerNode], at: i64,
+    inout out: OcspResponse) {
+    let fields = asn1.child_indices(nodes, at)
+    var i = 0
+    while i < fields.len() {
+        let tag = nodes[fields[i]].tag
+        if tag == 0xA0 {
+            // The version, explicit and defaulted, so almost never present.
+            i = i + 1
+            continue
+        }
+        if tag == 0xA1 and out.produced_at == 0 and
+        out.responder_name.len() == 0 {
+            read_name(der, nodes, fields[i], out)
+            i = i + 1
+            continue
+        }
+        if tag == 0xA2 and out.responder_key_hash.len() == 0 {
+            for hash in asn1.child_indices(nodes, fields[i]) {
+                out.responder_key_hash = asn1.value(der, nodes[hash])
+            }
+            i = i + 1
+            continue
+        }
+        if tag == asn1.GENERALIZED_TIME or tag == asn1.UTC_TIME {
+            out.produced_at = asn1.time_of(der, nodes[fields[i]]) ?? 0
+            i = i + 1
+            continue
+        }
+        if tag == asn1.SEQUENCE {
+            for single in asn1.child_indices(nodes, fields[i]) {
+                read_single(der, nodes, single, out)
+            }
+            i = i + 1
+            continue
+        }
+        if tag == 0xA1 {
+            read_extensions(der, nodes, fields[i], out)
+        }
+        i = i + 1
+    }
+}
+
+fn read_name(der: bytes, nodes: [DerNode], at: i64, inout out: OcspResponse) {
+    for name in asn1.child_indices(nodes, at) {
+        for rdn in asn1.child_indices(nodes, name) {
+            for pair in asn1.child_indices(nodes, rdn) {
+                let parts = asn1.child_indices(nodes, pair)
+                if parts.len() == 2 {
+                    out.responder_name.push((asn1.oid_of(der, nodes[parts[0]]),
+                        asn1.text_of(der, nodes[parts[1]])))
+                }
+            }
+        }
+    }
+}
+
+fn read_single(der: bytes, nodes: [DerNode], at: i64, inout out: OcspResponse) {
+    let fields = asn1.child_indices(nodes, at)
+    if fields.len() < 3 {
+        return
+    }
+    let id_parts = asn1.child_indices(nodes, fields[0])
+    if id_parts.len() < 4 {
+        return
+    }
+    let alg = asn1.child_indices(nodes, id_parts[0])
+    var id = OcspCertId{ hash_algorithm: "", issuer_name_hash: bytes_of([]),
+        issuer_key_hash: bytes_of([]), serial: "" }
+    if alg.len() > 0 {
+        id.hash_algorithm = asn1.oid_of(der, nodes[alg[0]])
+    }
+    id.issuer_name_hash = asn1.value(der, nodes[id_parts[1]])
+    id.issuer_key_hash = asn1.value(der, nodes[id_parts[2]])
+    id.serial = serial_hex(asn1.value(der, nodes[id_parts[3]]))
+
+    var single = OcspSingle{ id: id, status: UNKNOWN, revoked_at: 0,
+        reason: 0 - 1, this_update: 0, next_update: 0 }
+    let status_tag = nodes[fields[1]].tag
+    if status_tag == 0x80 {
+        single.status = GOOD
+    }
+    if status_tag == 0xA1 {
+        single.status = REVOKED
+        let revoked = asn1.child_indices(nodes, fields[1])
+        if revoked.len() > 0 {
+            single.revoked_at = asn1.time_of(der, nodes[revoked[0]]) ?? 0
+        }
+        if revoked.len() > 1 {
+            for code in asn1.child_indices(nodes, revoked[1]) {
+                single.reason = asn1.integer_of(der, nodes[code])
+            }
+        }
+    }
+    single.this_update = asn1.time_of(der, nodes[fields[2]]) ?? 0
+    var i = 3
+    while i < fields.len() {
+        if nodes[fields[i]].tag == 0xA0 {
+            for when in asn1.child_indices(nodes, fields[i]) {
+                single.next_update = asn1.time_of(der, nodes[when]) ?? 0
+            }
+        }
+        i = i + 1
+    }
+    out.singles.push(single)
+}
+
+fn read_extensions(der: bytes, nodes: [DerNode], at: i64,
+    inout out: OcspResponse) {
+    for list in asn1.child_indices(nodes, at) {
+        for extension in asn1.child_indices(nodes, list) {
+            let parts = asn1.child_indices(nodes, extension)
+            if parts.len() < 2 {
+                continue
+            }
+            if asn1.oid_of(der, nodes[parts[0]]) != nonce_oid() {
+                continue
+            }
+            out.nonce = asn1.value(der, nodes[parts[parts.len() - 1]])
+        }
+    }
+}
+
+// -------------------------------------------------------------- asking
+
+/// The answer about one serial, or `None` if the response does not mention it.
+pub fn answer_for(response: OcspResponse, serial: str) -> Option[OcspSingle] {
+    for single in response.singles {
+        if single.id.serial == serial {
+            return Some(single)
+        }
+    }
+    return None
+}
+
+/// Whether this response can be believed right now.
+///
+/// Three conditions, all of which a client has skipped at some point and
+/// regretted: the responder said `successful`, the answer is inside its own
+/// validity window, and the window has an end at all.
+pub fn is_fresh(single: OcspSingle, now: i64) -> bool {
+    if now + 300 < single.this_update {
+        return false
+    }
+    if single.next_update == 0 {
+        return false
+    }
+    return now < single.next_update
+}
+
+/// Whether the nonce in the response is the one that was sent.
+///
+/// A response with no nonce when one was sent is not a match: the responder
+/// may not support them, and a client that treats silence as agreement has
+/// no replay protection at all and does not know it.
+pub fn nonce_matches(response: OcspResponse, sent: bytes) -> bool {
+    if sent.len() == 0 {
+        return true
+    }
+    if response.nonce.len() == 0 {
+        return false
+    }
+    // The extension value is an OCTET STRING wrapping the nonce's own OCTET
+    // STRING, so the sent bytes appear two octets in.
+    let inner = response.nonce
+    if inner.len() == sent.len() {
+        return inner.to_list() == sent.to_list()
+    }
+    if inner.len() == sent.len() + 2 {
+        return inner.slice(2, inner.len()).to_list() == sent.to_list()
+    }
+    return false
+}
+
+pub fn hex(data: bytes) -> str {
+    return hex_of(data)
+}
