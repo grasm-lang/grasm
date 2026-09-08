@@ -1,0 +1,515 @@
+import socks5
+import tftp
+import whois
+import gopher
+import netdiscovery
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn hex_of(data: bytes) -> str {
+    let digits = "0123456789abcdef"
+    var out = ""
+    for i in 0..data.len() {
+        out = out + digits.substr(data.at(i).ushr(4), 1) +
+        digits.substr(data.at(i).bit_and(15), 1)
+    }
+    return out
+}
+
+fn from_hex(s: str) -> bytes {
+    var out: [i64] = []
+    var i = 0
+    while i + 1 < s.len() {
+        out.push(s.substr(i, 2).parse_int_base(16) ?? 0)
+        i = i + 2
+    }
+    return bytes_of(out)
+}
+
+// ------------------------------------------------------------ socks5
+
+fn empty_message() -> SocksMessage {
+    return SocksMessage{ code: 0, address: SocksDomain(""), port: 0 }
+}
+
+fn check_socks(inout f: i64) / {io} {
+    print("-- socks5: the domain form is what keeps the name off your resolver")
+    // Byte sequences from RFC 1928's own field layout.
+    say(f, "the greeting is the version, a count and the methods",
+        hex_of(socks5.greeting([SocksNoAuth, SocksUserPass]) ??
+            "".to_bytes()) == "05020002")
+    say(f, "a greeting with no methods is refused",
+        greeting_refuses())
+    say(f, "the server's choice is two bytes",
+        hex_of(socks5.method_choice(SocksUserPass)) == "0502")
+    say(f, "and 0xFF means it accepted none",
+        socks5.method_code(SocksNoneAcceptable) == 255)
+    // The sub-negotiation with its own version byte.
+    say(f, "the credentials message uses version 1, not 5",
+        hex_of(socks5.credentials("ab", "cd") ?? "".to_bytes()) ==
+        "01026162" + "026364")
+    say(f, "which is a different protocol from the one around it",
+        socks5.auth_version() == 1 and socks5.version() == 5)
+    say(f, "an empty username is refused", credentials_refuses("", "x"))
+    // Requests.
+    say(f, "a CONNECT to an address is the four octets and a big-endian port",
+        hex_of(socks5.request_address("127.0.0.1", 80) ?? "".to_bytes()) ==
+        "050100017f0000010050")
+    say(f, "a CONNECT to a name carries the name and its length",
+        hex_of(socks5.request_domain("a.example", 443) ?? "".to_bytes()) ==
+        "0501000309" + "612e6578616d706c65" + "01bb")
+    say(f, "so the proxy resolves it rather than the client",
+        socks5.address_text(SocksDomain("a.example")) == "a.example")
+    say(f, "port 0 and port 65536 are refused",
+        request_refuses(0) and request_refuses(65536))
+    say(f, "a name over 255 bytes is refused",
+        domain_refuses("a".repeat(256)))
+    check_socks_replies(f)
+}
+
+fn greeting_refuses() -> bool {
+    match socks5.greeting([]) {
+        Ok(_v) -> return false
+        Err(_x) -> return true
+    }
+}
+
+fn credentials_refuses(user: str, pass: str) -> bool {
+    match socks5.credentials(user, pass) {
+        Ok(_v) -> return false
+        Err(_x) -> return true
+    }
+}
+
+fn request_refuses(port: i64) -> bool {
+    match socks5.request_address("127.0.0.1", port) {
+        Ok(_v) -> return false
+        Err(_x) -> return true
+    }
+}
+
+fn domain_refuses(name: str) -> bool {
+    match socks5.request_domain(name, 80) {
+        Ok(_v) -> return false
+        Err(_x) -> return true
+    }
+}
+
+fn check_socks_replies(inout f: i64) / {io} {
+    let ok = socks5.parse_message(from_hex("05000001000000000000")) ??
+    empty_message()
+    say(f, "a reply of 0 succeeded", socks5.succeeded(ok))
+    say(f, "and its bound address of zeros means nothing",
+        not socks5.bound_is_meaningful(ok))
+    let refused = socks5.parse_message(from_hex("05050001c0a8000101bb")) ??
+    empty_message()
+    say(f, "a reply of 5 is a refused connection",
+        socks5.reply_meaning(refused.code) == "connection refused")
+    say(f, "which is different from a policy refusal, and worth reporting " +
+        "separately",
+        socks5.reply_meaning(2) == "not allowed by ruleset")
+    say(f, "the bound address and port come back",
+        socks5.address_text(refused.address) == "192.168.0.1" and
+        refused.port == 443)
+    let named = socks5.parse_message(
+        from_hex("0500000309612e6578616d706c6501bb")) ?? empty_message()
+    say(f, "a name in a reply is read back",
+        socks5.address_text(named.address) == "a.example")
+    let v6 = socks5.parse_message(from_hex(
+        "0500000420010db8000000000000000000000001" + "0050")) ??
+    empty_message()
+    say(f, "and so is an IPv6 address",
+        socks5.address_text(v6.address) ==
+        "2001:0db8:0000:0000:0000:0000:0000:0001")
+    say(f, "a version that is not 5 is refused",
+        parse_refuses(from_hex("04000001000000000000")))
+    say(f, "an unknown address type is refused",
+        parse_refuses(from_hex("05000009000000000000")))
+    say(f, "and a truncated message is",
+        parse_refuses(from_hex("050000")))
+    say(f, "the UDP header carries a fragment field almost nothing supports",
+        hex_of(socks5.udp_header(0, SocksIpv4([1, 2, 3, 4]), 53) ??
+            "".to_bytes()) == "00000001010203040035")
+}
+
+fn parse_refuses(data: bytes) -> bool {
+    match socks5.parse_message(data) {
+        Ok(_v) -> return false
+        Err(_x) -> return true
+    }
+}
+
+// -------------------------------------------------------------- tftp
+
+fn check_tftp(inout f: i64) / {io} {
+    print("-- tftp: no security, a 32 MB ceiling, and a duplicate ACK storm")
+    // The packet layouts from RFC 1350.
+    let read = tftp.encode(TftpRead("boot.img", "octet", [])) ?? "".to_bytes()
+    say(f, "a read request is opcode 1, the name, a NUL, the mode and a NUL",
+        hex_of(read) == "0001" + "626f6f742e696d6700" + "6f6374657400")
+    say(f, "a data packet is opcode 3 and a big-endian block number",
+        hex_of(tftp.encode(TftpData(1, bytes_of([65, 66]))) ??
+            "".to_bytes()) == "000300014142")
+    say(f, "an ack is four bytes",
+        hex_of(tftp.encode(TftpAck(513)) ?? "".to_bytes()) == "00040201")
+    say(f, "an error carries a code and a message",
+        hex_of(tftp.encode(TftpError(1, "nope")) ?? "".to_bytes()) ==
+        "00050001" + "6e6f706500")
+    let back = tftp.decode(read) ?? TftpAck(0)
+    say(f, "a request decodes back to its parts",
+        tftp.opcode_of(back) == 1)
+    say(f, "an unknown opcode is refused",
+        decode_refuses(from_hex("00090001")))
+    say(f, "an unterminated string is refused",
+        decode_refuses(from_hex("0001616263")))
+    say(f, "and a mode that is not one of the three is",
+        decode_refuses(from_hex("0001" + "6100" + "62616400")))
+    // The limits.
+    say(f, "the ceiling is 32 MB at the default block size",
+        tftp.max_transfer_size() == 33553920)
+    say(f, "a file under it fits without the counter wrapping",
+        tftp.fits_without_wrapping(30000000, 512))
+    say(f, "and one over it does not, which is worth refusing before starting",
+        not tftp.fits_without_wrapping(40000000, 512))
+    say(f, "a larger block size raises the ceiling",
+        tftp.fits_without_wrapping(40000000, 1468))
+    check_tftp_transfer(f)
+}
+
+fn decode_refuses(data: bytes) -> bool {
+    match tftp.decode(data) {
+        Ok(_v) -> return false
+        Err(_x) -> return true
+    }
+}
+
+fn check_tftp_transfer(inout f: i64) / {io} {
+    say(f, "a short block ends a transfer",
+        tftp.is_final_block(bytes_of([1, 2]), 512))
+    say(f, "and a full one does not",
+        not tftp.is_final_block(bytes_of([0]).concat(bytes_of([])), 1))
+    // The round-number hang.
+    say(f, "a file that divides exactly still needs an empty final block",
+        tftp.plan(1024, 512).len() == 3 and
+        tftp.plan(1024, 512)[2].2 == 0)
+    say(f, "and one that does not, does not",
+        tftp.plan(1000, 512).len() == 2)
+    say(f, "the blocks are numbered from one",
+        tftp.plan(1000, 512)[0].0 == 1)
+    // The sorcerer's apprentice.
+    say(f, "an ACK for a block already acknowledged is a duplicate",
+        tftp.is_duplicate_ack(5, 5) and tftp.is_duplicate_ack(4, 5))
+    say(f, "and the next one is not", not tftp.is_duplicate_ack(6, 5))
+    say(f, "the block counter wraps to zero, which is a choice the RFC does " +
+        "not make", tftp.next_block(65535) == 0)
+    // Options.
+    let options = tftp.common_options(1468, 5, 1000)
+    say(f, "a client asks for a larger block, a timeout and the size",
+        options.len() == 3 and options[0].name == "blksize")
+    say(f, "and takes the size the server acknowledged, not the one it asked " +
+        "for",
+        tftp.negotiated_block_size([TftpOption{ name: "blksize",
+            value: "1024" }]) == 1024 and
+        tftp.negotiated_block_size([]) == 512)
+    // The only access control there is.
+    say(f, "a traversing filename is refused",
+        not tftp.is_safe_filename("../etc/passwd") and
+        not tftp.is_safe_filename("/etc/passwd") and
+        not tftp.is_safe_filename("a\\..\\..\\b"))
+    say(f, "and an ordinary one is not",
+        tftp.is_safe_filename("boot/pxelinux.0"))
+}
+
+// ------------------------------------------------------------- whois
+
+fn iana_answer() -> str {
+    return "% IANA WHOIS server\n" +
+    "domain:       EXAMPLE\n" +
+    "organisation: Example Registry\n" +
+    "whois:        whois.nic.example\n"
+}
+
+fn registry_answer() -> str {
+    return "Domain Name: THING.EXAMPLE\n" +
+    "Registrar: Some Registrar, Inc.\n" +
+    "Registrar WHOIS Server: whois.someregistrar.example\n" +
+    "Creation Date: 2011-03-01T12:00:00Z\n" +
+    "Registry Expiry Date: 2027-03-01T12:00:00Z\n" +
+    "Domain Status: clientTransferProhibited https://icann.org/epp\n" +
+    "Domain Status: serverDeleteProhibited https://icann.org/epp\n" +
+    "Name Server: NS1.SOMEHOST.EXAMPLE\n" +
+    "Name Server: ns2.somehost.example\n" +
+    "Name Server: NS1.SOMEHOST.EXAMPLE\n" +
+    "Registrant Organization: REDACTED FOR PRIVACY\n" +
+    ">>> Last update of WHOIS database: 2026-01-01T00:00:00Z <<<\n"
+}
+
+fn check_whois(inout f: i64) / {io} {
+    print("-- whois: no format, so the value is the referral and the phrasing")
+    let record = whois.parse(registry_answer())
+    say(f, "the comment and boilerplate lines are dropped",
+        whois.count(record) == 11)
+    say(f, "a key is found whatever its case",
+        whois.first(record, "Domain Name") == Some("THING.EXAMPLE"))
+    say(f, "a repeated key returns every value, not the last",
+        whois.all(record, "name server").len() == 3)
+    say(f, "and the name servers are folded and de-duplicated",
+        whois.name_servers(record) == ["ns1.somehost.example",
+            "ns2.somehost.example"])
+    say(f, "the registrar is found under whichever name the registry used",
+        whois.registrar(record) == Some("Some Registrar, Inc."))
+    say(f, "and so are the dates",
+        whois.expires(record) == Some("2027-03-01T12:00:00Z") and
+        whois.created(record) == Some("2011-03-01T12:00:00Z"))
+    say(f, "the status codes are taken without their URLs",
+        whois.statuses(record) == ["clientTransferProhibited",
+            "serverDeleteProhibited"])
+    // Referrals.
+    let iana = whois.parse(iana_answer())
+    say(f, "IANA's answer is a referral, not a record",
+        whois.is_referral(iana) and
+        whois.referral_of(iana) == Some("whois.nic.example"))
+    say(f, "and a registry's answer names the registrar's server too",
+        whois.referral_of(record) ==
+        Some("whois.someregistrar.example"))
+    say(f, "but is not itself a referral, because it has the record",
+        not whois.is_referral(record))
+    // The three answers that are not errors.
+    say(f, "an unregistered domain is a successful response saying so",
+        whois.is_available("No match for \"NOTHING.EXAMPLE\"."))
+    say(f, "a rate limit is too",
+        whois.is_rate_limited("WHOIS LIMIT EXCEEDED - try again later"))
+    say(f, "and a redacted record is a third thing again",
+        whois.is_redacted(registry_answer()))
+    say(f, "which the verdict distinguishes",
+        whois.verdict(registry_answer()) == "registered, redacted" and
+        whois.verdict(iana_answer()) == "referral" and
+        whois.verdict("No match for X") == "available")
+    // The query and the successor.
+    say(f, "a query is the name and a CRLF",
+        (whois.query_for(" example.com ") ?? "") == "example.com\r\n")
+    say(f, "an empty query is refused", query_refuses(""))
+    say(f, "the TLD picks a server for the common cases",
+        whois.tld_of("a.b.example.com") == "com" and
+        whois.server_for("com") == Some("whois.verisign-grs.com") and
+        whois.server_for("zz") == None)
+    say(f, "and RDAP is the successor, with a real schema",
+        (whois.rdap_url_for("https://rdap.example/", "Thing.Example") ?? "")
+        == "https://rdap.example/domain/thing.example")
+}
+
+fn query_refuses(name: str) -> bool {
+    match whois.query_for(name) {
+        Ok(_v) -> return false
+        Err(_x) -> return true
+    }
+}
+
+// ------------------------------------------------------------ gopher
+
+fn menu_text() -> str {
+    let tab = (9).to_char()
+    return "iWelcome to the hole" + tab + "fake" + tab + "(NULL)" + tab +
+    "0\r\n" +
+    "1Other menus" + tab + "/other" + tab + "gopher.example" + tab +
+    "70\r\n" +
+    "0A text file" + tab + "/readme.txt" + tab + "gopher.example" + tab +
+    "70\r\n" +
+    "7Search" + tab + "/search" + tab + "gopher.example" + tab +
+    "70\r\n" +
+    "Ia picture" + tab + "/pic.png" + tab + "other.example" + tab +
+    "7070\r\n" +
+    ".\r\n"
+}
+
+fn empty_menu() -> GopherMenu {
+    return GopherMenu{ item: [], terminated: false }
+}
+
+fn check_gopher(inout f: i64) / {io} {
+    print("-- gopher: four tab-separated fields, and the type is in the link")
+    let menu = gopher.parse_menu(menu_text()) ?? empty_menu()
+    say(f, "five items and a terminator",
+        gopher.count(menu) == 5 and menu.terminated)
+    say(f, "the type is the first character of the display string",
+        menu.item[0].kind == "i" and menu.item[0].display ==
+        "Welcome to the hole")
+    say(f, "a menu, a text file, a search and an image are all named",
+        gopher.type_name(menu.item[1].kind) == "menu" and
+        gopher.type_name(menu.item[2].kind) == "text file" and
+        gopher.type_name(menu.item[3].kind) == "search" and
+        gopher.type_name(menu.item[4].kind) == "image")
+    say(f, "an informational line is not a link, whatever its selector says",
+        not gopher.is_followable(menu.item[0]))
+    say(f, "and the four real ones are",
+        gopher.followable(menu).len() == 4)
+    say(f, "a search needs terms before it is fetched",
+        gopher.needs_query(menu.item[3]) and
+        not gopher.needs_query(menu.item[2]))
+    say(f, "a line with fewer than four fields is refused",
+        menu_refuses("1a\tb\tc\r\n"))
+    say(f, "and a port that is not a number is",
+        menu_refuses("1a\tb\tc\td\r\n"))
+    say(f, "a menu round-trips", gopher.render_menu(menu) == menu_text())
+    // URLs.
+    say(f, "the type goes in the URL path, before the selector",
+        gopher.url_for(menu.item[1]) == "gopher://gopher.example/1/other")
+    say(f, "a non-default port is in the authority",
+        gopher.url_for(menu.item[4]) ==
+        "gopher://other.example:7070/I/pic.png")
+    say(f, "and a URL parses back to an item",
+        (gopher.parse_url("gopher://h/0/a.txt") ??
+            gopher.info_line("")).kind == "0")
+    say(f, "a URL with no path is the root menu",
+        (gopher.parse_url("gopher://h") ?? gopher.info_line("")).kind == "1")
+    say(f, "something that is not a gopher URL is not one",
+        gopher.parse_url("https://example.com") == None)
+    // Requests.
+    say(f, "a request is the selector and a CRLF",
+        gopher.request_for("/readme.txt") == "/readme.txt\r\n")
+    say(f, "and a search puts the terms after a tab",
+        gopher.search_request("/search", "cats") ==
+        "/search" + (9).to_char() + "cats\r\n")
+    say(f, "a menu that links elsewhere is not local",
+        not gopher.is_local(menu, "gopher.example"))
+    say(f, "and the items of one type can be listed",
+        gopher.items_of_type(menu, "0").len() == 1)
+}
+
+fn menu_refuses(text: str) -> bool {
+    match gopher.parse_menu(text) {
+        Ok(_v) -> return false
+        Err(_x) -> return true
+    }
+}
+
+// ------------------------------------------------------ netdiscovery
+
+fn empty_instance() -> DnsSdInstance {
+    return DnsSdInstance{ instance: "", service: "", protocol: "",
+        domain: "" }
+}
+
+fn check_discovery(inout f: i64) / {io} {
+    print("-- netdiscovery: the instance label may contain dots, and does")
+    let parsed = netdiscovery.parse_instance(
+        "Office 2.0._http._tcp.local") ?? empty_instance()
+    say(f, "an instance name splits from the right, not the left",
+        parsed.instance == "Office 2.0" and parsed.service == "_http" and
+        parsed.protocol == "_tcp" and parsed.domain == "local")
+    say(f, "and renders back the same",
+        netdiscovery.render_instance(parsed) == "Office 2.0._http._tcp.local")
+    say(f, "the service type is what a browse asks for",
+        netdiscovery.service_type(parsed) == "_http._tcp.local")
+    say(f, "a service label needs an underscore and at most fifteen " +
+        "characters",
+        netdiscovery.is_valid_service("_http") and
+        not netdiscovery.is_valid_service("http") and
+        not netdiscovery.is_valid_service("_" + "a".repeat(16)))
+    say(f, "it may not begin or end with a hyphen, or be all digits",
+        not netdiscovery.is_valid_service("_-a") and
+        not netdiscovery.is_valid_service("_a-") and
+        not netdiscovery.is_valid_service("_123"))
+    say(f, "a protocol that is not tcp or udp is refused",
+        instance_refuses("a._http._sctp.local"))
+    say(f, "and a name with too few labels is",
+        instance_refuses("_http._tcp"))
+    say(f, "a collision is resolved by appending a number, then raising it",
+        netdiscovery.next_on_collision("Printer") == "Printer (2)" and
+        netdiscovery.next_on_collision("Printer (2)") == "Printer (3)")
+    // TXT records.
+    let pairs = netdiscovery.parse_txt(["path=/admin", "secure", "u=",
+        "PATH=/other"])
+    say(f, "a key with no `=` is present with no value, which is not the " +
+        "same as an empty one",
+        netdiscovery.txt_present(pairs, "secure") and
+        pairs[1].present_only and not pairs[2].present_only)
+    say(f, "keys are case-insensitive and the first wins",
+        netdiscovery.txt_value(pairs, "PATH") == Some("/admin"))
+    say(f, "and the record renders back",
+        netdiscovery.render_txt(pairs) == ["path=/admin", "secure", "u="])
+    say(f, "a small record fits in one packet",
+        netdiscovery.txt_is_small(pairs))
+    check_ssdp(f)
+}
+
+fn instance_refuses(name: str) -> bool {
+    match netdiscovery.parse_instance(name) {
+        Ok(_v) -> return false
+        Err(_x) -> return true
+    }
+}
+
+fn empty_ssdp() -> SsdpMessage {
+    return SsdpMessage{ start_line: "", header: [] }
+}
+
+fn check_ssdp(inout f: i64) / {io} {
+    let request = netdiscovery.search_request(
+        netdiscovery.root_devices(), 3)
+    say(f, "an M-SEARCH is HTTP-shaped and is not HTTP",
+        request.starts_with("M-SEARCH * HTTP/1.1\r\n"))
+    say(f, "MAN is quoted, which strict devices require",
+        request.contains("MAN: \"ssdp:discover\"\r\n"))
+    let parsed = netdiscovery.parse_message(request) ?? empty_ssdp()
+    say(f, "and the message parses back as a well-formed search",
+        netdiscovery.is_search(parsed) and
+        netdiscovery.search_is_wellformed(parsed))
+    let unquoted = netdiscovery.parse_message(
+        "M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\n" +
+        "MAN: ssdp:discover\r\nMX: 1\r\nST: ssdp:all\r\n\r\n") ?? empty_ssdp()
+    say(f, "an unquoted MAN is not well formed, which is why a search finds " +
+        "some devices and not others",
+        not netdiscovery.search_is_wellformed(unquoted))
+    let response = netdiscovery.parse_message(
+        "HTTP/1.1 200 OK\r\nCACHE-CONTROL: max-age=1800\r\n" +
+        "LOCATION: http://192.168.1.5:80/desc.xml\r\n" +
+        "ST: upnp:rootdevice\r\nUSN: uuid:abc::upnp:rootdevice\r\n\r\n") ??
+    empty_ssdp()
+    say(f, "headers are matched without regard to case",
+        netdiscovery.header_value(response, "Location") ==
+        Some("http://192.168.1.5:80/desc.xml"))
+    say(f, "the description URL is the point of the reply",
+        netdiscovery.location_of(response) != None)
+    say(f, "and the max-age says when to forget the device",
+        netdiscovery.max_age_of(response) == 1800)
+    say(f, "a response is neither a search nor a notification",
+        not netdiscovery.is_search(response) and
+        not netdiscovery.is_notify(response))
+    say(f, "something that is not SSDP is refused",
+        ssdp_refuses("hello there"))
+    say(f, "and the addresses are the assigned ones",
+        netdiscovery.ssdp_address() == "239.255.255.250" and
+        netdiscovery.mdns_address() == "224.0.0.251" and
+        netdiscovery.mdns_port() == 5353)
+}
+
+fn ssdp_refuses(text: str) -> bool {
+    match netdiscovery.parse_message(text) {
+        Ok(_v) -> return false
+        Err(_x) -> return true
+    }
+}
+
+fn main() / {io} {
+    var f = 0
+
+    check_socks(f)
+    check_tftp(f)
+    check_whois(f)
+    check_gopher(f)
+    check_discovery(f)
+
+    if f == 0 {
+        print("networking: every claim held")
+    } else {
+        print("networking: {f} failed")
+    }
+}

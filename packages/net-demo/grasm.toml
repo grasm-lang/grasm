@@ -1,0 +1,24 @@
+[package]
+name = "net_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.socks5]
+path = "../socks5"
+version = "^1.0.0"
+
+[dependencies.tftp]
+path = "../tftp"
+version = "^1.0.0"
+
+[dependencies.whois]
+path = "../whois"
+version = "^1.0.0"
+
+[dependencies.gopher]
+path = "../gopher"
+version = "^1.0.0"
+
+[dependencies.netdiscovery]
+path = "../netdiscovery"
+version = "^1.0.0"

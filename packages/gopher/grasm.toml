@@ -1,0 +1,6 @@
+[package]
+name = "gopher"
+version = "1.0.0"
+
+# Text in, a menu out. Opens no socket.
+capabilities = []

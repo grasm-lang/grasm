@@ -1,0 +1,288 @@
+// Gopher, RFC 1436: a menu format with one rule everyone breaks.
+//
+// **The fields are separated by tabs and there are exactly four.** Display
+// string, selector, host, port — and the item type is the first character of
+// the display string, not a field of its own. A parser that splits on
+// whitespace, or that accepts three fields, accepts menus that no client can
+// follow; a *server* that emits a space instead of a tab produces a menu that
+// looks right in a text editor and is unusable.
+//
+// The format is worth having for two reasons beyond nostalgia. It is the
+// simplest hypertext protocol that still works, which makes it a good target
+// for a small client; and it is a clean illustration of a design decision the
+// web made differently: **the type is in the link, not in the response**. A
+// gopher menu says "this is an image" before you fetch it, so a client knows
+// what it will get. The web puts the type in the response, which is why
+// content sniffing exists and why an uploaded file can become script.
+//
+// The other rule: **a menu ends with a line containing only a full stop**,
+// and a client must stop there. A server that omits it and closes the
+// connection is common enough that this treats end-of-input as a terminator
+// too, and says which happened.
+
+type GopherItem = {
+    /// The one-character type.
+    kind: str,
+    display: str,
+    selector: str,
+    host: str,
+    port: i64,
+}
+
+type GopherMenu = {
+    item: [GopherItem],
+    /// Whether the menu ended with the `.` line rather than running out.
+    terminated: bool,
+}
+
+type GopherError =
+    | GopherTooFewFields(line: i64, found: i64)
+    | GopherBadPort(line: i64, text: str)
+    | GopherEmptyLine(line: i64)
+
+    /// The port gopher servers listen on.
+pub fn port() -> i64 {
+    return 70
+}
+
+/// What a type character means.
+///
+/// The canonical set from RFC 1436 plus the few later additions that are
+/// universally implemented. An unknown type is not an error: a client shows
+/// it as a file and lets the user decide, which is what the protocol's
+/// extensibility amounts to.
+pub fn type_name(kind: str) -> str {
+    if kind == "0" {
+        return "text file"
+    }
+    if kind == "1" {
+        return "menu"
+    }
+    if kind == "2" {
+        return "CSO phone book"
+    }
+    if kind == "3" {
+        return "error"
+    }
+    if kind == "4" {
+        return "BinHex file"
+    }
+    if kind == "5" {
+        return "DOS archive"
+    }
+    if kind == "6" {
+        return "uuencoded file"
+    }
+    if kind == "7" {
+        return "search"
+    }
+    if kind == "8" {
+        return "telnet"
+    }
+    if kind == "9" {
+        return "binary file"
+    }
+    if kind == "+" {
+        return "mirror"
+    }
+    if kind == "g" {
+        return "GIF image"
+    }
+    if kind == "I" {
+        return "image"
+    }
+    if kind == "T" {
+        return "telnet 3270"
+    }
+    if kind == "h" {
+        return "HTML"
+    }
+    if kind == "i" {
+        return "informational text"
+    }
+    if kind == "s" {
+        return "sound"
+    }
+    if kind == "d" {
+        return "document"
+    }
+    return "unknown type"
+}
+
+/// Whether an item is a link a client can follow.
+///
+/// Type `i` is not: it is a line of text laid out as an item so that a menu
+/// can contain prose, and its selector and host are conventionally `fake` or
+/// `error.host`. A client that tries to fetch one makes a request to a host
+/// that does not exist.
+pub fn is_followable(item: GopherItem) -> bool {
+    return item.kind != "i" and item.kind != "3" and item.selector != ""
+}
+
+/// Whether an item needs a query appended before it is fetched.
+///
+/// Type `7` is a search: the client asks the user for terms and sends
+/// `selector<TAB>terms`. Fetching it without them returns the search form's
+/// own prompt, which looks like an empty result.
+pub fn needs_query(item: GopherItem) -> bool {
+    return item.kind == "7"
+}
+
+/// Parse a menu.
+pub fn parse_menu(text: str) -> GopherMenu ! GopherError {
+    var out: [GopherItem] = []
+    var terminated = false
+    var number = 0
+    for raw in text.split("\n") {
+        number = number + 1
+        var line = raw
+        if line.ends_with("\r") {
+            line = line.substr(0, line.len() - 1)
+        }
+        if line == "." {
+            terminated = true
+            break
+        }
+        if line == "" {
+            continue
+        }
+        let fields = line.split("\t")
+        if fields.len() < 4 {
+            fail(GopherTooFewFields(number, fields.len()))
+        }
+        let head = fields[0]
+        if head == "" {
+            fail(GopherEmptyLine(number))
+        }
+        match fields[3].trim().parse_int() {
+            None -> fail(GopherBadPort(number, fields[3]))
+            Some(p) -> out.push(GopherItem{
+                kind: head.substr(0, 1),
+                display: head.substr(1, head.len() - 1),
+                selector: fields[1],
+                host: fields[2],
+                port: p })
+        }
+    }
+    return GopherMenu{ item: out, terminated: terminated }
+}
+
+/// Render a menu back, with the terminating full stop.
+pub fn render_menu(m: GopherMenu) -> str {
+    var lines: [str] = []
+    for item in m.item {
+        lines.push(render_item(item))
+    }
+    lines.push(".")
+    return lines.join("\r\n") + "\r\n"
+}
+
+/// One item as its line.
+pub fn render_item(item: GopherItem) -> str {
+    return item.kind + item.display + "\t" + item.selector + "\t" +
+    item.host + "\t" + "{item.port}"
+}
+
+/// A line of prose inside a menu.
+///
+/// Type `i` with placeholder host and port, which is the convention every
+/// server uses because the format has no other way to carry text.
+pub fn info_line(text: str) -> GopherItem {
+    return GopherItem{ kind: "i", display: text, selector: "fake",
+        host: "(NULL)", port: 0 }
+}
+
+/// The request a client sends for a selector.
+///
+/// The selector and a carriage-return line feed, and nothing else — no
+/// headers, no method, no version. That is the whole protocol.
+pub fn request_for(selector: str) -> str {
+    return selector + "\r\n"
+}
+
+/// The request for a search item, with the terms.
+pub fn search_request(selector: str, terms: str) -> str {
+    return selector + "\t" + terms + "\r\n"
+}
+
+/// A `gopher://` URL for an item, RFC 4266.
+///
+/// The type character goes in the path before the selector, which is the part
+/// that looks wrong and is correct: `gopher://host:70/1/selector` is a menu
+/// and `/0/selector` is a text file at the same place.
+pub fn url_for(item: GopherItem) -> str {
+    var out = "gopher://" + item.host
+    if item.port != 70 {
+        out = out + ":{item.port}"
+    }
+    return out + "/" + item.kind + item.selector
+}
+
+/// The parts of a `gopher://` URL.
+pub fn parse_url(url: str) -> Option[GopherItem] {
+    if not url.starts_with("gopher://") {
+        return None
+    }
+    let rest = url.substr(9, url.len() - 9)
+    let slash = rest.index_of("/") ?? (0 - 1)
+    let authority = if slash < 0 { rest } else { rest.substr(0, slash) }
+    var host = authority
+    var port_number = 70
+    let colon = authority.index_of(":") ?? (0 - 1)
+    if colon >= 0 {
+        host = authority.substr(0, colon)
+        port_number = authority.substr(colon + 1,
+            authority.len() - colon - 1).parse_int() ?? 70
+    }
+    if slash < 0 {
+        // No path at all is the root menu.
+        return Some(GopherItem{ kind: "1", display: host, selector: "",
+            host: host, port: port_number })
+    }
+    let path = rest.substr(slash + 1, rest.len() - slash - 1)
+    if path == "" {
+        return Some(GopherItem{ kind: "1", display: host, selector: "",
+            host: host, port: port_number })
+    }
+    return Some(GopherItem{ kind: path.substr(0, 1),
+        display: path.substr(1, path.len() - 1),
+        selector: path.substr(1, path.len() - 1), host: host,
+        port: port_number })
+}
+
+/// The items of one type.
+pub fn items_of_type(m: GopherMenu, kind: str) -> [GopherItem] {
+    var out: [GopherItem] = []
+    for item in m.item {
+        if item.kind == kind {
+            out.push(item)
+        }
+    }
+    return out
+}
+
+/// The links a crawler should follow.
+pub fn followable(m: GopherMenu) -> [GopherItem] {
+    var out: [GopherItem] = []
+    for item in m.item {
+        if is_followable(item) {
+            out.push(item)
+        }
+    }
+    return out
+}
+
+/// Whether every item names the same host, which is what a self-contained
+/// menu looks like.
+pub fn is_local(m: GopherMenu, host: str) -> bool {
+    for item in m.item {
+        if is_followable(item) and item.host != host {
+            return false
+        }
+    }
+    return true
+}
+
+pub fn count(m: GopherMenu) -> i64 {
+    return m.item.len()
+}

@@ -1,0 +1,10 @@
+[package]
+name = "socks5"
+version = "1.0.0"
+
+# Bytes in, bytes out. Opens no socket — the caller does that.
+capabilities = []
+
+[dependencies.ipaddr]
+path = "../ipaddr"
+version = "^1.0.0"

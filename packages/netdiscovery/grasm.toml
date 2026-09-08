@@ -1,0 +1,6 @@
+[package]
+name = "netdiscovery"
+version = "1.0.0"
+
+# Bytes and text in, records out. Opens no socket.
+capabilities = []

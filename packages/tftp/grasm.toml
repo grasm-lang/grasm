@@ -1,0 +1,6 @@
+[package]
+name = "tftp"
+version = "1.0.0"
+
+# Bytes in, bytes out. Opens no socket.
+capabilities = []

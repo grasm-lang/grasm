@@ -1,0 +1,406 @@
+// TFTP, RFC 1350: five packet types, and three ways it fails.
+//
+// Trivial File Transfer Protocol is the protocol a machine speaks before it
+// has an operating system — PXE boot, switch firmware, router configuration.
+// It is small enough to fit in a boot ROM, which is the whole design, and the
+// cost of that is worth stating because a program that speaks it is exposed
+// to all three:
+//
+// **There is no authentication and no encryption.** None. Anyone who can
+// reach the port can read any file the server offers and write any file it
+// accepts. A TFTP server is a filesystem published to the network segment,
+// and the only control is which files it is pointed at.
+//
+// **The block number is sixteen bits, and 512-byte blocks make 32 MB.** After
+// block 65535 the counter has to do something, and the RFC does not say what.
+// Most implementations wrap to 0, some wrap to 1, and a transfer between two
+// that disagree silently corrupts the file past 32 MB. `blocks_for` says how
+// many a file needs so a caller can refuse before it starts.
+//
+// **The sorcerer's apprentice bug.** A duplicated ACK makes the sender
+// retransmit, which makes the receiver ACK again, which makes the sender
+// retransmit — each duplicate doubles. The fix is in RFC 1123: never
+// retransmit in response to a duplicate ACK, only on a timeout.
+// `is_duplicate_ack` is the test that fix needs.
+//
+// One more thing that catches everyone: **a transfer ends with a short
+// block**, and a file whose length is an exact multiple of the block size
+// must be followed by an empty data packet. Without it the receiver waits for
+// more and the transfer hangs at exactly the sizes that are round numbers.
+
+type TftpPacket =
+    | TftpRead(filename: str, mode: str, options: [TftpOption])
+    | TftpWrite(filename: str, mode: str, options: [TftpOption])
+    | TftpData(block: i64, payload: bytes)
+    | TftpAck(block: i64)
+    | TftpError(code: i64, message: str)
+    | TftpOptionAck(options: [TftpOption])
+
+type TftpOption = {
+    name: str,
+    value: str,
+}
+
+type TftpError2 =
+    | TftpTruncated(at: i64)
+    | TftpBadOpcode(code: i64)
+    | TftpUnterminated(at: i64)
+    | TftpBadMode(mode: str)
+    | TftpBadBlock(block: i64)
+    | TftpNameTooLong(length: i64)
+
+    /// The block size the protocol uses without negotiation.
+pub fn default_block_size() -> i64 {
+    return 512
+}
+
+/// The largest file a 16-bit block counter can carry at the default size.
+///
+/// 65535 blocks of 512 bytes. Past this the counter has to wrap, and the RFC
+/// says nothing about how — which is why a 40 MB transfer between two
+/// implementations that disagree corrupts silently rather than failing.
+pub fn max_transfer_size() -> i64 {
+    return 65535 * 512
+}
+
+/// How many blocks a file of this size needs.
+///
+/// Including the final short block: a file that divides exactly still needs
+/// an empty one to say it has ended.
+pub fn blocks_for(size: i64, block_size: i64) -> i64 {
+    return size / block_size + 1
+}
+
+/// Whether a file can be transferred without the block counter wrapping.
+pub fn fits_without_wrapping(size: i64, block_size: i64) -> bool {
+    return blocks_for(size, block_size) <= 65535
+}
+
+/// The three transfer modes, of which one is used.
+///
+/// `netascii` translates line endings and `mail` was removed in 1995.
+/// `octet` sends the bytes, which is what anything that is not a text file
+/// needs — and sending a firmware image as `netascii` corrupts every 0x0D.
+pub fn modes() -> [str] {
+    return ["netascii", "octet", "mail"]
+}
+
+pub fn error_meaning(code: i64) -> str {
+    if code == 0 {
+        return "not defined"
+    }
+    if code == 1 {
+        return "file not found"
+    }
+    if code == 2 {
+        return "access violation"
+    }
+    if code == 3 {
+        return "disk full or allocation exceeded"
+    }
+    if code == 4 {
+        return "illegal TFTP operation"
+    }
+    if code == 5 {
+        return "unknown transfer ID"
+    }
+    if code == 6 {
+        return "file already exists"
+    }
+    if code == 7 {
+        return "no such user"
+    }
+    if code == 8 {
+        return "option negotiation failed"
+    }
+    return "unassigned error {code}"
+}
+
+fn push_string(inout out: [i64], text: str) ! TftpError2 {
+    let raw = text.to_bytes()
+    if raw.len() > 505 {
+        fail(TftpNameTooLong(raw.len()))
+    }
+    for i in 0..raw.len() {
+        if raw.at(i) == 0 {
+            fail(TftpNameTooLong(i))
+        }
+        out.push(raw.at(i))
+    }
+    out.push(0)
+}
+
+/// Encode a packet.
+pub fn encode(p: TftpPacket) -> bytes ! TftpError2 {
+    var out: [i64] = []
+    match p {
+        TftpRead(filename, mode, options) -> {
+            out.push(0)
+            out.push(1)
+            try push_string(out, filename)
+            try push_string(out, mode.to_lower())
+            for o in options {
+                try push_string(out, o.name)
+                try push_string(out, o.value)
+            }
+        }
+        TftpWrite(filename, mode, options) -> {
+            out.push(0)
+            out.push(2)
+            try push_string(out, filename)
+            try push_string(out, mode.to_lower())
+            for o in options {
+                try push_string(out, o.name)
+                try push_string(out, o.value)
+            }
+        }
+        TftpData(block, payload) -> {
+            if block < 0 or block > 65535 {
+                fail(TftpBadBlock(block))
+            }
+            out.push(0)
+            out.push(3)
+            out.push(block.ushr(8).bit_and(255))
+            out.push(block.bit_and(255))
+            for i in 0..payload.len() {
+                out.push(payload.at(i))
+            }
+        }
+        TftpAck(block) -> {
+            if block < 0 or block > 65535 {
+                fail(TftpBadBlock(block))
+            }
+            out.push(0)
+            out.push(4)
+            out.push(block.ushr(8).bit_and(255))
+            out.push(block.bit_and(255))
+        }
+        TftpError(code, message) -> {
+            out.push(0)
+            out.push(5)
+            out.push(code.ushr(8).bit_and(255))
+            out.push(code.bit_and(255))
+            try push_string(out, message)
+        }
+        TftpOptionAck(options) -> {
+            out.push(0)
+            out.push(6)
+            for o in options {
+                try push_string(out, o.name)
+                try push_string(out, o.value)
+            }
+        }
+    }
+    return bytes_of(out)
+}
+
+/// Decode a packet.
+pub fn decode(data: bytes) -> TftpPacket ! TftpError2 {
+    if data.len() < 4 {
+        fail(TftpTruncated(data.len()))
+    }
+    let opcode = data.at(0).shl(8).bit_or(data.at(1))
+    if opcode == 3 {
+        let block = data.at(2).shl(8).bit_or(data.at(3))
+        return TftpData(block, data.slice(4, data.len()))
+    }
+    if opcode == 4 {
+        return TftpAck(data.at(2).shl(8).bit_or(data.at(3)))
+    }
+    if opcode == 5 {
+        let code = data.at(2).shl(8).bit_or(data.at(3))
+        let text = try take_string(data, 4)
+        return TftpError(code, text.0)
+    }
+    if opcode == 1 or opcode == 2 {
+        let filename = try take_string(data, 2)
+        let mode = try take_string(data, filename.1)
+        if not is_mode(mode.0) {
+            fail(TftpBadMode(mode.0))
+        }
+        var options: [TftpOption] = []
+        var at = mode.1
+        while at < data.len() {
+            let name = try take_string(data, at)
+            if name.1 >= data.len() {
+                break
+            }
+            let value = try take_string(data, name.1)
+            options.push(TftpOption{ name: name.0, value: value.0 })
+            at = value.1
+        }
+        if opcode == 1 {
+            return TftpRead(filename.0, mode.0, options)
+        }
+        return TftpWrite(filename.0, mode.0, options)
+    }
+    if opcode == 6 {
+        var options: [TftpOption] = []
+        var at = 2
+        while at < data.len() {
+            let name = try take_string(data, at)
+            if name.1 >= data.len() {
+                break
+            }
+            let value = try take_string(data, name.1)
+            options.push(TftpOption{ name: name.0, value: value.0 })
+            at = value.1
+        }
+        return TftpOptionAck(options)
+    }
+    fail(TftpBadOpcode(opcode))
+}
+
+fn take_string(data: bytes, from: i64) -> (str, i64) ! TftpError2 {
+    var at = from
+    while at < data.len() and data.at(at) != 0 {
+        at = at + 1
+    }
+    if at >= data.len() {
+        fail(TftpUnterminated(from))
+    }
+    return (data.slice(from, at).to_str(), at + 1)
+}
+
+fn is_mode(text: str) -> bool {
+    for m in modes() {
+        if m == text.to_lower() {
+            return true
+        }
+    }
+    return false
+}
+
+/// The opcode a packet carries.
+pub fn opcode_of(p: TftpPacket) -> i64 {
+    match p {
+        TftpRead(_f, _m, _o) -> return 1
+        TftpWrite(_f, _m, _o) -> return 2
+        TftpData(_b, _p) -> return 3
+        TftpAck(_b) -> return 4
+        TftpError(_c, _m) -> return 5
+        TftpOptionAck(_o) -> return 6
+    }
+}
+
+// -------------------------------------------------- the transfer rules
+
+/// Whether a data packet is the last one.
+///
+/// Short means last, and only short. A file that divides exactly by the block
+/// size must be followed by an empty data packet — without it the receiver
+/// waits for more and the transfer hangs at exactly the round numbers.
+pub fn is_final_block(payload: bytes, block_size: i64) -> bool {
+    return payload.len() < block_size
+}
+
+/// Whether an ACK is a duplicate of one already seen.
+///
+/// The test the sorcerer's apprentice fix needs: a sender must retransmit on
+/// a *timeout* and never in answer to a duplicate ACK, or every duplicate
+/// doubles the traffic until the transfer collapses.
+pub fn is_duplicate_ack(block: i64, highest_acknowledged: i64) -> bool {
+    return block <= highest_acknowledged
+}
+
+/// The next block number, wrapping the way most implementations do.
+///
+/// To 0, which is what the common implementations chose — and it is a choice,
+/// because the RFC says nothing. A transfer past 32 MB between one that wraps
+/// to 0 and one that wraps to 1 corrupts silently, which is why
+/// `fits_without_wrapping` is worth calling first.
+pub fn next_block(block: i64) -> i64 {
+    if block >= 65535 {
+        return 0
+    }
+    return block + 1
+}
+
+/// The blocks a file is split into, as (number, offset, length).
+pub fn plan(size: i64, block_size: i64) -> [(i64, i64, i64)] {
+    var out: [(i64, i64, i64)] = []
+    var offset = 0
+    var block = 1
+    while offset < size {
+        var length = block_size
+        if offset + length > size {
+            length = size - offset
+        }
+        out.push((block, offset, length))
+        offset = offset + length
+        block = next_block(block)
+    }
+    // The empty final block, when the file divided exactly.
+    if size % block_size == 0 {
+        out.push((block, size, 0))
+    }
+    return out
+}
+
+/// The options a client usually asks for, RFC 2347 and 2348.
+///
+/// `blksize` is the one that matters: 512-byte blocks over a network with a
+/// 1500-byte MTU waste two thirds of every packet, and raising it to 1468 is
+/// the difference between 3 MB/s and 9 MB/s. The server may refuse, in which
+/// case the transfer proceeds at 512 — so a client must not assume its own
+/// request was accepted.
+pub fn common_options(block_size: i64, timeout_seconds: i64,
+    size: i64) -> [TftpOption] {
+    var out: [TftpOption] = []
+    if block_size != default_block_size() {
+        out.push(TftpOption{ name: "blksize", value: "{block_size}" })
+    }
+    if timeout_seconds > 0 {
+        out.push(TftpOption{ name: "timeout", value: "{timeout_seconds}" })
+    }
+    if size >= 0 {
+        out.push(TftpOption{ name: "tsize", value: "{size}" })
+    }
+    return out
+}
+
+/// The block size actually in force, from what the server acknowledged.
+///
+/// A server may accept some options and not others, and the ones it does not
+/// mention are not in force. Taking the requested size rather than the
+/// acknowledged one is how a transfer sends 1468-byte blocks to a server
+/// expecting 512.
+pub fn negotiated_block_size(acknowledged: [TftpOption]) -> i64 {
+    for o in acknowledged {
+        if o.name.to_lower() == "blksize" {
+            return o.value.parse_int() ?? default_block_size()
+        }
+    }
+    return default_block_size()
+}
+
+/// Whether a filename is safe to serve.
+///
+/// A TFTP server has no authentication, so the path check is the only
+/// control. A name with `..`, an absolute path or a NUL is refused — and a
+/// server that only checks the string for `../` misses the encoded and
+/// backslash forms, which is why this resolves the segments.
+pub fn is_safe_filename(name: str) -> bool {
+    if name == "" or name.starts_with("/") or name.starts_with("\\") {
+        return false
+    }
+    for c in name.chars() {
+        if c == (0).to_char() {
+            return false
+        }
+    }
+    var depth = 0
+    for part in name.replace("\\", "/").split("/") {
+        if part == ".." {
+            depth = depth - 1
+            if depth < 0 {
+                return false
+            }
+        } else {
+            if part != "" and part != "." {
+                depth = depth + 1
+            }
+        }
+    }
+    return true
+}

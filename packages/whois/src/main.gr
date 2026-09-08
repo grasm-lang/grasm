@@ -1,0 +1,378 @@
+// WHOIS, and the fact that it has no format.
+//
+// RFC 3912 specifies exactly two things: send a line, read text until the
+// server closes. What the text contains is up to the server, and every
+// registry chose differently — `Registrar:` here, `registrar:` there,
+// `Sponsoring Registrar` somewhere else, and .jp answers in Japanese with
+// `[Registrant]` in square brackets.
+//
+// So the value of a WHOIS package is not a parser for one format. It is:
+//
+// **The referral chain.** A query to `whois.iana.org` for a TLD answers with
+// a `whois:` line naming the registry's server, whose answer may carry a
+// `Registrar WHOIS Server:` naming a third. A client that queries one server
+// gets a referral and reports it as the answer — which is why a lookup often
+// comes back with almost nothing. `referral_of` finds the next hop.
+//
+// **A key-value reader that survives the variation.** Case-insensitive,
+// tolerant of the space-before-colon that some servers emit, and returning
+// *every* value for a repeated key rather than the last — because name
+// servers and status codes appear several times and taking the last one loses
+// all but one.
+//
+// **Knowing when the answer is not an answer.** A rate limit, an unregistered
+// domain and a redacted record all come back as a normal response with a
+// zero-length or boilerplate body. `is_available`, `is_rate_limited` and
+// `is_redacted` look for the phrasings the major registries use.
+//
+// And the successor: **RDAP**. It is JSON over HTTPS with a defined schema,
+// which is what WHOIS should have been, and `rdap_url_for` builds the query.
+// A new tool should use it and keep WHOIS for the registries that have not
+// moved.
+
+type WhoisField = {
+    key: str,
+    value: str,
+}
+
+type WhoisRecord = {
+    field: [WhoisField],
+    /// The server this came from, if the caller recorded it.
+    source: str,
+}
+
+type WhoisError =
+    | WhoisEmpty
+    | WhoisNoQuery
+
+    /// The port every WHOIS server listens on.
+pub fn port() -> i64 {
+    return 43
+}
+
+/// The query line for a domain.
+///
+/// A bare name and a carriage-return line feed. Some servers want extra flags
+/// — `domain ` for Verisign, `-B` for RIPE — and a client that sends them to
+/// a server that does not understand gets an error rather than a record.
+pub fn query_for(name: str) -> str ! WhoisError {
+    if name.trim() == "" {
+        fail(WhoisNoQuery)
+    }
+    return name.trim() + "\r\n"
+}
+
+/// The IANA server, which is where a lookup for an unknown TLD starts.
+pub fn root_server() -> str {
+    return "whois.iana.org"
+}
+
+/// The server for a handful of common TLDs.
+///
+/// A handful, deliberately: there are over 1,500 TLDs and a hard-coded table
+/// is out of date the week it is written. The right answer is to ask IANA and
+/// follow the referral, and this table is here only to skip one round trip
+/// for the common cases.
+pub fn server_for(tld: str) -> Option[str] {
+    let names = ["com", "net", "org", "io", "dev", "app", "uk", "de", "fr",
+        "nl", "eu", "info", "biz", "co"]
+    let servers = ["whois.verisign-grs.com", "whois.verisign-grs.com",
+        "whois.pir.org", "whois.nic.io", "whois.nic.google",
+        "whois.nic.google", "whois.nic.uk", "whois.denic.de",
+        "whois.nic.fr", "whois.domain-registry.nl", "whois.eu",
+        "whois.afilias.net", "whois.nic.biz", "whois.nic.co"]
+    let wanted = tld.to_lower()
+    for i in 0..names.len() {
+        if names[i] == wanted {
+            return Some(servers[i])
+        }
+    }
+    return None
+}
+
+/// The last label of a name.
+pub fn tld_of(name: str) -> str {
+    let parts = name.trim().to_lower().split(".")
+    if parts.len() == 0 {
+        return ""
+    }
+    return parts[parts.len() - 1]
+}
+
+/// Parse a response into fields.
+///
+/// Every `key: value` line, with the comments and the boilerplate dropped.
+/// A line beginning with `%`, `#` or `>>>` is a comment in one registry or
+/// another, and a line with no colon is prose.
+pub fn parse(text: str) -> WhoisRecord {
+    var out: [WhoisField] = []
+    for raw in text.split("\n") {
+        let line = raw.trim()
+        if line == "" or line.starts_with("%") or line.starts_with("#") or
+        line.starts_with(">>>") {
+            continue
+        }
+        let colon = line.index_of(":") ?? (0 - 1)
+        if colon <= 0 {
+            continue
+        }
+        let key = line.substr(0, colon).trim().to_lower()
+        let value = line.substr(colon + 1, line.len() - colon - 1).trim()
+        if value != "" {
+            out.push(WhoisField{ key: key, value: value })
+        }
+    }
+    return WhoisRecord{ field: out, source: "" }
+}
+
+/// The first value for a key, whatever its case.
+pub fn first(r: WhoisRecord, key: str) -> Option[str] {
+    let wanted = key.to_lower()
+    for f in r.field {
+        if f.key == wanted {
+            return Some(f.value)
+        }
+    }
+    return None
+}
+
+/// Every value for a key.
+///
+/// Every one, not the last: name servers, status codes and contact addresses
+/// all repeat, and a reader that keeps only the last returns one name server
+/// for a domain that has four.
+pub fn all(r: WhoisRecord, key: str) -> [str] {
+    var out: [str] = []
+    let wanted = key.to_lower()
+    for f in r.field {
+        if f.key == wanted {
+            out.push(f.value)
+        }
+    }
+    return out
+}
+
+/// The first value for whichever of these keys is present.
+///
+/// The way to read a field whose name varies: `registrar`,
+/// `sponsoring registrar` and `registrar name` are the same thing at three
+/// registries.
+pub fn first_of(r: WhoisRecord, keys: [str]) -> Option[str] {
+    for key in keys {
+        match first(r, key) {
+            Some(value) -> return Some(value)
+            None -> {}
+        }
+    }
+    return None
+}
+
+/// The registrar, under whichever name the registry used.
+pub fn registrar(r: WhoisRecord) -> Option[str] {
+    return first_of(r, ["registrar", "sponsoring registrar", "registrar name",
+        "registrar organization"])
+}
+
+/// The expiry date, under whichever name the registry used.
+pub fn expires(r: WhoisRecord) -> Option[str] {
+    return first_of(r, ["registry expiry date", "expiry date",
+        "expiration date", "registrar registration expiration date",
+        "paid-till", "expires"])
+}
+
+/// The creation date.
+pub fn created(r: WhoisRecord) -> Option[str] {
+    return first_of(r, ["creation date", "created", "registered on",
+        "domain registration date"])
+}
+
+/// The name servers, lower-cased and without duplicates.
+///
+/// Registries differ on case and some append the address in the same field;
+/// this takes the first token and folds the case, so two records for the same
+/// domain compare equal.
+pub fn name_servers(r: WhoisRecord) -> [str] {
+    var out: [str] = []
+    for value in all(r, "name server") {
+        push_server(out, value)
+    }
+    for value in all(r, "nserver") {
+        push_server(out, value)
+    }
+    for value in all(r, "nameserver") {
+        push_server(out, value)
+    }
+    return out
+}
+
+fn push_server(inout out: [str], value: str) {
+    let parts = value.trim().to_lower().split(" ")
+    if parts.len() == 0 {
+        return
+    }
+    let name = parts[0]
+    if name == "" {
+        return
+    }
+    for existing in out {
+        if existing == name {
+            return
+        }
+    }
+    out.push(name)
+}
+
+/// The status codes, which is where a domain's real state is.
+///
+/// `clientTransferProhibited` is normal; `pendingDelete` and `redemptionPeriod`
+/// mean the registration has lapsed and is on its way out. A tool that reports
+/// only the expiry date misses that a domain expired three weeks ago and is in
+/// its grace period.
+pub fn statuses(r: WhoisRecord) -> [str] {
+    var out: [str] = []
+    for value in all(r, "domain status") {
+        out.push(first_token(value))
+    }
+    for value in all(r, "status") {
+        out.push(first_token(value))
+    }
+    return out
+}
+
+fn first_token(value: str) -> str {
+    let parts = value.trim().split(" ")
+    if parts.len() == 0 {
+        return value
+    }
+    return parts[0]
+}
+
+// ------------------------------------------------------------ referrals
+
+/// The next server to ask, if this answer is a referral.
+///
+/// IANA answers with `whois:`; a registry answers with
+/// `Registrar WHOIS Server:`. A client that stops at the first response
+/// reports the referral as the record, which is why a lookup so often comes
+/// back with three fields and no registrant.
+pub fn referral_of(r: WhoisRecord) -> Option[str] {
+    return first_of(r, ["registrar whois server", "whois", "whois server",
+        "refer"])
+}
+
+/// Whether an answer is a referral rather than a record.
+pub fn is_referral(r: WhoisRecord) -> bool {
+    return referral_of(r) != None and registrar(r) == None
+}
+
+/// Whether the answer says the domain is not registered.
+///
+/// The phrasings are the registries' own, and they are not errors: an
+/// available domain returns a normal, successful response whose body says so
+/// in prose. A client that only checks for a network error reports every
+/// unregistered domain as registered with no fields.
+pub fn is_available(text: str) -> bool {
+    let lowered = text.to_lower()
+    let phrases = ["no match for", "not found", "no entries found",
+        "no data found", "domain not found", "no object found",
+        "status: free", "status: available", "nothing found"]
+    for p in phrases {
+        if lowered.contains(p) {
+            return true
+        }
+    }
+    return false
+}
+
+/// Whether the server refused because of a rate limit.
+///
+/// Also a successful response with prose in it. A crawler that does not check
+/// records "no such domain" for every domain it looks at after the limit.
+pub fn is_rate_limited(text: str) -> bool {
+    let lowered = text.to_lower()
+    let phrases = ["rate limit", "too many requests", "exceeded",
+        "quota exceeded", "try again later", "your connection limit"]
+    for p in phrases {
+        if lowered.contains(p) {
+            return true
+        }
+    }
+    return false
+}
+
+/// Whether the record has been redacted for privacy.
+///
+/// Since GDPR most registries return a record with the registrant replaced.
+/// The domain is registered and the contact is not available, which is a
+/// third answer distinct from "registered" and "available".
+pub fn is_redacted(text: str) -> bool {
+    let lowered = text.to_lower()
+    let phrases = ["redacted for privacy", "data protected",
+        "gdpr masked", "not disclosed", "privacy service",
+        "redacted | registry policy"]
+    for p in phrases {
+        if lowered.contains(p) {
+            return true
+        }
+    }
+    return false
+}
+
+/// What an answer actually says, as one word.
+pub fn verdict(text: str) -> str {
+    if is_rate_limited(text) {
+        return "rate limited"
+    }
+    if is_available(text) {
+        return "available"
+    }
+    let record = parse(text)
+    if is_referral(record) {
+        return "referral"
+    }
+    if is_redacted(text) {
+        return "registered, redacted"
+    }
+    if record.field.len() == 0 {
+        return "no fields"
+    }
+    return "registered"
+}
+
+// ----------------------------------------------------------------- RDAP
+
+/// The RDAP URL for a domain at a bootstrap base.
+///
+/// RDAP is what WHOIS should have been: JSON over HTTPS, with a schema, a
+/// status code that means something, and a bootstrap registry that says which
+/// server serves which TLD. A new tool should ask this first and fall back to
+/// WHOIS only for the registries that have not moved.
+pub fn rdap_url_for(base: str, name: str) -> str ! WhoisError {
+    if name.trim() == "" {
+        fail(WhoisNoQuery)
+    }
+    var root = base
+    if root.ends_with("/") {
+        root = root.substr(0, root.len() - 1)
+    }
+    return root + "/domain/" + name.trim().to_lower()
+}
+
+/// The IANA RDAP bootstrap, which says which server serves a TLD.
+pub fn rdap_bootstrap() -> str {
+    return "https://data.iana.org/rdap/dns.json"
+}
+
+/// A record rendered back as text, for a cache or a log.
+pub fn render(r: WhoisRecord) -> str {
+    var lines: [str] = []
+    for f in r.field {
+        lines.push(f.key + ": " + f.value)
+    }
+    return lines.join("\n")
+}
+
+/// How many fields a record holds.
+pub fn count(r: WhoisRecord) -> i64 {
+    return r.field.len()
+}

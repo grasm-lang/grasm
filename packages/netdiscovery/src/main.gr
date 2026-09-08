@@ -1,0 +1,397 @@
+// Finding things on a local network: DNS-SD service names, and SSDP.
+//
+// Two protocols, both of which work by shouting on a multicast address and
+// listening. The parts worth implementing are the *naming* rules, because
+// that is where every implementation goes wrong:
+//
+// **A DNS-SD instance name is three labels, and the instance label may
+// contain dots.** `Brother HL-2270DW._ipp._tcp.local` is not four labels
+// joined by dots — it is one instance label, a service label, a protocol
+// label and a domain. Splitting on `.` is wrong the moment a printer is
+// called "Office 2.0", which is why `parse_instance` splits from the right.
+//
+// **The instance label is UTF-8 and is meant to be shown to a person.** It is
+// not an identifier, it may be renamed by the user, and it may collide — the
+// protocol's answer to a collision is to append " (2)". Code that treats it
+// as a key gets two printers with the same one.
+//
+// **A service type is `_name._tcp`**, with the underscore, at most fifteen
+// characters after it, and only letters, digits and hyphens. A name that
+// breaks those rules is ignored by the resolver rather than rejected, which
+// is why a service that does not appear usually has an illegal name.
+//
+// SSDP is HTTP-shaped and is not HTTP: the request line is
+// `M-SEARCH * HTTP/1.1`, the headers are case-insensitive, and `MAN` must be
+// quoted — `MAN: "ssdp:discover"` with the quotes, which a surprising number
+// of devices reject when they are missing. `search_request` writes it
+// correctly and `parse_response` reads what comes back.
+
+type DnsSdInstance = {
+    /// The human-readable name, which may contain dots.
+    instance: str,
+    /// `_ipp`, `_http` and so on, with the underscore.
+    service: str,
+    /// `_tcp` or `_udp`.
+    protocol: str,
+    /// Usually `local`.
+    domain: str,
+}
+
+/// A key-value pair from a TXT record.
+type DnsSdPair = {
+    key: str,
+    value: str,
+    /// Whether the key was present with no `=` at all, which is not the same
+    /// as an empty value.
+    present_only: bool,
+}
+
+/// An SSDP message, request or response.
+type SsdpMessage = {
+    /// The start line, verbatim.
+    start_line: str,
+    header: [DnsSdPair],
+}
+
+type DiscoveryError =
+    | DiscoveryBadInstance(name: str)
+    | DiscoveryBadServiceType(name: str)
+    | DiscoveryBadTxt(at: i64)
+    | DiscoveryNotSsdp(line: str)
+
+    /// The multicast address and port DNS-SD uses on IPv4.
+pub fn mdns_address() -> str {
+    return "224.0.0.251"
+}
+
+pub fn mdns_port() -> i64 {
+    return 5353
+}
+
+/// The multicast address and port SSDP uses on IPv4.
+pub fn ssdp_address() -> str {
+    return "239.255.255.250"
+}
+
+pub fn ssdp_port() -> i64 {
+    return 1900
+}
+
+/// Whether a service label is legal.
+///
+/// An underscore, then one to fifteen characters of letters, digits and
+/// hyphens, not beginning or ending with a hyphen. A service whose name
+/// breaks this is ignored by resolvers rather than refused, so a service that
+/// never appears usually has an illegal name and no error anywhere.
+pub fn is_valid_service(label: str) -> bool {
+    if not label.starts_with("_") {
+        return false
+    }
+    let body = label.substr(1, label.len() - 1)
+    if body.len() < 1 or body.len() > 15 {
+        return false
+    }
+    if body.starts_with("-") or body.ends_with("-") {
+        return false
+    }
+    var letters = 0
+    for c in body.chars() {
+        let ok = (c >= "a" and c <= "z") or (c >= "A" and c <= "Z") or
+        (c >= "0" and c <= "9") or c == "-"
+        if not ok {
+            return false
+        }
+        if c != "-" and not (c >= "0" and c <= "9") {
+            letters = letters + 1
+        }
+    }
+    // At least one letter, so `_123` is not a service.
+    return letters > 0
+}
+
+/// Parse an instance name into its four parts.
+///
+/// From the right, because the instance label may contain dots and the other
+/// three may not. `Office 2.0._http._tcp.local` is one instance called
+/// "Office 2.0" — splitting from the left makes it "Office" with a service
+/// of `2`.
+pub fn parse_instance(name: str) -> DnsSdInstance ! DiscoveryError {
+    let parts = name.split(".")
+    if parts.len() < 4 {
+        fail(DiscoveryBadInstance(name))
+    }
+    let domain = parts[parts.len() - 1]
+    let protocol = parts[parts.len() - 2]
+    let service = parts[parts.len() - 3]
+    if protocol != "_tcp" and protocol != "_udp" {
+        fail(DiscoveryBadInstance(name))
+    }
+    if not is_valid_service(service) {
+        fail(DiscoveryBadServiceType(service))
+    }
+    var head: [str] = []
+    for i in 0..(parts.len() - 3) {
+        head.push(parts[i])
+    }
+    return DnsSdInstance{ instance: head.join("."), service: service,
+        protocol: protocol, domain: domain }
+}
+
+/// The full instance name.
+pub fn render_instance(i: DnsSdInstance) -> str {
+    return i.instance + "." + i.service + "." + i.protocol + "." + i.domain
+}
+
+/// The service type, which is what a browse query asks for.
+pub fn service_type(i: DnsSdInstance) -> str {
+    return i.service + "." + i.protocol + "." + i.domain
+}
+
+/// The name a collision is resolved to.
+///
+/// The protocol's own rule: append ` (2)`, then ` (3)`, and so on. A
+/// responder that instead refuses to start leaves the service invisible, and
+/// one that keeps the name has two devices answering for it.
+pub fn next_on_collision(instance: str) -> str {
+    if instance.ends_with(")") {
+        let open = last_index_of(instance, " (")
+        if open >= 0 {
+            let inner = instance.substr(open + 2,
+                instance.len() - open - 3)
+            match inner.parse_int() {
+                Some(n) -> return instance.substr(0, open) + " ({n + 1})"
+                None -> {}
+            }
+        }
+    }
+    return instance + " (2)"
+}
+
+fn last_index_of(text: str, what: str) -> i64 {
+    var at = 0 - 1
+    var i = 0
+    while i + what.len() <= text.len() {
+        if text.substr(i, what.len()) == what {
+            at = i
+        }
+        i = i + 1
+    }
+    return at
+}
+
+// --------------------------------------------------------- TXT records
+
+/// Parse a TXT record's key-value pairs.
+///
+/// Each string is `key=value`, and a string with no `=` is a key that is
+/// *present* with no value — which is not the same as `key=`, an empty value.
+/// The distinction is in the specification and is how a boolean flag is
+/// carried.
+///
+/// Keys are case-insensitive and the first occurrence wins, which is the
+/// opposite of most formats and is what the specification says.
+pub fn parse_txt(strings: [str]) -> [DnsSdPair] {
+    var out: [DnsSdPair] = []
+    for s in strings {
+        if s == "" {
+            continue
+        }
+        let equals = s.index_of("=") ?? (0 - 1)
+        var key = s
+        var value = ""
+        var present_only = true
+        if equals >= 0 {
+            key = s.substr(0, equals)
+            value = s.substr(equals + 1, s.len() - equals - 1)
+            present_only = false
+        }
+        let folded = key.to_lower()
+        var already = false
+        for p in out {
+            if p.key == folded {
+                already = true
+            }
+        }
+        if not already and folded != "" {
+            out.push(DnsSdPair{ key: folded, value: value,
+                present_only: present_only })
+        }
+    }
+    return out
+}
+
+/// The value for a key, or `None`.
+pub fn txt_value(pairs: [DnsSdPair], key: str) -> Option[str] {
+    let wanted = key.to_lower()
+    for p in pairs {
+        if p.key == wanted {
+            return Some(p.value)
+        }
+    }
+    return None
+}
+
+/// Whether a key is present at all, with or without a value.
+pub fn txt_present(pairs: [DnsSdPair], key: str) -> bool {
+    return txt_value(pairs, key) != None
+}
+
+/// Render pairs back to the strings a TXT record carries.
+pub fn render_txt(pairs: [DnsSdPair]) -> [str] {
+    var out: [str] = []
+    for p in pairs {
+        if p.present_only {
+            out.push(p.key)
+        } else {
+            out.push(p.key + "=" + p.value)
+        }
+    }
+    return out
+}
+
+/// Whether a TXT record fits what the specification recommends.
+///
+/// Under 200 bytes in total keeps it in one packet with the rest of the
+/// answer; over 1300 will not fit a single UDP datagram on Ethernet and the
+/// record is silently truncated by something on the path.
+pub fn txt_is_small(pairs: [DnsSdPair]) -> bool {
+    var total = 0
+    for s in render_txt(pairs) {
+        total = total + s.to_bytes().len() + 1
+    }
+    return total <= 200
+}
+
+// -------------------------------------------------------------- SSDP
+
+/// An `M-SEARCH` request.
+///
+/// `MAN` must be quoted. `MX` is the number of seconds a device may wait
+/// before answering, and it exists to spread the replies out — a search with
+/// `MX: 1` on a network of two hundred devices produces two hundred replies
+/// in one second and loses most of them to buffer overflow.
+pub fn search_request(target: str, seconds: i64) -> str {
+    return "M-SEARCH * HTTP/1.1\r\n" +
+    "HOST: " + ssdp_address() + ":{ssdp_port()}\r\n" +
+    "MAN: \"ssdp:discover\"\r\n" +
+    "MX: {seconds}\r\n" +
+    "ST: " + target + "\r\n\r\n"
+}
+
+/// The search target that matches everything.
+pub fn all_devices() -> str {
+    return "ssdp:all"
+}
+
+/// The search target for the root device of every UPnP host.
+pub fn root_devices() -> str {
+    return "upnp:rootdevice"
+}
+
+/// Parse an SSDP message: the start line and the headers.
+///
+/// The headers are folded to lower case because SSDP implementations disagree
+/// about capitalisation and the specification says they are case-insensitive —
+/// a client that looks for `Location` finds nothing on the devices that send
+/// `LOCATION`.
+pub fn parse_message(text: str) -> SsdpMessage ! DiscoveryError {
+    var lines: [str] = []
+    for raw in text.split("\n") {
+        var line = raw
+        if line.ends_with("\r") {
+            line = line.substr(0, line.len() - 1)
+        }
+        lines.push(line)
+    }
+    if lines.len() == 0 or lines[0].trim() == "" {
+        fail(DiscoveryNotSsdp(""))
+    }
+    let start = lines[0].trim()
+    if not start.contains("HTTP/1.1") {
+        fail(DiscoveryNotSsdp(start))
+    }
+    var header: [DnsSdPair] = []
+    for i in 1..lines.len() {
+        let line = lines[i]
+        if line.trim() == "" {
+            break
+        }
+        let colon = line.index_of(":") ?? (0 - 1)
+        if colon <= 0 {
+            continue
+        }
+        header.push(DnsSdPair{
+            key: line.substr(0, colon).trim().to_lower(),
+            value: line.substr(colon + 1, line.len() - colon - 1).trim(),
+            present_only: false })
+    }
+    return SsdpMessage{ start_line: start, header: header }
+}
+
+/// A header's value.
+pub fn header_value(m: SsdpMessage, name: str) -> Option[str] {
+    let wanted = name.to_lower()
+    for h in m.header {
+        if h.key == wanted {
+            return Some(h.value)
+        }
+    }
+    return None
+}
+
+/// Whether a message is a search rather than a response or a notification.
+pub fn is_search(m: SsdpMessage) -> bool {
+    return m.start_line.starts_with("M-SEARCH")
+}
+
+/// Whether a message is a device announcing or withdrawing itself.
+pub fn is_notify(m: SsdpMessage) -> bool {
+    return m.start_line.starts_with("NOTIFY")
+}
+
+/// The description URL a response points at, which is the point of the reply.
+pub fn location_of(m: SsdpMessage) -> Option[str] {
+    return header_value(m, "location")
+}
+
+/// How long a response says it is valid for, from `CACHE-CONTROL`.
+///
+/// `max-age=1800` inside a header that otherwise looks like HTTP's. A device
+/// that has not re-announced within this should be dropped, and a client that
+/// ignores it accumulates devices that left the network months ago.
+pub fn max_age_of(m: SsdpMessage) -> i64 {
+    match header_value(m, "cache-control") {
+        None -> return 0 - 1
+        Some(value) -> {
+            for part in value.split(",") {
+                let piece = part.trim().to_lower()
+                if piece.starts_with("max-age") {
+                    let equals = piece.index_of("=") ?? (0 - 1)
+                    if equals >= 0 {
+                        let tail = piece.substr(equals + 1,
+                            piece.len() - equals - 1)
+                        return tail.trim().parse_int() ?? (0 - 1)
+                    }
+                }
+            }
+            return 0 - 1
+        }
+    }
+}
+
+/// Whether a search is well formed enough for a strict device to answer it.
+///
+/// The quoted `MAN` is the one that catches people: a device that follows the
+/// specification strictly ignores `MAN: ssdp:discover` without the quotes,
+/// and the symptom is a search that finds some devices and not others.
+pub fn search_is_wellformed(m: SsdpMessage) -> bool {
+    if not is_search(m) {
+        return false
+    }
+    let man = header_value(m, "man") ?? ""
+    if man != "\"ssdp:discover\"" {
+        return false
+    }
+    return header_value(m, "st") != None and
+    header_value(m, "mx") != None and header_value(m, "host") != None
+}

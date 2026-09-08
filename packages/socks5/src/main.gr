@@ -1,0 +1,442 @@
+// SOCKS5, RFC 1928: the handshake, the request, and the reply.
+//
+// A proxy protocol worth having because it is the only one that carries
+// arbitrary TCP rather than only HTTP — which is why SSH's `-D`, Tor's client
+// port and every "proxy the whole application" setting speak it.
+//
+// Three things about it are worth stating, because each is a decision the
+// protocol made that a caller has to know about:
+//
+// **A domain name can be sent unresolved.** Address type 3 carries the name
+// and lets the proxy resolve it. That is the difference between a proxy that
+// hides which host you are visiting and one that does not — a client that
+// resolves locally first leaks the name to its own resolver, which is how
+// "all traffic through the proxy" fails to be true. `request_domain` sends
+// the name.
+//
+// **The username and password method is not encryption.** Method 2 sends both
+// in the clear, in a sub-negotiation that is its own little protocol (RFC
+// 1929) with its own version byte of 1 — not 5. Getting that byte wrong is
+// the commonest handshake bug, and it is why `credentials` is separate from
+// everything else here.
+//
+// **The reply's bound address is not the destination.** It is the address the
+// proxy used on its side, and for `CONNECT` most proxies return zeros. A
+// client that treats it as the peer address is reading a field the server was
+// never required to fill in.
+//
+// This package builds and parses the messages. It opens no socket: the caller
+// writes the bytes and reads the replies, which is what keeps a proxy client
+// out of the capability set of anything that merely wants to speak the
+// protocol.
+
+import ipaddr
+
+/// What a client offers or a server chooses.
+type SocksMethod =
+    | SocksNoAuth
+    | SocksGssapi
+    | SocksUserPass
+    | SocksNoneAcceptable
+    | SocksOther(code: i64)
+
+    /// The three commands.
+type SocksCommand =
+    | SocksConnect
+    | SocksBind
+    | SocksUdpAssociate
+
+    /// An address, in one of the three forms the protocol carries.
+type SocksAddress =
+    | SocksIpv4(octets: [i64])
+    | SocksDomain(name: str)
+    | SocksIpv6(octets: [i64])
+
+    /// A parsed request or reply.
+type SocksMessage = {
+    /// For a request: the command. For a reply: the status.
+    code: i64,
+    address: SocksAddress,
+    port: i64,
+}
+
+type SocksError =
+    | SocksBadVersion(found: i64)
+    | SocksTruncated(at: i64)
+    | SocksBadAddressType(code: i64)
+    | SocksNameTooLong(length: i64)
+    | SocksBadPort(port: i64)
+    | SocksNoMethods
+    | SocksBadCredentials(why: str)
+
+    /// The protocol's version byte.
+pub fn version() -> i64 {
+    return 5
+}
+
+/// The version byte of the username-and-password sub-negotiation.
+///
+/// One, not five. It is a different protocol with its own version, and using
+/// 5 here is the mistake that makes a server close the connection with no
+/// message.
+pub fn auth_version() -> i64 {
+    return 1
+}
+
+pub fn method_code(m: SocksMethod) -> i64 {
+    match m {
+        SocksNoAuth -> return 0
+        SocksGssapi -> return 1
+        SocksUserPass -> return 2
+        SocksNoneAcceptable -> return 255
+        SocksOther(code) -> return code
+    }
+}
+
+pub fn method_from(code: i64) -> SocksMethod {
+    if code == 0 {
+        return SocksNoAuth
+    }
+    if code == 1 {
+        return SocksGssapi
+    }
+    if code == 2 {
+        return SocksUserPass
+    }
+    if code == 255 {
+        return SocksNoneAcceptable
+    }
+    return SocksOther(code)
+}
+
+pub fn method_name(m: SocksMethod) -> str {
+    match m {
+        SocksNoAuth -> return "no authentication"
+        SocksGssapi -> return "GSSAPI"
+        SocksUserPass -> return "username and password"
+        SocksNoneAcceptable -> return "no acceptable method"
+        SocksOther(code) -> return "method {code}"
+    }
+}
+
+pub fn command_code(c: SocksCommand) -> i64 {
+    match c {
+        SocksConnect -> return 1
+        SocksBind -> return 2
+        SocksUdpAssociate -> return 3
+    }
+}
+
+/// What a reply code means.
+///
+/// The strings matter: a proxy that answers 2 is refusing on policy grounds
+/// and no retry will help, while a 4 or 5 is about the destination and a
+/// different one might work. Reporting them all as "the proxy said no" is
+/// what makes proxy problems hard to diagnose.
+pub fn reply_meaning(code: i64) -> str {
+    if code == 0 {
+        return "succeeded"
+    }
+    if code == 1 {
+        return "general failure"
+    }
+    if code == 2 {
+        return "not allowed by ruleset"
+    }
+    if code == 3 {
+        return "network unreachable"
+    }
+    if code == 4 {
+        return "host unreachable"
+    }
+    if code == 5 {
+        return "connection refused"
+    }
+    if code == 6 {
+        return "TTL expired"
+    }
+    if code == 7 {
+        return "command not supported"
+    }
+    if code == 8 {
+        return "address type not supported"
+    }
+    return "unassigned reply {code}"
+}
+
+// -------------------------------------------------------- the greeting
+
+/// The client's opening message: the methods it can use.
+pub fn greeting(methods: [SocksMethod]) -> bytes ! SocksError {
+    if methods.len() == 0 {
+        fail(SocksNoMethods)
+    }
+    var out: [i64] = [version(), methods.len()]
+    for m in methods {
+        out.push(method_code(m).bit_and(255))
+    }
+    return bytes_of(out)
+}
+
+/// The server's answer: the one method it chose.
+pub fn method_choice(m: SocksMethod) -> bytes {
+    return bytes_of([version(), method_code(m).bit_and(255)])
+}
+
+/// Read the server's chosen method.
+pub fn parse_method_choice(data: bytes) -> SocksMethod ! SocksError {
+    if data.len() < 2 {
+        fail(SocksTruncated(data.len()))
+    }
+    if data.at(0) != version() {
+        fail(SocksBadVersion(data.at(0)))
+    }
+    return method_from(data.at(1))
+}
+
+/// The username-and-password sub-negotiation, RFC 1929.
+pub fn credentials(username: str, password: str) -> bytes ! SocksError {
+    let user = username.to_bytes()
+    let pass = password.to_bytes()
+    if user.len() > 255 or user.len() == 0 {
+        fail(SocksBadCredentials("the username must be 1 to 255 bytes"))
+    }
+    if pass.len() > 255 {
+        fail(SocksBadCredentials("the password must be at most 255 bytes"))
+    }
+    var out: [i64] = [auth_version(), user.len()]
+    for i in 0..user.len() {
+        out.push(user.at(i))
+    }
+    out.push(pass.len())
+    for i in 0..pass.len() {
+        out.push(pass.at(i))
+    }
+    return bytes_of(out)
+}
+
+/// Whether the server accepted the credentials.
+pub fn credentials_accepted(data: bytes) -> bool ! SocksError {
+    if data.len() < 2 {
+        fail(SocksTruncated(data.len()))
+    }
+    if data.at(0) != auth_version() {
+        fail(SocksBadVersion(data.at(0)))
+    }
+    return data.at(1) == 0
+}
+
+// --------------------------------------------------------- the request
+
+fn push_address(inout out: [i64], address: SocksAddress) ! SocksError {
+    match address {
+        SocksIpv4(octets) -> {
+            out.push(1)
+            for o in octets {
+                out.push(o.bit_and(255))
+            }
+        }
+        SocksDomain(name) -> {
+            let raw = name.to_bytes()
+            if raw.len() > 255 or raw.len() == 0 {
+                fail(SocksNameTooLong(raw.len()))
+            }
+            out.push(3)
+            out.push(raw.len())
+            for i in 0..raw.len() {
+                out.push(raw.at(i))
+            }
+        }
+        SocksIpv6(octets) -> {
+            out.push(4)
+            for o in octets {
+                out.push(o.bit_and(255))
+            }
+        }
+    }
+}
+
+/// A request for a command, an address and a port.
+pub fn request(command: SocksCommand, address: SocksAddress,
+    port: i64) -> bytes ! SocksError {
+    if port < 1 or port > 65535 {
+        fail(SocksBadPort(port))
+    }
+    var out: [i64] = [version(), command_code(command), 0]
+    try push_address(out, address)
+    out.push(port.ushr(8).bit_and(255))
+    out.push(port.bit_and(255))
+    return bytes_of(out)
+}
+
+/// A `CONNECT` to a name the *proxy* resolves.
+///
+/// The form that keeps the destination name off the client's own resolver.
+/// Resolving locally and sending the address is a request that works and
+/// leaks which host is being visited to anyone watching the client's DNS.
+pub fn request_domain(name: str, port: i64) -> bytes ! SocksError {
+    return try request(SocksConnect, SocksDomain(name), port)
+}
+
+/// A `CONNECT` to an address already resolved.
+pub fn request_address(text: str, port: i64) -> bytes ! SocksError {
+    return try request(SocksConnect, try address_of(text), port)
+}
+
+/// Parse an address from its text form.
+///
+/// Anything that is not a dotted quad is treated as a name, which is the
+/// right default: a proxy resolves a name and a client that guessed wrong
+/// merely sends a name the proxy cannot resolve, rather than a malformed
+/// address the proxy rejects.
+pub fn address_of(text: str) -> SocksAddress ! SocksError {
+    match ipaddr.parse(text) {
+        Ok(packed) -> {
+            return SocksIpv4([packed.ushr(24).bit_and(255),
+                packed.ushr(16).bit_and(255), packed.ushr(8).bit_and(255),
+                packed.bit_and(255)])
+        }
+        Err(_e) -> return SocksDomain(text)
+    }
+}
+
+/// A server's reply: a status, the bound address and the bound port.
+pub fn reply(status: i64, address: SocksAddress,
+    port: i64) -> bytes ! SocksError {
+    var out: [i64] = [version(), status.bit_and(255), 0]
+    try push_address(out, address)
+    out.push(port.ushr(8).bit_and(255))
+    out.push(port.bit_and(255))
+    return bytes_of(out)
+}
+
+/// Parse a request or a reply — they have the same shape.
+pub fn parse_message(data: bytes) -> SocksMessage ! SocksError {
+    if data.len() < 7 {
+        fail(SocksTruncated(data.len()))
+    }
+    if data.at(0) != version() {
+        fail(SocksBadVersion(data.at(0)))
+    }
+    let code = data.at(1)
+    var at = 3
+    var address = SocksIpv4([0, 0, 0, 0])
+    let kind = data.at(at)
+    at = at + 1
+    if kind == 1 {
+        if at + 4 > data.len() {
+            fail(SocksTruncated(at))
+        }
+        address = SocksIpv4(data.slice(at, at + 4).to_list())
+        at = at + 4
+    } else {
+        if kind == 3 {
+            if at >= data.len() {
+                fail(SocksTruncated(at))
+            }
+            let length = data.at(at)
+            at = at + 1
+            if at + length > data.len() {
+                fail(SocksTruncated(at))
+            }
+            address = SocksDomain(data.slice(at, at + length).to_str())
+            at = at + length
+        } else {
+            if kind == 4 {
+                if at + 16 > data.len() {
+                    fail(SocksTruncated(at))
+                }
+                address = SocksIpv6(data.slice(at, at + 16).to_list())
+                at = at + 16
+            } else {
+                fail(SocksBadAddressType(kind))
+            }
+        }
+    }
+    if at + 2 > data.len() {
+        fail(SocksTruncated(at))
+    }
+    return SocksMessage{ code: code,
+        address: address,
+        port: data.at(at).shl(8).bit_or(data.at(at + 1)) }
+}
+
+/// An address as text.
+pub fn address_text(a: SocksAddress) -> str {
+    match a {
+        SocksIpv4(octets) -> {
+            var parts: [str] = []
+            for o in octets {
+                parts.push("{o}")
+            }
+            return parts.join(".")
+        }
+        SocksDomain(name) -> return name
+        SocksIpv6(octets) -> {
+            let digits = "0123456789abcdef"
+            var groups: [str] = []
+            var i = 0
+            while i + 1 < octets.len() {
+                let value = octets[i].shl(8).bit_or(octets[i + 1])
+                var text = ""
+                var shift = 12
+                while shift >= 0 {
+                    let nibble = value.ushr(shift).bit_and(15)
+                    text = text + digits.substr(nibble, 1)
+                    shift = shift - 4
+                }
+                groups.push(text)
+                i = i + 2
+            }
+            return groups.join(":")
+        }
+    }
+}
+
+/// Whether a reply means the connection is open.
+pub fn succeeded(m: SocksMessage) -> bool {
+    return m.code == 0
+}
+
+/// The bound address a reply carries, and a warning about it.
+///
+/// For a `CONNECT` most proxies send zeros here, because the field is about
+/// the proxy's own socket and nothing requires it to be filled in. A client
+/// that reads it as the peer's address gets `0.0.0.0` from a working proxy.
+pub fn bound_is_meaningful(m: SocksMessage) -> bool {
+    match m.address {
+        SocksIpv4(octets) -> {
+            for o in octets {
+                if o != 0 {
+                    return true
+                }
+            }
+            return false
+        }
+        SocksDomain(name) -> return name != ""
+        SocksIpv6(octets) -> {
+            for o in octets {
+                if o != 0 {
+                    return true
+                }
+            }
+            return false
+        }
+    }
+}
+
+/// The UDP request header that wraps every datagram through a proxy.
+///
+/// A SOCKS5 UDP association wraps each datagram in a header naming the real
+/// destination — which means the proxy has to be able to fragment, and the
+/// fragment field is why almost no proxy implements UDP at all. Sending a
+/// non-zero fragment number to a proxy that does not support it gets the
+/// datagram dropped with no error.
+pub fn udp_header(fragment: i64, address: SocksAddress,
+    port: i64) -> bytes ! SocksError {
+    var out: [i64] = [0, 0, fragment.bit_and(255)]
+    try push_address(out, address)
+    out.push(port.ushr(8).bit_and(255))
+    out.push(port.bit_and(255))
+    return bytes_of(out)
+}
