@@ -1,0 +1,364 @@
+// Fixed-width records: the format banks and governments still send.
+//
+// No delimiters, no quoting, no header. A record is a line and a field is a
+// range of columns in it, and the layout lives somewhere else — in a
+// copybook, a spec document, or an email from 2006. That is the format's one
+// real property and the source of everything below.
+//
+// ## What makes it dangerous rather than merely awkward
+//
+// **A field that overflows its column eats the next one.** There is no
+// delimiter to stop it, so a name one character too long shifts every
+// following field by one and the file still parses. `render_line` refuses
+// rather than truncating: a silently shortened account number is worse than
+// a failed export, because the export gets noticed.
+//
+// **Padding is not data, except when it is.** A trailing run of spaces is
+// almost always padding. A *leading* one may be a right-aligned number, and
+// stripping it is right; or it may be a name that genuinely begins with a
+// space, and stripping it is wrong. `parse_line` trims and `parse_line_raw`
+// does not, and a caller reading a spec should know which it needs.
+//
+// **Columns are characters here, and bytes in the original.** A mainframe
+// format counts bytes, because it predates Unicode. For anything ASCII the
+// two agree; for a file with an accent in it they do not, and this counts
+// characters. A caller handling EBCDIC or Shift-JIS records needs to decode
+// to text first and check that the widths still line up.
+//
+// ## Inference, and what it cannot know
+//
+// `infer` finds the columns that are blank on every line and calls them
+// separators, which is what `pandas.read_fwf` does and what works. It is
+// still a guess: a column that happens to be blank across a short sample but
+// not across the file splits one field into two, and the failure appears
+// halfway through a load. Infer to *read* a file whose spec is lost; never to
+// write one.
+//
+// Checked against `pandas.read_fwf` with inferred columns, field for field.
+
+type FixedField = {
+    name: str,
+    /// The first column, counting from zero.
+    start: i64,
+    width: i64,
+}
+
+type FixedLayout = { fields: [FixedField] }
+
+type FixedWidthError =
+    | FieldTooLong(name: str, width: i64, given: i64)
+    | WrongFieldCount(expected: i64, given: i64)
+    | OverlappingFields(first: str, second: str)
+
+pub fn field(name: str, start: i64, width: i64) -> FixedField {
+    return FixedField{ name: name, start: start, width: width }
+}
+
+pub fn layout(fields: [FixedField]) -> FixedLayout {
+    return FixedLayout{ fields: fields }
+}
+
+/// A layout from widths alone, laid out end to end.
+///
+/// The commonest way a spec is written down — "10, 30, 8" — and the one that
+/// cannot produce a gap or an overlap by accident.
+pub fn from_widths(names: [str], widths: [i64]) -> FixedLayout {
+    var out: [FixedField] = []
+    var at = 0
+    var i = 0
+    while i < widths.len() {
+        let name = if i < names.len() { names[i] } else { "column_{i}" }
+        out.push(field(name, at, widths[i]))
+        at = at + widths[i]
+        i = i + 1
+    }
+    return layout(out)
+}
+
+pub fn total_width(l: FixedLayout) -> i64 {
+    var end = 0
+    for f in l.fields {
+        if f.start + f.width > end {
+            end = f.start + f.width
+        }
+    }
+    return end
+}
+
+/// Pairs of fields that share a column.
+///
+/// A layout transcribed by hand from a spec is where this happens, and an
+/// overlap is not detectable from the data: both fields parse, one of them is
+/// wrong, and nothing says so.
+pub fn overlaps(l: FixedLayout) -> [(str, str)] {
+    var out: [(str, str)] = []
+    var i = 0
+    while i < l.fields.len() {
+        var j = i + 1
+        while j < l.fields.len() {
+            let a = l.fields[i]
+            let b = l.fields[j]
+            if a.start < b.start + b.width and b.start < a.start + a.width {
+                out.push((a.name, b.name))
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+/// Columns the layout does not name — usually filler, occasionally a field
+/// somebody forgot.
+pub fn gaps(l: FixedLayout) -> [(i64, i64)] {
+    var covered: [bool] = []
+    let width = total_width(l)
+    for _i in 0..width {
+        covered.push(false)
+    }
+    for f in l.fields {
+        var k = f.start
+        while k < f.start + f.width and k < width {
+            covered[k] = true
+            k = k + 1
+        }
+    }
+    var out: [(i64, i64)] = []
+    var i = 0
+    while i < width {
+        if covered[i] {
+            i = i + 1
+            continue
+        }
+        var j = i
+        while j < width and not covered[j] {
+            j = j + 1
+        }
+        out.push((i, j - i))
+        i = j
+    }
+    return out
+}
+
+// ------------------------------------------------------------- reading
+
+fn slice_of(line: [str], start: i64, width: i64) -> str {
+    var out = ""
+    var i = start
+    while i < start + width and i < line.len() {
+        out = out + line[i]
+        i = i + 1
+    }
+    return out
+}
+
+/// The fields of one record, with padding removed.
+pub fn parse_line(l: FixedLayout, line: str) -> [str] {
+    var out: [str] = []
+    let cs = line.chars()
+    for f in l.fields {
+        out.push(slice_of(cs, f.start, f.width).trim())
+    }
+    return out
+}
+
+/// The same, with every space kept — for a format where a leading space is
+/// part of the value.
+pub fn parse_line_raw(l: FixedLayout, line: str) -> [str] {
+    var out: [str] = []
+    let cs = line.chars()
+    for f in l.fields {
+        out.push(slice_of(cs, f.start, f.width))
+    }
+    return out
+}
+
+pub fn parse(l: FixedLayout, text: str) -> [[str]] {
+    var out: [[str]] = []
+    for line in text.split("\n") {
+        var stripped = line
+        if stripped.ends_with("\r") {
+            stripped = stripped.substr(0, stripped.len() - 1)
+        }
+        if stripped.trim() == "" {
+            continue
+        }
+        out.push(parse_line(l, stripped))
+    }
+    return out
+}
+
+pub fn to_maps(l: FixedLayout, rows: [[str]]) -> [Map[str, str]] {
+    var out: [Map[str, str]] = []
+    for row in rows {
+        var entry = map()
+        var i = 0
+        while i < l.fields.len() and i < row.len() {
+            entry.set(l.fields[i].name, row[i])
+            i = i + 1
+        }
+        out.push(entry)
+    }
+    return out
+}
+
+// -------------------------------------------------------------- writing
+
+/// One record, left-aligned and space-padded.
+///
+/// A value wider than its field is an error rather than a truncation: the
+/// caller can shorten it knowingly, and nobody can un-shorten it afterwards.
+pub fn render_line(l: FixedLayout, values: [str]) -> str ! FixedWidthError {
+    if values.len() != l.fields.len() {
+        fail(WrongFieldCount(l.fields.len(), values.len()))
+    }
+    var out = ""
+    var i = 0
+    while i < l.fields.len() {
+        let f = l.fields[i]
+        let v = values[i]
+        if v.len() > f.width {
+            fail(FieldTooLong(f.name, f.width, v.len()))
+        }
+        while out.len() < f.start {
+            out = out + " "
+        }
+        out = out + v
+        var pad = f.width - v.len()
+        while pad > 0 {
+            out = out + " "
+            pad = pad - 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+/// The same, right-aligned — which is what a number wants.
+pub fn render_line_right(l: FixedLayout,
+    values: [str]) -> str ! FixedWidthError {
+    if values.len() != l.fields.len() {
+        fail(WrongFieldCount(l.fields.len(), values.len()))
+    }
+    var out = ""
+    var i = 0
+    while i < l.fields.len() {
+        let f = l.fields[i]
+        let v = values[i]
+        if v.len() > f.width {
+            fail(FieldTooLong(f.name, f.width, v.len()))
+        }
+        while out.len() < f.start {
+            out = out + " "
+        }
+        var pad = f.width - v.len()
+        while pad > 0 {
+            out = out + " "
+            pad = pad - 1
+        }
+        out = out + v
+        i = i + 1
+    }
+    return out
+}
+
+pub fn render(l: FixedLayout, rows: [[str]]) -> str ! FixedWidthError {
+    var out = ""
+    for row in rows {
+        out = out + (try render_line(l, row)) + "\n"
+    }
+    return out
+}
+
+// ------------------------------------------------------------ inference
+
+/// Which columns hold something on at least one line.
+fn occupied(lines: [str]) -> [bool] {
+    var width = 0
+    for line in lines {
+        if line.chars().len() > width {
+            width = line.chars().len()
+        }
+    }
+    var out: [bool] = []
+    for _i in 0..width {
+        out.push(false)
+    }
+    for line in lines {
+        let cs = line.chars()
+        var i = 0
+        while i < cs.len() {
+            if cs[i] != " " and cs[i] != "\t" {
+                out[i] = true
+            }
+            i = i + 1
+        }
+    }
+    return out
+}
+
+/// A layout from the data, taking every column blank on every line as a
+/// separator.
+pub fn infer(text: str) -> FixedLayout {
+    var lines: [str] = []
+    for line in text.split("\n") {
+        var stripped = line
+        if stripped.ends_with("\r") {
+            stripped = stripped.substr(0, stripped.len() - 1)
+        }
+        if stripped.trim() != "" {
+            lines.push(stripped)
+        }
+    }
+    let used = occupied(lines)
+    var out: [FixedField] = []
+    var i = 0
+    var n = 0
+    while i < used.len() {
+        if not used[i] {
+            i = i + 1
+            continue
+        }
+        var j = i
+        while j < used.len() and used[j] {
+            j = j + 1
+        }
+        n = n + 1
+        out.push(field("column_{n}", i, j - i))
+        i = j
+    }
+    return layout(out)
+}
+
+/// The same, but taking the first line as the field names.
+pub fn infer_named(text: str) -> FixedLayout {
+    let l = infer(text)
+    var first = ""
+    for line in text.split("\n") {
+        if line.trim() != "" {
+            first = line
+            break
+        }
+    }
+    let names = parse_line(l, first)
+    var out: [FixedField] = []
+    var i = 0
+    while i < l.fields.len() {
+        let f = l.fields[i]
+        let name = if i < names.len() and names[i] != "" { names[i] } else {
+            f.name
+        }
+        out.push(field(name, f.start, f.width))
+        i = i + 1
+    }
+    return layout(out)
+}
+
+/// A one-line description of the layout, in the form a spec is written in.
+pub fn describe(l: FixedLayout) -> str {
+    var parts: [str] = []
+    for f in l.fields {
+        parts.push("{f.name}({f.start}+{f.width})")
+    }
+    return parts.join(" ")
+}

@@ -1,0 +1,527 @@
+// MediaWiki markup, enough of it to get the facts out.
+//
+// A Wikipedia dump is the largest freely licensed body of structured prose
+// there is, and almost all of the structure is in **templates**: an article's
+// infobox holds the population, the coordinates, the founding date, in named
+// parameters that are the same across every article of that kind. Getting at
+// them is why anyone parses wikitext.
+//
+// ## Why a full parser is not the goal
+//
+// MediaWiki's syntax is defined by its implementation, has no grammar, and
+// includes a macro expander — a template can generate a table's syntax, and
+// what a page means can depend on templates on other pages. Nothing short of
+// MediaWiki parses MediaWiki. So this does what the extraction libraries do:
+// read the syntactic layer — templates, links, sections, categories — without
+// expanding anything, and be clear that it is a layer rather than the whole.
+//
+// ## The nesting that catches naive splitting
+//
+// A template's parameters are separated by `|`, and a parameter can contain a
+// template, a link, or a table, each of which contains its own `|`. Splitting
+// on `|` gives the wrong answer for `{{convert|10|km|mi}}` nested inside
+// `{{Infobox|area={{convert|10|km2}}}}` — the outer split must ignore the
+// inner one. Everything here tracks the depth of `{{`, `[[` and `{|` and only
+// splits at zero, which is the whole difficulty of the format in one rule.
+//
+// Checked against `mwparserfromhell` — template names and parameters, and
+// link targets — on articles' worth of markup.
+
+type WikiTemplate = {
+    name: str,
+    /// Parameters given without a name, in order, `1` upward.
+    positional: [str],
+    /// Parameters given as `name=value`, with the name trimmed.
+    named: Map[str, str],
+}
+
+type WikiLink = {
+    /// The page or URL linked to.
+    target: str,
+    /// The text shown, which is the target when no text was given.
+    text: str,
+    external: bool,
+}
+
+type WikiSection = {
+    /// 1 for `= x =`, 2 for `== x ==`, and so on.
+    level: i64,
+    title: str,
+    body: str,
+}
+
+pub fn empty_template() -> WikiTemplate {
+    return WikiTemplate{ name: "", positional: [], named: map() }
+}
+
+/// Split on `sep` at nesting depth zero.
+///
+/// Depth counts `{{`, `[[` and `{|` as openers and their partners as closers.
+/// This is the function the whole package is built on: every other one is a
+/// scan plus a call to this.
+pub fn split_at_top(text: str, sep: str) -> [str] {
+    var out: [str] = []
+    var current = ""
+    var depth = 0
+    let cs = text.chars()
+    var i = 0
+    while i < cs.len() {
+        let two = if i + 1 < cs.len() { cs[i] + cs[i + 1] } else { "" }
+        if two == "\{\{" or two == "[[" or two == "\{|" {
+            depth = depth + 1
+            current = current + two
+            i = i + 2
+            continue
+        }
+        if two == "}}" or two == "]]" or two == "|}" {
+            if depth > 0 {
+                depth = depth - 1
+            }
+            current = current + two
+            i = i + 2
+            continue
+        }
+        if depth == 0 and cs[i] == sep {
+            out.push(current)
+            current = ""
+            i = i + 1
+            continue
+        }
+        current = current + cs[i]
+        i = i + 1
+    }
+    out.push(current)
+    return out
+}
+
+/// The spans of every `{{...}}` in the text, outermost first.
+fn template_spans(text: str) -> [(i64, i64)] {
+    var out: [(i64, i64)] = []
+    let cs = text.chars()
+    var i = 0
+    while i + 1 < cs.len() {
+        if cs[i] != "\{" or cs[i + 1] != "\{" {
+            i = i + 1
+            continue
+        }
+        var depth = 0
+        var j = i
+        var end = 0 - 1
+        while j + 1 < cs.len() {
+            if cs[j] == "\{" and cs[j + 1] == "\{" {
+                depth = depth + 1
+                j = j + 2
+                continue
+            }
+            if cs[j] == "}" and cs[j + 1] == "}" {
+                depth = depth - 1
+                j = j + 2
+                if depth == 0 {
+                    end = j
+                    break
+                }
+                continue
+            }
+            j = j + 1
+        }
+        if end < 0 {
+            return out
+        }
+        out.push((i, end))
+        i = end
+    }
+    return out
+}
+
+fn substring(cs: [str], from: i64, to: i64) -> str {
+    var out = ""
+    var i = from
+    while i < to and i < cs.len() {
+        out = out + cs[i]
+        i = i + 1
+    }
+    return out
+}
+
+/// Every top-level template on the page, in order.
+///
+/// Templates inside a template's parameters are *not* returned separately —
+/// they are part of the parameter's text, which is what a caller reading an
+/// infobox wants. `templates_within` gets at them when it does not.
+pub fn templates(text: str) -> [WikiTemplate] {
+    var out: [WikiTemplate] = []
+    let cs = text.chars()
+    for span in template_spans(text) {
+        out.push(parse_template(substring(cs, span.0 + 2, span.1 - 2)))
+    }
+    return out
+}
+
+pub fn templates_within(t: WikiTemplate) -> [WikiTemplate] {
+    var out: [WikiTemplate] = []
+    for v in t.positional {
+        for inner in templates(v) {
+            out.push(inner)
+        }
+    }
+    for entry in t.named.entries() {
+        for inner in templates(entry.1) {
+            out.push(inner)
+        }
+    }
+    return out
+}
+
+/// One template's body — everything between the braces.
+fn parse_template(body: str) -> WikiTemplate {
+    let parts = split_at_top(body, "|")
+    var out = empty_template()
+    if parts.len() == 0 {
+        return out
+    }
+    out.name = parts[0].trim()
+    var named = map()
+    var i = 1
+    while i < parts.len() {
+        let part = parts[i]
+        // A `=` at depth zero makes it a named parameter; one inside a
+        // nested template or a URL does not.
+        let halves = split_at_top(part, "=")
+        if halves.len() >= 2 {
+            var value = halves[1]
+            var k = 2
+            while k < halves.len() {
+                value = value + "=" + halves[k]
+                k = k + 1
+            }
+            named.set(halves[0].trim(), value.trim())
+        } else {
+            out.positional.push(part.trim())
+        }
+        i = i + 1
+    }
+    out.named = named
+    return out
+}
+
+/// A named parameter, or a positional one by its number.
+pub fn parameter(t: WikiTemplate, name: str) -> Option[str] {
+    let direct = t.named.get(name)
+    match direct {
+        Some(v) -> {
+            return Some(v)
+        }
+        None -> {
+        }
+    }
+    let n = name.parse_int() ?? 0
+    if n >= 1 and n <= t.positional.len() {
+        return Some(t.positional[n - 1])
+    }
+    return None
+}
+
+/// The article's infobox, which is where the structured facts live.
+pub fn infobox(text: str) -> Option[WikiTemplate] {
+    for t in templates(text) {
+        if t.name.to_lower().starts_with("infobox") {
+            return Some(t)
+        }
+    }
+    return None
+}
+
+// --------------------------------------------------------------- links
+
+/// Every `[[wikilink]]` and `[external link]` on the page.
+pub fn links(text: str) -> [WikiLink] {
+    var out: [WikiLink] = []
+    let cs = text.chars()
+    var i = 0
+    while i < cs.len() {
+        if i + 1 < cs.len() and cs[i] == "[" and cs[i + 1] == "[" {
+            var depth = 0
+            var j = i
+            var end = 0 - 1
+            while j + 1 < cs.len() {
+                if cs[j] == "[" and cs[j + 1] == "[" {
+                    depth = depth + 1
+                    j = j + 2
+                    continue
+                }
+                if cs[j] == "]" and cs[j + 1] == "]" {
+                    depth = depth - 1
+                    j = j + 2
+                    if depth == 0 {
+                        end = j
+                        break
+                    }
+                    continue
+                }
+                j = j + 1
+            }
+            if end < 0 {
+                return out
+            }
+            let inner = substring(cs, i + 2, end - 2)
+            let parts = split_at_top(inner, "|")
+            let target = parts[0].trim()
+            var shown = target
+            if parts.len() > 1 {
+                shown = parts[parts.len() - 1].trim()
+            }
+            if not target.to_lower().starts_with("category:") and
+            not target.to_lower().starts_with("file:") and
+            not target.to_lower().starts_with("image:") {
+                out.push(WikiLink{ target: target, text: shown,
+                    external: false })
+            }
+            i = end
+            continue
+        }
+        if cs[i] == "[" {
+            var j = i + 1
+            var inner = ""
+            var closed = false
+            while j < cs.len() {
+                if cs[j] == "]" {
+                    closed = true
+                    break
+                }
+                if cs[j] == "\n" {
+                    break
+                }
+                inner = inner + cs[j]
+                j = j + 1
+            }
+            let space = inner.index_of(" ") ?? (0 - 1)
+            var target = inner
+            var shown = inner
+            if space > 0 {
+                target = inner.substr(0, space)
+                shown = inner.substr(space + 1, inner.len() - space - 1)
+            }
+            if closed and looks_like_url(target) {
+                out.push(WikiLink{ target: target, text: shown.trim(),
+                    external: true })
+                i = j + 1
+                continue
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn looks_like_url(text: str) -> bool {
+    let lower = text.to_lower()
+    return lower.starts_with("http://") or lower.starts_with("https://") or
+    lower.starts_with("ftp://") or lower.starts_with("//")
+}
+
+/// The categories the page is filed under.
+pub fn categories(text: str) -> [str] {
+    var out: [str] = []
+    let cs = text.chars()
+    var i = 0
+    while i + 1 < cs.len() {
+        if cs[i] == "[" and cs[i + 1] == "[" {
+            var j = i + 2
+            var inner = ""
+            while j + 1 < cs.len() {
+                if cs[j] == "]" and cs[j + 1] == "]" {
+                    break
+                }
+                inner = inner + cs[j]
+                j = j + 1
+            }
+            if inner.to_lower().starts_with("category:") {
+                let name = inner.substr(9, inner.len() - 9)
+                out.push(split_at_top(name, "|")[0].trim())
+            }
+            i = j + 2
+            continue
+        }
+        i = i + 1
+    }
+    return out
+}
+
+/// Where a redirect points, if the page is one.
+pub fn redirect_target(text: str) -> Option[str] {
+    let head = text.trim()
+    if not head.to_lower().starts_with("#redirect") {
+        return None
+    }
+    for link in links(head) {
+        if not link.external {
+            return Some(link.target)
+        }
+    }
+    return None
+}
+
+// ------------------------------------------------------------- sections
+
+/// The page's sections, from its `== headings ==`.
+///
+/// The text before the first heading is the lead, and comes back with level
+/// zero — a section of the article that has no heading and that every
+/// extraction tool has to special-case.
+pub fn sections(text: str) -> [WikiSection] {
+    var out: [WikiSection] = []
+    var level = 0
+    var title = ""
+    var body = ""
+    for line in text.split("\n") {
+        let t = line.trim()
+        var found = 0
+        if t.starts_with("=") and t.ends_with("=") and t.len() > 2 {
+            var n = 0
+            let cs = t.chars()
+            while n < cs.len() and cs[n] == "=" {
+                n = n + 1
+            }
+            var m = 0
+            while m < cs.len() and cs[cs.len() - 1 - m] == "=" {
+                m = m + 1
+            }
+            if n == m and n * 2 < t.len() {
+                found = n
+            }
+        }
+        if found > 0 {
+            out.push(WikiSection{ level: level, title: title,
+                body: body.trim() })
+            level = found
+            title = t.substr(found, t.len() - 2 * found).trim()
+            body = ""
+            continue
+        }
+        body = body + line + "\n"
+    }
+    out.push(WikiSection{ level: level, title: title, body: body.trim() })
+    return out
+}
+
+// ---------------------------------------------------------------- text
+
+/// The page with the markup taken off — what a search index should hold.
+///
+/// Templates go entirely, because their text is generated elsewhere and what
+/// is written here is a call rather than prose. A link keeps its shown text
+/// and loses its target, which is the reverse of what `links` does and is why
+/// both exist.
+pub fn strip_markup(text: str) -> str {
+    var out = ""
+    var without_templates = ""
+    let cs = text.chars()
+    var spans = template_spans(text)
+    var at = 0
+    for span in spans {
+        without_templates = without_templates + substring(cs, at, span.0)
+        at = span.1
+    }
+    without_templates = without_templates + substring(cs, at, cs.len())
+
+    let ls = without_templates.chars()
+    var i = 0
+    while i < ls.len() {
+        if i + 1 < ls.len() and ls[i] == "[" and ls[i + 1] == "[" {
+            var j = i + 2
+            var inner = ""
+            while j + 1 < ls.len() {
+                if ls[j] == "]" and ls[j + 1] == "]" {
+                    break
+                }
+                inner = inner + ls[j]
+                j = j + 1
+            }
+            let parts = split_at_top(inner, "|")
+            out = out + parts[parts.len() - 1].trim()
+            i = j + 2
+            continue
+        }
+        if ls[i] == "'" {
+            var n = 0
+            while i + n < ls.len() and ls[i + n] == "'" {
+                n = n + 1
+            }
+            if n >= 2 {
+                i = i + n
+                continue
+            }
+        }
+        out = out + ls[i]
+        i = i + 1
+    }
+    return out.trim()
+}
+
+/// Bold and italic runs, as HTML — the one piece of inline markup that is
+/// unambiguous.
+///
+/// Three apostrophes is bold, two is italic, five is both. The rule is
+// stated by apostrophe count and not by nesting, which is why `'''''x'''''`
+/// works and why a possessive followed by a quote sometimes does not.
+pub fn inline_to_html(text: str) -> str {
+    var out = ""
+    var bold = false
+    var italic = false
+    let cs = text.chars()
+    var i = 0
+    while i < cs.len() {
+        if cs[i] != "'" {
+            out = out + cs[i]
+            i = i + 1
+            continue
+        }
+        var n = 0
+        while i + n < cs.len() and cs[i + n] == "'" {
+            n = n + 1
+        }
+        if n >= 5 {
+            // Both at once, and nested properly: `<i><b>x</b></i>`. Emitting
+            // the two toggles in a fixed order would close them crossed.
+            if bold and italic {
+                out = out + "</b></i>"
+                bold = false
+                italic = false
+            } else {
+                if not bold and not italic {
+                    out = out + "<i><b>"
+                    bold = true
+                    italic = true
+                } else {
+                    out = out + (if italic { "</i>" } else { "<i>" })
+                    out = out + (if bold { "</b>" } else { "<b>" })
+                    bold = not bold
+                    italic = not italic
+                }
+            }
+            i = i + 5
+            continue
+        }
+        if n >= 3 {
+            out = out + (if bold { "</b>" } else { "<b>" })
+            bold = not bold
+            i = i + 3
+            continue
+        }
+        if n == 2 {
+            out = out + (if italic { "</i>" } else { "<i>" })
+            italic = not italic
+            i = i + 2
+            continue
+        }
+        out = out + cs[i]
+        i = i + 1
+    }
+    if bold {
+        out = out + "</b>"
+    }
+    if italic {
+        out = out + "</i>"
+    }
+    return out
+}

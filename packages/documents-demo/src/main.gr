@@ -1,0 +1,394 @@
+import rst
+import bbcode
+import wikitext
+import csvdialect
+import fixedwidth
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn kinds_of(blocks: [RstBlock]) -> str {
+    var out: [str] = []
+    for b in blocks {
+        out.push(b.kind)
+    }
+    return out.join(",")
+}
+
+// ------------------------------------------------------------------- rst
+
+fn document() -> str {
+    return ":Author: Ada Lovelace\n:Version: 2.1\n\nIntroduction\n" +
+    "============\n\nThis is a paragraph with *emphasis*, **strong " +
+    "text** and ``literal text``.\nIt continues on a second line.\n\n" +
+    "A link to `the site <https://example.com>`_ appears here.\n\n" +
+    "History\n-------\n\nThe first list:\n\n- one item\n- another item\n" +
+    "- a third\n\nAnd a numbered one:\n\n1. first\n2. second\n" +
+    "3. third\n\nSome code follows::\n\n    def hello():\n" +
+    "        return \"world\"\n\n.. note::\n\n   This is a note " +
+    "directive.\n\n.. This is a comment.\n\n----\n\nDetails\n-------\n\n" +
+    "    An indented block quote.\n\nFinal paragraph.\n"
+}
+
+fn check_rst(inout f: i64) / {io} {
+    print("-- rst: levels the document decides, and indentation that means")
+    let blocks = rst.parse(document())
+    // The block sequence docutils builds from the same source.
+    say(f, "the whole document parses to the structure docutils finds",
+        kinds_of(blocks) == "field,field,section,paragraph,paragraph," +
+        "section,paragraph,bullet,bullet,bullet,paragraph,enumerated," +
+        "enumerated,enumerated,paragraph,literal_block,directive," +
+        "comment,transition,section,block_quote,paragraph")
+    let sections = rst.sections(document())
+    say(f, "a heading's level comes from the order its underline appeared",
+        sections.len() == 3 and sections[0].0 == 1 and
+        sections[1].0 == 2 and sections[2].0 == 2)
+    say(f, "the metadata at the top is a field list",
+        (rst.fields(document()).get("Author") ?? "") == "Ada Lovelace")
+    say(f, "a directive keeps its name, argument and indented body",
+        rst.directives(document()).len() == 1 and
+        rst.directives(document())[0].0 == "note" and
+        body_of(blocks, "directive") == "This is a note directive.")
+    // `::` after a word leaves one colon; docutils shows the same.
+    say(f, "the literal marker leaves a colon behind when it follows a word",
+        text_of(blocks, "paragraph", 4) == "Some code follows:")
+    say(f, "and the block keeps its own indentation, not the document's",
+        text_of(blocks, "literal_block", 0) ==
+        "def hello():\n    return \"world\"")
+    say(f, "an indented paragraph with no owner is a quotation",
+        text_of(blocks, "block_quote", 0) == "An indented block quote.")
+    say(f, "literal markup is read before emphasis, or the stars leak",
+        rst.inline_to_html("``a *b* c``") == "<tt>a *b* c</tt>")
+    say(f, "the four inline markups render",
+        rst.inline_to_html("*a* **b** ``c`` `d <u>`_") ==
+        "<em>a</em> <strong>b</strong> <tt>c</tt> " +
+        "<a href=\"u\">d</a>")
+    say(f, "and angle brackets in text are escaped, not rendered",
+        rst.inline_to_html("a <b> c") == "a &lt;b&gt; c")
+}
+
+fn text_of(blocks: [RstBlock], kind: str, nth: i64) -> str {
+    var n = 0
+    for b in blocks {
+        if b.kind == kind {
+            if n == nth {
+                return b.text
+            }
+            n = n + 1
+        }
+    }
+    return ""
+}
+
+fn body_of(blocks: [RstBlock], kind: str) -> str {
+    for b in blocks {
+        if b.kind == kind {
+            return b.body
+        }
+    }
+    return ""
+}
+
+// ---------------------------------------------------------------- bbcode
+
+fn check_bbcode(inout f: i64) / {io} {
+    print("-- bbcode: a fixed tag list, because strangers wrote script")
+    // Every expected string here is Python's `bbcode` library's own output.
+    say(f, "the basic tags render the way the reference renders them",
+        bbcode.to_html("[b]bold[/b] and [i]italic[/i]") ==
+        "<strong>bold</strong> and <em>italic</em>" and
+        bbcode.to_html("[u]x[/u][s]y[/s]") == "<u>x</u><strike>y</strike>")
+    say(f, "a link carries nofollow and escapes its own query string",
+        bbcode.to_html("[url=http://x.com/a?b=1&c=2]q[/url]") ==
+        "<a rel=\"nofollow\" href=\"http://x.com/a?b=1&amp;c=2\">q</a>")
+    say(f, "a bare URL is both the target and the text",
+        bbcode.to_html("[url]https://example.com[/url]") ==
+        "<a rel=\"nofollow\" href=\"https://example.com\">" +
+        "https://example.com</a>")
+    say(f, "a javascript URL takes its own contents with it",
+        bbcode.to_html("x [url=javascript:alert(1)]bad[/url] y") == "x  y")
+    say(f, "an unsafe colour is left as text so the author can see it",
+        bbcode.to_html("[color=x\"onclick=1]y[/color]") ==
+        "[color=x&quot;onclick=1]y[/color]" and
+        bbcode.to_html("[color=#ff0000]x[/color]") ==
+        "<span style=\"color:#ff0000;\">x</span>")
+    say(f, "text is escaped everywhere, including inside code",
+        bbcode.to_html("a < b & c > d") == "a &lt; b &amp; c &gt; d" and
+        bbcode.to_html("[code]a < b[/code]") == "<code>a &lt; b</code>")
+    say(f, "code does not parse tags and does not break lines",
+        bbcode.to_html("[code][b]x[/b]\ny[/code]") ==
+        "<code>[b]x[/b]\ny</code>")
+    say(f, "everything else turns a newline into a break",
+        bbcode.to_html("a\nb") == "a<br />b" and
+        bbcode.to_html("[quote]a\nb[/quote]") ==
+        "<blockquote>a<br />b</blockquote>")
+    say(f, "a list closes an item at a newline rather than breaking it",
+        bbcode.to_html("[list][*]a\n[*]b\n[/list]") ==
+        "<ul><li>a</li><li>b</li></ul>" and
+        bbcode.to_html("[list][*]a\nb[/list]") ==
+        "<ul><li>a</li>b</ul>")
+    say(f, "an ordered list carries the style the marker asked for",
+        bbcode.to_html("[list=a][*]x[/list]") ==
+        "<ol style=\"list-style-type:lower-alpha;\"><li>x</li></ol>")
+    say(f, "an unclosed tag is closed and a crossed pair is repaired",
+        bbcode.to_html("unclosed [b]bold") == "unclosed <strong>bold</strong>"
+        and bbcode.to_html("[b]mis[i]matched[/b][/i]") ==
+        "<strong>mis<em>matched</em></strong>")
+    say(f, "an unknown tag stays as written",
+        bbcode.to_html("text with [notatag] in it") ==
+        "text with [notatag] in it" and
+        bbcode.to_html("[size=20]big[/size]") == "[size=20]big[/size]")
+    say(f, "images are off by default and render when asked for",
+        bbcode.to_html("[img]https://e.com/a.png[/img]")
+            .starts_with("[img]") and
+        bbcode.to_html_with("[img]https://e.com/a.png[/img]",
+            bbcode.permissive_options()) ==
+        "<img src=\"https://e.com/a.png\" " +
+        "alt=\"https://e.com/a.png\" />")
+    say(f, "the plain text of a post has no tags and no escaping",
+        bbcode.to_text("[b]a < b[/b]") == "a < b")
+    say(f, "and a post can be checked for tags the renderer will not know",
+        bbcode.only_known_tags("[b]x[/b]") and
+        not bbcode.only_known_tags("[marquee]x[/marquee]"))
+}
+
+// -------------------------------------------------------------- wikitext
+
+fn article() -> str {
+    return "\{\{Infobox settlement\n| name = Springfield\n" +
+    "| population = \{\{convert|30720|inhabitants}}\n" +
+    "| area_km2 = \{\{convert|10|km2|sqmi}}\n| founded = 1796\n" +
+    "| website = [https://example.gov/ Official site]\n}}\n" +
+    "'''Springfield''' is a [[city]] in [[Illinois|the state of " +
+    "Illinois]].\n\n== History ==\nThe town grew after the [[railway]] " +
+    "arrived. See [https://example.com/history a history].\n\n" +
+    "=== Nineteenth century ===\nPopulation reached " +
+    "\{\{convert|10000|inhabitants}} by 1850.\n\n" +
+    "[[Category:Cities in Illinois]]\n"
+}
+
+fn check_wikitext(inout f: i64) / {io} {
+    print("-- wikitext: the facts are in the templates")
+    let templates = wikitext.templates(article())
+    // `mwparserfromhell` finds the same two top-level templates.
+    say(f, "only top-level templates are returned, nested ones stay in place",
+        templates.len() == 2 and
+        templates[0].name == "Infobox settlement" and
+        templates[1].name == "convert")
+    let box = templates[0]
+    say(f, "a parameter containing a template is one parameter, not three",
+        (box.named.get("population") ?? "") ==
+        "\{\{convert|30720|inhabitants}}")
+    say(f, "and a parameter with an equals sign inside a link is not named",
+        (box.named.get("website") ?? "") ==
+        "[https://example.gov/ Official site]")
+    say(f, "positional parameters keep their order",
+        templates[1].positional.len() == 2 and
+        templates[1].positional[0] == "10000")
+    say(f, "the infobox is found by name",
+        infobox_name(article()) == "Infobox settlement")
+    say(f, "nested templates are reachable when they are wanted",
+        wikitext.templates_within(box).len() == 2)
+    let links = wikitext.links(article())
+    say(f, "wikilinks keep their target and their shown text apart",
+        links.len() == 5 and links[1].target == "city" and
+        links[2].target == "Illinois" and
+        links[2].text == "the state of Illinois")
+    say(f, "external links are marked as such",
+        links[0].external and links[0].target == "https://example.gov/" and
+        links[0].text == "Official site")
+    say(f, "categories are not links, and come back separately",
+        wikitext.categories(article()).len() == 1 and
+        wikitext.categories(article())[0] == "Cities in Illinois")
+    let sections = wikitext.sections(article())
+    say(f, "the lead is a section with no heading and level zero",
+        sections.len() == 3 and sections[0].level == 0 and
+        sections[1].level == 2 and sections[1].title == "History" and
+        sections[2].level == 3)
+    say(f, "five apostrophes nest properly rather than crossing",
+        wikitext.inline_to_html("'''''both'''''") == "<i><b>both</b></i>")
+    say(f, "stripping markup keeps the shown text and drops the calls",
+        wikitext.strip_markup("'''X''' is a [[city|town]] \{\{cn}}")
+            .trim() == "X is a town")
+    say(f, "splitting at the top ignores a separator inside a nesting",
+        wikitext.split_at_top("a|\{\{b|c}}|d", "|").len() == 3)
+}
+
+fn infobox_name(text: str) -> str {
+    match wikitext.infobox(text) {
+        Some(t) -> {
+            return t.name
+        }
+        None -> {
+            return ""
+        }
+    }
+}
+
+// ------------------------------------------------------------ csvdialect
+
+fn check_csvdialect(inout f: i64) / {io} {
+    print("-- csvdialect: consistency is the signal, not frequency")
+    // Every answer here is Python's `csv.Sniffer`'s for the same sample.
+    say(f, "a comma file with a header is read as one",
+        dialect_is("name,age,city\nalice,30,London\nbob,25,Paris\n",
+            ",", true))
+    say(f, "and the same file without one is not",
+        dialect_is("alice,30,London\nbob,25,Paris\ncarol,41,Berlin\n",
+            ",", false))
+    say(f, "a European semicolon file is not read as commas",
+        dialect_is("name;price;qty\nwidget;1,50;3\ngadget;2,30;7\n",
+            ";", true))
+    say(f, "tabs, pipes and colons are found too",
+        delimiter_of("a\tb\tc\n1\t2\t3\n4\t5\t6\n") == "\t" and
+        delimiter_of("id|name\n1|a\n2|b\n") == "|" and
+        delimiter_of("root:x:0:0\ndaemon:x:1:1\nbin:x:2:2\n") == ":")
+    say(f, "a quoted field holding the delimiter does not vote",
+        delimiter_of("name,note\n\"Smith, John\",\"hi\"\n" +
+            "\"Doe, Jane\",\"bye\"\n") == ",")
+    say(f, "single quotes are detected when they are what the file uses",
+        quote_of("name,note\n'Smith, John','hi'\n'Doe, Jane','bye'\n") == "'")
+    say(f, "a space after every delimiter is a convention, not data",
+        skips_of("name, age\nalice, 30\nbob, 25\n") and
+        not skips_of("name,age\nalice,30\nbob, 25\n"))
+    say(f, "one line cannot be sniffed, and says so",
+        refuses_sample("a,b,c\n"))
+    say(f, "a ragged file gets an answer and a confidence to doubt it with",
+        confidence_of("a,b,c\n1,2\n3,4,5,6\n7,8,9\n") < 0.6 and
+        confidence_of("a,b,c\n1,2,3\n4,5,6\n") == 1.0)
+    say(f, "field names are generated when there is no header",
+        names_of("1,2,3\n4,5,6\n").join(",") ==
+        "column_1,column_2,column_3")
+}
+
+fn sniffed(sample: str) -> CsvDialect {
+    return csvdialect.sniff(sample) ?? csvdialect.excel()
+}
+
+fn dialect_is(sample: str, delimiter: str, header: bool) -> bool {
+    let d = sniffed(sample)
+    return d.delimiter == delimiter and d.has_header == header
+}
+
+fn delimiter_of(sample: str) -> str {
+    return sniffed(sample).delimiter
+}
+
+fn quote_of(sample: str) -> str {
+    return sniffed(sample).quote
+}
+
+fn skips_of(sample: str) -> bool {
+    return sniffed(sample).skip_initial_space
+}
+
+fn confidence_of(sample: str) -> f64 {
+    return sniffed(sample).confidence
+}
+
+fn names_of(sample: str) -> [str] {
+    return csvdialect.field_names(sample, sniffed(sample))
+}
+
+fn refuses_sample(sample: str) -> bool {
+    match csvdialect.sniff(sample) {
+        Ok(_d) -> {
+            return false
+        }
+        Err(_e) -> {
+            return true
+        }
+    }
+}
+
+// ------------------------------------------------------------ fixedwidth
+
+fn check_fixedwidth(inout f: i64) / {io} {
+    print("-- fixedwidth: no delimiter, so an overflow eats the next field")
+    // Every inferred split here is `pandas.read_fwf`'s for the same text.
+    let ledger = "ID    NAME           BALANCE\n" +
+    "00001 Alice Smith       120.50\n" +
+    "00002 Bob Jones          -3.75\n" +
+    "00003 Carol Roe        9999.00\n"
+    let l = fixedwidth.infer(ledger)
+    say(f, "columns blank on every line are the separators",
+        l.fields.len() == 3 and
+        fixedwidth.describe(l) ==
+        "column_1(0+5) column_2(6+11) column_3(21+9)")
+    let rows = fixedwidth.parse(l, ledger)
+    say(f, "a name with a space in it stays one field",
+        rows.len() == 4 and rows[1][1] == "Alice Smith")
+    say(f, "and the header row can name the fields",
+        fixedwidth.infer_named(ledger).fields[2].name == "BALANCE")
+    let spec = fixedwidth.from_widths(["id", "name", "amount"], [5, 12, 8])
+    say(f, "a layout from widths lies end to end with no gaps",
+        fixedwidth.total_width(spec) == 25 and
+        fixedwidth.gaps(spec).len() == 0 and
+        fixedwidth.overlaps(spec).len() == 0)
+    say(f, "a value too wide for its column is refused, not truncated",
+        refuses_long(spec) and
+        (fixedwidth.render_line(spec, ["1", "Alice", "10.00"]) ?? "") ==
+        "1    Alice       10.00   ")
+    say(f, "right alignment is what a number wants",
+        (fixedwidth.render_line_right(spec, ["1", "Alice", "10.00"]) ?? "") ==
+        "    1       Alice   10.00")
+    let bad = fixedwidth.layout([fixedwidth.field("a", 0, 5),
+        fixedwidth.field("b", 3, 5)])
+    say(f, "an overlap is found before it silently corrupts a column",
+        fixedwidth.overlaps(bad).len() == 1 and
+        fixedwidth.overlaps(bad)[0].0 == "a")
+    let sparse = fixedwidth.layout([fixedwidth.field("a", 0, 2),
+        fixedwidth.field("b", 5, 3)])
+    say(f, "and unnamed columns are reported as gaps",
+        fixedwidth.gaps(sparse).len() == 1 and
+        fixedwidth.gaps(sparse)[0].0 == 2)
+    say(f, "the wrong number of values is an error",
+        refuses_count(spec))
+    say(f, "padding is trimmed unless the caller asks for it raw",
+        fixedwidth.parse_line(spec, "1    Alice        10.00")[1] ==
+        "Alice" and
+        fixedwidth.parse_line_raw(spec, "1    Alice        10.00")[1] ==
+        "Alice       ")
+}
+
+fn refuses_long(l: FixedLayout) -> bool {
+    match fixedwidth.render_line(l, ["1", "A very long name here", "1"]) {
+        Ok(_s) -> {
+            return false
+        }
+        Err(_e) -> {
+            return true
+        }
+    }
+}
+
+fn refuses_count(l: FixedLayout) -> bool {
+    match fixedwidth.render_line(l, ["1", "A"]) {
+        Ok(_s) -> {
+            return false
+        }
+        Err(_e) -> {
+            return true
+        }
+    }
+}
+
+fn main() / {io} {
+    var f = 0
+    check_rst(f)
+    check_bbcode(f)
+    check_wikitext(f)
+    check_csvdialect(f)
+    check_fixedwidth(f)
+    if f == 0 {
+        print("documents: every claim held")
+    } else {
+        print("documents: {f} claims failed")
+    }
+}

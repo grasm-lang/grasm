@@ -1,0 +1,355 @@
+// Working out what a CSV file actually is, before parsing it.
+//
+// `csv` will read a file once you know its separator, its quote character and
+// whether the first row is data. This finds those out, which is the part
+// every import feature has to do and nobody wants to write.
+//
+// ## Why it is guesswork, and how to keep the guessing honest
+//
+// There is no header, no magic number and no declaration. A file of numbers
+// separated by semicolons is a valid CSV under two different readings — one
+// column of text or three columns of numbers — and only a human knows which.
+// So every answer here comes with the evidence that produced it:
+// `confidence` says how strongly the sample agreed, and a caller building an
+// import screen should show the guess and let somebody correct it rather than
+// proceeding silently.
+//
+// The commonest real failure is not an exotic delimiter. It is a
+// semicolon-separated file from a European spreadsheet — where the comma is
+// the decimal point — read as commas, which turns `1,50;2,30` into four
+// fields of nonsense that parse as numbers and never raise anything.
+//
+// ## How the delimiter is chosen
+//
+// Count each candidate on each line, ignoring anything inside quotes, and ask
+// which candidate appears the *same number of times on the most lines*.
+// Consistency is the signal, not frequency: a comma appearing 3 times on
+// every line of a hundred beats a space appearing 40 times on some lines and
+// 12 on others. Ties go to the more usual character, because in a genuine tie
+// the file is more likely to be comma-separated than colon-separated.
+//
+// Checked against Python's `csv.Sniffer` on a corpus of files with known
+// dialects — the agreement, and the cases where the two disagree, are in the
+// group demo.
+
+import csv
+
+type CsvDialect = {
+    delimiter: str,
+    quote: str,
+    /// A quote inside a quoted field written as two quotes, rather than
+    /// escaped with a backslash.
+    doubled_quotes: bool,
+    /// A space after the delimiter that is not part of the field.
+    skip_initial_space: bool,
+    /// `\r\n` or `\n`.
+    line_terminator: str,
+    has_header: bool,
+    /// How many of the sample's lines agreed with the chosen delimiter, as a
+    /// fraction. Below about 0.9 the answer is a guess worth showing a human.
+    confidence: f64,
+}
+
+type CsvDialectError =
+    | SampleTooSmall(lines: i64)
+    | NoDelimiterFound()
+
+pub fn excel() -> CsvDialect {
+    return CsvDialect{ delimiter: ",", quote: "\"", doubled_quotes: true,
+        skip_initial_space: false, line_terminator: "\r\n",
+        has_header: true, confidence: 1.0 }
+}
+
+pub fn unix_style() -> CsvDialect {
+    return CsvDialect{ delimiter: ",", quote: "\"", doubled_quotes: true,
+        skip_initial_space: false, line_terminator: "\n", has_header: true,
+        confidence: 1.0 }
+}
+
+pub fn tab_separated() -> CsvDialect {
+    return CsvDialect{ delimiter: "\t", quote: "\"", doubled_quotes: true,
+        skip_initial_space: false, line_terminator: "\n", has_header: true,
+        confidence: 1.0 }
+}
+
+/// The delimiters worth considering, in the order a tie is broken.
+pub fn candidates() -> [str] {
+    return [",", ";", "\t", "|", ":"]
+}
+
+fn lines_of(sample: str) -> [str] {
+    var out: [str] = []
+    for line in sample.split("\n") {
+        var l = line
+        if l.ends_with("\r") {
+            l = l.substr(0, l.len() - 1)
+        }
+        if l != "" {
+            out.push(l)
+        }
+    }
+    return out
+}
+
+/// How many times `d` appears outside quotes on this line.
+fn count_outside_quotes(line: str, d: str, quote: str) -> i64 {
+    var inside = false
+    var n = 0
+    for c in line.chars() {
+        if c == quote {
+            inside = not inside
+            continue
+        }
+        if not inside and c == d {
+            n = n + 1
+        }
+    }
+    return n
+}
+
+/// The delimiter, and the fraction of lines that agreed with it.
+pub fn sniff_delimiter(sample: str, quote: str) -> (str, f64) {
+    let lines = lines_of(sample)
+    if lines.len() == 0 {
+        return (",", 0.0)
+    }
+    var best = ""
+    var best_score = 0.0
+    for d in candidates() {
+        var counts = map()
+        for line in lines {
+            let n = count_outside_quotes(line, d, quote)
+            if n > 0 {
+                counts.set(n, (counts.get(n) ?? 0) + 1)
+            }
+        }
+        // The mode: how many lines agree on one count.
+        var agreed = 0
+        for entry in counts.entries() {
+            if entry.1 > agreed {
+                agreed = entry.1
+            }
+        }
+        let score = agreed.as_f64() / lines.len().as_f64()
+        if score > best_score {
+            best_score = score
+            best = d
+        }
+    }
+    if best == "" {
+        return (",", 0.0)
+    }
+    return (best, best_score)
+}
+
+/// Which quote character the sample uses, if any.
+///
+/// A file with no quoted field at all still needs an answer, and the answer
+/// is the double quote: it is what a writer will use the first time a field
+/// contains the delimiter, so it is what the file will be tomorrow.
+pub fn sniff_quote(sample: str) -> str {
+    var doubles = 0
+    var singles = 0
+    for line in lines_of(sample) {
+        for c in line.chars() {
+            if c == "\"" {
+                doubles = doubles + 1
+            }
+            if c == "'" {
+                singles = singles + 1
+            }
+        }
+    }
+    if singles > doubles and singles % 2 == 0 {
+        return "'"
+    }
+    return "\""
+}
+
+/// Everything about the file, from a sample of it.
+///
+/// A sample of one line cannot be read: with nothing to be consistent *with*,
+/// every candidate that appears once scores perfectly, and the answer would
+/// be the first one in the list. Two lines is the minimum and a dozen is
+/// enough.
+pub fn sniff(sample: str) -> CsvDialect ! CsvDialectError {
+    let lines = lines_of(sample)
+    if lines.len() < 2 {
+        fail(SampleTooSmall(lines.len()))
+    }
+    let quote = sniff_quote(sample)
+    let found = sniff_delimiter(sample, quote)
+    if found.1 == 0.0 {
+        fail(NoDelimiterFound())
+    }
+    var out = CsvDialect{
+        delimiter: found.0,
+        quote: quote,
+        doubled_quotes: sample.contains(quote + quote),
+        skip_initial_space: skips_space(lines, found.0),
+        line_terminator: if sample.contains("\r\n") { "\r\n" } else { "\n" },
+        has_header: false,
+        confidence: found.1,
+    }
+    out.has_header = looks_like_header(sample, out)
+    return out
+}
+
+/// Whether a space regularly follows the delimiter.
+///
+/// "Regularly" rather than "ever": one field beginning with a space is a
+/// field that begins with a space, and stripping it would lose data. Every
+/// delimiter followed by one is a formatting convention.
+fn skips_space(lines: [str], delimiter: str) -> bool {
+    var followed = 0
+    var total = 0
+    for line in lines {
+        let cs = line.chars()
+        var i = 0
+        while i + 1 < cs.len() {
+            if cs[i] == delimiter {
+                total = total + 1
+                if cs[i + 1] == " " {
+                    followed = followed + 1
+                }
+            }
+            i = i + 1
+        }
+    }
+    if total == 0 {
+        return false
+    }
+    return followed == total
+}
+
+fn is_number(field: str) -> bool {
+    let t = field.trim()
+    if t == "" {
+        return false
+    }
+    var seen_digit = false
+    var i = 0
+    let cs = t.chars()
+    while i < cs.len() {
+        let c = cs[i]
+        if c >= "0" and c <= "9" {
+            seen_digit = true
+        } else {
+            if c != "." and c != "-" and c != "+" and c != "," {
+                return false
+            }
+        }
+        i = i + 1
+    }
+    return seen_digit
+}
+
+/// Whether the first row is a header.
+///
+/// The test is the one that actually works: a column whose values below are
+/// numbers, or all the same length, and whose first value is neither. A
+/// header row of words above a column of words is undetectable and this says
+/// so by returning false — which is the safe answer, because treating data as
+/// a header loses a row and treating a header as data adds a wrong one that
+/// somebody will notice.
+pub fn looks_like_header(sample: str, dialect: CsvDialect) -> bool {
+    let rows = csv.parse_with(sample, dialect.delimiter) ?? []
+    if rows.len() < 2 {
+        return false
+    }
+    let head = rows[0]
+    var votes = 0
+    var columns = 0
+    var column = 0
+    while column < head.len() {
+        var below_numeric = 0
+        var below_total = 0
+        var r = 1
+        while r < rows.len() {
+            if column < rows[r].len() {
+                below_total = below_total + 1
+                if is_number(rows[r][column]) {
+                    below_numeric = below_numeric + 1
+                }
+            }
+            r = r + 1
+        }
+        if below_total > 0 {
+            columns = columns + 1
+            if below_numeric == below_total and not is_number(head[column]) {
+                votes = votes + 1
+            }
+        }
+        column = column + 1
+    }
+    if columns == 0 {
+        return false
+    }
+    return votes > 0
+}
+
+/// The rows, read with the dialect that was found.
+pub fn rows_of(text: str, dialect: CsvDialect) -> [[str]] {
+    var rows = csv.parse_with(text, dialect.delimiter) ?? []
+    if not dialect.skip_initial_space {
+        return rows
+    }
+    var out: [[str]] = []
+    for row in rows {
+        var fields: [str] = []
+        var first = true
+        for f in row {
+            if first {
+                fields.push(f)
+            } else {
+                fields.push(trim_one_leading_space(f))
+            }
+            first = false
+        }
+        out.push(fields)
+    }
+    return out
+}
+
+fn trim_one_leading_space(field: str) -> str {
+    if field.starts_with(" ") {
+        return field.substr(1, field.len() - 1)
+    }
+    return field
+}
+
+/// The header names, or generated ones when there is no header.
+///
+/// Generated names are `column_1` upward rather than the first row's values,
+/// because a caller that asked for names and got data would build a table
+/// with a row missing.
+pub fn field_names(text: str, dialect: CsvDialect) -> [str] {
+    let rows = rows_of(text, dialect)
+    if rows.len() == 0 {
+        return []
+    }
+    if dialect.has_header {
+        return rows[0]
+    }
+    var out: [str] = []
+    var i = 1
+    while i <= rows[0].len() {
+        out.push("column_{i}")
+        i = i + 1
+    }
+    return out
+}
+
+/// A one-line description, for an import screen to show a human.
+pub fn describe(dialect: CsvDialect) -> str {
+    var name = dialect.delimiter
+    if name == "\t" {
+        name = "tab"
+    }
+    let header = if dialect.has_header { "with header" } else {
+        "no header"
+    }
+    let percent = (dialect.confidence * 100.0 + 0.5).floor()
+    return "delimiter `{name}`, quote `{dialect.quote}`, {header}, " +
+    "{percent}% of lines agreed"
+}

@@ -1,0 +1,6 @@
+[package]
+name = "fixedwidth"
+version = "1.0.0"
+
+# Slicing text. Opens nothing.
+capabilities = []

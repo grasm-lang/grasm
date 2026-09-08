@@ -1,0 +1,617 @@
+// reStructuredText, the documentation format Python is written in.
+//
+// The parts that matter for reading a document: sections, lists, literal
+// blocks, directives, field lists and the four inline markups. Not the whole
+// of it — reStructuredText has substitutions, roles, tables, footnotes,
+// citations and an extension mechanism, and a complete implementation is
+// docutils and is thirty thousand lines.
+//
+// ## The two rules that make it different from Markdown
+//
+// **A heading has no fixed level.** `===` is not "level one": the level is
+// decided by the *order the underline characters first appear* in the
+// document. A file whose first heading is underlined with `-` has `-` as its
+// level one, and if that file is included in another whose level one is `=`,
+// the levels shift. This is the single thing that surprises everyone, and it
+// is why `sections` reports a level derived from the document rather than
+// from a table of characters.
+//
+// **Indentation is structure everywhere, not only in code.** A directive's
+// body, a list item's continuation and a block quote are all "the indented
+// text that follows", so an accidental indent turns a paragraph into a
+// quotation silently. That is the price of the format's regularity and it is
+// worth knowing before debugging why a paragraph moved.
+//
+// ## What is checked, and against what
+//
+// docutils. Every structure this reports — the sections and their levels, the
+// list items, the literal blocks, the directives and their arguments — is
+// compared against the element tree docutils builds from the same source. It
+// is a subset, and the subset agrees.
+
+type RstBlock = {
+    /// `section`, `paragraph`, `bullet`, `enumerated`, `literal_block`,
+    /// `directive`, `field`, `comment`, `transition`, `block_quote`.
+    kind: str,
+    /// The section title, the item text, the block's content, or the
+    /// directive's argument.
+    text: str,
+    /// A section's depth from 1; a directive's name goes in `name`.
+    level: i64,
+    /// A directive's name or a field's name; empty otherwise.
+    name: str,
+    /// A directive's indented body, with the indent removed.
+    body: str,
+}
+
+pub fn empty_block() -> RstBlock {
+    return RstBlock{ kind: "", text: "", level: 0, name: "", body: "" }
+}
+
+/// The characters reStructuredText allows under a heading.
+fn adornment_characters() -> str {
+    return "!\"#$%&'()*+,-./:;<=>?@[\\]^_`\{|}~"
+}
+
+fn is_adornment_line(line: str) -> bool {
+    let t = line.trim()
+    if t.len() < 2 {
+        return false
+    }
+    let first = t.substr(0, 1)
+    if adornment_characters().index_of(first) == None {
+        return false
+    }
+    for c in t.chars() {
+        if c != first {
+            return false
+        }
+    }
+    return true
+}
+
+fn indent_of(line: str) -> i64 {
+    var n = 0
+    for c in line.chars() {
+        if c == " " {
+            n = n + 1
+        } else {
+            return n
+        }
+    }
+    return n
+}
+
+fn is_bullet(line: str) -> bool {
+    let t = line.trim()
+    if t.len() < 2 {
+        return false
+    }
+    let first = t.substr(0, 1)
+    return (first == "-" or first == "*" or first == "+") and
+    t.substr(1, 1) == " "
+}
+
+/// Whether the line opens an enumerated item: `1.`, `1)`, `(1)`, `#.`, `a.`.
+fn enumerator_length(line: str) -> i64 {
+    let t = line.trim()
+    let cs = t.chars()
+    var i = 0
+    if i < cs.len() and cs[i] == "(" {
+        i = i + 1
+    }
+    var digits = 0
+    while i < cs.len() and ((cs[i] >= "0" and cs[i] <= "9") or cs[i] == "#") {
+        i = i + 1
+        digits = digits + 1
+    }
+    if digits == 0 {
+        // A single letter enumerator, which is why `a. x` is a list and
+        // `an apple` is not — the letter must be followed by the marker.
+        if i < cs.len() and ((cs[i] >= "a" and cs[i] <= "z") or
+            (cs[i] >= "A" and cs[i] <= "Z")) {
+            i = i + 1
+            digits = 1
+        }
+    }
+    if digits == 0 {
+        return 0
+    }
+    if i < cs.len() and (cs[i] == "." or cs[i] == ")") {
+        i = i + 1
+        if i < cs.len() and cs[i] == " " {
+            return i
+        }
+    }
+    return 0
+}
+
+/// Every block of the document, in order.
+///
+/// Flat rather than a tree, and each block carries the level it belongs at —
+/// the same shape `asn1` uses for a DER document, and for the same reason:
+/// walking a flat list needs no recursion and the nesting is still there.
+///
+/// The body is a dispatch: each `take_` below returns where it finished, or
+/// -1 when the line was not its kind. The order they are tried in is the
+/// grammar — a line that could be read two ways belongs to whichever is
+/// asked first, and indentation is asked before everything.
+pub fn parse(source: str) -> [RstBlock] {
+    var out: [RstBlock] = []
+    let lines = source.split("\n")
+    // The order the underline characters first appear decides the levels.
+    var seen: [str] = []
+    var i = 0
+    while i < lines.len() {
+        if lines[i].trim() == "" {
+            i = i + 1
+            continue
+        }
+        var next = take_block_quote(lines, i, out)
+        if next < 0 {
+            next = take_section(lines, i, seen, out)
+        }
+        if next < 0 {
+            next = take_transition(lines, i, out)
+        }
+        if next < 0 {
+            next = take_directive(lines, i, out)
+        }
+        if next < 0 {
+            next = take_field(lines, i, out)
+        }
+        if next < 0 {
+            next = take_bullet(lines, i, out)
+        }
+        if next < 0 {
+            next = take_enumerated(lines, i, out)
+        }
+        if next < 0 {
+            next = take_paragraph(lines, i, out)
+        }
+        i = next
+    }
+    return out
+}
+
+/// Anything still indented is a block quote.
+///
+/// The indented bodies of lists, directives and literal blocks are consumed
+/// by their own openers, so indentation reaching here has no owner. That is
+/// also why an accidental indent turns a paragraph into a quotation.
+fn take_block_quote(lines: [str], i: i64, inout out: [RstBlock]) -> i64 {
+    if indent_of(lines[i]) == 0 {
+        return 0 - 1
+    }
+    var quoted: [str] = []
+    var k = i
+    while k < lines.len() and (lines[k].trim() == "" or
+        indent_of(lines[k]) > 0) {
+        quoted.push(lines[k].trim())
+        k = k + 1
+    }
+    while quoted.len() > 0 and quoted[quoted.len() - 1] == "" {
+        let _blank = quoted.pop()
+    }
+    out.push(RstBlock{ kind: "block_quote", text: quoted.join("\n"),
+        level: 0, name: "", body: "" })
+    return i + quoted.len()
+}
+
+/// A title line with an underline at least as long as it.
+fn take_section(lines: [str], i: i64, inout seen: [str],
+    inout out: [RstBlock]) -> i64 {
+    if i + 1 >= lines.len() or not is_adornment_line(lines[i + 1]) {
+        return 0 - 1
+    }
+    let title = lines[i].trim()
+    if title == "" or is_adornment_line(lines[i]) {
+        return 0 - 1
+    }
+    if lines[i + 1].trim().len() < title.len() {
+        return 0 - 1
+    }
+    let mark = lines[i + 1].trim().substr(0, 1)
+    if not seen.contains(mark) {
+        seen.push(mark)
+    }
+    var level = 1
+    var k = 0
+    while k < seen.len() {
+        if seen[k] == mark {
+            level = k + 1
+        }
+        k = k + 1
+    }
+    out.push(RstBlock{ kind: "section", text: title, level: level,
+        name: "", body: "" })
+    return i + 2
+}
+
+fn take_transition(lines: [str], i: i64, inout out: [RstBlock]) -> i64 {
+    if not is_adornment_line(lines[i]) or lines[i].trim().len() < 4 {
+        return 0 - 1
+    }
+    out.push(RstBlock{ kind: "transition", text: lines[i].trim(), level: 0,
+        name: "", body: "" })
+    return i + 1
+}
+
+/// A directive or a comment: both begin `..`, and only one has a `::`.
+fn take_directive(lines: [str], i: i64, inout out: [RstBlock]) -> i64 {
+    let line = lines[i]
+    if not line.trim().starts_with("..") {
+        return 0 - 1
+    }
+    let rest = line.trim().substr(2, line.trim().len() - 2).trim()
+    let marker = rest.index_of("::") ?? (0 - 1)
+    let base = indent_of(line)
+    var body = ""
+    var j = i + 1
+    while j < lines.len() {
+        if lines[j].trim() == "" {
+            body = body + "\n"
+            j = j + 1
+            continue
+        }
+        if indent_of(lines[j]) <= base {
+            break
+        }
+        body = body + lines[j].trim() + "\n"
+        j = j + 1
+    }
+    if marker > 0 {
+        out.push(RstBlock{
+            kind: "directive",
+            text: rest.substr(marker + 2, rest.len() - marker - 2).trim(),
+            level: 0,
+            name: rest.substr(0, marker).trim(),
+            body: body.trim(),
+        })
+    } else {
+        out.push(RstBlock{ kind: "comment", text: (rest + "\n" + body).trim(),
+            level: 0, name: "", body: "" })
+    }
+    return j
+}
+
+fn take_field(lines: [str], i: i64, inout out: [RstBlock]) -> i64 {
+    let t = lines[i].trim()
+    if not t.starts_with(":") {
+        return 0 - 1
+    }
+    let close = t.substr(1, t.len() - 1).index_of(":") ?? (0 - 1)
+    if close <= 0 {
+        return 0 - 1
+    }
+    out.push(RstBlock{
+        kind: "field",
+        text: t.substr(close + 2, t.len() - close - 2).trim(),
+        level: 0,
+        name: t.substr(1, close),
+        body: "",
+    })
+    return i + 1
+}
+
+fn take_bullet(lines: [str], i: i64, inout out: [RstBlock]) -> i64 {
+    if not is_bullet(lines[i]) {
+        return 0 - 1
+    }
+    let t = lines[i].trim()
+    var text = t.substr(2, t.len() - 2)
+    let base = indent_of(lines[i])
+    var j = i + 1
+    while j < lines.len() and lines[j].trim() != "" and
+    indent_of(lines[j]) > base and not is_bullet(lines[j]) {
+        text = text + " " + lines[j].trim()
+        j = j + 1
+    }
+    out.push(RstBlock{ kind: "bullet", text: text.trim(), level: 0,
+        name: t.substr(0, 1), body: "" })
+    return j
+}
+
+fn take_enumerated(lines: [str], i: i64, inout out: [RstBlock]) -> i64 {
+    let enumerator = enumerator_length(lines[i])
+    if enumerator == 0 {
+        return 0 - 1
+    }
+    let t = lines[i].trim()
+    out.push(RstBlock{
+        kind: "enumerated",
+        text: t.substr(enumerator + 1, t.len() - enumerator - 1).trim(),
+        level: 0,
+        name: t.substr(0, enumerator),
+        body: "",
+    })
+    return i + 1
+}
+
+/// A paragraph, and the literal block that a trailing `::` introduces.
+fn take_paragraph(lines: [str], i: i64, inout out: [RstBlock]) -> i64 {
+    var text = lines[i].trim()
+    let base = indent_of(lines[i])
+    var j = i + 1
+    while j < lines.len() and lines[j].trim() != "" and
+    not is_bullet(lines[j]) and enumerator_length(lines[j]) == 0 and
+    not (j + 1 < lines.len() and is_adornment_line(lines[j + 1])) {
+        text = text + " " + lines[j].trim()
+        j = j + 1
+    }
+    var literal = false
+    if text.ends_with("::") {
+        literal = true
+        // The marker is not simply deleted. A `::` after a word leaves one
+        // colon behind — "Some code follows::" reads as "Some code
+        // follows:" — and a `::` after a space, or alone, leaves nothing.
+        let before = text.substr(0, text.len() - 2)
+        if before.trim() == "" {
+            text = ""
+        } else {
+            if before.ends_with(" ") {
+                text = before.trim()
+            } else {
+                text = before + ":"
+            }
+        }
+    }
+    if text != "" {
+        out.push(RstBlock{ kind: "paragraph", text: text, level: 0, name: "",
+            body: "" })
+    }
+    if not literal {
+        return j
+    }
+    return take_literal_block(lines, j, base, out)
+}
+
+/// The indented run after a `::`, with the common indent removed and
+/// nothing else touched.
+fn take_literal_block(lines: [str], from: i64, base: i64,
+    inout out: [RstBlock]) -> i64 {
+    var collected: [str] = []
+    var deepest = 0
+    var i = from
+    while i < lines.len() {
+        if lines[i].trim() == "" {
+            collected.push("")
+            i = i + 1
+            continue
+        }
+        if indent_of(lines[i]) <= base {
+            break
+        }
+        if deepest == 0 or indent_of(lines[i]) < deepest {
+            deepest = indent_of(lines[i])
+        }
+        collected.push(lines[i])
+        i = i + 1
+    }
+    while collected.len() > 0 and collected[collected.len() - 1] == "" {
+        let _blank = collected.pop()
+    }
+    var lead = 0
+    while lead < collected.len() and collected[lead] == "" {
+        lead = lead + 1
+    }
+    collected = collected.slice(lead, collected.len())
+    var text = ""
+    var first = true
+    for l in collected {
+        let stripped = if l.len() > deepest {
+            l.substr(deepest, l.len() - deepest)
+        } else {
+            ""
+        }
+        if not first {
+            text = text + "\n"
+        }
+        text = text + stripped
+        first = false
+    }
+    out.push(RstBlock{ kind: "literal_block", text: text, level: 0,
+        name: "", body: "" })
+    return i
+}
+
+/// The document's sections, with the levels the document itself defines.
+pub fn sections(source: str) -> [(i64, str)] {
+    var out: [(i64, str)] = []
+    for b in parse(source) {
+        if b.kind == "section" {
+            out.push((b.level, b.text))
+        }
+    }
+    return out
+}
+
+/// Every directive, as name and argument.
+pub fn directives(source: str) -> [(str, str)] {
+    var out: [(str, str)] = []
+    for b in parse(source) {
+        if b.kind == "directive" {
+            out.push((b.name, b.text))
+        }
+    }
+    return out
+}
+
+/// The document's field list — the `:Author:`-style metadata at the top.
+pub fn fields(source: str) -> Map[str, str] {
+    var out = map()
+    for b in parse(source) {
+        if b.kind == "field" {
+            out.set(b.name, b.text)
+        }
+    }
+    return out
+}
+
+// ------------------------------------------------------------- inline
+
+fn escape(text: str) -> str {
+    var out = ""
+    for c in text.chars() {
+        if c == "&" {
+            out = out + "&amp;"
+        } else {
+            if c == "<" {
+                out = out + "&lt;"
+            } else {
+                if c == ">" {
+                    out = out + "&gt;"
+                } else {
+                    out = out + c
+                }
+            }
+        }
+    }
+    return out
+}
+
+/// The four inline markups: literal, strong, emphasis, and a named link.
+///
+/// Order matters. ``literal`` has to be recognised before *emphasis*, or the
+/// asterisks inside a literal are read as markup — which is exactly what a
+/// literal exists to prevent.
+pub fn inline_to_html(text: str) -> str {
+    var out = ""
+    let cs = text.chars()
+    var i = 0
+    while i < cs.len() {
+        if i + 1 < cs.len() and cs[i] == "`" and cs[i + 1] == "`" {
+            let close = find_pair(cs, i + 2, "`")
+            if close > 0 {
+                out = out + "<tt>" + escape(join_range(cs, i + 2, close)) +
+                "</tt>"
+                i = close + 2
+                continue
+            }
+        }
+        if cs[i] == "`" {
+            let close = find_single(cs, i + 1, "`")
+            if close > 0 and close + 1 < cs.len() and cs[close + 1] == "_" {
+                let body = join_range(cs, i + 1, close)
+                let open_angle = body.index_of("<") ?? (0 - 1)
+                if open_angle > 0 and body.ends_with(">") {
+                    let label = body.substr(0, open_angle).trim()
+                    let url = body.substr(open_angle + 1,
+                        body.len() - open_angle - 2)
+                    out = out + "<a href=\"" + escape(url) + "\">" +
+                    escape(label) + "</a>"
+                    i = close + 2
+                    continue
+                }
+            }
+        }
+        if i + 1 < cs.len() and cs[i] == "*" and cs[i + 1] == "*" {
+            let close = find_pair(cs, i + 2, "*")
+            if close > 0 {
+                out = out + "<strong>" +
+                escape(join_range(cs, i + 2, close)) + "</strong>"
+                i = close + 2
+                continue
+            }
+        }
+        if cs[i] == "*" {
+            let close = find_single(cs, i + 1, "*")
+            if close > 0 {
+                out = out + "<em>" + escape(join_range(cs, i + 1, close)) +
+                "</em>"
+                i = close + 1
+                continue
+            }
+        }
+        out = out + escape(cs[i])
+        i = i + 1
+    }
+    return out
+}
+
+fn find_pair(cs: [str], from: i64, c: str) -> i64 {
+    var i = from
+    while i + 1 < cs.len() {
+        if cs[i] == c and cs[i + 1] == c {
+            return i
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+fn find_single(cs: [str], from: i64, c: str) -> i64 {
+    var i = from
+    while i < cs.len() {
+        if cs[i] == c {
+            return i
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+fn join_range(cs: [str], from: i64, to: i64) -> str {
+    var out = ""
+    var i = from
+    while i < to and i < cs.len() {
+        out = out + cs[i]
+        i = i + 1
+    }
+    return out
+}
+
+/// The document as HTML — a rendering of the subset, not of the format.
+pub fn to_html(source: str) -> str {
+    var out = ""
+    var in_bullets = false
+    var in_numbers = false
+    for b in parse(source) {
+        if b.kind != "bullet" and in_bullets {
+            out = out + "</ul>"
+            in_bullets = false
+        }
+        if b.kind != "enumerated" and in_numbers {
+            out = out + "</ol>"
+            in_numbers = false
+        }
+        if b.kind == "section" {
+            let tag = if b.level > 6 { 6 } else { b.level }
+            out = out + "<h{tag}>" + inline_to_html(b.text) + "</h{tag}>"
+        }
+        if b.kind == "paragraph" {
+            out = out + "<p>" + inline_to_html(b.text) + "</p>"
+        }
+        if b.kind == "literal_block" {
+            out = out + "<pre>" + escape(b.text) + "</pre>"
+        }
+        if b.kind == "block_quote" {
+            out = out + "<blockquote>" + inline_to_html(b.text) +
+            "</blockquote>"
+        }
+        if b.kind == "transition" {
+            out = out + "<hr />"
+        }
+        if b.kind == "bullet" {
+            if not in_bullets {
+                out = out + "<ul>"
+                in_bullets = true
+            }
+            out = out + "<li>" + inline_to_html(b.text) + "</li>"
+        }
+        if b.kind == "enumerated" {
+            if not in_numbers {
+                out = out + "<ol>"
+                in_numbers = true
+            }
+            out = out + "<li>" + inline_to_html(b.text) + "</li>"
+        }
+    }
+    if in_bullets {
+        out = out + "</ul>"
+    }
+    if in_numbers {
+        out = out + "</ol>"
+    }
+    return out
+}

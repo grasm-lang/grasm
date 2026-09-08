@@ -1,0 +1,10 @@
+[package]
+name = "csvdialect"
+version = "1.0.0"
+
+# Reads a sample the caller supplies. Opens nothing.
+capabilities = []
+
+[dependencies.csv]
+path = "../csv"
+version = "^1.0.0"

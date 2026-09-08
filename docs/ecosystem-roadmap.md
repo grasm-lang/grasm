@@ -14,7 +14,7 @@ plan that discovers them 300 packages in.
 | | |
 |---|---|
 | Started | 78 |
-| Now | 290 |
+| Now | 295 |
 | Tier 1 target | 200 |
 | Tier 2 target | 500 |
 | Tier 3 target | 800 |
@@ -185,7 +185,7 @@ outside implementation wherever one exists.
 | ~~Cryptography~~ | ~~`argon2` `bcrypt` `rsa` `ed25519` `pemfile`~~ — done, plus `blake2b` |
 | ~~Certificates~~ | ~~`csr` `pkcs7` `ocsp` `jwk` `certchain`~~ — done, plus `hostmatch`, `derwrite`, `pkcs8` and `crl` |
 | ~~Text analysis~~ | ~~`stemmer` `stopwords` `readability` `hyphenate` `keyphrase`~~ — done |
-| Documents | `rst` `bbcode` `wikitext` `csvdialect` `fixedwidth` |
+| ~~Documents~~ | ~~`rst` `bbcode` `wikitext` `csvdialect` `fixedwidth`~~ — done |
 | Build tooling | `changelog` `spdx` `codeowners` `patchfile` `coveragefmt` |
 | Money and tax | `vatid` `taxrate` `invoice` `ledgerfmt` `fx` |
 

@@ -1,0 +1,24 @@
+[package]
+name = "documents_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.rst]
+path = "../rst"
+version = "^1.0.0"
+
+[dependencies.bbcode]
+path = "../bbcode"
+version = "^1.0.0"
+
+[dependencies.wikitext]
+path = "../wikitext"
+version = "^1.0.0"
+
+[dependencies.csvdialect]
+path = "../csvdialect"
+version = "^1.0.0"
+
+[dependencies.fixedwidth]
+path = "../fixedwidth"
+version = "^1.0.0"

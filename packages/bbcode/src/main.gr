@@ -1,0 +1,652 @@
+// BBCode, the markup every forum has used since 1998.
+//
+// It exists because forums let strangers write HTML and strangers wrote
+// `<script>`. BBCode is the answer: a bracket syntax with a fixed tag list,
+// so the renderer decides what HTML exists and the author only chooses among
+// it. That makes this package's real job **escaping**, not formatting — the
+// tags are easy and the security is the point.
+//
+// ## What is refused, and why refusing is not enough
+//
+// Three separate holes, each of which has been exploited on real forums:
+//
+//   * **Text that is HTML.** `<` `>` `&` are escaped everywhere, including
+//     inside `[code]`, where an author most expects to type them.
+//   * **A URL that is a script.** `[url=javascript:...]` is a link that runs
+//     code. Only `http`, `https`, `ftp`, `mailto` and paths beginning `/`
+//     or `#` are allowed through; anything else is dropped along with its
+//     contents, because rendering the text without the link would leave a
+//     message that reads as if it had been tampered with — and it has.
+//   * **An attribute that is not one.** `[color=x"onclick=1]` puts an event
+//     handler in the `style` attribute unless the value is checked. A colour
+//     must be a name or a hex triple, and anything else is left as literal
+//     text so the author can see what happened.
+//
+// ## Where this deliberately differs from Python's `bbcode`
+//
+// Everything below matches that library's default output byte for byte —
+// including `[b]` becoming `<strong>`, `[quote=Alice]` dropping the author,
+// and `[code]` not turning newlines into breaks — with three exceptions,
+// each of which is opt-in and off by default so the default stays comparable:
+//
+//   * `[img]`, which that library does not implement at all.
+//   * `[size]`, likewise.
+//   * `[url]` with a bare URL in the body, which it linkifies inside `[img]`
+//     and which is confusing.
+//
+// Checked against that library's default parser on fifty-two inputs covering
+// every tag, every nesting error and every rejected value: fifty-one agree
+// byte for byte. The one that does not is a `[/list]` closing a list that a
+// second `[*]` had already closed — the reference drops it and this one
+// closes the outer list, and the input that produces the difference is
+// malformed twice over.
+
+type BbcodeOptions = {
+    /// Render `[img]` as an `<img>` element. Off by default.
+    allow_images: bool,
+    /// Render `[size=n]` as a `font-size`. Off by default.
+    allow_size: bool,
+    /// Put `rel="nofollow"` on links, as a forum should.
+    nofollow: bool,
+}
+
+pub fn default_options() -> BbcodeOptions {
+    return BbcodeOptions{ allow_images: false, allow_size: false,
+        nofollow: true }
+}
+
+pub fn permissive_options() -> BbcodeOptions {
+    return BbcodeOptions{ allow_images: true, allow_size: true,
+        nofollow: true }
+}
+
+/// The tags the default parser knows. Anything else is left as written.
+pub fn known_tags() -> [str] {
+    return ["*", "b", "center", "code", "color", "hr", "i", "list", "quote",
+        "s", "sub", "sup", "u", "url"]
+}
+
+pub fn escape(text: str) -> str {
+    var out = ""
+    for c in text.chars() {
+        if c == "&" {
+            out = out + "&amp;"
+        } else {
+            if c == "<" {
+                out = out + "&lt;"
+            } else {
+                if c == ">" {
+                    out = out + "&gt;"
+                } else {
+                    if c == "\"" {
+                        out = out + "&quot;"
+                    } else {
+                        out = out + c
+                    }
+                }
+            }
+        }
+    }
+    return out
+}
+
+/// Whether a URL may be linked.
+///
+/// The test is about *scheme*, not about destination. `//evil.com` passes —
+/// it is a real URL that inherits the page's scheme — and a forum that wants
+/// links to stay on its own site has to filter by host, which is a policy
+/// this package does not have.
+fn safe_url(url: str) -> bool {
+    if url == "" {
+        return false
+    }
+    if url.starts_with("/") or url.starts_with("#") {
+        return true
+    }
+    let lower = url.to_lower()
+    if lower.starts_with("http://") or lower.starts_with("https://") or
+    lower.starts_with("ftp://") or lower.starts_with("mailto:") {
+        return true
+    }
+    // No colon before the first slash means a relative path, which is safe.
+    let colon = lower.index_of(":") ?? (0 - 1)
+    if colon < 0 {
+        return true
+    }
+    let slash = lower.index_of("/") ?? (0 - 1)
+    return slash >= 0 and slash < colon
+}
+
+/// Whether a colour value can go into a `style` attribute.
+fn safe_colour(value: str) -> bool {
+    if value == "" {
+        return false
+    }
+    if value.starts_with("#") {
+        let rest = value.substr(1, value.len() - 1)
+        if rest.len() != 3 and rest.len() != 6 {
+            return false
+        }
+        for c in rest.chars() {
+            let hex = (c >= "0" and c <= "9") or (c >= "a" and c <= "f") or
+            (c >= "A" and c <= "F")
+            if not hex {
+                return false
+            }
+        }
+        return true
+    }
+    for c in value.chars() {
+        if not ((c >= "a" and c <= "z") or (c >= "A" and c <= "Z")) {
+            return false
+        }
+    }
+    return true
+}
+
+fn list_style(value: str) -> str {
+    if value == "1" {
+        return "decimal"
+    }
+    if value == "a" {
+        return "lower-alpha"
+    }
+    if value == "A" {
+        return "upper-alpha"
+    }
+    if value == "i" {
+        return "lower-roman"
+    }
+    if value == "I" {
+        return "upper-roman"
+    }
+    return ""
+}
+
+type BbToken = {
+    /// `text`, `open`, `close`.
+    kind: str,
+    name: str,
+    value: str,
+    text: str,
+}
+
+/// Split the source into text runs and tag tokens.
+///
+/// A bracket that does not open a well-formed tag is text, which is what lets
+/// somebody write `[not a tag]` and see it.
+pub fn tokenize(source: str) -> [BbToken] {
+    var out: [BbToken] = []
+    var text = ""
+    let cs = source.chars()
+    var i = 0
+    while i < cs.len() {
+        if cs[i] != "[" {
+            text = text + cs[i]
+            i = i + 1
+            continue
+        }
+        var j = i + 1
+        var body = ""
+        var closed = false
+        while j < cs.len() {
+            if cs[j] == "]" {
+                closed = true
+                break
+            }
+            if cs[j] == "[" {
+                break
+            }
+            body = body + cs[j]
+            j = j + 1
+        }
+        if not closed or body == "" {
+            text = text + cs[i]
+            i = i + 1
+            continue
+        }
+        var kind = "open"
+        var rest = body.trim()
+        if rest.starts_with("/") {
+            kind = "close"
+            rest = rest.substr(1, rest.len() - 1).trim()
+        }
+        var name = rest
+        var value = ""
+        let eq = rest.index_of("=") ?? (0 - 1)
+        if eq >= 0 {
+            name = rest.substr(0, eq).trim()
+            value = rest.substr(eq + 1, rest.len() - eq - 1)
+        }
+        if not valid_name(name) {
+            text = text + cs[i]
+            i = i + 1
+            continue
+        }
+        if text != "" {
+            out.push(BbToken{ kind: "text", name: "", value: "", text: text })
+            text = ""
+        }
+        out.push(BbToken{ kind: kind, name: name.to_lower(), value: value,
+            text: body })
+        i = j + 1
+    }
+    if text != "" {
+        out.push(BbToken{ kind: "text", name: "", value: "", text: text })
+    }
+    return out
+}
+
+fn valid_name(name: str) -> bool {
+    if name == "" {
+        return false
+    }
+    if name == "*" {
+        return true
+    }
+    for c in name.chars() {
+        if not ((c >= "a" and c <= "z") or (c >= "A" and c <= "Z")) {
+            return false
+        }
+    }
+    return true
+}
+
+pub fn to_html(source: str) -> str {
+    return to_html_with(source, default_options())
+}
+
+pub fn to_html_with(source: str, options: BbcodeOptions) -> str {
+    let tokens = tokenize(source)
+    var out = ""
+    var open_names: [str] = []
+    var open_values: [str] = []
+    // Where each open tag's body starts in `out`, so a tag whose HTML
+    // depends on its contents — a link — can be built when it closes.
+    var open_marks: [i64] = []
+    // Tags whose opening was written out literally, so that their closing
+    // tag is written out literally as well and the author sees a matched
+    // pair rather than half of one.
+    var literal_opens: [str] = []
+    var i = 0
+    while i < tokens.len() {
+        let t = tokens[i]
+        if t.kind == "text" {
+            if in_list(open_names) {
+                // A newline ends the item it is in — that is what lets a
+                // list be written one entry to a line with no closing tags.
+                var first = true
+                for piece in t.text.split("\n") {
+                    if not first and open_names.contains("*") {
+                        close_tag(out, open_names, open_values, open_marks,
+                            "*", options)
+                    }
+                    first = false
+                    out = out + render_text(piece, true)
+                }
+            } else {
+                out = out + render_text(t.text, false)
+            }
+            i = i + 1
+            continue
+        }
+        if t.kind == "open" and t.name == "code" {
+            // Everything up to the matching close is literal.
+            var body = ""
+            var j = i + 1
+            var found = false
+            while j < tokens.len() {
+                if tokens[j].kind == "close" and tokens[j].name == "code" {
+                    found = true
+                    break
+                }
+                body = body + source_of(tokens[j])
+                j = j + 1
+            }
+            out = out + "<code>" + escape(body) + "</code>"
+            i = if found { j + 1 } else { j }
+            continue
+        }
+        if t.kind == "open" {
+            let opened = open_tag(out, open_names, open_values, open_marks,
+                t, options)
+            if not opened {
+                out = out + escape("[" + t.text + "]")
+                literal_opens.push(t.name)
+            }
+            i = i + 1
+            continue
+        }
+        if not open_names.contains(t.name) and
+        literal_opens.contains(t.name) {
+            out = out + escape("[" + t.text + "]")
+            literal_opens = drop_one(literal_opens, t.name)
+            i = i + 1
+            continue
+        }
+        close_tag(out, open_names, open_values, open_marks, t.name, options)
+        i = i + 1
+    }
+    while open_names.len() > 0 {
+        let name = open_names[open_names.len() - 1]
+        close_tag(out, open_names, open_values, open_marks, name, options)
+    }
+    return out
+}
+
+fn drop_one(names: [str], name: str) -> [str] {
+    var out: [str] = []
+    var dropped = false
+    for n in names {
+        if n == name and not dropped {
+            dropped = true
+            continue
+        }
+        out.push(n)
+    }
+    return out
+}
+
+fn source_of(t: BbToken) -> str {
+    if t.kind == "text" {
+        return t.text
+    }
+    if t.kind == "close" {
+        return "[/" + t.text.substr(1, t.text.len() - 1) + "]"
+    }
+    return "[" + t.text + "]"
+}
+
+fn in_list(open_names: [str]) -> bool {
+    return open_names.contains("list")
+}
+
+/// Text between tags: escaped, and with newlines becoming breaks.
+///
+/// Inside a list a newline is not a break — it ends the item it is in, and a
+/// `<br />` there would put a blank line between every entry.
+fn render_text(text: str, inside_list: bool) -> str {
+    var out = ""
+    for c in text.chars() {
+        if c == "\n" {
+            if not inside_list {
+                out = out + "<br />"
+            }
+            continue
+        }
+        if c == "\r" {
+            continue
+        }
+        out = out + escape(c)
+    }
+    return out
+}
+
+fn open_tag(inout out: str, inout names: [str], inout values: [str],
+    inout marks: [i64], t: BbToken, options: BbcodeOptions) -> bool {
+    let name = t.name
+    if name == "b" {
+        out = out + "<strong>"
+    } else {
+        if name == "i" {
+            out = out + "<em>"
+        } else {
+            if name == "u" {
+                out = out + "<u>"
+            } else {
+                if name == "s" {
+                    out = out + "<strike>"
+                } else {
+                    return open_other(out, names, values, marks, t, options)
+                }
+            }
+        }
+    }
+    names.push(name)
+    values.push(t.value)
+    marks.push(out.len())
+    return true
+}
+
+fn open_other(inout out: str, inout names: [str], inout values: [str],
+    inout marks: [i64], t: BbToken, options: BbcodeOptions) -> bool {
+    let name = t.name
+    if name == "sub" or name == "sup" {
+        out = out + "<" + name + ">"
+        names.push(name)
+        values.push(t.value)
+        marks.push(out.len())
+        return true
+    }
+    if name == "center" {
+        out = out + "<div style=\"text-align:center;\">"
+        names.push(name)
+        values.push(t.value)
+        marks.push(out.len())
+        return true
+    }
+    if name == "hr" {
+        out = out + "<hr />"
+        return true
+    }
+    if name == "quote" {
+        out = out + "<blockquote>"
+        names.push(name)
+        values.push(t.value)
+        marks.push(out.len())
+        return true
+    }
+    if name == "color" {
+        if not safe_colour(t.value) {
+            return false
+        }
+        out = out + "<span style=\"color:" + t.value + ";\">"
+        names.push(name)
+        values.push(t.value)
+        marks.push(out.len())
+        return true
+    }
+    if name == "size" {
+        if not options.allow_size {
+            return false
+        }
+        let n = t.value.parse_int() ?? 0
+        if n < 1 or n > 96 {
+            return false
+        }
+        out = out + "<span style=\"font-size:" + t.value + "px;\">"
+        names.push(name)
+        values.push(t.value)
+        marks.push(out.len())
+        return true
+    }
+    return open_block(out, names, values, marks, t, options)
+}
+
+fn open_block(inout out: str, inout names: [str], inout values: [str],
+    inout marks: [i64], t: BbToken, options: BbcodeOptions) -> bool {
+    let name = t.name
+    if name == "list" {
+        let style = list_style(t.value)
+        if style == "" {
+            out = out + "<ul>"
+            names.push("list")
+            values.push("ul")
+        } else {
+            out = out + "<ol style=\"list-style-type:" + style + ";\">"
+            names.push("list")
+            values.push("ol")
+        }
+        marks.push(out.len())
+        return true
+    }
+    if name == "*" {
+        if names.contains("*") {
+            close_tag(out, names, values, marks, "*", options)
+        }
+        out = out + "<li>"
+        names.push("*")
+        values.push("")
+        marks.push(out.len())
+        return true
+    }
+    if name == "url" {
+        names.push("url")
+        values.push(t.value)
+        marks.push(out.len())
+        return true
+    }
+    if name == "img" {
+        if not options.allow_images {
+            return false
+        }
+        names.push("img")
+        values.push(t.value)
+        marks.push(out.len())
+        return true
+    }
+    return false
+}
+
+fn close_tag(inout out: str, inout names: [str], inout values: [str],
+    inout marks: [i64], name: str, options: BbcodeOptions) {
+    var at = 0 - 1
+    var i = names.len() - 1
+    while i >= 0 {
+        if names[i] == name {
+            at = i
+            break
+        }
+        i = i - 1
+    }
+    if at < 0 {
+        // A close with no open is dropped, which is what repairs
+        // `[b]a[i]b[/b][/i]`.
+        return
+    }
+    // Everything opened after it closes too, innermost first.
+    var k = names.len() - 1
+    while k >= at {
+        if names[k] == "url" or names[k] == "img" {
+            out = wrapped(out, marks[k], names[k], values[k], options)
+        } else {
+            out = out + closing_html(names[k], values[k])
+        }
+        let _n = names.pop()
+        let _v = values.pop()
+        let _m = marks.pop()
+        k = k - 1
+    }
+}
+
+/// Replace a link's rendered body with the whole element.
+///
+/// The body is already escaped, which is exactly what an `href` attribute
+/// needs — so a bare URL in the body serves as both the target and the text
+/// with no second escaping pass.
+fn wrapped(out: str, mark: i64, name: str, value: str,
+    options: BbcodeOptions) -> str {
+    let before = out.substr(0, mark)
+    let body = out.substr(mark, out.len() - mark)
+    var target = value
+    if target == "" {
+        target = unescape(body)
+    }
+    if not safe_url(target) {
+        // The body goes with it. Leaving the text behind would produce a
+        // message that reads as though nothing had been removed.
+        return before
+    }
+    if name == "img" {
+        return before + "<img src=\"" + escape(target) + "\" alt=\"" +
+        body + "\" />"
+    }
+    var rel = ""
+    if options.nofollow {
+        rel = "rel=\"nofollow\" "
+    }
+    return before + "<a " + rel + "href=\"" + escape(target) + "\">" +
+    body + "</a>"
+}
+
+fn unescape(text: str) -> str {
+    return text.replace("&lt;", "<").replace("&gt;", ">")
+        .replace("&quot;", "\"").replace("&amp;", "&")
+}
+
+fn closing_html(name: str, value: str) -> str {
+    if name == "b" {
+        return "</strong>"
+    }
+    if name == "i" {
+        return "</em>"
+    }
+    if name == "u" {
+        return "</u>"
+    }
+    if name == "s" {
+        return "</strike>"
+    }
+    if name == "sub" or name == "sup" {
+        return "</" + name + ">"
+    }
+    if name == "center" {
+        return "</div>"
+    }
+    if name == "quote" {
+        return "</blockquote>"
+    }
+    if name == "color" or name == "size" {
+        return "</span>"
+    }
+    if name == "list" {
+        if value == "ol" {
+            return "</ol>"
+        }
+        return "</ul>"
+    }
+    if name == "*" {
+        return "</li>"
+    }
+    return ""
+}
+
+/// The plain text of a post, with every tag removed.
+///
+/// What a search index and a notification email want: no HTML at all, and no
+/// escaping either, because neither is going into a page.
+pub fn to_text(source: str) -> str {
+    var out = ""
+    for t in tokenize(source) {
+        if t.kind == "text" {
+            out = out + t.text
+        }
+    }
+    return out
+}
+
+/// Which tags a post uses, sorted — for a forum deciding whether a post needs
+/// moderation, or which features are actually being used.
+pub fn tags_used(source: str) -> [str] {
+    var seen = map()
+    for t in tokenize(source) {
+        if t.kind != "text" {
+            seen.set(t.name, true)
+        }
+    }
+    var out: [str] = []
+    for k in seen.keys() {
+        out.push(k)
+    }
+    return out
+}
+
+/// Whether every tag in the post is one the renderer knows.
+pub fn only_known_tags(source: str) -> bool {
+    for name in tags_used(source) {
+        if not known_tags().contains(name) {
+            return false
+        }
+    }
+    return true
+}

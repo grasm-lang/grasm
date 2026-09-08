@@ -1,0 +1,6 @@
+[package]
+name = "wikitext"
+version = "1.0.0"
+
+# Reads text the caller supplies. Opens nothing.
+capabilities = []

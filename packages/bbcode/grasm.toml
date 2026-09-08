@@ -1,0 +1,6 @@
+[package]
+name = "bbcode"
+version = "1.0.0"
+
+# Text in, HTML out. Opens nothing.
+capabilities = []
