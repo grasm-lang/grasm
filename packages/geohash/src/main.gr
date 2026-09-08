@@ -1,0 +1,290 @@
+// Geohash: a location as a short string that a prefix search can use.
+//
+// The idea is that repeatedly halving the world — east or west, north or
+// south — produces a bit string, and that **a shared prefix means a shared
+// area**. `gcpuv` and `gcpuz` are in the same neighbourhood; a string index
+// on the hash answers "what is near here" with a range scan and no spatial
+// index at all.
+//
+// The two things it does badly, both of which follow from that same idea:
+//
+//   - **Neighbours can share no prefix.** Two points a metre apart either
+//     side of a cell boundary have completely different hashes, and either
+//     side of the prime meridian they share nothing at all. A proximity
+//     search has to look at the eight neighbouring cells as well, which is
+//     why `neighbours` is here and why a search that omits it misses half its
+//     results.
+//   - **Cells are not square.** Odd-length hashes are wider than tall and
+//     even-length ones nearly square, because the bits alternate between
+//     longitude and latitude and an odd count gives longitude one more.
+import haversine
+
+type GeohashError =
+    | BadCharacter(at: i64)
+    | Empty
+
+fn alphabet() -> str {
+    // Base 32, without `a`, `i`, `l` and `o` — the four that are misread.
+    return "0123456789bcdefghjkmnpqrstuvwxyz"
+}
+
+fn value_of(c: str) -> i64 {
+    let cs = alphabet().chars()
+    for i in 0..cs.len() {
+        if cs[i] == c {
+            return i
+        }
+    }
+    return 0 - 1
+}
+
+/// Encode to `length` characters. Twelve is about 3.7 cm and the practical
+/// maximum; five is about 5 km.
+pub fn encode(p: GeoPoint, length: i64) -> str {
+    let cs = alphabet().chars()
+    var lat_low = 0.0 - 90.0
+    var lat_high = 90.0
+    var lon_low = 0.0 - 180.0
+    var lon_high = 180.0
+    var out = ""
+    var bit = 0
+    var value = 0
+    var even = true
+    while out.len() < length {
+        if even {
+            let middle = (lon_low + lon_high) / 2.0
+            if p.longitude >= middle {
+                value = value * 2 + 1
+                lon_low = middle
+            } else {
+                value = value * 2
+                lon_high = middle
+            }
+        } else {
+            let middle = (lat_low + lat_high) / 2.0
+            if p.latitude >= middle {
+                value = value * 2 + 1
+                lat_low = middle
+            } else {
+                value = value * 2
+                lat_high = middle
+            }
+        }
+        even = not even
+        bit = bit + 1
+        if bit == 5 {
+            out = out + cs[value]
+            bit = 0
+            value = 0
+        }
+    }
+    return out
+}
+
+/// The cell a hash names, as its south-west and north-east corners.
+pub fn decode_box(hash: str) -> GeoBox ! GeohashError {
+    if hash.len() == 0 {
+        fail(Empty)
+    }
+    var lat_low = 0.0 - 90.0
+    var lat_high = 90.0
+    var lon_low = 0.0 - 180.0
+    var lon_high = 180.0
+    var even = true
+    let cs = hash.to_lower().chars()
+    for i in 0..cs.len() {
+        let v = value_of(cs[i])
+        if v < 0 {
+            fail(BadCharacter(i))
+        }
+        var mask = 16
+        while mask > 0 {
+            let bit = if v.bit_and(mask) != 0 { 1 } else { 0 }
+            if even {
+                let middle = (lon_low + lon_high) / 2.0
+                if bit == 1 {
+                    lon_low = middle
+                } else {
+                    lon_high = middle
+                }
+            } else {
+                let middle = (lat_low + lat_high) / 2.0
+                if bit == 1 {
+                    lat_low = middle
+                } else {
+                    lat_high = middle
+                }
+            }
+            even = not even
+            mask = mask / 2
+        }
+    }
+    return GeoBox{
+        south: lat_low, west: lon_low, north: lat_high, east: lon_high,
+    }
+}
+
+/// The centre of the cell — the point a hash decodes to.
+///
+/// The centre rather than a corner, because the hash names an area and the
+/// centre is the point with the least possible error from whatever was
+/// encoded.
+pub fn decode(hash: str) -> GeoPoint ! GeohashError {
+    let b = try decode_box(hash)
+    return GeoPoint{
+        latitude: (b.south + b.north) / 2.0,
+        longitude: (b.west + b.east) / 2.0,
+    }
+}
+
+/// How large the cell is, in metres, as (width, height).
+///
+/// Width and height separately, because they are not equal: an odd-length
+/// hash gives longitude one more bit than latitude, so its cell is about
+/// twice as wide as it is tall.
+pub fn cell_size(hash: str) -> (f64, f64) {
+    match decode_box(hash) {
+        Ok(b) -> {
+            let west = GeoPoint{ latitude: (b.south + b.north) / 2.0, longitude: b.west }
+            let east = GeoPoint{ latitude: (b.south + b.north) / 2.0, longitude: b.east }
+            let south = GeoPoint{ latitude: b.south, longitude: (b.west + b.east) / 2.0 }
+            let north = GeoPoint{ latitude: b.north, longitude: (b.west + b.east) / 2.0 }
+            return (haversine.distance(west, east), haversine.distance(south, north))
+        }
+        Err(_e) -> return (0.0, 0.0)
+    }
+}
+
+/// The hash's cell one step in a direction: "n", "s", "e" or "w".
+///
+/// Computed by moving a cell's width and re-encoding, which is exact because
+/// the step lands inside the neighbouring cell rather than on its edge.
+pub fn neighbour(hash: str, direction: str) -> str {
+    match decode_box(hash) {
+        Ok(b) -> {
+            let lat = (b.south + b.north) / 2.0
+            let lon = (b.west + b.east) / 2.0
+            let lat_step = (b.north - b.south)
+            let lon_step = (b.east - b.west)
+            var next_lat = lat
+            var next_lon = lon
+            if direction == "n" {
+                next_lat = lat + lat_step
+            } else if direction == "s" {
+                next_lat = lat - lat_step
+            } else if direction == "e" {
+                next_lon = lon + lon_step
+            } else if direction == "w" {
+                next_lon = lon - lon_step
+            }
+            if next_lat > 90.0 {
+                next_lat = 90.0
+            }
+            if next_lat < 0.0 - 90.0 {
+                next_lat = 0.0 - 90.0
+            }
+            next_lon = haversine.normalise_longitude(next_lon)
+            return encode(GeoPoint{ latitude: next_lat, longitude: next_lon },
+                hash.len())
+        }
+        Err(_e) -> return hash
+    }
+}
+
+/// The eight cells around this one, plus this one.
+///
+/// The nine a proximity search must look at: two points a metre apart either
+/// side of a cell boundary share no prefix at all, so searching the single
+/// cell misses half the neighbourhood.
+pub fn neighbours(hash: str) -> [str] {
+    var out: [str] = [hash]
+    let north = neighbour(hash, "n")
+    let south = neighbour(hash, "s")
+    for h in [north, south, neighbour(hash, "e"), neighbour(hash, "w"),
+        neighbour(north, "e"), neighbour(north, "w"),
+        neighbour(south, "e"), neighbour(south, "w")] {
+        if not out.contains(h) {
+            out.push(h)
+        }
+    }
+    return out
+}
+
+/// The length of hash whose cell is at least `metres` across.
+///
+/// The number a proximity search needs: too short and it scans the county,
+/// too long and it misses the next street.
+pub fn length_for(metres: f64) -> i64 {
+    // Widths of a cell at the equator, by hash length.
+    let widths = [5009400.0, 1252300.0, 156500.0, 39100.0, 4900.0, 1200.0,
+        152.9, 38.2, 4.8, 1.2, 0.149, 0.037]
+    for i in 0..widths.len() {
+        if widths[i] < metres {
+            // The previous length is the last one still wide enough.
+            if i == 0 {
+                return 1
+            }
+            return i
+        }
+    }
+    return widths.len()
+}
+
+/// The shared prefix of two hashes, which is a coarse measure of how close
+/// they are — and only that, because neighbours may share none.
+pub fn common_prefix(a: str, b: str) -> str {
+    let x = a.chars()
+    let y = b.chars()
+    var out = ""
+    var i = 0
+    while i < x.len() and i < y.len() and x[i] == y[i] {
+        out = out + x[i]
+        i = i + 1
+    }
+    return out
+}
+
+pub fn is_valid(hash: str) -> bool {
+    if hash.len() == 0 {
+        return false
+    }
+    for c in hash.to_lower().chars() {
+        if value_of(c) < 0 {
+            return false
+        }
+    }
+    return true
+}
+
+/// Whether `inner` is inside `outer`'s cell — a prefix test, which is what
+/// makes a geohash index a plain string index.
+pub fn contains(outer: str, inner: str) -> bool {
+    return inner.to_lower().starts_with(outer.to_lower())
+}
+
+/// Every hash of `length` covering a box.
+///
+/// The range a database query scans. Bounded, because a box the size of a
+/// continent at length 9 is more cells than anything can hold, and returning
+/// nothing is better than returning a hundred million strings.
+pub fn cover(b: GeoBox, length: i64, limit: i64) -> [str] {
+    var out: [str] = []
+    let step_lat = (b.north - b.south) / 20.0
+    let step_lon = (b.east - b.west) / 20.0
+    if step_lat <= 0.0 or step_lon <= 0.0 {
+        return out
+    }
+    var lat = b.south
+    while lat <= b.north and out.len() < limit {
+        var lon = b.west
+        while lon <= b.east and out.len() < limit {
+            let h = encode(GeoPoint{ latitude: lat, longitude: lon }, length)
+            if not out.contains(h) {
+                out.push(h)
+            }
+            lon = lon + step_lon
+        }
+        lat = lat + step_lat
+    }
+    return out
+}

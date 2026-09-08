@@ -1,0 +1,10 @@
+[package]
+name = "wkt"
+version = "1.0.0"
+
+# Text and arithmetic. Opens nothing.
+capabilities = []
+
+[dependencies.haversine]
+path = "../haversine"
+version = "^1.0.0"

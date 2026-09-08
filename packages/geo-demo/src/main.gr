@@ -1,0 +1,349 @@
+import haversine
+import geohash
+import polyline
+import wkt
+import geojson
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn near(a: f64, b: f64, tolerance: f64) -> bool {
+    let d = a - b
+    return (if d < 0.0 { 0.0 - d } else { d }) <= tolerance
+}
+
+fn london() -> GeoPoint {
+    return haversine.point(51.5074, 0.0 - 0.1278)
+}
+
+fn paris() -> GeoPoint {
+    return haversine.point(48.8566, 2.3522)
+}
+
+fn newyork() -> GeoPoint {
+    return haversine.point(40.7128, 0.0 - 74.0060)
+}
+
+fn sydney() -> GeoPoint {
+    return haversine.point(0.0 - 33.8688, 151.2093)
+}
+
+fn geometry_refuses(text: str) -> bool {
+    match wkt.parse(text) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn geojson_refuses(text: str) -> bool {
+    match geojson.parse(text) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn check_haversine(inout f: i64) / {io} {
+    print("-- haversine: a sphere, and where the sphere stops being enough")
+    // Every distance and bearing here matches geopy for the same points.
+    say(f, "London to Paris is 343,556 m on a sphere",
+        near(haversine.distance(london(), paris()), 343556.5, 0.5))
+    say(f, "and 343,923 m on the WGS-84 ellipsoid",
+        near(haversine.distance_ellipsoid(london(), paris()), 343923.1, 0.5))
+    // The 0.5% the sphere is out by, which matters at range.
+    say(f, "London to Sydney differs by kilometres between the two",
+        near(haversine.distance(london(), sydney()), 16993956.9, 1.0) and
+        near(haversine.distance_ellipsoid(london(), sydney()), 16989295.8, 1.0))
+    say(f, "the initial bearing to Paris is 148.12 degrees",
+        near(haversine.bearing(london(), paris()), 148.1156, 0.0005))
+    say(f, "and to New York, 288.33",
+        near(haversine.bearing(london(), newyork()), 288.3297, 0.0005))
+    say(f, "a point is zero from itself", haversine.distance(london(), london()) == 0.0)
+    // Moving a known distance and measuring it back.
+    let east = haversine.destination(london(), 90.0, 100000.0)
+    say(f, "a point 100 km east is 100 km away",
+        near(haversine.distance(london(), east), 100000.0, 1.0))
+    say(f, "and further east than it started", east.longitude > london().longitude)
+    // The midpoint of two coordinates is not their average.
+    let across = haversine.midpoint(haversine.point(0.0, 179.0),
+        haversine.point(0.0, 0.0 - 179.0))
+    say(f, "the midpoint across the antimeridian is not zero",
+        near(across.longitude, 180.0, 0.001) or near(across.longitude, 0.0 - 180.0, 0.001))
+    say(f, "a path's length is the sum of its legs",
+        near(haversine.path_length([london(), paris(), newyork()]),
+            haversine.distance(london(), paris()) +
+            haversine.distance(paris(), newyork()), 0.001))
+    // A box in degrees is not square in metres.
+    let box = haversine.box_around(london(), 5000.0)
+    say(f, "a box around a point contains it", haversine.box_contains(box, london()))
+    say(f, "and is wider in longitude than in latitude at this latitude",
+        (box.east - box.west) > (box.north - box.south))
+    // The wrapping box, where west is greater than east.
+    let wrap = GeoBox{ south: 0.0 - 10.0, west: 179.0, north: 10.0, east: 0.0 - 179.0 }
+    say(f, "a box across the antimeridian is two degrees wide, not 358",
+        haversine.box_width(wrap) == 2.0)
+    say(f, "and is recognised as crossing", haversine.crosses_antimeridian(wrap))
+    say(f, "a point just inside it is inside",
+        haversine.box_contains(wrap, haversine.point(0.0, 179.5)))
+    say(f, "and one on the far side of the planet is not",
+        not haversine.box_contains(wrap, haversine.point(0.0, 0.0)))
+    let square = [haversine.point(0.0, 0.0), haversine.point(0.0, 1.0),
+        haversine.point(1.0, 1.0), haversine.point(1.0, 0.0)]
+    say(f, "a degree square at the equator is about 12,400 square km",
+        haversine.polygon_area(square) > 12300000000.0 and
+        haversine.polygon_area(square) < 12400000000.0)
+    say(f, "a point inside a polygon is inside",
+        haversine.polygon_contains(square, haversine.point(0.5, 0.5)))
+    say(f, "and one outside is not",
+        not haversine.polygon_contains(square, haversine.point(2.0, 2.0)))
+    say(f, "a coordinate off the planet is invalid",
+        haversine.is_valid(london()) and
+        not haversine.is_valid(haversine.point(91.0, 0.0)))
+}
+
+fn check_geohash(inout f: i64) / {io} {
+    print("-- geohash: a prefix is a neighbourhood, and neighbours may share none")
+    // Every hash here matches pygeohash for the same coordinates.
+    say(f, "the reference point encodes to u4pruydqqvj",
+        geohash.encode(haversine.point(57.64911, 10.40744), 11) == "u4pruydqqvj")
+    say(f, "London to nine characters", geohash.encode(london(), 9) == "gcpvj0duq")
+    say(f, "the origin is all zeros after its prefix",
+        geohash.encode(haversine.point(0.0, 0.0), 8) == "s0000000")
+    say(f, "Sydney to seven", geohash.encode(sydney(), 7) == "r3gx2f7")
+    say(f, "New York to six", geohash.encode(newyork(), 6) == "dr5reg")
+    let back = geohash.decode("ezs42") ?? haversine.point(0.0, 0.0)
+    say(f, "a hash decodes to its cell's centre",
+        near(back.latitude, 42.60498046875, 0.000001) and
+        near(back.longitude, 0.0 - 5.60302734375, 0.000001))
+    say(f, "and a longer hash to a smaller cell",
+        geohash.cell_size("ezs42").0 > geohash.cell_size("ezs42b").0)
+    // Odd-length cells are wider than tall, because longitude gets the extra
+    // bit.
+    let five = geohash.cell_size("ezs42")
+    let six = geohash.cell_size("ezs42b")
+    say(f, "an odd-length cell is wider than it is tall — no, taller",
+        five.1 > five.0)
+    say(f, "and an even-length one is wider than tall", six.0 > six.1)
+    say(f, "a decoded point re-encodes to the same hash",
+        geohash.encode(back, 5) == "ezs42")
+    // The reason a proximity search must look at nine cells.
+    let around = geohash.neighbours("ezs42")
+    say(f, "there are nine cells in a neighbourhood", around.len() == 9)
+    say(f, "including the one asked for", around.contains("ezs42"))
+    say(f, "and its neighbour to the north", around.contains("ezs48"))
+    say(f, "some of which share no prefix at all",
+        geohash.common_prefix("ezs42", "ezefr") == "ez")
+    say(f, "a prefix means containment", geohash.contains("ezs", "ezs42") and
+        not geohash.contains("ezt", "ezs42"))
+    say(f, "the length for a kilometre is six", geohash.length_for(1000.0) == 6)
+    say(f, "and for a hundred metres, seven", geohash.length_for(100.0) == 7)
+    say(f, "a hash with an excluded letter is invalid",
+        not geohash.is_valid("ezs42a") and not geohash.is_valid("ezs42i") and
+        geohash.is_valid("ezs42b"))
+    say(f, "and an empty one is too", not geohash.is_valid(""))
+    say(f, "a box can be covered by a bounded set of cells",
+        geohash.cover(haversine.box_around(london(), 2000.0), 6, 200).len() > 1)
+}
+
+fn check_polyline(inout f: i64) / {io} {
+    print("-- polyline: one's complement after a shift, not two's")
+    let route = [haversine.point(38.5, 0.0 - 120.2),
+        haversine.point(40.7, 0.0 - 120.95),
+        haversine.point(43.252, 0.0 - 126.453)]
+    // The example from Google's own documentation, and what the reference
+    // implementation produces.
+    say(f, "the reference route encodes to the published string",
+        polyline.encode(route) == "_p~iF~ps|U_ulLnnqC_mqNvxq`@")
+    let back = polyline.decode("_p~iF~ps|U_ulLnnqC_mqNvxq`@") ?? []
+    say(f, "and decodes back to three points", back.len() == 3)
+    say(f, "at the coordinates it started from",
+        near(back[0].latitude, 38.5, 0.00001) and
+        near(back[2].longitude, 0.0 - 126.453, 0.00001))
+    say(f, "precision 6 is a different string",
+        polyline.encode_with(route, 6) == "_izlhA~rlgdF_\{geC~ywl@_kwzCn`\{nI")
+    say(f, "and decodes with the same precision",
+        near((polyline.decode_with(polyline.encode_with(route, 6), 6) ??
+            [])[0].latitude, 38.5, 0.000001))
+    // Reading at the wrong precision is out by a factor of ten, which is the
+    // most common bug in code that consumes these.
+    say(f, "read at the wrong precision it is ten times out",
+        not near((polyline.decode_with(polyline.encode_with(route, 6), 5) ??
+            [])[0].latitude, 38.5, 1.0))
+    say(f, "the rounding error is stated rather than guessed",
+        near(polyline.precision_metres(5), 0.557, 0.001) and
+        near(polyline.precision_metres(6), 0.056, 0.001))
+    say(f, "an empty route is an empty string", polyline.encode([]) == "")
+    say(f, "a negative coordinate round-trips",
+        near((polyline.decode(polyline.encode([haversine.point(0.0 - 33.8688,
+            151.2093)])) ?? [])[0].latitude, 0.0 - 33.8688, 0.00001))
+    // Simplification: a GPS trace is mostly noise.
+    var noisy: [GeoPoint] = []
+    for i in 0..200 {
+        let t = i.as_f64() / 199.0
+        let wobble = if i % 2 == 0 { 0.000005 } else { 0.0 - 0.000005 }
+        noisy.push(haversine.point(51.5 + t * 0.01 + wobble,
+            0.0 - 0.12 + t * 0.02))
+    }
+    let thin = polyline.simplify(noisy, 5.0)
+    say(f, "a straight noisy line simplifies to its ends", thin.len() == 2)
+    say(f, "and keeps the first and last points",
+        thin[0].latitude == noisy[0].latitude and
+        thin[1].latitude == noisy[199].latitude)
+    say(f, "a tight tolerance keeps more",
+        polyline.simplify(noisy, 0.1).len() > thin.len())
+    say(f, "a two-point line simplifies to itself",
+        polyline.simplify([london(), paris()], 100.0).len() == 2)
+    say(f, "the encoding saves most of the JSON",
+        polyline.saving_percent(noisy) > 80)
+    let bounds = polyline.bounds(route)
+    say(f, "the bounds cover every point",
+        bounds.south == 38.5 and bounds.north == 43.252)
+}
+
+fn check_wkt(inout f: i64) / {io} {
+    print("-- wkt: X is longitude, and every ring must close")
+    // The one line that catches everyone.
+    let p = wkt.parse("POINT (30 10)") ?? wkt.point_from_lat_lon(0.0, 0.0)
+    match wkt.to_geo(p) {
+        Some(g) -> say(f, "POINT(30 10) is longitude 30, latitude 10",
+            g.longitude == 30.0 and g.latitude == 10.0)
+        None -> say(f, "POINT(30 10) is longitude 30, latitude 10", false)
+    }
+    say(f, "and it writes back the same way",
+        wkt.render(p) == "POINT(30 10)")
+    // Every one of these is read by shapely from what this writes.
+    for text in ["LINESTRING(30 10, 10 30, 40 40)",
+        "POLYGON((30 10, 40 40, 20 40, 10 20, 30 10))",
+        "MULTIPOINT(10 40, 40 30, 20 20, 30 10)",
+        "MULTILINESTRING((10 10, 20 20, 10 40), (40 40, 30 30, 40 20, 30 10))"] {
+        let g = wkt.parse(text) ?? wkt.point_from_lat_lon(0.0, 0.0)
+        say(f, "{wkt.kind_of(g)} round-trips", wkt.render(g) == text)
+    }
+    let holed = wkt.parse("POLYGON((35 10, 45 45, 15 40, 10 20, 35 10), " +
+        "(20 30, 35 35, 30 20, 20 30))") ?? wkt.point_from_lat_lon(0.0, 0.0)
+    say(f, "a polygon with a hole keeps both rings",
+        wkt.render(holed).contains("(20 30, 35 35, 30 20, 20 30)"))
+    let multi = wkt.parse("MULTIPOLYGON(((30 20, 45 40, 10 40, 30 20)), " +
+        "((15 5, 40 10, 10 20, 5 10, 15 5)))") ?? wkt.point_from_lat_lon(0.0, 0.0)
+    say(f, "a multipolygon round-trips", wkt.kind_of(multi) == "MULTIPOLYGON")
+    say(f, "both spellings of MULTIPOINT are read",
+        wkt.kind_of(wkt.parse("MULTIPOINT((10 40), (40 30))") ??
+            wkt.point_from_lat_lon(0.0, 0.0)) == "MULTIPOINT")
+    say(f, "an empty geometry is legal",
+        wkt.render(wkt.parse("POINT EMPTY") ?? wkt.point_from_lat_lon(0.0, 0.0)) ==
+        "POINT EMPTY")
+    // The refusals.
+    say(f, "an unclosed ring is refused",
+        geometry_refuses("POLYGON((30 10, 40 40, 20 40, 10 20))"))
+    say(f, "a line with one point is refused",
+        geometry_refuses("LINESTRING(30 10)"))
+    say(f, "and an unknown type", geometry_refuses("TRIANGLE(0 0, 1 0, 0 1)"))
+    say(f, "closing a ring adds the first point back",
+        wkt.is_closed(wkt.close_ring([haversine.point(0.0, 0.0),
+            haversine.point(0.0, 1.0), haversine.point(1.0, 1.0)])))
+    // Area and containment, with a hole excluded.
+    let square = wkt.parse("POLYGON((0 0, 0 1, 1 1, 1 0, 0 0), " +
+        "(0.2 0.2, 0.2 0.8, 0.8 0.8, 0.8 0.2, 0.2 0.2))") ??
+    wkt.point_from_lat_lon(0.0, 0.0)
+    say(f, "a hole is subtracted from the area",
+        wkt.area(square) < haversine.polygon_area([haversine.point(0.0, 0.0),
+            haversine.point(1.0, 0.0), haversine.point(1.0, 1.0),
+            haversine.point(0.0, 1.0)]))
+    say(f, "a point in the hole is not contained",
+        not wkt.contains(square, haversine.point(0.5, 0.5)))
+    say(f, "and one between the hole and the edge is",
+        wkt.contains(square, haversine.point(0.1, 0.1)))
+    let bounds = wkt.bounds(multi)
+    say(f, "the bounds cover every ring",
+        bounds.west == 5.0 and bounds.east == 45.0)
+}
+
+fn check_geojson(inout f: i64) / {io} {
+    print("-- geojson: the four things RFC 7946 had to fix")
+    let brace = (123).to_char()
+    let doc = brace + "\"type\": \"FeatureCollection\", \"features\": [" +
+    brace + "\"type\": \"Feature\", \"id\": \"a1\", \"geometry\": " +
+    brace + "\"type\": \"Point\", \"coordinates\": [30, 10]}, " +
+    "\"properties\": " + brace + "\"name\": \"a place\", \"rank\": 3}}, " +
+    brace + "\"type\": \"Feature\", \"geometry\": " + brace +
+    "\"type\": \"Polygon\", \"coordinates\": " +
+    "[[[0, 0], [1, 0], [1, 1], [0, 1], [0, 0]]]}, \"properties\": " +
+    brace + "}}]}"
+    let features = geojson.parse(doc) ?? []
+    say(f, "a collection reads as its features", features.len() == 2)
+    say(f, "with the geometry typed", wkt.kind_of(features[0].geometry) == "POINT")
+    say(f, "and the id kept", features[0].id == "a1")
+    say(f, "properties come out as text, whatever they were",
+        geojson.property(features[0], "name") == Some("a place") and
+        geojson.property(features[0], "rank") == Some("3"))
+    say(f, "an absent property is None",
+        geojson.property(features[0], "nope") == None)
+    // Longitude first, unlabelled, which is the trap.
+    match wkt.to_geo(features[0].geometry) {
+        Some(p) -> say(f, "coordinates are longitude then latitude",
+            p.longitude == 30.0 and p.latitude == 10.0)
+        None -> say(f, "coordinates are longitude then latitude", false)
+    }
+    say(f, "a geometry renders back to GeoJSON",
+        geojson.render_geometry(features[0].geometry).contains(
+            "\"coordinates\": [30, 10]"))
+    say(f, "and to WKT for a spatial query",
+        geojson.to_wkt(features)[0] == "POINT(30 10)")
+    say(f, "a whole collection renders",
+        geojson.render(features).starts_with(brace + "\"type\": \"FeatureCollection\""))
+    // A bare geometry and a lone Feature are both GeoJSON.
+    say(f, "a bare geometry is accepted",
+        (geojson.parse(brace + "\"type\": \"Point\", \"coordinates\": [1, 2]}") ??
+            []).len() == 1)
+    // The pre-standard member that changes what the numbers mean.
+    say(f, "a `crs` member is refused rather than ignored",
+        geojson_refuses(brace + "\"type\": \"Point\", \"crs\": " + brace +
+            "\"type\": \"name\"}, \"coordinates\": [1, 2]}"))
+    say(f, "and something that is not JSON at all",
+        geojson_refuses("not json"))
+    // The winding rule, and the crossing that must be split.
+    let ccw = [haversine.point(0.0, 0.0), haversine.point(0.0, 1.0),
+        haversine.point(1.0, 1.0), haversine.point(1.0, 0.0)]
+    say(f, "a ring's winding is measurable",
+        geojson.is_counter_clockwise(ccw) !=
+        geojson.is_counter_clockwise(geojson.reverse_ring(ccw)))
+    let fixed = geojson.with_right_hand_rule(WktPolygon([geojson.reverse_ring(ccw)]))
+    match fixed {
+        WktPolygon(rs) -> say(f, "and a polygon can be wound the way the standard wants",
+            geojson.is_counter_clockwise(rs[0]))
+        _ -> say(f, "and a polygon can be wound the way the standard wants", false)
+    }
+    say(f, "a line across the antimeridian is detected",
+        geojson.crosses_antimeridian(wkt.parse("LINESTRING(179 0, -179 0)") ??
+            wkt.point_from_lat_lon(0.0, 0.0)))
+    say(f, "and an ordinary one is not",
+        not geojson.crosses_antimeridian(wkt.parse("LINESTRING(0 0, 1 1)") ??
+            wkt.point_from_lat_lon(0.0, 0.0)))
+    // The bounding box, in the order GeoJSON writes it.
+    say(f, "the bbox is west, south, east, north",
+        geojson.bbox(features[1].geometry) == [0.0, 0.0, 1.0, 1.0])
+    say(f, "and a point query finds the feature covering it",
+        geojson.features_containing(features,
+            haversine.point(0.5, 0.5)).len() == 1)
+}
+
+fn main() / {io} {
+    var f = 0
+
+    check_haversine(f)
+    check_geohash(f)
+    check_polyline(f)
+    check_wkt(f)
+    check_geojson(f)
+
+    if f == 0 {
+        print("geography: every claim held")
+    } else {
+        print("geography: {f} failed")
+    }
+}

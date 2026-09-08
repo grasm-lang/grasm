@@ -1,0 +1,309 @@
+// Distance and bearing on a sphere, and where the sphere stops being enough.
+//
+// The haversine formula is the one everybody uses, and it is right for what
+// it claims: distance on a *sphere*. The Earth is not one — it is 21 km wider
+// at the equator than pole to pole — so haversine is out by up to 0.5%, which
+// is 5 metres in a kilometre and 50 km on a transatlantic flight. For a
+// delivery radius that is fine; for a flight plan it is not, so Vincenty's
+// method on the WGS-84 ellipsoid is here too, and the difference between them
+// is measurable in the demo rather than asserted in a comment.
+//
+// The other thing the naive version gets wrong is **the antimeridian**. A
+// bounding box from 179° to -179° is two degrees wide, not 358, and a
+// comparison that assumes the west edge is smaller than the east edge is
+// wrong for every box crossing the Pacific.
+//
+// Angles are degrees at the surface and radians inside, because degrees are
+// what data carries and radians are what trigonometry takes.
+
+type GeoPoint = {
+    /// Degrees, positive north.
+    latitude: f64,
+    /// Degrees, positive east.
+    longitude: f64,
+}
+
+type GeoBox = {
+    south: f64,
+    west: f64,
+    north: f64,
+    east: f64,
+}
+
+pub fn point(latitude: f64, longitude: f64) -> GeoPoint {
+    return GeoPoint{ latitude: latitude, longitude: longitude }
+}
+
+/// The mean radius the sphere formulas use, in metres.
+pub fn earth_radius() -> f64 {
+    return 6371008.8
+}
+
+/// WGS-84's equatorial radius and flattening, which the ellipsoid uses.
+pub fn wgs84_major() -> f64 {
+    return 6378137.0
+}
+
+pub fn wgs84_flattening() -> f64 {
+    return 1.0 / 298.257223563
+}
+
+fn to_radians(degrees: f64) -> f64 {
+    return degrees * pi() / 180.0
+}
+
+fn to_degrees(radians: f64) -> f64 {
+    return radians * 180.0 / pi()
+}
+
+/// Great-circle distance in metres, by the haversine formula.
+///
+/// Haversine rather than the spherical law of cosines: the law of cosines
+/// loses all its precision for short distances, because `cos` of a tiny angle
+/// is 1 to within the width of a double. Haversine is written in terms of
+/// half-angle sines and stays accurate down to a metre.
+pub fn distance(a: GeoPoint, b: GeoPoint) -> f64 {
+    let lat1 = to_radians(a.latitude)
+    let lat2 = to_radians(b.latitude)
+    let dlat = to_radians(b.latitude - a.latitude)
+    let dlon = to_radians(b.longitude - a.longitude)
+    let s1 = (dlat / 2.0).sin()
+    let s2 = (dlon / 2.0).sin()
+    let h = s1 * s1 + lat1.cos() * lat2.cos() * s2 * s2
+    return 2.0 * earth_radius() * h.sqrt().asin()
+}
+
+/// The same on the WGS-84 ellipsoid, by Vincenty's inverse method.
+///
+/// Accurate to about half a millimetre, and iterative — it does not converge
+/// for two points almost exactly opposite each other, which is a real
+/// limitation of the method and is reported rather than looped over forever.
+pub fn distance_ellipsoid(a: GeoPoint, b: GeoPoint) -> f64 {
+    let f = wgs84_flattening()
+    let major = wgs84_major()
+    let minor = major * (1.0 - f)
+    let u1 = ((1.0 - f) * to_radians(a.latitude).tan()).atan()
+    let u2 = ((1.0 - f) * to_radians(b.latitude).tan()).atan()
+    let l = to_radians(b.longitude - a.longitude)
+    let sin_u1 = u1.sin()
+    let cos_u1 = u1.cos()
+    let sin_u2 = u2.sin()
+    let cos_u2 = u2.cos()
+    var lambda = l
+    var sin_sigma = 0.0
+    var cos_sigma = 0.0
+    var sigma = 0.0
+    var cos_sq_alpha = 0.0
+    var cos2_sigma_m = 0.0
+    var i = 0
+    while i < 100 {
+        let sin_lambda = lambda.sin()
+        let cos_lambda = lambda.cos()
+        let first = cos_u2 * sin_lambda
+        let second = cos_u1 * sin_u2 - sin_u1 * cos_u2 * cos_lambda
+        sin_sigma = (first * first + second * second).sqrt()
+        if sin_sigma == 0.0 {
+            return 0.0
+        }
+        cos_sigma = sin_u1 * sin_u2 + cos_u1 * cos_u2 * cos_lambda
+        sigma = sin_sigma.atan2(cos_sigma)
+        let sin_alpha = cos_u1 * cos_u2 * sin_lambda / sin_sigma
+        cos_sq_alpha = 1.0 - sin_alpha * sin_alpha
+        cos2_sigma_m = if cos_sq_alpha == 0.0 {
+            0.0
+        } else {
+            cos_sigma - 2.0 * sin_u1 * sin_u2 / cos_sq_alpha
+        }
+        let c = f / 16.0 * cos_sq_alpha * (4.0 + f * (4.0 - 3.0 * cos_sq_alpha))
+        let previous = lambda
+        lambda = l + (1.0 - c) * f * sin_alpha *
+        (sigma + c * sin_sigma * (cos2_sigma_m + c * cos_sigma *
+            (0.0 - 1.0 + 2.0 * cos2_sigma_m * cos2_sigma_m)))
+        let moved = lambda - previous
+        if (if moved < 0.0 { 0.0 - moved } else { moved }) < 0.000000000001 {
+            break
+        }
+        i = i + 1
+    }
+    let u_sq = cos_sq_alpha * (major * major - minor * minor) / (minor * minor)
+    let a_coefficient = 1.0 + u_sq / 16384.0 *
+    (4096.0 + u_sq * (0.0 - 768.0 + u_sq * (320.0 - 175.0 * u_sq)))
+    let b_coefficient = u_sq / 1024.0 *
+    (256.0 + u_sq * (0.0 - 128.0 + u_sq * (74.0 - 47.0 * u_sq)))
+    let delta_sigma = b_coefficient * sin_sigma *
+    (cos2_sigma_m + b_coefficient / 4.0 *
+        (cos_sigma * (0.0 - 1.0 + 2.0 * cos2_sigma_m * cos2_sigma_m) -
+            b_coefficient / 6.0 * cos2_sigma_m *
+            (0.0 - 3.0 + 4.0 * sin_sigma * sin_sigma) *
+            (0.0 - 3.0 + 4.0 * cos2_sigma_m * cos2_sigma_m)))
+    return minor * a_coefficient * (sigma - delta_sigma)
+}
+
+/// The initial bearing from `a` to `b`, in degrees clockwise from north.
+///
+/// *Initial*: a great-circle path curves, so the bearing changes along the
+/// way. A course held at this bearing is a rhumb line and a different route.
+pub fn bearing(a: GeoPoint, b: GeoPoint) -> f64 {
+    let lat1 = to_radians(a.latitude)
+    let lat2 = to_radians(b.latitude)
+    let dlon = to_radians(b.longitude - a.longitude)
+    let y = dlon.sin() * lat2.cos()
+    let x = lat1.cos() * lat2.sin() - lat1.sin() * lat2.cos() * dlon.cos()
+    return (to_degrees(y.atan2(x)) + 360.0) % 360.0
+}
+
+/// The point `metres` away from `from` on the given bearing.
+pub fn destination(from: GeoPoint, bearing_degrees: f64,
+    metres: f64) -> GeoPoint {
+    let angular = metres / earth_radius()
+    let lat1 = to_radians(from.latitude)
+    let lon1 = to_radians(from.longitude)
+    let theta = to_radians(bearing_degrees)
+    let lat2 = (lat1.sin() * angular.cos() +
+        lat1.cos() * angular.sin() * theta.cos()).asin()
+    let lon2 = lon1 + (theta.sin() * angular.sin() * lat1.cos())
+        .atan2(angular.cos() - lat1.sin() * lat2.sin())
+    return GeoPoint{
+        latitude: to_degrees(lat2), longitude: normalise_longitude(to_degrees(lon2)),
+    }
+}
+
+/// A longitude folded back into -180..180.
+pub fn normalise_longitude(degrees: f64) -> f64 {
+    var out = degrees
+    while out > 180.0 {
+        out = out - 360.0
+    }
+    while out < 0.0 - 180.0 {
+        out = out + 360.0
+    }
+    return out
+}
+
+/// The midpoint of the great circle between two points.
+///
+/// Not the average of the coordinates: averaging 179 and -179 gives 0, which
+/// is the other side of the planet.
+pub fn midpoint(a: GeoPoint, b: GeoPoint) -> GeoPoint {
+    let lat1 = to_radians(a.latitude)
+    let lat2 = to_radians(b.latitude)
+    let lon1 = to_radians(a.longitude)
+    let dlon = to_radians(b.longitude - a.longitude)
+    let bx = lat2.cos() * dlon.cos()
+    let by = lat2.cos() * dlon.sin()
+    let lat3 = (lat1.sin() + lat2.sin()).atan2(
+        ((lat1.cos() + bx) * (lat1.cos() + bx) + by * by).sqrt())
+    let lon3 = lon1 + by.atan2(lat1.cos() + bx)
+    return GeoPoint{
+        latitude: to_degrees(lat3),
+        longitude: normalise_longitude(to_degrees(lon3)),
+    }
+}
+
+/// The total length of a path, in metres.
+pub fn path_length(points: [GeoPoint]) -> f64 {
+    var total = 0.0
+    for i in 1..points.len() {
+        total = total + distance(points[i - 1], points[i])
+    }
+    return total
+}
+
+/// A bounding box around a point, `metres` in each direction.
+///
+/// The longitude span widens with latitude, because a degree of longitude is
+/// 111 km at the equator and 500 metres near the pole. A box computed with a
+/// fixed degree offset is far too small in Norway and far too large at the
+/// equator.
+pub fn box_around(centre: GeoPoint, metres: f64) -> GeoBox {
+    let lat_delta = to_degrees(metres / earth_radius())
+    let cos_lat = to_radians(centre.latitude).cos()
+    let lon_delta = if cos_lat < 0.000001 {
+        180.0
+    } else {
+        to_degrees(metres / earth_radius() / cos_lat)
+    }
+    return GeoBox{
+        south: centre.latitude - lat_delta,
+        west: normalise_longitude(centre.longitude - lon_delta),
+        north: centre.latitude + lat_delta,
+        east: normalise_longitude(centre.longitude + lon_delta),
+    }
+}
+
+/// Whether the box crosses the antimeridian, which makes `west > east`.
+pub fn crosses_antimeridian(b: GeoBox) -> bool {
+    return b.west > b.east
+}
+
+/// Whether a point is inside a box, handling the crossing case.
+pub fn box_contains(b: GeoBox, p: GeoPoint) -> bool {
+    if p.latitude < b.south or p.latitude > b.north {
+        return false
+    }
+    if crosses_antimeridian(b) {
+        // The box wraps, so "inside" is the union of the two halves.
+        return p.longitude >= b.west or p.longitude <= b.east
+    }
+    return p.longitude >= b.west and p.longitude <= b.east
+}
+
+/// The box's width in degrees, which is not `east - west` when it wraps.
+pub fn box_width(b: GeoBox) -> f64 {
+    if crosses_antimeridian(b) {
+        return 360.0 - b.west + b.east
+    }
+    return b.east - b.west
+}
+
+/// Whether a point is inside a polygon, by the ray-casting rule.
+///
+/// The polygon is a list of points; the last is joined to the first. Points
+/// exactly on an edge are not guaranteed either way, which is a property of
+/// the method rather than an oversight — a boundary test needs a tolerance
+/// and a tolerance is the caller's to choose.
+pub fn polygon_contains(polygon: [GeoPoint], p: GeoPoint) -> bool {
+    var inside = false
+    let n = polygon.len()
+    if n < 3 {
+        return false
+    }
+    var j = n - 1
+    for i in 0..n {
+        let a = polygon[i]
+        let b = polygon[j]
+        if (a.latitude > p.latitude) != (b.latitude > p.latitude) {
+            let cut = (b.longitude - a.longitude) *
+            (p.latitude - a.latitude) / (b.latitude - a.latitude) +
+            a.longitude
+            if p.longitude < cut {
+                inside = not inside
+            }
+        }
+        j = i
+    }
+    return inside
+}
+
+/// The area of a polygon in square metres, by the spherical excess.
+pub fn polygon_area(polygon: [GeoPoint]) -> f64 {
+    let n = polygon.len()
+    if n < 3 {
+        return 0.0
+    }
+    var total = 0.0
+    for i in 0..n {
+        let a = polygon[i]
+        let b = polygon[(i + 1) % n]
+        total = total + to_radians(b.longitude - a.longitude) *
+        (2.0 + to_radians(a.latitude).sin() + to_radians(b.latitude).sin())
+    }
+    let area = total * earth_radius() * earth_radius() / 2.0
+    return if area < 0.0 { 0.0 - area } else { area }
+}
+
+/// Whether a coordinate pair is on the planet at all.
+pub fn is_valid(p: GeoPoint) -> bool {
+    return p.latitude >= 0.0 - 90.0 and p.latitude <= 90.0 and
+    p.longitude >= 0.0 - 180.0 and p.longitude <= 180.0
+}

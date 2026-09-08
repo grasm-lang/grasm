@@ -1,0 +1,24 @@
+[package]
+name = "geo_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.haversine]
+path = "../haversine"
+version = "^1.0.0"
+
+[dependencies.geohash]
+path = "../geohash"
+version = "^1.0.0"
+
+[dependencies.polyline]
+path = "../polyline"
+version = "^1.0.0"
+
+[dependencies.wkt]
+path = "../wkt"
+version = "^1.0.0"
+
+[dependencies.geojson]
+path = "../geojson"
+version = "^1.0.0"

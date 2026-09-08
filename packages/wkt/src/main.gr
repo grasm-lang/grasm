@@ -1,0 +1,394 @@
+// Well-Known Text: the geometry format every spatial database speaks.
+//
+// `POINT(30 10)`, `LINESTRING(30 10, 10 30)`, `POLYGON((35 10, 45 45, 15 40,
+// 35 10))`. PostGIS, SQLite's spatial extension, Oracle and every GIS tool
+// read and write it, which makes it the format a query goes out as.
+//
+// Two things about it catch everyone:
+//
+//   - **The order is X then Y**, which is *longitude then latitude*. That is
+//     the opposite of how a coordinate is spoken, written on a map and
+//     returned by every GPS API. A library that stores them the spoken way
+//     and writes them out unchanged produces geometry in the wrong hemisphere,
+//     and it looks plausible until somebody plots it.
+//   - **A polygon's rings must close.** The last point repeats the first, and
+//     a database will reject a ring that does not — the check is here rather
+//     than in the database, because a rejection three layers away is a
+//     rejection nobody can read.
+//
+// A polygon's first ring is its outline and the rest are holes, which is why
+// a polygon is a list of rings rather than a list of points.
+import haversine
+
+type Geometry =
+    | WktPoint(x: f64, y: f64)
+    | WktLine(points: [GeoPoint])
+    | WktPolygon(rings: [[GeoPoint]])
+    | WktMultiPoint(points: [GeoPoint])
+    | WktMultiLine(lines: [[GeoPoint]])
+    | WktMultiPolygon(polygons: [[[GeoPoint]]])
+    | WktEmpty(kind: str)
+
+type WktError =
+    | Malformed(text: str, why: str)
+    | UnknownType(name: str)
+    | UnclosedRing(ring: i64)
+    | NotEnoughPoints(want: i64, got: i64)
+
+    /// A point, taking longitude and latitude in the order they are *spoken*.
+    ///
+    /// Named for what it takes, because the whole trap in this format is the
+    /// other order.
+pub fn point_from_lat_lon(latitude: f64, longitude: f64) -> Geometry {
+    return WktPoint(longitude, latitude)
+}
+
+pub fn to_geo(g: Geometry) -> Option[GeoPoint] {
+    match g {
+        WktPoint(x, y) -> return Some(haversine.point(y, x))
+        _ -> return None
+    }
+}
+
+fn number(text: str) -> f64 ! WktError {
+    match text.trim().parse_float() {
+        Some(v) -> return v
+        None -> fail(Malformed(text, "not a number"))
+    }
+}
+
+/// `30 10` — one coordinate pair, X then Y.
+fn coordinate(text: str) -> GeoPoint ! WktError {
+    let parts = text.trim().words()
+    if parts.len() < 2 {
+        fail(Malformed(text, "a coordinate is two numbers"))
+    }
+    let x = try number(parts[0])
+    let y = try number(parts[1])
+    // Stored latitude-first, because that is what every other package here
+    // takes — the conversion happens once, at the edge.
+    return haversine.point(y, x)
+}
+
+fn coordinate_list(text: str) -> [GeoPoint] ! WktError {
+    var out: [GeoPoint] = []
+    for piece in text.split(",") {
+        if piece.trim() == "" {
+            continue
+        }
+        out.push(try coordinate(piece))
+    }
+    return out
+}
+
+/// The text between the outermost brackets.
+fn inner(text: str) -> str ! WktError {
+    // The offset is taken from the *trimmed* text, because that is what is
+    // sliced. Taking it from the untrimmed one shifts the slice by the
+    // leading space, which dropped the first digit of every group after a
+    // comma — `(40 40, ...)` came back as `(0 40, ...)`.
+    let body = text.trim()
+    let open = body.index_of("(") ?? 0 - 1
+    if open < 0 or not body.ends_with(")") {
+        fail(Malformed(text, "no bracketed body"))
+    }
+    return body.substr(open + 1, body.len() - open - 2)
+}
+
+/// Split on commas that are not inside brackets.
+fn split_groups(text: str) -> [str] {
+    var out: [str] = []
+    var depth = 0
+    var current = ""
+    for c in text.chars() {
+        if c == "(" {
+            depth = depth + 1
+        } else if c == ")" {
+            depth = depth - 1
+        }
+        if c == "," and depth == 0 {
+            out.push(current)
+            current = ""
+            continue
+        }
+        current = current + c
+    }
+    if current.trim() != "" {
+        out.push(current)
+    }
+    return out
+}
+
+pub fn parse(text: str) -> Geometry ! WktError {
+    let body = text.trim()
+    let upper = body.to_upper()
+    var kind = ""
+    for name in ["MULTIPOLYGON", "MULTILINESTRING", "MULTIPOINT", "POLYGON",
+        "LINESTRING", "POINT"] {
+        if upper.starts_with(name) {
+            kind = name
+            break
+        }
+    }
+    if kind == "" {
+        fail(UnknownType(body.words()[0]))
+    }
+    let rest = body.substr(kind.len(), body.len() - kind.len()).trim()
+    if rest.to_upper() == "EMPTY" {
+        return WktEmpty(kind)
+    }
+    if kind == "POINT" {
+        let p = try coordinate(try inner(rest))
+        return WktPoint(p.longitude, p.latitude)
+    }
+    if kind == "LINESTRING" {
+        let points = try coordinate_list(try inner(rest))
+        if points.len() < 2 {
+            fail(NotEnoughPoints(2, points.len()))
+        }
+        return WktLine(points)
+    }
+    if kind == "MULTIPOINT" {
+        // Both `MULTIPOINT(1 2, 3 4)` and `MULTIPOINT((1 2), (3 4))` are
+        // legal, and readers that accept only one refuse half the world's
+        // data.
+        let body_text = (try inner(rest)).replace("(", "").replace(")", "")
+        return WktMultiPoint(try coordinate_list(body_text))
+    }
+    if kind == "POLYGON" {
+        return WktPolygon(try parse_rings(try inner(rest)))
+    }
+    if kind == "MULTILINESTRING" {
+        var lines: [[GeoPoint]] = []
+        for group in split_groups(try inner(rest)) {
+            lines.push(try coordinate_list(try inner(group)))
+        }
+        return WktMultiLine(lines)
+    }
+    var polygons: [[[GeoPoint]]] = []
+    for group in split_groups(try inner(rest)) {
+        polygons.push(try parse_rings(try inner(group)))
+    }
+    return WktMultiPolygon(polygons)
+}
+
+fn parse_rings(text: str) -> [[GeoPoint]] ! WktError {
+    var out: [[GeoPoint]] = []
+    var index = 0
+    for group in split_groups(text) {
+        let ring = try coordinate_list(try inner(group))
+        if ring.len() < 4 {
+            fail(NotEnoughPoints(4, ring.len()))
+        }
+        if not is_closed(ring) {
+            fail(UnclosedRing(index))
+        }
+        out.push(ring)
+        index = index + 1
+    }
+    return out
+}
+
+/// Whether a ring's last point repeats its first, which every database
+/// requires and no hand-written ring has.
+pub fn is_closed(ring: [GeoPoint]) -> bool {
+    if ring.len() < 2 {
+        return false
+    }
+    let first = ring[0]
+    let last = ring[ring.len() - 1]
+    return first.latitude == last.latitude and first.longitude == last.longitude
+}
+
+/// The same ring with its first point repeated at the end, if needed.
+pub fn close_ring(ring: [GeoPoint]) -> [GeoPoint] {
+    if ring.len() < 2 or is_closed(ring) {
+        return ring
+    }
+    var out = ring
+    out.push(ring[0])
+    return out
+}
+
+fn write_number(v: f64) -> str {
+    // Trailing zeros dropped, because `30` and `30.0` are the same coordinate
+    // and the shorter form is what every writer produces.
+    let text = "{v}"
+    if text.ends_with(".0") {
+        return text.substr(0, text.len() - 2)
+    }
+    return text
+}
+
+fn write_coordinate(p: GeoPoint) -> str {
+    // X then Y: longitude first. This one line is the whole trap.
+    return write_number(p.longitude) + " " + write_number(p.latitude)
+}
+
+fn write_list(points: [GeoPoint]) -> str {
+    var parts: [str] = []
+    for p in points {
+        parts.push(write_coordinate(p))
+    }
+    return parts.join(", ")
+}
+
+fn write_rings(rings: [[GeoPoint]]) -> str {
+    var parts: [str] = []
+    for r in rings {
+        parts.push("(" + write_list(r) + ")")
+    }
+    return parts.join(", ")
+}
+
+pub fn render(g: Geometry) -> str {
+    match g {
+        WktEmpty(kind) -> return kind + " EMPTY"
+        WktPoint(x, y) -> return "POINT(" + write_number(x) + " " +
+        write_number(y) + ")"
+        WktLine(points) -> return "LINESTRING(" + write_list(points) + ")"
+        WktPolygon(rings) -> return "POLYGON(" + write_rings(rings) + ")"
+        WktMultiPoint(points) -> return "MULTIPOINT(" + write_list(points) + ")"
+        WktMultiLine(lines) -> {
+            var parts: [str] = []
+            for l in lines {
+                parts.push("(" + write_list(l) + ")")
+            }
+            return "MULTILINESTRING(" + parts.join(", ") + ")"
+        }
+        WktMultiPolygon(polygons) -> {
+            var parts: [str] = []
+            for p in polygons {
+                parts.push("(" + write_rings(p) + ")")
+            }
+            return "MULTIPOLYGON(" + parts.join(", ") + ")"
+        }
+    }
+}
+
+pub fn kind_of(g: Geometry) -> str {
+    match g {
+        WktPoint(_x, _y) -> return "POINT"
+        WktLine(_p) -> return "LINESTRING"
+        WktPolygon(_r) -> return "POLYGON"
+        WktMultiPoint(_p) -> return "MULTIPOINT"
+        WktMultiLine(_l) -> return "MULTILINESTRING"
+        WktMultiPolygon(_p) -> return "MULTIPOLYGON"
+        WktEmpty(kind) -> return kind
+    }
+}
+
+/// Every point in a geometry, whatever its shape.
+pub fn all_points(g: Geometry) -> [GeoPoint] {
+    match g {
+        WktPoint(x, y) -> return [haversine.point(y, x)]
+        WktLine(points) -> return points
+        WktMultiPoint(points) -> return points
+        WktPolygon(rings) -> {
+            var out: [GeoPoint] = []
+            for r in rings {
+                for p in r {
+                    out.push(p)
+                }
+            }
+            return out
+        }
+        WktMultiLine(lines) -> {
+            var out: [GeoPoint] = []
+            for l in lines {
+                for p in l {
+                    out.push(p)
+                }
+            }
+            return out
+        }
+        WktMultiPolygon(polygons) -> {
+            var out: [GeoPoint] = []
+            for poly in polygons {
+                for r in poly {
+                    for p in r {
+                        out.push(p)
+                    }
+                }
+            }
+            return out
+        }
+        WktEmpty(_k) -> return []
+    }
+}
+
+pub fn bounds(g: Geometry) -> GeoBox {
+    let points = all_points(g)
+    if points.len() == 0 {
+        return GeoBox{ south: 0.0, west: 0.0, north: 0.0, east: 0.0 }
+    }
+    var south = points[0].latitude
+    var north = points[0].latitude
+    var west = points[0].longitude
+    var east = points[0].longitude
+    for p in points {
+        if p.latitude < south {
+            south = p.latitude
+        }
+        if p.latitude > north {
+            north = p.latitude
+        }
+        if p.longitude < west {
+            west = p.longitude
+        }
+        if p.longitude > east {
+            east = p.longitude
+        }
+    }
+    return GeoBox{ south: south, west: west, north: north, east: east }
+}
+
+/// A polygon's outline area minus its holes, in square metres.
+pub fn area(g: Geometry) -> f64 {
+    match g {
+        WktPolygon(rings) -> {
+            if rings.len() == 0 {
+                return 0.0
+            }
+            var total = haversine.polygon_area(rings[0])
+            for i in 1..rings.len() {
+                total = total - haversine.polygon_area(rings[i])
+            }
+            return total
+        }
+        WktMultiPolygon(polygons) -> {
+            var total = 0.0
+            for poly in polygons {
+                total = total + area(WktPolygon(poly))
+            }
+            return total
+        }
+        _ -> return 0.0
+    }
+}
+
+/// Whether a point is inside a polygon, holes excluded.
+pub fn contains(g: Geometry, p: GeoPoint) -> bool {
+    match g {
+        WktPolygon(rings) -> {
+            if rings.len() == 0 or not haversine.polygon_contains(rings[0], p) {
+                return false
+            }
+            for i in 1..rings.len() {
+                if haversine.polygon_contains(rings[i], p) {
+                    return false
+                }
+            }
+            return true
+        }
+        WktMultiPolygon(polygons) -> {
+            for poly in polygons {
+                if contains(WktPolygon(poly), p) {
+                    return true
+                }
+            }
+            return false
+        }
+        _ -> return false
+    }
+}

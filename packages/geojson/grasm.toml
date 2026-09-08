@@ -1,0 +1,18 @@
+[package]
+name = "geojson"
+version = "1.0.0"
+
+# Text and arithmetic. Opens nothing.
+capabilities = []
+
+[dependencies.json]
+path = "../json"
+version = "^1.0.0"
+
+[dependencies.haversine]
+path = "../haversine"
+version = "^1.0.0"
+
+[dependencies.wkt]
+path = "../wkt"
+version = "^1.0.0"

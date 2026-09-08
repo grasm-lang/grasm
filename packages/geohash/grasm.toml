@@ -1,0 +1,10 @@
+[package]
+name = "geohash"
+version = "1.0.0"
+
+# Bit arithmetic over coordinates. Opens nothing.
+capabilities = []
+
+[dependencies.haversine]
+path = "../haversine"
+version = "^1.0.0"

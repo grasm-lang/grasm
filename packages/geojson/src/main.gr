@@ -1,0 +1,373 @@
+// GeoJSON, RFC 7946, and the four rules it added to fix what came before.
+//
+// GeoJSON existed for years as a convention before it was standardised, and
+// the standard exists because the convention left four things ambiguous:
+//
+//   1. **The coordinate system is WGS-84, always.** Earlier GeoJSON had a
+//      `crs` member naming any projection; RFC 7946 removed it. A file with
+//      one is pre-standard, and reading its coordinates as longitude and
+//      latitude puts them wherever the projection happened to be.
+//   2. **Longitude first**, like WKT and unlike how a coordinate is spoken.
+//      The same trap, in a format where the numbers are unlabelled.
+//   3. **A polygon's exterior ring winds counter-clockwise** and its holes
+//      clockwise. Getting it backwards is accepted by most readers and drawn
+//      inside-out by some, which is the worst kind of disagreement.
+//   4. **Geometry crossing the antimeridian must be split** into two pieces.
+//      A line from 179° to -179° is drawn the long way round the planet by
+//      every renderer that takes it literally.
+//
+// The bounding box, when present, is `[west, south, east, north]` — and for a
+// box crossing the antimeridian the west value is *greater* than the east,
+// which the standard says explicitly because everybody got it wrong.
+import json
+import haversine
+import wkt
+
+type GeoJsonError =
+    | NotJson(why: str)
+    | NotGeoJson(why: str)
+    | UnknownType(name: str)
+    | BadCoordinates(why: str)
+    | HasCrs
+
+    /// A feature: a geometry with properties and an optional id.
+type GeoFeature = {
+    geometry: Geometry,
+    /// Property names and their values as text, which is what a map label,
+    /// a filter and a style all need.
+    key: [str],
+    value: [str],
+    id: str,
+}
+
+fn number_of(v: ref Json) -> f64 {
+    return json.as_num(v) ?? 0.0
+}
+
+fn positions(v: ref Json) -> [GeoPoint] ! GeoJsonError {
+    var out: [GeoPoint] = []
+    for item in json.items_of(v) {
+        let pair = json.items_of(item)
+        if pair.len() < 2 {
+            fail(BadCoordinates("a position is at least two numbers"))
+        }
+        // Longitude first. This one line is the trap.
+        out.push(haversine.point(number_of(pair[1]), number_of(pair[0])))
+    }
+    return out
+}
+
+fn rings(v: ref Json) -> [[GeoPoint]] ! GeoJsonError {
+    var out: [[GeoPoint]] = []
+    for item in json.items_of(v) {
+        out.push(try positions(item))
+    }
+    return out
+}
+
+/// Parse a geometry object.
+pub fn parse_geometry(v: ref Json) -> Geometry ! GeoJsonError {
+    match json.get(v, "crs") {
+        Some(_c) -> fail(HasCrs)
+        None -> {}
+    }
+    let kind = json.as_str(json.get(v, "type") ?? json.null()) ?? ""
+    if kind == "" {
+        fail(NotGeoJson("no type"))
+    }
+    let coordinates = json.get(v, "coordinates") ?? json.null()
+    if kind == "Point" {
+        let pair = json.items_of(coordinates)
+        if pair.len() < 2 {
+            fail(BadCoordinates("a Point needs two numbers"))
+        }
+        return WktPoint(number_of(pair[0]), number_of(pair[1]))
+    }
+    if kind == "LineString" {
+        return WktLine(try positions(coordinates))
+    }
+    if kind == "MultiPoint" {
+        return WktMultiPoint(try positions(coordinates))
+    }
+    if kind == "Polygon" {
+        return WktPolygon(try rings(coordinates))
+    }
+    if kind == "MultiLineString" {
+        return WktMultiLine(try rings(coordinates))
+    }
+    if kind == "MultiPolygon" {
+        var out: [[[GeoPoint]]] = []
+        for item in json.items_of(coordinates) {
+            out.push(try rings(item))
+        }
+        return WktMultiPolygon(out)
+    }
+    fail(UnknownType(kind))
+}
+
+/// Parse a Feature, a FeatureCollection or a bare geometry.
+///
+/// All three, because every one of them turns up in files called GeoJSON and
+/// a reader that takes only a FeatureCollection refuses half of them.
+pub fn parse(text: str) -> [GeoFeature] ! GeoJsonError {
+    match json.parse(text) {
+        Ok(root) -> {
+            let kind = json.as_str(json.get(root, "type") ?? json.null()) ?? ""
+            if kind == "FeatureCollection" {
+                var out: [GeoFeature] = []
+                for f in json.items_of(json.get(root, "features") ?? json.null()) {
+                    out.push(try parse_feature(f))
+                }
+                return out
+            }
+            if kind == "Feature" {
+                return [try parse_feature(root)]
+            }
+            return [GeoFeature{
+                geometry: try parse_geometry(root), key: [], value: [], id: "",
+            }]
+        }
+        Err(_e) -> fail(NotJson("the text is not JSON"))
+    }
+}
+
+fn parse_feature(v: ref Json) -> GeoFeature ! GeoJsonError {
+    let geometry = json.get(v, "geometry") ?? json.null()
+    if json.is_null(geometry) {
+        // A Feature with a null geometry is legal and means "this thing has
+        // properties and no location" — dropping it loses a row.
+        return GeoFeature{
+            geometry: WktEmpty("POINT"), key: [], value: [],
+            id: identifier(v),
+        }
+    }
+    let properties = json.get(v, "properties") ?? json.null()
+    var keys: [str] = []
+    var values: [str] = []
+    for k in json.keys_of(properties) {
+        keys.push(k)
+        let raw = json.get(properties, k) ?? json.null()
+        values.push(text_of(raw))
+    }
+    return GeoFeature{
+        geometry: try parse_geometry(geometry), key: keys, value: values,
+        id: identifier(v),
+    }
+}
+
+fn identifier(v: ref Json) -> str {
+    match json.get(v, "id") {
+        Some(id) -> return text_of(id)
+        None -> return ""
+    }
+}
+
+fn text_of(v: ref Json) -> str {
+    match json.as_str(v) {
+        Some(s) -> return s
+        None -> {}
+    }
+    match json.as_bool(v) {
+        Some(b) -> return "{b}"
+        None -> {}
+    }
+    match json.as_num(v) {
+        Some(n) -> {
+            if n == n.as_i64().as_f64() {
+                return "{n.as_i64()}"
+            }
+            return "{n}"
+        }
+        None -> {}
+    }
+    if json.is_null(v) {
+        return ""
+    }
+    return json.render(v)
+}
+
+fn write_position(p: GeoPoint) -> str {
+    return "[{trim(p.longitude)}, {trim(p.latitude)}]"
+}
+
+fn trim(v: f64) -> str {
+    let text = "{v}"
+    if text.ends_with(".0") {
+        return text.substr(0, text.len() - 2)
+    }
+    return text
+}
+
+fn write_positions(points: [GeoPoint]) -> str {
+    var parts: [str] = []
+    for p in points {
+        parts.push(write_position(p))
+    }
+    return "[" + parts.join(", ") + "]"
+}
+
+fn write_rings(rs: [[GeoPoint]]) -> str {
+    var parts: [str] = []
+    for r in rs {
+        parts.push(write_positions(r))
+    }
+    return "[" + parts.join(", ") + "]"
+}
+
+fn head(kind: str) -> str {
+    let brace = (123).to_char()
+    return brace + "\"type\": \"" + kind + "\", \"coordinates\": "
+}
+
+pub fn render_geometry(g: Geometry) -> str {
+    match g {
+        WktPoint(x, y) -> {
+            return head("Point") + "[" + trim(x) + ", " + trim(y) + "]}"
+        }
+        WktLine(points) -> {
+            return head("LineString") + write_positions(points) + "}"
+        }
+        WktMultiPoint(points) -> {
+            return head("MultiPoint") + write_positions(points) + "}"
+        }
+        WktPolygon(rs) -> {
+            return head("Polygon") + write_rings(rs) + "}"
+        }
+        WktMultiLine(ls) -> {
+            return head("MultiLineString") + write_rings(ls) + "}"
+        }
+        WktMultiPolygon(ps) -> {
+            var parts: [str] = []
+            for p in ps {
+                parts.push(write_rings(p))
+            }
+            return head("MultiPolygon") + "[" + parts.join(", ") + "]}"
+        }
+        WktEmpty(_k) -> return "null"
+    }
+}
+
+pub fn render_feature(f: GeoFeature) -> str {
+    var props: [str] = []
+    for i in 0..f.key.len() {
+        props.push("\"" + json.escape(f.key[i]) + "\": \"" +
+            json.escape(f.value[i]) + "\"")
+    }
+    let brace = (123).to_char()
+    var out = brace + "\"type\": \"Feature\""
+    if f.id != "" {
+        out = out + ", \"id\": \"" + json.escape(f.id) + "\""
+    }
+    out = out + ", \"geometry\": " + render_geometry(f.geometry) +
+    ", \"properties\": " + brace + props.join(", ") + "}}"
+    return out
+}
+
+pub fn render(features: [GeoFeature]) -> str {
+    var parts: [str] = []
+    for f in features {
+        parts.push(render_feature(f))
+    }
+    let brace = (123).to_char()
+    return brace + "\"type\": \"FeatureCollection\", \"features\": [" +
+    parts.join(", ") + "]}"
+}
+
+pub fn feature(g: Geometry, keys: [str], values: [str], id: str) -> GeoFeature {
+    return GeoFeature{ geometry: g, key: keys, value: values, id: id }
+}
+
+pub fn property(f: GeoFeature, name: str) -> Option[str] {
+    for i in 0..f.key.len() {
+        if f.key[i] == name {
+            return Some(f.value[i])
+        }
+    }
+    return None
+}
+
+/// The winding of a ring: positive is counter-clockwise.
+///
+/// The shoelace sum. RFC 7946 wants exteriors counter-clockwise and holes
+/// clockwise, and most readers accept either — which is why a file with the
+/// wrong winding renders correctly almost everywhere and inside-out
+/// somewhere.
+pub fn ring_winding(ring: [GeoPoint]) -> f64 {
+    var total = 0.0
+    let n = ring.len()
+    for i in 0..n {
+        let a = ring[i]
+        let b = ring[(i + 1) % n]
+        total = total + (b.longitude - a.longitude) * (b.latitude + a.latitude)
+    }
+    // Negative shoelace means counter-clockwise in this orientation.
+    return 0.0 - total
+}
+
+pub fn is_counter_clockwise(ring: [GeoPoint]) -> bool {
+    return ring_winding(ring) > 0.0
+}
+
+/// The same ring wound the other way.
+pub fn reverse_ring(ring: [GeoPoint]) -> [GeoPoint] {
+    return ring.rev()
+}
+
+/// A polygon with the winding RFC 7946 asks for.
+pub fn with_right_hand_rule(g: Geometry) -> Geometry {
+    match g {
+        WktPolygon(rs) -> {
+            var out: [[GeoPoint]] = []
+            for i in 0..rs.len() {
+                let want_ccw = i == 0
+                if is_counter_clockwise(rs[i]) == want_ccw {
+                    out.push(rs[i])
+                } else {
+                    out.push(reverse_ring(rs[i]))
+                }
+            }
+            return WktPolygon(out)
+        }
+        _ -> return g
+    }
+}
+
+/// The bounding box as GeoJSON writes it: west, south, east, north.
+pub fn bbox(g: Geometry) -> [f64] {
+    let b = wkt.bounds(g)
+    return [b.west, b.south, b.east, b.north]
+}
+
+/// Whether a geometry crosses the antimeridian, which RFC 7946 says must be
+/// split rather than left for a renderer to guess at.
+pub fn crosses_antimeridian(g: Geometry) -> bool {
+    let points = wkt.all_points(g)
+    for i in 1..points.len() {
+        let delta = points[i].longitude - points[i - 1].longitude
+        let magnitude = if delta < 0.0 { 0.0 - delta } else { delta }
+        if magnitude > 180.0 {
+            return true
+        }
+    }
+    return false
+}
+
+/// Every feature whose geometry contains a point.
+pub fn features_containing(features: [GeoFeature], p: GeoPoint) -> [GeoFeature] {
+    var out: [GeoFeature] = []
+    for f in features {
+        if wkt.contains(f.geometry, p) {
+            out.push(f)
+        }
+    }
+    return out
+}
+
+/// The same collection as WKT, for a query going to a spatial database.
+pub fn to_wkt(features: [GeoFeature]) -> [str] {
+    var out: [str] = []
+    for f in features {
+        out.push(wkt.render(f.geometry))
+    }
+    return out
+}

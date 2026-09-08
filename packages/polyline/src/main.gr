@@ -1,0 +1,262 @@
+// Encoded polylines: a route as a short ASCII string.
+//
+// A route with 5,000 points is 100 KB of JSON and 15 KB as a polyline, and
+// the difference is why every mapping API returns one. Three ideas do the
+// work:
+//
+//   1. **Deltas.** Each point is stored as the difference from the last, so
+//      the numbers are small — a step along a road is thousandths of a
+//      degree.
+//   2. **Fixed point.** Coordinates are rounded to five decimal places (about
+//      1.1 m) and stored as integers. That rounding is lossy and is the
+//      format, not a shortcut: a decoded route is not the route that was
+//      encoded, to within a metre.
+//   3. **Variable-length base 64.** Each number is chunked into five-bit
+//      groups, each with a continuation bit, and 63 is added so every byte is
+//      printable ASCII.
+//
+// The trap is the sign: negative values are stored in *one's complement after
+// a left shift*, which is not two's complement and not sign-magnitude. An
+// encoder that uses either produces a line that decodes to somewhere else,
+// usually in the ocean.
+//
+// Precision 6 exists too — Valhalla and some OSRM deployments use it — and a
+// line decoded at the wrong precision is out by a factor of ten, which is the
+// single most common bug in code that consumes these.
+import haversine
+
+type PolylineError =
+    | Truncated(at: i64)
+    | BadCharacter(at: i64)
+
+pub fn default_precision() -> i64 {
+    return 5
+}
+
+fn scale_for(precision: i64) -> f64 {
+    var out = 1.0
+    for _i in 0..precision {
+        out = out * 10.0
+    }
+    return out
+}
+
+/// Round half away from zero, which is what the reference implementation
+/// does — and not what truncation does for a negative coordinate.
+fn rounded(v: f64) -> i64 {
+    if v < 0.0 {
+        return (v - 0.5).as_i64()
+    }
+    return (v + 0.5).as_i64()
+}
+
+fn encode_number(value: i64) -> str {
+    // Left shift by one, then invert every bit if it was negative. Not two's
+    // complement: the sign lives in the low bit after the shift.
+    var v = value.shl(1)
+    if value < 0 {
+        v = v.bit_not()
+    }
+    var out = ""
+    while v >= 32 {
+        out = out + (v.bit_and(31).bit_or(32) + 63).to_char()
+        v = v.ushr(5)
+    }
+    return out + (v + 63).to_char()
+}
+
+pub fn encode_with(points: [GeoPoint], precision: i64) -> str {
+    let scale = scale_for(precision)
+    var out = ""
+    var last_lat = 0
+    var last_lon = 0
+    for p in points {
+        let lat = rounded(p.latitude * scale)
+        let lon = rounded(p.longitude * scale)
+        out = out + encode_number(lat - last_lat) + encode_number(lon - last_lon)
+        last_lat = lat
+        last_lon = lon
+    }
+    return out
+}
+
+pub fn encode(points: [GeoPoint]) -> str {
+    return encode_with(points, default_precision())
+}
+
+pub fn decode_with(text: str, precision: i64) -> [GeoPoint] ! PolylineError {
+    let scale = scale_for(precision)
+    let cs = text.chars()
+    var out: [GeoPoint] = []
+    var at = 0
+    var lat = 0
+    var lon = 0
+    while at < cs.len() {
+        let first = try decode_number(cs, at)
+        lat = lat + first.0
+        at = first.1
+        if at >= cs.len() {
+            fail(Truncated(at))
+        }
+        let second = try decode_number(cs, at)
+        lon = lon + second.0
+        at = second.1
+        out.push(GeoPoint{
+            latitude: lat.as_f64() / scale, longitude: lon.as_f64() / scale,
+        })
+    }
+    return out
+}
+
+fn decode_number(cs: [str], from: i64) -> (i64, i64) ! PolylineError {
+    var shift = 0
+    var value = 0
+    var at = from
+    while at < cs.len() {
+        let code = cs[at].code_at(0) - 63
+        if code < 0 or code > 63 {
+            fail(BadCharacter(at))
+        }
+        value = value.bit_or(code.bit_and(31).shl(shift))
+        at = at + 1
+        if code < 32 {
+            let signed = if value.bit_and(1) != 0 {
+                value.ushr(1).bit_not()
+            } else {
+                value.ushr(1)
+            }
+            return (signed, at)
+        }
+        shift = shift + 5
+        if shift > 60 {
+            fail(BadCharacter(at))
+        }
+    }
+    fail(Truncated(at))
+}
+
+pub fn decode(text: str) -> [GeoPoint] ! PolylineError {
+    return try decode_with(text, default_precision())
+}
+
+/// How far a decoded point may be from what was encoded, in metres.
+///
+/// Half the last place: about 0.56 m at precision 5 and 5.6 cm at 6. Stated
+/// because a caller comparing a round trip needs a tolerance and guessing one
+/// is how a test becomes flaky.
+pub fn precision_metres(precision: i64) -> f64 {
+    return 111320.0 / scale_for(precision) / 2.0
+}
+
+/// Douglas-Peucker simplification, with the tolerance in metres.
+///
+/// A route straight from a GPS has a point a second and most of them say
+/// nothing. Dropping the ones within `tolerance` of the line between their
+/// neighbours typically removes 90% of a road route and changes its shape by
+/// less than the GPS error that produced it.
+pub fn simplify(points: [GeoPoint], tolerance_metres: f64) -> [GeoPoint] {
+    if points.len() < 3 {
+        return points
+    }
+    var keep: [bool] = []
+    for _p in points {
+        keep.push(false)
+    }
+    keep[0] = true
+    keep[points.len() - 1] = true
+    mark(points, keep, 0, points.len() - 1, tolerance_metres, 0)
+    var out: [GeoPoint] = []
+    for i in 0..points.len() {
+        if keep[i] {
+            out.push(points[i])
+        }
+    }
+    return out
+}
+
+fn mark(points: [GeoPoint], inout keep: [bool], from: i64, to: i64,
+    tolerance: f64, depth: i64) {
+    if to <= from + 1 or depth > 64 {
+        return
+    }
+    var worst = 0.0
+    var worst_at = from
+    for i in (from + 1)..to {
+        let d = perpendicular_distance(points[i], points[from], points[to])
+        if d > worst {
+            worst = d
+            worst_at = i
+        }
+    }
+    if worst <= tolerance {
+        return
+    }
+    keep[worst_at] = true
+    mark(points, keep, from, worst_at, tolerance, depth + 1)
+    mark(points, keep, worst_at, to, tolerance, depth + 1)
+}
+
+/// The distance from a point to the segment between two others, in metres.
+///
+/// Computed on a local flat approximation — over a segment of a route the
+/// curvature is far below the tolerance anyone simplifies at, and doing it
+/// on the sphere costs three trigonometric calls per point for no visible
+/// difference.
+pub fn perpendicular_distance(p: GeoPoint, a: GeoPoint, b: GeoPoint) -> f64 {
+    let scale = (a.latitude * pi() / 180.0).cos()
+    let px = (p.longitude - a.longitude) * scale
+    let py = p.latitude - a.latitude
+    let bx = (b.longitude - a.longitude) * scale
+    let by = b.latitude - a.latitude
+    let length = bx * bx + by * by
+    var t = 0.0
+    if length > 0.0 {
+        t = (px * bx + py * by) / length
+    }
+    if t < 0.0 {
+        t = 0.0
+    }
+    if t > 1.0 {
+        t = 1.0
+    }
+    let dx = px - bx * t
+    let dy = py - by * t
+    return (dx * dx + dy * dy).sqrt() * pi() / 180.0 * haversine.earth_radius()
+}
+
+/// The bounding box of a line.
+pub fn bounds(points: [GeoPoint]) -> GeoBox {
+    if points.len() == 0 {
+        return GeoBox{ south: 0.0, west: 0.0, north: 0.0, east: 0.0 }
+    }
+    var south = points[0].latitude
+    var north = points[0].latitude
+    var west = points[0].longitude
+    var east = points[0].longitude
+    for p in points {
+        if p.latitude < south {
+            south = p.latitude
+        }
+        if p.latitude > north {
+            north = p.latitude
+        }
+        if p.longitude < west {
+            west = p.longitude
+        }
+        if p.longitude > east {
+            east = p.longitude
+        }
+    }
+    return GeoBox{ south: south, west: west, north: north, east: east }
+}
+
+/// How much shorter the encoding is than the obvious JSON, in percent.
+pub fn saving_percent(points: [GeoPoint]) -> i64 {
+    if points.len() == 0 {
+        return 0
+    }
+    // A conservative JSON estimate: `[12.34567,-76.54321],` per point.
+    let json = points.len() * 22
+    let encoded = encode(points).len()
+    return (json - encoded) * 100 / json
+}

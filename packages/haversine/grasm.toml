@@ -1,0 +1,6 @@
+[package]
+name = "haversine"
+version = "1.0.0"
+
+# Distances on a sphere. Opens nothing.
+capabilities = []
