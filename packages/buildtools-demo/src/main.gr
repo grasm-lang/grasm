@@ -1,0 +1,440 @@
+import spdx
+import codeowners
+import patchfile
+import changelog
+import coveragefmt
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+// ------------------------------------------------------------------ spdx
+
+fn normalised(text: str) -> str {
+    let n: str ! SpdxError = spdx.normalise(text)
+    return n ?? "ERROR"
+}
+
+fn check_spdx(inout f: i64) / {io} {
+    print("-- spdx: OR is a choice and AND is an obligation")
+    // Every normalised form here is Python's `license-expression`'s.
+    say(f, "casing and redundant brackets go",
+        normalised("mit") == "MIT" and normalised("((MIT))") == "MIT" and
+        normalised("MIT AND (Apache-2.0)") == "MIT AND Apache-2.0")
+    say(f, "AND binds tighter than OR, and the brackets say so afterwards",
+        normalised("MIT AND Apache-2.0 OR BSD-3-Clause") ==
+        "(MIT AND Apache-2.0) OR BSD-3-Clause")
+    say(f, "and brackets that were needed stay",
+        normalised("MIT OR (Apache-2.0 AND BSD-3-Clause)") ==
+        "MIT OR (Apache-2.0 AND BSD-3-Clause)")
+    say(f, "an exception attaches to one license, not to the expression",
+        normalised("apache-2.0 with llvm-exception") ==
+        "Apache-2.0 WITH LLVM-exception")
+    say(f, "the withdrawn spellings resolve to what they now mean",
+        normalised("GPL-2.0") == "GPL-2.0-only" and
+        normalised("GPL-2.0+") == "GPL-2.0-or-later" and
+        normalised("LGPL-2.1") == "LGPL-2.1-only")
+    say(f, "and are reported as withdrawn rather than silently rewritten",
+        spdx.is_deprecated("GPL-2.0") and not spdx.is_deprecated("MIT"))
+    say(f, "a plausible identifier that is not on the register is refused",
+        not spdx.is_valid("Apache2") and not spdx.is_valid("MIT-License") and
+        spdx.is_valid("Apache-2.0"))
+    say(f, "so is a license used where an exception belongs",
+        not spdx.is_valid("MIT WITH MIT") and
+        spdx.is_valid("MIT WITH Classpath-exception-2.0"))
+    say(f, "a choice is satisfied by either side, an obligation by neither",
+        satisfied("Apache-2.0 OR MIT", ["MIT"]) and
+        not satisfied("Apache-2.0 AND MIT", ["MIT"]) and
+        satisfied("Apache-2.0 AND MIT", ["MIT", "Apache-2.0"]))
+    say(f, "and the refusal names the license rather than saying no",
+        disallowed_in("MIT AND GPL-3.0-only", ["MIT"]) == "GPL-3.0-only")
+    let sizes = spdx.register_size()
+    say(f, "the register holds licenses and exceptions in separate lists",
+        sizes.0 == 667 and sizes.1 == 86)
+}
+
+fn satisfied(expression: str, allowed: [str]) -> bool {
+    let r: bool ! SpdxError = spdx.satisfied_by(expression, allowed)
+    return r ?? false
+}
+
+fn disallowed_in(expression: str, allowed: [str]) -> str {
+    let r: [str] ! SpdxError = spdx.disallowed(expression, allowed)
+    let list = r ?? []
+    if list.len() == 0 {
+        return ""
+    }
+    return list[0]
+}
+
+// ------------------------------------------------------------ codeowners
+
+fn owners_file() -> str {
+    return "# comment\n" +
+    "*       @global-owner1 @global-owner2\n" +
+    "*.js    @js-owner\n" +
+    "*.go    docs@example.com\n" +
+    "/build/logs/ @doctocat\n" +
+    "docs/*  docs@example.com\n" +
+    "apps/   @octocat\n" +
+    "/docs/  @doctocat\n" +
+    "**/logs @octocat\n" +
+    "/scripts/ @doctocat @octocat\n"
+}
+
+fn check_codeowners(inout f: i64) / {io} {
+    print("-- codeowners: the last matching line wins")
+    let file = codeowners.parse(owners_file())
+    // Every answer here is Python's `codeowners` library's, on the rules
+    // GitHub's own documentation gives.
+    say(f, "a pattern with no slash matches at any depth",
+        owner(file, "a.js") == "@js-owner" and
+        owner(file, "src/a.js") == "@js-owner")
+    say(f, "a later rule beats an earlier and more specific one",
+        owner(file, "build/logs/x.txt") == "@octocat" and
+        owner(file, "docs/getting-started.md") == "@doctocat")
+    say(f, "a directory pattern owns its whole subtree",
+        owner(file, "apps/a/b.txt") == "@octocat" and
+        owner(file, "docs/x/y.md") == "@doctocat")
+    say(f, "a leading double star matches at the root as well as below it",
+        owner(file, "logs/x") == "@octocat" and
+        owner(file, "a/logs/y") == "@octocat")
+    say(f, "several owners on one line all apply",
+        codeowners.owners_of(file, "scripts/run.sh").len() == 2)
+    say(f, "and a file nothing else matches falls to the catch-all",
+        owner(file, "README.md") == "@global-owner1")
+    say(f, "the rule that decided can be named, with its line",
+        rule_line(file, "build/logs/x.txt") == 9)
+    let paths = ["README.md", "a.js", "apps/x"]
+    say(f, "a rule for a directory that no longer exists is found",
+        codeowners.unmatched_rules(file, paths).len() == 6)
+    say(f, "and so is one that matches but never wins",
+        shadowed_names(file, ["docs/a.md"]).contains("docs/*"))
+    say(f, "an owner without an at sign is one the host will ignore",
+        codeowners.is_valid_owner("@user") and
+        codeowners.is_valid_owner("@org/team") and
+        codeowners.is_valid_owner("a@b.com") and
+        not codeowners.is_valid_owner("user"))
+    say(f, "a file with nothing matching it has no reviewer",
+        codeowners.unowned(codeowners.parse("*.js @a\n"),
+            ["a.js", "b.py"]).len() == 1)
+}
+
+fn owner(file: CodeownersFile, path: str) -> str {
+    let list = codeowners.owners_of(file, path)
+    if list.len() == 0 {
+        return ""
+    }
+    return list[0]
+}
+
+fn rule_line(file: CodeownersFile, path: str) -> i64 {
+    match codeowners.rule_for(file, path) {
+        Some(rule) -> {
+            return rule.line
+        }
+        None -> {
+            return 0 - 1
+        }
+    }
+}
+
+fn shadowed_names(file: CodeownersFile, paths: [str]) -> [str] {
+    var out: [str] = []
+    for rule in codeowners.shadowed_rules(file, paths) {
+        out.push(rule.pattern)
+    }
+    return out
+}
+
+// ------------------------------------------------------------- patchfile
+
+fn source_text() -> str {
+    return "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\n"
+}
+
+fn target_text() -> str {
+    return "one\nTWO\nthree\nfour\nsix\nseven\nextra\neight\n"
+}
+
+fn diff_text() -> str {
+    return "--- a.txt\n+++ b.txt\n@@ -1,8 +1,8 @@\n one\n-two\n+TWO\n" +
+    " three\n four\n-five\n six\n seven\n+extra\n eight\n"
+}
+
+fn check_patchfile(inout f: i64) / {io} {
+    print("-- patchfile: applied where it says, or not at all")
+    let files = patchfile.parse(diff_text()) ?? []
+    // `unidiff` reads the same header and the same counts.
+    say(f, "the header and the hunk range are read",
+        files.len() == 1 and files[0].old_path == "a.txt" and
+        files[0].new_path == "b.txt" and files[0].hunks.len() == 1 and
+        files[0].hunks[0].old_start == 1 and
+        files[0].hunks[0].old_count == 8)
+    let counts = patchfile.stats(files[0])
+    say(f, "two lines added and two removed", counts.0 == 2 and counts.1 == 2)
+    say(f, "applying it gives the file `diff` was given",
+        applied(files[0], source_text()) == target_text())
+    say(f, "and applying the reverse gives the original back",
+        applied(patchfile.reverse(files[0]), target_text()) == source_text())
+    say(f, "a hunk whose context does not match is refused, not fuzzed",
+        refuses(files[0], "one\nWRONG\nthree\nfour\nfive\nsix\nseven\neight\n"))
+    // `@@ -5 +5,2 @@` means one old line, not none.
+    let terse_text = "--- a\n+++ b\n@@ -2 +2,2 @@\n-b\n+B\n+C\n"
+    let terse = patchfile.parse(terse_text) ?? []
+    say(f, "an omitted count means one line rather than zero",
+        terse.len() == 1 and terse[0].hunks[0].old_count == 1 and
+        terse[0].hunks[0].new_count == 2)
+    say(f, "the changed lines are the ones a reviewer wants to look at",
+        patchfile.changed_lines(files[0]).len() == 2 and
+        patchfile.changed_lines(files[0])[0] == 2)
+    say(f, "and rendering it back gives the same patch",
+        patchfile.render(files) == diff_text())
+    say(f, "two patches touching the same lines are known to conflict",
+        patchfile.conflicts_with(files[0], files[0]) and
+        not patchfile.conflicts_with(files[0], other_file()))
+    say(f, "a patch that adds a file says so", first_is_new())
+}
+
+fn applied(file: PatchedFile, source: str) -> str {
+    let r: str ! PatchError = patchfile.apply(file, source)
+    return r ?? "ERROR"
+}
+
+fn refuses(file: PatchedFile, source: str) -> bool {
+    match patchfile.apply(file, source) {
+        Ok(_s) -> {
+            return false
+        }
+        Err(_e) -> {
+            return true
+        }
+    }
+}
+
+fn other_file() -> PatchedFile {
+    let files = patchfile.parse("--- a.txt\n+++ a.txt\n@@ -40,1 +40,1 @@\n" +
+        "-x\n+y\n") ?? []
+    return files[0]
+}
+
+fn first_is_new() -> bool {
+    let text = "--- /dev/null\n+++ b\n@@ -0,0 +1 @@\n+x\n"
+    let files = patchfile.parse(text) ?? []
+    return files.len() == 1 and files[0].is_new
+}
+
+// ------------------------------------------------------------- changelog
+
+fn changelog_text() -> str {
+    return "# Changelog\n\nSome prose about the file.\n\n" +
+    "## [Unreleased]\n\n### Added\n\n- a new thing\n\n" +
+    "## [1.2.0] - 2026-03-01\n\n### Added\n\n- one\n- two\n\n" +
+    "### Fixed\n\n- a bug\n\n## [1.1.0] \u{2014} 2026-01-15 [YANKED]\n\n" +
+    "### Security\n\n- a hole\n"
+}
+
+fn check_changelog(inout f: i64) / {io} {
+    print("-- changelog: six sections, and the bump a commit decides")
+    let releases = changelog.parse(changelog_text())
+    say(f, "the prose above the first release is not a release",
+        releases.len() == 3 and releases[0].version == "Unreleased")
+    say(f, "a version, its date and its withdrawal are all read",
+        releases[1].version == "1.2.0" and releases[1].date == "2026-03-01" and
+        releases[2].yanked)
+    say(f, "an em dash separates a date as often as a hyphen does",
+        releases[2].date == "2026-01-15")
+    say(f, "entries keep their section",
+        changelog.entries_in(releases[1], "Added").len() == 2 and
+        changelog.entries_in(releases[1], "Fixed").len() == 1)
+    say(f, "a section outside the six is reported rather than accepted",
+        changelog.nonstandard_sections(changelog.parse(
+            "## [1.0.0]\n\n### Bug fixes\n\n- x\n")).len() == 1)
+    let rendered = changelog.render_release(releases[1])
+    let added_at = rendered.index_of("### Added") ?? (0 - 1)
+    let fixed_at = rendered.index_of("### Fixed") ?? (0 - 1)
+    say(f, "and rendering puts the sections back in the specified order",
+        added_at >= 0 and fixed_at > added_at)
+    say(f, "a conventional subject splits into type, scope and description",
+        conventional_is("fix(parser): stop crashing", "fix", "parser",
+            false) and
+        conventional_is("feat(api)!: rename everything", "feat", "api",
+            true))
+    say(f, "a subject that is not conventional is not a broken one",
+        is_none("not a conventional commit") and is_none("WIP"))
+    say(f, "the type decides the section",
+        changelog.section_for("feat") == "Added" and
+        changelog.section_for("fix") == "Fixed" and
+        changelog.section_for("perf") == "Changed")
+    say(f, "a trailer in the body is as breaking as an exclamation mark",
+        changelog.is_breaking("fix: c\n\nBREAKING CHANGE: it moved") and
+        not changelog.is_breaking("fix: c"))
+    say(f, "the bump follows the commits",
+        changelog.bump_kind(["fix: a"]) == "patch" and
+        changelog.bump_kind(["fix: a", "feat: b"]) == "minor" and
+        changelog.bump_kind(["feat!: c"]) == "major")
+    say(f, "and the version follows the bump",
+        next_of("1.2.3", ["feat: b"]) == "1.3.0" and
+        next_of("1.2.3", ["feat!: c"]) == "2.0.0" and
+        next_of("1.2.3", ["fix: a"]) == "1.2.4")
+    say(f, "before 1.0.0 a breaking change usually moves the minor instead",
+        zerover_of("0.4.1", ["feat!: c"]) == "0.5.0" and
+        next_of("0.4.1", ["feat!: c"]) == "1.0.0")
+    let built = changelog.release_from_commits("1.3.0", "2026-04-01",
+        ["feat(api): add a thing", "chore: bump deps", "fix: a bug",
+            "not conventional"])
+    say(f, "a release built from commits drops the noise and keeps the rest",
+        built.changes.len() == 3 and
+        changelog.entries_in(built, "Added")[0] ==
+        "**api**: add a thing")
+}
+
+fn conventional_is(subject: str, kind: str, scope: str,
+    breaking: bool) -> bool {
+    match changelog.conventional(subject) {
+        Some(c) -> {
+            return c.kind == kind and c.scope == scope and
+            c.breaking == breaking
+        }
+        None -> {
+            return false
+        }
+    }
+}
+
+fn is_none(subject: str) -> bool {
+    match changelog.conventional(subject) {
+        Some(_c) -> {
+            return false
+        }
+        None -> {
+            return true
+        }
+    }
+}
+
+fn next_of(current: str, commits: [str]) -> str {
+    let r: str ! ChangelogError = changelog.next_version(current, commits)
+    return r ?? "ERROR"
+}
+
+fn zerover_of(current: str, commits: [str]) -> str {
+    let r: str ! ChangelogError =
+    changelog.next_version_zerover(current, commits)
+    return r ?? "ERROR"
+}
+
+// ----------------------------------------------------------- coveragefmt
+
+fn lcov_text() -> str {
+    return "SF:sample.py\nDA:1,1\nDA:2,1\nDA:4,1\nDA:5,1\nDA:7,1\nDA:8,0\n" +
+    "DA:9,0\nDA:10,0\nDA:12,1\nDA:13,1\nLF:10\nLH:7\nFN:1,2,add\n" +
+    "FNDA:1,add\nFN:4,5,sub\nFNDA:1,sub\nFN:7,10,unused\n" +
+    "FNDA:0,unused\nFNF:3\nFNH:2\nBRDA:8,0,jump to line 9,-\n" +
+    "BRDA:8,0,jump to line 10,-\nBRF:2\nBRH:0\nend_of_record\n"
+}
+
+fn cobertura_text() -> str {
+    return "<?xml version=\"1.0\" ?>\n<coverage lines-valid=\"10\" " +
+    "lines-covered=\"7\" line-rate=\"0.7\">\n<sources><source>.</source>" +
+    "</sources>\n<packages><package name=\".\" line-rate=\"0.7\">" +
+    "<classes>\n<class name=\"sample.py\" filename=\"sample.py\" " +
+    "line-rate=\"0.7\">\n<methods/>\n<lines>\n" +
+    "<line number=\"1\" hits=\"1\"/>\n<line number=\"2\" hits=\"1\"/>\n" +
+    "<line number=\"4\" hits=\"1\"/>\n<line number=\"5\" hits=\"1\"/>\n" +
+    "<line number=\"7\" hits=\"1\"/>\n<line number=\"8\" hits=\"0\" " +
+    "branch=\"true\" condition-coverage=\"0% (0/2)\"/>\n" +
+    "<line number=\"9\" hits=\"0\"/>\n<line number=\"10\" hits=\"0\"/>\n" +
+    "<line number=\"12\" hits=\"1\"/>\n<line number=\"13\" hits=\"1\"/>\n" +
+    "</lines>\n</class>\n</classes></package></packages>\n</coverage>\n"
+}
+
+fn check_coveragefmt(inout f: i64) / {io} {
+    print("-- coveragefmt: the number that moves is the changed-line one")
+    let lcov_parsed: CoverageReport ! CoverageError =
+    coveragefmt.parse_lcov(lcov_text())
+    let lcov = lcov_parsed ?? coveragefmt.empty_report()
+    // `coverage.py` wrote both of these from one run and reports 0.7.
+    say(f, "the LCOV file gives ten lines, seven covered",
+        coveragefmt.total_lines(lcov) == 10 and
+        coveragefmt.covered_lines(lcov) == 7 and
+        coveragefmt.line_rate(lcov) == 0.7)
+    say(f, "with the function and branch counts alongside",
+        lcov.files[0].functions_hit == 2 and
+        lcov.files[0].functions_found == 3 and
+        lcov.files[0].branches_found == 2 and
+        lcov.files[0].branches_hit == 0)
+    let xml_parsed: CoverageReport ! CoverageError =
+    coveragefmt.parse_cobertura(cobertura_text())
+    let xml_report = xml_parsed ?? coveragefmt.empty_report()
+    say(f, "and the Cobertura file from the same run agrees line for line",
+        coveragefmt.total_lines(xml_report) == 10 and
+        coveragefmt.covered_lines(xml_report) == 7)
+    say(f, "the branch numbers hide in a condition string in that format",
+        xml_report.files[0].branches_found == 2 and
+        xml_report.files[0].branches_hit == 0)
+    say(f, "an uncovered line is named, not counted",
+        coveragefmt.uncovered_lines(lcov.files[0]).len() == 3 and
+        coveragefmt.uncovered_lines(lcov.files[0])[0] == 8)
+    let go_text = "mode: set\nmain.go:10.20,14.2 3 1\n" +
+    "main.go:16.2,18.5 2 0\n"
+    let go_parsed: CoverageReport ! CoverageError =
+    coveragefmt.parse_go_profile(go_text)
+    let go = go_parsed ?? coveragefmt.empty_report()
+    say(f, "a Go profile's blocks become the lines they span",
+        go.files.len() == 1 and coveragefmt.total_lines(go) == 8 and
+        coveragefmt.covered_lines(go) == 5)
+    let again: CoverageReport ! CoverageError =
+    coveragefmt.parse_lcov(coveragefmt.render_lcov(lcov))
+    say(f, "LCOV round-trips through this package unchanged",
+        coveragefmt.total_lines(again ?? coveragefmt.empty_report()) == 10)
+    let other_text = "SF:sample.py\nDA:8,4\nDA:14,1\nend_of_record\n"
+    let other_parsed: CoverageReport ! CoverageError =
+    coveragefmt.parse_lcov(other_text)
+    let other = other_parsed ?? coveragefmt.empty_report()
+    let merged = coveragefmt.merge(lcov, other)
+    say(f, "two runs merge by adding hits, not by taking the larger",
+        coveragefmt.total_lines(merged) == 11 and
+        coveragefmt.covered_lines(merged) == 9)
+
+    // The two packages meeting: which of a patch's lines were tested.
+    let patch = patchfile.parse("--- sample.py\n+++ sample.py\n" +
+        "@@ -7,4 +7,4 @@\n-def unused(a):\n+def used(a):\n     if a > 0:\n" +
+        "         return 1\n     return 2\n") ?? []
+    var changed = map()
+    changed.set("sample.py", patchfile.changed_lines(patch[0]))
+    say(f, "and a patch's own lines can be scored against the report",
+        coveragefmt.changed_line_rate(lcov, changed) == 1.0)
+    var all_changed = map()
+    all_changed.set("sample.py", [8, 9, 12])
+    say(f, "a change into untested code scores badly however high the total",
+        coveragefmt.changed_line_rate(lcov, all_changed) < 0.4 and
+        coveragefmt.changed_and_uncovered(lcov, all_changed).len() == 2)
+    say(f, "a line the report knows nothing about is not counted either way",
+        coveragefmt.changed_line_rate(lcov, empty_change()) == 1.0)
+}
+
+fn empty_change() -> Map[str, [i64]] {
+    var out = map()
+    out.set("nowhere.py", [1, 2, 3])
+    return out
+}
+
+fn main() / {io} {
+    var f = 0
+    check_spdx(f)
+    check_codeowners(f)
+    check_patchfile(f)
+    check_changelog(f)
+    check_coveragefmt(f)
+    if f == 0 {
+        print("build tooling: every claim held")
+    } else {
+        print("build tooling: {f} claims failed")
+    }
+}

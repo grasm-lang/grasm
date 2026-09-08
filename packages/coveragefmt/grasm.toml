@@ -1,0 +1,10 @@
+[package]
+name = "coveragefmt"
+version = "1.0.0"
+
+# Reads and writes report text. Opens nothing.
+capabilities = []
+
+[dependencies.xml]
+path = "../xml"
+version = "^1.0.0"

@@ -1,0 +1,462 @@
+// Unified diffs: reading them, applying them, and turning them round.
+//
+// The format `diff -u`, `git diff` and every code review tool speak. Three
+// levels: a file header saying what changed, hunks saying where, and lines
+// prefixed `+`, `-` or a space.
+//
+// ## The three details that break naive parsers
+//
+// **A count of 1 is written by leaving it out.** `@@ -5 +5,2 @@` means one
+// old line at 5 and two new lines at 5. A parser that splits on `,` and takes
+// the second field reads a one-line hunk as a zero-line one, and then applies
+// it in the wrong place.
+//
+// **A context line that is empty may have no space.** The format says every
+// context line begins with a space, so a blank context line should be a line
+// containing exactly one space. Editors strip trailing whitespace, and every
+// patch that has been through an email client has bare empty lines in it
+// instead. Treating one as the end of the hunk truncates the patch; treating
+// it as a blank context line is what `patch` does and what this does.
+//
+// **`\ No newline at end of file` is a line of the patch that is not a line
+// of the file.** It applies to whichever side it follows, and a patch that
+// adds a trailing newline is *only* distinguishable from one that does not by
+// where that marker sits.
+//
+// ## Applying: strictly, and only at the stated offset
+//
+// `patch` searches nearby lines and applies with an offset, and with "fuzz"
+// will ignore context that does not match. That is right for a human at a
+// terminal and wrong for a program: a hunk applied three lines from where it
+// was meant to go produces a file that compiles and is wrong. `apply` checks
+// the context exactly and refuses otherwise, and the refusal names the line.
+//
+// Checked against `unidiff` for the parse of every hunk and header, and
+// against `patch` itself for the result of applying them.
+
+type PatchHunk = {
+    old_start: i64,
+    old_count: i64,
+    new_start: i64,
+    new_count: i64,
+    /// The text after the second `@@`, which git fills with the enclosing
+    /// function.
+    heading: str,
+    /// Every line of the hunk, prefix included.
+    lines: [str],
+}
+
+type PatchedFile = {
+    old_path: str,
+    new_path: str,
+    hunks: [PatchHunk],
+    is_new: bool,
+    is_deleted: bool,
+    is_binary: bool,
+}
+
+type PatchError =
+    | BadHunkHeader(text: str)
+    | ContextMismatch(line: i64, expected: str, found: str)
+    | HunkPastEndOfFile(line: i64)
+    | NoHunks()
+
+fn strip_prefix(path: str) -> str {
+    // git writes `a/src/x` and `b/src/x`; the letters are not directories.
+    if path.starts_with("a/") or path.starts_with("b/") {
+        return path.substr(2, path.len() - 2)
+    }
+    return path
+}
+
+fn header_path(line: str) -> str {
+    let rest = line.substr(4, line.len() - 4)
+    let tab = rest.index_of("\t") ?? (0 - 1)
+    if tab >= 0 {
+        return strip_prefix(rest.substr(0, tab))
+    }
+    return strip_prefix(rest.trim())
+}
+
+/// The two numbers of one side of a hunk header.
+fn range_of(text: str) -> (i64, i64) ! PatchError {
+    let body = text.substr(1, text.len() - 1)
+    let comma = body.index_of(",") ?? (0 - 1)
+    if comma < 0 {
+        // No comma means one line, not zero.
+        let start = body.parse_int() ?? (0 - 1)
+        if start < 0 {
+            fail(BadHunkHeader(text))
+        }
+        return (start, 1)
+    }
+    let start = body.substr(0, comma).parse_int() ?? (0 - 1)
+    let count = body.substr(comma + 1, body.len() - comma - 1)
+        .parse_int() ?? (0 - 1)
+    if start < 0 or count < 0 {
+        fail(BadHunkHeader(text))
+    }
+    return (start, count)
+}
+
+/// Every file a patch touches, in the order the patch lists them.
+pub fn parse(text: str) -> [PatchedFile] ! PatchError {
+    var out: [PatchedFile] = []
+    let lines = text.split("\n")
+    var i = 0
+    while i < lines.len() {
+        let line = lines[i]
+        if line.starts_with("--- ") and i + 1 < lines.len() and
+        lines[i + 1].starts_with("+++ ") {
+            var file = PatchedFile{
+                old_path: header_path(line),
+                new_path: header_path(lines[i + 1]),
+                hunks: [],
+                is_new: header_path(line) == "/dev/null",
+                is_deleted: header_path(lines[i + 1]) == "/dev/null",
+                is_binary: false,
+            }
+            i = i + 2
+            i = try read_hunks(lines, i, file)
+            out.push(file)
+            continue
+        }
+        if line.starts_with("Binary files ") or
+        line.starts_with("GIT binary patch") {
+            out.push(PatchedFile{ old_path: "", new_path: "", hunks: [],
+                is_new: false, is_deleted: false, is_binary: true })
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn read_hunks(lines: [str], from: i64,
+    inout file: PatchedFile) -> i64 ! PatchError {
+    var i = from
+    while i < lines.len() {
+        let line = lines[i]
+        if not line.starts_with("@@") {
+            return i
+        }
+        let close = line.substr(2, line.len() - 2).index_of("@@") ?? (0 - 1)
+        if close < 0 {
+            fail(BadHunkHeader(line))
+        }
+        let inside = line.substr(2, close).trim()
+        let parts = inside.split(" ")
+        if parts.len() < 2 {
+            fail(BadHunkHeader(line))
+        }
+        let old_range = try range_of(parts[0])
+        let new_range = try range_of(parts[1])
+        var hunk = PatchHunk{
+            old_start: old_range.0,
+            old_count: old_range.1,
+            new_start: new_range.0,
+            new_count: new_range.1,
+            heading: line.substr(close + 4, line.len() - close - 4).trim(),
+            lines: [],
+        }
+        i = i + 1
+        var old_left = hunk.old_count
+        var new_left = hunk.new_count
+        while i < lines.len() and (old_left > 0 or new_left > 0) {
+            let l = lines[i]
+            if l.starts_with("\\") {
+                // The no-newline marker belongs to the hunk and counts as no
+                // line on either side.
+                hunk.lines.push(l)
+                i = i + 1
+                continue
+            }
+            if l == "" {
+                // An empty line is a blank context line whose space was
+                // stripped in transit.
+                hunk.lines.push(" ")
+                old_left = old_left - 1
+                new_left = new_left - 1
+                i = i + 1
+                continue
+            }
+            let mark = l.substr(0, 1)
+            if mark == "+" {
+                new_left = new_left - 1
+            } else {
+                if mark == "-" {
+                    old_left = old_left - 1
+                } else {
+                    if mark == " " {
+                        old_left = old_left - 1
+                        new_left = new_left - 1
+                    } else {
+                        return i
+                    }
+                }
+            }
+            hunk.lines.push(l)
+            i = i + 1
+        }
+        // The no-newline marker sits after the last counted line, so the
+        // loop above has already finished when it arrives.
+        while i < lines.len() and lines[i].starts_with("\\") {
+            hunk.lines.push(lines[i])
+            i = i + 1
+        }
+        file.hunks.push(hunk)
+    }
+    return i
+}
+
+// -------------------------------------------------------------- applying
+
+fn body_of(line: str) -> str {
+    if line.len() == 0 {
+        return ""
+    }
+    return line.substr(1, line.len() - 1)
+}
+
+/// The patched text, or a refusal naming the line that did not match.
+pub fn apply(file: PatchedFile, source: str) -> str ! PatchError {
+    if file.hunks.len() == 0 {
+        fail(NoHunks())
+    }
+    var source_lines = source.split("\n")
+    // A trailing newline makes a final empty element that is not a line.
+    var had_trailing_newline = false
+    if source_lines.len() > 0 and
+    source_lines[source_lines.len() - 1] == "" {
+        had_trailing_newline = true
+        let _last = source_lines.pop()
+    }
+    var out: [str] = []
+    var at = 0
+    for hunk in file.hunks {
+        let start = hunk.old_start - 1
+        while at < start and at < source_lines.len() {
+            out.push(source_lines[at])
+            at = at + 1
+        }
+        if start > source_lines.len() {
+            fail(HunkPastEndOfFile(hunk.old_start))
+        }
+        for line in hunk.lines {
+            if line.starts_with("\\") {
+                continue
+            }
+            let mark = line.substr(0, 1)
+            let body = body_of(line)
+            if mark == "+" {
+                out.push(body)
+                continue
+            }
+            if at >= source_lines.len() {
+                fail(HunkPastEndOfFile(at + 1))
+            }
+            if source_lines[at] != body {
+                fail(ContextMismatch(at + 1, body, source_lines[at]))
+            }
+            if mark == " " {
+                out.push(body)
+            }
+            at = at + 1
+        }
+    }
+    while at < source_lines.len() {
+        out.push(source_lines[at])
+        at = at + 1
+    }
+    var text = out.join("\n")
+    if ends_with_newline(file, had_trailing_newline) {
+        text = text + "\n"
+    }
+    return text
+}
+
+/// Whether the patched file ends with a newline.
+///
+/// The `\ No newline at end of file` marker applies to the line above it, and
+/// which side that line belongs to is the whole answer: after a `+` or a
+/// context line it says the *new* file has no final newline; after a `-` it
+/// says the old one did not, which means the patch is adding one. With no
+/// marker at all the source decides, because the patch is not touching it.
+fn ends_with_newline(file: PatchedFile, source_had: bool) -> bool {
+    if file.hunks.len() == 0 {
+        return source_had
+    }
+    let last = file.hunks[file.hunks.len() - 1]
+    var last_new = 0 - 1
+    var last_old = 0 - 1
+    var i = 0
+    while i < last.lines.len() {
+        let line = last.lines[i]
+        if line.starts_with("+") or line.starts_with(" ") {
+            last_new = i
+        }
+        if line.starts_with("-") or line.starts_with(" ") {
+            last_old = i
+        }
+        i = i + 1
+    }
+    if marker_follows(last.lines, last_new) {
+        return false
+    }
+    if marker_follows(last.lines, last_old) {
+        return true
+    }
+    return source_had
+}
+
+fn marker_follows(lines: [str], at: i64) -> bool {
+    if at < 0 or at + 1 >= lines.len() {
+        return false
+    }
+    return lines[at + 1].starts_with("\\")
+}
+
+/// The patch turned round: applying this undoes the original.
+pub fn reverse(file: PatchedFile) -> PatchedFile {
+    var out = file
+    out.old_path = file.new_path
+    out.new_path = file.old_path
+    out.is_new = file.is_deleted
+    out.is_deleted = file.is_new
+    var hunks: [PatchHunk] = []
+    for hunk in file.hunks {
+        var flipped = hunk
+        flipped.old_start = hunk.new_start
+        flipped.old_count = hunk.new_count
+        flipped.new_start = hunk.old_start
+        flipped.new_count = hunk.old_count
+        var lines: [str] = []
+        for line in hunk.lines {
+            if line.starts_with("+") {
+                lines.push("-" + body_of(line))
+            } else {
+                if line.starts_with("-") {
+                    lines.push("+" + body_of(line))
+                } else {
+                    lines.push(line)
+                }
+            }
+        }
+        flipped.lines = lines
+        hunks.push(flipped)
+    }
+    out.hunks = hunks
+    return out
+}
+
+// ------------------------------------------------------------- rendering
+
+fn range_text(start: i64, count: i64) -> str {
+    if count == 1 {
+        return "{start}"
+    }
+    return "{start},{count}"
+}
+
+pub fn render(files: [PatchedFile]) -> str {
+    var out = ""
+    for file in files {
+        out = out + "--- " + file.old_path + "\n"
+        out = out + "+++ " + file.new_path + "\n"
+        for hunk in file.hunks {
+            out = out + "@@ -" + range_text(hunk.old_start, hunk.old_count) +
+            " +" + range_text(hunk.new_start, hunk.new_count) + " @@"
+            if hunk.heading != "" {
+                out = out + " " + hunk.heading
+            }
+            out = out + "\n"
+            for line in hunk.lines {
+                out = out + line + "\n"
+            }
+        }
+    }
+    return out
+}
+
+// -------------------------------------------------------------- reading
+
+/// Lines added and lines removed.
+pub fn stats(file: PatchedFile) -> (i64, i64) {
+    var added = 0
+    var removed = 0
+    for hunk in file.hunks {
+        for line in hunk.lines {
+            if line.starts_with("+") {
+                added = added + 1
+            }
+            if line.starts_with("-") {
+                removed = removed + 1
+            }
+        }
+    }
+    return (added, removed)
+}
+
+pub fn total_stats(files: [PatchedFile]) -> (i64, i64) {
+    var added = 0
+    var removed = 0
+    for file in files {
+        let one = stats(file)
+        added = added + one.0
+        removed = removed + one.1
+    }
+    return (added, removed)
+}
+
+/// The paths a patch changes, after the change.
+pub fn touched_paths(files: [PatchedFile]) -> [str] {
+    var out: [str] = []
+    for file in files {
+        if file.is_deleted {
+            out.push(file.old_path)
+        } else {
+            out.push(file.new_path)
+        }
+    }
+    return out
+}
+
+/// The line numbers a hunk touches in the *new* file.
+///
+/// What a review tool needs to place a comment, and what a coverage tool
+/// needs to say whether the changed lines are tested.
+pub fn changed_lines(file: PatchedFile) -> [i64] {
+    var out: [i64] = []
+    for hunk in file.hunks {
+        var at = hunk.new_start
+        for line in hunk.lines {
+            if line.starts_with("\\") {
+                continue
+            }
+            if line.starts_with("+") {
+                out.push(at)
+            }
+            if line.starts_with("+") or line.starts_with(" ") {
+                at = at + 1
+            }
+        }
+    }
+    return out
+}
+
+/// Whether two patches touch a line in common — which is when a merge will
+/// need a human.
+pub fn conflicts_with(a: PatchedFile, b: PatchedFile) -> bool {
+    if a.old_path != b.old_path {
+        return false
+    }
+    for one in a.hunks {
+        for other in b.hunks {
+            let a_end = one.old_start + one.old_count
+            let b_end = other.old_start + other.old_count
+            if one.old_start < b_end and other.old_start < a_end {
+                return true
+            }
+        }
+    }
+    return false
+}

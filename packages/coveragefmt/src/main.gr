@@ -1,0 +1,512 @@
+// Coverage reports: LCOV, Cobertura and Go's profile, and one number out of
+// any of them.
+//
+// Every language's coverage tool writes one of three formats and every CI
+// service reads a different one, so something in between has to translate.
+// That is most of what this is for. The other part is the number worth
+// looking at.
+//
+// ## The number that matters is not the total
+//
+// A repository at 82% tells nobody anything: it does not move, and when it
+// does nobody knows which change moved it. **Coverage of the lines a change
+// touched** is the number that can be acted on — it is about one pull
+// request, it is either good or bad on its own, and it is computable from a
+// report and a diff. `changed_line_rate` takes exactly that pair, and
+// `patchfile.changed_lines` produces the other half.
+//
+// ## Three formats and what they disagree about
+//
+// **LCOV** is line-oriented and additive: `DA:12,3` says line 12 ran three
+// times. Two runs merge by adding the counts, which is what makes it the
+// format parallel test suites write.
+//
+// **Cobertura** is XML and hit-oriented, and its `line-rate` is a ratio
+// already computed — which is why a Cobertura file can disagree with itself
+// if a tool writes the lines and forgets the attribute. This recomputes
+// rather than trusting it.
+//
+// **Go's profile** counts *statement blocks*, not lines: `f.go:12.34,15.2 3
+// 1` is a block spanning three statements from line 12 to line 15, hit once.
+// A block is not a line, so converting to a line-oriented format means
+// deciding what a partially covered block means — this takes the whole span
+// as covered when the count is non-zero, which is what `go tool cover` shows
+// and what every converter does.
+//
+// Checked against `coverage.py`'s own LCOV and Cobertura output for the same
+// run: the same lines, the same hits, and a rate that matches what
+// `coverage report` prints.
+
+import xml
+
+type CoverageLine = { line: i64, hits: i64 }
+
+type CoverageFile = {
+    path: str,
+    lines: [CoverageLine],
+    functions_found: i64,
+    functions_hit: i64,
+    branches_found: i64,
+    branches_hit: i64,
+}
+
+type CoverageReport = { files: [CoverageFile] }
+
+type CoverageError =
+    | NotXml(why: str)
+    | NoCoverageElement()
+    | BadRecord(text: str)
+
+pub fn empty_file(path: str) -> CoverageFile {
+    return CoverageFile{ path: path, lines: [], functions_found: 0,
+        functions_hit: 0, branches_found: 0, branches_hit: 0 }
+}
+
+pub fn empty_report() -> CoverageReport {
+    return CoverageReport{ files: [] }
+}
+
+fn number_after(text: str, prefix: str) -> i64 {
+    if not text.starts_with(prefix) {
+        return 0 - 1
+    }
+    return text.substr(prefix.len(), text.len() - prefix.len())
+        .parse_int() ?? (0 - 1)
+}
+
+// ------------------------------------------------------------------ LCOV
+
+/// An LCOV tracefile.
+///
+/// Only the records that carry information are read: the counts LCOV writes
+/// alongside them (`LF`, `LH`, `FNF`, `FNH`) are derived, and a file whose
+/// summary disagrees with its own records is one this recomputes rather than
+/// believes.
+pub fn parse_lcov(text: str) -> CoverageReport ! CoverageError {
+    var report = empty_report()
+    var current = empty_file("")
+    var open = false
+    for raw in text.split("\n") {
+        let line = raw.trim()
+        if line == "" {
+            continue
+        }
+        if line.starts_with("SF:") {
+            if open {
+                report.files.push(current)
+            }
+            current = empty_file(line.substr(3, line.len() - 3))
+            open = true
+            continue
+        }
+        if not open {
+            continue
+        }
+        if line == "end_of_record" {
+            report.files.push(current)
+            open = false
+            continue
+        }
+        if line.starts_with("DA:") {
+            let body = line.substr(3, line.len() - 3)
+            let comma = body.index_of(",") ?? (0 - 1)
+            if comma <= 0 {
+                fail(BadRecord(line))
+            }
+            let number = body.substr(0, comma).parse_int() ?? (0 - 1)
+            let hits = body.substr(comma + 1, body.len() - comma - 1)
+                .parse_int() ?? (0 - 1)
+            if number < 0 or hits < 0 {
+                fail(BadRecord(line))
+            }
+            current.lines.push(CoverageLine{ line: number, hits: hits })
+            continue
+        }
+        if line.starts_with("FNDA:") {
+            let body = line.substr(5, line.len() - 5)
+            let comma = body.index_of(",") ?? (0 - 1)
+            if comma > 0 {
+                current.functions_found = current.functions_found + 1
+                let hits = body.substr(0, comma).parse_int() ?? 0
+                if hits > 0 {
+                    current.functions_hit = current.functions_hit + 1
+                }
+            }
+            continue
+        }
+        if line.starts_with("BRDA:") {
+            current.branches_found = current.branches_found + 1
+            let body = line.substr(5, line.len() - 5)
+            let parts = body.split(",")
+            if parts.len() == 4 and parts[3] != "-" and parts[3] != "0" {
+                current.branches_hit = current.branches_hit + 1
+            }
+            continue
+        }
+    }
+    if open {
+        report.files.push(current)
+    }
+    return report
+}
+
+pub fn render_lcov(report: CoverageReport) -> str {
+    var out = ""
+    for file in report.files {
+        out = out + "SF:" + file.path + "\n"
+        for l in file.lines {
+            out = out + "DA:{l.line},{l.hits}\n"
+        }
+        out = out + "LF:{file.lines.len()}\n"
+        out = out + "LH:{covered_in(file)}\n"
+        if file.functions_found > 0 {
+            out = out + "FNF:{file.functions_found}\n"
+            out = out + "FNH:{file.functions_hit}\n"
+        }
+        if file.branches_found > 0 {
+            out = out + "BRF:{file.branches_found}\n"
+            out = out + "BRH:{file.branches_hit}\n"
+        }
+        out = out + "end_of_record\n"
+    }
+    return out
+}
+
+// ------------------------------------------------------------- Cobertura
+
+pub fn parse_cobertura(text: str) -> CoverageReport ! CoverageError {
+    let root = xml.parse(text) ?? xml.text("")
+    if xml.name_of(root) != "coverage" {
+        fail(NoCoverageElement())
+    }
+    var report = empty_report()
+    for packages in xml.elements(root, "packages") {
+        for package in xml.elements(packages, "package") {
+            for classes in xml.elements(package, "classes") {
+                for class in xml.elements(classes, "class") {
+                    report.files.push(file_of_class(class))
+                }
+            }
+        }
+    }
+    return report
+}
+
+fn file_of_class(class: ref Node) -> CoverageFile {
+    var out = empty_file(xml.attribute(class, "filename") ?? "")
+    for lines in xml.elements(class, "lines") {
+        for line in xml.elements(lines, "line") {
+            let number = (xml.attribute(line, "number") ?? "")
+                .parse_int() ?? (0 - 1)
+            let hits = (xml.attribute(line, "hits") ?? "").parse_int() ?? 0
+            if number >= 0 {
+                out.lines.push(CoverageLine{ line: number, hits: hits })
+            }
+            // `condition-coverage="50% (1/2)"` is where the branch numbers
+            // live, because Cobertura has no field for them.
+            let condition = xml.attribute(line, "condition-coverage") ?? ""
+            if condition != "" {
+                let open = condition.index_of("(") ?? (0 - 1)
+                let slash = condition.index_of("/") ?? (0 - 1)
+                let close = condition.index_of(")") ?? (0 - 1)
+                if open >= 0 and slash > open and close > slash {
+                    out.branches_hit = out.branches_hit +
+                    (condition.substr(open + 1, slash - open - 1)
+                            .parse_int() ?? 0)
+                    out.branches_found = out.branches_found +
+                    (condition.substr(slash + 1, close - slash - 1)
+                            .parse_int() ?? 0)
+                }
+            }
+        }
+    }
+    return out
+}
+
+fn rate_text(hit: i64, total: i64) -> str {
+    if total == 0 {
+        return "1"
+    }
+    let value = hit.as_f64() / total.as_f64()
+    return "{value}"
+}
+
+pub fn render_cobertura(report: CoverageReport) -> str {
+    var out = "<?xml version=\"1.0\" ?>\n"
+    let found = total_lines(report)
+    let hit = covered_lines(report)
+    out = out + "<coverage lines-valid=\"{found}\" lines-covered=\"{hit}\" " +
+    "line-rate=\"" + rate_text(hit, found) + "\">\n"
+    out = out + "  <packages>\n    <package name=\".\">\n      <classes>\n"
+    for file in report.files {
+        out = out + "        <class filename=\"" +
+        xml.escape_attribute(file.path) + "\" line-rate=\"" +
+        rate_text(covered_in(file), file.lines.len()) + "\">\n"
+        out = out + "          <lines>\n"
+        for l in file.lines {
+            out = out + "            <line number=\"{l.line}\" " +
+            "hits=\"{l.hits}\"/>\n"
+        }
+        out = out + "          </lines>\n        </class>\n"
+    }
+    out = out + "      </classes>\n    </package>\n  </packages>\n"
+    return out + "</coverage>\n"
+}
+
+// ------------------------------------------------------------ Go profiles
+
+/// A Go coverage profile, whose unit is a block of statements.
+///
+/// `f.go:12.34,15.2 3 1` — from line 12 column 34 to line 15 column 2, three
+/// statements, hit once. Every line of the span is taken as covered when the
+/// count is non-zero, which is what `go tool cover` renders and the only
+/// mapping from blocks to lines anybody uses.
+pub fn parse_go_profile(text: str) -> CoverageReport ! CoverageError {
+    var by_file = map()
+    var order: [str] = []
+    for raw in text.split("\n") {
+        let line = raw.trim()
+        if line == "" or line.starts_with("mode:") {
+            continue
+        }
+        let space = line.index_of(" ") ?? (0 - 1)
+        if space <= 0 {
+            fail(BadRecord(line))
+        }
+        let position = line.substr(0, space)
+        let rest = line.substr(space + 1, line.len() - space - 1).split(" ")
+        if rest.len() != 2 {
+            fail(BadRecord(line))
+        }
+        let count = rest[1].parse_int() ?? (0 - 1)
+        if count < 0 {
+            fail(BadRecord(line))
+        }
+        let colon = last_index_of(position, ":")
+        if colon <= 0 {
+            fail(BadRecord(line))
+        }
+        let path = position.substr(0, colon)
+        let span = position.substr(colon + 1, position.len() - colon - 1)
+        let comma = span.index_of(",") ?? (0 - 1)
+        if comma <= 0 {
+            fail(BadRecord(line))
+        }
+        let from = line_of(span.substr(0, comma))
+        let to = line_of(span.substr(comma + 1, span.len() - comma - 1))
+        if from < 0 or to < from {
+            fail(BadRecord(line))
+        }
+        if not by_file.has(path) {
+            by_file.set(path, map())
+            order.push(path)
+        }
+        var counts = by_file.get(path) ?? map()
+        var n = from
+        while n <= to {
+            let previous = counts.get(n) ?? 0
+            counts.set(n, previous + count)
+            n = n + 1
+        }
+        by_file.set(path, counts)
+    }
+    var report = empty_report()
+    for path in order {
+        var file = empty_file(path)
+        let counts = by_file.get(path) ?? map()
+        for key in counts.keys() {
+            file.lines.push(CoverageLine{ line: key,
+                hits: counts.get(key) ?? 0 })
+        }
+        report.files.push(file)
+    }
+    return report
+}
+
+fn last_index_of(text: str, needle: str) -> i64 {
+    var at = 0 - 1
+    var i = 0
+    let cs = text.chars()
+    while i < cs.len() {
+        if cs[i] == needle {
+            at = i
+        }
+        i = i + 1
+    }
+    return at
+}
+
+fn line_of(position: str) -> i64 {
+    let dot = position.index_of(".") ?? (0 - 1)
+    if dot < 0 {
+        return position.parse_int() ?? (0 - 1)
+    }
+    return position.substr(0, dot).parse_int() ?? (0 - 1)
+}
+
+// -------------------------------------------------------------- questions
+
+pub fn covered_in(file: CoverageFile) -> i64 {
+    var n = 0
+    for l in file.lines {
+        if l.hits > 0 {
+            n = n + 1
+        }
+    }
+    return n
+}
+
+pub fn total_lines(report: CoverageReport) -> i64 {
+    var n = 0
+    for f in report.files {
+        n = n + f.lines.len()
+    }
+    return n
+}
+
+pub fn covered_lines(report: CoverageReport) -> i64 {
+    var n = 0
+    for f in report.files {
+        n = n + covered_in(f)
+    }
+    return n
+}
+
+/// Covered lines over total lines, between 0 and 1.
+pub fn line_rate(report: CoverageReport) -> f64 {
+    let total = total_lines(report)
+    if total == 0 {
+        return 1.0
+    }
+    return covered_lines(report).as_f64() / total.as_f64()
+}
+
+/// The lines of a file that never ran — the list a reviewer wants.
+pub fn uncovered_lines(file: CoverageFile) -> [i64] {
+    var out: [i64] = []
+    for l in file.lines {
+        if l.hits == 0 {
+            out.push(l.line)
+        }
+    }
+    return out
+}
+
+pub fn file_named(report: CoverageReport,
+    path: str) -> Option[CoverageFile] {
+    for f in report.files {
+        if f.path == path {
+            return Some(f)
+        }
+    }
+    return None
+}
+
+/// Two runs added together — which is what LCOV's counts are for.
+///
+/// A line's hits add; a line one run knows about and the other does not is
+/// kept. This is how a report from four parallel shards becomes one report,
+/// and getting it wrong by taking the maximum instead makes a flaky test look
+/// like a coverage regression.
+pub fn merge(a: CoverageReport, b: CoverageReport) -> CoverageReport {
+    var out = empty_report()
+    for file in a.files {
+        var merged = file
+        match file_named(b, file.path) {
+            Some(other) -> {
+                merged = merge_files(file, other)
+            }
+            None -> {
+            }
+        }
+        out.files.push(merged)
+    }
+    for file in b.files {
+        match file_named(a, file.path) {
+            Some(_f) -> {
+            }
+            None -> {
+                out.files.push(file)
+            }
+        }
+    }
+    return out
+}
+
+fn merge_files(a: CoverageFile, b: CoverageFile) -> CoverageFile {
+    var counts = map()
+    for l in a.lines {
+        counts.set(l.line, (counts.get(l.line) ?? 0) + l.hits)
+    }
+    for l in b.lines {
+        counts.set(l.line, (counts.get(l.line) ?? 0) + l.hits)
+    }
+    var out = empty_file(a.path)
+    for key in counts.keys() {
+        out.lines.push(CoverageLine{ line: key, hits: counts.get(key) ?? 0 })
+    }
+    out.functions_found = a.functions_found
+    out.functions_hit = a.functions_hit
+    out.branches_found = a.branches_found
+    out.branches_hit = a.branches_hit
+    return out
+}
+
+/// Coverage of the lines a change touched.
+///
+/// The number a pull request should be judged by, and the one a total hides:
+/// a change that adds two hundred untested lines to a repository at 90%
+/// moves the total by a fraction of a point and moves this to zero.
+///
+/// Lines the report says nothing about — a comment, a blank line, a file with
+/// no coverage data — are not counted either way, because they are not lines
+/// that could have been covered.
+pub fn changed_line_rate(report: CoverageReport,
+    changed: Map[str, [i64]]) -> f64 {
+    var total = 0
+    var covered = 0
+    for entry in changed.entries() {
+        match file_named(report, entry.0) {
+            Some(file) -> {
+                for line in entry.1 {
+                    for l in file.lines {
+                        if l.line == line {
+                            total = total + 1
+                            if l.hits > 0 {
+                                covered = covered + 1
+                            }
+                        }
+                    }
+                }
+            }
+            None -> {
+            }
+        }
+    }
+    if total == 0 {
+        return 1.0
+    }
+    return covered.as_f64() / total.as_f64()
+}
+
+/// The changed lines that no test reached, by file.
+pub fn changed_and_uncovered(report: CoverageReport,
+    changed: Map[str, [i64]]) -> [(str, i64)] {
+    var out: [(str, i64)] = []
+    for entry in changed.entries() {
+        match file_named(report, entry.0) {
+            Some(file) -> {
+                for line in entry.1 {
+                    for l in file.lines {
+                        if l.line == line and l.hits == 0 {
+                            out.push((entry.0, line))
+                        }
+                    }
+                }
+            }
+            None -> {
+            }
+        }
+    }
+    return out
+}

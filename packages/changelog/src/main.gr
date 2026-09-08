@@ -1,0 +1,488 @@
+// Changelogs: reading Keep a Changelog, and building one from commits.
+//
+// ## Why the format is worth following
+//
+// Keep a Changelog exists because "see the git log" is not a changelog. A log
+// is a record of what the authors did; a changelog is a note to the people
+// upgrading, and the two overlap less than anyone expects. Six section names,
+// newest release first, and a date — that is the whole specification, and its
+// value is that a reader knows where to look before they start reading.
+//
+// The six are `Added`, `Changed`, `Deprecated`, `Removed`, `Fixed` and
+// `Security`. Not `Features`, not `Bug fixes`, not `Misc`: a fixed set is
+// what lets a tool find the security notes in a hundred projects' changelogs,
+// and `Misc` is where entries go to be unread.
+//
+// ## Conventional Commits, and the bump it decides
+//
+// A commit subject of the shape `type(scope)!: description` says what kind of
+// change it is, and the kind decides the version. A `!` or a
+// `BREAKING CHANGE:` trailer is a major bump, a `feat` is a minor one, and
+// everything else is a patch. That is the whole rule, and the reason to
+// automate it is not effort: it is that a human deciding the bump under
+// release pressure chooses patch, and the caller who upgrades finds out
+// afterwards.
+//
+// **Before 1.0.0 the rule usually changes.** Semver says a breaking change
+// is a major bump; most 0.x projects bump the minor instead, because going
+// to 1.0.0 says something they do not mean yet. `next_version` follows the
+// specification and `next_version_zerover` follows the convention, and a
+// caller picks — silently doing one or the other is how a project's version
+// numbers stop meaning anything.
+//
+// Checked by round-tripping this repository's own changelog, and against the
+// examples in the Conventional Commits and Keep a Changelog specifications.
+
+type ChangeEntry = {
+    /// One of the six section names.
+    section: str,
+    text: str,
+}
+
+type ChangelogRelease = {
+    /// `Unreleased` for the section at the top with no version.
+    version: str,
+    /// ISO 8601, or empty.
+    date: str,
+    yanked: bool,
+    changes: [ChangeEntry],
+}
+
+type ConventionalCommit = {
+    /// `feat`, `fix`, `docs`, `refactor`, and the rest.
+    kind: str,
+    scope: str,
+    breaking: bool,
+    description: str,
+}
+
+type ChangelogError =
+    | NotSemver(text: str)
+    | UnknownSection(name: str)
+
+    /// The six sections, in the order Keep a Changelog lists them.
+pub fn sections() -> [str] {
+    return ["Added", "Changed", "Deprecated", "Removed", "Fixed", "Security"]
+}
+
+pub fn is_section(name: str) -> bool {
+    return sections().contains(name)
+}
+
+// -------------------------------------------------------------- reading
+
+fn heading_level(line: str) -> i64 {
+    var n = 0
+    for c in line.chars() {
+        if c == "#" {
+            n = n + 1
+        } else {
+            return if c == " " { n } else { 0 }
+        }
+    }
+    return 0
+}
+
+fn heading_text(line: str) -> str {
+    let level = heading_level(line)
+    return line.substr(level, line.len() - level).trim()
+}
+
+/// The releases, newest first, as the file lists them.
+///
+/// Anything above the first release heading — the title and the explanatory
+/// paragraph every changelog has — is skipped rather than kept, because it is
+/// prose about the file rather than a change to the software.
+pub fn parse(text: str) -> [ChangelogRelease] {
+    var out: [ChangelogRelease] = []
+    var current = ChangelogRelease{ version: "", date: "", yanked: false,
+        changes: [] }
+    var section = ""
+    var started = false
+    for line in text.split("\n") {
+        let level = heading_level(line)
+        if level == 2 {
+            if started {
+                out.push(current)
+            }
+            started = true
+            current = release_from_heading(heading_text(line))
+            section = ""
+            continue
+        }
+        if level == 3 and started {
+            section = heading_text(line)
+            continue
+        }
+        if not started or section == "" {
+            continue
+        }
+        let t = line.trim()
+        if t.starts_with("- ") or t.starts_with("* ") {
+            current.changes.push(ChangeEntry{ section: section,
+                text: t.substr(2, t.len() - 2).trim() })
+        }
+    }
+    if started {
+        out.push(current)
+    }
+    return out
+}
+
+/// A release heading: `## [1.2.3] - 2024-01-05` or `## [Unreleased]`.
+///
+/// The brackets are a link reference in Markdown and are not part of the
+/// version, which is why a naive reader ends up with versions called
+/// `[1.2.3]` that compare unequal to every real one.
+fn release_from_heading(heading: str) -> ChangelogRelease {
+    var text = heading
+    var yanked = false
+    if text.to_upper().contains("[YANKED]") {
+        yanked = true
+    }
+    var version = text
+    var date = ""
+    // The specification writes a hyphen. Real changelogs — including this
+    // repository's — use an em dash or an en dash, because a typographer got
+    // to them, and a reader that only knows the hyphen reports every one of
+    // those releases as undated.
+    for separator in [" - ", " \u{2014} ", " \u{2013} "] {
+        let dash = text.index_of(separator) ?? (0 - 1)
+        if dash > 0 {
+            version = text.substr(0, dash).trim()
+            let width = separator.len()
+            date = text.substr(dash + width, text.len() - dash - width).trim()
+            let bracket = date.index_of("[") ?? (0 - 1)
+            if bracket >= 0 {
+                date = date.substr(0, bracket).trim()
+            }
+            break
+        }
+    }
+    version = version.trim()
+    if version.starts_with("[") {
+        let close = version.index_of("]") ?? (0 - 1)
+        if close > 0 {
+            version = version.substr(1, close - 1)
+        }
+    }
+    return ChangelogRelease{ version: version, date: date, yanked: yanked,
+        changes: [] }
+}
+
+pub fn unreleased(releases: [ChangelogRelease]) -> Option[ChangelogRelease] {
+    for r in releases {
+        if r.version.to_lower() == "unreleased" {
+            return Some(r)
+        }
+    }
+    return None
+}
+
+pub fn release_named(releases: [ChangelogRelease],
+    version: str) -> Option[ChangelogRelease] {
+    for r in releases {
+        if r.version == version {
+            return Some(r)
+        }
+    }
+    return None
+}
+
+/// The entries of one section of a release, in order.
+pub fn entries_in(release: ChangelogRelease, section: str) -> [str] {
+    var out: [str] = []
+    for c in release.changes {
+        if c.section == section {
+            out.push(c.text)
+        }
+    }
+    return out
+}
+
+/// Section names used that are not one of the six.
+///
+/// The check worth running in CI: a `### Bug fixes` heading looks fine to a
+/// human and is invisible to every tool that reads changelogs.
+pub fn nonstandard_sections(releases: [ChangelogRelease]) -> [str] {
+    var seen = map()
+    for r in releases {
+        for c in r.changes {
+            if not is_section(c.section) {
+                seen.set(c.section, true)
+            }
+        }
+    }
+    var out: [str] = []
+    for k in seen.keys() {
+        out.push(k)
+    }
+    return out
+}
+
+// ------------------------------------------------------------- rendering
+
+pub fn render(releases: [ChangelogRelease]) -> str {
+    var out = "# Changelog\n\nAll notable changes to this project are " +
+    "documented in this file.\n\nThe format is based on [Keep a " +
+    "Changelog](https://keepachangelog.com/en/1.1.0/), and this project " +
+    "adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0" +
+    ".html).\n"
+    for r in releases {
+        out = out + "\n" + render_release(r)
+    }
+    return out
+}
+
+pub fn render_release(release: ChangelogRelease) -> str {
+    var out = "## [" + release.version + "]"
+    if release.date != "" {
+        out = out + " - " + release.date
+    }
+    if release.yanked {
+        out = out + " [YANKED]"
+    }
+    out = out + "\n"
+    for section in sections() {
+        let entries = entries_in(release, section)
+        if entries.len() == 0 {
+            continue
+        }
+        out = out + "\n### " + section + "\n\n"
+        for e in entries {
+            out = out + "- " + e + "\n"
+        }
+    }
+    return out
+}
+
+// --------------------------------------------------- conventional commits
+
+/// A commit subject in the `type(scope)!: description` shape, or `None`.
+///
+/// `None` rather than a guess: a subject that is not conventional is not a
+/// broken conventional commit, it is a commit written before the convention
+/// or by somebody who does not use it, and inventing a type for it puts a
+/// wrong entry in the changelog.
+pub fn conventional(subject: str) -> Option[ConventionalCommit] {
+    let colon = subject.index_of(":") ?? (0 - 1)
+    if colon <= 0 or colon + 1 >= subject.len() {
+        return None
+    }
+    if subject.substr(colon + 1, 1) != " " {
+        return None
+    }
+    var head = subject.substr(0, colon)
+    var breaking = false
+    if head.ends_with("!") {
+        breaking = true
+        head = head.substr(0, head.len() - 1)
+    }
+    var kind = head
+    var scope = ""
+    let open = head.index_of("(") ?? (0 - 1)
+    if open > 0 {
+        if not head.ends_with(")") {
+            return None
+        }
+        kind = head.substr(0, open)
+        scope = head.substr(open + 1, head.len() - open - 2)
+        if scope == "" {
+            return None
+        }
+    }
+    if kind == "" or not is_type_word(kind) {
+        return None
+    }
+    return Some(ConventionalCommit{
+        kind: kind,
+        scope: scope,
+        breaking: breaking,
+        description: subject.substr(colon + 2, subject.len() - colon - 2)
+            .trim(),
+    })
+}
+
+fn is_type_word(kind: str) -> bool {
+    for c in kind.chars() {
+        if not ((c >= "a" and c <= "z") or (c >= "A" and c <= "Z")) {
+            return false
+        }
+    }
+    return true
+}
+
+/// Whether a whole commit message — subject and body — is a breaking change.
+///
+/// The `!` is the short form; the long one is a `BREAKING CHANGE:` trailer in
+/// the body, and a tool that only looks at the subject misses every commit
+/// that used it.
+pub fn is_breaking(message: str) -> bool {
+    let lines = message.split("\n")
+    if lines.len() > 0 {
+        match conventional(lines[0]) {
+            Some(c) -> {
+                if c.breaking {
+                    return true
+                }
+            }
+            None -> {
+            }
+        }
+    }
+    for line in lines {
+        let t = line.trim()
+        if t.starts_with("BREAKING CHANGE:") or
+        t.starts_with("BREAKING-CHANGE:") {
+            return true
+        }
+    }
+    return false
+}
+
+/// Which changelog section a commit type belongs in.
+///
+/// `feat` is `Added`, `fix` is `Fixed`, and a type nobody agreed on is
+/// `Changed` — which is honest, since the reader still needs to know
+/// something happened.
+pub fn section_for(kind: str) -> str {
+    if kind == "feat" {
+        return "Added"
+    }
+    if kind == "fix" {
+        return "Fixed"
+    }
+    if kind == "perf" or kind == "refactor" or kind == "style" {
+        return "Changed"
+    }
+    if kind == "revert" {
+        return "Removed"
+    }
+    if kind == "security" {
+        return "Security"
+    }
+    if kind == "deprecate" {
+        return "Deprecated"
+    }
+    return "Changed"
+}
+
+/// Commit types that produce no changelog entry at all.
+///
+/// A reader upgrading does not care that the CI configuration changed. Every
+/// changelog generator has this list and every one of them has it slightly
+/// different, so it is here to be read and overridden rather than hidden.
+pub fn silent_types() -> [str] {
+    return ["chore", "ci", "build", "test", "docs"]
+}
+
+// ------------------------------------------------------------- versions
+
+fn parse_version(text: str) -> (i64, i64, i64) ! ChangelogError {
+    var t = text
+    if t.starts_with("v") {
+        t = t.substr(1, t.len() - 1)
+    }
+    let dash = t.index_of("-") ?? (0 - 1)
+    if dash > 0 {
+        t = t.substr(0, dash)
+    }
+    let parts = t.split(".")
+    if parts.len() != 3 {
+        fail(NotSemver(text))
+    }
+    let major = parts[0].parse_int() ?? (0 - 1)
+    let minor = parts[1].parse_int() ?? (0 - 1)
+    let patch = parts[2].parse_int() ?? (0 - 1)
+    if major < 0 or minor < 0 or patch < 0 {
+        fail(NotSemver(text))
+    }
+    return (major, minor, patch)
+}
+
+/// `major`, `minor` or `patch` for a set of commit messages.
+pub fn bump_kind(messages: [str]) -> str {
+    var kind = "patch"
+    for m in messages {
+        if is_breaking(m) {
+            return "major"
+        }
+        let first = m.split("\n")[0]
+        match conventional(first) {
+            Some(c) -> {
+                if c.kind == "feat" {
+                    kind = "minor"
+                }
+            }
+            None -> {
+            }
+        }
+    }
+    return kind
+}
+
+/// The next version, by the specification.
+pub fn next_version(current: str,
+    messages: [str]) -> str ! ChangelogError {
+    let v = try parse_version(current)
+    let kind = bump_kind(messages)
+    if kind == "major" {
+        return "{v.0 + 1}.0.0"
+    }
+    if kind == "minor" {
+        return "{v.0}.{v.1 + 1}.0"
+    }
+    return "{v.0}.{v.1}.{v.2 + 1}"
+}
+
+/// The next version by the convention most 0.x projects follow, where a
+/// breaking change moves the minor rather than declaring 1.0.0.
+pub fn next_version_zerover(current: str,
+    messages: [str]) -> str ! ChangelogError {
+    let v = try parse_version(current)
+    if v.0 != 0 {
+        return try next_version(current, messages)
+    }
+    let kind = bump_kind(messages)
+    if kind == "major" or kind == "minor" {
+        return "0.{v.1 + 1}.0"
+    }
+    return "0.{v.1}.{v.2 + 1}"
+}
+
+/// A release built from commit messages, ready to render.
+///
+/// Silent types are dropped, non-conventional subjects are kept under
+/// `Changed` — losing them entirely would hide real changes behind a
+// convention the author did not use — and a breaking change is marked in the
+/// entry, because that is what a reader is scanning for.
+pub fn release_from_commits(version: str, date: str,
+    messages: [str]) -> ChangelogRelease {
+    var out = ChangelogRelease{ version: version, date: date, yanked: false,
+        changes: [] }
+    for m in messages {
+        let subject = m.split("\n")[0]
+        let breaking = is_breaking(m)
+        match conventional(subject) {
+            Some(c) -> {
+                if silent_types().contains(c.kind) and not breaking {
+                    continue
+                }
+                var text = c.description
+                if c.scope != "" {
+                    text = "**" + c.scope + "**: " + text
+                }
+                if breaking {
+                    text = "**BREAKING** " + text
+                }
+                out.changes.push(ChangeEntry{ section: section_for(c.kind),
+                    text: text })
+            }
+            None -> {
+                out.changes.push(ChangeEntry{ section: "Changed",
+                    text: subject })
+            }
+        }
+    }
+    return out
+}

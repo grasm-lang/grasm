@@ -1,0 +1,10 @@
+[package]
+name = "codeowners"
+version = "1.0.0"
+
+# Matching paths against patterns. Opens nothing.
+capabilities = []
+
+[dependencies.glob]
+path = "../glob"
+version = "^1.0.0"

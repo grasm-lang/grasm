@@ -1,0 +1,24 @@
+[package]
+name = "buildtools_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.spdx]
+path = "../spdx"
+version = "^1.0.0"
+
+[dependencies.codeowners]
+path = "../codeowners"
+version = "^1.0.0"
+
+[dependencies.patchfile]
+path = "../patchfile"
+version = "^1.0.0"
+
+[dependencies.changelog]
+path = "../changelog"
+version = "^1.0.0"
+
+[dependencies.coveragefmt]
+path = "../coveragefmt"
+version = "^1.0.0"

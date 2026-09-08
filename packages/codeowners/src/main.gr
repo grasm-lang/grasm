@@ -1,0 +1,309 @@
+// CODEOWNERS, the file that decides who reviews what.
+//
+// A line is a path pattern and the people responsible for anything it
+// matches. GitHub, GitLab and Gitea all read it, all with the same three
+// rules and all without documenting the corners.
+//
+// ## The rule everybody gets wrong
+//
+// **The last matching line wins, not the most specific one.** A file
+// declaring
+//
+//     /build/logs/  @doctocat
+//     **/logs       @octocat
+//
+// gives `build/logs/x.txt` to `@octocat`, because that line is lower down —
+// even though the first is more specific and looks more deliberate. This is
+// the opposite of how a routing table or a CSS rule behaves, and it is why a
+// CODEOWNERS file grows a catch-all at the top and the specific rules below
+// rather than the other way round.
+//
+// ## The other two
+//
+// **A pattern with no slash matches at every depth.** `*.js` covers
+// `src/a.js` as well as `a.js`. A pattern with a slash anywhere but the end
+// is anchored at the repository root, so `docs/*` covers `docs/a.md` and not
+// `src/docs/a.md`.
+//
+// **A pattern that names a directory owns everything beneath it**, with or
+// without the trailing slash. `apps/` and `**/logs` both take the whole
+// subtree, which is what makes a rule that looks like it names one thing
+// quietly own a thousand.
+//
+// ## What is deliberately missing
+//
+// Negation. gitignore has `!`, and CODEOWNERS does not — a line cannot
+// exclude a path from an earlier rule, and a file written as though it could
+// silently assigns everything to whoever wrote the last broad line. There is
+// no `!` handling here because there is nothing to handle.
+//
+// Checked against Python's `codeowners`, the library GitHub's own tooling
+// examples are tested with, on the rules from GitHub's documentation.
+
+import glob
+
+type CodeownersRule = {
+    pattern: str,
+    owners: [str],
+    /// The 1-based line the rule came from, for an error message that can
+    /// point at it.
+    line: i64,
+}
+
+type CodeownersFile = { rules: [CodeownersRule] }
+
+/// The rules, in the order written — which is the order that decides.
+pub fn parse(text: str) -> CodeownersFile {
+    var rules: [CodeownersRule] = []
+    var number = 0
+    for raw in text.split("\n") {
+        number = number + 1
+        var line = raw
+        let hash = line.index_of("#") ?? (0 - 1)
+        if hash >= 0 {
+            line = line.substr(0, hash)
+        }
+        let parts = words_of(line)
+        if parts.len() == 0 {
+            continue
+        }
+        var owners: [str] = []
+        var i = 1
+        while i < parts.len() {
+            owners.push(parts[i])
+            i = i + 1
+        }
+        rules.push(CodeownersRule{ pattern: parts[0], owners: owners,
+            line: number })
+    }
+    return CodeownersFile{ rules: rules }
+}
+
+fn words_of(line: str) -> [str] {
+    var out: [str] = []
+    var current = ""
+    for c in line.chars() {
+        if c == " " or c == "\t" {
+            if current != "" {
+                out.push(current)
+                current = ""
+            }
+        } else {
+            current = current + c
+        }
+    }
+    if current != "" {
+        out.push(current)
+    }
+    return out
+}
+
+/// Whether one pattern covers one path.
+///
+/// The pattern is expanded into the two or three globs it stands for — the
+/// path itself, and the subtree under it — because a CODEOWNERS pattern names
+/// a set of files and a glob names one shape.
+pub fn matches(pattern: str, path: str) -> bool {
+    var p = pattern
+    if p == "" {
+        return false
+    }
+    // A directory pattern owns its contents and nothing else.
+    let directory_only = p.ends_with("/")
+    if directory_only {
+        p = p.substr(0, p.len() - 1)
+    }
+    // A slash anywhere but the end anchors the pattern at the root.
+    var anchored = false
+    if p.starts_with("/") {
+        anchored = true
+        p = p.substr(1, p.len() - 1)
+    } else {
+        if p.contains("/") {
+            anchored = true
+        }
+    }
+    var candidates = [p + "/**"]
+    if not directory_only {
+        candidates.push(p)
+    }
+    for candidate in candidates {
+        if glob.matches(candidate, path) {
+            return true
+        }
+        if not anchored and glob.matches("**/" + candidate, path) {
+            return true
+        }
+        // `**/` stands for "at any depth including none", so `**/logs`
+        // covers `logs/x` as well as `a/logs/x`. A glob matcher that makes
+        // `**` consume at least one segment needs the zero case spelled out.
+        if candidate.starts_with("**/") {
+            let rooted = candidate.substr(3, candidate.len() - 3)
+            if glob.matches(rooted, path) {
+                return true
+            }
+        }
+    }
+    return false
+}
+
+/// Who owns a path, or nobody.
+///
+/// The last matching rule, because that is the rule the hosts apply. A
+/// caller wanting to know why should ask `rule_for`, which says which line
+/// it was.
+pub fn owners_of(file: CodeownersFile, path: str) -> [str] {
+    match rule_for(file, path) {
+        Some(rule) -> {
+            return rule.owners
+        }
+        None -> {
+            return []
+        }
+    }
+}
+
+pub fn rule_for(file: CodeownersFile, path: str) -> Option[CodeownersRule] {
+    var found = None
+    for rule in file.rules {
+        if matches(rule.pattern, path) {
+            found = Some(rule)
+        }
+    }
+    return found
+}
+
+/// Every rule that matches, earliest first — for showing a human why the
+/// answer is what it is.
+pub fn all_matching(file: CodeownersFile, path: str) -> [CodeownersRule] {
+    var out: [CodeownersRule] = []
+    for rule in file.rules {
+        if matches(rule.pattern, path) {
+            out.push(rule)
+        }
+    }
+    return out
+}
+
+/// Rules that no path in the list reaches.
+///
+/// A CODEOWNERS file accumulates rules for directories that were renamed
+/// years ago, and nothing ever tells anyone. Given the repository's paths,
+/// this says which lines are dead.
+pub fn unmatched_rules(file: CodeownersFile,
+    paths: [str]) -> [CodeownersRule] {
+    var out: [CodeownersRule] = []
+    for rule in file.rules {
+        var used = false
+        for path in paths {
+            if matches(rule.pattern, path) {
+                used = true
+            }
+        }
+        if not used {
+            out.push(rule)
+        }
+    }
+    return out
+}
+
+/// Rules that are matched but never *win*, because a later rule covers
+/// everything they do.
+///
+/// The more useful question than "is this rule dead": a rule can match a
+/// thousand files and own none of them, which is exactly the failure the
+/// last-wins rule produces and the one nobody sees in review.
+pub fn shadowed_rules(file: CodeownersFile,
+    paths: [str]) -> [CodeownersRule] {
+    var out: [CodeownersRule] = []
+    var index = 0
+    while index < file.rules.len() {
+        let rule = file.rules[index]
+        var matched = false
+        var wins = false
+        for path in paths {
+            if not matches(rule.pattern, path) {
+                continue
+            }
+            matched = true
+            var last = 0 - 1
+            var k = 0
+            while k < file.rules.len() {
+                if matches(file.rules[k].pattern, path) {
+                    last = k
+                }
+                k = k + 1
+            }
+            if last == index {
+                wins = true
+            }
+        }
+        if matched and not wins {
+            out.push(rule)
+        }
+        index = index + 1
+    }
+    return out
+}
+
+/// Paths no rule covers — the files a pull request can change with nobody
+/// required to look.
+pub fn unowned(file: CodeownersFile, paths: [str]) -> [str] {
+    var out: [str] = []
+    for path in paths {
+        if owners_of(file, path).len() == 0 {
+            out.push(path)
+        }
+    }
+    return out
+}
+
+/// Everyone named anywhere in the file, sorted.
+pub fn all_owners(file: CodeownersFile) -> [str] {
+    var seen = map()
+    for rule in file.rules {
+        for owner in rule.owners {
+            seen.set(owner, true)
+        }
+    }
+    var out: [str] = []
+    for k in seen.keys() {
+        out.push(k)
+    }
+    return out
+}
+
+/// Whether an owner is written the way a host will accept: `@user`,
+/// `@org/team`, or an email address.
+///
+/// A bare `user` with no `@` is silently ignored by GitHub, which means the
+/// path it was meant to protect has no owner and the file looks fine.
+pub fn is_valid_owner(owner: str) -> bool {
+    if owner.starts_with("@") {
+        let rest = owner.substr(1, owner.len() - 1)
+        if rest == "" {
+            return false
+        }
+        let slash = rest.index_of("/") ?? (0 - 1)
+        if slash < 0 {
+            return not rest.contains("@")
+        }
+        return slash > 0 and slash < rest.len() - 1
+    }
+    let at = owner.index_of("@") ?? (0 - 1)
+    return at > 0 and at < owner.len() - 1 and
+    owner.substr(at + 1, owner.len() - at - 1).contains(".")
+}
+
+/// Owners the hosts will ignore, with the line they are on.
+pub fn invalid_owners(file: CodeownersFile) -> [(i64, str)] {
+    var out: [(i64, str)] = []
+    for rule in file.rules {
+        for owner in rule.owners {
+            if not is_valid_owner(owner) {
+                out.push((rule.line, owner))
+            }
+        }
+    }
+    return out
+}

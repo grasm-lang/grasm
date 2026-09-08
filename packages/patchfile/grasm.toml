@@ -1,0 +1,6 @@
+[package]
+name = "patchfile"
+version = "1.0.0"
+
+# Reads and writes text the caller supplies. Opens nothing.
+capabilities = []
