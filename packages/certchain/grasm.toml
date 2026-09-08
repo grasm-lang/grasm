@@ -1,0 +1,11 @@
+[package]
+name = "certchain"
+version = "1.0.0"
+
+# Parsing and comparison. Opens nothing — the caller supplies the bytes and
+# the current time.
+capabilities = []
+
+[dependencies.asn1]
+path = "../asn1"
+version = "^1.0.0"

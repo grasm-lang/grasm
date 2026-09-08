@@ -1,0 +1,6 @@
+[package]
+name = "hostmatch"
+version = "1.0.0"
+
+# Does this certificate belong to this host. Opens nothing.
+capabilities = []

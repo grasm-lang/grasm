@@ -282,6 +282,23 @@ fn mul_small(limb: [i64], by: i64) -> [i64] {
 }
 
 /// Quotient and remainder, both truncated toward zero the way `i64 / i64` is.
+/// Divide the magnitude by a single limb, keeping the remainder.
+fn divmod_small(limb: [i64], by: i64) -> ([i64], i64) {
+    var out: [i64] = []
+    for _i in 0..limb.len() {
+        out.push(0)
+    }
+    var rest = 0
+    var i = limb.len() - 1
+    while i >= 0 {
+        let here = rest * base() + limb[i]
+        out[i] = here / by
+        rest = here % by
+        i = i - 1
+    }
+    return (out, rest)
+}
+
 pub fn divmod(a: BigInt, b: BigInt) -> (BigInt, BigInt) ! BigError {
     if is_zero(b) {
         fail(DivideByZero)
@@ -289,39 +306,57 @@ pub fn divmod(a: BigInt, b: BigInt) -> (BigInt, BigInt) ! BigError {
     if cmp_abs(a, b) < 0 {
         return (zero(), a)
     }
-    let top = BigInt{ limb: b.limb, negative: false }
+    // Normalise so the divisor's top limb is at least half the base. That is
+    // what makes the quotient estimate below wrong by at most one, and it is
+    // the difference between three comparisons a limb and thirty: the first
+    // version bisected the whole range, and one RSA-2048 verification took
+    // ten seconds because of it.
+    let shift = base() / (b.limb[b.limb.len() - 1] + 1)
+    var top = BigInt{ limb: b.limb, negative: false }
+    var left = BigInt{ limb: a.limb, negative: false }
+    if shift > 1 {
+        top = BigInt{ limb: mul_small(b.limb, shift), negative: false }
+        left = BigInt{ limb: mul_small(a.limb, shift), negative: false }
+        trim(top)
+        trim(left)
+    }
+    let n = top.limb.len()
+    let top_limb = top.limb[n - 1]
     var quotient: [i64] = []
-    for _i in 0..a.limb.len() {
+    for _i in 0..left.limb.len() {
         quotient.push(0)
     }
     var rest = zero()
-    var i = a.limb.len() - 1
+    var i = left.limb.len() - 1
     while i >= 0 {
         // Shift the running remainder up one limb and bring the next down.
-        var shifted: [i64] = [a.limb[i]]
+        var shifted: [i64] = [left.limb[i]]
         for l in rest.limb {
             shifted.push(l)
         }
         rest = BigInt{ limb: shifted, negative: false }
         trim(rest)
-        // The digit is found by bisection rather than by estimation: 30
-        // comparisons a limb, and no correction step to get wrong.
-        var lo = 0
-        var hi = base() - 1
-        while lo < hi {
-            let mid = (lo + hi + 1) / 2
-            var probe = BigInt{ limb: mul_small(top.limb, mid), negative: false }
-            trim(probe)
-            if cmp_abs(probe, rest) <= 0 {
-                lo = mid
-            } else {
-                hi = mid - 1
-            }
+        // The estimate, from the top two limbs of the remainder over the top
+        // limb of the divisor. Under normalisation it is exact or one too
+        // large, so at most two corrections follow.
+        var guess = 0
+        if rest.limb.len() > n {
+            guess = (rest.limb[n] * base() + rest.limb[n - 1]) / top_limb
+        } else if rest.limb.len() == n {
+            guess = rest.limb[n - 1] / top_limb
         }
-        quotient[i] = lo
-        if lo > 0 {
-            var taken = BigInt{ limb: mul_small(top.limb, lo), negative: false }
+        if guess > base() - 1 {
+            guess = base() - 1
+        }
+        var taken = BigInt{ limb: mul_small(top.limb, guess), negative: false }
+        trim(taken)
+        while guess > 0 and cmp_abs(taken, rest) > 0 {
+            guess = guess - 1
+            taken = BigInt{ limb: mul_small(top.limb, guess), negative: false }
             trim(taken)
+        }
+        quotient[i] = guess
+        if guess > 0 {
             rest = BigInt{ limb: sub_abs(rest, taken), negative: false }
             trim(rest)
         }
@@ -329,6 +364,11 @@ pub fn divmod(a: BigInt, b: BigInt) -> (BigInt, BigInt) ! BigError {
     }
     var q = BigInt{ limb: quotient, negative: a.negative != b.negative }
     trim(q)
+    // Undo the normalisation on the remainder; the quotient is unaffected.
+    if shift > 1 {
+        rest = BigInt{ limb: divmod_small(rest.limb, shift).0, negative: false }
+        trim(rest)
+    }
     var r = rest
     r.negative = a.negative and not is_zero(r)
     return (q, r)
@@ -360,6 +400,82 @@ pub fn pow(base_value: BigInt, exponent: i64) -> BigInt {
         left = left / 2
     }
     return result
+}
+
+/// `base^exponent mod modulus`, by squaring.
+///
+/// The operation an RSA verification is: with the usual public exponent of
+/// 65537 that is seventeen squarings and two multiplications, each followed
+/// by a reduction. Written here rather than in `rsa` because it is
+/// arithmetic, and because a modular exponentiation with no reduction inside
+/// the loop builds a number with as many digits as the exponent has bits.
+pub fn mod_pow(base_value: BigInt, exponent: BigInt,
+    modulus: BigInt) -> BigInt ! BigError {
+    if is_zero(modulus) {
+        fail(DivideByZero)
+    }
+    var result = from_i64(1)
+    var squared = try rem(base_value, modulus)
+    var left = exponent
+    let two = from_i64(2)
+    while not is_zero(left) {
+        let split = try divmod(left, two)
+        if not is_zero(split.1) {
+            result = try rem(mul(result, squared), modulus)
+        }
+        squared = try rem(mul(squared, squared), modulus)
+        left = split.0
+    }
+    return result
+}
+
+/// A big-endian byte string as a number.
+pub fn from_bytes(data: bytes) -> BigInt {
+    var out = zero()
+    let base_256 = from_i64(256)
+    for i in 0..data.len() {
+        out = add(mul(out, base_256), from_i64(data.at(i)))
+    }
+    return out
+}
+
+/// And back, left-padded to `width` bytes.
+///
+/// Padded rather than trimmed, because a signature or a modulus is a
+/// fixed-width quantity and a leading zero byte is part of it.
+pub fn to_bytes(n: BigInt, width: i64) -> bytes ! BigError {
+    var out: [i64] = []
+    var left = n
+    let base_256 = from_i64(256)
+    while not is_zero(left) {
+        let split = try divmod(left, base_256)
+        out.push(to_i64(split.1) ?? 0)
+        left = split.0
+    }
+    while out.len() < width {
+        out.push(0)
+    }
+    return bytes_of(out.rev())
+}
+
+/// How many bits the value occupies — an RSA key's size.
+///
+/// Estimated from the decimal digit count and then corrected, because the
+/// exact answer by repeated division is one division per bit and a 2048-bit
+/// modulus has two thousand of them.
+pub fn bit_length(n: BigInt) -> i64 {
+    if is_zero(n) {
+        return 0
+    }
+    let two = from_i64(2)
+    var bits = (digit_count(n).as_f64() * 3.321928094887362).as_i64() + 1
+    while bits > 1 and compare(pow(two, bits - 1), n) > 0 {
+        bits = bits - 1
+    }
+    while compare(pow(two, bits), n) <= 0 {
+        bits = bits + 1
+    }
+    return bits
 }
 
 pub fn factorial(n: i64) -> BigInt {

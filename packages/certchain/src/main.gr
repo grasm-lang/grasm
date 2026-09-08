@@ -1,0 +1,602 @@
+// Building and checking a certificate path: the half of TLS that is not
+// cryptography.
+//
+// `x509` verifies one signature against one key. That is not "is this
+// certificate trustworthy", and the gap between the two is where almost every
+// real certificate failure lives:
+//
+//   - **A chain is built, not given.** A server sends its leaf and usually
+//     the intermediates, in no guaranteed order, sometimes with extras and
+//     sometimes missing one. The path from leaf to a trusted root has to be
+//     found by matching each certificate's issuer to the next one's subject.
+//   - **Validity is a window, and the whole path must be inside it.** An
+//     expired intermediate invalidates a leaf that is perfectly current.
+//   - **Basic constraints.** A certificate that is not a CA may not sign
+//     another, and `pathLenConstraint` limits how many may follow. Ignoring
+//     this is the flaw that let anyone with any valid certificate mint one
+//     for any site, in 2002 and again in 2009.
+//   - **Key usage.** A CA certificate must have `keyCertSign`; a leaf used
+//     for TLS must have `digitalSignature` or `keyEncipherment`.
+//   - **A self-signed certificate is not a root.** It is a root only if a
+//     trust store says so, and the store is the caller's.
+//
+// This package does the path work and the field checks. The signature
+// verification is `x509`'s and `rsa`'s, and is passed in as a function — so
+// this stays capability-free, and so a caller can supply whichever algorithms
+// it is willing to accept rather than getting a fixed list.
+import asn1
+
+type CertFacts = {
+    /// DER, as received.
+    der: bytes,
+    /// The signed region, for a verifier.
+    tbs_at: i64,
+    tbs_len: i64,
+    /// Distinguished names, as a canonical string.
+    subject: str,
+    issuer: str,
+    /// Seconds since the epoch.
+    not_before: i64,
+    not_after: i64,
+    is_ca: bool,
+    /// -1 when unconstrained.
+    path_length: i64,
+    key_usage: i64,
+    dns_names: [str],
+    ip_names: [str],
+    serial: str,
+    signature_algorithm: str,
+    /// The signature bits.
+    signature: bytes,
+}
+
+type ChainError =
+    | NotACertificate(why: str)
+    | NoPath(subject: str)
+    | Expired(subject: str, not_after: i64)
+    | NotYetValid(subject: str, not_before: i64)
+    | NotACa(subject: str)
+    | PathTooLong(subject: str, allowed: i64)
+    | BadSignature(subject: str)
+    | UntrustedRoot(subject: str)
+    | Cycle(subject: str)
+
+    /// The key-usage bits, in the order the BIT STRING writes them.
+pub let DIGITAL_SIGNATURE = 128
+pub let KEY_ENCIPHERMENT = 32
+pub let KEY_CERT_SIGN = 4
+pub let CRL_SIGN = 2
+
+fn oid_basic_constraints() -> str {
+    return "2.5.29.19"
+}
+
+fn oid_key_usage() -> str {
+    return "2.5.29.15"
+}
+
+fn oid_subject_alt_name() -> str {
+    return "2.5.29.17"
+}
+
+/// Two digits from ASCII.
+fn two(text: str, at: i64) -> i64 {
+    return text.substr(at, 2).parse_int() ?? 0
+}
+
+/// A UTCTime or GeneralizedTime as seconds since the epoch.
+///
+/// UTCTime has a two-digit year, and the rule is that 50 and above means the
+/// twentieth century — which is why a certificate cannot express a date after
+/// 2049 in that encoding and why anything past it uses GeneralizedTime.
+pub fn parse_time(text: str) -> i64 {
+    var body = text
+    var year = 0
+    if body.len() >= 15 and not body.ends_with("Z") == false and body.len() == 15 {
+        year = body.substr(0, 4).parse_int() ?? 0
+        body = body.substr(4, body.len() - 4)
+    } else if body.len() >= 13 {
+        let short = two(body, 0)
+        year = if short >= 50 { 1900 + short } else { 2000 + short }
+        body = body.substr(2, body.len() - 2)
+    } else {
+        return 0
+    }
+    let month = two(body, 0)
+    let day = two(body, 2)
+    let hour = two(body, 4)
+    let minute = two(body, 6)
+    let second = two(body, 8)
+    return days_from_civil(year, month, day) * 86400 + hour * 3600 +
+    minute * 60 + second
+}
+
+/// Days from 1970-01-01, by Howard Hinnant's algorithm.
+///
+/// Written out rather than approximated: a leap-year rule that is nearly
+/// right makes a certificate expire on the wrong day, once every four years,
+/// somewhere nobody is testing.
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year }
+    let era = if y >= 0 { y / 400 } else { (y - 399) / 400 }
+    let year_of_era = y - era * 400
+    let m = if month > 2 { month - 3 } else { month + 9 }
+    let day_of_year = (153 * m + 2) / 5 + day - 1
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 +
+    day_of_year
+    return era * 146097 + day_of_era - 719468
+}
+
+fn name_string(der: bytes, nodes: [DerNode], start: i64, stop: i64) -> str {
+    // Every printable component, joined. Not a full RFC 4514 rendering — it
+    // is a key for comparing an issuer with a subject, and it only has to be
+    // consistent.
+    var parts: [str] = []
+    var i = start
+    while i < stop {
+        let n = nodes[i]
+        if n.tag == asn1.PRINTABLE_STRING or n.tag == asn1.UTF8_STRING or
+        n.tag == asn1.IA5_STRING{
+            parts.push(asn1.text_of(der, n).trim().to_lower())
+        }
+        i = i + 1
+    }
+    return parts.join(",")
+}
+
+fn hex_of(der: bytes, n: DerNode) -> str {
+    var out = ""
+    for i in 0..n.len {
+        let b = der.at(n.body + i)
+        out = out + b.ushr(4).to_base(16) + b.bit_and(15).to_base(16)
+    }
+    return out
+}
+
+/// The issuer and the subject.
+///
+/// The issuer is the name written before the validity and the subject the one
+/// after — which is the order the structure fixes, and cheaper than counting
+/// fields through an optional version wrapper.
+fn split_names(der: bytes, nodes: [DerNode]) -> (str, str) {
+    var before: [i64] = []
+    var after: [i64] = []
+    var seen_time = false
+    for i in 0..nodes.len() {
+        let n = nodes[i]
+        if n.tag == asn1.UTC_TIME or n.tag == asn1.GENERALIZED_TIME {
+            seen_time = true
+            continue
+        }
+        if n.tag == asn1.SET and n.depth == 3 {
+            if seen_time {
+                after.push(i)
+            } else {
+                before.push(i)
+            }
+        }
+    }
+    return (join_names(der, nodes, before), join_names(der, nodes, after))
+}
+
+/// The extensions that decide trust, found by their OIDs: whether it is a CA,
+/// its path length, its key usage, its names, and the signature algorithm.
+fn read_extensions(der: bytes, nodes: [DerNode]) -> (bool, i64, i64, [str], [str], str) {
+    var is_ca = false
+    var path_length = 0 - 1
+    var usage = 0
+    var dns: [str] = []
+    var ips: [str] = []
+    var algorithm = ""
+    for i in 0..nodes.len() {
+        if nodes[i].tag != asn1.OID {
+            continue
+        }
+        let oid = asn1.oid_of(der, nodes[i])
+        if oid == oid_basic_constraints() {
+            let found = read_basic_constraints(der, nodes, i)
+            is_ca = found.0
+            path_length = found.1
+        } else if oid == oid_key_usage() {
+            usage = read_key_usage(der, nodes, i)
+        } else if oid == oid_subject_alt_name() {
+            let found = read_alt_names(der, nodes, i)
+            dns = found.0
+            ips = found.1
+        } else if algorithm == "" and oid.starts_with("1.2.840.113549.1.1") {
+            algorithm = oid
+        } else if algorithm == "" and oid.starts_with("1.2.840.10045.4") {
+            algorithm = oid
+        }
+    }
+    return (is_ca, path_length, usage, dns, ips, algorithm)
+}
+
+/// Read the fields a path check needs.
+///
+/// Deliberately not a full X.509 parser: it reads the extensions that decide
+/// trust and skips the rest, and says so rather than pretending to understand
+/// a certificate completely.
+pub fn parse(der: bytes) -> CertFacts ! ChainError {
+    match asn1.parse(der) {
+        Ok(nodes) -> {
+            if nodes.len() < 2 or nodes[0].tag != asn1.SEQUENCE {
+                fail(NotACertificate("not a SEQUENCE"))
+            }
+            let top = asn1.children(nodes, 0)
+            if top.len() < 3 {
+                fail(NotACertificate("a certificate has three fields"))
+            }
+            let tbs = top[0]
+            var serial = ""
+            var subject = ""
+            var issuer = ""
+            var not_before = 0
+            var not_after = 0
+            var is_ca = false
+            var path_length = 0 - 1
+            var usage = 0
+            var dns: [str] = []
+            var ips: [str] = []
+            var algorithm = ""
+            // The two times are the only UTCTime or GeneralizedTime nodes in
+            // the certificate, in order.
+            var times: [i64] = []
+            var names: [i64] = []
+            for i in 0..nodes.len() {
+                let n = nodes[i]
+                if n.tag == asn1.UTC_TIME or n.tag == asn1.GENERALIZED_TIME {
+                    times.push(parse_time(asn1.text_of(der, n)))
+                }
+                if n.tag == asn1.SEQUENCE and n.depth == 2 and
+                n.at > tbs.body and serial != "" {
+                    names.push(i)
+                }
+                if n.tag == asn1.INTEGER and serial == "" and n.depth >= 2 {
+                    serial = hex_of(der, n)
+                }
+            }
+            if times.len() >= 2 {
+                not_before = times[0]
+                not_after = times[1]
+            }
+            let names_split = split_names(der, nodes)
+            issuer = names_split.0
+            subject = names_split.1
+            let extensions = read_extensions(der, nodes)
+            is_ca = extensions.0
+            path_length = extensions.1
+            usage = extensions.2
+            dns = extensions.3
+            ips = extensions.4
+            algorithm = extensions.5
+            var signature = bytes_of([])
+            let last = top[top.len() - 1]
+            if last.tag == asn1.BIT_STRING and last.len > 1 {
+                signature = der.slice(last.body + 1, last.len - 1)
+            }
+            return CertFacts{
+                der: der, tbs_at: tbs.at, tbs_len: tbs.body + tbs.len - tbs.at,
+                subject: subject, issuer: issuer, not_before: not_before,
+                not_after: not_after, is_ca: is_ca, path_length: path_length,
+                key_usage: usage, dns_names: dns, ip_names: ips,
+                serial: serial, signature_algorithm: algorithm,
+                signature: signature,
+            }
+        }
+        Err(_e) -> fail(NotACertificate("not DER"))
+    }
+}
+
+fn join_names(der: bytes, nodes: [DerNode], sets: [i64]) -> str {
+    var parts: [str] = []
+    for i in sets {
+        var k = i + 1
+        while k < nodes.len() and nodes[k].depth > nodes[i].depth {
+            let n = nodes[k]
+            if n.tag == asn1.PRINTABLE_STRING or n.tag == asn1.UTF8_STRING or
+            n.tag == asn1.IA5_STRING{
+                parts.push(asn1.text_of(der, n).trim().to_lower())
+            }
+            k = k + 1
+        }
+    }
+    return parts.join(",")
+}
+
+fn read_basic_constraints(der: bytes, nodes: [DerNode], at: i64) -> (bool, i64) {
+    var is_ca = false
+    var path = 0 - 1
+    var i = at + 1
+    // The extension's value is an OCTET STRING holding a DER SEQUENCE.
+    while i < nodes.len() and i < at + 8 {
+        let n = nodes[i]
+        if n.tag == asn1.OCTET_STRING {
+            match asn1.parse(der.slice(n.body, n.len)) {
+                Ok(inner) -> {
+                    for k in 0..inner.len() {
+                        if inner[k].tag == asn1.BOOLEAN {
+                            is_ca = der.at(n.body + inner[k].body) != 0
+                        }
+                        if inner[k].tag == asn1.INTEGER {
+                            path = asn1.integer_of(der.slice(n.body, n.len),
+                                inner[k])
+                        }
+                    }
+                }
+                Err(_e) -> {}
+            }
+            return (is_ca, path)
+        }
+        i = i + 1
+    }
+    return (is_ca, path)
+}
+
+fn read_key_usage(der: bytes, nodes: [DerNode], at: i64) -> i64 {
+    var i = at + 1
+    while i < nodes.len() and i < at + 8 {
+        let n = nodes[i]
+        if n.tag == asn1.OCTET_STRING {
+            match asn1.parse(der.slice(n.body, n.len)) {
+                Ok(inner) -> {
+                    for k in 0..inner.len() {
+                        if inner[k].tag == asn1.BIT_STRING and inner[k].len >= 2 {
+                            return der.at(n.body + inner[k].body + 1)
+                        }
+                    }
+                }
+                Err(_e) -> {}
+            }
+            return 0
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+fn read_alt_names(der: bytes, nodes: [DerNode], at: i64) -> ([str], [str]) {
+    var dns: [str] = []
+    var ips: [str] = []
+    var i = at + 1
+    while i < nodes.len() and i < at + 8 {
+        let n = nodes[i]
+        if n.tag == asn1.OCTET_STRING {
+            let body = der.slice(n.body, n.len)
+            match asn1.parse(body) {
+                Ok(inner) -> {
+                    for k in 0..inner.len() {
+                        // Context tag 2 is dNSName, 7 is iPAddress.
+                        if inner[k].tag == 130 {
+                            dns.push(body.slice(inner[k].body, inner[k].len).to_str())
+                        } else if inner[k].tag == 135 {
+                            ips.push(address_of(body, inner[k]))
+                        }
+                    }
+                }
+                Err(_e) -> {}
+            }
+            return (dns, ips)
+        }
+        i = i + 1
+    }
+    return (dns, ips)
+}
+
+fn address_of(der: bytes, n: DerNode) -> str {
+    if n.len == 4 {
+        return "{der.at(n.body)}.{der.at(n.body + 1)}." +
+        "{der.at(n.body + 2)}.{der.at(n.body + 3)}"
+    }
+    var parts: [str] = []
+    var i = 0
+    while i + 1 < n.len {
+        let v = der.at(n.body + i) * 256 + der.at(n.body + i + 1)
+        parts.push(v.to_base(16))
+        i = i + 2
+    }
+    return parts.join(":")
+}
+
+/// The SubjectPublicKeyInfo, as DER.
+///
+/// What a signature verifier needs from the *issuer*, and the one field a
+/// caller cannot extract itself without another DER parse. It is the
+/// SEQUENCE inside the certificate that holds an AlgorithmIdentifier and a
+/// BIT STRING, and it is found by that shape rather than by counting fields:
+/// an optional version wrapper moves every index by one.
+pub fn public_key_der(c: CertFacts) -> bytes ! ChainError {
+    match asn1.parse(c.der) {
+        Ok(nodes) -> {
+            for i in 0..nodes.len() {
+                let n = nodes[i]
+                if n.tag != asn1.SEQUENCE or n.depth != 2 {
+                    continue
+                }
+                let parts = asn1.children(nodes, i)
+                if parts.len() == 2 and parts[0].tag == asn1.SEQUENCE and
+                parts[1].tag == asn1.BIT_STRING{
+                    return c.der.slice(n.at, n.body + n.len - n.at)
+                }
+            }
+            fail(NotACertificate("no SubjectPublicKeyInfo"))
+        }
+        Err(_e) -> fail(NotACertificate("not DER"))
+    }
+}
+
+pub fn is_self_signed(c: CertFacts) -> bool {
+    return c.subject != "" and c.subject == c.issuer
+}
+
+pub fn is_valid_at(c: CertFacts, now_seconds: i64) -> bool {
+    return now_seconds >= c.not_before and now_seconds <= c.not_after
+}
+
+pub fn has_usage(c: CertFacts, bit: i64) -> bool {
+    // An absent key-usage extension means every usage is allowed, which is
+    // what the standard says and what a check for a zero would get backwards.
+    if c.key_usage == 0 {
+        return true
+    }
+    return c.key_usage.bit_and(bit) != 0
+}
+
+pub fn may_sign_certificates(c: CertFacts) -> bool {
+    return c.is_ca and has_usage(c, KEY_CERT_SIGN)
+}
+
+/// Build the path from `leaf` up, using `pool` for intermediates and `roots`
+/// for the trusted end.
+///
+/// Returns the path leaf-first, root last. The order the server sent them in
+/// is not trusted: a chain is found by matching names, because servers send
+/// them out of order and with extras.
+pub fn build_path(leaf: CertFacts, pool: [CertFacts],
+    roots: [CertFacts]) -> [CertFacts] ! ChainError {
+    var path: [CertFacts] = [leaf]
+    var current = leaf
+    var seen: [str] = [leaf.subject]
+    // Ten is far beyond any real chain and stops a pool containing a loop
+    // from running forever.
+    for _step in 0..10 {
+        if is_self_signed(current) {
+            break
+        }
+        var found = false
+        for r in roots {
+            if r.subject == current.issuer {
+                path.push(r)
+                current = r
+                found = true
+                break
+            }
+        }
+        if found {
+            break
+        }
+        for c in pool {
+            if c.subject == current.issuer and not seen.contains(c.subject) {
+                path.push(c)
+                seen.push(c.subject)
+                current = c
+                found = true
+                break
+            }
+        }
+        if not found {
+            fail(NoPath(current.issuer))
+        }
+    }
+    return path
+}
+
+/// Whether the path ends at something the trust store holds.
+pub fn ends_at_root(path: [CertFacts], roots: [CertFacts]) -> bool {
+    if path.len() == 0 {
+        return false
+    }
+    let last = path[path.len() - 1]
+    for r in roots {
+        if r.subject == last.subject and r.serial == last.serial {
+            return true
+        }
+    }
+    return false
+}
+
+/// Every check that does not need a signature.
+///
+/// Separated because these are the ones a caller can run on a chain it has
+/// only parsed, and because a chain that fails them need never be verified.
+pub fn check_path(path: [CertFacts], roots: [CertFacts],
+    now_seconds: i64) -> () ! ChainError {
+    if path.len() == 0 {
+        fail(NoPath(""))
+    }
+    if not ends_at_root(path, roots) {
+        fail(UntrustedRoot(path[path.len() - 1].subject))
+    }
+    for c in path {
+        if now_seconds < c.not_before {
+            fail(NotYetValid(c.subject, c.not_before))
+        }
+        if now_seconds > c.not_after {
+            fail(Expired(c.subject, c.not_after))
+        }
+    }
+    // Every certificate above the leaf must be allowed to sign one, and its
+    // path length limits how many may sit below it.
+    for i in 1..path.len() {
+        let issuer = path[i]
+        if not issuer.is_ca {
+            fail(NotACa(issuer.subject))
+        }
+        if not has_usage(issuer, KEY_CERT_SIGN) {
+            fail(NotACa(issuer.subject))
+        }
+        if issuer.path_length >= 0 and i - 1 > issuer.path_length {
+            fail(PathTooLong(issuer.subject, issuer.path_length))
+        }
+    }
+    let leaf = path[0]
+    if leaf.is_ca == false and not has_usage(leaf, DIGITAL_SIGNATURE) and
+    not has_usage(leaf, KEY_ENCIPHERMENT) {
+        fail(NotACa(leaf.subject))
+    }
+}
+
+/// The whole verification: build, check, and verify each signature with the
+/// function the caller supplied.
+///
+/// `verify` is given the signed bytes, the signature, the algorithm OID and
+/// the issuer's DER — everything it needs to check one link — and answers
+/// true or false. Passing it in is what keeps this package free of any
+/// cryptography and lets a caller decide which algorithms it accepts.
+pub fn verify_chain(leaf: CertFacts, pool: [CertFacts], roots: [CertFacts],
+    now_seconds: i64,
+    verify: fn(bytes, bytes, str, bytes) -> bool) -> [CertFacts] ! ChainError {
+    let path = try build_path(leaf, pool, roots)
+    try check_path(path, roots, now_seconds)
+    for i in 0..(path.len() - 1) {
+        let subject = path[i]
+        let issuer = path[i + 1]
+        let signed = subject.der.slice(subject.tbs_at, subject.tbs_len)
+        if not verify(signed, subject.signature, subject.signature_algorithm,
+            issuer.der) {
+            fail(BadSignature(subject.subject))
+        }
+    }
+    return path
+}
+
+/// How long until the leaf expires, in days.
+pub fn days_until_expiry(c: CertFacts, now_seconds: i64) -> i64 {
+    return (c.not_after - now_seconds) / 86400
+}
+
+/// The certificate in the path that expires first.
+///
+/// Usually the leaf and occasionally not — an intermediate about to expire
+/// takes every certificate under it with it, and it is the one nobody is
+/// watching.
+pub fn first_to_expire(path: [CertFacts]) -> Option[CertFacts] {
+    if path.len() == 0 {
+        return None
+    }
+    var soonest = path[0]
+    for c in path {
+        if c.not_after < soonest.not_after {
+            soonest = c
+        }
+    }
+    return Some(soonest)
+}
+
+pub fn subjects(path: [CertFacts]) -> [str] {
+    var out: [str] = []
+    for c in path {
+        out.push(c.subject)
+    }
+    return out
+}

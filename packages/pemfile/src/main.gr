@@ -1,0 +1,294 @@
+// PEM: base64 between two dashed lines, and the rules that make it not quite
+// base64 between two dashed lines.
+//
+// It is how every certificate, key and certificate-signing request travels,
+// and the format's whole job is to survive being pasted into an email in
+// 1993. What that leaves behind:
+//
+//   - **A file holds many blocks.** A certificate chain is several
+//     `CERTIFICATE` blocks in one file, in order from leaf to root, and a
+//     reader that takes the first one verifies the leaf against nothing.
+//   - **Anything outside a block is ignored.** OpenSSL writes a
+//     human-readable dump above the block and every reader skips it, so a
+//     parser that refuses unrecognised lines refuses ordinary files.
+//   - **The label must match.** `-----BEGIN CERTIFICATE-----` closed by
+//     `-----END PRIVATE KEY-----` is not a block; accepting it means
+//     accepting a file that has been spliced.
+//   - **RFC 7468 says 64 characters a line.** Longer lines are read here,
+//     because they exist, but never written.
+//   - **Encrypted keys** carry `Proc-Type: 4,ENCRYPTED` headers. They are
+//     detected and reported rather than decoded: the body is not the key.
+
+type PemBlock = {
+    label: str,
+    /// The decoded bytes.
+    data: bytes,
+    /// Header lines, as written, for the encrypted-key case.
+    header_key: [str],
+    header_value: [str],
+}
+
+type PemError =
+    | NoBlock
+    | LabelMismatch(begin: str, end: str)
+    | Unterminated(label: str)
+    | NotBase64(line: i64)
+
+pub fn line_width() -> i64 {
+    return 64
+}
+
+fn alphabet() -> str {
+    return "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+}
+
+fn value_of(c: str) -> i64 {
+    let cs = alphabet().chars()
+    for i in 0..cs.len() {
+        if cs[i] == c {
+            return i
+        }
+    }
+    if c == "=" {
+        return 0 - 2
+    }
+    return 0 - 1
+}
+
+pub fn decode_base64(text: str) -> bytes ! PemError {
+    var out: [i64] = []
+    var acc = 0
+    var bits = 0
+    var index = 0
+    for c in text.chars() {
+        index = index + 1
+        if c == "\n" or c == "\r" or c == " " or c == "\t" {
+            continue
+        }
+        let v = value_of(c)
+        if v == 0 - 2 {
+            break
+        }
+        if v < 0 {
+            fail(NotBase64(index))
+        }
+        acc = acc * 64 + v
+        bits = bits + 6
+        if bits >= 8 {
+            bits = bits - 8
+            out.push(acc / (2 ^ bits) % 256)
+            acc = acc % (2 ^ bits)
+        }
+    }
+    return bytes_of(out)
+}
+
+pub fn encode_base64(data: bytes) -> str {
+    let a = alphabet().chars()
+    var out = ""
+    var i = 0
+    while i < data.len() {
+        let have = if data.len() - i < 3 { data.len() - i } else { 3 }
+        var acc = 0
+        for k in 0..3 {
+            acc = acc * 256 + (if i + k < data.len() { data.at(i + k) } else { 0 })
+        }
+        for k in 0..4 {
+            if k <= have {
+                out = out + a[acc / (2 ^ (18 - k * 6)) % 64]
+            } else {
+                out = out + "="
+            }
+        }
+        i = i + 3
+    }
+    return out
+}
+
+fn is_begin(line: str) -> bool {
+    return line.starts_with("-----BEGIN ") and line.ends_with("-----")
+}
+
+fn is_end(line: str) -> bool {
+    return line.starts_with("-----END ") and line.ends_with("-----")
+}
+
+fn label_of(line: str, prefix: i64) -> str {
+    return line.substr(prefix, line.len() - prefix - 5)
+}
+
+/// Every block in the file, in order.
+///
+/// Anything outside a block is skipped, because OpenSSL writes a
+/// human-readable dump above one and refusing that refuses ordinary files.
+pub fn parse(text: str) -> [PemBlock] ! PemError {
+    var out: [PemBlock] = []
+    let lines = text.lines()
+    var i = 0
+    while i < lines.len() {
+        let line = lines[i].trim()
+        if not is_begin(line) {
+            i = i + 1
+            continue
+        }
+        let label = label_of(line, 11)
+        var body = ""
+        var keys: [str] = []
+        var values: [str] = []
+        var closed = false
+        var reading_headers = true
+        i = i + 1
+        while i < lines.len() {
+            let inner = lines[i].trim()
+            if is_end(inner) {
+                let ending = label_of(inner, 9)
+                if ending != label {
+                    fail(LabelMismatch(label, ending))
+                }
+                closed = true
+                i = i + 1
+                break
+            }
+            if reading_headers {
+                if inner == "" {
+                    reading_headers = false
+                    i = i + 1
+                    continue
+                }
+                match inner.index_of(": ") {
+                    Some(at) -> {
+                        keys.push(inner.substr(0, at))
+                        values.push(inner.substr(at + 2, inner.len() - at - 2))
+                        i = i + 1
+                        continue
+                    }
+                    None -> reading_headers = false
+                }
+            }
+            body = body + inner
+            i = i + 1
+        }
+        if not closed {
+            fail(Unterminated(label))
+        }
+        out.push(PemBlock{
+            label: label, data: try decode_base64(body), header_key: keys,
+            header_value: values,
+        })
+    }
+    if out.len() == 0 {
+        fail(NoBlock)
+    }
+    return out
+}
+
+pub fn render(b: PemBlock) -> str {
+    var out = "-----BEGIN {b.label}-----\n"
+    for i in 0..b.header_key.len() {
+        out = out + b.header_key[i] + ": " + b.header_value[i] + "\n"
+    }
+    if b.header_key.len() > 0 {
+        out = out + "\n"
+    }
+    let body = encode_base64(b.data)
+    var at = 0
+    while at < body.len() {
+        let take = if body.len() - at < line_width() {
+            body.len() - at
+        } else {
+            line_width()
+        }
+        out = out + body.substr(at, take) + "\n"
+        at = at + take
+    }
+    return out + "-----END {b.label}-----\n"
+}
+
+pub fn render_all(blocks: [PemBlock]) -> str {
+    var out = ""
+    for b in blocks {
+        out = out + render(b)
+    }
+    return out
+}
+
+pub fn block(label: str, data: bytes) -> PemBlock {
+    return PemBlock{
+        label: label, data: data, header_key: [], header_value: [],
+    }
+}
+
+/// The blocks with a given label — the certificates in a chain file.
+pub fn with_label(blocks: [PemBlock], label: str) -> [PemBlock] {
+    var out: [PemBlock] = []
+    for b in blocks {
+        if b.label == label {
+            out.push(b)
+        }
+    }
+    return out
+}
+
+pub fn labels(blocks: [PemBlock]) -> [str] {
+    var out: [str] = []
+    for b in blocks {
+        out.push(b.label)
+    }
+    return out
+}
+
+/// Every certificate in a file, as DER — what a chain builder is handed.
+pub fn certificates(text: str) -> [bytes] ! PemError {
+    var out: [bytes] = []
+    for b in try parse(text) {
+        if b.label == "CERTIFICATE" or b.label == "X509 CERTIFICATE" {
+            out.push(b.data)
+        }
+    }
+    return out
+}
+
+/// Whether a block is an encrypted private key.
+///
+/// Reported rather than decoded: the body is not the key, and handing it to a
+/// key parser produces a confusing failure a long way from the cause.
+pub fn is_encrypted(b: PemBlock) -> bool {
+    for i in 0..b.header_key.len() {
+        if b.header_key[i] == "Proc-Type" and b.header_value[i].contains("ENCRYPTED") {
+            return true
+        }
+    }
+    // The modern form says so in the label itself.
+    return b.label == "ENCRYPTED PRIVATE KEY"
+}
+
+pub fn is_private_key(b: PemBlock) -> bool {
+    return b.label.contains("PRIVATE KEY")
+}
+
+/// Whether a file contains a private key at all.
+///
+/// The check before a file is logged, attached or committed: a certificate is
+/// public and a key is not, and they look identical from a distance.
+pub fn contains_private_key(text: str) -> bool {
+    match parse(text) {
+        Ok(blocks) -> {
+            for b in blocks {
+                if is_private_key(b) {
+                    return true
+                }
+            }
+            return false
+        }
+        Err(_e) -> return text.contains("PRIVATE KEY")
+    }
+}
+
+pub fn header(b: PemBlock, key: str) -> Option[str] {
+    for i in 0..b.header_key.len() {
+        if b.header_key[i] == key {
+            return Some(b.header_value[i])
+        }
+    }
+    return None
+}

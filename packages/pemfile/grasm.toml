@@ -1,0 +1,6 @@
+[package]
+name = "pemfile"
+version = "1.0.0"
+
+# PEM blocks, in and out. Opens nothing.
+capabilities = []

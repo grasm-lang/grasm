@@ -1,0 +1,493 @@
+// The half of TLS that is not cryptography, and the half that is.
+//
+// `docs/ecosystem-roadmap.md` names a TLS client as the thing blocking about
+// 120 packages, and lists what was missing: chain building and a trust store,
+// RSA signature verification, hostname verification, expiry checks. This is
+// those four, and every certificate below was produced by an outside
+// implementation rather than by anything here.
+//
+// What is still missing is the handshake over a socket, which cannot be
+// asserted against without a server to talk to. The parts that *can* be
+// checked offline are checked offline, exactly.
+import rsa
+import pemfile
+import hostmatch
+import certchain
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn root_pem() -> str {
+    return "-----BEGIN CERTIFICATE-----\n" +
+    "MIIC/zCCAeegAwIBAgIBATANBgkqhkiG9w0BAQsFADAvMRgwFgYDVQQDDA9HcmFz\n" +
+    "bSBUZXN0IFJvb3QxEzARBgNVBAoMCkdyYXNtIFRlc3QwHhcNMjYwMTAxMDAwMDAw\n" +
+    "WhcNMzUxMjMwMDAwMDAwWjAvMRgwFgYDVQQDDA9HcmFzbSBUZXN0IFJvb3QxEzAR\n" +
+    "BgNVBAoMCkdyYXNtIFRlc3QwggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIB\n" +
+    "AQD3iPniVGLRtOnuEjzed8b77UfDSNOTvUKvJxNTxGgtY01EwRtZIeUthWzuzUcd\n" +
+    "3izOwDCELRMoBy46XTvztbVCnjFSd0w4oGSmHfv2bAss4UAdJ7QdA5ut7yNDYIH3\n" +
+    "jD8m/ATA/fe3ORH+GMwxiRbxcOkrI2iJTXHJskbIvj2l4Wkl3nG96tKN4JXIfy3i\n" +
+    "WWukE6LL3dBFY8MzP1zQi/aExkCnHdrxIv+rgjRHAqiFzbb7FyIVG3VDgPH0gJNO\n" +
+    "+6M8pSQVhU50nSEnTBbvJpBCDHwqKLzgBQ39Oh8Tb6VDbZAOANjKUftXPfyOwati\n" +
+    "JZmjO6mCn6kX4N3nbFKccT0tAgMBAAGjJjAkMBIGA1UdEwEB/wQIMAYBAf8CAQEw\n" +
+    "DgYDVR0PAQH/BAQDAgEGMA0GCSqGSIb3DQEBCwUAA4IBAQCW7f2erMF9YHmIslAR\n" +
+    "sUpgYt1K7MTkbauaVkwhUZykOeyw0EMIzT9ChlQvuiDZ5BEfKPrz2R1mgD2TMofd\n" +
+    "vomv8Z9uYzAg1WaPys89HFzMHW7Cj7p260CRcbE2omIMKaSOmp9p4Zn1BAacSYZ7\n" +
+    "WFKYyW2MI+spvTY5lo/8CUZYc0Tr1sNAY/Rki5Uqm1JG11K5S7q5z+E2tq0y6gYB\n" +
+    "V6aTy1/XkI42AXNOn5Ws6WzNfoQvpFVk5K4uJY8Whv4qCy7AALD0OBhxwG/xUR8E\n" +
+    "GO7+j/4EwJW+8rA7KR6kOVSnfdWtiB01b4SYm9bTGKssyM3RoIxilnADHG5xRxXV\n" +
+    "vSbf\n" +
+    "-----END CERTIFICATE-----\n"
+}
+
+fn mid_pem() -> str {
+    return "-----BEGIN CERTIFICATE-----\n" +
+    "MIIDBzCCAe+gAwIBAgIBAjANBgkqhkiG9w0BAQsFADAvMRgwFgYDVQQDDA9HcmFz\n" +
+    "bSBUZXN0IFJvb3QxEzARBgNVBAoMCkdyYXNtIFRlc3QwHhcNMjYwMTAxMDAwMDAw\n" +
+    "WhcNMzAxMjMxMDAwMDAwWjA3MSAwHgYDVQQDDBdHcmFzbSBUZXN0IEludGVybWVk\n" +
+    "aWF0ZTETMBEGA1UECgwKR3Jhc20gVGVzdDCCASIwDQYJKoZIhvcNAQEBBQADggEP\n" +
+    "ADCCAQoCggEBAKla8vcCrF3Jc++ls0Kl47DjZCJO0raeXWkCSu0A72revmf3K+Ag\n" +
+    "48JViQJdTl6U3+MrEPwFMi6ssqACHlFOAuH8CCwZlLRguTfP+8ImA55+VOjyB609\n" +
+    "jbSdsHbDr0OJq3UF3lMlgbI7tLFLBC0bxe4n4994vSklX1BK05h2+kQQAqAt9G2r\n" +
+    "xIMi04g0G01h/letu1GaBXVGOP5/QGrBwe16jhjDJFSZ/M8HwoShfziLRvyJiVMA\n" +
+    "r7TcW8IMxI5Ou6mGGfmdqG3Q7FAeMjOiPPtFnzHLsnMml4K+CgrUiDNNKdAn3Xo9\n" +
+    "4a9xV48UTCZ2hzqrXEjOkpZUhi6XC3c9mH0CAwEAAaMmMCQwEgYDVR0TAQH/BAgw\n" +
+    "BgEB/wIBADAOBgNVHQ8BAf8EBAMCAQYwDQYJKoZIhvcNAQELBQADggEBADTllk81\n" +
+    "CS31nSQiRf0xUME8Pv7m22jfI+6uUt9L9nzOY3/EjLQqxQsy81j2blHQRWpD2liG\n" +
+    "o9gcVArzhO5LntwbDl8pACy9JI7WFJatL2J0444AVhBb52BjoFY1KBPqS5wqp/Kz\n" +
+    "V1AYBbAr0euCSRyFhJFG0SP75kBneIZALo9saKsvtkN9mbkSf3Aspp/j4qsXbfnV\n" +
+    "zDO9XrRVGYkfoXfDXtTitbKrvpOkFovBfxBLOMweTa96C86WF0H8egLj8esoGX0X\n" +
+    "AIyhVXJueej3J74Bvsn59v60NcdjiNmCxlmwcmXvf8mwYUMx8NNGSfblPhqPI+xN\n" +
+    "1rsUZZIPS50zQU8=\n" +
+    "-----END CERTIFICATE-----\n"
+}
+
+fn leaf_pem() -> str {
+    return "-----BEGIN CERTIFICATE-----\n" +
+    "MIIDQTCCAimgAwIBAgIBAzANBgkqhkiG9w0BAQsFADA3MSAwHgYDVQQDDBdHcmFz\n" +
+    "bSBUZXN0IEludGVybWVkaWF0ZTETMBEGA1UECgwKR3Jhc20gVGVzdDAeFw0yNjAx\n" +
+    "MDEwMDAwMDBaFw0yNjA0MDEwMDAwMDBaMDQxHTAbBgNVBAMMFHNlcnZpY2UuZXhh\n" +
+    "bXBsZS50ZXN0MRMwEQYDVQQKDApHcmFzbSBUZXN0MIIBIjANBgkqhkiG9w0BAQEF\n" +
+    "AAOCAQ8AMIIBCgKCAQEA1vNtDhe7oDrNwzcZ4KEw0TF1FE+HuptaaaJOIKlu87/6\n" +
+    "3NXsOzUoPdoKIj69hbDUsC1/9KBFLVXGnZ1VCjVzrImOgKyDuYqwm/YFhNNsu72J\n" +
+    "XGbHtXjxZLdtFgXUZBJDyjmLwHbfKUPqjlT+Wn6D5ZHtX7huw73BgSqzwDQs3O3v\n" +
+    "v3JuIOfHo8v1NnNsj+8j/RmcOU+gK7iN2LU/ZnB5LSYr3HKt3xgQLQBpdRX8Si/c\n" +
+    "dTX6jj+N0nd+toLiy9dVmCOeC5N6HGkVLyiZvG7XqiiS9DUQtJhVTjZw+4kZbkBK\n" +
+    "yWbEuVMo0ghXQMK91wpzHo/6WhFZri2NWBtBUSXEvQIDAQABo1swWTAMBgNVHRMB\n" +
+    "Af8EAjAAMA4GA1UdDwEB/wQEAwIFoDA5BgNVHREEMjAwghRzZXJ2aWNlLmV4YW1w\n" +
+    "bGUudGVzdIISKi5hcGkuZXhhbXBsZS50ZXN0hwQKAQIDMA0GCSqGSIb3DQEBCwUA\n" +
+    "A4IBAQBJMAal9zUYacA0Aj6SEKUKlj4Iu2nQBTg5UlQpQ59Q9ExcrONLhK25imwg\n" +
+    "cGiLz7ikMqzB8swuCnjqW+koapnzLvZiPiIk4EoTHDRAtmuBj10bttsOIabzXVGf\n" +
+    "EvqFCtfm+USClUkP8BVGE9P7NrKqm3TgHREPkQHysf4pcmUYc7iIE2qxxOw11j8D\n" +
+    "XgJssGI5MFE7MLarXULGWxowr1LptmTSwmKkd2DqXs+SwHzyF2v8MTsIIjm8CuSc\n" +
+    "kU6g57eUsrdUbnxneYxFkt5A/8JhXcZM655I6Xf9hThaBX2qge7OOAKOa1UZG6HO\n" +
+    "gMvmjrhcwY+E0ANMDp7y3VSvvAim\n" +
+    "-----END CERTIFICATE-----\n"
+}
+
+fn expired_pem() -> str {
+    return "-----BEGIN CERTIFICATE-----\n" +
+    "MIIC8jCCAdqgAwIBAgIBBDANBgkqhkiG9w0BAQsFADA3MSAwHgYDVQQDDBdHcmFz\n" +
+    "bSBUZXN0IEludGVybWVkaWF0ZTETMBEGA1UECgwKR3Jhc20gVGVzdDAeFw0yMDAx\n" +
+    "MDEwMDAwMDBaFw0yMTAxMDEwMDAwMDBaMDAxGTAXBgNVBAMMEG9sZC5leGFtcGxl\n" +
+    "LnRlc3QxEzARBgNVBAoMCkdyYXNtIFRlc3QwggEiMA0GCSqGSIb3DQEBAQUAA4IB\n" +
+    "DwAwggEKAoIBAQDW820OF7ugOs3DNxngoTDRMXUUT4e6m1ppok4gqW7zv/rc1ew7\n" +
+    "NSg92goiPr2FsNSwLX/0oEUtVcadnVUKNXOsiY6ArIO5irCb9gWE02y7vYlcZse1\n" +
+    "ePFkt20WBdRkEkPKOYvAdt8pQ+qOVP5afoPlke1fuG7DvcGBKrPANCzc7e+/cm4g\n" +
+    "58ejy/U2c2yP7yP9GZw5T6AruI3YtT9mcHktJivccq3fGBAtAGl1FfxKL9x1NfqO\n" +
+    "P43Sd362guLL11WYI54Lk3ocaRUvKJm8bteqKJL0NRC0mFVONnD7iRluQErJZsS5\n" +
+    "UyjSCFdAwr3XCnMej/paEVmuLY1YG0FRJcS9AgMBAAGjEDAOMAwGA1UdEwEB/wQC\n" +
+    "MAAwDQYJKoZIhvcNAQELBQADggEBACfLPm3i29J0ohl3zQZ/wWQmsQmWfXbtFpn0\n" +
+    "ogqSCu/Byq+LfxArEJLB1JyD2UNztBtmybZtSPGAHvc8+QQsVR/HAWpT8JV73A+d\n" +
+    "4EKbmL04YszwhAMmj3ByrsFKTFyJq792fOX88RBqxwrWOeFGXVjL4F9LHT6RbAQJ\n" +
+    "HgNEW3dzm9JSwQ73dUaX9gq7YcwpqqR+3MitI6kZYKpMR7OW8V24tiLdzmAuT280\n" +
+    "MOAPHtrnnb/GZ53KU5wY1OFaj24j4uwWeu8n+5oXVCkTonhYUgCqhaPU1l5rgRIO\n" +
+    "rqT+AJc2Tt0W0P7qLvS2waZOcclr3FJAd2JFG0OG8x2jEKax+9E=\n" +
+    "-----END CERTIFICATE-----\n"
+}
+
+/// A 2048-bit public key, and a message with two signatures over it — one
+/// PKCS#1 v1.5 and one PSS, both produced by an outside implementation.
+fn key_spki_base64() -> str {
+    return "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA1Pv28rihidkpG3uzkI10" +
+    "GVRojLISPms0ooVdaoye3/Z4iAa/SAaIBseAj1xtDt/ArPanp9bOYpc+cR+hPfZf" +
+    "IVh5iRktQJxi0TRcF+4rUBJoX1Ibsta5/1Oj4dB3RMdFUJZX04Rz/76309yMZai5" +
+    "/ypny9cuV+BEDifetqUWZkYyd9o6d6fWxkRZU8RNKuA+0Xrw92L4x4Sw090teqce" +
+    "hKS76NiI6MHrrP5bo9gX3p77dWQQ8YN6dLgNVUwHz/Cg6zg2qrjaXfNYtHcqNuFw" +
+    "CiD/FWoUcWnt1byYtMFfb2u56P+2SJ2c6ewQDuVNwcxrASOIpnKu5qaxqGJwEXiN" +
+    "YwIDAQAB"
+}
+
+fn signed_message() -> str {
+    return "the message that was signed\n"
+}
+
+fn pkcs1_signature_base64() -> str {
+    return "aC6nr7ZVk9a4D07Li4dDVWCUq2qHM6WBdVqw2IJfRxKJ4U9jxNcWN5EcKJMriuuS" +
+    "YsSSFdYxg0ZgS0v72++v2yEdDrT3KDX4EnHWJ6oMVw2WpDgdFpZPs+bpGwFFo4zn" +
+    "eVkekB5GiZVejLrlQkjk/qC83QlEujq4wq87TknV4rc853IsiRpD4vVcOn3ADaGK" +
+    "FuMyPKUgAnPtqy0DKtHwsPviSjFo3oD07B5wXK5u/QK2Kyq0gotvRoW1kt3T8vTn" +
+    "HnU6UWw/LR0TTfLfa6OFyJ/nKF/MRB++qIg8ZniBFTGF2kDLd21u2sjRrewGRstS" +
+    "G8U2SZTeP5rzhHzjoESaWA=="
+}
+
+fn pss_signature_base64() -> str {
+    return "qw2+Po+B3BCPzyooDltXrvtkpD12o7sp6maj1u8/WVm63dtZArj4jPIiEeHajxN4" +
+    "OhYf3GuAJebxeDFvpb3aWtaoXrcb/vQ5waq6yU2GovwcAfGV/qX4Y5DQz6xBYd65" +
+    "CfItUNNejZOmgzrEC0FwTicAH7DGuSRkyVJQs5IkyA4fP7/nHSsUSwpWRtg+cIWH" +
+    "IRvq6Tj5gGKZKN5xyPcSW4MFv6VVv98rzJGF2jyKfAkYKzNhcwVWAqzvtnp0zZpj" +
+    "P3hEJPl4rQON48FfUiZxRIa8MC5uU8kOklZetQxPtxHbcoozAQuAWsORHnCv4ZBq" +
+    "AicieeTN+iniEqf1kJk2sw=="
+}
+
+fn from_base64(text: str) -> bytes {
+    return pemfile.decode_base64(text) ?? "".to_bytes()
+}
+
+fn blank_cert() -> CertFacts {
+    return CertFacts{
+        der: "".to_bytes(), tbs_at: 0, tbs_len: 0, subject: "", issuer: "",
+        not_before: 0, not_after: 0, is_ca: false, path_length: 0 - 1,
+        key_usage: 0, dns_names: [], ip_names: [], serial: "",
+        signature_algorithm: "", signature: "".to_bytes(),
+    }
+}
+
+fn cert_of(text: str) -> CertFacts {
+    let ders = pemfile.certificates(text) ?? []
+    if ders.len() == 0 {
+        return blank_cert()
+    }
+    return certchain.parse(ders[0]) ?? blank_cert()
+}
+
+/// The verifier the chain checker is handed.
+///
+/// Passing it in is what keeps `certchain` free of any cryptography, and what
+/// lets this decide which algorithms are acceptable — SHA-1 is refused here,
+/// and nothing in the chain checker had to know that.
+fn verify_rsa(signed: bytes, signature: bytes, algorithm: str,
+    issuer_der: bytes) -> bool {
+    if rsa.is_deprecated_oid(algorithm) {
+        return false
+    }
+    match certchain.parse(issuer_der) {
+        Ok(issuer) -> {
+            match certchain.public_key_der(issuer) {
+                Ok(spki) -> {
+                    match rsa.parse_spki(spki) {
+                        Ok(k) -> {
+                            if not rsa.is_strong_enough(k) {
+                                return false
+                            }
+                            return rsa.verify_by_oid(k, algorithm, signed,
+                                signature)
+                        }
+                        Err(_e) -> return false
+                    }
+                }
+                Err(_e) -> return false
+            }
+        }
+        Err(_e) -> return false
+    }
+}
+
+fn pem_refuses(text: str) -> bool {
+    match pemfile.parse(text) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn key_refuses(modulus: bytes, exponent: bytes) -> bool {
+    match rsa.key_from_bytes(modulus, exponent) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn wildcard_refused(pattern: str) -> bool {
+    match hostmatch.check_wildcard(pattern) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn host_refuses(dns: [str], ips: [str], common: str, host: str) -> bool {
+    match hostmatch.verify(dns, ips, common, host) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn host_accepts(dns: [str], ips: [str], common: str, host: str) -> bool {
+    match hostmatch.verify(dns, ips, common, host) {
+        Ok(v) -> return v
+        Err(_e) -> return false
+    }
+}
+
+fn path_refuses(leaf: CertFacts, pool: [CertFacts], roots: [CertFacts]) -> bool {
+    match certchain.build_path(leaf, pool, roots) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn chain_refuses(leaf: CertFacts, pool: [CertFacts], roots: [CertFacts],
+    now: i64) -> bool {
+    match certchain.verify_chain(leaf, pool, roots, now, verify_rsa) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn check_pemfile(inout f: i64) / {io} {
+    print("-- pemfile: a chain file is several blocks, not one")
+    let blocks = pemfile.parse(leaf_pem()) ?? []
+    say(f, "a block is found", blocks.len() == 1)
+    say(f, "with its label", blocks[0].label == "CERTIFICATE")
+    say(f, "and DER inside, which begins with a SEQUENCE",
+        blocks[0].data.at(0) == 48)
+    // The failure a reader that takes the first block makes.
+    let chain = leaf_pem() + mid_pem() + root_pem()
+    say(f, "a chain file holds three", (pemfile.parse(chain) ?? []).len() == 3)
+    say(f, "and certificates() returns all of them",
+        (pemfile.certificates(chain) ?? []).len() == 3)
+    say(f, "text around a block is ignored, as OpenSSL writes it",
+        (pemfile.certificates("Certificate:\n  Data:\n" + leaf_pem()) ?? []).len() == 1)
+    say(f, "a block re-encodes to the same bytes",
+        (pemfile.parse(pemfile.render(blocks[0])) ?? [])[0].data ==
+        blocks[0].data)
+    say(f, "rendering wraps at 64 characters",
+        pemfile.render(blocks[0]).lines()[1].len() == pemfile.line_width())
+    say(f, "a block closed with a different label is refused",
+        pem_refuses("-----BEGIN CERTIFICATE-----\nAA==\n" +
+            "-----END PRIVATE KEY-----\n"))
+    say(f, "an unterminated block is refused",
+        pem_refuses("-----BEGIN CERTIFICATE-----\nAA==\n"))
+    say(f, "a file with no block at all is refused",
+        pem_refuses("nothing here"))
+    // The check before a file is logged or attached.
+    say(f, "a private key in a file is detectable",
+        pemfile.contains_private_key("-----BEGIN PRIVATE KEY-----\nAA==\n" +
+            "-----END PRIVATE KEY-----\n"))
+    say(f, "and a certificate is not one",
+        not pemfile.contains_private_key(leaf_pem()))
+    say(f, "an encrypted key says so", pemfile.is_encrypted(
+        (pemfile.parse("-----BEGIN RSA PRIVATE KEY-----\n" +
+            "Proc-Type: 4,ENCRYPTED\nDEK-Info: AES-128-CBC,0\n\nAA==\n" +
+            "-----END RSA PRIVATE KEY-----\n") ?? [])[0]))
+    let sample = bytes_of([1, 2, 3, 4, 5])
+    say(f, "base64 round-trips through both directions",
+        (pemfile.decode_base64(pemfile.encode_base64(sample)) ??
+            "".to_bytes()) == sample)
+}
+
+fn check_rsa(inout f: i64) / {io} {
+    print("-- rsa: verification, and the forgery a search would accept")
+    let spki = from_base64(key_spki_base64())
+    var key = rsa.no_key()
+    match rsa.parse_spki(spki) {
+        Ok(k) -> key = k
+        Err(_e) -> print("  the embedded key did not parse")
+    }
+    say(f, "the key is 2048 bits", rsa.bits_of(key) == 2048)
+    say(f, "which is 256 bytes", rsa.size_of(key) == 256)
+    say(f, "and strong enough for a current policy", rsa.is_strong_enough(key))
+    let message = signed_message().to_bytes()
+    let pkcs1 = from_base64(pkcs1_signature_base64())
+    let pss = from_base64(pss_signature_base64())
+    say(f, "a PKCS#1 v1.5 signature made elsewhere verifies",
+        rsa.verify_pkcs1(key, rsa.SHA256, message, pkcs1))
+    say(f, "and a PSS one", rsa.verify_pss(key, rsa.SHA256, message, pss, 32))
+    say(f, "a changed message does not",
+        not rsa.verify_pkcs1(key, rsa.SHA256, (signed_message() + "x").to_bytes(),
+            pkcs1))
+    say(f, "nor a changed signature",
+        not rsa.verify_pkcs1(key, rsa.SHA256, message, flip(pkcs1, 10)))
+    say(f, "nor a PSS signature checked as PKCS#1",
+        not rsa.verify_pkcs1(key, rsa.SHA256, message, pss))
+    // The whole encoded block is rebuilt and compared, which is what makes
+    // Bleichenbacher's forgery impossible here.
+    let want = rsa.expected_pkcs1(key, rsa.SHA256, message) ?? "".to_bytes()
+    say(f, "the expected block is the size of the modulus",
+        want.len() == rsa.size_of(key))
+    say(f, "and starts 00 01", want.at(0) == 0 and want.at(1) == 1)
+    say(f, "with at least eight padding bytes of 0xFF",
+        want.at(2) == 255 and want.at(9) == 255)
+    // The separator sits immediately before the 19-byte DigestInfo prefix
+    // and the 32-byte digest, so 52 from the end.
+    say(f, "and a zero before the digest info",
+        want.at(want.len() - 52) == 0)
+    say(f, "a signature of the wrong length is refused",
+        not rsa.verify_pkcs1(key, rsa.SHA256, message, pkcs1.slice(0, 255)))
+    say(f, "an even modulus is not a key",
+        key_refuses(bytes_of([2, 0]), bytes_of([3])))
+    say(f, "and neither is an exponent of one",
+        key_refuses(bytes_of([255, 255]), bytes_of([1])))
+    say(f, "the signature OIDs map to hashes",
+        rsa.hash_for_oid("1.2.840.113549.1.1.11") == rsa.SHA256 and
+        rsa.hash_for_oid("1.2.840.113549.1.1.13") == rsa.SHA512)
+    say(f, "and PSS's OID names no hash, because its parameters do",
+        rsa.hash_for_oid("1.2.840.113549.1.1.10") == "")
+    say(f, "SHA-1 and MD5 signatures are marked deprecated",
+        rsa.is_deprecated_oid("1.2.840.113549.1.1.5") and
+        rsa.is_deprecated_oid("1.2.840.113549.1.1.4"))
+    say(f, "and SHA-256 is not", not rsa.is_deprecated_oid("1.2.840.113549.1.1.11"))
+}
+
+fn flip(data: bytes, at: i64) -> bytes {
+    var raw = data.to_list()
+    raw[at] = raw[at].bit_xor(1)
+    return bytes_of(raw)
+}
+
+fn check_hostmatch(inout f: i64) / {io} {
+    print("-- hostmatch: every wildcard rule is a fixed vulnerability")
+    say(f, "an exact name matches", hostmatch.matches("example.com", "example.com"))
+    say(f, "case and a trailing dot do not matter",
+        hostmatch.matches("Example.COM.", "example.com"))
+    say(f, "a different name does not match",
+        not hostmatch.matches("example.com", "example.org"))
+    // One label, leftmost only.
+    say(f, "a wildcard covers one label",
+        hostmatch.matches("*.example.com", "a.example.com"))
+    say(f, "and not two", not hostmatch.matches("*.example.com", "a.b.example.com"))
+    say(f, "and not the bare domain",
+        not hostmatch.matches("*.example.com", "example.com"))
+    say(f, "a wildcard anywhere but the front is not one",
+        not hostmatch.matches("a.*.com", "a.b.com"))
+    say(f, "a partial wildcard is refused",
+        not hostmatch.matches("w*.example.com", "www.example.com"))
+    say(f, "and `*` alone would match everything, so it is refused",
+        not hostmatch.matches("*", "anything.com"))
+    say(f, "as would `*.com`", not hostmatch.matches("*.com", "example.com"))
+    say(f, "and the reason is reported", wildcard_refused("*.com"))
+    // Addresses are matched against address entries, never names.
+    say(f, "an IPv4 address is recognised as one",
+        hostmatch.is_ipv4("10.1.2.3") and not hostmatch.is_ipv4("10.1.2"))
+    say(f, "a leading zero is refused, because parsers disagree about it",
+        not hostmatch.is_ipv4("010.1.2.3"))
+    say(f, "IPv6 too", hostmatch.is_ipv6("::1") and
+        hostmatch.is_ipv6("[2001:db8::1]"))
+    say(f, "an address matches an address entry",
+        host_accepts([], ["10.1.2.3"], "", "10.1.2.3"))
+    say(f, "and never a name entry, however the name reads",
+        not host_accepts(["10.1.2.3"], [], "", "10.1.2.3"))
+    // The Common Name is taken and ignored, on purpose.
+    say(f, "the Common Name is not consulted",
+        not host_accepts(["other.test"], [], "example.com", "example.com"))
+    say(f, "a certificate that names nothing is refused",
+        host_refuses([], [], "example.com", "example.com"))
+    say(f, "the explanation names the host and what was offered",
+        hostmatch.explain(["a.test"], [], "b.test").contains("b.test") and
+        hostmatch.explain(["a.test"], [], "b.test").contains("a.test"))
+    // The registrable domain, for the checks that need one.
+    let suffixes = ["com", "co.uk", "org"]
+    say(f, "the registrable domain skips the public suffix",
+        hostmatch.registrable_domain("a.b.example.co.uk", suffixes) ==
+        "example.co.uk")
+    say(f, "and two hosts under it are the same site",
+        hostmatch.same_site("a.example.com", "b.example.com", suffixes))
+    say(f, "while two different sites are not",
+        not hostmatch.same_site("a.example.com", "b.other.com", suffixes))
+    say(f, "a wildcard over a public suffix is too broad",
+        hostmatch.is_too_broad("*.co.uk", suffixes))
+}
+
+fn check_certchain(inout f: i64) / {io} {
+    print("-- certchain: a path, not a signature")
+    let root = cert_of(root_pem())
+    let mid = cert_of(mid_pem())
+    let leaf = cert_of(leaf_pem())
+    let expired = cert_of(expired_pem())
+    // 2026-02-02, inside every certificate's window but the expired one's.
+    let now = 1770000000
+    say(f, "the root is self-signed", certchain.is_self_signed(root))
+    say(f, "and the leaf is not", not certchain.is_self_signed(leaf))
+    say(f, "the CA flag is read", root.is_ca and mid.is_ca and not leaf.is_ca)
+    say(f, "and the path length constraint",
+        root.path_length == 1 and mid.path_length == 0 and
+        leaf.path_length == 0 - 1)
+    say(f, "the key usage says who may sign certificates",
+        certchain.may_sign_certificates(root) and
+        certchain.may_sign_certificates(mid) and
+        not certchain.may_sign_certificates(leaf))
+    say(f, "the leaf may sign and encipher",
+        certchain.has_usage(leaf, certchain.DIGITAL_SIGNATURE) and
+        certchain.has_usage(leaf, certchain.KEY_ENCIPHERMENT))
+    say(f, "the subject alternative names come out",
+        leaf.dns_names == ["service.example.test", "*.api.example.test"])
+    say(f, "including the address entry", leaf.ip_names == ["10.1.2.3"])
+    say(f, "the validity window is read as seconds",
+        leaf.not_before == 1767225600 and leaf.not_after == 1775001600)
+    say(f, "and the expired one is in the past", expired.not_after < now)
+    say(f, "the signature algorithm is named",
+        leaf.signature_algorithm == "1.2.840.113549.1.1.11")
+    say(f, "and the signature is the size of the issuer's modulus",
+        leaf.signature.len() == 256)
+    // Building the path, which is the work `x509` does not do.
+    let path = certchain.build_path(leaf, [mid], [root]) ?? []
+    say(f, "the path is leaf, intermediate, root", path.len() == 3)
+    say(f, "in that order", path[0].subject == leaf.subject and
+        path[2].subject == root.subject)
+    say(f, "and it ends at the trust store", certchain.ends_at_root(path, [root]))
+    say(f, "an extra certificate in the pool is ignored",
+        (certchain.build_path(leaf, [expired, mid], [root]) ?? []).len() == 3)
+    say(f, "a missing intermediate has no path",
+        path_refuses(leaf, [], [root]))
+    // And the whole thing, signatures included.
+    match certchain.verify_chain(leaf, [mid], [root], now, verify_rsa) {
+        Ok(verified) -> say(f, "the chain verifies end to end", verified.len() == 3)
+        Err(_e) -> say(f, "the chain verifies end to end", false)
+    }
+    say(f, "an expired leaf is refused", chain_refuses(expired, [mid], [root], now))
+    say(f, "an empty trust store is refused", chain_refuses(leaf, [mid], [], now))
+    say(f, "a time before the leaf was issued is refused",
+        chain_refuses(leaf, [mid], [root], 1000))
+    // A tampered certificate: the bytes changed, the signature did not.
+    var broken = leaf
+    broken.der = flip(leaf.der, leaf.tbs_at + 20)
+    say(f, "a tampered certificate fails its signature",
+        chain_refuses(broken, [mid], [root], now))
+    // Which certificate expires first is not always the leaf.
+    match certchain.first_to_expire(path) {
+        Some(c) -> say(f, "the soonest expiry is found",
+            c.subject == leaf.subject)
+        None -> say(f, "the soonest expiry is found", false)
+    }
+    say(f, "and the days remaining are counted",
+        certchain.days_until_expiry(leaf, now) == 57)
+    // The name check, which is a separate step and belongs to `hostmatch`.
+    say(f, "the leaf is for the host it says",
+        host_accepts(leaf.dns_names, leaf.ip_names, "", "service.example.test"))
+    say(f, "and its wildcard covers one label under api",
+        host_accepts(leaf.dns_names, leaf.ip_names, "", "v1.api.example.test"))
+    say(f, "but not two",
+        not host_accepts(leaf.dns_names, leaf.ip_names, "",
+            "a.v1.api.example.test"))
+    say(f, "and not a host it never names",
+        not host_accepts(leaf.dns_names, leaf.ip_names, "", "evil.test"))
+}
+
+fn main() / {io} {
+    var f = 0
+
+    check_pemfile(f)
+    check_rsa(f)
+    check_hostmatch(f)
+    check_certchain(f)
+
+    if f == 0 {
+        print("TLS verification: every claim held")
+    } else {
+        print("TLS verification: {f} failed")
+    }
+}

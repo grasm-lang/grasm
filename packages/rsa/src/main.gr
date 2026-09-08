@@ -1,0 +1,427 @@
+// RSA signature verification, which is what a TLS client and a certificate
+// chain actually need.
+//
+// **Verification only, and deliberately.** Signing needs the private key, and
+// a private key operation written without constant-time arithmetic and blinding
+// leaks the key to anyone who can time it. Nothing here can do that, because
+// nothing here has a private key. Verification is a public operation on public
+// data: there is no secret to leak, and it is the half a certificate chain,
+// a JWT and a TLS handshake use.
+//
+// Two padding schemes, and they fail differently:
+//
+//   - **PKCS#1 v1.5** is `00 01 FF..FF 00 DigestInfo`. Its trap is
+//     Bleichenbacher's 2006 attack: a verifier that *searches* for the digest
+//     rather than checking the padding byte by byte accepts a forged
+//     signature when the exponent is small. So the check here reconstructs
+//     the whole expected block and compares it, which cannot be fooled that
+//     way.
+//   - **PSS** is randomised and provably reducible to the RSA problem. It is
+//     what anything new should use, and what a certificate issued in the last
+//     decade increasingly does.
+//
+// The other rule worth stating: a signature is a number *strictly less than*
+// the modulus and exactly as many bytes as the modulus. A verifier that
+// accepts a longer one, or one numerically larger, accepts signatures the
+// signer never made.
+import bigint
+import asn1
+import crypto_hash
+import sha512
+
+type RsaKey = {
+    modulus: BigInt,
+    exponent: BigInt,
+    /// The modulus in bytes, which is the length every signature must be.
+    size: i64,
+    bits: i64,
+}
+
+type RsaError =
+    | NotAKey(why: str)
+    | WeakKey(bits: i64)
+    | BadExponent
+    | WrongLength(want: i64, got: i64)
+    | SignatureTooLarge
+    | BadPadding(why: str)
+    | UnknownHash(name: str)
+
+pub let SHA256 = "SHA256"
+pub let SHA384 = "SHA384"
+pub let SHA512 = "SHA512"
+pub let SHA1 = "SHA1"
+
+/// The smallest modulus this will accept.
+///
+/// 1024-bit RSA has been factorable by a well-funded attacker for years and
+/// is forbidden in every current certificate policy. Accepting one because
+/// the arithmetic works is how a verifier ends up trusting a key nobody
+/// should.
+pub fn minimum_bits() -> i64 {
+    return 2048
+}
+
+pub fn key_from_parts(modulus: BigInt, exponent: BigInt) -> RsaKey ! RsaError {
+    let bits = bigint.bit_length(modulus)
+    if bits < 512 {
+        fail(NotAKey("modulus is {bits} bits"))
+    }
+    // An even modulus is not a product of two odd primes and a public
+    // exponent of 1 makes the signature the message. Both are refused rather
+    // than producing an arithmetic result that means nothing.
+    let two = bigint.from_i64(2)
+    if bigint.is_zero(bigint.rem(modulus, two) ?? bigint.zero()) {
+        fail(NotAKey("modulus is even"))
+    }
+    if bigint.compare(exponent, bigint.from_i64(3)) < 0 {
+        fail(BadExponent)
+    }
+    if bigint.is_zero(bigint.rem(exponent, two) ?? bigint.zero()) {
+        fail(BadExponent)
+    }
+    return RsaKey{
+        modulus: modulus, exponent: exponent, size: (bits + 7) / 8, bits: bits,
+    }
+}
+
+/// A key from the two numbers as big-endian bytes.
+pub fn key_from_bytes(modulus: bytes, exponent: bytes) -> RsaKey ! RsaError {
+    return try key_from_parts(bigint.from_bytes(modulus),
+        bigint.from_bytes(exponent))
+}
+
+/// A key that cannot verify anything, for a caller that needs a value before
+/// it has parsed one.
+pub fn no_key() -> RsaKey {
+    return RsaKey{
+        modulus: bigint.zero(), exponent: bigint.zero(), size: 0, bits: 0,
+    }
+}
+
+pub fn bits_of(k: RsaKey) -> i64 {
+    return k.bits
+}
+
+pub fn size_of(k: RsaKey) -> i64 {
+    return k.size
+}
+
+pub fn is_strong_enough(k: RsaKey) -> bool {
+    return k.bits >= minimum_bits()
+}
+
+/// Parse `RSAPublicKey ::= SEQUENCE { modulus INTEGER, publicExponent INTEGER }`.
+pub fn parse_pkcs1(der: bytes) -> RsaKey ! RsaError {
+    match asn1.parse(der) {
+        Ok(nodes) -> {
+            if nodes.len() == 0 or nodes[0].tag != asn1.SEQUENCE {
+                fail(NotAKey("not a SEQUENCE"))
+            }
+            let parts = asn1.children(nodes, 0)
+            if parts.len() < 2 or parts[0].tag != asn1.INTEGER or
+            parts[1].tag != asn1.INTEGER{
+                fail(NotAKey("not two INTEGERs"))
+            }
+            return try key_from_bytes(asn1.value(der, parts[0]),
+                asn1.value(der, parts[1]))
+        }
+        Err(_e) -> fail(NotAKey("not DER"))
+    }
+}
+
+/// Parse a `SubjectPublicKeyInfo`, which is what a certificate carries.
+///
+/// The key is inside a BIT STRING whose first content byte counts unused
+/// bits — always zero here, and a parser that forgets to skip it reads a
+/// modulus shifted by one byte and fails every signature.
+pub fn parse_spki(der: bytes) -> RsaKey ! RsaError {
+    match asn1.parse(der) {
+        Ok(nodes) -> {
+            if nodes.len() == 0 or nodes[0].tag != asn1.SEQUENCE {
+                fail(NotAKey("not a SEQUENCE"))
+            }
+            let top = asn1.children(nodes, 0)
+            if top.len() < 2 {
+                fail(NotAKey("SubjectPublicKeyInfo needs two fields"))
+            }
+            var algorithm = ""
+            for i in 0..nodes.len() {
+                if nodes[i].tag == asn1.OID and nodes[i].depth == 2 {
+                    algorithm = asn1.oid_of(der, nodes[i])
+                    break
+                }
+            }
+            if algorithm != "1.2.840.113549.1.1.1" {
+                fail(NotAKey("algorithm {algorithm} is not RSA"))
+            }
+            var bit_string = top[1]
+            if bit_string.tag != asn1.BIT_STRING {
+                fail(NotAKey("the key is not a BIT STRING"))
+            }
+            if bit_string.len < 2 or der.at(bit_string.body) != 0 {
+                fail(NotAKey("the BIT STRING has unused bits"))
+            }
+            return try parse_pkcs1(der.slice(bit_string.body + 1,
+                bit_string.len - 1))
+        }
+        Err(_e) -> fail(NotAKey("not DER"))
+    }
+}
+
+/// The DigestInfo prefix for a hash: the DER of its AlgorithmIdentifier and
+/// the OCTET STRING header, which is fixed per hash and written out here.
+fn digest_prefix(name: str) -> [i64] ! RsaError {
+    if name == SHA256 {
+        return [48, 49, 48, 13, 6, 9, 96, 134, 72, 1, 101, 3, 4, 2, 1, 5, 0,
+            4, 32]
+    }
+    if name == SHA384 {
+        return [48, 65, 48, 13, 6, 9, 96, 134, 72, 1, 101, 3, 4, 2, 2, 5, 0,
+            4, 48]
+    }
+    if name == SHA512 {
+        return [48, 81, 48, 13, 6, 9, 96, 134, 72, 1, 101, 3, 4, 2, 3, 5, 0,
+            4, 64]
+    }
+    if name == SHA1 {
+        return [48, 33, 48, 9, 6, 5, 43, 14, 3, 2, 26, 5, 0, 4, 20]
+    }
+    fail(UnknownHash(name))
+}
+
+pub fn digest_of(name: str, message: bytes) -> bytes ! RsaError {
+    if name == SHA256 {
+        return crypto_hash.sha256_of(message)
+    }
+    if name == SHA384 {
+        return sha512.sha384(message)
+    }
+    if name == SHA512 {
+        return sha512.sha512(message)
+    }
+    fail(UnknownHash(name))
+}
+
+pub fn digest_length(name: str) -> i64 ! RsaError {
+    if name == SHA256 {
+        return 32
+    }
+    if name == SHA384 {
+        return 48
+    }
+    if name == SHA512 {
+        return 64
+    }
+    if name == SHA1 {
+        return 20
+    }
+    fail(UnknownHash(name))
+}
+
+/// The RSA public operation: `signature^e mod n`, as `size` bytes.
+fn public_transform(k: RsaKey, signature: bytes) -> bytes ! RsaError {
+    if signature.len() != k.size {
+        fail(WrongLength(k.size, signature.len()))
+    }
+    let s = bigint.from_bytes(signature)
+    // Strictly less than the modulus. A verifier that skips this accepts
+    // `s + n`, which is a different signature with the same value.
+    if bigint.compare(s, k.modulus) >= 0 {
+        fail(SignatureTooLarge)
+    }
+    match bigint.mod_pow(s, k.exponent, k.modulus) {
+        Ok(m) -> {
+            match bigint.to_bytes(m, k.size) {
+                Ok(raw) -> return raw
+                Err(_e) -> fail(BadPadding("the result does not fit"))
+            }
+        }
+        Err(_e) -> fail(BadPadding("the exponentiation failed"))
+    }
+}
+
+/// Verify a PKCS#1 v1.5 signature.
+///
+/// The expected encoded message is *built* and compared whole, rather than
+/// the digest being searched for inside the result. Searching is what makes
+/// Bleichenbacher's forgery work against a small exponent, and the difference
+/// is three lines.
+pub fn verify_pkcs1(k: RsaKey, hash: str, message: bytes,
+    signature: bytes) -> bool {
+    match public_transform(k, signature) {
+        Ok(block) -> {
+            match expected_pkcs1(k, hash, message) {
+                Ok(want) -> return crypto_hash.equal_constant_time(block, want)
+                Err(_e) -> return false
+            }
+        }
+        Err(_e) -> return false
+    }
+}
+
+/// The encoded message a valid PKCS#1 v1.5 signature decrypts to.
+pub fn expected_pkcs1(k: RsaKey, hash: str, message: bytes) -> bytes ! RsaError {
+    let prefix = try digest_prefix(hash)
+    let digest = try digest_of(hash, message)
+    var out: [i64] = [0, 1]
+    // At least eight 0xFF bytes, or the padding is too short to be one.
+    let padding = k.size - prefix.len() - digest.len() - 3
+    if padding < 8 {
+        fail(BadPadding("the modulus is too small for this hash"))
+    }
+    for _i in 0..padding {
+        out.push(255)
+    }
+    out.push(0)
+    for b in prefix {
+        out.push(b)
+    }
+    for i in 0..digest.len() {
+        out.push(digest.at(i))
+    }
+    return bytes_of(out)
+}
+
+/// MGF1, the mask generation function PSS is built on.
+fn mgf1(seed: bytes, length: i64, hash: str) -> bytes ! RsaError {
+    var out: [i64] = []
+    var counter = 0
+    while out.len() < length {
+        var input = seed.to_list()
+        for i in 0..4 {
+            input.push(counter.ushr((3 - i) * 8).bit_and(255))
+        }
+        let block = try digest_of(hash, bytes_of(input))
+        for i in 0..block.len() {
+            if out.len() < length {
+                out.push(block.at(i))
+            }
+        }
+        counter = counter + 1
+    }
+    return bytes_of(out)
+}
+
+/// Verify a PSS signature. `salt_length` is usually the digest length.
+///
+/// The steps that matter: the top bits of the block must be zero, the block
+/// must end in `0xBC`, the recovered salt is used to rebuild the hash, and
+/// the comparison is of the whole hash rather than a prefix.
+pub fn verify_pss(k: RsaKey, hash: str, message: bytes, signature: bytes,
+    salt_length: i64) -> bool {
+    match verify_pss_checked(k, hash, message, signature, salt_length) {
+        Ok(v) -> return v
+        Err(_e) -> return false
+    }
+}
+
+fn verify_pss_checked(k: RsaKey, hash: str, message: bytes, signature: bytes,
+    salt_length: i64) -> bool ! RsaError {
+    let block = try public_transform(k, signature)
+    let hash_len = try digest_length(hash)
+    let db_len = k.size - hash_len - 1
+    if db_len < salt_length + 2 {
+        fail(BadPadding("the modulus is too small for this salt"))
+    }
+    if block.at(block.len() - 1) != 188 {
+        return false
+    }
+    // The unused bits at the top of the block must be zero: the modulus is
+    // `bits` long and the block is `size * 8`, so the difference is a mask.
+    let spare = k.size * 8 - (k.bits - 1)
+    if spare > 0 and spare < 8 {
+        if block.at(0).ushr(8 - spare) != 0 {
+            return false
+        }
+    }
+    let masked = block.slice(0, db_len)
+    let seed = block.slice(db_len, hash_len)
+    let mask = try mgf1(seed, db_len, hash)
+    var db: [i64] = []
+    for i in 0..db_len {
+        db.push(masked.at(i).bit_xor(mask.at(i)))
+    }
+    if spare > 0 and spare < 8 {
+        db[0] = db[0].bit_and(255.ushr(spare))
+    }
+    // Everything before the salt is zero, then a single 0x01.
+    for i in 0..(db_len - salt_length - 1) {
+        if db[i] != 0 {
+            return false
+        }
+    }
+    if db[db_len - salt_length - 1] != 1 {
+        return false
+    }
+    var salted: [i64] = [0, 0, 0, 0, 0, 0, 0, 0]
+    let digest = try digest_of(hash, message)
+    for i in 0..digest.len() {
+        salted.push(digest.at(i))
+    }
+    for i in 0..salt_length {
+        salted.push(db[db_len - salt_length + i])
+    }
+    let want = try digest_of(hash, bytes_of(salted))
+    return crypto_hash.equal_constant_time(want, seed)
+}
+
+/// Verify with the algorithm named by an X.509 signature OID.
+///
+/// The mapping is here because a certificate says which one it used and a
+/// verifier that assumes SHA-256 rejects every certificate signed with
+/// anything else.
+pub fn verify_by_oid(k: RsaKey, oid: str, message: bytes,
+    signature: bytes) -> bool {
+    if oid == "1.2.840.113549.1.1.11" {
+        return verify_pkcs1(k, SHA256, message, signature)
+    }
+    if oid == "1.2.840.113549.1.1.12" {
+        return verify_pkcs1(k, SHA384, message, signature)
+    }
+    if oid == "1.2.840.113549.1.1.13" {
+        return verify_pkcs1(k, SHA512, message, signature)
+    }
+    if oid == "1.2.840.113549.1.1.5" {
+        // SHA-1, which is broken for collisions and still appears on old
+        // roots. The caller decides whether to allow it; this only says what
+        // the signature is.
+        return verify_pkcs1(k, SHA1, message, signature)
+    }
+    return false
+}
+
+/// The hash an X.509 signature OID names, or "".
+pub fn hash_for_oid(oid: str) -> str {
+    if oid == "1.2.840.113549.1.1.11" {
+        return SHA256
+    }
+    if oid == "1.2.840.113549.1.1.12" {
+        return SHA384
+    }
+    if oid == "1.2.840.113549.1.1.13" {
+        return SHA512
+    }
+    if oid == "1.2.840.113549.1.1.5" {
+        return SHA1
+    }
+    if oid == "1.2.840.113549.1.1.10" {
+        // RSASSA-PSS, whose real hash is in the parameters rather than the
+        // OID — so the OID alone does not answer, and saying "SHA256" here
+        // would be a guess.
+        return ""
+    }
+    return ""
+}
+
+/// Whether an OID names an RSA signature at all.
+pub fn is_rsa_oid(oid: str) -> bool {
+    return oid.starts_with("1.2.840.113549.1.1.")
+}
+
+/// Whether the signature algorithm is one a current policy allows.
+pub fn is_deprecated_oid(oid: str) -> bool {
+    // MD2, MD5 and SHA-1 with RSA. All three have practical collisions and
+    // none should verify a certificate issued this decade.
+    return oid == "1.2.840.113549.1.1.2" or oid == "1.2.840.113549.1.1.4" or
+    oid == "1.2.840.113549.1.1.5"
+}

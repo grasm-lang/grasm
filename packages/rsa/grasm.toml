@@ -1,0 +1,22 @@
+[package]
+name = "rsa"
+version = "1.0.0"
+
+# Arithmetic over bytes. Opens nothing.
+capabilities = []
+
+[dependencies.bigint]
+path = "../bigint"
+version = "^1.0.0"
+
+[dependencies.asn1]
+path = "../asn1"
+version = "^1.0.0"
+
+[dependencies.crypto_hash]
+path = "../crypto_hash"
+version = "^1.0.0"
+
+[dependencies.sha512]
+path = "../sha512"
+version = "^1.0.0"

@@ -1,0 +1,246 @@
+// Does this certificate belong to the host we asked for?
+//
+// RFC 6125, and the rules are all about what a wildcard may *not* do —
+// because every one of them was added after somebody exploited its absence.
+//
+//   - **The Common Name is not consulted.** It has been deprecated since 2011
+//     and forbidden since 2017, and browsers ignore it entirely. A verifier
+//     that falls back to it accepts a certificate whose SAN list does not
+//     name the host, which is the whole point of the SAN list.
+//   - **A wildcard matches one label, and only the leftmost.** `*.example.com`
+//     matches `a.example.com` and not `a.b.example.com`, and `a.*.com` is not
+//     a wildcard at all.
+//   - **A wildcard may not be the whole label's tail.** `*` alone, or
+//     `*.com`, would match every host under a public suffix. The first is
+//     refused outright; the second needs a suffix list the caller supplies,
+//     because which suffixes are public is data rather than a rule.
+//   - **A partial wildcard** — `w*.example.com` — is refused. It was legal
+//     once, no current client accepts it, and treating it as a full wildcard
+//     is strictly worse than refusing.
+//   - **An IP address is matched against an iPAddress SAN**, never a dNSName.
+//     A certificate for the *name* `10.0.0.1` does not authenticate the
+//     *address* 10.0.0.1.
+//
+// Names are compared after case folding and after trailing dots are removed,
+// because `Example.COM.` and `example.com` are the same host.
+
+type HostError =
+    | NoNames
+    | BadWildcard(pattern: str, why: str)
+    | Malformed(name: str)
+
+pub fn normalise(name: str) -> str {
+    var out = name.trim().to_lower()
+    while out.ends_with(".") {
+        out = out.substr(0, out.len() - 1)
+    }
+    return out
+}
+
+/// Whether the text is an IPv4 address in dotted form.
+pub fn is_ipv4(text: str) -> bool {
+    let parts = text.split(".")
+    if parts.len() != 4 {
+        return false
+    }
+    for p in parts {
+        if p.len() == 0 or p.len() > 3 {
+            return false
+        }
+        for c in p.chars() {
+            if c < "0" or c > "9" {
+                return false
+            }
+        }
+        let v = p.parse_int() ?? 0 - 1
+        if v < 0 or v > 255 {
+            return false
+        }
+        // A leading zero is a different number in some parsers and the same
+        // in others, which is a place two pieces of software disagree about
+        // what host they are talking to.
+        if p.len() > 1 and p.starts_with("0") {
+            return false
+        }
+    }
+    return true
+}
+
+/// Whether the text looks like an IPv6 address.
+pub fn is_ipv6(text: str) -> bool {
+    var body = text
+    if body.starts_with("[") and body.ends_with("]") {
+        body = body.substr(1, body.len() - 2)
+    }
+    if not body.contains(":") {
+        return false
+    }
+    for c in body.chars() {
+        let hex = (c >= "0" and c <= "9") or (c >= "a" and c <= "f") or
+        (c >= "A" and c <= "F")
+        if not (hex or c == ":" or c == ".") {
+            return false
+        }
+    }
+    return true
+}
+
+pub fn is_address(text: str) -> bool {
+    return is_ipv4(text) or is_ipv6(text)
+}
+
+/// Whether a pattern is a wildcard this will accept.
+///
+/// The reasons for each refusal are in the header; the point of returning
+/// *why* is that a certificate rejected for a bad wildcard is a different
+/// problem from one rejected for naming the wrong host.
+pub fn check_wildcard(pattern: str) -> () ! HostError {
+    let name = normalise(pattern)
+    if not name.contains("*") {
+        return
+    }
+    let labels = name.split(".")
+    if labels.len() < 3 {
+        // `*` and `*.com`: too broad to be anything but a mistake or an
+        // attack.
+        fail(BadWildcard(pattern, "a wildcard needs at least three labels"))
+    }
+    if not labels[0].contains("*") {
+        fail(BadWildcard(pattern, "only the leftmost label may be a wildcard"))
+    }
+    for i in 1..labels.len() {
+        if labels[i].contains("*") {
+            fail(BadWildcard(pattern, "only one label may be a wildcard"))
+        }
+    }
+    if labels[0] != "*" {
+        fail(BadWildcard(pattern, "a partial wildcard is not accepted"))
+    }
+}
+
+/// Whether `pattern` from a certificate matches `host`.
+pub fn matches(pattern: str, host: str) -> bool {
+    let want = normalise(host)
+    let name = normalise(pattern)
+    if want == "" or name == "" {
+        return false
+    }
+    if not name.contains("*") {
+        return name == want
+    }
+    match check_wildcard(name) {
+        Ok(_v) -> {}
+        Err(_e) -> return false
+    }
+    // The wildcard covers exactly one label, so the rest must match and the
+    // host must have a label in front of it.
+    let tail = name.substr(1, name.len() - 1)
+    if not want.ends_with(tail) {
+        return false
+    }
+    let head = want.substr(0, want.len() - tail.len())
+    if head.len() == 0 {
+        return false
+    }
+    return not head.contains(".")
+}
+
+/// Whether any dNSName in the list matches the host.
+pub fn matches_any(patterns: [str], host: str) -> bool {
+    for p in patterns {
+        if matches(p, host) {
+            return true
+        }
+    }
+    return false
+}
+
+/// The full check: which SAN list to use is decided by what the host is.
+///
+/// An address is matched against `ip_names` and a name against `dns_names`,
+/// and never the other way. `common_name` is taken and ignored, so a caller
+/// that has one cannot accidentally have it consulted.
+pub fn verify(dns_names: [str], ip_names: [str], common_name: str,
+    host: str) -> bool ! HostError {
+    let _ignored = common_name
+    if dns_names.len() == 0 and ip_names.len() == 0 {
+        fail(NoNames)
+    }
+    let want = normalise(host)
+    if want == "" {
+        fail(Malformed(host))
+    }
+    if is_address(want) {
+        for ip in ip_names {
+            if normalise(ip) == want {
+                return true
+            }
+        }
+        return false
+    }
+    return matches_any(dns_names, want)
+}
+
+/// Why a certificate did not match, for a message a person can act on.
+pub fn explain(dns_names: [str], ip_names: [str], host: str) -> str {
+    let want = normalise(host)
+    if dns_names.len() == 0 and ip_names.len() == 0 {
+        return "the certificate names no hosts at all"
+    }
+    if is_address(want) {
+        if ip_names.len() == 0 {
+            return "{want} is an address and the certificate has no address entries"
+        }
+        let listed = ip_names.join(", ")
+        return "{want} is not among the certificate's addresses: {listed}"
+    }
+    for p in dns_names {
+        match check_wildcard(p) {
+            Ok(_v) -> {}
+            Err(_e) -> return "the certificate contains an unusable wildcard `{p}`"
+        }
+    }
+    let listed = dns_names.join(", ")
+    return "{want} is not among the certificate's names: {listed}"
+}
+
+/// Whether the host's registrable part is a public suffix — the check that
+/// stops `*.co.uk` from being accepted.
+///
+/// The suffix list is the caller's, because it is data that changes weekly
+/// and a copy compiled into a library is a copy that is wrong.
+pub fn is_too_broad(pattern: str, public_suffixes: [str]) -> bool {
+    let name = normalise(pattern)
+    if not name.starts_with("*.") {
+        return false
+    }
+    let rest = name.substr(2, name.len() - 2)
+    return public_suffixes.contains(rest)
+}
+
+/// The registrable domain of a host, given a suffix list.
+pub fn registrable_domain(host: str, public_suffixes: [str]) -> str {
+    let name = normalise(host)
+    let labels = name.split(".")
+    var i = 0
+    while i < labels.len() {
+        let candidate = labels.slice(i, labels.len()).join(".")
+        if public_suffixes.contains(candidate) {
+            if i == 0 {
+                return ""
+            }
+            return labels.slice(i - 1, labels.len()).join(".")
+        }
+        i = i + 1
+    }
+    if labels.len() >= 2 {
+        return labels.slice(labels.len() - 2, labels.len()).join(".")
+    }
+    return name
+}
+
+/// Whether two hosts are the same site, for a cookie or a redirect check.
+pub fn same_site(a: str, b: str, public_suffixes: [str]) -> bool {
+    let left = registrable_domain(a, public_suffixes)
+    return left != "" and left == registrable_domain(b, public_suffixes)
+}

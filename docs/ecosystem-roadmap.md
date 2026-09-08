@@ -14,7 +14,7 @@ plan that discovers them 300 packages in.
 | | |
 |---|---|
 | Started | 78 |
-| Now | 205 |
+| Now | 209 |
 | Tier 1 target | 200 |
 | Tier 2 target | 500 |
 | Tier 3 target | 800 |
@@ -182,8 +182,8 @@ outside implementation wherever one exists.
 | Networking | `whois` `tftp` `socks5` `gopher` `netdiscovery` |
 | Observability | `otelspan` `prometheus` `logsample` `errorgroup` `slo` |
 | Terminal UI | `tuibox` `keymap` `editline` `prompt` `autocomplete` |
-| Cryptography | `argon2` `bcrypt` `rsa` `ed25519` `pemfile` |
-| Certificates | `csr` `jwk` `pkcs7` `ocsp` `certchain` |
+| Cryptography | `argon2` `bcrypt` ~~`rsa`~~ `ed25519` ~~`pemfile`~~ — two done |
+| Certificates | `csr` `jwk` `pkcs7` `ocsp` ~~`certchain`~~ — one done, plus `hostmatch` |
 | Text analysis | `stemmer` `stopwords` `readability` `hyphenate` `keyphrase` |
 | Documents | `rst` `bbcode` `wikitext` `csvdialect` `fixedwidth` |
 | Build tooling | `changelog` `spdx` `codeowners` `patchfile` `coveragefmt` |
@@ -200,8 +200,27 @@ Slack, GitHub, Kubernetes, Prometheus remote-write, OpenTelemetry export,
 OAuth providers, SMTP and IMAP over TLS, and every managed database. All of
 them are HTTPS-only and have been for years.
 
-**This is the next thing to build after the hundred above**, because it is
-the single item that unblocks the most.
+**Four of the five missing pieces are now built**, and each was checked
+against certificates and signatures produced by an outside implementation:
+
+- `rsa` — PKCS#1 v1.5 and PSS *verification*. No signing: a private key
+  operation without constant-time arithmetic and blinding leaks the key, and
+  verification is the half a certificate chain needs.
+- `certchain` — path building from a leaf through intermediates to a trust
+  store, validity windows across the whole path, basic constraints, path
+  length and key usage. The signature check is a function the caller passes
+  in, so this package contains no cryptography and the caller decides which
+  algorithms it will accept.
+- `hostmatch` — RFC 6125. The Common Name is taken and ignored; a wildcard
+  covers one leftmost label and nothing else; an address is matched against
+  address entries and never against names.
+- `pemfile` — a chain file is several blocks, and a reader that takes the
+  first verifies the leaf against nothing.
+
+**What is left is the handshake over a socket.** That cannot be asserted
+against without a server to talk to, which is why the four above were done
+first: they are the parts a fixture can check exactly, and they are the parts
+that were actually missing.
 
 ### Needs P2 — async I/O. About 40.
 
