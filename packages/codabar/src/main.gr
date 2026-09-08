@@ -1,0 +1,207 @@
+// Codabar: from 1972, still in blood banks and libraries.
+//
+// Sixteen symbols — the ten digits and `- $ : / . +` — and four
+// interchangeable start and stop letters, `A` to `D`. That is the whole
+// alphabet. It cannot encode a letter, it cannot encode a space, and it is
+// still in daily use in two industries that standardised on it before
+// anything better existed and have never had a reason to change.
+//
+// ## Why it survived
+//
+// It is **self-checking** and it needs no checksum: every character is seven
+// elements with a fixed number of wide ones, so a misread element produces an
+// invalid character rather than a different valid one. For a blood bag, where
+// a wrong number is a serious event and a failed scan is merely an
+// inconvenience, that trade is the right way round.
+//
+// It also prints on anything. Two widths, no fine gradation, and a
+// specification that tolerates a wide-to-narrow ratio anywhere from two to
+// three — which is why it works on a library card that has been in a wallet
+// for ten years.
+//
+// ## The start and stop letters carry meaning
+//
+// `A`, `B`, `C` and `D` are interchangeable as far as the symbology is
+// concerned, and industries have assigned them meanings anyway: the American
+// Blood Commission uses the pair to say what kind of number follows. So the
+// letters are part of the data and this package keeps them rather than
+// stripping them, which is the mistake that loses the distinction.
+//
+// Checked against Python's `python-barcode` at its default widths.
+
+type CodabarError =
+    | BadStart(character: str)
+    | BadStop(character: str)
+    | NotEncodable(character: str)
+    | TooShort()
+
+fn index_of_character(c: str) -> i64 {
+    let characters = codabar_characters()
+    var i = 0
+    while i < characters.len() {
+        if characters[i] == c {
+            return i
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+pub fn is_start_stop(c: str) -> bool {
+    return c == "A" or c == "B" or c == "C" or c == "D"
+}
+
+pub fn encodable_characters() -> [str] {
+    var out: [str] = []
+    for c in codabar_characters() {
+        if not is_start_stop(c) {
+            out.push(c)
+        }
+    }
+    return out
+}
+
+/// The element string: capitals are bars, lower case are spaces.
+///
+/// Characters are separated by a narrow space, which is the inter-character
+/// gap every discrete symbology has and which is why Codabar is longer than
+/// a continuous one like Code 128.
+pub fn elements(code: str) -> str ! CodabarError {
+    if code.len() < 2 {
+        fail(TooShort())
+    }
+    let chars = code.chars()
+    let first = chars[0]
+    let last = chars[chars.len() - 1]
+    if not is_start_stop(first) {
+        fail(BadStart(first))
+    }
+    if not is_start_stop(last) {
+        fail(BadStop(last))
+    }
+    let widths = codabar_widths()
+    var out = widths[index_of_character(first)] + "n"
+    var i = 1
+    while i < chars.len() - 1 {
+        let at = index_of_character(chars[i])
+        if at < 0 or is_start_stop(chars[i]) {
+            fail(NotEncodable(chars[i]))
+        }
+        out = out + widths[at]
+        if i < chars.len() - 2 {
+            out = out + "n"
+        }
+        i = i + 1
+    }
+    return out + "n" + widths[index_of_character(last)]
+}
+
+fn repeat(c: str, n: i64) -> str {
+    var out = ""
+    var i = 0
+    while i < n {
+        out = out + c
+        i = i + 1
+    }
+    return out
+}
+
+pub fn encode_with_widths(code: str, narrow: i64,
+    wide: i64) -> str ! CodabarError {
+    let pattern = try elements(code)
+    var out = ""
+    for e in pattern.chars() {
+        if e == "W" {
+            out = out + repeat("1", wide)
+        }
+        if e == "w" {
+            out = out + repeat("0", wide)
+        }
+        if e == "N" {
+            out = out + repeat("1", narrow)
+        }
+        if e == "n" {
+            out = out + repeat("0", narrow)
+        }
+    }
+    return out
+}
+
+pub fn encode(code: str) -> str ! CodabarError {
+    return try encode_with_widths(code, 2, 5)
+}
+
+/// Whether a string can be encoded at all.
+pub fn is_encodable(code: str) -> bool {
+    match elements(code) {
+        Ok(_e) -> {
+            return true
+        }
+        Err(_e) -> {
+            return false
+        }
+    }
+}
+
+/// The data between the start and stop letters.
+pub fn payload(code: str) -> str {
+    if code.len() < 2 {
+        return ""
+    }
+    return code.substr(1, code.len() - 2)
+}
+
+/// The start and stop letters, which carry meaning in some industries.
+pub fn delimiters(code: str) -> (str, str) {
+    if code.len() < 2 {
+        return ("", "")
+    }
+    return (code.substr(0, 1), code.substr(code.len() - 1, 1))
+}
+
+/// Whether every character is seven elements with the right number of wide
+/// ones — the property that makes Codabar self-checking.
+///
+/// Worth asserting rather than trusting: it is the format's entire safety
+/// argument, and a table with one wrong entry silently removes it.
+pub fn is_self_checking() -> bool {
+    for pattern in codabar_widths() {
+        if pattern.len() != 7 {
+            return false
+        }
+        var wide = 0
+        for e in pattern.chars() {
+            if e == "W" or e == "w" {
+                wide = wide + 1
+            }
+        }
+        if wide != 2 and wide != 3 {
+            return false
+        }
+    }
+    return true
+}
+/// The characters Codabar encodes, and its four start and stop letters.
+///
+/// Sixteen symbols and four delimiters, which is why Codabar survives in
+/// blood banks and libraries and nowhere else: it encodes almost nothing and
+/// every reader has supported it since 1972.
+fn codabar_characters() -> [str] {
+    return [
+        "$", "+", "-", ".", "/", "0", "1", "2", "3", "4", "5", "6",
+        "7", "8", "9", ":", "A", "B", "C", "D",
+    ]
+}
+/// Their bar and space widths: `N`arrow or `W`ide, bars in capitals.
+///
+/// A two-width code rather than a module pattern, which is what makes
+/// Codabar printable by a machine with no fine control over spacing.
+fn codabar_widths() -> [str] {
+    return [
+        "NnWwNnN", "NnWnWnW", "NnNwWnN", "WnWnWnN",
+        "WnWnNnW", "NnNnNwW", "NnNnWwN", "NnNwNnW",
+        "WwNnNnN", "NnWnNwN", "WnNnNwN", "NwNnNnW",
+        "NwNnWnN", "NwWnNnN", "WnNwNnN", "WnNnWnW",
+        "NnWwNwN", "NwNwNnW", "NnNwNwW", "NnNwWwN",
+    ]
+}

@@ -1,0 +1,6 @@
+[package]
+name = "ean"
+version = "1.0.0"
+
+# Turning digits into module patterns. Opens nothing.
+capabilities = []

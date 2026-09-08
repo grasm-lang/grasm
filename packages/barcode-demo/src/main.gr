@@ -1,0 +1,261 @@
+import code128
+import ean
+import itf
+import codabar
+import code39
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+// -------------------------------------------------------------- code128
+
+fn c128(text: str) -> str {
+    let e: str ! Code128Error = code128.encode(text)
+    return e ?? "ERR"
+}
+
+fn check_code128(inout f: i64) / {io} {
+    print("-- code128: set C is the whole reason to use it")
+    // Both of these are `python-barcode`'s output for the same input.
+    say(f, "eight digits encode as four pairs in set C",
+        c128("12345678") == "11010011100101100111001000101100011100010110" +
+        "11000010100100011101101100011101011")
+    say(f, "and one letter is one symbol in set B",
+        c128("A") == "1101001000010100011000100010110001100011101011")
+    say(f, "the sets used are visible, and chosen by the digit runs",
+        code128.sets_used("12345678") == "CCCC" and
+        code128.sets_used("Hello123") == "BBBBBBBB")
+    // Twenty digits in C are ten symbols; in B they are twenty.
+    say(f, "set C halves the width of a run of digits",
+        width("12345678901234567890") <
+        code128.width_without_set_c("12345678901234567890") / 2 + 40)
+    say(f, "the checksum weighs each symbol by its position",
+        code128.checksum([104, 33, 34, 35]) ==
+        (104 + 33 + 34 * 2 + 35 * 3) % 103)
+    say(f, "the stop symbol is thirteen modules, not eleven",
+        code128.stop_pattern().len() == 13 and
+        code128.modules_per_symbol() == 11)
+    say(f, "a symbol's width is countable before it is drawn",
+        width("A") == 46 and c128("A").len() == 46)
+    say(f, "everything printable encodes and a control character does not",
+        code128.is_encodable("Item-42 (x3)") and
+        not code128.is_encodable("caf\u{e9}"))
+    say(f, "and the first character that cannot be encoded is named",
+        unencodable_at("ab\u{e9}c") == 2)
+    say(f, "an empty string is refused rather than encoded as nothing",
+        c128("") == "ERR")
+}
+
+fn width(text: str) -> i64 {
+    let w: i64 ! Code128Error = code128.width_in_modules(text)
+    return w ?? (0 - 1)
+}
+
+fn unencodable_at(text: str) -> i64 {
+    match code128.first_unencodable(text) {
+        Some(pair) -> {
+            return pair.1
+        }
+        None -> {
+            return 0 - 1
+        }
+    }
+}
+
+// ------------------------------------------------------------------ ean
+
+fn check_ean(inout f: i64) / {io} {
+    print("-- ean: the digit that is not drawn")
+    let e: str ! EanError = ean.ean13("590123412345")
+    // `python-barcode` produces exactly this.
+    say(f, "an EAN-13 is the modules python-barcode produces",
+        (e ?? "") == "1010001011010011101100110010011011110100111010101011" +
+        "0011011011001000010101110010011101000100101")
+    say(f, "and it is ninety-five modules, as every EAN-13 is",
+        (e ?? "").len() == 95 and ean.ean13_modules() == 95)
+    let e8: str ! EanError = ean.ean8("9638507")
+    say(f, "an EAN-8 is sixty-seven, and every digit is drawn",
+        (e8 ?? "").len() == 67 and
+        (e8 ?? "") == "1010001011010111101111010110111010101001110111001" +
+        "010001001011100101")
+    say(f, "the check digit weighs alternate digits by three",
+        (ean.check_digit("590123412345") ?? (0 - 1)) == 7 and
+        (ean.check_digit("978014017739") ?? (0 - 1)) == 8)
+    say(f, "and a complete number checks itself",
+        ean.is_valid("5901234123457") and
+        not ean.is_valid("5901234123456"))
+    say(f, "the first digit is carried in the parity, not in any bar",
+        parity_differs("012345678901", "512345678901"))
+    say(f, "a UPC-A is an EAN-13 with a leading zero, and the same symbol",
+        (ean.upc_a("12345678901") ?? "") ==
+        (ean.ean13("012345678901") ?? "x"))
+    say(f, "a UPC-E expands by one of six rules on its last digit",
+        (ean.expand_upc_e("04252614") ?? "") == "042100005264")
+    say(f, "the prefix names the registry, not where the thing was made",
+        ean.prefix_meaning("5901234123457") == "a GS1 member organisation"
+        and ean.prefix_meaning("4001234567890") == "Germany" and
+        ean.prefix_meaning("9780140177398") == "a book, by ISBN")
+    say(f, "and a book's ISBN is recognisable as one",
+        ean.is_isbn("9780140177398") and not ean.is_isbn("5901234123457"))
+    say(f, "a wrong length is refused rather than padded",
+        (ean.ean13("123") ?? "ERR") == "ERR" and
+        (ean.ean8("12") ?? "ERR") == "ERR")
+    // The hole every EAN has: 18 and 81 check the same.
+    // 1 and 6 differ by five, so swapping them leaves the weighted sum
+    // unchanged — the one hole every EAN in the world has.
+    say(f, "a transposition of digits differing by five is not caught",
+        (ean.check_digit("111111111116") ?? 0) ==
+        (ean.check_digit("111111111161") ?? 1))
+}
+
+/// Two numbers whose digits two to twelve agree encode the same bars on the
+/// right and different ones on the left.
+///
+/// That difference is the first digit: it is drawn nowhere, and a scanner
+/// recovers it from which alphabet each left-hand digit used.
+fn parity_differs(a: str, b: str) -> bool {
+    let ea: str ! EanError = ean.ean13(a)
+    let eb: str ! EanError = ean.ean13(b)
+    let left_a = (ea ?? "").substr(3, 42)
+    let left_b = (eb ?? "").substr(3, 42)
+    // The last of the six right-hand digits is the check digit, which the
+    // first digit changes, so the comparison stops before it.
+    let right_a = (ea ?? "").substr(50, 35)
+    let right_b = (eb ?? "").substr(50, 35)
+    return left_a != left_b and right_a == right_b
+}
+
+// ------------------------------------------------------------------ itf
+
+fn check_itf(inout f: i64) / {io} {
+    print("-- itf: any even prefix is a valid barcode, which is the problem")
+    let e: str ! ItfError = itf.encode("12345678")
+    say(f, "eight digits interleave into the modules python-barcode gives",
+        (e ?? "") == "110011001111100110000011001100111110000011111001111" +
+        "1001100000110011000001111100110000011111000001100110011000" +
+        "001100110011111000001111100111110011")
+    say(f, "an odd number of digits is refused rather than padded silently",
+        (itf.encode("123") ?? "ERR") == "ERR" and
+        itf.pad_to_even("123") == "0123")
+    say(f, "ten patterns for ten digits, two wide out of five",
+        itf.digit_patterns().len() == 10 and
+        wide_count(itf.digit_patterns()[0]) == 2)
+    say(f, "the start is four narrow elements and the stop is three",
+        itf.start_pattern() == "NnNn" and itf.stop_pattern() == "WnN")
+    say(f, "the element string interleaves bars and spaces",
+        (itf.elements("12") ?? "").substr(0, 6) == "NnNnWn")
+    say(f, "an ITF-14 carries EAN's check digit",
+        (itf.check_digit("1234567890123") ?? (0 - 1)) == 1 and
+        (itf.itf14("1234567890123") ?? "ERR") != "ERR")
+    // The failure the format is famous for.
+    say(f, "a clipped scan reads a shorter number that is also valid",
+        itf.could_be_clipped("12345678", "1234") and
+        not itf.could_be_clipped("12345678", "2345"))
+    say(f, "the widths are a parameter, because the ratio matters",
+        (itf.encode_with_widths("12", 1, 3) ?? "").len() <
+        (itf.encode_with_widths("12", 2, 5) ?? "").len())
+    say(f, "a letter is not a digit and is refused",
+        (itf.encode("12a4") ?? "ERR") == "ERR")
+}
+
+fn wide_count(pattern: str) -> i64 {
+    var n = 0
+    for c in pattern.chars() {
+        if c == "W" {
+            n = n + 1
+        }
+    }
+    return n
+}
+
+// -------------------------------------------------------------- codabar
+
+fn check_codabar(inout f: i64) / {io} {
+    print("-- codabar: self-checking, which is why blood banks kept it")
+    let e: str ! CodabarError = codabar.encode("A20385A")
+    say(f, "it encodes to the modules python-barcode produces",
+        (e ?? "") == "1100111110000011000001100110011000001100111110011" +
+        "00110011000001111100111110000011001100110011000001111100" +
+        "11001100111110011001100000110011001111100000110000011")
+    say(f, "every character is seven elements with two or three wide",
+        codabar.is_self_checking())
+    say(f, "the start and stop letters are data, and are kept",
+        codabar.delimiters("A20385A").0 == "A" and
+        codabar.delimiters("A20385A").1 == "A" and
+        codabar.payload("A20385A") == "20385")
+    say(f, "any of the four letters may start it",
+        codabar.is_encodable("D1234C") and codabar.is_encodable("B99B"))
+    say(f, "and a digit may not",
+        not codabar.is_encodable("12345") and
+        (codabar.encode("120385A") ?? "ERR") == "ERR")
+    say(f, "sixteen characters and no letters at all",
+        codabar.encodable_characters().len() == 16 and
+        not codabar.is_encodable("AHELLOA"))
+    say(f, "punctuation it does encode goes through",
+        codabar.is_encodable("A1-2$3A") and codabar.is_encodable("A./+:A"))
+    say(f, "the widths are a parameter here too",
+        (codabar.encode_with_widths("A1A", 1, 3) ?? "").len() <
+        (codabar.encode_with_widths("A1A", 2, 5) ?? "").len())
+    say(f, "a string too short to have delimiters is refused",
+        (codabar.encode("A") ?? "ERR") == "ERR")
+}
+
+// --------------------------------------------------------------- code39
+
+fn check_code39(inout f: i64) / {io} {
+    print("-- code39: three of nine, and the asterisk that is not data")
+    let e: str ! Code39Error = code39.encode("ABC123")
+    say(f, "it encodes to the modules python-barcode produces",
+        (e ?? "") == "10001011101110101110101000101110101110100010111011" +
+        "10111010001010111010001010111010111000101011101110111000" +
+        "101010100010111011101")
+    say(f, "every pattern is fifteen modules, three of them wide",
+        code39.is_three_of_nine())
+    say(f, "the symbol begins and ends with the same delimiter",
+        (e ?? "").starts_with(code39.delimiter_pattern()) and
+        (e ?? "").ends_with(code39.delimiter_pattern()))
+    say(f, "forty-three characters, and lower case is not among them",
+        code39.encodable_characters().len() == 43 and
+        code39.is_encodable("HELLO-42") and
+        not code39.is_encodable("Hello"))
+    say(f, "lower case is upper-cased rather than refused",
+        (code39.encode("abc") ?? "x") == (code39.encode("ABC") ?? "y"))
+    say(f, "a checksum exists and is optional",
+        (code39.check_character("ABC123") ?? "") != "" and
+        (code39.encode_with_checksum("ABC123") ?? "").len() >
+        (e ?? "").len())
+    // Code 39 is about three times as wide as Code 128 for a long number.
+    say(f, "and it is much wider than Code 128 for the same digits",
+        code39.width_in_modules("12345678901234567890") >
+        width("12345678901234567890") * 2)
+    say(f, "full ASCII is a convention of pairs, layered on top",
+        code39.needs_full_ascii("Hello") and
+        code39.to_full_ascii("aB") == "+AB" and
+        code39.to_full_ascii("a?") == "+A%J" and
+        code39.to_full_ascii("a:") == "+A/Z")
+    say(f, "the asterisks a barcode font makes people type are not the value",
+        code39.payload("*ABC123*") == "ABC123" and
+        code39.payload("ABC123") == "ABC123")
+    say(f, "a character outside the alphabet is refused with its position",
+        (code39.encode("AB!CD") ?? "ERR") == "ERR")
+}
+
+fn main() / {io} {
+    var f = 0
+    check_code128(f)
+    check_ean(f)
+    check_itf(f)
+    check_codabar(f)
+    check_code39(f)
+    if f == 0 {
+        print("barcodes: every claim held")
+    } else {
+        print("barcodes: {f} claims failed")
+    }
+}

@@ -1,0 +1,323 @@
+// EAN and UPC: the barcode on everything in a shop.
+//
+// Thirteen digits, or eight, or twelve — the same encoding wearing different
+// names in different places. EAN-13 is the international one, UPC-A is the
+// American one and is an EAN-13 whose first digit is zero, and EAN-8 is the
+// short one for small packages.
+//
+// ## The digit that is not drawn
+//
+// An EAN-13 has thirteen digits and twelve digits' worth of bars. The first
+// one is never drawn: it is encoded in the *parity* of the six left-hand
+// digits, each of which is written with one of two mutually reversed
+// alphabets. A scanner reads which alphabet each digit used, looks the
+// pattern up, and recovers the first digit from it.
+//
+// That is also why the encoding is symmetric enough to be read upside down:
+// the right-hand alphabet is the left-hand one inverted, so a scanner that
+// finds the guard patterns in the wrong order knows to reverse everything.
+//
+// ## The check digit is a weighted sum, and the weights alternate
+//
+// Digits in odd positions count once and even positions three times, counting
+// from the right. The result modulo ten, subtracted from ten. Three catches
+// a single-digit error and — unlike a plain sum — most transpositions, which
+// is the failure that matters when a person is typing a number off a box.
+//
+// It does not catch a transposition of two digits differing by five: 18 and
+// 81 have the same check digit under this scheme, and every EAN in the world
+// has that hole.
+//
+// ## What UPC-E is
+//
+// A twelve-digit UPC-A compressed to eight by removing runs of zeros, for
+// packages too small for the full symbol. It is not a separate numbering
+// system and expanding it back is a fixed set of six rules — which is what
+// `expand_upc_e` does, and what a point-of-sale system needs before it can
+// look the product up.
+//
+// Checked against Python's `python-barcode` for every module pattern and
+// every check digit below.
+
+type EanError =
+    | WrongLength(expected: i64, given: i64)
+    | NotADigit(character: str)
+    | BadCheckDigit(expected: i64, given: i64)
+
+pub fn guard() -> str {
+    return "101"
+}
+
+pub fn centre_guard() -> str {
+    return "01010"
+}
+
+fn digits_of(text: str) -> [i64] ! EanError {
+    var out: [i64] = []
+    for c in text.chars() {
+        if c < "0" or c > "9" {
+            fail(NotADigit(c))
+        }
+        out.push(c.parse_int() ?? 0)
+    }
+    return out
+}
+
+/// The check digit for a number that does not yet have one.
+///
+/// Weights of three and one alternating from the right, which is what makes
+/// it catch transpositions. Pass the number *without* its check digit.
+pub fn check_digit(body: str) -> i64 ! EanError {
+    let ds = try digits_of(body)
+    var total = 0
+    var i = 0
+    while i < ds.len() {
+        // Counting from the right, so the rightmost body digit weighs three.
+        let weight = if (ds.len() - 1 - i) % 2 == 0 { 3 } else { 1 }
+        total = total + ds[i] * weight
+        i = i + 1
+    }
+    return (10 - total % 10) % 10
+}
+
+/// Whether a complete number's own check digit is right.
+pub fn is_valid(number: str) -> bool {
+    if number.len() < 2 {
+        return false
+    }
+    let body = number.substr(0, number.len() - 1)
+    let given = number.substr(number.len() - 1, 1).parse_int() ?? (0 - 1)
+    let expected = check_digit(body) ?? (0 - 2)
+    return given == expected
+}
+
+/// The number with its check digit appended.
+pub fn with_check_digit(body: str) -> str ! EanError {
+    let d = try check_digit(body)
+    return body + "{d}"
+}
+
+/// EAN-13 as modules, from twelve or thirteen digits.
+pub fn ean13(number: str) -> str ! EanError {
+    var full = number
+    if number.len() == 12 {
+        full = try with_check_digit(number)
+    }
+    if full.len() != 13 {
+        fail(WrongLength(13, full.len()))
+    }
+    let ds = try digits_of(full)
+    let expected = try check_digit(full.substr(0, 12))
+    if ds[12] != expected {
+        fail(BadCheckDigit(expected, ds[12]))
+    }
+    let a = ean_codes_a()
+    let b = ean_codes_b()
+    let c = ean_codes_c()
+    // The first digit chooses which of A and B encodes each of the next six.
+    let parity = ean_left_pattern()[ds[0]]
+    var out = guard()
+    var i = 1
+    while i <= 6 {
+        if parity.substr(i - 1, 1) == "A" {
+            out = out + a[ds[i]]
+        } else {
+            out = out + b[ds[i]]
+        }
+        i = i + 1
+    }
+    out = out + centre_guard()
+    while i <= 12 {
+        out = out + c[ds[i]]
+        i = i + 1
+    }
+    return out + guard()
+}
+
+/// EAN-8 as modules, from seven or eight digits.
+///
+/// No parity trick: four digits in set A on the left and four in set C on the
+/// right, and every digit is drawn.
+pub fn ean8(number: str) -> str ! EanError {
+    var full = number
+    if number.len() == 7 {
+        full = try with_check_digit(number)
+    }
+    if full.len() != 8 {
+        fail(WrongLength(8, full.len()))
+    }
+    let ds = try digits_of(full)
+    let expected = try check_digit(full.substr(0, 7))
+    if ds[7] != expected {
+        fail(BadCheckDigit(expected, ds[7]))
+    }
+    let a = ean_codes_a()
+    let c = ean_codes_c()
+    var out = guard()
+    var i = 0
+    while i < 4 {
+        out = out + a[ds[i]]
+        i = i + 1
+    }
+    out = out + centre_guard()
+    while i < 8 {
+        out = out + c[ds[i]]
+        i = i + 1
+    }
+    return out + guard()
+}
+
+/// UPC-A as modules, from eleven or twelve digits.
+///
+/// A UPC-A is an EAN-13 with a leading zero, and the symbol is identical —
+/// which is why every scanner reads both and why the two numbering systems
+/// merged in 2005.
+pub fn upc_a(number: str) -> str ! EanError {
+    var full = number
+    if number.len() == 11 {
+        full = try with_check_digit(number)
+    }
+    if full.len() != 12 {
+        fail(WrongLength(12, full.len()))
+    }
+    return try ean13("0" + full)
+}
+
+/// The twelve-digit UPC-A a UPC-E stands for.
+///
+/// Six rules keyed on the last digit, each putting a run of zeros back
+/// somewhere different. There is no pattern to them; they are a table from
+/// 1973 chosen to cover the most common product codes.
+pub fn expand_upc_e(short: str) -> str ! EanError {
+    if short.len() != 8 {
+        fail(WrongLength(8, short.len()))
+    }
+    let ds = try digits_of(short)
+    let manufacturer = short.substr(1, 5)
+    let last = ds[6]
+    var middle = ""
+    if last <= 2 {
+        middle = manufacturer.substr(0, 2) + "{last}" + "0000" +
+        manufacturer.substr(2, 3)
+    }
+    if last == 3 {
+        middle = manufacturer.substr(0, 3) + "00000" +
+        manufacturer.substr(3, 2)
+    }
+    if last == 4 {
+        middle = manufacturer.substr(0, 4) + "00000" +
+        manufacturer.substr(4, 1)
+    }
+    if last >= 5 {
+        middle = manufacturer + "0000" + "{last}"
+    }
+    let body = short.substr(0, 1) + middle
+    return try with_check_digit(body)
+}
+
+/// How many modules an EAN-13 takes: 95, always.
+///
+/// Every EAN-13 in the world is the same width, which is what lets a scanner
+/// know it has read a whole one.
+pub fn ean13_modules() -> i64 {
+    return 95
+}
+
+pub fn ean8_modules() -> i64 {
+    return 67
+}
+
+/// Which country or product category a number belongs to.
+///
+/// The first three digits are a GS1 prefix, and it names the *registry* the
+/// number was issued by rather than where the thing was made — a lasting
+/// source of confusion in shops.
+pub fn prefix_meaning(number: str) -> str {
+    if number.len() < 3 {
+        return "too short"
+    }
+    let prefix = number.substr(0, 3).parse_int() ?? (0 - 1)
+    if prefix < 0 {
+        return "not a number"
+    }
+    if prefix <= 19 or (prefix >= 30 and prefix <= 139) {
+        return "United States and Canada"
+    }
+    if prefix >= 200 and prefix <= 299 {
+        return "restricted to a shop's own use"
+    }
+    if prefix >= 300 and prefix <= 379 {
+        return "France"
+    }
+    if prefix >= 400 and prefix <= 440 {
+        return "Germany"
+    }
+    if prefix >= 450 and prefix <= 459 {
+        return "Japan"
+    }
+    if prefix >= 500 and prefix <= 509 {
+        return "the United Kingdom"
+    }
+    if prefix >= 690 and prefix <= 699 {
+        return "China"
+    }
+    if prefix >= 977 and prefix <= 977 {
+        return "a periodical, by ISSN"
+    }
+    if prefix >= 978 and prefix <= 979 {
+        return "a book, by ISBN"
+    }
+    return "a GS1 member organisation"
+}
+
+/// Whether a number is a book's ISBN in EAN form.
+pub fn is_isbn(number: str) -> bool {
+    return number.len() == 13 and (number.starts_with("978") or
+        number.starts_with("979")) and is_valid(number)
+}
+/// The EAN digit encodings for set A.
+///
+/// Three sets for ten digits: `A` and `B` on the left half and `C` on the
+/// right. `B` is `A` reversed with the bits inverted, which is what lets a
+/// scanner tell which way up the barcode is.
+fn ean_codes_a() -> [str] {
+    return [
+        "0001101", "0011001", "0010011", "0111101", "0100011",
+        "0110001", "0101111", "0111011", "0110111", "0001011",
+    ]
+}
+/// The EAN digit encodings for set B.
+///
+/// Three sets for ten digits: `A` and `B` on the left half and `C` on the
+/// right. `B` is `A` reversed with the bits inverted, which is what lets a
+/// scanner tell which way up the barcode is.
+fn ean_codes_b() -> [str] {
+    return [
+        "0100111", "0110011", "0011011", "0100001", "0011101",
+        "0111001", "0000101", "0010001", "0001001", "0010111",
+    ]
+}
+/// The EAN digit encodings for set C.
+///
+/// Three sets for ten digits: `A` and `B` on the left half and `C` on the
+/// right. `B` is `A` reversed with the bits inverted, which is what lets a
+/// scanner tell which way up the barcode is.
+fn ean_codes_c() -> [str] {
+    return [
+        "1110010", "1100110", "1101100", "1000010", "1011100",
+        "1001110", "1010000", "1000100", "1001000", "1110100",
+    ]
+}
+/// Which of `A` and `B` encodes each of the six left-hand digits.
+///
+/// The row is chosen by the *first* digit, which is therefore not drawn
+/// anywhere — it exists only as this parity pattern. That is why EAN-13
+/// carries thirteen digits in twelve digits' worth of bars.
+fn ean_left_pattern() -> [str] {
+    return [
+        "AAAAAA", "AABABB", "AABBAB",
+        "AABBBA", "ABAABB", "ABBAAB",
+        "ABBBAA", "ABABAB", "ABABBA",
+        "ABBABA",
+    ]
+}

@@ -1,0 +1,24 @@
+[package]
+name = "barcode_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.code128]
+path = "../code128"
+version = "^1.0.0"
+
+[dependencies.ean]
+path = "../ean"
+version = "^1.0.0"
+
+[dependencies.itf]
+path = "../itf"
+version = "^1.0.0"
+
+[dependencies.codabar]
+path = "../codabar"
+version = "^1.0.0"
+
+[dependencies.code39]
+path = "../code39"
+version = "^1.0.0"

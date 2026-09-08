@@ -1,0 +1,296 @@
+// Code 128: the barcode on every parcel, and the one that switches alphabets
+// mid-symbol.
+//
+// It encodes all 128 ASCII characters in about half the width of Code 39, and
+// it does it by having **three** character sets and switching between them.
+//
+//   * **A** — digits, capitals, punctuation and the control characters.
+//   * **B** — digits, capitals, lower case and punctuation.
+//   * **C** — *pairs* of digits, so `1234` is two symbols rather than four.
+//
+// ## Set C is the whole reason it is worth using
+//
+// A run of digits encoded in C takes half the space it does in B. A shipping
+// number of twenty digits is ten symbols instead of twenty, and that is the
+// difference between a label that fits and one that does not. Encoding
+// everything in B is easy, correct, and produces a barcode twice as wide as
+// it needs to be — which is what most naive implementations do.
+//
+// The rule this uses is the one the standard recommends: start in C if the
+// data begins with four or more digits, switch into C whenever six or more
+// digits appear together, and switch back out when they run out. Fewer than
+// six is not worth the switch symbol.
+//
+// ## The checksum is positional
+//
+// Every symbol's value is multiplied by its position — the start code counts
+// once, the first data symbol once, the second twice — and the total is taken
+// modulo 103. That catches a transposition, which a plain sum would not, and
+// it is why a check digit computed by adding the values is wrong in a way
+// that passes most tests.
+//
+// ## What this does not do
+//
+// Draw anything. The output is a string of `1` and `0` for bar and space, one
+// character per module, and turning that into ink is the caller's problem —
+// which is right, because the quiet zone, the module width and the height are
+// all decisions about the printer rather than about the data.
+//
+// Checked against Python's `python-barcode` for every encoding below.
+
+type Code128Error =
+    | NotEncodable(character: str, at: i64)
+    | Empty()
+
+    /// The number of modules in a symbol, which is where the name comes from —
+    /// eleven modules, three bars, three spaces.
+pub fn modules_per_symbol() -> i64 {
+    return 11
+}
+
+pub fn start_a() -> i64 {
+    return 103
+}
+
+pub fn start_b() -> i64 {
+    return 104
+}
+
+pub fn start_c() -> i64 {
+    return 105
+}
+
+/// The stop symbol, which is not in the value table.
+///
+/// Thirteen modules rather than eleven: the extra two are a termination bar
+/// that lets a scanner read the symbol backwards and know it has. It has no
+/// value and never enters the checksum.
+pub fn stop_pattern() -> str {
+    return "1100011101011"
+}
+
+/// Switching to another set for one character only.
+pub fn shift_code() -> i64 {
+    return 98
+}
+
+fn code_a() -> i64 {
+    return 101
+}
+
+fn code_b() -> i64 {
+    return 100
+}
+
+fn code_c() -> i64 {
+    return 99
+}
+
+fn is_digit(c: str) -> bool {
+    return c >= "0" and c <= "9"
+}
+
+/// The value of a character in set B, which covers printable ASCII.
+///
+/// Set B's values run from space at zero, so the value is the codepoint less
+/// 32 — for everything below 128. There is no table because there is no need
+/// for one.
+fn value_in_b(c: str) -> i64 {
+    let code = c.codes()[0]
+    if code < 32 or code > 126 {
+        return 0 - 1
+    }
+    return code - 32
+}
+
+/// How many digits start at `at`.
+fn digit_run(chars: [str], at: i64) -> i64 {
+    var n = 0
+    var i = at
+    while i < chars.len() and is_digit(chars[i]) {
+        n = n + 1
+        i = i + 1
+    }
+    return n
+}
+
+/// The symbol values for a string, switching sets where it pays.
+///
+/// Returned as values rather than modules so a caller can see the switches,
+/// check the length, and compute the checksum itself if it wants to.
+pub fn encode_values(text: str) -> [i64] ! Code128Error {
+    if text == "" {
+        fail(Empty())
+    }
+    let chars = text.chars()
+    var out: [i64] = []
+    // Starting in C pays from four digits: two symbols saved against one
+    // spent on the switch back.
+    var in_c = digit_run(chars, 0) >= 4
+    if in_c {
+        out.push(start_c())
+    } else {
+        out.push(start_b())
+    }
+    var i = 0
+    while i < chars.len() {
+        let run = digit_run(chars, i)
+        if in_c {
+            if run >= 2 {
+                let pair = chars[i].parse_int() ?? 0
+                let second = chars[i + 1].parse_int() ?? 0
+                out.push(pair * 10 + second)
+                i = i + 2
+                continue
+            }
+            out.push(code_b())
+            in_c = false
+            continue
+        }
+        // Six digits is where the switch into C pays for itself; at the end
+        // of the string four is enough, because nothing switches back.
+        let enough = if i + run >= chars.len() { 4 } else { 6 }
+        if run >= enough and run % 2 == 0 {
+            out.push(code_c())
+            in_c = true
+            continue
+        }
+        let value = value_in_b(chars[i])
+        if value < 0 {
+            fail(NotEncodable(chars[i], i))
+        }
+        out.push(value)
+        i = i + 1
+    }
+    return out
+}
+
+/// The check symbol: every value weighted by its position, modulo 103.
+///
+/// The start code counts once and the first data symbol counts once too,
+/// which is the off-by-one every implementation gets wrong once.
+pub fn checksum(values: [i64]) -> i64 {
+    if values.len() == 0 {
+        return 0
+    }
+    var total = values[0]
+    var i = 1
+    while i < values.len() {
+        total = total + values[i] * i
+        i = i + 1
+    }
+    return total % 103
+}
+
+/// The whole symbol as modules: `1` for a bar, `0` for a space.
+pub fn encode(text: str) -> str ! Code128Error {
+    let values = try encode_values(text)
+    var complete = values
+    complete.push(checksum(values))
+    let patterns = code128_patterns()
+    var out = ""
+    for v in complete {
+        if v < 0 or v >= patterns.len() {
+            fail(NotEncodable("{v}", 0))
+        }
+        out = out + patterns[v]
+    }
+    return out + stop_pattern()
+}
+
+/// How wide the symbol is, in modules, without the quiet zones.
+pub fn width_in_modules(text: str) -> i64 ! Code128Error {
+    let values = try encode_values(text)
+    // Every symbol is eleven modules and the stop is thirteen.
+    return (values.len() + 1) * 11 + 13
+}
+
+/// The width the same data would take with no set C at all.
+///
+/// The comparison worth printing when somebody asks why the label is wide:
+/// twenty digits are ten symbols in C and twenty in B.
+pub fn width_without_set_c(text: str) -> i64 {
+    return (text.len() + 2) * 11 + 13
+}
+
+/// Whether every character can be encoded.
+pub fn is_encodable(text: str) -> bool {
+    for c in text.chars() {
+        if value_in_b(c) < 0 {
+            return false
+        }
+    }
+    return text != ""
+}
+
+/// The first character that cannot be encoded, with its position.
+pub fn first_unencodable(text: str) -> Option[(str, i64)] {
+    let chars = text.chars()
+    var i = 0
+    while i < chars.len() {
+        if value_in_b(chars[i]) < 0 {
+            return Some((chars[i], i))
+        }
+        i = i + 1
+    }
+    return None
+}
+
+/// Which sets the encoder chose, as a string of `B` and `C`.
+///
+/// For seeing what the switching rule did, which is otherwise invisible in a
+/// string of ones and zeros.
+pub fn sets_used(text: str) -> str {
+    let values = encode_values(text) ?? []
+    var out = ""
+    var current = ""
+    for v in values {
+        if v == start_b() or v == code_b() {
+            current = "B"
+        }
+        if v == start_c() or v == code_c() {
+            current = "C"
+        }
+        if v != start_b() and v != start_c() and v != code_b() and
+        v != code_c() {
+            out = out + current
+        }
+    }
+    return out
+}
+/// The 106 Code 128 symbol values, as module patterns.
+///
+/// Eleven modules each, three bars and three spaces — which is where the
+/// name comes from. The stop is not among them: it is thirteen modules and
+/// has no value, so it is `stop_pattern` instead.
+fn code128_patterns() -> [str] {
+    return [
+        "11011001100", "11001101100", "11001100110", "10010011000",
+        "10010001100", "10001001100", "10011001000", "10011000100",
+        "10001100100", "11001001000", "11001000100", "11000100100",
+        "10110011100", "10011011100", "10011001110", "10111001100",
+        "10011101100", "10011100110", "11001110010", "11001011100",
+        "11001001110", "11011100100", "11001110100", "11101101110",
+        "11101001100", "11100101100", "11100100110", "11101100100",
+        "11100110100", "11100110010", "11011011000", "11011000110",
+        "11000110110", "10100011000", "10001011000", "10001000110",
+        "10110001000", "10001101000", "10001100010", "11010001000",
+        "11000101000", "11000100010", "10110111000", "10110001110",
+        "10001101110", "10111011000", "10111000110", "10001110110",
+        "11101110110", "11010001110", "11000101110", "11011101000",
+        "11011100010", "11011101110", "11101011000", "11101000110",
+        "11100010110", "11101101000", "11101100010", "11100011010",
+        "11101111010", "11001000010", "11110001010", "10100110000",
+        "10100001100", "10010110000", "10010000110", "10000101100",
+        "10000100110", "10110010000", "10110000100", "10011010000",
+        "10011000010", "10000110100", "10000110010", "11000010010",
+        "11001010000", "11110111010", "11000010100", "10001111010",
+        "10100111100", "10010111100", "10010011110", "10111100100",
+        "10011110100", "10011110010", "11110100100", "11110010100",
+        "11110010010", "11011011110", "11011110110", "11110110110",
+        "10101111000", "10100011110", "10001011110", "10111101000",
+        "10111100010", "11110101000", "11110100010", "10111011110",
+        "10111101110", "11101011110", "11110101110", "11010000100",
+        "11010010000", "11010011100",
+    ]
+}

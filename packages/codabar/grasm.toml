@@ -1,0 +1,6 @@
+[package]
+name = "codabar"
+version = "1.0.0"
+
+# Turning text into module patterns. Opens nothing.
+capabilities = []

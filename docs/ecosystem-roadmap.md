@@ -14,7 +14,7 @@ plan that discovers them 300 packages in.
 | | |
 |---|---|
 | Started | 78 |
-| Now | 325 |
+| Now | 330 |
 | Tier 1 target | 200 |
 | Tier 2 target | 500 |
 | Tier 3 target | 800 |
@@ -226,7 +226,7 @@ says where the data came from and under what licence, which is the condition.
 | ~~Graph algorithms II~~ | ~~`maxflow` `matching` `pagerank` `centrality` `spanning`~~ — done | networkx, scipy |
 | Numerical methods | `rootfind` `quadrature` `ode` `optimise` `autodiff` | scipy |
 | Fonts | `sfnt` `cmap` `glyf` `woff` `fontmetrics` | fontTools |
-| Barcodes | `code128` `ean` `itf` `codabar` `barcodetext` | python-barcode |
+| ~~Barcodes~~ | ~~`code128` `ean` `itf` `codabar` `code39`~~ — done | python-barcode |
 | Audio metadata | `id3` `flacmeta` `midi` `wavmeta` `loudness` | mutagen |
 | Images II | `gif` `ico` `jpegmeta` `resample` `bmpwrite` | Pillow |
 | Text encodings | `codepage` `shiftjis` `gb18030` `big5` `euckr` | Python codecs |

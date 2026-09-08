@@ -1,0 +1,185 @@
+// Interleaved 2 of 5: the densest way to encode digits with bars alone.
+//
+// The trick is in the name. Five elements encode a digit, two of them wide —
+// that is "2 of 5" — and then the *spaces* carry a second digit. One digit is
+// drawn in the bars and the next in the gaps between them, so two digits
+// occupy the space of one.
+//
+// It is the barcode on cardboard cartons, because it is the one that survives
+// being printed badly on corrugated board: only two widths, no fine
+// gradations, and nothing to read but wide-or-narrow.
+//
+// ## Why it must have an even number of digits
+//
+// A pair is one bar-digit and one space-digit. An odd count leaves a digit
+// with no partner, and the universal convention is to pad with a leading zero
+// — which changes the number. `pad_to_even` does it explicitly so that a
+// caller sees the number they will actually be printing, rather than
+// discovering later that their fourteen-digit code became fifteen digits with
+// a zero on the front.
+//
+// ## Why it is dangerous, and what bearer bars are for
+//
+// ITF has no start or stop character to speak of — the start is two narrow
+// bars and two narrow spaces — and no self-checking. A scanner that clips the
+// edge of the symbol reads a **shorter valid number**, because any even prefix
+// of an ITF symbol is itself a valid ITF symbol. That is the format's one
+// serious flaw and it has caused real mis-shipments.
+//
+// The fix is printed rather than encoded: a thick frame around the symbol,
+// called bearer bars, so a scan that misses part of it misses the frame and
+// is rejected. A caller printing ITF without them is relying on luck.
+//
+// Checked against Python's `python-barcode` at its default two-and-five
+// module widths.
+
+type ItfError =
+    | OddLength(length: i64)
+    | NotADigit(character: str)
+    | Empty()
+
+pub fn start_pattern() -> str {
+    return "NnNn"
+}
+
+pub fn stop_pattern() -> str {
+    return "WnN"
+}
+
+/// The five-element pattern for each digit: two wide and three narrow.
+///
+/// The ten patterns are every way of choosing two positions from five, which
+/// is why there are exactly ten and why the encoding is as dense as it is.
+pub fn digit_patterns() -> [str] {
+    return ["NNWWN", "WNNNW", "NWNNW", "WWNNN", "NNWNW", "WNWNN", "NWWNN",
+        "NNNWW", "WNNWN", "NWNWN"]
+}
+
+fn is_digit(c: str) -> bool {
+    return c >= "0" and c <= "9"
+}
+
+/// The number with a leading zero if it needs one to be even.
+pub fn pad_to_even(number: str) -> str {
+    if number.len() % 2 == 1 {
+        return "0" + number
+    }
+    return number
+}
+
+/// The interleaved element string, before the widths are chosen.
+///
+/// Capitals are bars and lower case are spaces, which is the notation every
+/// two-width barcode uses and which makes the interleaving readable.
+pub fn elements(number: str) -> str ! ItfError {
+    if number == "" {
+        fail(Empty())
+    }
+    if number.len() % 2 == 1 {
+        fail(OddLength(number.len()))
+    }
+    let chars = number.chars()
+    for c in chars {
+        if not is_digit(c) {
+            fail(NotADigit(c))
+        }
+    }
+    let patterns = digit_patterns()
+    var out = start_pattern()
+    var i = 0
+    while i < chars.len() {
+        let bars = patterns[chars[i].parse_int() ?? 0]
+        let spaces = patterns[chars[i + 1].parse_int() ?? 0]
+        var j = 0
+        while j < 5 {
+            out = out + bars.substr(j, 1).to_upper()
+            out = out + spaces.substr(j, 1).to_lower()
+            j = j + 1
+        }
+        i = i + 2
+    }
+    return out + stop_pattern()
+}
+
+/// The modules, given how many a narrow and a wide element take.
+///
+/// The ratio matters: below about two and a half to one a scanner cannot tell
+/// them apart on a badly printed carton, which is why the specification asks
+/// for between two and three and why two-and-five is the common choice.
+pub fn encode_with_widths(number: str, narrow: i64,
+    wide: i64) -> str ! ItfError {
+    let pattern = try elements(number)
+    var out = ""
+    for e in pattern.chars() {
+        if e == "W" {
+            out = out + repeat("1", wide)
+        }
+        if e == "w" {
+            out = out + repeat("0", wide)
+        }
+        if e == "N" {
+            out = out + repeat("1", narrow)
+        }
+        if e == "n" {
+            out = out + repeat("0", narrow)
+        }
+    }
+    return out
+}
+
+fn repeat(c: str, n: i64) -> str {
+    var out = ""
+    var i = 0
+    while i < n {
+        out = out + c
+        i = i + 1
+    }
+    return out
+}
+
+/// The modules at the usual widths.
+pub fn encode(number: str) -> str ! ItfError {
+    return try encode_with_widths(number, 2, 5)
+}
+
+/// The check digit ITF-14 carries, which is EAN's.
+///
+/// ITF itself has no checksum. ITF-14 — the carton code — adds one, computed
+/// exactly as an EAN's is, and it is the only thing standing between a
+/// clipped scan and a wrong shipment.
+pub fn check_digit(body: str) -> i64 ! ItfError {
+    let chars = body.chars()
+    var total = 0
+    var i = 0
+    while i < chars.len() {
+        if not is_digit(chars[i]) {
+            fail(NotADigit(chars[i]))
+        }
+        let weight = if (chars.len() - 1 - i) % 2 == 0 { 3 } else { 1 }
+        total = total + (chars[i].parse_int() ?? 0) * weight
+        i = i + 1
+    }
+    return (10 - total % 10) % 10
+}
+
+/// An ITF-14: thirteen digits and a check digit, always fourteen.
+pub fn itf14(body: str) -> str ! ItfError {
+    if body.len() != 13 {
+        fail(OddLength(body.len()))
+    }
+    let d = try check_digit(body)
+    return try encode(body + "{d}")
+}
+
+/// Whether a shorter number is a valid reading of a longer symbol.
+///
+/// The failure this format is famous for: any even-length prefix decodes
+/// cleanly, so a clipped scan is not an error. This says whether a given pair
+/// of readings could be the same symbol scanned twice, which is the check a
+/// warehouse system should run before believing a short one.
+pub fn could_be_clipped(full: str, short: str) -> bool {
+    if short.len() >= full.len() or short.len() % 2 != 0 {
+        return false
+    }
+    return full.starts_with(short)
+}

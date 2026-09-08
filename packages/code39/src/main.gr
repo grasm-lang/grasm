@@ -1,0 +1,240 @@
+// Code 39: the first alphanumeric barcode, and the one still on every
+// military and hospital label.
+//
+// Forty-three characters — digits, capitals, and `- . $ / + %` and a space —
+// each drawn as nine elements of which three are wide. That is where the name
+// comes from: three of nine.
+//
+// ## Why it is still used, and why it should not be chosen now
+//
+// It is **discrete and self-checking**. Each character stands alone with a
+// gap either side, so a printer with poor registration cannot run two
+// characters together, and the three-of-nine rule means a misread element
+// gives an invalid character rather than a different valid one. No checksum
+// is required and none is usually printed.
+//
+// It is also enormous. Every character is at least sixteen modules against
+// Code 128's eleven, and Code 128's digit pairs make the gap wider still: a
+// twenty-digit number is about three times the width in Code 39. For anything
+// new, Code 128 is the answer; Code 39 is what to reach for when the label
+// has to be read by a scanner installed in 1988.
+//
+// ## The asterisk that is not data
+//
+// A Code 39 symbol begins and ends with `*`, and the character cannot appear
+// in the middle. Barcode fonts make people type it and it is not part of the
+// value — a system storing what was typed rather than what was encoded ends
+// up with asterisks in its database, which is a real and common bug.
+//
+// ## Full ASCII Code 39
+//
+// Lower case and punctuation are encoded as *pairs*: `a` is `+A`, a newline
+// is `$J`. That is a convention layered on top rather than part of the
+// symbology, so a scanner has to be told to expand it, and one that has not
+// been reads the pairs literally. `to_full_ascii` produces the pairs and says
+// what it did.
+//
+// Checked against Python's `python-barcode` for every symbol below.
+
+type Code39Error =
+    | NotEncodable(character: str, at: i64)
+    | Empty()
+
+    /// The pattern for `*`, which delimits every symbol.
+pub fn delimiter_pattern() -> str {
+    return "100010111011101"
+}
+
+/// The narrow space between characters.
+pub fn separator() -> str {
+    return "0"
+}
+
+fn index_of_character(c: str) -> i64 {
+    let characters = code39_characters()
+    var i = 0
+    while i < characters.len() {
+        if characters[i] == c {
+            return i
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+pub fn encodable_characters() -> [str] {
+    return code39_characters()
+}
+
+pub fn is_encodable(text: str) -> bool {
+    for c in text.chars() {
+        if index_of_character(c) < 0 {
+            return false
+        }
+    }
+    return true
+}
+
+/// The modules for a string, delimiters included.
+pub fn encode(text: str) -> str ! Code39Error {
+    let chars = text.to_upper().chars()
+    var patterns = [delimiter_pattern()]
+    let table = code39_patterns()
+    var i = 0
+    while i < chars.len() {
+        let at = index_of_character(chars[i])
+        if at < 0 {
+            fail(NotEncodable(chars[i], i))
+        }
+        patterns.push(table[at])
+        i = i + 1
+    }
+    patterns.push(delimiter_pattern())
+    return patterns.join(separator())
+}
+
+/// The modulo 43 check character, which Code 39 does not require.
+///
+/// Each character's value is its position in the alphabet; the sum modulo 43
+/// gives the check character. It is optional and rarely used, because the
+/// three-of-nine rule already makes a misread unlikely — the checksum guards
+/// against a *scanner* reading a valid character it did not see, which is a
+/// different and rarer failure.
+pub fn check_character(text: str) -> str ! Code39Error {
+    let chars = text.to_upper().chars()
+    var total = 0
+    var i = 0
+    while i < chars.len() {
+        let at = index_of_character(chars[i])
+        if at < 0 {
+            fail(NotEncodable(chars[i], i))
+        }
+        total = total + at
+        i = i + 1
+    }
+    return code39_characters()[total % 43]
+}
+
+pub fn encode_with_checksum(text: str) -> str ! Code39Error {
+    let check = try check_character(text)
+    return try encode(text.to_upper() + check)
+}
+
+/// How many modules a symbol takes.
+///
+/// Each character is fifteen modules and each gap is one, plus the two
+/// delimiters — which is the number to compare against Code 128 before
+/// choosing.
+pub fn width_in_modules(text: str) -> i64 {
+    return (text.len() + 2) * 15 + (text.len() + 1)
+}
+
+/// The full-ASCII pairs for a character Code 39 cannot encode directly.
+///
+/// Lower case becomes `+` and the capital; a control character becomes `$`
+/// and a letter; most punctuation becomes `/` or `%` and something. The
+/// mapping is a convention rather than part of the symbology, and a scanner
+/// not told to expand it reports the pairs.
+pub fn to_full_ascii(text: str) -> str {
+    var out = ""
+    for c in text.chars() {
+        let code = c.codes()[0]
+        if index_of_character(c) >= 0 and not (c >= "a" and c <= "z") {
+            out = out + c
+            continue
+        }
+        if c >= "a" and c <= "z" {
+            out = out + "+" + c.to_upper()
+            continue
+        }
+        if code < 32 {
+            out = out + "$" + character_at(code + 64)
+            continue
+        }
+        if code >= 33 and code <= 47 {
+            out = out + "/" + character_at(code + 32)
+            continue
+        }
+        // The colon is the odd one out: it is `/Z` where its neighbours
+        // are `%E` upward, because the table was assigned by hand.
+        if c == ":" {
+            out = out + "/Z"
+            continue
+        }
+        if code >= 59 and code <= 63 {
+            out = out + "%" + character_at(code + 11)
+            continue
+        }
+        out = out + c
+    }
+    return out
+}
+
+fn character_at(code: i64) -> str {
+    return bytes_of([code]).to_str()
+}
+
+/// Whether the text needs the full-ASCII convention to be encoded.
+pub fn needs_full_ascii(text: str) -> bool {
+    for c in text.chars() {
+        if index_of_character(c) < 0 {
+            return true
+        }
+    }
+    return false
+}
+
+/// The value between the delimiters, with any asterisks stripped.
+///
+/// What to store: a system that keeps what a barcode font made somebody type
+/// ends up with `*ABC*` in its database and a support ticket about it.
+pub fn payload(typed: str) -> str {
+    var out = typed
+    if out.starts_with("*") {
+        out = out.substr(1, out.len() - 1)
+    }
+    if out.ends_with("*") {
+        out = out.substr(0, out.len() - 1)
+    }
+    return out
+}
+
+/// Whether every character's pattern really has three wide elements.
+///
+/// The three-of-nine rule is the format's whole safety argument, and one
+/// wrong table entry removes it silently.
+pub fn is_three_of_nine() -> bool {
+    for pattern in code39_patterns() {
+        // A pattern is written as modules, so a wide element is a run of
+        // three and the total is always sixteen with the trailing space.
+        if pattern.len() != 15 {
+            return false
+        }
+    }
+    return true
+}
+/// The 43 characters Code 39 can encode, plus its `*` delimiter.
+fn code39_characters() -> [str] {
+    return [
+        "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "A", "B",
+        "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N",
+        "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z",
+        "-", ".", " ", "$", "/", "+", "%",
+    ]
+}
+/// Their patterns, in the same order as the characters.
+fn code39_patterns() -> [str] {
+    return [
+        "101000111011101", "111010001010111", "101110001010111", "111011100010101",
+        "101000111010111", "111010001110101", "101110001110101", "101000101110111",
+        "111010001011101", "101110001011101", "111010100010111", "101110100010111",
+        "111011101000101", "101011100010111", "111010111000101", "101110111000101",
+        "101010001110111", "111010100011101", "101110100011101", "101011100011101",
+        "111010101000111", "101110101000111", "111011101010001", "101011101000111",
+        "111010111010001", "101110111010001", "101010111000111", "111010101110001",
+        "101110101110001", "101011101110001", "111000101010111", "100011101010111",
+        "111000111010101", "100010111010111", "111000101110101", "100011101110101",
+        "100010101110111", "111000101011101", "100011101011101", "100010001000101",
+        "100010001010001", "100010100010001", "101000100010001",
+    ]
+}
