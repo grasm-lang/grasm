@@ -1,0 +1,432 @@
+// AMQP 0-9-1 framing: the protocol RabbitMQ actually speaks.
+//
+// AMQP 1.0 is a different protocol with the same name — a working group
+// rewrote it from scratch and kept the brand, which is why "AMQP support" in
+// a product description means nothing without a version. The one in use is
+// 0-9-1, from 2008, and it is what RabbitMQ, and therefore most of the
+// world's task queues, speak.
+//
+// ## Frames
+//
+// A type byte, a channel, a length, a payload, and a frame-end byte of 0xCE.
+// The frame-end is redundant — the length already says where the frame stops
+// — and it is there so that a decoder that has lost its place can tell
+// immediately rather than at the end of the next frame. It is the cheapest
+// possible framing check and it catches the failure it was designed for.
+//
+// ## Channels
+//
+// Several logical connections share one socket, each with a channel number,
+// and channel 0 is the connection itself. That is why an AMQP client opens
+// one TCP connection and a hundred channels rather than a hundred
+// connections, and why a protocol error on one channel closes only that one
+// while a connection error closes everything.
+//
+// ## A message is three frames
+//
+// A method frame says what is happening — `basic.publish` with an exchange
+// and a routing key. A content header frame carries the body's total size and
+// its properties. Then one or more body frames carry the bytes. They must be
+// consecutive on the channel, which is the whole reason channels exist:
+// without them a large message would block every other message on the
+// connection until it finished.
+//
+// ## The property flags
+//
+// A content header's properties are a bitmap followed by the values that are
+// present, most significant bit first, and the bitmap's low bit means "another
+// bitmap follows". Fourteen properties are defined and the continuation bit
+// has never been used by anything.
+//
+// ## Field tables
+//
+// The typed key-value encoding used for headers, connection negotiation and
+// queue arguments. Each value is a type octet and then the value; RabbitMQ
+// and the specification disagree about two of the type letters, which is the
+// classic AMQP interoperability bug — the specification says `S` is a long
+// string and RabbitMQ agrees, but the specification's short-short-int is `b`
+// and some clients wrote `t` for it.
+//
+// Checked against `pika`, which is the client RabbitMQ's own documentation
+// uses.
+
+type AmqpError =
+    | Truncated(at: i64)
+    | BadFrameEnd(found: i64)
+    | BadFrameType(kind: i64)
+    | BadFieldType(letter: str)
+    | StringTooLong(length: i64)
+
+type AmqpFrame = {
+    /// 1 method, 2 content header, 3 body, 8 heartbeat.
+    kind: i64,
+    /// 0 is the connection itself.
+    channel: i64,
+    payload: bytes,
+}
+
+/// The eight bytes a client sends before anything else.
+///
+/// `AMQP` and then the version. A server that speaks a different one replies
+/// with its own header and closes, which is the entire version negotiation.
+pub fn protocol_header() -> bytes {
+    return bytes_of([65, 77, 81, 80, 0, 0, 9, 1])
+}
+
+/// The byte that ends every frame.
+pub fn frame_end() -> i64 {
+    return 206
+}
+
+fn push16(inout out: [i64], value: i64) {
+    out.push(value / 256 % 256)
+    out.push(value % 256)
+}
+
+fn push32(inout out: [i64], value: i64) {
+    push16(out, value / 65536 % 65536)
+    push16(out, value % 65536)
+}
+
+fn push64(inout out: [i64], value: i64) {
+    push32(out, value / 4294967296)
+    push32(out, value % 4294967296)
+}
+
+fn read16(data: bytes, at: i64) -> i64 {
+    return data.at(at) * 256 + data.at(at + 1)
+}
+
+fn read32(data: bytes, at: i64) -> i64 {
+    return read16(data, at) * 65536 + read16(data, at + 2)
+}
+
+/// A frame's bytes.
+pub fn encode(frame: AmqpFrame) -> bytes {
+    var out: [i64] = [frame.kind]
+    push16(out, frame.channel)
+    push32(out, frame.payload.len())
+    for i in 0..frame.payload.len() {
+        out.push(frame.payload.at(i))
+    }
+    out.push(frame_end())
+    return bytes_of(out)
+}
+
+/// A frame read back, with the offset just past it.
+pub fn decode(data: bytes, at: i64) -> (AmqpFrame, i64) ! AmqpError {
+    if at + 7 > data.len() {
+        fail(Truncated(at))
+    }
+    let kind = data.at(at)
+    if kind != 1 and kind != 2 and kind != 3 and kind != 8 {
+        fail(BadFrameType(kind))
+    }
+    let size = read32(data, at + 3)
+    if at + 7 + size > data.len() {
+        fail(Truncated(at))
+    }
+    // The frame-end byte is redundant — the length already said where the
+    // frame stops — and it is what tells a decoder that has lost its place
+    // immediately rather than at the end of the next frame.
+    if data.at(at + 7 + size) != frame_end() {
+        fail(BadFrameEnd(data.at(at + 7 + size)))
+    }
+    var payload: [i64] = []
+    for i in 0..size {
+        payload.push(data.at(at + 7 + i))
+    }
+    return (AmqpFrame{ kind: kind, channel: read16(data, at + 1),
+        payload: bytes_of(payload) }, at + 8 + size)
+}
+
+/// A method frame: a class, a method, and the arguments.
+pub fn method(channel: i64, class_id: i64, method_id: i64,
+    arguments: bytes) -> bytes {
+    var payload: [i64] = []
+    push16(payload, class_id)
+    push16(payload, method_id)
+    for i in 0..arguments.len() {
+        payload.push(arguments.at(i))
+    }
+    return encode(AmqpFrame{ kind: 1, channel: channel,
+        payload: bytes_of(payload) })
+}
+
+/// The class and method a method frame names.
+pub fn method_ids(frame: AmqpFrame) -> (i64, i64) ! AmqpError {
+    if frame.kind != 1 or frame.payload.len() < 4 {
+        fail(Truncated(0))
+    }
+    return (read16(frame.payload, 0), read16(frame.payload, 2))
+}
+
+/// A content header frame: how big the body is and what it is.
+///
+/// The weight field is always zero. It was going to mean something about
+/// nested content and never did, and every implementation writes zero and
+/// ignores it.
+pub fn content_header(channel: i64, class_id: i64, body_size: i64,
+    properties: bytes) -> bytes {
+    var payload: [i64] = []
+    push16(payload, class_id)
+    push16(payload, 0)
+    push64(payload, body_size)
+    for i in 0..properties.len() {
+        payload.push(properties.at(i))
+    }
+    return encode(AmqpFrame{ kind: 2, channel: channel,
+        payload: bytes_of(payload) })
+}
+
+/// A body frame.
+pub fn body(channel: i64, data: bytes) -> bytes {
+    return encode(AmqpFrame{ kind: 3, channel: channel, payload: data })
+}
+
+/// A heartbeat, which is always on channel zero and always empty.
+pub fn heartbeat() -> bytes {
+    return encode(AmqpFrame{ kind: 8, channel: 0, payload: "".to_bytes() })
+}
+
+/// A body split into frames that fit the negotiated maximum.
+///
+/// The maximum counts the whole frame, so the payload has to be eight bytes
+/// smaller than it: seven of header and one of frame-end. A client that
+/// splits at the maximum itself sends frames the server refuses, which is a
+/// bug that only appears on large messages.
+pub fn split_body(channel: i64, data: bytes, frame_max: i64) -> [bytes] {
+    var out: [bytes] = []
+    let room = frame_max - 8
+    var at = 0
+    while at < data.len() {
+        var take = data.len() - at
+        if take > room {
+            take = room
+        }
+        var chunk: [i64] = []
+        for i in 0..take {
+            chunk.push(data.at(at + i))
+        }
+        out.push(body(channel, bytes_of(chunk)))
+        at = at + take
+    }
+    return out
+}
+
+// -------------------------------------------------------------- field tables
+
+type AmqpValue = {
+    /// The type octet, as a one-character string: `S` long string,
+    /// `s` short string, `I` signed 32-bit, `l` signed 64-bit, `t` boolean,
+    /// `F` nested table, `V` void.
+    kind: str,
+    number: i64,
+    text: str,
+    table: [(str, AmqpValue)],
+}
+
+/// A short string: one length byte, so at most 255 bytes.
+pub fn short_string(text: str) -> [i64] ! AmqpError {
+    let raw = text.to_bytes()
+    if raw.len() > 255 {
+        fail(StringTooLong(raw.len()))
+    }
+    var out: [i64] = [raw.len()]
+    for i in 0..raw.len() {
+        out.push(raw.at(i))
+    }
+    return out
+}
+
+/// A long string: a four-byte length.
+pub fn long_string(text: str) -> [i64] {
+    let raw = text.to_bytes()
+    var out: [i64] = []
+    push32(out, raw.len())
+    for i in 0..raw.len() {
+        out.push(raw.at(i))
+    }
+    return out
+}
+
+/// A value that is a long string.
+pub fn text_value(text: str) -> AmqpValue {
+    return AmqpValue{ kind: "S", number: 0, text: text, table: [] }
+}
+
+/// A value that is a signed 32-bit integer.
+pub fn int_value(value: i64) -> AmqpValue {
+    return AmqpValue{ kind: "I", number: value, text: "", table: [] }
+}
+
+/// A value that is a boolean.
+pub fn bool_value(value: bool) -> AmqpValue {
+    var n = 0
+    if value {
+        n = 1
+    }
+    return AmqpValue{ kind: "t", number: n, text: "", table: [] }
+}
+
+/// A field table's bytes, four-byte length included.
+pub fn encode_table(entries: [(str, AmqpValue)]) -> bytes ! AmqpError {
+    var body: [i64] = []
+    for entry in entries {
+        for byte in try short_string(entry.0) {
+            body.push(byte)
+        }
+        for byte in try encode_value(entry.1) {
+            body.push(byte)
+        }
+    }
+    var out: [i64] = []
+    push32(out, body.len())
+    for byte in body {
+        out.push(byte)
+    }
+    return bytes_of(out)
+}
+
+fn encode_value(value: AmqpValue) -> [i64] ! AmqpError {
+    var out: [i64] = []
+    let letter = value.kind.to_bytes().at(0)
+    out.push(letter)
+    if value.kind == "S" {
+        for byte in long_string(value.text) {
+            out.push(byte)
+        }
+        return out
+    }
+    if value.kind == "s" {
+        for byte in try short_string(value.text) {
+            out.push(byte)
+        }
+        return out
+    }
+    if value.kind == "I" {
+        push32(out, signed32(value.number))
+        return out
+    }
+    if value.kind == "l" {
+        push64(out, value.number)
+        return out
+    }
+    if value.kind == "t" {
+        out.push(value.number)
+        return out
+    }
+    if value.kind == "F" {
+        let nested = try encode_table(value.table)
+        for i in 0..nested.len() {
+            out.push(nested.at(i))
+        }
+        return out
+    }
+    if value.kind == "V" {
+        return out
+    }
+    fail(BadFieldType(value.kind))
+}
+
+fn signed32(value: i64) -> i64 {
+    if value < 0 {
+        return value + 4294967296
+    }
+    return value
+}
+
+/// A field table read back.
+pub fn decode_table(data: bytes, at: i64) -> ([(str, AmqpValue)],
+    i64) ! AmqpError {
+    if at + 4 > data.len() {
+        fail(Truncated(at))
+    }
+    let size = read32(data, at)
+    let stop = at + 4 + size
+    if stop > data.len() {
+        fail(Truncated(at))
+    }
+    var out: [(str, AmqpValue)] = []
+    var i = at + 4
+    while i < stop {
+        let name = try read_short_string(data, i)
+        i = name.1
+        let value = try decode_value(data, i)
+        out.push((name.0, value.0))
+        i = value.1
+    }
+    return (out, stop)
+}
+
+fn read_short_string(data: bytes, at: i64) -> (str, i64) ! AmqpError {
+    if at >= data.len() {
+        fail(Truncated(at))
+    }
+    let length = data.at(at)
+    if at + 1 + length > data.len() {
+        fail(Truncated(at))
+    }
+    var out: [i64] = []
+    for k in 0..length {
+        out.push(data.at(at + 1 + k))
+    }
+    return (bytes_of(out).to_str(), at + 1 + length)
+}
+
+fn decode_value(data: bytes, at: i64) -> (AmqpValue, i64) ! AmqpError {
+    if at >= data.len() {
+        fail(Truncated(at))
+    }
+    let letter = bytes_of([data.at(at)]).to_str()
+    if letter == "S" {
+        let length = read32(data, at + 1)
+        var out: [i64] = []
+        for k in 0..length {
+            out.push(data.at(at + 5 + k))
+        }
+        return (text_value(bytes_of(out).to_str()), at + 5 + length)
+    }
+    if letter == "s" {
+        let text = try read_short_string(data, at + 1)
+        return (AmqpValue{ kind: "s", number: 0, text: text.0, table: [] },
+            text.1)
+    }
+    if letter == "I" {
+        var value = read32(data, at + 1)
+        if value >= 2147483648 {
+            value = value - 4294967296
+        }
+        return (int_value(value), at + 5)
+    }
+    if letter == "t" {
+        return (bool_value(data.at(at + 1) != 0), at + 2)
+    }
+    if letter == "F" {
+        let nested = try decode_table(data, at + 1)
+        return (AmqpValue{ kind: "F", number: 0, text: "",
+            table: nested.0 }, nested.1)
+    }
+    if letter == "V" {
+        return (AmqpValue{ kind: "V", number: 0, text: "", table: [] },
+            at + 1)
+    }
+    fail(BadFieldType(letter))
+}
+
+/// A value's text, whatever kind it is.
+pub fn value_text(value: AmqpValue) -> str {
+    if value.kind == "S" or value.kind == "s" {
+        return value.text
+    }
+    if value.kind == "t" {
+        if value.number == 0 {
+            return "false"
+        }
+        return "true"
+    }
+    if value.kind == "V" {
+        return ""
+    }
+    return "{value.number}"
+}

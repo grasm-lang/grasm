@@ -1,0 +1,6 @@
+[package]
+name = "mqtt"
+version = "1.0.0"
+
+# Builds and parses packets. Opens no socket.
+capabilities = []

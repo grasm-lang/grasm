@@ -1,0 +1,310 @@
+// STOMP: a message broker protocol you can speak by hand over telnet.
+//
+// AMQP is a binary protocol with a class-and-method registry and a
+// field-table encoding. STOMP is HTTP's shape — a command, headers, a blank
+// line, a body — terminated by a NUL byte. That is the entire specification,
+// and it is the reason STOMP clients exist for languages that have no AMQP
+// library and never will.
+//
+// It gives up a great deal for that. No exchanges, no routing keys, no queue
+// declaration, no flow control worth the name. What it gets is that a
+// developer can debug it by reading a packet capture, which turns out to
+// matter more often than the missing features.
+//
+// ## The escaping rules, and the version that had none
+//
+// A header value may contain a colon or a newline, which would otherwise end
+// the header. STOMP 1.2 escapes them: `\n`, `\r`, `\c` for colon, `\\` for
+// backslash. **STOMP 1.0 had no escaping at all**, so a value containing a
+// colon was simply unparseable, and a broker speaking both has to know which
+// version it negotiated before it can read a header.
+//
+// An escape sequence that is not one of those four is an error rather than a
+// literal backslash. That is deliberate: the alternative is that a client
+// sending a Windows path silently sends something else.
+//
+// ## Repeated headers
+//
+// If a header appears twice, **the first occurrence wins**. This is the
+// opposite of HTTP, where repeated headers are joined, and the opposite of
+// what almost every implementation did before 1.2 said so. It exists so that
+// a broker can prepend headers to a frame without rewriting the ones already
+// there.
+//
+// ## content-length, and the NUL
+//
+// A frame ends at a NUL byte — unless there is a `content-length` header, in
+// which case exactly that many bytes are read and the NUL after them is just
+// a terminator. Without the header a body containing a NUL is truncated, so
+// `content-length` is mandatory for binary bodies and optional for text ones,
+// which is a distinction that has caused a lot of bugs.
+//
+// ## Header order
+//
+// Headers are kept in the order they were given, because the first-wins rule
+// only means anything if there is an order. `stomp.py` stores them in a
+// dictionary and writes them sorted by name, which produces the same frames
+// for every practical purpose and loses the distinction the rule exists for.
+//
+// Checked against `stomp.py`'s own frame encoder, which agrees on every byte
+// once the headers are handed to it in the same order. Its header escaping is
+// checked against the specification's own four sequences instead, because
+// `stomp.py` does not escape at all — a value containing a colon goes out
+// unescaped and arrives as two headers.
+
+type StompError =
+    | NoCommand()
+    | BadHeader(line: str)
+    | BadEscape(at: i64)
+    | MissingTerminator()
+    | Truncated(at: i64)
+
+type StompFrame = {
+    command: str,
+    /// In the order they appeared. The first of a repeated name wins, which
+    /// is the opposite of HTTP.
+    headers: [(str, str)],
+    body: bytes,
+}
+
+/// The commands a client may send.
+pub fn client_commands() -> [str] {
+    return ["SEND", "SUBSCRIBE", "UNSUBSCRIBE", "BEGIN", "COMMIT", "ABORT",
+        "ACK", "NACK", "DISCONNECT", "CONNECT", "STOMP"]
+}
+
+/// The commands a server may send.
+pub fn server_commands() -> [str] {
+    return ["CONNECTED", "MESSAGE", "RECEIPT", "ERROR"]
+}
+
+/// A header value with the four escapes applied.
+pub fn escape(text: str) -> str {
+    var out = ""
+    for code in text.codes() {
+        if code == 92 {
+            out = out + "\\\\"
+        } else if code == 58 {
+            out = out + "\\c"
+        } else if code == 10 {
+            out = out + "\\n"
+        } else if code == 13 {
+            out = out + "\\r"
+        } else {
+            out = out + code.to_char()
+        }
+    }
+    return out
+}
+
+/// A header value with the escapes undone.
+///
+/// An escape that is not one of the four is an error rather than a literal
+/// backslash, so a client sending a Windows path is told rather than silently
+/// sending something else.
+pub fn unescape(text: str) -> str ! StompError {
+    var out = ""
+    let codes = text.codes()
+    var i = 0
+    while i < codes.len() {
+        if codes[i] != 92 {
+            out = out + codes[i].to_char()
+            i = i + 1
+            continue
+        }
+        if i + 1 >= codes.len() {
+            fail(BadEscape(i))
+        }
+        let next = codes[i + 1]
+        if next == 92 {
+            out = out + "\\"
+        } else if next == 99 {
+            out = out + ":"
+        } else if next == 110 {
+            out = out + "\n"
+        } else if next == 114 {
+            out = out + "\r"
+        } else {
+            fail(BadEscape(i))
+        }
+        i = i + 2
+    }
+    return out
+}
+
+/// A frame's bytes.
+///
+/// Headers are written in the order given and nothing is added. A caller
+/// sending a binary body wants `with_content_length` first — a body
+/// containing a NUL is truncated without that header, and the sender is the
+/// only side that knows whether it might.
+pub fn encode(frame: StompFrame) -> bytes {
+    var out = frame.command + "\n"
+    for header in frame.headers {
+        out = out + escape(header.0) + ":" + escape(header.1) + "\n"
+    }
+    out = out + "\n"
+    var bytes_out: [i64] = []
+    let head = out.to_bytes()
+    for i in 0..head.len() {
+        bytes_out.push(head.at(i))
+    }
+    for i in 0..frame.body.len() {
+        bytes_out.push(frame.body.at(i))
+    }
+    bytes_out.push(0)
+    return bytes_of(bytes_out)
+}
+
+/// The same frame with a `content-length` header, if it has none.
+///
+/// Mandatory for a binary body and optional for a text one, which is a
+/// distinction that has caused a great many bugs: a text body that happens
+/// to contain a NUL byte is silently truncated at it.
+pub fn with_content_length(frame: StompFrame) -> StompFrame {
+    if has_header(frame, "content-length") {
+        return frame
+    }
+    var out = frame
+    out.headers.push(("content-length", "{frame.body.len()}"))
+    return out
+}
+
+/// Whether a frame carries a header.
+pub fn has_header(frame: StompFrame, name: str) -> bool {
+    for header in frame.headers {
+        if header.0 == name {
+            return true
+        }
+    }
+    return false
+}
+
+/// A header's value, or the empty string.
+///
+/// The *first* occurrence, because that is what STOMP 1.2 says and what lets
+/// a broker prepend headers without rewriting the ones already there.
+pub fn header(frame: StompFrame, name: str) -> str {
+    for entry in frame.headers {
+        if entry.0 == name {
+            return entry.1
+        }
+    }
+    return ""
+}
+
+/// A frame read back from its bytes.
+pub fn decode(data: bytes) -> StompFrame ! StompError {
+    let end = line_end(data, 0)
+    if end < 0 {
+        fail(NoCommand())
+    }
+    let command = slice(data, 0, end).to_str()
+    if command == "" {
+        fail(NoCommand())
+    }
+    var frame = StompFrame{ command: command, headers: [],
+        body: "".to_bytes() }
+    var at = end + 1
+    var going = true
+    while going {
+        let stop = line_end(data, at)
+        if stop < 0 {
+            fail(MissingTerminator())
+        }
+        if stop == at {
+            at = at + 1
+            going = false
+            continue
+        }
+        let line = slice(data, at, stop - at).to_str()
+        let colon = index_of(line, ":")
+        if colon < 0 {
+            fail(BadHeader(line))
+        }
+        frame.headers.push((try unescape(line.substr(0, colon)),
+            try unescape(line.substr(colon + 1, line.len() - colon - 1))))
+        at = stop + 1
+    }
+    frame.body = try read_body(frame, data, at)
+    return frame
+}
+
+fn read_body(frame: StompFrame, data: bytes, at: i64) -> bytes ! StompError {
+    let declared = header(frame, "content-length")
+    if declared != "" {
+        let length = declared.parse_int() ?? 0 - 1
+        if length < 0 or at + length > data.len() {
+            fail(Truncated(at))
+        }
+        if at + length >= data.len() or data.at(at + length) != 0 {
+            fail(MissingTerminator())
+        }
+        return slice(data, at, length)
+    }
+    var i = at
+    while i < data.len() {
+        if data.at(i) == 0 {
+            return slice(data, at, i - at)
+        }
+        i = i + 1
+    }
+    fail(MissingTerminator())
+}
+
+fn line_end(data: bytes, at: i64) -> i64 {
+    var i = at
+    while i < data.len() {
+        if data.at(i) == 10 {
+            // A carriage return before the newline is allowed and not part of
+            // the line, which is how a frame written by a Windows client
+            // parses at all.
+            if i > at and data.at(i - 1) == 13 {
+                return i - 1
+            }
+            return i
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+fn slice(data: bytes, at: i64, length: i64) -> bytes {
+    var out: [i64] = []
+    var i = 0
+    while i < length and at + i < data.len() {
+        out.push(data.at(at + i))
+        i = i + 1
+    }
+    return bytes_of(out)
+}
+
+fn index_of(text: str, needle: str) -> i64 {
+    var i = 0
+    while i + needle.len() <= text.len() {
+        if text.substr(i, needle.len()) == needle {
+            return i
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+/// The version a client and server agree on.
+///
+/// The client offers a comma-separated list in `accept-version` and the
+/// server picks one. Highest common wins, and no overlap is an error rather
+/// than a fallback to 1.0 — which is what implementations used to do, and is
+/// why a 1.2 client could end up speaking an unescaped 1.0 without knowing.
+pub fn negotiate(offered: str, supported: [str]) -> str {
+    var best = ""
+    for candidate in offered.split(",") {
+        let trimmed = candidate.trim()
+        for known in supported {
+            if known == trimmed and trimmed > best {
+                best = trimmed
+            }
+        }
+    }
+    return best
+}

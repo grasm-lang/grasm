@@ -1,0 +1,6 @@
+[package]
+name = "coap"
+version = "1.0.0"
+
+# Builds and parses messages. Opens no socket.
+capabilities = []

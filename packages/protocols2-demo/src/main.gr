@@ -1,0 +1,438 @@
+import mqtt
+import coap
+import stomp
+import amqpframe
+import wsextension
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn list_of(data: bytes) -> [i64] {
+    var out: [i64] = []
+    for i in 0..data.len() {
+        out.push(data.at(i))
+    }
+    return out
+}
+
+// ------------------------------------------------------------------ mqtt
+
+fn plain_connect(client: str, version: i64) -> MqttConnect {
+    return MqttConnect{ protocol: "MQTT", version: version, clean_start: true,
+        keep_alive: 60, client_id: client, will_topic: "",
+        will_payload: "".to_bytes(), will_qos: 0, will_retain: false,
+        username: "", password: "", properties: "".to_bytes() }
+}
+
+fn check_mqtt(inout f: i64) / {io} {
+    print("-- mqtt: two bytes of header, and QoS is a hop guarantee")
+    // paho's own bytes for the same session.
+    say(f, "a CONNECT is what paho sends for the same session",
+        list_of(mqtt.connect(plain_connect("sensor-7", 4)) ?? "".to_bytes())
+        == [16, 20, 0, 4, 77, 81, 84, 84, 4, 2, 0, 60, 0, 8, 115, 101, 110,
+            115, 111, 114, 45, 55])
+    // MQTT 5 puts a property block after the keep-alive, and writes its
+    // length even when empty — so the same session is one byte longer.
+    say(f, "version 5 writes a property length even with no properties",
+        (mqtt.connect(plain_connect("x", 5)) ?? "".to_bytes()).len() ==
+        (mqtt.connect(plain_connect("x", 4)) ?? "".to_bytes()).len() + 1)
+    // The will: a device hands the broker its own obituary at connect time.
+    var will = plain_connect("dev", 4)
+    will.will_topic = "status/dev"
+    will.will_payload = "offline".to_bytes()
+    will.will_qos = 1
+    will.will_retain = true
+    will.username = "u"
+    will.password = "p"
+    say(f, "the will, the credentials and the QoS are all in one flags byte",
+        mqtt.connect_flags(will) == 238)
+    // The remaining length is seven bits a byte, four bytes at most. Without
+    // the cap, "read until the top bit is clear" is a denial of service.
+    say(f, "the remaining length is a varint capped at four bytes",
+        mqtt.write_length(127) == [127] and
+        mqtt.write_length(128) == [128, 1] and
+        mqtt.write_length(300) == [172, 2] and
+        mqtt.maximum_length() == 268435455)
+    say(f, "and a fifth continuation byte is malformed, not a bigger number",
+        length_refused(bytes_of([0, 255, 255, 255, 255, 255])))
+    // QoS, retain and duplicate live in the fixed header's low nibble.
+    let published = mqtt.publish(MqttPublish{ topic: "home/temp", qos: 2,
+        retain: true, duplicate: false, packet_id: 7,
+        payload: "21.5".to_bytes() }) ?? "".to_bytes()
+    say(f, "a PUBLISH matches paho byte for byte",
+        list_of(published) == [53, 17, 0, 9, 104, 111, 109, 101, 47, 116,
+            101, 109, 112, 0, 7, 50, 49, 46, 53])
+    let back = mqtt.parse_publish(published) ?? MqttPublish{ topic: "",
+        qos: 0, retain: false, duplicate: false, packet_id: 0,
+        payload: "".to_bytes() }
+    say(f, "and reads back with its flags out of the first byte's low nibble",
+        back.topic == "home/temp" and back.qos == 2 and back.retain and
+        not back.duplicate and back.packet_id == 7)
+    // The part everyone gets wrong.
+    say(f, "the delivered QoS is the lower of published and subscribed",
+        mqtt.effective_qos(2, 0) == 0 and mqtt.effective_qos(0, 2) == 0 and
+        mqtt.effective_qos(1, 2) == 1)
+    // Wildcards: `+` is one level, `#` is the rest and must be last.
+    say(f, "a plus matches one level and a hash matches the rest",
+        mqtt.matches("home/+/temp", "home/kitchen/temp") and
+        not mqtt.matches("home/+/temp", "home/kitchen/x/temp") and
+        mqtt.matches("home/#", "home/kitchen/temp") and
+        mqtt.matches("home/#", "home"))
+    say(f, "but a level filter does not match a shorter topic",
+        not mqtt.matches("sport/+", "sport") and
+        mqtt.matches("sport/+", "sport/"))
+    // A wildcard subscription must not pick up the broker's own $SYS tree.
+    say(f, "and a wildcard does not reach the dollar tree",
+        not mqtt.matches("#", "$SYS/broker/uptime") and
+        mqtt.matches("$SYS/#", "$SYS/broker/uptime"))
+    say(f, "a hash anywhere but the end is not a filter",
+        mqtt.is_valid_filter("a/#") and not mqtt.is_valid_filter("a/#/b") and
+        not mqtt.is_valid_filter("a/b+/c"))
+    say(f, "the two-byte packets are two bytes",
+        list_of(mqtt.empty_packet(12)) == [192, 0] and
+        list_of(mqtt.empty_packet(14)) == [224, 0] and
+        mqtt.type_name(3) == "PUBLISH" and mqtt.type_name(0) == "")
+}
+
+fn length_refused(data: bytes) -> bool {
+    match mqtt.read_length(data, 1) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+// ------------------------------------------------------------------ coap
+
+fn check_coap(inout f: i64) / {io} {
+    print("-- coap: HTTP's shape in four bytes, over UDP")
+    let request = coap.get("/temperature", 4660, bytes_of([1, 2]))
+    // aiocoap's own bytes for the same request.
+    say(f, "a GET is what aiocoap encodes for the same request",
+        list_of(coap.encode(request) ?? "".to_bytes()) == [66, 1, 18, 52, 1,
+            2, 187, 116, 101, 109, 112, 101, 114, 97, 116, 117, 114, 101])
+    // A code is a class and a detail, printed like a version number.
+    say(f, "a code is a class and a detail, and reads like a version",
+        coap.code_text(1) == "0.01" and coap.code_text(69) == "2.05" and
+        coap.code_text(132) == "4.04" and coap.code_of(4, 4) == 132)
+    // There is no slash in the encoding: a path is a repeated option.
+    say(f, "a path is repeated options, and there is no slash on the wire",
+        coap.path_options("/a/b/c").len() == 3 and
+        coap.path_of(request) == "/temperature")
+    // Options are delta-encoded, so a repeat costs one byte of overhead.
+    let post = CoapMessage{ kind: 0, code: 2, message_id: 1,
+        token: "".to_bytes(), options: coap.path_options("/a/b/c"),
+        payload: "body".to_bytes() }
+    say(f, "each option stores the difference from the one before it",
+        list_of(coap.encode(post) ?? "".to_bytes()) == [64, 2, 0, 1, 177, 97,
+            1, 98, 1, 99, 255, 98, 111, 100, 121])
+    // A large option number and a long value both need the escape nibbles.
+    let proxy = CoapMessage{ kind: 0, code: 1, message_id: 9,
+        token: "".to_bytes(), options: [CoapOption{ number: 35,
+            value: "coap://example.org/a".to_bytes() }],
+        payload: "".to_bytes() }
+    say(f, "a delta over twelve escapes into an extra byte",
+        list_of(coap.encode(proxy) ?? "".to_bytes()).len() == 27)
+    var long = ""
+    for _i in 0..300 {
+        long = long + "x"
+    }
+    say(f, "and a value over 268 bytes escapes into two",
+        (coap.encode(CoapMessage{ kind: 0, code: 3, message_id: 7,
+            token: bytes_of([170]), options: [CoapOption{ number: 11,
+                value: long.to_bytes() }], payload: "".to_bytes() }) ??
+            "".to_bytes()).len() == 308)
+    // The response usually rides in the acknowledgement.
+    let answer = coap.piggyback(request, coap.code_of(2, 5), 0,
+        "22.5 C".to_bytes())
+    say(f, "a response usually rides inside the acknowledgement",
+        coap.is_piggybacked(answer) and answer.message_id ==
+        request.message_id and
+        list_of(coap.encode(answer) ?? "".to_bytes()) == [98, 69, 18, 52, 1,
+            2, 192, 255, 50, 50, 46, 53, 32, 67])
+    // And when it does not, the token is what matches them up.
+    let waiting = coap.empty_ack(request)
+    say(f, "an empty acknowledgement leaves the token to do the matching",
+        not coap.is_piggybacked(waiting) and waiting.code == 0 and
+        waiting.token.len() == 0 and request.token.len() == 2)
+    // Zero is the empty option value, which is why absent and zero are the
+    // same thing on the wire.
+    say(f, "an integer option is as few bytes as possible, and zero is none",
+        coap.integer_bytes(0).len() == 0 and
+        list_of(coap.integer_bytes(300)) == [1, 44] and
+        coap.integer_value(bytes_of([1, 44])) == 300)
+    // The low two bits of an option number say what to do with one you do
+    // not understand.
+    say(f, "the option number itself says whether it may be ignored",
+        coap.is_critical(11) and not coap.is_critical(12) and
+        coap.is_safe_to_forward(12) and not coap.is_safe_to_forward(35))
+    say(f, "options out of order are refused rather than sorted",
+        out_of_order() and coap.option_number("Uri-Path") == 11)
+    say(f, "and a message claiming a version other than one is refused",
+        version_refused(bytes_of([128, 1, 0, 1])))
+}
+
+fn out_of_order() -> bool {
+    match coap.encode(CoapMessage{ kind: 0, code: 1, message_id: 1,
+        token: "".to_bytes(), options: [CoapOption{ number: 11,
+            value: "a".to_bytes() }, CoapOption{ number: 3,
+            value: "b".to_bytes() }], payload: "".to_bytes() }) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn version_refused(data: bytes) -> bool {
+    match coap.decode(data) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+// ----------------------------------------------------------------- stomp
+
+fn check_stomp(inout f: i64) / {io} {
+    print("-- stomp: a broker protocol you can type by hand")
+    let frame = StompFrame{ command: "SEND",
+        headers: [("destination", "/queue/a"), ("receipt", "r1")],
+        body: "hello".to_bytes() }
+    // stomp.py's own bytes.
+    say(f, "a frame is a command, headers, a blank line, a body and a NUL",
+        stomp.encode(frame).to_str() ==
+        "SEND\ndestination:/queue/a\nreceipt:r1\n\nhello\u{0}")
+    let back = stomp.decode(stomp.encode(frame)) ?? StompFrame{ command: "",
+        headers: [], body: "".to_bytes() }
+    say(f, "and reads back with its headers in the order they were sent",
+        back.command == "SEND" and back.headers.len() == 2 and
+        back.headers[0].0 == "destination" and back.body.to_str() == "hello")
+    // The four escapes, and only those four.
+    say(f, "a header value escapes exactly four characters",
+        stomp.escape("a:b\nc\\d\re") == "a\\cb\\nc\\\\d\\re" and
+        (stomp.unescape("a\\cb\\nc\\\\d\\re") ?? "") == "a:b\nc\\d\re")
+    say(f, "and any other escape is an error, not a literal backslash",
+        (stomp.unescape("a\\tb") ?? "ERR") == "ERR" and
+        (stomp.unescape("a\\") ?? "ERR") == "ERR")
+    // First occurrence wins, which is the opposite of HTTP.
+    let repeated = StompFrame{ command: "MESSAGE",
+        headers: [("x", "first"), ("x", "second")], body: "".to_bytes() }
+    say(f, "a repeated header takes its first value, unlike HTTP",
+        stomp.header(repeated, "x") == "first")
+    // A body containing a NUL needs content-length or it is truncated.
+    let binary = stomp.with_content_length(StompFrame{ command: "SEND",
+        headers: [("destination", "/q")], body: bytes_of([1, 0, 2]) })
+    say(f, "a body with a NUL in it needs content-length to survive",
+        stomp.header(binary, "content-length") == "3" and
+        list_of((stomp.decode(stomp.encode(binary)) ?? repeated).body) ==
+        [1, 0, 2])
+    say(f, "and without it the body stops at the first NUL",
+        list_of((stomp.decode(stomp.encode(StompFrame{ command: "SEND",
+            headers: [("destination", "/q")], body: bytes_of([1, 0, 2]) })) ??
+            repeated).body) == [1])
+    // Version negotiation: no overlap is an error, not a fallback to 1.0.
+    say(f, "the highest common version wins and no overlap is nothing",
+        stomp.negotiate("1.0,1.1,1.2", ["1.1", "1.2"]) == "1.2" and
+        stomp.negotiate("1.0", ["1.1", "1.2"]) == "")
+    say(f, "a frame with no terminator is refused",
+        no_terminator() and stomp.client_commands().len() == 11)
+}
+
+fn no_terminator() -> bool {
+    match stomp.decode("SEND\n\nbody".to_bytes()) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+// ------------------------------------------------------------- amqpframe
+
+fn short(text: str) -> [i64] {
+    return amqpframe.short_string(text) ?? []
+}
+
+fn check_amqpframe(inout f: i64) / {io} {
+    print("-- amqpframe: three frames make one message")
+    say(f, "a connection opens with eight bytes naming the version",
+        list_of(amqpframe.protocol_header()) == [65, 77, 81, 80, 0, 0, 9, 1])
+    // pika's own bytes for basic.publish on channel 1.
+    var publish: [i64] = [0, 0]
+    for b in short("ex") {
+        publish.push(b)
+    }
+    for b in short("rk") {
+        publish.push(b)
+    }
+    publish.push(0)
+    say(f, "a method frame is what pika sends for the same publish",
+        list_of(amqpframe.method(1, 60, 40, bytes_of(publish))) ==
+        [1, 0, 1, 0, 0, 0, 13, 0, 60, 0, 40, 0, 0, 2, 101, 120, 2, 114, 107,
+            0, 206])
+    say(f, "a body frame and a heartbeat too",
+        list_of(amqpframe.body(1, "hello".to_bytes())) ==
+        [3, 0, 1, 0, 0, 0, 5, 104, 101, 108, 108, 111, 206] and
+        list_of(amqpframe.heartbeat()) == [8, 0, 0, 0, 0, 0, 0, 206])
+    // The frame-end byte is redundant and that is the point.
+    let frame = amqpframe.decode(amqpframe.body(1, "hello".to_bytes()), 0) ??
+    (AmqpFrame{ kind: 0, channel: 0, payload: "".to_bytes() }, 0)
+    say(f, "a frame reads back, frame-end byte and all",
+        frame.0.kind == 3 and frame.0.channel == 1 and
+        frame.0.payload.to_str() == "hello" and
+        amqpframe.frame_end() == 206)
+    say(f, "and a frame whose end byte is wrong is refused at once",
+        bad_end())
+    // Channel 0 is the connection; everything else is a channel.
+    say(f, "a heartbeat is always on channel zero",
+        (amqpframe.decode(amqpframe.heartbeat(), 0) ??
+            (AmqpFrame{ kind: 0, channel: 9, payload: "".to_bytes() },
+                0)).0.channel == 0)
+    // The maximum counts the whole frame, so the payload is eight smaller.
+    let pieces = amqpframe.split_body(1, twenty_bytes(), 16)
+    say(f, "a body is split so the whole frame fits, not the payload",
+        pieces.len() == 3 and pieces[0].len() == 16 and
+        pieces[2].len() == 12)
+    // Field tables: pika's bytes for the same three entries.
+    let table = amqpframe.encode_table([("a", amqpframe.text_value("long")),
+        ("n", amqpframe.int_value(7)),
+        ("b", amqpframe.bool_value(true))]) ?? "".to_bytes()
+    say(f, "a field table is what pika encodes for the same three entries",
+        list_of(table) == [0, 0, 0, 22, 1, 97, 83, 0, 0, 0, 4, 108, 111, 110,
+            103, 1, 110, 73, 0, 0, 0, 7, 1, 98, 116, 1])
+    let read = amqpframe.decode_table(table, 0) ?? ([], 0)
+    say(f, "and reads back with its types intact",
+        read.0.len() == 3 and amqpframe.value_text(read.0[0].1) == "long" and
+        amqpframe.value_text(read.0[1].1) == "7" and
+        amqpframe.value_text(read.0[2].1) == "true")
+    say(f, "a content header carries the body size and the properties",
+        list_of(amqpframe.content_header(1, 60, 5,
+            bytes_of(content_properties()))) == [2, 0, 1, 0, 0, 0, 26, 0, 60, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 5, 144, 0, 10, 116, 101, 120, 116, 47, 112,
+            108, 97, 105, 110, 2, 206])
+    say(f, "and a short string longer than 255 bytes cannot be written",
+        short_refused())
+}
+
+fn content_properties() -> [i64] {
+    var out: [i64] = [144, 0]
+    for b in short("text/plain") {
+        out.push(b)
+    }
+    out.push(2)
+    return out
+}
+
+fn twenty_bytes() -> bytes {
+    var out: [i64] = []
+    for i in 0..20 {
+        out.push(i)
+    }
+    return bytes_of(out)
+}
+
+fn bad_end() -> bool {
+    var data = list_of(amqpframe.body(1, "x".to_bytes()))
+    data[data.len() - 1] = 0
+    match amqpframe.decode(bytes_of(data), 0) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn short_refused() -> bool {
+    var long = ""
+    for _i in 0..300 {
+        long = long + "x"
+    }
+    match amqpframe.short_string(long) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+// ----------------------------------------------------------- wsextension
+
+fn check_wsextension(inout f: i64) / {io} {
+    print("-- wsextension: one extension, and the asymmetry in its parameters")
+    let offers = wsextension.parse(
+        "permessage-deflate; client_max_window_bits; " +
+        "server_no_context_takeover, permessage-deflate") ?? []
+    say(f, "a client may offer the same extension twice on purpose",
+        offers.len() == 2 and offers[0].name == "permessage-deflate" and
+        offers[1].parameters.len() == 0)
+    say(f, "the header rebuilds to what the websockets library builds",
+        wsextension.build(offers) == "permessage-deflate; " +
+        "client_max_window_bits; server_no_context_takeover, " +
+        "permessage-deflate")
+    // A bare parameter is not the same as an absent one.
+    say(f, "a parameter with no value is present, and that is a distinction",
+        wsextension.has_flag(offers[0], "client_max_window_bits") and
+        wsextension.parameter(offers[0], "client_max_window_bits") == "" and
+        not wsextension.has_flag(offers[1], "client_max_window_bits"))
+    // The asymmetry: bare is legal in a request and not in a response.
+    say(f, "client_max_window_bits may be bare in a request and not a reply",
+        wsextension.is_valid_offer(offers[0], true) and
+        not wsextension.is_valid_offer(offers[0], false))
+    say(f, "server_max_window_bits always needs a value, and it is 8 to 15",
+        valid("permessage-deflate; server_max_window_bits=15", true) and
+        not valid("permessage-deflate; server_max_window_bits", true) and
+        not valid("permessage-deflate; server_max_window_bits=16", true))
+    say(f, "and an unknown parameter fails rather than being ignored",
+        not valid("permessage-deflate; x_made_up=1", true))
+    // The server picks one offer and answers it.
+    let answer = wsextension.respond(offers, 12, 0, false, true) ??
+    WsExtension{ name: "", parameters: [] }
+    say(f, "a server answers one offer with the parameters it agrees to",
+        answer.name == "permessage-deflate" and
+        wsextension.window_bits(answer, "server") == 12 and
+        wsextension.resets_context(answer, "client") and
+        wsextension.resets_context(answer, "server"))
+    say(f, "and may not ask for a window larger than it was offered",
+        wsextension.window_bits(wsextension.respond(
+            wsextension.parse("permessage-deflate; server_max_window_bits=10")
+            ?? [], 15, 0, false, false) ?? answer, "server") == 10)
+    // The check clients skip.
+    say(f, "a client must check the answer against what it offered",
+        wsextension.accepts_response(offers, answer) and
+        not wsextension.accepts_response(
+            wsextension.parse("permessage-deflate") ?? [],
+            first(wsextension.parse(
+                "permessage-deflate; client_max_window_bits=12") ?? [])))
+    say(f, "a declined offer is an empty name, not an error",
+        (wsextension.respond(wsextension.parse("x-other") ?? [], 0, 0, false,
+            false) ?? answer).name == "")
+    say(f, "and the default window is fifteen, which is 32 KB a direction",
+        wsextension.window_bits(WsExtension{ name: "permessage-deflate",
+            parameters: [] }, "server") == 15)
+}
+
+fn first(extensions: [WsExtension]) -> WsExtension {
+    if extensions.len() == 0 {
+        return WsExtension{ name: "", parameters: [] }
+    }
+    return extensions[0]
+}
+
+fn valid(header: str, is_request: bool) -> bool {
+    let parsed = wsextension.parse(header) ?? []
+    if parsed.len() == 0 {
+        return false
+    }
+    return wsextension.is_valid_offer(parsed[0], is_request)
+}
+
+fn main() / {io} {
+    var f = 0
+    check_mqtt(f)
+    check_coap(f)
+    check_stomp(f)
+    check_amqpframe(f)
+    check_wsextension(f)
+    if f == 0 {
+        print("protocols: every claim held")
+    } else {
+        print("protocols: {f} claims failed")
+    }
+}

@@ -1,0 +1,388 @@
+// CoAP: HTTP's shape in a four-byte header, over UDP.
+//
+// A sensor with a coin cell cannot afford TCP. The handshake alone costs
+// three packets before a byte of payload, and keeping the connection open
+// costs a radio that never sleeps. CoAP is REST — methods, paths, response
+// codes, content types — over UDP, with a four-byte header and its own tiny
+// reliability layer.
+//
+// The design brief was that a proxy should be able to translate it to HTTP
+// mechanically, and it very nearly can: GET is GET, 4.04 is 404, and the
+// content formats are the same media types by number.
+//
+// ## Reliability without a connection
+//
+// A message is confirmable, non-confirmable, an acknowledgement, or a reset.
+// A confirmable message is retransmitted until acknowledged, with the message
+// id matching them up. That is the whole of the reliability layer: no
+// connection, no window, no ordering, four message types.
+//
+// The response usually rides *in* the acknowledgement — a "piggybacked"
+// response — so a request and its answer are two packets rather than four.
+// When the server needs longer it sends an empty acknowledgement first and
+// the response separately, and matching that one up uses the **token** rather
+// than the message id, because it is a different message.
+//
+// Message id matches a retransmission; token matches a request to its
+// response. Programs that confuse the two work until a server is slow once.
+//
+// ## Options, and the delta encoding
+//
+// Options are numbered, and must be written in ascending order, and each
+// stores the *difference* from the previous one — so a message with options 11
+// and 11 again stores 11 and 0. Both the delta and the length are four-bit
+// nibbles with escapes at 13 and 14 for one and two extra bytes, so the
+// common case of a short option with a small delta is one byte of overhead.
+//
+// Repeating an option number is how a path with several segments is written:
+// `/a/b/c` is three Uri-Path options, each a delta of zero after the first.
+// There is no slash anywhere in the encoding, which is why CoAP paths cannot
+// contain one and why a proxy has to escape it.
+//
+// ## The codes
+//
+// One byte, read as class and detail: the top three bits are the class and
+// the low five the detail. 0.01 is GET, 2.05 is Content, 4.04 is Not Found.
+// Printed as `c.dd`, which is why CoAP responses look like version numbers.
+//
+// Checked against `aiocoap`, which encodes and decodes the same messages.
+
+type CoapError =
+    | Truncated(at: i64)
+    | BadVersion(version: i64)
+    | TokenTooLong(length: i64)
+    | OptionOutOfOrder(number: i64, previous: i64)
+    | ReservedNibble(at: i64)
+    | MissingPayload(at: i64)
+
+type CoapOption = {
+    number: i64,
+    value: bytes,
+}
+
+type CoapMessage = {
+    /// 0 confirmable, 1 non-confirmable, 2 acknowledgement, 3 reset.
+    kind: i64,
+    /// The request method or response code, as one byte.
+    code: i64,
+    /// Matches a retransmission to the message it repeats.
+    message_id: i64,
+    /// Matches a request to its response, which is not the same thing.
+    token: bytes,
+    /// In ascending order of number, repeats allowed.
+    options: [CoapOption],
+    payload: bytes,
+}
+
+/// The message types, in order.
+pub fn kind_names() -> [str] {
+    return ["CON", "NON", "ACK", "RST"]
+}
+
+/// A code's class: 0 for a request, 2 success, 4 client error, 5 server
+/// error.
+pub fn code_class(code: i64) -> i64 {
+    return code.ushr(5)
+}
+
+/// A code's detail.
+pub fn code_detail(code: i64) -> i64 {
+    return code.bit_and(31)
+}
+
+/// A code as it is written down: `0.01`, `2.05`, `4.04`.
+pub fn code_text(code: i64) -> str {
+    let detail = code_detail(code)
+    if detail < 10 {
+        return "{code_class(code)}.0{detail}"
+    }
+    return "{code_class(code)}.{detail}"
+}
+
+/// The byte a written code stands for.
+pub fn code_of(class: i64, detail: i64) -> i64 {
+    return class.shl(5).bit_or(detail)
+}
+
+/// The option numbers that matter, by name.
+pub fn option_number(name: str) -> i64 {
+    let names = ["If-Match", "Uri-Host", "ETag", "If-None-Match", "Observe",
+        "Uri-Port", "Location-Path", "Uri-Path", "Content-Format",
+        "Max-Age", "Uri-Query", "Accept", "Location-Query", "Block2",
+        "Block1", "Size2", "Proxy-Uri", "Proxy-Scheme", "Size1"]
+    let numbers = [1, 3, 4, 5, 6, 7, 8, 11, 12, 14, 15, 17, 20, 23, 27, 28,
+        35, 39, 60]
+    var i = 0
+    while i < names.len() {
+        if names[i] == name {
+            return numbers[i]
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+/// Whether an option number is critical — a server that does not understand
+/// it must refuse the message rather than ignore it.
+///
+/// The low bit of the number says so. Elective options are even, critical
+/// ones odd, which means the registry itself encodes the failure mode and a
+/// proxy can decide what to do with an option it has never heard of.
+pub fn is_critical(number: i64) -> bool {
+    return number.bit_and(1) == 1
+}
+
+/// Whether an option is safe for a proxy to forward without understanding
+/// it.
+pub fn is_safe_to_forward(number: i64) -> bool {
+    return number.bit_and(2) == 0
+}
+
+// ------------------------------------------------------------ the wire form
+
+fn nibble_of(value: i64) -> i64 {
+    if value < 13 {
+        return value
+    }
+    if value < 269 {
+        return 13
+    }
+    return 14
+}
+
+fn extension_of(value: i64) -> [i64] {
+    if value < 13 {
+        return []
+    }
+    if value < 269 {
+        return [value - 13]
+    }
+    let extra = value - 269
+    return [extra / 256, extra % 256]
+}
+
+/// A message's bytes.
+pub fn encode(message: CoapMessage) -> bytes ! CoapError {
+    if message.token.len() > 8 {
+        fail(TokenTooLong(message.token.len()))
+    }
+    var out: [i64] = [(1).shl(6).bit_or(message.kind.shl(4))
+            .bit_or(message.token.len()), message.code,
+        message.message_id / 256, message.message_id % 256]
+    for i in 0..message.token.len() {
+        out.push(message.token.at(i))
+    }
+    var previous = 0
+    for option in message.options {
+        if option.number < previous {
+            fail(OptionOutOfOrder(option.number, previous))
+        }
+        let delta = option.number - previous
+        let length = option.value.len()
+        out.push(nibble_of(delta).shl(4).bit_or(nibble_of(length)))
+        for byte in extension_of(delta) {
+            out.push(byte)
+        }
+        for byte in extension_of(length) {
+            out.push(byte)
+        }
+        for i in 0..length {
+            out.push(option.value.at(i))
+        }
+        previous = option.number
+    }
+    if message.payload.len() > 0 {
+        out.push(255)
+        for i in 0..message.payload.len() {
+            out.push(message.payload.at(i))
+        }
+    }
+    return bytes_of(out)
+}
+
+/// A message read back from its bytes.
+pub fn decode(data: bytes) -> CoapMessage ! CoapError {
+    if data.len() < 4 {
+        fail(Truncated(data.len()))
+    }
+    let version = data.at(0).ushr(6)
+    if version != 1 {
+        fail(BadVersion(version))
+    }
+    let token_length = data.at(0).bit_and(15)
+    if token_length > 8 {
+        fail(TokenTooLong(token_length))
+    }
+    if 4 + token_length > data.len() {
+        fail(Truncated(4))
+    }
+    var token: [i64] = []
+    for i in 0..token_length {
+        token.push(data.at(4 + i))
+    }
+    var message = CoapMessage{
+        kind: data.at(0).ushr(4).bit_and(3),
+        code: data.at(1),
+        message_id: data.at(2) * 256 + data.at(3),
+        token: bytes_of(token),
+        options: [],
+        payload: "".to_bytes(),
+    }
+    try read_options(message, data, 4 + token_length)
+    return message
+}
+
+fn read_options(inout message: CoapMessage, data: bytes,
+    from: i64) ! CoapError {
+    var at = from
+    var number = 0
+    while at < data.len() {
+        if data.at(at) == 255 {
+            var payload: [i64] = []
+            var i = at + 1
+            if i >= data.len() {
+                fail(MissingPayload(at))
+            }
+            while i < data.len() {
+                payload.push(data.at(i))
+                i = i + 1
+            }
+            message.payload = bytes_of(payload)
+            return
+        }
+        let delta_nibble = data.at(at).ushr(4)
+        let length_nibble = data.at(at).bit_and(15)
+        if delta_nibble == 15 or length_nibble == 15 {
+            fail(ReservedNibble(at))
+        }
+        at = at + 1
+        let delta = try read_extension(data, at, delta_nibble)
+        at = delta.1
+        let length = try read_extension(data, at, length_nibble)
+        at = length.1
+        if at + length.0 > data.len() {
+            fail(Truncated(at))
+        }
+        number = number + delta.0
+        var value: [i64] = []
+        for i in 0..length.0 {
+            value.push(data.at(at + i))
+        }
+        at = at + length.0
+        message.options.push(CoapOption{ number: number,
+            value: bytes_of(value) })
+    }
+}
+
+fn read_extension(data: bytes, at: i64,
+    nibble: i64) -> (i64, i64) ! CoapError {
+    if nibble < 13 {
+        return (nibble, at)
+    }
+    if nibble == 13 {
+        if at >= data.len() {
+            fail(Truncated(at))
+        }
+        return (data.at(at) + 13, at + 1)
+    }
+    if at + 1 >= data.len() {
+        fail(Truncated(at))
+    }
+    return (data.at(at) * 256 + data.at(at + 1) + 269, at + 2)
+}
+
+/// A path split into Uri-Path options.
+///
+/// There is no slash anywhere in the encoding: a path is a repeated option,
+/// one per segment. That is why a CoAP path segment cannot contain a slash
+/// and why a proxy translating to HTTP has to escape one.
+pub fn path_options(path: str) -> [CoapOption] {
+    var out: [CoapOption] = []
+    for segment in path.split("/") {
+        if segment == "" {
+            continue
+        }
+        out.push(CoapOption{ number: 11, value: segment.to_bytes() })
+    }
+    return out
+}
+
+/// The path a message's Uri-Path options spell.
+pub fn path_of(message: CoapMessage) -> str {
+    var out = ""
+    for option in message.options {
+        if option.number == 11 {
+            out = out + "/" + option.value.to_str()
+        }
+    }
+    return out
+}
+
+/// Query parameters as Uri-Query options.
+pub fn query_options(query: str) -> [CoapOption] {
+    var out: [CoapOption] = []
+    for part in query.split("&") {
+        if part == "" {
+            continue
+        }
+        out.push(CoapOption{ number: 15, value: part.to_bytes() })
+    }
+    return out
+}
+
+/// A GET request for a path.
+pub fn get(path: str, message_id: i64, token: bytes) -> CoapMessage {
+    return CoapMessage{ kind: 0, code: 1, message_id: message_id,
+        token: token, options: path_options(path),
+        payload: "".to_bytes() }
+}
+
+/// An acknowledgement carrying a response, which is the common case.
+pub fn piggyback(request: CoapMessage, code: i64, format: i64,
+    payload: bytes) -> CoapMessage {
+    var options: [CoapOption] = []
+    if format >= 0 {
+        options.push(CoapOption{ number: 12, value: integer_bytes(format) })
+    }
+    return CoapMessage{ kind: 2, code: code, message_id: request.message_id,
+        token: request.token, options: options, payload: payload }
+}
+
+/// An empty acknowledgement, sent when the answer will take longer than the
+/// client is prepared to wait for.
+pub fn empty_ack(request: CoapMessage) -> CoapMessage {
+    return CoapMessage{ kind: 2, code: 0, message_id: request.message_id,
+        token: "".to_bytes(), options: [], payload: "".to_bytes() }
+}
+
+/// A number as an option value: as few bytes as possible, and zero as none.
+///
+/// CoAP's integer options have no fixed width. Zero is the empty string,
+/// which is why an option whose value is absent and one whose value is zero
+/// are the same thing on the wire.
+pub fn integer_bytes(value: i64) -> bytes {
+    if value == 0 {
+        return "".to_bytes()
+    }
+    var out: [i64] = []
+    var v = value
+    while v > 0 {
+        out.push(v % 256)
+        v = v / 256
+    }
+    return bytes_of(out.rev())
+}
+
+/// The number an option value stands for.
+pub fn integer_value(value: bytes) -> i64 {
+    var out = 0
+    for i in 0..value.len() {
+        out = out * 256 + value.at(i)
+    }
+    return out
+}
+
+/// Whether a response arrived in the acknowledgement or separately.
+pub fn is_piggybacked(message: CoapMessage) -> bool {
+    return message.kind == 2 and message.code != 0
+}

@@ -1,0 +1,24 @@
+[package]
+name = "protocols2_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.mqtt]
+path = "../mqtt"
+version = "^1.0.0"
+
+[dependencies.coap]
+path = "../coap"
+version = "^1.0.0"
+
+[dependencies.stomp]
+path = "../stomp"
+version = "^1.0.0"
+
+[dependencies.amqpframe]
+path = "../amqpframe"
+version = "^1.0.0"
+
+[dependencies.wsextension]
+path = "../wsextension"
+version = "^1.0.0"

@@ -1,0 +1,6 @@
+[package]
+name = "wsextension"
+version = "1.0.0"
+
+# Parses and builds a header. Opens no socket.
+capabilities = []

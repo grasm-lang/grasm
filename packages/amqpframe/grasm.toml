@@ -1,0 +1,6 @@
+[package]
+name = "amqpframe"
+version = "1.0.0"
+
+# Builds and parses frames. Opens no socket.
+capabilities = []

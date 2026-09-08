@@ -1,0 +1,447 @@
+// MQTT: the protocol that fits in a two-byte header.
+//
+// Written in 1999 for oil pipeline telemetry over satellite links charged by
+// the byte, which is why the fixed header is two bytes and the smallest
+// useful packet is four. Twenty years later that frugality made it the
+// default protocol for anything battery-powered, and it now carries most of
+// the world's home automation and a good deal of its industrial telemetry.
+//
+// ## The remaining-length encoding
+//
+// After the first byte comes a length, seven bits a byte, top bit meaning
+// "another byte follows" — the same shape as a Protocol Buffers varint, and
+// capped at four bytes so the largest packet is 256 MB. A one-byte length
+// covers 127 bytes, which is most of the traffic on a sensor network.
+//
+// The cap matters: a decoder that keeps reading continuation bytes will
+// follow a malformed stream forever, and "read until the top bit is clear" is
+// how you write a denial of service. Four bytes, then it is malformed.
+//
+// ## Quality of service, and the part everyone gets wrong
+//
+// QoS 0 is fire and forget. QoS 1 is at least once — the receiver
+// acknowledges, and if the acknowledgement is lost the sender repeats, so the
+// receiver may see it twice. QoS 2 is exactly once, and costs four packets to
+// get there.
+//
+// The thing people expect and do not get: QoS is a *hop* guarantee, between a
+// client and the broker, not end to end. A publisher using QoS 2 and a
+// subscriber using QoS 0 has no exactly-once anything. The subscription's QoS
+// is separate from the publication's, and the effective one is the lower.
+//
+// ## The will, which is the good idea
+//
+// A client hands the broker a message at connect time and the broker
+// publishes it if the connection drops without a proper disconnect. A device
+// that loses power announces its own death. Nothing else in the mainstream
+// protocol world has this, and it is why MQTT's "online/offline" status
+// actually works.
+//
+// ## Version 5
+//
+// MQTT 5 added properties — a typed key-value block on most packets — and
+// reason codes on every acknowledgement. This handles both 3.1.1 and 5's
+// framing; the property block is exposed as bytes rather than parsed, because
+// a property's type depends on its identifier and the table is the package
+// that would need writing next.
+//
+// Checked against `paho-mqtt`'s own packet encoder.
+
+type MqttError =
+    | Truncated(at: i64)
+    | BadLength(at: i64)
+    | BadPacketType(kind: i64)
+    | BadProtocol(name: str)
+    | StringTooLong(length: i64)
+
+type MqttPacket = {
+    /// 1 CONNECT, 2 CONNACK, 3 PUBLISH, 4 PUBACK, 8 SUBSCRIBE, 9 SUBACK,
+    /// 12 PINGREQ, 13 PINGRESP, 14 DISCONNECT.
+    kind: i64,
+    /// The low four bits of the first byte. Only PUBLISH uses them all.
+    flags: i64,
+    payload: bytes,
+}
+
+/// The names, in packet-type order, with a blank at zero because zero is
+/// reserved and a packet claiming it is malformed.
+pub fn type_names() -> [str] {
+    return ["", "CONNECT", "CONNACK", "PUBLISH", "PUBACK", "PUBREC",
+        "PUBREL", "PUBCOMP", "SUBSCRIBE", "SUBACK", "UNSUBSCRIBE",
+        "UNSUBACK", "PINGREQ", "PINGRESP", "DISCONNECT", "AUTH"]
+}
+
+/// A packet type's name, or the empty string.
+pub fn type_name(kind: i64) -> str {
+    if kind < 0 or kind >= type_names().len() {
+        return ""
+    }
+    return type_names()[kind]
+}
+
+/// The remaining length, seven bits a byte.
+///
+/// Four bytes at most. A decoder that keeps following continuation bytes
+/// reads a malformed stream forever, which is a denial of service rather
+/// than a parse error.
+pub fn write_length(value: i64) -> [i64] {
+    var out: [i64] = []
+    var v = value
+    var going = true
+    while going {
+        var byte = v % 128
+        v = v / 128
+        if v > 0 {
+            byte = byte + 128
+        } else {
+            going = false
+        }
+        out.push(byte)
+    }
+    return out
+}
+
+/// A remaining length read back, with the offset just past it.
+pub fn read_length(data: bytes, at: i64) -> (i64, i64) ! MqttError {
+    var value = 0
+    var shift = 1
+    var i = at
+    while i < data.len() and i - at < 4 {
+        let byte = data.at(i)
+        value = value + byte.bit_and(127) * shift
+        i = i + 1
+        if byte < 128 {
+            return (value, i)
+        }
+        shift = shift * 128
+    }
+    if i - at >= 4 {
+        fail(BadLength(at))
+    }
+    fail(Truncated(at))
+}
+
+/// The largest packet the four-byte cap allows.
+pub fn maximum_length() -> i64 {
+    return 268435455
+}
+
+/// A length-prefixed string: two bytes of length, then UTF-8.
+pub fn write_string(text: str) -> [i64] ! MqttError {
+    let raw = text.to_bytes()
+    if raw.len() > 65535 {
+        fail(StringTooLong(raw.len()))
+    }
+    var out: [i64] = [raw.len() / 256, raw.len() % 256]
+    for i in 0..raw.len() {
+        out.push(raw.at(i))
+    }
+    return out
+}
+
+/// A length-prefixed string read back, with the offset just past it.
+pub fn read_string(data: bytes, at: i64) -> (str, i64) ! MqttError {
+    if at + 1 >= data.len() {
+        fail(Truncated(at))
+    }
+    let length = data.at(at) * 256 + data.at(at + 1)
+    if at + 2 + length > data.len() {
+        fail(Truncated(at))
+    }
+    var out: [i64] = []
+    for i in 0..length {
+        out.push(data.at(at + 2 + i))
+    }
+    return (bytes_of(out).to_str(), at + 2 + length)
+}
+
+/// A whole packet from its bytes.
+pub fn parse(data: bytes) -> MqttPacket ! MqttError {
+    if data.len() < 2 {
+        fail(Truncated(0))
+    }
+    let kind = data.at(0).ushr(4)
+    if kind == 0 or kind > 15 {
+        fail(BadPacketType(kind))
+    }
+    let header = try read_length(data, 1)
+    if header.1 + header.0 > data.len() {
+        fail(Truncated(header.1))
+    }
+    var payload: [i64] = []
+    for i in 0..header.0 {
+        payload.push(data.at(header.1 + i))
+    }
+    return MqttPacket{ kind: kind, flags: data.at(0).bit_and(15),
+        payload: bytes_of(payload) }
+}
+
+/// A packet's bytes.
+pub fn serialise(packet: MqttPacket) -> bytes {
+    var out: [i64] = [packet.kind.shl(4).bit_or(packet.flags)]
+    for byte in write_length(packet.payload.len()) {
+        out.push(byte)
+    }
+    for i in 0..packet.payload.len() {
+        out.push(packet.payload.at(i))
+    }
+    return bytes_of(out)
+}
+
+/// How many bytes the packet starting at an offset occupies, or -1.
+pub fn packet_length(data: bytes, at: i64) -> i64 {
+    match read_length(data, at + 1) {
+        Ok(header) -> return header.1 - at + header.0
+        Err(_e) -> return 0 - 1
+    }
+}
+
+// ------------------------------------------------------------ the packets
+
+type MqttConnect = {
+    /// `MQTT` for 3.1.1 and 5; `MQIsdp` for 3.1, which is still deployed.
+    protocol: str,
+    /// 4 for 3.1.1, 5 for 5.0.
+    version: i64,
+    clean_start: bool,
+    keep_alive: i64,
+    client_id: str,
+    will_topic: str,
+    will_payload: bytes,
+    will_qos: i64,
+    will_retain: bool,
+    username: str,
+    password: str,
+    /// MQTT 5's property block, already encoded. Left as bytes because a
+    /// property's type depends on its identifier, and that table is the
+    /// package that would have to be written next.
+    properties: bytes,
+}
+
+type MqttPublish = {
+    topic: str,
+    /// 0 fire and forget, 1 at least once, 2 exactly once.
+    qos: i64,
+    retain: bool,
+    /// Set when the broker is repeating a message it is not sure arrived.
+    duplicate: bool,
+    /// Present for QoS 1 and 2 only; 0 otherwise.
+    packet_id: i64,
+    payload: bytes,
+}
+
+/// A CONNECT packet's bytes.
+pub fn connect(session: MqttConnect) -> bytes ! MqttError {
+    var body: [i64] = []
+    for byte in try write_string(session.protocol) {
+        body.push(byte)
+    }
+    body.push(session.version)
+    body.push(connect_flags(session))
+    body.push(session.keep_alive / 256)
+    body.push(session.keep_alive % 256)
+    // Version 5 puts a property block here, and its length is written even
+    // when there are no properties — so a v5 CONNECT is one byte longer than
+    // the same v3.1.1 one, and a parser that skips the byte reads the client
+    // id's length from the wrong place.
+    if session.version >= 5 {
+        for byte in write_length(session.properties.len()) {
+            body.push(byte)
+        }
+        for i in 0..session.properties.len() {
+            body.push(session.properties.at(i))
+        }
+    }
+    for byte in try write_string(session.client_id) {
+        body.push(byte)
+    }
+    if session.will_topic != "" {
+        for byte in try write_string(session.will_topic) {
+            body.push(byte)
+        }
+        body.push(session.will_payload.len() / 256)
+        body.push(session.will_payload.len() % 256)
+        for i in 0..session.will_payload.len() {
+            body.push(session.will_payload.at(i))
+        }
+    }
+    if session.username != "" {
+        for byte in try write_string(session.username) {
+            body.push(byte)
+        }
+    }
+    if session.password != "" {
+        for byte in try write_string(session.password) {
+            body.push(byte)
+        }
+    }
+    return serialise(MqttPacket{ kind: 1, flags: 0,
+        payload: bytes_of(body) })
+}
+
+/// The connect flags byte, which is where the will and the credentials are
+/// announced.
+pub fn connect_flags(session: MqttConnect) -> i64 {
+    var flags = 0
+    if session.clean_start {
+        flags = flags + 2
+    }
+    if session.will_topic != "" {
+        flags = flags + 4 + session.will_qos * 8
+        if session.will_retain {
+            flags = flags + 32
+        }
+    }
+    if session.password != "" {
+        flags = flags + 64
+    }
+    if session.username != "" {
+        flags = flags + 128
+    }
+    return flags
+}
+
+/// A PUBLISH packet's bytes.
+///
+/// The QoS and the retain and duplicate flags live in the *fixed* header's
+/// low nibble rather than the body, which is the one place MQTT uses those
+/// four bits and the reason a parser cannot ignore them.
+pub fn publish(message: MqttPublish) -> bytes ! MqttError {
+    var body: [i64] = []
+    for byte in try write_string(message.topic) {
+        body.push(byte)
+    }
+    if message.qos > 0 {
+        body.push(message.packet_id / 256)
+        body.push(message.packet_id % 256)
+    }
+    for i in 0..message.payload.len() {
+        body.push(message.payload.at(i))
+    }
+    var flags = message.qos * 2
+    if message.retain {
+        flags = flags + 1
+    }
+    if message.duplicate {
+        flags = flags + 8
+    }
+    return serialise(MqttPacket{ kind: 3, flags: flags,
+        payload: bytes_of(body) })
+}
+
+/// A PUBLISH packet read back.
+pub fn parse_publish(data: bytes) -> MqttPublish ! MqttError {
+    let packet = try parse(data)
+    if packet.kind != 3 {
+        fail(BadPacketType(packet.kind))
+    }
+    let topic = try read_string(packet.payload, 0)
+    let qos = packet.flags.ushr(1).bit_and(3)
+    var at = topic.1
+    var id = 0
+    if qos > 0 {
+        if at + 1 >= packet.payload.len() {
+            fail(Truncated(at))
+        }
+        id = packet.payload.at(at) * 256 + packet.payload.at(at + 1)
+        at = at + 2
+    }
+    var body: [i64] = []
+    while at < packet.payload.len() {
+        body.push(packet.payload.at(at))
+        at = at + 1
+    }
+    return MqttPublish{ topic: topic.0, qos: qos,
+        retain: packet.flags.bit_and(1) == 1,
+        duplicate: packet.flags.bit_and(8) == 8, packet_id: id,
+        payload: bytes_of(body) }
+}
+
+/// A SUBSCRIBE packet's bytes: a packet id, then topic filters each with the
+/// quality of service the subscriber wants.
+pub fn subscribe(packet_id: i64,
+    filters: [(str, i64)]) -> bytes ! MqttError {
+    var body: [i64] = [packet_id / 256, packet_id % 256]
+    for filter in filters {
+        for byte in try write_string(filter.0) {
+            body.push(byte)
+        }
+        body.push(filter.1)
+    }
+    // The reserved bits in a SUBSCRIBE's fixed header are 0010, and a broker
+    // must reject a packet where they are anything else.
+    return serialise(MqttPacket{ kind: 8, flags: 2,
+        payload: bytes_of(body) })
+}
+
+/// PINGREQ, PINGRESP and DISCONNECT: two bytes each, which is the whole
+/// point of the protocol.
+pub fn empty_packet(kind: i64) -> bytes {
+    return serialise(MqttPacket{ kind: kind, flags: 0,
+        payload: "".to_bytes() })
+}
+
+/// Whether a topic filter matches a topic name.
+///
+/// `+` matches one level and `#` matches the rest. The rules that catch
+/// people: `#` must be the last level; `sport/+` does not match `sport`; and
+/// a filter starting with `#` or `+` does not match a topic starting with
+/// `$`, because the `$SYS` tree is meant to be invisible to a wildcard
+/// subscription.
+pub fn matches(filter: str, topic: str) -> bool {
+    let f = filter.split("/")
+    let t = topic.split("/")
+    if t.len() > 0 and t[0].starts_with("$") and f.len() > 0 and
+    (f[0] == "#" or f[0] == "+") {
+        return false
+    }
+    var i = 0
+    while i < f.len() {
+        if f[i] == "#" {
+            return i == f.len() - 1
+        }
+        if i >= t.len() {
+            return false
+        }
+        if f[i] != "+" and f[i] != t[i] {
+            return false
+        }
+        i = i + 1
+    }
+    return i == t.len()
+}
+
+/// Whether a topic filter is well formed.
+pub fn is_valid_filter(filter: str) -> bool {
+    if filter == "" {
+        return false
+    }
+    let parts = filter.split("/")
+    var i = 0
+    while i < parts.len() {
+        if parts[i].contains("#") and parts[i] != "#" {
+            return false
+        }
+        if parts[i].contains("+") and parts[i] != "+" {
+            return false
+        }
+        if parts[i] == "#" and i != parts.len() - 1 {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+/// The quality of service a message is actually delivered at.
+///
+/// The lower of what the publisher asked for and what the subscriber asked
+/// for. This is the part everyone gets wrong: QoS is a guarantee between a
+/// client and the broker, not from end to end, and a publisher using QoS 2
+/// gets nothing from it if the subscriber asked for 0.
+pub fn effective_qos(published: i64, subscribed: i64) -> i64 {
+    if published < subscribed {
+        return published
+    }
+    return subscribed
+}

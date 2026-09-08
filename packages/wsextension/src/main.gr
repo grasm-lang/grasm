@@ -1,0 +1,382 @@
+// Sec-WebSocket-Extensions, and the one extension anybody uses.
+//
+// WebSocket's extension mechanism was designed for a family of extensions
+// that never arrived. What exists is `permessage-deflate` — compress each
+// message with DEFLATE — and it is enabled on most WebSocket traffic on the
+// internet, usually without either end having chosen to.
+//
+// ## The negotiation, which is an offer and a selection
+//
+// The client sends a list of extensions it will accept, each with
+// parameters. The server picks **at most one** of the offers for each
+// extension and echoes it back with the parameters it agrees to. The client
+// must then check that what came back is compatible with what it offered, and
+// fail the connection if not — which is the step clients skip.
+//
+// A client may offer the same extension more than once with different
+// parameters. That is not a mistake: it is how a client says "I would prefer
+// a small window, but I will accept a large one", and the server picks.
+//
+// ## The four parameters
+//
+// `server_no_context_takeover` and `client_no_context_takeover` say the
+// compressor must reset its LZ77 window between messages. Without them the
+// window carries over, so a repeated message compresses to almost nothing —
+// and a compressor that holds a 32 KB window per connection costs 32 KB per
+// connection, which on a hundred thousand connections is three gigabytes.
+// That memory cost is why servers ask for it.
+//
+// `server_max_window_bits` and `client_max_window_bits` set the window size,
+// 8 to 15. The asymmetry that catches people: **`client_max_window_bits` may
+// appear without a value in a request** — meaning "I support this parameter,
+// tell me what to use" — but must have a value in a response.
+// `server_max_window_bits` must always have a value.
+//
+// ## The security part
+//
+// Compression before encryption leaks. If an attacker can inject text into a
+// message that also contains a secret, the compressed length tells them
+// whether their guess matched — this is CRIME and BREACH, applied to
+// WebSocket. Nothing in the negotiation addresses it, and the mitigation is
+// not to put secrets and attacker-controlled data in the same message.
+//
+// Checked against the `websockets` library's own header parser.
+
+type ExtensionError =
+    | EmptyName(at: i64)
+    | BadParameter(at: i64)
+    | UnterminatedQuote(at: i64)
+    | BadWindowBits(value: i64)
+
+type WsExtension = {
+    name: str,
+    /// In the order given. A parameter with no value has an empty one, which
+    /// `has_flag` tells apart from a parameter that is absent.
+    parameters: [(str, str)],
+}
+
+/// The header's offers, in order.
+///
+/// Extensions are separated by commas and parameters by semicolons, and a
+/// parameter's value may be a quoted string. Leading and trailing space is
+/// allowed everywhere, which is what makes a hand-written parser get this
+/// wrong.
+pub fn parse(header: str) -> [WsExtension] ! ExtensionError {
+    var out: [WsExtension] = []
+    for part in split_outside_quotes(header, 44) {
+        if part.trim() == "" {
+            continue
+        }
+        out.push(try parse_one(part))
+    }
+    return out
+}
+
+fn parse_one(text: str) -> WsExtension ! ExtensionError {
+    let parts = split_outside_quotes(text, 59)
+    let name = parts[0].trim()
+    if name == "" {
+        fail(EmptyName(0))
+    }
+    var extension = WsExtension{ name: name, parameters: [] }
+    var i = 1
+    while i < parts.len() {
+        let piece = parts[i].trim()
+        if piece == "" {
+            fail(BadParameter(i))
+        }
+        let equals = index_of(piece, "=")
+        if equals < 0 {
+            extension.parameters.push((piece, ""))
+        } else {
+            let key = piece.substr(0, equals).trim()
+            let value = piece.substr(equals + 1, piece.len() - equals - 1)
+            if key == "" {
+                fail(BadParameter(i))
+            }
+            extension.parameters.push((key, try unquote(value.trim())))
+        }
+        i = i + 1
+    }
+    return extension
+}
+
+/// A quoted string with its quotes and escapes removed.
+pub fn unquote(text: str) -> str ! ExtensionError {
+    if text.len() < 2 or not text.starts_with("\"") {
+        return text
+    }
+    if not text.ends_with("\"") {
+        fail(UnterminatedQuote(text.len()))
+    }
+    var out = ""
+    let codes = text.substr(1, text.len() - 2).codes()
+    var i = 0
+    while i < codes.len() {
+        if codes[i] == 92 and i + 1 < codes.len() {
+            out = out + codes[i + 1].to_char()
+            i = i + 2
+            continue
+        }
+        out = out + codes[i].to_char()
+        i = i + 1
+    }
+    return out
+}
+
+fn split_outside_quotes(text: str, separator: i64) -> [str] {
+    var out: [str] = []
+    var current = ""
+    var quoted = false
+    var escaped = false
+    for code in text.codes() {
+        if escaped {
+            current = current + code.to_char()
+            escaped = false
+            continue
+        }
+        if quoted and code == 92 {
+            current = current + code.to_char()
+            escaped = true
+            continue
+        }
+        if code == 34 {
+            quoted = not quoted
+            current = current + code.to_char()
+            continue
+        }
+        if code == separator and not quoted {
+            out.push(current)
+            current = ""
+            continue
+        }
+        current = current + code.to_char()
+    }
+    out.push(current)
+    return out
+}
+
+fn index_of(text: str, needle: str) -> i64 {
+    var i = 0
+    while i + needle.len() <= text.len() {
+        if text.substr(i, needle.len()) == needle {
+            return i
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+/// The header a list of extensions spells.
+///
+/// Values are written bare. A value needing quotes is one nothing sends, and
+/// writing quotes where they are not needed is what makes two libraries
+/// disagree about a header they both parsed the same way.
+pub fn build(extensions: [WsExtension]) -> str {
+    var parts: [str] = []
+    for extension in extensions {
+        var text = extension.name
+        for parameter in extension.parameters {
+            text = text + "; " + parameter.0
+            if parameter.1 != "" {
+                text = text + "=" + parameter.1
+            }
+        }
+        parts.push(text)
+    }
+    return parts.join(", ")
+}
+
+// ---------------------------------------------------- permessage-deflate
+
+/// The one extension anybody uses.
+pub fn deflate_name() -> str {
+    return "permessage-deflate"
+}
+
+/// Whether a parameter is present, whatever its value.
+pub fn has_flag(extension: WsExtension, name: str) -> bool {
+    for parameter in extension.parameters {
+        if parameter.0 == name {
+            return true
+        }
+    }
+    return false
+}
+
+/// A parameter's value, or the empty string.
+pub fn parameter(extension: WsExtension, name: str) -> str {
+    for entry in extension.parameters {
+        if entry.0 == name {
+            return entry.1
+        }
+    }
+    return ""
+}
+
+/// Whether a permessage-deflate offer is well formed.
+///
+/// `server_max_window_bits` must carry a value between 8 and 15;
+/// `client_max_window_bits` may be bare in a *request*, meaning "I understand
+/// this parameter, you choose". In a response it must have a value. Getting
+/// that asymmetry wrong is the most common permessage-deflate bug.
+pub fn is_valid_offer(extension: WsExtension, is_request: bool) -> bool {
+    for parameter in extension.parameters {
+        if parameter.0 == "server_no_context_takeover" or
+        parameter.0 == "client_no_context_takeover" {
+            if parameter.1 != "" {
+                return false
+            }
+            continue
+        }
+        if parameter.0 == "server_max_window_bits" {
+            if not is_window_bits(parameter.1) {
+                return false
+            }
+            continue
+        }
+        if parameter.0 == "client_max_window_bits" {
+            if parameter.1 == "" and is_request {
+                continue
+            }
+            if not is_window_bits(parameter.1) {
+                return false
+            }
+            continue
+        }
+        // An unknown parameter fails the negotiation rather than being
+        // ignored, because a parameter changes what the bytes mean.
+        return false
+    }
+    return true
+}
+
+fn is_window_bits(text: str) -> bool {
+    let value = text.parse_int() ?? 0 - 1
+    return value >= 8 and value <= 15
+}
+
+/// The response a server sends for an offer, or an extension with an empty
+/// name when it declines.
+///
+/// The server picks the first offer it can accept. It may reduce either
+/// window and may ask for either side to reset its context; it may not ask
+/// for a larger window than was offered, and it may not send
+/// `client_max_window_bits` unless the client offered the parameter at all.
+pub fn respond(offers: [WsExtension], server_window: i64,
+    client_window: i64, server_reset: bool,
+    client_reset: bool) -> WsExtension ! ExtensionError {
+    if server_window != 0 and not (server_window >= 8 and
+        server_window <= 15) {
+        fail(BadWindowBits(server_window))
+    }
+    if client_window != 0 and not (client_window >= 8 and
+        client_window <= 15) {
+        fail(BadWindowBits(client_window))
+    }
+    for offer in offers {
+        if offer.name != deflate_name() or not is_valid_offer(offer, true) {
+            continue
+        }
+        return accept(offer, server_window, client_window, server_reset,
+            client_reset)
+    }
+    return WsExtension{ name: "", parameters: [] }
+}
+
+fn accept(offer: WsExtension, server_window: i64, client_window: i64,
+    server_reset: bool, client_reset: bool) -> WsExtension {
+    var out = WsExtension{ name: deflate_name(), parameters: [] }
+    if server_reset or has_flag(offer, "server_no_context_takeover") {
+        out.parameters.push(("server_no_context_takeover", ""))
+    }
+    if client_reset or has_flag(offer, "client_no_context_takeover") {
+        out.parameters.push(("client_no_context_takeover", ""))
+    }
+    let asked = window_of(offer, "server_max_window_bits")
+    var server = server_window
+    if asked > 0 and (server == 0 or asked < server) {
+        server = asked
+    }
+    if server > 0 {
+        out.parameters.push(("server_max_window_bits", "{server}"))
+    }
+    // The server may only name the client's window if the client offered the
+    // parameter — bare or with a value. A server that sends it uninvited is
+    // making an offer the client never agreed to consider.
+    if has_flag(offer, "client_max_window_bits") {
+        let limit = window_of(offer, "client_max_window_bits")
+        var client = client_window
+        if limit > 0 and (client == 0 or limit < client) {
+            client = limit
+        }
+        if client > 0 {
+            out.parameters.push(("client_max_window_bits", "{client}"))
+        }
+    }
+    return out
+}
+
+fn window_of(extension: WsExtension, name: str) -> i64 {
+    let text = parameter(extension, name)
+    if text == "" {
+        return 0
+    }
+    return text.parse_int() ?? 0
+}
+
+/// Whether a response is compatible with what was offered.
+///
+/// The step clients skip. A server that answers with a smaller window than
+/// the client can decode, or with a parameter the client never offered, has
+/// to fail the connection — otherwise the first compressed message is
+/// garbage and the failure looks like a bug in the application.
+pub fn accepts_response(offers: [WsExtension],
+    response: WsExtension) -> bool {
+    if response.name == "" {
+        return true
+    }
+    if response.name != deflate_name() or not is_valid_offer(response,
+        false) {
+        return false
+    }
+    for offer in offers {
+        if offer.name != deflate_name() {
+            continue
+        }
+        if compatible(offer, response) {
+            return true
+        }
+    }
+    return false
+}
+
+fn compatible(offer: WsExtension, response: WsExtension) -> bool {
+    if has_flag(response, "client_max_window_bits") and
+    not has_flag(offer, "client_max_window_bits") {
+        return false
+    }
+    let offered = window_of(offer, "server_max_window_bits")
+    let answered = window_of(response, "server_max_window_bits")
+    if offered > 0 and (answered == 0 or answered > offered) {
+        return false
+    }
+    return true
+}
+
+/// The window size a side must use, in bits, given a negotiated response.
+///
+/// Fifteen when nothing said otherwise, which is DEFLATE's own default and a
+/// 32 KB window per connection per direction.
+pub fn window_bits(response: WsExtension, side: str) -> i64 {
+    let text = parameter(response, side + "_max_window_bits")
+    if text == "" {
+        return 15
+    }
+    return text.parse_int() ?? 15
+}
+
+/// Whether a side must reset its window between messages.
+pub fn resets_context(response: WsExtension, side: str) -> bool {
+    return has_flag(response, side + "_no_context_takeover")
+}
