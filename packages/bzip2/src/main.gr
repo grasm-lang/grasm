@@ -1,0 +1,614 @@
+// bzip2: sorting the data is the compression.
+//
+// Every other compressor in this set looks for repeats and codes what is
+// left. bzip2 does something stranger and better: it **sorts every rotation
+// of the block** and keeps the last column. That column has the property that
+// characters appearing in similar contexts end up next to each other — every
+// `h` that followed a `t` lands in one run — so the output is full of runs
+// even when the input had none.
+//
+// The transform is reversible, which is the surprising part. Given only the
+// last column and the index of the original row, the whole block comes back.
+// Burrows and Wheeler published it in 1994 at DEC's research lab, four years
+// after they had done the work, and Julian Seward built bzip2 around it in
+// 1996.
+//
+// ## The pipeline, and why each stage is there
+//
+// **RLE1** collapses runs of four or more before anything else, because the
+// sort is quadratic in the worst case and a megabyte of one character is that
+// worst case.
+//
+// **BWT** sorts the rotations. This is where the compression happens, and it
+// costs nothing in bits: the output is exactly as long as the input.
+//
+// **MTF** turns the runs the sort produced into runs of zero. A character
+// just seen moves to the front of a list, so a repeated character is a zero
+// every time after the first.
+//
+// **RLE2** codes the runs of zero in bijective base two — two symbols, RUNA
+// and RUNB, with no way to write a zero-length run, which is why the coding
+// is bijective and why every run length has exactly one representation.
+//
+// **Huffman** codes what is left, with up to six tables and a fresh choice of
+// table every fifty symbols. That per-block adaptivity is the second half of
+// why bzip2 beats gzip.
+//
+// ## Why it lost anyway
+//
+// The sort is slow — genuinely slow, hundreds of times slower than DEFLATE to
+// compress — and the block structure means the whole 900 KB block has to be
+// in memory to decompress any of it. Then zstd arrived with most of the ratio
+// at a hundred times the speed, and bzip2 became a legacy format. A legacy
+// format with several billion files in it.
+//
+// ## What this is
+//
+// A decoder, and the transforms it is built from, exposed on their own
+// because the BWT and MTF are useful outside bzip2. Compression is not here:
+// the encoder needs a suffix-array sort to be usable at all, and a
+// quadratic one would be a toy rather than a package.
+//
+// Checked against `/usr/bin/bzip2` and Python's `bz2` on files it produced.
+
+type Bzip2Error =
+    | NotBzip2(magic: str)
+    | BadLevel(level: i64)
+    | Truncated(at: i64)
+    | BadBlockMagic(at: i64)
+    | BadGroupCount(groups: i64)
+    | BadSelector(at: i64)
+    | BadCode(at: i64)
+    | BadOriginPointer(pointer: i64, size: i64)
+    | CrcMismatch(stored: i64, computed: i64)
+
+type Bzip2Bits = {
+    data: bytes,
+    /// The next bit to read, counted from the start of the data.
+    at: i64,
+}
+
+fn reader(data: bytes) -> Bzip2Bits {
+    return Bzip2Bits{ data: data, at: 0 }
+}
+
+fn take(inout r: Bzip2Bits, count: i64) -> i64 ! Bzip2Error {
+    if r.at + count > r.data.len() * 8 {
+        fail(Truncated(r.at))
+    }
+    var value = 0
+    for _i in 0..count {
+        let byte = r.data.at(r.at / 8)
+        value = value.shl(1).bit_or(byte.ushr(7 - r.at % 8).bit_and(1))
+        r.at = r.at + 1
+    }
+    return value
+}
+
+fn take_bit(inout r: Bzip2Bits) -> i64 ! Bzip2Error {
+    return try take(r, 1)
+}
+
+/// Whether the bytes start with a bzip2 header.
+pub fn is_bzip2(data: bytes) -> bool {
+    return data.len() >= 4 and data.at(0) == 66 and data.at(1) == 90 and
+    data.at(2) == 104 and data.at(3) >= 49 and data.at(3) <= 57
+}
+
+/// The block size in hundreds of kilobytes: 1 to 9.
+pub fn level(data: bytes) -> i64 {
+    if not is_bzip2(data) {
+        return 0
+    }
+    return data.at(3) - 48
+}
+
+/// Runs of four or more collapsed, which is bzip2's first stage.
+///
+/// Four identical bytes and then a count of how many *more* there are, up to
+/// 251. The four are always written even when the run is exactly four, which
+/// is why the stage expands data with no runs in it by a quarter of a per
+/// cent — a price paid so the sort never meets a long run.
+pub fn rle1_decode(data: [i64]) -> [i64] {
+    var out: [i64] = []
+    var run = 0
+    var previous = 0 - 1
+    var i = 0
+    while i < data.len() {
+        let byte = data[i]
+        i = i + 1
+        if run == 4 {
+            // This byte is a count, not data — and it may happen to equal the
+            // byte being repeated, which is why the run has to be tracked
+            // rather than spotted by looking back four bytes. A window scan
+            // reads the count as part of the run and loses everything after
+            // it, on exactly the inputs run-length coding is for.
+            for _k in 0..byte {
+                out.push(previous)
+            }
+            run = 0
+            previous = 0 - 1
+            continue
+        }
+        if byte == previous {
+            run = run + 1
+        } else {
+            run = 1
+            previous = byte
+        }
+        out.push(byte)
+    }
+    return out
+}
+
+/// Move to front: a character just seen becomes zero.
+///
+/// The step that turns the BWT's runs of one character into runs of zero,
+/// which is what the entropy coder can actually exploit.
+pub fn move_to_front(values: [i64], alphabet: [i64]) -> [i64] {
+    var table = alphabet
+    var out: [i64] = []
+    for value in values {
+        var at = 0
+        while at < table.len() and table[at] != value {
+            at = at + 1
+        }
+        out.push(at)
+        table = lift(table, at)
+    }
+    return out
+}
+
+/// The inverse of `move_to_front`.
+pub fn unmove_to_front(indices: [i64], alphabet: [i64]) -> [i64] {
+    var table = alphabet
+    var out: [i64] = []
+    for index in indices {
+        out.push(table[index])
+        table = lift(table, index)
+    }
+    return out
+}
+
+fn lift(table: [i64], at: i64) -> [i64] {
+    if at == 0 {
+        return table
+    }
+    var out: [i64] = [table[at]]
+    var i = 0
+    while i < table.len() {
+        if i != at {
+            out.push(table[i])
+        }
+        i = i + 1
+    }
+    return out
+}
+
+/// The Burrows-Wheeler transform undone.
+///
+/// Given the last column and which row was the original, the whole block
+/// comes back. The trick: the first column is the last column sorted, and for
+/// any character the *k*th occurrence in the last column is the *k*th in the
+/// first — so a single walk of the permutation rebuilds the block backwards.
+pub fn unbwt(last: [i64], origin: i64) -> [i64] ! Bzip2Error {
+    if origin < 0 or origin >= last.len() {
+        fail(BadOriginPointer(origin, last.len()))
+    }
+    var counts: [i64] = []
+    for _i in 0..256 {
+        counts.push(0)
+    }
+    for value in last {
+        counts[value] = counts[value] + 1
+    }
+    var starts: [i64] = []
+    var running = 0
+    for i in 0..256 {
+        starts.push(running)
+        running = running + counts[i]
+    }
+    // next[i] is the row that follows row i in the sorted order.
+    var next: [i64] = []
+    for _i in 0..last.len() {
+        next.push(0)
+    }
+    var seen: [i64] = []
+    for _i in 0..256 {
+        seen.push(0)
+    }
+    var i = 0
+    while i < last.len() {
+        let value = last[i]
+        next[starts[value] + seen[value]] = i
+        seen[value] = seen[value] + 1
+        i = i + 1
+    }
+    var out: [i64] = []
+    var at = next[origin]
+    for _k in 0..last.len() {
+        out.push(last[at])
+        at = next[at]
+    }
+    return out
+}
+
+// ------------------------------------------------------------- the decoder
+
+/// A whole `.bz2` stream.
+pub fn decode(data: bytes) -> bytes ! Bzip2Error {
+    if not is_bzip2(data) {
+        fail(NotBzip2(magic_of(data)))
+    }
+    var r = reader(data)
+    let _skip = try take(r, 32)
+    var out: [i64] = []
+    var stream_crc = 0
+    var going = true
+    while going {
+        let high = try take(r, 24)
+        let low = try take(r, 24)
+        if high == end_magic_high() and low == end_magic_low() {
+            // The end-of-stream magic, then the CRC of all the blocks.
+            let stored = try take(r, 32)
+            if stored != stream_crc {
+                fail(CrcMismatch(stored, stream_crc))
+            }
+            going = false
+            continue
+        }
+        if high != block_magic_high() or low != block_magic_low() {
+            fail(BadBlockMagic(r.at - 48))
+        }
+        let block = try read_block(r)
+        for v in block.0 {
+            out.push(v)
+        }
+        let computed = crc32(block.0)
+        if computed != block.1 {
+            fail(CrcMismatch(block.1, computed))
+        }
+        stream_crc = combine_crc(stream_crc, computed)
+    }
+    return bytes_of(out)
+}
+
+/// The forty-eight bits that start a block: pi's digits, 0x314159265359.
+pub fn block_magic_high() -> i64 {
+    return 3227993
+}
+
+pub fn block_magic_low() -> i64 {
+    return 2511705
+}
+
+/// And the ones that end a stream: the square root of pi, 0x177245385090.
+pub fn end_magic_high() -> i64 {
+    return 1536581
+}
+
+pub fn end_magic_low() -> i64 {
+    return 3690640
+}
+
+fn magic_of(data: bytes) -> str {
+    if data.len() < 3 {
+        return ""
+    }
+    return bytes_of([data.at(0), data.at(1), data.at(2)]).to_str()
+}
+
+fn read_block(inout r: Bzip2Bits) -> ([i64], i64) ! Bzip2Error {
+    let crc = try take(r, 32)
+    let randomised = try take_bit(r)
+    if randomised != 0 {
+        fail(BadBlockMagic(r.at))
+    }
+    let origin = try take(r, 24)
+    let used = try read_symbol_map(r)
+    let groups = try take(r, 3)
+    if groups < 2 or groups > 6 {
+        fail(BadGroupCount(groups))
+    }
+    let selector_count = try take(r, 15)
+    let selectors = try read_selectors(r, groups, selector_count)
+    let alphabet = used.len() + 2
+    var tables: [[i64]] = []
+    for _g in 0..groups {
+        tables.push(try read_lengths(r, alphabet))
+    }
+    let symbols = try read_symbols(r, tables, selectors, alphabet)
+    let mtf = try expand_runs(symbols, used.len())
+    let last = unmove_to_front(mtf, used)
+    return (rle1_decode(try unbwt(last, origin)), crc)
+}
+
+/// Which byte values the block uses.
+///
+/// Sixteen bits saying which groups of sixteen occur, then sixteen bits for
+/// each group that does. A block using only ASCII stores five words rather
+/// than thirty-two, which matters because this is per block.
+fn read_symbol_map(inout r: Bzip2Bits) -> [i64] ! Bzip2Error {
+    let present = try take(r, 16)
+    var used: [i64] = []
+    for group in 0..16 {
+        if present.ushr(15 - group).bit_and(1) == 0 {
+            continue
+        }
+        let bits = try take(r, 16)
+        for i in 0..16 {
+            if bits.ushr(15 - i).bit_and(1) == 1 {
+                used.push(group * 16 + i)
+            }
+        }
+    }
+    return used
+}
+
+/// Which Huffman table each run of fifty symbols uses.
+///
+/// The selectors are themselves move-to-front coded and written in unary,
+/// because the same table tends to be chosen again and again.
+fn read_selectors(inout r: Bzip2Bits, groups: i64,
+    count: i64) -> [i64] ! Bzip2Error {
+    var order: [i64] = []
+    for i in 0..groups {
+        order.push(i)
+    }
+    var out: [i64] = []
+    for _i in 0..count {
+        var steps = 0
+        while (try take_bit(r)) == 1 {
+            steps = steps + 1
+            if steps >= groups {
+                fail(BadSelector(r.at))
+            }
+        }
+        out.push(order[steps])
+        order = lift(order, steps)
+    }
+    return out
+}
+
+/// One table's code lengths.
+///
+/// A starting length, then a bit pair for each symbol: `0` keeps the length,
+/// `10` lengthens it, `11` shortens it. Lengths are similar between
+/// neighbouring symbols, so the deltas are almost always a single zero bit.
+fn read_lengths(inout r: Bzip2Bits, alphabet: i64) -> [i64] ! Bzip2Error {
+    var length = try take(r, 5)
+    var out: [i64] = []
+    for _i in 0..alphabet {
+        var going = true
+        while going {
+            if length < 1 or length > 20 {
+                fail(BadCode(r.at))
+            }
+            if (try take_bit(r)) == 0 {
+                going = false
+                continue
+            }
+            if (try take_bit(r)) == 0 {
+                length = length + 1
+            } else {
+                length = length - 1
+            }
+        }
+        out.push(length)
+    }
+    return out
+}
+
+/// The Huffman-coded symbol stream, switching table every fifty symbols.
+fn read_symbols(inout r: Bzip2Bits, tables: [[i64]], selectors: [i64],
+    alphabet: i64) -> [i64] ! Bzip2Error {
+    var out: [i64] = []
+    var group = 0
+    var left = 0
+    var limits: [i64] = []
+    var bases: [i64] = []
+    var perms: [i64] = []
+    var longest = 0
+    var shortest = 0
+    while true {
+        if left == 0 {
+            if group >= selectors.len() {
+                fail(BadSelector(r.at))
+            }
+            let built = build(tables[selectors[group]])
+            limits = built.0
+            bases = built.1
+            perms = built.2
+            shortest = built.3
+            longest = built.4
+            group = group + 1
+            left = 50
+        }
+        left = left - 1
+        let symbol = try one_symbol(r, limits, bases, perms, shortest,
+            longest)
+        if symbol == alphabet - 1 {
+            return out
+        }
+        out.push(symbol)
+    }
+    return out
+}
+
+/// The three tables bzip2's own decoder uses.
+///
+/// `limit[n]` is the largest code of length `n`, `base[n]` corrects the code
+/// value into an index, and `perm` maps the index to a symbol. Decoding is
+/// then one comparison a bit rather than a walk of the whole table, which is
+/// what makes a nine-hundred-kilobyte block decodable in reasonable time.
+fn build(lengths: [i64]) -> ([i64], [i64], [i64], i64, i64) {
+    var shortest = 32
+    var longest = 0
+    for length in lengths {
+        if length < shortest {
+            shortest = length
+        }
+        if length > longest {
+            longest = length
+        }
+    }
+    var perm: [i64] = []
+    for length in shortest..longest + 1 {
+        var i = 0
+        while i < lengths.len() {
+            if lengths[i] == length {
+                perm.push(i)
+            }
+            i = i + 1
+        }
+    }
+    var counts: [i64] = []
+    for _i in 0..longest + 2 {
+        counts.push(0)
+    }
+    for length in lengths {
+        counts[length + 1] = counts[length + 1] + 1
+    }
+    var i = 1
+    while i < counts.len() {
+        counts[i] = counts[i] + counts[i - 1]
+        i = i + 1
+    }
+    var limit: [i64] = []
+    var base: [i64] = []
+    for _k in 0..longest + 2 {
+        limit.push(0)
+        base.push(0)
+    }
+    var vec = 0
+    var length = shortest
+    while length <= longest {
+        vec = vec + counts[length + 1] - counts[length]
+        limit[length] = vec - 1
+        vec = vec * 2
+        length = length + 1
+    }
+    length = shortest + 1
+    while length <= longest {
+        base[length] = (limit[length - 1] + 1) * 2 - counts[length]
+        length = length + 1
+    }
+    return (limit, base, perm, shortest, longest)
+}
+
+fn one_symbol(inout r: Bzip2Bits, limits: [i64], bases: [i64], perms: [i64],
+    shortest: i64, longest: i64) -> i64 ! Bzip2Error {
+    var length = shortest
+    var value = try take(r, shortest)
+    while length <= longest {
+        if value <= limits[length] {
+            let at = value - bases[length]
+            if at < 0 or at >= perms.len() {
+                fail(BadCode(r.at))
+            }
+            return perms[at]
+        }
+        value = value.shl(1).bit_or(try take_bit(r))
+        length = length + 1
+    }
+    fail(BadCode(r.at))
+}
+
+/// RUNA and RUNB back into runs of zero.
+///
+/// Bijective base two: RUNA is 1 and RUNB is 2, and a run of length `n` has
+/// exactly one representation. Ordinary binary would have several — 3 is
+/// `11` and `011` and `0011` — and an encoder choosing between them would
+/// waste the difference. Every other symbol is a move-to-front index shifted
+/// up by one to make room.
+fn expand_runs(symbols: [i64], alphabet: i64) -> [i64] ! Bzip2Error {
+    var out: [i64] = []
+    var run = 0
+    var weight = 1
+    for symbol in symbols {
+        if symbol <= 1 {
+            run = run + (symbol + 1) * weight
+            weight = weight * 2
+            continue
+        }
+        for _i in 0..run {
+            out.push(0)
+        }
+        run = 0
+        weight = 1
+        if symbol - 1 >= alphabet {
+            fail(BadCode(symbol))
+        }
+        out.push(symbol - 1)
+    }
+    for _i in 0..run {
+        out.push(0)
+    }
+    return out
+}
+
+/// How many blocks a stream holds, without decoding them.
+pub fn block_count(data: bytes) -> i64 {
+    if not is_bzip2(data) {
+        return 0
+    }
+    var count = 0
+    var at = 32
+    let total = data.len() * 8
+    while at + 48 <= total {
+        if magic_at(data, at) == 1 {
+            count = count + 1
+        }
+        at = at + 1
+    }
+    return count
+}
+
+fn magic_at(data: bytes, at: i64) -> i64 {
+    let wanted = [49, 65, 89, 38, 83, 89]
+    for i in 0..6 {
+        var value = 0
+        for k in 0..8 {
+            let position = at + i * 8 + k
+            value = value.shl(1).bit_or(data.at(position / 8)
+                    .ushr(7 - position % 8).bit_and(1))
+        }
+        if value != wanted[i] {
+            return 0
+        }
+    }
+    return 1
+}
+
+/// bzip2's CRC, which is not the CRC everything else uses.
+///
+/// The same polynomial as zlib's and Ethernet's, 0x04C11DB7, but fed most
+/// significant bit first and never reflected. Every other CRC-32 in common
+/// use is the reflected form, so a table lifted from zlib produces a
+/// plausible wrong number here — and because bzip2 stores a CRC a block and
+/// one for the stream, that wrong number is checked twice.
+pub fn crc32(data: [i64]) -> i64 {
+    var crc = 4294967295
+    for byte in data {
+        crc = crc.bit_xor(byte.shl(24)).bit_and(4294967295)
+        for _i in 0..8 {
+            if crc.bit_and(2147483648) != 0 {
+                crc = crc.shl(1).bit_xor(79764919).bit_and(4294967295)
+            } else {
+                crc = crc.shl(1).bit_and(4294967295)
+            }
+        }
+    }
+    return crc.bit_xor(4294967295)
+}
+
+/// The CRCs of a stream's blocks combined, as bzip2 combines them.
+///
+/// Each block's CRC is folded into the running total by rotating it left one
+/// bit and exclusive-oring — not by a proper CRC combination, which would
+/// need the length. It is not a CRC of the whole stream and does not behave
+/// like one; it is a cheap way to notice that a block was dropped.
+pub fn combine_crc(running: i64, block: i64) -> i64 {
+    let rotated = running.shl(1).bit_or(running.ushr(31)).bit_and(4294967295)
+    return rotated.bit_xor(block)
+}

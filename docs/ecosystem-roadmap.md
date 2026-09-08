@@ -14,7 +14,7 @@ plan that discovers them 300 packages in.
 | | |
 |---|---|
 | Started | 78 |
-| Now | 345 |
+| Now | 350 |
 | Tier 1 target | 200 |
 | Tier 2 target | 500 |
 | Tier 3 target | 800 |
@@ -230,7 +230,7 @@ says where the data came from and under what licence, which is the condition.
 | ~~Audio metadata~~ | ~~`id3` `flacmeta` `midi` `wavmeta` `loudness`~~ — done | mutagen, mido, pyloudnorm |
 | ~~Images II~~ | ~~`gif` `ico` `jpegmeta` `resample`~~ and `bmpread`, because `bmp` already writes — done | Pillow |
 | ~~Text encodings~~ | ~~`codepage` `shiftjis` `gb18030` `big5` `euckr`~~ — done | Python codecs |
-| Compression II | `bzip2` `lzw` `huffman` `rangecoder` `deltacodec` | Python bz2, reference LZW |
+| ~~Compression II~~ | ~~`bzip2` `lzw` `huffman` `rangecoder` `deltacodec`~~ — done | Python bz2, `/usr/bin/compress`, Pillow |
 | Protocols II | `mqtt` `coap` `stomp` `amqpframe` `wsextension` | paho, aiocoap |
 | Database internals | `bplustree` `heapfile` `queryplan` `costmodel` `bitmapindex` | SQLite's own plans |
 | Compiler tooling | `lexgen` `parsegen` `firstfollow` `ssaform` `regalloc` | Lark, textbook grammars |

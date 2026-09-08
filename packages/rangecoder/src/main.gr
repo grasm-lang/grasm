@@ -1,0 +1,353 @@
+// Range coding: spending a fraction of a bit on a symbol.
+//
+// Huffman spends a whole number of bits on every symbol. A symbol with
+// probability 0.9 is worth 0.152 bits and Huffman must spend 1 — a sixfold
+// waste on the most common case, and the reason a Huffman-coded stream of
+// mostly-zeroes is nowhere near as small as it should be.
+//
+// Arithmetic coding, and range coding which is the same idea in integers,
+// spends the fraction. The whole message is one enormous number in [0, 1),
+// narrowed by each symbol in proportion to its probability, and the bits
+// written are just enough to identify it. There is no per-symbol overhead at
+// all, so the output approaches the entropy exactly.
+//
+// This is what every modern compressor's back end is. LZMA, Brotli's
+// context modelling, CABAC in H.264, the ANS coder in Zstandard: all of them
+// are this idea, differing in how they model probabilities rather than how
+// they code them.
+//
+// ## Why it took until 2003 to appear in free software
+//
+// Patents, again — IBM held several on arithmetic coding, which is why JPEG
+// shipped with the *worse* Huffman back end as its default for twenty years
+// and the arithmetic option nobody could implement. Range coding, published
+// by Nigel Martin in 1979 and predating the patents, was the way round it.
+//
+// ## The carry problem, which is the whole difficulty
+//
+// The encoder narrows a range and emits leading bytes once they can no longer
+// change. Sometimes they can: a range of [0.4999, 0.5001) has no settled
+// digits at all, and a later symbol may push it over 0.5 and change every
+// digit already written. A coder has to either propagate the carry backwards
+// or prevent it.
+//
+// This one prevents it, with the standard trick: when the range gets small
+// but straddles the midpoint, throw away the middle bit and remember that it
+// is owed. When the range finally settles, the owed bits are written as the
+// opposite of the settled one. It is called underflow handling, it costs four
+// lines, and a coder without it produces output that is *almost always*
+// right — which is much worse than always wrong.
+//
+// ## The model is the interesting part
+//
+// The coder here is exact and boring. What makes a compressor good is the
+// model: what probability it assigns to the next symbol given everything
+// before it. `adaptive_model` updates counts as it goes, so the decoder
+// builds the same model from the same symbols and nothing has to be stored.
+//
+// Checked by round trip on adversarial distributions, and against the entropy
+// bound `huffman.entropy` computes.
+
+type RangeCoderError =
+    | NoSymbols()
+    | ZeroFrequency(symbol: i64)
+    | Truncated(at: i64)
+    | BadStream(at: i64)
+
+    /// Cumulative frequencies: `bounds[i]` to `bounds[i + 1]` is symbol `i`'s
+    /// share of the range, and `bounds` has one more entry than there are
+    /// symbols.
+type RangeModel = { bounds: [i64] }
+
+fn top() -> i64 {
+    return 16777216
+}
+
+fn bottom() -> i64 {
+    return 65536
+}
+
+fn mask() -> i64 {
+    return 4294967295
+}
+
+/// A model from frequencies.
+///
+/// Every symbol needs a non-zero frequency, because a symbol with probability
+/// zero cannot be coded and a stream containing one cannot be decoded. A
+/// compressor that computes frequencies from the data must add one to each,
+/// which is Laplace's rule and costs almost nothing.
+pub fn model_from(frequencies: [i64]) -> RangeModel ! RangeCoderError {
+    if frequencies.len() == 0 {
+        fail(NoSymbols())
+    }
+    var bounds: [i64] = [0]
+    var running = 0
+    var i = 0
+    while i < frequencies.len() {
+        if frequencies[i] <= 0 {
+            fail(ZeroFrequency(i))
+        }
+        running = running + frequencies[i]
+        bounds.push(running)
+        i = i + 1
+    }
+    return RangeModel{ bounds: bounds }
+}
+
+/// A model where every symbol is equally likely.
+pub fn uniform_model(symbols: i64) -> RangeModel ! RangeCoderError {
+    var frequencies: [i64] = []
+    for _i in 0..symbols {
+        frequencies.push(1)
+    }
+    return try model_from(frequencies)
+}
+
+/// The total of all frequencies, which is what the range is divided into.
+pub fn total(model: RangeModel) -> i64 {
+    return model.bounds[model.bounds.len() - 1]
+}
+
+/// How many symbols a model covers.
+pub fn symbol_count(model: RangeModel) -> i64 {
+    return model.bounds.len() - 1
+}
+
+/// The symbol whose share of the range contains a value.
+pub fn symbol_at(model: RangeModel, value: i64) -> i64 {
+    var low = 0
+    var high = symbol_count(model)
+    while low + 1 < high {
+        let middle = (low + high) / 2
+        if model.bounds[middle] <= value {
+            low = middle
+        } else {
+            high = middle
+        }
+    }
+    return low
+}
+
+/// Symbols to bytes, with one fixed model.
+///
+/// The carry-free variant: the range is renormalised a byte at a time, and
+/// when it becomes small while straddling a byte boundary the low byte is
+/// forced down so no carry can propagate into what has already been written.
+/// That costs a fraction of a bit a renormalisation and removes the need to
+/// hold output in memory until the message ends.
+pub fn encode(model: RangeModel, symbols: [i64]) -> bytes ! RangeCoderError {
+    let scale = total(model)
+    var low = 0
+    var range = mask()
+    var out: [i64] = []
+    for symbol in symbols {
+        if symbol < 0 or symbol >= symbol_count(model) {
+            fail(ZeroFrequency(symbol))
+        }
+        let step = range / scale
+        low = low + step * model.bounds[symbol]
+        range = step * (model.bounds[symbol + 1] - model.bounds[symbol])
+        normalise(out, low, range)
+    }
+    // Four bytes of the final low value identify the message.
+    for _i in 0..4 {
+        out.push(low.ushr(24).bit_and(255))
+        low = low.shl(8).bit_and(mask())
+    }
+    return bytes_of(out)
+}
+
+fn settled(low: i64, range: i64) -> bool {
+    return low.bit_xor((low + range).bit_and(mask())).bit_and(mask()) < top()
+}
+
+fn normalise(inout out: [i64], inout low: i64, inout range: i64) {
+    var going = true
+    while going {
+        if settled(low, range) {
+            // The top byte can no longer change whatever comes next.
+        } else if range < bottom() {
+            // The straddling case: the range is small but the top byte is
+            // still undecided. Cut the range down until it is decided, which
+            // is what makes the coder carry-free — nothing already written
+            // can ever need to change.
+            range = (0 - low).bit_and(mask()).bit_and(bottom() - 1)
+        } else {
+            going = false
+            continue
+        }
+        out.push(low.ushr(24).bit_and(255))
+        low = low.shl(8).bit_and(mask())
+        range = range.shl(8).bit_and(mask())
+    }
+}
+
+/// Bytes back to symbols, given how many to expect.
+///
+/// The count has to come from somewhere, because the coder writes no end
+/// marker: a message is a number, and a number does not say how many symbols
+/// went into it. Formats store the length, or reserve a symbol for the end.
+pub fn decode(model: RangeModel, data: bytes,
+    count: i64) -> [i64] ! RangeCoderError {
+    let scale = total(model)
+    var low = 0
+    var range = mask()
+    var code = 0
+    var at = 0
+    for _i in 0..4 {
+        code = code.shl(8).bit_or(byte_at(data, at))
+        at = at + 1
+    }
+    var out: [i64] = []
+    for _i in 0..count {
+        let step = range / scale
+        var value = (code - low).bit_and(mask()) / step
+        if value >= scale {
+            value = scale - 1
+        }
+        let symbol = symbol_at(model, value)
+        low = low + step * model.bounds[symbol]
+        range = step * (model.bounds[symbol + 1] - model.bounds[symbol])
+        out.push(symbol)
+        renormalise(data, at, low, range, code)
+    }
+    return out
+}
+
+fn renormalise(data: bytes, inout at: i64, inout low: i64, inout range: i64,
+    inout code: i64) {
+    var going = true
+    while going {
+        if settled(low, range) {
+            // Nothing to do but consume the settled byte.
+        } else if range < bottom() {
+            range = (0 - low).bit_and(mask()).bit_and(bottom() - 1)
+        } else {
+            going = false
+            continue
+        }
+        code = code.shl(8).bit_and(mask()).bit_or(byte_at(data, at))
+        at = at + 1
+        low = low.shl(8).bit_and(mask())
+        range = range.shl(8).bit_and(mask())
+    }
+}
+
+fn byte_at(data: bytes, at: i64) -> i64 {
+    if at < 0 or at >= data.len() {
+        return 0
+    }
+    return data.at(at)
+}
+
+/// A model that counts what it has seen.
+///
+/// The decoder updates it in the same order from the same symbols, so the
+/// model itself is never transmitted. Every symbol starts at one, which is
+/// Laplace's rule: a symbol never seen still has to be codeable, because the
+/// next one might be it.
+pub fn adaptive_model(symbols: i64) -> [i64] {
+    var out: [i64] = []
+    for _i in 0..symbols {
+        out.push(1)
+    }
+    return out
+}
+
+/// The model updated after a symbol.
+///
+/// Counts are halved when the total gets large, which both bounds the
+/// arithmetic and makes the model forget: recent symbols end up weighing more
+/// than old ones, and on real data that is worth more than the precision lost.
+pub fn observe(inout counts: [i64], symbol: i64) {
+    counts[symbol] = counts[symbol] + 32
+    var sum = 0
+    for c in counts {
+        sum = sum + c
+    }
+    if sum < 65536 {
+        return
+    }
+    var i = 0
+    while i < counts.len() {
+        counts[i] = (counts[i] + 1) / 2
+        i = i + 1
+    }
+}
+
+/// Symbols coded against a model that learns as it goes.
+pub fn encode_adaptive(symbols: [i64],
+    alphabet: i64) -> bytes ! RangeCoderError {
+    var counts = adaptive_model(alphabet)
+    let scale = mask()
+    var low = 0
+    var range = scale
+    var out: [i64] = []
+    for symbol in symbols {
+        if symbol < 0 or symbol >= alphabet {
+            fail(ZeroFrequency(symbol))
+        }
+        let model = try model_from(counts)
+        let step = range / total(model)
+        low = low + step * model.bounds[symbol]
+        range = step * (model.bounds[symbol + 1] - model.bounds[symbol])
+        normalise(out, low, range)
+        observe(counts, symbol)
+    }
+    for _i in 0..4 {
+        out.push(low.ushr(24).bit_and(255))
+        low = low.shl(8).bit_and(mask())
+    }
+    return bytes_of(out)
+}
+
+/// The inverse of `encode_adaptive`.
+pub fn decode_adaptive(data: bytes, alphabet: i64,
+    count: i64) -> [i64] ! RangeCoderError {
+    var counts = adaptive_model(alphabet)
+    var low = 0
+    var range = mask()
+    var code = 0
+    var at = 0
+    for _i in 0..4 {
+        code = code.shl(8).bit_or(byte_at(data, at))
+        at = at + 1
+    }
+    var out: [i64] = []
+    for _i in 0..count {
+        let model = try model_from(counts)
+        let scale = total(model)
+        let step = range / scale
+        var value = (code - low).bit_and(mask()) / step
+        if value >= scale {
+            value = scale - 1
+        }
+        let symbol = symbol_at(model, value)
+        low = low + step * model.bounds[symbol]
+        range = step * (model.bounds[symbol + 1] - model.bounds[symbol])
+        out.push(symbol)
+        renormalise(data, at, low, range, code)
+        observe(counts, symbol)
+    }
+    return out
+}
+
+/// The bits a message costs under a fixed model, ignoring the coder's own
+/// four-byte tail.
+///
+/// The number the coder gets to within a byte or so, and the number Huffman
+/// cannot reach when any symbol's probability is not a power of two.
+pub fn ideal_bits(model: RangeModel, symbols: [i64]) -> f64 {
+    let scale = total(model).as_f64()
+    var bits = 0.0
+    for symbol in symbols {
+        if symbol < 0 or symbol >= symbol_count(model) {
+            continue
+        }
+        let share = (model.bounds[symbol + 1] -
+            model.bounds[symbol]).as_f64() / scale
+        bits = bits - share.ln() / (2.0).ln()
+    }
+    return bits
+}

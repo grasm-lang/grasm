@@ -1,0 +1,368 @@
+// The transforms that go before a compressor, and are most of the win.
+//
+// A general compressor sees bytes. A column of timestamps, a list of sorted
+// ids, a sensor reading sampled every second — these have structure a byte
+// compressor cannot see, and a two-line transform that exposes it usually
+// beats a better compressor that does not have it.
+//
+// This is the modelling half of compression. `huffman` and `rangecoder` are
+// the coding half; neither can do anything with `1000000, 1000001, 1000002`,
+// and after a delta pass it is `1000000, 1, 1` and both do very well.
+//
+// ## Delta, and why the second difference matters
+//
+// One difference turns a counter into a constant. A second difference turns a
+// *rate* into a constant — which is what a clock does, what a sensor sampled
+// at a fixed interval does, and what a monotonically increasing sequence with
+// a fixed step does. Gorilla, Prometheus and every time-series database in
+// production stores second differences for exactly this reason.
+//
+// ## Zig-zag, and why not two's complement
+//
+// A delta is often negative, and a negative number in two's complement has
+// every high bit set — so a varint of -1 is ten bytes. Zig-zag interleaves:
+// 0, -1, 1, -2, 2 become 0, 1, 2, 3, 4, so a small negative number is a small
+// unsigned one. Protocol Buffers' `sint64` is this; `int64` is not, and the
+// difference is nine bytes an entry on a field that is often negative.
+//
+// ## Frame of reference
+//
+// Subtract the minimum of a block and store the width the remainder needs.
+// A block of values between 1000 and 1007 becomes three bits each. This is
+// what every columnar format does — Parquet, ORC, Arrow — and it works
+// because real columns are locally clustered even when they are globally
+// spread.
+//
+// ## What this is not
+//
+// Not a compressor. Every function here is a bijection: nothing is lost and
+// nothing is smaller until a coder runs afterwards. The point is to make the
+// coder's job easy.
+
+type DeltaError =
+    | Empty()
+    | WidthTooLarge(width: i64)
+    | Truncated(at: i64)
+    | NotCanonical(at: i64)
+
+    /// Differences between neighbours, first value kept as it is.
+pub fn delta(values: [i64]) -> [i64] {
+    var out: [i64] = []
+    var i = 0
+    while i < values.len() {
+        if i == 0 {
+            out.push(values[i])
+        } else {
+            out.push(values[i] - values[i - 1])
+        }
+        i = i + 1
+    }
+    return out
+}
+
+/// The inverse of `delta`.
+pub fn undelta(values: [i64]) -> [i64] {
+    var out: [i64] = []
+    var running = 0
+    var i = 0
+    while i < values.len() {
+        if i == 0 {
+            running = values[i]
+        } else {
+            running = running + values[i]
+        }
+        out.push(running)
+        i = i + 1
+    }
+    return out
+}
+
+/// Differences of differences.
+///
+/// A sequence sampled at a fixed rate becomes a run of zeroes, which is what
+/// makes a time-series column compress by two orders of magnitude rather than
+/// two.
+pub fn delta2(values: [i64]) -> [i64] {
+    if values.len() < 2 {
+        return values
+    }
+    var out = delta(values)
+    let tail = delta(rest(out))
+    var result: [i64] = [out[0]]
+    for v in tail {
+        result.push(v)
+    }
+    return result
+}
+
+/// The inverse of `delta2`.
+pub fn undelta2(values: [i64]) -> [i64] {
+    if values.len() < 2 {
+        return values
+    }
+    var first = values[0]
+    var restored = undelta(rest(values))
+    var joined: [i64] = [first]
+    for v in restored {
+        joined.push(v)
+    }
+    return undelta(joined)
+}
+
+fn rest(values: [i64]) -> [i64] {
+    var out: [i64] = []
+    var i = 1
+    while i < values.len() {
+        out.push(values[i])
+        i = i + 1
+    }
+    return out
+}
+
+/// A signed number as an unsigned one, small negatives staying small.
+///
+/// Protocol Buffers calls this `sint64`. The plain `int64` encoding writes -1
+/// as ten bytes because two's complement sets every high bit; this writes it
+/// as one.
+pub fn zigzag(value: i64) -> i64 {
+    if value < 0 {
+        return 0 - value * 2 - 1
+    }
+    return value * 2
+}
+
+/// The inverse of `zigzag`.
+pub fn unzigzag(value: i64) -> i64 {
+    if value % 2 == 1 {
+        return 0 - (value + 1) / 2
+    }
+    return value / 2
+}
+
+/// Seven bits a byte, top bit set on every byte but the last.
+///
+/// The same shape as MIDI's variable-length quantity and Protocol Buffers'
+/// varint, and it is *not* the same as either: MIDI writes the high group
+/// first, this and Protocol Buffers write the low group first. Reading one as
+/// the other gives a plausible wrong number rather than an error.
+pub fn varint(value: i64) -> [i64] {
+    var out: [i64] = []
+    var v = value
+    while v >= 128 {
+        out.push(v % 128 + 128)
+        v = v / 128
+    }
+    out.push(v)
+    return out
+}
+
+/// A varint read back, with the offset just past it.
+pub fn read_varint(data: bytes, at: i64) -> (i64, i64) ! DeltaError {
+    var value = 0
+    var shift = 1
+    var i = at
+    while i < data.len() {
+        let byte = data.at(i)
+        value = value + byte.bit_and(127) * shift
+        i = i + 1
+        if byte < 128 {
+            return (value, i)
+        }
+        shift = shift * 128
+    }
+    fail(Truncated(at))
+}
+
+/// A list of signed numbers as bytes: zig-zag, then varint.
+pub fn pack(values: [i64]) -> bytes {
+    var out: [i64] = []
+    for value in values {
+        for byte in varint(zigzag(value)) {
+            out.push(byte)
+        }
+    }
+    return bytes_of(out)
+}
+
+/// The inverse of `pack`.
+pub fn unpack(data: bytes) -> [i64] ! DeltaError {
+    var out: [i64] = []
+    var at = 0
+    while at < data.len() {
+        let read = try read_varint(data, at)
+        out.push(unzigzag(read.0))
+        at = read.1
+    }
+    return out
+}
+
+/// The number of bits every value in a block needs, after subtracting the
+/// smallest.
+///
+/// The "frame of reference" of every columnar format: a block of values
+/// between 1000 and 1007 is three bits each plus one stored minimum, and the
+/// block does not care that the values are large, only that they are close.
+pub fn frame_width(values: [i64]) -> i64 ! DeltaError {
+    if values.len() == 0 {
+        fail(Empty())
+    }
+    let low = minimum(values)
+    var width = 0
+    for value in values {
+        let need = bits_for(value - low)
+        if need > width {
+            width = need
+        }
+    }
+    return width
+}
+
+fn minimum(values: [i64]) -> i64 {
+    var low = values[0]
+    for value in values {
+        if value < low {
+            low = value
+        }
+    }
+    return low
+}
+
+/// How many bits a non-negative number needs. Zero needs none.
+pub fn bits_for(value: i64) -> i64 {
+    var bits = 0
+    var v = value
+    while v > 0 {
+        bits = bits + 1
+        v = v / 2
+    }
+    return bits
+}
+
+/// A block packed against its own minimum.
+///
+/// Answers the minimum, the width, and the bits — which is what a columnar
+/// page header holds, and why a page can be skipped entirely when a query's
+/// range does not overlap the minimum and maximum.
+pub fn frame_pack(values: [i64]) -> (i64, i64, bytes) ! DeltaError {
+    let width = try frame_width(values)
+    if width > 62 {
+        fail(WidthTooLarge(width))
+    }
+    let low = minimum(values)
+    var out: [i64] = []
+    var held = 0
+    var bits = 0
+    for value in values {
+        let v = value - low
+        var i = width - 1
+        while i >= 0 {
+            held = held.shl(1).bit_or(v.ushr(i).bit_and(1))
+            bits = bits + 1
+            if bits == 8 {
+                out.push(held)
+                held = 0
+                bits = 0
+            }
+            i = i - 1
+        }
+    }
+    if bits > 0 {
+        out.push(held.shl(8 - bits))
+    }
+    return (low, width, bytes_of(out))
+}
+
+/// The inverse of `frame_pack`, given how many values to expect.
+pub fn frame_unpack(low: i64, width: i64, data: bytes,
+    count: i64) -> [i64] ! DeltaError {
+    if width == 0 {
+        var out: [i64] = []
+        for _i in 0..count {
+            out.push(low)
+        }
+        return out
+    }
+    if count * width > data.len() * 8 {
+        fail(Truncated(data.len()))
+    }
+    var out: [i64] = []
+    var at = 0
+    for _i in 0..count {
+        var value = 0
+        for _b in 0..width {
+            value = value.shl(1).bit_or(data.at(at / 8).ushr(7 - at % 8)
+                    .bit_and(1))
+            at = at + 1
+        }
+        out.push(low + value)
+    }
+    return out
+}
+
+/// Runs, as (value, length) pairs.
+///
+/// After a delta pass a constant-rate series is a run of zeroes, and this is
+/// what turns that into two numbers.
+pub fn runs(values: [i64]) -> [(i64, i64)] {
+    var out: [(i64, i64)] = []
+    var i = 0
+    while i < values.len() {
+        var length = 1
+        while i + length < values.len() and values[i + length] == values[i] {
+            length = length + 1
+        }
+        out.push((values[i], length))
+        i = i + length
+    }
+    return out
+}
+
+/// The inverse of `runs`.
+pub fn unruns(pairs: [(i64, i64)]) -> [i64] {
+    var out: [i64] = []
+    for pair in pairs {
+        for _i in 0..pair.1 {
+            out.push(pair.0)
+        }
+    }
+    return out
+}
+
+/// How many bytes `pack` would take, without building them.
+pub fn packed_size(values: [i64]) -> i64 {
+    var total = 0
+    for value in values {
+        total = total + varint(zigzag(value)).len()
+    }
+    return total
+}
+
+/// Whether a sequence never decreases, which is when a delta pass is
+/// guaranteed to produce non-negative numbers and zig-zag is not needed.
+pub fn is_monotonic(values: [i64]) -> bool {
+    var i = 1
+    while i < values.len() {
+        if values[i] < values[i - 1] {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+/// Whether a sequence steps by a constant amount, which is when a second
+/// difference is all zeroes.
+pub fn is_linear(values: [i64]) -> bool {
+    if values.len() < 3 {
+        return true
+    }
+    let step = values[1] - values[0]
+    var i = 2
+    while i < values.len() {
+        if values[i] - values[i - 1] != step {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}

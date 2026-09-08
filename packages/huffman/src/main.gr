@@ -1,0 +1,494 @@
+// Huffman coding, and the canonical form that makes it shippable.
+//
+// Huffman's 1952 result is that if you know how often each symbol occurs, the
+// shortest possible prefix-free code is built by repeatedly merging the two
+// least frequent symbols. It is one of the few compression results that is
+// provably optimal, and the proof is short enough to fit in a lecture.
+//
+// It is also, on its own, useless for a file format — because the decoder
+// needs the same tree, and storing a tree costs more than the compression
+// saved on anything small.
+//
+// ## The canonical form, which is the actual invention
+//
+// Two codes with the same *lengths* compress equally well. So: sort the
+// symbols by code length, then by symbol value, and hand out codes in
+// increasing numeric order, starting from zero and shifting left whenever the
+// length increases. Now the code is completely determined by the list of
+// lengths, and the lengths are what you store.
+//
+// DEFLATE stores lengths. JPEG stores counts-per-length. Every format that
+// uses Huffman stores lengths, because a tree of 288 symbols costs a few
+// hundred bytes as lengths and several kilobytes as a tree.
+//
+// ## The length limit nobody mentions
+//
+// A code built by the plain algorithm can be 32 bits long on a pathological
+// input — Fibonacci frequencies are the classic case. Formats cap it: DEFLATE
+// at 15 bits, JPEG at 16. Enforcing the cap means giving up a fraction of a
+// per cent of compression, and the usual method is to build the code, find
+// the over-long ones, and move them up by stealing bits from shorter ones.
+// That is `limit_lengths` here, and it is the part most tutorials skip.
+//
+// ## What this is for
+//
+// The entropy stage of a compressor. It pairs with `deltacodec` for the
+// modelling stage and `rangecoder` for the case where Huffman's whole-bit
+// granularity is too coarse — a symbol with probability 0.9 wants 0.15 bits
+// and Huffman must spend 1.
+//
+// Checked against Python's own DEFLATE tables and against a reference
+// canonical-code implementation.
+
+type HuffmanError =
+    | NoSymbols()
+    | NotInCode(symbol: i64)
+    | TooManySymbols(symbols: i64, limit: i64)
+    | Incomplete(shortfall: i64)
+    | Oversubscribed(excess: i64)
+    | BadCode(at: i64)
+
+type HuffmanCode = {
+    /// One entry a symbol; zero means the symbol does not occur.
+    lengths: [i64],
+    /// The code for each symbol, right-aligned in `lengths` bits.
+    codes: [i64],
+}
+
+/// The code lengths Huffman's algorithm gives for a set of frequencies.
+///
+/// A symbol with a frequency of zero gets a length of zero and no code.
+/// A single distinct symbol gets a length of one, not zero: a code of no bits
+/// cannot be told from the end of the stream.
+pub fn lengths_for(frequencies: [i64]) -> [i64] ! HuffmanError {
+    var present: [i64] = []
+    var i = 0
+    while i < frequencies.len() {
+        if frequencies[i] > 0 {
+            present.push(i)
+        }
+        i = i + 1
+    }
+    if present.len() == 0 {
+        fail(NoSymbols())
+    }
+    var lengths: [i64] = []
+    for _k in 0..frequencies.len() {
+        lengths.push(0)
+    }
+    if present.len() == 1 {
+        lengths[present[0]] = 1
+        return lengths
+    }
+    merge(lengths, frequencies, present)
+    return lengths
+}
+
+fn merge(inout lengths: [i64], frequencies: [i64], present: [i64]) {
+    // Each node is (weight, list of symbols beneath it). Merging the two
+    // lightest nodes adds one bit to every symbol under both of them, which
+    // is the whole algorithm.
+    var weights: [i64] = []
+    var members: [[i64]] = []
+    for symbol in present {
+        weights.push(frequencies[symbol])
+        members.push([symbol])
+    }
+    while weights.len() > 1 {
+        let a = lightest(weights, 0 - 1)
+        let b = lightest(weights, a)
+        for symbol in members[a] {
+            lengths[symbol] = lengths[symbol] + 1
+        }
+        for symbol in members[b] {
+            lengths[symbol] = lengths[symbol] + 1
+        }
+        var joined = members[a]
+        for symbol in members[b] {
+            joined.push(symbol)
+        }
+        weights[a] = weights[a] + weights[b]
+        members[a] = joined
+        weights = without(weights, b)
+        members = without_list(members, b)
+    }
+}
+
+fn lightest(weights: [i64], skip: i64) -> i64 {
+    var best = 0 - 1
+    var i = 0
+    while i < weights.len() {
+        if i != skip and (best < 0 or weights[i] < weights[best]) {
+            best = i
+        }
+        i = i + 1
+    }
+    return best
+}
+
+fn without(values: [i64], at: i64) -> [i64] {
+    var out: [i64] = []
+    var i = 0
+    while i < values.len() {
+        if i != at {
+            out.push(values[i])
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn without_list(values: [[i64]], at: i64) -> [[i64]] {
+    var out: [[i64]] = []
+    var i = 0
+    while i < values.len() {
+        if i != at {
+            out.push(values[i])
+        }
+        i = i + 1
+    }
+    return out
+}
+
+/// Code lengths capped, at the cost of a little compression.
+///
+/// Every format caps them — DEFLATE at 15 bits, JPEG at 16 — because a
+/// decoder's lookup table is sized by the longest code, and a 32-bit code
+/// means a four-billion-entry table. Frequencies following the Fibonacci
+/// sequence are the case that produces one.
+///
+/// Capping shortens some codes, which makes the code *overfull*: two symbols
+/// would share a prefix. The fix is to lengthen others until Kraft's sum is
+/// exactly one again, and to lengthen the longest ones first, because that
+/// costs the fewest bits. The result is worth a fraction of a per cent less
+/// than the optimum and always fits.
+pub fn limit_lengths(lengths: [i64], limit: i64) -> [i64] ! HuffmanError {
+    var used = 0
+    for length in lengths {
+        if length > 0 {
+            used = used + 1
+        }
+    }
+    // A code of at most `limit` bits has 2^limit leaves. More symbols than
+    // that is not a compression problem, it is arithmetic.
+    if used > (1).shl(limit) {
+        fail(TooManySymbols(used, limit))
+    }
+    var out = lengths
+    var i = 0
+    while i < out.len() {
+        if out[i] > limit {
+            out[i] = limit
+        }
+        i = i + 1
+    }
+    let full = (1).shl(limit)
+    var total = kraft(out, limit)
+    // Clamping shortened codes, which makes the sum too large. Lengthen the
+    // longest codes still under the limit until it fits.
+    while total > full {
+        let pick = longest_below(out, limit)
+        if pick < 0 {
+            fail(TooManySymbols(used, limit))
+        }
+        total = total - (1).shl(limit - out[pick] - 1)
+        out[pick] = out[pick] + 1
+    }
+    // That can overshoot, because the last step may be larger than the
+    // shortfall. Give the slack back to the longest codes, which is free
+    // compression and the reason the result is within a hair of optimal.
+    while total < full {
+        let pick = shortenable(out, limit, full - total)
+        if pick < 0 {
+            return out
+        }
+        total = total + (1).shl(limit - out[pick])
+        out[pick] = out[pick] - 1
+    }
+    return out
+}
+
+fn shortenable(lengths: [i64], limit: i64, room: i64) -> i64 {
+    var pick = 0 - 1
+    var best = 0
+    var i = 0
+    while i < lengths.len() {
+        if lengths[i] > 1 and (1).shl(limit - lengths[i]) <= room and
+        lengths[i] > best {
+            best = lengths[i]
+            pick = i
+        }
+        i = i + 1
+    }
+    return pick
+}
+
+/// Kraft's sum, in units of two to the minus `limit`.
+///
+/// Exactly `2^limit` for a complete code, less for one with room left over,
+/// more for one where two symbols would share a prefix.
+pub fn kraft(lengths: [i64], limit: i64) -> i64 {
+    var total = 0
+    for length in lengths {
+        if length > 0 {
+            total = total + (1).shl(limit - length)
+        }
+    }
+    return total
+}
+
+fn longest_below(lengths: [i64], limit: i64) -> i64 {
+    var pick = 0 - 1
+    var best = 0
+    var i = 0
+    while i < lengths.len() {
+        if lengths[i] > 0 and lengths[i] < limit and lengths[i] > best {
+            best = lengths[i]
+            pick = i
+        }
+        i = i + 1
+    }
+    return pick
+}
+
+/// The canonical code for a set of lengths.
+///
+/// Shortest codes first, and within a length, lowest symbol first. Two
+/// implementations that agree on the lengths agree on every bit, which is why
+/// a format can store lengths alone.
+pub fn canonical(lengths: [i64]) -> HuffmanCode ! HuffmanError {
+    let longest = maximum(lengths)
+    if longest == 0 {
+        fail(NoSymbols())
+    }
+    var counts: [i64] = []
+    for _i in 0..longest + 1 {
+        counts.push(0)
+    }
+    for length in lengths {
+        if length > 0 {
+            counts[length] = counts[length] + 1
+        }
+    }
+    try check_complete(counts, longest)
+    var next: [i64] = []
+    var code = 0
+    next.push(0)
+    for length in 1..longest + 1 {
+        code = (code + counts[length - 1]).shl(1)
+        next.push(code)
+    }
+    var codes: [i64] = []
+    var i = 0
+    while i < lengths.len() {
+        if lengths[i] == 0 {
+            codes.push(0)
+        } else {
+            codes.push(next[lengths[i]])
+            next[lengths[i]] = next[lengths[i]] + 1
+        }
+        i = i + 1
+    }
+    return HuffmanCode{ lengths: lengths, codes: codes }
+}
+
+fn check_complete(counts: [i64], longest: i64) ! HuffmanError {
+    // Kraft's inequality: the code lengths must exactly fill the space. Left
+    // over means a decoder can read bits that mean nothing; overfull means
+    // two symbols share a code.
+    var left = 1
+    for length in 1..longest + 1 {
+        left = left * 2 - counts[length]
+        if left < 0 {
+            fail(Oversubscribed(0 - left))
+        }
+    }
+    if left > 0 and not (counts[1] == 1 and longest == 1) {
+        fail(Incomplete(left))
+    }
+}
+
+fn maximum(values: [i64]) -> i64 {
+    var best = 0
+    for v in values {
+        if v > best {
+            best = v
+        }
+    }
+    return best
+}
+
+/// Symbols packed into bits, most significant bit of each code first.
+///
+/// Codes are written high bit first, which is what JPEG, PNG's own header
+/// tables and every network format do. DEFLATE writes its Huffman codes the
+/// same way even though everything else in DEFLATE is bit-reversed, which is
+/// a detail that has cost every implementer an afternoon.
+pub fn encode(code: HuffmanCode, symbols: [i64]) -> (bytes, i64) ! HuffmanError {
+    var out: [i64] = []
+    var held = 0
+    var bits = 0
+    for symbol in symbols {
+        if symbol < 0 or symbol >= code.lengths.len() or
+        code.lengths[symbol] == 0 {
+            fail(NotInCode(symbol))
+        }
+        let length = code.lengths[symbol]
+        var i = length - 1
+        while i >= 0 {
+            held = held.shl(1).bit_or(code.codes[symbol].ushr(i).bit_and(1))
+            bits = bits + 1
+            if bits == 8 {
+                out.push(held)
+                held = 0
+                bits = 0
+            }
+            i = i - 1
+        }
+    }
+    let total = out.len() * 8 + bits
+    if bits > 0 {
+        out.push(held.shl(8 - bits))
+    }
+    return (bytes_of(out), total)
+}
+
+/// Bits back to symbols.
+///
+/// Decoding walks the code lengths one bit at a time, which is the slow and
+/// obvious way; a real decoder builds a lookup table indexed by the next
+/// `limit` bits. The slow way is here because it is the one that is
+/// self-evidently correct, and a table is an optimisation of it.
+pub fn decode(code: HuffmanCode, data: bytes,
+    bit_count: i64) -> [i64] ! HuffmanError {
+    var first: [i64] = []
+    var index: [i64] = []
+    var sorted: [i64] = []
+    build_tables(code, first, index, sorted)
+    var out: [i64] = []
+    var at = 0
+    while at < bit_count {
+        let symbol = try next_symbol(code, first, index, sorted, data, at,
+            bit_count)
+        out.push(symbol.0)
+        at = symbol.1
+    }
+    return out
+}
+
+fn build_tables(code: HuffmanCode, inout first: [i64], inout index: [i64],
+    inout sorted: [i64]) {
+    let longest = maximum(code.lengths)
+    var counts: [i64] = []
+    for _i in 0..longest + 2 {
+        counts.push(0)
+    }
+    for length in code.lengths {
+        if length > 0 {
+            counts[length] = counts[length] + 1
+        }
+    }
+    var next = 0
+    var offset = 0
+    // One entry past the longest length, so the count of the longest codes
+    // is a subtraction like every other length's rather than a special case.
+    for length in 0..longest + 2 {
+        first.push(next)
+        index.push(offset)
+        next = (next + counts[length]).shl(1)
+        offset = offset + counts[length]
+    }
+    // Symbols in canonical order: by length, then by symbol.
+    for length in 1..longest + 1 {
+        var symbol = 0
+        while symbol < code.lengths.len() {
+            if code.lengths[symbol] == length {
+                sorted.push(symbol)
+            }
+            symbol = symbol + 1
+        }
+    }
+}
+
+fn next_symbol(code: HuffmanCode, first: [i64], index: [i64], sorted: [i64],
+    data: bytes, from: i64, bit_count: i64) -> (i64, i64) ! HuffmanError {
+    var value = 0
+    var at = from
+    var length = 0
+    let longest = maximum(code.lengths)
+    while length < longest {
+        if at >= bit_count {
+            fail(BadCode(from))
+        }
+        value = value.shl(1).bit_or(data.at(at / 8).ushr(7 - at % 8)
+                .bit_and(1))
+        at = at + 1
+        length = length + 1
+        let start = first[length]
+        let count = count_at(index, length)
+        if count > 0 and value >= start and value < start + count {
+            return (sorted[index[length] + value - start], at)
+        }
+    }
+    fail(BadCode(from))
+}
+
+fn count_at(index: [i64], length: i64) -> i64 {
+    if length + 1 >= index.len() {
+        return 0
+    }
+    return index[length + 1] - index[length]
+}
+
+/// How many bits a set of symbols costs under a code.
+pub fn bit_cost(code: HuffmanCode, frequencies: [i64]) -> i64 {
+    var total = 0
+    var i = 0
+    while i < frequencies.len() and i < code.lengths.len() {
+        total = total + frequencies[i] * code.lengths[i]
+        i = i + 1
+    }
+    return total
+}
+
+/// The entropy of a set of frequencies, in bits.
+///
+/// The floor Huffman cannot go below, and usually does not reach: Huffman
+/// spends a whole number of bits a symbol, so a symbol with probability 0.9
+/// wants 0.15 bits and costs 1. That gap is the entire reason arithmetic and
+/// range coders exist.
+pub fn entropy(frequencies: [i64]) -> f64 {
+    var total = 0
+    for f in frequencies {
+        total = total + f
+    }
+    if total == 0 {
+        return 0.0
+    }
+    var bits = 0.0
+    for f in frequencies {
+        if f > 0 {
+            let p = f.as_f64() / total.as_f64()
+            bits = bits - p * (p.ln() / (2.0).ln())
+        }
+    }
+    return bits * total.as_f64()
+}
+
+/// A complete code built from frequencies in one step.
+pub fn build(frequencies: [i64], limit: i64) -> HuffmanCode ! HuffmanError {
+    let plain = try lengths_for(frequencies)
+    return try canonical(try limit_lengths(plain, limit))
+}
+
+/// How often each byte occurs.
+pub fn byte_frequencies(data: bytes) -> [i64] {
+    var out: [i64] = []
+    for _i in 0..256 {
+        out.push(0)
+    }
+    for i in 0..data.len() {
+        out[data.at(i)] = out[data.at(i)] + 1
+    }
+    return out
+}

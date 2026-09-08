@@ -1,0 +1,6 @@
+[package]
+name = "rangecoder"
+version = "1.0.0"
+
+# Symbols in, bits out. Opens nothing.
+capabilities = []

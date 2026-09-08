@@ -1,0 +1,398 @@
+import huffman
+import lzw
+import rangecoder
+import deltacodec
+import bzip2
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn near(a: f64, b: f64, tolerance: f64) -> bool {
+    var d = a - b
+    if d < 0.0 {
+        d = 0.0 - d
+    }
+    return d < tolerance
+}
+
+fn list_of(data: bytes) -> [i64] {
+    var out: [i64] = []
+    for i in 0..data.len() {
+        out.push(data.at(i))
+    }
+    return out
+}
+
+// --------------------------------------------------------------- huffman
+
+fn lengths(frequencies: [i64]) -> [i64] {
+    return huffman.lengths_for(frequencies) ?? []
+}
+
+fn check_huffman(inout f: i64) / {io} {
+    print("-- huffman: the lengths are the code, and that is the invention")
+    // Huffman's own 1952 example: the two least frequent symbols merge, then
+    // the merged node competes on its combined weight.
+    say(f, "the least frequent symbols get the longest codes",
+        lengths([45, 13, 12, 16, 9, 5]) == [1, 3, 3, 3, 4, 4])
+    // A single distinct symbol still needs a bit: a code of no bits cannot be
+    // told from the end of the stream.
+    say(f, "a single symbol gets one bit, not none",
+        lengths([7]) == [1] and lengths([0, 5, 0]) == [0, 1, 0])
+    let code = huffman.canonical([1, 3, 3, 3, 4, 4]) ??
+    HuffmanCode{ lengths: [], codes: [] }
+    // Canonical: shortest first, and within a length, lowest symbol first.
+    // Two implementations that agree on lengths agree on every bit, which is
+    // why formats store lengths and not trees.
+    say(f, "the canonical code follows from the lengths alone",
+        code.codes == [0, 4, 5, 6, 14, 15])
+    // Kraft: the lengths must exactly fill the code space.
+    say(f, "a code that does not fill the space is refused",
+        huffman.kraft([1, 3, 3, 3, 4, 4], 4) == 16 and
+        refused([1, 3, 3]) and refused([1, 1, 1]))
+    // DEFLATE caps at 15 bits and JPEG at 16, because a decoder's table is
+    // sized by the longest code. Fibonacci frequencies are what produces a
+    // long one.
+    let long = lengths(fibonacci(30))
+    say(f, "Fibonacci frequencies produce codes too long for any format",
+        maximum(long) > 16)
+    let capped = huffman.limit_lengths(long, 15) ?? []
+    // The optimal code costs 5,702,853 bits and needs 29 of them for the
+    // rarest symbol. Capped at DEFLATE's fifteen it costs 5,724,752 — four
+    // tenths of a per cent more, and it fits in a table a decoder can hold.
+    say(f, "capping them costs four tenths of a per cent",
+        maximum(capped) == 15 and huffman.kraft(capped, 15) == 32768 and
+        huffman.bit_cost(huffman.canonical(capped) ??
+            HuffmanCode{ lengths: [], codes: [] }, fibonacci(30)) == 5724752)
+    say(f, "and more symbols than the cap has codes is refused, not capped",
+        cap_refused(20, 4))
+    // Round trip.
+    let symbols = [0, 1, 2, 3, 4, 5, 0, 0, 0, 2, 1, 0]
+    let built = huffman.build([45, 13, 12, 16, 9, 5], 15) ??
+    HuffmanCode{ lengths: [], codes: [] }
+    let packed = huffman.encode(built, symbols) ?? ("".to_bytes(), 0)
+    say(f, "symbols pack into bits and come back",
+        (huffman.decode(built, packed.0, packed.1) ?? []) == symbols)
+    // The gap Huffman cannot close: whole bits a symbol.
+    say(f, "byte frequencies are counted, not guessed",
+        huffman.byte_frequencies("aab".to_bytes())[97] == 2 and
+        huffman.byte_frequencies("aab".to_bytes())[98] == 1 and
+        huffman.byte_frequencies("aab".to_bytes())[99] == 0)
+    say(f, "and it always costs more than the entropy when it must round up",
+        huffman.bit_cost(built, [45, 13, 12, 16, 9, 5]) == 224 and
+        near(huffman.entropy([45, 13, 12, 16, 9, 5]), 221.98800, 0.001))
+}
+
+fn refused(lengths: [i64]) -> bool {
+    match huffman.canonical(lengths) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn cap_refused(symbols: i64, limit: i64) -> bool {
+    var frequencies: [i64] = []
+    for i in 0..symbols {
+        frequencies.push(i + 1)
+    }
+    match huffman.limit_lengths(lengths(frequencies), limit) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn fibonacci(n: i64) -> [i64] {
+    var out: [i64] = []
+    var a = 1
+    var b = 1
+    for _i in 0..n {
+        out.push(a)
+        let next = a + b
+        a = b
+        b = next
+    }
+    return out
+}
+
+fn maximum(values: [i64]) -> i64 {
+    var best = 0
+    for v in values {
+        if v > best {
+            best = v
+        }
+    }
+    return best
+}
+
+// ------------------------------------------------------------------- lzw
+
+// The strip Pillow wrote for an 8x8 TIFF: thirty 'I's, thirty '1's, and four
+// bytes of noise.
+fn tiff_strip() -> bytes {
+    return bytes_of([128, 18, 96, 80, 56, 36, 22, 13, 7, 129, 12, 97, 80,
+        184, 100, 54, 29, 15, 133, 2, 91, 171, 230, 244, 4])
+}
+
+fn tiff_pixels() -> [i64] {
+    var out: [i64] = []
+    for _i in 0..30 {
+        out.push(73)
+    }
+    for _i in 0..30 {
+        out.push(49)
+    }
+    for v in [9, 221, 190, 222] {
+        out.push(v)
+    }
+    return out
+}
+
+fn check_lzw(inout f: i64) / {io} {
+    print("-- lzw: three packings of one algorithm, and none of them agree")
+    let decoded: bytes ! LzwError = lzw.decode_tiff(tiff_strip())
+    say(f, "Pillow's TIFF strip decodes to Pillow's pixels",
+        list_of(decoded ?? "".to_bytes()) == tiff_pixels())
+    say(f, "and re-encoding gives Pillow's bytes back, to the bit",
+        list_of(lzw.encode_tiff(decoded ?? "".to_bytes())) ==
+        list_of(tiff_strip()))
+    // TIFF's specification increases the code width one code early. It is a
+    // mistake, it was noticed too late, and every implementation reproduces
+    // it deliberately.
+    say(f, "TIFF's decoder widens one code early, which is the known bug",
+        lzw.width_for(512, lzw.tiff_options()) == 10 and
+        lzw.width_for(512, lzw.strict_options()) == 9 and
+        lzw.width_for(511, lzw.tiff_options()) == 9)
+    say(f, "the two packings put the bits at opposite ends of the byte",
+        lzw.tiff_options().msb_first and
+        not lzw.compress_options(16, true).msb_first)
+    // Unix compress: a whole file, header and all.
+    let z = bytes_of([31, 157, 144, 65, 0])
+    say(f, "a .Z file says its own maximum width and whether it clears",
+        lzw.is_compress(z) and lzw.compress_max_width(z) == 16 and
+        lzw.compress_block_mode(z))
+    say(f, "and decodes to what compress compressed",
+        (lzw.decode_compress(z) ?? "".to_bytes()).to_str() == "A")
+    say(f, "what this writes is what compress writes, byte for byte",
+        list_of(lzw.encode_compress("A".to_bytes())) == [31, 157, 144, 65, 0])
+    // The run case: the code that has not been defined yet.
+    let runs = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_bytes()
+    let packed = lzw.encode_tiff(runs)
+    say(f, "a run exercises the code that is defined by the code using it",
+        list_of(lzw.decode_tiff(packed) ?? "".to_bytes()) == list_of(runs) and
+        packed.len() < runs.len() / 2)
+    say(f, "and a round trip through the compress packing agrees",
+        (lzw.decode_compress(lzw.encode_compress(runs)) ??
+            "".to_bytes()).to_str() == runs.to_str())
+    say(f, "a clear code and an end code sit above the byte values",
+        lzw.clear_code() == 256 and lzw.end_code() == 257 and
+        lzw.tiff_options().first_free == 258 and
+        lzw.compress_options(16, true).first_free == 257)
+    say(f, "something that is not a .Z file is refused",
+        not lzw.is_compress("PK\u{03}\u{04}".to_bytes()) and
+        z_refused("PK\u{03}\u{04}".to_bytes()))
+}
+
+fn z_refused(data: bytes) -> bool {
+    match lzw.decode_compress(data) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+// ------------------------------------------------------------ deltacodec
+
+fn check_deltacodec(inout f: i64) / {io} {
+    print("-- deltacodec: the transform is most of the compression")
+    let clock = [1700000000, 1700000060, 1700000120, 1700000180, 1700000240]
+    // One difference turns a counter into a constant; two turn a *rate* into
+    // one, which is what a fixed sampling interval is.
+    say(f, "a delta turns a counter into a constant",
+        deltacodec.delta(clock) == [1700000000, 60, 60, 60, 60])
+    say(f, "and a second delta turns a constant rate into zeroes",
+        deltacodec.delta2(clock) == [1700000000, 60, 0, 0, 0])
+    say(f, "both undo exactly",
+        deltacodec.undelta(deltacodec.delta(clock)) == clock and
+        deltacodec.undelta2(deltacodec.delta2(clock)) == clock)
+    // Zig-zag: -1 is one byte, not ten.
+    say(f, "zig-zag keeps small negatives small",
+        deltacodec.zigzag(0) == 0 and deltacodec.zigzag(0 - 1) == 1 and
+        deltacodec.zigzag(1) == 2 and deltacodec.zigzag(0 - 2) == 3 and
+        deltacodec.unzigzag(deltacodec.zigzag(0 - 500)) == 0 - 500)
+    say(f, "which is why a varint of minus one is one byte and not ten",
+        deltacodec.varint(deltacodec.zigzag(0 - 1)).len() == 1 and
+        deltacodec.varint(300) == [172, 2])
+    // The whole point, in one line: the same five numbers, before and after.
+    say(f, "so the same five timestamps take a fifth of the space",
+        deltacodec.packed_size(clock) == 25 and
+        deltacodec.packed_size(deltacodec.delta2(clock)) == 9)
+    say(f, "and pack round-trips whatever the signs are",
+        (deltacodec.unpack(deltacodec.pack([0, 0 - 1, 300, 0 - 100000,
+            7])) ?? []) == [0, 0 - 1, 300, 0 - 100000, 7])
+    // Frame of reference: a block of clustered values is its own width.
+    let block = [1000, 1003, 1001, 1007, 1002]
+    let framed = deltacodec.frame_pack(block) ?? (0, 0, "".to_bytes())
+    say(f, "a clustered block is three bits a value plus one minimum",
+        framed.0 == 1000 and framed.1 == 3 and framed.2.len() == 2)
+    say(f, "and comes back exactly",
+        (deltacodec.frame_unpack(framed.0, framed.1, framed.2, 5) ?? []) ==
+        block)
+    say(f, "a block of one repeated value needs no bits at all",
+        (deltacodec.frame_width([9, 9, 9]) ?? 0 - 1) == 0 and
+        (deltacodec.frame_unpack(9, 0, "".to_bytes(), 3) ?? []) == [9, 9, 9])
+    say(f, "a value's width is what it needs, and zero needs none",
+        deltacodec.bits_for(0) == 0 and deltacodec.bits_for(1) == 1 and
+        deltacodec.bits_for(255) == 8 and deltacodec.bits_for(256) == 9)
+    say(f, "runs are pairs, and the shapes are recognisable in advance",
+        deltacodec.runs([1, 1, 1, 2, 2, 3]) == [(1, 3), (2, 2), (3, 1)] and
+        deltacodec.unruns(deltacodec.runs(clock)) == clock and
+        deltacodec.is_monotonic(clock) and deltacodec.is_linear(clock))
+}
+
+// ------------------------------------------------------------ rangecoder
+
+fn check_rangecoder(inout f: i64) / {io} {
+    print("-- rangecoder: spending a fraction of a bit")
+    // The case Huffman cannot do: a symbol with probability 0.999 is worth
+    // 0.00144 bits and Huffman must spend a whole one.
+    let skewed = rangecoder.model_from([999, 1]) ??
+    RangeModel{ bounds: [0, 1] }
+    var common: [i64] = []
+    for _i in 0..800 {
+        common.push(0)
+    }
+    let packed = rangecoder.encode(skewed, common) ?? "".to_bytes()
+    say(f, "eight hundred likely symbols cost about a byte and a half",
+        packed.len() <= 6 and
+        near(rangecoder.ideal_bits(skewed, common), 1.1548, 0.001))
+    say(f, "where Huffman would have spent a hundred", 800 / 8 == 100)
+    say(f, "and they decode back",
+        (rangecoder.decode(skewed, packed, 800) ?? []) == common)
+    // A message is a number, so the coder writes no end marker and the length
+    // has to come from somewhere else.
+    let mixed = [0, 1, 0, 0, 1, 1, 0, 1, 0, 0, 0, 1]
+    let even = rangecoder.uniform_model(2) ?? RangeModel{ bounds: [0, 1] }
+    let bits = rangecoder.encode(even, mixed) ?? "".to_bytes()
+    say(f, "a fair coin costs one bit a flip and nothing more",
+        near(rangecoder.ideal_bits(even, mixed), 12.0, 1.0e-9) and
+        (rangecoder.decode(even, bits, mixed.len()) ?? []) == mixed)
+    // The four-byte tail is the coder's entire fixed overhead.
+    say(f, "the whole overhead is the four bytes that settle the number",
+        bits.len() * 8 - 12 <= 32)
+    // The adaptive model is what makes it a compressor: nothing is stored.
+    var lopsided: [i64] = []
+    for i in 0..600 {
+        if i % 50 == 0 {
+            lopsided.push(1)
+        } else {
+            lopsided.push(0)
+        }
+    }
+    let learned = rangecoder.encode_adaptive(lopsided, 2) ?? "".to_bytes()
+    say(f, "an adaptive model learns the distribution and stores none of it",
+        (rangecoder.decode_adaptive(learned, 2, 600) ?? []) == lopsided and
+        learned.len() < 40)
+    say(f, "a uniform model divides the range evenly",
+        rangecoder.total(rangecoder.uniform_model(4) ??
+            RangeModel{ bounds: [0, 1] }) == 4 and
+        rangecoder.symbol_count(rangecoder.uniform_model(4) ??
+            RangeModel{ bounds: [0, 1] }) == 4)
+    say(f, "a model needs every symbol to be possible, however unlikely",
+        zero_refused())
+    say(f, "and the model's own arithmetic is a search over cumulative counts",
+        rangecoder.symbol_at(skewed, 0) == 0 and
+        rangecoder.symbol_at(skewed, 998) == 0 and
+        rangecoder.symbol_at(skewed, 999) == 1 and
+        rangecoder.total(skewed) == 1000)
+}
+
+fn zero_refused() -> bool {
+    match rangecoder.model_from([3, 0, 1]) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+// ----------------------------------------------------------------- bzip2
+
+// `hello hello hello world`, compressed by Python's bz2 at level 9.
+fn hello_bz2() -> bytes {
+    return bytes_of([66, 90, 104, 57, 49, 65, 89, 38, 83, 89, 164, 215, 150,
+        132, 0, 0, 4, 81, 128, 0, 16, 64, 0, 6, 68, 144, 128, 32, 0, 49, 6,
+        76, 64, 200, 49, 22, 203, 103, 80, 144, 160, 122, 47, 23, 114, 69, 56,
+        80, 144, 164, 215, 150, 132])
+}
+
+fn check_bzip2(inout f: i64) / {io} {
+    print("-- bzip2: sorting the data is the compression")
+    say(f, "a stream says its block size in its fourth byte",
+        bzip2.is_bzip2(hello_bz2()) and bzip2.level(hello_bz2()) == 9 and
+        not bzip2.is_bzip2("PK\u{03}\u{04}".to_bytes()))
+    let out: bytes ! Bzip2Error = bzip2.decode(hello_bz2())
+    say(f, "and Python's bz2 output decodes to what went into it",
+        (out ?? "".to_bytes()).to_str() == "hello hello hello world\n")
+    say(f, "the magic numbers are pi and its square root, in hex",
+        bzip2.block_magic_high() == 3227993 and
+        bzip2.block_magic_low() == 2511705 and
+        bzip2.end_magic_high() == 1536581 and bzip2.block_count(hello_bz2())
+        == 1)
+    // The transform, on its own. Sorting every rotation of `banana` and
+    // taking the last column is the whole idea.
+    let banana = [98, 97, 110, 97, 110, 97]
+    say(f, "banana comes back from the last column of its rotations",
+        (bzip2.unbwt([110, 110, 98, 97, 97, 97], 3) ?? []) == banana)
+    say(f, "and a pointer outside the block is refused",
+        bwt_refused([110, 110, 98, 97, 97, 97], 6))
+    // Move to front: a repeat is a zero every time after the first.
+    say(f, "move-to-front turns a run into zeroes",
+        bzip2.move_to_front([97, 97, 97, 98, 98, 97], [97, 98]) ==
+        [0, 0, 0, 1, 0, 1])
+    say(f, "and undoes exactly",
+        bzip2.unmove_to_front([0, 0, 0, 1, 0, 1], [97, 98]) ==
+        [97, 97, 97, 98, 98, 97])
+    // The first stage: four identical bytes and a count of how many more.
+    // The count byte may equal the byte being repeated, which is why the run
+    // has to be tracked rather than spotted by looking back four bytes.
+    say(f, "four identical bytes are followed by a count of the rest",
+        bzip2.rle1_decode([65, 65, 65, 65, 3]) ==
+        [65, 65, 65, 65, 65, 65, 65])
+    say(f, "and a count that happens to equal the byte is still a count",
+        bzip2.rle1_decode([65, 65, 65, 65, 65, 66]).len() == 70)
+    // bzip2's CRC is the unreflected one, which is not the CRC anything else
+    // uses; a table lifted from zlib gives a plausible wrong answer.
+    say(f, "the CRC is the unreflected variant, checked twice a block",
+        bzip2.crc32([]) == 0 and bzip2.crc32([65]) == 2175806859 and
+        bzip2.crc32(check_string()) == 4236843288 and
+        bzip2.combine_crc(1, 0) == 2)
+}
+
+/// The nine digits every CRC's published check value is computed over.
+fn check_string() -> [i64] {
+    return [49, 50, 51, 52, 53, 54, 55, 56, 57]
+}
+
+fn bwt_refused(last: [i64], origin: i64) -> bool {
+    match bzip2.unbwt(last, origin) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn main() / {io} {
+    var f = 0
+    check_huffman(f)
+    check_lzw(f)
+    check_deltacodec(f)
+    check_rangecoder(f)
+    check_bzip2(f)
+    if f == 0 {
+        print("compression: every claim held")
+    } else {
+        print("compression: {f} claims failed")
+    }
+}

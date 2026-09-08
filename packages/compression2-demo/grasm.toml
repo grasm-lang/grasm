@@ -1,0 +1,24 @@
+[package]
+name = "compression2_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.huffman]
+path = "../huffman"
+version = "^1.0.0"
+
+[dependencies.lzw]
+path = "../lzw"
+version = "^1.0.0"
+
+[dependencies.rangecoder]
+path = "../rangecoder"
+version = "^1.0.0"
+
+[dependencies.deltacodec]
+path = "../deltacodec"
+version = "^1.0.0"
+
+[dependencies.bzip2]
+path = "../bzip2"
+version = "^1.0.0"

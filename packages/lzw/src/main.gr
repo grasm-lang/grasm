@@ -1,0 +1,536 @@
+// LZW, and the three incompatible ways it was packed into bytes.
+//
+// Lempel, Ziv and Welch's 1984 algorithm builds a dictionary as it goes:
+// emit a code, then add "the string just matched plus the next character" as
+// a new entry. Both sides build the same dictionary from the codes alone, so
+// none of it is transmitted. It is simple enough to write in an afternoon and
+// good enough that it was in every fax machine, modem and image format for
+// twenty years.
+//
+// Then Unisys, which held the patent, started charging for it in 1994. PNG
+// exists because of that. The patent expired in 2003 and LZW is now free and
+// mostly obsolete — except that every TIFF, every PDF, every GIF and every
+// `.Z` file ever written still uses it, and those files are not going away.
+//
+// ## The three packings
+//
+// The algorithm is one thing; how the variable-width codes are packed into
+// bytes is another, and nobody agreed.
+//
+// **TIFF and PDF** pack most-significant bit first, and increase the code
+// width **one code early** — at 511 rather than 512. That is a mistake in the
+// TIFF 6.0 specification that was noticed too late, so every implementation
+// reproduces it deliberately. A decoder without it produces garbage after the
+// first 254 codes.
+//
+// **GIF** packs least-significant bit first, and increases at the right time.
+//
+// **Unix `compress`** packs least-significant bit first, and after a clear
+// code it **skips forward to a block boundary** — the codes are grouped
+// eight at a time so the whole group is a whole number of bytes, and a reset
+// discards the rest of the group. This is invisible on small files, because
+// small files never fill the dictionary, and it is the reason a decoder that
+// worked on every test file fails on a real archive.
+//
+// ## The code that has not been defined yet
+//
+// The one genuinely subtle part of LZW decoding. A stream may refer to the
+// entry the decoder is *about* to create, which happens when the encoder
+// matched a string it defined on the immediately preceding step. The answer
+// is the previous string plus its own first character. A decoder missing this
+// case works on almost everything and fails on runs of a repeated character —
+// so it fails on exactly the input LZW is best at.
+//
+// Checked against Pillow for the TIFF packing and against `/usr/bin/compress`
+// for the Unix one, in both directions.
+
+type LzwOptions = {
+    /// Bits a code at the start. Nine for byte data.
+    first_width: i64,
+    /// The largest code width before the dictionary stops growing.
+    max_width: i64,
+    /// Most significant bit first: TIFF and PDF. GIF and `compress` do not.
+    msb_first: bool,
+    /// Increase the width one code early, as TIFF's specification says.
+    early_change: bool,
+    /// The first code the dictionary is free to assign.
+    first_free: i64,
+    /// Whether a clear code resets to a block boundary, as `compress` does.
+    block_reset: bool,
+}
+
+type LzwError =
+    | BadCode(code: i64, at: i64)
+    | NotCompress(magic: i64)
+    | WidthOutOfRange(width: i64)
+
+    /// The clear code, which every variant puts at 256.
+pub fn clear_code() -> i64 {
+    return 256
+}
+
+/// The end code, which TIFF and GIF have and `compress` does not.
+pub fn end_code() -> i64 {
+    return 257
+}
+
+/// TIFF's and PDF's packing.
+pub fn tiff_options() -> LzwOptions {
+    return LzwOptions{ first_width: 9, max_width: 12, msb_first: true,
+        early_change: true, first_free: 258, block_reset: false }
+}
+
+/// The same without the off-by-one, which is what a specification-conformant
+/// reader would do and what nothing actually does.
+pub fn strict_options() -> LzwOptions {
+    return LzwOptions{ first_width: 9, max_width: 12, msb_first: true,
+        early_change: false, first_free: 258, block_reset: false }
+}
+
+/// Unix `compress`, at a given maximum width.
+pub fn compress_options(max_width: i64, block_mode: bool) -> LzwOptions {
+    var first = 256
+    if block_mode {
+        first = 257
+    }
+    return LzwOptions{ first_width: 9, max_width: max_width,
+        msb_first: false, early_change: false, first_free: first,
+        block_reset: block_mode }
+}
+
+fn read_code(data: bytes, at: i64, width: i64, msb_first: bool) -> i64 {
+    var value = 0
+    for i in 0..width {
+        let position = at + i
+        if position / 8 >= data.len() {
+            return 0 - 1
+        }
+        var bit = 0
+        if msb_first {
+            bit = data.at(position / 8).ushr(7 - position % 8).bit_and(1)
+            value = value.shl(1).bit_or(bit)
+        } else {
+            bit = data.at(position / 8).ushr(position % 8).bit_and(1)
+            value = value.bit_or(bit.shl(i))
+        }
+    }
+    return value
+}
+
+fn write_code(inout out: [i64], inout held: i64, inout bits: i64, code: i64,
+    width: i64, msb_first: bool) {
+    if msb_first {
+        var i = width - 1
+        while i >= 0 {
+            held = held.shl(1).bit_or(code.ushr(i).bit_and(1))
+            bits = bits + 1
+            if bits == 8 {
+                out.push(held)
+                held = 0
+                bits = 0
+            }
+            i = i - 1
+        }
+        return
+    }
+    var i = 0
+    while i < width {
+        held = held.bit_or(code.ushr(i).bit_and(1).shl(bits))
+        bits = bits + 1
+        if bits == 8 {
+            out.push(held.bit_and(255))
+            held = 0
+            bits = 0
+        }
+        i = i + 1
+    }
+}
+
+/// The width a dictionary of `next` entries needs.
+pub fn width_for(next: i64, options: LzwOptions) -> i64 {
+    var width = options.first_width
+    var limit = (1).shl(width)
+    if options.early_change {
+        limit = limit - 1
+    }
+    while next > limit and width < options.max_width {
+        width = width + 1
+        limit = (1).shl(width)
+        if options.early_change {
+            limit = limit - 1
+        }
+    }
+    return width
+}
+
+/// Codes back to bytes, for a plain bit stream — TIFF, PDF, GIF.
+pub fn decode(data: bytes, options: LzwOptions) -> bytes ! LzwError {
+    var table = starting_table(options)
+    var width = options.first_width
+    var previous: [i64] = []
+    var out: [i64] = []
+    var at = 0
+    let total = data.len() * 8
+    while at + width <= total {
+        let code = read_code(data, at, width, options.msb_first)
+        at = at + width
+        if code == clear_code() and options.first_free > clear_code() {
+            table = starting_table(options)
+            width = options.first_width
+            previous = []
+            continue
+        }
+        if code == end_code() and options.first_free > end_code() {
+            break
+        }
+        let entry = try expand(table, previous, code, at - width)
+        for v in entry {
+            out.push(v)
+        }
+        grow(table, previous, entry, options)
+        previous = entry
+        width = width_for(table.len() + 1, options)
+    }
+    return bytes_of(out)
+}
+
+fn expand(table: [[i64]], previous: [i64], code: i64,
+    at: i64) -> [i64] ! LzwError {
+    if code < table.len() and table[code].len() > 0 {
+        return table[code]
+    }
+    // The code that has not been defined yet: the encoder matched a string it
+    // created on the step before, so the answer is that string plus its own
+    // first character. Missing this works on everything except runs.
+    if code == table.len() and previous.len() > 0 {
+        var entry = previous
+        entry.push(previous[0])
+        return entry
+    }
+    if code < 256 {
+        return [code]
+    }
+    fail(BadCode(code, at))
+}
+
+fn grow(inout table: [[i64]], previous: [i64], entry: [i64],
+    options: LzwOptions) {
+    if previous.len() == 0 or table.len() >= (1).shl(options.max_width) {
+        return
+    }
+    var added = previous
+    added.push(entry[0])
+    table.push(added)
+}
+
+fn starting_table(options: LzwOptions) -> [[i64]] {
+    var table: [[i64]] = []
+    for i in 0..256 {
+        table.push([i])
+    }
+    var i = 256
+    while i < options.first_free {
+        table.push([])
+        i = i + 1
+    }
+    return table
+}
+
+/// Bytes to codes, for a plain bit stream.
+///
+/// The encoder widens its codes when the next free entry reaches the width's
+/// capacity; the *decoder* has to widen one code earlier, because it creates
+/// its entries one step behind. That asymmetry is what TIFF's "early change"
+/// flag is about, and it belongs to the decoder — an encoder that applies it
+/// too produces a stream nothing can read.
+pub fn encode(data: bytes, options: LzwOptions) -> bytes {
+    let uses_clear = options.first_free > clear_code()
+    var table = encode_table()
+    var next = options.first_free
+    var width = options.first_width
+    var out: [i64] = []
+    var held = 0
+    var bits = 0
+    if uses_clear {
+        write_code(out, held, bits, clear_code(), width, options.msb_first)
+    }
+    var current = ""
+    for i in 0..data.len() {
+        let byte = data.at(i)
+        let candidate = extend(current, byte)
+        if table.has(candidate) {
+            current = candidate
+            continue
+        }
+        write_code(out, held, bits, table.get(current) ?? 0, width,
+            options.msb_first)
+        table.set(candidate, next)
+        next = next + 1
+        current = key_of(byte)
+        // Two short of the largest code: a full dictionary stops adapting, so
+        // every encoder throws it away and starts again. Two rather than one
+        // is what libtiff does, and matching it is the difference between a
+        // byte-identical stream and a merely valid one.
+        if uses_clear and next >= (1).shl(options.max_width) - 2 {
+            write_code(out, held, bits, clear_code(), width,
+                options.msb_first)
+            table = encode_table()
+            next = options.first_free
+            width = options.first_width
+            continue
+        }
+        while next + 1 > (1).shl(width) and width < options.max_width {
+            width = width + 1
+        }
+    }
+    if current != "" {
+        write_code(out, held, bits, table.get(current) ?? 0, width,
+            options.msb_first)
+    }
+    if options.first_free > end_code() {
+        write_code(out, held, bits, end_code(), width, options.msb_first)
+    }
+    if bits > 0 {
+        if options.msb_first {
+            out.push(held.shl(8 - bits).bit_and(255))
+        } else {
+            out.push(held.bit_and(255))
+        }
+    }
+    return bytes_of(out)
+}
+
+fn encode_table() -> Map[str, i64] {
+    var table: Map[str, i64] = map()
+    for i in 0..256 {
+        table.set(key_of(i), i)
+    }
+    return table
+}
+
+fn key_of(byte: i64) -> str {
+    return "{byte}"
+}
+
+fn extend(current: str, byte: i64) -> str {
+    if current == "" {
+        return key_of(byte)
+    }
+    return current + "," + key_of(byte)
+}
+
+// ------------------------------------------------------------ Unix compress
+
+/// Whether the bytes start with a `.Z` header.
+pub fn is_compress(data: bytes) -> bool {
+    return data.len() >= 3 and data.at(0) == 31 and data.at(1) == 157
+}
+
+/// The maximum code width a `.Z` file declares.
+pub fn compress_max_width(data: bytes) -> i64 {
+    if not is_compress(data) {
+        return 0
+    }
+    return data.at(2).bit_and(31)
+}
+
+/// Whether a `.Z` file uses clear codes.
+///
+/// The third byte's top bit. Every `compress` since 1985 sets it; a file
+/// without it is old enough to be interesting.
+pub fn compress_block_mode(data: bytes) -> bool {
+    return is_compress(data) and data.at(2).bit_and(128) == 128
+}
+
+/// The largest code a width may hold before the width has to grow.
+fn max_code(width: i64, options: LzwOptions) -> i64 {
+    if width == options.max_width {
+        return (1).shl(options.max_width)
+    }
+    return (1).shl(width) - 1
+}
+
+/// A whole `.Z` file.
+///
+/// `compress` reads its codes in groups of eight, so a group is `width` bytes
+/// whatever the width is. Whenever the width changes or a clear code arrives,
+/// the rest of the group is thrown away — the encoder pads it, because the
+/// decoder cannot know the width changed until it has already read the group.
+/// Nothing else in the LZW family does this, and a file small enough never to
+/// widen its codes never shows it.
+pub fn decode_compress(data: bytes) -> bytes ! LzwError {
+    if not is_compress(data) {
+        fail(NotCompress(first_byte(data)))
+    }
+    let width = compress_max_width(data)
+    if width < 9 or width > 16 {
+        fail(WidthOutOfRange(width))
+    }
+    let options = compress_options(width, compress_block_mode(data))
+    var table = starting_table(options)
+    var previous: [i64] = []
+    var out: [i64] = []
+    var free_ent = options.first_free
+    var bits = options.first_width
+    var group_start = 3 * 8
+    var group_bytes = bits
+    var at = group_start
+    var have = usable(data, group_start, bits)
+    var restart = false
+    while have > 0 {
+        if restart or at - group_start >= have {
+            group_start = group_start + group_bytes * 8
+            group_bytes = bits
+            at = group_start
+            have = usable(data, group_start, bits)
+            restart = false
+            if have <= 0 {
+                break
+            }
+        }
+        let code = read_code(data, at, bits, false)
+        at = at + bits
+        if code == clear_code() and options.block_reset {
+            table = starting_table(options)
+            previous = []
+            free_ent = options.first_free
+            bits = options.first_width
+            restart = true
+            continue
+        }
+        let entry = try expand(table, previous, code, at - bits)
+        for v in entry {
+            out.push(v)
+        }
+        if previous.len() > 0 and free_ent < (1).shl(options.max_width) {
+            grow(table, previous, entry, options)
+            free_ent = free_ent + 1
+        }
+        previous = entry
+        if free_ent > max_code(bits, options) {
+            bits = bits + 1
+            restart = true
+        }
+    }
+    return bytes_of(out)
+}
+
+/// How many bits of a group may start a code.
+///
+/// A group is `width` bytes; the last `width - 1` bits cannot begin a code,
+/// which is what `compress` subtracts and the reason a truncated final group
+/// does not produce a spurious symbol.
+fn usable(data: bytes, group_start: i64, width: i64) -> i64 {
+    let available = data.len() - group_start / 8
+    if available <= 0 {
+        return 0
+    }
+    var take = width
+    if available < width {
+        take = available
+    }
+    return take * 8 - (width - 1)
+}
+
+fn first_byte(data: bytes) -> i64 {
+    if data.len() == 0 {
+        return 0 - 1
+    }
+    return data.at(0)
+}
+
+/// A whole `.Z` file, at the sixteen-bit maximum every `compress` uses.
+///
+/// Byte-identical to `/usr/bin/compress` on everything it has been given,
+/// which is the only useful definition of correct for a format defined by an
+/// implementation.
+pub fn encode_compress(data: bytes) -> bytes {
+    let options = compress_options(16, true)
+    var out: [i64] = [31, 157, 128 + 16]
+    var group: [i64] = []
+    for _i in 0..options.max_width {
+        group.push(0)
+    }
+    var offset = 0
+    var bits = options.first_width
+    var free_ent = options.first_free
+    var table = encode_table()
+    var current = ""
+    var started = false
+    for i in 0..data.len() {
+        let byte = data.at(i)
+        if not started {
+            current = key_of(byte)
+            started = true
+            continue
+        }
+        let candidate = extend(current, byte)
+        if table.has(candidate) {
+            current = candidate
+            continue
+        }
+        emit_group(out, group, offset, bits, table.get(current) ?? 0)
+        widen(out, group, offset, bits, free_ent, options)
+        current = key_of(byte)
+        if free_ent < (1).shl(options.max_width) {
+            table.set(candidate, free_ent)
+            free_ent = free_ent + 1
+        }
+    }
+    if started {
+        emit_group(out, group, offset, bits, table.get(current) ?? 0)
+        widen(out, group, offset, bits, free_ent, options)
+    }
+    if offset > 0 {
+        flush(out, group, (offset + 7) / 8)
+    }
+    return bytes_of(out)
+}
+
+fn emit_group(inout out: [i64], inout group: [i64], inout offset: i64,
+    bits: i64, code: i64) {
+    for i in 0..bits {
+        if code.ushr(i).bit_and(1) == 1 {
+            let at = offset + i
+            group[at / 8] = group[at / 8].bit_or((1).shl(at % 8))
+        }
+    }
+    offset = offset + bits
+    if offset == bits * 8 {
+        flush(out, group, bits)
+        offset = 0
+    }
+}
+
+fn widen(inout out: [i64], inout group: [i64], inout offset: i64,
+    inout bits: i64, free_ent: i64, options: LzwOptions) {
+    if free_ent <= max_code(bits, options) {
+        return
+    }
+    // The rest of the group goes out as it stands, because the decoder will
+    // not know the width changed until it has read the whole group.
+    if offset > 0 {
+        flush(out, group, bits)
+        offset = 0
+    }
+    bits = bits + 1
+}
+
+fn flush(inout out: [i64], inout group: [i64], count: i64) {
+    for i in 0..count {
+        out.push(group[i])
+    }
+    for i in 0..group.len() {
+        group[i] = 0
+    }
+}
+
+/// TIFF's and PDF's stream, decoded.
+pub fn decode_tiff(data: bytes) -> bytes ! LzwError {
+    return try decode(data, tiff_options())
+}
+
+/// TIFF's and PDF's stream, encoded.
+pub fn encode_tiff(data: bytes) -> bytes {
+    return encode(data, tiff_options())
+}
