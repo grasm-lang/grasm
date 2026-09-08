@@ -141,6 +141,23 @@ fn nothing() -> () ! Bad {
     ()
 }
 
+fn ends_plainly(n: ref i64) -> () {
+    n.value = n.value + 1
+}
+
+fn ends_explicitly(n: ref i64) -> () {
+    n.value = n.value + 1
+    return ()
+}
+
+fn ends_in_a_branch(n: ref i64, c: bool) -> () {
+    if c {
+        n.value = n.value + 1
+        return ()
+    }
+    n.value = n.value + 10
+}
+
 fn deep() -> i64 ! Bad {
     fail(Bad)
 }
@@ -256,6 +273,7 @@ CLAUSES = {
     "T-SUM": "a sum is one variant",
     "T-TUPLE": "a tuple is positional",
     "T-TYPE-ALIAS": "a type alias is the type",
+    "T-UNIT-RETURN": "an explicit unit return is the plain one",
     "T-VAR-MUTABLE": "var is mutable",
     "L-LIB-SORT-NAN": "sort puts nan last",
     "L-LIB-FREE": "free functions",
@@ -323,6 +341,14 @@ LAWS = {
  # truncated one does not.
  "float bits round trip and carry the sign":
                               'let xs = [0.5, 1.0, 2.0, 1024.0]\n    var ok = true\n    for x in xs {\n        if x.to_bits().from_bits() != x { ok = false }\n        if x.to_bits() <= 0 { ok = false }\n        if (0.0 - x).to_bits() >= 0 { ok = false }\n    }\n    let one = 1.0\n    say(ok and one.to_bits() > 1000)',
+ # A unit function has nothing to hand back, so the only thing to relate is
+ # what it *did*: the explicit `return ()` form and the one that falls off the
+ # end must leave the same counter behind, and the branching one must really
+ # stop at the `return` rather than running on into the second write. A
+ # backend that drops the explicit return, or that returns a unit value where
+ # its own signature promises none, breaks one of the two.
+ "an explicit unit return is the plain one":
+                              'let a = ref(0)\n    let b = ref(0)\n    for _i in 0..LIMIT {\n        ends_plainly(a)\n        ends_explicitly(b)\n    }\n    let plain = a.value\n    let explicit = b.value\n    release(a)\n    release(b)\n    let taken = ref(0)\n    let skipped = ref(0)\n    ends_in_a_branch(taken, true)\n    ends_in_a_branch(skipped, false)\n    let early = taken.value\n    let late = skipped.value\n    release(taken)\n    release(skipped)\n    say(plain == explicit and plain == LIMIT and early == 1 and late == 10)',
  "rev twice is identity":      'let xs = [3, 1, 2]\n    say(xs.rev().rev() == xs)',
  # A law a degenerate implementation satisfies is not a law: `rev` as the
  # identity passes "rev twice is identity", and did.
