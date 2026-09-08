@@ -1,0 +1,14 @@
+[package]
+name = "unitparse"
+version = "1.0.0"
+
+# Parses a unit expression. Opens nothing.
+capabilities = []
+
+[dependencies.siunits]
+path = "../siunits"
+version = "^1.0.0"
+
+[dependencies.dimension]
+path = "../dimension"
+version = "^1.0.0"

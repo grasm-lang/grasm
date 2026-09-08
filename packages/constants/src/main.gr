@@ -1,0 +1,294 @@
+// The physical constants, and the seven that stopped being measured.
+//
+// CODATA publishes a set of recommended values every four years, each with an
+// uncertainty from the world's measurements. This is the 2022 set, as
+// `scipy.constants` carries it.
+//
+// The interesting part is which ones have an uncertainty of **zero**. Since
+// the 2019 redefinition of the SI, seven constants have exact defined values:
+// the caesium hyperfine frequency, the speed of light, the Planck constant,
+// the elementary charge, the Boltzmann constant, the Avogadro constant and
+// the luminous efficacy of 540 THz radiation. They are not measured any more.
+// The units are defined *from* them.
+//
+// So the gas constant is exact, because it is the Boltzmann constant times
+// the Avogadro constant, both exact. The vacuum permeability is **not**,
+// which is the surprise: it used to be exactly 4pi x 10^-7 by definition, and
+// the 2019 redefinition made it a measured quantity with a relative
+// uncertainty of 1.6 x 10^-10. The exactness moved.
+//
+// ## Uncertainty is not a rounding error
+//
+// The uncertainty here is a standard uncertainty — one standard deviation,
+// not a bound. A value of 6.6743(15) x 10^-11 means the true value is within
+// 0.0015 of 6.6743 about two times in three, and outside it one time in
+// three. Reading it as a maximum error is the most common mistake in the
+// field, and `uncertainty` in this set propagates it correctly.
+//
+// The gravitational constant is the worst-known of the lot: a relative
+// uncertainty of 2.2 x 10^-5, which is ten orders of magnitude worse than the
+// Rydberg constant. Gravity is very hard to measure and always has been.
+//
+// The values agree with `scipy.constants` exactly, which is where they came
+// from.
+
+type ConstantError =
+    | UnknownConstant(symbol: str)
+
+type PhysicalConstant = {
+    symbol: str,
+    name: str,
+    value: f64,
+    unit: str,
+    /// One standard deviation. Zero means the value is a definition rather
+    /// than a measurement.
+    uncertainty: f64,
+}
+
+/// Every constant this knows, in the order CODATA lists them.
+pub fn all() -> [PhysicalConstant] {
+    return [
+        PhysicalConstant{ symbol: "c",
+            name: "speed of light in vacuum",
+            value: 299792458.0, unit: "m s^-1",
+            uncertainty: 0.0 },
+        PhysicalConstant{ symbol: "h",
+            name: "Planck constant",
+            value: 6.62607015e-34, unit: "J Hz^-1",
+            uncertainty: 0.0 },
+        PhysicalConstant{ symbol: "hbar",
+            name: "reduced Planck constant",
+            value: 1.0545718176461565e-34, unit: "J s",
+            uncertainty: 0.0 },
+        PhysicalConstant{ symbol: "e",
+            name: "elementary charge",
+            value: 1.602176634e-19, unit: "C",
+            uncertainty: 0.0 },
+        PhysicalConstant{ symbol: "k",
+            name: "Boltzmann constant",
+            value: 1.380649e-23, unit: "J K^-1",
+            uncertainty: 0.0 },
+        PhysicalConstant{ symbol: "NA",
+            name: "Avogadro constant",
+            value: 6.02214076e+23, unit: "mol^-1",
+            uncertainty: 0.0 },
+        PhysicalConstant{ symbol: "R",
+            name: "molar gas constant",
+            value: 8.31446261815324, unit: "J mol^-1 K^-1",
+            uncertainty: 0.0 },
+        PhysicalConstant{ symbol: "me",
+            name: "electron mass",
+            value: 9.1093837139e-31, unit: "kg",
+            uncertainty: 2.8e-40 },
+        PhysicalConstant{ symbol: "mp",
+            name: "proton mass",
+            value: 1.67262192595e-27, unit: "kg",
+            uncertainty: 5.2e-37 },
+        PhysicalConstant{ symbol: "mn",
+            name: "neutron mass",
+            value: 1.67492750056e-27, unit: "kg",
+            uncertainty: 8.5e-37 },
+        PhysicalConstant{ symbol: "u",
+            name: "atomic mass constant",
+            value: 1.66053906892e-27, unit: "kg",
+            uncertainty: 5.2e-37 },
+        PhysicalConstant{ symbol: "G",
+            name: "Newtonian constant of gravitation",
+            value: 6.6743e-11, unit: "m^3 kg^-1 s^-2",
+            uncertainty: 1.5e-15 },
+        PhysicalConstant{ symbol: "eps0",
+            name: "vacuum electric permittivity",
+            value: 8.8541878188e-12, unit: "F m^-1",
+            uncertainty: 1.4e-21 },
+        PhysicalConstant{ symbol: "mu0",
+            name: "vacuum mag. permeability",
+            value: 1.25663706127e-06, unit: "N A^-2",
+            uncertainty: 2e-16 },
+        PhysicalConstant{ symbol: "alpha",
+            name: "fine-structure constant",
+            value: 0.0072973525643, unit: "",
+            uncertainty: 1.1e-12 },
+        PhysicalConstant{ symbol: "Rinf",
+            name: "Rydberg constant",
+            value: 10973731.568157, unit: "m^-1",
+            uncertainty: 1.2e-05 },
+        PhysicalConstant{ symbol: "sigma",
+            name: "Stefan-Boltzmann constant",
+            value: 5.6703744191844314e-08, unit: "W m^-2 K^-4",
+            uncertainty: 0.0 },
+        PhysicalConstant{ symbol: "a0",
+            name: "Bohr radius",
+            value: 5.29177210544e-11, unit: "m",
+            uncertainty: 8.2e-21 },
+        PhysicalConstant{ symbol: "Phi0",
+            name: "mag. flux quantum",
+            value: 2.0678338484619295e-15, unit: "Wb",
+            uncertainty: 0.0 },
+        PhysicalConstant{ symbol: "KJ",
+            name: "Josephson constant",
+            value: 483597848416983.6, unit: "Hz V^-1",
+            uncertainty: 0.0 },
+        PhysicalConstant{ symbol: "RK",
+            name: "von Klitzing constant",
+            value: 25812.807459304513, unit: "ohm",
+            uncertainty: 0.0 },
+        PhysicalConstant{ symbol: "g0",
+            name: "standard acceleration of gravity",
+            value: 9.80665, unit: "m s^-2",
+            uncertainty: 0.0 },
+        PhysicalConstant{ symbol: "F",
+            name: "Faraday constant",
+            value: 96485.33212331001, unit: "C mol^-1",
+            uncertainty: 0.0 },
+        PhysicalConstant{ symbol: "muB",
+            name: "Bohr magneton",
+            value: 9.2740100657e-24, unit: "J T^-1",
+            uncertainty: 2.9e-33 },
+        PhysicalConstant{ symbol: "Kcd",
+            name: "luminous efficacy",
+            value: 683.0, unit: "lm W^-1",
+            uncertainty: 0.0 },
+        PhysicalConstant{ symbol: "dnuCs",
+            name: "hyperfine transition frequency of Cs-133",
+            value: 9192631770.0, unit: "Hz",
+            uncertainty: 0.0 },
+    ]
+}
+
+/// A constant by symbol.
+pub fn get(symbol: str) -> PhysicalConstant ! ConstantError {
+    for constant in all() {
+        if constant.symbol == symbol {
+            return constant
+        }
+    }
+    fail(UnknownConstant(symbol))
+}
+
+/// A constant's value.
+pub fn value(symbol: str) -> f64 ! ConstantError {
+    return (try get(symbol)).value
+}
+
+/// A constant's standard uncertainty.
+pub fn uncertainty(symbol: str) -> f64 ! ConstantError {
+    return (try get(symbol)).uncertainty
+}
+
+/// Whether a constant is exact — defined rather than measured.
+///
+/// Seven of them define the SI itself, and everything computed only from
+/// those is exact too. That is why the gas constant has no uncertainty and
+/// the electron mass does.
+pub fn is_exact(symbol: str) -> bool {
+    match get(symbol) {
+        Ok(constant) -> return constant.uncertainty == 0.0
+        Err(_e) -> return false
+    }
+}
+
+/// The seven constants that define the SI.
+pub fn defining_constants() -> [str] {
+    return ["dnuCs", "c", "h", "e", "k", "NA", "Kcd"]
+}
+
+/// The uncertainty as a fraction of the value.
+///
+/// The number that says how well something is known. The gravitational
+/// constant's is 2.2 x 10^-5 and the Rydberg constant's is 1.1 x 10^-12:
+/// eleven million times better, on a quantity that is much harder to
+/// imagine measuring.
+pub fn relative_uncertainty(symbol: str) -> f64 ! ConstantError {
+    let constant = try get(symbol)
+    if constant.value == 0.0 {
+        return 0.0
+    }
+    return magnitude(constant.uncertainty / constant.value)
+}
+
+fn magnitude(v: f64) -> f64 {
+    if v < 0.0 {
+        return 0.0 - v
+    }
+    return v
+}
+
+/// The constants known least well, worst first.
+pub fn least_certain(count: i64) -> [str] {
+    var symbols: [str] = []
+    var values: [f64] = []
+    for constant in all() {
+        if constant.uncertainty == 0.0 {
+            continue
+        }
+        symbols.push(constant.symbol)
+        values.push(magnitude(constant.uncertainty / constant.value))
+    }
+    var out: [str] = []
+    var taken: [bool] = []
+    for _i in 0..symbols.len() {
+        taken.push(false)
+    }
+    var n = 0
+    while n < count and n < symbols.len() {
+        var best = 0 - 1
+        var i = 0
+        while i < symbols.len() {
+            if not taken[i] and (best < 0 or values[i] > values[best]) {
+                best = i
+            }
+            i = i + 1
+        }
+        taken[best] = true
+        out.push(symbols[best])
+        n = n + 1
+    }
+    return out
+}
+
+/// How many constants the table holds.
+pub fn count() -> i64 {
+    return all().len()
+}
+
+/// A value written the way CODATA writes it: the digits, then the
+/// uncertainty in the last of them, in brackets.
+///
+/// `6.6743(15)e-11` means 6.6743 plus or minus 0.0015. It is compact,
+/// unambiguous, and unreadable until somebody explains it once.
+pub fn concise(symbol: str, digits: i64) -> str ! ConstantError {
+    let constant = try get(symbol)
+    if constant.uncertainty == 0.0 {
+        return "{constant.value}"
+    }
+    return "{constant.value}({bracket(constant, digits)})"
+}
+
+fn bracket(constant: PhysicalConstant, digits: i64) -> i64 {
+    // The uncertainty scaled so that it lines up with the last digit shown.
+    var scale = 1.0
+    var i = 0
+    while i < digits {
+        scale = scale * 10.0
+        i = i + 1
+    }
+    let exponent = leading_power(constant.value)
+    return (constant.uncertainty / exponent * scale + 0.5).as_i64()
+}
+
+fn leading_power(value: f64) -> f64 {
+    var v = magnitude(value)
+    if v == 0.0 {
+        return 1.0
+    }
+    var power = 1.0
+    while v >= 10.0 {
+        v = v / 10.0
+        power = power * 10.0
+    }
+    while v < 1.0 {
+        v = v * 10.0
+        power = power / 10.0
+    }
+    return power
+}

@@ -1,0 +1,6 @@
+[package]
+name = "uncertainty"
+version = "1.0.0"
+
+# Arithmetic on measurements. Opens nothing.
+capabilities = []

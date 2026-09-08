@@ -1,0 +1,6 @@
+[package]
+name = "dimension"
+version = "1.0.0"
+
+# Arithmetic on exponents. Opens nothing.
+capabilities = []

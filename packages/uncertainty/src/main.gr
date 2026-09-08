@@ -1,0 +1,312 @@
+// Arithmetic on measurements, which is not arithmetic on numbers.
+//
+// A measurement is a value and an uncertainty, and the uncertainty has to
+// travel through every calculation the value does. Doing that by hand is
+// error-prone and doing it by adding the uncertainties is simply wrong: two
+// independent errors of 3 do not make an error of 6, they make one of about
+// 4.24, because they cancel as often as they add.
+//
+// ## Quadrature, and why
+//
+// Independent uncertainties combine as the square root of the sum of
+// squares. That falls out of the variance of a sum being the sum of the
+// variances — which is true exactly when the errors are uncorrelated, and is
+// the assumption every propagation formula rests on.
+//
+// The consequence people find surprising: **the largest uncertainty
+// dominates completely.** Combining 10 and 1 gives 10.05. Reducing the small
+// one to zero buys nothing; halving the large one buys almost everything.
+// That is why an experimentalist ignores every error bar an order of
+// magnitude below the biggest, and it is a mathematical fact rather than a
+// habit.
+//
+// ## Correlation is the trap
+//
+// `x - x` is exactly zero, with no uncertainty at all, because the two are
+// the same measurement and its errors cancel perfectly. Treating them as two
+// independent measurements of the same quantity gives an uncertainty of
+// sqrt(2) times x's — a non-zero error bar on a quantity that is identically
+// zero.
+//
+// A library that tracks which variable each uncertainty came from gets this
+// right; one that carries only a number cannot. This one carries the number
+// and says so, and provides the correlated forms explicitly — because a
+// caller who knows two quantities share a source has to be able to say it.
+//
+// ## The relative and the absolute
+//
+// Addition combines *absolute* uncertainties; multiplication combines
+// *relative* ones. That is the whole of first-order propagation and it is why
+// multiplying two quantities known to one per cent gives one known to 1.41
+// per cent however large the numbers are.
+//
+// ## First order only
+//
+// Every formula here is the first term of a Taylor expansion, which is what
+// every library does and what is right when the uncertainty is small compared
+// to the value. It is wrong for a quantity whose uncertainty is a large
+// fraction of itself — `1/x` where x is 1 plus or minus 0.9 is not
+// approximately anything — and no first-order library will tell you.
+//
+// Checked against Python's `uncertainties` package.
+
+type UncertainError =
+    | DivideByZero()
+    | NegativeUncertainty(value: f64)
+    | NotPositive(value: f64)
+
+type Measurement = {
+    value: f64,
+    /// One standard deviation, never negative.
+    uncertainty: f64,
+}
+
+/// A measurement.
+pub fn measure(value: f64, uncertainty: f64) -> Measurement ! UncertainError {
+    if uncertainty < 0.0 {
+        fail(NegativeUncertainty(uncertainty))
+    }
+    return Measurement{ value: value, uncertainty: uncertainty }
+}
+
+/// A number known exactly.
+pub fn exact(value: f64) -> Measurement {
+    return Measurement{ value: value, uncertainty: 0.0 }
+}
+
+fn magnitude(v: f64) -> f64 {
+    if v < 0.0 {
+        return 0.0 - v
+    }
+    return v
+}
+
+/// Two independent uncertainties combined.
+///
+/// The square root of the sum of squares, which is what the variance of a sum
+/// being the sum of the variances amounts to. Adding them instead
+/// overestimates every error bar in the world by up to forty per cent.
+pub fn quadrature(a: f64, b: f64) -> f64 {
+    return (a * a + b * b).sqrt()
+}
+
+/// A sum of two independent measurements.
+pub fn add(a: Measurement, b: Measurement) -> Measurement {
+    return Measurement{ value: a.value + b.value,
+        uncertainty: quadrature(a.uncertainty, b.uncertainty) }
+}
+
+/// A difference of two independent measurements.
+///
+/// The uncertainty *grows*, which catches people every time: subtracting two
+/// nearly equal measurements gives a small value with the same absolute
+/// uncertainty as the large ones, so the relative uncertainty explodes. That
+/// is why an experiment is designed to measure a difference directly rather
+/// than as a difference of two measurements.
+pub fn subtract(a: Measurement, b: Measurement) -> Measurement {
+    return Measurement{ value: a.value - b.value,
+        uncertainty: quadrature(a.uncertainty, b.uncertainty) }
+}
+
+/// The difference of a measurement with itself, which is exactly zero.
+///
+/// Not what `subtract` gives, and the difference is the whole point: the two
+/// operands are the same measurement, its errors cancel perfectly, and the
+/// answer has no uncertainty at all. A library that carries only a number
+/// cannot know this, so a caller who does has to say so.
+pub fn subtract_correlated(a: Measurement, b: Measurement,
+    correlation: f64) -> Measurement {
+    let variance = a.uncertainty * a.uncertainty +
+    b.uncertainty * b.uncertainty -
+    2.0 * correlation * a.uncertainty * b.uncertainty
+    if variance <= 0.0 {
+        return Measurement{ value: a.value - b.value, uncertainty: 0.0 }
+    }
+    return Measurement{ value: a.value - b.value,
+        uncertainty: variance.sqrt() }
+}
+
+/// A sum of two measurements that share a source.
+pub fn add_correlated(a: Measurement, b: Measurement,
+    correlation: f64) -> Measurement {
+    let variance = a.uncertainty * a.uncertainty +
+    b.uncertainty * b.uncertainty +
+    2.0 * correlation * a.uncertainty * b.uncertainty
+    if variance <= 0.0 {
+        return Measurement{ value: a.value + b.value, uncertainty: 0.0 }
+    }
+    return Measurement{ value: a.value + b.value,
+        uncertainty: variance.sqrt() }
+}
+
+/// The uncertainty as a fraction of the value.
+pub fn relative(m: Measurement) -> f64 {
+    if m.value == 0.0 {
+        return 0.0
+    }
+    return magnitude(m.uncertainty / m.value)
+}
+
+/// A product of two independent measurements.
+///
+/// The *relative* uncertainties combine in quadrature, which is why two
+/// quantities each known to one per cent give a product known to 1.41 per
+/// cent whatever their magnitudes.
+pub fn multiply(a: Measurement, b: Measurement) -> Measurement {
+    let value = a.value * b.value
+    return Measurement{ value: value,
+        uncertainty: magnitude(value) * quadrature(relative(a),
+            relative(b)) }
+}
+
+/// A quotient of two independent measurements.
+pub fn divide(a: Measurement, b: Measurement) -> Measurement ! UncertainError {
+    if b.value == 0.0 {
+        fail(DivideByZero())
+    }
+    let value = a.value / b.value
+    return Measurement{ value: value,
+        uncertainty: magnitude(value) * quadrature(relative(a),
+            relative(b)) }
+}
+
+/// A measurement times an exact number.
+pub fn scale(m: Measurement, by: f64) -> Measurement {
+    return Measurement{ value: m.value * by,
+        uncertainty: magnitude(by) * m.uncertainty }
+}
+
+/// A measurement raised to a power.
+///
+/// The relative uncertainty is multiplied by the exponent, so squaring
+/// doubles it and a square root halves it. That is why a volume computed from
+/// a length known to one per cent is known to three.
+pub fn power(m: Measurement, exponent: f64) -> Measurement ! UncertainError {
+    if m.value == 0.0 {
+        fail(NotPositive(m.value))
+    }
+    let value = raise(m.value, exponent)
+    return Measurement{ value: value,
+        uncertainty: magnitude(value * exponent) * relative(m) }
+}
+
+fn raise(base: f64, exponent: f64) -> f64 {
+    if base > 0.0 {
+        return (exponent * base.ln()).exp()
+    }
+    // A negative base only makes sense for a whole exponent.
+    let whole = exponent.as_i64()
+    var out = 1.0
+    var i = 0
+    while i < absolute(whole) {
+        out = out * base
+        i = i + 1
+    }
+    if whole < 0 {
+        return 1.0 / out
+    }
+    return out
+}
+
+fn absolute(v: i64) -> i64 {
+    if v < 0 {
+        return 0 - v
+    }
+    return v
+}
+
+/// A square root.
+pub fn root(m: Measurement) -> Measurement ! UncertainError {
+    if m.value < 0.0 {
+        fail(NotPositive(m.value))
+    }
+    if m.value == 0.0 {
+        return Measurement{ value: 0.0, uncertainty: 0.0 }
+    }
+    return try power(m, 0.5)
+}
+
+/// A natural logarithm.
+///
+/// The uncertainty of a logarithm is the *relative* uncertainty of its
+/// argument, which is the cleanest statement of why relative uncertainty is
+/// the natural quantity: a log turns it into an absolute one.
+pub fn logarithm(m: Measurement) -> Measurement ! UncertainError {
+    if m.value <= 0.0 {
+        fail(NotPositive(m.value))
+    }
+    return Measurement{ value: m.value.ln(), uncertainty: relative(m) }
+}
+
+/// An exponential.
+pub fn exponential(m: Measurement) -> Measurement {
+    let value = m.value.exp()
+    return Measurement{ value: value,
+        uncertainty: value * m.uncertainty }
+}
+
+/// A weighted mean of independent measurements, and its uncertainty.
+///
+/// Each measurement is weighted by one over its variance, so a measurement
+/// ten times as precise counts a hundred times as much. This is the right way
+/// to combine repeated measurements and it is not the average.
+pub fn weighted_mean(values: [Measurement]) -> Measurement ! UncertainError {
+    var weight_sum = 0.0
+    var value_sum = 0.0
+    for m in values {
+        if m.uncertainty <= 0.0 {
+            return Measurement{ value: m.value, uncertainty: 0.0 }
+        }
+        let w = 1.0 / (m.uncertainty * m.uncertainty)
+        weight_sum = weight_sum + w
+        value_sum = value_sum + w * m.value
+    }
+    if weight_sum == 0.0 {
+        fail(DivideByZero())
+    }
+    return Measurement{ value: value_sum / weight_sum,
+        uncertainty: (1.0 / weight_sum).sqrt() }
+}
+
+/// How many standard deviations apart two measurements are.
+///
+/// The number a physicist means by "a three sigma result". Under two is
+/// agreement, over five is a discovery, and the space between is where most
+/// arguments happen.
+pub fn sigmas_apart(a: Measurement, b: Measurement) -> f64 {
+    let spread = quadrature(a.uncertainty, b.uncertainty)
+    if spread == 0.0 {
+        if a.value == b.value {
+            return 0.0
+        }
+        return 1.0 / 0.0
+    }
+    return magnitude(a.value - b.value) / spread
+}
+
+/// Whether two measurements agree within a number of standard deviations.
+pub fn agrees_within(a: Measurement, b: Measurement, sigmas: f64) -> bool {
+    return sigmas_apart(a, b) <= sigmas
+}
+
+/// The digit the uncertainty first shows up in, as a power of ten.
+///
+/// What decides how many figures to print. An uncertainty of 0.0015 is in the
+/// fourth decimal place, so the value is written to four decimals and no
+/// more — writing more is claiming precision the measurement does not have.
+pub fn significant_place(m: Measurement) -> i64 {
+    if m.uncertainty <= 0.0 {
+        return 0
+    }
+    var place = 0
+    var u = m.uncertainty
+    while u < 1.0 {
+        u = u * 10.0
+        place = place - 1
+    }
+    while u >= 10.0 {
+        u = u / 10.0
+        place = place + 1
+    }
+    return place
+}

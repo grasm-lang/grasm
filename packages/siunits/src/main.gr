@@ -1,0 +1,293 @@
+// The SI, after 2019: seven constants, and everything else follows.
+//
+// On 20 May 2019 the SI stopped being defined by objects. Until then the
+// kilogram *was* a cylinder of platinum-iridium in a vault near Paris, and
+// the kilogram's value was whatever that cylinder's mass happened to be —
+// which drifted by about fifty micrograms over a century, and nobody could
+// say relative to what, because it was the definition.
+//
+// Now seven constants have exact defined values and the units follow from
+// them. The second is 9,192,631,770 periods of a caesium transition. The
+// metre is the distance light travels in 1/299,792,458 of a second. The
+// kilogram comes from Planck's constant being exactly
+// 6.62607015 x 10^-34 joule seconds — a number chosen so that the new
+// kilogram matched the old cylinder as closely as it could be measured.
+//
+// That is why those constants have no uncertainty: they are not measured any
+// more, they are *definitions*, and the uncertainty moved to the measurement
+// of things that used to be exact. The old cylinder now has a mass of one
+// kilogram plus or minus about ten micrograms.
+//
+// ## The prefixes
+//
+// Twenty-four of them, from quecto (10^-30) to quetta (10^30). The last four
+// — ronna, quetta, ronto, quecto — were added in 2022 because the world's
+// data was about to need them: a zettabyte is 10^21 and global storage passed
+// that in 2016.
+//
+// The one that catches people: **the kilogram is the only base unit with a
+// prefix already in it**. So a milligram is a thousandth of a gram, not a
+// thousandth of a kilogram, and `kkg` is not a unit at all. Every table of SI
+// units has this special case in it.
+//
+// ## The symbols that are not unique
+//
+// `kt` is a knot in one table, a kilotonne in another and a carat in a third.
+// This one has no knot in it, so `kt` is a kilotonne — and that is exactly
+// the kind of silent disagreement that lost the Mars Climate Orbiter, so a
+// program passing unit symbols between two libraries should not assume they
+// agree about the ambiguous ones.
+//
+// ## The derived units
+//
+// Twenty-two with special names, and each is a product of base units. A
+// newton is kg m s^-2. A joule is a newton metre. A watt is a joule a second.
+// They exist because writing the base form every time is unreadable, and
+// because a name records what the quantity *is* — a newton metre of torque
+// and a joule of energy have the same base form and are not interchangeable.
+//
+// Checked against `pint`, which carries the same definitions.
+
+import dimension
+
+type SiUnitError =
+    | UnknownUnit(name: str)
+    | UnknownPrefix(name: str)
+    | NotConvertible(from_unit: str, to_unit: str)
+
+type SiUnit = {
+    symbol: str,
+    name: str,
+    /// How many of the coherent base combination one of these is.
+    factor: f64,
+    dimension: Dimension,
+}
+
+/// The seven base units, in the SI brochure's order.
+pub fn base_units() -> [SiUnit] {
+    return [
+        SiUnit{ symbol: "m", name: "metre", factor: 1.0,
+            dimension: dimension.length() },
+        SiUnit{ symbol: "kg", name: "kilogram", factor: 1.0,
+            dimension: dimension.mass() },
+        SiUnit{ symbol: "s", name: "second", factor: 1.0,
+            dimension: dimension.time() },
+        SiUnit{ symbol: "A", name: "ampere", factor: 1.0,
+            dimension: dimension.current() },
+        SiUnit{ symbol: "K", name: "kelvin", factor: 1.0,
+            dimension: dimension.temperature() },
+        SiUnit{ symbol: "mol", name: "mole", factor: 1.0,
+            dimension: dimension.amount() },
+        SiUnit{ symbol: "cd", name: "candela", factor: 1.0,
+            dimension: dimension.luminosity() }]
+}
+
+/// The twenty-two derived units with special names, plus the ones everyone
+/// uses that are not SI at all.
+pub fn derived_units() -> [SiUnit] {
+    var out: [SiUnit] = [
+        named("Hz", "hertz", 1.0, dimension.of(0, 0, 0 - 1, 0, 0, 0, 0)),
+        named("N", "newton", 1.0, dimension.of(1, 1, 0 - 2, 0, 0, 0, 0)),
+        named("Pa", "pascal", 1.0, dimension.of(0 - 1, 1, 0 - 2, 0, 0, 0, 0)),
+        named("J", "joule", 1.0, dimension.of(2, 1, 0 - 2, 0, 0, 0, 0)),
+        named("W", "watt", 1.0, dimension.of(2, 1, 0 - 3, 0, 0, 0, 0)),
+        named("C", "coulomb", 1.0, dimension.of(0, 0, 1, 1, 0, 0, 0)),
+        named("V", "volt", 1.0, dimension.of(2, 1, 0 - 3, 0 - 1, 0, 0, 0)),
+        named("F", "farad", 1.0, dimension.of(0 - 2, 0 - 1, 4, 2, 0, 0, 0)),
+        named("ohm", "ohm", 1.0, dimension.of(2, 1, 0 - 3, 0 - 2, 0, 0, 0)),
+        named("S", "siemens", 1.0,
+            dimension.of(0 - 2, 0 - 1, 3, 2, 0, 0, 0)),
+        named("Wb", "weber", 1.0, dimension.of(2, 1, 0 - 2, 0 - 1, 0, 0, 0)),
+        named("T", "tesla", 1.0, dimension.of(0, 1, 0 - 2, 0 - 1, 0, 0, 0)),
+        named("H", "henry", 1.0, dimension.of(2, 1, 0 - 2, 0 - 2, 0, 0, 0)),
+        named("lm", "lumen", 1.0, dimension.of(0, 0, 0, 0, 0, 0, 1)),
+        named("lx", "lux", 1.0, dimension.of(0 - 2, 0, 0, 0, 0, 0, 1)),
+        named("Bq", "becquerel", 1.0, dimension.of(0, 0, 0 - 1, 0, 0, 0, 0)),
+        named("Gy", "gray", 1.0, dimension.of(2, 0, 0 - 2, 0, 0, 0, 0)),
+        named("Sv", "sievert", 1.0, dimension.of(2, 0, 0 - 2, 0, 0, 0, 0)),
+        named("kat", "katal", 1.0, dimension.of(0, 0, 0 - 1, 0, 0, 1, 0))]
+    for unit in accepted_units() {
+        out.push(unit)
+    }
+    return out
+}
+
+fn named(symbol: str, name: str, factor: f64, d: Dimension) -> SiUnit {
+    return SiUnit{ symbol: symbol, name: name, factor: factor,
+        dimension: d }
+}
+
+/// Units the SI accepts without being SI: the ones people actually write.
+///
+/// The minute, the hour, the litre, the tonne, the electronvolt. Each is an
+/// exact multiple of an SI unit except the electronvolt, whose factor is the
+/// elementary charge and has been exact since 2019.
+pub fn accepted_units() -> [SiUnit] {
+    return [
+        named("min", "minute", 60.0, dimension.time()),
+        named("h", "hour", 3600.0, dimension.time()),
+        named("d", "day", 86400.0, dimension.time()),
+        named("L", "litre", 0.001, dimension.of(3, 0, 0, 0, 0, 0, 0)),
+        named("t", "tonne", 1000.0, dimension.mass()),
+        named("g", "gram", 0.001, dimension.mass()),
+        named("eV", "electronvolt", 1.602176634e-19, dimension.energy()),
+        named("au", "astronomical unit", 149597870700.0,
+            dimension.length()),
+        named("bar", "bar", 100000.0, dimension.pressure()),
+        named("Wh", "watt hour", 3600.0, dimension.energy())]
+}
+
+/// The prefixes, from quetta down to quecto.
+pub fn prefixes() -> [(str, i64)] {
+    return [("Q", 30), ("R", 27), ("Y", 24), ("Z", 21), ("E", 18),
+        ("P", 15), ("T", 12), ("G", 9), ("M", 6), ("k", 3), ("h", 2),
+        ("da", 1), ("d", 0 - 1), ("c", 0 - 2), ("m", 0 - 3), ("u", 0 - 6),
+        ("n", 0 - 9), ("p", 0 - 12), ("f", 0 - 15), ("a", 0 - 18),
+        ("z", 0 - 21), ("y", 0 - 24), ("r", 0 - 27), ("q", 0 - 30)]
+}
+
+/// A prefix's power of ten, or zero when the name is not one.
+pub fn prefix_power(name: str) -> i64 ! SiUnitError {
+    if name == "" {
+        return 0
+    }
+    for entry in prefixes() {
+        if entry.0 == name {
+            return entry.1
+        }
+    }
+    fail(UnknownPrefix(name))
+}
+
+/// Ten to a power, exactly where a double can hold it.
+pub fn power_of_ten(exponent: i64) -> f64 {
+    var out = 1.0
+    var i = 0
+    while i < absolute(exponent) {
+        out = out * 10.0
+        i = i + 1
+    }
+    if exponent < 0 {
+        return 1.0 / out
+    }
+    return out
+}
+
+fn absolute(v: i64) -> i64 {
+    if v < 0 {
+        return 0 - v
+    }
+    return v
+}
+
+/// A unit by symbol, prefix and all.
+///
+/// The special case that every table needs: the kilogram already has a prefix
+/// in it, so a prefixed mass is a prefixed *gram* and the factor is a
+/// thousandth of what the symbol suggests.
+pub fn lookup(symbol: str) -> SiUnit ! SiUnitError {
+    for unit in base_units() {
+        if unit.symbol == symbol {
+            return unit
+        }
+    }
+    for unit in derived_units() {
+        if unit.symbol == symbol {
+            return unit
+        }
+    }
+    let split = try split_prefix(symbol)
+    var unit = split.1
+    unit.factor = unit.factor * power_of_ten(split.0)
+    unit.symbol = symbol
+    return unit
+}
+
+fn split_prefix(symbol: str) -> (i64, SiUnit) ! SiUnitError {
+    // Longest prefix first, so `da` is not read as `d` followed by an `a`
+    // that is not a unit.
+    for length in [2, 1] {
+        if symbol.len() <= length {
+            continue
+        }
+        let head = symbol.substr(0, length)
+        let rest = symbol.substr(length, symbol.len() - length)
+        var power = 0 - 1000
+        for entry in prefixes() {
+            if entry.0 == head {
+                power = entry.1
+            }
+        }
+        if power == 0 - 1000 {
+            continue
+        }
+        match bare(rest) {
+            Ok(unit) -> return (power, unit)
+            Err(_e) -> continue
+        }
+    }
+    fail(UnknownUnit(symbol))
+}
+
+fn bare(symbol: str) -> SiUnit ! SiUnitError {
+    // The kilogram already carries a prefix, and a prefix may not be applied
+    // twice: `kkg` is not a thing. Prefixed masses go on the gram, which is
+    // why `mg` is a millionth of a kilogram and every SI table has this one
+    // special case in it.
+    if symbol == "kg" {
+        fail(UnknownUnit(symbol))
+    }
+    for unit in base_units() {
+        if unit.symbol == symbol {
+            return unit
+        }
+    }
+    for unit in derived_units() {
+        if unit.symbol == symbol {
+            return unit
+        }
+    }
+    fail(UnknownUnit(symbol))
+}
+
+/// Whether a symbol names a unit this knows.
+pub fn is_known(symbol: str) -> bool {
+    match lookup(symbol) {
+        Ok(_v) -> return true
+        Err(_e) -> return false
+    }
+}
+
+/// An amount in one unit as an amount in another.
+pub fn convert(amount: f64, from_unit: str,
+    to_unit: str) -> f64 ! SiUnitError {
+    let a = try lookup(from_unit)
+    let b = try lookup(to_unit)
+    if not dimension.same(a.dimension, b.dimension) {
+        fail(NotConvertible(from_unit, to_unit))
+    }
+    return amount * a.factor / b.factor
+}
+
+/// An amount in the coherent base units.
+pub fn to_base(amount: f64, unit: str) -> f64 ! SiUnitError {
+    return amount * (try lookup(unit)).factor
+}
+
+/// A unit's dimension.
+pub fn dimension_of(unit: str) -> Dimension ! SiUnitError {
+    return (try lookup(unit)).dimension
+}
+
+/// Whether two units measure the same kind of thing.
+pub fn compatible(left: str, right: str) -> bool {
+    match dimension_of(left) {
+        Ok(a) -> {
+            match dimension_of(right) {
+                Ok(b) -> return dimension.same(a, b)
+                Err(_e) -> return false
+            }
+        }
+        Err(_e) -> return false
+    }
+}

@@ -1,0 +1,350 @@
+import dimension
+import siunits
+import unitparse
+import constants
+import uncertainty
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn near(a: f64, b: f64, tolerance: f64) -> bool {
+    var d = a - b
+    if d < 0.0 {
+        d = 0.0 - d
+    }
+    return d < tolerance
+}
+
+fn close(a: f64, b: f64) -> bool {
+    var d = a - b
+    if d < 0.0 {
+        d = 0.0 - d
+    }
+    var scale = b
+    if scale < 0.0 {
+        scale = 0.0 - scale
+    }
+    return d <= scale * 1.0e-12
+}
+
+// ------------------------------------------------------------- dimension
+
+fn check_dimension(inout f: i64) / {io} {
+    print("-- dimension: seven exponents, and arithmetic on them")
+    // pint carries the same vectors for all of these.
+    say(f, "a force is length, mass and time to the minus two",
+        dimension.show(dimension.force()) == "LMT^-2" and
+        dimension.show(dimension.energy()) == "L^2MT^-2" and
+        dimension.show(dimension.pressure()) == "L^-1MT^-2")
+    say(f, "multiplying quantities adds their exponents",
+        dimension.same(dimension.multiply(dimension.force(),
+            dimension.length()), dimension.energy()) and
+        dimension.same(dimension.divide(dimension.energy(),
+            dimension.time()), dimension.power_dimension()))
+    // Torque and energy have the same dimension and are not the same thing,
+    // which is a limit of the technique rather than a bug in it.
+    say(f, "and torque and energy are the same dimension, which is a limit",
+        dimension.same(dimension.multiply(dimension.force(),
+            dimension.length()), dimension.energy()))
+    say(f, "a dimensionless quantity is every exponent zero",
+        dimension.is_scalar(dimension.divide(dimension.length(),
+            dimension.length())) and
+        dimension.show(dimension.scalar()) == "1")
+    // Fractional exponents are real: volts per root hertz is one.
+    let root_area = dimension.root(dimension.power(dimension.length(),
+        dimension.whole(2)))
+    say(f, "a square root of an area is a length, exactly",
+        dimension.same(root_area, dimension.length()) and
+        dimension.is_integral(root_area))
+    let half = dimension.root(dimension.time())
+    say(f, "and a root that does not come out stays a fraction",
+        not dimension.is_integral(half) and
+        dimension.show(half) == "T^1/2" and
+        near(dimension.as_f64(half.time), 0.5, 1.0e-15))
+    say(f, "an exponent is reduced, so two thirds and four sixths are one",
+        dimension.same_exponent(dimension.fraction(2, 3) ??
+            dimension.whole(0), dimension.fraction(4, 6) ??
+            dimension.whole(1)) and
+        (dimension.fraction(1, 0) ?? dimension.whole(7)).numerator == 7)
+    // Adding across dimensions is the one question this answers.
+    say(f, "a length plus a time is refused, and the offender is named",
+        not dimension.addable(dimension.length(), dimension.time()) and
+        add_refused())
+    say(f, "the base symbols are the seven, in the brochure's own order",
+        dimension.base_symbols() == ["L", "M", "T", "I", "TH", "N", "J"] and
+        dimension.exponents(dimension.force()).len() == 7)
+    say(f, "the dimensions with names are recognised by their vectors alone",
+        dimension.name_of(dimension.of(1, 1, 0 - 2, 0, 0, 0, 0)) == "force"
+        and dimension.name_of(dimension.of(2, 1, 0 - 3, 0 - 1, 0, 0, 0)) ==
+        "voltage" and dimension.name_of(dimension.of(3, 0, 0, 0, 0, 0, 0))
+        == "")
+}
+
+fn add_refused() -> bool {
+    match dimension.check_add(dimension.length(), dimension.time()) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+// --------------------------------------------------------------- siunits
+
+fn factor_of(symbol: str) -> f64 {
+    let unit: SiUnit ! SiUnitError = siunits.lookup(symbol)
+    return (unit ?? SiUnit{ symbol: "", name: "", factor: 0.0,
+        dimension: dimension.scalar() }).factor
+}
+
+fn check_siunits(inout f: i64) / {io} {
+    print("-- siunits: seven base units, and one of them has a prefix in it")
+    say(f, "the base units are the seven the brochure lists",
+        siunits.base_units().len() == 7 and
+        siunits.base_units()[1].symbol == "kg" and
+        siunits.base_units()[1].name == "kilogram")
+    // The prefixes now run from quecto to quetta: the last four arrived in
+    // 2022 because the world's data was about to need them.
+    say(f, "there are twenty-four prefixes, quecto to quetta",
+        siunits.prefixes().len() == 24 and
+        (siunits.prefix_power("Q") ?? 0) == 30 and
+        (siunits.prefix_power("q") ?? 0) == 0 - 30 and
+        (siunits.prefix_power("") ?? 9) == 0)
+    say(f, "and a prefixed unit is what pint says it is",
+        close(factor_of("km"), 1000.0) and
+        close(factor_of("nm"), 1.0e-9) and
+        close(factor_of("GHz"), 1.0e9) and close(factor_of("hPa"), 100.0))
+    // The kilogram already carries a prefix, so a milligram is a millionth
+    // of a kilogram and `kkg` is not a unit at all.
+    say(f, "a milligram is a millionth of a kilogram, not a thousandth",
+        close(factor_of("mg"), 1.0e-6) and close(factor_of("g"), 0.001) and
+        close(factor_of("kg"), 1.0))
+    say(f, "and a prefix cannot be put on a unit that already has one",
+        not siunits.is_known("kkg") and siunits.is_known("kt"))
+    say(f, "the derived units carry the dimensions they are defined by",
+        dimension.same(siunits.dimension_of("N") ?? dimension.scalar(),
+            dimension.force()) and
+        dimension.same(siunits.dimension_of("V") ?? dimension.scalar(),
+            dimension.voltage()) and
+        dimension.same(siunits.dimension_of("ohm") ?? dimension.scalar(),
+            dimension.resistance()))
+    say(f, "conversion is a ratio of factors, and needs the same dimension",
+        close(siunits.convert(1.0, "h", "s") ?? 0.0, 3600.0) and
+        close(siunits.convert(1.0, "kWh", "J") ?? 0.0, 3600000.0) and
+        siunits.compatible("eV", "J") and not siunits.compatible("m", "s"))
+    say(f, "and a conversion across dimensions is refused",
+        conversion_refused("m", "s") and
+        not conversion_refused("min", "h"))
+    say(f, "ten to a power is exact where a double can hold it",
+        siunits.power_of_ten(0) == 1.0 and
+        siunits.power_of_ten(3) == 1000.0 and
+        close(siunits.power_of_ten(0 - 3), 0.001))
+    say(f, "an electronvolt has been exact since the elementary charge was",
+        close(factor_of("eV"), 1.602176634e-19) and
+        close(factor_of("au"), 149597870700.0))
+}
+
+fn conversion_refused(from_unit: str, to_unit: str) -> bool {
+    match siunits.convert(1.0, from_unit, to_unit) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+// ------------------------------------------------------------- unitparse
+
+fn parsed_factor(text: str) -> f64 {
+    let u: ParsedUnit ! UnitParseError = unitparse.parse(text)
+    return (u ?? ParsedUnit{ factor: 0.0,
+        dimension: dimension.scalar() }).factor
+}
+
+fn parsed_dimension(text: str) -> Dimension {
+    let u: ParsedUnit ! UnitParseError = unitparse.parse(text)
+    return (u ?? ParsedUnit{ factor: 0.0,
+        dimension: dimension.scalar() }).dimension
+}
+
+fn check_unitparse(inout f: i64) / {io} {
+    print("-- unitparse: four ways to write a multiplication")
+    // pint parses all of these to the same thing.
+    say(f, "a space, a star, a full stop and a middle dot all multiply",
+        dimension.same(parsed_dimension("kg m / s^2"), dimension.force()) and
+        dimension.same(parsed_dimension("kg*m/s**2"), dimension.force()) and
+        dimension.same(parsed_dimension("kg.m/s^2"), dimension.force()) and
+        dimension.same(parsed_dimension("N"), dimension.force()))
+    say(f, "and a trailing digit is a power, because the data is full of it",
+        dimension.same(parsed_dimension("m2"),
+            dimension.power(dimension.length(), dimension.whole(2))) and
+        dimension.same(parsed_dimension("m^2"), parsed_dimension("m2")))
+    // The rule that catches everyone: division binds one factor.
+    say(f, "division binds one factor, so m/s/s and m/s*s are different",
+        dimension.same(parsed_dimension("m/s/s"),
+            dimension.acceleration()) and
+        dimension.same(parsed_dimension("m/s*s"), dimension.length()))
+    say(f, "and parentheses say the other thing when that is meant",
+        dimension.same(parsed_dimension("W/(m*K)"),
+            parsed_dimension("W/m/K")) and
+        close(parsed_factor("W/(m*K)"), 1.0))
+    // The factor and the dimension are separate, which is what lets one
+    // library both convert and check.
+    say(f, "km/h and m/s measure the same thing and differ by a factor",
+        unitparse.compatible("km/h", "m/s") and
+        close(parsed_factor("km/h"), 1.0 / 3.6) and
+        close(parsed_factor("m/s"), 1.0))
+    say(f, "so a conversion between them is a division of factors",
+        close(unitparse.convert(36.0, "km/h", "m/s") ?? 0.0, 10.0) and
+        close(unitparse.convert(1.0, "kWh", "MJ") ?? 0.0, 3.6))
+    // A leading number makes `1/s` an expression and `/s` a fragment.
+    say(f, "a bare number is a factor, which is what makes 1/s a unit",
+        dimension.same(parsed_dimension("1/s"), dimension.frequency()) and
+        not unitparse.is_valid("/s") and not unitparse.is_valid("m/"))
+    say(f, "an expression says what it measures where the answer has a name",
+        unitparse.measures("kg*m/s^2") == "force" and
+        unitparse.measures("J/s") == "power" and
+        unitparse.measures("mol/L") == "")
+    say(f, "a negative power is written with a caret and a minus",
+        dimension.same(parsed_dimension("s^-1"), dimension.frequency()) and
+        dimension.same(parsed_dimension("m*kg*s^-2"), dimension.force()))
+    say(f, "and a symbol nothing defines is refused rather than ignored",
+        not unitparse.is_valid("nope") and
+        not unitparse.is_valid("kg*nope"))
+}
+
+// -------------------------------------------------------------- constants
+
+fn check_constants(inout f: i64) / {io} {
+    print("-- constants: the seven that stopped being measured")
+    // scipy's CODATA table, value for value.
+    say(f, "the speed of light and the Planck constant are exact",
+        (constants.value("c") ?? 0.0) == 299792458.0 and
+        (constants.value("h") ?? 0.0) == 6.62607015e-34 and
+        constants.is_exact("c") and constants.is_exact("h"))
+    say(f, "and seven constants are what the SI is now defined from",
+        constants.defining_constants().len() == 7 and
+        constants.is_exact("dnuCs") and constants.is_exact("Kcd") and
+        (constants.value("dnuCs") ?? 0.0) == 9192631770.0)
+    // Everything computed only from exact constants is exact too.
+    say(f, "so the gas constant is exact, being two exact ones multiplied",
+        constants.is_exact("R") and
+        close(constants.value("R") ?? 0.0, 8.31446261815324) and
+        close((constants.value("k") ?? 0.0) *
+            (constants.value("NA") ?? 0.0), constants.value("R") ?? 0.0))
+    // And the one that used to be exact and is not any more.
+    say(f, "the vacuum permeability used to be exact and stopped being so",
+        not constants.is_exact("mu0") and
+        close(constants.value("mu0") ?? 0.0, 1.25663706127e-6) and
+        (constants.uncertainty("mu0") ?? 0.0) == 2.0e-16)
+    // Gravity is the worst-known of the lot by a wide margin.
+    say(f, "the gravitational constant is the worst known of them",
+        constants.least_certain(1) == ["G"] and
+        near(constants.relative_uncertainty("G") ?? 0.0, 2.2e-5, 1.0e-6))
+    say(f, "and the Rydberg constant is ten orders better",
+        (constants.relative_uncertainty("Rinf") ?? 1.0) <
+        (constants.relative_uncertainty("G") ?? 0.0) / 1.0e7)
+    say(f, "the electron mass carries an uncertainty and the charge does not",
+        not constants.is_exact("me") and constants.is_exact("e") and
+        constants.count() == 26)
+    // CODATA writes the electron mass as 9.1093837139(28)e-31: the bracket
+    // is the uncertainty in units of the last digit shown.
+    say(f, "a value is written with its uncertainty in the last digits",
+        (constants.concise("me", 10) ?? "").ends_with("(28)") and
+        (constants.concise("c", 4) ?? "").contains("(") == false)
+    say(f, "and a constant nobody defined is refused rather than zero",
+        constant_refused("q") and not constant_refused("hbar"))
+}
+
+fn constant_refused(symbol: str) -> bool {
+    match constants.get(symbol) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+// ------------------------------------------------------------ uncertainty
+
+fn u(value: f64, spread: f64) -> Measurement {
+    return uncertainty.measure(value, spread) ??
+    Measurement{ value: value, uncertainty: 0.0 }
+}
+
+fn check_uncertainty(inout f: i64) / {io} {
+    print("-- uncertainty: errors that cancel as often as they add")
+    // Python's `uncertainties` agrees with every one of these.
+    say(f, "two independent uncertainties combine in quadrature, not by adding",
+        close(uncertainty.quadrature(3.0, 4.0), 5.0) and
+        close(uncertainty.add(u(10.0, 3.0), u(20.0, 4.0)).uncertainty, 5.0))
+    // The largest uncertainty dominates completely.
+    say(f, "so the largest one dominates and the small ones stop mattering",
+        near(uncertainty.quadrature(10.0, 1.0), 10.0499, 0.0001) and
+        near(uncertainty.quadrature(10.0, 0.0), 10.0, 1.0e-15))
+    // Subtraction grows the relative uncertainty, which is why an experiment
+    // measures a difference rather than differencing two measurements.
+    let difference = uncertainty.subtract(u(100.0, 1.0), u(99.0, 1.0))
+    say(f, "subtracting near-equal measurements explodes the relative error",
+        close(difference.value, 1.0) and
+        near(difference.uncertainty, 1.41421356, 1.0e-8) and
+        near(uncertainty.relative(difference), 1.41421356, 1.0e-8))
+    // And the correlated case, which a bare number cannot know.
+    let same = uncertainty.subtract_correlated(u(5.0, 2.0), u(5.0, 2.0), 1.0)
+    say(f, "but a measurement minus itself is exactly zero, with no spread",
+        same.value == 0.0 and same.uncertainty == 0.0)
+    // Multiplication combines *relative* uncertainties.
+    say(f, "multiplication combines the relative uncertainties instead",
+        near(uncertainty.relative(uncertainty.multiply(u(100.0, 1.0),
+            u(200.0, 2.0))), 0.01414213, 1.0e-8))
+    say(f, "and a power multiplies the relative one by the exponent",
+        near(uncertainty.relative(uncertainty.power(u(4.0, 0.1), 2.0) ??
+            u(0.0, 0.0)), 0.05, 1.0e-12) and
+        near(uncertainty.relative(uncertainty.root(u(4.0, 0.1)) ??
+            u(0.0, 0.0)), 0.0125, 1.0e-12))
+    say(f, "a logarithm turns a relative uncertainty into an absolute one",
+        near((uncertainty.logarithm(u(10.0, 0.5)) ??
+            u(0.0, 0.0)).uncertainty, 0.05, 1.0e-12))
+    // A weighted mean, which is not the average.
+    let mean = uncertainty.weighted_mean([u(10.0, 1.0), u(10.5, 0.5)]) ??
+    u(0.0, 0.0)
+    say(f, "a weighted mean counts a precise measurement four times over",
+        near(mean.value, 10.4, 1.0e-12) and
+        near(mean.uncertainty, 0.4472136, 1.0e-7))
+    // Sigmas, which is what "a three sigma result" means.
+    say(f, "two measurements are so many standard deviations apart",
+        near(uncertainty.sigmas_apart(u(10.0, 1.0), u(13.0, 1.0)),
+            2.12132034, 1.0e-8) and
+        uncertainty.agrees_within(u(10.0, 1.0), u(10.5, 1.0), 2.0) and
+        not uncertainty.agrees_within(u(10.0, 0.1), u(11.0, 0.1), 3.0))
+    say(f, "and the uncertainty says how many figures may be printed",
+        uncertainty.significant_place(u(6.6743, 0.0015)) == 0 - 3 and
+        uncertainty.significant_place(u(1.0, 25.0)) == 1)
+    say(f, "an exponential's uncertainty grows with the value",
+        near(uncertainty.exponential(u(2.0, 0.1)).uncertainty,
+            0.73890561, 1.0e-8))
+    say(f, "a negative uncertainty is not a measurement",
+        negative_refused() and
+        uncertainty.exact(3.0).uncertainty == 0.0)
+}
+
+fn negative_refused() -> bool {
+    match uncertainty.measure(1.0, 0.0 - 1.0) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn main() / {io} {
+    var f = 0
+    check_dimension(f)
+    check_siunits(f)
+    check_unitparse(f)
+    check_constants(f)
+    check_uncertainty(f)
+    if f == 0 {
+        print("units: every claim held")
+    } else {
+        print("units: {f} claims failed")
+    }
+}

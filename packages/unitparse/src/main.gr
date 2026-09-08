@@ -1,0 +1,319 @@
+// Reading `kg*m/s^2` and finding out it is a newton.
+//
+// A unit written down is a little expression: symbols multiplied, divided and
+// raised to powers. Parsing it gives a factor and a dimension vector, and
+// with those two a program can convert anything to anything else that
+// measures the same thing — and refuse everything else.
+//
+// This is what makes a units library usable rather than a lookup table. A
+// table has `N` in it; an expression parser has `kg*m/s**2`, `kg m s^-2`,
+// `kg·m·s⁻²` and `N` all meaning the same, which is what the data actually
+// looks like.
+//
+// ## The syntax nobody agreed on
+//
+// Multiplication is a space, or `*`, or `.`, or `·`. Division is `/`. A power
+// is `^2`, or `**2`, or a superscript, or nothing at all — `m2` means square
+// metres in a great deal of scientific data. Negative powers are `s^-1` or
+// `s-1` or `/s`.
+//
+// And the rule that catches everyone: **`m/s/s` and `m/(s*s)` are the same,
+// and `m/s*s` is not.** After a division, does the next multiplication go
+// back on top or stay underneath? Every implementation has to choose, and
+// they do not all choose the same. This one treats division as binding only
+// the next factor — `a/b*c` is `(a/b)*c` — which is left-to-right and is what
+// a programming language does.
+//
+// ## Why the factor and the dimension are separate
+//
+// `km/h` has dimension length/time and factor 1/3.6. `m/s` has the same
+// dimension and factor 1. Conversion is a division of factors and the
+// dimension check is a comparison of vectors — so the parser has to produce
+// both, and a library that produces only one of them can either convert or
+// check, not both.
+//
+// Checked against `pint`, which parses the same expressions.
+
+import siunits
+import dimension
+
+type UnitParseError =
+    | UnexpectedEnd(at: i64)
+    | UnexpectedChar(at: i64, code: i64)
+    | UnknownSymbol(name: str)
+    | EmptyUnit()
+
+    /// A parsed unit: what to multiply by, and what it measures.
+type ParsedUnit = {
+    factor: f64,
+    dimension: Dimension,
+}
+
+/// A unit expression parsed.
+pub fn parse(text: str) -> ParsedUnit ! UnitParseError {
+    let codes = text.codes()
+    if trimmed_length(codes) == 0 {
+        fail(EmptyUnit())
+    }
+    let parsed = try parse_expression(codes, 0)
+    let at = skip_space(codes, parsed.1)
+    if at != codes.len() {
+        fail(UnexpectedChar(at, codes[at]))
+    }
+    return parsed.0
+}
+
+fn parse_expression(codes: [i64], from: i64) -> (ParsedUnit,
+    i64) ! UnitParseError {
+    var at = skip_space(codes, from)
+    // A division with nothing to its left is not an expression: `1/s` is,
+    // and `/s` is a fragment. Refusing it is what pint does and what keeps a
+    // typo from becoming a unit.
+    var out = try parse_term(codes, at)
+    var result = out.0
+    at = out.1
+    while true {
+        let next = skip_space(codes, at)
+        if next >= codes.len() or codes[next] == 41 {
+            return (result, next)
+        }
+        var dividing = false
+        var start = next
+        if codes[next] == 47 {
+            dividing = true
+            start = next + 1
+        } else if is_multiply(codes[next]) {
+            start = next + 1
+        } else if next == at {
+            // No separator at all and no space between them.
+            return (result, at)
+        }
+        let piece = try parse_term(codes, skip_space(codes, start))
+        if dividing {
+            result = ParsedUnit{ factor: result.factor / piece.0.factor,
+                dimension: dimension.divide(result.dimension,
+                    piece.0.dimension) }
+        } else {
+            result = ParsedUnit{ factor: result.factor * piece.0.factor,
+                dimension: dimension.multiply(result.dimension,
+                    piece.0.dimension) }
+        }
+        at = piece.1
+    }
+    return (result, at)
+}
+
+fn parse_term(codes: [i64], from: i64) -> (ParsedUnit, i64) ! UnitParseError {
+    var at = skip_space(codes, from)
+    if at >= codes.len() {
+        fail(UnexpectedEnd(at))
+    }
+    if codes[at] == 40 {
+        let inner = try parse_expression(codes, at + 1)
+        var i = skip_space(codes, inner.1)
+        if i >= codes.len() or codes[i] != 41 {
+            fail(UnexpectedEnd(i))
+        }
+        i = i + 1
+        let power = try read_exponent(codes, i)
+        if not power.2 {
+            return (inner.0, power.1)
+        }
+        return (ParsedUnit{ factor: raise(inner.0.factor, power.0),
+            dimension: dimension.power(inner.0.dimension,
+                dimension.whole(power.0)) }, power.1)
+    }
+    // A bare number is a dimensionless multiplier, which is what makes `1/s`
+    // an expression and `/s` not one.
+    if is_digit(codes[at]) and not is_number_then_letter(codes, at) {
+        var digits = ""
+        var i = at
+        while i < codes.len() and (is_digit(codes[i]) or codes[i] == 46) {
+            digits = digits + codes[i].to_char()
+            i = i + 1
+        }
+        return (ParsedUnit{ factor: digits.parse_float() ?? 1.0,
+            dimension: dimension.scalar() }, i)
+    }
+    return try parse_factor(codes, at)
+}
+
+fn is_digit(code: i64) -> bool {
+    return code >= 48 and code <= 57
+}
+
+fn is_number_then_letter(codes: [i64], at: i64) -> bool {
+    var i = at
+    while i < codes.len() and is_digit(codes[i]) {
+        i = i + 1
+    }
+    return i < codes.len() and not is_digit(codes[i]) and codes[i] != 46 and
+    is_symbol_char(codes[i])
+}
+
+fn trimmed_length(codes: [i64]) -> i64 {
+    var count = 0
+    for code in codes {
+        if code != 32 and code != 9 {
+            count = count + 1
+        }
+    }
+    return count
+}
+
+fn skip_space(codes: [i64], at: i64) -> i64 {
+    var i = at
+    while i < codes.len() and (codes[i] == 32 or codes[i] == 9) {
+        i = i + 1
+    }
+    return i
+}
+
+fn is_multiply(code: i64) -> bool {
+    // Asterisk, full stop, and the middle dot the SI brochure itself uses.
+    return code == 42 or code == 46 or code == 183
+}
+
+fn parse_factor(codes: [i64], at: i64) -> (ParsedUnit, i64) ! UnitParseError {
+    var i = at
+    var symbol = ""
+    while i < codes.len() and is_symbol_char(codes[i]) {
+        symbol = symbol + codes[i].to_char()
+        i = i + 1
+    }
+    if symbol == "" {
+        fail(UnexpectedChar(i, codes[i]))
+    }
+    // A trailing digit run with no caret is a power: `m2` is square metres in
+    // a great deal of scientific data, and refusing it means refusing the
+    // data.
+    let split = split_trailing_digits(symbol)
+    symbol = split.0
+    var exponent = split.1
+    let power = try read_exponent(codes, i)
+    i = power.1
+    if power.2 {
+        exponent = power.0
+    }
+    let unit: SiUnit ! SiUnitError = siunits.lookup(symbol)
+    match unit {
+        Ok(u) -> {
+            return (ParsedUnit{ factor: raise(u.factor, exponent),
+                dimension: dimension.power(u.dimension,
+                    dimension.whole(exponent)) }, i)
+        }
+        Err(_e) -> fail(UnknownSymbol(symbol))
+    }
+}
+
+fn is_symbol_char(code: i64) -> bool {
+    return (code >= 65 and code <= 90) or (code >= 97 and code <= 122) or
+    (code >= 48 and code <= 57)
+}
+
+fn split_trailing_digits(symbol: str) -> (str, i64) {
+    let codes = symbol.codes()
+    var cut = codes.len()
+    while cut > 0 and codes[cut - 1] >= 48 and codes[cut - 1] <= 57 {
+        cut = cut - 1
+    }
+    if cut == 0 or cut == codes.len() {
+        return (symbol, 1)
+    }
+    let head = symbol.substr(0, cut)
+    // Only when what is left is a unit: `H2` is henry squared and `cd` is a
+    // candela, not a centi-d.
+    if not siunits.is_known(head) {
+        return (symbol, 1)
+    }
+    return (head, symbol.substr(cut, codes.len() - cut).parse_int() ?? 1)
+}
+
+fn read_exponent(codes: [i64], at: i64) -> (i64, i64, bool) ! UnitParseError {
+    var i = at
+    if i < codes.len() and codes[i] == 94 {
+        i = i + 1
+    } else if i + 1 < codes.len() and codes[i] == 42 and codes[i + 1] == 42 {
+        i = i + 2
+    } else {
+        return (1, at, false)
+    }
+    var negative = false
+    if i < codes.len() and (codes[i] == 45 or codes[i] == 8722) {
+        negative = true
+        i = i + 1
+    }
+    var digits = ""
+    while i < codes.len() and codes[i] >= 48 and codes[i] <= 57 {
+        digits = digits + codes[i].to_char()
+        i = i + 1
+    }
+    if digits == "" {
+        fail(UnexpectedEnd(i))
+    }
+    var value = digits.parse_int() ?? 1
+    if negative {
+        value = 0 - value
+    }
+    return (value, i, true)
+}
+
+fn raise(base: f64, exponent: i64) -> f64 {
+    var out = 1.0
+    var i = 0
+    while i < absolute(exponent) {
+        out = out * base
+        i = i + 1
+    }
+    if exponent < 0 {
+        return 1.0 / out
+    }
+    return out
+}
+
+fn absolute(v: i64) -> i64 {
+    if v < 0 {
+        return 0 - v
+    }
+    return v
+}
+
+/// An amount in one unit expression as an amount in another.
+pub fn convert(amount: f64, from_unit: str,
+    to_unit: str) -> f64 ! UnitParseError {
+    let a = try parse(from_unit)
+    let b = try parse(to_unit)
+    if not dimension.same(a.dimension, b.dimension) {
+        fail(UnknownSymbol(to_unit))
+    }
+    return amount * a.factor / b.factor
+}
+
+/// Whether two expressions measure the same kind of thing.
+pub fn compatible(left: str, right: str) -> bool {
+    match parse(left) {
+        Ok(a) -> {
+            match parse(right) {
+                Ok(b) -> return dimension.same(a.dimension, b.dimension)
+                Err(_e) -> return false
+            }
+        }
+        Err(_e) -> return false
+    }
+}
+
+/// What an expression measures, by name where it has one.
+pub fn measures(text: str) -> str {
+    match parse(text) {
+        Ok(u) -> return dimension.name_of(u.dimension)
+        Err(_e) -> return ""
+    }
+}
+
+/// Whether an expression parses at all.
+pub fn is_valid(text: str) -> bool {
+    match parse(text) {
+        Ok(_v) -> return true
+        Err(_e) -> return false
+    }
+}

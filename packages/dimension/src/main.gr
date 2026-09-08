@@ -1,0 +1,381 @@
+// Dimensions as a vector of exponents, and why that is the whole idea.
+//
+// A quantity's dimension is not a label. It is seven numbers: how many powers
+// of length, mass, time, current, temperature, amount and luminous intensity
+// it carries. A force is length¹ mass¹ time⁻². An energy is length² mass¹
+// time⁻². And once dimensions are vectors, dimensional arithmetic is vector
+// arithmetic — multiplying quantities adds the vectors, dividing subtracts,
+// raising to a power multiplies.
+//
+// That is what makes the checking work. `units` in this set carries one
+// dimension tag per quantity, which is enough to refuse metres plus seconds
+// and not enough to express metres per second squared. This is the general
+// case.
+//
+// ## Why it catches real errors
+//
+// The Mars Climate Orbiter was lost in 1999 because one program produced
+// pound-force seconds and another read them as newton seconds. Both
+// dimensions are force × time. **Dimensional analysis would not have caught
+// it** — the dimensions matched and the units did not. That is worth knowing
+// about the technique's limits: it catches adding a length to a time, and it
+// does not catch a factor of 4.45.
+//
+// What it does catch, constantly, is an exponent slip. `½mv²` written with
+// `v` instead of `v²` has dimension L¹M¹T⁻¹ rather than L²M¹T⁻², and a
+// dimension check finds it the moment the expression is built rather than
+// when the answer looks wrong.
+//
+// ## Fractional exponents
+//
+// Some real quantities have them: the standard deviation of a noise density
+// is volts per root hertz, dimension L²M¹T⁻⁵ᐟ²I⁻¹. So the exponents are
+// rationals rather than integers, kept as a numerator and a denominator so
+// that a square root is exact and does not accumulate error.
+//
+// ## The base dimensions, and the one that is not a dimension
+//
+// Seven: length, mass, time, electric current, thermodynamic temperature,
+// amount of substance, luminous intensity. The radian is *not* among them: an
+// angle is a length over a length, dimensionless, which is why radians appear
+// and disappear from formulas without anybody balancing them and why torque
+// and energy have the same dimension and are not the same thing.
+//
+// Checked against `pint`, which carries the same vectors.
+
+type DimensionError =
+    | DivideByZero()
+    | NotAnInteger(numerator: i64, denominator: i64)
+    | Mismatch(left: str, right: str)
+
+    /// A rational exponent, kept exact.
+type Exponent = {
+    numerator: i64,
+    denominator: i64,
+}
+
+/// The seven exponents, in the order the SI brochure lists the base units.
+type Dimension = {
+    length: Exponent,
+    mass: Exponent,
+    time: Exponent,
+    current: Exponent,
+    temperature: Exponent,
+    amount: Exponent,
+    luminosity: Exponent,
+}
+
+/// A whole-number exponent.
+pub fn whole(n: i64) -> Exponent {
+    return Exponent{ numerator: n, denominator: 1 }
+}
+
+/// A fractional one, reduced.
+pub fn fraction(numerator: i64, denominator: i64) -> Exponent ! DimensionError {
+    if denominator == 0 {
+        fail(DivideByZero())
+    }
+    return reduce(Exponent{ numerator: numerator,
+        denominator: denominator })
+}
+
+fn reduce(e: Exponent) -> Exponent {
+    var n = e.numerator
+    var d = e.denominator
+    if d < 0 {
+        n = 0 - n
+        d = 0 - d
+    }
+    let g = gcd(absolute(n), d)
+    if g == 0 {
+        return Exponent{ numerator: 0, denominator: 1 }
+    }
+    return Exponent{ numerator: n / g, denominator: d / g }
+}
+
+fn gcd(a: i64, b: i64) -> i64 {
+    var x = a
+    var y = b
+    while y != 0 {
+        let t = x % y
+        x = y
+        y = t
+    }
+    return x
+}
+
+fn absolute(v: i64) -> i64 {
+    if v < 0 {
+        return 0 - v
+    }
+    return v
+}
+
+fn add_exponents(a: Exponent, b: Exponent) -> Exponent {
+    return reduce(Exponent{
+        numerator: a.numerator * b.denominator + b.numerator * a.denominator,
+        denominator: a.denominator * b.denominator })
+}
+
+fn negate(e: Exponent) -> Exponent {
+    return Exponent{ numerator: 0 - e.numerator,
+        denominator: e.denominator }
+}
+
+fn times(e: Exponent, by: Exponent) -> Exponent {
+    return reduce(Exponent{ numerator: e.numerator * by.numerator,
+        denominator: e.denominator * by.denominator })
+}
+
+/// Whether two exponents are equal.
+pub fn same_exponent(a: Exponent, b: Exponent) -> bool {
+    let x = reduce(a)
+    let y = reduce(b)
+    return x.numerator == y.numerator and x.denominator == y.denominator
+}
+
+/// The dimensionless dimension: every exponent zero.
+pub fn scalar() -> Dimension {
+    return Dimension{ length: whole(0), mass: whole(0), time: whole(0),
+        current: whole(0), temperature: whole(0), amount: whole(0),
+        luminosity: whole(0) }
+}
+
+/// A dimension from seven whole exponents.
+pub fn of(length: i64, mass: i64, time: i64, current: i64, temperature: i64,
+    amount: i64, luminosity: i64) -> Dimension {
+    return Dimension{ length: whole(length), mass: whole(mass),
+        time: whole(time), current: whole(current),
+        temperature: whole(temperature), amount: whole(amount),
+        luminosity: whole(luminosity) }
+}
+
+/// Two dimensions multiplied, which adds their exponents.
+pub fn multiply(a: Dimension, b: Dimension) -> Dimension {
+    return Dimension{
+        length: add_exponents(a.length, b.length),
+        mass: add_exponents(a.mass, b.mass),
+        time: add_exponents(a.time, b.time),
+        current: add_exponents(a.current, b.current),
+        temperature: add_exponents(a.temperature, b.temperature),
+        amount: add_exponents(a.amount, b.amount),
+        luminosity: add_exponents(a.luminosity, b.luminosity) }
+}
+
+/// A dimension inverted.
+pub fn invert(d: Dimension) -> Dimension {
+    return Dimension{ length: negate(d.length), mass: negate(d.mass),
+        time: negate(d.time), current: negate(d.current),
+        temperature: negate(d.temperature), amount: negate(d.amount),
+        luminosity: negate(d.luminosity) }
+}
+
+/// Two dimensions divided.
+pub fn divide(a: Dimension, b: Dimension) -> Dimension {
+    return multiply(a, invert(b))
+}
+
+/// A dimension raised to a rational power.
+///
+/// A square root is a power of one half, which is why the exponents are
+/// rationals: taking the root of an area has to give a length exactly, not
+/// 0.9999999999999999 of one.
+pub fn power(d: Dimension, e: Exponent) -> Dimension {
+    return Dimension{ length: times(d.length, e), mass: times(d.mass, e),
+        time: times(d.time, e), current: times(d.current, e),
+        temperature: times(d.temperature, e), amount: times(d.amount, e),
+        luminosity: times(d.luminosity, e) }
+}
+
+/// A dimension's square root.
+pub fn root(d: Dimension) -> Dimension {
+    return power(d, Exponent{ numerator: 1, denominator: 2 })
+}
+
+/// Whether two dimensions are the same.
+pub fn same(a: Dimension, b: Dimension) -> bool {
+    return same_exponent(a.length, b.length) and
+    same_exponent(a.mass, b.mass) and same_exponent(a.time, b.time) and
+    same_exponent(a.current, b.current) and
+    same_exponent(a.temperature, b.temperature) and
+    same_exponent(a.amount, b.amount) and
+    same_exponent(a.luminosity, b.luminosity)
+}
+
+/// Whether a dimension is dimensionless.
+pub fn is_scalar(d: Dimension) -> bool {
+    return same(d, scalar())
+}
+
+/// The exponents in the SI brochure's order.
+pub fn exponents(d: Dimension) -> [Exponent] {
+    return [d.length, d.mass, d.time, d.current, d.temperature, d.amount,
+        d.luminosity]
+}
+
+/// The base symbols, in the same order.
+pub fn base_symbols() -> [str] {
+    return ["L", "M", "T", "I", "TH", "N", "J"]
+}
+
+/// A dimension written the way a textbook writes it.
+pub fn show(d: Dimension) -> str {
+    var out = ""
+    var i = 0
+    let symbols = base_symbols()
+    for e in exponents(d) {
+        if e.numerator != 0 {
+            out = out + symbols[i] + show_exponent(e)
+        }
+        i = i + 1
+    }
+    if out == "" {
+        return "1"
+    }
+    return out
+}
+
+fn show_exponent(e: Exponent) -> str {
+    if e.denominator == 1 and e.numerator == 1 {
+        return ""
+    }
+    if e.denominator == 1 {
+        return "^{e.numerator}"
+    }
+    return "^{e.numerator}/{e.denominator}"
+}
+
+// ------------------------------------------------- the dimensions that have
+// ------------------------------------------------- names
+
+/// Length.
+pub fn length() -> Dimension {
+    return of(1, 0, 0, 0, 0, 0, 0)
+}
+
+pub fn mass() -> Dimension {
+    return of(0, 1, 0, 0, 0, 0, 0)
+}
+
+pub fn time() -> Dimension {
+    return of(0, 0, 1, 0, 0, 0, 0)
+}
+
+pub fn current() -> Dimension {
+    return of(0, 0, 0, 1, 0, 0, 0)
+}
+
+pub fn temperature() -> Dimension {
+    return of(0, 0, 0, 0, 1, 0, 0)
+}
+
+pub fn amount() -> Dimension {
+    return of(0, 0, 0, 0, 0, 1, 0)
+}
+
+pub fn luminosity() -> Dimension {
+    return of(0, 0, 0, 0, 0, 0, 1)
+}
+
+/// Speed: length over time.
+pub fn velocity() -> Dimension {
+    return divide(length(), time())
+}
+
+pub fn acceleration() -> Dimension {
+    return divide(velocity(), time())
+}
+
+/// Force: mass times acceleration, which is the newton.
+pub fn force() -> Dimension {
+    return multiply(mass(), acceleration())
+}
+
+/// Energy: force times distance, which is the joule.
+///
+/// The same dimension as torque, which is force times distance too. They are
+/// not the same quantity, and no dimensional analysis will ever say so — the
+/// difference is that one is a dot product and the other a cross product,
+/// which is geometry rather than dimension.
+pub fn energy() -> Dimension {
+    return multiply(force(), length())
+}
+
+pub fn power_dimension() -> Dimension {
+    return divide(energy(), time())
+}
+
+pub fn pressure() -> Dimension {
+    return divide(force(), power(length(), whole(2)))
+}
+
+pub fn charge() -> Dimension {
+    return multiply(current(), time())
+}
+
+pub fn voltage() -> Dimension {
+    return divide(power_dimension(), current())
+}
+
+pub fn resistance() -> Dimension {
+    return divide(voltage(), current())
+}
+
+pub fn frequency() -> Dimension {
+    return invert(time())
+}
+
+/// The name a dimension is known by, or the empty string.
+pub fn name_of(d: Dimension) -> str {
+    let names = ["length", "mass", "time", "current", "temperature",
+        "amount", "luminosity", "velocity", "acceleration", "force",
+        "energy", "power", "pressure", "charge", "voltage", "resistance",
+        "frequency", "dimensionless"]
+    let known = [length(), mass(), time(), current(), temperature(),
+        amount(), luminosity(), velocity(), acceleration(), force(),
+        energy(), power_dimension(), pressure(), charge(), voltage(),
+        resistance(), frequency(), scalar()]
+    var i = 0
+    while i < known.len() {
+        if same(d, known[i]) {
+            return names[i]
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+/// Whether two quantities can be added.
+///
+/// The only question dimensional analysis actually answers, and the reason
+/// it is worth carrying: a length plus a time is not a slightly wrong number,
+/// it is not a number.
+pub fn addable(a: Dimension, b: Dimension) -> bool {
+    return same(a, b)
+}
+
+/// Two dimensions checked for addition, with the offender named.
+pub fn check_add(a: Dimension, b: Dimension) -> Dimension ! DimensionError {
+    if not same(a, b) {
+        fail(Mismatch(show(a), show(b)))
+    }
+    return a
+}
+
+/// Whether every exponent is a whole number.
+///
+/// A dimension with a fractional exponent is legal and rare. Anything that is
+/// not is usually a root taken one time too many.
+pub fn is_integral(d: Dimension) -> bool {
+    for e in exponents(d) {
+        if reduce(e).denominator != 1 {
+            return false
+        }
+    }
+    return true
+}
+
+/// The exponent as a number, for printing and comparison.
+pub fn as_f64(e: Exponent) -> f64 {
+    return e.numerator.as_f64() / e.denominator.as_f64()
+}

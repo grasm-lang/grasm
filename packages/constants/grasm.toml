@@ -1,0 +1,6 @@
+[package]
+name = "constants"
+version = "1.0.0"
+
+# A table of numbers. Opens nothing.
+capabilities = []

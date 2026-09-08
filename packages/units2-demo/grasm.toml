@@ -1,0 +1,24 @@
+[package]
+name = "units2_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.dimension]
+path = "../dimension"
+version = "^1.0.0"
+
+[dependencies.siunits]
+path = "../siunits"
+version = "^1.0.0"
+
+[dependencies.unitparse]
+path = "../unitparse"
+version = "^1.0.0"
+
+[dependencies.constants]
+path = "../constants"
+version = "^1.0.0"
+
+[dependencies.uncertainty]
+path = "../uncertainty"
+version = "^1.0.0"

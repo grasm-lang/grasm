@@ -1,0 +1,10 @@
+[package]
+name = "siunits"
+version = "1.0.0"
+
+# A table of units. Opens nothing.
+capabilities = []
+
+[dependencies.dimension]
+path = "../dimension"
+version = "^1.0.0"
