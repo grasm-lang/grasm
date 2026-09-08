@@ -1,0 +1,6 @@
+[package]
+name = "slo"
+version = "1.0.0"
+
+# Arithmetic. Opens nothing — no clock, no alerting.
+capabilities = []

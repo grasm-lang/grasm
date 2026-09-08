@@ -1,0 +1,6 @@
+[package]
+name = "otelspan"
+version = "1.0.0"
+
+# Text in, context out. Opens nothing — no exporter, no clock.
+capabilities = []

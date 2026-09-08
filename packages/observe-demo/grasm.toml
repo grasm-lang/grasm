@@ -1,0 +1,24 @@
+[package]
+name = "observe_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.otelspan]
+path = "../otelspan"
+version = "^1.0.0"
+
+[dependencies.prometheus]
+path = "../prometheus"
+version = "^1.0.0"
+
+[dependencies.logsample]
+path = "../logsample"
+version = "^1.0.0"
+
+[dependencies.errorgroup]
+path = "../errorgroup"
+version = "^1.0.0"
+
+[dependencies.slo]
+path = "../slo"
+version = "^1.0.0"

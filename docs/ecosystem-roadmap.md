@@ -14,7 +14,7 @@ plan that discovers them 300 packages in.
 | | |
 |---|---|
 | Started | 78 |
-| Now | 264 |
+| Now | 269 |
 | Tier 1 target | 200 |
 | Tier 2 target | 500 |
 | Tier 3 target | 800 |
@@ -180,7 +180,7 @@ outside implementation wherever one exists.
 | ~~Statistics~~ | ~~`regression` `distributions` `hypothesis` `sampling` `outliers`~~ — done |
 | ~~Game and graphics~~ | ~~`collision` `quadtree` `astar` `tilemap` `palette`~~ — done |
 | ~~Networking~~ | ~~`whois` `tftp` `socks5` `gopher` `netdiscovery`~~ — done |
-| Observability | `otelspan` `prometheus` `logsample` `errorgroup` `slo` |
+| ~~Observability~~ | ~~`otelspan` `prometheus` `logsample` `errorgroup` `slo`~~ — done |
 | Terminal UI | `tuibox` `keymap` `editline` `prompt` `autocomplete` |
 | Cryptography | `argon2` `bcrypt` ~~`rsa`~~ `ed25519` ~~`pemfile`~~ — two done |
 | Certificates | `csr` `jwk` `pkcs7` `ocsp` ~~`certchain`~~ — one done, plus `hostmatch` |

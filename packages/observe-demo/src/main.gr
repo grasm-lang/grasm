@@ -1,0 +1,598 @@
+import otelspan
+import prometheus
+import logsample
+import errorgroup
+import slo
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn near(a: f64, b: f64, tolerance: f64) -> bool {
+    let d = a - b
+    return (if d < 0.0 { 0.0 - d } else { d }) <= tolerance
+}
+
+// ---------------------------------------------------------- otelspan
+
+fn valid_header() -> str {
+    return "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+}
+
+fn empty_context() -> TraceContext {
+    return TraceContext{ version: "", trace_id: "", span_id: "", flags: 0,
+        extra: "" }
+}
+
+fn check_trace(inout f: i64) / {io} {
+    print("-- otelspan: fixed width, lower case, and an all-zero id is invalid")
+    // The example header from the W3C Trace Context specification.
+    let c = otelspan.parse_traceparent(valid_header()) ?? empty_context()
+    say(f, "the specification's own example parses",
+        c.trace_id == "4bf92f3577b34da6a3ce929d0e0e4736" and
+        c.span_id == "00f067aa0ba902b7" and c.flags == 1)
+    say(f, "the sampled bit is set", otelspan.is_sampled(c))
+    say(f, "and it renders back byte for byte",
+        (otelspan.render_traceparent(c) ?? "") == valid_header())
+    // The four strictness rules.
+    say(f, "an upper-case id is invalid, so two systems can compare as text",
+        not otelspan.can_continue(
+            "00-4BF92F3577B34DA6A3CE929D0E0E4736-00f067aa0ba902b7-01"))
+    say(f, "an all-zero trace id is invalid, not unset",
+        not otelspan.can_continue(
+            "00-00000000000000000000000000000000-00f067aa0ba902b7-01"))
+    say(f, "and so is an all-zero span id",
+        not otelspan.can_continue(
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-0000000000000000-01"))
+    say(f, "a short id is invalid, because the format is fixed width",
+        not otelspan.can_continue(
+            "00-4bf92f3577b34da6a3ce929d0e473-00f067aa0ba902b7-01"))
+    say(f, "version ff is reserved and never valid",
+        not otelspan.can_continue(
+            "ff-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"))
+    say(f, "a version 00 header with extra fields is invalid",
+        not otelspan.can_continue(valid_header() + "-extra"))
+    // But a future version is not an error.
+    let future = otelspan.parse_traceparent(
+        "cc-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-what") ??
+    empty_context()
+    say(f, "a future version is accepted, with the fields it does not know " +
+        "kept",
+        future.trace_id == "4bf92f3577b34da6a3ce929d0e0e4736" and
+        future.extra == "what")
+    say(f, "and is written back at the version this system understands",
+        (otelspan.render_traceparent(future) ?? "").starts_with("00-"))
+    say(f, "a child keeps the trace and takes a new span id",
+        (otelspan.child_of(c, "1234567890abcdef") ??
+            empty_context()).trace_id == c.trace_id and
+        (otelspan.child_of(c, "1234567890abcdef") ??
+            empty_context()).span_id == "1234567890abcdef")
+    say(f, "the sampled bit can be cleared and set",
+        not otelspan.is_sampled(otelspan.with_sampled(c, false)) and
+        otelspan.is_sampled(otelspan.with_sampled(
+            otelspan.with_sampled(c, false), true)))
+    check_tracestate(f, c)
+}
+
+fn check_tracestate(inout f: i64, c: TraceContext) / {io} {
+    let entries = otelspan.parse_tracestate("rojo=00f067aa0ba902b7,congo=t61rcWkgMzE") ?? []
+    say(f, "a tracestate is a list in order, most recent writer first",
+        entries.len() == 2 and entries[0].key == "rojo")
+    say(f, "an entry's value is found by key",
+        otelspan.entry_value(entries, "congo") == Some("t61rcWkgMzE"))
+    let updated = otelspan.put_first(entries, "congo", "ucfJifl5GOE") ?? []
+    say(f, "writing an entry moves it to the front rather than duplicating it",
+        updated.len() == 2 and updated[0].key == "congo" and
+        updated[0].value == "ucfJifl5GOE")
+    say(f, "and it renders back as a comma-separated list",
+        otelspan.render_tracestate(updated) ==
+        "congo=ucfJifl5GOE,rojo=00f067aa0ba902b7")
+    say(f, "an upper-case key is invalid",
+        not otelspan.is_valid_key("Rojo") and otelspan.is_valid_key("rojo"))
+    say(f, "a tenant key may have one @ and no more",
+        otelspan.is_valid_key("rojo@vendor") and
+        not otelspan.is_valid_key("a@b@c"))
+    say(f, "a malformed entry is refused",
+        tracestate_refuses("=novalue"))
+    // Sampling.
+    say(f, "sampling is a function of the trace id, so every service agrees",
+        otelspan.should_sample(c.trace_id, 10000) and
+        not otelspan.should_sample(c.trace_id, 0))
+    say(f, "which means two services asked the same question give the same " +
+        "answer",
+        otelspan.should_sample(c.trace_id, 5000) ==
+        otelspan.should_sample(c.trace_id, 5000))
+    say(f, "the headers come out as a pair",
+        (otelspan.headers_for(c, updated) ?? []).len() == 2)
+}
+
+fn tracestate_refuses(text: str) -> bool {
+    match otelspan.parse_tracestate(text) {
+        Ok(_v) -> return false
+        Err(_x) -> return true
+    }
+}
+
+// -------------------------------------------------------- prometheus
+
+fn observations() -> [f64] {
+    return [0.003, 0.02, 0.02, 0.3, 0.7, 1.5, 4.0, 12.0]
+}
+
+fn a_histogram() -> PromMetric {
+    let boundaries = prometheus.default_latency_buckets()
+    return prometheus.histogram("request_duration_seconds",
+        "Request duration.", [prometheus.label("handler", "root")],
+        boundaries, prometheus.cumulative_counts(boundaries, observations()),
+        18.543) ?? prometheus.gauge("x", "", [], 0.0)
+}
+
+fn check_prometheus(inout f: i64) / {io} {
+    print("-- prometheus: buckets are cumulative, and a summary cannot be " +
+        "aggregated")
+    // `prometheus_client`'s own parser reads everything this writes.
+    let counter = prometheus.counter("http_requests_total", "Requests.",
+        [prometheus.label("code", "200"), prometheus.label("path", "/a\"b")],
+        1027.0) ?? prometheus.gauge("x", "", [], 0.0)
+    let text = prometheus.render([counter]) ?? ""
+    say(f, "a counter writes its HELP, its TYPE and one sample",
+        text == "# HELP http_requests_total Requests.\n" +
+        "# TYPE http_requests_total counter\n" +
+        "http_requests_total\{code=\"200\",path=\"/a" +
+        "\\\"b\"} 1027\n")
+    say(f, "a quote in a label value is escaped",
+        text.contains("path=\"/a\\\"b\""))
+    say(f, "a negative counter is refused, because a counter only goes up",
+        counter_refuses(0.0 - 1.0))
+    say(f, "a label name beginning with two underscores is refused",
+        not prometheus.is_valid_label("__name__") and
+        prometheus.is_valid_label("code"))
+    say(f, "and a metric name with a hyphen is",
+        not prometheus.is_valid_name("a-b") and
+        prometheus.is_valid_name("a_b:c"))
+    // The histogram rules.
+    let counts = prometheus.cumulative_counts(
+        prometheus.default_latency_buckets(), observations())
+    say(f, "the bucket counts are cumulative, not per range",
+        counts[0] == 1 and counts[2] == 3 and
+        counts[counts.len() - 1] == 8)
+    say(f, "the +Inf bucket equals the count", histogram_has_infinity())
+    say(f, "a histogram with non-cumulative counts is refused",
+        histogram_refuses([1, 0, 3]))
+    say(f, "and one with unsorted boundaries is",
+        histogram_refuses_boundaries([1.0, 0.5]))
+    say(f, "a summary's values cannot be combined across instances",
+        not prometheus.is_aggregatable(PromSummary) and
+        prometheus.is_aggregatable(PromHistogram))
+    check_prometheus_more(f)
+}
+
+fn histogram_has_infinity() -> bool {
+    match prometheus.render_metric(a_histogram()) {
+        Ok(text) -> return text.contains("le=\"+Inf\"} 8")
+        Err(_x) -> return false
+    }
+}
+
+fn counter_refuses(value: f64) -> bool {
+    match prometheus.counter("a_total", "", [], value) {
+        Ok(_v) -> return false
+        Err(_x) -> return true
+    }
+}
+
+fn histogram_refuses(counts: [i64]) -> bool {
+    match prometheus.histogram("a", "", [], [1.0, 2.0], counts, 0.0) {
+        Ok(_v) -> return false
+        Err(_x) -> return true
+    }
+}
+
+fn histogram_refuses_boundaries(boundaries: [f64]) -> bool {
+    match prometheus.histogram("a", "", [], boundaries, [1, 2, 3], 0.0) {
+        Ok(_v) -> return false
+        Err(_x) -> return true
+    }
+}
+
+fn check_prometheus_more(inout f: i64) / {io} {
+    let text = prometheus.render_metric(a_histogram()) ?? ""
+    let back = prometheus.parse(text) ?? []
+    say(f, "a histogram parses back as one metric with fourteen samples",
+        back.len() == 1 and back[0].sample.len() == 14)
+    say(f, "with its buckets, its sum and its count grouped together",
+        prometheus.samples_named(back[0],
+            "request_duration_seconds_bucket").len() == 12)
+    let boundaries = prometheus.default_latency_buckets()
+    let counts = prometheus.cumulative_counts(boundaries, observations())
+    say(f, "a quantile is interpolated inside its bucket",
+        near(prometheus.quantile_from_buckets(boundaries, counts, 0.5), 0.5,
+            0.001))
+    say(f, "and one in the +Inf bucket can only be reported as the last " +
+        "boundary",
+        near(prometheus.quantile_from_buckets(boundaries, counts, 0.99), 10.0,
+            0.001))
+    // Rates and resets.
+    say(f, "a rate is the difference over the time",
+        near(prometheus.rate(100.0, 160.0, 30.0), 2.0, 0.000001))
+    say(f, "a counter that went down was reset, and the rate is what is " +
+        "there now",
+        prometheus.was_reset(100.0, 5.0) and
+        near(prometheus.rate(100.0, 5.0, 30.0), 5.0 / 30.0, 0.000001))
+    say(f, "not a large negative number", prometheus.rate(100.0, 5.0, 30.0) >
+        0.0)
+    say(f, "the specials have their own spellings",
+        prometheus.render_number(1.0 / 0.0) == "+Inf" and
+        prometheus.render_number(0.0 / 0.0) == "NaN")
+    say(f, "the default latency buckets span five orders of magnitude",
+        boundaries[0] == 0.005 and
+        boundaries[boundaries.len() - 1] == 10.0)
+}
+
+// -------------------------------------------------------- logsample
+
+fn check_logsample(inout f: i64) / {io} {
+    print("-- logsample: the same decision in every service, or the trace " +
+        "has holes")
+    say(f, "a decision on a key is the same every time it is asked",
+        logsample.keep_ratio("trace-a", 5000) ==
+        logsample.keep_ratio("trace-a", 5000))
+    say(f, "a ratio of zero keeps nothing and ten thousand keeps everything",
+        not logsample.keep_ratio("x", 0) and logsample.keep_ratio("x", 10000))
+    say(f, "over ten thousand keys, a 1% sample keeps about a hundred",
+        within(sampled_count(100), 100, 40))
+    say(f, "and a 10% sample about a thousand",
+        within(sampled_count(1000), 1000, 120))
+    // The difference between head and tail.
+    let head_errors = head_kept_errors()
+    let tail_errors = tail_kept_errors()
+    say(f, "a 1% head sample keeps about 1% of the errors",
+        head_errors < 40)
+    say(f, "a tail sample keeps all of them, which is the point",
+        tail_errors == 200)
+    say(f, "a slow request is kept even when it succeeded",
+        logsample.tail_decision("k", 200, 5000, 1000, 0).keep)
+    say(f, "and an ordinary fast one is not",
+        not logsample.tail_decision("k", 200, 5, 1000, 0).keep)
+    say(f, "each decision says why",
+        logsample.tail_decision("k", 500, 5, 1000, 0).reason ==
+        "the request failed")
+    check_logsample_more(f)
+}
+
+fn within(got: i64, want: i64, slack: i64) -> bool {
+    let d = got - want
+    return (if d < 0 { 0 - d } else { d }) <= slack
+}
+
+fn sampled_count(per_ten_thousand: i64) -> i64 {
+    var n = 0
+    for i in 0..10000 {
+        if logsample.keep_ratio("key-{i}", per_ten_thousand) {
+            n = n + 1
+        }
+    }
+    return n
+}
+
+fn head_kept_errors() -> i64 {
+    var n = 0
+    for i in 0..200 {
+        if logsample.head_decision("err-{i}", 100).keep {
+            n = n + 1
+        }
+    }
+    return n
+}
+
+fn tail_kept_errors() -> i64 {
+    var n = 0
+    for i in 0..200 {
+        if logsample.tail_decision("err-{i}", 500, 10, 1000, 100).keep {
+            n = n + 1
+        }
+    }
+    return n
+}
+
+fn check_logsample_more(inout f: i64) / {io} {
+    // The token bucket.
+    var bucket = logsample.new_bucket("endpoint", 2, 5, 0) ??
+    LogBucket{ key: "", tokens: 0, capacity: 0, refill: 0,
+        last_millis: 0 }
+    var allowed = 0
+    for _i in 0..10 {
+        if logsample.allow(bucket, 0) {
+            allowed = allowed + 1
+        }
+    }
+    say(f, "a burst of five is allowed and the sixth is not", allowed == 5)
+    say(f, "a second later there are two more", logsample.allow(bucket, 1000)
+        and logsample.allow(bucket, 1000) and
+        not logsample.allow(bucket, 1000))
+    say(f, "and the bucket never fills past its capacity",
+        refilled_capacity() == 5)
+    say(f, "a rate of zero is refused", bucket_refuses(0))
+    // Per-key limiting.
+    var limiter = logsample.new_limiter(1, 1)
+    let noisy = limiter_allowed(limiter, "noisy", 20)
+    let quiet = limiter_allowed(limiter, "quiet", 1)
+    say(f, "one noisy key is limited and does not starve another",
+        noisy == 1 and quiet == 1)
+    say(f, "the limiter tracks a bucket per key",
+        logsample.tracked_keys(limiter) == 2)
+    say(f, "and forgets the idle ones, so it does not grow forever",
+        forgotten() == 2)
+    // Reservoir.
+    var reservoir = logsample.new_reservoir(3)
+    for i in 0..10 {
+        logsample.offer(reservoir, "line-{i}", i % 3)
+    }
+    say(f, "a reservoir keeps a fixed number whatever the stream length",
+        logsample.sample_of(reservoir).len() == 3 and reservoir.seen == 10)
+    say(f, "and knows what chance each line had",
+        near(logsample.inclusion_probability(reservoir), 0.3, 0.0001))
+    // Reconstruction.
+    say(f, "a line from a 1% sample stands for a hundred",
+        near(logsample.weight_of(100), 100.0, 0.0001))
+    say(f, "so three sampled errors is an estimate of three hundred",
+        near(logsample.estimate_total(3, 100), 300.0, 0.0001))
+    say(f, "give or take about a hundred and seventy",
+        near(logsample.estimate_error(3, 100), 173.2, 0.2))
+    say(f, "and the rate belongs in the record, or nothing downstream can " +
+        "undo it",
+        logsample.context_for(logsample.head_decision("k", 100),
+            100).contains("rate=100"))
+}
+
+fn refilled_capacity() -> i64 {
+    var b = logsample.new_bucket("x", 2, 5, 0) ??
+    LogBucket{ key: "", tokens: 0, capacity: 0, refill: 0,
+        last_millis: 0 }
+    let _drain = logsample.allow(b, 0)
+    // A long quiet period must not accumulate more than the burst.
+    let _wait = logsample.allow(b, 1000000)
+    return logsample.available(b) + 1
+}
+
+fn bucket_refuses(rate: i64) -> bool {
+    match logsample.new_bucket("x", rate, 1, 0) {
+        Ok(_v) -> return false
+        Err(_x) -> return true
+    }
+}
+
+fn limiter_allowed(inout l: LogLimiter, key: str, attempts: i64) -> i64 {
+    var n = 0
+    for _i in 0..attempts {
+        if logsample.limiter_allow(l, key, 0) ?? false {
+            n = n + 1
+        }
+    }
+    return n
+}
+
+fn forgotten() -> i64 {
+    var l = logsample.new_limiter(1, 1)
+    let _a = logsample.limiter_allow(l, "a", 0) ?? false
+    let _b = logsample.limiter_allow(l, "b", 0) ?? false
+    return logsample.forget_idle(l, 100000, 1000)
+}
+
+// ------------------------------------------------------- errorgroup
+
+fn frames_a() -> [ErrorFrame] {
+    return [errorgroup.frame("handleOrder", "app/orders.rs", 42, true),
+        errorgroup.frame("parse", "/vendor/json/lib.rs", 91, false),
+        errorgroup.frame("main", "app/main.rs", 7, true)]
+}
+
+fn report_a(id: i64) -> ErrorReport {
+    return errorgroup.report("NotFoundError",
+        "order {id} not found for user 550e8400-e29b-41d4-a716-446655440000",
+        frames_a())
+}
+
+fn check_errorgroup(inout f: i64) / {io} {
+    print("-- errorgroup: two errors that differ by an id are one bug")
+    say(f, "a number in a message is instance data",
+        errorgroup.normalise_message("order 4711 not found") ==
+        "order <n> not found")
+    say(f, "so is a UUID",
+        errorgroup.normalise_message(
+            "user 550e8400-e29b-41d4-a716-446655440000 gone") ==
+        "user <uuid> gone")
+    say(f, "so is a long hex run",
+        errorgroup.normalise_message("at 0x7ffee3b0a8c0") == "at <hex>")
+    say(f, "and so is a quoted string",
+        errorgroup.normalise_message("column \"user_id\" missing") ==
+        "column <str> missing")
+    say(f, "two reports differing only by an id are the same bug",
+        errorgroup.same_bug(report_a(1), report_a(999), 3))
+    say(f, "and one with a different message shape is not",
+        not errorgroup.same_bug(report_a(1),
+            errorgroup.report("NotFoundError", "user not found", frames_a()),
+            3))
+    say(f, "nor is one of a different type",
+        not errorgroup.same_bug(report_a(1),
+            errorgroup.report("PermissionError", "order 1 not found",
+                frames_a()), 3))
+    // The stack.
+    say(f, "the library frames are dropped, so a shared parser does not " +
+        "merge unrelated bugs",
+        errorgroup.significant_frames(frames_a(), 5).len() == 2)
+    say(f, "a crash entirely inside a library still groups on something",
+        errorgroup.significant_frames(
+            [errorgroup.frame("x", "/vendor/a.rs", 1, false)], 5).len() == 1)
+    say(f, "and the library heuristic recognises the usual directories",
+        errorgroup.looks_like_library("/app/node_modules/x/index.js") and
+        errorgroup.looks_like_library("/usr/lib/python3/json.py") and
+        not errorgroup.looks_like_library("/srv/app/orders.rs"))
+    // The rule that decides whether a tracker survives six months.
+    say(f, "a fingerprint does not change when the lines move",
+        errorgroup.stable_across_lines(report_a(1), 3))
+    check_errorgroup_more(f)
+}
+
+fn many_reports() -> [ErrorReport] {
+    var out: [ErrorReport] = []
+    for i in 0..50 {
+        out.push(report_a(i))
+    }
+    for i in 0..5 {
+        out.push(errorgroup.report("TimeoutError",
+            "upstream timed out after {i * 100} ms", frames_a()))
+    }
+    out.push(errorgroup.report("PermissionError", "denied", frames_a()))
+    return out
+}
+
+fn check_errorgroup_more(inout f: i64) / {io} {
+    let groups = errorgroup.group(many_reports(), 3) ?? []
+    say(f, "fifty-six reports become three groups", groups.len() == 3)
+    say(f, "the largest holds fifty of them",
+        errorgroup.by_frequency(groups)[0].count == 50)
+    say(f, "and every report is accounted for",
+        errorgroup.total_reports(groups) == 56)
+    say(f, "the groups keep their order of first appearance, so a list does " +
+        "not reorder while it is read",
+        groups[0].count == 50 and groups[2].count == 1)
+    say(f, "a title is the type and the normalised message",
+        groups[0].title ==
+        "NotFoundError: order <n> not found for user <uuid>")
+    say(f, "the concentration says whether one bug is drowning the rest",
+        near(errorgroup.concentration(groups), 50.0 / 56.0, 0.001))
+    say(f, "no reports at all is refused", group_refuses())
+    say(f, "and a stack renders for display",
+        errorgroup.render_stack(frames_a()).contains("[library]"))
+}
+
+fn group_refuses() -> bool {
+    match errorgroup.group([], 3) {
+        Ok(_v) -> return false
+        Err(_x) -> return true
+    }
+}
+
+// -------------------------------------------------------------- slo
+
+fn three_nines() -> SloTarget {
+    return SloTarget{ objective: 0.999, window_seconds: slo.thirty_days() }
+}
+
+fn check_slo(inout f: i64) / {io} {
+    print("-- slo: a burn rate, because a single threshold cannot alert on a " +
+        "budget")
+    say(f, "three nines over thirty days is 43 minutes and 12 seconds",
+        near(slo.budget_seconds(three_nines()) ?? 0.0, 2592.0, 0.001) and
+        slo.duration_text(slo.budget_seconds(three_nines()) ?? 0.0) ==
+        "43m 12s")
+    say(f, "and 8 hours 45 minutes a year",
+        near(slo.yearly_downtime(0.999), 31536.0, 1.0))
+    say(f, "four nines is 52 minutes a year",
+        near(slo.yearly_downtime(0.9999) / 60.0, 52.56, 0.01))
+    say(f, "the nines convert both ways",
+        near(slo.nines_of(0.999), 3.0, 0.0001) and
+        near(slo.availability_for_nines(3.0), 0.999, 0.000001))
+    // The averaging mistake.
+    let days = [SloStatus{ good: 10, total: 10 },
+        SloStatus{ good: 9000000, total: 10000000 }]
+    say(f, "availability comes from the counts",
+        near(slo.availability_of(days) ?? 0.0, 0.9000001, 0.000001))
+    say(f, "and not from the average of the daily percentages, which says " +
+        "95%",
+        near(slo.mean_of_daily(days) ?? 0.0, 0.95, 0.000001))
+    // Budgets and burn.
+    let spent = SloStatus{ good: 999000, total: 1000000 }
+    say(f, "a thousand failures in a million is exactly the budget",
+        near(slo.budget_spent(three_nines(), spent) ?? 0.0, 1.0, 0.000001) and
+        near(slo.budget_remaining(three_nines(), spent) ?? 0.0, 0.0,
+            0.000001))
+    say(f, "the burn rate is one when the budget is spent exactly over the " +
+        "window",
+        near(slo.burn_rate(three_nines(), spent) ?? 0.0, 1.0, 0.000001))
+    say(f, "14.4 is the rate that spends a thirty-day budget in two days",
+        near(slo.rate_for_exhaustion(three_nines(), 2.0 * 86400.0), 15.0,
+            0.6))
+    say(f, "and at that rate the budget lasts about two days",
+        near((slo.time_to_exhaustion(three_nines(), 14.4) ?? 0.0) / 86400.0,
+            2.08, 0.01))
+    say(f, "a burn rate of zero never exhausts it",
+        (slo.time_to_exhaustion(three_nines(), 0.0) ?? 0.0) < 0.0)
+    check_slo_alerting(f)
+}
+
+fn check_slo_alerting(inout f: i64) / {io} {
+    let windows = slo.recommended_windows()
+    say(f, "the four recommended windows are the workbook's",
+        windows.len() == 4 and near(windows[0].threshold, 14.4, 0.001) and
+        windows[0].long_seconds == 3600 and windows[0].short_seconds == 300)
+    say(f, "the fast page consumes 2% of the budget in an hour",
+        near(slo.budget_consumed_by(slo.page_fast(), three_nines()), 0.02,
+            0.0001))
+    say(f, "and the slow page 5% in six hours",
+        near(slo.budget_consumed_by(slo.page_slow(), three_nines()), 0.05,
+            0.0001))
+    // Why both windows.
+    say(f, "a window fires only when the long and the short both exceed it",
+        slo.window_fires(slo.page_fast(), 20.0, 20.0))
+    say(f, "so a spike that has stopped does not keep paging",
+        not slo.window_fires(slo.page_fast(), 20.0, 0.5))
+    say(f, "and a blip too small to matter does not page at all",
+        not slo.window_fires(slo.page_fast(), 2.0, 30.0))
+    say(f, "an outage pages", slo.should_page([20.0, 20.0], [20.0, 20.0]))
+    say(f, "a slow leak does not page but does raise a ticket",
+        not slo.should_page([2.0, 2.0], [2.0, 2.0]) and
+        slo.window_fires(slo.ticket_slowest(), 2.0, 2.0))
+    say(f, "and the most urgent firing window is the one reported",
+        (slo.firing_window(slo.recommended_windows(),
+            [20.0, 20.0, 20.0, 20.0], [20.0, 20.0, 20.0, 20.0]) ??
+            slo.ticket_slowest()).name == "page (fast burn)")
+    // Latency.
+    let durations = [0.05, 0.1, 0.2, 0.25, 0.9, 1.2]
+    say(f, "a latency objective is a proportion, not an average",
+        near(slo.latency_availability(durations, 0.3) ?? 0.0, 4.0 / 6.0,
+            0.0001))
+    say(f, "apdex counts a tolerable request as a half",
+        near(slo.apdex(durations, 0.25) ?? 0.0, (4.0 + 0.5) / 6.0, 0.0001))
+    say(f, "an objective outside zero to one is refused",
+        objective_refuses(1.0) and objective_refuses(0.0))
+    say(f, "and a window with no requests is",
+        status_refuses(SloStatus{ good: 0, total: 0 }))
+}
+
+fn objective_refuses(value: f64) -> bool {
+    match slo.budget_seconds(SloTarget{ objective: value,
+        window_seconds: 100 }) {
+        Ok(_v) -> return false
+        Err(_x) -> return true
+    }
+}
+
+fn status_refuses(s: SloStatus) -> bool {
+    match slo.burn_rate(three_nines(), s) {
+        Ok(_v) -> return false
+        Err(_x) -> return true
+    }
+}
+
+fn main() / {io} {
+    var f = 0
+
+    check_trace(f)
+    check_prometheus(f)
+    check_logsample(f)
+    check_errorgroup(f)
+    check_slo(f)
+
+    if f == 0 {
+        print("observability: every claim held")
+    } else {
+        print("observability: {f} failed")
+    }
+}

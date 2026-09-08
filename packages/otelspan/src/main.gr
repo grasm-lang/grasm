@@ -1,0 +1,361 @@
+// W3C Trace Context: the two headers that make a trace span two services.
+//
+// `traceparent` is a fixed-width string — `00-` then 32 hex digits of trace
+// id, `-` then 16 of span id, `-` then two of flags — and the strictness is
+// the point. It is fixed width so a proxy can rewrite it without parsing, and
+// a receiver that accepts a short id accepts a header that no other
+// implementation will.
+//
+// Four rules from the specification that an implementation has to get right,
+// and that this refuses on rather than working around:
+//
+// **An all-zero trace id or span id is invalid.** Not "unset" — invalid. A
+// service that receives one must start a new trace rather than continuing a
+// broken one, because every span it emits would join a trace that does not
+// exist.
+//
+// **The hex must be lower case.** `AA` is not a valid id. The rule exists so
+// that two systems comparing ids as strings agree, and an implementation that
+// emits upper case produces traces that look broken in half the tools.
+//
+// **A version it does not know is not an error.** Version `00` has three
+// fields; a future version may have more, and a receiver must accept the
+// extra fields and use the first three rather than refusing. Refusing is what
+// makes a deployment of the next version break every service that has not
+// been updated.
+//
+// **`tracestate` is a list of at most 32 entries, and the entry a system
+// writes goes at the front.** The order is the ordering of the systems, not
+// arbitrary — a system that appends to the end loses the information that it
+// was the most recent writer.
+//
+// The sampled flag is one bit and it is a *decision*, not a suggestion: a
+// service that receives `01` and drops the span breaks the trace, and one
+// that receives `00` and keeps it fills the backend with orphans.
+
+type TraceContext = {
+    version: str,
+    trace_id: str,
+    span_id: str,
+    flags: i64,
+    /// Anything after the third field, which a future version may add.
+    extra: str,
+}
+
+type TraceEntry = {
+    key: str,
+    value: str,
+}
+
+type TraceError =
+    | TraceBadShape(text: str)
+    | TraceBadVersion(text: str)
+    | TraceNotLowerHex(field: str, text: str)
+    | TraceAllZero(field: str)
+    | TraceTooManyEntries(count: i64)
+    | TraceBadKey(key: str)
+
+    /// The version this writes.
+pub fn version() -> str {
+    return "00"
+}
+
+/// The sampled bit.
+pub fn sampled_flag() -> i64 {
+    return 1
+}
+
+fn is_lower_hex(text: str, length: i64) -> bool {
+    if text.len() != length {
+        return false
+    }
+    for c in text.chars() {
+        let ok = (c >= "0" and c <= "9") or (c >= "a" and c <= "f")
+        if not ok {
+            return false
+        }
+    }
+    return true
+}
+
+fn is_all_zero(text: str) -> bool {
+    for c in text.chars() {
+        if c != "0" {
+            return false
+        }
+    }
+    return true
+}
+
+/// Parse a `traceparent`.
+pub fn parse_traceparent(text: str) -> TraceContext ! TraceError {
+    let trimmed = text.trim()
+    let parts = trimmed.split("-")
+    if parts.len() < 4 {
+        fail(TraceBadShape(trimmed))
+    }
+    let version_text = parts[0]
+    if not is_lower_hex(version_text, 2) {
+        fail(TraceBadVersion(version_text))
+    }
+    if version_text == "ff" {
+        // `ff` is reserved and is never valid.
+        fail(TraceBadVersion(version_text))
+    }
+    if not is_lower_hex(parts[1], 32) {
+        fail(TraceNotLowerHex("trace id", parts[1]))
+    }
+    if not is_lower_hex(parts[2], 16) {
+        fail(TraceNotLowerHex("span id", parts[2]))
+    }
+    if not is_lower_hex(parts[3], 2) {
+        fail(TraceNotLowerHex("flags", parts[3]))
+    }
+    if is_all_zero(parts[1]) {
+        fail(TraceAllZero("trace id"))
+    }
+    if is_all_zero(parts[2]) {
+        fail(TraceAllZero("span id"))
+    }
+    // Version 00 has exactly four fields; a later version may have more, and
+    // the extra ones are kept rather than refused.
+    if version_text == "00" and parts.len() != 4 {
+        fail(TraceBadShape(trimmed))
+    }
+    var extra = ""
+    if parts.len() > 4 {
+        var rest: [str] = []
+        for i in 4..parts.len() {
+            rest.push(parts[i])
+        }
+        extra = rest.join("-")
+    }
+    return TraceContext{ version: version_text, trace_id: parts[1],
+        span_id: parts[2], flags: parts[3].parse_int_base(16) ?? 0,
+        extra: extra }
+}
+
+/// Render a `traceparent`, always at version 00.
+///
+/// Always 00 even when the context came in at a later version: a system emits
+/// the version it understands, and passing through a version whose fields it
+/// did not read would claim an understanding it does not have.
+pub fn render_traceparent(c: TraceContext) -> str ! TraceError {
+    if not is_lower_hex(c.trace_id, 32) or is_all_zero(c.trace_id) {
+        fail(TraceNotLowerHex("trace id", c.trace_id))
+    }
+    if not is_lower_hex(c.span_id, 16) or is_all_zero(c.span_id) {
+        fail(TraceNotLowerHex("span id", c.span_id))
+    }
+    return version() + "-" + c.trace_id + "-" + c.span_id + "-" +
+    hex_pair(c.flags)
+}
+
+fn hex_pair(value: i64) -> str {
+    let digits = "0123456789abcdef"
+    let v = value.bit_and(255)
+    return digits.substr(v.ushr(4), 1) + digits.substr(v.bit_and(15), 1)
+}
+
+/// Whether the sampled bit is set.
+///
+/// A decision, not a suggestion: a service that receives `01` and drops the
+/// span leaves a hole in someone else's trace, and one that receives `00` and
+/// keeps it fills the backend with spans no trace refers to.
+pub fn is_sampled(c: TraceContext) -> bool {
+    return c.flags.bit_and(sampled_flag()) != 0
+}
+
+pub fn with_sampled(c: TraceContext, sampled: bool) -> TraceContext {
+    var flags = c.flags
+    if sampled {
+        flags = flags.bit_or(sampled_flag())
+    } else {
+        flags = flags.bit_and(255 - sampled_flag())
+    }
+    return TraceContext{ version: c.version, trace_id: c.trace_id,
+        span_id: c.span_id, flags: flags, extra: c.extra }
+}
+
+/// The context a child span carries: the same trace, a new span id.
+pub fn child_of(c: TraceContext,
+    new_span_id: str) -> TraceContext ! TraceError {
+    if not is_lower_hex(new_span_id, 16) or is_all_zero(new_span_id) {
+        fail(TraceNotLowerHex("span id", new_span_id))
+    }
+    return TraceContext{ version: version(), trace_id: c.trace_id,
+        span_id: new_span_id, flags: c.flags, extra: "" }
+}
+
+/// A fresh root context.
+pub fn root(trace_id: str, span_id: str,
+    sampled: bool) -> TraceContext ! TraceError {
+    if not is_lower_hex(trace_id, 32) or is_all_zero(trace_id) {
+        fail(TraceNotLowerHex("trace id", trace_id))
+    }
+    if not is_lower_hex(span_id, 16) or is_all_zero(span_id) {
+        fail(TraceNotLowerHex("span id", span_id))
+    }
+    return TraceContext{ version: version(), trace_id: trace_id,
+        span_id: span_id, flags: if sampled { 1 } else { 0 }, extra: "" }
+}
+
+/// Whether a header can be continued, or a new trace has to be started.
+///
+/// The question a receiving service asks. An invalid header is not an error
+/// to report to the caller — it is a signal to start a new trace, which is
+/// what the specification requires and what keeps one broken client from
+/// breaking a whole service's tracing.
+pub fn can_continue(header: str) -> bool {
+    match parse_traceparent(header) {
+        Ok(_c) -> return true
+        Err(_e) -> return false
+    }
+}
+
+// -------------------------------------------------------- tracestate
+
+/// The most entries a `tracestate` may carry.
+pub fn max_entries() -> i64 {
+    return 32
+}
+
+/// Parse a `tracestate`.
+///
+/// Order is preserved and is meaningful: the first entry is the system that
+/// wrote most recently. An implementation that sorts, or that appends its own
+/// entry at the end, loses that.
+pub fn parse_tracestate(text: str) -> [TraceEntry] ! TraceError {
+    var out: [TraceEntry] = []
+    if text.trim() == "" {
+        return out
+    }
+    for piece in text.split(",") {
+        let entry = piece.trim()
+        if entry == "" {
+            continue
+        }
+        let equals = entry.index_of("=") ?? (0 - 1)
+        if equals <= 0 {
+            fail(TraceBadKey(entry))
+        }
+        let key = entry.substr(0, equals)
+        if not is_valid_key(key) {
+            fail(TraceBadKey(key))
+        }
+        out.push(TraceEntry{ key: key,
+            value: entry.substr(equals + 1, entry.len() - equals - 1) })
+        if out.len() > max_entries() {
+            fail(TraceTooManyEntries(out.len()))
+        }
+    }
+    return out
+}
+
+/// Whether a key is legal.
+///
+/// Lower-case letters, digits, and `_-*/`, optionally with one `@` separating
+/// a tenant from a system. A key with an upper-case letter is invalid, which
+/// is the rule an implementation that uses a hostname as a key breaks.
+pub fn is_valid_key(key: str) -> bool {
+    if key.len() == 0 or key.len() > 256 {
+        return false
+    }
+    var ats = 0
+    for c in key.chars() {
+        if c == "@" {
+            ats = ats + 1
+        } else {
+            let ok = (c >= "a" and c <= "z") or (c >= "0" and c <= "9") or
+            c == "_" or c == "-" or c == "*" or c == "/"
+            if not ok {
+                return false
+            }
+        }
+    }
+    let first = key.substr(0, 1)
+    if not ((first >= "a" and first <= "z") or (first >= "0" and
+        first <= "9")) {
+        return false
+    }
+    return ats <= 1
+}
+
+/// Add or move an entry to the front, which is where the most recent writer
+/// belongs.
+///
+/// If the key is already present it is removed first, so a system that
+/// touches a trace twice appears once and at the front.
+pub fn put_first(entries: [TraceEntry], key: str,
+    value: str) -> [TraceEntry] ! TraceError {
+    if not is_valid_key(key) {
+        fail(TraceBadKey(key))
+    }
+    var out: [TraceEntry] = [TraceEntry{ key: key, value: value }]
+    for e in entries {
+        if e.key != key {
+            out.push(e)
+        }
+    }
+    // The oldest entries are dropped rather than the newest, because the
+    // limit exists to bound the header and the recent ones are the useful
+    // ones.
+    var trimmed: [TraceEntry] = []
+    for i in 0..out.len() {
+        if i < max_entries() {
+            trimmed.push(out[i])
+        }
+    }
+    return trimmed
+}
+
+pub fn render_tracestate(entries: [TraceEntry]) -> str {
+    var parts: [str] = []
+    for e in entries {
+        parts.push(e.key + "=" + e.value)
+    }
+    return parts.join(",")
+}
+
+pub fn entry_value(entries: [TraceEntry], key: str) -> Option[str] {
+    for e in entries {
+        if e.key == key {
+            return Some(e.value)
+        }
+    }
+    return None
+}
+
+// ----------------------------------------------------------- sampling
+
+/// Whether to sample, from the trace id alone.
+///
+/// Deterministic on the trace id, so every service in a trace makes the same
+/// decision without talking to the others — which is the only way a trace is
+/// complete. A sampler that used a random number per service would keep a
+/// fraction of each span and produce traces with holes in them.
+///
+/// `ratio` is per ten thousand: 100 is one percent.
+pub fn should_sample(trace_id: str, ratio_per_ten_thousand: i64) -> bool {
+    if ratio_per_ten_thousand <= 0 {
+        return false
+    }
+    if ratio_per_ten_thousand >= 10000 {
+        return true
+    }
+    // The low 8 hex digits, which is what the specification's own consistent
+    // sampling suggestion uses.
+    let tail = trace_id.substr(trace_id.len() - 8, 8)
+    let value = tail.parse_int_base(16) ?? 0
+    return value % 10000 < ratio_per_ten_thousand
+}
+
+/// The header pair a request should carry.
+pub fn headers_for(c: TraceContext,
+    state: [TraceEntry]) -> [(str, str)] ! TraceError {
+    var out: [(str, str)] = [("traceparent", try render_traceparent(c))]
+    if state.len() > 0 {
+        out.push(("tracestate", render_tracestate(state)))
+    }
+    return out
+}

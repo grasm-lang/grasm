@@ -1,0 +1,10 @@
+[package]
+name = "errorgroup"
+version = "1.0.0"
+
+# Text in, groups out. Opens nothing.
+capabilities = []
+
+[dependencies.crypto_hash]
+path = "../crypto_hash"
+version = "^1.0.0"

@@ -1,0 +1,6 @@
+[package]
+name = "prometheus"
+version = "1.0.0"
+
+# Text in, text out. Opens nothing — no HTTP endpoint, no clock.
+capabilities = []

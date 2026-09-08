@@ -1,0 +1,369 @@
+// Service level objectives: error budgets, burn rates, and why a single
+// threshold cannot alert on one.
+//
+// An SLO is a target — 99.9% of requests succeed over 30 days — and its
+// useful form is the **error budget**: the 0.1% that may fail, which is
+// 43 minutes and 12 seconds in a 30-day month. That number is what turns an
+// argument about reliability into arithmetic.
+//
+// The alerting is the part that is done badly almost everywhere, and the
+// reason is worth understanding:
+//
+// **Alerting on the SLI directly is either too slow or too noisy.** "Page
+// when the error rate over the last hour exceeds 0.1%" fires on a two-minute
+// blip that consumed 0.2% of the month's budget, and does not fire on a
+// steady 0.09% that consumes the whole budget in 30 days. Neither is what
+// anyone wanted.
+//
+// **The right signal is the burn rate**: how fast the budget is being spent,
+// as a multiple of the rate that would exhaust it exactly at the end of the
+// window. A burn rate of 1 spends the budget exactly; 14.4 spends it in two
+// days; 0.5 never spends it.
+//
+// **And one burn rate is not enough.** A single fast window catches an
+// outage and misses a slow leak; a single slow window catches the leak hours
+// late. The Google SRE workbook's answer is **multi-window, multi-burn-rate**:
+// alert when a long window *and* a short window both exceed a threshold. The
+// long window is the signal and the short window is the reset — without it an
+// alert stays firing for hours after the incident is over.
+//
+// The four recommended pairs are here as `page_fast`, `page_slow`,
+// `ticket_slow` and `ticket_slowest`, with the thresholds and windows from
+// the workbook, and `should_page` combines them.
+//
+// One more thing that is always got wrong: **availability is not the average
+// of daily availabilities**. A day with ten requests and a day with ten
+// million are not equal, and averaging their percentages weights them as
+// though they were. `availability_of` sums the counts.
+
+/// An objective: a target, over a window.
+type SloTarget = {
+    /// The fraction that must succeed, as a proportion: 0.999 for 99.9%.
+    objective: f64,
+    /// The window the objective is measured over, in seconds.
+    window_seconds: i64,
+}
+
+/// What has actually happened.
+type SloStatus = {
+    good: i64,
+    total: i64,
+}
+
+/// One burn-rate alerting window.
+type SloWindow = {
+    name: str,
+    /// The burn rate at or above which this window fires.
+    threshold: f64,
+    long_seconds: i64,
+    short_seconds: i64,
+}
+
+type SloError =
+    | SloBadObjective(value: f64)
+    | SloEmptyWindow
+    | SloNoRequests
+
+    /// Thirty days, the usual SLO window.
+pub fn thirty_days() -> i64 {
+    return 30 * 24 * 3600
+}
+
+/// The error budget as a fraction: what proportion may fail.
+pub fn budget_fraction(t: SloTarget) -> f64 ! SloError {
+    if t.objective <= 0.0 or t.objective >= 1.0 {
+        fail(SloBadObjective(t.objective))
+    }
+    return 1.0 - t.objective
+}
+
+/// The error budget in seconds of the window.
+///
+/// The number that makes an SLO concrete: 99.9% over thirty days is 43
+/// minutes and 12 seconds of downtime, and everyone's intuition about "three
+/// nines" is wrong until they see it.
+pub fn budget_seconds(t: SloTarget) -> f64 ! SloError {
+    return (try budget_fraction(t)) * t.window_seconds.as_f64()
+}
+
+/// The error budget in requests, given how many are expected.
+pub fn budget_requests(t: SloTarget, expected: i64) -> f64 ! SloError {
+    return (try budget_fraction(t)) * expected.as_f64()
+}
+
+/// Availability from counts, which is not the average of percentages.
+///
+/// A day with ten requests and a day with ten million are not equal, and
+/// averaging their percentages treats them as though they were — which is how
+/// a service reports 99.95% for a month in which its busiest hour failed
+/// completely.
+pub fn availability_of(days: [SloStatus]) -> f64 ! SloError {
+    var good = 0
+    var total = 0
+    for d in days {
+        good = good + d.good
+        total = total + d.total
+    }
+    if total == 0 {
+        fail(SloNoRequests)
+    }
+    return good.as_f64() / total.as_f64()
+}
+
+/// The average of the daily percentages, for showing what it gets wrong.
+pub fn mean_of_daily(days: [SloStatus]) -> f64 ! SloError {
+    if days.len() == 0 {
+        fail(SloNoRequests)
+    }
+    var total = 0.0
+    var counted = 0
+    for d in days {
+        if d.total > 0 {
+            total = total + d.good.as_f64() / d.total.as_f64()
+            counted = counted + 1
+        }
+    }
+    if counted == 0 {
+        fail(SloNoRequests)
+    }
+    return total / counted.as_f64()
+}
+
+/// How much of the budget has been spent, as a proportion.
+///
+/// Above 1 the budget is gone. This is the number a dashboard should show,
+/// because it answers "may we ship?" and a raw error rate does not.
+pub fn budget_spent(t: SloTarget, s: SloStatus) -> f64 ! SloError {
+    if s.total == 0 {
+        fail(SloNoRequests)
+    }
+    let allowed = try budget_fraction(t)
+    let failed = (s.total - s.good).as_f64() / s.total.as_f64()
+    return failed / allowed
+}
+
+/// What is left of the budget, as a proportion.
+pub fn budget_remaining(t: SloTarget, s: SloStatus) -> f64 ! SloError {
+    return 1.0 - (try budget_spent(t, s))
+}
+
+/// The burn rate: how fast the budget is going, as a multiple of the rate
+/// that would exhaust it exactly at the end of the window.
+///
+/// 1 spends the budget exactly. 14.4 spends it in two days. Below 1 it is
+/// never spent.
+pub fn burn_rate(t: SloTarget, s: SloStatus) -> f64 ! SloError {
+    if s.total == 0 {
+        fail(SloNoRequests)
+    }
+    let allowed = try budget_fraction(t)
+    let failed = (s.total - s.good).as_f64() / s.total.as_f64()
+    return failed / allowed
+}
+
+/// How long the budget lasts at this burn rate, in seconds.
+pub fn time_to_exhaustion(t: SloTarget, rate: f64) -> f64 ! SloError {
+    if rate <= 0.0 {
+        // Not burning: it never runs out.
+        return 0.0 - 1.0
+    }
+    let _check = try budget_fraction(t)
+    return t.window_seconds.as_f64() / rate
+}
+
+/// The burn rate that exhausts the budget in a given time.
+///
+/// The arithmetic behind the workbook's thresholds: 14.4 is the rate that
+/// spends a 30-day budget in two days, and 6 is the rate that spends it in
+/// five.
+pub fn rate_for_exhaustion(t: SloTarget, seconds: f64) -> f64 {
+    if seconds <= 0.0 {
+        return 0.0
+    }
+    return t.window_seconds.as_f64() / seconds
+}
+
+// -------------------------------------------------------- the alerting
+
+/// Page: 2% of the budget in an hour, with a five-minute reset window.
+///
+/// A burn rate of 14.4 exhausts a 30-day budget in two days. The short window
+/// is not a second signal — it is what stops the alert from staying up for an
+/// hour after the incident ends.
+pub fn page_fast() -> SloWindow {
+    return SloWindow{ name: "page (fast burn)", threshold: 14.4,
+        long_seconds: 3600, short_seconds: 300 }
+}
+
+/// Page: 5% of the budget in six hours.
+pub fn page_slow() -> SloWindow {
+    return SloWindow{ name: "page (slow burn)", threshold: 6.0,
+        long_seconds: 6 * 3600, short_seconds: 1800 }
+}
+
+/// Ticket: 10% of the budget in a day.
+pub fn ticket_slow() -> SloWindow {
+    return SloWindow{ name: "ticket (daily)", threshold: 3.0,
+        long_seconds: 24 * 3600, short_seconds: 2 * 3600 }
+}
+
+/// Ticket: 10% of the budget in three days.
+pub fn ticket_slowest() -> SloWindow {
+    return SloWindow{ name: "ticket (three days)", threshold: 1.0,
+        long_seconds: 3 * 24 * 3600, short_seconds: 6 * 3600 }
+}
+
+/// The four recommended windows.
+pub fn recommended_windows() -> [SloWindow] {
+    return [page_fast(), page_slow(), ticket_slow(), ticket_slowest()]
+}
+
+/// Whether a window fires, given the burn over its long and short periods.
+///
+/// Both must exceed the threshold. The long one alone stays firing for the
+/// length of the window after the problem is fixed; the short one alone fires
+/// on every blip.
+pub fn window_fires(w: SloWindow, long_rate: f64, short_rate: f64) -> bool {
+    return long_rate >= w.threshold and short_rate >= w.threshold
+}
+
+/// The most urgent window that fires, or `None`.
+pub fn firing_window(windows: [SloWindow], long_rates: [f64],
+    short_rates: [f64]) -> Option[SloWindow] {
+    let n = if windows.len() < long_rates.len() { windows.len() } else {
+        long_rates.len() }
+    for i in 0..n {
+        if i < short_rates.len() and
+        window_fires(windows[i], long_rates[i], short_rates[i]) {
+            return Some(windows[i])
+        }
+    }
+    return None
+}
+
+/// Whether anything should page a human.
+pub fn should_page(long_rates: [f64], short_rates: [f64]) -> bool {
+    let pages = [page_fast(), page_slow()]
+    for i in 0..pages.len() {
+        if i < long_rates.len() and i < short_rates.len() and
+        window_fires(pages[i], long_rates[i], short_rates[i]) {
+            return true
+        }
+    }
+    return false
+}
+
+/// How much of the budget a window's threshold represents.
+///
+/// The number the workbook's table is built from: a burn rate of 14.4 over an
+/// hour is 2% of a 30-day budget, which is what makes it worth waking someone
+/// for.
+pub fn budget_consumed_by(w: SloWindow, t: SloTarget) -> f64 {
+    return w.threshold * w.long_seconds.as_f64() / t.window_seconds.as_f64()
+}
+
+// ------------------------------------------------------------- latency
+
+/// Whether a latency SLI is met: the proportion under a threshold.
+///
+/// A latency objective is a *proportion*, not an average: "99% of requests
+/// under 300 ms" is a target a p99 can be checked against, and "average
+/// latency under 300 ms" is a target that a service with a 50 ms median and a
+/// 30-second tail meets.
+pub fn latency_availability(durations: [f64],
+    threshold: f64) -> f64 ! SloError {
+    if durations.len() == 0 {
+        fail(SloNoRequests)
+    }
+    var good = 0
+    for d in durations {
+        if d <= threshold {
+            good = good + 1
+        }
+    }
+    return good.as_f64() / durations.len().as_f64()
+}
+
+/// Apdex, with its own definition of "tolerable".
+///
+/// Satisfied counts 1, tolerating counts a half, frustrated counts 0, and the
+/// tolerating threshold is four times the satisfied one by convention. It is
+/// a single number that hides the distribution, which is why it has fallen
+/// out of favour — but it is still what a lot of monitoring reports.
+pub fn apdex(durations: [f64], satisfied_threshold: f64) -> f64 ! SloError {
+    if durations.len() == 0 {
+        fail(SloNoRequests)
+    }
+    let tolerating = satisfied_threshold * 4.0
+    var score = 0.0
+    for d in durations {
+        if d <= satisfied_threshold {
+            score = score + 1.0
+        } else {
+            if d <= tolerating {
+                score = score + 0.5
+            }
+        }
+    }
+    return score / durations.len().as_f64()
+}
+
+/// The number of nines an availability represents.
+///
+/// 0.999 is three. Useful because the conversation is always in nines and the
+/// arithmetic is always in fractions.
+pub fn nines_of(availability: f64) -> f64 {
+    if availability >= 1.0 {
+        return 100.0
+    }
+    if availability <= 0.0 {
+        return 0.0
+    }
+    return 0.0 - (1.0 - availability).log10()
+}
+
+/// The availability a number of nines represents.
+pub fn availability_for_nines(nines: f64) -> f64 {
+    return 1.0 - (10.0).powf_slo(0.0 - nines)
+}
+
+fn powf_slo(x: f64, y: f64) -> f64 {
+    if x <= 0.0 {
+        return 0.0
+    }
+    return (y * x.ln()).exp()
+}
+
+/// Downtime allowed per year at a given availability, in seconds.
+///
+/// The table everyone quotes: 99.9% is 8 hours 45 minutes a year, 99.99% is
+/// 52 minutes, 99.999% is 5 minutes 15 seconds.
+pub fn yearly_downtime(availability: f64) -> f64 {
+    return (1.0 - availability) * 365.0 * 24.0 * 3600.0
+}
+
+/// A duration as a readable string.
+pub fn duration_text(seconds: f64) -> str {
+    if seconds < 0.0 {
+        return "never"
+    }
+    let total = seconds.as_i64()
+    let days = total / 86400
+    let hours = total % 86400 / 3600
+    let minutes = total % 3600 / 60
+    let rest = total % 60
+    var parts: [str] = []
+    if days > 0 {
+        parts.push("{days}d")
+    }
+    if hours > 0 {
+        parts.push("{hours}h")
+    }
+    if minutes > 0 {
+        parts.push("{minutes}m")
+    }
+    if rest > 0 or parts.len() == 0 {
+        parts.push("{rest}s")
+    }
+    return parts.join(" ")
+}

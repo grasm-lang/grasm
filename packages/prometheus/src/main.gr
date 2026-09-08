@@ -1,0 +1,657 @@
+// The Prometheus text exposition format: writing it and reading it.
+//
+// The format is a line per sample and the rules that matter are the ones a
+// hand-rolled `format!` gets wrong:
+//
+// **A histogram is not one metric.** It is `_bucket` with a `le` label per
+// boundary, plus `_sum` and `_count`, and the buckets are **cumulative** —
+// each holds everything at or below its boundary, not just the values in its
+// range. A `+Inf` bucket is required and must equal `_count`. Emitting
+// per-range counts produces a histogram whose quantiles are nonsense and
+// whose graph looks plausible.
+//
+// **A summary's quantiles are not buckets.** `quantile="0.99"` is a
+// pre-computed value from the client, and it cannot be aggregated across
+// instances — averaging three servers' 99th percentiles gives a number that
+// is not any percentile of anything. That is the reason to prefer a
+// histogram, and it is why `is_aggregatable` exists.
+//
+// **A counter must only go up**, and a reset is detected by the value
+// dropping. `rate()` handles the reset; a dashboard that subtracts two
+// samples by hand shows a large negative spike every time a process restarts.
+//
+// **Label values are escaped and label names are not.** A value may contain a
+// quote, a backslash or a newline and all three are escaped; a name may
+// contain only `[a-zA-Z_][a-zA-Z0-9_]*` and one that does not is refused
+// rather than escaped, because there is no escape for it.
+//
+// **`_total` is the convention for a counter** and the OpenMetrics
+// requirement. A counter without it is accepted everywhere and reads as a
+// gauge to anyone scanning a dashboard.
+//
+// Checked against `prometheus_client`'s own parser, which reads what this
+// writes.
+
+type PromKind =
+    | PromCounter
+    | PromGauge
+    | PromHistogram
+    | PromSummary
+    | PromUntyped
+
+type PromLabel = {
+    name: str,
+    value: str,
+}
+
+type PromSample = {
+    name: str,
+    labels: [PromLabel],
+    value: f64,
+}
+
+type PromMetric = {
+    name: str,
+    kind: PromKind,
+    help: str,
+    sample: [PromSample],
+}
+
+type PromError =
+    | PromBadName(name: str)
+    | PromBadLabel(name: str)
+    | PromBucketsNotSorted(at: i64)
+    | PromNoInfinityBucket
+    | PromNegativeCounter(name: str, value: f64)
+    | PromMalformed(line: i64, text: str)
+
+pub fn kind_name(k: PromKind) -> str {
+    match k {
+        PromCounter -> return "counter"
+        PromGauge -> return "gauge"
+        PromHistogram -> return "histogram"
+        PromSummary -> return "summary"
+        PromUntyped -> return "untyped"
+    }
+}
+
+pub fn kind_from(text: str) -> PromKind {
+    let lowered = text.to_lower()
+    if lowered == "counter" {
+        return PromCounter
+    }
+    if lowered == "gauge" {
+        return PromGauge
+    }
+    if lowered == "histogram" {
+        return PromHistogram
+    }
+    if lowered == "summary" {
+        return PromSummary
+    }
+    return PromUntyped
+}
+
+/// Whether a metric name is legal.
+pub fn is_valid_name(name: str) -> bool {
+    if name.len() == 0 {
+        return false
+    }
+    var first = true
+    for c in name.chars() {
+        let letter = (c >= "a" and c <= "z") or (c >= "A" and c <= "Z") or
+        c == "_" or c == ":"
+        let digit = c >= "0" and c <= "9"
+        if first and not letter {
+            return false
+        }
+        if not first and not (letter or digit) {
+            return false
+        }
+        first = false
+    }
+    return true
+}
+
+/// Whether a label name is legal.
+///
+/// The same rule without the colon, and names beginning `__` are reserved for
+/// the server. A label called `__name__` on an exposed metric is silently
+/// dropped, which is why it is refused here.
+pub fn is_valid_label(name: str) -> bool {
+    if name.starts_with("__") {
+        return false
+    }
+    if name.contains(":") {
+        return false
+    }
+    return is_valid_name(name)
+}
+
+/// Escape a label value.
+///
+/// A backslash, a quote and a newline, in that order — reversing the order
+/// double-escapes the backslashes a quote introduced.
+pub fn escape_value(value: str) -> str {
+    return value.replace("\\", "\\\\").replace("\"", "\\\"")
+        .replace("\n", "\\n")
+}
+
+pub fn unescape_value(value: str) -> str {
+    var out = ""
+    var i = 0
+    while i < value.len() {
+        let c = value.substr(i, 1)
+        if c == "\\" and i + 1 < value.len() {
+            let next = value.substr(i + 1, 1)
+            if next == "n" {
+                out = out + "\n"
+            } else {
+                out = out + next
+            }
+            i = i + 2
+            continue
+        }
+        out = out + c
+        i = i + 1
+    }
+    return out
+}
+
+/// A number as Prometheus writes it.
+///
+/// The three specials have their own spellings — `+Inf`, `-Inf` and `NaN` —
+/// and a parser that reads them as text and a writer that emits `inf` do not
+/// interoperate.
+pub fn render_number(value: f64) -> str {
+    if value != value {
+        return "NaN"
+    }
+    if value > 1.7976931348623157e308 {
+        return "+Inf"
+    }
+    if value < 0.0 - 1.7976931348623157e308 {
+        return "-Inf"
+    }
+    if value == value.floor() and value < 1000000000000000.0 and
+    value > 0.0 - 1000000000000000.0 {
+        return "{value.as_i64()}"
+    }
+    return "{value}"
+}
+
+pub fn parse_number(text: str) -> f64 {
+    let trimmed = text.trim()
+    if trimmed == "+Inf" or trimmed == "Inf" {
+        return 1.7976931348623157e308 * 2.0
+    }
+    if trimmed == "-Inf" {
+        return 0.0 - 1.7976931348623157e308 * 2.0
+    }
+    if trimmed == "NaN" {
+        return (0.0).sqrt() / 0.0
+    }
+    return trimmed.parse_float() ?? 0.0
+}
+
+/// One sample line.
+pub fn render_sample(s: PromSample) -> str ! PromError {
+    if not is_valid_name(s.name) {
+        fail(PromBadName(s.name))
+    }
+    var out = s.name
+    if s.labels.len() > 0 {
+        var parts: [str] = []
+        for l in s.labels {
+            if not is_valid_label(l.name) {
+                fail(PromBadLabel(l.name))
+            }
+            parts.push(l.name + "=\"" + escape_value(l.value) + "\"")
+        }
+        out = out + "\{" + parts.join(",") + "}"
+    }
+    return out + " " + render_number(s.value)
+}
+
+/// A whole metric, with its `# HELP` and `# TYPE` lines.
+pub fn render_metric(m: PromMetric) -> str ! PromError {
+    if not is_valid_name(m.name) {
+        fail(PromBadName(m.name))
+    }
+    var lines: [str] = []
+    if m.help != "" {
+        // Only the backslash and the newline are escaped in help text, and
+        // the quote is not — which is the opposite of a label value.
+        lines.push("# HELP " + m.name + " " +
+            m.help.replace("\\", "\\\\").replace("\n", "\\n"))
+    }
+    lines.push("# TYPE " + m.name + " " + kind_name(m.kind))
+    for s in m.sample {
+        lines.push(try render_sample(s))
+    }
+    return lines.join("\n") + "\n"
+}
+
+/// Several metrics, as an exposition page.
+pub fn render(metrics: [PromMetric]) -> str ! PromError {
+    var out = ""
+    for m in metrics {
+        out = out + (try render_metric(m))
+    }
+    return out
+}
+
+// ------------------------------------------------------------ building
+
+pub fn label(name: str, value: str) -> PromLabel {
+    return PromLabel{ name: name, value: value }
+}
+
+pub fn counter(name: str, help: str, labels: [PromLabel],
+    value: f64) -> PromMetric ! PromError {
+    if value < 0.0 {
+        fail(PromNegativeCounter(name, value))
+    }
+    return PromMetric{ name: name, kind: PromCounter, help: help,
+        sample: [PromSample{ name: name, labels: labels, value: value }] }
+}
+
+pub fn gauge(name: str, help: str, labels: [PromLabel],
+    value: f64) -> PromMetric {
+    return PromMetric{ name: name, kind: PromGauge, help: help,
+        sample: [PromSample{ name: name, labels: labels, value: value }] }
+}
+
+/// A histogram from its boundaries and the counts at or below each.
+///
+/// The counts are **cumulative**, and this checks it: each must be at least
+/// the one before, and the last must equal the total. A histogram built from
+/// per-range counts passes every syntax check and produces quantiles that are
+/// wrong in a way no dashboard shows.
+pub fn histogram(name: str, help: str, labels: [PromLabel],
+    boundaries: [f64], cumulative: [i64],
+    sum: f64) -> PromMetric ! PromError {
+    if boundaries.len() + 1 != cumulative.len() {
+        fail(PromNoInfinityBucket)
+    }
+    for i in 1..boundaries.len() {
+        if boundaries[i] <= boundaries[i - 1] {
+            fail(PromBucketsNotSorted(i))
+        }
+    }
+    for i in 1..cumulative.len() {
+        if cumulative[i] < cumulative[i - 1] {
+            fail(PromBucketsNotSorted(i))
+        }
+    }
+    var samples: [PromSample] = []
+    for i in 0..boundaries.len() {
+        var with_le = labels
+        with_le.push(label("le", render_number(boundaries[i])))
+        samples.push(PromSample{ name: name + "_bucket", labels: with_le,
+            value: cumulative[i].as_f64() })
+    }
+    var infinite = labels
+    infinite.push(label("le", "+Inf"))
+    let total = cumulative[cumulative.len() - 1]
+    samples.push(PromSample{ name: name + "_bucket", labels: infinite,
+        value: total.as_f64() })
+    samples.push(PromSample{ name: name + "_sum", labels: labels,
+        value: sum })
+    samples.push(PromSample{ name: name + "_count", labels: labels,
+        value: total.as_f64() })
+    return PromMetric{ name: name, kind: PromHistogram, help: help,
+        sample: samples }
+}
+
+/// A summary from pre-computed quantiles.
+///
+/// Here for completeness and with a warning attached: these values cannot be
+/// aggregated. The 99th percentile of three servers is not the average of
+/// their 99th percentiles, and there is no operation that recovers it from
+/// them. A histogram can be aggregated; a summary cannot.
+pub fn summary(name: str, help: str, labels: [PromLabel],
+    quantiles: [f64], values: [f64], sum: f64, count: i64) -> PromMetric {
+    var samples: [PromSample] = []
+    let n = if quantiles.len() < values.len() { quantiles.len() } else {
+        values.len() }
+    for i in 0..n {
+        var with_q = labels
+        with_q.push(label("quantile", render_number(quantiles[i])))
+        samples.push(PromSample{ name: name, labels: with_q,
+            value: values[i] })
+    }
+    samples.push(PromSample{ name: name + "_sum", labels: labels,
+        value: sum })
+    samples.push(PromSample{ name: name + "_count", labels: labels,
+        value: count.as_f64() })
+    return PromMetric{ name: name, kind: PromSummary, help: help,
+        sample: samples }
+}
+
+/// Whether a metric's values survive being combined across instances.
+pub fn is_aggregatable(k: PromKind) -> bool {
+    match k {
+        PromSummary -> return false
+        _ -> return true
+    }
+}
+
+/// The buckets a latency histogram usually wants, in seconds.
+///
+/// Roughly logarithmic and covering five orders of magnitude, which is what a
+/// web service's latency actually spans. Linear buckets are the commonest
+/// mistake: ten buckets from 0 to 1 second put every fast request in the
+/// first one and every slow one in the last.
+pub fn default_latency_buckets() -> [f64] {
+    return [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]
+}
+
+/// Buckets spread logarithmically between two bounds.
+pub fn logarithmic_buckets(start: f64, factor: f64, count: i64) -> [f64] {
+    var out: [f64] = []
+    var value = start
+    for _i in 0..count {
+        out.push(value)
+        value = value * factor
+    }
+    return out
+}
+
+/// Which bucket a value falls in, given the boundaries.
+pub fn bucket_of(boundaries: [f64], value: f64) -> i64 {
+    for i in 0..boundaries.len() {
+        if value <= boundaries[i] {
+            return i
+        }
+    }
+    return boundaries.len()
+}
+
+/// Cumulative counts from a set of observations.
+pub fn cumulative_counts(boundaries: [f64], values: [f64]) -> [i64] {
+    var out: [i64] = []
+    for _i in 0..(boundaries.len() + 1) {
+        out.push(0)
+    }
+    for v in values {
+        let at = bucket_of(boundaries, v)
+        for i in at..out.len() {
+            out[i] = out[i] + 1
+        }
+    }
+    return out
+}
+
+// ------------------------------------------------------------- parsing
+
+/// Parse an exposition page.
+pub fn parse(text: str) -> [PromMetric] ! PromError {
+    var out: [PromMetric] = []
+    var help: [str] = []
+    var help_for: [str] = []
+    var kinds: [str] = []
+    var kind_for: [str] = []
+    var number = 0
+    var samples: [PromSample] = []
+    for raw in text.split("\n") {
+        number = number + 1
+        let line = raw.trim()
+        if line == "" {
+            continue
+        }
+        if line.starts_with("#") {
+            let parts = split_comment(line)
+            if parts.0 == "HELP" {
+                help_for.push(parts.1)
+                help.push(parts.2)
+            }
+            if parts.0 == "TYPE" {
+                kind_for.push(parts.1)
+                kinds.push(parts.2)
+            }
+            continue
+        }
+        samples.push(try parse_sample(line, number))
+    }
+    // Group the samples under the metric each belongs to, which is the name
+    // with any `_bucket`, `_sum` or `_count` suffix removed.
+    var names: [str] = []
+    for s in samples {
+        let base = base_name(s.name, kind_for, kinds)
+        var found = false
+        for n in names {
+            if n == base {
+                found = true
+            }
+        }
+        if not found {
+            names.push(base)
+        }
+    }
+    for name in names {
+        var mine: [PromSample] = []
+        for s in samples {
+            if base_name(s.name, kind_for, kinds) == name {
+                mine.push(s)
+            }
+        }
+        out.push(PromMetric{ name: name,
+            kind: kind_from(lookup(kind_for, kinds, name)),
+            help: lookup(help_for, help, name), sample: mine })
+    }
+    return out
+}
+
+fn lookup(keys: [str], values: [str], name: str) -> str {
+    for i in 0..keys.len() {
+        if keys[i] == name {
+            return values[i]
+        }
+    }
+    return ""
+}
+
+fn base_name(name: str, kind_for: [str], kinds: [str]) -> str {
+    for i in 0..kind_for.len() {
+        let declared = kind_for[i]
+        if name == declared {
+            return declared
+        }
+        if kinds[i].to_lower() == "histogram" or
+        kinds[i].to_lower() == "summary" {
+            if name == declared + "_bucket" or name == declared + "_sum" or
+            name == declared + "_count" {
+                return declared
+            }
+        }
+    }
+    return name
+}
+
+fn split_comment(line: str) -> (str, str, str) {
+    let body = line.substr(1, line.len() - 1).trim()
+    let parts = body.split(" ")
+    if parts.len() < 2 {
+        return ("", "", "")
+    }
+    var rest: [str] = []
+    for i in 2..parts.len() {
+        rest.push(parts[i])
+    }
+    return (parts[0], parts[1], rest.join(" "))
+}
+
+fn parse_sample(line: str, number: i64) -> PromSample ! PromError {
+    let brace = line.index_of("\{") ?? (0 - 1)
+    if brace < 0 {
+        let space = line.index_of(" ") ?? (0 - 1)
+        if space <= 0 {
+            fail(PromMalformed(number, line))
+        }
+        return PromSample{ name: line.substr(0, space), labels: [],
+            value: parse_number(line.substr(space + 1,
+                line.len() - space - 1)) }
+    }
+    let name = line.substr(0, brace)
+    let close = closing_brace(line, brace)
+    if close < 0 {
+        fail(PromMalformed(number, line))
+    }
+    let inside = line.substr(brace + 1, close - brace - 1)
+    let tail = line.substr(close + 1, line.len() - close - 1).trim()
+    return PromSample{ name: name, labels: try parse_labels(inside, number),
+        value: parse_number(tail) }
+}
+
+fn closing_brace(line: str, from: i64) -> i64 {
+    var i = from
+    var in_quotes = false
+    while i < line.len() {
+        let c = line.substr(i, 1)
+        if c == "\\" and in_quotes {
+            i = i + 2
+            continue
+        }
+        if c == "\"" {
+            in_quotes = not in_quotes
+        }
+        if c == "}" and not in_quotes {
+            return i
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+fn parse_labels(text: str, number: i64) -> [PromLabel] ! PromError {
+    var out: [PromLabel] = []
+    var i = 0
+    while i < text.len() {
+        while i < text.len() and (text.substr(i, 1) == "," or
+            text.substr(i, 1) == " ") {
+            i = i + 1
+        }
+        if i >= text.len() {
+            break
+        }
+        let equals = index_from(text, i, "=")
+        if equals < 0 {
+            fail(PromMalformed(number, text))
+        }
+        let name = text.substr(i, equals - i).trim()
+        var j = equals + 1
+        if j >= text.len() or text.substr(j, 1) != "\"" {
+            fail(PromMalformed(number, text))
+        }
+        j = j + 1
+        var value = ""
+        while j < text.len() and text.substr(j, 1) != "\"" {
+            if text.substr(j, 1) == "\\" and j + 1 < text.len() {
+                value = value + text.substr(j, 2)
+                j = j + 2
+                continue
+            }
+            value = value + text.substr(j, 1)
+            j = j + 1
+        }
+        out.push(PromLabel{ name: name, value: unescape_value(value) })
+        i = j + 1
+    }
+    return out
+}
+
+fn index_from(text: str, from: i64, what: str) -> i64 {
+    var i = from
+    while i < text.len() {
+        if text.substr(i, 1) == what {
+            return i
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+/// A sample's label value.
+pub fn label_value(s: PromSample, name: str) -> Option[str] {
+    for l in s.labels {
+        if l.name == name {
+            return Some(l.value)
+        }
+    }
+    return None
+}
+
+/// A metric's samples of one suffix, for reading a histogram back.
+pub fn samples_named(m: PromMetric, name: str) -> [PromSample] {
+    var out: [PromSample] = []
+    for s in m.sample {
+        if s.name == name {
+            out.push(s)
+        }
+    }
+    return out
+}
+
+// --------------------------------------------------------------- rates
+
+/// The rate between two counter samples, handling a reset.
+///
+/// A counter that goes down has been reset, and the right reading is that
+/// everything since the reset is new — not that the rate is negative. A
+/// dashboard that subtracts by hand shows a deep negative spike at every
+/// deployment.
+pub fn rate(before: f64, after: f64, seconds: f64) -> f64 {
+    if seconds <= 0.0 {
+        return 0.0
+    }
+    if after < before {
+        return after / seconds
+    }
+    return (after - before) / seconds
+}
+
+/// Whether a counter appears to have been reset between two samples.
+pub fn was_reset(before: f64, after: f64) -> bool {
+    return after < before
+}
+
+/// A quantile estimated from cumulative buckets, the way `histogram_quantile`
+/// does it.
+///
+/// Linear interpolation inside the bucket the quantile falls in, which is an
+/// estimate and not a measurement: with the default buckets, a 99th
+/// percentile between 1 and 2.5 seconds is reported somewhere in that range
+/// and the true value is unknown. That is the trade a histogram makes, and it
+/// is why the bucket boundaries have to cover the range that matters.
+pub fn quantile_from_buckets(boundaries: [f64], cumulative: [i64],
+    quantile: f64) -> f64 {
+    if cumulative.len() == 0 {
+        return 0.0
+    }
+    let total = cumulative[cumulative.len() - 1]
+    if total == 0 {
+        return 0.0
+    }
+    let wanted = quantile * total.as_f64()
+    var i = 0
+    while i < cumulative.len() and cumulative[i].as_f64() < wanted {
+        i = i + 1
+    }
+    if i >= boundaries.len() {
+        // In the `+Inf` bucket: the value is above the last boundary and how
+        // far above cannot be known.
+        if boundaries.len() == 0 {
+            return 0.0
+        }
+        return boundaries[boundaries.len() - 1]
+    }
+    let low = if i == 0 { 0.0 } else { boundaries[i - 1] }
+    let high = boundaries[i]
+    let below = if i == 0 { 0.0 } else { cumulative[i - 1].as_f64() }
+    let inside = cumulative[i].as_f64() - below
+    if inside <= 0.0 {
+        return high
+    }
+    return low + (high - low) * (wanted - below) / inside
+}

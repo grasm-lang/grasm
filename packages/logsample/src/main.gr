@@ -1,0 +1,313 @@
+// Deciding which log lines to keep, when keeping all of them is not an
+// option.
+//
+// A service at ten thousand requests a second producing one line each is
+// 864 million lines a day. Sampling is not a compromise at that volume, it is
+// the only way to have logs at all — and the way it is done decides whether
+// the logs are still useful.
+//
+// Four strategies, and what each is for:
+//
+// **Head sampling** — decide at the start, keep 1 in N. Cheap, and it throws
+// away the interesting requests along with the boring ones: the errors are
+// 0.1% of traffic and a 1% sample keeps one in a thousand of them.
+//
+// **Tail sampling** — decide at the end, when the outcome is known. Keep
+// every error, every slow request, and 1 in N of the rest. Needs the whole
+// request buffered before the decision, which is the cost, and it is what
+// almost everyone actually wants.
+//
+// **Rate limiting** — keep at most N a second, per key. The defence against
+// one endpoint's error loop drowning everything else. A token bucket, so a
+// burst after a quiet period is allowed.
+//
+// **Consistent sampling** — the decision is a function of a key, so every
+// service in a request makes the same one. This is the difference between a
+// 1% sample of complete traces and a 1% sample of spans, which is 1% of a
+// trace's spans and no complete trace at all.
+//
+// The last one is the one that is usually missing, and its absence is why a
+// sampled trace so often has holes in it.
+
+import crypto_hash
+
+/// A token bucket: a rate limit that allows a burst.
+type LogBucket = {
+    key: str,
+    /// Tokens available, scaled by 1000 so the arithmetic stays integer.
+    tokens: i64,
+    capacity: i64,
+    /// Tokens added a second, scaled by 1000.
+    refill: i64,
+    last_millis: i64,
+}
+
+/// What a decision was, and why.
+type LogDecision = {
+    keep: bool,
+    reason: str,
+}
+
+type LogError =
+    | LogBadRate(rate: i64)
+    | LogNoKey
+
+    /// The scale the bucket arithmetic uses.
+    ///
+    /// A thousandth of a token, so a rate of one line every ten seconds is
+    /// representable without floating point — which keeps the decision identical
+    /// on every engine.
+pub fn scale() -> i64 {
+    return 1000
+}
+
+/// Keep one in `n`, deterministically on a key.
+///
+/// Deterministic on the key, so every service handling the same request makes
+/// the same decision. A sampler that used a fresh random number per service
+/// keeps a fraction of each span and produces traces with holes — which is
+/// the commonest reason a sampled trace is useless.
+pub fn keep_one_in(key: str, n: i64) -> bool {
+    if n <= 1 {
+        return n == 1
+    }
+    let digest = crypto_hash.sha256_of(key.to_bytes())
+    var value = 0
+    for i in 0..4 {
+        value = value.shl(8).bit_or(digest.at(i))
+    }
+    return value % n == 0
+}
+
+/// Keep a proportion, per ten thousand: 100 is one percent.
+pub fn keep_ratio(key: str, per_ten_thousand: i64) -> bool {
+    if per_ten_thousand <= 0 {
+        return false
+    }
+    if per_ten_thousand >= 10000 {
+        return true
+    }
+    let digest = crypto_hash.sha256_of(key.to_bytes())
+    var value = 0
+    for i in 0..4 {
+        value = value.shl(8).bit_or(digest.at(i))
+    }
+    return value % 10000 < per_ten_thousand
+}
+
+/// A head decision: made before the work, on the key alone.
+pub fn head_decision(key: str, per_ten_thousand: i64) -> LogDecision {
+    if keep_ratio(key, per_ten_thousand) {
+        return LogDecision{ keep: true, reason: "in the head sample" }
+    }
+    return LogDecision{ keep: false, reason: "not in the head sample" }
+}
+
+/// A tail decision: made after the work, knowing what happened.
+///
+/// Everything that failed, everything slow, and a sample of the rest. This is
+/// what a head sample cannot do: errors are a fraction of a percent of
+/// traffic, and a 1% head sample keeps one error in a hundred.
+pub fn tail_decision(key: str, status: i64, duration_millis: i64,
+    slow_millis: i64, per_ten_thousand: i64) -> LogDecision {
+    if status >= 500 {
+        return LogDecision{ keep: true, reason: "the request failed" }
+    }
+    if status >= 400 {
+        return LogDecision{ keep: true, reason: "the client was refused" }
+    }
+    if duration_millis >= slow_millis {
+        return LogDecision{ keep: true, reason: "the request was slow" }
+    }
+    if keep_ratio(key, per_ten_thousand) {
+        return LogDecision{ keep: true, reason: "in the tail sample" }
+    }
+    return LogDecision{ keep: false, reason: "ordinary and not sampled" }
+}
+
+// ------------------------------------------------------ rate limiting
+
+/// A bucket that allows `per_second` lines with a burst of `burst`.
+pub fn new_bucket(key: str, per_second: i64, burst: i64,
+    now_millis: i64) -> LogBucket ! LogError {
+    if per_second <= 0 {
+        fail(LogBadRate(per_second))
+    }
+    if key == "" {
+        fail(LogNoKey)
+    }
+    return LogBucket{ key: key, tokens: burst * scale(),
+        capacity: burst * scale(), refill: per_second * scale(),
+        last_millis: now_millis }
+}
+
+/// Take a token if there is one.
+///
+/// The clock is a parameter, which is what keeps this package free of
+/// capabilities — and makes every test exact rather than timed.
+pub fn allow(inout b: LogBucket, now_millis: i64) -> bool {
+    let elapsed = now_millis - b.last_millis
+    if elapsed > 0 {
+        b.tokens = b.tokens + elapsed * b.refill / 1000
+        if b.tokens > b.capacity {
+            b.tokens = b.capacity
+        }
+        b.last_millis = now_millis
+    }
+    if b.tokens >= scale() {
+        b.tokens = b.tokens - scale()
+        return true
+    }
+    return false
+}
+
+/// How many whole lines the bucket would allow right now.
+pub fn available(b: LogBucket) -> i64 {
+    return b.tokens / scale()
+}
+
+/// A set of buckets, one per key.
+///
+/// Per key, because the point is that one endpoint's error loop must not
+/// drown the others — a single global limit lets it.
+type LogLimiter = {
+    bucket: [LogBucket],
+    per_second: i64,
+    burst: i64,
+}
+
+pub fn new_limiter(per_second: i64, burst: i64) -> LogLimiter {
+    return LogLimiter{ bucket: [], per_second: per_second, burst: burst }
+}
+
+pub fn limiter_allow(inout l: LogLimiter, key: str,
+    now_millis: i64) -> bool ! LogError {
+    for i in 0..l.bucket.len() {
+        if l.bucket[i].key == key {
+            return allow(l.bucket[i], now_millis)
+        }
+    }
+    var fresh = try new_bucket(key, l.per_second, l.burst, now_millis)
+    let allowed = allow(fresh, now_millis)
+    l.bucket.push(fresh)
+    return allowed
+}
+
+/// How many distinct keys the limiter is tracking.
+///
+/// Worth watching: a limiter keyed on something unbounded — a URL with an id
+/// in it — grows without limit and becomes the memory leak it was added to
+/// prevent.
+pub fn tracked_keys(l: LogLimiter) -> i64 {
+    return l.bucket.len()
+}
+
+/// Drop the buckets that have been idle, so the limiter does not grow
+/// forever.
+pub fn forget_idle(inout l: LogLimiter, now_millis: i64,
+    idle_millis: i64) -> i64 {
+    var kept: [LogBucket] = []
+    var dropped = 0
+    for b in l.bucket {
+        if now_millis - b.last_millis < idle_millis {
+            kept.push(b)
+        } else {
+            dropped = dropped + 1
+        }
+    }
+    l.bucket = kept
+    return dropped
+}
+
+// --------------------------------------------------------- reservoir
+
+/// A fixed-size sample of a stream of unknown length.
+///
+/// Every line has the same chance of ending up in the sample, whatever the
+/// length of the stream and without storing it. That is the property a "keep
+/// the first N" or "keep the last N" approach does not have, and it is what
+/// makes a reservoir the right structure for "show me a hundred examples of
+/// this error".
+type LogReservoir = {
+    kept: [str],
+    size: i64,
+    seen: i64,
+}
+
+pub fn new_reservoir(size: i64) -> LogReservoir {
+    return LogReservoir{ kept: [], size: size, seen: 0 }
+}
+
+/// Offer a line, with a random number the caller supplies.
+///
+/// `random_below_seen` must be a uniform value in `0..seen`, and it is a
+/// parameter because this package opens nothing — which also makes the
+/// behaviour exactly reproducible in a test.
+pub fn offer(inout r: LogReservoir, line: str, random_below_seen: i64) {
+    r.seen = r.seen + 1
+    if r.kept.len() < r.size {
+        r.kept.push(line)
+        return
+    }
+    if random_below_seen < r.size {
+        r.kept[random_below_seen] = line
+    }
+}
+
+pub fn sample_of(r: LogReservoir) -> [str] {
+    return r.kept
+}
+
+/// The chance any one line had of being kept.
+pub fn inclusion_probability(r: LogReservoir) -> f64 {
+    if r.seen == 0 {
+        return 0.0
+    }
+    if r.seen <= r.size {
+        return 1.0
+    }
+    return r.size.as_f64() / r.seen.as_f64()
+}
+
+// -------------------------------------------------------- reconstruction
+
+/// What one kept line represents, given the rate it was sampled at.
+///
+/// The number that has to be carried with the line and almost never is. A
+/// count of errors taken from a 1% sample is a hundredth of the truth, and a
+/// dashboard that does not multiply is wrong by two orders of magnitude with
+/// no indication.
+pub fn weight_of(per_ten_thousand: i64) -> f64 {
+    if per_ten_thousand <= 0 {
+        return 0.0
+    }
+    return 10000.0 / per_ten_thousand.as_f64()
+}
+
+/// The true count estimated from a sampled one.
+pub fn estimate_total(sampled_count: i64, per_ten_thousand: i64) -> f64 {
+    return sampled_count.as_f64() * weight_of(per_ten_thousand)
+}
+
+/// How wrong that estimate might be, as a standard error.
+///
+/// The uncertainty a sampled count carries, which is why a 1% sample that saw
+/// three errors should not be reported as "300 errors" without a range: the
+/// standard error on three observations is about 173.
+pub fn estimate_error(sampled_count: i64, per_ten_thousand: i64) -> f64 {
+    if sampled_count <= 0 {
+        return 0.0
+    }
+    let weight = weight_of(per_ten_thousand)
+    return sampled_count.as_f64().sqrt() * weight
+}
+
+/// A sampling decision as a line of structured log context.
+///
+/// The rate belongs in the record. Without it, nothing downstream can undo
+/// the sampling, and a count taken from the logs is silently wrong.
+pub fn context_for(decision: LogDecision, per_ten_thousand: i64) -> str {
+    return "sampled=" + (if decision.keep { "true" } else { "false" }) +
+    " reason=\"" + decision.reason + "\" rate=" +
+    "{per_ten_thousand}" + " weight={weight_of(per_ten_thousand)}"
+}

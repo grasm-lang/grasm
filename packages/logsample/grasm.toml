@@ -1,0 +1,10 @@
+[package]
+name = "logsample"
+version = "1.0.0"
+
+# Deciding what to keep. Opens nothing — the clock is a parameter.
+capabilities = []
+
+[dependencies.crypto_hash]
+path = "../crypto_hash"
+version = "^1.0.0"

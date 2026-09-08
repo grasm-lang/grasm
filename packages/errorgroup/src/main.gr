@@ -1,0 +1,379 @@
+// Grouping errors, so that a million reports become a dozen problems.
+//
+// Two errors that differ only by an order number are one bug. An error
+// tracker that groups by message text produces a million issues nobody can
+// read; one that groups by exception class alone produces four, of which
+// three are `RuntimeError`. The useful answer is in between, and it is
+// arrived at by *normalising* before grouping:
+//
+// **Replace what varies and keep what identifies.** Numbers, hex strings,
+// UUIDs, quoted strings, IP addresses, file paths with a variable component,
+// memory addresses and timestamps are all instance data. What is left — the
+// shape of the message — is the bug.
+//
+// **Group by the stack, not by the message, when there is one.** The message
+// is often formatted with a value in it and the frames are not. The top
+// frames of application code identify a bug better than anything in the text,
+// and the frames from libraries and the runtime should be dropped — a
+// `NullPointerException` in a JSON parser called from twelve places is twelve
+// bugs, not one, and the frame that distinguishes them is yours.
+//
+// **A fingerprint has to be stable across releases.** Including a line number
+// makes every issue new after a refactor that adds a blank line. Including
+// the function name does not.
+//
+// The last rule is the one that decides whether an error tracker is useful
+// after six months.
+
+import crypto_hash
+
+type ErrorFrame = {
+    function_name: str,
+    file_name: str,
+    line: i64,
+    /// Whether this frame is the application's rather than a library's.
+    is_application: bool,
+}
+
+type ErrorReport = {
+    kind: str,
+    message: str,
+    frames: [ErrorFrame],
+}
+
+type ErrorGroup = {
+    fingerprint: str,
+    /// The normalised message, for showing.
+    title: str,
+    count: i64,
+    /// The first report in the group, as an example.
+    example: ErrorReport,
+}
+
+type GroupError =
+    | GroupEmpty
+    | GroupNoFrames
+
+    /// Replace the parts of a message that vary between occurrences.
+    ///
+    /// The order matters: the longest and most specific patterns first, so that a
+    /// UUID is replaced as a UUID rather than as five separate hex runs.
+pub fn normalise_message(text: str) -> str {
+    var out = ""
+    var i = 0
+    while i < text.len() {
+        let rest = text.len() - i
+        // A UUID: 8-4-4-4-12 hex with hyphens.
+        if rest >= 36 and looks_like_uuid(text, i) {
+            out = out + "<uuid>"
+            i = i + 36
+            continue
+        }
+        // A quoted string is instance data almost every time.
+        if text.substr(i, 1) == "'" or text.substr(i, 1) == "\"" {
+            let quote = text.substr(i, 1)
+            let close = find_from(text, i + 1, quote)
+            if close > 0 {
+                out = out + "<str>"
+                i = close + 1
+                continue
+            }
+        }
+        // A hex run of eight or more, which covers addresses and hashes.
+        let hex = hex_run(text, i)
+        if hex >= 8 {
+            out = out + "<hex>"
+            i = i + hex
+            continue
+        }
+        let number = number_run(text, i)
+        if number > 0 {
+            out = out + "<n>"
+            i = i + number
+            continue
+        }
+        out = out + text.substr(i, 1)
+        i = i + 1
+    }
+    return collapse_spaces(out)
+}
+
+fn looks_like_uuid(text: str, at: i64) -> bool {
+    let shape = [8, 4, 4, 4, 12]
+    var i = at
+    for part in 0..shape.len() {
+        for _k in 0..shape[part] {
+            if i >= text.len() or not is_hex(text.substr(i, 1)) {
+                return false
+            }
+            i = i + 1
+        }
+        if part < shape.len() - 1 {
+            if i >= text.len() or text.substr(i, 1) != "-" {
+                return false
+            }
+            i = i + 1
+        }
+    }
+    return true
+}
+
+fn is_hex(c: str) -> bool {
+    return (c >= "0" and c <= "9") or (c >= "a" and c <= "f") or
+    (c >= "A" and c <= "F")
+}
+
+fn hex_run(text: str, at: i64) -> i64 {
+    var i = at
+    // `0x` is part of the run.
+    if text.substr(i, 2).to_lower() == "0x" {
+        i = i + 2
+    }
+    let start = i
+    while i < text.len() and is_hex(text.substr(i, 1)) {
+        i = i + 1
+    }
+    let length = i - start
+    if length >= 8 {
+        return i - at
+    }
+    return 0
+}
+
+fn number_run(text: str, at: i64) -> i64 {
+    var i = at
+    while i < text.len() and text.substr(i, 1) >= "0" and
+    text.substr(i, 1) <= "9" {
+        i = i + 1
+    }
+    if i > at and i < text.len() and text.substr(i, 1) == "." {
+        var j = i + 1
+        while j < text.len() and text.substr(j, 1) >= "0" and
+        text.substr(j, 1) <= "9" {
+            j = j + 1
+        }
+        if j > i + 1 {
+            return j - at
+        }
+    }
+    return i - at
+}
+
+fn find_from(text: str, from: i64, what: str) -> i64 {
+    var i = from
+    while i < text.len() {
+        if text.substr(i, 1) == what {
+            return i
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+fn collapse_spaces(text: str) -> str {
+    var out = ""
+    var space = false
+    for c in text.chars() {
+        if c == " " or c == "\t" or c == "\n" {
+            space = true
+        } else {
+            if space and out != "" {
+                out = out + " "
+            }
+            space = false
+            out = out + c
+        }
+    }
+    return out.trim()
+}
+
+/// The frames that identify a bug: the application's, from the top.
+///
+/// Library and runtime frames are dropped because they are shared by every
+/// bug that goes through them. A `NullPointerException` inside a JSON parser
+/// called from twelve places is twelve bugs, and the frame that tells them
+/// apart is in your code.
+pub fn significant_frames(frames: [ErrorFrame], most: i64) -> [ErrorFrame] {
+    var out: [ErrorFrame] = []
+    for frame in frames {
+        if frame.is_application and out.len() < most {
+            out.push(frame)
+        }
+    }
+    if out.len() == 0 {
+        // No application frames at all — the crash is entirely inside a
+        // library, and the library frames are all there is to group on.
+        for frame in frames {
+            if out.len() < most {
+                out.push(frame)
+            }
+        }
+    }
+    return out
+}
+
+/// The fingerprint of a report.
+///
+/// Built from the exception type, the normalised message and the function and
+/// file of the top application frames — and **not** the line numbers, because
+/// including them makes every issue new after a refactor that adds a blank
+/// line.
+pub fn fingerprint(r: ErrorReport, frame_depth: i64) -> str {
+    var parts: [str] = [r.kind, normalise_message(r.message)]
+    for frame in significant_frames(r.frames, frame_depth) {
+        parts.push(frame.function_name + "@" + frame.file_name)
+    }
+    let digest = crypto_hash.sha256_of(parts.join("\u{1}").to_bytes())
+    return crypto_hash.hex_of(digest).substr(0, 16)
+}
+
+/// Whether two reports are the same bug.
+pub fn same_bug(a: ErrorReport, b: ErrorReport, frame_depth: i64) -> bool {
+    return fingerprint(a, frame_depth) == fingerprint(b, frame_depth)
+}
+
+/// Group reports by fingerprint, in order of first appearance.
+///
+/// First appearance rather than count, so that the list is stable as counts
+/// change — a list that reorders itself while being read is a list nobody
+/// finishes reading.
+pub fn group(reports: [ErrorReport],
+    frame_depth: i64) -> [ErrorGroup] ! GroupError {
+    if reports.len() == 0 {
+        fail(GroupEmpty)
+    }
+    var out: [ErrorGroup] = []
+    for r in reports {
+        let print = fingerprint(r, frame_depth)
+        var found = false
+        for i in 0..out.len() {
+            if out[i].fingerprint == print {
+                out[i] = ErrorGroup{ fingerprint: print, title: out[i].title,
+                    count: out[i].count + 1, example: out[i].example }
+                found = true
+            }
+        }
+        if not found {
+            out.push(ErrorGroup{ fingerprint: print,
+                title: title_of(r), count: 1, example: r })
+        }
+    }
+    return out
+}
+
+/// A group's title: the type and the normalised message.
+pub fn title_of(r: ErrorReport) -> str {
+    let message = normalise_message(r.message)
+    if message == "" {
+        return r.kind
+    }
+    return r.kind + ": " + message
+}
+
+/// The groups, most frequent first.
+pub fn by_frequency(groups: [ErrorGroup]) -> [ErrorGroup] {
+    var out = groups
+    for i in 0..out.len() {
+        var best = i
+        for j in (i + 1)..out.len() {
+            if out[j].count > out[best].count {
+                best = j
+            }
+        }
+        let t = out[i]
+        out[i] = out[best]
+        out[best] = t
+    }
+    return out
+}
+
+/// How many reports a set of groups accounts for.
+pub fn total_reports(groups: [ErrorGroup]) -> i64 {
+    var total = 0
+    for g in groups {
+        total = total + g.count
+    }
+    return total
+}
+
+/// The proportion of reports the largest group accounts for.
+///
+/// The number that says whether grouping worked. Above about 0.5 one bug is
+/// drowning everything else and should be fixed first; below 0.05 across
+/// hundreds of groups, the grouping is too fine and the normalisation is
+/// missing something that varies.
+pub fn concentration(groups: [ErrorGroup]) -> f64 {
+    let total = total_reports(groups)
+    if total == 0 {
+        return 0.0
+    }
+    var largest = 0
+    for g in groups {
+        if g.count > largest {
+            largest = g.count
+        }
+    }
+    return largest.as_f64() / total.as_f64()
+}
+
+/// A frame, for building a report.
+pub fn frame(function_name: str, file_name: str, line: i64,
+    is_application: bool) -> ErrorFrame {
+    return ErrorFrame{ function_name: function_name, file_name: file_name,
+        line: line, is_application: is_application }
+}
+
+pub fn report(kind: str, message: str, frames: [ErrorFrame]) -> ErrorReport {
+    return ErrorReport{ kind: kind, message: message, frames: frames }
+}
+
+/// Whether a file belongs to the application rather than a dependency.
+///
+/// A heuristic on the path, and it is the one every tracker uses: anything
+/// under a package directory, a runtime directory or a build cache is not
+/// yours. Getting it wrong in the safe direction — treating a library frame
+/// as application code — splits one bug into several, which is recoverable;
+/// getting it wrong the other way merges bugs, which is not.
+pub fn looks_like_library(path: str) -> bool {
+    let markers = ["/node_modules/", "/site-packages/", "/dist-packages/",
+        "/vendor/", "/.cargo/registry/", "/usr/lib/", "/usr/local/lib/",
+        "/go/pkg/mod/", "/gems/", "\\node_modules\\", "/target/release/",
+        "/rustc/"]
+    let lowered = path.to_lower()
+    for m in markers {
+        if lowered.contains(m) {
+            return true
+        }
+    }
+    return false
+}
+
+/// A stack rendered for display, one frame a line.
+pub fn render_stack(frames: [ErrorFrame]) -> str {
+    var lines: [str] = []
+    for f in frames {
+        var line = "  at " + f.function_name + " (" + f.file_name + ":" +
+        "{f.line})"
+        if not f.is_application {
+            line = line + " [library]"
+        }
+        lines.push(line)
+    }
+    return lines.join("\n")
+}
+
+/// Whether a fingerprint would survive a change to line numbers.
+///
+/// It does, by construction — this exists so the property can be asserted
+/// rather than believed.
+pub fn stable_across_lines(r: ErrorReport, frame_depth: i64) -> bool {
+    var moved: [ErrorFrame] = []
+    for f in r.frames {
+        moved.push(ErrorFrame{ function_name: f.function_name,
+            file_name: f.file_name, line: f.line + 17,
+            is_application: f.is_application })
+    }
+    return fingerprint(r, frame_depth) ==
+    fingerprint(ErrorReport{ kind: r.kind, message: r.message,
+        frames: moved }, frame_depth)
+}
