@@ -256,7 +256,7 @@ pub fn open_table(path: str) -> Table ! TableError / {io} {
         if at + klen > index_bytes.len() {
             fail(Damaged(path, "an index key runs past the index"))
         }
-        keys.push(index_bytes.slice(at, klen))
+        keys.push(index_bytes.slice(at, at + klen))
         at = at + klen
         let off = match varint.get_after(index_bytes, at) {
             Some(p) -> {
@@ -359,7 +359,7 @@ fn read_record(path: str, b: bytes, at: i64, kind: i64) -> (TableRecord, i64) ! 
     if i + klen > b.len() {
         fail(Damaged(path, "a key runs past the block"))
     }
-    let k = b.slice(i, klen)
+    let k = b.slice(i, i + klen)
     i = i + klen
     let vlen = match varint.get_after(b, i) {
         Some(p) -> {
@@ -371,7 +371,7 @@ fn read_record(path: str, b: bytes, at: i64, kind: i64) -> (TableRecord, i64) ! 
     if i + vlen > b.len() {
         fail(Damaged(path, "a value runs past the block"))
     }
-    let v = b.slice(i, vlen)
+    let v = b.slice(i, i + vlen)
     (TableRecord{ key: k, value: v, deleted: kind == 2 }, i + vlen)
 }
 

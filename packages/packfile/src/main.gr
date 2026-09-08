@@ -306,7 +306,7 @@ pub fn read_pack(data: bytes) -> [PackEntry] ! PackError / {io} {
         }
         // The zlib stream runs to wherever it ends, which is only known by
         // decompressing it — a pack does not record compressed lengths.
-        let rest = data.slice(at, data.len() - at - 20)
+        let rest = data.slice(at, at + data.len() - at - 20)
         let piece = match zlib.decompress_prefix(rest, size) {
             Ok(p) -> p
             Err(_e) -> fail(BadDelta("object at {start} will not decompress"))

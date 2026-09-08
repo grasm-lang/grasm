@@ -200,7 +200,7 @@ fn read_name(data: bytes, at: i64) -> (str, i64) ! DnsError {
             if name.len() > 0 {
                 name = name + "."
             }
-            name = name + data.slice(i + 1, length).to_str()
+            name = name + data.slice(i + 1, i + 1 + length).to_str()
             if name.len() > max_name() {
                 fail(NameTooLong(name.len()))
             }
@@ -314,7 +314,7 @@ fn read_record(data: bytes, at: i64) -> (DnsRecord, i64) ! DnsError {
     if i + length > data.len() {
         fail(Truncated(i))
     }
-    let body = data.slice(i, length)
+    let body = data.slice(i, i + length)
     (DnsRecord{
         name: n.0,
         kind: kind,
@@ -384,7 +384,7 @@ fn render(data: bytes, kind: RecordType, at: i64, length: i64) -> str ! DnsError
                 if i + 1 + n > at + length {
                     return s
                 }
-                s = s + data.slice(i + 1, n).to_str()
+                s = s + data.slice(i + 1, i + 1 + n).to_str()
                 i = i + 1 + n
             }
             s

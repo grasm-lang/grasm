@@ -141,7 +141,7 @@ pub fn read_object(git_dir: str, id: str) -> (str, bytes) ! ObjectError / {io} {
     if parts.len() != 2 {
         fail(Malformed("object {id} has a header of {parts.len()} parts"))
     }
-    let content = raw.slice(cut + 1, raw.len() - cut - 1)
+    let content = raw.slice(cut + 1, cut + 1 + raw.len() - cut - 1)
     if "{content.len()}" != parts[1] {
         fail(Malformed("object {id} says {parts[1]} bytes and holds {content.len()}"))
     }
@@ -277,8 +277,8 @@ pub fn read_tree(content: bytes) -> [TreeEntry] ! ObjectError {
             fail(Malformed("a tree entry has no object name"))
         }
         out.push(TreeEntry{
-            mode: content.slice(at, space - at).to_str(),
-            name: content.slice(space + 1, zero - space - 1).to_str(),
+            mode: content.slice(at, at + space - at).to_str(),
+            name: content.slice(space + 1, space + 1 + zero - space - 1).to_str(),
             id: to_hex(content, zero + 1),
         })
         at = zero + 21
@@ -328,7 +328,7 @@ pub fn read_commit(content: bytes) -> GitObject ! ObjectError {
     let message = if header_end < 0 {
         ""
     } else {
-        content.slice(header_end + 2, content.len() - header_end - 2).to_str()
+        content.slice(header_end + 2, header_end + 2 + content.len() - header_end - 2).to_str()
     }
 
     var tree = ""

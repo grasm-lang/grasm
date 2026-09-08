@@ -6090,17 +6090,16 @@ pub unsafe extern "C" fn grasm_bytes_at(v: *mut RtVal, i: i64) -> i64 {
 
 /// # Safety: boxed values.
 #[no_mangle]
-pub unsafe extern "C" fn grasm_bytes_slice(v: *mut RtVal, from: i64, count: i64) -> *mut RtVal {
+pub unsafe extern "C" fn grasm_bytes_slice(v: *mut RtVal, from: i64, end: i64) -> *mut RtVal {
     let b = as_bytes(v);
-    if from < 0 || count < 0 || (from + count) as usize > b.len() {
+    if from < 0 || end < from || end as usize > b.len() {
         rt_panic(&format!(
-            "slice {from}..{} out of bounds (len {})",
-            from + count,
+            "slice {from}..{end} out of bounds (len {})",
             b.len()
         ));
     }
     alloc(RtPayload::Bytes(std::sync::Arc::new(
-        b[from as usize..(from + count) as usize].to_vec(),
+        b[from as usize..end as usize].to_vec(),
     )))
 }
 

@@ -115,7 +115,7 @@ pub fn replay(path: str) -> Replayed ! WalError / {io} {
                         torn = true
                         at = all.len()
                     } else {
-                        let body = all.slice(body_at, length)
+                        let body = all.slice(body_at, body_at + length)
                         if crc32.of(body) != want_crc {
                             torn = true
                             at = all.len()
@@ -163,7 +163,7 @@ fn decode(body: bytes) -> Option[Entry] {
     if at + klen > body.len() {
         return None
     }
-    let k = body.slice(at, klen)
+    let k = body.slice(at, at + klen)
     at = at + klen
     let vlen = match varint.get_after(body, at) {
         Some(p) -> {
@@ -177,7 +177,7 @@ fn decode(body: bytes) -> Option[Entry] {
         // wrote, and reading it would be guessing.
         return None
     }
-    Some(Entry{ key: k, value: body.slice(at, vlen), deleted: kind == 2 })
+    Some(Entry{ key: k, value: body.slice(at, at + vlen), deleted: kind == 2 })
 }
 
 /// Cut a torn tail off, so the next append starts from a whole record.

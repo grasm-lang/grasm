@@ -161,8 +161,7 @@ pub fn parse_spki(der: bytes) -> RsaKey ! RsaError {
             if bit_string.len < 2 or der.at(bit_string.body) != 0 {
                 fail(NotAKey("the BIT STRING has unused bits"))
             }
-            return try parse_pkcs1(der.slice(bit_string.body + 1,
-                bit_string.len - 1))
+            return try parse_pkcs1(der.slice(bit_string.body + 1, bit_string.body + 1 + bit_string.len - 1))
         }
         Err(_e) -> fail(NotAKey("not DER"))
     }
@@ -335,7 +334,7 @@ fn verify_pss_checked(k: RsaKey, hash: str, message: bytes, signature: bytes,
         }
     }
     let masked = block.slice(0, db_len)
-    let seed = block.slice(db_len, hash_len)
+    let seed = block.slice(db_len, db_len + hash_len)
     let mask = try mgf1(seed, db_len, hash)
     var db: [i64] = []
     for i in 0..db_len {

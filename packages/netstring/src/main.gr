@@ -1,0 +1,415 @@
+// Netstrings, and their typed successor.
+//
+// A netstring is `9:some bytes,` — the length in decimal, a colon, the bytes,
+// a comma. Bernstein's format, and the smallest framing that a reader cannot
+// get wrong: the length comes first, so a reader knows exactly how much to
+// take and never has to scan for a terminator that might appear inside the
+// payload.
+//
+// That last part is the reason to use one. Line framing breaks the moment a
+// payload contains a newline; length-prefixed binary framing works but is
+// unreadable in a packet capture; a netstring is both unambiguous and legible.
+//
+// **The strictness here is deliberate.** `05:hello,` is rejected. A parser
+// that accepts leading zeros accepts two encodings of the same message, and
+// two encodings mean a signature over the bytes and a signature over the value
+// disagree — which is how framing bugs become security bugs. The trailing
+// comma is likewise required: it costs one byte and turns a truncated read
+// into an error instead of a short message.
+//
+// `tnetstring` is the typed variant used by Mongrel2: the same length prefix,
+// with the trailing byte naming a type instead of always being a comma. It
+// carries integers, floats, booleans, null, lists and dictionaries, which
+// makes it a complete serialisation format in about a page of code — and one
+// whose parser cannot be made to allocate before it knows the size.
+
+type NetError =
+    | NetTruncated(at: i64)
+    | NetNoColon(at: i64)
+    | NetBadLength(at: i64)
+    | NetLeadingZero(at: i64)
+    | NetTooLong(len: i64, limit: i64)
+    | NetNoTerminator(at: i64, found: i64)
+    | NetTrailingBytes(at: i64)
+    | NetBadType(tag: i64, at: i64)
+    | NetOddDictionary(at: i64)
+
+    /// A payload and where the next one starts.
+type NetFrame = {
+    payload: bytes,
+    next: i64,
+}
+
+/// A typed netstring value.
+type TnetValue =
+    | TnetNull
+    | TnetBool(b: bool)
+    | TnetInt(n: i64)
+    | TnetFloat(f: f64)
+    | TnetStr(s: str)
+    | TnetList(items: [ref TnetValue])
+    | TnetDict(keys: [str], values: [ref TnetValue])
+
+    /// The largest payload this will accept, unless a caller says otherwise.
+    ///
+    /// A length prefix read from a socket is attacker-controlled, and `999999999:`
+    /// is ten bytes that asks for a gigabyte. A default cap means the refusal
+    /// happens before the allocation rather than after it.
+pub fn default_limit() -> i64 {
+    return 16777216
+}
+
+fn push_bytes(inout out: [i64], data: bytes) {
+    for i in 0..data.len() {
+        out.push(data.at(i))
+    }
+}
+
+/// Wrap a payload as a netstring.
+pub fn encode(payload: bytes) -> bytes {
+    var out: [i64] = []
+    push_bytes(out, "{payload.len()}".to_bytes())
+    out.push(58)
+    for i in 0..payload.len() {
+        out.push(payload.at(i))
+    }
+    out.push(44)
+    return bytes_of(out)
+}
+
+pub fn encode_text(s: str) -> bytes {
+    return encode(s.to_bytes())
+}
+
+/// Read one netstring starting at `from`.
+pub fn decode_at(data: bytes, from: i64, limit: i64) -> NetFrame ! NetError {
+    if from >= data.len() {
+        fail(NetTruncated(from))
+    }
+    var i = from
+    var digits = 0
+    var length = 0
+    while i < data.len() and data.at(i) >= 48 and data.at(i) <= 57 {
+        // A leading zero would let `5` and `05` name the same message.
+        if digits == 1 and data.at(from) == 48 {
+            fail(NetLeadingZero(from))
+        }
+        length = length * 10 + (data.at(i) - 48)
+        digits = digits + 1
+        if length > limit {
+            fail(NetTooLong(length, limit))
+        }
+        i = i + 1
+    }
+    if digits == 0 {
+        fail(NetBadLength(from))
+    }
+    if i >= data.len() or data.at(i) != 58 {
+        fail(NetNoColon(i))
+    }
+    i = i + 1
+    if i + length >= data.len() + 1 and i + length > data.len() {
+        fail(NetTruncated(i))
+    }
+    if i + length >= data.len() {
+        fail(NetTruncated(i + length))
+    }
+    if data.at(i + length) != 44 {
+        fail(NetNoTerminator(i + length, data.at(i + length)))
+    }
+    return NetFrame{ payload: data.slice(i, i + length), next: i + length + 1 }
+}
+
+/// Read one netstring from the start, and require nothing to follow it.
+pub fn decode(data: bytes) -> bytes ! NetError {
+    let frame = try decode_at(data, 0, default_limit())
+    if frame.next != data.len() {
+        fail(NetTrailingBytes(frame.next))
+    }
+    return frame.payload
+}
+
+/// Every netstring in a buffer, in order.
+pub fn decode_all(data: bytes) -> [bytes] ! NetError {
+    var out: [bytes] = []
+    var at = 0
+    while at < data.len() {
+        let frame = try decode_at(data, at, default_limit())
+        out.push(frame.payload)
+        at = frame.next
+    }
+    return out
+}
+
+pub fn encode_all(payloads: [bytes]) -> bytes {
+    var out: [i64] = []
+    for p in payloads {
+        let framed = encode(p)
+        for i in 0..framed.len() {
+            out.push(framed.at(i))
+        }
+    }
+    return bytes_of(out)
+}
+
+/// How many complete netstrings a buffer holds, without decoding them.
+///
+/// What a socket reader wants: it has some bytes, and needs to know whether a
+/// whole message has arrived before it commits to parsing one.
+pub fn complete_frames(data: bytes) -> i64 {
+    var count = 0
+    var at = 0
+    while at < data.len() {
+        match decode_at(data, at, default_limit()) {
+            Ok(frame) -> {
+                count = count + 1
+                at = frame.next
+            }
+            Err(_e) -> return count
+        }
+    }
+    return count
+}
+
+// ---------------------------------------------------------- tnetstrings
+
+pub fn tnet_null() -> ref TnetValue {
+    return ref(TnetNull)
+}
+
+pub fn tnet_bool(b: bool) -> ref TnetValue {
+    return ref(TnetBool(b))
+}
+
+pub fn tnet_int(n: i64) -> ref TnetValue {
+    return ref(TnetInt(n))
+}
+
+pub fn tnet_float(f: f64) -> ref TnetValue {
+    return ref(TnetFloat(f))
+}
+
+pub fn tnet_text(s: str) -> ref TnetValue {
+    return ref(TnetStr(s))
+}
+
+pub fn tnet_list(items: [ref TnetValue]) -> ref TnetValue {
+    return ref(TnetList(items))
+}
+
+pub fn tnet_dict(keys: [str], values: [ref TnetValue]) -> ref TnetValue {
+    var ks: [str] = []
+    var vs: [ref TnetValue] = []
+    let n = if keys.len() < values.len() { keys.len() } else { values.len() }
+    for i in 0..n {
+        ks.push(keys[i])
+        vs.push(values[i])
+    }
+    return ref(TnetDict(ks, vs))
+}
+
+/// The type byte a value is written with.
+pub fn tnet_tag(v: ref TnetValue) -> str {
+    match v {
+        TnetNull -> return "~"
+        TnetBool(_b) -> return "!"
+        TnetInt(_n) -> return "#"
+        TnetFloat(_f) -> return "^"
+        TnetStr(_s) -> return ","
+        TnetList(_items) -> return "]"
+        TnetDict(_k, _v) -> return "}"
+    }
+}
+
+/// Encode a typed netstring.
+pub fn tnet_encode(v: ref TnetValue) -> bytes {
+    let body = tnet_body(v)
+    var out: [i64] = []
+    push_bytes(out, "{body.len()}".to_bytes())
+    out.push(58)
+    push_bytes(out, body)
+    push_bytes(out, tnet_tag(v).to_bytes())
+    return bytes_of(out)
+}
+
+fn tnet_body(v: ref TnetValue) -> bytes {
+    match v {
+        TnetNull -> return "".to_bytes()
+        TnetBool(b) -> {
+            if b {
+                return "true".to_bytes()
+            }
+            return "false".to_bytes()
+        }
+        TnetInt(n) -> return "{n}".to_bytes()
+        TnetFloat(f) -> return "{f}".to_bytes()
+        TnetStr(s) -> return s.to_bytes()
+        TnetList(items) -> {
+            var out: [i64] = []
+            for item in items {
+                let piece = tnet_encode(item)
+                for i in 0..piece.len() {
+                    out.push(piece.at(i))
+                }
+            }
+            return bytes_of(out)
+        }
+        TnetDict(keys, values) -> {
+            var out: [i64] = []
+            for i in 0..keys.len() {
+                // A dictionary is a flat list of alternating key and value,
+                // and a key is always a string.
+                let k = tnet_encode(ref(TnetStr(keys[i])))
+                for j in 0..k.len() {
+                    out.push(k.at(j))
+                }
+                let piece = tnet_encode(values[i])
+                for j in 0..piece.len() {
+                    out.push(piece.at(j))
+                }
+            }
+            return bytes_of(out)
+        }
+    }
+}
+
+/// A decoded typed netstring, and where the next one starts.
+type TnetFrame = {
+    value: ref TnetValue,
+    next: i64,
+}
+
+pub fn tnet_decode(data: bytes) -> ref TnetValue ! NetError {
+    let frame = try tnet_decode_at(data, 0)
+    if frame.next != data.len() {
+        fail(NetTrailingBytes(frame.next))
+    }
+    return frame.value
+}
+
+pub fn tnet_decode_at(data: bytes, from: i64) -> TnetFrame ! NetError {
+    var i = from
+    var digits = 0
+    var length = 0
+    while i < data.len() and data.at(i) >= 48 and data.at(i) <= 57 {
+        if digits == 1 and data.at(from) == 48 {
+            fail(NetLeadingZero(from))
+        }
+        length = length * 10 + (data.at(i) - 48)
+        digits = digits + 1
+        if length > default_limit() {
+            fail(NetTooLong(length, default_limit()))
+        }
+        i = i + 1
+    }
+    if digits == 0 {
+        fail(NetBadLength(from))
+    }
+    if i >= data.len() or data.at(i) != 58 {
+        fail(NetNoColon(i))
+    }
+    i = i + 1
+    if i + length >= data.len() {
+        fail(NetTruncated(i + length))
+    }
+    let body = data.slice(i, i + length)
+    let tag = data.at(i + length)
+    let next = i + length + 1
+    return TnetFrame{ value: try tnet_value(tag, body, i), next: next }
+}
+
+fn tnet_value(tag: i64, body: bytes, at: i64) -> ref TnetValue ! NetError {
+    if tag == 126 {
+        return ref(TnetNull)
+    }
+    if tag == 33 {
+        return ref(TnetBool(body.to_str() == "true"))
+    }
+    if tag == 35 {
+        match body.to_str().parse_int() {
+            Some(n) -> return ref(TnetInt(n))
+            None -> fail(NetBadLength(at))
+        }
+    }
+    if tag == 94 {
+        match body.to_str().parse_float() {
+            Some(f) -> return ref(TnetFloat(f))
+            None -> fail(NetBadLength(at))
+        }
+    }
+    if tag == 44 {
+        return ref(TnetStr(body.to_str()))
+    }
+    if tag == 93 {
+        var items: [ref TnetValue] = []
+        var inner = 0
+        while inner < body.len() {
+            let frame = try tnet_decode_at(body, inner)
+            items.push(frame.value)
+            inner = frame.next
+        }
+        return ref(TnetList(items))
+    }
+    if tag == 125 {
+        var keys: [str] = []
+        var values: [ref TnetValue] = []
+        var inner = 0
+        while inner < body.len() {
+            let key = try tnet_decode_at(body, inner)
+            inner = key.next
+            if inner >= body.len() {
+                fail(NetOddDictionary(at + inner))
+            }
+            let value = try tnet_decode_at(body, inner)
+            inner = value.next
+            match key.value {
+                TnetStr(s) -> keys.push(s)
+                _ -> fail(NetOddDictionary(at + inner))
+            }
+            values.push(value.value)
+        }
+        return ref(TnetDict(keys, values))
+    }
+    fail(NetBadType(tag, at + body.len()))
+}
+
+/// What a decoded value is, as a word.
+pub fn tnet_kind(v: ref TnetValue) -> str {
+    match v {
+        TnetNull -> return "null"
+        TnetBool(_b) -> return "bool"
+        TnetInt(_n) -> return "int"
+        TnetFloat(_f) -> return "float"
+        TnetStr(_s) -> return "str"
+        TnetList(_items) -> return "list"
+        TnetDict(_k, _v) -> return "dict"
+    }
+}
+
+pub fn tnet_get(v: ref TnetValue, key: str) -> Option[ref TnetValue] {
+    match v {
+        TnetDict(keys, values) -> {
+            for i in 0..keys.len() {
+                if keys[i] == key {
+                    return Some(values[i])
+                }
+            }
+            return None
+        }
+        _ -> return None
+    }
+}
+
+pub fn tnet_as_int(v: ref TnetValue) -> Option[i64] {
+    match v {
+        TnetInt(n) -> return Some(n)
+        _ -> return None
+    }
+}
+
+pub fn tnet_as_str(v: ref TnetValue) -> Option[str] {
+    match v {
+        TnetStr(s) -> return Some(s)
+        _ -> return None
+    }
+}

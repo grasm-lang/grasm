@@ -98,7 +98,7 @@ fn walk(der: bytes, from: i64, stop: i64, depth: i64, inout out: [DerNode]) ! As
 
 /// The content octets of a node.
 pub fn value(der: bytes, n: DerNode) -> bytes {
-    return der.slice(n.body, n.len)
+    return der.slice(n.body, n.body + n.len)
 }
 
 /// The nodes directly inside `nodes[i]`.

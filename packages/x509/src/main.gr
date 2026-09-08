@@ -167,7 +167,7 @@ pub fn parse(der: bytes) -> Cert ! CertError {
     if sig_bits.len < 2 or der.at(sig_bits.body) != 0 {
         fail(MalformedSignature)
     }
-    let inner = der.slice(sig_bits.body + 1, sig_bits.len - 1)
+    let inner = der.slice(sig_bits.body + 1, sig_bits.body + 1 + sig_bits.len - 1)
     let sig_nodes = match asn1.parse(inner) {
         Err(_e) -> fail(MalformedSignature)
         Ok(ns) -> ns
@@ -202,7 +202,7 @@ pub fn parse(der: bytes) -> Cert ! CertError {
 /// certificate's own key only to check that it is internally consistent, which
 /// is what a self-signed certificate is.
 pub fn verify_with(der: bytes, cert: Cert, key_x: [i64], key_y: [i64]) -> bool {
-    let signed = der.slice(cert.tbs_at, cert.tbs_len)
+    let signed = der.slice(cert.tbs_at, cert.tbs_at + cert.tbs_len)
     let digest = crypto_hash.sha256_of(signed)
     let e = p256.from_bytes(digest)
     return p256.verify(key_x, key_y, e, cert.sig_r, cert.sig_s)

@@ -200,7 +200,7 @@ pub fn decode(data: bytes) -> [ArMember] ! ArError {
         }
         if name == "//" {
             // The GNU string table, which every long name after this indexes.
-            table = data.slice(body_at, size).to_str()
+            table = data.slice(body_at, body_at + size).to_str()
             at = body_at + size + (size % 2)
             continue
         }
@@ -217,7 +217,7 @@ pub fn decode(data: bytes) -> [ArMember] ! ArError {
             if length <= 0 or body_at + length > data.len() {
                 fail(BadName(at))
             }
-            name = data.slice(body_at, length).to_str().replace((0).to_char(), "")
+            name = data.slice(body_at, body_at + length).to_str().replace((0).to_char(), "")
             body_at = body_at + length
             size = size - length
             if name.starts_with("__.SYMDEF") {
@@ -239,7 +239,7 @@ pub fn decode(data: bytes) -> [ArMember] ! ArError {
         }
         out.push(ArMember{
             name: name, modified: modified, uid: uid, gid: gid, mode: mode,
-            data: data.slice(body_at, size),
+            data: data.slice(body_at, body_at + size),
         })
         at = body_at + size + (size % 2)
     }

@@ -112,6 +112,7 @@ and the entries disagree.
 | [F94](#f94) | base32 decoding overflowed after thirteen characters | S2, package | **fixed** |
 | [F95](#f95) | two packages, one variant name, and the backend picked the wrong payload | S1, backend | **fixed** |
 | [F96](#f96) | the wasm engine stopped linking, and nothing said so | S2, build | **fixed** |
+| [F97](#f97) | one method name, two meanings: `bytes.slice` took a length where `list.slice` takes an end | S2, library | **fixed** |
 
 <!-- end index -->
 ## F1 — a wrapped condition must end the line with the operator (S4) — **fixed**
@@ -4172,3 +4173,51 @@ but the gate had not been run since the change that introduced the clocks.
 This is the second time that gate has been skipped and the second entry it has
 produced (F85 was the first). Nothing new is needed here; the gate works. It
 has to be run.
+
+## F97 — one method name, two meanings: `bytes.slice` took a length where `list.slice` takes an end (S2, library) — **fixed**
+
+```
+data.slice(i, i + length)     // on a list: bytes i to i+length
+                              // on bytes:  bytes i to i+i+length
+```
+
+`list.slice(a, b)` returned the elements from `a` up to but excluding `b`.
+`bytes.slice(from, count)` returned `count` bytes starting at `from`. Same
+name, same two `i64` arguments, no type error either way, and a different
+answer.
+
+**Why it is S2 and not a nuisance.** The failure is silent in exactly the
+place it matters. A parser walking a buffer writes `data.slice(i, i + n)`; on
+`bytes` that asked for `i + n` bytes starting at `i`, so the slice was `i` too
+long. Near the end of a buffer that panics and the author finds it in a
+minute. In the middle of one it returns a longer run of real bytes, and the
+field parsed out of it is wrong in a way that looks like a format
+misunderstanding rather than an index bug. Every one of the 78 call sites in
+this repository had to be read to find out which convention it meant.
+
+**Found by** writing `packages/netstring`, whose decoder is four lines of
+index arithmetic. `decode("12:hello world!,")` panicked with `slice 3..18 out
+of bounds (len 16)` — 18 being `3 + (3 + 12)`. Transcribing the same loop into
+a standalone program printed the right answer, because the standalone version
+had no `bytes` in it.
+
+**The fix** is that `slice` now means `(start, end)` on both, and every call
+site was migrated. They still differ in one respect, and that difference is
+now deliberate and written down: a list **clamps** an out-of-range end,
+because a list is usually being trimmed and clamping is what the caller meant;
+`bytes` **panics**, because bytes are usually being parsed and quietly
+returning the bytes that happen to be present is how a parser accepts a
+truncated message.
+
+**How the migration was made safe.** `check_arity` for `bytes.slice` was
+temporarily set to 3, which turned every call site in the corpus into a
+compile error naming its file, line and column — 78 of them, of which 20
+started at `0` and needed no change. Each remaining `slice(a, n)` became
+`slice(a, a + n)`, which is the identity for this rewrite. Nothing was found
+by grep, so nothing was missed by grep.
+
+**Gate**: `spec/conformance/L-LIB-BYTES.gr` now asserts that
+`b.slice(a, c).to_list()` equals `b.to_list().slice(a, c)` at four index
+pairs, and separately that the clamping difference is the one that remains.
+That is the invariant the old signature broke, stated in a program that runs
+under all four engines.

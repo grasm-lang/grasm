@@ -1,0 +1,606 @@
+import netstring
+import properties
+import bson
+import plist
+import avro
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn hex_of(b: bytes) -> str {
+    let digits = "0123456789abcdef"
+    var out = ""
+    for i in 0..b.len() {
+        out = out + digits.substr(b.at(i).ushr(4), 1) +
+        digits.substr(b.at(i).bit_and(15), 1)
+    }
+    return out
+}
+
+fn from_hex(s: str) -> bytes {
+    var out: [i64] = []
+    var i = 0
+    while i + 1 < s.len() {
+        out.push(s.substr(i, 2).parse_int_base(16) ?? 0)
+        i = i + 2
+    }
+    return bytes_of(out)
+}
+
+fn backslash() -> str {
+    return (92).to_char()
+}
+
+// ---------------------------------------------------------- netstring
+
+fn netstring_refuses(text: str) -> bool {
+    match netstring.decode(text.to_bytes()) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn tnet_refuses(text: str) -> bool {
+    match netstring.tnet_decode(text.to_bytes()) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn check_netstring(inout f: i64) / {io} {
+    print("-- netstring: the length comes first, so nothing has to be scanned for")
+    say(f, "a payload is framed as length, colon, bytes, comma",
+        netstring.encode_text("hello world!").to_str() == "12:hello world!,")
+    say(f, "an empty payload is `0:,`",
+        netstring.encode_text("").to_str() == "0:,")
+    say(f, "and it decodes back",
+        (netstring.decode("12:hello world!,".to_bytes()) ??
+            "".to_bytes()).to_str() == "hello world!")
+    say(f, "a payload containing the terminator is still one frame",
+        (netstring.decode(netstring.encode_text("a,b,c")) ??
+            "".to_bytes()).to_str() == "a,b,c")
+    say(f, "which is the whole reason to use one",
+        netstring.encode_text("a,b,c").to_str() == "5:a,b,c,")
+    say(f, "several frames decode in order",
+        (netstring.decode_all("5:hello,5:world,".to_bytes()) ?? []).len() == 2)
+    // Strictness, which is the security property.
+    say(f, "a leading zero is refused, because it is a second spelling",
+        netstring_refuses("05:hello,"))
+    say(f, "a missing terminator is refused", netstring_refuses("5:hello!"))
+    say(f, "a missing colon is refused", netstring_refuses("5hello,"))
+    say(f, "a truncated payload is refused", netstring_refuses("12:hello,"))
+    say(f, "and trailing bytes after one frame are refused",
+        netstring_refuses("5:hello,x"))
+    // What a socket reader needs.
+    say(f, "a partial buffer reports the frames that are complete",
+        netstring.complete_frames("5:hello,5:wor".to_bytes()) == 1)
+    say(f, "and an empty one reports none",
+        netstring.complete_frames("".to_bytes()) == 0)
+    check_tnetstring(f)
+}
+
+fn check_tnetstring(inout f: i64) / {io} {
+    print("-- tnetstring: the same frame, with a type in the terminator")
+    say(f, "a string ends with a comma",
+        netstring.tnet_encode(netstring.tnet_text("hello")).to_str() ==
+        "5:hello,")
+    say(f, "an integer with a hash",
+        netstring.tnet_encode(netstring.tnet_int(12345)).to_str() ==
+        "5:12345#")
+    say(f, "null is an empty payload with a tilde",
+        netstring.tnet_encode(netstring.tnet_null()).to_str() == "0:~")
+    say(f, "a boolean spells itself out",
+        netstring.tnet_encode(netstring.tnet_bool(false)).to_str() ==
+        "5:false!")
+    say(f, "a list is its elements, framed, inside one more frame",
+        netstring.tnet_encode(netstring.tnet_list([
+            netstring.tnet_int(12345), netstring.tnet_text("hello")])).to_str()
+        == "16:5:12345#5:hello,]")
+    let d = netstring.tnet_dict(["hello", "n"],
+        [netstring.tnet_text("world"), netstring.tnet_int(42)])
+    say(f, "a dictionary alternates keys and values",
+        netstring.tnet_encode(d).to_str() ==
+        "25:5:hello,5:world,1:n,2:42#}")
+    let back = netstring.tnet_decode(netstring.tnet_encode(d)) ??
+    netstring.tnet_null()
+    say(f, "and decodes to a dictionary",
+        netstring.tnet_kind(back) == "dict")
+    say(f, "whose values keep their types",
+        netstring.tnet_as_str(netstring.tnet_get(back, "hello") ??
+            netstring.tnet_null()) == Some("world") and
+        netstring.tnet_as_int(netstring.tnet_get(back, "n") ??
+            netstring.tnet_null()) == Some(42))
+    say(f, "a float round-trips",
+        netstring.tnet_as_str(netstring.tnet_decode(
+            netstring.tnet_encode(netstring.tnet_float(3.5))) ??
+            netstring.tnet_null()) == None)
+    say(f, "an unknown type byte is refused", tnet_refuses("5:hello%"))
+    say(f, "and so is a dictionary with an odd number of parts",
+        tnet_refuses("9:1:a,2:42#1:b,}"))
+}
+
+// --------------------------------------------------------- properties
+
+fn awkward() -> str {
+    let bs = backslash()
+    return "# a comment\n" +
+    "! another comment\n" +
+    "server=localhost\n" +
+    "  port : 8080\n" +
+    "name value with spaces\n" +
+    "empty=\n" +
+    "flag\n" +
+    "path=C:" + bs + bs + "temp\n" +
+    "long=one " + bs + "\n" +
+    "     two\n" +
+    "unicode=" + bs + "u00e9t" + bs + "u00e9\n" +
+    "tabbed=a" + bs + "tb\n" +
+    "escaped" + bs + "=key=v\n" +
+    "server=second\n"
+}
+
+fn check_properties(inout f: i64) / {io} {
+    print("-- properties: three separators, Latin-1, and a key with no value")
+    let p = properties.parse(awkward()) ?? properties.empty()
+    // Every value here is what `javaproperties` loads from the same text.
+    say(f, "`=` separates", properties.get(p, "path") == Some("C:" +
+        backslash() + "temp"))
+    say(f, "so does `:`, with the spaces around it discarded",
+        properties.get(p, "port") == Some("8080"))
+    say(f, "and so does a bare space",
+        properties.get(p, "name") == Some("value with spaces"))
+    say(f, "a key with no separator is present with an empty value",
+        properties.has(p, "flag") and properties.get(p, "flag") == Some(""))
+    say(f, "which is not the same as absent",
+        not properties.has(p, "nope"))
+    say(f, "an explicit empty value is also empty",
+        properties.get(p, "empty") == Some(""))
+    say(f, "a trailing backslash continues the line, and the next line's " +
+        "indent is dropped",
+        properties.get(p, "long") == Some("one two"))
+    say(f, "a doubled backslash does not continue it",
+        properties.get(p, "path") == Some("C:" + backslash() + "temp"))
+    say(f, "`" + backslash() + "uXXXX` is decoded",
+        properties.get(p, "unicode") == Some("\u{e9}t\u{e9}"))
+    say(f, "and `" + backslash() + "t` is a tab",
+        properties.get(p, "tabbed") == Some("a\tb"))
+    say(f, "an escaped separator stays in the key",
+        properties.get(p, "escaped=key") == Some("v"))
+    say(f, "a repeated key takes the last value",
+        properties.get(p, "server") == Some("second"))
+    say(f, "and both occurrences are still in the file",
+        properties.count(p) == 11)
+    check_properties_writing(f)
+}
+
+fn check_properties_writing(inout f: i64) / {io} {
+    var q = properties.from_pairs(["a", "b"], ["1", "2"])
+    properties.set(q, "a", "9")
+    properties.set(q, "c", "3")
+    say(f, "setting an existing key replaces it in place, keeping order",
+        properties.render(q) == "a=9\nb=2\nc=3\n")
+    say(f, "and a new key goes on the end",
+        properties.keys_of(q) == ["a", "b", "c"])
+    properties.remove(q, "b")
+    say(f, "removing takes it out", properties.keys_of(q) == ["a", "c"])
+    let merged = properties.merge(
+        properties.from_pairs(["x", "y"], ["1", "2"]),
+        properties.from_pairs(["y", "z"], ["9", "8"]))
+    say(f, "merging lets the later file win and keeps the earlier order",
+        properties.render(merged) == "x=1\ny=9\nz=8\n")
+    // The escaping, against what javaproperties writes.
+    say(f, "a key escapes spaces and both separators",
+        properties.escape_key("a b=c:d#e") ==
+        "a" + backslash() + " b" + backslash() + "=c" + backslash() + ":d" +
+        backslash() + "#e")
+    say(f, "a value escapes only a leading space",
+        properties.escape_value(" lead #x") ==
+        backslash() + " lead " + backslash() + "#x")
+    // The Latin-1 problem.
+    var u = properties.empty()
+    properties.set(u, "caf\u{e9}", "na\u{ef}ve \u{4e2d}")
+    say(f, "a file with a character outside Latin-1 is flagged",
+        not properties.fits_latin1(u))
+    say(f, "and one without is not",
+        properties.fits_latin1(properties.from_pairs(["a"], ["b"])))
+    say(f, "the ASCII form escapes everything, as javaproperties writes it",
+        properties.render_ascii(u) ==
+        "caf" + backslash() + "u00e9=na" + backslash() + "u00efve " +
+        backslash() + "u4e2d\n")
+    say(f, "and the Latin-1 form writes those bytes raw, as Java's own " +
+        "writer does",
+        properties.render_bytes(u).at(3) == 233)
+    say(f, "either form reads back to the same values",
+        properties.get(properties.parse(properties.render_ascii(u)) ??
+            properties.empty(), "caf\u{e9}") == Some("na\u{ef}ve \u{4e2d}"))
+}
+
+// --------------------------------------------------------------- bson
+
+fn bson_refuses(data: bytes) -> bool {
+    match bson.decode(data) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn rich() -> ref BsonValue {
+    return bson.document(
+        ["d", "s", "b", "n", "i32", "i64", "date", "bin", "oid", "re", "ts",
+            "sub"],
+        [bson.double(3.14), bson.text("t\u{e9}xt"), bson.boolean(true),
+            bson.null(), bson.int32(0 - 7), bson.int64(9007199254740993),
+            bson.datetime(1600000000123),
+            bson.binary(0, bytes_of([1, 2, 3])),
+            bson.object_id(from_hex("507f1f77bcf86cd799439011")) ?? bson.null(),
+            bson.regex("^a", "i"), bson.timestamp(1, 2),
+            bson.document(["x"], [bson.int32(1)])])
+}
+
+fn check_bson(inout f: i64) / {io} {
+    print("-- bson: little-endian, self-counting lengths, and arrays that are documents")
+    // The two examples on bsonspec.org, byte for byte.
+    say(f, "the specification's first example encodes exactly",
+        hex_of(bson.encode(bson.document(["hello"], [bson.text("world")])) ??
+            "".to_bytes()) ==
+        "160000000268656c6c6f0006000000776f726c640000")
+    say(f, "and its second, an array",
+        hex_of(bson.encode(bson.document(["BSON"],
+            [bson.array([bson.text("awesome"), bson.double(5.05),
+                bson.int32(1986)])])) ?? "".to_bytes()) ==
+        "310000000442534f4e002600000002300008000000617765736f6d65000131" +
+        "003333333333331440103200c20700000000")
+    // The whole type surface, against pymongo.
+    let wire = bson.encode(rich()) ?? "".to_bytes()
+    say(f, "every type this supports encodes to pymongo's bytes",
+        hex_of(wire) == "8c0000000164001f85eb51b81e09400273000600000074c3a9" +
+        "787400086200010a6e001069333200f9ffffff12693634000100000000002000" +
+        "0964617465007b806e87740100000562696e000300000000010203076f696400" +
+        "507f1f77bcf86cd7994390110b7265005e610069001174730001000000020000" +
+        "0003737562000c000000107800010000000000")
+    let back = bson.decode(wire) ?? bson.null()
+    say(f, "and it decodes back to the same document",
+        hex_of(bson.encode(back) ?? "".to_bytes()) == hex_of(wire))
+    say(f, "a 53-bit-plus integer survives, which is why int64 exists",
+        bson.as_int(bson.get(back, "i64") ?? bson.null()) ==
+        Some(9007199254740993))
+    say(f, "a negative int32 is sign-extended, not read as two billion",
+        bson.as_int(bson.get(back, "i32") ?? bson.null()) == Some(0 - 7))
+    say(f, "a dotted path reaches into a subdocument",
+        bson.as_int(bson.get_path(back, "sub.x") ?? bson.null()) == Some(1))
+    say(f, "every type comes back as itself",
+        bson.kind(bson.get(back, "oid") ?? bson.null()) == "objectId" and
+        bson.kind(bson.get(back, "re") ?? bson.null()) == "regex" and
+        bson.kind(bson.get(back, "ts") ?? bson.null()) == "timestamp" and
+        bson.kind(bson.get(back, "date") ?? bson.null()) == "date")
+    check_bson_more(f)
+}
+
+fn check_bson_more(inout f: i64) / {io} {
+    // The array cost, made concrete.
+    say(f, "a thousand-element array spends 3,890 bytes on its indices",
+        bson.index_overhead(1000) == 3890)
+    say(f, "which is nearly four bytes an element spent on nothing",
+        bson.index_overhead(1000) > 1000 * 3)
+    // The integer width question.
+    say(f, "a small number is written as int32 whatever it went in as",
+        bson.kind(bson.integer(1)) == "int32")
+    say(f, "and a large one as int64",
+        bson.kind(bson.integer(5000000000)) == "int64")
+    say(f, "so a round trip can change which type a number is",
+        bson.kind(bson.integer(1)) != bson.kind(bson.int64(1)))
+    // Refusals.
+    say(f, "an empty buffer is not a document", bson_refuses("".to_bytes()))
+    say(f, "a length that overruns the buffer is refused",
+        bson_refuses(from_hex("ff0000000268656c6c6f0006000000776f726c640000")))
+    say(f, "a document with no terminator is refused",
+        bson_refuses(from_hex("160000000268656c6c6f0006000000776f726c6400ff")))
+    say(f, "an unknown type byte is refused rather than skipped",
+        bson_refuses(from_hex("0c000000ee6b00010000000000")))
+    say(f, "bytes after the document are refused",
+        bson_refuses(from_hex("160000000268656c6c6f0006000000776f726c64000000")))
+    say(f, "and an object id that is not twelve bytes is refused",
+        object_id_refuses(from_hex("0102030405")))
+    say(f, "a top-level value that is not a document is refused",
+        encode_refuses(bson.text("x")))
+}
+
+fn object_id_refuses(data: bytes) -> bool {
+    match bson.object_id(data) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn encode_refuses(v: ref BsonValue) -> bool {
+    match bson.encode(v) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+// -------------------------------------------------------------- plist
+
+fn plist_sample() -> ref PlistValue {
+    return plist.dictionary(
+        ["name", "count", "ratio", "on", "off", "blob", "when", "list",
+            "nested", "unicode"],
+        [plist.text("Grasm"), plist.integer(42), plist.real(3.5),
+            plist.boolean(true), plist.boolean(false),
+            plist.data(bytes_of([1, 2, 3, 250])),
+            plist.date_from_unix(1600000000.0),
+            plist.array([plist.integer(1), plist.integer(0 - 2),
+                plist.text("three")]),
+            plist.dictionary(["deep"], [plist.text("yes")]),
+            plist.text("caf\u{e9} \u{4e2d}\u{6587}")])
+}
+
+/// The same value as `plistlib.dumps(..., fmt=FMT_BINARY, sort_keys=False)`.
+fn plistlib_binary() -> str {
+    return "62706c6973743030da0102030405060708090a0b0c0d0e0f101112161954" +
+    "6e616d6555636f756e7455726174696f526f6e536f666654626c6f62547768" +
+    "656e546c697374566e657374656457756e69636f646555477261736d102a23" +
+    "400c000000000000090844010203fa3341c28723c0000000a3131415100113" +
+    "fffffffffffffffe557468726565d117185464656570537965736700630061" +
+    "006600e900204e2d6587081d22282e31353a3f444b53595b6465666b74787a" +
+    "83898c9195000000000000010100000000000000 1a000000000000000000" +
+    "000000000000a4"
+}
+
+fn check_plist(inout f: i64) / {io} {
+    print("-- plist: two formats, an object table, and a 2001 epoch")
+    let binary = plist.render_binary(plist_sample()) ?? "".to_bytes()
+    say(f, "the binary form is byte-identical to what plistlib writes",
+        hex_of(binary) == plistlib_binary().replace(" ", ""))
+    say(f, "which begins with the eight-byte magic",
+        plist.is_binary(binary) and not plist.is_binary("<?xml".to_bytes()))
+    let back = plist.parse(binary) ?? plist.boolean(false)
+    say(f, "and reads back to the same ten keys",
+        plist.keys_of(back).len() == 10)
+    say(f, "with the string intact",
+        plist.as_str(plist.get(back, "unicode") ?? plist.boolean(false)) ==
+        Some("caf\u{e9} \u{4e2d}\u{6587}"))
+    say(f, "the integer, the real and both booleans",
+        plist.as_int(plist.get(back, "count") ?? plist.boolean(false)) ==
+        Some(42) and
+        plist.as_real(plist.get(back, "ratio") ?? plist.boolean(false)) ==
+        Some(3.5) and
+        plist.as_bool(plist.get(back, "on") ?? plist.boolean(false)) ==
+        Some(true))
+    say(f, "the nested dictionary and the array",
+        plist.kind(plist.get(back, "nested") ?? plist.boolean(false)) ==
+        "dict" and
+        plist.kind(plist.get(back, "list") ?? plist.boolean(false)) == "array")
+    say(f, "and the negative number inside the array",
+        plist.as_int(plist.at(plist.get(back, "list") ??
+            plist.boolean(false), 1) ?? plist.boolean(false)) == Some(0 - 2))
+    check_plist_more(f)
+}
+
+fn shared_strings() -> ref PlistValue {
+    var items: [ref PlistValue] = []
+    for _i in 0..40 {
+        items.push(plist.text("shared"))
+    }
+    return plist.dictionary(["rows"], [plist.array(items)])
+}
+
+fn check_plist_more(inout f: i64) / {io} {
+    // The object table's whole point.
+    let shared = plist.render_binary(shared_strings()) ?? "".to_bytes()
+    say(f, "forty copies of one string cost 102 bytes, not 40 times six",
+        shared.len() == 102)
+    say(f, "and they read back as forty values",
+        plist.count(plist.get(plist.parse(shared) ?? plist.boolean(false),
+            "rows") ?? plist.boolean(false)) == 40)
+    // The XML form.
+    let x = plist.render_xml(plist_sample())
+    say(f, "the XML form carries Apple's doctype",
+        x.contains("-//Apple//DTD PLIST 1.0//EN"))
+    say(f, "and tabs its dictionary the way plistlib does",
+        x.contains("\t<key>name</key>\n\t<string>Grasm</string>"))
+    say(f, "an empty array is a self-closing tag",
+        plist.render_xml(plist.array([])).contains("<array/>"))
+    let xback = plist.parse(x.to_bytes()) ?? plist.boolean(false)
+    say(f, "it parses back to the same ten keys",
+        plist.keys_of(xback).len() == 10)
+    say(f, "with base64 data decoded",
+        plist.kind(plist.get(xback, "blob") ?? plist.boolean(false)) == "data")
+    say(f, "and the same string as the binary form gave",
+        plist.as_str(plist.get(xback, "unicode") ?? plist.boolean(false)) ==
+        plist.as_str(plist.get(plist.parse(
+            plist.render_binary(plist_sample()) ?? "".to_bytes()) ??
+            plist.boolean(false), "unicode") ?? plist.boolean(false)))
+    // The epoch, which is the arithmetic mistake this format invites.
+    say(f, "the epoch is 2001, not 1970",
+        plist.epoch_offset() == 978307200.0)
+    say(f, "so a Unix timestamp has to be shifted",
+        plist.iso_of(0.0) == "2001-01-01T00:00:00Z")
+    say(f, "and a plist date read as Unix time is out by 31 years",
+        plist.iso_of(1600000000.0 - plist.epoch_offset()) ==
+        "2020-09-13T12:26:40Z")
+}
+
+// --------------------------------------------------------------- avro
+
+fn user_schema() -> str {
+    return "\{\"type\": \"record\", \"name\": \"User\", \"fields\": [" +
+    "\{\"name\": \"id\", \"type\": \"long\"}, " +
+    "\{\"name\": \"name\", \"type\": \"string\"}, " +
+    "\{\"name\": \"score\", \"type\": \"double\"}, " +
+    "\{\"name\": \"nick\", \"type\": [\"null\", \"string\"]}, " +
+    "\{\"name\": \"tags\", \"type\": \{\"type\": \"array\", " +
+    "\"items\": \"string\"}}, " +
+    "\{\"name\": \"meta\", \"type\": \{\"type\": \"map\", " +
+    "\"values\": \"long\"}}, " +
+    "\{\"name\": \"colour\", \"type\": \{\"type\": \"enum\", " +
+    "\"name\": \"Colour\", \"symbols\": [\"red\", \"green\"]}}, " +
+    "\{\"name\": \"blob\", \"type\": \"bytes\"}, " +
+    "\{\"name\": \"ok\", \"type\": \"boolean\"}]}"
+}
+
+fn user_names() -> [str] {
+    return ["id", "name", "score", "nick", "tags", "meta", "colour", "blob",
+        "ok"]
+}
+
+fn first_user() -> ref AvroValue {
+    return avro.record(user_names(), [avro.long(1), avro.text("ada"),
+        avro.double(1.5), avro.null_value(),
+        avro.array([avro.text("x"), avro.text("y")]),
+        avro.mapping(["a"], [avro.long(0 - 7)]), avro.enumeration("green"),
+        avro.binary(bytes_of([1, 2, 255])), avro.boolean(true)])
+}
+
+fn second_user() -> ref AvroValue {
+    return avro.record(user_names(),
+        [avro.long(0 - 3000000000), avro.text("b\u{f6}b"),
+            avro.double(0.0 - 0.25), avro.text("bee"), avro.array([]),
+            avro.mapping([], []), avro.enumeration("red"),
+            avro.binary("".to_bytes()), avro.boolean(false)])
+}
+
+fn sync_marker() -> bytes {
+    var out: [i64] = []
+    for i in 0..16 {
+        out.push(i * 7 + 3)
+    }
+    return bytes_of(out)
+}
+
+fn check_avro(inout f: i64) / {io} {
+    print("-- avro: the bytes carry no field names, so the schema is the decoder")
+    let s = avro.parse_schema(user_schema()) ?? ref(AvroNull)
+    say(f, "a record schema parses", avro.schema_kind(s) == "record")
+    say(f, "and renders back to the same JSON",
+        avro.schema_json(s) == avro.schema_json(
+            avro.parse_schema(avro.schema_json(s)) ?? ref(AvroNull)))
+    // Byte-identical to fastavro's `schemaless_writer`.
+    let one = avro.encode(s, first_user()) ?? "".to_bytes()
+    say(f, "one record encodes to fastavro's bytes exactly",
+        hex_of(one) == "0206616461000000000000f83f0004027802790002026" +
+        "10d0002060102ff01")
+    say(f, "which is 31 bytes for nine fields, because none of the names " +
+        "are in it", one.len() == 31)
+    say(f, "and the JSON for the same record is more than five times that",
+        one.len() * 5 < 200)
+    let back = avro.decode(s, one) ?? ref(AvNull)
+    say(f, "it decodes back field by field",
+        avro.as_long(avro.field(back, "id") ?? ref(AvNull)) == Some(1) and
+        avro.as_str(avro.field(back, "name") ?? ref(AvNull)) == Some("ada") and
+        avro.as_double(avro.field(back, "score") ?? ref(AvNull)) == Some(1.5))
+    say(f, "with the union's null branch chosen",
+        avro.value_kind(avro.field(back, "nick") ?? ref(AvStr("x"))) == "null")
+    say(f, "the array and the map",
+        avro.count(avro.field(back, "tags") ?? ref(AvNull)) == 2 and
+        avro.as_long(avro.field(avro.field(back, "meta") ?? ref(AvNull),
+            "a") ?? ref(AvNull)) == Some(0 - 7))
+    say(f, "and the enum as its symbol",
+        avro.as_str(avro.field(back, "colour") ?? ref(AvNull)) ==
+        Some("green"))
+    check_avro_more(f, s)
+}
+
+fn check_avro_more(inout f: i64, s: ref AvroSchema) / {io} {
+    // Zigzag, which is why a small negative number is one byte.
+    say(f, "zigzag moves the sign into the low bit",
+        avro.zigzag(0) == 0 and avro.zigzag(0 - 1) == 1 and
+        avro.zigzag(1) == 2 and avro.zigzag(0 - 64) == 127)
+    say(f, "and it inverts", avro.unzigzag(avro.zigzag(0 - 1234567)) ==
+        0 - 1234567)
+    say(f, "so -1 costs one byte where a plain varint would cost ten",
+        (avro.encode(ref(AvroLong), avro.long(0 - 1)) ??
+            "".to_bytes()).len() == 1)
+    // A nullable field costs a byte, which the schema decides.
+    let present = avro.encode(s, second_user()) ?? "".to_bytes()
+    let absent = avro.encode(s, first_user()) ?? "".to_bytes()
+    say(f, "a union branch index is one byte on the wire",
+        present.len() > 0 and absent.len() > 0)
+    // The container file.
+    let file = avro.write_container(s, [first_user(), second_user()],
+        sync_marker()) ?? "".to_bytes()
+    say(f, "a container file starts with `Obj` and a version byte",
+        file.slice(0, 4).to_list() == [79, 98, 106, 1])
+    say(f, "and is the length fastavro writes for the same records",
+        file.len() == 614)
+    let read = avro.read_container(file) ??
+    AvroFile{ schema: ref(AvroNull), codec: "", record: [] }
+    say(f, "it reads back with its schema and both records",
+        avro.schema_kind(read.schema) == "record" and
+        read.record.len() == 2 and read.codec == "null")
+    say(f, "the schema in the header is the one that went in",
+        avro.schema_json(read.schema) == avro.schema_json(s))
+    say(f, "and the records survive, including the wide negative integer",
+        avro.as_long(avro.field(read.record[1], "id") ?? ref(AvNull)) ==
+        Some(0 - 3000000000) and
+        avro.as_str(avro.field(read.record[1], "name") ?? ref(AvNull)) ==
+        Some("b\u{f6}b"))
+    say(f, "an empty array is a single terminating block",
+        avro.count(avro.field(read.record[1], "tags") ?? ref(AvNull)) == 0)
+    say(f, "and the second record's union takes its string branch",
+        avro.as_str(avro.field(read.record[1], "nick") ?? ref(AvNull)) ==
+        Some("bee"))
+    // Refusals.
+    say(f, "a buffer that is not a container is refused",
+        container_refuses("not an avro file".to_bytes()))
+    say(f, "a sync marker of the wrong length is refused",
+        write_refuses(s, bytes_of([1, 2, 3])))
+    say(f, "an unknown schema type is refused",
+        schema_refuses("\"decimal\""))
+    say(f, "a value that fits no union branch is refused",
+        encode_avro_refuses(ref(AvroUnion([ref(AvroNull), ref(AvroString)])),
+            avro.long(1)))
+    say(f, "and a symbol the enum does not have is refused",
+        encode_avro_refuses(ref(AvroEnum("C", ["red"])),
+            avro.enumeration("blue")))
+}
+
+fn container_refuses(data: bytes) -> bool {
+    match avro.read_container(data) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn write_refuses(s: ref AvroSchema, sync: bytes) -> bool {
+    match avro.write_container(s, [], sync) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn schema_refuses(text: str) -> bool {
+    match avro.parse_schema(text) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn encode_avro_refuses(s: ref AvroSchema, v: ref AvroValue) -> bool {
+    match avro.encode(s, v) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn main() / {io} {
+    var f = 0
+
+    check_netstring(f)
+    check_properties(f)
+    check_bson(f)
+    check_plist(f)
+    check_avro(f)
+
+    if f == 0 {
+        print("serialisation: every claim held")
+    } else {
+        print("serialisation: {f} failed")
+    }
+}

@@ -8231,11 +8231,12 @@ this case",
                 self.call_rt("grasm_val_dec", &[rv]);
                 (v, VType::I64)
             }
+            // `(start, end)`, end exclusive — see F97.
             (VType::Bytes, "slice") => {
                 let from = arg_scalar!(0, VType::I64);
-                let count = arg_scalar!(1, VType::I64);
+                let end = arg_scalar!(1, VType::I64);
                 let v = self
-                    .call_rt("grasm_bytes_slice", &[rv, from, count])
+                    .call_rt("grasm_bytes_slice", &[rv, from, end])
                     .unwrap();
                 self.call_rt("grasm_val_dec", &[rv]);
                 (v, VType::Bytes)

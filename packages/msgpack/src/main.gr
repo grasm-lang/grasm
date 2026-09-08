@@ -235,7 +235,7 @@ fn take_be(inout r: MsgReader, width: i64) -> i64 ! MsgError {
 
 fn take_bytes(inout r: MsgReader, n: i64) -> bytes ! MsgError {
     try need(r, n)
-    let out = r.data.slice(r.at, n)
+    let out = r.data.slice(r.at, r.at + n)
     r.at = r.at + n
     return out
 }

@@ -1,0 +1,24 @@
+[package]
+name = "serialise_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.netstring]
+path = "../netstring"
+version = "^1.0.0"
+
+[dependencies.properties]
+path = "../properties"
+version = "^1.0.0"
+
+[dependencies.bson]
+path = "../bson"
+version = "^1.0.0"
+
+[dependencies.plist]
+path = "../plist"
+version = "^1.0.0"
+
+[dependencies.avro]
+path = "../avro"
+version = "^1.0.0"

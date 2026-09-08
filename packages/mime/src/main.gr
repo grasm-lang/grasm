@@ -47,12 +47,12 @@ pub fn quoted_printable_encode(data: bytes) -> str {
         } else {
             var piece = ""
             if is_printable(b) {
-                piece = data.slice(i, 1).to_str()
+                piece = data.slice(i, i + 1).to_str()
             } else if (b == 32 or b == 9) and not at_line_end(data, i) {
                 // A space is literal *unless* it ends a line, where a relay
                 // may strip it. That conditional is the whole reason
                 // quoted-printable has a reputation.
-                piece = data.slice(i, 1).to_str()
+                piece = data.slice(i, i + 1).to_str()
             } else {
                 piece = "=" + hex_digits().substr(b / 16, 1) + hex_digits().substr(b % 16, 1)
             }
@@ -147,7 +147,7 @@ pub fn encode_word(text: str) -> str {
     for i in 0..b.len() {
         let v = b.at(i)
         if (v >= 65 and v <= 90) or (v >= 97 and v <= 122) or (v >= 48 and v <= 57) {
-            body = body + b.slice(i, 1).to_str()
+            body = body + b.slice(i, i + 1).to_str()
         } else if v == 32 {
             body = body + "_"
         } else {

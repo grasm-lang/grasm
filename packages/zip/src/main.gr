@@ -255,7 +255,7 @@ pub fn decode(data: bytes) -> [ZipEntry] ! ZipError {
         if body_at + compressed > data.len() {
             fail(Truncated(body_at))
         }
-        let stored = data.slice(body_at, compressed)
+        let stored = data.slice(body_at, body_at + compressed)
         var body = stored
         if method == DEFLATED {
             match zlib.inflate(stored, size + 64) {
@@ -286,7 +286,7 @@ fn read_name(data: bytes, at: i64, length: i64) -> str {
     if at + length > data.len() {
         return ""
     }
-    return data.slice(at, length).to_str()
+    return data.slice(at, at + length).to_str()
 }
 
 /// The directory only: names and sizes, without inflating anything.

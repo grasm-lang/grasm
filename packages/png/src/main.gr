@@ -264,7 +264,7 @@ pub fn chunks(data: bytes) -> [(str, i64, i64)] ! PngError {
             fail(BadChunk(kind, at))
         }
         let want = read_be32(data, at + 8 + length)
-        if crc32.of(data.slice(at + 4, length + 4)) != want {
+        if crc32.of(data.slice(at + 4, at + 4 + length + 4)) != want {
             fail(BadCrc(kind, at))
         }
         out.push((kind, at + 8, length))
@@ -342,12 +342,12 @@ pub fn decode(data: bytes) -> PngImage ! PngError {
             }
             seen_header = true
         } else if c.0 == "PLTE" {
-            palette = data.slice(c.1, c.2).to_list()
+            palette = data.slice(c.1, c.1 + c.2).to_list()
         } else if c.0 == "IDAT" {
             // Several IDAT chunks are one DEFLATE stream, split wherever the
             // writer felt like it. Joining them before inflating is the only
             // way that works.
-            for b in data.slice(c.1, c.2).to_list() {
+            for b in data.slice(c.1, c.1 + c.2).to_list() {
                 compressed.push(b)
             }
         }
@@ -422,7 +422,7 @@ pub fn filters_used(data: bytes) -> [i64] ! PngError {
     var compressed: [i64] = []
     for c in found {
         if c.0 == "IDAT" {
-            for b in data.slice(c.1, c.2).to_list() {
+            for b in data.slice(c.1, c.1 + c.2).to_list() {
                 compressed.push(b)
             }
         }

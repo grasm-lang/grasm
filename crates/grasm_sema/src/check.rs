@@ -6664,6 +6664,8 @@ Perform the effect after the closing brace, or yield a number and do the work ou
                     }
                     Type::I64
                 }
+                // `(start, end)`, the same shape as `list.slice` — see
+                // ProjectGold/FINDINGS.md F97 for why it is not `(start, len)`.
                 "slice" => {
                     if check_arity(self, 2) {
                         self.check_expr(&args[0], &Type::I64);

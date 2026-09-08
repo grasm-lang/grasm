@@ -1,0 +1,548 @@
+// BSON: MongoDB's binary document format.
+//
+// Five things about it are worth knowing before writing a parser, and all five
+// are the reason this one exists rather than a JSON encoder with different
+// brackets.
+//
+// **It is little-endian.** Every length, every integer, every double. Almost
+// every other wire format on this list — DNS, TLS, MessagePack, CBOR, ASN.1 —
+// is big-endian, so a reader that pastes in the byte-order helper it already
+// had gets lengths in the billions and blames the data.
+//
+// **A document's length counts itself.** The four length bytes and the
+// terminating `0x00` are both inside the number. Off by four in either
+// direction and every nested document after the first is misaligned.
+//
+// **Arrays are documents.** `["a", "b"]` is stored as `{"0": "a", "1": "b"}`,
+// with the indices written out as decimal text. A thousand-element array
+// therefore carries about 2.9 KB of keys that say nothing, which is a real
+// cost and a genuine surprise the first time a document is measured.
+//
+// **`int32` and `int64` are different types, and a round trip can change
+// which one a number is.** This encoder writes the narrowest type that holds
+// the value, which is what the MongoDB drivers do, so `1` comes back as an
+// `int32` even if it went in as an `int64`. Anything comparing types after a
+// round trip has to know that.
+//
+// **Keys are C strings and string values are not.** A key ends at a NUL and
+// carries no length; a string value carries a length *and* a NUL. So a key
+// containing a NUL cannot be represented at all — this refuses to encode one
+// rather than writing a document that truncates when read back.
+//
+// Checked against `pymongo`'s `bson` module in both directions.
+
+type BsonValue =
+    | BsonDouble(f: f64)
+    | BsonStr(s: str)
+    | BsonDoc(keys: [str], values: [ref BsonValue])
+    | BsonArray(items: [ref BsonValue])
+    | BsonBinary(subtype: i64, data: bytes)
+    | BsonObjectId(id: bytes)
+    | BsonBool(b: bool)
+    | BsonDateTime(millis: i64)
+    | BsonNull
+    | BsonRegex(pattern: str, options: str)
+    | BsonInt32(n: i64)
+    | BsonInt64(n: i64)
+    | BsonTimestamp(increment: i64, seconds: i64)
+    | BsonMinKey
+    | BsonMaxKey
+
+type BsonError =
+    | BsonTruncated(at: i64)
+    | BsonBadType(tag: i64, at: i64)
+    | BsonBadLength(said: i64, actual: i64)
+    | BsonUnterminated(at: i64)
+    | BsonNulInKey(key: str)
+    | BsonNotADocument
+    | BsonBadObjectId(length: i64)
+    | BsonArrayKeyOutOfOrder(expected: str, found: str)
+    | BsonTrailingBytes(at: i64)
+
+    /// A reader's position in a buffer.
+type BsonReader = {
+    data: bytes,
+    at: i64,
+}
+
+pub fn double(f: f64) -> ref BsonValue {
+    return ref(BsonDouble(f))
+}
+
+pub fn text(s: str) -> ref BsonValue {
+    return ref(BsonStr(s))
+}
+
+pub fn boolean(b: bool) -> ref BsonValue {
+    return ref(BsonBool(b))
+}
+
+pub fn null() -> ref BsonValue {
+    return ref(BsonNull)
+}
+
+/// An integer, in the narrowest type that holds it — which is what the
+/// official drivers do, and why a round trip can change an `int64` to an
+/// `int32`.
+pub fn integer(n: i64) -> ref BsonValue {
+    if n >= 0 - 2147483648 and n <= 2147483647 {
+        return ref(BsonInt32(n))
+    }
+    return ref(BsonInt64(n))
+}
+
+pub fn int32(n: i64) -> ref BsonValue {
+    return ref(BsonInt32(n))
+}
+
+pub fn int64(n: i64) -> ref BsonValue {
+    return ref(BsonInt64(n))
+}
+
+pub fn datetime(millis: i64) -> ref BsonValue {
+    return ref(BsonDateTime(millis))
+}
+
+pub fn binary(subtype: i64, data: bytes) -> ref BsonValue {
+    return ref(BsonBinary(subtype, data))
+}
+
+pub fn object_id(id: bytes) -> ref BsonValue ! BsonError {
+    if id.len() != 12 {
+        fail(BsonBadObjectId(id.len()))
+    }
+    return ref(BsonObjectId(id))
+}
+
+pub fn regex(pattern: str, options: str) -> ref BsonValue {
+    return ref(BsonRegex(pattern, options))
+}
+
+pub fn timestamp(increment: i64, seconds: i64) -> ref BsonValue {
+    return ref(BsonTimestamp(increment, seconds))
+}
+
+pub fn array(items: [ref BsonValue]) -> ref BsonValue {
+    return ref(BsonArray(items))
+}
+
+pub fn document(keys: [str], values: [ref BsonValue]) -> ref BsonValue {
+    var ks: [str] = []
+    var vs: [ref BsonValue] = []
+    let n = if keys.len() < values.len() { keys.len() } else { values.len() }
+    for i in 0..n {
+        ks.push(keys[i])
+        vs.push(values[i])
+    }
+    return ref(BsonDoc(ks, vs))
+}
+
+// -------------------------------------------------------------- encoding
+
+fn push_le(inout out: [i64], value: i64, width: i64) {
+    for i in 0..width {
+        out.push(value.ushr(i * 8).bit_and(255))
+    }
+}
+
+fn push_all(inout out: [i64], data: bytes) {
+    for i in 0..data.len() {
+        out.push(data.at(i))
+    }
+}
+
+/// A NUL-terminated key. A NUL inside one cannot be written at all.
+fn push_cstring(inout out: [i64], s: str) ! BsonError {
+    let raw = s.to_bytes()
+    for i in 0..raw.len() {
+        if raw.at(i) == 0 {
+            fail(BsonNulInKey(s))
+        }
+        out.push(raw.at(i))
+    }
+    out.push(0)
+}
+
+/// A length-prefixed string, which also ends in a NUL. The length counts it.
+fn push_string(inout out: [i64], s: str) {
+    let raw = s.to_bytes()
+    push_le(out, raw.len() + 1, 4)
+    push_all(out, raw)
+    out.push(0)
+}
+
+/// The type byte for a value.
+pub fn tag_of(v: ref BsonValue) -> i64 {
+    match v {
+        BsonDouble(_f) -> return 1
+        BsonStr(_s) -> return 2
+        BsonDoc(_k, _v) -> return 3
+        BsonArray(_items) -> return 4
+        BsonBinary(_t, _d) -> return 5
+        BsonObjectId(_id) -> return 7
+        BsonBool(_b) -> return 8
+        BsonDateTime(_m) -> return 9
+        BsonNull -> return 10
+        BsonRegex(_p, _o) -> return 11
+        BsonInt32(_n) -> return 16
+        BsonTimestamp(_i, _s) -> return 17
+        BsonInt64(_n) -> return 18
+        BsonMinKey -> return 0 - 1
+        BsonMaxKey -> return 127
+    }
+}
+
+/// Encode a document. Only a document or an array can be the top level.
+pub fn encode(v: ref BsonValue) -> bytes ! BsonError {
+    match v {
+        BsonDoc(keys, values) -> return bytes_of(try encode_pairs(keys, values))
+        BsonArray(items) -> {
+            var keys: [str] = []
+            for i in 0..items.len() {
+                keys.push("{i}")
+            }
+            return bytes_of(try encode_pairs(keys, items))
+        }
+        _ -> fail(BsonNotADocument)
+    }
+}
+
+fn encode_pairs(keys: [str], values: [ref BsonValue]) -> [i64] ! BsonError {
+    var body: [i64] = []
+    for i in 0..keys.len() {
+        body.push(tag_of(values[i]).bit_and(255))
+        try push_cstring(body, keys[i])
+        try push_value(body, values[i])
+    }
+    var out: [i64] = []
+    // The length counts the four bytes of itself and the terminator.
+    push_le(out, body.len() + 5, 4)
+    for b in body {
+        out.push(b)
+    }
+    out.push(0)
+    return out
+}
+
+fn push_value(inout out: [i64], v: ref BsonValue) ! BsonError {
+    match v {
+        BsonDouble(f) -> push_le(out, f.to_bits(), 8)
+        BsonStr(s) -> push_string(out, s)
+        BsonDoc(_k, _v) -> push_all(out, try encode(v))
+        BsonArray(_items) -> push_all(out, try encode(v))
+        BsonBinary(subtype, data) -> {
+            push_le(out, data.len(), 4)
+            out.push(subtype.bit_and(255))
+            push_all(out, data)
+        }
+        BsonObjectId(id) -> {
+            if id.len() != 12 {
+                fail(BsonBadObjectId(id.len()))
+            }
+            push_all(out, id)
+        }
+        BsonBool(b) -> out.push(if b { 1 } else { 0 })
+        BsonDateTime(millis) -> push_le(out, millis, 8)
+        BsonNull -> {}
+        BsonRegex(pattern, options) -> {
+            try push_cstring(out, pattern)
+            try push_cstring(out, options)
+        }
+        BsonInt32(n) -> push_le(out, n, 4)
+        BsonTimestamp(increment, seconds) -> {
+            push_le(out, increment, 4)
+            push_le(out, seconds, 4)
+        }
+        BsonInt64(n) -> push_le(out, n, 8)
+        BsonMinKey -> {}
+        BsonMaxKey -> {}
+    }
+}
+
+// -------------------------------------------------------------- decoding
+
+fn take_le(inout r: BsonReader, width: i64) -> i64 ! BsonError {
+    if r.at + width > r.data.len() {
+        fail(BsonTruncated(r.at))
+    }
+    var value = 0
+    for i in 0..width {
+        value = value.bit_or(r.data.at(r.at + i).shl(i * 8))
+    }
+    r.at = r.at + width
+    return value
+}
+
+/// A signed 32-bit value, sign-extended.
+///
+/// Without the extension a negative `int32` reads as a number above two
+/// billion, which is a valid `i64` and therefore never noticed.
+fn take_i32(inout r: BsonReader) -> i64 ! BsonError {
+    let raw = try take_le(r, 4)
+    if raw >= 2147483648 {
+        return raw - 4294967296
+    }
+    return raw
+}
+
+fn take_cstring(inout r: BsonReader) -> str ! BsonError {
+    var out: [i64] = []
+    while r.at < r.data.len() and r.data.at(r.at) != 0 {
+        out.push(r.data.at(r.at))
+        r.at = r.at + 1
+    }
+    if r.at >= r.data.len() {
+        fail(BsonUnterminated(r.at))
+    }
+    r.at = r.at + 1
+    return bytes_of(out).to_str()
+}
+
+fn take_string(inout r: BsonReader) -> str ! BsonError {
+    let length = try take_i32(r)
+    if length < 1 or r.at + length > r.data.len() {
+        fail(BsonTruncated(r.at))
+    }
+    if r.data.at(r.at + length - 1) != 0 {
+        fail(BsonUnterminated(r.at + length - 1))
+    }
+    let out = r.data.slice(r.at, r.at + length - 1).to_str()
+    r.at = r.at + length
+    return out
+}
+
+/// Decode one document from the front of a buffer, and require nothing after.
+pub fn decode(data: bytes) -> ref BsonValue ! BsonError {
+    var r = BsonReader{ data: data, at: 0 }
+    let v = try decode_document(r, false)
+    if r.at != data.len() {
+        fail(BsonTrailingBytes(r.at))
+    }
+    return v
+}
+
+/// Decode a document, or an array when `as_array` is set.
+fn decode_document(inout r: BsonReader,
+    as_array: bool) -> ref BsonValue ! BsonError {
+    let start = r.at
+    let said = try take_i32(r)
+    if said < 5 or start + said > r.data.len() {
+        fail(BsonBadLength(said, r.data.len() - start))
+    }
+    let stop = start + said - 1
+    var keys: [str] = []
+    var values: [ref BsonValue] = []
+    while r.at < stop {
+        let tag = r.data.at(r.at)
+        r.at = r.at + 1
+        let key = try take_cstring(r)
+        values.push(try decode_value(r, tag, key))
+        keys.push(key)
+    }
+    if r.at != stop or r.data.at(stop) != 0 {
+        fail(BsonUnterminated(stop))
+    }
+    r.at = stop + 1
+    if as_array {
+        // The indices are part of the format, and a document whose keys are
+        // not `0, 1, 2, ...` is not the array it claims to be.
+        for i in 0..keys.len() {
+            if keys[i] != "{i}" {
+                fail(BsonArrayKeyOutOfOrder("{i}", keys[i]))
+            }
+        }
+        return ref(BsonArray(values))
+    }
+    return ref(BsonDoc(keys, values))
+}
+
+fn decode_value(inout r: BsonReader, tag: i64,
+    key: str) -> ref BsonValue ! BsonError {
+    if tag == 1 {
+        return ref(BsonDouble((try take_le(r, 8)).from_bits()))
+    }
+    if tag == 2 {
+        return ref(BsonStr(try take_string(r)))
+    }
+    if tag == 3 {
+        return try decode_document(r, false)
+    }
+    if tag == 4 {
+        return try decode_document(r, true)
+    }
+    if tag == 5 {
+        let length = try take_i32(r)
+        if length < 0 or r.at + length + 1 > r.data.len() {
+            fail(BsonTruncated(r.at))
+        }
+        let subtype = r.data.at(r.at)
+        r.at = r.at + 1
+        let data = r.data.slice(r.at, r.at + length)
+        r.at = r.at + length
+        return ref(BsonBinary(subtype, data))
+    }
+    if tag == 7 {
+        if r.at + 12 > r.data.len() {
+            fail(BsonTruncated(r.at))
+        }
+        let id = r.data.slice(r.at, r.at + 12)
+        r.at = r.at + 12
+        return ref(BsonObjectId(id))
+    }
+    if tag == 8 {
+        if r.at >= r.data.len() {
+            fail(BsonTruncated(r.at))
+        }
+        let b = r.data.at(r.at)
+        r.at = r.at + 1
+        return ref(BsonBool(b != 0))
+    }
+    if tag == 9 {
+        return ref(BsonDateTime(try take_le(r, 8)))
+    }
+    if tag == 10 {
+        return ref(BsonNull)
+    }
+    if tag == 11 {
+        let pattern = try take_cstring(r)
+        return ref(BsonRegex(pattern, try take_cstring(r)))
+    }
+    if tag == 16 {
+        return ref(BsonInt32(try take_i32(r)))
+    }
+    if tag == 17 {
+        let increment = try take_le(r, 4)
+        return ref(BsonTimestamp(increment, try take_le(r, 4)))
+    }
+    if tag == 18 {
+        return ref(BsonInt64(try take_le(r, 8)))
+    }
+    if tag == 255 {
+        return ref(BsonMinKey)
+    }
+    if tag == 127 {
+        return ref(BsonMaxKey)
+    }
+    // Deprecated and rarely-seen types are refused rather than skipped: a
+    // parser that skips a type it does not understand has to guess how long
+    // it is, and guessing wrong desynchronises everything after it.
+    fail(BsonBadType(tag, r.at - key.to_bytes().len() - 2))
+}
+
+// ------------------------------------------------------------- accessors
+
+pub fn kind(v: ref BsonValue) -> str {
+    match v {
+        BsonDouble(_f) -> return "double"
+        BsonStr(_s) -> return "string"
+        BsonDoc(_k, _v) -> return "document"
+        BsonArray(_items) -> return "array"
+        BsonBinary(_t, _d) -> return "binary"
+        BsonObjectId(_id) -> return "objectId"
+        BsonBool(_b) -> return "bool"
+        BsonDateTime(_m) -> return "date"
+        BsonNull -> return "null"
+        BsonRegex(_p, _o) -> return "regex"
+        BsonInt32(_n) -> return "int32"
+        BsonTimestamp(_i, _s) -> return "timestamp"
+        BsonInt64(_n) -> return "int64"
+        BsonMinKey -> return "minKey"
+        BsonMaxKey -> return "maxKey"
+    }
+}
+
+pub fn get(v: ref BsonValue, key: str) -> Option[ref BsonValue] {
+    match v {
+        BsonDoc(keys, values) -> {
+            for i in 0..keys.len() {
+                if keys[i] == key {
+                    return Some(values[i])
+                }
+            }
+            return None
+        }
+        _ -> return None
+    }
+}
+
+/// A dotted path, so `get_path(doc, "user.address.city")` works.
+pub fn get_path(v: ref BsonValue, dotted: str) -> Option[ref BsonValue] {
+    var current = v
+    for part in dotted.split(".") {
+        match get(current, part) {
+            Some(next) -> current = next
+            None -> return None
+        }
+    }
+    return Some(current)
+}
+
+pub fn at(v: ref BsonValue, i: i64) -> Option[ref BsonValue] {
+    match v {
+        BsonArray(items) -> {
+            if i < 0 or i >= items.len() {
+                return None
+            }
+            return Some(items[i])
+        }
+        _ -> return None
+    }
+}
+
+pub fn keys_of(v: ref BsonValue) -> [str] {
+    match v {
+        BsonDoc(keys, _values) -> return keys
+        _ -> return []
+    }
+}
+
+/// Any integer, whichever width it was stored as.
+pub fn as_int(v: ref BsonValue) -> Option[i64] {
+    match v {
+        BsonInt32(n) -> return Some(n)
+        BsonInt64(n) -> return Some(n)
+        _ -> return None
+    }
+}
+
+pub fn as_str(v: ref BsonValue) -> Option[str] {
+    match v {
+        BsonStr(s) -> return Some(s)
+        _ -> return None
+    }
+}
+
+pub fn as_double(v: ref BsonValue) -> Option[f64] {
+    match v {
+        BsonDouble(f) -> return Some(f)
+        _ -> return None
+    }
+}
+
+pub fn as_bool(v: ref BsonValue) -> Option[bool] {
+    match v {
+        BsonBool(b) -> return Some(b)
+        _ -> return None
+    }
+}
+
+pub fn count(v: ref BsonValue) -> i64 {
+    match v {
+        BsonDoc(keys, _values) -> return keys.len()
+        BsonArray(items) -> return items.len()
+        _ -> return 0
+    }
+}
+
+/// How many bytes the array indices cost.
+///
+/// The number that makes the "arrays are documents" point concrete: a
+/// thousand small integers spend more bytes on keys nobody reads than on the
+/// values.
+pub fn index_overhead(count: i64) -> i64 {
+    var total = 0
+    for i in 0..count {
+        total = total + "{i}".to_bytes().len() + 1
+    }
+    return total
+}

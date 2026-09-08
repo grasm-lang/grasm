@@ -396,7 +396,7 @@ pub fn decode(data: bytes) -> [TarEntry] ! TarError {
         if at + size > data.len() {
             fail(Truncated(at))
         }
-        let body = data.slice(at, size)
+        let body = data.slice(at, at + size)
         at = at + size
         if size % 512 != 0 {
             at = at + (512 - size % 512)

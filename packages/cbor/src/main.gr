@@ -250,7 +250,7 @@ fn take_bytes(inout r: CborReader, n: i64) -> bytes ! CborError {
     if r.at + n > r.data.len() {
         fail(Truncated(r.at))
     }
-    let out = r.data.slice(r.at, n)
+    let out = r.data.slice(r.at, r.at + n)
     r.at = r.at + n
     return out
 }

@@ -233,7 +233,7 @@ pub fn parse(data: bytes) -> Module ! WasmError {
                 if c.at + len > data.len() {
                     fail(Truncated(c.at))
                 }
-                let name = data.slice(c.at, len).to_str()
+                let name = data.slice(c.at, c.at + len).to_str()
                 c.at = c.at + len
                 let kind = try byte_at(c)
                 let index = try uleb(c)
@@ -262,7 +262,7 @@ pub fn parse(data: bytes) -> Module ! WasmError {
                         locals.push(t)
                     }
                 }
-                let body = data.slice(c.at, body_end - c.at)
+                let body = data.slice(c.at, c.at + body_end - c.at)
                 let ti = if i < type_indices.len() { type_indices[i] } else { 0 }
                 funcs.push(WasmFunc{ type_index: ti, locals: locals, body: body })
                 c.at = body_end
@@ -282,7 +282,7 @@ pub fn parse(data: bytes) -> Module ! WasmError {
                     fail(Truncated(c.at))
                 }
                 data_offsets.push(offset)
-                data_bytes.push(data.slice(c.at, len))
+                data_bytes.push(data.slice(c.at, c.at + len))
                 c.at = c.at + len
             }
         } else {

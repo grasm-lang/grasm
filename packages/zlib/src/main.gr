@@ -417,7 +417,7 @@ pub fn decompress(data: bytes, limit: i64) -> bytes ! InflateError {
     if flg.bit_and(32) != 0 {
         fail(BadHeader("a preset dictionary is not supported"))
     }
-    let body = data.slice(2, data.len() - 6)
+    let body = data.slice(2, 2 + data.len() - 6)
     let out = try inflate(body, limit)
     let want = data.at(data.len() - 4).shl(24)
         .bit_or(data.at(data.len() - 3).shl(16))
@@ -451,7 +451,7 @@ pub fn decompress_prefix(data: bytes, limit: i64) -> (bytes, i64) ! InflateError
     if flg.bit_and(32) != 0 {
         fail(BadHeader("a preset dictionary is not supported"))
     }
-    let both = try inflate_prefix(data.slice(2, data.len() - 2), limit)
+    let both = try inflate_prefix(data.slice(2, 2 + data.len() - 2), limit)
     let out = both.0
     let end = 2 + both.1
     if end + 4 > data.len() {

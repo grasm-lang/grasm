@@ -152,7 +152,7 @@ pub fn parse(data: bytes) -> NtpPacket ! NtpError {
         precision: signed_byte(data.at(3)),
         root_delay: read_u32(data, 4),
         root_dispersion: read_u32(data, 8),
-        reference_id: data.slice(12, 4),
+        reference_id: data.slice(12, 12 + 4),
         reference: read_u64(data, 16),
         originate: read_u64(data, 24),
         receive: read_u64(data, 32),

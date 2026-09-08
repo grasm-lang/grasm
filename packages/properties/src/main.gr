@@ -1,0 +1,466 @@
+// Java `.properties` files, including the parts that surprise people.
+//
+// The format looks like `key=value` and is not. Four things about it catch
+// almost everyone, and all four are implemented here rather than approximated:
+//
+// **The file is Latin-1, not UTF-8.** `java.util.Properties.load` reads
+// ISO-8859-1 and nothing else, so a file saved as UTF-8 containing `café`
+// loads in Java as `cafÃ©`. Anything outside Latin-1 has to be written as
+// `\uXXXX`. `parse_bytes` and `render_bytes` do that conversion; `parse` and
+// `render` work on text that has already been decoded.
+//
+// **Three characters separate a key from a value**, not one: `=`, `:`, or
+// whitespace. `server localhost` is a key and a value, and so is
+// `server:localhost`. A parser that splits on `=` reads the first as one long
+// key with an empty value and says nothing.
+//
+// **A backslash continues the line**, and the leading whitespace of the
+// continuation is discarded. That is how a long value is wrapped, and it means
+// a value ending in a backslash is not what it looks like.
+//
+// **A key with no separator is legal** and has an empty value. `debug` on its
+// own is a key present with the value `""`, which is different from absent —
+// and the difference is exactly what a flag needs.
+//
+// Order is kept. A properties file is usually hand-edited and often in a
+// version-control diff, and reordering it on every write makes the diff
+// useless.
+//
+// Checked against Python's `javaproperties`, which implements the same
+// specification.
+
+/// A key and its value, in file order.
+type PropEntry = {
+    key: str,
+    value: str,
+}
+
+/// A parsed file: entries in order, comments dropped.
+type Props = {
+    entry: [PropEntry],
+}
+
+type PropError =
+    | PropBadUnicode(at: i64, text: str)
+    | PropTruncatedEscape(at: i64)
+
+pub fn empty() -> Props {
+    return Props{ entry: [] }
+}
+
+pub fn from_pairs(keys: [str], values: [str]) -> Props {
+    var out: [PropEntry] = []
+    let n = if keys.len() < values.len() { keys.len() } else { values.len() }
+    for i in 0..n {
+        out.push(PropEntry{ key: keys[i], value: values[i] })
+    }
+    return Props{ entry: out }
+}
+
+/// The value for a key, or `None`.
+///
+/// The last one, when a key appears more than once: that is what Java does,
+/// because it loads into a hash map and a later `put` replaces an earlier one.
+pub fn get(p: Props, key: str) -> Option[str] {
+    var found: Option[str] = None
+    for e in p.entry {
+        if e.key == key {
+            found = Some(e.value)
+        }
+    }
+    return found
+}
+
+pub fn get_or(p: Props, key: str, fallback: str) -> str {
+    return get(p, key) ?? fallback
+}
+
+pub fn has(p: Props, key: str) -> bool {
+    return get(p, key) != None
+}
+
+/// Set a key, in place if it is already there and at the end if it is not.
+pub fn set(inout p: Props, key: str, value: str) {
+    for i in 0..p.entry.len() {
+        if p.entry[i].key == key {
+            p.entry[i] = PropEntry{ key: key, value: value }
+            return
+        }
+    }
+    p.entry.push(PropEntry{ key: key, value: value })
+}
+
+pub fn remove(inout p: Props, key: str) {
+    var kept: [PropEntry] = []
+    for e in p.entry {
+        if e.key != key {
+            kept.push(e)
+        }
+    }
+    p.entry = kept
+}
+
+pub fn keys_of(p: Props) -> [str] {
+    var out: [str] = []
+    for e in p.entry {
+        out.push(e.key)
+    }
+    return out
+}
+
+pub fn count(p: Props) -> i64 {
+    return p.entry.len()
+}
+
+/// `later` wins, and its new keys go on the end.
+///
+/// The order that a defaults file and an override file are usually combined
+/// in, and the reason `set` replaces in place: an overridden value stays where
+/// the reader expects to find it.
+pub fn merge(base: Props, later: Props) -> Props {
+    var out = base
+    for e in later.entry {
+        set(out, e.key, e.value)
+    }
+    return out
+}
+
+// ---------------------------------------------------------------- parsing
+
+fn is_space(c: str) -> bool {
+    return c == " " or c == "\t" or c == "\u{c}"
+}
+
+/// Parse the text of a properties file.
+pub fn parse(text: str) -> Props ! PropError {
+    var out: [PropEntry] = []
+    let joined = try logical_lines(text)
+    for line in joined {
+        let trimmed = trim_leading(line)
+        if trimmed == "" or trimmed.starts_with("#") or trimmed.starts_with("!") {
+            continue
+        }
+        let cut = split_point(trimmed)
+        let key = try unescape(trimmed.substr(0, cut.0))
+        let value = try unescape(trimmed.substr(cut.1, trimmed.len() - cut.1))
+        out.push(PropEntry{ key: key, value: value })
+    }
+    return Props{ entry: out }
+}
+
+/// Parse the bytes of a properties file, which are Latin-1.
+///
+/// Each byte is one code point, which is what Latin-1 means and what Java
+/// does. Decoding as UTF-8 instead is the bug this exists to prevent: it
+/// either produces different characters or fails outright on a byte sequence
+/// that is perfectly valid Latin-1.
+pub fn parse_bytes(data: bytes) -> Props ! PropError {
+    var text = ""
+    for i in 0..data.len() {
+        text = text + data.at(i).to_char()
+    }
+    return try parse(text)
+}
+
+fn trim_leading(s: str) -> str {
+    var i = 0
+    while i < s.len() and is_space(s.substr(i, 1)) {
+        i = i + 1
+    }
+    return s.substr(i, s.len() - i)
+}
+
+/// Join lines that a trailing backslash continues.
+///
+/// An odd number of trailing backslashes continues; an even number is escaped
+/// backslashes and ends the line. Counting is the whole of it, and a parser
+/// that just looks at the last character gets `path=C:\\` wrong.
+fn logical_lines(text: str) -> [str] ! PropError {
+    var out: [str] = []
+    var current = ""
+    for raw in text.split("\n") {
+        var line = raw
+        if line.ends_with("\r") {
+            line = line.substr(0, line.len() - 1)
+        }
+        if current != "" {
+            line = trim_leading(line)
+        }
+        var slashes = 0
+        var i = line.len() - 1
+        while i >= 0 and line.substr(i, 1) == "\\" {
+            slashes = slashes + 1
+            i = i - 1
+        }
+        if slashes % 2 == 1 {
+            current = current + line.substr(0, line.len() - 1)
+        } else {
+            out.push(current + line)
+            current = ""
+        }
+    }
+    if current != "" {
+        out.push(current)
+    }
+    return out
+}
+
+/// Where the key ends and where the value begins.
+///
+/// They are two positions because everything between them — whitespace, then
+/// at most one `=` or `:`, then more whitespace — belongs to neither.
+fn split_point(line: str) -> (i64, i64) {
+    var i = 0
+    while i < line.len() {
+        let c = line.substr(i, 1)
+        if c == "\\" {
+            i = i + 2
+            continue
+        }
+        if c == "=" or c == ":" or is_space(c) {
+            let key_end = i
+            var j = i
+            while j < line.len() and is_space(line.substr(j, 1)) {
+                j = j + 1
+            }
+            if j < line.len() and (line.substr(j, 1) == "=" or
+                line.substr(j, 1) == ":") {
+                j = j + 1
+                while j < line.len() and is_space(line.substr(j, 1)) {
+                    j = j + 1
+                }
+            }
+            return (key_end, j)
+        }
+        i = i + 1
+    }
+    // No separator at all: the whole line is a key with an empty value.
+    return (line.len(), line.len())
+}
+
+fn hex_of(c: str) -> i64 {
+    if c >= "0" and c <= "9" {
+        return c.to_bytes().at(0) - 48
+    }
+    if c >= "a" and c <= "f" {
+        return c.to_bytes().at(0) - 87
+    }
+    if c >= "A" and c <= "F" {
+        return c.to_bytes().at(0) - 55
+    }
+    return 0 - 1
+}
+
+/// Undo the escapes.
+///
+/// An unknown escape is the character itself, which is what Java does — `\q`
+/// is `q`. That is lenient, and it is the specified behaviour, so a stricter
+/// parser here would reject files Java accepts.
+pub fn unescape(s: str) -> str ! PropError {
+    var out = ""
+    var i = 0
+    while i < s.len() {
+        let c = s.substr(i, 1)
+        if c != "\\" {
+            out = out + c
+            i = i + 1
+            continue
+        }
+        if i + 1 >= s.len() {
+            fail(PropTruncatedEscape(i))
+        }
+        let next = s.substr(i + 1, 1)
+        if next == "u" {
+            if i + 6 > s.len() {
+                fail(PropTruncatedEscape(i))
+            }
+            var value = 0
+            for k in 0..4 {
+                let digit = hex_of(s.substr(i + 2 + k, 1))
+                if digit < 0 {
+                    fail(PropBadUnicode(i, s.substr(i, 6)))
+                }
+                value = value * 16 + digit
+            }
+            out = out + value.to_char()
+            i = i + 6
+            continue
+        }
+        if next == "t" {
+            out = out + "\t"
+        } else {
+            if next == "n" {
+                out = out + "\n"
+            } else {
+                if next == "r" {
+                    out = out + "\r"
+                } else {
+                    if next == "f" {
+                        out = out + "\u{c}"
+                    } else {
+                        out = out + next
+                    }
+                }
+            }
+        }
+        i = i + 2
+    }
+    return out
+}
+
+// --------------------------------------------------------------- writing
+
+/// Escape a key: the separators must not appear unescaped, and neither may a
+/// leading space.
+pub fn escape_key(s: str) -> str {
+    return escape(s, true)
+}
+
+/// Escape a value: a leading space is escaped, later spaces need not be.
+pub fn escape_value(s: str) -> str {
+    return escape(s, false)
+}
+
+fn escape(s: str, is_key: bool) -> str {
+    var out = ""
+    var i = 0
+    for c in s.chars() {
+        if c == "\\" {
+            out = out + "\\\\"
+        } else {
+            if c == "\n" {
+                out = out + "\\n"
+            } else {
+                if c == "\r" {
+                    out = out + "\\r"
+                } else {
+                    if c == "\t" {
+                        out = out + "\\t"
+                    } else {
+                        if c == "\u{c}" {
+                            out = out + "\\f"
+                        } else {
+                            out = out + escape_plain(c, is_key, i)
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn escape_plain(c: str, is_key: bool, at: i64) -> str {
+    if c == "=" or c == ":" {
+        return "\\" + c
+    }
+    // `#` and `!` only begin a comment at the start of a line, and Java's own
+    // writer escapes them wherever they appear anyway. Matching that is what
+    // makes a file written here byte-identical to one Java wrote.
+    if c == "#" or c == "!" {
+        return "\\" + c
+    }
+    if c == " " {
+        if is_key or at == 0 {
+            return "\\ "
+        }
+        return " "
+    }
+    return c
+}
+
+/// The whole file as text, one `key=value` a line.
+pub fn render(p: Props) -> str {
+    var out = ""
+    for e in p.entry {
+        out = out + escape_key(e.key) + "=" + escape_value(e.value) + "\n"
+    }
+    return out
+}
+
+/// The whole file as text, with every non-ASCII character as `\uXXXX`.
+///
+/// The safest form: it is valid in any encoding a reader might guess, so it
+/// survives being moved between systems that disagree about the default. This
+/// is what most tooling emits, including Python's `javaproperties`.
+///
+/// Java's own `Properties.store` does not do this — it writes Latin-1 bytes
+/// and escapes only what Latin-1 cannot hold, which is `render_bytes`. Both
+/// are correct and they are not the same file.
+pub fn render_ascii(p: Props) -> str {
+    var out = ""
+    for e in p.entry {
+        out = out + ascii_only(escape_key(e.key)) + "=" +
+        ascii_only(escape_value(e.value)) + "\n"
+    }
+    return out
+}
+
+fn ascii_only(s: str) -> str {
+    var out = ""
+    for code in s.codes() {
+        if code < 128 {
+            out = out + code.to_char()
+        } else {
+            out = out + unicode_escape(code)
+        }
+    }
+    return out
+}
+
+/// The whole file as Latin-1 bytes, with everything else as `\uXXXX`.
+///
+/// This is the form a Java program can actually read. `render` on its own
+/// produces text that has to be encoded as Latin-1 by whoever writes it, and
+/// a character above 255 cannot be — so it is escaped here instead of being
+/// silently mangled at the point of writing.
+pub fn render_bytes(p: Props) -> bytes {
+    var out: [i64] = []
+    for e in p.entry {
+        push_latin1(out, escape_key(e.key))
+        out.push(61)
+        push_latin1(out, escape_value(e.value))
+        out.push(10)
+    }
+    return bytes_of(out)
+}
+
+fn push_latin1(inout out: [i64], s: str) {
+    for code in s.codes() {
+        if code < 256 {
+            out.push(code)
+        } else {
+            for d in unicode_escape(code).codes() {
+                out.push(d)
+            }
+        }
+    }
+}
+
+fn unicode_escape(code: i64) -> str {
+    let digits = "0123456789abcdef"
+    var out = "\\u"
+    var shift = 12
+    while shift >= 0 {
+        let nibble = code.ushr(shift).bit_and(15)
+        out = out + digits.substr(nibble, 1)
+        shift = shift - 4
+    }
+    return out
+}
+
+/// Whether every character can be written as one Latin-1 byte.
+///
+/// Worth asking before handing a file to a Java program: if this is false,
+/// the file needs `render_bytes` and not `render`.
+pub fn fits_latin1(p: Props) -> bool {
+    for e in p.entry {
+        for code in (e.key + e.value).codes() {
+            if code > 255 {
+                return false
+            }
+        }
+    }
+    return true
+}

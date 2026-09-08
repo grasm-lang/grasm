@@ -4451,21 +4451,31 @@ uses to mark the end of a string"
                 }
                 Value::Int(b[i as usize] as i64)
             }
+            // `slice(start, end)`, with `end` exclusive — the same shape as
+            // `list.slice`. It took a length until F97: two methods with one
+            // name and two meanings, where passing the wrong one produced a
+            // slice of the wrong size rather than an error.
+            //
+            // Unlike `list.slice` this refuses an out-of-range end instead of
+            // clamping to it. A list is usually being trimmed, where clamping
+            // is what the caller meant; `bytes` is usually being parsed, where
+            // a short read is a truncated message and silently returning the
+            // bytes that happen to be there is how a parser accepts a corrupt
+            // one.
             (Value::Bytes(b), "slice") => {
                 let Value::Int(from) = self.eval_expr(&args[0])? else {
                     return Err(Flow::Panic("slice expects an integer".into()));
                 };
-                let Value::Int(count) = self.eval_expr(&args[1])? else {
+                let Value::Int(end) = self.eval_expr(&args[1])? else {
                     return Err(Flow::Panic("slice expects an integer".into()));
                 };
-                if from < 0 || count < 0 || (from + count) as usize > b.len() {
+                if from < 0 || end < from || end as usize > b.len() {
                     return Err(Flow::Panic(format!(
-                        "slice {from}..{} out of bounds (len {})",
-                        from + count,
+                        "slice {from}..{end} out of bounds (len {})",
                         b.len()
                     )));
                 }
-                Value::Bytes(Rc::new(b[from as usize..(from + count) as usize].to_vec()))
+                Value::Bytes(Rc::new(b[from as usize..end as usize].to_vec()))
             }
             (Value::Bytes(b), "concat") => {
                 let Value::Bytes(other) = self.eval_expr(&args[0])? else {

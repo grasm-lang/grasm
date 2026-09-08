@@ -374,7 +374,7 @@ fn read_manifest(dir: str) -> [str] ! StoreError / {io} {
         if at + len > b.len() {
             fail(Corrupt(p))
         }
-        out.push(b.slice(at, len).to_str())
+        out.push(b.slice(at, at + len).to_str())
         at = at + len
     }
     out

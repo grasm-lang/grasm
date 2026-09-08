@@ -1,0 +1,6 @@
+[package]
+name = "bson"
+version = "1.0.0"
+
+# Parsing bytes. Opens nothing.
+capabilities = []

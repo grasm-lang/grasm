@@ -253,7 +253,7 @@ pub fn decompress_framed(data: bytes) -> bytes ! Lz4Error {
     for i in 0..4 {
         size = size.bit_or(data.at(i).shl(i * 8))
     }
-    return try decompress(data.slice(4, data.len() - 4), size)
+    return try decompress(data.slice(4, 4 + data.len() - 4), size)
 }
 
 pub fn framed_size(data: bytes) -> i64 {

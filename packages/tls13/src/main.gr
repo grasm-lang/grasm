@@ -213,7 +213,7 @@ pub fn open_record(k: TrafficKeys, sequence: i64, record: bytes) -> (i64, bytes)
         fail(TooShort(record.len()))
     }
     let header = record.slice(0, 5)
-    let body = record.slice(5, length)
+    let body = record.slice(5, 5 + length)
     let inner = match aes.gcm_open(k.key, record_nonce(k.iv, sequence), header, body) {
         Ok(b) -> b
         Err(_e) -> fail(NotAuthentic)

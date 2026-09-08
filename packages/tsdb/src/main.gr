@@ -186,7 +186,7 @@ pub fn query(path: str, name: str, from: i64, upto: i64) -> QueryResult ! Series
         if p + name_len.0 > peek.len() {
             fail(Corrupt("a series name runs past the header"))
         }
-        let block_name = peek.slice(p, name_len.0).to_str()
+        let block_name = peek.slice(p, p + name_len.0).to_str()
         p = p + name_len.0
         let body_len = try read_varint(peek, p, path)
         p = body_len.1

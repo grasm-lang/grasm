@@ -273,7 +273,7 @@ pub fn parse(der: bytes) -> CertFacts ! ChainError {
             var signature = bytes_of([])
             let last = top[top.len() - 1]
             if last.tag == asn1.BIT_STRING and last.len > 1 {
-                signature = der.slice(last.body + 1, last.len - 1)
+                signature = der.slice(last.body + 1, last.body + 1 + last.len - 1)
             }
             return CertFacts{
                 der: der, tbs_at: tbs.at, tbs_len: tbs.body + tbs.len - tbs.at,
@@ -312,14 +312,14 @@ fn read_basic_constraints(der: bytes, nodes: [DerNode], at: i64) -> (bool, i64) 
     while i < nodes.len() and i < at + 8 {
         let n = nodes[i]
         if n.tag == asn1.OCTET_STRING {
-            match asn1.parse(der.slice(n.body, n.len)) {
+            match asn1.parse(der.slice(n.body, n.body + n.len)) {
                 Ok(inner) -> {
                     for k in 0..inner.len() {
                         if inner[k].tag == asn1.BOOLEAN {
                             is_ca = der.at(n.body + inner[k].body) != 0
                         }
                         if inner[k].tag == asn1.INTEGER {
-                            path = asn1.integer_of(der.slice(n.body, n.len),
+                            path = asn1.integer_of(der.slice(n.body, n.body + n.len),
                                 inner[k])
                         }
                     }
@@ -338,7 +338,7 @@ fn read_key_usage(der: bytes, nodes: [DerNode], at: i64) -> i64 {
     while i < nodes.len() and i < at + 8 {
         let n = nodes[i]
         if n.tag == asn1.OCTET_STRING {
-            match asn1.parse(der.slice(n.body, n.len)) {
+            match asn1.parse(der.slice(n.body, n.body + n.len)) {
                 Ok(inner) -> {
                     for k in 0..inner.len() {
                         if inner[k].tag == asn1.BIT_STRING and inner[k].len >= 2 {
@@ -362,13 +362,13 @@ fn read_alt_names(der: bytes, nodes: [DerNode], at: i64) -> ([str], [str]) {
     while i < nodes.len() and i < at + 8 {
         let n = nodes[i]
         if n.tag == asn1.OCTET_STRING {
-            let body = der.slice(n.body, n.len)
+            let body = der.slice(n.body, n.body + n.len)
             match asn1.parse(body) {
                 Ok(inner) -> {
                     for k in 0..inner.len() {
                         // Context tag 2 is dNSName, 7 is iPAddress.
                         if inner[k].tag == 130 {
-                            dns.push(body.slice(inner[k].body, inner[k].len).to_str())
+                            dns.push(body.slice(inner[k].body, inner[k].body + inner[k].len).to_str())
                         } else if inner[k].tag == 135 {
                             ips.push(address_of(body, inner[k]))
                         }
@@ -416,7 +416,7 @@ pub fn public_key_der(c: CertFacts) -> bytes ! ChainError {
                 let parts = asn1.children(nodes, i)
                 if parts.len() == 2 and parts[0].tag == asn1.SEQUENCE and
                 parts[1].tag == asn1.BIT_STRING{
-                    return c.der.slice(n.at, n.body + n.len - n.at)
+                    return c.der.slice(n.at, n.at + n.body + n.len - n.at)
                 }
             }
             fail(NotACertificate("no SubjectPublicKeyInfo"))
@@ -561,7 +561,7 @@ pub fn verify_chain(leaf: CertFacts, pool: [CertFacts], roots: [CertFacts],
     for i in 0..(path.len() - 1) {
         let subject = path[i]
         let issuer = path[i + 1]
-        let signed = subject.der.slice(subject.tbs_at, subject.tbs_len)
+        let signed = subject.der.slice(subject.tbs_at, subject.tbs_at + subject.tbs_len)
         if not verify(signed, subject.signature, subject.signature_algorithm,
             issuer.der) {
             fail(BadSignature(subject.subject))

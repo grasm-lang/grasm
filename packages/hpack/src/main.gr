@@ -212,7 +212,7 @@ fn read_string(data: bytes, at: i64) -> (str, i64) ! HpackError {
     if length < 0 or start + length > data.len() {
         fail(Truncated(start))
     }
-    let raw = data.slice(start, length)
+    let raw = data.slice(start, start + length)
     if huffman {
         (try huffman_decode(raw), start + length)
     } else {

@@ -1,0 +1,14 @@
+[package]
+name = "avro"
+version = "1.0.0"
+
+# Parsing bytes and text. Opens nothing.
+capabilities = []
+
+[dependencies.json]
+path = "../json"
+version = "^1.0.0"
+
+[dependencies.zlib]
+path = "../zlib"
+version = "^1.0.0"

@@ -14,7 +14,7 @@ fn main() {
     // ways here, because the representation differs by how it was made.
     let literal = bytes_of([104, 105])
     let text = "hi".to_bytes()
-    let cut = bytes_of([32, 104, 105, 32]).slice(1, 2)
+    let cut = bytes_of([32, 104, 105, 32]).slice(1, 1 + 2)
     let joined = bytes_of([104]).concat(bytes_of([105]))
     print("{literal == literal} {literal == text} {literal == cut} " +
         "{literal == joined} {literal == bytes_of([104, 106])}")

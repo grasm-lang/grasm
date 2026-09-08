@@ -1,0 +1,889 @@
+// Apple property lists, in both of the formats that are actually used.
+//
+// A `.plist` on a Mac is either XML or `bplist00`, and which one it is cannot
+// be told from the extension — only from the first eight bytes. `parse` looks,
+// so a caller does not have to. `Info.plist` in an app bundle is usually
+// binary; one written by hand is usually XML; `defaults write` produces
+// binary; and the two hold exactly the same values.
+//
+// Three things about the binary format are worth stating, because they are
+// where a hand-written reader goes wrong.
+//
+// **Everything is a reference into an object table.** A binary plist is a list
+// of objects and a table of their offsets, and containers hold *indices* into
+// that table rather than nested bytes. That is what lets the same string
+// appear once and be referenced fifty times, and it is why the trailer has to
+// be read before anything else.
+//
+// **The reference width is variable and stated in the trailer.** One byte
+// while the file has fewer than 256 objects, two after that. A reader that
+// assumes one byte works on every small file and fails on the first real one.
+//
+// **Strings are ASCII or UTF-16 big-endian, never UTF-8.** Marker `0x5` is
+// ASCII and `0x6` is UTF-16BE, so a string containing one accented character
+// changes encoding and doubles in size. There is no UTF-8 string type at all.
+//
+// And one about dates in both formats: **the epoch is 2001-01-01**, not 1970.
+// A date read as a Unix timestamp is out by 978,307,200 seconds — a little
+// over 31 years — which is far enough to look like corrupt data and close
+// enough to look like a real date.
+//
+// Checked against Python's `plistlib` in both formats and both directions.
+
+import xml
+import bytes_codec
+
+type PlistValue =
+    | PlistBool(b: bool)
+    | PlistInt(n: i64)
+    | PlistReal(f: f64)
+    | PlistStr(s: str)
+    | PlistData(data: bytes)
+    | PlistDate(seconds: f64)
+    | PlistArray(items: [ref PlistValue])
+    | PlistDict(keys: [str], values: [ref PlistValue])
+
+type PlistError =
+    | PlistNotAPlist
+    | PlistTruncated(at: i64)
+    | PlistBadMarker(marker: i64, at: i64)
+    | PlistBadReference(index: i64, count: i64)
+    | PlistBadXml(why: str)
+    | PlistUnknownTag(name: str)
+    | PlistOddDictionary(at: i64)
+    | PlistTooDeep(depth: i64)
+
+    /// Seconds between the Unix epoch and the one Apple chose.
+    ///
+    /// Apple's reference date is 2001-01-01T00:00:00Z. Adding this to a plist
+    /// date gives a Unix timestamp; forgetting to is a date in 1970 that looks
+    /// plausible.
+pub fn epoch_offset() -> f64 {
+    return 978307200.0
+}
+
+pub fn boolean(b: bool) -> ref PlistValue {
+    return ref(PlistBool(b))
+}
+
+pub fn integer(n: i64) -> ref PlistValue {
+    return ref(PlistInt(n))
+}
+
+pub fn real(f: f64) -> ref PlistValue {
+    return ref(PlistReal(f))
+}
+
+pub fn text(s: str) -> ref PlistValue {
+    return ref(PlistStr(s))
+}
+
+pub fn data(d: bytes) -> ref PlistValue {
+    return ref(PlistData(d))
+}
+
+/// A date, in seconds since Apple's 2001 epoch.
+pub fn date(seconds: f64) -> ref PlistValue {
+    return ref(PlistDate(seconds))
+}
+
+/// A date, from a Unix timestamp.
+pub fn date_from_unix(seconds: f64) -> ref PlistValue {
+    return ref(PlistDate(seconds - epoch_offset()))
+}
+
+pub fn array(items: [ref PlistValue]) -> ref PlistValue {
+    return ref(PlistArray(items))
+}
+
+pub fn dictionary(keys: [str], values: [ref PlistValue]) -> ref PlistValue {
+    var ks: [str] = []
+    var vs: [ref PlistValue] = []
+    let n = if keys.len() < values.len() { keys.len() } else { values.len() }
+    for i in 0..n {
+        ks.push(keys[i])
+        vs.push(values[i])
+    }
+    return ref(PlistDict(ks, vs))
+}
+
+pub fn kind(v: ref PlistValue) -> str {
+    match v {
+        PlistBool(_b) -> return "bool"
+        PlistInt(_n) -> return "integer"
+        PlistReal(_f) -> return "real"
+        PlistStr(_s) -> return "string"
+        PlistData(_d) -> return "data"
+        PlistDate(_s) -> return "date"
+        PlistArray(_items) -> return "array"
+        PlistDict(_k, _v) -> return "dict"
+    }
+}
+
+pub fn get(v: ref PlistValue, key: str) -> Option[ref PlistValue] {
+    match v {
+        PlistDict(keys, values) -> {
+            for i in 0..keys.len() {
+                if keys[i] == key {
+                    return Some(values[i])
+                }
+            }
+            return None
+        }
+        _ -> return None
+    }
+}
+
+pub fn at(v: ref PlistValue, i: i64) -> Option[ref PlistValue] {
+    match v {
+        PlistArray(items) -> {
+            if i < 0 or i >= items.len() {
+                return None
+            }
+            return Some(items[i])
+        }
+        _ -> return None
+    }
+}
+
+/// How many entries a container holds, and zero for anything else.
+pub fn count(v: ref PlistValue) -> i64 {
+    match v {
+        PlistArray(items) -> return items.len()
+        PlistDict(keys, _values) -> return keys.len()
+        _ -> return 0
+    }
+}
+
+pub fn keys_of(v: ref PlistValue) -> [str] {
+    match v {
+        PlistDict(keys, _values) -> return keys
+        _ -> return []
+    }
+}
+
+pub fn as_str(v: ref PlistValue) -> Option[str] {
+    match v {
+        PlistStr(s) -> return Some(s)
+        _ -> return None
+    }
+}
+
+pub fn as_int(v: ref PlistValue) -> Option[i64] {
+    match v {
+        PlistInt(n) -> return Some(n)
+        _ -> return None
+    }
+}
+
+pub fn as_bool(v: ref PlistValue) -> Option[bool] {
+    match v {
+        PlistBool(b) -> return Some(b)
+        _ -> return None
+    }
+}
+
+pub fn as_real(v: ref PlistValue) -> Option[f64] {
+    match v {
+        PlistReal(f) -> return Some(f)
+        _ -> return None
+    }
+}
+
+/// Whether these bytes are a binary plist.
+pub fn is_binary(raw: bytes) -> bool {
+    if raw.len() < 8 {
+        return false
+    }
+    return raw.slice(0, 8).to_str() == "bplist00"
+}
+
+/// Parse either format, deciding from the first eight bytes.
+pub fn parse(raw: bytes) -> ref PlistValue ! PlistError {
+    if is_binary(raw) {
+        return try parse_binary(raw)
+    }
+    return try parse_xml(raw.to_str())
+}
+
+// -------------------------------------------------------- binary reading
+
+/// What the trailer says about the file.
+type PlistTrailer = {
+    offset_size: i64,
+    reference_size: i64,
+    object_count: i64,
+    top_object: i64,
+    table_at: i64,
+}
+
+fn read_be(raw: bytes, at: i64, width: i64) -> i64 ! PlistError {
+    if at + width > raw.len() {
+        fail(PlistTruncated(at))
+    }
+    var value = 0
+    for i in 0..width {
+        value = value.shl(8).bit_or(raw.at(at + i))
+    }
+    return value
+}
+
+pub fn parse_binary(raw: bytes) -> ref PlistValue ! PlistError {
+    if not is_binary(raw) or raw.len() < 40 {
+        fail(PlistNotAPlist)
+    }
+    let base = raw.len() - 32
+    let trailer = PlistTrailer{
+        offset_size: raw.at(base + 6),
+        reference_size: raw.at(base + 7),
+        object_count: try read_be(raw, base + 8, 8),
+        top_object: try read_be(raw, base + 16, 8),
+        table_at: try read_be(raw, base + 24, 8),
+    }
+    if trailer.offset_size < 1 or trailer.offset_size > 8 or
+    trailer.reference_size < 1 or trailer.reference_size > 8 {
+        fail(PlistNotAPlist)
+    }
+    var offsets: [i64] = []
+    for i in 0..trailer.object_count {
+        let at = trailer.table_at + i * trailer.offset_size
+        offsets.push(try read_be(raw, at, trailer.offset_size))
+    }
+    return try read_object(raw, offsets, trailer, trailer.top_object, 0)
+}
+
+/// The length a marker carries: the low nibble, or a following integer object
+/// when the nibble is `0xF`.
+fn marker_length(raw: bytes, at: i64, low: i64) -> (i64, i64) ! PlistError {
+    if low != 15 {
+        return (low, at + 1)
+    }
+    let next = raw.at(at + 1)
+    if next.ushr(4) != 1 {
+        fail(PlistBadMarker(next, at + 1))
+    }
+    let width = (2).shl(next.bit_and(15)) / 2
+    return (try read_be(raw, at + 2, width), at + 2 + width)
+}
+
+fn read_object(raw: bytes, offsets: [i64], trailer: PlistTrailer, index: i64,
+    depth: i64) -> ref PlistValue ! PlistError {
+    if depth > 64 {
+        fail(PlistTooDeep(depth))
+    }
+    if index < 0 or index >= offsets.len() {
+        fail(PlistBadReference(index, offsets.len()))
+    }
+    let at = offsets[index]
+    if at >= raw.len() {
+        fail(PlistTruncated(at))
+    }
+    let marker = raw.at(at)
+    let high = marker.ushr(4)
+    let low = marker.bit_and(15)
+    if high == 0 {
+        if low == 8 {
+            return ref(PlistBool(false))
+        }
+        if low == 9 {
+            return ref(PlistBool(true))
+        }
+        fail(PlistBadMarker(marker, at))
+    }
+    if high == 1 {
+        let width = (2).shl(low) / 2
+        var value = try read_be(raw, at + 1, width)
+        // Only the eight-byte form is signed; the shorter ones never are.
+        if width == 8 and value < 0 {
+            value = value
+        }
+        return ref(PlistInt(value))
+    }
+    if high == 2 {
+        if low == 2 {
+            let bits = try read_be(raw, at + 1, 4)
+            return ref(PlistReal(f32_from_bits(bits)))
+        }
+        return ref(PlistReal((try read_be(raw, at + 1, 8)).from_bits()))
+    }
+    if high == 3 {
+        return ref(PlistDate((try read_be(raw, at + 1, 8)).from_bits()))
+    }
+    return try read_sized(raw, offsets, trailer, at, high, low, depth)
+}
+
+fn read_sized(raw: bytes, offsets: [i64], trailer: PlistTrailer, at: i64,
+    high: i64, low: i64, depth: i64) -> ref PlistValue ! PlistError {
+    let sized = try marker_length(raw, at, low)
+    let count = sized.0
+    let body = sized.1
+    if high == 4 {
+        if body + count > raw.len() {
+            fail(PlistTruncated(body))
+        }
+        return ref(PlistData(raw.slice(body, body + count)))
+    }
+    if high == 5 {
+        if body + count > raw.len() {
+            fail(PlistTruncated(body))
+        }
+        return ref(PlistStr(raw.slice(body, body + count).to_str()))
+    }
+    if high == 6 {
+        return ref(PlistStr(try utf16_be(raw, body, count)))
+    }
+    if high == 10 or high == 12 {
+        var items: [ref PlistValue] = []
+        for i in 0..count {
+            let r = try read_be(raw, body + i * trailer.reference_size,
+                trailer.reference_size)
+            items.push(try read_object(raw, offsets, trailer, r, depth + 1))
+        }
+        return ref(PlistArray(items))
+    }
+    if high == 13 {
+        var keys: [str] = []
+        var values: [ref PlistValue] = []
+        // Every key first, then every value — not key, value, key, value.
+        for i in 0..count {
+            let r = try read_be(raw, body + i * trailer.reference_size,
+                trailer.reference_size)
+            match try read_object(raw, offsets, trailer, r, depth + 1) {
+                PlistStr(s) -> keys.push(s)
+                _ -> fail(PlistOddDictionary(body))
+            }
+        }
+        for i in 0..count {
+            let r = try read_be(raw,
+                body + (count + i) * trailer.reference_size,
+                trailer.reference_size)
+            values.push(try read_object(raw, offsets, trailer, r, depth + 1))
+        }
+        return ref(PlistDict(keys, values))
+    }
+    fail(PlistBadMarker(high.shl(4).bit_or(low), at))
+}
+
+/// A 32-bit float, widened by hand.
+///
+/// There is no four-byte float in the language, so the sign, exponent and
+/// mantissa are re-laid-out into the 64-bit form. Reading the four bytes as
+/// though they were the top half of a double gives a number that is wrong by
+/// a factor of about `10^300`.
+fn f32_from_bits(bits: i64) -> f64 {
+    let sign = bits.ushr(31).bit_and(1)
+    let exponent = bits.ushr(23).bit_and(255)
+    let mantissa = bits.bit_and(8388607)
+    if exponent == 0 and mantissa == 0 {
+        if sign == 1 {
+            return (0 - 9223372036854775807 - 1).from_bits()
+        }
+        return 0.0
+    }
+    if exponent == 255 {
+        return (sign.shl(63).bit_or(2047).shl(52).bit_or(
+            mantissa.shl(29))).from_bits()
+    }
+    let wide = sign.shl(63).bit_or((exponent - 127 + 1023).shl(52)).bit_or(
+        mantissa.shl(29))
+    return wide.from_bits()
+}
+
+fn utf16_be(raw: bytes, at: i64, units: i64) -> str ! PlistError {
+    if at + units * 2 > raw.len() {
+        fail(PlistTruncated(at))
+    }
+    var out = ""
+    var i = 0
+    while i < units {
+        let unit = raw.at(at + i * 2).shl(8).bit_or(raw.at(at + i * 2 + 1))
+        if unit >= 55296 and unit <= 56319 and i + 1 < units {
+            let low = raw.at(at + i * 2 + 2).shl(8).bit_or(
+                raw.at(at + i * 2 + 3))
+            out = out + (65536 + (unit - 55296) * 1024 + (low - 56320)).to_char()
+            i = i + 2
+        } else {
+            out = out + unit.to_char()
+            i = i + 1
+        }
+    }
+    return out
+}
+
+// -------------------------------------------------------- binary writing
+
+/// Objects laid out in the order the writer emits them.
+///
+/// `seen_key` and `seen_index` are the deduplication table: equal scalars are
+/// written once and referenced many times, which is what the object table is
+/// for and what Apple's writer does. A dictionary of a hundred records that
+/// all carry the same status string stores that string once.
+type PlistWriter = {
+    body: [i64],
+    offset: [i64],
+    reference_size: i64,
+    seen_key: [str],
+    seen_index: [i64],
+}
+
+/// Encode as `bplist00`.
+pub fn render_binary(v: ref PlistValue) -> bytes ! PlistError {
+    var counted: [str] = []
+    let total = count_objects(v, counted)
+    var w = PlistWriter{ body: [], offset: [], reference_size: 1,
+        seen_key: [], seen_index: [] }
+    if total > 255 {
+        w.reference_size = 2
+    }
+    if total > 65535 {
+        w.reference_size = 4
+    }
+    for c in "bplist00".to_bytes().to_list() {
+        w.body.push(c)
+    }
+    let _root = try write_object(w, v)
+    let table_at = w.body.len()
+    var offset_size = 1
+    if table_at > 255 {
+        offset_size = 2
+    }
+    if table_at > 65535 {
+        offset_size = 4
+    }
+    for o in w.offset {
+        push_be(w.body, o, offset_size)
+    }
+    for _i in 0..6 {
+        w.body.push(0)
+    }
+    w.body.push(offset_size)
+    w.body.push(w.reference_size)
+    push_be(w.body, w.offset.len(), 8)
+    push_be(w.body, 0, 8)
+    push_be(w.body, table_at, 8)
+    return bytes_of(w.body)
+}
+
+fn push_be(inout out: [i64], value: i64, width: i64) {
+    for i in 0..width {
+        out.push(value.ushr((width - 1 - i) * 8).bit_and(255))
+    }
+}
+
+/// How many distinct objects a value becomes, which fixes the reference width.
+///
+/// Distinct, not total: the width has to match what the writer actually emits,
+/// and the writer shares equal scalars. Counting every occurrence would push a
+/// file with 300 references to 20 distinct strings up to two-byte references
+/// that it does not need — valid, larger, and not what any other writer
+/// produces.
+fn count_objects(v: ref PlistValue, inout seen: [str]) -> i64 {
+    match v {
+        PlistArray(items) -> {
+            var n = 1
+            for item in items {
+                n = n + count_objects(item, seen)
+            }
+            return n
+        }
+        PlistDict(keys, values) -> {
+            var n = 1
+            for key in keys {
+                n = n + count_objects(ref(PlistStr(key)), seen)
+            }
+            for value in values {
+                n = n + count_objects(value, seen)
+            }
+            return n
+        }
+        _ -> {
+            let key = scalar_key(v)
+            for k in seen {
+                if k == key {
+                    return 0
+                }
+            }
+            seen.push(key)
+            return 1
+        }
+    }
+}
+
+/// A scalar's identity, for the sharing table.
+///
+/// The type is part of the key: `1` as an integer and `1.0` as a real are
+/// different objects and a reader that shared them would change the type of
+/// one of them.
+fn scalar_key(v: ref PlistValue) -> str {
+    match v {
+        PlistBool(b) -> return "b{b}"
+        PlistInt(n) -> return "i{n}"
+        PlistReal(f) -> return "r{f.to_bits()}"
+        PlistStr(s) -> return "s{s}"
+        PlistData(d) -> return "d{d.to_list()}"
+        PlistDate(seconds) -> return "t{seconds.to_bits()}"
+        _ -> return "?"
+    }
+}
+
+/// Write one object and return its index.
+///
+/// The index is claimed before the children are written, so a container's own
+/// index is lower than everything it holds — which is the order Apple's
+/// reader expects even though the format does not require it.
+fn write_object(inout w: PlistWriter, v: ref PlistValue) -> i64 ! PlistError {
+    var shared = false
+    match v {
+        PlistArray(_items) -> {}
+        PlistDict(_k, _v) -> {}
+        _ -> shared = true
+    }
+    let key = scalar_key(v)
+    if shared {
+        for i in 0..w.seen_key.len() {
+            if w.seen_key[i] == key {
+                return w.seen_index[i]
+            }
+        }
+    }
+    let index = w.offset.len()
+    if shared {
+        w.seen_key.push(key)
+        w.seen_index.push(index)
+    }
+    w.offset.push(w.body.len())
+    match v {
+        PlistBool(b) -> w.body.push(if b { 9 } else { 8 })
+        PlistInt(n) -> write_int(w, n)
+        PlistReal(f) -> {
+            w.body.push(35)
+            push_be(w.body, f.to_bits(), 8)
+        }
+        PlistStr(s) -> write_string(w, s)
+        PlistData(d) -> {
+            write_marker(w, 4, d.len())
+            for i in 0..d.len() {
+                w.body.push(d.at(i))
+            }
+        }
+        PlistDate(seconds) -> {
+            w.body.push(51)
+            push_be(w.body, seconds.to_bits(), 8)
+        }
+        PlistArray(items) -> {
+            write_marker(w, 10, items.len())
+            let hole = w.body.len()
+            for _i in 0..(items.len() * w.reference_size) {
+                w.body.push(0)
+            }
+            for i in 0..items.len() {
+                let child = try write_object(w, items[i])
+                patch(w, hole + i * w.reference_size, child)
+            }
+        }
+        PlistDict(keys, values) -> {
+            write_marker(w, 13, keys.len())
+            let hole = w.body.len()
+            for _i in 0..(keys.len() * 2 * w.reference_size) {
+                w.body.push(0)
+            }
+            for i in 0..keys.len() {
+                let child = try write_object(w, ref(PlistStr(keys[i])))
+                patch(w, hole + i * w.reference_size, child)
+            }
+            for i in 0..values.len() {
+                let child = try write_object(w, values[i])
+                patch(w, hole + (keys.len() + i) * w.reference_size, child)
+            }
+        }
+    }
+    return index
+}
+
+fn patch(inout w: PlistWriter, at: i64, value: i64) {
+    for i in 0..w.reference_size {
+        w.body[at + i] = value.ushr((w.reference_size - 1 - i) * 8).bit_and(255)
+    }
+}
+
+fn write_marker(inout w: PlistWriter, high: i64, count: i64) {
+    if count < 15 {
+        w.body.push(high.shl(4).bit_or(count))
+    } else {
+        w.body.push(high.shl(4).bit_or(15))
+        write_int(w, count)
+    }
+}
+
+fn write_int(inout w: PlistWriter, n: i64) {
+    if n >= 0 and n < 256 {
+        w.body.push(16)
+        w.body.push(n)
+        return
+    }
+    if n >= 0 and n < 65536 {
+        w.body.push(17)
+        push_be(w.body, n, 2)
+        return
+    }
+    if n >= 0 and n < 4294967296 {
+        w.body.push(18)
+        push_be(w.body, n, 4)
+        return
+    }
+    // Everything else, negatives included, in the eight-byte form: the
+    // shorter widths are unsigned, so `-1` in one byte is `255`.
+    w.body.push(19)
+    push_be(w.body, n, 8)
+}
+
+/// ASCII where it fits, UTF-16 big-endian where it does not.
+fn write_string(inout w: PlistWriter, s: str) {
+    var ascii = true
+    for code in s.codes() {
+        if code > 127 {
+            ascii = false
+        }
+    }
+    if ascii {
+        write_marker(w, 5, s.len())
+        for code in s.codes() {
+            w.body.push(code)
+        }
+        return
+    }
+    var units: [i64] = []
+    for code in s.codes() {
+        if code < 65536 {
+            units.push(code)
+        } else {
+            let rest = code - 65536
+            units.push(55296 + rest / 1024)
+            units.push(56320 + rest % 1024)
+        }
+    }
+    write_marker(w, 6, units.len())
+    for unit in units {
+        push_be(w.body, unit, 2)
+    }
+}
+
+// ------------------------------------------------------------------- XML
+
+/// Parse an XML property list.
+pub fn parse_xml(text: str) -> ref PlistValue ! PlistError {
+    match xml.parse(text) {
+        Err(e) -> fail(PlistBadXml(e.why))
+        Ok(root) -> {
+            let inner = xml.children_of(root)
+            for child in inner {
+                if xml.name_of(child) != "" {
+                    return try from_element(child, 0)
+                }
+            }
+            fail(PlistNotAPlist)
+        }
+    }
+}
+
+fn from_element(node: ref Node, depth: i64) -> ref PlistValue ! PlistError {
+    if depth > 64 {
+        fail(PlistTooDeep(depth))
+    }
+    let name = xml.name_of(node)
+    if name == "true" {
+        return ref(PlistBool(true))
+    }
+    if name == "false" {
+        return ref(PlistBool(false))
+    }
+    if name == "string" {
+        return ref(PlistStr(xml.text_of(node)))
+    }
+    if name == "integer" {
+        return ref(PlistInt(xml.text_of(node).trim().parse_int() ?? 0))
+    }
+    if name == "real" {
+        return ref(PlistReal(xml.text_of(node).trim().parse_float() ?? 0.0))
+    }
+    if name == "data" {
+        return ref(PlistData(bytes_codec.decode_base64(
+            strip_space(xml.text_of(node))) ?? "".to_bytes()))
+    }
+    if name == "date" {
+        return ref(PlistDate(try seconds_of(xml.text_of(node).trim())))
+    }
+    if name == "array" {
+        var items: [ref PlistValue] = []
+        for child in xml.children_of(node) {
+            if xml.name_of(child) != "" {
+                items.push(try from_element(child, depth + 1))
+            }
+        }
+        return ref(PlistArray(items))
+    }
+    if name == "dict" {
+        return try dict_from(node, depth)
+    }
+    fail(PlistUnknownTag(name))
+}
+
+/// A `<dict>` is a flat run of `<key>` followed by a value, which is why an
+/// odd number of children is a malformed file rather than a missing value.
+fn dict_from(node: ref Node, depth: i64) -> ref PlistValue ! PlistError {
+    var keys: [str] = []
+    var values: [ref PlistValue] = []
+    var pending = ""
+    var have_key = false
+    for child in xml.children_of(node) {
+        let child_name = xml.name_of(child)
+        if child_name == "" {
+            continue
+        }
+        if child_name == "key" {
+            if have_key {
+                fail(PlistOddDictionary(keys.len()))
+            }
+            pending = xml.text_of(child)
+            have_key = true
+        } else {
+            if not have_key {
+                fail(PlistOddDictionary(keys.len()))
+            }
+            keys.push(pending)
+            values.push(try from_element(child, depth + 1))
+            have_key = false
+        }
+    }
+    if have_key {
+        fail(PlistOddDictionary(keys.len()))
+    }
+    return ref(PlistDict(keys, values))
+}
+
+fn strip_space(s: str) -> str {
+    var out = ""
+    for c in s.chars() {
+        if c != " " and c != "\n" and c != "\t" and c != "\r" {
+            out = out + c
+        }
+    }
+    return out
+}
+
+/// `2020-09-13T12:26:40Z` to seconds since Apple's epoch.
+fn seconds_of(text: str) -> f64 ! PlistError {
+    if text.len() < 20 {
+        fail(PlistBadXml(text))
+    }
+    let year = text.substr(0, 4).parse_int() ?? 0
+    let month = text.substr(5, 2).parse_int() ?? 0
+    let day = text.substr(8, 2).parse_int() ?? 0
+    let hour = text.substr(11, 2).parse_int() ?? 0
+    let minute = text.substr(14, 2).parse_int() ?? 0
+    let second = text.substr(17, 2).parse_int() ?? 0
+    let days = days_from_civil(year, month, day)
+    return (days * 86400 + hour * 3600 + minute * 60 + second).as_f64() -
+    epoch_offset()
+}
+
+/// Days since 1970-01-01, by Howard Hinnant's civil-date algorithm.
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    var y = year
+    if month <= 2 {
+        y = y - 1
+    }
+    let era = (if y >= 0 { y } else { y - 399 }) / 400
+    let year_of_era = y - era * 400
+    let month_shift = if month > 2 { month - 3 } else { month + 9 }
+    let day_of_year = (153 * month_shift + 2) / 5 + day - 1
+    let day_of_era = year_of_era * 365 + year_of_era / 4 -
+    year_of_era / 100 + day_of_year
+    return era * 146097 + day_of_era - 719468
+}
+
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let z = days + 719468
+    let era = (if z >= 0 { z } else { z - 146096 }) / 146097
+    let day_of_era = z - era * 146097
+    let year_of_era = (day_of_era - day_of_era / 1460 + day_of_era / 36524 -
+        day_of_era / 146096) / 365
+    let y = year_of_era + era * 400
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 -
+        year_of_era / 100)
+    let month_shift = (5 * day_of_year + 2) / 153
+    let day = day_of_year - (153 * month_shift + 2) / 5 + 1
+    let month = if month_shift < 10 { month_shift + 3 } else { month_shift - 9 }
+    return (if month <= 2 { y + 1 } else { y }, month, day)
+}
+
+fn two(n: i64) -> str {
+    if n < 10 {
+        return "0{n}"
+    }
+    return "{n}"
+}
+
+/// The XML form, as `plistlib` writes it.
+pub fn render_xml(v: ref PlistValue) -> str {
+    return "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" +
+    "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" " +
+    "\"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n" +
+    "<plist version=\"1.0\">\n" + render_element(v, 0) + "</plist>\n"
+}
+
+fn indent(depth: i64) -> str {
+    var out = ""
+    for _i in 0..depth {
+        out = out + "\t"
+    }
+    return out
+}
+
+fn render_element(v: ref PlistValue, depth: i64) -> str {
+    let pad = indent(depth)
+    match v {
+        PlistBool(b) -> return pad + (if b { "<true/>" } else { "<false/>" }) +
+        "\n"
+        PlistInt(n) -> return pad + "<integer>{n}</integer>\n"
+        PlistReal(f) -> return pad + "<real>{f}</real>\n"
+        PlistStr(s) -> return pad + "<string>" + xml.escape_text(s) +
+        "</string>\n"
+        PlistData(d) -> return pad + "<data>\n" + pad +
+        bytes_codec.encode_base64(d) + "\n" + pad + "</data>\n"
+        PlistDate(seconds) -> return pad + "<date>" + iso_of(seconds) +
+        "</date>\n"
+        PlistArray(items) -> {
+            if items.len() == 0 {
+                return pad + "<array/>\n"
+            }
+            var out = pad + "<array>\n"
+            for item in items {
+                out = out + render_element(item, depth + 1)
+            }
+            return out + pad + "</array>\n"
+        }
+        PlistDict(keys, values) -> {
+            if keys.len() == 0 {
+                return pad + "<dict/>\n"
+            }
+            var out = pad + "<dict>\n"
+            for i in 0..keys.len() {
+                out = out + indent(depth + 1) + "<key>" +
+                xml.escape_text(keys[i]) + "</key>\n" +
+                render_element(values[i], depth + 1)
+            }
+            return out + pad + "</dict>\n"
+        }
+    }
+}
+
+/// Apple-epoch seconds as the ISO 8601 form a plist carries.
+pub fn iso_of(seconds: f64) -> str {
+    let unix = (seconds + epoch_offset()).as_i64()
+    let days = if unix >= 0 { unix / 86400 } else { (unix - 86399) / 86400 }
+    let rest = unix - days * 86400
+    let civil = civil_from_days(days)
+    return "{civil.0}-{two(civil.1)}-{two(civil.2)}T{two(rest / 3600)}:" +
+    "{two(rest % 3600 / 60)}:{two(rest % 60)}Z"
+}

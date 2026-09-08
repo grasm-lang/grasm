@@ -1,0 +1,941 @@
+// Apache Avro: the binary encoding and the container file.
+//
+// The one fact that explains everything else about Avro: **the data carries no
+// field names.** A record is its field values, concatenated, with nothing
+// between them. `{"id": 1, "name": "a"}` is three bytes. That is where the
+// size advantage over JSON and Protocol Buffers comes from — Protobuf still
+// writes a tag per field — and it is also the trap: reading with the wrong
+// schema does not fail, it returns plausible values in the wrong places. The
+// schema is not documentation, it is part of the decoder.
+//
+// Which is why the container format exists. An `.avro` file carries its own
+// writer's schema in the header, so a file is self-describing even though the
+// records inside it are not.
+//
+// Three encoding details worth stating:
+//
+// **Integers are zigzag varints.** `-1` is one byte, not ten: the sign is
+// moved into the low bit before the varint so that small negative numbers stay
+// small. A varint written without the zigzag step makes every negative number
+// ten bytes long.
+//
+// **A nullable field is a union, and costs a byte.** There is no "optional";
+// `["null", "string"]` is a two-branch union whose encoding is the branch index
+// followed by the value. So a nullable string that is present costs one byte
+// more than a plain one, and the branch order in the schema is part of the
+// wire format.
+//
+// **Arrays and maps are written in blocks, and a negative count means the
+// byte size follows.** That is what lets a reader skip an array it does not
+// want without decoding it, and it means an encoder is free to split a large
+// array however it likes — so two encoders produce different bytes for the
+// same array and both are correct.
+//
+// The `deflate` codec is read but not written. Writing it needs a real
+// compressor, and framing the data in stored deflate blocks — which is all
+// this could do — produces a file that is valid, larger than the uncompressed
+// one, and labelled as compressed. `null` is what this writes.
+//
+// Checked against `fastavro` in both directions.
+
+import json
+import zlib
+
+type AvroSchema =
+    | AvroNull
+    | AvroBool
+    | AvroInt
+    | AvroLong
+    | AvroFloat
+    | AvroDouble
+    | AvroBytes
+    | AvroString
+    | AvroRecord(name: str, field_names: [str], field_types: [ref AvroSchema])
+    | AvroEnum(name: str, symbols: [str])
+    | AvroArray(items: ref AvroSchema)
+    | AvroMap(values: ref AvroSchema)
+    | AvroUnion(options: [ref AvroSchema])
+    | AvroFixed(name: str, size: i64)
+
+type AvroValue =
+    | AvNull
+    | AvBool(b: bool)
+    | AvLong(n: i64)
+    | AvDouble(f: f64)
+    | AvBytes(data: bytes)
+    | AvStr(s: str)
+    | AvRecord(names: [str], values: [ref AvroValue])
+    | AvEnum(symbol: str)
+    | AvArray(items: [ref AvroValue])
+    | AvMap(keys: [str], values: [ref AvroValue])
+    | AvFixed(data: bytes)
+
+    /// A container file: the writer's schema, the codec, and the records.
+type AvroFile = {
+    schema: ref AvroSchema,
+    codec: str,
+    record: [ref AvroValue],
+}
+
+type AvroError =
+    | AvroBadSchema(why: str)
+    | AvroUnknownType(name: str)
+    | AvroTruncated(at: i64)
+    | AvroTypeMismatch(wanted: str, got: str)
+    | AvroNoUnionBranch(got: str)
+    | AvroUnknownSymbol(symbol: str)
+    | AvroBadFixedSize(wanted: i64, got: i64)
+    | AvroNotAContainer
+    | AvroUnsupportedCodec(codec: str)
+    | AvroBadSync(at: i64)
+    | AvroVarintTooLong(at: i64)
+
+type AvroReader = {
+    data: bytes,
+    at: i64,
+}
+
+// ------------------------------------------------------------ the schema
+
+/// Parse a schema from its JSON form.
+pub fn parse_schema(text: str) -> ref AvroSchema ! AvroError {
+    match json.parse(text) {
+        Err(e) -> fail(AvroBadSchema(e.why))
+        Ok(v) -> return try schema_of(v)
+    }
+}
+
+fn schema_of(v: ref Json) -> ref AvroSchema ! AvroError {
+    match v {
+        JStr(name) -> return try named(name)
+        JList(items) -> {
+            var options: [ref AvroSchema] = []
+            for item in items {
+                options.push(try schema_of(item))
+            }
+            return ref(AvroUnion(options))
+        }
+        JObj(_keys, _values) -> return try object_schema(v)
+        _ -> fail(AvroBadSchema("a schema is a name, a union or an object"))
+    }
+}
+
+fn named(name: str) -> ref AvroSchema ! AvroError {
+    if name == "null" {
+        return ref(AvroNull)
+    }
+    if name == "boolean" {
+        return ref(AvroBool)
+    }
+    if name == "int" {
+        return ref(AvroInt)
+    }
+    if name == "long" {
+        return ref(AvroLong)
+    }
+    if name == "float" {
+        return ref(AvroFloat)
+    }
+    if name == "double" {
+        return ref(AvroDouble)
+    }
+    if name == "bytes" {
+        return ref(AvroBytes)
+    }
+    if name == "string" {
+        return ref(AvroString)
+    }
+    fail(AvroUnknownType(name))
+}
+
+fn object_schema(v: ref Json) -> ref AvroSchema ! AvroError {
+    let kind = json.as_str(json.get(v, "type") ?? json.null()) ?? ""
+    if kind == "record" or kind == "error" {
+        let name = json.as_str(json.get(v, "name") ?? json.null()) ?? ""
+        var names: [str] = []
+        var types: [ref AvroSchema] = []
+        match json.get(v, "fields") {
+            Some(fields) -> {
+                for field in json.items_of(fields) {
+                    names.push(json.as_str(json.get(field, "name") ??
+                        json.null()) ?? "")
+                    match json.get(field, "type") {
+                        Some(t) -> types.push(try schema_of(t))
+                        None -> fail(AvroBadSchema("a field needs a type"))
+                    }
+                }
+            }
+            None -> fail(AvroBadSchema("a record needs fields"))
+        }
+        return ref(AvroRecord(name, names, types))
+    }
+    if kind == "enum" {
+        let name = json.as_str(json.get(v, "name") ?? json.null()) ?? ""
+        var symbols: [str] = []
+        match json.get(v, "symbols") {
+            Some(list) -> {
+                for s in json.items_of(list) {
+                    symbols.push(json.as_str(s) ?? "")
+                }
+            }
+            None -> fail(AvroBadSchema("an enum needs symbols"))
+        }
+        return ref(AvroEnum(name, symbols))
+    }
+    if kind == "array" {
+        match json.get(v, "items") {
+            Some(items) -> return ref(AvroArray(try schema_of(items)))
+            None -> fail(AvroBadSchema("an array needs items"))
+        }
+    }
+    if kind == "map" {
+        match json.get(v, "values") {
+            Some(values) -> return ref(AvroMap(try schema_of(values)))
+            None -> fail(AvroBadSchema("a map needs values"))
+        }
+    }
+    if kind == "fixed" {
+        let name = json.as_str(json.get(v, "name") ?? json.null()) ?? ""
+        let size = json.as_int(json.get(v, "size") ?? json.null()) ?? 0
+        return ref(AvroFixed(name, size))
+    }
+    // `{"type": "string"}` is a primitive wearing an object, which is legal
+    // and is what a schema with a logical type looks like.
+    return try named(kind)
+}
+
+/// The schema back as JSON, in the form a container header carries.
+pub fn schema_json(s: ref AvroSchema) -> str {
+    match s {
+        AvroNull -> return "\"null\""
+        AvroBool -> return "\"boolean\""
+        AvroInt -> return "\"int\""
+        AvroLong -> return "\"long\""
+        AvroFloat -> return "\"float\""
+        AvroDouble -> return "\"double\""
+        AvroBytes -> return "\"bytes\""
+        AvroString -> return "\"string\""
+        AvroRecord(name, names, types) -> {
+            var parts: [str] = []
+            for i in 0..names.len() {
+                parts.push("\{\"name\": \"" + names[i] + "\", \"type\": " +
+                    schema_json(types[i]) + "}")
+            }
+            return "\{\"type\": \"record\", \"name\": \"" + name +
+            "\", \"fields\": [" + parts.join(", ") + "]}"
+        }
+        AvroEnum(name, symbols) -> {
+            var parts: [str] = []
+            for symbol in symbols {
+                parts.push("\"" + symbol + "\"")
+            }
+            return "\{\"type\": \"enum\", \"name\": \"" + name +
+            "\", \"symbols\": [" + parts.join(", ") + "]}"
+        }
+        AvroArray(items) -> return "\{\"type\": \"array\", \"items\": " +
+        schema_json(items) + "}"
+        AvroMap(values) -> return "\{\"type\": \"map\", \"values\": " +
+        schema_json(values) + "}"
+        AvroUnion(options) -> {
+            var parts: [str] = []
+            for option in options {
+                parts.push(schema_json(option))
+            }
+            return "[" + parts.join(", ") + "]"
+        }
+        AvroFixed(name, size) -> return "\{\"type\": \"fixed\", \"name\": \"" +
+        name + "\", \"size\": {size}}"
+    }
+}
+
+pub fn schema_kind(s: ref AvroSchema) -> str {
+    match s {
+        AvroNull -> return "null"
+        AvroBool -> return "boolean"
+        AvroInt -> return "int"
+        AvroLong -> return "long"
+        AvroFloat -> return "float"
+        AvroDouble -> return "double"
+        AvroBytes -> return "bytes"
+        AvroString -> return "string"
+        AvroRecord(_n, _f, _t) -> return "record"
+        AvroEnum(_n, _s) -> return "enum"
+        AvroArray(_i) -> return "array"
+        AvroMap(_v) -> return "map"
+        AvroUnion(_o) -> return "union"
+        AvroFixed(_n, _s) -> return "fixed"
+    }
+}
+
+// ------------------------------------------------------------- varints
+
+/// Move the sign into the low bit, so `-1` is `1` and stays one byte.
+pub fn zigzag(n: i64) -> i64 {
+    return n.shl(1).bit_xor(n.shr(63))
+}
+
+pub fn unzigzag(n: i64) -> i64 {
+    return n.ushr(1).bit_xor(0 - n.bit_and(1))
+}
+
+fn push_long(inout out: [i64], n: i64) {
+    var v = zigzag(n)
+    while true {
+        let low = v.bit_and(127)
+        v = v.ushr(7)
+        if v == 0 {
+            out.push(low)
+            return
+        }
+        out.push(low.bit_or(128))
+    }
+}
+
+fn take_long(inout r: AvroReader) -> i64 ! AvroError {
+    var shift = 0
+    var value = 0
+    while shift < 70 {
+        if r.at >= r.data.len() {
+            fail(AvroTruncated(r.at))
+        }
+        let b = r.data.at(r.at)
+        r.at = r.at + 1
+        value = value.bit_or(b.bit_and(127).shl(shift))
+        if b < 128 {
+            return unzigzag(value)
+        }
+        shift = shift + 7
+    }
+    fail(AvroVarintTooLong(r.at))
+}
+
+// ------------------------------------------------------------- encoding
+
+pub fn null_value() -> ref AvroValue {
+    return ref(AvNull)
+}
+
+pub fn boolean(b: bool) -> ref AvroValue {
+    return ref(AvBool(b))
+}
+
+pub fn long(n: i64) -> ref AvroValue {
+    return ref(AvLong(n))
+}
+
+pub fn double(f: f64) -> ref AvroValue {
+    return ref(AvDouble(f))
+}
+
+pub fn text(s: str) -> ref AvroValue {
+    return ref(AvStr(s))
+}
+
+pub fn binary(data: bytes) -> ref AvroValue {
+    return ref(AvBytes(data))
+}
+
+pub fn fixed(data: bytes) -> ref AvroValue {
+    return ref(AvFixed(data))
+}
+
+pub fn enumeration(symbol: str) -> ref AvroValue {
+    return ref(AvEnum(symbol))
+}
+
+pub fn array(items: [ref AvroValue]) -> ref AvroValue {
+    return ref(AvArray(items))
+}
+
+pub fn mapping(keys: [str], values: [ref AvroValue]) -> ref AvroValue {
+    return ref(AvMap(keys, values))
+}
+
+pub fn record(names: [str], values: [ref AvroValue]) -> ref AvroValue {
+    return ref(AvRecord(names, values))
+}
+
+pub fn value_kind(v: ref AvroValue) -> str {
+    match v {
+        AvNull -> return "null"
+        AvBool(_b) -> return "boolean"
+        AvLong(_n) -> return "long"
+        AvDouble(_f) -> return "double"
+        AvBytes(_d) -> return "bytes"
+        AvStr(_s) -> return "string"
+        AvRecord(_n, _v) -> return "record"
+        AvEnum(_s) -> return "enum"
+        AvArray(_i) -> return "array"
+        AvMap(_k, _v) -> return "map"
+        AvFixed(_d) -> return "fixed"
+    }
+}
+
+/// Encode one value against a schema.
+pub fn encode(s: ref AvroSchema, v: ref AvroValue) -> bytes ! AvroError {
+    var out: [i64] = []
+    try write_value(out, s, v)
+    return bytes_of(out)
+}
+
+fn write_value(inout out: [i64], s: ref AvroSchema,
+    v: ref AvroValue) ! AvroError {
+    match s {
+        AvroNull -> {}
+        AvroBool -> out.push(if (try want_bool(v)) { 1 } else { 0 })
+        AvroInt -> push_long(out, try want_long(v))
+        AvroLong -> push_long(out, try want_long(v))
+        AvroFloat -> push_le(out, f32_bits(try want_double(v)), 4)
+        AvroDouble -> push_le(out, (try want_double(v)).to_bits(), 8)
+        AvroBytes -> {
+            let data = try want_bytes(v)
+            push_long(out, data.len())
+            push_all(out, data)
+        }
+        AvroString -> {
+            let raw = (try want_str(v)).to_bytes()
+            push_long(out, raw.len())
+            push_all(out, raw)
+        }
+        AvroRecord(_name, names, types) -> {
+            match v {
+                AvRecord(field_names, values) -> {
+                    for i in 0..names.len() {
+                        try write_value(out, types[i],
+                            try field_of(names[i], field_names, values))
+                    }
+                }
+                _ -> fail(AvroTypeMismatch("record", value_kind(v)))
+            }
+        }
+        AvroEnum(_name, symbols) -> {
+            match v {
+                AvEnum(symbol) -> {
+                    var at = 0 - 1
+                    for i in 0..symbols.len() {
+                        if symbols[i] == symbol {
+                            at = i
+                        }
+                    }
+                    if at < 0 {
+                        fail(AvroUnknownSymbol(symbol))
+                    }
+                    push_long(out, at)
+                }
+                _ -> fail(AvroTypeMismatch("enum", value_kind(v)))
+            }
+        }
+        AvroArray(items) -> try write_array(out, items, v)
+        AvroMap(values) -> try write_map(out, values, v)
+        AvroUnion(options) -> {
+            let branch = try union_branch(options, v)
+            push_long(out, branch)
+            try write_value(out, options[branch], v)
+        }
+        AvroFixed(_name, size) -> {
+            let data = try want_bytes(v)
+            if data.len() != size {
+                fail(AvroBadFixedSize(size, data.len()))
+            }
+            push_all(out, data)
+        }
+    }
+}
+
+fn write_array(inout out: [i64], items: ref AvroSchema,
+    v: ref AvroValue) ! AvroError {
+    match v {
+        AvArray(values) -> {
+            if values.len() > 0 {
+                push_long(out, values.len())
+                for item in values {
+                    try write_value(out, items, item)
+                }
+            }
+            // A zero-length block ends the array, and an empty array is
+            // nothing but that terminator.
+            push_long(out, 0)
+        }
+        _ -> fail(AvroTypeMismatch("array", value_kind(v)))
+    }
+}
+
+fn write_map(inout out: [i64], values: ref AvroSchema,
+    v: ref AvroValue) ! AvroError {
+    match v {
+        AvMap(keys, items) -> {
+            if keys.len() > 0 {
+                push_long(out, keys.len())
+                for i in 0..keys.len() {
+                    let raw = keys[i].to_bytes()
+                    push_long(out, raw.len())
+                    push_all(out, raw)
+                    try write_value(out, values, items[i])
+                }
+            }
+            push_long(out, 0)
+        }
+        _ -> fail(AvroTypeMismatch("map", value_kind(v)))
+    }
+}
+
+/// Which branch of a union a value belongs to.
+///
+/// By type, which is the only thing available: an Avro value carries no branch
+/// tag of its own. The first branch whose type matches wins, which is why a
+/// union of `["int", "long"]` is a schema to avoid.
+fn union_branch(options: [ref AvroSchema], v: ref AvroValue) -> i64 ! AvroError {
+    for i in 0..options.len() {
+        if fits(options[i], v) {
+            return i
+        }
+    }
+    fail(AvroNoUnionBranch(value_kind(v)))
+}
+
+fn fits(s: ref AvroSchema, v: ref AvroValue) -> bool {
+    let wanted = schema_kind(s)
+    let got = value_kind(v)
+    if wanted == got {
+        return true
+    }
+    if (wanted == "int" or wanted == "long") and got == "long" {
+        return true
+    }
+    if (wanted == "float" or wanted == "double") and got == "double" {
+        return true
+    }
+    if wanted == "fixed" and got == "bytes" {
+        return true
+    }
+    if wanted == "record" and got == "record" {
+        return true
+    }
+    return false
+}
+
+fn field_of(name: str, names: [str],
+    values: [ref AvroValue]) -> ref AvroValue ! AvroError {
+    for i in 0..names.len() {
+        if names[i] == name {
+            return values[i]
+        }
+    }
+    fail(AvroTypeMismatch(name, "missing"))
+}
+
+fn want_bool(v: ref AvroValue) -> bool ! AvroError {
+    match v {
+        AvBool(b) -> return b
+        _ -> fail(AvroTypeMismatch("boolean", value_kind(v)))
+    }
+}
+
+fn want_long(v: ref AvroValue) -> i64 ! AvroError {
+    match v {
+        AvLong(n) -> return n
+        _ -> fail(AvroTypeMismatch("long", value_kind(v)))
+    }
+}
+
+fn want_double(v: ref AvroValue) -> f64 ! AvroError {
+    match v {
+        AvDouble(f) -> return f
+        AvLong(n) -> return n.as_f64()
+        _ -> fail(AvroTypeMismatch("double", value_kind(v)))
+    }
+}
+
+fn want_str(v: ref AvroValue) -> str ! AvroError {
+    match v {
+        AvStr(s) -> return s
+        _ -> fail(AvroTypeMismatch("string", value_kind(v)))
+    }
+}
+
+fn want_bytes(v: ref AvroValue) -> bytes ! AvroError {
+    match v {
+        AvBytes(data) -> return data
+        AvFixed(data) -> return data
+        _ -> fail(AvroTypeMismatch("bytes", value_kind(v)))
+    }
+}
+
+fn push_le(inout out: [i64], value: i64, width: i64) {
+    for i in 0..width {
+        out.push(value.ushr(i * 8).bit_and(255))
+    }
+}
+
+fn push_all(inout out: [i64], data: bytes) {
+    for i in 0..data.len() {
+        out.push(data.at(i))
+    }
+}
+
+/// A double narrowed to the 32-bit layout, for the `float` type.
+fn f32_bits(f: f64) -> i64 {
+    let bits = f.to_bits()
+    let sign = bits.ushr(63).bit_and(1)
+    let exponent = bits.ushr(52).bit_and(2047)
+    let mantissa = bits.bit_and(4503599627370495)
+    if exponent == 0 {
+        return sign.shl(31)
+    }
+    if exponent == 2047 {
+        return sign.shl(31).bit_or((255).shl(23)).bit_or(mantissa.ushr(29))
+    }
+    let narrowed = exponent - 1023 + 127
+    if narrowed <= 0 {
+        return sign.shl(31)
+    }
+    if narrowed >= 255 {
+        return sign.shl(31).bit_or((255).shl(23))
+    }
+    // Round to nearest, ties to even — the same rule the hardware uses, and
+    // the difference between agreeing with every other encoder and being one
+    // bit out on half the values.
+    let dropped = mantissa.bit_and(536870911)
+    var low = mantissa.ushr(29)
+    if dropped > 268435456 or (dropped == 268435456 and low.bit_and(1) == 1) {
+        low = low + 1
+    }
+    return sign.shl(31).bit_or(narrowed.shl(23)).bit_or(low)
+}
+
+fn f32_to_f64(bits: i64) -> f64 {
+    let sign = bits.ushr(31).bit_and(1)
+    let exponent = bits.ushr(23).bit_and(255)
+    let mantissa = bits.bit_and(8388607)
+    if exponent == 0 and mantissa == 0 {
+        if sign == 1 {
+            return (0 - 9223372036854775807 - 1).from_bits()
+        }
+        return 0.0
+    }
+    if exponent == 255 {
+        return sign.shl(63).bit_or((2047).shl(52)).bit_or(
+            mantissa.shl(29)).from_bits()
+    }
+    return sign.shl(63).bit_or((exponent - 127 + 1023).shl(52)).bit_or(
+        mantissa.shl(29)).from_bits()
+}
+
+// ------------------------------------------------------------- decoding
+
+/// Decode one value against a schema.
+pub fn decode(s: ref AvroSchema, data: bytes) -> ref AvroValue ! AvroError {
+    var r = AvroReader{ data: data, at: 0 }
+    return try read_value(r, s)
+}
+
+fn read_value(inout r: AvroReader,
+    s: ref AvroSchema) -> ref AvroValue ! AvroError {
+    match s {
+        AvroNull -> return ref(AvNull)
+        AvroBool -> {
+            if r.at >= r.data.len() {
+                fail(AvroTruncated(r.at))
+            }
+            let b = r.data.at(r.at)
+            r.at = r.at + 1
+            return ref(AvBool(b != 0))
+        }
+        AvroInt -> return ref(AvLong(try take_long(r)))
+        AvroLong -> return ref(AvLong(try take_long(r)))
+        AvroFloat -> return ref(AvDouble(f32_to_f64(try take_le(r, 4))))
+        AvroDouble -> return ref(AvDouble((try take_le(r, 8)).from_bits()))
+        AvroBytes -> return ref(AvBytes(try take_run(r)))
+        AvroString -> return ref(AvStr((try take_run(r)).to_str()))
+        AvroRecord(_name, names, types) -> {
+            var values: [ref AvroValue] = []
+            for i in 0..names.len() {
+                values.push(try read_value(r, types[i]))
+            }
+            return ref(AvRecord(names, values))
+        }
+        AvroEnum(_name, symbols) -> {
+            let at = try take_long(r)
+            if at < 0 or at >= symbols.len() {
+                fail(AvroUnknownSymbol("{at}"))
+            }
+            return ref(AvEnum(symbols[at]))
+        }
+        AvroArray(items) -> return try read_array(r, items)
+        AvroMap(values) -> return try read_map(r, values)
+        AvroUnion(options) -> {
+            let branch = try take_long(r)
+            if branch < 0 or branch >= options.len() {
+                fail(AvroNoUnionBranch("{branch}"))
+            }
+            return try read_value(r, options[branch])
+        }
+        AvroFixed(_name, size) -> {
+            if r.at + size > r.data.len() {
+                fail(AvroTruncated(r.at))
+            }
+            let out = r.data.slice(r.at, r.at + size)
+            r.at = r.at + size
+            return ref(AvFixed(out))
+        }
+    }
+}
+
+/// A block count, and the byte size that a negative count carries.
+///
+/// A negative count means "this many items, and here is how many bytes they
+/// occupy" — the form that lets a reader skip the block entirely. The size is
+/// read and discarded here, because this reader always decodes.
+fn block_count(inout r: AvroReader) -> i64 ! AvroError {
+    var count = try take_long(r)
+    if count < 0 {
+        count = 0 - count
+        let _size = try take_long(r)
+    }
+    return count
+}
+
+fn read_array(inout r: AvroReader,
+    items: ref AvroSchema) -> ref AvroValue ! AvroError {
+    var out: [ref AvroValue] = []
+    var count = try block_count(r)
+    while count > 0 {
+        for _i in 0..count {
+            out.push(try read_value(r, items))
+        }
+        count = try block_count(r)
+    }
+    return ref(AvArray(out))
+}
+
+fn read_map(inout r: AvroReader,
+    values: ref AvroSchema) -> ref AvroValue ! AvroError {
+    var keys: [str] = []
+    var out: [ref AvroValue] = []
+    var count = try block_count(r)
+    while count > 0 {
+        for _i in 0..count {
+            keys.push((try take_run(r)).to_str())
+            out.push(try read_value(r, values))
+        }
+        count = try block_count(r)
+    }
+    return ref(AvMap(keys, out))
+}
+
+fn take_le(inout r: AvroReader, width: i64) -> i64 ! AvroError {
+    if r.at + width > r.data.len() {
+        fail(AvroTruncated(r.at))
+    }
+    var value = 0
+    for i in 0..width {
+        value = value.bit_or(r.data.at(r.at + i).shl(i * 8))
+    }
+    r.at = r.at + width
+    return value
+}
+
+fn take_run(inout r: AvroReader) -> bytes ! AvroError {
+    let length = try take_long(r)
+    if length < 0 or r.at + length > r.data.len() {
+        fail(AvroTruncated(r.at))
+    }
+    let out = r.data.slice(r.at, r.at + length)
+    r.at = r.at + length
+    return out
+}
+
+// ------------------------------------------------------ container files
+
+/// The four bytes every `.avro` file starts with.
+pub fn magic() -> bytes {
+    return bytes_of([79, 98, 106, 1])
+}
+
+/// Write a container file holding these records, with the `null` codec.
+///
+/// The sync marker is a caller's parameter rather than something generated
+/// here: this package opens nothing, and a marker that has to be random is a
+/// capability. Sixteen bytes from `random` is what a caller should pass. It
+/// only has to be unlikely to appear in the data.
+pub fn write_container(s: ref AvroSchema, values: [ref AvroValue],
+    sync: bytes) -> bytes ! AvroError {
+    if sync.len() != 16 {
+        fail(AvroBadFixedSize(16, sync.len()))
+    }
+    var out: [i64] = []
+    push_all(out, magic())
+    // The header metadata is a map of string to bytes, in the same encoding
+    // the rest of the file uses.
+    push_long(out, 2)
+    push_pair(out, "avro.schema", schema_json(s))
+    push_pair(out, "avro.codec", "null")
+    push_long(out, 0)
+    push_all(out, sync)
+    if values.len() > 0 {
+        var body: [i64] = []
+        for v in values {
+            try write_value(body, s, v)
+        }
+        push_long(out, values.len())
+        push_long(out, body.len())
+        for b in body {
+            out.push(b)
+        }
+        push_all(out, sync)
+    }
+    return bytes_of(out)
+}
+
+fn push_pair(inout out: [i64], key: str, value: str) {
+    let k = key.to_bytes()
+    push_long(out, k.len())
+    push_all(out, k)
+    let v = value.to_bytes()
+    push_long(out, v.len())
+    push_all(out, v)
+}
+
+/// Read a container file: its schema, its codec, and every record.
+pub fn read_container(data: bytes) -> AvroFile ! AvroError {
+    if data.len() < 4 or data.slice(0, 4).to_list() != magic().to_list() {
+        fail(AvroNotAContainer)
+    }
+    var r = AvroReader{ data: data, at: 4 }
+    var schema_text = ""
+    var codec = "null"
+    var count = try block_count(r)
+    while count > 0 {
+        for _i in 0..count {
+            let key = (try take_run(r)).to_str()
+            let value = try take_run(r)
+            if key == "avro.schema" {
+                schema_text = value.to_str()
+            }
+            if key == "avro.codec" {
+                codec = value.to_str()
+            }
+        }
+        count = try block_count(r)
+    }
+    if r.at + 16 > r.data.len() {
+        fail(AvroTruncated(r.at))
+    }
+    let sync = r.data.slice(r.at, r.at + 16)
+    r.at = r.at + 16
+    let s = try parse_schema(schema_text)
+    return AvroFile{ schema: s, codec: codec,
+        record: try read_blocks(r, s, codec, sync) }
+}
+
+fn read_blocks(inout r: AvroReader, s: ref AvroSchema, codec: str,
+    sync: bytes) -> [ref AvroValue] ! AvroError {
+    var out: [ref AvroValue] = []
+    while r.at < r.data.len() {
+        let count = try take_long(r)
+        let size = try take_long(r)
+        if size < 0 or r.at + size > r.data.len() {
+            fail(AvroTruncated(r.at))
+        }
+        var body = r.data.slice(r.at, r.at + size)
+        r.at = r.at + size
+        if codec == "deflate" {
+            match zlib.inflate(body, 268435456) {
+                Ok(plain) -> body = plain
+                Err(_e) -> fail(AvroUnsupportedCodec(codec))
+            }
+        } else {
+            if codec != "null" {
+                fail(AvroUnsupportedCodec(codec))
+            }
+        }
+        var inner = AvroReader{ data: body, at: 0 }
+        for _i in 0..count {
+            out.push(try read_value(inner, s))
+        }
+        // The sync marker after every block is what lets a reader that has
+        // seeked into the middle of a large file find the next block boundary.
+        if r.at + 16 > r.data.len() {
+            fail(AvroTruncated(r.at))
+        }
+        if r.data.slice(r.at, r.at + 16).to_list() != sync.to_list() {
+            fail(AvroBadSync(r.at))
+        }
+        r.at = r.at + 16
+    }
+    return out
+}
+
+// ------------------------------------------------------------ accessors
+
+pub fn field(v: ref AvroValue, name: str) -> Option[ref AvroValue] {
+    match v {
+        AvRecord(names, values) -> {
+            for i in 0..names.len() {
+                if names[i] == name {
+                    return Some(values[i])
+                }
+            }
+            return None
+        }
+        AvMap(keys, values) -> {
+            for i in 0..keys.len() {
+                if keys[i] == name {
+                    return Some(values[i])
+                }
+            }
+            return None
+        }
+        _ -> return None
+    }
+}
+
+pub fn at(v: ref AvroValue, i: i64) -> Option[ref AvroValue] {
+    match v {
+        AvArray(items) -> {
+            if i < 0 or i >= items.len() {
+                return None
+            }
+            return Some(items[i])
+        }
+        _ -> return None
+    }
+}
+
+pub fn as_long(v: ref AvroValue) -> Option[i64] {
+    match v {
+        AvLong(n) -> return Some(n)
+        _ -> return None
+    }
+}
+
+pub fn as_str(v: ref AvroValue) -> Option[str] {
+    match v {
+        AvStr(s) -> return Some(s)
+        AvEnum(s) -> return Some(s)
+        _ -> return None
+    }
+}
+
+pub fn as_double(v: ref AvroValue) -> Option[f64] {
+    match v {
+        AvDouble(f) -> return Some(f)
+        _ -> return None
+    }
+}
+
+pub fn as_bool(v: ref AvroValue) -> Option[bool] {
+    match v {
+        AvBool(b) -> return Some(b)
+        _ -> return None
+    }
+}
+
+pub fn count(v: ref AvroValue) -> i64 {
+    match v {
+        AvArray(items) -> return items.len()
+        AvMap(keys, _values) -> return keys.len()
+        AvRecord(names, _values) -> return names.len()
+        _ -> return 0
+    }
+}

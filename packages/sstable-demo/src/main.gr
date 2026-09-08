@@ -160,7 +160,7 @@ fn main() / {io} {
             say(f, "a truncated table is refused", not opens("{dir}/cut.sst"))
             // And one whose footer survived but whose body did not.
             var half = whole.slice(0, 200).to_list()
-            for v in whole.slice(whole.len() - 40, 40).to_list() {
+            for v in whole.slice(whole.len() - 40, whole.len() - 40 + 40).to_list() {
                 half.push(v)
             }
             match write_bytes("{dir}/short.sst", bytes_of(half)) {
