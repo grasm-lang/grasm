@@ -1,0 +1,24 @@
+[package]
+name = "tui_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.tuibox]
+path = "../tuibox"
+version = "^1.0.0"
+
+[dependencies.keymap]
+path = "../keymap"
+version = "^1.0.0"
+
+[dependencies.editline]
+path = "../editline"
+version = "^1.0.0"
+
+[dependencies.prompt]
+path = "../prompt"
+version = "^1.0.0"
+
+[dependencies.autocomplete]
+path = "../autocomplete"
+version = "^1.0.0"

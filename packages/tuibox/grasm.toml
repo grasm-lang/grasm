@@ -1,0 +1,6 @@
+[package]
+name = "tuibox"
+version = "1.0.0"
+
+# A screen buffer and the escape sequence to update it. Writes nothing itself.
+capabilities = []

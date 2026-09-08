@@ -1,0 +1,431 @@
+// A line editor: the buffer, the cursor, and the motions people expect.
+//
+// The bindings are readline's, because every shell, every REPL and every
+// prompt uses them and a program that invents its own is a program people
+// fight. Ctrl-A and Ctrl-E for the ends, Ctrl-W to kill a word back, Ctrl-U
+// to kill to the start, Ctrl-K to the end, Alt-B and Alt-F to move by word,
+// and Ctrl-Y to yank back whatever was killed.
+//
+// Two things here are harder than they look.
+//
+// **The cursor's column is not its index.** With a CJK character in the line,
+// the cursor after three characters is at column five. Every redraw needs the
+// column and every edit needs the index, and confusing them puts the cursor
+// visibly in the wrong place — which is the bug people notice first.
+// `cursor_column` computes it through `tuibox`'s width rules.
+//
+// **A kill ring is not a clipboard.** Consecutive kills in the same direction
+// *append* to the same entry, so Ctrl-W three times and Ctrl-Y once yanks
+// three words rather than one. An implementation that replaces the entry each
+// time is subtly wrong in a way that only shows up when someone tries it.
+//
+// The history has the rule people rely on and nobody documents: **moving up
+// from a partly typed line stashes it**, and moving back down past the end
+// restores it. Without that, pressing Up to check something loses what you
+// were writing.
+
+import tuibox
+
+type EditLine = {
+    /// The characters, one entry a grapheme.
+    text: [str],
+    /// The index into `text`, from 0 to `text.len()`.
+    cursor: i64,
+    /// The kill ring's most recent entry.
+    killed: str,
+    /// Whether the last operation was a kill, so the next one appends.
+    last_was_kill: bool,
+}
+
+type EditHistory = {
+    entry: [str],
+    /// Where the user is in the history; `entry.len()` means the live line.
+    at: i64,
+    /// The line being typed, stashed when the user moves up.
+    stashed: str,
+}
+
+type EditError =
+    | EditOutside(at: i64, length: i64)
+
+pub fn new_line() -> EditLine {
+    return EditLine{ text: [], cursor: 0, killed: "", last_was_kill: false }
+}
+
+pub fn from_text(text: str) -> EditLine {
+    var chars: [str] = []
+    for c in text.chars() {
+        chars.push(c)
+    }
+    return EditLine{ text: chars, cursor: chars.len(), killed: "",
+        last_was_kill: false }
+}
+
+pub fn text_of(l: EditLine) -> str {
+    return l.text.join("")
+}
+
+pub fn length(l: EditLine) -> i64 {
+    return l.text.len()
+}
+
+/// The column the cursor is displayed at.
+///
+/// Not the index: with a wide character before it, the cursor after three
+/// characters is at column five. Using the index to position the cursor is
+/// the bug that makes an editor unusable in Japanese.
+pub fn cursor_column(l: EditLine) -> i64 {
+    var column = 0
+    for i in 0..l.cursor {
+        column = column + tuibox.column_width(l.text[i])
+    }
+    return column
+}
+
+/// How many columns the whole line occupies.
+pub fn line_columns(l: EditLine) -> i64 {
+    return tuibox.column_width(text_of(l))
+}
+
+pub fn insert(inout l: EditLine, text: str) {
+    var at = l.cursor
+    for c in text.chars() {
+        l.text = before(l.text, at) + [c] + after(l.text, at)
+        at = at + 1
+    }
+    l.cursor = at
+    l.last_was_kill = false
+}
+
+fn before(xs: [str], at: i64) -> [str] {
+    var out: [str] = []
+    for i in 0..at {
+        out.push(xs[i])
+    }
+    return out
+}
+
+fn after(xs: [str], at: i64) -> [str] {
+    var out: [str] = []
+    for i in at..xs.len() {
+        out.push(xs[i])
+    }
+    return out
+}
+
+/// Delete the character before the cursor.
+pub fn backspace(inout l: EditLine) {
+    if l.cursor == 0 {
+        return
+    }
+    l.text = before(l.text, l.cursor - 1) + after(l.text, l.cursor)
+    l.cursor = l.cursor - 1
+    l.last_was_kill = false
+}
+
+/// Delete the character under the cursor.
+pub fn delete(inout l: EditLine) {
+    if l.cursor >= l.text.len() {
+        return
+    }
+    l.text = before(l.text, l.cursor) + after(l.text, l.cursor + 1)
+    l.last_was_kill = false
+}
+
+pub fn move_left(inout l: EditLine) {
+    if l.cursor > 0 {
+        l.cursor = l.cursor - 1
+    }
+    l.last_was_kill = false
+}
+
+pub fn move_right(inout l: EditLine) {
+    if l.cursor < l.text.len() {
+        l.cursor = l.cursor + 1
+    }
+    l.last_was_kill = false
+}
+
+pub fn move_start(inout l: EditLine) {
+    l.cursor = 0
+    l.last_was_kill = false
+}
+
+pub fn move_end(inout l: EditLine) {
+    l.cursor = l.text.len()
+    l.last_was_kill = false
+}
+
+fn is_word_char(c: str) -> bool {
+    return (c >= "a" and c <= "z") or (c >= "A" and c <= "Z") or
+    (c >= "0" and c <= "9") or c == "_"
+}
+
+/// The index one word back.
+///
+/// Skips the run of non-word characters first, then the word — which is what
+/// makes Alt-B from the end of `foo bar  ` land on the `b` rather than on the
+/// space.
+pub fn word_start(l: EditLine) -> i64 {
+    var at = l.cursor
+    while at > 0 and not is_word_char(l.text[at - 1]) {
+        at = at - 1
+    }
+    while at > 0 and is_word_char(l.text[at - 1]) {
+        at = at - 1
+    }
+    return at
+}
+
+/// The index one word forward.
+pub fn word_end(l: EditLine) -> i64 {
+    var at = l.cursor
+    while at < l.text.len() and not is_word_char(l.text[at]) {
+        at = at + 1
+    }
+    while at < l.text.len() and is_word_char(l.text[at]) {
+        at = at + 1
+    }
+    return at
+}
+
+pub fn move_word_left(inout l: EditLine) {
+    l.cursor = word_start(l)
+    l.last_was_kill = false
+}
+
+pub fn move_word_right(inout l: EditLine) {
+    l.cursor = word_end(l)
+    l.last_was_kill = false
+}
+
+// ---------------------------------------------------------- the kills
+
+fn kill_range(inout l: EditLine, from: i64, to: i64, backwards: bool) {
+    if to <= from {
+        return
+    }
+    var taken = ""
+    for i in from..to {
+        taken = taken + l.text[i]
+    }
+    // Consecutive kills join, so three Ctrl-W and one Ctrl-Y yanks three
+    // words. Replacing the entry each time is the version that surprises
+    // people.
+    if l.last_was_kill {
+        if backwards {
+            l.killed = taken + l.killed
+        } else {
+            l.killed = l.killed + taken
+        }
+    } else {
+        l.killed = taken
+    }
+    l.text = before(l.text, from) + after(l.text, to)
+    l.cursor = from
+    l.last_was_kill = true
+}
+
+/// Ctrl-W: kill the word before the cursor.
+pub fn kill_word_left(inout l: EditLine) {
+    kill_range(l, word_start(l), l.cursor, true)
+}
+
+/// Alt-D: kill the word after the cursor.
+pub fn kill_word_right(inout l: EditLine) {
+    let stop = word_end(l)
+    kill_range(l, l.cursor, stop, false)
+}
+
+/// Ctrl-U: kill to the start of the line.
+pub fn kill_to_start(inout l: EditLine) {
+    kill_range(l, 0, l.cursor, true)
+}
+
+/// Ctrl-K: kill to the end of the line.
+pub fn kill_to_end(inout l: EditLine) {
+    kill_range(l, l.cursor, l.text.len(), false)
+}
+
+/// Ctrl-Y: put back what was killed.
+pub fn yank(inout l: EditLine) {
+    let saved = l.killed
+    insert(l, saved)
+    l.killed = saved
+}
+
+/// Ctrl-T: swap the two characters around the cursor.
+///
+/// The transpose everybody discovers by accident and then relies on. At the
+/// end of the line it swaps the last two, which is the readline behaviour and
+/// not what a literal reading of "around the cursor" would do.
+pub fn transpose(inout l: EditLine) {
+    if l.text.len() < 2 {
+        return
+    }
+    var at = l.cursor
+    if at >= l.text.len() {
+        at = l.text.len() - 1
+    }
+    if at == 0 {
+        at = 1
+    }
+    let a = l.text[at - 1]
+    l.text[at - 1] = l.text[at]
+    l.text[at] = a
+    l.cursor = at + 1
+    l.last_was_kill = false
+}
+
+pub fn clear_line(inout l: EditLine) {
+    l.text = []
+    l.cursor = 0
+    l.last_was_kill = false
+}
+
+// --------------------------------------------------------- the history
+
+pub fn new_history() -> EditHistory {
+    return EditHistory{ entry: [], at: 0, stashed: "" }
+}
+
+/// Add a line, unless it repeats the one before it.
+///
+/// The de-duplication is what makes Up useful: without it, running the same
+/// command five times fills the history with five copies and finding the one
+/// before takes five presses.
+pub fn remember(inout h: EditHistory, line: str) {
+    if line.trim() == "" {
+        h.at = h.entry.len()
+        return
+    }
+    if h.entry.len() > 0 and h.entry[h.entry.len() - 1] == line {
+        h.at = h.entry.len()
+        return
+    }
+    h.entry.push(line)
+    h.at = h.entry.len()
+    h.stashed = ""
+}
+
+/// Move up, stashing a partly typed line the first time.
+///
+/// The rule nobody documents and everybody relies on: pressing Up to check
+/// something and then Down again gets your line back.
+pub fn previous(inout h: EditHistory, current: str) -> Option[str] {
+    if h.entry.len() == 0 {
+        return None
+    }
+    if h.at == h.entry.len() {
+        h.stashed = current
+    }
+    if h.at == 0 {
+        return Some(h.entry[0])
+    }
+    h.at = h.at - 1
+    return Some(h.entry[h.at])
+}
+
+/// Move down, restoring the stashed line past the end.
+pub fn next(inout h: EditHistory) -> Option[str] {
+    if h.at >= h.entry.len() {
+        return None
+    }
+    h.at = h.at + 1
+    if h.at == h.entry.len() {
+        return Some(h.stashed)
+    }
+    return Some(h.entry[h.at])
+}
+
+/// The most recent entry starting with a prefix, for Ctrl-R style search.
+pub fn search_backwards(h: EditHistory, prefix: str) -> Option[str] {
+    var i = h.entry.len() - 1
+    while i >= 0 {
+        if h.entry[i].contains(prefix) {
+            return Some(h.entry[i])
+        }
+        i = i - 1
+    }
+    return None
+}
+
+pub fn history_count(h: EditHistory) -> i64 {
+    return h.entry.len()
+}
+
+// -------------------------------------------------------- the display
+
+/// The window of the line that fits on screen, and where the cursor is in it.
+///
+/// A line longer than the terminal has to scroll horizontally, and the rule
+/// is that the cursor stays visible with a little context either side. A
+/// prompt that simply truncates loses the end of what is being typed.
+pub fn visible_window(l: EditLine, columns: i64) -> (str, i64) {
+    let full = text_of(l)
+    if tuibox.column_width(full) <= columns {
+        return (full, cursor_column(l))
+    }
+    let cursor = cursor_column(l)
+    var start = 0
+    if cursor > columns - 4 {
+        start = cursor - columns + 4
+    }
+    var shown = ""
+    var used = 0
+    var column = 0
+    for i in 0..l.text.len() {
+        let w = tuibox.column_width(l.text[i])
+        if column >= start {
+            if used + w > columns {
+                break
+            }
+            shown = shown + l.text[i]
+            used = used + w
+        }
+        column = column + w
+    }
+    return (shown, cursor - start)
+}
+
+/// The whole prompt line as it should appear.
+pub fn render(l: EditLine, prompt: str, columns: i64) -> (str, i64) {
+    let prompt_width = tuibox.column_width(prompt)
+    let room = columns - prompt_width
+    if room < 4 {
+        return (prompt, prompt_width)
+    }
+    let window = visible_window(l, room)
+    return (prompt + window.0, prompt_width + window.1)
+}
+
+/// Whether the line has anything in it.
+pub fn is_empty(l: EditLine) -> bool {
+    return l.text.len() == 0
+}
+
+/// The word the cursor is in or after, for completion.
+pub fn current_word(l: EditLine) -> str {
+    var out = ""
+    for i in word_start_from(l, l.cursor)..l.cursor {
+        out = out + l.text[i]
+    }
+    return out
+}
+
+fn word_start_from(l: EditLine, at: i64) -> i64 {
+    var i = at
+    while i > 0 and is_word_char(l.text[i - 1]) {
+        i = i - 1
+    }
+    return i
+}
+
+/// Replace the word the cursor is in, which is what accepting a completion
+/// does.
+pub fn replace_current_word(inout l: EditLine, replacement: str) {
+    let start = word_start_from(l, l.cursor)
+    l.text = before(l.text, start) + after(l.text, l.cursor)
+    l.cursor = start
+    insert(l, replacement)
+}

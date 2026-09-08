@@ -1,0 +1,10 @@
+[package]
+name = "editline"
+version = "1.0.0"
+
+# A buffer and a cursor. Reads no terminal and writes none.
+capabilities = []
+
+[dependencies.tuibox]
+path = "../tuibox"
+version = "^1.0.0"

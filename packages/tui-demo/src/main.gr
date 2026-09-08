@@ -1,0 +1,507 @@
+import tuibox
+import keymap
+import editline
+import prompt
+import autocomplete
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+// ------------------------------------------------------------ tuibox
+
+fn empty_buffer() -> TuiBuffer {
+    return TuiBuffer{ width: 0, height: 0, cell: [] }
+}
+
+fn buffer(width: i64, height: i64) -> TuiBuffer {
+    return tuibox.new_buffer(width, height) ?? empty_buffer()
+}
+
+fn check_tuibox(inout f: i64) / {io} {
+    print("-- tuibox: a column is not a character, and a repaint flickers")
+    // Every width here is Python's `wcwidth` for the same string.
+    say(f, "an ideograph is two columns and an accent is one",
+        tuibox.column_width("\u{4e2d}") == 2 and
+        tuibox.column_width("\u{e9}") == 1)
+    say(f, "a combining mark is none, so `e` plus an accent is one",
+        tuibox.column_width("e\u{301}") == 1)
+    say(f, "an emoji is two, and a zero-width space is none",
+        tuibox.column_width("\u{1f600}") == 2 and
+        tuibox.column_width("\u{200b}") == 0)
+    say(f, "a fullwidth letter and an ideographic space are two",
+        tuibox.column_width("\u{ff21}") == 2 and
+        tuibox.column_width("\u{3000}") == 2)
+    say(f, "a string is the sum of its parts",
+        tuibox.column_width("ab\u{4e2d}c") == 5)
+    say(f, "truncating never splits a wide character in half",
+        tuibox.truncate_columns("a\u{4e2d}b", 2) == "a" and
+        tuibox.column_width(tuibox.truncate_columns("ab\u{4e2d}cd", 4)) == 4)
+    say(f, "and padding measures in columns",
+        tuibox.column_width(tuibox.pad_columns("\u{4e2d}", 5)) == 5)
+    // The buffer.
+    var b = buffer(10, 3)
+    let _w = tuibox.write(b, 0, 0, "hi", "")
+    say(f, "text is written where it is put",
+        tuibox.cell_at(b, 0, 0).text == "h")
+    let _wide = tuibox.write(b, 0, 1, "\u{4e2d}x", "")
+    say(f, "a wide character claims two cells, the second empty",
+        tuibox.cell_at(b, 0, 1).text == "\u{4e2d}" and
+        tuibox.cell_at(b, 1, 1).text == "" and
+        tuibox.cell_at(b, 2, 1).text == "x")
+    say(f, "a write that runs off the edge stops rather than wrapping",
+        tuibox.write(b, 8, 2, "abcdef", "") == 2 and
+        tuibox.cell_at(b, 0, 2).text == " ")
+    say(f, "a zero-size buffer is refused", buffer_refuses(0, 5))
+    say(f, "and a write outside it is",
+        put_refuses(b, 99, 0))
+    check_tuibox_layout(f)
+}
+
+fn buffer_refuses(width: i64, height: i64) -> bool {
+    match tuibox.new_buffer(width, height) {
+        Ok(_v) -> return false
+        Err(_x) -> return true
+    }
+}
+
+fn put_refuses(b: TuiBuffer, x: i64, y: i64) -> bool {
+    var copy = b
+    match tuibox.put(copy, x, y, "a", "") {
+        Ok(_v) -> return false
+        Err(_x) -> return true
+    }
+}
+
+fn check_tuibox_layout(inout f: i64) / {io} {
+    var b = buffer(12, 5)
+    tuibox.box_of(b, TuiRect{ x: 0, y: 0, width: 12, height: 5 },
+        tuibox.single_border(), "Title", "")
+    let text = tuibox.to_text(b)
+    say(f, "a box has corners and a title in its top edge",
+        text.starts_with("\u{250c} Title \u{2500}") and
+        text.contains("\u{2514}"))
+    say(f, "the inside of a box is two smaller in each direction",
+        tuibox.inner(TuiRect{ x: 0, y: 0, width: 12, height: 5 }).width ==
+        10)
+    let halves = tuibox.split_vertical(TuiRect{ x: 0, y: 0, width: 12,
+        height: 5 }, 5) ?? (TuiRect{ x: 0, y: 0, width: 0, height: 0 },
+        TuiRect{ x: 0, y: 0, width: 0, height: 0 })
+    say(f, "a split adds up to the whole",
+        halves.0.width + halves.1.width == 12 and halves.1.x == 5)
+    say(f, "a split past the edge is refused", split_refuses(13))
+    let rows = tuibox.split_rows(TuiRect{ x: 0, y: 0, width: 10, height: 10 },
+        [1, 1, 1])
+    say(f, "rows split by weight and the remainder goes to the last, so " +
+        "nothing is lost",
+        rows.len() == 3 and rows[0].height + rows[1].height +
+        rows[2].height == 10 and rows[2].height == 4)
+    // The diff, which is the point.
+    var before = buffer(80, 24)
+    var after = before
+    let _c = tuibox.write(after, 5, 1, "x", "1;31")
+    let patch = tuibox.diff(before, after)
+    say(f, "a one-cell change is a short escape sequence",
+        patch.len() < 20 and patch.contains("\u{1b}[2;6H"))
+    say(f, "and it carries the style, then resets it",
+        patch.contains("\u{1b}[1;31m") and patch.ends_with("\u{1b}[0m"))
+    say(f, "an unchanged frame costs nothing at all",
+        tuibox.diff(before, before) == "")
+    say(f, "where a full repaint of the same screen costs a hundred times " +
+        "more", tuibox.render(after).len() > 100 * patch.len())
+    say(f, "the alternate screen is what restores the scrollback on exit",
+        tuibox.enter_alternate_screen() == "\u{1b}[?1049h")
+    say(f, "and the cursor is hidden while redrawing",
+        tuibox.hide_cursor() == "\u{1b}[?25l")
+}
+
+fn split_refuses(at: i64) -> bool {
+    match tuibox.split_vertical(TuiRect{ x: 0, y: 0, width: 12, height: 5 },
+        at) {
+        Ok(_v) -> return false
+        Err(_x) -> return true
+    }
+}
+
+// ------------------------------------------------------------ keymap
+
+fn read_of(data: bytes) -> KeyRead {
+    return keymap.decode(data) ??
+    KeyRead{ event: KeyEvent{ code: KeyEscape, shift: false, alt: false,
+        control: false }, consumed: 0, provisional: false }
+}
+
+fn check_keymap(inout f: i64) / {io} {
+    print("-- keymap: a lone escape is Escape, or the start of everything else")
+    // The sequences are xterm's, and every one is documented.
+    say(f, "an arrow is ESC [ A", keymap.name_of(
+        read_of(bytes_of([27, 91, 65])).event) == "Up")
+    say(f, "and in application mode it is ESC O A",
+        keymap.name_of(read_of(bytes_of([27, 79, 65])).event) == "Up")
+    say(f, "a modifier is a parameter, and it is the bitfield plus one",
+        keymap.name_of(read_of(bytes_of([27, 91, 49, 59, 50, 65])).event) ==
+        "Shift-Up" and
+        keymap.name_of(read_of(bytes_of([27, 91, 49, 59, 53, 65])).event) ==
+        "Ctrl-Up")
+    say(f, "Delete is ESC [ 3 ~ and Home is ESC [ H",
+        keymap.name_of(read_of(bytes_of([27, 91, 51, 126])).event) ==
+        "Delete" and
+        keymap.name_of(read_of(bytes_of([27, 91, 72])).event) == "Home")
+    say(f, "F5 is ESC [ 1 5 ~, and the numbering has gaps",
+        keymap.name_of(read_of(bytes_of([27, 91, 49, 53, 126])).event) ==
+        "F5" and
+        keymap.name_of(read_of(bytes_of([27, 91, 49, 55, 126])).event) ==
+        "F6")
+    say(f, "a control character is the letter minus 64",
+        keymap.name_of(read_of(bytes_of([1])).event) == "Ctrl-A")
+    say(f, "Ctrl-I and Tab are the same byte, and nothing can tell them apart",
+        keymap.name_of(read_of(bytes_of([9])).event) == "Tab")
+    say(f, "ESC then a letter is Alt",
+        keymap.name_of(read_of(bytes_of([27, 98])).event) == "Alt-b")
+    // The ambiguity.
+    say(f, "a lone escape is provisional, because it might still grow",
+        read_of(bytes_of([27])).provisional and
+        keymap.name_of(read_of(bytes_of([27])).event) == "Escape")
+    say(f, "and a partial sequence is too, so the caller waits rather than " +
+        "guessing", read_of(bytes_of([27, 91])).provisional)
+    say(f, "which is why there is a timeout at all",
+        keymap.escape_timeout_millis() > 0)
+    check_keymap_more(f)
+}
+
+fn check_keymap_more(inout f: i64) / {io} {
+    // Mouse.
+    let mouse = read_of("\u{1b}[<0;300;20M".to_bytes()).event
+    say(f, "SGR mouse works past column 223, which the old encoding cannot",
+        keymap.code_name(mouse.code) == "Mouse0 down at 300,20")
+    say(f, "and a release is the same sequence with a lower-case m",
+        keymap.code_name(read_of("\u{1b}[<0;10;5m".to_bytes()).event.code) ==
+        "Mouse0 up at 10,5")
+    // Streams.
+    let stream = keymap.decode_all("ab\u{1b}[A\u{1b}[".to_bytes())
+    say(f, "a stream decodes to its keys, keeping the partial tail for the " +
+        "next read",
+        stream.0.len() == 3 and stream.1.len() == 2 and
+        keymap.name_of(stream.0[2]) == "Up")
+    say(f, "and a complete stream leaves nothing",
+        keymap.decode_all("ab".to_bytes()).1.len() == 0)
+    // Bindings.
+    say(f, "a binding written in a configuration file parses",
+        keymap.name_of(keymap.parse_binding("Ctrl-A")) == "Ctrl-A" and
+        keymap.name_of(keymap.parse_binding("alt-left")) == "Alt-Left" and
+        keymap.name_of(keymap.parse_binding("shift-f5")) == "Shift-F5")
+    say(f, "and matches the key it was written for",
+        keymap.same_key(keymap.parse_binding("Ctrl-A"),
+            read_of(bytes_of([1])).event))
+    say(f, "a key encodes back to the bytes it arrived as",
+        keymap.encode(keymap.parse_binding("Ctrl-A")).to_list() == [1] and
+        keymap.encode(keymap.parse_binding("Up")).to_list() ==
+        [27, 91, 65] and
+        keymap.encode(keymap.parse_binding("Shift-Up")).to_list() ==
+        [27, 91, 49, 59, 50, 65])
+    say(f, "and an empty buffer has no key in it", decode_refuses())
+}
+
+fn decode_refuses() -> bool {
+    match keymap.decode("".to_bytes()) {
+        Ok(_v) -> return false
+        Err(_x) -> return true
+    }
+}
+
+// ---------------------------------------------------------- editline
+
+fn check_editline(inout f: i64) / {io} {
+    print("-- editline: the cursor's column is not its index")
+    var l = editline.from_text("hello world")
+    say(f, "a line starts with the cursor at the end",
+        editline.text_of(l) == "hello world" and l.cursor == 11)
+    editline.move_start(l)
+    editline.insert(l, "say ")
+    say(f, "inserting at the start moves everything along",
+        editline.text_of(l) == "say hello world" and l.cursor == 4)
+    editline.move_end(l)
+    editline.backspace(l)
+    say(f, "backspace takes the character before the cursor",
+        editline.text_of(l) == "say hello worl")
+    // The column.
+    var wide = editline.from_text("\u{4e2d}\u{6587}ab")
+    wide.cursor = 3
+    say(f, "the cursor after three characters is at column five when two of " +
+        "them are wide",
+        editline.cursor_column(wide) == 5 and wide.cursor == 3)
+    say(f, "and the whole line is six columns for four characters",
+        editline.line_columns(wide) == 6 and editline.length(wide) == 4)
+    // Word motions.
+    var words = editline.from_text("foo bar  baz")
+    editline.move_word_left(words)
+    say(f, "a word motion skips the separators then the word",
+        words.cursor == 9)
+    editline.move_word_left(words)
+    say(f, "and again", words.cursor == 4)
+    editline.move_start(words)
+    editline.move_word_right(words)
+    say(f, "forward is the same in reverse", words.cursor == 3)
+    // The kill ring.
+    var killing = editline.from_text("one two three")
+    editline.kill_word_left(killing)
+    editline.kill_word_left(killing)
+    say(f, "consecutive kills join, so two kills and one yank moves two words",
+        killing.killed == "two three" and
+        editline.text_of(killing) == "one ")
+    editline.move_start(killing)
+    editline.yank(killing)
+    say(f, "and the yank puts them back where the cursor is",
+        editline.text_of(killing) == "two threeone ")
+    var separate = editline.from_text("one two")
+    editline.kill_word_left(separate)
+    editline.move_start(separate)
+    editline.kill_to_end(separate)
+    say(f, "a kill after a motion starts a new entry rather than appending",
+        separate.killed == "one ")
+    check_editline_more(f)
+}
+
+fn check_editline_more(inout f: i64) / {io} {
+    var t = editline.from_text("ab")
+    editline.transpose(t)
+    say(f, "transpose at the end swaps the last two, as readline does",
+        editline.text_of(t) == "ba")
+    // History.
+    var h = editline.new_history()
+    editline.remember(h, "first")
+    editline.remember(h, "second")
+    editline.remember(h, "second")
+    say(f, "a repeated line is not remembered twice",
+        editline.history_count(h) == 2)
+    say(f, "an empty line is not remembered at all",
+        remembered_empty() == 0)
+    say(f, "moving up stashes what was being typed",
+        (editline.previous(h, "partly typed") ?? "") == "second")
+    say(f, "and moving back down past the end restores it",
+        (editline.next(h) ?? "") == "partly typed")
+    say(f, "moving up past the first stays there",
+        first_after_two_ups(h) == "first")
+    say(f, "and a search finds the most recent match",
+        (editline.search_backwards(h, "fir") ?? "") == "first")
+    // Scrolling.
+    var long = editline.from_text("0123456789abcdefghij")
+    long.cursor = 20
+    let window = editline.visible_window(long, 10)
+    say(f, "a line longer than the screen scrolls so the cursor stays visible",
+        tuibox_width(window.0) <= 10 and window.1 <= 10 and window.1 >= 0)
+    say(f, "and a short one is shown whole",
+        editline.visible_window(editline.from_text("abc"), 10).0 == "abc")
+    let rendered = editline.render(editline.from_text("abc"), "> ", 20)
+    say(f, "the prompt is part of the rendered line and of the column",
+        rendered.0 == "> abc" and rendered.1 == 5)
+    // Completion support.
+    var word = editline.from_text("git comm")
+    say(f, "the word under the cursor is what a completion replaces",
+        editline.current_word(word) == "comm")
+    editline.replace_current_word(word, "commit")
+    say(f, "and replacing it leaves the rest alone",
+        editline.text_of(word) == "git commit" and word.cursor == 10)
+}
+
+fn tuibox_width(text: str) -> i64 {
+    var n = 0
+    for _c in text.chars() {
+        n = n + 1
+    }
+    return n
+}
+
+fn remembered_empty() -> i64 {
+    var h = editline.new_history()
+    editline.remember(h, "   ")
+    return editline.history_count(h)
+}
+
+fn first_after_two_ups(h: EditHistory) -> str {
+    var copy = h
+    copy.at = copy.entry.len()
+    let _one = editline.previous(copy, "")
+    let _two = editline.previous(copy, "")
+    return editline.previous(copy, "") ?? ""
+}
+
+// ------------------------------------------------------------ prompt
+
+fn check_prompt(inout f: i64) / {io} {
+    print("-- prompt: no default in front of something irreversible")
+    say(f, "the capital letter is the default",
+        prompt.render_confirm("Go on?", Some(true)) == "Go on? [Y/n] " and
+        prompt.render_confirm("Go on?", Some(false)) == "Go on? [y/N] ")
+    say(f, "and with no default neither is capital",
+        prompt.render_confirm("Go on?", None) == "Go on? [y/n] ")
+    say(f, "Enter takes the default when there is one",
+        prompt.describe(prompt.interpret_confirm("", Some(true))) == "yes")
+    say(f, "and is invalid when there is not, so it cannot be answered by " +
+        "reflex",
+        prompt.needs_retry(prompt.interpret_confirm("", None)))
+    say(f, "yes and y are both accepted, in any case",
+        prompt.describe(prompt.interpret_confirm("YES", None)) == "yes" and
+        prompt.describe(prompt.interpret_confirm(" n ", None)) == "no")
+    // The destructive one.
+    say(f, "a destructive confirmation asks for a word",
+        prompt.render_destructive("Delete 4,000 rows?", "DELETE").contains(
+            "Type DELETE to confirm"))
+    say(f, "and Enter alone cancels rather than confirming",
+        prompt.describe(prompt.interpret_destructive("", "DELETE")) ==
+        "cancelled")
+    say(f, "only the exact word confirms",
+        prompt.describe(prompt.interpret_destructive("DELETE", "DELETE")) ==
+        "yes" and
+        prompt.needs_retry(prompt.interpret_destructive("delete", "DELETE")))
+    check_prompt_more(f)
+}
+
+fn choices() -> [PromptChoice] {
+    return [prompt.choice("Keep", "keep"), prompt.choice("Replace", "replace"),
+        prompt.choice("Merge", "merge")]
+}
+
+fn check_prompt_more(inout f: i64) / {io} {
+    let menu = prompt.render_menu("What now?", choices(), 1) ?? ""
+    say(f, "a menu counts from one and marks the default",
+        menu.contains("  1) Keep") and menu.contains("> 2) Replace") and
+        menu.contains("Choose 1-3 [2]"))
+    say(f, "and an empty menu is refused", menu_refuses())
+    say(f, "a number selects the item people counted to",
+        prompt.describe(prompt.interpret_menu("3", choices(), 1)) ==
+        "chose 3: merge")
+    say(f, "Enter takes the default",
+        prompt.value_of(prompt.interpret_menu("", choices(), 1)) == "replace")
+    say(f, "a number outside the range is refused rather than crashing",
+        prompt.needs_retry(prompt.interpret_menu("0", choices(), 1)) and
+        prompt.needs_retry(prompt.interpret_menu("4", choices(), 1)))
+    say(f, "and a label typed in full is accepted, because people do that",
+        prompt.value_of(prompt.interpret_menu("merge", choices(), 1)) ==
+        "merge")
+    say(f, "the selection wraps at both ends",
+        prompt.move_selection(2, 3, 1) == 0 and
+        prompt.move_selection(0, 3, 0 - 1) == 2)
+    // Text and validation.
+    say(f, "a default is shown and used",
+        prompt.render_text("Name", "world") == "Name [world]: " and
+        prompt.value_of(prompt.interpret_text("", "world",
+            prompt.any_text())) == "world")
+    say(f, "a required field refuses an empty answer",
+        prompt.needs_retry(prompt.interpret_text("", "",
+            prompt.required())))
+    say(f, "and a range is checked",
+        prompt.needs_retry(prompt.interpret_text("11", "",
+            prompt.integer_between(1, 10))) and
+        prompt.value_of(prompt.interpret_text("7", "",
+            prompt.integer_between(1, 10))) == "7")
+    // Masking.
+    say(f, "a masked field does not reveal how long the answer is",
+        not prompt.masked_reveals_length())
+    // No terminal.
+    say(f, "with no terminal, a question takes its default or refuses",
+        prompt.describe(prompt.decide(false, PromptUseDefault, PromptYes,
+            "q") ?? PromptCancelled) == "yes" and
+        prompt.describe(prompt.decide(false, PromptRefuse, PromptYes, "q") ??
+            PromptYes) == "cancelled")
+    say(f, "or fails, rather than hanging until the job times out",
+        decide_refuses())
+    say(f, "and a program told to assume yes does not ask at all",
+        not prompt.should_ask(true, true) and prompt.should_ask(true, false))
+}
+
+fn menu_refuses() -> bool {
+    match prompt.render_menu("q", [], 0) {
+        Ok(_v) -> return false
+        Err(_x) -> return true
+    }
+}
+
+fn decide_refuses() -> bool {
+    match prompt.decide(false, PromptFail, PromptYes, "q") {
+        Ok(_v) -> return false
+        Err(_x) -> return true
+    }
+}
+
+// ------------------------------------------------------ autocomplete
+
+fn paths() -> [str] {
+    return ["src/components/Header/index.tsx", "src/components/Footer.tsx",
+        "src/utils/date.ts", "discs.txt", "src/index.ts",
+        "test/components/Header.test.tsx"]
+}
+
+fn check_autocomplete(inout f: i64) / {io} {
+    print("-- autocomplete: nobody types the first letters of a path")
+    say(f, "a scattered query finds the path",
+        autocomplete.matches("schi", "src/components/Header/index.tsx"))
+    say(f, "and one whose letters are out of order does not",
+        not autocomplete.matches("ihcs",
+            "src/components/Header/index.tsx"))
+    say(f, "a match at the start of a word beats one in the middle",
+        autocomplete.score_of("sc", "src/components") >
+        autocomplete.score_of("sc", "discs.txt"))
+    say(f, "consecutive characters beat scattered ones",
+        autocomplete.score_of("com", "components") >
+        autocomplete.score_of("com", "c_o_m_p"))
+    say(f, "and a shorter candidate wins a tie",
+        autocomplete.score_of("src", "src") >
+        autocomplete.score_of("src", "src/a/b/c/d/e/f"))
+    say(f, "a capital after a lower-case letter starts a word",
+        autocomplete.is_word_start("HeaderDefault", 6) and
+        autocomplete.is_word_start("header_default", 7))
+    let ranked = autocomplete.rank("hdr", paths())
+    say(f, "the ranking puts the Header paths first",
+        ranked.len() >= 2 and ranked[0].candidate.contains("Header"))
+    say(f, "the best few can be taken",
+        autocomplete.best("src", paths(), 2).len() == 2)
+    // Completion.
+    say(f, "Tab inserts the prefix every match shares, not the first match",
+        autocomplete.common_prefix(["src/index.ts", "src/utils/date.ts"]) ==
+        "src/")
+    let completion = autocomplete.completion_for("src/", paths())
+    say(f, "so several matches insert what they agree on and show the list",
+        completion.0 == "" and completion.1)
+    say(f, "one match completes it and shows nothing",
+        autocomplete.completion_for("disc", paths()).0 == "s.txt" and
+        not autocomplete.completion_for("disc", paths()).1)
+    say(f, "and no match inserts nothing",
+        autocomplete.completion_for("zzz", paths()).0 == "")
+    // Presentation and history.
+    let one = autocomplete.match_one("hi", "hit") ??
+    CompleteMatch{ candidate: "", score: 0, positions: [] }
+    say(f, "the matched characters are marked, so the reason is visible",
+        autocomplete.highlight(one, "[", "]") == "[h][i]t")
+    say(f, "prefix matches are separated from the rest",
+        autocomplete.partition("src", paths()).0.len() == 4 and
+        autocomplete.partition("src", paths()).1.len() == 0)
+    let plain = autocomplete.rank("co", paths())
+    let chosen = "test/components/Header.test.tsx"
+    let with_history = autocomplete.rank_with_history("co", paths(),
+        [chosen], [8])
+    say(f, "and what was chosen before rises above what the text alone " +
+        "ranked higher",
+        plain[0].candidate != chosen and with_history[0].candidate == chosen)
+}
+
+fn main() / {io} {
+    var f = 0
+
+    check_tuibox(f)
+    check_keymap(f)
+    check_editline(f)
+    check_prompt(f)
+    check_autocomplete(f)
+
+    if f == 0 {
+        print("terminal: every claim held")
+    } else {
+        print("terminal: {f} failed")
+    }
+}

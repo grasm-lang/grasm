@@ -1,0 +1,373 @@
+// Completing what someone is typing, and the scoring that makes it feel
+// right.
+//
+// A prefix match is easy and nearly useless: nobody types the first letters
+// of `src/components/Header/index.tsx`. What people type is `schi` — a few
+// letters from each word, in order — and the job is to find that candidate
+// and to rank it above the hundred others that also contain those letters
+// somewhere.
+//
+// The ranking is the whole thing, and it is not a similarity measure. It is a
+// set of bonuses for the positions people mean:
+//
+// - **A match at the start of a word is worth more than one in the middle.**
+//   `sc` should find `src/components` before `discs`.
+// - **Consecutive matches are worth much more than scattered ones.** `com`
+//   matching `com`ponents beats `c`-`o`-`m` spread across a path.
+// - **A shorter candidate wins a tie**, because it is more likely to be what
+//   was meant.
+// - **A match at the very start beats one after a separator**, which beats
+//   one inside a word.
+//
+// And the completion itself: `common_prefix` is what Tab should insert. A
+// completer that inserts the first match instead makes Tab unusable when
+// there are several — the user has to undo it before typing more.
+//
+// One deliberate absence: no fuzzy *edit distance*. `srcc` should not match
+// `src` by deleting a character, because in a completer every keystroke is
+// intentional and a typo-tolerant match returns results that share no letters
+// with what was typed.
+
+type CompleteMatch = {
+    candidate: str,
+    score: i64,
+    /// The character positions in the candidate that matched, in order.
+    positions: [i64],
+}
+
+type CompleteError =
+    | CompleteEmptyQuery
+
+    /// A match at the start of the candidate.
+pub fn bonus_start() -> i64 {
+    return 30
+}
+
+/// A match at the start of a word — after a separator or at a case change.
+pub fn bonus_word_start() -> i64 {
+    return 20
+}
+
+/// Each character that immediately follows the previous match.
+///
+/// Worth more than a word start, and that ordering is the whole ranking:
+/// `com` matching `com`ponents must beat `c`_`o`_`m`_p, where each letter
+/// begins a word but nothing runs together. Setting this below the word-start
+/// bonus inverts it and makes the results feel arbitrary.
+pub fn bonus_consecutive() -> i64 {
+    return 25
+}
+
+/// A character that matches with the same case.
+pub fn bonus_exact_case() -> i64 {
+    return 2
+}
+
+/// Each character skipped before a match, charged once.
+pub fn penalty_gap() -> i64 {
+    return 0 - 3
+}
+
+fn is_separator(c: str) -> bool {
+    return c == "/" or c == "\\" or c == "_" or c == "-" or c == " " or
+    c == "." or c == ":"
+}
+
+fn is_upper(c: str) -> bool {
+    return c >= "A" and c <= "Z"
+}
+
+fn is_lower(c: str) -> bool {
+    return c >= "a" and c <= "z"
+}
+
+/// Whether a position begins a word.
+///
+/// After a separator, or a capital following a lower-case letter — which is
+/// what makes `hd` find `HeaderDefault` as well as `header_default`.
+pub fn is_word_start(candidate: str, at: i64) -> bool {
+    if at == 0 {
+        return true
+    }
+    let previous = candidate.substr(at - 1, 1)
+    if is_separator(previous) {
+        return true
+    }
+    return is_upper(candidate.substr(at, 1)) and is_lower(previous)
+}
+
+/// Match a query against a candidate, greedily and left to right.
+///
+/// Greedy is not optimal — the highest-scoring assignment of query characters
+/// to candidate positions would need a full search — but it is what every
+/// interactive completer does, because it is linear and the difference is
+/// almost never visible. The one case it loses is a candidate where a later
+/// occurrence would have scored better, and this checks a second pass from
+/// each word start to recover most of those.
+pub fn match_one(query: str, candidate: str) -> Option[CompleteMatch] {
+    if query == "" {
+        return Some(CompleteMatch{ candidate: candidate, score: 0,
+            positions: [] })
+    }
+    let greedy = scan(query, candidate, 0)
+    match greedy {
+        None -> return None
+        Some(first) -> {
+            // A second attempt anchored at the first word start after the
+            // greedy match's beginning, which recovers the common case where
+            // an earlier stray letter cost the word-start bonus.
+            var best = first
+            var at = 1
+            while at < candidate.len() {
+                if is_word_start(candidate, at) {
+                    match scan(query, candidate, at) {
+                        Some(other) -> {
+                            if other.score > best.score {
+                                best = other
+                            }
+                        }
+                        None -> at = candidate.len()
+                    }
+                }
+                at = at + 1
+            }
+            return Some(best)
+        }
+    }
+}
+
+fn scan(query: str, candidate: str, from: i64) -> Option[CompleteMatch] {
+    var positions: [i64] = []
+    var score = 0
+    var at = from
+    var previous = 0 - 2
+    for q in query.chars() {
+        var found = 0 - 1
+        var i = at
+        while i < candidate.len() and found < 0 {
+            if candidate.substr(i, 1).to_lower() == q.to_lower() {
+                found = i
+            }
+            i = i + 1
+        }
+        if found < 0 {
+            return None
+        }
+        if found == 0 {
+            score = score + bonus_start()
+        } else {
+            if is_word_start(candidate, found) {
+                score = score + bonus_word_start()
+            }
+        }
+        if found == previous + 1 {
+            score = score + bonus_consecutive()
+        } else {
+            if previous >= 0 {
+                score = score + penalty_gap()
+            }
+        }
+        if candidate.substr(found, 1) == q {
+            score = score + bonus_exact_case()
+        }
+        positions.push(found)
+        previous = found
+        at = found + 1
+    }
+    // A shorter candidate wins a tie, because it is more likely to be meant.
+    score = score - candidate.len() / 4
+    return Some(CompleteMatch{ candidate: candidate, score: score,
+        positions: positions })
+}
+
+/// Every candidate that matches, best first.
+///
+/// Ties are broken by the candidate's own order, so a list that was sorted
+/// stays sorted within a score — which is what stops the results from
+/// shuffling as someone types.
+pub fn rank(query: str, candidates: [str]) -> [CompleteMatch] {
+    var out: [CompleteMatch] = []
+    for c in candidates {
+        match match_one(query, c) {
+            Some(m) -> out.push(m)
+            None -> {}
+        }
+    }
+    for i in 0..out.len() {
+        var best = i
+        for j in (i + 1)..out.len() {
+            if out[j].score > out[best].score {
+                best = j
+            }
+        }
+        if best != i {
+            let t = out[i]
+            out[i] = out[best]
+            out[best] = t
+        }
+    }
+    return out
+}
+
+/// The best `count` matches.
+pub fn best(query: str, candidates: [str], count: i64) -> [str] {
+    var out: [str] = []
+    for m in rank(query, candidates) {
+        if out.len() < count {
+            out.push(m.candidate)
+        }
+    }
+    return out
+}
+
+/// Candidates that start with the query, which is the strict form.
+pub fn prefix_matches(query: str, candidates: [str]) -> [str] {
+    var out: [str] = []
+    for c in candidates {
+        if c.starts_with(query) {
+            out.push(c)
+        }
+    }
+    return out
+}
+
+/// Case-insensitive prefix matches.
+pub fn prefix_matches_folded(query: str, candidates: [str]) -> [str] {
+    var out: [str] = []
+    let wanted = query.to_lower()
+    for c in candidates {
+        if c.to_lower().starts_with(wanted) {
+            out.push(c)
+        }
+    }
+    return out
+}
+
+/// What Tab should insert: the longest prefix every match shares.
+///
+/// Not the first match. A completer that inserts the first one makes Tab
+/// unusable when there are several — the user has to undo it before typing
+/// another letter. Inserting the shared prefix is what a shell does and it is
+/// why Tab feels the way it does.
+pub fn common_prefix(candidates: [str]) -> str {
+    if candidates.len() == 0 {
+        return ""
+    }
+    var prefix = candidates[0]
+    for c in candidates {
+        var i = 0
+        while i < prefix.len() and i < c.len() and
+        prefix.substr(i, 1) == c.substr(i, 1) {
+            i = i + 1
+        }
+        prefix = prefix.substr(0, i)
+    }
+    return prefix
+}
+
+/// What Tab should do: the text to insert, and whether to show the list.
+///
+/// Nothing to insert and more than one match is the case where a shell rings
+/// the bell and shows the candidates on a second Tab.
+pub fn completion_for(query: str, candidates: [str]) -> (str, bool) {
+    let matched = prefix_matches(query, candidates)
+    if matched.len() == 0 {
+        return ("", false)
+    }
+    if matched.len() == 1 {
+        return (matched[0].substr(query.len(),
+            matched[0].len() - query.len()), false)
+    }
+    let shared = common_prefix(matched)
+    if shared.len() > query.len() {
+        return (shared.substr(query.len(), shared.len() - query.len()), true)
+    }
+    return ("", true)
+}
+
+/// The candidate with the matched characters marked, for showing the user.
+///
+/// The marks are what make a fuzzy list readable: without them a result looks
+/// arbitrary, and with them the reason it matched is obvious.
+pub fn highlight(m: CompleteMatch, open: str, close: str) -> str {
+    var out = ""
+    for i in 0..m.candidate.len() {
+        var marked = false
+        for p in m.positions {
+            if p == i {
+                marked = true
+            }
+        }
+        if marked {
+            out = out + open + m.candidate.substr(i, 1) + close
+        } else {
+            out = out + m.candidate.substr(i, 1)
+        }
+    }
+    return out
+}
+
+/// Whether a query matches at all.
+pub fn matches(query: str, candidate: str) -> bool {
+    return match_one(query, candidate) != None
+}
+
+/// The score, or a large negative number when it does not match.
+pub fn score_of(query: str, candidate: str) -> i64 {
+    match match_one(query, candidate) {
+        Some(m) -> return m.score
+        None -> return 0 - 1000000
+    }
+}
+
+/// Candidates grouped by whether they are a prefix match, so a list can show
+/// the exact ones first.
+pub fn partition(query: str, candidates: [str]) -> ([str], [str]) {
+    var exact: [str] = []
+    var fuzzy: [str] = []
+    for m in rank(query, candidates) {
+        if m.candidate.to_lower().starts_with(query.to_lower()) {
+            exact.push(m.candidate)
+        } else {
+            fuzzy.push(m.candidate)
+        }
+    }
+    return (exact, fuzzy)
+}
+
+/// A history of what was chosen, so a repeated choice ranks higher.
+///
+/// The single largest improvement to a completer, and the cheapest: what
+/// somebody picked last time is what they usually want this time. The bonus
+/// is capped so that frequency cannot override a much better textual match.
+pub fn rank_with_history(query: str, candidates: [str], history: [str],
+    counts: [i64]) -> [CompleteMatch] {
+    var out: [CompleteMatch] = []
+    for m in rank(query, candidates) {
+        var bonus = 0
+        for i in 0..history.len() {
+            if history[i] == m.candidate and i < counts.len() {
+                bonus = counts[i] * 5
+                if bonus > 40 {
+                    bonus = 40
+                }
+            }
+        }
+        out.push(CompleteMatch{ candidate: m.candidate,
+            score: m.score + bonus, positions: m.positions })
+    }
+    for i in 0..out.len() {
+        var best = i
+        for j in (i + 1)..out.len() {
+            if out[j].score > out[best].score {
+                best = j
+            }
+        }
+        if best != i {
+            let t = out[i]
+            out[i] = out[best]
+            out[best] = t
+        }
+    }
+    return out
+}

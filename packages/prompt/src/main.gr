@@ -1,0 +1,330 @@
+// Asking a person a question in a terminal, and the rules that make the
+// answer trustworthy.
+//
+// Four of them, and each has a failure mode that is worse than it looks:
+//
+// **A confirmation must not have a default when it is destructive.** `[Y/n]`
+// with Enter meaning yes is fine for "continue?"; for "delete 4,000 rows?" it
+// turns a reflexive Enter into data loss. `confirm_destructive` has no
+// default and requires the word.
+//
+// **A prompt that is not on a terminal must not wait.** A script running in
+// CI has no one to answer, and a program that asks anyway hangs until the job
+// times out — with the question buried in the log. When there is no terminal,
+// the answer is the default or a refusal, and `decide` says which.
+//
+// **A masked field must not reveal its length.** A password prompt that
+// prints one asterisk a character tells anyone watching how long it is.
+// Printing a fixed number, or none, does not.
+//
+// **A menu's numbering starts at 1 and its answer is validated.** People type
+// `3` for the third item and `0` for none; an off-by-one here selects the
+// wrong thing silently, and an unvalidated index is a crash.
+//
+// Nothing here reads or writes: `render` produces the text to show and
+// `interpret` takes what was typed. That is what lets every case be tested
+// exactly, including the ones a person would have to sit and type.
+
+import tuibox
+
+/// How a question should be answered when nobody is there.
+type PromptFallback =
+    | PromptUseDefault
+    | PromptRefuse
+    | PromptFail
+
+type PromptChoice = {
+    label: str,
+    value: str,
+}
+
+/// What the answer to a question turned out to be.
+type PromptAnswer =
+    | PromptText(value: str)
+    | PromptYes
+    | PromptNo
+    | PromptSelected(index: i64, value: str)
+    | PromptCancelled
+    | PromptInvalid(why: str)
+
+type PromptError =
+    | PromptNoChoices
+    | PromptNoTerminal(question: str)
+
+    /// The question, with its options shown the way people expect.
+    ///
+    /// The capital letter is the default, which is the convention every command
+    /// line tool follows and every user reads without thinking.
+pub fn render_confirm(question: str, default_yes: Option[bool]) -> str {
+    match default_yes {
+        Some(yes) -> {
+            if yes {
+                return question + " [Y/n] "
+            }
+            return question + " [y/N] "
+        }
+        None -> return question + " [y/n] "
+    }
+}
+
+/// Read a yes-or-no answer.
+///
+/// An empty answer takes the default when there is one, and is invalid when
+/// there is not — which is what makes a prompt with no default actually
+/// require an answer rather than accepting a reflexive Enter.
+pub fn interpret_confirm(text: str,
+    default_yes: Option[bool]) -> PromptAnswer {
+    let answer = text.trim().to_lower()
+    if answer == "" {
+        match default_yes {
+            Some(yes) -> return if yes { PromptYes } else { PromptNo }
+            None -> return PromptInvalid("please answer yes or no")
+        }
+    }
+    if answer == "y" or answer == "yes" {
+        return PromptYes
+    }
+    if answer == "n" or answer == "no" {
+        return PromptNo
+    }
+    return PromptInvalid("please answer yes or no")
+}
+
+/// A confirmation for something that cannot be undone.
+///
+/// No default and a word rather than a letter. The point is that Enter alone
+/// does nothing: a `[Y/n]` prompt in front of a destructive action is a
+/// prompt that will eventually be answered by someone's muscle memory.
+pub fn render_destructive(question: str, word: str) -> str {
+    return question + "\nType " + word + " to confirm: "
+}
+
+pub fn interpret_destructive(text: str, word: str) -> PromptAnswer {
+    if text.trim() == word {
+        return PromptYes
+    }
+    if text.trim() == "" {
+        return PromptCancelled
+    }
+    return PromptInvalid("that is not " + word)
+}
+
+// -------------------------------------------------------------- menus
+
+/// A numbered menu, counting from one.
+///
+/// From one, because that is how people count, and the answer is converted
+/// back — an off-by-one here selects the wrong item and says nothing.
+pub fn render_menu(question: str, choices: [PromptChoice],
+    default_index: i64) -> str ! PromptError {
+    if choices.len() == 0 {
+        fail(PromptNoChoices)
+    }
+    var lines: [str] = [question]
+    for i in 0..choices.len() {
+        var marker = "  "
+        if i == default_index {
+            marker = "> "
+        }
+        lines.push(marker + "{i + 1}) " + choices[i].label)
+    }
+    var tail = "Choose 1-{choices.len()}"
+    if default_index >= 0 and default_index < choices.len() {
+        tail = tail + " [{default_index + 1}]"
+    }
+    return lines.join("\n") + "\n" + tail + ": "
+}
+
+pub fn interpret_menu(text: str, choices: [PromptChoice],
+    default_index: i64) -> PromptAnswer {
+    let answer = text.trim()
+    if answer == "" {
+        if default_index >= 0 and default_index < choices.len() {
+            return PromptSelected(default_index,
+                choices[default_index].value)
+        }
+        return PromptInvalid("choose one of the numbers")
+    }
+    match answer.parse_int() {
+        None -> {
+            // A label typed in full is accepted, because people do that.
+            for i in 0..choices.len() {
+                if choices[i].label.to_lower() == answer.to_lower() {
+                    return PromptSelected(i, choices[i].value)
+                }
+            }
+            return PromptInvalid("choose one of the numbers")
+        }
+        Some(n) -> {
+            if n < 1 or n > choices.len() {
+                return PromptInvalid("choose a number from 1 to " +
+                    "{choices.len()}")
+            }
+            return PromptSelected(n - 1, choices[n - 1].value)
+        }
+    }
+}
+
+/// A menu rendered for a terminal that can move a cursor.
+///
+/// The same choices with the selected one marked, for a program that reads
+/// arrow keys instead of a number.
+pub fn render_selection(choices: [PromptChoice], selected: i64,
+    columns: i64) -> [str] {
+    var out: [str] = []
+    for i in 0..choices.len() {
+        var line = "  " + choices[i].label
+        if i == selected {
+            line = "> " + choices[i].label
+        }
+        out.push(tuibox.truncate_columns(line, columns))
+    }
+    return out
+}
+
+/// Where an arrow key moves the selection, wrapping at the ends.
+///
+/// Wrapping, because a list of five where Down at the bottom does nothing is
+/// a list where reaching the last item from the first takes four presses
+/// instead of one.
+pub fn move_selection(selected: i64, count: i64, by: i64) -> i64 {
+    if count <= 0 {
+        return 0
+    }
+    var at = (selected + by) % count
+    if at < 0 {
+        at = at + count
+    }
+    return at
+}
+
+// -------------------------------------------------------------- text
+
+/// A text question with its default shown.
+pub fn render_text(question: str, default_value: str) -> str {
+    if default_value == "" {
+        return question + ": "
+    }
+    return question + " [" + default_value + "]: "
+}
+
+/// Read a text answer, with validation the caller supplies.
+pub fn interpret_text(text: str, default_value: str,
+    validate: fn(str) -> str) -> PromptAnswer {
+    var value = text.trim()
+    if value == "" {
+        value = default_value
+    }
+    let problem = validate(value)
+    if problem != "" {
+        return PromptInvalid(problem)
+    }
+    return PromptText(value)
+}
+
+/// A validator that accepts anything.
+pub fn any_text() -> fn(str) -> str {
+    return |_v| ""
+}
+
+/// A validator that requires something.
+pub fn required() -> fn(str) -> str {
+    return |v| if v.trim() == "" { "this cannot be empty" } else { "" }
+}
+
+/// A validator that requires a whole number in a range.
+pub fn integer_between(low: i64, high: i64) -> fn(str) -> str {
+    return |v| {
+        let n = v.trim().parse_int() ?? (0 - 9223372036854775807 - 1)
+        if n == 0 - 9223372036854775807 - 1 {
+            return "that is not a whole number"
+        }
+        if n < low or n > high {
+            return "give a number from {low} to {high}"
+        }
+        return ""
+    }
+}
+
+/// What to show while a password is being typed.
+///
+/// Not one asterisk a character. A masked field that grows with the password
+/// tells anyone looking over a shoulder — or at a screen recording — how long
+/// it is, which is a real reduction in the work of guessing it. A fixed
+/// marker, or nothing at all, does not.
+pub fn render_masked(question: str, typed: i64) -> str {
+    if typed == 0 {
+        return question + ": "
+    }
+    return question + ": " + "\u{2022}\u{2022}\u{2022}"
+}
+
+/// Whether a masked prompt reveals the length of what was typed.
+///
+/// It does not, by construction — this exists so the property can be asserted
+/// rather than believed.
+pub fn masked_reveals_length() -> bool {
+    return render_masked("p", 3) != render_masked("p", 30)
+}
+
+// ------------------------------------------------------- no terminal
+
+/// What to do when the question cannot be asked.
+///
+/// A program that prompts with no terminal attached hangs until something
+/// kills it, with the question sitting unread in a CI log. The three honest
+/// answers are: take the default, refuse, or fail — and which one is right
+/// depends on the question, so the caller says.
+pub fn decide(is_terminal: bool, fallback: PromptFallback,
+    default_answer: PromptAnswer,
+    question: str) -> PromptAnswer ! PromptError {
+    if is_terminal {
+        return PromptInvalid("ask the question")
+    }
+    match fallback {
+        PromptUseDefault -> return default_answer
+        PromptRefuse -> return PromptCancelled
+        PromptFail -> fail(PromptNoTerminal(question))
+    }
+}
+
+/// Whether a program should ask at all.
+pub fn should_ask(is_terminal: bool, assume_yes: bool) -> bool {
+    return is_terminal and not assume_yes
+}
+
+/// An answer as a word, for a log.
+pub fn describe(a: PromptAnswer) -> str {
+    match a {
+        PromptText(value) -> return "text: " + value
+        PromptYes -> return "yes"
+        PromptNo -> return "no"
+        PromptSelected(index, value) -> return "chose {index + 1}: " + value
+        PromptCancelled -> return "cancelled"
+        PromptInvalid(why) -> return "invalid: " + why
+    }
+}
+
+/// Whether an answer needs the question asked again.
+pub fn needs_retry(a: PromptAnswer) -> bool {
+    match a {
+        PromptInvalid(_w) -> return true
+        _ -> return false
+    }
+}
+
+/// A choice, for a menu.
+pub fn choice(label: str, value: str) -> PromptChoice {
+    return PromptChoice{ label: label, value: value }
+}
+
+/// The value an answer carries, or `""`.
+pub fn value_of(a: PromptAnswer) -> str {
+    match a {
+        PromptText(value) -> return value
+        PromptSelected(_i, value) -> return value
+        PromptYes -> return "yes"
+        PromptNo -> return "no"
+        _ -> return ""
+    }
+}

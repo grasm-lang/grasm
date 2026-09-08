@@ -1,0 +1,562 @@
+// Turning terminal input into key events, and the ambiguity at the heart of
+// it.
+//
+// **A lone escape byte is indistinguishable from the start of a sequence.**
+// `0x1B` is the Escape key; `0x1B [ A` is the up arrow; `0x1B a` is Alt-A on
+// most terminals. When a reader has seen only `0x1B` it cannot know which,
+// and the only way to decide is *time*: if nothing follows within a few tens
+// of milliseconds it was Escape. Every terminal program has this timeout and
+// it is why pressing Escape in vim sometimes feels slow.
+//
+// This package makes that explicit. `decode` returns how many bytes it
+// consumed and whether the result is *provisional* — a lone escape that might
+// still become a sequence — so the caller decides the timeout rather than
+// having one baked in. A decoder that returns Escape immediately turns every
+// arrow key into Escape followed by a bracket.
+//
+// The rest is the encoding, which is a museum of three decades:
+//
+// - **CSI sequences**: `ESC [` then parameters then a final byte. Arrows are
+//   `A`–`D`, and the same keys are `ESC O A`–`D` in application cursor mode,
+//   which is what a terminal switches to when a program asks — so both have
+//   to be understood.
+// - **Modifiers are a parameter**, not a separate key: Shift-Up is
+//   `ESC [ 1 ; 2 A`, where the 2 is a bitfield of shift 1, alt 2, control 4
+//   *plus one*. The plus one is the part everyone gets wrong.
+// - **Function keys have two encodings** and no rule about which: F1 is
+//   `ESC O P` or `ESC [ 1 1 ~` depending on the terminal.
+// - **Control characters are the letter minus 64**: Ctrl-A is 1, Ctrl-@ is 0,
+//   and Ctrl-I is 9 — which is also Tab, and no terminal can tell them apart.
+//   Neither can this.
+// - **Mouse events** in SGR form, `ESC [ < b ; x ; y M`, which is the only
+//   encoding that works past column 223.
+
+type KeyCode =
+    | KeyChar(text: str)
+    | KeyEnter
+    | KeyTab
+    | KeyBackspace
+    | KeyEscape
+    | KeyUp
+    | KeyDown
+    | KeyLeft
+    | KeyRight
+    | KeyHome
+    | KeyEnd
+    | KeyPageUp
+    | KeyPageDown
+    | KeyInsert
+    | KeyDelete
+    | KeyFunction(number: i64)
+    | KeyMouse(button: i64, column: i64, row: i64, pressed: bool)
+    | KeyUnknown(bytes: [i64])
+
+type KeyEvent = {
+    code: KeyCode,
+    shift: bool,
+    alt: bool,
+    control: bool,
+}
+
+/// What a decode consumed, and whether it might yet grow.
+type KeyRead = {
+    event: KeyEvent,
+    consumed: i64,
+    /// True when the bytes so far are a prefix of a longer sequence and the
+    /// caller should wait before treating them as final.
+    provisional: bool,
+}
+
+type KeyError =
+    | KeyEmpty
+
+    /// The milliseconds to wait before deciding a lone escape was Escape.
+    ///
+    /// Long enough that a terminal's own sequence arrives in one read, short
+    /// enough that a person does not notice. 25 to 50 is the range every
+    /// implementation lands in; this is the middle of it.
+pub fn escape_timeout_millis() -> i64 {
+    return 30
+}
+
+fn plain(code: KeyCode) -> KeyEvent {
+    return KeyEvent{ code: code, shift: false, alt: false, control: false }
+}
+
+/// Decode one key from the front of a buffer.
+pub fn decode(data: bytes) -> KeyRead ! KeyError {
+    if data.len() == 0 {
+        fail(KeyEmpty)
+    }
+    let first = data.at(0)
+    if first != 27 {
+        return KeyRead{ event: decode_simple(data), consumed: simple_width(data),
+            provisional: false }
+    }
+    if data.len() == 1 {
+        // Escape, or the start of something. Only time can tell, so this is
+        // reported as provisional and the caller runs the clock.
+        return KeyRead{ event: plain(KeyEscape), consumed: 1,
+            provisional: true }
+    }
+    let second = data.at(1)
+    if second == 91 {
+        return try decode_csi(data)
+    }
+    if second == 79 {
+        // `ESC O x` — application cursor and keypad mode.
+        if data.len() < 3 {
+            return KeyRead{ event: plain(KeyEscape), consumed: 1,
+                provisional: true }
+        }
+        return KeyRead{ event: plain(application_key(data.at(2))),
+            consumed: 3, provisional: false }
+    }
+    // `ESC` then an ordinary key is Alt.
+    var event = decode_simple(data.slice(1, data.len()))
+    event.alt = true
+    return KeyRead{ event: event,
+        consumed: 1 + simple_width(data.slice(1, data.len())),
+        provisional: false }
+}
+
+fn simple_width(data: bytes) -> i64 {
+    let first = data.at(0)
+    if first < 128 {
+        return 1
+    }
+    // A UTF-8 lead byte says how many follow.
+    if first >= 240 {
+        return 4
+    }
+    if first >= 224 {
+        return 3
+    }
+    if first >= 192 {
+        return 2
+    }
+    return 1
+}
+
+fn decode_simple(data: bytes) -> KeyEvent {
+    let first = data.at(0)
+    if first == 13 or first == 10 {
+        return plain(KeyEnter)
+    }
+    if first == 9 {
+        return plain(KeyTab)
+    }
+    if first == 127 or first == 8 {
+        return plain(KeyBackspace)
+    }
+    if first < 32 {
+        // Control characters are the letter minus 64. Ctrl-I is 9, which is
+        // also Tab — the terminal cannot tell them apart and neither can
+        // this.
+        return KeyEvent{ code: KeyChar((first + 64).to_char()), shift: false,
+            alt: false, control: true }
+    }
+    let width = simple_width(data)
+    return plain(KeyChar(data.slice(0, width).to_str()))
+}
+
+fn application_key(final_byte: i64) -> KeyCode {
+    if final_byte == 65 {
+        return KeyUp
+    }
+    if final_byte == 66 {
+        return KeyDown
+    }
+    if final_byte == 67 {
+        return KeyRight
+    }
+    if final_byte == 68 {
+        return KeyLeft
+    }
+    if final_byte == 72 {
+        return KeyHome
+    }
+    if final_byte == 70 {
+        return KeyEnd
+    }
+    // `ESC O P` through `S` are F1 to F4 on many terminals.
+    if final_byte >= 80 and final_byte <= 83 {
+        return KeyFunction(final_byte - 79)
+    }
+    return KeyUnknown([27, 79, final_byte])
+}
+
+fn decode_csi(data: bytes) -> KeyRead ! KeyError {
+    var at = 2
+    if at >= data.len() {
+        return KeyRead{ event: plain(KeyEscape), consumed: 1,
+            provisional: true }
+    }
+    // SGR mouse: `ESC [ < b ; x ; y M` or `m`.
+    if data.at(at) == 60 {
+        return decode_mouse(data)
+    }
+    var parameters: [i64] = []
+    var current = 0
+    var has_digit = false
+    while at < data.len() {
+        let c = data.at(at)
+        if c >= 48 and c <= 57 {
+            current = current * 10 + (c - 48)
+            has_digit = true
+            at = at + 1
+            continue
+        }
+        if c == 59 {
+            parameters.push(if has_digit { current } else { 0 })
+            current = 0
+            has_digit = false
+            at = at + 1
+            continue
+        }
+        break
+    }
+    if at >= data.len() {
+        // A partial sequence: the final byte has not arrived.
+        return KeyRead{ event: plain(KeyEscape), consumed: 1,
+            provisional: true }
+    }
+    parameters.push(if has_digit { current } else { 0 })
+    let final_byte = data.at(at)
+    var event = plain(csi_key(final_byte, parameters))
+    if parameters.len() >= 2 {
+        // The modifier parameter is a bitfield **plus one**, which is the
+        // part everyone gets wrong: 2 is shift, 3 is alt, 5 is control.
+        let modifiers = parameters[1] - 1
+        event.shift = modifiers.bit_and(1) != 0
+        event.alt = modifiers.bit_and(2) != 0
+        event.control = modifiers.bit_and(4) != 0
+    }
+    return KeyRead{ event: event, consumed: at + 1, provisional: false }
+}
+
+fn csi_key(final_byte: i64, parameters: [i64]) -> KeyCode {
+    if final_byte == 65 {
+        return KeyUp
+    }
+    if final_byte == 66 {
+        return KeyDown
+    }
+    if final_byte == 67 {
+        return KeyRight
+    }
+    if final_byte == 68 {
+        return KeyLeft
+    }
+    if final_byte == 72 {
+        return KeyHome
+    }
+    if final_byte == 70 {
+        return KeyEnd
+    }
+    if final_byte == 126 {
+        return tilde_key(parameters[0])
+    }
+    if final_byte >= 80 and final_byte <= 83 {
+        return KeyFunction(final_byte - 79)
+    }
+    return KeyUnknown([27, 91, final_byte])
+}
+
+/// The `ESC [ n ~` family, whose numbering has gaps for historical reasons.
+///
+/// 16, 22, 27, 30 and 35 are unassigned — the numbering came from a DEC
+/// keyboard whose keys were not contiguous, and every terminal inherited the
+/// gaps.
+fn tilde_key(number: i64) -> KeyCode {
+    if number == 1 or number == 7 {
+        return KeyHome
+    }
+    if number == 2 {
+        return KeyInsert
+    }
+    if number == 3 {
+        return KeyDelete
+    }
+    if number == 4 or number == 8 {
+        return KeyEnd
+    }
+    if number == 5 {
+        return KeyPageUp
+    }
+    if number == 6 {
+        return KeyPageDown
+    }
+    if number >= 11 and number <= 15 {
+        return KeyFunction(number - 10)
+    }
+    if number >= 17 and number <= 21 {
+        return KeyFunction(number - 11)
+    }
+    if number >= 23 and number <= 26 {
+        return KeyFunction(number - 12)
+    }
+    if number >= 28 and number <= 29 {
+        return KeyFunction(number - 13)
+    }
+    if number >= 31 and number <= 34 {
+        return KeyFunction(number - 14)
+    }
+    return KeyUnknown([27, 91, number, 126])
+}
+
+/// SGR mouse: the only encoding that works past column 223.
+///
+/// The older X10 encoding puts the coordinates in single bytes offset by 32,
+/// so column 224 becomes byte 0 and the sequence is unparseable. SGR sends
+/// them as decimal, and the final byte says press (`M`) or release (`m`).
+fn decode_mouse(data: bytes) -> KeyRead {
+    var at = 3
+    var numbers: [i64] = []
+    var current = 0
+    var has_digit = false
+    while at < data.len() {
+        let c = data.at(at)
+        if c >= 48 and c <= 57 {
+            current = current * 10 + (c - 48)
+            has_digit = true
+            at = at + 1
+            continue
+        }
+        if c == 59 {
+            numbers.push(current)
+            current = 0
+            has_digit = false
+            at = at + 1
+            continue
+        }
+        break
+    }
+    if at >= data.len() or numbers.len() < 2 {
+        return KeyRead{ event: plain(KeyEscape), consumed: 1,
+            provisional: true }
+    }
+    numbers.push(if has_digit { current } else { 0 })
+    let final_byte = data.at(at)
+    let button = numbers[0]
+    var event = plain(KeyMouse(button.bit_and(3), numbers[1], numbers[2],
+        final_byte == 77))
+    event.shift = button.bit_and(4) != 0
+    event.alt = button.bit_and(8) != 0
+    event.control = button.bit_and(16) != 0
+    return KeyRead{ event: event, consumed: at + 1, provisional: false }
+}
+
+/// Every key in a buffer, with whatever is left over.
+///
+/// The leftover is the point: a read from a terminal can end in the middle of
+/// a sequence, and those bytes have to be kept for the next read rather than
+/// decoded as an escape and a bracket.
+pub fn decode_all(data: bytes) -> ([KeyEvent], bytes) {
+    var out: [KeyEvent] = []
+    var at = 0
+    while at < data.len() {
+        match decode(data.slice(at, data.len())) {
+            Err(_e) -> return (out, data.slice(at, data.len()))
+            Ok(read) -> {
+                if read.provisional {
+                    // A partial sequence and a malformed one look identical
+                    // from inside the buffer, so both are kept for the next
+                    // read. The escape timeout is what resolves them, and it
+                    // belongs to the caller with the clock.
+                    return (out, data.slice(at, data.len()))
+                }
+                out.push(read.event)
+                at = at + read.consumed
+            }
+        }
+    }
+    return (out, "".to_bytes())
+}
+
+/// A key as a name, in the notation `Ctrl-A`, `Alt-Left`, `Shift-F5`.
+pub fn name_of(e: KeyEvent) -> str {
+    var out = ""
+    if e.control {
+        out = out + "Ctrl-"
+    }
+    if e.alt {
+        out = out + "Alt-"
+    }
+    if e.shift {
+        out = out + "Shift-"
+    }
+    return out + code_name(e.code)
+}
+
+pub fn code_name(c: KeyCode) -> str {
+    match c {
+        KeyChar(text) -> return text
+        KeyEnter -> return "Enter"
+        KeyTab -> return "Tab"
+        KeyBackspace -> return "Backspace"
+        KeyEscape -> return "Escape"
+        KeyUp -> return "Up"
+        KeyDown -> return "Down"
+        KeyLeft -> return "Left"
+        KeyRight -> return "Right"
+        KeyHome -> return "Home"
+        KeyEnd -> return "End"
+        KeyPageUp -> return "PageUp"
+        KeyPageDown -> return "PageDown"
+        KeyInsert -> return "Insert"
+        KeyDelete -> return "Delete"
+        KeyFunction(number) -> return "F{number}"
+        KeyMouse(button, column, row, pressed) -> {
+            let what = if pressed { "down" } else { "up" }
+            return "Mouse{button} " + what + " at {column},{row}"
+        }
+        KeyUnknown(_b) -> return "Unknown"
+    }
+}
+
+/// Whether two events are the same key.
+pub fn same_key(a: KeyEvent, b: KeyEvent) -> bool {
+    return name_of(a) == name_of(b)
+}
+
+/// Parse a binding written the way a configuration file writes it.
+///
+/// `Ctrl-A`, `alt-left`, `shift-f5`. Case-insensitive on the modifiers and
+/// the key names, because a configuration file is written by a person.
+pub fn parse_binding(text: str) -> KeyEvent {
+    var event = plain(KeyUnknown([]))
+    var parts = text.split("-")
+    var last = ""
+    for i in 0..parts.len() {
+        let piece = parts[i].to_lower()
+        if i < parts.len() - 1 {
+            if piece == "ctrl" or piece == "control" or piece == "c" {
+                event.control = true
+            }
+            if piece == "alt" or piece == "meta" or piece == "m" {
+                event.alt = true
+            }
+            if piece == "shift" or piece == "s" {
+                event.shift = true
+            }
+        } else {
+            last = parts[i]
+        }
+    }
+    event.code = code_from_name(last)
+    return event
+}
+
+fn code_from_name(name: str) -> KeyCode {
+    let lowered = name.to_lower()
+    if lowered == "enter" or lowered == "return" {
+        return KeyEnter
+    }
+    if lowered == "tab" {
+        return KeyTab
+    }
+    if lowered == "backspace" {
+        return KeyBackspace
+    }
+    if lowered == "escape" or lowered == "esc" {
+        return KeyEscape
+    }
+    if lowered == "up" {
+        return KeyUp
+    }
+    if lowered == "down" {
+        return KeyDown
+    }
+    if lowered == "left" {
+        return KeyLeft
+    }
+    if lowered == "right" {
+        return KeyRight
+    }
+    if lowered == "home" {
+        return KeyHome
+    }
+    if lowered == "end" {
+        return KeyEnd
+    }
+    if lowered == "pageup" or lowered == "pgup" {
+        return KeyPageUp
+    }
+    if lowered == "pagedown" or lowered == "pgdn" {
+        return KeyPageDown
+    }
+    if lowered == "insert" or lowered == "ins" {
+        return KeyInsert
+    }
+    if lowered == "delete" or lowered == "del" {
+        return KeyDelete
+    }
+    if lowered.starts_with("f") and lowered.len() <= 3 {
+        match lowered.substr(1, lowered.len() - 1).parse_int() {
+            Some(n) -> return KeyFunction(n)
+            None -> {}
+        }
+    }
+    // A single character binding is written as itself, and is upper-cased for
+    // a control binding because `Ctrl-a` and `Ctrl-A` are the same byte.
+    if name.len() == 1 {
+        return KeyChar(name.to_upper())
+    }
+    return KeyUnknown([])
+}
+
+/// The bytes a key would arrive as, for a test or a script.
+pub fn encode(e: KeyEvent) -> bytes {
+    match e.code {
+        KeyUp -> return csi_bytes(e, 65)
+        KeyDown -> return csi_bytes(e, 66)
+        KeyRight -> return csi_bytes(e, 67)
+        KeyLeft -> return csi_bytes(e, 68)
+        KeyHome -> return csi_bytes(e, 72)
+        KeyEnd -> return csi_bytes(e, 70)
+        KeyEnter -> return bytes_of([13])
+        KeyTab -> return bytes_of([9])
+        KeyBackspace -> return bytes_of([127])
+        KeyEscape -> return bytes_of([27])
+        KeyDelete -> return bytes_of([27, 91, 51, 126])
+        KeyInsert -> return bytes_of([27, 91, 50, 126])
+        KeyPageUp -> return bytes_of([27, 91, 53, 126])
+        KeyPageDown -> return bytes_of([27, 91, 54, 126])
+        KeyChar(text) -> {
+            if e.control and text.len() == 1 {
+                let code = text.to_upper().to_bytes().at(0)
+                if code >= 64 and code < 96 {
+                    return bytes_of([code - 64])
+                }
+            }
+            if e.alt {
+                var out: [i64] = [27]
+                let raw = text.to_bytes()
+                for i in 0..raw.len() {
+                    out.push(raw.at(i))
+                }
+                return bytes_of(out)
+            }
+            return text.to_bytes()
+        }
+        _ -> return bytes_of([])
+    }
+}
+
+fn csi_bytes(e: KeyEvent, final_byte: i64) -> bytes {
+    var modifiers = 1
+    if e.shift {
+        modifiers = modifiers + 1
+    }
+    if e.alt {
+        modifiers = modifiers + 2
+    }
+    if e.control {
+        modifiers = modifiers + 4
+    }
+    if modifiers == 1 {
+        return bytes_of([27, 91, final_byte])
+    }
+    return bytes_of([27, 91, 49, 59, 48 + modifiers, final_byte])
+}

@@ -1,0 +1,6 @@
+[package]
+name = "autocomplete"
+version = "1.0.0"
+
+# Text in, ranked matches out. Opens nothing.
+capabilities = []

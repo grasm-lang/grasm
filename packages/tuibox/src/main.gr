@@ -1,0 +1,456 @@
+// A terminal screen buffer, and the two things that make one usable.
+//
+// **A column is not a character.** A CJK ideograph occupies two columns, a
+// combining accent occupies none, and an emoji occupies two. A layout that
+// counts characters puts a box border in the wrong place the first time
+// somebody's name is in Japanese. `column_width` implements the East Asian
+// Width rules and the zero-width categories, and every measurement here goes
+// through it.
+//
+// **Redrawing everything flickers.** A full repaint of an 80x24 screen is
+// about 2 KB of escape sequences; over ssh at 100 ms of latency, doing that
+// sixty times a second is not possible, and doing it at all makes the cursor
+// visibly sweep the screen. The answer is to keep the previous frame and emit
+// only what changed: `diff` walks two buffers and produces the shortest
+// sequence that turns one into the other. On a typical frame that is a few
+// dozen bytes.
+//
+// The buffer itself is a grid of cells, each a string of one grapheme plus a
+// style. Boxes, splits and text are written into it, and nothing is sent
+// anywhere — the caller writes the bytes, which is what keeps this package
+// free of capabilities and makes every test exact.
+
+type TuiCell = {
+    /// One grapheme, or `""` for the continuation column of a wide one.
+    text: str,
+    /// An SGR parameter string such as `1;31`, or `""` for plain.
+    style: str,
+}
+
+type TuiBuffer = {
+    width: i64,
+    height: i64,
+    cell: [TuiCell],
+}
+
+type TuiRect = {
+    x: i64,
+    y: i64,
+    width: i64,
+    height: i64,
+}
+
+type TuiError =
+    | TuiOutside(x: i64, y: i64)
+    | TuiBadSize(width: i64, height: i64)
+    | TuiBadSplit(at: i64, of: i64)
+
+    /// How many columns a code point occupies.
+    ///
+    /// Zero for a combining mark or a zero-width space, two for the East Asian
+    /// wide and fullwidth ranges and the common emoji blocks, one otherwise.
+    /// A control character is zero, because it is not printable and counting it
+    /// as one is how a stray byte shifts a whole line.
+pub fn code_width(code: i64) -> i64 {
+    if code == 0 {
+        return 0
+    }
+    if code < 32 or (code >= 127 and code < 160) {
+        return 0
+    }
+    if is_zero_width(code) {
+        return 0
+    }
+    if is_wide(code) {
+        return 2
+    }
+    return 1
+}
+
+fn is_zero_width(code: i64) -> bool {
+    // Combining marks and the format characters that occupy no space.
+    let low = [0x0300, 0x0483, 0x0591, 0x0610, 0x064B, 0x0670, 0x06D6,
+        0x0711, 0x0730, 0x07A6, 0x0816, 0x0900, 0x093A, 0x0951, 0x0A01,
+        0x1AB0, 0x1DC0, 0x20D0, 0xFE00, 0xFE20, 0x200B, 0x2060]
+    let high = [0x036F, 0x0489, 0x05BD, 0x061A, 0x065F, 0x0670, 0x06DC,
+        0x0711, 0x074A, 0x07B0, 0x082D, 0x0903, 0x093A, 0x0954, 0x0A03,
+        0x1AFF, 0x1DFF, 0x20F0, 0xFE0F, 0xFE2F, 0x200F, 0x2064]
+    for i in 0..low.len() {
+        if code >= low[i] and code <= high[i] {
+            return true
+        }
+    }
+    return false
+}
+
+fn is_wide(code: i64) -> bool {
+    // The East Asian Wide and Fullwidth blocks, plus the emoji that every
+    // terminal renders double width.
+    let low = [0x1100, 0x2E80, 0x2E9B, 0x2F00, 0x3000, 0x3041, 0x3099,
+        0x3105, 0x3131, 0x3190, 0x31F0, 0x3220, 0x3250, 0x4E00, 0xA000,
+        0xA490, 0xAC00, 0xF900, 0xFE10, 0xFE30, 0xFF00, 0xFFE0, 0x1F300,
+        0x1F600, 0x1F900, 0x20000, 0x30000]
+    let high = [0x115F, 0x2E99, 0x2EF3, 0x2FD5, 0x303E, 0x3096, 0x30FF,
+        0x312F, 0x318E, 0x31E3, 0x321E, 0x3247, 0x4DBF, 0x9FFF, 0xA48C,
+        0xA4C6, 0xD7A3, 0xFAFF, 0xFE19, 0xFE6F, 0xFF60, 0xFFE6, 0x1F5FF,
+        0x1F64F, 0x1F9FF, 0x2FFFD, 0x3FFFD]
+    for i in 0..low.len() {
+        if code >= low[i] and code <= high[i] {
+            return true
+        }
+    }
+    return false
+}
+
+/// How many columns a string occupies.
+pub fn column_width(text: str) -> i64 {
+    var total = 0
+    for code in text.codes() {
+        total = total + code_width(code)
+    }
+    return total
+}
+
+/// The prefix of a string that fits in a number of columns.
+///
+/// It never splits a wide character in half: a string cut at an odd column
+/// stops one short rather than emitting half an ideograph, which a terminal
+/// renders as a replacement character and which shifts everything after it.
+pub fn truncate_columns(text: str, columns: i64) -> str {
+    var out = ""
+    var used = 0
+    for c in text.chars() {
+        let w = column_width(c)
+        if used + w > columns {
+            return out
+        }
+        out = out + c
+        used = used + w
+    }
+    return out
+}
+
+/// A string padded to a column width.
+pub fn pad_columns(text: str, columns: i64) -> str {
+    let used = column_width(text)
+    if used >= columns {
+        return truncate_columns(text, columns)
+    }
+    var out = text
+    for _i in 0..(columns - used) {
+        out = out + " "
+    }
+    return out
+}
+
+// -------------------------------------------------------- the buffer
+
+pub fn new_buffer(width: i64, height: i64) -> TuiBuffer ! TuiError {
+    if width < 1 or height < 1 {
+        fail(TuiBadSize(width, height))
+    }
+    var cells: [TuiCell] = []
+    for _i in 0..(width * height) {
+        cells.push(TuiCell{ text: " ", style: "" })
+    }
+    return TuiBuffer{ width: width, height: height, cell: cells }
+}
+
+pub fn inside(b: TuiBuffer, x: i64, y: i64) -> bool {
+    return x >= 0 and y >= 0 and x < b.width and y < b.height
+}
+
+pub fn cell_at(b: TuiBuffer, x: i64, y: i64) -> TuiCell {
+    if not inside(b, x, y) {
+        return TuiCell{ text: " ", style: "" }
+    }
+    return b.cell[y * b.width + x]
+}
+
+/// Write one grapheme.
+///
+/// A wide grapheme claims two columns: the second is set to an empty cell,
+/// which is how the diff knows not to write anything there and how a later
+/// write knows it is overwriting half of something.
+pub fn put(inout b: TuiBuffer, x: i64, y: i64, text: str,
+    style: str) ! TuiError {
+    if not inside(b, x, y) {
+        fail(TuiOutside(x, y))
+    }
+    place(b, x, y, text, style)
+}
+
+/// The same, ignoring a write outside the buffer.
+///
+/// What every drawing routine here wants: a box clipped by the edge of the
+/// screen is normal, and threading a failure through every corner of a
+/// layout to say so would make the drawing code unreadable.
+fn place(inout b: TuiBuffer, x: i64, y: i64, text: str, style: str) {
+    if not inside(b, x, y) {
+        return
+    }
+    let w = column_width(text)
+    b.cell[y * b.width + x] = TuiCell{ text: text, style: style }
+    if w == 2 and inside(b, x + 1, y) {
+        b.cell[y * b.width + x + 1] = TuiCell{ text: "", style: style }
+    }
+}
+
+/// Write a string, stopping at the edge.
+///
+/// Stopping rather than wrapping: a string that runs off the right of a box
+/// and reappears on the left of the next line is the commonest visual bug in
+/// a terminal interface, and it happens whenever a buffer wraps by default.
+pub fn write(inout b: TuiBuffer, x: i64, y: i64, text: str,
+    style: str) -> i64 {
+    var at = x
+    for c in text.chars() {
+        let w = column_width(c)
+        if at + w > b.width or at < 0 or y < 0 or y >= b.height {
+            return at - x
+        }
+        if w > 0 {
+            place(b, at, y, c, style)
+            at = at + w
+        } else {
+            // A combining mark joins the cell before it rather than taking
+            // one of its own.
+            if at > x {
+                let previous = cell_at(b, at - 1, y)
+                place(b, at - 1, y, previous.text + c, style)
+            }
+        }
+    }
+    return at - x
+}
+
+/// Fill a rectangle with a character.
+pub fn fill(inout b: TuiBuffer, r: TuiRect, text: str, style: str) {
+    for y in r.y..(r.y + r.height) {
+        for x in r.x..(r.x + r.width) {
+            place(b, x, y, text, style)
+        }
+    }
+}
+
+pub fn clear(inout b: TuiBuffer) {
+    fill(b, TuiRect{ x: 0, y: 0, width: b.width, height: b.height }, " ", "")
+}
+
+/// The single-line box-drawing characters, in the order the drawing uses.
+pub fn single_border() -> [str] {
+    return ["\u{250c}", "\u{2510}", "\u{2514}", "\u{2518}", "\u{2500}",
+        "\u{2502}"]
+}
+
+/// The double-line ones.
+pub fn double_border() -> [str] {
+    return ["\u{2554}", "\u{2557}", "\u{255a}", "\u{255d}", "\u{2550}",
+        "\u{2551}"]
+}
+
+/// The rounded ones, which most modern terminals have.
+pub fn rounded_border() -> [str] {
+    return ["\u{256d}", "\u{256e}", "\u{2570}", "\u{256f}", "\u{2500}",
+        "\u{2502}"]
+}
+
+/// Draw a box, with an optional title in the top edge.
+pub fn box_of(inout b: TuiBuffer, r: TuiRect, border: [str], title: str,
+    style: str) {
+    if r.width < 2 or r.height < 2 {
+        return
+    }
+    let right = r.x + r.width - 1
+    let bottom = r.y + r.height - 1
+    place(b, r.x, r.y, border[0], style)
+    place(b, right, r.y, border[1], style)
+    place(b, r.x, bottom, border[2], style)
+    place(b, right, bottom, border[3], style)
+    for x in (r.x + 1)..right {
+        place(b, x, r.y, border[4], style)
+        place(b, x, bottom, border[4], style)
+    }
+    for y in (r.y + 1)..bottom {
+        place(b, r.x, y, border[5], style)
+        place(b, right, y, border[5], style)
+    }
+    if title != "" and r.width > 4 {
+        let shown = truncate_columns(" " + title + " ", r.width - 2)
+        let _w = write(b, r.x + 1, r.y, shown, style)
+    }
+}
+
+/// The area inside a box's border.
+pub fn inner(r: TuiRect) -> TuiRect {
+    if r.width < 2 or r.height < 2 {
+        return TuiRect{ x: r.x, y: r.y, width: 0, height: 0 }
+    }
+    return TuiRect{ x: r.x + 1, y: r.y + 1, width: r.width - 2,
+        height: r.height - 2 }
+}
+
+/// Split a rectangle into two, left and right.
+pub fn split_vertical(r: TuiRect, at: i64) -> (TuiRect, TuiRect) ! TuiError {
+    if at < 0 or at > r.width {
+        fail(TuiBadSplit(at, r.width))
+    }
+    return (TuiRect{ x: r.x, y: r.y, width: at, height: r.height },
+        TuiRect{ x: r.x + at, y: r.y, width: r.width - at,
+            height: r.height })
+}
+
+/// Split a rectangle into two, top and bottom.
+pub fn split_horizontal(r: TuiRect,
+    at: i64) -> (TuiRect, TuiRect) ! TuiError {
+    if at < 0 or at > r.height {
+        fail(TuiBadSplit(at, r.height))
+    }
+    return (TuiRect{ x: r.x, y: r.y, width: r.width, height: at },
+        TuiRect{ x: r.x, y: r.y + at, width: r.width,
+            height: r.height - at })
+}
+
+/// Split into several rows by proportion.
+///
+/// The remainder goes to the last row, so the parts always add up to the
+/// whole — a layout that loses a row to rounding leaves a line of the
+/// previous frame visible at the bottom.
+pub fn split_rows(r: TuiRect, weights: [i64]) -> [TuiRect] {
+    var total = 0
+    for w in weights {
+        total = total + w
+    }
+    if total <= 0 {
+        return []
+    }
+    var out: [TuiRect] = []
+    var used = 0
+    for i in 0..weights.len() {
+        var height = r.height * weights[i] / total
+        if i == weights.len() - 1 {
+            height = r.height - used
+        }
+        out.push(TuiRect{ x: r.x, y: r.y + used, width: r.width,
+            height: height })
+        used = used + height
+    }
+    return out
+}
+
+// ---------------------------------------------------------- the diff
+
+/// The escape sequence that turns `before` into `after`.
+///
+/// Only the cells that changed, and the cursor is moved only when the next
+/// change is not the cell after the last one — which is what turns a frame
+/// into a few dozen bytes rather than two kilobytes.
+pub fn diff(before: TuiBuffer, after: TuiBuffer) -> str {
+    var out = ""
+    var cursor_x = 0 - 1
+    var cursor_y = 0 - 1
+    var style = ""
+    for y in 0..after.height {
+        for x in 0..after.width {
+            let now = cell_at(after, x, y)
+            let was = cell_at(before, x, y)
+            if now.text == was.text and now.style == was.style and
+            before.width == after.width and
+            before.height == after.height {
+                continue
+            }
+            if now.text == "" {
+                // The continuation column of a wide character: nothing is
+                // written there.
+                continue
+            }
+            if cursor_y != y or cursor_x != x {
+                out = out + "\u{1b}[{y + 1};{x + 1}H"
+                cursor_y = y
+                cursor_x = x
+            }
+            if now.style != style {
+                if now.style == "" {
+                    out = out + "\u{1b}[0m"
+                } else {
+                    out = out + "\u{1b}[" + now.style + "m"
+                }
+                style = now.style
+            }
+            out = out + now.text
+            cursor_x = cursor_x + column_width(now.text)
+        }
+    }
+    if style != "" {
+        out = out + "\u{1b}[0m"
+    }
+    return out
+}
+
+/// The whole buffer as an escape sequence, for the first frame.
+pub fn render(b: TuiBuffer) -> str {
+    var blank = new_buffer(b.width, b.height) ?? b
+    // A buffer of a different size forces every cell, which is what a resize
+    // needs.
+    blank.width = 0
+    return "\u{1b}[2J" + diff(blank, b)
+}
+
+/// The buffer as plain text, for a test or a log.
+pub fn to_text(b: TuiBuffer) -> str {
+    var lines: [str] = []
+    for y in 0..b.height {
+        var line = ""
+        for x in 0..b.width {
+            let c = cell_at(b, x, y)
+            if c.text != "" {
+                line = line + c.text
+            }
+        }
+        lines.push(line)
+    }
+    return lines.join("\n")
+}
+
+/// How many bytes a frame costs, which is the number that matters over ssh.
+pub fn frame_cost(before: TuiBuffer, after: TuiBuffer) -> i64 {
+    return diff(before, after).to_bytes().len()
+}
+
+/// Move the cursor, hide it, show it.
+///
+/// Hiding the cursor during a redraw is not cosmetic: a visible cursor moves
+/// to every cell being written, and on a slow connection it is seen doing it.
+pub fn move_cursor(x: i64, y: i64) -> str {
+    return "\u{1b}[{y + 1};{x + 1}H"
+}
+
+pub fn hide_cursor() -> str {
+    return "\u{1b}[?25l"
+}
+
+pub fn show_cursor() -> str {
+    return "\u{1b}[?25h"
+}
+
+/// Switch to the alternate screen, and back.
+///
+/// The alternate screen is what makes a full-screen program restore the
+/// user's scrollback on exit. A program that does not use it leaves its own
+/// output where the shell's history was.
+pub fn enter_alternate_screen() -> str {
+    return "\u{1b}[?1049h"
+}
+
+pub fn leave_alternate_screen() -> str {
+    return "\u{1b}[?1049l"
+}
+
+/// Turn on SGR mouse reporting, and off.
+pub fn enable_mouse() -> str {
+    return "\u{1b}[?1000h\u{1b}[?1006h"
+}
+
+pub fn disable_mouse() -> str {
+    return "\u{1b}[?1006l\u{1b}[?1000l"
+}

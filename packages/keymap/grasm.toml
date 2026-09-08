@@ -1,0 +1,6 @@
+[package]
+name = "keymap"
+version = "1.0.0"
+
+# Bytes in, key events out. Opens no terminal.
+capabilities = []

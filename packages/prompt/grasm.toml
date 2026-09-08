@@ -1,0 +1,10 @@
+[package]
+name = "prompt"
+version = "1.0.0"
+
+# Rendering a question and reading an answer's text. Opens no terminal.
+capabilities = []
+
+[dependencies.tuibox]
+path = "../tuibox"
+version = "^1.0.0"
