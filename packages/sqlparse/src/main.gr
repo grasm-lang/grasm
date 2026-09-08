@@ -1,0 +1,661 @@
+// Reading SQL as text: splitting it, naming it, and normalising it.
+//
+// Not an execution planner and not a full grammar. Four jobs that a program
+// working with SQL actually needs, each of which requires a correct tokeniser
+// and nothing more:
+//
+// **Splitting a script into statements.** Every migration runner needs this,
+// and almost every one written from scratch does it with `split(";")`. That is
+// wrong for a `;` inside a string literal, inside a comment, or inside a
+// PostgreSQL dollar-quoted function body — and a function body is exactly
+// where a migration script puts semicolons. Splitting properly means
+// tokenising, which is why this package starts there.
+//
+// **Naming a statement.** Is this a read or a write? A migration runner needs
+// to know whether to open a transaction; a connection pool needs to know
+// whether it can send it to a replica; an audit log needs to record it.
+//
+// **Finding the tables.** What does this statement touch — for a dependency
+// graph, a permission check, or a cache invalidation.
+//
+// **Normalising for a log.** `WHERE id = 42` and `WHERE id = 43` are the same
+// query run twice, and a slow-query report that treats them as two entries is
+// useless on a real workload. Replacing every literal with a placeholder is
+// what `pg_stat_statements` does and what makes the report readable.
+//
+// The tokeniser handles what real SQL contains: `--` and `/* */` comments
+// (nested, in PostgreSQL), `'...'` with a doubled quote inside, `"..."` and
+// `` `...` `` identifiers, `$tag$...$tag$` dollar quoting, `E'...'` escape
+// strings, numbers with exponents, and `::` casts.
+
+import sqlescape
+
+type SqlTokenKind =
+    | SqlWord
+    | SqlQuotedName
+    | SqlString
+    | SqlNumber
+    | SqlPunctuation
+    | SqlComment
+    | SqlParameter
+    | SqlWhitespace
+
+type SqlToken = {
+    kind: SqlTokenKind,
+    text: str,
+    at: i64,
+}
+
+type SqlStatement = {
+    text: str,
+    verb: str,
+    tables: [str],
+    at: i64,
+}
+
+type SqlParseError =
+    | SqlUnterminatedString(at: i64)
+    | SqlUnterminatedComment(at: i64)
+    | SqlUnterminatedName(at: i64)
+    | SqlUnterminatedDollar(at: i64, tag: str)
+
+fn is_space(c: str) -> bool {
+    return c == " " or c == "\t" or c == "\n" or c == "\r"
+}
+
+fn is_digit(c: str) -> bool {
+    return c >= "0" and c <= "9"
+}
+
+fn is_word_start(c: str) -> bool {
+    return (c >= "a" and c <= "z") or (c >= "A" and c <= "Z") or c == "_" or
+    c == "$"
+}
+
+fn is_word(c: str) -> bool {
+    return is_word_start(c) or is_digit(c)
+}
+
+pub fn kind_name(k: SqlTokenKind) -> str {
+    match k {
+        SqlWord -> return "word"
+        SqlQuotedName -> return "name"
+        SqlString -> return "string"
+        SqlNumber -> return "number"
+        SqlPunctuation -> return "punctuation"
+        SqlComment -> return "comment"
+        SqlParameter -> return "parameter"
+        SqlWhitespace -> return "whitespace"
+    }
+}
+
+/// Every token, whitespace and comments included.
+///
+/// They are included because the caller usually wants to put the text back
+/// together — `strip_comments` and `normalise` both rebuild from this list, and
+/// a tokeniser that discards spacing cannot.
+pub fn tokenise(sql: str) -> [SqlToken] ! SqlParseError {
+    var out: [SqlToken] = []
+    var i = 0
+    while i < sql.len() {
+        let c = sql.substr(i, 1)
+        if is_space(c) {
+            let start = i
+            while i < sql.len() and is_space(sql.substr(i, 1)) {
+                i = i + 1
+            }
+            out.push(SqlToken{ kind: SqlWhitespace,
+                text: sql.substr(start, i - start), at: start })
+            continue
+        }
+        if c == "-" and sql.substr(i, 2) == "--" {
+            let start = i
+            while i < sql.len() and sql.substr(i, 1) != "\n" {
+                i = i + 1
+            }
+            out.push(SqlToken{ kind: SqlComment,
+                text: sql.substr(start, i - start), at: start })
+            continue
+        }
+        if c == "/" and sql.substr(i, 2) == "/*" {
+            let stop = try block_comment_end(sql, i)
+            out.push(SqlToken{ kind: SqlComment,
+                text: sql.substr(i, stop - i), at: i })
+            i = stop
+            continue
+        }
+        i = try one_token(sql, i, out)
+    }
+    return out
+}
+
+/// One token that is not whitespace and not a comment; returns where it ends.
+fn one_token(sql: str, i: i64, inout out: [SqlToken]) -> i64 ! SqlParseError {
+    let c = sql.substr(i, 1)
+    if c == "'" {
+        let stop = try string_end(sql, i, "'")
+        out.push(SqlToken{ kind: SqlString, text: sql.substr(i, stop - i),
+            at: i })
+        return stop
+    }
+    if c == "\"" or c == "`" {
+        let stop = try string_end(sql, i, c)
+        out.push(SqlToken{ kind: SqlQuotedName, text: sql.substr(i, stop - i),
+            at: i })
+        return stop
+    }
+    if c == "$" {
+        let tagged = dollar_tag(sql, i)
+        if tagged != "" {
+            let stop = try dollar_end(sql, i, tagged)
+            out.push(SqlToken{ kind: SqlString, text: sql.substr(i, stop - i),
+                at: i })
+            return stop
+        }
+        if i + 1 < sql.len() and is_digit(sql.substr(i + 1, 1)) {
+            var j = i + 1
+            while j < sql.len() and is_digit(sql.substr(j, 1)) {
+                j = j + 1
+            }
+            out.push(SqlToken{ kind: SqlParameter,
+                text: sql.substr(i, j - i), at: i })
+            return j
+        }
+    }
+    if c == "?" {
+        out.push(SqlToken{ kind: SqlParameter, text: "?", at: i })
+        return i + 1
+    }
+    if is_digit(c) {
+        let stop = number_end(sql, i)
+        out.push(SqlToken{ kind: SqlNumber, text: sql.substr(i, stop - i),
+            at: i })
+        return stop
+    }
+    // `E'...'` and `X'...'` are strings with a one-letter prefix; the letter
+    // has to be consumed with them or the string looks like a word followed
+    // by a literal.
+    if (c == "E" or c == "e" or c == "X" or c == "x" or c == "B" or
+        c == "b") and i + 1 < sql.len() and sql.substr(i + 1, 1) == "'" {
+        let stop = try string_end(sql, i + 1, "'")
+        out.push(SqlToken{ kind: SqlString, text: sql.substr(i, stop - i),
+            at: i })
+        return stop
+    }
+    if is_word_start(c) {
+        var j = i
+        while j < sql.len() and is_word(sql.substr(j, 1)) {
+            j = j + 1
+        }
+        out.push(SqlToken{ kind: SqlWord, text: sql.substr(i, j - i), at: i })
+        return j
+    }
+    // `::`, `<>`, `>=`, `<=`, `!=`, `||` are one token each.
+    let two = sql.substr(i, 2)
+    if two == "::" or two == "<>" or two == ">=" or two == "<=" or
+    two == "!=" or two == "||" {
+        out.push(SqlToken{ kind: SqlPunctuation, text: two, at: i })
+        return i + 2
+    }
+    out.push(SqlToken{ kind: SqlPunctuation, text: c, at: i })
+    return i + 1
+}
+
+/// A `$tag$` opener at `i`, or the empty string.
+fn dollar_tag(sql: str, i: i64) -> str {
+    var j = i + 1
+    while j < sql.len() and is_word(sql.substr(j, 1)) and
+    sql.substr(j, 1) != "$" {
+        j = j + 1
+    }
+    if j < sql.len() and sql.substr(j, 1) == "$" {
+        return sql.substr(i, j - i + 1)
+    }
+    return ""
+}
+
+fn dollar_end(sql: str, i: i64, tag: str) -> i64 ! SqlParseError {
+    var j = i + tag.len()
+    while j + tag.len() <= sql.len() {
+        if sql.substr(j, tag.len()) == tag {
+            return j + tag.len()
+        }
+        j = j + 1
+    }
+    fail(SqlUnterminatedDollar(i, tag))
+}
+
+/// Where a quoted run ends, counting a doubled quote as an escaped one.
+fn string_end(sql: str, i: i64, quote: str) -> i64 ! SqlParseError {
+    var j = i + 1
+    while j < sql.len() {
+        if sql.substr(j, 1) == "\\" and quote == "'" and j + 1 < sql.len() {
+            // MySQL, and PostgreSQL's `E'...'`, take a backslash as an escape.
+            // Skipping the next character here is what stops `'\''` from
+            // ending early.
+            j = j + 2
+            continue
+        }
+        if sql.substr(j, 1) == quote {
+            if j + 1 < sql.len() and sql.substr(j + 1, 1) == quote {
+                j = j + 2
+                continue
+            }
+            return j + 1
+        }
+        j = j + 1
+    }
+    if quote == "'" {
+        fail(SqlUnterminatedString(i))
+    }
+    fail(SqlUnterminatedName(i))
+}
+
+/// Block comments nest in PostgreSQL, so the depth has to be counted.
+fn block_comment_end(sql: str, i: i64) -> i64 ! SqlParseError {
+    var depth = 0
+    var j = i
+    while j + 1 < sql.len() {
+        let two = sql.substr(j, 2)
+        if two == "/*" {
+            depth = depth + 1
+            j = j + 2
+            continue
+        }
+        if two == "*/" {
+            depth = depth - 1
+            j = j + 2
+            if depth == 0 {
+                return j
+            }
+            continue
+        }
+        j = j + 1
+    }
+    fail(SqlUnterminatedComment(i))
+}
+
+fn number_end(sql: str, i: i64) -> i64 {
+    var j = i
+    while j < sql.len() and (is_digit(sql.substr(j, 1)) or
+        sql.substr(j, 1) == ".") {
+        j = j + 1
+    }
+    if j < sql.len() and (sql.substr(j, 1) == "e" or sql.substr(j, 1) == "E") {
+        var k = j + 1
+        if k < sql.len() and (sql.substr(k, 1) == "+" or
+            sql.substr(k, 1) == "-") {
+            k = k + 1
+        }
+        if k < sql.len() and is_digit(sql.substr(k, 1)) {
+            j = k
+            while j < sql.len() and is_digit(sql.substr(j, 1)) {
+                j = j + 1
+            }
+        }
+    }
+    return j
+}
+
+// ----------------------------------------------------------- statements
+
+/// Split a script into statements at the semicolons that are really separators.
+///
+/// Not `split(";")`: a semicolon inside a string, a comment or a dollar-quoted
+/// body is part of the statement, and a migration that creates a function has
+/// several of each.
+pub fn split_statements(sql: str) -> [SqlStatement] ! SqlParseError {
+    let tokens = try tokenise(sql)
+    var out: [SqlStatement] = []
+    var current: [SqlToken] = []
+    for t in tokens {
+        match t.kind {
+            SqlPunctuation -> {
+                if t.text == ";" {
+                    push_statement(out, current)
+                    current = []
+                } else {
+                    current.push(t)
+                }
+            }
+            _ -> current.push(t)
+        }
+    }
+    push_statement(out, current)
+    return out
+}
+
+fn push_statement(inout out: [SqlStatement], tokens: [SqlToken]) {
+    var text = ""
+    var at = 0 - 1
+    for t in tokens {
+        text = text + t.text
+        if at < 0 {
+            at = t.at
+        }
+    }
+    if text.trim() == "" {
+        return
+    }
+    out.push(SqlStatement{ text: text.trim(), verb: verb_of(tokens),
+        tables: tables_of(tokens), at: at })
+}
+
+/// The keyword that says what the statement does, upper-cased, or `""`.
+///
+/// Not simply the first word. A statement can begin with `WITH`, and what it
+/// *is* comes after the common table expressions: `WITH x AS (SELECT 1)
+/// DELETE FROM t` is a delete, and taking the first word calls it a `WITH`
+/// while taking the second calls it `X`. This looks for the first statement
+/// keyword outside any parentheses, which is where the real verb sits.
+fn verb_of(tokens: [SqlToken]) -> str {
+    var depth = 0
+    var first = ""
+    for t in tokens {
+        match t.kind {
+            SqlWord -> {
+                let upper = t.text.to_upper()
+                if depth == 0 {
+                    if first == "" {
+                        first = upper
+                    }
+                    if is_statement_verb(upper) {
+                        return upper
+                    }
+                }
+            }
+            SqlPunctuation -> {
+                if t.text == "(" {
+                    depth = depth + 1
+                }
+                if t.text == ")" {
+                    depth = depth - 1
+                }
+            }
+            _ -> {}
+        }
+    }
+    return first
+}
+
+/// The words that begin a statement.
+pub fn is_statement_verb(upper: str) -> bool {
+    let verbs = ["SELECT", "INSERT", "UPDATE", "DELETE", "MERGE", "REPLACE",
+        "CREATE", "DROP", "ALTER", "TRUNCATE", "GRANT", "REVOKE", "BEGIN",
+        "COMMIT", "ROLLBACK", "SAVEPOINT", "EXPLAIN", "SHOW", "VALUES",
+        "PRAGMA", "VACUUM", "ANALYZE", "ATTACH", "DETACH", "SET", "CALL",
+        "COPY", "REINDEX", "REFRESH", "COMMENT", "LOCK", "PREPARE",
+        "EXECUTE", "DEALLOCATE", "LISTEN", "NOTIFY", "EXPLAIN"]
+    for v in verbs {
+        if v == upper {
+            return true
+        }
+    }
+    return false
+}
+
+/// The verb of a statement's text.
+pub fn verb(sql: str) -> str ! SqlParseError {
+    return verb_of(try tokenise(sql))
+}
+
+/// Whether a statement only reads.
+///
+/// `SELECT` is not enough on its own: `SELECT ... FOR UPDATE` takes locks, and
+/// a `SELECT` calling a function can write. This answers the syntactic
+/// question, which is what a router can answer, and says so.
+pub fn is_read_only(sql: str) -> bool ! SqlParseError {
+    let tokens = try tokenise(sql)
+    let v = verb_of(tokens)
+    if v != "SELECT" and v != "EXPLAIN" and v != "SHOW" and v != "VALUES" {
+        return false
+    }
+    var previous = ""
+    for t in tokens {
+        match t.kind {
+            SqlWord -> {
+                let upper = t.text.to_upper()
+                if previous == "FOR" and (upper == "UPDATE" or
+                    upper == "SHARE" or upper == "NO") {
+                    return false
+                }
+                previous = upper
+            }
+            _ -> {}
+        }
+    }
+    return true
+}
+
+/// The tables a statement names.
+///
+/// Whatever follows `FROM`, `JOIN`, `INTO`, `UPDATE` or `TABLE`. It is a
+/// heuristic and it is the same heuristic every schema tool uses; it finds
+/// derived tables' aliases as well, which is why the result is a list of
+/// names and not a claim about the schema.
+fn tables_of(tokens: [SqlToken]) -> [str] {
+    var out: [str] = []
+    var wanted = false
+    for t in tokens {
+        match t.kind {
+            SqlWord -> {
+                let upper = t.text.to_upper()
+                if upper == "FROM" or upper == "JOIN" or upper == "INTO" or
+                upper == "UPDATE" or upper == "TABLE" {
+                    wanted = true
+                } else {
+                    if wanted {
+                        if upper != "ONLY" and upper != "IF" and
+                        upper != "NOT" and upper != "EXISTS" {
+                            push_unique(out, t.text)
+                            wanted = false
+                        }
+                    }
+                }
+            }
+            SqlQuotedName -> {
+                if wanted {
+                    push_unique(out, unquote(t.text))
+                    wanted = false
+                }
+            }
+            SqlWhitespace -> {}
+            SqlComment -> {}
+            _ -> wanted = false
+        }
+    }
+    return out
+}
+
+pub fn tables(sql: str) -> [str] ! SqlParseError {
+    return tables_of(try tokenise(sql))
+}
+
+fn push_unique(inout out: [str], name: str) {
+    for n in out {
+        if n == name {
+            return
+        }
+    }
+    out.push(name)
+}
+
+/// A quoted name with its quotes removed and its doubling undone.
+pub fn unquote(text: str) -> str {
+    if text.len() < 2 {
+        return text
+    }
+    let q = text.substr(0, 1)
+    if q != "\"" and q != "`" and q != "'" {
+        return text
+    }
+    return text.substr(1, text.len() - 2).replace(q + q, q)
+}
+
+// ---------------------------------------------------------- normalising
+
+/// The statement with every literal replaced, so two runs of it group together.
+///
+/// What `pg_stat_statements` does. Numbers, strings and existing placeholders
+/// all become `?`, whitespace collapses to one space, and comments are
+/// dropped — so `SELECT * FROM t WHERE id = 42` and
+/// `select  *  from t where id=43 -- hi` normalise to the same text.
+///
+/// A list of literals is collapsed too: `IN (1, 2, 3)` and `IN (1, 2)` are the
+/// same query shape, and without this a report has a separate line for every
+/// batch size.
+pub fn normalise(sql: str) -> str ! SqlParseError {
+    let tokens = try tokenise(sql)
+    var parts: [str] = []
+    var last_was_placeholder = false
+    var depth_comma = false
+    for t in tokens {
+        match t.kind {
+            SqlWhitespace -> {}
+            SqlComment -> {}
+            SqlNumber -> {
+                if not (last_was_placeholder and depth_comma) {
+                    parts.push("?")
+                }
+                last_was_placeholder = true
+            }
+            SqlString -> {
+                if not (last_was_placeholder and depth_comma) {
+                    parts.push("?")
+                }
+                last_was_placeholder = true
+            }
+            SqlParameter -> {
+                if not (last_was_placeholder and depth_comma) {
+                    parts.push("?")
+                }
+                last_was_placeholder = true
+            }
+            SqlWord -> {
+                // Keywords are upper-cased so `select` and `SELECT` group
+                // together; everything else keeps its case, because a table
+                // called `Orders` and one called `orders` can be two tables
+                // and folding them would merge two queries into one line.
+                if sqlescape.is_keyword(t.text.to_upper()) {
+                    parts.push(t.text.to_upper())
+                } else {
+                    parts.push(t.text)
+                }
+                last_was_placeholder = false
+                depth_comma = false
+            }
+            _ -> {
+                if t.text == "," and last_was_placeholder {
+                    // Swallow the comma between two literals, so a list of
+                    // any length becomes one `?`.
+                    depth_comma = true
+                } else {
+                    parts.push(t.text)
+                    last_was_placeholder = false
+                    depth_comma = false
+                }
+            }
+        }
+    }
+    return parts.join(" ")
+}
+
+/// The statement with its comments removed and its spacing kept.
+pub fn strip_comments(sql: str) -> str ! SqlParseError {
+    var out = ""
+    for t in try tokenise(sql) {
+        match t.kind {
+            SqlComment -> out = out + " "
+            _ -> out = out + t.text
+        }
+    }
+    return out
+}
+
+/// How many bound parameters a statement has.
+pub fn parameter_count(sql: str) -> i64 ! SqlParseError {
+    var n = 0
+    var highest = 0
+    for t in try tokenise(sql) {
+        match t.kind {
+            SqlParameter -> {
+                n = n + 1
+                if t.text != "?" {
+                    let tail = t.text.substr(1, t.text.len() - 1)
+                    let index = tail.parse_int() ?? 0
+                    if index > highest {
+                        highest = index
+                    }
+                }
+            }
+            _ -> {}
+        }
+    }
+    // A numbered placeholder can repeat, so the count of occurrences is not
+    // the number of values the driver needs.
+    if highest > 0 {
+        return highest
+    }
+    return n
+}
+
+/// The dialect a statement's placeholders belong to, if it has any.
+pub fn placeholder_dialect(sql: str) -> Option[SqlDialect] ! SqlParseError {
+    for t in try tokenise(sql) {
+        match t.kind {
+            SqlParameter -> {
+                if t.text == "?" {
+                    return Some(SqlSqlite)
+                }
+                return Some(SqlPostgres)
+            }
+            _ -> {}
+        }
+    }
+    return None
+}
+
+/// The statement laid out on several lines, for a log or an error.
+pub fn format(sql: str) -> str ! SqlParseError {
+    let breaks = ["SELECT", "FROM", "WHERE", "GROUP", "HAVING", "ORDER",
+        "LIMIT", "OFFSET", "UNION", "INSERT", "UPDATE", "DELETE", "VALUES",
+        "SET", "JOIN", "LEFT", "RIGHT", "INNER", "OUTER", "CROSS", "ON"]
+    var out = ""
+    var first = true
+    for t in try tokenise(sql) {
+        match t.kind {
+            SqlWhitespace -> {
+                if not out.ends_with("\n") and not out.ends_with(" ") and
+                out != "" {
+                    out = out + " "
+                }
+            }
+            SqlWord -> {
+                let upper = t.text.to_upper()
+                var starts = false
+                for b in breaks {
+                    if b == upper {
+                        starts = true
+                    }
+                }
+                // Every keyword is upper-cased; only the ones that begin a
+                // clause start a line.
+                var shown = t.text
+                if sqlescape.is_keyword(upper) {
+                    shown = upper
+                }
+                if starts and not first {
+                    out = out.trim_end() + "\n" + shown
+                } else {
+                    out = out + shown
+                }
+                first = false
+            }
+            _ -> {
+                out = out + t.text
+                first = false
+            }
+        }
+    }
+    return out.trim()
+}

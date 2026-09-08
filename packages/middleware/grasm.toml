@@ -1,0 +1,10 @@
+[package]
+name = "middleware"
+version = "1.0.0"
+
+# Wrapping a handler. Opens nothing.
+capabilities = []
+
+[dependencies.http]
+path = "../http"
+version = "^1.0.0"

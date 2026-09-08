@@ -1,0 +1,704 @@
+// HTML, parsed the way a browser does: leniently, and with the rules that
+// make a malformed document into the tree everyone expects.
+//
+// HTML is not XML and a parser that treats it as XML fails on the first real
+// page. Five things it has to know, and all five are here:
+//
+// **Void elements have no end tag.** `<br>` is complete. An XML parser waits
+// for `</br>`, never finds one, and nests the entire rest of the document
+// inside it.
+//
+// **Some end tags are implied.** `<p>one<p>two` is two paragraphs, not one
+// containing another: a `<p>` closes an open `<p>`, and so does any block
+// element. The same for `<li>`, `<td>`, `<tr>` and `<option>`. This is the
+// rule that turns a page of unclosed list items into a flat list rather than
+// a staircase forty levels deep.
+//
+// **`<script>` and `<style>` hold raw text.** A `<` inside them is not a tag
+// and `&amp;` is not an entity. Parsing their contents as markup is how a
+// perfectly valid `if (a < b)` becomes a broken tree.
+//
+// **A stray end tag is ignored.** `</div>` with no open `<div>` closes
+// nothing. Treating it as an error, or as closing whatever happens to be
+// open, both produce trees that no browser would agree with.
+//
+// **Entities are decoded in text and in attribute values**, including the
+// numeric forms, and not in raw text elements.
+//
+// What this is not: a full HTML5 tree construction algorithm. It does not
+// re-parent misnested formatting elements — the "adoption agency" — and it
+// does not build an implicit `<html><head><body>`. Those matter for rendering
+// and not for the reason a program usually parses HTML, which is to find
+// things in it.
+//
+// Checked against Python's `html.parser` for tokenisation and `html.unescape`
+// for entities.
+
+type HtmlAttr = {
+    name: str,
+    value: str,
+}
+
+type HtmlNode =
+    | HtmlElement(tag: str, attrs: [HtmlAttr], children: [ref HtmlNode])
+    | HtmlText(content: str)
+    | HtmlComment(content: str)
+    | HtmlDoctype(content: str)
+
+type HtmlError =
+    | HtmlUnterminatedComment(at: i64)
+    | HtmlUnterminatedTag(at: i64)
+    | HtmlTooDeep(depth: i64)
+
+    /// The elements that never have children or an end tag.
+pub fn is_void(tag: str) -> bool {
+    let voids = ["area", "base", "br", "col", "embed", "hr", "img", "input",
+        "link", "meta", "param", "source", "track", "wbr"]
+    for v in voids {
+        if v == tag {
+            return true
+        }
+    }
+    return false
+}
+
+/// The elements whose contents are not markup.
+pub fn is_raw_text(tag: str) -> bool {
+    return tag == "script" or tag == "style"
+}
+
+/// The elements whose contents are text with entities but no markup.
+pub fn is_escapable_raw_text(tag: str) -> bool {
+    return tag == "textarea" or tag == "title"
+}
+
+/// Whether an open `tag` is closed by a `starting` tag beginning.
+///
+/// This is the table that makes unclosed markup parse the way a reader means
+/// it. A `<p>` is closed by any block-level element; a `<li>` by another
+/// `<li>`; a cell by another cell or a new row.
+pub fn closes_implicitly(open_tag: str, starting: str) -> bool {
+    if open_tag == "p" {
+        return is_block(starting)
+    }
+    if open_tag == "li" {
+        return starting == "li"
+    }
+    if open_tag == "dt" or open_tag == "dd" {
+        return starting == "dt" or starting == "dd"
+    }
+    if open_tag == "td" or open_tag == "th" {
+        return starting == "td" or starting == "th" or starting == "tr" or
+        starting == "tbody" or starting == "tfoot"
+    }
+    if open_tag == "tr" {
+        return starting == "tr" or starting == "tbody" or starting == "tfoot"
+    }
+    if open_tag == "option" {
+        return starting == "option" or starting == "optgroup"
+    }
+    if open_tag == "thead" or open_tag == "tbody" {
+        return starting == "tbody" or starting == "tfoot"
+    }
+    return false
+}
+
+fn is_block(tag: str) -> bool {
+    let blocks = ["address", "article", "aside", "blockquote", "details",
+        "div", "dl", "fieldset", "figcaption", "figure", "footer", "form",
+        "h1", "h2", "h3", "h4", "h5", "h6", "header", "hr", "main", "menu",
+        "nav", "ol", "p", "pre", "section", "table", "ul"]
+    for b in blocks {
+        if b == tag {
+            return true
+        }
+    }
+    return false
+}
+
+fn is_space(c: str) -> bool {
+    return c == " " or c == "\t" or c == "\n" or c == "\r" or c == "\u{c}"
+}
+
+// ------------------------------------------------------------- entities
+
+fn named_entity(name: str) -> str {
+    let names = ["amp", "lt", "gt", "quot", "apos", "nbsp", "copy", "reg",
+        "trade", "hellip", "mdash", "ndash", "lsquo", "rsquo", "ldquo",
+        "rdquo", "laquo", "raquo", "deg", "plusmn", "frac12", "times",
+        "divide", "euro", "pound", "yen", "cent", "sect", "para", "middot",
+        "bull", "dagger", "permil", "prime", "Prime", "larr", "uarr", "rarr",
+        "darr", "harr", "ne", "le", "ge", "infin", "sum", "prod", "radic",
+        "int", "asymp", "equiv", "alpha", "beta", "gamma", "delta", "pi",
+        "sigma", "omega", "Omega", "eacute", "egrave", "agrave", "ccedil",
+        "uuml", "ouml", "auml", "szlig", "ntilde", "aring", "oslash", "aelig"]
+    let codes = [38, 60, 62, 34, 39, 160, 169, 174, 8482, 8230, 8212, 8211,
+        8216, 8217, 8220, 8221, 171, 187, 176, 177, 189, 215, 247, 8364, 163,
+        165, 162, 167, 182, 183, 8226, 8224, 8240, 8242, 8243, 8592, 8593,
+        8594, 8595, 8596, 8800, 8804, 8805, 8734, 8721, 8719, 8730, 8747,
+        8776, 8801, 945, 946, 947, 948, 960, 963, 969, 937, 233, 232, 224,
+        231, 252, 246, 228, 223, 241, 229, 248, 230]
+    for i in 0..names.len() {
+        if names[i] == name {
+            return codes[i].to_char()
+        }
+    }
+    return ""
+}
+
+/// Decode the entities in a run of text.
+///
+/// An `&` that is not the start of a recognised entity is left alone, which
+/// is what a browser does: `Tom & Jerry` is text, not an error, and turning
+/// it into an error breaks half the web.
+pub fn decode_entities(text: str) -> str {
+    var out = ""
+    var i = 0
+    while i < text.len() {
+        let c = text.substr(i, 1)
+        if c != "&" {
+            out = out + c
+            i = i + 1
+            continue
+        }
+        let semi = find_semicolon(text, i)
+        if semi < 0 {
+            out = out + c
+            i = i + 1
+            continue
+        }
+        let body = text.substr(i + 1, semi - i - 1)
+        var replacement = ""
+        if body.starts_with("#") {
+            let digits = body.substr(1, body.len() - 1)
+            if digits.starts_with("x") or digits.starts_with("X") {
+                match digits.substr(1, digits.len() - 1).parse_int_base(16) {
+                    Some(code) -> replacement = safe_char(code)
+                    None -> {}
+                }
+            } else {
+                match digits.parse_int() {
+                    Some(code) -> replacement = safe_char(code)
+                    None -> {}
+                }
+            }
+        } else {
+            replacement = named_entity(body)
+        }
+        if replacement == "" {
+            out = out + c
+            i = i + 1
+        } else {
+            out = out + replacement
+            i = semi + 1
+        }
+    }
+    return out
+}
+
+/// A code point, or the replacement character for one that is not usable.
+///
+/// A numeric reference to a surrogate or past the last code point is not an
+/// error in HTML: it becomes U+FFFD, which is what a browser shows and what
+/// keeps a malformed page parseable.
+fn safe_char(code: i64) -> str {
+    if code <= 0 or code > 1114111 or (code >= 55296 and code <= 57343) {
+        return (65533).to_char()
+    }
+    return code.to_char()
+}
+
+fn find_semicolon(text: str, from: i64) -> i64 {
+    var i = from + 1
+    while i < text.len() and i < from + 12 {
+        let c = text.substr(i, 1)
+        if c == ";" {
+            return i
+        }
+        let usable = (c >= "a" and c <= "z") or (c >= "A" and c <= "Z") or
+        (c >= "0" and c <= "9") or c == "#"
+        if not usable {
+            return 0 - 1
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+/// Escape text for putting into HTML.
+pub fn escape(text: str) -> str {
+    return text.replace("&", "&amp;").replace("<", "&lt;")
+        .replace(">", "&gt;").replace("\"", "&quot;")
+        .replace("'", "&#39;")
+}
+
+// -------------------------------------------------------------- parsing
+
+/// A parser's position and the stack of open elements.
+type HtmlParser = {
+    source: str,
+    at: i64,
+    tags: [str],
+    /// The attributes of each open element, alongside its name: the stack has
+    /// to carry them, because the element is only built when it closes.
+    open_attrs: [[HtmlAttr]],
+    kids: [[ref HtmlNode]],
+}
+
+/// Parse a document into a list of top-level nodes.
+pub fn parse(source: str) -> [ref HtmlNode] ! HtmlError {
+    var p = HtmlParser{ source: source, at: 0, tags: [], open_attrs: [],
+        kids: [[]] }
+    while p.at < p.source.len() {
+        try step(p)
+    }
+    // Anything still open at the end is closed here rather than dropped: a
+    // document that forgot four end tags still has its content.
+    while p.tags.len() > 0 {
+        close_top(p)
+    }
+    return p.kids[0]
+}
+
+fn step(inout p: HtmlParser) ! HtmlError {
+    let c = p.source.substr(p.at, 1)
+    if c != "<" {
+        try text_run(p)
+        return
+    }
+    if p.source.substr(p.at, 4) == "<!--" {
+        let stop = try comment_end(p.source, p.at)
+        emit(p, ref(HtmlComment(p.source.substr(p.at + 4,
+            stop - p.at - 7))))
+        p.at = stop
+        return
+    }
+    if p.source.substr(p.at, 2) == "<!" {
+        let stop = find_char(p.source, p.at, ">")
+        if stop < 0 {
+            fail(HtmlUnterminatedTag(p.at))
+        }
+        emit(p, ref(HtmlDoctype(p.source.substr(p.at + 2,
+            stop - p.at - 2).trim())))
+        p.at = stop + 1
+        return
+    }
+    if p.source.substr(p.at, 2) == "</" {
+        let stop = find_char(p.source, p.at, ">")
+        if stop < 0 {
+            fail(HtmlUnterminatedTag(p.at))
+        }
+        let name = p.source.substr(p.at + 2, stop - p.at - 2).trim().to_lower()
+        close_named(p, name)
+        p.at = stop + 1
+        return
+    }
+    try start_tag(p)
+}
+
+fn text_run(inout p: HtmlParser) ! HtmlError {
+    let stop = find_char(p.source, p.at - 1, "<")
+    let end = if stop < 0 { p.source.len() } else { stop }
+    let raw = p.source.substr(p.at, end - p.at)
+    if raw != "" {
+        emit(p, ref(HtmlText(decode_entities(raw))))
+    }
+    p.at = end
+}
+
+fn start_tag(inout p: HtmlParser) ! HtmlError {
+    let stop = tag_end(p.source, p.at)
+    if stop < 0 {
+        fail(HtmlUnterminatedTag(p.at))
+    }
+    var body = p.source.substr(p.at + 1, stop - p.at - 1)
+    var self_closing = false
+    if body.ends_with("/") {
+        self_closing = true
+        body = body.substr(0, body.len() - 1)
+    }
+    let name = first_word(body).to_lower()
+    let attrs = parse_attributes(body.substr(first_word(body).len(),
+        body.len() - first_word(body).len()))
+    p.at = stop + 1
+    // An implied end tag closes what the new element cannot sit inside.
+    while p.tags.len() > 0 and closes_implicitly(p.tags[p.tags.len() - 1],
+        name) {
+        close_top(p)
+    }
+    if is_void(name) or self_closing {
+        emit(p, ref(HtmlElement(name, attrs, [])))
+        return
+    }
+    if is_raw_text(name) or is_escapable_raw_text(name) {
+        let content_end = raw_text_end(p.source, p.at, name)
+        let raw = p.source.substr(p.at, content_end - p.at)
+        var children: [ref HtmlNode] = []
+        if raw != "" {
+            if is_raw_text(name) {
+                children.push(ref(HtmlText(raw)))
+            } else {
+                children.push(ref(HtmlText(decode_entities(raw))))
+            }
+        }
+        emit(p, ref(HtmlElement(name, attrs, children)))
+        let after = find_char(p.source, content_end, ">")
+        p.at = if after < 0 { p.source.len() } else { after + 1 }
+        return
+    }
+    if p.tags.len() > 64 {
+        fail(HtmlTooDeep(p.tags.len()))
+    }
+    p.tags.push(name)
+    p.open_attrs.push(attrs)
+    p.kids.push([])
+}
+
+fn emit(inout p: HtmlParser, node: ref HtmlNode) {
+    p.kids[p.kids.len() - 1].push(node)
+}
+
+fn close_top(inout p: HtmlParser) {
+    let name = p.tags.pop() ?? ""
+    let attrs = p.open_attrs.pop() ?? []
+    let children = p.kids.pop() ?? []
+    p.kids[p.kids.len() - 1].push(ref(HtmlElement(name, attrs, children)))
+}
+
+/// Close a named element, ignoring a stray end tag.
+///
+/// The search is down the stack: `</div>` closes the nearest open `div` and
+/// everything inside it. If there is no open `div`, nothing happens — which
+/// is what a browser does and is why a page with one extra `</div>` still
+/// renders.
+fn close_named(inout p: HtmlParser, name: str) {
+    var found = 0 - 1
+    var i = p.tags.len() - 1
+    while i >= 0 {
+        if p.tags[i] == name {
+            found = i
+            i = 0 - 1
+        } else {
+            i = i - 1
+        }
+    }
+    if found < 0 {
+        return
+    }
+    while p.tags.len() > found {
+        close_top(p)
+    }
+}
+
+/// The attributes in a start tag's body.
+///
+/// A value may be double quoted, single quoted or bare, and an attribute may
+/// have no value at all — which is how `disabled` and `checked` are written,
+/// and is not the same as being absent.
+fn parse_attributes(text: str) -> [HtmlAttr] {
+    var out: [HtmlAttr] = []
+    var i = 0
+    while i < text.len() {
+        while i < text.len() and (is_space(text.substr(i, 1)) or
+            text.substr(i, 1) == "/") {
+            i = i + 1
+        }
+        if i >= text.len() {
+            break
+        }
+        var j = i
+        while j < text.len() and not is_space(text.substr(j, 1)) and
+        text.substr(j, 1) != "=" {
+            j = j + 1
+        }
+        let name = text.substr(i, j - i).to_lower()
+        i = j
+        while i < text.len() and is_space(text.substr(i, 1)) {
+            i = i + 1
+        }
+        if i < text.len() and text.substr(i, 1) == "=" {
+            i = i + 1
+            while i < text.len() and is_space(text.substr(i, 1)) {
+                i = i + 1
+            }
+            if i < text.len() and (text.substr(i, 1) == "\"" or
+                text.substr(i, 1) == "'") {
+                let quote = text.substr(i, 1)
+                let close = find_char(text, i, quote)
+                let stop = if close < 0 { text.len() } else { close }
+                out.push(HtmlAttr{ name: name,
+                    value: decode_entities(text.substr(i + 1, stop - i - 1)) })
+                i = stop + 1
+            } else {
+                var k = i
+                while k < text.len() and not is_space(text.substr(k, 1)) {
+                    k = k + 1
+                }
+                out.push(HtmlAttr{ name: name,
+                    value: decode_entities(text.substr(i, k - i)) })
+                i = k
+            }
+        } else {
+            // A bare attribute is present with an empty value, which is how
+            // `disabled` and `checked` work.
+            if name != "" {
+                out.push(HtmlAttr{ name: name, value: "" })
+            }
+        }
+    }
+    return out
+}
+
+fn first_word(text: str) -> str {
+    var i = 0
+    while i < text.len() and not is_space(text.substr(i, 1)) {
+        i = i + 1
+    }
+    return text.substr(0, i)
+}
+
+fn find_char(text: str, from: i64, what: str) -> i64 {
+    var i = from + 1
+    while i < text.len() {
+        if text.substr(i, 1) == what {
+            return i
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+/// The `>` that ends a tag, skipping one inside a quoted attribute value.
+fn tag_end(text: str, from: i64) -> i64 {
+    var i = from + 1
+    var quote = ""
+    while i < text.len() {
+        let c = text.substr(i, 1)
+        if quote != "" {
+            if c == quote {
+                quote = ""
+            }
+        } else {
+            if c == "\"" or c == "'" {
+                quote = c
+            } else {
+                if c == ">" {
+                    return i
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+fn comment_end(text: str, from: i64) -> i64 ! HtmlError {
+    var i = from + 4
+    while i + 2 < text.len() + 1 {
+        if text.substr(i, 3) == "-->" {
+            return i + 3
+        }
+        i = i + 1
+    }
+    fail(HtmlUnterminatedComment(from))
+}
+
+/// Where a raw-text element's content stops.
+///
+/// At the *matching* close tag and nowhere else: a `</` inside a script that
+/// is not `</script` is script, which is why a regular expression for `</`
+/// breaks on `if (a </b/.test(c))`.
+fn raw_text_end(text: str, from: i64, tag: str) -> i64 {
+    var i = from
+    let wanted = "</" + tag
+    while i + wanted.len() <= text.len() {
+        if text.substr(i, wanted.len()).to_lower() == wanted {
+            return i
+        }
+        i = i + 1
+    }
+    return text.len()
+}
+
+// -------------------------------------------------------------- reading
+
+pub fn tag_of(node: ref HtmlNode) -> str {
+    match node {
+        HtmlElement(tag, _a, _c) -> return tag
+        _ -> return ""
+    }
+}
+
+pub fn children_of(node: ref HtmlNode) -> [ref HtmlNode] {
+    match node {
+        HtmlElement(_t, _a, children) -> return children
+        _ -> return []
+    }
+}
+
+pub fn attribute(node: ref HtmlNode, name: str) -> Option[str] {
+    match node {
+        HtmlElement(_t, attrs, _c) -> {
+            for a in attrs {
+                if a.name == name {
+                    return Some(a.value)
+                }
+            }
+            return None
+        }
+        _ -> return None
+    }
+}
+
+/// All the text inside a node, with the markup removed.
+///
+/// Script and style contents are left out: they are text in the tree and are
+/// not text on the page, and including them is why a naive scraper returns a
+// stylesheet.
+pub fn text_of(node: ref HtmlNode) -> str {
+    match node {
+        HtmlText(content) -> return content
+        HtmlElement(tag, _a, children) -> {
+            if is_raw_text(tag) {
+                return ""
+            }
+            var out = ""
+            for child in children {
+                out = out + text_of(child)
+            }
+            return out
+        }
+        _ -> return ""
+    }
+}
+
+/// Every element with a tag, depth first.
+pub fn find_by_tag(nodes: [ref HtmlNode], tag: str) -> [ref HtmlNode] {
+    var out: [ref HtmlNode] = []
+    collect_by(nodes, "tag", tag, out)
+    return out
+}
+
+/// Every element carrying a class.
+///
+/// A class attribute holds several names separated by whitespace, so this
+/// compares against each one — `class="a b"` matches `a` and matches `b` and
+/// does not match `a b` as a single name.
+pub fn find_by_class(nodes: [ref HtmlNode], name: str) -> [ref HtmlNode] {
+    var out: [ref HtmlNode] = []
+    collect_by(nodes, "class", name, out)
+    return out
+}
+
+/// The first element with an id, since an id is supposed to be unique.
+pub fn find_by_id(nodes: [ref HtmlNode], id: str) -> Option[ref HtmlNode] {
+    var out: [ref HtmlNode] = []
+    collect_by(nodes, "id", id, out)
+    if out.len() == 0 {
+        return None
+    }
+    return Some(out[0])
+}
+
+fn collect_by(nodes: [ref HtmlNode], how: str, what: str,
+    inout out: [ref HtmlNode]) {
+    for node in nodes {
+        match node {
+            HtmlElement(tag, attrs, children) -> {
+                if matches(tag, attrs, how, what) {
+                    out.push(node)
+                }
+                collect_by(children, how, what, out)
+            }
+            _ -> {}
+        }
+    }
+}
+
+fn matches(tag: str, attrs: [HtmlAttr], how: str, what: str) -> bool {
+    if how == "tag" {
+        return tag == what
+    }
+    for a in attrs {
+        if how == "id" and a.name == "id" and a.value == what {
+            return true
+        }
+        if how == "class" and a.name == "class" {
+            for part in a.value.split(" ") {
+                if part.trim() == what {
+                    return true
+                }
+            }
+        }
+    }
+    return false
+}
+
+pub fn first_by_tag(nodes: [ref HtmlNode], tag: str) -> Option[ref HtmlNode] {
+    let found = find_by_tag(nodes, tag)
+    if found.len() == 0 {
+        return None
+    }
+    return Some(found[0])
+}
+
+/// Every link's `href`, which is the commonest reason to parse a page.
+pub fn links(nodes: [ref HtmlNode]) -> [str] {
+    var out: [str] = []
+    for a in find_by_tag(nodes, "a") {
+        match attribute(a, "href") {
+            Some(href) -> out.push(href)
+            None -> {}
+        }
+    }
+    return out
+}
+
+/// Serialise a tree back to HTML.
+pub fn render(nodes: [ref HtmlNode]) -> str {
+    var out = ""
+    for node in nodes {
+        out = out + render_one(node)
+    }
+    return out
+}
+
+fn render_one(node: ref HtmlNode) -> str {
+    match node {
+        HtmlText(content) -> return escape(content)
+        HtmlComment(content) -> return "<!--" + content + "-->"
+        HtmlDoctype(content) -> return "<!" + content + ">"
+        HtmlElement(tag, attrs, children) -> {
+            var out = "<" + tag
+            for a in attrs {
+                out = out + " " + a.name + "=\"" + escape(a.value) + "\""
+            }
+            out = out + ">"
+            if is_void(tag) {
+                return out
+            }
+            if is_raw_text(tag) {
+                for child in children {
+                    match child {
+                        HtmlText(content) -> out = out + content
+                        _ -> {}
+                    }
+                }
+                return out + "</" + tag + ">"
+            }
+            return out + render(children) + "</" + tag + ">"
+        }
+    }
+}
+
+/// How many elements a tree holds.
+pub fn count(nodes: [ref HtmlNode]) -> i64 {
+    var n = 0
+    for node in nodes {
+        match node {
+            HtmlElement(_t, _a, children) -> n = n + 1 + count(children)
+            _ -> {}
+        }
+    }
+    return n
+}

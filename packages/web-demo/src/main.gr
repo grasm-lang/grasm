@@ -1,0 +1,640 @@
+import router
+import middleware
+import session
+import csrf
+import etag
+import http
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+// ------------------------------------------------------------- router
+
+fn routes() -> Router {
+    var r = router.new_router()
+    router.get(r, "/", "root")
+    router.get(r, "/users/new", "new_user")
+    router.get(r, "/users/:id", "user")
+    router.add(r, "DELETE", "/users/:id", "delete_user")
+    router.get(r, "/users/:id/orders/:order", "user_order")
+    router.get(r, "/files/*rest", "files")
+    return r
+}
+
+fn resolve_status(method: str, path: str) -> i64 {
+    return router.resolve(routes(), method, path).status
+}
+
+fn resolve_name(method: str, path: str) -> str {
+    return router.resolve(routes(), method, path).name
+}
+
+fn add_refuses(pattern: str) -> bool {
+    var r = router.new_router()
+    router.add(r, "GET", pattern, "x")
+    return router.validate(r).len() > 0
+}
+
+fn url_refuses(name: str, values: [str]) -> bool {
+    match router.url_for(routes(), name, values) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn check_router(inout f: i64) / {io} {
+    print("-- router: 405 is not 404, and declaration order is not priority")
+    // Every answer here is the one werkzeug gives for the same route table.
+    say(f, "a literal segment beats a capture, whatever the order",
+        resolve_name("GET", "/users/new") == "new_user" and
+        resolve_name("GET", "/users/7") == "user")
+    say(f, "and specificity says so before anything is matched",
+        router.specificity("/users/new") >
+        router.specificity("/users/:id") and
+        router.specificity("/users/:id") > router.specificity("/files/*rest"))
+    say(f, "a capture is captured",
+        router.param(router.resolve(routes(), "GET", "/users/7"), "id") ==
+        Some("7"))
+    say(f, "and two of them are",
+        router.param(router.resolve(routes(), "GET",
+            "/users/7/orders/9"), "order") == Some("9"))
+    say(f, "a wildcard takes the rest of the path, separators included",
+        router.param(router.resolve(routes(), "GET",
+            "/files/a/b/c.txt"), "rest") == Some("a/b/c.txt"))
+    // The status codes.
+    say(f, "a match is 200", resolve_status("GET", "/users/7") == 200)
+    say(f, "a path that exists with another verb is 405, not 404",
+        resolve_status("PUT", "/users/7") == 405)
+    say(f, "and the 405 says what is allowed",
+        router.allow_header(router.resolve(routes(), "PUT", "/users/7")) ==
+        "DELETE, GET, HEAD, OPTIONS")
+    say(f, "a path that does not exist is 404",
+        resolve_status("GET", "/nothing/here") == 404)
+    say(f, "HEAD is served by the GET route rather than refused",
+        resolve_status("HEAD", "/users/7") == 200)
+    say(f, "a trailing slash redirects to the canonical form",
+        resolve_status("GET", "/users/new/") == 308 and
+        router.resolve(routes(), "GET", "/users/new/").location ==
+        "/users/new")
+    say(f, "unless strict slashes are asked for",
+        strict_status("GET", "/users/new/") == 404)
+    say(f, "an empty segment does not fill a capture",
+        resolve_status("GET", "/users//orders/9") == 404)
+    check_router_more(f)
+}
+
+fn strict_status(method: str, path: str) -> i64 {
+    var r = routes()
+    router.strict_slash(r, true)
+    return router.resolve(r, method, path).status
+}
+
+fn check_router_more(inout f: i64) / {io} {
+    // Reverse routing.
+    say(f, "a URL is built from its route's name",
+        (router.url_for(routes(), "user", ["7"]) ?? "") == "/users/7")
+    say(f, "including a wildcard's whole tail",
+        (router.url_for(routes(), "files", ["a/b/c.txt"]) ?? "") ==
+        "/files/a/b/c.txt")
+    say(f, "the wrong number of values is refused",
+        url_refuses("user", []) and url_refuses("user", ["7", "8"]))
+    say(f, "and a name that does not exist is refused",
+        url_refuses("nope", []))
+    say(f, "a pattern's parameters can be listed",
+        router.parameters_of("/users/:id/orders/:order") == ["id", "order"])
+    // Refusals and conflicts.
+    say(f, "a wildcard anywhere but the end is refused",
+        add_refuses("/a/*rest/b") and not add_refuses("/a/*rest"))
+    say(f, "an empty pattern is refused", add_refuses(""))
+    say(f, "two routes matching the same paths are reported",
+        conflicting().len() == 1)
+    say(f, "and a route table with no shadowing reports none",
+        router.validate(routes()).len() == 0)
+    say(f, "the table can be described for a start-up log",
+        router.describe(routes()).len() == 6 and
+        router.describe(routes())[0] == "GET / -> root")
+}
+
+fn conflicting() -> [str] {
+    var r = router.new_router()
+    router.get(r, "/users/:id", "by_id")
+    router.get(r, "/users/:name", "by_name")
+    return router.conflicts(r)
+}
+
+// --------------------------------------------------------- middleware
+
+fn base_request(method: str, path: str) -> Request {
+    return Request{ method: method, path: path, query: "", version: "HTTP/1.1",
+        headers: [], body: "", ok: true, why: "" }
+}
+
+fn with_header_on(r: Request, name: str, value: str) -> Request {
+    var out = r
+    out.headers.push(Header{ name: name, value: value })
+    return out
+}
+
+fn ok_handler() -> MwNext {
+    return |request| http.text("handled " + request.method + " " +
+        request.path)
+}
+
+fn header_value(r: Response, name: str) -> str {
+    for h in r.headers {
+        if h.name == name {
+            return h.value
+        }
+    }
+    return ""
+}
+
+/// A step that marks the path on the way in, so the order it ran is visible.
+fn tagging(letter: str) -> MwStep {
+    return |request, next| {
+        var marked = request
+        marked.path = request.path + letter
+        return next(marked)
+    }
+}
+
+fn check_middleware(inout f: i64) / {io} {
+    print("-- middleware: the chain is built inside out")
+    let chain = middleware.wrap([tagging("a"), tagging("b"), tagging("c")],
+        ok_handler())
+    let ordered = chain(base_request("GET", "/x"))
+    // Each step marks the path on its way in, so the handler sees the order
+    // they ran: first in the list, first to run.
+    say(f, "the first step in the list is the outermost",
+        ordered.body == "handled GET /xabc")
+    say(f, "and the handler still runs",
+        middleware.wrap([], ok_handler())(base_request("GET", "/x")).body ==
+        "handled GET /x")
+    say(f, "an empty chain is the handler itself",
+        middleware.wrap([], ok_handler())(base_request("GET",
+            "/y")).body == "handled GET /y")
+    say(f, "a passthrough changes nothing",
+        middleware.wrap([middleware.passthrough()],
+            ok_handler())(base_request("GET", "/y")).body ==
+        "handled GET /y")
+    // Short circuits, which must not run the handler.
+    let health = middleware.wrap([middleware.short_circuit("/healthz",
+        http.text("ok"))], ok_handler())
+    say(f, "a short circuit answers without running the chain",
+        health(base_request("GET", "/healthz")).body == "ok")
+    say(f, "and passes everything else through",
+        health(base_request("GET", "/x")).body == "handled GET /x")
+    let limited = middleware.wrap([middleware.limit_body(10)], ok_handler())
+    say(f, "a body over the limit is refused with 413",
+        limited(long_body()).status == 413)
+    say(f, "and a declared length over the limit is refused too, even with " +
+        "a short body",
+        limited(with_header_on(base_request("POST", "/x"),
+            "Content-Length", "999")).status == 413)
+    say(f, "a body under it goes through",
+        limited(base_request("POST", "/x")).status == 200)
+    check_middleware_more(f)
+}
+
+fn long_body() -> Request {
+    var r = base_request("POST", "/x")
+    r.body = "0123456789abcdef"
+    return r
+}
+
+fn check_middleware_more(inout f: i64) / {io} {
+    let secured = middleware.wrap([middleware.security_headers()],
+        ok_handler())(base_request("GET", "/x"))
+    say(f, "the security headers are added",
+        header_value(secured, "X-Content-Type-Options") == "nosniff" and
+        header_value(secured, "X-Frame-Options") == "DENY" and
+        header_value(secured, "Referrer-Policy") ==
+        "strict-origin-when-cross-origin")
+    // Method override, and the reason it only applies to POST.
+    let override = middleware.wrap(
+        [middleware.method_override("X-HTTP-Method-Override")],
+        ok_handler())
+    say(f, "a POST can be overridden to a DELETE",
+        override(with_header_on(base_request("POST", "/x"),
+            "X-HTTP-Method-Override", "DELETE")).body == "handled DELETE /x")
+    say(f, "but a GET cannot, because a link would then be able to delete",
+        override(with_header_on(base_request("GET", "/x"),
+            "X-HTTP-Method-Override", "DELETE")).body == "handled GET /x")
+    // Prefix stripping.
+    let stripped = middleware.wrap([middleware.strip_prefix("/api")],
+        ok_handler())
+    say(f, "a mount prefix is removed before the handler sees the path",
+        stripped(base_request("GET", "/api/users")).body ==
+        "handled GET /users")
+    say(f, "the prefix alone becomes the root",
+        stripped(base_request("GET", "/api")).body == "handled GET /")
+    say(f, "and a path without it is untouched",
+        stripped(base_request("GET", "/healthz")).body ==
+        "handled GET /healthz")
+    // The rest.
+    let identified = middleware.wrap(
+        [middleware.request_id("X-Request-Id", "generated")], ok_handler())
+    say(f, "a client's request id is echoed back",
+        header_value(identified(with_header_on(base_request("GET", "/x"),
+            "X-Request-Id", "abc")), "X-Request-Id") == "abc")
+    say(f, "and one is supplied when the client sent none",
+        header_value(identified(base_request("GET", "/x")),
+            "X-Request-Id") == "generated")
+    let only_get = middleware.wrap([middleware.allow_methods(["GET"])],
+        ok_handler())
+    say(f, "a method that is not allowed gets 405",
+        only_get(base_request("POST", "/x")).status == 405)
+    let timed = middleware.wrap([middleware.timing_header(1000, 1042)],
+        ok_handler())
+    say(f, "the timing header carries the duration",
+        header_value(timed(base_request("GET", "/x")), "Server-Timing") ==
+        "total;dur=42")
+    let pretty = middleware.wrap([middleware.on_status(404,
+        http.html("<h1>gone</h1>"))], |_request| http.not_found())
+    say(f, "a status can be replaced on the way out",
+        pretty(base_request("GET", "/x")).body == "<h1>gone</h1>")
+    let required = middleware.wrap(
+        [middleware.require_header("X-Key", "secret", 401)], ok_handler())
+    say(f, "a required header is checked",
+        required(base_request("GET", "/x")).status == 401 and
+        required(with_header_on(base_request("GET", "/x"), "X-Key",
+            "secret")).status == 200)
+}
+
+// ------------------------------------------------------------ session
+
+fn demo_key() -> bytes {
+    return "a 32 byte key for the demo......".to_bytes()
+}
+
+fn old_key() -> bytes {
+    return "the previous key, also 32 bytes.".to_bytes()
+}
+
+fn demo_session() -> WebSession {
+    var s = session.new_session("abc123", 1700000000, 3600)
+    session.set(s, "user", "7")
+    session.set(s, "role", "admin")
+    return s
+}
+
+fn check_session(inout f: i64) / {io} {
+    print("-- session: signed, not encrypted, and the expiry is inside the " +
+        "signature")
+    let cookie = session.sign(demo_session(), [demo_key()]) ?? ""
+    // The same HMAC-SHA256 Python computes over the same body.
+    say(f, "the cookie is the payload, the expiry and an HMAC",
+        cookie == "aWQ9YWJjMTIzJnVzZXI9NyZyb2xlPWFkbWlu.1700003600." +
+        "-luQ-N0bV2KV5b28gqKW-pF37LZ0HwIG0tCAIHqsS3M")
+    say(f, "and it verifies before it expires",
+        session.is_valid(cookie, [demo_key()], 1700003599))
+    say(f, "the values come back",
+        session.get(session.verify(cookie, [demo_key()], 1700000000) ??
+            demo_session(), "role") == Some("admin"))
+    say(f, "including the id", (session.verify(cookie, [demo_key()],
+        1700000000) ?? demo_session()).id == "abc123")
+    // The failures.
+    say(f, "a changed payload does not verify",
+        not session.is_valid("aWQ9YWJjMTIzJnVzZXI9OCZyb2xlPWFkbWlu." +
+            "1700003600.-luQ-N0bV2KV5b28gqKW-pF37LZ0HwIG0tCAIHqsS3M",
+            [demo_key()], 1700000000))
+    say(f, "an extended expiry does not verify either, because it is signed",
+        not session.is_valid("aWQ9YWJjMTIzJnVzZXI9NyZyb2xlPWFkbWlu." +
+            "1799999999.-luQ-N0bV2KV5b28gqKW-pF37LZ0HwIG0tCAIHqsS3M",
+            [demo_key()], 1700000000))
+    say(f, "a cookie past its expiry is refused even with a valid signature",
+        not session.is_valid(cookie, [demo_key()], 1700003601))
+    say(f, "a cookie signed with another key is refused",
+        not session.is_valid(cookie, [old_key()], 1700000000))
+    say(f, "and one with the wrong number of parts is refused",
+        not session.is_valid("only.two", [demo_key()], 1700000000))
+    // Key rotation.
+    say(f, "a cookie signed with the old key still verifies during a rotation",
+        session.is_valid(cookie, [old_key(), demo_key()], 1700000000))
+    say(f, "and a new one is signed with the new key",
+        (session.sign(demo_session(), [old_key(), demo_key()]) ?? "") !=
+        cookie)
+    check_session_more(f)
+}
+
+fn check_session_more(inout f: i64) / {io} {
+    // Fixation.
+    var s = demo_session()
+    let before = s.id
+    session.regenerate(s, "def456", 1700001000, 3600)
+    say(f, "regenerating changes the id and keeps the contents",
+        s.id != before and session.get(s, "role") == Some("admin"))
+    say(f, "and restarts the clock", s.expires_at == 1700004600)
+    session.clear(s)
+    say(f, "clearing empties it but keeps the session",
+        session.keys_of(s).len() == 0 and s.id == "def456")
+    // Renewal.
+    say(f, "a session past halfway is due for renewal",
+        session.should_renew(demo_session(), 1700002000) and
+        not session.should_renew(demo_session(), 1700001000))
+    // Size.
+    say(f, "the cookie budget is checked, because a browser drops an " +
+        "oversized cookie rather than truncating it",
+        session.cookie_limit() == 4096 and
+        session.size_of(demo_session(), [demo_key()]) < 4096)
+    say(f, "and a session too large to fit is refused",
+        oversized_refuses())
+    // The cookie itself.
+    let c = session.cookie_for("sid", "value", 3600)
+    say(f, "the cookie defaults are the safe ones",
+        c.http_only and c.secure and c.same_site == "Lax" and c.path == "/")
+    say(f, "and it renders with every attribute",
+        session.render_cookie(c) ==
+        "sid=value; Path=/; Max-Age=3600; HttpOnly; Secure; SameSite=Lax")
+    say(f, "the clearing cookie expires immediately and keeps the path",
+        session.render_cookie(session.clearing_cookie("sid")).contains(
+            "Max-Age=0") and
+        session.render_cookie(session.clearing_cookie("sid")).contains(
+            "Path=/"))
+    say(f, "a cookie can be found in a header among others",
+        session.from_header("other=1; sid=abc; more=2", "sid") == Some("abc"))
+    say(f, "and one that is not there is not found",
+        session.from_header("other=1", "sid") == None)
+    say(f, "a key containing a separator is refused, so a value cannot forge " +
+        "a field", bad_key_refuses("a=b"))
+}
+
+fn oversized_refuses() -> bool {
+    var s = session.new_session("big", 0, 3600)
+    session.set(s, "blob", "x".repeat(5000))
+    match session.sign(s, [demo_key()]) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn bad_key_refuses(key: str) -> bool {
+    var s = demo_session()
+    session.set(s, key, "v")
+    match session.sign(s, [demo_key()]) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+// --------------------------------------------------------------- csrf
+
+fn csrf_secret() -> bytes {
+    return "csrf secret, thirty-two bytes ok".to_bytes()
+}
+
+fn pad() -> bytes {
+    var out: [i64] = []
+    for i in 0..32 {
+        out.push((i * 37 + 11) % 256)
+    }
+    return bytes_of(out)
+}
+
+fn check_csrf(inout f: i64) / {io} {
+    print("-- csrf: a token the other origin cannot read, compared in " +
+        "constant time")
+    let token = csrf.token_for(csrf_secret(), "abc123")
+    say(f, "the token is an HMAC over the session id",
+        token == "E8cXjc2egMPi8gFJN8W8hHfB0MM8-XzXhWzk-QqINk0")
+    say(f, "a different session gets a different token",
+        csrf.token_for(csrf_secret(), "def456") != token)
+    say(f, "which is why regenerating the session id rotates it too",
+        csrf.token_for(csrf_secret(), "abc123") == token)
+    say(f, "the plain token is accepted",
+        csrf.check_token(csrf_secret(), "abc123", token))
+    say(f, "another session's token is not",
+        not csrf.check_token(csrf_secret(), "abc123",
+            csrf.token_for(csrf_secret(), "def456")))
+    say(f, "and an empty one is not",
+        not csrf.check_token(csrf_secret(), "abc123", ""))
+    // Masking.
+    let masked = csrf.mask(token, pad()) ?? ""
+    say(f, "a masked token is twice as long and shares no bytes with the " +
+        "plain one", masked != token and masked.len() > token.len())
+    say(f, "it unmasks to the token", (csrf.unmask(masked) ?? "") == token)
+    say(f, "and is accepted as it is", csrf.check_token(csrf_secret(),
+        "abc123", masked))
+    say(f, "a different pad gives a different rendering of the same token",
+        (csrf.mask(token, other_pad()) ?? "") != masked and
+        (csrf.unmask(csrf.mask(token, other_pad()) ?? "") ?? "") == token)
+    say(f, "a pad shorter than the token is refused",
+        mask_refuses(token, bytes_of([1, 2, 3])))
+    check_csrf_more(f)
+}
+
+fn other_pad() -> bytes {
+    var out: [i64] = []
+    for i in 0..32 {
+        out.push((i * 91 + 5) % 256)
+    }
+    return bytes_of(out)
+}
+
+fn mask_refuses(token: str, small: bytes) -> bool {
+    match csrf.mask(token, small) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn nonce() -> bytes {
+    var out: [i64] = []
+    for i in 0..16 {
+        out.push(i)
+    }
+    return bytes_of(out)
+}
+
+fn request_refuses(method: str, submitted: str, origin: str) -> bool {
+    match csrf.check_request(csrf_secret(), "abc123", method, submitted,
+        origin, "", "https://example.com") {
+        Ok(allowed) -> return not allowed
+        Err(_e) -> return true
+    }
+}
+
+fn check_csrf_more(inout f: i64) / {io} {
+    // Double submit.
+    let cookie = csrf.double_submit_cookie(csrf_secret(), nonce()) ?? ""
+    say(f, "a double-submit cookie is a value and its signature",
+        cookie == "AAECAwQFBgcICQoLDA0ODw." +
+        "9I-FgNi2lyDxYzrK6qKaCHaCo9GDkhB7t31ljT4Ie1Q")
+    say(f, "the two halves have to agree",
+        csrf.check_double_submit(csrf_secret(), cookie,
+            "AAECAwQFBgcICQoLDA0ODw"))
+    say(f, "a forged cookie fails its signature, which a plain double " +
+        "submit could not detect",
+        not csrf.check_double_submit(csrf_secret(),
+            "ZZZZZZZZZZZZZZZZZZZZZZ.9I-FgNi2lyDxYzrK6qKaCHaCo9GDkhB7t31ljT4Ie1Q",
+            "ZZZZZZZZZZZZZZZZZZZZZZ"))
+    say(f, "and a nonce that is too short is refused",
+        double_refuses(bytes_of([1, 2, 3])))
+    // Origins.
+    say(f, "an origin is scheme and host, without the path",
+        csrf.origin_of("https://example.com/a/b?c=d") == "https://example.com")
+    say(f, "so a lookalike host does not match",
+        csrf.origin_of("https://example.com.attacker.net/x") !=
+        "https://example.com")
+    say(f, "a matching Origin passes",
+        (csrf.check_origin("https://example.com", "",
+            "https://example.com") ?? false))
+    say(f, "a Referer is the fallback when Origin is absent",
+        (csrf.check_origin("", "https://example.com/page",
+            "https://example.com") ?? false))
+    say(f, "neither header is not evidence of safety",
+        not (csrf.check_origin("", "", "https://example.com") ?? true))
+    // The whole check.
+    let token = csrf.token_for(csrf_secret(), "abc123")
+    say(f, "a safe method needs no token",
+        (csrf.check_request(csrf_secret(), "abc123", "GET", "", "", "",
+            "https://example.com") ?? false))
+    say(f, "an unsafe one with a good token and a good origin passes",
+        (csrf.check_request(csrf_secret(), "abc123", "POST", token,
+            "https://example.com", "", "https://example.com") ?? false))
+    say(f, "a missing token is refused", request_refuses("POST", "", ""))
+    say(f, "a wrong token is refused",
+        request_refuses("POST", "not-a-token", ""))
+    say(f, "and a good token from the wrong origin is refused",
+        request_refuses("POST", token, "https://attacker.example"))
+}
+
+fn double_refuses(small: bytes) -> bool {
+    match csrf.double_submit_cookie(csrf_secret(), small) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+// --------------------------------------------------------------- etag
+
+fn decide(method: str, if_match: str, if_none_match: str, modified_at: i64,
+    ims: i64, ius: i64) -> i64 {
+    match etag.decide(method, "\"v1\"", true, if_match, if_none_match,
+        modified_at, ims, ius) {
+        Ok(d) -> return d.status
+        Err(_e) -> return 0 - 1
+    }
+}
+
+fn check_etag(inout f: i64) / {io} {
+    print("-- etag: 304 for a read, 412 for a write, and they are not " +
+        "interchangeable")
+    say(f, "a tag is a hash of the body, so two servers agree",
+        etag.strong_of("hello world".to_bytes()) ==
+        "\"b94d27b9934d3e08a52e52d7da7dabfa\"")
+    say(f, "a weak tag says so", etag.weak_of("hello world".to_bytes()) ==
+        "W/\"b94d27b9934d3e08a52e52d7da7dabfa\"")
+    say(f, "a tag parses with its weakness",
+        (etag.parse_one("W/\"abc\"") ??
+            EtagValue{ value: "", weak: false }).weak and
+        not (etag.parse_one("\"abc\"") ??
+            EtagValue{ value: "", weak: true }).weak)
+    say(f, "a list splits on commas outside the quotes",
+        (etag.parse_list("W/\"a,b\", \"c\"") ?? []).len() == 2)
+    say(f, "and round-trips", etag.render(etag.parse_one("W/\"abc\"") ??
+        EtagValue{ value: "", weak: false }) == "W/\"abc\"")
+    // The comparison asymmetry.
+    let weak_a = EtagValue{ value: "abc", weak: true }
+    let strong_a = EtagValue{ value: "abc", weak: false }
+    say(f, "a weak comparison ignores the W/ prefix",
+        etag.compare_weak(weak_a, strong_a))
+    say(f, "a strong comparison does not",
+        not etag.compare_strong(weak_a, strong_a))
+    say(f, "and two identical weak tags never compare strongly",
+        not etag.compare_strong(weak_a, weak_a))
+    // The statuses, in the order RFC 9110 gives.
+    say(f, "a GET whose If-None-Match matches is 304",
+        decide("GET", "", "\"v1\"", 0 - 1, 0 - 1, 0 - 1) == 304)
+    say(f, "and one that does not match is handled normally",
+        decide("GET", "", "\"v0\"", 0 - 1, 0 - 1, 0 - 1) == 0)
+    say(f, "a PUT whose If-Match fails is 412, not 304",
+        decide("PUT", "\"v0\"", "", 0 - 1, 0 - 1, 0 - 1) == 412)
+    say(f, "and one that succeeds is handled normally",
+        decide("PUT", "\"v1\"", "", 0 - 1, 0 - 1, 0 - 1) == 0)
+    say(f, "a POST whose If-None-Match matches is 412, because it is not safe",
+        decide("POST", "", "\"v1\"", 0 - 1, 0 - 1, 0 - 1) == 412)
+    check_etag_more(f)
+}
+
+fn decide_missing(method: str, if_match: str, if_none_match: str) -> i64 {
+    match etag.decide(method, "", false, if_match, if_none_match, 0 - 1,
+        0 - 1, 0 - 1) {
+        Ok(d) -> return d.status
+        Err(_e) -> return 0 - 1
+    }
+}
+
+fn check_etag_more(inout f: i64) / {io} {
+    // The wildcard.
+    say(f, "If-Match: * succeeds when the resource exists",
+        decide("PUT", "*", "", 0 - 1, 0 - 1, 0 - 1) == 0)
+    say(f, "and fails with 412 when it does not, which is a conditional " +
+        "create", decide_missing("PUT", "*", "") == 412)
+    say(f, "If-None-Match: * fails when the resource exists",
+        decide("PUT", "", "*", 0 - 1, 0 - 1, 0 - 1) == 412)
+    say(f, "and succeeds when it does not",
+        decide_missing("PUT", "", "*") == 0)
+    // Dates, and their place in the order.
+    say(f, "If-Modified-Since gives a 304 when nothing changed",
+        decide("GET", "", "", 1000, 1000, 0 - 1) == 304)
+    say(f, "and is ignored entirely when If-None-Match is present",
+        decide("GET", "", "\"v0\"", 1000, 1000, 0 - 1) == 0)
+    say(f, "If-Unmodified-Since gives a 412 when something did",
+        decide("PUT", "", "", 2000, 0 - 1, 1000) == 412)
+    say(f, "and is ignored when If-Match is present",
+        decide("PUT", "\"v1\"", "", 2000, 0 - 1, 1000) == 0)
+    say(f, "a weak tag satisfies If-None-Match, because it compares weakly",
+        weak_none_match() == 304)
+    // The headers.
+    say(f, "a 304 carries the ETag, or the client has nothing to store",
+        etag.not_modified_headers("\"v1\"", "public, max-age=60") ==
+        ["ETag: \"v1\"", "Cache-Control: public, max-age=60"])
+    say(f, "cache-control is assembled from its parts",
+        etag.cache_control(true, 60, true) ==
+        "public, max-age=60, must-revalidate" and
+        etag.cache_control(false, 0 - 1, false) == "private")
+    say(f, "no-store is not no-cache", etag.no_store() == "no-store")
+    say(f, "and not every status may carry a tag",
+        etag.may_have_tag(200) and etag.may_have_tag(304) and
+        not etag.may_have_tag(500))
+    say(f, "a malformed tag is refused", parse_refuses("abc"))
+    say(f, "and an empty one is", parse_refuses(""))
+}
+
+fn weak_none_match() -> i64 {
+    match etag.decide("GET", "W/\"v1\"", true, "", "W/\"v1\"", 0 - 1, 0 - 1,
+        0 - 1) {
+        Ok(d) -> return d.status
+        Err(_e) -> return 0 - 1
+    }
+}
+
+fn parse_refuses(text: str) -> bool {
+    match etag.parse_one(text) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn main() / {io} {
+    var f = 0
+
+    check_router(f)
+    check_middleware(f)
+    check_session(f)
+    check_csrf(f)
+    check_etag(f)
+
+    if f == 0 {
+        print("web: every claim held")
+    } else {
+        print("web: {f} failed")
+    }
+}

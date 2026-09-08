@@ -1,0 +1,28 @@
+[package]
+name = "content_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.htmlparse]
+path = "../htmlparse"
+version = "^1.0.0"
+
+[dependencies.cssparse]
+path = "../cssparse"
+version = "^1.0.0"
+
+[dependencies.xpath]
+path = "../xpath"
+version = "^1.0.0"
+
+[dependencies.staticfiles]
+path = "../staticfiles"
+version = "^1.0.0"
+
+[dependencies.rangeheader]
+path = "../rangeheader"
+version = "^1.0.0"
+
+[dependencies.xml]
+path = "../xml"
+version = "^1.0.0"

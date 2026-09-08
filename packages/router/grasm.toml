@@ -1,0 +1,6 @@
+[package]
+name = "router"
+version = "1.0.0"
+
+# Text in, a decision out. Opens nothing.
+capabilities = []

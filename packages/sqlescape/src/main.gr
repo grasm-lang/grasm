@@ -1,0 +1,284 @@
+// Quoting SQL, and the reason a package that does this is a warning sign.
+//
+// **Read this before using any of it.** Escaping is not how a program should
+// put a value into a query. Parameter binding is: the driver sends the query
+// and the values separately, the value never becomes syntax, and no amount of
+// quoting can go wrong because no quoting happens. `packages/postgres` binds
+// parameters, and that is what application code should call.
+//
+// This package exists for the cases where binding is not available:
+//
+// - **identifiers.** No SQL dialect lets a table or column name be a bound
+//   parameter. `SELECT * FROM $1` is not a query. So a program that takes a
+//   column name from configuration has to quote it, and `quote_identifier` is
+//   the only correct way to do that.
+// - **generating a dump or a migration**, where the output is a text file
+//   rather than a statement being executed.
+// - **a literal in a place the protocol forbids a parameter**: inside a
+//   `LIMIT` on some drivers, in DDL defaults, in an `interval` string.
+//
+// Everything here is dialect-specific, because the escaping rules genuinely
+// differ. SQLite and PostgreSQL double an embedded quote; MySQL does that
+// *and* accepts backslash escapes, which is why a value escaped for
+// PostgreSQL is not safe in MySQL with `NO_BACKSLASH_ESCAPES` off. Identifiers
+// are `"..."` in the standard, SQLite and PostgreSQL, and `` `...` `` in
+// MySQL.
+//
+// The refusals are the useful part. A NUL byte in an identifier, a name that
+// is empty, a value containing a byte no encoding can carry — each is refused
+// rather than escaped, because there is no escape that makes them safe.
+
+type SqlDialect =
+    | SqlStandard
+    | SqlPostgres
+    | SqlSqlite
+    | SqlMysql
+
+type SqlEscapeError =
+    | SqlEmptyIdentifier
+    | SqlNulInIdentifier(name: str)
+    | SqlNulInValue(at: i64)
+    | SqlIdentifierTooLong(length: i64, limit: i64)
+
+    /// The longest identifier a dialect accepts.
+    ///
+    /// PostgreSQL truncates at 63 bytes *silently*, which is worse than refusing:
+    /// two different long names become the same object and the second `CREATE`
+    /// fails with a message about the first. This refuses instead.
+pub fn identifier_limit(d: SqlDialect) -> i64 {
+    match d {
+        SqlPostgres -> return 63
+        SqlMysql -> return 64
+        SqlSqlite -> return 1000000000
+        SqlStandard -> return 128
+    }
+}
+
+/// The character an identifier is wrapped in.
+pub fn identifier_quote(d: SqlDialect) -> str {
+    match d {
+        SqlMysql -> return "`"
+        _ -> return "\""
+    }
+}
+
+/// Quote an identifier: a table, column, index or schema name.
+///
+/// Always quote. An unquoted identifier is case-folded — upward in the
+/// standard and in Oracle, downward in PostgreSQL — so `Users` and `users`
+/// are the same table until one of them is quoted, and then they are not.
+/// Quoting consistently is the only way for a name to mean one thing.
+pub fn quote_identifier(d: SqlDialect, name: str) -> str ! SqlEscapeError {
+    if name == "" {
+        fail(SqlEmptyIdentifier)
+    }
+    let raw = name.to_bytes()
+    for i in 0..raw.len() {
+        if raw.at(i) == 0 {
+            fail(SqlNulInIdentifier(name))
+        }
+    }
+    if raw.len() > identifier_limit(d) {
+        fail(SqlIdentifierTooLong(raw.len(), identifier_limit(d)))
+    }
+    let q = identifier_quote(d)
+    return q + name.replace(q, q + q) + q
+}
+
+/// A dotted name, each part quoted separately.
+///
+/// `quote_qualified(d, "public.users")` is `"public"."users"` and not
+/// `"public.users"`, which would be one table whose name contains a dot.
+pub fn quote_qualified(d: SqlDialect, dotted: str) -> str ! SqlEscapeError {
+    var parts: [str] = []
+    for part in dotted.split(".") {
+        parts.push(try quote_identifier(d, part))
+    }
+    return parts.join(".")
+}
+
+/// Quote a string literal.
+pub fn quote_string(d: SqlDialect, value: str) -> str ! SqlEscapeError {
+    let raw = value.to_bytes()
+    for i in 0..raw.len() {
+        if raw.at(i) == 0 {
+            fail(SqlNulInValue(i))
+        }
+    }
+    match d {
+        SqlMysql -> return "'" + mysql_escape(value) + "'"
+        _ -> {
+            // Doubling the quote is the standard rule, and it is enough
+            // everywhere a backslash is not also an escape.
+            if value.contains("\\") {
+                match d {
+                    SqlPostgres -> return "E'" + postgres_escape(value) + "'"
+                    _ -> return "'" + value.replace("'", "''") + "'"
+                }
+            }
+            return "'" + value.replace("'", "''") + "'"
+        }
+    }
+}
+
+/// MySQL's escaping, which includes the backslash forms it accepts by default.
+fn mysql_escape(value: str) -> str {
+    var out = ""
+    for c in value.chars() {
+        if c == "\\" {
+            out = out + "\\\\"
+        } else {
+            if c == "'" {
+                out = out + "''"
+            } else {
+                if c == "\n" {
+                    out = out + "\\n"
+                } else {
+                    if c == "\r" {
+                        out = out + "\\r"
+                    } else {
+                        // Control-Z ends a file on Windows, and MySQL's own
+                        // client escapes it for that reason.
+                        if c == (26).to_char() {
+                            out = out + "\\Z"
+                        } else {
+                            out = out + c
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return out
+}
+
+/// PostgreSQL's `E'...'` escaping, for a value that contains a backslash.
+///
+/// In a plain `'...'` literal PostgreSQL treats a backslash as an ordinary
+/// character, so `'a\b'` is three characters — but only when
+/// `standard_conforming_strings` is on, which it has been by default since
+/// 9.1 and is not guaranteed to be. Writing `E'a\\b'` says what is meant
+/// whatever the setting.
+fn postgres_escape(value: str) -> str {
+    return value.replace("\\", "\\\\").replace("'", "''")
+}
+
+/// A `bytea` or `BLOB` literal, as the dialect spells it.
+pub fn quote_bytes(d: SqlDialect, data: bytes) -> str {
+    let digits = "0123456789abcdef"
+    var hex = ""
+    for i in 0..data.len() {
+        hex = hex + digits.substr(data.at(i).ushr(4), 1) +
+        digits.substr(data.at(i).bit_and(15), 1)
+    }
+    match d {
+        SqlPostgres -> return "'\\x" + hex + "'"
+        _ -> return "X'" + hex + "'"
+    }
+}
+
+/// A boolean, as the dialect spells it.
+///
+/// SQLite has no boolean type — it stores 1 and 0 — and MySQL's `BOOLEAN` is
+/// `TINYINT(1)`, so `TRUE` is accepted but comes back as an integer. Writing
+/// the number for those two is what round-trips.
+pub fn quote_boolean(d: SqlDialect, value: bool) -> str {
+    match d {
+        SqlSqlite -> return if value { "1" } else { "0" }
+        SqlMysql -> return if value { "1" } else { "0" }
+        _ -> return if value { "TRUE" } else { "FALSE" }
+    }
+}
+
+/// `NULL`, which is not a value and is never quoted.
+pub fn null_literal() -> str {
+    return "NULL"
+}
+
+/// A `LIKE` pattern with the wildcards in `value` made literal.
+///
+/// `LIKE` treats `%` and `_` as wildcards, so a search for a user-supplied
+/// string that happens to contain `%` matches everything. Escaping them needs
+/// an `ESCAPE` clause, which `like_clause` writes.
+pub fn escape_like(value: str, escape: str) -> str {
+    return value.replace(escape, escape + escape)
+        .replace("%", escape + "%")
+        .replace("_", escape + "_")
+}
+
+/// A complete `LIKE ... ESCAPE ...` fragment for a literal substring search.
+pub fn like_clause(d: SqlDialect, column: str,
+    contains: str) -> str ! SqlEscapeError {
+    let pattern = "%" + escape_like(contains, "\\") + "%"
+    return (try quote_identifier(d, column)) + " LIKE " +
+    (try quote_string(d, pattern)) + " ESCAPE '\\'"
+}
+
+/// Whether a name needs quoting to keep its meaning.
+///
+/// Every name does, in practice — this exists to show why: a name that is not
+/// lowercase, or that is a keyword, or that holds anything but letters, digits
+/// and underscores, changes meaning unquoted.
+pub fn needs_quoting(name: str) -> bool {
+    if name == "" {
+        return true
+    }
+    if is_keyword(name.to_upper()) {
+        return true
+    }
+    var first = true
+    for c in name.chars() {
+        let ok = (c >= "a" and c <= "z") or c == "_" or
+        (not first and c >= "0" and c <= "9")
+        if not ok {
+            return true
+        }
+        first = false
+    }
+    return false
+}
+
+/// The reserved words that most often turn up as column names.
+///
+/// Not the whole list — every dialect's is different and all of them are
+/// hundreds long. These are the ones that appear in real schemas: `user`,
+/// `order`, `group`, `key`, `value`, `desc`, `table`.
+pub fn is_keyword(upper: str) -> bool {
+    let words = ["ALL", "AND", "AS", "ASC", "BETWEEN", "BY", "CASE", "CHECK",
+        "COLLATE", "COLUMN", "CONSTRAINT", "CREATE", "CROSS", "CURRENT_DATE",
+        "DEFAULT", "DELETE", "DESC", "DISTINCT", "DROP", "ELSE", "END",
+        "EXCEPT", "EXISTS", "FALSE", "FOR", "FOREIGN", "FROM", "FULL",
+        "GROUP", "HAVING", "IN", "INDEX", "INNER", "INSERT", "INTERSECT",
+        "INTO", "IS", "JOIN", "KEY", "LEFT", "LIKE", "LIMIT", "NATURAL",
+        "NOT", "NULL", "OFFSET", "ON", "OR", "ORDER", "OUTER", "PRIMARY",
+        "REFERENCES", "RIGHT", "SELECT", "SET", "TABLE", "THEN", "TO",
+        "TRUE", "UNION", "UNIQUE", "UPDATE", "USER", "USING", "VALUES",
+        "WHEN", "WHERE", "WITH"]
+    for w in words {
+        if w == upper {
+            return true
+        }
+    }
+    return false
+}
+
+/// The placeholder a dialect uses for a bound parameter.
+///
+/// Different in every one, which is why a query string written for one driver
+/// does not move: PostgreSQL numbers them from 1, SQLite and MySQL do not
+/// number them at all.
+pub fn placeholder(d: SqlDialect, index: i64) -> str {
+    match d {
+        SqlPostgres -> return "${index}"
+        _ -> return "?"
+    }
+}
+
+/// A comma-separated run of placeholders, for an `IN` list.
+pub fn placeholders(d: SqlDialect, count: i64, from: i64) -> str {
+    var parts: [str] = []
+    for i in 0..count {
+        parts.push(placeholder(d, from + i))
+    }
+    return parts.join(", ")
+}

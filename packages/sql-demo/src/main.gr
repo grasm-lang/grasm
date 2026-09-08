@@ -1,0 +1,712 @@
+import sqlescape
+import sqlbuild
+import sqlparse
+import dbschema
+import sqlitefile
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn backslash() -> str {
+    return (92).to_char()
+}
+
+fn from_hex(s: str) -> bytes {
+    var out: [i64] = []
+    var i = 0
+    while i + 1 < s.len() {
+        out.push(s.substr(i, 2).parse_int_base(16) ?? 0)
+        i = i + 2
+    }
+    return bytes_of(out)
+}
+
+// ---------------------------------------------------------- sqlescape
+
+fn identifier_refuses(d: SqlDialect, name: str) -> bool {
+    match sqlescape.quote_identifier(d, name) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn check_escape(inout f: i64) / {io} {
+    print("-- sqlescape: for the places a bound parameter cannot go")
+    say(f, "an identifier is quoted and its quote doubled",
+        (sqlescape.quote_identifier(SqlPostgres, "we\"ird") ?? "") ==
+        "\"we\"\"ird\"")
+    say(f, "MySQL uses backticks instead",
+        (sqlescape.quote_identifier(SqlMysql, "we`ird") ?? "") ==
+        "`we``ird`")
+    say(f, "a qualified name quotes each part separately",
+        (sqlescape.quote_qualified(SqlPostgres, "public.users") ?? "") ==
+        "\"public\".\"users\"")
+    say(f, "an empty name is refused",
+        identifier_refuses(SqlPostgres, ""))
+    say(f, "and one past PostgreSQL's 63 bytes is refused rather than " +
+        "silently truncated",
+        identifier_refuses(SqlPostgres, "a".repeat(64)) and
+        not identifier_refuses(SqlPostgres, "a".repeat(63)))
+    say(f, "a string literal doubles its quote",
+        (sqlescape.quote_string(SqlSqlite, "O'Brien") ?? "") == "'O''Brien'")
+    say(f, "MySQL escapes the backslash too, because it treats one as an " +
+        "escape",
+        (sqlescape.quote_string(SqlMysql, "a" + backslash() + "b'c") ?? "") ==
+        "'a" + backslash() + backslash() + "b''c'")
+    say(f, "and PostgreSQL says so explicitly with an E-string",
+        (sqlescape.quote_string(SqlPostgres, "a" + backslash() + "b") ?? "")
+        == "E'a" + backslash() + backslash() + "b'")
+    say(f, "a byte run is hex, spelled the dialect's way",
+        sqlescape.quote_bytes(SqlPostgres, bytes_of([1, 255])) ==
+        "'" + backslash() + "x01ff'" and
+        sqlescape.quote_bytes(SqlSqlite, bytes_of([1, 255])) == "X'01ff'")
+    say(f, "a boolean is a number where the type does not exist",
+        sqlescape.quote_boolean(SqlPostgres, true) == "TRUE" and
+        sqlescape.quote_boolean(SqlSqlite, true) == "1")
+    // The `LIKE` wildcard problem.
+    say(f, "a search string's own wildcards are made literal",
+        sqlescape.escape_like("a_d%", backslash()) ==
+        "a" + backslash() + "_d" + backslash() + "%")
+    say(f, "and the escape character itself is doubled first",
+        sqlescape.escape_like("a" + backslash() + "b", backslash()) ==
+        "a" + backslash() + backslash() + "b")
+    // The reason to always quote.
+    say(f, "a keyword needs quoting", sqlescape.needs_quoting("order") and
+        sqlescape.needs_quoting("user"))
+    say(f, "so does anything not lowercase or with punctuation in it",
+        sqlescape.needs_quoting("Users") and
+        sqlescape.needs_quoting("a-b") and
+        not sqlescape.needs_quoting("user_name"))
+    say(f, "placeholders differ by dialect, which is why a query does not move",
+        sqlescape.placeholder(SqlPostgres, 3) == "$3" and
+        sqlescape.placeholder(SqlSqlite, 3) == "?")
+    say(f, "and a list of them counts from where it is told",
+        sqlescape.placeholders(SqlPostgres, 3, 2) == "$2, $3, $4")
+}
+
+// ----------------------------------------------------------- sqlbuild
+
+fn empty_query() -> SqlQuery {
+    return SqlQuery{ text: "", value: [], dialect: SqlSqlite }
+}
+
+fn built() -> SqlQuery {
+    var q = sqlbuild.select_from(SqlPostgres, "public.users")
+    sqlbuild.columns(q, ["id", "name"])
+    sqlbuild.join(q, "LEFT", "orders", "users.id", "orders.user_id")
+    sqlbuild.where_equals(q, "users.name", "ada")
+    sqlbuild.where_in(q, "users.id", ["1", "2", "3"])
+    sqlbuild.where_null(q, "users.deleted_at", true)
+    sqlbuild.order_by(q, "users.id", true)
+    sqlbuild.limit(q, 10, 20)
+    return sqlbuild.build(q) ?? empty_query()
+}
+
+fn build_refuses(q: SqlSelect) -> bool {
+    match sqlbuild.build(q) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn check_build(inout f: i64) / {io} {
+    print("-- sqlbuild: the values never enter the text")
+    let q = built()
+    // Every statement in this section was executed by SQLite or checked
+    // against what PostgreSQL and MySQL accept.
+    say(f, "a select numbers its placeholders across every clause",
+        q.text == "SELECT \"id\", \"name\" FROM \"public\".\"users\" " +
+        "LEFT JOIN \"orders\" ON \"users\".\"id\" = " +
+        "\"orders\".\"user_id\" WHERE \"users\".\"name\" = $1 AND " +
+        "\"users\".\"id\" IN ($2, $3, $4) AND " +
+        "\"users\".\"deleted_at\" IS NULL ORDER BY \"users\".\"id\" DESC " +
+        "LIMIT 10 OFFSET 20")
+    say(f, "and hands back the values separately, in order",
+        q.value == ["ada", "1", "2", "3"])
+    say(f, "no value appears in the query text",
+        not q.text.contains("ada"))
+    say(f, "a null test is `IS NULL`, never `= NULL`",
+        q.text.contains("IS NULL") and not q.text.contains("= NULL"))
+    // Refusals.
+    var empty_in = sqlbuild.select_from(SqlSqlite, "t")
+    sqlbuild.where_in(empty_in, "id", [])
+    say(f, "an empty IN list is refused, not written as `IN ()`",
+        build_refuses(empty_in))
+    say(f, "and a select with no table is refused",
+        build_refuses(sqlbuild.select_from(SqlSqlite, "")))
+    var unordered = sqlbuild.select_from(SqlSqlite, "t")
+    sqlbuild.limit(unordered, 10, 0)
+    say(f, "a LIMIT with no ORDER BY is reported, because the rows it " +
+        "returns are arbitrary",
+        sqlbuild.limit_without_order(unordered))
+    say(f, "and one with an order is not",
+        not sqlbuild.limit_without_order(ordered_select()))
+    check_build_more(f)
+}
+
+fn ordered_select() -> SqlSelect {
+    var s = sqlbuild.select_from(SqlSqlite, "t")
+    sqlbuild.limit(s, 10, 0)
+    sqlbuild.order_by(s, "id", false)
+    return s
+}
+
+fn insert_refuses(names: [str], values: [str]) -> bool {
+    match sqlbuild.insert(SqlSqlite, "t", names, values) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn update_refuses(where_names: [str]) -> bool {
+    match sqlbuild.update(SqlSqlite, "t", ["a"], ["1"], where_names, []) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn check_build_more(inout f: i64) / {io} {
+    let ins = sqlbuild.insert(SqlSqlite, "users", ["name", "score"],
+        ["ada", "1.5"]) ?? empty_query()
+    say(f, "an insert is placeholders only",
+        ins.text == "INSERT INTO \"users\" (\"name\", \"score\") " +
+        "VALUES (?, ?)")
+    let many = sqlbuild.insert_many(SqlSqlite, "users", ["name"],
+        [["a"], ["b"]]) ?? empty_query()
+    say(f, "and a multi-row insert is one statement, not two round trips",
+        many.text == "INSERT INTO \"users\" (\"name\") VALUES (?), (?)" and
+        many.value == ["a", "b"])
+    say(f, "a column count that does not match its values is refused",
+        insert_refuses(["a", "b"], ["1"]))
+    say(f, "and an insert with no columns is refused",
+        insert_refuses([], []))
+    let up = sqlbuild.update(SqlPostgres, "users", ["name"], ["bo"], ["id"],
+        ["7"]) ?? empty_query()
+    say(f, "an update numbers the SET values before the WHERE values",
+        up.text == "UPDATE \"users\" SET \"name\" = $1 WHERE \"id\" = $2" and
+        up.value == ["bo", "7"])
+    say(f, "an update with no WHERE is refused, because it would change " +
+        "every row", update_refuses([]))
+    // The upsert, in three spellings.
+    let pg = sqlbuild.upsert(SqlPostgres, "users", ["id", "name"],
+        ["1", "ada"], ["id"]) ?? empty_query()
+    say(f, "PostgreSQL and SQLite spell an upsert with ON CONFLICT",
+        pg.text.contains("ON CONFLICT (\"id\") DO UPDATE SET " +
+            "\"name\" = excluded.\"name\""))
+    let my = sqlbuild.upsert(SqlMysql, "users", ["id", "name"],
+        ["1", "ada"], ["id"]) ?? empty_query()
+    say(f, "and MySQL with ON DUPLICATE KEY, naming no key at all",
+        my.text.contains("ON DUPLICATE KEY UPDATE `name` = VALUES(`name`)"))
+    // The preview, and its positional replacement.
+    say(f, "a preview puts the values back for a log line",
+        (sqlbuild.preview(ins) ?? "") ==
+        "INSERT INTO \"users\" (\"name\", \"score\") VALUES ('ada', '1.5')")
+    say(f, "each `?` takes its own value, not the first one",
+        not (sqlbuild.preview(ins) ?? "").contains("'ada', 'ada'"))
+    say(f, "and a numbered dialect substitutes from the highest down, so " +
+        "$1 cannot corrupt $10",
+        (sqlbuild.preview(up) ?? "") ==
+        "UPDATE \"users\" SET \"name\" = 'bo' WHERE \"id\" = '7'")
+    var like = sqlbuild.select_from(SqlSqlite, "users")
+    sqlbuild.where_contains(like, "name", "a_d%")
+    let like_query = sqlbuild.build(like) ?? empty_query()
+    say(f, "a substring search escapes the pattern's own wildcards",
+        like_query.value == ["%a" + backslash() + "_d" + backslash() + "%%"])
+    say(f, "and says which character does the escaping",
+        like_query.text.contains("ESCAPE"))
+}
+
+// ----------------------------------------------------------- sqlparse
+
+fn migration_script() -> str {
+    return "-- a migration\n" +
+    "CREATE TABLE t (a INTEGER);\n" +
+    "INSERT INTO t VALUES ('a;b');\n" +
+    "/* nested /* comment */ still */\n" +
+    "CREATE FUNCTION f() RETURNS void AS $body$\n" +
+    "BEGIN\n" +
+    "  RAISE NOTICE 'hi;there';\n" +
+    "END;\n" +
+    "$body$ LANGUAGE plpgsql;\n" +
+    "SELECT * FROM t JOIN u ON t.a = u.a WHERE t.a = 1;\n"
+}
+
+fn check_parse(inout f: i64) / {io} {
+    print("-- sqlparse: `split(\";\")` is wrong four ways in one script")
+    let statements = sqlparse.split_statements(migration_script()) ?? []
+    // Python's `sqlparse` splits this script the same way; `split(";")` gives
+    // eight fragments.
+    say(f, "the script is four statements", statements.len() == 4)
+    say(f, "a semicolon inside a string literal does not split",
+        statements[1].text.contains("'a;b'"))
+    say(f, "nor do the three inside a dollar-quoted function body",
+        statements[2].text.contains("RAISE NOTICE 'hi;there'") and
+        statements[2].text.contains("END;"))
+    say(f, "and a naive split would have found eight",
+        migration_script().split(";").len() == 9)
+    say(f, "each statement knows its verb",
+        statements[0].verb == "CREATE" and statements[1].verb == "INSERT" and
+        statements[3].verb == "SELECT")
+    say(f, "and the tables it names",
+        statements[3].tables == ["t", "u"])
+    say(f, "a nested block comment is one comment",
+        statements[2].text.starts_with("/* nested /* comment */ still */"))
+    // What a router or a pool needs to know.
+    say(f, "a select is read-only", sqlparse.is_read_only("SELECT 1") ?? false)
+    say(f, "a select that takes locks is not",
+        not (sqlparse.is_read_only("SELECT 1 FOR UPDATE") ?? true))
+    say(f, "and neither is anything that writes",
+        not (sqlparse.is_read_only("INSERT INTO t VALUES (1)") ?? true) and
+        not (sqlparse.is_read_only("WITH x AS (SELECT 1) DELETE FROM t") ??
+            true))
+    say(f, "a statement beginning with WITH is named by what it does",
+        (sqlparse.verb("WITH x AS (SELECT 1) DELETE FROM t") ?? "") ==
+        "DELETE")
+    check_parse_more(f)
+}
+
+fn check_parse_more(inout f: i64) / {io} {
+    // Normalising, which is what makes a slow-query report readable.
+    let a = sqlparse.normalise(
+        "SELECT * FROM t WHERE id = 42 AND x IN (1, 2, 3)") ?? ""
+    let b = sqlparse.normalise(
+        "select  *  from t where id=43 and x in (7) -- hi") ?? ""
+    say(f, "two runs of the same query normalise to one line", a == b)
+    say(f, "which keeps the keywords and drops the literals",
+        a == "SELECT * FROM t WHERE id = ? AND x IN ( ? )")
+    say(f, "an IN list of any length is one placeholder",
+        not a.contains("?, ?"))
+    say(f, "table names keep their case, because two of them can differ",
+        (sqlparse.normalise("select * from Orders") ?? "") ==
+        "SELECT * FROM Orders")
+    say(f, "comments are removed and the spacing kept",
+        (sqlparse.strip_comments("SELECT 1 -- hi\nFROM t") ?? "") ==
+        "SELECT 1  \nFROM t")
+    say(f, "placeholders are counted, and a repeated $1 counted once",
+        (sqlparse.parameter_count("SELECT ?, ?") ?? 0) == 2 and
+        (sqlparse.parameter_count("SELECT $1, $2, $1") ?? 0) == 2)
+    say(f, "the dialect can be told from the placeholders",
+        dialect_of("SELECT ?") == "sqlite" and
+        dialect_of("SELECT $1") == "postgres" and
+        dialect_of("SELECT 1") == "none")
+    say(f, "a statement lays out one clause a line",
+        (sqlparse.format("select a,b from t where x=1 order by a") ?? "") ==
+        "SELECT a,b\nFROM t\nWHERE x=1\nORDER BY a")
+    // Refusals.
+    say(f, "an unterminated string is refused",
+        tokenise_refuses("SELECT 'unfinished"))
+    say(f, "an unterminated block comment is refused",
+        tokenise_refuses("SELECT 1 /* unfinished"))
+    say(f, "and an unterminated dollar quote is refused",
+        tokenise_refuses("SELECT $tag$ unfinished"))
+    say(f, "an escaped quote inside a string does not end it",
+        (sqlparse.tokenise("'it''s'") ?? []).len() == 1)
+    say(f, "and neither does a backslash-escaped one",
+        (sqlparse.tokenise("'a" + backslash() + "'b'") ?? []).len() == 1)
+}
+
+/// The dialect a statement's placeholders belong to, as a word.
+fn dialect_of(sql: str) -> str {
+    match sqlparse.placeholder_dialect(sql) {
+        Ok(found) -> {
+            match found {
+                Some(d) -> {
+                    match d {
+                        SqlSqlite -> return "sqlite"
+                        SqlPostgres -> return "postgres"
+                        _ -> return "other"
+                    }
+                }
+                None -> return "none"
+            }
+        }
+        Err(_e) -> return "error"
+    }
+}
+
+fn tokenise_refuses(sql: str) -> bool {
+    match sqlparse.tokenise(sql) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+// ----------------------------------------------------------- dbschema
+
+fn users_table() -> DbTable {
+    return dbschema.with_index(
+        dbschema.table("users", [
+            dbschema.primary_key(dbschema.column("id", DbSerial)),
+            dbschema.required(dbschema.column("name", DbVarchar(200))),
+            dbschema.column("score", DbDouble),
+            dbschema.with_default(dbschema.column("active", DbBool), "0"),
+            dbschema.column("created", DbTimestamp)]),
+        "users_name", ["name"], true)
+}
+
+fn orders_table() -> DbTable {
+    return dbschema.with_foreign_key(
+        dbschema.table("orders", [
+            dbschema.primary_key(dbschema.column("id", DbSerial)),
+            dbschema.required(dbschema.column("user_id", DbInt)),
+            dbschema.column("total", DbDecimal(10, 2))]),
+        "orders_user", ["user_id"], "users", ["id"], "CASCADE")
+}
+
+fn changed_schema() -> DbSchema {
+    return dbschema.schema([orders_table(), dbschema.table("users", [
+        dbschema.primary_key(dbschema.column("id", DbSerial)),
+        dbschema.required(dbschema.column("name", DbVarchar(50))),
+        dbschema.required(dbschema.column("email", DbText)),
+        dbschema.column("created", DbTimestamp)])])
+}
+
+fn check_schema(inout f: i64) / {io} {
+    print("-- dbschema: one description, four dialects, and a diff that " +
+        "refuses to guess")
+    let s = dbschema.schema([orders_table(), users_table()])
+    let sqlite = dbschema.create_schema(SqlSqlite, s) ?? []
+    // Every statement below was executed by SQLite and checked with
+    // `PRAGMA table_info`.
+    say(f, "the schema comes out in dependency order, referenced table first",
+        sqlite.len() == 3 and sqlite[0].contains("CREATE TABLE \"users\"") and
+        sqlite[2].contains("CREATE TABLE \"orders\""))
+    say(f, "SQLite gets its rowid alias inline, which only works spelled " +
+        "exactly that way",
+        sqlite[0].contains("\"id\" INTEGER PRIMARY KEY AUTOINCREMENT"))
+    say(f, "and a boolean becomes an integer, because it has no such type",
+        sqlite[0].contains("\"active\" INTEGER"))
+    let pg = dbschema.create_schema(SqlPostgres, s) ?? []
+    say(f, "PostgreSQL gets SERIAL and a table-level primary key",
+        pg[0].contains("\"id\" SERIAL") and
+        pg[0].contains("PRIMARY KEY (\"id\")"))
+    say(f, "a real boolean, a timestamp with a zone, and JSONB",
+        pg[0].contains("\"active\" BOOLEAN") and
+        pg[0].contains("TIMESTAMPTZ") and
+        dbschema.type_sql(SqlPostgres, DbJson) == "JSONB")
+    let my = dbschema.create_schema(SqlMysql, s) ?? []
+    say(f, "MySQL gets AUTO_INCREMENT and a TINYINT for its boolean",
+        my[0].contains("AUTO_INCREMENT") and
+        my[0].contains("`active` TINYINT(1)"))
+    say(f, "the foreign key carries its ON DELETE",
+        sqlite[2].contains("REFERENCES \"users\" (\"id\") ON DELETE CASCADE"))
+    say(f, "and the unique index is its own statement",
+        sqlite[1] == "CREATE UNIQUE INDEX \"users_name\" ON \"users\" " +
+        "(\"name\")")
+    say(f, "a duplicate column is refused",
+        create_refuses(dbschema.table("t", [
+            dbschema.column("a", DbInt), dbschema.column("a", DbText)])))
+    say(f, "an index on a column that is not there is refused",
+        index_refuses(dbschema.with_index(
+            dbschema.table("t", [dbschema.column("a", DbInt)]),
+            "i", ["b"], false)))
+    check_schema_diff(f, s)
+}
+
+fn create_refuses(t: DbTable) -> bool {
+    match dbschema.create_table(SqlSqlite, t) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn index_refuses(t: DbTable) -> bool {
+    match dbschema.create_indexes(SqlSqlite, t) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn find_change(changes: [DbChange], kind: str, detail: str) -> bool {
+    for c in changes {
+        if c.kind == kind and c.detail.starts_with(detail) {
+            return true
+        }
+    }
+    return false
+}
+
+fn change_is_destructive(changes: [DbChange], kind: str) -> bool {
+    for c in changes {
+        if c.kind == kind {
+            return c.destructive
+        }
+    }
+    return false
+}
+
+fn check_schema_diff(inout f: i64, s: DbSchema) / {io} {
+    let changes = dbschema.difference(s, changed_schema())
+    say(f, "a new column is an add", find_change(changes, "add column",
+        "email"))
+    say(f, "a removed one is a drop", find_change(changes, "drop column",
+        "score"))
+    say(f, "a narrowed varchar is a type change",
+        find_change(changes, "change type", "name: varchar(200)"))
+    say(f, "dropping a column is marked destructive",
+        change_is_destructive(changes, "drop column"))
+    say(f, "narrowing a type is too, because it truncates",
+        change_is_destructive(changes, "change type"))
+    say(f, "and so is adding a NOT NULL column with no default, which fails " +
+        "on every existing row",
+        change_is_destructive(changes, "add column"))
+    say(f, "the destructive ones can be listed on their own",
+        dbschema.destructive_changes(s, changed_schema()).len() == 4)
+    let safe = dbschema.migration(SqlPostgres, s, changed_schema(), false) ??
+    []
+    say(f, "a safe migration emits none of them", safe.len() == 0)
+    let all = dbschema.migration(SqlPostgres, s, changed_schema(), true) ?? []
+    say(f, "and an explicit one emits the drop", all.len() > 0 and
+        joined(all).contains("DROP COLUMN \"score\""))
+    say(f, "a rename is never inferred: it is a drop and an add",
+        find_change(changes, "drop column", "score") and
+        find_change(changes, "add column", "email") and
+        not find_change(changes, "rename column", ""))
+    say(f, "the tables a migration touches can be listed back out",
+        (dbschema.tables_touched(all) ?? []).contains("users"))
+}
+
+fn joined(xs: [str]) -> str {
+    return xs.join(" ")
+}
+
+// --------------------------------------------------------- sqlitefile
+
+/// A 4 KB SQLite database written by Python's `sqlite3` with 512-byte pages:
+/// two tables, 43 rows, a value that overflows onto another page, and enough
+/// rows to make the B-tree grow an interior page.
+fn tiny_database() -> str {
+    return "53514c69746520666f726d617420330002000101004020200000000400000008" +
+    "0000000000000000000000030000000400000000000000000000000100000000" +
+    "0000000000000000000000000000000000000000000000000000000000000004" +
+    "002e8df90d000000020151000187015100000000000000000000000000000000" +
+    "0000000000000000000000000000000000000000000000000000000000000000" +
+    "0000000000000000000000000000000000000000000000000000000000000000" +
+    "0000000000000000000000000000000000000000000000000000000000000000" +
+    "0000000000000000000000000000000000000000000000000000000000000000" +
+    "0000000000000000000000000000000000000000000000000000000000000000" +
+    "0000000000000000000000000000000000000000000000000000000000000000" +
+    "000000000000000000000000000000000034020617171701497461626c65656d" +
+    "707479656d70747903435245415445205441424c4520656d7074792028612049" +
+    "4e54454745522977010717171701814d7461626c656e6f7465736e6f74657302" +
+    "435245415445205441424c45206e6f7465732028696420494e54454745522050" +
+    "52494d415259204b45592c206e616d652054455854204e4f54204e554c4c2c20" +
+    "73636f7265205245414c2c2074616720424c4f422c20626f6479205445585429" +
+    "050000000201f6000000000801fb01f600ce00c200ae00a1008d0080006c005f" +
+    "004b003e002a00000000120f0600150700006e30313140160000000000000b0e" +
+    "0600150100006e30313005120d0600150700006e30303940120000000000000b" +
+    "0c0600150100006e30303804120b0600150700006e303037400c000000000000" +
+    "0b0a0600150100006e3030360312090600150700006e30303540040000000000" +
+    "000b080600150100006e3030340212070600150700006e3030333ff800000000" +
+    "00000a060600150900006e30303212050600150700006e3030313fe000000000" +
+    "00000a040600150800006e303030894c0307001d0716926d6f766572666c6f77" +
+    "7e37e43c8800759c010203040578787878787878787878787878787878787878" +
+    "7878787878787878787878787878787878787878787878787878787878787878" +
+    "7878787878787878787878787878787878787878787878787878787878787878" +
+    "7878787878787878787878787878787878787878787878787878787878787878" +
+    "7878787878787878787878787878787878787878787878787878787878787878" +
+    "7878787878787878787878787878787878787878787878787878787878787878" +
+    "7878787878000000041f02060025070c17636166c3a920e4b8ade69687bfd000" +
+    "000000000073686f727414010600130712006164613f000000072a000000060f" +
+    "0d00000000020000000000000000000000000000000000000000000000000000" +
+    "0000000000000000000000000000000000000000000000000000000000000000" +
+    "0000000000000000000000000000000000000000000000000000000000000000" +
+    "0000000000000000000000000000000000000000000000000000000000000000" +
+    "0000000000000000000000000000000000000000000000000000000000000000" +
+    "0000000000000000000000000000000000000000000000000000000000000000" +
+    "0000000000000000000000000000000000000000000000000000000000000000" +
+    "0000000000000000000000000000000000000000000000000000000000000000" +
+    "0000000000000000000000000000000000000000000000000000000000000000" +
+    "0000000000000000000000000000000000000000000000000000000000000000" +
+    "0000000000000000000000000000000000000000000000000000000000000000" +
+    "0000000000000000000000000000000000000000000000000000000000000000" +
+    "0000000000000000000000000000000000000000000000000000000000000000" +
+    "0000000000000000000000000000000000000000000000000000000000000000" +
+    "0000000000000000000000000000000000000000000000000000000000000000" +
+    "0000000000000000000000000000000000000000000000000000000000000000" +
+    "0000000578787878787878787878787878787878787878787878787878787878" +
+    "7878787878787878787878787878787878787878787878787878787878787878" +
+    "7878787878787878787878787878787878787878787878787878787878787878" +
+    "7878787878787878787878787878787878787878787878787878787878787878" +
+    "7878787878787878787878787878787878787878787878787878787878787878" +
+    "7878787878787878787878787878787878787878787878787878787878787878" +
+    "7878787878787878787878787878787878787878787878787878787878787878" +
+    "7878787878787878787878787878787878787878787878787878787878787878" +
+    "7878787878787878787878787878787878787878787878787878787878787878" +
+    "7878787878787878787878787878787878787878787878787878787878787878" +
+    "7878787878787878787878787878787878787878787878787878787878787878" +
+    "7878787878787878787878787878787878787878787878787878787878787878" +
+    "7878787878787878787878787878787878787878787878787878787878787878" +
+    "7878787878787878787878787878787878787878787878787878787878787878" +
+    "7878787878787878787878787878787878787878787878787878787878787878" +
+    "7878787878787878787878787878787878787878787878787878787878787878" +
+    "0000000078787878787878787878787878787878787878787878787878787878" +
+    "7878787878787878787878787878787878787878787878787878787878787878" +
+    "7878787878787878787878787878787878787878787878787878787878787878" +
+    "7878787878787878787878787878787878787878787878787878787878787878" +
+    "7878787878787878787878787878787878787878787878787878787878787878" +
+    "7878787878787878787878787878787878787878787878787878787878787878" +
+    "7878787878787878787878787878787878787878787878787878787878787878" +
+    "7878787878787878787878787878787878787878787878787878787878787878" +
+    "7878787878787878787878787878787878787878787878787878787878787878" +
+    "7878787878787878787878787878787878787878787878787878787878787878" +
+    "7878787878787878787878787878787878787878787878787878787878787878" +
+    "7878787878787878787878787878787878787878787878787878787878787878" +
+    "7878787878787878787878787878787878787878787878787878787878787878" +
+    "7878787878787878787878787878787878787878787878787878787878787878" +
+    "7878787878787878787878787878787878787878787878787878787878787878" +
+    "7878787878787878787878787878787878787878787878787878787878787878" +
+    "0d0000000f002a0001ea01c900ee00e200ce00c200ae00a1008d0080006c005f" +
+    "004b003e002a00000000120f0600150700006e30313140160000000000000b0e" +
+    "0600150100006e30313005120d0600150700006e30303940120000000000000b" +
+    "0c0600150100006e30303804120b0600150700006e303037400c000000000000" +
+    "0b0a0600150100006e3030360312090600150700006e30303540040000000000" +
+    "000b080600150100006e3030340212070600150700006e3030333ff800000000" +
+    "00000a060600150900006e30303212050600150700006e3030313fe000000000" +
+    "00000a040600150800006e303030894c0307001d0716926d6f766572666c6f77" +
+    "7e37e43c8800759c010203040578787878787878787878787878787878787878" +
+    "7878787878787878787878787878787878787878787878787878787878787878" +
+    "7878787878787878787878787878787878787878787878787878787878787878" +
+    "7878787878787878787878787878787878787878787878787878787878787878" +
+    "7878787878787878787878787878787878787878787878787878787878787878" +
+    "7878787878787878787878787878787878787878787878787878787878787878" +
+    "7878787878000000041f02060025070c17636166c3a920e4b8ade69687bfd000" +
+    "000000000073686f727414010600130712006164613ff80000000000000102ff" +
+    "0d0000001b00460001f301df01d201be01b1019d0190017c016f015b014e013a" +
+    "012d0119010c00f800eb00d700ca00b600a90095008800740067005300460000" +
+    "0000000000000b2a0600150100006e3033381312290600150700006e30333740" +
+    "328000000000000b280600150100006e3033361212270600150700006e303335" +
+    "40318000000000000b260600150100006e3033341112250600150700006e3033" +
+    "3340308000000000000b240600150100006e3033321012230600150700006e30" +
+    "3331402f0000000000000b220600150100006e3033300f12210600150700006e" +
+    "303239402d0000000000000b200600150100006e3032380e121f060015070000" +
+    "6e303237402b0000000000000b1e0600150100006e3032360d121d0600150700" +
+    "006e30323540290000000000000b1c0600150100006e3032340c121b06001507" +
+    "00006e30323340270000000000000b1a0600150100006e3032320b1219060015" +
+    "0700006e30323140250000000000000b180600150100006e3032300a12170600" +
+    "150700006e30313940230000000000000b160600150100006e30313809121506" +
+    "00150700006e30313740210000000000000b140600150100006e303136081213" +
+    "0600150700006e303135401e0000000000000b120600150100006e3031340712" +
+    "110600150700006e303133401a0000000000000b100600150100006e30313206" +
+    "0d0000000101ec0001ec00000000000000000000000000000000000000000000" +
+    "0000000000000000000000000000000000000000000000000000000000000000" +
+    "0000000000000000000000000000000000000000000000000000000000000000" +
+    "0000000000000000000000000000000000000000000000000000000000000000" +
+    "0000000000000000000000000000000000000000000000000000000000000000" +
+    "0000000000000000000000000000000000000000000000000000000000000000" +
+    "0000000000000000000000000000000000000000000000000000000000000000" +
+    "0000000000000000000000000000000000000000000000000000000000000000" +
+    "0000000000000000000000000000000000000000000000000000000000000000" +
+    "0000000000000000000000000000000000000000000000000000000000000000" +
+    "0000000000000000000000000000000000000000000000000000000000000000" +
+    "0000000000000000000000000000000000000000000000000000000000000000" +
+    "0000000000000000000000000000000000000000000000000000000000000000" +
+    "0000000000000000000000000000000000000000000000000000000000000000" +
+    "0000000000000000000000000000000000000000000000000000000000000000" +
+    "000000000000000000000000122b0600150700006e3033394033800000000000"
+}
+
+fn header_refuses(data: bytes) -> bool {
+    match sqlitefile.header(data) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn check_sqlite(inout f: i64) / {io} {
+    print("-- sqlitefile: pages, B-trees and serial types, without SQLite")
+    let file = from_hex(tiny_database())
+    let h = sqlitefile.header(file) ??
+    SqlHeader{ page_size: 0, write_version: 0, read_version: 0,
+        reserved: 0, page_count: 0, text_encoding: 0, schema_cookie: 0 }
+    say(f, "the header gives the page size and the page count",
+        h.page_size == 512 and h.page_count == 8)
+    say(f, "and the text encoding, which has to be UTF-8 here",
+        h.text_encoding == 1)
+    say(f, "something that is not a database is refused",
+        header_refuses("not a database at all, not even close!".to_bytes()))
+    let objects = sqlitefile.objects(file) ?? []
+    say(f, "sqlite_master lists both tables",
+        objects.len() >= 2)
+    say(f, "and the user tables can be named",
+        (sqlitefile.table_names(file) ?? []) == ["notes", "empty"])
+    say(f, "columns come from the CREATE TABLE text, as PRAGMA does",
+        (sqlitefile.column_names(file, "notes") ?? []) ==
+        ["id", "name", "score", "tag", "body"])
+    let rows = sqlitefile.table_rows(file, "notes") ?? []
+    say(f, "every row is read, across an interior page", rows.len() == 43)
+    say(f, "an empty table has no rows",
+        (sqlitefile.table_rows(file, "empty") ?? []).len() == 0)
+    check_sqlite_values(f, file, rows)
+}
+
+fn check_sqlite_values(inout f: i64, file: bytes, rows: [SqlRow]) / {io} {
+    say(f, "the serial types come back as themselves",
+        sqlitefile.value_kind(rows[0].value[1]) == "text" and
+        sqlitefile.value_kind(rows[0].value[2]) == "real" and
+        sqlitefile.value_kind(rows[0].value[3]) == "blob" and
+        sqlitefile.value_kind(rows[0].value[4]) == "null")
+    say(f, "text is UTF-8, whatever is in it",
+        sqlitefile.text_of(rows[1].value[1]) == "caf\u{e9} \u{4e2d}\u{6587}")
+    say(f, "a float is a float", sqlitefile.float_of(rows[0].value[2]) == 1.5)
+    say(f, "and a negative one keeps its sign",
+        sqlitefile.float_of(rows[1].value[2]) == 0.0 - 0.25)
+    say(f, "a blob keeps its bytes",
+        sqlitefile.blob_of(rows[0].value[3]).to_list() == [1, 2, 255])
+    say(f, "an empty blob is empty, not null",
+        sqlitefile.blob_of(rows[1].value[3]).len() == 0 and
+        not sqlitefile.is_null(rows[1].value[3]))
+    // The overflow path.
+    say(f, "a value too large for its page is reassembled from the overflow " +
+        "chain",
+        sqlitefile.text_of(rows[2].value[4]).len() == 1200)
+    say(f, "and every byte of it is right",
+        sqlitefile.text_of(rows[2].value[4]) == "x".repeat(1200))
+    // The rowid trick.
+    say(f, "an INTEGER PRIMARY KEY is stored as null in the record",
+        sqlitefile.is_null(rows[0].value[0]))
+    say(f, "because the rowid already holds it", rows[0].rowid == 1)
+    say(f, "and reading it by name gives the rowid back",
+        sqlitefile.int_of(sqlitefile.field(file, "notes", rows[2], "id") ??
+            SqlNull) == 3)
+    say(f, "the rows come out in rowid order",
+        rows[0].rowid == 1 and rows[rows.len() - 1].rowid == 43)
+    say(f, "and the last one is the last row inserted",
+        sqlitefile.text_of(rows[rows.len() - 1].value[1]) == "n039")
+    // The serial-type table.
+    say(f, "the serial type widths are the format's",
+        sqlitefile.serial_width(0) == 0 and sqlitefile.serial_width(5) == 6 and
+        sqlitefile.serial_width(7) == 8 and sqlitefile.serial_width(14) == 1 and
+        sqlitefile.serial_width(15) == 1)
+    say(f, "a missing table is refused",
+        rows_refuse(file, "nosuchtable"))
+}
+
+fn rows_refuse(file: bytes, name: str) -> bool {
+    match sqlitefile.table_rows(file, name) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn main() / {io} {
+    var f = 0
+
+    check_escape(f)
+    check_build(f)
+    check_parse(f)
+    check_schema(f)
+    check_sqlite(f)
+
+    if f == 0 {
+        print("sql: every claim held")
+    } else {
+        print("sql: {f} failed")
+    }
+}

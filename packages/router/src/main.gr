@@ -1,0 +1,397 @@
+// Matching a request to a route, and the three answers that are not 404.
+//
+// A router that returns "matched" or "not found" is missing most of the
+// problem. Four things it has to get right:
+//
+// **405, not 404.** If `/users/7` exists for `GET` and the request is a
+// `DELETE`, the answer is `405 Method Not Allowed` with an `Allow` header
+// listing what is permitted — not `404`. Returning 404 tells a client the
+// resource does not exist, which is false, and hides the bug where the wrong
+// verb was used.
+//
+// **Specificity, not declaration order.** `/users/new` and `/users/:id` both
+// match `/users/new`, and the literal one has to win however they were
+// declared. A router that takes the first declared match makes route order a
+// hidden dependency — add a route at the top of the file and a page three
+// hundred lines down stops working.
+//
+// **Reverse routing.** `url_for("user", ["7"])` gives `/users/7`. Building
+// that string by hand at every call site is how a URL change becomes a
+// twenty-file change, and how one of them gets missed.
+//
+// **Conflicts, reported.** Two routes that can never both be reached is a
+// mistake, and this finds them at start-up rather than in production.
+//
+// The pattern language is three things: a literal segment; `:name`, which
+// matches one segment and captures it; and `*name`, which matches the rest of
+// the path and captures it. A trailing `*` is only legal at the end, because
+// anywhere else it cannot be matched without backtracking — and a router that
+// backtracks is a router with a worst case.
+
+/// A captured segment.
+type RouteParam = {
+    name: str,
+    value: str,
+}
+
+type Route = {
+    method: str,
+    pattern: str,
+    name: str,
+}
+
+type Router = {
+    route: [Route],
+    /// Whether `/users` and `/users/` are different paths.
+    strict_slash: bool,
+    /// Patterns that could not be accepted, kept for `validate`.
+    problem: [str],
+}
+
+/// What a lookup produced.
+///
+/// `status` is the HTTP status the router would return: 200 when a route
+/// matched, 405 when the path matched but the method did not, 404 when
+/// nothing matched, and 308 when only a redirect to the other trailing-slash
+/// form would match.
+type RouteMatch = {
+    status: i64,
+    index: i64,
+    name: str,
+    params: [RouteParam],
+    allowed: [str],
+    location: str,
+}
+
+type RouteError =
+    | RouteNoSuchName(name: str)
+    | RouteWrongParamCount(name: str, wanted: i64, given: i64)
+
+pub fn new_router() -> Router {
+    return Router{ route: [], strict_slash: false, problem: [] }
+}
+
+/// Treat `/users` and `/users/` as different paths.
+///
+/// Off by default, which means a request for `/users/` is answered with a 308
+/// to `/users`. That is what a browser and every search engine expect; the
+/// strict form is here for an API where the two really are different.
+pub fn strict_slash(inout r: Router, strict: bool) {
+    r.strict_slash = strict
+}
+
+/// Record a route.
+///
+/// It cannot fail, so a route table is a run of plain calls rather than a run
+/// of `try`s. A pattern that is not usable is remembered instead, and
+/// `validate` reports every such problem at once — which is the right time to
+/// find out, because a route table is built at start-up and a caller that had
+/// to handle each `add` separately would handle none of them.
+pub fn add(inout r: Router, method: str, pattern: str, name: str) {
+    if pattern == "" {
+        r.problem.push("a route may not have an empty pattern")
+        return
+    }
+    let parts = pattern.split("/")
+    for i in 0..parts.len() {
+        if parts[i].starts_with("*") and i != parts.len() - 1 {
+            r.problem.push(pattern +
+                ": a wildcard may only be the last segment")
+            return
+        }
+    }
+    r.route.push(Route{ method: method.to_upper(), pattern: pattern,
+        name: name })
+}
+
+pub fn get(inout r: Router, pattern: str, name: str) {
+    add(r, "GET", pattern, name)
+}
+
+pub fn post(inout r: Router, pattern: str, name: str) {
+    add(r, "POST", pattern, name)
+}
+
+/// Everything wrong with a route table: bad patterns and shadowed routes.
+///
+/// Call it once at start-up. An empty list is a table that will behave the
+/// way it reads.
+pub fn validate(r: Router) -> [str] {
+    var out: [str] = []
+    for p in r.problem {
+        out.push(p)
+    }
+    for c in conflicts(r) {
+        out.push(c)
+    }
+    return out
+}
+
+/// How specific a pattern is: higher wins.
+///
+/// A literal segment is worth more than a capture, and a capture more than a
+/// wildcard. Summed over the path, so `/a/b` beats `/a/:x` beats `/:x/:y`
+/// beats `/*rest` — which is the order a reader expects and the order
+/// declaration order does not guarantee.
+pub fn specificity(pattern: str) -> i64 {
+    var score = 0
+    for part in pattern.split("/") {
+        if part.starts_with("*") {
+            score = score + 1
+        } else {
+            if part.starts_with(":") {
+                score = score + 10
+            } else {
+                score = score + 100
+            }
+        }
+    }
+    return score
+}
+
+/// Whether a pattern matches a path, and what it captured.
+pub fn match_pattern(pattern: str, path: str) -> Option[[RouteParam]] {
+    let ps = pattern.split("/")
+    let qs = path.split("/")
+    var out: [RouteParam] = []
+    var i = 0
+    while i < ps.len() {
+        if ps[i].starts_with("*") {
+            // The rest of the path, joined back together — including the
+            // separators, which is what a caller wants for a file path.
+            var rest: [str] = []
+            for j in i..qs.len() {
+                rest.push(qs[j])
+            }
+            out.push(RouteParam{ name: ps[i].substr(1, ps[i].len() - 1),
+                value: rest.join("/") })
+            return Some(out)
+        }
+        if i >= qs.len() {
+            return None
+        }
+        if ps[i].starts_with(":") {
+            if qs[i] == "" {
+                // An empty segment is not a value: `/users//edit` should not
+                // match `/users/:id/edit` with an empty id.
+                return None
+            }
+            out.push(RouteParam{ name: ps[i].substr(1, ps[i].len() - 1),
+                value: qs[i] })
+        } else {
+            if ps[i] != qs[i] {
+                return None
+            }
+        }
+        i = i + 1
+    }
+    if ps.len() != qs.len() {
+        return None
+    }
+    return Some(out)
+}
+
+/// The best route for a method and a path.
+pub fn resolve(r: Router, method: str, path: str) -> RouteMatch {
+    let wanted = method.to_upper()
+    var best = 0 - 1
+    var best_score = 0 - 1
+    var best_params: [RouteParam] = []
+    var allowed: [str] = []
+    for i in 0..r.route.len() {
+        match match_pattern(r.route[i].pattern, path) {
+            Some(params) -> {
+                push_unique(allowed, r.route[i].method)
+                // A HEAD is served by the GET handler, which is what the
+                // specification requires and what a router that only knows
+                // GET would answer 405 to.
+                let usable = r.route[i].method == wanted or
+                (wanted == "HEAD" and r.route[i].method == "GET")
+                if usable {
+                    let score = specificity(r.route[i].pattern)
+                    if score > best_score {
+                        best_score = score
+                        best = i
+                        best_params = params
+                    }
+                }
+            }
+            None -> {}
+        }
+    }
+    if best >= 0 {
+        return RouteMatch{ status: 200, index: best, name: r.route[best].name,
+            params: best_params, allowed: allowed, location: "" }
+    }
+    if allowed.len() > 0 {
+        // The path exists; the verb does not. `Allow` is a required header on
+        // a 405, and it is the part that tells a client what to do instead.
+        if allowed.contains("GET") {
+            push_unique(allowed, "HEAD")
+        }
+        push_unique(allowed, "OPTIONS")
+        return RouteMatch{ status: 405, index: 0 - 1, name: "", params: [],
+            allowed: allowed, location: "" }
+    }
+    if not r.strict_slash {
+        let other = toggled_slash(path)
+        if other != path and any_match(r, other) {
+            return RouteMatch{ status: 308, index: 0 - 1, name: "",
+                params: [], allowed: [], location: other }
+        }
+    }
+    return RouteMatch{ status: 404, index: 0 - 1, name: "", params: [],
+        allowed: [], location: "" }
+}
+
+fn any_match(r: Router, path: str) -> bool {
+    for route in r.route {
+        if match_pattern(route.pattern, path) != None {
+            return true
+        }
+    }
+    return false
+}
+
+fn toggled_slash(path: str) -> str {
+    if path == "/" {
+        return path
+    }
+    if path.ends_with("/") {
+        return path.substr(0, path.len() - 1)
+    }
+    return path + "/"
+}
+
+fn push_unique(inout out: [str], value: str) {
+    for v in out {
+        if v == value {
+            return
+        }
+    }
+    out.push(value)
+}
+
+/// The value a named parameter captured.
+pub fn param(m: RouteMatch, name: str) -> Option[str] {
+    for p in m.params {
+        if p.name == name {
+            return Some(p.value)
+        }
+    }
+    return None
+}
+
+/// The `Allow` header for a 405, in a stable order.
+pub fn allow_header(m: RouteMatch) -> str {
+    var sorted = m.allowed
+    sorted.sort()
+    return sorted.join(", ")
+}
+
+// ------------------------------------------------------- reverse routing
+
+/// The parameter names a pattern takes, in order.
+pub fn parameters_of(pattern: str) -> [str] {
+    var out: [str] = []
+    for part in pattern.split("/") {
+        if part.starts_with(":") or part.starts_with("*") {
+            out.push(part.substr(1, part.len() - 1))
+        }
+    }
+    return out
+}
+
+/// Build the path for a named route.
+///
+/// The reason to have this at all: a URL written as a literal at forty call
+/// sites is a URL that cannot be changed. With reverse routing the pattern
+/// lives in one place, and a wrong number of arguments is a compile-time-ish
+/// failure here rather than a 404 in production.
+pub fn url_for(r: Router, name: str, values: [str]) -> str ! RouteError {
+    for route in r.route {
+        if route.name == name {
+            let wanted = parameters_of(route.pattern)
+            if wanted.len() != values.len() {
+                fail(RouteWrongParamCount(name, wanted.len(), values.len()))
+            }
+            var parts: [str] = []
+            var at = 0
+            for part in route.pattern.split("/") {
+                if part.starts_with(":") or part.starts_with("*") {
+                    parts.push(values[at])
+                    at = at + 1
+                } else {
+                    parts.push(part)
+                }
+            }
+            return parts.join("/")
+        }
+    }
+    fail(RouteNoSuchName(name))
+}
+
+/// The named route's pattern.
+pub fn pattern_of(r: Router, name: str) -> Option[str] {
+    for route in r.route {
+        if route.name == name {
+            return Some(route.pattern)
+        }
+    }
+    return None
+}
+
+// ---------------------------------------------------------- conflicts
+
+/// Pairs of routes where one can never be reached.
+///
+/// Two routes conflict when they take the same method and every path matching
+/// the second also matches the first at a higher specificity. `/users/:id`
+/// and `/users/:name` are the same route written twice; `/*rest` after
+/// anything shadows nothing, because it is less specific.
+pub fn conflicts(r: Router) -> [str] {
+    var out: [str] = []
+    for i in 0..r.route.len() {
+        for j in (i + 1)..r.route.len() {
+            if r.route[i].method == r.route[j].method and
+            same_shape(r.route[i].pattern, r.route[j].pattern) {
+                out.push(r.route[i].pattern + " and " + r.route[j].pattern +
+                    " match the same paths")
+            }
+        }
+    }
+    return out
+}
+
+/// Whether two patterns match exactly the same set of paths.
+fn same_shape(a: str, b: str) -> bool {
+    let x = a.split("/")
+    let y = b.split("/")
+    if x.len() != y.len() {
+        return false
+    }
+    for i in 0..x.len() {
+        let capture_x = x[i].starts_with(":")
+        let capture_y = y[i].starts_with(":")
+        if capture_x != capture_y {
+            return false
+        }
+        if not capture_x and x[i] != y[i] {
+            return false
+        }
+    }
+    return true
+}
+
+/// Every route, as `METHOD pattern name`, for a start-up log.
+pub fn describe(r: Router) -> [str] {
+    var out: [str] = []
+    for route in r.route {
+        out.push(route.method + " " + route.pattern + " -> " + route.name)
+    }
+    return out
+}
+
+pub fn count(r: Router) -> i64 {
+    return r.route.len()
+}

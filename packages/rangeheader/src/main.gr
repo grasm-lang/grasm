@@ -1,0 +1,314 @@
+// `Range` and `Content-Range`: partial responses, and the ways they go wrong.
+//
+// A range request is how a video seeks, how a download resumes, and how a
+// client fetches the last few bytes of a zip to read its directory. The header
+// is small and the rules around it are not:
+//
+// **A suffix range counts from the end.** `bytes=-500` is the *last* 500
+// bytes, not "from 0 to 500". Reading it as a start is the difference between
+// resuming a download and starting it again.
+//
+// **An open-ended range has no end.** `bytes=500-` is byte 500 to the end,
+// and the end is not known to the client — which is why the server has to
+// clamp it and say what it actually sent.
+//
+// **The last byte is included.** `bytes=0-499` is 500 bytes. Half-open ranges
+// are what every programming language uses and what HTTP does not, and an
+// off-by-one here truncates every response by a byte.
+//
+// **An unsatisfiable range is 416, not 400 and not 200.** A range starting
+// past the end of the resource gets `416 Range Not Satisfiable` with a
+// `Content-Range: bytes */length` saying how long the resource really is —
+// which is how a client that guessed wrong learns the right length.
+//
+// **A range must be ignored unless the representation is unchanged.** That is
+// what `If-Range` is for: a client resuming a download sends the tag it had,
+// and if the file changed the server sends the whole thing rather than
+// splicing two different files together. Ignoring `If-Range` produces a
+// corrupt download that no status code reports.
+//
+// Multiple ranges in one request are parsed here and deliberately not served:
+// the response is a `multipart/byteranges` body, and a server is entitled to
+// answer with a single range covering them all or with the whole
+// representation. `coalesce` does the first, which is what most servers do and
+// what avoids a small-range denial of service.
+
+/// One resolved range, inclusive at both ends.
+type ByteRange = {
+    first: i64,
+    last: i64,
+}
+
+/// What to answer a range request with.
+type RangeAnswer = {
+    /// 200, 206 or 416.
+    status: i64,
+    ranges: [ByteRange],
+    content_range: str,
+    reason: str,
+}
+
+type RangeError =
+    | RangeNotBytes(unit: str)
+    | RangeMalformed(text: str)
+    | RangeEmpty
+    | RangeTooMany(given: i64, limit: i64)
+
+    /// The most ranges a single request may ask for.
+    ///
+    /// A request with ten thousand one-byte ranges makes a server assemble a
+    /// multipart body far larger than the resource. Every real server caps this;
+    /// the cap is the defence.
+pub fn range_limit() -> i64 {
+    return 100
+}
+
+/// Parse a `Range` header against a known length.
+///
+/// The length is needed to parse at all: a suffix range cannot be resolved
+/// without it, and neither can an open-ended one.
+pub fn parse(header: str, length: i64) -> [ByteRange] ! RangeError {
+    let trimmed = header.trim()
+    if trimmed == "" {
+        fail(RangeEmpty)
+    }
+    let equals = trimmed.index_of("=") ?? (0 - 1)
+    if equals < 0 {
+        fail(RangeMalformed(header))
+    }
+    let unit = trimmed.substr(0, equals).trim().to_lower()
+    if unit != "bytes" {
+        // The only unit anyone implements. A server must ignore a range in a
+        // unit it does not know and send the whole thing.
+        fail(RangeNotBytes(unit))
+    }
+    let body = trimmed.substr(equals + 1, trimmed.len() - equals - 1)
+    var out: [ByteRange] = []
+    for piece in body.split(",") {
+        let spec = piece.trim()
+        if spec == "" {
+            fail(RangeMalformed(header))
+        }
+        match try one_range(spec, length) {
+            Some(r) -> out.push(r)
+            None -> {}
+        }
+        if out.len() > range_limit() {
+            fail(RangeTooMany(out.len(), range_limit()))
+        }
+    }
+    return out
+}
+
+/// One `first-last`, `first-` or `-suffix`, resolved and clamped.
+///
+/// `None` means the range is syntactically fine and unsatisfiable — a start
+/// past the end. That is not a parse error: a request with one satisfiable
+/// range and one that is not is answered with the satisfiable one.
+fn one_range(spec: str, length: i64) -> Option[ByteRange] ! RangeError {
+    let dash = spec.index_of("-") ?? (0 - 1)
+    if dash < 0 {
+        fail(RangeMalformed(spec))
+    }
+    let head = spec.substr(0, dash).trim()
+    let tail = spec.substr(dash + 1, spec.len() - dash - 1).trim()
+    if head == "" {
+        // A suffix range: the last `tail` bytes.
+        if tail == "" {
+            fail(RangeMalformed(spec))
+        }
+        let want = try number(tail)
+        if want == 0 {
+            // `bytes=-0` asks for nothing, which is unsatisfiable.
+            return None
+        }
+        if want >= length {
+            return Some(ByteRange{ first: 0, last: length - 1 })
+        }
+        return Some(ByteRange{ first: length - want, last: length - 1 })
+    }
+    let first = try number(head)
+    if first >= length {
+        return None
+    }
+    if tail == "" {
+        return Some(ByteRange{ first: first, last: length - 1 })
+    }
+    var last = try number(tail)
+    if last < first {
+        fail(RangeMalformed(spec))
+    }
+    // Clamped, not refused: a client that asks for more than there is gets
+    // what there is, and the `Content-Range` tells it the real length.
+    if last >= length {
+        last = length - 1
+    }
+    return Some(ByteRange{ first: first, last: last })
+}
+
+fn number(text: str) -> i64 ! RangeError {
+    if text == "" {
+        fail(RangeMalformed(text))
+    }
+    for c in text.chars() {
+        if c < "0" or c > "9" {
+            fail(RangeMalformed(text))
+        }
+    }
+    match text.parse_int() {
+        Some(n) -> return n
+        None -> fail(RangeMalformed(text))
+    }
+}
+
+/// How many bytes a range covers. Inclusive, so `0-499` is 500.
+pub fn size_of(r: ByteRange) -> i64 {
+    return r.last - r.first + 1
+}
+
+/// The `Content-Range` header for a range of a known length.
+pub fn content_range(r: ByteRange, length: i64) -> str {
+    return "bytes {r.first}-{r.last}/{length}"
+}
+
+/// The `Content-Range` for a 416, which names the length and no range.
+///
+/// The `*` is the point: the client asked for something outside the
+/// representation, and this is how it is told how long the representation is
+/// so its next request can be right.
+pub fn unsatisfiable_range(length: i64) -> str {
+    return "bytes */{length}"
+}
+
+/// Merge overlapping and adjacent ranges, in order.
+///
+/// Adjacent as well as overlapping: `0-99` and `100-199` become `0-199`,
+/// because sending them separately costs two multipart parts for one
+/// contiguous run. Merging is also the defence against a request built from a
+/// thousand one-byte ranges.
+pub fn coalesce(ranges: [ByteRange]) -> [ByteRange] {
+    if ranges.len() == 0 {
+        return []
+    }
+    var sorted = ranges
+    for i in 0..sorted.len() {
+        var best = i
+        for j in (i + 1)..sorted.len() {
+            if sorted[j].first < sorted[best].first {
+                best = j
+            }
+        }
+        let t = sorted[i]
+        sorted[i] = sorted[best]
+        sorted[best] = t
+    }
+    var out: [ByteRange] = [sorted[0]]
+    for i in 1..sorted.len() {
+        let last = out[out.len() - 1]
+        if sorted[i].first <= last.last + 1 {
+            if sorted[i].last > last.last {
+                out[out.len() - 1] = ByteRange{ first: last.first,
+                    last: sorted[i].last }
+            }
+        } else {
+            out.push(sorted[i])
+        }
+    }
+    return out
+}
+
+/// The single range that covers every range asked for.
+pub fn spanning(ranges: [ByteRange]) -> Option[ByteRange] {
+    if ranges.len() == 0 {
+        return None
+    }
+    var first = ranges[0].first
+    var last = ranges[0].last
+    for r in ranges {
+        if r.first < first {
+            first = r.first
+        }
+        if r.last > last {
+            last = r.last
+        }
+    }
+    return Some(ByteRange{ first: first, last: last })
+}
+
+/// Whether `If-Range` allows the range to be served.
+///
+/// `If-Range` holds either an entity tag or a date. A tag must match
+/// **strongly** — a weak tag means "equivalent", and two equivalent
+/// representations can still differ byte for byte, which is exactly what a
+/// byte range cannot tolerate. A date matches when the resource has not been
+/// modified since.
+///
+/// When it does not match, the answer is the whole representation with 200 —
+/// not a 412 and not an error. The client asked for a piece of something it
+/// no longer has, and the right answer is the whole of what there is now.
+pub fn if_range_allows(if_range: str, current_tag: str,
+    modified_at: i64) -> bool {
+    let given = if_range.trim()
+    if given == "" {
+        return true
+    }
+    if given.starts_with("\"") {
+        return given == current_tag and not current_tag.starts_with("W/")
+    }
+    if given.starts_with("W/") {
+        // A weak tag never satisfies `If-Range`.
+        return false
+    }
+    match given.parse_int() {
+        Some(date) -> return modified_at >= 0 and modified_at <= date
+        None -> return false
+    }
+}
+
+/// The whole decision for a request.
+///
+/// `if_range` may be empty. A request with no `Range` is a 200; one with a
+/// range that cannot be satisfied is a 416; anything else is a 206 with the
+/// coalesced ranges and the `Content-Range` for the span.
+pub fn answer(range_header: str, if_range: str, current_tag: str,
+    modified_at: i64, length: i64) -> RangeAnswer {
+    if range_header.trim() == "" {
+        return RangeAnswer{ status: 200, ranges: [], content_range: "",
+            reason: "no range asked for" }
+    }
+    if not if_range_allows(if_range, current_tag, modified_at) {
+        return RangeAnswer{ status: 200, ranges: [], content_range: "",
+            reason: "the representation changed, so the whole of it is sent" }
+    }
+    match parse(range_header, length) {
+        Err(_e) -> return RangeAnswer{ status: 200, ranges: [],
+            content_range: "",
+            reason: "the range header was not usable, so it was ignored" }
+        Ok(ranges) -> {
+            if ranges.len() == 0 {
+                return RangeAnswer{ status: 416, ranges: [],
+                    content_range: unsatisfiable_range(length),
+                    reason: "no range asked for is inside the resource" }
+            }
+            let merged = coalesce(ranges)
+            let single = spanning(merged) ?? merged[0]
+            return RangeAnswer{ status: 206, ranges: merged,
+                content_range: content_range(single, length),
+                reason: "" }
+        }
+    }
+}
+
+/// The `Accept-Ranges` header a server that supports this should send.
+///
+/// Worth sending even before any client asks: it is how a download manager
+/// decides whether it can resume, and without it a client that loses its
+/// connection starts again from zero.
+pub fn accept_ranges() -> str {
+    return "bytes"
+}
+
+/// The header a server that does not support ranges should send.
+pub fn no_ranges() -> str {
+    return "none"
+}

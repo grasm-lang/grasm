@@ -1,0 +1,263 @@
+// Serving files from a directory, and the one bug that matters.
+//
+// **Path traversal.** A request for `/../../etc/passwd` must not read
+// `/etc/passwd`, and the ways to get that wrong are numerous enough that this
+// package exists to hold the one correct answer:
+//
+// - `..` may arrive percent-encoded as `%2e%2e`, or doubly encoded as
+//   `%252e%252e`, so decoding has to happen before the check and only once.
+// - Removing the string `../` is not enough: `....//` becomes `../` after one
+//   removal, which is why the check is on the *resolved* segments and not on
+//   the text.
+// - A backslash is a separator on some systems, so it is treated as one here
+//   whatever the host.
+// - A NUL byte truncates a path in a C API, so `a.txt%00.png` can pass an
+//   extension check and open a different file. It is refused.
+// - A symlink out of the root cannot be seen from the path at all. This says
+//   so rather than pretending; the caller has to refuse to follow links, and
+//   `resolve` returns the relative path precisely so the caller can join it
+//   safely and check.
+//
+// The resolution is textual and complete: every segment is examined, `.` is
+// dropped, `..` pops, and a `..` that would pop past the root is a refusal
+// rather than a clamp. Clamping — treating `/../a` as `/a` — is what lets a
+// crafted path reach a sibling directory when the root itself is a symlink.
+//
+// Everything else here is the small print of serving a file: index files,
+// content types, whether a type may be sniffed, and the headers that a
+// fingerprinted asset should carry.
+
+import mimetype
+
+/// What a request resolves to.
+type StaticFile = {
+    /// The path relative to the root, with no leading slash.
+    relative: str,
+    content_type: str,
+    /// Whether this is the directory's index rather than a named file.
+    is_index: bool,
+}
+
+type StaticError =
+    | StaticTraversal(path: str)
+    | StaticNulByte(path: str)
+    | StaticAbsolute(path: str)
+    | StaticEmpty
+    | StaticHidden(name: str)
+
+    /// Undo one layer of percent-encoding.
+    ///
+    /// One layer, deliberately. Decoding until nothing changes is what turns
+    /// `%252e` into `.` and lets a doubly-encoded traversal through — the client
+    /// encoded it once, so the server decodes it once, and a `%25` that survives
+    /// is a literal percent sign.
+pub fn percent_decode(s: str) -> str ! StaticError {
+    var out = ""
+    var i = 0
+    while i < s.len() {
+        let c = s.substr(i, 1)
+        if c == "%" and i + 2 < s.len() {
+            let hex = s.substr(i + 1, 2)
+            match hex.parse_int_base(16) {
+                Some(code) -> {
+                    if code == 0 {
+                        fail(StaticNulByte(s))
+                    }
+                    out = out + code.to_char()
+                    i = i + 3
+                    continue
+                }
+                None -> {}
+            }
+        }
+        if c == (0).to_char() {
+            fail(StaticNulByte(s))
+        }
+        out = out + c
+        i = i + 1
+    }
+    return out
+}
+
+/// The segments of a path, resolved.
+///
+/// `.` disappears, `..` pops, an empty segment disappears, and a `..` with
+/// nothing to pop is a refusal. A backslash separates as well as a slash,
+/// because on a host where it does, a path that passed a slash-only check
+/// still escapes.
+pub fn resolve_segments(path: str) -> [str] ! StaticError {
+    var out: [str] = []
+    for part in path.replace("\\", "/").split("/") {
+        if part == "" or part == "." {
+            continue
+        }
+        if part == ".." {
+            if out.len() == 0 {
+                fail(StaticTraversal(path))
+            }
+            out.pop()
+            continue
+        }
+        out.push(part)
+    }
+    return out
+}
+
+/// Resolve a request path to a file under the root.
+///
+/// `index` is the name to serve for a directory — usually `index.html`; pass
+/// `""` to refuse directory requests. `allow_hidden` decides whether a segment
+/// beginning with a dot is served, and the default answer is no: `.git`,
+/// `.env` and `.htpasswd` all live in directories that get published by
+/// accident.
+pub fn resolve(request_path: str, index: str,
+    allow_hidden: bool) -> StaticFile ! StaticError {
+    let decoded = try percent_decode(request_path)
+    if decoded == "" {
+        fail(StaticEmpty)
+    }
+    // A path is taken relative to the root whatever it starts with; a leading
+    // slash is the URL's, not the filesystem's.
+    let segments = try resolve_segments(decoded)
+    if not allow_hidden {
+        for s in segments {
+            if s.starts_with(".") {
+                fail(StaticHidden(s))
+            }
+        }
+    }
+    if segments.len() == 0 or decoded.ends_with("/") {
+        if index == "" {
+            fail(StaticEmpty)
+        }
+        var parts = segments
+        parts.push(index)
+        let relative = parts.join("/")
+        return StaticFile{ relative: relative,
+            content_type: content_type_for(relative), is_index: true }
+    }
+    let relative = segments.join("/")
+    return StaticFile{ relative: relative,
+        content_type: content_type_for(relative), is_index: false }
+}
+
+/// The content type for a name, with a safe default.
+///
+/// The default is `application/octet-stream` and not `text/plain`: a file of
+/// unknown type served as text is a file a browser may render, and a `.svg`
+/// or an `.html` uploaded by a user then runs as script on your origin.
+pub fn content_type_for(name: str) -> str {
+    let dot = last_dot(name)
+    if dot < 0 {
+        return "application/octet-stream"
+    }
+    let found = mimetype.by_name(name)
+    if found == mimetype.unknown() {
+        return "application/octet-stream"
+    }
+    return found
+}
+
+fn last_dot(name: str) -> i64 {
+    var at = 0 - 1
+    var i = 0
+    for c in name.chars() {
+        if c == "." {
+            at = i
+        }
+        if c == "/" {
+            at = 0 - 1
+        }
+        i = i + 1
+    }
+    return at
+}
+
+/// Whether a type should be served with a charset.
+///
+/// A `text/*` or JSON response without one is decoded by the browser's guess,
+/// and the guess used to be able to be steered by the content itself — which
+/// is how a UTF-7 encoded payload became script on pages that declared no
+/// charset.
+pub fn needs_charset(content_type: str) -> bool {
+    return content_type.starts_with("text/") or
+    content_type == "application/javascript" or
+    content_type == "application/json" or
+    content_type == "image/svg+xml"
+}
+
+/// The full `Content-Type` header value.
+pub fn content_type_header(content_type: str) -> str {
+    if needs_charset(content_type) {
+        return content_type + "; charset=utf-8"
+    }
+    return content_type
+}
+
+/// Whether a file should be served with `Content-Disposition: attachment`.
+///
+/// For anything the browser would otherwise run in the origin's context.
+/// A user-uploaded `.svg` is a script; a `.html` is a page on your domain
+/// with your cookies. Serving them as a download is the fix that does not
+/// depend on a sanitiser being complete.
+pub fn should_download(content_type: str) -> bool {
+    return content_type == "image/svg+xml" or content_type == "text/html" or
+    content_type == "application/xhtml+xml" or
+    content_type == "application/octet-stream"
+}
+
+/// A `Content-Disposition` value with the filename escaped.
+pub fn disposition(name: str, download: bool) -> str {
+    let safe = name.replace("\"", "").replace("\\", "").replace("\n", "")
+    if download {
+        return "attachment; filename=\"" + safe + "\""
+    }
+    return "inline; filename=\"" + safe + "\""
+}
+
+/// Whether a name looks fingerprinted, and can therefore be cached forever.
+///
+/// A name like `app.9f2c1b3d.js` changes when the content does, so the URL is
+/// unique to the bytes and a year-long cache is safe. A name like `app.js` is
+/// not, and caching it for a year means a bug fix that some users never see.
+pub fn is_fingerprinted(name: str) -> bool {
+    let parts = name.split(".")
+    if parts.len() < 3 {
+        return false
+    }
+    let candidate = parts[parts.len() - 2]
+    if candidate.len() < 8 {
+        return false
+    }
+    for c in candidate.chars() {
+        let hex = (c >= "0" and c <= "9") or (c >= "a" and c <= "f")
+        if not hex {
+            return false
+        }
+    }
+    return true
+}
+
+/// The `Cache-Control` a static file should carry.
+pub fn cache_control_for(name: str) -> str {
+    if is_fingerprinted(name) {
+        return "public, max-age=31536000, immutable"
+    }
+    return "public, max-age=0, must-revalidate"
+}
+
+/// Whether a request path is safe to serve at all, without resolving it.
+pub fn is_safe(request_path: str) -> bool {
+    match resolve(request_path, "index.html", false) {
+        Ok(_v) -> return true
+        Err(_e) -> return false
+    }
+}
+
+/// The path a caller should join to its root, with the separator it wants.
+pub fn join(root: str, file: StaticFile) -> str {
+    if root.ends_with("/") {
+        return root + file.relative
+    }
+    return root + "/" + file.relative
+}

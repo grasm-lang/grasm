@@ -1,0 +1,302 @@
+// Conditional requests: `ETag`, `If-None-Match`, `If-Match`, and the two
+// different answers they produce.
+//
+// The whole point is the status code, and there are two of them. A failed
+// `If-None-Match` on a `GET` is **304 Not Modified** — "you already have it".
+// A failed `If-Match` on a `PUT` is **412 Precondition Failed** — "someone
+// else changed it, do not overwrite". Getting these the wrong way round turns
+// a cache miss into a lost update.
+//
+// Four rules from RFC 9110 that a hand-written implementation usually gets
+// wrong:
+//
+// **`If-None-Match` compares weakly and `If-Match` compares strongly.** A
+// weak comparison ignores the `W/` prefix, so `W/"abc"` matches `"abc"`; a
+// strong one does not, and two weak tags never match each other even when
+// they are identical. That asymmetry is deliberate: a cache may serve a
+// semantically-equivalent body, and an update may not be applied to one.
+//
+// **`If-None-Match` wins over `If-Modified-Since`.** When both are present
+// the date is ignored entirely. A server that checks the date first will
+// return 304 for a body that changed twice in one second, because the date has
+// one-second resolution and the tag does not.
+//
+// **`If-Match: *` means "any current representation".** It succeeds when the
+// resource exists and fails with 412 when it does not — which is how a
+// conditional create is written.
+//
+// **A 304 carries headers, not a body**, and it must carry the `ETag` — a
+// client that gets a 304 with no tag has nothing to store for next time.
+//
+// Order of evaluation is `If-Match`, then `If-Unmodified-Since`, then
+// `If-None-Match`, then `If-Modified-Since`, and it matters: a request with
+// both `If-Match` and `If-None-Match` is answered by the first that fails.
+
+import crypto_hash
+
+/// One entity tag.
+type EtagValue = {
+    /// The opaque value, without quotes.
+    value: str,
+    /// Whether it was written `W/"..."`.
+    weak: bool,
+}
+
+/// What a conditional request should be answered with.
+type EtagDecision = {
+    /// 0 when the request should be handled normally, or the status to
+    /// return instead.
+    status: i64,
+    reason: str,
+}
+
+type EtagError =
+    | EtagMalformed(text: str)
+    | EtagEmpty
+
+    /// The tag for a body, as a quoted strong tag.
+    ///
+    /// A hash of the bytes, so two servers with the same content produce the same
+    /// tag — which matters behind a load balancer, where a tag derived from an
+    /// inode number or a process-local counter makes every cache hit a miss.
+pub fn strong_of(body: bytes) -> str {
+    let digest = crypto_hash.hex_of(crypto_hash.sha256_of(body))
+    return "\"" + digest.substr(0, 32) + "\""
+}
+
+/// A weak tag for a body: the same hash, marked as weak.
+///
+/// Weak is the honest choice when the bytes may differ while the meaning does
+/// not — a response that embeds a timestamp, or one served compressed by one
+/// server and plain by another.
+pub fn weak_of(body: bytes) -> str {
+    return "W/" + strong_of(body)
+}
+
+/// A tag built from a version and a size, for content not held in memory.
+pub fn from_version(version: i64, size: i64) -> str {
+    return "\"{version}-{size}\""
+}
+
+/// Parse one tag.
+pub fn parse_one(text: str) -> EtagValue ! EtagError {
+    let trimmed = text.trim()
+    if trimmed == "" {
+        fail(EtagEmpty)
+    }
+    var rest = trimmed
+    var weak = false
+    if rest.starts_with("W/") {
+        weak = true
+        rest = rest.substr(2, rest.len() - 2)
+    }
+    if rest == "*" {
+        return EtagValue{ value: "*", weak: false }
+    }
+    if not rest.starts_with("\"") or not rest.ends_with("\"") or
+    rest.len() < 2 {
+        fail(EtagMalformed(text))
+    }
+    return EtagValue{ value: rest.substr(1, rest.len() - 2), weak: weak }
+}
+
+/// Parse a comma-separated header value.
+///
+/// The split is not on every comma: a tag's opaque value may contain one, and
+/// only a comma outside the quotes separates two tags.
+pub fn parse_list(header: str) -> [EtagValue] ! EtagError {
+    var out: [EtagValue] = []
+    var current = ""
+    var in_quotes = false
+    for c in header.chars() {
+        if c == "\"" {
+            in_quotes = not in_quotes
+        }
+        if c == "," and not in_quotes {
+            if current.trim() != "" {
+                out.push(try parse_one(current))
+            }
+            current = ""
+        } else {
+            current = current + c
+        }
+    }
+    if current.trim() != "" {
+        out.push(try parse_one(current))
+    }
+    return out
+}
+
+/// Whether a list is the single wildcard `*`.
+pub fn is_wildcard(tags: [EtagValue]) -> bool {
+    return tags.len() == 1 and tags[0].value == "*"
+}
+
+/// Render a tag back to its header form.
+pub fn render(tag: EtagValue) -> str {
+    if tag.value == "*" {
+        return "*"
+    }
+    if tag.weak {
+        return "W/\"" + tag.value + "\""
+    }
+    return "\"" + tag.value + "\""
+}
+
+/// Strong comparison: equal values, and neither may be weak.
+///
+/// Used by `If-Match` and by range requests. Two identical weak tags do *not*
+/// compare strongly — which looks like a bug and is the rule: a weak tag says
+/// "equivalent, not identical", and a byte range needs identical.
+pub fn compare_strong(a: EtagValue, b: EtagValue) -> bool {
+    return not a.weak and not b.weak and a.value == b.value
+}
+
+/// Weak comparison: equal values, whatever the weakness.
+pub fn compare_weak(a: EtagValue, b: EtagValue) -> bool {
+    return a.value == b.value
+}
+
+fn any_weak_match(tags: [EtagValue], current: EtagValue) -> bool {
+    for t in tags {
+        if compare_weak(t, current) {
+            return true
+        }
+    }
+    return false
+}
+
+fn any_strong_match(tags: [EtagValue], current: EtagValue) -> bool {
+    for t in tags {
+        if compare_strong(t, current) {
+            return true
+        }
+    }
+    return false
+}
+
+/// Whether a method is safe, and therefore gets a 304 rather than a 412.
+pub fn is_safe_method(method: str) -> bool {
+    let m = method.to_upper()
+    return m == "GET" or m == "HEAD"
+}
+
+/// The whole decision, in the order RFC 9110 specifies.
+///
+/// `exists` says whether the resource is there at all, which `If-Match: *`
+/// and `If-None-Match: *` both turn on. `current` is the tag the resource has
+/// now, and `modified_at` and the two date headers are seconds since the
+/// epoch, with `-1` for absent.
+pub fn decide(method: str, current_tag: str, exists: bool,
+    if_match: str, if_none_match: str, modified_at: i64,
+    if_modified_since: i64,
+    if_unmodified_since: i64) -> EtagDecision ! EtagError {
+    let current = if current_tag == "" { EtagValue{ value: "", weak: false } }
+    else { try parse_one(current_tag) }
+    // 1. `If-Match`, which fails with 412 — never with 304.
+    if if_match != "" {
+        let tags = try parse_list(if_match)
+        if is_wildcard(tags) {
+            if not exists {
+                return EtagDecision{ status: 412,
+                    reason: "If-Match: * on a resource that does not exist" }
+            }
+        } else {
+            if not (exists and any_strong_match(tags, current)) {
+                return EtagDecision{ status: 412,
+                    reason: "If-Match did not match the current tag" }
+            }
+        }
+    } else {
+        // 2. `If-Unmodified-Since`, but only when `If-Match` was absent.
+        if if_unmodified_since >= 0 and modified_at >= 0 and
+        modified_at > if_unmodified_since {
+            return EtagDecision{ status: 412,
+                reason: "the resource changed after If-Unmodified-Since" }
+        }
+    }
+    return try decide_read(method, current, exists, if_none_match,
+        modified_at, if_modified_since)
+}
+
+fn decide_read(method: str, current: EtagValue, exists: bool,
+    if_none_match: str, modified_at: i64,
+    if_modified_since: i64) -> EtagDecision ! EtagError {
+    // 3. `If-None-Match`, weakly compared.
+    if if_none_match != "" {
+        let tags = try parse_list(if_none_match)
+        let matched = if is_wildcard(tags) { exists } else {
+            exists and any_weak_match(tags, current) }
+        if matched {
+            if is_safe_method(method) {
+                return EtagDecision{ status: 304,
+                    reason: "the client already has this representation" }
+            }
+            return EtagDecision{ status: 412,
+                reason: "If-None-Match matched on an unsafe method" }
+        }
+        // A present `If-None-Match` makes any date header irrelevant.
+        return EtagDecision{ status: 0, reason: "" }
+    }
+    // 4. `If-Modified-Since`, and only on a safe method.
+    if if_modified_since >= 0 and modified_at >= 0 and
+    is_safe_method(method) and modified_at <= if_modified_since {
+        return EtagDecision{ status: 304,
+            reason: "not modified since the date given" }
+    }
+    return EtagDecision{ status: 0, reason: "" }
+}
+
+/// The headers a 304 must carry.
+///
+/// A 304 with no `ETag` is a wasted round trip: the client revalidates,
+/// learns nothing new to store, and has to ask again next time with the same
+/// old tag.
+pub fn not_modified_headers(current_tag: str, cache_control: str) -> [str] {
+    var out: [str] = []
+    if current_tag != "" {
+        out.push("ETag: " + current_tag)
+    }
+    if cache_control != "" {
+        out.push("Cache-Control: " + cache_control)
+    }
+    return out
+}
+
+/// A `Cache-Control` value from the parts that matter.
+///
+/// `must_revalidate` is the one worth understanding: without it a cache is
+/// allowed to serve a stale response when the origin cannot be reached, which
+/// is usually what you want for a page and never what you want for a price.
+pub fn cache_control(public_cache: bool, max_age: i64,
+    must_revalidate: bool) -> str {
+    var parts: [str] = []
+    if public_cache {
+        parts.push("public")
+    } else {
+        parts.push("private")
+    }
+    if max_age >= 0 {
+        parts.push("max-age={max_age}")
+    }
+    if must_revalidate {
+        parts.push("must-revalidate")
+    }
+    return parts.join(", ")
+}
+
+/// `no-store`, which is not `no-cache`.
+///
+/// `no-cache` means "revalidate before using", and the response is still
+/// written to disk. `no-store` means "do not write it down at all". A bank
+/// statement served with `no-cache` is on the disk of every machine that saw
+/// it.
+pub fn no_store() -> str {
+    return "no-store"
+}
+
+/// Whether a response with this status may carry an entity tag.
+pub fn may_have_tag(status: i64) -> bool {
+    return status == 200 or status == 201 or status == 203 or
+    status == 206 or status == 304
+}

@@ -1,0 +1,689 @@
+// CSS: tokenising it, reading rules out of it, and computing specificity.
+//
+// Specificity is the part worth having. It is why a rule that looks more
+// specific loses, and it is computed by a formula almost nobody remembers
+// correctly:
+//
+//   a = the number of id selectors
+//   b = the number of class, attribute and pseudo-class selectors
+//   c = the number of type and pseudo-element selectors
+//
+// compared as the triple `(a, b, c)` and never summed — which is the part
+// that surprises people. Eleven classes do not beat one id, because the
+// comparison is lexicographic and `(1,0,0)` beats `(0,11,0)`. A single
+// inline style beats all of them, and `!important` beats that.
+//
+// Two more rules that are easy to get wrong and are implemented here:
+// **`:not()` contributes nothing itself but its argument does**, so
+// `:not(.a)` counts as one class; and **the universal selector `*` and the
+// combinators contribute nothing at all**.
+//
+// The tokeniser handles what a real stylesheet contains: comments, strings
+// with escapes, `url(...)` with and without quotes, numbers with units and
+// exponents, hash tokens, at-rules, and nested blocks. Nested blocks matter
+// because `@media` holds rules, and a parser that splits on `}` loses them.
+//
+// Checked against `tinycss2`, which implements the CSS Syntax specification.
+
+type CssTokenKind =
+    | CssIdent
+    | CssFunction
+    | CssAtKeyword
+    | CssHash
+    | CssString
+    | CssUrl
+    | CssNumber
+    | CssDimension
+    | CssPercentage
+    | CssDelim
+    | CssWhitespace
+    | CssComment
+    | CssOpen
+    | CssClose
+
+type CssToken = {
+    kind: CssTokenKind,
+    text: str,
+    unit: str,
+    at: i64,
+}
+
+type CssDeclaration = {
+    property: str,
+    value: str,
+    important: bool,
+}
+
+type CssRule = {
+    /// The selectors, comma-separated in the source and split here.
+    selectors: [str],
+    declarations: [CssDeclaration],
+    /// The at-rule this sits inside, or `""`.
+    context: str,
+}
+
+/// The three counts, compared as a triple.
+type CssSpecificity = {
+    ids: i64,
+    classes: i64,
+    types: i64,
+}
+
+type CssError =
+    | CssUnterminatedString(at: i64)
+    | CssUnterminatedComment(at: i64)
+    | CssUnbalanced(at: i64)
+    | CssEmpty
+
+fn is_space(c: str) -> bool {
+    return c == " " or c == "\t" or c == "\n" or c == "\r" or
+    c == "\u{c}"
+}
+
+fn is_digit(c: str) -> bool {
+    return c >= "0" and c <= "9"
+}
+
+fn is_name_start(c: str) -> bool {
+    return (c >= "a" and c <= "z") or (c >= "A" and c <= "Z") or c == "_" or
+    c == "-" or c > "\u{7f}"
+}
+
+fn is_name(c: str) -> bool {
+    return is_name_start(c) or is_digit(c)
+}
+
+pub fn kind_name(k: CssTokenKind) -> str {
+    match k {
+        CssIdent -> return "ident"
+        CssFunction -> return "function"
+        CssAtKeyword -> return "at-keyword"
+        CssHash -> return "hash"
+        CssString -> return "string"
+        CssUrl -> return "url"
+        CssNumber -> return "number"
+        CssDimension -> return "dimension"
+        CssPercentage -> return "percentage"
+        CssDelim -> return "delim"
+        CssWhitespace -> return "whitespace"
+        CssComment -> return "comment"
+        CssOpen -> return "open"
+        CssClose -> return "close"
+    }
+}
+
+/// Every token in a stylesheet.
+pub fn tokenise(css: str) -> [CssToken] ! CssError {
+    var out: [CssToken] = []
+    var i = 0
+    while i < css.len() {
+        let c = css.substr(i, 1)
+        if is_space(c) {
+            let start = i
+            while i < css.len() and is_space(css.substr(i, 1)) {
+                i = i + 1
+            }
+            out.push(CssToken{ kind: CssWhitespace,
+                text: css.substr(start, i - start), unit: "", at: start })
+            continue
+        }
+        if css.substr(i, 2) == "/*" {
+            let stop = try comment_end(css, i)
+            out.push(CssToken{ kind: CssComment,
+                text: css.substr(i, stop - i), unit: "", at: i })
+            i = stop
+            continue
+        }
+        i = try one_token(css, i, out)
+    }
+    return out
+}
+
+fn one_token(css: str, i: i64, inout out: [CssToken]) -> i64 ! CssError {
+    let c = css.substr(i, 1)
+    if c == "\"" or c == "'" {
+        let stop = try string_end(css, i, c)
+        out.push(CssToken{ kind: CssString,
+            text: css.substr(i + 1, stop - i - 2), unit: "", at: i })
+        return stop
+    }
+    if c == "@" and i + 1 < css.len() and is_name_start(css.substr(i + 1, 1)) {
+        var j = i + 1
+        while j < css.len() and is_name(css.substr(j, 1)) {
+            j = j + 1
+        }
+        out.push(CssToken{ kind: CssAtKeyword,
+            text: css.substr(i + 1, j - i - 1), unit: "", at: i })
+        return j
+    }
+    if c == "#" and i + 1 < css.len() and is_name(css.substr(i + 1, 1)) {
+        var j = i + 1
+        while j < css.len() and is_name(css.substr(j, 1)) {
+            j = j + 1
+        }
+        out.push(CssToken{ kind: CssHash, text: css.substr(i + 1, j - i - 1),
+            unit: "", at: i })
+        return j
+    }
+    if is_digit(c) or ((c == "." or c == "+" or c == "-") and
+        i + 1 < css.len() and is_digit(css.substr(i + 1, 1))) {
+        return numeric(css, i, out)
+    }
+    if is_name_start(c) {
+        var j = i
+        while j < css.len() and is_name(css.substr(j, 1)) {
+            j = j + 1
+        }
+        let name = css.substr(i, j - i)
+        if j < css.len() and css.substr(j, 1) == "(" {
+            // `url(` is its own thing: what follows may be unquoted and may
+            // contain characters no other token allows.
+            if name.to_lower() == "url" {
+                let stop = try url_end(css, j)
+                out.push(CssToken{ kind: CssUrl,
+                    text: url_body(css, j + 1, stop - 1), unit: "", at: i })
+                return stop
+            }
+            out.push(CssToken{ kind: CssFunction, text: name, unit: "",
+                at: i })
+            return j + 1
+        }
+        out.push(CssToken{ kind: CssIdent, text: name, unit: "", at: i })
+        return j
+    }
+    if c == "\{" or c == "[" or c == "(" {
+        out.push(CssToken{ kind: CssOpen, text: c, unit: "", at: i })
+        return i + 1
+    }
+    if c == "}" or c == "]" or c == ")" {
+        out.push(CssToken{ kind: CssClose, text: c, unit: "", at: i })
+        return i + 1
+    }
+    out.push(CssToken{ kind: CssDelim, text: c, unit: "", at: i })
+    return i + 1
+}
+
+fn numeric(css: str, i: i64, inout out: [CssToken]) -> i64 {
+    var j = i
+    if css.substr(j, 1) == "+" or css.substr(j, 1) == "-" {
+        j = j + 1
+    }
+    while j < css.len() and is_digit(css.substr(j, 1)) {
+        j = j + 1
+    }
+    if j < css.len() and css.substr(j, 1) == "." and j + 1 < css.len() and
+    is_digit(css.substr(j + 1, 1)) {
+        j = j + 1
+        while j < css.len() and is_digit(css.substr(j, 1)) {
+            j = j + 1
+        }
+    }
+    if j < css.len() and (css.substr(j, 1) == "e" or css.substr(j, 1) == "E") {
+        var k = j + 1
+        if k < css.len() and (css.substr(k, 1) == "+" or
+            css.substr(k, 1) == "-") {
+            k = k + 1
+        }
+        if k < css.len() and is_digit(css.substr(k, 1)) {
+            j = k
+            while j < css.len() and is_digit(css.substr(j, 1)) {
+                j = j + 1
+            }
+        }
+    }
+    let number = css.substr(i, j - i)
+    if j < css.len() and css.substr(j, 1) == "%" {
+        out.push(CssToken{ kind: CssPercentage, text: number, unit: "%",
+            at: i })
+        return j + 1
+    }
+    if j < css.len() and is_name_start(css.substr(j, 1)) {
+        var k = j
+        while k < css.len() and is_name(css.substr(k, 1)) {
+            k = k + 1
+        }
+        out.push(CssToken{ kind: CssDimension, text: number,
+            unit: css.substr(j, k - j), at: i })
+        return k
+    }
+    out.push(CssToken{ kind: CssNumber, text: number, unit: "", at: i })
+    return j
+}
+
+fn comment_end(css: str, i: i64) -> i64 ! CssError {
+    var j = i + 2
+    while j + 1 < css.len() {
+        if css.substr(j, 2) == "*/" {
+            return j + 2
+        }
+        j = j + 1
+    }
+    fail(CssUnterminatedComment(i))
+}
+
+fn string_end(css: str, i: i64, quote: str) -> i64 ! CssError {
+    var j = i + 1
+    while j < css.len() {
+        let c = css.substr(j, 1)
+        if c == "\\" {
+            j = j + 2
+            continue
+        }
+        if c == quote {
+            return j + 1
+        }
+        j = j + 1
+    }
+    fail(CssUnterminatedString(i))
+}
+
+fn url_end(css: str, open_paren: i64) -> i64 ! CssError {
+    var j = open_paren + 1
+    while j < css.len() {
+        if css.substr(j, 1) == ")" {
+            return j + 1
+        }
+        j = j + 1
+    }
+    fail(CssUnbalanced(open_paren))
+}
+
+fn url_body(css: str, from: i64, to: i64) -> str {
+    var body = css.substr(from, to - from).trim()
+    if body.len() >= 2 and (body.starts_with("\"") or body.starts_with("'")) {
+        return body.substr(1, body.len() - 2)
+    }
+    return body
+}
+
+// ------------------------------------------------------------- the rules
+
+/// Every rule in a stylesheet, including the ones inside at-rules.
+///
+/// An at-rule that holds a block — `@media`, `@supports` — has its contents
+/// parsed and each rule tagged with the condition. A parser that splits on
+/// `}` merges the closing brace of the last rule with the closing brace of
+/// the block and loses the last rule of every media query.
+pub fn parse(css: str) -> [CssRule] ! CssError {
+    let tokens = try tokenise(css)
+    var out: [CssRule] = []
+    try collect(tokens, 0, tokens.len(), "", out)
+    return out
+}
+
+fn collect(tokens: [CssToken], from: i64, to: i64, context: str,
+    inout out: [CssRule]) ! CssError {
+    var prelude = ""
+    var i = from
+    var at_rule = ""
+    while i < to {
+        let t = tokens[i]
+        match t.kind {
+            CssComment -> {}
+            CssAtKeyword -> at_rule = "@" + t.text
+            CssOpen -> {
+                if t.text == "\{" {
+                    let stop = try block_end(tokens, i, to)
+                    if at_rule != "" and holds_rules(at_rule) {
+                        let condition = collapse(at_rule + " " + prelude)
+                        try collect(tokens, i + 1, stop - 1, condition, out)
+                    } else {
+                        if at_rule == "" {
+                            out.push(CssRule{
+                                selectors: split_selectors(prelude),
+                                declarations: declarations_in(tokens, i + 1,
+                                    stop - 1),
+                                context: context })
+                        }
+                    }
+                    i = stop
+                    prelude = ""
+                    at_rule = ""
+                    continue
+                }
+                prelude = prelude + t.text
+            }
+            CssClose -> prelude = prelude + t.text
+            CssWhitespace -> prelude = prelude + " "
+            CssString -> prelude = prelude + "\"" + t.text + "\""
+            CssDimension -> prelude = prelude + t.text + t.unit
+            CssPercentage -> prelude = prelude + t.text + "%"
+            CssHash -> prelude = prelude + "#" + t.text
+            CssFunction -> prelude = prelude + t.text + "("
+            _ -> {
+                if t.text == ";" and at_rule != "" {
+                    // An at-rule with no block — `@import`, `@charset` — ends
+                    // at its semicolon and holds no rules.
+                    at_rule = ""
+                    prelude = ""
+                } else {
+                    prelude = prelude + t.text
+                }
+            }
+        }
+        i = i + 1
+    }
+}
+
+/// Runs of whitespace become one space, so a condition reads the way it was
+/// written rather than the way it tokenised.
+fn collapse(text: str) -> str {
+    var out = ""
+    var space = false
+    for c in text.trim().chars() {
+        if is_space(c) {
+            space = true
+        } else {
+            if space and out != "" {
+                out = out + " "
+            }
+            space = false
+            out = out + c
+        }
+    }
+    return out
+}
+
+fn holds_rules(at_rule: str) -> bool {
+    let name = at_rule.to_lower()
+    return name == "@media" or name == "@supports" or name == "@layer" or
+    name == "@container" or name == "@scope"
+}
+
+fn block_end(tokens: [CssToken], open_at: i64, to: i64) -> i64 ! CssError {
+    var depth = 0
+    var i = open_at
+    while i < to {
+        match tokens[i].kind {
+            CssOpen -> {
+                if tokens[i].text == "\{" {
+                    depth = depth + 1
+                }
+            }
+            CssClose -> {
+                if tokens[i].text == "}" {
+                    depth = depth - 1
+                    if depth == 0 {
+                        return i + 1
+                    }
+                }
+            }
+            _ -> {}
+        }
+        i = i + 1
+    }
+    fail(CssUnbalanced(tokens[open_at].at))
+}
+
+fn declarations_in(tokens: [CssToken], from: i64,
+    to: i64) -> [CssDeclaration] {
+    var out: [CssDeclaration] = []
+    var text = ""
+    var depth = 0
+    var i = from
+    while i < to {
+        let t = tokens[i]
+        match t.kind {
+            CssOpen -> {
+                depth = depth + 1
+                text = text + t.text
+            }
+            CssClose -> {
+                depth = depth - 1
+                text = text + t.text
+            }
+            CssComment -> {}
+            CssWhitespace -> text = text + " "
+            CssString -> text = text + "\"" + t.text + "\""
+            CssUrl -> text = text + "url(" + t.text + ")"
+            CssDimension -> text = text + t.text + t.unit
+            CssPercentage -> text = text + t.text + "%"
+            CssHash -> text = text + "#" + t.text
+            CssFunction -> text = text + t.text + "("
+            _ -> {
+                if t.text == ";" and depth == 0 {
+                    push_declaration(out, text)
+                    text = ""
+                } else {
+                    text = text + t.text
+                }
+            }
+        }
+        i = i + 1
+    }
+    push_declaration(out, text)
+    return out
+}
+
+fn push_declaration(inout out: [CssDeclaration], text: str) {
+    let trimmed = text.trim()
+    if trimmed == "" {
+        return
+    }
+    let colon = trimmed.index_of(":") ?? (0 - 1)
+    if colon < 0 {
+        return
+    }
+    let property = trimmed.substr(0, colon).trim().to_lower()
+    var value = trimmed.substr(colon + 1, trimmed.len() - colon - 1).trim()
+    var important = false
+    if value.to_lower().ends_with("!important") {
+        important = true
+        value = value.substr(0, value.len() - 10).trim()
+    }
+    out.push(CssDeclaration{ property: property, value: value,
+        important: important })
+}
+
+fn split_selectors(prelude: str) -> [str] {
+    var out: [str] = []
+    for part in prelude.split(",") {
+        let trimmed = part.trim()
+        if trimmed != "" {
+            out.push(trimmed)
+        }
+    }
+    return out
+}
+
+// ------------------------------------------------------- specificity
+
+/// The specificity of one selector.
+pub fn specificity(selector: str) -> CssSpecificity {
+    var ids = 0
+    var classes = 0
+    var types = 0
+    var i = 0
+    while i < selector.len() {
+        let c = selector.substr(i, 1)
+        if c == "#" {
+            ids = ids + 1
+            i = skip_name(selector, i + 1)
+            continue
+        }
+        if c == "." {
+            classes = classes + 1
+            i = skip_name(selector, i + 1)
+            continue
+        }
+        if c == "[" {
+            classes = classes + 1
+            i = skip_to(selector, i, "]")
+            continue
+        }
+        if c == ":" {
+            if selector.substr(i, 2) == "::" {
+                // A pseudo-element counts as a type, not as a class.
+                types = types + 1
+                i = skip_name(selector, i + 2)
+                continue
+            }
+            let name_end = skip_name(selector, i + 1)
+            let name = selector.substr(i + 1, name_end - i - 1).to_lower()
+            if name_end < selector.len() and
+            selector.substr(name_end, 1) == "(" {
+                let close = skip_to(selector, name_end, ")")
+                let inner = selector.substr(name_end + 1,
+                    close - name_end - 2)
+                if name == "not" or name == "is" or name == "has" {
+                    // These contribute nothing themselves; their argument
+                    // contributes the most specific of its alternatives.
+                    let inner_score = most_specific(inner)
+                    ids = ids + inner_score.ids
+                    classes = classes + inner_score.classes
+                    types = types + inner_score.types
+                } else {
+                    if name == "where" {
+                        // `:where()` contributes nothing at all, argument
+                        // included — which is the entire reason it exists.
+                    } else {
+                        classes = classes + 1
+                    }
+                }
+                i = close
+                continue
+            }
+            // The five that are pseudo-elements written with one colon, for
+            // compatibility with CSS 2.
+            if name == "before" or name == "after" or name == "first-line" or
+            name == "first-letter" {
+                types = types + 1
+            } else {
+                classes = classes + 1
+            }
+            i = name_end
+            continue
+        }
+        if c == "*" or c == ">" or c == "+" or c == "~" or is_space(c) or
+        c == "," {
+            // The universal selector and every combinator count for nothing.
+            i = i + 1
+            continue
+        }
+        if is_name_start(c) {
+            types = types + 1
+            i = skip_name(selector, i)
+            continue
+        }
+        i = i + 1
+    }
+    return CssSpecificity{ ids: ids, classes: classes, types: types }
+}
+
+fn most_specific(list: str) -> CssSpecificity {
+    var best = CssSpecificity{ ids: 0, classes: 0, types: 0 }
+    for part in list.split(",") {
+        let score = specificity(part.trim())
+        if compare(score, best) > 0 {
+            best = score
+        }
+    }
+    return best
+}
+
+fn skip_name(selector: str, from: i64) -> i64 {
+    var i = from
+    while i < selector.len() and is_name(selector.substr(i, 1)) {
+        i = i + 1
+    }
+    return i
+}
+
+fn skip_to(selector: str, from: i64, closing: str) -> i64 {
+    var i = from + 1
+    var depth = 1
+    while i < selector.len() {
+        let c = selector.substr(i, 1)
+        if c == "(" or c == "[" {
+            depth = depth + 1
+        }
+        if c == closing {
+            depth = depth - 1
+            if depth == 0 {
+                return i + 1
+            }
+        }
+        i = i + 1
+    }
+    return selector.len()
+}
+
+/// Compare two specificities: positive when `a` wins.
+///
+/// Lexicographic, never summed. That is why eleven classes lose to one id:
+/// `(0, 11, 0)` against `(1, 0, 0)` is decided on the first component and the
+/// rest is never looked at.
+pub fn compare(a: CssSpecificity, b: CssSpecificity) -> i64 {
+    if a.ids != b.ids {
+        return a.ids - b.ids
+    }
+    if a.classes != b.classes {
+        return a.classes - b.classes
+    }
+    return a.types - b.types
+}
+
+/// The specificity as it is usually written.
+pub fn to_str(s: CssSpecificity) -> str {
+    return "({s.ids},{s.classes},{s.types})"
+}
+
+/// Which rule wins for a property, among rules that all match.
+///
+/// The cascade in the part this package can answer: `!important` first, then
+/// specificity, then source order. Origin and layer come before all of it and
+/// are the caller's, because they are not in the stylesheet text.
+pub fn winning(rules: [CssRule], property: str) -> Option[CssDeclaration] {
+    var best: Option[CssDeclaration] = None
+    var best_score = CssSpecificity{ ids: 0 - 1, classes: 0, types: 0 }
+    var best_important = false
+    for rule in rules {
+        for d in rule.declarations {
+            if d.property == property {
+                let score = highest(rule.selectors)
+                let wins = (d.important and not best_important) or
+                (d.important == best_important and
+                    compare(score, best_score) >= 0)
+                if wins {
+                    best = Some(d)
+                    best_score = score
+                    best_important = d.important
+                }
+            }
+        }
+    }
+    return best
+}
+
+fn highest(selectors: [str]) -> CssSpecificity {
+    var best = CssSpecificity{ ids: 0, classes: 0, types: 0 }
+    for s in selectors {
+        let score = specificity(s)
+        if compare(score, best) > 0 {
+            best = score
+        }
+    }
+    return best
+}
+
+/// Every declaration in a stylesheet, for an audit.
+pub fn declarations(rules: [CssRule]) -> [CssDeclaration] {
+    var out: [CssDeclaration] = []
+    for rule in rules {
+        for d in rule.declarations {
+            out.push(d)
+        }
+    }
+    return out
+}
+
+/// The `!important` declarations, which are the ones worth reviewing.
+pub fn important_declarations(rules: [CssRule]) -> [CssDeclaration] {
+    var out: [CssDeclaration] = []
+    for d in declarations(rules) {
+        if d.important {
+            out.push(d)
+        }
+    }
+    return out
+}

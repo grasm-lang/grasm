@@ -1,0 +1,321 @@
+// Sessions in a signed cookie, and the four things that make one safe.
+//
+// The value in the cookie is `payload.expiry.signature`, where the signature
+// is HMAC-SHA256 over the first two parts. The server keeps nothing; the
+// cookie is the session. That is the right shape for anything horizontally
+// scaled — there is no store to replicate — and it has consequences a caller
+// has to know about, so they are stated rather than assumed:
+//
+// **A signed cookie is not an encrypted one.** Anyone holding it can read
+// what is in it. It cannot be *changed* without the key, which is what a
+// session needs; it must not hold anything the user should not see.
+//
+// **Signing must be verified in constant time.** A comparison that stops at
+// the first wrong byte leaks how many bytes were right, and a few thousand
+// requests turn that into a valid signature. `equal_constant_time` is used
+// for exactly that reason.
+//
+// **The expiry is inside the signature.** A cookie's own `Max-Age` is a
+// request to the browser and nothing more — a client that ignores it keeps
+// sending the cookie forever. The expiry that matters is the one the server
+// signed and checks.
+//
+// **Keys rotate, so verification takes a list.** New sessions are signed with
+// the first key; an old one still verifies against any key in the list.
+// Without that, rotating a key logs every user out at once, which is why in
+// practice nobody rotates.
+//
+// And the one that is not about cryptography: **the session id changes when
+// privileges do.** `regenerate` exists because an attacker who can set a
+// cookie before login otherwise still holds a valid session after it — session
+// fixation, which signing does nothing to prevent.
+//
+// The clock is a parameter. This package opens nothing, so `now` is passed
+// in; that also makes every expiry test in the demo exact rather than timed.
+
+import crypto_hash
+import bytes_codec
+
+/// A session's contents: keys and values, plus when it was issued.
+type WebSession = {
+    key: [str],
+    value: [str],
+    issued_at: i64,
+    expires_at: i64,
+    id: str,
+}
+
+/// How a cookie should be written.
+type WebSessionCookie = {
+    name: str,
+    value: str,
+    max_age: i64,
+    path: str,
+    http_only: bool,
+    secure: bool,
+    same_site: str,
+}
+
+type WebSessionError =
+    | SessionMalformed(why: str)
+    | SessionBadSignature
+    | SessionExpired(at: i64, now: i64)
+    | SessionNoKeys
+    | SessionTooLarge(size: i64, limit: i64)
+    | SessionBadKey(name: str)
+
+    /// The largest cookie a browser is required to keep.
+    ///
+    /// 4096 bytes including the name and the attributes. A session that grows past
+    /// it is not truncated by the browser — the whole cookie is dropped, and the
+    /// user is silently logged out. Refusing here turns that into an error at the
+    /// point the data was added.
+pub fn cookie_limit() -> i64 {
+    return 4096
+}
+
+pub fn new_session(id: str, now: i64, lifetime: i64) -> WebSession {
+    return WebSession{ key: [], value: [], issued_at: now,
+        expires_at: now + lifetime, id: id }
+}
+
+/// Set a value.
+///
+/// It cannot fail, so building a session is a run of plain calls. A key that
+/// the encoding cannot carry is caught by `sign`, which is where the whole
+/// session is in view and where a caller has to handle an error anyway.
+pub fn set(inout s: WebSession, key: str, value: str) {
+    for i in 0..s.key.len() {
+        if s.key[i] == key {
+            s.value[i] = value
+            return
+        }
+    }
+    s.key.push(key)
+    s.value.push(value)
+}
+
+pub fn get(s: WebSession, key: str) -> Option[str] {
+    for i in 0..s.key.len() {
+        if s.key[i] == key {
+            return Some(s.value[i])
+        }
+    }
+    return None
+}
+
+pub fn remove(inout s: WebSession, key: str) {
+    var keys: [str] = []
+    var values: [str] = []
+    for i in 0..s.key.len() {
+        if s.key[i] != key {
+            keys.push(s.key[i])
+            values.push(s.value[i])
+        }
+    }
+    s.key = keys
+    s.value = values
+}
+
+pub fn keys_of(s: WebSession) -> [str] {
+    return s.key
+}
+
+/// A new id, keeping the contents.
+///
+/// Called on every privilege change — logging in, logging out, becoming an
+/// administrator. An attacker who planted a session id before login holds a
+/// *different* session afterwards, which is the whole defence against session
+/// fixation and is not something a signature provides.
+pub fn regenerate(inout s: WebSession, new_id: str, now: i64, lifetime: i64) {
+    s.id = new_id
+    s.issued_at = now
+    s.expires_at = now + lifetime
+}
+
+/// Clear the contents but keep the session.
+pub fn clear(inout s: WebSession) {
+    s.key = []
+    s.value = []
+}
+
+// -------------------------------------------------------------- encoding
+
+fn escape(s: str) -> str {
+    return s.replace("%", "%25").replace("=", "%3D").replace("&", "%26")
+}
+
+fn unescape(s: str) -> str {
+    return s.replace("%3D", "=").replace("%26", "&").replace("%25", "%")
+}
+
+fn payload_of(s: WebSession) -> str {
+    var parts: [str] = ["id=" + escape(s.id)]
+    for i in 0..s.key.len() {
+        parts.push(escape(s.key[i]) + "=" + escape(s.value[i]))
+    }
+    return parts.join("&")
+}
+
+fn base64url(data: bytes) -> str {
+    return bytes_codec.encode_base64_url(data)
+}
+
+/// Sign a session into a cookie value.
+///
+/// The first key signs. Everything after it is there so that a cookie signed
+/// before a rotation still verifies.
+pub fn sign(s: WebSession, keys: [bytes]) -> str ! WebSessionError {
+    if keys.len() == 0 {
+        fail(SessionNoKeys)
+    }
+    // A key containing a separator could forge a second field, the same way
+    // an unescaped delimiter forges a log line.
+    for k in s.key {
+        if k == "" or k.contains("=") or k.contains("&") or k == "id" {
+            fail(SessionBadKey(k))
+        }
+    }
+    let body = base64url(payload_of(s).to_bytes()) + "." + "{s.expires_at}"
+    let mac = crypto_hash.hmac_sha256(keys[0], body.to_bytes())
+    let out = body + "." + base64url(mac)
+    if out.len() > cookie_limit() {
+        fail(SessionTooLarge(out.len(), cookie_limit()))
+    }
+    return out
+}
+
+/// Verify a cookie value and read the session back.
+pub fn verify(cookie: str, keys: [bytes],
+    now: i64) -> WebSession ! WebSessionError {
+    if keys.len() == 0 {
+        fail(SessionNoKeys)
+    }
+    let parts = cookie.split(".")
+    if parts.len() != 3 {
+        fail(SessionMalformed("expected three parts, got {parts.len()}"))
+    }
+    let body = parts[0] + "." + parts[1]
+    let given = bytes_codec.decode_base64_url(parts[2]) ?? "".to_bytes()
+    var ok = false
+    for key in keys {
+        // Every key is tried and none is skipped early: stopping at the first
+        // match would make the time taken depend on which key signed it.
+        let mac = crypto_hash.hmac_sha256(key, body.to_bytes())
+        if crypto_hash.equal_constant_time(mac, given) {
+            ok = true
+        }
+    }
+    if not ok {
+        fail(SessionBadSignature)
+    }
+    let expires = parts[1].parse_int() ?? 0
+    if now > expires {
+        fail(SessionExpired(expires, now))
+    }
+    let raw = bytes_codec.decode_base64_url(parts[0]) ?? "".to_bytes()
+    return try decode_payload(raw.to_str(), expires)
+}
+
+fn decode_payload(text: str, expires: i64) -> WebSession ! WebSessionError {
+    var s = WebSession{ key: [], value: [], issued_at: 0, expires_at: expires,
+        id: "" }
+    for pair in text.split("&") {
+        let at = pair.index_of("=") ?? (0 - 1)
+        if at < 0 {
+            fail(SessionMalformed("a field with no `=`"))
+        }
+        let name = unescape(pair.substr(0, at))
+        let value = unescape(pair.substr(at + 1, pair.len() - at - 1))
+        if name == "id" {
+            s.id = value
+        } else {
+            s.key.push(name)
+            s.value.push(value)
+        }
+    }
+    return s
+}
+
+/// Whether a cookie is valid, without saying why.
+pub fn is_valid(cookie: str, keys: [bytes], now: i64) -> bool {
+    match verify(cookie, keys, now) {
+        Ok(_s) -> return true
+        Err(_e) -> return false
+    }
+}
+
+// --------------------------------------------------------------- cookies
+
+/// The cookie a session should be written to.
+///
+/// The defaults are the safe ones, and each is worth a sentence.
+/// `HttpOnly` keeps the cookie out of `document.cookie`, so an injected
+/// script cannot read it. `Secure` keeps it off plaintext connections.
+/// `SameSite=Lax` stops it being sent on a cross-site POST, which is most of
+/// CSRF — the rest is what `packages/csrf` is for.
+pub fn cookie_for(name: str, value: str, max_age: i64) -> WebSessionCookie {
+    return WebSessionCookie{ name: name, value: value, max_age: max_age,
+        path: "/", http_only: true, secure: true, same_site: "Lax" }
+}
+
+/// The cookie that removes a session.
+///
+/// An expiry in the past and an empty value, with the same path and flags —
+/// a browser matches a deletion to an existing cookie by name, domain and
+/// path, so a `Set-Cookie` that omits the path deletes nothing.
+pub fn clearing_cookie(name: str) -> WebSessionCookie {
+    return WebSessionCookie{ name: name, value: "", max_age: 0, path: "/",
+        http_only: true, secure: true, same_site: "Lax" }
+}
+
+pub fn render_cookie(c: WebSessionCookie) -> str {
+    var out = c.name + "=" + c.value
+    if c.path != "" {
+        out = out + "; Path=" + c.path
+    }
+    out = out + "; Max-Age={c.max_age}"
+    if c.http_only {
+        out = out + "; HttpOnly"
+    }
+    if c.secure {
+        out = out + "; Secure"
+    }
+    if c.same_site != "" {
+        out = out + "; SameSite=" + c.same_site
+    }
+    return out
+}
+
+/// Find a cookie's value in a `Cookie` header.
+pub fn from_header(header: str, name: str) -> Option[str] {
+    for pair in header.split(";") {
+        let trimmed = pair.trim()
+        if trimmed.starts_with(name + "=") {
+            return Some(trimmed.substr(name.len() + 1,
+                trimmed.len() - name.len() - 1))
+        }
+    }
+    return None
+}
+
+/// How much of the cookie budget a session would use.
+pub fn size_of(s: WebSession, keys: [bytes]) -> i64 {
+    match sign(s, keys) {
+        Ok(cookie) -> return cookie.len()
+        Err(_e) -> return 0 - 1
+    }
+}
+
+/// Whether a session should be re-issued to extend its life.
+///
+/// A rolling session: once it is more than halfway to expiry, sign a fresh
+/// cookie. Re-signing on every request costs an HMAC per request and changes
+/// the cookie constantly; never re-signing logs an active user out mid-task.
+pub fn should_renew(s: WebSession, now: i64) -> bool {
+    let lifetime = s.expires_at - s.issued_at
+    if lifetime <= 0 {
+        return false
+    }
+    return now - s.issued_at > lifetime / 2
+}

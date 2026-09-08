@@ -1,0 +1,12 @@
+[package]
+name = "staticfiles"
+version = "1.0.0"
+
+# Deciding what to serve, not serving it: the caller reads the file. That is
+# what lets this open nothing while still being the thing that stops a path
+# traversal.
+capabilities = []
+
+[dependencies.mimetype]
+path = "../mimetype"
+version = "^1.0.0"

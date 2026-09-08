@@ -1,0 +1,10 @@
+[package]
+name = "sqlparse"
+version = "1.0.0"
+
+# Text in, text out. Opens nothing.
+capabilities = []
+
+[dependencies.sqlescape]
+path = "../sqlescape"
+version = "^1.0.0"

@@ -1,0 +1,24 @@
+[package]
+name = "sql_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.sqlescape]
+path = "../sqlescape"
+version = "^1.0.0"
+
+[dependencies.sqlbuild]
+path = "../sqlbuild"
+version = "^1.0.0"
+
+[dependencies.sqlparse]
+path = "../sqlparse"
+version = "^1.0.0"
+
+[dependencies.dbschema]
+path = "../dbschema"
+version = "^1.0.0"
+
+[dependencies.sqlitefile]
+path = "../sqlitefile"
+version = "^1.0.0"

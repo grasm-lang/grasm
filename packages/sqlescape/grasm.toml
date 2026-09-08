@@ -1,0 +1,6 @@
+[package]
+name = "sqlescape"
+version = "1.0.0"
+
+# Text in, text out. Opens nothing.
+capabilities = []

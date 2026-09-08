@@ -1,0 +1,10 @@
+[package]
+name = "etag"
+version = "1.0.0"
+
+# Text in, a decision out. Opens nothing.
+capabilities = []
+
+[dependencies.crypto_hash]
+path = "../crypto_hash"
+version = "^1.0.0"

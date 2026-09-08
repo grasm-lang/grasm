@@ -1,0 +1,281 @@
+// Cross-site request forgery: what actually stops it, and what only looks
+// like it does.
+//
+// The attack is one sentence: a page on another origin makes the browser send
+// a request to yours, and the browser attaches your cookies. The server sees a
+// perfectly authenticated request that the user never asked for.
+//
+// Three defences, and this package implements all three because none of them
+// is enough alone:
+//
+// **A token the other origin cannot read.** The synchroniser token — a value
+// held in the session and echoed in the form — is the classic defence. It
+// works because the attacker's page cannot read your session. `token_for` and
+// `check_token`.
+//
+// **A double-submit cookie**, for when there is no server-side session: the
+// same value in a cookie and in the form, compared. Weaker, because a
+// subdomain can set a cookie on the parent domain and forge both halves —
+// which is why the cookie value here is *signed*, so a forged one fails.
+//
+// **`SameSite` and an origin check.** `SameSite=Lax` stops the browser
+// sending the cookie on a cross-site POST at all, which removes most of the
+// attack surface without a token. It is not complete — an older browser
+// ignores it, and a same-site subdomain is still same-site — so the origin
+// check is here too.
+//
+// Two details that are the difference between working and not:
+//
+// **The comparison is constant time.** A token compared byte by byte with an
+// early exit leaks its prefix, and a few thousand requests recover it.
+//
+// **The token is masked per request.** A token that appears verbatim in every
+// response can be recovered by BREACH — compressing a response that contains
+// both the secret and attacker-controlled text leaks the secret through the
+// compressed length. Masking with a fresh random pad each time makes every
+// rendering of the same token different, so there is nothing for the
+// compression to correlate.
+//
+// Safe methods are exempt: `GET`, `HEAD`, `OPTIONS` and `TRACE` are not
+// supposed to change anything, and requiring a token on them breaks every
+// link. If a `GET` in your application does change something, the fix is the
+// `GET`.
+
+import crypto_hash
+import bytes_codec
+
+type CsrfError =
+    | CsrfMissingToken
+    | CsrfBadToken(why: str)
+    | CsrfMismatch
+    | CsrfBadOrigin(origin: str, expected: str)
+    | CsrfNoSecret
+    | CsrfShortRandom(given: i64, needed: i64)
+
+    /// How many bytes of randomness a token carries.
+pub fn token_bytes() -> i64 {
+    return 32
+}
+
+/// The token for a session, derived from a server secret and the session id.
+///
+/// Derived rather than stored: the server keeps one secret, and every
+/// session's token follows from it, so there is nothing per-session to store
+/// or to expire. Changing the session id — which `session.regenerate` does on
+/// login — changes the token, which is exactly what should happen.
+pub fn token_for(secret: bytes, session_id: str) -> str {
+    let mac = crypto_hash.hmac_sha256(secret,
+        ("csrf:" + session_id).to_bytes())
+    return bytes_codec.encode_base64_url(mac)
+}
+
+/// A masked rendering of a token, for putting in a page.
+///
+/// `pad` is fresh randomness from the caller, at least as long as the token.
+/// The rendering is `pad ++ (token XOR pad)`, so it differs every time and
+/// carries the pad needed to undo it. Two renderings of the same token share
+/// no bytes, which is what removes the compression side channel.
+pub fn mask(token: str, pad: bytes) -> str ! CsrfError {
+    let raw = bytes_codec.decode_base64_url(token) ?? "".to_bytes()
+    if raw.len() == 0 {
+        fail(CsrfBadToken("not base64url"))
+    }
+    if pad.len() < raw.len() {
+        fail(CsrfShortRandom(pad.len(), raw.len()))
+    }
+    var out: [i64] = []
+    for i in 0..raw.len() {
+        out.push(pad.at(i))
+    }
+    for i in 0..raw.len() {
+        out.push(raw.at(i).bit_xor(pad.at(i)))
+    }
+    return bytes_codec.encode_base64_url(bytes_of(out))
+}
+
+/// Undo a masked token.
+///
+/// The length is the tell: a masked token is exactly twice the token size,
+/// and a plain one is exactly the token size. Unmasking anything else would
+/// succeed on a plain token of even length and return sixteen bytes of
+/// nonsense, which a comparison would then reject for the wrong reason.
+pub fn unmask(masked: str) -> str ! CsrfError {
+    let raw = bytes_codec.decode_base64_url(masked) ?? "".to_bytes()
+    if raw.len() != token_bytes() * 2 {
+        fail(CsrfBadToken("a masked token is {token_bytes() * 2} bytes"))
+    }
+    let half = raw.len() / 2
+    var out: [i64] = []
+    for i in 0..half {
+        out.push(raw.at(half + i).bit_xor(raw.at(i)))
+    }
+    return bytes_codec.encode_base64_url(bytes_of(out))
+}
+
+/// Whether a submitted token is the one this session should have.
+///
+/// The submitted value may be masked or plain; both are accepted, because a
+/// form rendered before masking was introduced is still in someone's browser.
+pub fn check_token(secret: bytes, session_id: str,
+    submitted: str) -> bool {
+    if submitted == "" {
+        return false
+    }
+    let wanted = token_for(secret, session_id)
+    // Masked or plain, both are accepted: a form rendered before masking was
+    // introduced is still in someone's browser.
+    let plain = unmask(submitted) ?? submitted
+    let a = bytes_codec.decode_base64_url(wanted) ?? "".to_bytes()
+    let b = bytes_codec.decode_base64_url(plain) ?? "".to_bytes()
+    if b.len() == 0 {
+        return false
+    }
+    return crypto_hash.equal_constant_time(a, b)
+}
+
+// ----------------------------------------------------- double submit
+
+/// A signed value for a double-submit cookie.
+///
+/// The signature is what makes this usable: a plain double-submit cookie can
+/// be forged by anything that can set a cookie on the domain, including a
+/// compromised subdomain, because the attacker just sets both halves to the
+/// same value. A signed one cannot be produced without the secret.
+pub fn double_submit_cookie(secret: bytes,
+    nonce: bytes) -> str ! CsrfError {
+    if nonce.len() < 16 {
+        fail(CsrfShortRandom(nonce.len(), 16))
+    }
+    let value = bytes_codec.encode_base64_url(nonce)
+    let mac = crypto_hash.hmac_sha256(secret, value.to_bytes())
+    return value + "." + bytes_codec.encode_base64_url(mac)
+}
+
+/// Whether a cookie value and a form value agree, and the cookie is genuine.
+pub fn check_double_submit(secret: bytes, cookie_value: str,
+    form_value: str) -> bool {
+    if cookie_value == "" or form_value == "" {
+        return false
+    }
+    let parts = cookie_value.split(".")
+    if parts.len() != 2 {
+        return false
+    }
+    let mac = crypto_hash.hmac_sha256(secret, parts[0].to_bytes())
+    let given = bytes_codec.decode_base64_url(parts[1]) ?? "".to_bytes()
+    if not crypto_hash.equal_constant_time(mac, given) {
+        return false
+    }
+    let expected = bytes_codec.decode_base64_url(parts[0]) ?? "".to_bytes()
+    let submitted = bytes_codec.decode_base64_url(form_value) ?? "".to_bytes()
+    // A masked form value is twice the cookie's nonce; anything else is
+    // compared as it is.
+    if submitted.len() == expected.len() * 2 {
+        var plain: [i64] = []
+        for i in 0..expected.len() {
+            plain.push(submitted.at(expected.len() + i).bit_xor(
+                submitted.at(i)))
+        }
+        return crypto_hash.equal_constant_time(expected, bytes_of(plain))
+    }
+    return crypto_hash.equal_constant_time(expected, submitted)
+}
+
+// --------------------------------------------------------- the checks
+
+/// Whether a method needs a token at all.
+pub fn is_safe_method(method: str) -> bool {
+    let m = method.to_upper()
+    return m == "GET" or m == "HEAD" or m == "OPTIONS" or m == "TRACE"
+}
+
+/// The scheme-and-host part of a URL, which is what an origin comparison uses.
+///
+/// The port is part of it, and the path is not. Comparing whole URLs, or
+/// comparing with `starts_with`, is how `https://example.com.attacker.net`
+/// gets accepted as `https://example.com`.
+pub fn origin_of(url: str) -> str {
+    let scheme_end = url.index_of("://") ?? (0 - 1)
+    if scheme_end < 0 {
+        return ""
+    }
+    let rest = url.substr(scheme_end + 3, url.len() - scheme_end - 3)
+    let slash = rest.index_of("/") ?? (0 - 1)
+    let host = if slash < 0 { rest } else { rest.substr(0, slash) }
+    return url.substr(0, scheme_end + 3) + host
+}
+
+/// Whether the request came from the expected origin.
+///
+/// `Origin` is checked first because it is sent on every cross-origin request
+/// and cannot be forged by script. `Referer` is the fallback for the browsers
+/// and configurations that strip `Origin`; it can be absent for privacy
+/// reasons, and an absent `Referer` is not evidence of anything, so it is only
+/// consulted when `Origin` is missing.
+pub fn check_origin(origin: str, referer: str,
+    expected: str) -> bool ! CsrfError {
+    let want = origin_of(expected)
+    if origin != "" {
+        if origin_of(origin) == want or origin == want {
+            return true
+        }
+        fail(CsrfBadOrigin(origin, want))
+    }
+    if referer != "" {
+        if origin_of(referer) == want {
+            return true
+        }
+        fail(CsrfBadOrigin(referer, want))
+    }
+    // Neither header: not proof of an attack, and not proof of safety. The
+    // token check is what decides.
+    return false
+}
+
+/// The whole decision for a request.
+///
+/// A safe method passes. Everything else needs a valid token; the origin check
+/// is a second, independent condition, so a request that passes one and fails
+/// the other is refused.
+pub fn check_request(secret: bytes, session_id: str, method: str,
+    submitted: str, origin: str, referer: str,
+    expected_origin: str) -> bool ! CsrfError {
+    if is_safe_method(method) {
+        return true
+    }
+    if submitted == "" {
+        fail(CsrfMissingToken)
+    }
+    if not check_token(secret, session_id, submitted) {
+        fail(CsrfMismatch)
+    }
+    if origin != "" or referer != "" {
+        if not (try check_origin(origin, referer, expected_origin)) {
+            fail(CsrfBadOrigin(origin, expected_origin))
+        }
+    }
+    return true
+}
+
+/// The hidden field a form needs.
+pub fn form_field(name: str, masked_token: str) -> str {
+    return "<input type=\"hidden\" name=\"" + name + "\" value=\"" +
+    masked_token + "\">"
+}
+
+/// The header name a fetch-based client should send it in.
+///
+/// A custom header is itself a partial defence: a cross-origin request that
+/// sets one triggers a CORS preflight, which the attacker's origin will fail.
+pub fn header_name() -> str {
+    return "X-CSRF-Token"
+}
+
+/// The cookie attributes a CSRF cookie needs.
+///
+/// Not `HttpOnly`: a double-submit cookie has to be readable by the page's own
+/// script to be echoed back. That is the trade the pattern makes, and it is
+/// why the value is signed and carries no session information.
+pub fn cookie_attributes() -> str {
+    return "Path=/; Secure; SameSite=Lax"
+}

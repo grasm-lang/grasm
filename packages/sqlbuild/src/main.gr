@@ -1,0 +1,528 @@
+// Building SQL statements, with the values kept out of the text.
+//
+// Every builder here produces two things: a query string with placeholders in
+// it, and the list of values those placeholders stand for. They are returned
+// together and never joined, because joining them is the bug this package
+// exists to make impossible — a value that reaches the driver as a separate
+// argument cannot become syntax, whatever it contains.
+//
+// That is also why there is no `raw` method that takes a formatted string. A
+// builder with an escape hatch is a builder that will be used through the
+// escape hatch.
+//
+// Two design decisions worth stating.
+//
+// **Placeholders are numbered by the dialect.** PostgreSQL wants `$1`, `$2`;
+// SQLite and MySQL want `?` in order. The builder tracks the count so a
+// `WHERE` clause added after a `SET` clause gets the right numbers — which is
+// exactly the arithmetic that goes wrong when a query is assembled by hand.
+//
+// **The mutating methods cannot fail; `build` can.** Adding a condition
+// records what was asked for and validates nothing, so a caller chains calls
+// without a `try` on each one, and every refusal — a bad identifier, an empty
+// `IN` list, a missing table — arrives at one place with the whole query in
+// view.
+//
+// **An empty `IN ()` is refused rather than written.** `x IN ()` is a syntax
+// error in PostgreSQL and MySQL, and in SQLite it is a condition that is never
+// true — three dialects, three behaviours, none of them what the caller meant
+// by "match nothing". Refusing says so at the point the mistake was made.
+
+import sqlescape
+
+/// A finished statement: the text, and the values its placeholders stand for.
+type SqlQuery = {
+    text: str,
+    value: [str],
+    dialect: SqlDialect,
+}
+
+/// One condition in a `WHERE` or `HAVING` clause.
+///
+/// Held structured rather than as text, so the names are quoted once at
+/// `build` time and the mutators that add them cannot fail.
+type SqlCondition =
+    | CondCompare(name: str, operator: str, slot: i64)
+    | CondNull(name: str, is_null: bool)
+    | CondIn(name: str, from: i64, count: i64)
+    | CondLike(name: str, slot: i64)
+    | CondHaving(expression: str, operator: str, slot: i64)
+
+type SqlJoin = {
+    kind: str,
+    table: str,
+    left: str,
+    right: str,
+}
+
+type SqlOrder = {
+    name: str,
+    descending: bool,
+}
+
+/// A `SELECT` under construction.
+type SqlSelect = {
+    dialect: SqlDialect,
+    columns: [str],
+    table: str,
+    joins: [SqlJoin],
+    conditions: [SqlCondition],
+    values: [str],
+    grouping: [str],
+    havings: [SqlCondition],
+    ordering: [SqlOrder],
+    limit: i64,
+    offset: i64,
+    distinct: bool,
+}
+
+type SqlBuildError =
+    | SqlNoTable
+    | SqlNoColumns
+    | SqlEmptyInList(column: str)
+    | SqlNoAssignments
+    | SqlBadIdentifier(name: str)
+    | SqlLengthMismatch(columns: i64, values: i64)
+
+fn quoted(d: SqlDialect, name: str) -> str ! SqlBuildError {
+    match sqlescape.quote_identifier(d, name) {
+        Ok(q) -> return q
+        Err(_e) -> fail(SqlBadIdentifier(name))
+    }
+}
+
+fn qualified(d: SqlDialect, name: str) -> str ! SqlBuildError {
+    match sqlescape.quote_qualified(d, name) {
+        Ok(q) -> return q
+        Err(_e) -> fail(SqlBadIdentifier(name))
+    }
+}
+
+// -------------------------------------------------------------- SELECT
+
+pub fn select_from(d: SqlDialect, table: str) -> SqlSelect {
+    return SqlSelect{
+        dialect: d,
+        columns: [],
+        table: table,
+        joins: [],
+        conditions: [],
+        values: [],
+        grouping: [],
+        havings: [],
+        ordering: [],
+        limit: 0 - 1,
+        offset: 0,
+        distinct: false,
+    }
+}
+
+pub fn column(inout s: SqlSelect, name: str) {
+    s.columns.push(name)
+}
+
+pub fn columns(inout s: SqlSelect, names: [str]) {
+    for name in names {
+        s.columns.push(name)
+    }
+}
+
+pub fn distinct(inout s: SqlSelect) {
+    s.distinct = true
+}
+
+/// `INNER JOIN other ON left = right`, with every name quoted at build time.
+pub fn join(inout s: SqlSelect, kind: str, other: str, left: str, right: str) {
+    s.joins.push(SqlJoin{ kind: kind, table: other, left: left,
+        right: right })
+}
+
+/// `column = ?`, with the value bound.
+pub fn where_equals(inout s: SqlSelect, name: str, value: str) {
+    where_compare(s, name, "=", value)
+}
+
+/// Any comparison operator, with the value bound.
+///
+/// The operator is not escaped and not checked against a list: it is the
+/// caller's, and a caller that passes user input as an operator has a problem
+/// no library can fix. Everything that *can* be a value is one.
+pub fn where_compare(inout s: SqlSelect, name: str, operator: str,
+    value: str) {
+    s.values.push(value)
+    s.conditions.push(CondCompare(name, operator, s.values.len()))
+}
+
+/// `column IS NULL`, which is not `column = NULL`.
+///
+/// `= NULL` is never true, not even when the column is null: comparison with
+/// null is null, and null is not true. This is the single most common SQL
+/// mistake and the reason there is no way to bind a null through
+/// `where_equals` here.
+pub fn where_null(inout s: SqlSelect, name: str, is_null: bool) {
+    s.conditions.push(CondNull(name, is_null))
+}
+
+/// `column IN (?, ?, ?)`, with every value bound.
+pub fn where_in(inout s: SqlSelect, name: str, values: [str]) {
+    let from = s.values.len() + 1
+    for v in values {
+        s.values.push(v)
+    }
+    s.conditions.push(CondIn(name, from, values.len()))
+}
+
+/// A substring search, with the pattern's own wildcards made literal.
+pub fn where_contains(inout s: SqlSelect, name: str, text: str) {
+    s.values.push("%" + sqlescape.escape_like(text, "\\") + "%")
+    s.conditions.push(CondLike(name, s.values.len()))
+}
+
+pub fn group_by(inout s: SqlSelect, name: str) {
+    s.grouping.push(name)
+}
+
+/// A `HAVING` condition, with its value bound.
+pub fn having(inout s: SqlSelect, expression: str, operator: str,
+    value: str) {
+    s.values.push(value)
+    s.havings.push(CondHaving(expression, operator, s.values.len()))
+}
+
+pub fn order_by(inout s: SqlSelect, name: str, descending: bool) {
+    s.ordering.push(SqlOrder{ name: name, descending: descending })
+}
+
+/// A row limit, and where to start.
+///
+/// `LIMIT` without `ORDER BY` returns an arbitrary subset — arbitrary, not
+/// random and not the first rows inserted — and the set can change between two
+/// runs of the same query. `limit_without_order` reports that, so a caller or
+/// a lint can refuse it.
+pub fn limit(inout s: SqlSelect, rows: i64, from: i64) {
+    s.limit = rows
+    s.offset = from
+}
+
+/// Whether this query asks for a limited number of rows in no defined order.
+pub fn limit_without_order(s: SqlSelect) -> bool {
+    return s.limit >= 0 and s.ordering.len() == 0
+}
+
+fn condition_sql(d: SqlDialect, c: SqlCondition) -> str ! SqlBuildError {
+    match c {
+        CondCompare(name, operator, slot) -> {
+            let left = try qualified(d, name)
+            return left + " " + operator + " " + sqlescape.placeholder(d, slot)
+        }
+        CondNull(name, is_null) -> {
+            let left = try qualified(d, name)
+            if is_null {
+                return left + " IS NULL"
+            }
+            return left + " IS NOT NULL"
+        }
+        CondIn(name, from, count) -> {
+            if count == 0 {
+                fail(SqlEmptyInList(name))
+            }
+            let left = try qualified(d, name)
+            return left + " IN (" + sqlescape.placeholders(d, count, from) + ")"
+        }
+        CondLike(name, slot) -> {
+            let left = try qualified(d, name)
+            return left + " LIKE " + sqlescape.placeholder(d, slot) +
+            " ESCAPE '\\'"
+        }
+        CondHaving(expression, operator, slot) -> {
+            return expression + " " + operator + " " +
+            sqlescape.placeholder(d, slot)
+        }
+    }
+}
+
+pub fn build(s: SqlSelect) -> SqlQuery ! SqlBuildError {
+    if s.table == "" {
+        fail(SqlNoTable)
+    }
+    var text = "SELECT "
+    if s.distinct {
+        text = text + "DISTINCT "
+    }
+    if s.columns.len() == 0 {
+        text = text + "*"
+    } else {
+        var parts: [str] = []
+        for name in s.columns {
+            parts.push(try qualified(s.dialect, name))
+        }
+        text = text + parts.join(", ")
+    }
+    text = text + " FROM " + (try qualified(s.dialect, s.table))
+    for j in s.joins {
+        text = text + " " + j.kind + " JOIN " +
+        (try qualified(s.dialect, j.table)) + " ON " +
+        (try qualified(s.dialect, j.left)) + " = " +
+        (try qualified(s.dialect, j.right))
+    }
+    if s.conditions.len() > 0 {
+        var parts: [str] = []
+        for c in s.conditions {
+            parts.push(try condition_sql(s.dialect, c))
+        }
+        text = text + " WHERE " + parts.join(" AND ")
+    }
+    if s.grouping.len() > 0 {
+        var parts: [str] = []
+        for name in s.grouping {
+            parts.push(try qualified(s.dialect, name))
+        }
+        text = text + " GROUP BY " + parts.join(", ")
+    }
+    if s.havings.len() > 0 {
+        var parts: [str] = []
+        for c in s.havings {
+            parts.push(try condition_sql(s.dialect, c))
+        }
+        text = text + " HAVING " + parts.join(" AND ")
+    }
+    if s.ordering.len() > 0 {
+        var parts: [str] = []
+        for o in s.ordering {
+            parts.push((try qualified(s.dialect, o.name)) +
+                (if o.descending { " DESC" } else { " ASC" }))
+        }
+        text = text + " ORDER BY " + parts.join(", ")
+    }
+    if s.limit >= 0 {
+        text = text + " LIMIT {s.limit}"
+        if s.offset > 0 {
+            text = text + " OFFSET {s.offset}"
+        }
+    }
+    return SqlQuery{ text: text, value: s.values, dialect: s.dialect }
+}
+
+// ------------------------------------------------- INSERT, UPDATE, DELETE
+
+pub fn insert(d: SqlDialect, table: str, names: [str],
+    values: [str]) -> SqlQuery ! SqlBuildError {
+    if names.len() == 0 {
+        fail(SqlNoColumns)
+    }
+    if names.len() != values.len() {
+        fail(SqlLengthMismatch(names.len(), values.len()))
+    }
+    var quoted_names: [str] = []
+    for name in names {
+        quoted_names.push(try quoted(d, name))
+    }
+    let text = "INSERT INTO " + (try qualified(d, table)) + " (" +
+    quoted_names.join(", ") + ") VALUES (" +
+    sqlescape.placeholders(d, values.len(), 1) + ")"
+    return SqlQuery{ text: text, value: values, dialect: d }
+}
+
+/// One statement inserting several rows.
+///
+/// One statement rather than a loop: a thousand single-row inserts are a
+/// thousand round trips, and on a network with 1 ms of latency that is a
+/// second of waiting for work that takes microseconds.
+pub fn insert_many(d: SqlDialect, table: str, names: [str],
+    rows: [[str]]) -> SqlQuery ! SqlBuildError {
+    if names.len() == 0 {
+        fail(SqlNoColumns)
+    }
+    if rows.len() == 0 {
+        fail(SqlEmptyInList(table))
+    }
+    var quoted_names: [str] = []
+    for name in names {
+        quoted_names.push(try quoted(d, name))
+    }
+    var values: [str] = []
+    var groups: [str] = []
+    for row in rows {
+        if row.len() != names.len() {
+            fail(SqlLengthMismatch(names.len(), row.len()))
+        }
+        let from = values.len() + 1
+        for v in row {
+            values.push(v)
+        }
+        groups.push("(" + sqlescape.placeholders(d, row.len(), from) + ")")
+    }
+    let text = "INSERT INTO " + (try qualified(d, table)) + " (" +
+    quoted_names.join(", ") + ") VALUES " + groups.join(", ")
+    return SqlQuery{ text: text, value: values, dialect: d }
+}
+
+/// `UPDATE ... SET ... WHERE ...`, with every value bound.
+///
+/// The `WHERE` clause is not optional. An `UPDATE` with no `WHERE` changes
+/// every row in the table, and the number of times that has been done by
+/// accident is the reason it is a required argument here rather than a
+/// defaulted one.
+pub fn update(d: SqlDialect, table: str, names: [str], values: [str],
+    where_names: [str], where_values: [str]) -> SqlQuery ! SqlBuildError {
+    if names.len() == 0 {
+        fail(SqlNoAssignments)
+    }
+    if names.len() != values.len() {
+        fail(SqlLengthMismatch(names.len(), values.len()))
+    }
+    if where_names.len() == 0 {
+        fail(SqlEmptyInList(table))
+    }
+    if where_names.len() != where_values.len() {
+        fail(SqlLengthMismatch(where_names.len(), where_values.len()))
+    }
+    var bound: [str] = []
+    var sets: [str] = []
+    for i in 0..names.len() {
+        bound.push(values[i])
+        sets.push((try quoted(d, names[i])) + " = " +
+            sqlescape.placeholder(d, bound.len()))
+    }
+    var conditions: [str] = []
+    for i in 0..where_names.len() {
+        bound.push(where_values[i])
+        conditions.push((try quoted(d, where_names[i])) + " = " +
+            sqlescape.placeholder(d, bound.len()))
+    }
+    let text = "UPDATE " + (try qualified(d, table)) + " SET " +
+    sets.join(", ") + " WHERE " + conditions.join(" AND ")
+    return SqlQuery{ text: text, value: bound, dialect: d }
+}
+
+/// `DELETE FROM ... WHERE ...`, and the `WHERE` is required for the same
+/// reason.
+pub fn delete_from(d: SqlDialect, table: str, where_names: [str],
+    where_values: [str]) -> SqlQuery ! SqlBuildError {
+    if where_names.len() == 0 {
+        fail(SqlEmptyInList(table))
+    }
+    if where_names.len() != where_values.len() {
+        fail(SqlLengthMismatch(where_names.len(), where_values.len()))
+    }
+    var bound: [str] = []
+    var conditions: [str] = []
+    for i in 0..where_names.len() {
+        bound.push(where_values[i])
+        conditions.push((try quoted(d, where_names[i])) + " = " +
+            sqlescape.placeholder(d, bound.len()))
+    }
+    let text = "DELETE FROM " + (try qualified(d, table)) + " WHERE " +
+    conditions.join(" AND ")
+    return SqlQuery{ text: text, value: bound, dialect: d }
+}
+
+/// `INSERT ... ON CONFLICT DO UPDATE`, in the dialect's own spelling.
+///
+/// The same operation has three syntaxes: PostgreSQL and SQLite say
+/// `ON CONFLICT (key) DO UPDATE SET`, and MySQL says
+/// `ON DUPLICATE KEY UPDATE` with no key list at all — it uses whichever
+/// unique index the row collided with, which is a different guarantee.
+pub fn upsert(d: SqlDialect, table: str, names: [str], values: [str],
+    conflict: [str]) -> SqlQuery ! SqlBuildError {
+    let base = try insert(d, table, names, values)
+    var updates: [str] = []
+    for name in names {
+        var conflicting = false
+        for k in conflict {
+            if k == name {
+                conflicting = true
+            }
+        }
+        if not conflicting {
+            let q = try quoted(d, name)
+            match d {
+                SqlMysql -> updates.push(q + " = VALUES(" + q + ")")
+                _ -> updates.push(q + " = excluded." + q)
+            }
+        }
+    }
+    if updates.len() == 0 {
+        match d {
+            SqlMysql -> return SqlQuery{ text: base.text + " ON DUPLICATE " +
+                "KEY UPDATE " + (try quoted(d, names[0])) + " = " +
+                (try quoted(d, names[0])), value: base.value, dialect: d }
+            _ -> {
+                var keys: [str] = []
+                for k in conflict {
+                    keys.push(try quoted(d, k))
+                }
+                return SqlQuery{ text: base.text + " ON CONFLICT (" +
+                    keys.join(", ") + ") DO NOTHING", value: base.value,
+                    dialect: d }
+            }
+        }
+    }
+    match d {
+        SqlMysql -> return SqlQuery {
+            text: base.text + " ON DUPLICATE KEY UPDATE " +
+            updates.join(", "),
+            value: base.value, dialect: d }
+        _ -> {
+            var keys: [str] = []
+            for k in conflict {
+                keys.push(try quoted(d, k))
+            }
+            return SqlQuery{
+                text: base.text + " ON CONFLICT (" + keys.join(", ") +
+                ") DO UPDATE SET " + updates.join(", "),
+                value: base.value, dialect: d }
+        }
+    }
+}
+
+/// The query with its values substituted, for a log or an error message.
+///
+/// **Not for execution.** The point of this package is that the values never
+/// enter the text; this function puts them in, so what it returns is a
+/// readable record of what ran and not something to send to a database. It is
+/// named to say so.
+///
+/// It only understands queries this package built, which contain no string
+/// literals of their own — so a `?` in the text is always a placeholder. That
+/// is not true of SQL in general, which is another reason not to use this for
+/// anything but a log line.
+pub fn preview(q: SqlQuery) -> str ! SqlBuildError {
+    match q.dialect {
+        SqlPostgres -> {
+            // Numbered placeholders are replaced from the highest down, so
+            // that substituting `$1` cannot corrupt `$10`.
+            var out = q.text
+            var i = q.value.len()
+            while i >= 1 {
+                out = out.replace(sqlescape.placeholder(q.dialect, i),
+                    try literal(q.dialect, q.value[i - 1]))
+                i = i - 1
+            }
+            return out
+        }
+        _ -> {
+            // `?` is the same everywhere it appears, so the replacement has
+            // to be positional: replacing all of them at once gives every
+            // placeholder the first value, which is a log line that lies.
+            var out = ""
+            var slot = 0
+            for c in q.text.chars() {
+                if c == "?" and slot < q.value.len() {
+                    out = out + (try literal(q.dialect, q.value[slot]))
+                    slot = slot + 1
+                } else {
+                    out = out + c
+                }
+            }
+            return out
+        }
+    }
+}
+
+fn literal(d: SqlDialect, value: str) -> str ! SqlBuildError {
+    match sqlescape.quote_string(d, value) {
+        Ok(s) -> return s
+        Err(_e) -> fail(SqlBadIdentifier(value))
+    }
+}

@@ -1,0 +1,653 @@
+// A schema described once and emitted as DDL for each dialect, plus the diff
+// between two schemas.
+//
+// The diff is the point. A migration written by hand against a schema that has
+// drifted produces a database that no longer matches anything, and the usual
+// discovery is a `NOT NULL` violation in production. `difference` compares two
+// schemas and says what changed, in the order the changes have to be applied;
+// `migration` turns that into statements.
+//
+// Three things it will not do, and says so rather than guessing:
+//
+// **It will not drop a column silently.** A dropped column is data loss, so
+// `difference` reports it as a change with `destructive` set, and
+// `migration` emits it only when asked. A tool that emits `DROP COLUMN`
+// automatically is a tool that deletes a production column because someone
+// renamed a field.
+//
+// **It will not rename.** A rename is indistinguishable from a drop and an add
+// when all you have is two schemas — there is no information in either one
+// that says the new column is the old one. Renames have to be told, not
+// inferred, and inferring them from a type match is how a migration tool moves
+// data into the wrong column.
+//
+// **It will not narrow a type.** `VARCHAR(200)` to `VARCHAR(50)` truncates,
+// and the statement to do it succeeds on some engines and fails on others.
+// It is reported as destructive.
+//
+// Types are named abstractly and spelled per dialect, because the differences
+// are not cosmetic: `SERIAL` is PostgreSQL's, `AUTO_INCREMENT` is MySQL's,
+// SQLite wants `INTEGER PRIMARY KEY` exactly, and a boolean is a `TINYINT`
+// in one and a real type in another.
+
+import sqlescape
+import sqlparse
+
+type DbType =
+    | DbInt
+    | DbBigInt
+    | DbSerial
+    | DbText
+    | DbVarchar(length: i64)
+    | DbBool
+    | DbDouble
+    | DbDecimal(precision: i64, scale: i64)
+    | DbTimestamp
+    | DbDate
+    | DbBlob
+    | DbUuid
+    | DbJson
+
+type DbColumn = {
+    name: str,
+    kind: DbType,
+    nullable: bool,
+    default_text: str,
+    primary: bool,
+    unique: bool,
+}
+
+type DbIndex = {
+    name: str,
+    columns: [str],
+    unique: bool,
+}
+
+type DbForeignKey = {
+    name: str,
+    columns: [str],
+    references_table: str,
+    references_columns: [str],
+    on_delete: str,
+}
+
+type DbTable = {
+    name: str,
+    column: [DbColumn],
+    index: [DbIndex],
+    foreign_key: [DbForeignKey],
+}
+
+type DbSchema = {
+    table: [DbTable],
+}
+
+/// One difference between two schemas.
+type DbChange = {
+    kind: str,
+    table: str,
+    detail: str,
+    destructive: bool,
+}
+
+type DbSchemaError =
+    | DbNoColumns(table: str)
+    | DbNoPrimaryKey(table: str)
+    | DbDuplicateColumn(table: str, name: str)
+    | DbUnknownColumn(table: str, name: str)
+    | DbBadName(name: str)
+    | DbMissingTable(name: str)
+
+pub fn column(name: str, kind: DbType) -> DbColumn {
+    return DbColumn{ name: name, kind: kind, nullable: true,
+        default_text: "", primary: false, unique: false }
+}
+
+pub fn required(c: DbColumn) -> DbColumn {
+    return DbColumn{ name: c.name, kind: c.kind, nullable: false,
+        default_text: c.default_text, primary: c.primary, unique: c.unique }
+}
+
+pub fn primary_key(c: DbColumn) -> DbColumn {
+    return DbColumn{ name: c.name, kind: c.kind, nullable: false,
+        default_text: c.default_text, primary: true, unique: c.unique }
+}
+
+pub fn unique(c: DbColumn) -> DbColumn {
+    return DbColumn{ name: c.name, kind: c.kind, nullable: c.nullable,
+        default_text: c.default_text, primary: c.primary, unique: true }
+}
+
+/// A default, written as SQL text.
+///
+/// Text rather than a value, because a default is often an expression —
+/// `CURRENT_TIMESTAMP`, `gen_random_uuid()`, `nextval(...)` — and a package
+/// that took only literals could not express the defaults that matter.
+pub fn with_default(c: DbColumn, sql: str) -> DbColumn {
+    return DbColumn{ name: c.name, kind: c.kind, nullable: c.nullable,
+        default_text: sql, primary: c.primary, unique: c.unique }
+}
+
+pub fn table(name: str, columns: [DbColumn]) -> DbTable {
+    return DbTable{ name: name, column: columns, index: [], foreign_key: [] }
+}
+
+pub fn with_index(t: DbTable, name: str, columns: [str],
+    is_unique: bool) -> DbTable {
+    var out = t
+    out.index.push(DbIndex{ name: name, columns: columns, unique: is_unique })
+    return out
+}
+
+pub fn with_foreign_key(t: DbTable, name: str, columns: [str],
+    other: str, other_columns: [str], on_delete: str) -> DbTable {
+    var out = t
+    out.foreign_key.push(DbForeignKey{ name: name, columns: columns,
+        references_table: other, references_columns: other_columns,
+        on_delete: on_delete })
+    return out
+}
+
+pub fn schema(tables: [DbTable]) -> DbSchema {
+    return DbSchema{ table: tables }
+}
+
+/// The type's spelling in a dialect.
+///
+/// Every one of these differs for a reason worth knowing. `SERIAL` is a
+/// PostgreSQL macro for an integer with a sequence default; MySQL spells the
+/// same thing `AUTO_INCREMENT`; SQLite gives it only to a column declared
+/// exactly `INTEGER PRIMARY KEY`, which is why the type name alone is not
+/// enough there. A boolean is a real type in PostgreSQL, a `TINYINT(1)` in
+/// MySQL, and nothing at all in SQLite.
+pub fn type_sql(d: SqlDialect, t: DbType) -> str {
+    match t {
+        DbInt -> return "INTEGER"
+        DbBigInt -> return "BIGINT"
+        DbSerial -> {
+            match d {
+                SqlPostgres -> return "SERIAL"
+                SqlMysql -> return "INTEGER AUTO_INCREMENT"
+                _ -> return "INTEGER"
+            }
+        }
+        DbText -> {
+            match d {
+                SqlMysql -> return "LONGTEXT"
+                _ -> return "TEXT"
+            }
+        }
+        DbVarchar(length) -> return "VARCHAR({length})"
+        DbBool -> {
+            match d {
+                SqlPostgres -> return "BOOLEAN"
+                SqlStandard -> return "BOOLEAN"
+                SqlMysql -> return "TINYINT(1)"
+                _ -> return "INTEGER"
+            }
+        }
+        DbDouble -> return "DOUBLE PRECISION"
+        DbDecimal(precision, scale) -> return "DECIMAL({precision}, {scale})"
+        DbTimestamp -> {
+            match d {
+                SqlPostgres -> return "TIMESTAMPTZ"
+                SqlMysql -> return "DATETIME"
+                _ -> return "TIMESTAMP"
+            }
+        }
+        DbDate -> return "DATE"
+        DbBlob -> {
+            match d {
+                SqlPostgres -> return "BYTEA"
+                SqlMysql -> return "LONGBLOB"
+                _ -> return "BLOB"
+            }
+        }
+        DbUuid -> {
+            match d {
+                SqlPostgres -> return "UUID"
+                SqlMysql -> return "CHAR(36)"
+                _ -> return "TEXT"
+            }
+        }
+        DbJson -> {
+            match d {
+                SqlPostgres -> return "JSONB"
+                SqlMysql -> return "JSON"
+                _ -> return "TEXT"
+            }
+        }
+    }
+}
+
+pub fn type_name(t: DbType) -> str {
+    match t {
+        DbInt -> return "int"
+        DbBigInt -> return "bigint"
+        DbSerial -> return "serial"
+        DbText -> return "text"
+        DbVarchar(length) -> return "varchar({length})"
+        DbBool -> return "bool"
+        DbDouble -> return "double"
+        DbDecimal(precision, scale) -> return "decimal({precision},{scale})"
+        DbTimestamp -> return "timestamp"
+        DbDate -> return "date"
+        DbBlob -> return "blob"
+        DbUuid -> return "uuid"
+        DbJson -> return "json"
+    }
+}
+
+fn quoted(d: SqlDialect, name: str) -> str ! DbSchemaError {
+    match sqlescape.quote_identifier(d, name) {
+        Ok(q) -> return q
+        Err(_e) -> fail(DbBadName(name))
+    }
+}
+
+fn column_sql(d: SqlDialect, t: DbTable, c: DbColumn) -> str ! DbSchemaError {
+    var out = (try quoted(d, c.name)) + " " + type_sql(d, c.kind)
+    // SQLite gives a rowid alias only to `INTEGER PRIMARY KEY`, written
+    // exactly that way and on a single-column key — so the primary key has to
+    // be inline there rather than a table constraint.
+    match d {
+        SqlSqlite -> {
+            if c.primary and single_primary(t) {
+                out = out + " PRIMARY KEY"
+                match c.kind {
+                    DbSerial -> out = out + " AUTOINCREMENT"
+                    _ -> {}
+                }
+            }
+        }
+        _ -> {}
+    }
+    if not c.nullable {
+        out = out + " NOT NULL"
+    }
+    if c.unique and not c.primary {
+        out = out + " UNIQUE"
+    }
+    if c.default_text != "" {
+        out = out + " DEFAULT " + c.default_text
+    }
+    return out
+}
+
+fn single_primary(t: DbTable) -> bool {
+    var n = 0
+    for c in t.column {
+        if c.primary {
+            n = n + 1
+        }
+    }
+    return n == 1
+}
+
+/// `CREATE TABLE`, in the dialect's spelling.
+pub fn create_table(d: SqlDialect, t: DbTable) -> str ! DbSchemaError {
+    if t.column.len() == 0 {
+        fail(DbNoColumns(t.name))
+    }
+    var seen: [str] = []
+    var parts: [str] = []
+    for c in t.column {
+        for s in seen {
+            if s == c.name {
+                fail(DbDuplicateColumn(t.name, c.name))
+            }
+        }
+        seen.push(c.name)
+        parts.push("    " + (try column_sql(d, t, c)))
+    }
+    var keys: [str] = []
+    for c in t.column {
+        if c.primary {
+            keys.push(try quoted(d, c.name))
+        }
+    }
+    var inline_key = keys.len() > 0
+    match d {
+        SqlSqlite -> inline_key = keys.len() > 1
+        _ -> {}
+    }
+    if inline_key {
+        parts.push("    PRIMARY KEY (" + keys.join(", ") + ")")
+    }
+    for k in t.foreign_key {
+        parts.push("    " + (try foreign_key_sql(d, k)))
+    }
+    return "CREATE TABLE " + (try quoted(d, t.name)) + " (\n" +
+    parts.join(",\n") + "\n)"
+}
+
+fn foreign_key_sql(d: SqlDialect, k: DbForeignKey) -> str ! DbSchemaError {
+    var mine: [str] = []
+    for c in k.columns {
+        mine.push(try quoted(d, c))
+    }
+    var theirs: [str] = []
+    for c in k.references_columns {
+        theirs.push(try quoted(d, c))
+    }
+    var out = "CONSTRAINT " + (try quoted(d, k.name)) + " FOREIGN KEY (" +
+    mine.join(", ") + ") REFERENCES " +
+    (try quoted(d, k.references_table)) + " (" + theirs.join(", ") + ")"
+    if k.on_delete != "" {
+        out = out + " ON DELETE " + k.on_delete
+    }
+    return out
+}
+
+/// The `CREATE INDEX` statements for a table.
+pub fn create_indexes(d: SqlDialect, t: DbTable) -> [str] ! DbSchemaError {
+    var out: [str] = []
+    for i in t.index {
+        var names: [str] = []
+        for c in i.columns {
+            var found = false
+            for existing in t.column {
+                if existing.name == c {
+                    found = true
+                }
+            }
+            if not found {
+                fail(DbUnknownColumn(t.name, c))
+            }
+            names.push(try quoted(d, c))
+        }
+        let head = if i.unique { "CREATE UNIQUE INDEX " } else {
+            "CREATE INDEX " }
+        out.push(head + (try quoted(d, i.name)) + " ON " +
+            (try quoted(d, t.name)) + " (" + names.join(", ") + ")")
+    }
+    return out
+}
+
+/// Every statement needed to build a schema, in dependency order.
+///
+/// Tables that a foreign key points at come first, because a database that
+/// checks constraints at creation time will refuse the other order. The sort
+/// is a topological one over the foreign keys; a cycle is left in the input
+/// order, since a cycle cannot be created in any order and needs a deferred
+/// constraint the caller has to add.
+pub fn create_schema(d: SqlDialect, s: DbSchema) -> [str] ! DbSchemaError {
+    var out: [str] = []
+    for t in try ordered_tables(s) {
+        out.push(try create_table(d, t))
+        for i in try create_indexes(d, t) {
+            out.push(i)
+        }
+    }
+    return out
+}
+
+fn ordered_tables(s: DbSchema) -> [DbTable] ! DbSchemaError {
+    var out: [DbTable] = []
+    var placed: [str] = []
+    var rounds = 0
+    while out.len() < s.table.len() and rounds <= s.table.len() {
+        for t in s.table {
+            var already = false
+            for p in placed {
+                if p == t.name {
+                    already = true
+                }
+            }
+            if not already and (try dependencies_met(t, placed, s)) {
+                out.push(t)
+                placed.push(t.name)
+            }
+        }
+        rounds = rounds + 1
+    }
+    // Anything left is in a cycle, and goes in its declared order.
+    for t in s.table {
+        var already = false
+        for p in placed {
+            if p == t.name {
+                already = true
+            }
+        }
+        if not already {
+            out.push(t)
+        }
+    }
+    return out
+}
+
+fn dependencies_met(t: DbTable, placed: [str],
+    s: DbSchema) -> bool ! DbSchemaError {
+    for k in t.foreign_key {
+        if k.references_table == t.name {
+            continue
+        }
+        var known = false
+        for other in s.table {
+            if other.name == k.references_table {
+                known = true
+            }
+        }
+        if not known {
+            fail(DbMissingTable(k.references_table))
+        }
+        var ready = false
+        for p in placed {
+            if p == k.references_table {
+                ready = true
+            }
+        }
+        if not ready {
+            return false
+        }
+    }
+    return true
+}
+
+// ------------------------------------------------------------- the diff
+
+/// What changed between two schemas.
+pub fn difference(from: DbSchema, to: DbSchema) -> [DbChange] {
+    var out: [DbChange] = []
+    for t in to.table {
+        match find_table(from, t.name) {
+            None -> out.push(DbChange{ kind: "create table", table: t.name,
+                detail: "", destructive: false })
+            Some(old) -> compare_columns(out, old, t)
+        }
+    }
+    for t in from.table {
+        if find_table(to, t.name) == None {
+            out.push(DbChange{ kind: "drop table", table: t.name, detail: "",
+                destructive: true })
+        }
+    }
+    return out
+}
+
+fn find_table(s: DbSchema, name: str) -> Option[DbTable] {
+    for t in s.table {
+        if t.name == name {
+            return Some(t)
+        }
+    }
+    return None
+}
+
+fn find_column(t: DbTable, name: str) -> Option[DbColumn] {
+    for c in t.column {
+        if c.name == name {
+            return Some(c)
+        }
+    }
+    return None
+}
+
+fn compare_columns(inout out: [DbChange], old: DbTable, fresh: DbTable) {
+    for c in fresh.column {
+        match find_column(old, c.name) {
+            None -> {
+                // Adding a `NOT NULL` column with no default fails on every
+                // existing row, so it is flagged even though nothing is lost.
+                let risky = not c.nullable and c.default_text == ""
+                out.push(DbChange{ kind: "add column", table: fresh.name,
+                    detail: c.name + " " + type_name(c.kind),
+                    destructive: risky })
+            }
+            Some(before) -> compare_column(out, fresh.name, before, c)
+        }
+    }
+    for c in old.column {
+        if find_column(fresh, c.name) == None {
+            out.push(DbChange{ kind: "drop column", table: fresh.name,
+                detail: c.name, destructive: true })
+        }
+    }
+}
+
+fn compare_column(inout out: [DbChange], table: str, before: DbColumn,
+    after: DbColumn) {
+    if type_name(before.kind) != type_name(after.kind) {
+        out.push(DbChange{ kind: "change type", table: table,
+            detail: after.name + ": " + type_name(before.kind) + " -> " +
+            type_name(after.kind),
+            destructive: narrows(before.kind, after.kind) })
+    }
+    if before.nullable and not after.nullable {
+        // Going from nullable to not-null fails if any row holds a null,
+        // which the schema cannot know — so it is always flagged.
+        out.push(DbChange{ kind: "set not null", table: table,
+            detail: after.name, destructive: true })
+    }
+    if not before.nullable and after.nullable {
+        out.push(DbChange{ kind: "drop not null", table: table,
+            detail: after.name, destructive: false })
+    }
+    if before.default_text != after.default_text {
+        out.push(DbChange{ kind: "change default", table: table,
+            detail: after.name + ": " + after.default_text,
+            destructive: false })
+    }
+}
+
+/// Whether the new type can hold less than the old one.
+fn narrows(before: DbType, after: DbType) -> bool {
+    match before {
+        DbVarchar(old) -> {
+            match after {
+                DbVarchar(fresh) -> return fresh < old
+                DbText -> return false
+                _ -> return true
+            }
+        }
+        DbBigInt -> {
+            match after {
+                DbBigInt -> return false
+                DbText -> return false
+                _ -> return true
+            }
+        }
+        DbText -> {
+            match after {
+                DbText -> return false
+                _ -> return true
+            }
+        }
+        _ -> {
+            match after {
+                DbText -> return false
+                _ -> return type_name(before) != type_name(after)
+            }
+        }
+    }
+}
+
+/// The statements for a set of changes.
+///
+/// `allow_destructive` is a parameter and not a setting: dropping a column is
+/// the caller's decision, and a function that silently included it would make
+/// the decision for them.
+pub fn migration(d: SqlDialect, from: DbSchema, to: DbSchema,
+    allow_destructive: bool) -> [str] ! DbSchemaError {
+    var out: [str] = []
+    for change in difference(from, to) {
+        if change.destructive and not allow_destructive {
+            continue
+        }
+        if change.kind == "create table" {
+            match find_table(to, change.table) {
+                Some(t) -> {
+                    out.push(try create_table(d, t))
+                    for i in try create_indexes(d, t) {
+                        out.push(i)
+                    }
+                }
+                None -> {}
+            }
+        }
+        if change.kind == "drop table" {
+            out.push("DROP TABLE " + (try quoted(d, change.table)))
+        }
+        if change.kind == "add column" {
+            match find_table(to, change.table) {
+                Some(t) -> {
+                    match find_column(t, first_word(change.detail)) {
+                        Some(c) -> out.push("ALTER TABLE " +
+                            (try quoted(d, t.name)) + " ADD COLUMN " +
+                            (try column_sql(d, t, c)))
+                        None -> {}
+                    }
+                }
+                None -> {}
+            }
+        }
+        if change.kind == "drop column" {
+            out.push("ALTER TABLE " + (try quoted(d, change.table)) +
+                " DROP COLUMN " + (try quoted(d, change.detail)))
+        }
+    }
+    return out
+}
+
+fn first_word(s: str) -> str {
+    let parts = s.split(" ")
+    if parts.len() == 0 {
+        return s
+    }
+    return parts[0]
+}
+
+/// The changes that would lose data or fail on existing rows.
+pub fn destructive_changes(from: DbSchema, to: DbSchema) -> [DbChange] {
+    var out: [DbChange] = []
+    for change in difference(from, to) {
+        if change.destructive {
+            out.push(change)
+        }
+    }
+    return out
+}
+
+/// The tables a set of statements names, for checking a migration's scope.
+pub fn tables_touched(statements: [str]) -> [str] ! DbSchemaError {
+    var out: [str] = []
+    for s in statements {
+        match sqlparse.tables(s) {
+            Ok(names) -> {
+                for n in names {
+                    var already = false
+                    for existing in out {
+                        if existing == n {
+                            already = true
+                        }
+                    }
+                    if not already {
+                        out.push(n)
+                    }
+                }
+            }
+            Err(_e) -> fail(DbBadName(s))
+        }
+    }
+    return out
+}

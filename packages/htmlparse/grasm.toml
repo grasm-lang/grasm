@@ -1,0 +1,6 @@
+[package]
+name = "htmlparse"
+version = "1.0.0"
+
+# Text in, a tree out. No network, no entity resolution from outside.
+capabilities = []

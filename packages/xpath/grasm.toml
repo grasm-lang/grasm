@@ -1,0 +1,10 @@
+[package]
+name = "xpath"
+version = "1.0.0"
+
+# Text in, nodes out. Opens nothing.
+capabilities = []
+
+[dependencies.xml]
+path = "../xml"
+version = "^1.0.0"

@@ -1,0 +1,439 @@
+import htmlparse
+import cssparse
+import xpath
+import staticfiles
+import rangeheader
+import xml
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+// ---------------------------------------------------------- htmlparse
+
+fn page() -> str {
+    return "<!DOCTYPE html>\n" +
+    "<html lang=\"en\"><head><title>T &amp; T</title>" +
+    "<style>a > b \{ color: red }</style></head>\n" +
+    "<body>\n" +
+    "<!-- a comment -->\n" +
+    "<p>one<p>two\n" +
+    "<ul><li>a<li>b<li>c</ul>\n" +
+    "<img src=\"x.png\" alt=\"an image\">\n" +
+    "<br/>\n" +
+    "<a href=\"/one\" class=\"link big\">first</a>\n" +
+    "<a href='/two' class=big>second</a>\n" +
+    "<div id=\"main\"><span>deep</span></div>\n" +
+    "<input disabled type=checkbox>\n" +
+    "<script>if (a < b && c > d) \{ x(\"</b>\") }</script>\n" +
+    "</div>\n" +
+    "<table><tr><td>1<td>2<tr><td>3</table>\n" +
+    "&copy; 2026 &#65;&#x42; &nope;\n" +
+    "</body></html>"
+}
+
+fn tree() -> [ref HtmlNode] {
+    return htmlparse.parse(page()) ?? []
+}
+
+fn check_html(inout f: i64) / {io} {
+    print("-- htmlparse: void elements, implied end tags, and raw text")
+    // Every count here is what Python's `html.parser` reports for the same
+    // page.
+    say(f, "twenty-five elements, the same as html.parser finds",
+        htmlparse.count(tree()) == 25)
+    say(f, "`<p>one<p>two` is two paragraphs, not one inside another",
+        htmlparse.find_by_tag(tree(), "p").len() == 2 and
+        htmlparse.text_of(htmlparse.find_by_tag(tree(), "p")[0]) == "one")
+    say(f, "three unclosed list items are three siblings, not a staircase",
+        htmlparse.find_by_tag(tree(), "li").len() == 3)
+    say(f, "a table with no closing cell tags still has three cells and two " +
+        "rows",
+        htmlparse.find_by_tag(tree(), "td").len() == 3 and
+        htmlparse.find_by_tag(tree(), "tr").len() == 2)
+    say(f, "a void element has no children and needs no end tag",
+        htmlparse.children_of(htmlparse.first_by_tag(tree(), "img") ??
+            ref(HtmlText(""))).len() == 0 and
+        htmlparse.find_by_tag(tree(), "br").len() == 1)
+    say(f, "and `<br/>` is the same element as `<br>`",
+        htmlparse.is_void("br") and not htmlparse.is_void("div"))
+    // Raw text.
+    say(f, "a `<` inside a script is not a tag",
+        htmlparse.find_by_tag(tree(), "b").len() == 0)
+    say(f, "the script's contents are one run of text",
+        htmlparse.children_of(htmlparse.first_by_tag(tree(), "script") ??
+            ref(HtmlText(""))).len() == 1)
+    say(f, "and a script's text is not part of the page's text",
+        not htmlparse.text_of(tree()[2]).contains("x(\"</b>\")"))
+    say(f, "a stray `</div>` closes nothing",
+        htmlparse.find_by_id(tree(), "main") != None)
+    check_html_more(f)
+}
+
+fn attribute_of(tag: str, name: str) -> str {
+    match htmlparse.first_by_tag(tree(), tag) {
+        Some(n) -> return htmlparse.attribute(n, name) ?? "<absent>"
+        None -> return "<no such element>"
+    }
+}
+
+fn check_html_more(inout f: i64) / {io} {
+    say(f, "a double-quoted attribute is read",
+        attribute_of("img", "alt") == "an image")
+    say(f, "a single-quoted one is",
+        htmlparse.attribute(htmlparse.find_by_tag(tree(), "a")[1], "href") ==
+        Some("/two"))
+    say(f, "an unquoted one is",
+        htmlparse.attribute(htmlparse.find_by_tag(tree(), "a")[1], "class") ==
+        Some("big"))
+    say(f, "and a bare one is present with an empty value, not absent",
+        attribute_of("input", "disabled") == "" and
+        attribute_of("input", "checked") == "<absent>")
+    say(f, "a class attribute holds several names",
+        htmlparse.find_by_class(tree(), "big").len() == 2 and
+        htmlparse.find_by_class(tree(), "link").len() == 1)
+    say(f, "an id finds one element",
+        htmlparse.text_of(htmlparse.find_by_id(tree(), "main") ??
+            ref(HtmlText(""))) == "deep")
+    say(f, "the links come out in order",
+        htmlparse.links(tree()) == ["/one", "/two"])
+    // Entities, against html.unescape.
+    say(f, "named, decimal and hex entities all decode",
+        htmlparse.decode_entities("&copy; 2026 &#65;&#x42;") ==
+        "\u{a9} 2026 AB")
+    say(f, "an unknown entity is left alone, as a browser leaves it",
+        htmlparse.decode_entities("&nope; a &amp;&amp; b") ==
+        "&nope; a && b")
+    say(f, "and a bare ampersand is text",
+        htmlparse.decode_entities("Tom & Jerry") == "Tom & Jerry")
+    say(f, "an entity in an attribute value is decoded too",
+        htmlparse.text_of(htmlparse.first_by_tag(tree(), "title") ??
+            ref(HtmlText(""))) == "T & T")
+    say(f, "escaping is the reverse, and covers the quote characters",
+        htmlparse.escape("<a href=\"x\">&</a>") ==
+        "&lt;a href=&quot;x&quot;&gt;&amp;&lt;/a&gt;")
+    say(f, "a rendered tree parses back to the same element count",
+        htmlparse.count(htmlparse.parse(htmlparse.render(tree())) ?? []) ==
+        htmlparse.count(tree()))
+    say(f, "an unterminated comment is refused",
+        html_refuses("<p>a<!-- never ends"))
+}
+
+fn html_refuses(source: str) -> bool {
+    match htmlparse.parse(source) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+// ----------------------------------------------------------- cssparse
+
+fn sheet() -> str {
+    return "/* a comment */\n" +
+    "@import url(\"other.css\");\n" +
+    "h1, .title \{ color: red; font-size: 2em !important }\n" +
+    "@media (min-width: 600px) \{\n" +
+    "  #main .row > p:not(.skip) \{ margin: 0 auto; }\n" +
+    "  a[href^=\"http\"]::after \{ content: \" (external)\"; }\n" +
+    "}\n"
+}
+
+fn spec_of(selector: str) -> str {
+    return cssparse.to_str(cssparse.specificity(selector))
+}
+
+fn check_css(inout f: i64) / {io} {
+    print("-- cssparse: specificity is a triple, and it is never summed")
+    let rules = cssparse.parse(sheet()) ?? []
+    // `tinycss2` finds the same three rules and the same at-rules.
+    say(f, "three rules, and the ones inside the media query are not lost",
+        rules.len() == 3)
+    say(f, "a comma splits the selectors",
+        rules[0].selectors == ["h1", ".title"])
+    say(f, "an at-rule that holds rules tags them with its condition",
+        rules[1].context == "@media (min-width: 600px)" and
+        rules[0].context == "")
+    say(f, "an at-rule with no block holds none",
+        rules.len() == 3)
+    say(f, "the declarations come out with their values",
+        rules[0].declarations.len() == 2 and
+        rules[0].declarations[0].property == "color" and
+        rules[0].declarations[0].value == "red")
+    say(f, "and `!important` is taken off the value and recorded",
+        rules[0].declarations[1].important and
+        rules[0].declarations[1].value == "2em")
+    say(f, "a string value keeps its spaces",
+        rules[2].declarations[0].value == "\" (external)\"")
+    // The specificity examples from the Selectors specification, verbatim.
+    say(f, "the specification's own examples: * is (0,0,0)",
+        spec_of("*") == "(0,0,0)")
+    say(f, "li is (0,0,1) and ul li is (0,0,2)",
+        spec_of("li") == "(0,0,1)" and spec_of("ul li") == "(0,0,2)")
+    say(f, "ul ol+li is (0,0,3), so a combinator counts for nothing",
+        spec_of("ul ol+li") == "(0,0,3)")
+    say(f, "h1 + *[rel=up] is (0,1,1), so an attribute counts as a class",
+        spec_of("h1 + *[rel=up]") == "(0,1,1)")
+    say(f, "ul ol li.red is (0,1,3) and li.red.level is (0,2,1)",
+        spec_of("ul ol li.red") == "(0,1,3)" and
+        spec_of("li.red.level") == "(0,2,1)")
+    say(f, "#x34y is (1,0,0) and #s12:not(FOO) is (1,0,1)",
+        spec_of("#x34y") == "(1,0,0)" and
+        spec_of("#s12:not(FOO)") == "(1,0,1)")
+    check_css_more(f)
+}
+
+fn check_css_more(inout f: i64) / {io} {
+    say(f, ":is() takes the specificity of its most specific argument",
+        spec_of(".foo :is(.bar, #baz)") == "(1,1,0)")
+    say(f, ":where() takes none at all, argument included",
+        spec_of("li:where(.a, #b)") == "(0,0,1)")
+    say(f, "a pseudo-element counts as a type, not as a class",
+        spec_of("p::before") == "(0,0,2)" and
+        spec_of("p:first-line") == "(0,0,2)")
+    say(f, "and a pseudo-class counts as a class",
+        spec_of("p:hover") == "(0,1,1)")
+    // The comparison, which is the whole point.
+    say(f, "eleven classes lose to one id, because the triple is compared " +
+        "and not summed",
+        cssparse.compare(cssparse.specificity(".a.b.c.d.e.f.g.h.i.j.k"),
+            cssparse.specificity("#one")) < 0)
+    say(f, "and one class beats any number of types",
+        cssparse.compare(cssparse.specificity(".a"),
+            cssparse.specificity("a b c d e f g h i j k")) > 0)
+    // The cascade, in the part a stylesheet can decide.
+    let rules = cssparse.parse(sheet()) ?? []
+    say(f, "the winning declaration for a property is the most specific one",
+        (cssparse.winning(rules, "color") ??
+            CssDeclaration{ property: "", value: "", important: false }
+        ).value == "red")
+    say(f, "an `!important` declaration is found for review",
+        cssparse.important_declarations(rules).len() == 1)
+    say(f, "and every declaration can be listed",
+        cssparse.declarations(rules).len() == 4)
+    // Refusals.
+    say(f, "an unterminated comment is refused",
+        css_refuses("a \{ color: red } /* never ends"))
+    say(f, "an unterminated string is refused",
+        css_refuses("a \{ content: \"never ends }"))
+    say(f, "a `url(` with no closing paren is refused",
+        css_refuses("a \{ background: url(never-ends"))
+}
+
+fn css_refuses(text: str) -> bool {
+    match cssparse.parse(text) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+// -------------------------------------------------------------- xpath
+
+fn document() -> str {
+    return "<library>" +
+    "<shelf id=\"a\"><book isbn=\"1\"><title>One</title>" +
+    "<author>Ada</author></book>" +
+    "<book isbn=\"2\"><title>Two</title><author>Bo</author></book></shelf>" +
+    "<shelf id=\"b\"><book isbn=\"3\"><title>Three</title>" +
+    "<author>Ada</author></book></shelf>" +
+    "</library>"
+}
+
+fn library() -> ref Node {
+    let root = xml.parse(document()) ?? xml.text("")
+    return xml.first_element(root, "library") ?? root
+}
+
+fn selected(path: str) -> [str] {
+    return xpath.select_strings(library(), path) ?? ["<refused>"]
+}
+
+fn check_xpath(inout f: i64) / {io} {
+    print("-- xpath: a predicate on `//` applies per parent")
+    // Every answer here is lxml's for the same document.
+    say(f, "a child path walks down", selected("/shelf/book/title") ==
+        ["One", "Two", "Three"])
+    say(f, "a descendant path finds them anywhere",
+        selected("//title") == ["One", "Two", "Three"])
+    say(f, "an attribute step yields values, not elements",
+        selected("//book/@isbn") == ["1", "2", "3"])
+    say(f, "a predicate on an attribute selects",
+        selected("/shelf[@id='b']/book/title") == ["Three"])
+    // The rule that catches everyone.
+    say(f, "`//book[1]` is the first book under each parent, not the first " +
+        "in the document",
+        selected("//book[1]/title") == ["One", "Three"])
+    say(f, "and `//book[last()]` is the last under each",
+        selected("//book[last()]/title") == ["Two", "Three"])
+    say(f, "which is what lxml gives, and is two nodes rather than one",
+        selected("//book[position()<2]/@isbn") == ["1", "3"])
+    say(f, "a child path's predicate does the same, per parent",
+        selected("/shelf/book[1]/title") == ["One", "Three"])
+    say(f, "a predicate can compare a child's text",
+        selected("//book[author='Ada']/title") == ["One", "Three"])
+    say(f, "or test that an attribute is merely present",
+        selected("//book[@isbn]/title") == ["One", "Two", "Three"])
+    say(f, "a wildcard takes every element child",
+        selected("//shelf/*").len() == 3)
+    say(f, "text() takes the text nodes",
+        selected("//title/text()") == ["One", "Two", "Three"])
+    say(f, "counting is counting", (xpath.count(library(), "//book") ?? 0) == 3)
+    // The refusals.
+    say(f, "the parent axis is refused, because this tree has no parents",
+        not xpath.is_supported("//book/../title") and
+        xpath.why_unsupported("//book/../title").contains("parent axis"))
+    say(f, "a parenthesised path is refused rather than misread",
+        not xpath.is_supported("(//book)[1]"))
+    say(f, "and an unsupported function is named",
+        xpath.why_unsupported("//substring(a)").contains("substring"))
+    say(f, "a supported path says so before any document is loaded",
+        xpath.is_supported("//a[@href]"))
+}
+
+// ------------------------------------------------- staticfiles, ranges
+
+fn resolved(path: str) -> str {
+    match staticfiles.resolve(path, "index.html", false) {
+        Ok(file) -> return file.relative
+        Err(_e) -> return "<refused>"
+    }
+}
+
+fn check_static(inout f: i64) / {io} {
+    print("-- staticfiles: every way `..` can be spelled")
+    say(f, "an ordinary path resolves", resolved("/a/b/c.css") == "a/b/c.css")
+    say(f, "a `.` segment disappears", resolved("/a/./b.png") == "a/b.png")
+    say(f, "a directory becomes its index",
+        resolved("/") == "index.html" and resolved("/dir/") ==
+        "dir/index.html")
+    say(f, "a plain traversal is refused",
+        resolved("/../etc/passwd") == "<refused>")
+    say(f, "one that only escapes after a descent is refused",
+        resolved("/a/../../x") == "<refused>")
+    say(f, "a percent-encoded traversal is refused",
+        resolved("/%2e%2e/secret") == "<refused>")
+    say(f, "a backslash separator is refused too",
+        resolved("/..\\etc") == "<refused>")
+    say(f, "a doubly-encoded one is not a traversal, because it decodes once",
+        resolved("/a%252e%252e/b") == "a%2e%2e/b")
+    say(f, "a NUL byte is refused, because it truncates a path in a C API",
+        resolved("/x%00.png") == "<refused>")
+    say(f, "a dotfile is refused, because `.git` and `.env` get published " +
+        "by accident", resolved("/.git/config") == "<refused>")
+    say(f, "and a content type comes with it",
+        (staticfiles.resolve("/a.css", "index.html", false) ??
+            StaticFile{ relative: "", content_type: "", is_index: false }
+        ).content_type == "text/css")
+    say(f, "an unknown extension is an octet stream, not text",
+        staticfiles.content_type_for("x.zzz") == "application/octet-stream")
+    say(f, "text types get a charset, so the browser does not guess",
+        staticfiles.content_type_header("text/html") ==
+        "text/html; charset=utf-8" and
+        staticfiles.content_type_header("image/png") == "image/png")
+    say(f, "an SVG is served as a download, because it is script",
+        staticfiles.should_download("image/svg+xml"))
+    say(f, "a fingerprinted name can be cached forever",
+        staticfiles.is_fingerprinted("app.9f2c1b3d.js") and
+        staticfiles.cache_control_for("app.9f2c1b3d.js") ==
+        "public, max-age=31536000, immutable")
+    say(f, "and one that is not, cannot",
+        not staticfiles.is_fingerprinted("app.js") and
+        staticfiles.cache_control_for("app.js") ==
+        "public, max-age=0, must-revalidate")
+    check_ranges(f)
+}
+
+fn ranged(header: str) -> str {
+    match rangeheader.parse(header, 10000) {
+        Ok(rs) -> {
+            var parts: [str] = []
+            for r in rs {
+                parts.push("{r.first}-{r.last}")
+            }
+            return parts.join(",")
+        }
+        Err(_e) -> return "<refused>"
+    }
+}
+
+fn check_ranges(inout f: i64) / {io} {
+    print("-- rangeheader: the last byte is included, and `-500` is a suffix")
+    say(f, "a closed range includes both ends",
+        ranged("bytes=0-499") == "0-499" and
+        rangeheader.size_of(ByteRange{ first: 0, last: 499 }) == 500)
+    say(f, "an open range runs to the end", ranged("bytes=500-") ==
+        "500-9999")
+    say(f, "and a suffix range counts backwards from it",
+        ranged("bytes=-500") == "9500-9999")
+    say(f, "a range past the end is clamped, not refused",
+        ranged("bytes=9999-100000") == "9999-9999")
+    say(f, "a range starting past the end is unsatisfiable",
+        ranged("bytes=10000-") == "")
+    say(f, "two ranges are two ranges",
+        ranged("bytes=0-0,-1") == "0-0,9999-9999")
+    say(f, "adjacent ones merge into one",
+        merged("bytes=0-99,100-199") == "0-199")
+    say(f, "and overlapping ones do too",
+        merged("bytes=0-150,100-199") == "0-199")
+    say(f, "a unit that is not bytes is refused",
+        ranged("items=0-5") == "<refused>")
+    say(f, "and so is a backwards range", ranged("bytes=500-100") ==
+        "<refused>")
+    // The statuses.
+    say(f, "no range is a 200",
+        rangeheader.answer("", "", "\"v1\"", 100, 10000).status == 200)
+    say(f, "a satisfiable range is a 206 with a Content-Range",
+        rangeheader.answer("bytes=0-499", "", "\"v1\"", 100, 10000).status ==
+        206 and
+        rangeheader.answer("bytes=0-499", "", "\"v1\"", 100,
+            10000).content_range == "bytes 0-499/10000")
+    say(f, "an unsatisfiable one is a 416 that says how long the resource is",
+        rangeheader.answer("bytes=20000-", "", "\"v1\"", 100, 10000).status ==
+        416 and
+        rangeheader.answer("bytes=20000-", "", "\"v1\"", 100,
+            10000).content_range == "bytes */10000")
+    // If-Range.
+    say(f, "a stale If-Range gives the whole thing, not an error",
+        rangeheader.answer("bytes=0-499", "\"v0\"", "\"v1\"", 100,
+            10000).status == 200)
+    say(f, "a matching one allows the range",
+        rangeheader.answer("bytes=0-499", "\"v1\"", "\"v1\"", 100,
+            10000).status == 206)
+    say(f, "and a weak tag never satisfies If-Range, because a byte range " +
+        "needs identical bytes",
+        not rangeheader.if_range_allows("W/\"v1\"", "W/\"v1\"", 100))
+    say(f, "the Accept-Ranges header is how a client knows it can resume",
+        rangeheader.accept_ranges() == "bytes")
+}
+
+fn merged(header: str) -> str {
+    match rangeheader.parse(header, 10000) {
+        Ok(rs) -> {
+            var parts: [str] = []
+            for r in rangeheader.coalesce(rs) {
+                parts.push("{r.first}-{r.last}")
+            }
+            return parts.join(",")
+        }
+        Err(_e) -> return "<refused>"
+    }
+}
+
+fn main() / {io} {
+    var f = 0
+
+    check_html(f)
+    check_css(f)
+    check_xpath(f)
+    check_static(f)
+
+    if f == 0 {
+        print("web content: every claim held")
+    } else {
+        print("web content: {f} failed")
+    }
+}

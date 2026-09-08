@@ -1,0 +1,226 @@
+// Wrapping a handler, and the two things about a chain that surprise people.
+//
+// A handler is `fn(Request) -> Response`. A middleware is
+// `fn(Request, MwNext) -> Response` — it gets the request and the rest of the
+// chain, and decides whether to call it.
+//
+// **The chain is built inside out.** `wrap([a, b, c], handler)` runs `a`
+// first, and `a` is the *last* one wrapped around the others. Building it in
+// declaration order gives a chain that runs backwards, and the symptom is a
+// logger that reports the response before the request and an authenticator
+// that runs after the thing it was supposed to protect.
+//
+// **A middleware that returns early must not call `next`.** Returning a
+// 401 and then calling the chain anyway runs the handler, does the work, and
+// throws the answer away — the side effects have already happened. Every
+// short-circuit here returns without calling `next`, and `after` exists for
+// the cases where something has to happen on the way out regardless.
+//
+// The middleware here are the ones almost every service ends up writing:
+// a request id, security headers, a method override for HTML forms, a prefix
+// strip for running behind a path-based proxy, a body-size limit, and a
+// timing header. Each is small, and each has a note about the case it exists
+// for.
+
+import http
+
+/// The rest of the chain.
+type MwNext = fn(Request) -> Response
+
+/// One step: it receives the request and the rest of the chain.
+type MwStep = fn(Request, MwNext) -> Response
+
+/// Build a chain. The first step in the list is the outermost.
+///
+/// The list is walked backwards for exactly that reason: each step has to
+/// close over the chain that comes after it, so the innermost is built first.
+pub fn wrap(steps: [MwStep], handler: MwNext) -> MwNext {
+    var chain = handler
+    var i = steps.len() - 1
+    while i >= 0 {
+        let step = steps[i]
+        let rest = chain
+        chain = |request| step(request, rest)
+        i = i - 1
+    }
+    return chain
+}
+
+/// A step that does nothing, for a list that has to have one.
+pub fn passthrough() -> MwStep {
+    return |request, next| next(request)
+}
+
+/// Add a header to whatever the chain returns.
+pub fn add_response_header(name: str, value: str) -> MwStep {
+    return |request, next| http.with_header(next(request), name, value)
+}
+
+/// The headers that cost nothing and prevent a class of bug each.
+///
+/// `X-Content-Type-Options: nosniff` stops a browser guessing that a text file
+/// is HTML and running it. `X-Frame-Options: DENY` stops the page being framed
+/// by another site, which is clickjacking. `Referrer-Policy` stops the full
+/// URL — including anything in the query string — being sent to every image
+/// host the page loads.
+pub fn security_headers() -> MwStep {
+    return |request, next| {
+        var response = next(request)
+        response = http.with_header(response, "X-Content-Type-Options",
+            "nosniff")
+        response = http.with_header(response, "X-Frame-Options", "DENY")
+        response = http.with_header(response, "Referrer-Policy",
+            "strict-origin-when-cross-origin")
+        return response
+    }
+}
+
+/// Echo a request id, or make one from a counter the caller supplies.
+///
+/// The id is a parameter rather than generated here, because generating one
+/// needs randomness and this package opens nothing. Echoing a client's id when
+/// it sends one is what makes a trace span two services.
+pub fn request_id(header: str, fallback: str) -> MwStep {
+    return |request, next| {
+        let given = http.header(request, header) ?? fallback
+        return http.with_header(next(request), header, given)
+    }
+}
+
+/// Refuse a body larger than a limit, before the handler sees it.
+///
+/// The check is on the declared `Content-Length` as well as the body actually
+/// read: a request that lies about its length is refused on whichever is
+/// larger, so neither a small header with a large body nor the reverse gets
+/// through.
+pub fn limit_body(bytes_allowed: i64) -> MwStep {
+    return |request, next| {
+        let declared = (http.header(request, "Content-Length") ?? "0")
+            .parse_int() ?? 0
+        if declared > bytes_allowed or request.body.len() > bytes_allowed {
+            return http.respond(413, "text/plain",
+                "request body over {bytes_allowed} bytes")
+        }
+        return next(request)
+    }
+}
+
+/// Let an HTML form send a `PUT` or a `DELETE`.
+///
+/// A form can only issue `GET` and `POST`. The convention is a hidden field or
+/// a header naming the real method — and the restriction to `POST` is the
+/// safety property: allowing a `GET` to be overridden would let a link perform
+/// a delete, which is the CSRF this was supposed to avoid.
+pub fn method_override(header: str) -> MwStep {
+    return |request, next| {
+        if request.method.to_upper() != "POST" {
+            return next(request)
+        }
+        let wanted = http.header(request, header) ?? ""
+        if wanted == "" {
+            return next(request)
+        }
+        var changed = request
+        changed.method = wanted.to_upper()
+        return next(changed)
+    }
+}
+
+/// Remove a path prefix before the handler sees it.
+///
+/// For running behind a proxy that mounts the service at `/api`: the routes
+/// are written without it, and this takes it off. A request that does not
+/// carry the prefix is passed through unchanged rather than refused, because
+/// a health check usually does not.
+pub fn strip_prefix(prefix: str) -> MwStep {
+    return |request, next| {
+        if not request.path.starts_with(prefix) {
+            return next(request)
+        }
+        var changed = request
+        changed.path = request.path.substr(prefix.len(),
+            request.path.len() - prefix.len())
+        if changed.path == "" {
+            changed.path = "/"
+        }
+        return next(changed)
+    }
+}
+
+/// Answer a path directly, without running the rest of the chain.
+///
+/// A health check that runs through authentication, rate limiting and body
+/// parsing is a health check that reports the health of the middleware.
+pub fn short_circuit(path: str, response: Response) -> MwStep {
+    return |request, next| {
+        if request.path == path {
+            return response
+        }
+        return next(request)
+    }
+}
+
+/// Refuse anything but the listed methods.
+pub fn allow_methods(methods: [str]) -> MwStep {
+    return |request, next| {
+        var allowed = false
+        for m in methods {
+            if m.to_upper() == request.method.to_upper() {
+                allowed = true
+            }
+        }
+        if not allowed {
+            return http.method_not_allowed(methods.join(", "))
+        }
+        return next(request)
+    }
+}
+
+/// Require a header to be present and to have a given value.
+pub fn require_header(name: str, value: str, status: i64) -> MwStep {
+    return |request, next| {
+        let given = http.header(request, name) ?? ""
+        if given == "" {
+            return http.respond(status, "text/plain", "{name} is required")
+        }
+        if given == value {
+            return next(request)
+        }
+        return http.respond(status, "text/plain",
+            "{name} is not what this endpoint accepts")
+    }
+}
+
+/// Record how long the chain took, from a clock the caller reads.
+///
+/// Both readings are parameters because this package has no clock — and that
+/// turns out to be the right shape anyway: a test can pass two fixed numbers
+/// and assert on the header exactly.
+pub fn timing_header(started_at: i64, finished_at: i64) -> MwStep {
+    return |request, next| http.with_header(next(request), "Server-Timing",
+        "total;dur={finished_at - started_at}")
+}
+
+/// Replace the response when the chain produced a given status.
+///
+/// For turning a bare 404 into a page. It runs on the way out, which is the
+/// only place it can: the status is not known until the handler has run.
+pub fn on_status(status: i64, replacement: Response) -> MwStep {
+    return |request, next| {
+        let response = next(request)
+        if response.status == status {
+            return replacement
+        }
+        return response
+    }
+}
+
+/// A handler that always answers the same way, for building a chain to test.
+pub fn constant_handler(response: Response) -> MwNext {
+    return |_request| response
+}
+
+/// The number of steps a chain holds, for a start-up log.
+pub fn describe(names: [str]) -> str {
+    return names.join(" -> ")
+}

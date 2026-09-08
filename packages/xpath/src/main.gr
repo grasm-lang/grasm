@@ -1,0 +1,520 @@
+// XPath over an XML tree: the subset that does the work, and a clear refusal
+// for the rest.
+//
+// What is here: the child and descendant axes (`/a/b` and `//b`), the
+// self-and-attribute steps (`.`, `@name`), wildcards (`*`, `@*`), `text()`,
+// and predicates — by position (`[2]`, `[last()]`, `[position()<3]`), by the
+// presence of an attribute or a child (`[@id]`, `[title]`), and by their value
+// (`[@id='x']`, `[title='y']`). Steps compose, predicates stack, and a path
+// may be absolute or relative.
+//
+// What is not here, and why it is refused rather than approximated:
+//
+// **The parent and ancestor axes.** The tree this walks — `packages/xml` —
+// holds children and not parents, so `..` cannot be evaluated at all. A
+// library that silently returned an empty node set for `..` would look like a
+// document that did not match, which is the worst possible failure: a query
+// that is wrong and looks like data that is missing.
+//
+// **Arithmetic, string functions and unions.** `substring-before()`,
+// `translate()`, `a | b`. Each is real XPath and none is needed to find
+// things in a document; adding them badly is worse than not having them.
+//
+// The one XPath rule that catches everyone is implemented: **a predicate on a
+// descendant step applies per parent, not to the whole result**. `//a[1]` is
+// "every `a` that is the first `a` among its siblings", not "the first `a` in
+// the document" — those are different node sets, and the second is written
+// `(//a)[1]`, which this refuses rather than getting wrong.
+//
+// One more thing to know: **the node you pass in is the root**. There is no
+// document node above it, so a leading `/` means "a child of the node you
+// gave me". `lxml` evaluating `/shelf` against a `<library>` element returns
+// nothing, because in a real document `/` is above `<library>`; here it
+// returns the shelves. The difference matters only for absolute paths, and it
+// is the behaviour that makes an element handed to a function usable as a
+// starting point.
+//
+// Checked against `lxml`, which implements XPath 1.0.
+
+import xml
+
+type XPathStep = {
+    /// "child", "descendant", "self", "attribute" or "text".
+    axis: str,
+    /// The element or attribute name, or `*`.
+    name: str,
+    predicates: [str],
+}
+
+/// A node or an attribute value: an XPath result is not only elements.
+type XPathResult =
+    | XPathNode(node: ref Node)
+    | XPathValue(text: str)
+
+type XPathError =
+    | XPathUnsupported(what: str)
+    | XPathMalformed(path: str, at: i64)
+    | XPathEmptyStep(path: str)
+
+    /// Split a path into steps.
+pub fn compile(path: str) -> [XPathStep] ! XPathError {
+    if path == "" {
+        fail(XPathEmptyStep(path))
+    }
+    if path.starts_with("(") {
+        fail(XPathUnsupported("a parenthesised path such as `(//a)[1]`"))
+    }
+    var out: [XPathStep] = []
+    var i = 0
+    // A leading `/` is the document root, which is where evaluation starts
+    // anyway; a leading `//` is a descendant step from it.
+    while i < path.len() {
+        var axis = "child"
+        if path.substr(i, 2) == "//" {
+            axis = "descendant"
+            i = i + 2
+        } else {
+            if path.substr(i, 1) == "/" {
+                i = i + 1
+                if i >= path.len() {
+                    fail(XPathEmptyStep(path))
+                }
+            }
+        }
+        let stop = step_end(path, i)
+        let text = path.substr(i, stop - i)
+        if text == "" {
+            fail(XPathEmptyStep(path))
+        }
+        out.push(try one_step(axis, text, path, i))
+        i = stop
+    }
+    if out.len() == 0 {
+        fail(XPathEmptyStep(path))
+    }
+    return out
+}
+
+fn step_end(path: str, from: i64) -> i64 {
+    var i = from
+    var depth = 0
+    while i < path.len() {
+        let c = path.substr(i, 1)
+        if c == "[" {
+            depth = depth + 1
+        }
+        if c == "]" {
+            depth = depth - 1
+        }
+        if c == "/" and depth == 0 {
+            return i
+        }
+        i = i + 1
+    }
+    return path.len()
+}
+
+fn one_step(axis: str, text: str, path: str,
+    at: i64) -> XPathStep ! XPathError {
+    var body = text
+    var predicates: [str] = []
+    while body.ends_with("]") {
+        let open = matching_open(body)
+        if open < 0 {
+            fail(XPathMalformed(path, at))
+        }
+        predicates.push(body.substr(open + 1, body.len() - open - 2))
+        body = body.substr(0, open)
+    }
+    predicates = reversed(predicates)
+    if body == ".." {
+        fail(XPathUnsupported("the parent axis `..`, which this tree cannot " +
+            "walk"))
+    }
+    if body.starts_with("ancestor") or body.starts_with("following") or
+    body.starts_with("preceding") or body.starts_with("parent") {
+        fail(XPathUnsupported("the axis `" + body + "`"))
+    }
+    if body == "." {
+        return XPathStep{ axis: "self", name: "*", predicates: predicates }
+    }
+    if body == "text()" {
+        return XPathStep{ axis: "text", name: "", predicates: predicates }
+    }
+    if body == "node()" {
+        return XPathStep{ axis: axis, name: "*", predicates: predicates }
+    }
+    if body.starts_with("@") {
+        return XPathStep{ axis: "attribute",
+            name: body.substr(1, body.len() - 1), predicates: predicates }
+    }
+    if body.contains("(") {
+        fail(XPathUnsupported("the function `" + body + "`"))
+    }
+    return XPathStep{ axis: axis, name: body, predicates: predicates }
+}
+
+fn matching_open(text: str) -> i64 {
+    var depth = 0
+    var i = text.len() - 1
+    while i >= 0 {
+        let c = text.substr(i, 1)
+        if c == "]" {
+            depth = depth + 1
+        }
+        if c == "[" {
+            depth = depth - 1
+            if depth == 0 {
+                return i
+            }
+        }
+        i = i - 1
+    }
+    return 0 - 1
+}
+
+fn reversed(xs: [str]) -> [str] {
+    var out: [str] = []
+    var i = xs.len() - 1
+    while i >= 0 {
+        out.push(xs[i])
+        i = i - 1
+    }
+    return out
+}
+
+// ---------------------------------------------------------- evaluation
+
+/// Evaluate a path against a document root.
+pub fn select(root: ref Node, path: str) -> [XPathResult] ! XPathError {
+    let steps = try compile(path)
+    var current: [XPathResult] = [XPathNode(root)]
+    for step in steps {
+        current = try apply(current, step)
+    }
+    return current
+}
+
+/// The elements a path selects, dropping any attribute or text results.
+pub fn select_nodes(root: ref Node, path: str) -> [ref Node] ! XPathError {
+    var out: [ref Node] = []
+    for r in try select(root, path) {
+        match r {
+            XPathNode(n) -> out.push(n)
+            XPathValue(_t) -> {}
+        }
+    }
+    return out
+}
+
+/// The strings a path selects: attribute values, text nodes, or the text of
+/// an element.
+pub fn select_strings(root: ref Node, path: str) -> [str] ! XPathError {
+    var out: [str] = []
+    for r in try select(root, path) {
+        match r {
+            XPathValue(t) -> out.push(t)
+            XPathNode(n) -> out.push(xml.text_of(n))
+        }
+    }
+    return out
+}
+
+/// The first result, or `None`.
+pub fn select_first(root: ref Node,
+    path: str) -> Option[ref Node] ! XPathError {
+    let found = try select_nodes(root, path)
+    if found.len() == 0 {
+        return None
+    }
+    return Some(found[0])
+}
+
+/// How many results a path has.
+pub fn count(root: ref Node, path: str) -> i64 ! XPathError {
+    return (try select(root, path)).len()
+}
+
+fn apply(current: [XPathResult],
+    step: XPathStep) -> [XPathResult] ! XPathError {
+    var out: [XPathResult] = []
+    for item in current {
+        match item {
+            XPathValue(_t) -> {}
+            XPathNode(node) -> {
+                // `//a` is `descendant-or-self::node()/child::a`, so the
+                // predicate is applied once per *parent* and not once to the
+                // whole result. That is why `//a[1]` is "the first `a` under
+                // each parent" and not "the first `a` in the document".
+                if step.axis == "descendant" {
+                    var parents: [ref Node] = [node]
+                    all_descendants(node, parents)
+                    for parent in parents {
+                        let group = children_named(parent, step.name)
+                        for kept in try filtered(group, step) {
+                            out.push(kept)
+                        }
+                    }
+                } else {
+                    for kept in try filtered(gather(node, step), step) {
+                        out.push(kept)
+                    }
+                }
+            }
+        }
+    }
+    return out
+}
+
+fn gather(node: ref Node, step: XPathStep) -> [XPathResult] {
+    if step.axis == "self" {
+        return [XPathNode(node)]
+    }
+    if step.axis == "attribute" {
+        var out: [XPathResult] = []
+        for a in attributes_of(node) {
+            if step.name == "*" or a.name == step.name {
+                out.push(XPathValue(a.value))
+            }
+        }
+        return out
+    }
+    if step.axis == "text" {
+        var out: [XPathResult] = []
+        for child in xml.children_of(node) {
+            if xml.name_of(child) == "" {
+                out.push(XPathValue(xml.text_of(child)))
+            }
+        }
+        return out
+    }
+    var out: [XPathResult] = []
+    if step.axis == "descendant" {
+        descend(node, step.name, out)
+        return out
+    }
+    for child in xml.children_of(node) {
+        let name = xml.name_of(child)
+        if name != "" and (step.name == "*" or name == step.name) {
+            out.push(XPathNode(child))
+        }
+    }
+    return out
+}
+
+/// Every element under a node, in document order.
+fn all_descendants(node: ref Node, inout out: [ref Node]) {
+    for child in xml.children_of(node) {
+        if xml.name_of(child) != "" {
+            out.push(child)
+            all_descendants(child, out)
+        }
+    }
+}
+
+/// A node's element children with a name, or all of them for `*`.
+fn children_named(node: ref Node, name: str) -> [XPathResult] {
+    var out: [XPathResult] = []
+    for child in xml.children_of(node) {
+        let child_name = xml.name_of(child)
+        if child_name != "" and (name == "*" or child_name == name) {
+            out.push(XPathNode(child))
+        }
+    }
+    return out
+}
+
+fn descend(node: ref Node, name: str, inout out: [XPathResult]) {
+    for child in xml.children_of(node) {
+        let child_name = xml.name_of(child)
+        if child_name != "" {
+            if name == "*" or child_name == name {
+                out.push(XPathNode(child))
+            }
+            descend(child, name, out)
+        }
+    }
+}
+
+/// The attributes of a node, which `xml` exposes one at a time.
+fn attributes_of(node: ref Node) -> [Attr] {
+    match node {
+        Element(_n, attrs, _c) -> return attrs
+        _ -> return []
+    }
+}
+
+fn filtered(candidates: [XPathResult],
+    step: XPathStep) -> [XPathResult] ! XPathError {
+    var current = candidates
+    for predicate in step.predicates {
+        current = try one_predicate(current, predicate)
+    }
+    return current
+}
+
+fn one_predicate(candidates: [XPathResult],
+    predicate: str) -> [XPathResult] ! XPathError {
+    let text = predicate.trim()
+    if text == "" {
+        fail(XPathMalformed(predicate, 0))
+    }
+    // A bare number is a position, counted from one — not from zero, which is
+    // the other thing everyone gets wrong.
+    match text.parse_int() {
+        Some(n) -> {
+            if n >= 1 and n <= candidates.len() {
+                return [candidates[n - 1]]
+            }
+            return []
+        }
+        None -> {}
+    }
+    if text == "last()" {
+        if candidates.len() == 0 {
+            return []
+        }
+        return [candidates[candidates.len() - 1]]
+    }
+    if text.starts_with("position()") {
+        return try position_predicate(candidates, text)
+    }
+    return try value_predicate(candidates, text)
+}
+
+fn position_predicate(candidates: [XPathResult],
+    text: str) -> [XPathResult] ! XPathError {
+    let rest = text.substr(10, text.len() - 10).trim()
+    var operator = ""
+    var number_text = ""
+    for op in ["<=", ">=", "!=", "<", ">", "="] {
+        if rest.starts_with(op) {
+            operator = op
+            number_text = rest.substr(op.len(), rest.len() - op.len()).trim()
+            break
+        }
+    }
+    if operator == "" {
+        fail(XPathMalformed(text, 0))
+    }
+    let wanted = number_text.parse_int() ?? 0
+    var out: [XPathResult] = []
+    for i in 0..candidates.len() {
+        let position = i + 1
+        var keep = false
+        if operator == "=" {
+            keep = position == wanted
+        }
+        if operator == "!=" {
+            keep = position != wanted
+        }
+        if operator == "<" {
+            keep = position < wanted
+        }
+        if operator == ">" {
+            keep = position > wanted
+        }
+        if operator == "<=" {
+            keep = position <= wanted
+        }
+        if operator == ">=" {
+            keep = position >= wanted
+        }
+        if keep {
+            out.push(candidates[i])
+        }
+    }
+    return out
+}
+
+fn value_predicate(candidates: [XPathResult],
+    text: str) -> [XPathResult] ! XPathError {
+    var name = text
+    var wanted = ""
+    var comparing = false
+    let equals = text.index_of("=") ?? (0 - 1)
+    if equals >= 0 {
+        comparing = true
+        name = text.substr(0, equals).trim()
+        wanted = unquote(text.substr(equals + 1,
+            text.len() - equals - 1).trim())
+    }
+    if name.contains("(") {
+        fail(XPathUnsupported("the function `" + name + "` in a predicate"))
+    }
+    var out: [XPathResult] = []
+    for item in candidates {
+        match item {
+            XPathValue(_t) -> {}
+            XPathNode(node) -> {
+                if holds(node, name, wanted, comparing) {
+                    out.push(item)
+                }
+            }
+        }
+    }
+    return out
+}
+
+fn holds(node: ref Node, name: str, wanted: str, comparing: bool) -> bool {
+    if name.starts_with("@") {
+        let attribute = name.substr(1, name.len() - 1)
+        match xml.attribute(node, attribute) {
+            Some(value) -> {
+                if not comparing {
+                    return true
+                }
+                return value == wanted
+            }
+            None -> return false
+        }
+    }
+    if name == "text()" {
+        return comparing and xml.text_of(node) == wanted
+    }
+    for child in xml.children_of(node) {
+        if xml.name_of(child) == name {
+            if not comparing {
+                return true
+            }
+            if xml.text_of(child) == wanted {
+                return true
+            }
+        }
+    }
+    return false
+}
+
+fn unquote(text: str) -> str {
+    if text.len() >= 2 and ((text.starts_with("'") and text.ends_with("'")) or
+        (text.starts_with("\"") and text.ends_with("\""))) {
+        return text.substr(1, text.len() - 2)
+    }
+    return text
+}
+
+/// Whether a path uses only what this supports.
+///
+/// Worth calling on a path that came from configuration: the answer is known
+/// before any document is loaded, so a typo is a start-up error rather than an
+/// empty result at midnight.
+pub fn is_supported(path: str) -> bool {
+    match compile(path) {
+        Ok(_v) -> return true
+        Err(_e) -> return false
+    }
+}
+
+/// What a path was refused for, as a sentence.
+pub fn why_unsupported(path: str) -> str {
+    match compile(path) {
+        Ok(_v) -> return ""
+        Err(e) -> {
+            match e {
+                XPathUnsupported(what) -> return "unsupported: " + what
+                XPathMalformed(_p, at) -> return "malformed at {at}"
+                XPathEmptyStep(_p) -> return "a step with nothing in it"
+            }
+        }
+    }
+}

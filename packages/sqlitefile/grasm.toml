@@ -1,0 +1,10 @@
+[package]
+name = "sqlitefile"
+version = "1.0.0"
+
+# Bytes in, values out. Opens nothing — the caller reads the file.
+capabilities = []
+
+[dependencies.sqlparse]
+path = "../sqlparse"
+version = "^1.0.0"
