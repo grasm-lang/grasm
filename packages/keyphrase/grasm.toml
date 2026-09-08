@@ -1,0 +1,10 @@
+[package]
+name = "keyphrase"
+version = "1.0.0"
+
+# Counting words. Opens nothing.
+capabilities = []
+
+[dependencies.stopwords]
+path = "../stopwords"
+version = "^1.0.0"

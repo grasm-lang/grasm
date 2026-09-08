@@ -1,0 +1,10 @@
+[package]
+name = "readability"
+version = "1.0.0"
+
+# Counting and arithmetic. Opens nothing.
+capabilities = []
+
+[dependencies.hyphenate]
+path = "../hyphenate"
+version = "^1.0.0"

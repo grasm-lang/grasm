@@ -1,0 +1,6 @@
+[package]
+name = "stemmer"
+version = "1.0.0"
+
+# Arithmetic over text. Opens nothing.
+capabilities = []

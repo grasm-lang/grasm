@@ -1,0 +1,436 @@
+// Stop word lists, for seven languages, and an argument about using them.
+//
+// ## A stop word list is a choice, not a fact
+//
+// There is no set of English words that carry no meaning. "To be or not to
+// be" is six words and every one of them is on the list below; removing them
+// leaves nothing. "Not" is a stop word in almost every published list, and
+// dropping it turns a review from a complaint into a recommendation.
+//
+// Removing them was originally about *space*: a 1970s index could not afford
+// posting lists for `the`. That reason is gone — the index is cheap now — and
+// modern search engines keep stop words so that phrase queries, quoted
+// searches and negation still work. So the honest default is not to remove
+// them, and the honest use of this package is narrower: as a filter for
+// keyword extraction, topic modelling, and word clouds, where the frequent
+// words genuinely are noise.
+//
+// ## The lists disagree, so which one matters
+//
+// NLTK's English list has 198 entries, Snowball's 174, scikit-learn's 318 —
+// and scikit-learn's contains `computer`, `system` and `interest`, which are
+// content words in most corpora and which it will silently delete from
+// yours. This ships NLTK's lists, which are the Snowball ones plus contracted
+// forms, and says so, because a list whose provenance is unrecorded is one
+// nobody can reason about.
+//
+// A caller who knows their corpus should build their own: the words that
+// carry no information *here* are the ones that appear in nearly every
+// document, and `by_document_frequency` finds them from the corpus rather
+// than from a list somebody wrote in 1971.
+//
+// Checked word for word against NLTK's `stopwords` corpus for all seven
+// languages.
+
+type StopwordSet = {
+    present: Map[str, bool],
+    language: str,
+}
+
+type StopwordError = | NoSuchLanguage(name: str)
+
+pub fn languages() -> [str] {
+    return ["english", "spanish", "french", "german", "italian",
+        "portuguese", "dutch"]
+}
+
+/// NLTK's list for a language, as a sorted list of words.
+pub fn words_for(language: str) -> [str] ! StopwordError {
+    if language == "english" {
+        return english_words().split(" ")
+    }
+    if language == "spanish" {
+        return spanish_words().split(" ")
+    }
+    if language == "french" {
+        return french_words().split(" ")
+    }
+    if language == "german" {
+        return german_words().split(" ")
+    }
+    if language == "italian" {
+        return italian_words().split(" ")
+    }
+    if language == "portuguese" {
+        return portuguese_words().split(" ")
+    }
+    if language == "dutch" {
+        return dutch_words().split(" ")
+    }
+    fail(NoSuchLanguage(language))
+}
+
+pub fn english() -> [str] {
+    return english_words().split(" ")
+}
+
+/// The two dozen words nearly every list agrees on.
+///
+/// For a caller who wants the frequent function words gone and is not willing
+/// to lose `not`, `no` or `only` — all of which the full lists remove and all
+/// of which change what a sentence means.
+pub fn minimal() -> [str] {
+    return ["a", "an", "and", "are", "as", "at", "be", "by", "for", "from",
+        "has", "he", "in", "is", "it", "its", "of", "on", "that", "the",
+        "to", "was", "were", "will", "with"]
+}
+
+pub fn build(words: [str]) -> StopwordSet {
+    var present = map()
+    for w in words {
+        if w != "" {
+            present.set(w.to_lower(), true)
+        }
+    }
+    return StopwordSet{ present: present, language: "" }
+}
+
+pub fn for_language(language: str) -> StopwordSet ! StopwordError {
+    var out = build(try words_for(language))
+    out.language = language
+    return out
+}
+
+pub fn size(set: StopwordSet) -> i64 {
+    return set.present.len()
+}
+
+pub fn is_stopword(set: StopwordSet, word: str) -> bool {
+    return set.present.has(word.to_lower())
+}
+
+/// The same set with more words in it.
+pub fn with_extra(set: StopwordSet, more: [str]) -> StopwordSet {
+    var out = set
+    var present = out.present
+    for w in more {
+        present.set(w.to_lower(), true)
+    }
+    out.present = present
+    return out
+}
+
+/// The same set with some words taken out — the call to make before removing
+/// `not` from a corpus about opinions.
+pub fn without(set: StopwordSet, fewer: [str]) -> StopwordSet {
+    var out = set
+    var present = out.present
+    for w in fewer {
+        let _gone = present.delete(w.to_lower())
+    }
+    out.present = present
+    return out
+}
+
+pub fn remove_from(set: StopwordSet, words: [str]) -> [str] {
+    var out: [str] = []
+    for w in words {
+        if not is_stopword(set, w) {
+            out.push(w)
+        }
+    }
+    return out
+}
+
+pub fn only_stopwords(set: StopwordSet, words: [str]) -> [str] {
+    var out: [str] = []
+    for w in words {
+        if is_stopword(set, w) {
+            out.push(w)
+        }
+    }
+    return out
+}
+
+/// What fraction of these words the set would remove.
+///
+/// Worth looking at before removing anything: a passage that is 70% stop
+/// words has almost nothing left, and the number says so before the damage
+/// is done.
+pub fn coverage(set: StopwordSet, words: [str]) -> f64 {
+    if words.len() == 0 {
+        return 0.0
+    }
+    var hits = 0
+    for w in words {
+        if is_stopword(set, w) {
+            hits = hits + 1
+        }
+    }
+    return hits.as_f64() / words.len().as_f64()
+}
+
+/// Words appearing in at least `fraction` of the documents.
+///
+/// This is the list worth using: a word that is in nine documents out of ten
+/// separates nothing, whatever a general-purpose list thinks of it, and a
+/// word this finds is noise *in this corpus* rather than in somebody else's.
+pub fn by_document_frequency(documents: [[str]], fraction: f64) -> [str] {
+    if documents.len() == 0 {
+        return []
+    }
+    var counts = map()
+    for doc in documents {
+        var seen = map()
+        for w in doc {
+            let key = w.to_lower()
+            if not seen.has(key) {
+                seen.set(key, true)
+                counts.set(key, (counts.get(key) ?? 0) + 1)
+            }
+        }
+    }
+    let threshold = fraction * documents.len().as_f64()
+    var out: [str] = []
+    for entry in counts.entries() {
+        if entry.1.as_f64() >= threshold {
+            out.push(entry.0)
+        }
+    }
+    out.sort()
+    return out
+}
+
+/// Split text into lowercase words, which is what everything above expects.
+///
+/// An apostrophe stays inside a word, because the lists contain `don't` and
+/// `it's` and splitting them first would leave `t` and `s` behind.
+pub fn tokenize(text: str) -> [str] {
+    var out: [str] = []
+    var current = ""
+    for c in text.to_lower().chars() {
+        let letter = (c >= "a" and c <= "z") or (c >= "0" and c <= "9") or
+        c == "'"
+        if letter {
+            current = current + c
+        } else {
+            if current != "" {
+                out.push(current)
+                current = ""
+            }
+        }
+    }
+    if current != "" {
+        out.push(current)
+    }
+    return out
+}
+fn english_words() -> str {
+    return "a about above after again against ain all " +
+    "am an and any are aren aren't as " +
+    "at be because been before being below between " +
+    "both but by can couldn couldn't d did " +
+    "didn didn't do does doesn doesn't doing don " +
+    "don't down during each few for from further " +
+    "had hadn hadn't has hasn hasn't have haven " +
+    "haven't having he he'd he'll he's her here " +
+    "hers herself him himself his how i i'd " +
+    "i'll i'm i've if in into is isn " +
+    "isn't it it'd it'll it's its itself just " +
+    "ll m ma me mightn mightn't more most " +
+    "mustn mustn't my myself needn needn't no nor " +
+    "not now o of off on once only " +
+    "or other our ours ourselves out over own " +
+    "re s same shan shan't she she'd she'll " +
+    "she's should should've shouldn shouldn't so some such " +
+    "t than that that'll the their theirs them " +
+    "themselves then there these they they'd they'll they're " +
+    "they've this those through to too under until " +
+    "up ve very was wasn wasn't we we'd " +
+    "we'll we're we've were weren weren't what when " +
+    "where which while who whom why will with " +
+    "won won't wouldn wouldn't y you you'd you'll " +
+    "you're you've your yours yourself yourselves"
+}
+
+fn spanish_words() -> str {
+    return "a al algo algunas algunos ante antes como " +
+    "con contra cual cuando de del desde donde " +
+    "durante e el ella ellas ellos en entre " +
+    "era erais eran eras eres es esa esas " +
+    "ese eso esos esta estaba estabais estaban estabas " +
+    "estad estada estadas estado estados estamos estando estar " +
+    "estaremos estará estarán estarás estaré estaréis estaría estaríais " +
+    "estaríamos estarían estarías estas este estemos esto estos " +
+    "estoy estuve estuviera estuvierais estuvieran estuvieras estuvieron estuviese " +
+    "estuvieseis estuviesen estuvieses estuvimos estuviste estuvisteis estuviéramos estuviésemos " +
+    "estuvo está estábamos estáis están estás esté estéis " +
+    "estén estés fue fuera fuerais fueran fueras fueron " +
+    "fuese fueseis fuesen fueses fui fuimos fuiste fuisteis " +
+    "fuéramos fuésemos ha habida habidas habido habidos habiendo " +
+    "habremos habrá habrán habrás habré habréis habría habríais " +
+    "habríamos habrían habrías habéis había habíais habíamos habían " +
+    "habías han has hasta hay haya hayamos hayan " +
+    "hayas hayáis he hemos hube hubiera hubierais hubieran " +
+    "hubieras hubieron hubiese hubieseis hubiesen hubieses hubimos hubiste " +
+    "hubisteis hubiéramos hubiésemos hubo la las le les " +
+    "lo los me mi mis mucho muchos muy " +
+    "más mí mía mías mío míos nada ni " +
+    "no nos nosotras nosotros nuestra nuestras nuestro nuestros " +
+    "o os otra otras otro otros para pero " +
+    "poco por porque que quien quienes qué se " +
+    "sea seamos sean seas sentid sentida sentidas sentido " +
+    "sentidos seremos será serán serás seré seréis sería " +
+    "seríais seríamos serían serías seáis siente sin sintiendo " +
+    "sobre sois somos son soy su sus suya " +
+    "suyas suyo suyos sí también tanto te tendremos " +
+    "tendrá tendrán tendrás tendré tendréis tendría tendríais tendríamos " +
+    "tendrían tendrías tened tenemos tenga tengamos tengan tengas " +
+    "tengo tengáis tenida tenidas tenido tenidos teniendo tenéis " +
+    "tenía teníais teníamos tenían tenías ti tiene tienen " +
+    "tienes todo todos tu tus tuve tuviera tuvierais " +
+    "tuvieran tuvieras tuvieron tuviese tuvieseis tuviesen tuvieses tuvimos " +
+    "tuviste tuvisteis tuviéramos tuviésemos tuvo tuya tuyas tuyo " +
+    "tuyos tú un una uno unos vosotras vosotros " +
+    "vuestra vuestras vuestro vuestros y ya yo él " +
+    "éramos"
+}
+
+fn french_words() -> str {
+    return "ai aie aient aies ait as au aura " +
+    "aurai auraient aurais aurait auras aurez auriez aurions " +
+    "aurons auront aux avaient avais avait avec avez " +
+    "aviez avions avons ayant ayante ayantes ayants ayez " +
+    "ayons c ce ces d dans de des " +
+    "du elle en es est et eu eue " +
+    "eues eurent eus eusse eussent eusses eussiez eussions " +
+    "eut eux eûmes eût eûtes furent fus fusse " +
+    "fussent fusses fussiez fussions fut fûmes fût fûtes " +
+    "il ils j je l la le les " +
+    "leur lui m ma mais me mes moi " +
+    "mon même n ne nos notre nous on " +
+    "ont ou par pas pour qu que qui " +
+    "s sa se sera serai seraient serais serait " +
+    "seras serez seriez serions serons seront ses soient " +
+    "sois soit sommes son sont soyez soyons suis " +
+    "sur t ta te tes toi ton tu " +
+    "un une vos votre vous y à étaient " +
+    "étais était étant étante étantes étants étiez étions " +
+    "été étée étées étés êtes"
+}
+
+fn german_words() -> str {
+    return "aber alle allem allen aller alles als also " +
+    "am an ander andere anderem anderen anderer anderes " +
+    "anderm andern anderr anders auch auf aus bei " +
+    "bin bis bist da damit dann das dass " +
+    "dasselbe dazu daß dein deine deinem deinen deiner " +
+    "deines dem demselben den denn denselben der derer " +
+    "derselbe derselben des desselben dessen dich die dies " +
+    "diese dieselbe dieselben diesem diesen dieser dieses dir " +
+    "doch dort du durch ein eine einem einen " +
+    "einer eines einig einige einigem einigen einiger einiges " +
+    "einmal er es etwas euch euer eure eurem " +
+    "euren eurer eures für gegen gewesen hab habe " +
+    "haben hat hatte hatten hier hin hinter ich " +
+    "ihm ihn ihnen ihr ihre ihrem ihren ihrer " +
+    "ihres im in indem ins ist jede jedem " +
+    "jeden jeder jedes jene jenem jenen jener jenes " +
+    "jetzt kann kein keine keinem keinen keiner keines " +
+    "können könnte machen man manche manchem manchen mancher " +
+    "manches mein meine meinem meinen meiner meines mich " +
+    "mir mit muss musste nach nicht nichts noch " +
+    "nun nur ob oder ohne sehr sein seine " +
+    "seinem seinen seiner seines selbst sich sie sind " +
+    "so solche solchem solchen solcher solches soll sollte " +
+    "sondern sonst um und uns unser unsere unserem " +
+    "unseren unseres unter viel vom von vor war " +
+    "waren warst was weg weil weiter welche welchem " +
+    "welchen welcher welches wenn werde werden wie wieder " +
+    "will wir wird wirst wo wollen wollte während " +
+    "würde würden zu zum zur zwar zwischen über"
+}
+
+fn italian_words() -> str {
+    return "a abbia abbiamo abbiano abbiate ad agl agli " +
+    "ai al all alla alle allo anche avemmo " +
+    "avendo avesse avessero avessi avessimo aveste avesti avete " +
+    "aveva avevamo avevano avevate avevi avevo avrai avranno " +
+    "avrebbe avrebbero avrei avremmo avremo avreste avresti avrete " +
+    "avrà avrò avuta avute avuti avuto c che " +
+    "chi ci coi col come con contro cui " +
+    "da dagl dagli dai dal dall dalla dalle " +
+    "dallo degl degli dei del dell della delle " +
+    "dello di dov dove e ebbe ebbero ebbi " +
+    "ed era erano eravamo eravate eri ero essendo " +
+    "faccia facciamo facciano facciate faccio facemmo facendo facesse " +
+    "facessero facessi facessimo faceste facesti faceva facevamo facevano " +
+    "facevate facevi facevo fai fanno farai faranno farebbe " +
+    "farebbero farei faremmo faremo fareste faresti farete farà " +
+    "farò fece fecero feci fosse fossero fossi fossimo " +
+    "foste fosti fu fui fummo furono gli ha " +
+    "hai hanno ho i il in io l " +
+    "la le lei li lo loro lui ma " +
+    "mi mia mie miei mio ne negl negli " +
+    "nei nel nell nella nelle nello noi non " +
+    "nostra nostre nostri nostro o per perché più " +
+    "quale quanta quante quanti quanto quella quelle quelli " +
+    "quello questa queste questi questo sarai saranno sarebbe " +
+    "sarebbero sarei saremmo saremo sareste saresti sarete sarà " +
+    "sarò se sei si sia siamo siano siate " +
+    "siete sono sta stai stando stanno starai staranno " +
+    "starebbe starebbero starei staremmo staremo stareste staresti starete " +
+    "starà starò stava stavamo stavano stavate stavi stavo " +
+    "stemmo stesse stessero stessi stessimo steste stesti stette " +
+    "stettero stetti stia stiamo stiano stiate sto su " +
+    "sua sue sugl sugli sui sul sull sulla " +
+    "sulle sullo suo suoi ti tra tu tua " +
+    "tue tuo tuoi tutti tutto un una uno " +
+    "vi voi vostra vostre vostri vostro è"
+}
+
+fn portuguese_words() -> str {
+    return "a ao aos aquela aquelas aquele aqueles aquilo " +
+    "as até com como da das de dela " +
+    "delas dele deles depois do dos e ela " +
+    "elas ele eles em entre era eram essa " +
+    "essas esse esses esta estamos estar estas estava " +
+    "estavam este esteja estejam estejamos estes esteve estive " +
+    "estivemos estiver estivera estiveram estiverem estivermos estivesse estivessem " +
+    "estivéramos estivéssemos estou está estávamos estão eu foi " +
+    "fomos for fora foram forem formos fosse fossem " +
+    "fui fôramos fôssemos haja hajam hajamos havemos haver " +
+    "hei houve houvemos houver houvera houveram houverei houverem " +
+    "houveremos houveria houveriam houvermos houverá houverão houveríamos houvesse " +
+    "houvessem houvéramos houvéssemos há hão isso isto já " +
+    "lhe lhes mais mas me mesmo meu meus " +
+    "minha minhas muito na nas nem no nos " +
+    "nossa nossas nosso nossos num numa não nós " +
+    "o os ou para pela pelas pelo pelos " +
+    "por qual quando que quem se seja sejam " +
+    "sejamos sem ser serei seremos seria seriam será " +
+    "serão seríamos seu seus somos sou sua suas " +
+    "são só também te tem temos tenha tenham " +
+    "tenhamos tenho terei teremos teria teriam terá terão " +
+    "teríamos teu teus teve tinha tinham tive tivemos " +
+    "tiver tivera tiveram tiverem tivermos tivesse tivessem tivéramos " +
+    "tivéssemos tu tua tuas tém tínhamos um uma " +
+    "você vocês vos à às é éramos"
+}
+
+fn dutch_words() -> str {
+    return "aan al alles als altijd andere ben bij " +
+    "daar dan dat de der deze die dit " +
+    "doch doen door dus een eens en er " +
+    "ge geen geweest haar had heb hebben heeft " +
+    "hem het hier hij hoe hun iemand iets " +
+    "ik in is ja je kan kon kunnen " +
+    "maar me meer men met mij mijn moet " +
+    "na naar niet niets nog nu of om " +
+    "omdat onder ons ook op over reeds te " +
+    "tegen toch toen tot u uit uw van " +
+    "veel voor want waren was wat werd wezen " +
+    "wie wil worden wordt zal ze zelf zich " +
+    "zij zijn zo zonder zou"
+}
+

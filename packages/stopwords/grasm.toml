@@ -1,0 +1,6 @@
+[package]
+name = "stopwords"
+version = "1.0.0"
+
+# Word lists and set arithmetic. Opens nothing.
+capabilities = []

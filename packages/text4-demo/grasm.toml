@@ -1,0 +1,24 @@
+[package]
+name = "text4_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.hyphenate]
+path = "../hyphenate"
+version = "^1.0.0"
+
+[dependencies.stemmer]
+path = "../stemmer"
+version = "^1.0.0"
+
+[dependencies.stopwords]
+path = "../stopwords"
+version = "^1.0.0"
+
+[dependencies.readability]
+path = "../readability"
+version = "^1.0.0"
+
+[dependencies.keyphrase]
+path = "../keyphrase"
+version = "^1.0.0"

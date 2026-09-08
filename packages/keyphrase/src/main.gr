@@ -1,0 +1,219 @@
+// RAKE — Rapid Automatic Keyword Extraction, Rose et al., 2010.
+//
+// Pull the phrases a document is about, from the document alone. No corpus,
+// no training, no model: the whole algorithm is two counts and a division,
+// and it works well enough that it is still the default in a dozen tools
+// fifteen years later.
+//
+// ## How it works, and why it works
+//
+// Stop words and punctuation are treated as *walls*. What survives between
+// two walls is a candidate phrase: "the rapid automatic extraction of
+// keywords from individual documents" becomes `rapid automatic extraction`,
+// `keywords`, `individual documents`. Every content word then gets two
+// numbers — how often it appears, and the total size of the phrases it
+// appears in — and its score is the second over the first.
+//
+// That ratio is the trick. A word that appears alone as often as it appears
+// in phrases scores near one; a word that appears only inside long phrases
+// scores high. So `algorithm` in a paper about algorithms scores low —
+// it is everywhere and mostly alone — while `minimal generating sets` scores
+// high, because those three words only ever appear together. The method finds
+// what is *distinctive* about a document without ever seeing another one.
+//
+// ## What it gets wrong
+//
+// Long phrases score high by construction, since a phrase's score is the sum
+// of its words'. A run of five content words with no stop word between them
+// beats every two-word phrase in the document whether or not it means
+// anything, which is why `max_words` exists and why anyone using this sets
+// it.
+//
+// It is also entirely at the mercy of the stop word list. Too small a list
+// and every phrase runs into the next; too large and the phrases are cut into
+// single words. This is the one place where `stopwords`' warning about
+// choosing a list is not academic.
+//
+// Checked against `rake-nltk`, the reference implementation, on texts drawn
+// from the paper and from documentation prose.
+
+import stopwords
+
+type Keyphrase = {
+    text: str,
+    score: f64,
+    /// How many times the phrase itself occurs.
+    count: i64,
+}
+
+/// Candidate phrases: the runs between stop words and punctuation.
+///
+/// Punctuation is a wall too — `speed, accuracy` is two phrases, not one.
+/// That is what stops a comma-separated list from being read as one long
+/// keyphrase, and it is the difference between RAKE and counting n-grams.
+pub fn phrases(text: str, stops: StopwordSet, max_words: i64) -> [[str]] {
+    var out: [[str]] = []
+    var current: [str] = []
+    var word = ""
+    for c in text.to_lower().chars() {
+        let part = (c >= "a" and c <= "z") or (c >= "0" and c <= "9") or
+        c == "'" or c == "-"
+        if part {
+            word = word + c
+            continue
+        }
+        if word != "" {
+            if stopwords.is_stopword(stops, word) {
+                push_phrase(out, current, max_words)
+                current = []
+            } else {
+                current.push(word)
+            }
+            word = ""
+        }
+        // A space continues a phrase; anything else ends it.
+        if c != " " and c != "\t" and c != "\n" and c != "\r" {
+            push_phrase(out, current, max_words)
+            current = []
+        }
+    }
+    if word != "" {
+        if stopwords.is_stopword(stops, word) {
+            push_phrase(out, current, max_words)
+            current = []
+        } else {
+            current.push(word)
+        }
+    }
+    push_phrase(out, current, max_words)
+    return out
+}
+
+fn push_phrase(inout out: [[str]], phrase: [str], max_words: i64) {
+    if phrase.len() == 0 {
+        return
+    }
+    if max_words > 0 and phrase.len() > max_words {
+        return
+    }
+    out.push(phrase)
+}
+
+/// The score of each content word: total phrase size over occurrences.
+///
+/// A word occurring in a three-word phrase contributes three to its degree,
+/// not two — the word is a member of its own phrase, so a word that only ever
+/// stands alone scores exactly one rather than zero.
+pub fn word_scores(candidates: [[str]]) -> Map[str, f64] {
+    var frequency = map()
+    var degree = map()
+    for phrase in candidates {
+        let size = phrase.len()
+        for w in phrase {
+            frequency.set(w, (frequency.get(w) ?? 0) + 1)
+            degree.set(w, (degree.get(w) ?? 0) + size)
+        }
+    }
+    var out = map()
+    for entry in frequency.entries() {
+        let f = entry.1
+        let d = degree.get(entry.0) ?? 0
+        out.set(entry.0, d.as_f64() / f.as_f64())
+    }
+    return out
+}
+
+/// The ranked keyphrases of a text, best first.
+///
+/// Ties are broken by the phrase text so the order is the same on every
+/// engine — two phrases with identical scores are genuinely tied, and a
+/// ranking that came out differently each run would be untestable.
+pub fn rake(text: str, stops: StopwordSet, max_words: i64) -> [Keyphrase] {
+    let candidates = phrases(text, stops, max_words)
+    let scores = word_scores(candidates)
+    var totals = map()
+    var counts = map()
+    for phrase in candidates {
+        let joined = phrase.join(" ")
+        var total = 0.0
+        for w in phrase {
+            total = total + (scores.get(w) ?? 0.0)
+        }
+        totals.set(joined, total)
+        counts.set(joined, (counts.get(joined) ?? 0) + 1)
+    }
+    var out: [Keyphrase] = []
+    for entry in totals.entries() {
+        out.push(Keyphrase{ text: entry.0, score: entry.1,
+            count: counts.get(entry.0) ?? 0 })
+    }
+    out.sort_by(|k| k.text)
+    out.sort_by(|k| 0.0 - k.score)
+    return out
+}
+
+/// The best `n`, which is what a caller actually wants.
+pub fn top(ranked: [Keyphrase], n: i64) -> [Keyphrase] {
+    if ranked.len() <= n {
+        return ranked
+    }
+    return ranked.slice(0, n)
+}
+
+/// Just the phrase texts, for a caller that wants a list of strings.
+pub fn texts_of(ranked: [Keyphrase]) -> [str] {
+    var out: [str] = []
+    for k in ranked {
+        out.push(k.text)
+    }
+    return out
+}
+
+/// The baseline RAKE has to beat: the commonest content words.
+///
+/// Worth having in the same package, because it is what a reader assumes
+/// keyword extraction does, and comparing the two on a real document is the
+/// quickest way to see what RAKE is actually buying.
+pub fn by_frequency(text: str, stops: StopwordSet) -> [Keyphrase] {
+    var counts = map()
+    for w in stopwords.tokenize(text) {
+        if stopwords.is_stopword(stops, w) {
+            continue
+        }
+        counts.set(w, (counts.get(w) ?? 0) + 1)
+    }
+    var out: [Keyphrase] = []
+    for entry in counts.entries() {
+        out.push(Keyphrase{ text: entry.0, score: entry.1.as_f64(),
+            count: entry.1 })
+    }
+    out.sort_by(|k| k.text)
+    out.sort_by(|k| 0.0 - k.score)
+    return out
+}
+
+/// Phrases that appear in every one of these documents.
+///
+/// A phrase RAKE ranks highly in every document of a collection is describing
+/// the collection, not the document — boilerplate, a header, a legal footer —
+/// and is worth removing before anything else is read into the results.
+pub fn shared_across(documents: [str], stops: StopwordSet,
+    max_words: i64, keep: i64) -> [str] {
+    if documents.len() == 0 {
+        return []
+    }
+    var counts = map()
+    for doc in documents {
+        for phrase in top(rake(doc, stops, max_words), keep) {
+            counts.set(phrase.text, (counts.get(phrase.text) ?? 0) + 1)
+        }
+    }
+    var out: [str] = []
+    for entry in counts.entries() {
+        if entry.1 == documents.len() {
+            out.push(entry.0)
+        }
+    }
+    out.sort()
+    return out
+}

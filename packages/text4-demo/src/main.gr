@@ -1,0 +1,311 @@
+import hyphenate
+import stemmer
+import stopwords
+import readability
+import keyphrase
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn near(a: f64, b: f64) -> bool {
+    let d = a - b
+    return d < 0.0000001 and d > 0.0 - 0.0000001
+}
+
+fn sample() -> str {
+    return "The quick brown fox jumps over the lazy dog. It was a bright " +
+    "cold day in April, and the clocks were striking thirteen. Never " +
+    "has so much been owed by so many to so few."
+}
+
+/// The abstract RAKE's own paper uses as its worked example.
+fn paper() -> str {
+    return "Compatibility of systems of linear constraints over the set of " +
+    "natural numbers. Criteria of compatibility of a system of linear " +
+    "Diophantine equations, strict inequations, and nonstrict " +
+    "inequations are considered. Upper bounds for components of a " +
+    "minimal set of solutions and algorithms of construction of " +
+    "minimal generating sets of solutions for all types of systems are " +
+    "given. These criteria and the corresponding algorithms for " +
+    "constructing a minimal supporting set of solutions can be used in " +
+    "solving all the considered types of systems and systems of mixed " +
+    "types."
+}
+
+// ------------------------------------------------------------- hyphenate
+
+fn check_hyphenate(inout f: i64, h: Hyphenator) / {io} {
+    print("-- hyphenate: five thousand patterns voting")
+    // Every break here is `hyphenate.py`'s, an independent implementation
+    // carrying the same patterns.
+    say(f, "the algorithm's own name breaks where TeX breaks it",
+        hyphenate.hyphenated(h, "hyphenation") == "hy-phen-ation")
+    say(f, "and so do the words that gave it trouble",
+        hyphenate.hyphenated(h, "presentation") == "pre-sen-ta-tion" and
+        hyphenate.hyphenated(h, "extraordinary") == "ex-tra-or-di-nary")
+    // TeX would offer `democ-ra-cy`; the right-hand minimum of three refuses
+    // to stand `cy` alone on a line, and that is the intended difference.
+    say(f, "the right-hand minimum removes a break TeX's patterns allow",
+        hyphenate.hyphenated(h, "democracy") == "democ-racy")
+    say(f, "a word with no legal break comes back whole",
+        hyphenate.hyphenated(h, "strengths") == "strengths" and
+        hyphenate.hyphenated(h, "project") == "project")
+    say(f, "four letters or fewer are never broken",
+        hyphenate.hyphenated(h, "also") == "also" and
+        hyphenate.hyphenated(h, "tab") == "tab")
+    say(f, "the exception list beats the patterns",
+        hyphenate.hyphenated(h, "associate") == "as-so-ciate")
+    say(f, "the right-hand minimum keeps two letters off the next line",
+        hyphenate.hyphenated(h, "computer") == "com-puter")
+    let wide = hyphenate.with_limits(h, 2, 2)
+    say(f, "and lowering it lets the same word break later",
+        hyphenate.hyphenated(wide, "computer") == "com-put-er")
+    say(f, "break points are offsets a line breaker can use",
+        hyphenate.break_points(h, "hyphenation").len() == 2 and
+        hyphenate.break_points(h, "hyphenation")[0] == 2)
+    say(f, "a soft hyphen goes at every break and nowhere else",
+        hyphenate.with_soft_hyphens(h, "hyphenation!") ==
+        "hy\u{00ad}phen\u{00ad}ation!")
+    say(f, "splitting to fit takes the longest prefix that leaves room",
+        fits(h, "hyphenation", 6) == "hy-" and
+        fits(h, "hyphenation", 8) == "hyphen-" and
+        fits(h, "hyphenation", 20) == "hyphen-")
+    say(f, "and refuses when no break fits",
+        no_fit(h, "hyphenation", 2))
+    say(f, "syllables fall back to vowel runs for an unbroken word",
+        hyphenate.syllables(h, "strengths") == 1 and
+        hyphenate.syllables(h, "every") == 3 and
+        hyphenate.syllables(h, "table") == 2)
+}
+
+fn fits(h: Hyphenator, word: str, room: i64) -> str {
+    match hyphenate.split_to_fit(h, word, room) {
+        Some(pair) -> {
+            return pair.0
+        }
+        None -> {
+            return ""
+        }
+    }
+}
+
+fn no_fit(h: Hyphenator, word: str, room: i64) -> bool {
+    match hyphenate.split_to_fit(h, word, room) {
+        Some(_p) -> {
+            return false
+        }
+        None -> {
+            return true
+        }
+    }
+}
+
+// --------------------------------------------------------------- stemmer
+
+fn check_stemmer(inout f: i64) / {io} {
+    print("-- stemmer: Porter2, and the words it is told to leave alone")
+    // Every stem here is NLTK's SnowballStemmer, which is Porter2.
+    say(f, "a family of forms lands on one token",
+        stemmer.stem("connecting") == "connect" and
+        stemmer.stem("connection") == "connect" and
+        stemmer.stem("connected") == "connect")
+    say(f, "and the token need not be a word",
+        stemmer.stem("ugly") == "ugli" and stemmer.stem("arguing") == "argu")
+    say(f, "two different words can share a stem, which is the trade",
+        stemmer.same_stem("universe", "university") and
+        stemmer.stem("university") == "univers")
+    say(f, "R1 is empty in a short word, so no suffix rule can reach",
+        stemmer.stem("red") == "red" and stemmer.stem("bled") == "bled")
+    say(f, "`eed` needs R1 too, which is why `feed` survives",
+        stemmer.stem("feed") == "feed" and stemmer.stem("agreed") == "agre")
+    say(f, "a doubled consonant is undoubled after the suffix goes",
+        stemmer.stem("hopping") == "hop" and stemmer.stem("hissing") == "hiss")
+    say(f, "the gener and commun prefixes have their own R1",
+        stemmer.stem("generously") == "generous" and
+        stemmer.stem("communism") == "communism")
+    say(f, "the special list maps two spellings of one word together",
+        stemmer.stem("skies") == "sky" and stemmer.stem("skis") == "ski")
+    say(f, "and leaves words the rules would ruin",
+        stemmer.stem("news") == "news" and stemmer.stem("atlas") == "atlas")
+    say(f, "a word of two letters is returned unchanged",
+        stemmer.stem("is") == "is" and stemmer.stem("a") == "a")
+    say(f, "stemming a list is stemming each of them",
+        stemmer.stem_all(["running", "runs"]).join(",") == "run,run")
+}
+
+// ------------------------------------------------------------- stopwords
+
+fn check_stopwords(inout f: i64) / {io} {
+    print("-- stopwords: a choice, not a fact")
+    let set: StopwordSet ! StopwordError = stopwords.for_language("english")
+    let english = set ?? stopwords.build([])
+    // The counts are NLTK's corpus, list for list.
+    say(f, "the English list is NLTK's 198 words",
+        stopwords.size(english) == 198)
+    say(f, "and the other six are the sizes NLTK ships",
+        size_of("spanish") == 313 and size_of("french") == 157 and
+        size_of("german") == 232 and size_of("italian") == 279 and
+        size_of("portuguese") == 207 and size_of("dutch") == 101)
+    let hamlet = stopwords.tokenize("To be or not to be")
+    say(f, "every word of the most famous line in English is a stop word",
+        stopwords.remove_from(english, hamlet).len() == 0 and
+        stopwords.coverage(english, hamlet) == 1.0)
+    say(f, "`not` is on the list, which is why removing it changes meaning",
+        stopwords.is_stopword(english, "not") and
+        not stopwords.is_stopword(stopwords.build(stopwords.minimal()),
+            "not"))
+    say(f, "a language nobody shipped is an error, not an empty list",
+        refuses_language("klingon"))
+    let widened = stopwords.with_extra(english, ["grasm"])
+    say(f, "a set can be widened and narrowed",
+        stopwords.is_stopword(widened, "GRASM") and
+        not stopwords.is_stopword(stopwords.without(english, ["not"]),
+            "not"))
+    let corpus = [["the", "cat", "sat"], ["the", "dog", "sat"],
+        ["the", "bird", "flew"]]
+    say(f, "the useful list comes from the corpus, not from 1971",
+        stopwords.by_document_frequency(corpus, 1.0).join(",") == "the" and
+        stopwords.by_document_frequency(corpus, 0.6).join(",") ==
+        "sat,the")
+    say(f, "an apostrophe stays inside a word, because the list has `don't`",
+        stopwords.tokenize("don't stop").len() == 2 and
+        stopwords.is_stopword(english, "don't"))
+}
+
+fn size_of(language: str) -> i64 {
+    let set: StopwordSet ! StopwordError = stopwords.for_language(language)
+    return stopwords.size(set ?? stopwords.build([]))
+}
+
+fn refuses_language(name: str) -> bool {
+    match stopwords.for_language(name) {
+        Ok(_s) -> {
+            return false
+        }
+        Err(_e) -> {
+            return true
+        }
+    }
+}
+
+// ----------------------------------------------------------- readability
+
+fn check_readability(inout f: i64, h: Hyphenator) / {io} {
+    print("-- readability: two ratios and a fitted line")
+    let c = readability.measure(h, sample())
+    // Sentences, words, letters and characters are `textstat`'s counts.
+    say(f, "the counts match another implementation's, one for one",
+        c.sentences == 3 and c.words == 35 and c.letters == 130 and
+        c.characters == 134)
+    say(f, "ARI needs no syllables, so it agrees exactly",
+        near(readability.automated_readability(c), 2.4359047619047622))
+    say(f, "and so does LIX",
+        near(readability.lix(c), 17.38095238095238))
+    let paper_counts = readability.measure(h, paper())
+    say(f, "a dense abstract counts as dense",
+        paper_counts.sentences == 4 and paper_counts.words == 86 and
+        paper_counts.letters == 476)
+    say(f, "Coleman-Liau uses the paper's 0.0588, not textstat's 0.058",
+        near(readability.coleman_liau(paper_counts), 15.368372093023254))
+    say(f, "Flesch and Flesch-Kincaid are the published formulas",
+        near(readability.flesch_reading_ease(paper_counts),
+            28.6008720930233) and
+        near(readability.flesch_kincaid_grade(paper_counts),
+            14.611279069767445))
+    say(f, "and so are fog and SMOG",
+        near(readability.gunning_fog(paper_counts), 19.297674418604654) and
+        near(readability.smog(paper_counts), 16.827784334635936))
+    say(f, "SMOG refuses a text it was not calibrated for",
+        readability.smog(readability.measure(h, "One short line.")) == 0.0)
+    say(f, "the abstract is very difficult and the sample is not",
+        readability.ease_label(readability.flesch_reading_ease(
+            paper_counts)) == "very difficult" and
+        readability.ease_label(readability.flesch_reading_ease(c)) ==
+        "very easy")
+    say(f, "the consensus is a median, so one bad formula cannot drag it",
+        readability.consensus_grade(paper_counts) > 14.0 and
+        readability.consensus_grade(paper_counts) < 17.0)
+    let longest = readability.longest_sentences(paper(), 1)
+    say(f, "and the actionable answer is which sentence to cut",
+        longest.len() == 1 and longest[0].0 == 30)
+    say(f, "an empty text scores zero rather than dividing by it",
+        readability.flesch_reading_ease(readability.empty()) == 0.0 and
+        readability.automated_readability(readability.empty()) == 0.0)
+}
+
+// ------------------------------------------------------------- keyphrase
+
+fn check_keyphrase(inout f: i64) / {io} {
+    print("-- keyphrase: stop words as walls")
+    let set: StopwordSet ! StopwordError = stopwords.for_language("english")
+    let stops = set ?? stopwords.build([])
+    let ranked = keyphrase.rake(paper(), stops, 0)
+    // These are `rake-nltk`'s scores for the same abstract, to the digit.
+    say(f, "the paper's own example ranks the way the paper says",
+        ranked.len() > 3 and ranked[0].text == "minimal generating sets" and
+        near(ranked[0].score, 8.666666666666666) and
+        ranked[1].text == "linear diophantine equations" and
+        near(ranked[1].score, 8.5))
+    say(f, "a phrase that only appears whole outscores a common word",
+        near(score_of(ranked, "minimal supporting set"),
+            7.666666666666666) and
+        score_of(ranked, "systems") < 2.0)
+    say(f, "the frequency baseline finds something else entirely",
+        keyphrase.by_frequency(paper(), stops)[0].text == "systems")
+    say(f, "capping the phrase length drops the long ones",
+        keyphrase.rake(paper(), stops, 2).len() < ranked.len() and
+        longest_phrase(keyphrase.rake(paper(), stops, 2)) == 2)
+    say(f, "punctuation is a wall, so a list is not one keyphrase",
+        keyphrase.phrases("speed, accuracy and cost", stops, 0).len() == 3)
+    say(f, "a word alone scores exactly one",
+        near(score_of(keyphrase.rake("Cats. Dogs.", stops, 0), "cats"), 1.0))
+    let docs = ["Confidential draft. Linear constraints are considered.",
+        "Confidential draft. Diophantine equations are considered.",
+        "Confidential draft. Minimal generating sets are considered."]
+    say(f, "a phrase ranked highly in every document is boilerplate",
+        keyphrase.shared_across(docs, stops, 3, 6)
+            .contains("confidential draft"))
+    say(f, "an empty text produces no phrases",
+        keyphrase.rake("", stops, 0).len() == 0)
+}
+
+fn score_of(ranked: [Keyphrase], text: str) -> f64 {
+    for k in ranked {
+        if k.text == text {
+            return k.score
+        }
+    }
+    return 0.0 - 1.0
+}
+
+fn longest_phrase(ranked: [Keyphrase]) -> i64 {
+    var best = 0
+    for k in ranked {
+        let n = k.text.split(" ").len()
+        if n > best {
+            best = n
+        }
+    }
+    return best
+}
+
+fn main() / {io} {
+    var f = 0
+    let h = hyphenate.english()
+    check_hyphenate(f, h)
+    check_stemmer(f)
+    check_stopwords(f)
+    check_readability(f, h)
+    check_keyphrase(f)
+    if f == 0 {
+        print("text analysis: every claim held")
+    } else {
+        print("text analysis: {f} claims failed")
+    }
+}

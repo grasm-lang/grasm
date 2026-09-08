@@ -1,0 +1,297 @@
+// Readability formulas: seven of them, and what they are worth.
+//
+// Every one of these reduces a text to two or three numbers — words per
+// sentence, syllables per word, letters per word — and fits a line through
+// them. None of them reads anything. A passage of shuffled words scores
+// exactly as its unshuffled original does, and a text can be made to score
+// two grades easier by cutting every sentence in half at a comma.
+//
+// So the honest use is *comparative and directional*: is this draft harder
+// than the last one, is this paragraph the hard one, has this rewrite helped.
+// A single score reported to one decimal place as "grade 8.3" is a number
+// with two significant figures of meaning and one of decoration.
+//
+// ## Why they still earn their place
+//
+// Because the two things they measure are the two things that actually make
+// prose hard to follow — long sentences and long words — and because a
+// formula that can be recomputed on every commit catches drift that nobody
+// would otherwise notice. The alternative is not a better measure; it is no
+// measure.
+//
+// ## The counts, and the one that is unreliable
+//
+// Sentences, words, letters and characters are countable and this package
+// counts them the way every implementation does. **Syllables are not.**
+// English syllable counting has no exact algorithm; this uses hyphenation
+// points, which are a subset of syllable boundaries, and falls back to
+// counting vowel runs for a word the patterns will not break. It undercounts
+// — `university` comes out at four where a dictionary says five — and every
+// formula below that uses syllables inherits that. Two texts counted the same
+// way are still comparable, which is what the formulas are for.
+//
+// ## A constant worth knowing about
+//
+// Coleman-Liau's first coefficient is **0.0588** in Coleman and Liau's 1975
+// paper. Python's `textstat` uses 0.058, which shifts every score it reports
+// by about a third of a grade. This uses the published number, so the two
+// disagree and the disagreement is not a defect here.
+//
+// Checked against `textstat` for sentence, word, letter and character counts,
+// and against the published formulas computed independently.
+
+import hyphenate
+
+type ReadabilityCounts = {
+    sentences: i64,
+    words: i64,
+    syllables: i64,
+    /// Letters only — no punctuation, no spaces.
+    letters: i64,
+    /// Everything but whitespace, which is what ARI counts.
+    characters: i64,
+    /// Words of three syllables or more.
+    complex_words: i64,
+    /// Words of more than six letters, which is what LIX counts.
+    long_words: i64,
+}
+
+pub fn empty() -> ReadabilityCounts {
+    return ReadabilityCounts{ sentences: 0, words: 0, syllables: 0,
+        letters: 0, characters: 0, complex_words: 0, long_words: 0 }
+}
+
+// ------------------------------------------------------------- counting
+
+fn is_letter(c: str) -> bool {
+    return (c >= "a" and c <= "z") or (c >= "A" and c <= "Z")
+}
+
+fn is_digit(c: str) -> bool {
+    return c >= "0" and c <= "9"
+}
+
+/// The words of a text: runs of letters, digits and inner apostrophes.
+///
+/// `don't` is one word and `end.` is one word, which is what every
+/// implementation of these formulas assumes and what the coefficients were
+/// fitted against.
+pub fn words_of(text: str) -> [str] {
+    var out: [str] = []
+    var current = ""
+    for c in text.chars() {
+        if is_letter(c) or is_digit(c) or (c == "'" and current != "") {
+            current = current + c
+        } else {
+            if current != "" {
+                out.push(current)
+                current = ""
+            }
+        }
+    }
+    if current != "" {
+        out.push(current)
+    }
+    return out
+}
+
+/// The sentences of a text, split on `.`, `!` and `?`.
+///
+/// An abbreviation ends a sentence here — `Dr. Smith` counts as two — and
+/// every implementation of these formulas has the same failing. It matters
+/// less than it looks: the error is a constant fraction of a text's
+/// abbreviations, so a comparison between two drafts survives it.
+pub fn sentences_of(text: str) -> [str] {
+    var out: [str] = []
+    var current = ""
+    for c in text.chars() {
+        if c == "." or c == "!" or c == "?" {
+            if current.trim() != "" {
+                out.push(current.trim())
+            }
+            current = ""
+        } else {
+            current = current + c
+        }
+    }
+    if current.trim() != "" {
+        out.push(current.trim())
+    }
+    return out
+}
+
+/// Every count the formulas below need, in one pass.
+pub fn measure(h: Hyphenator, text: str) -> ReadabilityCounts {
+    var out = empty()
+    out.sentences = sentences_of(text).len()
+    let words = words_of(text)
+    out.words = words.len()
+    for w in words {
+        let n = hyphenate.syllables(h, w)
+        out.syllables = out.syllables + n
+        if n >= 3 {
+            out.complex_words = out.complex_words + 1
+        }
+        if w.len() > 6 {
+            out.long_words = out.long_words + 1
+        }
+    }
+    for c in text.chars() {
+        if c == " " or c == "\n" or c == "\t" or c == "\r" {
+            continue
+        }
+        out.characters = out.characters + 1
+        if is_letter(c) or is_digit(c) {
+            out.letters = out.letters + 1
+        }
+    }
+    return out
+}
+
+fn ratio(a: i64, b: i64) -> f64 {
+    if b == 0 {
+        return 0.0
+    }
+    return a.as_f64() / b.as_f64()
+}
+
+// -------------------------------------------------------------- formulas
+
+/// Flesch reading ease, 1948: higher is easier, 0 to 100 in practice.
+///
+/// The coefficients came from fitting against school comprehension tests, and
+/// the scale is not bounded — a sentence of thirty polysyllables scores below
+/// zero and a nursery rhyme above 100.
+pub fn flesch_reading_ease(c: ReadabilityCounts) -> f64 {
+    if c.words == 0 or c.sentences == 0 {
+        return 0.0
+    }
+    return 206.835 - 1.015 * ratio(c.words, c.sentences) -
+    84.6 * ratio(c.syllables, c.words)
+}
+
+/// The same two ratios, rescaled to US school grades — Kincaid, 1975.
+pub fn flesch_kincaid_grade(c: ReadabilityCounts) -> f64 {
+    if c.words == 0 or c.sentences == 0 {
+        return 0.0
+    }
+    return 0.39 * ratio(c.words, c.sentences) +
+    11.8 * ratio(c.syllables, c.words) - 15.59
+}
+
+/// Gunning's fog index, 1952.
+///
+/// Gunning's own definition excludes proper nouns, familiar jargon and
+/// compound words from the complex count. No implementation does that,
+/// because it needs a dictionary and a judgement, so every published fog
+/// score — including this one — is slightly higher than Gunning intended.
+pub fn gunning_fog(c: ReadabilityCounts) -> f64 {
+    if c.words == 0 or c.sentences == 0 {
+        return 0.0
+    }
+    return 0.4 * (ratio(c.words, c.sentences) +
+        100.0 * ratio(c.complex_words, c.words))
+}
+
+/// SMOG, 1969 — the one medical writing guidelines ask for.
+///
+/// McLaughlin fitted it to *thirty sentences* and it is calibrated for that
+/// length; on a shorter text it is an extrapolation. Below three sentences it
+/// is meaningless and this returns zero rather than a number.
+pub fn smog(c: ReadabilityCounts) -> f64 {
+    if c.sentences < 3 {
+        return 0.0
+    }
+    let per_thirty = c.complex_words.as_f64() * 30.0 / c.sentences.as_f64()
+    return 1.043 * per_thirty.sqrt() + 3.1291
+}
+
+/// Coleman-Liau, 1975, with the paper's own 0.0588.
+///
+/// It uses letters rather than syllables, which is the point of it: it was
+/// designed for machine scoring in 1975, when counting syllables meant a
+/// dictionary and counting letters meant a card reader.
+pub fn coleman_liau(c: ReadabilityCounts) -> f64 {
+    if c.words == 0 {
+        return 0.0
+    }
+    return 0.0588 * (ratio(c.letters, c.words) * 100.0) -
+    0.296 * (ratio(c.sentences, c.words) * 100.0) - 15.8
+}
+
+/// The automated readability index, 1967. Characters, not letters.
+pub fn automated_readability(c: ReadabilityCounts) -> f64 {
+    if c.words == 0 or c.sentences == 0 {
+        return 0.0
+    }
+    return 4.71 * ratio(c.characters, c.words) +
+    0.5 * ratio(c.words, c.sentences) - 21.43
+}
+
+/// LIX, the Swedish index — sentence length plus the share of long words.
+///
+/// It needs no syllables at all, which makes it the one formula here that is
+/// as reliable in another language as in English.
+pub fn lix(c: ReadabilityCounts) -> f64 {
+    if c.words == 0 or c.sentences == 0 {
+        return 0.0
+    }
+    return ratio(c.words, c.sentences) + 100.0 * ratio(c.long_words, c.words)
+}
+
+/// The median of the grade-level formulas, which is steadier than any one.
+///
+/// Not the mean: one formula behaving badly on a short text — SMOG, usually —
+/// drags a mean and leaves a median where it was.
+pub fn consensus_grade(c: ReadabilityCounts) -> f64 {
+    var grades = [flesch_kincaid_grade(c), gunning_fog(c), coleman_liau(c),
+        automated_readability(c)]
+    if c.sentences >= 3 {
+        grades.push(smog(c))
+    }
+    grades.sort()
+    let n = grades.len()
+    if n % 2 == 1 {
+        return grades[n / 2]
+    }
+    return (grades[n / 2 - 1] + grades[n / 2]) / 2.0
+}
+
+/// Flesch's own labels for his scale.
+pub fn ease_label(score: f64) -> str {
+    if score >= 90.0 {
+        return "very easy"
+    }
+    if score >= 80.0 {
+        return "easy"
+    }
+    if score >= 70.0 {
+        return "fairly easy"
+    }
+    if score >= 60.0 {
+        return "standard"
+    }
+    if score >= 50.0 {
+        return "fairly difficult"
+    }
+    if score >= 30.0 {
+        return "difficult"
+    }
+    return "very difficult"
+}
+
+/// The sentences of a text, longest first — the actual advice.
+///
+/// A grade level says a document is hard; this says which sentence to fix.
+/// It is the only output here a writer can act on directly.
+pub fn longest_sentences(text: str, count: i64) -> [(i64, str)] {
+    var scored: [(i64, str)] = []
+    for s in sentences_of(text) {
+        scored.push((words_of(s).len(), s))
+    }
+    scored.sort_by(|p| 0 - p.0)
+    if scored.len() <= count {
+        return scored
+    }
+    return scored.slice(0, count)
+}
