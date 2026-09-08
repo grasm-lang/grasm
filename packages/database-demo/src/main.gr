@@ -1,0 +1,409 @@
+import bplustree
+import heapfile
+import bitmapindex
+import costmodel
+import queryplan
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn near(a: f64, b: f64, tolerance: f64) -> bool {
+    var d = a - b
+    if d < 0.0 {
+        d = 0.0 - d
+    }
+    return d < tolerance
+}
+
+// ------------------------------------------------------------- bplustree
+
+fn tree_of(order: i64, keys: [i64]) -> BPlusTree {
+    var tree = bplustree.new_tree(order) ??
+    BPlusTree{ order: 4, nodes: [], root: 0 }
+    for key in keys {
+        bplustree.insert(tree, key, "v{key}")
+    }
+    return tree
+}
+
+fn check_bplustree(inout f: i64) / {io} {
+    print("-- bplustree: the leaves are chained, and that is the plus")
+    var keys: [i64] = []
+    for i in 0..200 {
+        keys.push((i * 37) % 200)
+    }
+    let tree = tree_of(8, keys)
+    say(f, "every key inserted is found, and in order",
+        bplustree.count(tree) == 200 and bplustree.is_ordered(tree) and
+        bplustree.keys(tree)[0] == 0 and bplustree.keys(tree)[199] == 199)
+    // The height is what the fan-out buys: 200 keys in three levels of an
+    // order-8 tree, where a binary tree would need eight.
+    say(f, "two hundred keys sit three levels down, not eight",
+        bplustree.height(tree) == 3)
+    // A range scan is one descent and then a walk of the leaf chain.
+    let window = bplustree.range(tree, 50, 59)
+    say(f, "a range walks the leaf chain rather than the tree",
+        window.len() == 10 and window[0].0 == 50 and window[9].0 == 59 and
+        window[3].1 == "v53")
+    say(f, "and stops at the first key past the bound",
+        bplustree.range(tree, 195, 500).len() == 5)
+    // Sequential inserts split at the end every time, so the tree ends half
+    // empty. This is the case every database has a special path for.
+    var ascending: [i64] = []
+    for i in 0..200 {
+        ascending.push(i)
+    }
+    let sorted_tree = tree_of(8, ascending)
+    say(f, "sorted inserts leave the leaves half empty, as they always do",
+        bplustree.fill_factor(sorted_tree) < bplustree.fill_factor(tree))
+    say(f, "and both hold the same keys either way",
+        bplustree.keys(sorted_tree) == bplustree.keys(tree))
+    // Deleting leaves the separators alone.
+    var shrinking = tree_of(8, keys)
+    var removed = 0
+    for i in 0..100 {
+        if bplustree.remove(shrinking, i * 2) {
+            removed = removed + 1
+        }
+    }
+    say(f, "deleting a key leaves the separators above it untouched",
+        removed == 100 and bplustree.count(shrinking) == 100 and
+        bplustree.is_ordered(shrinking) and
+        bplustree.height(shrinking) == bplustree.height(tree))
+    say(f, "a key that is not there is not deleted",
+        not bplustree.remove(shrinking, 0) and
+        bplustree.get(shrinking, 0) == "" and
+        bplustree.get(shrinking, 1) == "v1")
+    say(f, "the leaf chain covers every leaf and nothing else",
+        bplustree.leaf_count(tree) * (tree.order - 1) >= 200 and
+        bplustree.first_leaf(tree) == bplustree.find_leaf(tree, 0))
+    say(f, "an order below three is not a tree",
+        order_refused(2) and not order_refused(3))
+}
+
+fn order_refused(order: i64) -> bool {
+    match bplustree.new_tree(order) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+// -------------------------------------------------------------- heapfile
+
+fn row(length: i64) -> bytes {
+    var out: [i64] = []
+    for i in 0..length {
+        out.push(65 + i % 26)
+    }
+    return bytes_of(out)
+}
+
+fn check_heapfile(inout f: i64) / {io} {
+    print("-- heapfile: slots grow forwards and rows grow backwards")
+    var page = heapfile.new_page(256)
+    // Free space counts the slot entry as well as the row, which is why a
+    // page with a hundred bytes free cannot take a hundred-byte row.
+    say(f, "an empty page's free space is the size less its header",
+        heapfile.free_space(page) == 248 and
+        heapfile.capacity(256) == 244)
+    var slots: [i64] = []
+    for i in 0..5 {
+        slots.push(heapfile.insert(page, row(20 + i)) ?? 0 - 1)
+    }
+    say(f, "five rows take their own bytes plus four each for their slots",
+        heapfile.free_space(page) == 248 - 110 - 20 and
+        heapfile.live_count(page) == 5)
+    say(f, "and every one reads back",
+        (heapfile.read(page, slots[2]) ?? "".to_bytes()).len() == 22 and
+        heapfile.is_consistent(page))
+    // Deletion leaves the bytes behind. This is why a table does not shrink.
+    say(f, "deleting a row frees a slot and not a byte",
+        heapfile.remove(page, slots[1]) and heapfile.live_count(page) == 4 and
+        heapfile.dead_count(page) == 1 and heapfile.dead_space(page) == 21)
+    say(f, "reading a dead slot is an error and not an empty row",
+        dead_read(page, slots[1]))
+    // Compaction recovers it, and the slot numbers survive — which is the
+    // only reason a database can afford to compact at all.
+    let recovered = heapfile.compact(page)
+    say(f, "compaction recovers the bytes and keeps the slot numbers",
+        recovered == 21 and heapfile.dead_space(page) == 0 and
+        (heapfile.read(page, slots[4]) ?? "".to_bytes()).len() == 24)
+    say(f, "and a freed slot is reused before a new one is added",
+        (heapfile.insert(page, row(5)) ?? 0 - 1) == slots[1])
+    // A row that grows past the page is forwarded rather than moved.
+    var small = heapfile.new_page(64)
+    let only = heapfile.insert(small, row(30)) ?? 0 - 1
+    say(f, "a row that no longer fits cannot be updated in place",
+        not (heapfile.update(small, only, row(40)) ?? true))
+    match heapfile.forward(small, only, 7, 3) {
+        Ok(_v) -> {}
+        Err(_e) -> {}
+    }
+    say(f, "so its slot becomes a pointer at where the row went",
+        (heapfile.resolve(small, only) ?? (0, 0)) == (7, 3) and
+        heapfile.live_count(small) == 0)
+    say(f, "a row larger than the page is refused rather than split",
+        too_large(256, 300) and not too_large(256, 200))
+    say(f, "a row that is not forwarded resolves to its own page",
+        (heapfile.resolve(page, slots[0]) ?? (0, 0)) == (0 - 1, slots[0]))
+    say(f, "and a full page says how much room it had",
+        page_fills())
+}
+
+fn dead_read(page: HeapPage, slot: i64) -> bool {
+    match heapfile.read(page, slot) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn too_large(size: i64, length: i64) -> bool {
+    var page = heapfile.new_page(size)
+    match heapfile.insert(page, row(length)) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn page_fills() -> bool {
+    var page = heapfile.new_page(128)
+    var count = 0
+    for _i in 0..20 {
+        match heapfile.insert(page, row(20)) {
+            Ok(_v) -> count = count + 1
+            Err(_e) -> count = count + 0
+        }
+    }
+    return count == 5 and heapfile.free_space(page) < 24
+}
+
+// ----------------------------------------------------------- bitmapindex
+
+fn check_bitmapindex(inout f: i64) / {io} {
+    print("-- bitmapindex: the predicate is a bitwise AND")
+    let status = [0, 1, 2, 0, 1, 0, 2, 1, 0, 0]
+    let region = [1, 1, 0, 0, 1, 1, 0, 1, 0, 1]
+    let by_status = bitmapindex.build(status)
+    let by_region = bitmapindex.build(region)
+    say(f, "one bitmap a distinct value, one bit a row",
+        bitmapindex.cardinality(by_status) == 3 and
+        bitmapindex.size_in_bits(by_status) == 30 and
+        bitmapindex.rows_of(bitmapindex.equals(by_status, 1)) ==
+        [1, 4, 7])
+    // Two predicates are one AND, and a CPU does that 64 rows at a time.
+    let both = bitmapindex.intersect(bitmapindex.equals(by_status, 0),
+        bitmapindex.equals(by_region, 1)) ?? []
+    say(f, "combining two predicates is one bitwise AND",
+        bitmapindex.rows_of(both) == [0, 5, 9] and
+        near(bitmapindex.selectivity(both), 0.3, 1.0e-12))
+    say(f, "a NOT needs the row count, which a set of row ids cannot supply",
+        bitmapindex.count(bitmapindex.complement(
+            bitmapindex.equals(by_status, 0))) == 5 and
+        bitmapindex.rows_of(bitmapindex.difference(
+            bitmapindex.equals(by_region, 1), bitmapindex.equals(by_status, 0))
+            ?? []) == [1, 4, 7])
+    say(f, "and a value the column never had selects nothing",
+        bitmapindex.count(bitmapindex.equals(by_status, 9)) == 0 and
+        bitmapindex.rows_of(bitmapindex.in_set(by_status, [1, 2])) ==
+        [1, 2, 4, 6, 7])
+    // Bit slicing: one bitmap a binary digit rather than a distinct value.
+    let totals = [3, 17, 200, 45, 6, 999, 1, 0, 512, 128]
+    let sliced = bitmapindex.build_sliced(totals) ??
+    SliceIndex{ rows: 0, slices: [], present: [] }
+    let plain = bitmapindex.build(totals)
+    say(f, "ten distinct values need ten bitmaps, or ten digits need ten",
+        bitmapindex.cardinality(plain) == 10 and
+        bitmapindex.slice_count(sliced) == 10)
+    say(f, "but a thousand values would still need only ten slices",
+        bitmapindex.bits_for(999) == 10 and
+        bitmapindex.bits_for(1000) == 10 and
+        bitmapindex.bits_for(0) == 0)
+    // A range is a walk down the slices, the way two numbers are compared.
+    say(f, "a range query walks the digits instead of the values",
+        bitmapindex.rows_of(bitmapindex.greater_than(sliced, 100)) ==
+        [2, 5, 8, 9] and
+        bitmapindex.rows_of(bitmapindex.less_than(sliced, 10)) ==
+        [0, 4, 6, 7] and
+        bitmapindex.rows_of(bitmapindex.in_range(sliced, 6, 200)) ==
+        [1, 2, 3, 4, 9])
+    say(f, "and the slices agree with the plain index on equality",
+        bitmapindex.rows_of(bitmapindex.equal_to(sliced, 45)) == [3] and
+        bitmapindex.count(bitmapindex.equal_to(sliced, 7)) == 0)
+    // A sum falls out of the slices without reading the column.
+    say(f, "a sum is a few population counts, not a pass over the rows",
+        bitmapindex.sum_where(sliced, bitmapindex.full(10)) == 1911 and
+        bitmapindex.sum_where(sliced,
+            bitmapindex.greater_than(sliced, 100)) == 1839)
+    say(f, "an empty bitmap and a full one are the ends of the scale",
+        bitmapindex.count(bitmapindex.empty(10)) == 0 and
+        bitmapindex.count(bitmapindex.full(10)) == 10 and
+        near(bitmapindex.selectivity(bitmapindex.full(10)), 1.0, 1.0e-12))
+    say(f, "two bitmaps of different lengths cannot be combined",
+        length_refused())
+}
+
+fn length_refused() -> bool {
+    match bitmapindex.intersect([true, false], [true]) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+// ------------------------------------------------- costmodel and queryplan
+
+fn users() -> TableStats {
+    return TableStats{ name: "users", rows: 10000, pages: 100 }
+}
+
+fn orders() -> TableStats {
+    return TableStats{ name: "orders", rows: 50000, pages: 500 }
+}
+
+fn all_indexes() -> [IndexStats] {
+    return [
+        IndexStats{ name: "users_pk", table: "users", column: "id",
+            clustered: true, unique: true, height: 2 },
+        IndexStats{ name: "users_region", table: "users", column: "region",
+            clustered: false, unique: false, height: 2 },
+        IndexStats{ name: "orders_pk", table: "orders", column: "id",
+            clustered: true, unique: true, height: 3 },
+        IndexStats{ name: "orders_user", table: "orders", column: "user_id",
+            clustered: false, unique: false, height: 3 },
+        IndexStats{ name: "orders_status", table: "orders",
+            column: "status", clustered: false, unique: false, height: 3 },
+    ]
+}
+
+fn eq(table: str, column: str, distinct: i64) -> PlanPredicate {
+    return PlanPredicate{ table: table, column: column, kind: "eq",
+        other_table: "", other_column: "",
+        selectivity: costmodel.equality_selectivity(distinct) }
+}
+
+fn joins(table: str, column: str, other: str) -> PlanPredicate {
+    return PlanPredicate{ table: table, column: column, kind: "join",
+        other_table: other, other_column: "",
+        selectivity: costmodel.equality_selectivity(10000) }
+}
+
+fn explained(model: CostModel, tables: [TableStats],
+    predicates: [PlanPredicate], order: str) -> [str] {
+    let made: QueryPlan ! QueryPlanError = queryplan.plan(model, tables,
+        all_indexes(), predicates, order)
+    return queryplan.explain(made ?? QueryPlan{ steps: [], sorts: false,
+        order_column: "", cost: 0.0 })
+}
+
+fn check_planner(inout f: i64) / {io} {
+    print("-- costmodel and queryplan: the plans SQLite prints")
+    let sqlite = costmodel.sqlite_model()
+    // The estimation, which is what actually decides the plan.
+    say(f, "an equality's selectivity is one over the distinct count",
+        near(costmodel.equality_selectivity(4), 0.25, 1.0e-12) and
+        near(costmodel.equality_selectivity(10000), 0.0001, 1.0e-15))
+    // The multiplication that turns Paris and France into one row in two
+    // million.
+    say(f, "two predicates are multiplied, which assumes they are unrelated",
+        near(costmodel.conjunction(0.0001, 0.005), 0.0000005, 1.0e-15))
+    say(f, "and an OR is not an addition, or two of 0.6 would exceed one",
+        near(costmodel.disjunction(0.6, 0.6), 0.84, 1.0e-12) and
+        near(costmodel.negation(0.25), 0.75, 1.0e-12))
+    // An estimate of zero rows makes everything above it look free.
+    say(f, "an estimate never falls below one row, however selective",
+        near(costmodel.rows_after(10, 0.0), 1.0, 1.0e-12) and
+        near(costmodel.rows_after(10000, 0.25), 2500.0, 1.0e-12))
+    // The two models disagree about what a scattered row costs, and that is
+    // the whole difference between two databases' plans.
+    let region = IndexStats{ name: "users_region", table: "users",
+        column: "region", clustered: false, unique: false, height: 2 }
+    say(f, "the page model puts the crossover near one per cent",
+        costmodel.index_crossover(costmodel.page_model(), users(), region) <
+        0.011 and costmodel.index_crossover(costmodel.page_model(), users(),
+            region) > 0.008)
+    say(f, "and SQLite's is high enough that an equality always wins",
+        costmodel.index_crossover(sqlite, users(), region) > 0.9)
+    // The same query, two models, two plans.
+    say(f, "so the same query gets a different plan on each",
+        explained(costmodel.page_model(), [users()],
+            [eq("users", "region", 4)], "") == ["SCAN users"] and
+        explained(sqlite, [users()], [eq("users", "region", 4)], "") ==
+        ["SEARCH users USING INDEX users_region (region=?)"])
+    // SQLite's own plans, on SQLite's own statistics.
+    say(f, "a primary key lookup is what SQLite prints for one",
+        explained(sqlite, [users()], [eq("users", "id", 10000)], "") ==
+        ["SEARCH users USING INTEGER PRIMARY KEY (rowid=?)"])
+    say(f, "an unindexed column is a scan, on either model",
+        explained(sqlite, [users()], [eq("users", "age", 62)], "") ==
+        ["SCAN users"])
+    // Join order: drive from the table a filter cuts down.
+    say(f, "a join drives from the filtered table and indexes the other",
+        explained(sqlite, [users(), orders()],
+            [eq("users", "region", 4), joins("orders", "user_id", "users")],
+            "") == ["SEARCH users USING INDEX users_region (region=?)",
+            "SEARCH orders USING INDEX orders_user (user_id=?)"])
+    say(f, "and the same query with the filter on the other side turns round",
+        explained(sqlite, [orders(), users()],
+            [eq("orders", "status", 3), joins("users", "id", "orders")], "") ==
+        ["SEARCH orders USING INDEX orders_status (status=?)",
+            "SEARCH users USING INTEGER PRIMARY KEY (rowid=?)"])
+    // ORDER BY changes the access path, because a sort avoided is worth
+    // more than the pages an index scan costs.
+    say(f, "an ordered read uses the index even with nothing to search for",
+        explained(sqlite, [users()], [], "region") ==
+        ["SCAN users USING INDEX users_region"])
+    say(f, "and an order with no index behind it needs a sort",
+        explained(sqlite, [users()], [], "age") ==
+        ["SCAN users", "USE TEMP B-TREE FOR ORDER BY"])
+    // The join costs, which is arithmetic rather than heuristics.
+    say(f, "a hash join costs twice as much when the build side spills",
+        near(costmodel.hash_join_cost(1000.0, 5000.0, 2000.0), 60.0,
+            1.0e-9) and near(costmodel.hash_join_cost(1000.0, 5000.0, 500.0),
+            120.0, 1.0e-9))
+    say(f, "a merge join is nearly free when both sides are already sorted",
+        costmodel.merge_join_cost(1000.0, 1000.0, true, true) <
+        costmodel.merge_join_cost(1000.0, 1000.0, false, false) / 10.0)
+    say(f, "and a join's size is the product over the larger distinct count",
+        near(costmodel.join_rows(100.0, 50000.0, 10000, 10000), 500.0,
+            1.0e-9))
+    // A range's selectivity comes from the column's own bounds, and a range
+    // wider than the column is the whole column rather than more than it.
+    let ages = ColumnStats{ table: "users", column: "age", distinct: 62,
+        low: 18, high: 79 }
+    say(f, "a range's selectivity is its share of the column's own span",
+        near(costmodel.range_selectivity(ages, 18, 79), 1.0, 1.0e-12) and
+        near(costmodel.range_selectivity(ages, 0, 200), 1.0, 1.0e-12) and
+        near(costmodel.range_selectivity(ages, 18, 48), 0.5, 1.0e-12) and
+        near(costmodel.range_selectivity(ages, 200, 300), 0.0, 1.0e-12))
+    say(f, "a nested loop pays the inner cost once for every outer row",
+        near(costmodel.nested_loop_cost(2500.0, 3.05), 7625.0, 1.0e-9) and
+        near(costmodel.scan_cost(sqlite, users()), 100.0, 1.0e-12))
+    say(f, "a plan over no tables is an error rather than an empty plan",
+        no_tables())
+}
+
+fn no_tables() -> bool {
+    match queryplan.plan(costmodel.sqlite_model(), [], all_indexes(), [],
+        "") {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn main() / {io} {
+    var f = 0
+    check_bplustree(f)
+    check_heapfile(f)
+    check_bitmapindex(f)
+    check_planner(f)
+    if f == 0 {
+        print("database: every claim held")
+    } else {
+        print("database: {f} claims failed")
+    }
+}

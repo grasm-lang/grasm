@@ -113,6 +113,7 @@ and the entries disagree.
 | [F95](#f95) | two packages, one variant name, and the backend picked the wrong payload | S1, backend | **fixed** |
 | [F96](#f96) | the wasm engine stopped linking, and nothing said so | S2, build | **fixed** |
 | [F97](#f97) | one method name, two meanings: `bytes.slice` took a length where `list.slice` takes an end | S2, library | **fixed** |
+| [F98](#f98) | a function returning `()` could not say so out loud | S3, backend | **fixed** |
 
 <!-- end index -->
 ## F1 — a wrapped condition must end the line with the operator (S4) — **fixed**
@@ -4221,3 +4222,48 @@ by grep, so nothing was missed by grep.
 pairs, and separately that the clamping difference is the one that remains.
 That is the invariant the old signature broke, stated in a program that runs
 under all four engines.
+
+## F98 — a function returning `()` could not say so out loud (S3, backend) — **fixed**
+
+```
+fn nothing() -> () {
+    return ()
+}
+```
+
+The interpreter ran it. `--native` refused the whole program:
+
+```
+error: native backend does not yet support (codegen bug in `nothing`:
+Compilation error: Verifier errors) — use `grasm run` (interpreter) for now
+```
+
+A Cranelift function whose Grasm return type is `()` has **no return value in
+its signature**. `return ()` took the branch for `return <expression>`, which
+evaluates the operand and emits `return_(&[val])` — one value, where the
+signature says none. Cranelift's verifier rejected the function, and the
+backend reported the rejection against itself.
+
+**Why it is S3 and not lower.** The program is correct, the interpreter runs
+it, and the refusal names no fix the author can apply — `-> ()` with
+`return ()` is how the language says "this returns nothing", and the message
+says the backend does not support something without saying what. The
+workaround is to write `return` with no operand, or to end the function
+without a return at all, and nothing pointed at either.
+
+**Why it is not higher.** It is a refusal, not a wrong answer: nothing
+miscompiles, and a bare `return` has always worked. Most unit-returning
+functions are written without an explicit `return` at all, which is why this
+survived ninety-seven findings.
+
+**The fix.** `Stmt::Return(Some(e))` now checks the function's own return
+type: when it is `()`, the operand is still evaluated — it may have effects —
+and then `return_(&[])` is emitted, matching the signature.
+
+**Found by** `packages/database-demo`, which wrote a one-line helper returning
+`()` to discard a fallible call's result. `spec/conformance/T-UNIT-RETURN.gr`
+holds the reproducer, including the cases that matter more than the trivial
+one: a unit function with an `inout` side effect, and one that returns from
+inside a branch. All three run identically under the interpreter, the native
+build and the bundle.
+

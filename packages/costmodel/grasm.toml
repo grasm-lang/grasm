@@ -1,0 +1,6 @@
+[package]
+name = "costmodel"
+version = "1.0.0"
+
+# Arithmetic on statistics. Opens nothing.
+capabilities = []

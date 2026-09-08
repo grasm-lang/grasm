@@ -1,0 +1,6 @@
+[package]
+name = "heapfile"
+version = "1.0.0"
+
+# Lays out pages in memory. Touches no disk.
+capabilities = []

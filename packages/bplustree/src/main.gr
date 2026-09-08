@@ -1,0 +1,476 @@
+// The B+ tree, and why every database uses one and no textbook explains it.
+//
+// A balanced binary tree does one comparison a node and one cache miss a
+// node. A B+ tree of order 200 does eight comparisons a node and one cache
+// miss for all eight, because the node is one page. For a million keys that
+// is three page reads instead of twenty, and when a page read is a disk seek
+// the difference is three milliseconds against twenty.
+//
+// That is the whole idea: **the tree is shaped by the storage, not by the
+// algorithm**. Bayer and McCreight published it in 1972 for disks, and it
+// survived the move to memory because a cache line is a small page and the
+// argument is the same.
+//
+// ## The plus, which is the part that matters
+//
+// A B-tree stores values in every node. A B+ tree stores them only in the
+// leaves, and links the leaves together. Two consequences, both large:
+//
+// An internal node holds only keys, so it holds more of them, so the tree is
+// shallower. And a range scan walks the leaf chain instead of the tree, so
+// `WHERE age BETWEEN 20 AND 30` is one descent and then a linear walk. Every
+// database's range query depends on that chain.
+//
+// ## The separator keys are not the data
+//
+// An internal node's keys are *separators* — they say which child to descend
+// into, and a separator may be a key that was deleted years ago. Deleting a
+// row does not have to touch the internal nodes at all, which is why deletion
+// in a B+ tree is cheap and why a tree can end up with separators for keys
+// that no longer exist.
+//
+// ## Why half full
+//
+// Every node but the root is kept at least half full, which is what bounds
+// the height. That is also why insertion splits a full node down the middle
+// rather than adding to the end: a tree built by inserting sorted keys with
+// end-splitting ends up half empty, which is the "sequential insert" problem
+// every database has a special case for.
+//
+// ## What this is not
+//
+// In memory, with no page layout, no write-ahead log, no concurrency. It is
+// the data structure, which is what makes the behaviour visible: the height,
+// the fill factor, the splits, the leaf chain. `heapfile` is the page layout
+// and `bitmapindex` the other kind of index.
+
+type BPlusError =
+    | OrderTooSmall(order: i64)
+    | KeyNotFound(key: i64)
+    | Corrupt(node: i64)
+
+type BPlusNode = {
+    /// Leaves hold keys and values; internal nodes hold separators and
+    /// children.
+    leaf: bool,
+    keys: [i64],
+    /// Only on a leaf.
+    values: [str],
+    /// Only on an internal node: one more than there are keys.
+    children: [i64],
+    /// The next leaf, or -1. This chain is what a range scan walks.
+    next: i64,
+}
+
+type BPlusTree = {
+    /// The most children an internal node may have.
+    order: i64,
+    nodes: [BPlusNode],
+    root: i64,
+}
+
+fn empty_node(leaf: bool) -> BPlusNode {
+    return BPlusNode{ leaf: leaf, keys: [], values: [], children: [],
+        next: 0 - 1 }
+}
+
+/// An empty tree of a given order.
+///
+/// Order three is the smallest that works: an internal node needs at least
+/// two children to be a tree and at least three to be able to split.
+pub fn new_tree(order: i64) -> BPlusTree ! BPlusError {
+    if order < 3 {
+        fail(OrderTooSmall(order))
+    }
+    return BPlusTree{ order: order, nodes: [empty_node(true)], root: 0 }
+}
+
+/// The leaf a key belongs in.
+pub fn find_leaf(tree: BPlusTree, key: i64) -> i64 {
+    var at = tree.root
+    while not tree.nodes[at].leaf {
+        at = tree.nodes[at].children[child_index(tree.nodes[at], key)]
+    }
+    return at
+}
+
+fn child_index(node: BPlusNode, key: i64) -> i64 {
+    var i = 0
+    while i < node.keys.len() and key >= node.keys[i] {
+        i = i + 1
+    }
+    return i
+}
+
+fn leaf_index(node: BPlusNode, key: i64) -> i64 {
+    var i = 0
+    while i < node.keys.len() and node.keys[i] < key {
+        i = i + 1
+    }
+    return i
+}
+
+/// A key's value, or the empty string.
+pub fn get(tree: BPlusTree, key: i64) -> str {
+    let leaf = tree.nodes[find_leaf(tree, key)]
+    let at = leaf_index(leaf, key)
+    if at < leaf.keys.len() and leaf.keys[at] == key {
+        return leaf.values[at]
+    }
+    return ""
+}
+
+/// Whether a key is in the tree.
+pub fn has(tree: BPlusTree, key: i64) -> bool {
+    let leaf = tree.nodes[find_leaf(tree, key)]
+    let at = leaf_index(leaf, key)
+    return at < leaf.keys.len() and leaf.keys[at] == key
+}
+
+/// A key inserted, or its value replaced.
+pub fn insert(inout tree: BPlusTree, key: i64, value: str) {
+    let leaf = find_leaf(tree, key)
+    let at = leaf_index(tree.nodes[leaf], key)
+    if at < tree.nodes[leaf].keys.len() and tree.nodes[leaf].keys[at] == key {
+        tree.nodes[leaf].values[at] = value
+        return
+    }
+    tree.nodes[leaf].keys = insert_key(tree.nodes[leaf].keys, at, key)
+    tree.nodes[leaf].values = insert_value(tree.nodes[leaf].values, at, value)
+    if tree.nodes[leaf].keys.len() < tree.order {
+        return
+    }
+    split_leaf(tree, leaf)
+}
+
+fn insert_key(keys: [i64], at: i64, key: i64) -> [i64] {
+    var out: [i64] = []
+    var i = 0
+    while i < keys.len() {
+        if i == at {
+            out.push(key)
+        }
+        out.push(keys[i])
+        i = i + 1
+    }
+    if at >= keys.len() {
+        out.push(key)
+    }
+    return out
+}
+
+fn insert_value(values: [str], at: i64, value: str) -> [str] {
+    var out: [str] = []
+    var i = 0
+    while i < values.len() {
+        if i == at {
+            out.push(value)
+        }
+        out.push(values[i])
+        i = i + 1
+    }
+    if at >= values.len() {
+        out.push(value)
+    }
+    return out
+}
+
+/// A full leaf split down the middle, and the separator pushed up.
+///
+/// Down the middle rather than at the end, which is why a tree built from
+/// sorted keys ends up half empty and why every database has a special case
+/// for a sequential insert.
+fn split_leaf(inout tree: BPlusTree, leaf: i64) {
+    let middle = tree.nodes[leaf].keys.len() / 2
+    var right = empty_node(true)
+    var i = middle
+    while i < tree.nodes[leaf].keys.len() {
+        right.keys.push(tree.nodes[leaf].keys[i])
+        right.values.push(tree.nodes[leaf].values[i])
+        i = i + 1
+    }
+    right.next = tree.nodes[leaf].next
+    tree.nodes.push(right)
+    let at = tree.nodes.len() - 1
+    tree.nodes[leaf].keys = prefix(tree.nodes[leaf].keys, middle)
+    tree.nodes[leaf].values = prefix_values(tree.nodes[leaf].values, middle)
+    tree.nodes[leaf].next = at
+    // The separator is the first key of the right leaf, and it *stays* in the
+    // leaf. Every key lives in a leaf; an internal node's keys are copies
+    // that only say which way to go.
+    promote(tree, leaf, tree.nodes[at].keys[0], at)
+}
+
+fn prefix(values: [i64], n: i64) -> [i64] {
+    var out: [i64] = []
+    var i = 0
+    while i < n {
+        out.push(values[i])
+        i = i + 1
+    }
+    return out
+}
+
+fn prefix_values(values: [str], n: i64) -> [str] {
+    var out: [str] = []
+    var i = 0
+    while i < n {
+        out.push(values[i])
+        i = i + 1
+    }
+    return out
+}
+
+fn promote(inout tree: BPlusTree, left: i64, key: i64, right: i64) {
+    let path = descend(tree, key, left)
+    if path.len() == 0 {
+        var root = empty_node(false)
+        root.keys.push(key)
+        root.children.push(left)
+        root.children.push(right)
+        tree.nodes.push(root)
+        tree.root = tree.nodes.len() - 1
+        return
+    }
+    let parent = path[path.len() - 1]
+    let at = child_index(tree.nodes[parent], key)
+    tree.nodes[parent].keys = insert_key(tree.nodes[parent].keys, at, key)
+    tree.nodes[parent].children = insert_key(tree.nodes[parent].children,
+        at + 1, right)
+    if tree.nodes[parent].keys.len() < tree.order {
+        return
+    }
+    split_internal(tree, parent)
+}
+
+/// The internal nodes above a leaf, root first.
+fn descend(tree: BPlusTree, key: i64, target: i64) -> [i64] {
+    var path: [i64] = []
+    var at = tree.root
+    while not tree.nodes[at].leaf {
+        path.push(at)
+        at = tree.nodes[at].children[child_index(tree.nodes[at], key)]
+    }
+    if at != target and path.len() == 0 {
+        return []
+    }
+    return path
+}
+
+/// A full internal node split, with the middle key moving up rather than
+/// being copied.
+///
+/// This is the one asymmetry between the two kinds of node: a leaf's
+/// separator is copied up because the data has to stay in the leaf; an
+/// internal node's is *moved*, because a separator has no data under it.
+fn split_internal(inout tree: BPlusTree, node: i64) {
+    let middle = tree.nodes[node].keys.len() / 2
+    let key = tree.nodes[node].keys[middle]
+    var right = empty_node(false)
+    var i = middle + 1
+    while i < tree.nodes[node].keys.len() {
+        right.keys.push(tree.nodes[node].keys[i])
+        i = i + 1
+    }
+    i = middle + 1
+    while i < tree.nodes[node].children.len() {
+        right.children.push(tree.nodes[node].children[i])
+        i = i + 1
+    }
+    tree.nodes.push(right)
+    let at = tree.nodes.len() - 1
+    tree.nodes[node].keys = prefix(tree.nodes[node].keys, middle)
+    tree.nodes[node].children = prefix(tree.nodes[node].children, middle + 1)
+    promote_internal(tree, node, key, at)
+}
+
+fn promote_internal(inout tree: BPlusTree, left: i64, key: i64, right: i64) {
+    if tree.root == left {
+        var root = empty_node(false)
+        root.keys.push(key)
+        root.children.push(left)
+        root.children.push(right)
+        tree.nodes.push(root)
+        tree.root = tree.nodes.len() - 1
+        return
+    }
+    let parent = parent_of(tree, left)
+    let at = child_index(tree.nodes[parent], key)
+    tree.nodes[parent].keys = insert_key(tree.nodes[parent].keys, at, key)
+    tree.nodes[parent].children = insert_key(tree.nodes[parent].children,
+        at + 1, right)
+    if tree.nodes[parent].keys.len() < tree.order {
+        return
+    }
+    split_internal(tree, parent)
+}
+
+fn parent_of(tree: BPlusTree, child: i64) -> i64 {
+    var i = 0
+    while i < tree.nodes.len() {
+        if not tree.nodes[i].leaf {
+            for candidate in tree.nodes[i].children {
+                if candidate == child {
+                    return i
+                }
+            }
+        }
+        i = i + 1
+    }
+    return tree.root
+}
+
+/// The tree's height, counting the root as one.
+pub fn height(tree: BPlusTree) -> i64 {
+    var at = tree.root
+    var depth = 1
+    while not tree.nodes[at].leaf {
+        at = tree.nodes[at].children[0]
+        depth = depth + 1
+    }
+    return depth
+}
+
+/// The leftmost leaf, where a full scan starts.
+pub fn first_leaf(tree: BPlusTree) -> i64 {
+    var at = tree.root
+    while not tree.nodes[at].leaf {
+        at = tree.nodes[at].children[0]
+    }
+    return at
+}
+
+/// Every key in order, by walking the leaf chain.
+///
+/// Not by walking the tree. The chain is the whole reason a range query is
+/// one descent and then a linear read.
+pub fn keys(tree: BPlusTree) -> [i64] {
+    var out: [i64] = []
+    var at = first_leaf(tree)
+    while at >= 0 {
+        for key in tree.nodes[at].keys {
+            out.push(key)
+        }
+        at = tree.nodes[at].next
+    }
+    return out
+}
+
+/// The keys between two bounds, inclusive.
+pub fn range(tree: BPlusTree, low: i64, high: i64) -> [(i64, str)] {
+    var out: [(i64, str)] = []
+    var at = find_leaf(tree, low)
+    while at >= 0 {
+        var i = 0
+        while i < tree.nodes[at].keys.len() {
+            let key = tree.nodes[at].keys[i]
+            if key > high {
+                return out
+            }
+            if key >= low {
+                out.push((key, tree.nodes[at].values[i]))
+            }
+            i = i + 1
+        }
+        at = tree.nodes[at].next
+    }
+    return out
+}
+
+/// How many keys the tree holds.
+pub fn count(tree: BPlusTree) -> i64 {
+    return keys(tree).len()
+}
+
+/// How full the leaves are, as a fraction.
+///
+/// A tree built from random keys settles near 0.69 — ln 2, which is a real
+/// result and not a coincidence. One built from sorted keys with a
+/// middle-split ends near 0.5, which is the sequential-insert problem.
+pub fn fill_factor(tree: BPlusTree) -> f64 {
+    var used = 0
+    var leaves = 0
+    var at = first_leaf(tree)
+    while at >= 0 {
+        used = used + tree.nodes[at].keys.len()
+        leaves = leaves + 1
+        at = tree.nodes[at].next
+    }
+    if leaves == 0 {
+        return 0.0
+    }
+    return used.as_f64() / (leaves * (tree.order - 1)).as_f64()
+}
+
+/// How many leaves the tree has.
+pub fn leaf_count(tree: BPlusTree) -> i64 {
+    var count = 0
+    var at = first_leaf(tree)
+    while at >= 0 {
+        count = count + 1
+        at = tree.nodes[at].next
+    }
+    return count
+}
+
+/// A key removed from its leaf.
+///
+/// The separators above are left alone, which is legal and is why deletion is
+/// cheap: a separator that no longer names a live key still points the right
+/// way. It is also why a tree can hold separators for keys deleted years ago.
+pub fn remove(inout tree: BPlusTree, key: i64) -> bool {
+    let leaf = find_leaf(tree, key)
+    let at = leaf_index(tree.nodes[leaf], key)
+    if at >= tree.nodes[leaf].keys.len() or tree.nodes[leaf].keys[at] != key {
+        return false
+    }
+    tree.nodes[leaf].keys = without(tree.nodes[leaf].keys, at)
+    tree.nodes[leaf].values = without_values(tree.nodes[leaf].values, at)
+    return true
+}
+
+fn without(values: [i64], at: i64) -> [i64] {
+    var out: [i64] = []
+    var i = 0
+    while i < values.len() {
+        if i != at {
+            out.push(values[i])
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn without_values(values: [str], at: i64) -> [str] {
+    var out: [str] = []
+    var i = 0
+    while i < values.len() {
+        if i != at {
+            out.push(values[i])
+        }
+        i = i + 1
+    }
+    return out
+}
+
+/// Whether every separator still points the right way.
+///
+/// The invariant that matters: everything left of a separator is less than
+/// it and everything right is at least it. A tree that fails this returns
+/// wrong answers rather than crashing, which is the worst kind of index bug.
+pub fn is_ordered(tree: BPlusTree) -> bool {
+    let all = keys(tree)
+    var i = 1
+    while i < all.len() {
+        if all[i] <= all[i - 1] {
+            return false
+        }
+        i = i + 1
+    }
+    for key in all {
+        if not has(tree, key) {
+            return false
+        }
+    }
+    return true
+}

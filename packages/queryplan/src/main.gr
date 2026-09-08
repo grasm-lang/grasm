@@ -1,0 +1,322 @@
+// Choosing a plan, and printing it the way SQLite does.
+//
+// A query says what, not how. The optimiser decides how: which index to use
+// for each table, which order to join them in, and whether the result needs
+// sorting. Three decisions, and the third depends on the first two.
+//
+// ## The access path
+//
+// For each table: scan it, or use an index. An index wins when the predicate
+// on it is selective enough — `costmodel.index_crossover` says where that is
+// — and when it is not, the optimiser scans and ignores the index, which is
+// the behaviour that makes people add hints.
+//
+// An index also wins when it produces the order the query asked for, even at
+// a higher cost, because the sort it avoids is worth more than the pages it
+// costs. That is why `ORDER BY indexed_column` reads through the index and
+// `ORDER BY anything_else` reads the table and sorts.
+//
+// ## The join order
+//
+// The number of orders for *n* tables is *n* factorial, so an exhaustive
+// search stops being possible around ten tables. Every optimiser uses
+// dynamic programming to about that many and then a heuristic; this uses the
+// heuristic alone — **drive from the most selective table** — because it is
+// what SQLite's own planner does for the shapes here and it is the rule worth
+// knowing.
+//
+// The rule works because the outer side of a nested loop is scanned once and
+// the inner side once per outer row. Starting with the table that a filter
+// cuts to ten rows means ten inner lookups; starting with the other one means
+// fifty thousand.
+//
+// ## Why the output looks like SQLite's
+//
+// So it can be compared with SQLite's. `SEARCH` means an index was used and
+// `SCAN` means it was not; the phrasing is SQLite's and the decisions are
+// checked against SQLite's on the same statistics.
+
+import costmodel
+
+type QueryPlanError =
+    | NoTables()
+    | UnknownTable(name: str)
+
+type PlanPredicate = {
+    table: str,
+    column: str,
+    /// `eq`, `range`, or `join`.
+    kind: str,
+    /// For a join: the other side.
+    other_table: str,
+    other_column: str,
+    selectivity: f64,
+}
+
+type PlanStep = {
+    table: str,
+    /// The index used, or the empty string for a scan.
+    index: str,
+    /// Whether the index is the table's own primary key.
+    primary: bool,
+    /// The column the index was probed on.
+    column: str,
+    /// `eq` or `join` for a search; empty for a scan.
+    probe: str,
+    rows: f64,
+    cost: f64,
+}
+
+type QueryPlan = {
+    steps: [PlanStep],
+    /// Whether a sort has to be added at the end.
+    sorts: bool,
+    order_column: str,
+    cost: f64,
+}
+
+/// The cheapest way into one table, given the predicates on it.
+///
+/// Considers a scan and every index, and picks the cheapest — except that an
+/// index producing the order the query wants gets the sort's cost taken off,
+/// which is how `ORDER BY` changes an access path.
+pub fn best_access(model: CostModel, table: TableStats,
+    indexes: [IndexStats], predicates: [PlanPredicate],
+    order_column: str) -> PlanStep {
+    var best = PlanStep{ table: table.name, index: "", primary: false,
+        column: "", probe: "", rows: table.rows.as_f64(),
+        cost: costmodel.scan_cost(model, table) }
+    var best_score = best.cost
+    if order_column != "" {
+        // A scan has to be sorted afterwards, so it carries that cost when
+        // the query asked for an order.
+        best_score = best_score + costmodel.sort_cost(best.rows)
+    }
+    for index in indexes {
+        if index.table != table.name {
+            continue
+        }
+        let candidate = access_by(model, table, index, predicates,
+            order_column)
+        var score = candidate.cost
+        if order_column != "" and index.column != order_column {
+            score = score + costmodel.sort_cost(candidate.rows)
+        }
+        if score < best_score {
+            best = candidate
+            best_score = score
+        }
+    }
+    return best
+}
+
+fn access_by(model: CostModel, table: TableStats, index: IndexStats,
+    predicates: [PlanPredicate], order_column: str) -> PlanStep {
+    for predicate in predicates {
+        if predicate.table != table.name or predicate.column != index.column {
+            continue
+        }
+        if predicate.kind != "eq" and predicate.kind != "join" {
+            continue
+        }
+        return PlanStep{ table: table.name, index: index.name,
+            primary: index.clustered, column: index.column,
+            probe: predicate.kind,
+            rows: costmodel.rows_after(table.rows, predicate.selectivity),
+            cost: costmodel.index_cost(model, table, index,
+                predicate.selectivity) }
+    }
+    // No predicate on this index. It is still worth using if it produces the
+    // order the query wants — a full scan of the index rather than a probe.
+    if index.column == order_column {
+        return PlanStep{ table: table.name, index: index.name,
+            primary: index.clustered, column: index.column, probe: "",
+            rows: table.rows.as_f64(),
+            cost: costmodel.scan_cost(model, table) * 1.5 }
+    }
+    return PlanStep{ table: table.name, index: index.name,
+        primary: index.clustered, column: index.column, probe: "",
+        rows: table.rows.as_f64(),
+        cost: costmodel.scan_cost(model, table) * 10.0 }
+}
+
+/// A plan for a query over one or more tables.
+///
+/// The join order is the heuristic every textbook gives and every optimiser
+/// starts from: drive from the table a filter cuts down most, then reach the
+/// others through their indexes.
+pub fn plan(model: CostModel, tables: [TableStats],
+    indexes: [IndexStats], predicates: [PlanPredicate],
+    order_column: str) -> QueryPlan ! QueryPlanError {
+    if tables.len() == 0 {
+        fail(NoTables())
+    }
+    var remaining = tables
+    var steps: [PlanStep] = []
+    var total = 0.0
+    var driver = true
+    while remaining.len() > 0 {
+        let pick = cheapest(model, remaining, indexes, predicates,
+            order_column, driver, steps)
+        steps.push(pick.0)
+        total = total + pick.0.cost
+        remaining = without(remaining, pick.1)
+        driver = false
+    }
+    var sorts = false
+    if order_column != "" {
+        sorts = steps[0].index == "" or steps[0].column != order_column
+        if sorts {
+            total = total + costmodel.sort_cost(steps[0].rows)
+        }
+    }
+    return QueryPlan{ steps: steps, sorts: sorts,
+        order_column: order_column, cost: total }
+}
+
+fn cheapest(model: CostModel, tables: [TableStats],
+    indexes: [IndexStats], predicates: [PlanPredicate], order_column: str,
+    driver: bool, chosen: [PlanStep]) -> (PlanStep, i64) {
+    var best = PlanStep{ table: "", index: "", primary: false, column: "",
+        probe: "", rows: 0.0, cost: 0.0 }
+    var best_at = 0
+    var best_score = 0.0 - 1.0
+    let filtered = filtered_tables(predicates)
+    var i = 0
+    while i < tables.len() {
+        let usable = visible(predicates, tables[i].name, driver, chosen)
+        var order = ""
+        if driver {
+            order = order_column
+        }
+        let step = best_access(model, tables[i], indexes, usable, order)
+        // The driving table is chosen by how few rows it produces, not by
+        // what it costs: the outer side is read once and the inner side once
+        // per outer row, so the row count is what multiplies.
+        var score = step.cost
+        if driver {
+            // A table with no filter on it is not a selective table, and
+            // driving from one means reading everything and throwing most of
+            // it away after the join. Only tables a filter touches are
+            // candidates, unless nothing has one.
+            if filtered.len() > 0 and not contains(filtered, tables[i].name) {
+                i = i + 1
+                continue
+            }
+            score = step.rows
+        }
+        if best_score < 0.0 or score < best_score {
+            best = step
+            best_at = i
+            best_score = score
+        }
+        i = i + 1
+    }
+    return (best, best_at)
+}
+
+/// The tables a non-join predicate touches.
+fn filtered_tables(predicates: [PlanPredicate]) -> [str] {
+    var out: [str] = []
+    for predicate in predicates {
+        if predicate.kind != "join" and not contains(out, predicate.table) {
+            out.push(predicate.table)
+        }
+    }
+    return out
+}
+
+fn contains(names: [str], wanted: str) -> bool {
+    for name in names {
+        if name == wanted {
+            return true
+        }
+    }
+    return false
+}
+
+/// The predicates usable on a table at this point in the plan.
+///
+/// A join predicate is only usable once the other side has been read: an
+/// index on `orders.user_id` is no help until there is a user to look up.
+fn visible(predicates: [PlanPredicate], table: str, driver: bool,
+    chosen: [PlanStep]) -> [PlanPredicate] {
+    var out: [PlanPredicate] = []
+    for predicate in predicates {
+        if predicate.table != table {
+            continue
+        }
+        if predicate.kind != "join" {
+            out.push(predicate)
+            continue
+        }
+        if driver {
+            continue
+        }
+        for step in chosen {
+            if step.table == predicate.other_table {
+                out.push(predicate)
+            }
+        }
+    }
+    return out
+}
+
+fn without(tables: [TableStats], at: i64) -> [TableStats] {
+    var out: [TableStats] = []
+    var i = 0
+    while i < tables.len() {
+        if i != at {
+            out.push(tables[i])
+        }
+        i = i + 1
+    }
+    return out
+}
+
+/// The plan as SQLite prints it.
+///
+/// `SEARCH` when an index was probed, `SCAN` when it was not, the index named
+/// unless it is the primary key, and a line for the sort when one is needed.
+pub fn explain(plan: QueryPlan) -> [str] {
+    var out: [str] = []
+    for step in plan.steps {
+        out.push(explain_step(step))
+    }
+    if plan.sorts {
+        out.push("USE TEMP B-TREE FOR ORDER BY")
+    }
+    return out
+}
+
+fn explain_step(step: PlanStep) -> str {
+    if step.index == "" {
+        return "SCAN " + step.table
+    }
+    if step.probe == "" {
+        return "SCAN " + step.table + " USING INDEX " + step.index
+    }
+    if step.primary {
+        return "SEARCH " + step.table + " USING INTEGER PRIMARY KEY (rowid=?)"
+    }
+    return "SEARCH " + step.table + " USING INDEX " + step.index + " (" +
+    step.column + "=?)"
+}
+
+/// Whether a plan reads a table without using any index.
+pub fn has_scan(plan: QueryPlan) -> bool {
+    for step in plan.steps {
+        if step.index == "" {
+            return true
+        }
+    }
+    return false
+}
+
+/// The table the plan drives from.
+pub fn driving_table(plan: QueryPlan) -> str {
+    if plan.steps.len() == 0 {
+        return ""
+    }
+    return plan.steps[0].table
+}

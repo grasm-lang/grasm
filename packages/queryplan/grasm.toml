@@ -1,0 +1,10 @@
+[package]
+name = "queryplan"
+version = "1.0.0"
+
+# Chooses a plan. Runs nothing.
+capabilities = []
+
+[dependencies.costmodel]
+path = "../costmodel"
+version = "^1.0.0"

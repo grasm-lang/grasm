@@ -1,0 +1,24 @@
+[package]
+name = "database_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.bplustree]
+path = "../bplustree"
+version = "^1.0.0"
+
+[dependencies.heapfile]
+path = "../heapfile"
+version = "^1.0.0"
+
+[dependencies.bitmapindex]
+path = "../bitmapindex"
+version = "^1.0.0"
+
+[dependencies.costmodel]
+path = "../costmodel"
+version = "^1.0.0"
+
+[dependencies.queryplan]
+path = "../queryplan"
+version = "^1.0.0"

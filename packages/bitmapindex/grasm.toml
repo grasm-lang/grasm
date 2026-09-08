@@ -1,0 +1,6 @@
+[package]
+name = "bitmapindex"
+version = "1.0.0"
+
+# An index in memory. Touches no disk.
+capabilities = []

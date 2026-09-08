@@ -1,0 +1,301 @@
+// What a query optimiser is actually doing: guessing how many rows.
+//
+// Choosing a plan is a search over an enormous space, and the search is only
+// as good as the number it is minimising. That number is an estimate of how
+// many rows each step produces, and almost every catastrophically bad query
+// plan is an estimate that was wrong by three orders of magnitude — not a
+// search that picked the wrong branch.
+//
+// So this is the estimation, and `queryplan` is the search that uses it.
+//
+// ## The independence assumption, and why it is wrong
+//
+// Given `WHERE city = 'Paris' AND country = 'France'`, an optimiser
+// multiplies the two selectivities. If the city has 10,000 values and the
+// country 200, it estimates one row in two million. The real answer is one in
+// ten thousand, because every Paris row *is* a France row.
+//
+// Every optimiser does this, every optimiser knows it is wrong, and the fix —
+// multi-column statistics — has to be asked for by hand in PostgreSQL and
+// Oracle because there are too many column pairs to collect automatically.
+// Correlated columns are the single most common cause of a plan that takes an
+// hour instead of a second.
+//
+// ## Why an index is not always faster
+//
+// An unclustered index lookup costs one page read a row, because the rows are
+// scattered. A table scan costs one page read per *page*, and a page holds a
+// hundred rows. So an index wins only below roughly one per cent selectivity,
+// and above that a scan is faster — which is why an optimiser ignores the
+// index you added and why forcing it makes the query slower.
+//
+// ## Sorted output is worth something
+//
+// A plan that produces rows in the order asked for avoids the sort entirely.
+// A sort of a million rows that do not fit in memory is a spill to disk, and
+// an index scan that costs twice as much but avoids it wins easily. This is
+// why an optimiser sometimes picks a slower access path.
+//
+// ## The join costs
+//
+// Nested loop is cheap for a small outer and an indexed inner, and quadratic
+// otherwise. Hash join builds a table from the smaller side and is linear,
+// but needs the memory. Merge join is linear and needs both sides sorted, so
+// it is nearly free when the inputs already are and expensive when they are
+// not. Choosing between them is arithmetic, and the arithmetic is here.
+//
+// Checked against SQLite's own choices: `queryplan` uses this model and picks
+// the plans SQLite prints.
+
+type CostError =
+    | NoRows()
+    | BadSelectivity(value: f64)
+
+type TableStats = {
+    name: str,
+    rows: i64,
+    /// How many pages the table occupies. Rows per page is what makes a scan
+    /// cheaper than it looks.
+    pages: i64,
+}
+
+type ColumnStats = {
+    table: str,
+    column: str,
+    /// How many distinct values. One over this is the equality selectivity,
+    /// and it is the single most important number an optimiser has.
+    distinct: i64,
+    low: i64,
+    high: i64,
+}
+
+type IndexStats = {
+    name: str,
+    table: str,
+    column: str,
+    /// A primary key's index is clustered: the rows are in it, so a lookup
+    /// costs no extra page read.
+    clustered: bool,
+    unique: bool,
+    /// Levels in the B+ tree, root included.
+    height: i64,
+}
+
+/// The fraction of rows an equality matches.
+///
+/// One over the distinct count, which assumes the values are evenly spread.
+/// They never are — a status column is 95% 'done' — and that is what a
+/// histogram is for.
+pub fn equality_selectivity(distinct: i64) -> f64 {
+    if distinct <= 0 {
+        return 1.0
+    }
+    return 1.0 / distinct.as_f64()
+}
+
+/// The fraction a range matches, assuming an even spread.
+pub fn range_selectivity(column: ColumnStats, from: i64, to: i64) -> f64 {
+    if column.high <= column.low {
+        return 1.0
+    }
+    var start = from
+    var stop = to
+    if start < column.low {
+        start = column.low
+    }
+    if stop > column.high {
+        stop = column.high
+    }
+    if stop < start {
+        return 0.0
+    }
+    return (stop - start + 1).as_f64() /
+    (column.high - column.low + 1).as_f64()
+}
+
+/// Two predicates ANDed, assuming they are independent.
+///
+/// They usually are not. This is the multiplication that turns "city = Paris
+/// and country = France" into an estimate of one row in two million, and it
+/// is why correlated columns produce plans that take an hour.
+pub fn conjunction(left: f64, right: f64) -> f64 {
+    return left * right
+}
+
+/// Two predicates ORed, under the same assumption.
+///
+/// Not `left + right`: that double-counts the rows matching both, and on two
+/// predicates of 0.6 it produces a selectivity of 1.2.
+pub fn disjunction(left: f64, right: f64) -> f64 {
+    return left + right - left * right
+}
+
+/// A predicate negated.
+pub fn negation(selectivity: f64) -> f64 {
+    return 1.0 - selectivity
+}
+
+/// How many rows survive a selectivity.
+///
+/// Never rounded down to zero. An estimate of zero rows makes every step
+/// above it free, so the optimiser stops caring what happens there — and the
+/// step that "produces nothing" is the one that produces a million.
+pub fn rows_after(rows: i64, selectivity: f64) -> f64 {
+    let out = rows.as_f64() * selectivity
+    if out < 1.0 {
+        return 1.0
+    }
+    return out
+}
+
+/// What a scan and a lookup cost, relative to each other.
+///
+/// The one number that matters is what an unclustered index's per-row fetch
+/// costs against a sequential page read, and databases disagree about it by
+/// two orders of magnitude — which is why the same query gets a different
+/// plan on each of them.
+type CostModel = {
+    /// Charged for every row an unclustered index fetches.
+    random_page_cost: f64,
+    /// Charged for every page of a sequential scan.
+    sequential_page_cost: f64,
+}
+
+/// The textbook model: a scattered row costs a whole page read.
+///
+/// What PostgreSQL and Oracle approximate, and it puts the crossover near one
+/// per cent — above that a scan wins and the index you added is ignored.
+pub fn page_model() -> CostModel {
+    return CostModel{ random_page_cost: 1.0, sequential_page_cost: 1.0 }
+}
+
+/// SQLite's, which charges very little for a row fetched through an index.
+///
+/// SQLite's tables *are* B-trees keyed by rowid, so an index lookup is a
+/// second B-tree descent into pages that are usually already cached rather
+/// than a seek. The consequence is visible and surprising: **SQLite uses an
+/// index for an equality constraint whatever its selectivity**, even at fifty
+/// per cent, where the page model would scan.
+pub fn sqlite_model() -> CostModel {
+    return CostModel{ random_page_cost: 0.01, sequential_page_cost: 1.0 }
+}
+
+/// What a full table scan costs, in page reads.
+pub fn scan_cost(model: CostModel, table: TableStats) -> f64 {
+    return table.pages.as_f64() * model.sequential_page_cost
+}
+
+/// What an index lookup costs, in page reads.
+///
+/// The descent, plus the model's per-row charge for each row fetched when the
+/// index is not clustered. That per-row charge is the whole reason an index
+/// stops being worth it — and where it stops depends entirely on the model.
+pub fn index_cost(model: CostModel, table: TableStats, index: IndexStats,
+    selectivity: f64) -> f64 {
+    let matched = rows_after(table.rows, selectivity)
+    let cost = index.height.as_f64()
+    if index.clustered {
+        // The rows are in the index, so the only extra cost is the leaves
+        // they occupy.
+        return cost + matched / rows_per_page(table)
+    }
+    return cost + matched * model.random_page_cost
+}
+
+fn rows_per_page(table: TableStats) -> f64 {
+    if table.pages <= 0 {
+        return 1.0
+    }
+    return table.rows.as_f64() / table.pages.as_f64()
+}
+
+/// The selectivity below which an index beats a scan.
+///
+/// A hundred rows to a page puts it near one per cent, which is the number
+/// every database administrator has heard and few have seen derived.
+pub fn index_crossover(model: CostModel, table: TableStats,
+    index: IndexStats) -> f64 {
+    var low = 0.0
+    var high = 1.0
+    for _i in 0..40 {
+        let middle = (low + high) / 2.0
+        if index_cost(model, table, index, middle) < scan_cost(model, table) {
+            low = middle
+        } else {
+            high = middle
+        }
+    }
+    return low
+}
+
+/// What sorting costs, as a page-read equivalent.
+///
+/// Rows times the log of rows, which is the comparison count, scaled to
+/// pages. Real sorts are worse than this when they spill.
+pub fn sort_cost(rows: f64) -> f64 {
+    if rows <= 1.0 {
+        return 0.0
+    }
+    return rows * (rows.ln() / (2.0).ln()) / 100.0
+}
+
+/// A nested loop join: the inner side once for every outer row.
+///
+/// Cheap when the outer is small and the inner is indexed, quadratic when it
+/// is not. It is the only join that needs no memory, which is why it is the
+/// fallback everywhere.
+pub fn nested_loop_cost(outer_rows: f64, inner_lookup: f64) -> f64 {
+    return outer_rows * inner_lookup
+}
+
+/// A hash join: build from the smaller side, probe with the larger.
+///
+/// Linear in both inputs, and needs the build side in memory. When it does
+/// not fit, the join spills and partitions, and the cost roughly doubles.
+pub fn hash_join_cost(build_rows: f64, probe_rows: f64,
+    memory_rows: f64) -> f64 {
+    let base = (build_rows + probe_rows) / 100.0
+    if build_rows <= memory_rows {
+        return base
+    }
+    return base * 2.0
+}
+
+/// A merge join: one pass over each side, if both are already sorted.
+///
+/// Nearly free when they are, and the cost of two sorts when they are not —
+/// which is why an optimiser will pick an index scan that is twice as
+/// expensive to feed one.
+pub fn merge_join_cost(left_rows: f64, right_rows: f64, left_sorted: bool,
+    right_sorted: bool) -> f64 {
+    var cost = (left_rows + right_rows) / 100.0
+    if not left_sorted {
+        cost = cost + sort_cost(left_rows)
+    }
+    if not right_sorted {
+        cost = cost + sort_cost(right_rows)
+    }
+    return cost
+}
+
+/// How many rows a join produces, by the containment assumption.
+///
+/// The textbook estimate: the product of the inputs over the larger distinct
+/// count. It assumes every value on the smaller side has a match, which is
+/// true for a foreign key and false otherwise — and when it is false the
+/// estimate is high, which is the safe direction.
+pub fn join_rows(left_rows: f64, right_rows: f64, left_distinct: i64,
+    right_distinct: i64) -> f64 {
+    var larger = left_distinct
+    if right_distinct > larger {
+        larger = right_distinct
+    }
+    if larger <= 0 {
+        return left_rows * right_rows
+    }
+    let out = left_rows * right_rows / larger.as_f64()
+    if out < 1.0 {
+        return 1.0
+    }
+    return out
+}

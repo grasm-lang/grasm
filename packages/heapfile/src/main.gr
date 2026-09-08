@@ -1,0 +1,323 @@
+// The slotted page: how a database actually stores a row.
+//
+// A table is a file of fixed-size pages, usually 4 or 8 KB, and a page holds
+// rows. Rows are variable length, so the page cannot be an array. What every
+// database uses instead — PostgreSQL, SQLite, InnoDB, SQL Server, all of them
+// — is the same layout, and it is worth knowing because it explains a great
+// deal of database behaviour that otherwise looks arbitrary.
+//
+// ## The layout
+//
+// A header at the front. Then a **slot array** growing forwards, one small
+// entry a row saying where the row is and how long. Then free space. Then the
+// **rows themselves**, growing backwards from the end of the page.
+//
+// The two grow towards each other and the page is full when they meet. That
+// is the whole trick, and it buys three things at once: a row can be found in
+// one indirection, a row can be moved within the page without anything
+// outside noticing, and free space is one number rather than a list.
+//
+// ## Why a row id is (page, slot) and not an offset
+//
+// An index entry points at a slot, not at a row. So compaction can slide
+// every row on the page to close the gaps and only the slot array has to
+// change — the index does not, and the rows keep their identities. If a row
+// id were an offset, every index in the table would have to be rewritten
+// every time a page was compacted, and no database could afford to compact.
+//
+// ## Deletion, and why a table does not shrink
+//
+// Deleting a row marks its slot dead and leaves the bytes. The space is not
+// reusable until the page is compacted, and compaction only happens when the
+// page is next written to. That is why `DELETE FROM t` does not make the file
+// smaller, and why `VACUUM` exists.
+//
+// ## The row that no longer fits
+//
+// Update a row to be longer and it may not fit in its page. Moving it would
+// change its id, so instead the slot is turned into a **forwarding pointer**
+// to the row's new home, and a reader following the pointer does two page
+// reads instead of one. Enough of those and the table needs reorganising —
+// which is what Oracle calls row migration and PostgreSQL avoids by writing a
+// new version and leaving the old one for the vacuum.
+//
+// ## What this is not
+//
+// No file, no buffer pool, no write-ahead log, no MVCC. The page layout,
+// which is the part that explains the behaviour.
+
+type HeapError =
+    | PageFull(needed: i64, free: i64)
+    | NoSuchSlot(slot: i64)
+    | SlotDead(slot: i64)
+    | RowTooLarge(size: i64, capacity: i64)
+
+type HeapSlot = {
+    /// Where the row starts. -1 for a dead slot.
+    offset: i64,
+    length: i64,
+    /// The page a forwarded row moved to, or -1.
+    forwarded_to: i64,
+    forwarded_slot: i64,
+}
+
+type HeapPage = {
+    size: i64,
+    slots: [HeapSlot],
+    /// Row bytes, keyed by slot. Stored separately from the page image so
+    /// that the layout arithmetic is visible rather than implied.
+    rows: [bytes],
+    /// Where the rows currently start, counting down from the page's end.
+    row_start: i64,
+}
+
+/// The bytes a page header takes: a slot count and the row-start pointer.
+pub fn header_size() -> i64 {
+    return 8
+}
+
+/// The bytes one slot entry takes.
+pub fn slot_size() -> i64 {
+    return 4
+}
+
+/// An empty page.
+pub fn new_page(size: i64) -> HeapPage {
+    return HeapPage{ size: size, slots: [], rows: [], row_start: size }
+}
+
+/// The space a page has left for one more row, slot entry included.
+///
+/// The number a database checks before an insert, and it counts the slot as
+/// well as the row — a page with a hundred bytes free cannot take a
+/// hundred-byte row.
+pub fn free_space(page: HeapPage) -> i64 {
+    let slot_end = header_size() + page.slots.len() * slot_size()
+    return page.row_start - slot_end
+}
+
+/// The largest row a page could ever hold, which is less than the page size.
+pub fn capacity(size: i64) -> i64 {
+    return size - header_size() - slot_size()
+}
+
+/// A row added, answering its slot number.
+pub fn insert(inout page: HeapPage, row: bytes) -> i64 ! HeapError {
+    if row.len() > capacity(page.size) {
+        fail(RowTooLarge(row.len(), capacity(page.size)))
+    }
+    // A dead slot is reused before a new one is added, because a slot number
+    // that has been handed out to an index must never be reused for a
+    // *different* row while the index still points at it — but a slot whose
+    // row was deleted has already been removed from every index.
+    let reused = first_dead(page)
+    let needed = row.len() + if reused >= 0 { 0 } else { slot_size() }
+    if needed > free_space(page) {
+        fail(PageFull(needed, free_space(page)))
+    }
+    page.row_start = page.row_start - row.len()
+    if reused >= 0 {
+        page.slots[reused] = HeapSlot{ offset: page.row_start,
+            length: row.len(), forwarded_to: 0 - 1, forwarded_slot: 0 - 1 }
+        page.rows[reused] = row
+        return reused
+    }
+    page.slots.push(HeapSlot{ offset: page.row_start, length: row.len(),
+        forwarded_to: 0 - 1, forwarded_slot: 0 - 1 })
+    page.rows.push(row)
+    return page.slots.len() - 1
+}
+
+fn first_dead(page: HeapPage) -> i64 {
+    var i = 0
+    while i < page.slots.len() {
+        if page.slots[i].offset < 0 and page.slots[i].forwarded_to < 0 {
+            return i
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+/// A row read back.
+pub fn read(page: HeapPage, slot: i64) -> bytes ! HeapError {
+    if slot < 0 or slot >= page.slots.len() {
+        fail(NoSuchSlot(slot))
+    }
+    if page.slots[slot].offset < 0 {
+        fail(SlotDead(slot))
+    }
+    return page.rows[slot]
+}
+
+/// A row deleted: the slot dies and the bytes stay.
+///
+/// The space is not reusable until the page is compacted, which is why
+/// deleting rows does not make a table smaller and why `VACUUM` exists.
+pub fn remove(inout page: HeapPage, slot: i64) -> bool {
+    if slot < 0 or slot >= page.slots.len() or page.slots[slot].offset < 0 {
+        return false
+    }
+    page.slots[slot] = HeapSlot{ offset: 0 - 1, length: 0,
+        forwarded_to: 0 - 1, forwarded_slot: 0 - 1 }
+    page.rows[slot] = "".to_bytes()
+    return true
+}
+
+/// The bytes a compaction would recover.
+pub fn dead_space(page: HeapPage) -> i64 {
+    var live = 0
+    for slot in page.slots {
+        if slot.offset >= 0 {
+            live = live + slot.length
+        }
+    }
+    return page.size - page.row_start - live
+}
+
+/// A page compacted: the live rows slid together, the slot numbers kept.
+///
+/// The slot numbers are the point. Every index in the table points at slots,
+/// so compaction changes only the offsets inside the page and no index has to
+/// be touched — which is the only reason a database can afford to compact at
+/// all.
+pub fn compact(inout page: HeapPage) -> i64 {
+    let before = free_space(page)
+    var at = page.size
+    var i = page.slots.len() - 1
+    while i >= 0 {
+        if page.slots[i].offset >= 0 {
+            at = at - page.slots[i].length
+            page.slots[i].offset = at
+        }
+        i = i - 1
+    }
+    page.row_start = at
+    // Trailing dead slots can go: nothing points at a slot past the end.
+    while page.slots.len() > 0 and
+    page.slots[page.slots.len() - 1].offset < 0 and
+    page.slots[page.slots.len() - 1].forwarded_to < 0 {
+        page.slots = drop_last(page.slots)
+        page.rows = drop_last_rows(page.rows)
+    }
+    return free_space(page) - before
+}
+
+fn drop_last(slots: [HeapSlot]) -> [HeapSlot] {
+    var out: [HeapSlot] = []
+    var i = 0
+    while i < slots.len() - 1 {
+        out.push(slots[i])
+        i = i + 1
+    }
+    return out
+}
+
+fn drop_last_rows(rows: [bytes]) -> [bytes] {
+    var out: [bytes] = []
+    var i = 0
+    while i < rows.len() - 1 {
+        out.push(rows[i])
+        i = i + 1
+    }
+    return out
+}
+
+/// A row updated in place, or forwarded when it no longer fits.
+///
+/// Forwarding keeps the row's identity, which every index depends on, at the
+/// cost of a second page read for every reader that follows it.
+pub fn update(inout page: HeapPage, slot: i64,
+    row: bytes) -> bool ! HeapError {
+    if slot < 0 or slot >= page.slots.len() {
+        fail(NoSuchSlot(slot))
+    }
+    if page.slots[slot].offset < 0 {
+        fail(SlotDead(slot))
+    }
+    if row.len() <= page.slots[slot].length {
+        page.slots[slot].length = row.len()
+        page.rows[slot] = row
+        return true
+    }
+    // The whole new row has to fit in the free space, not just the growth:
+    // the old bytes stay where they are until the page is compacted, so a
+    // row that grows by ten needs room for all of it and not for ten.
+    if row.len() <= free_space(page) {
+        page.row_start = page.row_start - row.len()
+        page.slots[slot] = HeapSlot{ offset: page.row_start,
+            length: row.len(), forwarded_to: 0 - 1, forwarded_slot: 0 - 1 }
+        page.rows[slot] = row
+        return true
+    }
+    return false
+}
+
+/// A slot turned into a pointer at the row's new home.
+pub fn forward(inout page: HeapPage, slot: i64, to_page: i64,
+    to_slot: i64) ! HeapError {
+    if slot < 0 or slot >= page.slots.len() {
+        fail(NoSuchSlot(slot))
+    }
+    page.slots[slot] = HeapSlot{ offset: 0 - 1, length: 0,
+        forwarded_to: to_page, forwarded_slot: to_slot }
+    page.rows[slot] = "".to_bytes()
+}
+
+/// Where a slot's row really lives, as (page, slot).
+pub fn resolve(page: HeapPage, slot: i64) -> (i64, i64) ! HeapError {
+    if slot < 0 or slot >= page.slots.len() {
+        fail(NoSuchSlot(slot))
+    }
+    if page.slots[slot].forwarded_to >= 0 {
+        return (page.slots[slot].forwarded_to,
+            page.slots[slot].forwarded_slot)
+    }
+    return (0 - 1, slot)
+}
+
+/// How many live rows the page holds.
+pub fn live_count(page: HeapPage) -> i64 {
+    var count = 0
+    for slot in page.slots {
+        if slot.offset >= 0 {
+            count = count + 1
+        }
+    }
+    return count
+}
+
+/// How many slots are dead but still occupying an entry.
+pub fn dead_count(page: HeapPage) -> i64 {
+    var count = 0
+    for slot in page.slots {
+        if slot.offset < 0 and slot.forwarded_to < 0 {
+            count = count + 1
+        }
+    }
+    return count
+}
+
+/// Whether the page's arithmetic still adds up.
+///
+/// Slots ascending from the header, rows descending from the end, and the two
+/// never overlapping. A page that fails this has already corrupted itself and
+/// will hand out one row's bytes for another's slot.
+pub fn is_consistent(page: HeapPage) -> bool {
+    if page.slots.len() != page.rows.len() {
+        return false
+    }
+    if free_space(page) < 0 {
+        return false
+    }
+    for slot in page.slots {
+        if slot.offset < 0 {
+            continue
+        }
+        if slot.offset < page.row_start or
+        slot.offset + slot.length > page.size {
+            return false
+        }
+    }
+    return true
+}

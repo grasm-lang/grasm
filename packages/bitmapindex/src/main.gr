@@ -1,0 +1,393 @@
+// The bitmap index: one bit a row, and the predicate is a bitwise AND.
+//
+// A B-tree index answers "which rows have status = 'shipped'" with a
+// traversal and a list of row ids. A bitmap index answers it with a
+// **pointer**: one bitmap per distinct value, already built, one bit a row.
+// And then `status = 'shipped' AND region = 'EU'` is one bitwise AND of two
+// arrays, which a CPU does 64 rows at a time.
+//
+// That is why every analytical database has them and no transactional one
+// does by default.
+//
+// ## Where it wins
+//
+// Low cardinality and many predicates. A column with four distinct values
+// over ten million rows is four bitmaps of 1.25 MB each — five megabytes for
+// an index that answers any equality instantly and combines with any other
+// bitmap for free. A B-tree over the same column stores ten million row ids.
+//
+// The combination is the real win. Six predicates over six bitmap indexes is
+// six ANDs and then one pass over the surviving bits. A B-tree plan has to
+// pick one index, use it, and filter the rest row by row.
+//
+// ## Where it loses, and why OLTP does not use them
+//
+// High cardinality: a million distinct values is a million bitmaps, and the
+// index is larger than the table. Compression fixes the space and not the
+// count.
+//
+// And **updates**. Changing one row's value means clearing a bit in one
+// bitmap and setting it in another, which on a compressed bitmap means
+// decompressing and recompressing a run — so a single-row update touches
+// kilobytes. Oracle locks the whole compressed run, which turns one row's
+// update into a lock on thousands. That is the reason bitmap indexes are a
+// warehouse feature.
+//
+// ## Range queries, and the bit-sliced trick
+//
+// Equality is one bitmap. A range over a thousand distinct values would be a
+// thousand ORs — unless the index is **bit-sliced**: store one bitmap per
+// *binary digit* of the value rather than per value. Ten bitmaps cover a
+// thousand values, and `x > k` becomes a walk down the ten slices comparing
+// digit by digit, which is the same algorithm as comparing two numbers.
+//
+// Ten bitmaps instead of a thousand, and range queries in logarithmic rather
+// than linear work. It was published by O'Neil and Quass in 1997 and is what
+// makes a bitmap index usable on anything but a status column.
+//
+// ## What this is not
+//
+// Uncompressed. `roaring` in this set is the compressed representation, and
+// it is what a real implementation would store these in.
+
+type BitmapError =
+    | LengthMismatch(left: i64, right: i64)
+    | NoSuchValue(value: i64)
+    | NegativeValue(value: i64)
+
+type BitmapIndex = {
+    /// How many rows the index covers.
+    rows: i64,
+    /// The distinct values, in ascending order.
+    values: [i64],
+    /// One bitmap a value, each `rows` bits.
+    bitmaps: [[bool]],
+}
+
+/// An empty bitmap of a length.
+pub fn empty(rows: i64) -> [bool] {
+    var out: [bool] = []
+    for _i in 0..rows {
+        out.push(false)
+    }
+    return out
+}
+
+/// A bitmap of all ones.
+pub fn full(rows: i64) -> [bool] {
+    var out: [bool] = []
+    for _i in 0..rows {
+        out.push(true)
+    }
+    return out
+}
+
+/// An index over a column.
+pub fn build(column: [i64]) -> BitmapIndex {
+    var values: [i64] = []
+    for value in column {
+        if not contains(values, value) {
+            values.push(value)
+        }
+    }
+    values.sort()
+    var bitmaps: [[bool]] = []
+    for value in values {
+        var bitmap = empty(column.len())
+        var i = 0
+        while i < column.len() {
+            if column[i] == value {
+                bitmap[i] = true
+            }
+            i = i + 1
+        }
+        bitmaps.push(bitmap)
+    }
+    return BitmapIndex{ rows: column.len(), values: values,
+        bitmaps: bitmaps }
+}
+
+fn contains(values: [i64], wanted: i64) -> bool {
+    for value in values {
+        if value == wanted {
+            return true
+        }
+    }
+    return false
+}
+
+/// The bitmap for one value, or an empty one.
+pub fn equals(index: BitmapIndex, value: i64) -> [bool] {
+    var i = 0
+    while i < index.values.len() {
+        if index.values[i] == value {
+            return index.bitmaps[i]
+        }
+        i = i + 1
+    }
+    return empty(index.rows)
+}
+
+/// The rows whose value is in a set.
+pub fn in_set(index: BitmapIndex, wanted: [i64]) -> [bool] {
+    var out = empty(index.rows)
+    for value in wanted {
+        out = union(out, equals(index, value)) ?? out
+    }
+    return out
+}
+
+/// The rows whose value is between two bounds, inclusive.
+pub fn between(index: BitmapIndex, low: i64, high: i64) -> [bool] {
+    var out = empty(index.rows)
+    var i = 0
+    while i < index.values.len() {
+        if index.values[i] >= low and index.values[i] <= high {
+            out = union(out, index.bitmaps[i]) ?? out
+        }
+        i = i + 1
+    }
+    return out
+}
+
+/// Two bitmaps ANDed.
+pub fn intersect(left: [bool], right: [bool]) -> [bool] ! BitmapError {
+    if left.len() != right.len() {
+        fail(LengthMismatch(left.len(), right.len()))
+    }
+    var out: [bool] = []
+    var i = 0
+    while i < left.len() {
+        out.push(left[i] and right[i])
+        i = i + 1
+    }
+    return out
+}
+
+/// Two bitmaps ORed.
+pub fn union(left: [bool], right: [bool]) -> [bool] ! BitmapError {
+    if left.len() != right.len() {
+        fail(LengthMismatch(left.len(), right.len()))
+    }
+    var out: [bool] = []
+    var i = 0
+    while i < left.len() {
+        out.push(left[i] or right[i])
+        i = i + 1
+    }
+    return out
+}
+
+/// A bitmap inverted.
+///
+/// Which needs the row count, and is why a bitmap index has to know how many
+/// rows there are even when nothing matches: `NOT status = 'x'` over an empty
+/// bitmap is every row, and a representation that only stores the set bits
+/// cannot say that without being told the length.
+pub fn complement(bitmap: [bool]) -> [bool] {
+    var out: [bool] = []
+    for bit in bitmap {
+        out.push(not bit)
+    }
+    return out
+}
+
+/// The rows in the left and not the right.
+pub fn difference(left: [bool], right: [bool]) -> [bool] ! BitmapError {
+    return try intersect(left, complement(right))
+}
+
+/// How many bits are set.
+pub fn count(bitmap: [bool]) -> i64 {
+    var total = 0
+    for bit in bitmap {
+        if bit {
+            total = total + 1
+        }
+    }
+    return total
+}
+
+/// The row numbers a bitmap names.
+pub fn rows_of(bitmap: [bool]) -> [i64] {
+    var out: [i64] = []
+    var i = 0
+    while i < bitmap.len() {
+        if bitmap[i] {
+            out.push(i)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+/// What fraction of the rows a bitmap selects.
+pub fn selectivity(bitmap: [bool]) -> f64 {
+    if bitmap.len() == 0 {
+        return 0.0
+    }
+    return count(bitmap).as_f64() / bitmap.len().as_f64()
+}
+
+/// How many distinct values the column has.
+pub fn cardinality(index: BitmapIndex) -> i64 {
+    return index.values.len()
+}
+
+/// The bits the index occupies, uncompressed.
+///
+/// Cardinality times rows. The number that decides whether a bitmap index is
+/// a good idea: four values over ten million rows is five megabytes, and a
+/// million values over the same rows is a terabyte.
+pub fn size_in_bits(index: BitmapIndex) -> i64 {
+    return index.values.len() * index.rows
+}
+
+// ------------------------------------------------------------ bit slicing
+
+type SliceIndex = {
+    rows: i64,
+    /// One bitmap a binary digit, least significant first.
+    slices: [[bool]],
+    /// Which rows have a value at all.
+    present: [bool],
+}
+
+/// A bit-sliced index over a column of non-negative numbers.
+///
+/// One bitmap per *digit* rather than per value: ten bitmaps cover a thousand
+/// values. O'Neil and Quass, 1997, and the reason a bitmap index is usable on
+/// anything but a status column.
+pub fn build_sliced(column: [i64]) -> SliceIndex ! BitmapError {
+    var widest = 0
+    for value in column {
+        if value < 0 {
+            fail(NegativeValue(value))
+        }
+        let bits = bits_for(value)
+        if bits > widest {
+            widest = bits
+        }
+    }
+    if widest == 0 {
+        widest = 1
+    }
+    var slices: [[bool]] = []
+    for bit in 0..widest {
+        var slice = empty(column.len())
+        var i = 0
+        while i < column.len() {
+            if column[i].ushr(bit).bit_and(1) == 1 {
+                slice[i] = true
+            }
+            i = i + 1
+        }
+        slices.push(slice)
+    }
+    return SliceIndex{ rows: column.len(), slices: slices,
+        present: full(column.len()) }
+}
+
+/// How many bits a non-negative number needs.
+pub fn bits_for(value: i64) -> i64 {
+    var bits = 0
+    var v = value
+    while v > 0 {
+        bits = bits + 1
+        v = v / 2
+    }
+    return bits
+}
+
+/// The rows whose value is greater than a bound.
+///
+/// A walk down the slices, most significant digit first, carrying two
+/// bitmaps: the rows already known to be greater, and the rows still equal so
+/// far. That is exactly how two numbers are compared, done to a million rows
+/// at once.
+pub fn greater_than(index: SliceIndex, bound: i64) -> [bool] {
+    var greater = empty(index.rows)
+    var equal = index.present
+    var bit = index.slices.len() - 1
+    while bit >= 0 {
+        let wanted = bound.ushr(bit).bit_and(1)
+        if wanted == 1 {
+            // The bound has a one here, so a row stays equal only if it does
+            // too, and no row can become greater at this digit.
+            equal = intersect(equal, index.slices[bit]) ?? equal
+        } else {
+            // The bound has a zero, so a row with a one here is greater from
+            // now on and drops out of the equal set.
+            greater = union(greater, intersect(equal, index.slices[bit]) ??
+                greater) ?? greater
+            equal = difference(equal, index.slices[bit]) ?? equal
+        }
+        bit = bit - 1
+    }
+    return greater
+}
+
+/// The rows whose value is at least a bound.
+pub fn at_least(index: SliceIndex, bound: i64) -> [bool] {
+    return union(greater_than(index, bound), equal_to(index, bound)) ??
+    greater_than(index, bound)
+}
+
+/// The rows whose value is less than a bound.
+pub fn less_than(index: SliceIndex, bound: i64) -> [bool] {
+    return difference(index.present, at_least(index, bound)) ??
+    empty(index.rows)
+}
+
+/// The rows whose value equals a bound.
+pub fn equal_to(index: SliceIndex, bound: i64) -> [bool] {
+    var out = index.present
+    var bit = 0
+    while bit < index.slices.len() {
+        if bound.ushr(bit).bit_and(1) == 1 {
+            out = intersect(out, index.slices[bit]) ?? out
+        } else {
+            out = difference(out, index.slices[bit]) ?? out
+        }
+        bit = bit + 1
+    }
+    // A bound with a digit above the widest column value matches nothing.
+    if bound.ushr(index.slices.len()) != 0 {
+        return empty(index.rows)
+    }
+    return out
+}
+
+/// The rows whose value is between two bounds, inclusive.
+pub fn in_range(index: SliceIndex, low: i64, high: i64) -> [bool] {
+    return intersect(at_least(index, low),
+        difference(index.present, greater_than(index, high)) ??
+        index.present) ?? empty(index.rows)
+}
+
+/// How many bitmaps a bit-sliced index needs, against a plain one.
+///
+/// The comparison that decides the design: a thousand distinct values is a
+/// thousand bitmaps plain and ten sliced.
+pub fn slice_count(index: SliceIndex) -> i64 {
+    return index.slices.len()
+}
+
+/// The sum of a column, from the slices alone.
+///
+/// Each slice contributes its population count times its place value, so a
+/// sum is a few population counts rather than a pass over the rows. This is
+/// why a bit-sliced index can answer `SELECT SUM(x) WHERE ...` without
+/// reading the column at all.
+pub fn sum_where(index: SliceIndex, filter: [bool]) -> i64 {
+    var total = 0
+    var bit = 0
+    var place = 1
+    while bit < index.slices.len() {
+        total = total + place * count(intersect(index.slices[bit], filter) ??
+            empty(index.rows))
+        place = place * 2
+        bit = bit + 1
+    }
+    return total
+}

@@ -5356,6 +5356,21 @@ impl FnCx<'_, '_> {
                                 val = self.call_rt("grasm_ok_new", &[boxed]).unwrap();
                             }
                         }
+                        // A function returning `()` has no return value in
+                        // its Cranelift signature, so `return ()` — which is
+                        // how a unit function is written explicitly — must
+                        // return nothing rather than the unit it just built.
+                        // Returning it produced a function whose body
+                        // disagreed with its own signature, and Cranelift's
+                        // verifier rejected it as "codegen bug in `f`".
+                        // The operand is still evaluated: it may have effects.
+                        if self.ret == VType::Unit {
+                            let _ = val;
+                            self.emit_scope_decs_all();
+                            self.b.ins().return_(&[]);
+                            self.filled = true;
+                            return Ok(StmtOut::Terminated);
+                        }
                         // Returned value stays owned; release the rest.
                         // (Locals holding the same box are fine: their dec is
                         // balanced by the +1 the Ident eval added.)
