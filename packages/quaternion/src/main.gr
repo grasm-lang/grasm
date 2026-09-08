@@ -1,0 +1,386 @@
+// Rotations in three dimensions, without gimbal lock.
+//
+// A quaternion is four numbers that describe a rotation, and the reason to use
+// one instead of three Euler angles is a single failure the angles have:
+// **gimbal lock**. At a pitch of ±90 degrees, roll and yaw become the same
+// axis, one degree of freedom disappears, and the rotation cannot be
+// interpolated through that point at all. This is not a corner case — it is
+// straight up and straight down, which is where a camera, an aircraft and a
+// robot arm all spend real time.
+//
+// Conventions, because every one of them is a choice and disagreeing about any
+// of them produces a rotation that looks almost right:
+//
+// - **Storage is `(w, x, y, z)`**, scalar first. Some libraries store scalar
+//   last, and the two are indistinguishable by inspection.
+// - **Multiplication is Hamilton's**, so `mul(a, b)` applies `b` and then `a`,
+//   the same order function composition reads in. The other convention (JPL)
+//   flips the sign of the vector part and reverses this order.
+// - **Euler angles are intrinsic Z-Y-X**: yaw about Z, then pitch about the
+//   new Y, then roll about the new X. This is the aerospace convention and
+//   what `scipy`'s `Rotation.from_euler("ZYX", ...)` produces.
+// - **Rotation is active**: `rotate` moves the vector, it does not move the
+//   frame the vector is measured in. The two differ by a transpose, which is
+//   silent and wrong.
+//
+// Checked against `scipy.spatial.transform.Rotation` for every conversion, and
+// against its `Slerp` for interpolation.
+
+import matrix
+
+/// A quaternion, scalar part first.
+type Quat = {
+    w: f64,
+    x: f64,
+    y: f64,
+    z: f64,
+}
+
+/// A vector in three dimensions — an axis, or a point being rotated.
+type QuatVec3 = {
+    x: f64,
+    y: f64,
+    z: f64,
+}
+
+/// Yaw about Z, then pitch about Y, then roll about X, in radians.
+type QuatEuler = {
+    roll: f64,
+    pitch: f64,
+    yaw: f64,
+}
+
+type QuatError =
+    | QuatZeroNorm
+    | QuatNotThreeByThree(rows: i64, cols: i64)
+
+fn abs_of(v: f64) -> f64 {
+    if v < 0.0 {
+        return 0.0 - v
+    }
+    return v
+}
+
+pub fn make(w: f64, x: f64, y: f64, z: f64) -> Quat {
+    return Quat{ w: w, x: x, y: y, z: z }
+}
+
+pub fn vector(x: f64, y: f64, z: f64) -> QuatVec3 {
+    return QuatVec3{ x: x, y: y, z: z }
+}
+
+/// The rotation that does nothing.
+pub fn identity() -> Quat {
+    return Quat{ w: 1.0, x: 0.0, y: 0.0, z: 0.0 }
+}
+
+/// A rotation of `angle` radians about `axis`, which need not be unit length.
+pub fn from_axis_angle(axis: QuatVec3, angle: f64) -> Quat ! QuatError {
+    let length = (axis.x * axis.x + axis.y * axis.y + axis.z * axis.z).sqrt()
+    if length < 0.000000000001 {
+        fail(QuatZeroNorm)
+    }
+    // The half-angle is not a simplification: a quaternion covers the rotation
+    // group twice, and it is the half that makes `q v q*` a rotation by the
+    // full angle rather than by double it.
+    let half = angle / 2.0
+    let s = half.sin() / length
+    return Quat{ w: half.cos(), x: axis.x * s, y: axis.y * s, z: axis.z * s }
+}
+
+/// The axis and angle a rotation stands for.
+///
+/// The angle comes from `atan2` of the vector length against `w`, not from
+/// `acos(w) * 2`. `acos` near zero angle loses half its digits, which is
+/// exactly the region where a caller is checking whether two rotations agree.
+pub fn to_axis_angle(q: Quat) -> QuatEulerAxis {
+    let unit = normalise_or_identity(q)
+    let length = (unit.x * unit.x + unit.y * unit.y + unit.z * unit.z).sqrt()
+    if length < 0.000000000001 {
+        return QuatEulerAxis{ axis: vector(1.0, 0.0, 0.0), angle: 0.0 }
+    }
+    let angle = 2.0 * length.atan2(unit.w)
+    return QuatEulerAxis{
+        axis: vector(unit.x / length, unit.y / length, unit.z / length),
+        angle: angle,
+    }
+}
+
+/// An axis and the angle turned about it.
+type QuatEulerAxis = {
+    axis: QuatVec3,
+    angle: f64,
+}
+
+/// Intrinsic Z-Y-X Euler angles, in radians.
+pub fn from_euler(e: QuatEuler) -> Quat {
+    let cr = (e.roll / 2.0).cos()
+    let sr = (e.roll / 2.0).sin()
+    let cp = (e.pitch / 2.0).cos()
+    let sp = (e.pitch / 2.0).sin()
+    let cy = (e.yaw / 2.0).cos()
+    let sy = (e.yaw / 2.0).sin()
+    return Quat{
+        w: cr * cp * cy + sr * sp * sy,
+        x: sr * cp * cy - cr * sp * sy,
+        y: cr * sp * cy + sr * cp * sy,
+        z: cr * cp * sy - sr * sp * cy,
+    }
+}
+
+/// Back to Euler angles — where gimbal lock is, and what happens at it.
+///
+/// At a pitch of ±90 degrees, roll and yaw are the same rotation and only
+/// their sum or difference is determined. This puts the whole of it into yaw
+/// and sets roll to zero, which is the convention `scipy` uses. It is a
+/// choice, and the reason the rest of this package never converts through
+/// Euler angles internally.
+pub fn to_euler(q: Quat) -> QuatEuler {
+    let u = normalise_or_identity(q)
+    let sp = 2.0 * (u.w * u.y - u.z * u.x)
+    if sp >= 1.0 or sp <= 0.0 - 1.0 {
+        var pitch = pi() / 2.0
+        if sp < 0.0 {
+            pitch = 0.0 - pitch
+        }
+        // Locked: only `yaw - roll` is determined, and this recovers it.
+        let yaw = 2.0 * (u.z).atan2(u.w)
+        return QuatEuler{ roll: 0.0, pitch: pitch, yaw: yaw }
+    }
+    let roll = (2.0 * (u.w * u.x + u.y * u.z)).atan2(
+        1.0 - 2.0 * (u.x * u.x + u.y * u.y))
+    let yaw = (2.0 * (u.w * u.z + u.x * u.y)).atan2(
+        1.0 - 2.0 * (u.y * u.y + u.z * u.z))
+    return QuatEuler{ roll: roll, pitch: sp.asin(), yaw: yaw }
+}
+
+/// Whether a rotation is at or near gimbal lock, in Euler terms.
+///
+/// Worth asking before converting: inside this band the Euler angles a caller
+/// reads back are not the ones that went in, even though the rotation is
+/// unchanged.
+pub fn near_gimbal_lock(q: Quat, tolerance: f64) -> bool {
+    let u = normalise_or_identity(q)
+    let sp = 2.0 * (u.w * u.y - u.z * u.x)
+    return abs_of(abs_of(sp) - 1.0) <= tolerance
+}
+
+/// Hamilton product: `mul(a, b)` applies `b` first, then `a`.
+pub fn mul(a: Quat, b: Quat) -> Quat {
+    return Quat{
+        w: a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z,
+        x: a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
+        y: a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+        z: a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w,
+    }
+}
+
+pub fn add(a: Quat, b: Quat) -> Quat {
+    return Quat{ w: a.w + b.w, x: a.x + b.x, y: a.y + b.y, z: a.z + b.z }
+}
+
+pub fn sub(a: Quat, b: Quat) -> Quat {
+    return Quat{ w: a.w - b.w, x: a.x - b.x, y: a.y - b.y, z: a.z - b.z }
+}
+
+pub fn scale(q: Quat, by: f64) -> Quat {
+    return Quat{ w: q.w * by, x: q.x * by, y: q.y * by, z: q.z * by }
+}
+
+pub fn negate(q: Quat) -> Quat {
+    return scale(q, 0.0 - 1.0)
+}
+
+pub fn conjugate(q: Quat) -> Quat {
+    return Quat{ w: q.w, x: 0.0 - q.x, y: 0.0 - q.y, z: 0.0 - q.z }
+}
+
+pub fn dot(a: Quat, b: Quat) -> f64 {
+    return a.w * b.w + a.x * b.x + a.y * b.y + a.z * b.z
+}
+
+pub fn norm(q: Quat) -> f64 {
+    return (dot(q, q)).sqrt()
+}
+
+pub fn normalise(q: Quat) -> Quat ! QuatError {
+    let n = norm(q)
+    if n < 0.000000000001 {
+        fail(QuatZeroNorm)
+    }
+    return scale(q, 1.0 / n)
+}
+
+fn normalise_or_identity(q: Quat) -> Quat {
+    let n = norm(q)
+    if n < 0.000000000001 {
+        return identity()
+    }
+    return scale(q, 1.0 / n)
+}
+
+/// The inverse rotation.
+///
+/// For a unit quaternion this is the conjugate, and dividing by the norm is
+/// wasted work — but a quaternion that has been multiplied a few thousand
+/// times is no longer unit, and the conjugate of a non-unit quaternion is not
+/// its inverse. Dividing costs one division and removes the failure.
+pub fn inverse(q: Quat) -> Quat ! QuatError {
+    let n2 = dot(q, q)
+    if n2 < 0.000000000001 {
+        fail(QuatZeroNorm)
+    }
+    return scale(conjugate(q), 1.0 / n2)
+}
+
+/// Rotate a vector: `q v q*`, with `q` taken as a rotation.
+pub fn rotate(q: Quat, v: QuatVec3) -> QuatVec3 {
+    let u = normalise_or_identity(q)
+    // Expanded rather than three quaternion multiplies: half the operations,
+    // and the vector part of the result is exact rather than carrying a
+    // rounding-sized `w`.
+    let tx = 2.0 * (u.y * v.z - u.z * v.y)
+    let ty = 2.0 * (u.z * v.x - u.x * v.z)
+    let tz = 2.0 * (u.x * v.y - u.y * v.x)
+    return QuatVec3{
+        x: v.x + u.w * tx + u.y * tz - u.z * ty,
+        y: v.y + u.w * ty + u.z * tx - u.x * tz,
+        z: v.z + u.w * tz + u.x * ty - u.y * tx,
+    }
+}
+
+/// The angle between two rotations, in radians, from 0 to pi.
+///
+/// `q` and `-q` are the same rotation, so the absolute value of the dot
+/// product is taken. Without it, two identical rotations stored with opposite
+/// signs come out as pi radians apart.
+pub fn angle_between(a: Quat, b: Quat) -> f64 {
+    let ua = normalise_or_identity(a)
+    let ub = normalise_or_identity(b)
+    var d = abs_of(dot(ua, ub))
+    if d > 1.0 {
+        d = 1.0
+    }
+    return 2.0 * d.acos()
+}
+
+/// Spherical linear interpolation, at constant angular speed.
+///
+/// The shorter of the two arcs: if the quaternions point away from each other,
+/// one is negated first. Skipping that gives an interpolation that takes the
+/// long way round — a 350-degree turn where 10 degrees would do — and it is
+/// the most common bug in a hand-written slerp.
+pub fn slerp(a: Quat, b: Quat, t: f64) -> Quat {
+    let ua = normalise_or_identity(a)
+    var ub = normalise_or_identity(b)
+    var d = dot(ua, ub)
+    if d < 0.0 {
+        ub = negate(ub)
+        d = 0.0 - d
+    }
+    if d > 0.9995 {
+        // Nearly parallel: `sin(theta)` underflows and the division below is
+        // meaningless. A straight line between them is within rounding.
+        return normalise_or_identity(add(ua, scale(sub(ub, ua), t)))
+    }
+    if d > 1.0 {
+        d = 1.0
+    }
+    let theta = d.acos()
+    let s = theta.sin()
+    let wa = ((1.0 - t) * theta).sin() / s
+    let wb = (t * theta).sin() / s
+    return add(scale(ua, wa), scale(ub, wb))
+}
+
+/// Linear interpolation, renormalised. Cheaper than `slerp` and not constant
+/// speed: it lags in the middle of a large turn.
+pub fn nlerp(a: Quat, b: Quat, t: f64) -> Quat {
+    let ua = normalise_or_identity(a)
+    var ub = normalise_or_identity(b)
+    if dot(ua, ub) < 0.0 {
+        ub = negate(ub)
+    }
+    return normalise_or_identity(add(ua, scale(sub(ub, ua), t)))
+}
+
+/// The 3x3 rotation matrix, row-major.
+pub fn to_matrix(q: Quat) -> Mat {
+    let u = normalise_or_identity(q)
+    let xx = u.x * u.x
+    let yy = u.y * u.y
+    let zz = u.z * u.z
+    return matrix.of(3, 3, [
+        1.0 - 2.0 * (yy + zz), 2.0 * (u.x * u.y - u.z * u.w),
+        2.0 * (u.x * u.z + u.y * u.w),
+        2.0 * (u.x * u.y + u.z * u.w), 1.0 - 2.0 * (xx + zz),
+        2.0 * (u.y * u.z - u.x * u.w),
+        2.0 * (u.x * u.z - u.y * u.w), 2.0 * (u.y * u.z + u.x * u.w),
+        1.0 - 2.0 * (xx + yy),
+    ])
+}
+
+/// A rotation from a 3x3 matrix, by Shepperd's method.
+///
+/// Four formulas rather than one: the direct formula divides by `w`, and for a
+/// rotation near 180 degrees `w` is near zero, so the answer is dominated by
+/// rounding. Picking whichever of the four components is largest and deriving
+/// the rest from it keeps the division safe at every rotation.
+pub fn from_matrix(m: Mat) -> Quat ! QuatError {
+    if m.rows != 3 or m.cols != 3 {
+        fail(QuatNotThreeByThree(m.rows, m.cols))
+    }
+    let trace = m.cell[0] + m.cell[4] + m.cell[8]
+    if trace > 0.0 {
+        let s = (trace + 1.0).sqrt() * 2.0
+        return Quat{
+            w: 0.25 * s,
+            x: (m.cell[7] - m.cell[5]) / s,
+            y: (m.cell[2] - m.cell[6]) / s,
+            z: (m.cell[3] - m.cell[1]) / s,
+        }
+    }
+    if m.cell[0] > m.cell[4] and m.cell[0] > m.cell[8] {
+        let s = (1.0 + m.cell[0] - m.cell[4] - m.cell[8]).sqrt() * 2.0
+        return Quat{
+            w: (m.cell[7] - m.cell[5]) / s,
+            x: 0.25 * s,
+            y: (m.cell[1] + m.cell[3]) / s,
+            z: (m.cell[2] + m.cell[6]) / s,
+        }
+    }
+    if m.cell[4] > m.cell[8] {
+        let s = (1.0 + m.cell[4] - m.cell[0] - m.cell[8]).sqrt() * 2.0
+        return Quat{
+            w: (m.cell[2] - m.cell[6]) / s,
+            x: (m.cell[1] + m.cell[3]) / s,
+            y: 0.25 * s,
+            z: (m.cell[5] + m.cell[7]) / s,
+        }
+    }
+    let s = (1.0 + m.cell[8] - m.cell[0] - m.cell[4]).sqrt() * 2.0
+    return Quat{
+        w: (m.cell[3] - m.cell[1]) / s,
+        x: (m.cell[2] + m.cell[6]) / s,
+        y: (m.cell[5] + m.cell[7]) / s,
+        z: 0.25 * s,
+    }
+}
+
+/// Whether two quaternions are the same rotation, to a tolerance.
+///
+/// The same rotation, not the same four numbers: `q` and `-q` turn a vector
+/// identically, so both are accepted.
+pub fn same_rotation(a: Quat, b: Quat, tolerance: f64) -> bool {
+    return angle_between(a, b) <= tolerance
+}
+
+/// Whether two quaternions hold the same four numbers, to a tolerance.
+pub fn nearly_equal(a: Quat, b: Quat, tolerance: f64) -> bool {
+    return abs_of(a.w - b.w) <= tolerance and abs_of(a.x - b.x) <= tolerance and
+    abs_of(a.y - b.y) <= tolerance and abs_of(a.z - b.z) <= tolerance
+}
+
+pub fn to_str(q: Quat) -> str {
+    return "({q.w}, {q.x}, {q.y}, {q.z})"
+}

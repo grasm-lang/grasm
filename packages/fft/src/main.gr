@@ -1,0 +1,371 @@
+// The discrete Fourier transform, at any length.
+//
+// Radix-2 Cooley-Tukey when the length is a power of two, and Bluestein's
+// chirp-z when it is not. That second half is the point of this package.
+//
+// Almost every small FFT written from scratch handles powers of two and then
+// tells the caller to zero-pad. Zero-padding does not compute the transform
+// the caller asked for: it computes the transform of a longer, different
+// signal, whose bins fall at different frequencies and whose peaks have been
+// smeared by the rectangular window the padding created. For a spectrum you
+// are going to read numbers off, that is the wrong answer, quietly.
+//
+// Bluestein turns a length-`n` transform into a convolution of length `2n-1`
+// or more, which can be padded to a power of two *legitimately* — a
+// convolution does not care about extra zeros the way a transform does. It
+// costs about three power-of-two transforms and gives the exact answer at the
+// exact length.
+//
+// One numerical detail worth stating: the chirp exponent is `k^2 / n`, and
+// `k^2` for a length in the tens of thousands is large enough that reducing it
+// modulo `2n` first is the difference between a clean spectrum and one with a
+// visible noise floor. This does that reduction in integers, before any
+// conversion to a float.
+//
+// Checked against `numpy.fft` at power-of-two and prime lengths.
+
+import complexnum
+
+type FftError =
+    | FftEmpty
+    | FftLengthMismatch(a: i64, b: i64)
+
+    /// Whether `n` is a power of two — the case radix-2 handles directly.
+pub fn is_power_of_two(n: i64) -> bool {
+    if n < 1 {
+        return false
+    }
+    return n.bit_and(n - 1) == 0
+}
+
+/// The smallest power of two at or above `n`.
+pub fn next_power_of_two(n: i64) -> i64 {
+    var p = 1
+    while p < n {
+        p = p * 2
+    }
+    return p
+}
+
+/// The forward transform, at whatever length the input is.
+///
+/// Sign convention: the forward transform carries `exp(-2 pi i k n / N)` and
+/// no scaling, and the inverse carries `+` and `1/N`. That is numpy's
+/// convention and the one every signal-processing text uses; the other
+/// convention exists and putting the scale in the wrong direction is a bug
+/// that only shows up when you round-trip.
+pub fn forward(xs: [Cplx]) -> [Cplx] {
+    return transform(xs, false)
+}
+
+/// The inverse transform, scaled by `1/N`.
+pub fn inverse(xs: [Cplx]) -> [Cplx] {
+    return transform(xs, true)
+}
+
+fn transform(xs: [Cplx], inverting: bool) -> [Cplx] {
+    let n = xs.len()
+    if n < 2 {
+        return xs
+    }
+    if is_power_of_two(n) {
+        var out = xs
+        radix2(out, inverting)
+        if inverting {
+            return scaled(out, 1.0 / n.as_f64())
+        }
+        return out
+    }
+    let out = bluestein(xs, inverting)
+    if inverting {
+        return scaled(out, 1.0 / n.as_f64())
+    }
+    return out
+}
+
+fn scaled(xs: [Cplx], by: f64) -> [Cplx] {
+    var out: [Cplx] = []
+    for x in xs {
+        out.push(complexnum.scale(x, by))
+    }
+    return out
+}
+
+// --------------------------------------------------------------- radix-2
+
+/// In-place iterative Cooley-Tukey. `xs.len()` must be a power of two.
+///
+/// Iterative rather than recursive: the recursion allocates two lists per
+/// level, which for a 65,536-point transform is 131,070 allocations that the
+/// bit-reversal permutation below replaces with one.
+fn radix2(inout xs: [Cplx], inverting: bool) {
+    let n = xs.len()
+    // The permutation that makes the butterflies contiguous.
+    var j = 0
+    for i in 1..n {
+        var bit = n / 2
+        while j.bit_and(bit) != 0 {
+            j = j - bit
+            bit = bit / 2
+        }
+        j = j + bit
+        if i < j {
+            let t = xs[i]
+            xs[i] = xs[j]
+            xs[j] = t
+        }
+    }
+    var length = 2
+    while length <= n {
+        var angle = 0.0 - 2.0 * pi() / length.as_f64()
+        if inverting {
+            angle = 0.0 - angle
+        }
+        let step = complexnum.from_polar(1.0, angle)
+        var start = 0
+        while start < n {
+            var w = complexnum.one()
+            for k in 0..(length / 2) {
+                let a = xs[start + k]
+                let b = complexnum.mul(xs[start + k + length / 2], w)
+                xs[start + k] = complexnum.add(a, b)
+                xs[start + k + length / 2] = complexnum.sub(a, b)
+                w = complexnum.mul(w, step)
+            }
+            start = start + length
+        }
+        length = length * 2
+    }
+}
+
+// ------------------------------------------------------------- Bluestein
+
+/// A transform of any length, as a convolution that a radix-2 transform can do.
+fn bluestein(xs: [Cplx], inverting: bool) -> [Cplx] {
+    let n = xs.len()
+    let m = next_power_of_two(2 * n - 1)
+    var chirp: [Cplx] = []
+    for k in 0..n {
+        chirp.push(chirp_at(k, n, inverting))
+    }
+    // `a` is the signal pre-multiplied by the chirp, zero-padded to `m`.
+    var a: [Cplx] = []
+    for k in 0..n {
+        a.push(complexnum.mul(xs[k], chirp[k]))
+    }
+    for _k in n..m {
+        a.push(complexnum.zero())
+    }
+    // `b` is the conjugate chirp, wrapped so that the cyclic convolution of
+    // length `m` computes the linear one this needs.
+    var b: [Cplx] = []
+    for _k in 0..m {
+        b.push(complexnum.zero())
+    }
+    b[0] = complexnum.conjugate(chirp[0])
+    for k in 1..n {
+        let c = complexnum.conjugate(chirp[k])
+        b[k] = c
+        b[m - k] = c
+    }
+    radix2(a, false)
+    radix2(b, false)
+    for k in 0..m {
+        a[k] = complexnum.mul(a[k], b[k])
+    }
+    radix2(a, true)
+    var out: [Cplx] = []
+    for k in 0..n {
+        let unscaled = complexnum.scale(a[k], 1.0 / m.as_f64())
+        out.push(complexnum.mul(unscaled, chirp[k]))
+    }
+    return out
+}
+
+/// `exp(-i pi k^2 / n)`, with `k^2` reduced before it reaches a float.
+///
+/// `k * k` for `k` in the tens of thousands is a number whose low bits carry
+/// the whole of the angle. Taking it modulo `2n` in integers first keeps every
+/// one of those bits; converting first and then taking a remainder in floating
+/// point throws them away and puts a noise floor under the spectrum.
+fn chirp_at(k: i64, n: i64, inverting: bool) -> Cplx {
+    let reduced = (k * k) % (2 * n)
+    var angle = 0.0 - pi() * reduced.as_f64() / n.as_f64()
+    if inverting {
+        angle = 0.0 - angle
+    }
+    return complexnum.from_polar(1.0, angle)
+}
+
+// ------------------------------------------------------------ real input
+
+/// The transform of a real signal.
+pub fn forward_real(xs: [f64]) -> [Cplx] {
+    var cs: [Cplx] = []
+    for x in xs {
+        cs.push(complexnum.real(x))
+    }
+    return forward(cs)
+}
+
+/// The real part of an inverse transform, for a signal known to be real.
+///
+/// The imaginary parts of a correct inverse are rounding error, but they are
+/// not zero, and a caller comparing them against zero gets a surprise. This
+/// drops them once, in one place.
+pub fn inverse_real(xs: [Cplx]) -> [f64] {
+    var out: [f64] = []
+    for c in inverse(xs) {
+        out.push(c.re)
+    }
+    return out
+}
+
+/// The magnitude of each bin.
+pub fn magnitudes(xs: [Cplx]) -> [f64] {
+    var out: [f64] = []
+    for c in xs {
+        out.push(complexnum.magnitude(c))
+    }
+    return out
+}
+
+/// The power of each bin: magnitude squared, with no square root taken.
+pub fn power(xs: [Cplx]) -> [f64] {
+    var out: [f64] = []
+    for c in xs {
+        out.push(complexnum.magnitude_squared(c))
+    }
+    return out
+}
+
+/// The frequency each bin stands for, in the same unit as `sample_rate`.
+///
+/// Bins at and above `n / 2` are the negative frequencies, and are reported as
+/// negative rather than as their aliases — which is what makes it obvious that
+/// the top half of a real signal's spectrum is a mirror and not new
+/// information.
+///
+/// At an even length the middle bin is exactly Nyquist, where `+rate/2` and
+/// `-rate/2` are the same frequency and the choice is arbitrary. It is
+/// reported negative, which is what `numpy.fft.fftfreq` does, so a spectrum
+/// read against either agrees bin for bin.
+pub fn frequencies(n: i64, sample_rate: f64) -> [f64] {
+    var out: [f64] = []
+    for k in 0..n {
+        if k * 2 < n {
+            out.push(k.as_f64() * sample_rate / n.as_f64())
+        } else {
+            out.push((k - n).as_f64() * sample_rate / n.as_f64())
+        }
+    }
+    return out
+}
+
+/// The frequency of the strongest bin in a real signal, ignoring the mean.
+///
+/// Bin zero is the average of the signal, not a frequency, and it is the
+/// largest bin in anything with an offset — which is most real measurements.
+/// Skipping it is the difference between "the tone is 440 Hz" and "the tone is
+/// 0 Hz".
+pub fn dominant_frequency(xs: [f64], sample_rate: f64) -> f64 {
+    let n = xs.len()
+    if n < 2 {
+        return 0.0
+    }
+    let spectrum = magnitudes(forward_real(xs))
+    var best = 1
+    var largest = 0.0 - 1.0
+    for k in 1..(n / 2 + 1) {
+        if spectrum[k] > largest {
+            largest = spectrum[k]
+            best = k
+        }
+    }
+    return best.as_f64() * sample_rate / n.as_f64()
+}
+
+// ---------------------------------------------------------- convolution
+
+/// Linear convolution of two real signals, through the frequency domain.
+///
+/// The result is `a.len() + b.len() - 1` long, which is the length a linear
+/// convolution has. Doing this cyclically — transforming both at the length of
+/// the longer one — wraps the tail of the result back onto its head, and the
+/// error looks like a plausible signal rather than like a bug.
+pub fn convolve(a: [f64], b: [f64]) -> [f64] ! FftError {
+    if a.len() == 0 or b.len() == 0 {
+        fail(FftEmpty)
+    }
+    let out_len = a.len() + b.len() - 1
+    let m = next_power_of_two(out_len)
+    var fa = padded(a, m)
+    var fb = padded(b, m)
+    radix2(fa, false)
+    radix2(fb, false)
+    for k in 0..m {
+        fa[k] = complexnum.mul(fa[k], fb[k])
+    }
+    radix2(fa, true)
+    var out: [f64] = []
+    for k in 0..out_len {
+        out.push(fa[k].re / m.as_f64())
+    }
+    return out
+}
+
+/// Cross-correlation of two equal-length signals, at every lag.
+///
+/// Entry `k` is the correlation at lag `k`, and lags at and above `n/2` are
+/// the negative ones — the same wrap-around the transform itself has.
+pub fn cross_correlate(a: [f64], b: [f64]) -> [f64] ! FftError {
+    if a.len() != b.len() {
+        fail(FftLengthMismatch(a.len(), b.len()))
+    }
+    if a.len() == 0 {
+        fail(FftEmpty)
+    }
+    let m = next_power_of_two(a.len())
+    var fa = padded(a, m)
+    var fb = padded(b, m)
+    radix2(fa, false)
+    radix2(fb, false)
+    for k in 0..m {
+        fa[k] = complexnum.mul(fa[k], complexnum.conjugate(fb[k]))
+    }
+    radix2(fa, true)
+    var out: [f64] = []
+    for k in 0..a.len() {
+        out.push(fa[k].re / m.as_f64())
+    }
+    return out
+}
+
+fn padded(xs: [f64], m: i64) -> [Cplx] {
+    var out: [Cplx] = []
+    for x in xs {
+        out.push(complexnum.real(x))
+    }
+    for _k in xs.len()..m {
+        out.push(complexnum.zero())
+    }
+    return out
+}
+
+/// The lag at which two signals line up best.
+pub fn best_lag(a: [f64], b: [f64]) -> i64 ! FftError {
+    let c = try cross_correlate(a, b)
+    let n = c.len()
+    var best = 0
+    var largest = c[0]
+    for k in 1..n {
+        if c[k] > largest {
+            largest = c[k]
+            best = k
+        }
+    }
+    if best * 2 > n {
+        return best - n
+    }
+    return best
+}

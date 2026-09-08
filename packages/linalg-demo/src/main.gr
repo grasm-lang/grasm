@@ -1,0 +1,688 @@
+import linalg
+import matrix
+import fft
+import polynomial
+import quaternion
+import bezier
+import geometry
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn near(a: f64, b: f64, tolerance: f64) -> bool {
+    let d = a - b
+    return (if d < 0.0 { 0.0 - d } else { d }) <= tolerance
+}
+
+fn near_all(a: [f64], b: [f64], tolerance: f64) -> bool {
+    if a.len() != b.len() {
+        return false
+    }
+    for i in 0..a.len() {
+        if not near(a[i], b[i], tolerance) {
+            return false
+        }
+    }
+    return true
+}
+
+fn solve_refuses(a: Mat, b: [f64]) -> bool {
+    match linalg.solve(a, b) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn cholesky_refuses(a: Mat) -> bool {
+    match linalg.cholesky(a) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn eigen_refuses(a: Mat) -> bool {
+    match linalg.eigen_symmetric(a) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn condition_refuses(a: Mat) -> bool {
+    match linalg.condition(a) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn convolve_refuses(a: [f64], b: [f64]) -> bool {
+    match fft.convolve(a, b) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn correlate_refuses(a: [f64], b: [f64]) -> bool {
+    match fft.cross_correlate(a, b) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn divide_refuses(a: Polynomial, b: Polynomial) -> bool {
+    match polynomial.divide(a, b) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn fit_refuses(xs: [f64], ys: [f64], wanted: i64) -> bool {
+    match polynomial.fit(xs, ys, wanted) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn from_matrix_refuses(m: Mat) -> bool {
+    match quaternion.from_matrix(m) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn axis_refuses(v: QuatVec3, angle: f64) -> bool {
+    match quaternion.from_axis_angle(v, angle) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn quat_inverse_refuses(q: Quat) -> bool {
+    match quaternion.inverse(q) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn curve_refuses(points: [Vec2]) -> bool {
+    match bezier.of(points) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn singular() -> Mat {
+    return matrix.of(3, 3, [1.0, 2.0, 3.0, 2.0, 4.0, 6.0, 1.0, 1.0, 1.0])
+}
+
+fn spd() -> Mat {
+    // The textbook positive-definite example, whose Cholesky factor is exact.
+    return matrix.of(3, 3, [4.0, 12.0, 0.0 - 16.0, 12.0, 37.0, 0.0 - 43.0,
+        0.0 - 16.0, 0.0 - 43.0, 98.0])
+}
+
+fn system() -> Mat {
+    return matrix.of(3, 3, [2.0, 1.0, 1.0, 1.0, 3.0, 2.0, 1.0, 0.0, 0.0])
+}
+
+fn swapped() -> Mat {
+    // Perfectly conditioned, and elimination without a pivot search divides
+    // by zero on it at the first step.
+    return matrix.of(2, 2, [0.0, 1.0, 1.0, 0.0])
+}
+
+fn overdetermined() -> Mat {
+    return matrix.of(4, 2, [1.0, 1.0, 1.0, 2.0, 1.0, 3.0, 1.0, 4.0])
+}
+
+fn check_linalg(inout f: i64) / {io} {
+    print("-- linalg: pivoting is not optional, and an inverse is not a solver")
+    // Every number here is numpy's for the same matrix.
+    say(f, "a 3x3 system solves to the values numpy gives",
+        near_all(linalg.solve(system(), [4.0, 5.0, 6.0]) ?? [],
+            [6.0, 15.0, 0.0 - 23.0], 0.00000001))
+    say(f, "the determinant is -1", near(linalg.determinant(system()) ?? 0.0,
+        0.0 - 1.0, 0.00000001))
+    say(f, "the inverse is the matrix numpy inverts to",
+        near_all((linalg.inverse(system()) ?? matrix.zeros(1, 1)).cell,
+            [0.0, 0.0, 1.0, 0.0 - 2.0, 1.0, 3.0, 3.0, 0.0 - 1.0, 0.0 - 5.0],
+            0.00000001))
+    say(f, "and multiplies back to the identity",
+        linalg.nearly_equal(matrix.multiply(system(),
+            linalg.inverse(system()) ?? matrix.zeros(1, 1)) ??
+            matrix.zeros(1, 1), matrix.identity(3), 0.000000001))
+    // The whole reason for the pivot search.
+    say(f, "a matrix with a zero in the corner still solves",
+        near_all(linalg.solve(swapped(), [3.0, 7.0]) ?? [], [7.0, 3.0],
+            0.000000001))
+    say(f, "a singular matrix is refused rather than answered",
+        solve_refuses(singular(), [1.0, 2.0, 3.0]))
+    say(f, "its determinant is zero",
+        near(linalg.determinant(singular()) ?? 1.0, 0.0, 0.000000001))
+    say(f, "and its rank is 2, not 3", linalg.rank(singular()) == 2)
+    say(f, "a full-rank matrix reports its size", linalg.rank(system()) == 3)
+    say(f, "the zero matrix has rank 0", linalg.rank(matrix.zeros(3, 3)) == 0)
+    // Cholesky, and the refusal that is the point of it.
+    say(f, "a positive-definite matrix factors to the expected triangle",
+        near_all((linalg.cholesky(spd()) ?? matrix.zeros(1, 1)).cell,
+            [2.0, 0.0, 0.0, 6.0, 1.0, 0.0, 0.0 - 8.0, 5.0, 3.0], 0.000000001))
+    say(f, "and L times L transposed is the matrix back",
+        linalg.nearly_equal(matrix.multiply(
+            linalg.cholesky(spd()) ?? matrix.zeros(1, 1),
+            matrix.transpose(linalg.cholesky(spd()) ??
+                matrix.zeros(1, 1))) ?? matrix.zeros(1, 1),
+            spd(), 0.000000001))
+    say(f, "a symmetric matrix that is not positive definite is refused",
+        cholesky_refuses(matrix.of(2, 2, [1.0, 2.0, 2.0, 1.0])))
+    say(f, "and an asymmetric one is refused before that",
+        cholesky_refuses(matrix.of(2, 2, [1.0, 2.0, 3.0, 4.0])))
+    check_linalg_more(f)
+}
+
+fn check_linalg_more(inout f: i64) / {io} {
+    // QR: the signs are a convention, so what is asserted is the property.
+    let factored = linalg.qr(overdetermined()) ??
+    LinQr{ q: matrix.zeros(1, 1), r: matrix.zeros(1, 1) }
+    say(f, "Q times R is the matrix it came from",
+        linalg.nearly_equal(matrix.multiply(factored.q, factored.r) ??
+            matrix.zeros(1, 1), overdetermined(), 0.000000001))
+    say(f, "Q transposed times Q is the identity",
+        linalg.nearly_equal(matrix.multiply(matrix.transpose(factored.q),
+            factored.q) ?? matrix.zeros(1, 1), matrix.identity(4),
+            0.000000001))
+    say(f, "and R has nothing below its diagonal",
+        near(factored.r.cell[2], 0.0, 0.000000001) and
+        near(factored.r.cell[4], 0.0, 0.000000001) and
+        near(factored.r.cell[6], 0.0, 0.000000001))
+    say(f, "least squares through four points gives numpy's line",
+        near_all(linalg.least_squares(overdetermined(),
+            [6.0, 5.0, 7.0, 10.0]) ?? [], [3.5, 1.4], 0.000000001))
+    // Eigenvalues, against numpy's eigh on the same matrix.
+    let e = linalg.eigen_symmetric(spd()) ??
+    LinEigen{ values: [], vectors: matrix.zeros(1, 1), sweeps: 0 }
+    say(f, "the eigenvalues are numpy's, largest first",
+        near_all(e.values, [123.47723179013155, 15.503963229407594,
+            0.018804980460812], 0.000000001))
+    say(f, "and they sum to the trace",
+        near(e.values[0] + e.values[1] + e.values[2],
+            linalg.trace(spd()) ?? 0.0, 0.0000001))
+    say(f, "their product is the determinant",
+        near(e.values[0] * e.values[1] * e.values[2],
+            linalg.determinant(spd()) ?? 0.0, 0.0000001))
+    say(f, "the eigenvectors are orthogonal",
+        linalg.nearly_equal(matrix.multiply(matrix.transpose(e.vectors),
+            e.vectors) ?? matrix.zeros(1, 1), matrix.identity(3), 0.000000001))
+    say(f, "and A v equals lambda v for the first of them",
+        near_all(column_of(matrix.multiply(spd(), e.vectors) ??
+            matrix.zeros(3, 3), 0),
+            scaled(column_of(e.vectors, 0), e.values[0]), 0.000001))
+    say(f, "an asymmetric matrix has no symmetric eigendecomposition",
+        eigen_refuses(matrix.of(2, 2, [1.0, 2.0, 3.0, 4.0])))
+    say(f, "the three norms are the three numpy reports",
+        near(linalg.norm_frobenius(system()), 4.58257569495584, 0.000000001) and
+        near(linalg.norm_one(system()), 4.0, 0.000000001) and
+        near(linalg.norm_infinity(system()), 6.0, 0.000000001))
+    say(f, "the condition number is 36", near(linalg.condition(system()) ?? 0.0,
+        36.0, 0.0000001))
+    say(f, "and a singular matrix has none",
+        condition_refuses(singular()))
+}
+
+fn column_of(m: Mat, c: i64) -> [f64] {
+    var out: [f64] = []
+    for r in 0..m.rows {
+        out.push(m.cell[r * m.cols + c])
+    }
+    return out
+}
+
+fn scaled(xs: [f64], by: f64) -> [f64] {
+    var out: [f64] = []
+    for x in xs {
+        out.push(x * by)
+    }
+    return out
+}
+
+fn tone(count: i64, hz: f64, rate: f64) -> [f64] {
+    var out: [f64] = []
+    for i in 0..count {
+        out.push(5.0 + (2.0 * pi() * hz * i.as_f64() / rate).sin())
+    }
+    return out
+}
+
+fn check_fft(inout f: i64) / {io} {
+    print("-- fft: a prime length is not a power of two, and padding is not the answer")
+    let eight = [1.0, 2.0, 3.0, 4.0, 4.0, 3.0, 2.0, 1.0]
+    let spectrum = fft.forward_real(eight)
+    say(f, "a symmetric signal transforms to numpy's bins",
+        near(spectrum[0].re, 20.0, 0.000000001) and
+        near(spectrum[1].re, 0.0 - 5.82842712474619, 0.000000001) and
+        near(spectrum[1].im, 0.0 - 2.414213562373095, 0.000000001))
+    say(f, "its odd bins are zero", near(spectrum[2].re, 0.0, 0.000000001) and
+        near(spectrum[4].re, 0.0, 0.000000001))
+    say(f, "bin zero is the sum of the signal",
+        near(spectrum[0].re, 20.0, 0.000000001))
+    // The half this package exists for.
+    let seven = [1.0, 3.0, 0.0 - 2.0, 5.0, 0.5, 0.0 - 1.5, 4.0]
+    let odd = fft.forward_real(seven)
+    say(f, "a length-7 transform is exact, not padded",
+        odd.len() == 7 and near(odd[0].re, 10.0, 0.0000001) and
+        near(odd[1].re, 1.187923108394929, 0.0000001) and
+        near(odd[1].im, 0.0 - 0.68318138747007, 0.0000001))
+    say(f, "and bin 2 matches numpy at that prime length",
+        near(odd[2].re, 6.024938410187301, 0.0000001) and
+        near(odd[2].im, 4.276227713729178, 0.0000001))
+    say(f, "a length-5 transform round-trips to what went in",
+        near_all(fft.inverse_real(fft.forward_real(
+            [2.0, 0.0 - 1.0, 3.0, 7.0, 0.0 - 4.0])),
+            [2.0, 0.0 - 1.0, 3.0, 7.0, 0.0 - 4.0], 0.000000001))
+    say(f, "so does a length-7 one",
+        near_all(fft.inverse_real(fft.forward_real(seven)), seven,
+            0.000000001))
+    say(f, "and a length-1 one is the signal itself",
+        near_all(fft.inverse_real(fft.forward_real([3.0])), [3.0],
+            0.000000001))
+    say(f, "eight is a power of two and seven is not",
+        fft.is_power_of_two(8) and not fft.is_power_of_two(7) and
+        not fft.is_power_of_two(0))
+    say(f, "the next power of two above 7 is 8",
+        fft.next_power_of_two(7) == 8 and fft.next_power_of_two(8) == 8)
+    // The Nyquist bin, where numpy's sign convention is the one followed.
+    say(f, "bin frequencies run positive then negative",
+        near_all(fft.frequencies(8, 800.0), [0.0, 100.0, 200.0, 300.0,
+            0.0 - 400.0, 0.0 - 300.0, 0.0 - 200.0, 0.0 - 100.0], 0.000000001))
+    say(f, "a 48 Hz tone at 512 Hz is found at 48 Hz",
+        near(fft.dominant_frequency(tone(64, 48.0, 512.0), 512.0), 48.0, 0.001))
+    say(f, "and the offset in it does not become the answer",
+        fft.dominant_frequency(tone(64, 48.0, 512.0), 512.0) > 0.0)
+    say(f, "convolution is as long as both signals less one",
+        near_all(fft.convolve([1.0, 2.0, 3.0], [0.0, 1.0, 0.5]) ?? [],
+            [0.0, 1.0, 2.5, 4.0, 1.5], 0.000000001))
+    say(f, "an empty signal has no convolution",
+        convolve_refuses([], [1.0]))
+    say(f, "cross-correlation at lag zero is the dot product",
+        near((fft.cross_correlate([1.0, 2.0, 3.0, 4.0],
+            [0.0, 1.0, 2.0, 3.0]) ?? [])[0], 20.0, 0.000000001))
+    say(f, "signals of different lengths do not correlate",
+        correlate_refuses([1.0], [1.0, 2.0]))
+    say(f, "a shifted signal is found at the shift",
+        (fft.best_lag([0.0, 0.0, 1.0, 2.0, 3.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 2.0, 3.0, 0.0, 0.0, 0.0, 0.0]) ?? 0) == 1)
+}
+
+fn cubic() -> Polynomial {
+    // (x-1)(x-2)(x-3)
+    return polynomial.of([0.0 - 6.0, 11.0, 0.0 - 6.0, 1.0])
+}
+
+fn check_polynomial(inout f: i64) / {io} {
+    print("-- polynomial: coefficients low to high, and roots that come back complex")
+    say(f, "a cubic prints highest power first",
+        polynomial.to_str(cubic()) == "1.0x^3 - 6.0x^2 + 11.0x - 6.0")
+    say(f, "a negative term prints as a subtraction, not as `+ -`",
+        not polynomial.to_str(cubic()).contains("+ -"))
+    say(f, "it is zero at each of its roots",
+        near(polynomial.eval(cubic(), 2.0), 0.0, 0.000000001) and
+        near(polynomial.eval(cubic(), 3.0), 0.0, 0.000000001))
+    say(f, "and 24 at five", near(polynomial.eval(cubic(), 5.0), 24.0,
+        0.000000001))
+    say(f, "its degree is 3", polynomial.degree(cubic()) == 3)
+    say(f, "the zero polynomial has degree -1, not 0",
+        polynomial.degree(polynomial.zero()) == 0 - 1)
+    say(f, "trailing zeros do not raise the degree",
+        polynomial.degree(polynomial.of([1.0, 0.0, 0.0])) == 0)
+    say(f, "the three real roots come back as 1, 2, 3",
+        near_all(polynomial.real_roots(cubic(), 0.000000001) ?? [],
+            [1.0, 2.0, 3.0], 0.000000001))
+    // The reason roots are complex.
+    let quartic = polynomial.of([5.0, 0.0, 1.0, 0.0, 1.0])
+    say(f, "a quartic with no real roots gives four complex ones",
+        (polynomial.roots(quartic) ?? []).len() == 4)
+    say(f, "and none of them survive a real filter",
+        (polynomial.real_roots(quartic, 0.000000001) ?? [0.0]).len() == 0)
+    say(f, "the complex roots are numpy's",
+        near((polynomial.roots(quartic) ?? [])[0].re,
+            0.0 - 0.9316834165905805, 0.0000001) and
+        near((polynomial.roots(quartic) ?? [])[0].im,
+            0.0 - 1.1696298511708298, 0.0000001))
+    say(f, "they come in conjugate pairs",
+        near((polynomial.roots(quartic) ?? [])[0].im +
+            (polynomial.roots(quartic) ?? [])[1].im, 0.0, 0.0000001))
+    say(f, "building from roots gives the polynomial back",
+        polynomial.nearly_equal(polynomial.from_roots([1.0, 2.0, 3.0]),
+            cubic(), 0.000000001))
+    check_polynomial_more(f)
+}
+
+fn check_polynomial_more(inout f: i64) / {io} {
+    let b = polynomial.of([1.0, 2.0, 3.0])
+    let c = polynomial.of([0.0 - 1.0, 1.0])
+    say(f, "multiplication adds the degrees",
+        near_all(polynomial.mul(b, c).coefficient,
+            [0.0 - 1.0, 0.0 - 1.0, 0.0 - 1.0, 3.0], 0.000000001))
+    let d = polynomial.divide(b, c) ??
+    PolyDivision{ quotient: polynomial.zero(),
+        remainder: polynomial.zero() }
+    say(f, "division gives a quotient and a remainder",
+        near_all(d.quotient.coefficient, [5.0, 3.0], 0.000000001) and
+        near_all(d.remainder.coefficient, [6.0], 0.000000001))
+    say(f, "and they rebuild the numerator",
+        polynomial.nearly_equal(polynomial.add(polynomial.mul(d.quotient, c),
+            d.remainder), b, 0.000000001))
+    say(f, "dividing by zero is refused",
+        divide_refuses(b, polynomial.zero()))
+    say(f, "the derivative drops a degree",
+        near_all(polynomial.derivative(cubic()).coefficient,
+            [11.0, 0.0 - 12.0, 3.0], 0.000000001))
+    say(f, "the integral raises one",
+        near_all(polynomial.integral(cubic(), 0.0).coefficient,
+            [0.0, 0.0 - 6.0, 5.5, 0.0 - 2.0, 0.25], 0.000000001))
+    say(f, "and the definite integral over 0..2 is -2",
+        near(polynomial.integrate(cubic(), 0.0, 2.0), 0.0 - 2.0, 0.000000001))
+    say(f, "composition substitutes one into the other",
+        near_all(polynomial.compose(b, c).coefficient,
+            [2.0, 0.0 - 4.0, 3.0], 0.000000001))
+    // Fitting.
+    let xs = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]
+    let ys = [1.0, 2.9, 5.2, 6.8, 9.1, 11.0]
+    say(f, "a straight-line fit is the one numpy's polyfit gives",
+        near_all((polynomial.fit(xs, ys, 1) ?? polynomial.zero()).coefficient,
+            [0.985714285714283, 2.005714285714286], 0.0000001))
+    say(f, "a quadratic fit finds almost no curvature in a straight line",
+        near((polynomial.fit(xs, ys, 2) ??
+            polynomial.zero()).coefficient[2], 0.0, 0.0000001))
+    say(f, "the residual is small but not zero",
+        (polynomial.residual(polynomial.fit(xs, ys, 1) ??
+            polynomial.zero(), xs, ys) ?? 0.0) > 0.0)
+    say(f, "a degree above the point count is refused",
+        fit_refuses([1.0, 2.0], [1.0, 2.0], 5))
+    say(f, "and mismatched inputs are refused",
+        fit_refuses([1.0, 2.0], [1.0], 1))
+    say(f, "interpolation passes through every point exactly",
+        near_all((polynomial.through([0.0, 1.0, 2.0],
+            [1.0, 3.0, 7.0]) ?? polynomial.zero()).coefficient,
+            [1.0, 1.0, 1.0], 0.000000001))
+    say(f, "the gcd of two products is their shared factor",
+        polynomial.nearly_equal(polynomial.gcd(
+            polynomial.from_roots([1.0, 2.0, 3.0]),
+            polynomial.from_roots([2.0, 3.0, 9.0])) ?? polynomial.zero(),
+            polynomial.from_roots([2.0, 3.0]), 0.0000001))
+    say(f, "a repeated root is detectable before it breaks a root-finder",
+        polynomial.has_repeated_root(polynomial.from_roots([2.0, 2.0, 5.0])) ??
+        false)
+    say(f, "and a polynomial with distinct roots has none",
+        not (polynomial.has_repeated_root(cubic()) ?? true))
+}
+
+fn euler(roll: f64, pitch: f64, yaw: f64) -> QuatEuler {
+    return QuatEuler{ roll: roll, pitch: pitch, yaw: yaw }
+}
+
+fn check_quaternion(inout f: i64) / {io} {
+    print("-- quaternion: gimbal lock is real, and it is at straight up")
+    let q = quaternion.from_euler(euler(0.1, 0.2, 0.3))
+    // scipy's `Rotation.from_euler("ZYX", [0.3, 0.2, 0.1])`, scalar moved
+    // to the front.
+    say(f, "Euler angles convert to scipy's quaternion",
+        near(q.w, 0.983347443256356, 0.000000001) and
+        near(q.x, 0.034270798550482, 0.000000001) and
+        near(q.y, 0.106020511061796, 0.000000001) and
+        near(q.z, 0.143572175027392, 0.000000001))
+    let back = quaternion.to_euler(q)
+    say(f, "and convert back to the angles they came from",
+        near(back.roll, 0.1, 0.000000001) and near(back.pitch, 0.2,
+            0.000000001) and near(back.yaw, 0.3, 0.000000001))
+    say(f, "the rotation matrix is scipy's",
+        near_all(quaternion.to_matrix(q).cell,
+            [0.936293363584199, 0.0 - 0.275095847318244, 0.218350663146334,
+                0.289629477625516, 0.956425085849233, 0.0 - 0.036957013524625,
+                0.0 - 0.198669330795061, 0.097843395007256, 0.975170327201816],
+            0.000000001))
+    say(f, "and the matrix converts back to the same rotation",
+        quaternion.same_rotation(quaternion.from_matrix(
+            quaternion.to_matrix(q)) ?? quaternion.identity(), q, 0.000000001))
+    say(f, "a 2x2 matrix is not a rotation",
+        from_matrix_refuses(matrix.identity(2)))
+    say(f, "rotating a vector agrees with scipy",
+        near_all(as_list(quaternion.rotate(q, quaternion.vector(1.0, 2.0,
+            3.0))), [1.041153658386715, 2.091608608750105, 2.922528440824898],
+            0.000000001))
+    let turn = quaternion.from_axis_angle(quaternion.vector(0.0, 0.0, 1.0),
+        pi() / 2.0) ?? quaternion.identity()
+    say(f, "a quarter turn about Z takes X to Y",
+        near_all(as_list(quaternion.rotate(turn,
+            quaternion.vector(1.0, 0.0, 0.0))), [0.0, 1.0, 0.0], 0.000000001))
+    say(f, "four of them come back to the start",
+        quaternion.same_rotation(quaternion.mul(quaternion.mul(turn, turn),
+            quaternion.mul(turn, turn)), quaternion.identity(), 0.000000001))
+    say(f, "an axis of zero length is refused",
+        axis_refuses(quaternion.vector(0.0, 0.0, 0.0), 1.0))
+    say(f, "the axis and angle come back out",
+        near(quaternion.to_axis_angle(turn).angle, pi() / 2.0, 0.000000001) and
+        near(quaternion.to_axis_angle(turn).axis.z, 1.0, 0.000000001))
+    check_quaternion_more(f, q, turn)
+}
+
+fn as_list(v: QuatVec3) -> [f64] {
+    return [v.x, v.y, v.z]
+}
+
+fn check_quaternion_more(inout f: i64, q: Quat, turn: Quat) / {io} {
+    say(f, "multiplication applies the right-hand rotation first",
+        quaternion.same_rotation(quaternion.mul(turn, quaternion.identity()),
+            turn, 0.000000001))
+    say(f, "a rotation times its inverse is nothing",
+        quaternion.same_rotation(quaternion.mul(q,
+            quaternion.inverse(q) ?? quaternion.identity()),
+            quaternion.identity(), 0.000000001))
+    say(f, "a zero quaternion has no inverse",
+        quat_inverse_refuses(quaternion.make(0.0, 0.0, 0.0, 0.0)))
+    say(f, "a rotation and its negation are the same rotation",
+        quaternion.same_rotation(q, quaternion.negate(q), 0.000000001))
+    say(f, "even though they are different numbers",
+        not quaternion.nearly_equal(q, quaternion.negate(q), 0.0001))
+    say(f, "slerp a quarter of the way is scipy's slerp",
+        near(quaternion.slerp(quaternion.identity(), turn, 0.25).w,
+            0.98078528040323, 0.000000001) and
+        near(quaternion.slerp(quaternion.identity(), turn, 0.25).z,
+            0.195090322016128, 0.000000001))
+    say(f, "slerp at the ends is the ends",
+        quaternion.same_rotation(quaternion.slerp(quaternion.identity(), turn,
+            0.0), quaternion.identity(), 0.000000001) and
+        quaternion.same_rotation(quaternion.slerp(quaternion.identity(), turn,
+            1.0), turn, 0.000000001))
+    say(f, "slerp takes the short way round a negated target",
+        quaternion.same_rotation(quaternion.slerp(quaternion.identity(),
+            quaternion.negate(turn), 0.25),
+            quaternion.slerp(quaternion.identity(), turn, 0.25), 0.000000001))
+    say(f, "nlerp reaches the same ends by a different path",
+        quaternion.same_rotation(quaternion.nlerp(quaternion.identity(), turn,
+            1.0), turn, 0.000000001) and
+        not quaternion.nearly_equal(quaternion.nlerp(quaternion.identity(),
+            turn, 0.25), quaternion.slerp(quaternion.identity(), turn, 0.25),
+            0.0001))
+    say(f, "the angle between a rotation and itself is zero",
+        near(quaternion.angle_between(q, q), 0.0, 0.000000001))
+    say(f, "and a quarter turn is a quarter turn",
+        near(quaternion.angle_between(quaternion.identity(), turn),
+            pi() / 2.0, 0.000000001))
+    // Gimbal lock, the thing quaternions exist to avoid.
+    let locked = quaternion.from_euler(euler(0.4, pi() / 2.0, 0.7))
+    say(f, "straight up is gimbal lock",
+        quaternion.near_gimbal_lock(locked, 0.000001))
+    say(f, "and an ordinary rotation is not",
+        not quaternion.near_gimbal_lock(q, 0.000001))
+    let recovered = quaternion.to_euler(locked)
+    say(f, "at lock the Euler angles that come back are not the ones that went in",
+        not near(recovered.roll, 0.4, 0.0001))
+    say(f, "only their difference is, which is what scipy also reports",
+        near(recovered.roll, 0.0, 0.000000001) and
+        near(recovered.yaw, 0.3, 0.000000001))
+    say(f, "and yet the rotation itself is unchanged",
+        quaternion.same_rotation(quaternion.from_euler(recovered), locked,
+            0.000000001))
+    say(f, "which is the entire argument for not storing rotations as angles",
+        near_all(as_list(quaternion.rotate(locked,
+            quaternion.vector(1.0, 2.0, 3.0))),
+            [2.274969054054139, 2.797233598235231, 0.0 - 1.0], 0.000000001))
+}
+
+fn curve() -> Bezier {
+    return bezier.cubic(geometry.point(0.0, 0.0), geometry.point(10.0, 40.0),
+        geometry.point(90.0, 0.0 - 20.0), geometry.point(100.0, 10.0))
+}
+
+fn check_bezier(inout f: i64) / {io} {
+    print("-- bezier: the parameter is not the distance")
+    let p = bezier.at(curve(), 0.35)
+    say(f, "the point at t = 0.35 is the Bernstein sum",
+        near(p.x, 30.2225, 0.0000001) and near(p.y, 13.39625, 0.0000001))
+    say(f, "the ends are the first and last control points",
+        near(bezier.at(curve(), 0.0).x, 0.0, 0.000000001) and
+        near(bezier.at(curve(), 1.0).x, 100.0, 0.000000001))
+    say(f, "the length matches scipy's adaptive quadrature to the last digit",
+        near(bezier.length(curve()) ?? 0.0, 112.11380507199428, 0.0000000001))
+    say(f, "and the length to a point is a part of it",
+        near(bezier.length_to(curve(), 0.35) ?? 0.0, 37.12507598094068,
+            0.0000000001))
+    // The claim in the header, made testable.
+    say(f, "t = 0.35 is not 35 percent of the way along",
+        not near((bezier.length_to(curve(), 0.35) ?? 0.0) /
+            (bezier.length(curve()) ?? 1.0), 0.35, 0.01))
+    say(f, "the point 50 units along is not the point at t = 0.5",
+        not near((bezier.at_distance(curve(), 50.0) ??
+            geometry.point(0.0, 0.0)).x, bezier.at(curve(), 0.5).x, 1.0))
+    say(f, "and it is where scipy's root-find puts it",
+        near((bezier.at_distance(curve(), 50.0) ??
+            geometry.point(0.0, 0.0)).x, 42.80373895, 0.00001))
+    say(f, "evenly spaced points are evenly spaced by distance",
+        evenly_spaced(bezier.even_points(curve(), 9) ?? []))
+    say(f, "the tangent is a unit vector",
+        near(length_of(bezier.tangent(curve(), 0.35) ??
+            geometry.point(0.0, 0.0)), 1.0, 0.000000001))
+    say(f, "and it points the way scipy's derivative does",
+        near((bezier.tangent(curve(), 0.35) ??
+            geometry.point(0.0, 0.0)).x, 0.98733367, 0.0000001))
+    say(f, "the normal is at a right angle to it",
+        near(geometry.dot(bezier.tangent(curve(), 0.35) ??
+            geometry.point(0.0, 0.0), bezier.normal(curve(), 0.35) ??
+            geometry.point(0.0, 0.0)), 0.0, 0.000000001))
+    say(f, "the curvature is signed, and negative here",
+        near(bezier.curvature(curve(), 0.35) ?? 0.0,
+            0.0 - 0.011036800059086, 0.000000001))
+    say(f, "a straight line has no curvature",
+        near(bezier.curvature(bezier.line(geometry.point(0.0, 0.0),
+            geometry.point(1.0, 1.0)), 0.5) ?? 1.0, 0.0, 0.000000001))
+    check_bezier_more(f)
+}
+
+fn length_of(v: Vec2) -> f64 {
+    return (v.x * v.x + v.y * v.y).sqrt()
+}
+
+fn evenly_spaced(points: [Vec2]) -> bool {
+    if points.len() < 3 {
+        return false
+    }
+    let first = geometry.distance(points[0], points[1])
+    for i in 1..(points.len() - 1) {
+        let d = geometry.distance(points[i], points[i + 1])
+        if d < first * 0.9 or d > first * 1.1 {
+            return false
+        }
+    }
+    return true
+}
+
+fn check_bezier_more(inout f: i64) / {io} {
+    // The tight box against the loose one.
+    let box = bezier.bounds(curve()) ?? geometry.rect(0.0, 0.0, 0.0, 0.0)
+    say(f, "the bounding box touches the curve at both ends of y",
+        near(box.y, 0.0, 0.0000001) and
+        near(box.y + box.h, 14.270111227337654, 0.0000001))
+    say(f, "and it is far smaller than the control polygon's box",
+        box.h < 20.0)
+    say(f, "which spans the control points and not the curve",
+        control_height(curve()) > 55.0)
+    let halves = bezier.split(curve(), 0.35)
+    say(f, "splitting gives two curves that meet at the split point",
+        near(halves.left.point[3].x, 30.2225, 0.0000001) and
+        near(halves.right.point[0].x, 30.2225, 0.0000001))
+    say(f, "the left half starts where the whole one does",
+        near(halves.left.point[0].x, 0.0, 0.000000001))
+    say(f, "the right half ends where the whole one does",
+        near(halves.right.point[3].x, 100.0, 0.000000001))
+    say(f, "and the two lengths add up to the whole",
+        near((bezier.length(halves.left) ?? 0.0) +
+            (bezier.length(halves.right) ?? 0.0),
+            bezier.length(curve()) ?? 0.0, 0.0000001))
+    say(f, "raising the degree adds a control point",
+        bezier.degree(bezier.elevate(curve())) == 4)
+    say(f, "and does not move the curve",
+        near(bezier.at(bezier.elevate(curve()), 0.35).x, 30.2225, 0.0000001))
+    say(f, "flattening adapts: a tight tolerance costs more points",
+        bezier.flatten(curve(), 0.1).len() >
+        bezier.flatten(curve(), 5.0).len())
+    say(f, "and every flattening keeps the two ends",
+        near(bezier.flatten(curve(), 1.0)[0].x, 0.0, 0.000000001))
+    let n = bezier.nearest(curve(), geometry.point(50.0, 0.0))
+    say(f, "the nearest point is where scipy's minimiser puts it",
+        near(n.t, 0.5168686193, 0.0000001) and
+        near(n.distance, 8.427396376995851, 0.0000001))
+    say(f, "a two-point curve is a line", bezier.degree(bezier.line(
+        geometry.point(0.0, 0.0), geometry.point(3.0, 4.0))) == 1)
+    say(f, "and its length is the distance between its ends",
+        near(bezier.length(bezier.line(geometry.point(0.0, 0.0),
+            geometry.point(3.0, 4.0))) ?? 0.0, 5.0, 0.000000001))
+    say(f, "one point is not a curve", curve_refuses([geometry.point(0.0, 0.0)]))
+    // CSS easing, which is a solve and not an evaluation.
+    say(f, "the CSS ease curve gives the values a browser gives",
+        near(bezier.css_ease(0.25), 0.408510591355396, 0.0000001) and
+        near(bezier.css_ease(0.5), 0.802403387584857, 0.0000001) and
+        near(bezier.css_ease(0.75), 0.960458978348974, 0.0000001))
+    say(f, "ease-in-out is symmetric about the middle",
+        near(bezier.css_ease_in_out(0.5), 0.5, 0.000000001) and
+        near(bezier.css_ease_in_out(0.25) + bezier.css_ease_in_out(0.75), 1.0,
+            0.000000001))
+    say(f, "and the answer is y at the t where x matches, not y at t",
+        not near(bezier.css_ease(0.25), 0.25, 0.01))
+    say(f, "the ends are pinned", bezier.css_ease(0.0) == 0.0 and
+        bezier.css_ease(1.0) == 1.0)
+}
+
+fn control_height(b: Bezier) -> f64 {
+    var low = b.point[0].y
+    var high = low
+    for p in b.point {
+        if p.y < low {
+            low = p.y
+        }
+        if p.y > high {
+            high = p.y
+        }
+    }
+    return high - low
+}
+
+fn main() / {io} {
+    var f = 0
+
+    check_linalg(f)
+    check_fft(f)
+    check_polynomial(f)
+    check_quaternion(f)
+    check_bezier(f)
+
+    if f == 0 {
+        print("linear algebra: every claim held")
+    } else {
+        print("linear algebra: {f} failed")
+    }
+}

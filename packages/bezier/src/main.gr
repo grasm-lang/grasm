@@ -1,0 +1,566 @@
+// Bezier curves of any degree, and the two things about them that are
+// counter-intuitive.
+//
+// **The parameter is not distance.** Stepping `t` from 0 to 1 in equal
+// increments does not move along the curve at an even speed; on a curve with
+// a sharp bend, points bunch up in the bend and spread out on the straight.
+// Anything that moves an object along a path, spaces dashes, or places labels
+// needs `at_distance`, which inverts the arc length. Using `at` for that is
+// the single most common Bezier bug, and it looks like a rendering problem
+// rather than like a maths one.
+//
+// **The control polygon is not the bounding box.** The convex hull of the
+// control points contains the curve, so it is a valid box — but it can be
+// several times too large, and for a curve with a control point flung far out
+// it is much too large. `bounds` here differentiates and solves, so the box it
+// returns touches the curve.
+//
+// Arc length is by 16-point Gauss-Legendre quadrature over eight panels,
+// rather than by chopping the curve into a thousand chords and adding them up.
+// Checked against `scipy.integrate.quad` to the last digit a double holds.
+
+import geometry
+
+/// A curve, held as its control points. Degree is `point.len() - 1`.
+type Bezier = {
+    point: [Vec2],
+}
+
+/// A curve cut in two at some `t`, both halves reparameterised to 0..1.
+type BezSplit = {
+    left: Bezier,
+    right: Bezier,
+}
+
+/// The closest place on a curve to some point.
+type BezNearest = {
+    t: f64,
+    point: Vec2,
+    distance: f64,
+}
+
+type BezError =
+    | BezTooFewPoints(given: i64)
+    | BezDegenerate
+
+fn abs_of(v: f64) -> f64 {
+    if v < 0.0 {
+        return 0.0 - v
+    }
+    return v
+}
+
+/// A curve through these control points, of whatever degree they imply.
+pub fn of(points: [Vec2]) -> Bezier ! BezError {
+    if points.len() < 2 {
+        fail(BezTooFewPoints(points.len()))
+    }
+    return Bezier{ point: points }
+}
+
+pub fn line(a: Vec2, b: Vec2) -> Bezier {
+    return Bezier{ point: [a, b] }
+}
+
+pub fn quadratic(a: Vec2, control: Vec2, b: Vec2) -> Bezier {
+    return Bezier{ point: [a, control, b] }
+}
+
+pub fn cubic(a: Vec2, c1: Vec2, c2: Vec2, b: Vec2) -> Bezier {
+    return Bezier{ point: [a, c1, c2, b] }
+}
+
+pub fn degree(b: Bezier) -> i64 {
+    return b.point.len() - 1
+}
+
+/// The point at parameter `t`, by de Casteljau's algorithm.
+///
+/// De Casteljau and not the Bernstein sum: the sum needs binomial coefficients
+/// and powers of `t`, both of which overflow and lose precision at degree 20
+/// or so, while de Casteljau is a chain of interpolations between numbers that
+/// are all in range. It is also what `split` needs, so there is one algorithm
+/// here rather than two.
+pub fn at(b: Bezier, t: f64) -> Vec2 {
+    var work = b.point
+    var n = work.len()
+    while n > 1 {
+        for i in 0..(n - 1) {
+            work[i] = geometry.point(
+                work[i].x + (work[i + 1].x - work[i].x) * t,
+                work[i].y + (work[i + 1].y - work[i].y) * t)
+        }
+        n = n - 1
+    }
+    return work[0]
+}
+
+/// The derivative curve — degree one lower, and it is itself a Bezier.
+pub fn derivative(b: Bezier) -> Bezier ! BezError {
+    let n = degree(b)
+    if n < 1 {
+        fail(BezDegenerate)
+    }
+    var out: [Vec2] = []
+    for i in 0..n {
+        out.push(geometry.point(
+            (b.point[i + 1].x - b.point[i].x) * n.as_f64(),
+            (b.point[i + 1].y - b.point[i].y) * n.as_f64()))
+    }
+    if out.len() < 2 {
+        // The derivative of a line is a constant, which is not a curve. Held
+        // as a two-point curve with both points equal so `at` still works.
+        out.push(out[0])
+    }
+    return Bezier{ point: out }
+}
+
+/// The unit tangent at `t`.
+pub fn tangent(b: Bezier, t: f64) -> Vec2 ! BezError {
+    let d = try derivative(b)
+    let v = at(d, t)
+    let length = (v.x * v.x + v.y * v.y).sqrt()
+    if length < 0.000000000001 {
+        return geometry.point(0.0, 0.0)
+    }
+    return geometry.point(v.x / length, v.y / length)
+}
+
+/// The unit normal at `t`, the tangent turned a quarter turn anticlockwise.
+pub fn normal(b: Bezier, t: f64) -> Vec2 ! BezError {
+    let v = try tangent(b, t)
+    return geometry.point(0.0 - v.y, v.x)
+}
+
+/// Signed curvature at `t`: positive turning left, negative turning right.
+///
+/// Signed and not absolute, because the sign is the information: it changes at
+/// an inflection point, and finding those is most of what curvature is asked
+/// for.
+pub fn curvature(b: Bezier, t: f64) -> f64 ! BezError {
+    let d1 = try derivative(b)
+    let d2 = try derivative(d1)
+    let v = at(d1, t)
+    let a = at(d2, t)
+    let speed = (v.x * v.x + v.y * v.y).sqrt()
+    if speed < 0.000000000001 {
+        return 0.0
+    }
+    return (v.x * a.y - v.y * a.x) / (speed * speed * speed)
+}
+
+/// Cut the curve at `t`, both halves reparameterised to run 0 to 1.
+///
+/// The intermediate points de Casteljau produces are the two halves' control
+/// points, which is why this costs no more than evaluating.
+pub fn split(b: Bezier, t: f64) -> BezSplit {
+    var work = b.point
+    var left: [Vec2] = [work[0]]
+    var right: [Vec2] = [work[work.len() - 1]]
+    var n = work.len()
+    while n > 1 {
+        for i in 0..(n - 1) {
+            work[i] = geometry.point(
+                work[i].x + (work[i + 1].x - work[i].x) * t,
+                work[i].y + (work[i + 1].y - work[i].y) * t)
+        }
+        n = n - 1
+        left.push(work[0])
+        right.push(work[n - 1])
+    }
+    var flipped: [Vec2] = []
+    var i = right.len() - 1
+    while i >= 0 {
+        flipped.push(right[i])
+        i = i - 1
+    }
+    return BezSplit{ left: Bezier{ point: left },
+        right: Bezier{ point: flipped } }
+}
+
+/// The same curve, one degree higher.
+///
+/// Used to bring two curves to a common degree before adding or comparing
+/// them. The shape does not change; only the number of control points does.
+pub fn elevate(b: Bezier) -> Bezier {
+    let n = degree(b)
+    var out: [Vec2] = [b.point[0]]
+    for i in 1..(n + 1) {
+        let w = i.as_f64() / (n + 1).as_f64()
+        out.push(geometry.point(
+            b.point[i - 1].x * w + b.point[i].x * (1.0 - w),
+            b.point[i - 1].y * w + b.point[i].y * (1.0 - w)))
+    }
+    out.push(b.point[n])
+    return Bezier{ point: out }
+}
+
+// ------------------------------------------------------------ arc length
+
+/// The 16 Gauss-Legendre abscissae on -1..1, as the positive halves.
+fn gauss_nodes() -> [f64] {
+    return [0.0950125098376374, 0.2816035507792589, 0.4580167776572274,
+        0.6178762444026438, 0.7554044083550030, 0.8656312023878318,
+        0.9445750230732326, 0.9894009349916499]
+}
+
+/// The weight for each of those, in the same order.
+fn gauss_weights() -> [f64] {
+    return [0.1894506104550685, 0.1826034150449236, 0.1691565193950025,
+        0.1495959888165767, 0.1246289712555339, 0.0951585116824928,
+        0.0622535239386479, 0.0271524594117541]
+}
+
+/// How many panels the interval is cut into before each is integrated.
+///
+/// One panel of 16 points is out in the ninth significant digit on a curve
+/// with a bend in it — the speed is a square root, so it is not a polynomial
+/// and no fixed rule is exact. Eight panels reaches full double precision on
+/// every curve tested against `scipy.integrate.quad`, and costs 128 evaluations
+/// of a de Casteljau chain, which is nothing next to the subdivision the
+/// alternative would need.
+fn panels() -> i64 {
+    return 8
+}
+
+/// The length of the curve, by Gauss-Legendre quadrature of its speed.
+pub fn length(b: Bezier) -> f64 ! BezError {
+    return try length_to(b, 1.0)
+}
+
+/// The length from the start to parameter `t`.
+pub fn length_to(b: Bezier, t: f64) -> f64 ! BezError {
+    if t <= 0.0 {
+        return 0.0
+    }
+    let d = try derivative(b)
+    let nodes = gauss_nodes()
+    let weights = gauss_weights()
+    let width = t / panels().as_f64()
+    let half = width / 2.0
+    var total = 0.0
+    for panel in 0..panels() {
+        let centre = width * panel.as_f64() + half
+        for i in 0..nodes.len() {
+            // Each node stands for a symmetric pair, so both are taken here.
+            let ahead = at(d, centre + half * nodes[i])
+            let behind = at(d, centre - half * nodes[i])
+            let sa = (ahead.x * ahead.x + ahead.y * ahead.y).sqrt()
+            let sb = (behind.x * behind.x + behind.y * behind.y).sqrt()
+            total = total + weights[i] * (sa + sb)
+        }
+    }
+    return total * half
+}
+
+/// The point at a given distance along the curve, not at a given parameter.
+///
+/// This is what "move the object 30 pixels along the path" needs. It inverts
+/// the arc length by bisection on `t`, which converges because length is
+/// monotonic in `t` — Newton's method is faster and fails at a cusp, where the
+/// speed is zero and the step is unbounded.
+pub fn at_distance(b: Bezier, distance: f64) -> Vec2 ! BezError {
+    let total = try length(b)
+    if total < 0.000000000001 {
+        return b.point[0]
+    }
+    if distance <= 0.0 {
+        return b.point[0]
+    }
+    if distance >= total {
+        return b.point[b.point.len() - 1]
+    }
+    var low = 0.0
+    var high = 1.0
+    for _i in 0..60 {
+        let mid = (low + high) / 2.0
+        if try length_to(b, mid) < distance {
+            low = mid
+        } else {
+            high = mid
+        }
+    }
+    return at(b, (low + high) / 2.0)
+}
+
+/// Points evenly spaced by distance along the curve, ends included.
+///
+/// Not evenly spaced in `t`: that is the same curve sampled unevenly, and it
+/// is what makes a dashed path's dashes different lengths.
+pub fn even_points(b: Bezier, count: i64) -> [Vec2] ! BezError {
+    if count < 2 {
+        return [b.point[0]]
+    }
+    let total = try length(b)
+    var out: [Vec2] = []
+    for i in 0..count {
+        let d = total * i.as_f64() / (count - 1).as_f64()
+        out.push(try at_distance(b, d))
+    }
+    return out
+}
+
+// --------------------------------------------------------------- bounds
+
+/// The tight bounding box: the box that touches the curve.
+///
+/// The convex hull of the control points also contains the curve and is what
+/// most code uses, because it needs no maths. It can be several times too
+/// large, and a hit test or a redraw region built on it does several times the
+/// work it needed to.
+pub fn bounds(b: Bezier) -> Rect ! BezError {
+    var lowx = b.point[0].x
+    var highx = lowx
+    var lowy = b.point[0].y
+    var highy = lowy
+    let last = b.point[b.point.len() - 1]
+    lowx = min_of(lowx, last.x)
+    highx = max_of(highx, last.x)
+    lowy = min_of(lowy, last.y)
+    highy = max_of(highy, last.y)
+    // Interior extremes are where a component of the derivative is zero.
+    let d = try derivative(b)
+    for t in stationary(d, true) {
+        let p = at(b, t)
+        lowx = min_of(lowx, p.x)
+        highx = max_of(highx, p.x)
+    }
+    for t in stationary(d, false) {
+        let p = at(b, t)
+        lowy = min_of(lowy, p.y)
+        highy = max_of(highy, p.y)
+    }
+    return geometry.rect(lowx, lowy, highx - lowx, highy - lowy)
+}
+
+fn min_of(a: f64, b: f64) -> f64 {
+    if a < b {
+        return a
+    }
+    return b
+}
+
+fn max_of(a: f64, b: f64) -> f64 {
+    if a > b {
+        return a
+    }
+    return b
+}
+
+/// The `t` in 0..1 where one component of the derivative curve is zero.
+///
+/// Solved exactly for degree 1 and 2 — the derivative of a quadratic and of a
+/// cubic — and by bisection on sign changes above that, because a general
+/// polynomial root-finder is a much larger thing than a bounding box needs.
+fn stationary(d: Bezier, horizontal: bool) -> [f64] {
+    var out: [f64] = []
+    let n = degree(d)
+    if n == 1 {
+        let a = component(d.point[0], horizontal)
+        let b = component(d.point[1], horizontal)
+        if a != b {
+            push_if_inside(out, a / (a - b))
+        }
+        return out
+    }
+    if n == 2 {
+        let p0 = component(d.point[0], horizontal)
+        let p1 = component(d.point[1], horizontal)
+        let p2 = component(d.point[2], horizontal)
+        let a = p0 - 2.0 * p1 + p2
+        let b = 2.0 * (p1 - p0)
+        let c = p0
+        if abs_of(a) < 0.000000000001 {
+            if abs_of(b) > 0.000000000001 {
+                push_if_inside(out, (0.0 - c) / b)
+            }
+            return out
+        }
+        let disc = b * b - 4.0 * a * c
+        if disc >= 0.0 {
+            let root = disc.sqrt()
+            push_if_inside(out, ((0.0 - b) + root) / (2.0 * a))
+            push_if_inside(out, ((0.0 - b) - root) / (2.0 * a))
+        }
+        return out
+    }
+    var previous = component(at(d, 0.0), horizontal)
+    for i in 1..201 {
+        let t = i.as_f64() / 200.0
+        let value = component(at(d, t), horizontal)
+        if (previous < 0.0 and value > 0.0) or (previous > 0.0 and value < 0.0) {
+            out.push(refine(d, horizontal, (i - 1).as_f64() / 200.0, t))
+        }
+        previous = value
+    }
+    return out
+}
+
+fn refine(d: Bezier, horizontal: bool, from: f64, to: f64) -> f64 {
+    var low = from
+    var high = to
+    let sign_low = component(at(d, low), horizontal)
+    for _i in 0..60 {
+        let mid = (low + high) / 2.0
+        let value = component(at(d, mid), horizontal)
+        if (value < 0.0) == (sign_low < 0.0) {
+            low = mid
+        } else {
+            high = mid
+        }
+    }
+    return (low + high) / 2.0
+}
+
+fn component(p: Vec2, horizontal: bool) -> f64 {
+    if horizontal {
+        return p.x
+    }
+    return p.y
+}
+
+fn push_if_inside(inout out: [f64], t: f64) {
+    if t > 0.0 and t < 1.0 {
+        out.push(t)
+    }
+}
+
+// ------------------------------------------------------- flatten, nearest
+
+/// A polyline that stays within `tolerance` of the curve.
+///
+/// Adaptive: a nearly straight stretch becomes one segment and a tight bend
+/// becomes many, so the output has the fewest points that meet the tolerance.
+/// Sampling at a fixed step gives either a visible polygon on the bends or ten
+/// times the points needed on the straights.
+pub fn flatten(b: Bezier, tolerance: f64) -> [Vec2] {
+    var out: [Vec2] = [b.point[0]]
+    subdivide(b, tolerance, out, 0)
+    return out
+}
+
+fn subdivide(b: Bezier, tolerance: f64, inout out: [Vec2], depth: i64) {
+    if flat_enough(b, tolerance) or depth >= 24 {
+        out.push(b.point[b.point.len() - 1])
+    } else {
+        let halves = split(b, 0.5)
+        subdivide(halves.left, tolerance, out, depth + 1)
+        subdivide(halves.right, tolerance, out, depth + 1)
+    }
+}
+
+/// Whether every control point is within `tolerance` of the chord.
+fn flat_enough(b: Bezier, tolerance: f64) -> bool {
+    let a = b.point[0]
+    let z = b.point[b.point.len() - 1]
+    let dx = z.x - a.x
+    let dy = z.y - a.y
+    let chord = (dx * dx + dy * dy).sqrt()
+    if chord < 0.000000000001 {
+        // A closed loop has no chord to measure against; only its size.
+        for p in b.point {
+            let ex = p.x - a.x
+            let ey = p.y - a.y
+            if (ex * ex + ey * ey).sqrt() > tolerance {
+                return false
+            }
+        }
+        return true
+    }
+    for i in 1..(b.point.len() - 1) {
+        let p = b.point[i]
+        let away = abs_of(dy * (p.x - a.x) - dx * (p.y - a.y)) / chord
+        if away > tolerance {
+            return false
+        }
+    }
+    return true
+}
+
+/// The place on the curve closest to `p`.
+///
+/// A coarse sweep followed by bisection on the derivative of the squared
+/// distance. Solving it exactly means the roots of a degree-5 polynomial for a
+/// cubic, which is a root-finder this package would otherwise not need.
+pub fn nearest(b: Bezier, p: Vec2) -> BezNearest {
+    var best = 0.0
+    var closest = distance_squared(at(b, 0.0), p)
+    for i in 1..101 {
+        let t = i.as_f64() / 100.0
+        let d = distance_squared(at(b, t), p)
+        if d < closest {
+            closest = d
+            best = t
+        }
+    }
+    var low = max_of(0.0, best - 0.01)
+    var high = min_of(1.0, best + 0.01)
+    for _i in 0..40 {
+        let third = (high - low) / 3.0
+        let a = low + third
+        let z = high - third
+        if distance_squared(at(b, a), p) < distance_squared(at(b, z), p) {
+            high = z
+        } else {
+            low = a
+        }
+    }
+    let t = (low + high) / 2.0
+    let point = at(b, t)
+    return BezNearest{ t: t, point: point,
+        distance: distance_squared(point, p).sqrt() }
+}
+
+fn distance_squared(a: Vec2, b: Vec2) -> f64 {
+    let dx = a.x - b.x
+    let dy = a.y - b.y
+    return dx * dx + dy * dy
+}
+
+// --------------------------------------------------------------- easing
+
+/// CSS `cubic-bezier(x1, y1, x2, y2)`: the output for a given input.
+///
+/// The curve runs from `(0,0)` to `(1,1)`, and the answer is `y` at the `t`
+/// where `x` equals the input — **not** `y` at `t` equal to the input. Those
+/// two are the same only for a linear curve, and confusing them is why a
+/// hand-rolled easing function feels wrong at the ends while looking right in
+/// the middle.
+///
+/// `x1` and `x2` outside 0..1 make `x` non-monotonic, which CSS forbids; the
+/// bisection below still returns the first crossing rather than failing.
+pub fn ease(x1: f64, y1: f64, x2: f64, y2: f64, x: f64) -> f64 {
+    if x <= 0.0 {
+        return 0.0
+    }
+    if x >= 1.0 {
+        return 1.0
+    }
+    var low = 0.0
+    var high = 1.0
+    for _i in 0..60 {
+        let mid = (low + high) / 2.0
+        if bezier_component(x1, x2, mid) < x {
+            low = mid
+        } else {
+            high = mid
+        }
+    }
+    return bezier_component(y1, y2, (low + high) / 2.0)
+}
+
+/// One coordinate of a cubic from `0` to `1` with the two given controls.
+fn bezier_component(c1: f64, c2: f64, t: f64) -> f64 {
+    let u = 1.0 - t
+    return 3.0 * u * u * t * c1 + 3.0 * u * t * t * c2 + t * t * t
+}
+
+/// The CSS `ease` curve, which is `cubic-bezier(0.25, 0.1, 0.25, 1)`.
+pub fn css_ease(x: f64) -> f64 {
+    return ease(0.25, 0.1, 0.25, 1.0, x)
+}
+
+/// The CSS `ease-in-out` curve, `cubic-bezier(0.42, 0, 0.58, 1)`.
+pub fn css_ease_in_out(x: f64) -> f64 {
+    return ease(0.42, 0.0, 0.58, 1.0, x)
+}

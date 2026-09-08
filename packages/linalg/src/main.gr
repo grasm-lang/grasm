@@ -1,0 +1,623 @@
+// Factorisations, and the things you can only get from one.
+//
+// `matrix` holds the arithmetic: add, multiply, transpose, determinant. This
+// holds what elimination gives you once — LU, QR, Cholesky — and the answers
+// that come out of a factorisation rather than out of a formula: solving,
+// inverting, least squares, rank, the condition number, and the eigenvalues
+// of a symmetric matrix.
+//
+// Two things are deliberate.
+//
+// **Pivoting is not optional.** Elimination without a pivot search divides by
+// whatever happens to sit on the diagonal, and on a matrix that is perfectly
+// well conditioned — `[[0, 1], [1, 0]]` is the smallest example — that is a
+// division by zero. Every routine here searches for the largest available
+// pivot first. This is why `solve` is not `inverse` followed by a multiply.
+//
+// **An inverse is a bad way to solve a system.** `inverse(a)` then a multiply
+// costs three times what `solve` costs and loses accuracy at every step. It is
+// here because sometimes the inverse is the answer you actually want; it is
+// not here as the way to answer `Ax = b`.
+//
+// Checked against numpy's `linalg` module: the same decompositions on the same
+// matrices, to 1e-9.
+
+import matrix
+
+type LinError =
+    | LinNotSquare(n: i64)
+    | LinSingular
+    | LinShape(a: str, b: str)
+    | LinNotSymmetric
+    | LinNotPositiveDefinite
+    | LinNoConvergence(sweeps: i64)
+
+    /// An LU factorisation with partial pivoting: `P A = L U`.
+    ///
+    /// `L` and `U` share one array, because `L` has a unit diagonal that does not
+    /// need storing: below the diagonal is `L`, on and above it is `U`.
+type LinLu = {
+    n: i64,
+    packed: [f64],
+    pivot: [i64],
+    sign: f64,
+    singular: bool,
+}
+
+/// `A = Q R`, with `Q` orthogonal and `R` upper triangular.
+type LinQr = {
+    q: Mat,
+    r: Mat,
+}
+
+/// The eigenvalues of a symmetric matrix, and the vectors they belong to.
+///
+/// Values are in descending order, and column `i` of `vectors` is the vector
+/// for value `i` — the order pairs them, so sorting one means sorting both.
+type LinEigen = {
+    values: [f64],
+    vectors: Mat,
+    sweeps: i64,
+}
+
+fn abs_of(x: f64) -> f64 {
+    if x < 0.0 {
+        return 0.0 - x
+    }
+    return x
+}
+
+/// Below this, a pivot is treated as zero.
+///
+/// Not a tolerance on the answer: a tolerance on whether elimination can
+/// continue at all. A matrix whose largest remaining pivot is this small is
+/// singular for every purpose a caller has.
+pub fn epsilon() -> f64 {
+    return 0.000000000001
+}
+
+// ---------------------------------------------------------------------- LU
+
+/// `P A = L U` by Gaussian elimination with partial pivoting.
+///
+/// A singular matrix is factorised rather than refused: the result carries
+/// `singular`, and it is `solve` and `inverse` that fail. Callers that only
+/// want the determinant or the rank get an answer from a singular matrix.
+pub fn lu(a: Mat) -> LinLu ! LinError {
+    if a.rows != a.cols {
+        fail(LinNotSquare(a.rows))
+    }
+    let n = a.rows
+    var packed = a.cell
+    var pivot: [i64] = []
+    for i in 0..n {
+        pivot.push(i)
+    }
+    var sign = 1.0
+    var singular = false
+    for col in 0..n {
+        // The largest available pivot, not the first non-zero one: the
+        // difference is the whole of this routine's accuracy.
+        var best = col
+        var largest = abs_of(packed[col * n + col])
+        for r in (col + 1)..n {
+            let v = abs_of(packed[r * n + col])
+            if v > largest {
+                largest = v
+                best = r
+            }
+        }
+        if largest < epsilon() {
+            singular = true
+        } else {
+            if best != col {
+                for j in 0..n {
+                    let t = packed[col * n + j]
+                    packed[col * n + j] = packed[best * n + j]
+                    packed[best * n + j] = t
+                }
+                let tp = pivot[col]
+                pivot[col] = pivot[best]
+                pivot[best] = tp
+                sign = 0.0 - sign
+            }
+            let p = packed[col * n + col]
+            for row in (col + 1)..n {
+                let factor = packed[row * n + col] / p
+                // The multiplier is kept where the zero it creates would go:
+                // that is the lower triangle, and it is `L`.
+                packed[row * n + col] = factor
+                for j in (col + 1)..n {
+                    packed[row * n + j] = packed[row * n + j] -
+                    factor * packed[col * n + j]
+                }
+            }
+        }
+    }
+    return LinLu{ n: n, packed: packed, pivot: pivot, sign: sign,
+        singular: singular }
+}
+
+/// The determinant, from a factorisation already paid for.
+///
+/// `matrix.determinant` runs its own elimination. This one is the product of
+/// the diagonal, which is free once `lu` has run — so solving and taking the
+/// determinant of the same matrix costs one elimination rather than two.
+pub fn lu_determinant(f: LinLu) -> f64 {
+    if f.singular {
+        return 0.0
+    }
+    var d = f.sign
+    for i in 0..f.n {
+        d = d * f.packed[i * f.n + i]
+    }
+    return d
+}
+
+/// Solve `A x = b` using a factorisation, by forward then back substitution.
+pub fn lu_solve(f: LinLu, b: [f64]) -> [f64] ! LinError {
+    if f.singular {
+        fail(LinSingular)
+    }
+    if b.len() != f.n {
+        fail(LinShape("{f.n}", "{b.len()}"))
+    }
+    let n = f.n
+    // Applying `P` is a gather, not a loop of swaps.
+    var y: [f64] = []
+    for i in 0..n {
+        y.push(b[f.pivot[i]])
+    }
+    for i in 1..n {
+        var s = y[i]
+        for j in 0..i {
+            s = s - f.packed[i * n + j] * y[j]
+        }
+        y[i] = s
+    }
+    var x = y
+    var i = n - 1
+    while i >= 0 {
+        var s = x[i]
+        for j in (i + 1)..n {
+            s = s - f.packed[i * n + j] * x[j]
+        }
+        x[i] = s / f.packed[i * n + i]
+        i = i - 1
+    }
+    return x
+}
+
+/// Solve `A x = b`.
+///
+/// Not `inverse(a)` times `b`: three times the work and worse answers.
+pub fn solve(a: Mat, b: [f64]) -> [f64] ! LinError {
+    let f = try lu(a)
+    return try lu_solve(f, b)
+}
+
+/// Solve `A X = B` for several right-hand sides at once.
+///
+/// The factorisation is computed once and reused per column, which is the
+/// reason this exists rather than a loop over `solve`.
+pub fn solve_many(a: Mat, b: Mat) -> Mat ! LinError {
+    if a.rows != b.rows {
+        fail(LinShape(matrix.shape(a), matrix.shape(b)))
+    }
+    let f = try lu(a)
+    var out = matrix.zeros(b.rows, b.cols)
+    for c in 0..b.cols {
+        var column: [f64] = []
+        for r in 0..b.rows {
+            column.push(b.cell[r * b.cols + c])
+        }
+        let x = try lu_solve(f, column)
+        for r in 0..b.rows {
+            out.cell[r * b.cols + c] = x[r]
+        }
+    }
+    return out
+}
+
+/// The inverse, by solving against each column of the identity.
+pub fn inverse(a: Mat) -> Mat ! LinError {
+    return try solve_many(a, matrix.identity(a.rows))
+}
+
+/// The determinant, without the caller holding a factorisation.
+pub fn determinant(a: Mat) -> f64 ! LinError {
+    return lu_determinant(try lu(a))
+}
+
+// ---------------------------------------------------------------------- QR
+
+/// `A = Q R` by Householder reflections, for any shape with `rows >= cols`.
+///
+/// Reflections rather than Gram-Schmidt: classical Gram-Schmidt loses
+/// orthogonality on anything close to rank-deficient, and the modified form
+/// only delays it. A reflection is orthogonal to machine precision by
+/// construction.
+pub fn qr(a: Mat) -> LinQr ! LinError {
+    if a.rows < a.cols {
+        fail(LinShape(matrix.shape(a), "rows >= cols"))
+    }
+    let m = a.rows
+    let n = a.cols
+    var r = a
+    var q = matrix.identity(m)
+    for k in 0..n {
+        // The reflector that puts every entry below `k` in column `k` to zero.
+        var norm = 0.0
+        for i in k..m {
+            let v = r.cell[i * n + k]
+            norm = norm + v * v
+        }
+        norm = norm.sqrt()
+        if norm >= epsilon() {
+            // Reflecting away from the pivot rather than towards it: the other
+            // choice subtracts two nearly equal numbers and loses the digits.
+            if r.cell[k * n + k] > 0.0 {
+                norm = 0.0 - norm
+            }
+            var v: [f64] = []
+            for i in 0..m {
+                if i < k {
+                    v.push(0.0)
+                } else {
+                    v.push(r.cell[i * n + k])
+                }
+            }
+            v[k] = v[k] - norm
+            var vnorm = 0.0
+            for i in k..m {
+                vnorm = vnorm + v[i] * v[i]
+            }
+            if vnorm >= epsilon() {
+                apply_reflector(r, v, vnorm, k, n)
+                apply_reflector(q, v, vnorm, 0, m)
+            }
+        }
+    }
+    // `Q` was built by reflecting the identity, which produces its transpose.
+    return LinQr{ q: matrix.transpose(q), r: r }
+}
+
+/// `M = M - (2 v v^T / v.v) M`, over the columns from `first` on.
+fn apply_reflector(inout m: Mat, v: [f64], vnorm: f64, first: i64, cols: i64) {
+    for c in first..cols {
+        var dot = 0.0
+        for i in 0..m.rows {
+            dot = dot + v[i] * m.cell[i * cols + c]
+        }
+        let scale = 2.0 * dot / vnorm
+        for i in 0..m.rows {
+            m.cell[i * cols + c] = m.cell[i * cols + c] - scale * v[i]
+        }
+    }
+}
+
+/// The least-squares solution of an overdetermined `A x = b`.
+///
+/// Through `QR`, not through the normal equations `A^T A x = A^T b`. Forming
+/// `A^T A` squares the condition number, so a system that was merely awkward
+/// becomes one that cannot be solved at all — and the normal equations are
+/// the way every textbook writes it.
+pub fn least_squares(a: Mat, b: [f64]) -> [f64] ! LinError {
+    if b.len() != a.rows {
+        fail(LinShape(matrix.shape(a), "{b.len()}"))
+    }
+    let f = try qr(a)
+    let n = a.cols
+    // `Q^T b`, of which only the first `n` entries matter.
+    var qtb: [f64] = []
+    for c in 0..n {
+        var s = 0.0
+        for i in 0..a.rows {
+            s = s + f.q.cell[i * a.rows + c] * b[i]
+        }
+        qtb.push(s)
+    }
+    var x = qtb
+    var i = n - 1
+    while i >= 0 {
+        var s = x[i]
+        for j in (i + 1)..n {
+            s = s - f.r.cell[i * n + j] * x[j]
+        }
+        let d = f.r.cell[i * n + i]
+        if abs_of(d) < epsilon() {
+            fail(LinSingular)
+        }
+        x[i] = s / d
+        i = i - 1
+    }
+    return x
+}
+
+// -------------------------------------------------------------- Cholesky
+
+/// `A = L L^T` for a symmetric positive-definite `A`, returning `L`.
+///
+/// Half the work of `LU` and no pivoting needed, which is why every covariance
+/// matrix and every least-squares weighting goes through this instead. The
+/// refusal is the useful part: a matrix that is not positive definite fails
+/// here, and that failure is how you test for positive definiteness.
+pub fn cholesky(a: Mat) -> Mat ! LinError {
+    if a.rows != a.cols {
+        fail(LinNotSquare(a.rows))
+    }
+    let n = a.rows
+    for i in 0..n {
+        for j in 0..i {
+            if abs_of(a.cell[i * n + j] - a.cell[j * n + i]) > 0.000000001 {
+                fail(LinNotSymmetric)
+            }
+        }
+    }
+    var l = matrix.zeros(n, n)
+    for i in 0..n {
+        for j in 0..(i + 1) {
+            var s = a.cell[i * n + j]
+            for k in 0..j {
+                s = s - l.cell[i * n + k] * l.cell[j * n + k]
+            }
+            if i == j {
+                if s <= 0.0 {
+                    fail(LinNotPositiveDefinite)
+                }
+                l.cell[i * n + j] = s.sqrt()
+            } else {
+                l.cell[i * n + j] = s / l.cell[j * n + j]
+            }
+        }
+    }
+    return l
+}
+
+// ----------------------------------------------------------------- norms
+
+/// The Frobenius norm: the square root of the sum of the squares.
+pub fn norm_frobenius(a: Mat) -> f64 {
+    var s = 0.0
+    for v in a.cell {
+        s = s + v * v
+    }
+    return s.sqrt()
+}
+
+/// The 1-norm: the largest absolute column sum.
+pub fn norm_one(a: Mat) -> f64 {
+    var best = 0.0
+    for c in 0..a.cols {
+        var s = 0.0
+        for r in 0..a.rows {
+            s = s + abs_of(a.cell[r * a.cols + c])
+        }
+        if s > best {
+            best = s
+        }
+    }
+    return best
+}
+
+/// The infinity norm: the largest absolute row sum.
+pub fn norm_infinity(a: Mat) -> f64 {
+    var best = 0.0
+    for r in 0..a.rows {
+        var s = 0.0
+        for c in 0..a.cols {
+            s = s + abs_of(a.cell[r * a.cols + c])
+        }
+        if s > best {
+            best = s
+        }
+    }
+    return best
+}
+
+/// The 1-norm condition number: `||A|| * ||A inverse||`.
+///
+/// What it means: a condition number of `10^k` costs about `k` decimal digits
+/// of every answer you get out of the matrix. A singular matrix has no
+/// condition number, and this fails rather than returning a large one.
+pub fn condition(a: Mat) -> f64 ! LinError {
+    let inv = try inverse(a)
+    return norm_one(a) * norm_one(inv)
+}
+
+/// The number of independent rows, by elimination with a tolerance.
+///
+/// A tolerance and not an equality: a rank computed by asking whether a pivot
+/// is exactly zero reports full rank for almost every singular matrix built
+/// out of measurements.
+pub fn rank(a: Mat) -> i64 {
+    var work = a
+    let rows = a.rows
+    let cols = a.cols
+    // Scaled against the largest entry, so the answer does not change when the
+    // whole matrix is multiplied by a thousand.
+    var largest = 0.0
+    for v in a.cell {
+        if abs_of(v) > largest {
+            largest = abs_of(v)
+        }
+    }
+    if largest == 0.0 {
+        return 0
+    }
+    let tolerance = largest * 0.000000001
+    var found = 0
+    for c in 0..cols {
+        if found < rows {
+            var best = found
+            var big = abs_of(work.cell[found * cols + c])
+            for r in (found + 1)..rows {
+                if abs_of(work.cell[r * cols + c]) > big {
+                    big = abs_of(work.cell[r * cols + c])
+                    best = r
+                }
+            }
+            if big > tolerance {
+                for j in 0..cols {
+                    let t = work.cell[found * cols + j]
+                    work.cell[found * cols + j] = work.cell[best * cols + j]
+                    work.cell[best * cols + j] = t
+                }
+                for r in (found + 1)..rows {
+                    let factor = work.cell[r * cols + c] /
+                    work.cell[found * cols + c]
+                    for j in c..cols {
+                        work.cell[r * cols + j] = work.cell[r * cols + j] -
+                        factor * work.cell[found * cols + j]
+                    }
+                }
+                found = found + 1
+            }
+        }
+    }
+    return found
+}
+
+/// The trace: the sum of the diagonal.
+pub fn trace(a: Mat) -> f64 ! LinError {
+    if a.rows != a.cols {
+        fail(LinNotSquare(a.rows))
+    }
+    var s = 0.0
+    for i in 0..a.rows {
+        s = s + a.cell[i * a.cols + i]
+    }
+    return s
+}
+
+// -------------------------------------------------------------- eigen
+
+/// The eigenvalues and eigenvectors of a symmetric matrix, by Jacobi rotation.
+///
+/// Symmetric only, and that is not a limitation being apologised for: a
+/// general matrix has complex eigenvalues and needs the QR algorithm with
+/// shifts, which is a different and much larger piece of code. Symmetric
+/// covers covariance, adjacency, stiffness and every Gram matrix, and Jacobi
+/// gets those to full precision with a rotation that cannot lose
+/// orthogonality.
+pub fn eigen_symmetric(a: Mat) -> LinEigen ! LinError {
+    if a.rows != a.cols {
+        fail(LinNotSquare(a.rows))
+    }
+    let n = a.rows
+    for i in 0..n {
+        for j in 0..i {
+            if abs_of(a.cell[i * n + j] - a.cell[j * n + i]) > 0.000000001 {
+                fail(LinNotSymmetric)
+            }
+        }
+    }
+    var work = a
+    var vectors = matrix.identity(n)
+    var sweeps = 0
+    var off = off_diagonal(work)
+    while off > epsilon() and sweeps < 100 {
+        for p in 0..n {
+            for q in (p + 1)..n {
+                if abs_of(work.cell[p * n + q]) > epsilon() {
+                    rotate(work, vectors, p, q, n)
+                }
+            }
+        }
+        sweeps = sweeps + 1
+        off = off_diagonal(work)
+    }
+    if off > epsilon() {
+        fail(LinNoConvergence(sweeps))
+    }
+    var values: [f64] = []
+    for i in 0..n {
+        values.push(work.cell[i * n + i])
+    }
+    sort_descending(values, vectors, n)
+    return LinEigen{ values: values, vectors: vectors, sweeps: sweeps }
+}
+
+/// The sum of the squares off the diagonal — what a sweep drives to zero.
+fn off_diagonal(m: Mat) -> f64 {
+    var s = 0.0
+    for i in 0..m.rows {
+        for j in 0..m.cols {
+            if i != j {
+                s = s + m.cell[i * m.cols + j] * m.cell[i * m.cols + j]
+            }
+        }
+    }
+    return s
+}
+
+/// One Jacobi rotation, zeroing entry `(p, q)` and accumulating the vectors.
+fn rotate(inout m: Mat, inout v: Mat, p: i64, q: i64, n: i64) {
+    let apq = m.cell[p * n + q]
+    let theta = (m.cell[q * n + q] - m.cell[p * n + p]) / (2.0 * apq)
+    // The smaller root, which keeps the rotation under 45 degrees and stops
+    // the accumulated product from drifting.
+    var t = 1.0 / (abs_of(theta) + (theta * theta + 1.0).sqrt())
+    if theta < 0.0 {
+        t = 0.0 - t
+    }
+    let c = 1.0 / (t * t + 1.0).sqrt()
+    let s = t * c
+    for k in 0..n {
+        let mkp = m.cell[k * n + p]
+        let mkq = m.cell[k * n + q]
+        m.cell[k * n + p] = c * mkp - s * mkq
+        m.cell[k * n + q] = s * mkp + c * mkq
+    }
+    for k in 0..n {
+        let mpk = m.cell[p * n + k]
+        let mqk = m.cell[q * n + k]
+        m.cell[p * n + k] = c * mpk - s * mqk
+        m.cell[q * n + k] = s * mpk + c * mqk
+    }
+    for k in 0..n {
+        let vkp = v.cell[k * n + p]
+        let vkq = v.cell[k * n + q]
+        v.cell[k * n + p] = c * vkp - s * vkq
+        v.cell[k * n + q] = s * vkp + c * vkq
+    }
+}
+
+/// Largest value first, moving each vector with the value it belongs to.
+fn sort_descending(inout values: [f64], inout vectors: Mat, n: i64) {
+    for i in 0..n {
+        var best = i
+        for j in (i + 1)..n {
+            if values[j] > values[best] {
+                best = j
+            }
+        }
+        if best != i {
+            let t = values[i]
+            values[i] = values[best]
+            values[best] = t
+            for k in 0..n {
+                let c = vectors.cell[k * n + i]
+                vectors.cell[k * n + i] = vectors.cell[k * n + best]
+                vectors.cell[k * n + best] = c
+            }
+        }
+    }
+}
+
+/// Whether two matrices agree to a tolerance.
+///
+/// Every routine here returns floating point, so an equality test on the
+/// result of one is a test that fails for reasons that have nothing to do
+/// with the answer.
+pub fn nearly_equal(a: Mat, b: Mat, tolerance: f64) -> bool {
+    if a.rows != b.rows or a.cols != b.cols {
+        return false
+    }
+    for i in 0..a.cell.len() {
+        if abs_of(a.cell[i] - b.cell[i]) > tolerance {
+            return false
+        }
+    }
+    return true
+}

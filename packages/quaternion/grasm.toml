@@ -1,0 +1,10 @@
+[package]
+name = "quaternion"
+version = "1.0.0"
+
+# Arithmetic. Opens nothing.
+capabilities = []
+
+[dependencies.matrix]
+path = "../matrix"
+version = "^1.0.0"

@@ -1,0 +1,18 @@
+[package]
+name = "polynomial"
+version = "1.0.0"
+
+# Arithmetic. Opens nothing.
+capabilities = []
+
+[dependencies.complexnum]
+path = "../complexnum"
+version = "^1.0.0"
+
+[dependencies.linalg]
+path = "../linalg"
+version = "^1.0.0"
+
+[dependencies.matrix]
+path = "../matrix"
+version = "^1.0.0"

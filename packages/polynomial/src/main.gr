@@ -1,0 +1,518 @@
+// Polynomials over the reals: arithmetic, division, fitting, and roots.
+//
+// Coefficients run **low to high**, so `[3, 0, 2]` is `2x^2 + 3`. That is the
+// order every numerical text uses and the opposite of the order `numpy.poly1d`
+// takes; the two conventions are the single most common source of wrong
+// answers when moving code between them, so it is stated here rather than left
+// to be discovered.
+//
+// Two decisions worth explaining.
+//
+// **Roots come back complex, always.** A real cubic has either one or three
+// real roots and the caller does not know which in advance; a function that
+// returns `[f64]` has to either lie about the complex pair or drop it. This
+// returns every root as a complex number, and `real_roots` filters to the ones
+// whose imaginary part is within a tolerance the caller sets. That tolerance
+// is a real parameter and not a detail: a root at `1 + 1e-9i` is a double real
+// root that rounding has split, and whether you want one root or none is a
+// question about your problem.
+//
+// **Fitting goes through least squares, not through the normal equations.**
+// `fit` builds a Vandermonde matrix and hands it to `linalg.least_squares`,
+// which factorises. Forming `V^T V` instead — the textbook derivation — squares
+// the condition number, and a Vandermonde matrix is already about as badly
+// conditioned as a matrix gets. Degree 8 on data spread over `0..100` is
+// enough to make the difference between six correct digits and none.
+//
+// Checked against `numpy.polynomial` and `numpy.roots`.
+
+import complexnum
+import linalg
+import matrix
+
+/// Coefficients low to high: entry `i` multiplies `x^i`.
+type Polynomial = {
+    coefficient: [f64],
+}
+
+type PolyError =
+    | PolyDivideByZero
+    | PolyDegreeTooHigh(wanted: i64, points: i64)
+    | PolyLengthMismatch(xs: i64, ys: i64)
+    | PolyRootsNotFound(iterations: i64)
+    | PolySingularFit
+
+    /// A quotient and a remainder, which is what dividing gives you.
+type PolyDivision = {
+    quotient: Polynomial,
+    remainder: Polynomial,
+}
+
+fn abs_of(x: f64) -> f64 {
+    if x < 0.0 {
+        return 0.0 - x
+    }
+    return x
+}
+
+/// A polynomial from coefficients low to high, with trailing zeros dropped.
+///
+/// Trimming on construction is what makes `degree` mean something: without it
+/// `[1, 0, 0]` is degree 2, division by it leaves a zero pivot, and every
+/// routine downstream has to trim defensively.
+pub fn of(coefficients: [f64]) -> Polynomial {
+    var c = coefficients
+    while c.len() > 0 and c[c.len() - 1] == 0.0 {
+        c.pop()
+    }
+    return Polynomial{ coefficient: c }
+}
+
+pub fn zero() -> Polynomial {
+    return Polynomial{ coefficient: [] }
+}
+
+pub fn constant(c: f64) -> Polynomial {
+    return of([c])
+}
+
+/// `x`, the identity polynomial.
+pub fn identity() -> Polynomial {
+    return of([0.0, 1.0])
+}
+
+/// The degree, and `-1` for the zero polynomial.
+///
+/// `-1` and not `0`: the zero polynomial has no degree, and `0` is the degree
+/// of a non-zero constant. Conflating them makes `degree(a * b) ==
+/// degree(a) + degree(b)` false exactly when one side is zero.
+pub fn degree(p: Polynomial) -> i64 {
+    return p.coefficient.len() - 1
+}
+
+pub fn is_zero(p: Polynomial) -> bool {
+    return p.coefficient.len() == 0
+}
+
+/// The coefficient of `x^i`, which is zero past the end rather than an error.
+pub fn coefficient(p: Polynomial, i: i64) -> f64 {
+    if i < 0 or i >= p.coefficient.len() {
+        return 0.0
+    }
+    return p.coefficient[i]
+}
+
+/// The leading coefficient, or zero.
+pub fn leading(p: Polynomial) -> f64 {
+    return coefficient(p, degree(p))
+}
+
+/// Evaluate at `x` by Horner's rule.
+///
+/// Horner and not `sum(c[i] * x^i)`: the direct form computes each power
+/// separately, which is `n` multiplications more and loses the accuracy of
+/// every one of them. For a degree-20 polynomial at `x = 3` the direct form is
+/// out in the fourth digit.
+pub fn eval(p: Polynomial, x: f64) -> f64 {
+    var acc = 0.0
+    var i = degree(p)
+    while i >= 0 {
+        acc = acc * x + p.coefficient[i]
+        i = i - 1
+    }
+    return acc
+}
+
+/// Evaluate at a complex point, also by Horner.
+pub fn eval_complex(p: Polynomial, z: Cplx) -> Cplx {
+    var acc = complexnum.zero()
+    var i = degree(p)
+    while i >= 0 {
+        acc = complexnum.add(complexnum.mul(acc, z),
+            complexnum.real(p.coefficient[i]))
+        i = i - 1
+    }
+    return acc
+}
+
+pub fn add(a: Polynomial, b: Polynomial) -> Polynomial {
+    var out: [f64] = []
+    var n = a.coefficient.len()
+    if b.coefficient.len() > n {
+        n = b.coefficient.len()
+    }
+    for i in 0..n {
+        out.push(coefficient(a, i) + coefficient(b, i))
+    }
+    return of(out)
+}
+
+pub fn sub(a: Polynomial, b: Polynomial) -> Polynomial {
+    var out: [f64] = []
+    var n = a.coefficient.len()
+    if b.coefficient.len() > n {
+        n = b.coefficient.len()
+    }
+    for i in 0..n {
+        out.push(coefficient(a, i) - coefficient(b, i))
+    }
+    return of(out)
+}
+
+pub fn scale(p: Polynomial, by: f64) -> Polynomial {
+    var out: [f64] = []
+    for c in p.coefficient {
+        out.push(c * by)
+    }
+    return of(out)
+}
+
+pub fn negate(p: Polynomial) -> Polynomial {
+    return scale(p, 0.0 - 1.0)
+}
+
+pub fn mul(a: Polynomial, b: Polynomial) -> Polynomial {
+    if is_zero(a) or is_zero(b) {
+        return zero()
+    }
+    var out: [f64] = []
+    for _i in 0..(a.coefficient.len() + b.coefficient.len() - 1) {
+        out.push(0.0)
+    }
+    for i in 0..a.coefficient.len() {
+        for j in 0..b.coefficient.len() {
+            out[i + j] = out[i + j] + a.coefficient[i] * b.coefficient[j]
+        }
+    }
+    return of(out)
+}
+
+/// Long division: `a = quotient * b + remainder`, with `remainder` of lower
+/// degree than `b`.
+pub fn divide(a: Polynomial, b: Polynomial) -> PolyDivision ! PolyError {
+    if is_zero(b) {
+        fail(PolyDivideByZero)
+    }
+    if degree(a) < degree(b) {
+        return PolyDivision{ quotient: zero(), remainder: a }
+    }
+    var rest = a.coefficient
+    var quotient: [f64] = []
+    for _i in 0..(degree(a) - degree(b) + 1) {
+        quotient.push(0.0)
+    }
+    let db = degree(b)
+    let lead = leading(b)
+    var i = degree(a) - db
+    while i >= 0 {
+        let factor = rest[i + db] / lead
+        quotient[i] = factor
+        for j in 0..(db + 1) {
+            rest[i + j] = rest[i + j] - factor * b.coefficient[j]
+        }
+        i = i - 1
+    }
+    var remainder: [f64] = []
+    for j in 0..db {
+        remainder.push(rest[j])
+    }
+    return PolyDivision{ quotient: of(quotient), remainder: of(remainder) }
+}
+
+/// The derivative.
+pub fn derivative(p: Polynomial) -> Polynomial {
+    var out: [f64] = []
+    for i in 1..p.coefficient.len() {
+        out.push(p.coefficient[i] * i.as_f64())
+    }
+    return of(out)
+}
+
+/// The antiderivative with the given constant of integration.
+pub fn integral(p: Polynomial, constant_term: f64) -> Polynomial {
+    var out = [constant_term]
+    for i in 0..p.coefficient.len() {
+        out.push(p.coefficient[i] / (i + 1).as_f64())
+    }
+    return of(out)
+}
+
+/// The definite integral from `a` to `b`.
+pub fn integrate(p: Polynomial, a: f64, b: f64) -> f64 {
+    let anti = integral(p, 0.0)
+    return eval(anti, b) - eval(anti, a)
+}
+
+/// `a(b(x))`.
+pub fn compose(a: Polynomial, b: Polynomial) -> Polynomial {
+    var acc = zero()
+    var i = degree(a)
+    while i >= 0 {
+        acc = add(mul(acc, b), constant(a.coefficient[i]))
+        i = i - 1
+    }
+    return acc
+}
+
+/// The monic polynomial with exactly these real roots.
+pub fn from_roots(roots: [f64]) -> Polynomial {
+    var acc = constant(1.0)
+    for r in roots {
+        acc = mul(acc, of([0.0 - r, 1.0]))
+    }
+    return acc
+}
+
+/// The monic greatest common divisor, by the Euclidean algorithm.
+///
+/// Useful for one thing above all: `gcd(p, derivative(p))` is non-constant
+/// exactly when `p` has a repeated root, which is the case every root-finder
+/// including this one struggles with. Testing for it first is cheaper than
+/// discovering it in the residuals.
+pub fn gcd(a: Polynomial, b: Polynomial) -> Polynomial ! PolyError {
+    var x = a
+    var y = b
+    while not is_zero(y) {
+        let d = try divide(x, y)
+        x = y
+        y = d.remainder
+    }
+    if is_zero(x) {
+        return zero()
+    }
+    return scale(x, 1.0 / leading(x))
+}
+
+// ----------------------------------------------------------------- roots
+
+/// Every root, real and complex, by Durand-Kerner.
+///
+/// All the roots at once rather than one at a time: deflation — finding a
+/// root, dividing it out, and repeating — accumulates the error of every
+/// earlier root into every later one, so the last root of a degree-10
+/// polynomial is often wrong in the second digit. Durand-Kerner refines all
+/// `n` approximations together against the original coefficients, so no root
+/// inherits another's error.
+pub fn roots(p: Polynomial) -> [Cplx] ! PolyError {
+    let n = degree(p)
+    if n < 1 {
+        return []
+    }
+    let monic = scale(p, 1.0 / leading(p))
+    // Starting points on a spiral off the real axis. On the axis, a
+    // polynomial with a symmetric root pattern keeps every approximation
+    // real and the complex roots are never reached.
+    var z: [Cplx] = []
+    var seed = complexnum.make(0.4, 0.9)
+    var current = complexnum.one()
+    for _i in 0..n {
+        z.push(current)
+        current = complexnum.mul(current, seed)
+    }
+    var iteration = 0
+    var moved = 1.0
+    while moved > 0.0000000000001 and iteration < 1000 {
+        moved = 0.0
+        for i in 0..n {
+            var denominator = complexnum.one()
+            for j in 0..n {
+                if j != i {
+                    denominator = complexnum.mul(denominator,
+                        complexnum.sub(z[i], z[j]))
+                }
+            }
+            if complexnum.magnitude(denominator) > 0.0 {
+                let step = complexnum.div(eval_complex(monic, z[i]),
+                    denominator)
+                z[i] = complexnum.sub(z[i], step)
+                let size = complexnum.magnitude(step)
+                if size > moved {
+                    moved = size
+                }
+            }
+        }
+        iteration = iteration + 1
+    }
+    if moved > 0.000001 {
+        fail(PolyRootsNotFound(iteration))
+    }
+    return sorted_roots(z)
+}
+
+/// Real part first, then imaginary — so two runs agree on the order.
+fn sorted_roots(zs: [Cplx]) -> [Cplx] {
+    var out = zs
+    for i in 0..out.len() {
+        var best = i
+        for j in (i + 1)..out.len() {
+            if out[j].re < out[best].re or
+            (out[j].re == out[best].re and out[j].im < out[best].im) {
+                best = j
+            }
+        }
+        let t = out[i]
+        out[i] = out[best]
+        out[best] = t
+    }
+    return out
+}
+
+/// The roots whose imaginary part is within `tolerance` of zero.
+///
+/// The tolerance is the caller's because it is a statement about their data. A
+/// double root that rounding has split into `1 ± 1e-8i` is one real root at
+/// `1e-7` and no real roots at `1e-12`, and only the caller knows which answer
+/// their problem wants.
+pub fn real_roots(p: Polynomial, tolerance: f64) -> [f64] ! PolyError {
+    var out: [f64] = []
+    for z in try roots(p) {
+        if abs_of(z.im) <= tolerance {
+            out.push(z.re)
+        }
+    }
+    return out
+}
+
+/// Whether `p` has a repeated root, by testing it against its derivative.
+pub fn has_repeated_root(p: Polynomial) -> bool ! PolyError {
+    if degree(p) < 2 {
+        return false
+    }
+    let g = try gcd(p, derivative(p))
+    return degree(g) > 0
+}
+
+// --------------------------------------------------------------- fitting
+
+/// The least-squares polynomial of the given degree through the points.
+///
+/// Through a QR factorisation of the Vandermonde matrix. The alternative — the
+/// normal equations, which is how the formula is usually derived — squares an
+/// already ill-conditioned matrix, and past about degree 6 it returns
+/// coefficients with no correct digits while looking exactly as plausible.
+pub fn fit(xs: [f64], ys: [f64], wanted: i64) -> Polynomial ! PolyError {
+    if xs.len() != ys.len() {
+        fail(PolyLengthMismatch(xs.len(), ys.len()))
+    }
+    if wanted + 1 > xs.len() {
+        fail(PolyDegreeTooHigh(wanted, xs.len()))
+    }
+    var cells: [f64] = []
+    for x in xs {
+        var power = 1.0
+        for _j in 0..(wanted + 1) {
+            cells.push(power)
+            power = power * x
+        }
+    }
+    let v = matrix.of(xs.len(), wanted + 1, cells)
+    match linalg.least_squares(v, ys) {
+        Ok(c) -> return of(c)
+        Err(_e) -> fail(PolySingularFit)
+    }
+}
+
+/// The exact polynomial through every point, by Lagrange interpolation.
+///
+/// Degree `n-1` through `n` points, which is a different thing from `fit`: this
+/// passes through every point exactly and oscillates wildly between them once
+/// there are more than a handful. `fit` at a low degree is almost always what
+/// is wanted; this is for the cases where the points are exact.
+pub fn through(xs: [f64], ys: [f64]) -> Polynomial ! PolyError {
+    if xs.len() != ys.len() {
+        fail(PolyLengthMismatch(xs.len(), ys.len()))
+    }
+    var acc = zero()
+    for i in 0..xs.len() {
+        var term = constant(1.0)
+        var scaling = 1.0
+        for j in 0..xs.len() {
+            if j != i {
+                term = mul(term, of([0.0 - xs[j], 1.0]))
+                scaling = scaling * (xs[i] - xs[j])
+            }
+        }
+        if scaling == 0.0 {
+            fail(PolySingularFit)
+        }
+        acc = add(acc, scale(term, ys[i] / scaling))
+    }
+    return acc
+}
+
+/// How far the polynomial misses the points, as a root-mean-square.
+pub fn residual(p: Polynomial, xs: [f64], ys: [f64]) -> f64 ! PolyError {
+    if xs.len() != ys.len() {
+        fail(PolyLengthMismatch(xs.len(), ys.len()))
+    }
+    if xs.len() == 0 {
+        return 0.0
+    }
+    var total = 0.0
+    for i in 0..xs.len() {
+        let d = eval(p, xs[i]) - ys[i]
+        total = total + d * d
+    }
+    return (total / xs.len().as_f64()).sqrt()
+}
+
+// ---------------------------------------------------------------- output
+
+pub fn nearly_equal(a: Polynomial, b: Polynomial, tolerance: f64) -> bool {
+    var n = a.coefficient.len()
+    if b.coefficient.len() > n {
+        n = b.coefficient.len()
+    }
+    for i in 0..n {
+        if abs_of(coefficient(a, i) - coefficient(b, i)) > tolerance {
+            return false
+        }
+    }
+    return true
+}
+
+/// Highest power first, which is how a polynomial is written down.
+///
+/// Written high to low even though it is stored low to high: the storage order
+/// is what the arithmetic wants and the printed order is what a reader wants,
+/// and picking one for both makes one of them wrong.
+pub fn to_str(p: Polynomial) -> str {
+    if is_zero(p) {
+        return "0"
+    }
+    var out = ""
+    var i = degree(p)
+    while i >= 0 {
+        let c = p.coefficient[i]
+        if c != 0.0 {
+            var size = c
+            if c < 0.0 {
+                size = 0.0 - c
+            }
+            var term = "{size}"
+            if i == 1 {
+                term = "{size}x"
+            }
+            if i > 1 {
+                term = "{size}x^{i}"
+            }
+            // A leading minus is a sign; a later one is an operator. Printing
+            // both as `+ -6` is what makes generated output unreadable.
+            if out == "" {
+                if c < 0.0 {
+                    out = "-{term}"
+                } else {
+                    out = term
+                }
+            } else {
+                if c < 0.0 {
+                    out = "{out} - {term}"
+                } else {
+                    out = "{out} + {term}"
+                }
+            }
+        }
+        i = i - 1
+    }
+    return out
+}

@@ -1,0 +1,32 @@
+[package]
+name = "linalg_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.linalg]
+path = "../linalg"
+version = "^1.0.0"
+
+[dependencies.matrix]
+path = "../matrix"
+version = "^1.0.0"
+
+[dependencies.fft]
+path = "../fft"
+version = "^1.0.0"
+
+[dependencies.polynomial]
+path = "../polynomial"
+version = "^1.0.0"
+
+[dependencies.quaternion]
+path = "../quaternion"
+version = "^1.0.0"
+
+[dependencies.bezier]
+path = "../bezier"
+version = "^1.0.0"
+
+[dependencies.geometry]
+path = "../geometry"
+version = "^1.0.0"

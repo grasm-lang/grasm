@@ -1,0 +1,10 @@
+[package]
+name = "bezier"
+version = "1.0.0"
+
+# Arithmetic. Opens nothing.
+capabilities = []
+
+[dependencies.geometry]
+path = "../geometry"
+version = "^1.0.0"
