@@ -1,0 +1,360 @@
+// ID3: the tags on an MP3, and the size field that is not a size.
+//
+// An ID3v2 tag sits at the *front* of the file — before any audio — so a
+// player can show a title before it has finished downloading. It is a
+// ten-byte header and then frames, each a four-character identifier, a size,
+// two flag bytes and a payload.
+//
+// ## The synchsafe integer
+//
+// The tag's total size is stored as four bytes of **seven** bits each, top
+// bit always clear. The reason is that an MP3 decoder finds the start of
+// audio by looking for eleven set bits in a row, and a size with a byte of
+// `0xFF` in it would look like the start of a frame. Synchsafe encoding makes
+// that impossible.
+//
+// A reader that treats the size as an ordinary big-endian integer gets a
+// number up to 128 times too large — and for small tags it gets a number that
+// is merely wrong, which is worse, because the file still plays and the
+// second tag is silently unreachable.
+//
+// ## The v2.3 and v2.4 difference that breaks everything
+//
+// In ID3v2.3 a **frame's** size is an ordinary integer. In v2.4 it is
+// synchsafe. The tag header is synchsafe in both. So a reader that assumes
+// one version reads every frame of the other at the wrong offset — and since
+// most frames are under 128 bytes, where the two encodings agree, it works on
+// most files and fails on the one with a long comment or an embedded image.
+// That is the single most common ID3 bug and it is why `version` has to be
+// read before anything else.
+//
+// ## Text frames carry an encoding byte
+//
+// The first byte of a text frame's payload says which of four encodings the
+// rest is: Latin-1, UTF-16 with a byte-order mark, UTF-16 big-endian, or
+// UTF-8. Dropping it gives a title beginning with an invisible control
+// character, which is what a stray box at the start of a track name is.
+//
+// Checked against `mutagen` for the frames, sizes and text of tags it wrote,
+// in both v2.3 and v2.4.
+
+type Id3Frame = {
+    /// Four characters in v2.3 and v2.4; three in v2.2.
+    id: str,
+    size: i64,
+    flags: i64,
+    payload: bytes,
+}
+
+type Id3Tag = {
+    major: i64,
+    revision: i64,
+    flags: i64,
+    /// The size the header declares, not counting the header itself.
+    size: i64,
+    frames: [Id3Frame],
+}
+
+type Id3Error =
+    | NoTag()
+    | UnsupportedVersion(major: i64)
+    | Truncated(at: i64)
+
+    /// A synchsafe integer: seven bits a byte, top bit always clear.
+pub fn read_synchsafe(data: bytes, at: i64) -> i64 {
+    if at + 4 > data.len() {
+        return 0
+    }
+    return data.at(at).bit_and(127).shl(21)
+        .bit_or(data.at(at + 1).bit_and(127).shl(14))
+        .bit_or(data.at(at + 2).bit_and(127).shl(7))
+        .bit_or(data.at(at + 3).bit_and(127))
+}
+
+pub fn write_synchsafe(value: i64) -> bytes {
+    return bytes_of([value.ushr(21).bit_and(127),
+        value.ushr(14).bit_and(127), value.ushr(7).bit_and(127),
+        value.bit_and(127)])
+}
+
+fn read32(data: bytes, at: i64) -> i64 {
+    if at + 4 > data.len() {
+        return 0
+    }
+    return data.at(at).shl(24).bit_or(data.at(at + 1).shl(16))
+        .bit_or(data.at(at + 2).shl(8)).bit_or(data.at(at + 3))
+}
+
+/// Whether the bytes begin with an ID3v2 tag.
+pub fn has_tag(data: bytes) -> bool {
+    return data.len() >= 10 and data.slice(0, 3).to_str() == "ID3"
+}
+
+/// Where the audio starts: past the tag, or at zero if there is none.
+pub fn audio_offset(data: bytes) -> i64 {
+    if not has_tag(data) {
+        return 0
+    }
+    return 10 + read_synchsafe(data, 6)
+}
+
+/// The tag at the front of the data.
+pub fn parse(data: bytes) -> Id3Tag ! Id3Error {
+    if not has_tag(data) {
+        fail(NoTag())
+    }
+    let major = data.at(3)
+    if major != 3 and major != 4 and major != 2 {
+        fail(UnsupportedVersion(major))
+    }
+    var out = Id3Tag{
+        major: major,
+        revision: data.at(4),
+        flags: data.at(5),
+        size: read_synchsafe(data, 6),
+        frames: [],
+    }
+    let stop = 10 + out.size
+    var at = 10
+    let id_length = if major == 2 { 3 } else { 4 }
+    let header_length = if major == 2 { 6 } else { 10 }
+    while at + header_length <= stop and at + header_length <= data.len() {
+        let id = data.slice(at, at + id_length).to_str()
+        // Padding: the tag is over when the identifier is zero bytes.
+        if data.at(at) == 0 {
+            break
+        }
+        var size = 0
+        if major == 2 {
+            size = data.at(at + 3).shl(16).bit_or(data.at(at + 4).shl(8))
+                .bit_or(data.at(at + 5))
+        } else {
+            // The version difference that breaks readers: v2.4 frame sizes
+            // are synchsafe and v2.3's are not.
+            if major == 4 {
+                size = read_synchsafe(data, at + 4)
+            } else {
+                size = read32(data, at + 4)
+            }
+        }
+        let flags = if major == 2 { 0 } else {
+            data.at(at + 8).shl(8).bit_or(data.at(at + 9))
+        }
+        let start = at + header_length
+        if start + size > data.len() {
+            fail(Truncated(start))
+        }
+        out.frames.push(Id3Frame{ id: id, size: size, flags: flags,
+            payload: data.slice(start, start + size) })
+        at = start + size
+    }
+    return out
+}
+
+pub fn frame_named(tag: Id3Tag, id: str) -> Id3Frame ! Id3Error {
+    for f in tag.frames {
+        if f.id == id {
+            return f
+        }
+    }
+    fail(NoTag())
+}
+
+pub fn has_frame(tag: Id3Tag, id: str) -> bool {
+    for f in tag.frames {
+        if f.id == id {
+            return true
+        }
+    }
+    return false
+}
+
+/// A text frame's value, decoded by its own first byte.
+///
+/// Encoding 0 is Latin-1, 1 is UTF-16 with a byte-order mark, 2 is UTF-16
+/// big-endian without one, 3 is UTF-8. A reader that skips the byte and
+/// assumes UTF-8 produces a title with a control character at the front — the
+/// stray box at the start of a track name.
+pub fn text_of(f: Id3Frame) -> str {
+    if f.payload.len() < 1 {
+        return ""
+    }
+    let encoding = f.payload.at(0)
+    let body = f.payload.slice(1, f.payload.len())
+    if encoding == 0 {
+        return latin1(body)
+    }
+    if encoding == 3 {
+        return trim_nulls(body.to_str())
+    }
+    return utf16_text(body, encoding)
+}
+
+fn latin1(data: bytes) -> str {
+    var out = ""
+    for b in data.to_list() {
+        if b == 0 {
+            continue
+        }
+        out = out + bytes_of(encode_code_point(b)).to_str()
+    }
+    return out
+}
+
+fn encode_code_point(code: i64) -> [i64] {
+    if code < 128 {
+        return [code]
+    }
+    if code < 2048 {
+        return [192 + code.ushr(6), 128 + code.bit_and(63)]
+    }
+    return [224 + code.ushr(12), 128 + code.ushr(6).bit_and(63),
+        128 + code.bit_and(63)]
+}
+
+/// UTF-16 to text, honouring a byte-order mark when there is one.
+fn utf16_text(data: bytes, encoding: i64) -> str {
+    var at = 0
+    var big_endian = encoding == 2
+    if data.len() >= 2 {
+        let first = data.at(0)
+        let second = data.at(1)
+        if first == 255 and second == 254 {
+            big_endian = false
+            at = 2
+        }
+        if first == 254 and second == 255 {
+            big_endian = true
+            at = 2
+        }
+    }
+    var out = ""
+    while at + 1 < data.len() {
+        let unit = if big_endian {
+            data.at(at).shl(8).bit_or(data.at(at + 1))
+        } else {
+            data.at(at + 1).shl(8).bit_or(data.at(at))
+        }
+        at = at + 2
+        if unit == 0 {
+            continue
+        }
+        out = out + bytes_of(encode_code_point(unit)).to_str()
+    }
+    return out
+}
+
+fn trim_nulls(text: str) -> str {
+    var out = text
+    while out.ends_with("\u{0}") {
+        out = out.substr(0, out.len() - 1)
+    }
+    return out
+}
+
+/// The four frames anything reads: title, artist, album, track.
+pub fn title(tag: Id3Tag) -> str {
+    return text_field(tag, "TIT2", "TT2")
+}
+
+pub fn artist(tag: Id3Tag) -> str {
+    return text_field(tag, "TPE1", "TP1")
+}
+
+pub fn album(tag: Id3Tag) -> str {
+    return text_field(tag, "TALB", "TAL")
+}
+
+pub fn track(tag: Id3Tag) -> str {
+    return text_field(tag, "TRCK", "TRK")
+}
+
+fn text_field(tag: Id3Tag, modern: str, old: str) -> str {
+    let id = if tag.major == 2 { old } else { modern }
+    match frame_named(tag, id) {
+        Ok(f) -> {
+            return text_of(f)
+        }
+        Err(_e) -> {
+            return ""
+        }
+    }
+}
+
+/// The track number out of a `3/12`, which is how the frame is written.
+pub fn track_number(tag: Id3Tag) -> i64 {
+    let text = track(tag)
+    let slash = text.index_of("/") ?? (0 - 1)
+    if slash >= 0 {
+        return text.substr(0, slash).parse_int() ?? (0 - 1)
+    }
+    return text.parse_int() ?? (0 - 1)
+}
+
+/// Whether the tag says the whole thing has been unsynchronised.
+///
+/// A scheme that inserts a zero byte after every `0xFF` so no part of the tag
+/// can look like the start of audio. Almost nothing sets it now, because
+/// synchsafe sizes made it unnecessary, and a reader that ignores the flag
+/// reads a tag with extra bytes in every frame.
+pub fn is_unsynchronised(tag: Id3Tag) -> bool {
+    return tag.flags.bit_and(128) != 0
+}
+
+pub fn has_extended_header(tag: Id3Tag) -> bool {
+    return tag.flags.bit_and(64) != 0
+}
+
+/// A minimal v2.4 tag holding text frames.
+///
+/// Written in v2.4 because its synchsafe frame sizes are the ones that cannot
+/// be misread — a v2.3 tag with a frame over 128 bytes is read wrongly by
+/// anything that assumed the other version.
+pub fn build(fields: [(str, str)]) -> bytes {
+    var body: [i64] = []
+    for pair in fields {
+        for c in pair.0.to_bytes().to_list() {
+            body.push(c)
+        }
+        // Encoding 3 is UTF-8, which is the only sane choice in v2.4.
+        let payload = bytes_of([3]).concat(pair.1.to_bytes())
+        for b in write_synchsafe(payload.len()).to_list() {
+            body.push(b)
+        }
+        body.push(0)
+        body.push(0)
+        for b in payload.to_list() {
+            body.push(b)
+        }
+    }
+    var out = "ID3".to_bytes().to_list()
+    out.push(4)
+    out.push(0)
+    out.push(0)
+    for b in write_synchsafe(body.len()).to_list() {
+        out.push(b)
+    }
+    for b in body {
+        out.push(b)
+    }
+    return bytes_of(out)
+}
+
+/// An ID3v1 tag, which lives in the last 128 bytes of the file.
+///
+/// Thirty characters for a title and nothing else — no encoding, no
+/// extensibility, and a genre that is a number into a list somebody wrote in
+/// 1996. It exists because ID3v2 did not, and it is still written because
+/// some hardware only reads it.
+pub fn parse_v1(data: bytes) -> (str, str, str) {
+    if data.len() < 128 {
+        return ("", "", "")
+    }
+    let at = data.len() - 128
+    if data.slice(at, at + 3).to_str() != "TAG" {
+        return ("", "", "")
+    }
+    return (latin1(data.slice(at + 3, at + 33)).trim(),
+        latin1(data.slice(at + 33, at + 63)).trim(),
+        latin1(data.slice(at + 63, at + 93)).trim())
+}

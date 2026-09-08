@@ -1,0 +1,6 @@
+[package]
+name = "loudness"
+version = "1.0.0"
+
+# Arithmetic on samples the caller supplies. Opens nothing.
+capabilities = []

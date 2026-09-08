@@ -1,0 +1,464 @@
+import midi
+import wavmeta
+import id3
+import flacmeta
+import loudness
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+// ------------------------------------------------------------------ midi
+
+// Written by `mido`: format 1, 480 ticks a quarter note, one track holding a
+// tempo, a track name, a program change and three notes.
+fn midi_file() -> bytes {
+    return bytes_of([77, 84, 104, 100, 0, 0, 0, 6, 0, 1, 0, 1, 1, 224, 77, 84,
+        114, 107, 0, 0, 0, 51, 0, 255, 81, 3, 7, 161, 32, 0, 255, 3, 4, 76,
+        101, 97, 100, 0, 192, 4, 0, 144, 60, 100, 129, 112, 128, 60, 0, 131,
+        96, 144, 64, 100, 129, 112, 128, 64, 0, 131, 96, 144, 67, 100, 129,
+        112, 128, 67, 0, 0, 255, 47, 0])
+}
+
+fn midi_of(data: bytes) -> MidiFile {
+    let m: MidiFile ! MidiError = midi.parse(data)
+    return m ?? MidiFile{ format: 0 - 1, division: 0, tracks: [] }
+}
+
+fn check_midi(inout f: i64) / {io} {
+    print("-- midi: the two sixteen-bit header fields nobody keeps straight")
+    let file = midi_of(midi_file())
+    // The header is format, then track count, then division. Reading the
+    // last two the other way round gives a division of 1 and a file that
+    // plays a thousand times too fast, and it still parses.
+    say(f, "the division is read after the track count, not before",
+        file.format == 1 and file.division == 480 and file.tracks.len() == 1)
+    let track = file.tracks[0]
+    say(f, "and every event in the track is accounted for",
+        track.events.len() == 10)
+    say(f, "a track's name is a meta event, not a field",
+        midi.track_name(track) == "Lead")
+    say(f, "tempo is microseconds a beat, so the bpm is a division",
+        midi.initial_tempo(file) == 500000 and
+        midi.beats_per_minute(500000) == 120.0)
+    // 500000 us a beat over 480 ticks: a beat is half a second.
+    say(f, "which turns ticks into seconds", midi.seconds_at(480, 500000,
+        480) == 0.5)
+    // Middle C, E, G, each a quarter note apart.
+    // Start tick, pitch, velocity, length — the pairing the format does not
+    // do for you.
+    let played = midi.notes(track)
+    say(f, "note-on and note-off pair up into notes with lengths",
+        played.len() == 3 and played[0].1 == 60 and played[1].1 == 64 and
+        played[2].1 == 67)
+    say(f, "each with the velocity, start and length it was written with",
+        played[0].2 == 100 and played[0].3 == 240 and played[1].0 == 720 and
+        played[2].0 == 1440)
+    say(f, "a note-on of velocity zero is a note-off, which is the trap",
+        midi.is_note_off(MidiEvent{ delta: 0, kind: "note_on", channel: 0,
+            first: 60, second: 0, data: "".to_bytes() }))
+    // A delta is a variable-length quantity: seven bits a byte, top bit set
+    // on every byte but the last.
+    say(f, "deltas are variable-length, and round-trip",
+        midi.write_varint(240).len() == 2 and
+        midi.read_varint(midi.write_varint(1000000), 0).0 == 1000000 and
+        midi.write_varint(0).len() == 1)
+    say(f, "the track's length in ticks is the sum of its deltas",
+        midi.track_length_in_ticks(track) == 1680)
+    say(f, "and something that is not a MIDI file is refused",
+        midi_of("RIFF....WAVE".to_bytes()).format == 0 - 1)
+}
+
+// --------------------------------------------------------------- wavmeta
+
+// A 440 Hz tone, 800 frames of 16-bit mono at 8 kHz, laid out the way
+// Python's `wave` module writes one.
+fn wav_file() -> bytes {
+    var out: [i64] = []
+    push_tag(out, "RIFF")
+    push32(out, 36 + 1600)
+    push_tag(out, "WAVE")
+    push_tag(out, "fmt ")
+    push32(out, 16)
+    push16(out, 1)
+    push16(out, 1)
+    push32(out, 8000)
+    push32(out, 16000)
+    push16(out, 2)
+    push16(out, 16)
+    push_tag(out, "data")
+    push32(out, 1600)
+    for i in 0..800 {
+        push16(out, (sample_at(i) + 65536) % 65536)
+    }
+    return bytes_of(out)
+}
+
+fn sample_at(i: i64) -> i64 {
+    let phase = 2.0 * 3.141592653589793 * 440.0 * i.as_f64() / 8000.0
+    return (16000.0 * phase.sin()).as_i64()
+}
+
+fn push_tag(inout out: [i64], tag: str) {
+    push_bytes(out, tag.to_bytes())
+}
+
+fn push_bytes(inout out: [i64], data: bytes) {
+    for i in 0..data.len() {
+        out.push(data.at(i))
+    }
+}
+
+fn push16(inout out: [i64], value: i64) {
+    out.push(value % 256)
+    out.push(value / 256 % 256)
+}
+
+fn push32(inout out: [i64], value: i64) {
+    push16(out, value % 65536)
+    push16(out, value / 65536 % 65536)
+}
+
+fn check_wavmeta(inout f: i64) / {io} {
+    print("-- wavmeta: chunks, and the pad byte that is not in the length")
+    let data = wav_file()
+    let format: WavFormat ! WavMetaError = wavmeta.format_of(data)
+    let fmt = format ?? WavFormat{ format_code: 0, channels: 0,
+        sample_rate: 0, bytes_per_second: 0, block_align: 0,
+        bits_per_sample: 0, extensible_code: 0 }
+    say(f, "the format chunk says what Python's wave module says",
+        fmt.channels == 1 and fmt.bits_per_sample == 16 and
+        fmt.sample_rate == 8000 and wavmeta.is_pcm(fmt))
+    let frames: i64 ! WavMetaError = wavmeta.frame_count(data)
+    say(f, "the frame count is the data length over the block align",
+        (frames ?? 0) == 800 and fmt.block_align == 2)
+    say(f, "and the duration falls out of it", wavmeta.duration(data) == 0.1)
+    // Sample zero is silence because the sine starts at zero.
+    let first: [i64] ! WavMetaError = wavmeta.frame_at(data, 0)
+    let second: [i64] ! WavMetaError = wavmeta.frame_at(data, 1)
+    say(f, "samples are signed above eight bits and unsigned at eight",
+        (first ?? [])[0] == 0 and (second ?? [])[0] == 5419)
+    // 800 frames at 8 kHz is exactly a hundredth of the 440 Hz period times
+    // 44, so the tone comes back to zero at frame 100.
+    let hundred: [i64] ! WavMetaError = wavmeta.frame_at(data, 100)
+    say(f, "and reading a frame in the middle needs no decoding",
+        (hundred ?? [])[0] == 0)
+    say(f, "chunks are walked by tag, not by a fixed layout",
+        wavmeta.has_chunk(data, "fmt ") and wavmeta.has_chunk(data, "data")
+        and not wavmeta.has_chunk(data, "LIST"))
+    let chunks: [WavChunk] ! WavMetaError = wavmeta.chunks(data)
+    say(f, "and the walk finds exactly the two this file has",
+        (chunks ?? []).len() == 2)
+    say(f, "a file whose data chunk is shorter than it claims is spotted",
+        wavmeta.is_truncated(bytes_of(prefix_of(data, 1000))))
+    say(f, "samples come back as floats between minus one and one",
+        near(wavmeta.channel_samples(data, 0)[1], 5419.0 / 32768.0, 1.0e-9))
+    say(f, "and something that is not RIFF is refused",
+        wav_refuses("RIFXjunkWAVE".to_bytes()) and
+        wav_refuses("RIFF....AVI ".to_bytes()))
+}
+
+fn wav_refuses(data: bytes) -> bool {
+    match wavmeta.format_of(data) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn prefix_of(data: bytes, n: i64) -> [i64] {
+    var out: [i64] = []
+    for i in 0..n {
+        out.push(data.at(i))
+    }
+    return out
+}
+
+// ------------------------------------------------------------------- id3
+
+// The same four fields written twice: once the way v2.3 writes a frame size
+// and once the way v2.4 does. The album name is deliberately long enough for
+// the two to disagree.
+fn long_album() -> str {
+    return "An Album with a rather long name so that at least one frame " +
+    "exceeds one hundred and twenty-eight bytes, which is where the " +
+    "two versions stop agreeing about how a frame size is written down"
+}
+
+fn tag_fields() -> [(str, str)] {
+    return [("TIT2", "A Test Track"), ("TPE1", "Nobody"), ("TRCK", "3/12"),
+        ("TALB", long_album())]
+}
+
+fn v23_tag() -> bytes {
+    var body: [i64] = []
+    for field in tag_fields() {
+        var payload: [i64] = [0]
+        push_bytes(payload, field.1.to_bytes())
+        push_tag(body, field.0)
+        push32be(body, payload.len())
+        push16(body, 0)
+        for b in payload {
+            body.push(b)
+        }
+    }
+    var out: [i64] = [73, 68, 51, 3, 0, 0]
+    push_bytes(out, id3.write_synchsafe(body.len()))
+    for b in body {
+        out.push(b)
+    }
+    return bytes_of(out)
+}
+
+fn push32be(inout out: [i64], value: i64) {
+    out.push(value / 16777216 % 256)
+    out.push(value / 65536 % 256)
+    out.push(value / 256 % 256)
+    out.push(value % 256)
+}
+
+fn tag_of(data: bytes) -> Id3Tag {
+    let t: Id3Tag ! Id3Error = id3.parse(data)
+    return t ?? Id3Tag{ major: 0 - 1, revision: 0, flags: 0, size: 0,
+        frames: [] }
+}
+
+fn frame_size(tag: Id3Tag, id: str) -> i64 {
+    let fr: Id3Frame ! Id3Error = id3.frame_named(tag, id)
+    return (fr ?? Id3Frame{ id: "", size: 0 - 1, flags: 0,
+        payload: "".to_bytes() }).size
+}
+
+fn check_id3(inout f: i64) / {io} {
+    print("-- id3: a frame size is synchsafe in v2.4 and plain in v2.3")
+    let v24 = tag_of(id3.build(tag_fields()))
+    let v23 = tag_of(v23_tag())
+    say(f, "both versions parse, and say which they are",
+        v24.major == 4 and v23.major == 3)
+    say(f, "and both carry the same four frames",
+        v24.frames.len() == 4 and v23.frames.len() == 4)
+    // Both tags write the same bytes for the album — an encoding marker and
+    // then Latin-1, which is also UTF-8 here — so the payloads are identical
+    // and only the way the *size* is written down differs.
+    say(f, "the long frame is over 127 bytes, which is where they differ",
+        frame_size(v24, "TALB") == 189 and
+        frame_size(v23, "TALB") == frame_size(v24, "TALB"))
+    // A synchsafe 189 is 0x01 0x3D; a plain one is 0xBD. Reading a v2.4 size
+    // as plain gives 317, and the parser then walks off the end of the frame
+    // and into the next one.
+    say(f, "a synchsafe size is not the plain one, and the gap grows",
+        id3.read_synchsafe(bytes_of([0, 0, 2, 62]), 0) == 318 and
+        id3.write_synchsafe(318).len() == 4)
+    say(f, "every byte of a synchsafe integer has its top bit clear",
+        id3.write_synchsafe(268435455).at(0) == 127 and
+        id3.read_synchsafe(id3.write_synchsafe(268435455), 0) == 268435455)
+    say(f, "the text of a frame is read whatever encoding it declares",
+        id3.title(v24) == "A Test Track" and id3.title(v23) == "A Test Track")
+    say(f, "and the same is true of the other three",
+        id3.artist(v23) == "Nobody" and id3.album(v23) == long_album() and
+        id3.track(v23) == "3/12")
+    say(f, "a track of the form 3/12 is a number and a total",
+        id3.track_number(v24) == 3)
+    // The tag's declared size is what tells a player where the audio is.
+    say(f, "the audio starts after the header and the declared size",
+        id3.audio_offset(id3.build(tag_fields())) == v24.size + 10)
+    say(f, "a file with no tag has no tag rather than an empty one",
+        not id3.has_tag("\u{ff}\u{fb}audio".to_bytes()) and
+        id3.audio_offset("\u{ff}\u{fb}audio".to_bytes()) == 0)
+    say(f, "and the v1 tag at the end of a file is a different format",
+        id3.parse_v1(v1_tag()).0 == "A Test Track")
+}
+
+fn v1_tag() -> bytes {
+    var out: [i64] = []
+    push_tag(out, "TAG")
+    push_padded(out, "A Test Track", 30)
+    push_padded(out, "Nobody", 30)
+    push_padded(out, "An Album", 30)
+    push_padded(out, "2026", 4)
+    push_padded(out, "", 30)
+    out.push(0)
+    return bytes_of(out)
+}
+
+fn push_padded(inout out: [i64], text: str, width: i64) {
+    var written = 0
+    let raw = text.to_bytes()
+    for i in 0..raw.len() {
+        out.push(raw.at(i))
+        written = written + 1
+    }
+    while written < width {
+        out.push(0)
+        written = written + 1
+    }
+}
+
+// -------------------------------------------------------------- flacmeta
+
+// Ten seconds of 44.1 kHz stereo, with the vendor string and three tags a
+// `reference libFLAC` encoder writes.
+fn flac_file() -> bytes {
+    return bytes_of([102, 76, 97, 67, 0, 0, 0, 34, 16, 0, 16, 0, 0, 0, 0, 0,
+        0, 0, 10, 196, 66, 240, 0, 6, 186, 168, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 132, 0, 0, 83, 23, 0, 0, 0, 114, 101, 102, 101, 114,
+        101, 110, 99, 101, 32, 108, 105, 98, 70, 76, 65, 67, 32, 49, 46, 52,
+        46, 51, 3, 0, 0, 0, 18, 0, 0, 0, 84, 73, 84, 76, 69, 61, 65, 32, 84,
+        101, 115, 116, 32, 84, 114, 97, 99, 107, 13, 0, 0, 0, 65, 82, 84, 73,
+        83, 84, 61, 78, 111, 98, 111, 100, 121, 9, 0, 0, 0, 68, 65, 84, 69,
+        61, 50, 48, 50, 54])
+}
+
+fn check_flacmeta(inout f: i64) / {io} {
+    print("-- flacmeta: fields that do not start on a byte boundary")
+    let data = flac_file()
+    let si: FlacStreamInfo ! FlacError = flacmeta.stream_info(data)
+    let info = si ?? FlacStreamInfo{ minimum_block_size: 0,
+        maximum_block_size: 0, minimum_frame_size: 0, maximum_frame_size: 0,
+        sample_rate: 0, channels: 0, bits_per_sample: 0, total_samples: 0 }
+    // The rate is 20 bits, the channel count 3, the depth 5 and the sample
+    // count 36 — none of them byte-aligned, and all of them stored minus one
+    // except the rate.
+    say(f, "the rate, channels and depth share bytes and still come out",
+        info.sample_rate == 44100 and info.channels == 2 and
+        info.bits_per_sample == 16)
+    say(f, "the total sample count is thirty-six bits, so it is an i64",
+        info.total_samples == 441000)
+    say(f, "and the duration is the one over the other",
+        flacmeta.duration(info) == 10.0)
+    let vendor: str ! FlacError = flacmeta.vendor(data)
+    // Vorbis comments are little-endian inside a big-endian container, which
+    // is the thing that catches people.
+    say(f, "the vendor string is little-endian in a big-endian file",
+        (vendor ?? "") == "reference libFLAC 1.4.3")
+    let tags: [(str, str)] ! FlacError = flacmeta.comments(data)
+    say(f, "and the three tags come back in the order they were written",
+        (tags ?? []).len() == 3 and (tags ?? [])[0].0 == "TITLE")
+    say(f, "a tag's name is matched without regard to case",
+        flacmeta.value_for(data, "title") == "A Test Track" and
+        flacmeta.value_for(data, "Artist") == "Nobody")
+    // A name may legally appear more than once, which is how several artists
+    // are written down, so the value is a list.
+    say(f, "and a name that is absent has no values rather than an empty one",
+        flacmeta.values_for(data, "GENRE").len() == 0 and
+        flacmeta.values_for(data, "DATE").len() == 1)
+    let blocks: [FlacBlock] ! FlacError = flacmeta.blocks(data)
+    say(f, "the blocks are walked to the one flagged last",
+        (blocks ?? []).len() == 2 and (blocks ?? [])[1].last)
+    say(f, "and named by their number",
+        flacmeta.block_type_name(0) == "STREAMINFO" and
+        flacmeta.block_type_name(4) == "VORBIS_COMMENT")
+    say(f, "the audio starts where the metadata stops",
+        flacmeta.audio_offset(data) == data.len())
+    say(f, "and something that is not FLAC is refused",
+        not flacmeta.is_flac("ID3\u{04}".to_bytes()))
+}
+
+// -------------------------------------------------------------- loudness
+
+fn tone(frequency: f64, amplitude: f64, seconds: f64) -> [f64] {
+    var out: [f64] = []
+    let n = (48000.0 * seconds).as_i64()
+    var i = 0
+    while i < n {
+        out.push(amplitude *
+            (2.0 * 3.141592653589793 * frequency * i.as_f64() / 48000.0).sin())
+        i = i + 1
+    }
+    return out
+}
+
+fn near(a: f64, b: f64, tolerance: f64) -> bool {
+    var d = a - b
+    if d < 0.0 {
+        d = 0.0 - d
+    }
+    return d < tolerance
+}
+
+fn lufs(channels: [[f64]]) -> f64 {
+    let m: f64 ! LoudnessError = loudness.integrated(channels, 48000.0)
+    return m ?? 0.0
+}
+
+fn check_loudness(inout f: i64) / {io} {
+    print("-- loudness: the gate is what makes the number match the ear")
+    let kilohertz = tone(1000.0, 0.5, 1.0)
+    // pyloudnorm's answers for the same three signals.
+    say(f, "a 1 kHz tone at half scale measures what pyloudnorm measures",
+        near(lufs([kilohertz]), 0.0 - 9.06564750788675, 1.0e-9))
+    say(f, "and a quieter, lower one does too",
+        near(lufs([tone(440.0, 0.1, 1.0)]), 0.0 - 23.73598172476926, 1.0e-9))
+    // Two identical channels are twice the energy: three decibels louder.
+    say(f, "the same tone in two channels is three decibels louder",
+        near(lufs([kilohertz, kilohertz]), 0.0 - 6.055347551246938, 1.0e-9))
+    // K-weighting is a shelf and a high pass, and the coefficients have to be
+    // derived for any rate but 48 kHz, because the specification tabulates
+    // only that one.
+    let filters = loudness.k_weighting(48000.0)
+    say(f, "the K-weighting coefficients are the specification's",
+        near(filters[0].b0, 1.5351828863637502, 1.0e-12) and
+        near(filters[0].a2, 0.7325047060963897, 1.0e-12))
+    say(f, "and the high pass at 38 Hz is the second stage",
+        near(filters[1].b0, 0.9950442970178917, 1.0e-12))
+    // A second of 400 ms blocks at 75% overlap is 7 blocks, not 2: the step
+    // is 100 ms.
+    say(f, "blocks overlap by three quarters, so there are far more of them",
+        loudness.momentary([kilohertz], 48000.0).len() == 7)
+    // The gate is why appending a second of silence barely moves the number.
+    // Ungated, doubling the length with silence would take three decibels
+    // off; gated it costs seven tenths of one, all of it from the blocks that
+    // straddle the join.
+    var padded = kilohertz
+    for _i in 0..48000 {
+        padded.push(0.0)
+    }
+    say(f, "silence appended to a signal barely changes its loudness",
+        near(lufs([padded]), 0.0 - 9.7713684169653, 1.0e-9) and
+        near(lufs([padded]), lufs([kilohertz]), 1.0))
+    say(f, "even though it more than doubles the blocks measured",
+        loudness.momentary([padded], 48000.0).len() == 17)
+    say(f, "the absolute gate is -70 LUFS and the relative one -10 LU",
+        loudness.absolute_gate() == 0.0 - 70.0 and
+        loudness.relative_gate() == 0.0 - 10.0)
+    // Halving the amplitude is -6 dB, and the measurement is linear in that.
+    say(f, "halving a signal takes six decibels off it",
+        near(lufs([tone(1000.0, 0.25, 1.0)]), lufs([kilohertz]) -
+            6.020599913279624, 1.0e-9))
+    say(f, "the gain to a target is a subtraction, because it is a log scale",
+        near(loudness.gain_to_reach(0.0 - 9.0, loudness.broadcast_target()),
+            0.0 - 14.0, 1.0e-12) and
+        near(loudness.gain_factor(0.0 - 6.020599913279624), 0.5, 1.0e-12))
+    // The surround channels count for about +1.5 dB because sound from
+    // behind is heard as louder; the LFE is not counted at all.
+    say(f, "the surround channels are weighted and the front ones are not",
+        loudness.channel_weight(0) == 1.0 and
+        loudness.channel_weight(3) == 1.41)
+    say(f, "a signal shorter than one block is an error, not a silence",
+        too_short(tone(1000.0, 0.5, 0.2)))
+}
+
+fn too_short(samples: [f64]) -> bool {
+    match loudness.integrated_mono(samples, 48000.0) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn main() / {io} {
+    var f = 0
+    check_midi(f)
+    check_wavmeta(f)
+    check_id3(f)
+    check_flacmeta(f)
+    check_loudness(f)
+    if f == 0 {
+        print("audio: every claim held")
+    } else {
+        print("audio: {f} claims failed")
+    }
+}

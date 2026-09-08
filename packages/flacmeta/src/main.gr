@@ -1,0 +1,292 @@
+// FLAC metadata: bit-packed fields, and one block that changes endianness.
+//
+// A FLAC file is `fLaC`, then metadata blocks, then audio frames. Each block
+// has a four-byte header — a last-block flag, a seven-bit type, and a 24-bit
+// length — and the first block is always STREAMINFO.
+//
+// ## STREAMINFO is packed to the bit
+//
+// Sample rate is twenty bits, channels three, bits per sample five, and the
+// total sample count thirty-six — sixty-four bits in eight bytes with nothing
+// aligned to a byte boundary. That is not premature optimisation: it is the
+// only block a decoder *must* read, and keeping it at 34 bytes means it fits
+// in one read on any medium.
+//
+// The consequence is that every field needs shifting and masking, and getting
+// one boundary wrong gives a plausible number. A sample rate read one bit out
+// is 22050 instead of 44100, which sounds like a slowed-down recording rather
+// than like a parse error.
+//
+// ## Vorbis comments are little-endian, and nothing else in FLAC is
+//
+// Every length in a FLAC file is big-endian except inside VORBIS_COMMENT,
+// which is little-endian because it was borrowed wholesale from Ogg Vorbis
+// and nobody wanted to define a second version. A reader using one convention
+// throughout reads a three-byte field length as fifty million and gives up.
+//
+// ## The tags are `NAME=value` strings and the name is case-insensitive
+//
+// There is no schema, no type, and no list of valid names — `TITLE`, `title`
+// and `TiTlE` are the same field, a field may appear more than once, and a
+// player showing only the first artist of a duet is doing so because it
+// stopped at the first match.
+//
+// Checked against `mutagen` for the stream information and the tags of files
+// it reads.
+
+type FlacBlock = {
+    /// 0 STREAMINFO, 1 PADDING, 2 APPLICATION, 3 SEEKTABLE,
+    /// 4 VORBIS_COMMENT, 5 CUESHEET, 6 PICTURE.
+    kind: i64,
+    last: bool,
+    offset: i64,
+    length: i64,
+}
+
+type FlacStreamInfo = {
+    minimum_block_size: i64,
+    maximum_block_size: i64,
+    minimum_frame_size: i64,
+    maximum_frame_size: i64,
+    sample_rate: i64,
+    channels: i64,
+    bits_per_sample: i64,
+    total_samples: i64,
+}
+
+type FlacError =
+    | NotFlac(magic: str)
+    | Truncated(at: i64)
+    | NoStreamInfo()
+    | NoComments()
+
+pub fn streaminfo_type() -> i64 {
+    return 0
+}
+
+pub fn vorbis_comment_type() -> i64 {
+    return 4
+}
+
+pub fn picture_type() -> i64 {
+    return 6
+}
+
+fn read16(data: bytes, at: i64) -> i64 {
+    if at + 2 > data.len() {
+        return 0
+    }
+    return data.at(at).shl(8).bit_or(data.at(at + 1))
+}
+
+fn read24(data: bytes, at: i64) -> i64 {
+    if at + 3 > data.len() {
+        return 0
+    }
+    return data.at(at).shl(16).bit_or(data.at(at + 1).shl(8))
+        .bit_or(data.at(at + 2))
+}
+
+/// A little-endian 32-bit number, which only Vorbis comments use.
+fn read32_le(data: bytes, at: i64) -> i64 {
+    if at + 4 > data.len() {
+        return 0
+    }
+    return data.at(at + 3).shl(24).bit_or(data.at(at + 2).shl(16))
+        .bit_or(data.at(at + 1).shl(8)).bit_or(data.at(at))
+}
+
+pub fn is_flac(data: bytes) -> bool {
+    return data.len() >= 4 and data.slice(0, 4).to_str() == "fLaC"
+}
+
+/// Every metadata block, in order.
+pub fn blocks(data: bytes) -> [FlacBlock] ! FlacError {
+    if not is_flac(data) {
+        fail(NotFlac(if data.len() >= 4 { data.slice(0, 4).to_str() } else {
+            ""
+        }))
+    }
+    var out: [FlacBlock] = []
+    var at = 4
+    var last = false
+    while not last and at + 4 <= data.len() {
+        let header = data.at(at)
+        last = header.bit_and(128) != 0
+        let length = read24(data, at + 1)
+        if at + 4 + length > data.len() {
+            fail(Truncated(at))
+        }
+        out.push(FlacBlock{ kind: header.bit_and(127), last: last,
+            offset: at + 4, length: length })
+        at = at + 4 + length
+    }
+    return out
+}
+
+/// Where the audio frames begin.
+pub fn audio_offset(data: bytes) -> i64 {
+    let all = blocks(data) ?? []
+    if all.len() == 0 {
+        return 0
+    }
+    let final_block = all[all.len() - 1]
+    return final_block.offset + final_block.length
+}
+
+/// The STREAMINFO block, unpacked.
+///
+/// The last eight of its thirty-four bytes hold four fields with no byte
+/// boundaries between them, which is why this is arithmetic rather than
+/// indexing.
+pub fn stream_info(data: bytes) -> FlacStreamInfo ! FlacError {
+    for b in try blocks(data) {
+        if b.kind != streaminfo_type() {
+            continue
+        }
+        if b.length < 34 {
+            fail(Truncated(b.offset))
+        }
+        let at = b.offset
+        // Twenty bits of sample rate, three of channels, five of bits per
+        // sample, then thirty-six of total samples.
+        let packed_high = data.at(at + 10).shl(24)
+            .bit_or(data.at(at + 11).shl(16))
+            .bit_or(data.at(at + 12).shl(8)).bit_or(data.at(at + 13))
+        let rate = packed_high.ushr(12).bit_and(1048575)
+        let channels = packed_high.ushr(9).bit_and(7) + 1
+        let bits = packed_high.ushr(4).bit_and(31) + 1
+        var total = packed_high.bit_and(15)
+        var i = 0
+        while i < 4 {
+            total = total.shl(8).bit_or(data.at(at + 14 + i))
+            i = i + 1
+        }
+        return FlacStreamInfo{
+            minimum_block_size: read16(data, at),
+            maximum_block_size: read16(data, at + 2),
+            minimum_frame_size: read24(data, at + 4),
+            maximum_frame_size: read24(data, at + 7),
+            sample_rate: rate,
+            channels: channels,
+            bits_per_sample: bits,
+            total_samples: total,
+        }
+    }
+    fail(NoStreamInfo())
+}
+
+/// How long the file plays, in seconds.
+pub fn duration(info: FlacStreamInfo) -> f64 {
+    if info.sample_rate == 0 {
+        return 0.0
+    }
+    return info.total_samples.as_f64() / info.sample_rate.as_f64()
+}
+
+/// The vendor string a VORBIS_COMMENT block opens with.
+pub fn vendor(data: bytes) -> str ! FlacError {
+    for b in try blocks(data) {
+        if b.kind != vorbis_comment_type() {
+            continue
+        }
+        let length = read32_le(data, b.offset)
+        return data.slice(b.offset + 4, b.offset + 4 + length).to_str()
+    }
+    fail(NoComments())
+}
+
+/// The tags, as they are written: `NAME=value`, name first.
+///
+/// A name may repeat — two artists on a duet is two `ARTIST` entries — so
+/// this is a list rather than a map, and a caller that wants one field has to
+/// decide what more than one means.
+pub fn comments(data: bytes) -> [(str, str)] ! FlacError {
+    for b in try blocks(data) {
+        if b.kind != vorbis_comment_type() {
+            continue
+        }
+        var at = b.offset
+        let vendor_length = read32_le(data, at)
+        at = at + 4 + vendor_length
+        let count = read32_le(data, at)
+        at = at + 4
+        var out: [(str, str)] = []
+        var i = 0
+        while i < count and at + 4 <= data.len() {
+            let length = read32_le(data, at)
+            at = at + 4
+            let text = data.slice(at, at + length).to_str()
+            at = at + length
+            let equals = text.index_of("=") ?? (0 - 1)
+            if equals > 0 {
+                out.push((text.substr(0, equals),
+                    text.substr(equals + 1, text.len() - equals - 1)))
+            }
+            i = i + 1
+        }
+        return out
+    }
+    fail(NoComments())
+}
+
+/// Every value for a field name, compared without case.
+///
+/// The names are case-insensitive by specification, and a reader that
+/// compares them exactly misses tags written by half the tools that exist.
+pub fn values_for(data: bytes, name: str) -> [str] {
+    var out: [str] = []
+    let wanted = name.to_lower()
+    for pair in comments(data) ?? [] {
+        if pair.0.to_lower() == wanted {
+            out.push(pair.1)
+        }
+    }
+    return out
+}
+
+/// The first value for a field, or empty.
+pub fn value_for(data: bytes, name: str) -> str {
+    let all = values_for(data, name)
+    if all.len() == 0 {
+        return ""
+    }
+    return all[0]
+}
+
+/// The names of every block type present, for looking at a file's shape.
+pub fn block_type_name(kind: i64) -> str {
+    let names = ["STREAMINFO", "PADDING", "APPLICATION", "SEEKTABLE",
+        "VORBIS_COMMENT", "CUESHEET", "PICTURE"]
+    if kind < 0 or kind >= names.len() {
+        return "reserved"
+    }
+    return names[kind]
+}
+
+/// How many bytes of the file are metadata rather than audio.
+///
+/// Worth knowing when a library of files each carries a full-size album
+/// cover: the pictures can be a tenth of the collection.
+pub fn metadata_bytes(data: bytes) -> i64 {
+    var total = 0
+    for b in blocks(data) ?? [] {
+        total = total + 4 + b.length
+    }
+    return total
+}
+
+/// Whether the file has any padding to write new tags into.
+///
+/// Without it, adding a tag means rewriting the whole file. Encoders leave a
+/// PADDING block for exactly that reason and tools that strip it make every
+/// later edit expensive.
+pub fn padding_bytes(data: bytes) -> i64 {
+    var total = 0
+    for b in blocks(data) ?? [] {
+        if b.kind == 1 {
+            total = total + b.length
+        }
+    }
+    return total
+}

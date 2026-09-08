@@ -1,0 +1,24 @@
+[package]
+name = "audio_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.midi]
+path = "../midi"
+version = "^1.0.0"
+
+[dependencies.wavmeta]
+path = "../wavmeta"
+version = "^1.0.0"
+
+[dependencies.id3]
+path = "../id3"
+version = "^1.0.0"
+
+[dependencies.flacmeta]
+path = "../flacmeta"
+version = "^1.0.0"
+
+[dependencies.loudness]
+path = "../loudness"
+version = "^1.0.0"

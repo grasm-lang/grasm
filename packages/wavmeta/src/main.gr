@@ -1,0 +1,322 @@
+// WAV files: a RIFF container, and the four things that go wrong in it.
+//
+// A WAV is a list of chunks, each a four-character tag, a length, and that
+// many bytes. Two chunks matter — `fmt ` says what the samples are and `data`
+// holds them — and everything else is optional metadata that half the world's
+// software drops on save.
+//
+// ## Every number is little-endian, including in a format named for a
+// big-endian one
+//
+// RIFF is Microsoft's version of IFF, which was big-endian. The tags read
+// left to right and every length in the file is little-endian, which is the
+// first thing a parser written from the IFF specification gets wrong.
+//
+// ## A chunk of odd length is followed by a padding byte
+//
+// The byte is not counted in the length. A parser that advances by the length
+// alone lands one byte short on the next chunk and reads its tag as garbage —
+// which happens on real files as soon as any metadata has an odd-length
+// string, so on most files with a title.
+//
+// ## The four-gigabyte ceiling
+//
+// Lengths are 32 bits, so a WAV cannot exceed about four gigabytes — six
+// hours of stereo CD audio. Recorders hit it, and the workarounds (RF64, W64)
+// are different formats wearing the same extension. A file whose `RIFF`
+// length disagrees with its actual size is usually one that was still being
+// written when something crashed, and the data is usually fine: `is_truncated`
+// says so rather than refusing.
+//
+// ## `fmt ` has three lengths
+//
+// Sixteen bytes for PCM, eighteen with an extension size, forty for
+// `WAVE_FORMAT_EXTENSIBLE` — which is what anything above two channels or
+// sixteen bits must use, and which stores the *real* format code in a GUID at
+// the end. A reader that looks only at the format code sees `0xFFFE` and
+// concludes the file is not PCM when it is.
+//
+// Checked against Python's `wave` module for the format and frame counts, and
+// against the RIFF specification for the chunk walking.
+
+type WavChunk = {
+    tag: str,
+    /// Where the chunk's contents start.
+    offset: i64,
+    length: i64,
+}
+
+type WavFormat = {
+    /// 1 is PCM, 3 is float, 0xFFFE is extensible.
+    format_code: i64,
+    channels: i64,
+    sample_rate: i64,
+    bytes_per_second: i64,
+    block_align: i64,
+    bits_per_sample: i64,
+    /// The real format when the code is extensible.
+    extensible_code: i64,
+}
+
+type WavMetaError =
+    | NotRiff(magic: str)
+    | NotWave(kind: str)
+    | Truncated(at: i64)
+    | NoFormatChunk()
+    | NoDataChunk()
+
+fn read16(data: bytes, at: i64) -> i64 {
+    if at + 2 > data.len() {
+        return 0
+    }
+    return data.at(at + 1).shl(8).bit_or(data.at(at))
+}
+
+fn read32(data: bytes, at: i64) -> i64 {
+    if at + 4 > data.len() {
+        return 0
+    }
+    return data.at(at + 3).shl(24).bit_or(data.at(at + 2).shl(16))
+        .bit_or(data.at(at + 1).shl(8)).bit_or(data.at(at))
+}
+
+fn tag_at(data: bytes, at: i64) -> str {
+    if at + 4 > data.len() {
+        return ""
+    }
+    return data.slice(at, at + 4).to_str()
+}
+
+/// Every chunk in the file, in order.
+///
+/// The padding byte after an odd-length chunk is skipped here, which is the
+/// whole reason to walk chunks with a function rather than by hand.
+pub fn chunks(data: bytes) -> [WavChunk] ! WavMetaError {
+    if data.len() < 12 {
+        fail(Truncated(data.len()))
+    }
+    if tag_at(data, 0) != "RIFF" {
+        fail(NotRiff(tag_at(data, 0)))
+    }
+    if tag_at(data, 8) != "WAVE" {
+        fail(NotWave(tag_at(data, 8)))
+    }
+    var out: [WavChunk] = []
+    var at = 12
+    while at + 8 <= data.len() {
+        let tag = tag_at(data, at)
+        let length = read32(data, at + 4)
+        out.push(WavChunk{ tag: tag, offset: at + 8, length: length })
+        var next = at + 8 + length
+        // The pad byte is not counted in the length and is not optional.
+        if length % 2 == 1 {
+            next = next + 1
+        }
+        if next <= at {
+            break
+        }
+        at = next
+    }
+    return out
+}
+
+pub fn chunk_named(data: bytes, tag: str) -> WavChunk ! WavMetaError {
+    for c in try chunks(data) {
+        if c.tag == tag {
+            return c
+        }
+    }
+    fail(NoFormatChunk())
+}
+
+pub fn has_chunk(data: bytes, tag: str) -> bool {
+    match chunk_named(data, tag) {
+        Ok(_c) -> {
+            return true
+        }
+        Err(_e) -> {
+            return false
+        }
+    }
+}
+
+/// The `fmt ` chunk, extensible or not.
+pub fn format_of(data: bytes) -> WavFormat ! WavMetaError {
+    let c = try chunk_named(data, "fmt ")
+    if c.length < 16 {
+        fail(Truncated(c.offset))
+    }
+    let at = c.offset
+    var out = WavFormat{
+        format_code: read16(data, at),
+        channels: read16(data, at + 2),
+        sample_rate: read32(data, at + 4),
+        bytes_per_second: read32(data, at + 8),
+        block_align: read16(data, at + 12),
+        bits_per_sample: read16(data, at + 14),
+        extensible_code: 0,
+    }
+    // `0xFFFE` means the real code is the first two bytes of a GUID at the
+    // end of a forty-byte chunk. A reader stopping at the code decides a
+    // twenty-four-bit file is not PCM.
+    if out.format_code == 65534 and c.length >= 40 {
+        out.extensible_code = read16(data, at + 24)
+    }
+    return out
+}
+
+/// Whether the samples are plain integers, extensible or not.
+pub fn is_pcm(f: WavFormat) -> bool {
+    return f.format_code == 1 or (f.format_code == 65534 and
+        f.extensible_code == 1)
+}
+
+pub fn is_float(f: WavFormat) -> bool {
+    return f.format_code == 3 or (f.format_code == 65534 and
+        f.extensible_code == 3)
+}
+
+/// How many frames — one sample on every channel — the file holds.
+pub fn frame_count(data: bytes) -> i64 ! WavMetaError {
+    let f = try format_of(data)
+    let d = try chunk_named(data, "data")
+    if f.block_align == 0 {
+        fail(Truncated(d.offset))
+    }
+    return d.length / f.block_align
+}
+
+/// How long the file plays, in seconds.
+pub fn duration(data: bytes) -> f64 {
+    let f = format_of(data) ?? WavFormat{ format_code: 0, channels: 0,
+        sample_rate: 0, bytes_per_second: 0, block_align: 0,
+        bits_per_sample: 0, extensible_code: 0 }
+    let frames = frame_count(data) ?? 0
+    if f.sample_rate == 0 {
+        return 0.0
+    }
+    return frames.as_f64() / f.sample_rate.as_f64()
+}
+
+/// One frame's samples, as signed integers.
+///
+/// Eight-bit WAV is *unsigned* and everything wider is signed, which is a
+/// discontinuity nobody expects and which makes an eight-bit file read as
+/// signed sound like loud static.
+pub fn frame_at(data: bytes, index: i64) -> [i64] ! WavMetaError {
+    let f = try format_of(data)
+    let d = try chunk_named(data, "data")
+    if f.block_align == 0 or f.channels == 0 {
+        fail(Truncated(d.offset))
+    }
+    let width = f.bits_per_sample / 8
+    var out: [i64] = []
+    var channel = 0
+    while channel < f.channels {
+        let at = d.offset + index * f.block_align + channel * width
+        if at + width > data.len() {
+            fail(Truncated(at))
+        }
+        var value = 0
+        var i = width - 1
+        while i >= 0 {
+            value = value.shl(8).bit_or(data.at(at + i))
+            i = i - 1
+        }
+        if width == 1 {
+            // Eight bits are unsigned, with 128 as silence.
+            out.push(value - 128)
+        } else {
+            let limit = (1).shl(width * 8 - 1)
+            if value >= limit {
+                value = value - limit * 2
+            }
+            out.push(value)
+        }
+        channel = channel + 1
+    }
+    return out
+}
+
+/// The samples of one channel, as floats between -1 and 1.
+pub fn channel_samples(data: bytes, channel: i64) -> [f64] {
+    let f = format_of(data) ?? WavFormat{ format_code: 0, channels: 0,
+        sample_rate: 0, bytes_per_second: 0, block_align: 0,
+        bits_per_sample: 0, extensible_code: 0 }
+    let frames = frame_count(data) ?? 0
+    var out: [f64] = []
+    if f.bits_per_sample == 0 {
+        return out
+    }
+    let scale = (1).shl(f.bits_per_sample - 1).as_f64()
+    var i = 0
+    while i < frames {
+        let frame = frame_at(data, i) ?? []
+        if channel < frame.len() {
+            out.push(frame[channel].as_f64() / scale)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+/// The `LIST`/`INFO` metadata, as name and value.
+///
+/// Four-character names — `INAM` for a title, `IART` for an artist — from a
+/// 1991 registry that nobody has extended and every editor drops on save.
+pub fn info_tags(data: bytes) -> [(str, str)] {
+    var out: [(str, str)] = []
+    let all = chunks(data) ?? []
+    for c in all {
+        if c.tag != "LIST" {
+            continue
+        }
+        if tag_at(data, c.offset) != "INFO" {
+            continue
+        }
+        var at = c.offset + 4
+        let stop = c.offset + c.length
+        while at + 8 <= stop {
+            let name = tag_at(data, at)
+            let length = read32(data, at + 4)
+            var text = data.slice(at + 8, at + 8 + length).to_str()
+            // The strings are null-terminated inside their own length.
+            let zero = text.index_of("\u{0}") ?? (0 - 1)
+            if zero >= 0 {
+                text = text.substr(0, zero)
+            }
+            out.push((name, text))
+            at = at + 8 + length
+            if length % 2 == 1 {
+                at = at + 1
+            }
+        }
+    }
+    return out
+}
+
+/// Whether the `RIFF` length disagrees with the file's actual size.
+///
+/// Usually a recording interrupted mid-write. The audio before the cut is
+/// fine, so this reports rather than refuses.
+pub fn is_truncated(data: bytes) -> bool {
+    if data.len() < 8 {
+        return true
+    }
+    return read32(data, 4) + 8 > data.len()
+}
+
+/// A one-line description, the way a media tool prints one.
+pub fn describe(data: bytes) -> str {
+    let f = format_of(data) ?? WavFormat{ format_code: 0, channels: 0,
+        sample_rate: 0, bytes_per_second: 0, block_align: 0,
+        bits_per_sample: 0, extensible_code: 0 }
+    if f.sample_rate == 0 {
+        return "not a readable WAV"
+    }
+    let kind = if is_float(f) { "float" } else {
+        if is_pcm(f) { "PCM" } else { "compressed" }
+    }
+    return "{f.channels} channel {kind}, {f.bits_per_sample}-bit, " +
+    "{f.sample_rate} Hz"
+}

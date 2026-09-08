@@ -1,0 +1,6 @@
+[package]
+name = "wavmeta"
+version = "1.0.0"
+
+# Reads bytes the caller supplies. Opens nothing.
+capabilities = []

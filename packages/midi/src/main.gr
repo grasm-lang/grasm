@@ -1,0 +1,408 @@
+// Standard MIDI files: the format that has not changed since 1983.
+//
+// A file is a header chunk and some track chunks, and a track is a list of
+// `(delta time, event)`. It describes *performance* rather than sound — which
+// note, how hard, when — which is why a MIDI file of a symphony is forty
+// kilobytes and a recording of one is forty megabytes, and why the same file
+// sounds different on every synthesiser.
+//
+// ## The variable-length quantity
+//
+// Every delta time is a base-128 number with the top bit set on all but the
+// last byte. A delta of 96 is one byte; 192 is two. It is the reason a MIDI
+// file cannot be indexed and must be walked from the start, and it is the
+// first thing a parser gets wrong: reading a fixed number of bytes works for
+// every short delta and fails on the first long one.
+//
+// ## Running status
+//
+// If an event has the same status byte as the one before it, the byte is
+// omitted. A run of note-ons is a status byte and then pairs of data bytes
+// for the rest of the run — which is a real saving in a dense track and which
+// means a parser must *remember* the last status. A parser that does not
+// reads the second note's pitch as a status byte and desynchronises for the
+// rest of the file.
+//
+// Meta events and system-exclusive events cancel running status. A parser
+// that forgets that survives most files and fails on the ones with tempo
+// changes in the middle.
+//
+// ## Ticks are not time
+//
+// A delta is in ticks, and how long a tick is comes from the header's
+// division *and* from tempo events inside the track. A file with a tempo
+// change halfway through has two tick durations, and `seconds_at` is the
+// only honest way to turn a tick into a time.
+//
+// Checked against `mido` for the events, the deltas and the tempo of files it
+// wrote.
+
+type MidiEvent = {
+    /// Ticks since the previous event.
+    delta: i64,
+    /// `note_on`, `note_off`, `control_change`, `program_change`,
+    /// `pitch_bend`, `meta`, `sysex`.
+    kind: str,
+    channel: i64,
+    /// Note number, controller number, or the meta type.
+    first: i64,
+    /// Velocity or value.
+    second: i64,
+    /// A meta event's payload, or empty.
+    data: bytes,
+}
+
+type MidiTrack = { events: [MidiEvent] }
+
+type MidiFile = {
+    /// 0 is one track, 1 is several played together, 2 is several
+    /// independent ones.
+    format: i64,
+    /// Ticks per quarter note when positive; SMPTE when negative.
+    division: i64,
+    tracks: [MidiTrack],
+}
+
+type MidiError =
+    | NotMidi(magic: str)
+    | Truncated(at: i64)
+    | BadChunk(tag: str)
+    | RunningStatusWithoutStatus(at: i64)
+
+fn read16(data: bytes, at: i64) -> i64 {
+    if at + 2 > data.len() {
+        return 0
+    }
+    return data.at(at).shl(8).bit_or(data.at(at + 1))
+}
+
+fn read32(data: bytes, at: i64) -> i64 {
+    if at + 4 > data.len() {
+        return 0
+    }
+    return data.at(at).shl(24).bit_or(data.at(at + 1).shl(16))
+        .bit_or(data.at(at + 2).shl(8)).bit_or(data.at(at + 3))
+}
+
+fn tag_at(data: bytes, at: i64) -> str {
+    if at + 4 > data.len() {
+        return ""
+    }
+    return data.slice(at, at + 4).to_str()
+}
+
+/// A variable-length quantity, and how many bytes it took.
+///
+/// Seven bits per byte, most significant first, with the top bit set on every
+/// byte but the last. The specification caps it at four bytes, which is what
+/// stops a corrupt file from producing an unbounded read.
+pub fn read_varint(data: bytes, at: i64) -> (i64, i64) {
+    var value = 0
+    var used = 0
+    while used < 4 and at + used < data.len() {
+        let byte = data.at(at + used)
+        value = value.shl(7).bit_or(byte.bit_and(127))
+        used = used + 1
+        if byte < 128 {
+            return (value, used)
+        }
+    }
+    return (value, used)
+}
+
+/// The same number written back out.
+pub fn write_varint(value: i64) -> bytes {
+    if value == 0 {
+        return bytes_of([0])
+    }
+    var groups: [i64] = []
+    var v = value
+    while v > 0 {
+        groups.push(v.bit_and(127))
+        v = v.ushr(7)
+    }
+    var out: [i64] = []
+    let reversed = groups.rev()
+    var i = 0
+    while i < reversed.len() {
+        if i + 1 < reversed.len() {
+            out.push(reversed[i] + 128)
+        } else {
+            out.push(reversed[i])
+        }
+        i = i + 1
+    }
+    return bytes_of(out)
+}
+
+/// The whole file.
+pub fn parse(data: bytes) -> MidiFile ! MidiError {
+    if data.len() < 14 {
+        fail(Truncated(data.len()))
+    }
+    if tag_at(data, 0) != "MThd" {
+        fail(NotMidi(tag_at(data, 0)))
+    }
+    let header_length = read32(data, 4)
+    // Format, then the track count, then the division — in that order. The
+    // two sixteen-bit fields in the middle are easy to swap and a file read
+    // with them swapped has a division of one and plays a thousand times
+    // too fast.
+    var out = MidiFile{
+        format: read16(data, 8),
+        division: signed16(read16(data, 12)),
+        tracks: [],
+    }
+    let track_count = read16(data, 10)
+    var at = 8 + header_length
+    var i = 0
+    while i < track_count and at < data.len() {
+        if tag_at(data, at) != "MTrk" {
+            fail(BadChunk(tag_at(data, at)))
+        }
+        let length = read32(data, at + 4)
+        if at + 8 + length > data.len() {
+            fail(Truncated(at))
+        }
+        out.tracks.push(try parse_track(data.slice(at + 8,
+            at + 8 + length)))
+        at = at + 8 + length
+        i = i + 1
+    }
+    return out
+}
+
+fn signed16(value: i64) -> i64 {
+    if value >= 32768 {
+        return value - 65536
+    }
+    return value
+}
+
+/// One track's events, resolving running status as it goes.
+pub fn parse_track(data: bytes) -> MidiTrack ! MidiError {
+    var out = MidiTrack{ events: [] }
+    var at = 0
+    var status = 0 - 1
+    while at < data.len() {
+        let timing = read_varint(data, at)
+        at = at + timing.1
+        if at >= data.len() {
+            break
+        }
+        var byte = data.at(at)
+        if byte >= 128 {
+            status = byte
+            at = at + 1
+        } else {
+            // Running status: the byte is data, and the status is the one
+            // from last time. A parser without this desynchronises here.
+            if status < 0 {
+                fail(RunningStatusWithoutStatus(at))
+            }
+            byte = status
+        }
+        if byte == 255 {
+            // A meta event, which also cancels running status.
+            status = 0 - 1
+            let kind = data.at(at)
+            let length = read_varint(data, at + 1)
+            let start = at + 1 + length.1
+            out.events.push(MidiEvent{ delta: timing.0, kind: "meta",
+                channel: 0 - 1, first: kind, second: 0,
+                data: data.slice(start, start + length.0) })
+            at = start + length.0
+            continue
+        }
+        if byte == 240 or byte == 247 {
+            status = 0 - 1
+            let length = read_varint(data, at)
+            let start = at + length.1
+            out.events.push(MidiEvent{ delta: timing.0, kind: "sysex",
+                channel: 0 - 1, first: byte, second: 0,
+                data: data.slice(start, start + length.0) })
+            at = start + length.0
+            continue
+        }
+        let high = byte.ushr(4)
+        let channel = byte.bit_and(15)
+        let arity = if high == 12 or high == 13 { 1 } else { 2 }
+        let first = if at < data.len() { data.at(at) } else { 0 }
+        let second = if arity == 2 and at + 1 < data.len() {
+            data.at(at + 1)
+        } else {
+            0
+        }
+        at = at + arity
+        out.events.push(MidiEvent{ delta: timing.0, kind: kind_of(high),
+            channel: channel, first: first, second: second,
+            data: bytes_of([]) })
+    }
+    return out
+}
+
+fn kind_of(high: i64) -> str {
+    if high == 8 {
+        return "note_off"
+    }
+    if high == 9 {
+        return "note_on"
+    }
+    if high == 10 {
+        return "aftertouch"
+    }
+    if high == 11 {
+        return "control_change"
+    }
+    if high == 12 {
+        return "program_change"
+    }
+    if high == 13 {
+        return "channel_pressure"
+    }
+    if high == 14 {
+        return "pitch_bend"
+    }
+    return "unknown"
+}
+
+/// A note-on with velocity zero is a note-off.
+///
+/// The convention exists so a run of notes can share one status byte, which
+/// is what makes running status worth having. Every sequencer emits it and a
+/// reader that treats it as a note-on leaves every note sounding for ever.
+pub fn is_note_off(e: MidiEvent) -> bool {
+    return e.kind == "note_off" or (e.kind == "note_on" and e.second == 0)
+}
+
+pub fn is_note_on(e: MidiEvent) -> bool {
+    return e.kind == "note_on" and e.second > 0
+}
+
+/// The tempo in microseconds per quarter note, from a meta event.
+pub fn tempo_of(e: MidiEvent) -> i64 {
+    if e.kind != "meta" or e.first != 81 or e.data.len() < 3 {
+        return 0
+    }
+    return e.data.at(0).shl(16).bit_or(e.data.at(1).shl(8))
+        .bit_or(e.data.at(2))
+}
+
+/// The first tempo in a file, or 500000 — which is 120 beats a minute and is
+/// what a file with no tempo event means.
+pub fn initial_tempo(file: MidiFile) -> i64 {
+    for track in file.tracks {
+        for e in track.events {
+            let tempo = tempo_of(e)
+            if tempo > 0 {
+                return tempo
+            }
+        }
+    }
+    return 500000
+}
+
+/// Beats per minute from microseconds per quarter note.
+pub fn beats_per_minute(tempo: i64) -> f64 {
+    if tempo == 0 {
+        return 0.0
+    }
+    return 60000000.0 / tempo.as_f64()
+}
+
+/// A meta event's text, for the ones that carry any.
+pub fn meta_text(e: MidiEvent) -> str {
+    if e.kind != "meta" or e.first > 15 {
+        return ""
+    }
+    return e.data.to_str()
+}
+
+/// The track's name, from its meta event.
+pub fn track_name(track: MidiTrack) -> str {
+    for e in track.events {
+        if e.kind == "meta" and e.first == 3 {
+            return e.data.to_str()
+        }
+    }
+    return ""
+}
+
+/// Where a track ends in ticks: the sum of its deltas.
+pub fn track_length_in_ticks(track: MidiTrack) -> i64 {
+    var total = 0
+    for e in track.events {
+        total = total + e.delta
+    }
+    return total
+}
+
+/// A tick's position in seconds, given a tempo and the file's division.
+///
+/// Only correct while the tempo holds. A file with a tempo change has two
+/// answers and the caller has to walk the events to know which applies —
+/// which is why this takes the tempo rather than looking it up.
+pub fn seconds_at(ticks: i64, tempo: i64, division: i64) -> f64 {
+    if division <= 0 {
+        return 0.0
+    }
+    return ticks.as_f64() * tempo.as_f64() / division.as_f64() / 1000000.0
+}
+
+/// The notes a track plays, as `(start tick, pitch, velocity, length)`.
+///
+/// Pairing each note-on with its note-off, which is what anyone reading a
+/// MIDI file actually wants and what the format goes out of its way not to
+/// provide.
+pub fn notes(track: MidiTrack) -> [(i64, i64, i64, i64)] {
+    var out: [(i64, i64, i64, i64)] = []
+    var pending: [(i64, i64, i64)] = []
+    var now = 0
+    for e in track.events {
+        now = now + e.delta
+        if is_note_on(e) {
+            pending.push((now, e.first, e.second))
+            continue
+        }
+        if is_note_off(e) {
+            var i = pending.len() - 1
+            while i >= 0 {
+                if pending[i].1 == e.first {
+                    out.push((pending[i].0, pending[i].1, pending[i].2,
+                        now - pending[i].0))
+                    var kept: [(i64, i64, i64)] = []
+                    var k = 0
+                    while k < pending.len() {
+                        if k != i {
+                            kept.push(pending[k])
+                        }
+                        k = k + 1
+                    }
+                    pending = kept
+                    break
+                }
+                i = i - 1
+            }
+        }
+    }
+    return out
+}
+
+/// How many events use running status — which is how much the file saved.
+pub fn running_status_count(data: bytes) -> i64 {
+    let file = parse(data) ?? MidiFile{ format: 0, division: 0, tracks: [] }
+    var total = 0
+    for track in file.tracks {
+        var last = ""
+        var last_channel = 0 - 1
+        for e in track.events {
+            if e.kind == last and e.channel == last_channel and
+            e.channel >= 0 {
+                total = total + 1
+            }
+            last = e.kind
+            last_channel = e.channel
+        }
+    }
+    return total
+}

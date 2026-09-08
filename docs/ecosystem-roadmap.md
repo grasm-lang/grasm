@@ -14,7 +14,7 @@ plan that discovers them 300 packages in.
 | | |
 |---|---|
 | Started | 78 |
-| Now | 330 |
+| Now | 335 |
 | Tier 1 target | 200 |
 | Tier 2 target | 500 |
 | Tier 3 target | 800 |
@@ -224,10 +224,10 @@ says where the data came from and under what licence, which is the condition.
 |---|---|---|
 | ~~Spatial~~ | ~~`convexhull` `kdtree` `rtree` `simplify` `triangulate`~~ — done | scipy, shapely, earcut |
 | ~~Graph algorithms II~~ | ~~`maxflow` `matching` `pagerank` `centrality` `spanning`~~ — done | networkx, scipy |
-| Numerical methods | `rootfind` `quadrature` `ode` `optimise` `autodiff` | scipy |
-| Fonts | `sfnt` `cmap` `glyf` `woff` `fontmetrics` | fontTools |
+| ~~Numerical methods~~ | ~~`rootfind` `quadrature` `ode` `optimise` `autodiff`~~ — done | scipy |
+| ~~Fonts~~ | ~~`sfnt` `cmap` `glyf` `woff` `fontmetrics`~~ — done | fontTools |
 | ~~Barcodes~~ | ~~`code128` `ean` `itf` `codabar` `code39`~~ — done | python-barcode |
-| Audio metadata | `id3` `flacmeta` `midi` `wavmeta` `loudness` | mutagen |
+| ~~Audio metadata~~ | ~~`id3` `flacmeta` `midi` `wavmeta` `loudness`~~ — done | mutagen, mido, pyloudnorm |
 | Images II | `gif` `ico` `jpegmeta` `resample` `bmpwrite` | Pillow |
 | Text encodings | `codepage` `shiftjis` `gb18030` `big5` `euckr` | Python codecs |
 | Compression II | `bzip2` `lzw` `huffman` `rangecoder` `deltacodec` | Python bz2, reference LZW |

@@ -1,0 +1,378 @@
+// Loudness by ITU-R BS.1770, which is why everything is the same volume now.
+//
+// Before 2011 the loud war was real: every record was mastered louder than
+// the last, because a louder track sounded better in an A/B comparison and
+// nothing measured it. BS.1770 defined a number that corresponds to how loud
+// something *sounds*, broadcasters were required to hit a target, and
+// streaming services followed. Every track on Spotify is normalised to this
+// measurement.
+//
+// ## Why peak measurement failed
+//
+// A peak meter says how close a signal comes to clipping, which is a
+// technical fact about the file and not about the listener. A heavily
+// compressed track and a dynamic one can have the same peak and differ by
+// fifteen decibels in how loud they sound. Measuring the *average energy*
+// gets closer, and BS.1770 adds two corrections that get it right.
+//
+// ## The K-weighting
+//
+// Two filters before the energy is measured: a high shelf that lifts the
+// treble by about four decibels, standing in for the way a head reflects
+// sound into the ear, and a high pass at 38 Hz, because energy below that is
+// felt rather than heard. Together they are "K-weighting", and they are why
+// a bass-heavy track no longer measures louder than it sounds.
+//
+// ## The gating, which is the subtle part
+//
+// Energy is measured over 400-millisecond blocks overlapping by three
+// quarters, and then blocks are **thrown away** twice. First anything below
+// -70 LUFS, which is silence. Then anything more than 10 LU below the average
+// of what survived — which removes the quiet passages.
+//
+// That second, relative gate is what makes the measurement match perception.
+// Without it a film with long silences measures far quieter than it sounds,
+// and the fix broadcasters used before gating existed was to normalise by
+// hand. It also means loudness is *not* linear: doubling a track's silence
+// does not change its measured loudness at all.
+//
+// ## The units
+//
+// LUFS is decibels relative to full scale, on the loudness scale — so -23
+// LUFS is the European broadcast target and -14 is roughly what streaming
+// uses. LU is the same scale as a difference. One LU is one decibel; the two
+// names exist so that an absolute measurement is never confused with a
+// relative one.
+//
+// Checked against `pyloudnorm`, which implements the same specification, on
+// tones and on multichannel signals.
+
+type Biquad = {
+    b0: f64,
+    b1: f64,
+    b2: f64,
+    a1: f64,
+    a2: f64,
+}
+
+type LoudnessError =
+    | TooShort(samples: i64, needed: i64)
+    | NoChannels()
+
+    /// The absolute gate: quieter than this is silence.
+pub fn absolute_gate() -> f64 {
+    return 0.0 - 70.0
+}
+
+/// The relative gate: this far below the ungated mean is a quiet passage.
+pub fn relative_gate() -> f64 {
+    return 0.0 - 10.0
+}
+
+/// The block length in seconds.
+pub fn block_seconds() -> f64 {
+    return 0.4
+}
+
+/// How much of each block the next one repeats.
+pub fn overlap() -> f64 {
+    return 0.75
+}
+
+/// The offset in the loudness formula, which comes from the specification's
+/// calibration against a reference signal.
+pub fn offset() -> f64 {
+    return 0.0 - 0.691
+}
+
+fn pi() -> f64 {
+    return 3.141592653589793
+}
+
+fn log10(x: f64) -> f64 {
+    return x.ln() / (10.0).ln()
+}
+
+fn power10(x: f64) -> f64 {
+    return (x * (10.0).ln()).exp()
+}
+
+/// A high shelf, by the audio EQ cookbook's formulas.
+///
+/// The same derivation `pyloudnorm` uses. The specification gives the
+/// coefficients for 48 kHz only, so anything else has to be derived — and two
+/// derivations that disagree in the last digit give measurements that differ
+/// in the second decimal, which matters when a delivery specification says
+/// "-23.0 plus or minus 0.5".
+pub fn high_shelf(gain_db: f64, q: f64, cutoff: f64, rate: f64) -> Biquad {
+    let a = power10(gain_db / 40.0)
+    let w0 = 2.0 * pi() * cutoff / rate
+    let alpha = w0.sin() / (2.0 * q)
+    let cos_w0 = w0.cos()
+    let root = a.sqrt()
+    let b0 = a * ((a + 1.0) + (a - 1.0) * cos_w0 + 2.0 * root * alpha)
+    let b1 = 0.0 - 2.0 * a * ((a - 1.0) + (a + 1.0) * cos_w0)
+    let b2 = a * ((a + 1.0) + (a - 1.0) * cos_w0 - 2.0 * root * alpha)
+    let a0 = (a + 1.0) - (a - 1.0) * cos_w0 + 2.0 * root * alpha
+    let a1 = 2.0 * ((a - 1.0) - (a + 1.0) * cos_w0)
+    let a2 = (a + 1.0) - (a - 1.0) * cos_w0 - 2.0 * root * alpha
+    return Biquad{ b0: b0 / a0, b1: b1 / a0, b2: b2 / a0, a1: a1 / a0,
+        a2: a2 / a0 }
+}
+
+pub fn high_pass(q: f64, cutoff: f64, rate: f64) -> Biquad {
+    let w0 = 2.0 * pi() * cutoff / rate
+    let alpha = w0.sin() / (2.0 * q)
+    let cos_w0 = w0.cos()
+    let b0 = (1.0 + cos_w0) / 2.0
+    let b1 = 0.0 - (1.0 + cos_w0)
+    let b2 = (1.0 + cos_w0) / 2.0
+    let a0 = 1.0 + alpha
+    let a1 = 0.0 - 2.0 * cos_w0
+    let a2 = 1.0 - alpha
+    return Biquad{ b0: b0 / a0, b1: b1 / a0, b2: b2 / a0, a1: a1 / a0,
+        a2: a2 / a0 }
+}
+
+/// The two K-weighting stages for a sample rate.
+pub fn k_weighting(rate: f64) -> [Biquad] {
+    return [high_shelf(4.0, 0.7071067811865475, 1500.0, rate),
+        high_pass(0.5, 38.0, rate)]
+}
+
+/// One biquad over a signal, starting from silence.
+pub fn filter_signal(f: Biquad, samples: [f64]) -> [f64] {
+    var out: [f64] = []
+    var x1 = 0.0
+    var x2 = 0.0
+    var y1 = 0.0
+    var y2 = 0.0
+    for x in samples {
+        let y = f.b0 * x + f.b1 * x1 + f.b2 * x2 - f.a1 * y1 - f.a2 * y2
+        out.push(y)
+        x2 = x1
+        x1 = x
+        y2 = y1
+        y1 = y
+    }
+    return out
+}
+
+/// K-weighting applied: the shelf, then the high pass.
+pub fn k_weight(samples: [f64], rate: f64) -> [f64] {
+    var out = samples
+    for stage in k_weighting(rate) {
+        out = filter_signal(stage, out)
+    }
+    return out
+}
+
+/// The weight each channel carries.
+///
+/// The surround channels count for 1.41 — about +1.5 dB — because sound
+/// arriving from behind is heard as louder than the same energy from in
+/// front. The LFE channel is not counted at all.
+pub fn channel_weight(index: i64) -> f64 {
+    if index >= 3 {
+        return 1.41
+    }
+    return 1.0
+}
+
+/// The mean square of each 400 ms block, per channel, after weighting.
+fn block_powers(channels: [[f64]], rate: f64) -> [[f64]] {
+    var weighted: [[f64]] = []
+    for c in channels {
+        weighted.push(k_weight(c, rate))
+    }
+    let block_length = (block_seconds() * rate).as_i64()
+    let step = (block_seconds() * (1.0 - overlap()) * rate).as_i64()
+    var out: [[f64]] = []
+    if weighted.len() == 0 or step <= 0 {
+        return out
+    }
+    let samples = weighted[0].len()
+    var start = 0
+    while start + block_length <= samples {
+        var row: [f64] = []
+        for c in weighted {
+            var total = 0.0
+            var i = start
+            while i < start + block_length {
+                total = total + c[i] * c[i]
+                i = i + 1
+            }
+            row.push(total / block_length.as_f64())
+        }
+        out.push(row)
+        start = start + step
+    }
+    return out
+}
+
+fn block_loudness(powers: [f64]) -> f64 {
+    var total = 0.0
+    var i = 0
+    while i < powers.len() {
+        total = total + channel_weight(i) * powers[i]
+        i = i + 1
+    }
+    if total <= 0.0 {
+        return 0.0 - 1000.0
+    }
+    return offset() + 10.0 * log10(total)
+}
+
+/// The integrated loudness of a signal, in LUFS.
+///
+/// `channels` is one list of samples per channel, each between -1 and 1. The
+/// signal must be at least one block long — 400 milliseconds — because there
+/// is nothing to average otherwise, and a shorter one is an error rather than
+/// a silence.
+pub fn integrated(channels: [[f64]], rate: f64) -> f64 ! LoudnessError {
+    if channels.len() == 0 {
+        fail(NoChannels())
+    }
+    let needed = (block_seconds() * rate).as_i64()
+    if channels[0].len() < needed {
+        fail(TooShort(channels[0].len(), needed))
+    }
+    let powers = block_powers(channels, rate)
+    if powers.len() == 0 {
+        fail(TooShort(channels[0].len(), needed))
+    }
+    // The absolute gate first: anything below -70 LUFS is silence.
+    var kept: [[f64]] = []
+    for row in powers {
+        if block_loudness(row) > absolute_gate() {
+            kept.push(row)
+        }
+    }
+    if kept.len() == 0 {
+        return 0.0 - 1000.0
+    }
+    // Then the relative one, measured against what survived the first.
+    let threshold = mean_loudness(kept) + relative_gate()
+    var final_blocks: [[f64]] = []
+    for row in kept {
+        if block_loudness(row) > threshold {
+            final_blocks.push(row)
+        }
+    }
+    if final_blocks.len() == 0 {
+        return 0.0 - 1000.0
+    }
+    return mean_loudness(final_blocks)
+}
+
+/// The loudness of the mean power of a set of blocks.
+///
+/// The mean is taken over *power* and then converted, not over the
+/// decibel values — averaging decibels is averaging logarithms and gives a
+/// number several LU out on anything with dynamics.
+fn mean_loudness(blocks: [[f64]]) -> f64 {
+    if blocks.len() == 0 {
+        return 0.0 - 1000.0
+    }
+    let channels = blocks[0].len()
+    var sums: [f64] = []
+    var c = 0
+    while c < channels {
+        var total = 0.0
+        for row in blocks {
+            total = total + row[c]
+        }
+        sums.push(total / blocks.len().as_f64())
+        c = c + 1
+    }
+    return block_loudness(sums)
+}
+
+/// The loudness of a single mono signal.
+pub fn integrated_mono(samples: [f64], rate: f64) -> f64 ! LoudnessError {
+    return try integrated([samples], rate)
+}
+
+/// The loudness of each block, for drawing a loudness graph.
+pub fn momentary(channels: [[f64]], rate: f64) -> [f64] {
+    var out: [f64] = []
+    for row in block_powers(channels, rate) {
+        out.push(block_loudness(row))
+    }
+    return out
+}
+
+/// The loudness range: how much the quiet and loud parts differ.
+///
+/// The tenth to ninety-fifth percentile of the block loudnesses, which is
+/// what EBU R128 calls LRA. A track with a range of two has been compressed
+/// flat; one with twenty has real dynamics, and the number is what a
+/// mastering engineer argues about.
+pub fn loudness_range(channels: [[f64]], rate: f64) -> f64 {
+    var values = momentary(channels, rate)
+    var kept: [f64] = []
+    for v in values {
+        if v > absolute_gate() {
+            kept.push(v)
+        }
+    }
+    if kept.len() < 2 {
+        return 0.0
+    }
+    kept.sort()
+    let low = kept[(kept.len().as_f64() * 0.1).as_i64()]
+    var high_at = (kept.len().as_f64() * 0.95).as_i64()
+    if high_at >= kept.len() {
+        high_at = kept.len() - 1
+    }
+    return kept[high_at] - low
+}
+
+/// The gain in decibels that would bring a signal to a target loudness.
+///
+/// What a normaliser applies. It is a straight subtraction because the scale
+/// is logarithmic, and applying it does not change the loudness range — which
+/// is the point: normalising is not compressing.
+pub fn gain_to_reach(current: f64, target: f64) -> f64 {
+    return target - current
+}
+
+/// The linear factor that gain corresponds to.
+pub fn gain_factor(decibels: f64) -> f64 {
+    return power10(decibels / 20.0)
+}
+
+/// The broadcast target in Europe, and roughly what streaming uses.
+pub fn broadcast_target() -> f64 {
+    return 0.0 - 23.0
+}
+
+pub fn streaming_target() -> f64 {
+    return 0.0 - 14.0
+}
+
+/// The true peak of a signal, as a sample peak.
+///
+/// Named honestly: a *true* peak needs the signal oversampled four times,
+/// because the analogue waveform between two samples can exceed both of them
+/// and clip a converter that the file itself never does. This is the sample
+/// peak, which is a lower bound, and a caller needing the real thing has to
+/// oversample first.
+pub fn sample_peak(channels: [[f64]]) -> f64 {
+    var peak = 0.0
+    for c in channels {
+        for x in c {
+            var v = x
+            if v < 0.0 {
+                v = 0.0 - v
+            }
+            if v > peak {
+                peak = v
+            }
+        }
+    }
+    if peak == 0.0 {
+        return 0.0 - 1000.0
+    }
+    return 20.0 * log10(peak)
+}
