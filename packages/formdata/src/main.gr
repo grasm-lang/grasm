@@ -1,0 +1,380 @@
+// multipart/form-data: the format every file upload on the web uses.
+//
+// A browser posting a form with a file in it sends this, and has since 1995.
+// It is MIME's multipart body with a few rules bolted on, and it is
+// specified across four documents that contradict each other in places —
+// RFC 2388 defined it, RFC 7578 replaced it, the HTML standard says what
+// browsers actually do, and browsers do something slightly different again.
+//
+// ## The boundary
+//
+// The parts are separated by a delimiter the *sender* chooses and announces
+// in the Content-Type header. It must not appear anywhere in the content,
+// which the sender guarantees by choosing something random and long — there
+// is no escaping mechanism at all. A sender that picks a boundary appearing
+// in a file it is uploading produces a body that parses into the wrong
+// number of parts and no error.
+//
+// The delimiter on the wire is `CRLF--boundary`, and the final one is
+// `CRLF--boundary--`. The leading CRLF belongs to the *delimiter*, not to the
+// part before it, which is why a part's content does not end with a newline
+// it never had.
+//
+// ## The filename that is not a filename
+//
+// A part carries `filename="..."`, and it is whatever the client sent. It may
+// contain a path, a null byte, `../`, or a name in a character set the server
+// has never heard of. Every path traversal vulnerability in every upload
+// handler ever written comes from using it as a path. It is a *label*.
+//
+// ## The encoding nobody can agree on
+//
+// A non-ASCII filename has no agreed representation. RFC 7578 says use UTF-8
+// directly; RFC 2231 says use an encoded-word; browsers do the first, some
+// old clients do the second, and a few send the raw bytes of whatever code
+// page the machine had. This reads all three, because the data does.
+//
+// ## What this is not
+//
+// Not a streaming parser. A real server must not hold a two-gigabyte upload
+// in memory, so it parses as bytes arrive and writes to disk as it goes.
+// This takes the whole body, which is right for a form and wrong for a file
+// server.
+//
+// Checked against Python's `email` package parsing the same bodies.
+
+type FormError =
+    | NoBoundary()
+    | Truncated(at: i64)
+    | NoFinalDelimiter()
+    | BadHeader(text: str)
+
+type FormPart = {
+    /// The `name` from the Content-Disposition header.
+    name: str,
+    /// The `filename`, or the empty string. A label, never a path.
+    filename: str,
+    content_type: str,
+    headers: [(str, str)],
+    body: bytes,
+}
+
+/// The boundary named in a Content-Type header.
+///
+/// May be quoted, and often is — a boundary containing a comma or a space has
+/// to be. A parser that takes everything after `boundary=` gets the closing
+/// quote as part of the delimiter and finds no parts at all.
+pub fn boundary_of(content_type: str) -> str {
+    let at = index_of(content_type.to_lower(), "boundary=")
+    if at < 0 {
+        return ""
+    }
+    var rest = content_type.substr(at + 9, content_type.len() - at - 9)
+    if rest.starts_with("\"") {
+        let close = index_of(rest.substr(1, rest.len() - 1), "\"")
+        if close < 0 {
+            return ""
+        }
+        return rest.substr(1, close)
+    }
+    let stop = index_of(rest, ";")
+    if stop >= 0 {
+        rest = rest.substr(0, stop)
+    }
+    return rest.trim()
+}
+
+fn index_of(text: str, needle: str) -> i64 {
+    return index_from(text, needle, 0)
+}
+
+fn index_from(text: str, needle: str, at: i64) -> i64 {
+    var i = at
+    while i + needle.len() <= text.len() {
+        if text.substr(i, needle.len()) == needle {
+            return i
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+fn find_bytes(data: bytes, needle: bytes, at: i64) -> i64 {
+    var i = at
+    while i + needle.len() <= data.len() {
+        var same = true
+        var k = 0
+        while k < needle.len() {
+            if data.at(i + k) != needle.at(k) {
+                same = false
+                k = needle.len()
+            } else {
+                k = k + 1
+            }
+        }
+        if same {
+            return i
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+fn slice(data: bytes, at: i64, length: i64) -> bytes {
+    var out: [i64] = []
+    var i = 0
+    while i < length and at + i < data.len() {
+        out.push(data.at(at + i))
+        i = i + 1
+    }
+    return bytes_of(out)
+}
+
+/// A body split into parts.
+pub fn parse(body: bytes, boundary: str) -> [FormPart] ! FormError {
+    if boundary == "" {
+        fail(NoBoundary())
+    }
+    let delimiter = ("--" + boundary).to_bytes()
+    var out: [FormPart] = []
+    // The first delimiter has no leading CRLF, because there is nothing
+    // before it. Every later one does, and that CRLF belongs to the
+    // delimiter rather than to the part — which is why a part's content does
+    // not end with a newline it never had.
+    var at = find_bytes(body, delimiter, 0)
+    if at < 0 {
+        fail(NoBoundary())
+    }
+    at = at + delimiter.len()
+    var going = true
+    while going {
+        if at + 1 >= body.len() {
+            fail(NoFinalDelimiter())
+        }
+        if body.at(at) == 45 and body.at(at + 1) == 45 {
+            return out
+        }
+        at = skip_line_end(body, at)
+        let next = find_bytes(body, ("\r\n--" + boundary).to_bytes(), at)
+        if next < 0 {
+            fail(NoFinalDelimiter())
+        }
+        out.push(try part_of(slice(body, at, next - at)))
+        at = next + boundary.len() + 4
+    }
+    return out
+}
+
+fn skip_line_end(data: bytes, at: i64) -> i64 {
+    var i = at
+    if i < data.len() and data.at(i) == 13 {
+        i = i + 1
+    }
+    if i < data.len() and data.at(i) == 10 {
+        i = i + 1
+    }
+    return i
+}
+
+fn part_of(chunk: bytes) -> FormPart ! FormError {
+    let split = find_bytes(chunk, "\r\n\r\n".to_bytes(), 0)
+    if split < 0 {
+        fail(Truncated(chunk.len()))
+    }
+    let head = slice(chunk, 0, split).to_str()
+    var out = FormPart{ name: "", filename: "", content_type: "",
+        headers: [], body: slice(chunk, split + 4, chunk.len() - split - 4) }
+    for line in head.split("\r\n") {
+        if line.trim() == "" {
+            continue
+        }
+        let colon = index_of(line, ":")
+        if colon < 0 {
+            fail(BadHeader(line))
+        }
+        let key = line.substr(0, colon).trim()
+        let value = line.substr(colon + 1, line.len() - colon - 1).trim()
+        out.headers.push((key, value))
+        if key.to_lower() == "content-disposition" {
+            out.name = parameter(value, "name")
+            out.filename = parameter(value, "filename")
+        }
+        if key.to_lower() == "content-type" {
+            out.content_type = value
+        }
+    }
+    return out
+}
+
+/// A parameter's value from a header, quoted or not.
+///
+/// Also handles RFC 2231's `name*=UTF-8''...` form, because old clients send
+/// it and the data is what it is.
+pub fn parameter(header: str, name: str) -> str {
+    let extended = index_of(header, name + "*=")
+    if extended >= 0 {
+        return decode_extended(after(header, extended + name.len() + 2))
+    }
+    let at = index_of(header, name + "=")
+    if at < 0 {
+        return ""
+    }
+    var rest = after(header, at + name.len() + 1)
+    if rest.starts_with("\"") {
+        let close = index_of(rest.substr(1, rest.len() - 1), "\"")
+        if close < 0 {
+            return ""
+        }
+        return rest.substr(1, close)
+    }
+    let stop = index_of(rest, ";")
+    if stop >= 0 {
+        rest = rest.substr(0, stop)
+    }
+    return rest.trim()
+}
+
+fn after(text: str, at: i64) -> str {
+    if at >= text.len() {
+        return ""
+    }
+    return text.substr(at, text.len() - at)
+}
+
+fn decode_extended(text: str) -> str {
+    // `UTF-8''name%20here`: a charset, a language, and percent-encoding.
+    var rest = text
+    let stop = index_of(rest, ";")
+    if stop >= 0 {
+        rest = rest.substr(0, stop)
+    }
+    let first = index_of(rest, "'")
+    if first < 0 {
+        return percent_decode(rest)
+    }
+    let second = index_of(rest.substr(first + 1, rest.len() - first - 1), "'")
+    if second < 0 {
+        return percent_decode(rest)
+    }
+    return percent_decode(after(rest, first + second + 2))
+}
+
+/// Percent-encoding undone.
+pub fn percent_decode(text: str) -> str {
+    var out: [i64] = []
+    let codes = text.codes()
+    var i = 0
+    while i < codes.len() {
+        if codes[i] == 37 and i + 2 < codes.len() {
+            let hex = codes[i + 1].to_char() + codes[i + 2].to_char()
+            out.push(hex.parse_int_base(16) ?? 63)
+            i = i + 3
+            continue
+        }
+        out.push(codes[i])
+        i = i + 1
+    }
+    return bytes_of(out).to_str()
+}
+
+/// A part by name, or an empty one.
+pub fn part_named(parts: [FormPart], name: str) -> FormPart {
+    for part in parts {
+        if part.name == name {
+            return part
+        }
+    }
+    return FormPart{ name: "", filename: "", content_type: "", headers: [],
+        body: "".to_bytes() }
+}
+
+/// Whether a part is a file rather than a plain field.
+///
+/// A filename being present is what says so. An empty filename means the
+/// user submitted a file input with nothing chosen, which browsers send as a
+/// part with an empty filename and zero bytes — not as nothing at all.
+pub fn is_file(part: FormPart) -> bool {
+    for header in part.headers {
+        if header.0.to_lower() == "content-disposition" and
+        index_of(header.1, "filename") >= 0 {
+            return true
+        }
+    }
+    return false
+}
+
+/// The parts that are files.
+pub fn files(parts: [FormPart]) -> [FormPart] {
+    var out: [FormPart] = []
+    for part in parts {
+        if is_file(part) {
+            out.push(part)
+        }
+    }
+    return out
+}
+
+/// Every value for a name, because a form may repeat one.
+///
+/// Checkboxes do this, and a handler taking only the first silently loses
+/// every box but one.
+pub fn values_for(parts: [FormPart], name: str) -> [str] {
+    var out: [str] = []
+    for part in parts {
+        if part.name == name {
+            out.push(part.body.to_str())
+        }
+    }
+    return out
+}
+
+/// A boundary that cannot appear in the content, from a counter.
+///
+/// There is no escaping in this format, so the only defence is a delimiter
+/// long enough and odd enough that it does not occur. Browsers use about
+/// thirty random characters; this takes a caller-supplied token so that the
+/// output is reproducible.
+pub fn boundary_from(token: str) -> str {
+    return "----GrasmFormBoundary" + token
+}
+
+/// A body built from parts.
+pub fn build(parts: [FormPart], boundary: str) -> bytes {
+    var out: [i64] = []
+    for part in parts {
+        push_str(out, "--" + boundary + "\r\n")
+        push_str(out, "Content-Disposition: form-data; name=\"" +
+            part.name + "\"")
+        if part.filename != "" {
+            push_str(out, "; filename=\"" + part.filename + "\"")
+        }
+        push_str(out, "\r\n")
+        if part.content_type != "" {
+            push_str(out, "Content-Type: " + part.content_type + "\r\n")
+        }
+        push_str(out, "\r\n")
+        var i = 0
+        while i < part.body.len() {
+            out.push(part.body.at(i))
+            i = i + 1
+        }
+        push_str(out, "\r\n")
+    }
+    push_str(out, "--" + boundary + "--\r\n")
+    return bytes_of(out)
+}
+
+fn push_str(inout out: [i64], text: str) {
+    let raw = text.to_bytes()
+    var i = 0
+    while i < raw.len() {
+        out.push(raw.at(i))
+        i = i + 1
+    }
+}
+
+/// Whether a boundary appears in a body, which is the failure the format
+/// cannot detect for itself.
+pub fn boundary_collides(body: bytes, boundary: str) -> bool {
+    return find_bytes(body, ("--" + boundary).to_bytes(), 0) >= 0
+}

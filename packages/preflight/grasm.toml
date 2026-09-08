@@ -1,0 +1,6 @@
+[package]
+name = "preflight"
+version = "1.0.0"
+
+# Decides a CORS request. Opens no socket.
+capabilities = []

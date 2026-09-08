@@ -1,0 +1,24 @@
+[package]
+name = "web3_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.formdata]
+path = "../formdata"
+version = "^1.0.0"
+
+[dependencies.csp]
+path = "../csp"
+version = "^1.0.0"
+
+[dependencies.hsts]
+path = "../hsts"
+version = "^1.0.0"
+
+[dependencies.preflight]
+path = "../preflight"
+version = "^1.0.0"
+
+[dependencies.webfinger]
+path = "../webfinger"
+version = "^1.0.0"

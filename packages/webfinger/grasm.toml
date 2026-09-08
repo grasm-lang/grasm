@@ -1,0 +1,6 @@
+[package]
+name = "webfinger"
+version = "1.0.0"
+
+# Builds and reads a JRD document. Opens no socket.
+capabilities = []

@@ -14,7 +14,7 @@ plan that discovers them 300 packages in.
 | | |
 |---|---|
 | Started | 78 |
-| Now | 380 |
+| Now | 385 |
 | Tier 1 target | 200 |
 | Tier 2 target | 500 |
 | Tier 3 target | 800 |
@@ -239,7 +239,7 @@ says where the data came from and under what licence, which is the condition.
 | Statistics III | `bootstrap` `anova` `survival` `timeseries` `changepoint` | scipy, statsmodels |
 | Machine learning basics | `kmeans` `naivebayes` `decisiontree` `knn` `mlmetrics` | scikit-learn |
 | Security III | `passwordpolicy` `entropy` `secretscan` `keyderive` `saltedhash` | zxcvbn, gitleaks rules |
-| Web III | `formdata` `csp` `hsts` `preflight` `webfinger` | the specifications |
+| ~~Web III~~ | ~~`formdata` `csp` `hsts` `preflight` `webfinger`~~ | RFC 6797's own ABNF, Python's `email`, `content-security-policy`, Flask-Cors, urllib |
 | Serialisation IV | `flatbuffers` `capnp` `ubjson` `smile` `amf` | the reference encoders |
 | ~~Geospatial II~~ | ~~`mgrs` `utm` `gpx` `kml` `geodesic`~~ | pyproj, geographiclib, the Python `mgrs` package, gpxpy |
 

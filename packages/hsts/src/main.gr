@@ -1,0 +1,308 @@
+// Strict-Transport-Security: the header you cannot take back.
+//
+// HSTS tells a browser to refuse plain HTTP to a host for a period, and to
+// refuse it *before* making the request — so the redirect an attacker could
+// intercept never happens. It closes the one gap TLS leaves open: the first
+// request, typed without a scheme, that goes out over HTTP and can be
+// answered by anybody on the path.
+//
+// ## The bootstrap problem it does not solve
+//
+// A browser learns the policy from a response it received over HTTPS. So the
+// very first visit is still unprotected, and an attacker present for that one
+// request wins. Preloading is the answer: a list compiled into the browser
+// itself, so the policy is known before the first request.
+//
+// ## Which is why `preload` is a one-way door
+//
+// Submitting a host to the preload list puts it in browsers shipped for
+// years afterwards. Removal takes months and reaches only users who update.
+// A host that preloads and then finds a subdomain that cannot do TLS —
+// an appliance, a legacy mail host, an internal tool — has broken it for
+// everyone until browsers ship the removal.
+//
+// `includeSubDomains` is the same trap without the list: it applies to every
+// subdomain that exists now or ever will, for the whole of `max-age`.
+//
+// ## The max-age that is a mistake
+//
+// The header is honoured from the last response that carried it, so
+// `max-age=31536000` means a year *from now*, refreshed on every visit. A
+// site testing HSTS should start at a few minutes. Setting a year and then
+// discovering a problem means every visitor is locked out of the plain-HTTP
+// fallback for a year, and there is nothing to be served over HTTP that could
+// tell them otherwise.
+//
+// `max-age=0` is the retraction, and it only reaches browsers that come back.
+
+type HstsError =
+    | NoMaxAge()
+    | BadMaxAge(text: str)
+    | Duplicate(name: str)
+
+type HstsPolicy = {
+    /// Seconds the policy holds for, counted from the response.
+    max_age: i64,
+    include_subdomains: bool,
+    preload: bool,
+}
+
+/// A header parsed.
+///
+/// A repeated directive makes the whole header invalid rather than taking the
+/// first or the last — which is deliberate: an injected duplicate must not be
+/// able to change a security policy quietly.
+pub fn parse(header: str) -> HstsPolicy ! HstsError {
+    var out = HstsPolicy{ max_age: 0 - 1, include_subdomains: false,
+        preload: false }
+    var seen: [str] = []
+    for directive in try split_directives(header) {
+        let name = directive.0.to_lower()
+        let value = directive.1
+        // Rule 2 of section 6.1 is not limited to the directives this
+        // package understands: any name written twice invalidates the
+        // header. Checking only the known three would let an injected
+        // `report-uri` pair through a header a browser throws away.
+        for earlier in seen {
+            if earlier == name {
+                fail(Duplicate(directive.0))
+            }
+        }
+        seen.push(name)
+        if name == "max-age" {
+            out.max_age = try seconds_of(value)
+        } else if name == "includesubdomains" {
+            out.include_subdomains = true
+        } else if name == "preload" {
+            out.preload = true
+        }
+        // An unknown directive is ignored, which is what lets the header be
+        // extended without breaking old browsers. It still has to parse.
+    }
+    if not has_name(seen, "max-age") {
+        fail(NoMaxAge())
+    }
+    return out
+}
+
+fn has_name(names: [str], wanted: str) -> bool {
+    for name in names {
+        if name == wanted {
+            return true
+        }
+    }
+    return false
+}
+
+/// The directives of a field value, as (name, value), value empty when the
+/// directive was written without one.
+///
+/// The split cannot be a plain `;` split: a `;` inside a quoted value is
+/// part of the value, so `preload="a;max-age=0"` is one directive and not
+/// two. Reading it as two is how a value smuggles a directive past a
+/// checker, and the whole header must be refused when a quote never closes.
+fn split_directives(header: str) -> [(str, str)] ! HstsError {
+    var out: [(str, str)] = []
+    let codes = header.codes()
+    var i = 0
+    while i <= codes.len() {
+        if i == codes.len() or codes[i] == 59 {
+            i = i + 1
+            continue
+        }
+        var name = ""
+        while i < codes.len() and codes[i] != 59 and codes[i] != 61 {
+            name = name + codes[i].to_char()
+            i = i + 1
+        }
+        name = name.trim()
+        if name == "" and (i >= codes.len() or codes[i] == 59) {
+            // `a=1; ;b=2` has an empty directive in the middle, which the
+            // grammar's `*( ";" [ directive ] )` allows.
+            continue
+        }
+        var value = ""
+        if i < codes.len() and codes[i] == 61 {
+            i = i + 1
+            let read = try read_value(codes, i)
+            value = read.0
+            i = read.1
+        }
+        if name == "" {
+            // `;=1` has a value and no name, which no production allows.
+            fail(BadMaxAge(header))
+        }
+        if not is_token(name) {
+            fail(BadMaxAge(name))
+        }
+        out.push((name, value))
+    }
+    return out
+}
+
+/// One directive-value: a token, or a quoted-string with its quotes kept.
+fn read_value(codes: [i64], from: i64) -> (str, i64) ! HstsError {
+    var i = from
+    while i < codes.len() and (codes[i] == 32 or codes[i] == 9) {
+        i = i + 1
+    }
+    if i < codes.len() and codes[i] == 34 {
+        var value = "\""
+        i = i + 1
+        while i < codes.len() {
+            if codes[i] == 92 and i + 1 < codes.len() {
+                value = value + codes[i].to_char() + codes[i + 1].to_char()
+                i = i + 2
+                continue
+            }
+            if codes[i] == 34 {
+                value = value + "\""
+                i = i + 1
+                // Only whitespace may follow a closing quote, up to the
+                // next `;`.
+                while i < codes.len() and (codes[i] == 32 or codes[i] == 9) {
+                    i = i + 1
+                }
+                if i < codes.len() and codes[i] != 59 {
+                    fail(BadMaxAge(value))
+                }
+                return (value, i)
+            }
+            value = value + codes[i].to_char()
+            i = i + 1
+        }
+        // The quote never closed, so the rest of the header is one value
+        // that does not parse, and the header goes in the bin.
+        fail(BadMaxAge(value))
+    }
+    var value = ""
+    while i < codes.len() and codes[i] != 59 {
+        value = value + codes[i].to_char()
+        i = i + 1
+    }
+    value = value.trim()
+    if value != "" and not is_token(value) {
+        fail(BadMaxAge(value))
+    }
+    return (value, i)
+}
+
+/// RFC 2616's token: any character but the controls and the separators.
+fn is_token(text: str) -> bool {
+    if text == "" {
+        return false
+    }
+    for code in text.codes() {
+        if code <= 32 or code >= 127 {
+            return false
+        }
+        if code == 40 or code == 41 or code == 60 or code == 62 or
+        code == 64 or code == 44 or code == 59 or code == 58 or
+        code == 92 or code == 34 or code == 47 or code == 91 or
+        code == 93 or code == 63 or code == 61 or code == 123 or
+        code == 125 {
+            return false
+        }
+    }
+    return true
+}
+
+fn index_of(text: str, needle: str) -> i64 {
+    var i = 0
+    while i + needle.len() <= text.len() {
+        if text.substr(i, needle.len()) == needle {
+            return i
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+fn seconds_of(text: str) -> i64 ! HstsError {
+    var value = text
+    if value.starts_with("\"") and value.ends_with("\"") and
+    value.len() >= 2 {
+        value = value.substr(1, value.len() - 2)
+    }
+    if value == "" {
+        fail(BadMaxAge(text))
+    }
+    for code in value.codes() {
+        if code < 48 or code > 57 {
+            fail(BadMaxAge(text))
+        }
+    }
+    return value.parse_int() ?? 0 - 1
+}
+
+/// A policy written as a header.
+pub fn build(policy: HstsPolicy) -> str {
+    var out = "max-age={policy.max_age}"
+    if policy.include_subdomains {
+        out = out + "; includeSubDomains"
+    }
+    if policy.preload {
+        out = out + "; preload"
+    }
+    return out
+}
+
+/// Whether a policy meets the preload list's own requirements.
+///
+/// A year at least, every subdomain, the preload token, and — not checkable
+/// from the header — the site must redirect HTTP to HTTPS on the same host
+/// first. Sites are rejected for that last one more than for anything else.
+pub fn is_preloadable(policy: HstsPolicy) -> bool {
+    return policy.max_age >= 31536000 and policy.include_subdomains and
+    policy.preload
+}
+
+/// The minimum `max-age` the preload list requires.
+pub fn preload_minimum() -> i64 {
+    return 31536000
+}
+
+/// Whether a policy applies to a subdomain of the host that sent it.
+pub fn covers_subdomains(policy: HstsPolicy) -> bool {
+    return policy.include_subdomains and policy.max_age > 0
+}
+
+/// Whether a header retracts the policy.
+///
+/// `max-age=0`, and it reaches only browsers that visit again over HTTPS. A
+/// host that has locked itself out cannot serve the retraction over HTTP,
+/// because the browser will not make the request.
+pub fn is_retraction(policy: HstsPolicy) -> bool {
+    return policy.max_age == 0
+}
+
+/// When a policy expires, given when it was received.
+pub fn expires_at(policy: HstsPolicy, received: i64) -> i64 {
+    return received + policy.max_age
+}
+
+/// What is risky about a policy, in the order it matters.
+pub fn cautions(policy: HstsPolicy) -> [str] {
+    var out: [str] = []
+    if policy.preload and not policy.include_subdomains {
+        out.push("preload without includeSubDomains is rejected by the list")
+    }
+    if policy.preload {
+        out.push("preload reaches browsers shipped for years and takes " +
+            "months to undo")
+    }
+    if policy.include_subdomains and policy.max_age >= 31536000 {
+        out.push("a year of includeSubDomains applies to subdomains that " +
+            "do not exist yet")
+    }
+    if policy.max_age > 0 and policy.max_age < 300 {
+        out.push("a max-age under five minutes protects almost nobody")
+    }
+    return out
+}
+
+/// A policy safe to deploy while testing: minutes, this host only.
+pub fn testing_policy() -> HstsPolicy {
+    return HstsPolicy{ max_age: 300, include_subdomains: false,
+        preload: false }
+}

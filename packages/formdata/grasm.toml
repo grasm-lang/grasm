@@ -1,0 +1,6 @@
+[package]
+name = "formdata"
+version = "1.0.0"
+
+# Parses and builds a request body. Opens nothing.
+capabilities = []

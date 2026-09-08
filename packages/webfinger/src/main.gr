@@ -1,0 +1,364 @@
+// WebFinger: how the fediverse finds `@alice@example.social`.
+//
+// An account name that looks like an email address is not one. WebFinger is
+// the protocol that turns `acct:alice@example.social` into a set of links —
+// the ActivityPub actor document, the profile page, the avatar — by asking
+// the host in the address a single question over HTTPS.
+//
+// It is 2013's answer to a problem from 2005, it was nearly forgotten, and
+// then Mastodon made it load-bearing for millions of accounts. Every mention
+// of a remote user in the fediverse starts with one of these lookups.
+//
+// ## The `acct:` scheme, and why it is not `mailto:`
+//
+// `acct:alice@example.social` means "the account alice at example.social".
+// It looks like an email address and is deliberately a different scheme,
+// because the account may have no mailbox and the mailbox may belong to
+// somebody else. Software that treats them as interchangeable sends mail to
+// people who never had an address.
+//
+// ## The query is fixed and the answer is JRD
+//
+// `GET /.well-known/webfinger?resource=acct:alice@example.social`, and the
+// response is a JSON Resource Descriptor: a subject, some aliases, and a list
+// of links each with a relation and a href or a template.
+//
+// ## The redirect that must be followed and the one that must not
+//
+// The host in the address is the authority. A response from a *different*
+// host, reached by a redirect, is still authoritative for the original
+// address — which is how a host delegates to a service. But the initial
+// request must be HTTPS and must go to the host in the address, or anybody
+// can answer for anybody.
+//
+// ## The relation that matters
+//
+// `self` with type `application/activity+json` is the ActivityPub actor.
+// Everything else — `http://webfinger.net/rel/profile-page`, the avatar, the
+// OStatus subscribe template — is decoration. A client that takes the first
+// `self` link without checking the type follows an HTML page and fails.
+
+type FingerError =
+    | NoSubject()
+    | BadResource(text: str)
+    | NoSuchLink(relation: str)
+
+type FingerLink = {
+    relation: str,
+    /// The media type, which is what tells two `self` links apart.
+    media_type: str,
+    href: str,
+    /// A URI template with `{uri}` in it, for a link that takes a parameter.
+    template: str,
+    titles: [(str, str)],
+    properties: [(str, str)],
+}
+
+type Descriptor = {
+    subject: str,
+    aliases: [str],
+    properties: [(str, str)],
+    links: [FingerLink],
+}
+
+/// The account part of an `acct:` resource, as (user, host).
+pub fn split_account(resource: str) -> (str, str) ! FingerError {
+    var rest = resource
+    if rest.starts_with("acct:") {
+        rest = rest.substr(5, rest.len() - 5)
+    } else if scheme_length(rest) > 0 {
+        // Some other scheme, and `mailto:alice@example.social` is the one
+        // that matters: it is a mailbox, not an account, and treating the
+        // two as interchangeable is the mistake `acct:` exists to prevent.
+        fail(BadResource(resource))
+    }
+    if rest.starts_with("@") {
+        rest = rest.substr(1, rest.len() - 1)
+    }
+    // RFC 7565's userpart cannot hold a bare `@`, so an address with two of
+    // them is ambiguous rather than merely odd: reading
+    // `acct:victim@good.example@attacker.example` as a user at the last host
+    // sends the lookup to the attacker, and reading it as a user at the
+    // first sends it to a host with a `@` in its name. Refuse instead.
+    if count_of(rest, "@") != 1 {
+        fail(BadResource(resource))
+    }
+    let at = last_index_of(rest, "@")
+    if at <= 0 or at == rest.len() - 1 {
+        fail(BadResource(resource))
+    }
+    return (rest.substr(0, at), rest.substr(at + 1, rest.len() - at - 1))
+}
+
+/// The length of a leading `scheme:`, or zero if there is none.
+///
+/// A scheme is letters, digits, `+`, `-` and `.` after a first letter, and
+/// it ends at the first `:`. A `:` that comes after an `@` is part of the
+/// address, not a scheme, which is why the search stops there.
+fn scheme_length(text: str) -> i64 {
+    var i = 0
+    for code in text.codes() {
+        if code == 58 {
+            if i == 0 {
+                return 0
+            }
+            return i + 1
+        }
+        let letter = (code >= 65 and code <= 90) or (code >= 97 and code <= 122)
+        if i == 0 and not letter {
+            return 0
+        }
+        let extra = code == 43 or code == 45 or code == 46
+        if not (letter or (code >= 48 and code <= 57) or extra) {
+            return 0
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+fn count_of(text: str, needle: str) -> i64 {
+    var found = 0
+    var i = 0
+    while i + needle.len() <= text.len() {
+        if text.substr(i, needle.len()) == needle {
+            found = found + 1
+        }
+        i = i + 1
+    }
+    return found
+}
+
+fn last_index_of(text: str, needle: str) -> i64 {
+    var found = 0 - 1
+    var i = 0
+    while i + needle.len() <= text.len() {
+        if text.substr(i, needle.len()) == needle {
+            found = i
+        }
+        i = i + 1
+    }
+    return found
+}
+
+/// The `acct:` URI for a user and host.
+pub fn account_uri(user: str, host: str) -> str {
+    return "acct:" + user + "@" + host
+}
+
+/// The path and query to request, without the scheme or host.
+pub fn query_path(resource: str) -> str {
+    return "/.well-known/webfinger?resource=" + percent_encode(resource)
+}
+
+/// The host to ask, which is the host in the address and no other.
+pub fn authority_for(resource: str) -> str ! FingerError {
+    return (try split_account(resource)).1
+}
+
+/// Percent-encoding for a query parameter.
+///
+/// `:` and `@` are legal in a query and are encoded anyway, because enough
+/// servers mishandle them raw that every client encodes them.
+pub fn percent_encode(text: str) -> str {
+    // The encoding is defined over octets, not characters: a codepoint
+    // above 127 becomes one escape per UTF-8 byte, so `\u{e9}` is `%C3%A9`
+    // and not `%E9`. Encoding the codepoint instead produces a string that
+    // some servers decode as latin-1 and most reject.
+    let octets = text.to_bytes()
+    var out = ""
+    var i = 0
+    while i < octets.len() {
+        let octet = octets.at(i)
+        if is_unreserved(octet) {
+            out = out + octet.to_char()
+        } else {
+            out = out + "%" + hex_byte(octet)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn is_unreserved(code: i64) -> bool {
+    return (code >= 65 and code <= 90) or (code >= 97 and code <= 122) or
+    (code >= 48 and code <= 57) or code == 45 or code == 46 or
+    code == 95 or code == 126
+}
+
+fn hex_byte(code: i64) -> str {
+    let digits = "0123456789ABCDEF"
+    return digits.substr(code / 16 % 16, 1) + digits.substr(code % 16, 1)
+}
+
+/// The first link with a relation, or an error.
+pub fn link_for(document: Descriptor, relation: str) -> FingerLink ! FingerError {
+    for link in document.links {
+        if link.relation == relation {
+            return link
+        }
+    }
+    fail(NoSuchLink(relation))
+}
+
+/// The first link with a relation *and* a media type.
+///
+/// Which is what an ActivityPub client needs: a profile page and an actor
+/// document are both `self` links, and taking the first one gets HTML about
+/// half the time.
+pub fn link_of_type(document: Descriptor, relation: str,
+    media_type: str) -> FingerLink ! FingerError {
+    for link in document.links {
+        if link.relation == relation and link.media_type == media_type {
+            return link
+        }
+    }
+    fail(NoSuchLink(relation))
+}
+
+/// The ActivityPub actor URL, which is the link everything else needs.
+pub fn actor_url(document: Descriptor) -> str {
+    match link_of_type(document, "self", "application/activity+json") {
+        Ok(link) -> return link.href
+        Err(_e) -> {
+            match link_of_type(document, "self",
+                "application/ld+json; profile=\"" +
+                "https://www.w3.org/ns/activitystreams\"") {
+                Ok(link) -> return link.href
+                Err(_f) -> return ""
+            }
+        }
+    }
+}
+
+/// The human-readable profile page.
+pub fn profile_url(document: Descriptor) -> str {
+    match link_for(document, "http://webfinger.net/rel/profile-page") {
+        Ok(link) -> return link.href
+        Err(_e) -> return ""
+    }
+}
+
+/// A template filled in with a URI.
+///
+/// The OStatus subscribe link is one of these: the template says where to
+/// send a user who wants to follow an account on another server, and the
+/// account's URI goes in the hole.
+pub fn expand(template: str, uri: str) -> str {
+    return replace_all(template, "\{uri}", percent_encode(uri))
+}
+
+fn replace_all(text: str, needle: str, with_text: str) -> str {
+    var out = ""
+    var i = 0
+    while i < text.len() {
+        if i + needle.len() <= text.len() and
+        text.substr(i, needle.len()) == needle {
+            out = out + with_text
+            i = i + needle.len()
+            continue
+        }
+        out = out + text.substr(i, 1)
+        i = i + 1
+    }
+    return out
+}
+
+/// Whether a document is well formed enough to use.
+pub fn is_usable(document: Descriptor) -> bool {
+    return document.subject != "" and document.links.len() > 0
+}
+
+/// Whether an alias names the same account as the subject.
+pub fn has_alias(document: Descriptor, uri: str) -> bool {
+    for alias in document.aliases {
+        if alias == uri {
+            return true
+        }
+    }
+    return false
+}
+
+/// A descriptor written as JRD.
+///
+/// Hand-written rather than through a JSON library, because the shape is
+/// fixed and small — and because the escaping is the only interesting part,
+/// which is worth having in one place.
+pub fn to_json(document: Descriptor) -> str {
+    var out = "\{\n  \"subject\": " + quote(document.subject)
+    if document.aliases.len() > 0 {
+        out = out + ",\n  \"aliases\": [\n"
+        var parts: [str] = []
+        for alias in document.aliases {
+            parts.push("    " + quote(alias))
+        }
+        out = out + parts.join(",\n") + "\n  ]"
+    }
+    if document.links.len() > 0 {
+        out = out + ",\n  \"links\": [\n"
+        var parts: [str] = []
+        for link in document.links {
+            parts.push(link_json(link))
+        }
+        out = out + parts.join(",\n") + "\n  ]"
+    }
+    return out + "\n}\n"
+}
+
+fn link_json(link: FingerLink) -> str {
+    var fields: [str] = ["      \"rel\": " + quote(link.relation)]
+    if link.media_type != "" {
+        fields.push("      \"type\": " + quote(link.media_type))
+    }
+    if link.href != "" {
+        fields.push("      \"href\": " + quote(link.href))
+    }
+    if link.template != "" {
+        fields.push("      \"template\": " + quote(link.template))
+    }
+    return "    \{\n" + fields.join(",\n") + "\n    }"
+}
+
+fn quote(text: str) -> str {
+    var out = "\""
+    for code in text.codes() {
+        if code == 34 {
+            out = out + "\\\""
+        } else if code == 92 {
+            out = out + "\\\\"
+        } else if code == 10 {
+            out = out + "\\n"
+        } else if code == 13 {
+            out = out + "\\r"
+        } else if code == 9 {
+            out = out + "\\t"
+        } else if code < 32 {
+            out = out + "\\u00" + hex_byte(code).to_lower()
+        } else {
+            out = out + code.to_char()
+        }
+    }
+    return out + "\""
+}
+
+/// The media type a WebFinger response must carry.
+pub fn content_type() -> str {
+    return "application/jrd+json"
+}
+
+/// A descriptor for an account, with the links a fediverse server publishes.
+pub fn actor_descriptor(user: str, host: str, actor: str,
+    profile: str) -> Descriptor {
+    let uri = account_uri(user, host)
+    return Descriptor{ subject: uri, aliases: [profile, actor],
+        properties: [], links: [
+            FingerLink{ relation: "http://webfinger.net/rel/profile-page",
+                media_type: "text/html", href: profile, template: "",
+                titles: [], properties: [] },
+            FingerLink{ relation: "self", media_type: "application/activity+json",
+                href: actor, template: "", titles: [], properties: [] },
+            FingerLink{ relation: "http://ostatus.org/schema/1.0/subscribe",
+                media_type: "", href: "",
+                template: "https://" + host + "/authorize_interaction?uri=\{uri}",
+                titles: [], properties: [] }] }
+}

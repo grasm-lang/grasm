@@ -1,0 +1,272 @@
+// CORS: what the browser is actually asking, and what it does with the
+// answer.
+//
+// The same-origin policy stops a page on one site reading a response from
+// another. CORS is the server's way of saying "this one may". The part that
+// confuses everybody is *where* the enforcement happens: entirely in the
+// browser, after the response has arrived. The request was made. The server
+// did the work. The browser then refuses to hand the bytes to the script.
+//
+// So CORS is not access control. A server that returns secrets to any
+// requester and no CORS headers is still leaking them to `curl`, to a proxy,
+// and to any non-browser client. CORS protects the *user's* credentials from
+// a hostile page, not the server's data from a hostile client.
+//
+// ## Simple requests are not preflighted, and that is a compatibility scar
+//
+// A GET, HEAD, or POST with an ordinary content type is sent straight out
+// with no permission asked, because HTML forms could always do that and the
+// web could not be broken. The consequence: a hostile page can *make* those
+// requests with the user's cookies, it just cannot read the answer. Which is
+// why CSRF is a separate problem CORS does not solve.
+//
+// Add a custom header, or a JSON content type, and the browser asks first —
+// an OPTIONS request naming the method and headers it wants to use.
+//
+// ## The wildcard that stops working the moment it matters
+//
+// `Access-Control-Allow-Origin: *` is incompatible with credentials. A
+// request with cookies requires the header to name the origin exactly, and
+// `Access-Control-Allow-Credentials: true` alongside. So the moment a
+// developer adds `credentials: 'include'`, the wildcard that worked stops
+// working, and the fix is to echo the Origin — which means validating it,
+// which is where the bugs live.
+//
+// Echoing `Origin` without checking it is equivalent to no policy at all, and
+// it is the single most common CORS misconfiguration. A prefix check —
+// `origin.startsWith("https://example.com")` — is bypassed by
+// `https://example.com.attacker.net`.
+//
+// ## Vary: Origin
+//
+// A response whose CORS header depends on the request's Origin must say so,
+// or a cache will serve one origin's permission to another. Forgetting it
+// turns a correct policy into a wrong one under any shared cache.
+
+type CorsError =
+    | NoOrigin()
+    | BadMaxAge(text: str)
+
+type CorsPolicy = {
+    /// Origins allowed exactly. A single `*` is the wildcard.
+    allowed_origins: [str],
+    allowed_methods: [str],
+    /// Request headers a client may send, matched without regard to case.
+    allowed_headers: [str],
+    /// Response headers a script may read, beyond the safelisted ones.
+    exposed_headers: [str],
+    allow_credentials: bool,
+    /// Seconds a browser may cache the preflight answer.
+    max_age: i64,
+}
+
+type CorsRequest = {
+    origin: str,
+    method: str,
+    /// For a preflight: the value of Access-Control-Request-Headers.
+    requested_headers: [str],
+    with_credentials: bool,
+}
+
+/// The methods a form could always send, so no permission is asked.
+pub fn simple_methods() -> [str] {
+    return ["GET", "HEAD", "POST"]
+}
+
+/// The request headers a page could always set.
+pub fn safelisted_request_headers() -> [str] {
+    return ["accept", "accept-language", "content-language", "content-type",
+        "range"]
+}
+
+/// The content types a form could always send.
+pub fn simple_content_types() -> [str] {
+    return ["application/x-www-form-urlencoded", "multipart/form-data",
+        "text/plain"]
+}
+
+/// The response headers a script may read without being told it may.
+pub fn safelisted_response_headers() -> [str] {
+    return ["cache-control", "content-language", "content-length",
+        "content-type", "expires", "last-modified", "pragma"]
+}
+
+fn contains(values: [str], wanted: str) -> bool {
+    for value in values {
+        if value == wanted {
+            return true
+        }
+    }
+    return false
+}
+
+fn contains_fold(values: [str], wanted: str) -> bool {
+    for value in values {
+        if value.to_lower() == wanted.to_lower() {
+            return true
+        }
+    }
+    return false
+}
+
+/// Whether a request goes out without a preflight.
+///
+/// The compatibility rule, not a security one: anything an HTML form could
+/// always do needs no permission. Which is why a hostile page can still
+/// *make* the request — it just cannot read the answer — and why CSRF is a
+/// separate problem.
+pub fn is_simple(method: str, headers: [(str, str)]) -> bool {
+    if not contains(simple_methods(), method.to_upper()) {
+        return false
+    }
+    for header in headers {
+        let name = header.0.to_lower()
+        if not contains(safelisted_request_headers(), name) {
+            return false
+        }
+        if name == "content-type" {
+            let value = header.1.split(";")[0].trim().to_lower()
+            if not contains(simple_content_types(), value) {
+                return false
+            }
+        }
+    }
+    return true
+}
+
+/// Whether a policy allows an origin.
+///
+/// Exact match only. A prefix or suffix check is bypassed by
+/// `https://example.com.attacker.net` and `https://notexample.com`
+/// respectively, and both appear in real code.
+pub fn allows_origin(policy: CorsPolicy, origin: str) -> bool {
+    if origin == "" {
+        return false
+    }
+    for allowed in policy.allowed_origins {
+        if allowed == "*" or allowed == origin {
+            return true
+        }
+    }
+    return false
+}
+
+/// The `Access-Control-Allow-Origin` value for a request, or the empty
+/// string when the request is refused.
+///
+/// A credentialed request may not be answered with `*`, so the origin is
+/// echoed — which is safe only because `allows_origin` matched it exactly.
+pub fn allow_origin_header(policy: CorsPolicy,
+    request: CorsRequest) -> str {
+    if not allows_origin(policy, request.origin) {
+        return ""
+    }
+    if request.with_credentials {
+        return request.origin
+    }
+    if contains(policy.allowed_origins, "*") {
+        return "*"
+    }
+    return request.origin
+}
+
+/// Whether the response must carry `Vary: Origin`.
+///
+/// Whenever the CORS answer depends on the request's origin, which is
+/// whenever the policy is not a bare wildcard. Without it a shared cache
+/// serves one origin's permission to another.
+pub fn needs_vary(policy: CorsPolicy) -> bool {
+    if policy.allow_credentials {
+        return true
+    }
+    return not (policy.allowed_origins.len() == 1 and
+        policy.allowed_origins[0] == "*")
+}
+
+/// The headers a preflight response should carry, or an empty list when the
+/// preflight is refused.
+pub fn preflight_response(policy: CorsPolicy,
+    request: CorsRequest) -> [(str, str)] {
+    let origin = allow_origin_header(policy, request)
+    if origin == "" {
+        return []
+    }
+    if not contains(policy.allowed_methods, request.method.to_upper()) {
+        return []
+    }
+    for header in request.requested_headers {
+        if contains(safelisted_request_headers(), header.to_lower()) {
+            continue
+        }
+        if not contains_fold(policy.allowed_headers, header) {
+            return []
+        }
+    }
+    var out: [(str, str)] = [("Access-Control-Allow-Origin", origin)]
+    out.push(("Access-Control-Allow-Methods",
+        policy.allowed_methods.join(", ")))
+    if policy.allowed_headers.len() > 0 {
+        out.push(("Access-Control-Allow-Headers",
+            policy.allowed_headers.join(", ")))
+    }
+    if policy.allow_credentials {
+        out.push(("Access-Control-Allow-Credentials", "true"))
+    }
+    if policy.max_age > 0 {
+        out.push(("Access-Control-Max-Age", "{policy.max_age}"))
+    }
+    if needs_vary(policy) {
+        out.push(("Vary", "Origin"))
+    }
+    return out
+}
+
+/// The headers an actual response should carry.
+pub fn response_headers(policy: CorsPolicy,
+    request: CorsRequest) -> [(str, str)] {
+    let origin = allow_origin_header(policy, request)
+    if origin == "" {
+        return []
+    }
+    var out: [(str, str)] = [("Access-Control-Allow-Origin", origin)]
+    if policy.allow_credentials {
+        out.push(("Access-Control-Allow-Credentials", "true"))
+    }
+    if policy.exposed_headers.len() > 0 {
+        out.push(("Access-Control-Expose-Headers",
+            policy.exposed_headers.join(", ")))
+    }
+    if needs_vary(policy) {
+        out.push(("Vary", "Origin"))
+    }
+    return out
+}
+
+/// Whether a script may read a response header.
+pub fn header_is_readable(policy: CorsPolicy, name: str) -> bool {
+    if contains(safelisted_response_headers(), name.to_lower()) {
+        return true
+    }
+    return contains_fold(policy.exposed_headers, name)
+}
+
+/// What is wrong with a policy.
+pub fn weaknesses(policy: CorsPolicy) -> [str] {
+    var out: [str] = []
+    if contains(policy.allowed_origins, "*") and policy.allow_credentials {
+        out.push("a wildcard origin with credentials is refused by every " +
+            "browser, so the policy does nothing")
+    }
+    if policy.allow_credentials and policy.allowed_origins.len() > 8 {
+        out.push("a long credentialed origin list is usually an echo of " +
+            "Origin in disguise")
+    }
+    if contains(policy.allowed_origins, "null") {
+        out.push("the null origin is sent by sandboxed iframes and data " +
+            "URLs, which any page can create")
+    }
+    if policy.max_age > 86400 {
+        out.push("a max-age over a day is capped by browsers anyway")
+    }
+    return out
+}

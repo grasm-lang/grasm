@@ -1,0 +1,495 @@
+import formdata
+import csp
+import hsts
+import preflight
+import webfinger
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn list_of(data: bytes) -> [i64] {
+    var out: [i64] = []
+    for i in 0..data.len() {
+        out.push(data.at(i))
+    }
+    return out
+}
+
+// -------------------------------------------------------------- formdata
+
+fn boundary() -> str {
+    return "----WebKitFormBoundary7MA4YWxkTrZu0gW"
+}
+
+fn sample_body() -> bytes {
+    var out: [i64] = []
+    push(out, "--" + boundary() + "\r\n")
+    push(out, "Content-Disposition: form-data; name=\"field\"\r\n\r\n")
+    push(out, "value one\r\n")
+    push(out, "--" + boundary() + "\r\n")
+    push(out, "Content-Disposition: form-data; name=\"upload\"; " +
+        "filename=\"report.pdf\"\r\n")
+    push(out, "Content-Type: application/pdf\r\n\r\n")
+    for b in [37, 80, 68, 70, 0, 1, 2, 255] {
+        out.push(b)
+    }
+    push(out, "\r\n")
+    push(out, "--" + boundary() + "\r\n")
+    push(out, "Content-Disposition: form-data; name=\"box\"\r\n\r\na\r\n")
+    push(out, "--" + boundary() + "\r\n")
+    push(out, "Content-Disposition: form-data; name=\"box\"\r\n\r\nb\r\n")
+    push(out, "--" + boundary() + "--\r\n")
+    return bytes_of(out)
+}
+
+fn push(inout out: [i64], text: str) {
+    let raw = text.to_bytes()
+    var i = 0
+    while i < raw.len() {
+        out.push(raw.at(i))
+        i = i + 1
+    }
+}
+
+fn check_formdata(inout f: i64) / {io} {
+    print("-- formdata: the boundary nobody can escape")
+    // The boundary is announced in the header and may be quoted.
+    say(f, "the boundary comes out of the header, quoted or not",
+        formdata.boundary_of("multipart/form-data; boundary=\"" +
+            boundary() + "\"") == boundary() and
+        formdata.boundary_of("multipart/form-data; boundary=" +
+            boundary()) == boundary() and
+        formdata.boundary_of("application/json") == "")
+    // Python's email package agrees with all of these.
+    let parts = formdata.parse(sample_body(), boundary()) ?? []
+    say(f, "the parts and their bytes are what Python's email package finds",
+        parts.len() == 4 and parts[0].name == "field" and
+        parts[0].body.to_str() == "value one")
+    // Binary content survives, including nulls and CRLF.
+    say(f, "binary content survives, nulls and all",
+        list_of(parts[1].body) == [37, 80, 68, 70, 0, 1, 2, 255] and
+        parts[1].content_type == "application/pdf")
+    // A filename is a label, never a path.
+    say(f, "a filename is what the client sent, and is a label not a path",
+        parts[1].filename == "report.pdf" and formdata.is_file(parts[1]) and
+        not formdata.is_file(parts[0]) and formdata.files(parts).len() == 1)
+    // A form may repeat a name. Checkboxes do.
+    say(f, "a repeated name is every value, because checkboxes repeat",
+        formdata.values_for(parts, "box") == ["a", "b"] and
+        formdata.part_named(parts, "box").body.to_str() == "a")
+    // The old RFC 2231 encoding, which real clients still send.
+    say(f, "a non-ASCII filename is read in either of its two encodings",
+        formdata.parameter("form-data; name=\"f\"; " +
+            "filename*=UTF-8''caf%C3%A9.txt", "filename") == "caf\u{e9}.txt" and
+        formdata.percent_decode("a%20b%2Fc") == "a b/c")
+    // The failure the format cannot detect for itself.
+    say(f, "a boundary inside the content is undetectable by the format",
+        formdata.boundary_collides(sample_body(), boundary()) and
+        not formdata.boundary_collides("plain text".to_bytes(),
+            boundary()))
+    let rebuilt = formdata.build(parts, boundary())
+    say(f, "and a body built from parts parses back to the same parts",
+        (formdata.parse(rebuilt, boundary()) ?? []).len() == 4 and
+        (formdata.parse(rebuilt, boundary()) ?? [])[1].filename ==
+        "report.pdf")
+    say(f, "a body with no boundary in it is refused",
+        parse_refused("nothing here", boundary()) and
+        parse_refused("--x--", ""))
+}
+
+fn parse_refused(text: str, bound: str) -> bool {
+    match formdata.parse(text.to_bytes(), bound) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+// ------------------------------------------------------------------- csp
+
+fn policy_of(header: str) -> CspPolicy {
+    return csp.parse(header) ?? CspPolicy{ directives: [], ignored: [] }
+}
+
+fn check_csp(inout f: i64) / {io} {
+    print("-- csp: three ways to write a policy that does nothing")
+    let policy = policy_of("default-src 'self'; script-src 'self' " +
+        "https://cdn.example; object-src 'none'")
+    say(f, "directives and their sources come out in order",
+        policy.directives.len() == 3 and
+        csp.sources_of(policy, "script-src") == ["'self'",
+            "https://cdn.example"] and
+        csp.sources_of(policy, "object-src") == ["'none'"])
+    // A repeated directive is ignored, unlike most headers — so an injected
+    // duplicate cannot loosen a policy.
+    say(f, "a repeated directive keeps the first, so injection cannot widen",
+        csp.sources_of(policy_of("script-src 'self'; script-src *"),
+            "script-src") == ["'self'"])
+    // The fallback chain, and the five directives that are not in it.
+    say(f, "most directives fall back to default-src",
+        csp.effective_sources(policy_of("default-src 'self'"), "img-src")
+        == ["'self'"] and csp.falls_back("img-src"))
+    say(f, "but base-uri, form-action and frame-ancestors do not",
+        not csp.falls_back("base-uri") and
+        not csp.falls_back("form-action") and
+        not csp.falls_back("frame-ancestors") and
+        csp.effective_sources(policy_of("default-src 'self'"), "base-uri")
+            .len() == 0)
+        // Which is why an injected <base> works against a policy that looks
+        // complete.
+    say(f, "so a policy of default-src alone leaves base-uri unrestricted",
+        contains(csp.weaknesses(policy_of("default-src 'self'")),
+            "no base-uri: an injected <base> can redirect every relative " +
+            "script URL, and default-src does not cover it"))
+    // unsafe-inline permits exactly the thing CSP exists to stop.
+    say(f, "unsafe-inline permits the injected script it exists to stop",
+        csp.allows_inline_script(policy_of(
+            "script-src 'self' 'unsafe-inline'")) and
+        not csp.allows_inline_script(policy_of("script-src 'self'")))
+    // Unless a nonce is present, in which case browsers ignore it.
+    say(f, "unless a nonce is there too, which makes browsers ignore it",
+        not csp.allows_inline_script(policy_of(
+            "script-src 'nonce-abc123' 'unsafe-inline'")) and
+        csp.script_nonce(policy_of("script-src 'nonce-abc123'")) ==
+        "abc123")
+    say(f, "eval is a separate permission again",
+        csp.allows_eval(policy_of("script-src 'unsafe-eval'")) and
+        not csp.allows_eval(policy_of("script-src 'self'")))
+    // The host allowlist is what strict-dynamic replaces.
+    say(f, "a host allowlist is a list of places to look for a bypass",
+        csp.script_hosts(policy_of("script-src 'self' https://cdn.example " +
+            "https://ads.example")) == ["https://cdn.example",
+            "https://ads.example"])
+    let strict = csp.strict_policy("r4nd0m")
+    say(f, "and a nonce with strict-dynamic replaces the list entirely",
+        csp.uses_strict_dynamic(strict) and
+        csp.script_nonce(strict) == "r4nd0m" and
+        csp.weaknesses(strict).len() == 0)
+    say(f, "report-only is a different header, which is how a policy ships",
+        csp.header_name(true) == "Content-Security-Policy-Report-Only" and
+        csp.header_name(false) == "Content-Security-Policy")
+    say(f, "and a policy round-trips through its own text",
+        csp.build(strict) == "script-src 'nonce-r4nd0m' 'strict-dynamic' " +
+        "https: 'unsafe-inline'; object-src 'none'; base-uri 'none'")
+    // The grammar says a source list is `'none'` or real sources, never
+    // both. Browsers do not refuse the mixture; they drop the `'none'`.
+    let muddled = policy_of("script-src 'none' https://cdn.example")
+    say(f, "a 'none' beside real sources is dropped, not honoured",
+        csp.sources_of(muddled, "script-src") == ["https://cdn.example"])
+    say(f, "and the drop is named rather than left silent",
+        contains(muddled.ignored, "'none' beside other sources in " +
+            "script-src is dropped, so the directive allows them all") and
+        contains(csp.weaknesses(muddled), "'none' beside other sources in " +
+            "script-src is dropped, so the directive allows them all"))
+    say(f, "a 'none' on its own still means nothing is allowed",
+        csp.sources_of(policy_of("script-src 'none'"), "script-src") ==
+        ["'none'"])
+    // Sources are separated by runs of spaces and tabs, not by one space.
+    say(f, "sources separate on tabs as well as spaces",
+        csp.sources_of(policy_of("script-src\t'self'  \thttps:"),
+            "script-src") == ["'self'", "https:"])
+    say(f, "and a directive name is matched without regard to case",
+        csp.sources_of(policy_of("DEFAULT-SRC 'self'"), "default-src") ==
+        ["'self'"])
+}
+
+fn contains(values: [str], wanted: str) -> bool {
+    for value in values {
+        if value == wanted {
+            return true
+        }
+    }
+    return false
+}
+
+// ------------------------------------------------------------------ hsts
+
+fn hsts_of(header: str) -> HstsPolicy {
+    return hsts.parse(header) ?? HstsPolicy{ max_age: 0 - 1,
+        include_subdomains: false, preload: false }
+}
+
+fn check_hsts(inout f: i64) / {io} {
+    print("-- hsts: the header you cannot take back")
+    say(f, "the directives parse, in any case and any order",
+        hsts_of("max-age=31536000; includeSubDomains; preload").max_age ==
+        31536000 and
+        hsts_of("PRELOAD; MAX-AGE=100").preload and
+        hsts_of("PRELOAD; MAX-AGE=100").max_age == 100)
+    // A duplicate invalidates the whole header rather than picking one.
+    say(f, "a repeated directive invalidates the header rather than picking",
+        hsts_refused("max-age=1; max-age=2") and
+        hsts_refused("max-age=1; preload; preload"))
+    say(f, "an unknown directive is ignored, which is how it gets extended",
+        hsts_of("max-age=100; futureThing=3").max_age == 100)
+    say(f, "and a header with no max-age is not a policy",
+        hsts_refused("includeSubDomains") and
+        hsts_refused("max-age=abc") and hsts_refused("max-age="))
+    // The preload list's own rules.
+    say(f, "preloading needs a year, every subdomain, and the token",
+        hsts.is_preloadable(hsts_of(
+            "max-age=31536000; includeSubDomains; preload")) and
+        not hsts.is_preloadable(hsts_of("max-age=100; preload")) and
+        hsts.preload_minimum() == 31536000)
+    say(f, "and preload without includeSubDomains is rejected by the list",
+        contains(hsts.cautions(hsts_of("max-age=31536000; preload")),
+            "preload without includeSubDomains is rejected by the list"))
+    // The retraction that only reaches browsers that come back.
+    say(f, "max-age=0 is the retraction, and it needs another HTTPS visit",
+        hsts.is_retraction(hsts_of("max-age=0")) and
+        not hsts.covers_subdomains(hsts_of("max-age=0; includeSubDomains")))
+    say(f, "the policy expires a max-age after the response that carried it",
+        hsts.expires_at(hsts_of("max-age=300"), 1000) == 1300)
+    say(f, "a testing policy is minutes and this host only",
+        hsts.testing_policy().max_age == 300 and
+        not hsts.testing_policy().include_subdomains and
+        hsts.build(hsts.testing_policy()) == "max-age=300")
+    say(f, "and a policy round-trips through its own text",
+        hsts.build(hsts_of("max-age=31536000; includeSubDomains; preload"))
+        == "max-age=31536000; includeSubDomains; preload")
+    // RFC 6797's grammar, and the three places a lazy reading of it goes
+    // wrong.
+    say(f, "the value may be quoted, which the RFC's own examples show",
+        hsts_of("max-age=\"31536000\"").max_age == 31536000)
+    say(f, "whitespace may sit around the equals sign and the semicolons",
+        hsts_of("  max-age = 300 ;  includeSubDomains  ").max_age == 300 and
+        hsts_of("  max-age = 300 ;  includeSubDomains  ")
+            .include_subdomains and hsts_of("max-age=1;;preload").preload)
+        // A `;` inside a quoted value belongs to the value. Splitting on `;`
+        // first is how a value smuggles a directive past a checker.
+    say(f, "a semicolon inside a quoted value does not start a directive",
+        hsts_refused("report-uri=\"a;max-age=0\"") and
+        hsts_of("max-age=1; report-uri=\"a;max-age=0\"").max_age == 1)
+    say(f, "and a quote that never closes throws the header away",
+        hsts_refused("preload=\"a ; max-age=0"))
+    // Rule 2 of section 6.1 is not limited to the directives anyone knows.
+    say(f, "a directive repeated is a repeat even when nobody knows it",
+        hsts_refused("max-age=1; report-uri=a; report-uri=b"))
+    say(f, "and a name that is not a token is not a directive",
+        hsts_refused("max-age=1; re port-uri=a") and
+        hsts_refused("max-age=1; a@b=c"))
+}
+
+fn hsts_refused(header: str) -> bool {
+    match hsts.parse(header) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+// ------------------------------------------------------------- preflight
+
+fn open_policy() -> CorsPolicy {
+    return CorsPolicy{ allowed_origins: ["*"], allowed_methods: ["GET",
+        "POST"], allowed_headers: [], exposed_headers: [],
+        allow_credentials: false, max_age: 0 }
+}
+
+fn strict_cors() -> CorsPolicy {
+    return CorsPolicy{ allowed_origins: ["https://app.example"],
+        allowed_methods: ["GET", "POST", "PUT"],
+        allowed_headers: ["Authorization", "X-Request-Id"],
+        exposed_headers: ["X-Total-Count"], allow_credentials: true,
+        max_age: 600 }
+}
+
+fn request_from(origin: str, method: str, headers: [str],
+    credentials: bool) -> CorsRequest {
+    return CorsRequest{ origin: origin, method: method,
+        requested_headers: headers, with_credentials: credentials }
+}
+
+fn header_value(headers: [(str, str)], name: str) -> str {
+    for header in headers {
+        if header.0 == name {
+            return header.1
+        }
+    }
+    return ""
+}
+
+fn check_preflight(inout f: i64) / {io} {
+    print("-- preflight: enforced in the browser, after the work is done")
+    // The compatibility rule: anything a form could always do.
+    say(f, "a form-shaped request goes out without asking",
+        preflight.is_simple("POST", [("Content-Type",
+            "application/x-www-form-urlencoded")]) and
+        preflight.is_simple("GET", []))
+    say(f, "and anything else asks first",
+        not preflight.is_simple("POST", [("Content-Type",
+            "application/json")]) and
+        not preflight.is_simple("PUT", []) and
+        not preflight.is_simple("GET", [("X-Request-Id", "1")]))
+    // Which is why CSRF is a separate problem: the request still happens.
+    say(f, "so a hostile page can still make the request, only not read it",
+        preflight.is_simple("POST", [("Content-Type", "text/plain")]))
+    // The wildcard that stops working the moment credentials appear.
+    say(f, "a wildcard origin answers a plain request",
+        preflight.allow_origin_header(open_policy(),
+            request_from("https://anywhere.example", "GET", [], false)) == "*")
+    say(f, "and must name the origin exactly once credentials are involved",
+        preflight.allow_origin_header(strict_cors(),
+            request_from("https://app.example", "GET", [], true)) ==
+        "https://app.example" and
+        preflight.allow_origin_header(strict_cors(),
+            request_from("https://evil.example", "GET", [], true)) == "")
+    // The prefix check that every bypass uses.
+    say(f, "matching is exact, which is what a prefix check is not",
+        not preflight.allows_origin(strict_cors(),
+            "https://app.example.attacker.net") and
+        not preflight.allows_origin(strict_cors(), "https://app.example/") and
+        preflight.allows_origin(strict_cors(), "https://app.example"))
+    // A preflight is answered only if the method and every header are
+    // allowed.
+    let answer = preflight.preflight_response(strict_cors(),
+        request_from("https://app.example", "PUT", ["Authorization"], true))
+    say(f, "a preflight answers with the method, the headers and the age",
+        answer.len() == 6 and
+        header_value(answer, "Access-Control-Allow-Methods") ==
+        "GET, POST, PUT" and
+        header_value(answer, "Access-Control-Max-Age") == "600" and
+        header_value(answer, "Access-Control-Allow-Credentials") == "true")
+    say(f, "and refuses when a single requested header is not allowed",
+        preflight.preflight_response(strict_cors(),
+            request_from("https://app.example", "PUT", ["X-Secret"], true))
+            .len() == 0 and
+        preflight.preflight_response(strict_cors(),
+            request_from("https://app.example", "DELETE", [], true)).len() == 0)
+    say(f, "a safelisted header needs no permission, being one a form sends",
+        preflight.preflight_response(strict_cors(),
+            request_from("https://app.example", "POST", ["Accept"], true))
+            .len() > 0)
+        // Vary: Origin, without which a cache leaks one origin's permission.
+    say(f, "a response whose answer depends on the origin must say so",
+        preflight.needs_vary(strict_cors()) and
+        not preflight.needs_vary(open_policy()) and
+        header_value(preflight.response_headers(strict_cors(),
+            request_from("https://app.example", "GET", [], true)), "Vary") ==
+        "Origin")
+    // What a script may read is a separate question again.
+    say(f, "a script reads the safelisted headers and whatever is exposed",
+        preflight.header_is_readable(strict_cors(), "Content-Type") and
+        preflight.header_is_readable(strict_cors(), "X-Total-Count") and
+        not preflight.header_is_readable(strict_cors(), "X-Internal"))
+    // A HEAD carrying a custom header does get a preflight, and the server
+    // may decline it: HEAD is safelisted only for the requests that never
+    // ask.
+    say(f, "a safelisted method still needs listing when a header is custom",
+        preflight.preflight_response(strict_cors(),
+            request_from("https://app.example", "HEAD", ["X-Request-Id"], true))
+            .len() == 0 and
+        preflight.is_simple("HEAD", []))
+    say(f, "a wildcard with credentials is a policy that does nothing",
+        contains(preflight.weaknesses(CorsPolicy{ allowed_origins: ["*"],
+            allowed_methods: ["GET"], allowed_headers: [], exposed_headers: [],
+            allow_credentials: true, max_age: 0 }),
+            "a wildcard origin with credentials is refused by every browser, " +
+            "so the policy does nothing"))
+}
+
+// ------------------------------------------------------------- webfinger
+
+fn check_webfinger(inout f: i64) / {io} {
+    print("-- webfinger: how the fediverse finds a name")
+    let document = webfinger.actor_descriptor("alice", "example.social",
+        "https://example.social/users/alice",
+        "https://example.social/@alice")
+    // The address is not an email address, and the scheme says so.
+    say(f, "an account address splits into a user and a host",
+        (webfinger.split_account("acct:alice@example.social") ??
+            ("", "")) == ("alice", "example.social") and
+        (webfinger.split_account("@alice@example.social") ?? ("", "")) ==
+        ("alice", "example.social") and
+        webfinger.account_uri("alice", "example.social") ==
+        "acct:alice@example.social")
+    say(f, "and something with no host in it is not an address",
+        account_refused("alice") and account_refused("@alice") and
+        account_refused("alice@"))
+    // The query is fixed, and the host in the address is the authority.
+    say(f, "the query is one fixed path with the resource encoded into it",
+        webfinger.query_path("acct:alice@example.social") ==
+        "/.well-known/webfinger?resource=acct%3Aalice%40example.social" and
+        (webfinger.authority_for("acct:alice@example.social") ?? "") ==
+        "example.social")
+    // Two `self` links, and only the type tells them apart.
+    say(f, "the actor is a self link with a type, not just a self link",
+        webfinger.actor_url(document) ==
+        "https://example.social/users/alice" and
+        webfinger.profile_url(document) == "https://example.social/@alice")
+    say(f, "so a link is found by relation and type together",
+        (webfinger.link_of_type(document, "self", "text/html") ??
+            empty_link()).href == "" and
+        (webfinger.link_of_type(document, "self",
+            "application/activity+json") ?? empty_link()).href ==
+        "https://example.social/users/alice")
+    // A template with a hole in it.
+    say(f, "a template takes a URI, encoded",
+        webfinger.expand("https://example.social/x?uri=\{uri}",
+            "acct:bob@other.example") ==
+        "https://example.social/x?uri=acct%3Abob%40other.example")
+    say(f, "the aliases name the same account by other URLs",
+        webfinger.has_alias(document, "https://example.social/@alice") and
+        not webfinger.has_alias(document, "https://elsewhere/@alice") and
+        webfinger.is_usable(document))
+    // The document is JSON, and the media type says which kind.
+    let json = webfinger.to_json(document)
+    say(f, "the document is JRD, which is JSON with its own media type",
+        webfinger.content_type() == "application/jrd+json" and
+        json.starts_with("\{") and
+        json.contains("\"subject\": \"acct:alice@example.social\""))
+    say(f, "and the escaping is the only interesting part of writing it",
+        webfinger.percent_encode("a b/c") == "a%20b%2Fc" and
+        webfinger.percent_encode("caf\u{e9}") == "caf%C3%A9")
+    say(f, "a relation nothing carries is an error, not an empty string",
+        link_refused(document, "http://example.com/rel/nothing"))
+    // The escaping is over octets, and the address is not a mailbox.
+    say(f, "a non-ASCII character escapes as its UTF-8 bytes, not its code",
+        webfinger.percent_encode("\u{65e5}") == "%E6%97%A5" and
+        webfinger.percent_encode("\u{1f600}") == "%F0%9F%98%80")
+    say(f, "the bare form is accepted, because that is what people paste",
+        (webfinger.split_account("alice@example.social") ?? ("", "")) ==
+        ("alice", "example.social"))
+    say(f, "but another scheme is refused, mailto: above all",
+        account_refused("mailto:alice@example.social") and
+        account_refused("https://example.social/@alice"))
+    say(f, "and two at-signs are ambiguous rather than merely odd",
+        account_refused("acct:victim@good.example@attacker.example"))
+}
+
+fn empty_link() -> FingerLink {
+    return FingerLink{ relation: "", media_type: "", href: "", template: "",
+        titles: [], properties: [] }
+}
+
+fn account_refused(text: str) -> bool {
+    match webfinger.split_account(text) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn link_refused(document: Descriptor, relation: str) -> bool {
+    match webfinger.link_for(document, relation) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn main() / {io} {
+    var f = 0
+    check_formdata(f)
+    check_csp(f)
+    check_hsts(f)
+    check_preflight(f)
+    check_webfinger(f)
+    if f == 0 {
+        print("web: every claim held")
+    } else {
+        print("web: {f} claims failed")
+    }
+}

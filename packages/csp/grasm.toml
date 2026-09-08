@@ -1,0 +1,6 @@
+[package]
+name = "csp"
+version = "1.0.0"
+
+# Parses and builds a header. Opens nothing.
+capabilities = []

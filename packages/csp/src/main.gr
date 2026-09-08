@@ -1,0 +1,332 @@
+// Content-Security-Policy: a header that is a small language.
+//
+// CSP tells a browser what a page is allowed to load and execute. It is the
+// only mitigation for cross-site scripting that works when the escaping has
+// already failed, and it is the header most often written in a way that does
+// nothing at all.
+//
+// ## The three ways to write a policy that does nothing
+//
+// **`unsafe-inline` in `script-src`.** It permits every inline script,
+// which is exactly what an injected `<script>` is. A policy with it is a
+// policy against remote scripts only, and the attack it is meant to stop is
+// almost always inline.
+//
+// **A host allowlist containing a CDN.** If `https://cdn.example` is allowed
+// and that CDN hosts any library with a JSONP endpoint or an AngularJS build,
+// the allowlist is bypassable. Google's mine research found 94% of real
+// allowlist policies bypassable this way, which is why the advice is now
+// nonces and hashes rather than hosts.
+//
+// **No `object-src` and no `base-uri`.** `default-src` does not cover
+// `base-uri`, so a policy without it allows an injected `<base>` tag to
+// redirect every relative script URL. This is the one people are most
+// surprised by.
+//
+// ## Nonces, and the property that makes them work
+//
+// A nonce is a random value in the header and repeated on each legitimate
+// script tag. An injected script cannot carry it, because the attacker does
+// not know it — which requires that it be regenerated for every response.
+// A nonce baked into a static file is a nonce the attacker can read.
+//
+// `strict-dynamic` then says: a script the nonce permitted may load more
+// scripts. That turns an unmaintainable allowlist into a single nonce, and it
+// is the modern shape of a policy.
+//
+// ## Report-only exists so a policy can be deployed at all
+//
+// `Content-Security-Policy-Report-Only` enforces nothing and reports what it
+// would have blocked. Deploying a real policy on an existing site without it
+// breaks the site, every time.
+
+type CspError =
+    | EmptyDirective(at: i64)
+    | BadName(name: str)
+
+type Directive = {
+    name: str,
+    /// Source expressions, in the order written.
+    sources: [str],
+}
+
+type CspPolicy = {
+    directives: [Directive],
+    /// What the browser will silently discard, named so it need not be
+    /// silent here: a directive written twice, or a `'none'` written
+    /// beside real sources.
+    ignored: [str],
+}
+
+/// A policy header parsed.
+///
+/// Directives separated by semicolons, sources by whitespace. A repeated
+/// directive is **ignored after the first**, which is the opposite of most
+/// headers and is what stops an injected duplicate from loosening a policy.
+pub fn parse(header: str) -> CspPolicy ! CspError {
+    var out = CspPolicy{ directives: [], ignored: [] }
+    var at = 0
+    for chunk in header.split(";") {
+        at = at + 1
+        let trimmed = chunk.trim()
+        if trimmed == "" {
+            continue
+        }
+        let fields = split_whitespace(trimmed)
+        if fields.len() == 0 {
+            fail(EmptyDirective(at))
+        }
+        let name = fields[0].to_lower()
+        if has_directive(out, name) {
+            out.ignored.push("a second " + name + " is ignored; the first " +
+                "one stands")
+            continue
+        }
+        var sources: [str] = []
+        var i = 1
+        while i < fields.len() {
+            sources.push(fields[i])
+            i = i + 1
+        }
+        // The grammar says a source list is either `'none'` or a list of
+        // real sources, never both. Browsers do not refuse the mixture —
+        // they drop the `'none'` and honour the rest, which is a policy far
+        // wider than whoever wrote it intended. Read it the way the browser
+        // will, and let `weaknesses` say that it happened.
+        if sources.len() > 1 {
+            var kept: [str] = []
+            for source in sources {
+                if source.to_lower() != "'none'" {
+                    kept.push(source)
+                }
+            }
+            if kept.len() != sources.len() {
+                out.ignored.push("'none' beside other sources in " + name +
+                    " is dropped, so the directive allows them all")
+            }
+            sources = kept
+        }
+        out.directives.push(Directive{ name: name, sources: sources })
+    }
+    return out
+}
+
+/// Fields separated by runs of spaces and tabs, which is what RWS means.
+fn split_whitespace(text: str) -> [str] {
+    var out: [str] = []
+    var field = ""
+    for code in text.codes() {
+        if code == 32 or code == 9 {
+            if field != "" {
+                out.push(field)
+                field = ""
+            }
+        } else {
+            field = field + code.to_char()
+        }
+    }
+    if field != "" {
+        out.push(field)
+    }
+    return out
+}
+
+fn has_directive(policy: CspPolicy, name: str) -> bool {
+    for directive in policy.directives {
+        if directive.name == name {
+            return true
+        }
+    }
+    return false
+}
+
+/// A directive's sources, or the empty list.
+pub fn sources_of(policy: CspPolicy, name: str) -> [str] {
+    for directive in policy.directives {
+        if directive.name == name {
+            return directive.sources
+        }
+    }
+    return []
+}
+
+/// The sources that apply to a kind of load, following the fallback chain.
+///
+/// `script-src` falls back to `default-src`; so do `img-src`, `style-src`
+/// and most others. **`base-uri`, `form-action`, `frame-ancestors`,
+/// `report-uri` and `sandbox` do not** — they have no fallback at all, so a
+/// policy with only `default-src` leaves every one of them unrestricted.
+/// That is the surprise that makes `base-uri` injection work.
+pub fn effective_sources(policy: CspPolicy, name: str) -> [str] {
+    let mine = sources_of(policy, name)
+    if mine.len() > 0 or has_directive(policy, name) {
+        return mine
+    }
+    if not falls_back(name) {
+        return []
+    }
+    return sources_of(policy, "default-src")
+}
+
+/// Whether a directive falls back to `default-src`.
+pub fn falls_back(name: str) -> bool {
+    let standalone = ["base-uri", "form-action", "frame-ancestors",
+        "report-uri", "report-to", "sandbox", "upgrade-insecure-requests",
+        "plugin-types", "navigate-to"]
+    for entry in standalone {
+        if entry == name {
+            return false
+        }
+    }
+    return true
+}
+
+/// Whether a policy permits inline script.
+///
+/// The single most common way to write a policy that stops nothing: an
+/// injected script *is* an inline script.
+pub fn allows_inline_script(policy: CspPolicy) -> bool {
+    for source in effective_sources(policy, "script-src") {
+        if source == "'unsafe-inline'" {
+            // A nonce or hash present alongside it makes browsers ignore
+            // `unsafe-inline` entirely, which is the documented backwards
+            // compatibility route and the reason a policy may safely carry
+            // both.
+            return not has_nonce_or_hash(policy)
+        }
+    }
+    return false
+}
+
+fn has_nonce_or_hash(policy: CspPolicy) -> bool {
+    for source in effective_sources(policy, "script-src") {
+        if source.starts_with("'nonce-") or
+        source.starts_with("'sha256-") or
+        source.starts_with("'sha384-") or
+        source.starts_with("'sha512-") {
+            return true
+        }
+    }
+    return false
+}
+
+/// Whether a policy permits `eval` and its relatives.
+pub fn allows_eval(policy: CspPolicy) -> bool {
+    for source in effective_sources(policy, "script-src") {
+        if source == "'unsafe-eval'" {
+            return true
+        }
+    }
+    return false
+}
+
+/// The nonce a policy carries for scripts, or the empty string.
+pub fn script_nonce(policy: CspPolicy) -> str {
+    for source in effective_sources(policy, "script-src") {
+        if source.starts_with("'nonce-") and source.ends_with("'") {
+            return source.substr(7, source.len() - 8)
+        }
+    }
+    return ""
+}
+
+/// Whether the policy uses `strict-dynamic`.
+pub fn uses_strict_dynamic(policy: CspPolicy) -> bool {
+    for source in effective_sources(policy, "script-src") {
+        if source == "'strict-dynamic'" {
+            return true
+        }
+    }
+    return false
+}
+
+/// The host sources a policy allows for scripts, ignoring keywords.
+///
+/// The list to look at when judging a policy: every one of these is a place
+/// an attacker might find a JSONP endpoint.
+pub fn script_hosts(policy: CspPolicy) -> [str] {
+    var out: [str] = []
+    for source in effective_sources(policy, "script-src") {
+        if not source.starts_with("'") {
+            out.push(source)
+        }
+    }
+    return out
+}
+
+/// What is wrong with a policy, in the order it matters.
+///
+/// Not a score. Each finding is a specific way the policy fails to stop the
+/// attack it exists for, and a policy with none of them can still be
+/// bypassable through a host nobody checked.
+pub fn weaknesses(policy: CspPolicy) -> [str] {
+    var out: [str] = []
+    if not has_directive(policy, "default-src") and
+    not has_directive(policy, "script-src") {
+        out.push("no script-src and no default-src: scripts are unrestricted")
+    }
+    if allows_inline_script(policy) {
+        out.push("'unsafe-inline' in script-src permits an injected script")
+    }
+    if allows_eval(policy) {
+        out.push("'unsafe-eval' permits string-to-code conversion")
+    }
+    if not has_directive(policy, "object-src") and
+    not has_directive(policy, "default-src") {
+        out.push("no object-src: a plugin can execute script")
+    }
+    if not has_directive(policy, "base-uri") {
+        out.push("no base-uri: an injected <base> can redirect every " +
+            "relative script URL, and default-src does not cover it")
+    }
+    if wildcard_in(policy, "script-src") {
+        out.push("a wildcard in script-src allows every host")
+    }
+    for note in policy.ignored {
+        out.push(note)
+    }
+    return out
+}
+
+fn wildcard_in(policy: CspPolicy, name: str) -> bool {
+    for source in effective_sources(policy, name) {
+        if source == "*" {
+            return true
+        }
+        if source.contains("*") and not source.starts_with("*.") {
+            return true
+        }
+    }
+    return false
+}
+
+/// A policy written back out.
+pub fn build(policy: CspPolicy) -> str {
+    var parts: [str] = []
+    for directive in policy.directives {
+        var text = directive.name
+        for source in directive.sources {
+            text = text + " " + source
+        }
+        parts.push(text)
+    }
+    return parts.join("; ")
+}
+
+/// The header name a policy goes in, enforcing or not.
+pub fn header_name(report_only: bool) -> str {
+    if report_only {
+        return "Content-Security-Policy-Report-Only"
+    }
+    return "Content-Security-Policy"
+}
+
+/// A modern policy: a nonce, strict-dynamic, and the directives that have no
+/// fallback.
+pub fn strict_policy(nonce: str) -> CspPolicy {
+    return CspPolicy{ directives: [
+        Directive{ name: "script-src", sources: ["'nonce-" + nonce + "'",
+            "'strict-dynamic'", "https:", "'unsafe-inline'"] },
+        Directive{ name: "object-src", sources: ["'none'"] },
+        Directive{ name: "base-uri", sources: ["'none'"] }], ignored: [] }
+}
