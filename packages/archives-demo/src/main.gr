@@ -1,0 +1,342 @@
+import tar
+import zip
+import lz4
+import snappy
+import arfile
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn tar_refuses(data: bytes) -> bool {
+    match tar.decode(data) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn zip_refuses(data: bytes) -> bool {
+    match zip.decode(data) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn lz4_refuses(data: bytes, limit: i64) -> bool {
+    match lz4.decompress(data, limit) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn snappy_refuses(data: bytes, limit: i64) -> bool {
+    match snappy.decompress(data, limit) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn ar_refuses(data: bytes) -> bool {
+    match arfile.decode(data) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+/// Text with structure, which is what these formats are for.
+fn body(n: i64) -> bytes {
+    let one = "the quick brown fox jumps over the lazy dog. "
+    let raw = one.repeat(n / one.len() + 1).to_bytes()
+    var out: [i64] = []
+    for i in 0..n {
+        out.push(raw.at(i))
+    }
+    return bytes_of(out)
+}
+
+fn noise(n: i64) -> bytes {
+    var out: [i64] = []
+    var h = 12345
+    for _i in 0..n {
+        h = (h * 1103515245 + 12345) % 2147483648
+        out.push(h / 65536 % 256)
+    }
+    return bytes_of(out)
+}
+
+fn check_tar(inout f: i64) / {io} {
+    print("-- tar: 512-byte blocks, octal, and three name conventions")
+    let long_name = "a/" + "very-long-directory-name/".repeat(6) + "file.txt"
+    let entries = [
+        tar.with_modified(tar.entry("hello.txt", "Hello, world\n".to_bytes()),
+            1700000000),
+        tar.with_mode(tar.entry("bin/run.sh", "#!/bin/sh\n".to_bytes()), 493),
+        tar.directory("docs"),
+        tar.entry("docs/guide.md", "# Guide\n".to_bytes()),
+        tar.symlink("latest", "docs/guide.md"),
+        tar.entry(long_name, "deep\n".to_bytes()),
+        tar.entry("empty.bin", bytes_of([])),
+    ]
+    let data = tar.encode(entries)
+    say(f, "every archive is a whole number of 512-byte blocks",
+        data.len() % tar.block_size() == 0)
+    // Two empty blocks, not one: a reader that stops at the first reads a
+    // concatenated archive as truncated.
+    say(f, "and ends with two empty ones",
+        data.at(data.len() - 1024) == 0 and data.at(data.len() - 1) == 0)
+    let back = tar.decode(data) ?? []
+    say(f, "it reads back as seven entries", back.len() == 7)
+    say(f, "with the names intact", tar.names(back)[0] == "hello.txt")
+    say(f, "and the modes, which are octal in the file",
+        (tar.find(back, "bin/run.sh") ?? tar.entry("", bytes_of([]))).mode == 493)
+    say(f, "and the modification time", back[0].modified == 1700000000)
+    say(f, "a directory is marked as one", back[2].kind == tar.DIRECTORY)
+    say(f, "a symlink carries its target",
+        back[4].kind == tar.SYMLINK and back[4].link_target == "docs/guide.md")
+    // A name too long for the header goes in a PAX record ahead of it, which
+    // is what `tar` has done by default since 2001.
+    say(f, "a 158-character name survives", back[5].name == long_name)
+    say(f, "and the data with it", back[5].data.to_str() == "deep\n")
+    say(f, "an empty file is an entry, not an omission",
+        (tar.find(back, "empty.bin") ?? tar.entry("x", "y".to_bytes())).size == 0)
+    say(f, "the sizes add up", tar.total_size(back) == 13 + 10 + 8 + 5)
+    // The checksum, which is the only thing standing between a corrupted
+    // header and a nonsense extraction.
+    var damaged = data.to_list()
+    damaged[5] = damaged[5].bit_xor(1)
+    say(f, "one flipped header byte is caught", tar_refuses(bytes_of(damaged)))
+    say(f, "and something that is not a whole number of blocks",
+        tar_refuses("not a tar archive, not even close".to_bytes()))
+    // The check an extractor needs before writing anything.
+    say(f, "a name that escapes the target is refused",
+        not tar.is_safe_path("../../etc/passwd") and
+        not tar.is_safe_path("/etc/passwd"))
+    say(f, "an ordinary one is not", tar.is_safe_path("docs/guide.md"))
+    say(f, "and the archive can be checked as a whole",
+        tar.unsafe_names(back).len() == 0)
+}
+
+fn check_zip(inout f: i64) / {io} {
+    print("-- zip: read from the end, and the comment that hides the marker")
+    let entries = [
+        zip.with_time(zip.entry("hello.txt", "Hello, world\n".to_bytes()),
+            zip.dos_date_of(2026, 9, 8), zip.dos_time_of(12, 30, 44)),
+        zip.with_mode(zip.entry("bin/run.sh", "#!/bin/sh\n".to_bytes()), 493),
+        zip.directory("docs"),
+        zip.entry("docs/guide.md", body(400)),
+        zip.entry("empty.bin", bytes_of([])),
+    ]
+    let data = zip.encode(entries)
+    // "PK\x03\x04", which is Phil Katz's initials and has been the first four
+    // bytes of every ZIP since 1989.
+    say(f, "the first entry starts with PK",
+        data.at(0) == 80 and data.at(1) == 75 and data.at(2) == 3 and
+        data.at(3) == 4)
+    say(f, "the names can be listed without reading the entries",
+        zip.list_names(data) ?? [] == ["hello.txt", "bin/run.sh", "docs/",
+            "docs/guide.md", "empty.bin"])
+    let back = zip.decode(data) ?? []
+    say(f, "five entries", back.len() == 5)
+    say(f, "the mode is in the top sixteen bits of the attributes",
+        zip.mode_of(back[1]) == 493)
+    say(f, "a directory is one whose name ends in a slash",
+        zip.is_directory(back[2]) and not zip.is_directory(back[0]))
+    say(f, "the DOS date packs the year from 1980",
+        back[0].dos_date == zip.dos_date_of(2026, 9, 8))
+    say(f, "and the time to two-second resolution",
+        back[0].dos_time == zip.dos_time_of(12, 30, 44))
+    say(f, "the contents come back", back[0].data.to_str() == "Hello, world\n")
+    say(f, "including an empty one", back[4].size == 0)
+    say(f, "and the CRC is checked rather than carried",
+        back[0].crc != 0)
+    // The EOCD is searched backwards because the comment may contain its
+    // signature.
+    var with_comment = data.to_list()
+    // A comment containing "PK\x05\x06", which a forward scan would find.
+    for b in "PK".to_bytes().to_list() {
+        with_comment.push(b)
+    }
+    with_comment.push(5)
+    with_comment.push(6)
+    for b in " a trap for a forward scan".to_bytes().to_list() {
+        with_comment.push(b)
+    }
+    let length = with_comment.len() - data.len()
+    with_comment[data.len() - 2] = length.bit_and(255)
+    with_comment[data.len() - 1] = length.ushr(8).bit_and(255)
+    say(f, "an archive whose comment contains the marker still reads",
+        (zip.decode(bytes_of(with_comment)) ?? []).len() == 5)
+    // Byte 40 is inside hello.txt's own data: the header is 30 bytes and
+    // the name is nine.
+    var damaged = data.to_list()
+    damaged[40] = damaged[40].bit_xor(255)
+    say(f, "a corrupted entry fails its CRC", zip_refuses(bytes_of(damaged)))
+    say(f, "and something with no directory at all is refused",
+        zip_refuses("PK\u{0003}\u{0004} and nothing else".to_bytes()))
+    say(f, "a name that escapes the target is refused",
+        not zip.is_safe_path("..\\..\\windows\\system32") and
+        not zip.is_safe_path("C:\\x"))
+    say(f, "the expansion ratio is what catches a zip bomb",
+        zip.expansion_ratio(back) >= 1)
+    say(f, "and the total is knowable before extracting",
+        zip.total_size(back) == 13 + 10 + 400)
+}
+
+fn check_lz4(inout f: i64) / {io} {
+    print("-- lz4: no entropy coding, and overlapping matches")
+    let text = body(4000)
+    let packed = lz4.compress(text)
+    say(f, "repetitive text compresses hard",
+        lz4.saved_percent(text.len(), packed.len()) > 90)
+    say(f, "and comes back exactly",
+        (lz4.decompress(packed, text.len()) ?? "x".to_bytes()) == text)
+    let random = noise(4000)
+    let packed_noise = lz4.compress(random)
+    say(f, "incompressible data grows a little rather than shrinking",
+        packed_noise.len() >= random.len())
+    say(f, "but stays inside the bound",
+        packed_noise.len() <= lz4.compress_bound(random.len()))
+    say(f, "and still round-trips",
+        (lz4.decompress(packed_noise, random.len()) ?? "x".to_bytes()) == random)
+    say(f, "an empty block is one token, not nothing",
+        lz4.compress(bytes_of([])).len() == 1)
+    say(f, "which decodes to nothing",
+        (lz4.decompress(lz4.compress(bytes_of([])), 16) ?? "x".to_bytes()).len() == 0)
+    // The rule that makes a naive decoder wrong: an offset of one means
+    // "repeat the previous byte", so the copy overlaps its own output.
+    var run: [i64] = []
+    for _i in 0..500 {
+        run.push(65)
+    }
+    let repeated = bytes_of(run)
+    say(f, "five hundred of one byte is a handful of bytes",
+        lz4.compress(repeated).len() < 20)
+    say(f, "and expands back to all five hundred",
+        (lz4.decompress(lz4.compress(repeated), 500) ?? "x".to_bytes()) == repeated)
+    // A limit, because the output length is not in the block.
+    say(f, "a limit stops a block claiming more than the caller allowed",
+        lz4_refuses(lz4.compress(text), 100))
+    say(f, "an offset past the start of the output is refused",
+        lz4_refuses(bytes_of([16, 65, 200, 0]), 1000))
+    // The framing, which puts the length in front.
+    let framed = lz4.compress_framed(text)
+    say(f, "framing records the length", lz4.framed_size(framed) == 4000)
+    say(f, "so a decoder needs nothing told to it",
+        (lz4.decompress_framed(framed) ?? "x".to_bytes()) == text)
+    var sizes_ok = true
+    for n in [0, 1, 5, 20, 100, 1000] {
+        let sample = body(n)
+        if (lz4.decompress(lz4.compress(sample), n + 16) ?? "x".to_bytes()) != sample {
+            sizes_ok = false
+        }
+    }
+    say(f, "every length from nothing to a thousand round-trips", sizes_ok)
+}
+
+fn check_snappy(inout f: i64) / {io} {
+    print("-- snappy: four tag shapes, chosen by two bits")
+    let text = body(4000)
+    let packed = snappy.compress(text)
+    say(f, "the block declares its uncompressed length",
+        (snappy.uncompressed_length(packed) ?? 0) == 4000)
+    say(f, "which a decoder can read without decompressing",
+        snappy.looks_like_snappy(packed, 4000))
+    say(f, "repetitive text compresses hard",
+        snappy.saved_percent(4000, packed.len()) > 90)
+    say(f, "and comes back exactly",
+        (snappy.decompress(packed, 4096) ?? "x".to_bytes()) == text)
+    let random = noise(4000)
+    say(f, "incompressible data stays inside the bound",
+        snappy.compress(random).len() <= snappy.compress_bound(4000))
+    say(f, "and round-trips",
+        (snappy.decompress(snappy.compress(random), 4096) ?? "x".to_bytes()) ==
+        random)
+    say(f, "an empty block is just its length",
+        snappy.compress(bytes_of([])).len() == 1)
+    var run: [i64] = []
+    for _i in 0..500 {
+        run.push(66)
+    }
+    let repeated = bytes_of(run)
+    say(f, "an overlapping copy repeats one byte five hundred times",
+        (snappy.decompress(snappy.compress(repeated), 600) ?? "x".to_bytes()) ==
+        repeated)
+    say(f, "a length that disagrees with the data is refused",
+        snappy_refuses(bytes_of([200, 1, 0]), 1000))
+    say(f, "and so is an offset past the output",
+        snappy_refuses(bytes_of([10, 5, 65, 65]), 1000))
+    say(f, "the declared length is bounded by the caller's limit",
+        snappy_refuses(packed, 100))
+    var sizes_ok = true
+    for n in [0, 1, 5, 20, 100, 1000] {
+        let sample = body(n)
+        if (snappy.decompress(snappy.compress(sample), n + 64) ?? "x".to_bytes()) !=
+        sample {
+            sizes_ok = false
+        }
+    }
+    say(f, "every length from nothing to a thousand round-trips", sizes_ok)
+}
+
+fn check_arfile(inout f: i64) / {io} {
+    print("-- ar: sixty ASCII bytes, and a pad outside the size")
+    let members = [
+        arfile.with_modified(arfile.member("short.o", "odd".to_bytes()),
+            1700000000),
+        arfile.member("a-really-long-member-name.o", "even".to_bytes()),
+        arfile.with_mode(arfile.member("run.sh", "#!/bin/sh\n".to_bytes()), 493),
+    ]
+    let data = arfile.encode(members)
+    say(f, "the archive begins with the magic line", arfile.is_archive(data))
+    let back = arfile.decode(data) ?? []
+    say(f, "three members", back.len() == 3)
+    say(f, "with their names", arfile.names(back) == ["short.o",
+        "a-really-long-member-name.o", "run.sh"])
+    // The 16-character field cannot hold the second name, so it goes in the
+    // GNU string table stored as a member called `//`.
+    say(f, "a name too long for the header still round-trips",
+        back[1].name.len() == 27)
+    say(f, "the data is intact", back[0].data.to_str() == "odd")
+    say(f, "including after an odd-length member, whose pad is not in its size",
+        back[1].data.to_str() == "even")
+    say(f, "the mode is octal in the file", back[2].mode == 493)
+    say(f, "and the modification time is seconds", back[0].modified == 1700000000)
+    say(f, "the total is the members, not the headers",
+        arfile.total_size(back) == 3 + 4 + 10)
+    say(f, "finding by name works", (arfile.find(back, "run.sh") ??
+        arfile.member("", bytes_of([]))).data.len() == 10)
+    say(f, "something that is not an archive is refused",
+        ar_refuses("not an ar file at all".to_bytes()))
+    say(f, "and a truncated header too",
+        ar_refuses("!<arch>\nshort".to_bytes()))
+    // A `.deb` is three members in a fixed order.
+    let deb = [
+        arfile.member("debian-binary", "2.0\n".to_bytes()),
+        arfile.member("control.tar.gz", "x".to_bytes()),
+        arfile.member("data.tar.xz", "y".to_bytes()),
+    ]
+    say(f, "a Debian package is recognised by its three members",
+        arfile.is_deb(arfile.decode(arfile.encode(deb)) ?? []))
+    say(f, "and an ordinary archive is not", not arfile.is_deb(back))
+}
+
+fn main() / {io} {
+    var f = 0
+
+    check_tar(f)
+    check_zip(f)
+    check_lz4(f)
+    check_snappy(f)
+    check_arfile(f)
+
+    if f == 0 {
+        print("archives: every claim held")
+    } else {
+        print("archives: {f} failed")
+    }
+}

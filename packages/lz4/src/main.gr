@@ -1,0 +1,268 @@
+// LZ4: compression that gives up ratio to run at memory speed.
+//
+// DEFLATE spends most of its time on Huffman coding, which buys it a few
+// percent and costs it an order of magnitude in throughput. LZ4 drops entropy
+// coding entirely and keeps only the LZ77 half: find a repeat, emit a
+// reference to it. The result compresses about 30% worse than gzip and
+// decompresses at several gigabytes a second, which is the trade that makes
+// it what a database's page cache, a network protocol or a log shipper uses.
+//
+// The block format is one idea repeated. A **sequence** is:
+//
+//     token   one byte: literal length in the high nibble, match length in
+//             the low one
+//     [len]   0xFF bytes while a nibble was 15, then the remainder
+//     literal that many bytes, copied as they are
+//     offset  two bytes, little-endian, how far back the match starts
+//     [len]   the match length's extension, if its nibble was 15
+//
+// The two rules that are easy to get wrong and both produce a decoder that
+// works until it does not:
+//
+//   - **Overlapping matches are legal and common.** An offset of 1 with a
+//     length of 100 means "repeat the previous byte 100 times", so the copy
+//     has to be byte at a time rather than a block move.
+//   - **The last sequence has no match**, and the last five bytes of a block
+//     must be literals. A compressor that emits a match at the end produces
+//     a block the reference decoder rejects.
+
+type Lz4Error =
+    | Truncated(at: i64)
+    | BadOffset(at: i64, offset: i64)
+    | TooLarge(want: i64)
+
+fn min_match() -> i64 {
+    return 4
+}
+
+fn window() -> i64 {
+    return 65535
+}
+
+fn mask32(v: i64) -> i64 {
+    return v.bit_and(4294967295)
+}
+
+/// A 32-bit multiply that keeps only the low half.
+///
+/// Split at sixteen bits, because the full product of two 32-bit values
+/// overflows an `i64` and a debug build traps on it — and a wrapped product
+/// is a negative index into the table, which is what it was.
+fn mul32(a: i64, b: i64) -> i64 {
+    let hi = a / 65536
+    let lo = a % 65536
+    return mask32((hi * b) % 65536 * 65536 + lo * b)
+}
+
+/// The hash of four bytes at `at`, for the match-finding table.
+fn hash4(data: bytes, at: i64) -> i64 {
+    let v = mask32(data.at(at).bit_or(data.at(at + 1).shl(8))
+            .bit_or(data.at(at + 2).shl(16)).bit_or(data.at(at + 3).shl(24)))
+        // Knuth's multiplicative hash; the top twelve bits index the table.
+    return mul32(v, 2654435761).ushr(20)
+}
+
+fn push_length(inout out: [i64], value: i64) {
+    var left = value
+    while left >= 255 {
+        out.push(255)
+        left = left - 255
+    }
+    out.push(left)
+}
+
+/// Compress a block.
+///
+/// A single hash table of the last position each four-byte sequence was seen
+/// at — the "fast" mode, which is what LZ4 is for. A thorough search would
+/// buy a few percent and cost the throughput that is the whole point.
+pub fn compress(data: bytes) -> bytes {
+    var out: [i64] = []
+    if data.len() == 0 {
+        // An empty block is one token saying "no literals, no match", not
+        // nothing: a decoder handed zero bytes has no sequence to read and
+        // reports the block as corrupt.
+        out.push(0)
+        return bytes_of(out)
+    }
+    var table: [i64] = []
+    for _i in 0..4096 {
+        table.push(0 - 1)
+    }
+    var at = 0
+    var literal_start = 0
+    // The last five bytes are always literals, and a match may not start
+    // within twelve of the end.
+    let limit = data.len() - 12
+    while at < limit {
+        let h = hash4(data, at)
+        let candidate = table[h]
+        table[h] = at
+        if candidate < 0 or at - candidate > window() or
+        data.at(candidate) != data.at(at) or
+        data.at(candidate + 1) != data.at(at + 1) or
+        data.at(candidate + 2) != data.at(at + 2) or
+        data.at(candidate + 3) != data.at(at + 3) {
+            at = at + 1
+            continue
+        }
+        // Extend the match as far as it goes, stopping five bytes from the
+        // end so the tail stays literal.
+        var length = min_match()
+        while at + length < data.len() - 5 and
+        data.at(candidate + length) == data.at(at + length) {
+            length = length + 1
+        }
+        let literals = at - literal_start
+        let extra_literal = if literals >= 15 { 15 } else { literals }
+        let match_extra = length - min_match()
+        let extra_match = if match_extra >= 15 { 15 } else { match_extra }
+        out.push(extra_literal.shl(4).bit_or(extra_match))
+        if literals >= 15 {
+            push_length(out, literals - 15)
+        }
+        for i in 0..literals {
+            out.push(data.at(literal_start + i))
+        }
+        let offset = at - candidate
+        out.push(offset.bit_and(255))
+        out.push(offset.ushr(8).bit_and(255))
+        if match_extra >= 15 {
+            push_length(out, match_extra - 15)
+        }
+        at = at + length
+        literal_start = at
+    }
+    // The final sequence: literals only, no offset.
+    let literals = data.len() - literal_start
+    let extra_literal = if literals >= 15 { 15 } else { literals }
+    out.push(extra_literal.shl(4))
+    if literals >= 15 {
+        push_length(out, literals - 15)
+    }
+    for i in 0..literals {
+        out.push(data.at(literal_start + i))
+    }
+    return bytes_of(out)
+}
+
+fn read_length(data: bytes, inout at: i64, nibble: i64) -> i64 ! Lz4Error {
+    var total = nibble
+    if nibble < 15 {
+        return total
+    }
+    while true {
+        if at >= data.len() {
+            fail(Truncated(at))
+        }
+        let b = data.at(at)
+        at = at + 1
+        total = total + b
+        if b != 255 {
+            return total
+        }
+    }
+    return total
+}
+
+/// Decompress a block. `limit` bounds the output, because the length is not
+/// in the block and an attacker chooses the input.
+pub fn decompress(data: bytes, limit: i64) -> bytes ! Lz4Error {
+    var out: [i64] = []
+    var at = 0
+    while at < data.len() {
+        let token = data.at(at)
+        at = at + 1
+        let literals = try read_length(data, at, token.ushr(4))
+        if at + literals > data.len() {
+            fail(Truncated(at))
+        }
+        if out.len() + literals > limit {
+            fail(TooLarge(out.len() + literals))
+        }
+        for i in 0..literals {
+            out.push(data.at(at + i))
+        }
+        at = at + literals
+        if at >= data.len() {
+            // The last sequence has no match, which is how a block ends.
+            break
+        }
+        if at + 2 > data.len() {
+            fail(Truncated(at))
+        }
+        let offset = data.at(at).bit_or(data.at(at + 1).shl(8))
+        at = at + 2
+        if offset == 0 or offset > out.len() {
+            fail(BadOffset(at, offset))
+        }
+        let length = (try read_length(data, at, token.bit_and(15))) + min_match()
+        if out.len() + length > limit {
+            fail(TooLarge(out.len() + length))
+        }
+        // One byte at a time, because an offset of 1 means "repeat the last
+        // byte" and a block copy would read what has not been written.
+        var from = out.len() - offset
+        for _i in 0..length {
+            out.push(out[from])
+            from = from + 1
+        }
+    }
+    return bytes_of(out)
+}
+
+/// The largest a block of `n` bytes can compress to.
+///
+/// Incompressible input costs a little more than it started as, and a caller
+/// sizing a buffer needs the bound rather than a guess.
+pub fn compress_bound(n: i64) -> i64 {
+    return n + n / 255 + 16
+}
+
+/// How much smaller, in percent. Negative when it grew.
+pub fn saved_percent(original: i64, compressed: i64) -> i64 {
+    if original == 0 {
+        return 0
+    }
+    return (original - compressed) * 100 / original
+}
+
+/// A framed block: the uncompressed length in front, so a decoder does not
+/// need to be told.
+///
+/// Not the official LZ4 frame format — that carries a magic number, flags, a
+/// block checksum and a content checksum. This is the minimal framing a
+/// caller usually wants, and it says so rather than implying compatibility.
+pub fn compress_framed(data: bytes) -> bytes {
+    let body = compress(data)
+    var out: [i64] = []
+    for i in 0..4 {
+        out.push(data.len().ushr(i * 8).bit_and(255))
+    }
+    for i in 0..body.len() {
+        out.push(body.at(i))
+    }
+    return bytes_of(out)
+}
+
+pub fn decompress_framed(data: bytes) -> bytes ! Lz4Error {
+    if data.len() < 4 {
+        fail(Truncated(0))
+    }
+    var size = 0
+    for i in 0..4 {
+        size = size.bit_or(data.at(i).shl(i * 8))
+    }
+    return try decompress(data.slice(4, data.len() - 4), size)
+}
+
+pub fn framed_size(data: bytes) -> i64 {
+    if data.len() < 4 {
+        return 0
+    }
+    var size = 0
+    for i in 0..4 {
+        size = size.bit_or(data.at(i).shl(i * 8))
+    }
+    return size
+}

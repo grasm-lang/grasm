@@ -1,0 +1,24 @@
+[package]
+name = "archives_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.tar]
+path = "../tar"
+version = "^1.0.0"
+
+[dependencies.zip]
+path = "../zip"
+version = "^1.0.0"
+
+[dependencies.lz4]
+path = "../lz4"
+version = "^1.0.0"
+
+[dependencies.snappy]
+path = "../snappy"
+version = "^1.0.0"
+
+[dependencies.arfile]
+path = "../arfile"
+version = "^1.0.0"

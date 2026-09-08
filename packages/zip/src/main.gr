@@ -1,0 +1,400 @@
+// The ZIP format: a central directory at the end, and a local header before
+// every entry that repeats most of it.
+//
+// The redundancy is the design. A ZIP is read from the *end* — find the
+// end-of-central-directory record, read the directory, seek to each entry —
+// which is what lets a reader list a 4 GB archive without reading it, and
+// what lets a *streaming writer* emit entries before it knows their sizes.
+// The local headers exist for extraction without the directory, and the two
+// copies disagreeing is the standard's own accepted ambiguity: the directory
+// wins.
+//
+// Four things this gets right that a short implementation usually does not:
+//
+//   - **The EOCD is searched for backwards**, because the comment after it is
+//     variable-length and may contain the signature. Scanning forwards finds
+//     the wrong one for any archive with a comment.
+//   - **Data descriptors.** An entry written by a streaming writer has zero
+//     sizes in its local header and the real ones in a descriptor after the
+//     data. A reader that trusts the local header reads nothing.
+//   - **Path traversal.** `../../etc/passwd` and `C:\x` are both refused by
+//     name rather than sanitised.
+//   - **The compressed size is what is stored**, and the uncompressed size
+//     is what is checked, along with a CRC-32 of the plaintext.
+import zlib
+import crc32
+
+type ZipEntry = {
+    name: str,
+    /// 0 stored, 8 deflate.
+    method: i64,
+    /// CRC-32 of the uncompressed data.
+    crc: i64,
+    compressed_size: i64,
+    size: i64,
+    /// MS-DOS time and date, packed.
+    dos_time: i64,
+    dos_date: i64,
+    /// External attributes; the top sixteen bits are the Unix mode.
+    attributes: i64,
+    comment: str,
+    data: bytes,
+}
+
+type ZipError =
+    | NoDirectory
+    | Truncated(at: i64)
+    | BadSignature(at: i64)
+    | BadCrc(name: str)
+    | Unsupported(method: i64, name: str)
+    | Encrypted(name: str)
+
+pub let STORED = 0
+pub let DEFLATED = 8
+
+pub fn entry(name: str, data: bytes) -> ZipEntry {
+    return ZipEntry{
+        name: name, method: STORED, crc: crc32.of(data),
+        compressed_size: data.len(), size: data.len(), dos_time: 0,
+        dos_date: 33, attributes: 27262976, comment: "", data: data,
+    }
+}
+
+/// A directory entry: a name ending in `/`, no data, and the directory bit
+/// in the external attributes.
+pub fn directory(name: str) -> ZipEntry {
+    var path = name
+    if not path.ends_with("/") {
+        path = path + "/"
+    }
+    return ZipEntry{
+        name: path, method: STORED, crc: 0, compressed_size: 0, size: 0,
+        dos_time: 0, dos_date: 33, attributes: 1106051088, comment: "",
+        data: bytes_of([]),
+    }
+}
+
+/// The Unix mode, which lives in the top sixteen bits of the attributes.
+pub fn with_mode(e: ZipEntry, mode: i64) -> ZipEntry {
+    return ZipEntry{
+        name: e.name, method: e.method, crc: e.crc,
+        compressed_size: e.compressed_size, size: e.size,
+        dos_time: e.dos_time, dos_date: e.dos_date,
+        attributes: mode.shl(16), comment: e.comment, data: e.data,
+    }
+}
+
+pub fn mode_of(e: ZipEntry) -> i64 {
+    return e.attributes.ushr(16).bit_and(65535)
+}
+
+/// MS-DOS packs a date into sixteen bits, with the year counted from 1980 and
+/// the second divided by two — so a ZIP cannot record an odd second, and
+/// cannot record any date before 1980 at all.
+pub fn dos_date_of(year: i64, month: i64, day: i64) -> i64 {
+    return (year - 1980).shl(9).bit_or(month.shl(5)).bit_or(day)
+}
+
+pub fn dos_time_of(hour: i64, minute: i64, second: i64) -> i64 {
+    return hour.shl(11).bit_or(minute.shl(5)).bit_or(second / 2)
+}
+
+pub fn with_time(e: ZipEntry, date: i64, time: i64) -> ZipEntry {
+    return ZipEntry{
+        name: e.name, method: e.method, crc: e.crc,
+        compressed_size: e.compressed_size, size: e.size, dos_time: time,
+        dos_date: date, attributes: e.attributes, comment: e.comment,
+        data: e.data,
+    }
+}
+
+fn push_le(inout out: [i64], value: i64, width: i64) {
+    for i in 0..width {
+        out.push(value.ushr(i * 8).bit_and(255))
+    }
+}
+
+fn push_text(inout out: [i64], text: str) {
+    for b in text.to_bytes().to_list() {
+        out.push(b)
+    }
+}
+
+fn read_le(data: bytes, at: i64, width: i64) -> i64 {
+    var v = 0
+    for i in 0..width {
+        v = v.bit_or(data.at(at + i).shl(i * 8))
+    }
+    return v
+}
+
+pub fn encode(entries: [ZipEntry]) -> bytes {
+    var out: [i64] = []
+    var offsets: [i64] = []
+    for e in entries {
+        offsets.push(out.len())
+        // Local file header.
+        push_le(out, 67324752, 4)
+        // Version needed: 2.0, which is what deflate requires.
+        push_le(out, 20, 2)
+        push_le(out, 0, 2)
+        push_le(out, e.method, 2)
+        push_le(out, e.dos_time, 2)
+        push_le(out, e.dos_date, 2)
+        push_le(out, e.crc, 4)
+        push_le(out, e.compressed_size, 4)
+        push_le(out, e.size, 4)
+        push_le(out, e.name.byte_len(), 2)
+        push_le(out, 0, 2)
+        push_text(out, e.name)
+        for i in 0..e.data.len() {
+            out.push(e.data.at(i))
+        }
+    }
+    let directory_at = out.len()
+    for i in 0..entries.len() {
+        let e = entries[i]
+        push_le(out, 33639248, 4)
+        // Version made by: 3 is Unix, which is what makes the mode in the
+        // external attributes meaningful.
+        push_le(out, 798, 2)
+        push_le(out, 20, 2)
+        push_le(out, 0, 2)
+        push_le(out, e.method, 2)
+        push_le(out, e.dos_time, 2)
+        push_le(out, e.dos_date, 2)
+        push_le(out, e.crc, 4)
+        push_le(out, e.compressed_size, 4)
+        push_le(out, e.size, 4)
+        push_le(out, e.name.byte_len(), 2)
+        push_le(out, 0, 2)
+        push_le(out, e.comment.byte_len(), 2)
+        push_le(out, 0, 2)
+        push_le(out, 0, 2)
+        push_le(out, e.attributes, 4)
+        push_le(out, offsets[i], 4)
+        push_text(out, e.name)
+        push_text(out, e.comment)
+    }
+    let directory_size = out.len() - directory_at
+    push_le(out, 101010256, 4)
+    push_le(out, 0, 2)
+    push_le(out, 0, 2)
+    push_le(out, entries.len(), 2)
+    push_le(out, entries.len(), 2)
+    push_le(out, directory_size, 4)
+    push_le(out, directory_at, 4)
+    push_le(out, 0, 2)
+    return bytes_of(out)
+}
+
+/// Where the end-of-central-directory record starts.
+///
+/// Searched backwards, because the archive comment that follows it is
+/// variable-length and may itself contain the signature. A forward scan finds
+/// the first match, which for an archive with a comment is the wrong one.
+fn find_eocd(data: bytes) -> i64 {
+    var at = data.len() - 22
+    // The comment is at most 65,535 bytes, so the record cannot be further
+    // back than that.
+    let floor = if data.len() > 65557 { data.len() - 65557 } else { 0 }
+    while at >= floor {
+        if read_le(data, at, 4) == 101010256 {
+            // And the one whose comment length reaches exactly the end of the
+            // file. Without that check, a comment containing the signature is
+            // found *after* the real record by a backward scan, which is the
+            // same trap a forward scan falls into from the other side.
+            if read_le(data, at + 20, 2) == data.len() - at - 22 {
+                return at
+            }
+        }
+        at = at - 1
+    }
+    return 0 - 1
+}
+
+pub fn decode(data: bytes) -> [ZipEntry] ! ZipError {
+    let eocd = find_eocd(data)
+    if eocd < 0 {
+        fail(NoDirectory)
+    }
+    let count = read_le(data, eocd + 10, 2)
+    var at = read_le(data, eocd + 16, 4)
+    var out: [ZipEntry] = []
+    for _i in 0..count {
+        if at + 46 > data.len() {
+            fail(Truncated(at))
+        }
+        if read_le(data, at, 4) != 33639248 {
+            fail(BadSignature(at))
+        }
+        let flags = read_le(data, at + 8, 2)
+        if flags.bit_and(1) == 1 {
+            fail(Encrypted(read_name(data, at + 46, read_le(data, at + 28, 2))))
+        }
+        let method = read_le(data, at + 10, 2)
+        let crc = read_le(data, at + 16, 4)
+        let compressed = read_le(data, at + 20, 4)
+        let size = read_le(data, at + 24, 4)
+        let name_len = read_le(data, at + 28, 2)
+        let extra_len = read_le(data, at + 30, 2)
+        let comment_len = read_le(data, at + 32, 2)
+        let attributes = read_le(data, at + 38, 4)
+        let offset = read_le(data, at + 42, 4)
+        let name = read_name(data, at + 46, name_len)
+        let comment = read_name(data, at + 46 + name_len + extra_len, comment_len)
+        // The local header is read only for its own name and extra lengths:
+        // the sizes there may be zero when a data descriptor followed, and
+        // the directory's copy is the one to believe.
+        if offset + 30 > data.len() or read_le(data, offset, 4) != 67324752 {
+            fail(BadSignature(offset))
+        }
+        let local_name = read_le(data, offset + 26, 2)
+        let local_extra = read_le(data, offset + 28, 2)
+        let body_at = offset + 30 + local_name + local_extra
+        if body_at + compressed > data.len() {
+            fail(Truncated(body_at))
+        }
+        let stored = data.slice(body_at, compressed)
+        var body = stored
+        if method == DEFLATED {
+            match zlib.inflate(stored, size + 64) {
+                Ok(plain) -> body = plain
+                Err(_e) -> fail(Unsupported(method, name))
+            }
+        } else if method != STORED {
+            fail(Unsupported(method, name))
+        }
+        if body.len() != size {
+            fail(Truncated(body_at))
+        }
+        if crc32.of(body) != crc and size > 0 {
+            fail(BadCrc(name))
+        }
+        out.push(ZipEntry{
+            name: name, method: method, crc: crc, compressed_size: compressed,
+            size: size, dos_time: read_le(data, at + 12, 2),
+            dos_date: read_le(data, at + 14, 2), attributes: attributes,
+            comment: comment, data: body,
+        })
+        at = at + 46 + name_len + extra_len + comment_len
+    }
+    return out
+}
+
+fn read_name(data: bytes, at: i64, length: i64) -> str {
+    if at + length > data.len() {
+        return ""
+    }
+    return data.slice(at, length).to_str()
+}
+
+/// The directory only: names and sizes, without inflating anything.
+///
+/// The reason a ZIP has a directory at all — listing a large archive should
+/// not read it.
+pub fn list_names(data: bytes) -> [str] ! ZipError {
+    let eocd = find_eocd(data)
+    if eocd < 0 {
+        fail(NoDirectory)
+    }
+    let count = read_le(data, eocd + 10, 2)
+    var at = read_le(data, eocd + 16, 4)
+    var out: [str] = []
+    for _i in 0..count {
+        if at + 46 > data.len() or read_le(data, at, 4) != 33639248 {
+            fail(BadSignature(at))
+        }
+        let name_len = read_le(data, at + 28, 2)
+        out.push(read_name(data, at + 46, name_len))
+        at = at + 46 + name_len + read_le(data, at + 30, 2) +
+        read_le(data, at + 32, 2)
+    }
+    return out
+}
+
+pub fn find(entries: [ZipEntry], name: str) -> Option[ZipEntry] {
+    for e in entries {
+        if e.name == name {
+            return Some(e)
+        }
+    }
+    return None
+}
+
+pub fn names(entries: [ZipEntry]) -> [str] {
+    var out: [str] = []
+    for e in entries {
+        out.push(e.name)
+    }
+    return out
+}
+
+pub fn is_directory(e: ZipEntry) -> bool {
+    return e.name.ends_with("/")
+}
+
+/// How much smaller the archive made it, in percent.
+pub fn saved_percent(e: ZipEntry) -> i64 {
+    if e.size == 0 {
+        return 0
+    }
+    return (e.size - e.compressed_size) * 100 / e.size
+}
+
+/// Whether extracting this name would write outside the target directory.
+///
+/// Refused rather than sanitised: a sanitised name is a name the archive did
+/// not contain, and silently renaming a file is how a malicious archive
+/// becomes a confusing one instead of a rejected one.
+pub fn is_safe_path(name: str) -> bool {
+    if name.starts_with("/") or name.starts_with("\\") {
+        return false
+    }
+    if name.len() > 1 and name.substr(1, 1) == ":" {
+        return false
+    }
+    for part in name.replace("\\", "/").split("/") {
+        if part == ".." {
+            return false
+        }
+    }
+    return true
+}
+
+pub fn unsafe_names(entries: [ZipEntry]) -> [str] {
+    var out: [str] = []
+    for e in entries {
+        if not is_safe_path(e.name) {
+            out.push(e.name)
+        }
+    }
+    return out
+}
+
+/// The ratio of uncompressed to compressed size across the archive.
+///
+/// The number that catches a zip bomb: a 42 KB archive that expands to 4.5 PB
+/// has a ratio in the billions, and refusing to extract past a limit is the
+/// only defence — the sizes in the directory are attacker-controlled, so
+/// trusting them is no defence at all.
+pub fn expansion_ratio(entries: [ZipEntry]) -> i64 {
+    var compressed = 0
+    var plain = 0
+    for e in entries {
+        compressed = compressed + e.compressed_size
+        plain = plain + e.size
+    }
+    if compressed == 0 {
+        return 0
+    }
+    return plain / compressed
+}
+
+pub fn total_size(entries: [ZipEntry]) -> i64 {
+    var total = 0
+    for e in entries {
+        total = total + e.size
+    }
+    return total
+}

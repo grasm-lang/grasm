@@ -1,0 +1,491 @@
+// The tar format: 512-byte headers, in octal, with three incompatible
+// extensions and no index.
+//
+// What makes tar awkward is that its header has fixed-width fields and the
+// world outgrew all of them. A name over 100 characters, a file over 8 GB, a
+// user id over 2,097,151 — each needed an extension, and there are three:
+//
+//   - **v7**, the original, which cannot express any of it.
+//   - **USTAR**, which splits a long name across a 155-character prefix and
+//     the 100-character name, so a path fits if it has a `/` in the right
+//     place and does not otherwise.
+//   - **PAX**, which gives up and writes the real values as a small text
+//     record in a preceding entry. It is the only one that always works, and
+//     it is what `tar` has produced by default since 2001.
+//
+// This reads all three and writes PAX when a field does not fit, which is
+// what an extractor on the other end expects.
+//
+// The checksum is the other trap: it is computed over the header with the
+// checksum field itself treated as eight spaces, and it is stored as octal
+// with a NUL and a space after it. Getting the padding wrong produces an
+// archive that GNU tar reads and BSD tar refuses.
+
+type TarEntry = {
+    name: str,
+    /// Octal in the file; an integer here.
+    mode: i64,
+    uid: i64,
+    gid: i64,
+    size: i64,
+    modified: i64,
+    /// "0" file, "5" directory, "2" symlink, "1" hard link.
+    kind: str,
+    link_target: str,
+    user: str,
+    group: str,
+    data: bytes,
+}
+
+type TarError =
+    | Truncated(at: i64)
+    | BadChecksum(name: str, at: i64)
+    | BadNumber(field: str, at: i64)
+    | NameTooLong(name: str)
+
+pub let FILE = "0"
+pub let HARD_LINK = "1"
+pub let SYMLINK = "2"
+pub let DIRECTORY = "5"
+pub let PAX_HEADER = "x"
+pub let PAX_GLOBAL = "g"
+pub let LONG_NAME = "L"
+
+pub fn block_size() -> i64 {
+    return 512
+}
+
+pub fn entry(name: str, data: bytes) -> TarEntry {
+    return TarEntry{
+        name: name, mode: 420, uid: 0, gid: 0, size: data.len(),
+        modified: 0, kind: FILE, link_target: "", user: "", group: "",
+        data: data,
+    }
+}
+
+pub fn directory(name: str) -> TarEntry {
+    var path = name
+    if not path.ends_with("/") {
+        path = path + "/"
+    }
+    return TarEntry{
+        name: path, mode: 493, uid: 0, gid: 0, size: 0, modified: 0,
+        kind: DIRECTORY, link_target: "", user: "", group: "",
+        data: bytes_of([]),
+    }
+}
+
+pub fn symlink(name: str, target: str) -> TarEntry {
+    return TarEntry{
+        name: name, mode: 511, uid: 0, gid: 0, size: 0, modified: 0,
+        kind: SYMLINK, link_target: target, user: "", group: "",
+        data: bytes_of([]),
+    }
+}
+
+pub fn with_mode(e: TarEntry, mode: i64) -> TarEntry {
+    return TarEntry{
+        name: e.name, mode: mode, uid: e.uid, gid: e.gid, size: e.size,
+        modified: e.modified, kind: e.kind, link_target: e.link_target,
+        user: e.user, group: e.group, data: e.data,
+    }
+}
+
+pub fn with_modified(e: TarEntry, when: i64) -> TarEntry {
+    return TarEntry{
+        name: e.name, mode: e.mode, uid: e.uid, gid: e.gid, size: e.size,
+        modified: when, kind: e.kind, link_target: e.link_target,
+        user: e.user, group: e.group, data: e.data,
+    }
+}
+
+pub fn with_owner(e: TarEntry, uid: i64, gid: i64, user: str,
+    group: str) -> TarEntry {
+    return TarEntry{
+        name: e.name, mode: e.mode, uid: uid, gid: gid, size: e.size,
+        modified: e.modified, kind: e.kind, link_target: e.link_target,
+        user: user, group: group, data: e.data,
+    }
+}
+
+/// An octal field: right-aligned, zero-padded, then a NUL.
+///
+/// `width` counts the NUL, which is why the number gets `width - 1`
+/// characters. Writing `width` digits and no NUL is the single most common
+/// way to produce an archive that half the extractors reject.
+fn octal_field(value: i64, width: i64) -> [i64] {
+    var text = value.to_base(8)
+    while text.len() < width - 1 {
+        text = "0" + text
+    }
+    var out: [i64] = []
+    for c in text.chars() {
+        out.push(c.code_at(0))
+    }
+    out.push(0)
+    return out
+}
+
+fn text_field(value: str, width: i64) -> [i64] {
+    var out: [i64] = []
+    let raw = value.to_bytes()
+    for i in 0..width {
+        out.push(if i < raw.len() { raw.at(i) } else { 0 })
+    }
+    return out
+}
+
+fn read_text(data: bytes, at: i64, width: i64) -> str {
+    var out: [i64] = []
+    for i in 0..width {
+        let b = data.at(at + i)
+        if b == 0 {
+            break
+        }
+        out.push(b)
+    }
+    return bytes_of(out).to_str()
+}
+
+fn read_octal(data: bytes, at: i64, width: i64) -> i64 {
+    var out = 0
+    for i in 0..width {
+        let b = data.at(at + i)
+        if b < 48 or b > 55 {
+            // A space or a NUL ends the number; anything else is not octal
+            // and stopping is better than reading it as a digit.
+            break
+        }
+        out = out * 8 + (b - 48)
+    }
+    return out
+}
+
+/// The header's checksum: every byte summed, with the checksum field itself
+/// counted as eight spaces.
+fn checksum_of(header: [i64]) -> i64 {
+    var total = 0
+    for i in 0..512 {
+        if i >= 148 and i < 156 {
+            total = total + 32
+        } else {
+            total = total + header[i]
+        }
+    }
+    return total
+}
+
+fn split_ustar_name(name: str) -> (str, str) {
+    if name.len() <= 100 {
+        return (name, "")
+    }
+    // USTAR splits at a `/`, with at most 155 before it and 100 after.
+    let cs = name.chars()
+    var at = name.len() - 100
+    while at < name.len() {
+        if cs[at] == "/" and at <= 155 {
+            return (name.substr(at + 1, name.len() - at - 1),
+                name.substr(0, at))
+        }
+        at = at + 1
+    }
+    return ("", "")
+}
+
+fn header_for(e: TarEntry, name: str, prefix: str, kind: str,
+    size: i64) -> [i64] {
+    var h: [i64] = []
+    for b in text_field(name, 100) {
+        h.push(b)
+    }
+    for b in octal_field(e.mode, 8) {
+        h.push(b)
+    }
+    for b in octal_field(e.uid, 8) {
+        h.push(b)
+    }
+    for b in octal_field(e.gid, 8) {
+        h.push(b)
+    }
+    for b in octal_field(size, 12) {
+        h.push(b)
+    }
+    for b in octal_field(e.modified, 12) {
+        h.push(b)
+    }
+    // The checksum field, filled in below.
+    for _i in 0..8 {
+        h.push(32)
+    }
+    h.push(kind.code_at(0))
+    for b in text_field(e.link_target, 100) {
+        h.push(b)
+    }
+    // "ustar" and the version "00", which is what says this is USTAR and not
+    // the 1979 format.
+    for b in text_field("ustar", 6) {
+        h.push(b)
+    }
+    h.push(48)
+    h.push(48)
+    for b in text_field(e.user, 32) {
+        h.push(b)
+    }
+    for b in text_field(e.group, 32) {
+        h.push(b)
+    }
+    for b in octal_field(0, 8) {
+        h.push(b)
+    }
+    for b in octal_field(0, 8) {
+        h.push(b)
+    }
+    for b in text_field(prefix, 155) {
+        h.push(b)
+    }
+    while h.len() < 512 {
+        h.push(0)
+    }
+    let sum = checksum_of(h)
+    // Six octal digits, a NUL, then a space — in that order, which is what
+    // every extractor accepts and what a plain octal field is not.
+    var text = sum.to_base(8)
+    while text.len() < 6 {
+        text = "0" + text
+    }
+    for i in 0..6 {
+        h[148 + i] = text.chars()[i].code_at(0)
+    }
+    h[154] = 0
+    h[155] = 32
+    return h
+}
+
+fn pad_to_block(inout out: [i64]) {
+    while out.len() % 512 != 0 {
+        out.push(0)
+    }
+}
+
+/// A PAX record: "length key=value\n", where the length counts itself.
+///
+/// Self-referential, so it is computed by trying a length and growing it when
+/// the digits push it over — which is the whole reason this is a function
+/// rather than a format string.
+fn pax_record(key: str, value: str) -> str {
+    let body = " " + key + "=" + value + "\n"
+    var length = body.len() + 1
+    var text = "{length}"
+    while text.len() + body.len() != length {
+        length = text.len() + body.len()
+        text = "{length}"
+    }
+    return text + body
+}
+
+pub fn encode(entries: [TarEntry]) -> bytes {
+    var out: [i64] = []
+    for e in entries {
+        let split = split_ustar_name(e.name)
+        if split.0 == "" and e.name != "" {
+            // The name fits nowhere in the header, so it goes in a PAX
+            // record ahead of it and the header carries a stand-in.
+            let record = pax_record("path", e.name)
+            var meta = TarEntry{
+                name: "PaxHeader", mode: 420, uid: 0, gid: 0,
+                size: record.byte_len(), modified: e.modified, kind: PAX_HEADER,
+                link_target: "", user: "", group: "", data: record.to_bytes(),
+            }
+            for b in header_for(meta, "PaxHeader", "", PAX_HEADER,
+                record.byte_len()) {
+                out.push(b)
+            }
+            for b in record.to_bytes().to_list() {
+                out.push(b)
+            }
+            pad_to_block(out)
+            for b in header_for(e, "PaxHeader", "", e.kind, e.size) {
+                out.push(b)
+            }
+        } else {
+            for b in header_for(e, split.0, split.1, e.kind, e.size) {
+                out.push(b)
+            }
+        }
+        for i in 0..e.data.len() {
+            out.push(e.data.at(i))
+        }
+        pad_to_block(out)
+    }
+    // Two empty blocks end the archive, and a reader that stops at one will
+    // read a concatenated archive as truncated.
+    for _i in 0..1024 {
+        out.push(0)
+    }
+    return bytes_of(out)
+}
+
+fn is_zero_block(data: bytes, at: i64) -> bool {
+    for i in 0..512 {
+        if at + i >= data.len() or data.at(at + i) != 0 {
+            return false
+        }
+    }
+    return true
+}
+
+fn parse_pax(text: str) -> ([str], [str]) {
+    var keys: [str] = []
+    var values: [str] = []
+    var rest = text
+    while rest.len() > 0 {
+        let space = rest.index_of(" ") ?? 0 - 1
+        if space < 0 {
+            break
+        }
+        let length = rest.substr(0, space).parse_int() ?? 0
+        if length <= 0 or length > rest.len() {
+            break
+        }
+        let body = rest.substr(space + 1, length - space - 2)
+        match body.index_of("=") {
+            Some(at) -> {
+                keys.push(body.substr(0, at))
+                values.push(body.substr(at + 1, body.len() - at - 1))
+            }
+            None -> {}
+        }
+        rest = rest.substr(length, rest.len() - length)
+    }
+    return (keys, values)
+}
+
+pub fn decode(data: bytes) -> [TarEntry] ! TarError {
+    // Every tar is a whole number of 512-byte blocks. Anything else is not a
+    // truncated tar, it is not a tar — and reading it as an empty archive
+    // would report success for a file that is nothing of the kind.
+    if data.len() % block_size() != 0 or data.len() < block_size() {
+        fail(Truncated(data.len()))
+    }
+    var out: [TarEntry] = []
+    var at = 0
+    var pending_name = ""
+    while at + 512 <= data.len() {
+        if is_zero_block(data, at) {
+            break
+        }
+        var header: [i64] = []
+        for i in 0..512 {
+            header.push(data.at(at + i))
+        }
+        let stored = read_octal(data, at + 148, 8)
+        if stored != checksum_of(header) {
+            fail(BadChecksum(read_text(data, at, 100), at))
+        }
+        // Kept, because `at` moves past the body and the padding below and
+        // every field offset is measured from the header's own start.
+        let header_at = at
+        var name = read_text(data, at, 100)
+        let prefix = read_text(data, at + 345, 155)
+        if prefix != "" {
+            name = prefix + "/" + name
+        }
+        let size = read_octal(data, at + 124, 12)
+        let kind = read_text(data, at + 156, 1)
+        at = at + 512
+        if at + size > data.len() {
+            fail(Truncated(at))
+        }
+        let body = data.slice(at, size)
+        at = at + size
+        if size % 512 != 0 {
+            at = at + (512 - size % 512)
+        }
+        if kind == PAX_HEADER or kind == PAX_GLOBAL {
+            // The records apply to the entry that follows.
+            let records = parse_pax(body.to_str())
+            for i in 0..records.0.len() {
+                if records.0[i] == "path" {
+                    pending_name = records.1[i]
+                }
+            }
+            continue
+        }
+        if kind == LONG_NAME {
+            pending_name = body.to_str().replace((0).to_char(), "")
+            continue
+        }
+        if pending_name != "" {
+            name = pending_name
+            pending_name = ""
+        }
+        out.push(TarEntry{
+            name: name, mode: read_octal(data, header_at + 100, 8),
+            uid: read_octal(data, header_at + 108, 8),
+            gid: read_octal(data, header_at + 116, 8),
+            size: size, modified: read_octal(data, header_at + 136, 12),
+            kind: if kind == "" { FILE } else { kind },
+            link_target: read_text(data, header_at + 157, 100),
+            user: read_text(data, header_at + 265, 32),
+            group: read_text(data, header_at + 297, 32),
+            data: body,
+        })
+    }
+    return out
+}
+
+pub fn names(entries: [TarEntry]) -> [str] {
+    var out: [str] = []
+    for e in entries {
+        out.push(e.name)
+    }
+    return out
+}
+
+pub fn find(entries: [TarEntry], name: str) -> Option[TarEntry] {
+    for e in entries {
+        if e.name == name {
+            return Some(e)
+        }
+    }
+    return None
+}
+
+pub fn total_size(entries: [TarEntry]) -> i64 {
+    var total = 0
+    for e in entries {
+        total = total + e.size
+    }
+    return total
+}
+
+/// Whether a name would escape the directory it is extracted into.
+///
+/// The check every extractor needs and many have shipped without: an entry
+/// named `../../etc/passwd` writes outside the target, and an absolute name
+/// writes wherever it says. Both are refused here rather than sanitised,
+/// because a sanitised name is a name the archive did not contain.
+pub fn is_safe_path(name: str) -> bool {
+    if name.starts_with("/") or name.starts_with("\\") {
+        return false
+    }
+    if name.len() > 1 and name.substr(1, 1) == ":" {
+        return false
+    }
+    for part in name.split("/") {
+        if part == ".." {
+            return false
+        }
+    }
+    return true
+}
+
+pub fn unsafe_names(entries: [TarEntry]) -> [str] {
+    var out: [str] = []
+    for e in entries {
+        if not is_safe_path(e.name) {
+            out.push(e.name)
+        }
+    }
+    return out
+}

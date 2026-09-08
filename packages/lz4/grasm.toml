@@ -1,0 +1,6 @@
+[package]
+name = "lz4"
+version = "1.0.0"
+
+# The LZ4 block format, both directions. Opens nothing.
+capabilities = []

@@ -1,0 +1,293 @@
+// `ar`: the archive format under every `.a` static library and every `.deb`.
+//
+// It is the simplest container in wide use — a magic line, then a 60-byte
+// ASCII header and the file's bytes, repeated — and its age shows in two
+// places that a naive reader gets wrong:
+//
+//   - **Padding is outside the size.** A member of odd length is followed by
+//     a newline that is *not* counted in its size field. A reader that seeks
+//     by size alone lands one byte off after the first odd member, and every
+//     header after that is garbage.
+//   - **Long names have three incompatible conventions.** The 16-character
+//     field could not hold a real path, so: BSD writes `#1/<length>` and puts
+//     the name in front of the data; GNU writes `/<offset>` into a string
+//     table stored as a member called `//`; and a short name in the GNU
+//     variant ends with `/` to mark where it stops. All three are read here,
+//     and the GNU form is written, because that is what `ar` on Linux and
+//     every `.deb` uses.
+//
+// The fields are ASCII decimal, space-padded, which means a `.a` file can be
+// read with `head` — which was the point in 1971 and is still occasionally
+// useful.
+//
+// One thing this does not do, because it cannot: BSD `ar` pads a member's
+// *contents* to an eight-byte boundary and counts the padding in the size, so
+// a six-byte file reads back as eight. Nothing in the header distinguishes
+// the padding from the file, and stripping trailing newlines would corrupt
+// any archive whose members legitimately end in one. The bytes are reported
+// as the archive stores them.
+
+type ArMember = {
+    name: str,
+    /// Seconds since the epoch, as written.
+    modified: i64,
+    uid: i64,
+    gid: i64,
+    /// Octal in the file.
+    mode: i64,
+    data: bytes,
+}
+
+type ArError =
+    | NotAnArchive
+    | Truncated(at: i64)
+    | BadHeader(at: i64)
+    | BadName(at: i64)
+
+fn magic() -> str {
+    return "!<arch>\n"
+}
+
+pub fn member(name: str, data: bytes) -> ArMember {
+    return ArMember{
+        name: name, modified: 0, uid: 0, gid: 0, mode: 420, data: data,
+    }
+}
+
+pub fn with_modified(m: ArMember, when: i64) -> ArMember {
+    return ArMember{
+        name: m.name, modified: when, uid: m.uid, gid: m.gid, mode: m.mode,
+        data: m.data,
+    }
+}
+
+pub fn with_mode(m: ArMember, mode: i64) -> ArMember {
+    return ArMember{
+        name: m.name, modified: m.modified, uid: m.uid, gid: m.gid,
+        mode: mode, data: m.data,
+    }
+}
+
+fn pad_field(text: str, width: i64) -> [i64] {
+    var out: [i64] = []
+    let raw = text.to_bytes()
+    for i in 0..width {
+        out.push(if i < raw.len() { raw.at(i) } else { 32 })
+    }
+    return out
+}
+
+fn push_text(inout out: [i64], text: str) {
+    for b in text.to_bytes().to_list() {
+        out.push(b)
+    }
+}
+
+fn header_for(inout out: [i64], name: str, modified: i64, uid: i64, gid: i64,
+    mode: i64, size: i64) {
+    for b in pad_field(name, 16) {
+        out.push(b)
+    }
+    for b in pad_field("{modified}", 12) {
+        out.push(b)
+    }
+    for b in pad_field("{uid}", 6) {
+        out.push(b)
+    }
+    for b in pad_field("{gid}", 6) {
+        out.push(b)
+    }
+    for b in pad_field(mode.to_base(8), 8) {
+        out.push(b)
+    }
+    for b in pad_field("{size}", 10) {
+        out.push(b)
+    }
+    // The two-byte terminator, which is how a reader knows the header was
+    // where it thought it was.
+    out.push(96)
+    out.push(10)
+}
+
+pub fn encode(members: [ArMember]) -> bytes {
+    var out: [i64] = []
+    push_text(out, magic())
+    // The GNU string table, for every name that will not fit.
+    var long_names = ""
+    var long_offsets: [i64] = []
+    for m in members {
+        if m.name.len() > 15 {
+            long_offsets.push(long_names.len())
+            long_names = long_names + m.name + "/\n"
+        } else {
+            long_offsets.push(0 - 1)
+        }
+    }
+    if long_names.len() > 0 {
+        header_for(out, "//", 0, 0, 0, 0, long_names.byte_len())
+        push_text(out, long_names)
+        if long_names.byte_len() % 2 == 1 {
+            out.push(10)
+        }
+    }
+    for i in 0..members.len() {
+        let m = members[i]
+        var stored = m.name + "/"
+        if long_offsets[i] >= 0 {
+            stored = "/{long_offsets[i]}"
+        }
+        header_for(out, stored, m.modified, m.uid, m.gid, m.mode, m.data.len())
+        for k in 0..m.data.len() {
+            out.push(m.data.at(k))
+        }
+        // The pad byte, which is outside the size field. Counting it would
+        // make the size wrong; omitting it puts every later header one byte
+        // out.
+        if m.data.len() % 2 == 1 {
+            out.push(10)
+        }
+    }
+    return bytes_of(out)
+}
+
+fn read_field(data: bytes, at: i64, width: i64) -> str {
+    var out: [i64] = []
+    for i in 0..width {
+        out.push(data.at(at + i))
+    }
+    return bytes_of(out).to_str().trim()
+}
+
+fn name_from_table(table: str, offset: i64) -> str {
+    if offset < 0 or offset >= table.len() {
+        return ""
+    }
+    let rest = table.substr(offset, table.len() - offset)
+    match rest.index_of("/") {
+        Some(at) -> return rest.substr(0, at)
+        None -> {
+            match rest.index_of("\n") {
+                Some(at) -> return rest.substr(0, at)
+                None -> return rest
+            }
+        }
+    }
+}
+
+pub fn decode(data: bytes) -> [ArMember] ! ArError {
+    if data.len() < 8 or data.slice(0, 8).to_str() != magic() {
+        fail(NotAnArchive)
+    }
+    var out: [ArMember] = []
+    var table = ""
+    var at = 8
+    while at + 60 <= data.len() {
+        if data.at(at + 58) != 96 or data.at(at + 59) != 10 {
+            fail(BadHeader(at))
+        }
+        var name = read_field(data, at, 16)
+        let modified = read_field(data, at + 16, 12).parse_int() ?? 0
+        let uid = read_field(data, at + 28, 6).parse_int() ?? 0
+        let gid = read_field(data, at + 34, 6).parse_int() ?? 0
+        let mode = read_field(data, at + 40, 8).parse_int_base(8) ?? 0
+        var size = read_field(data, at + 48, 10).parse_int() ?? 0 - 1
+        if size < 0 {
+            fail(BadHeader(at))
+        }
+        var body_at = at + 60
+        if body_at + size > data.len() {
+            fail(Truncated(body_at))
+        }
+        if name == "//" {
+            // The GNU string table, which every long name after this indexes.
+            table = data.slice(body_at, size).to_str()
+            at = body_at + size + (size % 2)
+            continue
+        }
+        if name == "/" or name == "/SYM64/" or name.starts_with("__.SYMDEF") {
+            // The symbol index a linker uses; not a member of the archive as
+            // far as anything reading its files is concerned.
+            at = body_at + size + (size % 2)
+            continue
+        }
+        if name.starts_with("#1/") {
+            // BSD: the name is the first `length` bytes of the data, padded
+            // with NULs to a multiple of eight.
+            let length = name.substr(3, name.len() - 3).parse_int() ?? 0
+            if length <= 0 or body_at + length > data.len() {
+                fail(BadName(at))
+            }
+            name = data.slice(body_at, length).to_str().replace((0).to_char(), "")
+            body_at = body_at + length
+            size = size - length
+            if name.starts_with("__.SYMDEF") {
+                // BSD's symbol index, under the long-name convention. It is
+                // a linker's table, not one of the archive's files.
+                at = body_at + size + (size % 2)
+                continue
+            }
+        } else if name.starts_with("/") and name.len() > 1 {
+            // GNU: an offset into the string table.
+            name = name_from_table(table, name.substr(1, name.len() - 1)
+                    .parse_int() ?? 0 - 1)
+            if name == "" {
+                fail(BadName(at))
+            }
+        } else if name.ends_with("/") {
+            // GNU marks the end of a short name with a slash.
+            name = name.substr(0, name.len() - 1)
+        }
+        out.push(ArMember{
+            name: name, modified: modified, uid: uid, gid: gid, mode: mode,
+            data: data.slice(body_at, size),
+        })
+        at = body_at + size + (size % 2)
+    }
+    // Bytes left over that are too few for a header are a truncated archive,
+    // not the end of one — reading them as the end reports success for a file
+    // that stops in the middle.
+    if at != data.len() {
+        fail(Truncated(at))
+    }
+    return out
+}
+
+pub fn names(members: [ArMember]) -> [str] {
+    var out: [str] = []
+    for m in members {
+        out.push(m.name)
+    }
+    return out
+}
+
+pub fn find(members: [ArMember], name: str) -> Option[ArMember] {
+    for m in members {
+        if m.name == name {
+            return Some(m)
+        }
+    }
+    return None
+}
+
+pub fn total_size(members: [ArMember]) -> i64 {
+    var total = 0
+    for m in members {
+        total = total + m.data.len()
+    }
+    return total
+}
+
+pub fn is_archive(data: bytes) -> bool {
+    return data.len() >= 8 and data.slice(0, 8).to_str() == magic()
+}
+
+/// Whether the archive is a Debian package: three members in a fixed order,
+/// the first of which says which version of the format it is.
+pub fn is_deb(members: [ArMember]) -> bool {
+    if members.len() < 3 {
+        return false
+    }
+    return members[0].name == "debian-binary" and
+    members[1].name.starts_with("control.tar") and
+    members[2].name.starts_with("data.tar")
+}

@@ -1,0 +1,6 @@
+[package]
+name = "arfile"
+version = "1.0.0"
+
+# The Unix ar archive, both directions. Opens nothing.
+capabilities = []

@@ -14,7 +14,7 @@ plan that discovers them 300 packages in.
 | | |
 |---|---|
 | Started | 78 |
-| Now | 200 |
+| Now | 205 |
 | Tier 1 target | 200 |
 | Tier 2 target | 500 |
 | Tier 3 target | 800 |
@@ -168,7 +168,7 @@ outside implementation wherever one exists.
 
 | batch | packages |
 |---|---|
-| Archives | `zip` `tar` `lz4` `snappy` `arfile` |
+| ~~Archives~~ | ~~`zip` `tar` `lz4` `snappy` `arfile`~~ — done |
 | Serialisation | `avro` `bson` `plist` `properties` `netstring` |
 | SQL | `sqlbuild` `sqlparse` `sqlescape` `sqlitefile` `dbschema` |
 | Web routing | `router` `middleware` `session` `csrf` `etag` |

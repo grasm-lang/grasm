@@ -1,0 +1,279 @@
+// Snappy: Google's answer to the same question LZ4 answers.
+//
+// Both drop entropy coding and keep LZ77. Where they differ is the encoding
+// of a reference, and the difference is instructive: LZ4 has one sequence
+// shape with variable-length extensions, while Snappy has **four tag types**
+// chosen by the two low bits of the first byte, each tuned for a size range.
+//
+//     00  literal      length in the upper six bits, or in 1-4 bytes after
+//     01  copy, 1 byte  length 4..11, offset up to 2047 (11 bits, split)
+//     10  copy, 2 bytes length 1..64, offset up to 65535
+//     11  copy, 4 bytes length 1..64, offset up to 2^32
+//
+// The one-byte copy is the interesting one: it spends *three* bits of the tag
+// byte on the top of the offset, so a short repeat close behind costs two
+// bytes total. That is where Snappy's ratio on structured data comes from,
+// and it is why the tag layout looks arbitrary until you count the bits.
+//
+// A block begins with the uncompressed length as a varint, so a decoder
+// knows how much to allocate — which LZ4's block format does not carry and
+// this one does.
+
+type SnappyError =
+    | Truncated(at: i64)
+    | BadOffset(at: i64, offset: i64)
+    | LengthMismatch(want: i64, got: i64)
+    | TooLarge(want: i64)
+
+fn window() -> i64 {
+    return 65535
+}
+
+fn mask32(v: i64) -> i64 {
+    return v.bit_and(4294967295)
+}
+
+fn mul32(a: i64, b: i64) -> i64 {
+    let hi = a / 65536
+    let lo = a % 65536
+    return mask32((hi * b) % 65536 * 65536 + lo * b)
+}
+
+fn hash4(data: bytes, at: i64) -> i64 {
+    let v = mask32(data.at(at).bit_or(data.at(at + 1).shl(8))
+            .bit_or(data.at(at + 2).shl(16)).bit_or(data.at(at + 3).shl(24)))
+    return mul32(v, 506832829).ushr(20)
+}
+
+fn push_varint(inout out: [i64], value: i64) {
+    var left = value
+    while left >= 128 {
+        out.push(left.bit_and(127).bit_or(128))
+        left = left.ushr(7)
+    }
+    out.push(left)
+}
+
+fn read_varint(data: bytes, inout at: i64) -> i64 ! SnappyError {
+    var out = 0
+    var shift = 0
+    while at < data.len() {
+        let b = data.at(at)
+        at = at + 1
+        out = out.bit_or(b.bit_and(127).shl(shift))
+        if b < 128 {
+            return out
+        }
+        shift = shift + 7
+        if shift > 35 {
+            fail(Truncated(at))
+        }
+    }
+    fail(Truncated(at))
+}
+
+/// The uncompressed length a block declares, without decompressing it.
+pub fn uncompressed_length(data: bytes) -> i64 ! SnappyError {
+    var at = 0
+    return try read_varint(data, at)
+}
+
+fn emit_literal(inout out: [i64], data: bytes, from: i64, length: i64) {
+    if length == 0 {
+        return
+    }
+    let n = length - 1
+    if n < 60 {
+        out.push(n.shl(2))
+    } else if n < 256 {
+        out.push(60.shl(2))
+        out.push(n)
+    } else if n < 65536 {
+        out.push(61.shl(2))
+        out.push(n.bit_and(255))
+        out.push(n.ushr(8).bit_and(255))
+    } else if n < 16777216 {
+        out.push(62.shl(2))
+        out.push(n.bit_and(255))
+        out.push(n.ushr(8).bit_and(255))
+        out.push(n.ushr(16).bit_and(255))
+    } else {
+        out.push(63.shl(2))
+        for i in 0..4 {
+            out.push(n.ushr(i * 8).bit_and(255))
+        }
+    }
+    for i in 0..length {
+        out.push(data.at(from + i))
+    }
+}
+
+fn emit_copy(inout out: [i64], offset: i64, length: i64) {
+    var left = length
+    // A two-byte copy carries at most 64, so a longer match is several.
+    while left >= 68 {
+        out.push(2.bit_or(63.shl(2)))
+        out.push(offset.bit_and(255))
+        out.push(offset.ushr(8).bit_and(255))
+        left = left - 64
+    }
+    if left > 64 {
+        out.push(2.bit_or(59.shl(2)))
+        out.push(offset.bit_and(255))
+        out.push(offset.ushr(8).bit_and(255))
+        left = left - 60
+    }
+    if left >= 4 and left <= 11 and offset < 2048 {
+        // The one-byte form: three bits of offset in the tag, eight after.
+        out.push(1.bit_or((left - 4).shl(2)).bit_or(offset.ushr(8).shl(5)))
+        out.push(offset.bit_and(255))
+        return
+    }
+    out.push(2.bit_or((left - 1).shl(2)))
+    out.push(offset.bit_and(255))
+    out.push(offset.ushr(8).bit_and(255))
+}
+
+pub fn compress(data: bytes) -> bytes {
+    var out: [i64] = []
+    push_varint(out, data.len())
+    if data.len() == 0 {
+        return bytes_of(out)
+    }
+    var table: [i64] = []
+    for _i in 0..4096 {
+        table.push(0 - 1)
+    }
+    var at = 0
+    var literal_start = 0
+    let limit = if data.len() > 4 { data.len() - 4 } else { 0 }
+    while at < limit {
+        let h = hash4(data, at)
+        let candidate = table[h]
+        table[h] = at
+        if candidate < 0 or at - candidate > window() or
+        data.at(candidate) != data.at(at) or
+        data.at(candidate + 1) != data.at(at + 1) or
+        data.at(candidate + 2) != data.at(at + 2) or
+        data.at(candidate + 3) != data.at(at + 3) {
+            at = at + 1
+            continue
+        }
+        var length = 4
+        while at + length < data.len() and
+        data.at(candidate + length) == data.at(at + length) {
+            length = length + 1
+        }
+        emit_literal(out, data, literal_start, at - literal_start)
+        emit_copy(out, at - candidate, length)
+        at = at + length
+        literal_start = at
+    }
+    emit_literal(out, data, literal_start, data.len() - literal_start)
+    return bytes_of(out)
+}
+
+pub fn decompress(data: bytes, limit: i64) -> bytes ! SnappyError {
+    var at = 0
+    let want = try read_varint(data, at)
+    if want > limit {
+        fail(TooLarge(want))
+    }
+    var out: [i64] = []
+    while at < data.len() {
+        let tag = data.at(at)
+        let kind = tag.bit_and(3)
+        at = at + 1
+        if kind == 0 {
+            var length = tag.ushr(2)
+            if length >= 60 {
+                let width = length - 59
+                if at + width > data.len() {
+                    fail(Truncated(at))
+                }
+                length = 0
+                for i in 0..width {
+                    length = length.bit_or(data.at(at + i).shl(i * 8))
+                }
+                at = at + width
+            }
+            length = length + 1
+            if at + length > data.len() {
+                fail(Truncated(at))
+            }
+            for i in 0..length {
+                out.push(data.at(at + i))
+            }
+            at = at + length
+            continue
+        }
+        var offset = 0
+        var length = 0
+        if kind == 1 {
+            if at >= data.len() {
+                fail(Truncated(at))
+            }
+            length = 4 + tag.ushr(2).bit_and(7)
+            offset = tag.ushr(5).shl(8).bit_or(data.at(at))
+            at = at + 1
+        } else if kind == 2 {
+            if at + 2 > data.len() {
+                fail(Truncated(at))
+            }
+            length = tag.ushr(2) + 1
+            offset = data.at(at).bit_or(data.at(at + 1).shl(8))
+            at = at + 2
+        } else {
+            if at + 4 > data.len() {
+                fail(Truncated(at))
+            }
+            length = tag.ushr(2) + 1
+            offset = 0
+            for i in 0..4 {
+                offset = offset.bit_or(data.at(at + i).shl(i * 8))
+            }
+            at = at + 4
+        }
+        if offset == 0 or offset > out.len() {
+            fail(BadOffset(at, offset))
+        }
+        if out.len() + length > limit {
+            fail(TooLarge(out.len() + length))
+        }
+        // Byte at a time: an offset of 1 repeats the last byte, and the
+        // source overlaps the destination on purpose.
+        var from = out.len() - offset
+        for _i in 0..length {
+            out.push(out[from])
+            from = from + 1
+        }
+    }
+    if out.len() != want {
+        fail(LengthMismatch(want, out.len()))
+    }
+    return bytes_of(out)
+}
+
+/// The largest a block of `n` bytes can compress to.
+pub fn compress_bound(n: i64) -> i64 {
+    return 32 + n + n / 6
+}
+
+pub fn saved_percent(original: i64, compressed: i64) -> i64 {
+    if original == 0 {
+        return 0
+    }
+    return (original - compressed) * 100 / original
+}
+
+/// Whether the bytes begin with a plausible Snappy block.
+///
+/// Only the length varint can be checked without decompressing, which is
+/// exactly as much as the format allows — Snappy has no magic number, and a
+/// reader that claims to detect one is guessing.
+pub fn looks_like_snappy(data: bytes, expected: i64) -> bool {
+    match uncompressed_length(data) {
+        Ok(n) -> return n == expected
+        Err(_e) -> return false
+    }
+}

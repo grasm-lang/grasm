@@ -1,0 +1,6 @@
+[package]
+name = "snappy"
+version = "1.0.0"
+
+# The Snappy block format, both directions. Opens nothing.
+capabilities = []

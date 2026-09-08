@@ -1,0 +1,6 @@
+[package]
+name = "tar"
+version = "1.0.0"
+
+# The tar format, both directions. Opens nothing.
+capabilities = []
