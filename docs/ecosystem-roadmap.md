@@ -157,25 +157,64 @@ because the number needed rounding up.
 
 ## Tier 2 — to 500
 
-Grouped by what unblocks each group.
+Three hundred more. Grouped by what unblocks each group, because two of the
+four groups cannot be started at all.
 
-**Needs nothing (about 180 packages).** Wire formats, codecs and pure logic:
-Avro, Parquet, protobuf codegen, ORM query building, SQL construction and
-escaping, a template engine, a router, middleware, session handling, CSV/Excel
-readers, ZIP and tar, calendar maths, GeoJSON, collision detection, decimal
-maths, and the CLI UI packages.
+### Buildable now — about 180
 
-**Needs P1 — TLS (about 120 packages).** Every hosted-service client:
-Stripe, AWS S3/DynamoDB/SQS, Google Cloud, Azure, Discord, Slack, GitHub,
-Kubernetes, Prometheus remote-write, OpenTelemetry export, OAuth and OpenID
-providers, SMTP/IMAP over TLS, MongoDB Atlas, and every managed database.
+These need nothing that does not exist. Written in batches of five or six
+with a group demo each, the same rhythm Tier 1 used, and checked against an
+outside implementation wherever one exists.
 
-**Needs P2 — async (about 40 packages).** Kafka, RabbitMQ, MQTT, task queues,
-event loops, connection pools, WebSocket servers at scale.
+| batch | packages |
+|---|---|
+| Archives | `zip` `tar` `lz4` `snappy` `arfile` |
+| Serialisation | `avro` `bson` `plist` `properties` `netstring` |
+| SQL | `sqlbuild` `sqlparse` `sqlescape` `sqlitefile` `dbschema` |
+| Web routing | `router` `middleware` `session` `csrf` `etag` |
+| Web content | `htmlparse` `cssparse` `xpath` `staticfiles` `rangeheader` |
+| Schemas | `jsonschema` `openapi` `graphqlparse` `protoschema` `avroschema` |
+| Time | `calendar` `recurrence` `workdays` `iso8601` `humanize` |
+| Geography | `geojson` `geohash` `haversine` `polyline` `wkt` |
+| Linear algebra | `linalg` `fft` `polynomial` `quaternion` `bezier` |
+| Statistics | `regression` `distributions` `hypothesis` `sampling` `outliers` |
+| Game and graphics | `collision` `quadtree` `astar` `tilemap` `palette` |
+| Networking | `whois` `tftp` `socks5` `gopher` `netdiscovery` |
+| Observability | `otelspan` `prometheus` `logsample` `errorgroup` `slo` |
+| Terminal UI | `tuibox` `keymap` `editline` `prompt` `autocomplete` |
+| Cryptography | `argon2` `bcrypt` `rsa` `ed25519` `pemfile` |
+| Certificates | `csr` `jwk` `pkcs7` `ocsp` `certchain` |
+| Text analysis | `stemmer` `stopwords` `readability` `hyphenate` `keyphrase` |
+| Documents | `rst` `bbcode` `wikitext` `csvdialect` `fixedwidth` |
+| Build tooling | `changelog` `spdx` `codeowners` `patchfile` `coveragefmt` |
+| Money and tax | `vatid` `taxrate` `invoice` `ledgerfmt` `fx` |
 
-**Needs P3 — a decision (about 90 packages).** Native runtimes and GUI:
-ONNX/TensorFlow/PyTorch bindings, Qt, OpenGL, Vulkan, FFmpeg, USB, serial,
-Bluetooth.
+That is a hundred, in twenty batches. The second hundred is deliberately not
+listed: the first will change what the second should be, and a list written
+now would be a list written before anything was learnt.
+
+### Needs P1 — a TLS client. About 120, and none of them can start.
+
+Every hosted-service client: Stripe, AWS, Google Cloud, Azure, Discord,
+Slack, GitHub, Kubernetes, Prometheus remote-write, OpenTelemetry export,
+OAuth providers, SMTP and IMAP over TLS, and every managed database. All of
+them are HTTPS-only and have been for years.
+
+**This is the next thing to build after the hundred above**, because it is
+the single item that unblocks the most.
+
+### Needs P2 — async I/O. About 40.
+
+Kafka, RabbitMQ, MQTT, task queues, event loops, connection pools, WebSocket
+servers at scale. A thread per connection works to a few hundred; past that
+it needs `poll` or `epoll`/`kqueue`, which is a runtime addition rather than
+a library.
+
+### Needs P3 — a decision. About 90.
+
+ONNX, TensorFlow, PyTorch, Qt, OpenGL, Vulkan, FFmpeg, USB, serial,
+Bluetooth. Still an open question for the project owner, not a task: see P3
+above.
 
 ## Tier 3 — to 800
 
