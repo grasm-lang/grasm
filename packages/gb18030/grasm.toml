@@ -1,0 +1,6 @@
+[package]
+name = "gb18030"
+version = "1.0.0"
+
+# Bytes to text and back. Opens nothing.
+capabilities = []

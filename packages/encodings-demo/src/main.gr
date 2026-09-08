@@ -1,0 +1,293 @@
+import codepage
+import shiftjis
+import big5
+import euckr
+import gb18030
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn list_of(data: bytes) -> [i64] {
+    var out: [i64] = []
+    for i in 0..data.len() {
+        out.push(data.at(i))
+    }
+    return out
+}
+
+// ---------------------------------------------------------------- codepage
+
+fn decoded(page: str, data: [i64]) -> str {
+    return codepage.decode(page, bytes_of(data)) ?? "ERR"
+}
+
+fn encoded(page: str, text: str) -> [i64] {
+    return list_of(codepage.encode(page, text) ?? "".to_bytes())
+}
+
+fn check_codepage(inout f: i64) / {io} {
+    print("-- codepage: the encoding is never in the file")
+    // The single most consequential difference in the set: ISO 8859-1 leaves
+    // 0x80 to 0x9F as control characters and CP1252 puts printable ones
+    // there. HTML5 gives up and says a document declaring the former must be
+    // decoded as the latter, because that is what the documents are.
+    say(f, "CP1252 puts printable characters where Latin-1 has controls",
+        decoded("cp1252", [147, 145, 128, 151]) ==
+        "\u{201c}\u{2018}\u{20ac}\u{2014}" and
+        decoded("latin1", [147, 145, 128, 151]) ==
+        "\u{93}\u{91}\u{80}\u{97}")
+    say(f, "and it is exactly the thirty-two bytes of that block",
+        codepage.differs_from_latin1("cp1252").len() == 32 and
+        codepage.differs_from_latin1("latin1").len() == 0)
+    // CP437's top half is the box-drawing set every DOS program drew with.
+    say(f, "CP437 is the IBM PC's own page, with the boxes in it",
+        decoded("cp437", [201, 205, 187]) == "\u{2554}\u{2550}\u{2557}" and
+        decoded("cp850", [201, 205, 187]) == "\u{2554}\u{2550}\u{2557}")
+    say(f, "and CP850 replaced half of them with accented letters",
+        decoded("cp437", [181]) == "\u{2561}" and
+        decoded("cp850", [181]) == "\u{c1}")
+    // The same bytes in four pages: this is mojibake, and nothing in the
+    // bytes says which reading was meant.
+    say(f, "the same bytes read differently in every page, silently",
+        decoded("koi8r", [212, 197, 211, 212]) ==
+        "\u{442}\u{435}\u{441}\u{442}" and
+        decoded("cp1251", [212, 197, 211, 212]) ==
+        "\u{424}\u{415}\u{423}\u{424}" and
+        decoded("latin1", [212, 197, 211, 212]) ==
+        "\u{d4}\u{c5}\u{d3}\u{d4}")
+    say(f, "a page name is written four ways and means one page",
+        codepage.normalise("windows-1252") == "cp1252" and
+        codepage.normalise("CP_1252") == "cp1252" and
+        codepage.normalise("ISO-8859-15") == "latin9" and
+        codepage.normalise("iso 8859-1") == "latin1")
+    say(f, "the pages this knows are known and the rest are not",
+        codepage.is_known("Windows 1251") and codepage.is_known("KOI8-R") and
+        not codepage.is_known("cp9999"))
+    // Encoding is the direction that fails, and it says where.
+    say(f, "encoding says which character it could not write and where",
+        encoded("cp1252", "caf\u{e9}") == [99, 97, 102, 233] and
+        codepage.unencodable_at("cp1252", "a\u{4e2d}b") == 1 and
+        codepage.unencodable_at("cp1252", "caf\u{e9}") == 0 - 1)
+    // A byte the page never assigned decodes to U+FFFD rather than failing:
+    // text with a hole in it is still text.
+    say(f, "an unassigned byte becomes a replacement character, not an error",
+        decoded("cp1252", [129]) == "\u{fffd}" and
+        not codepage.is_encodable("cp1252", "\u{fffd}"))
+    say(f, "and an unknown page is refused rather than guessed at",
+        decoded("cp9999", [65]) == "ERR")
+    // The low half is ASCII in every one of these pages, which is the only
+    // reason a mislabelled file is readable at all.
+    say(f, "every page here agrees with ASCII below 0x80",
+        (codepage.decode_byte("koi8r", 65) ?? 0) == 65 and
+        (codepage.decode_byte("cp437", 126) ?? 0) == 126 and
+        codepage.names().len() == 19)
+}
+
+// ---------------------------------------------------------------- shiftjis
+
+fn check_shiftjis(inout f: i64) / {io} {
+    print("-- shiftjis: the second byte of a kanji can be a backslash")
+    let data = bytes_of([147, 250, 150, 123, 140, 234])
+    say(f, "Japanese text decodes to what Python decodes it to",
+        (shiftjis.decode(data) ?? "") == "\u{65e5}\u{672c}\u{8a9e}")
+    say(f, "and encodes back to the same bytes",
+        list_of(shiftjis.encode("\u{65e5}\u{672c}\u{8a9e}") ??
+            "".to_bytes()) == [147, 250, 150, 123, 140, 234])
+    // This is the bug that broke Japanese Windows for twenty years. U+8868
+    // is 0x95 0x5C and U+30BD is 0x83 0x5C: the trail byte is a backslash,
+    // and a path splitter that scans for one cuts the character in half.
+    say(f, "a trail byte may be an ASCII backslash, which is the whole trap",
+        shiftjis.code_to_pair(34920) == (149, 92) and
+        shiftjis.code_to_pair(12477) == (131, 92) and
+        shiftjis.is_trail(92))
+    say(f, "so a byte scan finds a backslash inside a character",
+        count_bytes(shiftjis.encode("\u{8868}\u{5c}\u{30bd}") ??
+            "".to_bytes(), 92) == 3)
+    // Half-width katakana are single bytes, from the 1969 telex standard.
+    say(f, "half-width katakana are one byte a character",
+        (shiftjis.decode(bytes_of([177, 178, 179])) ?? "") ==
+        "\u{ff71}\u{ff72}\u{ff73}" and
+        list_of(shiftjis.encode("\u{ff71}") ?? "".to_bytes()) == [177])
+    say(f, "the lead bytes stop before the katakana and start again after",
+        shiftjis.is_lead(129) and not shiftjis.is_lead(160) and
+        not shiftjis.is_lead(177) and shiftjis.is_lead(224))
+    say(f, "the table holds the 6,879 characters JIS X 0208 defines",
+        shiftjis.table_size() == 6879)
+    say(f, "a lead byte with nothing after it is truncated, not invalid",
+        truncated_sj(bytes_of([147])) and
+        not shiftjis.is_valid(bytes_of([255, 65])))
+    say(f, "and a character outside the standard cannot be written",
+        not shiftjis.is_encodable("\u{20ac}"))
+    // A prepared table costs the scan once instead of once a character.
+    say(f, "a prepared encoder writes the same bytes as the plain one",
+        list_of(shiftjis.encode_with(shiftjis.encoder(),
+            "\u{65e5}\u{ff71}a") ?? "".to_bytes()) == [147, 250, 177, 97])
+    say(f, "and counting characters is not counting bytes",
+        (shiftjis.char_count(bytes_of([147, 250, 177, 97])) ?? 0) == 3)
+}
+
+fn count_bytes(data: bytes, want: i64) -> i64 {
+    var total = 0
+    for i in 0..data.len() {
+        if data.at(i) == want {
+            total = total + 1
+        }
+    }
+    return total
+}
+
+fn truncated_sj(data: bytes) -> bool {
+    match shiftjis.decode(data) {
+        Ok(_v) -> return false
+        Err(e) -> {
+            match e {
+                Truncated(_at) -> return true
+                Invalid(_at, _byte) -> return false
+                Unencodable(_at, _code) -> return false
+            }
+        }
+    }
+}
+
+// -------------------------------------------------------------------- big5
+
+fn check_big5(inout f: i64) / {io} {
+    print("-- big5: a standard five companies agreed on and nobody wrote down")
+    let data = bytes_of([193, 99, 197, 233, 164, 164, 164, 229])
+    say(f, "traditional Chinese decodes to what Python decodes it to",
+        (big5.decode(data) ?? "") ==
+        "\u{7e41}\u{9ad4}\u{4e2d}\u{6587}")
+    say(f, "and encodes back to the same bytes",
+        list_of(big5.encode("\u{7e41}\u{9ad4}\u{4e2d}\u{6587}") ??
+            "".to_bytes()) == [193, 99, 197, 233, 164, 164, 164, 229])
+    // Big5 made the same choice Shift-JIS made, and got the same bug.
+    say(f, "a trail byte may be an ASCII value here too",
+        big5.is_trail(92) and big5.is_trail(99) and
+        big5.code_to_pair(32321) == (193, 99))
+    // Four characters have two encodings each, because the standard was
+    // assembled from two sources and nobody removed the overlap.
+    say(f, "four characters are in the table twice",
+        big5.duplicates().len() == 4 and
+        big5.pair_to_code(162, 204) == big5.pair_to_code(164, 81))
+    say(f, "and every encoder picks the ideograph-block one, so this does",
+        list_of(big5.encode("\u{5341}") ?? "".to_bytes()) == [164, 81] and
+        big5.preferred_pair(21313) == (164, 81))
+    say(f, "the table holds 13,710 characters",
+        big5.table_size() == 13710)
+    // The gap between the two ideograph blocks is where vendors put their own
+    // characters, and where the incompatibilities live.
+    say(f, "there is a gap in the lead bytes between the two blocks",
+        big5.is_lead(199) and not big5.is_lead(200) and big5.is_lead(201))
+    say(f, "and a Cantonese character from the Hong Kong set is not in it",
+        not big5.is_encodable("\u{4e28}"))
+    say(f, "a byte that starts nothing is invalid where a lead byte is not",
+        big5.is_lead(161) and not big5.is_lead(160) and
+        not big5.is_valid(bytes_of([160, 65])))
+}
+
+// ------------------------------------------------------------------- euckr
+
+fn check_euckr(inout f: i64) / {io} {
+    print("-- euckr: 2,350 syllables out of 11,172")
+    let data = bytes_of([199, 209, 177, 185, 190, 238])
+    say(f, "Korean decodes to what Python decodes it to",
+        (euckr.decode(data) ?? "") == "\u{d55c}\u{ad6d}\u{c5b4}")
+    say(f, "and encodes back to the same bytes",
+        list_of(euckr.encode("\u{d55c}\u{ad6d}\u{c5b4}") ?? "".to_bytes()) ==
+        [199, 209, 177, 185, 190, 238])
+    // Unlike Shift-JIS and Big5, no trail byte is ever an ASCII value. This
+    // is what the EUC discipline buys: a byte scan is safe.
+    say(f, "no trail byte is ever an ASCII value, which is the point of EUC",
+        not euckr.is_trail(92) and not euckr.is_trail(47) and
+        not euckr.is_trail(126) and euckr.is_trail(161))
+    // KS X 1001 holds 2,350 of the 11,172 modern syllables. The rest cannot
+    // be written at all, which is the whole story of Korean encoding.
+    // 8,822 of the 11,172 modern syllables have no EUC-KR form at all.
+    say(f, "8,822 of the 11,172 syllables cannot be written",
+        euckr.is_encodable("\u{d55c}") and euckr.is_encodable("\u{ac01}") and
+        not euckr.is_encodable("\u{d7a3}") and
+        not euckr.is_encodable("\u{ac02}"))
+    say(f, "the table holds 8,225 characters, syllables and hanja together",
+        euckr.table_size() == 8225)
+    say(f, "hanja are in it too, and appear more than once",
+        (euckr.decode(bytes_of([249, 211, 237, 174])) ?? "") ==
+        "\u{6f22}\u{5b57}")
+    say(f, "the syllable block starts at lead byte 0xB0",
+        euckr.is_lead(176) and euckr.is_lead(161) and not euckr.is_lead(173))
+    say(f, "and a truncated pair is refused",
+        not euckr.is_valid(bytes_of([199])))
+}
+
+// ----------------------------------------------------------------- gb18030
+
+fn check_gb18030(inout f: i64) / {io} {
+    print("-- gb18030: one byte, two bytes, or four, and no flag bit")
+    let data = bytes_of([188, 242, 204, 229, 214, 208, 206, 196])
+    say(f, "simplified Chinese decodes to what Python decodes it to",
+        (gb18030.decode(data) ?? "") ==
+        "\u{7b80}\u{4f53}\u{4e2d}\u{6587}")
+    say(f, "and the two-byte table is the 23,940 characters GBK had",
+        gb18030.table_size() == 23940)
+    // The four-byte form is two pairs of a high byte and an ASCII digit. A
+    // two-byte trail byte is never a digit, so the widths are unambiguous
+    // without a single flag.
+    say(f, "a four-byte sequence is two high bytes and two ASCII digits",
+        gb18030.four_byte_of(165) == [129, 48, 132, 54] and
+        gb18030.four_byte_of(496) == [129, 48, 162, 50] and
+        gb18030.four_byte_of(1106) == [129, 48, 211, 48])
+    say(f, "and it cannot be confused with a two-byte one",
+        gb18030.width_at(bytes_of([129, 48, 132, 54]), 0) == 4 and
+        gb18030.width_at(data, 0) == 2 and
+        gb18030.width_at("a".to_bytes(), 0) == 1)
+    say(f, "which is why no two-byte trail byte is ever a digit",
+        not gb18030.is_trail(48) and not gb18030.is_trail(57) and
+        gb18030.is_trail(64))
+    // Everything from U+10000 up is a straight linear mapping, which is how
+    // one encoding covers all of Unicode with a 206-range table.
+    say(f, "the supplementary planes are a linear mapping from one number",
+        gb18030.supplementary_base() == 189000 and
+        gb18030.index_to_code(189000) == 65536 and
+        gb18030.four_byte_of(119070) == [148, 50, 190, 52])
+    say(f, "so every code point Unicode has can be written",
+        gb18030.is_encodable("\u{1f600}") and
+        gb18030.is_encodable("\u{10ffff}") and
+        gb18030.is_encodable("\u{a5}"))
+    say(f, "and it round-trips through four bytes and back",
+        (gb18030.decode(gb18030.encode("\u{1d11e}\u{a5}\u{416}") ??
+            "".to_bytes()) ?? "") == "\u{1d11e}\u{a5}\u{416}")
+    // GBK put the euro at 0x80 in 1999; GB18030 moved it to two bytes.
+    say(f, "the euro moved from one byte to two between the two standards",
+        list_of(gb18030.encode("\u{20ac}") ?? "".to_bytes()) == [162, 227] and
+        not gb18030.is_valid(bytes_of([128])))
+    say(f, "a four-byte sequence with a byte out of range is refused",
+        not gb18030.is_valid(bytes_of([129, 48, 132, 200])))
+    say(f, "the four-byte number and its bytes are inverses",
+        gb18030.four_byte_index(129, 48, 132, 54) == 36 and
+        gb18030.index_to_four_bytes(36) == [129, 48, 132, 54] and
+        gb18030.index_to_code(36) == 165)
+    // 1,587,600 four-byte sequences for 1,112,064 code points: the form has
+    // room to spare, which is why it never needed a second version.
+    say(f, "the four-byte space is larger than Unicode",
+        gb18030.index_to_code(1237575) == 1114111 and
+        gb18030.index_to_code(1237576) == 0 - 1)
+}
+
+fn main() / {io} {
+    var f = 0
+    check_codepage(f)
+    check_shiftjis(f)
+    check_big5(f)
+    check_euckr(f)
+    check_gb18030(f)
+    if f == 0 {
+        print("encodings: every claim held")
+    } else {
+        print("encodings: {f} claims failed")
+    }
+}
