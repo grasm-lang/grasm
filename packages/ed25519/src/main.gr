@@ -1,0 +1,537 @@
+// Ed25519, RFC 8032.
+//
+// The signature scheme SSH keys, Signify, Tor, and TLS 1.3 certificates use,
+// and the reason a program wants it over ECDSA: signing needs no randomness.
+// An ECDSA signature made twice with the same nonce hands the attacker the
+// private key, which is how a games console and a Bitcoin wallet have each
+// been opened; Ed25519 derives its nonce by hashing the message under a
+// secret, so a broken random number generator produces a *deterministic*
+// signature rather than a fatal one.
+//
+// ## What is here and what is borrowed
+//
+// The field is the one `x25519` already implements — the same p = 2^255 - 19,
+// the same ten limbs of alternating 26 and 25 bits, for the same reason about
+// Grasm's integer width. This package adds the Edwards curve on top: the
+// group law, the point encoding, and the scalar arithmetic modulo the group
+// order.
+//
+// Points are carried in **extended coordinates** (X : Y : Z : T) with
+// T = XY/Z, which is what makes the addition formula complete — one formula
+// that is correct for every pair of points, including a point and itself and
+// including the identity. A projective formula with an exception in it is
+// where implementations get a special case wrong that nobody exercises until
+// somebody constructs the input.
+//
+// ## The two things a verifier must refuse
+//
+// **A signature with S >= L.** The equation still holds if L is added to S,
+// so a valid signature can be turned into a second, different valid signature
+// for the same message. Anything that treats a signature as an identifier —
+// a transaction hash, a deduplication key — breaks when that happens. RFC
+// 8032 requires the check and this does it.
+//
+// **A public key that is not a point.** Decoding recovers x from y and can
+// fail; when it does the answer is "not a signature by this key", not a
+// panic and not an accidental success on the identity.
+//
+// The group equation checked here is the cofactorless one, `[S]B = R + [k]A`,
+// compared as encodings. RFC 8032 also permits the cofactored form with the
+// factor of eight, which accepts a few more signatures involving small-order
+// points. The two disagree on inputs nobody produces honestly, and the
+// cofactorless form is what the reference implementation, NaCl, and every
+// library derived from them do — so it is what interoperates.
+//
+// ## WARNING — what this is not
+//
+// The scalar multiplication is written branch-free: the window table is read
+// with a mask rather than an index, and no control flow depends on the
+// scalar. **Grasm cannot promise the compiler preserves that**, for exactly
+// the reasons `x25519` sets out at length. This is unaudited research code.
+// Do not sign anything that matters with it.
+//
+// Checked against RFC 8032 section 7.1's test vectors — all four, including
+// the 1023-byte message and the SHA-512-of-abc case — and against PyNaCl for
+// a further hundred random key-and-message pairs.
+
+import x25519
+import sha512
+import bigint
+
+type Ed25519Point = {
+    x: Fe,
+    y: Fe,
+    z: Fe,
+    t: Fe,
+}
+
+type Ed25519Error =
+    | BadSeedLength(len: i64)
+    | BadKeyLength(len: i64)
+    | BadSignatureLength(len: i64)
+    | NotOnCurve()
+    | ScalarTooLarge()
+
+pub fn seed_size() -> i64 {
+    return 32
+}
+
+pub fn key_size() -> i64 {
+    return 32
+}
+
+pub fn signature_size() -> i64 {
+    return 64
+}
+
+// ------------------------------------------------------------- constants
+
+/// d = -121665/121666, the curve constant, little-endian.
+fn d_bytes() -> bytes {
+    return bytes_of([163, 120, 89, 19, 202, 77, 235, 117, 171, 216, 65, 65,
+        77, 10, 112, 0, 152, 232, 121, 119, 121, 64, 199, 140, 115, 254, 111,
+        43, 238, 108, 3, 82])
+}
+
+/// 2d, which is what the addition formula actually multiplies by.
+fn d2_bytes() -> bytes {
+    return bytes_of([89, 241, 178, 38, 148, 155, 214, 235, 86, 177, 131, 130,
+        154, 20, 224, 0, 48, 209, 243, 238, 242, 128, 142, 25, 231, 252, 223,
+        86, 220, 217, 6, 36])
+}
+
+/// A square root of -1, needed when the first candidate for x is wrong by
+/// exactly that factor.
+fn sqrtm1_bytes() -> bytes {
+    return bytes_of([176, 160, 14, 74, 39, 27, 238, 196, 120, 228, 47, 173, 6,
+        24, 67, 47, 167, 215, 251, 61, 153, 0, 77, 43, 11, 223, 193, 79, 128,
+        36, 131, 43])
+}
+
+fn base_x_bytes() -> bytes {
+    return bytes_of([26, 213, 37, 143, 96, 45, 86, 201, 178, 167, 37, 149, 96,
+        199, 44, 105, 92, 220, 214, 253, 49, 226, 164, 192, 254, 83, 110, 205,
+        211, 54, 105, 33])
+}
+
+fn base_y_bytes() -> bytes {
+    return bytes_of([88, 102, 102, 102, 102, 102, 102, 102, 102, 102, 102,
+        102, 102, 102, 102, 102, 102, 102, 102, 102, 102, 102, 102, 102, 102,
+        102, 102, 102, 102, 102, 102, 102])
+}
+
+/// L, the order of the base point: 2^252 + 27742317777372353535851937790883648493.
+fn order_text() -> str {
+    return "7237005577332262213973186563042994240857116359379907606001950938285454250989"
+}
+
+fn order() -> BigInt {
+    return bigint.parse(order_text()) ?? bigint.zero()
+}
+
+// ----------------------------------------------------------------- points
+
+/// The identity, which is (0, 1) in affine coordinates rather than a point at
+/// infinity — an Edwards curve has none, which is the other half of why the
+/// addition formula needs no special case.
+pub fn identity() -> Ed25519Point {
+    return Ed25519Point{
+        x: x25519.fzero(),
+        y: x25519.fone(),
+        z: x25519.fone(),
+        t: x25519.fzero(),
+    }
+}
+
+pub fn base_point() -> Ed25519Point {
+    let bx = x25519.expand(base_x_bytes())
+    let by = x25519.expand(base_y_bytes())
+    return Ed25519Point{ x: bx, y: by, z: x25519.fone(), t: x25519.fmul(bx, by) }
+}
+
+fn fneg(a: Fe) -> Fe {
+    return x25519.fsub(x25519.fzero(), a)
+}
+
+/// `add-2008-hwcd-3`: complete, and eight multiplications.
+pub fn point_add(p1: Ed25519Point, p2: Ed25519Point) -> Ed25519Point {
+    return point_add_with(x25519.expand(d2_bytes()), p1, p2)
+}
+
+/// The same, with 2d already in hand.
+///
+/// A ladder does this three hundred times and `expand` is not free, so the
+/// constant is decoded once by the caller and passed down.
+fn point_add_with(d2: Fe, p1: Ed25519Point, p2: Ed25519Point) -> Ed25519Point {
+    let a = x25519.fmul(x25519.fsub(p1.y, p1.x), x25519.fsub(p2.y, p2.x))
+    let b = x25519.fmul(x25519.fadd(p1.y, p1.x), x25519.fadd(p2.y, p2.x))
+    let c = x25519.fmul(x25519.fmul(p1.t, d2), p2.t)
+    let dd = x25519.fscalar(x25519.fmul(p1.z, p2.z), 2)
+    let e = x25519.fsub(b, a)
+    let f = x25519.fsub(dd, c)
+    let g = x25519.fadd(dd, c)
+    let h = x25519.fadd(b, a)
+    return Ed25519Point{
+        x: x25519.fmul(e, f),
+        y: x25519.fmul(g, h),
+        z: x25519.fmul(f, g),
+        t: x25519.fmul(e, h),
+    }
+}
+
+/// `dbl-2008-hwcd`, which does not need T and so does not need d.
+pub fn point_double(p1: Ed25519Point) -> Ed25519Point {
+    let a = x25519.fsquare(p1.x)
+    let b = x25519.fsquare(p1.y)
+    let c = x25519.fscalar(x25519.fsquare(p1.z), 2)
+    let h = x25519.fadd(a, b)
+    let e = x25519.fsub(h, x25519.fsquare(x25519.fadd(p1.x, p1.y)))
+    let g = x25519.fsub(a, b)
+    let f = x25519.fadd(c, g)
+    return Ed25519Point{
+        x: x25519.fmul(e, f),
+        y: x25519.fmul(g, h),
+        z: x25519.fmul(f, g),
+        t: x25519.fmul(e, h),
+    }
+}
+
+pub fn point_negate(p1: Ed25519Point) -> Ed25519Point {
+    return Ed25519Point{ x: fneg(p1.x), y: p1.y, z: p1.z, t: fneg(p1.t) }
+}
+
+// --------------------------------------------------- constant-time choosing
+
+/// 1 when the two are equal, 0 when they are not, with no branch.
+///
+/// `x | -x` has its sign bit set for every non-zero x and clear for zero, so
+/// the top bit is the answer inverted. A comparison written as `if` would put
+/// the window index into the branch predictor.
+fn ct_eq(a: i64, b: i64) -> i64 {
+    let x = a.bit_xor(b)
+    return x.bit_or(0 - x).ushr(63).bit_xor(1)
+}
+
+/// Entry `want` of the table, read by touching all sixteen.
+///
+/// Every entry contributes; fifteen of them contribute zero, and an `or` of
+/// one value with fifteen zeroes is that value whatever its sign. Indexing
+/// the list instead would make the memory address depend on four bits of the
+/// scalar, which is the leak this whole shape exists to avoid.
+fn select(table: [Ed25519Point], want: i64) -> Ed25519Point {
+    var ax = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    var ay = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    var az = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    var at = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    for i in 0..16 {
+        let m = 0 - ct_eq(i, want)
+        let e = table[i]
+        let ex = e.x.l
+        let ey = e.y.l
+        let ez = e.z.l
+        let et = e.t.l
+        for k in 0..10 {
+            ax[k] = ax[k].bit_or(m.bit_and(ex[k]))
+            ay[k] = ay[k].bit_or(m.bit_and(ey[k]))
+            az[k] = az[k].bit_or(m.bit_and(ez[k]))
+            at[k] = at[k].bit_or(m.bit_and(et[k]))
+        }
+    }
+    return Ed25519Point{ x: Fe{ l: ax }, y: Fe{ l: ay }, z: Fe{ l: az },
+        t: Fe{ l: at } }
+}
+
+// -------------------------------------------------------- scalar multiples
+
+/// `[k]P` for a 32-byte little-endian scalar, four bits at a time.
+///
+/// Sixty-four windows: four doublings, then one addition of the table entry
+/// the next nibble names. The table holds 0P through 15P, so the addition
+/// happens on every window whether or not the nibble is zero — a version that
+/// skipped the zero case would run in a time that says how many zero nibbles
+/// the scalar has.
+pub fn scalar_mult(scalar: bytes, p1: Ed25519Point) -> Ed25519Point {
+    let d2 = x25519.expand(d2_bytes())
+    var table = [identity()]
+    var i = 1
+    while i < 16 {
+        table.push(point_add_with(d2, table[i - 1], p1))
+        i = i + 1
+    }
+    var acc = identity()
+    var w = 63
+    while w >= 0 {
+        for _r in 0..4 {
+            acc = point_double(acc)
+        }
+        let byte = scalar.at(w / 2)
+        let nibble = if w % 2 == 1 { byte.ushr(4) } else { byte.bit_and(15) }
+        acc = point_add_with(d2, acc, select(table, nibble))
+        w = w - 1
+    }
+    return acc
+}
+
+pub fn scalar_mult_base(scalar: bytes) -> Ed25519Point {
+    return scalar_mult(scalar, base_point())
+}
+
+// ------------------------------------------------------------- encodings
+
+/// Thirty-two bytes: y little-endian, with x's low bit in the top one.
+pub fn encode_point(p1: Ed25519Point) -> bytes {
+    let zi = x25519.invert(p1.z)
+    let ax = x25519.contract(x25519.fmul(p1.x, zi))
+    let ay = x25519.contract(x25519.fmul(p1.y, zi))
+    var out = ay.to_list()
+    out[31] = out[31].bit_or(ax.at(0).bit_and(1).shl(7))
+    return bytes_of(out)
+}
+
+/// x^((p-5)/8), the exponent that gives a fourth root when one exists.
+///
+/// A fixed chain of 250 squarings and 11 multiplications, the same shape as
+/// the inversion next door and fixed for the same reason.
+fn pow22523(z: Fe) -> Fe {
+    let z2 = x25519.fsquare(z)
+    var t = x25519.fsquare(z2)
+    t = x25519.fsquare(t)
+    let z9 = x25519.fmul(t, z)
+    let z11 = x25519.fmul(z9, z2)
+    t = x25519.fsquare(z11)
+    let z5_0 = x25519.fmul(t, z9)
+
+    t = x25519.fsquare(z5_0)
+    for _i in 0..4 {
+        t = x25519.fsquare(t)
+    }
+    let z10_0 = x25519.fmul(t, z5_0)
+
+    t = x25519.fsquare(z10_0)
+    for _i in 0..9 {
+        t = x25519.fsquare(t)
+    }
+    let z20_0 = x25519.fmul(t, z10_0)
+
+    t = x25519.fsquare(z20_0)
+    for _i in 0..19 {
+        t = x25519.fsquare(t)
+    }
+    let z40_0 = x25519.fmul(t, z20_0)
+
+    t = x25519.fsquare(z40_0)
+    for _i in 0..9 {
+        t = x25519.fsquare(t)
+    }
+    let z50_0 = x25519.fmul(t, z10_0)
+
+    t = x25519.fsquare(z50_0)
+    for _i in 0..49 {
+        t = x25519.fsquare(t)
+    }
+    let z100_0 = x25519.fmul(t, z50_0)
+
+    t = x25519.fsquare(z100_0)
+    for _i in 0..99 {
+        t = x25519.fsquare(t)
+    }
+    let z200_0 = x25519.fmul(t, z100_0)
+
+    t = x25519.fsquare(z200_0)
+    for _i in 0..49 {
+        t = x25519.fsquare(t)
+    }
+    let z250_0 = x25519.fmul(t, z50_0)
+
+    t = x25519.fsquare(z250_0)
+    t = x25519.fsquare(t)
+    return x25519.fmul(t, z)
+}
+
+fn fe_equal(a: Fe, b: Fe) -> bool {
+    return x25519.contract(a).to_list() == x25519.contract(b).to_list()
+}
+
+fn fe_is_zero(a: Fe) -> bool {
+    return fe_equal(a, x25519.fzero())
+}
+
+/// Recover a point from its encoding, or refuse.
+///
+/// y comes straight out of the low 255 bits. x is the square root of
+/// (y^2 - 1)/(d y^2 + 1), which exists for a little under half of all y — and
+/// when it does not, the bytes are not a point and the answer is no.
+pub fn decode_point(encoded: bytes) -> Ed25519Point ! Ed25519Error {
+    if encoded.len() != 32 {
+        fail(BadKeyLength(encoded.len()))
+    }
+    let d = x25519.expand(d_bytes())
+    let y = x25519.expand(encoded)
+    let yy = x25519.fsquare(y)
+    let u = x25519.fsub(yy, x25519.fone())
+    let v = x25519.fadd(x25519.fmul(d, yy), x25519.fone())
+
+    let v3 = x25519.fmul(x25519.fsquare(v), v)
+    let v7 = x25519.fmul(x25519.fsquare(v3), v)
+    var x = x25519.fmul(pow22523(x25519.fmul(u, v7)), x25519.fmul(u, v3))
+
+    let vxx = x25519.fmul(v, x25519.fsquare(x))
+    if not fe_equal(vxx, u) {
+        if fe_equal(vxx, fneg(u)) {
+            x = x25519.fmul(x, x25519.expand(sqrtm1_bytes()))
+        } else {
+            fail(NotOnCurve())
+        }
+    }
+
+    let want_odd = encoded.at(31).ushr(7)
+    if fe_is_zero(x) and want_odd == 1 {
+        // x = 0 has one square root, not two, so a sign bit asking for the
+        // other one describes a point that does not exist.
+        fail(NotOnCurve())
+    }
+    if x25519.contract(x).at(0).bit_and(1) != want_odd {
+        x = fneg(x)
+    }
+    return Ed25519Point{ x: x, y: y, z: x25519.fone(), t: x25519.fmul(x, y) }
+}
+
+// ------------------------------------------------------ scalars modulo L
+
+fn le_to_big(le: bytes) -> BigInt {
+    return bigint.from_bytes(bytes_of(le.to_list().rev()))
+}
+
+fn big_to_le32(n: BigInt) -> bytes ! Ed25519Error {
+    let be = bigint.to_bytes(n, 32) ?? bytes_of([])
+    if be.len() != 32 {
+        fail(ScalarTooLarge())
+    }
+    return bytes_of(be.to_list().rev())
+}
+
+/// A hash, read little-endian, taken modulo the group order.
+///
+/// Sixty-four bytes go in and thirty-two come out. Reducing is not optional:
+/// the hash is uniform over 2^512 and the group has about 2^252 elements, so
+/// an unreduced value is not a scalar at all.
+fn reduce_scalar(wide: bytes) -> bytes ! Ed25519Error {
+    let n = le_to_big(wide)
+    let r = bigint.rem(n, order()) ?? bigint.zero()
+    return try big_to_le32(r)
+}
+
+/// (r + k*a) mod L, the one place signing does arithmetic on a secret.
+fn muladd(k: bytes, a: bytes, r: bytes) -> bytes ! Ed25519Error {
+    let v = bigint.add(bigint.mul(le_to_big(k), le_to_big(a)), le_to_big(r))
+    let s = bigint.rem(v, order()) ?? bigint.zero()
+    return try big_to_le32(s)
+}
+
+/// The scalar clamp: clear the low three bits, clear the top bit, set the
+/// second from the top.
+///
+/// The low bits force a multiple of the cofactor, which removes the small
+/// subgroup; the top bit fixes the scalar's length so a variable-time ladder
+/// cannot leak it. Both are part of the specification rather than advice, and
+/// a key derived without them will not interoperate.
+pub fn clamp(h: bytes) -> bytes {
+    var a = h.slice(0, 32).to_list()
+    a[0] = a[0].bit_and(248)
+    a[31] = a[31].bit_and(63).bit_or(64)
+    return bytes_of(a)
+}
+
+// ---------------------------------------------------------------- the API
+
+/// The 32-byte public key for a 32-byte seed.
+pub fn public_key(seed: bytes) -> bytes ! Ed25519Error {
+    if seed.len() != 32 {
+        fail(BadSeedLength(seed.len()))
+    }
+    let h = sha512.sha512(seed)
+    return encode_point(scalar_mult_base(clamp(h)))
+}
+
+/// A 64-byte signature: the commitment R, then the scalar S.
+///
+/// The nonce is `SHA-512(prefix || message)` where the prefix is the second
+/// half of the seed's hash — secret, and never used for anything else. That
+/// is what makes signing deterministic and what makes it safe to be: two
+/// different messages cannot collide on a nonce without colliding in SHA-512.
+pub fn sign(seed: bytes, message: bytes) -> bytes ! Ed25519Error {
+    if seed.len() != 32 {
+        fail(BadSeedLength(seed.len()))
+    }
+    let h = sha512.sha512(seed)
+    let a = clamp(h)
+    let prefix = h.slice(32, 64)
+    let public = encode_point(scalar_mult_base(a))
+
+    let r = try reduce_scalar(sha512.sha512(prefix.concat(message)))
+    let big_r = encode_point(scalar_mult_base(r))
+
+    let k = try reduce_scalar(sha512.sha512(big_r.concat(public).concat(message)))
+    let s = try muladd(k, a, r)
+    return big_r.concat(s)
+}
+
+/// Whether `signature` is this key's signature over this message.
+///
+/// Returns a bool rather than failing, because every reason to say no is the
+/// same answer to the caller: a malformed key, a malformed signature, an S
+/// out of range and an equation that does not hold all mean "not signed by
+/// this key".
+pub fn verify(public: bytes, message: bytes, signature: bytes) -> bool {
+    if public.len() != 32 or signature.len() != 64 {
+        return false
+    }
+    let big_r = signature.slice(0, 32)
+    let s = signature.slice(32, 64)
+    if bigint.compare(le_to_big(s), order()) >= 0 {
+        return false
+    }
+    if not is_decodable(public) or not is_decodable(big_r) {
+        return false
+    }
+    let key_point = decode_point(public) ?? identity()
+    let r_point = decode_point(big_r) ?? identity()
+    let wide = sha512.sha512(big_r.concat(public).concat(message))
+    let k = reduce_scalar(wide) ?? bytes_of([])
+    if k.len() != 32 {
+        return false
+    }
+    let left = scalar_mult_base(s)
+    let right = point_add(r_point, scalar_mult(k, key_point))
+    return encode_point(left).to_list() == encode_point(right).to_list()
+}
+
+fn is_decodable(encoded: bytes) -> bool {
+    match decode_point(encoded) {
+        Ok(_p) -> {
+            return true
+        }
+        Err(_e) -> {
+            return false
+        }
+    }
+}
+
+/// Whether these 32 bytes name a point, which is the only structural check a
+/// public key admits.
+pub fn is_valid_public_key(public: bytes) -> bool {
+    if public.len() != 32 {
+        return false
+    }
+    return is_decodable(public)
+}
+
+/// Lowercase hex, for showing a key or a signature.
+pub fn hex(data: bytes) -> str {
+    var out = ""
+    for b in data.to_list() {
+        out = out + "0123456789abcdef".substr(b.ushr(4), 1)
+        out = out + "0123456789abcdef".substr(b.bit_and(15), 1)
+    }
+    return out
+}

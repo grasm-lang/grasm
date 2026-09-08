@@ -14,7 +14,7 @@ plan that discovers them 300 packages in.
 | | |
 |---|---|
 | Started | 78 |
-| Now | 274 |
+| Now | 280 |
 | Tier 1 target | 200 |
 | Tier 2 target | 500 |
 | Tier 3 target | 800 |
@@ -182,8 +182,8 @@ outside implementation wherever one exists.
 | ~~Networking~~ | ~~`whois` `tftp` `socks5` `gopher` `netdiscovery`~~ — done |
 | ~~Observability~~ | ~~`otelspan` `prometheus` `logsample` `errorgroup` `slo`~~ — done |
 | ~~Terminal UI~~ | ~~`tuibox` `keymap` `editline` `prompt` `autocomplete`~~ — done |
-| Cryptography | `argon2` `bcrypt` ~~`rsa`~~ `ed25519` ~~`pemfile`~~ — two done |
-| Certificates | `csr` `jwk` `pkcs7` `ocsp` ~~`certchain`~~ — one done, plus `hostmatch` |
+| ~~Cryptography~~ | ~~`argon2` `bcrypt` `rsa` `ed25519` `pemfile`~~ — done, plus `blake2b` |
+| Certificates | `csr` `pkcs7` `ocsp` ~~`jwk`~~ ~~`certchain`~~ — two done, plus `hostmatch` and `derwrite` |
 | Text analysis | `stemmer` `stopwords` `readability` `hyphenate` `keyphrase` |
 | Documents | `rst` `bbcode` `wikitext` `csvdialect` `fixedwidth` |
 | Build tooling | `changelog` `spdx` `codeowners` `patchfile` `coveragefmt` |

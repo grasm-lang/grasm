@@ -1,0 +1,6 @@
+[package]
+name = "derwrite"
+version = "1.0.0"
+
+# Builds byte strings. Opens nothing.
+capabilities = []

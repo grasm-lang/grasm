@@ -1,0 +1,14 @@
+[package]
+name = "jwk"
+version = "1.0.0"
+
+# Parsing and hashing text the caller supplies. Opens nothing.
+capabilities = []
+
+[dependencies.json]
+path = "../json"
+version = "^1.0.0"
+
+[dependencies.crypto_hash]
+path = "../crypto_hash"
+version = "^1.0.0"

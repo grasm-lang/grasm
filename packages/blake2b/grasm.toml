@@ -1,0 +1,6 @@
+[package]
+name = "blake2b"
+version = "1.0.0"
+
+# Hashing bytes the caller supplies. Opens nothing.
+capabilities = []

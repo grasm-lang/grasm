@@ -1,0 +1,18 @@
+[package]
+name = "ed25519"
+version = "1.0.0"
+
+# Arithmetic and hashing. Opens nothing; a caller supplies the key.
+capabilities = []
+
+[dependencies.x25519]
+path = "../x25519"
+version = "^1.0.0"
+
+[dependencies.sha512]
+path = "../sha512"
+version = "^1.0.0"
+
+[dependencies.bigint]
+path = "../bigint"
+version = "^1.0.0"

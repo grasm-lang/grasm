@@ -1,0 +1,617 @@
+// Argon2, RFC 9106 — the winner of the 2015 Password Hashing Competition and
+// the answer to what bcrypt cannot do.
+//
+// bcrypt's 4 KiB of state was chosen in 1999 and cannot be raised; every
+// bcrypt in the world uses the same 4 KiB, which now fits in a GPU core's
+// local memory. Argon2 makes the memory a *parameter*. Ask for 64 MiB and an
+// attacker's thousand-core card needs 64 GiB to run a thousand guesses at
+// once, which it does not have. That is the whole idea, and the reason a new
+// system should use this rather than bcrypt.
+//
+// ## Three variants, and which one to pick
+//
+//   * **Argon2d** picks its memory addresses from the data. Fastest at
+//     resisting a GPU, and it leaks the access pattern — a threat only where
+//     an attacker can watch memory timing on the same machine.
+//   * **Argon2i** picks them from a counter, so the pattern is public and
+//     independent of the password. Safe against that side channel, weaker
+//     against a time-memory trade-off.
+//   * **Argon2id** does the first half of the first pass the independent way
+//     and everything after it the dependent way. RFC 9106 names it the
+//     choice for anyone without a specific reason for another, and it is what
+//     `hash` writes.
+//
+// ## What the parameters mean
+//
+// `m` is kibibytes, `t` is passes over that memory, `p` is lanes. RFC 9106's
+// first recommendation is m = 2 GiB, t = 1, p = 4; its second, for a machine
+// that cannot spare that, is m = 64 MiB, t = 3, p = 4. Raising `t` is the
+// cheap knob and the wrong one — memory is what an attacker cannot buy in
+// bulk, so spend there first and only raise passes once memory is capped.
+//
+// ## A note on what this costs here
+//
+// The memory is a list of 1 KiB blocks and the compression is 128 words of
+// mixing per block, so the work is real and the timings are honest. It is not
+// fast: this is a reference-shaped implementation, not a tuned one, and a
+// server choosing parameters should measure rather than copy a number.
+//
+// Checked against RFC 9106's section 5 test vectors for all three variants —
+// the ones with a secret key and associated data, which most implementations
+// do not expose and therefore do not test — and against Python's
+// `argon2-cffi` for the encoded string form.
+
+import blake2b
+
+let SYNC_POINTS = 4
+let WORDS = 128
+let VERSION = 19
+
+/// The variant, as it appears in the parameter block and in the name.
+pub let ARGON2D = 0
+pub let ARGON2I = 1
+pub let ARGON2ID = 2
+
+type Argon2Error =
+    | TooFewPasses(t: i64)
+    | TooFewLanes(p: i64)
+    | NotEnoughMemory(m: i64, needed: i64)
+    | TagTooShort(len: i64)
+    | UnknownVariant(kind: i64)
+    | Malformed(text: str)
+
+pub fn min_tag_bytes() -> i64 {
+    return 4
+}
+
+pub fn variant_name(kind: i64) -> str ! Argon2Error {
+    if kind == ARGON2D {
+        return "argon2d"
+    }
+    if kind == ARGON2I {
+        return "argon2i"
+    }
+    if kind == ARGON2ID {
+        return "argon2id"
+    }
+    fail(UnknownVariant(kind))
+}
+
+// -------------------------------------------------------------- little ends
+
+fn le32(v: i64) -> [i64] {
+    return [v.bit_and(255), v.ushr(8).bit_and(255), v.ushr(16).bit_and(255),
+        v.ushr(24).bit_and(255)]
+}
+
+fn push_all(inout out: [i64], more: [i64]) {
+    for b in more {
+        out.push(b)
+    }
+}
+
+fn push_bytes(inout out: [i64], more: bytes) {
+    for b in more.to_list() {
+        out.push(b)
+    }
+}
+
+// --------------------------------------------------------- the long hash
+
+/// H', the variable-length hash Argon2 builds from BLAKE2b.
+///
+/// Up to 64 bytes it is one BLAKE2b with the length prefixed. Past that it is
+/// a chain: each 64-byte link contributes its first 32 bytes and feeds the
+/// next, and the last link is however many bytes remain. The length prefix is
+/// what stops a 32-byte tag from being a prefix of a 64-byte one.
+fn h_prime(input: [i64], out_len: i64) -> bytes {
+    var msg = le32(out_len)
+    push_all(msg, input)
+    if out_len <= 64 {
+        let short: bytes ! Blake2bError =
+        blake2b.digest(bytes_of(msg), bytes_of([]), out_len)
+        return short ?? bytes_of([])
+    }
+    let r = (out_len + 31) / 32 - 2
+    var out: [i64] = []
+    var v = blake2b.digest(bytes_of(msg), bytes_of([]), 64) ?? bytes_of([])
+    push_all(out, v.slice(0, 32).to_list())
+    var i = 1
+    while i < r {
+        v = blake2b.digest(v, bytes_of([]), 64) ?? bytes_of([])
+        push_all(out, v.slice(0, 32).to_list())
+        i = i + 1
+    }
+    let last = blake2b.digest(v, bytes_of([]), out_len - 32 * r) ?? bytes_of([])
+    push_bytes(out, last)
+    return bytes_of(out)
+}
+
+// ------------------------------------------------------------- the block
+
+fn zero_block() -> [i64] {
+    var out: [i64] = []
+    for _i in 0..128 {
+        out.push(0)
+    }
+    return out
+}
+
+fn bytes_to_block(b: bytes) -> [i64] {
+    var out: [i64] = []
+    for w in 0..128 {
+        var v = 0
+        var k = 7
+        while k >= 0 {
+            v = v.shl(8).bit_or(b.at(w * 8 + k))
+            k = k - 1
+        }
+        out.push(v)
+    }
+    return out
+}
+
+fn block_to_bytes(blk: [i64]) -> bytes {
+    var out: [i64] = []
+    for w in blk {
+        var k = 0
+        while k < 8 {
+            out.push(w.ushr(k * 8).bit_and(255))
+            k = k + 1
+        }
+    }
+    return bytes_of(out)
+}
+
+fn lo32(v: i64) -> i64 {
+    return v.bit_and(0xFFFFFFFF)
+}
+
+/// Argon2's round function: BLAKE2b's, with the addition replaced.
+///
+/// `a + b + 2 * lo32(a) * lo32(b)` is a 64x64 multiply in disguise, and it is
+/// there on purpose: a multiplication has a latency an attacker's circuit
+/// cannot shorten, so a hardware implementation gains less over a CPU than it
+/// would against addition and rotation alone.
+fn mix(inout v: [i64], a: i64, b: i64, c: i64, d: i64) {
+    v[a] = v[a] + v[b] + 2 * lo32(v[a]) * lo32(v[b])
+    v[d] = blake2b.rotr64(v[d].bit_xor(v[a]), 32)
+    v[c] = v[c] + v[d] + 2 * lo32(v[c]) * lo32(v[d])
+    v[b] = blake2b.rotr64(v[b].bit_xor(v[c]), 24)
+    v[a] = v[a] + v[b] + 2 * lo32(v[a]) * lo32(v[b])
+    v[d] = blake2b.rotr64(v[d].bit_xor(v[a]), 16)
+    v[c] = v[c] + v[d] + 2 * lo32(v[c]) * lo32(v[d])
+    v[b] = blake2b.rotr64(v[b].bit_xor(v[c]), 63)
+}
+
+/// One BLAKE2b round over sixteen words of the block, named by index.
+///
+/// The indices are given rather than assumed contiguous because the second
+/// half of the compression reads columns: sixteen words 2, 3, 18, 19, ... 113
+/// apart, which is what makes the block mix in both directions rather than
+/// eight independent stripes.
+fn round_at(inout blk: [i64], idx: [i64]) {
+    var v: [i64] = []
+    for i in idx {
+        v.push(blk[i])
+    }
+    mix(v, 0, 4, 8, 12)
+    mix(v, 1, 5, 9, 13)
+    mix(v, 2, 6, 10, 14)
+    mix(v, 3, 7, 11, 15)
+    mix(v, 0, 5, 10, 15)
+    mix(v, 1, 6, 11, 12)
+    mix(v, 2, 7, 8, 13)
+    mix(v, 3, 4, 9, 14)
+    var k = 0
+    for i in idx {
+        blk[i] = v[k]
+        k = k + 1
+    }
+}
+
+fn row_indices(i: i64) -> [i64] {
+    var out: [i64] = []
+    for k in 0..16 {
+        out.push(16 * i + k)
+    }
+    return out
+}
+
+fn column_indices(i: i64) -> [i64] {
+    var out: [i64] = []
+    for k in 0..8 {
+        out.push(2 * i + 16 * k)
+        out.push(2 * i + 16 * k + 1)
+    }
+    return out
+}
+
+/// The compression: `next = t ^ P_columns(P_rows(ref ^ prev))`.
+///
+/// `with_xor` folds the block already sitting there into the result, which is
+// what makes a second pass build on the first rather than replace it.
+fn fill_block(prev: [i64], reference: [i64], current: [i64],
+    with_xor: bool) -> [i64] {
+    var r: [i64] = []
+    for i in 0..128 {
+        r.push(reference[i].bit_xor(prev[i]))
+    }
+    var t: [i64] = []
+    for i in 0..128 {
+        t.push(if with_xor { r[i].bit_xor(current[i]) } else { r[i] })
+    }
+    for i in 0..8 {
+        round_at(r, row_indices(i))
+    }
+    for i in 0..8 {
+        round_at(r, column_indices(i))
+    }
+    var out: [i64] = []
+    for i in 0..128 {
+        out.push(t[i].bit_xor(r[i]))
+    }
+    return out
+}
+
+// ---------------------------------------------------------- the reference
+
+/// Where in the lane the next block may look, RFC 9106 section 3.4.1.2.
+///
+/// The squaring is not decoration. A uniform index would make recent blocks
+/// as likely as old ones; `x^2 / 2^32` biases the choice towards the newest,
+/// which is what forces an attacker who discarded early blocks to recompute
+/// them rather than wait.
+fn index_alpha(pass: i64, slice: i64, index: i64, same_lane: bool,
+    lane_length: i64, segment_length: i64, pseudo_rand: i64) -> i64 {
+    var area = 0
+    if pass == 0 {
+        if slice == 0 {
+            area = index - 1
+        } else {
+            if same_lane {
+                area = slice * segment_length + index - 1
+            } else {
+                area = slice * segment_length + if index == 0 { 0 - 1 } else { 0 }
+            }
+        }
+    } else {
+        if same_lane {
+            area = lane_length - segment_length + index - 1
+        } else {
+            area = lane_length - segment_length +
+            if index == 0 { 0 - 1 } else { 0 }
+        }
+    }
+    var relative = lo32(pseudo_rand)
+    relative = (relative * relative).ushr(32)
+    relative = area - 1 - (area * relative).ushr(32)
+    var start = 0
+    if pass != 0 {
+        start = if slice == SYNC_POINTS - 1 { 0 } else {
+            (slice + 1) * segment_length
+        }
+    }
+    return (start + relative) % lane_length
+}
+
+fn next_addresses(inout input_block: [i64], zero: [i64]) -> [i64] {
+    input_block[6] = input_block[6] + 1
+    let first = fill_block(zero, input_block, zero, false)
+    return fill_block(zero, first, zero, false)
+}
+
+// ------------------------------------------------------------------- core
+
+/// The raw tag, with every knob exposed.
+///
+/// `secret` is a key held by the server and not stored with the hash — an
+/// attacker who steals the database cannot test guesses without it. `ad` is
+/// associated data bound into the hash the same way. Almost no library
+/// exposes either; RFC 9106 defines both and this passes the vectors that use
+/// them.
+pub fn raw(kind: i64, password: bytes, salt: bytes, secret: bytes, ad: bytes,
+    t_cost: i64, m_cost: i64, lanes: i64, tag_len: i64) -> bytes ! Argon2Error {
+    if kind < 0 or kind > 2 {
+        fail(UnknownVariant(kind))
+    }
+    if t_cost < 1 {
+        fail(TooFewPasses(t_cost))
+    }
+    if lanes < 1 {
+        fail(TooFewLanes(lanes))
+    }
+    if tag_len < 4 {
+        fail(TagTooShort(tag_len))
+    }
+    if m_cost < 8 * lanes {
+        fail(NotEnoughMemory(m_cost, 8 * lanes))
+    }
+
+    // The memory is rounded down to a multiple of four blocks per lane, so
+    // every one of the four slices in a pass is the same size.
+    let blocks = 4 * lanes * (m_cost / (4 * lanes))
+    let lane_length = blocks / lanes
+    let segment_length = lane_length / SYNC_POINTS
+
+    var pre: [i64] = []
+    push_all(pre, le32(lanes))
+    push_all(pre, le32(tag_len))
+    push_all(pre, le32(m_cost))
+    push_all(pre, le32(t_cost))
+    push_all(pre, le32(VERSION))
+    push_all(pre, le32(kind))
+    push_all(pre, le32(password.len()))
+    push_bytes(pre, password)
+    push_all(pre, le32(salt.len()))
+    push_bytes(pre, salt)
+    push_all(pre, le32(secret.len()))
+    push_bytes(pre, secret)
+    push_all(pre, le32(ad.len()))
+    push_bytes(pre, ad)
+    let h0 = blake2b.digest(bytes_of(pre), bytes_of([]), 64) ?? bytes_of([])
+
+    var memory: [[i64]] = []
+    for _i in 0..blocks {
+        memory.push([])
+    }
+    for lane in 0..lanes {
+        for slot in 0..2 {
+            var seed = h0.to_list()
+            push_all(seed, le32(slot))
+            push_all(seed, le32(lane))
+            memory[lane * lane_length + slot] =
+            bytes_to_block(h_prime(seed, 1024))
+        }
+    }
+
+    let zero = zero_block()
+    for pass in 0..t_cost {
+        for slice in 0..SYNC_POINTS {
+            for lane in 0..lanes {
+                fill_segment(memory, kind, pass, slice, lane, lanes,
+                    lane_length, segment_length, blocks, t_cost, zero)
+            }
+        }
+    }
+
+    var final_block = memory[lane_length - 1]
+    var lane = 1
+    while lane < lanes {
+        let other = memory[lane * lane_length + lane_length - 1]
+        var merged: [i64] = []
+        for i in 0..128 {
+            merged.push(final_block[i].bit_xor(other[i]))
+        }
+        final_block = merged
+        lane = lane + 1
+    }
+    return h_prime(block_to_bytes(final_block).to_list(), tag_len)
+}
+
+/// One lane's share of one slice of one pass.
+///
+/// The four slices are what make the lanes parallelisable: within a slice a
+/// lane may only reference blocks finished in earlier slices, so `p` threads
+/// can run a slice together and synchronise between them. This runs them in
+/// order — the result is the same, since the rule is about what may be read
+/// and not about who reads it.
+fn fill_segment(inout memory: [[i64]], kind: i64, pass: i64, slice: i64,
+    lane: i64, lanes: i64, lane_length: i64, segment_length: i64,
+    blocks: i64, t_cost: i64, zero: [i64]) {
+    let independent = kind == ARGON2I or
+    (kind == ARGON2ID and pass == 0 and slice < SYNC_POINTS / 2)
+
+    var input_block = zero_block()
+    var address_block = zero_block()
+    if independent {
+        input_block[0] = pass
+        input_block[1] = lane
+        input_block[2] = slice
+        input_block[3] = blocks
+        input_block[4] = t_cost
+        input_block[5] = kind
+    }
+
+    var start = 0
+    if pass == 0 and slice == 0 {
+        // The first two blocks of every lane came from H0.
+        start = 2
+        if independent {
+            address_block = next_addresses(input_block, zero)
+        }
+    }
+
+    var curr = lane * lane_length + slice * segment_length + start
+    var prev = if curr % lane_length == 0 { curr + lane_length - 1 } else {
+        curr - 1
+    }
+
+    var i = start
+    while i < segment_length {
+        if curr % lane_length == 1 {
+            prev = curr - 1
+        }
+        var pseudo = 0
+        if independent {
+            if i % WORDS == 0 {
+                address_block = next_addresses(input_block, zero)
+            }
+            pseudo = address_block[i % WORDS]
+        } else {
+            pseudo = memory[prev][0]
+        }
+        var ref_lane = pseudo.ushr(32).bit_and(0xFFFFFFFF) % lanes
+        if pass == 0 and slice == 0 {
+            // Nothing in another lane exists yet.
+            ref_lane = lane
+        }
+        let ref_index = index_alpha(pass, slice, i, ref_lane == lane,
+            lane_length, segment_length, pseudo)
+        let reference = memory[ref_lane * lane_length + ref_index]
+        memory[curr] = fill_block(memory[prev], reference, memory[curr],
+            pass != 0)
+        i = i + 1
+        curr = curr + 1
+        prev = prev + 1
+    }
+}
+
+// ------------------------------------------------------------ the API
+
+/// Argon2id with RFC 9106's second recommended parameters, scaled by the
+/// caller.
+pub fn hash_raw(password: bytes, salt: bytes, t_cost: i64, m_cost: i64,
+    lanes: i64, tag_len: i64) -> bytes ! Argon2Error {
+    return try raw(ARGON2ID, password, salt, bytes_of([]), bytes_of([]),
+        t_cost, m_cost, lanes, tag_len)
+}
+
+/// The encoded form other tools read: `$argon2id$v=19$m=..,t=..,p=..$salt$tag`.
+///
+/// Base 64 without padding, and the salt travels in the string because a hash
+/// is useless without it. The parameters travel too, for bcrypt's reason: a
+/// stored hash has to say what it cost so the cost can be raised later
+/// without a migration.
+pub fn hash(password: bytes, salt: bytes, t_cost: i64, m_cost: i64,
+    lanes: i64, tag_len: i64) -> str ! Argon2Error {
+    let tag = try hash_raw(password, salt, t_cost, m_cost, lanes, tag_len)
+    return "$argon2id$v=" + "{VERSION}" + "$m=" + "{m_cost}" + ",t=" +
+    "{t_cost}" + ",p=" + "{lanes}" + "$" + encode64(salt) + "$" +
+    encode64(tag)
+}
+
+/// Whether the password produces this encoded hash.
+pub fn verify(password: bytes, encoded: str) -> bool {
+    let parts = encoded.split("$")
+    if parts.len() != 6 {
+        return false
+    }
+    var kind = 0 - 1
+    if parts[1] == "argon2d" {
+        kind = ARGON2D
+    }
+    if parts[1] == "argon2i" {
+        kind = ARGON2I
+    }
+    if parts[1] == "argon2id" {
+        kind = ARGON2ID
+    }
+    if kind < 0 {
+        return false
+    }
+    if parts[2] != "v=19" {
+        return false
+    }
+    let params = parts[3].split(",")
+    if params.len() != 3 {
+        return false
+    }
+    let m = number_after(params[0], "m=")
+    let t = number_after(params[1], "t=")
+    let p = number_after(params[2], "p=")
+    if m < 0 or t < 0 or p < 0 {
+        return false
+    }
+    let salt = decode64(parts[4]) ?? bytes_of([])
+    let want = decode64(parts[5]) ?? bytes_of([])
+    if salt.len() == 0 or want.len() < 4 {
+        return false
+    }
+    let got = raw(kind, password, salt, bytes_of([]), bytes_of([]), t, m, p,
+        want.len()) ?? bytes_of([])
+    if got.len() != want.len() {
+        return false
+    }
+    var diff = 0
+    var i = 0
+    while i < got.len() {
+        diff = diff.bit_or(got.at(i).bit_xor(want.at(i)))
+        i = i + 1
+    }
+    return diff == 0
+}
+
+fn number_after(text: str, prefix: str) -> i64 {
+    if not text.starts_with(prefix) {
+        return 0 - 1
+    }
+    return text.substr(prefix.len(), text.len() - prefix.len())
+        .parse_int() ?? (0 - 1)
+}
+
+// --------------------------------------------------------------- base 64
+
+fn alphabet() -> str {
+    return "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+}
+
+/// Base 64 with the padding left off, which is what the Argon2 string form
+/// uses and what a caller pasting one into a checker will expect.
+pub fn encode64(data: bytes) -> str {
+    let alpha = alphabet()
+    var out = ""
+    var i = 0
+    let n = data.len()
+    while i < n {
+        let b0 = data.at(i)
+        out = out + alpha.substr(b0.ushr(2), 1)
+        if i + 1 >= n {
+            out = out + alpha.substr(b0.bit_and(3).shl(4), 1)
+            break
+        }
+        let b1 = data.at(i + 1)
+        out = out + alpha.substr(b0.bit_and(3).shl(4).bit_or(b1.ushr(4)), 1)
+        if i + 2 >= n {
+            out = out + alpha.substr(b1.bit_and(15).shl(2), 1)
+            break
+        }
+        let b2 = data.at(i + 2)
+        out = out + alpha.substr(b1.bit_and(15).shl(2).bit_or(b2.ushr(6)), 1)
+        out = out + alpha.substr(b2.bit_and(63), 1)
+        i = i + 3
+    }
+    return out
+}
+
+pub fn decode64(text: str) -> bytes ! Argon2Error {
+    let alpha = alphabet()
+    var vals: [i64] = []
+    var i = 0
+    while i < text.len() {
+        let c = text.substr(i, 1)
+        if c == "=" {
+            break
+        }
+        let at = alpha.index_of(c) ?? (0 - 1)
+        if at < 0 {
+            fail(Malformed(text))
+        }
+        vals.push(at)
+        i = i + 1
+    }
+    var out: [i64] = []
+    var k = 0
+    while k + 1 < vals.len() {
+        out.push(vals[k].shl(2).bit_or(vals[k + 1].ushr(4)).bit_and(255))
+        if k + 2 >= vals.len() {
+            break
+        }
+        out.push(vals[k + 1].shl(4).bit_or(vals[k + 2].ushr(2)).bit_and(255))
+        if k + 3 >= vals.len() {
+            break
+        }
+        out.push(vals[k + 2].shl(6).bit_or(vals[k + 3]).bit_and(255))
+        k = k + 4
+    }
+    return bytes_of(out)
+}
+
+pub fn hex(data: bytes) -> str {
+    var out = ""
+    for b in data.to_list() {
+        out = out + "0123456789abcdef".substr(b.ushr(4), 1)
+        out = out + "0123456789abcdef".substr(b.bit_and(15), 1)
+    }
+    return out
+}

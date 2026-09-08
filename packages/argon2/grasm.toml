@@ -1,0 +1,10 @@
+[package]
+name = "argon2"
+version = "1.0.0"
+
+# Arithmetic over the caller's password. Opens nothing.
+capabilities = []
+
+[dependencies.blake2b]
+path = "../blake2b"
+version = "^1.0.0"

@@ -1,0 +1,417 @@
+import blake2b
+import ed25519
+import bcrypt
+import argon2
+import derwrite
+import jwk
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn unhex(s: str) -> bytes {
+    var out: [i64] = []
+    let digits = "0123456789abcdef"
+    var i = 0
+    while i + 2 <= s.len() {
+        let hi = digits.index_of(s.substr(i, 1)) ?? 0
+        let lo = digits.index_of(s.substr(i + 1, 1)) ?? 0
+        out.push(hi * 16 + lo)
+        i = i + 2
+    }
+    return bytes_of(out)
+}
+
+fn fill(v: i64, n: i64) -> bytes {
+    var out: [i64] = []
+    for _i in 0..n {
+        out.push(v)
+    }
+    return bytes_of(out)
+}
+
+// ---------------------------------------------------------------- blake2b
+
+fn sized(message: bytes, n: i64) -> str {
+    let d: bytes ! Blake2bError = blake2b.blake2b_sized(message, n)
+    return blake2b.hex(d ?? bytes_of([]))
+}
+
+fn check_blake2b(inout f: i64) / {io} {
+    print("-- blake2b: the same design one word wider")
+    // RFC 7693 appendix A.
+    say(f, "the RFC's own vector for \"abc\"",
+        blake2b.blake2b_hex("abc".to_bytes()) ==
+        "ba80a53f981c4d0d6a2797b69f12f6e94c212f14685ac4b74b12bb6fdbffa2d1" +
+        "7d87c5392aab792dc252d5de4533cc9518d38aa8dbf1925ab92386edd4009923")
+    say(f, "the empty message still gets a block",
+        blake2b.blake2b_hex("".to_bytes()) ==
+        "786a02f742015903c6c6fd852552d272912f4740e15847618a86e217f71f5419" +
+        "d25e1031afee585313896444934eb04b903a685b1448b755d56f701afe9be2ce")
+    // Every value here is Python's `hashlib.blake2b` for the same input.
+    say(f, "a 32-byte digest is not the first half of a 64-byte one",
+        sized("".to_bytes(), 32) ==
+        "0e5751c026e543b2e8ab2eb06099daa1d1e5df47778f7787faab45cdf12fe3a8")
+    say(f, "the digest length goes into the state, so one byte differs",
+        sized("the quick brown fox".to_bytes(), 1) !=
+        sized("the quick brown fox".to_bytes(), 2).substr(0, 2))
+    say(f, "a key is a MAC without HMAC around it",
+        blake2b.hex(blake2b.mac(bytes_of([1, 2, 3, 4, 5, 6, 7, 8]),
+            "message".to_bytes(), 32) ?? bytes_of([])) ==
+        "ee06c196471afdd0336e9364a441f757c507ae2c50b95ad5267156eb481f8def")
+    say(f, "an empty key is not a key of one zero byte",
+        blake2b.hex(blake2b.mac(bytes_of([]), "m".to_bytes(), 32)
+            ?? bytes_of([])) !=
+        blake2b.hex(blake2b.mac(bytes_of([0]), "m".to_bytes(), 32)
+            ?? bytes_of([])))
+    say(f, "an exact block boundary is one block, not two",
+        sized(fill(65, 128), 32) != sized(fill(65, 129), 32))
+    say(f, "a digest of zero bytes is refused rather than rounded up",
+        refuses_size(0) and refuses_size(65))
+}
+
+fn refuses_size(n: i64) -> bool {
+    match blake2b.blake2b_sized("x".to_bytes(), n) {
+        Ok(_v) -> {
+            return false
+        }
+        Err(_e) -> {
+            return true
+        }
+    }
+}
+
+// --------------------------------------------------------------- ed25519
+
+fn check_ed25519(inout f: i64) / {io} {
+    print("-- ed25519: deterministic, and two things a verifier must refuse")
+    // RFC 8032 section 7.1, the first test vector.
+    let seed = unhex("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")
+    let want_pk = "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"
+    let want_sig = "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e0652249015" +
+    "55fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b"
+    let pk = ed25519.public_key(seed) ?? bytes_of([])
+    say(f, "the RFC's public key for the RFC's seed", ed25519.hex(pk) == want_pk)
+    let sig = ed25519.sign(seed, bytes_of([])) ?? bytes_of([])
+    say(f, "the RFC's signature over the empty message",
+        ed25519.hex(sig) == want_sig)
+    say(f, "signing twice gives the same bytes — there is no nonce to reuse",
+        ed25519.hex(ed25519.sign(seed, bytes_of([])) ?? bytes_of([])) ==
+        want_sig)
+    say(f, "and the signature verifies",
+        ed25519.verify(pk, bytes_of([]), sig))
+    say(f, "a signature over a different message does not",
+        not ed25519.verify(pk, "x".to_bytes(), sig))
+
+    // S + L is a second valid-looking S for the same signature. The check
+    // that L bounds it is what stops one signature becoming two.
+    var malleable = sig.to_list()
+    let l = unhex("edd3f55c1a631258d69cf7a2def9de1400000000000000000000000000000010")
+    var carry = 0
+    var i = 0
+    while i < 32 {
+        let sum = malleable[32 + i] + l.at(i) + carry
+        malleable[32 + i] = sum.bit_and(255)
+        carry = sum.ushr(8)
+        i = i + 1
+    }
+    say(f, "S + L is refused, so one signature cannot become two",
+        not ed25519.verify(pk, bytes_of([]), bytes_of(malleable)))
+
+    // y = 2 has no x on this curve: (y^2-1)/(d*y^2+1) is not a square.
+    var not_a_point = fill(0, 32).to_list()
+    not_a_point[0] = 2
+    say(f, "a y with no x is refused, not panicked on",
+        not ed25519.is_valid_public_key(bytes_of(not_a_point)))
+    say(f, "a key of the wrong length is refused",
+        not ed25519.is_valid_public_key(fill(1, 31)))
+    say(f, "a signature of the wrong length is refused",
+        not ed25519.verify(pk, bytes_of([]), sig.slice(0, 63)))
+    say(f, "the RFC's own public key is a point",
+        ed25519.is_valid_public_key(unhex(want_pk)))
+
+    // Vector three, verified against the RFC's published signature rather
+    // than signed again — one scalar multiplication instead of two.
+    let pk3 = unhex("fc51cd8e6218a1a38da47ed00230f0580816ed13ba3303ac5deb911548908025")
+    let sig3 = unhex("6291d657deec24024827e69c3abe01a30ce548a284743a445e3680d7db5ac3ac" +
+        "18ff9b538d16f290ae67f760984dc6594a7c15e9716ed28dc027beceea1ec40a")
+    say(f, "the RFC's third vector verifies",
+        ed25519.verify(pk3, unhex("af82"), sig3))
+}
+
+// ---------------------------------------------------------------- bcrypt
+
+fn check_bcrypt(inout f: i64) / {io} {
+    print("-- bcrypt: 4 KiB of state, and seventy-two bytes of password")
+    // Every hash here is Python's `bcrypt`, which wraps OpenBSD's code.
+    let salt = bcrypt.decode64("abcdefghijklmnopqrstuu", 16) ?? bytes_of([])
+    let h: str ! BcryptError =
+    bcrypt.hash("correct horse battery staple".to_bytes(), salt, 4)
+    say(f, "the hash matches OpenBSD's for the same salt and cost",
+        (h ?? "") ==
+        "$2b$04$abcdefghijklmnopqrstuu7EJV7kdjBBQxyb0HjTh9KS7.Lah/6CG")
+    say(f, "and verifying it accepts the password",
+        bcrypt.verify("correct horse battery staple".to_bytes(),
+            "$2b$04$abcdefghijklmnopqrstuu7EJV7kdjBBQxyb0HjTh9KS7.Lah/6CG"))
+    say(f, "one character out and it does not",
+        not bcrypt.verify("correct horse battery stapl3".to_bytes(),
+            "$2b$04$abcdefghijklmnopqrstuu7EJV7kdjBBQxyb0HjTh9KS7.Lah/6CG"))
+    say(f, "a $2a$ hash verifies too — the versions agree below 72 bytes",
+        bcrypt.verify("".to_bytes(),
+            "$2a$04$DCq7YPn5Rq63x1Lad4cll.gPqnXZmDhhq3zJUTSJckzck53/zZY4W"))
+    say(f, "the alphabet is not RFC 4648's, so the salt round-trips only here",
+        bcrypt.encode64(bytes_of([0, 16, 131])) == "./AB" and
+        bcrypt.encode64(bytes_of([255, 255, 255])) == "9999")
+    say(f, "a 73-byte password is refused rather than quietly truncated",
+        refuses_long_password())
+    say(f, "72 bytes is accepted",
+        (bcrypt.hash(fill(97, 72), salt, 4) ?? "") ==
+        "$2b$04$abcdefghijklmnopqrstuuBzzIgyKkz7xMWYSzkIjUSnxEQFQ0WNe")
+    say(f, "the cost travels in the hash, so a row can be re-hashed later",
+        bcrypt.needs_rehash(
+            "$2b$04$abcdefghijklmnopqrstuu7EJV7kdjBBQxyb0HjTh9KS7.Lah/6CG",
+            12) and
+        not bcrypt.needs_rehash(
+            "$2b$04$abcdefghijklmnopqrstuu7EJV7kdjBBQxyb0HjTh9KS7.Lah/6CG",
+            4))
+    say(f, "each step of cost doubles the work",
+        bcrypt.relative_work(10, 13) == 8)
+    say(f, "a malformed hash is refused, not treated as a match",
+        not bcrypt.verify("x".to_bytes(), "$2b$04$tooshort"))
+}
+
+fn refuses_long_password() -> bool {
+    let salt = bcrypt.decode64("abcdefghijklmnopqrstuu", 16) ?? bytes_of([])
+    match bcrypt.hash(fill(97, 73), salt, 4) {
+        Ok(_v) -> {
+            return false
+        }
+        Err(_e) -> {
+            return true
+        }
+    }
+}
+
+// ---------------------------------------------------------------- argon2
+
+fn check_argon2(inout f: i64) / {io} {
+    print("-- argon2: memory an attacker has to buy")
+    // RFC 9106 section 5, all three variants — the vectors that use a secret
+    // key and associated data, which most libraries cannot even express.
+    let pw = fill(1, 32)
+    let salt = fill(2, 16)
+    let secret = fill(3, 8)
+    let ad = fill(4, 12)
+    let d: bytes ! Argon2Error =
+    argon2.raw(argon2.ARGON2D, pw, salt, secret, ad, 3, 32, 4, 32)
+    say(f, "the RFC's Argon2d vector",
+        argon2.hex(d ?? bytes_of([])) ==
+        "512b391b6f1162975371d30919734294f868e3be3984f3c1a13a4db9fabe4acb")
+    let i: bytes ! Argon2Error =
+    argon2.raw(argon2.ARGON2I, pw, salt, secret, ad, 3, 32, 4, 32)
+    say(f, "the RFC's Argon2i vector",
+        argon2.hex(i ?? bytes_of([])) ==
+        "c814d9d1dc7f37aa13f0d77f2494bda1c8de6b016dd388d29952a4c4672b6ce8")
+    let id: bytes ! Argon2Error =
+    argon2.raw(argon2.ARGON2ID, pw, salt, secret, ad, 3, 32, 4, 32)
+    say(f, "the RFC's Argon2id vector",
+        argon2.hex(id ?? bytes_of([])) ==
+        "0d640df58d78766c08c037a34a8b53c9d01ef0452d75b65eb52520e96b01e659")
+    // This string is byte-identical to what `argon2-cffi` writes.
+    let enc: str ! Argon2Error = argon2.hash(
+        "correct horse battery staple".to_bytes(),
+        "somesalt12345678".to_bytes(), 2, 64, 1, 32)
+    let text = enc ?? ""
+    say(f, "the encoded form matches the reference implementation's",
+        text == "$argon2id$v=19$m=64,t=2,p=1$c29tZXNhbHQxMjM0NTY3OA" +
+        "$XcCA2JUsASN/cSOFKIjniOq1/b/68WY0kQ+IjzYPp+w")
+    say(f, "and it verifies its own password and not another",
+        argon2.verify("correct horse battery staple".to_bytes(), text) and
+        not argon2.verify("wrong".to_bytes(), text))
+    say(f, "the parameters travel with the hash, as bcrypt's cost does",
+        text.contains("m=64,t=2,p=1"))
+    say(f, "memory below eight blocks a lane is refused",
+        refuses_memory(7, 1) and not refuses_memory(8, 1))
+    say(f, "zero passes is refused",
+        refuses_passes(0))
+    say(f, "the secret key changes the tag, so a stolen table is not enough",
+        argon2.hex(argon2.raw(argon2.ARGON2ID, pw, salt, secret, ad, 1, 32,
+            1, 32) ?? bytes_of([])) !=
+        argon2.hex(argon2.raw(argon2.ARGON2ID, pw, salt, bytes_of([]), ad, 1,
+            32, 1, 32) ?? bytes_of([])))
+}
+
+fn refuses_memory(m: i64, p: i64) -> bool {
+    match argon2.raw(argon2.ARGON2ID, "p".to_bytes(), "ssssssss".to_bytes(),
+        bytes_of([]), bytes_of([]), 1, m, p, 32) {
+        Ok(_v) -> {
+            return false
+        }
+        Err(_e) -> {
+            return true
+        }
+    }
+}
+
+fn refuses_passes(t: i64) -> bool {
+    match argon2.raw(argon2.ARGON2ID, "p".to_bytes(), "ssssssss".to_bytes(),
+        bytes_of([]), bytes_of([]), t, 32, 1, 32) {
+        Ok(_v) -> {
+            return false
+        }
+        Err(_e) -> {
+            return true
+        }
+    }
+}
+
+// -------------------------------------------------------------- derwrite
+
+fn enc(r: bytes ! DerWriteError) -> str {
+    return derwrite.hex(r ?? bytes_of([]))
+}
+
+fn check_derwrite(inout f: i64) / {io} {
+    print("-- derwrite: the encoding a signature has to agree about")
+    // Every expected value here is what Python's `asn1crypto` writes.
+    say(f, "a length under 128 is one octet and 128 needs two",
+        enc(derwrite.length(127)) == "7f" and
+        enc(derwrite.length(128)) == "8180" and
+        enc(derwrite.length(256)) == "820100")
+    say(f, "an INTEGER gains a leading zero only when the top bit is set",
+        enc(derwrite.integer(127)) == "02017f" and
+        enc(derwrite.integer(128)) == "02020080")
+    say(f, "a negative INTEGER is two's complement and minimal",
+        enc(derwrite.integer(0 - 1)) == "0201ff" and
+        enc(derwrite.integer(0 - 129)) == "0202ff7f")
+    say(f, "an unsigned magnitude drops leading zeroes before padding",
+        enc(derwrite.integer_unsigned(bytes_of([0, 0, 128, 1]))) ==
+        "0203008001")
+    say(f, "the first two OID arcs share one octet",
+        enc(derwrite.oid("2.5.4.3")) == "0603550403" and
+        enc(derwrite.oid("1.2.840.113549.1.1.11")) ==
+        "06092a864886f70d01010b")
+    say(f, "an arc above 127 is written base 128",
+        enc(derwrite.oid("2.16.840.1.101.3.4.2.1")) ==
+        "0609608648016503040201")
+    say(f, "a SET OF sorts by its members' encodings, not the caller's order",
+        enc(derwrite.set_of([derwrite.octet_string(bytes_of([9]))
+            ?? bytes_of([]), derwrite.integer(2) ?? bytes_of([]),
+            derwrite.integer(1) ?? bytes_of([])])) == "3109020101020102040109")
+    say(f, "KeyUsage truncates to the last set bit",
+        enc(derwrite.named_bits([0])) == "03020780" and
+        enc(derwrite.named_bits([5, 6])) == "03020106")
+    say(f, "a time is Zulu with seconds, and 2050 changes the type",
+        enc(derwrite.time_der(1700000000)) ==
+        "170d3233313131343232313332305a" and
+        enc(derwrite.time_der(2600000000)).substr(0, 2) == "18")
+    say(f, "countryName is a PrintableString and the rest are UTF8Strings",
+        enc(derwrite.name_of([("2.5.4.6", "GB"), ("2.5.4.10", "Example Ltd"),
+            ("2.5.4.3", "example.com")])) ==
+        "3039310b300906035504061302474231143012060355040a0c0b4578616d70" +
+        "6c65204c74643114301206035504030c0b6578616d706c652e636f6d")
+    say(f, "an implicit tag keeps the constructed bit and an explicit one wraps",
+        enc(derwrite.implicit(2, derwrite.sequence([derwrite.integer(1)
+            ?? bytes_of([])]) ?? bytes_of([]))) == "a203020101" and
+        enc(derwrite.explicit(0, derwrite.integer(1) ?? bytes_of([]))) ==
+        "a003020101")
+    say(f, "a value with a character PrintableString lacks widens to UTF8",
+        enc(derwrite.narrowest_string("*.example.com")).substr(0, 2) == "0c")
+}
+
+// ------------------------------------------------------------------- jwk
+
+fn check_jwk(inout f: i64) / {io} {
+    print("-- jwk: one name for a key, whoever described it")
+    let text = "\{\"kty\":\"RSA\",\"n\":\"0vx7agoebGcQSuuPiLJXZptN9nndrQmbXEps2aiAFbWhM78LhWx4cbbfAAtVT86zwu1RK7aPFFxuhDR1L6tSoc_BJECPebWKRXjBZCiFV4n3oknjhMstn64tZ_2W-5JsGY4Hc5n9yBXArwl93lqt7_RN5w6Cf0h4QyQ5v-65YGjQR0_FDW2QvzqY368QQMicAtaSqzs8KJZgnYb9c7d0zgdAZHzu6qMQvRL5hajrn1n91CbOpbISD08qNLyrdkt-bFTWhAI4vMQFh6WeZu0fM4lFd2NcRwr3XPksINHaQ-G_xBniIqbw0Ls1jF44-csFCur-kEgU8awapJzKnqDKgw\",\"e\":\"AQAB\",\"alg\":\"RS256\",\"kid\":\"2011-04-29\"}"
+    let key = jwk.parse(text) ?? jwk.empty()
+    say(f, "the modulus is read as 2048 bits", jwk.rsa_bits(key) == 2048)
+    let tb: str ! JwkError = jwk.thumbprint_b64(key)
+    say(f, "RFC 7638's own worked example",
+        (tb ?? "") == "NzbLsXh8uDCcd-6MNwXF4W_7noWXFZAfHkxZsRGC9Xs")
+    // RFC 8037 appendix A.3 gives this thumbprint as the key's kid.
+    let ed_text = "\{\"kty\":\"OKP\",\"crv\":\"Ed25519\",\"x\":\"11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo\"}"
+    let ed = jwk.parse(ed_text) ?? jwk.empty()
+    let et: str ! JwkError = jwk.thumbprint_b64(ed)
+    say(f, "RFC 8037's Ed25519 key gets RFC 8037's kid",
+        (et ?? "") == "kPrK_qmxVWaYVA9wwBF6Iuo3vVzz7TxHCTwXBygrS4k")
+    say(f, "the thumbprint ignores kid and alg, which is what makes it a name",
+        thumb_of(strip_extras(key)) == thumb_of(key))
+    say(f, "a modulus arriving with DER's leading zero encodes the same",
+        thumb_of(jwk.from_rsa(bytes_of([0, 200, 1, 2]), bytes_of([1, 0, 1]),
+            "")) ==
+        thumb_of(jwk.from_rsa(bytes_of([200, 1, 2]), bytes_of([1, 0, 1]),
+            "a")))
+    say(f, "a symmetric key is private and has no public half",
+        jwk.is_private(jwk.from_octet(bytes_of([1, 2, 3]), "s")) and
+        has_no_public(jwk.from_octet(bytes_of([1, 2, 3]), "s")))
+    say(f, "a set carrying a private member is not safe to serve",
+        not jwk.set_is_public([key, private_copy(key)]) and
+        jwk.set_is_public([key]))
+    say(f, "an Ed25519 key is OKP, never EC", ed.kty == "OKP" and
+        ed.crv == "Ed25519")
+    say(f, "base64url has no padding and no plus or slash",
+        jwk.encode64(bytes_of([251, 255, 190])) == "-_--")
+    let keys = [key, ed]
+    say(f, "a kid picks one key and an algorithm narrows the rest",
+        jwk.candidates(keys, "2011-04-29", "").len() == 1 and
+        jwk.candidates(keys, "", "EdDSA").len() == 1 and
+        jwk.candidates(keys, "", "").len() == 2)
+    say(f, "a key that declares no use is a candidate, an `enc` key is not",
+        jwk.candidates([enc_only(key)], "", "").len() == 0)
+}
+
+fn thumb_of(k: Jwk) -> str {
+    let t: str ! JwkError = jwk.thumbprint_b64(k)
+    return t ?? "ERR"
+}
+
+fn strip_extras(k: Jwk) -> Jwk {
+    var out = k
+    out.kid = ""
+    out.alg = ""
+    return out
+}
+
+fn private_copy(k: Jwk) -> Jwk {
+    var out = k
+    out.d = "AQAB"
+    return out
+}
+
+fn enc_only(k: Jwk) -> Jwk {
+    var out = k
+    out.purpose = "enc"
+    return out
+}
+
+fn has_no_public(k: Jwk) -> bool {
+    match jwk.public_of(k) {
+        Some(_v) -> {
+            return false
+        }
+        None -> {
+            return true
+        }
+    }
+}
+
+fn main() / {io} {
+    var f = 0
+    check_blake2b(f)
+    check_ed25519(f)
+    check_bcrypt(f)
+    check_argon2(f)
+    check_derwrite(f)
+    check_jwk(f)
+    if f == 0 {
+        print("crypto: every claim held")
+    } else {
+        print("crypto: {f} claims failed")
+    }
+}

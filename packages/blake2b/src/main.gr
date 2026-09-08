@@ -1,0 +1,237 @@
+// BLAKE2b, RFC 7693 — the 64-bit sibling of the BLAKE2s already here.
+//
+// Same design, wider word: eight 64-bit lanes instead of eight 32-bit ones,
+// twelve rounds instead of ten, rotations by 32, 24, 16 and 63. On a 64-bit
+// machine it is the faster of the two and the one everything reaches for —
+// Argon2 is defined over it, so are libsodium's generic hash, WireGuard's
+// cousin protocols, and half the content-addressed stores written since 2013.
+//
+// ## Why the constants are negative
+//
+// Grasm's integer is signed and the initialisation vector is not: four of the
+// eight IV words have their top bit set. They are written here as the signed
+// integers with those bit patterns, with the hexadecimal in a comment beside
+// each. Nothing downstream cares — every operation in BLAKE2b is addition
+// modulo 2^64, exclusive or, and rotation, and all three are the same
+// operation on the same bits whichever way the top one is read.
+//
+// The one place the distinction is real is the right shift, which is why
+// every rotation below uses `ushr` and not `shr`. `shr` copies the sign bit
+// down, which turns a rotation into something that is not one.
+//
+// ## Two features beyond a plain hash
+//
+// A **keyed** mode, which is a MAC without HMAC's two-pass construction
+// around it, and a **variable output length** from 1 to 64 bytes, which is
+// what lets Argon2 ask this one primitive for a 64-byte block and a 32-byte
+// tag. The length and the key length go into the parameter block that seeds
+// the state, so a 32-byte digest is not the first 32 bytes of a 64-byte one —
+// they are unrelated, which is the point.
+//
+// Checked against RFC 7693's appendix A vector, against Python's
+// `hashlib.blake2b` for every digest size from 1 to 64, and for keyed hashes
+// against the reference implementation's test suite.
+
+let BLOCK = 128
+
+type Blake2bError =
+    | DigestSizeOutOfRange(size: i64)
+    | KeyTooLong(len: i64)
+
+pub fn block_size() -> i64 {
+    return 128
+}
+
+pub fn max_digest_size() -> i64 {
+    return 64
+}
+
+pub fn max_key_size() -> i64 {
+    return 64
+}
+
+fn iv() -> [i64] {
+    return [
+        7640891576956012808,
+        0 - 4942790177534073029,
+        4354685564936845355,
+        0 - 6534734903238641935,
+        5840696475078001361,
+        0 - 7276294671716946913,
+        2270897969802886507,
+        6620516959819538809,
+    ]
+}
+
+/// The message schedule: twelve permutations of sixteen indices, of which the
+/// last two repeat the first two.
+///
+/// Indexed by the round and nothing else, so which entry is read says the
+/// round number and no part of the message.
+fn sigma() -> [[i64]] {
+    return [
+        [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+        [14, 10, 4, 8, 9, 15, 13, 6, 1, 12, 0, 2, 11, 7, 5, 3],
+        [11, 8, 12, 0, 5, 2, 15, 13, 10, 14, 3, 6, 7, 1, 9, 4],
+        [7, 9, 3, 1, 13, 12, 11, 14, 2, 6, 5, 10, 4, 0, 15, 8],
+        [9, 0, 5, 7, 2, 4, 10, 15, 14, 1, 11, 12, 6, 8, 3, 13],
+        [2, 12, 6, 10, 0, 11, 8, 3, 4, 13, 7, 5, 15, 14, 1, 9],
+        [12, 5, 1, 15, 14, 13, 4, 10, 0, 7, 6, 3, 9, 2, 8, 11],
+        [13, 11, 7, 14, 12, 1, 3, 9, 5, 0, 15, 4, 8, 6, 2, 10],
+        [6, 15, 14, 9, 11, 3, 0, 8, 12, 2, 13, 7, 1, 4, 10, 5],
+        [10, 2, 8, 4, 7, 6, 1, 5, 15, 11, 9, 14, 3, 12, 13, 0],
+        [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+        [14, 10, 4, 8, 9, 15, 13, 6, 1, 12, 0, 2, 11, 7, 5, 3],
+    ]
+}
+
+/// Rotate right within 64 bits.
+///
+/// BLAKE2 rotates right where ChaCha20 rotates left; the two are otherwise
+/// the same shape, and getting the direction wrong gives a hash that is
+/// self-consistent and matches nothing.
+pub fn rotr64(v: i64, n: i64) -> i64 {
+    return v.ushr(n).bit_or(v.shl(64 - n))
+}
+
+/// The compression function on one 128-byte block.
+///
+/// `t` is the number of bytes hashed so far including this block, and `last`
+/// says whether this is the final one. Both go into the working state rather
+/// than into the message, which is what stops a hash of a prefix from being
+/// extended — the length is mixed in before the attacker's bytes, not after.
+fn compress(inout h: [i64], m: [i64], t: i64, last: bool) {
+    let vinit = iv()
+    var v: [i64] = []
+    for i in 0..8 {
+        v.push(h[i])
+    }
+    for i in 0..8 {
+        v.push(vinit[i])
+    }
+    v[12] = v[12].bit_xor(t)
+    // The high half of the counter. A message long enough to need it does not
+    // fit in this machine's memory, so it stays zero — but the word is part
+    // of the state and leaving it out would change the answer.
+    v[13] = v[13].bit_xor(0)
+    if last {
+        v[14] = v[14].bit_xor(0 - 1)
+    }
+    let sched = sigma()
+    for r in 0..12 {
+        let sg = sched[r]
+        mix(v, 0, 4, 8, 12, m[sg[0]], m[sg[1]])
+        mix(v, 1, 5, 9, 13, m[sg[2]], m[sg[3]])
+        mix(v, 2, 6, 10, 14, m[sg[4]], m[sg[5]])
+        mix(v, 3, 7, 11, 15, m[sg[6]], m[sg[7]])
+        mix(v, 0, 5, 10, 15, m[sg[8]], m[sg[9]])
+        mix(v, 1, 6, 11, 12, m[sg[10]], m[sg[11]])
+        mix(v, 2, 7, 8, 13, m[sg[12]], m[sg[13]])
+        mix(v, 3, 4, 9, 14, m[sg[14]], m[sg[15]])
+    }
+    for i in 0..8 {
+        h[i] = h[i].bit_xor(v[i]).bit_xor(v[i + 8])
+    }
+}
+
+fn mix(inout v: [i64], a: i64, b: i64, c: i64, d: i64, x: i64, y: i64) {
+    v[a] = v[a] + v[b] + x
+    v[d] = rotr64(v[d].bit_xor(v[a]), 32)
+    v[c] = v[c] + v[d]
+    v[b] = rotr64(v[b].bit_xor(v[c]), 24)
+    v[a] = v[a] + v[b] + y
+    v[d] = rotr64(v[d].bit_xor(v[a]), 16)
+    v[c] = v[c] + v[d]
+    v[b] = rotr64(v[b].bit_xor(v[c]), 63)
+}
+
+/// Sixteen little-endian 64-bit words from 128 bytes starting at `at`.
+fn words_at(data: bytes, at: i64) -> [i64] {
+    var out: [i64] = []
+    for w in 0..16 {
+        var v = 0
+        var k = 7
+        while k >= 0 {
+            let idx = at + w * 8 + k
+            let byte = if idx < data.len() { data.at(idx) } else { 0 }
+            v = v.shl(8).bit_or(byte)
+            k = k - 1
+        }
+        out.push(v)
+    }
+    return out
+}
+
+/// The digest of `message` under `key`, `size` bytes long.
+///
+/// An empty key is an unkeyed hash and is not the same as a key of one zero
+/// byte: the key length goes into the parameter block, and a keyed hash also
+/// prepends a padded key block to the message.
+pub fn digest(message: bytes, key: bytes, size: i64) -> bytes ! Blake2bError {
+    if size < 1 or size > 64 {
+        fail(DigestSizeOutOfRange(size))
+    }
+    if key.len() > 64 {
+        fail(KeyTooLong(key.len()))
+    }
+    var h = iv()
+    h[0] = h[0].bit_xor(0x01010000).bit_xor(key.len().shl(8)).bit_xor(size)
+
+    var input = message
+    if key.len() > 0 {
+        var padded = key.to_list()
+        while padded.len() < BLOCK {
+            padded.push(0)
+        }
+        input = bytes_of(padded).concat(message)
+    }
+
+    let n = input.len()
+    var at = 0
+    // Every block but the last is compressed with the running byte count; the
+    // last carries the final flag as well. An empty message still has one
+    // block, which is why this is not a `while at < n`.
+    while n - at > BLOCK {
+        compress(h, words_at(input, at), at + BLOCK, false)
+        at = at + BLOCK
+    }
+    compress(h, words_at(input, at), n, true)
+
+    var out: [i64] = []
+    var i = 0
+    while i < size {
+        out.push(h[i / 8].ushr(i % 8 * 8).bit_and(255))
+        i = i + 1
+    }
+    return bytes_of(out)
+}
+
+pub fn blake2b(message: bytes) -> bytes {
+    return digest(message, bytes_of([]), 64) ?? bytes_of([])
+}
+
+pub fn blake2b_sized(message: bytes, size: i64) -> bytes ! Blake2bError {
+    return try digest(message, bytes_of([]), size)
+}
+
+/// A message authentication code, without HMAC around it.
+///
+/// HMAC exists because Merkle-Damgard hashes extend; BLAKE2's finalisation
+/// flag means this one does not, so the key goes in directly and one pass
+/// does the work of two.
+pub fn mac(key: bytes, message: bytes, size: i64) -> bytes ! Blake2bError {
+    return try digest(message, key, size)
+}
+
+pub fn hex(data: bytes) -> str {
+    var out = ""
+    for b in data.to_list() {
+        out = out + "0123456789abcdef".substr(b.ushr(4), 1)
+        out = out + "0123456789abcdef".substr(b.bit_and(15), 1)
+    }
+    return out
+}
+
+pub fn blake2b_hex(message: bytes) -> str {
+    return hex(blake2b(message))
+}

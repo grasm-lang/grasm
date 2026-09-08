@@ -1,0 +1,6 @@
+[package]
+name = "bcrypt"
+version = "1.0.0"
+
+# Arithmetic on a password the caller supplies. Opens nothing.
+capabilities = []

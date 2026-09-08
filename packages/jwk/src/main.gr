@@ -1,0 +1,526 @@
+// JSON Web Keys, RFC 7517, with the thumbprint from RFC 7638.
+//
+// A JWK is how a public key travels over HTTP: an object with a `kty` saying
+// what kind of key it is and base64url members carrying the numbers. Every
+// OpenID provider publishes a set of them at a well-known URL, and every
+// verifier of an ID token fetches that set and picks a key out of it.
+//
+// ## The two things that go wrong
+//
+// **A set published with private members in it.** A JWK holds `d` when it is
+// a private key, and a program that builds a set out of its signing keys and
+// serves it has published them. `public_of` strips the private members and
+// `is_private` answers the question; a set is worth checking before it is
+// served, which is why both exist.
+//
+// **A number with a leading zero.** RFC 7518 says an RSA modulus is the
+// unsigned big-endian octets, minimally encoded. DER says an INTEGER carries
+// a leading `00` when its top bit is set — which a 2048-bit modulus always
+// has. So a key converted from a certificate without dropping that byte is
+// 257 bytes where it should be 256, and its thumbprint is wrong, and it does
+// not match the same key from any other source. `from_rsa` drops leading
+// zeroes for exactly this reason.
+//
+// ## What the thumbprint is for
+//
+// A stable name for a key that does not depend on how the key was described.
+// The canonical form has **only the required members**, in code point order,
+// with no whitespace — so `kid`, `alg`, `use`, and the order the publisher
+// happened to write them in all fall out, and two descriptions of one key
+// give one thumbprint. That is what makes it usable as a `kid` when the
+// publisher did not supply one, which is what RFC 7638 section 3.3 suggests.
+//
+// Checked against RFC 7638 section 3.1's worked example, RFC 8037 appendix
+// A's Ed25519 key, and against the canonical JSON built independently in
+// Python for a hundred generated keys.
+
+import json
+import crypto_hash
+
+type Jwk = {
+    /// `RSA`, `EC`, `OKP` or `oct`.
+    kty: str,
+    /// The key id, or empty when the publisher gave none.
+    kid: str,
+    /// `sig`, `enc`, or empty. Named for what it is because `use` is taken.
+    purpose: str,
+    alg: str,
+    crv: str,
+    /// RSA: modulus and exponent, base64url.
+    n: str,
+    e: str,
+    /// EC and OKP coordinates, base64url.
+    x: str,
+    y: str,
+    /// A symmetric key, base64url.
+    k: str,
+    /// The private member. Empty on a public key.
+    d: str,
+    ops: [str],
+}
+
+type JwkError =
+    | NotAnObject()
+    | MissingMember(name: str)
+    | UnknownKeyType(kty: str)
+    | BadBase64(text: str)
+    | BadJson(why: str)
+    | NoKeysMember()
+
+pub fn empty() -> Jwk {
+    return Jwk{ kty: "", kid: "", purpose: "", alg: "", crv: "", n: "",
+        e: "", x: "", y: "", k: "", d: "", ops: [] }
+}
+
+// --------------------------------------------------------- base64url
+
+fn alphabet() -> str {
+    return "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+}
+
+/// Base64url, no padding — the only encoding a JWK member uses.
+///
+/// `-` and `_` replace `+` and `/` so a value survives a URL, and the `=`
+/// padding is dropped because RFC 7515 says to. A decoder that insists on
+/// padding rejects every real JWK.
+pub fn encode64(data: bytes) -> str {
+    let alpha = alphabet()
+    var out = ""
+    var i = 0
+    let n = data.len()
+    while i < n {
+        let b0 = data.at(i)
+        out = out + alpha.substr(b0.ushr(2), 1)
+        if i + 1 >= n {
+            out = out + alpha.substr(b0.bit_and(3).shl(4), 1)
+            break
+        }
+        let b1 = data.at(i + 1)
+        out = out + alpha.substr(b0.bit_and(3).shl(4).bit_or(b1.ushr(4)), 1)
+        if i + 2 >= n {
+            out = out + alpha.substr(b1.bit_and(15).shl(2), 1)
+            break
+        }
+        let b2 = data.at(i + 2)
+        out = out + alpha.substr(b1.bit_and(15).shl(2).bit_or(b2.ushr(6)), 1)
+        out = out + alpha.substr(b2.bit_and(63), 1)
+        i = i + 3
+    }
+    return out
+}
+
+pub fn decode64(text: str) -> bytes ! JwkError {
+    let alpha = alphabet()
+    var vals: [i64] = []
+    var i = 0
+    while i < text.len() {
+        let c = text.substr(i, 1)
+        if c == "=" {
+            break
+        }
+        let at = alpha.index_of(c) ?? (0 - 1)
+        if at < 0 {
+            fail(BadBase64(text))
+        }
+        vals.push(at)
+        i = i + 1
+    }
+    var out: [i64] = []
+    var k = 0
+    while k + 1 < vals.len() {
+        out.push(vals[k].shl(2).bit_or(vals[k + 1].ushr(4)).bit_and(255))
+        if k + 2 >= vals.len() {
+            break
+        }
+        out.push(vals[k + 1].shl(4).bit_or(vals[k + 2].ushr(2)).bit_and(255))
+        if k + 3 >= vals.len() {
+            break
+        }
+        out.push(vals[k + 2].shl(6).bit_or(vals[k + 3]).bit_and(255))
+        k = k + 4
+    }
+    return bytes_of(out)
+}
+
+/// The unsigned big-endian octets of a number, with leading zeroes gone.
+///
+/// This is where a key converted out of DER loses the padding byte an INTEGER
+/// carries. A modulus that keeps it encodes to a different string and
+/// therefore a different thumbprint.
+pub fn encode_number(magnitude: bytes) -> str {
+    var at = 0
+    while at + 1 < magnitude.len() and magnitude.at(at) == 0 {
+        at = at + 1
+    }
+    if magnitude.len() == 0 {
+        return ""
+    }
+    return encode64(magnitude.slice(at, magnitude.len()))
+}
+
+// -------------------------------------------------------------- parsing
+
+fn member(v: ref Json, name: str) -> str {
+    let got = json.get(v, name)
+    match got {
+        Some(node) -> {
+            return json.as_str(node) ?? ""
+        }
+        None -> {
+            return ""
+        }
+    }
+}
+
+fn string_list(v: ref Json, name: str) -> [str] {
+    var out: [str] = []
+    let got = json.get(v, name)
+    match got {
+        Some(node) -> {
+            for item in json.items_of(node) {
+                out.push(json.as_str(item) ?? "")
+            }
+        }
+        None -> {
+        }
+    }
+    return out
+}
+
+pub fn of_json(v: ref Json) -> Jwk ! JwkError {
+    if json.kind(v) != "object" {
+        fail(NotAnObject())
+    }
+    let kty = member(v, "kty")
+    if kty == "" {
+        fail(MissingMember("kty"))
+    }
+    if kty != "RSA" and kty != "EC" and kty != "OKP" and kty != "oct" {
+        fail(UnknownKeyType(kty))
+    }
+    return Jwk{
+        kty: kty,
+        kid: member(v, "kid"),
+        purpose: member(v, "use"),
+        alg: member(v, "alg"),
+        crv: member(v, "crv"),
+        n: member(v, "n"),
+        e: member(v, "e"),
+        x: member(v, "x"),
+        y: member(v, "y"),
+        k: member(v, "k"),
+        d: member(v, "d"),
+        ops: string_list(v, "key_ops"),
+    }
+}
+
+pub fn parse(text: str) -> Jwk ! JwkError {
+    let doc = json.parse(text) ?? json.null()
+    if json.is_null(doc) {
+        fail(BadJson(text))
+    }
+    return try of_json(doc)
+}
+
+/// The keys of a JWK Set, in the order published.
+///
+/// Order matters: a verifier with no `kid` to match tries them in turn, and
+/// the publisher lists the current one first.
+pub fn parse_set(text: str) -> [Jwk] ! JwkError {
+    let doc = json.parse(text) ?? json.null()
+    if json.is_null(doc) {
+        fail(BadJson(text))
+    }
+    let keys = json.get(doc, "keys")
+    var out: [Jwk] = []
+    match keys {
+        Some(node) -> {
+            for item in json.items_of(node) {
+                out.push(try of_json(item))
+            }
+        }
+        None -> {
+            fail(NoKeysMember())
+        }
+    }
+    return out
+}
+
+// ------------------------------------------------------------- building
+
+pub fn from_rsa(modulus: bytes, exponent: bytes, kid: str) -> Jwk {
+    var key = empty()
+    key.kty = "RSA"
+    key.n = encode_number(modulus)
+    key.e = encode_number(exponent)
+    key.kid = kid
+    key.alg = "RS256"
+    return key
+}
+
+/// An Ed25519 public key, RFC 8037: `kty` is `OKP` and `crv` is `Ed25519`.
+///
+/// Not `EC`. The curve is not a Weierstrass one and has no `y`, and a key
+/// published as `EC` will be rejected by anything that reads the spec.
+pub fn from_ed25519(public: bytes, kid: str) -> Jwk {
+    var key = empty()
+    key.kty = "OKP"
+    key.crv = "Ed25519"
+    key.x = encode64(public)
+    key.kid = kid
+    key.alg = "EdDSA"
+    return key
+}
+
+pub fn from_p256(x: bytes, y: bytes, kid: str) -> Jwk {
+    var key = empty()
+    key.kty = "EC"
+    key.crv = "P-256"
+    key.x = encode64(x)
+    key.y = encode64(y)
+    key.kid = kid
+    key.alg = "ES256"
+    return key
+}
+
+pub fn from_octet(secret: bytes, kid: str) -> Jwk {
+    var key = empty()
+    key.kty = "oct"
+    key.k = encode64(secret)
+    key.kid = kid
+    return key
+}
+
+// -------------------------------------------------------------- privacy
+
+/// Whether this key carries a private member.
+pub fn is_private(key: Jwk) -> bool {
+    return key.d != "" or key.kty == "oct"
+}
+
+/// The same key with everything secret removed, or `None` when there is
+/// nothing to publish.
+///
+/// A symmetric key has no public half at all. Returning it with `k` blanked
+/// would give a caller something that looks publishable and is not a key, so
+/// the answer is `None` and the caller has to notice.
+pub fn public_of(key: Jwk) -> Option[Jwk] {
+    if key.kty == "oct" {
+        return None
+    }
+    var out = key
+    out.d = ""
+    return Some(out)
+}
+
+/// Whether a set is safe to serve.
+pub fn set_is_public(keys: [Jwk]) -> bool {
+    for key in keys {
+        if is_private(key) {
+            return false
+        }
+    }
+    return true
+}
+
+// ------------------------------------------------------------ rendering
+
+fn quoted(s: str) -> str {
+    return "\"" + json.escape(s) + "\""
+}
+
+fn pair(name: str, value: str) -> str {
+    return quoted(name) + ":" + quoted(value)
+}
+
+/// The canonical form RFC 7638 hashes: required members only, code point
+/// order, no whitespace.
+///
+/// Everything optional is left out — `kid` above all. A thumbprint that
+/// changed when a publisher added a key id would be no use as a key id.
+pub fn canonical(key: Jwk) -> str ! JwkError {
+    if key.kty == "RSA" {
+        if key.n == "" {
+            fail(MissingMember("n"))
+        }
+        if key.e == "" {
+            fail(MissingMember("e"))
+        }
+        return "\{" + pair("e", key.e) + "," + pair("kty", "RSA") + "," +
+        pair("n", key.n) + "}"
+    }
+    if key.kty == "EC" {
+        if key.crv == "" {
+            fail(MissingMember("crv"))
+        }
+        if key.x == "" {
+            fail(MissingMember("x"))
+        }
+        if key.y == "" {
+            fail(MissingMember("y"))
+        }
+        return "\{" + pair("crv", key.crv) + "," + pair("kty", "EC") + "," +
+        pair("x", key.x) + "," + pair("y", key.y) + "}"
+    }
+    if key.kty == "OKP" {
+        if key.crv == "" {
+            fail(MissingMember("crv"))
+        }
+        if key.x == "" {
+            fail(MissingMember("x"))
+        }
+        return "\{" + pair("crv", key.crv) + "," + pair("kty", "OKP") + "," +
+        pair("x", key.x) + "}"
+    }
+    if key.kty == "oct" {
+        if key.k == "" {
+            fail(MissingMember("k"))
+        }
+        return "\{" + pair("k", key.k) + "," + pair("kty", "oct") + "}"
+    }
+    fail(UnknownKeyType(key.kty))
+}
+
+/// The SHA-256 thumbprint, thirty-two bytes.
+pub fn thumbprint(key: Jwk) -> bytes ! JwkError {
+    let text = try canonical(key)
+    return crypto_hash.sha256_of(text.to_bytes())
+}
+
+pub fn thumbprint_b64(key: Jwk) -> str ! JwkError {
+    return encode64(try thumbprint(key))
+}
+
+/// The URI form from RFC 9278, which is what an identifier for a key looks
+/// like when it has to sit in a field expecting one.
+pub fn thumbprint_uri(key: Jwk) -> str ! JwkError {
+    return "urn:ietf:params:oauth:jwk-thumbprint:sha-256:" +
+    (try thumbprint_b64(key))
+}
+
+/// The key as JSON, with the members that are set.
+pub fn render(key: Jwk) -> str {
+    var parts: [str] = []
+    parts.push(pair("kty", key.kty))
+    if key.crv != "" {
+        parts.push(pair("crv", key.crv))
+    }
+    if key.n != "" {
+        parts.push(pair("n", key.n))
+    }
+    if key.e != "" {
+        parts.push(pair("e", key.e))
+    }
+    if key.x != "" {
+        parts.push(pair("x", key.x))
+    }
+    if key.y != "" {
+        parts.push(pair("y", key.y))
+    }
+    if key.k != "" {
+        parts.push(pair("k", key.k))
+    }
+    if key.d != "" {
+        parts.push(pair("d", key.d))
+    }
+    if key.kid != "" {
+        parts.push(pair("kid", key.kid))
+    }
+    if key.purpose != "" {
+        parts.push(pair("use", key.purpose))
+    }
+    if key.alg != "" {
+        parts.push(pair("alg", key.alg))
+    }
+    return "\{" + parts.join(",") + "}"
+}
+
+pub fn render_set(keys: [Jwk]) -> str {
+    var parts: [str] = []
+    for key in keys {
+        parts.push(render(key))
+    }
+    return "\{\"keys\":[" + parts.join(",") + "]}"
+}
+
+// ------------------------------------------------------------ selecting
+
+pub fn find(keys: [Jwk], kid: str) -> Option[Jwk] {
+    for key in keys {
+        if key.kid == kid {
+            return Some(key)
+        }
+    }
+    return None
+}
+
+/// The keys a verifier should try for a token with this header.
+///
+/// A `kid` in the header narrows it to one; without one, every key whose
+/// declared algorithm and use do not contradict the header is a candidate,
+/// in the order published. A key that declares no `alg` is a candidate for
+/// any — that is what leaving it out means.
+pub fn candidates(keys: [Jwk], kid: str, alg: str) -> [Jwk] {
+    var out: [Jwk] = []
+    for key in keys {
+        if kid != "" and key.kid != kid {
+            continue
+        }
+        if key.alg != "" and alg != "" and key.alg != alg {
+            continue
+        }
+        if key.purpose == "enc" {
+            continue
+        }
+        out.push(key)
+    }
+    return out
+}
+
+/// The number of bits in an RSA modulus, or 0 if this is not an RSA key.
+pub fn rsa_bits(key: Jwk) -> i64 {
+    if key.kty != "RSA" {
+        return 0
+    }
+    let m = decode64(key.n) ?? bytes_of([])
+    if m.len() == 0 {
+        return 0
+    }
+    var bits = (m.len() - 1) * 8
+    var top = m.at(0)
+    while top > 0 {
+        bits = bits + 1
+        top = top.ushr(1)
+    }
+    return bits
+}
+
+pub fn rsa_modulus(key: Jwk) -> bytes ! JwkError {
+    if key.kty != "RSA" {
+        fail(UnknownKeyType(key.kty))
+    }
+    return try decode64(key.n)
+}
+
+pub fn rsa_exponent(key: Jwk) -> bytes ! JwkError {
+    if key.kty != "RSA" {
+        fail(UnknownKeyType(key.kty))
+    }
+    return try decode64(key.e)
+}
+
+pub fn okp_public(key: Jwk) -> bytes ! JwkError {
+    if key.kty != "OKP" {
+        fail(UnknownKeyType(key.kty))
+    }
+    return try decode64(key.x)
+}
+
+pub fn hex(data: bytes) -> str {
+    var out = ""
+    for b in data.to_list() {
+        out = out + "0123456789abcdef".substr(b.ushr(4), 1)
+        out = out + "0123456789abcdef".substr(b.bit_and(15), 1)
+    }
+    return out
+}

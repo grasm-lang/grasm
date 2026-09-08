@@ -1,0 +1,28 @@
+[package]
+name = "crypto4_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.blake2b]
+path = "../blake2b"
+version = "^1.0.0"
+
+[dependencies.ed25519]
+path = "../ed25519"
+version = "^1.0.0"
+
+[dependencies.bcrypt]
+path = "../bcrypt"
+version = "^1.0.0"
+
+[dependencies.argon2]
+path = "../argon2"
+version = "^1.0.0"
+
+[dependencies.derwrite]
+path = "../derwrite"
+version = "^1.0.0"
+
+[dependencies.jwk]
+path = "../jwk"
+version = "^1.0.0"

@@ -39,18 +39,28 @@
 // somebody has reviewed this.
 //
 // Checked against RFC 7748 section 5.2's vectors and section 6.1's exchange.
+//
+// ## Why the field arithmetic is public
+//
+// Curve25519 and Edwards25519 are two curves over the *same* field, and the
+// ten-limb representation above is the answer to a question about Grasm's
+// integer width rather than about either curve. `ed25519` therefore builds on
+// these operations instead of carrying a second copy of them: one
+// representation, one set of carry bounds, one place a mistake in them can be.
+// `fadd` through `invert` are field arithmetic and nothing more — they know
+// no curve, no scalar, and no key.
 
 type Fe = { l: [i64] }
 
-fn fzero() -> Fe {
+pub fn fzero() -> Fe {
     Fe{ l: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0] }
 }
 
-fn fone() -> Fe {
+pub fn fone() -> Fe {
     Fe{ l: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0] }
 }
 
-fn fadd(a: Fe, b: Fe) -> Fe {
+pub fn fadd(a: Fe, b: Fe) -> Fe {
     var out: [i64] = []
     for i in 0..10 {
         out.push(a.l[i] + b.l[i])
@@ -60,7 +70,7 @@ fn fadd(a: Fe, b: Fe) -> Fe {
 
 /// `a - b`. Limbs may go negative and that is allowed: the carry chain uses an
 /// arithmetic shift, and the bounds still hold.
-fn fsub(a: Fe, b: Fe) -> Fe {
+pub fn fsub(a: Fe, b: Fe) -> Fe {
     var out: [i64] = []
     for i in 0..10 {
         out.push(a.l[i] - b.l[i])
@@ -110,17 +120,26 @@ fn reduce(inout t: [i64]) {
     }
 }
 
-fn fmul(a: Fe, b: Fe) -> Fe {
+pub fn fmul(a: Fe, b: Fe) -> Fe {
+    let al = a.l
+    let bl = b.l
+    // Two odd limbs are each stored scaled by two, so their product carries a
+    // factor the others do not. Doubling the odd limbs of `b` once puts that
+    // factor in the operand rather than in a test the inner loop repeats a
+    // hundred times.
+    var bx: [i64] = []
+    for j in 0..10 {
+        bx.push(if j % 2 == 1 { 2 * bl[j] } else { bl[j] })
+    }
     var t: [i64] = []
     for _i in 0..19 {
         t.push(0)
     }
     for i in 0..10 {
+        let ai = al[i]
+        let row = if i % 2 == 1 { bx } else { bl }
         for j in 0..10 {
-            // Two odd limbs are each stored scaled by two, so their product
-            // carries a factor the others do not.
-            let scale = if i % 2 == 1 and j % 2 == 1 { 2 } else { 1 }
-            t[i + j] = t[i + j] + scale * a.l[i] * b.l[j]
+            t[i + j] = t[i + j] + ai * row[j]
         }
     }
     // Fold the degree back: limb i+10 has weight 2^255 times limb i's.
@@ -138,11 +157,11 @@ fn fmul(a: Fe, b: Fe) -> Fe {
     Fe{ l: out }
 }
 
-fn fsquare(a: Fe) -> Fe {
+pub fn fsquare(a: Fe) -> Fe {
     fmul(a, a)
 }
 
-fn fscalar(a: Fe, s: i64) -> Fe {
+pub fn fscalar(a: Fe, s: i64) -> Fe {
     var out: [i64] = []
     for i in 0..10 {
         out.push(a.l[i] * s)
@@ -152,7 +171,7 @@ fn fscalar(a: Fe, s: i64) -> Fe {
 }
 
 /// Thirty-two bytes, little-endian, into ten limbs.
-fn expand(b: bytes) -> Fe {
+pub fn expand(b: bytes) -> Fe {
     var bits = 0
     var acc = 0
     var out: [i64] = []
@@ -186,7 +205,7 @@ fn expand(b: bytes) -> Fe {
 ///
 /// **And whether it was is a fact about a secret**, so the subtraction happens
 /// unconditionally and the answer is selected with a mask.
-fn contract(a: Fe) -> bytes {
+pub fn contract(a: Fe) -> bytes {
     var t = a.l
 
     // Non-negative, every limb inside its width. Three passes: the top limb
@@ -268,7 +287,7 @@ fn cswap(swap: i64, inout a: Fe, inout b: Fe) {
 /// A fixed addition chain of 254 squarings and 11 multiplications. Fixed
 /// because the exponent is a constant of the curve — nothing here depends on
 /// the value being inverted, which is what keeps it constant-time.
-fn invert(z: Fe) -> Fe {
+pub fn invert(z: Fe) -> Fe {
     var z2 = fsquare(z)
     var t = fsquare(z2)
     t = fsquare(t)

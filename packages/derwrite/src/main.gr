@@ -1,0 +1,668 @@
+// Writing DER, which `asn1` only reads.
+//
+// A certificate request, a signed message and an OCSP query are all documents
+// a program has to *produce*, and a parser is no help there. This is the other
+// half: every universal type a PKIX document uses, encoded the one way DER
+// allows.
+//
+// DER is BER with the choices removed, and the removed choices are the whole
+// point — two encoders given the same value must produce the same bytes, or a
+// signature over those bytes means nothing. Four rules do most of that work,
+// and each is a place a hand-rolled encoder goes wrong:
+//
+//   * **A length is minimal.** Under 128 it is one octet. At 128 or above it
+//     is a count octet with the high bit set, then the length big-endian with
+//     no leading zero. The indefinite form BER allows is not written here at
+//     all, and `asn1` refuses to read it.
+//   * **An INTEGER is two's complement, and minimal.** A leading `0x00` goes
+//     in when the top bit of the first octet is set, and only then. The common
+//     bug is padding an unsigned modulus that does not need it, which changes
+//     the bytes a signature covers.
+//   * **A SET OF is sorted by its members' own encodings.** Not by the values,
+//     not by the order the caller listed them. This is what makes a directory
+//     name with two attributes reproducible.
+//   * **A time is Zulu, with seconds.** The optional forms — an offset, an
+//     omitted seconds field, fractional seconds — are BER's, and RFC 5280
+//     forbids them. Years before 2050 are UTCTime and the rest are
+//     GeneralizedTime, which is the rule that keeps two-digit years unambiguous
+//     without a certificate saying which century it means.
+//
+// Checked by encoding each type and reading it back with `asn1`, and by having
+// Python's `asn1crypto` parse the same bytes and agree on the value.
+
+/// The identifier octets this package writes. They match `asn1`'s names; the
+/// two are the same table read in opposite directions.
+pub let BOOLEAN = 1
+pub let INTEGER = 2
+pub let BIT_STRING = 3
+pub let OCTET_STRING = 4
+pub let NULL = 5
+pub let OID = 6
+pub let UTF8_STRING = 12
+pub let PRINTABLE_STRING = 19
+pub let IA5_STRING = 22
+pub let UTC_TIME = 23
+pub let GENERALIZED_TIME = 24
+pub let SEQUENCE = 48
+pub let SET = 49
+
+type DerWriteError =
+    | TagOutOfRange(tag: i64)
+    | LengthNegative(len: i64)
+    | OidMalformed(text: str)
+    | OidFirstArc(arc: i64)
+    | OidSecondArc(arc: i64)
+    | NotPrintable(text: str)
+    | NotAscii(text: str)
+    | UnusedBitsOutOfRange(bits: i64)
+    | YearOutOfRange(year: i64)
+
+    // ------------------------------------------------------------------ lengths
+
+    /// The length octets for a body of `n` bytes, in the one form DER permits.
+    ///
+    /// Short form under 128, long form above it with no leading zero. A body of
+    /// 127 bytes writes `7F`; 128 writes `81 80`; 256 writes `82 01 00`. Writing
+    /// `81 7F` for 127 is legal BER and invalid DER, and is what an encoder that
+    /// always uses the long form produces.
+pub fn length(n: i64) -> bytes ! DerWriteError {
+    if n < 0 {
+        fail(LengthNegative(n))
+    }
+    if n < 128 {
+        return bytes_of([n])
+    }
+    var big: [i64] = []
+    var v = n
+    while v > 0 {
+        big.push(v.bit_and(255))
+        v = v.ushr(8)
+    }
+    var out = [128 + big.len()]
+    for byte in big.rev() {
+        out.push(byte)
+    }
+    return bytes_of(out)
+}
+
+/// A tag, its length and its body: the whole of DER, once the bodies are
+/// decided.
+pub fn tlv(tag: i64, body: bytes) -> bytes ! DerWriteError {
+    if tag < 0 or tag > 255 {
+        fail(TagOutOfRange(tag))
+    }
+    let head = try length(body.len())
+    return bytes_of([tag]).concat(head).concat(body)
+}
+
+// ------------------------------------------------------------ simple values
+
+pub fn boolean(v: bool) -> bytes ! DerWriteError {
+    // DER pins true to `FF`. BER accepts any non-zero octet, which is why a
+    // BER-tolerant reader and a DER writer can disagree about a byte that
+    // means the same thing.
+    if v {
+        return try tlv(BOOLEAN, bytes_of([255]))
+    }
+    return try tlv(BOOLEAN, bytes_of([0]))
+}
+
+pub fn null() -> bytes ! DerWriteError {
+    return try tlv(NULL, bytes_of([]))
+}
+
+/// A signed integer that fits in a machine word.
+pub fn integer(v: i64) -> bytes ! DerWriteError {
+    return try tlv(INTEGER, integer_body(v))
+}
+
+/// The content octets of an INTEGER: two's complement, big-endian, and as few
+/// octets as say the value.
+fn integer_body(v: i64) -> bytes {
+    if v == 0 {
+        return bytes_of([0])
+    }
+    var low_first: [i64] = []
+    var x = v
+    if v > 0 {
+        while x > 0 {
+            low_first.push(x.bit_and(255))
+            x = x.ushr(8)
+        }
+        var out = low_first.rev()
+        // A leading octet of 0x80 or more would read as negative.
+        if out[0] >= 128 {
+            var padded = [0]
+            for b in out {
+                padded.push(b)
+            }
+            out = padded
+        }
+        return bytes_of(out)
+    }
+    // Negative: take the two's complement octets, then stop as soon as the
+    // leading `FF` octets the next octet already implies are gone.
+    var done = false
+    while not done {
+        let byte = x.bit_and(255)
+        low_first.push(byte)
+        x = x.shr(8)
+        if x == 0 - 1 and byte >= 128 {
+            done = true
+        }
+    }
+    return bytes_of(low_first.rev())
+}
+
+/// An INTEGER whose value is the big-endian *unsigned* magnitude in `mag`.
+///
+/// This is the form every key and signature component arrives in. Leading
+/// zeroes in `mag` are dropped and one is added back when the top bit is set,
+/// so a 2048-bit modulus encodes as 257 octets and a 2047-bit one as 256.
+pub fn integer_unsigned(mag: bytes) -> bytes ! DerWriteError {
+    var i = 0
+    while i < mag.len() and mag.at(i) == 0 {
+        i = i + 1
+    }
+    if i == mag.len() {
+        return try tlv(INTEGER, bytes_of([0]))
+    }
+    var body = mag.slice(i, mag.len())
+    if body.at(0) >= 128 {
+        body = bytes_of([0]).concat(body)
+    }
+    return try tlv(INTEGER, body)
+}
+
+pub fn octet_string(b: bytes) -> bytes ! DerWriteError {
+    return try tlv(OCTET_STRING, b)
+}
+
+/// A BIT STRING, with `unused` bits of the final octet not part of the value.
+///
+/// The leading octet says how many trailing bits to ignore. A key or a
+/// signature wrapped in a BIT STRING always has zero of them, so
+/// `bit_string(der, 0)` is the call PKIX makes; `unused` exists for the
+/// KeyUsage flags, which genuinely stop mid-octet.
+pub fn bit_string(b: bytes, unused: i64) -> bytes ! DerWriteError {
+    if unused < 0 or unused > 7 {
+        fail(UnusedBitsOutOfRange(unused))
+    }
+    if b.len() == 0 and unused != 0 {
+        fail(UnusedBitsOutOfRange(unused))
+    }
+    return try tlv(BIT_STRING, bytes_of([unused]).concat(b))
+}
+
+/// KeyUsage-style flags: bit 0 is the *high* bit of the first octet, and the
+/// encoding is truncated to the last set bit.
+///
+/// The truncation is the part that surprises. `digitalSignature` alone is
+/// `03 02 07 80` — one content octet with seven unused bits — not a full
+/// two-octet field with zeros in it.
+pub fn named_bits(bits: [i64]) -> bytes ! DerWriteError {
+    var high = 0 - 1
+    for b in bits {
+        if b > high {
+            high = b
+        }
+    }
+    if high < 0 {
+        return try tlv(BIT_STRING, bytes_of([0]))
+    }
+    var octets: [i64] = []
+    var i = 0
+    while i <= high / 8 {
+        octets.push(0)
+        i = i + 1
+    }
+    for b in bits {
+        let at = b / 8
+        let mask = 1.shl(7 - b % 8)
+        octets[at] = octets[at].bit_or(mask)
+    }
+    return try bit_string(bytes_of(octets), 7 - high % 8)
+}
+
+// ----------------------------------------------------------------- strings
+
+pub fn utf8_string(s: str) -> bytes ! DerWriteError {
+    return try tlv(UTF8_STRING, s.to_bytes())
+}
+
+/// PrintableString, whose alphabet is smaller than its name suggests.
+///
+/// Letters, digits, space, and `'()+,-./:=?` — no `@`, no `_`, no `*`. A
+/// wildcard common name is therefore not a PrintableString, which is why
+/// certificates for `*.example.com` carry it as a UTF8String or IA5String and
+/// an encoder that guesses PrintableString produces a document real parsers
+/// reject.
+pub fn printable_string(s: str) -> bytes ! DerWriteError {
+    for c in s.codes() {
+        if not is_printable_code(c) {
+            fail(NotPrintable(s))
+        }
+    }
+    return try tlv(PRINTABLE_STRING, s.to_bytes())
+}
+
+fn is_printable_code(c: i64) -> bool {
+    if c >= 65 and c <= 90 {
+        return true
+    }
+    if c >= 97 and c <= 122 {
+        return true
+    }
+    if c >= 48 and c <= 57 {
+        return true
+    }
+    // space ' ( ) + , - . / : = ?
+    let others = [32, 39, 40, 41, 43, 44, 45, 46, 47, 58, 61, 63]
+    for o in others {
+        if c == o {
+            return true
+        }
+    }
+    return false
+}
+
+/// IA5String: ASCII, which is what an email address and a DNS name are.
+pub fn ia5_string(s: str) -> bytes ! DerWriteError {
+    for c in s.codes() {
+        if c > 127 {
+            fail(NotAscii(s))
+        }
+    }
+    return try tlv(IA5_STRING, s.to_bytes())
+}
+
+/// PrintableString where the text fits it, UTF8String otherwise.
+///
+/// This is how names were written before the 2004 migration, and it is still
+/// what a caller wants for an attribute whose ASN.1 type is a choice and whose
+/// existing encoding has to be reproduced. It is *not* the rule for building a
+/// new name — see `attribute_value`, which asks the attribute rather than the
+/// text.
+pub fn narrowest_string(s: str) -> bytes ! DerWriteError {
+    var ok = true
+    for c in s.codes() {
+        if not is_printable_code(c) {
+            ok = false
+        }
+    }
+    if ok {
+        return try printable_string(s)
+    }
+    return try utf8_string(s)
+}
+
+// ------------------------------------------------------------- object ids
+
+/// An OBJECT IDENTIFIER from its dotted form.
+///
+/// The first two arcs share one octet as `40 * first + second`, which is why
+/// `2.5.4.3` starts `55` and not `02 05`. Every later arc is base 128, most
+/// significant group first, with the high bit set on all but the last octet.
+pub fn oid(dotted: str) -> bytes ! DerWriteError {
+    let parts = dotted.split(".")
+    if parts.len() < 2 {
+        fail(OidMalformed(dotted))
+    }
+    var arcs: [i64] = []
+    for p in parts {
+        let n = p.parse_int() ?? (0 - 1)
+        if n < 0 {
+            fail(OidMalformed(dotted))
+        }
+        arcs.push(n)
+    }
+    let first = arcs[0]
+    let second = arcs[1]
+    if first > 2 {
+        fail(OidFirstArc(first))
+    }
+    // Under joint-iso-itu-t the second arc is unbounded; under the other two
+    // roots it must be below 40, because that is all the shared octet leaves.
+    if first < 2 and second >= 40 {
+        fail(OidSecondArc(second))
+    }
+    var out = base128(40 * first + second)
+    var i = 2
+    while i < arcs.len() {
+        for byte in base128(arcs[i]) {
+            out.push(byte)
+        }
+        i = i + 1
+    }
+    return try tlv(OID, bytes_of(out))
+}
+
+fn base128(v: i64) -> [i64] {
+    if v == 0 {
+        return [0]
+    }
+    var low_first: [i64] = []
+    var x = v
+    while x > 0 {
+        low_first.push(x.bit_and(127))
+        x = x.ushr(7)
+    }
+    let groups = low_first.rev()
+    var out: [i64] = []
+    var i = 0
+    while i < groups.len() {
+        if i + 1 < groups.len() {
+            out.push(groups[i] + 128)
+        } else {
+            out.push(groups[i])
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// -------------------------------------------------------------- structures
+
+pub fn sequence(items: [bytes]) -> bytes ! DerWriteError {
+    return try tlv(SEQUENCE, join(items))
+}
+
+/// A SET OF, whose members DER orders by their own encodings.
+///
+/// The comparison is over the full TLV of each member, shorter-is-smaller when
+/// one is a prefix of the other. Sorting by the caller's order instead is the
+/// classic way to produce a name that re-encodes differently from how it was
+/// read, which breaks the issuer/subject match a chain is built from.
+pub fn set_of(items: [bytes]) -> bytes ! DerWriteError {
+    var keys: [[i64]] = []
+    for it in items {
+        keys.push(it.to_list())
+    }
+    keys.sort_by(|k| encoding_key(k))
+    var sorted: [bytes] = []
+    for k in keys {
+        sorted.push(bytes_of(k))
+    }
+    return try tlv(SET, join(sorted))
+}
+
+/// A sortable stand-in for "compare these encodings octet by octet".
+///
+/// `sort_by` wants one key, so the octets are stretched into a string of
+/// fixed-width groups: octet-wise order over equal-width text is the order DER
+/// asks for, and a shorter encoding sorts first because its text is a prefix.
+fn encoding_key(octets: [i64]) -> str {
+    var out = ""
+    for o in octets {
+        var h = ""
+        var v = o
+        var i = 0
+        while i < 2 {
+            let d = v.bit_and(15)
+            h = "0123456789abcdef".substr(d, 1) + h
+            v = v.ushr(4)
+            i = i + 1
+        }
+        out = out + h
+    }
+    return out
+}
+
+/// A SET whose members keep the order given, for the one case where the
+/// caller has already sorted them.
+pub fn set_in_order(items: [bytes]) -> bytes ! DerWriteError {
+    return try tlv(SET, join(items))
+}
+
+/// `[n] EXPLICIT`: the inner TLV kept whole, inside a constructed context tag.
+pub fn explicit(n: i64, inner: bytes) -> bytes ! DerWriteError {
+    if n < 0 or n > 30 {
+        fail(TagOutOfRange(n))
+    }
+    return try tlv(160 + n, inner)
+}
+
+/// `[n] IMPLICIT`: the inner TLV's tag *replaced* by the context tag.
+///
+/// The constructed bit has to be carried across — an implicit tag over a
+/// SEQUENCE stays constructed, over an OCTET STRING it does not — so this
+/// reads it off the value being retagged rather than taking it as an argument.
+pub fn implicit(n: i64, inner_tlv: bytes) -> bytes ! DerWriteError {
+    if n < 0 or n > 30 {
+        fail(TagOutOfRange(n))
+    }
+    if inner_tlv.len() == 0 {
+        fail(TagOutOfRange(n))
+    }
+    let constructed = inner_tlv.at(0).bit_and(32)
+    let body = try content_of(inner_tlv)
+    return try tlv(128 + constructed + n, body)
+}
+
+/// The content octets of a TLV, with its own tag and length stripped.
+pub fn content_of(tlv_bytes: bytes) -> bytes ! DerWriteError {
+    if tlv_bytes.len() < 2 {
+        fail(LengthNegative(tlv_bytes.len()))
+    }
+    let first = tlv_bytes.at(1)
+    if first < 128 {
+        return tlv_bytes.slice(2, tlv_bytes.len())
+    }
+    let count = first - 128
+    if 2 + count > tlv_bytes.len() {
+        fail(LengthNegative(tlv_bytes.len()))
+    }
+    return tlv_bytes.slice(2 + count, tlv_bytes.len())
+}
+
+fn join(items: [bytes]) -> bytes {
+    var out: [i64] = []
+    for it in items {
+        for b in it.to_list() {
+            out.push(b)
+        }
+    }
+    return bytes_of(out)
+}
+
+// ------------------------------------------------------------------- times
+
+/// The time type RFC 5280 requires for this instant: UTCTime before 2050,
+/// GeneralizedTime from 2050 on.
+///
+/// Both are Zulu and both carry seconds. The rule is not a preference — a
+/// two-digit year is read as 1950..2049, so a certificate expiring in 2050
+/// written as UTCTime says it expired a century ago.
+pub fn time_der(unix_seconds: i64) -> bytes ! DerWriteError {
+    let c = civil_of(unix_seconds)
+    if c[0] < 2050 {
+        return try utc_time(unix_seconds)
+    }
+    return try generalized_time(unix_seconds)
+}
+
+pub fn utc_time(unix_seconds: i64) -> bytes ! DerWriteError {
+    let c = civil_of(unix_seconds)
+    let year = c[0]
+    if year < 1950 or year > 2049 {
+        fail(YearOutOfRange(year))
+    }
+    let text = two(year % 100) + two(c[1]) + two(c[2]) +
+    two(c[3]) + two(c[4]) + two(c[5]) + "Z"
+    return try tlv(UTC_TIME, text.to_bytes())
+}
+
+pub fn generalized_time(unix_seconds: i64) -> bytes ! DerWriteError {
+    let c = civil_of(unix_seconds)
+    let year = c[0]
+    if year < 0 or year > 9999 {
+        fail(YearOutOfRange(year))
+    }
+    let text = four(year) + two(c[1]) + two(c[2]) +
+    two(c[3]) + two(c[4]) + two(c[5]) + "Z"
+    return try tlv(GENERALIZED_TIME, text.to_bytes())
+}
+
+fn two(v: i64) -> str {
+    if v < 10 {
+        return "0{v}"
+    }
+    return "{v}"
+}
+
+fn four(v: i64) -> str {
+    if v < 10 {
+        return "000{v}"
+    }
+    if v < 100 {
+        return "00{v}"
+    }
+    if v < 1000 {
+        return "0{v}"
+    }
+    return "{v}"
+}
+
+/// Year, month, day, hour, minute, second from a Unix timestamp.
+///
+/// The date part shifts the era to start in March, which puts the leap day at
+/// the end of the year and removes February from the arithmetic entirely.
+pub fn civil_of(unix_seconds: i64) -> [i64] {
+    var days = unix_seconds / 86400
+    var rem = unix_seconds % 86400
+    if rem < 0 {
+        rem = rem + 86400
+        days = days - 1
+    }
+    let hour = rem / 3600
+    let minute = rem % 3600 / 60
+    let second = rem % 60
+
+    var z = days + 719468
+    var era = z / 146097
+    if z < 0 {
+        era = (z - 146096) / 146097
+    }
+    let doe = z - era * 146097
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+    let y = yoe + era * 400
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100)
+    let mp = (5 * doy + 2) / 153
+    let d = doy - (153 * mp + 2) / 5 + 1
+    var m = mp + 3
+    if mp >= 10 {
+        m = mp - 9
+    }
+    var year = y
+    if m <= 2 {
+        year = y + 1
+    }
+    return [year, m, d, hour, minute, second]
+}
+
+// ----------------------------------------------------------------- helpers
+
+/// An AlgorithmIdentifier: an OID and its parameters.
+///
+/// `absent` is not the same as NULL, and which one belongs there depends on
+/// the algorithm rather than on taste. RSA with PKCS#1 v1.5 requires an
+/// explicit NULL; ECDSA and Ed25519 require the field to be missing. A
+/// signature covers these bytes, so guessing produces a document that verifies
+/// nowhere.
+pub fn algorithm(oid_dotted: str) -> bytes ! DerWriteError {
+    return try sequence([try oid(oid_dotted)])
+}
+
+pub fn algorithm_with_null(oid_dotted: str) -> bytes ! DerWriteError {
+    return try sequence([try oid(oid_dotted), try null()])
+}
+
+pub fn algorithm_with(oid_dotted: str, params: bytes) -> bytes ! DerWriteError {
+    return try sequence([try oid(oid_dotted), params])
+}
+
+/// One `AttributeTypeAndValue` wrapped as the single-member RDN a name is
+/// usually built from: `SET { SEQUENCE { OID, value } }`.
+pub fn rdn(oid_dotted: str, value: bytes) -> bytes ! DerWriteError {
+    return try set_of([try sequence([try oid(oid_dotted), value])])
+}
+
+/// The string type an attribute's own definition requires.
+///
+/// Not a question of what the text will fit into. `countryName` is
+/// `PrintableString (SIZE (2))` in the ASN.1 module, so it is a
+/// PrintableString even though every two-letter code would also fit a
+/// UTF8String; `serialNumber` and `dnQualifier` are pinned the same way.
+/// Everything else in a name is a DirectoryString, and RFC 5280 tells a CA to
+/// write those as UTF8String — which is what OpenSSL emits and what a
+/// certificate issued this decade contains.
+///
+/// Choosing by the text instead gives `O=Example Ltd` a PrintableString and
+/// `O=Café Ltd` a UTF8String, so two subjects that differ only in an accent
+/// differ in their tags as well. That is a difference no reader expects and
+/// one that a byte-comparing issuer match will not forgive.
+pub fn attribute_value(oid_dotted: str, text: str) -> bytes ! DerWriteError {
+    if oid_dotted == "2.5.4.6" or oid_dotted == "2.5.4.5" or oid_dotted == "2.5.4.46" {
+        return try printable_string(text)
+    }
+    if oid_dotted == "1.2.840.113549.1.9.1" or oid_dotted == "0.9.2342.19200300.100.1.25" {
+        // emailAddress and domainComponent are IA5, not DirectoryString.
+        return try ia5_string(text)
+    }
+    return try utf8_string(text)
+}
+
+/// A Name from attribute pairs, in the order given.
+///
+/// Order is part of the value here — `CN=a, O=b` and `O=b, CN=a` are different
+/// names — so this sorts nothing. The SET around each attribute is where
+/// sorting applies, and there is one attribute in each.
+pub fn name_of(pairs: [(str, str)]) -> bytes ! DerWriteError {
+    var rdns: [bytes] = []
+    for p in pairs {
+        rdns.push(try rdn(p.0, try attribute_value(p.0, p.1)))
+    }
+    return try sequence(rdns)
+}
+
+/// Common attribute OIDs, so a caller writes `derwrite.CN` rather than
+/// `2.5.4.3` and gets it wrong once.
+pub fn cn() -> str {
+    return "2.5.4.3"
+}
+pub fn country() -> str {
+    return "2.5.4.6"
+}
+pub fn organisation() -> str {
+    return "2.5.4.10"
+}
+pub fn organisational_unit() -> str {
+    return "2.5.4.11"
+}
+pub fn locality() -> str {
+    return "2.5.4.7"
+}
+pub fn state() -> str {
+    return "2.5.4.8"
+}
+pub fn email_address() -> str {
+    return "1.2.840.113549.1.9.1"
+}
+pub fn serial_number() -> str {
+    return "2.5.4.5"
+}
+pub fn domain_component() -> str {
+    return "0.9.2342.19200300.100.1.25"
+}
+
+/// Hex, for a caller that has a digest and wants to look at it.
+pub fn hex(data: bytes) -> str {
+    var out = ""
+    for b in data.to_list() {
+        let hi = b.ushr(4)
+        let lo = b.bit_and(15)
+        out = out + "0123456789abcdef".substr(hi, 1)
+        out = out + "0123456789abcdef".substr(lo, 1)
+    }
+    return out
+}
