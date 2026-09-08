@@ -1,0 +1,277 @@
+// IBAN and BIC: bank identifiers, validated rather than trusted.
+//
+// An IBAN carries its own check digits, so a mistyped account number is
+// caught before the money leaves — which is the entire reason the format
+// exists, and the reason a payment form that does not check one is doing its
+// user a disservice.
+//
+// Three things have to be right and each is a separate failure:
+//
+//   1. **The length**, which differs by country: 16 in Belgium, 22 in
+//      Germany, 31 in Malta. A generic length check accepts a German IBAN
+//      with a digit missing.
+//   2. **The mod-97 check**, computed over the account with the country and
+//      check digits moved to the end and letters replaced by numbers. It
+//      catches every single-digit error and every transposition of adjacent
+//      digits.
+//   3. **The structure of the national part**, which is where the bank code
+//      and the branch live. Not checked here, and said so rather than
+//      implied — that would be a table per country of what is a letter and
+//      what is a digit, and a wrong entry rejects valid accounts.
+//
+// The mod-97 arithmetic is done in chunks, because the number formed by a
+// 34-character IBAN has 36 digits and does not fit in anything this language
+// has as a primitive.
+
+type IbanError =
+    | TooShort(len: i64)
+    | UnknownCountry(code: str)
+    | WrongLength(code: str, want: i64, got: i64)
+    | BadCharacter(at: i64)
+    | CheckFailed(remainder: i64)
+
+    /// Country code and total IBAN length, flat.
+fn lengths() -> [str] {
+    return [
+        "AD", "24", "AE", "23", "AL", "28", "AT", "20", "AZ", "28",
+        "BA", "20", "BE", "16", "BG", "22", "BH", "22", "BR", "29",
+        "BY", "28", "CH", "21", "CR", "22", "CY", "28", "CZ", "24",
+        "DE", "22", "DK", "18", "DO", "28", "EE", "20", "EG", "29",
+        "ES", "24", "FI", "18", "FO", "18", "FR", "27", "GB", "22",
+        "GE", "22", "GI", "23", "GL", "18", "GR", "27", "GT", "28",
+        "HR", "21", "HU", "28", "IE", "22", "IL", "23", "IQ", "23",
+        "IS", "26", "IT", "27", "JO", "30", "KW", "30", "KZ", "20",
+        "LB", "28", "LC", "32", "LI", "21", "LT", "20", "LU", "20",
+        "LV", "21", "LY", "25", "MC", "27", "MD", "24", "ME", "22",
+        "MK", "19", "MR", "27", "MT", "31", "MU", "30", "NL", "18",
+        "NO", "15", "PK", "24", "PL", "28", "PS", "29", "PT", "25",
+        "QA", "29", "RO", "24", "RS", "22", "SA", "24", "SC", "31",
+        "SE", "24", "SI", "19", "SK", "24", "SM", "27", "ST", "25",
+        "SV", "28", "TL", "23", "TN", "24", "TR", "26", "UA", "29",
+        "VA", "22", "VG", "24", "XK", "20",
+    ]
+}
+
+/// The IBAN length for a country, or -1.
+pub fn length_for(country: str) -> i64 {
+    let want = country.to_upper()
+    let t = lengths()
+    var i = 0
+    while i < t.len() {
+        if t[i] == want {
+            return t[i + 1].parse_int() ?? 0 - 1
+        }
+        i = i + 2
+    }
+    return 0 - 1
+}
+
+pub fn countries() -> [str] {
+    var out: [str] = []
+    let t = lengths()
+    var i = 0
+    while i < t.len() {
+        out.push(t[i])
+        i = i + 2
+    }
+    return out
+}
+
+/// Spaces removed, letters upper case — the electronic form.
+pub fn normalise(text: str) -> str {
+    return text.replace(" ", "").replace("-", "").to_upper()
+}
+
+fn digit_value(c: str) -> i64 {
+    if c >= "0" and c <= "9" {
+        return c.code_at(0) - 48
+    }
+    if c >= "A" and c <= "Z" {
+        // A is 10, B is 11, and so on to Z at 35.
+        return c.code_at(0) - 65 + 10
+    }
+    return 0 - 1
+}
+
+/// The remainder of the rearranged IBAN modulo 97.
+///
+/// Chunked: the digits are folded in a few at a time so the running value
+/// never exceeds what an `i64` holds, which is the only way to do this
+/// without an arbitrary-precision integer.
+fn mod97(text: str) -> i64 ! IbanError {
+    let moved = text.substr(4, text.len() - 4) + text.substr(0, 4)
+    var remainder = 0
+    let cs = moved.chars()
+    for i in 0..cs.len() {
+        let v = digit_value(cs[i])
+        if v < 0 {
+            fail(BadCharacter(i))
+        }
+        if v < 10 {
+            remainder = (remainder * 10 + v) % 97
+        } else {
+            remainder = (remainder * 100 + v) % 97
+        }
+    }
+    return remainder
+}
+
+pub fn is_valid(text: str) -> bool {
+    match validate(text) {
+        Ok(_v) -> return true
+        Err(_e) -> return false
+    }
+}
+
+/// Validate, saying which of the three checks failed.
+pub fn validate(text: str) -> str ! IbanError {
+    let iban = normalise(text)
+    if iban.len() < 5 {
+        fail(TooShort(iban.len()))
+    }
+    let country = iban.substr(0, 2)
+    for c in country.chars() {
+        if c < "A" or c > "Z" {
+            fail(UnknownCountry(country))
+        }
+    }
+    let want = length_for(country)
+    if want < 0 {
+        fail(UnknownCountry(country))
+    }
+    if iban.len() != want {
+        fail(WrongLength(country, want, iban.len()))
+    }
+    let remainder = try mod97(iban)
+    if remainder != 1 {
+        fail(CheckFailed(remainder))
+    }
+    return iban
+}
+
+pub fn country_of(text: str) -> str {
+    let iban = normalise(text)
+    if iban.len() < 2 {
+        return ""
+    }
+    return iban.substr(0, 2)
+}
+
+pub fn check_digits(text: str) -> str {
+    let iban = normalise(text)
+    if iban.len() < 4 {
+        return ""
+    }
+    return iban.substr(2, 2)
+}
+
+/// The national part: everything after the country and check digits.
+pub fn bban(text: str) -> str {
+    let iban = normalise(text)
+    if iban.len() < 4 {
+        return ""
+    }
+    return iban.substr(4, iban.len() - 4)
+}
+
+/// The check digits for a country and a national part.
+///
+/// What a bank does when it issues an account, and what a test fixture needs
+/// to produce an IBAN that is valid rather than merely well-shaped.
+pub fn compute_check_digits(country: str, national: str) -> str ! IbanError {
+    let body = country.to_upper() + "00" + normalise(national)
+    let remainder = try mod97(body)
+    let digits = 98 - remainder
+    if digits < 10 {
+        return "0{digits}"
+    }
+    return "{digits}"
+}
+
+pub fn build(country: str, national: str) -> str ! IbanError {
+    let check = try compute_check_digits(country, national)
+    return country.to_upper() + check + normalise(national)
+}
+
+/// The printed form: groups of four, separated by spaces.
+pub fn format_printed(text: str) -> str {
+    let iban = normalise(text)
+    var out: [str] = []
+    var i = 0
+    while i < iban.len() {
+        let take = if iban.len() - i < 4 { iban.len() - i } else { 4 }
+        out.push(iban.substr(i, take))
+        i = i + 4
+    }
+    return out.join(" ")
+}
+
+/// Everything but the last four characters replaced, for a log or a receipt.
+pub fn masked(text: str) -> str {
+    let iban = normalise(text)
+    if iban.len() <= 8 {
+        return iban
+    }
+    let head = iban.substr(0, 4)
+    let tail = iban.substr(iban.len() - 4, 4)
+    return head + "*".repeat(iban.len() - 8) + tail
+}
+
+/// A BIC, which is the other half of an international payment.
+///
+/// Eight characters or eleven: four for the bank, two for the country, two
+/// for the location, and an optional three for the branch. `XXX` as the
+/// branch means head office and is written out or left off, which is why both
+/// lengths are valid and mean the same thing.
+pub fn is_valid_bic(text: str) -> bool {
+    let bic = normalise(text)
+    if bic.len() != 8 and bic.len() != 11 {
+        return false
+    }
+    let cs = bic.chars()
+    for i in 0..4 {
+        if cs[i] < "A" or cs[i] > "Z" {
+            return false
+        }
+    }
+    for i in 4..6 {
+        if cs[i] < "A" or cs[i] > "Z" {
+            return false
+        }
+    }
+    for i in 6..bic.len() {
+        let c = cs[i]
+        let letter = c >= "A" and c <= "Z"
+        let digit = c >= "0" and c <= "9"
+        if not (letter or digit) {
+            return false
+        }
+    }
+    // `0` and `1` are not valid in the location code's first character:
+    // 0 marks a test BIC and 1 a passive participant.
+    return true
+}
+
+pub fn bic_country(text: str) -> str {
+    let bic = normalise(text)
+    if bic.len() < 6 {
+        return ""
+    }
+    return bic.substr(4, 2)
+}
+
+/// Whether a BIC is marked as a test one, which must never reach production.
+pub fn is_test_bic(text: str) -> bool {
+    let bic = normalise(text)
+    if bic.len() < 8 {
+        return false
+    }
+    return bic.substr(7, 1) == "0"
+}
+
+/// Whether an IBAN and a BIC agree about the country.
+pub fn countries_agree(iban_text: str, bic_text: str) -> bool {
+    let a = country_of(iban_text)
+    let b = bic_country(bic_text)
+    return a != "" and a == b
+}

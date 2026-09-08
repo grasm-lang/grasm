@@ -1,0 +1,282 @@
+// ISO 4217: what a currency code means, and how many decimals it has.
+//
+// The number that matters is the **minor unit**, and it is not two. The yen
+// has none, so ¥100 is one hundred yen and not one yen; the dinar has three,
+// so a Kuwaiti amount stored in "cents" is out by a factor of ten. Software
+// that assumes two silently multiplies or divides real money by ten or a
+// hundred, and it does it only for the currencies the author does not use.
+//
+// This is the table, and the formatting that depends on it. Arithmetic is
+// `money`'s job — a currency here is a description, not an amount, and the
+// two are separate because mixing them is how a currency code ends up
+// attached to a number that was never converted.
+import locale
+
+type CurrencyInfo = {
+    code: str,
+    numeric: i64,
+    /// Digits after the decimal point.
+    minor_units: i64,
+    name: str,
+    symbol: str,
+}
+
+type CurrencyError =
+    | UnknownCode(code: str)
+    | NotMinorUnits(code: str, amount: i64)
+
+    /// The table, flat: code, numeric, minor units, symbol, name.
+    ///
+    /// The currencies with a minor unit other than two are all here, because
+    /// those are the ones an assumption gets wrong.
+fn table() -> [str] {
+    return [
+        "USD", "840", "2", "$", "US Dollar",
+        "EUR", "978", "2", (8364).to_char(), "Euro",
+        "GBP", "826", "2", (163).to_char(), "Pound Sterling",
+        "JPY", "392", "0", (165).to_char(), "Yen",
+        "CNY", "156", "2", (165).to_char(), "Yuan Renminbi",
+        "CHF", "756", "2", "CHF", "Swiss Franc",
+        "CAD", "124", "2", "$", "Canadian Dollar",
+        "AUD", "036", "2", "$", "Australian Dollar",
+        "NZD", "554", "2", "$", "New Zealand Dollar",
+        "SEK", "752", "2", "kr", "Swedish Krona",
+        "NOK", "578", "2", "kr", "Norwegian Krone",
+        "DKK", "208", "2", "kr", "Danish Krone",
+        "PLN", "985", "2", (122).to_char() + (322).to_char(), "Zloty",
+        "CZK", "203", "2", (75).to_char() + (269).to_char(), "Czech Koruna",
+        "HUF", "348", "2", "Ft", "Forint",
+        "RUB", "643", "2", (8381).to_char(), "Russian Ruble",
+        "TRY", "949", "2", (8378).to_char(), "Turkish Lira",
+        "INR", "356", "2", (8377).to_char(), "Indian Rupee",
+        "BRL", "986", "2", "R$", "Brazilian Real",
+        "MXN", "484", "2", "$", "Mexican Peso",
+        "ZAR", "710", "2", "R", "Rand",
+        "SGD", "702", "2", "$", "Singapore Dollar",
+        "HKD", "344", "2", "$", "Hong Kong Dollar",
+        "KRW", "410", "0", (8361).to_char(), "Won",
+        "IDR", "360", "2", "Rp", "Rupiah",
+        "THB", "764", "2", (3647).to_char(), "Baht",
+        "ILS", "376", "2", (8362).to_char(), "New Israeli Sheqel",
+        "AED", "784", "2", (1583).to_char() + (46).to_char() + (1573).to_char(),
+        "UAE Dirham",
+        "SAR", "682", "2", (65020).to_char(), "Saudi Riyal",
+        "NGN", "566", "2", (8358).to_char(), "Naira",
+        "KES", "404", "2", "KSh", "Kenyan Shilling",
+        "PHP", "608", "2", (8369).to_char(), "Philippine Peso",
+        "VND", "704", "0", (8363).to_char(), "Dong",
+        "CLP", "152", "0", "$", "Chilean Peso",
+        "ISK", "352", "0", "kr", "Iceland Krona",
+        "PYG", "600", "0", (8370).to_char(), "Guarani",
+        "RWF", "646", "0", "FRw", "Rwanda Franc",
+        "UGX", "800", "0", "USh", "Uganda Shilling",
+        "XAF", "950", "0", "FCFA", "CFA Franc BEAC",
+        "XOF", "952", "0", "CFA", "CFA Franc BCEAO",
+        "KWD", "414", "3", (1583).to_char() + (46).to_char() + (1603).to_char(),
+        "Kuwaiti Dinar",
+        "BHD", "048", "3", (1576).to_char() + (46).to_char() + (1583).to_char(),
+        "Bahraini Dinar",
+        "OMR", "512", "3", (1585).to_char() + (46).to_char() + (1593).to_char(),
+        "Rial Omani",
+        "JOD", "400", "3", (1583).to_char() + (46).to_char() + (1575).to_char(),
+        "Jordanian Dinar",
+        "TND", "788", "3", (1583).to_char() + (46).to_char() + (1578).to_char(),
+        "Tunisian Dinar",
+        "IQD", "368", "3", (1593).to_char() + (46).to_char() + (1583).to_char(),
+        "Iraqi Dinar",
+        "LYD", "434", "3", (1604).to_char() + (46).to_char() + (1583).to_char(),
+        "Libyan Dinar",
+        "XAU", "959", "0", "XAU", "Gold",
+        "XAG", "961", "0", "XAG", "Silver",
+        "XXX", "999", "0", "", "No currency",
+    ]
+}
+
+fn row_size() -> i64 {
+    return 5
+}
+
+pub fn lookup(code: str) -> CurrencyInfo ! CurrencyError {
+    let want = code.to_upper()
+    let t = table()
+    var i = 0
+    while i < t.len() {
+        if t[i] == want {
+            return CurrencyInfo{
+                code: t[i], numeric: t[i + 1].parse_int() ?? 0,
+                minor_units: t[i + 2].parse_int() ?? 2, symbol: t[i + 3],
+                name: t[i + 4],
+            }
+        }
+        i = i + row_size()
+    }
+    fail(UnknownCode(code))
+}
+
+pub fn is_known(code: str) -> bool {
+    match lookup(code) {
+        Ok(_v) -> return true
+        Err(_e) -> return false
+    }
+}
+
+/// How many decimal places this currency has. **Not always two.**
+pub fn minor_units(code: str) -> i64 ! CurrencyError {
+    return (try lookup(code)).minor_units
+}
+
+/// How many minor units make one major one — 100 for a dollar, 1 for a yen,
+/// 1000 for a dinar.
+pub fn minor_per_major(code: str) -> i64 ! CurrencyError {
+    var out = 1
+    for _i in 0..(try minor_units(code)) {
+        out = out * 10
+    }
+    return out
+}
+
+pub fn symbol(code: str) -> str ! CurrencyError {
+    return (try lookup(code)).symbol
+}
+
+pub fn name(code: str) -> str ! CurrencyError {
+    return (try lookup(code)).name
+}
+
+/// The ISO 4217 numeric code, which is what a fixed-width record carries.
+pub fn numeric(code: str) -> i64 ! CurrencyError {
+    return (try lookup(code)).numeric
+}
+
+pub fn all_codes() -> [str] {
+    var out: [str] = []
+    let t = table()
+    var i = 0
+    while i < t.len() {
+        out.push(t[i])
+        i = i + row_size()
+    }
+    return out
+}
+
+/// Codes whose minor unit is not two — the ones an assumption breaks.
+pub fn unusual_codes() -> [str] {
+    var out: [str] = []
+    for code in all_codes() {
+        if (minor_units(code) ?? 2) != 2 {
+            out.push(code)
+        }
+    }
+    return out
+}
+
+/// An amount in minor units, as text, with the currency's own decimals.
+///
+/// The input is minor units — cents, yen, fils — because that is the only
+/// representation in which money adds up. Handing this a major-unit float is
+/// the mistake it exists to prevent, and there is no overload that accepts
+/// one.
+pub fn format_minor(amount: i64, code: str, tag: str) -> str ! CurrencyError {
+    let info = try lookup(code)
+    let per = try minor_per_major(code)
+    let negative = amount < 0
+    let magnitude = if negative { 0 - amount } else { amount }
+    let whole = magnitude / per
+    var out = locale.format_integer(whole, tag)
+    if info.minor_units > 0 {
+        var fraction = "{magnitude % per}"
+        while fraction.len() < info.minor_units {
+            fraction = "0" + fraction
+        }
+        out = out + locale.decimal_mark(tag) + fraction
+    }
+    if negative {
+        return "-" + out
+    }
+    return out
+}
+
+/// The same, with the symbol where the locale puts it.
+///
+/// Before the number in English and after it in most of Europe, with a
+/// no-break space so a line never breaks between the amount and its currency.
+pub fn format_with_symbol(amount: i64, code: str, tag: str) -> str ! CurrencyError {
+    let body = try format_minor(amount, code, tag)
+    let mark = try symbol(code)
+    if mark == "" {
+        return body + " " + code
+    }
+    let language = tag.to_lower().split("-")[0]
+    if ["en", "ja", "zh", "ko", "he", "th", "vi", "id"].contains(language) {
+        return mark + body
+    }
+    return body + (160).to_char() + mark
+}
+
+/// The accounting form, where a negative amount is in brackets.
+pub fn format_accounting(amount: i64, code: str, tag: str) -> str ! CurrencyError {
+    if amount >= 0 {
+        return try format_with_symbol(amount, code, tag)
+    }
+    let body = try format_with_symbol(0 - amount, code, tag)
+    return "(" + body + ")"
+}
+
+/// Text back to minor units.
+///
+/// Refuses more decimals than the currency has: `12.345 USD` is not a rounding
+/// question, it is an amount that does not exist.
+pub fn parse_minor(text: str, code: str) -> i64 ! CurrencyError {
+    let info = try lookup(code)
+    let per = try minor_per_major(code)
+    var body = text.trim().replace(",", "").replace(" ", "")
+    var negative = false
+    if body.starts_with("-") {
+        negative = true
+        body = body.substr(1, body.len() - 1)
+    }
+    var whole = body
+    var fraction = ""
+    match body.index_of(".") {
+        Some(at) -> {
+            whole = body.substr(0, at)
+            fraction = body.substr(at + 1, body.len() - at - 1)
+        }
+        None -> {}
+    }
+    if fraction.len() > info.minor_units {
+        fail(NotMinorUnits(code, fraction.len()))
+    }
+    while fraction.len() < info.minor_units {
+        fraction = fraction + "0"
+    }
+    var total = (whole.parse_int() ?? 0) * per
+    if info.minor_units > 0 {
+        total = total + (fraction.parse_int() ?? 0)
+    }
+    if negative {
+        return 0 - total
+    }
+    return total
+}
+
+/// Convert an amount between currencies at a rate given in ten-thousandths.
+///
+/// The rate is an integer for the reason the amount is: a float rate applied
+/// to a float amount is two roundings, and the result of the second depends
+/// on the first. Rounding is half away from zero, once, at the end.
+pub fn convert(amount: i64, from_code: str, to_code: str,
+    rate_ten_thousandths: i64) -> i64 ! CurrencyError {
+    let from_per = try minor_per_major(from_code)
+    let to_per = try minor_per_major(to_code)
+    let negative = amount < 0
+    let magnitude = if negative { 0 - amount } else { amount }
+    // Through major units, so the differing minor units are handled once.
+    let scaled = magnitude * rate_ten_thousandths * to_per
+    let divisor = 10000 * from_per
+    var out = (scaled + divisor / 2) / divisor
+    if negative {
+        return 0 - out
+    }
+    return out
+}

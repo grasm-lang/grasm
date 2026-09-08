@@ -1,0 +1,6 @@
+[package]
+name = "migrate"
+version = "1.0.0"
+
+# Ordered schema changes. Opens nothing.
+capabilities = []

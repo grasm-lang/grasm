@@ -29,9 +29,9 @@ honest and a stub is a promise nobody kept.
 | | |
 |---|---|
 | Started at | 78 |
-| Now | 189 |
+| Now | 200 |
 | Target | 200 |
-| Remaining | 11 |
+| Remaining | 0 |
 
 ## Batches
 
@@ -56,8 +56,15 @@ asserts against it.
   `envcfg`
 - [x] **Formats II** — `msgpack` `cbor` `yamlish` `markdown` `template`
 - [x] **Media II** — `png` `wav` `qrcode` `perlin` `dither` `asciiart`
+- [x] **Config II** — `migrate` `locale` `i18n` `currency` `iban`
+- [x] **Tooling III** — `benchtime` `treeview` `ulid` `phonetic` `natsort`
+  `fixtureset`
 
-### Planned
+**200 of 200.** Six names in the plan below turned out to be packages that
+already existed under another name; `docs/ecosystem-roadmap.md` says which,
+and what took their places.
+
+### Planned, and what became of it
 
 **Encoding** — `base58` `base85` `cbor` `msgpack` `bencode` `hexdump`
 `punycode` `utf16`

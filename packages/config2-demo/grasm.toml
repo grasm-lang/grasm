@@ -1,0 +1,24 @@
+[package]
+name = "config2_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.migrate]
+path = "../migrate"
+version = "^1.0.0"
+
+[dependencies.locale]
+path = "../locale"
+version = "^1.0.0"
+
+[dependencies.i18n]
+path = "../i18n"
+version = "^1.0.0"
+
+[dependencies.currency]
+path = "../currency"
+version = "^1.0.0"
+
+[dependencies.iban]
+path = "../iban"
+version = "^1.0.0"

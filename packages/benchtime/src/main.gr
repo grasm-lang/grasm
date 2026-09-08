@@ -1,0 +1,284 @@
+// Making a benchmark's numbers mean something.
+//
+// The mistake every home-made benchmark makes is reporting the **mean**. A
+// timing distribution is not symmetric: it has a floor set by the work and a
+// long tail set by everything else on the machine, so the mean sits somewhere
+// between the two and moves whenever the noise does. Two runs of identical
+// code differ by 30% in the mean and by 1% in the minimum.
+//
+// So the numbers here are the ones that survive noise: the **minimum**, which
+// is the closest estimate of the work itself; the **median**, which is what a
+// typical call costs; and the **p95** and **p99**, which are what a request
+// actually waits for. The mean is reported too, next to the standard
+// deviation, so a reader can see how far apart they are.
+//
+// The other half is **warm-up and outlier detection**. The first iterations
+// pay for a cold cache and a cold branch predictor and belong to a different
+// distribution; and a sample fifty times the median is the garbage collector,
+// the scheduler or a neighbour, not the code. Both are reported rather than
+// silently dropped, because "we discarded 12 of 100 samples" is information.
+//
+// Nothing here reads a clock. The caller times the work and hands over the
+// durations, which is what makes every number below reproducible.
+
+type BenchSample = {
+    name: str,
+    /// Nanoseconds per iteration, one entry per measurement.
+    duration: [i64],
+    /// How many iterations each measurement covered.
+    batch: i64,
+    /// Measurements discarded as warm-up.
+    warmup: i64,
+}
+
+type BenchReport = {
+    name: str,
+    count: i64,
+    minimum: i64,
+    median: i64,
+    mean: i64,
+    p95: i64,
+    p99: i64,
+    maximum: i64,
+    /// Population standard deviation, in the same units.
+    deviation: i64,
+    /// Measurements more than eight times the median.
+    outliers: i64,
+    warmup: i64,
+}
+
+pub fn sample(name: str, durations: [i64]) -> BenchSample {
+    return BenchSample{ name: name, duration: durations, batch: 1, warmup: 0 }
+}
+
+/// A sample whose measurements each covered `batch` iterations.
+///
+/// Batching is how anything faster than the clock's resolution is measured at
+/// all: a function taking 20 ns cannot be timed once, and timing a thousand
+/// calls and dividing is the only honest way to get the number.
+pub fn batched(name: str, durations: [i64], batch: i64) -> BenchSample {
+    let n = if batch < 1 { 1 } else { batch }
+    var per: [i64] = []
+    for d in durations {
+        per.push(d / n)
+    }
+    return BenchSample{ name: name, duration: per, batch: n, warmup: 0 }
+}
+
+/// Drop the first `count` measurements as warm-up, and say so.
+pub fn drop_warmup(s: BenchSample, count: i64) -> BenchSample {
+    if count <= 0 or count >= s.duration.len() {
+        return s
+    }
+    return BenchSample{
+        name: s.name, duration: s.duration.slice(count, s.duration.len()),
+        batch: s.batch, warmup: s.warmup + count,
+    }
+}
+
+fn percentile(sorted: [i64], permille: i64) -> i64 {
+    if sorted.len() == 0 {
+        return 0
+    }
+    // Nearest-rank, computed in permille so the index for p99 of 100 samples
+    // is 99 and not 98 — integer division at the wrong scale is how a p99
+    // quietly becomes a p98.
+    var index = (permille * sorted.len() + 999) / 1000 - 1
+    if index < 0 {
+        index = 0
+    }
+    if index >= sorted.len() {
+        index = sorted.len() - 1
+    }
+    return sorted[index]
+}
+
+/// An integer square root, so no float decides a reported number.
+fn isqrt(v: i64) -> i64 {
+    if v <= 0 {
+        return 0
+    }
+    var x = v
+    var y = (x + 1) / 2
+    while y < x {
+        x = y
+        y = (x + v / x) / 2
+    }
+    return x
+}
+
+pub fn report(s: BenchSample) -> BenchReport {
+    var sorted = s.duration
+    sorted.sort()
+    let n = sorted.len()
+    if n == 0 {
+        return BenchReport{
+            name: s.name, count: 0, minimum: 0, median: 0, mean: 0, p95: 0,
+            p99: 0, maximum: 0, deviation: 0, outliers: 0, warmup: s.warmup,
+        }
+    }
+    var total = 0
+    for d in sorted {
+        total = total + d
+    }
+    let mean = total / n
+    var variance = 0
+    for d in sorted {
+        let diff = d - mean
+        variance = variance + diff * diff
+    }
+    let median = percentile(sorted, 500)
+    var outliers = 0
+    for d in sorted {
+        if median > 0 and d > median * 8 {
+            outliers = outliers + 1
+        }
+    }
+    return BenchReport{
+        name: s.name, count: n, minimum: sorted[0], median: median, mean: mean,
+        p95: percentile(sorted, 950), p99: percentile(sorted, 990),
+        maximum: sorted[n - 1], deviation: isqrt(variance / n),
+        outliers: outliers, warmup: s.warmup,
+    }
+}
+
+/// How noisy the measurement was: the deviation as a percentage of the mean.
+///
+/// Above about 5% the numbers are worth repeating on a quieter machine, and
+/// above 20% they are worth nothing at all. Reporting it is what lets a
+/// reader tell a real 3% regression from noise.
+pub fn noise_percent(r: BenchReport) -> i64 {
+    if r.mean == 0 {
+        return 0
+    }
+    return r.deviation * 100 / r.mean
+}
+
+pub fn is_stable(r: BenchReport) -> bool {
+    return noise_percent(r) <= 5
+}
+
+/// The gap between the mean and the median, in percent of the median.
+///
+/// A distribution with a long tail has a mean well above its median. When
+/// this is large, the mean is not describing the work.
+pub fn skew_percent(r: BenchReport) -> i64 {
+    if r.median == 0 {
+        return 0
+    }
+    return (r.mean - r.median) * 100 / r.median
+}
+
+fn scaled(nanos: i64) -> str {
+    if nanos < 1000 {
+        return "{nanos} ns"
+    }
+    if nanos < 1000000 {
+        let whole = nanos / 1000
+        let fraction = nanos % 1000 / 100
+        return "{whole}.{fraction} " + (181).to_char() + "s"
+    }
+    if nanos < 1000000000 {
+        let whole = nanos / 1000000
+        let fraction = nanos % 1000000 / 100000
+        return "{whole}.{fraction} ms"
+    }
+    let whole = nanos / 1000000000
+    let fraction = nanos % 1000000000 / 100000000
+    return "{whole}.{fraction} s"
+}
+
+pub fn format_duration(nanos: i64) -> str {
+    return scaled(nanos)
+}
+
+/// One line, with the numbers that survive noise first.
+pub fn format_line(r: BenchReport) -> str {
+    return "{r.name}: min {scaled(r.minimum)}  median {scaled(r.median)}  " +
+    "p95 {scaled(r.p95)}  p99 {scaled(r.p99)}  " +
+    "(n={r.count}, noise {noise_percent(r)}%)"
+}
+
+/// The full report, including the numbers that qualify the others.
+pub fn format_report(r: BenchReport) -> [str] {
+    var out: [str] = []
+    out.push("{r.name}")
+    out.push("  minimum   {scaled(r.minimum)}")
+    out.push("  median    {scaled(r.median)}")
+    out.push("  mean      {scaled(r.mean)} " + (177).to_char() + " {scaled(r.deviation)}")
+    out.push("  p95       {scaled(r.p95)}")
+    out.push("  p99       {scaled(r.p99)}")
+    out.push("  maximum   {scaled(r.maximum)}")
+    out.push("  samples   {r.count}, {r.warmup} discarded as warm-up")
+    if r.outliers > 0 {
+        out.push("  outliers  {r.outliers} above eight times the median")
+    }
+    if not is_stable(r) {
+        out.push("  NOISY     {noise_percent(r)}% deviation — repeat on a quieter machine")
+    }
+    return out
+}
+
+/// How much faster `after` is than `before`, in percent.
+///
+/// Compared on the *median*, not the mean, and negative means slower. A
+/// comparison of means reports a regression whenever the machine was busier
+/// for the second run.
+pub fn change_percent(before: BenchReport, after: BenchReport) -> i64 {
+    if after.median == 0 {
+        return 0
+    }
+    return (before.median - after.median) * 100 / before.median
+}
+
+/// Whether a difference is larger than the noise in either measurement.
+///
+/// Not a significance test — it is the check that stops a 2% "improvement"
+/// being announced when both runs vary by 8%.
+pub fn is_meaningful(before: BenchReport, after: BenchReport) -> bool {
+    let change = change_percent(before, after)
+    let magnitude = if change < 0 { 0 - change } else { change }
+    var noise = noise_percent(before)
+    if noise_percent(after) > noise {
+        noise = noise_percent(after)
+    }
+    return magnitude > noise * 2
+}
+
+pub fn compare(before: BenchReport, after: BenchReport) -> str {
+    let change = change_percent(before, after)
+    let word = if change > 0 { "faster" } else { "slower" }
+    let magnitude = if change < 0 { 0 - change } else { change }
+    if not is_meaningful(before, after) {
+        return "{after.name}: {magnitude}% {word}, within the noise"
+    }
+    return "{after.name}: {magnitude}% {word}"
+}
+
+/// Operations a second, from the median.
+pub fn per_second(r: BenchReport) -> i64 {
+    if r.median == 0 {
+        return 0
+    }
+    return 1000000000 / r.median
+}
+
+/// How many iterations are needed for the clock's resolution to be under
+/// `permille` of the measurement.
+///
+/// The calculation that decides a batch size: with a 100 ns clock and a 20 ns
+/// function, one call is unmeasurable and ten thousand are fine.
+pub fn batch_for(estimate_nanos: i64, clock_nanos: i64, permille: i64) -> i64 {
+    if estimate_nanos <= 0 or permille <= 0 {
+        return 1
+    }
+    let needed = clock_nanos * 1000 / permille
+    var n = needed / estimate_nanos
+    if needed % estimate_nanos != 0 {
+        n = n + 1
+    }
+    if n < 1 {
+        return 1
+    }
+    return n
+}

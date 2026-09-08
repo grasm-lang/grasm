@@ -1,0 +1,346 @@
+// Language tags, and the formatting conventions that come with them.
+//
+// A locale is not a language. `en-GB` and `en-US` share every word and
+// disagree about the date; `de-DE` and `de-CH` share every word and disagree
+// about the thousands separator — Switzerland uses an apostrophe. Getting
+// either wrong produces output that is not merely ugly but *ambiguous*:
+// `1.234` is one thousand two hundred and thirty-four in Germany and slightly
+// more than one in Britain.
+//
+// So the two halves here are separate on purpose. Tag handling — parsing,
+// matching, fallback — is BCP 47 and is exact. The conventions are a table,
+// and the table is small and says so: it covers the locales it covers, and
+// `is_known` answers before a caller relies on one.
+
+type LocaleTag = {
+    language: str,
+    /// ISO 15924, four letters, title case. Empty when absent.
+    script: str,
+    /// ISO 3166-1 alpha-2, upper case, or a three-digit UN region.
+    region: str,
+    variant: [str],
+    /// `-u-` extensions and the rest, as written.
+    extension: str,
+}
+
+type LocaleError =
+    | Malformed(tag: str, why: str)
+    | UnknownLocale(tag: str)
+
+    /// Parse a BCP 47 tag.
+    ///
+    /// Case is normalised rather than preserved: `EN-latn-us` and `en-Latn-US`
+    /// are the same tag, and a comparison that says otherwise is a bug waiting
+    /// for its first non-English user.
+pub fn parse(tag: str) -> LocaleTag ! LocaleError {
+    let text = tag.trim().replace("_", "-")
+    if text == "" {
+        fail(Malformed(tag, "empty"))
+    }
+    let parts = text.split("-")
+    let language = parts[0].to_lower()
+    if language.len() < 2 or language.len() > 8 {
+        fail(Malformed(tag, "a language subtag is two to eight letters"))
+    }
+    for c in language.chars() {
+        if c < "a" or c > "z" {
+            fail(Malformed(tag, "a language subtag is letters only"))
+        }
+    }
+    var script = ""
+    var region = ""
+    var variants: [str] = []
+    var extension = ""
+    var i = 1
+    while i < parts.len() {
+        let p = parts[i]
+        if p.len() == 1 {
+            // A singleton starts the extensions; everything after is one.
+            extension = parts.slice(i, parts.len()).join("-")
+            break
+        }
+        if p.len() == 4 and script == "" and region == "" and variants.len() == 0 {
+            script = p.substr(0, 1).to_upper() + p.substr(1, 3).to_lower()
+        } else if (p.len() == 2 or p.len() == 3) and region == "" and
+        variants.len() == 0 {
+            region = p.to_upper()
+        } else if p.len() >= 4 {
+            variants.push(p.to_lower())
+        } else {
+            fail(Malformed(tag, "`{p}` is not a subtag"))
+        }
+        i = i + 1
+    }
+    return LocaleTag{
+        language: language, script: script, region: region, variant: variants,
+        extension: extension,
+    }
+}
+
+pub fn render(t: LocaleTag) -> str {
+    var parts: [str] = [t.language]
+    if t.script != "" {
+        parts.push(t.script)
+    }
+    if t.region != "" {
+        parts.push(t.region)
+    }
+    for v in t.variant {
+        parts.push(v)
+    }
+    if t.extension != "" {
+        parts.push(t.extension)
+    }
+    return parts.join("-")
+}
+
+/// The tag with its last subtag removed — `en-Latn-US`, `en-Latn`, `en`.
+///
+/// The fallback chain a message lookup walks. Truncation, not a lookup table,
+/// which is what BCP 47 specifies and what makes an unknown region degrade to
+/// its language rather than to nothing.
+pub fn fallbacks(t: LocaleTag) -> [str] {
+    var out: [str] = []
+    var current = LocaleTag{
+        language: t.language, script: t.script, region: t.region,
+        variant: t.variant, extension: "",
+    }
+    out.push(render(current))
+    if current.variant.len() > 0 {
+        current.variant = []
+        out.push(render(current))
+    }
+    if current.region != "" {
+        current.region = ""
+        out.push(render(current))
+    }
+    if current.script != "" {
+        current.script = ""
+        out.push(render(current))
+    }
+    return out
+}
+
+/// The best of `available` for a caller who asked for `wanted`, in order.
+///
+/// Exact match first, then a fallback of the request, then any locale sharing
+/// the language. Returning the first available rather than nothing is what
+/// stops a Swiss German user getting English.
+pub fn best_match(wanted: [str], available: [str]) -> Option[str] {
+    for want in wanted {
+        match parse(want) {
+            Ok(t) -> {
+                for candidate in fallbacks(t) {
+                    for a in available {
+                        if a.to_lower() == candidate.to_lower() {
+                            return Some(a)
+                        }
+                    }
+                }
+                for a in available {
+                    match parse(a) {
+                        Ok(at) -> {
+                            if at.language == t.language {
+                                return Some(a)
+                            }
+                        }
+                        Err(_e) -> {}
+                    }
+                }
+            }
+            Err(_e) -> {}
+        }
+    }
+    return None
+}
+
+/// An `Accept-Language` header, best first.
+pub fn parse_accept_language(header: str) -> [str] {
+    var scored: [(i64, str)] = []
+    var order = 0
+    for piece in header.split(",") {
+        let parts = piece.split(";")
+        let tag = parts[0].trim()
+        if tag == "" {
+            continue
+        }
+        // Quality defaults to 1 and is kept in thousandths, so no float
+        // comparison decides an ordering.
+        var quality = 1000
+        for i in 1..parts.len() {
+            let p = parts[i].trim()
+            if p.starts_with("q=") {
+                let text = p.substr(2, p.len() - 2)
+                quality = ((text.parse_float() ?? 1.0) * 1000.0).as_i64()
+            }
+        }
+        // Ties keep the header's own order, which the standard leaves to the
+        // implementation and every user expects.
+        scored.push((0 - quality * 1000 + order, tag))
+        order = order + 1
+    }
+    scored.sort_by(|s| s.0)
+    var out: [str] = []
+    for s in scored {
+        out.push(s.1)
+    }
+    return out
+}
+
+/// The number conventions of a locale: decimal mark, group mark, group size.
+///
+/// A small table, and `is_known` says whether a tag is in it. The default is
+/// the one most of the world uses, not the one this file was written in.
+fn conventions(tag: str) -> (str, str, i64) {
+    let language = tag.to_lower().split("-")[0]
+    let region = if tag.contains("-") {
+        tag.to_upper().split("-")[tag.split("-").len() - 1]
+    } else {
+        ""
+    }
+    if region == "CH" {
+        // Switzerland groups with an apostrophe, whatever the language.
+        return (".", (8217).to_char(), 3)
+    }
+    if language == "en" or language == "zh" or language == "ja" or
+    language == "ko" or language == "he" or language == "th" {
+        return (".", ",", 3)
+    }
+    if language == "hi" or language == "bn" or language == "ta" {
+        // South Asian grouping: the first group is three, the rest two.
+        return (".", ",", 2)
+    }
+    if language == "fr" or language == "ru" or language == "uk" or
+    language == "pl" or language == "cs" or language == "sv" or
+    language == "nb" or language == "fi" {
+        // A narrow no-break space, which is what CLDR specifies and what a
+        // plain space silently is not.
+        return (",", (8239).to_char(), 3)
+    }
+    return (",", ".", 3)
+}
+
+pub fn is_known(tag: str) -> bool {
+    let language = tag.to_lower().split("-")[0]
+    return ["en", "de", "fr", "es", "it", "pt", "nl", "ru", "uk", "pl", "cs",
+        "sv", "nb", "fi", "tr", "zh", "ja", "ko", "he", "th", "hi", "bn",
+        "ta", "ar", "id", "vi"].contains(language)
+}
+
+pub fn decimal_mark(tag: str) -> str {
+    return conventions(tag).0
+}
+
+pub fn group_mark(tag: str) -> str {
+    return conventions(tag).1
+}
+
+/// Group an integer's digits the way the locale does.
+pub fn group_digits(digits: str, tag: str) -> str {
+    let c = conventions(tag)
+    let mark = c.1
+    let size = c.2
+    let cs = digits.chars()
+    var out = ""
+    var count = 0
+    var first = true
+    var i = cs.len() - 1
+    while i >= 0 {
+        out = cs[i] + out
+        count = count + 1
+        let group = if first { 3 } else { size }
+        if count == group and i > 0 {
+            out = mark + out
+            count = 0
+            first = false
+        }
+        i = i - 1
+    }
+    return out
+}
+
+/// A whole number, grouped.
+pub fn format_integer(value: i64, tag: str) -> str {
+    let negative = value < 0
+    let magnitude = if negative { 0 - value } else { value }
+    let text = group_digits("{magnitude}", tag)
+    if negative {
+        return "-" + text
+    }
+    return text
+}
+
+/// A number with `places` decimals, grouped and marked the local way.
+pub fn format_decimal(value: f64, places: i64, tag: str) -> str {
+    let fixed = value.to_fixed(places)
+    let negative = fixed.starts_with("-")
+    let body = if negative { fixed.substr(1, fixed.len() - 1) } else { fixed }
+    var whole = body
+    var fraction = ""
+    match body.index_of(".") {
+        Some(at) -> {
+            whole = body.substr(0, at)
+            fraction = body.substr(at + 1, body.len() - at - 1)
+        }
+        None -> {}
+    }
+    var out = group_digits(whole, tag)
+    if fraction != "" {
+        out = out + decimal_mark(tag) + fraction
+    }
+    if negative {
+        return "-" + out
+    }
+    return out
+}
+
+/// The order a locale writes a date in: "dmy", "mdy" or "ymd".
+pub fn date_order(tag: str) -> str {
+    let language = tag.to_lower().split("-")[0]
+    let region = tag.to_upper()
+    if region.ends_with("-US") or region == "US" {
+        return "mdy"
+    }
+    if language == "ja" or language == "zh" or language == "ko" or
+    language == "hu" or language == "lt" {
+        return "ymd"
+    }
+    return "dmy"
+}
+
+/// Whether the locale's script runs right to left.
+///
+/// Not a display detail: a right-to-left locale needs the *whole* interface
+/// mirrored, and finding out at render time is finding out too late.
+pub fn is_right_to_left(tag: str) -> bool {
+    let language = tag.to_lower().split("-")[0]
+    return ["ar", "he", "fa", "ur", "yi", "ps", "sd", "dv"].contains(language)
+}
+
+/// A list joined the way the locale joins one — "a, b and c".
+pub fn format_list(items: [str], tag: str) -> str {
+    if items.len() == 0 {
+        return ""
+    }
+    if items.len() == 1 {
+        return items[0]
+    }
+    let language = tag.to_lower().split("-")[0]
+    var final_word = " and "
+    if language == "de" {
+        final_word = " und "
+    } else if language == "fr" {
+        final_word = " et "
+    } else if language == "es" {
+        final_word = " y "
+    } else if language == "it" {
+        final_word = " e "
+    } else if language == "nl" {
+        final_word = " en "
+    }
+    if items.len() == 2 {
+        return items[0] + final_word + items[1]
+    }
+    let head = items.slice(0, items.len() - 1).join(", ")
+    return head + final_word + items[items.len() - 1]
+}

@@ -1,0 +1,6 @@
+[package]
+name = "iban"
+version = "1.0.0"
+
+# Bank account numbers, checked. Opens nothing.
+capabilities = []

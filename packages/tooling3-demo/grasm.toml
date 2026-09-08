@@ -1,0 +1,28 @@
+[package]
+name = "tooling3_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.benchtime]
+path = "../benchtime"
+version = "^1.0.0"
+
+[dependencies.treeview]
+path = "../treeview"
+version = "^1.0.0"
+
+[dependencies.ulid]
+path = "../ulid"
+version = "^1.0.0"
+
+[dependencies.phonetic]
+path = "../phonetic"
+version = "^1.0.0"
+
+[dependencies.natsort]
+path = "../natsort"
+version = "^1.0.0"
+
+[dependencies.fixtureset]
+path = "../fixtureset"
+version = "^1.0.0"

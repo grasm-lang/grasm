@@ -1,0 +1,10 @@
+[package]
+name = "i18n"
+version = "1.0.0"
+
+# Text and tables. Opens nothing.
+capabilities = []
+
+[dependencies.locale]
+path = "../locale"
+version = "^1.0.0"

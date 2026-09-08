@@ -1,0 +1,399 @@
+// Matching names by how they sound.
+//
+// Edit distance says "Smith" and "Smyth" are one change apart and so are
+// "Smith" and "Smith" with a typo — it cannot tell a misspelling from a
+// different spelling of the same name. A phonetic code can: it maps a word to
+// how it is pronounced, so every spelling of one name collides on purpose.
+//
+// That is what makes it useful for a *search index*: store the code beside
+// the name, look up by code, and a search for "Katherine" finds "Catherine",
+// "Kathryn" and "Katharine" without a fuzzy scan of the whole table.
+//
+// Three codes, because they disagree and the disagreement is the point:
+//
+//   - **Soundex** is from 1918 and keeps only four characters. It over-matches
+//     badly — "Robert" and "Rupert" share a code, and so do "Tymczak" and
+//     "Tanacz". It is here because census and government data is indexed with
+//     it and matching that data means reproducing it, warts and all.
+//   - **Metaphone** knows English spelling rules: `ph` is `f`, a silent `k`
+//     in `kn` is dropped, `tion` is `xn`. Far better, and English-only.
+//   - **NYSIIS** was built for New York's welfare records and handles
+//     surnames of non-English origin better than either.
+//
+// All three are for *names*. Run one over ordinary prose and it will produce
+// codes; they will not mean anything.
+
+fn is_vowel(c: str) -> bool {
+    return c == "A" or c == "E" or c == "I" or c == "O" or c == "U"
+}
+
+fn letters_only(text: str) -> str {
+    var out = ""
+    for c in text.to_upper().chars() {
+        if c >= "A" and c <= "Z" {
+            out = out + c
+        }
+    }
+    return out
+}
+
+/// Soundex's digit for a letter, or "" for the ones it drops.
+fn soundex_digit(c: str) -> str {
+    if ["B", "F", "P", "V"].contains(c) {
+        return "1"
+    }
+    if ["C", "G", "J", "K", "Q", "S", "X", "Z"].contains(c) {
+        return "2"
+    }
+    if c == "D" or c == "T" {
+        return "3"
+    }
+    if c == "L" {
+        return "4"
+    }
+    if c == "M" or c == "N" {
+        return "5"
+    }
+    if c == "R" {
+        return "6"
+    }
+    return ""
+}
+
+/// Soundex: a letter and three digits.
+///
+/// The two rules everyone gets wrong are both about what separates a repeat.
+/// `H` and `W` do *not* — "Ashcraft" is A261 and not A226, because the `s`
+/// and the `c` are the same digit with only an `h` between them. A vowel
+/// does separate them.
+pub fn soundex(name: str) -> str {
+    let letters = letters_only(name)
+    if letters.len() == 0 {
+        return ""
+    }
+    let cs = letters.chars()
+    var out = cs[0]
+    var last = soundex_digit(cs[0])
+    var i = 1
+    while i < cs.len() and out.len() < 4 {
+        let c = cs[i]
+        let digit = soundex_digit(c)
+        if digit != "" and digit != last {
+            out = out + digit
+        }
+        if c == "H" or c == "W" {
+            // Neither replaces the previous digit nor separates a repeat.
+            i = i + 1
+            continue
+        }
+        last = digit
+        i = i + 1
+    }
+    while out.len() < 4 {
+        out = out + "0"
+    }
+    return out
+}
+
+fn starts_at(cs: [str], at: i64, want: str) -> bool {
+    let w = want.chars()
+    if at + w.len() > cs.len() {
+        return false
+    }
+    for i in 0..w.len() {
+        if cs[at + i] != w[i] {
+            return false
+        }
+    }
+    return true
+}
+
+fn char_at(cs: [str], at: i64) -> str {
+    if at < 0 or at >= cs.len() {
+        return ""
+    }
+    return cs[at]
+}
+
+/// The consonants from P onward, which is the second half of the table.
+///
+/// Split out because the whole table in one function is longer than anything
+/// in this project is allowed to be, and the split is at a letter rather than
+/// in the middle of a rule.
+fn late_consonant(c: str, next: str, after: str) -> str {
+    if c == "P" {
+        return if next == "H" { "F" } else { "P" }
+    }
+    if c == "Q" {
+        return "K"
+    }
+    if c == "S" {
+        if next == "H" {
+            return "X"
+        }
+        if next == "I" and (after == "O" or after == "A") {
+            return "X"
+        }
+        return "S"
+    }
+    if c == "T" {
+        if next == "H" {
+            return "0"
+        }
+        if next == "I" and (after == "O" or after == "A") {
+            return "X"
+        }
+        return "T"
+    }
+    if c == "V" {
+        return "F"
+    }
+    if c == "W" or c == "Y" {
+        // Kept only before a vowel: "away" ends in nothing.
+        return if is_vowel(next) { c } else { "" }
+    }
+    if c == "X" {
+        return "KS"
+    }
+    if c == "Z" {
+        return "S"
+    }
+    return c
+}
+
+/// Whether the letter consumed the one after it as part of a digraph.
+fn skips_next(c: str, next: str) -> bool {
+    if next != "H" {
+        return false
+    }
+    return c == "P" or c == "S" or c == "T"
+}
+
+/// Metaphone: English spelling rules, applied.
+///
+/// Not the full 1990 algorithm — it is a subset covering the transformations
+/// that matter for names, and it says so rather than claiming to be
+/// something a reader could check against a published table and find it is
+/// not.
+pub fn metaphone(name: str) -> str {
+    var letters = letters_only(name)
+    if letters.len() == 0 {
+        return ""
+    }
+    var cs = letters.chars()
+    // The initial-cluster rules, which apply only at the start.
+    var start = 0
+    var out = ""
+    if starts_at(cs, 0, "AE") or starts_at(cs, 0, "GN") or
+    starts_at(cs, 0, "KN") or starts_at(cs, 0, "PN") or
+    starts_at(cs, 0, "WR") {
+        start = 1
+    } else if starts_at(cs, 0, "X") {
+        out = "S"
+        start = 1
+    } else if starts_at(cs, 0, "WH") {
+        out = "W"
+        start = 2
+    }
+    var i = start
+    var previous = ""
+    while i < cs.len() {
+        let c = cs[i]
+        let next = char_at(cs, i + 1)
+        let after = char_at(cs, i + 2)
+        // A doubled consonant is one sound, except CC.
+        if c == previous and c != "C" {
+            i = i + 1
+            continue
+        }
+        if is_vowel(c) {
+            // A vowel is kept only at the start of the word.
+            if i == start {
+                out = out + c
+            }
+        } else if c == "B" {
+            // Silent at the end after an M: "lamb".
+            if not (i == cs.len() - 1 and previous == "M") {
+                out = out + "B"
+            }
+        } else if c == "C" {
+            if next == "I" and after == "A" {
+                out = out + "X"
+            } else if next == "H" {
+                out = out + "X"
+                i = i + 1
+            } else if next == "I" or next == "E" or next == "Y" {
+                out = out + "S"
+            } else {
+                out = out + "K"
+            }
+        } else if c == "D" {
+            if next == "G" and (after == "E" or after == "Y" or after == "I") {
+                out = out + "J"
+                i = i + 2
+            } else {
+                out = out + "T"
+            }
+        } else if c == "G" {
+            if next == "H" {
+                // Silent unless a vowel follows the H: "night" against
+                // "ghost", which is the initial rule above.
+                if is_vowel(after) {
+                    out = out + "K"
+                }
+                i = i + 1
+            } else if next == "N" {
+                // Silent: "gnome", "sign".
+                i = i + 1
+            } else if next == "I" or next == "E" or next == "Y" {
+                out = out + "J"
+            } else {
+                out = out + "K"
+            }
+        } else if c == "H" {
+            // Sounded only between a vowel and a vowel.
+            if is_vowel(previous) and not is_vowel(next) {
+                i = i + 1
+                previous = c
+                continue
+            }
+            out = out + "H"
+        } else if c == "K" {
+            if previous != "C" {
+                out = out + "K"
+            }
+        } else {
+            out = out + late_consonant(c, next, after)
+            if skips_next(c, next) {
+                i = i + 1
+            }
+        }
+        previous = c
+        i = i + 1
+    }
+    return out
+}
+
+/// NYSIIS: New York State's code, which handles non-English surnames better.
+pub fn nysiis(name: str) -> str {
+    var letters = letters_only(name)
+    if letters.len() == 0 {
+        return ""
+    }
+    // The initial clusters.
+    if letters.starts_with("MAC") {
+        letters = "MCC" + letters.substr(3, letters.len() - 3)
+    } else if letters.starts_with("KN") {
+        letters = "NN" + letters.substr(2, letters.len() - 2)
+    } else if letters.starts_with("K") {
+        letters = "C" + letters.substr(1, letters.len() - 1)
+    } else if letters.starts_with("PH") or letters.starts_with("PF") {
+        letters = "FF" + letters.substr(2, letters.len() - 2)
+    } else if letters.starts_with("SCH") {
+        letters = "SSS" + letters.substr(3, letters.len() - 3)
+    }
+    // And the final ones.
+    if letters.ends_with("EE") or letters.ends_with("IE") {
+        letters = letters.substr(0, letters.len() - 2) + "Y"
+    } else if letters.ends_with("DT") or letters.ends_with("RT") or
+    letters.ends_with("RD") or letters.ends_with("NT") or
+    letters.ends_with("ND") {
+        letters = letters.substr(0, letters.len() - 2) + "D"
+    }
+    let cs = letters.chars()
+    var out = cs[0]
+    var i = 1
+    while i < cs.len() {
+        var c = cs[i]
+        let next = char_at(cs, i + 1)
+        if c == "E" and next == "V" {
+            c = "A"
+            i = i + 1
+        } else if is_vowel(c) {
+            c = "A"
+        } else if c == "Q" {
+            c = "G"
+        } else if c == "Z" {
+            c = "S"
+        } else if c == "M" {
+            c = "N"
+        } else if c == "K" {
+            c = if next == "N" { "N" } else { "C" }
+        } else if c == "S" and next == "C" and char_at(cs, i + 2) == "H" {
+            c = "S"
+            i = i + 2
+        } else if c == "P" and next == "H" {
+            c = "F"
+            i = i + 1
+        } else if c == "H" {
+            // Kept only between vowels.
+            if not is_vowel(char_at(cs, i - 1)) or not is_vowel(next) {
+                c = char_at(cs, i - 1)
+            }
+        } else if c == "W" and is_vowel(char_at(cs, i - 1)) {
+            c = "A"
+        }
+        if c != "" and c != out.substr(out.len() - 1, 1) {
+            out = out + c
+        }
+        i = i + 1
+    }
+    // The trailing rules.
+    if out.ends_with("S") and out.len() > 1 {
+        out = out.substr(0, out.len() - 1)
+    }
+    if out.ends_with("AY") {
+        out = out.substr(0, out.len() - 2) + "Y"
+    }
+    if out.ends_with("A") and out.len() > 1 {
+        out = out.substr(0, out.len() - 1)
+    }
+    return out
+}
+
+/// Whether two names share a Soundex code.
+pub fn sounds_like(a: str, b: str) -> bool {
+    return soundex(a) == soundex(b)
+}
+
+/// Whether they agree on all three codes — a much stronger claim.
+pub fn strongly_alike(a: str, b: str) -> bool {
+    return soundex(a) == soundex(b) and metaphone(a) == metaphone(b) and
+    nysiis(a) == nysiis(b)
+}
+
+/// How many of the three codes agree, 0 to 3.
+///
+/// The number to rank candidates by: three is almost certainly the same name,
+/// one is Soundex being Soundex.
+pub fn agreement(a: str, b: str) -> i64 {
+    var n = 0
+    if soundex(a) == soundex(b) {
+        n = n + 1
+    }
+    if metaphone(a) == metaphone(b) {
+        n = n + 1
+    }
+    if nysiis(a) == nysiis(b) {
+        n = n + 1
+    }
+    return n
+}
+
+/// Names from `candidates` that sound like `name`, strongest agreement first.
+pub fn matches(name: str, candidates: [str]) -> [(str, i64)] {
+    var out: [(str, i64)] = []
+    for c in candidates {
+        let score = agreement(name, c)
+        if score > 0 {
+            out.push((c, score))
+        }
+    }
+    out.sort_by(|pair| 0 - pair.1)
+    return out
+}
+
+/// The index key a search would store: all three codes, joined.
+pub fn index_key(name: str) -> str {
+    return soundex(name) + ":" + metaphone(name) + ":" + nysiis(name)
+}

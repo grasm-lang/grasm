@@ -1,0 +1,265 @@
+// Drawing a tree the way `tree` and `git log --graph` do.
+//
+// The whole difficulty is the vertical bars. A child three levels down needs
+// to know, for each ancestor, whether that ancestor had a sibling after it —
+// because that decides whether the column shows a bar or a space. Getting it
+// wrong gives the output where branches float unattached, which is the
+// failure everyone recognises and nobody can quite describe.
+//
+// So the drawing carries a stack of "is this ancestor the last of its
+// siblings", one entry per level, and reads it from the outside in.
+//
+// A tree here is nodes in a list referring to each other by index, which is
+// what a directory listing, a dependency graph or a comment thread produces
+// naturally — and it means a cycle is representable, so there is a check for
+// one rather than a stack overflow.
+
+type TreeNode = {
+    label: str,
+    /// Indices of the children, in the order they should be drawn.
+    child: [i64],
+    /// Anything the caller wants beside the label — a size, a status.
+    note: str,
+}
+
+type TreeShape = {
+    node: [TreeNode],
+    root: i64,
+}
+
+type TreeStyle = {
+    /// The four pieces: a branch, the last branch, a continuing bar, a gap.
+    branch: str,
+    last_branch: str,
+    bar: str,
+    gap: str,
+}
+
+type TreeError =
+    | Cycle(at: i64)
+    | NoSuchNode(at: i64)
+    | TooDeep(depth: i64)
+
+pub fn unicode_style() -> TreeStyle {
+    let horizontal = (9472).to_char()
+    return TreeStyle{
+        branch: (9500).to_char() + horizontal + horizontal + " ",
+        last_branch: (9492).to_char() + horizontal + horizontal + " ",
+        bar: (9474).to_char() + "   ",
+        gap: "    ",
+    }
+}
+
+/// The same shape in ASCII, for a terminal or a log that mangles anything else.
+pub fn ascii_style() -> TreeStyle {
+    return TreeStyle{
+        branch: "|-- ", last_branch: "`-- ", bar: "|   ", gap: "    ",
+    }
+}
+
+pub fn new_tree() -> TreeShape {
+    return TreeShape{ node: [], root: 0 }
+}
+
+/// Add a node and answer its index.
+pub fn add(inout t: TreeShape, label: str, note: str) -> i64 {
+    t.node.push(TreeNode{ label: label, child: [], note: note })
+    return t.node.len() - 1
+}
+
+pub fn attach(inout t: TreeShape, parent: i64, child: i64) {
+    if parent < 0 or parent >= t.node.len() {
+        return
+    }
+    t.node[parent].child.push(child)
+}
+
+pub fn set_root(inout t: TreeShape, at: i64) {
+    t.root = at
+}
+
+/// Whether the shape is a tree at all: reachable, acyclic, one parent each.
+///
+/// Checked rather than assumed, because the input is indices and indices can
+/// point anywhere — and the failure mode without this check is a stack that
+/// runs out rather than a message.
+pub fn validate(t: TreeShape) -> () ! TreeError {
+    if t.node.len() == 0 {
+        return
+    }
+    if t.root < 0 or t.root >= t.node.len() {
+        fail(NoSuchNode(t.root))
+    }
+    var seen: [bool] = []
+    for _i in 0..t.node.len() {
+        seen.push(false)
+    }
+    var stack: [i64] = [t.root]
+    while stack.len() > 0 {
+        let at = stack.pop() ?? 0
+        if at < 0 or at >= t.node.len() {
+            fail(NoSuchNode(at))
+        }
+        if seen[at] {
+            fail(Cycle(at))
+        }
+        seen[at] = true
+        for c in t.node[at].child {
+            stack.push(c)
+        }
+    }
+}
+
+fn draw_into(inout out: [str], t: TreeShape, at: i64, prefix: str,
+    style: TreeStyle, depth: i64, limit: i64) {
+    if at < 0 or at >= t.node.len() or depth > limit {
+        return
+    }
+    let children = t.node[at].child
+    for i in 0..children.len() {
+        let last = i == children.len() - 1
+        let child = children[i]
+        if child < 0 or child >= t.node.len() {
+            continue
+        }
+        let elbow = if last { style.last_branch } else { style.branch }
+        var line = prefix + elbow + t.node[child].label
+        if t.node[child].note != "" {
+            line = line + "  " + t.node[child].note
+        }
+        out.push(line)
+        // The column this child occupies becomes a bar for its own children
+        // when there is a sibling after it, and a gap when there is not.
+        let below = prefix + (if last { style.gap } else { style.bar })
+        draw_into(out, t, child, below, style, depth + 1, limit)
+    }
+}
+
+/// The tree as lines, root first.
+pub fn draw(t: TreeShape, style: TreeStyle) -> [str] ! TreeError {
+    try validate(t)
+    var out: [str] = []
+    if t.node.len() == 0 {
+        return out
+    }
+    var head = t.node[t.root].label
+    if t.node[t.root].note != "" {
+        head = head + "  " + t.node[t.root].note
+    }
+    out.push(head)
+    draw_into(out, t, t.root, "", style, 0, 64)
+    return out
+}
+
+pub fn draw_ascii(t: TreeShape) -> [str] ! TreeError {
+    return try draw(t, ascii_style())
+}
+
+/// Build a tree from paths like `a/b/c`, the way a file listing arrives.
+pub fn from_paths(paths: [str], root_label: str) -> TreeShape {
+    var t = new_tree()
+    let root = add(t, root_label, "")
+    set_root(t, root)
+    // Parallel lists rather than a map, because the order children were first
+    // seen in is the order they should be drawn in, and a map would lose it.
+    var full: [str] = [""]
+    var index: [i64] = [root]
+    for path in paths {
+        var here = root
+        var walked = ""
+        for part in path.split("/") {
+            if part == "" {
+                continue
+            }
+            walked = if walked == "" { part } else { walked + "/" + part }
+            var found = 0 - 1
+            for i in 0..full.len() {
+                if full[i] == walked {
+                    found = index[i]
+                }
+            }
+            if found < 0 {
+                found = add(t, part, "")
+                attach(t, here, found)
+                full.push(walked)
+                index.push(found)
+            }
+            here = found
+        }
+    }
+    return t
+}
+
+/// How many nodes are below `at`, itself included.
+pub fn size_of(t: TreeShape, at: i64) -> i64 {
+    if at < 0 or at >= t.node.len() {
+        return 0
+    }
+    var total = 1
+    for c in t.node[at].child {
+        total = total + size_of(t, c)
+    }
+    return total
+}
+
+pub fn depth_of(t: TreeShape, at: i64) -> i64 {
+    if at < 0 or at >= t.node.len() {
+        return 0
+    }
+    var deepest = 0
+    for c in t.node[at].child {
+        let d = depth_of(t, c)
+        if d > deepest {
+            deepest = d
+        }
+    }
+    return deepest + 1
+}
+
+pub fn leaves(t: TreeShape) -> i64 {
+    var n = 0
+    for node in t.node {
+        if node.child.len() == 0 {
+            n = n + 1
+        }
+    }
+    return n
+}
+
+/// Every node's label, depth-first — the order the drawing walks them in.
+pub fn labels_in_order(t: TreeShape) -> [str] {
+    var out: [str] = []
+    collect(out, t, t.root, 0)
+    return out
+}
+
+fn collect(inout out: [str], t: TreeShape, at: i64, depth: i64) {
+    if at < 0 or at >= t.node.len() or depth > 64 {
+        return
+    }
+    out.push(t.node[at].label)
+    for c in t.node[at].child {
+        collect(out, t, c, depth + 1)
+    }
+}
+
+/// Draw only the first `limit` children of any node, with a count for the
+/// rest.
+///
+/// A directory with 4,000 entries printed in full is not a tree view, it is a
+/// listing with decoration.
+pub fn draw_limited(t: TreeShape, style: TreeStyle, limit: i64) -> [str] ! TreeError {
+    try validate(t)
+    var trimmed = t
+    for i in 0..trimmed.node.len() {
+        let children = trimmed.node[i].child
+        if children.len() > limit and limit > 0 {
+            let hidden = children.len() - limit
+            let marker = add(trimmed, "... {hidden} more", "")
+            var kept = children.slice(0, limit)
+            kept.push(marker)
+            trimmed.node[i].child = kept
+        }
+    }
+    return try draw(trimmed, style)
+}

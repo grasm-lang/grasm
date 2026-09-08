@@ -1,0 +1,258 @@
+// ULIDs: unique identifiers that sort by when they were made.
+//
+// A UUID v4 is 122 random bits and no order. Used as a primary key that is
+// exactly wrong: every insert lands in a random page of the index, so a table
+// that would have appended to one hot page instead writes to hundreds, and
+// the index fragments. The measured cost on a large table is several times
+// the insert throughput.
+//
+// A ULID puts 48 bits of millisecond timestamp in front of 80 bits of
+// randomness and encodes the lot in Crockford's base32, which is
+// lexicographically ordered. So the text sorts by time, an index appends,
+// and the identifier is still unguessable.
+//
+// Two details that are easy to miss and both matter:
+//
+//   - **Monotonicity within a millisecond.** Two ULIDs made in the same
+//     millisecond sort by their random part, which is to say arbitrarily.
+//     The specification's answer is to increment the previous random value
+//     instead of drawing a new one, and `next_monotonic` does that.
+//   - **Crockford's alphabet excludes I, L, O and U** — the first three
+//     because they look like 1 and 0, the last so the encoding cannot spell
+//     anything unfortunate. Decoding accepts the lookalikes and maps them
+//     back, which is what makes a ULID safe to read down a phone.
+//
+// Randomness is the caller's, so this opens nothing and every test is exact.
+
+type UlidError =
+    | WrongLength(len: i64)
+    | BadCharacter(at: i64)
+    | Overflow(at: i64)
+    | TimestampTooLarge(millis: i64)
+
+fn alphabet() -> str {
+    return "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+}
+
+/// A character's value, accepting the lookalikes Crockford excludes.
+fn value_of(c: str) -> i64 {
+    let upper = c.to_upper()
+    // I and L read as 1, O reads as 0 — which is what makes a ULID
+    // transcribable by a person without a fifty-fifty guess.
+    if upper == "I" or upper == "L" {
+        return 1
+    }
+    if upper == "O" {
+        return 0
+    }
+    let cs = alphabet().chars()
+    for i in 0..cs.len() {
+        if cs[i] == upper {
+            return i
+        }
+    }
+    return 0 - 1
+}
+
+/// The largest timestamp a ULID can hold: 48 bits of milliseconds, which runs
+/// out in the year 10889.
+pub fn max_timestamp() -> i64 {
+    return 281474976710655
+}
+
+fn encode_bits(value: i64, chars: i64) -> str {
+    let cs = alphabet().chars()
+    var out = ""
+    var left = value
+    var i = 0
+    while i < chars {
+        out = cs[left % 32] + out
+        left = left / 32
+        i = i + 1
+    }
+    return out
+}
+
+/// A ULID from a timestamp and eighty bits of randomness, given as two halves.
+///
+/// Two halves because eighty bits do not fit in an `i64`: `high` carries the
+/// top 40 and `low` the bottom 40.
+pub fn make(millis: i64, high: i64, low: i64) -> str ! UlidError {
+    if millis < 0 or millis > max_timestamp() {
+        fail(TimestampTooLarge(millis))
+    }
+    let mask = 1099511627775
+    // Ten characters of time, sixteen of randomness: 48 and 80 bits.
+    return encode_bits(millis, 10) + encode_bits(high.bit_and(mask), 8) +
+    encode_bits(low.bit_and(mask), 8)
+}
+
+pub fn is_valid(text: str) -> bool {
+    match parse(text) {
+        Ok(_v) -> return true
+        Err(_e) -> return false
+    }
+}
+
+/// The timestamp, the top forty random bits and the bottom forty.
+pub fn parse(text: str) -> (i64, i64, i64) ! UlidError {
+    if text.len() != 26 {
+        fail(WrongLength(text.len()))
+    }
+    let cs = text.chars()
+    // The first character encodes five bits of a 48-bit field, so anything
+    // above 7 would overflow — the reason `8000...` is not a ULID.
+    if value_of(cs[0]) > 7 {
+        fail(Overflow(0))
+    }
+    var millis = 0
+    for i in 0..10 {
+        let v = value_of(cs[i])
+        if v < 0 {
+            fail(BadCharacter(i))
+        }
+        millis = millis * 32 + v
+    }
+    var high = 0
+    for i in 10..18 {
+        let v = value_of(cs[i])
+        if v < 0 {
+            fail(BadCharacter(i))
+        }
+        high = high * 32 + v
+    }
+    var low = 0
+    for i in 18..26 {
+        let v = value_of(cs[i])
+        if v < 0 {
+            fail(BadCharacter(i))
+        }
+        low = low * 32 + v
+    }
+    return (millis, high, low)
+}
+
+pub fn timestamp_of(text: str) -> i64 ! UlidError {
+    return (try parse(text)).0
+}
+
+/// The ten-character time prefix, which is what a range query matches on.
+pub fn time_prefix(text: str) -> str {
+    if text.len() < 10 {
+        return ""
+    }
+    return text.substr(0, 10).to_upper()
+}
+
+/// The smallest ULID with a given timestamp — the lower bound of a range.
+pub fn floor_of(millis: i64) -> str ! UlidError {
+    return try make(millis, 0, 0)
+}
+
+/// And the largest, which is the other end.
+pub fn ceiling_of(millis: i64) -> str ! UlidError {
+    return try make(millis, 1099511627775, 1099511627775)
+}
+
+/// The next ULID in the same millisecond: the random part incremented.
+///
+/// This is what makes two identifiers made in one millisecond sort in the
+/// order they were made. Without it they sort randomly, and a paginated
+/// listing keyed on the identifier skips and repeats rows.
+pub fn next_monotonic(previous: str) -> str ! UlidError {
+    let parts = try parse(previous)
+    var low = parts.2 + 1
+    var high = parts.1
+    if low > 1099511627775 {
+        low = 0
+        high = high + 1
+        if high > 1099511627775 {
+            // Eighty bits exhausted inside one millisecond, which needs
+            // 2^80 identifiers and cannot happen — but saying so beats
+            // wrapping to the value already issued.
+            fail(Overflow(10))
+        }
+    }
+    return try make(parts.0, high, low)
+}
+
+/// The next identifier, monotonic when the clock has not moved on.
+pub fn next(previous: str, millis: i64, high: i64, low: i64) -> str ! UlidError {
+    if previous != "" {
+        let parts = try parse(previous)
+        if parts.0 == millis {
+            return try next_monotonic(previous)
+        }
+        if millis < parts.0 {
+            // The wall clock went backwards, which it does. Keeping the
+            // previous timestamp is what preserves the ordering the type
+            // exists for.
+            return try next_monotonic(previous)
+        }
+    }
+    return try make(millis, high, low)
+}
+
+/// Whether `a` was made before `b`, by comparing the text.
+///
+/// The whole point: no parsing is needed, because the encoding sorts.
+pub fn is_before(a: str, b: str) -> bool {
+    return a.to_upper() < b.to_upper()
+}
+
+/// The canonical form: upper case, with the lookalikes normalised.
+pub fn canonical(text: str) -> str ! UlidError {
+    let parts = try parse(text)
+    return try make(parts.0, parts.1, parts.2)
+}
+
+/// The 128 bits as sixteen bytes, for a column that stores them binary.
+pub fn to_bytes(text: str) -> bytes ! UlidError {
+    let parts = try parse(text)
+    var out: [i64] = []
+    for i in 0..6 {
+        out.push(parts.0.ushr((5 - i) * 8).bit_and(255))
+    }
+    for i in 0..5 {
+        out.push(parts.1.ushr((4 - i) * 8).bit_and(255))
+    }
+    for i in 0..5 {
+        out.push(parts.2.ushr((4 - i) * 8).bit_and(255))
+    }
+    return bytes_of(out)
+}
+
+pub fn from_bytes(data: bytes) -> str ! UlidError {
+    if data.len() != 16 {
+        fail(WrongLength(data.len()))
+    }
+    var millis = 0
+    for i in 0..6 {
+        millis = millis.shl(8).bit_or(data.at(i))
+    }
+    var high = 0
+    for i in 6..11 {
+        high = high.shl(8).bit_or(data.at(i))
+    }
+    var low = 0
+    for i in 11..16 {
+        low = low.shl(8).bit_or(data.at(i))
+    }
+    return try make(millis, high, low)
+}
+
+/// The same 128 bits written as a UUID, for a column that already is one.
+///
+/// Not a UUID v4 and not claimed to be: the version and variant nibbles carry
+/// timestamp bits, so anything reading those will see a nonsense version.
+/// It is a lossless way to store a ULID in a `uuid` column and nothing more.
+pub fn to_uuid_text(text: str) -> str ! UlidError {
+    let raw = try to_bytes(text)
+    var hex = ""
+    for i in 0..raw.len() {
+        let b = raw.at(i)
+        hex = hex + b.ushr(4).to_base(16) + b.bit_and(15).to_base(16)
+    }
+    return hex.substr(0, 8) + "-" + hex.substr(8, 4) + "-" +
+    hex.substr(12, 4) + "-" + hex.substr(16, 4) + "-" + hex.substr(20, 12)
+}

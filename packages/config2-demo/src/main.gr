@@ -1,0 +1,377 @@
+import migrate
+import locale
+import i18n
+import currency
+import iban
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn empty_plan() -> MigrationPlan {
+    return MigrationPlan{ pending: [], changed: [], unknown: [], out_of_order: [] }
+}
+
+fn planned(steps: [MigrationStep], history: [AppliedStep]) -> MigrationPlan {
+    return migrate.plan(steps, history) ?? empty_plan()
+}
+
+fn plan_refuses(steps: [MigrationStep], history: [AppliedStep]) -> bool {
+    match migrate.plan(steps, history) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn tag(text: str) -> LocaleTag {
+    return locale.parse(text) ??
+    LocaleTag{ language: "", script: "", region: "", variant: [], extension: "" }
+}
+
+fn parse_currency(text: str, code: str) -> i64 {
+    return currency.parse_minor(text, code) ?? 0 - 1
+}
+
+fn currency_rejects(text: str, code: str) -> bool {
+    match currency.parse_minor(text, code) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn locale_refuses(tag_text: str) -> bool {
+    match locale.parse(tag_text) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn currency_refuses(code: str) -> bool {
+    match currency.lookup(code) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn rolls_back(steps: [MigrationStep], history: [AppliedStep], n: i64) -> bool {
+    match migrate.rollback(steps, history, n) {
+        Ok(_v) -> return true
+        Err(_e) -> return false
+    }
+}
+
+fn check_migrate(inout f: i64) / {io} {
+    print("-- migrate: what will run, and what has changed underneath")
+    let steps = [
+        migrate.step("0001", "create users", "CREATE TABLE users", "DROP TABLE users"),
+        migrate.step("0002", "add email", "ALTER TABLE users ADD email", ""),
+        migrate.step("0003", "index email", "CREATE INDEX ix", "DROP INDEX ix"),
+    ]
+    let fresh = planned(steps, [])
+    say(f, "on an empty database everything is pending",
+        migrate.pending_count(fresh) == 3)
+    say(f, "and the plan is clean", migrate.is_clean(fresh))
+    say(f, "in id order", fresh.pending[0].id == "0001" and
+        fresh.pending[2].id == "0003")
+    say(f, "the scripts come out in that order",
+        migrate.up_scripts(fresh)[0] == "CREATE TABLE users")
+    // One applied, two to go.
+    var history = migrate.record([], steps[0], 100)
+    let partial = planned(steps, history)
+    say(f, "an applied step is not pending again",
+        migrate.pending_count(partial) == 2)
+    say(f, "and the plan is still clean", migrate.is_clean(partial))
+    // The case nothing else catches: the file changed after it ran.
+    let edited = [
+        migrate.step("0001", "create users", "CREATE TABLE users (id INT)",
+            "DROP TABLE users"),
+        steps[1],
+        steps[2],
+    ]
+    let drifted = planned(edited, history)
+    say(f, "editing an applied migration is reported",
+        drifted.changed == ["0001"])
+    say(f, "and the plan is no longer clean", not migrate.is_clean(drifted))
+    say(f, "the report says what happened",
+        migrate.describe(drifted)[2].contains("the file has changed since"))
+    // A migration in the database that is no longer on disk.
+    let orphaned = planned([steps[1], steps[2]], history)
+    say(f, "a migration that has vanished from the plan is reported",
+        orphaned.unknown == ["0001"])
+    // Two branches, both numbering their migration after the other merged.
+    var later = migrate.record(history, steps[2], 200)
+    let late = planned(steps, later)
+    say(f, "a step that sorts before an applied one is late",
+        late.out_of_order == ["0002"])
+    say(f, "which is not clean either", not migrate.is_clean(late))
+    say(f, "a duplicate id is refused outright",
+        plan_refuses([steps[0], steps[0]], []))
+    // Rolling back, and refusing to start one that cannot finish.
+    say(f, "the last applied step rolls back",
+        rolls_back(steps, history, 1))
+    say(f, "and its down script is what runs",
+        migrate.down_scripts(migrate.rollback(steps, history, 1) ?? [])[0] ==
+        "DROP TABLE users")
+    let two_applied = migrate.record(history, steps[1], 200)
+    say(f, "a rollback through a step with no down is refused before it starts",
+        not rolls_back(steps, two_applied, 2))
+    say(f, "and the plan says which steps have no way back",
+        not migrate.is_reversible(steps))
+    say(f, "a checksum changes when the body does",
+        migrate.checksum(steps[0]) != migrate.checksum(edited[0]))
+    say(f, "and not when nothing does",
+        migrate.checksum(steps[0]) == migrate.checksum(steps[0]))
+    say(f, "a new id avoids the ones taken",
+        migrate.next_id(steps, "0003") == "0003_1")
+}
+
+fn check_locale(inout f: i64) / {io} {
+    print("-- locale: 1.234 is two different numbers")
+    let t = tag("en-Latn-GB-u-ca-gregory")
+    say(f, "the language is lowercased", t.language == "en")
+    say(f, "the script is title case", t.script == "Latn")
+    say(f, "the region is upper case", t.region == "GB")
+    say(f, "and the extension is kept whole", t.extension == "u-ca-gregory")
+    say(f, "an underscore is accepted as a separator",
+        tag("pt_BR").region == "BR")
+    say(f, "case does not change the tag",
+        locale.render(tag("EN-latn-us")) == "en-Latn-US")
+    say(f, "something that is not a tag is refused", locale_refuses("1"))
+    say(f, "and so is nothing at all", locale_refuses(""))
+    // The fallback chain is truncation, which is what makes an unknown region
+    // degrade to its language.
+    say(f, "the chain drops one subtag at a time",
+        locale.fallbacks(t) == ["en-Latn-GB", "en-Latn", "en"])
+    say(f, "an exact match wins",
+        locale.best_match(["de-CH"], ["de", "de-CH", "en"]) == Some("de-CH"))
+    say(f, "then a fallback of what was asked for",
+        locale.best_match(["de-AT"], ["de", "en"]) == Some("de"))
+    say(f, "then anything sharing the language",
+        locale.best_match(["de-AT"], ["de-CH", "en"]) == Some("de-CH"))
+    say(f, "and nothing matching is None",
+        locale.best_match(["ja"], ["de", "en"]) == None)
+    say(f, "an Accept-Language header sorts by quality",
+        locale.parse_accept_language("da, en-GB;q=0.8, en;q=0.7") ==
+        ["da", "en-GB", "en"])
+    say(f, "and ties keep the header's order",
+        locale.parse_accept_language("fr;q=0.9, de;q=0.9") == ["fr", "de"])
+    // The conventions, which is where getting it wrong changes the number.
+    say(f, "English groups with a comma",
+        locale.format_integer(1234567, "en-GB") == "1,234,567")
+    say(f, "German with a full stop",
+        locale.format_integer(1234567, "de-DE") == "1.234.567")
+    say(f, "Switzerland with an apostrophe, whatever the language",
+        locale.format_integer(1234567, "de-CH").contains((8217).to_char()))
+    say(f, "India groups the upper digits in twos",
+        locale.format_integer(1234567, "hi-IN") == "12,34,567")
+    say(f, "the decimal mark differs too",
+        locale.format_decimal(1.5, 2, "en-GB") == "1.50" and
+        locale.format_decimal(1.5, 2, "de-DE") == "1,50")
+    say(f, "so the same digits are two numbers",
+        locale.format_decimal(1234.0, 0, "en-GB") == "1,234" and
+        locale.format_decimal(1.234, 3, "de-DE") == "1,234")
+    say(f, "a negative keeps its sign outside the grouping",
+        locale.format_integer(0 - 1234, "en-GB") == "-1,234")
+    say(f, "the date order differs by region",
+        locale.date_order("en-US") == "mdy" and locale.date_order("en-GB") == "dmy" and
+        locale.date_order("ja-JP") == "ymd")
+    say(f, "and some scripts run the other way",
+        locale.is_right_to_left("ar-EG") and not locale.is_right_to_left("en"))
+    say(f, "a list is joined with the local word",
+        locale.format_list(["a", "b", "c"], "en") == "a, b and c" and
+        locale.format_list(["a", "b"], "de") == "a und b")
+    say(f, "and one item is itself", locale.format_list(["a"], "en") == "a")
+    say(f, "is_known says what the table covers",
+        locale.is_known("de") and not locale.is_known("qqq"))
+}
+
+fn check_i18n(inout f: i64) / {io} {
+    print("-- i18n: two plural forms is the exception, not the rule")
+    var en = i18n.new_catalogue("en")
+    i18n.define(en, "greeting", "Hello, \{name}")
+    i18n.define_plural(en, "files", [i18n.ONE, i18n.OTHER],
+        ["\{n} file", "\{n} files"])
+    say(f, "a message interpolates",
+        i18n.translate(en, "greeting", ["name"], ["Ada"]) == "Hello, Ada")
+    say(f, "an unknown placeholder is left alone, not deleted",
+        i18n.translate(en, "greeting", ["other"], ["x"]) == "Hello, \{name}")
+    say(f, "one file is singular",
+        i18n.plural(en, "files", 1, ["n"], ["1"]) == "1 file")
+    say(f, "and two are plural",
+        i18n.plural(en, "files", 2, ["n"], ["2"]) == "2 files")
+    // The rules that make `n == 1` wrong.
+    say(f, "French counts zero as singular",
+        i18n.plural_category("fr", 0) == i18n.ONE and
+        i18n.plural_category("en", 0) == i18n.OTHER)
+    say(f, "Japanese has one form for everything",
+        i18n.plural_forms("ja") == [i18n.OTHER])
+    say(f, "Russian has three",
+        i18n.plural_forms("ru").len() == 3)
+    say(f, "and 21 takes the singular one in Russian",
+        i18n.plural_category("ru", 21) == i18n.ONE)
+    say(f, "while 11 does not", i18n.plural_category("ru", 11) == i18n.MANY)
+    say(f, "and 3 is the third form", i18n.plural_category("ru", 3) == i18n.FEW)
+    say(f, "Arabic has six", i18n.plural_forms("ar").len() == 6)
+    say(f, "Polish distinguishes 2 from 12",
+        i18n.plural_category("pl", 2) == i18n.FEW and
+        i18n.plural_category("pl", 12) == i18n.MANY)
+    say(f, "and the package says which languages it has rules for",
+        i18n.has_plural_rule("cy") and not i18n.has_plural_rule("qqq"))
+    // A missing key is reportable rather than silent.
+    var partial = i18n.new_catalogue("de")
+    i18n.define(partial, "greeting", "Hallo, \{name}")
+    let _asked = i18n.get(partial, "farewell")
+    say(f, "a missing key comes back as itself",
+        i18n.get(partial, "farewell") == "farewell")
+    say(f, "and is recorded", i18n.missing_keys(partial) == ["farewell"])
+    say(f, "coverage counts what is defined",
+        i18n.coverage_percent(partial, ["greeting", "files", "farewell"]) == 33)
+    say(f, "and names what is not",
+        i18n.untranslated(partial, ["greeting", "files"]) == ["files"])
+    // The fallback chain, so a regional catalogue need not repeat everything.
+    var ch = i18n.new_catalogue("de-CH")
+    i18n.define(ch, "greeting", (71).to_char() + "r" + (252).to_char() + "ezi")
+    var chain = i18n.chain_for("de-CH", [ch, partial])
+    say(f, "the chain is the regional catalogue then the language one",
+        chain.len() == 2)
+    say(f, "an overridden key comes from the regional one",
+        i18n.get_from(chain, "greeting").starts_with("Gr"))
+    var only_de = i18n.chain_for("de-CH", [partial])
+    say(f, "and one it does not override comes from the language",
+        i18n.get_from(only_de, "greeting") == "Hallo, \{name}")
+    // The check that catches a translation which lost a placeholder.
+    say(f, "placeholders are listed",
+        i18n.placeholders("Hello, \{name}, you have \{n}") == ["name", "n"])
+    say(f, "and a translation missing one is reported",
+        i18n.lost_placeholders("Hello, \{name}", "Bonjour") == ["name"])
+    say(f, "while a complete one is not",
+        i18n.lost_placeholders("Hello, \{name}", "Bonjour, \{name}") == [])
+}
+
+fn check_currency(inout f: i64) / {io} {
+    print("-- currency: the minor unit is not always two")
+    say(f, "a dollar has two decimals", (currency.minor_units("USD") ?? 0) == 2)
+    say(f, "the yen has none", (currency.minor_units("JPY") ?? 9) == 0)
+    say(f, "and the Kuwaiti dinar three", (currency.minor_units("KWD") ?? 0) == 3)
+    say(f, "so one dinar is a thousand minor units",
+        (currency.minor_per_major("KWD") ?? 0) == 1000 and
+        (currency.minor_per_major("JPY") ?? 0) == 1)
+    say(f, "the table names every currency that is not two",
+        currency.unusual_codes().len() > 10)
+    say(f, "codes are matched case-insensitively",
+        (currency.minor_units("usd") ?? 0) == 2)
+    say(f, "an unknown code is refused, not defaulted", currency_refuses("ZZZ"))
+    say(f, "the numeric code is carried too",
+        (currency.numeric("USD") ?? 0) == 840 and (currency.numeric("EUR") ?? 0) == 978)
+    say(f, "and the name", (currency.name("JPY") ?? "") == "Yen")
+    // Formatting: the same integer means different amounts.
+    say(f, "123456 minor units is 1,234.56 dollars",
+        (currency.format_minor(123456, "USD", "en-US") ?? "") == "1,234.56")
+    say(f, "and 123,456 yen", (currency.format_minor(123456, "JPY", "en-US") ?? "") ==
+        "123,456")
+    say(f, "and 123.456 dinars", (currency.format_minor(123456, "KWD", "en-US") ?? "") ==
+        "123.456")
+    say(f, "German puts the marks the other way round",
+        (currency.format_minor(123456, "EUR", "de-DE") ?? "") == "1.234,56")
+    say(f, "the symbol goes before the number in English",
+        (currency.format_with_symbol(123456, "USD", "en-US") ?? "").starts_with("$"))
+    say(f, "and after it in German",
+        (currency.format_with_symbol(123456, "EUR", "de-DE") ?? "").ends_with(
+            (8364).to_char()))
+    say(f, "accounting brackets a negative",
+        (currency.format_accounting(0 - 500, "USD", "en-US") ?? "").starts_with("(") and
+        (currency.format_accounting(0 - 500, "USD", "en-US") ?? "").ends_with(")"))
+    // Parsing back, and refusing an amount that does not exist.
+    say(f, "text parses to minor units",
+        (currency.parse_minor("1,234.56", "USD") ?? 0) == 123456)
+    say(f, "a yen amount has no decimals to parse",
+        (currency.parse_minor("123456", "JPY") ?? 0) == 123456)
+    say(f, "and three decimals is fine for a dinar",
+        (currency.parse_minor("123.456", "KWD") ?? 0) == 123456)
+    say(f, "but not for a dollar", currency_rejects("12.345", "USD"))
+    say(f, "a negative round-trips",
+        (currency.parse_minor("-1.00", "USD") ?? 0) == 0 - 100)
+    // Conversion across differing minor units, which is where an assumption
+    // of two decimals is off by ten.
+    say(f, "100 dollars at 0.9 is 90 euro",
+        (currency.convert(10000, "USD", "EUR", 9000) ?? 0) == 9000)
+    say(f, "100 dollars at 150 is 15,000 yen",
+        (currency.convert(10000, "USD", "JPY", 1500000) ?? 0) == 15000)
+    say(f, "and 100 yen at 0.0067 is 67 cents",
+        (currency.convert(100, "JPY", "USD", 67) ?? 0) == 67)
+    say(f, "rounding is half away from zero, once",
+        (currency.convert(1, "USD", "USD", 15000) ?? 0) == 2)
+}
+
+fn check_iban(inout f: i64) / {io} {
+    print("-- iban: the check digits are the point")
+    // Every one of these is a published example, and each passes mod-97
+    // independently.
+    for good in ["GB82 WEST 1234 5698 7654 32",
+        "DE89 3704 0044 0532 0130 00",
+        "FR14 2004 1010 0505 0001 3M02 606",
+        "NO93 8601 1117 947",
+        "MT84 MALT 0110 0001 2345 MTLC AST0 01S",
+        "KW81 CBKU 0000 0000 0000 1234 5601 01",
+        "BR15 0000 0000 0000 1093 2840 814 P2"] {
+        say(f, "{good.substr(0, 2)} validates", iban.is_valid(good))
+    }
+    let gb = "GB82WEST12345698765432"
+    say(f, "the country comes out", iban.country_of(gb) == "GB")
+    say(f, "and the check digits", iban.check_digits(gb) == "82")
+    say(f, "and the national part", iban.bban(gb) == "WEST12345698765432")
+    // The three ways it fails, each reported separately.
+    say(f, "a changed digit fails the check",
+        not iban.is_valid("GB82WEST12345698765433"))
+    say(f, "two adjacent digits swapped fails too",
+        not iban.is_valid("GB82WEST12345698764532"))
+    say(f, "a short one fails on length, not on the check",
+        not iban.is_valid("DE8937040044053201300"))
+    say(f, "and an unknown country is refused", not iban.is_valid("ZZ82WEST1234569876"))
+    say(f, "the length table knows Germany is 22 and Malta 31",
+        iban.length_for("DE") == 22 and iban.length_for("MT") == 31)
+    say(f, "and Norway 15, which is the shortest", iban.length_for("NO") == 15)
+    say(f, "the table covers most of Europe and beyond",
+        iban.countries().len() > 70)
+    // Building one, which is what a bank does.
+    say(f, "the check digits can be computed",
+        (iban.compute_check_digits("GB", "WEST12345698765432") ?? "") == "82")
+    say(f, "and a built IBAN validates",
+        iban.is_valid(iban.build("DE", "370400440532013000") ?? ""))
+    say(f, "the printed form groups in fours",
+        iban.format_printed(gb) == "GB82 WEST 1234 5698 7654 32")
+    say(f, "and normalising undoes that",
+        iban.normalise("GB82 WEST 1234 5698 7654 32") == gb)
+    say(f, "masking keeps the ends", iban.masked(gb) == "GB82**************5432")
+    // BICs, the other half.
+    say(f, "an eight-character BIC is valid", iban.is_valid_bic("DEUTDEFF"))
+    say(f, "and an eleven-character one", iban.is_valid_bic("DEUTDEFF500"))
+    say(f, "nine is not", not iban.is_valid_bic("DEUTDEFF5"))
+    say(f, "the country is in the middle", iban.bic_country("DEUTDEFF") == "DE")
+    say(f, "a test BIC is marked and must not reach production",
+        iban.is_test_bic("DEUTDEF0") and not iban.is_test_bic("DEUTDEFF"))
+    say(f, "and an IBAN and a BIC can be checked against each other",
+        iban.countries_agree("DE89370400440532013000", "DEUTDEFF") and
+        not iban.countries_agree(gb, "DEUTDEFF"))
+}
+
+fn main() / {io} {
+    var f = 0
+
+    check_migrate(f)
+    check_locale(f)
+    check_i18n(f)
+    check_currency(f)
+    check_iban(f)
+
+    if f == 0 {
+        print("config II: every claim held")
+    } else {
+        print("config II: {f} failed")
+    }
+}

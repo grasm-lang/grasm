@@ -1,0 +1,6 @@
+[package]
+name = "treeview"
+version = "1.0.0"
+
+# Trees drawn as text. Opens nothing.
+capabilities = []

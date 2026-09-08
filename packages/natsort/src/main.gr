@@ -1,0 +1,262 @@
+// Sorting text the way a person expects, which is not the way bytes do.
+//
+// `sort` puts `file10` before `file9`, because `1` is before `9`. Every file
+// manager, every release-notes generator and every list of versions has to
+// fix that, and the fix is always the same: compare runs of digits as
+// numbers and runs of everything else as text.
+//
+// The three details that separate a working implementation from one that
+// looks right:
+//
+//   - **Leading zeros.** `file007` and `file7` are the same number. They must
+//     compare equal on the number and then break the tie on the text, or the
+//     sort is unstable and a listing reorders itself between runs.
+//   - **Numbers longer than an integer.** A 40-digit run in a hash is a
+//     number no `i64` holds. Comparing digit runs by length-then-lexically
+//     gets it right without arbitrary-precision arithmetic.
+//   - **Case.** `Apple` before `apple` is what bytes say and not what anyone
+//     wants. Case-insensitive first, exact as the tie-break, so the order is
+//     still total.
+
+fn is_digit(c: str) -> bool {
+    return c >= "0" and c <= "9"
+}
+
+/// Compare two runs of digits as numbers, whatever their length.
+///
+/// Leading zeros are stripped, then the longer run is the larger number, and
+/// equal lengths compare character by character. No parsing, so a 40-digit
+/// run works exactly as a two-digit one does.
+fn compare_digits(a: str, b: str) -> i64 {
+    var x = a
+    var y = b
+    while x.len() > 1 and x.starts_with("0") {
+        x = x.substr(1, x.len() - 1)
+    }
+    while y.len() > 1 and y.starts_with("0") {
+        y = y.substr(1, y.len() - 1)
+    }
+    if x.len() != y.len() {
+        if x.len() < y.len() {
+            return 0 - 1
+        }
+        return 1
+    }
+    if x < y {
+        return 0 - 1
+    }
+    if x > y {
+        return 1
+    }
+    return 0
+}
+
+/// The natural comparison: -1, 0 or 1.
+pub fn compare(a: str, b: str) -> i64 {
+    return compare_with(a, b, true)
+}
+
+/// The same, with case sensitivity as a choice.
+pub fn compare_with(a: str, b: str, fold_case: bool) -> i64 {
+    let left = if fold_case { a.to_lower() } else { a }
+    let right = if fold_case { b.to_lower() } else { b }
+    let x = left.chars()
+    let y = right.chars()
+    var i = 0
+    var j = 0
+    while i < x.len() and j < y.len() {
+        if is_digit(x[i]) and is_digit(y[j]) {
+            var run_x = ""
+            while i < x.len() and is_digit(x[i]) {
+                run_x = run_x + x[i]
+                i = i + 1
+            }
+            var run_y = ""
+            while j < y.len() and is_digit(y[j]) {
+                run_y = run_y + y[j]
+                j = j + 1
+            }
+            let order = compare_digits(run_x, run_y)
+            if order != 0 {
+                return order
+            }
+            continue
+        }
+        if x[i] != y[j] {
+            if x[i] < y[j] {
+                return 0 - 1
+            }
+            return 1
+        }
+        i = i + 1
+        j = j + 1
+    }
+    if i < x.len() {
+        return 1
+    }
+    if j < y.len() {
+        return 0 - 1
+    }
+    // Equal ignoring case and leading zeros. The exact text breaks the tie,
+    // so the order is total and a sort is stable between runs.
+    if fold_case and a != b {
+        if a < b {
+            return 0 - 1
+        }
+        return 1
+    }
+    return 0
+}
+
+/// A sort key that a plain lexicographic sort orders naturally.
+///
+/// Every digit run is stripped of leading zeros and padded to a fixed width,
+/// so `9` becomes `00000000000000000009` and `10` becomes
+/// `00000000000000000010`, and the shorter number sorts first without a
+/// comparator. That is what lets a database index or a language's own `sort`
+/// produce the right order.
+///
+/// Padding rather than a length marker, because a marker byte would sort
+/// before every ordinary character and move digits ahead of punctuation:
+/// `a-1` belongs before `a2`, and a key that puts it after disagrees with
+/// `compare` on the same input.
+///
+/// A run longer than twenty digits orders by its first twenty. Nothing that
+/// is really a number is that long, and `compare` is exact for any length.
+pub fn key_width() -> i64 {
+    return 20
+}
+
+pub fn sort_key(text: str) -> str {
+    let cs = text.to_lower().chars()
+    var out = ""
+    var i = 0
+    while i < cs.len() {
+        if is_digit(cs[i]) {
+            var run = ""
+            while i < cs.len() and is_digit(cs[i]) {
+                run = run + cs[i]
+                i = i + 1
+            }
+            while run.len() > 1 and run.starts_with("0") {
+                run = run.substr(1, run.len() - 1)
+            }
+            while run.len() < key_width() {
+                run = "0" + run
+            }
+            out = out + run
+            continue
+        }
+        out = out + cs[i]
+        i = i + 1
+    }
+    return out
+}
+
+/// Sorted naturally.
+pub fn sorted(items: [str]) -> [str] {
+    var keyed: [(str, str)] = []
+    for item in items {
+        keyed.push((sort_key(item), item))
+    }
+    keyed.sort()
+    var out: [str] = []
+    for k in keyed {
+        out.push(k.1)
+    }
+    return out
+}
+
+pub fn sorted_descending(items: [str]) -> [str] {
+    return sorted(items).rev()
+}
+
+/// Whether a list is already in natural order.
+pub fn is_sorted(items: [str]) -> bool {
+    for i in 1..items.len() {
+        if compare(items[i - 1], items[i]) > 0 {
+            return false
+        }
+    }
+    return true
+}
+
+/// A version-aware comparison, where a pre-release sorts before its release.
+///
+/// `1.0.0-rc1` is *before* `1.0.0`, which natural order alone gets backwards
+/// because the extra text makes the string longer. The rule is semver's and
+/// it exists because a release candidate is not a release.
+pub fn compare_version(a: str, b: str) -> i64 {
+    let a_at = a.index_of("-") ?? a.len()
+    let b_at = b.index_of("-") ?? b.len()
+    let a_core = a.substr(0, a_at)
+    let b_core = b.substr(0, b_at)
+    let order = compare(a_core, b_core)
+    if order != 0 {
+        return order
+    }
+    let a_pre = a_at < a.len()
+    let b_pre = b_at < b.len()
+    if a_pre and not b_pre {
+        return 0 - 1
+    }
+    if b_pre and not a_pre {
+        return 1
+    }
+    if not a_pre and not b_pre {
+        return 0
+    }
+    return compare(a.substr(a_at, a.len() - a_at), b.substr(b_at, b.len() - b_at))
+}
+
+pub fn sorted_versions(items: [str]) -> [str] {
+    // A selection sort, because `sort_by` needs a key and a version's order
+    // is a comparison rather than a key.
+    var rest = items
+    var out: [str] = []
+    while rest.len() > 0 {
+        var best = 0
+        for i in 1..rest.len() {
+            if compare_version(rest[i], rest[best]) < 0 {
+                best = i
+            }
+        }
+        out.push(rest[best])
+        rest = rest.slice(0, best) + rest.slice(best + 1, rest.len())
+    }
+    return out
+}
+
+/// Sort file names with their extension considered separately.
+///
+/// `a.txt` before `a1.txt` before `a2.txt`, which sorting the whole name
+/// gets right, and `report.txt` before `report.zip`, which it also does —
+/// the reason this exists is the case where a name and a longer name share a
+/// prefix: `a.txt` and `a-1.txt` sort by the stem, not by the dot.
+pub fn sorted_filenames(items: [str]) -> [str] {
+    var keyed: [(str, str, str)] = []
+    for item in items {
+        var stem = item
+        var extension = ""
+        let cs = item.chars()
+        var i = cs.len() - 1
+        while i > 0 {
+            if cs[i] == "." {
+                stem = item.substr(0, i)
+                extension = item.substr(i, item.len() - i)
+                break
+            }
+            i = i - 1
+        }
+        // Three components rather than a joined key: a tuple compares by
+        // component, so a stem that is a prefix of another sorts first
+        // instead of being run together with its extension.
+        keyed.push((sort_key(stem), sort_key(extension), item))
+    }
+    keyed.sort()
+    var out: [str] = []
+    for k in keyed {
+        out.push(k.2)
+    }
+    return out
+}

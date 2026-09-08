@@ -1,0 +1,366 @@
+// Translating messages, and the two things that make it more than a lookup.
+//
+// **Plurals.** English has two forms and it is the exception. Russian has
+// three, Arabic six, Japanese one, and which form a number takes is a rule
+// per language rather than `n == 1`. A message written as "1 file" / "n
+// files" cannot be translated into any of them, which is why the catalogue
+// stores a form *per category* and the code asks for a category rather than
+// deciding one.
+//
+// **Missing keys.** A lookup that falls back to the key silently ships an
+// interface with English scattered through it and no way to find out. So a
+// miss is reportable: `missing` names every key a run asked for and did not
+// find, which is what makes a translation coverage number possible.
+//
+// Placeholders are `{name}` and are substituted, never formatted — a number
+// belongs to `locale`, and doing it here would make the catalogue's meaning
+// depend on which package rendered it.
+import locale
+
+type Catalogue = {
+    tag: str,
+    key: [str],
+    /// One entry per key. A plural message stores its forms joined by U+241E.
+    value: [str],
+    /// Keys asked for and not found, in the order first asked.
+    missing: [str],
+}
+
+type I18nError =
+    | NoSuchKey(key: str)
+    | BadPlural(key: str, category: str)
+
+pub let ZERO = "zero"
+pub let ONE = "one"
+pub let TWO = "two"
+pub let FEW = "few"
+pub let MANY = "many"
+pub let OTHER = "other"
+
+fn separator() -> str {
+    // A record separator, which cannot appear in a translated message.
+    return (9246).to_char()
+}
+
+pub fn new_catalogue(tag: str) -> Catalogue {
+    return Catalogue{ tag: tag, key: [], value: [], missing: [] }
+}
+
+pub fn define(inout c: Catalogue, key: str, message: str) {
+    for i in 0..c.key.len() {
+        if c.key[i] == key {
+            c.value[i] = message
+            return
+        }
+    }
+    c.key.push(key)
+    c.value.push(message)
+}
+
+/// A plural message: one form per category, in the order given.
+pub fn define_plural(inout c: Catalogue, key: str, categories: [str],
+    forms: [str]) {
+    var parts: [str] = []
+    for i in 0..categories.len() {
+        if i < forms.len() {
+            parts.push(categories[i] + "=" + forms[i])
+        }
+    }
+    define(c, key, parts.join(separator()))
+}
+
+fn find(c: Catalogue, key: str) -> Option[str] {
+    for i in 0..c.key.len() {
+        if c.key[i] == key {
+            return Some(c.value[i])
+        }
+    }
+    return None
+}
+
+pub fn has(c: Catalogue, key: str) -> bool {
+    return find(c, key) != None
+}
+
+/// Substitute `{name}` placeholders. An unknown name is left as written,
+/// because deleting it hides a mistake in the catalogue.
+pub fn interpolate(message: str, names: [str], values: [str]) -> str {
+    var out = message
+    for i in 0..names.len() {
+        if i < values.len() {
+            let open = (123).to_char()
+            out = out.replace(open + names[i] + "}", values[i])
+        }
+    }
+    return out
+}
+
+/// Look up a key, recording a miss.
+pub fn get(inout c: Catalogue, key: str) -> str {
+    match find(c, key) {
+        Some(v) -> return v
+        None -> {
+            if not c.missing.contains(key) {
+                c.missing.push(key)
+            }
+            // The key itself, which is at least legible and searchable —
+            // and `missing` is what makes it findable in bulk.
+            return key
+        }
+    }
+}
+
+pub fn translate(inout c: Catalogue, key: str, names: [str],
+    values: [str]) -> str {
+    return interpolate(get(c, key), names, values)
+}
+
+/// The plural category for `n` in a language.
+///
+/// The rules are CLDR's, for the languages named; anything else gets the
+/// two-form English rule, and `has_plural_rule` says which is which. A wrong
+/// category is a grammatical error in somebody's language, so the honest
+/// thing is to say what is covered.
+pub fn plural_category(tag: str, n: i64) -> str {
+    let language = tag.to_lower().split("-")[0]
+    // One form: the count never changes the noun.
+    if ["ja", "zh", "ko", "vi", "th", "id", "ms", "lo", "my", "km"]
+        .contains(language) {
+        return OTHER
+    }
+    if language == "fr" or language == "pt" {
+        // 0 and 1 share a form, which English does not.
+        if n == 0 or n == 1 {
+            return ONE
+        }
+        return OTHER
+    }
+    if language == "ru" or language == "uk" or language == "be" {
+        let last = n % 10
+        let last_two = n % 100
+        if last == 1 and last_two != 11 {
+            return ONE
+        }
+        if last >= 2 and last <= 4 and (last_two < 12 or last_two > 14) {
+            return FEW
+        }
+        return MANY
+    }
+    if language == "pl" {
+        let last = n % 10
+        let last_two = n % 100
+        if n == 1 {
+            return ONE
+        }
+        if last >= 2 and last <= 4 and (last_two < 12 or last_two > 14) {
+            return FEW
+        }
+        return MANY
+    }
+    if language == "cs" or language == "sk" {
+        if n == 1 {
+            return ONE
+        }
+        if n >= 2 and n <= 4 {
+            return FEW
+        }
+        return OTHER
+    }
+    if language == "ar" {
+        let last_two = n % 100
+        if n == 0 {
+            return ZERO
+        }
+        if n == 1 {
+            return ONE
+        }
+        if n == 2 {
+            return TWO
+        }
+        if last_two >= 3 and last_two <= 10 {
+            return FEW
+        }
+        if last_two >= 11 and last_two <= 99 {
+            return MANY
+        }
+        return OTHER
+    }
+    if language == "cy" {
+        if n == 0 {
+            return ZERO
+        }
+        if n == 1 {
+            return ONE
+        }
+        if n == 2 {
+            return TWO
+        }
+        if n == 3 {
+            return FEW
+        }
+        if n == 6 {
+            return MANY
+        }
+        return OTHER
+    }
+    if n == 1 {
+        return ONE
+    }
+    return OTHER
+}
+
+pub fn has_plural_rule(tag: str) -> bool {
+    let language = tag.to_lower().split("-")[0]
+    return ["ja", "zh", "ko", "vi", "th", "id", "ms", "lo", "my", "km", "fr",
+        "pt", "ru", "uk", "be", "pl", "cs", "sk", "ar", "cy", "en", "de", "es",
+        "it", "nl", "sv", "nb", "da", "fi", "tr", "he"].contains(language)
+}
+
+/// How many forms a language needs — the number a translator is handed.
+pub fn plural_forms(tag: str) -> [str] {
+    var out: [str] = []
+    for n in [0, 1, 2, 3, 5, 6, 11, 21, 101] {
+        let category = plural_category(tag, n)
+        if not out.contains(category) {
+            out.push(category)
+        }
+    }
+    return out
+}
+
+/// A plural message for `n`, falling back to `other` when the exact category
+/// is absent from the catalogue.
+pub fn plural(inout c: Catalogue, key: str, n: i64, names: [str],
+    values: [str]) -> str {
+    let raw = get(c, key)
+    let category = plural_category(c.tag, n)
+    var fallback = ""
+    for piece in raw.split(separator()) {
+        match piece.index_of("=") {
+            Some(at) -> {
+                let name = piece.substr(0, at)
+                let form = piece.substr(at + 1, piece.len() - at - 1)
+                if name == category {
+                    return interpolate(form, names, values)
+                }
+                if name == OTHER {
+                    fallback = form
+                }
+            }
+            None -> {}
+        }
+    }
+    if fallback != "" {
+        return interpolate(fallback, names, values)
+    }
+    return interpolate(raw, names, values)
+}
+
+/// A chain of catalogues, most specific first.
+///
+/// The fallback that stops `de-CH` from being all-or-nothing: a key the Swiss
+/// catalogue does not override comes from the German one, and only a key
+/// neither has is missing.
+pub fn get_from(inout chain: [Catalogue], key: str) -> str {
+    for i in 0..chain.len() {
+        match find(chain[i], key) {
+            Some(v) -> return v
+            None -> {}
+        }
+    }
+    if chain.len() > 0 and not chain[0].missing.contains(key) {
+        chain[0].missing.push(key)
+    }
+    return key
+}
+
+/// Build the chain for a locale out of the catalogues available.
+pub fn chain_for(tag: str, available: [Catalogue]) -> [Catalogue] {
+    var out: [Catalogue] = []
+    match locale.parse(tag) {
+        Ok(t) -> {
+            for want in locale.fallbacks(t) {
+                for c in available {
+                    if c.tag.to_lower() == want.to_lower() {
+                        out.push(c)
+                    }
+                }
+            }
+        }
+        Err(_e) -> {}
+    }
+    return out
+}
+
+pub fn missing_keys(c: Catalogue) -> [str] {
+    return c.missing
+}
+
+/// What share of `keys` this catalogue defines, in percent.
+///
+/// The number a release checks before shipping a language: 100 means every
+/// message has a translation, and anything less names which.
+pub fn coverage_percent(c: Catalogue, keys: [str]) -> i64 {
+    if keys.len() == 0 {
+        return 100
+    }
+    var found = 0
+    for k in keys {
+        if has(c, k) {
+            found = found + 1
+        }
+    }
+    return found * 100 / keys.len()
+}
+
+pub fn untranslated(c: Catalogue, keys: [str]) -> [str] {
+    var out: [str] = []
+    for k in keys {
+        if not has(c, k) {
+            out.push(k)
+        }
+    }
+    return out
+}
+
+/// Placeholders a message uses, so a translation can be checked against the
+/// original for the ones it dropped.
+pub fn placeholders(message: str) -> [str] {
+    var out: [str] = []
+    let cs = message.chars()
+    var i = 0
+    let open = (123).to_char()
+    while i < cs.len() {
+        if cs[i] == open {
+            var name = ""
+            var j = i + 1
+            while j < cs.len() and cs[j] != "}" {
+                name = name + cs[j]
+                j = j + 1
+            }
+            if j < cs.len() and name != "" and not out.contains(name) {
+                out.push(name)
+            }
+            i = j + 1
+            continue
+        }
+        i = i + 1
+    }
+    return out
+}
+
+/// Placeholders the translation is missing, compared with the original.
+///
+/// The check that catches the translated string which lost its `{count}` —
+/// which renders as a sentence with a hole in it, in production, in a
+/// language nobody on the team reads.
+pub fn lost_placeholders(original: str, translated: str) -> [str] {
+    var out: [str] = []
+    let have = placeholders(translated)
+    for p in placeholders(original) {
+        if not have.contains(p) {
+            out.push(p)
+        }
+    }
+    return out
+}

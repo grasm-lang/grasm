@@ -1,0 +1,245 @@
+// Test data that is the same every run, and different every row.
+//
+// Two failures this exists to prevent, and they pull in opposite directions:
+//
+//   - **Data that is the same every row.** A hundred users all called "Test
+//     User" will not find the bug where two users with the same name collide,
+//     and a unique index over a fixture like that passes because there is
+//     only one distinct value.
+//   - **Data that is different every run.** A fixture built from a real
+//     random source produces a failure that cannot be reproduced, which is
+//     the worst kind: the test is red on CI and green on the machine that has
+//     to fix it.
+//
+// So everything here is derived from a seed. The same seed gives the same
+// hundred rows on every machine and every engine; a different seed gives a
+// different hundred. When a test fails, the seed is printed and the failure
+// is reproducible by definition.
+//
+// The generator is a small counter-based one rather than a chain: `value(n)`
+// depends only on `n`, so row 57 can be produced without producing rows 1 to
+// 56, and two fields of one row cannot accidentally share a stream.
+
+type FixtureSource = {
+    seed: i64,
+    /// How many values have been drawn, so a sequence is reproducible.
+    drawn: i64,
+}
+
+pub fn from_seed(seed: i64) -> FixtureSource {
+    return FixtureSource{ seed: if seed == 0 { 1 } else { seed }, drawn: 0 }
+}
+
+fn mask32(v: i64) -> i64 {
+    return v.bit_and(4294967295)
+}
+
+fn mul32(a: i64, b: i64) -> i64 {
+    let hi = a / 65536
+    let lo = a % 65536
+    return mask32((hi * b) % 65536 * 65536 + lo * b)
+}
+
+/// The `n`th value from a seed, with no state between them.
+///
+/// Counter-based rather than a chain, so `value(s, 57)` is answerable
+/// directly. A chained generator makes a fixture's tenth field depend on how
+/// many fields the ones before it drew, which is why adding a column to a
+/// fixture used to change every value after it.
+pub fn value(s: FixtureSource, n: i64) -> i64 {
+    var h = mask32(s.seed + mul32(mask32(n), 2654435761))
+    h = h.bit_xor(h.ushr(16))
+    h = mul32(h, 2246822507)
+    h = h.bit_xor(h.ushr(13))
+    h = mul32(h, 3266489909)
+    return mask32(h.bit_xor(h.ushr(16)))
+}
+
+/// The next value, advancing the source.
+pub fn next(inout s: FixtureSource) -> i64 {
+    let v = value(s, s.drawn)
+    s.drawn = s.drawn + 1
+    return v
+}
+
+pub fn drawn(s: FixtureSource) -> i64 {
+    return s.drawn
+}
+
+pub fn reset(inout s: FixtureSource) {
+    s.drawn = 0
+}
+
+/// A value in `low..high`, inclusive of both.
+pub fn between(s: FixtureSource, n: i64, low: i64, high: i64) -> i64 {
+    if high <= low {
+        return low
+    }
+    return low + value(s, n) % (high - low + 1)
+}
+
+pub fn boolean(s: FixtureSource, n: i64) -> bool {
+    return value(s, n) % 2 == 0
+}
+
+/// One of `choices`.
+pub fn pick(s: FixtureSource, n: i64, choices: [str]) -> str {
+    if choices.len() == 0 {
+        return ""
+    }
+    return choices[value(s, n) % choices.len()]
+}
+
+fn first_names() -> [str] {
+    return ["Ada", "Grace", "Alan", "Edsger", "Barbara", "Ken", "Dennis",
+        "Margaret", "Donald", "Frances", "Tony", "Katherine", "Niklaus",
+        "Radia", "Leslie", "Adele", "Bjarne", "Anita", "Rob", "Jean"]
+}
+
+fn surnames() -> [str] {
+    return ["Lovelace", "Hopper", "Turing", "Dijkstra", "Liskov", "Thompson",
+        "Ritchie", "Hamilton", "Knuth", "Allen", "Hoare", "Johnson", "Wirth",
+        "Perlman", "Lamport", "Goldberg", "Stroustrup", "Borg", "Pike",
+        "Sammet"]
+}
+
+fn domains() -> [str] {
+    return ["example.com", "example.org", "example.net", "test.invalid",
+        "sample.test"]
+}
+
+fn streets() -> [str] {
+    return ["High Street", "Station Road", "Church Lane", "Park Avenue",
+        "Mill Lane", "Victoria Road", "Green Lane", "Kings Road"]
+}
+
+fn cities() -> [str] {
+    return ["Bristol", "Leeds", "Cardiff", "Aberdeen", "Cork", "Utrecht",
+        "Bergen", "Lund", "Ghent", "Porto"]
+}
+
+/// A person's name. The number is part of it, so a hundred rows have a
+/// hundred distinct names even though the word list is short.
+pub fn person_name(s: FixtureSource, n: i64) -> str {
+    let first = pick(s, n * 3, first_names())
+    let last = pick(s, n * 3 + 1, surnames())
+    return "{first} {last}"
+}
+
+/// An email address that is unique per row and syntactically valid.
+///
+/// The `+n` tag is what makes them distinct without making them unrealistic:
+/// it is the form a real user actually types, and a system that mishandles a
+/// plus in an address will fail here rather than in production.
+pub fn email(s: FixtureSource, n: i64) -> str {
+    let first = pick(s, n * 3, first_names()).to_lower()
+    let last = pick(s, n * 3 + 1, surnames()).to_lower()
+    let domain = pick(s, n * 3 + 2, domains())
+    return "{first}.{last}+{n}@{domain}"
+}
+
+pub fn street_address(s: FixtureSource, n: i64) -> str {
+    let number = between(s, n * 4, 1, 250)
+    let street = pick(s, n * 4 + 1, streets())
+    return "{number} {street}"
+}
+
+pub fn city(s: FixtureSource, n: i64) -> str {
+    return pick(s, n, cities())
+}
+
+/// Lorem-style words drawn from a fixed list.
+///
+/// Deliberately English words rather than Latin: a layout tested with `lorem
+/// ipsum` is tested with a word-length distribution no real language has.
+pub fn words(s: FixtureSource, n: i64, count: i64) -> str {
+    let list = ["time", "person", "year", "way", "day", "thing", "man",
+        "world", "life", "hand", "part", "child", "eye", "woman", "place",
+        "work", "week", "case", "point", "government", "company", "number",
+        "group", "problem", "fact", "system", "programme", "question",
+        "water", "money"]
+    var out: [str] = []
+    for i in 0..count {
+        out.push(list[value(s, n * 100 + i) % list.len()])
+    }
+    return out.join(" ")
+}
+
+pub fn sentence(s: FixtureSource, n: i64) -> str {
+    let body = words(s, n, between(s, n, 4, 12))
+    return body.substr(0, 1).to_upper() + body.substr(1, body.len() - 1) + "."
+}
+
+/// A timestamp within `days` of `origin`, in seconds.
+pub fn timestamp(s: FixtureSource, n: i64, origin: i64, days: i64) -> i64 {
+    return origin + between(s, n, 0, days * 86400)
+}
+
+/// A hexadecimal identifier of `length` characters.
+pub fn hex_id(s: FixtureSource, n: i64, length: i64) -> str {
+    var out = ""
+    var i = 0
+    while out.len() < length {
+        let v = value(s, n * 1000 + i)
+        for k in 0..8 {
+            if out.len() < length {
+                out = out + v.ushr(k * 4).bit_and(15).to_base(16)
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+/// `count` distinct values from `make`, retried until they are distinct.
+///
+/// The retry is the point: a generator over a short word list produces
+/// duplicates, and a fixture for a unique column has to have none or the test
+/// passes for the wrong reason.
+pub fn distinct(count: i64, make: fn(i64) -> str) -> [str] {
+    var out: [str] = []
+    var n = 0
+    // Bounded, so a generator that cannot produce `count` distinct values
+    // says so by returning fewer rather than running forever.
+    while out.len() < count and n < count * 100 {
+        let v = make(n)
+        if not out.contains(v) {
+            out.push(v)
+        }
+        n = n + 1
+    }
+    return out
+}
+
+/// A shuffle that depends only on the seed.
+pub fn shuffled(s: FixtureSource, items: [str]) -> [str] {
+    var out = items
+    var i = out.len() - 1
+    var n = 0
+    while i > 0 {
+        let j = value(s, n) % (i + 1)
+        let hold = out[i]
+        out[i] = out[j]
+        out[j] = hold
+        i = i - 1
+        n = n + 1
+    }
+    return out
+}
+
+/// `count` of `items`, without repeats — a sample rather than a shuffle.
+pub fn sample(s: FixtureSource, items: [str], count: i64) -> [str] {
+    let mixed = shuffled(s, items)
+    if count >= mixed.len() {
+        return mixed
+    }
+    return mixed.slice(0, count)
+}
+
+/// The seed as a line to print when a test fails.
+///
+/// The whole reason the source is seeded: a red test names the seed, and the
+/// person fixing it reproduces the exact data.
+pub fn describe(s: FixtureSource) -> str {
+    return "fixture seed {s.seed} ({s.drawn} values drawn)"
+}

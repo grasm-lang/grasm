@@ -1,0 +1,268 @@
+// Applying schema changes in order, once each, and knowing when someone has
+// changed one after it ran.
+//
+// The hard parts of migrations are not the SQL. They are:
+//
+//   - **Editing a migration that has already run.** The database has the old
+//     shape and the file describes a new one; nothing notices unless the
+//     checksum was recorded when it ran. That is the single most common way a
+//     staging environment quietly diverges from production.
+//   - **Two branches adding a migration at the same time.** Both get the next
+//     number, both merge, and one runs after a *later* migration has already
+//     been applied. Detecting that is a comparison of the applied set against
+//     the plan, not a maximum.
+//   - **Knowing what will run before it runs.** A plan a person can read
+//     beforehand is the difference between a deploy and a hope.
+//
+// Nothing here executes anything. A step carries a name and a body, the
+// caller runs the body, and this decides what to run, in what order, and
+// whether the state it was handed makes sense.
+
+type MigrationStep = {
+    /// Sorts the plan. Two steps may not share one.
+    id: str,
+    name: str,
+    /// What running it does; opaque here, applied by the caller.
+    up: str,
+    /// Empty when the step cannot be undone, which is worth saying out loud.
+    down: str,
+}
+
+type AppliedStep = {
+    id: str,
+    checksum: i64,
+    /// Whatever the caller uses for time; only compared, never interpreted.
+    at: i64,
+}
+
+type MigrationPlan = {
+    /// Steps to run, in order.
+    pending: [MigrationStep],
+    /// Applied steps whose file has changed since.
+    changed: [str],
+    /// Applied steps no longer in the plan at all.
+    unknown: [str],
+    /// Pending steps that sort *before* something already applied.
+    out_of_order: [str],
+}
+
+type MigrateError =
+    | DuplicateId(id: str)
+    | Unordered(id: str, after: str)
+    | NoSuchStep(id: str)
+    | Irreversible(id: str)
+
+pub fn step(id: str, name: str, up: str, down: str) -> MigrationStep {
+    return MigrationStep{ id: id, name: name, up: up, down: down }
+}
+
+pub fn applied(id: str, checksum: i64, at: i64) -> AppliedStep {
+    return AppliedStep{ id: id, checksum: checksum, at: at }
+}
+
+/// A step's checksum: FNV-1a over its id and body.
+///
+/// Over the body *and* the id, so renaming a file without changing its
+/// contents is also a change — because to the database it is a different
+/// migration with the same effect, and both facts matter.
+pub fn checksum(s: MigrationStep) -> i64 {
+    var h = 2166136261
+    let text = s.id + "\n" + s.up
+    for b in text.to_bytes().to_list() {
+        h = h.bit_xor(b)
+        h = h * 16777619 % 4294967296
+    }
+    return h
+}
+
+/// Steps sorted by id, with duplicates refused.
+pub fn ordered(steps: [MigrationStep]) -> [MigrationStep] ! MigrateError {
+    var seen: [str] = []
+    for s in steps {
+        if seen.contains(s.id) {
+            fail(DuplicateId(s.id))
+        }
+        seen.push(s.id)
+    }
+    var out = steps
+    out.sort_by(|s| s.id)
+    return out
+}
+
+fn applied_ids(history: [AppliedStep]) -> [str] {
+    var out: [str] = []
+    for a in history {
+        out.push(a.id)
+    }
+    return out
+}
+
+/// What would happen, given the steps on disk and the history in the database.
+///
+/// Every category is reported rather than the first problem: a deploy that
+/// stops at the first surprise and hides the other three is a deploy that
+/// takes four attempts.
+pub fn plan(steps: [MigrationStep], history: [AppliedStep]) -> MigrationPlan ! MigrateError {
+    let sorted = try ordered(steps)
+    let done = applied_ids(history)
+    var pending: [MigrationStep] = []
+    var changed: [str] = []
+    var unknown: [str] = []
+    var out_of_order: [str] = []
+    // The highest id already applied: anything pending below it is arriving
+    // late, which is the two-branches case.
+    var highest = ""
+    for a in history {
+        if a.id > highest {
+            highest = a.id
+        }
+    }
+    for s in sorted {
+        var was_applied = false
+        for a in history {
+            if a.id == s.id {
+                was_applied = true
+                if a.checksum != checksum(s) {
+                    changed.push(s.id)
+                }
+            }
+        }
+        if not was_applied {
+            pending.push(s)
+            if highest != "" and s.id < highest {
+                out_of_order.push(s.id)
+            }
+        }
+    }
+    var known: [str] = []
+    for s in sorted {
+        known.push(s.id)
+    }
+    for id in done {
+        if not known.contains(id) {
+            unknown.push(id)
+        }
+    }
+    return MigrationPlan{
+        pending: pending, changed: changed, unknown: unknown,
+        out_of_order: out_of_order,
+    }
+}
+
+/// Whether the plan is safe to run without a human looking at it.
+pub fn is_clean(p: MigrationPlan) -> bool {
+    return p.changed.len() == 0 and p.unknown.len() == 0 and
+    p.out_of_order.len() == 0
+}
+
+pub fn pending_count(p: MigrationPlan) -> i64 {
+    return p.pending.len()
+}
+
+/// The plan as lines, for printing before anything runs.
+pub fn describe(p: MigrationPlan) -> [str] {
+    var out: [str] = []
+    for s in p.pending {
+        out.push("apply  {s.id}  {s.name}")
+    }
+    for id in p.changed {
+        out.push("CHANGED  {id}  applied, and the file has changed since")
+    }
+    for id in p.unknown {
+        out.push("UNKNOWN  {id}  applied, and no longer in the plan")
+    }
+    for id in p.out_of_order {
+        out.push("LATE  {id}  sorts before something already applied")
+    }
+    if out.len() == 0 {
+        out.push("nothing to do")
+    }
+    return out
+}
+
+/// The bodies to run, in order — what a caller feeds to its database.
+pub fn up_scripts(p: MigrationPlan) -> [str] {
+    var out: [str] = []
+    for s in p.pending {
+        out.push(s.up)
+    }
+    return out
+}
+
+/// Roll back the last `count` applied steps, newest first.
+///
+/// Refuses at the first step with no `down`, and refuses *before* running
+/// anything: a rollback that gets three steps in and then finds an
+/// irreversible one has left the schema somewhere nobody has ever tested.
+pub fn rollback(steps: [MigrationStep], history: [AppliedStep],
+    count: i64) -> [MigrationStep] ! MigrateError {
+    var newest = history
+    newest.sort_by(|a| a.id)
+    var out: [MigrationStep] = []
+    var i = newest.len() - 1
+    while i >= 0 and out.len() < count {
+        var found = false
+        for s in steps {
+            if s.id == newest[i].id {
+                if s.down == "" {
+                    fail(Irreversible(s.id))
+                }
+                out.push(s)
+                found = true
+            }
+        }
+        if not found {
+            fail(NoSuchStep(newest[i].id))
+        }
+        i = i - 1
+    }
+    return out
+}
+
+pub fn down_scripts(steps: [MigrationStep]) -> [str] {
+    var out: [str] = []
+    for s in steps {
+        out.push(s.down)
+    }
+    return out
+}
+
+/// The history after applying a step, so a caller can record it.
+pub fn record(history: [AppliedStep], s: MigrationStep, at: i64) -> [AppliedStep] {
+    var out = history
+    out.push(AppliedStep{ id: s.id, checksum: checksum(s), at: at })
+    return out
+}
+
+/// Whether every step in the plan has a way back.
+pub fn is_reversible(steps: [MigrationStep]) -> bool {
+    for s in steps {
+        if s.down == "" {
+            return false
+        }
+    }
+    return true
+}
+
+/// The id a new step should take, given what exists: the day plus a counter.
+///
+/// A timestamp rather than a sequence number, because two branches picking
+/// the next sequence number is exactly the collision this package reports.
+pub fn next_id(steps: [MigrationStep], stamp: str) -> str {
+    var suffix = 1
+    var candidate = "{stamp}_{suffix}"
+    var taken = true
+    while taken {
+        taken = false
+        for s in steps {
+            if s.id == candidate {
+                taken = true
+            }
+        }
+        if taken {
+            suffix = suffix + 1
+            candidate = "{stamp}_{suffix}"
+        }
+    }
+    return candidate
+}

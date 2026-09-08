@@ -1,0 +1,6 @@
+[package]
+name = "fixtureset"
+version = "1.0.0"
+
+# Test data built the same way every time. Opens nothing.
+capabilities = []

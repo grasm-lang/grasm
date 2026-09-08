@@ -1,0 +1,6 @@
+[package]
+name = "natsort"
+version = "1.0.0"
+
+# Sorting the way a person would. Opens nothing.
+capabilities = []

@@ -1,0 +1,6 @@
+[package]
+name = "benchtime"
+version = "1.0.0"
+
+# Turning timings into a number you can trust. Opens nothing.
+capabilities = []

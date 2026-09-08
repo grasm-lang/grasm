@@ -14,7 +14,7 @@ plan that discovers them 300 packages in.
 | | |
 |---|---|
 | Started | 78 |
-| Now | 189 |
+| Now | 200 |
 | Tier 1 target | 200 |
 | Tier 2 target | 500 |
 | Tier 3 target | 800 |
@@ -134,24 +134,26 @@ could ask "am I in a region" with a load instead of a `RefCell` borrow,
 measured **zero** on a benchmark allocating 800,000 times. The bookkeeping
 around allocation is not where the time goes.
 
-## Tier 1 — to 200 (11 remaining)
+## Tier 1 — to 200: done
 
-All buildable now. No prerequisite blocks any of it.
+Two hundred libraries, every one of which compiles, formats and lints clean,
+declares its capabilities, has its types prefixed so nothing collides, and is
+asserted against by a group demo that runs under all four engines.
 
-The last 22, with the duplicates struck out. Six names from the original
-list turned out to be packages that already exist under another name, and
-writing them would have been the failure `docs/packages-to-200.md` exists to
-prevent: `assertlib` and `fixture` are `testing`, `flags` is `cli`,
-`spinner` is `progress`, `tablefmt` is `texttable`, `plurals2` is
-`pluralize`, and `dirwalk` and `globwalk` are both `fs`. `totp` was written
-before this was noticed and has been folded into `hotp` rather than shipped
-beside it.
+Six names from the original list turned out to be packages that already
+existed under another name, and writing them would have been the failure
+`docs/packages-to-200.md` exists to prevent: `assertlib` and `fixture` are
+`testing`, `flags` is `cli`, `spinner` is `progress`, `tablefmt` is
+`texttable`, `plurals2` is `pluralize`, and `dirwalk` and `globwalk` are both
+`fs`. `totp` was written before this was noticed and folded into the `hotp`
+that already did the job. Their places went to `atomicfile`, `envcfg`,
+`ulid`, `iban`, `phonetic`, `natsort` and `fixtureset`, each of which
+something in the set actually needed.
 
-**Config / i18n** — `migrate` `i18n` `locale` `currency`
-
-**Tooling** — `benchtime` `treeview` `fixtureset`
-
-**Identifiers and text** — `ulid` `iban` `phonetic` `natsort`
+Five of the two hundred are gate harnesses rather than libraries —
+`casefolddiff`, `certdiff`, `cryptodiff`, `wasmdiff` and `zlibdiff` — and
+they are counted because they are packages that exist and are built, not
+because the number needed rounding up.
 
 ## Tier 2 — to 500
 

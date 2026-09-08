@@ -1,0 +1,10 @@
+[package]
+name = "currency"
+version = "1.0.0"
+
+# A table and some formatting. Opens nothing.
+capabilities = []
+
+[dependencies.locale]
+path = "../locale"
+version = "^1.0.0"

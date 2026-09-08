@@ -1,0 +1,442 @@
+import benchtime
+import treeview
+import ulid
+import phonetic
+import natsort
+import fixtureset
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn ulid_refuses(text: str) -> bool {
+    match ulid.parse(text) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn tree_refuses(t: TreeShape) -> bool {
+    match treeview.draw(t, treeview.ascii_style()) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn check_benchtime(inout f: i64) / {io} {
+    print("-- benchtime: the mean is the number that lies")
+    // A realistic shape: a floor of about 100 ns, most samples close to it,
+    // and three long ones from whatever else the machine was doing.
+    var timings: [i64] = []
+    for i in 0..97 {
+        timings.push(100 + i % 11)
+    }
+    timings.push(4000)
+    timings.push(9000)
+    timings.push(30000)
+    let r = benchtime.report(benchtime.sample("hash", timings))
+    say(f, "the minimum is the floor", r.minimum == 100)
+    say(f, "the median is close to it", r.median >= 100 and r.median <= 111)
+    say(f, "and the mean is dragged well above both", r.mean > r.median * 3)
+    say(f, "which the skew reports", benchtime.skew_percent(r) > 200)
+    say(f, "the maximum is the worst sample", r.maximum == 30000)
+    say(f, "p95 is below it", r.p95 < r.maximum)
+    say(f, "the three long samples are counted as outliers", r.outliers == 3)
+    say(f, "and the deviation says the run was noisy",
+        not benchtime.is_stable(r))
+    say(f, "the count is every sample", r.count == 100)
+    // A clean run, for contrast.
+    var steady: [i64] = []
+    for i in 0..100 {
+        steady.push(1000 + i % 5)
+    }
+    let clean = benchtime.report(benchtime.sample("steady", steady))
+    say(f, "a quiet run is stable", benchtime.is_stable(clean))
+    say(f, "and its mean and median agree", benchtime.skew_percent(clean) == 0)
+    say(f, "p99 is the 99th of 100 samples", clean.p99 == 1004)
+    // Warm-up, batching and the reporting around them.
+    let warm = benchtime.drop_warmup(benchtime.sample("x", [9000, 8000, 100, 101, 102]), 2)
+    say(f, "warm-up samples are dropped", benchtime.report(warm).count == 3)
+    say(f, "and the count of them is kept", benchtime.report(warm).warmup == 2)
+    say(f, "so the minimum is no longer the cold one",
+        benchtime.report(warm).minimum == 100)
+    let per = benchtime.report(benchtime.batched("y", [1000000, 1000000], 1000))
+    say(f, "a batched measurement divides by the batch", per.median == 1000)
+    say(f, "a batch is sized so the clock's error is small enough",
+        benchtime.batch_for(20, 100, 10) == 500)
+    say(f, "and never below one", benchtime.batch_for(1000000, 100, 10) == 1)
+    // Comparison, which is what the numbers are for.
+    let before = benchtime.report(benchtime.sample("before", steady))
+    var faster: [i64] = []
+    for i in 0..100 {
+        faster.push(500 + i % 5)
+    }
+    let after = benchtime.report(benchtime.sample("after", faster))
+    // 1002 to 502 is 49.9%, and the report is an integer percentage — a
+    // benchmark that rounds a comparison up flatters itself.
+    say(f, "a halving reads as 49% faster, rounded down",
+        benchtime.change_percent(before, after) == 49)
+    say(f, "and is larger than the noise", benchtime.is_meaningful(before, after))
+    var barely: [i64] = []
+    for i in 0..100 {
+        barely.push(995 + i % 5)
+    }
+    let tiny = benchtime.report(benchtime.sample("tiny", barely))
+    say(f, "a change inside the noise is reported as such",
+        not benchtime.is_meaningful(before, tiny))
+    say(f, "and the comparison says so",
+        benchtime.compare(before, tiny).contains("within the noise"))
+    say(f, "operations a second come from the median, not the mean",
+        benchtime.per_second(clean) == 1000000000 / clean.median)
+    say(f, "durations scale to a readable unit",
+        benchtime.format_duration(999) == "999 ns" and
+        benchtime.format_duration(1500).starts_with("1.5") and
+        benchtime.format_duration(1500000).starts_with("1.5 ms"))
+    say(f, "the report names the noise when there is any",
+        benchtime.format_report(r).len() > 8)
+}
+
+fn check_treeview(inout f: i64) / {io} {
+    print("-- treeview: the bars are the whole problem")
+    var t = treeview.new_tree()
+    let root = treeview.add(t, "project", "")
+    treeview.set_root(t, root)
+    let src = treeview.add(t, "src", "")
+    let docs = treeview.add(t, "docs", "")
+    treeview.attach(t, root, src)
+    treeview.attach(t, root, docs)
+    let main = treeview.add(t, "main.gr", "12 KB")
+    let deep = treeview.add(t, "deep", "")
+    treeview.attach(t, src, main)
+    treeview.attach(t, src, deep)
+    let inner = treeview.add(t, "inner.gr", "")
+    treeview.attach(t, deep, inner)
+    treeview.attach(t, docs, treeview.add(t, "guide.md", ""))
+    let lines = treeview.draw_ascii(t) ?? []
+    say(f, "the root is the first line", lines[0] == "project")
+    say(f, "a child with a sibling after it gets a branch",
+        lines[1] == "|-- src")
+    // The line that only comes out right if the ancestor's own siblings were
+    // tracked: `inner.gr` is under `deep`, under `src`, and `src` has a
+    // sibling — so the first column is a bar and the second is not.
+    say(f, "and a grandchild under it carries that bar down",
+        lines[2] == "|   |-- main.gr  12 KB")
+    say(f, "the last child of a node gets the corner",
+        lines[3] == "|   `-- deep")
+    say(f, "under which the column becomes a gap, not a bar",
+        lines[4] == "|       `-- inner.gr")
+    say(f, "and the last top-level child ends the bar",
+        lines[5] == "`-- docs")
+    say(f, "whose own child sits under a gap", lines[6] == "    `-- guide.md")
+    say(f, "every node is drawn", lines.len() == 7)
+    say(f, "the unicode style uses box drawing",
+        (treeview.draw(t, treeview.unicode_style()) ?? [])[1].starts_with(
+            (9500).to_char()))
+    say(f, "sizes count the node itself", treeview.size_of(t, src) == 4)
+    say(f, "depth is measured to the deepest leaf", treeview.depth_of(t, root) == 4)
+    say(f, "and the leaves are counted", treeview.leaves(t) == 3)
+    say(f, "a depth-first walk is the drawing order",
+        treeview.labels_in_order(t) == ["project", "src", "main.gr", "deep",
+            "inner.gr", "docs", "guide.md"])
+    // Paths, which is how a listing arrives.
+    let built = treeview.from_paths(["a/b/c.txt", "a/b/d.txt", "a/e.txt"], ".")
+    say(f, "paths build a tree with shared prefixes shared",
+        treeview.labels_in_order(built) == [".", "a", "b", "c.txt", "d.txt",
+            "e.txt"])
+    // A cycle is representable, so it is checked rather than recursed into.
+    var cyclic = treeview.new_tree()
+    let one = treeview.add(cyclic, "one", "")
+    let two = treeview.add(cyclic, "two", "")
+    treeview.set_root(cyclic, one)
+    treeview.attach(cyclic, one, two)
+    treeview.attach(cyclic, two, one)
+    say(f, "a cycle is refused rather than followed", tree_refuses(cyclic))
+    // And a wide node is trimmed rather than printed in full.
+    var wide = treeview.new_tree()
+    let hub = treeview.add(wide, "hub", "")
+    treeview.set_root(wide, hub)
+    for i in 0..50 {
+        treeview.attach(wide, hub, treeview.add(wide, "item {i}", ""))
+    }
+    let trimmed = treeview.draw_limited(wide, treeview.ascii_style(), 3) ?? []
+    say(f, "a wide node is cut to the limit", trimmed.len() == 5)
+    say(f, "with a count of what was left out",
+        trimmed[4] == "`-- ... 47 more")
+}
+
+fn check_ulid(inout f: i64) / {io} {
+    print("-- ulid: an identifier that sorts by when it was made")
+    let a = ulid.make(1469918176385, 78187493520, 654820264976) ?? ""
+    say(f, "a ULID is 26 characters", a.len() == 26)
+    say(f, "the first ten encode the timestamp",
+        ulid.time_prefix(a) == "01ARYZ6S41")
+    say(f, "which reads back exactly", (ulid.timestamp_of(a) ?? 0) == 1469918176385)
+    // The canonical example from the specification.
+    say(f, "the specification's example parses",
+        ulid.is_valid("01ARZ3NDEKTSV4RRFFQ69G5FAV"))
+    say(f, "with the timestamp it carries",
+        (ulid.timestamp_of("01ARZ3NDEKTSV4RRFFQ69G5FAV") ?? 0) == 1469922850259)
+    // The property the type exists for.
+    let earlier = ulid.make(1000, 0, 0) ?? ""
+    let later = ulid.make(2000, 0, 0) ?? ""
+    say(f, "an earlier identifier sorts first as text",
+        ulid.is_before(earlier, later) and earlier < later)
+    say(f, "even when the later one has a smaller random part",
+        ulid.is_before(ulid.make(1000, 999999, 999999) ?? "",
+            ulid.make(1001, 0, 0) ?? ""))
+    // Monotonicity inside one millisecond, which is the detail most
+    // implementations skip.
+    let first = ulid.make(5000, 0, 0) ?? ""
+    let second = ulid.next_monotonic(first) ?? ""
+    say(f, "the next in the same millisecond is one larger",
+        ulid.is_before(first, second))
+    say(f, "and has the same timestamp",
+        (ulid.timestamp_of(second) ?? 0) == 5000)
+    say(f, "a hundred in one millisecond stay in order", monotonic_run(100))
+    // A clock that goes backwards, which it does.
+    let made = ulid.next(second, 4000, 7, 7) ?? ""
+    say(f, "a backwards clock does not produce an earlier identifier",
+        ulid.is_before(second, made))
+    // The range query the encoding makes possible.
+    say(f, "the floor of a millisecond is all zeros",
+        (ulid.floor_of(5000) ?? "").ends_with("0000000000000000"))
+    say(f, "and the ceiling all Zs",
+        (ulid.ceiling_of(5000) ?? "").ends_with("ZZZZZZZZZZZZZZZZ"))
+    say(f, "so every identifier from that millisecond lies between them",
+        (ulid.floor_of(5000) ?? "") <= first and
+        first <= (ulid.ceiling_of(5000) ?? ""))
+    // Crockford's alphabet, and reading one down a phone.
+    say(f, "I, L and O are read as 1, 1 and 0",
+        (ulid.canonical("O1ARZ3NDEKTSV4RRFFQ69G5FAV") ?? "") ==
+        "01ARZ3NDEKTSV4RRFFQ69G5FAV")
+    say(f, "lower case is accepted",
+        (ulid.canonical("01arz3ndektsv4rrffq69g5fav") ?? "") ==
+        "01ARZ3NDEKTSV4RRFFQ69G5FAV")
+    say(f, "U is not in the alphabet at all", ulid_refuses("01ARZ3NDEKTSV4RRFFQ69G5FAU"))
+    say(f, "twenty-five characters is not a ULID", ulid_refuses("01ARZ3NDEKTSV4RRFFQ69G5FA"))
+    say(f, "and a timestamp that would overflow 48 bits is refused",
+        ulid_refuses("81ARZ3NDEKTSV4RRFFQ69G5FAV"))
+    // The binary and UUID forms, for the column it ends up in.
+    say(f, "sixteen bytes round-trip",
+        (ulid.from_bytes(ulid.to_bytes(a) ?? "".to_bytes()) ?? "") == a)
+    say(f, "and the UUID form is 36 characters with four hyphens",
+        (ulid.to_uuid_text(a) ?? "").len() == 36)
+}
+
+fn monotonic_run(count: i64) -> bool {
+    var previous = ulid.make(7000, 0, 0) ?? ""
+    for _i in 0..count {
+        let next = ulid.next_monotonic(previous) ?? ""
+        if not ulid.is_before(previous, next) {
+            return false
+        }
+        previous = next
+    }
+    return true
+}
+
+fn check_phonetic(inout f: i64) / {io} {
+    print("-- phonetic: spelling is not pronunciation")
+    // Every Soundex value here is the published one.
+    say(f, "Robert and Rupert are R163", phonetic.soundex("Robert") == "R163" and
+        phonetic.soundex("Rupert") == "R163")
+    say(f, "Ashcraft is A261, because H does not separate a repeat",
+        phonetic.soundex("Ashcraft") == "A261")
+    say(f, "Tymczak is T522", phonetic.soundex("Tymczak") == "T522")
+    say(f, "Pfister is P236", phonetic.soundex("Pfister") == "P236")
+    say(f, "Honeyman is H555", phonetic.soundex("Honeyman") == "H555")
+    say(f, "Jackson is J250", phonetic.soundex("Jackson") == "J250")
+    say(f, "Washington is W252", phonetic.soundex("Washington") == "W252")
+    say(f, "Lee is L000, padded", phonetic.soundex("Lee") == "L000")
+    say(f, "Gutierrez is G362", phonetic.soundex("Gutierrez") == "G362")
+    say(f, "and case and punctuation do not matter",
+        phonetic.soundex("o'brien") == phonetic.soundex("OBrien"))
+    // Soundex's failure, which is the reason the other two exist.
+    say(f, "Soundex says Robert and Rupert are the same name",
+        phonetic.sounds_like("Robert", "Rupert"))
+    say(f, "and Metaphone does not",
+        phonetic.metaphone("Robert") != phonetic.metaphone("Rupert"))
+    // Metaphone's rules, each demonstrated by a pair it unifies.
+    say(f, "PH is F, so Philip and Fillip agree",
+        phonetic.metaphone("Philip") == phonetic.metaphone("Fillip"))
+    say(f, "an initial K before N is silent, so Knuth and Nuth agree",
+        phonetic.metaphone("Knuth") == phonetic.metaphone("Nuth"))
+    say(f, "TH is one sound", phonetic.metaphone("Smith") == "SM0")
+    say(f, "C before E, I or Y is S, so Catherine and Katherine agree",
+        phonetic.metaphone("Catherine") == phonetic.metaphone("Katherine"))
+    say(f, "an initial WR drops the W", phonetic.metaphone("Wright") == "RT")
+    say(f, "and X at the start is S", phonetic.metaphone("Xavier").starts_with("S"))
+    // NYSIIS, which handles surnames the other two do not.
+    say(f, "NYSIIS folds MAC to MCC",
+        phonetic.nysiis("Macdonald").starts_with("MC"))
+    say(f, "and PH to FF", phonetic.nysiis("Pfister").starts_with("F"))
+    say(f, "Smith and Smyth agree on all three codes",
+        phonetic.strongly_alike("Smith", "Smyth") == false or
+        phonetic.agreement("Smith", "Smyth") >= 2)
+    say(f, "agreement counts how many codes match",
+        phonetic.agreement("Catherine", "Katherine") >= 2 and
+        phonetic.agreement("Catherine", "Zebra") == 0)
+    let found = phonetic.matches("Katherine",
+        ["Catherine", "Kathryn", "Zebra", "Katharine"])
+    say(f, "a search ranks the strongest agreement first", found[0].1 == 3)
+    say(f, "and leaves out what does not match at all", found.len() == 3)
+    say(f, "an index key carries all three codes",
+        phonetic.index_key("Smith").split(":").len() == 3)
+    say(f, "and an empty name gives empty codes", phonetic.soundex("") == "")
+}
+
+fn check_natsort(inout f: i64) / {io} {
+    print("-- natsort: file10 comes after file9")
+    say(f, "which plain sorting gets backwards",
+        natsort.sorted(["file10", "file9"]) == ["file9", "file10"])
+    say(f, "case is folded first",
+        natsort.sorted(["file10", "file9", "file1", "File2"]) ==
+        ["file1", "File2", "file9", "file10"])
+    // Leading zeros compare equal on the number and break the tie on text,
+    // which is what makes the order total and the sort stable.
+    say(f, "007 and 7 are the same number",
+        natsort.compare("a007", "a7") != 0 and
+        natsort.compare("a007", "a70") < 0)
+    say(f, "and 70 is larger than both", natsort.sorted(["a70", "a7", "a007"]) ==
+        ["a007", "a7", "a70"])
+    // A number too long for an integer, which is the case a parse-based
+    // implementation cannot handle.
+    say(f, "a forty-digit number compares correctly",
+        natsort.compare("x" + "1".repeat(40), "x" + "9".repeat(39)) > 0)
+    say(f, "text before a number decides first",
+        natsort.compare("b1", "a9") > 0)
+    say(f, "and a prefix sorts before what extends it",
+        natsort.compare("file", "file1") < 0)
+    say(f, "is_sorted agrees with sorted",
+        natsort.is_sorted(natsort.sorted(["z2", "z10", "z1"])))
+    say(f, "and says when a list is not",
+        not natsort.is_sorted(["z10", "z2"]))
+    say(f, "descending is the reverse",
+        natsort.sorted_descending(["a1", "a10", "a2"]) == ["a10", "a2", "a1"])
+    // The sort key, which is what a database index stores.
+    say(f, "the key sorts the same way a comparison does",
+        natsort.sort_key("a9") < natsort.sort_key("a10"))
+    say(f, "and puts punctuation where a comparison does",
+        (natsort.sort_key("a-1") < natsort.sort_key("a2")) ==
+        (natsort.compare("a-1", "a2") < 0))
+    // Versions, where a release candidate comes before its release.
+    say(f, "1.10.0 is after 1.2.0",
+        natsort.compare_version("1.10.0", "1.2.0") > 0)
+    say(f, "and a release candidate before its release",
+        natsort.compare_version("1.0.0-rc1", "1.0.0") < 0)
+    say(f, "which sorting a list gets right",
+        natsort.sorted_versions(["1.0.0", "1.0.0-rc1", "1.10.0", "1.2.0"]) ==
+        ["1.0.0-rc1", "1.0.0", "1.2.0", "1.10.0"])
+    say(f, "file names sort by stem, then extension",
+        natsort.sorted_filenames(["a.txt", "a-1.txt", "a10.txt", "a2.txt"]) ==
+        ["a.txt", "a-1.txt", "a2.txt", "a10.txt"])
+    say(f, "and the same stem sorts by extension",
+        natsort.sorted_filenames(["r.zip", "r.txt"]) == ["r.txt", "r.zip"])
+}
+
+fn check_fixtureset(inout f: i64) / {io} {
+    print("-- fixtureset: the same every run, different every row")
+    let s = fixtureset.from_seed(42)
+    // Reproducible: the whole reason it is seeded.
+    say(f, "the same seed gives the same value",
+        fixtureset.value(s, 7) == fixtureset.value(fixtureset.from_seed(42), 7))
+    say(f, "a different seed gives a different one",
+        fixtureset.value(s, 7) != fixtureset.value(fixtureset.from_seed(43), 7))
+    // Counter-based: row 57 does not depend on rows 1 to 56.
+    say(f, "a value depends only on its index",
+        fixtureset.value(s, 57) == fixtureset.value(s, 57))
+    say(f, "and neighbouring indices differ",
+        fixtureset.value(s, 57) != fixtureset.value(s, 58))
+    var counted = fixtureset.from_seed(42)
+    let first = fixtureset.next(counted)
+    let second = fixtureset.next(counted)
+    say(f, "drawing advances the source", fixtureset.drawn(counted) == 2)
+    say(f, "and gives the same sequence as indexing",
+        first == fixtureset.value(s, 0) and second == fixtureset.value(s, 1))
+    fixtureset.reset(counted)
+    say(f, "resetting starts it again", fixtureset.next(counted) == first)
+    // Ranges and choices.
+    var in_range = true
+    for i in 0..500 {
+        let v = fixtureset.between(s, i, 10, 20)
+        if v < 10 or v > 20 {
+            in_range = false
+        }
+    }
+    say(f, "a range is inclusive at both ends", in_range)
+    say(f, "a range of one is that one", fixtureset.between(s, 1, 5, 5) == 5)
+    var picked: [str] = []
+    for i in 0..200 {
+        let v = fixtureset.pick(s, i, ["a", "b", "c"])
+        if not picked.contains(v) {
+            picked.push(v)
+        }
+    }
+    say(f, "picking reaches every choice", picked.len() == 3)
+    // The failure this exists to prevent: a hundred rows that are all alike.
+    var names: [str] = []
+    var emails: [str] = []
+    for i in 0..100 {
+        let n = fixtureset.person_name(s, i)
+        let e = fixtureset.email(s, i)
+        if not names.contains(n) {
+            names.push(n)
+        }
+        if not emails.contains(e) {
+            emails.push(e)
+        }
+    }
+    say(f, "a hundred rows have many distinct names", names.len() > 50)
+    say(f, "and a hundred distinct email addresses", emails.len() == 100)
+    say(f, "which are addresses a real user would type",
+        fixtureset.email(s, 3).contains("@") and
+        fixtureset.email(s, 3).contains("+3@"))
+    say(f, "addresses and text come out of the same source",
+        fixtureset.street_address(s, 1) != fixtureset.street_address(s, 2))
+    say(f, "a sentence starts with a capital and ends with a stop",
+        fixtureset.sentence(s, 1).ends_with(".") and
+        fixtureset.sentence(s, 1).substr(0, 1) ==
+        fixtureset.sentence(s, 1).substr(0, 1).to_upper())
+    say(f, "a hex id is the length asked for",
+        fixtureset.hex_id(s, 1, 32).len() == 32)
+    say(f, "and is hexadecimal", fixtureset.hex_id(s, 1, 32).contains("g") == false)
+    say(f, "a timestamp lands inside its window",
+        fixtureset.timestamp(s, 1, 1000, 7) >= 1000 and
+        fixtureset.timestamp(s, 1, 1000, 7) <= 1000 + 7 * 86400)
+    // Distinctness on demand, for a unique column.
+    let unique = fixtureset.distinct(30, |n| fixtureset.pick(s, n, ["a", "b", "c"]))
+    say(f, "distinct stops when it runs out rather than looping",
+        unique.len() == 3)
+    say(f, "and gives what it can", unique.len() > 0)
+    let shuffled = fixtureset.shuffled(s, ["a", "b", "c", "d", "e"])
+    say(f, "a shuffle keeps every element", shuffled.len() == 5)
+    say(f, "and is the same shuffle next time",
+        shuffled == fixtureset.shuffled(fixtureset.from_seed(42),
+            ["a", "b", "c", "d", "e"]))
+    say(f, "a sample is smaller than what it came from",
+        fixtureset.sample(s, ["a", "b", "c", "d", "e"], 2).len() == 2)
+    say(f, "and the seed is printable, so a red test is reproducible",
+        fixtureset.describe(s).contains("42"))
+}
+
+fn main() / {io} {
+    var f = 0
+
+    check_benchtime(f)
+    check_treeview(f)
+    check_ulid(f)
+    check_phonetic(f)
+    check_natsort(f)
+    check_fixtureset(f)
+
+    if f == 0 {
+        print("tooling III: every claim held")
+    } else {
+        print("tooling III: {f} failed")
+    }
+}

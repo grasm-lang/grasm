@@ -1,0 +1,6 @@
+[package]
+name = "phonetic"
+version = "1.0.0"
+
+# Names that sound alike. Opens nothing.
+capabilities = []

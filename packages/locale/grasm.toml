@@ -1,0 +1,6 @@
+[package]
+name = "locale"
+version = "1.0.0"
+
+# Language tags, and the conventions behind them. Opens nothing.
+capabilities = []
