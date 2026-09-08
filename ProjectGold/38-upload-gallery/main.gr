@@ -111,7 +111,7 @@ fn boundary_of(content_type: str) -> str {
 /// The headers of a multipart part are text by specification, so decoding just
 /// them is correct — it is the *body* that must not be decoded, and it is not.
 fn header_text(body: bytes, at: i64, end: i64) -> str {
-    body.slice(at, end - at).to_str()
+    body.slice(at, end).to_str()
 }
 
 fn header_value(head: str, name: str) -> str {
@@ -175,7 +175,7 @@ fn parse_multipart(body: bytes, boundary: str) -> [Part] {
             name: param(disposition, "name"),
             filename: param(disposition, "filename"),
             content_type: header_value(head, "Content-Type"),
-            body: body.slice(body_start, body_end - body_start),
+            body: body.slice(body_start, body_end),
         })
         at = next
     }
@@ -369,7 +369,7 @@ fn parse_req(raw: bytes) -> Req {
     let body = if head_end < 0 {
         bytes_of([])
     } else {
-        raw.slice(head_end + 4, raw.len() - head_end - 4)
+        raw.slice(head_end + 4, raw.len())
     }
     let lines = head.lines()
     if lines.len() == 0 {

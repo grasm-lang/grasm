@@ -1,0 +1,32 @@
+[package]
+name = "game_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.collision]
+path = "../collision"
+version = "^1.0.0"
+
+[dependencies.quadtree]
+path = "../quadtree"
+version = "^1.0.0"
+
+[dependencies.astar]
+path = "../astar"
+version = "^1.0.0"
+
+[dependencies.tilemap]
+path = "../tilemap"
+version = "^1.0.0"
+
+[dependencies.palette]
+path = "../palette"
+version = "^1.0.0"
+
+[dependencies.geometry]
+path = "../geometry"
+version = "^1.0.0"
+
+[dependencies.colorspace]
+path = "../colorspace"
+version = "^1.0.0"

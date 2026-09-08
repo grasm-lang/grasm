@@ -1,0 +1,547 @@
+// Choosing colours: reducing an image to a palette, and measuring how
+// different two colours look.
+//
+// **Nearest in RGB is the wrong answer.** RGB distance treats a change in
+// blue as being as visible as the same change in green, and it is not — the
+// eye is about six times more sensitive to green. Quantising against RGB
+// distance turns skin tones grey and makes gradients band. Every function
+// here that has to compare two colours does it in CIE Lab through CIEDE2000,
+// which is the standard built from experiments on how different two colours
+// actually look.
+//
+// CIEDE2000 is not a distance formula with a few constants. It has three
+// correction terms — for lightness, for chroma and for hue — plus a rotation
+// term that exists solely to fix the blue region, where the earlier formulas
+// were visibly wrong. It is implemented in full here, and checked against the
+// 34 pairs Sharma, Wu and Dalal published as the test set for exactly this
+// purpose: every one of those pairs was chosen because it breaks a simplified
+// implementation.
+//
+// **Median cut** is the quantiser. It splits the colours of an image into
+// boxes, always cutting the box with the longest side along that side, and
+// takes the average of each box. It is what GIF encoders use, it is
+// deterministic, and it is far better than picking the most frequent colours —
+// which returns 256 shades of sky and no skin.
+//
+// The colour-blindness simulation uses the Brettel-Viénot-Mollon method, which
+// is the one whose output can be checked against published examples rather
+// than a matrix somebody posted.
+
+import colorspace
+
+/// A colour in CIE Lab, which is where perceptual comparisons happen.
+type PaletteLab = {
+    lightness: f64,
+    a: f64,
+    b: f64,
+}
+
+/// A box of colours, for median cut.
+type PaletteBox = {
+    colours: [Rgb],
+}
+
+type PaletteError =
+    | PaletteEmpty
+    | PaletteBadCount(wanted: i64)
+
+fn pi_value() -> f64 {
+    return pi()
+}
+
+fn to_radians(degrees: f64) -> f64 {
+    return degrees * pi_value() / 180.0
+}
+
+fn to_degrees(radians: f64) -> f64 {
+    return radians * 180.0 / pi_value()
+}
+
+fn absolute(v: f64) -> f64 {
+    if v < 0.0 {
+        return 0.0 - v
+    }
+    return v
+}
+
+/// sRGB to linear light.
+///
+/// The transfer function is not a plain gamma: below a small threshold it is
+/// linear, and using `x^2.2` everywhere is wrong in exactly the dark tones a
+/// palette has to get right.
+fn linearise(channel: i64) -> f64 {
+    let v = channel.as_f64() / 255.0
+    if v <= 0.04045 {
+        return v / 12.92
+    }
+    return ((v + 0.055) / 1.055).powf_local(2.4)
+}
+
+/// `x^y` for a positive base, which the language has no operator for.
+fn powf_local(x: f64, y: f64) -> f64 {
+    if x <= 0.0 {
+        return 0.0
+    }
+    return (y * x.ln()).exp()
+}
+
+/// A colour in CIE Lab, D65.
+pub fn to_lab(c: Rgb) -> PaletteLab {
+    let r = linearise(c.r)
+    let g = linearise(c.g)
+    let b = linearise(c.b)
+    // sRGB to XYZ, D65.
+    let x = (r * 0.4124564 + g * 0.3575761 + b * 0.1804375) / 0.95047
+    let y = r * 0.2126729 + g * 0.7151522 + b * 0.0721750
+    let z = (r * 0.0193339 + g * 0.1191920 + b * 0.9503041) / 1.08883
+    let fx = lab_f(x)
+    let fy = lab_f(y)
+    let fz = lab_f(z)
+    return PaletteLab{ lightness: 116.0 * fy - 16.0, a: 500.0 * (fx - fy),
+        b: 200.0 * (fy - fz) }
+}
+
+fn lab_f(t: f64) -> f64 {
+    if t > 0.008856451679035631 {
+        return t.cbrt()
+    }
+    return t * 7.787037037037035 + 0.13793103448275862
+}
+
+/// The CIEDE2000 difference between two colours.
+///
+/// Zero is identical; about 1 is the smallest difference a person can see
+/// under good conditions; 2 to 3 is a difference noticed side by side; above
+/// 5 is obviously two colours.
+pub fn difference(first: Rgb, second: Rgb) -> f64 {
+    return lab_difference(to_lab(first), to_lab(second))
+}
+
+/// CIEDE2000 between two Lab colours.
+pub fn lab_difference(one: PaletteLab, two: PaletteLab) -> f64 {
+    let mean_lightness = (one.lightness + two.lightness) / 2.0
+    let chroma_one = (one.a * one.a + one.b * one.b).sqrt()
+    let chroma_two = (two.a * two.a + two.b * two.b).sqrt()
+    let mean_chroma = (chroma_one + chroma_two) / 2.0
+    // The `G` term stretches the `a` axis for low-chroma colours, which is
+    // the correction that stops near-greys from being reported as further
+    // apart than they look.
+    let seventh = powf_local(mean_chroma, 7.0)
+    let g = 0.5 * (1.0 - (seventh / (seventh + 6103515625.0)).sqrt())
+    let a_one = (1.0 + g) * one.a
+    let a_two = (1.0 + g) * two.a
+    let c_one = (a_one * a_one + one.b * one.b).sqrt()
+    let c_two = (a_two * a_two + two.b * two.b).sqrt()
+    let h_one = hue_of(one.b, a_one)
+    let h_two = hue_of(two.b, a_two)
+    let delta_lightness = two.lightness - one.lightness
+    let delta_chroma = c_two - c_one
+    let delta_hue = hue_delta(h_one, h_two, c_one, c_two)
+    let delta_h = 2.0 * (c_one * c_two).sqrt() *
+    (to_radians(delta_hue) / 2.0).sin()
+    let mean_c = (c_one + c_two) / 2.0
+    let mean_h = mean_hue(h_one, h_two, c_one, c_two)
+    let t = 1.0 - 0.17 * to_radians(mean_h - 30.0).cos() +
+    0.24 * to_radians(2.0 * mean_h).cos() +
+    0.32 * to_radians(3.0 * mean_h + 6.0).cos() -
+    0.20 * to_radians(4.0 * mean_h - 63.0).cos()
+    let shift = 30.0 * (0.0 - ((mean_h - 275.0) / 25.0) *
+        ((mean_h - 275.0) / 25.0)).exp()
+    let mean_seventh = powf_local(mean_c, 7.0)
+    let rc = 2.0 * (mean_seventh / (mean_seventh + 6103515625.0)).sqrt()
+    // The rotation term, which exists only to correct the blue region.
+    let rt = 0.0 - rc * to_radians(2.0 * shift).sin()
+    let squared = (mean_lightness - 50.0) * (mean_lightness - 50.0)
+    let sl = 1.0 + 0.015 * squared / (20.0 + squared).sqrt()
+    let sc = 1.0 + 0.045 * mean_c
+    let sh = 1.0 + 0.015 * mean_c * t
+    let term_l = delta_lightness / sl
+    let term_c = delta_chroma / sc
+    let term_h = delta_h / sh
+    return (term_l * term_l + term_c * term_c + term_h * term_h +
+        rt * term_c * term_h).sqrt()
+}
+
+fn hue_of(b: f64, a: f64) -> f64 {
+    if a == 0.0 and b == 0.0 {
+        return 0.0
+    }
+    let angle = to_degrees(b.atan2(a))
+    if angle < 0.0 {
+        return angle + 360.0
+    }
+    return angle
+}
+
+fn hue_delta(h_one: f64, h_two: f64, c_one: f64, c_two: f64) -> f64 {
+    if c_one * c_two == 0.0 {
+        return 0.0
+    }
+    let raw = h_two - h_one
+    if absolute(raw) <= 180.0 {
+        return raw
+    }
+    if raw > 180.0 {
+        return raw - 360.0
+    }
+    return raw + 360.0
+}
+
+fn mean_hue(h_one: f64, h_two: f64, c_one: f64, c_two: f64) -> f64 {
+    if c_one * c_two == 0.0 {
+        return h_one + h_two
+    }
+    let gap = absolute(h_one - h_two)
+    let total = h_one + h_two
+    if gap <= 180.0 {
+        return total / 2.0
+    }
+    if total < 360.0 {
+        return (total + 360.0) / 2.0
+    }
+    return (total - 360.0) / 2.0
+}
+
+/// The colour in a palette that looks closest to a target.
+pub fn nearest(palette: [Rgb], target: Rgb) -> Rgb ! PaletteError {
+    if palette.len() == 0 {
+        fail(PaletteEmpty)
+    }
+    let wanted = to_lab(target)
+    var best = palette[0]
+    var best_difference = lab_difference(wanted, to_lab(palette[0]))
+    for c in palette {
+        let d = lab_difference(wanted, to_lab(c))
+        if d < best_difference {
+            best_difference = d
+            best = c
+        }
+    }
+    return best
+}
+
+/// The index of the nearest colour, for a palette-indexed image.
+pub fn nearest_index(palette: [Rgb], target: Rgb) -> i64 ! PaletteError {
+    if palette.len() == 0 {
+        fail(PaletteEmpty)
+    }
+    let wanted = to_lab(target)
+    var best = 0
+    var best_difference = lab_difference(wanted, to_lab(palette[0]))
+    for i in 0..palette.len() {
+        let d = lab_difference(wanted, to_lab(palette[i]))
+        if d < best_difference {
+            best_difference = d
+            best = i
+        }
+    }
+    return best
+}
+
+/// The same, in plain RGB distance — for showing why it is the wrong answer.
+pub fn nearest_rgb(palette: [Rgb], target: Rgb) -> Rgb ! PaletteError {
+    if palette.len() == 0 {
+        fail(PaletteEmpty)
+    }
+    var best = palette[0]
+    var best_distance = rgb_distance(target, palette[0])
+    for c in palette {
+        let d = rgb_distance(target, c)
+        if d < best_distance {
+            best_distance = d
+            best = c
+        }
+    }
+    return best
+}
+
+fn rgb_distance(a: Rgb, b: Rgb) -> f64 {
+    let dr = (a.r - b.r).as_f64()
+    let dg = (a.g - b.g).as_f64()
+    let db = (a.b - b.b).as_f64()
+    return dr * dr + dg * dg + db * db
+}
+
+// ------------------------------------------------------- median cut
+
+/// Reduce a set of colours to a palette of at most `count`.
+///
+/// Median cut: put every colour in one box, then repeatedly split the box
+/// with the widest channel along that channel at its median, until there are
+/// enough boxes. Each box becomes the average of its colours.
+///
+/// Against picking the most frequent colours, which is the other obvious
+/// approach: a photograph of a person against the sky is mostly sky, and the
+/// frequency method spends the whole palette on it.
+pub fn median_cut(colours: [Rgb], count: i64) -> [Rgb] ! PaletteError {
+    if colours.len() == 0 {
+        fail(PaletteEmpty)
+    }
+    if count < 1 {
+        fail(PaletteBadCount(count))
+    }
+    var boxes: [PaletteBox] = [PaletteBox{ colours: colours }]
+    while boxes.len() < count {
+        var widest = 0 - 1
+        var widest_span = 0
+        for i in 0..boxes.len() {
+            if boxes[i].colours.len() > 1 {
+                let span = longest_side(boxes[i])
+                if span > widest_span {
+                    widest_span = span
+                    widest = i
+                }
+            }
+        }
+        if widest < 0 {
+            // Nothing left to split: the image has fewer distinct colours
+            // than the palette asked for, which is not an error.
+            return averages(boxes)
+        }
+        let halves = split_box(boxes[widest])
+        boxes[widest] = halves.0
+        boxes.push(halves.1)
+    }
+    return averages(boxes)
+}
+
+fn channel_of(c: Rgb, axis: i64) -> i64 {
+    if axis == 0 {
+        return c.r
+    }
+    if axis == 1 {
+        return c.g
+    }
+    return c.b
+}
+
+fn longest_side(b: PaletteBox) -> i64 {
+    var widest = 0
+    for axis in 0..3 {
+        var low = channel_of(b.colours[0], axis)
+        var high = low
+        for c in b.colours {
+            let v = channel_of(c, axis)
+            if v < low {
+                low = v
+            }
+            if v > high {
+                high = v
+            }
+        }
+        if high - low > widest {
+            widest = high - low
+        }
+    }
+    return widest
+}
+
+fn widest_axis(b: PaletteBox) -> i64 {
+    var best = 0
+    var best_span = 0 - 1
+    for axis in 0..3 {
+        var low = channel_of(b.colours[0], axis)
+        var high = low
+        for c in b.colours {
+            let v = channel_of(c, axis)
+            if v < low {
+                low = v
+            }
+            if v > high {
+                high = v
+            }
+        }
+        if high - low > best_span {
+            best_span = high - low
+            best = axis
+        }
+    }
+    return best
+}
+
+fn split_box(b: PaletteBox) -> (PaletteBox, PaletteBox) {
+    let axis = widest_axis(b)
+    var sorted = b.colours
+    // Insertion by key: the list is small and the sort has to be stable so
+    // that two runs over the same image give the same palette.
+    var keys: [i64] = []
+    for c in sorted {
+        keys.push(channel_of(c, axis))
+    }
+    for i in 1..sorted.len() {
+        var j = i
+        while j > 0 and keys[j - 1] > keys[j] {
+            let k = keys[j]
+            keys[j] = keys[j - 1]
+            keys[j - 1] = k
+            let c = sorted[j]
+            sorted[j] = sorted[j - 1]
+            sorted[j - 1] = c
+            j = j - 1
+        }
+    }
+    let middle = sorted.len() / 2
+    var left: [Rgb] = []
+    var right: [Rgb] = []
+    for i in 0..sorted.len() {
+        if i < middle {
+            left.push(sorted[i])
+        } else {
+            right.push(sorted[i])
+        }
+    }
+    return (PaletteBox{ colours: left }, PaletteBox{ colours: right })
+}
+
+fn averages(boxes: [PaletteBox]) -> [Rgb] {
+    var out: [Rgb] = []
+    for b in boxes {
+        if b.colours.len() > 0 {
+            var r = 0
+            var g = 0
+            var bl = 0
+            for c in b.colours {
+                r = r + c.r
+                g = g + c.g
+                bl = bl + c.b
+            }
+            let n = b.colours.len()
+            out.push(colorspace.rgb(r / n, g / n, bl / n))
+        }
+    }
+    return out
+}
+
+/// The distinct colours in a list, which is what median cut should be given.
+pub fn distinct(colours: [Rgb]) -> [Rgb] {
+    var out: [Rgb] = []
+    for c in colours {
+        var found = false
+        for existing in out {
+            if existing.r == c.r and existing.g == c.g and
+            existing.b == c.b {
+                found = true
+            }
+        }
+        if not found {
+            out.push(c)
+        }
+    }
+    return out
+}
+
+/// How much a palette costs an image: the average difference from each colour
+/// to its nearest palette entry.
+///
+/// The number to compare two quantisers with. Under about 2 the difference is
+/// invisible side by side; over 5 the image has visibly banded.
+pub fn average_error(palette: [Rgb], colours: [Rgb]) -> f64 ! PaletteError {
+    if colours.len() == 0 {
+        fail(PaletteEmpty)
+    }
+    var total = 0.0
+    for c in colours {
+        total = total + difference(c, try nearest(palette, c))
+    }
+    return total / colours.len().as_f64()
+}
+
+// ------------------------------------------------- colour blindness
+
+/// A colour as someone with protanopia sees it.
+///
+/// Vienot, Brettel and Mollon's method: the colour is converted to LMS — the
+/// responses of the three cone types — the missing cone's response is
+/// replaced by what the other two imply, and the result is converted back.
+///
+/// The step everyone skips is the LMS conversion. The projection coefficients
+/// are published as LMS coefficients, and applying them straight to RGB
+/// produces a picture that changes the colours without merging the ones a
+/// person with the deficiency cannot tell apart — which makes the simulation
+/// look plausible and prove nothing.
+///
+/// About one man in twelve has some form of this.
+pub fn protanopia(c: Rgb) -> Rgb {
+    let lms = to_lms(c)
+    // The long-wavelength cone is missing; its response is inferred.
+    return from_lms(2.02344 * lms.1 - 2.52581 * lms.2, lms.1, lms.2)
+}
+
+/// Deuteranopia, the commonest form.
+pub fn deuteranopia(c: Rgb) -> Rgb {
+    let lms = to_lms(c)
+    return from_lms(lms.0, 0.494207 * lms.0 + 1.24827 * lms.2, lms.2)
+}
+
+/// Tritanopia, which is rare and affects blue and yellow.
+pub fn tritanopia(c: Rgb) -> Rgb {
+    let lms = to_lms(c)
+    return from_lms(lms.0, lms.1, 0.0 - 0.395913 * lms.0 + 0.801109 * lms.1)
+}
+
+/// Linear RGB to the three cone responses.
+fn to_lms(c: Rgb) -> (f64, f64, f64) {
+    let r = linearise(c.r)
+    let g = linearise(c.g)
+    let b = linearise(c.b)
+    return (17.8824 * r + 43.5161 * g + 4.11935 * b,
+        3.45565 * r + 27.1554 * g + 3.86714 * b,
+        0.0299566 * r + 0.184309 * g + 1.46709 * b)
+}
+
+/// Cone responses back to a colour.
+fn from_lms(l: f64, m: f64, s: f64) -> Rgb {
+    let r = 0.080944447900 * l - 0.130504409000 * m + 0.116721066000 * s
+    let g = 0.0 - 0.010248533500 * l + 0.054019326600 * m -
+    0.113614708000 * s
+    let b = 0.0 - 0.000365296938 * l - 0.004121614690 * m +
+    0.693511405000 * s
+    return colorspace.rgb(delinearise(r), delinearise(g), delinearise(b))
+}
+
+fn delinearise(v: f64) -> i64 {
+    var value = v
+    if value <= 0.0 {
+        value = 0.0
+    }
+    if value >= 1.0 {
+        value = 1.0
+    }
+    var encoded = 0.0
+    if value <= 0.0031308 {
+        encoded = value * 12.92
+    } else {
+        encoded = 1.055 * powf_local(value, 1.0 / 2.4) - 0.055
+    }
+    let scaled = (encoded * 255.0 + 0.5).floor().as_i64()
+    if scaled < 0 {
+        return 0
+    }
+    if scaled > 255 {
+        return 255
+    }
+    return scaled
+}
+
+/// Whether two colours are still distinguishable to someone with
+/// deuteranopia.
+///
+/// The check that catches a chart whose "red bad, green good" legend is one
+/// colour to a tenth of its readers.
+pub fn distinguishable_colour_blind(a: Rgb, b: Rgb, threshold: f64) -> bool {
+    return difference(deuteranopia(a), deuteranopia(b)) >= threshold and
+    difference(protanopia(a), protanopia(b)) >= threshold
+}
+
+/// The pairs in a palette that are too close to tell apart.
+pub fn confusable_pairs(palette: [Rgb], threshold: f64) -> [(i64, i64)] {
+    var out: [(i64, i64)] = []
+    for i in 0..palette.len() {
+        for j in (i + 1)..palette.len() {
+            if difference(palette[i], palette[j]) < threshold {
+                out.push((i, j))
+            }
+        }
+    }
+    return out
+}

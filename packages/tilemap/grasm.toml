@@ -1,0 +1,6 @@
+[package]
+name = "tilemap"
+version = "1.0.0"
+
+# Text in, a grid out. Opens nothing.
+capabilities = []

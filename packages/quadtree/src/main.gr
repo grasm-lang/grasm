@@ -1,0 +1,335 @@
+// A quadtree over rectangles, and the decision that makes one work.
+//
+// **An item that straddles a boundary stays in the parent.** That is the
+// whole design. The alternatives are both worse: putting a copy in every
+// child it touches means a query returns the same item several times and a
+// removal has to find all of them; splitting the item is not possible, it is
+// somebody's sprite. Keeping it at the level where it fits entirely means a
+// query has to look at every ancestor of the region it cares about — which is
+// cheap, because there are `log n` of them.
+//
+// The consequence is worth knowing: a world full of large items degenerates
+// to a list, because everything straddles. A quadtree is for many small
+// things among few large ones, which is what a game world is, and it is not
+// for a world of uniformly large ones.
+//
+// Two parameters, and both matter. `capacity` is how many items a node holds
+// before splitting: too low and the tree is deep and pointer-chasing, too
+// high and a query scans a long list. `max_depth` bounds the split, which is
+// what stops a thousand items at the same coordinate from splitting forever —
+// they cannot be separated, and without the bound the tree recurses until it
+// runs out of memory.
+
+import geometry
+
+/// One stored item: a rectangle and the caller's identifier for it.
+type QuadItem = {
+    bounds: Rect,
+    id: i64,
+}
+
+/// A node. Children are indices into the tree's node list, or -1.
+type QuadNode = {
+    bounds: Rect,
+    items: [QuadItem],
+    /// North-west, north-east, south-west, south-east; -1 when a leaf.
+    children: [i64],
+    depth: i64,
+}
+
+type Quadtree = {
+    node: [QuadNode],
+    capacity: i64,
+    max_depth: i64,
+}
+
+type QuadError =
+    | QuadOutsideBounds(id: i64)
+    | QuadBadCapacity(capacity: i64)
+
+    /// A tree covering a region.
+pub fn new_tree(bounds: Rect, capacity: i64,
+    max_depth: i64) -> Quadtree ! QuadError {
+    if capacity < 1 {
+        fail(QuadBadCapacity(capacity))
+    }
+    return Quadtree{
+        node: [QuadNode{ bounds: bounds, items: [], children: [], depth: 0 }],
+        capacity: capacity,
+        max_depth: max_depth,
+    }
+}
+
+fn is_leaf(n: QuadNode) -> bool {
+    return n.children.len() == 0
+}
+
+/// Does the outer rectangle contain the inner one entirely?
+pub fn contains(outer: Rect, inner: Rect) -> bool {
+    return inner.x >= outer.x and inner.y >= outer.y and
+    inner.x + inner.w <= outer.x + outer.w and
+    inner.y + inner.h <= outer.y + outer.h
+}
+
+/// Do two rectangles overlap at all?
+pub fn overlaps(a: Rect, b: Rect) -> bool {
+    return a.x < b.x + b.w and a.x + a.w > b.x and
+    a.y < b.y + b.h and a.y + a.h > b.y
+}
+
+/// Insert an item.
+///
+/// It is refused rather than clamped when it is outside the tree's region: an
+/// item silently dropped is a bug that shows up as something being
+/// invisible, and one silently clamped is worse.
+pub fn insert(inout t: Quadtree, id: i64, bounds: Rect) ! QuadError {
+    if not overlaps(t.node[0].bounds, bounds) {
+        fail(QuadOutsideBounds(id))
+    }
+    insert_at(t, 0, QuadItem{ bounds: bounds, id: id })
+}
+
+fn insert_at(inout t: Quadtree, at: i64, item: QuadItem) {
+    if is_leaf(t.node[at]) {
+        t.node[at].items.push(item)
+        if t.node[at].items.len() > t.capacity and
+        t.node[at].depth < t.max_depth {
+            split(t, at)
+        }
+        return
+    }
+    // Down to the child that contains it entirely, or stay here.
+    for child in t.node[at].children {
+        if contains(t.node[child].bounds, item.bounds) {
+            insert_at(t, child, item)
+            return
+        }
+    }
+    t.node[at].items.push(item)
+}
+
+fn split(inout t: Quadtree, at: i64) {
+    let b = t.node[at].bounds
+    let half_w = b.w / 2.0
+    let half_h = b.h / 2.0
+    let depth = t.node[at].depth + 1
+    var children: [i64] = []
+    let corners = [geometry.rect(b.x, b.y, half_w, half_h),
+        geometry.rect(b.x + half_w, b.y, half_w, half_h),
+        geometry.rect(b.x, b.y + half_h, half_w, half_h),
+        geometry.rect(b.x + half_w, b.y + half_h, half_w, half_h)]
+    for corner in corners {
+        children.push(t.node.len())
+        t.node.push(QuadNode{ bounds: corner, items: [], children: [],
+            depth: depth })
+    }
+    t.node[at].children = children
+    // The items already here are re-placed: the ones that fit a child move
+    // down, and the ones that straddle stay.
+    let existing = t.node[at].items
+    t.node[at].items = []
+    for item in existing {
+        var placed = false
+        for child in children {
+            if not placed and contains(t.node[child].bounds, item.bounds) {
+                t.node[child].items.push(item)
+                placed = true
+            }
+        }
+        if not placed {
+            t.node[at].items.push(item)
+        }
+    }
+}
+
+/// Every item whose rectangle overlaps a region.
+///
+/// The parent's items are checked at every level on the way down, which is
+/// where the straddling items live. Skipping them is the commonest quadtree
+/// bug and it looks like large objects being invisible to collision.
+pub fn query(t: Quadtree, region: Rect) -> [i64] {
+    var out: [i64] = []
+    gather(t, 0, region, out)
+    return out
+}
+
+fn gather(t: Quadtree, at: i64, region: Rect, inout out: [i64]) {
+    if not overlaps(t.node[at].bounds, region) {
+        return
+    }
+    for item in t.node[at].items {
+        if overlaps(item.bounds, region) {
+            out.push(item.id)
+        }
+    }
+    for child in t.node[at].children {
+        gather(t, child, region, out)
+    }
+}
+
+/// Every item at a point.
+pub fn query_point(t: Quadtree, p: Vec2) -> [i64] {
+    return query(t, geometry.rect(p.x, p.y, 0.0, 0.0))
+}
+
+/// Remove an item by identifier.
+///
+/// It has to be searched for, because the tree stores the rectangle and the
+/// caller usually knows only the identifier. A caller that removes often
+/// should keep its own map from identifier to rectangle and call
+/// `remove_at`, which is `O(log n)` rather than `O(n)`.
+pub fn remove(inout t: Quadtree, id: i64) -> bool {
+    return remove_from(t, 0, id)
+}
+
+fn remove_from(inout t: Quadtree, at: i64, id: i64) -> bool {
+    var kept: [QuadItem] = []
+    var found = false
+    for item in t.node[at].items {
+        if item.id == id {
+            found = true
+        } else {
+            kept.push(item)
+        }
+    }
+    if found {
+        t.node[at].items = kept
+        return true
+    }
+    for child in t.node[at].children {
+        if remove_from(t, child, id) {
+            return true
+        }
+    }
+    return false
+}
+
+/// Remove an item whose rectangle is known, without searching the whole tree.
+pub fn remove_at(inout t: Quadtree, id: i64, bounds: Rect) -> bool {
+    return remove_known(t, 0, id, bounds)
+}
+
+fn remove_known(inout t: Quadtree, at: i64, id: i64, bounds: Rect) -> bool {
+    var kept: [QuadItem] = []
+    var found = false
+    for item in t.node[at].items {
+        if item.id == id {
+            found = true
+        } else {
+            kept.push(item)
+        }
+    }
+    if found {
+        t.node[at].items = kept
+        return true
+    }
+    for child in t.node[at].children {
+        if contains(t.node[child].bounds, bounds) {
+            return remove_known(t, child, id, bounds)
+        }
+    }
+    return false
+}
+
+/// How many items the tree holds.
+pub fn count(t: Quadtree) -> i64 {
+    var total = 0
+    for n in t.node {
+        total = total + n.items.len()
+    }
+    return total
+}
+
+/// How many nodes it has, which is the memory it costs.
+pub fn node_count(t: Quadtree) -> i64 {
+    return t.node.len()
+}
+
+/// The deepest level in use.
+pub fn depth(t: Quadtree) -> i64 {
+    var deepest = 0
+    for n in t.node {
+        if n.items.len() > 0 and n.depth > deepest {
+            deepest = n.depth
+        }
+    }
+    return deepest
+}
+
+/// How many items sit above a leaf because they straddle a boundary.
+///
+/// The number that says whether a quadtree is helping. If most items are
+/// here, they are large relative to the world and the tree is a list with
+/// extra steps.
+pub fn straddling(t: Quadtree) -> i64 {
+    var total = 0
+    for i in 0..t.node.len() {
+        if not is_leaf(t.node[i]) {
+            total = total + t.node[i].items.len()
+        }
+    }
+    return total
+}
+
+/// Every pair of items whose rectangles overlap.
+///
+/// The broad phase: it returns the pairs worth testing exactly, and it is the
+/// reason a quadtree exists. A world of `n` items has `n(n-1)/2` pairs and
+/// this returns the few hundred that are near each other.
+pub fn overlapping_pairs(t: Quadtree) -> [(i64, i64)] {
+    var out: [(i64, i64)] = []
+    var seen: [(i64, i64)] = []
+    collect_pairs(t, 0, [], out, seen)
+    return out
+}
+
+fn collect_pairs(t: Quadtree, at: i64, above: [QuadItem],
+    inout out: [(i64, i64)], inout seen: [(i64, i64)]) {
+    let here = t.node[at].items
+    // Each item against the others at this level, and against everything
+    // above it — which is where the straddling items are.
+    for i in 0..here.len() {
+        for j in (i + 1)..here.len() {
+            if overlaps(here[i].bounds, here[j].bounds) {
+                push_pair(out, seen, here[i].id, here[j].id)
+            }
+        }
+        for parent in above {
+            if overlaps(here[i].bounds, parent.bounds) {
+                push_pair(out, seen, parent.id, here[i].id)
+            }
+        }
+    }
+    if t.node[at].children.len() > 0 {
+        var deeper = above
+        for item in here {
+            deeper.push(item)
+        }
+        for child in t.node[at].children {
+            collect_pairs(t, child, deeper, out, seen)
+        }
+    }
+}
+
+fn push_pair(inout out: [(i64, i64)], inout seen: [(i64, i64)], a: i64,
+    b: i64) {
+    let low = if a < b { a } else { b }
+    let high = if a < b { b } else { a }
+    for p in seen {
+        if p.0 == low and p.1 == high {
+            return
+        }
+    }
+    seen.push((low, high))
+    out.push((low, high))
+}
+
+/// Empty the tree, keeping its region and its settings.
+///
+/// Rebuilding every frame is a real strategy for a world where everything
+/// moves: it costs one insertion per item and avoids the removal search
+/// entirely.
+pub fn clear(inout t: Quadtree) {
+    let root = t.node[0].bounds
+    t.node = [QuadNode{ bounds: root, items: [], children: [], depth: 0 }]
+}

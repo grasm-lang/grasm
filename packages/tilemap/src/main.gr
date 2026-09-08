@@ -1,0 +1,403 @@
+// Tile grids: reading them, walking them, and the coordinate maths that is
+// always wrong the first time.
+//
+// Three things here are worth more than the rest.
+//
+// **Auto-tiling by bitmask.** A wall tile's appearance depends on which of
+// its neighbours are also wall — a corner, a straight run, a T-junction. The
+// standard encoding is a bitmask of the neighbours, and the standard mistake
+// is the eight-neighbour version: a diagonal only counts when *both* of the
+// orthogonal neighbours between it and the centre are filled, or the tile
+// gets a corner piece where there is a gap. `bitmask8` implements that rule
+// and `bitmask4` the simpler one.
+//
+// **Line of sight.** Bresenham's line, used to ask whether one tile can see
+// another. The subtlety is symmetry: the line from A to B and the line from B
+// to A visit different cells when the slope is not exact, so a monster can
+// see the player while the player cannot see the monster. `visible_both_ways`
+// is the fix, and it is why sight is usually checked in both directions.
+//
+// **Isometric coordinates.** A diamond grid's screen position is not its
+// grid position rotated; it is a shear, and the inverse involves a division
+// by two that is easy to get backwards. Both directions are here, and they
+// round-trip.
+//
+// The CSV form is the one Tiled exports: rows of comma-separated numbers with
+// 0 for an empty cell, which is why every tile identifier here is one-based
+// with 0 reserved.
+
+type TileMap = {
+    width: i64,
+    height: i64,
+    /// Row-major, one entry a cell; 0 means empty.
+    tile: [i64],
+}
+
+type TileError =
+    | TileOutside(x: i64, y: i64)
+    | TileRaggedRow(row: i64, found: i64, wanted: i64)
+    | TileNotANumber(text: str)
+    | TileEmptySource
+
+pub fn new_map(width: i64, height: i64, fill: i64) -> TileMap {
+    var tiles: [i64] = []
+    for _i in 0..(width * height) {
+        tiles.push(fill)
+    }
+    return TileMap{ width: width, height: height, tile: tiles }
+}
+
+pub fn inside(m: TileMap, x: i64, y: i64) -> bool {
+    return x >= 0 and y >= 0 and x < m.width and y < m.height
+}
+
+/// The tile at a cell, or 0 outside the map.
+///
+/// Outside is empty rather than an error, because every neighbour lookup on
+/// an edge cell asks about a cell that is not there — and a version that
+/// failed would need a bounds check at every call site.
+pub fn at(m: TileMap, x: i64, y: i64) -> i64 {
+    if not inside(m, x, y) {
+        return 0
+    }
+    return m.tile[y * m.width + x]
+}
+
+pub fn set(inout m: TileMap, x: i64, y: i64, value: i64) ! TileError {
+    if not inside(m, x, y) {
+        fail(TileOutside(x, y))
+    }
+    m.tile[y * m.width + x] = value
+}
+
+/// Parse the comma-separated form Tiled exports.
+pub fn parse_csv(text: str) -> TileMap ! TileError {
+    var rows: [[i64]] = []
+    for line in text.split("\n") {
+        let trimmed = line.trim()
+        if trimmed == "" {
+            continue
+        }
+        var row: [i64] = []
+        for cell in trimmed.split(",") {
+            let value = cell.trim()
+            if value == "" {
+                continue
+            }
+            match value.parse_int() {
+                Some(n) -> row.push(n)
+                None -> fail(TileNotANumber(value))
+            }
+        }
+        rows.push(row)
+    }
+    if rows.len() == 0 {
+        fail(TileEmptySource)
+    }
+    let width = rows[0].len()
+    var tiles: [i64] = []
+    for i in 0..rows.len() {
+        if rows[i].len() != width {
+            fail(TileRaggedRow(i, rows[i].len(), width))
+        }
+        for v in rows[i] {
+            tiles.push(v)
+        }
+    }
+    return TileMap{ width: width, height: rows.len(), tile: tiles }
+}
+
+pub fn render_csv(m: TileMap) -> str {
+    var lines: [str] = []
+    for y in 0..m.height {
+        var row: [str] = []
+        for x in 0..m.width {
+            row.push("{at(m, x, y)}")
+        }
+        lines.push(row.join(","))
+    }
+    return lines.join("\n")
+}
+
+// ----------------------------------------------------------- auto-tiling
+
+/// The four-neighbour bitmask: north 1, east 2, south 4, west 8.
+///
+/// Sixteen combinations, which is the small tileset a top-down wall needs.
+pub fn bitmask4(m: TileMap, x: i64, y: i64, matches: fn(i64) -> bool) -> i64 {
+    var mask = 0
+    if matches(at(m, x, y - 1)) {
+        mask = mask + 1
+    }
+    if matches(at(m, x + 1, y)) {
+        mask = mask + 2
+    }
+    if matches(at(m, x, y + 1)) {
+        mask = mask + 4
+    }
+    if matches(at(m, x - 1, y)) {
+        mask = mask + 8
+    }
+    return mask
+}
+
+/// The eight-neighbour bitmask, with the corner rule.
+///
+/// A diagonal neighbour only contributes when both orthogonal neighbours
+/// between it and the centre are filled. Without that rule a wall with a
+/// diagonal gap gets an inside-corner tile drawn over the gap, which is the
+/// artefact that makes hand-written auto-tiling look broken.
+///
+/// North 1, north-east 2, east 4, south-east 8, south 16, south-west 32,
+/// west 64, north-west 128.
+pub fn bitmask8(m: TileMap, x: i64, y: i64, matches: fn(i64) -> bool) -> i64 {
+    let north = matches(at(m, x, y - 1))
+    let east = matches(at(m, x + 1, y))
+    let south = matches(at(m, x, y + 1))
+    let west = matches(at(m, x - 1, y))
+    var mask = 0
+    if north {
+        mask = mask + 1
+    }
+    if north and east and matches(at(m, x + 1, y - 1)) {
+        mask = mask + 2
+    }
+    if east {
+        mask = mask + 4
+    }
+    if east and south and matches(at(m, x + 1, y + 1)) {
+        mask = mask + 8
+    }
+    if south {
+        mask = mask + 16
+    }
+    if south and west and matches(at(m, x - 1, y + 1)) {
+        mask = mask + 32
+    }
+    if west {
+        mask = mask + 64
+    }
+    if west and north and matches(at(m, x - 1, y - 1)) {
+        mask = mask + 128
+    }
+    return mask
+}
+
+// -------------------------------------------------------------- walking
+
+/// The cells a line passes through, by Bresenham.
+pub fn line(x0: i64, y0: i64, x1: i64, y1: i64) -> [(i64, i64)] {
+    var out: [(i64, i64)] = []
+    var x = x0
+    var y = y0
+    let dx = absolute(x1 - x0)
+    let dy = 0 - absolute(y1 - y0)
+    let step_x = if x0 < x1 { 1 } else { 0 - 1 }
+    let step_y = if y0 < y1 { 1 } else { 0 - 1 }
+    var error = dx + dy
+    while true {
+        out.push((x, y))
+        if x == x1 and y == y1 {
+            return out
+        }
+        let doubled = error * 2
+        if doubled >= dy {
+            error = error + dy
+            x = x + step_x
+        }
+        if doubled <= dx {
+            error = error + dx
+            y = y + step_y
+        }
+    }
+    return out
+}
+
+fn absolute(n: i64) -> i64 {
+    if n < 0 {
+        return 0 - n
+    }
+    return n
+}
+
+/// Whether one cell can see another, with `blocks` saying what stops sight.
+///
+/// The endpoints do not block: a wall you are standing next to is visible,
+/// and a version that counted the destination as blocking would make every
+/// wall invisible.
+pub fn visible(m: TileMap, x0: i64, y0: i64, x1: i64, y1: i64,
+    blocks: fn(i64) -> bool) -> bool {
+    let cells = line(x0, y0, x1, y1)
+    for i in 1..(cells.len() - 1) {
+        if blocks(at(m, cells[i].0, cells[i].1)) {
+            return false
+        }
+    }
+    return true
+}
+
+/// Whether two cells can see each other from both ends.
+///
+/// Bresenham is not symmetric: the line from A to B and the line from B to A
+/// visit different cells on a half-slope, so sight can be one-way. Checking
+/// both is the usual fix, and it is why a monster sometimes sees a player
+/// through a wall in a game that only checked one direction.
+pub fn visible_both_ways(m: TileMap, x0: i64, y0: i64, x1: i64, y1: i64,
+    blocks: fn(i64) -> bool) -> bool {
+    return visible(m, x0, y0, x1, y1, blocks) and
+    visible(m, x1, y1, x0, y0, blocks)
+}
+
+/// Every cell reachable from a start, four-connected.
+pub fn flood(m: TileMap, x: i64, y: i64,
+    passable: fn(i64) -> bool) -> [(i64, i64)] {
+    var out: [(i64, i64)] = []
+    if not inside(m, x, y) or not passable(at(m, x, y)) {
+        return out
+    }
+    var seen: [bool] = []
+    for _i in 0..(m.width * m.height) {
+        seen.push(false)
+    }
+    var stack: [(i64, i64)] = [(x, y)]
+    seen[y * m.width + x] = true
+    while stack.len() > 0 {
+        let here = stack.pop() ?? (0, 0)
+        out.push(here)
+        let dx = [1, 0 - 1, 0, 0]
+        let dy = [0, 0, 1, 0 - 1]
+        for i in 0..4 {
+            let nx = here.0 + dx[i]
+            let ny = here.1 + dy[i]
+            if inside(m, nx, ny) and not seen[ny * m.width + nx] and
+            passable(at(m, nx, ny)) {
+                seen[ny * m.width + nx] = true
+                stack.push((nx, ny))
+            }
+        }
+    }
+    return out
+}
+
+/// Fill a connected region with a value.
+pub fn flood_fill(inout m: TileMap, x: i64, y: i64, value: i64,
+    passable: fn(i64) -> bool) -> i64 ! TileError {
+    let cells = flood(m, x, y, passable)
+    for cell in cells {
+        try set(m, cell.0, cell.1, value)
+    }
+    return cells.len()
+}
+
+/// How many separate regions the map has.
+///
+/// The number a level designer wants: two regions means part of the map is
+/// unreachable, which is usually a mistake and always worth knowing.
+pub fn region_count(m: TileMap, passable: fn(i64) -> bool) -> i64 {
+    var seen: [bool] = []
+    for _i in 0..(m.width * m.height) {
+        seen.push(false)
+    }
+    var regions = 0
+    for y in 0..m.height {
+        for x in 0..m.width {
+            if passable(at(m, x, y)) and not seen[y * m.width + x] {
+                regions = regions + 1
+                for cell in flood(m, x, y, passable) {
+                    seen[cell.1 * m.width + cell.0] = true
+                }
+            }
+        }
+    }
+    return regions
+}
+
+// --------------------------------------------------------- coordinates
+
+/// The top-left pixel of a cell in an orthogonal grid.
+pub fn to_screen(x: i64, y: i64, tile_width: i64,
+    tile_height: i64) -> (i64, i64) {
+    return (x * tile_width, y * tile_height)
+}
+
+/// The cell a pixel is in.
+///
+/// Floor division, not truncation: at `x = -1` with a tile 32 wide the cell
+/// is -1, and truncating towards zero gives 0 — so everything left of the
+/// origin is off by one.
+pub fn from_screen(px: i64, py: i64, tile_width: i64,
+    tile_height: i64) -> (i64, i64) {
+    return (floor_div(px, tile_width), floor_div(py, tile_height))
+}
+
+fn floor_div(a: i64, b: i64) -> i64 {
+    if (a < 0) != (b < 0) and a % b != 0 {
+        return a / b - 1
+    }
+    return a / b
+}
+
+/// The screen position of a cell on a diamond isometric grid.
+///
+/// The tile size is the diamond's full width and height, so a 64x32 tile is
+/// twice as wide as it is tall — which is the usual ratio and the reason the
+/// halves below are not symmetric.
+pub fn to_isometric(x: i64, y: i64, tile_width: i64,
+    tile_height: i64) -> (i64, i64) {
+    return ((x - y) * tile_width / 2, (x + y) * tile_height / 2)
+}
+
+/// The cell a pixel is in on a diamond isometric grid.
+///
+/// The inverse shear. It is easy to write the two divisions the wrong way
+/// round, and the symptom is a selection that tracks the mouse at half speed
+/// in one direction.
+pub fn from_isometric(px: i64, py: i64, tile_width: i64,
+    tile_height: i64) -> (i64, i64) {
+    let a = px * 2
+    let b = py * 2
+    return (floor_div(a * tile_height + b * tile_width,
+        2 * tile_width * tile_height),
+        floor_div(b * tile_width - a * tile_height,
+            2 * tile_width * tile_height))
+}
+
+/// The cells inside a rectangle of pixels, for drawing only what is on screen.
+pub fn visible_cells(m: TileMap, px: i64, py: i64, width: i64, height: i64,
+    tile_width: i64, tile_height: i64) -> [(i64, i64)] {
+    let start = from_screen(px, py, tile_width, tile_height)
+    let stop = from_screen(px + width, py + height, tile_width, tile_height)
+    var out: [(i64, i64)] = []
+    for y in start.1..(stop.1 + 1) {
+        for x in start.0..(stop.0 + 1) {
+            if inside(m, x, y) {
+                out.push((x, y))
+            }
+        }
+    }
+    return out
+}
+
+/// How many cells hold each tile identifier, for a histogram.
+pub fn counts_of(m: TileMap) -> [(i64, i64)] {
+    var ids: [i64] = []
+    var totals: [i64] = []
+    for v in m.tile {
+        var found = false
+        for i in 0..ids.len() {
+            if ids[i] == v {
+                totals[i] = totals[i] + 1
+                found = true
+            }
+        }
+        if not found {
+            ids.push(v)
+            totals.push(1)
+        }
+    }
+    var out: [(i64, i64)] = []
+    for i in 0..ids.len() {
+        out.push((ids[i], totals[i]))
+    }
+    return out
+}

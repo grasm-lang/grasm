@@ -22,7 +22,7 @@
 22-multithreaded-scraper/main.gr 2663
 23-turing-machine/main.gr 1857
 24-micro-vm/main.gr 2257
-25-dns-resolver/main.gr 2227
+25-dns-resolver/main.gr 2231
 26-garbage-collector/main.gr 1575
 27-sha256/main.gr 1754
 28-sql-engine/main.gr 3743
@@ -35,7 +35,7 @@
 35-blog-dashboard/main.gr 3153
 36-markdown-editor/main.gr 1736
 37-user-auth/main.gr 3449
-38-upload-gallery/main.gr 3277
+38-upload-gallery/main.gr 3269
 39-chat-router/main.gr 3085
 40-collaborative-todo/main.gr 4144
 41-spa-router/main.gr 2047

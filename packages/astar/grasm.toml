@@ -1,0 +1,6 @@
+[package]
+name = "astar"
+version = "1.0.0"
+
+# Searching a graph the caller describes. Opens nothing.
+capabilities = []

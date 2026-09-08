@@ -1,0 +1,10 @@
+[package]
+name = "palette"
+version = "1.0.0"
+
+# Arithmetic. Opens nothing.
+capabilities = []
+
+[dependencies.colorspace]
+path = "../colorspace"
+version = "^1.0.0"

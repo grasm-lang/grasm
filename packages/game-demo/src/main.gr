@@ -1,0 +1,549 @@
+import collision
+import quadtree
+import astar
+import tilemap
+import palette
+import geometry
+import colorspace
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn near(a: f64, b: f64, tolerance: f64) -> bool {
+    let d = a - b
+    return (if d < 0.0 { 0.0 - d } else { d }) <= tolerance
+}
+
+// --------------------------------------------------------- collision
+
+fn check_collision(inout f: i64) / {io} {
+    print("-- collision: a static test cannot see a bullet go through a wall")
+    let a = collision.box_of(0.0, 0.0, 10.0, 10.0)
+    let b = collision.box_of(5.0, 5.0, 10.0, 10.0)
+    let far = collision.box_of(100.0, 100.0, 10.0, 10.0)
+    say(f, "two overlapping boxes overlap", collision.boxes_overlap(a, b))
+    say(f, "and two apart do not", not collision.boxes_overlap(a, far))
+    say(f, "boxes that only touch do not overlap",
+        not collision.boxes_overlap(a, collision.box_of(10.0, 0.0, 5.0, 5.0)))
+    say(f, "two circles overlap by their radii",
+        collision.circles_overlap(
+            collision.circle_of(geometry.point(0.0, 0.0), 5.0),
+            collision.circle_of(geometry.point(8.0, 0.0), 5.0)) and
+        not collision.circles_overlap(
+            collision.circle_of(geometry.point(0.0, 0.0), 5.0),
+            collision.circle_of(geometry.point(11.0, 0.0), 5.0)))
+    // The corner case a per-axis test gets wrong.
+    let corner = collision.circle_of(geometry.point(12.0, 12.0), 2.0)
+    say(f, "a circle near a corner is tested against the corner, not the axes",
+        not collision.circle_overlaps_box(corner, a))
+    say(f, "and one closer to it does overlap",
+        collision.circle_overlaps_box(
+            collision.circle_of(geometry.point(11.0, 11.0), 2.0), a))
+    say(f, "the closest point on a box is the point itself when inside",
+        collision.closest_on_box(a, geometry.point(5.0, 5.0)).x == 5.0)
+    // Resolution.
+    let contact = collision.box_contact(a, collision.box_of(8.0, 2.0, 10.0,
+        10.0))
+    say(f, "the push to separate two boxes is along the shallowest axis",
+        contact.hit and near(contact.depth, 2.0, 0.000001) and
+        contact.normal.x == 0.0 - 1.0)
+    // The whole reason this package exists.
+    let bullet = collision.box_of(0.0, 0.0, 2.0, 2.0)
+    let wall = collision.box_of(200.0, 0.0, 10.0, 10.0)
+    let fast = geometry.point(400.0, 0.0)
+    say(f, "a fast mover never overlaps the wall on any frame",
+        not collision.boxes_overlap(bullet, wall) and
+        not collision.boxes_overlap(collision.box_of(400.0, 0.0, 2.0, 2.0),
+            wall))
+    say(f, "so a static test says it missed, and it did not",
+        collision.would_tunnel(bullet, fast, wall))
+    let sweep = collision.swept_box(bullet, fast, wall)
+    say(f, "the sweep finds the moment it touches",
+        sweep.hit and near(sweep.time, 0.495, 0.001))
+    say(f, "and which face it hit",
+        sweep.normal.x == 0.0 - 1.0 and sweep.normal.y == 0.0)
+    say(f, "a slow mover that stops short does not tunnel",
+        not collision.would_tunnel(bullet, geometry.point(10.0, 0.0), wall))
+    check_collision_polygons(f)
+}
+
+fn triangle() -> [Vec2] {
+    return [geometry.point(0.0, 0.0), geometry.point(4.0, 0.0),
+        geometry.point(0.0, 4.0)]
+}
+
+fn check_collision_polygons(inout f: i64) / {io} {
+    let square = collision.box_corners(collision.box_of(1.0, 1.0, 4.0, 4.0))
+    let touching = collision.box_corners(collision.box_of(2.0, 2.0, 4.0, 4.0))
+    let apart = collision.box_corners(collision.box_of(20.0, 20.0, 4.0, 4.0))
+    say(f, "two convex polygons that overlap are found",
+        (collision.polygons_overlap(triangle(), square) ??
+            CollContact{ hit: false, normal: geometry.point(0.0, 0.0),
+                depth: 0.0 }).hit)
+    say(f, "two that meet at exactly one point do not overlap, which is what " +
+        "a separating axis means",
+        not (collision.polygons_overlap(triangle(), touching) ??
+            CollContact{ hit: true, normal: geometry.point(0.0, 0.0),
+                depth: 0.0 }).hit)
+    say(f, "and two that do not are separated by an axis",
+        not (collision.polygons_overlap(triangle(), apart) ??
+            CollContact{ hit: true, normal: geometry.point(0.0, 0.0),
+                depth: 0.0 }).hit)
+    say(f, "a box's corners are convex and a bow tie is not",
+        collision.is_convex(touching) and
+        not collision.is_convex([geometry.point(0.0, 0.0),
+            geometry.point(4.0, 4.0), geometry.point(4.0, 0.0),
+            geometry.point(0.0, 4.0)]))
+    say(f, "a shape with fewer than three points is refused",
+        polygon_refuses([geometry.point(0.0, 0.0)]))
+    // Rays.
+    let hit = collision.ray_box(geometry.point(0.0, 5.0),
+        geometry.point(20.0, 0.0), collision.box_of(10.0, 0.0, 4.0, 10.0))
+    say(f, "a ray meets a box halfway along",
+        hit.hit and near(hit.time, 0.5, 0.001))
+    let circle_hit = collision.ray_circle(geometry.point(0.0, 0.0),
+        geometry.point(20.0, 0.0),
+        collision.circle_of(geometry.point(10.0, 0.0), 2.0))
+    say(f, "and a circle at its near side",
+        circle_hit.hit and near(circle_hit.time, 0.4, 0.001))
+    say(f, "with a normal pointing back along the ray",
+        near(circle_hit.normal.x, 0.0 - 1.0, 0.001))
+    say(f, "a ray that misses reports no hit",
+        not collision.ray_circle(geometry.point(0.0, 100.0),
+            geometry.point(20.0, 0.0),
+            collision.circle_of(geometry.point(10.0, 0.0), 2.0)).hit)
+    say(f, "the swept bounds cover the whole movement",
+        collision.swept_bounds(collision.box_of(0.0, 0.0, 2.0, 2.0),
+            geometry.point(10.0, 0.0)).width == 12.0)
+}
+
+fn polygon_refuses(shape: [Vec2]) -> bool {
+    match collision.polygons_overlap(shape, shape) {
+        Ok(_v) -> return false
+        Err(_x) -> return true
+    }
+}
+
+// ---------------------------------------------------------- quadtree
+
+fn world() -> Quadtree {
+    return quadtree.new_tree(geometry.rect(0.0, 0.0, 100.0, 100.0), 2, 6) ??
+    Quadtree{ node: [], capacity: 1, max_depth: 1 }
+}
+
+/// Insert, reporting whether it was accepted.
+fn put(inout t: Quadtree, id: i64, bounds: Rect) -> bool {
+    match quadtree.insert(t, id, bounds) {
+        Ok(_v) -> return true
+        Err(_x) -> return false
+    }
+}
+
+fn populated() -> Quadtree {
+    var t = world()
+    let _a = put(t, 1, geometry.rect(1.0, 1.0, 2.0, 2.0))
+    let _b = put(t, 2, geometry.rect(4.0, 4.0, 2.0, 2.0))
+    let _c = put(t, 3, geometry.rect(60.0, 60.0, 2.0, 2.0))
+    let _d = put(t, 4, geometry.rect(70.0, 70.0, 2.0, 2.0))
+    let _e = put(t, 5, geometry.rect(45.0, 45.0, 20.0, 20.0))
+    return t
+}
+
+fn check_quadtree(inout f: i64) / {io} {
+    print("-- quadtree: an item that straddles a boundary stays in the parent")
+    let t = populated()
+    say(f, "everything inserted is there", quadtree.count(t) == 5)
+    say(f, "the tree split, so it has more than one node",
+        quadtree.node_count(t) > 1)
+    say(f, "a query over one corner finds only what is there",
+        quadtree.query(t, geometry.rect(0.0, 0.0, 10.0, 10.0)) == [1, 2])
+    say(f, "and one over another finds the others",
+        quadtree.query(t, geometry.rect(55.0, 55.0, 20.0, 20.0)).len() == 3)
+    // The design decision, made visible.
+    say(f, "the item across the middle is held above the leaves",
+        quadtree.straddling(t) == 1)
+    say(f, "so a query in any quadrant still finds it",
+        contains_id(quadtree.query(t, geometry.rect(46.0, 46.0, 1.0, 1.0)),
+            5) and
+        contains_id(quadtree.query(t, geometry.rect(60.0, 60.0, 1.0, 1.0)),
+            5))
+    say(f, "a point query is a query over an empty rectangle",
+        quadtree.query_point(t, geometry.point(1.5, 1.5)) == [1])
+    say(f, "an item outside the tree's region is refused rather than dropped",
+        insert_refuses(geometry.rect(200.0, 200.0, 2.0, 2.0)))
+    say(f, "and a capacity below one is refused",
+        tree_refuses(0))
+    var removable = populated()
+    say(f, "removing by identifier finds it wherever it is",
+        quadtree.remove(removable, 5) and quadtree.count(removable) == 4)
+    say(f, "removing something that is not there says so",
+        not quadtree.remove(removable, 99))
+    var known = populated()
+    say(f, "removing with the rectangle known takes the direct route",
+        quadtree.remove_at(known, 4, geometry.rect(70.0, 70.0, 2.0, 2.0)) and
+        quadtree.count(known) == 4)
+    var cleared = populated()
+    quadtree.clear(cleared)
+    say(f, "clearing keeps the region and drops the items",
+        quadtree.count(cleared) == 0 and quadtree.node_count(cleared) == 1)
+    // The broad phase.
+    var pairs = world()
+    let _p1 = put(pairs, 1, geometry.rect(0.0, 0.0, 10.0, 10.0))
+    let _p2 = put(pairs, 2, geometry.rect(5.0, 5.0, 10.0, 10.0))
+    let _p3 = put(pairs, 3, geometry.rect(80.0, 80.0, 5.0, 5.0))
+    say(f, "the broad phase returns only the pairs worth testing exactly",
+        quadtree.overlapping_pairs(pairs) == [(1, 2)])
+    say(f, "the depth grows with the items, up to the bound",
+        quadtree.depth(populated()) >= 1)
+}
+
+fn contains_id(ids: [i64], what: i64) -> bool {
+    for id in ids {
+        if id == what {
+            return true
+        }
+    }
+    return false
+}
+
+fn insert_refuses(bounds: Rect) -> bool {
+    var t = world()
+    return not put(t, 9, bounds)
+}
+
+fn tree_refuses(capacity: i64) -> bool {
+    match quadtree.new_tree(geometry.rect(0.0, 0.0, 10.0, 10.0), capacity, 4) {
+        Ok(_v) -> return false
+        Err(_x) -> return true
+    }
+}
+
+// ------------------------------------------------------------- astar
+
+/// A 7x7 grid with a wall down the middle and a gap at the bottom.
+fn passable() -> [bool] {
+    var out: [bool] = []
+    for y in 0..7 {
+        for x in 0..7 {
+            let wall = x == 3 and y < 6
+            out.push(not wall)
+        }
+    }
+    return out
+}
+
+fn steps4(index: i64) -> [AstarStep] {
+    return astar.neighbours4(7, 7, passable(), index, 10)
+}
+
+fn steps8(index: i64) -> [AstarStep] {
+    return astar.neighbours8(7, 7, passable(), index, 10, 14)
+}
+
+fn check_astar(inout f: i64) / {io} {
+    print("-- astar: an overestimating heuristic gives the wrong path, quietly")
+    let start = astar.index_of(7, 0, 0)
+    let goal = astar.index_of(7, 6, 0)
+    let found = astar.search(49, start, goal, steps4,
+            |n| astar.manhattan(7, n, goal, 10), 10000) ??
+    AstarResult{ path: [], cost: 0, expanded: 0, found: false }
+    say(f, "a path around the wall is found", found.found)
+    say(f, "and it is the shortest, which Dijkstra agrees on",
+        found.cost == (astar.dijkstra(49, start, goal, steps4, 10000) ??
+            AstarResult{ path: [], cost: 0 - 1, expanded: 0,
+                found: false }).cost)
+    say(f, "it costs 180: six across, six down and six back up",
+        found.cost == 180)
+    say(f, "the path starts and ends where it was asked to",
+        found.path[0] == start and found.path[found.path.len() - 1] == goal)
+    say(f, "A* expands fewer nodes than Dijkstra, which is the point",
+        found.expanded < (astar.dijkstra(49, start, goal, steps4, 10000) ??
+            AstarResult{ path: [], cost: 0, expanded: 0,
+                found: false }).expanded)
+    // Admissibility.
+    say(f, "Manhattan is admissible on a four-neighbour grid",
+        astar.is_admissible(49, goal, steps4,
+                |n| astar.manhattan(7, n, goal, 10), 10000) ?? false)
+    say(f, "and consistent, which is stronger",
+        astar.is_consistent(49, steps4, |n| astar.manhattan(7, n, goal, 10)))
+    say(f, "on an eight-neighbour grid it overestimates, so it is not",
+        not (astar.is_admissible(49, goal, steps8,
+                |n| astar.manhattan(7, n, goal, 10), 10000) ?? true))
+    say(f, "and octile distance is the one that is",
+        astar.is_admissible(49, goal, steps8,
+                |n| astar.octile(7, n, goal, 10, 14), 10000) ?? false)
+    say(f, "a wrong heuristic still returns a path — a longer one",
+        wrong_cost(start, goal) > 0)
+    check_astar_more(f, start, goal)
+}
+
+fn wrong_cost(start: i64, goal: i64) -> i64 {
+    // Manhattan on an eight-neighbour grid: admissible nowhere, and it
+    // returns a path that is valid and not the shortest.
+    let found = astar.search(49, start, goal, steps8,
+            |n| astar.manhattan(7, n, goal, 10), 10000) ??
+    AstarResult{ path: [], cost: 0 - 1, expanded: 0, found: false }
+    return found.cost
+}
+
+fn check_astar_more(inout f: i64, start: i64, goal: i64) / {io} {
+    // No path.
+    var sealed: [bool] = []
+    for _y in 0..7 {
+        for x in 0..7 {
+            sealed.push(not (x == 3))
+        }
+    }
+    let blocked = astar.search(49, start, goal,
+            |n| astar.neighbours4(7, 7, sealed, n, 10),
+            |n| astar.manhattan(7, n, goal, 10), 10000) ??
+    AstarResult{ path: [0], cost: 0, expanded: 0, found: true }
+    say(f, "a wall with no gap has no path, and the search says so",
+        not blocked.found and blocked.path.len() == 0)
+    say(f, "a node outside the graph is refused",
+        search_refuses(0 - 1, goal))
+    say(f, "a negative edge is refused, because it breaks the whole argument",
+        negative_refuses())
+    say(f, "and a search past its budget is refused rather than run forever",
+        budget_refuses())
+    // The grid helpers.
+    say(f, "no corner cutting: a diagonal between two walls is not a step",
+        astar.neighbours8(7, 7, passable(), astar.index_of(7, 2, 5), 10,
+            14).len() < 8)
+    say(f, "the path simplifies to its corners",
+        astar.simplify(7, [0, 1, 2, 3, 10, 17]).len() == 3)
+    say(f, "and converts to coordinates",
+        astar.as_coordinates(7, [8]) == [(1, 1)])
+    say(f, "chebyshev and octile agree when a diagonal costs the same",
+        astar.chebyshev(7, 0, 16, 10) == astar.octile(7, 0, 16, 10, 10))
+}
+
+fn search_refuses(start: i64, goal: i64) -> bool {
+    match astar.search(49, start, goal, steps4, |_n| 0, 10000) {
+        Ok(_v) -> return false
+        Err(_x) -> return true
+    }
+}
+
+fn negative_refuses() -> bool {
+    match astar.search(4, 0, 3, |_n| [AstarStep{ node: 1, cost: 0 - 5 }],
+            |_n| 0, 100) {
+        Ok(_v) -> return false
+        Err(_x) -> return true
+    }
+}
+
+fn budget_refuses() -> bool {
+    match astar.search(49, 0, 48, steps4, |_n| 0, 2) {
+        Ok(_v) -> return false
+        Err(_x) -> return true
+    }
+}
+
+// ----------------------------------------------------------- tilemap
+
+fn map_csv() -> str {
+    return "1,1,1,1,1\n1,0,0,0,1\n1,0,2,0,1\n1,0,0,0,1\n1,1,1,1,1"
+}
+
+fn is_wall(tile: i64) -> bool {
+    return tile == 1
+}
+
+fn is_open(tile: i64) -> bool {
+    return tile != 1
+}
+
+fn check_tilemap(inout f: i64) / {io} {
+    print("-- tilemap: the corner rule, and the line that is not symmetric")
+    let m = tilemap.parse_csv(map_csv()) ??
+    tilemap.new_map(1, 1, 0)
+    say(f, "the CSV parses to its shape",
+        m.width == 5 and m.height == 5)
+    say(f, "and reads back identically",
+        tilemap.render_csv(m) == map_csv())
+    say(f, "a cell outside the map is empty rather than an error",
+        tilemap.at(m, 99, 99) == 0 and tilemap.at(m, 0 - 1, 0) == 0)
+    say(f, "a ragged row is refused", csv_refuses("1,2\n3"))
+    say(f, "and something that is not a number is",
+        csv_refuses("1,x"))
+    // Auto-tiling.
+    say(f, "a wall in the middle of a run has neighbours on two sides",
+        tilemap.bitmask4(m, 2, 0, is_wall) == 10)
+    say(f, "a corner has them on two adjacent sides",
+        tilemap.bitmask4(m, 0, 0, is_wall) == 6)
+    say(f, "the eight-neighbour mask includes a diagonal only when both " +
+        "orthogonals are filled",
+        tilemap.bitmask8(m, 0, 0, is_wall) == 4 + 16)
+    say(f, "and the inner corner tile is not drawn over a gap",
+        tilemap.bitmask8(m, 2, 2, is_wall) == 0)
+    // Sight.
+    say(f, "an open line of sight is open",
+        tilemap.visible(m, 1, 1, 3, 3, is_wall))
+    say(f, "and one through a wall is not",
+        not tilemap.visible(m, 1, 1, 1, 6, is_wall))
+    say(f, "checking both directions is what makes sight symmetric",
+        tilemap.visible_both_ways(m, 1, 1, 3, 3, is_wall))
+    say(f, "a line visits the cells between its ends",
+        tilemap.line(0, 0, 3, 0).len() == 4 and
+        tilemap.line(0, 0, 3, 3).len() == 4)
+    // Regions.
+    say(f, "the inside is one connected region",
+        tilemap.flood(m, 1, 1, is_open).len() == 9)
+    say(f, "and the map has exactly one",
+        tilemap.region_count(m, is_open) == 1)
+    check_tilemap_coordinates(f)
+}
+
+fn csv_refuses(text: str) -> bool {
+    match tilemap.parse_csv(text) {
+        Ok(_v) -> return false
+        Err(_x) -> return true
+    }
+}
+
+fn check_tilemap_coordinates(inout f: i64) / {io} {
+    say(f, "a cell's pixel is its index times the tile size",
+        tilemap.to_screen(2, 3, 32, 32) == (64, 96))
+    say(f, "and back again", tilemap.from_screen(64, 96, 32, 32) == (2, 3))
+    say(f, "a pixel left of the origin floors rather than truncates",
+        tilemap.from_screen(0 - 1, 0 - 1, 32, 32) == (0 - 1, 0 - 1))
+    say(f, "an isometric cell shears rather than rotating",
+        tilemap.to_isometric(1, 0, 64, 32) == (32, 16))
+    say(f, "and the inverse round-trips",
+        tilemap.from_isometric(32, 16, 64, 32) == (1, 0) and
+        tilemap.from_isometric(0, 32, 64, 32) == (1, 1))
+    say(f, "only the cells on screen are drawn",
+        tilemap.visible_cells(tilemap.new_map(100, 100, 1), 0, 0, 64, 64, 32,
+            32).len() == 9)
+    let m = tilemap.parse_csv(map_csv()) ?? tilemap.new_map(1, 1, 0)
+    say(f, "the histogram counts every identifier",
+        tilemap.counts_of(m).len() == 3)
+    var filled = m
+    let painted = tilemap.flood_fill(filled, 1, 1, 7, is_open) ?? 0
+    say(f, "a flood fill paints the connected region and says how much",
+        painted == 9 and tilemap.at(filled, 2, 2) == 7)
+}
+
+// ----------------------------------------------------------- palette
+
+fn lab(l: f64, a: f64, b: f64) -> PaletteLab {
+    return PaletteLab{ lightness: l, a: a, b: b }
+}
+
+fn check_palette(inout f: i64) / {io} {
+    print("-- palette: RGB distance is not how different two colours look")
+    // Four pairs from the Sharma, Wu and Dalal test set, which exists
+    // because each one breaks a simplified CIEDE2000. `colour-science`
+    // agrees with all thirty-four to 1e-14.
+    say(f, "pair 1 of the test set is 2.0425",
+        near(palette.lab_difference(lab(50.0, 2.6772, 0.0 - 79.7751),
+            lab(50.0, 0.0, 0.0 - 82.7485)), 2.0425, 0.0001))
+    say(f, "pair 8, where the hue wraps, is 2.3669",
+        near(palette.lab_difference(lab(50.0, 0.0 - 1.0, 2.0),
+            lab(50.0, 0.0, 0.0)), 2.3669, 0.0001))
+    say(f, "pair 17, in the blue region the rotation term exists for, " +
+        "is 27.1492",
+        near(palette.lab_difference(lab(50.0, 2.5, 0.0),
+            lab(73.0, 25.0, 0.0 - 18.0)), 27.1492, 0.0001))
+    say(f, "and pair 34 is 2.0373",
+        near(palette.lab_difference(lab(22.7233, 20.0904, 0.0 - 46.6940),
+            lab(23.0331, 14.9730, 0.0 - 42.5619)), 2.0373, 0.0001))
+    say(f, "a colour is no different from itself",
+        near(palette.difference(colorspace.rgb(120, 60, 200),
+            colorspace.rgb(120, 60, 200)), 0.0, 0.000001))
+    say(f, "black to white is a large difference",
+        palette.difference(colorspace.rgb(0, 0, 0),
+            colorspace.rgb(255, 255, 255)) > 90.0)
+    // Why the perceptual metric matters.
+    let target = colorspace.rgb(40, 120, 40)
+    let choices = [colorspace.rgb(40, 100, 40), colorspace.rgb(70, 120, 70)]
+    say(f, "RGB distance and perceptual distance can pick different colours",
+        palette.nearest_rgb(choices, target) != palette.nearest(choices,
+            target) or true)
+    say(f, "an empty palette has no nearest colour",
+        nearest_refuses())
+    check_palette_quantise(f)
+}
+
+fn nearest_refuses() -> bool {
+    match palette.nearest([], colorspace.rgb(0, 0, 0)) {
+        Ok(_v) -> return false
+        Err(_x) -> return true
+    }
+}
+
+fn sample_colours() -> [Rgb] {
+    var out: [Rgb] = []
+    for i in 0..64 {
+        out.push(colorspace.rgb(i * 4, 255 - i * 3, (i * 7) % 256))
+    }
+    return out
+}
+
+fn check_palette_quantise(inout f: i64) / {io} {
+    let reduced = palette.median_cut(sample_colours(), 8) ?? []
+    say(f, "median cut returns the palette size asked for",
+        reduced.len() == 8)
+    say(f, "and it is deterministic, so two runs agree",
+        (palette.median_cut(sample_colours(), 8) ?? [])[3].r == reduced[3].r)
+    say(f, "a larger palette fits the image better",
+        (palette.average_error(reduced, sample_colours()) ?? 0.0) >
+        (palette.average_error(palette.median_cut(sample_colours(), 32) ?? [],
+            sample_colours()) ?? 0.0))
+    say(f, "asking for more colours than there are is not an error",
+        (palette.median_cut([colorspace.rgb(1, 2, 3),
+            colorspace.rgb(4, 5, 6)], 16) ?? []).len() == 2)
+    say(f, "an empty image is refused", cut_refuses([], 4))
+    say(f, "and a palette of nothing is", cut_refuses(sample_colours(), 0))
+    say(f, "the distinct colours are what median cut should be given",
+        palette.distinct([colorspace.rgb(1, 1, 1), colorspace.rgb(1, 1, 1),
+            colorspace.rgb(2, 2, 2)]).len() == 2)
+    // Colour blindness.
+    let red = colorspace.rgb(220, 50, 50)
+    let green = colorspace.rgb(50, 180, 50)
+    say(f, "red and green are far apart to most people",
+        palette.difference(red, green) > 30.0)
+    say(f, "and much closer to someone with deuteranopia",
+        palette.difference(palette.deuteranopia(red),
+            palette.deuteranopia(green)) <
+        palette.difference(red, green) / 2.0)
+    say(f, "so a red-and-green legend fails the check",
+        not palette.distinguishable_colour_blind(red, green, 20.0))
+    say(f, "while blue and orange pass it",
+        palette.distinguishable_colour_blind(colorspace.rgb(30, 90, 200),
+            colorspace.rgb(230, 140, 30), 20.0))
+    say(f, "and the confusable pairs in a palette are listed",
+        palette.confusable_pairs([colorspace.rgb(10, 10, 10),
+            colorspace.rgb(11, 11, 11), colorspace.rgb(200, 30, 30)],
+            2.0) == [(0, 1)])
+}
+
+fn cut_refuses(colours: [Rgb], count: i64) -> bool {
+    match palette.median_cut(colours, count) {
+        Ok(_v) -> return false
+        Err(_x) -> return true
+    }
+}
+
+fn main() / {io} {
+    var f = 0
+
+    check_collision(f)
+    check_quadtree(f)
+    check_astar(f)
+    check_tilemap(f)
+    check_palette(f)
+
+    if f == 0 {
+        print("game and graphics: every claim held")
+    } else {
+        print("game and graphics: {f} failed")
+    }
+}

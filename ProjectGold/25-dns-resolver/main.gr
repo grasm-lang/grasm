@@ -180,7 +180,7 @@ fn read_name(b: bytes, start: i64) -> (str, i64) {
             if out.len() > 0 {
                 out = out + "."
             }
-            out = out + b.slice(i + 1, n).to_str()
+            out = out + b.slice(i + 1, i + 1 + n).to_str()
             i = i + 1 + n
         }
     }
@@ -259,7 +259,7 @@ fn demo() / {io, net} {
     let query = build_query(0x1234, "example.com")
     print("query is {query.len()} bytes")
     print("header:   {hex(query, 12)}")
-    print("question: {hex(query.slice(12, query.len() - 12), 32)}")
+    print("question: {hex(query.slice(12, query.len()), 32)}")
 
     // Both sockets ask for port 0, so this runs on a machine where whatever
     // port it would otherwise have picked is already held.

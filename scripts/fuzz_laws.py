@@ -406,7 +406,9 @@ LAWS = {
  "parse_float round trips":    'say(((2.5).to_str().parse_float() ?? 0.0) == 2.5)',
  "parse_int_base reads hex":   'say(("ff".parse_int_base(16) ?? 0) == 255)',
  "concat joins bytes":         'let a = bytes_of([1])\n    let b = bytes_of([2])\n    say(a.concat(b).len() == 2 and a.concat(b).at(1) == 2)',
- "slice takes a window":       'let b = bytes_of([1, 2, 3])\n    say(b.slice(1, 2).to_list() == [2, 3])',
+ # `slice` is `(start, end)` on `bytes` as it is on a list — see F97.
+    "slice takes a window":       'let b = bytes_of([1, 2, 3])\n    say(b.slice(1, 3).to_list() == [2, 3])',
+    "slice agrees with a list's":  'let b = bytes_of([1, 2, 3])\n    say(b.slice(1, 3).to_list() == b.to_list().slice(1, 3))',
  "at reads in order":          'let b = bytes_of([7, 8])\n    say(b.at(0) == 7 and b.at(1) == 8)',
  "first is the head":          'let xs = [4, 5, 6]\n    say((xs.first() ?? 0) == 4 and (xs.last() ?? 0) == 6)',
  "first of empty is none":     'let xs: [i64] = []\n    say(xs.first() == None and xs.is_empty())',

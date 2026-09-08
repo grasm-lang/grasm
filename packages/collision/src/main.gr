@@ -1,0 +1,423 @@
+// Collision detection in two dimensions, including the case a static test
+// cannot answer.
+//
+// **Tunnelling.** A bullet moving 400 pixels a frame and a wall 10 pixels
+// thick never overlap on any frame: the bullet is in front of it, then
+// behind it. Every static overlap test — AABB against AABB, circle against
+// circle — reports no collision, correctly, and the bullet goes through the
+// wall. The fix is a *swept* test that considers the whole path, and
+// `swept_aabb` is it: it returns the fraction of the frame at which the two
+// first touch, so the mover can be placed there instead of past it.
+//
+// The rest is the ordinary set, with the ordering that makes it fast: an AABB
+// test first because it is four comparisons, then the exact test only for the
+// pairs that survive. A separating-axis test for convex polygons is here for
+// the shapes a box cannot approximate, and it says *why* it separated — the
+// axis and the overlap — because that is what a resolver needs to push the
+// shapes apart.
+//
+// One numerical note: every test here uses a small tolerance rather than
+// exact equality, because two shapes that touch exactly are the case that
+// happens constantly in a physics loop and floating point never reproduces it
+// twice.
+
+import geometry
+
+/// An axis-aligned box, as a minimum corner and a size.
+type CollBox = {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+}
+
+type CollCircle = {
+    centre: Vec2,
+    radius: f64,
+}
+
+/// What a separating-axis test found.
+type CollContact = {
+    hit: bool,
+    /// The direction to push the first shape to separate them.
+    normal: Vec2,
+    /// How far along that direction.
+    depth: f64,
+}
+
+/// The result of a swept test.
+type CollSweep = {
+    hit: bool,
+    /// The fraction of the movement at which they first touch, 0 to 1.
+    time: f64,
+    normal: Vec2,
+}
+
+type CollError =
+    | CollNotConvex(at: i64)
+    | CollTooFewPoints(given: i64)
+
+    /// The tolerance every comparison here uses.
+pub fn epsilon() -> f64 {
+    return 0.000001
+}
+
+pub fn box_of(x: f64, y: f64, width: f64, height: f64) -> CollBox {
+    return CollBox{ x: x, y: y, width: width, height: height }
+}
+
+pub fn circle_of(centre: Vec2, radius: f64) -> CollCircle {
+    return CollCircle{ centre: centre, radius: radius }
+}
+
+pub fn box_right(b: CollBox) -> f64 {
+    return b.x + b.width
+}
+
+pub fn box_bottom(b: CollBox) -> f64 {
+    return b.y + b.height
+}
+
+pub fn box_centre(b: CollBox) -> Vec2 {
+    return geometry.point(b.x + b.width / 2.0, b.y + b.height / 2.0)
+}
+
+/// Do two boxes overlap?
+///
+/// Four comparisons, and the cheapest useful test there is — which is why
+/// everything else here is preceded by one.
+pub fn boxes_overlap(a: CollBox, b: CollBox) -> bool {
+    return a.x < box_right(b) and box_right(a) > b.x and
+    a.y < box_bottom(b) and box_bottom(a) > b.y
+}
+
+/// Do two circles overlap?
+///
+/// Compared as squared distances: a square root costs more than the
+/// comparison and changes nothing about the answer.
+pub fn circles_overlap(a: CollCircle, b: CollCircle) -> bool {
+    let dx = a.centre.x - b.centre.x
+    let dy = a.centre.y - b.centre.y
+    let reach = a.radius + b.radius
+    return dx * dx + dy * dy < reach * reach
+}
+
+pub fn box_holds_point(b: CollBox, p: Vec2) -> bool {
+    return p.x >= b.x and p.x <= box_right(b) and p.y >= b.y and
+    p.y <= box_bottom(b)
+}
+
+pub fn circle_holds_point(c: CollCircle, p: Vec2) -> bool {
+    let dx = p.x - c.centre.x
+    let dy = p.y - c.centre.y
+    return dx * dx + dy * dy <= c.radius * c.radius
+}
+
+/// The point on a box closest to `p`, which is `p` itself when inside.
+pub fn closest_on_box(b: CollBox, p: Vec2) -> Vec2 {
+    return geometry.point(clamp(p.x, b.x, box_right(b)),
+        clamp(p.y, b.y, box_bottom(b)))
+}
+
+fn clamp(v: f64, low: f64, high: f64) -> f64 {
+    if v < low {
+        return low
+    }
+    if v > high {
+        return high
+    }
+    return v
+}
+
+/// Does a circle overlap a box?
+///
+/// By the closest point on the box, which handles the corner case — a circle
+/// near a corner overlaps only if its centre is within the radius of that
+/// corner, and an axis-by-axis test says it overlaps when it does not.
+pub fn circle_overlaps_box(c: CollCircle, b: CollBox) -> bool {
+    let near = closest_on_box(b, c.centre)
+    let dx = c.centre.x - near.x
+    let dy = c.centre.y - near.y
+    return dx * dx + dy * dy < c.radius * c.radius
+}
+
+/// The overlap of two boxes, as the push needed to separate them.
+///
+/// The smallest of the four possible pushes, which is what a resolver wants:
+/// pushing along the deepest axis moves a shape further than it has to and
+/// makes a stack of boxes jitter.
+pub fn box_contact(a: CollBox, b: CollBox) -> CollContact {
+    if not boxes_overlap(a, b) {
+        return CollContact{ hit: false, normal: geometry.point(0.0, 0.0),
+            depth: 0.0 }
+    }
+    let left = box_right(b) - a.x
+    let right = box_right(a) - b.x
+    let up = box_bottom(b) - a.y
+    let down = box_bottom(a) - b.y
+    var depth = left
+    var normal = geometry.point(1.0, 0.0)
+    if right < depth {
+        depth = right
+        normal = geometry.point(0.0 - 1.0, 0.0)
+    }
+    if up < depth {
+        depth = up
+        normal = geometry.point(0.0, 1.0)
+    }
+    if down < depth {
+        depth = down
+        normal = geometry.point(0.0, 0.0 - 1.0)
+    }
+    return CollContact{ hit: true, normal: normal, depth: depth }
+}
+
+// ------------------------------------------------------------ the sweep
+
+/// When, during a movement, does a moving box first touch a static one?
+///
+/// The answer static tests cannot give. `time` is the fraction of the
+/// movement at which they touch — place the mover at `start + velocity *
+/// time` and it is against the wall rather than through it.
+///
+/// The method is a slab test: for each axis, the interval of time during
+/// which the boxes overlap on that axis. They collide when those intervals
+/// overlap, and the entry time is the later of the two entries.
+pub fn swept_box(moving: CollBox, velocity: Vec2,
+    static_box: CollBox) -> CollSweep {
+    let no_hit = CollSweep{ hit: false, time: 1.0,
+        normal: geometry.point(0.0, 0.0) }
+    var entry_x = 0.0
+    var exit_x = 1.0
+    if velocity.x == 0.0 {
+        if box_right(moving) <= static_box.x or
+        moving.x >= box_right(static_box) {
+            return no_hit
+        }
+    } else {
+        let near = (static_box.x - box_right(moving)) / velocity.x
+        let far = (box_right(static_box) - moving.x) / velocity.x
+        entry_x = near.min(far)
+        exit_x = near.max(far)
+    }
+    var entry_y = 0.0
+    var exit_y = 1.0
+    if velocity.y == 0.0 {
+        if box_bottom(moving) <= static_box.y or
+        moving.y >= box_bottom(static_box) {
+            return no_hit
+        }
+    } else {
+        let near = (static_box.y - box_bottom(moving)) / velocity.y
+        let far = (box_bottom(static_box) - moving.y) / velocity.y
+        entry_y = near.min(far)
+        exit_y = near.max(far)
+    }
+    let entry = entry_x.max(entry_y)
+    let exit = exit_x.min(exit_y)
+    if entry > exit or entry >= 1.0 or exit <= 0.0 {
+        return no_hit
+    }
+    var time = entry
+    if time < 0.0 {
+        time = 0.0
+    }
+    // The axis that entered last is the one that was hit, and its sign is
+    // the opposite of the movement along it.
+    var normal = geometry.point(0.0, 0.0)
+    if entry_x > entry_y {
+        normal = geometry.point(if velocity.x > 0.0 { 0.0 - 1.0 } else { 1.0 },
+            0.0)
+    } else {
+        normal = geometry.point(0.0,
+            if velocity.y > 0.0 { 0.0 - 1.0 } else { 1.0 })
+    }
+    return CollSweep{ hit: true, time: time, normal: normal }
+}
+
+/// Whether a static test would miss a collision the sweep finds.
+///
+/// The definition of tunnelling, made checkable: a mover that starts clear,
+/// ends clear, and touches something in between.
+pub fn would_tunnel(moving: CollBox, velocity: Vec2,
+    static_box: CollBox) -> bool {
+    let after = box_of(moving.x + velocity.x, moving.y + velocity.y,
+        moving.width, moving.height)
+    if boxes_overlap(moving, static_box) or boxes_overlap(after, static_box) {
+        return false
+    }
+    return swept_box(moving, velocity, static_box).hit
+}
+
+/// Where a ray first meets a box, as a fraction of its length.
+pub fn ray_box(origin: Vec2, direction: Vec2, b: CollBox) -> CollSweep {
+    return swept_box(box_of(origin.x, origin.y, 0.0, 0.0), direction, b)
+}
+
+/// Where a ray first meets a circle, as a fraction of its length.
+pub fn ray_circle(origin: Vec2, direction: Vec2, c: CollCircle) -> CollSweep {
+    let ox = origin.x - c.centre.x
+    let oy = origin.y - c.centre.y
+    let a = direction.x * direction.x + direction.y * direction.y
+    if a < epsilon() {
+        return CollSweep{ hit: false, time: 1.0,
+            normal: geometry.point(0.0, 0.0) }
+    }
+    let b = 2.0 * (ox * direction.x + oy * direction.y)
+    let cc = ox * ox + oy * oy - c.radius * c.radius
+    let discriminant = b * b - 4.0 * a * cc
+    if discriminant < 0.0 {
+        return CollSweep{ hit: false, time: 1.0,
+            normal: geometry.point(0.0, 0.0) }
+    }
+    let root = discriminant.sqrt()
+    var t = (0.0 - b - root) / (2.0 * a)
+    if t < 0.0 {
+        t = (0.0 - b + root) / (2.0 * a)
+    }
+    if t < 0.0 or t > 1.0 {
+        return CollSweep{ hit: false, time: 1.0,
+            normal: geometry.point(0.0, 0.0) }
+    }
+    let hit_x = origin.x + direction.x * t
+    let hit_y = origin.y + direction.y * t
+    return CollSweep{ hit: true, time: t,
+        normal: geometry.normalise(geometry.point(hit_x - c.centre.x,
+            hit_y - c.centre.y)) }
+}
+
+// -------------------------------------------------- separating axis
+
+/// Do two convex polygons overlap, and by how much?
+///
+/// The separating-axis theorem: two convex shapes are apart exactly when
+/// there is a line onto which their projections do not overlap, and the only
+/// lines worth testing are the normals of their edges. It returns the axis of
+/// least overlap, which is the direction to push them apart.
+///
+/// Convex only. A concave polygon has separating axes that are not edge
+/// normals, so the test reports an overlap that is not there — which is why
+/// every engine decomposes a concave shape into convex pieces first.
+pub fn polygons_overlap(a: [Vec2], b: [Vec2]) -> CollContact ! CollError {
+    if a.len() < 3 or b.len() < 3 {
+        fail(CollTooFewPoints(if a.len() < b.len() { a.len() } else {
+            b.len() }))
+    }
+    var depth = 1000000000.0
+    var normal = geometry.point(0.0, 0.0)
+    for shape in [a, b] {
+        for i in 0..shape.len() {
+            let p = shape[i]
+            let q = shape[(i + 1) % shape.len()]
+            let axis = geometry.normalise(geometry.point(0.0 - (q.y - p.y),
+                q.x - p.x))
+            let span_a = project(a, axis)
+            let span_b = project(b, axis)
+            let overlap = span_a.1.min(span_b.1) - span_a.0.max(span_b.0)
+            if overlap <= 0.0 {
+                return CollContact{ hit: false,
+                    normal: geometry.point(0.0, 0.0), depth: 0.0 }
+            }
+            if overlap < depth {
+                depth = overlap
+                normal = axis
+            }
+        }
+    }
+    // The normal must point from `a` towards `b`, whichever shape's edge it
+    // came from.
+    let between = geometry.point(centroid(b).x - centroid(a).x,
+        centroid(b).y - centroid(a).y)
+    if geometry.dot(between, normal) < 0.0 {
+        normal = geometry.point(0.0 - normal.x, 0.0 - normal.y)
+    }
+    return CollContact{ hit: true, normal: normal, depth: depth }
+}
+
+fn project(shape: [Vec2], axis: Vec2) -> (f64, f64) {
+    var low = geometry.dot(shape[0], axis)
+    var high = low
+    for p in shape {
+        let v = geometry.dot(p, axis)
+        if v < low {
+            low = v
+        }
+        if v > high {
+            high = v
+        }
+    }
+    return (low, high)
+}
+
+fn centroid(shape: [Vec2]) -> Vec2 {
+    var x = 0.0
+    var y = 0.0
+    for p in shape {
+        x = x + p.x
+        y = y + p.y
+    }
+    return geometry.point(x / shape.len().as_f64(), y / shape.len().as_f64())
+}
+
+/// Whether a polygon is convex, which the test above requires.
+pub fn is_convex(shape: [Vec2]) -> bool {
+    if shape.len() < 3 {
+        return false
+    }
+    var sign = 0
+    for i in 0..shape.len() {
+        let a = shape[i]
+        let b = shape[(i + 1) % shape.len()]
+        let c = shape[(i + 2) % shape.len()]
+        let cross = (b.x - a.x) * (c.y - b.y) - (b.y - a.y) * (c.x - b.x)
+        if cross > epsilon() {
+            if sign < 0 {
+                return false
+            }
+            sign = 1
+        }
+        if cross < 0.0 - epsilon() {
+            if sign > 0 {
+                return false
+            }
+            sign = 0 - 1
+        }
+    }
+    return true
+}
+
+/// A box as its four corners, for the polygon test.
+pub fn box_corners(b: CollBox) -> [Vec2] {
+    return [geometry.point(b.x, b.y), geometry.point(box_right(b), b.y),
+        geometry.point(box_right(b), box_bottom(b)),
+        geometry.point(b.x, box_bottom(b))]
+}
+
+/// The box that contains a set of points, for a broad-phase test.
+pub fn bounding_box(points: [Vec2]) -> CollBox ! CollError {
+    if points.len() == 0 {
+        fail(CollTooFewPoints(0))
+    }
+    var low_x = points[0].x
+    var high_x = low_x
+    var low_y = points[0].y
+    var high_y = low_y
+    for p in points {
+        low_x = low_x.min(p.x)
+        high_x = high_x.max(p.x)
+        low_y = low_y.min(p.y)
+        high_y = high_y.max(p.y)
+    }
+    return box_of(low_x, low_y, high_x - low_x, high_y - low_y)
+}
+
+/// The box a moving box sweeps out, for a broad-phase test over a frame.
+pub fn swept_bounds(b: CollBox, velocity: Vec2) -> CollBox {
+    let x = if velocity.x > 0.0 { b.x } else { b.x + velocity.x }
+    let y = if velocity.y > 0.0 { b.y } else { b.y + velocity.y }
+    let width = b.width + (if velocity.x > 0.0 { velocity.x } else {
+        0.0 - velocity.x })
+    let height = b.height + (if velocity.y > 0.0 { velocity.y } else {
+        0.0 - velocity.y })
+    return box_of(x, y, width, height)
+}

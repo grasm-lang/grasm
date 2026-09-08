@@ -1,0 +1,371 @@
+// A*, and the one property that decides whether it finds the shortest path.
+//
+// **The heuristic must never overestimate.** A* expands the node with the
+// lowest `g + h`, and it stops when the goal comes off the queue. That is
+// only correct if `h` never claims a node is further from the goal than it
+// is: an overestimate lets A* stop early, on a path that is not the shortest,
+// and it does so silently — the answer is a valid path of the wrong length.
+// A heuristic that never overestimates is called *admissible*, and
+// `is_admissible` here checks it against a known distance so a wrong one can
+// be found in a test rather than in a bug report.
+//
+// The second property is **consistency**: `h(a) <= cost(a, b) + h(b)` for
+// every edge. A consistent heuristic is also admissible, and it is what lets
+// A* close a node permanently the first time it is reached. Without it a node
+// can be reached again by a cheaper route after being closed, and an
+// implementation that never reopens returns a path that is not the shortest.
+// This one reopens, so an inconsistent-but-admissible heuristic still gives
+// the right answer — at the cost of doing more work.
+//
+// The graph is described by two functions the caller supplies: the
+// neighbours of a node with their costs, and the heuristic. Nodes are `i64`,
+// which is what a grid index or a table row already is; a caller with
+// something else numbers it once.
+//
+// The frontier is a binary heap. A linear scan is simpler and turns A* into
+// `O(n^2)`, which is the difference between a 1000x1000 grid searching in
+// milliseconds and in minutes.
+
+/// The result of a search.
+type AstarResult = {
+    /// The nodes from start to goal, or empty when there is no path.
+    path: [i64],
+    cost: i64,
+    /// How many nodes came off the frontier — the number to watch when
+    /// judging a heuristic.
+    expanded: i64,
+    found: bool,
+}
+
+/// A neighbour and what it costs to step to it.
+type AstarStep = {
+    node: i64,
+    cost: i64,
+}
+
+type AstarError =
+    | AstarBadNode(node: i64, count: i64)
+    | AstarNegativeCost(from: i64, to: i64, cost: i64)
+    | AstarBudgetSpent(expanded: i64)
+
+    /// A binary min-heap keyed by `f`, with the node beside it.
+type AstarHeap = {
+    key: [i64],
+    node: [i64],
+}
+
+fn push(inout h: AstarHeap, key: i64, node: i64) {
+    h.key.push(key)
+    h.node.push(node)
+    var i = h.key.len() - 1
+    while i > 0 {
+        let parent = (i - 1) / 2
+        if h.key[parent] <= h.key[i] {
+            return
+        }
+        swap(h, i, parent)
+        i = parent
+    }
+}
+
+fn pop(inout h: AstarHeap) -> i64 {
+    let top = h.node[0]
+    let last = h.key.len() - 1
+    h.key[0] = h.key[last]
+    h.node[0] = h.node[last]
+    let _k = h.key.pop()
+    let _n = h.node.pop()
+    var i = 0
+    while true {
+        let left = i * 2 + 1
+        let right = left + 1
+        var best = i
+        if left < h.key.len() and h.key[left] < h.key[best] {
+            best = left
+        }
+        if right < h.key.len() and h.key[right] < h.key[best] {
+            best = right
+        }
+        if best == i {
+            return top
+        }
+        swap(h, i, best)
+        i = best
+    }
+    return top
+}
+
+fn swap(inout h: AstarHeap, a: i64, b: i64) {
+    let k = h.key[a]
+    h.key[a] = h.key[b]
+    h.key[b] = k
+    let n = h.node[a]
+    h.node[a] = h.node[b]
+    h.node[b] = n
+}
+
+/// Search from `start` to `goal` over `count` nodes.
+///
+/// `neighbours` gives the steps out of a node; `heuristic` estimates the
+/// remaining cost. `budget` bounds how many nodes may be expanded before the
+/// search gives up — a search over a graph the caller generates lazily can
+/// otherwise run forever on an unreachable goal.
+pub fn search(count: i64, start: i64, goal: i64,
+    neighbours: fn(i64) -> [AstarStep], heuristic: fn(i64) -> i64,
+    budget: i64) -> AstarResult ! AstarError {
+    if start < 0 or start >= count {
+        fail(AstarBadNode(start, count))
+    }
+    if goal < 0 or goal >= count {
+        fail(AstarBadNode(goal, count))
+    }
+    var best: [i64] = []
+    var came_from: [i64] = []
+    for _i in 0..count {
+        // A cost of -1 means "not reached", which is distinguishable from a
+        // real cost in a way that a large number is not.
+        best.push(0 - 1)
+        came_from.push(0 - 1)
+    }
+    var frontier = AstarHeap{ key: [], node: [] }
+    best[start] = 0
+    push(frontier, heuristic(start), start)
+    var expanded = 0
+    while frontier.key.len() > 0 {
+        let current = pop(frontier)
+        if current == goal {
+            return AstarResult{ path: rebuild(came_from, start, goal),
+                cost: best[goal], expanded: expanded, found: true }
+        }
+        expanded = expanded + 1
+        if expanded > budget {
+            fail(AstarBudgetSpent(expanded))
+        }
+        for step in neighbours(current) {
+            if step.node < 0 or step.node >= count {
+                fail(AstarBadNode(step.node, count))
+            }
+            if step.cost < 0 {
+                // A negative edge breaks the whole argument: a node closed at
+                // one cost could be reachable later for less, and A* would
+                // have to reopen everything. Dijkstra has the same rule.
+                fail(AstarNegativeCost(current, step.node, step.cost))
+            }
+            let candidate = best[current] + step.cost
+            if best[step.node] < 0 or candidate < best[step.node] {
+                best[step.node] = candidate
+                came_from[step.node] = current
+                push(frontier, candidate + heuristic(step.node), step.node)
+            }
+        }
+    }
+    return AstarResult{ path: [], cost: 0 - 1, expanded: expanded,
+        found: false }
+}
+
+fn rebuild(came_from: [i64], start: i64, goal: i64) -> [i64] {
+    var backwards: [i64] = [goal]
+    var current = goal
+    while current != start and came_from[current] >= 0 {
+        current = came_from[current]
+        backwards.push(current)
+    }
+    var out: [i64] = []
+    var i = backwards.len() - 1
+    while i >= 0 {
+        out.push(backwards[i])
+        i = i - 1
+    }
+    return out
+}
+
+/// Dijkstra: A* with a heuristic of zero.
+///
+/// Always correct and always slower, because it expands in every direction.
+/// Worth having as the answer to check a heuristic against.
+pub fn dijkstra(count: i64, start: i64, goal: i64,
+    neighbours: fn(i64) -> [AstarStep],
+    budget: i64) -> AstarResult ! AstarError {
+    return try search(count, start, goal, neighbours, |_n| 0, budget)
+}
+
+/// Whether a heuristic never overestimates, checked against the truth.
+///
+/// The truth comes from a Dijkstra search, which needs no heuristic. Run this
+/// over a representative map in a test: an inadmissible heuristic produces a
+/// path that is valid, shorter to compute, and not the shortest — and nothing
+/// else will tell you.
+pub fn is_admissible(count: i64, goal: i64,
+    neighbours: fn(i64) -> [AstarStep], heuristic: fn(i64) -> i64,
+    budget: i64) -> bool ! AstarError {
+    for node in 0..count {
+        let truth = try dijkstra(count, node, goal, neighbours, budget)
+        if truth.found and heuristic(node) > truth.cost {
+            return false
+        }
+    }
+    return true
+}
+
+/// Whether a heuristic is consistent: `h(a) <= cost(a, b) + h(b)`.
+///
+/// Consistency implies admissibility and is usually easier to check, because
+/// it is a property of each edge rather than of the whole graph.
+pub fn is_consistent(count: i64, neighbours: fn(i64) -> [AstarStep],
+    heuristic: fn(i64) -> i64) -> bool {
+    for node in 0..count {
+        for step in neighbours(node) {
+            if heuristic(node) > step.cost + heuristic(step.node) {
+                return false
+            }
+        }
+    }
+    return true
+}
+
+// ------------------------------------------------------------ grid help
+
+/// The index of a cell in a row-major grid.
+pub fn index_of(width: i64, x: i64, y: i64) -> i64 {
+    return y * width + x
+}
+
+pub fn column_of(width: i64, index: i64) -> i64 {
+    return index % width
+}
+
+pub fn row_of(width: i64, index: i64) -> i64 {
+    return index / width
+}
+
+/// Manhattan distance, scaled by the cost of one step.
+///
+/// The right heuristic for a four-neighbour grid, and admissible there. On an
+/// eight-neighbour grid it **overestimates** — a diagonal covers two
+/// Manhattan steps for the price of about one and a half — so using it there
+/// is the classic way to get a wrong path from a correct implementation.
+pub fn manhattan(width: i64, a: i64, b: i64, step_cost: i64) -> i64 {
+    let dx = absolute(column_of(width, a) - column_of(width, b))
+    let dy = absolute(row_of(width, a) - row_of(width, b))
+    return (dx + dy) * step_cost
+}
+
+/// Chebyshev distance, for an eight-neighbour grid with equal costs.
+pub fn chebyshev(width: i64, a: i64, b: i64, step_cost: i64) -> i64 {
+    let dx = absolute(column_of(width, a) - column_of(width, b))
+    let dy = absolute(row_of(width, a) - row_of(width, b))
+    return (if dx > dy { dx } else { dy }) * step_cost
+}
+
+/// Octile distance: the admissible heuristic for a grid where a diagonal
+/// costs more than a straight step.
+///
+/// With a straight step of 10 and a diagonal of 14 — the usual integer
+/// approximation of 1 and root two — this is the exact cost of an
+/// unobstructed path, which makes it both admissible and as informed as a
+/// heuristic can be.
+pub fn octile(width: i64, a: i64, b: i64, straight: i64,
+    diagonal: i64) -> i64 {
+    let dx = absolute(column_of(width, a) - column_of(width, b))
+    let dy = absolute(row_of(width, a) - row_of(width, b))
+    let low = if dx < dy { dx } else { dy }
+    let high = if dx > dy { dx } else { dy }
+    return diagonal * low + straight * (high - low)
+}
+
+fn absolute(n: i64) -> i64 {
+    if n < 0 {
+        return 0 - n
+    }
+    return n
+}
+
+/// The four orthogonal neighbours of a cell that are inside the grid and
+/// passable.
+pub fn neighbours4(width: i64, height: i64, passable: [bool], index: i64,
+    step_cost: i64) -> [AstarStep] {
+    var out: [AstarStep] = []
+    let x = column_of(width, index)
+    let y = row_of(width, index)
+    let dx = [1, 0 - 1, 0, 0]
+    let dy = [0, 0, 1, 0 - 1]
+    for i in 0..4 {
+        let nx = x + dx[i]
+        let ny = y + dy[i]
+        if nx >= 0 and nx < width and ny >= 0 and ny < height {
+            let at = index_of(width, nx, ny)
+            if passable[at] {
+                out.push(AstarStep{ node: at, cost: step_cost })
+            }
+        }
+    }
+    return out
+}
+
+/// The eight neighbours, with diagonals costing more and no corner cutting.
+///
+/// No corner cutting: a diagonal step between two blocked orthogonal
+/// neighbours is refused, because a unit moving that way passes through a
+/// wall corner. Allowing it is the reason characters clip through scenery.
+pub fn neighbours8(width: i64, height: i64, passable: [bool], index: i64,
+    straight: i64, diagonal: i64) -> [AstarStep] {
+    var out: [AstarStep] = []
+    let x = column_of(width, index)
+    let y = row_of(width, index)
+    let dx = [1, 0 - 1, 0, 0, 1, 1, 0 - 1, 0 - 1]
+    let dy = [0, 0, 1, 0 - 1, 1, 0 - 1, 1, 0 - 1]
+    for i in 0..8 {
+        let nx = x + dx[i]
+        let ny = y + dy[i]
+        if nx >= 0 and nx < width and ny >= 0 and ny < height {
+            let at = index_of(width, nx, ny)
+            if passable[at] {
+                if i < 4 {
+                    out.push(AstarStep{ node: at, cost: straight })
+                } else {
+                    let side_a = passable[index_of(width, nx, y)]
+                    let side_b = passable[index_of(width, x, ny)]
+                    if side_a and side_b {
+                        out.push(AstarStep{ node: at, cost: diagonal })
+                    }
+                }
+            }
+        }
+    }
+    return out
+}
+
+/// The path as (x, y) pairs, for a caller that thinks in coordinates.
+pub fn as_coordinates(width: i64, path: [i64]) -> [(i64, i64)] {
+    var out: [(i64, i64)] = []
+    for index in path {
+        out.push((column_of(width, index), row_of(width, index)))
+    }
+    return out
+}
+
+/// A path with the redundant middle points removed.
+///
+/// A grid path is a staircase; a unit that follows it turns on every cell.
+/// Dropping the points that lie on a straight run between their neighbours
+/// leaves the corners, which is what a mover should steer between.
+pub fn simplify(width: i64, path: [i64]) -> [i64] {
+    if path.len() < 3 {
+        return path
+    }
+    var out: [i64] = [path[0]]
+    for i in 1..(path.len() - 1) {
+        let before = path[i - 1]
+        let here = path[i]
+        let after = path[i + 1]
+        let dx1 = column_of(width, here) - column_of(width, before)
+        let dy1 = row_of(width, here) - row_of(width, before)
+        let dx2 = column_of(width, after) - column_of(width, here)
+        let dy2 = row_of(width, after) - row_of(width, here)
+        if dx1 != dx2 or dy1 != dy2 {
+            out.push(here)
+        }
+    }
+    out.push(path[path.len() - 1])
+    return out
+}
