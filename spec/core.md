@@ -224,10 +224,10 @@ The budgets, measured rather than asserted:
 |---|---|---|
 | Core constructs | ≤ 30 | **36** |
 | Reference interpreter | ≤ 5,000 lines | **9046** |
-| Specification | ≤ 50 pages | ~55 pages |
+| Specification | ≤ 50 pages | **~70 pages** |
 
-None of the three is met. All three are now measured on every test run, which
-is the difference between a target and a slogan.
+None of the three is met, and all three are measured on every run. The
+specification's is the binding one: a new clause is paid for out of prose.
 
 The interpreter grew 6,009 → 6,667 for readiness and datagrams ([L-LIB-NET],
 [L-LIB-UDP]), then → 9046 for the sender's address, the file calls a

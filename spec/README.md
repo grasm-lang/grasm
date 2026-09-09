@@ -31,15 +31,10 @@ cargo test -p grasm_spec
 ## Status
 
 This directory describes the language the implementation supports today. The
-**Grasm-Core / Grasm-Full split** that MASTERPLAN §19.2 makes binding is defined
-in [`core.md`](core.md), with a rewrite for every Full form and a test that fails
-when a new syntactic form is classified as neither.
-
-That document also records what is *not* met: Core is 37 forms against a budget
-of 30, the reference interpreter is 6,009 lines against 5,000, and this
-specification is about 55 pages against 50. Those three numbers were asserted as
-met for a long time before anybody measured them. It is not yet a frozen 1.0 specification; see
-`STABILITY.md` in the repository root for what stability guarantees exist.
+**Grasm-Core / Grasm-Full split** MASTERPLAN §19.2 makes binding is defined in
+[`core.md`](core.md), with a rewrite for every Full form, a test that refuses a
+form classified as neither, and the three §19.2 budgets measured on every run —
+none of which is met. This is not a frozen 1.0; `STABILITY.md` says what is.
 
 ## Conformance program format
 
