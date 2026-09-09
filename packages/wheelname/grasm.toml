@@ -1,0 +1,10 @@
+[package]
+name = "wheelname"
+version = "1.0.0"
+
+# Reading file names. Opens nothing.
+capabilities = []
+
+[dependencies.pep440]
+path = "../pep440"
+version = "^1.0.0"

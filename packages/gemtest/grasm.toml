@@ -1,0 +1,8 @@
+[package]
+name = "gemtest"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.gemversion]
+path = "../gemversion"
+version = "^1.0.0"

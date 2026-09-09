@@ -1,0 +1,571 @@
+// Package URLs, the identifier an SBOM uses to say which package it
+// means.
+//
+//   pkg:npm/%40angular/animation@12.3.1
+//   pkg:pypi/django-package@1.11.1.dev1
+//   pkg:maven/org.apache.xmlgraphics/batik-anim@1.9.1?type=zip
+//   pkg:golang/google.golang.org/genproto#googleapis/api/annotations
+//
+// The shape is
+//
+//   pkg:type/namespace/name@version?qualifiers#subpath
+//
+// and every field except the type and the name may be absent. Two things
+// make this harder than it looks, and both are why a vulnerability
+// scanner mismatches packages:
+//
+//   - **The separators can appear inside the fields.** A name may hold
+//     an `@`, a qualifier value may hold a `/`, so the string is taken
+//     apart from the right in a fixed order — subpath, then qualifiers,
+//     then version — and each field is percent-decoded only afterwards.
+//     A reader that decodes first, or splits from the left, gets a
+//     different package.
+//   - **Each type normalises differently.** `pkg:PYPI/Django_package`
+//     and `pkg:pypi/django-package` are the same package; for `maven`
+//     the same transformation would be wrong, because a Maven artifact
+//     id is case-sensitive. So the type decides what case means, and
+//     comparing two purls without normalising them first reports two
+//     packages where there is one.
+//
+// ## Canonical form
+//
+// `render` writes the form two implementations must agree on: the type
+// lower case, the qualifiers sorted by key, every field percent-encoded
+// down to the unreserved characters and `:`. That is what a purl in a
+// document should be, and what comparison should be done on.
+
+type PurlError =
+    | NoScheme(text: str)
+    | NoType(text: str)
+    | BadType(text: str)
+    | NoName(text: str)
+    | BadQualifierKey(key: str)
+    | NamespaceRequired(kind: str)
+    | NamespaceProhibited(kind: str)
+    | BadName(name: str)
+    | BadVersion(version: str)
+    | QualifierRequired(key: str)
+
+    /// A package URL, taken apart and normalised.
+type Purl = {
+    /// Always lower case. `type` is a word this language keeps.
+    kind: str,
+    /// The empty string when there is none.
+    namespace: str,
+    name: str,
+    /// The empty string when there is none.
+    version: str,
+    /// Sorted by key, and never holding an empty value.
+    qualifiers: [(str, str)],
+    /// The empty string when there is none.
+    subpath: str,
+}
+
+fn is_digit(character: str) -> bool {
+    return character >= "0" and character <= "9"
+}
+
+fn is_letter(character: str) -> bool {
+    return (character >= "a" and character <= "z") or
+    (character >= "A" and character <= "Z")
+}
+
+fn is_unreserved(character: str) -> bool {
+    return is_letter(character) or is_digit(character) or character == "-" or
+    character == "." or character == "_" or character == "~"
+}
+
+fn hex_value(character: str) -> i64 {
+    if is_digit(character) {
+        return character.code_at(0) - "0".code_at(0)
+    }
+    let lower = character.to_lower()
+    if lower >= "a" and lower <= "f" {
+        return lower.code_at(0) - "a".code_at(0) + 10
+    }
+    return 0 - 1
+}
+
+/// Undo percent-encoding. Bytes are collected first, so a multi-byte
+/// character written as several escapes comes back as one character.
+pub fn percent_decode(text: str) -> str {
+    var out: [i64] = []
+    var i = 0
+    while i < text.len() {
+        if text.substr(i, 1) == "%" and i + 2 < text.len() {
+            let high = hex_value(text.substr(i + 1, 1))
+            let low = hex_value(text.substr(i + 2, 1))
+            if high >= 0 and low >= 0 {
+                out.push(high * 16 + low)
+                i = i + 3
+                continue
+            }
+        }
+        let raw = text.substr(i, 1).to_bytes()
+        var b = 0
+        while b < raw.len() {
+            out.push(raw.at(b))
+            b = b + 1
+        }
+        i = i + 1
+    }
+    return bytes_of(out).to_str()
+}
+
+/// Percent-encode everything a purl field may not carry literally.
+///
+/// `:` stays as written — `1:0.47.4-4` is a real Arch version and an
+/// epoch that came back as `%3A` would not match the package.
+pub fn percent_encode(text: str) -> str {
+    let digits = "0123456789ABCDEF"
+    var out = ""
+    let raw = text.to_bytes()
+    var i = 0
+    while i < raw.len() {
+        let byte = raw.at(i)
+        let character = bytes_of([byte]).to_str()
+        if (byte < 128 and is_unreserved(character)) or character == ":" {
+            out = out + character
+        } else {
+            out = out + "%" + digits.substr(byte / 16, 1) +
+            digits.substr(byte % 16, 1)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn last_index_of(text: str, needle: str) -> i64 {
+    var at = 0 - 1
+    var i = 0
+    while i < text.len() {
+        if text.substr(i, 1) == needle {
+            at = i
+        }
+        i = i + 1
+    }
+    return at
+}
+
+fn index_of(text: str, needle: str) -> i64 {
+    var i = 0
+    while i < text.len() {
+        if text.substr(i, 1) == needle {
+            return i
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+fn strip(text: str, character: str) -> str {
+    var start = 0
+    while start < text.len() and text.substr(start, 1) == character {
+        start = start + 1
+    }
+    var end = text.len()
+    while end > start and text.substr(end - 1, 1) == character {
+        end = end - 1
+    }
+    return text.substr(start, end - start)
+}
+
+fn trim(text: str) -> str {
+    var start = 0
+    while start < text.len() and (text.substr(start, 1) == " " or
+        text.substr(start, 1) == "\t" or text.substr(start, 1) == "\n" or
+        text.substr(start, 1) == "\r") {
+        start = start + 1
+    }
+    var end = text.len()
+    while end > start and (text.substr(end - 1, 1) == " " or
+        text.substr(end - 1, 1) == "\t" or text.substr(end - 1, 1) == "\n" or
+        text.substr(end - 1, 1) == "\r") {
+        end = end - 1
+    }
+    return text.substr(start, end - start)
+}
+
+/// Read a purl string.
+pub fn parse(text: str) -> Purl ! PurlError {
+    let whole = trim(text)
+    let colon = index_of(whole, ":")
+    if colon < 0 or whole.substr(0, colon).to_lower() != "pkg" {
+        fail(NoScheme(text))
+    }
+    var rest = whole.substr(colon + 1, whole.len() - colon - 1)
+    // `pkg://type/...` is written in the wild and means the same thing.
+    while rest.starts_with("/") {
+        rest = rest.substr(1, rest.len() - 1)
+    }
+    // Right to left: the subpath, then the qualifiers, then the version.
+    var subpath = ""
+    let hash = last_index_of(rest, "#")
+    if hash >= 0 {
+        subpath = rest.substr(hash + 1, rest.len() - hash - 1)
+        rest = rest.substr(0, hash)
+    }
+    var qualifiers_text = ""
+    let question = last_index_of(rest, "?")
+    if question >= 0 {
+        qualifiers_text = rest.substr(question + 1, rest.len() - question - 1)
+        rest = rest.substr(0, question)
+    }
+    let slash = index_of(rest, "/")
+    if slash <= 0 {
+        fail(NoType(text))
+    }
+    let kind = rest.substr(0, slash).to_lower()
+    try check_type(kind)
+    rest = rest.substr(slash + 1, rest.len() - slash - 1)
+    while rest.starts_with("/") {
+        rest = rest.substr(1, rest.len() - 1)
+    }
+    // npm's scoped names begin with `@`, so for npm the scope is taken
+    // off the front *before* the version is looked for. Everywhere else
+    // a leading `@` is part of the name, which is why `pkg:maven/@1.3.4`
+    // has no name and is refused.
+    var scope = ""
+    if kind == "npm" and rest.starts_with("@") {
+        let cut = index_of(rest, "/")
+        if cut > 0 {
+            scope = percent_decode(rest.substr(0, cut))
+            rest = rest.substr(cut + 1, rest.len() - cut - 1)
+        }
+    }
+    var version = ""
+    let at = last_index_of(rest, "@")
+    if at >= 0 {
+        version = percent_decode(rest.substr(at + 1, rest.len() - at - 1))
+        rest = rest.substr(0, at)
+    }
+    let split = try path_of(kind, rest, text)
+    var namespace = split.0
+    if scope.len() > 0 {
+        namespace = scope
+    }
+    return try build(kind, namespace, split.1, version,
+        try read_qualifiers(qualifiers_text), read_subpath(subpath))
+}
+
+/// Split the path into a namespace and a name.
+fn path_of(kind: str, rest: str, text: str) -> (str, str) ! PurlError {
+    let written = trim(rest).split("/")
+    // A trailing `/` leaves the name empty, which is an error rather
+    // than something to tidy away: `pkg:swift/github.com/Alamofire/`
+    // names no package.
+    if written.len() == 0 or written[written.len() - 1].len() == 0 {
+        fail(NoName(text))
+    }
+    var segments: [str] = []
+    for piece in written {
+        if piece.len() > 0 {
+            segments.push(percent_decode(piece))
+        }
+    }
+    if segments.len() == 0 {
+        fail(NoName(text))
+    }
+    // A `git` purl names a host and then a path inside it, so
+    // everything after the first segment is the name.
+    if kind == "git" and segments.len() > 1 {
+        var tail: [str] = []
+        var j = 1
+        while j < segments.len() {
+            tail.push(segments[j])
+            j = j + 1
+        }
+        return (segments[0], tail.join("/"))
+    }
+    var namespace: [str] = []
+    var i = 0
+    while i < segments.len() - 1 {
+        namespace.push(segments[i])
+        i = i + 1
+    }
+    return (namespace.join("/"), segments[segments.len() - 1])
+}
+
+fn check_type(kind: str) -> bool ! PurlError {
+    if kind.len() == 0 {
+        fail(BadType(kind))
+    }
+    if is_digit(kind.substr(0, 1)) {
+        fail(BadType(kind))
+    }
+    for character in kind.chars() {
+        if not is_letter(character) and not is_digit(character) and
+        character != "." and character != "-" and character != "_" {
+            fail(BadType(kind))
+        }
+    }
+    return true
+}
+
+/// Read the `?key=value&key=value` part.
+///
+/// A key with no value is dropped rather than kept empty, which is what
+/// makes `?arch=` and no `arch` at all the same purl.
+fn read_qualifiers(text: str) -> [(str, str)] ! PurlError {
+    var out: [(str, str)] = []
+    if text.len() == 0 {
+        return out
+    }
+    for piece in text.split("&") {
+        if piece.len() == 0 {
+            continue
+        }
+        let equals = index_of(piece, "=")
+        if equals < 0 {
+            fail(BadQualifierKey(piece))
+        }
+        let key = trim(piece.substr(0, equals)).to_lower()
+        let value = percent_decode(
+            piece.substr(equals + 1, piece.len() - equals - 1))
+        try check_qualifier_key(key)
+        if trim(value).len() == 0 {
+            continue
+        }
+        out.push((key, value))
+    }
+    return sorted_qualifiers(out)
+}
+
+fn check_qualifier_key(key: str) -> bool ! PurlError {
+    if key.len() == 0 or is_digit(key.substr(0, 1)) {
+        fail(BadQualifierKey(key))
+    }
+    for character in key.chars() {
+        if not is_letter(character) and not is_digit(character) and
+        character != "." and character != "-" and character != "_" {
+            fail(BadQualifierKey(key))
+        }
+    }
+    return true
+}
+
+fn sorted_qualifiers(pairs: [(str, str)]) -> [(str, str)] {
+    var out = pairs
+    var i = 1
+    while i < out.len() {
+        var j = i
+        while j > 0 and out[j - 1].0 > out[j].0 {
+            let held = out[j - 1]
+            out[j - 1] = out[j]
+            out[j] = held
+            j = j - 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+/// Read the `#a/b/c` part, dropping the segments a path walk would.
+fn read_subpath(text: str) -> str {
+    var out: [str] = []
+    for piece in strip(text, "/").split("/") {
+        let one = percent_decode(piece)
+        if one.len() == 0 or one == "." or one == ".." {
+            continue
+        }
+        out.push(one)
+    }
+    return out.join("/")
+}
+
+/// Put a purl together from its parts, applying the type's own rules.
+pub fn build(kind: str, namespace: str, name: str, version: str,
+    qualifiers: [(str, str)], subpath: str) -> Purl ! PurlError {
+    let lower = trim(kind).to_lower()
+    try check_type(lower)
+    var space = strip(trim(namespace), "/")
+    var title = trim(name)
+    var release = trim(version)
+    var kept: [(str, str)] = []
+    for pair in qualifiers {
+        try check_qualifier_key(pair.0)
+        if trim(pair.1).len() > 0 {
+            kept.push((pair.0.to_lower(), pair.1))
+        }
+    }
+    kept = sorted_qualifiers(kept)
+    if lowercases_namespace(lower) {
+        space = space.to_lower()
+    }
+    if lower == "cpan" {
+        space = space.to_upper()
+    }
+    if lowercases_name(lower) {
+        title = title.to_lower()
+    }
+    if lower == "pypi" or lower == "hackage" {
+        title = with_dashes(title)
+    }
+    if lower == "mlflow" {
+        title = mlflow_name(title, kept)
+    }
+    if lower == "huggingface" or lower == "oci" {
+        release = release.to_lower()
+    }
+    if title.len() == 0 {
+        fail(NoName(name))
+    }
+    if space.len() == 0 and requires_namespace(lower) {
+        fail(NamespaceRequired(lower))
+    }
+    if space.len() > 0 and prohibits_namespace(lower) {
+        fail(NamespaceProhibited(lower))
+    }
+    try check_type_rules(lower, title, release, kept)
+    return Purl{ kind: lower, namespace: space, name: title,
+        version: release, qualifiers: kept,
+        subpath: read_subpath(subpath) }
+}
+
+fn with_dashes(name: str) -> str {
+    var out = ""
+    for character in name.chars() {
+        if character == "_" {
+            out = out + "-"
+        } else {
+            out = out + character
+        }
+    }
+    return out
+}
+
+fn lowercases_namespace(kind: str) -> bool {
+    return kind == "bitbucket" or kind == "github" or kind == "gitlab" or
+    kind == "pypi" or kind == "composer" or kind == "alpm" or
+    kind == "apk" or kind == "hex" or kind == "qpkg" or
+    kind == "luarocks" or kind == "brew" or kind == "git"
+}
+
+fn lowercases_name(kind: str) -> bool {
+    return kind == "bitbucket" or kind == "github" or kind == "gitlab" or
+    kind == "pypi" or kind == "composer" or kind == "alpm" or
+    kind == "apk" or kind == "hex" or kind == "npm" or kind == "oci" or
+    kind == "bitnami" or kind == "luarocks" or kind == "pub" or
+    kind == "brew" or kind == "git"
+}
+
+fn requires_namespace(kind: str) -> bool {
+    return kind == "swift" or kind == "vscode-extension"
+}
+
+fn prohibits_namespace(kind: str) -> bool {
+    return kind == "vcpkg" or kind == "otp"
+}
+
+fn qualifier_value(qualifiers: [(str, str)], key: str) -> str {
+    for pair in qualifiers {
+        if pair.0 == key {
+            return pair.1
+        }
+    }
+    return ""
+}
+
+/// MLflow model names are case-sensitive on Azure ML and not on
+/// Databricks, and the only thing that says which registry a purl means
+/// is the `repository_url` it carries.
+fn mlflow_name(name: str, qualifiers: [(str, str)]) -> str {
+    let repository = qualifier_value(qualifiers, "repository_url").to_lower()
+    if repository.contains("azureml") {
+        return name
+    }
+    if repository.contains("databricks") {
+        return name.to_lower()
+    }
+    return name
+}
+
+/// The rules that belong to one type and refuse a purl outright.
+fn check_type_rules(kind: str, name: str, version: str,
+    qualifiers: [(str, str)]) -> bool ! PurlError {
+    if kind == "cpan" and name.contains("::") {
+        // A CPAN purl names a *distribution*, which is written with
+        // dashes; `URI::PackageURL` is the module inside it.
+        fail(BadName(name))
+    }
+    if kind == "chrome-extension" {
+        try check_chrome_extension(name, version)
+    }
+    if kind == "julia" {
+        // A Julia package is identified by its UUID, because two
+        // registries may both hold a `Dates`.
+        if qualifier_value(qualifiers, "uuid").len() == 0 and
+        qualifier_value(qualifiers, "repository_url").len() == 0 {
+            fail(QualifierRequired("uuid"))
+        }
+    }
+    return true
+}
+
+/// A Chrome extension id is 32 letters from `a` to `p`, and its version
+/// is up to four numbers.
+fn check_chrome_extension(name: str, version: str) -> bool ! PurlError {
+    if name.len() != 32 {
+        fail(BadName(name))
+    }
+    for character in name.chars() {
+        if character < "a" or character > "p" {
+            fail(BadName(name))
+        }
+    }
+    if version.len() == 0 {
+        return true
+    }
+    let pieces = version.split(".")
+    if pieces.len() > 4 {
+        fail(BadVersion(version))
+    }
+    for piece in pieces {
+        if piece.len() == 0 {
+            fail(BadVersion(version))
+        }
+        for character in piece.chars() {
+            if not is_digit(character) {
+                fail(BadVersion(version))
+            }
+        }
+    }
+    return true
+}
+
+/// Write the canonical form.
+pub fn render(purl: Purl) -> str {
+    var out = "pkg:" + purl.kind
+    if purl.namespace.len() > 0 {
+        var encoded: [str] = []
+        for piece in purl.namespace.split("/") {
+            if piece.len() > 0 {
+                encoded.push(percent_encode(piece))
+            }
+        }
+        out = out + "/" + encoded.join("/")
+    }
+    var titles: [str] = []
+    for piece in purl.name.split("/") {
+        titles.push(percent_encode(piece))
+    }
+    out = out + "/" + titles.join("/")
+    if purl.version.len() > 0 {
+        out = out + "@" + percent_encode(purl.version)
+    }
+    if purl.qualifiers.len() > 0 {
+        var pieces: [str] = []
+        for pair in purl.qualifiers {
+            pieces.push(pair.0 + "=" + percent_encode(pair.1))
+        }
+        out = out + "?" + pieces.join("&")
+    }
+    if purl.subpath.len() > 0 {
+        var encoded: [str] = []
+        for piece in purl.subpath.split("/") {
+            encoded.push(percent_encode(piece))
+        }
+        out = out + "#" + encoded.join("/")
+    }
+    return out
+}

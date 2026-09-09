@@ -1,0 +1,6 @@
+[package]
+name = "purl"
+version = "1.0.0"
+
+# Parsing and writing identifiers. Opens nothing.
+capabilities = []

@@ -1,0 +1,276 @@
+// RPM versions, and the comparison `rpm` itself does.
+//
+//   [epoch:]version[-release]
+//
+// The ordering is `rpmvercmp`, which is neither ASCII order nor the
+// Debian one, and the differences are the whole point:
+//
+//   - **Everything that is not a letter or a digit is a separator**, and
+//     which separator it was does not matter: `1.0`, `1_0` and `1--0`
+//     all compare equal. Debian compares those apart.
+//   - **A run of digits compares as a number**, after leading zeros are
+//     dropped, so `1.10` is above `1.9` and `1.007` equals `1.7`.
+//   - **A digit run beats a letter run**, so `1.1` is above `1.a`.
+//   - **`~` sorts before everything, including the end of the string**,
+//     which is how `1.0~rc1` is published below `1.0`.
+//   - **`^` sorts after the end of the string and before everything
+//     else**, which is how a build taken from the commits after a
+//     release is named: `1.0^20240101git` is above `1.0` and below
+//     `1.1`.
+//
+// ## The epoch is invisible and decides everything
+//
+// `1:1.0` is above `2.0`, and no file name carries the epoch — it lives
+// in the package header alone. A comparison written without it upgrades
+// a machine to an older package and reports success, so `compare` takes
+// the epoch first and `parse_text` defaults it to zero rather than
+// leaving it unset.
+//
+// ## Where this is used outside `rpm`
+//
+// Every dependency solver that reads a `.repo` index, every "is the
+// installed build older than the advisory" check in a scanner, and every
+// container image that pins a package by version. All three compare
+// versions that people wrote by hand, which is where `~` and `^` show
+// up.
+
+type RpmError =
+    | BadEpoch(text: str)
+
+    /// An epoch, version and release, which is what `rpm` compares.
+type RpmEvr = {
+    /// Zero when the version did not name one, which is what `rpm`
+    /// assumes.
+    epoch: i64,
+    version: str,
+    /// The empty string when the version did not name one.
+    release: str,
+}
+
+fn is_digit(character: str) -> bool {
+    return character >= "0" and character <= "9"
+}
+
+fn is_alpha(character: str) -> bool {
+    return (character >= "a" and character <= "z") or
+    (character >= "A" and character <= "Z")
+}
+
+fn is_alnum(character: str) -> bool {
+    return is_digit(character) or is_alpha(character)
+}
+
+/// Read `[epoch:]version[-release]`.
+///
+/// The release is everything after the *last* `-`, because a version may
+/// hold one and a release may not.
+pub fn parse(text: str) -> RpmEvr ! RpmError {
+    var body = text
+    var epoch = 0
+    var colon = 0 - 1
+    var i = 0
+    while i < body.len() {
+        if body.substr(i, 1) == ":" {
+            colon = i
+            i = body.len()
+        } else {
+            i = i + 1
+        }
+    }
+    if colon >= 0 {
+        let head = body.substr(0, colon)
+        match head.parse_int() {
+            Some(value) -> epoch = value
+            None -> fail(BadEpoch(head))
+        }
+        body = body.substr(colon + 1, body.len() - colon - 1)
+    }
+    var dash = 0 - 1
+    var j = 0
+    while j < body.len() {
+        if body.substr(j, 1) == "-" {
+            dash = j
+        }
+        j = j + 1
+    }
+    if dash < 0 {
+        return RpmEvr{ epoch: epoch, version: body, release: "" }
+    }
+    return RpmEvr{ epoch: epoch, version: body.substr(0, dash),
+        release: body.substr(dash + 1, body.len() - dash - 1) }
+}
+
+/// Where the run of digits or of letters starting at `from` ends.
+fn run_end(text: str, from: i64, numeric: bool) -> i64 {
+    var i = from
+    while i < text.len() {
+        let here = text.substr(i, 1)
+        if numeric and not is_digit(here) {
+            return i
+        }
+        if not numeric and not is_alpha(here) {
+            return i
+        }
+        i = i + 1
+    }
+    return i
+}
+
+/// Where the next letter, digit, `~` or `^` is, skipping separators.
+fn next_meaningful(text: str, from: i64) -> i64 {
+    var i = from
+    while i < text.len() {
+        let here = text.substr(i, 1)
+        if is_alnum(here) or here == "~" or here == "^" {
+            return i
+        }
+        i = i + 1
+    }
+    return i
+}
+
+fn without_leading_zeros(text: str) -> str {
+    var i = 0
+    while i < text.len() - 1 and text.substr(i, 1) == "0" {
+        i = i + 1
+    }
+    return text.substr(i, text.len() - i)
+}
+
+fn compare_str(a: str, b: str) -> i64 {
+    if a < b {
+        return 0 - 1
+    }
+    if a > b {
+        return 1
+    }
+    return 0
+}
+
+/// `rpmvercmp`: compare one version or release string with another.
+///
+/// Answers -1, 0 or 1. This is the function everything else here is
+/// written in terms of, and it is worth reading as the definition of the
+/// ordering rather than as an implementation of it.
+pub fn compare_parts(left: str, right: str) -> i64 {
+    var a = 0
+    var b = 0
+    while a < left.len() or b < right.len() {
+        a = next_meaningful(left, a)
+        b = next_meaningful(right, b)
+        let left_tilde = a < left.len() and left.substr(a, 1) == "~"
+        let right_tilde = b < right.len() and right.substr(b, 1) == "~"
+        if left_tilde or right_tilde {
+            if not left_tilde {
+                return 1
+            }
+            if not right_tilde {
+                return 0 - 1
+            }
+            a = a + 1
+            b = b + 1
+            continue
+        }
+        let left_caret = a < left.len() and left.substr(a, 1) == "^"
+        let right_caret = b < right.len() and right.substr(b, 1) == "^"
+        if left_caret or right_caret {
+            // A `^` beats the end of the string, which is the opposite
+            // of what `~` does and the reason both exist.
+            if a >= left.len() {
+                return 0 - 1
+            }
+            if b >= right.len() {
+                return 1
+            }
+            if not left_caret {
+                return 1
+            }
+            if not right_caret {
+                return 0 - 1
+            }
+            a = a + 1
+            b = b + 1
+            continue
+        }
+        if a >= left.len() or b >= right.len() {
+            break
+        }
+        let numeric = is_digit(left.substr(a, 1))
+        let a_end = run_end(left, a, numeric)
+        let b_end = run_end(right, b, numeric)
+        if b_end == b {
+            // The runs are of different kinds, and a number is always
+            // above a word: `1.1` is above `1.a`.
+            if numeric {
+                return 1
+            }
+            return 0 - 1
+        }
+        var left_run = left.substr(a, a_end - a)
+        var right_run = right.substr(b, b_end - b)
+        if numeric {
+            left_run = without_leading_zeros(left_run)
+            right_run = without_leading_zeros(right_run)
+            if left_run.len() != right_run.len() {
+                if left_run.len() > right_run.len() {
+                    return 1
+                }
+                return 0 - 1
+            }
+        }
+        let verdict = compare_str(left_run, right_run)
+        if verdict != 0 {
+            return verdict
+        }
+        a = a_end
+        b = b_end
+    }
+    if a >= left.len() and b >= right.len() {
+        return 0
+    }
+    if a >= left.len() {
+        return 0 - 1
+    }
+    return 1
+}
+
+/// Compare two whole versions: epoch first, then version, then release.
+///
+/// An empty release compares as an empty string, which is what `rpm`
+/// does when only one side names one.
+pub fn compare(left: RpmEvr, right: RpmEvr) -> i64 {
+    if left.epoch != right.epoch {
+        if left.epoch > right.epoch {
+            return 1
+        }
+        return 0 - 1
+    }
+    let verdict = compare_parts(left.version, right.version)
+    if verdict != 0 {
+        return verdict
+    }
+    return compare_parts(left.release, right.release)
+}
+
+/// Compare two versions written out, defaulting a missing epoch to zero.
+pub fn compare_text(left: str, right: str) -> i64 ! RpmError {
+    return compare(try parse(left), try parse(right))
+}
+
+/// Whether the first version is above the second.
+pub fn is_newer(left: RpmEvr, right: RpmEvr) -> bool {
+    return compare(left, right) > 0
+}
+
+/// Write an EVR back out, leaving out the parts that were not given.
+pub fn render(evr: RpmEvr) -> str {
+    var out = ""
+    if evr.epoch != 0 {
+        out = "{evr.epoch}:"
+    }
+    out = out + evr.version
+    if evr.release.len() > 0 {
+        out = out + "-" + evr.release
+    }
+    return out
+}

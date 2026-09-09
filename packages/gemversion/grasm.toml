@@ -1,0 +1,6 @@
+[package]
+name = "gemversion"
+version = "1.0.0"
+
+# Parsing and comparing text. Opens nothing.
+capabilities = []

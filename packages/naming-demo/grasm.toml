@@ -1,0 +1,24 @@
+[package]
+name = "naming_demo"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.rpmversion]
+path = "../rpmversion"
+version = "^1.0.0"
+
+[dependencies.gemversion]
+path = "../gemversion"
+version = "^1.0.0"
+
+[dependencies.wheelname]
+path = "../wheelname"
+version = "^1.0.0"
+
+[dependencies.purl]
+path = "../purl"
+version = "^1.0.0"
+
+[dependencies.cpename]
+path = "../cpename"
+version = "^1.0.0"

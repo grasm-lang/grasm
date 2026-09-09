@@ -1,0 +1,6 @@
+[package]
+name = "cpename"
+version = "1.0.0"
+
+# Reading and writing identifiers. Opens nothing.
+capabilities = []

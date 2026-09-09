@@ -18,5 +18,8 @@ here, and the code was correct every time.
 | `structured-field-tests/` | the HTTP working group's `structured-field-tests` | `sf_diff.sh` |
 | `LineBreakTest.txt` | the Unicode Consortium, UCD 17.0.0 | `linebreak_diff.sh` |
 | `h2-transcript.txt` | recorded from the Python `h2` library by `h2_capture.py` | `h2_diff.sh` |
+| `purl/` | the `package-url/purl-spec` project's `tests/` directory | `purl_diff.sh` |
+| `rpmvercmp.at` | `tests/rpmvercmp.at` from rpm itself | `rpm_vercmp_diff.sh` |
+| `rubygems-version.rb` | `lib/rubygems/version.rb` from RubyGems | `gem_version_diff.sh` |
 
 The Unicode files carry their own terms of use, which are in the files.

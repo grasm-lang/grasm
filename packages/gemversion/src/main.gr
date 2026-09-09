@@ -1,0 +1,311 @@
+// RubyGems versions, and the ordering `Gem::Version` gives them.
+//
+//   1.2.3    1.2.3.pre.1    1.2.3-beta    2.0.0.rc1
+//
+// It is not semantic versioning and it is not the Debian or RPM
+// ordering. Four rules of its own decide everything:
+//
+//   - **A dash is a pre-release marker**, and the first thing that
+//     happens to a version is `-` becoming `.pre.`: `1.2.3-beta` *is*
+//     `1.2.3.pre.beta`, which is why it sorts below `1.2.3`.
+//   - **A version is a list of runs**, each either all digits or all
+//     letters, taken in order however they were punctuated: `1.0a1` is
+//     `1`, `0`, `a`, `1`.
+//   - **A word sorts below a number**, so `1.0.a` is below `1.0.1` and
+//     below `1.0.0` — every pre-release is below every release.
+//   - **Trailing zeros do not count**, so `1.0` and `1.0.0` are the same
+//     version, and `1.0.0.pre` is *not* the same as `1.0.pre` only
+//     because the zeros are trimmed from each half separately.
+//
+// That last rule is the one that surprises: the numeric run and the part
+// from the first word onwards are trimmed *apart*, so `1.0.0.a.0` keeps
+// its `0` after the `a` while losing the one before it.
+//
+// ## Why a resolver cannot use the semantic-versioning ordering here
+//
+// `1.0.0.pre.1` against `1.0.0-pre.1` is one version written two ways in
+// RubyGems and two different versions under semantic versioning, and
+// `1.0` against `1.0.0` is one version here and two comparable ones
+// there. A lock file written by one and read by the other picks a
+// different build, which is the bug this package exists to prevent.
+
+type GemError =
+    | Malformed(text: str)
+
+    /// One run of a version: all digits, or all letters.
+type GemSegment = {
+    /// Whether the run was digits, which decides how it compares.
+    numeric: bool,
+    number: i64,
+    /// The letters, for a run that was not digits.
+    text: str,
+}
+
+/// A version, kept both as written and as the runs it compares by.
+type GemVersion = {
+    /// As written, after `-` became `.pre.`.
+    text: str,
+    segments: [GemSegment],
+}
+
+fn is_digit(character: str) -> bool {
+    return character >= "0" and character <= "9"
+}
+
+fn is_alpha(character: str) -> bool {
+    return (character >= "a" and character <= "z") or
+    (character >= "A" and character <= "Z")
+}
+
+fn is_space(character: str) -> bool {
+    return character == " " or character == "\t" or character == "\n" or
+    character == "\r"
+}
+
+fn trim(text: str) -> str {
+    var start = 0
+    while start < text.len() and is_space(text.substr(start, 1)) {
+        start = start + 1
+    }
+    var end = text.len()
+    while end > start and is_space(text.substr(end - 1, 1)) {
+        end = end - 1
+    }
+    return text.substr(start, end - start)
+}
+
+/// Whether RubyGems would accept the version at all.
+///
+/// The shape is `digits (. word)* (- word (. word)*)?`, and an empty
+/// string is accepted — `Gem::Version.new("")` is version zero.
+pub fn is_correct(text: str) -> bool {
+    let body = trim(text)
+    if body.len() == 0 {
+        return true
+    }
+    var i = 0
+    // A leading run of digits is required.
+    while i < body.len() and is_digit(body.substr(i, 1)) {
+        i = i + 1
+    }
+    if i == 0 {
+        return false
+    }
+    var seen_dash = false
+    while i < body.len() {
+        let here = body.substr(i, 1)
+        if here == "." or (here == "-" and not seen_dash) {
+            if here == "-" {
+                seen_dash = true
+            }
+            i = i + 1
+            // Every separator has to be followed by at least one
+            // character of the right kind.
+            var run = 0
+            while i < body.len() and (is_digit(body.substr(i, 1)) or
+                is_alpha(body.substr(i, 1)) or
+                (seen_dash and body.substr(i, 1) == "-")) {
+                i = i + 1
+                run = run + 1
+            }
+            if run == 0 {
+                return false
+            }
+            continue
+        }
+        return false
+    }
+    return true
+}
+
+/// Split into runs of digits and runs of letters, ignoring everything
+/// else.
+fn runs_of(text: str) -> [GemSegment] {
+    var out: [GemSegment] = []
+    var i = 0
+    while i < text.len() {
+        let here = text.substr(i, 1)
+        if is_digit(here) {
+            var run = ""
+            while i < text.len() and is_digit(text.substr(i, 1)) {
+                run = run + text.substr(i, 1)
+                i = i + 1
+            }
+            out.push(GemSegment{ numeric: true, number: run.parse_int() ?? 0,
+                text: run })
+            continue
+        }
+        if is_alpha(here) {
+            var run = ""
+            while i < text.len() and is_alpha(text.substr(i, 1)) {
+                run = run + text.substr(i, 1)
+                i = i + 1
+            }
+            out.push(GemSegment{ numeric: false, number: 0, text: run })
+            continue
+        }
+        i = i + 1
+    }
+    return out
+}
+
+/// Drop the trailing zeros of one half of a version.
+fn without_trailing_zeros(segments: [GemSegment]) -> [GemSegment] {
+    var end = segments.len()
+    while end > 0 and segments[end - 1].numeric and
+    segments[end - 1].number == 0 {
+        end = end - 1
+    }
+    var out: [GemSegment] = []
+    var i = 0
+    while i < end {
+        out.push(segments[i])
+        i = i + 1
+    }
+    return out
+}
+
+/// The segments a comparison actually uses.
+///
+/// The numeric head and the part from the first word onwards are trimmed
+/// of trailing zeros *separately*, which is why `1.0.0.a.0` keeps a zero
+/// and `1.0.0` does not.
+fn canonical_segments(segments: [GemSegment]) -> [GemSegment] {
+    var at = segments.len()
+    var i = 0
+    while i < segments.len() {
+        if not segments[i].numeric {
+            at = i
+            i = segments.len()
+        } else {
+            i = i + 1
+        }
+    }
+    var head: [GemSegment] = []
+    var tail: [GemSegment] = []
+    var j = 0
+    while j < segments.len() {
+        if j < at {
+            head.push(segments[j])
+        } else {
+            tail.push(segments[j])
+        }
+        j = j + 1
+    }
+    var out = without_trailing_zeros(head)
+    for one in without_trailing_zeros(tail) {
+        out.push(one)
+    }
+    return out
+}
+
+/// Read a version, refusing one RubyGems would refuse.
+///
+/// A `-` becomes `.pre.` before anything else looks at the text, which
+/// is the whole of the pre-release rule.
+pub fn parse(text: str) -> GemVersion ! GemError {
+    if not is_correct(text) {
+        fail(Malformed(text))
+    }
+    // An empty version is version zero, which is what `Gem::Version`
+    // stores for one.
+    if trim(text).len() == 0 {
+        return GemVersion{ text: "0",
+            segments: canonical_segments(runs_of("0")) }
+    }
+    var body = ""
+    for character in trim(text).chars() {
+        if character == "-" {
+            body = body + ".pre."
+        } else {
+            body = body + character
+        }
+    }
+    return GemVersion{ text: body, segments: canonical_segments(runs_of(body)) }
+}
+
+fn compare_segment(left: GemSegment, right: GemSegment) -> i64 {
+    if left.numeric and right.numeric {
+        if left.number > right.number {
+            return 1
+        }
+        if left.number < right.number {
+            return 0 - 1
+        }
+        return 0
+    }
+    // A word is below a number, which is what makes every pre-release
+    // below every release.
+    if not left.numeric and right.numeric {
+        return 0 - 1
+    }
+    if left.numeric and not right.numeric {
+        return 1
+    }
+    if left.text < right.text {
+        return 0 - 1
+    }
+    if left.text > right.text {
+        return 1
+    }
+    return 0
+}
+
+fn zero_segment() -> GemSegment {
+    return GemSegment{ numeric: true, number: 0, text: "0" }
+}
+
+/// Compare two versions, answering -1, 0 or 1.
+///
+/// A missing segment counts as the number zero, which is why `1.0` and
+/// `1` are one version.
+pub fn compare(left: GemVersion, right: GemVersion) -> i64 {
+    var i = 0
+    var limit = left.segments.len()
+    if right.segments.len() > limit {
+        limit = right.segments.len()
+    }
+    while i < limit {
+        var a = zero_segment()
+        var b = zero_segment()
+        if i < left.segments.len() {
+            a = left.segments[i]
+        }
+        if i < right.segments.len() {
+            b = right.segments[i]
+        }
+        let verdict = compare_segment(a, b)
+        if verdict != 0 {
+            return verdict
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+/// Whether the version names a pre-release, which is any version with a
+/// letter in it.
+pub fn is_prerelease(version: GemVersion) -> bool {
+    for one in runs_of(version.text) {
+        if not one.numeric {
+            return true
+        }
+    }
+    return false
+}
+
+/// The release a pre-release belongs to: everything up to its first
+/// word.
+pub fn release_of(version: GemVersion) -> GemVersion {
+    var out: [str] = []
+    for one in runs_of(version.text) {
+        // The release is rebuilt from the numbers, not from the text
+        // they were written with, so `1.011a` releases as `1.11`.
+        if not one.numeric {
+            return GemVersion{ text: out.join("."),
+                segments: canonical_segments(runs_of(out.join("."))) }
+        }
+        out.push("{one.number}")
+    }
+    return version
+}

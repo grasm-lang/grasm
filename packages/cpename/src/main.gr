@@ -1,0 +1,425 @@
+// CPE names, which is how a vulnerability advisory says which product it
+// is about.
+//
+//   cpe:2.3:a:microsoft:internet_explorer:8.0.6001:beta:*:*:*:*:*:*
+//   cpe:/a:microsoft:internet_explorer:8.0.6001:beta
+//
+// One name, two bindings. The 2.2 URI binding is what most published
+// data still carries and the 2.3 formatted string is what tools emit,
+// and they are *not* string transformations of one another: each binds
+// the same eleven attributes with its own escaping, and the URI binding
+// packs four of the eleven into one field.
+//
+// Between them sits the well-formed name, where a value is either a
+// string with `\` quoting, or one of two logical values:
+//
+//   `ANY`  the attribute is not part of the name — matches anything
+//   `NA`   the attribute does not apply — matches nothing else
+//
+// The distinction is the whole point of the format and it is where
+// readers go wrong: in the URI binding `ANY` is written as an *empty
+// field* and `NA` as `-`, so `cpe:/a:vendor::1.0` and
+// `cpe:/a:vendor:-:1.0` name different things, and a reader that treats
+// an empty field as the string `-`, or either as the string `*`, matches
+// products the advisory never named.
+//
+// ## Round trips
+//
+// `render_uri(parse(x)) == x` does not hold for every `x`, and should
+// not: the bindings have spellings that mean the same name, and this
+// answers with the one the specification calls bound. What does hold is
+// that parsing either binding gives the same attributes, which is what
+// lets an advisory in one binding be compared with an inventory in the
+// other.
+
+type CpeError =
+    | NotACpe(text: str)
+    | WrongFieldCount(text: str)
+    | BadEscape(text: str)
+
+    /// One attribute: a string, or one of the two logical values.
+type CpeValue = {
+    /// `any`, `na` or `text`.
+    kind: str,
+    /// The well-formed value, with `\` quoting, when the kind is `text`.
+    text: str,
+}
+
+/// The eleven attributes of a well-formed name.
+type CpeName = {
+    part: CpeValue,
+    vendor: CpeValue,
+    product: CpeValue,
+    version: CpeValue,
+    update: CpeValue,
+    edition: CpeValue,
+    language: CpeValue,
+    sw_edition: CpeValue,
+    target_sw: CpeValue,
+    target_hw: CpeValue,
+    other: CpeValue,
+}
+
+fn is_alnum(character: str) -> bool {
+    return (character >= "a" and character <= "z") or
+    (character >= "A" and character <= "Z") or
+    (character >= "0" and character <= "9")
+}
+
+/// The attribute that matches anything, written `*` in a formatted
+/// string and as an empty field in a URI.
+pub fn any_value() -> CpeValue {
+    return CpeValue{ kind: "any", text: "" }
+}
+
+/// The attribute that does not apply, written `-` in both bindings.
+pub fn na_value() -> CpeValue {
+    return CpeValue{ kind: "na", text: "" }
+}
+
+/// An attribute with a value, given as a well-formed (quoted) string.
+pub fn text_value(text: str) -> CpeValue {
+    return CpeValue{ kind: "text", text: text }
+}
+
+/// A name with every attribute unset.
+pub fn empty_name() -> CpeName {
+    return CpeName{ part: any_value(), vendor: any_value(),
+        product: any_value(), version: any_value(), update: any_value(),
+        edition: any_value(), language: any_value(),
+        sw_edition: any_value(), target_sw: any_value(),
+        target_hw: any_value(), other: any_value() }
+}
+
+fn hex_of(byte: i64) -> str {
+    let digits = "0123456789abcdef"
+    return digits.substr(byte / 16, 1) + digits.substr(byte % 16, 1)
+}
+
+fn hex_value(character: str) -> i64 {
+    let lower = character.to_lower()
+    if lower >= "0" and lower <= "9" {
+        return lower.code_at(0) - "0".code_at(0)
+    }
+    if lower >= "a" and lower <= "f" {
+        return lower.code_at(0) - "a".code_at(0) + 10
+    }
+    return 0 - 1
+}
+
+// ------------------------------------------------ the formatted string
+
+/// Write one attribute the way a 2.3 formatted string does.
+fn bind_for_fs(value: CpeValue) -> str {
+    if value.kind == "any" {
+        return "*"
+    }
+    if value.kind == "na" {
+        return "-"
+    }
+    var out = ""
+    var i = 0
+    while i < value.text.len() {
+        let here = value.text.substr(i, 1)
+        if here == "\\" and i + 1 < value.text.len() {
+            let after = value.text.substr(i + 1, 1)
+            // A quoted `.`, `-` or `_` is written plain: those three are
+            // the punctuation a formatted string carries unescaped.
+            if after == "." or after == "-" or after == "_" {
+                out = out + after
+            } else {
+                out = out + "\\" + after
+            }
+            i = i + 2
+            continue
+        }
+        out = out + here
+        i = i + 1
+    }
+    return out
+}
+
+/// Read one attribute of a 2.3 formatted string.
+fn unbind_from_fs(text: str) -> CpeValue {
+    if text == "*" {
+        return any_value()
+    }
+    if text == "-" {
+        return na_value()
+    }
+    var out = ""
+    var i = 0
+    while i < text.len() {
+        let here = text.substr(i, 1)
+        if here == "\\" and i + 1 < text.len() {
+            out = out + "\\" + text.substr(i + 1, 1)
+            i = i + 2
+            continue
+        }
+        if is_alnum(here) or here == "_" or here == "*" or here == "?" {
+            out = out + here
+        } else {
+            out = out + "\\" + here
+        }
+        i = i + 1
+    }
+    return text_value(out)
+}
+
+// ------------------------------------------------------- the URI form
+
+fn percent_encode_character(character: str) -> str {
+    if is_alnum(character) or character == "_" {
+        return character
+    }
+    if character == "." or character == "-" {
+        return character
+    }
+    let raw = character.to_bytes()
+    var out = ""
+    var i = 0
+    while i < raw.len() {
+        out = out + "%" + hex_of(raw.at(i))
+        i = i + 1
+    }
+    return out
+}
+
+/// Write one attribute the way a 2.2 URI does.
+fn bind_for_uri(value: CpeValue) -> str {
+    if value.kind == "any" {
+        return ""
+    }
+    if value.kind == "na" {
+        return "-"
+    }
+    var out = ""
+    var i = 0
+    while i < value.text.len() {
+        let here = value.text.substr(i, 1)
+        if here == "\\" and i + 1 < value.text.len() {
+            out = out + percent_encode_character(value.text.substr(i + 1, 1))
+            i = i + 2
+            continue
+        }
+        if here == "?" {
+            out = out + "%01"
+        } else if here == "*" {
+            out = out + "%02"
+        } else {
+            out = out + percent_encode_character(here)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+/// Read one attribute of a 2.2 URI.
+fn unbind_from_uri(text: str) -> CpeValue {
+    if text.len() == 0 {
+        return any_value()
+    }
+    if text == "-" {
+        return na_value()
+    }
+    var out = ""
+    var i = 0
+    while i < text.len() {
+        if text.substr(i, 1) == "%" and i + 2 < text.len() {
+            let code = text.substr(i + 1, 2).to_lower()
+            if code == "01" {
+                out = out + "?"
+                i = i + 3
+                continue
+            }
+            if code == "02" {
+                out = out + "*"
+                i = i + 3
+                continue
+            }
+            let high = hex_value(text.substr(i + 1, 1))
+            let low = hex_value(text.substr(i + 2, 1))
+            if high >= 0 and low >= 0 {
+                out = out + "\\" + bytes_of([high * 16 + low]).to_str()
+                i = i + 3
+                continue
+            }
+        }
+        let here = text.substr(i, 1)
+        if is_alnum(here) or here == "_" {
+            out = out + here
+        } else {
+            out = out + "\\" + here
+        }
+        i = i + 1
+    }
+    return text_value(out)
+}
+
+fn split_unescaped(text: str, separator: str) -> [str] {
+    var out: [str] = []
+    var current = ""
+    var i = 0
+    while i < text.len() {
+        let here = text.substr(i, 1)
+        if here == "\\" and i + 1 < text.len() {
+            current = current + here + text.substr(i + 1, 1)
+            i = i + 2
+            continue
+        }
+        if here == separator {
+            out.push(current)
+            current = ""
+            i = i + 1
+            continue
+        }
+        current = current + here
+        i = i + 1
+    }
+    out.push(current)
+    return out
+}
+
+/// Read a 2.3 formatted string.
+pub fn parse_fs(text: str) -> CpeName ! CpeError {
+    if not text.to_lower().starts_with("cpe:2.3:") {
+        fail(NotACpe(text))
+    }
+    let fields = split_unescaped(text.substr(8, text.len() - 8), ":")
+    if fields.len() != 11 {
+        fail(WrongFieldCount(text))
+    }
+    return CpeName{ part: unbind_from_fs(fields[0]),
+        vendor: unbind_from_fs(fields[1]),
+        product: unbind_from_fs(fields[2]),
+        version: unbind_from_fs(fields[3]),
+        update: unbind_from_fs(fields[4]),
+        edition: unbind_from_fs(fields[5]),
+        language: unbind_from_fs(fields[6]),
+        sw_edition: unbind_from_fs(fields[7]),
+        target_sw: unbind_from_fs(fields[8]),
+        target_hw: unbind_from_fs(fields[9]),
+        other: unbind_from_fs(fields[10]) }
+}
+
+/// Read a 2.2 URI, including the packed `~` edition.
+pub fn parse_uri(text: str) -> CpeName ! CpeError {
+    if not text.to_lower().starts_with("cpe:/") {
+        fail(NotACpe(text))
+    }
+    var fields = text.substr(5, text.len() - 5).split(":")
+    if fields.len() > 7 {
+        fail(WrongFieldCount(text))
+    }
+    while fields.len() < 7 {
+        fields.push("")
+    }
+    var out = empty_name()
+    out.part = unbind_from_uri(fields[0])
+    out.vendor = unbind_from_uri(fields[1])
+    out.product = unbind_from_uri(fields[2])
+    out.version = unbind_from_uri(fields[3])
+    out.update = unbind_from_uri(fields[4])
+    out.language = unbind_from_uri(fields[6])
+    // The edition field carries five attributes when it is packed, which
+    // is how 2.2 names a 2.3 name it has no field for.
+    if fields[5].starts_with("~") {
+        let packed = fields[5].substr(1, fields[5].len() - 1).split("~")
+        var five = packed
+        while five.len() < 5 {
+            five.push("")
+        }
+        out.edition = unbind_from_uri(five[0])
+        out.sw_edition = unbind_from_uri(five[1])
+        out.target_sw = unbind_from_uri(five[2])
+        out.target_hw = unbind_from_uri(five[3])
+        out.other = unbind_from_uri(five[4])
+    } else {
+        out.edition = unbind_from_uri(fields[5])
+    }
+    return out
+}
+
+/// Read either binding.
+pub fn parse(text: str) -> CpeName ! CpeError {
+    if text.to_lower().starts_with("cpe:2.3:") {
+        return try parse_fs(text)
+    }
+    return try parse_uri(text)
+}
+
+/// Write the 2.3 formatted string.
+pub fn render_fs(name: CpeName) -> str {
+    return "cpe:2.3:" + bind_for_fs(name.part) + ":" +
+    bind_for_fs(name.vendor) + ":" + bind_for_fs(name.product) + ":" +
+    bind_for_fs(name.version) + ":" + bind_for_fs(name.update) + ":" +
+    bind_for_fs(name.edition) + ":" + bind_for_fs(name.language) + ":" +
+    bind_for_fs(name.sw_edition) + ":" + bind_for_fs(name.target_sw) +
+    ":" + bind_for_fs(name.target_hw) + ":" + bind_for_fs(name.other)
+}
+
+/// Whether the four attributes 2.2 has no field for are all unset.
+fn needs_packing(name: CpeName) -> bool {
+    return name.sw_edition.kind != "any" or name.target_sw.kind != "any" or
+    name.target_hw.kind != "any" or name.other.kind != "any"
+}
+
+/// Write the 2.2 URI, packing the extra attributes when there are any.
+pub fn render_uri(name: CpeName) -> str {
+    var edition = bind_for_uri(name.edition)
+    if needs_packing(name) {
+        edition = "~" + bind_for_uri(name.edition) + "~" +
+        bind_for_uri(name.sw_edition) + "~" +
+        bind_for_uri(name.target_sw) + "~" +
+        bind_for_uri(name.target_hw) + "~" + bind_for_uri(name.other)
+    }
+    var fields = [bind_for_uri(name.part), bind_for_uri(name.vendor),
+        bind_for_uri(name.product), bind_for_uri(name.version),
+        bind_for_uri(name.update), edition, bind_for_uri(name.language)]
+    // Trailing empty fields are left off, which is what makes
+    // `cpe:/a:vendor:product` a name and not a truncation.
+    var end = fields.len()
+    while end > 1 and fields[end - 1].len() == 0 {
+        end = end - 1
+    }
+    var kept: [str] = []
+    var i = 0
+    while i < end {
+        kept.push(fields[i])
+        i = i + 1
+    }
+    return "cpe:/" + kept.join(":")
+}
+
+fn value_matches(source: CpeValue, target: CpeValue) -> bool {
+    if source.kind == "any" {
+        return true
+    }
+    if source.kind == "na" {
+        return target.kind == "na"
+    }
+    if target.kind != "text" {
+        return false
+    }
+    return source.text.to_lower() == target.text.to_lower()
+}
+
+/// Whether every attribute of the first name covers the second.
+///
+/// `ANY` covers anything, `NA` covers only `NA`, and a value covers only
+/// itself. This is the comparison an advisory is applied with, and it is
+/// not symmetric: a name with `ANY` for the version is about every
+/// version, and a name with a version is not about any other.
+pub fn covers(source: CpeName, target: CpeName) -> bool {
+    return value_matches(source.part, target.part) and
+    value_matches(source.vendor, target.vendor) and
+    value_matches(source.product, target.product) and
+    value_matches(source.version, target.version) and
+    value_matches(source.update, target.update) and
+    value_matches(source.edition, target.edition) and
+    value_matches(source.language, target.language) and
+    value_matches(source.sw_edition, target.sw_edition) and
+    value_matches(source.target_sw, target.target_sw) and
+    value_matches(source.target_hw, target.target_hw) and
+    value_matches(source.other, target.other)
+}

@@ -1,0 +1,8 @@
+[package]
+name = "purltest"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.purl]
+path = "../purl"
+version = "^1.0.0"

@@ -1,0 +1,9 @@
+import rpmversion
+
+fn main() / {io} {
+    var i = 0
+    while i + 1 < args().len() {
+        print("{rpmversion.compare_parts(args()[i], args()[i + 1])}")
+        i = i + 2
+    }
+}

@@ -1,0 +1,8 @@
+[package]
+name = "rpmtest"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.rpmversion]
+path = "../rpmversion"
+version = "^1.0.0"

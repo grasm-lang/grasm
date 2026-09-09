@@ -1,0 +1,206 @@
+// Five ways of naming a package, and the five different things that go
+// wrong when a tool compares two names by their text.
+//
+// Every expected value here was checked against the implementation that
+// owns the format: rpm's own `rpmvercmp` suite, RubyGems' `Gem::Version`,
+// Python's `packaging`, the purl-spec test suite and the `cpe` library.
+import rpmversion
+import gemversion
+import wheelname
+import purl
+import cpename
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+// ------------------------------------------------------------ rpmversion
+
+fn rpm_order(a: str, b: str) -> i64 {
+    return rpmversion.compare_parts(a, b)
+}
+
+fn check_rpm(inout f: i64) / {io} {
+    print("-- rpmversion: separators do not count, and two of them do")
+    say(f, "which separator was written makes no difference at all",
+        rpm_order("1.0", "1_0") == 0 and rpm_order("1..0", "1.0") == 0 and
+        rpm_order("--", "..") == 0)
+    say(f, "a run of digits is a number, so 1.10 is above 1.9",
+        rpm_order("1.10", "1.9") > 0 and rpm_order("1.007", "1.7") == 0)
+    say(f, "a number beats a word, which is why 1.1 is above 1.a",
+        rpm_order("1.1", "1.a") > 0)
+    say(f, "a tilde sorts below the end of the string",
+        rpm_order("1.0~rc1", "1.0") < 0)
+    say(f, "and a caret sorts above it, which is the opposite",
+        rpm_order("1.0^", "1.0") > 0 and
+        rpm_order("1.0^git1", "1.01") < 0)
+    let evr = rpmversion.parse("1:1.2.3-4") ?? no_evr()
+    say(f, "the epoch is read, and it decides before anything else",
+        evr.epoch == 1 and evr.version == "1.2.3" and evr.release == "4" and
+        (rpmversion.compare_text("1:1.0", "2.0") ?? 0) > 0)
+}
+
+fn no_evr() -> RpmEvr {
+    return RpmEvr{ epoch: 0, version: "", release: "" }
+}
+
+// ------------------------------------------------------------ gemversion
+
+fn gem_order(a: str, b: str) -> i64 {
+    let left = gemversion.parse(a) ?? no_gem()
+    let right = gemversion.parse(b) ?? no_gem()
+    return gemversion.compare(left, right)
+}
+
+fn no_gem() -> GemVersion {
+    return GemVersion{ text: "0", segments: [] }
+}
+
+fn check_gem(inout f: i64) / {io} {
+    print("-- gemversion: a dash is a pre-release, and zeros vanish")
+    say(f, "trailing zeros do not make a different version",
+        gem_order("1.0", "1.0.0") == 0 and gem_order("1", "1.0.0.0") == 0)
+    say(f, "a dash becomes .pre. before anything else looks at it",
+        gem_order("1.0-1", "1.0.pre.1") == 0 and
+        gem_order("1.0-1", "1.0") < 0 and gem_order("1.0.pre", "1.0") < 0)
+    say(f, "a word is below a number, so every pre-release is below",
+        gem_order("1.0.a", "1.0.1") < 0 and gem_order("1.0.a", "1.0") < 0)
+    say(f, "the halves are trimmed apart, which is the surprising part",
+        gem_order("1.0.0.a.0", "1.0.0.a") == 0 and
+        gem_order("1.0.0.a", "1.0.pre") < 0)
+    say(f, "and a pre-release knows the release it belongs to",
+        gemversion.release_of(gemversion.parse("1.0.0.rc1") ?? no_gem())
+            .text == "1.0.0" and
+        gemversion.is_prerelease(gemversion.parse("1.0.0.rc1") ?? no_gem()))
+}
+
+// ------------------------------------------------------------ wheelname
+
+fn check_wheel(inout f: i64) / {io} {
+    print("-- wheelname: the file name is the metadata")
+    let wheel = wheelname.parse_wheel(
+        "numpy-1.26.4-cp312-cp312-macosx_11_0_arm64.whl") ?? no_wheel()
+    say(f, "a wheel name is taken apart by counting its dashes",
+        wheel.distribution == "numpy" and wheel.version == "1.26.4" and
+        wheel.platform_tag == "macosx_11_0_arm64")
+    let universal = wheelname.parse_wheel(
+        "pip-24.0-1-py2.py3-none-any.whl") ?? no_wheel()
+    say(f, "a build tag is read as a number, so 10 is above 9",
+        universal.build_number == 1 and universal.build == "1")
+    say(f, "a compressed tag is two tags and is expanded to both",
+        wheelname.tags_of(universal) ==
+        ["py2-none-any", "py3-none-any"] and
+        wheelname.is_supported(universal, ["py3-none-any"]))
+    say(f, "a project name is compared after it is normalised",
+        wheelname.normalise_name("Foo.Bar_baz") == "foo-bar-baz" and
+        wheelname.normalise_name("zope.interface") == "zope-interface")
+    let sdist = wheelname.parse_sdist("requests-2.31.0.tar.gz") ?? ("", "")
+    say(f, "and a source distribution names the same two things",
+        sdist.0 == "requests" and sdist.1 == "2.31.0")
+    say(f, "a name with a dash too many is refused, not guessed at",
+        wheelname.parse_wheel("my-package-1.0-py3-none-any.whl") ?? no_wheel()
+        == no_wheel())
+}
+
+fn no_wheel() -> WheelName {
+    return WheelName{ distribution: "", version: "", build: "",
+        build_number: 0 - 1, python_tag: "", abi_tag: "",
+        platform_tag: "" }
+}
+
+// ----------------------------------------------------------------- purl
+
+fn no_purl() -> Purl {
+    return Purl{ kind: "", namespace: "", name: "", version: "",
+        qualifiers: [], subpath: "" }
+}
+
+fn check_purl(inout f: i64) / {io} {
+    print("-- purl: one identifier, and the type decides what case means")
+    let pypi = purl.parse("pkg:PYPI/Django_package@1.11.1.dev1") ?? no_purl()
+    say(f, "a pypi name is lower case with dashes, whatever was written",
+        pypi.kind == "pypi" and pypi.name == "django-package" and
+        purl.render(pypi) == "pkg:pypi/django-package@1.11.1.dev1")
+    let maven = purl.parse(
+        "pkg:maven/HTTPClient/HTTPClient@0.3-3") ?? no_purl()
+    say(f, "and a maven artifact keeps its case, because it matters there",
+        maven.namespace == "HTTPClient" and maven.name == "HTTPClient")
+    let scoped = purl.parse("pkg:npm/%40babel/core@7.0.0") ?? no_purl()
+    say(f, "an npm scope is a namespace, not part of the name",
+        scoped.namespace == "@babel" and scoped.name == "core" and
+        purl.render(scoped) == "pkg:npm/%40babel/core@7.0.0")
+    let walked: Purl ! PurlError = purl.parse(
+        "pkg:golang/google.golang.org/genproto#googleapis/api/annotations")
+    let packed = walked ?? no_purl()
+    say(f, "a subpath survives, and its walk-up segments do not",
+        packed.subpath == "googleapis/api/annotations")
+    say(f, "a qualifier value keeps its colon and loses its slashes",
+        purl.render(purl.parse(
+            "pkg:maven/g/a@1?repository_url=https://repo.example.test")
+            ?? no_purl()) ==
+        "pkg:maven/g/a@1?repository_url=https:%2F%2Frepo.example.test")
+    say(f, "a purl with no name at all is refused",
+        (purl.parse("pkg:maven/@1.3.4") ?? no_purl()) == no_purl())
+}
+
+// -------------------------------------------------------------- cpename
+
+fn no_cpe() -> CpeName {
+    return cpename.empty_name()
+}
+
+fn check_cpe(inout f: i64) / {io} {
+    print("-- cpename: an empty field and a dash are different answers")
+    let read: CpeName ! CpeError = cpename.parse(
+        "cpe:/a:microsoft:internet_explorer:8.%02:sp%01")
+    let uri = read ?? no_cpe()
+    say(f, "a 2.2 URI unbinds its escapes into the wildcards they are",
+        cpename.render_fs(uri) ==
+        "cpe:2.3:a:microsoft:internet_explorer:8.*:sp?:*:*:*:*:*:*")
+    let read_packed: CpeName ! CpeError = cpename.parse(
+        "cpe:/a:hp:insight_diagnostics:7.4.0.1570:-:~~online~win2003~x64~")
+    let packed = read_packed ?? no_cpe()
+    say(f, "a packed edition carries four attributes 2.2 has no field for",
+        packed.sw_edition.text == "online" and
+        packed.target_sw.text == "win2003" and
+        packed.target_hw.text == "x64" and packed.edition.kind == "any")
+    say(f, "and writing it back out packs them again",
+        cpename.render_uri(packed) ==
+        "cpe:/a:hp:insight_diagnostics:7.4.0.1570:-:~~online~win2003~x64~")
+    let unset = cpename.parse("cpe:/a:vendor::1.0") ?? no_cpe()
+    let missing = cpename.parse("cpe:/a:vendor:-:1.0") ?? no_cpe()
+    say(f, "an empty field means any, and a dash means does not apply",
+        unset.product.kind == "any" and missing.product.kind == "na" and
+        not cpename.covers(missing, unset))
+    say(f, "any covers everything, which is what makes an advisory apply",
+        cpename.covers(cpename.parse(
+            "cpe:2.3:a:microsoft:internet_explorer:*:*:*:*:*:*:*:*")
+            ?? no_cpe(), cpename.parse(
+                "cpe:2.3:a:microsoft:internet_explorer:8.0:beta:*:*:*:*:*:*")
+            ?? no_cpe()))
+    say(f, "and a version does not cover another version",
+        not cpename.covers(cpename.parse(
+            "cpe:2.3:a:microsoft:internet_explorer:8.0:*:*:*:*:*:*:*")
+            ?? no_cpe(), cpename.parse(
+                "cpe:2.3:a:microsoft:internet_explorer:9.0:*:*:*:*:*:*:*")
+            ?? no_cpe()))
+}
+
+fn main() / {io} {
+    var f = 0
+    check_rpm(f)
+    check_gem(f)
+    check_wheel(f)
+    check_purl(f)
+    check_cpe(f)
+    if f == 0 {
+        print("naming: every claim held")
+    } else {
+        print("naming: {f} claims failed")
+    }
+}

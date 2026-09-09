@@ -1,0 +1,235 @@
+// The names Python distribution files carry, which are a data format
+// rather than a label.
+//
+//   requests-2.31.0-py3-none-any.whl
+//   numpy-1.26.4-cp312-cp312-macosx_11_0_arm64.whl
+//   pip-24.0-py3-none-any.whl
+//   requests-2.31.0.tar.gz
+//
+// A wheel's name is `distribution-version[-build]-python-abi-platform`,
+// and every installer reads it rather than opening the file: the name is
+// how it knows whether the wheel runs here at all. That makes the
+// parsing rules load-bearing, and three of them catch people out:
+//
+//   - **The count of dashes decides the shape.** Four means no build
+//     tag, five means there is one, and any other count is not a wheel
+//     name. So neither the distribution nor the version may contain a
+//     dash, which is why `pip install ./my-package-1.0...whl` fails on
+//     a name that looks fine.
+//   - **A tag may be compressed.** `py2.py3-none-any` is *two* tags, and
+//     `cp37.cp38-abi3-manylinux1_x86_64.manylinux2010_x86_64` is four.
+//     A reader that compares the tag text against the running
+//     interpreter's tag rejects wheels that would have installed.
+//   - **The build tag starts with a number**, and it is compared as one:
+//     build `10` is above build `9`, and `10_patched` above `9_patched`.
+//
+// ## The distribution name is not the name you type
+//
+// `Foo.Bar_baz` and `foo-bar-baz` are the same project. Comparing the
+// text is how an installer ends up with two copies of one library, so
+// `normalise_name` is applied before anything is compared.
+import pep440
+
+type WheelError =
+    | NotAWheel(name: str)
+    | WrongShape(name: str)
+    | BadProjectName(name: str)
+    | BadVersion(text: str)
+    | BadBuildTag(text: str)
+    | NotASdist(name: str)
+
+    /// A wheel's file name, taken apart.
+type WheelName = {
+    /// Normalised, so it can be compared.
+    distribution: str,
+    /// As written; `version_of` reads it.
+    version: str,
+    /// The empty string when there was no build tag.
+    build: str,
+    /// The number a build tag starts with, or -1 for no build tag.
+    build_number: i64,
+    /// The three tag fields, each still compressed.
+    python_tag: str,
+    abi_tag: str,
+    platform_tag: str,
+}
+
+fn is_digit(character: str) -> bool {
+    return character >= "0" and character <= "9"
+}
+
+fn is_name_character(character: str) -> bool {
+    return (character >= "a" and character <= "z") or
+    (character >= "A" and character <= "Z") or is_digit(character) or
+    character == "_" or character == "."
+}
+
+/// The project name everything compares by (PEP 503): lower case, with
+/// every run of `-`, `_` or `.` written as a single `-`.
+pub fn normalise_name(name: str) -> str {
+    var out = ""
+    var previous_separator = false
+    for character in name.to_lower().chars() {
+        if character == "-" or character == "_" or character == "." {
+            if not previous_separator {
+                out = out + "-"
+            }
+            previous_separator = true
+        } else {
+            out = out + character
+            previous_separator = false
+        }
+    }
+    return out
+}
+
+fn count_of(text: str, character: str) -> i64 {
+    var out = 0
+    var i = 0
+    while i < text.len() {
+        if text.substr(i, 1) == character {
+            out = out + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+/// Split on `-`, stopping after `limit` splits so the tag triple stays
+/// in one piece.
+fn split_limited(text: str, limit: i64) -> [str] {
+    var out: [str] = []
+    var current = ""
+    var i = 0
+    while i < text.len() {
+        if text.substr(i, 1) == "-" and out.len() < limit {
+            out.push(current)
+            current = ""
+        } else {
+            current = current + text.substr(i, 1)
+        }
+        i = i + 1
+    }
+    out.push(current)
+    return out
+}
+
+/// Read a wheel file name.
+pub fn parse_wheel(name: str) -> WheelName ! WheelError {
+    if not name.ends_with(".whl") {
+        fail(NotAWheel(name))
+    }
+    let body = name.substr(0, name.len() - 4)
+    let dashes = count_of(body, "-")
+    if dashes != 4 and dashes != 5 {
+        fail(WrongShape(name))
+    }
+    let parts = split_limited(body, dashes - 2)
+    let project = parts[0]
+    if project.len() == 0 or project.contains("__") {
+        fail(BadProjectName(name))
+    }
+    for character in project.chars() {
+        if not is_name_character(character) {
+            fail(BadProjectName(name))
+        }
+    }
+    match pep440.parse(parts[1]) {
+        Ok(_version) -> {}
+        Err(_why) -> fail(BadVersion(parts[1]))
+    }
+    var build = ""
+    var build_number = 0 - 1
+    if dashes == 5 {
+        build = parts[2]
+        if build.len() == 0 or not is_digit(build.substr(0, 1)) {
+            fail(BadBuildTag(build))
+        }
+        var digits = ""
+        var i = 0
+        while i < build.len() and is_digit(build.substr(i, 1)) {
+            digits = digits + build.substr(i, 1)
+            i = i + 1
+        }
+        build_number = digits.parse_int() ?? 0
+    }
+    let tags = parts[parts.len() - 1].split("-")
+    if tags.len() != 3 {
+        fail(WrongShape(name))
+    }
+    return WheelName{ distribution: normalise_name(project),
+        version: parts[1], build: build, build_number: build_number,
+        python_tag: tags[0], abi_tag: tags[1], platform_tag: tags[2] }
+}
+
+/// The version, read.
+pub fn version_of(wheel: WheelName) -> PepVersion ! WheelError {
+    match pep440.parse(wheel.version) {
+        Ok(version) -> return version
+        Err(_why) -> fail(BadVersion(wheel.version))
+    }
+}
+
+/// Every tag the wheel claims, with the compressed fields expanded.
+///
+/// `py2.py3-none-any` is two tags, not one, and an installer that
+/// compares the written text against its own tag refuses a wheel that
+/// would have installed.
+pub fn tags_of(wheel: WheelName) -> [str] {
+    var out: [str] = []
+    for python in wheel.python_tag.split(".") {
+        for abi in wheel.abi_tag.split(".") {
+            for platform in wheel.platform_tag.split(".") {
+                out.push(python + "-" + abi + "-" + platform)
+            }
+        }
+    }
+    return out
+}
+
+/// Whether any tag the wheel claims is one the interpreter supports.
+pub fn is_supported(wheel: WheelName, supported: [str]) -> bool {
+    for tag in tags_of(wheel) {
+        for one in supported {
+            if tag == one {
+                return true
+            }
+        }
+    }
+    return false
+}
+
+/// Read a source distribution's file name, which is
+/// `distribution-version` and one of two extensions.
+///
+/// The distribution here *may* contain a dash, so the version is found
+/// from the last one — which is why a name with no dash at all, or a
+/// version that is not a version, is refused rather than guessed at.
+pub fn parse_sdist(name: str) -> (str, str) ! WheelError {
+    var body = ""
+    if name.ends_with(".tar.gz") {
+        body = name.substr(0, name.len() - 7)
+    } else if name.ends_with(".zip") {
+        body = name.substr(0, name.len() - 4)
+    } else {
+        fail(NotASdist(name))
+    }
+    var dash = 0 - 1
+    var i = 0
+    while i < body.len() {
+        if body.substr(i, 1) == "-" {
+            dash = i
+        }
+        i = i + 1
+    }
+    if dash <= 0 {
+        fail(NotASdist(name))
+    }
+    let project = body.substr(0, dash)
+    let version = body.substr(dash + 1, body.len() - dash - 1)
+    match pep440.parse(version) {
+        Ok(_read) -> {}
+        Err(_why) -> fail(BadVersion(version))
+    }
+    return (normalise_name(project), version)
+}

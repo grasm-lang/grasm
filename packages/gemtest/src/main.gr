@@ -1,0 +1,25 @@
+import gemversion
+
+fn main() / {io} {
+    var i = 0
+    while i + 1 < args().len() {
+        match gemversion.parse(args()[i]) {
+            Ok(left) -> {
+                match gemversion.parse(args()[i + 1]) {
+                    Ok(right) -> {
+                        var out = "{gemversion.compare(left, right)}"
+                        if gemversion.is_prerelease(left) {
+                            out = out + " pre"
+                        } else {
+                            out = out + " rel"
+                        }
+                        print(out + " " + gemversion.release_of(left).text)
+                    }
+                    Err(_why) -> print("error")
+                }
+            }
+            Err(_why) -> print("error")
+        }
+        i = i + 2
+    }
+}
