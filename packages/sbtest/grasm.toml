@@ -1,0 +1,8 @@
+[package]
+name = "sbtest"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.sentencebreak]
+path = "../sentencebreak"
+version = "^1.0.0"

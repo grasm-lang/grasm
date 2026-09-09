@@ -1,0 +1,20 @@
+[package]
+name = "unicode2_demo"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.sentencebreak]
+path = "../sentencebreak"
+version = "^1.0.0"
+
+[dependencies.casemap]
+path = "../casemap"
+version = "^1.0.0"
+
+[dependencies.unicodescript]
+path = "../unicodescript"
+version = "^1.0.0"
+
+[dependencies.numericvalue]
+path = "../numericvalue"
+version = "^1.0.0"

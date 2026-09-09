@@ -1,0 +1,158 @@
+// Four more questions about text that the ASCII answer gets wrong.
+//
+// The expected values came from the Unicode Consortium's own
+// SentenceBreakTest, from Python's `str.upper` and `str.lower`, from the
+// `regex` module's script property, and from `unicodedata`.
+import sentencebreak
+import casemap
+import unicodescript
+import numericvalue
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn text_of(codes: [i64]) -> str {
+    var out = ""
+    for code in codes {
+        out = out + code.to_char()
+    }
+    return out
+}
+
+fn codes_of(text: str) -> [i64] {
+    var out: [i64] = []
+    for character in text.chars() {
+        out.push(character.code_at(0))
+    }
+    return out
+}
+
+// -------------------------------------------------------- sentencebreak
+
+fn check_sentences(inout f: i64) / {io} {
+    print("-- sentencebreak: a full stop is only an ending in company")
+    say(f, "an ordinary pair of sentences",
+        sentencebreak.count("He went home. She stayed.") == 2)
+    say(f, "a decimal point is not an ending",
+        sentencebreak.count("It cost 3.14 pounds.") == 1)
+    say(f, "and neither are initials",
+        sentencebreak.count("The U.S. dollar fell.") == 1)
+    say(f, "the closing quote and the space belong to the first sentence",
+        sentencebreak.sentences("\"Stop.\" He stopped.")[0] ==
+        "\"Stop.\" ")
+    say(f, "an exclamation and a question end a sentence too",
+        sentencebreak.count("Stop! Why? Because.") == 3)
+    say(f, "a line ending ends one whatever precedes it",
+        sentencebreak.count("no stop here\nsecond") == 2)
+    say(f, "and the default is to continue, not to break",
+        sentencebreak.count("one two three four five") == 1)
+    say(f, "an abbreviation it cannot know about is got wrong on purpose",
+        sentencebreak.count("Dr. Smith arrived.") == 2)
+}
+
+// --------------------------------------------------------------- casemap
+
+fn check_case(inout f: i64) / {io} {
+    print("-- casemap: changing case changes the length")
+    say(f, "the sharp s becomes two letters",
+        casemap.upper(text_of([223])) == "SS")
+    say(f, "and so does a ligature",
+        casemap.upper(text_of([64257])) == "FI" and
+        casemap.upper(text_of([64260])) == "FFL")
+    say(f, "a letter with a caron uppercases to two code points",
+        codes_of(casemap.upper(text_of([496]))) == [74, 780])
+    say(f, "a digraph has three cases, not two",
+        casemap.upper(text_of([454])) == text_of([452]) and
+        casemap.lower(text_of([454])) == text_of([454]) and
+        casemap.title_word(text_of([454])) == text_of([453]))
+    say(f, "a sigma at the end of a word is written differently",
+        codes_of(casemap.lower(text_of([913, 931]))) == [945, 962] and
+        codes_of(casemap.lower(text_of([913, 931, 914]))) ==
+        [945, 963, 946])
+    say(f, "and a whole word of them gets the same treatment",
+        codes_of(casemap.lower(text_of([927, 916, 927, 931]))) ==
+        [959, 948, 959, 962])
+    say(f, "the dotted capital I lowercases to a letter and a dot",
+        codes_of(casemap.lower(text_of([304]))) == [105, 775])
+    say(f, "the simple mapping never changes the length, and is wrong",
+        casemap.simple_upper(223) == 223 and
+        casemap.simple_upper(97) == 65)
+    say(f, "and a caller can ask whether upper case will need more room",
+        casemap.upper_grows(text_of([223])) and
+        not casemap.upper_grows("plain"))
+}
+
+// -------------------------------------------------------- unicodescript
+
+fn check_scripts(inout f: i64) / {io} {
+    print("-- unicodescript: which alphabet, and what a mixture means")
+    say(f, "a Latin a and a Cyrillic one are different characters",
+        unicodescript.script_of(97) == "Latin" and
+        unicodescript.script_of(1072) == "Cyrillic")
+    say(f, "digits and punctuation belong to no script",
+        unicodescript.script_of(48) == "Common" and
+        unicodescript.script_of(45) == "Common" and
+        unicodescript.is_common(unicodescript.script_of(768)))
+    say(f, "so a word with a hyphen and a number is still one script",
+        unicodescript.is_single_script("abc-123") and
+        not unicodescript.mixes_scripts("abc-123"))
+    say(f, "a Cyrillic letter hidden in a Latin word is caught",
+        unicodescript.mixes_scripts(text_of([1072, 112, 112, 108, 101])))
+    say(f, "and the same word without it is not",
+        not unicodescript.mixes_scripts("apple"))
+    say(f, "Japanese is three scripts at once and is not suspicious",
+        not unicodescript.mixes_scripts(text_of([26085, 26412, 35486,
+            12391, 12377])) and
+        unicodescript.scripts_in(text_of([26085, 26412, 35486, 12391,
+            12377])).len() == 2)
+    say(f, "and Korean mixes two",
+        not unicodescript.mixes_scripts(text_of([54620, 44397, 50612])))
+}
+
+// --------------------------------------------------------- numericvalue
+
+fn check_numbers(inout f: i64) / {io} {
+    print("-- numericvalue: a three is a three in a hundred alphabets")
+    say(f, "Arabic-Indic, Devanagari and Thai threes are all decimal",
+        numericvalue.decimal_value(1635) == 3 and
+        numericvalue.decimal_value(2409) == 3 and
+        numericvalue.decimal_value(3667) == 3)
+    say(f, "a Han three has a value and is not a positional digit",
+        numericvalue.is_numeric(19977) and
+        not numericvalue.is_digit(19977) and
+        numericvalue.numeric_value(19977) == (3, 1))
+    say(f, "a circled three and a superscript three are digits, not decimal",
+        numericvalue.is_digit(9314) and
+        not numericvalue.is_decimal_digit(9314) and
+        numericvalue.is_digit(179))
+    say(f, "a half is a number whose value is not an integer",
+        numericvalue.numeric_value(189) == (1, 2))
+    say(f, "and ten thousand is one character",
+        numericvalue.numeric_value(19975) == (10000, 1))
+    say(f, "a run of digits in one alphabet reads as a number",
+        (numericvalue.parse_decimal(text_of([1633, 1634, 1635])) ?? 0) ==
+        123)
+    say(f, "a run that mixes alphabets does not",
+        numericvalue.parse_decimal(text_of([1633, 50, 1635])) == None)
+    say(f, "and any alphabet's digits can be written in this one",
+        numericvalue.to_ascii_digits(text_of([1633, 1634, 1635])) == "123")
+}
+
+fn main() / {io} {
+    var f = 0
+    check_sentences(f)
+    check_case(f)
+    check_scripts(f)
+    check_numbers(f)
+    if f == 0 {
+        print("unicode2: every claim held")
+    } else {
+        print("unicode2: {f} claims failed")
+    }
+}

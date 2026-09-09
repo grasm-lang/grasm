@@ -1,5 +1,5 @@
-"""Grapheme cluster and word boundaries, against the Unicode Consortium's
-own test files.
+"""Grapheme cluster, word and sentence boundaries, against the Unicode
+Consortium's own test files.
 
 Each line of those files is a string written as `÷ 0061 × 0300 ÷`, where a
 division sign is a boundary and a multiplication sign is not. The boundary
@@ -60,6 +60,8 @@ def main():
               os.path.join(fixtures, "GraphemeBreakTest.txt"), "clusters")
     bad += run(grasm, root, os.path.join(root, "packages/wbtest/src/main.gr"),
                os.path.join(fixtures, "WordBreakTest.txt"), "words")
+    bad += run(grasm, root, os.path.join(root, "packages/sbtest/src/main.gr"),
+               os.path.join(fixtures, "SentenceBreakTest.txt"), "sentences")
     sys.exit(1 if bad else 0)
 
 
