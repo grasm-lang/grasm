@@ -1,0 +1,469 @@
+// ELF binaries: the header, the sections, the segments, and what the
+// file needs at run time.
+//
+// The questions a tool asks of a Linux binary are "will this run on that
+// machine", "what does it need loaded beside it" and "which build is
+// this", and all three are answered here without a linker.
+//
+// ## The file says how to read the file
+//
+// Bytes 4 and 5 of every ELF give the class (32- or 64-bit) and the byte
+// order, and *everything after them* is laid out accordingly: a 64-bit
+// header is 64 bytes and a 32-bit one is 52, and the fields are not in
+// the same places. So a reader cannot have one struct; it has to decide
+// its own field offsets after reading two bytes. A reader written
+// against `readelf` output from one machine silently misreads a binary
+// from another — big-endian s390x and 32-bit i386 files are common in
+// distribution archives and are exactly what such a reader gets wrong.
+//
+// ## Section names live in another section
+//
+// A section header holds an *offset into the section-name string table*,
+// and which section that is comes from `e_shstrndx` in the file header.
+// Two indirections before a name; a reader that takes `sh_name` for a
+// name gets a number.
+//
+// ## What a program needs is in `.dynamic`, not in the sections
+//
+// The shared libraries a binary loads are `DT_NEEDED` entries in the
+// dynamic table, each an offset into `.dynstr`. The section list says
+// what the file *contains*; the dynamic table says what it *wants*, and
+// a packaging tool needs the second.
+
+type ElfError =
+    | NotAnElf()
+    | Truncated(at: i64)
+    | BadClass(value: i64)
+
+    /// The file header, whatever the class and byte order.
+type ElfHeader = {
+    /// 32 or 64.
+    class_bits: i64,
+    big_endian: bool,
+    os_abi: i64,
+    /// `ET_REL`, `ET_EXEC`, `ET_DYN`, `ET_CORE` as their numbers.
+    file_type: i64,
+    machine: i64,
+    entry: i64,
+    program_offset: i64,
+    section_offset: i64,
+    flags: i64,
+    program_entry_size: i64,
+    program_count: i64,
+    section_entry_size: i64,
+    section_count: i64,
+    /// Which section holds the section names.
+    name_section: i64,
+}
+
+/// One section header.
+type ElfSection = {
+    name: str,
+    name_offset: i64,
+    kind: i64,
+    flags: i64,
+    address: i64,
+    offset: i64,
+    size: i64,
+    link: i64,
+    info: i64,
+    alignment: i64,
+    entry_size: i64,
+}
+
+/// One program header, which is what the loader reads.
+type ElfSegment = {
+    kind: i64,
+    flags: i64,
+    offset: i64,
+    virtual_address: i64,
+    physical_address: i64,
+    file_size: i64,
+    memory_size: i64,
+    alignment: i64,
+}
+
+/// One symbol.
+type ElfSymbol = {
+    name: str,
+    value: i64,
+    size: i64,
+    /// 0 local, 1 global, 2 weak.
+    binding: i64,
+    /// 1 object, 2 function, and the rest.
+    kind: i64,
+    section: i64,
+}
+
+fn byte_at(data: bytes, at: i64) -> i64 ! ElfError {
+    if at < 0 or at >= data.len() {
+        fail(Truncated(at))
+    }
+    return data.at(at)
+}
+
+/// Read an unsigned number of `width` bytes in the file's own order.
+pub fn number_at(data: bytes, at: i64, width: i64,
+    big_endian: bool) -> i64 ! ElfError {
+    var out = 0
+    var i = 0
+    while i < width {
+        var byte = 0
+        if big_endian {
+            byte = try byte_at(data, at + i)
+        } else {
+            byte = try byte_at(data, at + width - 1 - i)
+        }
+        out = out * 256 + byte
+        i = i + 1
+    }
+    return out
+}
+
+/// Whether the bytes begin with the ELF magic.
+pub fn is_elf(data: bytes) -> bool {
+    if data.len() < 4 {
+        return false
+    }
+    return data.at(0) == 127 and data.at(1) == 69 and data.at(2) == 76 and
+    data.at(3) == 70
+}
+
+/// Read the file header.
+pub fn header(data: bytes) -> ElfHeader ! ElfError {
+    if not is_elf(data) {
+        fail(NotAnElf())
+    }
+    let class_byte = try byte_at(data, 4)
+    if class_byte != 1 and class_byte != 2 {
+        fail(BadClass(class_byte))
+    }
+    let bits = 32 * class_byte
+    let big_endian = (try byte_at(data, 5)) == 2
+    // The header's own layout follows the class: everything from the
+    // entry point onwards is four bytes wide in a 32-bit file and eight
+    // in a 64-bit one.
+    var word = 4
+    if bits == 64 {
+        word = 8
+    }
+    let at = 16
+    let file_type = try number_at(data, at, 2, big_endian)
+    let machine = try number_at(data, at + 2, 2, big_endian)
+    let entry = try number_at(data, at + 8, word, big_endian)
+    let program_offset = try number_at(data, at + 8 + word, word, big_endian)
+    let section_offset = try number_at(data, at + 8 + word * 2, word,
+        big_endian)
+    let tail = at + 8 + word * 3
+    return ElfHeader{ class_bits: bits, big_endian: big_endian,
+        os_abi: try byte_at(data, 7), file_type: file_type,
+        machine: machine, entry: entry, program_offset: program_offset,
+        section_offset: section_offset,
+        flags: try number_at(data, tail, 4, big_endian),
+        program_entry_size: try number_at(data, tail + 6, 2, big_endian),
+        program_count: try number_at(data, tail + 8, 2, big_endian),
+        section_entry_size: try number_at(data, tail + 10, 2, big_endian),
+        section_count: try number_at(data, tail + 12, 2, big_endian),
+        name_section: try number_at(data, tail + 14, 2, big_endian) }
+}
+
+/// A NUL-terminated name out of a string table.
+pub fn name_at(data: bytes, table_offset: i64, at: i64) -> str {
+    var out: [i64] = []
+    var i = table_offset + at
+    while i < data.len() and data.at(i) != 0 {
+        out.push(data.at(i))
+        i = i + 1
+    }
+    return bytes_of(out).to_str()
+}
+
+fn section_headers(data: bytes, head: ElfHeader) -> [ElfSection] ! ElfError {
+    var out: [ElfSection] = []
+    var word = 4
+    if head.class_bits == 64 {
+        word = 8
+    }
+    var i = 0
+    while i < head.section_count {
+        let at = head.section_offset + i * head.section_entry_size
+        let name_offset = try number_at(data, at, 4, head.big_endian)
+        let kind = try number_at(data, at + 4, 4, head.big_endian)
+        let flags = try number_at(data, at + 8, word, head.big_endian)
+        let address = try number_at(data, at + 8 + word, word,
+            head.big_endian)
+        let offset = try number_at(data, at + 8 + word * 2, word,
+            head.big_endian)
+        let size = try number_at(data, at + 8 + word * 3, word,
+            head.big_endian)
+        let tail = at + 8 + word * 4
+        out.push(ElfSection{ name: "", name_offset: name_offset,
+            kind: kind, flags: flags, address: address, offset: offset,
+            size: size,
+            link: try number_at(data, tail, 4, head.big_endian),
+            info: try number_at(data, tail + 4, 4, head.big_endian),
+            alignment: try number_at(data, tail + 8, word, head.big_endian),
+            entry_size: try number_at(data, tail + 8 + word, word,
+                head.big_endian) })
+        i = i + 1
+    }
+    return out
+}
+
+/// The sections, with their names read out of the name table.
+pub fn sections(data: bytes) -> [ElfSection] ! ElfError {
+    let head = try header(data)
+    var out = try section_headers(data, head)
+    if head.name_section >= out.len() {
+        return out
+    }
+    let table = out[head.name_section].offset
+    var i = 0
+    while i < out.len() {
+        out[i].name = name_at(data, table, out[i].name_offset)
+        i = i + 1
+    }
+    return out
+}
+
+/// The program headers.
+pub fn segments(data: bytes) -> [ElfSegment] ! ElfError {
+    let head = try header(data)
+    var out: [ElfSegment] = []
+    var i = 0
+    while i < head.program_count {
+        let at = head.program_offset + i * head.program_entry_size
+        let kind = try number_at(data, at, 4, head.big_endian)
+        if head.class_bits == 64 {
+            // 64-bit puts the flags right after the type; 32-bit puts
+            // them at the end. Same fields, different order.
+            out.push(ElfSegment{ kind: kind,
+                flags: try number_at(data, at + 4, 4, head.big_endian),
+                offset: try number_at(data, at + 8, 8, head.big_endian),
+                virtual_address: try number_at(data, at + 16, 8,
+                    head.big_endian),
+                physical_address: try number_at(data, at + 24, 8,
+                    head.big_endian),
+                file_size: try number_at(data, at + 32, 8, head.big_endian),
+                memory_size: try number_at(data, at + 40, 8,
+                    head.big_endian),
+                alignment: try number_at(data, at + 48, 8,
+                    head.big_endian) })
+        } else {
+            out.push(ElfSegment{ kind: kind,
+                offset: try number_at(data, at + 4, 4, head.big_endian),
+                virtual_address: try number_at(data, at + 8, 4,
+                    head.big_endian),
+                physical_address: try number_at(data, at + 12, 4,
+                    head.big_endian),
+                file_size: try number_at(data, at + 16, 4, head.big_endian),
+                memory_size: try number_at(data, at + 20, 4,
+                    head.big_endian),
+                flags: try number_at(data, at + 24, 4, head.big_endian),
+                alignment: try number_at(data, at + 28, 4,
+                    head.big_endian) })
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn section_named(list: [ElfSection], name: str) -> i64 {
+    var i = 0
+    while i < list.len() {
+        if list[i].name == name {
+            return i
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+/// The symbols of one table, `.symtab` or `.dynsym`.
+pub fn symbols(data: bytes, table: str) -> [ElfSymbol] ! ElfError {
+    let head = try header(data)
+    let list = try sections(data)
+    let at = section_named(list, table)
+    var out: [ElfSymbol] = []
+    if at < 0 {
+        return out
+    }
+    let strings = list[at].link
+    if strings >= list.len() {
+        return out
+    }
+    let names = list[strings].offset
+    var entry = list[at].entry_size
+    if entry == 0 {
+        entry = 24
+        if head.class_bits == 32 {
+            entry = 16
+        }
+    }
+    var i = 0
+    while i * entry < list[at].size {
+        let base = list[at].offset + i * entry
+        let name_offset = try number_at(data, base, 4, head.big_endian)
+        var info = 0
+        var section = 0
+        var value = 0
+        var size = 0
+        if head.class_bits == 64 {
+            // 64-bit moves the value and size behind the info byte,
+            // which is the one place the two layouts disagree in order
+            // rather than only in width.
+            info = try byte_at(data, base + 4)
+            section = try number_at(data, base + 6, 2, head.big_endian)
+            value = try number_at(data, base + 8, 8, head.big_endian)
+            size = try number_at(data, base + 16, 8, head.big_endian)
+        } else {
+            value = try number_at(data, base + 4, 4, head.big_endian)
+            size = try number_at(data, base + 8, 4, head.big_endian)
+            info = try byte_at(data, base + 12)
+            section = try number_at(data, base + 14, 2, head.big_endian)
+        }
+        out.push(ElfSymbol{ name: name_at(data, names, name_offset),
+            value: value, size: size, binding: info / 16, kind: info % 16,
+            section: section })
+        i = i + 1
+    }
+    return out
+}
+
+/// The `.dynamic` entries, as `(tag, value)`.
+pub fn dynamic(data: bytes) -> [(i64, i64)] ! ElfError {
+    let head = try header(data)
+    let list = try sections(data)
+    let at = section_named(list, ".dynamic")
+    var out: [(i64, i64)] = []
+    if at < 0 {
+        return out
+    }
+    var word = 4
+    if head.class_bits == 64 {
+        word = 8
+    }
+    var i = 0
+    while (i + 1) * word * 2 <= list[at].size {
+        let base = list[at].offset + i * word * 2
+        let tag = try number_at(data, base, word, head.big_endian)
+        let value = try number_at(data, base + word, word, head.big_endian)
+        if tag == 0 {
+            return out
+        }
+        out.push((tag, value))
+        i = i + 1
+    }
+    return out
+}
+
+/// The shared libraries the file needs — the `DT_NEEDED` entries.
+pub fn needed_libraries(data: bytes) -> [str] ! ElfError {
+    let list = try sections(data)
+    let at = section_named(list, ".dynstr")
+    var out: [str] = []
+    if at < 0 {
+        return out
+    }
+    for entry in try dynamic(data) {
+        if entry.0 == 1 {
+            out.push(name_at(data, list[at].offset, entry.1))
+        }
+    }
+    return out
+}
+
+/// The `DT_SONAME`, which is the name other binaries link against.
+pub fn soname(data: bytes) -> str ! ElfError {
+    let list = try sections(data)
+    let at = section_named(list, ".dynstr")
+    if at < 0 {
+        return ""
+    }
+    for entry in try dynamic(data) {
+        if entry.0 == 14 {
+            return name_at(data, list[at].offset, entry.1)
+        }
+    }
+    return ""
+}
+
+/// The GNU build id, as lower-case hexadecimal, or the empty string.
+///
+/// It is a note rather than a section of its own: the section holds a
+/// name, a description and their two lengths, and the id is the
+/// description.
+pub fn build_id(data: bytes) -> str ! ElfError {
+    let head = try header(data)
+    let list = try sections(data)
+    let at = section_named(list, ".note.gnu.build-id")
+    if at < 0 {
+        return ""
+    }
+    let base = list[at].offset
+    let name_size = try number_at(data, base, 4, head.big_endian)
+    let description_size = try number_at(data, base + 4, 4, head.big_endian)
+    var start = base + 12 + name_size
+    // Each part is padded to a four-byte boundary.
+    if name_size % 4 != 0 {
+        start = start + 4 - name_size % 4
+    }
+    let digits = "0123456789abcdef"
+    var out = ""
+    var i = 0
+    while i < description_size {
+        let byte = try byte_at(data, start + i)
+        out = out + digits.substr(byte / 16, 1) + digits.substr(byte % 16, 1)
+        i = i + 1
+    }
+    return out
+}
+
+/// The machine, by name, for the ones a packaging tool meets.
+pub fn machine_name(machine: i64) -> str {
+    if machine == 3 {
+        return "i386"
+    }
+    if machine == 8 {
+        return "mips"
+    }
+    if machine == 20 {
+        return "ppc"
+    }
+    if machine == 21 {
+        return "ppc64"
+    }
+    if machine == 22 {
+        return "s390"
+    }
+    if machine == 40 {
+        return "arm"
+    }
+    if machine == 62 {
+        return "x86_64"
+    }
+    if machine == 183 {
+        return "aarch64"
+    }
+    if machine == 243 {
+        return "riscv"
+    }
+    return "unknown"
+}
+
+/// The file type, by name.
+pub fn file_type_name(file_type: i64) -> str {
+    if file_type == 1 {
+        return "relocatable"
+    }
+    if file_type == 2 {
+        return "executable"
+    }
+    if file_type == 3 {
+        return "shared object"
+    }
+    if file_type == 4 {
+        return "core"
+    }
+    return "unknown"
+}

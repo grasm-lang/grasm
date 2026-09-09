@@ -1,0 +1,388 @@
+// What a file is, from what is in it rather than from what it is called.
+//
+// A file name is a claim its owner makes; the first bytes are evidence.
+// Anything that accepts an upload, unpacks an archive or decides how to
+// display something has to use the second, because the first is chosen
+// by whoever sent the file.
+//
+// ## Not every signature is at the start
+//
+// A tar file says `ustar` 257 bytes in, and an ISO image says `CD001` at
+// 32769 — both because the format predates the idea of a magic number
+// and the space was already spoken for. A sniffer that only looks at the
+// first bytes misses both.
+//
+// ## Two formats share a magic number
+//
+// `cafebabe` is a Java class file and a macOS universal binary. They are
+// told apart by what follows: a class file's next four bytes are a
+// version in the forties to seventies, a universal binary's are a small
+// count of architectures. This is the one place a signature table is not
+// enough, and a sniffer that returns the first match gets it wrong half
+// the time.
+//
+// ## Containers are not their contents
+//
+// A `.docx`, a `.jar`, an `.epub` and a Python wheel are all zip files,
+// and the honest answer for all four is `application/zip`. Saying more
+// means reading the archive, which is the caller's job and needs a zip
+// reader; what belongs here is the answer the bytes actually support.
+
+/// What a file appears to be.
+type FileKind = {
+    /// The media type, or the empty string when nothing matched.
+    media_type: str,
+    /// A few words for a person.
+    description: str,
+    /// Where the evidence was, for a caller that wants to say why.
+    at: i64,
+}
+
+fn matches_at(data: bytes, at: i64, pattern: [i64]) -> bool {
+    if at + pattern.len() > data.len() {
+        return false
+    }
+    var i = 0
+    while i < pattern.len() {
+        if data.at(at + i) != pattern[i] {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn text_at(data: bytes, at: i64, text: str) -> bool {
+    var pattern: [i64] = []
+    let raw = text.to_bytes()
+    var i = 0
+    while i < raw.len() {
+        pattern.push(raw.at(i))
+        i = i + 1
+    }
+    return matches_at(data, at, pattern)
+}
+
+fn big_number(data: bytes, at: i64, width: i64) -> i64 {
+    if at + width > data.len() {
+        return 0 - 1
+    }
+    var out = 0
+    var i = 0
+    while i < width {
+        out = out * 256 + data.at(at + i)
+        i = i + 1
+    }
+    return out
+}
+
+fn found(media_type: str, description: str, at: i64) -> FileKind {
+    return FileKind{ media_type: media_type, description: description,
+        at: at }
+}
+
+/// An ELF file says which of four kinds it is in its header, and the
+/// media types differ.
+fn elf_kind(data: bytes) -> FileKind {
+    var file_type = 0
+    if data.len() > 17 {
+        if data.at(5) == 2 {
+            file_type = data.at(16) * 256 + data.at(17)
+        } else {
+            file_type = data.at(17) * 256 + data.at(16)
+        }
+    }
+    if file_type == 1 {
+        return found("application/x-object", "ELF relocatable object", 0)
+    }
+    if file_type == 2 {
+        return found("application/x-executable", "ELF executable", 0)
+    }
+    if file_type == 4 {
+        return found("application/x-coredump", "ELF core file", 0)
+    }
+    return found("application/x-sharedlib", "ELF shared object", 0)
+}
+
+/// `cafebabe` is two formats, and what follows tells them apart.
+fn cafebabe_kind(data: bytes) -> FileKind {
+    let next = big_number(data, 4, 4)
+    if next > 0 and next < 32 {
+        return found("application/x-mach-binary",
+            "Mach-O universal binary", 0)
+    }
+    return found("application/x-java-applet", "Java class file", 0)
+}
+
+fn riff_kind(data: bytes) -> FileKind {
+    if text_at(data, 8, "WAVE") {
+        return found("audio/x-wav", "WAV audio", 8)
+    }
+    if text_at(data, 8, "WEBP") {
+        return found("image/webp", "WebP image", 8)
+    }
+    if text_at(data, 8, "AVI ") {
+        return found("video/x-msvideo", "AVI video", 8)
+    }
+    return found("application/octet-stream", "RIFF container", 0)
+}
+
+fn ftyp_kind(data: bytes) -> FileKind {
+    if text_at(data, 8, "heic") or text_at(data, 8, "heix") or
+    text_at(data, 8, "mif1") {
+        return found("image/heic", "HEIC image", 4)
+    }
+    if text_at(data, 8, "avif") {
+        return found("image/avif", "AVIF image", 4)
+    }
+    if text_at(data, 8, "qt  ") {
+        return found("video/quicktime", "QuickTime video", 4)
+    }
+    return found("video/mp4", "MPEG-4 video", 4)
+}
+
+fn archive_kind(data: bytes) -> FileKind {
+    // A Debian package is an `ar` archive whose first member is a file
+    // called `debian-binary`, which is the only thing that tells it from
+    // a static library.
+    if text_at(data, 8, "debian-binary") {
+        return found("application/vnd.debian.binary-package",
+            "Debian package", 8)
+    }
+    return found("application/x-archive", "ar archive", 0)
+}
+
+fn image_kind(data: bytes) -> FileKind {
+    if matches_at(data, 0, [137, 80, 78, 71, 13, 10, 26, 10]) {
+        return found("image/png", "PNG image", 0)
+    }
+    if matches_at(data, 0, [255, 216, 255]) {
+        return found("image/jpeg", "JPEG image", 0)
+    }
+    if text_at(data, 0, "GIF87a") or text_at(data, 0, "GIF89a") {
+        return found("image/gif", "GIF image", 0)
+    }
+    if text_at(data, 0, "BM") {
+        return found("image/bmp", "BMP image", 0)
+    }
+    if matches_at(data, 0, [0, 0, 1, 0]) {
+        return found("image/vnd.microsoft.icon", "Windows icon", 0)
+    }
+    if text_at(data, 0, "icns") {
+        return found("image/x-icns", "Apple icon image", 0)
+    }
+    if text_at(data, 0, "II*\u{0}") or text_at(data, 0, "MM\u{0}*") {
+        return found("image/tiff", "TIFF image", 0)
+    }
+    return found("", "", 0)
+}
+
+fn compression_kind(data: bytes) -> FileKind {
+    if matches_at(data, 0, [31, 139]) {
+        return found("application/gzip", "gzip stream", 0)
+    }
+    if text_at(data, 0, "BZh") {
+        return found("application/x-bzip2", "bzip2 stream", 0)
+    }
+    if matches_at(data, 0, [253, 55, 122, 88, 90, 0]) {
+        return found("application/x-xz", "xz stream", 0)
+    }
+    if matches_at(data, 0, [40, 181, 47, 253]) {
+        return found("application/zstd", "Zstandard stream", 0)
+    }
+    if matches_at(data, 0, [4, 34, 77, 24]) {
+        return found("application/x-lz4", "LZ4 stream", 0)
+    }
+    if text_at(data, 0, "7z") and matches_at(data, 2, [188, 175, 39, 28]) {
+        return found("application/x-7z-compressed", "7-zip archive", 0)
+    }
+    if text_at(data, 0, "Rar!") {
+        return found("application/x-rar", "RAR archive", 0)
+    }
+    return found("", "", 0)
+}
+
+fn font_kind(data: bytes) -> FileKind {
+    if text_at(data, 0, "ttcf") {
+        return found("font/ttf", "TrueType collection", 0)
+    }
+    if matches_at(data, 0, [0, 1, 0, 0, 0]) or text_at(data, 0, "true") or
+    text_at(data, 0, "OTTO") {
+        return found("font/sfnt", "TrueType or OpenType font", 0)
+    }
+    if text_at(data, 0, "wOFF") {
+        return found("font/woff", "WOFF font", 0)
+    }
+    if text_at(data, 0, "wOF2") {
+        return found("font/woff2", "WOFF2 font", 0)
+    }
+    return found("", "", 0)
+}
+
+fn audio_kind(data: bytes) -> FileKind {
+    if text_at(data, 0, "ID3") or matches_at(data, 0, [255, 251]) or
+    matches_at(data, 0, [255, 243]) or matches_at(data, 0, [255, 242]) {
+        return found("audio/mpeg", "MPEG audio", 0)
+    }
+    if text_at(data, 0, "fLaC") {
+        return found("audio/flac", "FLAC audio", 0)
+    }
+    if text_at(data, 0, "OggS") {
+        return found("audio/ogg", "Ogg stream", 0)
+    }
+    if text_at(data, 0, "FORM") and text_at(data, 8, "AIFF") {
+        return found("audio/x-aiff", "AIFF audio", 8)
+    }
+    if matches_at(data, 0, [26, 69, 223, 163]) {
+        return found("video/x-matroska", "Matroska container", 0)
+    }
+    return found("", "", 0)
+}
+
+fn document_kind(data: bytes) -> FileKind {
+    if text_at(data, 0, "%PDF-") {
+        return found("application/pdf", "PDF document", 0)
+    }
+    if text_at(data, 0, "%!PS") {
+        return found("application/postscript", "PostScript program", 0)
+    }
+    if text_at(data, 0, "SQLite format 3\u{0}") {
+        return found("application/vnd.sqlite3", "SQLite database", 0)
+    }
+    if text_at(data, 0, "<?xml") {
+        return found("text/xml", "XML document", 0)
+    }
+    if text_at(data, 0, "\u{d0}\u{cf}\u{11}\u{e0}") {
+        return found("application/x-ole-storage",
+            "Microsoft compound document", 0)
+    }
+    return found("", "", 0)
+}
+
+fn packaging_kind(data: bytes) -> FileKind {
+    if matches_at(data, 0, [80, 75, 3, 4]) or
+    matches_at(data, 0, [80, 75, 5, 6]) or
+    matches_at(data, 0, [80, 75, 7, 8]) {
+        return found("application/zip", "zip archive", 0)
+    }
+    if matches_at(data, 0, [237, 171, 238, 219]) {
+        return found("application/x-rpm", "RPM package", 0)
+    }
+    if text_at(data, 0, "070701") or text_at(data, 0, "070702") or
+    text_at(data, 0, "070707") {
+        return found("application/x-cpio", "cpio archive", 0)
+    }
+    if text_at(data, 0, "!<arch>\n") {
+        return archive_kind(data)
+    }
+    // Both of these are deliberately late: their evidence is a long way
+    // into the file, and an earlier signature is better evidence.
+    if text_at(data, 257, "ustar") {
+        return found("application/x-tar", "tar archive", 257)
+    }
+    if text_at(data, 32769, "CD001") {
+        return found("application/x-iso9660-image", "ISO 9660 image", 32769)
+    }
+    return found("", "", 0)
+}
+
+fn executable_kind(data: bytes) -> FileKind {
+    if matches_at(data, 0, [127, 69, 76, 70]) {
+        return elf_kind(data)
+    }
+    if matches_at(data, 0, [77, 90]) {
+        return found("application/x-dosexec", "DOS or Windows executable", 0)
+    }
+    if matches_at(data, 0, [202, 254, 186, 190]) {
+        return cafebabe_kind(data)
+    }
+    if matches_at(data, 0, [254, 237, 250, 206]) or
+    matches_at(data, 0, [254, 237, 250, 207]) or
+    matches_at(data, 0, [206, 250, 237, 254]) or
+    matches_at(data, 0, [207, 250, 237, 254]) {
+        return found("application/x-mach-binary", "Mach-O binary", 0)
+    }
+    if matches_at(data, 0, [0, 97, 115, 109]) {
+        return found("application/wasm", "WebAssembly module", 0)
+    }
+    return found("", "", 0)
+}
+
+/// Whether the bytes are text, by the rule a sniffer can afford: no NUL,
+/// and every byte either printable ASCII, ordinary whitespace, or part
+/// of a well-formed UTF-8 sequence.
+pub fn is_text(data: bytes) -> bool {
+    var i = 0
+    while i < data.len() {
+        let byte = data.at(i)
+        if byte == 0 {
+            return false
+        }
+        if byte < 32 and byte != 9 and byte != 10 and byte != 13 and
+        byte != 12 and byte != 27 {
+            return false
+        }
+        if byte >= 128 {
+            var following = 0
+            if byte >= 240 {
+                following = 3
+            } else if byte >= 224 {
+                following = 2
+            } else if byte >= 192 {
+                following = 1
+            } else {
+                return false
+            }
+            var j = 1
+            while j <= following {
+                if i + j >= data.len() or data.at(i + j) / 64 != 2 {
+                    return false
+                }
+                j = j + 1
+            }
+            i = i + following
+        }
+        i = i + 1
+    }
+    return true
+}
+
+/// What the bytes appear to be.
+///
+/// The order matters: signatures at the start of the file are tried
+/// before the ones a long way in, and the text answer is last because
+/// anything that matched a signature is not text.
+pub fn identify(data: bytes) -> FileKind {
+    if data.len() == 0 {
+        // `file(1)` spells this `inode/x-empty`, and an empty file is
+        // worth an answer of its own: it is the shape a truncated
+        // upload arrives in.
+        return found("inode/x-empty", "empty", 0)
+    }
+    let steps = [executable_kind(data), image_kind(data),
+        compression_kind(data), packaging_kind(data), audio_kind(data),
+        font_kind(data), document_kind(data)]
+    for one in steps {
+        if one.media_type.len() > 0 {
+            return one
+        }
+    }
+    if text_at(data, 0, "RIFF") {
+        return riff_kind(data)
+    }
+    if text_at(data, 4, "ftyp") {
+        return ftyp_kind(data)
+    }
+    if is_text(data) {
+        if text_at(data, 0, "#!") {
+            return found("text/x-shellscript", "script with a shebang", 0)
+        }
+        return found("text/plain", "text", 0)
+    }
+    return found("application/octet-stream", "unrecognised data", 0)
+}
+
+/// The media type alone, for a caller that wants one string.
+pub fn media_type(data: bytes) -> str {
+    return identify(data).media_type
+}

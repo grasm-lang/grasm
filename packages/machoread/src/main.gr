@@ -1,0 +1,316 @@
+// Mach-O binaries: the header, the load commands, and what a binary links
+// against.
+//
+// The questions a tool actually asks of a macOS binary are "which
+// architectures does it contain", "what does it link against" and "what
+// is the oldest system it will run on", and all three are answered by the
+// load commands rather than by any table.
+//
+// ## A universal binary is a container, not a binary
+//
+// `/bin/ls` on an Apple machine is a *fat* file: a small header, then two
+// or more complete Mach-O images at aligned offsets. Its first four bytes
+// are `cafebabe` and not a Mach-O magic at all, so a reader that starts
+// parsing a header there reads the architecture count as a CPU type. The
+// fat header is also big-endian *whatever the images inside it are*,
+// which is the second surprise.
+//
+// ## Load commands are a linked list by length
+//
+// Each command says its own size, and walking them means adding that size
+// rather than the size of the struct you think you are looking at. A
+// command a reader does not recognise still has to be stepped over
+// correctly, and new ones appear with every release.
+//
+// ## What is not here
+//
+// The symbol table and the relocations. Reading those is a linker's job;
+// what is here is what a packager, a dependency scanner or a "why will
+// this not run" tool needs.
+
+type MachoError =
+    | NotMacho()
+    | Truncated(at: i64)
+
+    /// One architecture inside a fat file.
+type MachFatEntry = {
+    cpu_type: i64,
+    cpu_subtype: i64,
+    offset: i64,
+    size: i64,
+}
+
+/// A Mach-O header.
+type MachoHeader = {
+    /// Whether the image is 64-bit.
+    is_64: bool,
+    /// Whether its integers are most-significant byte first.
+    big_endian: bool,
+    cpu_type: i64,
+    cpu_subtype: i64,
+    file_type: i64,
+    command_count: i64,
+    command_size: i64,
+    flags: i64,
+}
+
+/// One load command, as its number, its bytes and where it started.
+type MachLoadCommand = {
+    kind: i64,
+    size: i64,
+    at: i64,
+    body: bytes,
+}
+
+fn word32(data: bytes, at: i64, big_endian: bool) -> i64 {
+    if big_endian {
+        return data.at(at).shl(24).bit_or(data.at(at + 1).shl(16))
+            .bit_or(data.at(at + 2).shl(8)).bit_or(data.at(at + 3))
+    }
+    return data.at(at + 3).shl(24).bit_or(data.at(at + 2).shl(16))
+        .bit_or(data.at(at + 1).shl(8)).bit_or(data.at(at))
+}
+
+fn slice(data: bytes, from: i64, count: i64) -> bytes {
+    var out: [i64] = []
+    var i = 0
+    while i < count and from + i < data.len() {
+        out.push(data.at(from + i))
+        i = i + 1
+    }
+    return bytes_of(out)
+}
+
+/// Whether the file is a universal container rather than one image.
+pub fn is_fat(data: bytes) -> bool {
+    if data.len() < 8 {
+        return false
+    }
+    let magic = word32(data, 0, true)
+    return magic == 3405691582 or magic == 3405691583
+}
+
+/// The architectures a universal file contains.
+///
+/// The fat header is big-endian whatever the images are, which is the
+/// rule a reader that follows the images' own order gets wrong.
+pub fn fat_entries(data: bytes) -> [MachFatEntry] ! MachoError {
+    if not is_fat(data) {
+        fail(NotMacho())
+    }
+    let wide = word32(data, 0, true) == 3405691583
+    let count = word32(data, 4, true)
+    var out: [MachFatEntry] = []
+    let stride = if wide { 32 } else { 20 }
+    var at = 8
+    var i = 0
+    while i < count {
+        if at + stride > data.len() {
+            fail(Truncated(at))
+        }
+        var offset = word32(data, at + 8, true)
+        var size = word32(data, at + 12, true)
+        if wide {
+            // The 64-bit fat entry keeps the offset and size in eight
+            // bytes each; the low half is enough for any real file.
+            offset = word32(data, at + 12, true)
+            size = word32(data, at + 20, true)
+        }
+        out.push(MachFatEntry{ cpu_type: word32(data, at, true),
+            cpu_subtype: word32(data, at + 4, true), offset: offset,
+            size: size })
+        at = at + stride
+        i = i + 1
+    }
+    return out
+}
+
+/// Read a Mach-O header, at an offset inside the file.
+pub fn header(data: bytes, at: i64) -> MachoHeader ! MachoError {
+    if at + 28 > data.len() {
+        fail(Truncated(at))
+    }
+    let magic = word32(data, at, true)
+    var is_64 = false
+    var big_endian = false
+    if magic == 4277009103 {
+        big_endian = true
+    } else if magic == 3472551422 {
+        big_endian = false
+    } else if magic == 4277009104 {
+        big_endian = true
+        is_64 = true
+    } else if magic == 3489328638 {
+        big_endian = false
+        is_64 = true
+    } else {
+        fail(NotMacho())
+    }
+    return MachoHeader{ is_64: is_64, big_endian: big_endian,
+        cpu_type: word32(data, at + 4, big_endian),
+        cpu_subtype: word32(data, at + 8, big_endian),
+        file_type: word32(data, at + 12, big_endian),
+        command_count: word32(data, at + 16, big_endian),
+        command_size: word32(data, at + 20, big_endian),
+        flags: word32(data, at + 24, big_endian) }
+}
+
+/// The load commands of an image.
+pub fn commands(data: bytes, at: i64) -> [MachLoadCommand] ! MachoError {
+    let head = try header(data, at)
+    var out: [MachLoadCommand] = []
+    var cursor = at + if head.is_64 { 32 } else { 28 }
+    var i = 0
+    while i < head.command_count {
+        if cursor + 8 > data.len() {
+            fail(Truncated(cursor))
+        }
+        let kind = word32(data, cursor, head.big_endian)
+        let size = word32(data, cursor + 4, head.big_endian)
+        if size < 8 or cursor + size > data.len() {
+            fail(Truncated(cursor))
+        }
+        out.push(MachLoadCommand{ kind: kind, size: size, at: cursor,
+            body: slice(data, cursor, size) })
+        cursor = cursor + size
+        i = i + 1
+    }
+    return out
+}
+
+/// A null-terminated string inside a load command, at a byte offset the
+/// command gives.
+fn string_at(body: bytes, at: i64) -> str {
+    var out = ""
+    var i = at
+    while i < body.len() and body.at(i) != 0 {
+        out = out + body.at(i).to_char()
+        i = i + 1
+    }
+    return out
+}
+
+/// The libraries an image links against, in the order the linker will
+/// search them.
+pub fn linked_libraries(data: bytes, at: i64) -> [str] ! MachoError {
+    var out: [str] = []
+    let head = try header(data, at)
+    for command in try commands(data, at) {
+        // LC_LOAD_DYLIB, LC_LOAD_WEAK_DYLIB, LC_REEXPORT_DYLIB and
+        // LC_LOAD_UPWARD_DYLIB all carry a name the same way.
+        let kind = command.kind.bit_and(2147483647)
+        if kind != 12 and kind != 24 and kind != 31 and kind != 35 {
+            continue
+        }
+        let offset = word32(command.body, 8, head.big_endian)
+        if offset < command.size {
+            out.push(string_at(command.body, offset))
+        }
+    }
+    return out
+}
+
+/// The run paths an image carries, which is where `@rpath` is resolved
+/// from.
+pub fn run_paths(data: bytes, at: i64) -> [str] ! MachoError {
+    var out: [str] = []
+    let head = try header(data, at)
+    for command in try commands(data, at) {
+        if command.kind.bit_and(2147483647) != 28 {
+            continue
+        }
+        let offset = word32(command.body, 8, head.big_endian)
+        if offset < command.size {
+            out.push(string_at(command.body, offset))
+        }
+    }
+    return out
+}
+
+/// The names of an image's segments.
+pub fn segments(data: bytes, at: i64) -> [str] ! MachoError {
+    var out: [str] = []
+    for command in try commands(data, at) {
+        let kind = command.kind
+        if kind != 1 and kind != 25 {
+            continue
+        }
+        var name = ""
+        var i = 8
+        while i < 24 and command.body.at(i) != 0 {
+            name = name + command.body.at(i).to_char()
+            i = i + 1
+        }
+        out.push(name)
+    }
+    return out
+}
+
+/// The oldest system version an image says it needs, as a string, or the
+/// empty string when it does not say.
+///
+/// Both the old `LC_VERSION_MIN_*` commands and the newer
+/// `LC_BUILD_VERSION` are read: a binary built recently carries only the
+/// second, and one built a few years ago only the first.
+pub fn minimum_version(data: bytes, at: i64) -> str ! MachoError {
+    let head = try header(data, at)
+    for command in try commands(data, at) {
+        let kind = command.kind
+        if kind == 36 or kind == 37 or kind == 38 or kind == 44 {
+            return version_text(word32(command.body, 8, head.big_endian))
+        }
+        if kind == 50 and command.size >= 16 {
+            return version_text(word32(command.body, 12, head.big_endian))
+        }
+    }
+    return ""
+}
+
+/// A packed `xxxx.yy.zz` version number.
+fn version_text(value: i64) -> str {
+    return "{value.ushr(16)}.{value.ushr(8).bit_and(255)}" +
+    ".{value.bit_and(255)}"
+}
+
+/// The name of a CPU type, for the ones a Mac has ever had.
+pub fn cpu_name(cpu_type: i64) -> str {
+    if cpu_type == 7 {
+        return "i386"
+    }
+    if cpu_type == 16777223 {
+        return "x86_64"
+    }
+    if cpu_type == 12 {
+        return "arm"
+    }
+    if cpu_type == 16777228 {
+        return "arm64"
+    }
+    if cpu_type == 18 {
+        return "ppc"
+    }
+    if cpu_type == 16777234 {
+        return "ppc64"
+    }
+    return "{cpu_type}"
+}
+
+/// The name of a file type, for the ones that turn up.
+pub fn file_type_name(file_type: i64) -> str {
+    if file_type == 1 {
+        return "object"
+    }
+    if file_type == 2 {
+        return "executable"
+    }
+    if file_type == 6 {
+        return "dylib"
+    }
+    if file_type == 8 {
+        return "bundle"
+    }
+    if file_type == 10 {
+        return "dsym"
+    }
+    return "{file_type}"
+}

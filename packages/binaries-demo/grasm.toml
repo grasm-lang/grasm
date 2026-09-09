@@ -1,0 +1,20 @@
+[package]
+name = "binaries_demo"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.elfread]
+path = "../elfread"
+version = "^1.0.0"
+
+[dependencies.peread]
+path = "../peread"
+version = "^1.0.0"
+
+[dependencies.machoread]
+path = "../machoread"
+version = "^1.0.0"
+
+[dependencies.magicbytes]
+path = "../magicbytes"
+version = "^1.0.0"

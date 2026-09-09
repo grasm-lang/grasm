@@ -1,0 +1,9 @@
+import magicbytes
+
+fn main() / {io} {
+    for path in args() {
+        let data = read_bytes(path) ?? bytes_of([])
+        let kind = magicbytes.identify(data)
+        print(kind.media_type + "\u{2}" + kind.description + "\u{2}{kind.at}")
+    }
+}

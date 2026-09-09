@@ -1,0 +1,350 @@
+// Three executable formats and one question asked of all of them.
+//
+// The binaries here are built byte by byte so the demo can say exactly
+// what it put in and check exactly what came back. Every reader was also
+// checked against the tool that owns its format — pyelftools, `pefile`
+// and `otool` — over real binaries; this is the part that fits in a
+// program.
+import elfread
+import peread
+import machoread
+import magicbytes
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+// ------------------------------------------------------- writing bytes
+
+fn little(inout out: [i64], value: i64, width: i64) {
+    var left = value
+    var i = 0
+    while i < width {
+        out.push(left % 256)
+        left = left / 256
+        i = i + 1
+    }
+}
+
+fn big(inout out: [i64], value: i64, width: i64) {
+    var i = width - 1
+    while i >= 0 {
+        var left = value
+        var j = 0
+        while j < i {
+            left = left / 256
+            j = j + 1
+        }
+        out.push(left % 256)
+        i = i - 1
+    }
+}
+
+fn zeros(inout out: [i64], count: i64) {
+    var i = 0
+    while i < count {
+        out.push(0)
+        i = i + 1
+    }
+}
+
+fn letters(inout out: [i64], text: str) {
+    let raw = text.to_bytes()
+    var i = 0
+    while i < raw.len() {
+        out.push(raw.at(i))
+        i = i + 1
+    }
+}
+
+// ------------------------------------------------------------- elfread
+
+/// A 64-bit little-endian shared object with two real sections.
+fn small_elf() -> bytes {
+    var out: [i64] = []
+    letters(out, "\u{7f}ELF")
+    out.push(2)
+    out.push(1)
+    out.push(1)
+    zeros(out, 9)
+    little(out, 3, 2)
+    little(out, 62, 2)
+    little(out, 1, 4)
+    little(out, 4096, 8)
+    little(out, 64, 8)
+    little(out, 144, 8)
+    little(out, 0, 4)
+    little(out, 64, 2)
+    little(out, 56, 2)
+    little(out, 1, 2)
+    little(out, 64, 2)
+    little(out, 3, 2)
+    little(out, 1, 2)
+    // One loadable segment, at 64.
+    little(out, 1, 4)
+    little(out, 5, 4)
+    little(out, 0, 8)
+    little(out, 0, 8)
+    little(out, 0, 8)
+    little(out, 512, 8)
+    little(out, 512, 8)
+    little(out, 4096, 8)
+    // The section-name table, at 120.
+    out.push(0)
+    letters(out, ".shstrtab")
+    out.push(0)
+    letters(out, ".text")
+    out.push(0)
+    zeros(out, 7)
+    // Three section headers, at 144.
+    zeros(out, 64)
+    little(out, 1, 4)
+    little(out, 3, 4)
+    little(out, 0, 8)
+    little(out, 0, 8)
+    little(out, 120, 8)
+    little(out, 17, 8)
+    little(out, 0, 4)
+    little(out, 0, 4)
+    little(out, 1, 8)
+    little(out, 0, 8)
+    little(out, 11, 4)
+    little(out, 1, 4)
+    little(out, 6, 8)
+    little(out, 4096, 8)
+    little(out, 64, 8)
+    little(out, 16, 8)
+    little(out, 0, 4)
+    little(out, 0, 4)
+    little(out, 16, 8)
+    little(out, 0, 8)
+    return bytes_of(out)
+}
+
+fn check_elf(inout f: i64) / {io} {
+    print("-- elfread: two bytes decide how the rest is laid out")
+    let data = small_elf()
+    let head = elfread.header(data) ?? no_elf_header()
+    say(f, "the class and the byte order come from the identity bytes",
+        head.class_bits == 64 and not head.big_endian and
+        elfread.machine_name(head.machine) == "x86_64")
+    say(f, "and the kind of file is what a packager asks first",
+        elfread.file_type_name(head.file_type) == "shared object" and
+        head.entry == 4096)
+    let list = elfread.sections(data) ?? []
+    say(f, "a section's name is two indirections away from its header",
+        list.len() == 3 and list[1].name == ".shstrtab" and
+        list[2].name == ".text")
+    say(f, "the section sizes are read, not guessed from the offsets",
+        list[1].size == 17 and list[2].size == 16 and
+        list[2].address == 4096)
+    let loads = elfread.segments(data) ?? []
+    say(f, "a program header is laid out differently in the two classes",
+        loads.len() == 1 and loads[0].kind == 1 and
+        loads[0].file_size == 512 and loads[0].flags == 5)
+    say(f, "and something that is not an ELF is refused",
+        not elfread.is_elf(bytes_of([1, 2, 3, 4])))
+}
+
+fn no_elf_header() -> ElfHeader {
+    return ElfHeader{ class_bits: 0, big_endian: false, os_abi: 0,
+        file_type: 0, machine: 0, entry: 0, program_offset: 0,
+        section_offset: 0, flags: 0, program_entry_size: 0,
+        program_count: 0, section_entry_size: 0, section_count: 0,
+        name_section: 0 }
+}
+
+// -------------------------------------------------------------- peread
+
+/// A 64-bit PE with one section, and nothing else in it.
+fn small_pe() -> bytes {
+    var out: [i64] = []
+    letters(out, "MZ")
+    zeros(out, 58)
+    little(out, 64, 4)
+    letters(out, "PE")
+    zeros(out, 2)
+    little(out, 34404, 2)
+    little(out, 1, 2)
+    little(out, 305419896, 4)
+    little(out, 0, 4)
+    little(out, 0, 4)
+    little(out, 240, 2)
+    little(out, 8226, 2)
+    // The optional header, which is where the two forms differ.
+    little(out, 523, 2)
+    out.push(14)
+    out.push(0)
+    little(out, 1024, 4)
+    little(out, 512, 4)
+    little(out, 0, 4)
+    little(out, 4096, 4)
+    little(out, 4096, 4)
+    little(out, 6442450944, 8)
+    little(out, 4096, 4)
+    little(out, 512, 4)
+    zeros(out, 12)
+    little(out, 0, 4)
+    little(out, 8192, 4)
+    little(out, 1024, 4)
+    little(out, 0, 4)
+    little(out, 3, 2)
+    little(out, 352, 2)
+    zeros(out, 32)
+    little(out, 0, 4)
+    little(out, 16, 4)
+    zeros(out, 128)
+    // One section header.
+    letters(out, ".text")
+    zeros(out, 3)
+    little(out, 16, 4)
+    little(out, 4096, 4)
+    little(out, 512, 4)
+    little(out, 1024, 4)
+    zeros(out, 12)
+    little(out, 1610612768, 4)
+    return bytes_of(out)
+}
+
+fn check_pe(inout f: i64) / {io} {
+    print("-- peread: the header is where a number at 0x3c says it is")
+    let data = small_pe()
+    let head = peread.header(data) ?? no_pe_header()
+    say(f, "the DOS stub is stepped over rather than assumed away",
+        (peread.pe_offset(data) ?? 0) == 64 and
+        peread.machine_name(head.machine) == "x86_64")
+    say(f, "PE32+ moves every field after the image base",
+        head.bits == 64 and head.image_base == 6442450944 and
+        head.image_size == 8192 and head.subsystem == 3)
+    say(f, "and the fields before it stay where they were",
+        head.entry_point == 4096 and head.timestamp == 305419896 and
+        head.section_count == 1)
+    let list = peread.sections(data) ?? []
+    say(f, "a section name is eight bytes, padded with nothing",
+        list.len() == 1 and list[0].name == ".text" and
+        list[0].raw_offset == 1024)
+    say(f, "and an address in a table is turned into a file offset",
+        peread.offset_of(list, 4100) == 1028 and
+        peread.offset_of(list, 100) == 0 - 1)
+}
+
+fn no_pe_header() -> PeHeader {
+    return PeHeader{ machine: 0, section_count: 0, timestamp: 0,
+        optional_size: 0, characteristics: 0, bits: 0, entry_point: 0,
+        image_base: 0, section_alignment: 0, file_alignment: 0,
+        image_size: 0, headers_size: 0, subsystem: 0,
+        dll_characteristics: 0, optional_at: 0 }
+}
+
+// ----------------------------------------------------------- machoread
+
+/// A 64-bit little-endian Mach-O with a segment and a linked library.
+fn small_macho() -> bytes {
+    var out: [i64] = []
+    out.push(207)
+    out.push(250)
+    out.push(237)
+    out.push(254)
+    little(out, 16777228, 4)
+    little(out, 0, 4)
+    little(out, 2, 4)
+    little(out, 2, 4)
+    little(out, 72 + 56, 4)
+    little(out, 2097285, 4)
+    little(out, 0, 4)
+    // LC_SEGMENT_64, whose name sits in the middle of the command.
+    little(out, 25, 4)
+    little(out, 72, 4)
+    letters(out, "__TEXT")
+    zeros(out, 10)
+    zeros(out, 72 - 24)
+    // LC_LOAD_DYLIB, whose name is at an offset the command carries.
+    little(out, 12, 4)
+    little(out, 56, 4)
+    little(out, 24, 4)
+    little(out, 0, 4)
+    little(out, 65536, 4)
+    little(out, 65536, 4)
+    letters(out, "/usr/lib/libSystem.B.dylib")
+    zeros(out, 56 - 24 - 26)
+    return bytes_of(out)
+}
+
+fn check_macho(inout f: i64) / {io} {
+    print("-- machoread: the load commands are a list by length")
+    let data = small_macho()
+    let head = machoread.header(data, 0) ?? no_macho_header()
+    say(f, "the magic says the class and the byte order at once",
+        head.is_64 and not head.big_endian and head.command_count == 2)
+    say(f, "a segment names itself sixteen bytes into its command",
+        (machoread.segments(data, 0) ?? []) == ["__TEXT"])
+    say(f, "and a linked library is named by an offset, not a field",
+        (machoread.linked_libraries(data, 0) ?? []) ==
+        ["/usr/lib/libSystem.B.dylib"])
+    say(f, "the commands are walked by their own sizes",
+        (machoread.commands(data, 0) ?? []).len() == 2 and
+        (machoread.commands(data, 0) ?? [])[1].at == 32 + 72)
+}
+
+fn no_macho_header() -> MachoHeader {
+    return MachoHeader{ is_64: false, big_endian: false, cpu_type: 0,
+        cpu_subtype: 0, file_type: 0, command_count: 0, command_size: 0,
+        flags: 0 }
+}
+
+// ---------------------------------------------------------- magicbytes
+
+fn check_magic(inout f: i64) / {io} {
+    print("-- magicbytes: what a file is, not what it is called")
+    say(f, "each of the three executables is told apart by its first bytes",
+        magicbytes.media_type(small_elf()) == "application/x-sharedlib" and
+        magicbytes.media_type(small_pe()) == "application/x-dosexec" and
+        magicbytes.media_type(small_macho()) == "application/x-mach-binary")
+    var png: [i64] = [137, 80, 78, 71, 13, 10, 26, 10]
+    zeros(png, 20)
+    var gzip: [i64] = [31, 139, 8, 0]
+    zeros(gzip, 20)
+    say(f, "an image and a compressed stream are signatures at the start",
+        magicbytes.media_type(bytes_of(png)) == "image/png" and
+        magicbytes.media_type(bytes_of(gzip)) == "application/gzip")
+    var tar: [i64] = []
+    zeros(tar, 257)
+    letters(tar, "ustar")
+    zeros(tar, 250)
+    say(f, "and a tar file says so 257 bytes in, where nobody looks",
+        magicbytes.media_type(bytes_of(tar)) == "application/x-tar")
+    var class_file: [i64] = [202, 254, 186, 190]
+    big(class_file, 65, 4)
+    zeros(class_file, 20)
+    var fat: [i64] = [202, 254, 186, 190]
+    big(fat, 2, 4)
+    zeros(fat, 20)
+    say(f, "two formats share cafebabe and are told apart by what follows",
+        magicbytes.media_type(bytes_of(class_file)) ==
+        "application/x-java-applet" and
+        magicbytes.media_type(bytes_of(fat)) == "application/x-mach-binary")
+    var script: [i64] = []
+    letters(script, "#!/bin/sh\necho hello\n")
+    say(f, "text is what is left when nothing matched, and a shebang shows",
+        magicbytes.media_type(bytes_of(script)) == "text/x-shellscript" and
+        magicbytes.media_type("plain words\n".to_bytes()) == "text/plain" and
+        magicbytes.media_type(bytes_of([])) == "inode/x-empty")
+}
+
+fn main() / {io} {
+    var f = 0
+    check_elf(f)
+    check_pe(f)
+    check_macho(f)
+    check_magic(f)
+    if f == 0 {
+        print("binaries: every claim held")
+    } else {
+        print("binaries: {f} claims failed")
+    }
+}

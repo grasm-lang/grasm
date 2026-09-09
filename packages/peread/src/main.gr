@@ -1,0 +1,375 @@
+// PE binaries — Windows `.exe`, `.dll` and `.pyd` — the headers, the
+// sections, and what the file imports and exports.
+//
+// The questions asked of a Windows binary are the same three asked of
+// any other: which machine, what does it need beside it, and what does
+// it offer. Getting to the answers takes four steps a reader has to do
+// in order, and each is a place to go wrong.
+//
+// ## The file starts with a program from 1981
+//
+// Every PE begins with an MS-DOS executable whose only job is to print
+// "This program cannot be run in DOS mode". The real header's position
+// is a four-byte number at offset 0x3c, and nothing else in the DOS stub
+// is fixed. A reader that assumes the PE header is at a constant offset
+// works on the files its author tried and not on the next one.
+//
+// ## Addresses in the tables are not file offsets
+//
+// Imports, exports and resources are all named by *relative virtual
+// address* — where the loader will put the byte, not where it is in the
+// file. Turning one into a file offset means finding the section that
+// covers it and adding the difference between the two, so reading an
+// import table needs the section table first. This is the single
+// biggest source of wrong answers about PE files.
+//
+// ## PE32 and PE32+ differ in the middle of a header
+//
+// The optional header has one field of a different width (`ImageBase`)
+// and one field PE32+ leaves out entirely (`BaseOfData`), so every
+// field after them moves. A 32-bit reader pointed at a 64-bit binary
+// does not fail — it reports a plausible, wrong subsystem.
+
+type PeError =
+    | NotAPe()
+    | Truncated(at: i64)
+    | BadMagic(value: i64)
+
+    /// The COFF header, which is the same in both forms.
+type PeHeader = {
+    machine: i64,
+    section_count: i64,
+    timestamp: i64,
+    optional_size: i64,
+    characteristics: i64,
+    /// 32 or 64, from the optional header's magic.
+    bits: i64,
+    entry_point: i64,
+    image_base: i64,
+    section_alignment: i64,
+    file_alignment: i64,
+    image_size: i64,
+    headers_size: i64,
+    subsystem: i64,
+    dll_characteristics: i64,
+    /// Where the optional header starts, which is where the sections
+    /// are counted from.
+    optional_at: i64,
+}
+
+/// One section header.
+type PeSection = {
+    name: str,
+    virtual_size: i64,
+    virtual_address: i64,
+    raw_size: i64,
+    raw_offset: i64,
+    characteristics: i64,
+}
+
+/// One data directory entry.
+type PeDirectory = {
+    address: i64,
+    size: i64,
+}
+
+/// What one library is imported from.
+type PeImport = {
+    library: str,
+    /// The names, and `#ordinal` for the ones imported by number.
+    names: [str],
+}
+
+fn byte_at(data: bytes, at: i64) -> i64 ! PeError {
+    if at < 0 or at >= data.len() {
+        fail(Truncated(at))
+    }
+    return data.at(at)
+}
+
+/// A little-endian unsigned number; PE is little-endian throughout.
+pub fn number_at(data: bytes, at: i64, width: i64) -> i64 ! PeError {
+    var out = 0
+    var i = width - 1
+    while i >= 0 {
+        out = out * 256 + (try byte_at(data, at + i))
+        i = i - 1
+    }
+    return out
+}
+
+/// Where the PE header is, read from the DOS stub.
+pub fn pe_offset(data: bytes) -> i64 ! PeError {
+    if data.len() < 64 or (try byte_at(data, 0)) != 77 or
+    (try byte_at(data, 1)) != 90 {
+        fail(NotAPe())
+    }
+    let at = try number_at(data, 60, 4)
+    if at + 4 > data.len() or (try byte_at(data, at)) != 80 or
+    (try byte_at(data, at + 1)) != 69 {
+        fail(NotAPe())
+    }
+    return at
+}
+
+/// Read the COFF and optional headers.
+pub fn header(data: bytes) -> PeHeader ! PeError {
+    let at = try pe_offset(data)
+    let coff = at + 4
+    let optional = coff + 20
+    let magic = try number_at(data, optional, 2)
+    if magic != 267 and magic != 523 {
+        fail(BadMagic(magic))
+    }
+    var bits = 32
+    if magic == 523 {
+        bits = 64
+    }
+    // PE32 has a `BaseOfData` that PE32+ does not, and an `ImageBase`
+    // half the width, so everything after moves by four bytes.
+    var image_base = 0
+    var after_base = 0
+    if bits == 32 {
+        image_base = try number_at(data, optional + 28, 4)
+        after_base = optional + 32
+    } else {
+        image_base = try number_at(data, optional + 24, 8)
+        after_base = optional + 32
+    }
+    return PeHeader{ machine: try number_at(data, coff, 2),
+        section_count: try number_at(data, coff + 2, 2),
+        timestamp: try number_at(data, coff + 4, 4),
+        optional_size: try number_at(data, coff + 16, 2),
+        characteristics: try number_at(data, coff + 18, 2),
+        bits: bits,
+        entry_point: try number_at(data, optional + 16, 4),
+        image_base: image_base,
+        section_alignment: try number_at(data, after_base, 4),
+        file_alignment: try number_at(data, after_base + 4, 4),
+        image_size: try number_at(data, after_base + 24, 4),
+        headers_size: try number_at(data, after_base + 28, 4),
+        subsystem: try number_at(data, after_base + 36, 2),
+        dll_characteristics: try number_at(data, after_base + 38, 2),
+        optional_at: optional }
+}
+
+fn directory_count_at(head: PeHeader) -> i64 {
+    // The count and the directories themselves sit after four
+    // pointer-wide sizes, which is where the two forms differ again.
+    if head.bits == 32 {
+        return head.optional_at + 92
+    }
+    return head.optional_at + 108
+}
+
+/// The data directories, in order.
+pub fn directories(data: bytes) -> [PeDirectory] ! PeError {
+    let head = try header(data)
+    let at = directory_count_at(head)
+    let count = try number_at(data, at, 4)
+    var out: [PeDirectory] = []
+    var i = 0
+    while i < count and i < 16 {
+        out.push(PeDirectory{
+            address: try number_at(data, at + 4 + i * 8, 4),
+            size: try number_at(data, at + 8 + i * 8, 4) })
+        i = i + 1
+    }
+    return out
+}
+
+fn trimmed_name(data: bytes, at: i64) -> str ! PeError {
+    var out: [i64] = []
+    var i = 0
+    while i < 8 {
+        let byte = try byte_at(data, at + i)
+        if byte == 0 {
+            i = 8
+        } else {
+            out.push(byte)
+            i = i + 1
+        }
+    }
+    return bytes_of(out).to_str()
+}
+
+/// The section table.
+pub fn sections(data: bytes) -> [PeSection] ! PeError {
+    let head = try header(data)
+    let at = head.optional_at + head.optional_size
+    var out: [PeSection] = []
+    var i = 0
+    while i < head.section_count {
+        let base = at + i * 40
+        out.push(PeSection{ name: try trimmed_name(data, base),
+            virtual_size: try number_at(data, base + 8, 4),
+            virtual_address: try number_at(data, base + 12, 4),
+            raw_size: try number_at(data, base + 16, 4),
+            raw_offset: try number_at(data, base + 20, 4),
+            characteristics: try number_at(data, base + 36, 4) })
+        i = i + 1
+    }
+    return out
+}
+
+/// Turn a relative virtual address into a file offset, or -1.
+pub fn offset_of(list: [PeSection], address: i64) -> i64 {
+    for one in list {
+        var size = one.virtual_size
+        if size == 0 {
+            size = one.raw_size
+        }
+        if address >= one.virtual_address and
+        address < one.virtual_address + size {
+            return address - one.virtual_address + one.raw_offset
+        }
+    }
+    return 0 - 1
+}
+
+fn string_at(data: bytes, at: i64) -> str {
+    if at < 0 {
+        return ""
+    }
+    var out: [i64] = []
+    var i = at
+    while i < data.len() and data.at(i) != 0 {
+        out.push(data.at(i))
+        i = i + 1
+    }
+    return bytes_of(out).to_str()
+}
+
+/// What the file imports, one entry per library.
+pub fn imports(data: bytes) -> [PeImport] ! PeError {
+    let head = try header(data)
+    let list = try sections(data)
+    let table = try directories(data)
+    var out: [PeImport] = []
+    if table.len() < 2 or table[1].address == 0 {
+        return out
+    }
+    let start = offset_of(list, table[1].address)
+    if start < 0 {
+        return out
+    }
+    var width = 4
+    if head.bits == 64 {
+        width = 8
+    }
+    var i = 0
+    while true {
+        let base = start + i * 20
+        if base + 20 > data.len() {
+            return out
+        }
+        let lookup = try number_at(data, base, 4)
+        let name_address = try number_at(data, base + 12, 4)
+        let thunk = try number_at(data, base + 16, 4)
+        if lookup == 0 and name_address == 0 and thunk == 0 {
+            return out
+        }
+        var names: [str] = []
+        // The import lookup table is the one to read: the other is
+        // overwritten with addresses once the file is loaded.
+        var from = lookup
+        if from == 0 {
+            from = thunk
+        }
+        var at = offset_of(list, from)
+        if at >= 0 {
+            var j = 0
+            while true {
+                let entry = try number_at(data, at + j * width, width)
+                if entry == 0 {
+                    j = 0 - 1
+                    break
+                }
+                // The top bit means "imported by number, not by name",
+                // and the number is the low sixteen. In a 64-bit file
+                // that bit is the sign bit, and a reader that tests it
+                // by dividing by two to the sixty-third overflows and
+                // reads every ordinal as a name — which is a pointer
+                // into the middle of the file and prints as rubbish.
+                var by_ordinal = entry < 0
+                if width == 4 {
+                    by_ordinal = entry / 2147483648 == 1
+                }
+                if by_ordinal {
+                    let ordinal = try number_at(data, at + j * width, 2)
+                    names.push("#{ordinal}")
+                } else {
+                    let where = offset_of(list, entry % 2147483648)
+                    names.push(string_at(data, where + 2))
+                }
+                j = j + 1
+            }
+        }
+        out.push(PeImport{
+            library: string_at(data, offset_of(list, name_address)),
+            names: names })
+        i = i + 1
+    }
+    return out
+}
+
+/// The names the file exports.
+pub fn exports(data: bytes) -> [str] ! PeError {
+    let list = try sections(data)
+    let table = try directories(data)
+    var out: [str] = []
+    if table.len() < 1 or table[0].address == 0 {
+        return out
+    }
+    let start = offset_of(list, table[0].address)
+    if start < 0 {
+        return out
+    }
+    let count = try number_at(data, start + 24, 4)
+    let names_address = try number_at(data, start + 32, 4)
+    let names_at = offset_of(list, names_address)
+    if names_at < 0 {
+        return out
+    }
+    var i = 0
+    while i < count {
+        let address = try number_at(data, names_at + i * 4, 4)
+        out.push(string_at(data, offset_of(list, address)))
+        i = i + 1
+    }
+    return out
+}
+
+/// The name the export directory gives the library itself.
+pub fn export_name(data: bytes) -> str ! PeError {
+    let list = try sections(data)
+    let table = try directories(data)
+    if table.len() < 1 or table[0].address == 0 {
+        return ""
+    }
+    let start = offset_of(list, table[0].address)
+    if start < 0 {
+        return ""
+    }
+    return string_at(data, offset_of(list, try number_at(data, start + 12, 4)))
+}
+
+/// The machine, by name.
+pub fn machine_name(machine: i64) -> str {
+    if machine == 332 {
+        return "i386"
+    }
+    if machine == 34404 {
+        return "x86_64"
+    }
+    if machine == 43620 {
+        return "aarch64"
+    }
+    if machine == 448 {
+        return "arm"
+    }
+    if machine == 452 {
+        return "armv7"
+    }
+    return "unknown"
+}

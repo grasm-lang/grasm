@@ -71,6 +71,7 @@ run_gate ipv6diff       scripts/ipv6_diff.sh
 run_gate purldiff       scripts/purl_diff.sh
 run_gate rpmvercmpdiff  scripts/rpm_vercmp_diff.sh
 run_gate gemdiff        scripts/gem_version_diff.sh
+run_gate sniffdiff      scripts/sniff_diff.sh
 run_gate kvcrash       scripts/kvstore_crash.sh
 run_gate zlibdiff      scripts/zlib_diff.sh
 run_gate casefolddiff  scripts/casefold_diff.sh

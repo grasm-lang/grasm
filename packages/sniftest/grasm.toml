@@ -1,0 +1,8 @@
+[package]
+name = "sniftest"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.magicbytes]
+path = "../magicbytes"
+version = "^1.0.0"
