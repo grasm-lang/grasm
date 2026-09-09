@@ -1,0 +1,274 @@
+// Kubernetes resource quantities: `100m`, `1Gi`, `129e6`.
+//
+// Every limit, request and capacity in a Kubernetes manifest is one of
+// these, and they are not floating-point numbers. `100m` is a tenth of a
+// CPU exactly, `1Gi` is 1073741824 exactly, and a client that reads them as
+// `f64` gets a scheduler that disagrees with the API server about whether a
+// pod fits.
+//
+// ## Two families of suffix, and one that looks like both
+//
+//   n u m (none) k M G T P E     powers of a thousand
+//   Ki Mi Gi Ti Pi Ei            powers of 1024
+//   e<n> E<n>                    an explicit power of ten
+//
+// `E` alone is exa, 10^18. `E3` is ten cubed. The letter does two jobs and
+// which one it is doing depends on what follows it.
+//
+// Note that `k` is lower case where every other decimal suffix is upper
+// case, which is the SI spelling and catches everyone once. `K` is not a
+// suffix: Kubernetes refuses `1K`.
+//
+// ## Why this holds a big integer
+//
+// `1Ei` is 2^60, which fits in a signed 64-bit integer, and `1000Ei` is not
+// and neither is `1e30`, which a manifest is allowed to say. The value is
+// kept as an exact significand times a power of ten so that comparison and
+// conversion are exact, and `to_milli` says so when the answer will not fit
+// rather than wrapping.
+import bigint
+
+type QuantityError =
+    | Empty()
+    | NotANumber(text: str)
+    | BadSuffix(suffix: str)
+    | TooLarge(text: str)
+    | NotWhole(text: str)
+
+    /// An exact value: `units` times ten to the `scale`.
+    ///
+    /// A binary suffix multiplies `units` rather than moving `scale`, because
+    /// 1024 is not a power of ten and pretending otherwise is where the
+    /// rounding creeps in.
+type KubeQuantity = {
+    units: BigInt,
+    scale: i64,
+}
+
+/// The quantity zero, which a caller needs to have something to fall back
+/// to when a parse fails.
+pub fn zero() -> KubeQuantity {
+    return KubeQuantity{ units: bigint.zero(), scale: 0 }
+}
+
+fn is_digit(byte: i64) -> bool {
+    return byte >= 48 and byte <= 57
+}
+
+/// How many places a decimal suffix moves the point, or -100 for one that
+/// is not decimal.
+fn decimal_places(suffix: str) -> i64 {
+    if suffix == "n" {
+        return 0 - 9
+    } else if suffix == "u" {
+        return 0 - 6
+    } else if suffix == "m" {
+        return 0 - 3
+    } else if suffix == "" {
+        return 0
+    } else if suffix == "k" {
+        return 3
+    } else if suffix == "M" {
+        return 6
+    } else if suffix == "G" {
+        return 9
+    } else if suffix == "T" {
+        return 12
+    } else if suffix == "P" {
+        return 15
+    } else if suffix == "E" {
+        return 18
+    }
+    return 0 - 100
+}
+
+/// The power of two a binary suffix stands for, or -1 for one that is not
+/// binary.
+fn binary_power(suffix: str) -> i64 {
+    if suffix == "Ki" {
+        return 10
+    } else if suffix == "Mi" {
+        return 20
+    } else if suffix == "Gi" {
+        return 30
+    } else if suffix == "Ti" {
+        return 40
+    } else if suffix == "Pi" {
+        return 50
+    } else if suffix == "Ei" {
+        return 60
+    }
+    return 0 - 1
+}
+
+/// Read a quantity.
+///
+/// Strict on purpose: no leading or trailing space, no `K`, no underscore,
+/// no `inf`. Kubernetes refuses all of those, and a client that accepts
+/// them sends a manifest the API server rejects with a message about a
+/// field the user did not write.
+pub fn parse(text: str) -> KubeQuantity ! QuantityError {
+    if text.len() == 0 {
+        fail(Empty())
+    }
+    let raw = text.to_bytes()
+    var i = 0
+    var negative = false
+    if raw.at(0) == 43 or raw.at(0) == 45 {
+        negative = raw.at(0) == 45
+        i = 1
+    }
+    var digits = ""
+    while i < raw.len() and is_digit(raw.at(i)) {
+        digits = digits + raw.at(i).to_char()
+        i = i + 1
+    }
+    var scale = 0
+    if i < raw.len() and raw.at(i) == 46 {
+        i = i + 1
+        while i < raw.len() and is_digit(raw.at(i)) {
+            digits = digits + raw.at(i).to_char()
+            scale = scale - 1
+            i = i + 1
+        }
+    }
+    if digits.len() == 0 {
+        fail(NotANumber(text))
+    }
+    let suffix = text.substr(i, text.len() - i)
+    var units = bigint.zero()
+    match bigint.parse(digits) {
+        Ok(value) -> units = value
+        Err(_why) -> fail(NotANumber(text))
+    }
+    if negative {
+        units = bigint.negate(units)
+    }
+    // An explicit exponent, which is the one suffix that carries a number.
+    if suffix.len() > 1 and (suffix.starts_with("e") or
+        suffix.starts_with("E")) and exponent_follows(suffix) {
+        var exponent = 0
+        match suffix.substr(1, suffix.len() - 1).parse_int() {
+            Some(value) -> exponent = value
+            None -> fail(BadSuffix(suffix))
+        }
+        return KubeQuantity{ units: units, scale: scale + exponent }
+    }
+    let places = decimal_places(suffix)
+    if places > 0 - 100 {
+        return KubeQuantity{ units: units, scale: scale + places }
+    }
+    let power = binary_power(suffix)
+    if power < 0 {
+        fail(BadSuffix(suffix))
+    }
+    return KubeQuantity{ units: bigint.mul(units,
+        bigint.pow(bigint.from_i64(2), power)), scale: scale }
+}
+
+/// Whether what follows `e` is a signed run of digits and nothing else.
+fn exponent_follows(suffix: str) -> bool {
+    let raw = suffix.to_bytes()
+    var i = 1
+    if i < raw.len() and (raw.at(i) == 43 or raw.at(i) == 45) {
+        i = i + 1
+    }
+    if i >= raw.len() {
+        return false
+    }
+    while i < raw.len() {
+        if not is_digit(raw.at(i)) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+/// The significand and the power of ten, which is what an exact comparison
+/// against another implementation needs.
+pub fn parts(quantity: KubeQuantity) -> (str, i64) {
+    return (bigint.to_str(quantity.units), quantity.scale)
+}
+
+/// Compare two quantities exactly. -1, 0 or 1.
+pub fn compare(a: KubeQuantity, b: KubeQuantity) -> i64 {
+    var left = a.units
+    var right = b.units
+    if a.scale < b.scale {
+        right = bigint.mul(right, bigint.pow(bigint.from_i64(10),
+            b.scale - a.scale))
+    } else if b.scale < a.scale {
+        left = bigint.mul(left, bigint.pow(bigint.from_i64(10),
+            a.scale - b.scale))
+    }
+    return bigint.compare(left, right)
+}
+
+/// The value in thousandths, which is how CPU is asked for and accounted.
+///
+/// Refuses rather than rounds: `0.0001` is a tenth of a milli and a
+/// scheduler that silently rounds it to zero has given a pod no CPU.
+pub fn to_milli(quantity: KubeQuantity) -> i64 ! QuantityError {
+    let scaled = try rescale(quantity, 0 - 3)
+    match bigint.to_i64(scaled) {
+        Some(value) -> return value
+        None -> fail(TooLarge(bigint.to_str(scaled)))
+    }
+}
+
+/// The value as a whole number, which is how memory and storage are asked
+/// for. Refuses a fraction rather than truncating it.
+pub fn to_whole(quantity: KubeQuantity) -> i64 ! QuantityError {
+    let scaled = try rescale(quantity, 0)
+    match bigint.to_i64(scaled) {
+        Some(value) -> return value
+        None -> fail(TooLarge(bigint.to_str(scaled)))
+    }
+}
+
+/// The significand this quantity would have at a given power of ten.
+fn rescale(quantity: KubeQuantity, want: i64) -> BigInt ! QuantityError {
+    if quantity.scale >= want {
+        return bigint.mul(quantity.units,
+            bigint.pow(bigint.from_i64(10), quantity.scale - want))
+    }
+    let divisor = bigint.pow(bigint.from_i64(10), want - quantity.scale)
+    match bigint.divmod(quantity.units, divisor) {
+        Ok(both) -> {
+            if not bigint.is_zero(both.1) {
+                fail(NotWhole(bigint.to_str(quantity.units)))
+            }
+            return both.0
+        }
+        Err(_why) -> fail(NotWhole(bigint.to_str(quantity.units)))
+    }
+}
+
+/// The value written out in full, with a decimal point where one is needed.
+///
+/// Not the canonical form Kubernetes echoes back — that picks a suffix —
+/// but the form that compares equal to another implementation's answer
+/// without agreeing on how to abbreviate it first.
+pub fn render(quantity: KubeQuantity) -> str {
+    var digits = bigint.to_str(quantity.units)
+    var sign = ""
+    if digits.starts_with("-") {
+        sign = "-"
+        digits = digits.substr(1, digits.len() - 1)
+    }
+    if quantity.scale >= 0 {
+        var i = 0
+        while i < quantity.scale {
+            digits = digits + "0"
+            i = i + 1
+        }
+        return sign + digits
+    }
+    let places = 0 - quantity.scale
+    while digits.len() <= places {
+        digits = "0" + digits
+    }
+    return sign + digits.substr(0, digits.len() - places) + "." +
+    digits.substr(digits.len() - places, places)
+}

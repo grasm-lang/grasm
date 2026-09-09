@@ -1,0 +1,24 @@
+[package]
+name = "services_demo"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.k8squantity]
+path = "../k8squantity"
+version = "^1.0.0"
+
+[dependencies.discordwire]
+path = "../discordwire"
+version = "^1.0.0"
+
+[dependencies.githubwire]
+path = "../githubwire"
+version = "^1.0.0"
+
+[dependencies.slackwire]
+path = "../slackwire"
+version = "^1.0.0"
+
+[dependencies.gitignore]
+path = "../gitignore"
+version = "^1.0.0"

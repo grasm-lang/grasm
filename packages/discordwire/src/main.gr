@@ -1,0 +1,317 @@
+// Discord's two arithmetic problems: what an id means, and what a member
+// is allowed to do.
+//
+// ## An id is a timestamp
+//
+// Every object Discord hands back is named by a snowflake — a 64-bit
+// number whose top 42 bits are milliseconds since 2015. So a client can sort
+// by id and get creation order, can ask "everything after this message"
+// without a timestamp field, and can read the creation time of anything
+// without a request. It can also, if it stores the id in a JavaScript
+// number, silently lose the bottom three digits, which is why the API
+// returns them as strings.
+//
+// ## Permissions are computed, not fetched
+//
+// There is no endpoint that answers "may this member post here". The
+// answer is built from the guild's `@everyone` role, the member's other
+// roles, and then the channel's overwrites applied in a fixed order, with
+// two shortcuts: the guild owner and anyone with `administrator` have
+// every permission regardless of what the overwrites say. Getting the order
+// wrong produces a client that hides a button the user can press, or shows
+// one they cannot — and the second is how a bot ends up spamming an
+// endpoint that returns 403.
+
+type DiscordError =
+    | UnknownPermission(name: str)
+    | NotASnowflake(text: str)
+
+    /// Milliseconds between the Unix epoch and Discord's, the first moment of
+    /// 2015. Every snowflake is counted from here.
+pub fn epoch_millis() -> i64 {
+    return 1420070400000
+}
+
+/// When the object with this id was made, in milliseconds since the Unix
+/// epoch.
+pub fn snowflake_millis(id: i64) -> i64 {
+    return id.ushr(22) + epoch_millis()
+}
+
+/// The lowest snowflake that could have been made at this instant.
+///
+/// What "give me everything after Tuesday" is written as: Discord's
+/// `after` parameters take an id, not a time.
+pub fn snowflake_for(millis: i64) -> i64 {
+    return (millis - epoch_millis()).shl(22)
+}
+
+/// Which worker made it.
+pub fn snowflake_worker(id: i64) -> i64 {
+    return id.bit_and(4063232).ushr(17)
+}
+
+/// Which process on that worker.
+pub fn snowflake_process(id: i64) -> i64 {
+    return id.bit_and(126976).ushr(12)
+}
+
+/// How many ids that process had already made in the same millisecond.
+pub fn snowflake_increment(id: i64) -> i64 {
+    return id.bit_and(4095)
+}
+
+/// An id as it arrives: a string, because it does not survive a
+/// double-precision float.
+pub fn parse_snowflake(text: str) -> i64 ! DiscordError {
+    if text.len() == 0 or text.len() > 20 {
+        fail(NotASnowflake(text))
+    }
+    let raw = text.to_bytes()
+    var i = 0
+    while i < raw.len() {
+        if raw.at(i) < 48 or raw.at(i) > 57 {
+            fail(NotASnowflake(text))
+        }
+        i = i + 1
+    }
+    match text.parse_int() {
+        Some(value) -> return value
+        None -> fail(NotASnowflake(text))
+    }
+}
+
+/// Every permission Discord defines, name to bit.
+///
+/// Some bits have two names: `read_messages` was renamed
+/// `view_channel` and both are still in use, so both answer here.
+/// The table was taken from a library that talks to the live API
+/// rather than typed from the documentation.
+pub fn permission_bits() -> [(str, i64)] {
+    return [
+        ("create_instant_invite", 1), ("kick_members", 2),
+        ("ban_members", 4), ("administrator", 8),
+        ("manage_channels", 16), ("manage_guild", 32),
+        ("add_reactions", 64), ("view_audit_log", 128),
+        ("priority_speaker", 256), ("stream", 512),
+        ("read_messages", 1024), ("view_channel", 1024),
+        ("send_messages", 2048), ("send_tts_messages", 4096),
+        ("manage_messages", 8192), ("embed_links", 16384),
+        ("attach_files", 32768), ("read_message_history", 65536),
+        ("mention_everyone", 131072), ("external_emojis", 262144),
+        ("use_external_emojis", 262144), ("view_guild_insights", 524288),
+        ("connect", 1048576), ("speak", 2097152),
+        ("mute_members", 4194304), ("deafen_members", 8388608),
+        ("move_members", 16777216), ("use_voice_activation", 33554432),
+        ("change_nickname", 67108864), ("manage_nicknames", 134217728),
+        ("manage_permissions", 268435456), ("manage_roles", 268435456),
+        ("manage_webhooks", 536870912), ("manage_emojis", 1073741824),
+        ("manage_emojis_and_stickers", 1073741824), ("manage_expressions", 1073741824),
+        ("use_application_commands", 2147483648), ("request_to_speak", 4294967296),
+        ("manage_events", 8589934592), ("manage_threads", 17179869184),
+        ("create_public_threads", 34359738368), ("create_private_threads", 68719476736),
+        ("external_stickers", 137438953472), ("use_external_stickers", 137438953472),
+        ("send_messages_in_threads", 274877906944), ("use_embedded_activities", 549755813888),
+        ("moderate_members", 1099511627776), ("view_creator_monetization_analytics", 2199023255552),
+        ("use_soundboard", 4398046511104), ("create_expressions", 8796093022208),
+        ("create_events", 17592186044416), ("use_external_sounds", 35184372088832),
+        ("send_voice_messages", 70368744177664), ("set_voice_channel_status", 281474976710656),
+        ("create_polls", 562949953421312), ("send_polls", 562949953421312),
+        ("use_external_apps", 1125899906842624), ("pin_messages", 2251799813685248),
+        ("bypass_slowmode", 4503599627370496),
+    ]
+}
+
+/// The bit a permission's name stands for.
+pub fn permission_bit(name: str) -> i64 ! DiscordError {
+    for entry in permission_bits() {
+        if entry.0 == name {
+            return entry.1
+        }
+    }
+    fail(UnknownPermission(name))
+}
+
+/// Every name for the permissions in a bitfield, in bit order.
+pub fn permission_names(permissions: i64) -> [str] {
+    var out: [str] = []
+    for entry in permission_bits() {
+        if permissions.bit_and(entry.1) == entry.1 and entry.1 != 0 {
+            out.push(entry.0)
+        }
+    }
+    return out
+}
+
+/// Every permission there is, which is what `administrator` amounts to.
+pub fn all_permissions() -> i64 {
+    var out = 0
+    for entry in permission_bits() {
+        out = out.bit_or(entry.1)
+    }
+    return out
+}
+
+/// Whether a bitfield carries a permission. `administrator` carries every
+/// one of them, and code that tests the bit directly gets that wrong.
+pub fn allows(permissions: i64, bit: i64) -> bool {
+    if permissions.bit_and(8) == 8 {
+        return true
+    }
+    return permissions.bit_and(bit) == bit
+}
+
+/// One channel overwrite: what it allows and what it denies.
+type DiscordOverwrite = {
+    /// The role or member this applies to.
+    id: i64,
+    /// `role` or `member`.
+    kind: str,
+    allow: i64,
+    deny: i64,
+}
+
+/// What a member may do in a guild, before any channel is considered.
+pub fn guild_permissions(owner_id: i64, member_id: i64,
+    everyone_permissions: i64, role_permissions: [i64]) -> i64 {
+    if owner_id == member_id {
+        return all_permissions()
+    }
+    var out = everyone_permissions
+    for role in role_permissions {
+        out = out.bit_or(role)
+    }
+    if out.bit_and(8) == 8 {
+        return all_permissions()
+    }
+    return out
+}
+
+/// What a member may do in one channel.
+///
+/// The order is the whole content of this function, and it is Discord's:
+/// the `@everyone` overwrite first, then *every* role deny, then every role
+/// allow, then the member's own overwrite. Applying a role's deny and allow
+/// together — the obvious way to write it — lets one role's allow undo
+/// another role's deny, which is not what a moderator setting them up
+/// expects.
+pub fn channel_permissions(base: i64, guild_id: i64, member_id: i64,
+    member_roles: [i64], overwrites: [DiscordOverwrite]) -> i64 {
+    if base.bit_and(8) == 8 {
+        return all_permissions()
+    }
+    var out = base
+    for overwrite in overwrites {
+        if overwrite.id == guild_id and overwrite.kind == "role" {
+            out = out.bit_and(overwrite.deny.bit_xor(0 - 1))
+            out = out.bit_or(overwrite.allow)
+        }
+    }
+    var denied = 0
+    var allowed = 0
+    for overwrite in overwrites {
+        if overwrite.kind == "role" and overwrite.id != guild_id and
+        holds(member_roles, overwrite.id) {
+            denied = denied.bit_or(overwrite.deny)
+            allowed = allowed.bit_or(overwrite.allow)
+        }
+    }
+    out = out.bit_and(denied.bit_xor(0 - 1))
+    out = out.bit_or(allowed)
+    for overwrite in overwrites {
+        if overwrite.kind == "member" and overwrite.id == member_id {
+            out = out.bit_and(overwrite.deny.bit_xor(0 - 1))
+            out = out.bit_or(overwrite.allow)
+        }
+    }
+    return out
+}
+
+fn holds(roles: [i64], id: i64) -> bool {
+    for role in roles {
+        if role == id {
+            return true
+        }
+    }
+    return false
+}
+
+/// What Discord's rate limit headers said.
+type DiscordLimit = {
+    /// The bucket this endpoint shares a budget with. Two routes with the
+    /// same bucket exhaust each other, which is why a client keyed on the
+    /// URL over-sends and then gets banned.
+    bucket: str,
+    remaining: i64,
+    /// Seconds until the bucket refills, as a whole number of
+    /// milliseconds so no precision is lost.
+    reset_after_millis: i64,
+    /// Whether the limit is the global one, which no bucket can wait out.
+    global_limit: bool,
+}
+
+fn header_of(headers: [(str, str)], name: str) -> str {
+    for header in headers {
+        if header.0.to_lower() == name {
+            return header.1
+        }
+    }
+    return ""
+}
+
+/// Read the rate limit headers.
+pub fn limit_of(headers: [(str, str)]) -> DiscordLimit {
+    return DiscordLimit{ bucket: header_of(headers, "x-ratelimit-bucket"),
+        remaining: header_of(headers, "x-ratelimit-remaining")
+            .parse_int() ?? 0 - 1,
+        reset_after_millis: millis_of(header_of(headers,
+            "x-ratelimit-reset-after")),
+        global_limit: header_of(headers, "x-ratelimit-global") == "true" }
+}
+
+/// A seconds-with-decimals header as whole milliseconds.
+///
+/// `x-ratelimit-reset-after: 0.523` is half a second, and a client that
+/// reads it as an integer waits none of it and is rate-limited again
+/// immediately.
+fn millis_of(text: str) -> i64 {
+    if text.len() == 0 {
+        return 0
+    }
+    var whole = text
+    var fraction = ""
+    var i = 0
+    while i < text.len() {
+        if text.substr(i, 1) == "." {
+            whole = text.substr(0, i)
+            fraction = text.substr(i + 1, text.len() - i - 1)
+            i = text.len()
+        } else {
+            i = i + 1
+        }
+    }
+    while fraction.len() < 3 {
+        fraction = fraction + "0"
+    }
+    return (whole.parse_int() ?? 0) * 1000 +
+    (fraction.substr(0, 3).parse_int() ?? 0)
+}
+
+/// How long to wait before trying again, in milliseconds.
+///
+/// A 429 says `retry-after` in seconds; anything else with no requests left
+/// says how long the bucket has to run. Zero means go ahead.
+pub fn wait_millis(status: i64, headers: [(str, str)]) -> i64 {
+    if status == 429 {
+        let told = millis_of(header_of(headers, "retry-after"))
+        if told > 0 {
+            return told
+        }
+        return limit_of(headers).reset_after_millis
+    }
+    let limit = limit_of(headers)
+    if limit.remaining == 0 {
+        return limit.reset_after_millis
+    }
+    return 0
+}

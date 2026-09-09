@@ -1,0 +1,276 @@
+// Slack's app surface: the three places a message can be refused before a
+// human sees it.
+//
+// ## The signature covers the raw body, and a timestamp
+//
+// `v0:<timestamp>:<body>`, HMAC-SHA256 with the signing secret, compared
+// against `X-Slack-Signature`. `webhooksig` does the comparison; what is
+// here is the string that gets signed and the age check, because a request
+// that verifies is still a replay if it is an hour old and Slack's own
+// guidance is to refuse anything older than five minutes.
+//
+// ## Block Kit fails at send time, not at build time
+//
+// A message with a section over three thousand characters is rejected by
+// `chat.postMessage` with `invalid_blocks`, which says nothing about which
+// block or which field. Checking before sending turns that into a message
+// naming the block.
+//
+// ## Text is escaped, but only three characters
+//
+// `&`, `<` and `>` and nothing else — Slack's markup uses angle brackets
+// for links, so an unescaped `<` in user text becomes a broken link rather
+// than a rendering bug. Escaping quotes as well, the way an HTML escaper
+// would, puts `&quot;` in front of the user.
+import json
+
+type SlackError =
+    | TooLong(where: str, length: i64, limit: i64)
+    | TooMany(where: str, count: i64, limit: i64)
+    | UnknownBlock(kind: str)
+    | NotBlocks()
+
+    /// The string Slack signs. The body is the bytes as they arrived: a
+    /// framework that re-serialises the form data changes the order and the
+    /// signature stops matching.
+pub fn signing_base(timestamp: str, body: str) -> str {
+    return "v0:" + timestamp + ":" + body
+}
+
+/// Whether a request is recent enough to act on.
+///
+/// Five minutes each way: a clock behind Slack's is as common as one ahead,
+/// and refusing only the future half leaves the replay window open.
+pub fn timestamp_is_fresh(timestamp: str, now: i64) -> bool {
+    let sent = timestamp.parse_int() ?? 0
+    if sent == 0 {
+        return false
+    }
+    var gap = now - sent
+    if gap < 0 {
+        gap = 0 - gap
+    }
+    return gap <= 300
+}
+
+/// Escape text for a message. Three characters, no more.
+pub fn escape_text(text: str) -> str {
+    var out = ""
+    var i = 0
+    while i < text.len() {
+        let here = text.substr(i, 1)
+        if here == "&" {
+            out = out + "&amp;"
+        } else if here == "<" {
+            out = out + "&lt;"
+        } else if here == ">" {
+            out = out + "&gt;"
+        } else {
+            out = out + here
+        }
+        i = i + 1
+    }
+    return out
+}
+
+/// A link, which is the one place the angle brackets are meant.
+pub fn link(url: str, label: str) -> str {
+    if label.len() == 0 {
+        return "<" + url + ">"
+    }
+    return "<" + url + "|" + escape_text(label) + ">"
+}
+
+/// A user mention, which is by id: a mention written as `@name` is text and
+/// does not notify anybody.
+pub fn mention(user_id: str) -> str {
+    return "<@" + user_id + ">"
+}
+
+fn text_at(value: ref Json, key: str) -> str {
+    match json.get(value, key) {
+        Some(found) -> return json.as_str(found) ?? ""
+        None -> return ""
+    }
+}
+
+/// The length of a block's text, wherever that block keeps it.
+fn block_text_length(block: ref Json) -> i64 {
+    match json.get(block, "text") {
+        Some(found) -> {
+            match json.as_str(found) {
+                Some(plain) -> return plain.len()
+                None -> return text_at(found, "text").len()
+            }
+        }
+        None -> return 0
+    }
+}
+
+/// Check a Block Kit payload against the limits `chat.postMessage`
+/// enforces.
+///
+/// The numbers are Slack's, and they are per block type rather than one
+/// global length — a header is 150 characters where a section is 3000, and
+/// the header is the one that overflows first because it holds a title
+/// somebody generated.
+pub fn check_blocks(payload: str) -> bool ! SlackError {
+    var document = json.null()
+    match json.parse(payload) {
+        Ok(parsed) -> document = parsed
+        Err(_why) -> fail(NotBlocks())
+    }
+    let blocks = json.items_of(document)
+    if blocks.len() > 50 {
+        fail(TooMany("blocks", blocks.len(), 50))
+    }
+    for block in blocks {
+        let kind = text_at(block, "type")
+        let length = block_text_length(block)
+        if kind == "section" {
+            if length > 3000 {
+                fail(TooLong("section text", length, 3000))
+            }
+            match json.get(block, "fields") {
+                Some(fields) -> {
+                    let items = json.items_of(fields)
+                    if items.len() > 10 {
+                        fail(TooMany("section fields", items.len(), 10))
+                    }
+                    for field in items {
+                        if text_at(field, "text").len() > 2000 {
+                            fail(TooLong("section field",
+                                text_at(field, "text").len(), 2000))
+                        }
+                    }
+                }
+                None -> {}
+            }
+        } else if kind == "header" {
+            if length > 150 {
+                fail(TooLong("header text", length, 150))
+            }
+        } else if kind == "context" {
+            let items = json.items_of(json.get(block, "elements") ??
+                json.list([]))
+            if items.len() > 10 {
+                fail(TooMany("context elements", items.len(), 10))
+            }
+        } else if kind == "actions" {
+            let items = json.items_of(json.get(block, "elements") ??
+                json.list([]))
+            if items.len() > 25 {
+                fail(TooMany("actions elements", items.len(), 25))
+            }
+        } else if kind == "image" {
+            if text_at(block, "alt_text").len() > 2000 {
+                fail(TooLong("image alt text",
+                    text_at(block, "alt_text").len(), 2000))
+            }
+        } else if kind != "divider" and kind != "input" and
+        kind != "file" and kind != "rich_text" and kind != "video" {
+            fail(UnknownBlock(kind))
+        }
+    }
+    return true
+}
+
+/// A slash command's form-encoded body, taken apart.
+///
+/// Form encoding, not JSON: Slack sends interactive payloads as a `payload`
+/// field inside a form, and slash commands as plain fields.
+pub fn parse_command(body: str) -> [(str, str)] {
+    var out: [(str, str)] = []
+    for piece in body.split("&") {
+        if piece.len() == 0 {
+            continue
+        }
+        var name = piece
+        var value = ""
+        var i = 0
+        while i < piece.len() {
+            if piece.substr(i, 1) == "=" {
+                name = piece.substr(0, i)
+                value = piece.substr(i + 1, piece.len() - i - 1)
+                i = piece.len()
+            } else {
+                i = i + 1
+            }
+        }
+        out.push((form_decode(name), form_decode(value)))
+    }
+    return out
+}
+
+fn hex_value(character: str) -> i64 {
+    let byte = character.to_bytes().at(0)
+    if byte >= 48 and byte <= 57 {
+        return byte - 48
+    }
+    if byte >= 97 and byte <= 102 {
+        return byte - 87
+    }
+    if byte >= 65 and byte <= 70 {
+        return byte - 55
+    }
+    return 0 - 1
+}
+
+/// Undo form encoding, where `+` is a space.
+pub fn form_decode(text: str) -> str {
+    var out: [i64] = []
+    var i = 0
+    while i < text.len() {
+        let here = text.substr(i, 1)
+        if here == "+" {
+            out.push(32)
+            i = i + 1
+        } else if here == "%" and i + 2 < text.len() {
+            let high = hex_value(text.substr(i + 1, 1))
+            let low = hex_value(text.substr(i + 2, 1))
+            if high < 0 or low < 0 {
+                out.push(37)
+                i = i + 1
+            } else {
+                out.push(high * 16 + low)
+                i = i + 3
+            }
+        } else {
+            for byte in here.to_bytes().to_list() {
+                out.push(byte)
+            }
+            i = i + 1
+        }
+    }
+    return bytes_of(out).to_str()
+}
+
+/// How long to wait after a rate-limited response, in seconds.
+///
+/// Slack's `Retry-After` is whole seconds and is always present on a 429.
+/// A client that backs off exponentially instead waits longer than it has
+/// to, and one that ignores it is throttled harder.
+pub fn wait_seconds(status: i64, headers: [(str, str)]) -> i64 {
+    if status != 429 {
+        return 0
+    }
+    for header in headers {
+        if header.0.to_lower() == "retry-after" {
+            return header.1.parse_int() ?? 1
+        }
+    }
+    return 1
+}
+
+/// Whether an `ok: false` response can be tried again as it stands.
+///
+/// `ratelimited` can, once the wait is over. `invalid_blocks` and
+/// `channel_not_found` cannot: the request is wrong and sending it again
+/// produces the same answer and spends the budget.
+pub fn is_retryable(error_code: str) -> bool {
+    return error_code == "ratelimited" or
+    error_code == "service_unavailable" or
+    error_code == "internal_error" or
+    error_code == "fatal_error" or
+    error_code == "request_timeout"
+}

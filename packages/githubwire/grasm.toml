@@ -1,0 +1,11 @@
+[package]
+name = "githubwire"
+version = "1.0.0"
+
+[dependencies.json]
+path = "../json"
+version = "^1.0.0"
+
+[dependencies.linkheader]
+path = "../linkheader"
+version = "^1.0.0"

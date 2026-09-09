@@ -1,0 +1,186 @@
+// GitHub's REST API: the headers that decide whether a client works at
+// scale, rather than the endpoints.
+//
+// The endpoints are the easy half. What breaks a client is the rate limit,
+// which has two of them, and pagination, which is not in the body.
+//
+// ## Two rate limits, and only one of them has a plan
+//
+// The *primary* limit is a budget per hour, and the response says how much
+// is left and when it refills. The *secondary* limit is about how fast a
+// client is going, has no published number, and is signalled by a 403 with
+// `retry-after`. Code that only reads `x-ratelimit-remaining` sails past
+// the second one and gets a 403 it treats as a permissions problem.
+//
+// ## A 304 is free
+//
+// A conditional request that comes back `304 Not Modified` does not spend
+// rate limit. Keeping an ETag and sending `If-None-Match` is therefore not
+// a bandwidth optimisation but the difference between a poller that fits in
+// the budget and one that does not.
+//
+// ## Pagination is a header
+//
+// The page links are in `Link`, not in the body, and the last page is the
+// one with no `rel="next"`. Guessing by "fewer results than per_page"
+// breaks on a page that is exactly full, which happens once per run.
+import json
+import linkheader
+
+type GithubError =
+    | NotAnObject()
+
+    /// The headers every request should carry.
+    ///
+    /// The version header is not optional in practice: without it GitHub
+    /// serves whatever it currently calls the default, which changes.
+pub fn api_headers(token: str, version: str) -> [(str, str)] {
+    var out = [("Accept", "application/vnd.github+json"),
+        ("X-GitHub-Api-Version", version)]
+    if token.len() > 0 {
+        out.push(("Authorization", "Bearer " + token))
+    }
+    return out
+}
+
+/// What is left of the hourly budget.
+type GithubLimit = {
+    limit: i64,
+    remaining: i64,
+    used: i64,
+    /// When the budget refills, in seconds since the Unix epoch.
+    reset: i64,
+    /// Which budget this is: `core`, `search`, `graphql` and the rest have
+    /// separate ones, so a search that runs out has not stopped the others.
+    resource: str,
+}
+
+fn header_of(headers: [(str, str)], name: str) -> str {
+    for header in headers {
+        if header.0.to_lower() == name {
+            return header.1
+        }
+    }
+    return ""
+}
+
+fn number_header(headers: [(str, str)], name: str) -> i64 {
+    return header_of(headers, name).parse_int() ?? 0 - 1
+}
+
+/// Read the rate limit headers.
+pub fn limit_of(headers: [(str, str)]) -> GithubLimit {
+    return GithubLimit{ limit: number_header(headers, "x-ratelimit-limit"),
+        remaining: number_header(headers, "x-ratelimit-remaining"),
+        used: number_header(headers, "x-ratelimit-used"),
+        reset: number_header(headers, "x-ratelimit-reset"),
+        resource: header_of(headers, "x-ratelimit-resource") }
+}
+
+/// How long to wait before the next request, in seconds.
+///
+/// `retry-after` first, because that is the secondary limit and it means
+/// what it says. Then the primary budget, which is only exhausted when
+/// `remaining` is zero — a client that waits because `remaining` is *low*
+/// throws away the budget it was given.
+pub fn wait_seconds(headers: [(str, str)], now: i64) -> i64 {
+    let told = header_of(headers, "retry-after")
+    if told.len() > 0 {
+        return told.parse_int() ?? 60
+    }
+    let limit = limit_of(headers)
+    if limit.remaining == 0 and limit.reset > now {
+        return limit.reset - now
+    }
+    // A 403 with budget left is a permissions problem, not a limit, and
+    // waiting for it is how a client hides a bad token for an hour.
+    return 0
+}
+
+/// The next page's URL, or nothing when this was the last page.
+pub fn next_page(headers: [(str, str)]) -> str {
+    return linkheader.next_page(header_of(headers, "link")) ?? ""
+}
+
+/// The headers that make a request conditional.
+///
+/// Both are sent when both are known: GitHub honours either, and a proxy in
+/// between may only understand one.
+pub fn conditional_headers(etag: str,
+    last_modified: str) -> [(str, str)] {
+    var out: [(str, str)] = []
+    if etag.len() > 0 {
+        out.push(("If-None-Match", etag))
+    }
+    if last_modified.len() > 0 {
+        out.push(("If-Modified-Since", last_modified))
+    }
+    return out
+}
+
+/// The claims a GitHub App signs to get an installation token.
+///
+/// `iat` is set a minute in the past on purpose: GitHub rejects a token
+/// whose `iat` is in the future by its clock, and a client whose clock is
+/// thirty seconds fast fails every request with a message about the
+/// signature. `exp` is capped at ten minutes because GitHub refuses longer.
+pub fn app_claims(app_id: str, now: i64,
+    lifetime_seconds: i64) -> [(str, str)] {
+    var lifetime = lifetime_seconds
+    if lifetime > 600 {
+        lifetime = 600
+    }
+    if lifetime < 1 {
+        lifetime = 1
+    }
+    return [("iat", "{now - 60}"), ("exp", "{now + lifetime}"),
+        ("iss", app_id)]
+}
+
+/// What GitHub said went wrong.
+type GithubFailure = {
+    message: str,
+    /// The per-field complaints a 422 carries, as `resource/field/code`.
+    errors: [str],
+    documentation_url: str,
+}
+
+fn string_at(value: ref Json, key: str) -> str {
+    match json.get(value, key) {
+        Some(found) -> return json.as_str(found) ?? ""
+        None -> return ""
+    }
+}
+
+/// Read an error body.
+///
+/// A 422 is the interesting one: its `message` is always "Validation
+/// Failed" and the useful part is in `errors`, which is why a client that
+/// logs only the message reports the same thing for every mistake.
+pub fn failure_of(body: str) -> GithubFailure ! GithubError {
+    var document = json.null()
+    match json.parse(body) {
+        Ok(parsed) -> document = parsed
+        Err(_why) -> fail(NotAnObject())
+    }
+    var complaints: [str] = []
+    match json.get(document, "errors") {
+        Some(found) -> {
+            for entry in json.items_of(found) {
+                complaints.push(string_at(entry, "resource") + "/" +
+                    string_at(entry, "field") + "/" +
+                    string_at(entry, "code"))
+            }
+        }
+        None -> {}
+    }
+    return GithubFailure{ message: string_at(document, "message"),
+        errors: complaints,
+        documentation_url: string_at(document, "documentation_url") }
+}
+
+/// Whether a response spent rate limit. A 304 did not, which is the whole
+/// reason to send a conditional request.
+pub fn spent_budget(status: i64) -> bool {
+    return status != 304
+}

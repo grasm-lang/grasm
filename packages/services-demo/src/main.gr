@@ -1,0 +1,311 @@
+// Five things a program that talks to somebody else's service has to get
+// exactly right, and that are usually written from memory.
+//
+// The expected values here came from the implementations that define them:
+// the Kubernetes Python client, discord.py, Python's own form decoder, and
+// `git check-ignore` itself.
+import k8squantity
+import discordwire
+import githubwire
+import slackwire
+import gitignore
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+// ---------------------------------------------------------- k8squantity
+
+fn shown(text: str) -> str {
+    match k8squantity.parse(text) {
+        Ok(quantity) -> return k8squantity.render(quantity)
+        Err(_why) -> return "<error>"
+    }
+}
+
+fn quantity_refused(text: str) -> bool {
+    match k8squantity.parse(text) {
+        Ok(_quantity) -> return false
+        Err(_why) -> return true
+    }
+}
+
+fn check_quantities(inout f: i64) / {io} {
+    print("-- k8squantity: a limit is not a floating-point number")
+    say(f, "a milli is a thousandth, exactly, whatever the number",
+        shown("100m") == "0.100" and shown("123456789m") == "123456.789" and
+        shown("10.5m") == "0.0105")
+    say(f, "the binary suffixes are powers of 1024, not of 1000",
+        shown("1Ki") == "1024" and shown("1Mi") == "1048576" and
+        shown("1Gi") == "1073741824" and shown("0.5Gi") == "536870912.0")
+    say(f, "and the decimal ones are powers of 1000, with a lower-case k",
+        shown("1k") == "1000" and shown("1M") == "1000000" and
+        shown("1E") == "1000000000000000000" and quantity_refused("1K"))
+    say(f, "E is exa, and E3 is ten cubed: the letter does two jobs",
+        shown("1E") == "1000000000000000000" and shown("1E3") == "1000" and
+        shown("129e6") == "129000000")
+    say(f, "a value too big for sixty-four bits is still exact",
+        shown("1000Ei") == "1152921504606846976000")
+    say(f, "millicores come back as an integer, or say they cannot",
+        milli_of("2500m") == 2500 and milli_of("2") == 2000 and
+        milli_of("1Ki") == 1024000 and milli_refused("0.0001"))
+    say(f, "comparison does not go through a float on the way",
+        compared("1Gi", "1G") == 1 and compared("1000m", "1") == 0 and
+        compared("1Mi", "1M") == 1)
+    say(f, "and what Kubernetes refuses is refused here as well",
+        quantity_refused("1 Mi") and quantity_refused("1_000") and
+        quantity_refused("inf") and quantity_refused("") and
+        quantity_refused("1e") and quantity_refused("1Mi3"))
+}
+
+fn milli_of(text: str) -> i64 {
+    match k8squantity.parse(text) {
+        Ok(quantity) -> return k8squantity.to_milli(quantity) ?? 0 - 1
+        Err(_why) -> return 0 - 1
+    }
+}
+
+fn milli_refused(text: str) -> bool {
+    match k8squantity.parse(text) {
+        Ok(quantity) -> {
+            match k8squantity.to_milli(quantity) {
+                Ok(_value) -> return false
+                Err(_why) -> return true
+            }
+        }
+        Err(_why) -> return true
+    }
+}
+
+fn compared(a: str, b: str) -> i64 {
+    return k8squantity.compare(k8squantity.parse(a) ?? k8squantity.zero(),
+        k8squantity.parse(b) ?? k8squantity.zero())
+}
+
+// ---------------------------------------------------------- discordwire
+
+fn check_discord(inout f: i64) / {io} {
+    print("-- discordwire: an id is a clock, and permissions are computed")
+    say(f, "the top forty-two bits are milliseconds since 2015",
+        discordwire.snowflake_millis(175928847299117063) == 1462015105796)
+    say(f, "and the bottom bits say which worker made it, and when",
+        discordwire.snowflake_worker(175928847299117063) == 1 and
+        discordwire.snowflake_process(175928847299117063) == 0 and
+        discordwire.snowflake_increment(175928847299117063) == 7)
+    say(f, "a time turns into the lowest id that could hold it",
+        discordwire.snowflake_millis(
+            discordwire.snowflake_for(1462015105796)) == 1462015105796)
+    say(f, "an id arrives as a string because it does not fit a double",
+        (discordwire.parse_snowflake("175928847299117063") ?? 0) ==
+        175928847299117063 and snowflake_refused("17592884729911706x") and
+        snowflake_refused(""))
+    say(f, "the bits have the values a live client uses",
+        (discordwire.permission_bit("administrator") ?? 0) == 8 and
+        (discordwire.permission_bit("send_messages") ?? 0) == 2048 and
+        (discordwire.permission_bit("manage_roles") ?? 0) == 268435456)
+    say(f, "and a renamed one answers to both names",
+        (discordwire.permission_bit("read_messages") ?? 0) ==
+        (discordwire.permission_bit("view_channel") ?? 1))
+    say(f, "administrator carries every permission, tested or not",
+        discordwire.allows(8, 2048) and not discordwire.allows(4, 2048))
+    let owner = discordwire.guild_permissions(7, 7, 0, [])
+    say(f, "the guild owner has all of them however the roles are set",
+        owner == discordwire.all_permissions())
+    // The channel algorithm, in the order Discord publishes it.
+    let base = discordwire.guild_permissions(7, 9, 3072, [64])
+    say(f, "roles are added together before any channel is considered",
+        base == 3136)
+    let overwrites = [
+        DiscordOverwrite{ id: 1, kind: "role", allow: 0, deny: 2048 },
+        DiscordOverwrite{ id: 5, kind: "role", allow: 2048, deny: 0 },
+        DiscordOverwrite{ id: 6, kind: "role", allow: 0, deny: 64 },
+    ]
+    say(f, "every role deny lands before any role allow, so one role's" +
+        " allow cannot undo another's deny",
+        discordwire.channel_permissions(base, 1, 9, [5, 6], overwrites) ==
+        3072)
+    say(f, "and the member's own overwrite is applied last of all",
+        discordwire.channel_permissions(base, 1, 9, [5, 6],
+            [DiscordOverwrite{ id: 1, kind: "role", allow: 0, deny: 2048 },
+                DiscordOverwrite{ id: 9, kind: "member", allow: 2048,
+                    deny: 0 }]) == 3136)
+    say(f, "a fractional reset header is milliseconds, not seconds",
+        discordwire.wait_millis(429,
+            [("x-ratelimit-remaining", "0"),
+                ("x-ratelimit-reset-after", "0.523")]) == 523)
+    say(f, "and a request with budget left waits for nothing",
+        discordwire.wait_millis(200,
+            [("x-ratelimit-remaining", "4"),
+                ("x-ratelimit-reset-after", "5")]) == 0)
+}
+
+fn snowflake_refused(text: str) -> bool {
+    match discordwire.parse_snowflake(text) {
+        Ok(_id) -> return false
+        Err(_why) -> return true
+    }
+}
+
+// ----------------------------------------------------------- githubwire
+
+fn check_github(inout f: i64) / {io} {
+    print("-- githubwire: two rate limits, and pagination in a header")
+    say(f, "the version header is sent because the default one moves",
+        githubwire.api_headers("ghp_x", "2022-11-28").len() == 3 and
+        githubwire.api_headers("", "2022-11-28").len() == 2)
+    let headers = [("x-ratelimit-limit", "5000"),
+        ("x-ratelimit-remaining", "0"), ("x-ratelimit-used", "5000"),
+        ("x-ratelimit-reset", "1700000000"),
+        ("x-ratelimit-resource", "core")]
+    say(f, "the budget is per resource, so search does not stop core",
+        githubwire.limit_of(headers).resource == "core" and
+        githubwire.limit_of(headers).remaining == 0)
+    say(f, "an exhausted budget waits until it refills",
+        githubwire.wait_seconds(headers, 1699999940) == 60)
+    say(f, "a secondary limit says retry-after, and that wins",
+        githubwire.wait_seconds([("retry-after", "37"),
+            ("x-ratelimit-remaining", "4000"),
+            ("x-ratelimit-reset", "1700000000")], 1699999940) == 37)
+    say(f, "a 403 with budget left is a permissions problem, not a wait",
+        githubwire.wait_seconds([("x-ratelimit-remaining", "4999"),
+            ("x-ratelimit-reset", "1700000000")], 1699999940) == 0)
+    say(f, "the next page is in the Link header or there is no next page",
+        githubwire.next_page([("Link",
+            "<https://api.github.com/x?page=2>; rel=\"next\", " +
+            "<https://api.github.com/x?page=9>; rel=\"last\"")]) ==
+        "https://api.github.com/x?page=2" and
+        githubwire.next_page([("Link",
+            "<https://api.github.com/x?page=9>; rel=\"last\"")]) == "")
+    say(f, "a 304 costs nothing, which is what the ETag is for",
+        not githubwire.spent_budget(304) and githubwire.spent_budget(200)
+        and githubwire.conditional_headers("W/\"abc\"", "").len() == 1)
+    let claims = githubwire.app_claims("12345", 1700000000, 3600)
+    say(f, "an app token is backdated a minute and capped at ten",
+        claims[0] == ("iat", "1699999940") and
+        claims[1] == ("exp", "1700000600") and
+        claims[2] == ("iss", "12345"))
+    let failure = githubwire.failure_of("\{\"message\": " +
+        "\"Validation Failed\", \"errors\": [\{\"resource\": \"Issue\"," +
+        " \"field\": \"title\", \"code\": \"missing_field\"}]," +
+        " \"documentation_url\": \"https://docs.github.com/rest\"}") ??
+    no_github_failure()
+    say(f, "and a 422's message is always the same, so read the errors",
+        failure.message == "Validation Failed" and
+        failure.errors == ["Issue/title/missing_field"])
+}
+
+fn no_github_failure() -> GithubFailure {
+    return GithubFailure{ message: "", errors: [], documentation_url: "" }
+}
+
+// ------------------------------------------------------------ slackwire
+
+fn check_slack(inout f: i64) / {io} {
+    print("-- slackwire: refused before a human sees it, three ways")
+    say(f, "the signed string is a version, a timestamp and the raw body",
+        slackwire.signing_base("1531420618", "token=x&team_id=T1") ==
+        "v0:1531420618:token=x&team_id=T1")
+    say(f, "a stale request is refused in both directions",
+        slackwire.timestamp_is_fresh("1531420618", 1531420700) and
+        not slackwire.timestamp_is_fresh("1531420618", 1531421618) and
+        not slackwire.timestamp_is_fresh("1531420618", 1531419618))
+    say(f, "three characters are escaped and the quotes are left alone",
+        slackwire.escape_text("a & b < c > d \"e\"") ==
+        "a &amp; b &lt; c &gt; d \"e\"")
+    say(f, "a link is the one place angle brackets are meant",
+        slackwire.link("https://x.test", "the report") ==
+        "<https://x.test|the report>" and
+        slackwire.mention("U024BE7LH") == "<@U024BE7LH>")
+    say(f, "a slash command arrives form-encoded, plus for space",
+        slackwire.parse_command("command=%2Fdeploy&text=to+prod") ==
+        [("command", "/deploy"), ("text", "to prod")])
+    say(f, "a header over 150 characters is refused before it is sent",
+        blocks_refused("[\{\"type\": \"header\", \"text\": \{\"type\":" +
+            " \"plain_text\", \"text\": \"" + "x".repeat(151) + "\"}}]") and
+        not blocks_refused("[\{\"type\": \"header\", \"text\":" +
+            " \{\"type\": \"plain_text\", \"text\": \"" + "x".repeat(150) +
+            "\"}}]"))
+    say(f, "and so is a section over three thousand, or a fifty-first block",
+        blocks_refused("[\{\"type\": \"section\", \"text\": \{\"type\":" +
+            " \"mrkdwn\", \"text\": \"" + "x".repeat(3001) + "\"}}]") and
+        blocks_refused("[" + "\{\"type\": \"divider\"},".repeat(50) +
+            "\{\"type\": \"divider\"}]"))
+    say(f, "a 429 says how long to wait, so nothing has to be guessed",
+        slackwire.wait_seconds(429, [("Retry-After", "30")]) == 30 and
+        slackwire.wait_seconds(200, [("Retry-After", "30")]) == 0)
+    say(f, "and a wrong request is not sent again as it stands",
+        slackwire.is_retryable("ratelimited") and
+        not slackwire.is_retryable("invalid_blocks") and
+        not slackwire.is_retryable("channel_not_found"))
+}
+
+fn blocks_refused(payload: str) -> bool {
+    match slackwire.check_blocks(payload) {
+        Ok(_yes) -> return false
+        Err(_why) -> return true
+    }
+}
+
+// ------------------------------------------------------------ gitignore
+
+fn ignored(patterns: str, path: str, is_dir: bool) -> bool {
+    return gitignore.is_ignored(gitignore.parse(patterns), path, is_dir)
+}
+
+fn check_gitignore(inout f: i64) / {io} {
+    print("-- gitignore: the last pattern wins, and a parent has the say")
+    say(f, "a later negation re-includes, and a later pattern takes back",
+        not ignored("*.log\n!keep.log\n", "keep.log", false) and
+        ignored("!keep.log\n*.log\n", "keep.log", false))
+    say(f, "a pattern with a slash is anchored, one without is not",
+        ignored("doc/x\n", "doc/x", false) and
+        not ignored("doc/x\n", "a/doc/x", false) and
+        ignored("x\n", "a/b/x", false))
+    say(f, "a trailing slash means directories, and only directories",
+        ignored("build/\n", "build", true) and
+        not ignored("build/\n", "build", false) and
+        ignored("build/\n", "build/main.o", false))
+    say(f, "nothing under an ignored directory can be brought back",
+        ignored("secrets/\n!secrets/public.txt\n",
+            "secrets/public.txt", false))
+    say(f, "but a directory named only by a trailing ** is not ignored" +
+        " itself, so its contents can be",
+        not ignored("a/**\n!a/keep\n", "a/keep", false) and
+        ignored("a/**\n!a/keep\n", "a/other", false))
+    say(f, "a star stops at a slash and a double star does not",
+        not ignored("a/*/c\n", "a/b/d/c", false) and
+        ignored("a/**/c\n", "a/b/d/c", false) and
+        ignored("a/**/c\n", "a/c", false))
+    say(f, "a leading double star matches at any depth",
+        ignored("**/tmp\n", "tmp", false) and
+        ignored("**/tmp\n", "x/y/tmp", false))
+    say(f, "a character class works, and a leading hash can be escaped",
+        ignored("[abc].txt\n", "b.txt", false) and
+        not ignored("[abc].txt\n", "d.txt", false) and
+        ignored("\\#literal\n", "#literal", false) and
+        not ignored("#comment\n", "comment", false))
+    say(f, "trailing spaces are not part of a pattern unless escaped",
+        not ignored("name   \n", "name   ", false) and
+        ignored("name   \n", "name", false))
+    say(f, "and a blank line matches nothing at all",
+        not ignored("\n\n", "anything", false))
+}
+
+fn main() / {io} {
+    var f = 0
+    check_quantities(f)
+    check_discord(f)
+    check_github(f)
+    check_slack(f)
+    check_gitignore(f)
+    if f == 0 {
+        print("services: every claim held")
+    } else {
+        print("services: {f} claims failed")
+    }
+}
