@@ -1,0 +1,263 @@
+// The signature on an inbound webhook, and the four ways vendors write it.
+//
+// A webhook is an HTTP request from a service to you, and the only thing
+// distinguishing it from a request anybody can send is a signature header.
+// Every vendor invented their own, and the differences are not decoration:
+// two of the four bind a timestamp into the signature and two do not, and
+// the two that do not can be replayed forever by anyone who saw one.
+//
+// ## The four shapes
+//
+//   Stripe    `t=1614556800,v1=<hex>` — HMAC-SHA256 over `t.payload`, so
+//             the timestamp is signed and a replay is detectable.
+//   Slack     `v0=<hex>` beside `X-Slack-Request-Timestamp` — HMAC over
+//             `v0:timestamp:payload`, same idea, different spelling.
+//   GitHub    `sha256=<hex>` — HMAC over the payload alone. No timestamp,
+//             so a captured delivery is replayable until the secret
+//             changes.
+//   Shopify   base64 HMAC-SHA256 over the payload alone, same exposure.
+//
+// ## Why the comparison must be constant-time
+//
+// A verifier that returns on the first differing byte tells an attacker how
+// many bytes of their guess were right, and a webhook endpoint can be hit as
+// often as they like. Recovering a 64-character hex signature that way takes
+// a few thousand requests. Every comparison here goes through the
+// constant-time one, and the reason is worth stating because the fast
+// comparison is the one that gets written by accident.
+//
+// ## Why the raw body, always
+//
+// The signature covers the bytes as sent. A framework that parses JSON and
+// re-serialises it changes the whitespace, and the signature stops matching
+// for reasons nobody can find. Take the body before anything touches it.
+
+import crypto_hash
+import bytes_codec
+
+type WebhookError =
+    | Malformed(header: str)
+    | NoSignature()
+    | TooOld(age: i64)
+    | FromTheFuture(skew: i64)
+    | UnknownScheme(name: str)
+
+    /// What a check decided.
+type WebhookCheck = {
+    valid: bool,
+    /// The timestamp the header carried, or -1 when the scheme has none.
+    timestamp: i64,
+    /// `stripe`, `slack`, `github` or `shopify`.
+    scheme: str,
+    reason: str,
+}
+
+/// The hexadecimal HMAC-SHA256 of a message under a key.
+pub fn hmac_hex(secret: str, message: bytes) -> str {
+    return crypto_hash.hex_of(crypto_hash.hmac_sha256(secret.to_bytes(),
+        message))
+}
+
+/// The same, base64-encoded, which is Shopify's spelling.
+pub fn hmac_base64(secret: str, message: bytes) -> str {
+    return bytes_codec.encode_base64(crypto_hash.hmac_sha256(secret.to_bytes(),
+        message))
+}
+
+/// Whether two signatures are equal, in time that does not depend on where
+/// they differ.
+pub fn signatures_equal(a: str, b: str) -> bool {
+    return crypto_hash.equal_constant_time(a.to_bytes(), b.to_bytes())
+}
+
+fn joined(prefix: str, payload: bytes) -> bytes {
+    var out: [i64] = []
+    let head = prefix.to_bytes()
+    var i = 0
+    while i < head.len() {
+        out.push(head.at(i))
+        i = i + 1
+    }
+    var j = 0
+    while j < payload.len() {
+        out.push(payload.at(j))
+        j = j + 1
+    }
+    return bytes_of(out)
+}
+
+/// Stripe's `Stripe-Signature` header, parsed into its timestamp and its
+/// signatures.
+///
+/// There can be more than one `v1`, because Stripe signs with both the old
+/// and the new secret while a secret is being rotated. A verifier that takes
+/// the first one fails for the whole rotation window.
+pub fn stripe_parts(header: str) -> (i64, [str]) ! WebhookError {
+    var timestamp = 0 - 1
+    var signatures: [str] = []
+    for part in header.split(",") {
+        let piece = part.trim()
+        if piece.starts_with("t=") {
+            timestamp = piece.substr(2, piece.len() - 2).parse_int() ?? 0 - 1
+        } else if piece.starts_with("v1=") {
+            signatures.push(piece.substr(3, piece.len() - 3))
+        }
+    }
+    if timestamp < 0 {
+        fail(Malformed(header))
+    }
+    if signatures.len() == 0 {
+        fail(NoSignature())
+    }
+    return (timestamp, signatures)
+}
+
+/// Verify a Stripe webhook.
+///
+/// `tolerance` is how far the timestamp may be from now, in seconds; five
+/// minutes is Stripe's own default and is a compromise between clock skew
+/// and how long a replay stays useful.
+pub fn stripe(secret: str, header: str, payload: bytes, now: i64,
+    tolerance: i64) -> WebhookCheck {
+    match stripe_parts(header) {
+        Ok(parts) -> {
+            let age = now - parts.0
+            if age > tolerance {
+                return refused("stripe", parts.0,
+                    "the timestamp is {age} seconds old")
+            }
+            if 0 - age > tolerance {
+                return refused("stripe", parts.0,
+                    "the timestamp is {0 - age} seconds in the future")
+            }
+            let expected = hmac_hex(secret,
+                joined("{parts.0}.", payload))
+            for candidate in parts.1 {
+                if signatures_equal(expected, candidate) {
+                    return WebhookCheck{ valid: true, timestamp: parts.0,
+                        scheme: "stripe", reason: "signed and in time" }
+                }
+            }
+            return refused("stripe", parts.0, "no signature matched")
+        }
+        Err(_e) -> return refused("stripe", 0 - 1,
+            "the header is not a Stripe signature")
+    }
+}
+
+/// Verify a Slack request signature.
+///
+/// The signed string is `v0:` then the timestamp then `:` then the body,
+/// with the version prefix inside the signature so that a future v1 cannot
+/// be confused with this one.
+pub fn slack(secret: str, signature: str, timestamp: str, payload: bytes,
+    now: i64, tolerance: i64) -> WebhookCheck {
+    let sent = timestamp.parse_int() ?? 0 - 1
+    if sent < 0 {
+        return refused("slack", 0 - 1, "the timestamp is not a number")
+    }
+    let age = now - sent
+    if age > tolerance or 0 - age > tolerance {
+        return refused("slack", sent, "the timestamp is {age} seconds out")
+    }
+    let expected = "v0=" + hmac_hex(secret,
+        joined("v0:" + timestamp + ":", payload))
+    if signatures_equal(expected, signature) {
+        return WebhookCheck{ valid: true, timestamp: sent,
+            scheme: "slack", reason: "signed and in time" }
+    }
+    return refused("slack", sent, "the signature does not match")
+}
+
+/// Verify a GitHub webhook signature.
+///
+/// No timestamp anywhere, so this says nothing about when the delivery was
+/// made: a captured request is replayable until the secret is changed, and
+/// the endpoint has to be idempotent for that reason rather than for
+/// tidiness.
+pub fn github(secret: str, signature: str,
+    payload: bytes) -> WebhookCheck {
+    if not signature.starts_with("sha256=") {
+        return refused("github", 0 - 1,
+            "the header is not a sha256 signature")
+    }
+    let expected = "sha256=" + hmac_hex(secret, payload)
+    if signatures_equal(expected, signature) {
+        return WebhookCheck{ valid: true, timestamp: 0 - 1,
+            scheme: "github",
+            reason: "signed; nothing here says when" }
+    }
+    return refused("github", 0 - 1, "the signature does not match")
+}
+
+/// Verify a Shopify webhook signature, which is the same HMAC in base64.
+pub fn shopify(secret: str, signature: str,
+    payload: bytes) -> WebhookCheck {
+    let expected = hmac_base64(secret, payload)
+    if signatures_equal(expected, signature) {
+        return WebhookCheck{ valid: true, timestamp: 0 - 1,
+            scheme: "shopify",
+            reason: "signed; nothing here says when" }
+    }
+    return refused("shopify", 0 - 1, "the signature does not match")
+}
+
+fn refused(scheme: str, timestamp: i64, reason: str) -> WebhookCheck {
+    return WebhookCheck{ valid: false, timestamp: timestamp,
+        scheme: scheme, reason: reason }
+}
+
+/// Whether a scheme binds a timestamp into what it signs.
+///
+/// The ones that do can refuse a replay; the ones that do not cannot, and
+/// an endpoint receiving those has to be idempotent to be safe at all.
+pub fn binds_time(scheme: str) -> bool ! WebhookError {
+    if scheme == "stripe" or scheme == "slack" {
+        return true
+    }
+    if scheme == "github" or scheme == "shopify" {
+        return false
+    }
+    fail(UnknownScheme(scheme))
+}
+
+/// The header each scheme's signature arrives in.
+pub fn header_name(scheme: str) -> str ! WebhookError {
+    if scheme == "stripe" {
+        return "Stripe-Signature"
+    }
+    if scheme == "slack" {
+        return "X-Slack-Signature"
+    }
+    if scheme == "github" {
+        return "X-Hub-Signature-256"
+    }
+    if scheme == "shopify" {
+        return "X-Shopify-Hmac-Sha256"
+    }
+    fail(UnknownScheme(scheme))
+}
+
+/// The signature a sender would produce, for a test double.
+///
+/// Here because the alternative is every consumer of this package
+/// reimplementing the signing side in its test fixtures, and getting it
+/// subtly wrong in a way that makes the verifier look right.
+pub fn sign_as(scheme: str, secret: str, payload: bytes,
+    timestamp: i64) -> str ! WebhookError {
+    if scheme == "stripe" {
+        return "t={timestamp},v1=" + hmac_hex(secret,
+            joined("{timestamp}.", payload))
+    }
+    if scheme == "slack" {
+        return "v0=" + hmac_hex(secret,
+            joined("v0:{timestamp}:", payload))
+    }
+    if scheme == "github" {
+        return "sha256=" + hmac_hex(secret, payload)
+    }
+    if scheme == "shopify" {
+        return hmac_base64(secret, payload)
+    }
+    fail(UnknownScheme(scheme))
+}

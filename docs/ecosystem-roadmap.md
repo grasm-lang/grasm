@@ -14,7 +14,7 @@ plan that discovers them 300 packages in.
 | | |
 |---|---|
 | Started | 78 |
-| Now | 412 |
+| Now | 417 |
 | Tier 1 target | 200 |
 | Tier 2 target | 500 |
 | Tier 3 target | 800 |
@@ -257,6 +257,10 @@ Slack, GitHub, Kubernetes, Prometheus remote-write, OpenTelemetry export,
 OAuth providers, SMTP and IMAP over TLS, and every managed database. All of
 them are HTTPS-only and have been for years, and none of them could be
 started until now.
+
+`https_client` speaks HTTP/1.1 over it, `awssig` signs what AWS wants signed
+and `webhooksig` checks what arrives back, so the first layer above TLS is
+built too.
 
 `tlsclient` completes a TLS 1.3 handshake over a socket and refuses to
 return a connection it has not verified. `tlshandshake` builds and reads the

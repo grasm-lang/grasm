@@ -64,6 +64,8 @@ type TlsConnection = {
     session: TlsSession,
     /// The protocol ALPN settled on, or the empty string.
     protocol: str,
+    /// Which cipher suite the record layer is using.
+    suite: i64,
 }
 
 fn concat(a: bytes, b: bytes) -> bytes {
@@ -130,8 +132,8 @@ fn next_plain(inout c: TlsConnection) -> (i64, bytes) ! ClientError / {net} {
         if record.content_type == 21 {
             fail(Protocol("the server sent an alert"))
         }
-        match tls13.open_record(c.read_keys, c.read_sequence,
-            record_bytes(record)) {
+        match tls13.open_record_with(c.read_keys, c.read_sequence,
+            record_bytes(record), c.suite) {
             Ok(opened) -> {
                 c.read_sequence = c.read_sequence + 1
                 return opened
@@ -151,8 +153,8 @@ fn record_bytes(record: TlsRecord) -> bytes {
 fn send_protected(inout c: TlsConnection, kind: i64,
     payload: bytes) -> bool ! ClientError / {net} {
     var sealed = bytes_of([])
-    match tls13.seal_record(c.write_keys, c.write_sequence, kind,
-        payload) {
+    match tls13.seal_record_with(c.write_keys, c.write_sequence, kind,
+        payload, c.suite) {
         Ok(made) -> sealed = made
         Err(_e) -> fail(Protocol("a record could not be sealed"))
     }
@@ -301,7 +303,8 @@ pub fn connect(host: str, port: i64, roots: [bytes], protocols: [str],
     }
     var c = TlsConnection{ socket: socket, read_keys: empty_keys(),
         write_keys: empty_keys(), read_sequence: 0, write_sequence: 0,
-        pending: bytes_of([]), session: no_session(), protocol: "" }
+        pending: bytes_of([]), session: no_session(), protocol: "",
+        suite: tls13.suite_aes_128_gcm() }
     var transcript = try send_hello(socket, x25519.public_key(private_key),
         host, protocols)
     let answer = try read_hello(c)
@@ -309,6 +312,16 @@ pub fn connect(host: str, port: i64, roots: [bytes], protocols: [str],
     if answer.hello.group != tlshandshake.group_x25519() {
         fail(HandshakeFailed("the server chose a group this client did " +
             "not offer a share for"))
+    }
+    // The record layer implements two suites. A server that answers with a
+    // third is refused here rather than three records later with a
+    // decryption failure, which is what the same mistake looks like when it
+    // is not checked.
+    let suite = answer.hello.cipher_suite
+    if suite != tls13.suite_aes_128_gcm() and
+    suite != tls13.suite_chacha20_poly1305() {
+        fail(HandshakeFailed("the server chose cipher suite {suite}, " +
+            "which this client does not implement"))
     }
     let shared = x25519.shared_secret(private_key, answer.hello.key_share) ??
     bytes_of([])
@@ -318,8 +331,9 @@ pub fn connect(host: str, port: i64, roots: [bytes], protocols: [str],
     let schedule = tls13.schedule_of(tls13.zeros(), shared)
     let handshake = tls13.handshake_traffic(schedule,
         crypto_hash.sha256_of(transcript))
-    c.read_keys = tls13.traffic_keys(handshake.1)
-    c.write_keys = tls13.traffic_keys(handshake.0)
+    c.suite = suite
+    c.read_keys = tls13.traffic_keys_for(handshake.1, suite)
+    c.write_keys = tls13.traffic_keys_for(handshake.0, suite)
     let flight = try read_flight(c, transcript)
     c.protocol = flight.protocol
     // Verify before answering. A client that sends its Finished first has
@@ -349,8 +363,8 @@ pub fn connect(host: str, port: i64, roots: [bytes], protocols: [str],
     // server's Finished, not the client's.
     let application = tls13.application_traffic(schedule,
         crypto_hash.sha256_of(transcript))
-    c.read_keys = tls13.traffic_keys(application.1)
-    c.write_keys = tls13.traffic_keys(application.0)
+    c.read_keys = tls13.traffic_keys_for(application.1, suite)
+    c.write_keys = tls13.traffic_keys_for(application.0, suite)
     c.read_sequence = 0
     c.write_sequence = 0
     return c

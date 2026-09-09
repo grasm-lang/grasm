@@ -1,0 +1,287 @@
+import awssig
+import webhooksig
+import https_client
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn key_id() -> str {
+    return "AKIDEXAMPLE"
+}
+
+fn secret_key() -> str {
+    return "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY"
+}
+
+fn when() -> str {
+    return "20150830T123600Z"
+}
+
+fn vanilla() -> Signed {
+    return Signed{ method: "GET", path: "/", query: [],
+        headers: [("host", "example.amazonaws.com"),
+            ("x-amz-date", when())], payload: bytes_of([]) }
+}
+
+// --------------------------------------------------------------- awssig
+
+fn check_awssig(inout f: i64) / {io} {
+    print("-- awssig: the signature on every request to every AWS service")
+    // The published test-suite vector, which botocore agrees with.
+    let signed = awssig.sign(vanilla(), key_id(), secret_key(), when(),
+        "us-east-1", "service", true) ?? empty_canonical()
+    say(f, "the get-vanilla case signs to the value AWS publishes",
+        signed.signature ==
+        "5fa00fa31553b73ebf1942676e86291e8372ff2a2260956d9b8aae1d763fbf31")
+    say(f, "the canonical request is six lines and ends in the body hash",
+        signed.canonical_request.starts_with("GET\n/\n\nhost:") and
+        signed.canonical_request.ends_with(
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"))
+    say(f, "the string to sign names the algorithm, the time and the scope",
+        signed.string_to_sign.starts_with("AWS4-HMAC-SHA256\n" + when() +
+            "\n20150830/us-east-1/service/aws4_request\n"))
+    say(f, "and the Authorization header carries all three parts",
+        signed.authorization.contains("Credential=" + key_id() +
+            "/20150830/us-east-1/service/aws4_request") and
+        signed.authorization.contains("SignedHeaders=host;x-amz-date") and
+        signed.authorization.contains("Signature=" + signed.signature))
+    // The query rules, which is where implementations disagree.
+    say(f, "the query sorts by name then value, not as one joined string",
+        awssig.canonical_query([("A", "z"), ("A9", "a"), ("A", "a")]) ==
+        "A=a&A=z&A9=a")
+    say(f, "and every part is percent-encoded, including the space",
+        awssig.canonical_query([("a b", "c d")]) == "a%20b=c%20d" and
+        awssig.encode("/x", true) == "%2Fx" and
+        awssig.encode("/x", false) == "/x")
+    // The path rules, and the one service that does not follow them.
+    say(f, "a path is encoded twice for everything except S3",
+        awssig.canonical_uri("/a b", true) == "/a%2520b" and
+        awssig.canonical_uri("/a b", false) == "/a%20b")
+    say(f, "and normalised first, so a dot segment does not reach the wire",
+        awssig.normalise_path("/./a/../b/") == "/b/" and
+        awssig.normalise_path("/") == "/" and
+        awssig.normalise_path("/a/./b") == "/a/b")
+    say(f, "S3 is the exception, and is the one everybody meets first",
+        awssig.double_encodes("dynamodb") and
+        not awssig.double_encodes("s3"))
+    // Header canonicalisation.
+    say(f, "a header value has its internal runs of spaces collapsed",
+        awssig.trim_value("  a   b  c  ") == "a b c" and
+        awssig.trim_value("plain") == "plain")
+    let headers = awssig.canonical_headers([("Zed", "1"), ("Alpha", " 2 ")])
+    say(f, "and the headers are lower-cased and sorted, names listed apart",
+        headers.0 == "alpha:2\nzed:1\n" and headers.1 == "alpha;zed")
+    // The signing key, which is what makes a scraped signature nearly
+    // worthless.
+    say(f, "the signing key is four HMACs and belongs to one day and place",
+        awssig.signing_key(secret_key(), when(), "us-east-1", "service")
+        != awssig.signing_key(secret_key(), when(), "eu-west-1",
+            "service"))
+    // Presigning, and the ceiling on it.
+    let presigned = awssig.presign(vanilla(), key_id(), secret_key(),
+        when(), "us-east-1", "s3", 3600, false) ?? empty_canonical()
+    say(f, "a presigned URL carries the credential in the query",
+        presigned.authorization.contains("X-Amz-Algorithm=AWS4-HMAC-SHA256")
+        and presigned.authorization.contains("X-Amz-Expires=3600") and
+        presigned.authorization.contains("X-Amz-Signature="))
+    say(f, "and it does not cover the body, which is why it needs TLS",
+        presigned.canonical_request.ends_with(awssig.unsigned_payload()))
+    say(f, "seven days is the ceiling on a URL that is itself a credential",
+        presign_refused(604801) and presign_refused(0))
+    say(f, "a timestamp that is not one is refused before anything is hashed",
+        sign_refused("20150830") and sign_refused("2015083012360000"))
+}
+
+fn empty_canonical() -> Canonical {
+    return Canonical{ canonical_request: "", string_to_sign: "",
+        signature: "", authorization: "", signed_headers: "", scope: "" }
+}
+
+fn presign_refused(seconds: i64) -> bool {
+    match awssig.presign(vanilla(), key_id(), secret_key(), when(),
+        "us-east-1", "s3", seconds, false) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn sign_refused(timestamp: str) -> bool {
+    match awssig.sign(vanilla(), key_id(), secret_key(), timestamp,
+        "us-east-1", "service", true) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+// ----------------------------------------------------------- webhooksig
+
+fn body() -> bytes {
+    return "\{\"id\":\"evt_1\"}".to_bytes()
+}
+
+fn hook_secret() -> str {
+    return "whsec_test"
+}
+
+fn check_webhooksig(inout f: i64) / {io} {
+    print("-- webhooksig: four vendors, four spellings, two exposures")
+    // Python's hmac agrees on every one of these.
+    say(f, "Stripe signs the timestamp and the body together",
+        (webhooksig.sign_as("stripe", hook_secret(), body(), 1614556800)
+            ?? "") == "t=1614556800,v1=e326b9127f526dab808bd39e79a44ab6" +
+        "1b0dc0517386b06a7abf563ce203409b")
+    say(f, "Slack signs a version, the timestamp and the body",
+        (webhooksig.sign_as("slack", hook_secret(), body(), 1614556800)
+            ?? "") == "v0=eb56fc5ffe60c23c57b5a0beb8b4eee75453ce72e9e43583" +
+        "2f5f3082d345d32d")
+    say(f, "GitHub signs the body and nothing else",
+        (webhooksig.sign_as("github", hook_secret(), body(), 0) ?? "") ==
+        "sha256=030fa3b2413d1993c551364bd53bb9b3edb5c0c34d55dba6ada6" +
+        "041245632811")
+    say(f, "and Shopify signs the same bytes and writes them in base64",
+        (webhooksig.sign_as("shopify", hook_secret(), body(), 0) ?? "") ==
+        "Aw+jskE9GZPFUTZL1Tu5s+21wMNNVdumraYEEkVjKBE=")
+    // Which of them can refuse a replay, and which cannot.
+    say(f, "two of the four bind a timestamp, and two cannot see a replay",
+        (webhooksig.binds_time("stripe") ?? false) and
+        (webhooksig.binds_time("slack") ?? false) and
+        not (webhooksig.binds_time("github") ?? true) and
+        not (webhooksig.binds_time("shopify") ?? true))
+    say(f, "and each arrives in its own header",
+        (webhooksig.header_name("stripe") ?? "") == "Stripe-Signature" and
+        (webhooksig.header_name("github") ?? "") ==
+        "X-Hub-Signature-256")
+    // A signature that checks out, and the four ways one does not.
+    let stripe_header = webhooksig.sign_as("stripe", hook_secret(), body(),
+        1614556800) ?? ""
+    say(f, "a Stripe webhook inside the window is accepted",
+        webhooksig.stripe(hook_secret(), stripe_header, body(),
+            1614556900, 300).valid)
+    say(f, "one that arrived six minutes ago is refused as too old",
+        not webhooksig.stripe(hook_secret(), stripe_header, body(),
+            1614557200, 300).valid)
+    say(f, "one whose body changed by a byte is refused",
+        not webhooksig.stripe(hook_secret(), stripe_header,
+            "\{\"id\":\"evt_2\"}".to_bytes(), 1614556900, 300).valid)
+    say(f, "and one signed with another secret is refused",
+        not webhooksig.stripe("whsec_other", stripe_header, body(),
+            1614556900, 300).valid)
+    // Rotation: Stripe sends both signatures while a secret is being
+    // changed, so a verifier that takes the first fails for the window.
+    let both = stripe_header + ",v1=" + "0".repeat(64)
+    say(f, "a header carrying two signatures matches on either",
+        webhooksig.stripe(hook_secret(), both, body(), 1614556900,
+            300).valid)
+    say(f, "a header with no signature at all is refused, not accepted",
+        not webhooksig.stripe(hook_secret(), "t=1614556800", body(),
+            1614556900, 300).valid)
+    // Slack and GitHub.
+    say(f, "Slack's timestamp is a separate header and is still bound in",
+        webhooksig.slack(hook_secret(),
+            webhooksig.sign_as("slack", hook_secret(), body(), 1614556800) ??
+            "", "1614556800", body(), 1614556900, 300).valid and
+        not webhooksig.slack(hook_secret(),
+            webhooksig.sign_as("slack", hook_secret(), body(), 1614556800) ??
+            "", "1614556801", body(), 1614556900, 300).valid)
+    say(f, "GitHub's has no timestamp, so it verifies at any moment at all",
+        webhooksig.github(hook_secret(),
+            webhooksig.sign_as("github", hook_secret(), body(), 0) ?? "",
+            body()).valid and
+        webhooksig.github(hook_secret(),
+            webhooksig.sign_as("github", hook_secret(), body(), 0) ?? "",
+            body()).timestamp == 0 - 1)
+    say(f, "a header that is not the shape the vendor sends is refused",
+        not webhooksig.github(hook_secret(), "sha1=abc", body()).valid)
+    say(f, "and a scheme nobody here implements is an error, not a false",
+        scheme_refused("paypal"))
+}
+
+fn scheme_refused(scheme: str) -> bool {
+    match webhooksig.binds_time(scheme) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+// --------------------------------------------------------- https_client
+
+fn check_https(inout f: i64) / {io} {
+    print("-- https_client: where a body ends, and in what order to ask")
+    let request = https_client.request_of("GET", "example.com", "/x",
+        [("Accept", "text/plain")], bytes_of([]))
+    say(f, "a request names the host, because one address serves many",
+        text_of(request).starts_with("GET /x HTTP/1.1\r\nHost: " +
+            "example.com\r\n"))
+    say(f, "and a body brings a length with it",
+        text_of(https_client.request_of("POST", "h", "/", [],
+            "abc".to_bytes())).contains("Content-Length: 3\r\n"))
+    let head = https_client.parse_head("HTTP/1.1 204 No Content\r\n" +
+        "Content-Type: text/plain\r\nX-Trace: 7\r\n") ?? (0, "", [])
+    say(f, "a status line is a code and a phrase that means nothing",
+        head.0 == 204 and head.1 == "No Content")
+    say(f, "and the headers come back lower-cased, so a lookup can be exact",
+        https_client.header_of(head.2, "Content-Type") == "text/plain" and
+        https_client.header_of(head.2, "x-trace") == "7" and
+        https_client.header_of(head.2, "absent") == "")
+    say(f, "a status line that is not one is refused rather than guessed",
+        head_refused("nonsense") and head_refused("HTTP/1.1 99 Odd"))
+    // Chunked decoding, including the extension nobody uses.
+    let chunked = https_client.dechunk(("4\r\none \r\n3\r\ntwo\r\n" +
+        "0\r\n\r\n").to_bytes()) ?? (bytes_of([]), false)
+    say(f, "a chunked body is its own length, chunk by chunk",
+        chunked.1 and text_of(chunked.0) == "one two")
+    say(f, "an extension after the size is skipped, since nobody reads them",
+        text_of((https_client.dechunk("3;a=b\r\nxyz\r\n0\r\n\r\n"
+                .to_bytes()) ?? (bytes_of([]), false)).0) == "xyz")
+    say(f, "and a body that has not finished says so rather than truncating",
+        not (https_client.dechunk("4\r\none ".to_bytes()) ??
+            (bytes_of([]), true)).1)
+    // The redirect rules.
+    say(f, "the five statuses a client follows, and no others",
+        https_client.is_redirect(301) and https_client.is_redirect(308) and
+        not https_client.is_redirect(200) and
+        not https_client.is_redirect(304))
+    say(f, "a 302 turns a POST into a GET, which is what browsers do",
+        https_client.method_after(302, "POST") == "GET" and
+        https_client.method_after(303, "PUT") == "GET")
+    say(f, "and 307 and 308 exist to say do not do that",
+        https_client.method_after(307, "POST") == "POST" and
+        https_client.method_after(308, "PUT") == "PUT")
+    say(f, "a HEAD stays a HEAD, because it never had a body to drop",
+        https_client.method_after(302, "HEAD") == "HEAD")
+}
+
+fn head_refused(text: str) -> bool {
+    match https_client.parse_head(text) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn text_of(data: bytes) -> str {
+    var out = ""
+    var i = 0
+    while i < data.len() {
+        out = out + data.at(i).to_char()
+        i = i + 1
+    }
+    return out
+}
+
+fn main() / {io} {
+    var f = 0
+    check_awssig(f)
+    check_webhooksig(f)
+    check_https(f)
+    if f == 0 {
+        print("hosted: every claim held")
+    } else {
+        print("hosted: {f} claims failed")
+    }
+}

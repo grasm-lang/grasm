@@ -1,0 +1,38 @@
+// Fetches one URL over HTTPS and prints what came back, so a shell script
+// can compare it with curl's answer.
+import https_client
+
+fn main() / {net, io} {
+    let port = args()[0].parse_int() ?? 0
+    let root = read_bytes(args()[1]) ?? bytes_of([])
+    let host = args()[2]
+    let path = args()[3]
+    let now = args()[4].parse_int() ?? 0
+    match https_client.get(host, port, [root], path, 3, now) {
+        Ok(reply) -> {
+            print("{reply.status}|" + reply.reason + "|" +
+                https_client.header_of(reply.headers, "content-type") +
+                "|{reply.body.len()}|" + text_of(reply.body).trim())
+        }
+        Err(why) -> {
+            match why {
+                Refused(text) -> print("refused|" + text)
+                NotVerified(text) -> print("unverified|" + text)
+                BadStatus(text) -> print("badstatus|" + text)
+                BadChunk(at) -> print("badchunk|{at}")
+                TooManyRedirects(n) -> print("redirects|{n}")
+                Closed() -> print("closed|")
+            }
+        }
+    }
+}
+
+fn text_of(data: bytes) -> str {
+    var out = ""
+    var i = 0
+    while i < data.len() {
+        out = out + data.at(i).to_char()
+        i = i + 1
+    }
+    return out
+}

@@ -1,0 +1,11 @@
+[package]
+name = "awssig"
+version = "1.0.0"
+
+# Hashing and text. Opens nothing: signing is a pure function of the
+# request, and a signer that reads the clock cannot be tested.
+capabilities = []
+
+[dependencies.crypto_hash]
+path = "../crypto_hash"
+version = "^1.0.0"

@@ -1,0 +1,10 @@
+[package]
+name = "https_client"
+version = "1.0.0"
+
+# A socket, through TLS, and the operating system's randomness beneath it.
+capabilities = ["net", "io"]
+
+[dependencies.tlsclient]
+path = "../tlsclient"
+version = "^1.0.0"

@@ -1,0 +1,374 @@
+// HTTP/1.1 over TLS: the thing every hosted service actually speaks.
+//
+// `http_client` in this package set speaks HTTP over a plain socket, which
+// reaches almost nothing on the public internet any more. This is the same
+// protocol over `tlsclient`, and the interesting part is not the TLS — that
+// is a function call — but the two places HTTP/1.1 is harder than it looks
+// through an encrypted connection.
+//
+// ## A record is not a message
+//
+// A TLS read returns a record, and a record has no relationship to an HTTP
+// message: a response can arrive as one record or thirty, and one record can
+// hold the end of one response and the start of the next. Everything here
+// accumulates into a buffer and looks for message boundaries in that, never
+// in what a single read returned.
+//
+// ## Where a body ends
+//
+// Three answers, in order of precedence: a `Transfer-Encoding: chunked`
+// header means the body says so itself; a `Content-Length` means count; and
+// neither means read until the connection closes, which is the only case
+// where a truncated response and a complete one look the same. A client that
+// checks `Content-Length` first accepts a smuggled request, which is the
+// whole of request smuggling as an attack.
+//
+// ## Redirects
+//
+// Followed only to the same scheme, and a 301 or 302 in answer to a POST
+// becomes a GET — which is what every browser does and what the
+// specification came to permit after the fact. The body is dropped with it,
+// because sending it again to a different place is how a redirect becomes a
+// way to steal a request body.
+
+import tlsclient
+
+type HttpsError =
+    | Refused(why: str)
+    | NotVerified(why: str)
+    | BadStatus(line: str)
+    | BadChunk(at: i64)
+    | TooManyRedirects(count: i64)
+    | Closed()
+
+    /// A response.
+type HttpsReply = {
+    status: i64,
+    /// The reason phrase, which carries no meaning and is logged anyway.
+    reason: str,
+    headers: [(str, str)],
+    body: bytes,
+    /// What the connection settled on: `http/1.1`, or empty when the server
+    /// offered no ALPN.
+    protocol: str,
+    /// The names the certificate carried, so a caller can log what it
+    /// actually talked to.
+    names: [str],
+}
+
+fn concat(a: bytes, b: bytes) -> bytes {
+    var out: [i64] = []
+    var i = 0
+    while i < a.len() {
+        out.push(a.at(i))
+        i = i + 1
+    }
+    var j = 0
+    while j < b.len() {
+        out.push(b.at(j))
+        j = j + 1
+    }
+    return bytes_of(out)
+}
+
+fn slice_of(data: bytes, at: i64, length: i64) -> bytes {
+    var out: [i64] = []
+    var i = 0
+    while i < length and at + i < data.len() {
+        out.push(data.at(at + i))
+        i = i + 1
+    }
+    return bytes_of(out)
+}
+
+fn text_of(data: bytes) -> str {
+    var out = ""
+    var i = 0
+    while i < data.len() {
+        out = out + data.at(i).to_char()
+        i = i + 1
+    }
+    return out
+}
+
+/// Where the blank line separating the headers from the body is, or -1.
+fn header_end(data: bytes) -> i64 {
+    var i = 0
+    while i + 3 < data.len() {
+        if data.at(i) == 13 and data.at(i + 1) == 10 and
+        data.at(i + 2) == 13 and data.at(i + 3) == 10 {
+            return i + 4
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+/// The request line and headers, as bytes.
+pub fn request_of(method: str, host: str, path: str,
+    headers: [(str, str)], body: bytes) -> bytes {
+    var text = method + " " + path + " HTTP/1.1\r\nHost: " + host +
+    "\r\n"
+    for header in headers {
+        text = text + header.0 + ": " + header.1 + "\r\n"
+    }
+    if body.len() > 0 {
+        text = text + "Content-Length: {body.len()}\r\n"
+    }
+    text = text + "Connection: close\r\n\r\n"
+    return concat(text.to_bytes(), body)
+}
+
+/// The status line and headers of a response.
+pub fn parse_head(head: str) -> (i64, str, [(str, str)]) ! HttpsError {
+    let lines = head.split("\r\n")
+    if lines.len() == 0 {
+        fail(BadStatus(head))
+    }
+    let status_line = lines[0]
+    let first = index_of(status_line, " ")
+    if first < 0 {
+        fail(BadStatus(status_line))
+    }
+    let rest = status_line.substr(first + 1, status_line.len() - first - 1)
+    let second = index_of(rest, " ")
+    var code = 0
+    var reason = ""
+    if second < 0 {
+        code = rest.parse_int() ?? 0
+    } else {
+        code = rest.substr(0, second).parse_int() ?? 0
+        reason = rest.substr(second + 1, rest.len() - second - 1)
+    }
+    if code < 100 or code > 599 {
+        fail(BadStatus(status_line))
+    }
+    var headers: [(str, str)] = []
+    var i = 1
+    while i < lines.len() {
+        let line = lines[i]
+        if line == "" {
+            i = i + 1
+            continue
+        }
+        let at = index_of(line, ":")
+        if at > 0 {
+            headers.push((line.substr(0, at).to_lower(),
+                line.substr(at + 1, line.len() - at - 1).trim()))
+        }
+        i = i + 1
+    }
+    return (code, reason, headers)
+}
+
+fn index_of(text: str, needle: str) -> i64 {
+    var i = 0
+    while i + needle.len() <= text.len() {
+        if text.substr(i, needle.len()) == needle {
+            return i
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+/// A header's value, or the empty string.
+pub fn header_of(headers: [(str, str)], name: str) -> str {
+    for header in headers {
+        if header.0 == name.to_lower() {
+            return header.1
+        }
+    }
+    return ""
+}
+
+/// A chunked body, decoded.
+///
+/// Each chunk is a hexadecimal length, optionally with extensions after a
+/// semicolon that nobody uses and everybody must skip, then the bytes, then
+/// a CRLF. A zero-length chunk ends it, and trailers may follow.
+pub fn dechunk(data: bytes) -> (bytes, bool) ! HttpsError {
+    var out: [i64] = []
+    var at = 0
+    while at < data.len() {
+        var line = ""
+        while at < data.len() and data.at(at) != 13 {
+            line = line + data.at(at).to_char()
+            at = at + 1
+        }
+        if at + 1 >= data.len() {
+            return (bytes_of(out), false)
+        }
+        at = at + 2
+        let semicolon = index_of(line, ";")
+        var size_text = line
+        if semicolon >= 0 {
+            size_text = line.substr(0, semicolon)
+        }
+        let size = size_text.trim().parse_int_base(16) ?? 0 - 1
+        if size < 0 {
+            fail(BadChunk(at))
+        }
+        if size == 0 {
+            return (bytes_of(out), true)
+        }
+        if at + size > data.len() {
+            return (bytes_of(out), false)
+        }
+        var i = 0
+        while i < size {
+            out.push(data.at(at + i))
+            i = i + 1
+        }
+        at = at + size + 2
+    }
+    return (bytes_of(out), false)
+}
+
+/// Send one request over a connection that is already open and verified.
+pub fn exchange(inout c: TlsConnection, method: str, host: str,
+    path: str, headers: [(str, str)],
+    body: bytes) -> HttpsReply ! HttpsError / {net} {
+    match tlsclient.write(c, request_of(method, host, path, headers,
+        body)) {
+        Ok(_sent) -> {}
+        Err(_e) -> fail(Closed())
+    }
+    var buffer = bytes_of([])
+    var head_at = 0 - 1
+    var quiet = 0
+    while head_at < 0 and quiet < 3 {
+        match tlsclient.read(c) {
+            Ok(piece) -> {
+                if piece.len() == 0 {
+                    quiet = quiet + 1
+                } else {
+                    quiet = 0
+                    buffer = concat(buffer, piece)
+                }
+                head_at = header_end(buffer)
+            }
+            Err(_e) -> quiet = 3
+        }
+    }
+    if head_at < 0 {
+        fail(Closed())
+    }
+    let head = try parse_head(text_of(slice_of(buffer, 0, head_at - 4)))
+    var payload = slice_of(buffer, head_at, buffer.len() - head_at)
+    // Chunked first: a response carrying both headers is a smuggling
+    // attempt, and the specification says the transfer encoding wins.
+    let chunked = header_of(head.2, "transfer-encoding").contains("chunked")
+    var wanted = 0 - 1
+    if not chunked {
+        wanted = header_of(head.2, "content-length").parse_int() ?? 0 - 1
+    }
+    var done = false
+    var idle = 0
+    while not done and idle < 3 {
+        if chunked {
+            let decoded = try dechunk(payload)
+            if decoded.1 {
+                payload = decoded.0
+                done = true
+            }
+        } else if wanted >= 0 and payload.len() >= wanted {
+            payload = slice_of(payload, 0, wanted)
+            done = true
+        }
+        if not done {
+            match tlsclient.read(c) {
+                Ok(piece) -> {
+                    if piece.len() == 0 {
+                        idle = idle + 1
+                    } else {
+                        idle = 0
+                        payload = concat(payload, piece)
+                    }
+                }
+                Err(_e) -> idle = 3
+            }
+        }
+    }
+    if chunked and not done {
+        payload = (try dechunk(payload)).0
+    }
+    let session = tlsclient.session_of(c)
+    return HttpsReply{ status: head.0, reason: head.1, headers: head.2,
+        body: payload, protocol: c.protocol, names: session.names }
+}
+
+/// Open a connection, send one request, and read the response.
+pub fn fetch(host: str, port: i64, roots: [bytes], method: str, path: str,
+    headers: [(str, str)], body: bytes,
+    now_seconds: i64) -> HttpsReply ! HttpsError / {net, io} {
+    match tlsclient.connect(host, port, roots, ["http/1.1"], now_seconds) {
+        Ok(opened) -> {
+            var c = opened
+            let reply = try exchange(c, method, host, path, headers, body)
+            tlsclient.close(c)
+            return reply
+        }
+        Err(why) -> {
+            match why {
+                Refused(text) -> fail(Refused(text))
+                NotVerified(text) -> fail(NotVerified(text))
+                HandshakeFailed(text) -> fail(NotVerified(text))
+                Protocol(text) -> fail(Refused(text))
+                Closed() -> fail(Closed())
+            }
+        }
+    }
+}
+
+/// A GET, with redirects followed.
+///
+/// `most` is the redirect limit; three is what most clients use and the
+/// reason for any limit at all is that a pair of servers pointing at each
+/// other is a loop the client has to break.
+pub fn get(host: str, port: i64, roots: [bytes], path: str, most: i64,
+    now_seconds: i64) -> HttpsReply ! HttpsError / {net, io} {
+    var target = path
+    var followed = 0
+    while followed <= most {
+        let reply = try fetch(host, port, roots, "GET", target, [],
+            bytes_of([]), now_seconds)
+        if not is_redirect(reply.status) {
+            return reply
+        }
+        let location = header_of(reply.headers, "location")
+        if location == "" or not location.starts_with("/") {
+            // An absolute redirect may point at another host, and following
+            // it means opening a connection to somewhere the caller did not
+            // name and did not supply roots for. That is the caller's
+            // decision, so the response is handed back as it is.
+            return reply
+        }
+        target = location
+        followed = followed + 1
+    }
+    fail(TooManyRedirects(most))
+}
+
+/// Whether a status is one a client should follow.
+pub fn is_redirect(status: i64) -> bool {
+    return status == 301 or status == 302 or status == 303 or
+    status == 307 or status == 308
+}
+
+/// The method to use after a redirect.
+///
+/// A 301, 302 or 303 in answer to a POST becomes a GET and the body is
+/// dropped — which every browser does, which the specification came to
+/// permit after the fact, and which is what stops a redirect being a way to
+/// replay a request body somewhere else. 307 and 308 exist precisely to say
+/// "do not do that".
+pub fn method_after(status: i64, method: str) -> str {
+    if status == 307 or status == 308 {
+        return method
+    }
+    if method == "HEAD" {
+        return "HEAD"
+    }
+    return "GET"
+}

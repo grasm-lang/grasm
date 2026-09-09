@@ -1,0 +1,395 @@
+// AWS Signature Version 4: the signature on every request to every AWS
+// service.
+//
+// Nothing reaches AWS unsigned. The signature covers the method, the path,
+// the query, a chosen set of headers and a hash of the body, so a proxy
+// cannot add a header or change a parameter without invalidating it — which
+// is the difference between this and a bearer token, where anything holding
+// the token can send anything.
+//
+// ## Four steps, and the one everybody gets wrong
+//
+//   1. The canonical request: the method, the path, the query and the
+//      headers, each written in exactly one way so that both sides agree
+//      on the bytes.
+//   2. The string to sign: the algorithm, the timestamp, the scope, and a
+//      hash of the canonical request.
+//   3. The signing key: HMAC applied four times, over the date, the region,
+//      the service and a fixed terminator. The secret never touches the
+//      request; what signs it is a key derived for that day, that region and
+//      that service, so a signature captured from one cannot be replayed
+//      against another.
+//   4. The signature, and the `Authorization` header that carries it.
+//
+// Step 1 is where implementations disagree. The path is percent-encoded
+// *twice* for every service except S3, the query must be sorted by name and
+// then by value after encoding rather than before, and a header's value has
+// its internal runs of spaces collapsed to one. Get any of those wrong and
+// the server returns a signature mismatch with no indication of which part.
+//
+// ## Why it is a pure function
+//
+// The timestamp is an argument. A signer that reads the clock cannot be
+// tested against a published vector, and the vectors are the only way to
+// know it is right — the failure mode is a 403 with a message that names
+// nothing.
+
+import crypto_hash
+
+type SigError =
+    | BadTimestamp(text: str)
+    | MissingHeader(name: str)
+    | BadRegion(text: str)
+    | NotCanonical(why: str)
+
+    /// A request, in the form the signer needs it.
+type Signed = {
+    method: str,
+    /// The path, already URI-decoded; the signer encodes it.
+    path: str,
+    /// Query parameters, in any order.
+    query: [(str, str)],
+    /// Headers, in any order and any case.
+    headers: [(str, str)],
+    /// The body, which is hashed rather than signed directly.
+    payload: bytes,
+}
+
+/// What the signing produced, so each step can be checked on its own.
+type Canonical = {
+    canonical_request: str,
+    string_to_sign: str,
+    signature: str,
+    authorization: str,
+    signed_headers: str,
+    scope: str,
+}
+
+/// The unreserved set: everything else is percent-encoded.
+fn is_unreserved(code: i64) -> bool {
+    return (code >= 65 and code <= 90) or (code >= 97 and code <= 122) or
+    (code >= 48 and code <= 57) or code == 45 or code == 46 or
+    code == 95 or code == 126
+}
+
+/// Percent-encoding, over the UTF-8 octets.
+///
+/// `encode_slash` is false for a path, where `/` separates segments and
+/// stays as it is, and true everywhere else.
+pub fn encode(text: str, encode_slash: bool) -> str {
+    let digits = "0123456789ABCDEF"
+    let octets = text.to_bytes()
+    var out = ""
+    var i = 0
+    while i < octets.len() {
+        let octet = octets.at(i)
+        if is_unreserved(octet) or (octet == 47 and not encode_slash) {
+            out = out + octet.to_char()
+        } else {
+            out = out + "%" + digits.substr(octet / 16, 1) +
+            digits.substr(octet % 16, 1)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+/// The canonical URI.
+///
+/// Encoded twice for every service but S3, because the server decodes once
+/// on its way in and signs what is left. S3 signs the path as sent, which is
+/// why an object whose name contains a `+` is the classic S3 signing bug.
+pub fn canonical_uri(path: str, double_encode: bool) -> str {
+    if path == "" {
+        return "/"
+    }
+    var normalised = path
+    if double_encode {
+        normalised = normalise_path(path)
+    }
+    let once = encode(normalised, false)
+    if double_encode {
+        return encode(once, false)
+    }
+    return once
+}
+
+/// RFC 3986 path normalisation: `.` segments removed, `..` segments pop.
+///
+/// Applied for every service but S3, because the server normalises before
+/// it verifies. S3 does not, which is how an object literally named `../x`
+/// is addressable there and nowhere else.
+pub fn normalise_path(path: str) -> str {
+    var out: [str] = []
+    for segment in path.split("/") {
+        if segment == "" or segment == "." {
+            continue
+        }
+        if segment == ".." {
+            if out.len() > 0 {
+                out.pop()
+            }
+            continue
+        }
+        out.push(segment)
+    }
+    var text = ""
+    for segment in out {
+        text = text + "/" + segment
+    }
+    if text == "" {
+        return "/"
+    }
+    if path.ends_with("/") {
+        return text + "/"
+    }
+    return text
+}
+
+/// The canonical query string: encoded, then sorted by name and value.
+///
+/// Sorted *after* encoding, which is the order the bytes come in rather than
+/// the order the characters do — and the two differ wherever a name contains
+/// a character that encodes to a higher byte than its neighbour.
+pub fn canonical_query(query: [(str, str)]) -> str {
+    var pairs: [(str, str)] = []
+    for pair in query {
+        pairs.push((encode(pair.0, true), encode(pair.1, true)))
+    }
+    // Sorted by name and *then* by value, not by the joined `name=value`
+    // string: `A` sorts before `A9`, but `A=x` sorts after `A9=y` because
+    // `9` is a lower byte than `=`. Sorting the joined form is the natural
+    // thing to write and produces a signature the server rejects with no
+    // indication of why.
+    var i = 1
+    while i < pairs.len() {
+        let value = pairs[i]
+        var j = i - 1
+        while j >= 0 and after_in_order(pairs[j], value) {
+            pairs[j + 1] = pairs[j]
+            j = j - 1
+        }
+        pairs[j + 1] = value
+        i = i + 1
+    }
+    var out = ""
+    var k = 0
+    while k < pairs.len() {
+        if k > 0 {
+            out = out + "&"
+        }
+        out = out + pairs[k].0 + "=" + pairs[k].1
+        k = k + 1
+    }
+    return out
+}
+
+fn after_in_order(left: (str, str), right: (str, str)) -> bool {
+    if left.0 != right.0 {
+        return left.0 > right.0
+    }
+    return left.1 > right.1
+}
+
+fn sorted_strings(values: [str]) -> [str] {
+    var out = values
+    var i = 1
+    while i < out.len() {
+        let value = out[i]
+        var j = i - 1
+        while j >= 0 and out[j] > value {
+            out[j + 1] = out[j]
+            j = j - 1
+        }
+        out[j + 1] = value
+        i = i + 1
+    }
+    return out
+}
+
+/// A header value with its ends trimmed and its internal runs of spaces
+/// collapsed to one.
+///
+/// Collapsed because HTTP allows a header to be folded across lines and
+/// re-joined with any amount of space, so two proxies can deliver the same
+/// value with different whitespace. Signing the collapsed form is what makes
+/// the signature survive that.
+pub fn trim_value(value: str) -> str {
+    var out = ""
+    var last_space = false
+    var started = false
+    for code in value.trim().codes() {
+        if code == 32 or code == 9 {
+            last_space = true
+        } else {
+            if last_space and started {
+                out = out + " "
+            }
+            out = out + code.to_char()
+            last_space = false
+            started = true
+        }
+    }
+    return out
+}
+
+/// The headers, lower-cased, trimmed and sorted, and the list of their
+/// names.
+pub fn canonical_headers(headers: [(str, str)]) -> (str, str) {
+    var lines: [str] = []
+    var names: [str] = []
+    for header in headers {
+        let name = header.0.to_lower()
+        lines.push(name + ":" + trim_value(header.1))
+        names.push(name)
+    }
+    let sorted_lines = sorted_strings(lines)
+    let sorted_names = sorted_strings(names)
+    var block = ""
+    for line in sorted_lines {
+        block = block + line + "\n"
+    }
+    var signed = ""
+    var i = 0
+    while i < sorted_names.len() {
+        if i > 0 {
+            signed = signed + ";"
+        }
+        signed = signed + sorted_names[i]
+        i = i + 1
+    }
+    return (block, signed)
+}
+
+/// The hexadecimal SHA-256 of some bytes, which is how AWS writes every
+/// hash in this protocol.
+pub fn hex_hash(data: bytes) -> str {
+    return crypto_hash.hex_of(crypto_hash.sha256_of(data))
+}
+
+/// The hash of a payload nobody wants to read twice.
+///
+/// A streaming upload cannot be hashed before it is sent, so the literal
+/// `UNSIGNED-PAYLOAD` stands in — which means the body is not covered by the
+/// signature at all, and is accepted only over TLS for exactly that reason.
+pub fn unsigned_payload() -> str {
+    return "UNSIGNED-PAYLOAD"
+}
+
+/// The canonical request: six lines, and the shape everything else hangs
+/// off.
+pub fn canonical_request(request: Signed, payload_hash: str,
+    double_encode: bool) -> (str, str) {
+    let headers = canonical_headers(request.headers)
+    let text = request.method + "\n" +
+    canonical_uri(request.path, double_encode) + "\n" +
+    canonical_query(request.query) + "\n" + headers.0 + "\n" +
+    headers.1 + "\n" + payload_hash
+    return (text, headers.1)
+}
+
+/// The scope a signature is valid in: one day, one region, one service.
+pub fn scope_of(timestamp: str, region: str, service: str) -> str {
+    return timestamp.substr(0, 8) + "/" + region + "/" + service +
+    "/aws4_request"
+}
+
+/// The string that is actually signed.
+pub fn string_to_sign(timestamp: str, region: str, service: str,
+    canonical: str) -> str {
+    return "AWS4-HMAC-SHA256\n" + timestamp + "\n" +
+    scope_of(timestamp, region, service) + "\n" +
+    hex_hash(canonical.to_bytes())
+}
+
+/// The signing key: four HMACs, none of them reversible to the secret.
+///
+/// A key derived this way is useless outside its day, its region and its
+/// service, so a signature scraped from a log gives an attacker one day of
+/// one service in one region rather than the account.
+pub fn signing_key(secret: str, timestamp: str, region: str,
+    service: str) -> bytes {
+    let date = crypto_hash.hmac_sha256(("AWS4" + secret).to_bytes(),
+        timestamp.substr(0, 8).to_bytes())
+    let regional = crypto_hash.hmac_sha256(date, region.to_bytes())
+    let serviced = crypto_hash.hmac_sha256(regional, service.to_bytes())
+    return crypto_hash.hmac_sha256(serviced, "aws4_request".to_bytes())
+}
+
+/// Sign a request, returning every intermediate so each can be checked.
+pub fn sign(request: Signed, key_id: str, secret: str, timestamp: str,
+    region: str, service: str,
+    double_encode: bool) -> Canonical ! SigError {
+    if timestamp.len() != 16 or timestamp.substr(8, 1) != "T" {
+        fail(BadTimestamp(timestamp))
+    }
+    if region == "" {
+        fail(BadRegion(region))
+    }
+    let payload_hash = hex_hash(request.payload)
+    let canonical = canonical_request(request, payload_hash, double_encode)
+    let to_sign = string_to_sign(timestamp, region, service, canonical.0)
+    let signature = crypto_hash.hex_of(crypto_hash.hmac_sha256(
+        signing_key(secret, timestamp, region, service),
+        to_sign.to_bytes()))
+    let scope = scope_of(timestamp, region, service)
+    return Canonical{ canonical_request: canonical.0,
+        string_to_sign: to_sign, signature: signature,
+        authorization: "AWS4-HMAC-SHA256 Credential=" + key_id + "/" +
+        scope + ", SignedHeaders=" + canonical.1 + ", Signature=" +
+        signature, signed_headers: canonical.1, scope: scope }
+}
+
+/// The query parameters a presigned URL carries.
+///
+/// A presigned URL puts the signature in the query rather than a header, so
+/// it can be handed to something that cannot set headers — a browser, a
+/// `curl` in somebody's runbook. The cost is that the URL *is* the
+/// credential: it works for anyone who has it, until it expires.
+pub fn presign_query(key_id: str, timestamp: str, region: str,
+    service: str, seconds: i64,
+    signed_headers: str) -> [(str, str)] ! SigError {
+    if seconds < 1 or seconds > 604800 {
+        // Seven days is the ceiling AWS enforces, and a URL good for seven
+        // days is a credential in a chat log.
+        fail(BadTimestamp("{seconds}"))
+    }
+    return [("X-Amz-Algorithm", "AWS4-HMAC-SHA256"),
+        ("X-Amz-Credential", key_id + "/" +
+            scope_of(timestamp, region, service)),
+        ("X-Amz-Date", timestamp), ("X-Amz-Expires", "{seconds}"),
+        ("X-Amz-SignedHeaders", signed_headers)]
+}
+
+/// Sign a request as a presigned URL: the parameters go in the query and
+/// the payload is not covered.
+pub fn presign(request: Signed, key_id: str, secret: str, timestamp: str,
+    region: str, service: str, seconds: i64,
+    double_encode: bool) -> Canonical ! SigError {
+    let headers = canonical_headers(request.headers)
+    var query = request.query
+    for extra in try presign_query(key_id, timestamp, region, service,
+        seconds, headers.1) {
+        query.push(extra)
+    }
+    let with_query = Signed{ method: request.method, path: request.path,
+        query: query, headers: request.headers, payload: request.payload }
+    let canonical = canonical_request(with_query, unsigned_payload(),
+        double_encode)
+    let to_sign = string_to_sign(timestamp, region, service, canonical.0)
+    let signature = crypto_hash.hex_of(crypto_hash.hmac_sha256(
+        signing_key(secret, timestamp, region, service),
+        to_sign.to_bytes()))
+    return Canonical{ canonical_request: canonical.0,
+        string_to_sign: to_sign, signature: signature,
+        authorization: canonical_query(query) + "&X-Amz-Signature=" +
+        signature, signed_headers: canonical.1,
+        scope: scope_of(timestamp, region, service) }
+}
+
+/// Whether a service signs its path once or twice.
+///
+/// S3 is the exception, and it is the one everybody meets first.
+pub fn double_encodes(service: str) -> bool {
+    return service != "s3"
+}

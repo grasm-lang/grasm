@@ -1,0 +1,8 @@
+[package]
+name = "httpsdiff"
+version = "0.1.0"
+capabilities = ["net", "io"]
+
+[dependencies.https_client]
+path = "../https_client"
+version = "^1.0.0"

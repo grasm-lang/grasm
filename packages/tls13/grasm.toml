@@ -17,3 +17,7 @@ version = "^1.0.0"
 [dependencies.aes]
 path = "../aes"
 version = "^1.0.0"
+
+[dependencies.chachapoly]
+path = "../chachapoly"
+version = "^1.0.0"

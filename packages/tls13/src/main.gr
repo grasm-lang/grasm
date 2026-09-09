@@ -35,6 +35,7 @@
 import crypto_hash
 import hkdf
 import aes
+import chachapoly
 
 fn hash_length() -> i64 { 32 }
 
@@ -122,9 +123,31 @@ type TrafficKeys = {
 /// which is what makes every record's nonce different without either side
 /// sending one.
 pub fn traffic_keys(secret: bytes) -> TrafficKeys {
+    traffic_keys_for(secret, suite_aes_128_gcm())
+}
+
+/// The two cipher suites this record layer implements.
+///
+/// Both use SHA-256, so the key schedule above is the same for either; only
+/// the key length and the AEAD differ.
+pub fn suite_aes_128_gcm() -> i64 { 4865 }
+
+pub fn suite_chacha20_poly1305() -> i64 { 4867 }
+
+/// The keys a traffic secret produces for a named suite.
+///
+/// Sixteen bytes of key for AES-128-GCM and thirty-two for
+/// ChaCha20-Poly1305; twelve of IV for both. A client that derives sixteen
+/// and then encrypts with ChaCha20 gets a key that is half zeros and a
+/// connection that fails on the first record.
+pub fn traffic_keys_for(secret: bytes, suite: i64) -> TrafficKeys {
+    var length = 16
+    if suite == suite_chacha20_poly1305() {
+        length = 32
+    }
     TrafficKeys{
         secret: secret,
-        key: expand_label(secret, "key", bytes_of([]), 16),
+        key: expand_label(secret, "key", bytes_of([]), length),
         iv: expand_label(secret, "iv", bytes_of([]), 12),
     }
 }
@@ -187,6 +210,13 @@ fn max_record() -> i64 { 16640 }
 /// altered without the tag failing.
 pub fn seal_record(k: TrafficKeys, sequence: i64, content_type: i64,
     plaintext: bytes) -> bytes ! RecordError {
+    try seal_record_with(k, sequence, content_type, plaintext,
+        suite_aes_128_gcm())
+}
+
+/// The same, for a named suite.
+pub fn seal_record_with(k: TrafficKeys, sequence: i64, content_type: i64,
+    plaintext: bytes, suite: i64) -> bytes ! RecordError {
     var inner = plaintext.to_list()
     inner.push(content_type)
     let length = inner.len() + 16
@@ -194,8 +224,14 @@ pub fn seal_record(k: TrafficKeys, sequence: i64, content_type: i64,
         fail(Overlong(length))
     }
     var header: [i64] = [23, 3, 3, length.ushr(8).bit_and(255), length.bit_and(255)]
-    let sealed = aes.gcm_seal(k.key, record_nonce(k.iv, sequence),
-        bytes_of(header), bytes_of(inner))
+    var sealed = bytes_of([])
+    if suite == suite_chacha20_poly1305() {
+        sealed = chachapoly.seal_combined(k.key, record_nonce(k.iv, sequence),
+            bytes_of(header), bytes_of(inner))
+    } else {
+        sealed = aes.gcm_seal(k.key, record_nonce(k.iv, sequence),
+            bytes_of(header), bytes_of(inner))
+    }
     var out = header
     for b in sealed.to_list() {
         out.push(b)
@@ -205,6 +241,12 @@ pub fn seal_record(k: TrafficKeys, sequence: i64, content_type: i64,
 
 /// Open one record, answering the content type and the plaintext.
 pub fn open_record(k: TrafficKeys, sequence: i64, record: bytes) -> (i64, bytes) ! RecordError {
+    try open_record_with(k, sequence, record, suite_aes_128_gcm())
+}
+
+/// The same, for a named suite.
+pub fn open_record_with(k: TrafficKeys, sequence: i64, record: bytes,
+    suite: i64) -> (i64, bytes) ! RecordError {
     if record.len() < 22 {
         fail(TooShort(record.len()))
     }
@@ -214,10 +256,20 @@ pub fn open_record(k: TrafficKeys, sequence: i64, record: bytes) -> (i64, bytes)
     }
     let header = record.slice(0, 5)
     let body = record.slice(5, 5 + length)
-    let inner = match aes.gcm_open(k.key, record_nonce(k.iv, sequence), header, body) {
-        Ok(b) -> b
-        Err(_e) -> fail(NotAuthentic)
+    var opened = bytes_of([])
+    if suite == suite_chacha20_poly1305() {
+        opened = match chachapoly.open_combined(k.key,
+            record_nonce(k.iv, sequence), header, body) {
+            Ok(b) -> b
+            Err(_e) -> fail(NotAuthentic)
+        }
+    } else {
+        opened = match aes.gcm_open(k.key, record_nonce(k.iv, sequence), header, body) {
+            Ok(b) -> b
+            Err(_e) -> fail(NotAuthentic)
+        }
     }
+    let inner = opened
     // Trailing zeros are padding and are stripped from the end; the last
     // non-zero byte is the real content type. A record that is all padding has
     // no type and is refused rather than guessed at.
