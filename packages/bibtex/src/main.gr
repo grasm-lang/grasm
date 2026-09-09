@@ -1,0 +1,396 @@
+// BibTeX, the bibliography format every academic tool reads.
+//
+//   @article{Cesar2013,
+//     author = {Jean César and Ann {O'Neill}},
+//     title  = {An amazing {Title} with, a comma},
+//     journal = jcp # " Letters",
+//     year = 2013
+//   }
+//
+// ## Braces are the whole difficulty
+//
+// A value delimited by braces may contain braces, nested to any depth, and
+// the commas and quotation marks inside them are ordinary text. So a field
+// cannot be found by splitting on commas, and the outer braces are
+// delimiters while the inner ones are *content* — `{Title}` inside a title
+// is BibTeX's way of saying "do not change this capitalisation", and a
+// reader that strips all the braces has changed the meaning.
+//
+// ## Values can be concatenated, and names can stand for values
+//
+// `jcp # " Letters"` is a `@string` abbreviation joined to a literal. The
+// abbreviations are defined in the file, so a reader that ignores
+// `@string` produces a journal called `jcp`.
+//
+// ## What is not here
+//
+// LaTeX. `\'{e}` is left exactly as written: turning it into `é` is a
+// different job with its own table, and doing it inside the parser would
+// make the round trip lossy.
+
+type BibError =
+    | Unbalanced(at: i64)
+    | NoKey(at: i64)
+    | BadEntry(at: i64)
+
+    /// One field of an entry.
+type BibField = {
+    /// Lower-cased, since BibTeX does not distinguish.
+    name: str,
+    value: str,
+}
+
+/// One entry.
+type BibEntry = {
+    /// `article`, `book` and so on, lower-cased.
+    kind: str,
+    key: str,
+    fields: [BibField],
+}
+
+/// A whole file.
+type BibFile = {
+    entries: [BibEntry],
+    /// The `@string` abbreviations, in the order they were defined.
+    strings: [BibField],
+    preamble: str,
+}
+
+fn is_space(character: str) -> bool {
+    return character == " " or character == "\t" or character == "\n" or
+    character == "\r"
+}
+
+fn is_name_char(character: str) -> bool {
+    let byte = character.to_bytes().at(0)
+    if (byte >= 65 and byte <= 90) or (byte >= 97 and byte <= 122) or
+    (byte >= 48 and byte <= 57) {
+        return true
+    }
+    return character == "-" or character == "_" or character == "." or
+    character == ":" or character == "+" or character == "/" or
+    character == "*" or character == "'"
+}
+
+/// Where the parser is.
+type BibReader = {
+    text: str,
+    at: i64,
+}
+
+fn skip_space(inout reader: BibReader) {
+    while reader.at < reader.text.len() and
+    is_space(reader.text.substr(reader.at, 1)) {
+        reader.at = reader.at + 1
+    }
+}
+
+fn peek(reader: BibReader) -> str {
+    if reader.at >= reader.text.len() {
+        return ""
+    }
+    return reader.text.substr(reader.at, 1)
+}
+
+fn read_name(inout reader: BibReader) -> str {
+    var out = ""
+    while reader.at < reader.text.len() and
+    is_name_char(reader.text.substr(reader.at, 1)) {
+        out = out + reader.text.substr(reader.at, 1)
+        reader.at = reader.at + 1
+    }
+    return out
+}
+
+/// A brace-delimited run, keeping every brace inside it.
+fn read_braced(inout reader: BibReader) -> str ! BibError {
+    let start = reader.at
+    reader.at = reader.at + 1
+    var depth = 1
+    var out = ""
+    while reader.at < reader.text.len() {
+        let here = reader.text.substr(reader.at, 1)
+        if here == "\{" {
+            depth = depth + 1
+        } else if here == "}" {
+            depth = depth - 1
+            if depth == 0 {
+                reader.at = reader.at + 1
+                return out
+            }
+        }
+        out = out + here
+        reader.at = reader.at + 1
+    }
+    fail(Unbalanced(start))
+}
+
+/// A quoted run. Braces inside it still nest, so a quotation mark inside
+/// braces does not end it.
+fn read_quoted(inout reader: BibReader) -> str ! BibError {
+    let start = reader.at
+    reader.at = reader.at + 1
+    var depth = 0
+    var out = ""
+    while reader.at < reader.text.len() {
+        let here = reader.text.substr(reader.at, 1)
+        if here == "\{" {
+            depth = depth + 1
+        } else if here == "}" {
+            depth = depth - 1
+        } else if here == "\"" and depth == 0 {
+            reader.at = reader.at + 1
+            return out
+        }
+        out = out + here
+        reader.at = reader.at + 1
+    }
+    fail(Unbalanced(start))
+}
+
+/// One value, which may be several pieces joined with `#`.
+fn read_value(inout reader: BibReader,
+    strings: [BibField]) -> str ! BibError {
+    var out = ""
+    var going = true
+    while going {
+        skip_space(reader)
+        let here = peek(reader)
+        if here == "\{" {
+            out = out + try read_braced(reader)
+        } else if here == "\"" {
+            out = out + try read_quoted(reader)
+        } else {
+            let name = read_name(reader)
+            if name.len() == 0 {
+                fail(BadEntry(reader.at))
+            }
+            out = out + expand(name, strings)
+        }
+        skip_space(reader)
+        if peek(reader) == "#" {
+            reader.at = reader.at + 1
+        } else {
+            going = false
+        }
+    }
+    return out
+}
+
+/// An abbreviation's value, or the name itself when it is a number or is
+/// not defined.
+fn expand(name: str, strings: [BibField]) -> str {
+    for one in strings {
+        if one.name == name.to_lower() {
+            return one.value
+        }
+    }
+    return name
+}
+
+/// Read a file.
+pub fn parse(text: str) -> BibFile ! BibError {
+    var reader = BibReader{ text: text, at: 0 }
+    var out = BibFile{ entries: [], strings: month_strings(),
+        preamble: "" }
+    while reader.at < reader.text.len() {
+        // Anything outside an entry is a comment, which is how a `.bib`
+        // file carries prose without a tag for it.
+        while reader.at < reader.text.len() and peek(reader) != "@" {
+            reader.at = reader.at + 1
+        }
+        if reader.at >= reader.text.len() {
+            return out
+        }
+        reader.at = reader.at + 1
+        skip_space(reader)
+        let kind = read_name(reader).to_lower()
+        skip_space(reader)
+        let opener = peek(reader)
+        if opener != "\{" and opener != "(" {
+            continue
+        }
+        let closer = if opener == "\{" { "\}" } else { ")" }
+        reader.at = reader.at + 1
+        if kind == "comment" {
+            try skip_body(reader, closer)
+            continue
+        }
+        if kind == "preamble" {
+            out.preamble = out.preamble + try read_value(reader,
+                out.strings)
+            skip_space(reader)
+            if peek(reader) == closer {
+                reader.at = reader.at + 1
+            }
+            continue
+        }
+        if kind == "string" {
+            skip_space(reader)
+            let name = read_name(reader).to_lower()
+            skip_space(reader)
+            if peek(reader) == "=" {
+                reader.at = reader.at + 1
+                let value = try read_value(reader, out.strings)
+                out.strings.push(BibField{ name: name, value: value })
+            }
+            skip_space(reader)
+            if peek(reader) == closer {
+                reader.at = reader.at + 1
+            }
+            continue
+        }
+        out.entries.push(try read_entry(reader, kind, closer,
+            out.strings))
+    }
+    return out
+}
+
+/// The twelve month abbreviations every BibTeX style defines.
+fn month_strings() -> [BibField] {
+    let names = ["January", "February", "March", "April", "May", "June",
+        "July", "August", "September", "October", "November", "December"]
+    let keys = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug",
+        "sep", "oct", "nov", "dec"]
+    var out: [BibField] = []
+    var i = 0
+    while i < 12 {
+        out.push(BibField{ name: keys[i], value: names[i] })
+        i = i + 1
+    }
+    return out
+}
+
+fn skip_body(inout reader: BibReader, closer: str) -> bool ! BibError {
+    var depth = 1
+    while reader.at < reader.text.len() {
+        let here = reader.text.substr(reader.at, 1)
+        if here == "\{" or here == "(" {
+            depth = depth + 1
+        } else if here == closer {
+            depth = depth - 1
+            if depth == 0 {
+                reader.at = reader.at + 1
+                return true
+            }
+        }
+        reader.at = reader.at + 1
+    }
+    fail(Unbalanced(reader.at))
+}
+
+fn read_entry(inout reader: BibReader, kind: str, closer: str,
+    strings: [BibField]) -> BibEntry ! BibError {
+    skip_space(reader)
+    let key = read_name(reader)
+    if key.len() == 0 {
+        fail(NoKey(reader.at))
+    }
+    var fields: [BibField] = []
+    skip_space(reader)
+    while peek(reader) == "," {
+        reader.at = reader.at + 1
+        skip_space(reader)
+        if peek(reader) == closer {
+            break
+        }
+        let name = read_name(reader).to_lower()
+        if name.len() == 0 {
+            break
+        }
+        skip_space(reader)
+        if peek(reader) != "=" {
+            fail(BadEntry(reader.at))
+        }
+        reader.at = reader.at + 1
+        fields.push(BibField{ name: name,
+            value: try read_value(reader, strings) })
+        skip_space(reader)
+    }
+    if peek(reader) == closer {
+        reader.at = reader.at + 1
+    }
+    return BibEntry{ kind: kind, key: key, fields: fields }
+}
+
+/// A field's value, or the empty string.
+pub fn field(entry: BibEntry, name: str) -> str {
+    for one in entry.fields {
+        if one.name == name.to_lower() {
+            return one.value
+        }
+    }
+    return ""
+}
+
+/// An entry by key.
+pub fn entry(file: BibFile, key: str) -> Option[BibEntry] {
+    for one in file.entries {
+        if one.key == key {
+            return Some(one)
+        }
+    }
+    return None
+}
+
+/// The authors of an entry, split on the ` and ` that separates them.
+///
+/// Only an `and` outside braces separates: `{Barnes and Noble}` is one
+/// publisher, and a split on the word alone makes it two authors.
+pub fn authors(entry: BibEntry) -> [str] {
+    var out: [str] = []
+    let value = field(entry, "author")
+    var current = ""
+    var depth = 0
+    var i = 0
+    while i < value.len() {
+        let here = value.substr(i, 1)
+        if here == "\{" {
+            depth = depth + 1
+        } else if here == "}" {
+            depth = depth - 1
+        }
+        if depth == 0 and i + 5 <= value.len() and
+        value.substr(i, 5) == " and " {
+            out.push(current.trim())
+            current = ""
+            i = i + 5
+            continue
+        }
+        current = current + here
+        i = i + 1
+    }
+    if current.trim().len() > 0 {
+        out.push(current.trim())
+    }
+    return out
+}
+
+/// The fields a style requires for an entry type, and which are missing.
+///
+/// The lists are BibTeX's own, and they are the reason half the entries in
+/// a shared bibliography do not format: a missing `year` on an `article`
+/// is silently dropped by some styles and printed as `??` by others.
+pub fn missing_fields(entry: BibEntry) -> [str] {
+    var required: [str] = []
+    if entry.kind == "article" {
+        required = ["author", "title", "journal", "year"]
+    } else if entry.kind == "book" {
+        required = ["title", "publisher", "year"]
+    } else if entry.kind == "inproceedings" {
+        required = ["author", "title", "booktitle", "year"]
+    } else if entry.kind == "techreport" {
+        required = ["author", "title", "institution", "year"]
+    } else if entry.kind == "phdthesis" or entry.kind == "mastersthesis" {
+        required = ["author", "title", "school", "year"]
+    } else {
+        return []
+    }
+    var out: [str] = []
+    for name in required {
+        if field(entry, name).len() == 0 {
+            out.push(name)
+        }
+    }
+    return out
+}

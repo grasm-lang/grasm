@@ -1,0 +1,312 @@
+// Subtitles: SubRip and WebVTT, which are almost the same format.
+//
+//   SRT          1                      WebVTT   WEBVTT
+//                00:00:01,000 --> 00:00:04,000            00:00:01.000 --> 00:00:04.000
+//                Hello there                              Hello there
+//
+// The differences are small and every one of them breaks a converter that
+// treats them as the same:
+//
+//   - **The decimal separator.** SRT writes a comma and WebVTT a full
+//     stop. A file with the wrong one is refused by players rather than
+//     tolerated.
+//   - **The hours are optional in WebVTT** and required in SRT, so
+//     `01:30.000` is a minute and a half in one and nothing in the other.
+//   - **WebVTT cues carry settings** after the timestamps — `align:start
+//     position:10%` — which an SRT reader would take for subtitle text.
+//   - **SRT is numbered** and WebVTT cue identifiers are optional and need
+//     not be numbers.
+//
+// ## Times are milliseconds
+//
+// Not floats and not a string: comparing, sorting and shifting are all
+// arithmetic, and a converter that keeps the text and re-formats it loses
+// nothing only because it never does arithmetic at all.
+
+type SubtitleError =
+    | BadTime(text: str)
+    | NoArrow(line: i64)
+    | NoHeader()
+    | OutOfOrder(index: i64)
+
+    /// One cue.
+type Cue = {
+    /// The SRT number, or the WebVTT identifier, or the empty string.
+    id: str,
+    /// Milliseconds from the start of the media.
+    start: i64,
+    end: i64,
+    /// The cue's lines, joined with newlines.
+    text: str,
+    /// WebVTT settings, as written. Empty for SRT.
+    settings: str,
+}
+
+fn is_digit(character: str) -> bool {
+    let byte = character.to_bytes().at(0)
+    return byte >= 48 and byte <= 57
+}
+
+/// Read a timestamp in either dialect.
+///
+/// `HH:MM:SS,mmm`, `HH:MM:SS.mmm` or `MM:SS.mmm`. The separator is
+/// accepted either way here, and `render_srt` and `render_vtt` write the
+/// right one — a reader that insisted would refuse half the files in the
+/// world, and a writer that guessed would produce files players refuse.
+pub fn parse_time(text: str) -> i64 ! SubtitleError {
+    var parts: [str] = []
+    var current = ""
+    var i = 0
+    while i < text.len() {
+        let here = text.substr(i, 1)
+        if here == ":" or here == "," or here == "." {
+            parts.push(current)
+            current = ""
+        } else if is_digit(here) {
+            current = current + here
+        } else {
+            fail(BadTime(text))
+        }
+        i = i + 1
+    }
+    parts.push(current)
+    if parts.len() < 3 or parts.len() > 4 {
+        fail(BadTime(text))
+    }
+    var hours = 0
+    var at = 0
+    if parts.len() == 4 {
+        hours = parts[0].parse_int() ?? 0 - 1
+        at = 1
+    }
+    let minutes = parts[at].parse_int() ?? 0 - 1
+    let seconds = parts[at + 1].parse_int() ?? 0 - 1
+    var fraction = parts[at + 2]
+    if fraction.len() != 3 {
+        fail(BadTime(text))
+    }
+    let millis = fraction.parse_int() ?? 0 - 1
+    if hours < 0 or minutes < 0 or minutes > 59 or seconds < 0 or
+    seconds > 59 or millis < 0 {
+        fail(BadTime(text))
+    }
+    return ((hours * 60 + minutes) * 60 + seconds) * 1000 + millis
+}
+
+fn two(value: i64) -> str {
+    if value < 10 {
+        return "0{value}"
+    }
+    return "{value}"
+}
+
+fn three(value: i64) -> str {
+    if value < 10 {
+        return "00{value}"
+    }
+    if value < 100 {
+        return "0{value}"
+    }
+    return "{value}"
+}
+
+/// A timestamp written out, with the separator a format wants.
+pub fn render_time(millis: i64, separator: str) -> str {
+    let hours = millis / 3600000
+    let minutes = millis % 3600000 / 60000
+    let seconds = millis % 60000 / 1000
+    return two(hours) + ":" + two(minutes) + ":" + two(seconds) +
+    separator + three(millis % 1000)
+}
+
+fn split_lines(text: str) -> [str] {
+    var out: [str] = []
+    for raw in text.split("\n") {
+        if raw.ends_with("\r") {
+            out.push(raw.substr(0, raw.len() - 1))
+        } else {
+            out.push(raw)
+        }
+    }
+    return out
+}
+
+fn arrow_at(line: str) -> i64 {
+    var i = 0
+    while i + 3 <= line.len() {
+        if line.substr(i, 3) == "-->" {
+            return i
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+/// Read a SubRip file.
+pub fn parse_srt(text: str) -> [Cue] ! SubtitleError {
+    var out: [Cue] = []
+    let lines = split_lines(text)
+    var i = 0
+    var number = 0
+    while i < lines.len() {
+        while i < lines.len() and lines[i].trim().len() == 0 {
+            i = i + 1
+        }
+        if i >= lines.len() {
+            return out
+        }
+        var id = ""
+        if arrow_at(lines[i]) < 0 {
+            id = lines[i].trim()
+            i = i + 1
+        }
+        if i >= lines.len() or arrow_at(lines[i]) < 0 {
+            fail(NoArrow(i))
+        }
+        let at = arrow_at(lines[i])
+        let start = try parse_time(lines[i].substr(0, at).trim())
+        let end = try parse_time(lines[i].substr(at + 3,
+            lines[i].len() - at - 3).trim())
+        i = i + 1
+        var body: [str] = []
+        while i < lines.len() and lines[i].trim().len() > 0 {
+            body.push(lines[i])
+            i = i + 1
+        }
+        number = number + 1
+        out.push(Cue{ id: id, start: start, end: end,
+            text: body.join("\n"), settings: "" })
+    }
+    return out
+}
+
+/// Read a WebVTT file.
+pub fn parse_vtt(text: str) -> [Cue] ! SubtitleError {
+    let lines = split_lines(text)
+    if lines.len() == 0 or not lines[0].starts_with("WEBVTT") {
+        fail(NoHeader())
+    }
+    var out: [Cue] = []
+    var i = 1
+    while i < lines.len() {
+        while i < lines.len() and lines[i].trim().len() == 0 {
+            i = i + 1
+        }
+        if i >= lines.len() {
+            return out
+        }
+        // A block that is not a cue — NOTE, STYLE, REGION — is skipped
+        // whole, and a comment may run over several lines.
+        if lines[i].starts_with("NOTE") or
+        lines[i].starts_with("STYLE") or
+        lines[i].starts_with("REGION") {
+            while i < lines.len() and lines[i].trim().len() > 0 {
+                i = i + 1
+            }
+            continue
+        }
+        var id = ""
+        if arrow_at(lines[i]) < 0 {
+            id = lines[i].trim()
+            i = i + 1
+        }
+        if i >= lines.len() or arrow_at(lines[i]) < 0 {
+            fail(NoArrow(i))
+        }
+        let at = arrow_at(lines[i])
+        let start = try parse_time(lines[i].substr(0, at).trim())
+        let rest = lines[i].substr(at + 3, lines[i].len() - at - 3).trim()
+        var stamp = rest
+        var settings = ""
+        var j = 0
+        while j < rest.len() {
+            if rest.substr(j, 1) == " " {
+                stamp = rest.substr(0, j)
+                settings = rest.substr(j + 1, rest.len() - j - 1).trim()
+                j = rest.len()
+            } else {
+                j = j + 1
+            }
+        }
+        let end = try parse_time(stamp)
+        i = i + 1
+        var body: [str] = []
+        while i < lines.len() and lines[i].trim().len() > 0 {
+            body.push(lines[i])
+            i = i + 1
+        }
+        out.push(Cue{ id: id, start: start, end: end,
+            text: body.join("\n"), settings: settings })
+    }
+    return out
+}
+
+/// Write SubRip, which numbers its cues from one whatever they were
+/// called before.
+pub fn render_srt(cues: [Cue]) -> str {
+    var out = ""
+    var number = 0
+    for cue in cues {
+        number = number + 1
+        out = out + "{number}\n" + render_time(cue.start, ",") + " --> " +
+        render_time(cue.end, ",") + "\n" + cue.text + "\n\n"
+    }
+    return out
+}
+
+/// Write WebVTT, keeping the identifiers that are not just numbers.
+pub fn render_vtt(cues: [Cue]) -> str {
+    var out = "WEBVTT\n\n"
+    for cue in cues {
+        if cue.id.len() > 0 {
+            out = out + cue.id + "\n"
+        }
+        out = out + render_time(cue.start, ".") + " --> " +
+        render_time(cue.end, ".")
+        if cue.settings.len() > 0 {
+            out = out + " " + cue.settings
+        }
+        out = out + "\n" + cue.text + "\n\n"
+    }
+    return out
+}
+
+/// Move every cue by a number of milliseconds, which is what fixing a
+/// track that starts late amounts to.
+///
+/// A cue that would start before zero is clamped rather than dropped: a
+/// subtitle at a negative time is not shown by any player, and dropping
+/// it silently loses a line.
+pub fn shift(cues: [Cue], millis: i64) -> [Cue] {
+    var out: [Cue] = []
+    for cue in cues {
+        var start = cue.start + millis
+        var end = cue.end + millis
+        if start < 0 {
+            start = 0
+        }
+        if end < 0 {
+            end = 0
+        }
+        out.push(Cue{ id: cue.id, start: start, end: end, text: cue.text,
+            settings: cue.settings })
+    }
+    return out
+}
+
+/// The problems a player will notice: a cue that ends before it starts,
+/// and two that overlap.
+pub fn problems(cues: [Cue]) -> [str] {
+    var out: [str] = []
+    var i = 0
+    while i < cues.len() {
+        if cues[i].end < cues[i].start {
+            out.push("cue {i + 1} ends before it starts")
+        }
+        if i > 0 and cues[i].start < cues[i - 1].end {
+            out.push("cue {i + 1} starts before cue {i} ends")
+        }
+        i = i + 1
+    }
+    return out
+}

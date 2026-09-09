@@ -14,7 +14,7 @@ plan that discovers them 300 packages in.
 | | |
 |---|---|
 | Started | 78 |
-| Now | 464 |
+| Now | 467 |
 | Tier 1 target | 200 |
 | Tier 2 target | 500 |
 | Tier 3 target | 800 |
@@ -251,6 +251,7 @@ says where the data came from and under what licence, which is the condition.
 | ~~Unicode II~~ | ~~`sentencebreak` `casemap` `unicodescript` `numericvalue`~~ | the Consortium's SentenceBreakTest, Python's `str.upper`, the `regex` module's script property, `unicodedata` |
 | ~~Layout~~ | ~~`structuredfields` `linebreak` `wordwrap`~~ | the HTTP working group's structured-field suite, UAX #14's LineBreakTest |
 | ~~Personal data~~ | ~~`contentline` `icalendar` `vcard`~~ | the Python `icalendar` library's line reader, `vobject` |
+| ~~Media and citation~~ | ~~`m3u8` `subtitles` `bibtex`~~ | the `m3u8` library, `srt` and `webvtt-py`, `bibtexparser` |
 
 That is a hundred, in twenty batches, and the same rhythm as the first: five
 or six packages to a group demo, every claim an assertion, every batch checked

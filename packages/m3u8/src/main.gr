@@ -1,0 +1,328 @@
+// HLS playlists, RFC 8216 — the `.m3u8` files a video player fetches.
+//
+// Two different documents share the extension and a player has to tell
+// them apart before it can do anything:
+//
+//   - A **master** playlist lists renditions, each with a bandwidth and a
+//     codec, and the player picks one.
+//   - A **media** playlist lists segments with durations, and the player
+//     downloads them in order.
+//
+// The tag that distinguishes them is `EXT-X-STREAM-INF`, and a file may
+// not contain both. `kind_of` answers, and a client that guesses from the
+// file name fetches a master playlist expecting segments and plays
+// nothing.
+//
+// ## Attribute lists are not a comma-split
+//
+//   #EXT-X-STREAM-INF:BANDWIDTH=1280000,CODECS="avc1.42e00a,mp4a.40.2"
+//
+// The `CODECS` value contains a comma, inside quotes. Splitting on the
+// commas first gives a codec list of two broken halves — and this is the
+// single most common bug in a hand-written HLS parser, because the file
+// looks like CSV until the day a stream has two codecs.
+//
+// ## A duration is not an integer
+//
+// `#EXTINF:9.009,` is nine and nine thousandths of a second, and a
+// playlist's target duration is the ceiling of the longest one. Reading
+// durations as integers makes a player that drifts a second every two
+// minutes, which shows up as audio going out of sync and not as an error.
+// Durations are kept here as thousandths.
+
+type PlaylistError =
+    | NoHeader()
+    | BadDuration(text: str)
+    | Mixed()
+    | BadAttribute(text: str)
+
+    /// One attribute of a tag.
+type M3uAttribute = {
+    name: str,
+    /// Without its quotes, if it had any.
+    value: str,
+    quoted: bool,
+}
+
+/// One segment of a media playlist.
+type M3uSegment = {
+    /// Thousandths of a second.
+    duration: i64,
+    title: str,
+    uri: str,
+    /// Whether an `EXT-X-DISCONTINUITY` preceded it.
+    discontinuity: bool,
+    /// The `EXT-X-KEY` in force, as attributes, or empty when none is.
+    key: [M3uAttribute],
+}
+
+/// One rendition of a master playlist.
+type M3uVariant = {
+    attributes: [M3uAttribute],
+    uri: str,
+}
+
+/// A whole playlist.
+type M3uPlaylist = {
+    /// `master`, `media` or `empty`.
+    kind: str,
+    version: i64,
+    /// Thousandths of a second; zero when the tag is absent.
+    target_duration: i64,
+    media_sequence: i64,
+    segments: [M3uSegment],
+    variants: [M3uVariant],
+    ended: bool,
+    /// `VOD`, `EVENT`, or empty.
+    playlist_type: str,
+    independent_segments: bool,
+}
+
+/// Read an attribute list, honouring the quotes.
+pub fn parse_attributes(text: str) -> [M3uAttribute] ! PlaylistError {
+    var out: [M3uAttribute] = []
+    var i = 0
+    while i < text.len() {
+        var name = ""
+        while i < text.len() and text.substr(i, 1) != "=" {
+            name = name + text.substr(i, 1)
+            i = i + 1
+        }
+        if i >= text.len() {
+            fail(BadAttribute(text))
+        }
+        i = i + 1
+        var value = ""
+        var quoted = false
+        if i < text.len() and text.substr(i, 1) == "\"" {
+            quoted = true
+            i = i + 1
+            var closed = false
+            while i < text.len() {
+                if text.substr(i, 1) == "\"" {
+                    closed = true
+                    i = i + 1
+                    break
+                }
+                value = value + text.substr(i, 1)
+                i = i + 1
+            }
+            if not closed {
+                fail(BadAttribute(text))
+            }
+        } else {
+            while i < text.len() and text.substr(i, 1) != "," {
+                value = value + text.substr(i, 1)
+                i = i + 1
+            }
+        }
+        out.push(M3uAttribute{ name: name.trim(), value: value,
+            quoted: quoted })
+        if i < text.len() and text.substr(i, 1) == "," {
+            i = i + 1
+        }
+    }
+    return out
+}
+
+/// An attribute by name, or the empty string.
+pub fn attribute(attributes: [M3uAttribute], name: str) -> str {
+    for one in attributes {
+        if one.name == name {
+            return one.value
+        }
+    }
+    return ""
+}
+
+/// A decimal number of seconds, as thousandths.
+pub fn parse_seconds(text: str) -> i64 ! PlaylistError {
+    var whole = text
+    var fraction = ""
+    var i = 0
+    while i < text.len() {
+        if text.substr(i, 1) == "." {
+            whole = text.substr(0, i)
+            fraction = text.substr(i + 1, text.len() - i - 1)
+            i = text.len()
+        } else {
+            i = i + 1
+        }
+    }
+    if whole.len() == 0 {
+        fail(BadDuration(text))
+    }
+    var value = 0
+    match whole.parse_int() {
+        Some(found) -> value = found
+        None -> fail(BadDuration(text))
+    }
+    while fraction.len() < 3 {
+        fraction = fraction + "0"
+    }
+    var thousandths = 0
+    match fraction.substr(0, 3).parse_int() {
+        Some(found) -> thousandths = found
+        None -> fail(BadDuration(text))
+    }
+    return value * 1000 + thousandths
+}
+
+/// An `EXTINF` value split at its comma: the duration and the title. The
+/// comma is required even when there is no title, which is why the split
+/// is on the first one rather than on the last.
+fn extinf_of(value: str) -> (str, str) {
+    var i = 0
+    while i < value.len() {
+        if value.substr(i, 1) == "," {
+            return (value.substr(0, i),
+                value.substr(i + 1, value.len() - i - 1))
+        }
+        i = i + 1
+    }
+    return (value, "")
+}
+
+/// A tag line split into its name and its value: `#EXTINF:9.009,` is
+/// `EXTINF` and `9.009,`. The name keeps the `EXT` — the `#` is the
+/// comment marker the whole format is built on, and everything after it is
+/// the tag.
+fn tag_of(line: str) -> (str, str) {
+    var i = 1
+    while i < line.len() {
+        if line.substr(i, 1) == ":" {
+            return (line.substr(1, i - 1),
+                line.substr(i + 1, line.len() - i - 1))
+        }
+        i = i + 1
+    }
+    return (line.substr(1, line.len() - 1), "")
+}
+
+/// Read a playlist.
+pub fn parse(text: str) -> M3uPlaylist ! PlaylistError {
+    var out = M3uPlaylist{ kind: "empty", version: 0, target_duration: 0,
+        media_sequence: 0, segments: [], variants: [], ended: false,
+        playlist_type: "", independent_segments: false }
+    var seen_header = false
+    var duration = 0 - 1
+    var title = ""
+    var discontinuity = false
+    var key: [M3uAttribute] = []
+    var pending: [M3uAttribute] = []
+    var has_pending = false
+    for raw in text.split("\n") {
+        var line = raw
+        if line.ends_with("\r") {
+            line = line.substr(0, line.len() - 1)
+        }
+        line = line.trim()
+        if line.len() == 0 {
+            continue
+        }
+        if not seen_header {
+            if line != "#EXTM3U" {
+                fail(NoHeader())
+            }
+            seen_header = true
+            continue
+        }
+        if line.starts_with("#EXT") {
+            let both = tag_of(line)
+            if both.0 == "EXTINF" {
+                let split = extinf_of(both.1)
+                duration = try parse_seconds(split.0)
+                title = split.1
+            } else if both.0 == "EXT-X-STREAM-INF" {
+                pending = try parse_attributes(both.1)
+                has_pending = true
+            } else if both.0 == "EXT-X-VERSION" {
+                out.version = both.1.parse_int() ?? 0
+            } else if both.0 == "EXT-X-TARGETDURATION" {
+                out.target_duration = try parse_seconds(both.1)
+            } else if both.0 == "EXT-X-MEDIA-SEQUENCE" {
+                out.media_sequence = both.1.parse_int() ?? 0
+            } else if both.0 == "EXT-X-ENDLIST" {
+                out.ended = true
+            } else if both.0 == "EXT-X-PLAYLIST-TYPE" {
+                out.playlist_type = both.1
+            } else if both.0 == "EXT-X-INDEPENDENT-SEGMENTS" {
+                out.independent_segments = true
+            } else if both.0 == "EXT-X-DISCONTINUITY" {
+                discontinuity = true
+            } else if both.0 == "EXT-X-KEY" {
+                key = try parse_attributes(both.1)
+            }
+            continue
+        }
+        if line.starts_with("#") {
+            continue
+        }
+        if has_pending {
+            out.variants.push(M3uVariant{ attributes: pending,
+                uri: line })
+            pending = []
+            has_pending = false
+        } else {
+            out.segments.push(M3uSegment{
+                duration: if duration < 0 { 0 } else { duration },
+                title: title, uri: line, discontinuity: discontinuity,
+                key: key })
+            duration = 0 - 1
+            title = ""
+            discontinuity = false
+        }
+    }
+    if not seen_header {
+        fail(NoHeader())
+    }
+    if out.variants.len() > 0 and out.segments.len() > 0 {
+        fail(Mixed())
+    }
+    if out.variants.len() > 0 {
+        out.kind = "master"
+    } else if out.segments.len() > 0 {
+        out.kind = "media"
+    }
+    return out
+}
+
+/// The total running time of a media playlist, in thousandths.
+pub fn total_duration(playlist: M3uPlaylist) -> i64 {
+    var total = 0
+    for segment in playlist.segments {
+        total = total + segment.duration
+    }
+    return total
+}
+
+/// Whether the target duration is at least as long as every segment,
+/// which the specification requires and a re-encoder breaks.
+pub fn target_is_honest(playlist: M3uPlaylist) -> bool {
+    for segment in playlist.segments {
+        // The rule is on the *rounded* duration: a target of ten allows a
+        // segment of 10.499.
+        if (segment.duration + 500) / 1000 * 1000 >
+        playlist.target_duration {
+            return false
+        }
+    }
+    return true
+}
+
+/// The variant with the highest bandwidth a limit allows, or -1.
+pub fn best_variant(playlist: M3uPlaylist, bits_per_second: i64) -> i64 {
+    var best = 0 - 1
+    var most = 0 - 1
+    var i = 0
+    while i < playlist.variants.len() {
+        let bandwidth = attribute(playlist.variants[i].attributes,
+            "BANDWIDTH").parse_int() ?? 0
+        if bandwidth <= bits_per_second and bandwidth > most {
+            most = bandwidth
+            best = i
+        }
+        i = i + 1
+    }
+    return best
+}

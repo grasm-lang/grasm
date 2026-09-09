@@ -1,0 +1,179 @@
+// Three formats that look like line-oriented text and are not.
+//
+// The expected values were checked against the `m3u8` library, `srt` and
+// `webvtt-py`, and `bibtexparser`.
+import m3u8
+import subtitles
+import bibtex
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn joined(lines: [str]) -> str {
+    return lines.join("\n") + "\n"
+}
+
+// ------------------------------------------------------------------ m3u8
+
+fn playlist_of(lines: [str]) -> M3uPlaylist {
+    return m3u8.parse(joined(lines)) ?? M3uPlaylist{ kind: "", version: 0,
+        target_duration: 0, media_sequence: 0, segments: [], variants: [],
+        ended: false, playlist_type: "", independent_segments: false }
+}
+
+fn check_playlists(inout f: i64) / {io} {
+    print("-- m3u8: two documents share the extension, and a player must" +
+        " tell them apart")
+    let media = playlist_of(["#EXTM3U", "#EXT-X-VERSION:3",
+        "#EXT-X-TARGETDURATION:10", "#EXT-X-MEDIA-SEQUENCE:7",
+        "#EXTINF:9.009,", "a.ts", "#EXTINF:8.5,a title, with comma",
+        "b.ts", "#EXT-X-ENDLIST"])
+    say(f, "a media playlist is segments, and it says so",
+        media.kind == "media" and media.segments.len() == 2 and
+        media.ended)
+    say(f, "a duration is thousandths, so nothing drifts",
+        media.segments[0].duration == 9009 and
+        media.segments[1].duration == 8500 and
+        m3u8.total_duration(media) == 17509)
+    say(f, "an EXTINF title may contain the comma that follows the number",
+        media.segments[1].title == "a title, with comma")
+    say(f, "and the target duration has to cover every segment",
+        m3u8.target_is_honest(media) and
+        not m3u8.target_is_honest(playlist_of(["#EXTM3U",
+            "#EXT-X-TARGETDURATION:5", "#EXTINF:9.0,", "a.ts"])))
+    let master = playlist_of(["#EXTM3U",
+        "#EXT-X-STREAM-INF:BANDWIDTH=1280000,CODECS=\"avc1.42e00a," +
+        "mp4a.40.2\",RESOLUTION=640x360", "low.m3u8",
+        "#EXT-X-STREAM-INF:BANDWIDTH=5000000,CODECS=\"avc1.4d401f\"",
+        "high.m3u8"])
+    say(f, "a master playlist is renditions, and it says that instead",
+        master.kind == "master" and master.variants.len() == 2 and
+        master.segments.len() == 0)
+    say(f, "an attribute value in quotes may contain a comma",
+        m3u8.attribute(master.variants[0].attributes, "CODECS") ==
+        "avc1.42e00a,mp4a.40.2" and
+        m3u8.attribute(master.variants[0].attributes, "RESOLUTION") ==
+        "640x360")
+    say(f, "and picking a rendition is picking the widest one that fits",
+        m3u8.best_variant(master, 2000000) == 0 and
+        m3u8.best_variant(master, 6000000) == 1 and
+        m3u8.best_variant(master, 100) == 0 - 1)
+    say(f, "a file with no header is not a playlist",
+        playlist_refused(["#EXTINF:1.0,", "a.ts"]))
+}
+
+fn playlist_refused(lines: [str]) -> bool {
+    match m3u8.parse(joined(lines)) {
+        Ok(_playlist) -> return false
+        Err(_why) -> return true
+    }
+}
+
+// ------------------------------------------------------------- subtitles
+
+fn check_subtitles(inout f: i64) / {io} {
+    print("-- subtitles: two formats that differ in four small ways")
+    let srt = cues_srt(["1", "00:00:01,000 --> 00:00:04,000",
+        "Hello there", "", "2", "00:00:05,500 --> 00:00:09,250", "Two",
+        "lines here", ""])
+    say(f, "SubRip, with a comma before the milliseconds",
+        srt.len() == 2 and srt[0].start == 1000 and srt[0].end == 4000 and
+        srt[1].text == "Two\nlines here")
+    let vtt = cues_vtt(["WEBVTT", "", "NOTE this is a comment",
+        "and it continues", "", "cue-1",
+        "00:00:01.000 --> 00:00:04.000 align:start position:10%",
+        "Hello there", ""])
+    say(f, "WebVTT, with a full stop, an identifier and settings",
+        vtt.len() == 1 and vtt[0].id == "cue-1" and
+        vtt[0].settings == "align:start position:10%")
+    say(f, "a comment block is skipped whole rather than read as a cue",
+        vtt.len() == 1)
+    say(f, "WebVTT may leave the hours out and SubRip may not",
+        (subtitles.parse_time("01:30.000") ?? 0) == 90000 and
+        time_refused("1:30"))
+    say(f, "a converted file gets the other separator, not the same one",
+        subtitles.render_srt(vtt).replace("\n", "|") ==
+        "1|00:00:01,000 --> 00:00:04,000|Hello there||" and
+        subtitles.render_vtt(srt).starts_with("WEBVTT"))
+    say(f, "shifting is arithmetic, and does not go below zero",
+        subtitles.shift(srt, 500)[0].start == 1500 and
+        subtitles.shift(srt, 0 - 5000)[0].start == 0)
+    say(f, "and the two problems a player notices are reported",
+        subtitles.problems(srt).len() == 0 and
+        subtitles.problems(cues_srt(["1",
+            "00:00:05,000 --> 00:00:04,000", "backwards", ""])).len() == 1)
+}
+
+fn cues_srt(lines: [str]) -> [Cue] {
+    return subtitles.parse_srt(joined(lines)) ?? []
+}
+
+fn cues_vtt(lines: [str]) -> [Cue] {
+    return subtitles.parse_vtt(joined(lines)) ?? []
+}
+
+fn time_refused(text: str) -> bool {
+    match subtitles.parse_time(text) {
+        Ok(_millis) -> return false
+        Err(_why) -> return true
+    }
+}
+
+// ---------------------------------------------------------------- bibtex
+
+fn check_bibtex(inout f: i64) / {io} {
+    print("-- bibtex: braces are delimiters and content at the same time")
+    let text = joined(["@string\{jcp = \"J. Chem. Phys.\"}",
+        "@ARTICLE\{Cesar2013,",
+        "  author = \{Jean C\u{e9}sar and Ann \{O'Neill}},",
+        "  title = \{An amazing \{Title} with, a comma},",
+        "  journal = jcp # \" Letters\",",
+        "  year = 2013",
+        "}",
+        "@book\{b1, title = \{Book}}"])
+    let file = bibtex.parse(text) ?? BibFile{ entries: [], strings: [],
+        preamble: "" }
+    say(f, "the entry type and key, with the type lower-cased",
+        file.entries.len() == 2 and file.entries[0].kind == "article" and
+        file.entries[0].key == "Cesar2013")
+    say(f, "the inner braces stay, because they are the meaning",
+        bibtex.field(file.entries[0], "title") ==
+        "An amazing \{Title} with, a comma")
+    say(f, "an abbreviation is expanded and joined to what follows it",
+        bibtex.field(file.entries[0], "journal") ==
+        "J. Chem. Phys. Letters")
+    say(f, "a bare number is a value too",
+        bibtex.field(file.entries[0], "year") == "2013")
+    say(f, "authors split on the and that is not inside braces",
+        bibtex.authors(file.entries[0]) ==
+        ["Jean C\u{e9}sar", "Ann \{O'Neill}"])
+    say(f, "and a publisher that contains the word does not split",
+        bibtex.authors(BibEntry{ kind: "book", key: "x",
+            fields: [BibField{ name: "author",
+                value: "\{Barnes and Noble}" }] }) == ["\{Barnes and Noble}"])
+    say(f, "a month abbreviation is defined before the file starts",
+        bibtex.field(BibEntry{ kind: "misc", key: "y", fields: [] },
+            "nothing") == "" and file.strings.len() >= 13)
+    say(f, "and a style's required fields are reported when missing",
+        bibtex.missing_fields(file.entries[1]) ==
+        ["publisher", "year"] and
+        bibtex.missing_fields(file.entries[0]).len() == 0)
+}
+
+fn main() / {io} {
+    var f = 0
+    check_playlists(f)
+    check_subtitles(f)
+    check_bibtex(f)
+    if f == 0 {
+        print("library: every claim held")
+    } else {
+        print("library: {f} claims failed")
+    }
+}
