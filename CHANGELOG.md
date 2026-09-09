@@ -5,6 +5,38 @@ before 2.0. Anything marked `provisional` may change in a minor release with a
 migration note here; anything `experimental` may change in any release. See
 `docs/stability.md`.
 
+## Unreleased — since 1.0.0
+
+### Changed
+
+- **Forty-nine clauses promoted from `provisional` to `stable`**, taking the
+  stable set to 163 of 239. Nothing about the language changed; what changed is
+  what 1.0 promises not to break. Each was checked against the five-part test in
+  `docs/stability.md` on its own evidence — a conformance program passing under
+  both engines, a program history with no expectation ever reversed, an age past
+  a month, a clause text that admits nothing unfinished, and no membership of an
+  area with open design work. Thirty provisional clauses did not pass and are
+  listed with their reasons in the commit; `E-RECURSION-DEPTH` passed and was
+  held back anyway, because the stack check its text describes is being looked
+  at.
+
+- **The allocation path resolves one thread-local instead of four.** On macOS a
+  thread-local is a call, and `sample` put that call at the top of the profile
+  of the allocation benchmark with about a third of the samples: the allocator
+  asked for three separate ones and releasing a value asked for two. They are
+  one structure now, and the "is a region open" test reads a counter rather than
+  borrowing a `RefCell`. Paired measurements, best of nine alternating runs:
+  `tree` 1.19x, `wordfreq` 1.10x, `sort` 1.03x, and no change to the programs
+  that do not allocate. The machine was not idle, so `benchmarks/README.md`
+  keeps its own table and is due a re-measure.
+
+### Added
+
+- **The package set passed 500** — 513 directories that are not group demos, of
+  which 31 are gate harnesses. The eight batches that took it there are in
+  `docs/ecosystem-roadmap.md`, each checked against the implementation that owns
+  its format, and thirteen of those checks became gates.
+
 ## 1.0.0 — 2026-08-31
 
 The release bar in `docs/release-scope.md` is met: **S1 zero, S2 zero**, every
