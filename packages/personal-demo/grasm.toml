@@ -1,0 +1,16 @@
+[package]
+name = "personal_demo"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.contentline]
+path = "../contentline"
+version = "^1.0.0"
+
+[dependencies.icalendar]
+path = "../icalendar"
+version = "^1.0.0"
+
+[dependencies.vcard]
+path = "../vcard"
+version = "^1.0.0"

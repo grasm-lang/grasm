@@ -1,0 +1,11 @@
+[package]
+name = "icalendar"
+version = "1.0.0"
+
+[dependencies.contentline]
+path = "../contentline"
+version = "^1.0.0"
+
+[dependencies.time]
+path = "../time"
+version = "^1.0.0"

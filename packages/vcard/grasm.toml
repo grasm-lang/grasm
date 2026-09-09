@@ -1,0 +1,7 @@
+[package]
+name = "vcard"
+version = "1.0.0"
+
+[dependencies.contentline]
+path = "../contentline"
+version = "^1.0.0"

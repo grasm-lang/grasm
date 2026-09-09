@@ -1,0 +1,300 @@
+// iCalendar, RFC 5545 — the format every calendar invitation is written in.
+//
+// A `.ics` file, the body of a meeting invitation in an email, and what a
+// CalDAV server stores are all this. `contentline` reads the lines; this
+// says what they mean: which components nest inside which, and how the
+// three kinds of date are told apart.
+//
+// ## Three kinds of date, and they are not interchangeable
+//
+//   `20240315`               a whole day, with no time and no zone
+//   `20240315T090000Z`       an instant, in UTC
+//   `20240315T090000`        a local time, whose zone is in `TZID` — and
+//                            which means a *different* instant depending
+//                            on it
+//
+// A reader that treats the third as UTC puts a nine o'clock meeting at
+// ten in the summer. `when` answers with which of the three it found, so
+// a caller cannot use one as another by accident.
+//
+// ## A recurrence is a rule, not a list
+//
+// `RRULE:FREQ=WEEKLY;BYDAY=MO,WE;COUNT=5` describes five meetings and the
+// file contains one event. Expanding that is `recurrence`'s job; what is
+// here is reading the rule into its parts, which is where the parsing
+// mistakes are — `BYDAY` holds a list, `COUNT` and `UNTIL` are mutually
+// exclusive, and `WKST` changes what `BYWEEKNO` means.
+//
+// ## What is not here
+//
+// Time zone conversion. A `VTIMEZONE` component carries its own rules and
+// `tzrule` knows how to read them; joining the two is a caller's decision,
+// because a calendar written against a zone definition that has since
+// changed is a real situation with no automatic right answer.
+import contentline
+import time
+
+type CalendarError =
+    | BadLine(why: str)
+    | Unbalanced(name: str)
+    | NotACalendar()
+    | BadDate(text: str)
+
+    /// One component: its name, its properties and the components inside it.
+type CalComponent = {
+    name: str,
+    properties: [ContentLine],
+    children: [CalComponent],
+}
+
+/// What kind of date a property carried.
+type CalWhen = {
+    /// `date`, `utc` or `local`.
+    kind: str,
+    stamp: Stamp,
+    /// The `TZID` parameter for a local time, or the empty string.
+    zone: str,
+}
+
+/// Read a document into its components.
+pub fn parse(text: str) -> CalComponent ! CalendarError {
+    var lines: [ContentLine] = []
+    match contentline.parse_all(text) {
+        Ok(found) -> lines = found
+        Err(_why) -> fail(BadLine("a content line did not parse"))
+    }
+    var stack: [CalComponent] = []
+    var root = CalComponent{ name: "", properties: [], children: [] }
+    var have_root = false
+    for line in lines {
+        if line.name == "BEGIN" {
+            stack.push(CalComponent{ name: line.value.to_upper(),
+                properties: [], children: [] })
+        } else if line.name == "END" {
+            if stack.len() == 0 or
+            stack[stack.len() - 1].name != line.value.to_upper() {
+                fail(Unbalanced(line.value))
+            }
+            let done = stack[stack.len() - 1]
+            stack = dropped(stack)
+            if stack.len() == 0 {
+                root = done
+                have_root = true
+            } else {
+                stack[stack.len() - 1].children.push(done)
+            }
+        } else {
+            if stack.len() == 0 {
+                fail(NotACalendar())
+            }
+            stack[stack.len() - 1].properties.push(line)
+        }
+    }
+    if stack.len() > 0 {
+        fail(Unbalanced(stack[stack.len() - 1].name))
+    }
+    if not have_root {
+        fail(NotACalendar())
+    }
+    return root
+}
+
+fn dropped(stack: [CalComponent]) -> [CalComponent] {
+    var out: [CalComponent] = []
+    var i = 0
+    while i + 1 < stack.len() {
+        out.push(stack[i])
+        i = i + 1
+    }
+    return out
+}
+
+/// Every component of a name, at any depth.
+pub fn components(root: CalComponent, name: str) -> [CalComponent] {
+    var out: [CalComponent] = []
+    if root.name == name.to_upper() {
+        out.push(root)
+    }
+    for child in root.children {
+        for found in components(child, name) {
+            out.push(found)
+        }
+    }
+    return out
+}
+
+/// The first property of a name, or nothing.
+pub fn property(component: CalComponent, name: str) -> Option[ContentLine] {
+    for line in component.properties {
+        if line.name == name.to_upper() {
+            return Some(line)
+        }
+    }
+    return None
+}
+
+/// Every property of a name, since several are allowed more than once.
+pub fn properties(component: CalComponent, name: str) -> [ContentLine] {
+    var out: [ContentLine] = []
+    for line in component.properties {
+        if line.name == name.to_upper() {
+            out.push(line)
+        }
+    }
+    return out
+}
+
+/// A TEXT property's value, with its escapes undone.
+pub fn text_of(component: CalComponent, name: str) -> str {
+    match property(component, name) {
+        Some(line) -> return contentline.unescape_text(line.value)
+        None -> return ""
+    }
+}
+
+/// A list-valued property, split on its unescaped commas.
+pub fn list_of(component: CalComponent, name: str) -> [str] {
+    var out: [str] = []
+    match property(component, name) {
+        Some(line) -> {
+            for piece in contentline.split_list(line.value) {
+                out.push(contentline.unescape_text(piece))
+            }
+        }
+        None -> {}
+    }
+    return out
+}
+
+fn digits(text: str, from: i64, count: i64) -> i64 {
+    return text.substr(from, count).parse_int() ?? 0 - 1
+}
+
+/// Read a DATE or a DATE-TIME.
+pub fn parse_when(value: str, zone: str) -> CalWhen ! CalendarError {
+    if value.len() == 8 {
+        let date = Date{ year: digits(value, 0, 4),
+            month: digits(value, 4, 2), day: digits(value, 6, 2) }
+        if date.year < 0 or date.month < 1 or date.month > 12 or
+        date.day < 1 or date.day > 31 {
+            fail(BadDate(value))
+        }
+        return CalWhen{ kind: "date",
+            stamp: Stamp{ date: date,
+                time: Time{ hour: 0, minute: 0, second: 0, milli: 0 } },
+            zone: "" }
+    }
+    if value.len() < 15 or value.substr(8, 1) != "T" {
+        fail(BadDate(value))
+    }
+    let date = Date{ year: digits(value, 0, 4),
+        month: digits(value, 4, 2), day: digits(value, 6, 2) }
+    let clock = Time{ hour: digits(value, 9, 2),
+        minute: digits(value, 11, 2), second: digits(value, 13, 2),
+        milli: 0 }
+    if date.month < 1 or date.month > 12 or clock.hour > 23 or
+    clock.minute > 59 or clock.second > 60 {
+        fail(BadDate(value))
+    }
+    var kind = "local"
+    if value.len() == 16 and value.substr(15, 1) == "Z" {
+        kind = "utc"
+    } else if value.len() != 15 {
+        fail(BadDate(value))
+    }
+    var found = zone
+    if kind == "utc" {
+        found = ""
+    }
+    return CalWhen{ kind: kind, stamp: Stamp{ date: date, time: clock },
+        zone: found }
+}
+
+/// A date-valued property, with the `TZID` parameter taken into account.
+pub fn when(component: CalComponent,
+    name: str) -> CalWhen ! CalendarError {
+    match property(component, name) {
+        Some(line) -> return try parse_when(line.value,
+            contentline.param_of(line, "TZID"))
+        None -> fail(BadDate(""))
+    }
+}
+
+/// A recurrence rule, taken apart. The parts keep their order and their
+/// lists, because `BYDAY=MO,WE` is two days and not the string `MO,WE`.
+type CalRule = {
+    parts: [(str, [str])],
+}
+
+/// Read an `RRULE` or an `EXRULE` value.
+pub fn parse_rule(value: str) -> CalRule {
+    var parts: [(str, [str])] = []
+    for piece in value.split(";") {
+        if piece.len() == 0 {
+            continue
+        }
+        var key = piece
+        var rest = ""
+        var i = 0
+        while i < piece.len() {
+            if piece.substr(i, 1) == "=" {
+                key = piece.substr(0, i)
+                rest = piece.substr(i + 1, piece.len() - i - 1)
+                i = piece.len()
+            } else {
+                i = i + 1
+            }
+        }
+        var values: [str] = []
+        for one in rest.split(",") {
+            if one.len() > 0 {
+                values.push(one)
+            }
+        }
+        parts.push((key.to_upper(), values))
+    }
+    return CalRule{ parts: parts }
+}
+
+/// One part of a rule, or nothing.
+pub fn rule_part(rule: CalRule, name: str) -> [str] {
+    for part in rule.parts {
+        if part.0 == name.to_upper() {
+            return part.1
+        }
+    }
+    return []
+}
+
+/// Whether a rule is contradictory: `COUNT` and `UNTIL` may not both
+/// appear, and a rule with neither runs forever.
+pub fn rule_is_valid(rule: CalRule) -> bool {
+    if rule_part(rule, "FREQ").len() != 1 {
+        return false
+    }
+    return not (rule_part(rule, "COUNT").len() > 0 and
+        rule_part(rule, "UNTIL").len() > 0)
+}
+
+/// Write a component back out, folded, with its children.
+pub fn render(component: CalComponent) -> str {
+    var out = "BEGIN:" + component.name + "\r\n"
+    for line in component.properties {
+        out = out + contentline.render(line) + "\r\n"
+    }
+    for child in component.children {
+        out = out + render(child)
+    }
+    return out + "END:" + component.name + "\r\n"
+}
+
+/// The instant a UTC date-time names, in milliseconds since the epoch.
+///
+/// Refuses a floating local time, which has no instant until a zone is
+/// chosen — the mistake this package exists to make impossible.
+pub fn instant_of(found: CalWhen) -> i64 ! CalendarError {
+    if found.kind == "local" {
+        fail(BadDate("a local time has no instant without a zone"))
+    }
+    return time.to_millis(found.stamp)
+}

@@ -1,0 +1,180 @@
+// A calendar and an address book, which are the same file format twice.
+//
+// The line-level claims were checked against the Python `icalendar`
+// library's own content-line reader and against `vobject`.
+import contentline
+import icalendar
+import vcard
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn crlf(lines: [str]) -> str {
+    return lines.join("\r\n") + "\r\n"
+}
+
+// ------------------------------------------------------------ contentline
+
+fn parsed(line: str) -> ContentLine {
+    return contentline.parse(line, 1) ??
+    ContentLine{ name: "", params: [], value: "" }
+}
+
+fn check_lines(inout f: i64) / {io} {
+    print("-- contentline: the line format two formats share")
+    say(f, "a folded line is one line, and the fold character goes",
+        contentline.unfold("SUMMARY:one\r\n two\r\nUID:x\r\n") ==
+        ["SUMMARY:onetwo", "UID:x"])
+    say(f, "a tab continues a line as well as a space",
+        contentline.unfold("A:one\r\n\ttwo\r\n") == ["A:onetwo"])
+    say(f, "a quoted parameter may hold a colon and a comma",
+        parsed("ATTENDEE;CN=\"Smith, John\";ROLE=CHAIR:mailto:j@x.test")
+            .value == "mailto:j@x.test" and
+        contentline.param_of(parsed(
+            "ATTENDEE;CN=\"Smith, John\";ROLE=CHAIR:mailto:j@x.test"),
+            "CN") == "Smith, John")
+    say(f, "a parameter may have several values",
+        parsed("TEL;TYPE=home,voice:+44").params[0].values ==
+        ["home", "voice"])
+    say(f, "the name and parameter names are upper-cased, the value is not",
+        parsed("summary;language=en:Text").name == "SUMMARY" and
+        parsed("summary;language=en:Text").params[0].name == "LANGUAGE" and
+        parsed("summary;language=en:Text").value == "Text")
+    say(f, "a comma, a semicolon and a newline are escaped in a value",
+        contentline.unescape_text("a\\, b\\; c\\nd\\\\e") ==
+        "a, b; c\nd\\e" and
+        contentline.escape_text("a, b; c\nd\\e") ==
+        "a\\, b\\; c\\nd\\\\e")
+    say(f, "and an upper-case escape means a newline too",
+        contentline.unescape_text("a\\Nb") == "a\nb")
+    say(f, "a list value splits on the commas that are not escaped",
+        contentline.split_list("work,ur\\,gent,home") ==
+        ["work", "ur\\,gent", "home"])
+    say(f, "folding counts octets, so it cannot split a character in half",
+        contentline.fold("A:" + "e\u{301}".repeat(40))
+            .split("\r\n")[0].to_bytes().len() <= 75)
+}
+
+// ------------------------------------------------------------- icalendar
+
+fn calendar_of(lines: [str]) -> CalComponent {
+    return icalendar.parse(crlf(lines)) ??
+    CalComponent{ name: "", properties: [], children: [] }
+}
+
+fn check_calendar(inout f: i64) / {io} {
+    print("-- icalendar: three kinds of date, which are not the same kind")
+    let text = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Test//EN",
+        "BEGIN:VEVENT", "UID:1@test", "DTSTAMP:20240101T000000Z",
+        "DTSTART;TZID=Europe/London:20240315T090000",
+        "DTEND:20240315T100000Z", "SUMMARY:A meeting\\, with a comma",
+        "CATEGORIES:work,urgent",
+        "RRULE:FREQ=WEEKLY;BYDAY=MO,WE;COUNT=5",
+        "BEGIN:VALARM", "ACTION:DISPLAY", "TRIGGER:-PT15M", "END:VALARM",
+        "END:VEVENT", "END:VCALENDAR"]
+    let calendar = calendar_of(text)
+    say(f, "the components nest, and an alarm sits inside its event",
+        calendar.name == "VCALENDAR" and
+        icalendar.components(calendar, "VEVENT").len() == 1 and
+        icalendar.components(calendar, "VALARM").len() == 1)
+    let event = icalendar.components(calendar, "VEVENT")[0]
+    say(f, "a text property comes back with its escapes undone",
+        icalendar.text_of(event, "SUMMARY") == "A meeting, with a comma")
+    say(f, "a list property comes back as a list",
+        icalendar.list_of(event, "CATEGORIES") == ["work", "urgent"])
+    let start = icalendar.when(event, "DTSTART") ?? no_when()
+    let end = icalendar.when(event, "DTEND") ?? no_when()
+    say(f, "a local time keeps its zone and is not an instant",
+        start.kind == "local" and start.zone == "Europe/London" and
+        instant_refused(start))
+    say(f, "a UTC time is an instant",
+        end.kind == "utc" and (icalendar.instant_of(end) ?? 0) ==
+        1710496800000)
+    say(f, "and a whole-day date is a third thing again",
+        (icalendar.parse_when("20240315", "") ?? no_when()).kind == "date")
+    let rule = icalendar.parse_rule(
+        icalendar.text_of(event, "RRULE"))
+    say(f, "a recurrence rule is parts, and BYDAY is a list of days",
+        icalendar.rule_part(rule, "FREQ") == ["WEEKLY"] and
+        icalendar.rule_part(rule, "BYDAY") == ["MO", "WE"] and
+        icalendar.rule_part(rule, "COUNT") == ["5"])
+    say(f, "a rule with both a count and an end is refused",
+        icalendar.rule_is_valid(rule) and
+        not icalendar.rule_is_valid(icalendar.parse_rule(
+            "FREQ=DAILY;COUNT=5;UNTIL=20240401T000000Z")))
+    say(f, "and an unbalanced document is refused rather than guessed at",
+        calendar_refused(["BEGIN:VCALENDAR", "BEGIN:VEVENT",
+            "END:VCALENDAR"]))
+}
+
+fn no_when() -> CalWhen {
+    return CalWhen{ kind: "", stamp: Stamp{
+        date: Date{ year: 0, month: 1, day: 1 },
+        time: Time{ hour: 0, minute: 0, second: 0, milli: 0 } },
+        zone: "" }
+}
+
+fn instant_refused(found: CalWhen) -> bool {
+    match icalendar.instant_of(found) {
+        Ok(_millis) -> return false
+        Err(_why) -> return true
+    }
+}
+
+fn calendar_refused(lines: [str]) -> bool {
+    match icalendar.parse(crlf(lines)) {
+        Ok(_calendar) -> return false
+        Err(_why) -> return true
+    }
+}
+
+// ----------------------------------------------------------------- vcard
+
+fn check_cards(inout f: i64) / {io} {
+    let text = ["BEGIN:VCARD", "VERSION:4.0",
+        "N:Smith;John;Q.,Public;Dr.;Jr.,M.D.", "FN:Dr John Smith",
+        "TEL;TYPE=\"home,voice\":+44 20 7946 0000",
+        "EMAIL;TYPE=INTERNET:j@example.test", "END:VCARD",
+        "BEGIN:VCARD", "VERSION:3.0", "N:Doe;Jane;;;",
+        "TEL;HOME;VOICE:+1 555 0100", "END:VCARD"]
+    print("-- vcard: the same lines, and two properties with structure")
+    let cards = vcard.parse_all(crlf(text)) ?? []
+    say(f, "a file may hold more than one card", cards.len() == 2)
+    say(f, "the five components of a name, each a list of its own",
+        vcard.name_parts(cards[0])[0] == ["Smith"] and
+        vcard.name_parts(cards[0])[2] == ["Q.", "Public"] and
+        vcard.name_parts(cards[0])[4] == ["Jr.", "M.D."])
+    say(f, "a card with no FN gets a name assembled from those parts",
+        vcard.display_name(cards[0]) == "Dr John Smith" and
+        vcard.display_name(cards[1]) == "Jane Doe")
+    let modern = vcard.properties(cards[0], "TEL")[0]
+    let old = vcard.properties(cards[1], "TEL")[0]
+    say(f, "a type is found whichever decade the card was written in",
+        vcard.has_type(modern, "home") and vcard.has_type(modern, "voice")
+        and vcard.has_type(old, "home") and vcard.has_type(old, "voice"))
+    say(f, "and something that is not a type is not found",
+        not vcard.has_type(modern, "work"))
+    say(f, "a structured value keeps its commas inside its semicolons",
+        vcard.structured("a;b,c;d")[1] == ["b", "c"])
+    say(f, "and a card writes back out as a card",
+        vcard.render(cards[1]).starts_with("BEGIN:VCARD\r\n") and
+        vcard.render(cards[1]).ends_with("END:VCARD\r\n"))
+}
+
+fn main() / {io} {
+    var f = 0
+    check_lines(f)
+    check_calendar(f)
+    check_cards(f)
+    if f == 0 {
+        print("personal: every claim held")
+    } else {
+        print("personal: {f} claims failed")
+    }
+}

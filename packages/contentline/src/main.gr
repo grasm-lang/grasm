@@ -1,0 +1,311 @@
+// The line format iCalendar and vCard share — RFC 5545 section 3.1.
+//
+// Both formats are a sequence of lines shaped
+//
+//   NAME;PARAM=value;OTHER="quoted, value":the content
+//
+// with three rules that catch every hand-written parser:
+//
+//   - **Lines are folded at 75 octets**, and a continuation begins with a
+//     space or a tab which is *not* part of the value. Unfolding has to
+//     happen before anything else, and folding counts octets rather than
+//     characters, so a fold may not land in the middle of a UTF-8
+//     sequence.
+//   - **A parameter value may be quoted**, and inside the quotes a colon,
+//     a semicolon and a comma are ordinary text. Splitting on `:` before
+//     honouring the quotes reads `URL;X="a:b":c` as having the value
+//     `b":c`.
+//   - **The value has its own escapes**: `\n` is a newline, `\,` a comma,
+//     `\;` a semicolon and `\\` a backslash — and a colon is *not*
+//     escaped, which surprises people writing URLs into a TEXT property.
+//
+// ## What this is not
+//
+// A calendar or an address book. It reads and writes lines; `icalendar`
+// and `vcard` say what the lines mean.
+
+type LineError =
+    | NoName(line: i64)
+    | NoValue(line: i64)
+    | UnclosedQuote(line: i64)
+
+    /// One parameter. The value may have been quoted, which the parser
+    /// records because writing it back needs to know.
+type LineParam = {
+    name: str,
+    values: [str],
+}
+
+/// One content line.
+type ContentLine = {
+    /// Upper-cased, since the format is case-insensitive here and a
+    /// caller comparing `DTSTART` against `dtstart` should not have to
+    /// know that.
+    name: str,
+    params: [LineParam],
+    /// The value with its escapes still in place: whether `\n` means a
+    /// newline depends on the property's type, which this layer does not
+    /// know.
+    value: str,
+}
+
+/// Undo the folding: a line beginning with a space or a tab continues the
+/// one before it, and that first character is dropped.
+pub fn unfold(text: str) -> [str] {
+    var out: [str] = []
+    for raw in text.split("\n") {
+        var line = raw
+        if line.ends_with("\r") {
+            line = line.substr(0, line.len() - 1)
+        }
+        if line.len() > 0 and (line.starts_with(" ") or
+            line.starts_with("\t")) and out.len() > 0 {
+            out[out.len() - 1] = out[out.len() - 1] +
+            line.substr(1, line.len() - 1)
+        } else {
+            out.push(line)
+        }
+    }
+    // A file ends with a line ending, which is a terminator and not a
+    // separator: the empty piece after the last one is not a line.
+    if out.len() > 0 and out[out.len() - 1].len() == 0 {
+        var trimmed: [str] = []
+        var i = 0
+        while i + 1 < out.len() {
+            trimmed.push(out[i])
+            i = i + 1
+        }
+        return trimmed
+    }
+    return out
+}
+
+/// Fold a line at 75 octets, continuing with a space.
+///
+/// Octets, not characters: the limit is on the bytes, and a fold that
+/// landed inside a UTF-8 sequence would produce two lines neither of which
+/// is text. So the break is taken at the last character boundary that
+/// fits.
+pub fn fold(line: str) -> str {
+    let raw = line.to_bytes()
+    if raw.len() <= 75 {
+        return line
+    }
+    var out = ""
+    var used = 0
+    var first = true
+    for character in line.chars() {
+        let width = character.to_bytes().len()
+        let limit = if first { 75 } else { 74 }
+        if used + width > limit {
+            out = out + "\r\n "
+            used = 0
+            first = false
+        }
+        out = out + character
+        used = used + width
+    }
+    return out
+}
+
+fn is_quoted_safe(character: str) -> bool {
+    return character != "\"" and character != ";" and character != ":" and
+    character != ","
+}
+
+/// Read one content line.
+pub fn parse(line: str, number: i64) -> ContentLine ! LineError {
+    var at = 0
+    var name = ""
+    while at < line.len() {
+        let here = line.substr(at, 1)
+        if here == ";" or here == ":" {
+            break
+        }
+        name = name + here
+        at = at + 1
+    }
+    if name.len() == 0 {
+        fail(NoName(number))
+    }
+    var params: [LineParam] = []
+    while at < line.len() and line.substr(at, 1) == ";" {
+        at = at + 1
+        var key = ""
+        while at < line.len() and line.substr(at, 1) != "=" and
+        line.substr(at, 1) != ";" and line.substr(at, 1) != ":" {
+            key = key + line.substr(at, 1)
+            at = at + 1
+        }
+        var values: [str] = []
+        if at < line.len() and line.substr(at, 1) == "=" {
+            at = at + 1
+            var going = true
+            while going {
+                var value = ""
+                if at < line.len() and line.substr(at, 1) == "\"" {
+                    at = at + 1
+                    var closed = false
+                    while at < line.len() {
+                        if line.substr(at, 1) == "\"" {
+                            at = at + 1
+                            closed = true
+                            break
+                        }
+                        value = value + line.substr(at, 1)
+                        at = at + 1
+                    }
+                    if not closed {
+                        fail(UnclosedQuote(number))
+                    }
+                } else {
+                    while at < line.len() and
+                    is_quoted_safe(line.substr(at, 1)) {
+                        value = value + line.substr(at, 1)
+                        at = at + 1
+                    }
+                }
+                values.push(value)
+                if at < line.len() and line.substr(at, 1) == "," {
+                    at = at + 1
+                } else {
+                    going = false
+                }
+            }
+        }
+        params.push(LineParam{ name: key.to_upper(), values: values })
+    }
+    if at >= line.len() or line.substr(at, 1) != ":" {
+        fail(NoValue(number))
+    }
+    return ContentLine{ name: name.to_upper(), params: params,
+        value: line.substr(at + 1, line.len() - at - 1) }
+}
+
+/// Every content line of a document, unfolded and parsed.
+pub fn parse_all(text: str) -> [ContentLine] ! LineError {
+    var out: [ContentLine] = []
+    var number = 0
+    for line in unfold(text) {
+        number = number + 1
+        if line.trim().len() == 0 {
+            continue
+        }
+        out.push(try parse(line, number))
+    }
+    return out
+}
+
+/// The first parameter of a name, or the empty string.
+pub fn param_of(line: ContentLine, name: str) -> str {
+    for param in line.params {
+        if param.name == name.to_upper() and param.values.len() > 0 {
+            return param.values[0]
+        }
+    }
+    return ""
+}
+
+/// Undo the escapes a TEXT value carries.
+///
+/// `\N` as well as `\n`, because the specification allows either and a
+/// reader that only knows the lower-case one leaves a stray `N` in the
+/// middle of a description.
+pub fn unescape_text(value: str) -> str {
+    var out = ""
+    var i = 0
+    while i < value.len() {
+        let here = value.substr(i, 1)
+        if here == "\\" and i + 1 < value.len() {
+            let next = value.substr(i + 1, 1)
+            if next == "n" or next == "N" {
+                out = out + "\n"
+            } else if next == "\\" or next == "," or next == ";" {
+                out = out + next
+            } else {
+                out = out + next
+            }
+            i = i + 2
+        } else {
+            out = out + here
+            i = i + 1
+        }
+    }
+    return out
+}
+
+/// Put the escapes back.
+pub fn escape_text(value: str) -> str {
+    var out = ""
+    for character in value.chars() {
+        if character == "\n" {
+            out = out + "\\n"
+        } else if character == "\\" or character == "," or
+        character == ";" {
+            out = out + "\\" + character
+        } else {
+            out = out + character
+        }
+    }
+    return out
+}
+
+/// A TEXT value split on its unescaped commas, which is how a list-valued
+/// property such as `CATEGORIES` is written.
+pub fn split_list(value: str) -> [str] {
+    var out: [str] = []
+    var current = ""
+    var i = 0
+    while i < value.len() {
+        let here = value.substr(i, 1)
+        if here == "\\" and i + 1 < value.len() {
+            current = current + here + value.substr(i + 1, 1)
+            i = i + 2
+        } else if here == "," {
+            out.push(current)
+            current = ""
+            i = i + 1
+        } else {
+            current = current + here
+            i = i + 1
+        }
+    }
+    out.push(current)
+    return out
+}
+
+/// Write a content line back out, folded.
+pub fn render(line: ContentLine) -> str {
+    var out = line.name
+    for param in line.params {
+        out = out + ";" + param.name
+        if param.values.len() > 0 {
+            out = out + "="
+            var first = true
+            for value in param.values {
+                if not first {
+                    out = out + ","
+                }
+                first = false
+                if needs_quotes(value) {
+                    out = out + "\"" + value + "\""
+                } else {
+                    out = out + value
+                }
+            }
+        }
+    }
+    return fold(out + ":" + line.value)
+}
+
+fn needs_quotes(value: str) -> bool {
+    var i = 0
+    while i < value.len() {
+        let here = value.substr(i, 1)
+        if here == ":" or here == ";" or here == "," {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
