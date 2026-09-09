@@ -1,0 +1,16 @@
+[package]
+name = "configfiles_demo"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.gitconfig]
+path = "../gitconfig"
+version = "^1.0.0"
+
+[dependencies.sshconfig]
+path = "../sshconfig"
+version = "^1.0.0"
+
+[dependencies.editorconfig]
+path = "../editorconfig"
+version = "^1.0.0"

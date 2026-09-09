@@ -1,0 +1,288 @@
+// `~/.ssh/config`, and the rule that makes it behave unlike every other
+// configuration file.
+//
+//   Host *.example.test bastion
+//       User deploy
+//       Port 2222
+//   Host *
+//       User default
+//
+// ## The *first* value wins, not the last
+//
+// Every other configuration format lets a later setting override an
+// earlier one. This one does the opposite: for each keyword, the first
+// value found while reading top to bottom is the one used, and everything
+// after it is ignored. That is why `Host *` goes at the *bottom* — a
+// general block written first would win over every specific one after it,
+// and the file would appear to ignore its own contents.
+//
+// ## Patterns, and the negated ones
+//
+// A `Host` line takes several patterns, with `*` and `?` wildcards. A
+// pattern beginning with `!` excludes: a host matching any negated pattern
+// does not match the line at all, whatever else is on it. So
+// `Host !secret.example.test *.example.test` is "every host in the domain
+// except that one", and a reader that treats `!x` as a literal name
+// applies the block to the host it was written to exclude.
+//
+// ## What is not here
+//
+// `Include`, which reads another file, and `Match exec`, which runs a
+// command. Both need something outside the text, and a function that
+// takes a string should not go looking for either.
+
+/// One directive.
+type SshEntry = {
+    /// Lower-cased: the file's keywords are case-insensitive.
+    keyword: str,
+    value: str,
+}
+
+/// One block: the patterns it applies to and the settings inside it.
+type SshBlock = {
+    /// `host` or `match`. A `match` block is kept and never matched,
+    /// because deciding whether it applies needs more than the text.
+    kind: str,
+    patterns: [str],
+    entries: [SshEntry],
+}
+
+fn is_space(character: str) -> bool {
+    return character == " " or character == "\t"
+}
+
+fn split_words(text: str) -> [str] {
+    var out: [str] = []
+    var current = ""
+    var quoted = false
+    var i = 0
+    while i < text.len() {
+        let here = text.substr(i, 1)
+        if here == "\"" {
+            quoted = not quoted
+        } else if is_space(here) and not quoted {
+            if current.len() > 0 {
+                out.push(current)
+                current = ""
+            }
+        } else {
+            current = current + here
+        }
+        i = i + 1
+    }
+    if current.len() > 0 {
+        out.push(current)
+    }
+    return out
+}
+
+/// Read a configuration file into its blocks.
+///
+/// Settings written before the first `Host` line apply to every host, and
+/// are returned as a leading block matching `*`.
+pub fn parse(text: str) -> [SshBlock] {
+    var out: [SshBlock] = []
+    var current = SshBlock{ kind: "host", patterns: ["*"], entries: [] }
+    var started = false
+    for raw in text.split("\n") {
+        var line = raw
+        if line.ends_with("\r") {
+            line = line.substr(0, line.len() - 1)
+        }
+        let words = split_words(strip_comment(line))
+        if words.len() == 0 {
+            continue
+        }
+        let keyword = words[0].to_lower()
+        if keyword == "host" or keyword == "match" {
+            if started or current.entries.len() > 0 {
+                out.push(current)
+            }
+            var patterns: [str] = []
+            var i = 1
+            while i < words.len() {
+                patterns.push(words[i])
+                i = i + 1
+            }
+            current = SshBlock{ kind: keyword, patterns: patterns,
+                entries: [] }
+            started = true
+            continue
+        }
+        var value = ""
+        var i = 1
+        while i < words.len() {
+            if i > 1 {
+                value = value + " "
+            }
+            value = value + words[i]
+            i = i + 1
+        }
+        // `Keyword=value` is allowed as well as `Keyword value`.
+        if words.len() == 1 {
+            var at = 0 - 1
+            var j = 0
+            while j < words[0].len() {
+                if words[0].substr(j, 1) == "=" {
+                    at = j
+                    j = words[0].len()
+                } else {
+                    j = j + 1
+                }
+            }
+            if at > 0 {
+                current.entries.push(SshEntry{
+                    keyword: words[0].substr(0, at).to_lower(),
+                    value: words[0].substr(at + 1,
+                        words[0].len() - at - 1) })
+                continue
+            }
+        }
+        current.entries.push(SshEntry{ keyword: keyword, value: value })
+    }
+    if started or current.entries.len() > 0 {
+        out.push(current)
+    }
+    return out
+}
+
+fn strip_comment(line: str) -> str {
+    var out = ""
+    var quoted = false
+    var i = 0
+    while i < line.len() {
+        let here = line.substr(i, 1)
+        if here == "\"" {
+            quoted = not quoted
+        }
+        if here == "#" and not quoted {
+            return out
+        }
+        out = out + here
+        i = i + 1
+    }
+    return out
+}
+
+/// Whether a host name matches one pattern, with `*` and `?`.
+pub fn pattern_matches(pattern: str, host: str) -> bool {
+    return glob_from(pattern, host, 0, 0)
+}
+
+fn glob_from(pattern: str, host: str, p: i64, h: i64) -> bool {
+    var i = p
+    var j = h
+    while i < pattern.len() {
+        let here = pattern.substr(i, 1)
+        if here == "*" {
+            var k = j
+            while k <= host.len() {
+                if glob_from(pattern, host, i + 1, k) {
+                    return true
+                }
+                k = k + 1
+            }
+            return false
+        }
+        if j >= host.len() {
+            return false
+        }
+        if here != "?" and here != host.substr(j, 1) {
+            return false
+        }
+        i = i + 1
+        j = j + 1
+    }
+    return j == host.len()
+}
+
+/// Whether a block's patterns match a host.
+///
+/// A negated pattern that matches rules the block out entirely, and is
+/// checked before anything else — which is what makes
+/// `Host !secret.example.test *.example.test` mean what it looks like.
+pub fn block_matches(block: SshBlock, host: str) -> bool {
+    if block.kind != "host" {
+        return false
+    }
+    var positive = false
+    for pattern in block.patterns {
+        if pattern.starts_with("!") {
+            if pattern_matches(pattern.substr(1, pattern.len() - 1),
+                host) {
+                return false
+            }
+        } else if pattern_matches(pattern, host) {
+            positive = true
+        }
+    }
+    return positive
+}
+
+/// The settings that apply to a host, first value winning.
+pub fn lookup(blocks: [SshBlock], host: str) -> [SshEntry] {
+    var out: [SshEntry] = []
+    for block in blocks {
+        if not block_matches(block, host) {
+            continue
+        }
+        for entry in block.entries {
+            var seen = false
+            for known in out {
+                if known.keyword == entry.keyword {
+                    seen = true
+                }
+            }
+            // The first value wins, so a keyword already answered is not
+            // answered again.
+            if not seen or is_multiple(entry.keyword) {
+                out.push(entry)
+            }
+        }
+    }
+    return out
+}
+
+/// The keywords that accumulate rather than being answered once.
+///
+/// `IdentityFile` is the one that matters: ssh tries every key it has been
+/// given, and a reader that keeps only the first offers one key and fails
+/// to log in.
+pub fn is_multiple(keyword: str) -> bool {
+    return keyword == "identityfile" or keyword == "certificatefile" or
+    keyword == "localforward" or keyword == "remoteforward" or
+    keyword == "dynamicforward" or keyword == "sendenv" or
+    keyword == "setenv"
+}
+
+/// One setting for a host, or the empty string.
+pub fn value_for(blocks: [SshBlock], host: str, keyword: str) -> str {
+    for entry in lookup(blocks, host) {
+        if entry.keyword == keyword.to_lower() {
+            return entry.value
+        }
+    }
+    return ""
+}
+
+/// Every value of a keyword that accumulates.
+pub fn values_for(blocks: [SshBlock], host: str,
+    keyword: str) -> [str] {
+    var out: [str] = []
+    for entry in lookup(blocks, host) {
+        if entry.keyword == keyword.to_lower() {
+            out.push(entry.value)
+        }
+    }
+    return out
+}
+
+/// The host to connect to: `HostName` if the file gives one, and the name
+/// asked for otherwise.
+pub fn hostname_for(blocks: [SshBlock], host: str) -> str {
+    let found = value_for(blocks, host, "hostname")
+    if found.len() > 0 {
+        return found
+    }
+    return host
+}

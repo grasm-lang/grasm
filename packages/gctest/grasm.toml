@@ -1,0 +1,8 @@
+[package]
+name = "gctest"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.gitconfig]
+path = "../gitconfig"
+version = "^1.0.0"

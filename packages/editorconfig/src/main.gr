@@ -1,0 +1,433 @@
+// `.editorconfig`, the file that stops an editor fighting a repository.
+//
+//   root = true
+//
+//   [*]
+//   indent_style = space
+//   indent_size = 4
+//
+//   [*.{js,ts}]
+//   indent_size = 2
+//
+//   [Makefile]
+//   indent_style = tab
+//
+// ## The section names are globs, and not the usual ones
+//
+// `*` stops at a slash and `**` does not, as in `.gitignore`. On top of
+// that there is `{a,b}` alternation and `{1..10}` for a numeric range,
+// neither of which any other configuration format has. And a section
+// without a slash in it matches a file of that name *in any directory*,
+// while one with a slash is relative to the file the section is in — so
+// `[lib/*.js]` and `[*.js]` are different rules and not two spellings of
+// one.
+//
+// ## Later wins, and the merge is per property
+//
+// Every matching section contributes, and a later one overrides an earlier
+// one property by property. So `[*]` sets the defaults and `[*.js]` after
+// it changes one of them — which is the opposite of `~/.ssh/config`, where
+// the first value wins, and getting the two the same way round is a
+// common bug in a tool that reads both.
+
+type EditorSection = {
+    /// The glob as written.
+    pattern: str,
+    properties: [(str, str)],
+}
+
+/// A whole file.
+type EditorFile = {
+    /// Whether `root = true` appeared before the first section, which
+    /// stops the search walking further up the tree.
+    root: bool,
+    sections: [EditorSection],
+}
+
+fn trim(text: str) -> str {
+    var start = 0
+    while start < text.len() and (text.substr(start, 1) == " " or
+        text.substr(start, 1) == "\t") {
+        start = start + 1
+    }
+    var end = text.len()
+    while end > start and (text.substr(end - 1, 1) == " " or
+        text.substr(end - 1, 1) == "\t") {
+        end = end - 1
+    }
+    return text.substr(start, end - start)
+}
+
+/// Read a file.
+pub fn parse(text: str) -> EditorFile {
+    var out = EditorFile{ root: false, sections: [] }
+    var current = 0 - 1
+    for raw in text.split("\n") {
+        var line = raw
+        if line.ends_with("\r") {
+            line = line.substr(0, line.len() - 1)
+        }
+        let body = trim(line)
+        if body.len() == 0 or body.starts_with("#") or
+        body.starts_with(";") {
+            continue
+        }
+        if body.starts_with("[") and body.ends_with("]") {
+            out.sections.push(EditorSection{
+                pattern: body.substr(1, body.len() - 2), properties: [] })
+            current = out.sections.len() - 1
+            continue
+        }
+        var at = 0 - 1
+        var i = 0
+        while i < body.len() {
+            if body.substr(i, 1) == "=" or body.substr(i, 1) == ":" {
+                at = i
+                i = body.len()
+            } else {
+                i = i + 1
+            }
+        }
+        if at < 0 {
+            continue
+        }
+        // Keys are always lower-cased; values are lower-cased only for
+        // the settings whose values are an enumeration. A path or a
+        // number would be damaged by folding, so it is left alone.
+        let key = trim(body.substr(0, at)).to_lower()
+        var value = trim(body.substr(at + 1, body.len() - at - 1))
+        if is_enumerated(key) {
+            value = value.to_lower()
+        }
+        if current < 0 {
+            if key == "root" {
+                out.root = value.to_lower() == "true"
+            }
+            continue
+        }
+        out.sections[current].properties.push((key, value))
+    }
+    return out
+}
+
+/// The settings whose values are one of a fixed set, and so are compared
+/// without regard to case.
+fn is_enumerated(name: str) -> bool {
+    return name == "end_of_line" or name == "indent_style" or
+    name == "indent_size" or name == "insert_final_newline" or
+    name == "trim_trailing_whitespace" or name == "charset"
+}
+
+/// Expand a `{a,b}` alternation and a `{1..9}` range into plain patterns.
+///
+/// Done before matching rather than inside it: the alternation may hold
+/// anything, including another alternation, and expanding once is much
+/// easier to be sure of than a matcher that backtracks through braces.
+pub fn expand(pattern: str) -> [str] {
+    var open = 0 - 1
+    var depth = 0
+    var i = 0
+    while i < pattern.len() {
+        let here = pattern.substr(i, 1)
+        if here == "\\" {
+            i = i + 2
+            continue
+        }
+        if here == "\{" {
+            if depth == 0 {
+                open = i
+            }
+            depth = depth + 1
+        } else if here == "}" {
+            depth = depth - 1
+            if depth == 0 {
+                return expand_at(pattern, open, i)
+            }
+        }
+        i = i + 1
+    }
+    return [pattern]
+}
+
+fn expand_at(pattern: str, open: i64, close: i64) -> [str] {
+    let head = pattern.substr(0, open)
+    let inner = pattern.substr(open + 1, close - open - 1)
+    let tail = pattern.substr(close + 1, pattern.len() - close - 1)
+    var out: [str] = []
+    for piece in numeric_or_split(inner) {
+        for rest in expand(head + piece + tail) {
+            out.push(rest)
+        }
+    }
+    return out
+}
+
+/// The pieces of a brace group: the members of an alternation, or the
+/// numbers of a `{1..9}` range.
+fn numeric_or_split(inner: str) -> [str] {
+    var dots = 0 - 1
+    var i = 0
+    while i + 1 < inner.len() {
+        if inner.substr(i, 2) == ".." {
+            dots = i
+            i = inner.len()
+        } else {
+            i = i + 1
+        }
+    }
+    if dots > 0 {
+        let low = inner.substr(0, dots).parse_int() ?? 0
+        let high = inner.substr(dots + 2, inner.len() - dots - 2)
+            .parse_int() ?? 0 - 1
+        if high >= low and high - low < 10000 {
+            var out: [str] = []
+            var value = low
+            while value <= high {
+                out.push("{value}")
+                value = value + 1
+            }
+            return out
+        }
+    }
+    var out: [str] = []
+    var current = ""
+    var depth = 0
+    var j = 0
+    while j < inner.len() {
+        let here = inner.substr(j, 1)
+        if here == "\\" and j + 1 < inner.len() {
+            current = current + here + inner.substr(j + 1, 1)
+            j = j + 2
+            continue
+        }
+        if here == "\{" {
+            depth = depth + 1
+        } else if here == "}" {
+            depth = depth - 1
+        }
+        if here == "," and depth == 0 {
+            out.push(current)
+            current = ""
+        } else {
+            current = current + here
+        }
+        j = j + 1
+    }
+    out.push(current)
+    return out
+}
+
+/// Whether a glob matches a path.
+///
+/// `*` stops at a slash, `**` does not, `?` is one character that is not a
+/// slash, and `[...]` is a class.
+pub fn glob_matches(pattern: str, path: str) -> bool {
+    return glob_from(pattern, path, 0, 0)
+}
+
+fn glob_from(pattern: str, path: str, p: i64, s: i64) -> bool {
+    var i = p
+    var j = s
+    while i < pattern.len() {
+        let here = pattern.substr(i, 1)
+        if here == "*" {
+            if i + 1 < pattern.len() and pattern.substr(i + 1, 1) == "*" {
+                var k = j
+                while k <= path.len() {
+                    if glob_from(pattern, path, i + 2, k) {
+                        return true
+                    }
+                    k = k + 1
+                }
+                return false
+            }
+            var k = j
+            while k <= path.len() {
+                if glob_from(pattern, path, i + 1, k) {
+                    return true
+                }
+                if k < path.len() and path.substr(k, 1) == "/" {
+                    return false
+                }
+                k = k + 1
+            }
+            return false
+        }
+        if here == "?" {
+            if j >= path.len() or path.substr(j, 1) == "/" {
+                return false
+            }
+            i = i + 1
+            j = j + 1
+        } else if here == "[" {
+            let after = class_matches(pattern, path, i, j)
+            if after < 0 {
+                return false
+            }
+            i = after
+            j = j + 1
+        } else if here == "\\" and i + 1 < pattern.len() {
+            if j >= path.len() or
+            path.substr(j, 1) != pattern.substr(i + 1, 1) {
+                return false
+            }
+            i = i + 2
+            j = j + 1
+        } else {
+            if j >= path.len() or path.substr(j, 1) != here {
+                return false
+            }
+            i = i + 1
+            j = j + 1
+        }
+    }
+    return j == path.len()
+}
+
+fn class_matches(pattern: str, path: str, at: i64, j: i64) -> i64 {
+    if j >= path.len() {
+        return 0 - 1
+    }
+    var i = at + 1
+    var negated = false
+    if i < pattern.len() and (pattern.substr(i, 1) == "!" or
+        pattern.substr(i, 1) == "^") {
+        negated = true
+        i = i + 1
+    }
+    let character = path.substr(j, 1)
+    var hit = false
+    var first = true
+    while i < pattern.len() {
+        if pattern.substr(i, 1) == "]" and not first {
+            if hit != negated {
+                return i + 1
+            }
+            return 0 - 1
+        }
+        first = false
+        var low = pattern.substr(i, 1)
+        if low == "\\" and i + 1 < pattern.len() {
+            i = i + 1
+            low = pattern.substr(i, 1)
+        }
+        if i + 2 < pattern.len() and pattern.substr(i + 1, 1) == "-" and
+        pattern.substr(i + 2, 1) != "]" {
+            let high = pattern.substr(i + 2, 1)
+            if character >= low and character <= high {
+                hit = true
+            }
+            i = i + 3
+        } else {
+            if character == low {
+                hit = true
+            }
+            i = i + 1
+        }
+    }
+    return 0 - 1
+}
+
+fn has_slash(text: str) -> bool {
+    var i = 0
+    while i < text.len() {
+        if text.substr(i, 1) == "/" {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+/// Whether a section applies to a path relative to the file's directory.
+pub fn section_matches(section: EditorSection, path: str) -> bool {
+    for one in expand(section.pattern) {
+        var pattern = one
+        if not has_slash(pattern) {
+            // A name with no slash matches that name in any directory.
+            pattern = "**/" + pattern
+        } else if pattern.starts_with("/") {
+            pattern = pattern.substr(1, pattern.len() - 1)
+        }
+        if glob_matches(pattern, path) or
+        glob_matches(pattern, "/" + path) {
+            return true
+        }
+    }
+    return false
+}
+
+/// The properties that apply to a path, later sections overriding earlier
+/// ones property by property.
+pub fn properties_for(file: EditorFile, path: str) -> [(str, str)] {
+    var out: [(str, str)] = []
+    for section in file.sections {
+        if not section_matches(section, path) {
+            continue
+        }
+        for property in section.properties {
+            var found = 0 - 1
+            var i = 0
+            while i < out.len() {
+                if out[i].0 == property.0 {
+                    found = i
+                }
+                i = i + 1
+            }
+            if found >= 0 {
+                out[found] = property
+            } else {
+                out.push(property)
+            }
+        }
+    }
+    derive(out)
+    return out
+}
+
+/// The three settings the specification derives rather than reads.
+///
+/// `indent_size` and `tab_width` are two names for nearly the same thing,
+/// and an editor asks for whichever it happens to use — so a file that
+/// sets one has to answer for both, or half the editors ignore it.
+fn derive(inout properties: [(str, str)]) {
+    let style = find(properties, "indent_style")
+    let size = find(properties, "indent_size")
+    let width = find(properties, "tab_width")
+    if style == "tab" and size.len() == 0 {
+        properties.push(("indent_size", "tab"))
+    }
+    let now = find(properties, "indent_size")
+    if now.len() > 0 and width.len() == 0 and now != "tab" {
+        properties.push(("tab_width", now))
+    }
+    let again = find(properties, "tab_width")
+    if now == "tab" and again.len() > 0 {
+        var i = 0
+        while i < properties.len() {
+            if properties[i].0 == "indent_size" {
+                properties[i] = ("indent_size", again)
+            }
+            i = i + 1
+        }
+    }
+}
+
+fn find(properties: [(str, str)], name: str) -> str {
+    for property in properties {
+        if property.0 == name {
+            return property.1
+        }
+    }
+    return ""
+}
+
+/// One property for a path, or the empty string.
+pub fn property_for(file: EditorFile, path: str, name: str) -> str {
+    for property in properties_for(file, path) {
+        if property.0 == name.to_lower() {
+            return property.1
+        }
+    }
+    return ""
+}

@@ -1,0 +1,326 @@
+// Git's configuration file, which is nearly INI and is not INI.
+//
+//   [core]
+//   	filemode = true
+//   	bare
+//   [remote "origin"]
+//   	url = https://example.test/repo.git
+//
+// Five differences from every INI parser:
+//
+//   - **Section names have a subsection**: `[remote "origin"]` makes keys
+//     called `remote.origin.url`, and the subsection is case-*sensitive*
+//     while the section and key names are not. So `[REMOTE "Origin"]` and
+//     `[remote "Origin"]` are the same section and `[remote "origin"]` is
+//     a different one.
+//   - **A key may have no value**, which means true.
+//   - **A value may be quoted**, and inside the quotes a `;` is not a
+//     comment and trailing space is kept.
+//   - **A value may be continued** onto the next line with a trailing
+//     backslash, and the newline goes.
+//   - **Escapes are `\n`, `\t`, `\b`, `\"` and `\\`** and nothing else; a
+//     backslash before anything else is an error rather than a literal.
+//
+// ## The same key may appear many times
+//
+// `fetch` in a remote and `push` in a branch are both multi-valued, and
+// what git does with a repeated key depends on the key. `values_of`
+// answers with all of them in order; `value_of` answers with the last,
+// which is what git does for a single-valued key.
+
+type GitConfigError =
+    | BadSection(line: i64)
+    | BadEscape(line: i64)
+    | NoNewline(line: i64)
+    | BadKey(line: i64)
+
+    /// One setting, with its name already assembled.
+type GitConfigEntry = {
+    /// `core.filemode`, or `remote.origin.url`. The section and key are
+    /// lower-cased and the subsection is not.
+    name: str,
+    value: str,
+    /// Whether the key was written with no `=`, which means true.
+    implicit: bool,
+}
+
+fn is_space(character: str) -> bool {
+    return character == " " or character == "\t"
+}
+
+fn is_key_char(character: str) -> bool {
+    let byte = character.to_bytes().at(0)
+    return (byte >= 65 and byte <= 90) or (byte >= 97 and byte <= 122) or
+    (byte >= 48 and byte <= 57) or character == "-"
+}
+
+fn trim_both(text: str) -> str {
+    var start = 0
+    while start < text.len() and is_space(text.substr(start, 1)) {
+        start = start + 1
+    }
+    var end = text.len()
+    while end > start and is_space(text.substr(end - 1, 1)) {
+        end = end - 1
+    }
+    return text.substr(start, end - start)
+}
+
+/// Read a file.
+pub fn parse(text: str) -> [GitConfigEntry] ! GitConfigError {
+    var out: [GitConfigEntry] = []
+    var section = ""
+    let lines = text.split("\n")
+    var i = 0
+    while i < lines.len() {
+        var line = lines[i]
+        if line.ends_with("\r") {
+            line = line.substr(0, line.len() - 1)
+        }
+        let number = i + 1
+        i = i + 1
+        let body = trim_both(line)
+        if body.len() == 0 or body.starts_with("#") or
+        body.starts_with(";") {
+            continue
+        }
+        if body.starts_with("[") {
+            section = try read_section(body, number)
+            continue
+        }
+        // A key, and a value that may run onto the following lines.
+        var whole = line
+        while whole.ends_with("\\") {
+            if i >= lines.len() {
+                fail(NoNewline(number))
+            }
+            var next = lines[i]
+            if next.ends_with("\r") {
+                next = next.substr(0, next.len() - 1)
+            }
+            whole = whole.substr(0, whole.len() - 1) + next
+            i = i + 1
+        }
+        out.push(try read_entry(whole, section, number))
+    }
+    return out
+}
+
+/// `[section "subsection"]`, with the section lower-cased and the
+/// subsection left alone.
+fn read_section(body: str, number: i64) -> str ! GitConfigError {
+    if not body.ends_with("]") {
+        fail(BadSection(number))
+    }
+    let inner = body.substr(1, body.len() - 2)
+    var name = ""
+    var i = 0
+    while i < inner.len() and not is_space(inner.substr(i, 1)) {
+        name = name + inner.substr(i, 1)
+        i = i + 1
+    }
+    // The dotted form `[section.subsection]` is also allowed, and there
+    // the subsection is lower-cased like the section — which is the one
+    // place the two spellings mean different things.
+    if i >= inner.len() {
+        return name.to_lower()
+    }
+    while i < inner.len() and is_space(inner.substr(i, 1)) {
+        i = i + 1
+    }
+    if i >= inner.len() or inner.substr(i, 1) != "\"" {
+        fail(BadSection(number))
+    }
+    i = i + 1
+    var subsection = ""
+    var closed = false
+    while i < inner.len() {
+        let here = inner.substr(i, 1)
+        if here == "\\" and i + 1 < inner.len() {
+            subsection = subsection + inner.substr(i + 1, 1)
+            i = i + 2
+            continue
+        }
+        if here == "\"" {
+            closed = true
+            i = i + 1
+            break
+        }
+        subsection = subsection + here
+        i = i + 1
+    }
+    if not closed {
+        fail(BadSection(number))
+    }
+    return name.to_lower() + "." + subsection
+}
+
+fn read_entry(line: str, section: str,
+    number: i64) -> GitConfigEntry ! GitConfigError {
+    var i = 0
+    while i < line.len() and is_space(line.substr(i, 1)) {
+        i = i + 1
+    }
+    var key = ""
+    while i < line.len() and is_key_char(line.substr(i, 1)) {
+        key = key + line.substr(i, 1)
+        i = i + 1
+    }
+    if key.len() == 0 {
+        fail(BadKey(number))
+    }
+    let name = section + "." + key.to_lower()
+    while i < line.len() and is_space(line.substr(i, 1)) {
+        i = i + 1
+    }
+    if i >= line.len() or line.substr(i, 1) != "=" {
+        return GitConfigEntry{ name: name, value: "true", implicit: true }
+    }
+    i = i + 1
+    return GitConfigEntry{ name: name,
+        value: try read_value(line, i, number), implicit: false }
+}
+
+/// A value: quoted runs, escapes, and a comment that ends it.
+fn read_value(line: str, from: i64, number: i64) -> str ! GitConfigError {
+    var out = ""
+    var quoted = false
+    var i = from
+    var trailing = 0
+    while i < line.len() {
+        let here = line.substr(i, 1)
+        if here == "\"" {
+            quoted = not quoted
+            i = i + 1
+            continue
+        }
+        if here == "\\" {
+            if i + 1 >= line.len() {
+                fail(BadEscape(number))
+            }
+            let next = line.substr(i + 1, 1)
+            if next == "n" {
+                out = out + "\n"
+            } else if next == "t" {
+                out = out + "\t"
+            } else if next == "b" {
+                out = out + 8.to_char()
+            } else if next == "\"" or next == "\\" {
+                out = out + next
+            } else {
+                fail(BadEscape(number))
+            }
+            trailing = 0
+            i = i + 2
+            continue
+        }
+        if not quoted and (here == "#" or here == ";") {
+            break
+        }
+        if not quoted and is_space(here) {
+            // Space outside quotes is only kept when something follows
+            // it, so a trailing run is dropped and an inner one is not.
+            trailing = trailing + 1
+            out = out + here
+            i = i + 1
+            continue
+        }
+        trailing = 0
+        out = out + here
+        i = i + 1
+    }
+    if trailing > 0 {
+        out = out.substr(0, out.len() - trailing)
+    }
+    var start = 0
+    while start < out.len() and is_space(out.substr(start, 1)) {
+        start = start + 1
+    }
+    return out.substr(start, out.len() - start)
+}
+
+/// Every value of a name, in the order they were written.
+pub fn values_of(entries: [GitConfigEntry], name: str) -> [str] {
+    var out: [str] = []
+    for entry in entries {
+        if entry.name == name {
+            out.push(entry.value)
+        }
+    }
+    return out
+}
+
+/// The last value of a name, which is what git uses for a single-valued
+/// key, or the empty string.
+pub fn value_of(entries: [GitConfigEntry], name: str) -> str {
+    var out = ""
+    for entry in entries {
+        if entry.name == name {
+            out = entry.value
+        }
+    }
+    return out
+}
+
+/// A boolean setting, read the way git reads one.
+///
+/// `yes`, `on`, `true`, `1` and a bare key are all true; `no`, `off`,
+/// `false`, `0` and the empty string are false. Anything else is neither,
+/// which is why this answers with an `Option` rather than guessing.
+pub fn boolean_of(entries: [GitConfigEntry], name: str) -> Option[bool] {
+    var found = false
+    var value = ""
+    for entry in entries {
+        if entry.name == name {
+            found = true
+            value = entry.value.to_lower()
+        }
+    }
+    if not found {
+        return None
+    }
+    if value == "yes" or value == "on" or value == "true" or
+    value == "1" {
+        return Some(true)
+    }
+    if value == "no" or value == "off" or value == "false" or
+    value == "0" or value.len() == 0 {
+        return Some(false)
+    }
+    return None
+}
+
+/// The subsections of a section: the remotes, the branches, the worktrees.
+pub fn subsections(entries: [GitConfigEntry], section: str) -> [str] {
+    var out: [str] = []
+    let prefix = section.to_lower() + "."
+    for entry in entries {
+        if not entry.name.starts_with(prefix) {
+            continue
+        }
+        let rest = entry.name.substr(prefix.len(),
+            entry.name.len() - prefix.len())
+        var last = 0 - 1
+        var i = 0
+        while i < rest.len() {
+            if rest.substr(i, 1) == "." {
+                last = i
+            }
+            i = i + 1
+        }
+        if last < 0 {
+            continue
+        }
+        let name = rest.substr(0, last)
+        var seen = false
+        for known in out {
+            if known == name {
+                seen = true
+            }
+        }
+        if not seen {
+            out.push(name)
+        }
+    }
+    return out
+}

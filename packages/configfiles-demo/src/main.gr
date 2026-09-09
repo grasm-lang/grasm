@@ -1,0 +1,154 @@
+// Three configuration files a developer's machine already has, and the
+// three different rules they use to decide which setting wins.
+//
+// The expected values were checked against `git config --list` itself,
+// against paramiko's reader, and against the reference `editorconfig`
+// library.
+import gitconfig
+import sshconfig
+import editorconfig
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn joined(lines: [str]) -> str {
+    return lines.join("\n") + "\n"
+}
+
+// ------------------------------------------------------------- gitconfig
+
+fn entries_of(lines: [str]) -> [GitConfigEntry] {
+    return gitconfig.parse(joined(lines)) ?? []
+}
+
+fn check_git(inout f: i64) / {io} {
+    print("-- gitconfig: nearly INI, and not INI")
+    let entries = entries_of(["[core]", "\tfilemode = true", "\tbare",
+        "[remote \"origin\"]",
+        "\turl = https://example.test/repo.git",
+        "\tfetch = +refs/heads/*:refs/remotes/origin/*",
+        "\tfetch = +refs/tags/*:refs/tags/*",
+        "[Alias]", "\tCO = checkout",
+        "\tlg = log --oneline \\", "\t\t--graph",
+        "[user]", "\tname = \"A \\\"quoted\\\" name\"",
+        "\temail = a@b.test ; trailing comment"])
+    say(f, "a subsection becomes part of the name, and keeps its case",
+        gitconfig.value_of(entries, "remote.origin.url") ==
+        "https://example.test/repo.git")
+    say(f, "the section and the key are folded and the subsection is not",
+        gitconfig.value_of(entries, "alias.co") == "checkout")
+    say(f, "a key with no value means true",
+        gitconfig.value_of(entries, "core.bare") == "true" and
+        (gitconfig.boolean_of(entries, "core.bare") ?? false))
+    say(f, "a trailing backslash joins the next line, newline and all gone",
+        gitconfig.value_of(entries, "alias.lg") ==
+        "log --oneline \t\t--graph")
+    say(f, "a quoted value keeps what is inside it",
+        gitconfig.value_of(entries, "user.name") ==
+        "A \"quoted\" name")
+    say(f, "and a semicolon outside quotes starts a comment",
+        gitconfig.value_of(entries, "user.email") == "a@b.test")
+    say(f, "a key written twice keeps both, in order",
+        gitconfig.values_of(entries, "remote.origin.fetch").len() == 2)
+    say(f, "git's own spellings of true and false are understood",
+        (gitconfig.boolean_of(entries_of(["[a]", "b = yes"]), "a.b")
+            ?? false) and
+        not (gitconfig.boolean_of(entries_of(["[a]", "b = off"]), "a.b")
+            ?? true) and
+        gitconfig.boolean_of(entries_of(["[a]", "b = maybe"]), "a.b") ==
+        None)
+    say(f, "and the subsections of a section can be listed",
+        gitconfig.subsections(entries, "remote") == ["origin"])
+}
+
+// ------------------------------------------------------------- sshconfig
+
+fn check_ssh(inout f: i64) / {io} {
+    print("-- sshconfig: the first value wins, which is backwards")
+    let blocks = sshconfig.parse(joined([
+        "Host !secret.example.test *.example.test",
+        "    User deploy", "    Port 2222",
+        "Host *",
+        "    User default",
+        "    IdentityFile ~/.ssh/id_ed25519",
+        "    IdentityFile ~/.ssh/other"]))
+    say(f, "a specific block set first wins over the general one after it",
+        sshconfig.value_for(blocks, "a.example.test", "user") == "deploy"
+        and sshconfig.value_for(blocks, "other.test", "user") == "default")
+    say(f, "a negated pattern rules the whole line out",
+        sshconfig.value_for(blocks, "secret.example.test", "user") ==
+        "default")
+    say(f, "a keyword that accumulates keeps every value",
+        sshconfig.values_for(blocks, "other.test", "identityfile")
+            .len() == 2)
+    say(f, "and one that does not keeps the first",
+        sshconfig.values_for(blocks, "a.example.test", "user").len() == 1)
+    say(f, "the wildcards are the shell's, and stop at nothing else",
+        sshconfig.pattern_matches("*.example.test", "a.b.example.test") and
+        sshconfig.pattern_matches("web??", "web01") and
+        not sshconfig.pattern_matches("web??", "web1"))
+    say(f, "Keyword=value is the same as Keyword value",
+        sshconfig.value_for(sshconfig.parse(joined(["Host x",
+            "  Port=2200"])), "x", "port") == "2200")
+    say(f, "settings before the first Host line apply to every host",
+        sshconfig.value_for(sshconfig.parse(joined(["Compression yes",
+            "Host x", "  Port 22"])), "anything", "compression") == "yes")
+    say(f, "and the host to dial is HostName when the file gives one",
+        sshconfig.hostname_for(sshconfig.parse(joined(["Host short",
+            "  HostName long.example.test"])), "short") ==
+        "long.example.test" and
+        sshconfig.hostname_for(blocks, "other.test") == "other.test")
+}
+
+// ---------------------------------------------------------- editorconfig
+
+fn check_editor(inout f: i64) / {io} {
+    print("-- editorconfig: later wins, per property")
+    let file = editorconfig.parse(joined(["root = true",
+        "[*]", "indent_style = space", "indent_size = 4",
+        "charset = utf-8",
+        "[*.\{js,ts}]", "indent_size = 2",
+        "[Makefile]", "indent_style = tab",
+        "[lib/*.c]", "max_line_length = 100"]))
+    say(f, "root stops the search walking further up the tree", file.root)
+    say(f, "the general section sets the defaults",
+        editorconfig.property_for(file, "a.py", "indent_size") == "4")
+    say(f, "and a later section changes one property, not all of them",
+        editorconfig.property_for(file, "a.js", "indent_size") == "2" and
+        editorconfig.property_for(file, "a.js", "indent_style") == "space")
+    say(f, "an alternation is expanded, so both extensions match",
+        editorconfig.property_for(file, "a.ts", "indent_size") == "2")
+    say(f, "a section with no slash matches that name in any directory",
+        editorconfig.property_for(file, "deep/Makefile", "indent_style")
+        == "tab")
+    say(f, "and one with a slash is relative to the file it is in",
+        editorconfig.property_for(file, "lib/a.c", "max_line_length") ==
+        "100" and
+        editorconfig.property_for(file, "deep/lib/a.c",
+            "max_line_length") == "")
+    say(f, "tab_width follows indent_size, because editors ask for both",
+        editorconfig.property_for(file, "a.js", "tab_width") == "2")
+    say(f, "and indent_size follows a tab style when it is not given",
+        editorconfig.property_for(file, "Makefile", "indent_size") == "4")
+    say(f, "a numeric range in a section name is expanded too",
+        editorconfig.property_for(editorconfig.parse(joined([
+            "[*.\{1..3}]", "indent_size = 8"])), "a.2", "indent_size") == "8")
+}
+
+fn main() / {io} {
+    var f = 0
+    check_git(f)
+    check_ssh(f)
+    check_editor(f)
+    if f == 0 {
+        print("configuration files: every claim held")
+    } else {
+        print("configuration files: {f} claims failed")
+    }
+}

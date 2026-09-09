@@ -1,0 +1,45 @@
+import gitconfig
+
+fn from_hex(text: str) -> str {
+    var out: [i64] = []
+    var i = 0
+    while i + 1 < text.len() {
+        out.push(text.substr(i, 2).parse_int_base(16) ?? 0)
+        i = i + 2
+    }
+    return bytes_of(out).to_str()
+}
+
+fn to_hex(text: str) -> str {
+    let digits = "0123456789abcdef"
+    let raw = text.to_bytes()
+    var out = ""
+    var i = 0
+    while i < raw.len() {
+        out = out + digits.substr(raw.at(i) / 16, 1) +
+            digits.substr(raw.at(i) % 16, 1)
+        i = i + 1
+    }
+    return out
+}
+
+fn main() / {io} {
+    var i = 0
+    while i < args().len() {
+        match gitconfig.parse(from_hex(args()[i])) {
+            Ok(entries) -> {
+                var out = ""
+                for entry in entries {
+                    out = out + entry.name
+                    if not entry.implicit {
+                        out = out + "=" + entry.value
+                    }
+                    out = out + "\n"
+                }
+                print(to_hex(out))
+            }
+            Err(_why) -> print("error")
+        }
+        i = i + 1
+    }
+}
