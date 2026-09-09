@@ -1,0 +1,28 @@
+[package]
+name = "ml_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.kmeans]
+path = "../kmeans"
+version = "^1.0.0"
+
+[dependencies.knn]
+path = "../knn"
+version = "^1.0.0"
+
+[dependencies.naivebayes]
+path = "../naivebayes"
+version = "^1.0.0"
+
+[dependencies.decisiontree]
+path = "../decisiontree"
+version = "^1.0.0"
+
+[dependencies.mlmetrics]
+path = "../mlmetrics"
+version = "^1.0.0"
+
+[dependencies.random]
+path = "../random"
+version = "^1.0.0"

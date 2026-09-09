@@ -14,7 +14,7 @@ plan that discovers them 300 packages in.
 | | |
 |---|---|
 | Started | 78 |
-| Now | 390 |
+| Now | 408 |
 | Tier 1 target | 200 |
 | Tier 2 target | 500 |
 | Tier 3 target | 800 |
@@ -237,15 +237,18 @@ says where the data came from and under what licence, which is the condition.
 | ~~Scientific units~~ | ~~`siunits` `constants` `uncertainty` `dimension` `unitparse`~~ — done | pint, CODATA via scipy, uncertainties |
 | ~~Time zones~~ | ~~`tzfile` `tzrule` `sunrise` `solar` `leapsecond`~~ — done | zoneinfo, astral, IERS |
 | ~~Statistics III~~ | ~~`bootstrap` `anova` `survival` `timeseries` `changepoint`~~ | scipy, statsmodels, lifelines, pingouin, ruptures |
-| Machine learning basics | `kmeans` `naivebayes` `decisiontree` `knn` `mlmetrics` | scikit-learn |
-| Security III | `passwordpolicy` `entropy` `secretscan` `keyderive` `saltedhash` | zxcvbn, gitleaks rules |
+| ~~Machine learning basics~~ | ~~`kmeans` `naivebayes` `decisiontree` `knn` `mlmetrics`~~ | scikit-learn |
+| ~~Security III~~ | ~~`passwordpolicy` `entropy` `secretscan` `keyderive` `saltedhash`~~ | zxcvbn, gitleaks' own rules, passlib |
 | ~~Web III~~ | ~~`formdata` `csp` `hsts` `preflight` `webfinger`~~ | RFC 6797's own ABNF, Python's `email`, `content-security-policy`, Flask-Cors, urllib |
-| Serialisation IV | `flatbuffers` `capnp` `ubjson` `smile` `amf` | the reference encoders |
+| ~~Serialisation IV~~ | ~~`flatbuffers` `capnp` `ubjson`~~ and `ion` and `thriftcompact`, because Smile's and AMF's only Python implementations are abandoned at Python 2 and there is nothing left to check against | the reference encoders |
 | ~~Geospatial II~~ | ~~`mgrs` `utm` `gpx` `kml` `geodesic`~~ | pyproj, geographiclib, the Python `mgrs` package, gpxpy |
 
 That is a hundred, in twenty batches, and the same rhythm as the first: five
 or six packages to a group demo, every claim an assertion, every batch checked
-against the tool that owns its format before it lands.
+against the tool that owns its format before it lands. **All twenty are
+done.** The count is 408, not 500, and the ninety-odd that would close the gap
+are the ones below: they are not skipped for being hard but for being
+impossible until P1 exists.
 
 ### Needs P1 — a TLS client. About 120, and none of them can start.
 

@@ -1,0 +1,560 @@
+// How good is the classifier, and what does the number you quoted mean.
+//
+// Accuracy is the first thing anybody reports and is nearly useless. A
+// fraud detector that says "not fraud" to everything is 99.9% accurate.
+// Every metric here exists because accuracy failed somebody, and each one
+// fails in its own way, which is the part worth knowing.
+//
+// ## Precision and recall trade against each other
+//
+// Precision is how many of the things you flagged were real; recall is how
+// many of the real ones you flagged. Flag everything and recall is 1;
+// flag one thing you are certain of and precision is 1. F1 is their harmonic
+// mean, which punishes the imbalance a plain average would hide — 0.99 and
+// 0.01 average to 0.5 and have an F1 of 0.02.
+//
+// ## Averaging across classes is three different questions
+//
+// Macro averaging weights every class equally, so a class with nine
+// examples counts as much as one with nine thousand: use it when the rare
+// classes are the point. Micro averaging pools the counts first, which for
+// single-label classification makes precision, recall and F1 all equal to
+// accuracy. Weighted averaging weights by support, which is the one that
+// flatters an imbalanced model. Quoting one without saying which is how a
+// number becomes meaningless.
+//
+// ## The threshold-free ones
+//
+// ROC AUC is the probability that a randomly chosen positive is scored
+// above a randomly chosen negative. It is insensitive to class imbalance —
+// which is a feature when comparing models and a trap when reporting one,
+// because 0.95 on a dataset with 0.1% positives can still mean a precision
+// of 2%. Average precision, the area under the precision-recall curve, is
+// the one to report there.
+
+type MetricError =
+    | LengthMismatch(a: i64, b: i64)
+    | NoObservations()
+    | BadLabel(label: i64)
+    | NoPositives()
+    | NotAProbability(value: f64)
+
+    /// The counts of a two-class outcome.
+type Confusion = {
+    true_positive: i64,
+    false_positive: i64,
+    true_negative: i64,
+    false_negative: i64,
+}
+
+fn check_pair(a: [i64], b: [i64]) -> bool ! MetricError {
+    if a.len() != b.len() {
+        fail(LengthMismatch(a.len(), b.len()))
+    }
+    if a.len() == 0 {
+        fail(NoObservations())
+    }
+    return true
+}
+
+/// The share of predictions that were right.
+pub fn accuracy(truth: [i64], predicted: [i64]) -> f64 ! MetricError {
+    try check_pair(truth, predicted)
+    var right = 0
+    var i = 0
+    while i < truth.len() {
+        if truth[i] == predicted[i] {
+            right = right + 1
+        }
+        i = i + 1
+    }
+    return right.as_f64() / truth.len().as_f64()
+}
+
+/// The full confusion matrix, `matrix[actual][predicted]`.
+///
+/// Labels are 0 to `classes - 1`. The matrix is the thing to look at before
+/// any single number: it says *which* classes are being confused, and no
+/// scalar can.
+pub fn confusion_matrix(truth: [i64], predicted: [i64],
+    classes: i64) -> [[i64]] ! MetricError {
+    try check_pair(truth, predicted)
+    if classes < 1 {
+        fail(BadLabel(classes))
+    }
+    var out: [[i64]] = []
+    var i = 0
+    while i < classes {
+        var row: [i64] = []
+        var j = 0
+        while j < classes {
+            row.push(0)
+            j = j + 1
+        }
+        out.push(row)
+        i = i + 1
+    }
+    var k = 0
+    while k < truth.len() {
+        if truth[k] < 0 or truth[k] >= classes {
+            fail(BadLabel(truth[k]))
+        }
+        if predicted[k] < 0 or predicted[k] >= classes {
+            fail(BadLabel(predicted[k]))
+        }
+        out[truth[k]][predicted[k]] = out[truth[k]][predicted[k]] + 1
+        k = k + 1
+    }
+    return out
+}
+
+/// The four counts for one class treated as the positive one.
+pub fn counts_for(truth: [i64], predicted: [i64],
+    positive: i64) -> Confusion ! MetricError {
+    try check_pair(truth, predicted)
+    var out = Confusion{ true_positive: 0, false_positive: 0,
+        true_negative: 0, false_negative: 0 }
+    var i = 0
+    while i < truth.len() {
+        let actual = truth[i] == positive
+        let said = predicted[i] == positive
+        if actual and said {
+            out.true_positive = out.true_positive + 1
+        } else if said {
+            out.false_positive = out.false_positive + 1
+        } else if actual {
+            out.false_negative = out.false_negative + 1
+        } else {
+            out.true_negative = out.true_negative + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+/// Of the ones flagged, how many were right.
+///
+/// Zero when nothing was flagged, which is the convention every library
+/// settled on: the alternative is a division by zero, and calling it 1
+/// would reward a model that never flags anything.
+pub fn precision_of(counts: Confusion) -> f64 {
+    let flagged = counts.true_positive + counts.false_positive
+    if flagged == 0 {
+        return 0.0
+    }
+    return counts.true_positive.as_f64() / flagged.as_f64()
+}
+
+/// Of the real ones, how many were flagged.
+pub fn recall_of(counts: Confusion) -> f64 {
+    let real = counts.true_positive + counts.false_negative
+    if real == 0 {
+        return 0.0
+    }
+    return counts.true_positive.as_f64() / real.as_f64()
+}
+
+/// The harmonic mean of precision and recall.
+pub fn f1_of(counts: Confusion) -> f64 {
+    let p = precision_of(counts)
+    let r = recall_of(counts)
+    if p + r == 0.0 {
+        return 0.0
+    }
+    return 2.0 * p * r / (p + r)
+}
+
+/// F-beta: beta above one weights recall, below one weights precision.
+///
+/// The knob exists because the two errors cost different amounts. A cancer
+/// screen wants beta of 2; a spam filter that moves mail out of the inbox
+/// wants beta of 0.5.
+pub fn f_beta_of(counts: Confusion, beta: f64) -> f64 {
+    let p = precision_of(counts)
+    let r = recall_of(counts)
+    let square = beta * beta
+    if square * p + r == 0.0 {
+        return 0.0
+    }
+    return (1.0 + square) * p * r / (square * p + r)
+}
+
+/// Macro averaging: every class counts the same, whatever its size.
+pub fn macro_f1(truth: [i64], predicted: [i64],
+    classes: i64) -> f64 ! MetricError {
+    var total = 0.0
+    var c = 0
+    while c < classes {
+        total = total + f1_of(try counts_for(truth, predicted, c))
+        c = c + 1
+    }
+    return total / classes.as_f64()
+}
+
+/// Weighted averaging: each class counts as much as it has examples.
+pub fn weighted_f1(truth: [i64], predicted: [i64],
+    classes: i64) -> f64 ! MetricError {
+    try check_pair(truth, predicted)
+    var total = 0.0
+    var c = 0
+    while c < classes {
+        let counts = try counts_for(truth, predicted, c)
+        let support = counts.true_positive + counts.false_negative
+        total = total + f1_of(counts) * support.as_f64()
+        c = c + 1
+    }
+    return total / truth.len().as_f64()
+}
+
+/// Micro averaging, which for single-label classification is the accuracy.
+///
+/// Worth having anyway, because seeing the three agree is what tells you the
+/// problem is single-label and the number you are quoting is accuracy under
+/// another name.
+pub fn micro_f1(truth: [i64], predicted: [i64],
+    classes: i64) -> f64 ! MetricError {
+    var pooled = Confusion{ true_positive: 0, false_positive: 0,
+        true_negative: 0, false_negative: 0 }
+    var c = 0
+    while c < classes {
+        let counts = try counts_for(truth, predicted, c)
+        pooled.true_positive = pooled.true_positive + counts.true_positive
+        pooled.false_positive = pooled.false_positive + counts.false_positive
+        pooled.false_negative = pooled.false_negative + counts.false_negative
+        c = c + 1
+    }
+    return f1_of(pooled)
+}
+
+/// Matthews' correlation coefficient, between -1 and 1.
+///
+/// The one number that is hard to game: it is only high when all four cells
+/// of the matrix are good, so the all-negatives classifier scores 0 rather
+/// than 0.999. It is the correlation between the truth and the prediction
+/// read as two binary variables.
+pub fn matthews(counts: Confusion) -> f64 {
+    let tp = counts.true_positive.as_f64()
+    let fp = counts.false_positive.as_f64()
+    let tn = counts.true_negative.as_f64()
+    let fn_count = counts.false_negative.as_f64()
+    let bottom = ((tp + fp) * (tp + fn_count) * (tn + fp) *
+        (tn + fn_count)).sqrt()
+    if bottom == 0.0 {
+        return 0.0
+    }
+    return (tp * tn - fp * fn_count) / bottom
+}
+
+/// Cohen's kappa: agreement above what two raters would reach by chance.
+///
+/// Answers the question accuracy cannot on an imbalanced problem — how much
+/// of the agreement is skill rather than both parties guessing the common
+/// answer.
+pub fn cohen_kappa(truth: [i64], predicted: [i64],
+    classes: i64) -> f64 ! MetricError {
+    let matrix = try confusion_matrix(truth, predicted, classes)
+    let n = truth.len().as_f64()
+    var agreed = 0.0
+    var expected = 0.0
+    var i = 0
+    while i < classes {
+        agreed = agreed + matrix[i][i].as_f64()
+        var row = 0
+        var column = 0
+        var j = 0
+        while j < classes {
+            row = row + matrix[i][j]
+            column = column + matrix[j][i]
+            j = j + 1
+        }
+        expected = expected + row.as_f64() * column.as_f64() / n
+        i = i + 1
+    }
+    if n - expected == 0.0 {
+        return 0.0
+    }
+    return (agreed - expected) / (n - expected)
+}
+
+// -------------------------------------------------- scores, not decisions
+
+fn check_scored(truth: [i64], scores: [f64]) -> bool ! MetricError {
+    if truth.len() != scores.len() {
+        fail(LengthMismatch(truth.len(), scores.len()))
+    }
+    if truth.len() == 0 {
+        fail(NoObservations())
+    }
+    return true
+}
+
+/// The order that sorts the scores from highest to lowest.
+fn descending(scores: [f64]) -> [i64] {
+    var out: [i64] = []
+    var i = 0
+    while i < scores.len() {
+        out.push(i)
+        i = i + 1
+    }
+    var a = 1
+    while a < out.len() {
+        let value = out[a]
+        var b = a - 1
+        while b >= 0 and scores[out[b]] < scores[value] {
+            out[b + 1] = out[b]
+            b = b - 1
+        }
+        out[b + 1] = value
+        a = a + 1
+    }
+    return out
+}
+
+/// The area under the ROC curve, computed by rank rather than by
+/// trapezoids.
+///
+/// AUC is the probability that a random positive outranks a random
+/// negative, and the Mann-Whitney statistic computes exactly that from the
+/// ranks — with ties counted as half, which is the part a trapezoid
+/// implementation quietly gets wrong when many scores are equal.
+pub fn roc_auc(truth: [i64], scores: [f64]) -> f64 ! MetricError {
+    try check_scored(truth, scores)
+    var positives = 0
+    for label in truth {
+        if label == 1 {
+            positives = positives + 1
+        }
+    }
+    let negatives = truth.len() - positives
+    if positives == 0 or negatives == 0 {
+        fail(NoPositives())
+    }
+    let order = descending(scores)
+    var rank_total = 0.0
+    var i = 0
+    while i < order.len() {
+        var j = i
+        while j < order.len() and scores[order[j]] == scores[order[i]] {
+            j = j + 1
+        }
+        // Every score in a tied block gets the average of the ranks the
+        // block covers, counting from the bottom as Mann-Whitney does.
+        let low = order.len() - j + 1
+        let high = order.len() - i
+        let shared = (low + high).as_f64() / 2.0
+        var k = i
+        while k < j {
+            if truth[order[k]] == 1 {
+                rank_total = rank_total + shared
+            }
+            k = k + 1
+        }
+        i = j
+    }
+    let positive_pairs = positives.as_f64() * negatives.as_f64()
+    return (rank_total - positives.as_f64() * (positives + 1).as_f64() /
+        2.0) / positive_pairs
+}
+
+/// Average precision: the area under the precision-recall curve, summed as
+/// a step function rather than interpolated.
+///
+/// The step form is what scikit-learn reports and is the honest one: the
+/// interpolated version is optimistic by up to the width of one step, and
+/// on a rare-positive problem the steps are wide.
+pub fn average_precision(truth: [i64],
+    scores: [f64]) -> f64 ! MetricError {
+    try check_scored(truth, scores)
+    var positives = 0
+    for label in truth {
+        if label == 1 {
+            positives = positives + 1
+        }
+    }
+    if positives == 0 {
+        fail(NoPositives())
+    }
+    let order = descending(scores)
+    var found = 0
+    var flagged = 0
+    var total = 0.0
+    var previous_recall = 0.0
+    var i = 0
+    while i < order.len() {
+        var j = i
+        while j < order.len() and scores[order[j]] == scores[order[i]] {
+            j = j + 1
+        }
+        // A block of equal scores is one threshold: they are all flagged
+        // together or not at all, so precision and recall move once.
+        var k = i
+        while k < j {
+            flagged = flagged + 1
+            if truth[order[k]] == 1 {
+                found = found + 1
+            }
+            k = k + 1
+        }
+        let recall = found.as_f64() / positives.as_f64()
+        let precision = found.as_f64() / flagged.as_f64()
+        total = total + (recall - previous_recall) * precision
+        previous_recall = recall
+        i = j
+    }
+    return total
+}
+
+/// The cross-entropy of a set of predicted probabilities.
+///
+/// Unlike accuracy it cares how confident a wrong answer was, which is what
+/// makes it the thing to train against and a poor thing to report to
+/// anybody: it has no upper bound and no natural scale.
+pub fn log_loss(truth: [i64], probabilities: [f64]) -> f64 ! MetricError {
+    try check_scored(truth, probabilities)
+    // A probability of exactly zero on an outcome that happened gives an
+    // infinite loss, so every implementation clips. This is scikit-learn's
+    // bound, and the clip is why two libraries can disagree in the sixth
+    // decimal on the same predictions.
+    let floor = 0.000000000000001
+    var total = 0.0
+    var i = 0
+    while i < truth.len() {
+        var p = probabilities[i]
+        if p < 0.0 or p > 1.0 {
+            fail(NotAProbability(p))
+        }
+        if p < floor {
+            p = floor
+        }
+        if p > 1.0 - floor {
+            p = 1.0 - floor
+        }
+        if truth[i] == 1 {
+            total = total - p.ln()
+        } else {
+            total = total - (1.0 - p).ln()
+        }
+        i = i + 1
+    }
+    return total / truth.len().as_f64()
+}
+
+/// The Brier score: the mean squared error of the probabilities.
+///
+/// Bounded, unlike the log loss, and it punishes a confident mistake less
+/// harshly. Which of the two to report depends on whether being certain and
+/// wrong should cost four times being unsure and wrong, or infinitely more.
+pub fn brier_score(truth: [i64],
+    probabilities: [f64]) -> f64 ! MetricError {
+    try check_scored(truth, probabilities)
+    var total = 0.0
+    var i = 0
+    while i < truth.len() {
+        // Label 1 is the positive class and everything else is not, which
+        // is what `roc_auc` and `log_loss` above already assume. Using the
+        // label as the target instead would make a three-class problem's
+        // Brier score depend on which integers the classes were numbered
+        // with.
+        var target = 0.0
+        if truth[i] == 1 {
+            target = 1.0
+        }
+        let gap = probabilities[i] - target
+        total = total + gap * gap
+        i = i + 1
+    }
+    return total / truth.len().as_f64()
+}
+
+// ------------------------------------------------------------ regression
+
+fn check_real(truth: [f64], predicted: [f64]) -> bool ! MetricError {
+    if truth.len() != predicted.len() {
+        fail(LengthMismatch(truth.len(), predicted.len()))
+    }
+    if truth.len() == 0 {
+        fail(NoObservations())
+    }
+    return true
+}
+
+/// The mean absolute error, in the units of the thing being predicted.
+pub fn mean_absolute_error(truth: [f64],
+    predicted: [f64]) -> f64 ! MetricError {
+    try check_real(truth, predicted)
+    var total = 0.0
+    var i = 0
+    while i < truth.len() {
+        total = total + (truth[i] - predicted[i]).abs()
+        i = i + 1
+    }
+    return total / truth.len().as_f64()
+}
+
+/// The root mean squared error, which is not the same as the mean error and
+/// is always at least as large.
+///
+/// Squaring makes one bad miss count for more than several small ones,
+/// which is right when a large error is disproportionately costly and
+/// wrong when it is merely larger.
+pub fn root_mean_squared_error(truth: [f64],
+    predicted: [f64]) -> f64 ! MetricError {
+    try check_real(truth, predicted)
+    var total = 0.0
+    var i = 0
+    while i < truth.len() {
+        let gap = truth[i] - predicted[i]
+        total = total + gap * gap
+        i = i + 1
+    }
+    return (total / truth.len().as_f64()).sqrt()
+}
+
+/// The share of the variance the model explains.
+///
+/// Negative when the model is worse than predicting the mean, which is not
+/// a bug and is the most useful thing it says.
+pub fn r_squared(truth: [f64], predicted: [f64]) -> f64 ! MetricError {
+    try check_real(truth, predicted)
+    var mean = 0.0
+    for value in truth {
+        mean = mean + value
+    }
+    mean = mean / truth.len().as_f64()
+    var residual = 0.0
+    var total = 0.0
+    var i = 0
+    while i < truth.len() {
+        let gap = truth[i] - predicted[i]
+        residual = residual + gap * gap
+        let spread = truth[i] - mean
+        total = total + spread * spread
+        i = i + 1
+    }
+    if total == 0.0 {
+        // Every true value is the same, so there is no variance to explain.
+        // scikit-learn answers 1 when the predictions are exact and 0
+        // otherwise, rather than dividing by zero.
+        if residual == 0.0 {
+            return 1.0
+        }
+        return 0.0
+    }
+    return 1.0 - residual / total
+}
+
+/// The mean absolute percentage error, refusing a zero it cannot divide by.
+pub fn mean_absolute_percentage_error(truth: [f64],
+    predicted: [f64]) -> f64 ! MetricError {
+    try check_real(truth, predicted)
+    var total = 0.0
+    var i = 0
+    while i < truth.len() {
+        if truth[i] == 0.0 {
+            fail(NotAProbability(0.0))
+        }
+        total = total + ((truth[i] - predicted[i]) / truth[i]).abs()
+        i = i + 1
+    }
+    return total / truth.len().as_f64()
+}

@@ -1,0 +1,370 @@
+// A classification tree: ask about one feature at a time until the answer is
+// obvious.
+//
+// The model is a sequence of questions of the form "is feature 3 below
+// 2.7?", and it is the only common classifier a person can read and check.
+// That is most of the reason to use one. The other reason is that it needs
+// no scaling, handles features on wildly different scales, and does not care
+// about monotone transformations of them at all.
+//
+// ## How the split is chosen
+//
+// At each node, over every feature and every threshold, choose the split
+// that most reduces the impurity of the labels. Gini impurity is the chance
+// that two items drawn from the node have different labels; entropy is the
+// information content of the label. They pick the same split nearly always,
+// and Gini is the default because it needs no logarithm.
+//
+// ## Why an unconstrained tree is useless
+//
+// Grown to purity, a tree puts every training row in its own leaf and is
+// exactly right on the training set and no better than guessing off it. The
+// depth limit and the minimum leaf size are not tuning knobs on the margin;
+// they are the difference between a model and a lookup table.
+//
+// ## The instability nobody mentions
+//
+// Change one row and the top split can change, and with it the entire tree.
+// Two trees fitted on 99% the same data can look nothing alike and predict
+// nearly the same. This is why forests work — averaging over that variance
+// is most of what they do — and why "the tree says feature 3 matters most"
+// is a claim about one sample rather than about the world.
+
+type CartError =
+    | NoRows()
+    | LengthMismatch(rows: i64, labels: i64)
+    | RaggedRows(row: i64, width: i64)
+    | BadClass(label: i64)
+    | BadDepth(depth: i64)
+    | NotFitted()
+
+    /// One node. A leaf has `feature` of -1 and its answer in `label`; a split
+    /// has the two child indices.
+type CartNode = {
+    feature: i64,
+    threshold: f64,
+    left: i64,
+    right: i64,
+    label: i64,
+    /// How many training rows reached this node, and how many of each class.
+    samples: i64,
+    distribution: [i64],
+    impurity: f64,
+}
+
+/// The nodes, with the root at index 0.
+type Cart = {
+    nodes: [CartNode],
+    classes: i64,
+}
+
+fn check_data(rows: [[f64]], labels: [i64],
+    classes: i64) -> i64 ! CartError {
+    if rows.len() == 0 {
+        fail(NoRows())
+    }
+    if rows.len() != labels.len() {
+        fail(LengthMismatch(rows.len(), labels.len()))
+    }
+    let width = rows[0].len()
+    var i = 0
+    while i < rows.len() {
+        if rows[i].len() != width {
+            fail(RaggedRows(i, width))
+        }
+        if labels[i] < 0 or labels[i] >= classes {
+            fail(BadClass(labels[i]))
+        }
+        i = i + 1
+    }
+    return width
+}
+
+/// The chance that two items drawn from a node have different labels.
+pub fn gini(distribution: [i64], total: i64) -> f64 {
+    if total == 0 {
+        return 0.0
+    }
+    var sum = 0.0
+    for count in distribution {
+        let share = count.as_f64() / total.as_f64()
+        sum = sum + share * share
+    }
+    return 1.0 - sum
+}
+
+/// The information content of the label at a node, in bits.
+pub fn entropy(distribution: [i64], total: i64) -> f64 {
+    if total == 0 {
+        return 0.0
+    }
+    var sum = 0.0
+    for count in distribution {
+        if count > 0 {
+            let share = count.as_f64() / total.as_f64()
+            sum = sum - share * (share.ln() / 0.6931471805599453)
+        }
+    }
+    return sum
+}
+
+fn impurity_of(distribution: [i64], total: i64, use_entropy: bool) -> f64 {
+    if use_entropy {
+        return entropy(distribution, total)
+    }
+    return gini(distribution, total)
+}
+
+fn distribution_of(labels: [i64], indices: [i64],
+    classes: i64) -> [i64] {
+    var out: [i64] = []
+    var c = 0
+    while c < classes {
+        out.push(0)
+        c = c + 1
+    }
+    for index in indices {
+        out[labels[index]] = out[labels[index]] + 1
+    }
+    return out
+}
+
+fn majority_of(distribution: [i64]) -> i64 {
+    var best = 0
+    var i = 1
+    while i < distribution.len() {
+        if distribution[i] > distribution[best] {
+            best = i
+        }
+        i = i + 1
+    }
+    return best
+}
+
+/// Fit a tree, greedily and exactly.
+///
+/// Every feature and every midpoint between two distinct adjacent values is
+/// tried, which is what "best split" means when nothing is sampled. A tie
+/// goes to the lower feature index and then the lower threshold, so the same
+/// data always gives the same tree.
+pub fn fit(rows: [[f64]], labels: [i64], classes: i64, most_depth: i64,
+    least_split: i64, least_leaf: i64,
+    use_entropy: bool) -> Cart ! CartError {
+    let width = try check_data(rows, labels, classes)
+    if most_depth < 1 {
+        fail(BadDepth(most_depth))
+    }
+    var indices: [i64] = []
+    var i = 0
+    while i < rows.len() {
+        indices.push(i)
+        i = i + 1
+    }
+    var tree = Cart{ nodes: [], classes: classes }
+    let _root = grow(tree, rows, labels, indices, classes, width, 0,
+        most_depth, least_split, least_leaf, use_entropy)
+    return tree
+}
+
+fn grow(inout tree: Cart, rows: [[f64]], labels: [i64], indices: [i64],
+    classes: i64, width: i64, depth: i64, most_depth: i64,
+    least_split: i64, least_leaf: i64, use_entropy: bool) -> i64 {
+    let distribution = distribution_of(labels, indices, classes)
+    let total = indices.len()
+    let here = impurity_of(distribution, total, use_entropy)
+    let at = tree.nodes.len()
+    tree.nodes.push(CartNode{ feature: 0 - 1, threshold: 0.0, left: 0 - 1,
+        right: 0 - 1, label: majority_of(distribution), samples: total,
+        distribution: distribution, impurity: here })
+    if depth >= most_depth or total < least_split or here == 0.0 {
+        return at
+    }
+    let best = best_split(rows, labels, indices, classes, width,
+        least_leaf, use_entropy)
+    if best.0 < 0 {
+        return at
+    }
+    var left: [i64] = []
+    var right: [i64] = []
+    for index in indices {
+        if rows[index][best.0] <= best.1 {
+            left.push(index)
+        } else {
+            right.push(index)
+        }
+    }
+    tree.nodes[at].feature = best.0
+    tree.nodes[at].threshold = best.1
+    let left_at = grow(tree, rows, labels, left, classes, width, depth + 1,
+        most_depth, least_split, least_leaf, use_entropy)
+    tree.nodes[at].left = left_at
+    let right_at = grow(tree, rows, labels, right, classes, width,
+        depth + 1, most_depth, least_split, least_leaf, use_entropy)
+    tree.nodes[at].right = right_at
+    return at
+}
+
+/// The best (feature, threshold) at a node, or a feature of -1 when no split
+/// helps.
+fn best_split(rows: [[f64]], labels: [i64], indices: [i64], classes: i64,
+    width: i64, least_leaf: i64, use_entropy: bool) -> (i64, f64, f64) {
+    let total = indices.len()
+    let here = impurity_of(distribution_of(labels, indices, classes),
+        total, use_entropy)
+    var best_feature = 0 - 1
+    var best_threshold = 0.0
+    var best_gain = 0.0
+    var feature = 0
+    while feature < width {
+        let order = sorted_by(rows, indices, feature)
+        var left_counts: [i64] = []
+        var c = 0
+        while c < classes {
+            left_counts.push(0)
+            c = c + 1
+        }
+        var right_counts = distribution_of(labels, indices, classes)
+        var i = 0
+        while i + 1 < order.len() {
+            let index = order[i]
+            left_counts[labels[index]] = left_counts[labels[index]] + 1
+            right_counts[labels[index]] = right_counts[labels[index]] - 1
+            i = i + 1
+            // A threshold only exists between two different values; a run of
+            // equal values cannot be split.
+            if rows[order[i]][feature] > rows[order[i - 1]][feature] and
+            i >= least_leaf and total - i >= least_leaf {
+                let left_impurity = impurity_of(left_counts, i, use_entropy)
+                let right_impurity = impurity_of(right_counts, total - i,
+                    use_entropy)
+                let gain = here - (i.as_f64() * left_impurity +
+                    (total - i).as_f64() * right_impurity) / total.as_f64()
+                if gain > best_gain {
+                    best_gain = gain
+                    best_feature = feature
+                    best_threshold = (rows[order[i]][feature] +
+                        rows[order[i - 1]][feature]) / 2.0
+                }
+            }
+        }
+        feature = feature + 1
+    }
+    return (best_feature, best_threshold, best_gain)
+}
+
+fn sorted_by(rows: [[f64]], indices: [i64], feature: i64) -> [i64] {
+    var out = indices
+    var a = 1
+    while a < out.len() {
+        let value = out[a]
+        var b = a - 1
+        while b >= 0 and rows[out[b]][feature] > rows[value][feature] {
+            out[b + 1] = out[b]
+            b = b - 1
+        }
+        out[b + 1] = value
+        a = a + 1
+    }
+    return out
+}
+
+/// The leaf a row falls into.
+pub fn leaf_for(tree: Cart, row: [f64]) -> i64 ! CartError {
+    if tree.nodes.len() == 0 {
+        fail(NotFitted())
+    }
+    var at = 0
+    while tree.nodes[at].feature >= 0 {
+        if row[tree.nodes[at].feature] <= tree.nodes[at].threshold {
+            at = tree.nodes[at].left
+        } else {
+            at = tree.nodes[at].right
+        }
+    }
+    return at
+}
+
+/// The class a row is given.
+pub fn classify(tree: Cart, row: [f64]) -> i64 ! CartError {
+    return tree.nodes[try leaf_for(tree, row)].label
+}
+
+/// The class shares at the leaf a row falls into.
+///
+/// A tree's "probability" is the label mix of the training rows that reached
+/// the same leaf, which on a deep tree is one row and a probability of 1.0.
+/// That number is not a confidence and treating it as one is the commonest
+/// misreading of this model.
+pub fn probabilities(tree: Cart, row: [f64]) -> [f64] ! CartError {
+    let leaf = tree.nodes[try leaf_for(tree, row)]
+    var out: [f64] = []
+    for count in leaf.distribution {
+        out.push(count.as_f64() / leaf.samples.as_f64())
+    }
+    return out
+}
+
+/// How much each feature reduced the impurity, normalised to sum to one.
+///
+/// Biased towards features with many distinct values — a continuous feature
+/// offers hundreds of thresholds to a binary one's one — which is why this
+/// number should not be read as "how much this feature matters".
+pub fn feature_importance(tree: Cart, width: i64) -> [f64] {
+    var out: [f64] = []
+    var i = 0
+    while i < width {
+        out.push(0.0)
+        i = i + 1
+    }
+    if tree.nodes.len() == 0 {
+        return out
+    }
+    let root_samples = tree.nodes[0].samples.as_f64()
+    var total = 0.0
+    for node in tree.nodes {
+        if node.feature >= 0 {
+            let left = tree.nodes[node.left]
+            let right = tree.nodes[node.right]
+            let drop = node.samples.as_f64() * node.impurity -
+            left.samples.as_f64() * left.impurity -
+            right.samples.as_f64() * right.impurity
+            out[node.feature] = out[node.feature] + drop / root_samples
+            total = total + drop / root_samples
+        }
+    }
+    if total > 0.0 {
+        var j = 0
+        while j < width {
+            out[j] = out[j] / total
+            j = j + 1
+        }
+    }
+    return out
+}
+
+/// How deep the tree actually went.
+pub fn depth_of(tree: Cart) -> i64 {
+    if tree.nodes.len() == 0 {
+        return 0
+    }
+    return depth_from(tree, 0)
+}
+
+fn depth_from(tree: Cart, at: i64) -> i64 {
+    if tree.nodes[at].feature < 0 {
+        return 1
+    }
+    return 1 + depth_from(tree, tree.nodes[at].left)
+        .max(depth_from(tree, tree.nodes[at].right))
+}
+
+/// How many leaves it has.
+pub fn leaf_count(tree: Cart) -> i64 {
+    var count = 0
+    for node in tree.nodes {
+        if node.feature < 0 {
+            count = count + 1
+        }
+    }
+    return count
+}

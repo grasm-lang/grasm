@@ -1,0 +1,435 @@
+// k-means: split the points into k groups, where each point belongs to the
+// nearest group's centre.
+//
+// It is the clustering everybody reaches for first, and the reasons it works
+// are also the reasons it fails. Lloyd's algorithm alternates two steps that
+// each can only lower the total squared distance — assign every point to its
+// nearest centre, then move every centre to the mean of what it got — so it
+// always converges. It converges to a local minimum that depends entirely on
+// where the centres started.
+//
+// ## Why the initialisation is the algorithm
+//
+// Choosing k points at random gives a bad answer often enough that it is not
+// worth doing. k-means++ spreads the initial centres by choosing each one
+// with probability proportional to its squared distance from the nearest
+// centre already chosen, and comes with a proof: the expected cost is within
+// O(log k) of the best possible, before a single iteration has run. That
+// bound is why scikit-learn's default is ten k-means++ restarts rather than
+// one random one.
+//
+// ## What it assumes, said plainly
+//
+// That clusters are round, about the same size, and about the same density.
+// Squared Euclidean distance is what makes all three true at once. Two
+// crescents interlocking, a small dense cluster beside a large sparse one, a
+// long thin cluster at an angle: k-means gets each of them wrong, and gets
+// them wrong confidently, because the cost function it is minimising says
+// its answer is good.
+//
+// ## Choosing k
+//
+// There is no answer inside the data. The cost falls monotonically with k
+// and hits zero when k is the number of points. The elbow is where the fall
+// stops being steep, and reading it is a judgement; the silhouette is a
+// number, and it is the one to report when someone asks why k is 4.
+
+import random
+
+type MlError =
+    | NoPoints()
+    | BadClusterCount(k: i64)
+    | RaggedRows(row: i64, width: i64)
+    | NotFitted()
+    | EmptyCluster(index: i64)
+
+    /// A fitted model: where the centres ended up and what it cost.
+type KMeans = {
+    centres: [[f64]],
+    /// Which cluster each point was given, in the order the points came in.
+    labels: [i64],
+    /// The total squared distance from each point to its centre. scikit-learn
+    /// calls this the inertia.
+    inertia: f64,
+    iterations: i64,
+    /// False when the iteration limit was reached rather than the assignment
+    /// settling.
+    converged: bool,
+}
+
+fn check_points(points: [[f64]]) -> i64 ! MlError {
+    if points.len() == 0 {
+        fail(NoPoints())
+    }
+    let width = points[0].len()
+    if width == 0 {
+        fail(RaggedRows(0, 0))
+    }
+    var i = 0
+    while i < points.len() {
+        if points[i].len() != width {
+            fail(RaggedRows(i, width))
+        }
+        i = i + 1
+    }
+    return width
+}
+
+/// The squared Euclidean distance, which is what k-means minimises.
+///
+/// The square root is never taken: it does not change which centre is
+/// nearest and it costs a call per point per centre per iteration.
+pub fn squared_distance(a: [f64], b: [f64]) -> f64 {
+    var total = 0.0
+    var i = 0
+    while i < a.len() and i < b.len() {
+        let gap = a[i] - b[i]
+        total = total + gap * gap
+        i = i + 1
+    }
+    return total
+}
+
+/// The index of the nearest centre, and how far away it is.
+pub fn nearest(centres: [[f64]], point: [f64]) -> (i64, f64) {
+    var best = 0
+    var best_distance = 0.0
+    var i = 0
+    while i < centres.len() {
+        let distance = squared_distance(point, centres[i])
+        if i == 0 or distance < best_distance {
+            best = i
+            best_distance = distance
+        }
+        i = i + 1
+    }
+    return (best, best_distance)
+}
+
+/// The k-means++ seeding: each centre after the first is drawn with
+/// probability proportional to its squared distance from the nearest centre
+/// already chosen.
+///
+/// The first is uniform. Everything after it is the trick, and the trick is
+/// what the O(log k) guarantee rests on.
+pub fn seed_plus_plus(inout rng: Rng, points: [[f64]],
+    k: i64) -> [[f64]] ! MlError {
+    let _width = try check_points(points)
+    if k < 1 or k > points.len() {
+        fail(BadClusterCount(k))
+    }
+    var centres: [[f64]] = [points[random.below(rng, points.len())]]
+    while centres.len() < k {
+        var weights: [f64] = []
+        var total = 0.0
+        for point in points {
+            let distance = nearest(centres, point).1
+            weights.push(distance)
+            total = total + distance
+        }
+        if total <= 0.0 {
+            // Every remaining point is already a centre, so there is nothing
+            // left to spread towards; take them in order rather than looping.
+            var i = 0
+            while centres.len() < k and i < points.len() {
+                centres.push(points[i])
+                i = i + 1
+            }
+            return centres
+        }
+        let target = random.unit(rng) * total
+        var running = 0.0
+        var chosen = points.len() - 1
+        var i = 0
+        while i < points.len() {
+            running = running + weights[i]
+            if running >= target {
+                chosen = i
+                i = points.len()
+            } else {
+                i = i + 1
+            }
+        }
+        centres.push(points[chosen])
+    }
+    return centres
+}
+
+/// Lloyd's algorithm from a given set of starting centres.
+///
+/// Separated from the seeding so that a run can be reproduced exactly, and
+/// so that the two halves can be checked against another implementation one
+/// at a time.
+pub fn fit_from(points: [[f64]], start: [[f64]],
+    most: i64) -> KMeans ! MlError {
+    let width = try check_points(points)
+    if start.len() < 1 {
+        fail(BadClusterCount(start.len()))
+    }
+    var centres = start
+    var labels: [i64] = []
+    var i = 0
+    while i < points.len() {
+        labels.push(0 - 1)
+        i = i + 1
+    }
+    var iterations = 0
+    var converged = false
+    var running = true
+    while running and iterations < most {
+        var moved = false
+        var sums: [[f64]] = []
+        var counts: [i64] = []
+        var c = 0
+        while c < centres.len() {
+            var row: [f64] = []
+            var d = 0
+            while d < width {
+                row.push(0.0)
+                d = d + 1
+            }
+            sums.push(row)
+            counts.push(0)
+            c = c + 1
+        }
+        var distances: [f64] = []
+        var p = 0
+        while p < points.len() {
+            let found = nearest(centres, points[p])
+            distances.push(found.1)
+            if labels[p] != found.0 {
+                labels[p] = found.0
+                moved = true
+            }
+            var d = 0
+            while d < width {
+                sums[found.0][d] = sums[found.0][d] + points[p][d]
+                d = d + 1
+            }
+            counts[found.0] = counts[found.0] + 1
+            p = p + 1
+        }
+        iterations = iterations + 1
+        if relocate_empty(sums, counts, labels, points, distances, width) {
+            moved = true
+        }
+        if not moved {
+            // The assignment settled, so `iterations` is left at the number
+            // that actually ran rather than at the limit — a caller that
+            // cannot tell the two apart cannot tell a converged fit from a
+            // truncated one.
+            converged = true
+            running = false
+        } else {
+            centres = recentred(centres, sums, counts, width)
+        }
+    }
+    var inertia = 0.0
+    var q = 0
+    while q < points.len() {
+        let found = nearest(centres, points[q])
+        labels[q] = found.0
+        inertia = inertia + found.1
+        q = q + 1
+    }
+    return KMeans{ centres: centres, labels: labels, inertia: inertia,
+        iterations: iterations, converged: converged }
+}
+
+/// Give every empty cluster the point that is furthest from its own centre.
+///
+/// An empty cluster is not a curiosity: it means the answer has fewer groups
+/// in it than were asked for, and the point most poorly served by the
+/// clustering is the one with the best claim to a group of its own. Leaving
+/// the centre where it was instead — which is the obvious thing to write —
+/// cost 28 per cent on the worst case in the corpus this was checked
+/// against, because a cluster that empties once stays empty forever.
+///
+/// The furthest points go to the empty clusters in order, one each, which is
+/// what scikit-learn does.
+fn relocate_empty(inout sums: [[f64]], inout counts: [i64],
+    labels: [i64], points: [[f64]], distances: [f64],
+    width: i64) -> bool {
+    var taken: [i64] = []
+    var moved = false
+    var cluster = 0
+    while cluster < counts.len() {
+        if counts[cluster] == 0 {
+            var far = 0 - 1
+            var far_distance = 0.0
+            var i = 0
+            while i < points.len() {
+                if not holds(taken, i) and
+                (far < 0 or distances[i] > far_distance) {
+                    far = i
+                    far_distance = distances[i]
+                }
+                i = i + 1
+            }
+            if far >= 0 {
+                taken.push(far)
+                let previous = labels[far]
+                var d = 0
+                while d < width {
+                    sums[cluster][d] = points[far][d]
+                    sums[previous][d] = sums[previous][d] - points[far][d]
+                    d = d + 1
+                }
+                counts[cluster] = 1
+                counts[previous] = counts[previous] - 1
+                moved = true
+            }
+        }
+        cluster = cluster + 1
+    }
+    return moved
+}
+
+fn holds(values: [i64], wanted: i64) -> bool {
+    for value in values {
+        if value == wanted {
+            return true
+        }
+    }
+    return false
+}
+
+/// Each centre moved to the mean of what it was given.
+///
+/// By the time this runs no cluster is empty — `relocate_empty` has given
+/// each of them a point — so the zero branch is reached only when there were
+/// fewer points than clusters, which `seed_plus_plus` already refuses.
+fn recentred(centres: [[f64]], sums: [[f64]], counts: [i64],
+    width: i64) -> [[f64]] {
+    var out: [[f64]] = []
+    var j = 0
+    while j < centres.len() {
+        if counts[j] == 0 {
+            out.push(centres[j])
+        } else {
+            var row: [f64] = []
+            var d = 0
+            while d < width {
+                row.push(sums[j][d] / counts[j].as_f64())
+                d = d + 1
+            }
+            out.push(row)
+        }
+        j = j + 1
+    }
+    return out
+}
+
+/// Seed with k-means++ and run Lloyd's, keeping the best of several
+/// restarts.
+///
+/// Restarts are not a refinement: with one start the answer is a coin toss
+/// on anything but the easiest data, which is why every serious
+/// implementation defaults to ten.
+pub fn fit(inout rng: Rng, points: [[f64]], k: i64, restarts: i64,
+    most: i64) -> KMeans ! MlError {
+    if restarts < 1 {
+        fail(BadClusterCount(restarts))
+    }
+    var best = try fit_from(points, try seed_plus_plus(rng, points, k), most)
+    var attempt = 1
+    while attempt < restarts {
+        let candidate = try fit_from(points,
+            try seed_plus_plus(rng, points, k), most)
+        if candidate.inertia < best.inertia {
+            best = candidate
+        }
+        attempt = attempt + 1
+    }
+    return best
+}
+
+/// The points that landed in one cluster.
+pub fn members_of(points: [[f64]], model: KMeans,
+    cluster: i64) -> [[f64]] {
+    var out: [[f64]] = []
+    var i = 0
+    while i < points.len() and i < model.labels.len() {
+        if model.labels[i] == cluster {
+            out.push(points[i])
+        }
+        i = i + 1
+    }
+    return out
+}
+
+/// The silhouette of every point: how much closer it is to its own cluster
+/// than to the next nearest one, between -1 and 1.
+///
+/// A negative silhouette says a point is nearer to a cluster it is not in.
+/// Unlike the inertia this does not fall automatically as k rises, which is
+/// what makes it usable for choosing k.
+pub fn silhouettes(points: [[f64]], labels: [i64],
+    k: i64) -> [f64] ! MlError {
+    let _width = try check_points(points)
+    if k < 2 {
+        fail(BadClusterCount(k))
+    }
+    var out: [f64] = []
+    var i = 0
+    while i < points.len() {
+        var totals: [f64] = []
+        var counts: [i64] = []
+        var c = 0
+        while c < k {
+            totals.push(0.0)
+            counts.push(0)
+            c = c + 1
+        }
+        var j = 0
+        while j < points.len() {
+            if j != i {
+                let group = labels[j]
+                totals[group] = totals[group] +
+                squared_distance(points[i], points[j]).sqrt()
+                counts[group] = counts[group] + 1
+            }
+            j = j + 1
+        }
+        let mine = labels[i]
+        if counts[mine] == 0 {
+            // A cluster of one has nothing to be close to, and the
+            // convention is that its silhouette is zero rather than
+            // undefined.
+            out.push(0.0)
+        } else {
+            let inside = totals[mine] / counts[mine].as_f64()
+            var outside = 0.0
+            var found = false
+            var g = 0
+            while g < k {
+                if g != mine and counts[g] > 0 {
+                    let mean = totals[g] / counts[g].as_f64()
+                    if not found or mean < outside {
+                        outside = mean
+                        found = true
+                    }
+                }
+                g = g + 1
+            }
+            if not found {
+                out.push(0.0)
+            } else {
+                out.push((outside - inside) / inside.max(outside))
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+/// The mean silhouette, which is the one number to report beside a k.
+pub fn silhouette_score(points: [[f64]], labels: [i64],
+    k: i64) -> f64 ! MlError {
+    let each = try silhouettes(points, labels, k)
+    var total = 0.0
+    for value in each {
+        total = total + value
+    }
+    return total / each.len().as_f64()
+}

@@ -1,0 +1,470 @@
+import kmeans
+import knn
+import naivebayes
+import decisiontree
+import mlmetrics
+import random
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn near(a: f64, b: f64, tolerance: f64) -> bool {
+    var d = a - b
+    if d < 0.0 {
+        d = 0.0 - d
+    }
+    return d < tolerance
+}
+
+// ---------------------------------------------------------------- kmeans
+
+/// Three well-separated groups of three.
+fn corners() -> [[f64]] {
+    return [[1.0, 1.0], [1.5, 2.0], [1.2, 0.8], [8.0, 8.0], [8.5, 9.0],
+        [8.2, 7.8], [1.0, 9.0], [1.5, 8.5], [0.8, 8.8]]
+}
+
+fn check_kmeans(inout f: i64) / {io} {
+    print("-- kmeans: three groups, and the one that empties")
+    let start = [[1.0, 1.0], [8.0, 8.0], [1.0, 9.0]]
+    let model = kmeans.fit_from(corners(), start, 300) ??
+    KMeans{ centres: [], labels: [], inertia: 0.0, iterations: 0,
+        converged: false }
+    // scikit-learn agrees on every one of these to the last bit.
+    say(f, "the centres land on the means of the three groups",
+        near(model.centres[0][0], 1.2333333333333334, 0.0000000001) and
+        near(model.centres[1][1], 8.266666666666666, 0.0000000001) and
+        near(model.centres[2][0], 1.1, 0.0000000001))
+    say(f, "every point gets the group it obviously belongs to",
+        model.labels == [0, 0, 0, 1, 1, 1, 2, 2, 2] and
+        near(model.inertia, 2.2933333333333339, 0.0000000001))
+    say(f, "and it stops when nothing moves, rather than at the limit",
+        model.converged and model.iterations == 2)
+    // Three starts inside one group: two clusters empty on the first pass.
+    let bad_start = [[1.0, 1.0], [1.2, 0.8], [1.5, 2.0]]
+    let rescued = kmeans.fit_from(corners(), bad_start, 300) ??
+    KMeans{ centres: [], labels: [], inertia: 0.0, iterations: 0,
+        converged: false }
+    say(f, "a start inside one group still finds three groups",
+        near(rescued.inertia, 78.081666666666663, 0.000000001) and
+        rescued.centres.len() == 3)
+    say(f, "because an emptied cluster is given the worst-served point",
+        counts_of(rescued.labels, 3) == [1, 2, 6])
+    // Which is 28 per cent better than leaving the centre where it was.
+    say(f, "and leaving it where it was would have cost a quarter more",
+        rescued.inertia < 108.0)
+    // The seeding, which is the part with the guarantee.
+    say(f, "k-means++ spreads the first centres apart",
+        seeded_spread() > 40.0)
+    // The silhouette, against scikit-learn.
+    say(f, "the silhouette says the answer is a good one",
+        near(kmeans.silhouette_score(corners(), model.labels, 3) ?? 0.0,
+            0.89208041673560645, 0.0000000001))
+    say(f, "and a point put in the wrong group scores below zero",
+        (kmeans.silhouettes(corners(), [1, 0, 0, 1, 1, 1, 2, 2, 2], 3) ??
+            [])[0] < 0.0)
+    // The refusals.
+    say(f, "more clusters than points is refused, and so is none at all",
+        seed_refused(20) and seed_refused(0))
+    say(f, "and a ragged row is refused rather than read short",
+        ragged_refused())
+}
+
+fn counts_of(labels: [i64], k: i64) -> [i64] {
+    var out: [i64] = []
+    var i = 0
+    while i < k {
+        out.push(0)
+        i = i + 1
+    }
+    for label in labels {
+        out[label] = out[label] + 1
+    }
+    return out
+}
+
+fn seeded_spread() -> f64 {
+    var rng = random_of()
+    let centres = kmeans.seed_plus_plus(rng, corners(), 3) ?? []
+    if centres.len() < 3 {
+        return 0.0
+    }
+    return kmeans.squared_distance(centres[0], centres[1]) +
+    kmeans.squared_distance(centres[1], centres[2])
+}
+
+fn random_of() -> Rng {
+    return random.seeded(20260909)
+}
+
+fn seed_refused(k: i64) -> bool {
+    var rng = random_of()
+    match kmeans.seed_plus_plus(rng, corners(), k) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn ragged_refused() -> bool {
+    match kmeans.fit_from([[1.0, 2.0], [3.0]], [[1.0, 2.0]], 10) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+// ------------------------------------------------------------------- knn
+
+fn line_rows() -> [[f64]] {
+    return [[1.0], [2.0], [3.0], [6.0], [7.0], [8.0]]
+}
+
+fn line_labels() -> [i64] {
+    return [0, 0, 0, 1, 1, 1]
+}
+
+fn check_knn(inout f: i64) / {io} {
+    print("-- knn: the model is the training set")
+    // scikit-learn's KNeighborsClassifier gives the same answers.
+    say(f, "the boundary sits halfway between the two nearest points",
+        (knn.classify(line_rows(), line_labels(), [4.4], 1, 2) ?? 0 - 1)
+        == 0 and
+        (knn.classify(line_rows(), line_labels(), [4.6], 1, 2) ?? 0 - 1)
+        == 1)
+    say(f, "and three neighbours keep it, two of them being on one side",
+        (knn.classify(line_rows(), line_labels(), [4.4], 3, 2) ?? 0 - 1)
+        == 0)
+    // An even k on two classes ties constantly, so the rule matters.
+    say(f, "an even count ties, and the tie goes to the lower label",
+        (knn.classify(line_rows(), line_labels(), [4.5], 2, 2) ?? 0 - 1)
+        == 0)
+    say(f, "weighting by distance breaks that tie by which side is nearer",
+        (knn.classify_weighted(line_rows(), line_labels(), [4.5], 2, 2) ??
+            0 - 1) == 0 and
+        (knn.classify_weighted(line_rows(), line_labels(), [3.0], 2, 2) ??
+            0 - 1) == 0)
+    // A neighbour at distance zero would divide by it.
+    say(f, "a query sitting on a training point takes that point's label",
+        (knn.classify_weighted(line_rows(), line_labels(), [6.0], 4, 2) ??
+            0 - 1) == 1)
+    say(f, "the regressor averages the neighbours' values",
+        near(knn.regress(line_rows(), [0.0, 0.0, 0.0, 10.0, 10.0, 10.0],
+            [4.5], 2) ?? 0.0, 5.0, 0.0000000001))
+    // The neighbours themselves, and the rule that makes them reproducible.
+    let near_three = knn.neighbours_of(line_rows(), [4.5], 3) ?? []
+    say(f, "the neighbours come back nearest first",
+        near_three.len() == 3 and
+        near_three[0].distance <= near_three[1].distance and
+        near_three[1].distance < near_three[2].distance)
+    say(f, "and an exact tie in distance is broken by the row's own index",
+        near(near_three[0].distance, near_three[1].distance, 0.0000000001)
+        and near_three[0].index == 2 and near_three[1].index == 3 and
+        near_three[2].index == 1)
+    // The three distances, and the reason to pick between them.
+    say(f, "Manhattan and Euclidean are the same in one dimension",
+        near(knn.euclidean([1.0], [4.0]), knn.manhattan([1.0], [4.0]),
+            0.0000000001) and
+        near(knn.euclidean([3.0, 4.0], [0.0, 0.0]), 5.0, 0.0000000001) and
+        near(knn.manhattan([3.0, 4.0], [0.0, 0.0]), 7.0, 0.0000000001))
+    say(f, "and Minkowski is both, at p of one and of two",
+        near(knn.minkowski([3.0, 4.0], [0.0, 0.0], 1.0), 7.0,
+            0.0000000001) and
+        near(knn.minkowski([3.0, 4.0], [0.0, 0.0], 2.0), 5.0,
+            0.0000000001) and
+        near(knn.minkowski([3.0, 4.0], [0.0, 0.0], 3.0), 4.4979414453,
+            0.000000001))
+    // Scaling, which is not optional and is why it lives here.
+    let unscaled = [[1.0, 1000.0], [2.0, 2000.0], [3.0, 3000.0]]
+    let scaling = knn.scaling_of(unscaled) ?? ([], [])
+    say(f, "the scaling uses the population divisor, as StandardScaler does",
+        near(scaling.1[0], 0.816496580927726, 0.0000000001) and
+        near(scaling.1[1], 816.496580927726, 0.000000001))
+    let scaled = knn.standardise(unscaled, scaling.0, scaling.1) ?? []
+    say(f, "and after it the two columns weigh the same",
+        near(scaled[0][0], scaled[0][1], 0.0000000001) and
+        near(scaled[2][0], 1.224744871391589, 0.0000000001))
+    say(f, "a column that never varies is scaled by one, not by zero",
+        (knn.scaling_of([[5.0], [5.0]]) ?? ([], [])).1[0] == 1.0)
+    say(f, "and asking for more neighbours than there are rows is refused",
+        neighbours_refused())
+}
+
+fn neighbours_refused() -> bool {
+    match knn.neighbours_of(line_rows(), [1.0], 99) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+// ------------------------------------------------------------ naivebayes
+
+fn heights() -> [[f64]] {
+    return [[1.0, 20.0], [2.0, 21.0], [1.5, 19.0], [8.0, 80.0],
+        [9.0, 82.0], [8.5, 78.0]]
+}
+
+fn word_counts() -> [[f64]] {
+    return [[3.0, 0.0, 1.0], [2.0, 0.0, 2.0], [0.0, 4.0, 1.0],
+        [0.0, 3.0, 2.0]]
+}
+
+fn check_naivebayes(inout f: i64) / {io} {
+    print("-- naivebayes: a bad probability and a decent classifier")
+    let gaussian = naivebayes.fit_gaussian(heights(), [0, 0, 0, 1, 1, 1],
+        2, 0.000000001) ?? Gaussian{ means: [], variances: [],
+        log_priors: [], counts: [] }
+    say(f, "the fit is a mean and a variance per feature per class",
+        near(gaussian.means[0][0], 1.5, 0.0000000001) and
+        near(gaussian.means[1][1], 80.0, 0.0000000001) and
+        gaussian.counts == [3, 3])
+    // The population divisor, which is what scikit-learn uses here.
+    say(f, "the variance is the maximum likelihood one, not the unbiased",
+        near(gaussian.variances[0][0], 0.1666666676, 0.000001))
+    // The posteriors, against scikit-learn's GaussianNB.
+    say(f, "and a clear case comes out as certain, because it always does",
+        near(naivebayes.posterior_of(naivebayes.gaussian_scores(gaussian,
+            [1.2, 20.5]))[0], 1.0, 0.000000001))
+    say(f, "including one halfway between, which is the model's real flaw",
+        near(naivebayes.posterior_of(naivebayes.gaussian_scores(gaussian,
+            [4.5, 50.0]))[1], 1.0, 0.000001))
+    let multinomial = naivebayes.fit_multinomial(word_counts(),
+        [0, 0, 1, 1], 2, 1.0) ?? Multinomial{ log_likelihood: [],
+        log_priors: [], counts: [] }
+    // Against MultinomialNB with alpha of one.
+    say(f, "the multinomial fit is a log probability per word per class",
+        near(multinomial.log_likelihood[0][0], 0.0 - 0.60613580357,
+            0.00000001) and
+        near(multinomial.log_likelihood[1][1], 0.0 - 0.485507815782,
+            0.00000001))
+    say(f, "and a document is classified by the words it happens to hold",
+        near(naivebayes.posterior_of(naivebayes.multinomial_scores(
+            multinomial, [2.0, 0.0, 1.0]))[0], 0.983450008082, 0.000000001) and
+        near(naivebayes.posterior_of(naivebayes.multinomial_scores(
+            multinomial, [0.0, 5.0, 0.0]))[1], 0.999929648583, 0.000000001))
+    // Smoothing is what stops one unseen word from deciding everything.
+    say(f, "a word unseen in a class does not zero that class out",
+        multinomial.log_likelihood[0][1] > 0.0 - 100.0)
+    say(f, "and the amount of smoothing has to be positive",
+        smoothing_refused())
+    // The softmax, and why it subtracts the largest first.
+    say(f, "log scores turn into probabilities that sum to one",
+        near(sum_of(naivebayes.posterior_of([0.0 - 800.0, 0.0 - 802.0,
+            0.0 - 805.0])), 1.0, 0.0000000001))
+    say(f, "even when every one of them would exponentiate to zero",
+        naivebayes.posterior_of([0.0 - 800.0, 0.0 - 802.0])[0] > 0.8)
+    say(f, "the winner is the largest score, ties going to the lower label",
+        naivebayes.best_of([1.0, 3.0, 3.0]) == 1 and
+        naivebayes.best_of([5.0, 1.0]) == 0)
+}
+
+fn sum_of(values: [f64]) -> f64 {
+    var total = 0.0
+    for value in values {
+        total = total + value
+    }
+    return total
+}
+
+fn smoothing_refused() -> bool {
+    match naivebayes.fit_multinomial(word_counts(), [0, 0, 1, 1], 2, 0.0) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+// ---------------------------------------------------------- decisiontree
+
+fn shapes() -> [[f64]] {
+    return [[2.0, 1.0], [1.0, 2.0], [3.0, 1.5], [7.0, 8.0], [8.0, 7.0],
+        [9.0, 9.0], [7.5, 1.0], [8.5, 2.0]]
+}
+
+fn shape_labels() -> [i64] {
+    return [0, 0, 0, 1, 1, 1, 2, 2]
+}
+
+fn check_decisiontree(inout f: i64) / {io} {
+    print("-- decisiontree: a model you can read")
+    let tree = decisiontree.fit(shapes(), shape_labels(), 3, 3, 2, 1,
+        false) ?? Cart{ nodes: [], classes: 0 }
+    // scikit-learn's DecisionTreeClassifier builds the same tree.
+    say(f, "three classes that separate cleanly need two questions",
+        decisiontree.leaf_count(tree) == 3 and
+        decisiontree.depth_of(tree) == 3)
+    // Two features split these eight rows equally well at the root, so
+    // which one is chosen is a tie. scikit-learn breaks it with its random
+    // feature permutation and picks the second feature at 4.5; this picks
+    // the lower index, which is the rule that makes the same data give the
+    // same tree twice.
+    say(f, "and the questions are the ones a person would ask",
+        tree.nodes[0].feature == 0 and
+        near(tree.nodes[0].threshold, 5.0, 0.0000000001))
+    say(f, "every training row lands where it belongs",
+        (decisiontree.classify(tree, [2.0, 1.0]) ?? 0 - 1) == 0 and
+        (decisiontree.classify(tree, [8.0, 7.0]) ?? 0 - 1) == 1 and
+        (decisiontree.classify(tree, [7.5, 1.0]) ?? 0 - 1) == 2)
+    // The two impurities, which agree on the split and not on the numbers.
+    say(f, "Gini is the chance two draws differ, entropy is in bits",
+        near(decisiontree.gini([1, 1], 2), 0.5, 0.0000000001) and
+        near(decisiontree.entropy([1, 1], 2), 1.0, 0.0000000001) and
+        decisiontree.gini([4, 0], 4) == 0.0 and
+        decisiontree.entropy([4, 0], 4) == 0.0 and
+        near(decisiontree.entropy([2, 1, 1], 4), 1.5, 0.0000000001))
+    let by_entropy = decisiontree.fit(shapes(), shape_labels(), 3, 3, 2, 1,
+        true) ?? Cart{ nodes: [], classes: 0 }
+    say(f, "the two pick the same split here and weigh it differently",
+        by_entropy.nodes[0].feature == tree.nodes[0].feature and
+        not near(decisiontree.feature_importance(by_entropy, 2)[0],
+            decisiontree.feature_importance(tree, 2)[0], 0.00001))
+    say(f, "the importances are the impurity each feature removed",
+        near(decisiontree.feature_importance(tree, 2)[0], 0.542857142857,
+            0.000000001) and
+        near(sum_of(decisiontree.feature_importance(tree, 2)), 1.0,
+            0.0000000001))
+    // The depth limit, which is the difference between a model and a table.
+    let stump = decisiontree.fit(shapes(), shape_labels(), 3, 1, 2, 1,
+        false) ?? Cart{ nodes: [], classes: 0 }
+    say(f, "a depth of one is one question and two answers",
+        decisiontree.leaf_count(stump) == 2 and
+        decisiontree.depth_of(stump) == 2)
+    say(f, "and its leaves are impure, which its probabilities admit",
+        (decisiontree.probabilities(stump, [8.0, 7.0]) ?? [])[1] < 1.0)
+    // A leaf's probability is the training mix, not a confidence.
+    say(f, "a pure leaf claims certainty on the strength of few rows",
+        (decisiontree.probabilities(tree, [8.0, 7.0]) ?? []) ==
+        [0.0, 1.0, 0.0])
+    say(f, "the minimum leaf size stops the tree splitting off single rows",
+        decisiontree.leaf_count(decisiontree.fit(shapes(), shape_labels(),
+            3, 5, 2, 3, false) ?? Cart{ nodes: [], classes: 0 }) < 3)
+    say(f, "and a depth of zero is refused, not silently made one",
+        depth_refused())
+}
+
+fn depth_refused() -> bool {
+    match decisiontree.fit(shapes(), shape_labels(), 3, 0, 2, 1, false) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+// ------------------------------------------------------------- mlmetrics
+
+fn truth() -> [i64] {
+    return [0, 0, 0, 0, 1, 1, 1, 0, 1, 0]
+}
+
+fn predicted() -> [i64] {
+    return [0, 0, 1, 0, 1, 1, 0, 0, 1, 0]
+}
+
+fn scores() -> [f64] {
+    return [0.1, 0.2, 0.6, 0.3, 0.9, 0.8, 0.35, 0.05, 0.7, 0.15]
+}
+
+fn check_mlmetrics(inout f: i64) / {io} {
+    print("-- mlmetrics: what the number you quoted means")
+    let counts = mlmetrics.counts_for(truth(), predicted(), 1) ??
+    Confusion{ true_positive: 0, false_positive: 0, true_negative: 0,
+        false_negative: 0 }
+    // Every one of these matches scikit-learn.
+    say(f, "the four counts add up to the number of predictions",
+        counts.true_positive == 3 and counts.false_positive == 1 and
+        counts.true_negative == 5 and counts.false_negative == 1)
+    say(f, "precision and recall answer two different questions",
+        near(mlmetrics.precision_of(counts), 0.75, 0.0000000001) and
+        near(mlmetrics.recall_of(counts), 0.75, 0.0000000001) and
+        near(mlmetrics.f1_of(counts), 0.75, 0.0000000001))
+    say(f, "and F1 punishes an imbalance a plain average would hide",
+        near(mlmetrics.f1_of(Confusion{ true_positive: 99,
+            false_positive: 1, true_negative: 0, false_negative: 9801 }),
+            0.0198, 0.0000000001))
+    say(f, "a beta above one buys recall with precision",
+        near(mlmetrics.f_beta_of(Confusion{ true_positive: 3,
+            false_positive: 5, true_negative: 5, false_negative: 1 }, 2.0),
+            0.625, 0.0000000001))
+    // The classifier that says one thing to everything.
+    let lazy = mlmetrics.counts_for(truth(), [0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0], 1) ?? Confusion{ true_positive: 0, false_positive: 0,
+        true_negative: 0, false_negative: 0 }
+    say(f, "the all-negatives classifier is 60% accurate here",
+        near(mlmetrics.accuracy(truth(), [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]) ??
+            0.0, 0.6, 0.0000000001))
+    say(f, "and scores zero on the two metrics that cannot be gamed",
+        mlmetrics.f1_of(lazy) == 0.0 and mlmetrics.matthews(lazy) ==
+        0.0)
+    say(f, "Matthews and kappa are what accuracy should have been",
+        near(mlmetrics.matthews(counts), 0.583333333333, 0.000000001) and
+        near(mlmetrics.cohen_kappa(truth(), predicted(), 2) ?? 0.0,
+            0.583333333333, 0.000000001))
+    // The three averages, and why the label matters.
+    say(f, "micro averaging is accuracy under another name",
+        near(mlmetrics.micro_f1(truth(), predicted(), 2) ?? 0.0,
+            mlmetrics.accuracy(truth(), predicted()) ?? 0.0, 0.0000000001))
+    say(f, "macro weighs every class alike, weighted weighs by support",
+        near(mlmetrics.macro_f1(truth(), predicted(), 2) ?? 0.0, 0.79166666,
+            0.000001) and
+        near(mlmetrics.weighted_f1(truth(), predicted(), 2) ?? 0.0, 0.8,
+            0.000001))
+    // The confusion matrix, which says what no scalar can.
+    let matrix = mlmetrics.confusion_matrix(truth(), predicted(), 2) ?? []
+    say(f, "the matrix says which classes are being confused",
+        matrix[0][0] == 5 and matrix[0][1] == 1 and matrix[1][0] == 1 and
+        matrix[1][1] == 3)
+    // The threshold-free pair.
+    say(f, "AUC is the chance a positive outranks a negative",
+        near(mlmetrics.roc_auc(truth(), scores()) ?? 0.0, 0.958333333333,
+            0.000000001))
+    say(f, "average precision is the one to quote when positives are rare",
+        near(mlmetrics.average_precision(truth(), scores()) ?? 0.0, 0.95,
+            0.000000001))
+    say(f, "and AUC has no opinion at all about a constant score",
+        near(mlmetrics.roc_auc(truth(), [0.5, 0.5, 0.5, 0.5, 0.5, 0.5,
+            0.5, 0.5, 0.5, 0.5]) ?? 0.0, 0.5, 0.0000000001))
+    // The two probability scores.
+    say(f, "the log loss cares how confident a wrong answer was",
+        near(mlmetrics.log_loss(truth(), scores()) ?? 0.0, 0.355028310208,
+            0.000000001) and
+        near(mlmetrics.brier_score(truth(), scores()) ?? 0.0, 0.10875,
+            0.000000001))
+    say(f, "and it is clipped, so a confident mistake is not infinite",
+        (mlmetrics.log_loss([1], [0.0]) ?? 0.0) < 40.0)
+    // The regression three.
+    say(f, "the regression metrics are in the units of the thing",
+        near(mlmetrics.mean_absolute_error([3.0, 0.0 - 0.5, 2.0, 7.0],
+            [2.5, 0.0, 2.0, 8.0]) ?? 0.0, 0.5, 0.0000000001) and
+        near(mlmetrics.root_mean_squared_error([3.0, 0.0 - 0.5, 2.0, 7.0],
+            [2.5, 0.0, 2.0, 8.0]) ?? 0.0, 0.612372435696, 0.000000001))
+    say(f, "and R squared goes negative below the mean predictor",
+        near(mlmetrics.r_squared([3.0, 0.0 - 0.5, 2.0, 7.0],
+            [2.5, 0.0, 2.0, 8.0]) ?? 0.0, 0.948608137045, 0.000000001) and
+        (mlmetrics.r_squared([1.0, 2.0, 3.0], [3.0, 2.0, 1.0]) ?? 0.0) <
+        0.0)
+    say(f, "mismatched lengths are refused rather than truncated",
+        length_refused())
+}
+
+fn length_refused() -> bool {
+    match mlmetrics.accuracy([0, 1], [0]) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn main() / {io} {
+    var f = 0
+    check_kmeans(f)
+    check_knn(f)
+    check_naivebayes(f)
+    check_decisiontree(f)
+    check_mlmetrics(f)
+    if f == 0 {
+        print("machine learning: every claim held")
+    } else {
+        print("machine learning: {f} claims failed")
+    }
+}

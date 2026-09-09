@@ -1,0 +1,10 @@
+[package]
+name = "kmeans"
+version = "1.0.0"
+
+# Arithmetic. Opens nothing.
+capabilities = []
+
+[dependencies.random]
+path = "../random"
+version = "^1.0.0"

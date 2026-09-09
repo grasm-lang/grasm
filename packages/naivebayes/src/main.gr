@@ -1,0 +1,353 @@
+// Naive Bayes: assume the features are independent, which they are not, and
+// get a good classifier anyway.
+//
+// Bayes' rule says the probability of a class given the features is
+// proportional to the probability of the features given the class, times the
+// class's own prior. The features-given-class part is the hard bit: with
+// twenty binary features there are a million combinations and no dataset has
+// seen them all. The naive assumption is that they are independent given the
+// class, which turns one impossible estimate into twenty easy ones.
+//
+// ## Why it works when the assumption is false
+//
+// The assumption is essentially never true — in text, "New" and "York"
+// are not independent — and the estimated probabilities are correspondingly
+// terrible, routinely 0.9999 when the truth is 0.6. But the *ranking* of the
+// classes survives: the errors are in the same direction for every class and
+// mostly cancel when you take the argmax. Naive Bayes is a bad probability
+// estimator and a decent classifier, and confusing the two is how people end
+// up thresholding its output.
+//
+// ## Zero counts, and why smoothing is not optional
+//
+// One word never seen in one class makes that class's probability zero for
+// every document containing it, whatever the other thousand words say.
+// Laplace smoothing adds a pseudo-count to every cell. Adding one is the
+// default and adding less than one usually works better, which is why the
+// amount is a parameter rather than a constant.
+//
+// ## Logs, not products
+//
+// Multiplying a thousand probabilities underflows to zero in double
+// precision after about seven hundred of them. Everything here is done as a
+// sum of logs, which is the only reason the multinomial classifier works on
+// documents at all.
+
+type NbError =
+    | NoRows()
+    | LengthMismatch(rows: i64, labels: i64)
+    | RaggedRows(row: i64, width: i64)
+    | BadClass(label: i64)
+    | BadSmoothing(alpha: f64)
+    | NegativeCount(value: f64)
+
+    /// A fitted Gaussian model: a mean and a variance per feature per class.
+type Gaussian = {
+    /// `means[class][feature]`.
+    means: [[f64]],
+    variances: [[f64]],
+    log_priors: [f64],
+    counts: [i64],
+}
+
+/// A fitted multinomial model: a log probability per feature per class.
+type Multinomial = {
+    /// `log_likelihood[class][feature]`.
+    log_likelihood: [[f64]],
+    log_priors: [f64],
+    counts: [i64],
+}
+
+fn check_data(rows: [[f64]], labels: [i64],
+    classes: i64) -> i64 ! NbError {
+    if rows.len() == 0 {
+        fail(NoRows())
+    }
+    if rows.len() != labels.len() {
+        fail(LengthMismatch(rows.len(), labels.len()))
+    }
+    let width = rows[0].len()
+    var i = 0
+    while i < rows.len() {
+        if rows[i].len() != width {
+            fail(RaggedRows(i, width))
+        }
+        if labels[i] < 0 or labels[i] >= classes {
+            fail(BadClass(labels[i]))
+        }
+        i = i + 1
+    }
+    return width
+}
+
+/// Fit a Gaussian naive Bayes: each feature is normal within each class.
+///
+/// `smoothing` is added to every variance as a share of the largest feature
+/// variance in the whole dataset. Without it a feature that is constant
+/// within a class has zero variance and every density becomes infinite;
+/// scikit-learn's default share is 1e-9 and it is doing exactly this.
+pub fn fit_gaussian(rows: [[f64]], labels: [i64], classes: i64,
+    smoothing: f64) -> Gaussian ! NbError {
+    let width = try check_data(rows, labels, classes)
+    if smoothing < 0.0 {
+        fail(BadSmoothing(smoothing))
+    }
+    var means: [[f64]] = []
+    var variances: [[f64]] = []
+    var counts: [i64] = []
+    var c = 0
+    while c < classes {
+        var row_mean: [f64] = []
+        var row_variance: [f64] = []
+        var d = 0
+        while d < width {
+            row_mean.push(0.0)
+            row_variance.push(0.0)
+            d = d + 1
+        }
+        means.push(row_mean)
+        variances.push(row_variance)
+        counts.push(0)
+        c = c + 1
+    }
+    var i = 0
+    while i < rows.len() {
+        let group = labels[i]
+        counts[group] = counts[group] + 1
+        var d = 0
+        while d < width {
+            means[group][d] = means[group][d] + rows[i][d]
+            d = d + 1
+        }
+        i = i + 1
+    }
+    var g = 0
+    while g < classes {
+        if counts[g] > 0 {
+            var d = 0
+            while d < width {
+                means[g][d] = means[g][d] / counts[g].as_f64()
+                d = d + 1
+            }
+        }
+        g = g + 1
+    }
+    var j = 0
+    while j < rows.len() {
+        let group = labels[j]
+        var d = 0
+        while d < width {
+            let gap = rows[j][d] - means[group][d]
+            variances[group][d] = variances[group][d] + gap * gap
+            d = d + 1
+        }
+        j = j + 1
+    }
+    // The population divisor, not the sample one: this is a maximum
+    // likelihood estimate rather than an unbiased one, and it is what
+    // scikit-learn uses.
+    let floor = smoothing * largest_variance(rows, width)
+    var h = 0
+    while h < classes {
+        var d = 0
+        while d < width {
+            if counts[h] > 0 {
+                variances[h][d] = variances[h][d] / counts[h].as_f64()
+            }
+            variances[h][d] = variances[h][d] + floor
+            d = d + 1
+        }
+        h = h + 1
+    }
+    return Gaussian{ means: means, variances: variances,
+        log_priors: priors_of(counts, rows.len()), counts: counts }
+}
+
+/// The log of each class's share of the rows.
+///
+/// A class with no examples cannot be predicted, and the log of zero is not
+/// a number to carry around. Its score is negative infinity in effect; a
+/// large negative constant says the same and keeps the arithmetic finite.
+fn priors_of(counts: [i64], total: i64) -> [f64] {
+    var out: [f64] = []
+    for count in counts {
+        if count == 0 {
+            out.push(0.0 - 1000000000.0)
+        } else {
+            out.push((count.as_f64() / total.as_f64()).ln())
+        }
+    }
+    return out
+}
+
+fn largest_variance(rows: [[f64]], width: i64) -> f64 {
+    var largest = 0.0
+    var d = 0
+    while d < width {
+        var total = 0.0
+        var i = 0
+        while i < rows.len() {
+            total = total + rows[i][d]
+            i = i + 1
+        }
+        let mean = total / rows.len().as_f64()
+        var spread = 0.0
+        var j = 0
+        while j < rows.len() {
+            let gap = rows[j][d] - mean
+            spread = spread + gap * gap
+            j = j + 1
+        }
+        let variance = spread / rows.len().as_f64()
+        if variance > largest {
+            largest = variance
+        }
+        d = d + 1
+    }
+    return largest
+}
+
+/// The unnormalised log probability of each class for one row.
+///
+/// Unnormalised because the normaliser is the same for every class and
+/// dividing by it changes nothing about which class wins. `posterior_of`
+/// does the division when the probabilities themselves are wanted.
+pub fn gaussian_scores(model: Gaussian, row: [f64]) -> [f64] {
+    var out: [f64] = []
+    var c = 0
+    while c < model.means.len() {
+        var total = model.log_priors[c]
+        var d = 0
+        while d < row.len() and d < model.means[c].len() {
+            let variance = model.variances[c][d]
+            if variance > 0.0 {
+                let gap = row[d] - model.means[c][d]
+                total = total - 0.5 * (6.283185307179586 * variance).ln() -
+                gap * gap / (2.0 * variance)
+            }
+            d = d + 1
+        }
+        out.push(total)
+        c = c + 1
+    }
+    return out
+}
+
+/// Fit a multinomial naive Bayes: each feature is a count.
+///
+/// This is the one for text. A row is the counts of each word in a document;
+/// `alpha` is the pseudo-count added to every word in every class.
+pub fn fit_multinomial(rows: [[f64]], labels: [i64], classes: i64,
+    alpha: f64) -> Multinomial ! NbError {
+    let width = try check_data(rows, labels, classes)
+    if alpha <= 0.0 {
+        fail(BadSmoothing(alpha))
+    }
+    var totals: [[f64]] = []
+    var counts: [i64] = []
+    var c = 0
+    while c < classes {
+        var row: [f64] = []
+        var d = 0
+        while d < width {
+            row.push(0.0)
+            d = d + 1
+        }
+        totals.push(row)
+        counts.push(0)
+        c = c + 1
+    }
+    var i = 0
+    while i < rows.len() {
+        let group = labels[i]
+        counts[group] = counts[group] + 1
+        var d = 0
+        while d < width {
+            if rows[i][d] < 0.0 {
+                fail(NegativeCount(rows[i][d]))
+            }
+            totals[group][d] = totals[group][d] + rows[i][d]
+            d = d + 1
+        }
+        i = i + 1
+    }
+    var log_likelihood: [[f64]] = []
+    var g = 0
+    while g < classes {
+        var class_total = 0.0
+        var d = 0
+        while d < width {
+            class_total = class_total + totals[g][d] + alpha
+            d = d + 1
+        }
+        var row: [f64] = []
+        var e = 0
+        while e < width {
+            row.push(((totals[g][e] + alpha) / class_total).ln())
+            e = e + 1
+        }
+        log_likelihood.push(row)
+        g = g + 1
+    }
+    return Multinomial{ log_likelihood: log_likelihood,
+        log_priors: priors_of(counts, rows.len()), counts: counts }
+}
+
+/// The unnormalised log probability of each class for one row of counts.
+pub fn multinomial_scores(model: Multinomial, row: [f64]) -> [f64] {
+    var out: [f64] = []
+    var c = 0
+    while c < model.log_likelihood.len() {
+        var total = model.log_priors[c]
+        var d = 0
+        while d < row.len() and d < model.log_likelihood[c].len() {
+            total = total + row[d] * model.log_likelihood[c][d]
+            d = d + 1
+        }
+        out.push(total)
+        c = c + 1
+    }
+    return out
+}
+
+/// The class with the highest score, ties going to the lowest label.
+pub fn best_of(scores: [f64]) -> i64 {
+    var best = 0
+    var i = 1
+    while i < scores.len() {
+        if scores[i] > scores[best] {
+            best = i
+        }
+        i = i + 1
+    }
+    return best
+}
+
+/// Log scores turned into probabilities that sum to one.
+///
+/// Done by subtracting the largest before exponentiating. Not an
+/// optimisation: without it a set of scores around -800 exponentiates to
+/// zeroes and the division is 0/0.
+pub fn posterior_of(scores: [f64]) -> [f64] {
+    if scores.len() == 0 {
+        return []
+    }
+    var largest = scores[0]
+    for score in scores {
+        if score > largest {
+            largest = score
+        }
+    }
+    var total = 0.0
+    var shifted: [f64] = []
+    for score in scores {
+        let value = (score - largest).exp()
+        shifted.push(value)
+        total = total + value
+    }
+    var out: [f64] = []
+    for value in shifted {
+        out.push(value / total)
+    }
+    return out
+}
