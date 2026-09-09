@@ -1,0 +1,224 @@
+// What a password policy should be, and what almost every one of them is.
+//
+// NIST rewrote its own advice in SP 800-63B after two decades of the rules
+// everybody still ships. The rules it *removed* are the interesting part:
+//
+//   - No composition rules. "Must contain an uppercase letter, a digit and
+//     a symbol" produces `Password1!` from everyone, which is a smaller
+//     space than the one it was meant to enlarge.
+//   - No periodic rotation. Forcing a change every 90 days produces
+//     `Summer2024` then `Autumn2024`, and an attacker who has one has the
+//     next. Rotate on evidence of compromise, and only then.
+//   - No hints and no security questions. A hint is a plaintext leak and
+//     mother's maiden name is public record.
+//   - No blocking paste. Blocking it stops password managers, and the
+//     people it stops are the ones with the good passwords.
+//
+// What it adds is one rule that does work: check the password against a
+// list of ones already known to be breached, and refuse those.
+//
+// ## Checking a breach list without sending the password
+//
+// Have I Been Pwned's range API is the standard way. SHA-1 the password,
+// send the *first five hex characters* of the digest, and get back every
+// suffix in that range with its count — about 800 of them. The server
+// learns which of a million buckets the password is in, which is not enough
+// to identify it, and the client does the final comparison itself. This
+// package computes the prefix and does the matching; the request is the
+// caller's, because a package that opens a socket cannot be used in the
+// places this one can.
+
+import sha1
+import entropy
+
+type PolicyError =
+    | TooShort(length: i64, least: i64)
+    | TooLong(length: i64, most: i64)
+    | Breached(count: i64)
+    | Blocked(reason: str)
+    | BadPrefix(prefix: str)
+
+    /// The rules a policy actually enforces.
+type PasswordPolicy = {
+    /// Eight for a password a person chose; six for one that was generated.
+    least_length: i64,
+    /// The cap, which exists only to bound the hashing work. Sixty-four is
+    /// the floor NIST sets for it.
+    most_length: i64,
+    /// Refuse a password that appears in the breach list at all, or only
+    /// one that appears often. Refusing at one count is stricter than most
+    /// sites can bear.
+    most_breaches: i64,
+    /// Words about this site: its name, the user's own name and address.
+    /// These are what people reach for and what an attacker tries first.
+    context: [str],
+    /// The minimum guess count, when the policy wants a strength floor
+    /// rather than a length one.
+    least_guesses: f64,
+}
+
+/// What was wrong with a password, in the order it was found.
+type Finding = {
+    /// `length`, `breached`, `context`, `repeat`, `sequence`, `keyboard`
+    /// or `weak`.
+    kind: str,
+    detail: str,
+}
+
+/// The policy SP 800-63B describes, with no composition rules in it.
+pub fn nist_policy() -> PasswordPolicy {
+    return PasswordPolicy{ least_length: 8, most_length: 64, most_breaches: 0,
+        context: [], least_guesses: 0.0 }
+}
+
+/// The five-character prefix to send, and the suffix to look for.
+///
+/// Upper case, because the API answers in upper case and a client that
+/// compares in lower case finds nothing and reports every password as safe
+/// — a failure that looks exactly like success.
+pub fn range_query(password: str) -> (str, str) {
+    let digest = sha1.hex(password.to_bytes()).to_upper()
+    return (digest.substr(0, 5), digest.substr(5, digest.len() - 5))
+}
+
+/// How many times a password appears in the breach list, given the lines the
+/// range API returned.
+///
+/// Each line is `SUFFIX:COUNT`. A suffix that is not there means the
+/// password is not in the list, which is the answer for most of them.
+pub fn breach_count(password: str,
+    lines: [str]) -> i64 ! PolicyError {
+    let query = range_query(password)
+    for line in lines {
+        let trimmed = line.trim()
+        if trimmed == "" {
+            continue
+        }
+        let at = index_of(trimmed, ":")
+        if at < 0 {
+            fail(BadPrefix(trimmed))
+        }
+        if trimmed.substr(0, at).to_upper() == query.1 {
+            return trimmed.substr(at + 1, trimmed.len() - at - 1).trim()
+                .parse_int() ?? 0
+        }
+    }
+    return 0
+}
+
+fn index_of(text: str, needle: str) -> i64 {
+    var i = 0
+    while i + needle.len() <= text.len() {
+        if text.substr(i, needle.len()) == needle {
+            return i
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+/// Everything wrong with a password under a policy.
+///
+/// An empty list means it passes. The order is the order a person should
+/// read them in: the length first, because it is the only one they can fix
+/// without thinking.
+pub fn findings_for(policy: PasswordPolicy, password: str, breaches: i64,
+    words: [str]) -> [Finding] {
+    var out: [Finding] = []
+    if password.len() < policy.least_length {
+        out.push(Finding{ kind: "length", detail: "shorter than " +
+            "{policy.least_length} characters" })
+    }
+    if password.len() > policy.most_length {
+        out.push(Finding{ kind: "length", detail: "longer than " +
+            "{policy.most_length} characters" })
+    }
+    if breaches > policy.most_breaches {
+        out.push(Finding{ kind: "breached", detail: "found in a breach " +
+            "{breaches} times" })
+    }
+    let lowered = password.to_lower()
+    for word in policy.context {
+        if word != "" and lowered.contains(word.to_lower()) {
+            out.push(Finding{ kind: "context", detail: "contains " + word })
+        }
+    }
+    if entropy.is_repeat(password) {
+        out.push(Finding{ kind: "repeat", detail: "one thing repeated" })
+    }
+    if entropy.is_sequence(password) {
+        out.push(Finding{ kind: "sequence", detail: "a run of consecutive " +
+            "characters" })
+    }
+    if entropy.is_keyboard_run(password) {
+        out.push(Finding{ kind: "keyboard", detail: "a walk across the " +
+            "keyboard" })
+    }
+    if policy.least_guesses > 0.0 {
+        let guesses = entropy.guesses_of(password, words) ?? 0.0
+        if guesses < policy.least_guesses {
+            out.push(Finding{ kind: "weak", detail: "guessed in about " +
+                "{guesses.round()} tries" })
+        }
+    }
+    return out
+}
+
+/// Whether a password passes.
+pub fn accepts(policy: PasswordPolicy, password: str, breaches: i64,
+    words: [str]) -> bool {
+    return findings_for(policy, password, breaches, words).len() == 0
+}
+
+/// The rules a policy must *not* have, each with why.
+///
+/// Here as data rather than prose because a policy is usually written by
+/// somebody who has to justify each line to somebody else.
+pub fn removed_rules() -> [(str, str)] {
+    return [("composition", "requiring a mix of character classes makes " +
+        "everyone produce the same shapes, and shrinks the space it was " +
+        "meant to widen"),
+        ("rotation", "forcing a change on a schedule produces a sequence " +
+            "an attacker can extrapolate from one member"),
+        ("hints", "a hint is stored to be shown, so it is a plaintext " +
+            "leak of something about the password"),
+        ("questions", "the answers are public record or are themselves " +
+            "passwords, kept in plaintext"),
+        ("paste", "blocking it stops password managers, and the people " +
+            "using one have the passwords worth keeping"),
+        ("truncation", "silently cutting a password to n characters means " +
+            "a longer one is no stronger, and the user is never told")]
+}
+
+/// Whether a stated rule is one of the ones to remove.
+pub fn is_removed(rule: str) -> bool {
+    for pair in removed_rules() {
+        if pair.0 == rule {
+            return true
+        }
+    }
+    return false
+}
+
+/// The reason a rule was removed, or an error when it is not one of them.
+pub fn reason_for(rule: str) -> str ! PolicyError {
+    for pair in removed_rules() {
+        if pair.0 == rule {
+            return pair.1
+        }
+    }
+    fail(Blocked(rule))
+}
+
+/// How long a generated password must be to reach a bit count.
+///
+/// The answer to "how long should the tokens we mint be", which is the one
+/// question in this area with an exact answer.
+pub fn generated_length(bits: f64,
+    alphabet: i64) -> i64 ! PolicyError {
+    if alphabet < 2 {
+        fail(BadPrefix("{alphabet}"))
+    }
+    let per_character = alphabet.as_f64().ln() / 0.6931471805599453
+    return (bits / per_character).ceil().as_i64()
+}

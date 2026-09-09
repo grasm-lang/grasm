@@ -1,0 +1,233 @@
+// The record a password is stored in, and the four things that are not the
+// hash.
+//
+// `password` in this package set derives and verifies the digest. That is
+// the cryptography, and it is the part that is already right. What is left
+// is the bookkeeping around it, which is where the failures actually
+// happen:
+//
+//   - The salt has to be unique per credential, not per deployment. A
+//     single salt in a config file turns a stolen table into one rainbow
+//     table attack against every account at once.
+//   - The pepper is a *different* thing from the salt and lives somewhere
+//     the database does not: a key in the process environment or an HSM.
+//     Its whole value is that a stolen database without it is useless, so a
+//     pepper stored beside the hashes is decoration.
+//   - The pepper has to be versioned, because it will be rotated, and a
+//     rotation that cannot verify the old records logs everybody out
+//     permanently.
+//   - Verifying an unknown user has to take the same time as verifying a
+//     known one. Returning early on "no such user" turns the login endpoint
+//     into a user enumeration oracle, and the timing difference is
+//     milliseconds, which is enormous.
+//
+// ## Peppering, and where it goes
+//
+// HMAC the password with the server key *before* handing it to the key
+// derivation. Doing it afterwards also works and is worse in one specific
+// way: the KDF's output is short and fixed-length, so an attacker who
+// obtains the pepper can then attack the hashes offline exactly as before,
+// while peppering first means the KDF input is unknown to them at all.
+//
+// ## What this cannot fix
+//
+// A stolen database with the pepper is a stolen database. Peppering buys
+// the case where the database leaks and the application server does not,
+// which is the common shape of a leak — an injection, a backup, a snapshot
+// — and not the rare one.
+
+import crypto_hash
+import keyderive
+
+type SaltError =
+    | ShortSalt(length: i64, least: i64)
+    | NoSuchPepper(version: i64)
+    | MalformedRecord(text: str)
+    | EmptySecret()
+
+    /// A stored credential: the hash, and everything around it.
+type Credential = {
+    /// The crypt string, which carries the scheme and its cost.
+    stored: str,
+    /// Which pepper key was used, so it can be rotated.
+    pepper_version: i64,
+    /// When it was written, in seconds, so an old scheme can be found
+    /// without parsing every string.
+    written_at: i64,
+}
+
+/// The least salt anybody should use, in bytes.
+///
+/// Sixteen. The number exists to make collisions between two users'
+/// salts negligible, not to resist anything: at eight bytes a large site
+/// has duplicate salts by the birthday bound, and two users with one salt
+/// can be attacked together.
+pub fn least_salt_bytes() -> i64 {
+    return 16
+}
+
+/// Whether a salt is long enough and not a constant somebody typed.
+pub fn salt_is_usable(salt: bytes) -> bool {
+    if salt.len() < least_salt_bytes() {
+        return false
+    }
+    // All-zero and all-one salts are what appears when a buffer was never
+    // filled, and a scan for them costs nothing.
+    var zeros = 0
+    var ones = 0
+    var i = 0
+    while i < salt.len() {
+        if salt.at(i) == 0 {
+            zeros = zeros + 1
+        }
+        if salt.at(i) == 255 {
+            ones = ones + 1
+        }
+        i = i + 1
+    }
+    return zeros < salt.len() and ones < salt.len()
+}
+
+/// The password with the pepper folded in, ready for the key derivation.
+///
+/// HMAC rather than concatenation: appending a key to a message and hashing
+/// it is the length-extension mistake, and while these hashes are not
+/// vulnerable to it the habit is what matters.
+pub fn peppered(secret: str, pepper: bytes) -> bytes ! SaltError {
+    if secret == "" {
+        fail(EmptySecret())
+    }
+    if pepper.len() == 0 {
+        return secret.to_bytes()
+    }
+    return crypto_hash.hmac_sha256(pepper, secret.to_bytes())
+}
+
+/// A record written out as one line: `version:written:crypt`.
+///
+/// The crypt string is last because it is the only field that contains no
+/// colon, so the split is unambiguous however the scheme changes.
+pub fn encode(record: Credential) -> str {
+    return "{record.pepper_version}:{record.written_at}:{record.stored}"
+}
+
+/// A record read back.
+pub fn decode(text: str) -> Credential ! SaltError {
+    let first = index_of(text, ":")
+    if first < 0 {
+        fail(MalformedRecord(text))
+    }
+    let rest = text.substr(first + 1, text.len() - first - 1)
+    let second = index_of(rest, ":")
+    if second < 0 {
+        fail(MalformedRecord(text))
+    }
+    let version = text.substr(0, first).parse_int() ?? 0 - 1
+    let written = rest.substr(0, second).parse_int() ?? 0 - 1
+    if version < 0 or written < 0 {
+        fail(MalformedRecord(text))
+    }
+    return Credential{ stored: rest.substr(second + 1, rest.len() - second - 1),
+        pepper_version: version, written_at: written }
+}
+
+fn index_of(text: str, needle: str) -> i64 {
+    var i = 0
+    while i + needle.len() <= text.len() {
+        if text.substr(i, needle.len()) == needle {
+            return i
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+/// The pepper for a version, from a keyring of (version, key) pairs.
+///
+/// A keyring rather than a key, because rotation means holding the old ones
+/// until every record has been rewritten — which happens at login, one user
+/// at a time, over however long it takes them all to come back.
+pub fn pepper_for(keyring: [(i64, bytes)],
+    version: i64) -> bytes ! SaltError {
+    for entry in keyring {
+        if entry.0 == version {
+            return entry.1
+        }
+    }
+    fail(NoSuchPepper(version))
+}
+
+/// The newest version in a keyring, which is the one to write with.
+pub fn newest_version(keyring: [(i64, bytes)]) -> i64 ! SaltError {
+    if keyring.len() == 0 {
+        fail(NoSuchPepper(0 - 1))
+    }
+    var newest = keyring[0].0
+    for entry in keyring {
+        if entry.0 > newest {
+            newest = entry.0
+        }
+    }
+    return newest
+}
+
+/// Whether a record should be rewritten at the next successful login.
+///
+/// Either the pepper has been rotated since, or the key derivation's cost
+/// is below what is recommended now. Both are the same operation — rehash
+/// with today's settings — and both can only happen while the password is
+/// in hand.
+pub fn needs_rewrite(record: Credential, keyring: [(i64, bytes)],
+    scheme: str) -> bool ! SaltError {
+    if record.pepper_version != try newest_version(keyring) {
+        return true
+    }
+    match keyderive.parse(record.stored) {
+        Ok(hash) -> {
+            match keyderive.needs_rehash(hash, scheme) {
+                Ok(answer) -> return answer
+                Err(_e) -> return true
+            }
+        }
+        Err(_e) -> return true
+    }
+}
+
+/// A record to verify against when the user does not exist.
+///
+/// Returning early on an unknown user is the enumeration bug, and it is not
+/// subtle: the difference between a string comparison and an argon2 hash is
+/// tens of milliseconds, which is visible over the network from another
+/// continent. The fix is to do the work anyway, against a hash of something
+/// nobody knows, and this returns a record shaped for that.
+pub fn decoy_record(scheme: str, salt: str) -> Credential {
+    var stored = "$argon2id$v=19$m=19456,t=2,p=1$" + salt +
+    "$0000000000000000000000000000000000000000000"
+    if scheme == "bcrypt" {
+        stored = "$2b$10$" + salt +
+        "0000000000000000000000000000000"
+    }
+    return Credential{ stored: stored, pepper_version: 0, written_at: 0 }
+}
+
+/// Whether two digests are equal, in time that does not depend on where
+/// they first differ.
+///
+/// The obvious comparison returns on the first differing byte, so the time
+/// it takes says how many bytes were right. Against a hash that is useless
+/// — the attacker cannot choose the digest — and against a token or a MAC
+/// it is a complete break, so the habit is to never write the obvious one.
+pub fn digests_equal(a: bytes, b: bytes) -> bool {
+    return crypto_hash.equal_constant_time(a, b)
+}
+
+/// How many bits of the salt space two users share by the birthday bound.
+///
+/// With `n` users and a salt of `bits` bits, a collision is likely once
+/// `n` is about `2^(bits/2)`. Sixteen bytes is 128 bits, so the answer for
+/// any real site is "never"; eight bytes is 64 bits, and a site with four
+/// billion accounts has duplicates.
+pub fn collision_population(salt_bytes: i64) -> f64 {
+    let bits = salt_bytes.as_f64() * 8.0
+    return (bits / 2.0 * 0.6931471805599453).exp()
+}

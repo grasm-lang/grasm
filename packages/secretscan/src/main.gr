@@ -1,0 +1,260 @@
+// Finding the credential somebody committed.
+//
+// Every API key in every git history got there the same way: it worked
+// locally, it went in a config file, the config file went in the commit.
+// Scanning for them is a solved problem in the sense that the patterns are
+// published — gitleaks maintains a couple of hundred of them — and an
+// unsolved one in the sense that the generic patterns drown in false
+// positives.
+//
+// ## Two kinds of rule, and why the second one is hard
+//
+// A *shaped* secret announces itself: an AWS access key is `AKIA` followed
+// by twenty base-32 characters, a GitHub token is `ghp_` and thirty-six
+// alphanumerics. These have essentially no false positives, and a scanner
+// that only found these would still be worth running.
+//
+// A *generic* secret is a long random-looking string next to the word
+// `password` or `token`. Every one of these rules fires on test fixtures,
+// example documentation, and base64-encoded images. The entropy threshold is
+// what makes them usable at all: a real key has close to the maximum
+// entropy for its alphabet, and `xxxxxxxxxxxxxxxxxxxx` does not.
+//
+// ## The entropy filter, precisely
+//
+// Shannon entropy of the matched secret, per character, against a threshold
+// per rule. gitleaks uses 3.0 for most shaped rules and up to 4.5 for the
+// generic ones. It is a weak filter — the whole point of a key is to look
+// random, and so does a hash, and so does base64 — but it removes the
+// placeholder strings, which are most of what a scanner finds.
+//
+// ## What a scanner cannot do
+//
+// Tell a live key from a revoked one, or a real one from an example in the
+// documentation. Every finding needs a human, and a scanner that reports
+// five hundred needs a human who will stop reading at forty.
+
+import regex
+import entropy
+
+type ScanError =
+    | BadPattern(rule: str, why: str)
+    | NoSuchRule(id: str)
+
+    /// One rule: what to look for, and how random the result has to be.
+type ScanRule = {
+    id: str,
+    description: str,
+    /// The pattern, without the word boundaries gitleaks writes: the
+    /// boundary is applied by the scanner so the same rule text works
+    /// against an engine that has no `\b`.
+    pattern: str,
+    /// Shannon bits per character the match must exceed. Zero means the
+    /// shape alone is enough.
+    least_entropy: f64,
+    /// A cheap prefilter: the rule cannot fire unless one of these appears
+    /// somewhere in the text. gitleaks does this too, and it is the reason
+    /// a scan of a large repository finishes.
+    keywords: [str],
+}
+
+/// Where a secret was found and what it looks like.
+type Secret = {
+    rule: str,
+    line: i64,
+    column: i64,
+    matched: str,
+    entropy: f64,
+}
+
+/// The shaped rules, taken from the gitleaks configuration.
+///
+/// Fifteen of the two hundred there: the ones whose shape is distinctive
+/// enough that a match is almost certainly real.
+pub fn rules() -> [ScanRule] {
+    return [
+        ScanRule{ id: "aws-access-token", description: "an AWS access key",
+            pattern: "(A3T[A-Z0-9]|AKIA|ASIA|ABIA|ACCA)[A-Z2-7]\{16}",
+            least_entropy: 3.0, keywords: ["akia", "asia", "abia", "acca",
+                "a3t"] },
+        ScanRule{ id: "github-pat", description: "a GitHub personal token",
+            pattern: "ghp_[0-9a-zA-Z]\{36}", least_entropy: 3.0,
+            keywords: ["ghp_"] },
+        ScanRule{ id: "github-fine-grained-pat",
+            description: "a fine-grained GitHub token",
+            pattern: "github_pat_\\w\{82}", least_entropy: 3.0,
+            keywords: ["github_pat_"] },
+        ScanRule{ id: "gitlab-pat", description: "a GitLab personal token",
+            pattern: "glpat-[\\w-]\{20}", least_entropy: 3.0,
+            keywords: ["glpat-"] },
+        ScanRule{ id: "slack-bot-token", description: "a Slack bot token",
+            pattern: "xoxb-[0-9]\{10,13}-[0-9]\{10,13}[a-zA-Z0-9-]*",
+            least_entropy: 3.0, keywords: ["xoxb-"] },
+        ScanRule{ id: "stripe-access-token", description: "a Stripe key",
+            pattern: "(sk|rk)_(test|live|prod)_[a-zA-Z0-9]\{10,99}",
+            least_entropy: 2.0, keywords: ["sk_test", "sk_live", "sk_prod",
+                "rk_test", "rk_live", "rk_prod"] },
+        ScanRule{ id: "npm-access-token", description: "an npm token",
+            pattern: "npm_[a-zA-Z0-9]\{36}", least_entropy: 2.0,
+            keywords: ["npm_"] },
+        ScanRule{ id: "sendgrid-api-token", description: "a SendGrid key",
+            pattern: "SG\\.[a-zA-Z0-9=_\\-\\.]\{66}", least_entropy: 2.0,
+            keywords: ["sg."] },
+        ScanRule{ id: "shopify-access-token", description: "a Shopify token",
+            pattern: "shpat_[a-fA-F0-9]\{32}", least_entropy: 2.0,
+            keywords: ["shpat_"] },
+        ScanRule{ id: "square-access-token", description: "a Square token",
+            pattern: "(EAAA|sq0atp-)[\\w-]\{22,60}", least_entropy: 2.0,
+            keywords: ["eaaa", "sq0atp-"] },
+        ScanRule{ id: "twilio-api-key", description: "a Twilio key",
+            pattern: "SK[0-9a-fA-F]\{32}", least_entropy: 3.0,
+            keywords: ["sk"] },
+        ScanRule{ id: "jwt", description: "a JSON web token",
+            pattern: "ey[a-zA-Z0-9]\{17,}\\.ey[a-zA-Z0-9/\\\\_-]\{17,}" +
+            "\\.([a-zA-Z0-9/\\\\_-]\{10,}=\{0,2})?", least_entropy: 3.0,
+            keywords: ["ey"] },
+        ScanRule{ id: "private-key", description: "a private key block",
+            pattern: "-----BEGIN[ A-Z0-9_-]\{0,100}PRIVATE KEY" +
+            "( BLOCK)?-----", least_entropy: 0.0,
+            keywords: ["-----begin"] },
+        ScanRule{ id: "openai-api-key", description: "an OpenAI key",
+            pattern: "sk-(proj|svcacct|admin)-[A-Za-z0-9_-]\{20,200}",
+            least_entropy: 3.0, keywords: ["sk-proj-", "sk-svcacct-",
+                "sk-admin-"] },
+        ScanRule{ id: "generic-high-entropy",
+            description: "a long random-looking string beside a secret word",
+            pattern: "[A-Za-z0-9+/=_-]\{32,120}", least_entropy: 4.5,
+            keywords: ["secret", "token", "password", "api_key", "apikey",
+                "credential"] }]
+}
+
+/// The rule with an id, or an error naming it.
+pub fn rule_named(id: str) -> ScanRule ! ScanError {
+    for rule in rules() {
+        if rule.id == id {
+            return rule
+        }
+    }
+    fail(NoSuchRule(id))
+}
+
+/// Whether the prefilter lets a rule run against a text.
+///
+/// gitleaks calls this the keyword check and it is not an optimisation
+/// detail: with it a scan is a substring search that rarely runs a regex,
+/// and without it every rule runs over every file.
+pub fn keywords_present(rule: ScanRule, text: str) -> bool {
+    if rule.keywords.len() == 0 {
+        return true
+    }
+    let lowered = text.to_lower()
+    for keyword in rule.keywords {
+        if lowered.contains(keyword) {
+            return true
+        }
+    }
+    return false
+}
+
+/// Whether a character can be part of a token, for the boundary check.
+fn is_word(code: i64) -> bool {
+    return (code >= 48 and code <= 57) or (code >= 65 and code <= 90) or
+    (code >= 97 and code <= 122) or code == 95
+}
+
+/// Whether a match sits on token boundaries, which is what `\b` means.
+pub fn on_boundaries(text: str, start: i64, end: i64) -> bool {
+    let codes = text.codes()
+    if start > 0 and is_word(codes[start - 1]) and
+    is_word(codes[start]) {
+        return false
+    }
+    if end < codes.len() and is_word(codes[end - 1]) and
+    is_word(codes[end]) {
+        return false
+    }
+    return true
+}
+
+/// Every secret one rule finds in a text.
+pub fn scan_with(rule: ScanRule, text: str) -> [Secret] ! ScanError {
+    if not keywords_present(rule, text) {
+        return []
+    }
+    var compiled = regex.compile(rule.pattern) ??
+    fail(BadPattern(rule.id, rule.pattern))
+    var out: [Secret] = []
+    for found in regex.find_all(compiled, text) {
+        if not on_boundaries(text, found.start, found.end) {
+            continue
+        }
+        let bits = entropy.shannon_bits(found.text) ?? 0.0
+        if bits <= rule.least_entropy {
+            continue
+        }
+        let place = position_of(text, found.start)
+        out.push(Secret{ rule: rule.id, line: place.0, column: place.1,
+            matched: found.text, entropy: bits })
+    }
+    return out
+}
+
+/// Every secret every rule finds, in the order the rules are written.
+pub fn scan(text: str) -> [Secret] ! ScanError {
+    var out: [Secret] = []
+    for rule in rules() {
+        for found in try scan_with(rule, text) {
+            out.push(found)
+        }
+    }
+    return out
+}
+
+/// The line and column of an offset, both counting from one.
+fn position_of(text: str, offset: i64) -> (i64, i64) {
+    var line = 1
+    var column = 1
+    var i = 0
+    for code in text.codes() {
+        if i >= offset {
+            return (line, column)
+        }
+        if code == 10 {
+            line = line + 1
+            column = 1
+        } else {
+            column = column + 1
+        }
+        i = i + 1
+    }
+    return (line, column)
+}
+
+/// A secret with its middle replaced, so a report can be pasted into a
+/// ticket.
+///
+/// The first four and last four characters are kept, which is enough to
+/// recognise a key you are holding and not enough to use one you are not.
+/// A short secret is replaced entirely.
+pub fn redact(secret: str) -> str {
+    if secret.len() <= 12 {
+        var out = ""
+        var i = 0
+        while i < secret.len() {
+            out = out + "*"
+            i = i + 1
+        }
+        return out
+    }
+    return secret.substr(0, 4) + "..." +
+    secret.substr(secret.len() - 4, 4)
+}
+
+/// Whether a finding is worth waking somebody for.
+///
+/// A shaped rule that fired is; the generic one is not, on its own. The
+/// distinction is the only thing standing between a scanner and being
+/// switched off.
+pub fn is_high_confidence(secret: Secret) -> bool {
+    return secret.rule != "generic-high-entropy"
+}

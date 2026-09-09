@@ -1,0 +1,24 @@
+[package]
+name = "security3_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.entropy]
+path = "../entropy"
+version = "^1.0.0"
+
+[dependencies.passwordpolicy]
+path = "../passwordpolicy"
+version = "^1.0.0"
+
+[dependencies.secretscan]
+path = "../secretscan"
+version = "^1.0.0"
+
+[dependencies.keyderive]
+path = "../keyderive"
+version = "^1.0.0"
+
+[dependencies.saltedhash]
+path = "../saltedhash"
+version = "^1.0.0"

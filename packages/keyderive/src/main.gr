@@ -1,0 +1,387 @@
+// The string a password hash is stored as, and the parameters inside it.
+//
+// `$argon2id$v=19$m=65536,t=3,p=4$c29tZXNhbHQ$RdescudvJCsgt3ub+b+dWRWJTmaaJObG`
+// is not a hash; it is a hash *and its own instructions*. The scheme, the
+// cost, the salt and the digest travel together, which is what lets a
+// verifier check a password against a hash made years ago by different code
+// with different settings — and lets it notice that the settings are now too
+// weak and upgrade them at the next login.
+//
+// This package reads and writes those strings and says what the parameters
+// mean. It does not compute the hashes: `argon2`, `scrypt`, `bcrypt` and
+// `pbkdf2` do that, and separating the two is the point — the format is
+// where the interoperability lives, and it is the part everybody
+// reimplements slightly wrong.
+//
+// ## The three encodings, none of them the same
+//
+// The modular crypt format is old enough that each scheme brought its own
+// base64:
+//
+//   - `$5$`, `$6$` and `$2b$` use the crypt alphabet, `./0-9A-Za-z`, and
+//     `$2b$` further encodes the salt with `.` and `/` first.
+//   - `$pbkdf2-sha256$` uses passlib's adapted base64: the standard
+//     alphabet with `+` written as `.`, and no padding.
+//   - `$argon2id$` and `$scrypt$` use standard base64 with the padding
+//     stripped.
+//
+// A parser that assumes one of them silently mangles the salt of the other
+// two, and the mangling shows up as "the password is wrong" for every user.
+//
+// ## Why the cost is in the string
+//
+// Because it has to change. Every recommendation for these parameters has
+// risen every few years and will keep rising. A system that stores the cost
+// separately, in a config file, cannot verify a hash made under the old one;
+// a system that stores it in the string can, and `needs_rehash` says when to
+// replace it.
+
+type KdfError =
+    | NotACryptString(text: str)
+    | UnknownScheme(id: str)
+    | BadParameter(name: str, value: str)
+    | MissingParameter(name: str)
+
+    /// A parsed crypt string.
+type Crypt = {
+    /// `argon2id`, `argon2i`, `scrypt`, `pbkdf2-sha256`, `pbkdf2-sha512`,
+    /// `sha256-crypt`, `sha512-crypt` or `bcrypt`.
+    scheme: str,
+    /// The parameters, in the order they appeared.
+    parameters: [(str, str)],
+    /// The salt, exactly as written; decoding it needs the scheme's own
+    /// alphabet.
+    salt: str,
+    digest: str,
+    /// The version field argon2 puts between the scheme and the cost.
+    version: str,
+}
+
+/// The scheme identifiers this understands.
+pub fn schemes() -> [str] {
+    return ["argon2id", "argon2i", "argon2d", "scrypt", "pbkdf2-sha256",
+        "pbkdf2-sha512", "sha256-crypt", "sha512-crypt", "bcrypt"]
+}
+
+fn split_on(text: str, sep: str) -> [str] {
+    return text.split(sep)
+}
+
+/// Read a crypt string.
+///
+/// The `$5$` and `$6$` schemes are named by a digit and everything else by a
+/// word; bcrypt's `$2a$`, `$2b$` and `$2y$` are one field where every other
+/// scheme has two, with the cost and salt run together. Each of those is a
+/// special case in every implementation of this that exists.
+pub fn parse(text: str) -> Crypt ! KdfError {
+    if not text.starts_with("$") {
+        fail(NotACryptString(text))
+    }
+    let fields = split_on(text, "$")
+    if fields.len() < 3 {
+        fail(NotACryptString(text))
+    }
+    let id = fields[1]
+    if id == "2a" or id == "2b" or id == "2y" {
+        return try parse_bcrypt(text, id, fields)
+    }
+    if id == "5" or id == "6" {
+        return try parse_shacrypt(text, id, fields)
+    }
+    if id == "argon2id" or id == "argon2i" or id == "argon2d" {
+        return try parse_argon(text, id, fields)
+    }
+    if id == "scrypt" or id == "pbkdf2-sha256" or id == "pbkdf2-sha512" or
+    id == "pbkdf2" {
+        return try parse_plain(text, id, fields)
+    }
+    fail(UnknownScheme(id))
+}
+
+fn parse_bcrypt(text: str, id: str, fields: [str]) -> Crypt ! KdfError {
+    if fields.len() != 4 {
+        fail(NotACryptString(text))
+    }
+    let tail = fields[3]
+    if tail.len() != 53 {
+        fail(BadParameter("digest", tail))
+    }
+    return Crypt{ scheme: "bcrypt",
+        parameters: [("ident", id), ("rounds", fields[2])],
+        salt: tail.substr(0, 22), digest: tail.substr(22, 31),
+        version: "" }
+}
+
+fn parse_shacrypt(text: str, id: str, fields: [str]) -> Crypt ! KdfError {
+    var scheme = "sha256-crypt"
+    if id == "6" {
+        scheme = "sha512-crypt"
+    }
+    // The rounds field is optional, and its absence means 5000 rather than
+    // an error — which is how the format was extended without breaking the
+    // strings that came before it.
+    var at = 2
+    var parameters: [(str, str)] = [("rounds", "5000")]
+    if fields.len() > 2 and fields[2].starts_with("rounds=") {
+        parameters = [("rounds", fields[2].substr(7, fields[2].len() - 7))]
+        at = 3
+    }
+    if fields.len() < at + 2 {
+        fail(NotACryptString(text))
+    }
+    return Crypt{ scheme: scheme, parameters: parameters, salt: fields[at],
+        digest: fields[at + 1], version: "" }
+}
+
+fn parse_argon(text: str, id: str, fields: [str]) -> Crypt ! KdfError {
+    // `$argon2id$v=19$m=...,t=...,p=...$salt$digest`, and the version field
+    // is optional because version 16 predates it.
+    var at = 2
+    var version = ""
+    if fields.len() > 2 and fields[2].starts_with("v=") {
+        version = fields[2].substr(2, fields[2].len() - 2)
+        at = 3
+    }
+    if fields.len() < at + 3 {
+        fail(NotACryptString(text))
+    }
+    return Crypt{ scheme: id,
+        parameters: try comma_parameters(fields[at]),
+        salt: fields[at + 1], digest: fields[at + 2], version: version }
+}
+
+fn parse_plain(text: str, id: str, fields: [str]) -> Crypt ! KdfError {
+    if fields.len() != 5 {
+        fail(NotACryptString(text))
+    }
+    var parameters: [(str, str)] = []
+    if fields[2].contains("=") {
+        parameters = try comma_parameters(fields[2])
+    } else {
+        parameters = [("rounds", fields[2])]
+    }
+    return Crypt{ scheme: id, parameters: parameters, salt: fields[3],
+        digest: fields[4], version: "" }
+}
+
+fn comma_parameters(text: str) -> [(str, str)] ! KdfError {
+    var out: [(str, str)] = []
+    for piece in text.split(",") {
+        if piece == "" {
+            continue
+        }
+        let at = index_of(piece, "=")
+        if at < 0 {
+            fail(BadParameter(piece, text))
+        }
+        out.push((piece.substr(0, at),
+            piece.substr(at + 1, piece.len() - at - 1)))
+    }
+    return out
+}
+
+fn index_of(text: str, needle: str) -> i64 {
+    var i = 0
+    while i + needle.len() <= text.len() {
+        if text.substr(i, needle.len()) == needle {
+            return i
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+/// A parameter's value, or an error naming it.
+pub fn parameter_of(hash: Crypt, name: str) -> str ! KdfError {
+    for pair in hash.parameters {
+        if pair.0 == name {
+            return pair.1
+        }
+    }
+    fail(MissingParameter(name))
+}
+
+/// A parameter as a number.
+pub fn number_of(hash: Crypt, name: str) -> i64 ! KdfError {
+    let text = try parameter_of(hash, name)
+    match text.parse_int() {
+        Some(value) -> return value
+        None -> fail(BadParameter(name, text))
+    }
+}
+
+/// Write a crypt string back out.
+///
+/// Round-tripping is the test that matters: a parser that loses the
+/// optional version field, or reorders the argon2 parameters, produces a
+/// string that other software cannot verify against.
+pub fn build(hash: Crypt) -> str ! KdfError {
+    if hash.scheme == "bcrypt" {
+        return "$" + (try parameter_of(hash, "ident")) + "$" +
+        (try parameter_of(hash, "rounds")) + "$" + hash.salt + hash.digest
+    }
+    if hash.scheme == "sha256-crypt" or hash.scheme == "sha512-crypt" {
+        var id = "5"
+        if hash.scheme == "sha512-crypt" {
+            id = "6"
+        }
+        let rounds = try parameter_of(hash, "rounds")
+        if rounds == "5000" {
+            return "$" + id + "$" + hash.salt + "$" + hash.digest
+        }
+        return "$" + id + "$rounds=" + rounds + "$" + hash.salt + "$" +
+        hash.digest
+    }
+    var out = "$" + hash.scheme + "$"
+    if hash.version != "" {
+        out = out + "v=" + hash.version + "$"
+    }
+    if hash.parameters.len() == 1 and hash.parameters[0].0 == "rounds" and
+    hash.scheme.starts_with("pbkdf2") {
+        out = out + hash.parameters[0].1
+    } else {
+        var first = true
+        for pair in hash.parameters {
+            if not first {
+                out = out + ","
+            }
+            out = out + pair.0 + "=" + pair.1
+            first = false
+        }
+    }
+    return out + "$" + hash.salt + "$" + hash.digest
+}
+
+/// Which base64 alphabet a scheme's salt and digest are written in.
+///
+/// `crypt` is `./0-9A-Za-z`, `adapted` is the standard alphabet with `+`
+/// written as `.` and no padding, and `standard` is the usual one with the
+/// padding stripped.
+pub fn alphabet_of(scheme: str) -> str {
+    if scheme == "bcrypt" {
+        return "bcrypt"
+    }
+    if scheme == "sha256-crypt" or scheme == "sha512-crypt" {
+        return "crypt"
+    }
+    if scheme.starts_with("pbkdf2") {
+        return "adapted"
+    }
+    return "standard"
+}
+
+// ------------------------------------------------- what the cost should be
+
+/// The parameters to use today, by scheme.
+///
+/// OWASP's 2023 numbers. They are a floor rather than a target: the right
+/// answer is the largest that keeps a login under about half a second on
+/// the hardware you have, and these are what that came to on ordinary
+/// hardware at the time of writing. They will be too low in a few years,
+/// which is the reason `needs_rehash` exists.
+pub fn recommended(scheme: str) -> [(str, str)] ! KdfError {
+    if scheme == "argon2id" {
+        return [("m", "19456"), ("t", "2"), ("p", "1")]
+    }
+    if scheme == "scrypt" {
+        return [("ln", "17"), ("r", "8"), ("p", "1")]
+    }
+    if scheme == "bcrypt" {
+        return [("rounds", "10")]
+    }
+    if scheme == "pbkdf2-sha256" {
+        return [("rounds", "600000")]
+    }
+    if scheme == "pbkdf2-sha512" {
+        return [("rounds", "210000")]
+    }
+    if scheme == "sha256-crypt" or scheme == "sha512-crypt" {
+        return [("rounds", "535000")]
+    }
+    fail(UnknownScheme(scheme))
+}
+
+/// Whether a stored hash should be replaced at the next successful login.
+///
+/// True when the scheme is not the one in use any more, or when any
+/// parameter is below what is recommended now. The check has to happen at
+/// login because that is the only moment the password is in hand.
+pub fn needs_rehash(hash: Crypt, scheme: str) -> bool ! KdfError {
+    if hash.scheme != scheme {
+        return true
+    }
+    for wanted in try recommended(scheme) {
+        let have = try parameter_of(hash, wanted.0)
+        let want_number = wanted.1.parse_int() ?? 0 - 1
+        let have_number = have.parse_int() ?? 0 - 1
+        if want_number >= 0 and have_number >= 0 {
+            // A larger `p` is not stronger for argon2 — it is the same work
+            // spread over more threads — so only the cost parameters are
+            // compared upwards.
+            if wanted.0 != "p" and have_number < want_number {
+                return true
+            }
+        } else if have != wanted.1 {
+            return true
+        }
+    }
+    return false
+}
+
+/// Roughly how much memory an argon2 hash will take, in bytes.
+///
+/// The `m` parameter is in kibibytes, which is the unit everybody gets
+/// wrong once: `m=65536` is 64 MiB per hash in flight, and a login endpoint
+/// that allows twenty at a time needs 1.3 GiB.
+pub fn memory_bytes(hash: Crypt) -> i64 ! KdfError {
+    if not hash.scheme.starts_with("argon2") {
+        fail(UnknownScheme(hash.scheme))
+    }
+    return (try number_of(hash, "m")) * 1024
+}
+
+/// The same for scrypt, whose cost is a base-two logarithm.
+///
+/// `128 * r * 2^ln` bytes. `ln=17` with `r=8` is 128 MiB, and the jump from
+/// 16 to 17 doubles it — which is why this parameter is the one that takes
+/// a service down.
+pub fn scrypt_memory_bytes(hash: Crypt) -> i64 ! KdfError {
+    if hash.scheme != "scrypt" {
+        fail(UnknownScheme(hash.scheme))
+    }
+    let ln = try number_of(hash, "ln")
+    let r = try number_of(hash, "r")
+    if ln < 1 or ln > 40 {
+        fail(BadParameter("ln", "{ln}"))
+    }
+    var factor = 1
+    var i = 0
+    while i < ln {
+        factor = factor * 2
+        i = i + 1
+    }
+    return 128 * r * factor
+}
+
+/// Whether two crypt strings describe the same scheme and cost.
+///
+/// Comparing the strings themselves would say no for two hashes of the same
+/// password, since the salts differ; this compares what a rehash decision
+/// actually depends on.
+pub fn same_settings(a: Crypt, b: Crypt) -> bool {
+    if a.scheme != b.scheme or a.version != b.version {
+        return false
+    }
+    if a.parameters.len() != b.parameters.len() {
+        return false
+    }
+    var i = 0
+    while i < a.parameters.len() {
+        if a.parameters[i].0 != b.parameters[i].0 or
+        a.parameters[i].1 != b.parameters[i].1 {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}

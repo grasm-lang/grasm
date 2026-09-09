@@ -1,0 +1,6 @@
+[package]
+name = "keyderive"
+version = "1.0.0"
+
+# Text. Opens nothing.
+capabilities = []

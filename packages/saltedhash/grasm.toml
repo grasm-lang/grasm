@@ -1,0 +1,14 @@
+[package]
+name = "saltedhash"
+version = "1.0.0"
+
+# Arithmetic and hashing. Opens nothing.
+capabilities = []
+
+[dependencies.crypto_hash]
+path = "../crypto_hash"
+version = "^1.0.0"
+
+[dependencies.keyderive]
+path = "../keyderive"
+version = "^1.0.0"

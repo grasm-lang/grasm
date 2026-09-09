@@ -1,0 +1,435 @@
+import entropy
+import passwordpolicy
+import secretscan
+import keyderive
+import saltedhash
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn near(a: f64, b: f64, tolerance: f64) -> bool {
+    var d = a - b
+    if d < 0.0 {
+        d = 0.0 - d
+    }
+    return d < tolerance
+}
+
+/// A very small attacker's dictionary, most common first.
+fn words() -> [str] {
+    return ["password", "123456", "qwerty", "dragon", "monkey", "letmein",
+        "sunshine", "master", "welcome", "football", "princess", "admin",
+        "summer", "horse", "battery", "correct", "staple", "hunter"]
+}
+
+// --------------------------------------------------------------- entropy
+
+fn check_entropy(inout f: i64) / {io} {
+    print("-- entropy: three questions, and which one you are asking")
+    // The formula every password meter shows, and what it is actually for.
+    say(f, "a generated secret's entropy is length times log of alphabet",
+        near(entropy.generated_bits(16, 62) ?? 0.0, 95.2671409662,
+            0.000001) and
+        near(entropy.generated_bits(12, 94) ?? 0.0, 78.6550662201,
+            0.000001))
+    say(f, "and it says the same for a good password and a terrible one",
+        near(entropy.assumed_bits("aaaaaaaaaaaa") ?? 0.0,
+            entropy.assumed_bits("qwertyuiopas") ?? 0.0, 0.0000000001) and
+        near(entropy.assumed_bits("aaaaaaaaaaaa") ?? 0.0, 56.4052766177,
+            0.000001))
+    // Which is why it is the wrong question for a human-chosen password.
+    say(f, "the alphabet is the classes used, not the characters",
+        entropy.alphabet_size(entropy.alphabet_of("abc")) == 26 and
+        entropy.alphabet_size(entropy.alphabet_of("Abc1")) == 62 and
+        entropy.alphabet_size(entropy.alphabet_of("Abc1!")) == 95)
+    // Shannon entropy measures repetition and nothing else.
+    say(f, "Shannon entropy sees repetition and not predictability",
+        near(entropy.shannon_bits("abababab") ?? 0.0, 1.0, 0.0000000001)
+        and near(entropy.shannon_bits("qwertyuiop") ?? 0.0,
+            entropy.shannon_bits("x7#kP2vLm9") ?? 0.0, 0.0000000001))
+    say(f, "and min-entropy counts only the commonest character",
+        near(entropy.min_entropy_bits("aaab") ?? 0.0, 0.4150374993,
+            0.000001) and
+        (entropy.min_entropy_bits("aaab") ?? 9.0) <
+        (entropy.shannon_bits("aaab") ?? 0.0))
+    // The patterns an attacker actually tries.
+    say(f, "a keyboard walk is a walk in any direction, not along a row",
+        entropy.is_keyboard_run("qwerty") and
+        entropy.is_keyboard_run("1qaz") and
+        entropy.is_keyboard_run("zaq1") and
+        not entropy.is_keyboard_run("qazwsx"))
+    say(f, "a sequence steps by one, forwards or back",
+        entropy.is_sequence("abcdef") and entropy.is_sequence("54321") and
+        not entropy.is_sequence("acegik"))
+    say(f, "a repeat is one thing repeated, at any unit length",
+        entropy.is_repeat("aaaa") and entropy.is_repeat("abcabcabc") and
+        not entropy.is_repeat("abcabd"))
+    say(f, "and four digits that could be a year read as a date",
+        entropy.is_date("1985") and entropy.is_date("20240101") and
+        not entropy.is_date("3500"))
+    // The leetspeak nobody is fooled by.
+    say(f, "a substituted word is still the word, at twice the cost",
+        entropy.rank_of("p4ssw0rd", words()) == 1 and
+        entropy.rank_of("PASSWORD", words()) == 1 and
+        entropy.rank_of("xyzzy", words()) == 0)
+    // The guess count, which is the only honest answer.
+    say(f, "so the guess count sees through what the bit count does not",
+        (entropy.guesses_of("password", words()) ?? 0.0) < 10.0 and
+        (entropy.guesses_of("P4ssw0rd", words()) ?? 0.0) < 100.0 and
+        (entropy.guesses_of("x7#kP2vLm9", words()) ?? 0.0) > 1.0e12)
+    say(f, "and the score buckets are zxcvbn's own thresholds",
+        entropy.score_of(999.0) == 0 and entropy.score_of(1000.0) == 1 and
+        entropy.score_of(1.0e11) == 4)
+    say(f, "an attack takes half the space on average",
+        near(entropy.seconds_to_guess(1000000.0, 1000.0), 500.0,
+            0.0000000001))
+    say(f, "and an empty secret has no entropy to report",
+        empty_refused())
+}
+
+fn empty_refused() -> bool {
+    match entropy.shannon_bits("") {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+// -------------------------------------------------------- passwordpolicy
+
+fn check_policy(inout f: i64) / {io} {
+    print("-- passwordpolicy: the rules NIST took out")
+    let policy = passwordpolicy.nist_policy()
+    say(f, "the policy is a length and a blocklist, and nothing else",
+        policy.least_length == 8 and policy.most_length == 64 and
+        policy.most_breaches == 0)
+    // The k-anonymity query, against Python's hashlib.
+    let query = passwordpolicy.range_query("password")
+    say(f, "the breach query sends five hex characters, not the password",
+        query.0 == "5BAA6" and
+        query.1 == "1E4C9B93F3F0682250B6CF8331B7EE68FD8")
+    say(f, "and the answer is found by matching the rest of the digest",
+        (passwordpolicy.breach_count("password",
+            ["0018A45C4D1DEF81644B54AB7F969CA39:3",
+                "1E4C9B93F3F0682250B6CF8331B7EE68FD8:9659365"]) ?? 0) == 9659365)
+    say(f, "a password that is not in the range comes back at zero",
+        (passwordpolicy.breach_count("password",
+            ["0018A45C4D1DEF81644B54AB7F969CA39:3"]) ?? 0 - 1) == 0)
+    say(f, "and the comparison is upper case, because the API answers so",
+        (passwordpolicy.breach_count("password",
+            ["1e4c9b93f3f0682250b6cf8331b7ee68fd8:12"]) ?? 0) == 12)
+    // What the policy refuses, and what it does not.
+    say(f, "a short password fails on length and a breached one on the list",
+        kinds_of(policy, "ab", 0) == ["length"] and
+        kinds_of(policy, "correcthorse", 9659365) == ["breached"])
+    say(f, "a long passphrase with no breaches passes, capitals or not",
+        passwordpolicy.accepts(policy, "correcthorsebattery", 0, []) and
+        passwordpolicy.accepts(policy, "CORRECTHORSEBATTERY", 0, []))
+    say(f, "which is the point: there are no composition rules to fail",
+        passwordpolicy.accepts(policy, "aardvarks going north", 0, []))
+    // The context words, which is what people actually pick.
+    var contextual = passwordpolicy.nist_policy()
+    contextual.context = ["acme", "widgets"]
+    say(f, "a password naming the site is refused, and only that one",
+        not passwordpolicy.accepts(contextual, "acmelogin99", 0, []) and
+        passwordpolicy.accepts(contextual, "brightorange", 0, []))
+    // The strength floor, when a policy wants one.
+    var strict = passwordpolicy.nist_policy()
+    strict.least_guesses = 1000000.0
+    say(f, "a strength floor catches what the length check cannot",
+        not passwordpolicy.accepts(strict, "passwordpassword", 0, words())
+        and passwordpolicy.accepts(strict, "x7#kP2vLm9qR", 0, words()))
+    say(f, "the shapes an attacker tries are named individually",
+        kinds_of(policy, "abcdefgh", 0) == ["sequence"] and
+        kinds_of(policy, "qwertyui", 0) == ["keyboard"] and
+        kinds_of(policy, "abcabcabcabc", 0) == ["repeat"])
+    // The rules that were removed, and why.
+    say(f, "the six removed rules are named, with the reason for each",
+        passwordpolicy.removed_rules().len() == 6 and
+        passwordpolicy.is_removed("composition") and
+        passwordpolicy.is_removed("rotation") and
+        not passwordpolicy.is_removed("blocklist"))
+    say(f, "and asking why gives the argument, not just the ruling",
+        (passwordpolicy.reason_for("rotation") ?? "").contains(
+            "extrapolate"))
+    // The one question here with an exact answer.
+    say(f, "how long a generated password must be is arithmetic",
+        (passwordpolicy.generated_length(128.0, 62) ?? 0) == 22 and
+        (passwordpolicy.generated_length(128.0, 94) ?? 0) == 20)
+}
+
+fn kinds_of(policy: PasswordPolicy, password: str,
+    breaches: i64) -> [str] {
+    var out: [str] = []
+    for finding in passwordpolicy.findings_for(policy, password, breaches,
+        words()) {
+        out.push(finding.kind)
+    }
+    return out
+}
+
+// ------------------------------------------------------------ secretscan
+
+fn check_secretscan(inout f: i64) / {io} {
+    print("-- secretscan: the credential somebody committed")
+    // These fifteen shapes are gitleaks' own, and Python's re running the
+    // same patterns finds exactly the same things.
+    say(f, "the shaped rules are the ones worth waking somebody for",
+        secretscan.rules().len() == 15 and
+        secretscan.is_high_confidence(Secret{ rule: "aws-access-token",
+            line: 1, column: 1, matched: "", entropy: 0.0 }) and
+        not secretscan.is_high_confidence(Secret{
+            rule: "generic-high-entropy", line: 1, column: 1, matched: "",
+            entropy: 0.0 }))
+    let aws = secretscan.scan("key = \"AKIAIOSFODNN7EXAMPLE\"") ?? []
+    say(f, "an AWS key is four letters and twenty base-32 characters",
+        aws.len() == 1 and aws[0].rule == "aws-access-token" and
+        aws[0].matched == "AKIAIOSFODNN7EXAMPLE" and aws[0].column == 8)
+    let github = secretscan.scan(
+        "token: ghp_16C7e42F292c6912E7710c838347Ae178B4a") ?? []
+    say(f, "and a GitHub token is a prefix and thirty-six more",
+        github.len() == 1 and github[0].rule == "github-pat")
+    // The entropy filter, which is what makes the rules usable.
+    say(f, "a placeholder with the right shape is thrown out by entropy",
+        (secretscan.scan("AKIAXXXXXXXXXXXXXXXX") ?? []).len() == 0 and
+        (secretscan.scan("ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") ??
+            []).len() == 0)
+    // The prefilter, which is why a scan of a repository finishes.
+    say(f, "a rule cannot fire unless its keyword is somewhere in the text",
+        not secretscan.keywords_present(secretscan.rule_named("github-pat")
+            ?? empty_rule(), "nothing here") and
+        secretscan.keywords_present(secretscan.rule_named("github-pat") ??
+            empty_rule(), "see ghp_ in the docs"))
+    // The boundary, which is what `\b` means and what an engine without it
+    // has to do by hand.
+    say(f, "a key with a word character against it is not a key",
+        (secretscan.scan("xAKIAIOSFODNN7EXAMPLEy") ?? []).len() == 0 and
+        (secretscan.scan("(AKIAIOSFODNN7EXAMPLE)") ?? []).len() == 1)
+    // Several secrets on one line, in rule order.
+    let both = secretscan.scan("AKIAIOSFODNN7EXAMPLE and " +
+        "ghp_16C7e42F292c6912E7710c838347Ae178B4a") ?? []
+    say(f, "two secrets on one line are both found, in rule order",
+        both.len() == 2 and both[0].rule == "aws-access-token" and
+        both[1].rule == "github-pat")
+    // The line and column, which is what a report needs.
+    let multiline = secretscan.scan("first line\nsecond\n  " +
+        "AKIAIOSFODNN7EXAMPLE") ?? []
+    say(f, "the position is a line and a column, both counting from one",
+        multiline.len() == 1 and multiline[0].line == 3 and
+        multiline[0].column == 3)
+    // The private key block, which has no entropy threshold at all.
+    say(f, "a private key header needs no entropy test to be certain",
+        (secretscan.scan("-----BEGIN RSA PRIVATE KEY-----") ?? []).len()
+        == 1 and
+        (secretscan.scan("-----BEGIN CERTIFICATE-----") ?? []).len() == 0)
+    // Redaction, for the ticket.
+    say(f, "a finding is redacted to enough to recognise and not to use",
+        secretscan.redact("AKIAIOSFODNN7EXAMPLE") == "AKIA...MPLE" and
+        secretscan.redact("short") == "*****")
+    say(f, "and a rule that does not exist is an error, not an empty rule",
+        rule_refused())
+}
+
+fn empty_rule() -> ScanRule {
+    return ScanRule{ id: "", description: "", pattern: "",
+        least_entropy: 0.0, keywords: [] }
+}
+
+fn rule_refused() -> bool {
+    match secretscan.rule_named("no-such-rule") {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+// ------------------------------------------------------------- keyderive
+
+fn check_keyderive(inout f: i64) / {io} {
+    print("-- keyderive: the hash carries its own instructions")
+    // passlib writes these, and every one of them round-trips.
+    let argon = keyderive.parse("$argon2id$v=19$m=65536,t=3,p=4$" +
+        "MDEyMzQ1Njc4OWFiY2RlZg$s7HDvht1s+JaAdJ1qoLH/2c4KCL7V5DME2Cyd+d1" +
+        "XPI") ?? empty_crypt()
+    say(f, "argon2 carries a version, three costs, a salt and a digest",
+        argon.scheme == "argon2id" and argon.version == "19" and
+        (keyderive.number_of(argon, "m") ?? 0) == 65536 and
+        (keyderive.number_of(argon, "t") ?? 0) == 3 and
+        (keyderive.number_of(argon, "p") ?? 0) == 4)
+    say(f, "and its memory cost is in kibibytes, which is 64 MiB here",
+        (keyderive.memory_bytes(argon) ?? 0) == 67108864)
+    let scrypt = keyderive.parse("$scrypt$ln=16,r=8,p=1$" +
+        "MDEyMzQ1Njc4OWFiY2RlZg$+pjUbsMTmD6S9/S5ospoRdf5I5baM+2DmBRJfE5I" +
+        "AIk") ?? empty_crypt()
+    say(f, "scrypt's cost is a logarithm, so ln=16 with r=8 is 64 MiB",
+        (keyderive.scrypt_memory_bytes(scrypt) ?? 0) == 67108864)
+    // The three base64 alphabets, which is the detail that breaks logins.
+    say(f, "each family writes its salt in a different base64",
+        keyderive.alphabet_of("bcrypt") == "bcrypt" and
+        keyderive.alphabet_of("sha512-crypt") == "crypt" and
+        keyderive.alphabet_of("pbkdf2-sha256") == "adapted" and
+        keyderive.alphabet_of("argon2id") == "standard")
+    // bcrypt, where the cost and the salt run together.
+    let bcrypt = keyderive.parse("$2b$12$LQv3c1yqBWVHxkd0LHAkCOYz6Ttx" +
+        "MQJqhN8/LewdBPj/RsFHNW6Fu") ?? empty_crypt()
+    say(f, "bcrypt runs the cost and salt together in one field",
+        bcrypt.scheme == "bcrypt" and bcrypt.salt.len() == 22 and
+        bcrypt.digest.len() == 31 and
+        (keyderive.parameter_of(bcrypt, "ident") ?? "") == "2b")
+    // The sha-crypt schemes, where the rounds field is optional.
+    let plain = keyderive.parse("$5$abcdefghijklmnop$" +
+        "urYZaQPmPZhJ71QqMl82jO72tkInTuZvy3UJseNTUE6") ?? empty_crypt()
+    say(f, "a sha-crypt string with no rounds field means five thousand",
+        plain.scheme == "sha256-crypt" and
+        (keyderive.number_of(plain, "rounds") ?? 0) == 5000)
+    say(f, "and writing it back leaves the field out again",
+        (keyderive.build(plain) ?? "") == "$5$abcdefghijklmnop$" +
+        "urYZaQPmPZhJ71QqMl82jO72tkInTuZvy3UJseNTUE6")
+    // What the cost should be, and when to raise it.
+    say(f, "the recommended cost is OWASP's, and it is a floor",
+        (keyderive.recommended("argon2id") ?? []).len() == 3 and
+        (keyderive.recommended("bcrypt") ?? []) == [("rounds", "10")])
+    say(f, "a hash below it needs replacing at the next login",
+        (keyderive.needs_rehash(keyderive.parse(
+            "$argon2id$v=19$m=4096,t=1,p=1$c2FsdA$ZGlnZXN0") ?? empty_crypt(),
+            "argon2id") ?? false) and
+        not (keyderive.needs_rehash(keyderive.parse(
+            "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$ZGlnZXN0") ?? empty_crypt(),
+            "argon2id") ?? true))
+    say(f, "and so does one made by a scheme nobody uses any more",
+        keyderive.needs_rehash(plain, "argon2id") ?? false)
+    // A larger p is not a stronger hash, and is not treated as one.
+    say(f, "more threads is the same work, so it is not a cost to compare",
+        not (keyderive.needs_rehash(keyderive.parse(
+            "$argon2id$v=19$m=19456,t=2,p=8$c2FsdA$ZGlnZXN0") ?? empty_crypt(),
+            "argon2id") ?? true))
+    say(f, "two hashes of two passwords still have the same settings",
+        keyderive.same_settings(argon, keyderive.parse(
+            "$argon2id$v=19$m=65536,t=3,p=4$b3RoZXI$b3RoZXI") ??
+            empty_crypt()))
+    say(f, "and something that is not a crypt string is refused",
+        crypt_refused("not a hash") and crypt_refused("$nope$1$a$b"))
+}
+
+fn empty_crypt() -> Crypt {
+    return Crypt{ scheme: "", parameters: [], salt: "", digest: "",
+        version: "" }
+}
+
+fn crypt_refused(text: str) -> bool {
+    match keyderive.parse(text) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+// ------------------------------------------------------------ saltedhash
+
+fn check_saltedhash(inout f: i64) / {io} {
+    print("-- saltedhash: the four things that are not the hash")
+    say(f, "a salt is sixteen bytes, and a buffer nobody filled is not one",
+        saltedhash.least_salt_bytes() == 16 and
+        saltedhash.salt_is_usable(bytes_of([1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+            11, 12, 13, 14, 15, 16])) and
+        not saltedhash.salt_is_usable(bytes_of([0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0])) and
+        not saltedhash.salt_is_usable(bytes_of([1, 2, 3])))
+    // Python's hmac agrees on the peppered secret.
+    say(f, "the pepper goes in by HMAC, not by sticking it on the end",
+        (saltedhash.peppered("secret", "key".to_bytes()) ??
+            "".to_bytes()).len() == 32 and
+        saltedhash.peppered("secret", "key".to_bytes()) !=
+        saltedhash.peppered("secret", "kex".to_bytes()))
+    say(f, "and with no pepper at all the password goes through unchanged",
+        (saltedhash.peppered("secret", "".to_bytes()) ?? "".to_bytes()) ==
+        "secret".to_bytes())
+    say(f, "an empty secret is refused rather than hashed",
+        peppered_refused())
+    // The record, and why the crypt string goes last.
+    let record = Credential{ stored: "$argon2id$v=19$m=19456,t=2,p=1$" +
+        "c2FsdA$ZGlnZXN0", pepper_version: 3, written_at: 1750000000 }
+    say(f, "a record is a version, a time and the crypt string",
+        saltedhash.encode(record) == "3:1750000000:$argon2id$v=19$" +
+        "m=19456,t=2,p=1$c2FsdA$ZGlnZXN0")
+    say(f, "and it reads back, colons in the crypt string and all",
+        (saltedhash.decode(saltedhash.encode(record)) ??
+            empty_credential()).stored == record.stored and
+        (saltedhash.decode(saltedhash.encode(record)) ??
+            empty_credential()).pepper_version == 3)
+    say(f, "a record missing a field is an error, not a default",
+        record_refused("3") and record_refused("x:1:$5$a$b"))
+    // The keyring, which is what makes rotation possible at all.
+    let keyring = [(1, "old".to_bytes()), (3, "new".to_bytes())]
+    say(f, "the keyring holds the old peppers until every record is rewritten",
+        (saltedhash.newest_version(keyring) ?? 0) == 3 and
+        (saltedhash.pepper_for(keyring, 1) ?? "".to_bytes()) ==
+        "old".to_bytes())
+    say(f, "and a version nobody holds is an error, not a silent failure",
+        pepper_refused(keyring))
+    say(f, "a record on the newest pepper and today's cost stands",
+        not (saltedhash.needs_rewrite(record, keyring, "argon2id") ??
+            true))
+    let stale = Credential{ stored: record.stored, pepper_version: 1,
+        written_at: 1750000000 }
+    say(f, "one on an older pepper is rewritten at the next login",
+        saltedhash.needs_rewrite(stale, keyring, "argon2id") ?? false)
+    let weak = Credential{ stored: "$argon2id$v=19$m=4096,t=1,p=1$" +
+        "c2FsdA$ZGlnZXN0", pepper_version: 3, written_at: 1750000000 }
+    say(f, "and so is one whose cost has fallen behind",
+        saltedhash.needs_rewrite(weak, keyring, "argon2id") ?? false)
+    // The decoy, which is what stops the login endpoint enumerating users.
+    say(f, "an unknown user is verified against a decoy, so the time matches",
+        (keyderive.parse(saltedhash.decoy_record("argon2id",
+            "c2FsdHNhbHRzYWx0c2E").stored) ?? empty_crypt()).scheme ==
+        "argon2id")
+    say(f, "digests are compared without stopping at the first difference",
+        saltedhash.digests_equal("abc".to_bytes(), "abc".to_bytes()) and
+        not saltedhash.digests_equal("abc".to_bytes(), "abd".to_bytes()))
+    // Why sixteen bytes and not eight.
+    say(f, "sixteen bytes puts a salt collision past any real population",
+        saltedhash.collision_population(16) > 1.0e19 and
+        saltedhash.collision_population(8) < 5.0e9)
+}
+
+fn empty_credential() -> Credential {
+    return Credential{ stored: "", pepper_version: 0, written_at: 0 }
+}
+
+fn peppered_refused() -> bool {
+    match saltedhash.peppered("", "key".to_bytes()) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn record_refused(text: str) -> bool {
+    match saltedhash.decode(text) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn pepper_refused(keyring: [(i64, bytes)]) -> bool {
+    match saltedhash.pepper_for(keyring, 99) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn main() / {io} {
+    var f = 0
+    check_entropy(f)
+    check_policy(f)
+    check_secretscan(f)
+    check_keyderive(f)
+    check_saltedhash(f)
+    if f == 0 {
+        print("security: every claim held")
+    } else {
+        print("security: {f} claims failed")
+    }
+}
