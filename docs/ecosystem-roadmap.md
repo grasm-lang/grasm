@@ -14,7 +14,7 @@ plan that discovers them 300 packages in.
 | | |
 |---|---|
 | Started | 78 |
-| Now | 420 |
+| Now | 440 |
 | Tier 1 target | 200 |
 | Tier 2 target | 500 |
 | Tier 3 target | 800 |
@@ -242,13 +242,23 @@ says where the data came from and under what licence, which is the condition.
 | ~~Web III~~ | ~~`formdata` `csp` `hsts` `preflight` `webfinger`~~ | RFC 6797's own ABNF, Python's `email`, `content-security-policy`, Flask-Cors, urllib |
 | ~~Serialisation IV~~ | ~~`flatbuffers` `capnp` `ubjson`~~ and `ion` and `thriftcompact`, because Smile's and AMF's only Python implementations are abandoned at Python 2 and there is nothing left to check against | the reference encoders |
 | ~~Geospatial II~~ | ~~`mgrs` `utm` `gpx` `kml` `geodesic`~~ | pyproj, geographiclib, the Python `mgrs` package, gpxpy |
+| ~~HTTP/2~~ | ~~`http2frame` `http2client` `grpcwire`~~ — and `hpack`'s Huffman coding, which was the gap that blocked all three | hyperframe, Python `hpack`, a live `h2` server |
+| ~~APIs I~~ | ~~`urltemplate` `jsonpointer` `jsonpatch` `jsonmergepatch` `stripewire` `s3wire`~~ | the RFC 6570 and JSON Patch test suites, RFC 7386's own appendix, Stripe's encoder, botocore |
+| ~~Services~~ | ~~`k8squantity` `discordwire` `githubwire` `slackwire` `gitignore`~~ | the Kubernetes client, discord.py, `git check-ignore` itself |
+| ~~Unicode~~ | ~~`unicodenorm` `graphemes` `wordbreak` `textwidth`~~ | the Consortium's own NormalizationTest, GraphemeBreakTest and WordBreakTest, and wcwidth |
 
 That is a hundred, in twenty batches, and the same rhythm as the first: five
 or six packages to a group demo, every claim an assertion, every batch checked
 against the tool that owns its format before it lands. **All twenty are
-done.** The count is 408, not 500, and the ninety-odd that would close the gap
-are the ones below: they are not skipped for being hard but for being
-impossible until P1 exists.
+done**, and the four batches after them are the first that P1 unblocked.
+
+The four are worth reading as a set, because each was checked against a
+suite its own standard publishes rather than against expectations written
+here: 270 URI templates, 123 JSON patches, 766 grapheme boundaries, 1944
+word boundaries and 400,680 normalisations. Two of those found defects —
+`json.equal` compared object members by position, which made a JSON Patch
+`test` fail against any server that reordered a response, and a `.gitignore`
+negation was allowed to reach into a subtree it never named.
 
 ### ~~Needs P1 — a TLS client.~~ **P1 is built.** About 120 unblocked.
 
@@ -262,6 +272,27 @@ started until now.
 and `webhooksig` checks what arrives back, so the first layer above TLS is
 built too — and above that `cloudevents`, `problemjson` and `httpcache`, the
 three shapes a hosted API answers in.
+
+`http2frame`, `http2client` and `grpcwire` speak the version of HTTP the
+hosted services above actually run, and the RPC protocol built on it. What
+made this possible was finishing `hpack`: its Huffman coding was a gap, and
+a gap in HPACK is total, because a server compresses whichever way it likes
+and one that chooses Huffman is one this client could not read a header
+from. The `h2diff` gate replays a recorded conversation from Python's `h2`
+library, including a response larger than a default connection window, so a
+client that never refills flow control fails rather than hangs.
+
+The service clients themselves have started: `stripewire` writes the form
+encoding Stripe's API takes and reads the errors it answers with,
+`s3wire` decides which of the two ways to address a bucket a request has to
+use and reads a listing back, `discordwire` does the two pieces of
+arithmetic a Discord client cannot avoid, `githubwire` handles the two rate
+limits and the pagination that is not in the body, `slackwire` refuses a
+message before Slack does, and `k8squantity` reads a Kubernetes resource
+limit exactly rather than through a float. `urltemplate`, `jsonpointer`,
+`jsonpatch` and `jsonmergepatch` are the four things every one of those
+APIs uses to name and to edit a resource, and each is checked against the
+test suite its own specification publishes.
 
 `tlsclient` completes a TLS 1.3 handshake over a socket and refuses to
 return a connection it has not verified. `tlshandshake` builds and reads the
