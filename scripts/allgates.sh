@@ -59,6 +59,8 @@ run_gate httpsdiff     scripts/https_diff.sh
 run_gate h2diff        scripts/h2_diff.sh
 run_gate uritdiff      scripts/urit_diff.sh
 run_gate patchdiff     scripts/patch_diff.sh
+run_gate segmentdiff   scripts/segment_diff.sh
+run_gate normdiff      scripts/normalise_diff.sh
 run_gate kvcrash       scripts/kvstore_crash.sh
 run_gate zlibdiff      scripts/zlib_diff.sh
 run_gate casefolddiff  scripts/casefold_diff.sh

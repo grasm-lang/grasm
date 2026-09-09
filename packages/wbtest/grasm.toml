@@ -1,0 +1,8 @@
+[package]
+name = "wbtest"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.wordbreak]
+path = "../wordbreak"
+version = "^1.0.0"

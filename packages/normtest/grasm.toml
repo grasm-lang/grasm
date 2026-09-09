@@ -1,0 +1,8 @@
+[package]
+name = "normtest"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.unicodenorm]
+path = "../unicodenorm"
+version = "^1.0.0"

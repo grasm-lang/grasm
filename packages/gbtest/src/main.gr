@@ -1,0 +1,38 @@
+// The client end of the `grapheme_diff.sh` gate: code points in, cluster
+// boundaries out.
+//
+// Code points arrive as hex separated by commas so a case can hold
+// characters no terminal would show, and the answer is the offsets the
+// clusters start at.
+import graphemes
+
+fn main() / {io} {
+    var i = 0
+    while i < args().len() {
+        var codes: [i64] = []
+        for piece in args()[i].split(",") {
+            if piece.len() > 0 {
+                codes.push(piece.parse_int_base(16) ?? 0)
+            }
+        }
+        print(offsets(codes))
+        i = i + 1
+    }
+}
+
+fn offsets(codes: [i64]) -> str {
+    var out = "0"
+    if codes.len() == 0 {
+        return out
+    }
+    var state = graphemes.advance(graphemes.start_state(), codes[0])
+    var i = 1
+    while i < codes.len() {
+        if graphemes.breaks_between(state, codes[i - 1], codes[i]) {
+            out = out + ",{i}"
+        }
+        state = graphemes.advance(state, codes[i])
+        i = i + 1
+    }
+    return out + ",{codes.len()}"
+}

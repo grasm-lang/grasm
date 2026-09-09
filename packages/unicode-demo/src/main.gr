@@ -1,0 +1,178 @@
+// Three questions about text that a byte count cannot answer: are these the
+// same string, where does one character end, and how wide is it.
+//
+// Every expected value here came from the Unicode Consortium's own test
+// files or from an implementation checked against them.
+import unicodenorm
+import graphemes
+import textwidth
+import wordbreak
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn text_of(codes: [i64]) -> str {
+    var out = ""
+    for code in codes {
+        out = out + code.to_char()
+    }
+    return out
+}
+
+fn codes_of(text: str) -> [i64] {
+    var out: [i64] = []
+    for character in text.chars() {
+        out.push(character.code_at(0))
+    }
+    return out
+}
+
+// ---------------------------------------------------------- unicodenorm
+
+fn check_normalisation(inout f: i64) / {io} {
+    print("-- unicodenorm: the same word, spelled two ways")
+    let precomposed = text_of([99, 97, 102, 233])
+    let decomposed = text_of([99, 97, 102, 101, 769])
+    say(f, "two spellings of the same word are not equal as bytes",
+        precomposed != decomposed and
+        precomposed.len() != decomposed.len())
+    say(f, "and are equal once normalised, which is the point",
+        unicodenorm.equal(precomposed, decomposed) and
+        unicodenorm.nfc(decomposed) == precomposed and
+        unicodenorm.nfd(precomposed) == decomposed)
+    say(f, "a mark is put in canonical order before anything composes",
+        codes_of(unicodenorm.nfd(text_of([7690, 803]))) ==
+        [68, 803, 775] and
+        codes_of(unicodenorm.nfc(text_of([7690, 803]))) == [7692, 775])
+    say(f, "an ogonek blocks the acute behind it, so only one composes",
+        codes_of(unicodenorm.nfc(text_of([65, 808, 769]))) == [260, 769])
+    say(f, "a singleton decomposes and does not come back the same",
+        codes_of(unicodenorm.nfd(text_of([8491]))) == [65, 778] and
+        codes_of(unicodenorm.nfc(text_of([8491]))) == [197])
+    say(f, "Hangul is arithmetic rather than a table, in both directions",
+        codes_of(unicodenorm.nfd(text_of([44032]))) == [4352, 4449] and
+        codes_of(unicodenorm.nfc(text_of([4352, 4449]))) == [44032] and
+        codes_of(unicodenorm.nfc(text_of([4352, 4449, 4520]))) == [44033])
+    say(f, "the compatibility forms replace a ligature and a numeral",
+        unicodenorm.nfkc(text_of([64257])) == "fi" and
+        unicodenorm.nfkc(text_of([9312])) == "1" and
+        unicodenorm.nfkc(text_of([8547])) == "IV")
+    say(f, "and leave them alone in the canonical forms, which is why" +
+        " only the canonical ones are safe to store",
+        unicodenorm.nfc(text_of([64257])) == text_of([64257]) and
+        unicodenorm.nfd(text_of([9312])) == text_of([9312]))
+    say(f, "a compatibility decomposition goes all the way down",
+        codes_of(unicodenorm.nfkd(text_of([3959]))) == [4018, 3953, 3968])
+    say(f, "and normalising twice changes nothing the second time",
+        unicodenorm.is_nfc(unicodenorm.nfc(decomposed)) and
+        unicodenorm.nfkc(unicodenorm.nfkc(text_of([64257]))) == "fi")
+}
+
+// ------------------------------------------------------------ graphemes
+
+fn check_clusters(inout f: i64) / {io} {
+    print("-- graphemes: where one character ends and the next begins")
+    say(f, "a letter and its accent are one character to a reader",
+        graphemes.count(text_of([101, 769])) == 1 and
+        text_of([101, 769]).chars().len() == 2)
+    say(f, "two regional indicators are a flag, and three are a flag" +
+        " and a letter",
+        graphemes.count(text_of([127467, 127479])) == 1 and
+        graphemes.count(text_of([127467, 127479, 127465])) == 2 and
+        graphemes.count(text_of([127467, 127479, 127465, 127466])) == 2)
+    say(f, "a joiner glues two pictographs and nothing else",
+        graphemes.count(text_of([128105, 8205, 128187])) == 1 and
+        graphemes.count(text_of([97, 8205, 128187])) == 2)
+    say(f, "a family is one character however many code points it takes",
+        graphemes.count(text_of([128104, 8205, 128105, 8205, 128103,
+            8205, 128102])) == 1)
+    say(f, "an Indic linker holds two consonants together",
+        graphemes.count(text_of([2325, 2381, 2359])) == 1 and
+        graphemes.count(text_of([2325, 2359])) == 2)
+    say(f, "a carriage return and a line feed are one, not two",
+        graphemes.count("\r\n") == 1 and graphemes.count("\n\r") == 2)
+    say(f, "a Hangul syllable written as jamo is still one character",
+        graphemes.count(text_of([4352, 4449, 4520])) == 1)
+    say(f, "and a string comes apart at those boundaries",
+        graphemes.clusters(text_of([101, 769, 127467, 127479, 33])) ==
+        [text_of([101, 769]), text_of([127467, 127479]), "!"])
+}
+
+// ------------------------------------------------------------ textwidth
+
+fn check_width(inout f: i64) / {io} {
+    print("-- textwidth: how many columns a terminal will give it")
+    say(f, "an ideograph takes two columns and a letter takes one",
+        textwidth.code_width(28450) == 2 and
+        textwidth.code_width(97) == 1)
+    say(f, "a combining mark takes none, so an accent is free",
+        textwidth.code_width(769) == 0 and
+        textwidth.width(text_of([101, 769])) == 1)
+    say(f, "a fullwidth letter is two even though it is Latin",
+        textwidth.code_width(65313) == 2)
+    say(f, "a control character has no width and says so",
+        textwidth.code_width(9) == 0 - 1 and
+        textwidth.width("a\tb") == 0 - 1 and
+        textwidth.width_ignoring_controls("a\tb") == 2)
+    say(f, "an emoji is two columns wide",
+        textwidth.width(text_of([128512])) == 2)
+    say(f, "truncation leaves a double-width character out rather than" +
+        " drawing half of it",
+        textwidth.truncate(text_of([28450, 23383, 97]), 3) ==
+        text_of([28450]) and
+        textwidth.truncate(text_of([28450, 23383, 97]), 5) ==
+        text_of([28450, 23383, 97]))
+    say(f, "and padding counts columns, so a table stays square",
+        textwidth.pad_right(text_of([28450]), 4) ==
+        text_of([28450]) + "  " and
+        textwidth.pad_left("ab", 4) == "  ab" and
+        textwidth.width(textwidth.pad_right(text_of([101, 769]), 4)) == 4)
+}
+
+// ------------------------------------------------------------ wordbreak
+
+fn check_words(inout f: i64) / {io} {
+    print("-- wordbreak: a separator is only one with letters both sides")
+    say(f, "an apostrophe inside a word does not split it",
+        wordbreak.words("can't stop") == ["can't", "stop"])
+    say(f, "and one outside a word is not part of it",
+        wordbreak.words("'quoted'") == ["quoted"])
+    say(f, "a number keeps its commas and its decimal point",
+        wordbreak.words("1,000.50 and 3.14") ==
+        ["1,000.50", "and", "3.14"])
+    say(f, "a full stop at the end of a sentence is not part of the word",
+        wordbreak.words("stop. go") == ["stop", "go"])
+    say(f, "a combining mark is looked straight through",
+        wordbreak.words(text_of([99, 97, 102, 101, 769])) ==
+        [text_of([99, 97, 102, 101, 769])])
+    say(f, "an underscore joins, which is why identifiers survive",
+        wordbreak.words("snake_case_name") == ["snake_case_name"])
+    say(f, "a run of Katakana is one word",
+        wordbreak.words(text_of([12459, 12479, 12459, 12490])).len() == 1)
+    say(f, "and Han is one segment each and no words at all, because" +
+        " splitting Chinese needs a dictionary these rules do not have",
+        wordbreak.segments(text_of([28450, 23383])).len() == 2 and
+        wordbreak.words(text_of([28450, 23383])).len() == 0)
+    say(f, "the pieces include the ones that are not words",
+        wordbreak.segments("hi there").len() == 3 and
+        wordbreak.words("hi there").len() == 2)
+}
+
+fn main() / {io} {
+    var f = 0
+    check_normalisation(f)
+    check_clusters(f)
+    check_width(f)
+    check_words(f)
+    if f == 0 {
+        print("unicode: every claim held")
+    } else {
+        print("unicode: {f} claims failed")
+    }
+}

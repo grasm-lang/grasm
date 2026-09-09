@@ -1,0 +1,8 @@
+[package]
+name = "gbtest"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.graphemes]
+path = "../graphemes"
+version = "^1.0.0"

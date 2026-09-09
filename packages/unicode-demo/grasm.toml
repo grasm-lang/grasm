@@ -1,0 +1,20 @@
+[package]
+name = "unicode_demo"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.unicodenorm]
+path = "../unicodenorm"
+version = "^1.0.0"
+
+[dependencies.graphemes]
+path = "../graphemes"
+version = "^1.0.0"
+
+[dependencies.textwidth]
+path = "../textwidth"
+version = "^1.0.0"
+
+[dependencies.wordbreak]
+path = "../wordbreak"
+version = "^1.0.0"

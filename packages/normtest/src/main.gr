@@ -1,0 +1,59 @@
+// The client end of the `normalise_diff.sh` gate.
+//
+// A case is a form letter and a comma-separated run of hex code points;
+// the answer is the normalised run in the same shape. Hex rather than text
+// because the test file is full of unpaired marks and characters no font
+// has.
+import unicodenorm
+
+fn main() / {io} {
+    var i = 0
+    while i + 1 < args().len() {
+        let form = args()[i]
+        var codes: [i64] = []
+        for piece in args()[i + 1].split(",") {
+            if piece.len() > 0 {
+                codes.push(piece.parse_int_base(16) ?? 0)
+            }
+        }
+        var text = ""
+        for code in codes {
+            text = text + code.to_char()
+        }
+        var done = text
+        if form == "nfd" {
+            done = unicodenorm.nfd(text)
+        } else if form == "nfc" {
+            done = unicodenorm.nfc(text)
+        } else if form == "nfkd" {
+            done = unicodenorm.nfkd(text)
+        } else {
+            done = unicodenorm.nfkc(text)
+        }
+        print(as_hex(done))
+        i = i + 2
+    }
+}
+
+fn as_hex(text: str) -> str {
+    let digits = "0123456789abcdef"
+    var out = ""
+    var first = true
+    for character in text.chars() {
+        if not first {
+            out = out + ","
+        }
+        first = false
+        var code = character.code_at(0)
+        var piece = ""
+        while code > 0 {
+            piece = digits.substr(code % 16, 1) + piece
+            code = code / 16
+        }
+        if piece.len() == 0 {
+            piece = "0"
+        }
+        out = out + piece
+    }
+    return out
+}

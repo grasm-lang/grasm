@@ -1,0 +1,26 @@
+// The client end of the word half of `segment_diff.sh`: code points in,
+// word boundaries out.
+import wordbreak
+
+fn main() / {io} {
+    var i = 0
+    while i < args().len() {
+        var codes: [i64] = []
+        for piece in args()[i].split(",") {
+            if piece.len() > 0 {
+                codes.push(piece.parse_int_base(16) ?? 0)
+            }
+        }
+        var out = ""
+        var first = true
+        for mark in wordbreak.boundaries_of(codes) {
+            if not first {
+                out = out + ","
+            }
+            first = false
+            out = out + "{mark}"
+        }
+        print(out)
+        i = i + 1
+    }
+}

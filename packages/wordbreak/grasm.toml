@@ -1,0 +1,7 @@
+[package]
+name = "wordbreak"
+version = "1.0.0"
+
+[dependencies.graphemes]
+path = "../graphemes"
+version = "^1.0.0"
