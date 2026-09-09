@@ -1,0 +1,336 @@
+// Dockerfiles: the instructions, and the three things that make them not
+// a list of lines.
+//
+//   # syntax=docker/dockerfile:1
+//   FROM node:20 AS build
+//   RUN npm ci \
+//       && npm run build
+//   COPY --from=build /app/dist /usr/share/nginx/html
+//
+//   - **A backslash continues a line**, and the continuation may be a
+//     comment, which is skipped rather than joined. So a `#` in the middle
+//     of a multi-line `RUN` deletes that line and not the rest.
+//   - **The escape character is configurable** by a directive in the first
+//     lines: `# escape=\`` makes the backtick the continuation character,
+//     which Windows images use because a backslash is a path separator.
+//   - **`RUN`, `CMD` and `ENTRYPOINT` have two forms.** `CMD ls -l` runs
+//     through a shell and `CMD ["ls", "-l"]` does not, which changes what
+//     happens to signals and to `$HOME`. Telling them apart is looking at
+//     whether the argument parses as a JSON array.
+//
+// ## Stages
+//
+// `FROM x AS y` names a stage, and `COPY --from=y` reads from it. The
+// stages a file defines and the ones it refers to should agree, and a
+// typo in the name silently copies from an *image* of that name instead —
+// which either fails to pull or, worse, succeeds.
+
+type DockerError =
+    | Empty()
+    | NoInstruction(line: i64)
+
+    /// One instruction.
+type DockerInstruction = {
+    /// Upper-cased.
+    keyword: str,
+    /// Everything after the keyword, with continuations joined.
+    value: str,
+    /// The line the instruction started on, counting from one.
+    line: i64,
+}
+
+/// A whole file.
+type Dockerfile = {
+    /// The parser directives that came before the first instruction.
+    directives: [(str, str)],
+    instructions: [DockerInstruction],
+    /// The escape character, `\` unless a directive changed it.
+    escape: str,
+}
+
+fn is_space(character: str) -> bool {
+    return character == " " or character == "\t"
+}
+
+fn trim_right(text: str) -> str {
+    var end = text.len()
+    while end > 0 and is_space(text.substr(end - 1, 1)) {
+        end = end - 1
+    }
+    return text.substr(0, end)
+}
+
+fn trim(text: str) -> str {
+    var start = 0
+    while start < text.len() and is_space(text.substr(start, 1)) {
+        start = start + 1
+    }
+    var end = text.len()
+    while end > start and is_space(text.substr(end - 1, 1)) {
+        end = end - 1
+    }
+    return text.substr(start, end - start)
+}
+
+fn strip_return(line: str) -> str {
+    if line.ends_with("\r") {
+        return line.substr(0, line.len() - 1)
+    }
+    return line
+}
+
+/// Read a file.
+pub fn parse(text: str) -> Dockerfile ! DockerError {
+    var out = Dockerfile{ directives: [], instructions: [], escape: "\\" }
+    var lines: [str] = []
+    for raw in text.split("\n") {
+        lines.push(strip_return(raw))
+    }
+    var i = 0
+    // The directives come first, and stop at the first line that is not
+    // one — a comment that is not a directive ends them too.
+    while i < lines.len() {
+        let body = trim(lines[i])
+        if not body.starts_with("#") {
+            break
+        }
+        let inner = trim(body.substr(1, body.len() - 1))
+        var at = 0 - 1
+        var j = 0
+        while j < inner.len() {
+            if inner.substr(j, 1) == "=" {
+                at = j
+                j = inner.len()
+            } else {
+                j = j + 1
+            }
+        }
+        if at <= 0 {
+            break
+        }
+        let name = trim(inner.substr(0, at)).to_lower()
+        let value = trim(inner.substr(at + 1, inner.len() - at - 1))
+        if name != "syntax" and name != "escape" and name != "check" {
+            break
+        }
+        if name == "escape" and value.len() == 1 {
+            out.escape = value
+        }
+        out.directives.push((name, value))
+        i = i + 1
+    }
+    while i < lines.len() {
+        let started = i + 1
+        var body = trim(lines[i])
+        i = i + 1
+        if body.len() == 0 or body.starts_with("#") {
+            continue
+        }
+        // A continuation joins the next line *as written*: only the
+        // escape character and any whitespace after it go, so the
+        // indentation of the joined line stays inside the argument. A
+        // `RUN` written over indented lines therefore runs a command
+        // with runs of spaces in it, and a reader that tidies them up
+        // reports a command the build never ran. Comment lines and
+        // blank lines between the pieces are skipped.
+        while trim_right(body).ends_with(out.escape) {
+            let joined = trim_right(body)
+            body = joined.substr(0, joined.len() - 1)
+            var next = ""
+            var found = false
+            while i < lines.len() {
+                let candidate = lines[i]
+                i = i + 1
+                if trim(candidate).starts_with("#") or
+                trim(candidate).len() == 0 {
+                    continue
+                }
+                next = candidate
+                found = true
+                break
+            }
+            if not found {
+                break
+            }
+            body = body + next
+        }
+        var keyword = ""
+        var at = 0
+        while at < body.len() and not is_space(body.substr(at, 1)) {
+            keyword = keyword + body.substr(at, 1)
+            at = at + 1
+        }
+        out.instructions.push(DockerInstruction{ keyword: keyword.to_upper(),
+            value: trim(body.substr(at, body.len() - at)),
+            line: started })
+    }
+    if out.instructions.len() == 0 {
+        fail(Empty())
+    }
+    return out
+}
+
+/// Whether an instruction's argument is the JSON form, which runs without
+/// a shell.
+pub fn is_exec_form(value: str) -> bool {
+    let body = trim(value)
+    if not body.starts_with("[") or not body.ends_with("]") {
+        return false
+    }
+    // A JSON array of strings, which is all the format allows: double
+    // quotes only, and single quotes are a common mistake that docker
+    // reads as the shell form.
+    var i = 1
+    var seen = false
+    while i < body.len() - 1 {
+        let here = body.substr(i, 1)
+        if is_space(here) or here == "," {
+            i = i + 1
+            continue
+        }
+        if here != "\"" {
+            return false
+        }
+        i = i + 1
+        var closed = false
+        while i < body.len() - 1 {
+            if body.substr(i, 1) == "\\" {
+                i = i + 2
+                continue
+            }
+            if body.substr(i, 1) == "\"" {
+                closed = true
+                i = i + 1
+                break
+            }
+            i = i + 1
+        }
+        if not closed {
+            return false
+        }
+        seen = true
+    }
+    return seen
+}
+
+/// The instructions of a keyword.
+pub fn instructions_of(file: Dockerfile, keyword: str) -> [DockerInstruction] {
+    var out: [DockerInstruction] = []
+    for one in file.instructions {
+        if one.keyword == keyword.to_upper() {
+            out.push(one)
+        }
+    }
+    return out
+}
+
+/// The stages a file defines, in order, with the empty string for an
+/// unnamed one.
+pub fn stages(file: Dockerfile) -> [str] {
+    var out: [str] = []
+    for one in instructions_of(file, "FROM") {
+        var name = ""
+        let words = words_of(one.value)
+        var i = 0
+        while i + 1 < words.len() {
+            if words[i].to_lower() == "as" {
+                name = words[i + 1]
+            }
+            i = i + 1
+        }
+        out.push(name)
+    }
+    return out
+}
+
+fn words_of(text: str) -> [str] {
+    var out: [str] = []
+    for piece in text.split(" ") {
+        if trim(piece).len() > 0 {
+            out.push(trim(piece))
+        }
+    }
+    return out
+}
+
+/// The stage names a `COPY --from=` refers to that no `FROM` defines.
+///
+/// Not an error on its own — `--from` may name an image — but almost
+/// always a typo, and the failure it causes is either a confusing pull or
+/// a build that silently copies the wrong files.
+pub fn unknown_stages(file: Dockerfile) -> [str] {
+    let defined = stages(file)
+    var out: [str] = []
+    for one in file.instructions {
+        if one.keyword != "COPY" and one.keyword != "RUN" {
+            continue
+        }
+        for word in words_of(one.value) {
+            if not word.starts_with("--from=") {
+                continue
+            }
+            let name = word.substr(7, word.len() - 7)
+            if name.len() == 0 or looks_like_image(name) {
+                continue
+            }
+            var known = false
+            for stage in defined {
+                if stage == name {
+                    known = true
+                }
+            }
+            if not known {
+                out.push(name)
+            }
+        }
+    }
+    return out
+}
+
+/// Whether a `--from` value looks like an image reference rather than a
+/// stage name: a stage name has no slash, no colon and no dot.
+fn looks_like_image(name: str) -> bool {
+    var i = 0
+    while i < name.len() {
+        let here = name.substr(i, 1)
+        if here == "/" or here == ":" or here == "." {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+/// The base images a file builds from, ignoring the stages it defines
+/// itself — which is what a scanner asking "what am I pulling" wants.
+pub fn base_images(file: Dockerfile) -> [str] {
+    var defined: [str] = []
+    var out: [str] = []
+    for one in instructions_of(file, "FROM") {
+        let words = words_of(one.value)
+        if words.len() == 0 {
+            continue
+        }
+        var image = words[0]
+        if image.starts_with("--") and words.len() > 1 {
+            image = words[1]
+        }
+        var known = false
+        for stage in defined {
+            if stage == image {
+                known = true
+            }
+        }
+        if not known {
+            out.push(image)
+        }
+        var i = 0
+        while i + 1 < words.len() {
+            if words[i].to_lower() == "as" {
+                defined.push(words[i + 1])
+            }
+            i = i + 1
+        }
+    }
+    return out
+}

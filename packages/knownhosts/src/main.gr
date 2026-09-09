@@ -1,0 +1,268 @@
+// `~/.ssh/known_hosts`, and the hashed form that makes it unreadable on
+// purpose.
+//
+//   example.test ssh-ed25519 AAAAC3Nza...
+//   |1|c2FsdA==|aGFzaA== ssh-ed25519 AAAAC3Nza...
+//   @revoked * ssh-rsa AAAAB3Nza...
+//
+// A worm that reads a compromised machine's `known_hosts` learns every
+// host that machine talks to. `HashKnownHosts` stops that: the name is
+// replaced by an HMAC-SHA1 of it under a random salt, so a host can be
+// *checked* and cannot be *listed*. Every reader therefore has to hash
+// the name it is looking for against each entry's own salt — there is no
+// index and there cannot be one.
+//
+// ## Three markers, and two of them invert the answer
+//
+//   `@cert-authority`  the key signs host certificates rather than being
+//                      a host key
+//   `@revoked`         this key must be *refused*, even if another line
+//                      accepts it
+//
+// A reader that ignores markers accepts a key its own file says has been
+// revoked, which is the failure the marker exists to prevent.
+//
+// ## Patterns, and why hashed entries have none
+//
+// A plain entry may hold several comma-separated patterns with `*` and
+// `?`, and a negated one with `!`. A hashed entry holds exactly one host,
+// because a hash cannot be matched against a pattern.
+import hotp
+import bytes_codec
+
+type KnownHostsError =
+    | BadHash(line: i64)
+
+    /// One line of the file.
+type KnownHostEntry = {
+    /// `@cert-authority`, `@revoked`, or the empty string.
+    marker: str,
+    /// The comma-separated patterns, or one hashed entry.
+    patterns: [str],
+    /// The base64 salt and hash of a `|1|` entry.
+    salt: str,
+    hash: str,
+    hashed: bool,
+    key_type: str,
+    /// The base64 key.
+    key: str,
+    line: i64,
+}
+
+fn is_space(character: str) -> bool {
+    return character == " " or character == "\t"
+}
+
+fn words_of(text: str) -> [str] {
+    var out: [str] = []
+    var current = ""
+    var i = 0
+    while i < text.len() {
+        let here = text.substr(i, 1)
+        if is_space(here) {
+            if current.len() > 0 {
+                out.push(current)
+                current = ""
+            }
+        } else {
+            current = current + here
+        }
+        i = i + 1
+    }
+    if current.len() > 0 {
+        out.push(current)
+    }
+    return out
+}
+
+/// Read a file. Malformed lines are skipped, which is what ssh does:
+/// a line it cannot read must not stop it reading the rest.
+pub fn parse(text: str) -> [KnownHostEntry] {
+    var out: [KnownHostEntry] = []
+    var number = 0
+    for raw in text.split("\n") {
+        number = number + 1
+        var line = raw
+        if line.ends_with("\r") {
+            line = line.substr(0, line.len() - 1)
+        }
+        if line.trim().len() == 0 or line.trim().starts_with("#") {
+            continue
+        }
+        var words = words_of(line)
+        var marker = ""
+        if words.len() > 0 and words[0].starts_with("@") {
+            marker = words[0]
+            var rest: [str] = []
+            var i = 1
+            while i < words.len() {
+                rest.push(words[i])
+                i = i + 1
+            }
+            words = rest
+        }
+        if words.len() < 3 {
+            continue
+        }
+        var patterns: [str] = []
+        var salt = ""
+        var hash = ""
+        var hashed = false
+        if words[0].starts_with("|1|") {
+            let body = words[0].substr(3, words[0].len() - 3)
+            var at = 0 - 1
+            var j = 0
+            while j < body.len() {
+                if body.substr(j, 1) == "|" {
+                    at = j
+                    j = body.len()
+                } else {
+                    j = j + 1
+                }
+            }
+            if at < 0 {
+                continue
+            }
+            salt = body.substr(0, at)
+            hash = body.substr(at + 1, body.len() - at - 1)
+            hashed = true
+        } else {
+            for piece in words[0].split(",") {
+                if piece.len() > 0 {
+                    patterns.push(piece)
+                }
+            }
+        }
+        out.push(KnownHostEntry{ marker: marker, patterns: patterns,
+            salt: salt, hash: hash, hashed: hashed, key_type: words[1],
+            key: words[2], line: number })
+    }
+    return out
+}
+
+/// The hash of a host name under a salt, base64-encoded, as
+/// `HashKnownHosts` writes it.
+pub fn hash_of(salt: str, host: str) -> str {
+    let key = bytes_codec.decode_base64(salt) ?? bytes_of([])
+    return bytes_codec.encode_base64(hotp.hmac_sha1(key, host.to_bytes()))
+}
+
+/// Whether a pattern matches a host name.
+pub fn pattern_matches(pattern: str, host: str) -> bool {
+    return glob_from(pattern, host, 0, 0)
+}
+
+fn glob_from(pattern: str, host: str, p: i64, h: i64) -> bool {
+    var i = p
+    var j = h
+    while i < pattern.len() {
+        let here = pattern.substr(i, 1)
+        if here == "*" {
+            var k = j
+            while k <= host.len() {
+                if glob_from(pattern, host, i + 1, k) {
+                    return true
+                }
+                k = k + 1
+            }
+            return false
+        }
+        if j >= host.len() {
+            return false
+        }
+        if here != "?" and here != host.substr(j, 1) {
+            return false
+        }
+        i = i + 1
+        j = j + 1
+    }
+    return j == host.len()
+}
+
+/// Whether an entry names a host.
+///
+/// A hashed entry is checked by hashing the name under that entry's own
+/// salt, which is why looking a host up costs one HMAC per hashed line
+/// and cannot be indexed.
+pub fn entry_matches(entry: KnownHostEntry, host: str) -> bool {
+    if entry.hashed {
+        return hash_of(entry.salt, host) == entry.hash
+    }
+    var positive = false
+    for pattern in entry.patterns {
+        if pattern.starts_with("!") {
+            if pattern_matches(pattern.substr(1, pattern.len() - 1),
+                host) {
+                return false
+            }
+        } else if pattern_matches(pattern, host) {
+            positive = true
+        }
+    }
+    return positive
+}
+
+/// What the file says about a host and a key.
+///
+/// `revoked` beats everything, because a revoked key must be refused
+/// however many other lines accept it. `unknown` means the host is not in
+/// the file at all, and `changed` means it is and the key is different —
+/// which are very different situations and are the reason this does not
+/// answer with a boolean.
+pub fn verdict(entries: [KnownHostEntry], host: str, key_type: str,
+    key: str) -> str {
+    var seen_host = false
+    var accepted = false
+    var authority = false
+    for entry in entries {
+        if not entry_matches(entry, host) {
+            continue
+        }
+        seen_host = true
+        if entry.key_type == key_type and entry.key == key {
+            if entry.marker == "@revoked" {
+                return "revoked"
+            }
+            if entry.marker == "@cert-authority" {
+                authority = true
+            } else {
+                accepted = true
+            }
+        }
+    }
+    if accepted {
+        return "known"
+    }
+    if authority {
+        return "authority"
+    }
+    if seen_host {
+        return "changed"
+    }
+    return "unknown"
+}
+
+/// Write an entry back out.
+pub fn render(entry: KnownHostEntry) -> str {
+    var out = ""
+    if entry.marker.len() > 0 {
+        out = entry.marker + " "
+    }
+    if entry.hashed {
+        out = out + "|1|" + entry.salt + "|" + entry.hash
+    } else {
+        out = out + entry.patterns.join(",")
+    }
+    return out + " " + entry.key_type + " " + entry.key
+}
+
+/// A hashed entry for a host, given a salt.
+///
+/// The salt must be random and per-entry: reusing one lets an attacker
+/// build a single table and read every line that shares it.
+pub fn hashed_entry(salt: str, host: str, key_type: str,
+    key: str) -> KnownHostEntry {
+    return KnownHostEntry{ marker: "", patterns: [], salt: salt,
+        hash: hash_of(salt, host), hashed: true, key_type: key_type,
+        key: key, line: 0 }
+}

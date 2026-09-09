@@ -1,0 +1,20 @@
+[package]
+name = "opsfiles_demo"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.netrc]
+path = "../netrc"
+version = "^1.0.0"
+
+[dependencies.dockerfile]
+path = "../dockerfile"
+version = "^1.0.0"
+
+[dependencies.nginxconf]
+path = "../nginxconf"
+version = "^1.0.0"
+
+[dependencies.knownhosts]
+path = "../knownhosts"
+version = "^1.0.0"

@@ -1,0 +1,8 @@
+[package]
+name = "nrtest"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.netrc]
+path = "../netrc"
+version = "^1.0.0"

@@ -1,0 +1,30 @@
+import knownhosts
+
+fn from_hex(text: str) -> str {
+    var out: [i64] = []
+    var i = 0
+    while i + 1 < text.len() {
+        out.push(text.substr(i, 2).parse_int_base(16) ?? 0)
+        i = i + 2
+    }
+    return bytes_of(out).to_str()
+}
+
+fn main() / {io} {
+    if args().len() == 0 {
+        return
+    }
+    let entries = knownhosts.parse(from_hex(args()[0]))
+    var i = 1
+    while i < args().len() {
+        let host = from_hex(args()[i])
+        var found: [str] = []
+        for entry in entries {
+            if knownhosts.entry_matches(entry, host) {
+                found.push("{entry.line}")
+            }
+        }
+        print(found.join(","))
+        i = i + 1
+    }
+}

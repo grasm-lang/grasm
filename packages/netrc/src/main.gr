@@ -1,0 +1,212 @@
+// `~/.netrc`, where curl, ftp and git look for credentials.
+//
+//   machine example.test login alice password s3cret
+//   default login anonymous password ""
+//
+// The format is a stream of *tokens*, not a stream of lines: a newline is
+// just whitespace, so
+//
+//   machine example.test
+//     login alice
+//     password s3cret
+//
+// and the one-line form are the same file. A parser written around lines
+// reads the second one and not the first, or the other way round, and
+// both shapes are common.
+//
+// ## `default` has to come last
+//
+// It matches any machine not named before it, so an entry after it is
+// unreachable. `problems` reports that, because the failure is silent:
+// the credentials are simply never used.
+//
+// ## `macdef` swallows lines
+//
+// A macro definition runs to the next blank line and its body is *not*
+// tokens. A parser that keeps tokenising reads the macro body as machine
+// entries, which is how a stray `password` inside a macro becomes the
+// password for the next host.
+
+type NetrcError =
+    | Unterminated(name: str)
+
+    /// One entry.
+type NetrcEntry = {
+    /// The host, or the empty string for the `default` entry.
+    machine: str,
+    login: str,
+    password: str,
+    account: str,
+    is_default: bool,
+}
+
+fn is_space(character: str) -> bool {
+    return character == " " or character == "\t" or character == "\n" or
+    character == "\r"
+}
+
+/// Split into tokens, treating every newline as ordinary whitespace —
+/// except inside a `macdef`, which the caller handles by looking at the
+/// lines.
+///
+/// A double quote opens a quoted run only where a token *begins*: in
+/// `a"b c"` the quote is an ordinary character and the tokens are `a"b`
+/// and `c"`. A backslash escapes the character after it everywhere,
+/// quoted or not, which is how `login with\ space` names one login.
+fn tokens_of(text: str) -> [str] {
+    var out: [str] = []
+    var i = 0
+    while i < text.len() {
+        if is_space(text.substr(i, 1)) {
+            i = i + 1
+            continue
+        }
+        var current = ""
+        if text.substr(i, 1) == "\"" {
+            i = i + 1
+            while i < text.len() and text.substr(i, 1) != "\"" {
+                if text.substr(i, 1) == "\\" and i + 1 < text.len() {
+                    i = i + 1
+                }
+                current = current + text.substr(i, 1)
+                i = i + 1
+            }
+            // Step over the closing quote, which ends the token whatever
+            // follows it.
+            i = i + 1
+        } else {
+            while i < text.len() and not is_space(text.substr(i, 1)) {
+                if text.substr(i, 1) == "\\" and i + 1 < text.len() {
+                    i = i + 1
+                }
+                current = current + text.substr(i, 1)
+                i = i + 1
+            }
+        }
+        out.push(current)
+    }
+    return out
+}
+
+/// Remove every `macdef` block, which runs to the next blank line and
+/// whose body is not part of the token stream.
+fn without_macros(text: str) -> str {
+    var out: [str] = []
+    var skipping = false
+    for raw in text.split("\n") {
+        var line = raw
+        if line.ends_with("\r") {
+            line = line.substr(0, line.len() - 1)
+        }
+        if skipping {
+            if line.trim().len() == 0 {
+                skipping = false
+            }
+            continue
+        }
+        if line.trim().starts_with("macdef ") or line.trim() == "macdef" {
+            skipping = true
+            continue
+        }
+        out.push(line)
+    }
+    return out.join("\n")
+}
+
+/// Read a file.
+pub fn parse(text: str) -> [NetrcEntry] {
+    var out: [NetrcEntry] = []
+    var current = NetrcEntry{ machine: "", login: "", password: "",
+        account: "", is_default: false }
+    var open = false
+    let words = tokens_of(without_macros(text))
+    var i = 0
+    while i < words.len() {
+        let word = words[i]
+        if word == "machine" and i + 1 < words.len() {
+            if open {
+                out.push(current)
+            }
+            current = NetrcEntry{ machine: words[i + 1], login: "",
+                password: "", account: "", is_default: false }
+            open = true
+            i = i + 2
+            continue
+        }
+        if word == "default" {
+            if open {
+                out.push(current)
+            }
+            current = NetrcEntry{ machine: "", login: "", password: "",
+                account: "", is_default: true }
+            open = true
+            i = i + 1
+            continue
+        }
+        if i + 1 < words.len() and open {
+            if word == "login" {
+                current.login = words[i + 1]
+                i = i + 2
+                continue
+            }
+            if word == "password" {
+                current.password = words[i + 1]
+                i = i + 2
+                continue
+            }
+            if word == "account" {
+                current.account = words[i + 1]
+                i = i + 2
+                continue
+            }
+        }
+        i = i + 1
+    }
+    if open {
+        out.push(current)
+    }
+    return out
+}
+
+/// The entry for a host: the first one named, or the `default` entry.
+pub fn lookup(entries: [NetrcEntry], machine: str) -> Option[NetrcEntry] {
+    for entry in entries {
+        if not entry.is_default and entry.machine == machine {
+            return Some(entry)
+        }
+    }
+    for entry in entries {
+        if entry.is_default {
+            return Some(entry)
+        }
+    }
+    return None
+}
+
+/// The mistakes that make credentials silently unused.
+pub fn problems(entries: [NetrcEntry]) -> [str] {
+    var out: [str] = []
+    var seen_default = false
+    var seen: [str] = []
+    for entry in entries {
+        if seen_default {
+            out.push("an entry after `default` is never reached")
+            return out
+        }
+        if entry.is_default {
+            seen_default = true
+            continue
+        }
+        for known in seen {
+            if known == entry.machine {
+                out.push(entry.machine + " is named twice; the second is" +
+                    " never reached")
+            }
+        }
+        seen.push(entry.machine)
+        if entry.login.len() == 0 and entry.password.len() > 0 {
+            out.push(entry.machine + " has a password and no login")
+        }
+    }
+    return out
+}

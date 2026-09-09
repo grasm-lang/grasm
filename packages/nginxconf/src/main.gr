@@ -1,0 +1,388 @@
+// nginx configuration files.
+//
+//   http {
+//       server {
+//           listen 443 ssl;
+//           server_name example.test;
+//           location /api/ {
+//               proxy_pass http://backend;
+//           }
+//       }
+//   }
+//
+// The grammar is small — a directive is a name, some arguments and either
+// a semicolon or a block — and the difficulty is all in the arguments:
+//
+//   - **Quotes may be single or double**, and a quoted argument may
+//     contain a semicolon, a brace or whitespace. Splitting on `;` first
+//     truncates `add_header Content-Security-Policy "default-src 'self';";`
+//     at the wrong place, and the result is a header that is silently
+//     different from what was written.
+//   - **A backslash escapes the next character**, inside quotes and out.
+//   - **A `#` starts a comment except inside quotes**, so a URL fragment
+//     in a `return` directive is not a comment.
+//
+// ## What is not here
+//
+// `include`, which reads other files, and the meaning of any particular
+// directive. This says what the file says; whether `worker_processes` may
+// appear inside `http` is nginx's business and changes between versions.
+
+type NginxError =
+    | Unbalanced(line: i64)
+    | Unterminated(line: i64)
+    | UnclosedQuote(line: i64)
+
+    /// One directive.
+type NginxDirective = {
+    name: str,
+    args: [str],
+    /// The directives inside its block; empty when it ended with a
+    /// semicolon.
+    block: [NginxDirective],
+    /// Whether it had a block at all, which is not the same as the block
+    /// being empty.
+    has_block: bool,
+    line: i64,
+}
+
+fn is_space(character: str) -> bool {
+    return character == " " or character == "\t" or character == "\n" or
+    character == "\r"
+}
+
+/// One token of the file: a word, `{`, `}` or `;`, with the line it was
+/// on.
+type NginxToken = {
+    text: str,
+    /// Whether the word was written in quotes, which stops `{` and `;`
+    /// being punctuation.
+    quoted: bool,
+    line: i64,
+}
+
+/// Read a quoted run, which begins where a word begins and ends the
+/// word at its closing quote. Answers the text, where reading stopped,
+/// and how many lines it crossed.
+fn read_quoted(text: str, from: i64) -> (str, i64, i64) ! NginxError {
+    let closer = text.substr(from, 1)
+    var word = ""
+    var crossed = 0
+    var closed = false
+    var i = from + 1
+    while i < text.len() {
+        let inner = text.substr(i, 1)
+        if inner == "\\" and i + 1 < text.len() {
+            // A backslash removes itself before the closing quote and
+            // nowhere else: `\.` in a regular expression has to survive
+            // into the pattern.
+            let after = text.substr(i + 1, 1)
+            if after == closer {
+                word = word + closer
+            } else {
+                word = word + inner + after
+            }
+            if after == "\n" {
+                crossed = crossed + 1
+            }
+            i = i + 2
+            continue
+        }
+        if inner == closer {
+            closed = true
+            i = i + 1
+            break
+        }
+        if inner == "\n" {
+            crossed = crossed + 1
+        }
+        word = word + inner
+        i = i + 1
+    }
+    if not closed {
+        fail(UnclosedQuote(0))
+    }
+    return (word, i, crossed)
+}
+
+/// Read an unquoted word.
+fn read_word(text: str, from: i64) -> (str, i64, i64) {
+    var word = ""
+    var crossed = 0
+    var i = from
+    while i < text.len() {
+        let character = text.substr(i, 1)
+        if character == "\\" and i + 1 < text.len() {
+            // Outside quotes a backslash keeps itself too; all it does
+            // is stop `{`, `}` and `;` ending the word.
+            let after = text.substr(i + 1, 1)
+            word = word + character + after
+            if after == "\n" {
+                crossed = crossed + 1
+            }
+            i = i + 2
+            continue
+        }
+        // `${name}` is one word: nginx stops `{` ending a word when a
+        // `$` came immediately before it, and the matching `}` belongs
+        // to the variable rather than to a block.
+        if character == "\{" and word.ends_with("$") {
+            while i < text.len() and not is_space(text.substr(i, 1)) {
+                word = word + text.substr(i, 1)
+                i = i + 1
+                if word.ends_with("}") {
+                    break
+                }
+            }
+            continue
+        }
+        if is_space(character) or character == ";" or character == "\{" or
+        character == "}" {
+            break
+        }
+        word = word + character
+        i = i + 1
+    }
+    return (word, i, crossed)
+}
+
+fn tokens_of(text: str) -> [NginxToken] ! NginxError {
+    var out: [NginxToken] = []
+    var line = 1
+    var i = 0
+    while i < text.len() {
+        let here = text.substr(i, 1)
+        if here == "\n" {
+            line = line + 1
+            i = i + 1
+            continue
+        }
+        if is_space(here) {
+            i = i + 1
+            continue
+        }
+        if here == "#" {
+            while i < text.len() and text.substr(i, 1) != "\n" {
+                i = i + 1
+            }
+            continue
+        }
+        if here == "\{" or here == "}" or here == ";" {
+            out.push(NginxToken{ text: here, quoted: false, line: line })
+            i = i + 1
+            continue
+        }
+        // A quote opens a quoted run only where a word *begins*: in
+        // `a"b"` the quotes are ordinary characters.
+        if here == "\"" or here == "'" {
+            match read_quoted(text, i) {
+                Ok(read) -> {
+                    out.push(NginxToken{ text: read.0, quoted: true,
+                        line: line })
+                    i = read.1
+                    line = line + read.2
+                }
+                Err(_why) -> fail(UnclosedQuote(line))
+            }
+            continue
+        }
+        let read = read_word(text, i)
+        out.push(NginxToken{ text: read.0, quoted: false, line: line })
+        i = read.1
+        line = line + read.2
+    }
+    return out
+}
+
+fn trim_left(text: str) -> str {
+    var start = 0
+    while start < text.len() and is_space(text.substr(start, 1)) {
+        start = start + 1
+    }
+    return text.substr(start, text.len() - start)
+}
+
+fn trim_right(text: str) -> str {
+    var end = text.len()
+    while end > 0 and is_space(text.substr(end - 1, 1)) {
+        end = end - 1
+    }
+    return text.substr(0, end)
+}
+
+/// `if` is written `if ($request_method = POST)`, and the parentheses
+/// belong to the directive rather than to the condition: the rewrite
+/// module strips them off the first and last argument before reading it.
+/// A reader that keeps them compares `($request_method` against a
+/// variable name and never matches.
+fn without_parentheses(args: [str]) -> [str] {
+    if args.len() == 0 or not args[0].starts_with("(") or
+    not args[args.len() - 1].ends_with(")") {
+        return args
+    }
+    var out = args
+    let last = out.len() - 1
+    out[0] = trim_left(out[0].substr(1, out[0].len() - 1))
+    out[last] = trim_right(out[last].substr(0, out[last].len() - 1))
+    var start = 0
+    if out[0].len() == 0 {
+        start = 1
+    }
+    var end = out.len()
+    if out[out.len() - 1].len() == 0 {
+        end = end - 1
+    }
+    var kept: [str] = []
+    var i = start
+    while i < end {
+        kept.push(out[i])
+        i = i + 1
+    }
+    return kept
+}
+
+/// Read a configuration file.
+pub fn parse(text: str) -> [NginxDirective] ! NginxError {
+    let words = try tokens_of(text)
+    var at = 0
+    let out = try read_block(words, at, 0)
+    if out.1 != words.len() {
+        fail(Unbalanced(words[out.1].line))
+    }
+    return out.0
+}
+
+fn read_block(words: [NginxToken], from: i64,
+    depth: i64) -> ([NginxDirective], i64) ! NginxError {
+    var out: [NginxDirective] = []
+    var i = from
+    while i < words.len() {
+        if words[i].text == "}" and not words[i].quoted {
+            if depth == 0 {
+                fail(Unbalanced(words[i].line))
+            }
+            return (out, i + 1)
+        }
+        let line = words[i].line
+        var name = words[i].text
+        var args: [str] = []
+        i = i + 1
+        while i < words.len() and not (not words[i].quoted and
+            (words[i].text == ";" or words[i].text == "\{" or
+                words[i].text == "}")) {
+            args.push(words[i].text)
+            i = i + 1
+        }
+        if i >= words.len() {
+            fail(Unterminated(line))
+        }
+        if name == "if" {
+            args = without_parentheses(args)
+        }
+        if words[i].text == ";" {
+            out.push(NginxDirective{ name: name, args: args, block: [],
+                has_block: false, line: line })
+            i = i + 1
+            continue
+        }
+        if words[i].text == "}" {
+            fail(Unterminated(line))
+        }
+        let inner = try read_block(words, i + 1, depth + 1)
+        out.push(NginxDirective{ name: name, args: args, block: inner.0,
+            has_block: true, line: line })
+        i = inner.1
+    }
+    if depth != 0 {
+        fail(Unbalanced(words[words.len() - 1].line))
+    }
+    return (out, i)
+}
+
+/// Every directive of a name, at any depth.
+pub fn find(directives: [NginxDirective], name: str) -> [NginxDirective] {
+    var out: [NginxDirective] = []
+    for one in directives {
+        if one.name == name {
+            out.push(one)
+        }
+        for found in find(one.block, name) {
+            out.push(found)
+        }
+    }
+    return out
+}
+
+/// The directives of a name directly inside a block.
+pub fn children(parent: NginxDirective, name: str) -> [NginxDirective] {
+    var out: [NginxDirective] = []
+    for one in parent.block {
+        if one.name == name {
+            out.push(one)
+        }
+    }
+    return out
+}
+
+/// The first argument of the first directive of a name, or the empty
+/// string.
+pub fn value_of(directives: [NginxDirective], name: str) -> str {
+    for one in find(directives, name) {
+        if one.args.len() > 0 {
+            return one.args[0]
+        }
+    }
+    return ""
+}
+
+fn quoting_needed(value: str) -> bool {
+    if value.len() == 0 {
+        return true
+    }
+    var i = 0
+    while i < value.len() {
+        let here = value.substr(i, 1)
+        if is_space(here) or here == ";" or here == "\{" or here == "}" or
+        here == "#" or here == "\"" or here == "'" {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn quoted(value: str) -> str {
+    if not quoting_needed(value) {
+        return value
+    }
+    var out = "\""
+    var i = 0
+    while i < value.len() {
+        let here = value.substr(i, 1)
+        if here == "\"" or here == "\\" {
+            out = out + "\\"
+        }
+        out = out + here
+        i = i + 1
+    }
+    return out + "\""
+}
+
+/// Write the directives back out, indented.
+pub fn render(directives: [NginxDirective], indent: i64) -> str {
+    var out = ""
+    let pad = " ".repeat(indent * 4)
+    for one in directives {
+        out = out + pad + one.name
+        for argument in one.args {
+            out = out + " " + quoted(argument)
+        }
+        if one.has_block {
+            out = out + " \{\n" + render(one.block, indent + 1) + pad +
+            "}\n"
+        } else {
+            out = out + ";\n"
+        }
+    }
+    return out
+}

@@ -1,0 +1,8 @@
+[package]
+name = "khtest"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.knownhosts]
+path = "../knownhosts"
+version = "^1.0.0"

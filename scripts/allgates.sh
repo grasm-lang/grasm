@@ -65,6 +65,8 @@ run_gate bip39diff     scripts/bip39_diff.sh
 run_gate sfdiff        scripts/sf_diff.sh
 run_gate linebreakdiff scripts/linebreak_diff.sh
 run_gate gitconfigdiff  scripts/gitconfig_diff.sh
+run_gate netrcdiff      scripts/netrc_diff.sh
+run_gate knownhostsdiff scripts/known_hosts_diff.sh
 run_gate kvcrash       scripts/kvstore_crash.sh
 run_gate zlibdiff      scripts/zlib_diff.sh
 run_gate casefolddiff  scripts/casefold_diff.sh

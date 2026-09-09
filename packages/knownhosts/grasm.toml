@@ -1,0 +1,11 @@
+[package]
+name = "knownhosts"
+version = "1.0.0"
+
+[dependencies.hotp]
+path = "../hotp"
+version = "^1.0.0"
+
+[dependencies.bytes_codec]
+path = "../bytes"
+version = "^1.0.0"

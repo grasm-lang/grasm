@@ -1,0 +1,184 @@
+// Four files on a server, each with one rule that a line-by-line reader
+// gets wrong.
+import netrc
+import dockerfile
+import nginxconf
+import knownhosts
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn joined(lines: [str]) -> str {
+    return lines.join("\n") + "\n"
+}
+
+// ----------------------------------------------------------------- netrc
+
+fn check_netrc(inout f: i64) / {io} {
+    print("-- netrc: a stream of tokens, not a stream of lines")
+    let one_line = netrc.parse(joined([
+        "machine example.test login alice password s3cret"]))
+    let many_lines = netrc.parse(joined(["machine example.test",
+        "  login alice", "  password s3cret"]))
+    say(f, "the one-line and the indented form are the same file",
+        one_line.len() == 1 and many_lines.len() == 1 and
+        one_line[0].login == many_lines[0].login and
+        one_line[0].password == many_lines[0].password)
+    say(f, "a quoted value may contain a space",
+        netrc.parse(joined(["machine x login \"a b\" password c"]))[0]
+            .login == "a b")
+    say(f, "default matches a host no entry names",
+        (netrc.lookup(netrc.parse(joined(["machine a login x",
+            "default login anon"])), "other") ??
+            no_entry()).login == "anon")
+    say(f, "a named machine is found before the default",
+        (netrc.lookup(netrc.parse(joined(["machine a login x",
+            "default login anon"])), "a") ?? no_entry()).login == "x")
+    say(f, "a macdef body is not read as entries",
+        netrc.parse(joined(["macdef init", "machine evil login mallory",
+            "", "machine good login alice"])).len() == 1)
+    say(f, "and an entry after default is reported as unreachable",
+        netrc.problems(netrc.parse(joined(["default login anon",
+            "machine a login x"]))).len() == 1)
+}
+
+fn no_entry() -> NetrcEntry {
+    return NetrcEntry{ machine: "", login: "", password: "",
+        account: "", is_default: false }
+}
+
+// ------------------------------------------------------------ dockerfile
+
+fn docker_of(lines: [str]) -> Dockerfile {
+    return dockerfile.parse(joined(lines)) ??
+    Dockerfile{ directives: [], instructions: [], escape: "\\" }
+}
+
+fn check_docker(inout f: i64) / {io} {
+    print("-- dockerfile: a backslash joins, and a comment between does" +
+        " not")
+    let file = docker_of(["# syntax=docker/dockerfile:1",
+        "FROM node:20 AS build", "RUN npm ci \\", "# a comment",
+        "    && npm run build", "CMD [\"node\", \"server.js\"]",
+        "FROM nginx", "COPY --from=build /app/dist /usr/share/nginx/html"])
+    say(f, "a parser directive is read before the first instruction",
+        file.directives.len() == 1 and file.directives[0].0 == "syntax")
+    say(f, "a continuation joins as written, keeping the indentation",
+        dockerfile.instructions_of(file, "RUN")[0].value ==
+        "npm ci     && npm run build")
+    say(f, "the exec form is told from the shell form by its JSON",
+        dockerfile.is_exec_form(
+            dockerfile.instructions_of(file, "CMD")[0].value) and
+        not dockerfile.is_exec_form("node server.js") and
+        not dockerfile.is_exec_form("['node', 'server.js']"))
+    say(f, "the stages a file defines are listed in order",
+        dockerfile.stages(file) == ["build", ""])
+    say(f, "the images it pulls leave its own stages out",
+        dockerfile.base_images(file) == ["node:20", "nginx"])
+    say(f, "a copy from a stage that does not exist is reported",
+        dockerfile.unknown_stages(file).len() == 0 and
+        dockerfile.unknown_stages(docker_of(["FROM a AS build",
+            "COPY --from=biuld /x /y"])) == ["biuld"])
+    say(f, "and the escape character can be changed by a directive",
+        docker_of(["# escape=`", "FROM a", "RUN one `", "  two"])
+            .escape == "`" and
+        dockerfile.instructions_of(docker_of(["# escape=`", "FROM a",
+            "RUN one `", "  two"]), "RUN")[0].value == "one   two")
+}
+
+// ------------------------------------------------------------- nginxconf
+
+fn nginx_of(lines: [str]) -> [NginxDirective] {
+    return nginxconf.parse(joined(lines)) ?? []
+}
+
+fn check_nginx(inout f: i64) / {io} {
+    print("-- nginxconf: a semicolon inside quotes is not a terminator")
+    let config = nginx_of(["http \{", "    server \{",
+        "        listen 443 ssl;", "        server_name example.test;",
+        "        add_header Content-Security-Policy " +
+        "\"default-src 'self'; frame-ancestors 'none'\";",
+        "        location /api/ \{", "            proxy_pass " +
+        "http://backend;", "        }", "    }", "}"])
+    say(f, "the blocks nest, and a directive knows whether it has one",
+        config.len() == 1 and config[0].name == "http" and
+        config[0].has_block and
+        nginxconf.children(config[0], "server").len() == 1)
+    say(f, "a quoted argument keeps its semicolon and its spaces",
+        nginxconf.value_of(config, "add_header") ==
+        "Content-Security-Policy" and
+        nginxconf.find(config, "add_header")[0].args[1] ==
+        "default-src 'self'; frame-ancestors 'none'")
+    say(f, "a directive is found at any depth",
+        nginxconf.find(config, "proxy_pass").len() == 1 and
+        nginxconf.value_of(config, "proxy_pass") == "http://backend")
+    say(f, "arguments keep their order",
+        nginxconf.find(config, "listen")[0].args == ["443", "ssl"])
+    say(f, "and a value that needs quoting gets them back",
+        nginxconf.render(nginx_of(["x \"a b;c\";"]), 0) ==
+        "x \"a b;c\";\n")
+    say(f, "an unbalanced brace is refused rather than half-read",
+        nginx_refused(["http \{", "  server \{", "  }"]))
+}
+
+fn nginx_refused(lines: [str]) -> bool {
+    match nginxconf.parse(joined(lines)) {
+        Ok(_config) -> return false
+        Err(_why) -> return true
+    }
+}
+
+// ------------------------------------------------------------ knownhosts
+
+fn check_hosts(inout f: i64) / {io} {
+    print("-- knownhosts: a hashed entry can be checked and not listed")
+    let salt = "MTIzNDU2Nzg5MDEyMzQ1Njc4OTA="
+    let hashed = knownhosts.hashed_entry(salt, "example.test",
+        "ssh-ed25519", "AAAAC3Nza")
+    let entries = knownhosts.parse(joined([
+        knownhosts.render(hashed),
+        "other.test,*.other.test ssh-rsa AAAAB3Nza",
+        "@revoked bad.test ssh-rsa AAAAB3Bad",
+        "@cert-authority *.ca.test ssh-ed25519 AAAAC3Ca"]))
+    say(f, "a hashed entry matches only the host it was made from",
+        knownhosts.entry_matches(entries[0], "example.test") and
+        not knownhosts.entry_matches(entries[0], "other.test"))
+    say(f, "and the same host hashes to the same thing under that salt",
+        knownhosts.hash_of(salt, "example.test") == hashed.hash)
+    say(f, "a plain entry may hold several patterns",
+        knownhosts.entry_matches(entries[1], "a.other.test") and
+        knownhosts.entry_matches(entries[1], "other.test"))
+    say(f, "a known key is known and a different one has changed",
+        knownhosts.verdict(entries, "example.test", "ssh-ed25519",
+            "AAAAC3Nza") == "known" and
+        knownhosts.verdict(entries, "example.test", "ssh-ed25519",
+            "AAAAC3Different") == "changed")
+    say(f, "a host nobody wrote down is unknown, which is not the same",
+        knownhosts.verdict(entries, "nowhere.test", "ssh-rsa", "x") ==
+        "unknown")
+    say(f, "a revoked key is refused however it was written",
+        knownhosts.verdict(entries, "bad.test", "ssh-rsa",
+            "AAAAB3Bad") == "revoked")
+    say(f, "and a certificate authority is a third answer again",
+        knownhosts.verdict(entries, "a.ca.test", "ssh-ed25519",
+            "AAAAC3Ca") == "authority")
+}
+
+fn main() / {io} {
+    var f = 0
+    check_netrc(f)
+    check_docker(f)
+    check_nginx(f)
+    check_hosts(f)
+    if f == 0 {
+        print("opsfiles: every claim held")
+    } else {
+        print("opsfiles: {f} claims failed")
+    }
+}
