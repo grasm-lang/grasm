@@ -26,12 +26,16 @@ numbers taken that way, and they should not be published.
 
 `fib` is the one figure a stack guard shows up in. A compiled Grasm function
 that can recurse checks how much stack is left on entry ([E-RECURSION-DEPTH]);
-without it, deep recursion took SIGSEGV with nothing reported. On `fib` — a
-microbenchmark whose entire body *is* the call — that check costs about 70%.
-On a small recursive interpreter it costs about 5%, and on the loop-based
-programs here it costs nothing, because only functions that can reach
-themselves are guarded. The trade is a measured one and it is the right way
-round: a program that crashes silently has no time to report.
+without it, deep recursion took SIGSEGV with nothing reported. Measured again
+on 2026-09-10 by building each program with the check short-circuited and
+timing the two alternately: **7% on `fib`**, 3% on `tree`, and nothing on the
+loop-based programs, because only functions that can reach themselves are
+guarded. An earlier note here said 70% for `fib`; that figure predates the
+free-box pool and the thread-local consolidation and was wrong by the time it
+was read. Both of these were taken on a machine that was not idle, so they are
+ratios between two builds rather than publishable times. The trade is the
+right way round either way: a program that crashes silently has no time to
+report.
 | `sieve`    | list indexing and tight loops                   |
 | `matmul`   | nested indexing over a flat list                |
 | `wordfreq` | hashing, string handling, map updates           |

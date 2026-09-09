@@ -377,13 +377,16 @@ built is not.
 
 ## The order this will be done in
 
-1. **Finish Tier 1 to 200.** All buildable, no blockers, in flight now.
-2. **Build P1, the TLS client.** Chain validation, a trust store, RSA
-   verification, hostname checks. This is the one that unlocks the most.
-3. **Tier 2, the 180 that need nothing.**
-4. **Tier 2, the 120 behind TLS.**
-5. **Build P2 if the broker and server packages are wanted.**
+1. ~~**Finish Tier 1 to 200.**~~ Done.
+2. ~~**Build P1, the TLS client.**~~ Done: chain validation, a trust store,
+   RSA verification, hostname checks.
+3. ~~**Tier 2, the 180 that need nothing.**~~ Done.
+4. ~~**Tier 2, the 120 behind TLS.**~~ Done — the count passed 500 on
+   2026-09-10.
+5. **Build P2 if the broker and server packages are wanted.** Not started.
+   About 40 packages wait on it.
 6. **Raise P3 as a question** rather than answering it inside a commit.
+   Raised, and open: about 90 packages wait on the answer.
 
 ## What will not be claimed
 
