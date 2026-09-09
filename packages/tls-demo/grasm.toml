@@ -1,0 +1,24 @@
+[package]
+name = "tls_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.tlshandshake]
+path = "../tlshandshake"
+version = "^1.0.0"
+
+[dependencies.tlsverify]
+path = "../tlsverify"
+version = "^1.0.0"
+
+[dependencies.tls13]
+path = "../tls13"
+version = "^1.0.0"
+
+[dependencies.x25519]
+path = "../x25519"
+version = "^1.0.0"
+
+[dependencies.crypto_hash]
+path = "../crypto_hash"
+version = "^1.0.0"

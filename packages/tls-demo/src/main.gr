@@ -1,0 +1,419 @@
+import tlshandshake
+import tlsverify
+import tls13
+import x25519
+import crypto_hash
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn hex(text: str) -> bytes {
+    return tlshandshake.from_hex(text)
+}
+
+fn same(a: bytes, b: bytes) -> bool {
+    if a.len() != b.len() {
+        return false
+    }
+    var i = 0
+    while i < a.len() {
+        if a.at(i) != b.at(i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn concat(a: bytes, b: bytes) -> bytes {
+    var out: [i64] = []
+    var i = 0
+    while i < a.len() {
+        out.push(a.at(i))
+        i = i + 1
+    }
+    var j = 0
+    while j < b.len() {
+        out.push(b.at(j))
+        j = j + 1
+    }
+    return bytes_of(out)
+}
+fn rfc_client_private() -> str {
+    return "49af42ba7f7994852d713ef2784bcbcaa7911de26adc5642cb634540e7" +
+    "ea5005"
+}
+
+fn rfc_server_public() -> str {
+    return "c9828876112095fe66762bdbf7c672e156d6cc253b833df1dd69b1b04e" +
+    "751f0f"
+}
+
+fn rfc_client_hello() -> str {
+    return "010000c00303cb34ecb1e78163ba1c38c6dacb196a6dffa21a8d9912ec" +
+    "18a2ef6283024dece7000006130113031302010000910000000b000900" +
+    "0006736572766572ff01000100000a00140012001d0017001800190100" +
+    "010101020103010400230000003300260024001d002099381de560e4bd" +
+    "43d23d8e435a7dbafeb3c06e51c13cae4d5413691e529aaf2c002b0003" +
+    "020304000d0020001e0403050306030203080408050806040105010601" +
+    "02010402050206020202002d00020101001c00024001"
+}
+
+fn rfc_server_hello() -> str {
+    return "020000560303a6af06a4121860dc5e6e60249cd34c95930c8ac5cb1434" +
+    "dac155772ed3e2692800130100002e00330024001d0020c98288761120" +
+    "95fe66762bdbf7c672e156d6cc253b833df1dd69b1b04e751f0f002b00" +
+    "020304"
+}
+
+fn rfc_flight_record() -> str {
+    return "17030302a2d1ff334a56f5bff6594a07cc87b580233f500f45e489e7f3" +
+    "3af35edf7869fcf40aa40aa2b8ea73f848a7ca07612ef9f945cb960b40" +
+    "68905123ea78b111b429ba9191cd05d2a389280f526134aadc7fc78c4b" +
+    "729df828b5ecf7b13bd9aefb0e57f271585b8ea9bb355c7c79020716cf" +
+    "b9b1183ef3ab20e37d57a6b9d7477609aee6e122a4cf51427325250c7d" +
+    "0e509289444c9b3a648f1d71035d2ed65b0e3cdd0cbae8bf2d0b227812" +
+    "cbb360987255cc744110c453baa4fcd610928d809810e4b7ed1a8fd991" +
+    "f06aa6248204797e36a6a73b70a2559c09ead686945ba246ab66e5edd8" +
+    "044b4c6de3fcf2a89441ac66272fd8fb330ef8190579b3684596c960bd" +
+    "596eea520a56a8d650f563aad27409960dca63d3e688611ea5e22f4415" +
+    "cf9538d51a200c27034272968a264ed6540c84838d89f72c24461aad6d" +
+    "26f59ecaba9acbbb317b66d902f4f292a36ac1b639c637ce343117b659" +
+    "622245317b49eeda0c6258f100d7d961ffb138647e92ea330faeea6dfa" +
+    "31c7a84dc3bd7e1b7a6c7178af36879018e3f252107f243d243dc7339d" +
+    "5684c8b0378bf30244da8c87c843f5e56eb4c5e8280a2b48052cf93b16" +
+    "499a66db7cca71e4599426f7d461e66f99882bd89fc50800becca62d6c" +
+    "74116dbd2972fda1fa80f85df881edbe5a37668936b335583b599186dc" +
+    "5c6918a396fa48a181d6b6fa4f9d62d513afbb992f2b992f67f8afe67f" +
+    "76913fa388cb5630c8ca01e0c65d11c66a1e2ac4c85977b7c7a6999bbf" +
+    "10dc35ae69f5515614636c0b9b68c19ed2e31c0b3b66763038ebba42f3" +
+    "b38edc0399f3a9f23faa63978c317fc9fa66a73f60f0504de93b5b845e" +
+    "275592c12335ee340bbc4fddd502784016e4b3be7ef04dda49f4b440a3" +
+    "0cb5d2af939828fd4ae3794e44f94df5a631ede42c1719bfdabf0253fe" +
+    "5175be898e750edc53370d2b"
+}
+
+fn rfc_flight_plain() -> str {
+    return "080000240022000a00140012001d001700180019010001010102010301" +
+    "04001c00024001000000000b0001b9000001b50001b0308201ac308201" +
+    "15a003020102020102300d06092a864886f70d01010b0500300e310c30" +
+    "0a06035504031303727361301e170d3136303733303031323335395a17" +
+    "0d3236303733303031323335395a300e310c300a060355040313037273" +
+    "6130819f300d06092a864886f70d010101050003818d00308189028181" +
+    "00b4bb498f8279303d980836399b36c6988c0c68de55e1bdb826d3901a" +
+    "2461eafd2de49a91d015abbc9a95137ace6c1af19eaa6af98c7ced4312" +
+    "0998e187a80ee0ccb0524b1b018c3e0b63264d449a6d38e22a5fda4308" +
+    "46748030530ef0461c8ca9d9efbfae8ea6d1d03e2bd193eff0ab9a8002" +
+    "c47428a6d35a8d88d79f7f1e3f0203010001a31a301830090603551d13" +
+    "04023000300b0603551d0f0404030205a0300d06092a864886f70d0101" +
+    "0b05000381810085aad2a0e5b9276b908c65f73a7267170618a54c5f8a" +
+    "7b337d2df7a594365417f2eae8f8a58c8f8172f9319cf36b7fd6c55b80" +
+    "f21a03015156726096fd335e5e67f2dbf102702e608ccae6bec1fc63a4" +
+    "2a99be5c3eb7107c3c54e9b9eb2bd5203b1c3b84e0a8b2f759409ba3ea" +
+    "c9d91d402dcc0cc8f8961229ac9187b42b4de100000f00008408040080" +
+    "5a747c5d88fa9bd2e55ab085a61015b7211f824cd484145ab3ff52f1fd" +
+    "a8477b0b7abc90db78e2d33a5c141a078653fa6bef780c5ea248eeaaa7" +
+    "85c4f394cab6d30bbe8d4859ee511f602957b15411ac027671459e4644" +
+    "5c9ea58c181e818e95b8c3fb0bf3278409d3be152a3da5043e063dda65" +
+    "cdf5aea20d53dfacd42f74f3140000209b9b141d906337fbd2cbdce71d" +
+    "f4deda4ab42c309572cb7fffee5454b78f0718"
+}
+
+fn rfc_handshake_secret() -> str {
+    return "1dc826e93606aa6fdc0aadc12f741b01046aa6b99f691ed221a9f0ca04" +
+    "3fbeac"
+}
+
+fn rfc_client_hs() -> str {
+    return "b3eddb126e067f35a780b3abf45e2d8f3b1a950738f52e9600746a0e27" +
+    "a55a21"
+}
+
+fn rfc_server_hs() -> str {
+    return "b67b7d690cc16c4e75e54213cb2d37b4e9c912bcded9105d42befd59d3" +
+    "91ad38"
+}
+
+fn rfc_server_key() -> str {
+    return "3fce516009c21727d0f2e4e86ee403bc"
+}
+
+fn rfc_server_iv() -> str {
+    return "5d313eb2671276ee13000b30"
+}
+
+fn rfc_client_finished() -> str {
+    return "14000020a8ec436d677634ae525ac1fcebe11a039ec17694fac6e98527" +
+    "b642f2edd5ce61"
+}
+
+fn rfc_leaf() -> str {
+    return "308201ac30820115a003020102020102300d06092a864886f70d01010b" +
+    "0500300e310c300a06035504031303727361301e170d31363037333030" +
+    "31323335395a170d3236303733303031323335395a300e310c300a0603" +
+    "550403130372736130819f300d06092a864886f70d010101050003818d" +
+    "0030818902818100b4bb498f8279303d980836399b36c6988c0c68de55" +
+    "e1bdb826d3901a2461eafd2de49a91d015abbc9a95137ace6c1af19eaa" +
+    "6af98c7ced43120998e187a80ee0ccb0524b1b018c3e0b63264d449a6d" +
+    "38e22a5fda430846748030530ef0461c8ca9d9efbfae8ea6d1d03e2bd1" +
+    "93eff0ab9a8002c47428a6d35a8d88d79f7f1e3f0203010001a31a3018" +
+    "30090603551d1304023000300b0603551d0f0404030205a0300d06092a" +
+    "864886f70d01010b05000381810085aad2a0e5b9276b908c65f73a7267" +
+    "170618a54c5f8a7b337d2df7a594365417f2eae8f8a58c8f8172f9319c" +
+    "f36b7fd6c55b80f21a03015156726096fd335e5e67f2dbf102702e608c" +
+    "cae6bec1fc63a42a99be5c3eb7107c3c54e9b9eb2bd5203b1c3b84e0a8" +
+    "b2f759409ba3eac9d91d402dcc0cc8f8961229ac9187b42b4de1"
+}
+
+fn rfc_cv_message() -> str {
+    return "0f000084080400805a747c5d88fa9bd2e55ab085a61015b7211f824cd4" +
+    "84145ab3ff52f1fda8477b0b7abc90db78e2d33a5c141a078653fa6bef" +
+    "780c5ea248eeaaa785c4f394cab6d30bbe8d4859ee511f602957b15411" +
+    "ac027671459e46445c9ea58c181e818e95b8c3fb0bf3278409d3be152a" +
+    "3da5043e063dda65cdf5aea20d53dfacd42f74f3"
+}
+
+fn rfc_cv_hash() -> str {
+    return "764d6632b3c35c3f3205e3499ac3edbaabb88295fba751461d3678e2e5" +
+    "ea0687"
+}
+
+// --------------------------------------------------------- the framing
+
+fn check_framing(inout f: i64) / {io} {
+    print("-- tlshandshake: three lengths, all different")
+    // A record is a type, a version and two bytes of length.
+    let record = tlshandshake.record_of(22, 769, hex("0102")) ??
+    bytes_of([])
+    say(f, "a record header is five bytes and the payload follows",
+        tlshandshake.to_hex(record) == "160301000201" + "02")
+    say(f, "a handshake message header is four, with a three-byte length",
+        tlshandshake.to_hex(tlshandshake.message_of(1, hex("0102")) ??
+            bytes_of([])) == "010000020102")
+    // A partial record is not an error: a socket has half of one more often
+    // than not.
+    let split = tlshandshake.split_records(concat(record, hex("1603"))) ??
+    ([], 0)
+    say(f, "a partial record at the end is left for the next read",
+        split.0.len() == 1 and split.1 == 7)
+    say(f, "and several messages can share one record",
+        (tlshandshake.split_messages(hex("0100000101020000020304")) ??
+            ([], 0)).0.len() == 2)
+    // The inner content type, which is what hides a handshake record from
+    // an observer.
+    let inner = tlshandshake.inner_plaintext(22, hex("abcd"), 3)
+    say(f, "the real content type goes inside the encryption, then padding",
+        tlshandshake.to_hex(inner) == "abcd16000000")
+    let stripped = tlshandshake.strip_inner(inner) ?? (0, bytes_of([]))
+    say(f, "and it is the last byte that is not padding",
+        stripped.0 == 22 and tlshandshake.to_hex(stripped.1) == "abcd")
+    say(f, "a record of nothing but zeros has no content type at all",
+        inner_refused("000000"))
+}
+
+fn inner_refused(text: str) -> bool {
+    match tlshandshake.strip_inner(hex(text)) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+// ------------------------------------------------- the RFC 8448 trace
+
+fn check_hello(inout f: i64) / {io} {
+    print("-- the ClientHello RFC 8448 publishes, rebuilt from its parts")
+    let published = hex(rfc_client_hello())
+    let body = (tlshandshake.split_messages(published) ?? ([], 0)).0[0].body
+    // The extensions, read back in the order the RFC wrote them.
+    let extensions = tlshandshake.read_extensions(body, 45) ?? []
+    say(f, "the nine extensions come out in the order they were written",
+        extensions.len() == 9 and extensions[0].kind == 0 and
+        extensions[4].kind == 51 and extensions[8].kind == 28)
+    var parts = ClientHelloParts{ random: slice(body, 2, 32),
+        session_id: bytes_of([]), cipher_suites: [4865, 4867, 4866],
+        extensions: extensions }
+    let rebuilt = tlshandshake.message_of(1,
+        tlshandshake.client_hello(parts) ?? bytes_of([])) ?? bytes_of([])
+    say(f, "and the message rebuilds byte for byte", same(rebuilt,
+        published))
+    say(f, "the version field says TLS 1.2 whatever is really being asked",
+        body.at(0) == 3 and body.at(1) == 3)
+    // The extension builders produce the same bytes as the RFC's.
+    say(f, "the server name extension is a list of one name, typed",
+        tlshandshake.to_hex(tlshandshake.server_name_extension("server")
+                .body) == "000900000673657276657" + "2")
+    say(f, "supported_versions names 0x0304, which is where 1.3 really is",
+        tlshandshake.to_hex(tlshandshake.supported_versions_extension(
+            [772]).body) == "020304")
+    say(f, "and a key share carries the group beside the bytes",
+        tlshandshake.to_hex(tlshandshake.key_share_extension(29,
+            hex("aabb")).body) == "0006001d0002aabb")
+    say(f, "alpn is a list of length-prefixed names inside one more length",
+        tlshandshake.to_hex(tlshandshake.alpn_extension(["h2",
+            "http/1.1"]).body) == "000c02683208687474702f312e31")
+}
+
+fn slice(data: bytes, at: i64, length: i64) -> bytes {
+    var out: [i64] = []
+    var i = 0
+    while i < length {
+        out.push(data.at(at + i))
+        i = i + 1
+    }
+    return bytes_of(out)
+}
+
+fn check_schedule(inout f: i64) / {io} {
+    print("-- the whole 1-RTT handshake, against the published trace")
+    let shared = x25519.shared_secret(hex(rfc_client_private()),
+        hex(rfc_server_public())) ?? bytes_of([])
+    say(f, "the two halves of the key exchange make the shared secret",
+        tlshandshake.to_hex(shared) ==
+        "8bd4054fb55b9d63fdfbacf9f04b9f0d35e6d63f537563efd46272900f89492d")
+    let schedule = tls13.schedule_of(tls13.zeros(), shared)
+    say(f, "which extracts to the handshake secret the RFC records",
+        same(schedule.handshake, hex(rfc_handshake_secret())))
+    // Every secret is bound to the transcript, so the hash comes first.
+    let transcript = concat(hex(rfc_client_hello()), hex(rfc_server_hello()))
+    let hash = crypto_hash.sha256_of(transcript)
+    say(f, "the transcript is the two hellos, unencrypted, in order",
+        tlshandshake.to_hex(hash) ==
+        "860c06edc07858ee8e78f0e7428c58edd6b43f2ca3e6e95f02ed063cf0e1cad8")
+    let traffic = tls13.handshake_traffic(schedule, hash)
+    say(f, "and both handshake traffic secrets fall out of it",
+        same(traffic.0, hex(rfc_client_hs())) and
+        same(traffic.1, hex(rfc_server_hs())))
+    let keys = tls13.traffic_keys(traffic.1)
+    say(f, "the server's record key and nonce are derived from its secret",
+        same(keys.key, hex(rfc_server_key())) and
+        same(keys.iv, hex(rfc_server_iv())))
+    // The whole encrypted flight, opened.
+    let opened = tls13.open_record(keys, 0, hex(rfc_flight_record())) ??
+    (0, bytes_of([]))
+    say(f, "and the server's encrypted flight decrypts to what it sent",
+        opened.0 == 22 and same(opened.1, hex(rfc_flight_plain())))
+    let messages = (tlshandshake.split_messages(opened.1) ?? ([], 0)).0
+    say(f, "which is four messages: extensions, certificate, proof, finish",
+        messages.len() == 4 and messages[0].kind == 8 and
+        messages[1].kind == 11 and messages[2].kind == 15 and
+        messages[3].kind == 20)
+    // The certificate chain and the signature over the transcript.
+    let chain = tlshandshake.certificate_chain(messages[1].body) ?? []
+    say(f, "the certificate message carries a chain, leaf first",
+        chain.len() == 1 and chain[0].len() == 432)
+    let signature = tlshandshake.certificate_verify(messages[2].body) ??
+    (0, bytes_of([]))
+    say(f, "and the proof names its scheme beside the signature",
+        signature.0 == tlshandshake.scheme_rsa_pss_rsae_sha256() and
+        signature.1.len() == 128)
+}
+
+fn check_verify_content(inout f: i64) / {io} {
+    print("-- what the signature is over, and why it is not the transcript")
+    let content = tlshandshake.verify_content(hex(rfc_cv_hash()), true)
+    say(f, "sixty-four spaces come first, so a 1.2 signature cannot fit",
+        content.len() == 130 and content.at(0) == 32 and
+        content.at(63) == 32)
+    say(f, "then the context string, which keeps client and server apart",
+        tlshandshake.to_hex(slice(content, 64, 33)) ==
+        tlshandshake.to_hex("TLS 1.3, server CertificateVerify".to_bytes()))
+    say(f, "a zero byte separates it from the hash that follows",
+        content.at(97) == 0 and same(slice(content, 98, 32),
+            hex(rfc_cv_hash())))
+    let client_side = tlshandshake.verify_content(hex(rfc_cv_hash()), false)
+    say(f, "and the client's differs in one word, which is the whole point",
+        not same(content, client_side) and client_side.len() == 130)
+}
+
+// ------------------------------------------------------ the three checks
+
+fn check_verification(inout f: i64) / {io} {
+    print("-- tlsverify: chain, name, signature, and none of them optional")
+    let leaf = hex(rfc_leaf())
+    let hash = hex(rfc_cv_hash())
+    let message = hex(rfc_cv_message())
+    let body = (tlshandshake.split_messages(message) ?? ([], 0)).0[0].body
+    let signature = tlshandshake.certificate_verify(body) ??
+    (0, bytes_of([]))
+    // The RFC's own certificate has a 1024-bit key, which no policy written
+    // this decade accepts. Refusing it is the correct answer and the reason
+    // the signature in the published trace cannot be checked here.
+    say(f, "a key below the minimum is refused before it is used",
+        signature_refused(leaf, signature.0, signature.1, hash))
+    // Which scheme goes with which digest, and which have a verifier.
+    say(f, "each scheme names its digest, spelled the rsa package's way",
+        (tlsverify.hash_for_scheme(2052) ?? "") == "SHA256" and
+        (tlsverify.hash_for_scheme(2053) ?? "") == "SHA384" and
+        (tlsverify.hash_for_scheme(2054) ?? "") == "SHA512" and
+        (tlsverify.hash_for_scheme(1027) ?? "") == "SHA256")
+    say(f, "a scheme with no verifier is an error rather than a false",
+        scheme_refused(2055) and scheme_refused(513))
+    say(f, "the three PSS schemes are recognised as such",
+        tlsverify.is_pss(2052) and tlsverify.is_pss(2054) and
+        not tlsverify.is_pss(1027) and not tlsverify.is_pss(1025))
+    // A client should offer only what it can check.
+    say(f, "and the handshake layer agrees about which those are",
+        tlshandshake.scheme_is_verifiable(2052) and
+        tlshandshake.scheme_is_verifiable(1027) and
+        not tlshandshake.scheme_is_verifiable(2055))
+    // Each of the three checks refuses on its own.
+    let empty: [bytes] = []
+    say(f, "no certificate at all is refused, and says so",
+        tlsverify.describe(empty, [], "example.com", 2052, bytes_of([]),
+            hash, 1788000000).reason.contains("no certificate"))
+    say(f, "a certificate that is not one is refused before anything else",
+        not tlsverify.describe([hex("3003020101")], [], "example.com",
+            2052, bytes_of([]), hash, 1788000000).trusted)
+    say(f, "and a chain with no root to reach is refused as untrusted",
+        tlsverify.describe([leaf], [], "example.com", 2052, bytes_of([]),
+            hash, 1788000000).reason.contains("trusted root"))
+    // The RFC's own certificate is `CN=rsa` with no subject alternative
+    // name at all, so it matches no host: the Common Name is not read here,
+    // which browsers stopped doing in 2017 and which is why this refuses a
+    // certificate whose subject is the very name being asked for.
+    let by_name = tlsverify.describe([leaf], [leaf], "rsa", 2052,
+        bytes_of([]), hash, 1471000000)
+    say(f, "a certificate with no SAN matches nothing, Common Name or not",
+        not by_name.trusted and
+        by_name.reason.contains("does not carry rsa"))
+    // The order of the three checks shows in which refusal comes back: the
+    // name is checked before the signature, so a certificate that fails
+    // both says so about the name.
+    say(f, "and the first failure is the one reported, in check order",
+        not by_name.reason.contains("signature"))
+}
+
+fn signature_refused(leaf: bytes, scheme: i64, signature: bytes,
+    hash: bytes) -> bool {
+    match tlsverify.check_signature(leaf, scheme, signature, hash) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn scheme_refused(scheme: i64) -> bool {
+    match tlsverify.hash_for_scheme(scheme) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn main() / {io} {
+    var f = 0
+    check_framing(f)
+    check_hello(f)
+    check_schedule(f)
+    check_verify_content(f)
+    check_verification(f)
+    if f == 0 {
+        print("tls: every claim held")
+    } else {
+        print("tls: {f} claims failed")
+    }
+}

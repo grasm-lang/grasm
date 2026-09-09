@@ -1,0 +1,26 @@
+[package]
+name = "tlsclient"
+version = "1.0.0"
+
+# A socket, and the operating system's randomness for the key share.
+capabilities = ["net", "io"]
+
+[dependencies.tlshandshake]
+path = "../tlshandshake"
+version = "^1.0.0"
+
+[dependencies.tlsverify]
+path = "../tlsverify"
+version = "^1.0.0"
+
+[dependencies.tls13]
+path = "../tls13"
+version = "^1.0.0"
+
+[dependencies.x25519]
+path = "../x25519"
+version = "^1.0.0"
+
+[dependencies.crypto_hash]
+path = "../crypto_hash"
+version = "^1.0.0"

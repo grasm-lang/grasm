@@ -1,0 +1,66 @@
+// One TLS handshake, driven from the command line, so a shell script can run
+// it against a real server and check the answer.
+//
+// Arguments: the port, a file holding the trust store as DER, the name to
+// connect to and verify against, and the moment to check the validity window
+// at — the clock is an argument because a gate that tests an expired
+// certificate cannot wait for one to expire. It prints
+// one line: `verified`, or the reason it refused. A gate compares that with
+// what the case was meant to prove.
+import tlsclient
+
+fn main() / {net, io} {
+    let port = arg(0).parse_int() ?? 0
+    let root_path = arg(1)
+    let name = arg(2)
+    let now = arg(3).parse_int() ?? 0
+    var roots: [bytes] = []
+    if root_path != "" {
+        let root = read_bytes(root_path) ?? bytes_of([])
+        if root.len() > 0 {
+            roots.push(root)
+        }
+    }
+    match tlsclient.connect(name, port, roots, ["http/1.1"], now) {
+        Ok(c) -> {
+            var conn = c
+            let session = tlsclient.session_of(conn)
+            let sent = tlsclient.write(conn, "ping\n".to_bytes()) ?? false
+            var reply = ""
+            match tlsclient.read(conn) {
+                Ok(data) -> reply = text_of(data).trim()
+                Err(_e) -> reply = "<none>"
+            }
+            tlsclient.close(conn)
+            print("verified|" + session.names.join(",") + "|" +
+                "{session.scheme}|" + conn.protocol + "|{sent}|" + reply)
+        }
+        Err(why) -> {
+            match why {
+                Refused(text) -> print("refused|" + text)
+                HandshakeFailed(text) -> print("handshake|" + text)
+                NotVerified(text) -> print("unverified|" + text)
+                Closed() -> print("closed|")
+                Protocol(text) -> print("protocol|" + text)
+            }
+        }
+    }
+}
+
+fn arg(index: i64) -> str / {io} {
+    let all = args()
+    if index < all.len() {
+        return all[index]
+    }
+    return ""
+}
+
+fn text_of(data: bytes) -> str {
+    var out = ""
+    var i = 0
+    while i < data.len() {
+        out = out + data.at(i).to_char()
+        i = i + 1
+    }
+    return out
+}

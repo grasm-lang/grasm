@@ -1,0 +1,314 @@
+// Is this the server you asked for? The half of TLS that is not
+// cryptography.
+//
+// `tls13` derives the keys and `tlshandshake` builds the messages, and
+// between them they will happily complete a handshake with anybody at all.
+// What turns that into a connection to a *named* server is this: three
+// checks, in an order that matters, on the certificate the server sent.
+//
+//   1. The chain. The leaf is signed by an intermediate, which is signed by
+//      another, up to a certificate the trust store already holds. Every
+//      link's signature is checked and every certificate's validity window
+//      must contain the moment of the check.
+//   2. The name. The leaf must carry the host asked for, in a subject
+//      alternative name — not in the Common Name, which browsers stopped
+//      reading in 2017 and which this package will not read either.
+//   3. The signature in CertificateVerify, made by the leaf's own key over
+//      the transcript. Without it, an attacker who has *any* valid
+//      certificate can replay somebody else's chain.
+//
+// Any one of the three left out makes the other two worthless, and the third
+// is the one most often forgotten because a handshake completes without it.
+//
+// ## Why the order is what it is
+//
+// The signature check is last because it is the expensive one and because it
+// is meaningless before the key it uses is known to belong to the right
+// party. Checking it first — which is the natural way to write it, since the
+// message arrives last — spends an RSA operation on a certificate that might
+// be about to fail on its dates.
+//
+// ## What is not here
+//
+// Revocation. A certificate can be valid, well-named, correctly signed, and
+// revoked an hour ago; `crl` and `ocsp` in this package set read those
+// answers, and deciding what to do when the answer does not arrive is a
+// policy question rather than a parsing one.
+
+import tlshandshake
+import certchain
+import hostmatch
+import rsa
+import x509
+import p256
+import crypto_hash
+
+type TlsError =
+    | NoCertificates()
+    | BadCertificate(why: str)
+    | UntrustedChain(why: str)
+    | WrongHost(host: str)
+    | BadSignature(scheme: i64)
+    | UnsupportedScheme(scheme: i64)
+    | Expired(subject: str)
+
+    /// What a verification decided, and why.
+type TlsSession = {
+    trusted: bool,
+    /// The names the leaf certificate carries.
+    names: [str],
+    /// The subjects of the path, leaf first.
+    path: [str],
+    /// The scheme the server signed with.
+    scheme: i64,
+    reason: str,
+}
+
+/// Whether a signature scheme is one this can check, and with what hash.
+///
+/// A client should offer only these: a server that picks a scheme with no
+/// verifier behind it produces a handshake that fails at the last message,
+/// which is a worse failure than not offering it.
+pub fn hash_for_scheme(scheme: i64) -> str ! TlsError {
+    // The names are `rsa`'s own constants, spelled its way. Passing
+    // "sha256" instead of "SHA256" is a silent verification failure rather
+    // than an error: the digest lookup fails, the verifier returns false,
+    // and the connection is refused with a message about the signature.
+    if scheme == tlshandshake.scheme_rsa_pss_rsae_sha256() or
+    scheme == tlshandshake.scheme_rsa_pkcs1_sha256() or
+    scheme == tlshandshake.scheme_ecdsa_p256_sha256() {
+        return rsa.SHA256
+    }
+    if scheme == tlshandshake.scheme_rsa_pss_rsae_sha384() {
+        return rsa.SHA384
+    }
+    if scheme == tlshandshake.scheme_rsa_pss_rsae_sha512() {
+        return rsa.SHA512
+    }
+    fail(UnsupportedScheme(scheme))
+}
+
+/// Whether a scheme is one of the RSA-PSS ones.
+pub fn is_pss(scheme: i64) -> bool {
+    return scheme == tlshandshake.scheme_rsa_pss_rsae_sha256() or
+    scheme == tlshandshake.scheme_rsa_pss_rsae_sha384() or
+    scheme == tlshandshake.scheme_rsa_pss_rsae_sha512()
+}
+
+/// Check the signature in a CertificateVerify against the leaf's key.
+///
+/// The message signed is not the transcript but the fixed context string,
+/// then a zero, then the transcript's hash — see `tlshandshake.verify_content`
+/// for why each part is there.
+pub fn check_signature(leaf_der: bytes, scheme: i64, signature: bytes,
+    transcript_hash: bytes) -> bool ! TlsError {
+    let content = tlshandshake.verify_content(transcript_hash, true)
+    if scheme == tlshandshake.scheme_ecdsa_p256_sha256() {
+        return try check_ecdsa(leaf_der, signature, content)
+    }
+    let hash = try hash_for_scheme(scheme)
+    var key = rsa.no_key()
+    match certchain.parse(leaf_der) {
+        Ok(facts) -> {
+            match certchain.public_key_der(facts) {
+                Ok(spki) -> {
+                    match rsa.parse_spki(spki) {
+                        Ok(parsed) -> key = parsed
+                        Err(_e) -> fail(BadCertificate("not an RSA key"))
+                    }
+                }
+                Err(_e) -> fail(BadCertificate("no public key"))
+            }
+        }
+        Err(_e) -> fail(BadCertificate("not a certificate"))
+    }
+    if not rsa.is_strong_enough(key) {
+        fail(BadCertificate("the key is too small"))
+    }
+    if is_pss(scheme) {
+        // The salt is the digest's own length, which is what TLS 1.3
+        // requires and what makes the scheme name enough to verify by.
+        return rsa.verify_pss(key, hash, content, signature,
+            rsa.digest_length(hash) ?? 32)
+    }
+    return rsa.verify_pkcs1(key, hash, content, signature)
+}
+
+fn check_ecdsa(leaf_der: bytes, signature: bytes,
+    content: bytes) -> bool ! TlsError {
+    // An ECDSA signature in TLS is a DER SEQUENCE of two INTEGERs, not the
+    // fixed-width pair the curve code wants, and the curve code wants a
+    // number rather than bytes — three representations of the same two
+    // integers, and getting any of them wrong reads as a bad signature
+    // rather than as an error.
+    let pair = try der_signature(signature)
+    match x509.parse(leaf_der) {
+        Ok(cert) -> {
+            let digest = crypto_hash.sha256_of(content)
+            return p256.verify(cert.key_x, cert.key_y,
+                p256.from_bytes(digest), p256.from_bytes(pair.0),
+                p256.from_bytes(pair.1))
+        }
+        Err(_e) -> fail(BadCertificate("not a certificate"))
+    }
+}
+
+/// The two integers of a DER-encoded ECDSA signature, each as thirty-two
+/// big-endian bytes.
+fn der_signature(signature: bytes) -> (bytes, bytes) ! TlsError {
+    if signature.len() < 8 or signature.at(0) != 48 {
+        fail(BadSignature(tlshandshake.scheme_ecdsa_p256_sha256()))
+    }
+    var at = 2
+    if signature.at(1) >= 128 {
+        at = 2 + (signature.at(1) - 128)
+    }
+    if signature.at(at) != 2 {
+        fail(BadSignature(tlshandshake.scheme_ecdsa_p256_sha256()))
+    }
+    let r_len = signature.at(at + 1)
+    let r = aligned(signature, at + 2, r_len)
+    let s_at = at + 2 + r_len
+    if s_at + 1 >= signature.len() or signature.at(s_at) != 2 {
+        fail(BadSignature(tlshandshake.scheme_ecdsa_p256_sha256()))
+    }
+    let s_len = signature.at(s_at + 1)
+    return (r, aligned(signature, s_at + 2, s_len))
+}
+
+/// A DER integer as thirty-two big-endian bytes.
+///
+/// DER writes a leading zero when the top bit would make the number look
+/// negative, and writes fewer bytes for a small one, so the value is
+/// right-aligned rather than assumed to fill the field.
+fn aligned(data: bytes, at: i64, length: i64) -> bytes {
+    var out: [i64] = []
+    var i = 0
+    while i < 32 {
+        out.push(0)
+        i = i + 1
+    }
+    var from = at
+    var count = length
+    while count > 32 and from < data.len() {
+        from = from + 1
+        count = count - 1
+    }
+    var j = 0
+    while j < count and from + j < data.len() {
+        out[32 - count + j] = data.at(from + j)
+        j = j + 1
+    }
+    return bytes_of(out)
+}
+
+/// Verify a chain, a name and a signature, in that order.
+///
+/// `now_seconds` is passed in rather than read, because a package that reads
+/// the clock cannot be used where the clock is the thing under test — and
+/// because a verifier whose answer depends on an unstated input is a
+/// verifier nobody can reproduce.
+pub fn verify(chain: [bytes], roots: [bytes], host: str, scheme: i64,
+    signature: bytes, transcript_hash: bytes,
+    now_seconds: i64) -> TlsSession ! TlsError {
+    if chain.len() == 0 {
+        fail(NoCertificates())
+    }
+    var facts: [CertFacts] = []
+    for der in chain {
+        match certchain.parse(der) {
+            Ok(one) -> facts.push(one)
+            Err(_e) -> fail(BadCertificate("a certificate did not parse"))
+        }
+    }
+    var root_facts: [CertFacts] = []
+    for der in roots {
+        match certchain.parse(der) {
+            Ok(one) -> root_facts.push(one)
+            Err(_e) -> fail(BadCertificate("a root did not parse"))
+        }
+    }
+    let leaf = facts[0]
+    // 1. the chain.
+    var pool: [CertFacts] = []
+    var i = 1
+    while i < facts.len() {
+        pool.push(facts[i])
+        i = i + 1
+    }
+    var path: [CertFacts] = []
+    match certchain.build_path(leaf, pool, root_facts) {
+        Ok(found) -> path = found
+        Err(_e) -> fail(UntrustedChain("no path from the leaf to a " +
+            "trusted root"))
+    }
+    if path.len() == 0 {
+        fail(UntrustedChain("no path from the leaf to a trusted root"))
+    }
+    if not certchain.ends_at_root(path, root_facts) {
+        fail(UntrustedChain("the path does not end at a trusted root"))
+    }
+    for one in path {
+        if not certchain.is_valid_at(one, now_seconds) {
+            fail(Expired(one.subject))
+        }
+    }
+    // 2. the name.
+    if not hostmatch.matches_any(leaf.dns_names, host) {
+        if not hostmatch.matches_any(leaf.ip_names, host) {
+            fail(WrongHost(host))
+        }
+    }
+    // 3. the signature over the transcript.
+    if not try check_signature(chain[0], scheme, signature,
+        transcript_hash) {
+        fail(BadSignature(scheme))
+    }
+    return TlsSession{ trusted: true, names: leaf.dns_names,
+        path: certchain.subjects(path), scheme: scheme,
+        reason: "chain, name and signature all check out" }
+}
+
+/// The same, reporting rather than failing.
+///
+/// A caller that is going to refuse the connection either way wants the
+/// error; one that is going to show a person why wants all three answers,
+/// and the difference between "expired yesterday" and "wrong host" is the
+/// difference between a warning worth clicking through and one that is not.
+pub fn describe(chain: [bytes], roots: [bytes], host: str, scheme: i64,
+    signature: bytes, transcript_hash: bytes,
+    now_seconds: i64) -> TlsSession {
+    match verify(chain, roots, host, scheme, signature, transcript_hash,
+        now_seconds) {
+        Ok(session) -> return session
+        Err(why) -> {
+            // The scheme is carried through a refusal too: "the signature
+            // does not check" and "the signature does not check, and it was
+            // scheme 1283" are different amounts of help.
+            match why {
+                NoCertificates() -> return refused("the server sent no " +
+                    "certificate")
+                BadCertificate(text) -> return refused(text)
+                UntrustedChain(text) -> return refused(text)
+                WrongHost(name) -> return refused("the certificate does " +
+                    "not carry " + name)
+                BadSignature(s) -> return refused_with(s,
+                    "the signature over the transcript does not check")
+                UnsupportedScheme(s) -> return refused_with(s,
+                    "signature scheme {s} has no verifier here")
+                Expired(subject) -> return refused(subject +
+                    " is outside its validity window")
+            }
+        }
+    }
+}
+
+fn refused(reason: str) -> TlsSession {
+    return TlsSession{ trusted: false, names: [], path: [], scheme: 0,
+        reason: reason }
+}
+
+fn refused_with(scheme: i64, reason: str) -> TlsSession {
+    return TlsSession{ trusted: false, names: [], path: [], scheme: scheme,
+        reason: reason }
+}

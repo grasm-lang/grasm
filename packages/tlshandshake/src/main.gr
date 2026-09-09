@@ -1,0 +1,748 @@
+// The TLS 1.3 handshake, as messages rather than as a connection.
+//
+// `tls13` in this package set has the key schedule and the record
+// protection, and says plainly that it is not a client. This is the layer
+// above: the messages themselves — what a ClientHello is made of, what comes
+// back, and where in all that the server's identity actually lives. It still
+// opens no socket. A client is this plus a socket plus certificate
+// verification, and separating them is what lets the message layer be
+// checked against RFC 8448's published byte-for-byte trace without a network
+// anywhere near the test.
+//
+// ## What the handshake is for, in one paragraph
+//
+// Both sides send a key share, derive the same secret from them, and switch
+// to encryption after two messages. Everything after the ServerHello is
+// encrypted — including the server's certificate, which in TLS 1.2 went over
+// the wire in the clear for anyone to log. The server then signs the
+// transcript with the key its certificate names, and that signature is the
+// only thing in the protocol that says who you are talking to.
+//
+// ## The three lengths, and why they are all different
+//
+// A record has a three-byte header and a two-byte length. A handshake
+// message has a one-byte type and a *three-byte* length. An extension has a
+// two-byte type and a two-byte length. One handshake message can span
+// several records, several can share one record, and a reader that assumes
+// otherwise works against every implementation until it meets the one that
+// fragments.
+//
+// ## The middlebox theatre
+//
+// A TLS 1.3 ClientHello claims to be TLS 1.2 in its version field, carries a
+// fake session id, and is usually followed by a change_cipher_spec record
+// that means nothing. All three exist because middleboxes on the public
+// internet drop anything that does not look like TLS 1.2. The real version
+// is in an extension, where the middleboxes do not look.
+//
+// ## Where the identity is
+//
+// `CertificateVerify` holds a signature over a fixed context string, the
+// literal `"TLS 1.3, server CertificateVerify"`, and the transcript hash.
+// The context string is what stops a signature made for a client
+// certificate, or by some other protocol that signs with the same key, being
+// replayed as a server's. Checking that signature — against a certificate
+// chain that a trust store accepts, for a name that matches the host asked
+// for — is the whole of authentication, and none of it happens here.
+
+import tls13
+
+type HsError =
+    | Truncated(at: i64)
+    | BadLength(field: str, length: i64)
+    | UnexpectedMessage(kind: i64)
+    | NoSuchExtension(kind: i64)
+    | UnsupportedVersion(version: i64)
+    | HelloRetry()
+
+    /// One handshake message: its type and its body, without the four-byte
+    /// header.
+type HandshakeMessage = {
+    kind: i64,
+    body: bytes,
+}
+
+/// One record: its content type, its version field, and its payload.
+type TlsRecord = {
+    content_type: i64,
+    version: i64,
+    payload: bytes,
+}
+
+/// An extension, as it appears in a hello.
+type Extension = {
+    kind: i64,
+    body: bytes,
+}
+
+/// What a ClientHello is made of.
+///
+/// The extensions are given in the order they will be written, because the
+/// order is part of the bytes and two clients that choose differently are
+/// distinguishable from each other — which is what fingerprinting a TLS
+/// client means.
+type ClientHelloParts = {
+    random: bytes,
+    session_id: bytes,
+    cipher_suites: [i64],
+    extensions: [Extension],
+}
+
+/// What came back.
+type ServerHelloParts = {
+    random: bytes,
+    session_id: bytes,
+    cipher_suite: i64,
+    /// The group and the server's share, from the key_share extension.
+    group: i64,
+    key_share: bytes,
+    /// The version the supported_versions extension names, which is the
+    /// real one.
+    version: i64,
+    extensions: [Extension],
+}
+
+// -------------------------------------------------------- message types
+
+pub fn hs_client_hello() -> i64 { 1 }
+
+pub fn hs_server_hello() -> i64 { 2 }
+
+pub fn hs_new_session_ticket() -> i64 { 4 }
+
+pub fn hs_end_of_early_data() -> i64 { 5 }
+
+pub fn hs_encrypted_extensions() -> i64 { 8 }
+
+pub fn hs_certificate() -> i64 { 11 }
+
+pub fn hs_certificate_request() -> i64 { 13 }
+
+pub fn hs_certificate_verify() -> i64 { 15 }
+
+pub fn hs_finished() -> i64 { 20 }
+
+pub fn content_change_cipher_spec() -> i64 { 20 }
+
+/// The random value a HelloRetryRequest carries instead of a real one.
+///
+/// A retry is a ServerHello with this exact random, which is the SHA-256 of
+/// the string "HelloRetryRequest". Distinguishing it any other way — by the
+/// extensions it carries, say — is what implementations did before this was
+/// specified, and they disagreed.
+pub fn hello_retry_random() -> bytes {
+    return from_hex("cf21ad74e59a6111be1d8c021e65b891" +
+        "c2a211167abb8c5e079e09e2c8a8339c")
+}
+
+// ------------------------------------------------------ bytes and lengths
+
+/// Bytes from a hexadecimal string, which is how every vector in the
+/// specification is written.
+pub fn from_hex(text: str) -> bytes {
+    var out: [i64] = []
+    var i = 0
+    while i + 1 < text.len() {
+        out.push(text.substr(i, 2).parse_int_base(16) ?? 0)
+        i = i + 2
+    }
+    return bytes_of(out)
+}
+
+/// The hexadecimal of some bytes, lower case and unspaced.
+pub fn to_hex(data: bytes) -> str {
+    let digits = "0123456789abcdef"
+    var out = ""
+    var i = 0
+    while i < data.len() {
+        out = out + digits.substr(data.at(i) / 16, 1) +
+        digits.substr(data.at(i) % 16, 1)
+        i = i + 1
+    }
+    return out
+}
+
+fn push_bytes(inout out: [i64], data: bytes) {
+    var i = 0
+    while i < data.len() {
+        out.push(data.at(i))
+        i = i + 1
+    }
+}
+
+fn push_be(inout out: [i64], value: i64, width: i64) {
+    var i = width - 1
+    while i >= 0 {
+        out.push(value.ushr(i * 8).bit_and(255))
+        i = i - 1
+    }
+}
+
+fn read_be(data: bytes, at: i64, width: i64) -> i64 ! HsError {
+    if at + width > data.len() {
+        fail(Truncated(at))
+    }
+    var value = 0
+    var i = 0
+    while i < width {
+        value = value * 256 + data.at(at + i)
+        i = i + 1
+    }
+    return value
+}
+
+fn slice_of(data: bytes, at: i64, length: i64) -> bytes ! HsError {
+    if at + length > data.len() or length < 0 {
+        fail(Truncated(at))
+    }
+    var out: [i64] = []
+    var i = 0
+    while i < length {
+        out.push(data.at(at + i))
+        i = i + 1
+    }
+    return bytes_of(out)
+}
+
+// -------------------------------------------------------- record framing
+
+/// A record: type, version, two-byte length, payload.
+pub fn record_of(content_type: i64, version: i64,
+    payload: bytes) -> bytes ! HsError {
+    if payload.len() > 16384 + 256 {
+        fail(BadLength("record", payload.len()))
+    }
+    var out: [i64] = []
+    out.push(content_type)
+    push_be(out, version, 2)
+    push_be(out, payload.len(), 2)
+    push_bytes(out, payload)
+    return bytes_of(out)
+}
+
+/// Every whole record in a buffer, and how many bytes were consumed.
+///
+/// A partial record at the end is left alone rather than failing: a reader
+/// on a socket has half a record more often than not, and the caller's job
+/// is to read more, not to give up.
+pub fn split_records(data: bytes) -> ([TlsRecord], i64) ! HsError {
+    var out: [TlsRecord] = []
+    var at = 0
+    while at + 5 <= data.len() {
+        let length = try read_be(data, at + 3, 2)
+        if at + 5 + length > data.len() {
+            return (out, at)
+        }
+        out.push(TlsRecord{ content_type: data.at(at),
+            version: try read_be(data, at + 1, 2),
+            payload: try slice_of(data, at + 5, length) })
+        at = at + 5 + length
+    }
+    return (out, at)
+}
+
+/// The inner plaintext a TLS 1.3 record protects: the payload, the real
+/// content type, then any padding.
+///
+/// The content type moves inside the encryption so that an observer cannot
+/// tell a handshake record from an application one, and the padding is there
+/// so they cannot count the bytes either. Both are free and both were
+/// impossible in TLS 1.2.
+pub fn inner_plaintext(content_type: i64, payload: bytes,
+    padding: i64) -> bytes {
+    var out: [i64] = []
+    push_bytes(out, payload)
+    out.push(content_type)
+    var i = 0
+    while i < padding {
+        out.push(0)
+        i = i + 1
+    }
+    return bytes_of(out)
+}
+
+/// The payload and real content type of a decrypted record.
+///
+/// The padding is zeros at the end, and the content type is the last byte
+/// that is not one of them. A record of nothing but zeros has no content
+/// type and is an error rather than an empty message.
+pub fn strip_inner(plaintext: bytes) -> (i64, bytes) ! HsError {
+    var at = plaintext.len() - 1
+    while at >= 0 and plaintext.at(at) == 0 {
+        at = at - 1
+    }
+    if at < 0 {
+        fail(BadLength("inner plaintext", plaintext.len()))
+    }
+    return (plaintext.at(at), try slice_of(plaintext, 0, at))
+}
+
+// --------------------------------------------------- handshake messages
+
+/// A handshake message: one type byte, a three-byte length, the body.
+pub fn message_of(kind: i64, body: bytes) -> bytes ! HsError {
+    if body.len() >= 16777216 {
+        fail(BadLength("handshake body", body.len()))
+    }
+    var out: [i64] = []
+    out.push(kind)
+    push_be(out, body.len(), 3)
+    push_bytes(out, body)
+    return bytes_of(out)
+}
+
+/// Every whole handshake message in a buffer, and how many bytes were used.
+///
+/// One message can span several records and several can share one, so the
+/// caller concatenates record payloads and calls this on the result.
+pub fn split_messages(data: bytes) -> ([HandshakeMessage], i64) ! HsError {
+    var out: [HandshakeMessage] = []
+    var at = 0
+    while at + 4 <= data.len() {
+        let length = try read_be(data, at + 1, 3)
+        if at + 4 + length > data.len() {
+            return (out, at)
+        }
+        out.push(HandshakeMessage{ kind: data.at(at),
+            body: try slice_of(data, at + 4, length) })
+        at = at + 4 + length
+    }
+    return (out, at)
+}
+
+// ------------------------------------------------------------ extensions
+
+pub fn ext_server_name() -> i64 { 0 }
+
+pub fn ext_supported_groups() -> i64 { 10 }
+
+pub fn ext_signature_algorithms() -> i64 { 13 }
+
+pub fn ext_alpn() -> i64 { 16 }
+
+pub fn ext_record_size_limit() -> i64 { 28 }
+
+pub fn ext_session_ticket() -> i64 { 35 }
+
+pub fn ext_supported_versions() -> i64 { 43 }
+
+pub fn ext_psk_key_exchange_modes() -> i64 { 45 }
+
+pub fn ext_key_share() -> i64 { 51 }
+
+pub fn ext_renegotiation_info() -> i64 { 65281 }
+
+pub fn group_x25519() -> i64 { 29 }
+
+pub fn group_secp256r1() -> i64 { 23 }
+
+pub fn suite_aes_128_gcm_sha256() -> i64 { 4865 }
+
+pub fn suite_chacha20_poly1305_sha256() -> i64 { 4867 }
+
+pub fn suite_aes_256_gcm_sha384() -> i64 { 4866 }
+
+/// The name of the host being reached, which the server needs before it can
+/// choose a certificate.
+///
+/// It goes out in the clear, so it is the one part of a TLS 1.3 handshake
+/// that still tells an observer which site is being visited. Encrypting it
+/// is a separate extension and a separate argument.
+pub fn server_name_extension(host: str) -> Extension {
+    var inner: [i64] = []
+    inner.push(0)
+    push_be(inner, host.len(), 2)
+    push_bytes(inner, host.to_bytes())
+    var out: [i64] = []
+    push_be(out, inner.len(), 2)
+    push_bytes(out, bytes_of(inner))
+    return Extension{ kind: ext_server_name(), body: bytes_of(out) }
+}
+
+/// The versions the client will accept, newest first.
+///
+/// This is where the real version lives. The version field in the hello
+/// itself says TLS 1.2 whatever this says, because a middlebox that sees
+/// anything else in that field drops the connection.
+pub fn supported_versions_extension(versions: [i64]) -> Extension {
+    var out: [i64] = []
+    out.push(versions.len() * 2)
+    for version in versions {
+        push_be(out, version, 2)
+    }
+    return Extension{ kind: ext_supported_versions(), body: bytes_of(out) }
+}
+
+/// The groups the client can do a key exchange in.
+pub fn supported_groups_extension(groups: [i64]) -> Extension {
+    var out: [i64] = []
+    push_be(out, groups.len() * 2, 2)
+    for group in groups {
+        push_be(out, group, 2)
+    }
+    return Extension{ kind: ext_supported_groups(), body: bytes_of(out) }
+}
+
+/// A key share the client has already generated.
+///
+/// TLS 1.3 sends the share in the first message rather than waiting to be
+/// told which group to use. That is what makes it a one round trip
+/// handshake, and the cost is a guess: guess wrong and the server sends a
+/// HelloRetryRequest and it becomes two.
+pub fn key_share_extension(group: i64, share: bytes) -> Extension {
+    var entry: [i64] = []
+    push_be(entry, group, 2)
+    push_be(entry, share.len(), 2)
+    push_bytes(entry, share)
+    var out: [i64] = []
+    push_be(out, entry.len(), 2)
+    push_bytes(out, bytes_of(entry))
+    return Extension{ kind: ext_key_share(), body: bytes_of(out) }
+}
+
+/// The signature algorithms the client will accept in CertificateVerify.
+///
+/// A server signs with one of these and no other, so a client that leaves
+/// out the algorithm its trust store's roots actually use gets a handshake
+/// failure rather than a bad signature.
+pub fn signature_algorithms_extension(algorithms: [i64]) -> Extension {
+    var out: [i64] = []
+    push_be(out, algorithms.len() * 2, 2)
+    for algorithm in algorithms {
+        push_be(out, algorithm, 2)
+    }
+    return Extension{ kind: ext_signature_algorithms(),
+        body: bytes_of(out) }
+}
+
+/// The application protocols the client offers, in order of preference.
+pub fn alpn_extension(protocols: [str]) -> Extension {
+    var inner: [i64] = []
+    for protocol in protocols {
+        inner.push(protocol.len())
+        push_bytes(inner, protocol.to_bytes())
+    }
+    var out: [i64] = []
+    push_be(out, inner.len(), 2)
+    push_bytes(out, bytes_of(inner))
+    return Extension{ kind: ext_alpn(), body: bytes_of(out) }
+}
+
+/// Which pre-shared-key modes the client supports; 1 is "with a key
+/// exchange", which is the only one worth offering.
+pub fn psk_modes_extension(modes: [i64]) -> Extension {
+    var out: [i64] = []
+    out.push(modes.len())
+    for mode in modes {
+        out.push(mode)
+    }
+    return Extension{ kind: ext_psk_key_exchange_modes(),
+        body: bytes_of(out) }
+}
+
+/// The largest record the client wants to receive.
+pub fn record_size_limit_extension(limit: i64) -> Extension {
+    var out: [i64] = []
+    push_be(out, limit, 2)
+    return Extension{ kind: ext_record_size_limit(), body: bytes_of(out) }
+}
+
+/// The empty renegotiation_info extension, which says "no renegotiation".
+///
+/// TLS 1.3 has no renegotiation at all, so this carries no information. It
+/// is here because servers that predate 1.3 refuse a hello without it.
+pub fn renegotiation_info_extension() -> Extension {
+    return Extension{ kind: ext_renegotiation_info(), body: bytes_of([0]) }
+}
+
+/// The empty session_ticket extension, for the same reason.
+pub fn session_ticket_extension() -> Extension {
+    return Extension{ kind: ext_session_ticket(), body: bytes_of([]) }
+}
+
+fn write_extensions(inout out: [i64], extensions: [Extension]) {
+    var inner: [i64] = []
+    for extension in extensions {
+        push_be(inner, extension.kind, 2)
+        push_be(inner, extension.body.len(), 2)
+        push_bytes(inner, extension.body)
+    }
+    push_be(out, inner.len(), 2)
+    push_bytes(out, bytes_of(inner))
+}
+
+/// The extensions in a block, read in the order they appear.
+pub fn read_extensions(data: bytes,
+    at: i64) -> [Extension] ! HsError {
+    let total = try read_be(data, at, 2)
+    var out: [Extension] = []
+    var i = at + 2
+    let stop = at + 2 + total
+    while i + 4 <= stop {
+        let kind = try read_be(data, i, 2)
+        let length = try read_be(data, i + 2, 2)
+        out.push(Extension{ kind: kind,
+            body: try slice_of(data, i + 4, length) })
+        i = i + 4 + length
+    }
+    if i != stop {
+        fail(BadLength("extensions", total))
+    }
+    return out
+}
+
+/// One extension by type, or an error naming it.
+pub fn extension_of(extensions: [Extension],
+    kind: i64) -> bytes ! HsError {
+    for extension in extensions {
+        if extension.kind == kind {
+            return extension.body
+        }
+    }
+    fail(NoSuchExtension(kind))
+}
+
+// ---------------------------------------------------------------- hello
+
+/// A ClientHello body.
+///
+/// The version field is 0x0303 — TLS 1.2 — whatever version is really being
+/// asked for, and the compression list is one zero byte. Both are lies the
+/// protocol tells the network so that the handshake survives the middleboxes
+/// between here and the server.
+pub fn client_hello(parts: ClientHelloParts) -> bytes ! HsError {
+    if parts.random.len() != 32 {
+        fail(BadLength("random", parts.random.len()))
+    }
+    if parts.session_id.len() > 32 {
+        fail(BadLength("session id", parts.session_id.len()))
+    }
+    var out: [i64] = []
+    push_be(out, 771, 2)
+    push_bytes(out, parts.random)
+    out.push(parts.session_id.len())
+    push_bytes(out, parts.session_id)
+    push_be(out, parts.cipher_suites.len() * 2, 2)
+    for suite in parts.cipher_suites {
+        push_be(out, suite, 2)
+    }
+    out.push(1)
+    out.push(0)
+    write_extensions(out, parts.extensions)
+    return bytes_of(out)
+}
+
+/// A ServerHello read.
+///
+/// The version in the body is ignored in favour of the supported_versions
+/// extension, which is the only place a TLS 1.3 server says 1.3. A server
+/// that omits the extension is offering TLS 1.2, and a 1.3 client should
+/// stop rather than fall back.
+pub fn server_hello(body: bytes) -> ServerHelloParts ! HsError {
+    let random = try slice_of(body, 2, 32)
+    let session_length = try read_be(body, 34, 1)
+    let after_session = 35 + session_length
+    let suite = try read_be(body, after_session, 2)
+    let extensions = try read_extensions(body, after_session + 3)
+    if bytes_equal(random, hello_retry_random()) {
+        fail(HelloRetry())
+    }
+    var version = try read_be(body, 0, 2)
+    match extension_of(extensions, ext_supported_versions()) {
+        Ok(chosen) -> version = try read_be(chosen, 0, 2)
+        Err(_e) -> version = version
+    }
+    if version != 772 {
+        fail(UnsupportedVersion(version))
+    }
+    var group = 0
+    var share = bytes_of([])
+    match extension_of(extensions, ext_key_share()) {
+        Ok(entry) -> {
+            group = try read_be(entry, 0, 2)
+            share = try slice_of(entry, 4, try read_be(entry, 2, 2))
+        }
+        Err(_e) -> fail(NoSuchExtension(ext_key_share()))
+    }
+    return ServerHelloParts{ random: random,
+        session_id: try slice_of(body, 35, session_length),
+        cipher_suite: suite, group: group, key_share: share,
+        version: version, extensions: extensions }
+}
+
+/// Whether a ServerHello is a HelloRetryRequest rather than a real one.
+pub fn is_hello_retry(body: bytes) -> bool {
+    match slice_of(body, 2, 32) {
+        Ok(random) -> return bytes_equal(random, hello_retry_random())
+        Err(_e) -> return false
+    }
+}
+
+fn bytes_equal(a: bytes, b: bytes) -> bool {
+    if a.len() != b.len() {
+        return false
+    }
+    var i = 0
+    while i < a.len() {
+        if a.at(i) != b.at(i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// ------------------------------------------- what the server sends after
+
+/// The extensions in an EncryptedExtensions message.
+///
+/// Everything the server wants to say that is not needed to derive the keys
+/// goes here, where it is encrypted — ALPN most usefully, so an observer
+/// cannot tell HTTP/2 from HTTP/1.1 by watching the handshake.
+pub fn encrypted_extensions(body: bytes) -> [Extension] ! HsError {
+    return try read_extensions(body, 0)
+}
+
+/// The certificates in a Certificate message, leaf first.
+///
+/// Each entry carries its own extensions, which are almost always empty and
+/// must still be skipped. The context at the front is empty for a server and
+/// echoes the request for a client.
+pub fn certificate_chain(body: bytes) -> [bytes] ! HsError {
+    let context_length = try read_be(body, 0, 1)
+    let total = try read_be(body, 1 + context_length, 3)
+    var out: [bytes] = []
+    var at = 4 + context_length
+    let stop = at + total
+    while at + 3 <= stop {
+        let length = try read_be(body, at, 3)
+        out.push(try slice_of(body, at + 3, length))
+        let extensions = try read_be(body, at + 3 + length, 2)
+        at = at + 3 + length + 2 + extensions
+    }
+    if at != stop {
+        fail(BadLength("certificate list", total))
+    }
+    return out
+}
+
+/// The algorithm and signature in a CertificateVerify message.
+pub fn certificate_verify(body: bytes) -> (i64, bytes) ! HsError {
+    let algorithm = try read_be(body, 0, 2)
+    let length = try read_be(body, 2, 2)
+    return (algorithm, try slice_of(body, 4, length))
+}
+
+/// The bytes a CertificateVerify signature is over.
+///
+/// Sixty-four spaces, then a context string, then a zero byte, then the
+/// transcript hash. The spaces are there so that a signature made by a TLS
+/// 1.2 server — which signed a structure beginning with two randoms — can
+/// never be confused with one of these, and the context string is what keeps
+/// the client's and the server's signatures apart. Signing the transcript
+/// hash rather than the transcript is what makes the message a fixed size.
+pub fn verify_content(transcript_hash: bytes,
+    from_server: bool) -> bytes {
+    var out: [i64] = []
+    var i = 0
+    while i < 64 {
+        out.push(32)
+        i = i + 1
+    }
+    var label = "TLS 1.3, client CertificateVerify"
+    if from_server {
+        label = "TLS 1.3, server CertificateVerify"
+    }
+    push_bytes(out, label.to_bytes())
+    out.push(0)
+    push_bytes(out, transcript_hash)
+    return bytes_of(out)
+}
+
+/// The Finished body: an HMAC over the transcript with a key derived from
+/// the traffic secret.
+///
+/// It proves the sender holds the handshake keys and saw the same transcript
+/// — so an attacker who tampered with an earlier message produces a Finished
+/// the other side rejects, whatever else they managed.
+pub fn finished(traffic_secret: bytes, transcript_hash: bytes) -> bytes {
+    return tls13.finished_value(traffic_secret, transcript_hash)
+}
+
+/// The signature scheme codes a client is likely to want.
+pub fn scheme_ecdsa_p256_sha256() -> i64 { 1027 }
+
+pub fn scheme_rsa_pss_rsae_sha256() -> i64 { 2052 }
+
+pub fn scheme_rsa_pss_rsae_sha384() -> i64 { 2053 }
+
+pub fn scheme_rsa_pss_rsae_sha512() -> i64 { 2054 }
+
+pub fn scheme_ed25519() -> i64 { 2055 }
+
+pub fn scheme_rsa_pkcs1_sha256() -> i64 { 1025 }
+
+/// Whether a scheme is one this package set can actually check.
+///
+/// Offering a scheme with no verifier behind it is how a client ends up with
+/// a handshake it cannot finish: the server picks it, signs with it, and the
+/// client has to abort at the last message.
+pub fn scheme_is_verifiable(scheme: i64) -> bool {
+    return scheme == scheme_ecdsa_p256_sha256() or
+    scheme == scheme_rsa_pss_rsae_sha256() or
+    scheme == scheme_rsa_pss_rsae_sha384() or
+    scheme == scheme_rsa_pss_rsae_sha512() or
+    scheme == scheme_rsa_pkcs1_sha256()
+}
+
+/// A ClientHello with the extensions a working client needs, in a sensible
+/// order.
+///
+/// Offered: this host's name, TLS 1.3 only, x25519, the signature schemes
+/// with a verifier behind them, and the two middlebox-appeasing extensions
+/// without which a fair number of servers refuse to answer.
+pub fn default_hello(random: bytes, session_id: bytes, share: bytes,
+    host: str, protocols: [str]) -> ClientHelloParts {
+    var extensions: [Extension] = [server_name_extension(host),
+        renegotiation_info_extension(),
+        supported_groups_extension([group_x25519(), group_secp256r1()]),
+        session_ticket_extension(),
+        key_share_extension(group_x25519(), share),
+        supported_versions_extension([772]),
+        signature_algorithms_extension([scheme_ecdsa_p256_sha256(),
+            scheme_rsa_pss_rsae_sha256(), scheme_rsa_pss_rsae_sha384(),
+            scheme_rsa_pss_rsae_sha512(), scheme_rsa_pkcs1_sha256()]),
+        psk_modes_extension([1])]
+    if protocols.len() > 0 {
+        extensions.push(alpn_extension(protocols))
+    }
+    return ClientHelloParts{ random: random, session_id: session_id,
+        cipher_suites: [suite_aes_128_gcm_sha256(),
+            suite_chacha20_poly1305_sha256()], extensions: extensions }
+}
+
+/// The protocol the server chose from an ALPN offer, or the empty string.
+pub fn chosen_protocol(extensions: [Extension]) -> str {
+    match extension_of(extensions, ext_alpn()) {
+        Ok(body) -> {
+            match read_be(body, 2, 1) {
+                Ok(length) -> {
+                    match slice_of(body, 3, length) {
+                        Ok(name) -> {
+                            var out = ""
+                            var i = 0
+                            while i < name.len() {
+                                out = out + name.at(i).to_char()
+                                i = i + 1
+                            }
+                            return out
+                        }
+                        Err(_e) -> return ""
+                    }
+                }
+                Err(_e) -> return ""
+            }
+        }
+        Err(_e) -> return ""
+    }
+}

@@ -1,0 +1,34 @@
+[package]
+name = "tlsverify"
+version = "1.0.0"
+
+# Arithmetic and parsing. Opens nothing.
+capabilities = []
+
+[dependencies.tlshandshake]
+path = "../tlshandshake"
+version = "^1.0.0"
+
+[dependencies.certchain]
+path = "../certchain"
+version = "^1.0.0"
+
+[dependencies.hostmatch]
+path = "../hostmatch"
+version = "^1.0.0"
+
+[dependencies.rsa]
+path = "../rsa"
+version = "^1.0.0"
+
+[dependencies.x509]
+path = "../x509"
+version = "^1.0.0"
+
+[dependencies.p256]
+path = "../p256"
+version = "^1.0.0"
+
+[dependencies.crypto_hash]
+path = "../crypto_hash"
+version = "^1.0.0"

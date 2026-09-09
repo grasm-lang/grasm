@@ -1,0 +1,8 @@
+[package]
+name = "tlsdiff"
+version = "0.1.0"
+capabilities = ["net", "io"]
+
+[dependencies.tlsclient]
+path = "../tlsclient"
+version = "^1.0.0"

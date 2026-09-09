@@ -1,0 +1,11 @@
+[package]
+name = "tlshandshake"
+version = "1.0.0"
+
+# Bytes. Opens nothing: this package builds and reads handshake messages and
+# never touches a socket.
+capabilities = []
+
+[dependencies.tls13]
+path = "../tls13"
+version = "^1.0.0"

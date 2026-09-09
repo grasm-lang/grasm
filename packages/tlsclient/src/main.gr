@@ -1,0 +1,417 @@
+// A TLS 1.3 client: the handshake, over a socket, to a server whose identity
+// is checked.
+//
+// This is the package the rest of the roadmap waits on. Everything that
+// talks to a hosted service — every API client, every cloud SDK, every OAuth
+// provider — needs exactly this and cannot be written without it, because
+// they have all been HTTPS-only for years.
+//
+// It is assembled rather than implemented: `tls13` has the key schedule and
+// the record protection, `tlshandshake` has the messages, `tlsverify` has the
+// three checks that decide who you are talking to, and this drives them over
+// a socket in the right order. The ordering is the part worth reading.
+//
+// ## What the handshake does, as a sequence
+//
+//   1. Generate an x25519 key pair from the operating system's randomness.
+//      Not from a seeded generator: a predictable key share is a broken
+//      connection that looks exactly like a working one.
+//   2. Send a ClientHello carrying the public half.
+//   3. Read a ServerHello, take the server's share, derive the handshake
+//      secrets. Everything after this point is encrypted.
+//   4. Decrypt the server's flight: EncryptedExtensions, Certificate,
+//      CertificateVerify, Finished.
+//   5. **Verify.** Chain, name, signature. Before sending anything.
+//   6. Check the server's Finished against the transcript, then send the
+//      client's.
+//   7. Switch to application keys and start talking.
+//
+// Step 5 is the one that is easy to leave out and impossible to notice
+// missing: the connection works, the bytes flow, and there is nobody at the
+// other end who has proved anything.
+//
+// ## What this does not do
+//
+// Session resumption, 0-RTT, client certificates, key updates, or renegotia-
+// tion — which does not exist in 1.3. A connection that runs long enough to
+// need a key update will fail rather than continue with a stale key, which
+// is the honest failure.
+
+import tlshandshake
+import tlsverify
+import tls13
+import x25519
+import crypto_hash
+
+type ClientError =
+    | Refused(why: str)
+    | HandshakeFailed(why: str)
+    | NotVerified(why: str)
+    | Closed()
+    | Protocol(why: str)
+
+    /// An open connection, and everything needed to keep talking on it.
+type TlsConnection = {
+    socket: i64,
+    read_keys: TrafficKeys,
+    write_keys: TrafficKeys,
+    /// Record sequence numbers, which are per-key and start at zero.
+    read_sequence: i64,
+    write_sequence: i64,
+    /// Bytes read from the socket and not yet consumed as whole records.
+    pending: bytes,
+    /// What the verification decided.
+    session: TlsSession,
+    /// The protocol ALPN settled on, or the empty string.
+    protocol: str,
+}
+
+fn concat(a: bytes, b: bytes) -> bytes {
+    var out: [i64] = []
+    var i = 0
+    while i < a.len() {
+        out.push(a.at(i))
+        i = i + 1
+    }
+    var j = 0
+    while j < b.len() {
+        out.push(b.at(j))
+        j = j + 1
+    }
+    return bytes_of(out)
+}
+
+fn drop_front(data: bytes, count: i64) -> bytes {
+    var out: [i64] = []
+    var i = count
+    while i < data.len() {
+        out.push(data.at(i))
+        i = i + 1
+    }
+    return bytes_of(out)
+}
+
+/// Read until at least one whole record is available, then return it.
+///
+/// A read that answers nothing twice running is a peer that has stopped
+/// talking; waiting longer only turns a failed handshake into a hung one.
+fn next_record(inout c: TlsConnection) -> TlsRecord ! ClientError / {net} {
+    var quiet = 0
+    while quiet < 3 {
+        match tlshandshake.split_records(c.pending) {
+            Ok(split) -> {
+                if split.0.len() > 0 {
+                    c.pending = drop_front(c.pending,
+                        5 + split.0[0].payload.len())
+                    return split.0[0]
+                }
+            }
+            Err(_e) -> fail(Protocol("a record header did not parse"))
+        }
+        let piece = tcp_read_bytes(c.socket) ?? bytes_of([])
+        if piece.len() == 0 {
+            quiet = quiet + 1
+        } else {
+            quiet = 0
+            c.pending = concat(c.pending, piece)
+        }
+    }
+    fail(Closed())
+}
+
+/// Read one record and decrypt it, skipping the change_cipher_spec records
+/// a server sends only to look like TLS 1.2 to whatever is in the way.
+fn next_plain(inout c: TlsConnection) -> (i64, bytes) ! ClientError / {net} {
+    while true {
+        let record = try next_record(c)
+        if record.content_type == tlshandshake.content_change_cipher_spec() {
+            continue
+        }
+        if record.content_type == 21 {
+            fail(Protocol("the server sent an alert"))
+        }
+        match tls13.open_record(c.read_keys, c.read_sequence,
+            record_bytes(record)) {
+            Ok(opened) -> {
+                c.read_sequence = c.read_sequence + 1
+                return opened
+            }
+            Err(_e) -> fail(Protocol("a record did not decrypt"))
+        }
+    }
+    fail(Closed())
+}
+
+fn record_bytes(record: TlsRecord) -> bytes {
+    return tlshandshake.record_of(record.content_type, record.version,
+        record.payload) ?? bytes_of([])
+}
+
+/// Send one encrypted record.
+fn send_protected(inout c: TlsConnection, kind: i64,
+    payload: bytes) -> bool ! ClientError / {net} {
+    var sealed = bytes_of([])
+    match tls13.seal_record(c.write_keys, c.write_sequence, kind,
+        payload) {
+        Ok(made) -> sealed = made
+        Err(_e) -> fail(Protocol("a record could not be sealed"))
+    }
+    c.write_sequence = c.write_sequence + 1
+    match tcp_write_bytes(c.socket, sealed) {
+        Ok(_n) -> return true
+        Err(_e) -> fail(Closed())
+    }
+}
+
+/// Open a connection and complete the handshake, or fail saying why.
+///
+/// `roots` is the trust store, as DER certificates. There is no default: a
+/// package that ships its own roots decides for its callers whom to trust,
+/// which is not a decision a library should be making.
+/// What the server's flight said.
+type ServerFlight = {
+    chain: [bytes],
+    scheme: i64,
+    signature: bytes,
+    finished: bytes,
+    /// The transcript as it stood before each of the last two messages,
+    /// because each is checked against the one that preceded it.
+    before_verify: bytes,
+    before_finished: bytes,
+    protocol: str,
+}
+
+/// Build a ClientHello and send it, returning the bytes for the transcript.
+fn send_hello(socket: i64, public_key: bytes, host: str,
+    protocols: [str]) -> bytes ! ClientError / {net, io} {
+    let random = random_bytes(32) ?? bytes_of([])
+    // A non-empty session id is more middlebox theatre: it is never used,
+    // and a server behind something old sometimes drops a hello without it.
+    let session_id = random_bytes(32) ?? bytes_of([])
+    let parts = tlshandshake.default_hello(random, session_id, public_key,
+        host, protocols)
+    var hello = bytes_of([])
+    match tlshandshake.client_hello(parts) {
+        Ok(body) -> {
+            match tlshandshake.message_of(tlshandshake.hs_client_hello(),
+                body) {
+                Ok(message) -> hello = message
+                Err(_e) -> fail(HandshakeFailed("could not frame the hello"))
+            }
+        }
+        Err(_e) -> fail(HandshakeFailed("could not build the hello"))
+    }
+    var framed = bytes_of([])
+    match tlshandshake.record_of(22, 769, hello) {
+        Ok(made) -> framed = made
+        Err(_e) -> fail(HandshakeFailed("the hello did not fit a record"))
+    }
+    match tcp_write_bytes(socket, framed) {
+        Ok(_n) -> return hello
+        Err(_e) -> fail(Closed())
+    }
+}
+
+/// Read the ServerHello, which arrives unencrypted.
+type HelloAnswer = { hello: ServerHelloParts, payload: bytes }
+
+fn read_hello(inout c: TlsConnection) -> HelloAnswer ! ClientError / {net} {
+    while true {
+        let record = try next_record(c)
+        if record.content_type == tlshandshake.content_change_cipher_spec() {
+            continue
+        }
+        if record.content_type != 22 {
+            fail(Protocol("expected a handshake record"))
+        }
+        let messages = (tlshandshake.split_messages(record.payload) ??
+            ([], 0)).0
+        if messages.len() == 0 {
+            fail(Protocol("an empty handshake record"))
+        }
+        if messages[0].kind != tlshandshake.hs_server_hello() {
+            fail(Protocol("expected a ServerHello"))
+        }
+        match tlshandshake.server_hello(messages[0].body) {
+            Ok(found) -> return HelloAnswer{ hello: found,
+                payload: record.payload }
+            Err(_e) -> fail(HandshakeFailed("the ServerHello was not one " +
+                "this client can use"))
+        }
+    }
+    fail(Closed())
+}
+
+/// Read the server's encrypted flight, up to and including its Finished.
+fn read_flight(inout c: TlsConnection,
+    inout transcript: bytes) -> ServerFlight ! ClientError / {net} {
+    var flight = ServerFlight{ chain: [], scheme: 0,
+        signature: bytes_of([]), finished: bytes_of([]),
+        before_verify: bytes_of([]), before_finished: bytes_of([]),
+        protocol: "" }
+    var seen_finished = false
+    while not seen_finished {
+        let opened = try next_plain(c)
+        if opened.0 != 22 {
+            fail(Protocol("expected an encrypted handshake record"))
+        }
+        for message in (tlshandshake.split_messages(opened.1) ?? ([], 0)).0 {
+            let framed = tlshandshake.message_of(message.kind,
+                message.body) ?? bytes_of([])
+            if message.kind == tlshandshake.hs_certificate() {
+                flight.chain =
+                tlshandshake.certificate_chain(message.body) ?? []
+            } else if message.kind ==
+            tlshandshake.hs_certificate_verify() {
+                flight.before_verify = transcript
+                let pair = tlshandshake.certificate_verify(message.body) ??
+                (0, bytes_of([]))
+                flight.scheme = pair.0
+                flight.signature = pair.1
+            } else if message.kind == tlshandshake.hs_finished() {
+                flight.before_finished = transcript
+                flight.finished = message.body
+                seen_finished = true
+            } else if message.kind ==
+            tlshandshake.hs_encrypted_extensions() {
+                flight.protocol = tlshandshake.chosen_protocol(
+                    tlshandshake.encrypted_extensions(message.body) ?? [])
+            }
+            transcript = concat(transcript, framed)
+        }
+    }
+    return flight
+}
+
+/// Open a connection and complete the handshake, or fail saying why.
+///
+/// `roots` is the trust store, as DER certificates. There is no default: a
+/// package that ships its own roots decides for its callers whom to trust,
+/// which is not a decision a library should be making.
+pub fn connect(host: str, port: i64, roots: [bytes], protocols: [str],
+    now_seconds: i64) -> TlsConnection ! ClientError / {net, io} {
+    let private_key = random_bytes(32) ?? bytes_of([])
+    if private_key.len() != 32 {
+        fail(HandshakeFailed("no randomness for the key share"))
+    }
+    var socket = 0
+    match tcp_connect(host, port) {
+        Ok(handle) -> socket = handle
+        Err(_e) -> fail(Refused("could not reach " + host))
+    }
+    var c = TlsConnection{ socket: socket, read_keys: empty_keys(),
+        write_keys: empty_keys(), read_sequence: 0, write_sequence: 0,
+        pending: bytes_of([]), session: no_session(), protocol: "" }
+    var transcript = try send_hello(socket, x25519.public_key(private_key),
+        host, protocols)
+    let answer = try read_hello(c)
+    transcript = concat(transcript, answer.payload)
+    if answer.hello.group != tlshandshake.group_x25519() {
+        fail(HandshakeFailed("the server chose a group this client did " +
+            "not offer a share for"))
+    }
+    let shared = x25519.shared_secret(private_key, answer.hello.key_share) ??
+    bytes_of([])
+    if shared.len() != 32 {
+        fail(HandshakeFailed("the key exchange produced nothing"))
+    }
+    let schedule = tls13.schedule_of(tls13.zeros(), shared)
+    let handshake = tls13.handshake_traffic(schedule,
+        crypto_hash.sha256_of(transcript))
+    c.read_keys = tls13.traffic_keys(handshake.1)
+    c.write_keys = tls13.traffic_keys(handshake.0)
+    let flight = try read_flight(c, transcript)
+    c.protocol = flight.protocol
+    // Verify before answering. A client that sends its Finished first has
+    // already told the server it is happy.
+    if flight.chain.len() == 0 {
+        fail(NotVerified("the server sent no certificate"))
+    }
+    let session = tlsverify.describe(flight.chain, roots, host,
+        flight.scheme, flight.signature,
+        crypto_hash.sha256_of(flight.before_verify), now_seconds)
+    if not session.trusted {
+        fail(NotVerified(session.reason + " (scheme {session.scheme})"))
+    }
+    c.session = session
+    if not same_bytes(tlshandshake.finished(handshake.1,
+        crypto_hash.sha256_of(flight.before_finished)), flight.finished) {
+        fail(HandshakeFailed("the server's Finished does not match the " +
+            "transcript"))
+    }
+    let mine = tlshandshake.finished(handshake.0,
+        crypto_hash.sha256_of(transcript))
+    match tlshandshake.message_of(tlshandshake.hs_finished(), mine) {
+        Ok(message) -> try send_protected(c, 22, message)
+        Err(_e) -> fail(HandshakeFailed("could not frame the Finished"))
+    }
+    // Application keys come from the transcript up to and including the
+    // server's Finished, not the client's.
+    let application = tls13.application_traffic(schedule,
+        crypto_hash.sha256_of(transcript))
+    c.read_keys = tls13.traffic_keys(application.1)
+    c.write_keys = tls13.traffic_keys(application.0)
+    c.read_sequence = 0
+    c.write_sequence = 0
+    return c
+}
+
+fn same_bytes(a: bytes, b: bytes) -> bool {
+    if a.len() != b.len() {
+        return false
+    }
+    var i = 0
+    while i < a.len() {
+        if a.at(i) != b.at(i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn empty_keys() -> TrafficKeys {
+    return tls13.traffic_keys(tls13.zeros())
+}
+
+fn no_session() -> TlsSession {
+    return TlsSession{ trusted: false, names: [], path: [], scheme: 0,
+        reason: "not verified" }
+}
+
+fn empty_hello() -> ServerHelloParts {
+    return ServerHelloParts{ random: bytes_of([]), session_id: bytes_of([]),
+        cipher_suite: 0, group: 0, key_share: bytes_of([]), version: 0,
+        extensions: [] }
+}
+
+/// Send application data.
+pub fn write(inout c: TlsConnection,
+    data: bytes) -> bool ! ClientError / {net} {
+    return try send_protected(c, 23, data)
+}
+
+/// Read application data, skipping the session tickets a server sends after
+/// the handshake and which a client with no resumption has no use for.
+pub fn read(inout c: TlsConnection) -> bytes ! ClientError / {net} {
+    while true {
+        let opened = try next_plain(c)
+        if opened.0 == 23 {
+            return opened.1
+        }
+        if opened.0 == 21 {
+            fail(Closed())
+        }
+    }
+    fail(Closed())
+}
+
+/// Close the connection.
+pub fn close(c: TlsConnection) / {net} {
+    net_close(c.socket)
+}
+
+/// Whether the connection was verified, and what it decided.
+pub fn session_of(c: TlsConnection) -> TlsSession {
+    return c.session
+}

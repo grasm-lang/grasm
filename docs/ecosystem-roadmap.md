@@ -14,7 +14,7 @@ plan that discovers them 300 packages in.
 | | |
 |---|---|
 | Started | 78 |
-| Now | 408 |
+| Now | 412 |
 | Tier 1 target | 200 |
 | Tier 2 target | 500 |
 | Tier 3 target | 800 |
@@ -250,15 +250,23 @@ done.** The count is 408, not 500, and the ninety-odd that would close the gap
 are the ones below: they are not skipped for being hard but for being
 impossible until P1 exists.
 
-### Needs P1 — a TLS client. About 120, and none of them can start.
+### ~~Needs P1 — a TLS client.~~ **P1 is built.** About 120 unblocked.
 
 Every hosted-service client: Stripe, AWS, Google Cloud, Azure, Discord,
 Slack, GitHub, Kubernetes, Prometheus remote-write, OpenTelemetry export,
 OAuth providers, SMTP and IMAP over TLS, and every managed database. All of
-them are HTTPS-only and have been for years.
+them are HTTPS-only and have been for years, and none of them could be
+started until now.
 
-**Four of the five missing pieces are now built**, and each was checked
-against certificates and signatures produced by an outside implementation:
+`tlsclient` completes a TLS 1.3 handshake over a socket and refuses to
+return a connection it has not verified. `tlshandshake` builds and reads the
+messages; `tlsverify` does the three checks — chain, name, signature over
+the transcript — in that order. The `tlsdiff` gate runs five handshakes
+against OpenSSL's own server on every gate run: one RSA, one ECDSA, and
+three that must be refused.
+
+The five pieces it is assembled from, each checked against certificates and
+signatures produced by an outside implementation:
 
 - `rsa` — PKCS#1 v1.5 and PSS *verification*. No signing: a private key
   operation without constant-time arithmetic and blinding leaks the key, and
@@ -274,10 +282,14 @@ against certificates and signatures produced by an outside implementation:
 - `pemfile` — a chain file is several blocks, and a reader that takes the
   first verifies the leaf against nothing.
 
-**What is left is the handshake over a socket.** That cannot be asserted
-against without a server to talk to, which is why the four above were done
-first: they are the parts a fixture can check exactly, and they are the parts
-that were actually missing.
+**The handshake over a socket is what was left, and it is done.** It could
+not be asserted against without a server to talk to, so it is checked two
+ways: the message layer and the key schedule against RFC 8448's published
+byte-for-byte trace, which needs no network at all, and the whole client
+against `openssl s_server` in a gate. The second found two defects the first
+could not — a digest named `"sha256"` where the `rsa` package spells it
+`"SHA256"`, which is a silent verification failure, and an ECDSA signature
+handed to the curve code as bytes where it wanted limbs.
 
 ### Needs P2 — async I/O. About 40.
 
