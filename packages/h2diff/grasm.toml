@@ -1,0 +1,8 @@
+[package]
+name = "h2diff"
+version = "1.0.0"
+capabilities = ["net", "io"]
+
+[dependencies.http2client]
+path = "../http2client"
+version = "^1.0.0"

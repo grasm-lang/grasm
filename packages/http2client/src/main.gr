@@ -1,0 +1,425 @@
+// An HTTP/2 client: one connection, many streams.
+//
+// HTTP/1.1 over TLS gets a request and a response per connection, and a
+// client wanting six in parallel opens six connections and six handshakes.
+// HTTP/2 gets all six down one, interleaved, with the headers compressed
+// against each other — which is most of why the modern web is faster than
+// it was, and all of why this is harder to write.
+//
+// ## What has to happen before a request can
+//
+//   1. TLS, with ALPN offering `h2`. A server that answers `http/1.1` is
+//      not going to speak this, and finding that out after sending the
+//      preface produces a connection that hangs rather than fails.
+//   2. The twenty-four byte preface, then a SETTINGS frame. Both, in that
+//      order, before anything else.
+//   3. The server's SETTINGS, acknowledged. A client that skips the
+//      acknowledgement stalls the server's timeout rather than failing
+//      anything visibly.
+//
+// ## The header table is shared and ordered
+//
+// HPACK compresses each header block against every block sent before it on
+// the same connection, so the blocks must be *decoded in the order they
+// arrived* even if the streams they belong to are finished with. A client
+// that drops a stream and skips its header block corrupts the table for
+// every stream after it, and the failure appears somewhere else entirely.
+//
+// ## Flow control, and the deadlock it causes when half-done
+//
+// Every DATA frame spends from the stream's window and the connection's.
+// This client sends a WINDOW_UPDATE for both as it consumes, because a
+// receiver that refills only the stream stalls the connection as soon as a
+// second stream is busy.
+//
+// ## What is not here
+//
+// Server push, which browsers stopped honouring and servers stopped
+// sending; priority, which was respecified twice and is advisory in both;
+// and concurrent streams, which need the `poll` this runtime does not have
+// yet. A request at a time down one connection is what this does, and it is
+// what an API client needs.
+
+import http2frame
+import hpack
+import tlsclient
+
+type H2ClientError =
+    | Refused(why: str)
+    | NotVerified(why: str)
+    | NoAlpn(chosen: str)
+    | Protocol(why: str)
+    | GoneAway(code: i64, last_stream: i64)
+    | StreamReset(code: i64)
+    | Closed()
+
+    /// A response.
+type H2Reply = {
+    status: i64,
+    headers: [(str, str)],
+    body: bytes,
+    /// The trailers, which gRPC uses to carry its status and most other
+    /// callers never see.
+    trailers: [(str, str)],
+}
+
+/// An open connection.
+type H2Connection = {
+    tls: TlsConnection,
+    /// The HPACK tables. Two, because each direction compresses against
+    /// its own history and they are never the same.
+    outgoing: HeaderTable,
+    incoming: HeaderTable,
+    next_stream: i64,
+    /// The connection-level window this client may still send into.
+    send_window: i64,
+    /// The largest frame the server said it would accept.
+    max_frame: i64,
+    /// Bytes read and not yet consumed as whole frames.
+    pending: bytes,
+    /// Frames split out of those bytes and not yet handled.
+    queue: [H2Frame],
+}
+
+fn concat(a: bytes, b: bytes) -> bytes {
+    var out: [i64] = []
+    var i = 0
+    while i < a.len() {
+        out.push(a.at(i))
+        i = i + 1
+    }
+    var j = 0
+    while j < b.len() {
+        out.push(b.at(j))
+        j = j + 1
+    }
+    return bytes_of(out)
+}
+
+fn drop_front(data: bytes, count: i64) -> bytes {
+    var out: [i64] = []
+    var i = count
+    while i < data.len() {
+        out.push(data.at(i))
+        i = i + 1
+    }
+    return bytes_of(out)
+}
+
+/// Write to the connection's TLS socket.
+///
+/// The socket is moved out of the connection and back rather than passed as
+/// `c.tls`: `write` takes its argument `inout`, and the native backend
+/// cannot yet pass a field that way. Every path here puts it back before
+/// returning, including the failing one.
+fn write_out(inout c: H2Connection,
+    data: bytes) -> bool ! H2ClientError / {net} {
+    var tls = c.tls
+    var open = true
+    match tlsclient.write(tls, data) {
+        Ok(_sent) -> {}
+        Err(_e) -> open = false
+    }
+    c.tls = tls
+    if not open {
+        fail(Closed())
+    }
+    return true
+}
+
+/// Read whatever has arrived, or nothing. See `write_out` for why the
+/// socket travels this way.
+fn read_in(inout c: H2Connection) -> bytes / {net} {
+    var tls = c.tls
+    var piece = bytes_of([])
+    match tlsclient.read(tls) {
+        Ok(arrived) -> piece = arrived
+        Err(_e) -> piece = bytes_of([])
+    }
+    c.tls = tls
+    return piece
+}
+
+/// Encode a header block against the outgoing table. The table travels out
+/// of the connection and back for the reason `write_out` gives.
+fn encode_block(inout c: H2Connection, headers: [HeaderPair]) -> bytes {
+    var table = c.outgoing
+    let block = hpack.encode(table, headers)
+    c.outgoing = table
+    return block
+}
+
+/// Decode a header block against the incoming table.
+fn decode_block(inout c: H2Connection,
+    data: bytes) -> [HeaderPair] ! H2ClientError {
+    var table = c.incoming
+    var decoded: [HeaderPair] = []
+    var ok = true
+    match hpack.decode(table, data) {
+        Ok(pairs) -> decoded = pairs
+        Err(_e) -> ok = false
+    }
+    c.incoming = table
+    if not ok {
+        fail(Protocol("a header block did not decode"))
+    }
+    return decoded
+}
+
+/// Adopt the table size the server asked for.
+fn set_outgoing_capacity(inout c: H2Connection, capacity: i64) {
+    var table = c.outgoing
+    hpack.set_capacity(table, capacity)
+    c.outgoing = table
+}
+
+fn send(inout c: H2Connection, frame: H2Frame) -> bool ! H2ClientError / {net} {
+    match http2frame.encode(frame) {
+        Ok(encoded) -> return try write_out(c, encoded)
+        Err(_e) -> fail(Protocol("a frame would not encode"))
+    }
+}
+
+/// The next frame, reading more from the socket when the queue is empty.
+///
+/// Frames are queued rather than taken one at a time because `split` strips
+/// padding: a frame's payload is not its length on the wire, so the buffer
+/// can only be advanced by what `split` says it consumed, and that covers
+/// every frame it returned.
+fn next_frame(inout c: H2Connection) -> H2Frame ! H2ClientError / {net} {
+    var quiet = 0
+    while quiet < 3 {
+        if c.queue.len() > 0 {
+            let frame = c.queue[0]
+            var rest: [H2Frame] = []
+            var i = 1
+            while i < c.queue.len() {
+                rest.push(c.queue[i])
+                i = i + 1
+            }
+            c.queue = rest
+            return frame
+        }
+        match http2frame.split(c.pending) {
+            Ok(split) -> {
+                if split.0.len() > 0 {
+                    c.queue = split.0
+                    c.pending = drop_front(c.pending, split.1)
+                    continue
+                }
+            }
+            Err(_e) -> fail(Protocol("a frame header did not parse"))
+        }
+        let piece = read_in(c)
+        if piece.len() == 0 {
+            quiet = quiet + 1
+        } else {
+            quiet = 0
+            c.pending = concat(c.pending, piece)
+        }
+    }
+    fail(Closed())
+}
+
+/// Open a connection: TLS with ALPN, the preface, and the settings
+/// exchange.
+pub fn connect(host: str, port: i64, roots: [bytes],
+    now_seconds: i64) -> H2Connection ! H2ClientError / {net, io} {
+    var tls = tlsclient.no_connection()
+    match tlsclient.connect(host, port, roots, ["h2"], now_seconds) {
+        Ok(opened) -> tls = opened
+        Err(why) -> {
+            match why {
+                Refused(text) -> fail(Refused(text))
+                NotVerified(text) -> fail(NotVerified(text))
+                HandshakeFailed(text) -> fail(NotVerified(text))
+                Protocol(text) -> fail(Protocol(text))
+                Closed() -> fail(Closed())
+            }
+        }
+    }
+    // A server that did not agree to `h2` is about to be sent a preface it
+    // will read as a malformed HTTP/1.1 request. Stopping here turns a hang
+    // into a message.
+    if tls.protocol != "h2" {
+        tlsclient.close(tls)
+        fail(NoAlpn(tls.protocol))
+    }
+    var c = H2Connection{ tls: tls, outgoing: hpack.new_table(4096),
+        incoming: hpack.new_table(4096), next_stream: 1,
+        send_window: http2frame.default_window(),
+        max_frame: http2frame.default_frame_size(),
+        pending: bytes_of([]), queue: [] }
+    try write_out(c, http2frame.preface())
+    // Push is refused up front rather than ignored: a server that pushes
+    // into a client that discards the streams wastes both ends' windows.
+    try send(c, http2frame.settings_frame(H2Settings{ entries: [
+        (http2frame.setting_enable_push(), 0),
+        (http2frame.setting_initial_window_size(), 1048576),
+        (http2frame.setting_max_frame_size(), 16384)] }))
+    // Read until the server's SETTINGS has arrived and been acknowledged.
+    var seen_settings = false
+    while not seen_settings {
+        let frame = try next_frame(c)
+        try handle_connection_frame(c, frame)
+        if frame.kind == http2frame.frame_settings() and
+        not http2frame.has_flag(frame, http2frame.flag_ack()) {
+            seen_settings = true
+        }
+    }
+    return c
+}
+
+/// Deal with a frame that belongs to the connection rather than a stream.
+///
+/// Returns true when the frame was one of those, so a stream loop can tell
+/// whether it still has to look at it.
+fn handle_connection_frame(inout c: H2Connection,
+    frame: H2Frame) -> bool ! H2ClientError / {net} {
+    if frame.kind == http2frame.frame_settings() {
+        if http2frame.has_flag(frame, http2frame.flag_ack()) {
+            return true
+        }
+        match http2frame.settings_of(frame) {
+            Ok(settings) -> {
+                c.max_frame = http2frame.setting_of(settings,
+                    http2frame.setting_max_frame_size(),
+                    http2frame.default_frame_size())
+                let table = http2frame.setting_of(settings,
+                    http2frame.setting_header_table_size(), 4096)
+                set_outgoing_capacity(c, table)
+            }
+            Err(_e) -> fail(Protocol("a SETTINGS frame did not parse"))
+        }
+        try send(c, http2frame.settings_ack())
+        return true
+    }
+    if frame.kind == http2frame.frame_ping() {
+        if not http2frame.has_flag(frame, http2frame.flag_ack()) {
+            try send(c, http2frame.ping(frame.payload, true))
+        }
+        return true
+    }
+    if frame.kind == http2frame.frame_window_update() {
+        if frame.stream == 0 {
+            match http2frame.increment_of(frame) {
+                Ok(increment) -> c.send_window = c.send_window + increment
+                Err(_e) -> fail(Protocol("a WINDOW_UPDATE did not parse"))
+            }
+        }
+        return true
+    }
+    if frame.kind == http2frame.frame_goaway() {
+        match http2frame.goaway_of(frame) {
+            Ok(parts) -> fail(GoneAway(parts.1, parts.0))
+            Err(_e) -> fail(Protocol("a GOAWAY did not parse"))
+        }
+    }
+    return false
+}
+
+/// The pseudo-headers a request must open with, in order.
+///
+/// All four, before any ordinary header, and lower-cased: HTTP/2 has no
+/// request line, so the method and the path are headers, and a server that
+/// sees them out of order treats the stream as malformed.
+pub fn request_headers(method: str, host: str, path: str,
+    extra: [(str, str)]) -> [HeaderPair] {
+    var out: [HeaderPair] = [hpack.pair(":method", method),
+        hpack.pair(":scheme", "https"), hpack.pair(":authority", host),
+        hpack.pair(":path", path)]
+    for header in extra {
+        out.push(hpack.pair(header.0.to_lower(), header.1))
+    }
+    return out
+}
+
+/// Send one request and read its response.
+pub fn request(inout c: H2Connection, method: str, host: str, path: str,
+    extra: [(str, str)], body: bytes) -> H2Reply ! H2ClientError / {net} {
+    let stream = c.next_stream
+    c.next_stream = c.next_stream + 2
+    let block = encode_block(c, request_headers(method, host, path, extra))
+    try send(c, http2frame.headers_frame(stream, block, true,
+        body.len() == 0))
+    if body.len() > 0 {
+        try send(c, http2frame.data_frame(stream, body, true))
+    }
+    var reply = H2Reply{ status: 0, headers: [], body: bytes_of([]),
+        trailers: [] }
+    var seen_headers = false
+    var done = false
+    while not done {
+        let frame = try next_frame(c)
+        if try handle_connection_frame(c, frame) {
+            continue
+        }
+        if frame.stream != stream {
+            continue
+        }
+        if frame.kind == http2frame.frame_rst_stream() {
+            fail(StreamReset(0))
+        }
+        if frame.kind == http2frame.frame_headers() or
+        frame.kind == http2frame.frame_continuation() {
+            // The block must be decoded whatever the stream is doing: the
+            // table is shared, and skipping one corrupts every block after
+            // it.
+            let decoded = try decode_block(c, frame.payload)
+            for pair in decoded {
+                if pair.name == ":status" {
+                    reply.status = pair.value.parse_int() ?? 0
+                } else if seen_headers {
+                    reply.trailers.push((pair.name, pair.value))
+                } else {
+                    reply.headers.push((pair.name, pair.value))
+                }
+            }
+            if http2frame.has_flag(frame, http2frame.flag_end_headers()) {
+                seen_headers = true
+            }
+        }
+        if frame.kind == http2frame.frame_data() {
+            reply.body = concat(reply.body, frame.payload)
+            // Refill both windows. A receiver that refills only the stream
+            // stalls the connection the moment a second stream is busy.
+            if frame.payload.len() > 0 {
+                try send(c, http2frame.window_update(0,
+                    frame.payload.len()))
+                try send(c, http2frame.window_update(stream,
+                    frame.payload.len()))
+            }
+        }
+        if http2frame.has_flag(frame, http2frame.flag_end_stream()) {
+            done = true
+        }
+    }
+    return reply
+}
+
+/// A response header's value, or the empty string.
+pub fn header_of(headers: [(str, str)], name: str) -> str {
+    for header in headers {
+        if header.0 == name.to_lower() {
+            return header.1
+        }
+    }
+    return ""
+}
+
+/// Close the connection politely, saying which streams were handled.
+pub fn close(inout c: H2Connection) / {net} {
+    let last = c.next_stream - 2
+    var tls = c.tls
+    match http2frame.encode(http2frame.goaway(last, 0, bytes_of([]))) {
+        Ok(bye) -> {
+            match tlsclient.write(tls, bye) {
+                Ok(_sent) -> {}
+                Err(_e) -> {}
+            }
+        }
+        Err(_e) -> {}
+    }
+    tlsclient.close(tls)
+    c.tls = tlsclient.no_connection()
+}

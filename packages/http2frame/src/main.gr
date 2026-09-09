@@ -1,0 +1,383 @@
+// HTTP/2's frame layer: nine bytes of header, then everything else.
+//
+// HTTP/1.1 is a text protocol where a message is a blob and a connection
+// carries one at a time. HTTP/2 is a binary protocol where a connection
+// carries many interleaved *streams*, each a sequence of frames. That one
+// change is the whole of it: the header compression, the flow control and
+// the priority scheme all exist because several requests now share a
+// socket.
+//
+// ## The header, which never varies
+//
+// Three bytes of length, one of type, one of flags, four of stream
+// identifier with its top bit reserved. Every frame. A reader that has nine
+// bytes knows how many more to wait for, which is what makes the protocol
+// easy to proxy and impossible to read with `tail -f`.
+//
+// ## Streams are odd from the client and even from the server
+//
+// A client opens 1, 3, 5; a server pushes 2, 4, 6. Identifiers only
+// increase, and a connection that runs out — after about a billion — must
+// be replaced rather than wrapped. Stream 0 is the connection itself, and
+// SETTINGS, PING and GOAWAY belong to it.
+//
+// ## Flow control is per-stream and per-connection, and both must be
+// respected
+//
+// Every DATA frame spends from two windows, and a sender that watches only
+// the stream's window deadlocks the connection when several streams are
+// busy. The windows start at 65535 and are refilled by WINDOW_UPDATE — a
+// frame whose absence is the commonest cause of a stall that looks like a
+// network problem.
+//
+// ## What is deliberately not here
+//
+// The HPACK state, which `hpack` in this package set holds, and the
+// connection state machine, which belongs to a client. This is the
+// framing: bytes in, frames out, and back.
+
+type H2Error =
+    | Truncated(at: i64)
+    | Overlong(length: i64)
+    | BadStream(id: i64)
+    | BadPadding(at: i64)
+    | UnknownType(kind: i64)
+    | BadSetting(id: i64, value: i64)
+
+    /// One frame.
+type H2Frame = {
+    kind: i64,
+    flags: i64,
+    stream: i64,
+    /// The payload with any padding already removed.
+    payload: bytes,
+}
+
+/// A settings frame's contents, in the order they were written.
+type H2Settings = {
+    entries: [(i64, i64)],
+}
+
+pub fn frame_data() -> i64 { 0 }
+
+pub fn frame_headers() -> i64 { 1 }
+
+pub fn frame_priority() -> i64 { 2 }
+
+pub fn frame_rst_stream() -> i64 { 3 }
+
+pub fn frame_settings() -> i64 { 4 }
+
+pub fn frame_push_promise() -> i64 { 5 }
+
+pub fn frame_ping() -> i64 { 6 }
+
+pub fn frame_goaway() -> i64 { 7 }
+
+pub fn frame_window_update() -> i64 { 8 }
+
+pub fn frame_continuation() -> i64 { 9 }
+
+pub fn flag_end_stream() -> i64 { 1 }
+
+pub fn flag_ack() -> i64 { 1 }
+
+pub fn flag_end_headers() -> i64 { 4 }
+
+pub fn flag_padded() -> i64 { 8 }
+
+pub fn flag_priority() -> i64 { 32 }
+
+/// The twenty-four bytes a client sends before anything else.
+///
+/// It spells a request an HTTP/1.1 server cannot mistake for a real one, so
+/// a server that is not expecting HTTP/2 fails immediately rather than
+/// half-parsing the connection.
+pub fn preface() -> bytes {
+    return "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_bytes()
+}
+
+/// The default a connection starts with before SETTINGS is exchanged.
+pub fn default_frame_size() -> i64 { 16384 }
+
+pub fn default_window() -> i64 { 65535 }
+
+fn push_be(inout out: [i64], value: i64, width: i64) {
+    var i = width - 1
+    while i >= 0 {
+        out.push(value.ushr(i * 8).bit_and(255))
+        i = i - 1
+    }
+}
+
+fn read_be(data: bytes, at: i64, width: i64) -> i64 ! H2Error {
+    if at + width > data.len() {
+        fail(Truncated(at))
+    }
+    var value = 0
+    var i = 0
+    while i < width {
+        value = value * 256 + data.at(at + i)
+        i = i + 1
+    }
+    return value
+}
+
+fn slice_of(data: bytes, at: i64, length: i64) -> bytes ! H2Error {
+    if length < 0 or at + length > data.len() {
+        fail(Truncated(at))
+    }
+    var out: [i64] = []
+    var i = 0
+    while i < length {
+        out.push(data.at(at + i))
+        i = i + 1
+    }
+    return bytes_of(out)
+}
+
+/// A frame, serialised.
+///
+/// The stream identifier's top bit is reserved and must be sent as zero; a
+/// sender that lets a large number set it produces a frame every receiver
+/// reads as a different stream.
+pub fn encode(frame: H2Frame) -> bytes ! H2Error {
+    if frame.payload.len() > 16777215 {
+        fail(Overlong(frame.payload.len()))
+    }
+    if frame.stream < 0 or frame.stream > 2147483647 {
+        fail(BadStream(frame.stream))
+    }
+    var out: [i64] = []
+    push_be(out, frame.payload.len(), 3)
+    out.push(frame.kind.bit_and(255))
+    out.push(frame.flags.bit_and(255))
+    push_be(out, frame.stream.bit_and(2147483647), 4)
+    var i = 0
+    while i < frame.payload.len() {
+        out.push(frame.payload.at(i))
+        i = i + 1
+    }
+    return bytes_of(out)
+}
+
+/// Every whole frame in a buffer, and how many bytes were consumed.
+///
+/// A partial frame at the end is left alone: a reader on a socket has one
+/// more often than not, and the caller's job is to read more.
+pub fn split(data: bytes) -> ([H2Frame], i64) ! H2Error {
+    var out: [H2Frame] = []
+    var at = 0
+    while at + 9 <= data.len() {
+        let length = try read_be(data, at, 3)
+        if at + 9 + length > data.len() {
+            return (out, at)
+        }
+        let kind = data.at(at + 3)
+        let flags = data.at(at + 4)
+        // The top bit of the stream identifier is reserved; a receiver
+        // ignores it rather than refusing, which is what lets the field be
+        // reused later without breaking today's readers.
+        let stream = (try read_be(data, at + 5, 4)).bit_and(2147483647)
+        var payload = try slice_of(data, at + 9, length)
+        if flags.bit_and(flag_padded()) != 0 and
+        (kind == frame_data() or kind == frame_headers() or
+            kind == frame_push_promise()) {
+            if payload.len() < 1 {
+                fail(BadPadding(at))
+            }
+            let padding = payload.at(0)
+            if padding + 1 > payload.len() {
+                // Padding longer than the frame is a connection error, not
+                // a stream one: the receiver cannot tell where the next
+                // frame starts.
+                fail(BadPadding(at))
+            }
+            payload = try slice_of(payload, 1, payload.len() - 1 - padding)
+        }
+        out.push(H2Frame{ kind: kind, flags: flags, stream: stream,
+            payload: payload })
+        at = at + 9 + length
+    }
+    return (out, at)
+}
+
+/// Whether a flag is set.
+pub fn has_flag(frame: H2Frame, flag: i64) -> bool {
+    return frame.flags.bit_and(flag) != 0
+}
+
+/// A SETTINGS payload read.
+pub fn settings_of(frame: H2Frame) -> H2Settings ! H2Error {
+    if frame.payload.len() % 6 != 0 {
+        fail(Truncated(frame.payload.len()))
+    }
+    var out: [(i64, i64)] = []
+    var at = 0
+    while at < frame.payload.len() {
+        out.push((try read_be(frame.payload, at, 2),
+            try read_be(frame.payload, at + 2, 4)))
+        at = at + 6
+    }
+    return H2Settings{ entries: out }
+}
+
+/// A SETTINGS frame built.
+pub fn settings_frame(settings: H2Settings) -> H2Frame {
+    var out: [i64] = []
+    for entry in settings.entries {
+        push_be(out, entry.0, 2)
+        push_be(out, entry.1, 4)
+    }
+    return H2Frame{ kind: frame_settings(), flags: 0, stream: 0,
+        payload: bytes_of(out) }
+}
+
+/// The acknowledgement a SETTINGS frame must be answered with.
+///
+/// Empty and flagged, and required: a peer that does not answer stalls the
+/// other side's timeout rather than failing anything visibly.
+pub fn settings_ack() -> H2Frame {
+    return H2Frame{ kind: frame_settings(), flags: flag_ack(), stream: 0,
+        payload: bytes_of([]) }
+}
+
+/// A setting's value, or the default when it was not sent.
+pub fn setting_of(settings: H2Settings, id: i64, fallback: i64) -> i64 {
+    for entry in settings.entries {
+        if entry.0 == id {
+            return entry.1
+        }
+    }
+    return fallback
+}
+
+pub fn setting_header_table_size() -> i64 { 1 }
+
+pub fn setting_enable_push() -> i64 { 2 }
+
+pub fn setting_max_concurrent_streams() -> i64 { 3 }
+
+pub fn setting_initial_window_size() -> i64 { 4 }
+
+pub fn setting_max_frame_size() -> i64 { 5 }
+
+pub fn setting_max_header_list_size() -> i64 { 6 }
+
+/// Whether a settings frame is one a peer may send.
+///
+/// The two that have ranges: a window above 2^31-1 and a frame size outside
+/// 16384..16777215 are connection errors, and a client that sends either
+/// gets its connection closed with no explanation beyond a GOAWAY code.
+pub fn settings_are_legal(settings: H2Settings) -> bool ! H2Error {
+    for entry in settings.entries {
+        if entry.0 == setting_initial_window_size() and
+        entry.1 > 2147483647 {
+            fail(BadSetting(entry.0, entry.1))
+        }
+        if entry.0 == setting_max_frame_size() and
+        (entry.1 < 16384 or entry.1 > 16777215) {
+            fail(BadSetting(entry.0, entry.1))
+        }
+        if entry.0 == setting_enable_push() and entry.1 > 1 {
+            fail(BadSetting(entry.0, entry.1))
+        }
+    }
+    return true
+}
+
+/// A WINDOW_UPDATE frame.
+pub fn window_update(stream: i64, increment: i64) -> H2Frame {
+    var out: [i64] = []
+    push_be(out, increment.bit_and(2147483647), 4)
+    return H2Frame{ kind: frame_window_update(), flags: 0, stream: stream,
+        payload: bytes_of(out) }
+}
+
+/// The increment a WINDOW_UPDATE carries.
+pub fn increment_of(frame: H2Frame) -> i64 ! H2Error {
+    return (try read_be(frame.payload, 0, 4)).bit_and(2147483647)
+}
+
+/// A PING, and the eight bytes it echoes.
+pub fn ping(payload: bytes, is_ack: bool) -> H2Frame {
+    var flags = 0
+    if is_ack {
+        flags = flag_ack()
+    }
+    return H2Frame{ kind: frame_ping(), flags: flags, stream: 0,
+        payload: payload }
+}
+
+/// A GOAWAY, saying the last stream that will be processed and why.
+///
+/// The last-stream field is the point: a client can tell which of its
+/// in-flight requests the server never looked at, and retry exactly those.
+pub fn goaway(last_stream: i64, code: i64, debug: bytes) -> H2Frame {
+    var out: [i64] = []
+    push_be(out, last_stream.bit_and(2147483647), 4)
+    push_be(out, code, 4)
+    var i = 0
+    while i < debug.len() {
+        out.push(debug.at(i))
+        i = i + 1
+    }
+    return H2Frame{ kind: frame_goaway(), flags: 0, stream: 0,
+        payload: bytes_of(out) }
+}
+
+/// The last stream and the error code a GOAWAY carries.
+pub fn goaway_of(frame: H2Frame) -> (i64, i64) ! H2Error {
+    return ((try read_be(frame.payload, 0, 4)).bit_and(2147483647),
+        try read_be(frame.payload, 4, 4))
+}
+
+/// A RST_STREAM, which ends one stream and leaves the connection alone.
+pub fn rst_stream(stream: i64, code: i64) -> H2Frame {
+    var out: [i64] = []
+    push_be(out, code, 4)
+    return H2Frame{ kind: frame_rst_stream(), flags: 0, stream: stream,
+        payload: bytes_of(out) }
+}
+
+/// A DATA frame.
+pub fn data_frame(stream: i64, payload: bytes, end: bool) -> H2Frame {
+    var flags = 0
+    if end {
+        flags = flag_end_stream()
+    }
+    return H2Frame{ kind: frame_data(), flags: flags, stream: stream,
+        payload: payload }
+}
+
+/// A HEADERS frame carrying an already-encoded block.
+pub fn headers_frame(stream: i64, block: bytes, end_headers: bool,
+    end_stream: bool) -> H2Frame {
+    var flags = 0
+    if end_headers {
+        flags = flags + flag_end_headers()
+    }
+    if end_stream {
+        flags = flags + flag_end_stream()
+    }
+    return H2Frame{ kind: frame_headers(), flags: flags, stream: stream,
+        payload: block }
+}
+
+/// The error codes, by name.
+pub fn error_name(code: i64) -> str {
+    let names = ["NO_ERROR", "PROTOCOL_ERROR", "INTERNAL_ERROR",
+        "FLOW_CONTROL_ERROR", "SETTINGS_TIMEOUT", "STREAM_CLOSED",
+        "FRAME_SIZE_ERROR", "REFUSED_STREAM", "CANCEL",
+        "COMPRESSION_ERROR", "CONNECT_ERROR", "ENHANCE_YOUR_CALM",
+        "INADEQUATE_SECURITY", "HTTP_1_1_REQUIRED"]
+    if code < 0 or code >= names.len() {
+        return "UNKNOWN"
+    }
+    return names[code]
+}
+
+/// Whether a stream identifier is one a client may open.
+pub fn is_client_stream(id: i64) -> bool {
+    return id > 0 and id % 2 == 1
+}

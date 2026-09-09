@@ -1,0 +1,281 @@
+// gRPC's wire format: HTTP/2, with five bytes in front of every message.
+//
+// gRPC is usually met through a code generator, and the generated code
+// hides how little there is: a call is one HTTP/2 stream, the request and
+// response bodies are length-prefixed protobuf messages, and the outcome
+// arrives in the *trailers* rather than the status line.
+//
+// ## The status is in the trailers, and that is the whole design
+//
+// An HTTP status of 200 means the stream worked; whether the *call* worked
+// is `grpc-status` in the trailers, sent after the last message. That is
+// what lets a streaming call fail halfway through having already sent good
+// data — which HTTP alone cannot express, because the status line is
+// already gone.
+//
+// A consequence people meet the hard way: a proxy that drops trailers turns
+// every gRPC call into a hang, because the client is waiting for a status
+// that will never come.
+//
+// ## Five bytes, and the compression flag nobody sets
+//
+// One byte saying whether the message is compressed, four of length, then
+// the message. The flag is per-message and the algorithm is named once in
+// `grpc-encoding`, so a stream can mix compressed and uncompressed frames —
+// which almost nothing does, and which a reader still has to handle.
+//
+// ## What is not here
+//
+// Protobuf itself, which `protobuf` in this package set does, and the
+// connection, which `http2client` does. This is the framing and the status
+// vocabulary between them.
+
+type GrpcError =
+    | Truncated(at: i64)
+    | Overlong(length: i64)
+    | UnknownCompression(flag: i64)
+    | NoStatus()
+    | BadStatus(text: str)
+
+    /// One message off the wire.
+type GrpcMessage = {
+    compressed: bool,
+    body: bytes,
+}
+
+/// How a call ended.
+type GrpcStatus = {
+    code: i64,
+    message: str,
+    /// The HTTP status the stream carried, which is 200 for almost every
+    /// outcome including the failures.
+    http_status: i64,
+}
+
+/// The content type that selects gRPC.
+pub fn content_type() -> str {
+    return "application/grpc"
+}
+
+/// The path a method is called at: the full service name and the method.
+///
+/// Leading slash, the package-qualified service, another slash, the method
+/// — and the method name keeps the casing from the `.proto`, which is the
+/// one part of gRPC that is not lower-cased somewhere.
+pub fn path_of(service: str, method: str) -> str {
+    return "/" + service + "/" + method
+}
+
+/// The headers a call opens with.
+pub fn call_headers(timeout_millis: i64) -> [(str, str)] {
+    var out: [(str, str)] = [("content-type", content_type()),
+        ("te", "trailers")]
+    if timeout_millis > 0 {
+        // The deadline travels with the call and is a duration rather than
+        // an instant, so it needs no agreement about clocks between the two
+        // ends — which is why gRPC has deadlines that work and HTTP does
+        // not.
+        out.push(("grpc-timeout", "{timeout_millis}m"))
+    }
+    return out
+}
+
+fn push_be(inout out: [i64], value: i64, width: i64) {
+    var i = width - 1
+    while i >= 0 {
+        out.push(value.ushr(i * 8).bit_and(255))
+        i = i - 1
+    }
+}
+
+/// One message framed.
+pub fn frame(message: GrpcMessage) -> bytes ! GrpcError {
+    if message.body.len() > 4294967295 {
+        fail(Overlong(message.body.len()))
+    }
+    var out: [i64] = []
+    if message.compressed {
+        out.push(1)
+    } else {
+        out.push(0)
+    }
+    push_be(out, message.body.len(), 4)
+    var i = 0
+    while i < message.body.len() {
+        out.push(message.body.at(i))
+        i = i + 1
+    }
+    return bytes_of(out)
+}
+
+/// Every whole message in a buffer, and how many bytes were consumed.
+pub fn unframe(data: bytes) -> ([GrpcMessage], i64) ! GrpcError {
+    var out: [GrpcMessage] = []
+    var at = 0
+    while at + 5 <= data.len() {
+        let flag = data.at(at)
+        if flag > 1 {
+            // The byte is a bitfield with one bit defined; anything else is
+            // a message this reader cannot be sure it understands, and
+            // guessing is how a compressed message gets handed to a parser
+            // as though it were protobuf.
+            fail(UnknownCompression(flag))
+        }
+        var length = 0
+        var i = 0
+        while i < 4 {
+            length = length * 256 + data.at(at + 1 + i)
+            i = i + 1
+        }
+        if at + 5 + length > data.len() {
+            return (out, at)
+        }
+        var body: [i64] = []
+        var j = 0
+        while j < length {
+            body.push(data.at(at + 5 + j))
+            j = j + 1
+        }
+        out.push(GrpcMessage{ compressed: flag == 1,
+            body: bytes_of(body) })
+        at = at + 5 + length
+    }
+    return (out, at)
+}
+
+/// The status codes, by name.
+pub fn code_name(code: i64) -> str {
+    let names = ["OK", "CANCELLED", "UNKNOWN", "INVALID_ARGUMENT",
+        "DEADLINE_EXCEEDED", "NOT_FOUND", "ALREADY_EXISTS",
+        "PERMISSION_DENIED", "RESOURCE_EXHAUSTED", "FAILED_PRECONDITION",
+        "ABORTED", "OUT_OF_RANGE", "UNIMPLEMENTED", "INTERNAL",
+        "UNAVAILABLE", "DATA_LOSS", "UNAUTHENTICATED"]
+    if code < 0 or code >= names.len() {
+        return "UNKNOWN_CODE"
+    }
+    return names[code]
+}
+
+pub fn code_ok() -> i64 { 0 }
+
+pub fn code_deadline_exceeded() -> i64 { 4 }
+
+pub fn code_unavailable() -> i64 { 14 }
+
+/// The status a call ended with, read out of its trailers.
+///
+/// A missing `grpc-status` is not "success": it means the trailers never
+/// arrived, which is a failed call that a client reading a default of zero
+/// would report as a success with an empty response.
+pub fn status_of(http_status: i64,
+    trailers: [(str, str)]) -> GrpcStatus ! GrpcError {
+    var found = false
+    var code = 0
+    var message = ""
+    for trailer in trailers {
+        if trailer.0 == "grpc-status" {
+            found = true
+            code = trailer.1.parse_int() ?? 0 - 1
+            if code < 0 {
+                fail(BadStatus(trailer.1))
+            }
+        }
+        if trailer.0 == "grpc-message" {
+            message = percent_decode(trailer.1)
+        }
+    }
+    if not found {
+        fail(NoStatus())
+    }
+    return GrpcStatus{ code: code, message: message,
+        http_status: http_status }
+}
+
+/// `grpc-message` is percent-encoded, because a header may not carry a
+/// newline and error messages have them.
+pub fn percent_decode(text: str) -> str {
+    var out: [i64] = []
+    let codes = text.codes()
+    var i = 0
+    while i < codes.len() {
+        if codes[i] == 37 and i + 2 < codes.len() {
+            let pair = codes[i + 1].to_char() + codes[i + 2].to_char()
+            match pair.parse_int_base(16) {
+                Some(value) -> {
+                    out.push(value)
+                    i = i + 3
+                }
+                None -> {
+                    out.push(codes[i])
+                    i = i + 1
+                }
+            }
+        } else {
+            out.push(codes[i])
+            i = i + 1
+        }
+    }
+    return bytes_of(out).to_str()
+}
+
+/// And the encoding side, for a server.
+pub fn percent_encode(text: str) -> str {
+    let digits = "0123456789ABCDEF"
+    var out = ""
+    for octet in text.to_bytes().to_list() {
+        if octet >= 32 and octet < 127 and octet != 37 {
+            out = out + octet.to_char()
+        } else {
+            out = out + "%" + digits.substr(octet / 16, 1) +
+            digits.substr(octet % 16, 1)
+        }
+    }
+    return out
+}
+
+/// Whether a status is worth retrying.
+///
+/// Only the ones that say the call did not happen. Retrying `ABORTED` or
+/// `INTERNAL` re-runs work that may have half-succeeded, and a client that
+/// retries `INVALID_ARGUMENT` sends the same bad request forever.
+pub fn is_retryable(code: i64) -> bool {
+    return code == code_unavailable() or code == 8
+}
+
+/// The HTTP status a gRPC code maps to, for a gateway.
+pub fn http_status_for(code: i64) -> i64 {
+    if code == 0 {
+        return 200
+    }
+    if code == 3 or code == 11 {
+        return 400
+    }
+    if code == 16 {
+        return 401
+    }
+    if code == 7 {
+        return 403
+    }
+    if code == 5 {
+        return 404
+    }
+    if code == 6 or code == 10 {
+        return 409
+    }
+    if code == 9 {
+        return 412
+    }
+    if code == 8 {
+        return 429
+    }
+    if code == 12 {
+        return 501
+    }
+    if code == 14 {
+        return 503
+    }
+    if code == 4 {
+        return 504
+    }
+    return 500
+}

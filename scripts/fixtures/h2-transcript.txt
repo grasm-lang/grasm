@@ -1,0 +1,31 @@
+# Every byte a real HTTP/2 server sent, in order.
+#
+# Written by scripts/h2_capture.py against the Python `h2` library,
+# whose HPACK encoder produced the header blocks below. `h2_diff.sh`
+# replays these at the client so the gate needs nothing but the
+# standard library, and so the bytes the client is judged against
+# are an outside implementation's rather than this project's.
+#
+# <requests seen> <connection window credit seen> raw  <frame hex>
+# <requests seen> <credit seen> fill <header hex> <byte> <count>
+#
+# The requests, in order: / /missing /big
+0 0 raw 00002a04000000000000010000100000020000000000040000ffff000500004000000800000000000300000064000600010000
+0 0 raw 000000040100000000
+1 0 raw 00000e010400000001885f87497ca58ae819aa5c820b5f
+1 0 raw 00000e00010000000168656c6c6f206f7665722068320a
+2 14 raw 0000040105000000038d5c8107
+3 14 raw 00000801040000000588c05c8410000003
+3 14 fill 004000000000000005 79 16384
+3 14 fill 004000000000000005 79 16384
+3 14 fill 004000000000000005 79 16384
+3 14 fill 003fff000000000005 79 16383
+3 16398 fill 004000000000000005 79 16384
+3 32782 fill 004000000000000005 79 16384
+3 49166 fill 004000000000000005 79 16384
+3 65549 fill 003fff000000000005 79 16383
+3 81933 fill 004000000000000005 79 16384
+3 98317 fill 004000000000000005 79 16384
+3 114701 fill 004000000000000005 79 16384
+3 131084 fill 003fff000000000005 79 16383
+3 147468 fill 000d43000100000005 79 3395

@@ -1,0 +1,16 @@
+[package]
+name = "h2_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.http2frame]
+path = "../http2frame"
+version = "^1.0.0"
+
+[dependencies.grpcwire]
+path = "../grpcwire"
+version = "^1.0.0"
+
+[dependencies.hpack]
+path = "../hpack"
+version = "^1.0.0"

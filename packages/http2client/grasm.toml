@@ -1,0 +1,18 @@
+[package]
+name = "http2client"
+version = "1.0.0"
+
+# A socket, through TLS, and the operating system's randomness beneath it.
+capabilities = ["net", "io"]
+
+[dependencies.http2frame]
+path = "../http2frame"
+version = "^1.0.0"
+
+[dependencies.hpack]
+path = "../hpack"
+version = "^1.0.0"
+
+[dependencies.tlsclient]
+path = "../tlsclient"
+version = "^1.0.0"

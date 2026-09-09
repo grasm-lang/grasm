@@ -425,6 +425,18 @@ pub fn close(c: TlsConnection) / {net} {
     net_close(c.socket)
 }
 
+/// A connection value that is not open.
+///
+/// Here because a caller building a connection in stages needs something to
+/// start from, and a package that makes them assemble one by hand makes
+/// them get the sequence numbers wrong.
+pub fn no_connection() -> TlsConnection {
+    return TlsConnection{ socket: 0 - 1, read_keys: empty_keys(),
+        write_keys: empty_keys(), read_sequence: 0, write_sequence: 0,
+        pending: bytes_of([]), session: no_session(), protocol: "",
+        suite: tls13.suite_aes_128_gcm() }
+}
+
 /// Whether the connection was verified, and what it decided.
 pub fn session_of(c: TlsConnection) -> TlsSession {
     return c.session

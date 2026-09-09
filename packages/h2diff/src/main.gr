@@ -1,0 +1,60 @@
+// The client end of the `h2_diff.sh` gate.
+//
+// Every path named on the command line is requested down *one* connection,
+// in order, because that is the case a second connection would hide: HPACK
+// compresses each header block against the blocks before it, so a client
+// that decodes the second response correctly and the third one wrongly has
+// a bug the first response cannot show.
+import http2client
+
+fn main() / {net, io} {
+    let port = args()[0].parse_int() ?? 0
+    let root = read_bytes(args()[1]) ?? bytes_of([])
+    let host = args()[2]
+    let now = args()[3].parse_int() ?? 0
+    match http2client.connect(host, port, [root], now) {
+        Ok(opened) -> {
+            var c = opened
+            var i = 4
+            while i < args().len() {
+                ask(c, host, args()[i])
+                i = i + 1
+            }
+            http2client.close(c)
+        }
+        Err(why) -> print("connect|" + reason(why))
+    }
+}
+
+fn ask(inout c: H2Connection, host: str, path: str) / {net, io} {
+    match http2client.request(c, "GET", host, path, [], bytes_of([])) {
+        Ok(reply) -> print("{reply.status}|" +
+            http2client.header_of(reply.headers, "content-type") +
+            "|{reply.body.len()}|" + first_line(reply.body))
+        Err(why) -> print("request|" + reason(why))
+    }
+}
+
+fn reason(why: H2ClientError) -> str {
+    match why {
+        Refused(text) -> return "refused/" + text
+        NotVerified(text) -> return "unverified/" + text
+        NoAlpn(text) -> return "noalpn/" + text
+        Protocol(text) -> return "protocol/" + text
+        GoneAway(code, last) -> return "goaway/{code}/{last}"
+        StreamReset(code) -> return "reset/{code}"
+        Closed() -> return "closed/"
+    }
+}
+
+/// The body's first line, capped, so a gate can name what it expects
+/// without writing forty thousand bytes down.
+fn first_line(data: bytes) -> str {
+    var out = ""
+    var i = 0
+    while i < data.len() and i < 30 and data.at(i) != 10 {
+        out = out + data.at(i).to_char()
+        i = i + 1
+    }
+    return out
+}

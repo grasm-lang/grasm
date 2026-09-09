@@ -1,0 +1,6 @@
+[package]
+name = "http2frame"
+version = "1.0.0"
+
+# Bytes. Opens nothing.
+capabilities = []

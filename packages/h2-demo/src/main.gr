@@ -1,0 +1,249 @@
+import http2frame
+import grpcwire
+import hpack
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn from_hex(text: str) -> bytes {
+    var out: [i64] = []
+    var i = 0
+    while i + 1 < text.len() {
+        out.push(text.substr(i, 2).parse_int_base(16) ?? 0)
+        i = i + 2
+    }
+    return bytes_of(out)
+}
+
+fn to_hex(data: bytes) -> str {
+    let digits = "0123456789abcdef"
+    var out = ""
+    var i = 0
+    while i < data.len() {
+        out = out + digits.substr(data.at(i) / 16, 1) +
+        digits.substr(data.at(i) % 16, 1)
+        i = i + 1
+    }
+    return out
+}
+
+// ------------------------------------------------------------ http2frame
+
+fn check_frames(inout f: i64) / {io} {
+    print("-- http2frame: nine bytes of header, then everything else")
+    // hyperframe writes exactly these bytes for these frames.
+    let data = http2frame.data_frame(1, "hello".to_bytes(), true)
+    say(f, "a DATA frame is a length, a type, a flag and a stream",
+        to_hex(http2frame.encode(data) ?? bytes_of([])) ==
+        "00000500010000000168656c6c6f")
+    say(f, "and a SETTINGS frame is six bytes per setting, on stream zero",
+        to_hex(http2frame.encode(http2frame.settings_frame(H2Settings{
+            entries: [(1, 4096), (4, 65535)] })) ?? bytes_of([])) ==
+        "00000c04000000000000010000100000040000ffff")
+    // The preface, which is deliberately not a valid HTTP/1.1 request.
+    say(f, "the preface is a request no HTTP/1.1 server can mistake",
+        to_hex(http2frame.preface()) ==
+        "505249202a20485454502f322e300d0a0d0a534d0d0a0d0a")
+    // Reading them back.
+    let split = http2frame.split(from_hex("00000500010000000168656c6c6f" +
+        "000000040100000000")) ?? ([], 0)
+    say(f, "several frames can share one buffer, and are read in order",
+        split.0.len() == 2 and split.0[0].kind ==
+        http2frame.frame_data() and split.0[1].kind ==
+        http2frame.frame_settings() and split.1 == 23)
+    say(f, "and a partial frame at the end is left for the next read",
+        (http2frame.split(from_hex("0000050001000000")) ?? ([], 1)).1 == 0)
+    // Padding, which is stripped and which must fit.
+    let padded = http2frame.split(from_hex("00000b00080000000106626f6479" +
+        "000000000000")) ?? ([], 0)
+    say(f, "padding is removed, and the pad length byte with it",
+        padded.0.len() == 1 and
+        to_hex(padded.0[0].payload) == "626f6479")
+    say(f, "padding longer than the frame is refused, not clamped",
+        padding_refused("000002000800000001ff00"))
+    // Flags and streams.
+    say(f, "a client's streams are odd, and zero is the connection",
+        http2frame.is_client_stream(1) and
+        http2frame.is_client_stream(3) and
+        not http2frame.is_client_stream(2) and
+        not http2frame.is_client_stream(0))
+    say(f, "the reserved top bit of a stream id is ignored on the way in",
+        (http2frame.split(from_hex("000000060080000001" +
+            "")) ?? ([], 0)).0[0].stream == 1)
+    // Settings, and the two that have legal ranges.
+    let settings = http2frame.settings_of(H2Frame{ kind: 4, flags: 0,
+        stream: 0, payload: from_hex("000100001000000400010000") }) ??
+    H2Settings{ entries: [] }
+    say(f, "settings come back in the order they were written",
+        settings.entries.len() == 2 and settings.entries[0].0 == 1 and
+        http2frame.setting_of(settings, 4, 0) == 65536)
+    say(f, "a frame size outside sixteen k to sixteen meg is refused",
+        settings_refused(5, 100) and settings_refused(5, 16777216) and
+        not settings_refused(5, 16384))
+    say(f, "and a window above two to the thirty-one is refused",
+        settings_refused(4, 2147483648) and not settings_refused(4, 1))
+    // The frames that carry a number.
+    say(f, "a WINDOW_UPDATE carries an increment and nothing else",
+        (http2frame.increment_of(http2frame.window_update(3, 65535)) ?? 0)
+        == 65535)
+    say(f, "a GOAWAY says which streams the peer actually looked at",
+        (http2frame.goaway_of(http2frame.goaway(7, 1, bytes_of([]))) ??
+            (0, 0)) == (7, 1))
+    say(f, "and the error codes have the names the RFC gives them",
+        http2frame.error_name(0) == "NO_ERROR" and
+        http2frame.error_name(7) == "REFUSED_STREAM" and
+        http2frame.error_name(11) == "ENHANCE_YOUR_CALM" and
+        http2frame.error_name(99) == "UNKNOWN")
+    // A SETTINGS acknowledgement is empty and flagged.
+    say(f, "an acknowledgement is the same frame, empty and flagged",
+        http2frame.settings_ack().payload.len() == 0 and
+        http2frame.has_flag(http2frame.settings_ack(),
+            http2frame.flag_ack()))
+}
+
+fn padding_refused(hex: str) -> bool {
+    match http2frame.split(from_hex(hex)) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn settings_refused(id: i64, value: i64) -> bool {
+    match http2frame.settings_are_legal(H2Settings{
+        entries: [(id, value)] }) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+// ----------------------------------------------------------------- hpack
+
+fn check_huffman(inout f: i64) / {io} {
+    print("-- hpack: a Huffman table taken from the RFC, not from memory")
+    // RFC 7541's own examples, appendix C.
+    say(f, "www.example.com codes to the twelve bytes C.4.1 shows",
+        to_hex((hpack.huffman_encode("www.example.com".to_bytes())).0) ==
+        "f1e3c2e5f23a6ba0ab90f4ff")
+    say(f, "no-cache to the six bytes beside it",
+        to_hex((hpack.huffman_encode("no-cache".to_bytes())).0) ==
+        "a8eb10649cbf")
+    say(f, "custom-key and custom-value likewise",
+        to_hex((hpack.huffman_encode("custom-key".to_bytes())).0) ==
+        "25a849e95ba97d7f" and
+        to_hex((hpack.huffman_encode("custom-value".to_bytes())).0) ==
+        "25a849e95bb8e8b4bf")
+    // Whether it was worth it, which an encoder must decide per string.
+    say(f, "a single letter costs more coded than plain, and says so",
+        not (hpack.huffman_encode("a".to_bytes())).1 and
+        (hpack.huffman_encode("www.example.com".to_bytes())).1)
+    // The padding rule, which is the security-relevant part.
+    var table = hpack.new_table(4096)
+    say(f, "a string padded with anything but ones is refused",
+        block_refused(table, "0001618af1e3c2e5f23a6ba0ab90f4fe"))
+    say(f, "and an explicit end-of-string symbol inside one is refused",
+        block_refused(table, "000161a4ffffffff"))
+}
+
+fn block_refused(inout table: HeaderTable, hex: str) -> bool {
+    match hpack.decode(table, from_hex(hex)) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+// -------------------------------------------------------------- grpcwire
+
+fn check_grpc(inout f: i64) / {io} {
+    print("-- grpcwire: five bytes in front, the status in the trailers")
+    say(f, "a message is a compression byte, four of length, then bytes",
+        to_hex(grpcwire.frame(GrpcMessage{ compressed: false,
+            body: from_hex("0a02686900") }) ?? bytes_of([])) ==
+        "00000000050a02686900")
+    let messages = grpcwire.unframe(from_hex("0000000002aabb" +
+        "0000000001cc")) ?? ([], 0)
+    say(f, "and a stream of them comes apart at the lengths",
+        messages.0.len() == 2 and to_hex(messages.0[0].body) == "aabb" and
+        to_hex(messages.0[1].body) == "cc" and messages.1 == 13)
+    say(f, "a half-arrived message is left for the next read",
+        (grpcwire.unframe(from_hex("0000000004aabb")) ?? ([], 1)).1 == 0)
+    say(f, "a compression byte that is not zero or one is refused",
+        unframe_refused("0200000000"))
+    // The path and the headers a call opens with.
+    say(f, "a method is called at a path built from the service name",
+        grpcwire.path_of("helloworld.Greeter", "SayHello") ==
+        "/helloworld.Greeter/SayHello")
+    say(f, "the call says it will accept trailers, which is the point",
+        header_present(grpcwire.call_headers(0), "te", "trailers") and
+        header_present(grpcwire.call_headers(0), "content-type",
+            "application/grpc"))
+    say(f, "and a deadline travels as a duration, not an instant",
+        header_present(grpcwire.call_headers(5000), "grpc-timeout",
+            "5000m"))
+    // The status, and the case that looks like success and is not.
+    say(f, "the outcome is a trailer, and its absence is a failed call",
+        (grpcwire.status_of(200, [("grpc-status", "0")]) ??
+            GrpcStatus{ code: 0 - 1, message: "", http_status: 0 }).code == 0
+        and status_refused([("content-type", "application/grpc")]))
+    say(f, "a trailer message is percent-encoded; headers hold no newline",
+        (grpcwire.status_of(200, [("grpc-status", "5"),
+            ("grpc-message", "no%20such%20row")]) ??
+            GrpcStatus{ code: 0, message: "", http_status: 0 }).message ==
+        "no such row")
+    say(f, "and encoding one puts back what a header cannot carry",
+        grpcwire.percent_encode("two\nlines") == "two%0Alines" and
+        grpcwire.percent_decode("two%0Alines") == "two\nlines")
+    say(f, "the codes have the names the specification gives them",
+        grpcwire.code_name(0) == "OK" and
+        grpcwire.code_name(4) == "DEADLINE_EXCEEDED" and
+        grpcwire.code_name(16) == "UNAUTHENTICATED" and
+        grpcwire.code_name(99) == "UNKNOWN_CODE")
+    say(f, "only the ones saying the call did not happen are retried",
+        grpcwire.is_retryable(14) and grpcwire.is_retryable(8) and
+        not grpcwire.is_retryable(13) and not grpcwire.is_retryable(3))
+    say(f, "and a gateway has a status for each, none of them 200",
+        grpcwire.http_status_for(0) == 200 and
+        grpcwire.http_status_for(5) == 404 and
+        grpcwire.http_status_for(16) == 401 and
+        grpcwire.http_status_for(4) == 504)
+}
+
+fn header_present(headers: [(str, str)], name: str, value: str) -> bool {
+    for header in headers {
+        if header.0 == name and header.1 == value {
+            return true
+        }
+    }
+    return false
+}
+
+fn unframe_refused(hex: str) -> bool {
+    match grpcwire.unframe(from_hex(hex)) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn status_refused(trailers: [(str, str)]) -> bool {
+    match grpcwire.status_of(200, trailers) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn main() / {io} {
+    var f = 0
+    check_frames(f)
+    check_huffman(f)
+    check_grpc(f)
+    if f == 0 {
+        print("http2: every claim held")
+    } else {
+        print("http2: {f} claims failed")
+    }
+}
