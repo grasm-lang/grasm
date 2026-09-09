@@ -1,0 +1,6 @@
+[package]
+name = "rpmfile"
+version = "1.0.0"
+
+# Reading bytes it is handed. Opens nothing.
+capabilities = []

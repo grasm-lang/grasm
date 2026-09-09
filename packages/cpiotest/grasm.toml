@@ -1,0 +1,8 @@
+[package]
+name = "cpiotest"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.cpio]
+path = "../cpio"
+version = "^1.0.0"

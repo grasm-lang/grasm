@@ -1,0 +1,353 @@
+// cpio archives, which is what an initramfs is and what RPM packages
+// hold.
+//
+// A cpio archive is the simplest archive format still in use: a header,
+// a name, the file, repeat, and a last entry called `TRAILER!!!`. There
+// is no index and no central directory, so the only way to find a file
+// is to walk the whole archive — which is exactly what a boot loader
+// wants and exactly what a random-access reader cannot have.
+//
+// ## There are several formats and they do not announce themselves well
+//
+// The first six bytes are the format: `070701` is the "new ASCII"
+// format everything uses today, `070702` the same with a CRC, and
+// `070707` the old portable format whose numbers are *octal* and whose
+// header is a different size. A reader that assumes one of them reads a
+// header of the wrong length and then walks off the end of the archive.
+//
+// ## Padding is measured from the start of the archive
+//
+// In the new format the name and the file are each padded so the *next*
+// header begins on a four-byte boundary. The padding therefore depends
+// on where the entry started, not on the length of the name alone, and
+// getting it wrong shifts everything after it. The old format has no
+// padding at all.
+//
+// ## The size of a hard link is a lie in one direction
+//
+// The new format stores the file content with the *last* link to an
+// inode and gives the earlier ones a size of zero. A reader that
+// extracts them in order writes empty files, then the real one; a
+// reader that stops at the first match writes an empty file.
+
+type CpioError =
+    | Truncated(at: i64)
+    | BadMagic(at: i64)
+    | BadNumber(text: str)
+
+    /// One entry of an archive.
+type CpioEntry = {
+    name: str,
+    mode: i64,
+    uid: i64,
+    gid: i64,
+    nlink: i64,
+    mtime: i64,
+    size: i64,
+    /// The device and inode, which is how hard links are recognised.
+    device_major: i64,
+    device_minor: i64,
+    inode: i64,
+    /// The file itself.
+    data: bytes,
+}
+
+/// `070701`, `070702` or `070707`.
+pub fn format_of(data: bytes) -> str {
+    if data.len() < 6 {
+        return ""
+    }
+    var out = ""
+    var i = 0
+    while i < 6 {
+        out = out + bytes_of([data.at(i)]).to_str()
+        i = i + 1
+    }
+    if out == "070701" or out == "070702" or out == "070707" {
+        return out
+    }
+    return ""
+}
+
+fn digit_value(byte: i64) -> i64 {
+    if byte >= 48 and byte <= 57 {
+        return byte - 48
+    }
+    if byte >= 97 and byte <= 102 {
+        return byte - 97 + 10
+    }
+    if byte >= 65 and byte <= 70 {
+        return byte - 65 + 10
+    }
+    return 0 - 1
+}
+
+fn number_at(data: bytes, at: i64, width: i64, base: i64) -> i64 ! CpioError {
+    if at + width > data.len() {
+        fail(Truncated(at))
+    }
+    var out = 0
+    var i = 0
+    while i < width {
+        let value = digit_value(data.at(at + i))
+        if value < 0 or value >= base {
+            // A field padded with spaces or NULs stops the number
+            // rather than failing: the old format writes both.
+            if data.at(at + i) == 32 or data.at(at + i) == 0 {
+                return out
+            }
+            fail(BadNumber("{data.at(at + i)}"))
+        }
+        out = out * base + value
+        i = i + 1
+    }
+    return out
+}
+
+fn slice_of(data: bytes, at: i64, size: i64) -> bytes ! CpioError {
+    if at + size > data.len() {
+        fail(Truncated(at))
+    }
+    var out: [i64] = []
+    var i = 0
+    while i < size {
+        out.push(data.at(at + i))
+        i = i + 1
+    }
+    return bytes_of(out)
+}
+
+fn name_of(data: bytes, at: i64, size: i64) -> str ! CpioError {
+    var out: [i64] = []
+    var i = 0
+    while i < size {
+        if at + i >= data.len() {
+            fail(Truncated(at + i))
+        }
+        if data.at(at + i) == 0 {
+            i = size
+        } else {
+            out.push(data.at(at + i))
+            i = i + 1
+        }
+    }
+    return bytes_of(out).to_str()
+}
+
+fn rounded_up(value: i64, to: i64) -> i64 {
+    if value % to == 0 {
+        return value
+    }
+    return value + to - value % to
+}
+
+/// Read an archive. The `TRAILER!!!` entry ends it and is not returned.
+pub fn parse(data: bytes) -> [CpioEntry] ! CpioError {
+    var out: [CpioEntry] = []
+    var at = 0
+    while at < data.len() {
+        let kind = format_of(try slice_of(data, at, 6))
+        if kind.len() == 0 {
+            // A trailing run of NULs is padding to a block boundary,
+            // not a broken header.
+            if data.at(at) == 0 {
+                return out
+            }
+            fail(BadMagic(at))
+        }
+        var entry = CpioEntry{ name: "", mode: 0, uid: 0, gid: 0, nlink: 0,
+            mtime: 0, size: 0, device_major: 0, device_minor: 0, inode: 0,
+            data: bytes_of([]) }
+        var name_size = 0
+        var header = 0
+        if kind == "070707" {
+            entry.device_major = try number_at(data, at + 6, 6, 8)
+            entry.inode = try number_at(data, at + 12, 6, 8)
+            entry.mode = try number_at(data, at + 18, 6, 8)
+            entry.uid = try number_at(data, at + 24, 6, 8)
+            entry.gid = try number_at(data, at + 30, 6, 8)
+            entry.nlink = try number_at(data, at + 36, 6, 8)
+            entry.mtime = try number_at(data, at + 48, 11, 8)
+            name_size = try number_at(data, at + 59, 6, 8)
+            entry.size = try number_at(data, at + 65, 11, 8)
+            header = 76
+        } else {
+            entry.inode = try number_at(data, at + 6, 8, 16)
+            entry.mode = try number_at(data, at + 14, 8, 16)
+            entry.uid = try number_at(data, at + 22, 8, 16)
+            entry.gid = try number_at(data, at + 30, 8, 16)
+            entry.nlink = try number_at(data, at + 38, 8, 16)
+            entry.mtime = try number_at(data, at + 46, 8, 16)
+            entry.size = try number_at(data, at + 54, 8, 16)
+            entry.device_major = try number_at(data, at + 62, 8, 16)
+            entry.device_minor = try number_at(data, at + 70, 8, 16)
+            name_size = try number_at(data, at + 94, 8, 16)
+            header = 110
+        }
+        entry.name = try name_of(data, at + header, name_size)
+        var body = at + header + name_size
+        if kind != "070707" {
+            body = at + rounded_up(header + name_size, 4)
+        }
+        entry.data = try slice_of(data, body, entry.size)
+        if entry.name == "TRAILER!!!" {
+            return out
+        }
+        out.push(entry)
+        at = body + entry.size
+        if kind != "070707" {
+            at = body + rounded_up(entry.size, 4)
+        }
+    }
+    return out
+}
+
+fn hex_field(value: i64, width: i64) -> str {
+    let digits = "0123456789ABCDEF"
+    var out = ""
+    var left = value
+    var i = 0
+    while i < width {
+        out = digits.substr(left % 16, 1) + out
+        left = left / 16
+        i = i + 1
+    }
+    return out
+}
+
+fn octal_field(value: i64, width: i64) -> str {
+    var out = ""
+    var left = value
+    var i = 0
+    while i < width {
+        out = "{left % 8}" + out
+        left = left / 8
+        i = i + 1
+    }
+    return out
+}
+
+fn push_text(inout out: [i64], text: str) {
+    let raw = text.to_bytes()
+    var i = 0
+    while i < raw.len() {
+        out.push(raw.at(i))
+        i = i + 1
+    }
+}
+
+fn push_bytes(inout out: [i64], data: bytes) {
+    var i = 0
+    while i < data.len() {
+        out.push(data.at(i))
+        i = i + 1
+    }
+}
+
+fn pad_to(inout out: [i64], to: i64) {
+    while out.len() % to != 0 {
+        out.push(0)
+    }
+}
+
+fn write_new(inout out: [i64], entry: CpioEntry, name: str, size: i64) {
+    push_text(out, "070701")
+    push_text(out, hex_field(entry.inode, 8))
+    push_text(out, hex_field(entry.mode, 8))
+    push_text(out, hex_field(entry.uid, 8))
+    push_text(out, hex_field(entry.gid, 8))
+    push_text(out, hex_field(entry.nlink, 8))
+    push_text(out, hex_field(entry.mtime, 8))
+    push_text(out, hex_field(size, 8))
+    push_text(out, hex_field(entry.device_major, 8))
+    push_text(out, hex_field(entry.device_minor, 8))
+    push_text(out, hex_field(0, 8))
+    push_text(out, hex_field(0, 8))
+    push_text(out, hex_field(name.len() + 1, 8))
+    push_text(out, hex_field(0, 8))
+    push_text(out, name)
+    out.push(0)
+    pad_to(out, 4)
+}
+
+fn write_old(inout out: [i64], entry: CpioEntry, name: str, size: i64) {
+    push_text(out, "070707")
+    push_text(out, octal_field(entry.device_major, 6))
+    push_text(out, octal_field(entry.inode, 6))
+    push_text(out, octal_field(entry.mode, 6))
+    push_text(out, octal_field(entry.uid, 6))
+    push_text(out, octal_field(entry.gid, 6))
+    push_text(out, octal_field(entry.nlink, 6))
+    push_text(out, octal_field(0, 6))
+    push_text(out, octal_field(entry.mtime, 11))
+    push_text(out, octal_field(name.len() + 1, 6))
+    push_text(out, octal_field(size, 11))
+    push_text(out, name)
+    out.push(0)
+}
+
+/// Write an archive, in `070701` or `070707`.
+///
+/// The trailer is written for you, because an archive without one is not
+/// an archive: every reader walks until it sees that name.
+pub fn render(entries: [CpioEntry], format: str) -> bytes {
+    var out: [i64] = []
+    let old = format == "070707"
+    for entry in entries {
+        if old {
+            write_old(out, entry, entry.name, entry.data.len())
+        } else {
+            write_new(out, entry, entry.name, entry.data.len())
+        }
+        push_bytes(out, entry.data)
+        if not old {
+            pad_to(out, 4)
+        }
+    }
+    let trailer = CpioEntry{ name: "TRAILER!!!", mode: 0, uid: 0, gid: 0,
+        nlink: 1, mtime: 0, size: 0, device_major: 0, device_minor: 0,
+        inode: 0, data: bytes_of([]) }
+    if old {
+        write_old(out, trailer, "TRAILER!!!", 0)
+    } else {
+        write_new(out, trailer, "TRAILER!!!", 0)
+    }
+    // Archives are padded to a 512-byte block, which is what `cpio`
+    // writes and what a reader skipping to the end expects.
+    while out.len() % 512 != 0 {
+        out.push(0)
+    }
+    return bytes_of(out)
+}
+
+/// Whether the mode says directory, regular file or symbolic link.
+pub fn kind_of(entry: CpioEntry) -> str {
+    let top = entry.mode / 4096 % 16
+    if top == 4 {
+        return "directory"
+    }
+    if top == 8 {
+        return "file"
+    }
+    if top == 10 {
+        return "symlink"
+    }
+    if top == 6 {
+        return "block device"
+    }
+    if top == 2 {
+        return "character device"
+    }
+    if top == 1 {
+        return "fifo"
+    }
+    if top == 12 {
+        return "socket"
+    }
+    return "unknown"
+}
+
+/// The permission bits alone.
+pub fn permissions_of(entry: CpioEntry) -> i64 {
+    return entry.mode % 4096
+}

@@ -1,0 +1,8 @@
+[package]
+name = "cstest"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.checksumfile]
+path = "../checksumfile"
+version = "^1.0.0"

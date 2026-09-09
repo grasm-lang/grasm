@@ -1,0 +1,410 @@
+// ISO 9660 images: the volume descriptors, the directory tree, and the
+// three different names one file can have inside them.
+//
+// A CD image is still how operating systems are shipped and how a
+// virtual machine is handed a disc, so reading one is a normal thing to
+// need. The format is from 1988 and shows it in ways that matter:
+//
+// ## Every number is stored twice
+//
+// A field is written little-endian *and* big-endian, one after the
+// other, so a machine of either kind could read the disc without
+// swapping. A reader that takes the first four bytes of an eight-byte
+// field gets the right answer; one that takes all eight gets a number
+// in the quintillions. Both halves must agree, and this reads the
+// little-endian half and says so.
+//
+// ## One file has up to three names
+//
+// The base standard allows eight characters, a dot, three more, and a
+// `;1` version — `README.TXT;1`. Joliet adds a second directory tree
+// with the same files under UCS-2 names of up to 64 characters. Rock
+// Ridge leaves the tree alone and hides the real name in the padding
+// after each record. A reader that reports only the first shows
+// `HELLO~1.TXT` for a file everyone else calls `hello.txt`.
+//
+// ## The padding is not padding
+//
+// Rock Ridge lives in the "system use" area after a directory record's
+// name, which is why the record length is not the size of the struct
+// plus the name. Skipping to the next record by adding a computed size
+// walks into the middle of one; the length is in the record's first
+// byte for exactly this reason.
+
+type Iso9660Error =
+    | NotAnIso()
+    | Truncated(at: i64)
+    | NoPrimary()
+
+    /// A volume descriptor: what kind, and where it is.
+type IsoVolume = {
+    /// 1 primary, 2 supplementary (Joliet), 255 terminator.
+    kind: i64,
+    at: i64,
+    system_id: str,
+    volume_id: str,
+    /// In blocks.
+    volume_size: i64,
+    block_size: i64,
+    /// Whether the escape sequences say this is a Joliet tree.
+    joliet: bool,
+    /// The root directory's record.
+    root_extent: i64,
+    root_length: i64,
+}
+
+/// One entry of a directory.
+type IsoEntry = {
+    /// The name as the tree spells it, with any `;1` removed.
+    name: str,
+    /// The Rock Ridge name when the record carries one.
+    posix_name: str,
+    extent: i64,
+    size: i64,
+    is_directory: bool,
+    /// Year, month, day, hour, minute, second.
+    recorded: [i64],
+}
+
+fn byte_at(data: bytes, at: i64) -> i64 ! Iso9660Error {
+    if at < 0 or at >= data.len() {
+        fail(Truncated(at))
+    }
+    return data.at(at)
+}
+
+/// The little-endian half of a both-endian field.
+pub fn number_at(data: bytes, at: i64, width: i64) -> i64 ! Iso9660Error {
+    var out = 0
+    var i = width - 1
+    while i >= 0 {
+        out = out * 256 + (try byte_at(data, at + i))
+        i = i - 1
+    }
+    return out
+}
+
+fn trimmed(data: bytes, at: i64, width: i64) -> str ! Iso9660Error {
+    var out: [i64] = []
+    var i = 0
+    while i < width {
+        out.push(try byte_at(data, at + i))
+        i = i + 1
+    }
+    var text = bytes_of(out).to_str()
+    while text.ends_with(" ") {
+        text = text.substr(0, text.len() - 1)
+    }
+    return text
+}
+
+/// UCS-2 big-endian, which is what a Joliet name is.
+fn ucs2_name(data: bytes, at: i64, width: i64) -> str ! Iso9660Error {
+    var out = ""
+    var i = 0
+    while i + 1 < width {
+        let code = (try byte_at(data, at + i)) * 256 +
+        (try byte_at(data, at + i + 1))
+        if code != 0 {
+            out = out + string_of_code(code)
+        }
+        i = i + 2
+    }
+    return out
+}
+
+fn string_of_code(code: i64) -> str {
+    if code < 128 {
+        return bytes_of([code]).to_str()
+    }
+    if code < 2048 {
+        return bytes_of([192 + code / 64, 128 + code % 64]).to_str()
+    }
+    return bytes_of([224 + code / 4096, 128 + code / 64 % 64,
+        128 + code % 64]).to_str()
+}
+
+/// Whether the image has the `CD001` signature where one belongs.
+pub fn is_iso(data: bytes) -> bool {
+    if data.len() < 32774 {
+        return false
+    }
+    return data.at(32769) == 67 and data.at(32770) == 68 and
+    data.at(32771) == 48 and data.at(32772) == 48 and data.at(32773) == 49
+}
+
+/// Every volume descriptor, in the order they appear.
+pub fn volumes(data: bytes) -> [IsoVolume] ! Iso9660Error {
+    if not is_iso(data) {
+        fail(NotAnIso())
+    }
+    var out: [IsoVolume] = []
+    var at = 16 * 2048
+    while at + 2048 <= data.len() {
+        let kind = try byte_at(data, at)
+        if kind == 255 {
+            out.push(IsoVolume{ kind: kind, at: at, system_id: "",
+                volume_id: "", volume_size: 0, block_size: 0,
+                joliet: false, root_extent: 0, root_length: 0 })
+            return out
+        }
+        // A Joliet tree is a supplementary descriptor whose escape
+        // sequence begins `%/`; the third byte says how many levels.
+        var joliet = false
+        if kind == 2 and (try byte_at(data, at + 88)) == 37 and
+        (try byte_at(data, at + 89)) == 47 {
+            joliet = true
+        }
+        var system_id = ""
+        var volume_id = ""
+        if joliet {
+            system_id = try ucs2_name(data, at + 8, 32)
+            volume_id = try ucs2_name(data, at + 40, 32)
+        } else {
+            system_id = try trimmed(data, at + 8, 32)
+            volume_id = try trimmed(data, at + 40, 32)
+        }
+        out.push(IsoVolume{ kind: kind, at: at, system_id: system_id,
+            volume_id: volume_id,
+            volume_size: try number_at(data, at + 80, 4),
+            block_size: try number_at(data, at + 128, 2),
+            joliet: joliet,
+            root_extent: try number_at(data, at + 156 + 2, 4),
+            root_length: try number_at(data, at + 156 + 10, 4) })
+        at = at + 2048
+    }
+    return out
+}
+
+/// The primary volume descriptor.
+pub fn primary(data: bytes) -> IsoVolume ! Iso9660Error {
+    for one in try volumes(data) {
+        if one.kind == 1 {
+            return one
+        }
+    }
+    fail(NoPrimary())
+}
+
+/// The Joliet descriptor, if the image has one.
+pub fn joliet(data: bytes) -> Option[IsoVolume] {
+    for one in volumes(data) ?? [] {
+        if one.joliet {
+            return Some(one)
+        }
+    }
+    return None
+}
+
+/// The Rock Ridge `NM` name in a record's system-use area, or "".
+///
+/// The entries are `signature, length, version, body`, and `NM`'s body
+/// begins with a flag byte. A name too long for one entry is continued
+/// in the next, which is why this appends rather than returns at the
+/// first.
+fn rock_ridge_name(data: bytes, at: i64, ends: i64) -> str ! Iso9660Error {
+    var out = ""
+    var i = at
+    while i + 4 <= ends {
+        let length = try byte_at(data, i + 2)
+        if length < 3 {
+            return out
+        }
+        if (try byte_at(data, i)) == 78 and (try byte_at(data, i + 1)) == 77 {
+            var body: [i64] = []
+            var j = 5
+            while j < length {
+                body.push(try byte_at(data, i + j))
+                j = j + 1
+            }
+            out = out + bytes_of(body).to_str()
+        }
+        i = i + length
+    }
+    return out
+}
+
+fn read_entry(data: bytes, at: i64, as_ucs2: bool) -> IsoEntry ! Iso9660Error {
+    let length = try byte_at(data, at)
+    let name_length = try byte_at(data, at + 32)
+    var name = ""
+    if as_ucs2 {
+        name = try ucs2_name(data, at + 33, name_length)
+    } else {
+        var raw: [i64] = []
+        var i = 0
+        while i < name_length {
+            raw.push(try byte_at(data, at + 33 + i))
+            i = i + 1
+        }
+        name = bytes_of(raw).to_str()
+    }
+    // `;1` is a version number, not part of the name, and a name that
+    // is nothing but a dot is a directory's own entry.
+    var at_semicolon = 0 - 1
+    var k = 0
+    while k < name.len() {
+        if name.substr(k, 1) == ";" {
+            at_semicolon = k
+        }
+        k = k + 1
+    }
+    if at_semicolon >= 0 {
+        name = name.substr(0, at_semicolon)
+    }
+    if name.ends_with(".") and name.len() > 1 {
+        name = name.substr(0, name.len() - 1)
+    }
+    var system_use = at + 33 + name_length
+    if name_length % 2 == 0 {
+        system_use = system_use + 1
+    }
+    let flags = try byte_at(data, at + 25)
+    return IsoEntry{ name: name,
+        posix_name: try rock_ridge_name(data, system_use, at + length),
+        extent: try number_at(data, at + 2, 4),
+        size: try number_at(data, at + 10, 4),
+        is_directory: flags / 2 % 2 == 1,
+        recorded: [1900 + (try byte_at(data, at + 18)),
+            try byte_at(data, at + 19), try byte_at(data, at + 20),
+            try byte_at(data, at + 21), try byte_at(data, at + 22),
+            try byte_at(data, at + 23)] }
+}
+
+/// The entries of one directory, given where it is and how big it is.
+///
+/// The two entries every directory begins with — itself and its parent,
+/// named with a single zero byte and a single one — are left out.
+pub fn entries(data: bytes, extent: i64, size: i64,
+    as_ucs2: bool) -> [IsoEntry] ! Iso9660Error {
+    var out: [IsoEntry] = []
+    var at = extent * 2048
+    let ends = at + size
+    while at < ends {
+        let length = try byte_at(data, at)
+        if length == 0 {
+            // A record never straddles a sector, so a zero length means
+            // "the rest of this sector is empty".
+            at = (at / 2048 + 1) * 2048
+            continue
+        }
+        let name_length = try byte_at(data, at + 32)
+        if name_length == 1 and (try byte_at(data, at + 33)) < 2 {
+            at = at + length
+            continue
+        }
+        out.push(try read_entry(data, at, as_ucs2))
+        at = at + length
+    }
+    return out
+}
+
+/// Every file in the image, as whole paths, walking whichever tree is
+/// asked for.
+pub fn walk(data: bytes, use_joliet: bool) -> [(str, i64)] ! Iso9660Error {
+    var volume = try primary(data)
+    var as_ucs2 = false
+    if use_joliet {
+        match joliet(data) {
+            Some(other) -> {
+                volume = other
+                as_ucs2 = true
+            }
+            None -> {}
+        }
+    }
+    var out: [(str, i64)] = []
+    var pending: [(str, i64, i64)] = [("", volume.root_extent,
+        volume.root_length)]
+    // An image is a file somebody else wrote, and a directory that
+    // points at itself is a walk that never ends. Each extent is
+    // entered once.
+    var seen: [i64] = []
+    while pending.len() > 0 {
+        let here = pending[pending.len() - 1]
+        pending.pop()
+        var visited = false
+        for one in seen {
+            if one == here.1 {
+                visited = true
+            }
+        }
+        if visited {
+            continue
+        }
+        seen.push(here.1)
+        for one in try entries(data, here.1, here.2, as_ucs2) {
+            var name = one.name
+            if one.posix_name.len() > 0 {
+                name = one.posix_name
+            }
+            let path = here.0 + "/" + name
+            if one.is_directory {
+                pending.push((path, one.extent, one.size))
+            } else {
+                out.push((path, one.size))
+            }
+        }
+    }
+    return out
+}
+
+/// The bytes of one file, given its record.
+pub fn contents(data: bytes, entry: IsoEntry) -> bytes ! Iso9660Error {
+    var out: [i64] = []
+    var i = 0
+    while i < entry.size {
+        out.push(try byte_at(data, entry.extent * 2048 + i))
+        i = i + 1
+    }
+    return bytes_of(out)
+}
+
+/// Find one entry by its whole path, in whichever tree is asked for.
+pub fn find(data: bytes, path: str,
+    use_joliet: bool) -> Option[IsoEntry] {
+    var volume = primary(data) ?? no_volume()
+    var as_ucs2 = false
+    if use_joliet {
+        match joliet(data) {
+            Some(other) -> {
+                volume = other
+                as_ucs2 = true
+            }
+            None -> {}
+        }
+    }
+    var extent = volume.root_extent
+    var size = volume.root_length
+    var answer: Option[IsoEntry] = None
+    for piece in path.split("/") {
+        if piece.len() == 0 {
+            continue
+        }
+        var next: Option[IsoEntry] = None
+        for one in entries(data, extent, size, as_ucs2) ?? [] {
+            var name = one.name
+            if one.posix_name.len() > 0 {
+                name = one.posix_name
+            }
+            if name == piece {
+                next = Some(one)
+            }
+        }
+        match next {
+            Some(one) -> {
+                extent = one.extent
+                size = one.size
+                answer = Some(one)
+            }
+            None -> return None
+        }
+    }
+    return answer
+}
+
+fn no_volume() -> IsoVolume {
+    return IsoVolume{ kind: 0, at: 0, system_id: "", volume_id: "",
+        volume_size: 0, block_size: 0, joliet: false, root_extent: 0,
+        root_length: 0 }
+}

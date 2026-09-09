@@ -1,0 +1,20 @@
+[package]
+name = "discs_demo"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.cpio]
+path = "../cpio"
+version = "^1.0.0"
+
+[dependencies.rpmfile]
+path = "../rpmfile"
+version = "^1.0.0"
+
+[dependencies.iso9660]
+path = "../iso9660"
+version = "^1.0.0"
+
+[dependencies.checksumfile]
+path = "../checksumfile"
+version = "^1.0.0"

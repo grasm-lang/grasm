@@ -1,0 +1,45 @@
+import cpio
+
+fn digest_of(data: bytes) -> str {
+    // A cheap checksum: enough to say two byte strings differ, and it
+    // keeps the comparison out of the archive reader being checked.
+    var sum = 0
+    var i = 0
+    while i < data.len() {
+        sum = (sum * 31 + data.at(i)) % 1000000007
+        i = i + 1
+    }
+    return "{sum}"
+}
+
+fn main() / {io} {
+    if args().len() < 2 {
+        return
+    }
+    // `list <archive>` prints the entries; `rewrite <in> <out> <format>`
+    // reads one and writes it back out for `cpio` itself to read.
+    if args()[0] == "list" {
+        let data = read_bytes(args()[1]) ?? bytes_of([])
+        print(cpio.format_of(data))
+        match cpio.parse(data) {
+            Ok(entries) -> {
+                for one in entries {
+                    print(one.name + "\u{2}" + cpio.kind_of(one) +
+                        "\u{2}{cpio.permissions_of(one)}" +
+                        "\u{2}{one.size}\u{2}{one.mtime}" +
+                        "\u{2}{one.uid}\u{2}{one.gid}\u{2}{one.nlink}" +
+                        "\u{2}" + digest_of(one.data))
+                }
+            }
+            Err(_why) -> print("error")
+        }
+        return
+    }
+    let data = read_bytes(args()[1]) ?? bytes_of([])
+    let entries = cpio.parse(data) ?? []
+    match write_bytes(args()[2], cpio.render(entries, args()[3])) {
+        Ok(_written) -> {}
+        Err(_why) -> print("error")
+    }
+    print("{entries.len()}")
+}

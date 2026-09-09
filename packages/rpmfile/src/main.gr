@@ -1,0 +1,325 @@
+// RPM packages: the lead, the two headers, and the metadata every
+// package manager reads before it decides anything.
+//
+// An `.rpm` is four things joined end to end: a 96-byte lead nobody
+// uses any more, a signature header, the header proper, and a
+// compressed cpio archive of the files. The two headers have the same
+// shape, which is a small database in a byte string: a count of index
+// entries, then the entries, then one data store the entries point into.
+//
+// ## Everything is big-endian, including on little-endian machines
+//
+// The format was written when that was the obvious choice and has not
+// changed. A reader that uses the machine's own order gets numbers in
+// the hundreds of millions where it expected a build time.
+//
+// ## The file list is stored as a join
+//
+// A package does not store paths. It stores `DIRNAMES` (the distinct
+// directories), `BASENAMES` (one per file) and `DIRINDEXES` (which
+// directory each file is in), and a reader has to put them back
+// together. This is not an optimisation gone wrong — a package with a
+// thousand files in ten directories stores ten directories — but a
+// reader that reports `BASENAMES` alone reports a file list with no
+// paths in it, and one that ignores `DIRINDEXES` reports the wrong ones.
+//
+// ## The signature header is padded and the header is not
+//
+// The signature header's data store is rounded up to eight bytes and
+// the header proper is not. Off by that padding and the second header's
+// magic is not where it should be, which is the failure people report
+// as "the file is corrupt".
+
+type RpmFileError =
+    | NotAnRpm()
+    | Truncated(at: i64)
+    | BadHeader(at: i64)
+
+    /// The 96-byte lead.
+type RpmLead = {
+    major: i64,
+    minor: i64,
+    /// 0 binary, 1 source.
+    kind: i64,
+    architecture: i64,
+    name: str,
+    operating_system: i64,
+    signature_type: i64,
+}
+
+/// One index entry of a header.
+type RpmTag = {
+    tag: i64,
+    /// 6 string, 7 binary, 8 string array, 4 int32, and so on.
+    kind: i64,
+    offset: i64,
+    count: i64,
+}
+
+/// One header: its entries, and the store they point into.
+type RpmHeader = {
+    entries: [RpmTag],
+    /// Where the data store begins in the whole file.
+    store_at: i64,
+    store_size: i64,
+    /// Where the next thing after this header begins.
+    ends_at: i64,
+}
+
+fn byte_at(data: bytes, at: i64) -> i64 ! RpmFileError {
+    if at < 0 or at >= data.len() {
+        fail(Truncated(at))
+    }
+    return data.at(at)
+}
+
+/// A big-endian unsigned number, which is the only kind RPM has.
+pub fn number_at(data: bytes, at: i64, width: i64) -> i64 ! RpmFileError {
+    var out = 0
+    var i = 0
+    while i < width {
+        out = out * 256 + (try byte_at(data, at + i))
+        i = i + 1
+    }
+    return out
+}
+
+fn string_at(data: bytes, at: i64) -> str {
+    var out: [i64] = []
+    var i = at
+    while i < data.len() and data.at(i) != 0 {
+        out.push(data.at(i))
+        i = i + 1
+    }
+    return bytes_of(out).to_str()
+}
+
+/// Whether the bytes begin with the RPM magic.
+pub fn is_rpm(data: bytes) -> bool {
+    if data.len() < 96 {
+        return false
+    }
+    return data.at(0) == 237 and data.at(1) == 171 and data.at(2) == 238 and
+    data.at(3) == 219
+}
+
+/// Read the lead.
+pub fn lead(data: bytes) -> RpmLead ! RpmFileError {
+    if not is_rpm(data) {
+        fail(NotAnRpm())
+    }
+    return RpmLead{ major: try byte_at(data, 4),
+        minor: try byte_at(data, 5),
+        kind: try number_at(data, 6, 2),
+        architecture: try number_at(data, 8, 2),
+        name: string_at(data, 10),
+        operating_system: try number_at(data, 76, 2),
+        signature_type: try number_at(data, 78, 2) }
+}
+
+/// Read one header at `at`.
+///
+/// `padded` rounds the end up to eight bytes, which the signature header
+/// wants and the header proper does not.
+pub fn header_at(data: bytes, at: i64,
+    padded: bool) -> RpmHeader ! RpmFileError {
+    if (try byte_at(data, at)) != 142 or (try byte_at(data, at + 1)) != 173 or
+    (try byte_at(data, at + 2)) != 232 {
+        fail(BadHeader(at))
+    }
+    let count = try number_at(data, at + 8, 4)
+    let store_size = try number_at(data, at + 12, 4)
+    var entries: [RpmTag] = []
+    var i = 0
+    while i < count {
+        let base = at + 16 + i * 16
+        entries.push(RpmTag{ tag: try number_at(data, base, 4),
+            kind: try number_at(data, base + 4, 4),
+            offset: try number_at(data, base + 8, 4),
+            count: try number_at(data, base + 12, 4) })
+        i = i + 1
+    }
+    let store_at = at + 16 + count * 16
+    var ends = store_at + store_size
+    if padded and ends % 8 != 0 {
+        ends = ends + 8 - ends % 8
+    }
+    return RpmHeader{ entries: entries, store_at: store_at,
+        store_size: store_size, ends_at: ends }
+}
+
+/// The signature header.
+pub fn signature_header(data: bytes) -> RpmHeader ! RpmFileError {
+    if not is_rpm(data) {
+        fail(NotAnRpm())
+    }
+    return try header_at(data, 96, true)
+}
+
+/// The header proper, the one with the package metadata in it.
+pub fn header(data: bytes) -> RpmHeader ! RpmFileError {
+    let signature = try signature_header(data)
+    return try header_at(data, signature.ends_at, false)
+}
+
+/// Where the compressed cpio archive begins.
+pub fn payload_at(data: bytes) -> i64 ! RpmFileError {
+    return (try header(data)).ends_at
+}
+
+fn entry_of(head: RpmHeader, tag: i64) -> Option[RpmTag] {
+    for one in head.entries {
+        if one.tag == tag {
+            return Some(one)
+        }
+    }
+    return None
+}
+
+/// A string tag, or the empty string.
+pub fn tag_string(data: bytes, head: RpmHeader, tag: i64) -> str {
+    match entry_of(head, tag) {
+        Some(entry) -> {
+            if entry.kind != 6 and entry.kind != 8 and entry.kind != 9 {
+                return ""
+            }
+            return string_at(data, head.store_at + entry.offset)
+        }
+        None -> return ""
+    }
+}
+
+/// A string-array tag, or an empty list.
+pub fn tag_strings(data: bytes, head: RpmHeader, tag: i64) -> [str] {
+    var out: [str] = []
+    match entry_of(head, tag) {
+        Some(entry) -> {
+            if entry.kind != 8 and entry.kind != 9 and entry.kind != 6 {
+                return out
+            }
+            var at = head.store_at + entry.offset
+            var i = 0
+            while i < entry.count {
+                let one = string_at(data, at)
+                out.push(one)
+                at = at + one.to_bytes().len() + 1
+                i = i + 1
+            }
+            return out
+        }
+        None -> return out
+    }
+}
+
+/// A numeric tag, or -1.
+pub fn tag_number(data: bytes, head: RpmHeader, tag: i64) -> i64 {
+    match entry_of(head, tag) {
+        Some(entry) -> {
+            var width = 4
+            if entry.kind == 2 {
+                width = 1
+            }
+            if entry.kind == 3 {
+                width = 2
+            }
+            if entry.kind == 5 {
+                width = 8
+            }
+            if entry.kind < 2 or entry.kind > 5 {
+                return 0 - 1
+            }
+            return number_at(data, head.store_at + entry.offset, width) ??
+            0 - 1
+        }
+        None -> return 0 - 1
+    }
+}
+
+/// Every value of a numeric array tag.
+pub fn tag_numbers(data: bytes, head: RpmHeader, tag: i64) -> [i64] {
+    var out: [i64] = []
+    match entry_of(head, tag) {
+        Some(entry) -> {
+            var width = 4
+            if entry.kind == 2 {
+                width = 1
+            }
+            if entry.kind == 3 {
+                width = 2
+            }
+            if entry.kind == 5 {
+                width = 8
+            }
+            if entry.kind < 2 or entry.kind > 5 {
+                return out
+            }
+            var i = 0
+            while i < entry.count {
+                out.push(number_at(data,
+                    head.store_at + entry.offset + i * width, width) ?? 0)
+                i = i + 1
+            }
+            return out
+        }
+        None -> return out
+    }
+}
+
+/// The package's name.
+pub fn name(data: bytes) -> str ! RpmFileError {
+    return tag_string(data, try header(data), 1000)
+}
+
+/// `[epoch:]version-release`, the string `rpmversion` compares.
+pub fn evr(data: bytes) -> str ! RpmFileError {
+    let head = try header(data)
+    let epoch = tag_number(data, head, 1003)
+    var out = ""
+    if epoch >= 0 {
+        out = "{epoch}:"
+    }
+    return out + tag_string(data, head, 1001) + "-" +
+    tag_string(data, head, 1002)
+}
+
+/// The files the package installs, as whole paths.
+///
+/// This is the join the format leaves to the reader: a directory list, a
+/// base-name list, and an index from the second into the first.
+pub fn file_names(data: bytes) -> [str] ! RpmFileError {
+    let head = try header(data)
+    let directories = tag_strings(data, head, 1118)
+    let bases = tag_strings(data, head, 1117)
+    let indexes = tag_numbers(data, head, 1116)
+    var out: [str] = []
+    var i = 0
+    while i < bases.len() {
+        var directory = ""
+        if i < indexes.len() and indexes[i] < directories.len() {
+            directory = directories[indexes[i]]
+        }
+        out.push(directory + bases[i])
+        i = i + 1
+    }
+    return out
+}
+
+/// What the payload is compressed with — `gzip`, `xz`, `zstd`.
+pub fn payload_compressor(data: bytes) -> str ! RpmFileError {
+    return tag_string(data, try header(data), 1125)
+}
+
+/// What the payload holds, which is `cpio` for every package there is.
+pub fn payload_format(data: bytes) -> str ! RpmFileError {
+    return tag_string(data, try header(data), 1124)
+}
+
+/// What the package says it needs.
+pub fn requires_names(data: bytes) -> [str] ! RpmFileError {
+    return tag_strings(data, try header(data), 1049)
+}
+
+/// What the package says it offers.
+pub fn provides_names(data: bytes) -> [str] ! RpmFileError {
+    return tag_strings(data, try header(data), 1047)
+}

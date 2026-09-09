@@ -1,0 +1,6 @@
+[package]
+name = "cpio"
+version = "1.0.0"
+
+# Reading and writing bytes it is handed. Opens nothing.
+capabilities = []

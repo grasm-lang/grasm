@@ -1,0 +1,381 @@
+// What a package or an image is made of: an archive, a header, a
+// directory tree, and the digest file that says the download arrived
+// intact.
+//
+// The archives and images here are built byte by byte, so the demo can
+// say what it put in. Each reader was also checked against the tool that
+// owns its format — `cpio(1)` in both directions, the `rpmfile` library
+// over real Fedora packages, `pycdlib` over images it wrote, and
+// `shasum` — which is where the corpus size lives.
+import cpio
+import rpmfile
+import iso9660
+import checksumfile
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn little(inout out: [i64], value: i64, width: i64) {
+    var left = value
+    var i = 0
+    while i < width {
+        out.push(left % 256)
+        left = left / 256
+        i = i + 1
+    }
+}
+
+fn big(inout out: [i64], value: i64, width: i64) {
+    var i = width - 1
+    while i >= 0 {
+        var left = value
+        var j = 0
+        while j < i {
+            left = left / 256
+            j = j + 1
+        }
+        out.push(left % 256)
+        i = i - 1
+    }
+}
+
+fn spaces(inout out: [i64], count: i64) {
+    var i = 0
+    while i < count {
+        out.push(32)
+        i = i + 1
+    }
+}
+
+fn zeros(inout out: [i64], count: i64) {
+    var i = 0
+    while i < count {
+        out.push(0)
+        i = i + 1
+    }
+}
+
+fn letters(inout out: [i64], text: str) {
+    let raw = text.to_bytes()
+    var i = 0
+    while i < raw.len() {
+        out.push(raw.at(i))
+        i = i + 1
+    }
+}
+
+// ----------------------------------------------------------------- cpio
+
+fn entry(name: str, mode: i64, body: str) -> CpioEntry {
+    return CpioEntry{ name: name, mode: mode, uid: 501, gid: 20, nlink: 1,
+        mtime: 1700000000, size: body.to_bytes().len(), device_major: 0,
+        device_minor: 0, inode: 42, data: body.to_bytes() }
+}
+
+fn check_cpio(inout f: i64) / {io} {
+    print("-- cpio: padding measured from the start, not from the name")
+    let entries = [entry("short", 33188, "one"),
+        entry("a-much-longer-name-that-pads-differently", 33188, "two"),
+        entry("dir", 16877, ""),
+        entry("link", 40960, "short")]
+    let written = cpio.render(entries, "070701")
+    let read = cpio.parse(written) ?? []
+    say(f, "an archive written here is read back the same",
+        read.len() == 4 and read[0].name == "short" and
+        read[1].name == "a-much-longer-name-that-pads-differently" and
+        read[1].data.to_str() == "two")
+    say(f, "the mode says what the entry is, and the rest is permissions",
+        cpio.kind_of(read[0]) == "file" and
+        cpio.kind_of(read[2]) == "directory" and
+        cpio.kind_of(read[3]) == "symlink" and
+        cpio.permissions_of(read[0]) == 420)
+    say(f, "the archive names its own format in its first six bytes",
+        cpio.format_of(written) == "070701" and
+        cpio.format_of(cpio.render(entries, "070707")) == "070707")
+    let old = cpio.parse(cpio.render(entries, "070707")) ?? []
+    say(f, "the old format has no padding and reads back the same anyway",
+        old.len() == 4 and old[1].data.to_str() == "two" and
+        old[3].data.to_str() == "short")
+    say(f, "and the trailer ends the archive rather than appearing in it",
+        written.len() % 512 == 0)
+}
+
+// -------------------------------------------------------------- rpmfile
+
+/// A header: the magic, a count, a store size, the index entries, then
+/// the store they point into.
+fn rpm_header(inout out: [i64], tags: [(i64, i64, i64, i64)],
+    store: [i64]) {
+    out.push(142)
+    out.push(173)
+    out.push(232)
+    out.push(1)
+    zeros(out, 4)
+    big(out, tags.len(), 4)
+    big(out, store.len(), 4)
+    for one in tags {
+        big(out, one.0, 4)
+        big(out, one.1, 4)
+        big(out, one.2, 4)
+        big(out, one.3, 4)
+    }
+    for byte in store {
+        out.push(byte)
+    }
+}
+
+fn small_rpm() -> bytes {
+    var out: [i64] = []
+    // The lead, which nothing reads any more and every file still has.
+    out.push(237)
+    out.push(171)
+    out.push(238)
+    out.push(219)
+    out.push(3)
+    out.push(0)
+    big(out, 0, 2)
+    big(out, 1, 2)
+    letters(out, "demo-1.0-1")
+    zeros(out, 66 - 10)
+    big(out, 1, 2)
+    big(out, 5, 2)
+    zeros(out, 16)
+    // A signature header with one entry, whose store is padded to eight.
+    var signature_store: [i64] = []
+    letters(signature_store, "not-a-real-digest")
+    signature_store.push(0)
+    rpm_header(out, [(269, 6, 0, 1)], signature_store)
+    while out.len() % 8 != 0 {
+        out.push(0)
+    }
+    // The header proper. Offsets are into its own store.
+    var store: [i64] = []
+    letters(store, "demo")
+    store.push(0)
+    letters(store, "1.0")
+    store.push(0)
+    letters(store, "1.fc40")
+    store.push(0)
+    letters(store, "MIT")
+    store.push(0)
+    // The directory list, the base names, and the indexes that join them.
+    letters(store, "/usr/bin/")
+    store.push(0)
+    letters(store, "/usr/share/doc/demo/")
+    store.push(0)
+    letters(store, "demo")
+    store.push(0)
+    letters(store, "README")
+    store.push(0)
+    letters(store, "LICENCE")
+    store.push(0)
+    let indexes_at = store.len()
+    big(store, 0, 4)
+    big(store, 1, 4)
+    big(store, 1, 4)
+    rpm_header(out, [(1000, 6, 0, 1), (1001, 6, 5, 1), (1002, 6, 9, 1),
+        (1014, 6, 16, 1), (1118, 8, 20, 2), (1117, 8, 51, 3),
+        (1116, 4, indexes_at, 3)], store)
+    letters(out, "the payload would be here")
+    return bytes_of(out)
+}
+
+fn check_rpm(inout f: i64) / {io} {
+    print("-- rpmfile: a small database in a byte string, twice over")
+    let data = small_rpm()
+    let head = rpmfile.header(data) ?? no_header()
+    say(f, "the signature header is padded to eight and the next is not",
+        (rpmfile.name(data) ?? "") == "demo" and
+        rpmfile.tag_string(data, head, 1001) == "1.0")
+    say(f, "the version a package manager compares is three tags joined",
+        (rpmfile.evr(data) ?? "") == "1.0-1.fc40")
+    say(f, "the file list is a join the reader has to do",
+        (rpmfile.file_names(data) ?? []) ==
+        ["/usr/bin/demo", "/usr/share/doc/demo/README",
+            "/usr/share/doc/demo/LICENCE"])
+    say(f, "a tag of the wrong kind answers nothing rather than rubbish",
+        rpmfile.tag_string(data, head, 1116) == "" and
+        rpmfile.tag_number(data, head, 1000) == 0 - 1)
+    say(f, "and the payload starts where the header says it ends",
+        (rpmfile.payload_at(data) ?? 0) == data.len() -
+        "the payload would be here".len())
+}
+
+fn no_header() -> RpmHeader {
+    return RpmHeader{ entries: [], store_at: 0, store_size: 0, ends_at: 0 }
+}
+
+// -------------------------------------------------------------- iso9660
+
+fn both_endian(inout out: [i64], value: i64, width: i64) {
+    little(out, value, width)
+    big(out, value, width)
+}
+
+/// A directory record. `name` is the ISO name; a directory has bit 1 of
+/// the flags set.
+fn directory_record(inout out: [i64], name: str, extent: i64, size: i64,
+    is_directory: bool) {
+    var length = 33 + name.len()
+    if length % 2 == 1 {
+        length = length + 1
+    }
+    out.push(length)
+    out.push(0)
+    both_endian(out, extent, 4)
+    both_endian(out, size, 4)
+    out.push(124)
+    out.push(1)
+    out.push(1)
+    out.push(0)
+    out.push(0)
+    out.push(0)
+    out.push(0)
+    var flags = 0
+    if is_directory {
+        flags = 2
+    }
+    out.push(flags)
+    out.push(0)
+    out.push(0)
+    both_endian(out, 1, 2)
+    out.push(name.len())
+    letters(out, name)
+    while out.len() % 2048 != 0 and (out.len() % 2048) % 2 == 1 {
+        out.push(0)
+    }
+}
+
+fn pad_to_sector(inout out: [i64], sector: i64) {
+    while out.len() < sector * 2048 {
+        out.push(0)
+    }
+}
+
+/// An image with one file in the root and one in a directory.
+fn small_iso() -> bytes {
+    var out: [i64] = []
+    pad_to_sector(out, 16)
+    // The primary volume descriptor.
+    out.push(1)
+    letters(out, "CD001")
+    out.push(1)
+    out.push(0)
+    // The identifier fields are padded with spaces, which is what
+    // makes trailing blanks part of the format rather than of the name.
+    letters(out, "A SYSTEM")
+    spaces(out, 32 - 8)
+    letters(out, "DEMO VOLUME")
+    spaces(out, 32 - 11)
+    zeros(out, 8)
+    both_endian(out, 24, 4)
+    zeros(out, 32)
+    both_endian(out, 1, 2)
+    both_endian(out, 1, 2)
+    both_endian(out, 2048, 2)
+    both_endian(out, 10, 4)
+    zeros(out, 16)
+    directory_record(out, "\u{0}", 18, 2048, true)
+    pad_to_sector(out, 17)
+    // The terminator.
+    out.push(255)
+    letters(out, "CD001")
+    out.push(1)
+    pad_to_sector(out, 18)
+    // The root directory: itself, its parent, a file and a directory.
+    directory_record(out, "\u{0}", 18, 2048, true)
+    directory_record(out, "\u{1}", 18, 2048, true)
+    directory_record(out, "HELLO.TXT;1", 20, 12, false)
+    directory_record(out, "DIR1", 19, 2048, true)
+    pad_to_sector(out, 19)
+    // The directory, and the file inside it.
+    directory_record(out, "\u{0}", 19, 2048, true)
+    directory_record(out, "\u{1}", 18, 2048, true)
+    directory_record(out, "INNER.TXT;1", 21, 6, false)
+    pad_to_sector(out, 20)
+    letters(out, "hello there!")
+    pad_to_sector(out, 21)
+    letters(out, "inner!")
+    pad_to_sector(out, 22)
+    return bytes_of(out)
+}
+
+fn check_iso(inout f: i64) / {io} {
+    print("-- iso9660: every number written twice, and the tree walked")
+    let data = small_iso()
+    say(f, "the signature is 32769 bytes in, not at the start",
+        iso9660.is_iso(data) and not iso9660.is_iso("CD001".to_bytes()))
+    let volume = iso9660.primary(data) ?? no_volume()
+    say(f, "the little-endian half of a both-endian field is the answer",
+        volume.volume_id == "DEMO VOLUME" and
+        volume.system_id == "A SYSTEM" and volume.block_size == 2048 and
+        volume.volume_size == 24)
+    let files = iso9660.walk(data, false) ?? []
+    say(f, "the tree is walked, and a version suffix is not a name",
+        files.len() == 2 and files[0].0 == "/HELLO.TXT" and
+        files[0].1 == 12)
+    say(f, "a file inside a directory is found by its whole path",
+        files[1].0 == "/DIR1/INNER.TXT" and files[1].1 == 6)
+    var body = ""
+    match iso9660.find(data, "/DIR1/INNER.TXT", false) {
+        Some(one) -> body = (iso9660.contents(data, one) ??
+            bytes_of([])).to_str()
+        None -> body = "not found"
+    }
+    say(f, "and its contents are where its extent says they are",
+        body == "inner!")
+}
+
+fn no_volume() -> IsoVolume {
+    return IsoVolume{ kind: 0, at: 0, system_id: "", volume_id: "",
+        volume_size: 0, block_size: 0, joliet: false, root_extent: 0,
+        root_length: 0 }
+}
+
+// --------------------------------------------------------- checksumfile
+
+fn check_digests(inout f: i64) / {io} {
+    print("-- checksumfile: two shapes, and a name that needs escaping")
+    let gnu = checksumfile.parse(
+        "d41d8cd98f00b204e9800998ecf8427e  empty.txt\n" +
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" +
+        " *binary.bin\n")
+    say(f, "a digest file names its algorithm by the length of its digest",
+        gnu.len() == 2 and checksumfile.algorithm_of(gnu[0]) == "MD5" and
+        checksumfile.algorithm_of(gnu[1]) == "SHA256")
+    say(f, "and a star before the name means it was read as binary",
+        not gnu[0].binary and gnu[1].binary and
+        gnu[1].name == "binary.bin")
+    let bsd = checksumfile.parse("SHA256 (a file.txt) = " +
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n")
+    say(f, "the BSD shape puts the name in the middle and is read too",
+        bsd.len() == 1 and bsd[0].name == "a file.txt" and
+        bsd[0].algorithm == "SHA256")
+    let escaped = checksumfile.parse("\\d41d8cd98f00b204e9800998ecf8427e" +
+        "  a\\nname\n")
+    say(f, "a name with a newline in it is escaped, and the line says so",
+        escaped.len() == 1 and escaped[0].escaped and
+        escaped[0].name == "a\nname")
+    say(f, "and writing one back out escapes it again",
+        checksumfile.render_gnu(escaped[0]) ==
+        "\\d41d8cd98f00b204e9800998ecf8427e  a\\nname")
+}
+
+fn main() / {io} {
+    var f = 0
+    check_cpio(f)
+    check_rpm(f)
+    check_iso(f)
+    check_digests(f)
+    if f == 0 {
+        print("discs: every claim held")
+    } else {
+        print("discs: {f} claims failed")
+    }
+}
