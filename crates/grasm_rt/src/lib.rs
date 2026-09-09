@@ -1213,18 +1213,58 @@ impl Drop for Pool {
     }
 }
 
+/// The per-thread state the allocation path touches.
+///
+/// macOS resolves a thread-local through `_tlv_get_addr`, which is a call,
+/// and a profile of `benchmarks/grasm/tree.gr` — the program whose whole shape
+/// is allocate, walk, free — put that call at the top of the list with about a
+/// third of the samples. `alloc` reached three separate thread-locals and the
+/// release path two, so every value cost three resolutions to make and two to
+/// release. They are one structure here, resolved once.
+struct Local {
+    /// Boxes waiting to be used again.
+    pool: Pool,
+    /// Allocations this thread has made and not yet freed.
+    ///
+    /// A leak is invisible to the differential harness: it compares output,
+    /// and a program that leaks produces exactly the right output. This is
+    /// what makes the difference observable, and it is the prerequisite for
+    /// Tier 1 — a `region` works by *not* decrementing inside the block and
+    /// sweeping at the brace, so a miscount there is a double-free or a leak
+    /// and only one of those announces itself.
+    live: Cell<i64>,
+    /// One list of allocations per open region, innermost last.
+    regions: std::cell::RefCell<Vec<Vec<*mut RtVal>>>,
+    /// How many of those are open. The hot path asks this rather than
+    /// borrowing the list, because borrowing a `RefCell` to ask whether it is
+    /// empty is a flag write on every allocation.
+    region_depth: Cell<usize>,
+    /// The address this thread's stack may not go past.
+    stack_floor: Cell<usize>,
+}
+
 thread_local! {
-    static POOL: Pool = const {
-        Pool {
-            head: Cell::new(std::ptr::null_mut()),
-            n: Cell::new(0),
+    static LOCAL: Local = const {
+        Local {
+            pool: Pool {
+                head: Cell::new(std::ptr::null_mut()),
+                n: Cell::new(0),
+            },
+            live: Cell::new(0),
+            regions: std::cell::RefCell::new(Vec::new()),
+            region_depth: Cell::new(0),
+            stack_floor: Cell::new(0),
         }
     };
 }
 
 /// Sixty-four bytes to put an `RtVal` in, recycled if one is going spare.
-fn take_box() -> *mut RtVal {
-    POOL.with(|pool| {
+///
+/// Takes the thread's state rather than resolving it: on macOS that
+/// resolution is a call, and the allocation path already has it.
+fn take_box_in(local: &Local) -> *mut RtVal {
+    let pool = &local.pool;
+    {
         let head = pool.head.get();
         if head.is_null() {
             let fresh: Box<std::mem::MaybeUninit<RtVal>> =
@@ -1238,16 +1278,19 @@ fn take_box() -> *mut RtVal {
             pool.n.set(pool.n.get() - 1);
             head
         }
-    })
+    }
 }
 
 /// Drops what a box holds and keeps the box.
 ///
 /// # Safety: `p` was allocated here, its refcount has reached zero, and
 /// nothing points at it any more.
-unsafe fn give_box(p: *mut RtVal) {
+/// # Safety: `p` was allocated here, its refcount has reached zero, and
+/// nothing points at it any more.
+unsafe fn give_box_in(local: &Local, p: *mut RtVal) {
     std::ptr::drop_in_place(&mut (*p).payload);
-    POOL.with(|pool| {
+    {
+        let pool = &local.pool;
         if pool.n.get() >= POOL_CAP {
             drop(Box::from_raw(p as *mut std::mem::MaybeUninit<RtVal>));
             return;
@@ -1255,46 +1298,36 @@ unsafe fn give_box(p: *mut RtVal) {
         (*p).rc.store(pool.head.get() as usize as i64, Relaxed);
         pool.head.set(p);
         pool.n.set(pool.n.get() + 1);
-    })
+    }
 }
 
 fn alloc(payload: RtPayload) -> *mut RtVal {
-    LIVE.with(|n| n.set(n.get() + 1));
-    // Inside a region the value is arena-owned: no reference counting, and the
-    // whole set is freed at the closing brace ([T-REGION]).
-    let in_region = REGIONS.with(|r| !r.borrow().is_empty());
-    let p = take_box();
-    // Safety: `take_box` returns storage for exactly one `RtVal`, uninitialised.
-    unsafe {
-        std::ptr::write(
-            p,
-            RtVal {
-                rc: AtomicI64::new(if in_region { ARENA } else { 1 }),
-                payload,
-            },
-        );
-    }
-    if in_region {
-        REGIONS.with(|r| {
-            if let Some(top) = r.borrow_mut().last_mut() {
+    LOCAL.with(|local| {
+        local.live.set(local.live.get() + 1);
+        // Inside a region the value is arena-owned: no reference counting, and
+        // the whole set is freed at the closing brace ([T-REGION]).
+        let in_region = local.region_depth.get() > 0;
+        let p = take_box_in(local);
+        // Safety: `take_box_in` returns storage for exactly one `RtVal`,
+        // uninitialised.
+        unsafe {
+            std::ptr::write(
+                p,
+                RtVal {
+                    rc: AtomicI64::new(if in_region { ARENA } else { 1 }),
+                    payload,
+                },
+            );
+        }
+        if in_region {
+            if let Some(top) = local.regions.borrow_mut().last_mut() {
                 top.push(p);
             }
-        });
-    }
-    p
+        }
+        p
+    })
 }
 
-thread_local! {
-    /// Allocations this thread has made and not yet freed.
-    ///
-    /// A leak is invisible to the differential harness: it compares output,
-    /// and a program that leaks produces exactly the right output. This is
-    /// what makes the difference observable, and it is the prerequisite for
-    /// Tier 1 — a `region` works by *not* decrementing inside the block and
-    /// sweeping at the brace, so a miscount there is a double-free or a leak
-    /// and only one of those announces itself.
-    static LIVE: Cell<i64> = const { Cell::new(0) };
-}
 
 /// What worker threads allocated and did not free themselves.
 ///
@@ -1307,7 +1340,7 @@ static ESCAPED: AtomicI64 = AtomicI64::new(0);
 
 /// Called by a worker as it ends: its balance becomes everyone's.
 fn hand_back_live() {
-    let n = LIVE.with(|l| l.replace(0));
+    let n = LOCAL.with(|l| l.live.replace(0));
     if n != 0 {
         ESCAPED.fetch_add(n, Relaxed);
     }
@@ -1339,7 +1372,7 @@ static C_COPIES: AtomicI64 = AtomicI64::new(0);
 /// allocations are its own.
 #[no_mangle]
 pub extern "C" fn grasm_live_allocations() -> i64 {
-    LIVE.with(Cell::get)
+    LOCAL.with(|l| l.live.get())
 }
 
 /// Reports still-live allocations, if `GRASM_LEAK_CHECK` is set.
@@ -1375,7 +1408,7 @@ pub extern "C" fn grasm_check_leaks() {
     // and a thread folds its balance in when it ends. A value built on a
     // worker and freed here would otherwise take this count negative and
     // report a leak of minus four.
-    let live = LIVE.with(Cell::get) + ESCAPED.load(Relaxed);
+    let live = LOCAL.with(|l| l.live.get()) + ESCAPED.load(Relaxed);
     let copies = C_COPIES.load(Relaxed);
     if live == 0 && copies == 0 {
         return;
@@ -1424,16 +1457,14 @@ fn is_counted(rc: i64) -> bool {
 // could ask "am I inside a region" with a load rather than a `RefCell` borrow.
 // It measured **zero** on a benchmark that allocates 800,000 times, and was
 // reverted: the borrow is not what costs.
-thread_local! {
-    /// One list of allocations per open region, innermost last.
-    static REGIONS: std::cell::RefCell<Vec<Vec<*mut RtVal>>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-}
 
 /// Opens a region: allocations until the matching pop belong to it.
 #[no_mangle]
 pub extern "C" fn grasm_region_push() {
-    REGIONS.with(|r| r.borrow_mut().push(Vec::new()));
+    LOCAL.with(|local| {
+        local.regions.borrow_mut().push(Vec::new());
+        local.region_depth.set(local.region_depth.get() + 1);
+    });
 }
 
 /// Closes a region, freeing everything allocated inside it in one sweep.
@@ -1447,7 +1478,14 @@ pub extern "C" fn grasm_region_push() {
 /// and, by [T-REGION], is unreachable from outside.
 #[no_mangle]
 pub unsafe extern "C" fn grasm_region_pop() {
-    let Some(vals) = REGIONS.with(|r| r.borrow_mut().pop()) else {
+    let popped = LOCAL.with(|local| {
+        let out = local.regions.borrow_mut().pop();
+        local
+            .region_depth
+            .set(local.region_depth.get().saturating_sub(1));
+        out
+    });
+    let Some(vals) = popped else {
         return;
     };
     for p in vals {
@@ -1490,8 +1528,10 @@ pub unsafe extern "C" fn grasm_region_pop() {
         for c in outside {
             dec(c);
         }
-        LIVE.with(|n| n.set(n.get() - 1));
-        give_box(p);
+        LOCAL.with(|local| {
+            local.live.set(local.live.get() - 1);
+            give_box_in(local, p);
+        });
     }
 }
 
@@ -1569,7 +1609,6 @@ unsafe fn dec(v: *mut RtVal) {
                 let left = rc.fetch_sub(1, Release) - 1;
                 if left <= 0 {
                     std::sync::atomic::fence(Acquire);
-                    LIVE.with(|n| n.set(n.get() - 1));
                     // The children are read out *before* the payload is
                     // dropped; the box itself goes back to the pool.
                     match &(*cur).payload {
@@ -1609,7 +1648,10 @@ unsafe fn dec(v: *mut RtVal) {
                         }
                         _ => {}
                     }
-                    give_box(cur);
+                    LOCAL.with(|local| {
+                        local.live.set(local.live.get() - 1);
+                        give_box_in(local, cur);
+                    });
                 }
             }
         }
@@ -3918,12 +3960,6 @@ pub extern "C" fn grasm_ref_alive(r: i64) -> i8 {
     i8::from(idx < s.slots.len() && s.gens[idx] == gen && s.slots[idx].is_some())
 }
 
-thread_local! {
-    /// The lowest stack address this thread may use, or 0 before the first
-    /// check on it. Per thread, because a worker's stack is somewhere else
-    /// entirely and a limit from another one says nothing about it.
-    static STACK_FLOOR: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
 
 /// How much stack a program may use below its entry frame.
 ///
@@ -3957,14 +3993,16 @@ const MAX_ALLOC: usize = 1 << 33;
 fn rt_stack_check() {
     let here = 0u8;
     let sp = std::ptr::addr_of!(here) as usize;
-    let floor = STACK_FLOOR.with(std::cell::Cell::get);
-    if floor == 0 {
-        STACK_FLOOR.with(|c| c.set(sp.saturating_sub(STACK_BUDGET)));
-        return;
-    }
-    if sp < floor {
-        rt_panic("stack overflow: recursion too deep");
-    }
+    LOCAL.with(|local| {
+        let floor = local.stack_floor.get();
+        if floor == 0 {
+            local.stack_floor.set(sp.saturating_sub(STACK_BUDGET));
+            return;
+        }
+        if sp < floor {
+            rt_panic("stack overflow: recursion too deep");
+        }
+    });
 }
 
 /// Panics if the stack has run down past this thread's floor.
@@ -3978,14 +4016,16 @@ fn rt_stack_check() {
 #[no_mangle]
 pub extern "C" fn grasm_stack_check(sp: i64) {
     let sp = sp as usize;
-    let floor = STACK_FLOOR.with(std::cell::Cell::get);
-    if floor == 0 {
-        STACK_FLOOR.with(|c| c.set(sp.saturating_sub(STACK_BUDGET)));
-        return;
-    }
-    if sp < floor {
-        rt_panic("stack overflow: recursion too deep");
-    }
+    LOCAL.with(|local| {
+        let floor = local.stack_floor.get();
+        if floor == 0 {
+            local.stack_floor.set(sp.saturating_sub(STACK_BUDGET));
+            return;
+        }
+        if sp < floor {
+            rt_panic("stack overflow: recursion too deep");
+        }
+    });
 }
 
 /// Whether `x` is NaN.
