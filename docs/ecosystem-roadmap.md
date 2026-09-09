@@ -14,7 +14,7 @@ plan that discovers them 300 packages in.
 | | |
 |---|---|
 | Started | 78 |
-| Now | 467 |
+| Now | 513 |
 | Tier 1 target | 200 |
 | Tier 2 target | 500 |
 | Tier 3 target | 800 |
@@ -252,11 +252,26 @@ says where the data came from and under what licence, which is the condition.
 | ~~Layout~~ | ~~`structuredfields` `linebreak` `wordwrap`~~ | the HTTP working group's structured-field suite, UAX #14's LineBreakTest |
 | ~~Personal data~~ | ~~`contentline` `icalendar` `vcard`~~ | the Python `icalendar` library's line reader, `vobject` |
 | ~~Media and citation~~ | ~~`m3u8` `subtitles` `bibtex`~~ | the `m3u8` library, `srt` and `webvtt-py`, `bibtexparser` |
+| ~~Configuration~~ | ~~`gitconfig` `sshconfig` `editorconfig`~~ | `git config --list` itself, paramiko, the reference EditorConfig library |
+| ~~Version schemes~~ | ~~`pep440` `pep508` `semverrange` `debversion`~~ | Python's `packaging`, node's `semver`, `python-debian` |
+| ~~Operations files~~ | ~~`netrc` `dockerfile` `nginxconf` `knownhosts`~~ | Python's `netrc`, `dockerfile-parse`, nginx-inc's `crossplane`, `ssh-keygen` itself |
+| ~~Network II~~ | ~~`ipv6` `packets` `pcapfile`~~ | Python's `ipaddress`, `dpkt` |
+| ~~Package identity~~ | ~~`rpmversion` `gemversion` `wheelname` `purl` `cpename`~~ | rpm's own `rpmvercmp` suite, RubyGems' `Gem::Version`, `packaging`, the purl-spec test suite, the `cpe` library |
+| ~~Executables~~ | ~~`elfread` `peread` `machoread` `magicbytes`~~ | pyelftools, `pefile`, `otool`, `file(1)` |
+| ~~Packages and images~~ | ~~`cpio` `rpmfile` `iso9660` `checksumfile`~~ | `cpio(1)` both ways, the `rpmfile` library over real Fedora packages, `pycdlib`, `shasum` |
+| ~~Mail~~ | ~~`mimeword` `emailaddr` `mboxfile` `ldif` `spf` `dkimsig`~~ | Python's `email` and `mailbox`, `ldif3`, `pyspf`, `dkimpy` |
 
 That is a hundred, in twenty batches, and the same rhythm as the first: five
 or six packages to a group demo, every claim an assertion, every batch checked
 against the tool that owns its format before it lands. **All twenty are
-done**, and the four batches after them are the first that P1 unblocked.
+done**, and the batches after them are the first that P1 unblocked.
+
+**The 500 mark is passed: 513.** That figure counts directories under
+`packages/` that are not group demos, which is what "467" counted before it,
+and 31 of them are gate harnesses rather than libraries — the small programs
+the differential gates drive, listed in `scripts/`. Counting them is the same
+choice the first two hundred made, and it is written here so the number can
+be checked rather than believed.
 
 The four are worth reading as a set, because each was checked against a
 suite its own standard publishes rather than against expectations written
