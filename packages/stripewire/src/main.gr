@@ -1,0 +1,270 @@
+// What a Stripe request looks like on the wire.
+//
+// Stripe's API is JSON coming back and *form encoding* going out, which
+// surprises people: `POST /v1/charges` carries
+// `amount=2000&currency=usd&metadata[order_id]=6735`, not a JSON body. A
+// client that sends JSON gets a 400 with no useful message.
+//
+// ## Nesting has a spelling, and it is not obvious
+//
+// A map is written `parent[key]` and a list is written `parent[0]`, both
+// nested arbitrarily: `items[0][price]=p1`. An empty map or list is not
+// sent at all — there is no key to write — so a caller clearing a field
+// sends `metadata[key]=` rather than `metadata={}`.
+//
+// ## Idempotency is the point of the key
+//
+// A network failure on `POST /v1/charges` leaves the caller unable to tell
+// whether the customer was charged. Sending an `Idempotency-Key` makes the
+// retry return the *first* response instead of charging twice, and the key
+// must therefore be generated once per logical operation and reused across
+// every retry of it. A key regenerated per attempt is worse than none: it
+// looks like protection and gives none.
+//
+// ## Which failures may be retried
+//
+// A 409 or a 5xx may be. A 402 `card_declined` may not — retrying a
+// decline neither helps nor is free, since some issuers count attempts. The
+// header `Stripe-Should-Retry` overrides the status when it is present,
+// which is how Stripe tells a client about cases it has not published.
+import json
+
+type StripeError =
+    | NotAnObject()
+    | NoError()
+
+    /// A value in a request body. Deliberately without a floating-point case:
+    /// every amount in Stripe's API is an integer of the currency's smallest
+    /// unit, and a client that can send `19.99` is a client that will.
+type StripeValue =
+    | SvText(text: str)
+    | SvInt(number: i64)
+    | SvBool(flag: bool)
+    | SvList(items: [ref StripeValue])
+    | SvMap(entries: [(str, ref StripeValue)])
+
+pub fn sv_text(text: str) -> ref StripeValue {
+    return ref(SvText(text))
+}
+
+pub fn sv_int(number: i64) -> ref StripeValue {
+    return ref(SvInt(number))
+}
+
+pub fn sv_bool(flag: bool) -> ref StripeValue {
+    return ref(SvBool(flag))
+}
+
+pub fn sv_list(items: [ref StripeValue]) -> ref StripeValue {
+    return ref(SvList(items))
+}
+
+pub fn sv_map(entries: [(str, ref StripeValue)]) -> ref StripeValue {
+    return ref(SvMap(entries))
+}
+
+fn is_unreserved(byte: i64) -> bool {
+    return (byte >= 65 and byte <= 90) or (byte >= 97 and byte <= 122) or
+    (byte >= 48 and byte <= 57) or byte == 45 or byte == 46 or
+    byte == 95 or byte == 126
+}
+
+/// `application/x-www-form-urlencoded` escaping, where a space is `+`.
+///
+/// Not the same as a URI's escaping, which leaves a space as `%20`. Both
+/// are correct in their own place and neither is correct in the other's.
+pub fn form_escape(value: str) -> str {
+    let digits = "0123456789ABCDEF"
+    let raw = value.to_bytes()
+    var out = ""
+    var i = 0
+    while i < raw.len() {
+        let byte = raw.at(i)
+        if is_unreserved(byte) {
+            out = out + byte.to_char()
+        } else if byte == 32 {
+            out = out + "+"
+        } else {
+            out = out + "%" + digits.substr(byte / 16, 1) +
+            digits.substr(byte % 16, 1)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+/// The name-value pairs a body flattens to, before escaping.
+///
+/// Kept separate from `form_body` because a caller signing a request, or
+/// logging one, wants the pairs rather than the string.
+pub fn form_pairs(
+    entries: [(str, ref StripeValue)]) -> [(str, str)] {
+    var out: [(str, str)] = []
+    for entry in entries {
+        flatten(out, entry.0, entry.1)
+    }
+    return out
+}
+
+fn flatten(inout out: [(str, str)], name: str, value: ref StripeValue) {
+    match value {
+        SvText(text) -> out.push((name, text))
+        SvInt(number) -> out.push((name, "{number}"))
+        SvBool(flag) -> {
+            if flag {
+                out.push((name, "true"))
+            } else {
+                out.push((name, "false"))
+            }
+        }
+        SvList(items) -> {
+            var i = 0
+            while i < items.len() {
+                flatten(out, name + "[{i}]", items[i])
+                i = i + 1
+            }
+        }
+        SvMap(inner) -> {
+            for pair in inner {
+                flatten(out, name + "[" + pair.0 + "]", pair.1)
+            }
+        }
+    }
+}
+
+/// The request body.
+pub fn form_body(entries: [(str, ref StripeValue)]) -> str {
+    var parts: [str] = []
+    for pair in form_pairs(entries) {
+        parts.push(form_escape(pair.0) + "=" + form_escape(pair.1))
+    }
+    return parts.join("&")
+}
+
+/// The headers a request carries.
+///
+/// `version` pins the API version, and pinning it is not optional in
+/// practice: Stripe changes response shapes, and an unpinned client changes
+/// behaviour on a date nobody chose. An empty `idempotency_key` leaves the
+/// header off, which is right for a `GET` and wrong for anything else.
+pub fn request_headers(secret: str, version: str,
+    idempotency_key: str) -> [(str, str)] {
+    var out = [("Authorization", "Bearer " + secret),
+        ("Content-Type", "application/x-www-form-urlencoded")]
+    if version.len() > 0 {
+        out.push(("Stripe-Version", version))
+    }
+    if idempotency_key.len() > 0 {
+        out.push(("Idempotency-Key", idempotency_key))
+    }
+    return out
+}
+
+/// What Stripe said went wrong.
+type StripeFailure = {
+    /// `card_error`, `invalid_request_error`, `api_error`,
+    /// `rate_limit_error`, `authentication_error` or `idempotency_error`.
+    kind: str,
+    code: str,
+    message: str,
+    /// Which parameter was at fault, for the `invalid_request_error` that
+    /// names one. Empty otherwise.
+    param: str,
+    /// The decline code, for a card error. Empty otherwise, and worth
+    /// keeping apart from `code`: `card_declined` says the charge failed
+    /// and `insufficient_funds` says why.
+    decline_code: str,
+}
+
+/// Read the `error` object out of a failed response.
+pub fn failure_of(body: str) -> StripeFailure ! StripeError {
+    var document = json.null()
+    match json.parse(body) {
+        Ok(parsed) -> document = parsed
+        Err(_why) -> fail(NotAnObject())
+    }
+    var error = json.null()
+    match json.get(document, "error") {
+        Some(found) -> error = found
+        None -> fail(NoError())
+    }
+    return StripeFailure{ kind: string_at(error, "type"),
+        code: string_at(error, "code"),
+        message: string_at(error, "message"),
+        param: string_at(error, "param"),
+        decline_code: string_at(error, "decline_code") }
+}
+
+fn string_at(value: ref Json, key: str) -> str {
+    match json.get(value, key) {
+        Some(found) -> {
+            match json.as_str(found) {
+                Some(text) -> return text
+                None -> return ""
+            }
+        }
+        None -> return ""
+    }
+}
+
+fn header_of(headers: [(str, str)], name: str) -> str {
+    for header in headers {
+        if header.0.to_lower() == name.to_lower() {
+            return header.1
+        }
+    }
+    return ""
+}
+
+/// Whether this response may be tried again.
+///
+/// `Stripe-Should-Retry` decides it when present, because Stripe knows
+/// about cases a status code does not distinguish. Otherwise: a conflict or
+/// a server error may be retried, a 429 may be retried after waiting, and
+/// nothing else may — a 402 is a decline and a 400 is a bug in the request.
+pub fn should_retry(status: i64, headers: [(str, str)]) -> bool {
+    let told = header_of(headers, "stripe-should-retry")
+    if told == "true" {
+        return true
+    }
+    if told == "false" {
+        return false
+    }
+    return status == 409 or status == 429 or status >= 500
+}
+
+/// The request id, which is the only thing Stripe's support can act on.
+pub fn request_id(headers: [(str, str)]) -> str {
+    return header_of(headers, "request-id")
+}
+
+/// The `starting_after` cursor for the next page, or the empty string when
+/// this was the last one.
+///
+/// Stripe pages by object id rather than by offset, so a page taken while
+/// objects are being created does not repeat or skip rows the way
+/// `?page=2` does.
+pub fn next_cursor(body: str) -> str {
+    var document = json.null()
+    match json.parse(body) {
+        Ok(parsed) -> document = parsed
+        Err(_why) -> return ""
+    }
+    var more = false
+    match json.get(document, "has_more") {
+        Some(found) -> more = json.as_bool(found) ?? false
+        None -> more = false
+    }
+    if not more {
+        return ""
+    }
+    var items: [ref Json] = []
+    match json.get(document, "data") {
+        Some(found) -> items = json.items_of(found)
+        None -> return ""
+    }
+    if items.len() == 0 {
+        return ""
+    }
+    return string_at(items[items.len() - 1], "id")
+}

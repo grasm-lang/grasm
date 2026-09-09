@@ -1,0 +1,361 @@
+// JSON Patch, RFC 6902: a list of edits to a JSON document.
+//
+//   [{"op": "replace", "path": "/a/b", "value": 42}]
+//
+// Kubernetes, Elasticsearch and every API that offers a partial update take
+// one of these. The interesting part is not applying the edits; it is
+// refusing the ones that must not apply.
+//
+// ## All or nothing
+//
+// A patch that fails halfway must leave the document as it was. This is why
+// `apply` builds a new document and only hands it back on success — a
+// version that edited in place would have to unwind, and unwinding a `move`
+// is not the reverse of doing it.
+//
+// ## `test` is the whole reason for optimistic updates
+//
+// A `test` operation compares by value, not by text: `1` and `1.0` are the
+// same number, and `{"a":1,"b":2}` and `{"b":2,"a":1}` are the same object.
+// A patch that begins with a `test` on the field it is about to change is
+// how a client says "only if nobody else got here first", and comparing
+// rendered text instead breaks that for reasons the caller cannot see.
+//
+// ## What `add` means depends on what it lands on
+//
+// On an object member it adds or replaces. On an array index it *inserts*,
+// shifting everything after it, and `-` appends. The same word doing three
+// things is the specification's choice, and a patch written against one
+// reading fails against another.
+import json
+import jsonpointer
+
+type JsonPatchError =
+    | NotAList()
+    | NotAnOperation(at: i64)
+    | NoOp(at: i64)
+    | UnknownOp(at: i64, op: str)
+    | NoPath(at: i64)
+    | NoValue(at: i64)
+    | NoFrom(at: i64)
+    | BadPointer(at: i64, pointer: str)
+    | Missing(at: i64, pointer: str)
+    | TestFailed(at: i64, pointer: str)
+    | IntoItself(at: i64, pointer: str)
+    | RootRemoved(at: i64)
+
+    /// Apply a patch, or answer why it did not apply.
+pub fn apply(document: ref Json,
+    patch: ref Json) -> ref Json ! JsonPatchError {
+    match patch {
+        JList(_items) -> {}
+        _ -> fail(NotAList())
+    }
+    var here = document
+    var at = 0
+    for operation in json.items_of(patch) {
+        here = try one(here, operation, at)
+        at = at + 1
+    }
+    return here
+}
+
+fn member(operation: ref Json, key: str) -> Option[ref Json] {
+    match operation {
+        JObj(_keys, _values) -> return json.get(operation, key)
+        _ -> return None
+    }
+}
+
+fn text_member(operation: ref Json, key: str) -> Option[str] {
+    match member(operation, key) {
+        Some(found) -> return json.as_str(found)
+        None -> return None
+    }
+}
+
+fn one(document: ref Json, operation: ref Json,
+    at: i64) -> ref Json ! JsonPatchError {
+    match operation {
+        JObj(_keys, _values) -> {}
+        _ -> fail(NotAnOperation(at))
+    }
+    var op = ""
+    match text_member(operation, "op") {
+        Some(found) -> op = found
+        None -> fail(NoOp(at))
+    }
+    var path = ""
+    match text_member(operation, "path") {
+        Some(found) -> path = found
+        None -> fail(NoPath(at))
+    }
+    var tokens: [str] = []
+    match jsonpointer.parse(path) {
+        Ok(parsed) -> tokens = parsed
+        Err(_why) -> fail(BadPointer(at, path))
+    }
+    if op == "add" {
+        return try place(document, tokens, try value_of(operation, at), at,
+            path, true)
+    } else if op == "replace" {
+        try require(document, tokens, at, path)
+        return try place(document, tokens, try value_of(operation, at), at,
+            path, false)
+    } else if op == "remove" {
+        if tokens.len() == 0 {
+            fail(RootRemoved(at))
+        }
+        try require(document, tokens, at, path)
+        return try take_out(document, tokens, at, path)
+    } else if op == "test" {
+        let want = try value_of(operation, at)
+        var found = json.null()
+        match walk(document, tokens) {
+            Ok(reached) -> found = reached
+            Err(_why) -> fail(TestFailed(at, path))
+        }
+        if not json.equal(found, want) {
+            fail(TestFailed(at, path))
+        }
+        return document
+    } else if op == "move" or op == "copy" {
+        var from = ""
+        match text_member(operation, "from") {
+            Some(found) -> from = found
+            None -> fail(NoFrom(at))
+        }
+        var source: [str] = []
+        match jsonpointer.parse(from) {
+            Ok(parsed) -> source = parsed
+            Err(_why) -> fail(BadPointer(at, from))
+        }
+        try require(document, source, at, from)
+        var lifted = json.null()
+        match walk(document, source) {
+            Ok(reached) -> lifted = reached
+            Err(_why) -> fail(Missing(at, from))
+        }
+        if op == "copy" {
+            return try place(document, tokens, lifted, at, path, true)
+        }
+        // A `move` into its own subtree would lose the value it is
+        // moving. Into *itself* is not that: `from` and `path` naming the
+        // same place is a move that does nothing, and the specification
+        // forbids a *proper* prefix rather than any prefix.
+        if is_prefix(source, tokens) and source.len() < tokens.len() {
+            fail(IntoItself(at, from))
+        }
+        let without = try take_out(document, source, at, from)
+        return try place(without, tokens, lifted, at, path, true)
+    }
+    fail(UnknownOp(at, op))
+}
+
+fn value_of(operation: ref Json, at: i64) -> ref Json ! JsonPatchError {
+    match member(operation, "value") {
+        Some(found) -> return found
+        None -> fail(NoValue(at))
+    }
+}
+
+/// Whether `outer` names an ancestor of `inner`, or the same place. A move
+/// from `/a` to `/a/b` is the case this refuses.
+fn is_prefix(outer: [str], inner: [str]) -> bool {
+    if outer.len() > inner.len() {
+        return false
+    }
+    var i = 0
+    while i < outer.len() {
+        if outer[i] != inner[i] {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn walk(document: ref Json, tokens: [str]) -> ref Json ! JsonPatchError {
+    var here = document
+    var i = 0
+    while i < tokens.len() {
+        match jsonpointer.step(here, tokens[i]) {
+            Ok(next) -> here = next
+            Err(_why) -> fail(Missing(i, tokens[i]))
+        }
+        i = i + 1
+    }
+    return here
+}
+
+fn require(document: ref Json, tokens: [str], at: i64,
+    path: str) -> bool ! JsonPatchError {
+    match walk(document, tokens) {
+        Ok(_found) -> return true
+        Err(_why) -> fail(Missing(at, path))
+    }
+}
+
+fn take_out(document: ref Json, tokens: [str], at: i64,
+    path: str) -> ref Json ! JsonPatchError {
+    if tokens.len() == 0 {
+        fail(RootRemoved(at))
+    }
+    let token = tokens[0]
+    if tokens.len() == 1 {
+        return try drop_one(document, token, at, path)
+    }
+    let child = try descend(document, token, at, path)
+    let edited = try take_out(child, rest(tokens), at, path)
+    return try replace_child(document, token, edited, at, path)
+}
+
+fn rest(tokens: [str]) -> [str] {
+    var out: [str] = []
+    var i = 1
+    while i < tokens.len() {
+        out.push(tokens[i])
+        i = i + 1
+    }
+    return out
+}
+
+fn descend(document: ref Json, token: str, at: i64,
+    path: str) -> ref Json ! JsonPatchError {
+    match jsonpointer.step(document, token) {
+        Ok(next) -> return next
+        Err(_why) -> fail(Missing(at, path))
+    }
+}
+
+fn drop_one(document: ref Json, token: str, at: i64,
+    path: str) -> ref Json ! JsonPatchError {
+    match document {
+        JObj(keys, values) -> {
+            var ks: [str] = []
+            var vs: [ref Json] = []
+            var found = false
+            var i = 0
+            while i < keys.len() {
+                if keys[i] == token {
+                    found = true
+                } else {
+                    ks.push(keys[i])
+                    vs.push(values[i])
+                }
+                i = i + 1
+            }
+            if not found {
+                fail(Missing(at, path))
+            }
+            return ref(JObj(ks, vs))
+        }
+        JList(items) -> {
+            var index = 0 - 1
+            match jsonpointer.index_of(token) {
+                Ok(found) -> index = found
+                Err(_why) -> fail(Missing(at, path))
+            }
+            if index >= items.len() {
+                fail(Missing(at, path))
+            }
+            var out: [ref Json] = []
+            var i = 0
+            while i < items.len() {
+                if i != index {
+                    out.push(items[i])
+                }
+                i = i + 1
+            }
+            return ref(JList(out))
+        }
+        _ -> fail(Missing(at, path))
+    }
+}
+
+fn replace_child(document: ref Json, token: str, child: ref Json,
+    at: i64, path: str) -> ref Json ! JsonPatchError {
+    match document {
+        JObj(_keys, _values) -> return json.with_key(document, token, child)
+        JList(items) -> {
+            var index = 0 - 1
+            match jsonpointer.index_of(token) {
+                Ok(found) -> index = found
+                Err(_why) -> fail(Missing(at, path))
+            }
+            if index >= items.len() {
+                fail(Missing(at, path))
+            }
+            var out: [ref Json] = []
+            var i = 0
+            while i < items.len() {
+                if i == index {
+                    out.push(child)
+                } else {
+                    out.push(items[i])
+                }
+                i = i + 1
+            }
+            return ref(JList(out))
+        }
+        _ -> fail(Missing(at, path))
+    }
+}
+
+/// Put a value where a pointer says. `inserting` is true for `add`, where
+/// an array index shifts what is there rather than overwriting it.
+fn place(document: ref Json, tokens: [str], value: ref Json, at: i64,
+    path: str, inserting: bool) -> ref Json ! JsonPatchError {
+    if tokens.len() == 0 {
+        return value
+    }
+    let token = tokens[0]
+    if tokens.len() == 1 {
+        return try put(document, token, value, at, path, inserting)
+    }
+    let child = try descend(document, token, at, path)
+    let edited = try place(child, rest(tokens), value, at, path, inserting)
+    return try replace_child(document, token, edited, at, path)
+}
+
+fn put(document: ref Json, token: str, value: ref Json, at: i64,
+    path: str, inserting: bool) -> ref Json ! JsonPatchError {
+    match document {
+        JObj(_keys, _values) -> return json.with_key(document, token, value)
+        JList(items) -> {
+            var index = items.len()
+            if token != "-" {
+                match jsonpointer.index_of(token) {
+                    Ok(found) -> index = found
+                    Err(_why) -> fail(Missing(at, path))
+                }
+            } else if not inserting {
+                // `-` names the position after the last element, where
+                // there is nothing to replace.
+                fail(Missing(at, path))
+            }
+            if index > items.len() or (not inserting and
+                index >= items.len()) {
+                fail(Missing(at, path))
+            }
+            var out: [ref Json] = []
+            var i = 0
+            while i < items.len() {
+                if i == index {
+                    out.push(value)
+                    if inserting {
+                        out.push(items[i])
+                    }
+                } else {
+                    out.push(items[i])
+                }
+                i = i + 1
+            }
+            if index == items.len() {
+                out.push(value)
+            }
+            return ref(JList(out))
+        }
+        _ -> fail(Missing(at, path))
+    }
+}

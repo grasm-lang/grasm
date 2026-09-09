@@ -1,0 +1,409 @@
+// Talking to somebody else's HTTP API: naming the thing, editing the thing,
+// and the two vendors whose wire formats are not JSON in and JSON out.
+//
+// Every expected value below came from an outside implementation — the URI
+// Template working group's test suite, the JSON Patch test suite, the RFCs'
+// own example tables, Stripe's own encoder and botocore — and none of them
+// was written from memory.
+import json
+import urltemplate
+import jsonpointer
+import jsonpatch
+import jsonmergepatch
+import stripewire
+import s3wire
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn expanded(template: str, values: [(str, UtValue)]) -> str {
+    match urltemplate.expand(template, values) {
+        Ok(filled) -> return filled
+        Err(_why) -> return "<error>"
+    }
+}
+
+fn refused(template: str, values: [(str, UtValue)]) -> bool {
+    match urltemplate.expand(template, values) {
+        Ok(_filled) -> return false
+        Err(_why) -> return true
+    }
+}
+
+// ----------------------------------------------------------- urltemplate
+
+fn check_templates(inout f: i64) / {io} {
+    print("-- urltemplate: what a server hands back is not a URL yet")
+    // RFC 6570 section 3.2's variable set, and its own expected answers.
+    let values = [
+        urltemplate.text("var", "value"),
+        urltemplate.text("hello", "Hello World!"),
+        urltemplate.text("half", "50%"),
+        urltemplate.text("empty", ""),
+        urltemplate.text("path", "/foo/bar"),
+        urltemplate.text("who", "fred"),
+        urltemplate.text("dub", "me/too"),
+        urltemplate.text("x", "1024"),
+        urltemplate.text("y", "768"),
+        urltemplate.list("list", ["red", "green", "blue"]),
+    ]
+    say(f, "a plain expansion escapes everything a URI reserves",
+        expanded("\{var}", values) == "value" and
+        expanded("\{hello}", values) == "Hello%20World%21")
+    say(f, "and the reserved operator lets a path through as a path",
+        expanded("\{+path}/here", values) == "/foo/bar/here" and
+        expanded("\{+half}", values) == "50%25")
+    say(f, "a fragment keeps its own reserved characters and its hash",
+        expanded("\{#hello}", values) == "#Hello%20World!")
+    say(f, "a label writes the dot, a segment writes the slash",
+        expanded("X\{.var}", values) == "X.value" and
+        expanded("\{/who,dub}", values) == "/fred/me%2Ftoo")
+    say(f, "an exploded list becomes one segment each",
+        expanded("\{/list*}", values) == "/red/green/blue" and
+        expanded("\{list}", values) == "red,green,blue")
+    say(f, "the named operators write the variable's own name",
+        expanded("\{;x,y}", values) == ";x=1024;y=768" and
+        expanded("\{?x,y,empty}", values) == "?x=1024&y=768&empty=")
+    say(f, "an undefined variable takes its separator with it",
+        expanded("O\{empty}X", values) == "OX" and
+        expanded("O\{undef}X", values) == "OX" and
+        expanded("\{?undef}", values) == "")
+    say(f, "a prefix counts characters, so it cannot split a codepoint",
+        expanded("\{var:3}", values) == "val" and
+        expanded("\{hello:5}", values) == "Hello")
+    // The refusals, which the working group's suite has a file of.
+    say(f, "a hyphen is not a variable character, so that is not a miss",
+        refused("/\{default-graph-uri}", values))
+    say(f, "a prefix of zero, or one written 01, is malformed",
+        refused("\{var:0}", values) and refused("\{var:01}", values))
+    say(f, "a dot may not lead, trail or double in a name",
+        refused("\{x.}", values) and refused("\{x..y}", values))
+    say(f, "and a prefix on a list is refused rather than ignored",
+        refused("\{list:3}", values))
+    say(f, "the names a template will read can be asked for first",
+        (urltemplate.variables(
+            "https://api.example/repos\{/owner,name}/issues\{?state,page}") ??
+            []) == ["owner", "name", "state", "page"])
+}
+
+// ----------------------------------------------------------- jsonpointer
+
+fn check_pointers(inout f: i64) / {io} {
+    print("-- jsonpointer: one place in a document, written as a string")
+    // RFC 6901 section 5's document, and its own table of answers.
+    let document = json.parse("\{\"foo\": [\"bar\", \"baz\"], \"\": 0," +
+        " \"a/b\": 1, \"c%d\": 2, \"e^f\": 3, \"g|h\": 4," +
+        " \"i\\\\j\": 5, \"k\\\"l\": 6, \" \": 7, \"m~n\": 8}") ??
+    json.null()
+    say(f, "the empty pointer is the whole document, not its root member",
+        json.count(resolved(document, "")) == 10)
+    say(f, "a member, and an element of it",
+        json.count(resolved(document, "/foo")) == 2 and
+        (json.as_str(resolved(document, "/foo/0")) ?? "") == "bar")
+    say(f, "a single slash names the member called the empty string",
+        number_at(document, "/") == 0)
+    say(f, "a slash inside a name is written ~1",
+        number_at(document, "/a~1b") == 1)
+    say(f, "and a tilde is written ~0, unescaped after the slash",
+        number_at(document, "/m~0n") == 8 and
+        (jsonpointer.unescape("~01") ?? "") == "~1")
+    say(f, "the characters a URI would escape are not escaped here",
+        number_at(document, "/c%d") == 2 and
+        number_at(document, "/e^f") == 3 and
+        number_at(document, "/g|h") == 4 and
+        number_at(document, "/i\\j") == 5 and
+        number_at(document, "/k\"l") == 6 and
+        number_at(document, "/ ") == 7)
+    say(f, "a pointer that does not start with a slash is not a pointer",
+        pointer_refused(document, "foo"))
+    say(f, "a tilde followed by anything else is malformed",
+        pointer_refused(document, "/~2"))
+    say(f, "an index with a leading zero is not that index",
+        pointer_refused(document, "/foo/01") and
+        not s3wire.is_dns_name("01"))
+    say(f, "and building a pointer escapes what parsing unescapes",
+        jsonpointer.render(["a/b", "m~n", "plain"]) ==
+        "/a~1b/m~0n/plain")
+}
+
+fn resolved(document: ref Json, pointer: str) -> ref Json {
+    return jsonpointer.resolve(document, pointer) ?? json.null()
+}
+
+fn number_at(document: ref Json, pointer: str) -> i64 {
+    return json.as_int(resolved(document, pointer)) ?? 0 - 1
+}
+
+fn pointer_refused(document: ref Json, pointer: str) -> bool {
+    match jsonpointer.resolve(document, pointer) {
+        Ok(_found) -> return false
+        Err(_why) -> return true
+    }
+}
+
+// ------------------------------------------------- jsonpatch, mergepatch
+
+fn patched(document: str, patch: str) -> ref Json {
+    let before = json.parse(document) ?? json.null()
+    let edits = json.parse(patch) ?? json.null()
+    return jsonpatch.apply(before, edits) ?? json.null()
+}
+
+fn patch_refused(document: str, patch: str) -> bool {
+    let before = json.parse(document) ?? json.null()
+    let edits = json.parse(patch) ?? json.null()
+    match jsonpatch.apply(before, edits) {
+        Ok(_after) -> return false
+        Err(_why) -> return true
+    }
+}
+
+fn same(value: ref Json, text: str) -> bool {
+    return json.equal(value, json.parse(text) ?? json.null())
+}
+
+fn check_patches(inout f: i64) / {io} {
+    print("-- jsonpatch: a list of edits, and the ones that must not apply")
+    // RFC 6902 appendix A, by way of the JSON Patch test suite.
+    say(f, "adding a member, and adding an array element by inserting",
+        same(patched("\{\"foo\": \"bar\"}",
+            "[\{\"op\": \"add\", \"path\": \"/baz\", \"value\": \"qux\"}]"),
+            "\{\"baz\": \"qux\", \"foo\": \"bar\"}") and
+        same(patched("\{\"foo\": [\"bar\", \"baz\"]}",
+            "[\{\"op\": \"add\", \"path\": \"/foo/1\", \"value\": \"qux\"}]"),
+            "\{\"foo\": [\"bar\", \"qux\", \"baz\"]}"))
+    say(f, "removing one of each",
+        same(patched("\{\"baz\": \"qux\", \"foo\": \"bar\"}",
+            "[\{\"op\": \"remove\", \"path\": \"/baz\"}]"),
+            "\{\"foo\": \"bar\"}") and
+        same(patched("\{\"foo\": [\"bar\", \"qux\", \"baz\"]}",
+            "[\{\"op\": \"remove\", \"path\": \"/foo/1\"}]"),
+            "\{\"foo\": [\"bar\", \"baz\"]}"))
+    say(f, "moving an array element is a remove and an insert, in order",
+        same(patched("\{\"foo\": [\"all\", \"grass\", \"cows\", \"eat\"]}",
+            "[\{\"op\": \"move\", \"from\": \"/foo/1\", \"path\": \"/foo/3\"}]"),
+            "\{\"foo\": [\"all\", \"cows\", \"eat\", \"grass\"]}"))
+    say(f, "a dash appends, and only when adding",
+        same(patched("\{\"foo\": [1, 2]}",
+            "[\{\"op\": \"add\", \"path\": \"/foo/-\", \"value\": 3}]"),
+            "\{\"foo\": [1, 2, 3]}") and
+        patch_refused("\{\"foo\": [1, 2]}",
+            "[\{\"op\": \"replace\", \"path\": \"/foo/-\", \"value\": 3}]"))
+    say(f, "a test compares values, so member order does not matter",
+        same(patched("\{\"foo\": \{\"foo\": 1, \"bar\": 2}}",
+            "[\{\"op\": \"test\", \"path\": \"/foo\"," +
+            " \"value\": \{\"bar\": 2, \"foo\": 1}}]"),
+            "\{\"foo\": \{\"foo\": 1, \"bar\": 2}}"))
+    say(f, "a failing test stops the patch, leaving the document alone",
+        patch_refused("\{\"foo\": \"bar\"}",
+            "[\{\"op\": \"replace\", \"path\": \"/foo\", \"value\": \"x\"}," +
+            " \{\"op\": \"test\", \"path\": \"/foo\", \"value\": \"bar\"}]"))
+    say(f, "missing objects are not created on the way down",
+        patch_refused("\{\"q\": \{\"bar\": 2}}",
+            "[\{\"op\": \"add\", \"path\": \"/a/b\", \"value\": 1}]"))
+    say(f, "a move into its own subtree is refused, into itself is not",
+        patch_refused("\{\"foo\": \{\"bar\": 1}}",
+            "[\{\"op\": \"move\", \"from\": \"/foo\", \"path\": \"/foo/x\"}]")
+        and same(patched("\{\"foo\": 1}",
+            "[\{\"op\": \"move\", \"from\": \"/foo\", \"path\": \"/foo\"}]"),
+            "\{\"foo\": 1}"))
+}
+
+fn merged(target: str, patch: str) -> ref Json {
+    return jsonmergepatch.apply(json.parse(target) ?? json.null(),
+        json.parse(patch) ?? json.null())
+}
+
+fn check_merges(inout f: i64) / {io} {
+    print("-- jsonmergepatch: a sketch of the document you want instead")
+    // RFC 7386 appendix A, every row of it that says something new.
+    say(f, "a member is replaced, and a new one is added",
+        same(merged("\{\"a\":\"b\"}", "\{\"a\":\"c\"}"),
+            "\{\"a\":\"c\"}") and
+        same(merged("\{\"a\":\"b\"}", "\{\"b\":\"c\"}"),
+            "\{\"a\":\"b\",\"b\":\"c\"}"))
+    say(f, "null deletes, which is why null cannot be a value",
+        same(merged("\{\"a\":\"b\",\"b\":\"c\"}", "\{\"a\":null}"),
+            "\{\"b\":\"c\"}"))
+    say(f, "an array is replaced whole, never merged element by element",
+        same(merged("\{\"a\":[\{\"b\":\"c\"}]}", "\{\"a\":[1]}"),
+            "\{\"a\":[1]}") and
+        same(merged("[\"a\",\"b\"]", "[\"c\",\"d\"]"), "[\"c\",\"d\"]"))
+    say(f, "a patch that is not an object replaces the whole document",
+        same(merged("\{\"a\":\"foo\"}", "null"), "null") and
+        same(merged("\{\"a\":\"foo\"}", "\"bar\""), "\"bar\""))
+    say(f, "and a target that is not an object is started again as one",
+        same(merged("[1,2]", "\{\"a\":\"b\",\"c\":null}"),
+            "\{\"a\":\"b\"}"))
+    say(f, "a null already in the target is not touched by an unrelated add",
+        same(merged("\{\"e\":null}", "\{\"a\":1}"),
+            "\{\"e\":null,\"a\":1}"))
+    say(f, "and the round trip: the difference reapplies to the same thing",
+        same(jsonmergepatch.apply(json.parse("\{\"a\":1,\"b\":\{\"c\":2}}") ??
+            json.null(), jsonmergepatch.diff(
+                json.parse("\{\"a\":1,\"b\":\{\"c\":2}}") ?? json.null(),
+                json.parse("\{\"a\":1,\"b\":\{\"d\":3}}") ?? json.null())),
+            "\{\"a\":1,\"b\":\{\"d\":3}}"))
+}
+
+// ------------------------------------------------------------ stripewire
+
+fn check_stripe(inout f: i64) / {io} {
+    print("-- stripewire: JSON comes back, form encoding goes out")
+    // Every body below is what Stripe's own encoder produces.
+    say(f, "a nested map is written parent[key], not as JSON",
+        stripewire.form_body([("amount", stripewire.sv_int(2000)),
+            ("currency", stripewire.sv_text("usd")),
+            ("metadata", stripewire.sv_map([("order_id",
+                stripewire.sv_text("6735"))]))]) ==
+        "amount=2000&currency=usd&metadata%5Border_id%5D=6735")
+    say(f, "and a list is written parent[0], nested as deep as it goes",
+        stripewire.form_body([("items", stripewire.sv_list([
+            stripewire.sv_map([("price", stripewire.sv_text("price_1")),
+                ("quantity", stripewire.sv_int(2))])])),
+            ("expand", stripewire.sv_list([
+                stripewire.sv_text("customer")]))]) ==
+        "items%5B0%5D%5Bprice%5D=price_1&items%5B0%5D%5Bquantity%5D=2" +
+        "&expand%5B0%5D=customer")
+    say(f, "an empty map has no key to write, so it is not sent",
+        stripewire.form_body([("metadata", stripewire.sv_map([])),
+            ("description", stripewire.sv_text("a b+c"))]) ==
+        "description=a+b%2Bc")
+    say(f, "a space is a plus here, which is not what a URI does",
+        stripewire.form_escape("a b") == "a+b" and
+        stripewire.form_escape("a+b") == "a%2Bb" and
+        stripewire.form_escape("a=b&c") == "a%3Db%26c")
+    say(f, "booleans go out lower-case, the way the API reads them",
+        stripewire.form_body([("livemode", stripewire.sv_bool(true)),
+            ("paid", stripewire.sv_bool(false))]) ==
+        "livemode=true&paid=false")
+    say(f, "an idempotency key is left off when there is none to send",
+        stripewire.request_headers("sk_test", "2024-06-20", "").len() == 3
+        and stripewire.request_headers("sk_test", "2024-06-20",
+            "abc").len() == 4)
+    let declined = "\{\"error\": \{\"type\": \"card_error\"," +
+    " \"code\": \"card_declined\"," +
+    " \"decline_code\": \"insufficient_funds\"," +
+    " \"message\": \"Your card has insufficient funds.\"}}"
+    say(f, "a decline says what happened and, separately, why",
+        (stripewire.failure_of(declined) ?? no_failure()).code ==
+        "card_declined" and
+        (stripewire.failure_of(declined) ?? no_failure()).decline_code ==
+        "insufficient_funds")
+    say(f, "a decline is not retried; a conflict and a 500 are",
+        not stripewire.should_retry(402, []) and
+        not stripewire.should_retry(400, []) and
+        stripewire.should_retry(409, []) and
+        stripewire.should_retry(503, []))
+    say(f, "and the header overrules the status, in both directions",
+        stripewire.should_retry(400, [("Stripe-Should-Retry", "true")]) and
+        not stripewire.should_retry(500,
+            [("stripe-should-retry", "false")]))
+    say(f, "paging is by the last id, and stops when there is no more",
+        stripewire.next_cursor("\{\"has_more\": true, \"data\": " +
+            "[\{\"id\": \"ch_1\"}, \{\"id\": \"ch_2\"}]}") == "ch_2" and
+        stripewire.next_cursor("\{\"has_more\": false, \"data\": " +
+            "[\{\"id\": \"ch_1\"}]}") == "")
+}
+
+fn no_failure() -> StripeFailure {
+    return StripeFailure{ kind: "", code: "", message: "", param: "",
+        decline_code: "" }
+}
+
+// ---------------------------------------------------------------- s3wire
+
+fn check_s3(inout f: i64) / {io} {
+    print("-- s3wire: a bucket is not always a host, a key is not a path")
+    // botocore answers each of these the same way.
+    say(f, "a plain name can go in the host",
+        s3wire.is_dns_name("my-bucket"))
+    say(f, "a dot cannot, because the certificate covers one label",
+        not s3wire.is_dns_name("my.bucket"))
+    say(f, "nor an upper-case letter, nor two characters, nor sixty-four",
+        not s3wire.is_dns_name("MyBucket") and
+        not s3wire.is_dns_name("ab") and
+        not s3wire.is_dns_name("a".repeat(64)))
+    say(f, "so the addressing style follows from the name, not a setting",
+        s3wire.host_for("my-bucket", "eu-west-1", false) ==
+        "my-bucket.s3.eu-west-1.amazonaws.com" and
+        s3wire.host_for("my.bucket", "eu-west-1", false) ==
+        "s3.eu-west-1.amazonaws.com" and
+        s3wire.object_path("my.bucket", "k", false) == "/my.bucket/k")
+    say(f, "a key keeps its slashes and loses everything else reserved",
+        s3wire.encode_key("a/b c.txt") == "a/b%20c.txt" and
+        s3wire.encode_key("a+b~c*d(e)") == "a%2Bb~c%2Ad%28e%29" and
+        s3wire.encode_key("caf\u{e9}/x") == "caf%C3%A9/x")
+    say(f, "and dot-dot is two characters of a key, not a path to resolve",
+        s3wire.encode_key("a/../b") == "a/../b")
+    say(f, "a name that could be an address is refused outright",
+        bucket_refused("192.168.5.4") and bucket_refused("a..b") and
+        bucket_refused("-lead") and bucket_refused("UPPER") and
+        not bucket_refused("my.bucket"))
+    let listing = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>" +
+    "<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/" +
+    "2006-03-01/\"><Name>bucket</Name><Prefix>photos/</Prefix>" +
+    "<Delimiter>/</Delimiter><IsTruncated>true</IsTruncated>" +
+    "<NextContinuationToken>1ueGcx</NextContinuationToken>" +
+    "<Contents><Key>photos/a &amp; b.jpg</Key>" +
+    "<LastModified>2009-10-12T17:50:30.000Z</LastModified>" +
+    "<ETag>&quot;fba9dede&quot;</ETag><Size>434234</Size>" +
+    "<StorageClass>STANDARD</StorageClass></Contents>" +
+    "<CommonPrefixes><Prefix>photos/2006/</Prefix></CommonPrefixes>" +
+    "</ListBucketResult>"
+    let page = s3wire.listing_of(listing) ?? no_listing()
+    say(f, "a listing is read through its namespace, not around it",
+        page.name == "bucket" and page.prefix == "photos/" and
+        page.objects.len() == 1 and
+        page.objects[0].key == "photos/a & b.jpg" and
+        page.objects[0].size == 434234)
+    say(f, "the quotes round an ETag are part of it",
+        page.objects[0].etag == "\"fba9dede\"")
+    say(f, "a rolled-up prefix is not an object and is kept apart",
+        page.folders.len() == 1 and page.folders[0] == "photos/2006/")
+    say(f, "and a truncated page says what to ask for next",
+        page.truncated and page.next_token == "1ueGcx")
+    let refusal = "<Error><Code>SignatureDoesNotMatch</Code>" +
+    "<Message>The request signature we calculated does not match" +
+    "</Message><RequestId>656c76696e</RequestId></Error>"
+    say(f, "a 403 body says which of the four kinds of 403 it is",
+        (s3wire.failure_of(refusal) ?? no_failure_s3()).code ==
+        "SignatureDoesNotMatch")
+}
+
+fn bucket_refused(name: str) -> bool {
+    match s3wire.check_bucket(name) {
+        Ok(_yes) -> return false
+        Err(_why) -> return true
+    }
+}
+
+fn no_listing() -> S3Listing {
+    return S3Listing{ name: "", prefix: "", delimiter: "", objects: [],
+        folders: [], truncated: false, next_token: "" }
+}
+
+fn no_failure_s3() -> S3Failure {
+    return S3Failure{ code: "", message: "", resource: "", request_id: "" }
+}
+
+fn main() / {io} {
+    var f = 0
+    check_templates(f)
+    check_pointers(f)
+    check_patches(f)
+    check_merges(f)
+    check_stripe(f)
+    check_s3(f)
+    if f == 0 {
+        print("apis: every claim held")
+    } else {
+        print("apis: {f} claims failed")
+    }
+}

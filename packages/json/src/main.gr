@@ -279,6 +279,16 @@ pub fn render(v: ref Json) -> str {
     }
 }
 
+/// Whether two documents are the same *value*.
+///
+/// An object is an unordered collection, so `\{"a":1,"b":2\}` and
+/// `\{"b":2,"a":1\}` are equal even though `render` writes them differently.
+/// Comparing members by position instead would be faster and would make a
+/// JSON Patch `test` fail against a server that reordered a response — which
+/// servers do, because nothing tells them not to.
+///
+/// A duplicate key is compared against the first member of that name, which
+/// is the one `parse` kept and the one `get` answers with.
 pub fn equal(a: ref Json, b: ref Json) -> bool {
     match a {
         JNull -> match b { JNull -> true _ -> false }
@@ -305,7 +315,14 @@ pub fn equal(a: ref Json, b: ref Json) -> bool {
                     return false
                 }
                 for i in 0..xk.len() {
-                    if xk[i] != yk[i] or not equal(xv[i], yv[i]) {
+                    var found = false
+                    for j in 0..yk.len() {
+                        if yk[j] == xk[i] {
+                            found = equal(xv[i], yv[j])
+                            break
+                        }
+                    }
+                    if not found {
                         return false
                     }
                 }

@@ -1,0 +1,184 @@
+// JSON Pointer, RFC 6901: a string that names one place in a document.
+//
+//   ""            the whole document
+//   "/foo"        the member `foo`
+//   "/foo/0"      its first element
+//   "/"           the member whose name is the empty string, which is legal
+//                 and is not the document root
+//
+// ## The two escapes, and the order they come off in
+//
+// A member name may contain `/` and `~`, and a pointer is split on `/`, so
+// both are escaped: `~1` is a slash and `~0` is a tilde. They must be
+// unescaped in *that* order — `~0` last — or `~01` comes out as `/` where
+// the RFC says `~1`. Doing it the other way round is the classic bug, and
+// it is silent: the pointer resolves to nothing rather than to the wrong
+// thing, so it reads as a missing key.
+//
+// ## An index is not a key
+//
+// Inside a list a token must be `0`, or a digit string with no leading
+// zero, or `-`. `01` is not 1 and `1.0` is not 1: both are malformed, and a
+// pointer library that calls `parse_int` on the token accepts them and then
+// disagrees with every other implementation about what the document says.
+//
+// `-` names the position after the last element. Nothing is ever there to
+// read, which is why `resolve` refuses it and `add` in `jsonpatch` is the
+// one operation that wants it.
+import json
+
+type PointerError =
+    | NotAPointer(text: str)
+    | BadEscape(token: str)
+    | BadIndex(token: str)
+    | NoSuchKey(token: str)
+    | OutOfRange(token: str)
+    | NotAContainer(token: str)
+
+    /// Split a pointer into its tokens, unescaped.
+pub fn parse(pointer: str) -> [str] ! PointerError {
+    if pointer.len() == 0 {
+        return []
+    }
+    if not pointer.starts_with("/") {
+        fail(NotAPointer(pointer))
+    }
+    var tokens: [str] = []
+    var first = true
+    for piece in pointer.split("/") {
+        if first {
+            // `split` yields the empty string before the leading slash.
+            first = false
+        } else {
+            tokens.push(try unescape(piece))
+        }
+    }
+    return tokens
+}
+
+/// Turn `~1` into `/` and `~0` into `~`, in that order, refusing a `~`
+/// followed by anything else.
+pub fn unescape(token: str) -> str ! PointerError {
+    var out = ""
+    var i = 0
+    while i < token.len() {
+        let here = token.substr(i, 1)
+        if here == "~" {
+            if i + 1 >= token.len() {
+                fail(BadEscape(token))
+            }
+            let next = token.substr(i + 1, 1)
+            if next == "0" {
+                out = out + "~"
+            } else if next == "1" {
+                out = out + "/"
+            } else {
+                fail(BadEscape(token))
+            }
+            i = i + 2
+        } else {
+            out = out + here
+            i = i + 1
+        }
+    }
+    return out
+}
+
+/// The inverse: a member name written as a token.
+pub fn escape(name: str) -> str {
+    var out = ""
+    var i = 0
+    while i < name.len() {
+        let here = name.substr(i, 1)
+        if here == "~" {
+            out = out + "~0"
+        } else if here == "/" {
+            out = out + "~1"
+        } else {
+            out = out + here
+        }
+        i = i + 1
+    }
+    return out
+}
+
+/// Build a pointer from tokens.
+pub fn render(tokens: [str]) -> str {
+    var out = ""
+    for token in tokens {
+        out = out + "/" + escape(token)
+    }
+    return out
+}
+
+/// Whether a token is a legal array index: `0`, or digits with no leading
+/// zero. `-` is legal in a pointer and is not an index, so it is refused
+/// here and handled by the caller that wants it.
+pub fn is_index(token: str) -> bool {
+    if token.len() == 0 {
+        return false
+    }
+    let raw = token.to_bytes()
+    if raw.at(0) == 48 {
+        return token.len() == 1
+    }
+    var i = 0
+    while i < raw.len() {
+        if raw.at(i) < 48 or raw.at(i) > 57 {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+/// The index a token names, having been checked by `is_index`.
+pub fn index_of(token: str) -> i64 ! PointerError {
+    if not is_index(token) {
+        fail(BadIndex(token))
+    }
+    match token.parse_int() {
+        Some(value) -> return value
+        None -> fail(BadIndex(token))
+    }
+}
+
+/// Follow one token.
+pub fn step(document: ref Json,
+    token: str) -> ref Json ! PointerError {
+    match document {
+        JObj(_keys, _values) -> {
+            match json.get(document, token) {
+                Some(found) -> return found
+                None -> fail(NoSuchKey(token))
+            }
+        }
+        JList(items) -> {
+            let index = try index_of(token)
+            if index >= items.len() {
+                fail(OutOfRange(token))
+            }
+            return items[index]
+        }
+        _ -> fail(NotAContainer(token))
+    }
+}
+
+/// The value a pointer names.
+pub fn resolve(document: ref Json,
+    pointer: str) -> ref Json ! PointerError {
+    var here = document
+    for token in try parse(pointer) {
+        here = try step(here, token)
+    }
+    return here
+}
+
+/// Whether a pointer names anything, which is the question a `test`
+/// operation and a conditional read both ask.
+pub fn exists(document: ref Json, pointer: str) -> bool {
+    match resolve(document, pointer) {
+        Ok(_found) -> return true
+        Err(_why) -> return false
+    }
+}

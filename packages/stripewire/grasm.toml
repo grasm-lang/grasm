@@ -1,0 +1,7 @@
+[package]
+name = "stripewire"
+version = "1.0.0"
+
+[dependencies.json]
+path = "../json"
+version = "^1.0.0"

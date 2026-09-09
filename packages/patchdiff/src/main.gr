@@ -1,0 +1,60 @@
+// The client end of the `patch_diff.sh` gate.
+//
+// Arguments come in threes: `6902` or `7386`, a document, and a patch, the
+// last two hex-encoded because a test case is JSON and JSON is full of
+// quotes. Out comes the patched document, hex-encoded, or `error`.
+import json
+import jsonpatch
+import jsonmergepatch
+
+fn from_hex(text: str) -> str {
+    var out: [i64] = []
+    var i = 0
+    while i + 1 < text.len() {
+        out.push(text.substr(i, 2).parse_int_base(16) ?? 0)
+        i = i + 2
+    }
+    return bytes_of(out).to_str()
+}
+
+fn to_hex(text: str) -> str {
+    let digits = "0123456789abcdef"
+    let raw = text.to_bytes()
+    var out = ""
+    var i = 0
+    while i < raw.len() {
+        out = out + digits.substr(raw.at(i) / 16, 1) +
+        digits.substr(raw.at(i) % 16, 1)
+        i = i + 1
+    }
+    return out
+}
+
+fn main() / {io} {
+    var i = 0
+    while i + 2 < args().len() {
+        print(run(args()[i], from_hex(args()[i + 1]),
+            from_hex(args()[i + 2])))
+        i = i + 3
+    }
+}
+
+fn run(kind: str, document_text: str, patch_text: str) -> str {
+    var document = json.null()
+    match json.parse(document_text) {
+        Ok(parsed) -> document = parsed
+        Err(_why) -> return "error/document"
+    }
+    var patch = json.null()
+    match json.parse(patch_text) {
+        Ok(parsed) -> patch = parsed
+        Err(_why) -> return "error/patch"
+    }
+    if kind == "7386" {
+        return to_hex(json.render(jsonmergepatch.apply(document, patch)))
+    }
+    match jsonpatch.apply(document, patch) {
+        Ok(patched) -> return to_hex(json.render(patched))
+        Err(_why) -> return "error/apply"
+    }
+}

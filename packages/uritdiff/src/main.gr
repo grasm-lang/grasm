@@ -1,0 +1,100 @@
+// The client end of the `urit_diff.sh` gate.
+//
+// Variables and templates arrive as arguments, hex-encoded, because the
+// official test suite contains values holding spaces, quotes, percent signs
+// and non-ASCII text, and an encoding that needs no escaping rules cannot
+// get its escaping rules wrong. Expansions go back out the same way.
+//
+//   t:<name>:<hex>            a string variable
+//   l:<name>:<hex>|<hex>      a list, possibly empty
+//   p:<name>:<hex>,<hex>|...  name-value pairs, possibly empty
+//   x:<hex>                   expand this template and print the result
+//
+// A template that will not expand prints `error/<reason>`, which is what
+// the suite's negative cases expect to see.
+import urltemplate
+
+fn from_hex(text: str) -> str {
+    var out: [i64] = []
+    var i = 0
+    while i + 1 < text.len() {
+        out.push(text.substr(i, 2).parse_int_base(16) ?? 0)
+        i = i + 2
+    }
+    return bytes_of(out).to_str()
+}
+
+fn to_hex(text: str) -> str {
+    let digits = "0123456789abcdef"
+    let raw = text.to_bytes()
+    var out = ""
+    var i = 0
+    while i < raw.len() {
+        out = out + digits.substr(raw.at(i) / 16, 1) +
+        digits.substr(raw.at(i) % 16, 1)
+        i = i + 1
+    }
+    return out
+}
+
+fn split_first(text: str, mark: str) -> (str, str) {
+    var i = 0
+    while i < text.len() {
+        if text.substr(i, 1) == mark {
+            return (text.substr(0, i), text.substr(i + 1, text.len() - i - 1))
+        }
+        i = i + 1
+    }
+    return (text, "")
+}
+
+fn main() / {io} {
+    var values: [(str, UtValue)] = []
+    var i = 0
+    while i < args().len() {
+        let argument = args()[i]
+        let kind = argument.substr(0, 1)
+        let rest = argument.substr(2, argument.len() - 2)
+        if kind == "x" {
+            match urltemplate.expand(from_hex(rest), values) {
+                Ok(filled) -> print(to_hex(filled))
+                Err(why) -> print("error/" + name_of(why))
+            }
+        } else {
+            let cut = split_first(rest, ":")
+            let name = from_hex(cut.0)
+            if kind == "t" {
+                values.push(urltemplate.text(name, from_hex(cut.1)))
+            } else if kind == "l" {
+                var items: [str] = []
+                if cut.1.len() > 0 {
+                    for piece in cut.1.split("|") {
+                        items.push(from_hex(piece))
+                    }
+                }
+                values.push(urltemplate.list(name, items))
+            } else {
+                var entries: [(str, str)] = []
+                if cut.1.len() > 0 {
+                    for piece in cut.1.split("|") {
+                        let both = split_first(piece, ",")
+                        entries.push((from_hex(both.0), from_hex(both.1)))
+                    }
+                }
+                values.push(urltemplate.pairs(name, entries))
+            }
+        }
+        i = i + 1
+    }
+}
+
+fn name_of(why: UtError) -> str {
+    match why {
+        Unclosed(at) -> return "unclosed/{at}"
+        Empty(at) -> return "empty/{at}"
+        BadOperator(operator) -> return "operator/" + operator
+        BadName(name) -> return "name/" + name
+        BadLength(spec) -> return "length/" + spec
+        Composite(name) -> return "composite/" + name
+    }
+}

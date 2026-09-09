@@ -1,0 +1,129 @@
+// JSON Merge Patch, RFC 7386: a document that looks like the one it edits.
+//
+//   target  {"a": "b", "c": {"d": "e", "f": "g"}}
+//   patch   {"a": "z", "c": {"f": null}}
+//   result  {"a": "z", "c": {"d": "e"}}
+//
+// Where `jsonpatch` is a list of instructions, this is a sketch of the
+// wanted document with `null` meaning "delete". It is much easier to write
+// by hand, which is why Kubernetes takes it as well, and it pays for that
+// in two ways a caller has to know about.
+//
+// ## `null` cannot be a value
+//
+// There is no way to *set* a member to null, because that spelling is taken
+// by deletion. A document with meaningful nulls cannot be edited this way
+// at all, and that is a property of the format rather than of this code.
+//
+// ## An array is replaced, never merged
+//
+// A patch containing a list replaces the whole list. There is no way to say
+// "append one element" or "change the third". This surprises people every
+// time, and it is the right choice: an array has no member names, so there
+// is nothing for a merge to match on.
+import json
+
+/// Apply a merge patch.
+pub fn apply(target: ref Json, patch: ref Json) -> ref Json {
+    match patch {
+        JObj(keys, values) -> {
+            var base = target
+            // Anything that is not an object is replaced wholesale before
+            // the members are merged in — merging into a string has no
+            // meaning, and the specification says to start from an empty
+            // object instead.
+            match base {
+                JObj(_k, _v) -> {}
+                _ -> base = json.object([], [])
+            }
+            var i = 0
+            while i < keys.len() {
+                if json.is_null(values[i]) {
+                    base = without(base, keys[i])
+                } else {
+                    var was = json.null()
+                    match json.get(base, keys[i]) {
+                        Some(found) -> was = found
+                        None -> was = json.object([], [])
+                    }
+                    base = json.with_key(base, keys[i],
+                        apply(was, values[i]))
+                }
+                i = i + 1
+            }
+            return base
+        }
+        _ -> return patch
+    }
+}
+
+/// An object without one member. Answers the object unchanged when it has
+/// no such member, which is what "remove if present" means.
+fn without(document: ref Json, key: str) -> ref Json {
+    match document {
+        JObj(keys, values) -> {
+            var ks: [str] = []
+            var vs: [ref Json] = []
+            var i = 0
+            while i < keys.len() {
+                if keys[i] != key {
+                    ks.push(keys[i])
+                    vs.push(values[i])
+                }
+                i = i + 1
+            }
+            return ref(JObj(ks, vs))
+        }
+        _ -> return document
+    }
+}
+
+/// The merge patch that turns `before` into `after`.
+///
+/// Not unique — `{"a": 1}` can be reached from many patches — so this
+/// answers the smallest one: members that did not change are left out, and
+/// members that went away become `null`. Feeding it back through `apply`
+/// gives `after`, which is what the demo checks over every case in the
+/// specification's own table.
+pub fn diff(before: ref Json, after: ref Json) -> ref Json {
+    match before {
+        JObj(before_keys, _before_values) -> {
+            match after {
+                JObj(after_keys, after_values) -> {
+                    var ks: [str] = []
+                    var vs: [ref Json] = []
+                    var i = 0
+                    while i < after_keys.len() {
+                        match json.get(before, after_keys[i]) {
+                            Some(was) -> {
+                                if not json.equal(was, after_values[i]) {
+                                    ks.push(after_keys[i])
+                                    vs.push(diff(was, after_values[i]))
+                                }
+                            }
+                            None -> {
+                                ks.push(after_keys[i])
+                                vs.push(after_values[i])
+                            }
+                        }
+                        i = i + 1
+                    }
+                    var j = 0
+                    while j < before_keys.len() {
+                        match json.get(after, before_keys[j]) {
+                            Some(_still) -> {}
+                            None -> {
+                                ks.push(before_keys[j])
+                                vs.push(json.null())
+                            }
+                        }
+                        j = j + 1
+                    }
+                    return ref(JObj(ks, vs))
+                }
+                _ -> return after
+            }
+        }
+        _ -> return after
+    }
+}

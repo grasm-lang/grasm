@@ -1,0 +1,293 @@
+// Addressing an object in S3, and reading what S3 says back.
+//
+// `awssig` signs a request; this decides what the request *is*. The two
+// halves are separate because getting the URL wrong produces a signature
+// that is correct for a URL nobody asked for, and the error S3 returns says
+// only that the signature did not match.
+//
+// ## Two ways to name a bucket, and only one of them always works
+//
+// Virtual-hosted style puts the bucket in the host —
+// `my-bucket.s3.eu-west-1.amazonaws.com` — and is what AWS wants. It is
+// impossible for a bucket whose name is not a DNS label: a name containing
+// a dot breaks certificate matching, since the wildcard in
+// `*.s3.<region>.amazonaws.com` covers one label. Those buckets need path
+// style, `s3.eu-west-1.amazonaws.com/my.bucket`, and a client that does not
+// notice sends a request that fails TLS verification rather than S3.
+//
+// ## A key is not a path
+//
+// `a/../b` is a key with four characters and two slashes in it. It is not a
+// path, there is no directory to go up from, and a client that normalises
+// it asks for a different object — and then signs the normalised form,
+// which is why `awssig.canonical_uri` is told not to normalise for S3.
+// Every other AWS service does normalise, and this is the one exception.
+//
+// ## The listing is XML and the pagination is not optional
+//
+// `ListObjectsV2` returns at most a thousand keys and says
+// `<IsTruncated>true</IsTruncated>` when there are more. Code that reads
+// the first page and stops works on every bucket in development and loses
+// data on the first real one.
+import xml
+
+type S3Error =
+    | BadBucket(name: str, why: str)
+    | NotXml(why: str)
+    | NotAListing()
+
+    /// Whether a bucket name is legal at all.
+    ///
+    /// The rules are AWS's: three to sixty-three characters, lower-case
+    /// letters, digits, dots and hyphens, starting and ending with a letter or
+    /// a digit, no two adjacent dots, and not shaped like an IP address —
+    /// `192.168.5.4` would be ambiguous with a host.
+pub fn check_bucket(name: str) -> bool ! S3Error {
+    if name.len() < 3 or name.len() > 63 {
+        fail(BadBucket(name, "a name is three to sixty-three characters"))
+    }
+    let raw = name.to_bytes()
+    var i = 0
+    while i < raw.len() {
+        let byte = raw.at(i)
+        let ok = (byte >= 97 and byte <= 122) or
+        (byte >= 48 and byte <= 57) or byte == 45 or byte == 46
+        if not ok {
+            fail(BadBucket(name,
+                "only lower-case letters, digits, dots and hyphens"))
+        }
+        if byte == 46 and i + 1 < raw.len() and raw.at(i + 1) == 46 {
+            fail(BadBucket(name, "two dots in a row"))
+        }
+        i = i + 1
+    }
+    if not is_alphanumeric(raw.at(0)) or
+    not is_alphanumeric(raw.at(raw.len() - 1)) {
+        fail(BadBucket(name, "it must start and end with a letter or digit"))
+    }
+    if looks_like_address(name) {
+        fail(BadBucket(name, "it looks like an IP address"))
+    }
+    if name.starts_with("xn--") or name.ends_with("-s3alias") {
+        fail(BadBucket(name, "that prefix or suffix is reserved"))
+    }
+    return true
+}
+
+fn is_alphanumeric(byte: i64) -> bool {
+    return (byte >= 97 and byte <= 122) or (byte >= 48 and byte <= 57)
+}
+
+fn looks_like_address(name: str) -> bool {
+    var parts = 0
+    for piece in name.split(".") {
+        if piece.len() == 0 or piece.len() > 3 {
+            return false
+        }
+        let raw = piece.to_bytes()
+        var i = 0
+        while i < raw.len() {
+            if raw.at(i) < 48 or raw.at(i) > 57 {
+                return false
+            }
+            i = i + 1
+        }
+        parts = parts + 1
+    }
+    return parts == 4
+}
+
+/// Whether the bucket can go in the host.
+///
+/// A dot is legal in a bucket name and fatal in a host name, because the
+/// certificate covers one label. This is the check that decides which of
+/// the two addressing styles a request has to use, and it is deliberately
+/// stricter than `check_bucket`.
+pub fn is_dns_name(name: str) -> bool {
+    if name.len() < 3 or name.len() > 63 {
+        return false
+    }
+    var i = 0
+    let raw = name.to_bytes()
+    while i < raw.len() {
+        let byte = raw.at(i)
+        let ok = (byte >= 97 and byte <= 122) or
+        (byte >= 48 and byte <= 57) or byte == 45
+        if not ok {
+            return false
+        }
+        i = i + 1
+    }
+    return is_alphanumeric(raw.at(0)) and
+    is_alphanumeric(raw.at(raw.len() - 1))
+}
+
+/// The host a request goes to.
+pub fn host_for(bucket: str, region: str, path_style: bool) -> str {
+    let base = if region == "us-east-1" {
+        "s3.amazonaws.com"
+    } else {
+        "s3." + region + ".amazonaws.com"
+    }
+    if path_style or not is_dns_name(bucket) {
+        return base
+    }
+    return bucket + "." + base
+}
+
+fn is_unreserved(byte: i64) -> bool {
+    return (byte >= 65 and byte <= 90) or (byte >= 97 and byte <= 122) or
+    (byte >= 48 and byte <= 57) or byte == 45 or byte == 46 or
+    byte == 95 or byte == 126
+}
+
+/// A key, escaped for the request line.
+///
+/// A slash stays a slash — it is what makes a key look like a path in a
+/// console listing — and every other reserved character is escaped,
+/// including `+`, which S3 would otherwise read as a space.
+pub fn encode_key(key: str) -> str {
+    let digits = "0123456789ABCDEF"
+    let raw = key.to_bytes()
+    var out = ""
+    var i = 0
+    while i < raw.len() {
+        let byte = raw.at(i)
+        if is_unreserved(byte) or byte == 47 {
+            out = out + byte.to_char()
+        } else {
+            out = out + "%" + digits.substr(byte / 16, 1) +
+            digits.substr(byte % 16, 1)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+/// The path an object sits at, given the addressing style the host used.
+pub fn object_path(bucket: str, key: str, path_style: bool) -> str {
+    if path_style or not is_dns_name(bucket) {
+        return "/" + bucket + "/" + encode_key(key)
+    }
+    return "/" + encode_key(key)
+}
+
+/// One object in a listing.
+type S3Object = {
+    key: str,
+    /// RFC 3339, as S3 writes it.
+    modified: str,
+    /// The quotes S3 puts round an ETag are kept: they are part of the
+    /// value an `If-None-Match` has to send back.
+    etag: str,
+    size: i64,
+    storage_class: str,
+}
+
+/// A page of a `ListObjectsV2` response.
+type S3Listing = {
+    name: str,
+    prefix: str,
+    delimiter: str,
+    objects: [S3Object],
+    /// The prefixes rolled up by a delimiter, which is how a listing
+    /// pretends to have folders.
+    folders: [str],
+    truncated: bool,
+    /// What to send as `continuation-token` for the next page. Empty when
+    /// this was the last one.
+    next_token: str,
+}
+
+/// The text of a child element, by local name.
+///
+/// By *local* name: S3 answers in the
+/// `http://s3.amazonaws.com/doc/2006-03-01/` namespace, and a reader that
+/// matches on the qualified name breaks the day something rewrites the
+/// prefix.
+fn child_text(node: ref Node, name: str) -> str {
+    for child in xml.children_of(node) {
+        if xml.local_name(child) == name {
+            return xml.text_of(child)
+        }
+    }
+    return ""
+}
+
+/// Read a `ListObjectsV2` response.
+pub fn listing_of(body: str) -> S3Listing ! S3Error {
+    var root = xml.text("")
+    match xml.parse(body) {
+        Ok(parsed) -> root = parsed
+        Err(why) -> fail(NotXml(why.why))
+    }
+    if xml.local_name(root) != "ListBucketResult" {
+        fail(NotAListing())
+    }
+    var objects: [S3Object] = []
+    var folders: [str] = []
+    for child in xml.children_of(root) {
+        let name = xml.local_name(child)
+        if name == "Contents" {
+            objects.push(S3Object{ key: child_text(child, "Key"),
+                modified: child_text(child, "LastModified"),
+                etag: child_text(child, "ETag"),
+                size: child_text(child, "Size").parse_int() ?? 0,
+                storage_class: child_text(child, "StorageClass") })
+        } else if name == "CommonPrefixes" {
+            folders.push(child_text(child, "Prefix"))
+        }
+    }
+    return S3Listing{ name: child_text(root, "Name"),
+        prefix: child_text(root, "Prefix"),
+        delimiter: child_text(root, "Delimiter"),
+        objects: objects, folders: folders,
+        truncated: child_text(root, "IsTruncated") == "true",
+        next_token: child_text(root, "NextContinuationToken") }
+}
+
+/// What S3 said went wrong.
+type S3Failure = {
+    code: str,
+    message: str,
+    resource: str,
+    request_id: str,
+}
+
+/// Read an error response.
+///
+/// S3 answers a failed request with an XML body and a status code, and the
+/// body says more: a 403 is `AccessDenied`, `SignatureDoesNotMatch`,
+/// `InvalidAccessKeyId` or `RequestTimeTooSkewed`, and only the first is
+/// about permissions.
+pub fn failure_of(body: str) -> S3Failure ! S3Error {
+    var root = xml.text("")
+    match xml.parse(body) {
+        Ok(parsed) -> root = parsed
+        Err(why) -> fail(NotXml(why.why))
+    }
+    return S3Failure{ code: child_text(root, "Code"),
+        message: child_text(root, "Message"),
+        resource: child_text(root, "Resource"),
+        request_id: child_text(root, "RequestId") }
+}
+
+/// The query a `ListObjectsV2` request carries, in the order AWS's
+/// canonical query would sort it into anyway.
+pub fn list_query(prefix: str, delimiter: str, token: str,
+    limit: i64) -> [(str, str)] {
+    var out = [("list-type", "2")]
+    if delimiter.len() > 0 {
+        out.push(("delimiter", delimiter))
+    }
+    if token.len() > 0 {
+        out.push(("continuation-token", token))
+    }
+    if limit > 0 {
+        out.push(("max-keys", "{limit}"))
+    }
+    if prefix.len() > 0 {
+        out.push(("prefix", prefix))
+    }
+    return out
+}

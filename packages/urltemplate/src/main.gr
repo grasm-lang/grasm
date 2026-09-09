@@ -1,0 +1,550 @@
+// URI templates, RFC 6570, to level four.
+//
+// A hosted API that returns its own URLs — GitHub's does for nearly every
+// object it hands back — returns them as templates:
+//
+//   "issues_url": "https://api.github.com/repos/o/r/issues{/number}"
+//
+// A client that treats that as a string and appends produces
+// `.../issues3`. A client that strips the braces by regular expression gets
+// the four common cases right and the other twenty wrong, which is worse,
+// because the wrong ones are the ones carrying user input.
+//
+// ## What the operator changes
+//
+// The character after `{` selects the whole expansion, not just a prefix:
+//
+//   {var}      simple, and every reserved character is escaped
+//   {+var}     reserved allowed through, so a path can carry `/`
+//   {#var}     a fragment, prefixed with `#`
+//   {.var}     a label, prefixed with `.`
+//   {/var}     a path segment, prefixed with `/`
+//   {;var}     a path parameter, `;name=value`
+//   {?var}     a query, `?name=value`
+//   {&var}     another query parameter, `&name=value`
+//
+// The last three are *named*: they write the variable's name into the
+// output, which is why `{?q}` with `q` undefined produces nothing at all
+// rather than a dangling `?`.
+//
+// ## Undefined is not empty
+//
+// A variable that has no value is skipped, separator and all. A variable
+// whose value is the empty string is expanded, and for a named operator
+// that means `?q=` rather than `?q`. Getting these the same way round is
+// most of what a hand-written expander gets wrong.
+//
+// ## What is not here
+//
+// Extraction — reading values back out of a filled-in URL. RFC 6570 says
+// plainly that templates are not reversible in general, and a function that
+// works for the easy half is a function that fails silently on the rest.
+
+type UtError =
+    | Unclosed(at: i64)
+    | Empty(at: i64)
+    | BadOperator(operator: str)
+    | BadName(name: str)
+    | BadLength(spec: str)
+    | Composite(name: str)
+
+    /// What a variable holds. A template treats these three differently, and a
+    /// caller that flattens a list to a comma-joined string before calling has
+    /// already thrown away what `*` needs.
+type UtValue =
+    | UtText(text: str)
+    | UtList(items: [str])
+    | UtPairs(pairs: [(str, str)])
+
+    /// A variable with a value.
+pub fn text(name: str, value: str) -> (str, UtValue) {
+    return (name, UtText(value))
+}
+
+/// A variable holding a list.
+pub fn list(name: str, items: [str]) -> (str, UtValue) {
+    return (name, UtList(items))
+}
+
+/// A variable holding name-value pairs, which `*` explodes into separate
+/// parameters and no modifier joins with commas.
+pub fn pairs(name: str, entries: [(str, str)]) -> (str, UtValue) {
+    return (name, UtPairs(entries))
+}
+
+fn is_unreserved(byte: i64) -> bool {
+    return (byte >= 65 and byte <= 90) or (byte >= 97 and byte <= 122) or
+    (byte >= 48 and byte <= 57) or byte == 45 or byte == 46 or
+    byte == 95 or byte == 126
+}
+
+/// The reserved set plus the unreserved one: what `+` and `#` let through.
+fn is_reserved(byte: i64) -> bool {
+    let gen = byte == 58 or byte == 47 or byte == 63 or byte == 35 or
+    byte == 91 or byte == 93 or byte == 64
+    let sub = byte == 33 or byte == 36 or byte == 38 or byte == 39 or
+    byte == 40 or byte == 41 or byte == 42 or byte == 43 or
+    byte == 44 or byte == 59 or byte == 61
+    return gen or sub
+}
+
+fn hex_digit(value: i64) -> str {
+    return "0123456789ABCDEF".substr(value, 1)
+}
+
+/// Percent-encode, escaping every octet the operator does not allow.
+///
+/// The octets are UTF-8, not codepoints: `caf\u{e9}` is two bytes and becomes
+/// `%C3%A9`, and an encoder that escapes the codepoint writes `%E9`, which
+/// is a different string that no server decodes back.
+fn encode(value: str, allow_reserved: bool) -> str {
+    let raw = value.to_bytes()
+    var out = ""
+    var i = 0
+    while i < raw.len() {
+        let byte = raw.at(i)
+        if is_unreserved(byte) or (allow_reserved and is_reserved(byte)) {
+            out = out + byte.to_char()
+        } else if allow_reserved and byte == 37 and
+        is_pct_encoded(raw, i) {
+            // An already-encoded triplet is copied rather than encoded
+            // again, or `%2F` becomes `%252F`.
+            out = out + "%" + raw.at(i + 1).to_char() +
+            raw.at(i + 2).to_char()
+            i = i + 2
+        } else {
+            out = out + "%" + hex_digit(byte / 16) + hex_digit(byte % 16)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn is_hex(byte: i64) -> bool {
+    return (byte >= 48 and byte <= 57) or (byte >= 65 and byte <= 70) or
+    (byte >= 97 and byte <= 102)
+}
+
+fn is_pct_encoded(raw: bytes, at: i64) -> bool {
+    return at + 2 < raw.len() and is_hex(raw.at(at + 1)) and
+    is_hex(raw.at(at + 2))
+}
+
+/// How one operator behaves: what it writes first, what separates values,
+/// whether names appear, what an empty value becomes, and whether reserved
+/// characters survive.
+type UtRule = {
+    first: str,
+    separator: str,
+    named: bool,
+    if_empty: str,
+    allow_reserved: bool,
+}
+
+fn rule_for(operator: str) -> UtRule ! UtError {
+    if operator == "" {
+        return UtRule{ first: "", separator: ",", named: false,
+            if_empty: "", allow_reserved: false }
+    } else if operator == "+" {
+        return UtRule{ first: "", separator: ",", named: false,
+            if_empty: "", allow_reserved: true }
+    } else if operator == "#" {
+        return UtRule{ first: "#", separator: ",", named: false,
+            if_empty: "", allow_reserved: true }
+    } else if operator == "." {
+        return UtRule{ first: ".", separator: ".", named: false,
+            if_empty: "", allow_reserved: false }
+    } else if operator == "/" {
+        return UtRule{ first: "/", separator: "/", named: false,
+            if_empty: "", allow_reserved: false }
+    } else if operator == ";" {
+        return UtRule{ first: ";", separator: ";", named: true,
+            if_empty: "", allow_reserved: false }
+    } else if operator == "?" {
+        return UtRule{ first: "?", separator: "&", named: true,
+            if_empty: "=", allow_reserved: false }
+    } else if operator == "&" {
+        return UtRule{ first: "&", separator: "&", named: true,
+            if_empty: "=", allow_reserved: false }
+    }
+    fail(BadOperator(operator))
+}
+
+/// One variable inside an expression, with its modifier.
+type UtSpec = {
+    name: str,
+    /// The `:n` prefix length, or -1 for none. Only a string may carry one.
+    prefix: i64,
+    /// Whether `*` was written.
+    explode: bool,
+}
+
+fn parse_spec(spec: str) -> UtSpec ! UtError {
+    if spec.len() == 0 {
+        fail(BadName(spec))
+    }
+    if spec.ends_with("*") {
+        let name = spec.substr(0, spec.len() - 1)
+        try check_name(name)
+        return UtSpec{ name: name, prefix: 0 - 1, explode: true }
+    }
+    let colon = index_of(spec, ":")
+    if colon < 0 {
+        try check_name(spec)
+        return UtSpec{ name: spec, prefix: 0 - 1, explode: false }
+    }
+    let name = spec.substr(0, colon)
+    try check_name(name)
+    let digits = spec.substr(colon + 1, spec.len() - colon - 1)
+    // `max-length = %x31-39 0*3DIGIT` — one to four digits, and the first
+    // may not be a zero, so `{var:0}` and `{var:01}` are both malformed
+    // rather than a zero-length prefix.
+    if digits.len() == 0 or digits.len() > 4 {
+        fail(BadLength(spec))
+    }
+    let raw = digits.to_bytes()
+    if raw.at(0) < 49 or raw.at(0) > 57 {
+        fail(BadLength(spec))
+    }
+    var at = 1
+    while at < raw.len() {
+        if not is_digit(raw.at(at)) {
+            fail(BadLength(spec))
+        }
+        at = at + 1
+    }
+    var length = 0
+    match digits.parse_int() {
+        Some(value) -> length = value
+        None -> fail(BadLength(spec))
+    }
+    return UtSpec{ name: name, prefix: length, explode: false }
+}
+
+/// RFC 6570's `varname`, which is narrower than it looks:
+///
+///     varchar = ALPHA / DIGIT / "_" / pct-encoded
+///     varname = varchar *( ["."] varchar )
+///
+/// So `-` and `~` are not variable characters — `{default-graph-uri}` is a
+/// malformed template, not a lookup that misses — and a dot must have a
+/// varchar on both sides, which rules out `{x.}` and `{x..y}`.
+fn check_name(name: str) -> bool ! UtError {
+    if name.len() == 0 {
+        fail(BadName(name))
+    }
+    let raw = name.to_bytes()
+    var i = 0
+    var want_char = true
+    while i < raw.len() {
+        let byte = raw.at(i)
+        if byte == 46 {
+            // A dot may not lead, trail, or double.
+            if want_char or i + 1 >= raw.len() {
+                fail(BadName(name))
+            }
+            want_char = true
+            i = i + 1
+        } else if byte == 37 {
+            if not is_pct_encoded(raw, i) {
+                fail(BadName(name))
+            }
+            want_char = false
+            i = i + 3
+        } else if is_letter(byte) or is_digit(byte) or byte == 95 {
+            want_char = false
+            i = i + 1
+        } else {
+            fail(BadName(name))
+        }
+    }
+    if want_char {
+        fail(BadName(name))
+    }
+    return true
+}
+
+fn is_letter(byte: i64) -> bool {
+    return (byte >= 65 and byte <= 90) or (byte >= 97 and byte <= 122)
+}
+
+fn is_digit(byte: i64) -> bool {
+    return byte >= 48 and byte <= 57
+}
+
+fn index_of(text: str, needle: str) -> i64 {
+    var i = 0
+    while i + needle.len() <= text.len() {
+        if text.substr(i, needle.len()) == needle {
+            return i
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+fn lookup(values: [(str, UtValue)], name: str) -> Option[UtValue] {
+    for entry in values {
+        if entry.0 == name {
+            return Some(entry.1)
+        }
+    }
+    return None
+}
+
+/// The first `count` characters of a string, counting *characters* rather
+/// than bytes, because `{name:3}` over `caf\u{e9}` must not cut a codepoint in
+/// half and produce an invalid percent-encoding.
+fn take_prefix(text: str, count: i64) -> str {
+    if count < 0 {
+        return text
+    }
+    var out = ""
+    var taken = 0
+    for character in text.chars() {
+        if taken >= count {
+            return out
+        }
+        out = out + character
+        taken = taken + 1
+    }
+    return out
+}
+
+/// Expand one variable, or return the empty string when it contributes
+/// nothing. `wrote` says whether it did, so the caller knows whether to
+/// write a separator before the next one.
+fn expand_one(rule: UtRule, spec: UtSpec,
+    value: UtValue) -> (str, bool) ! UtError {
+    if spec.prefix >= 0 {
+        match value {
+            UtText(_text) -> {}
+            UtList(_items) -> fail(Composite(spec.name))
+            UtPairs(_entries) -> fail(Composite(spec.name))
+        }
+    }
+    match value {
+        UtText(text) -> {
+            let cut = take_prefix(text, spec.prefix)
+            let body = encode(cut, rule.allow_reserved)
+            if rule.named {
+                if cut.len() == 0 {
+                    return (spec.name + rule.if_empty, true)
+                }
+                return (spec.name + "=" + body, true)
+            }
+            return (body, true)
+        }
+        UtList(items) -> {
+            if items.len() == 0 {
+                return ("", false)
+            }
+            var out = ""
+            var i = 0
+            while i < items.len() {
+                let body = encode(items[i], rule.allow_reserved)
+                if i > 0 {
+                    if spec.explode {
+                        out = out + rule.separator
+                    } else {
+                        out = out + ","
+                    }
+                }
+                if rule.named and spec.explode {
+                    if items[i].len() == 0 {
+                        out = out + spec.name + rule.if_empty
+                    } else {
+                        out = out + spec.name + "=" + body
+                    }
+                } else if rule.named and i == 0 {
+                    // Joined, so the name is written once for the whole
+                    // comma-separated list.
+                    out = spec.name + "=" + body
+                } else {
+                    out = out + body
+                }
+                i = i + 1
+            }
+            return (out, true)
+        }
+        UtPairs(entries) -> {
+            if entries.len() == 0 {
+                return ("", false)
+            }
+            var out = ""
+            var i = 0
+            while i < entries.len() {
+                let key = encode(entries[i].0, rule.allow_reserved)
+                let body = encode(entries[i].1, rule.allow_reserved)
+                if i > 0 {
+                    if spec.explode {
+                        out = out + rule.separator
+                    } else {
+                        out = out + ","
+                    }
+                } else if rule.named and not spec.explode {
+                    out = spec.name + "="
+                }
+                if spec.explode {
+                    out = out + key + "=" + body
+                } else {
+                    out = out + key + "," + body
+                }
+                i = i + 1
+            }
+            return (out, true)
+        }
+    }
+}
+
+fn expand_expression(body: str,
+    values: [(str, UtValue)]) -> str ! UtError {
+    var operator = ""
+    var rest = body
+    if body.len() > 0 {
+        let head = body.substr(0, 1)
+        if head == "+" or head == "#" or head == "." or head == "/" or
+        head == ";" or head == "?" or head == "&" {
+            operator = head
+            rest = body.substr(1, body.len() - 1)
+        } else if head == "=" or head == "," or head == "!" or
+        head == "@" or head == "|" {
+            // Reserved for a future level, and reserved means refused
+            // rather than guessed at.
+            fail(BadOperator(head))
+        }
+    }
+    let rule = try rule_for(operator)
+    var out = ""
+    var wrote_any = false
+    for piece in rest.split(",") {
+        let spec = try parse_spec(piece)
+        match lookup(values, spec.name) {
+            Some(value) -> {
+                let done = try expand_one(rule, spec, value)
+                if done.1 {
+                    if wrote_any {
+                        out = out + rule.separator
+                    } else {
+                        out = out + rule.first
+                    }
+                    out = out + done.0
+                    wrote_any = true
+                }
+            }
+            None -> {}
+        }
+    }
+    return out
+}
+
+/// Copy a literal, escaping what a URI may not carry directly.
+fn literal(text: str) -> str {
+    let raw = text.to_bytes()
+    var out = ""
+    var i = 0
+    while i < raw.len() {
+        let byte = raw.at(i)
+        if is_unreserved(byte) or is_reserved(byte) {
+            out = out + byte.to_char()
+        } else if byte == 37 and is_pct_encoded(raw, i) {
+            out = out + "%" + raw.at(i + 1).to_char() +
+            raw.at(i + 2).to_char()
+            i = i + 2
+        } else {
+            out = out + "%" + hex_digit(byte / 16) + hex_digit(byte % 16)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+/// Fill in a template.
+///
+/// A variable with no entry in `values` is undefined and contributes
+/// nothing, which is the whole point of `{/number}` on a collection URL.
+pub fn expand(template: str,
+    values: [(str, UtValue)]) -> str ! UtError {
+    var out = ""
+    var run = ""
+    var i = 0
+    while i < template.len() {
+        let character = template.substr(i, 1)
+        if character == "\{" {
+            let close = find_from(template, "}", i)
+            if close < 0 {
+                fail(Unclosed(i))
+            }
+            let body = template.substr(i + 1, close - i - 1)
+            if body.len() == 0 {
+                fail(Empty(i))
+            }
+            out = out + literal(run)
+            run = ""
+            out = out + try expand_expression(body, values)
+            i = close + 1
+        } else if character == "}" {
+            fail(Unclosed(i))
+        } else {
+            run = run + character
+            i = i + 1
+        }
+    }
+    return out + literal(run)
+}
+
+fn find_from(text: str, needle: str, from: i64) -> i64 {
+    var i = from
+    while i + needle.len() <= text.len() {
+        if text.substr(i, needle.len()) == needle {
+            return i
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+/// The variable names a template mentions, in order, without duplicates.
+///
+/// A caller with a template from a server and a bag of values wants to know
+/// which of them will be used before it sends anything.
+pub fn variables(template: str) -> [str] ! UtError {
+    var names: [str] = []
+    var i = 0
+    while i < template.len() {
+        if template.substr(i, 1) == "\{" {
+            let close = find_from(template, "}", i)
+            if close < 0 {
+                fail(Unclosed(i))
+            }
+            var body = template.substr(i + 1, close - i - 1)
+            if body.len() == 0 {
+                fail(Empty(i))
+            }
+            let head = body.substr(0, 1)
+            if head == "+" or head == "#" or head == "." or head == "/" or
+            head == ";" or head == "?" or head == "&" {
+                body = body.substr(1, body.len() - 1)
+            }
+            for piece in body.split(",") {
+                let spec = try parse_spec(piece)
+                if not contains(names, spec.name) {
+                    names.push(spec.name)
+                }
+            }
+            i = close + 1
+        } else {
+            i = i + 1
+        }
+    }
+    return names
+}
+
+fn contains(names: [str], name: str) -> bool {
+    for known in names {
+        if known == name {
+            return true
+        }
+    }
+    return false
+}

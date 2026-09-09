@@ -1,0 +1,8 @@
+[package]
+name = "uritdiff"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.urltemplate]
+path = "../urltemplate"
+version = "^1.0.0"

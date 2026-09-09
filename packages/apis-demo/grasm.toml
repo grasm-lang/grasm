@@ -1,0 +1,32 @@
+[package]
+name = "apis_demo"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.json]
+path = "../json"
+version = "^1.0.0"
+
+[dependencies.urltemplate]
+path = "../urltemplate"
+version = "^1.0.0"
+
+[dependencies.jsonpointer]
+path = "../jsonpointer"
+version = "^1.0.0"
+
+[dependencies.jsonpatch]
+path = "../jsonpatch"
+version = "^1.0.0"
+
+[dependencies.jsonmergepatch]
+path = "../jsonmergepatch"
+version = "^1.0.0"
+
+[dependencies.stripewire]
+path = "../stripewire"
+version = "^1.0.0"
+
+[dependencies.s3wire]
+path = "../s3wire"
+version = "^1.0.0"
