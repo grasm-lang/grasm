@@ -14,7 +14,7 @@ plan that discovers them 300 packages in.
 | | |
 |---|---|
 | Started | 78 |
-| Now | 417 |
+| Now | 420 |
 | Tier 1 target | 200 |
 | Tier 2 target | 500 |
 | Tier 3 target | 800 |
@@ -260,7 +260,8 @@ started until now.
 
 `https_client` speaks HTTP/1.1 over it, `awssig` signs what AWS wants signed
 and `webhooksig` checks what arrives back, so the first layer above TLS is
-built too.
+built too — and above that `cloudevents`, `problemjson` and `httpcache`, the
+three shapes a hosted API answers in.
 
 `tlsclient` completes a TLS 1.3 handshake over a socket and refuses to
 return a connection it has not verified. `tlshandshake` builds and reads the

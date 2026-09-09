@@ -1,0 +1,274 @@
+import cloudevents
+import problemjson
+import httpcache
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn empty_event() -> CloudEvent {
+    return CloudEvent{ id: "", source: "", spec_version: "",
+        event_type: "", data_content_type: "", data_schema: "",
+        subject: "", time: "", extensions: [], data: "",
+        data_is_binary: false }
+}
+
+/// The specification's own example, from the end of the CloudEvents
+/// document.
+fn spec_example() -> str {
+    return "\{\"specversion\":\"1.0\"," +
+    "\"type\":\"com.github.pull_request.opened\"," +
+    "\"source\":\"https://github.com/cloudevents/spec/pull\"," +
+    "\"subject\":\"123\",\"id\":\"A234-1234-1234\"," +
+    "\"time\":\"2018-04-05T17:31:00Z\"," +
+    "\"comexampleextension1\":\"value\"," +
+    "\"datacontenttype\":\"text/xml\",\"data\":\"body\"}"
+}
+
+fn check_cloudevents(inout f: i64) / {io} {
+    print("-- cloudevents: one envelope, so a consumer needs one parser")
+    let event = cloudevents.parse(spec_example()) ?? empty_event()
+    say(f, "the specification's own example reads back, attribute by one",
+        event.id == "A234-1234-1234" and
+        event.event_type == "com.github.pull_request.opened" and
+        event.source == "https://github.com/cloudevents/spec/pull" and
+        event.subject == "123" and event.time == "2018-04-05T17:31:00Z")
+    say(f, "an extension is anything the specification did not name",
+        cloudevents.extension_of(event, "comexampleextension1") ==
+        "value" and event.extensions.len() == 1)
+    say(f, "and source with id is what makes a redelivery detectable",
+        cloudevents.identity_of(event) ==
+        "https://github.com/cloudevents/spec/pull A234-1234-1234")
+    // The four that must be there.
+    say(f, "the four required attributes are required, one at a time",
+        missing_refused("id") and missing_refused("source") and
+        missing_refused("type") and missing_refused("specversion"))
+    // The rules the Python SDK does not enforce, each a MUST in the spec.
+    say(f, "an id that is present and empty is not a non-empty string",
+        event_refused("\{\"specversion\":\"1.0\",\"type\":\"t\"," +
+            "\"source\":\"s\",\"id\":\"\"}"))
+    say(f, "and neither is an optional attribute present and empty",
+        event_refused("\{\"specversion\":\"1.0\",\"type\":\"t\"," +
+            "\"source\":\"s\",\"id\":\"1\",\"subject\":\"\"}"))
+    say(f, "carrying data and data_base64 together is mutually exclusive",
+        event_refused("\{\"specversion\":\"1.0\",\"type\":\"t\"," +
+            "\"source\":\"s\",\"id\":\"1\",\"data\":\"a\"," +
+            "\"data_base64\":\"YQ==\"}"))
+    // Attribute names are restricted so they survive being a header, a
+    // column and a Kafka key.
+    say(f, "an attribute name is lower-case letters and digits, and no more",
+        cloudevents.is_valid_name("comexample1") and
+        not cloudevents.is_valid_name("Bad-Name") and
+        not cloudevents.is_valid_name("with_underscore") and
+        not cloudevents.is_valid_name(""))
+    say(f, "and a document carrying one that is not is refused",
+        event_refused("\{\"specversion\":\"1.0\",\"type\":\"t\"," +
+            "\"source\":\"s\",\"id\":\"1\",\"Bad-Name\":\"x\"}"))
+    // Times are RFC 3339, which is narrower than ISO 8601.
+    say(f, "a time is RFC 3339, which admits an offset and a fraction",
+        cloudevents.is_rfc3339("2018-04-05T17:31:00Z") and
+        cloudevents.is_rfc3339("2018-04-05T17:31:00.123456Z") and
+        cloudevents.is_rfc3339("2018-04-05T17:31:00+05:30"))
+    say(f, "and rejects the ISO 8601 shapes two libraries disagree about",
+        not cloudevents.is_rfc3339("20180405T173100Z") and
+        not cloudevents.is_rfc3339("2018-04-05 17:31:00Z") and
+        not cloudevents.is_rfc3339("2018-04-05T17:31:00"))
+    // Only 1.0 is implemented, and an older version is refused by name
+    // rather than read as though it were this one.
+    say(f, "a version this does not implement is refused, not guessed at",
+        event_refused("\{\"specversion\":\"0.3\",\"type\":\"t\"," +
+            "\"source\":\"s\",\"id\":\"1\"}"))
+    // The two delivery modes.
+    let headers = cloudevents.binary_headers(event)
+    say(f, "binary mode puts the attributes in headers, prefixed with ce-",
+        headers.len() == 8 and headers[0].0 == "ce-specversion" and
+        headers[1].1 == "com.github.pull_request.opened")
+    say(f, "except the content type, which is the body's own",
+        headers[headers.len() - 1].0 == "content-type" and
+        headers[headers.len() - 1].1 == "text/xml")
+    say(f, "and structured mode is the whole event under its own type",
+        cloudevents.structured_content_type() ==
+        "application/cloudevents+json; charset=UTF-8")
+    say(f, "an event round-trips through its own JSON",
+        (cloudevents.parse(cloudevents.render(event)) ??
+            empty_event()).id == event.id)
+}
+
+fn missing_refused(name: str) -> bool {
+    var document = "\{\"specversion\":\"1.0\",\"type\":\"t\"," +
+    "\"source\":\"s\",\"id\":\"1\"}"
+    if name == "id" {
+        document = "\{\"specversion\":\"1.0\",\"type\":\"t\"," +
+        "\"source\":\"s\"}"
+    } else if name == "source" {
+        document = "\{\"specversion\":\"1.0\",\"type\":\"t\"," +
+        "\"id\":\"1\"}"
+    } else if name == "type" {
+        document = "\{\"specversion\":\"1.0\",\"source\":\"s\"," +
+        "\"id\":\"1\"}"
+    } else {
+        document = "\{\"type\":\"t\",\"source\":\"s\",\"id\":\"1\"}"
+    }
+    return event_refused(document)
+}
+
+fn event_refused(document: str) -> bool {
+    match cloudevents.parse(document) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+// ---------------------------------------------------------- problemjson
+
+fn empty_problem() -> Problem {
+    return Problem{ kind: "", title: "", status: 0, detail: "",
+        instance: "", extensions: [] }
+}
+
+/// The RFC's own example, from section 3.
+fn rfc_example() -> str {
+    return "\{\"type\":\"https://example.com/probs/out-of-credit\"," +
+    "\"title\":\"You do not have enough credit.\",\"status\":403," +
+    "\"detail\":\"Your current balance is 30, but that costs 50.\"," +
+    "\"instance\":\"/account/12345/msgs/abc\",\"balance\":\"30\"}"
+}
+
+fn check_problemjson(inout f: i64) / {io} {
+    print("-- problemjson: a machine-readable error, not prose in a field")
+    let problem = problemjson.parse(rfc_example()) ?? empty_problem()
+    say(f, "the five members the RFC names come out as themselves",
+        problem.kind == "https://example.com/probs/out-of-credit" and
+        problem.title == "You do not have enough credit." and
+        problem.status == 403 and problem.instance ==
+        "/account/12345/msgs/abc")
+    say(f, "and the number is in an extension, where a client can find it",
+        problemjson.extension_of(problem, "balance") == "30" and
+        problem.extensions.len() == 1)
+    // The distinction that makes the format worth anything.
+    say(f, "the title describes the class and the detail this occurrence",
+        problem.title.contains("do not have enough") and
+        problem.detail.contains("30") and problem.detail.contains("50"))
+    // A document with no type is valid and says nothing.
+    let bare = problemjson.parse("\{\"status\":404}") ?? empty_problem()
+    say(f, "a document with no type means about:blank, and is still valid",
+        bare.kind == problemjson.default_kind() and bare.status == 404)
+    say(f, "and says no more than the status line already did",
+        not problemjson.is_informative(bare) and
+        problemjson.is_informative(problem))
+    // The content type, and the parameters a server may add to it.
+    say(f, "the media type is matched without its parameters",
+        problemjson.is_problem_type("application/problem+json") and
+        problemjson.is_problem_type(
+            "application/problem+json; charset=utf-8") and
+        not problemjson.is_problem_type("application/json"))
+    // Retry policy, which is the question a client actually asks.
+    say(f, "the 5xx family and 429 are worth trying again",
+        problemjson.is_retryable(503) and problemjson.is_retryable(429) and
+        not problemjson.is_retryable(400) and
+        not problemjson.is_retryable(404))
+    // Refusals.
+    say(f, "something that is not an object is not a problem document",
+        problem_refused("[1,2]") and problem_refused("\"text\"") and
+        problem_refused("not json"))
+    say(f, "and a status outside the range is refused rather than carried",
+        problem_refused("\{\"status\":99}") and
+        problem_refused("\{\"status\":600}"))
+    // Round trip.
+    say(f, "a problem round-trips through its own JSON",
+        (problemjson.parse(problemjson.render(problem)) ??
+            empty_problem()).kind == problem.kind and
+        problemjson.render(problemjson.of_status(404, "Not Found")) ==
+        "\{\"title\":\"Not Found\",\"status\":404}")
+}
+
+fn problem_refused(document: str) -> bool {
+    match problemjson.parse(document) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+// ------------------------------------------------------------ httpcache
+
+fn check_httpcache(inout f: i64) / {io} {
+    print("-- httpcache: whether a stored response may be used, and how long")
+    let now = 1700000000
+    // The first rule that matches wins, which is what lets one response
+    // give a CDN and a browser different answers.
+    let shared = httpcache.freshness_of("s-maxage=10, max-age=600", 0 - 1,
+        now, 0 - 1, 0 - 1, now, now, now + 30, true)
+    let private_cache = httpcache.freshness_of("s-maxage=10, max-age=600",
+        0 - 1, now, 0 - 1, 0 - 1, now, now, now + 30, false)
+    say(f, "a shared cache reads s-maxage and a private one does not",
+        shared.source == "s-maxage" and not shared.fresh and
+        private_cache.source == "max-age" and private_cache.fresh)
+    say(f, "Expires is used only when no max-age says otherwise",
+        httpcache.freshness_of("", now + 300, now, 0 - 1, 0 - 1, now, now,
+            now + 100, false).source == "expires" and
+        httpcache.freshness_of("max-age=60", now + 300, now, 0 - 1, 0 - 1,
+            now, now, now + 100, false).source == "max-age")
+    say(f, "and a heuristic only when nothing explicit is there at all",
+        httpcache.freshness_of("", 0 - 1, now, now - 36000, 0 - 1, now,
+            now, now + 100, false).lifetime == 3600)
+    // Age, which is not "how long I have had it".
+    say(f, "an Age header counts, so an object old on arrival stays old",
+        httpcache.age_of(90, now, now, now, now + 30) == 120 and
+        httpcache.age_of(0 - 1, now, now, now, now + 30) == 30)
+    say(f, "which is why a response can arrive already stale",
+        not httpcache.freshness_of("max-age=100", 0 - 1, now, 0 - 1, 90,
+            now, now, now + 30, false).fresh)
+    // The directives whose names mislead.
+    say(f, "no-cache means revalidate every time, not do not store",
+        httpcache.may_store(httpcache.directives_of("no-cache"), true) and
+        httpcache.must_revalidate(httpcache.directives_of("no-cache"),
+            true))
+    say(f, "no-store is the one that means do not store",
+        not httpcache.may_store(httpcache.directives_of("no-store"), true))
+    say(f, "and private means a browser may and a shared cache may not",
+        httpcache.may_store(httpcache.directives_of("private"), false) and
+        not httpcache.may_store(httpcache.directives_of("private"), true))
+    // A directive that is not a number makes the response stale.
+    say(f, "a max-age that is not an integer is stale, not unlimited",
+        not httpcache.freshness_of("max-age=abc", 0 - 1, now, 0 - 1, 0 - 1,
+            now, now, now, false).fresh)
+    // Parsing, including the quoted form.
+    say(f, "directives parse with and without values, and unquoted",
+        httpcache.has_directive(httpcache.directives_of(
+            "public, max-age=\"60\""), "public") and
+        httpcache.seconds_of(httpcache.directives_of(
+            "public, max-age=\"60\""), "max-age") == 60)
+    // Entity tags, and why there are two comparisons.
+    say(f, "the weak comparison ignores the prefix; a conditional GET uses it",
+        httpcache.tags_match_weak("W/\"abc\"", "\"abc\"") and
+        httpcache.tags_match_weak("\"abc\"", "\"abc\""))
+    say(f, "the strong one does not: a range must not span two of them",
+        not httpcache.tags_match_strong("W/\"abc\"", "\"abc\"") and
+        httpcache.tags_match_strong("\"abc\"", "\"abc\""))
+    say(f, "revalidating sends whichever validators are known",
+        httpcache.revalidation_headers("\"abc\"", "").len() == 1 and
+        httpcache.revalidation_headers("\"abc\"", "Mon, 1 Jan 2024").len()
+        == 2 and httpcache.revalidation_headers("", "").len() == 0)
+    // Which statuses may be stored without being told to.
+    say(f, "a 404 is cacheable by default and a 500 is not",
+        httpcache.is_heuristically_cacheable(404) and
+        httpcache.is_heuristically_cacheable(200) and
+        not httpcache.is_heuristically_cacheable(500))
+}
+
+fn main() / {io} {
+    var f = 0
+    check_cloudevents(f)
+    check_problemjson(f)
+    check_httpcache(f)
+    if f == 0 {
+        print("api wire: every claim held")
+    } else {
+        print("api wire: {f} claims failed")
+    }
+}

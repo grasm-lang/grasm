@@ -1,0 +1,10 @@
+[package]
+name = "cloudevents"
+version = "1.0.0"
+
+# Text. Opens nothing.
+capabilities = []
+
+[dependencies.json]
+path = "../json"
+version = "^1.0.0"

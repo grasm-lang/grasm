@@ -1,0 +1,377 @@
+// CloudEvents: one envelope, so a consumer does not need a parser per
+// producer.
+//
+// Every event system invented its own shape, and a service consuming three
+// of them needed three parsers to answer the same three questions: what
+// happened, where did it come from, and when. CloudEvents is the CNCF's
+// answer — four required attributes and a body — and its value is entirely
+// in being the same everywhere rather than in being clever.
+//
+// ## The four that are always there
+//
+// `id` and `source` together identify the event, so a duplicate delivery is
+// detectable: a consumer that has seen this pair before has seen this event
+// before. `type` says what happened, in reverse-DNS so that two producers do
+// not collide. `specversion` says which version of this document applies,
+// and is the one attribute a consumer must read first.
+//
+// ## The type system is deliberately small
+//
+// Boolean, integer, string, binary, URI, URI-reference, timestamp. Seven,
+// with no nesting, because an attribute is metadata that a router or a
+// filter reads without parsing the body — and a router that has to parse
+// nested JSON to route is a router that is slow and has a parser bug.
+//
+// ## Where the data goes, and the one case that is awkward
+//
+// In the JSON format the body is `data`, unless it is binary, in which case
+// it is `data_base64`. Carrying both is invalid, and a producer that emits
+// both is usually a library that base64-encoded a string and forgot to
+// remove the original.
+
+import json
+
+type EventError =
+    | NotAnObject()
+    | MissingAttribute(name: str)
+    | EmptyAttribute(name: str)
+    | BadVersion(version: str)
+    | BadAttributeName(name: str)
+    | BothBodies()
+    | BadTime(text: str)
+
+    /// One event: the attributes that are always there, the ones that are
+    /// sometimes there, and the body.
+type CloudEvent = {
+    id: str,
+    source: str,
+    spec_version: str,
+    event_type: str,
+    /// The empty string where the attribute was absent, which is how
+    /// CloudEvents says "not set": an optional attribute present and empty
+    /// is invalid.
+    data_content_type: str,
+    data_schema: str,
+    subject: str,
+    time: str,
+    /// Extension attributes, in the order they appeared.
+    extensions: [(str, str)],
+    /// The body as it was written, or the empty string.
+    data: str,
+    /// True when the body arrived base64-encoded in `data_base64`.
+    data_is_binary: bool,
+}
+
+/// The version this implements.
+pub fn spec_version() -> str {
+    return "1.0"
+}
+
+/// Whether an attribute name is legal.
+///
+/// Lower-case letters and digits, and nothing else — no dots, no dashes, no
+/// underscores. The rule is that strict because attribute names have to
+/// survive being a header name, a query parameter, a Kafka header and a
+/// column name, and the intersection of what those allow is very small.
+pub fn is_valid_name(name: str) -> bool {
+    if name == "" {
+        return false
+    }
+    for code in name.codes() {
+        let lower = code >= 97 and code <= 122
+        let digit = code >= 48 and code <= 57
+        if not lower and not digit {
+            return false
+        }
+    }
+    return true
+}
+
+/// The attributes this specification defines, which an extension may not
+/// use.
+pub fn reserved_names() -> [str] {
+    return ["id", "source", "specversion", "type", "datacontenttype",
+        "dataschema", "subject", "time", "data", "data_base64"]
+}
+
+fn is_reserved(name: str) -> bool {
+    for reserved in reserved_names() {
+        if reserved == name {
+            return true
+        }
+    }
+    return false
+}
+
+fn string_at(document: ref Json, key: str) -> str {
+    match json.get(document, key) {
+        Some(value) -> {
+            match json.as_str(value) {
+                Some(text) -> return text
+                None -> return json.render(value)
+            }
+        }
+        None -> return ""
+    }
+}
+
+fn has_key(document: ref Json, key: str) -> bool {
+    match json.get(document, key) {
+        Some(_v) -> return true
+        None -> return false
+    }
+}
+
+/// Read an event from its JSON form.
+pub fn parse(text: str) -> CloudEvent ! EventError {
+    var document = json.null()
+    match json.parse(text) {
+        Ok(parsed) -> document = parsed
+        Err(_e) -> fail(NotAnObject())
+    }
+    if json.kind(document) != "object" {
+        fail(NotAnObject())
+    }
+    let version = string_at(document, "specversion")
+    if version == "" {
+        fail(MissingAttribute("specversion"))
+    }
+    if version != spec_version() {
+        fail(BadVersion(version))
+    }
+    var event = CloudEvent{ id: "", source: "", spec_version: version,
+        event_type: "", data_content_type: "", data_schema: "",
+        subject: "", time: "", extensions: [], data: "",
+        data_is_binary: false }
+    for name in ["id", "source", "type"] {
+        if not has_key(document, name) {
+            fail(MissingAttribute(name))
+        }
+        if string_at(document, name) == "" {
+            fail(EmptyAttribute(name))
+        }
+    }
+    event.id = string_at(document, "id")
+    event.source = string_at(document, "source")
+    event.event_type = string_at(document, "type")
+    // An optional attribute that is present and empty is invalid, which is
+    // different from being absent: the specification has no empty string.
+    for name in ["datacontenttype", "dataschema", "subject", "time"] {
+        if has_key(document, name) and string_at(document, name) == "" {
+            fail(EmptyAttribute(name))
+        }
+    }
+    event.data_content_type = string_at(document, "datacontenttype")
+    event.data_schema = string_at(document, "dataschema")
+    event.subject = string_at(document, "subject")
+    event.time = string_at(document, "time")
+    if event.time != "" and not is_rfc3339(event.time) {
+        fail(BadTime(event.time))
+    }
+    if has_key(document, "data") and has_key(document, "data_base64") {
+        fail(BothBodies())
+    }
+    if has_key(document, "data_base64") {
+        event.data = string_at(document, "data_base64")
+        event.data_is_binary = true
+    } else if has_key(document, "data") {
+        match json.get(document, "data") {
+            Some(value) -> {
+                match json.as_str(value) {
+                    Some(inner) -> event.data = inner
+                    None -> event.data = json.render(value)
+                }
+            }
+            None -> event.data = ""
+        }
+    }
+    for name in json.keys_of(document) {
+        if is_reserved(name) {
+            continue
+        }
+        if not is_valid_name(name) {
+            fail(BadAttributeName(name))
+        }
+        event.extensions.push((name, string_at(document, name)))
+    }
+    return event
+}
+
+/// Whether a timestamp is RFC 3339, which is the only form the
+/// specification allows.
+///
+/// Not ISO 8601: RFC 3339 is a subset, and the parts it leaves out — a
+/// missing `T`, a week date, a two-digit year — are exactly the parts that
+/// two libraries disagree about.
+pub fn is_rfc3339(text: str) -> bool {
+    if text.len() < 20 {
+        return false
+    }
+    let codes = text.codes()
+    var i = 0
+    while i < 19 {
+        let code = codes[i]
+        let expected_dash = i == 4 or i == 7
+        let expected_colon = i == 13 or i == 16
+        if expected_dash {
+            if code != 45 {
+                return false
+            }
+        } else if expected_colon {
+            if code != 58 {
+                return false
+            }
+        } else if i == 10 {
+            if code != 84 and code != 116 {
+                return false
+            }
+        } else if code < 48 or code > 57 {
+            return false
+        }
+        i = i + 1
+    }
+    let tail = text.substr(19, text.len() - 19)
+    if tail == "Z" or tail == "z" {
+        return true
+    }
+    if tail.starts_with(".") {
+        var j = 1
+        while j < tail.len() and tail.codes()[j] >= 48 and
+        tail.codes()[j] <= 57 {
+            j = j + 1
+        }
+        if j == 1 {
+            return false
+        }
+        return is_offset(tail.substr(j, tail.len() - j))
+    }
+    return is_offset(tail)
+}
+
+fn is_offset(text: str) -> bool {
+    if text == "Z" or text == "z" {
+        return true
+    }
+    if text.len() != 6 {
+        return false
+    }
+    let codes = text.codes()
+    if codes[0] != 43 and codes[0] != 45 {
+        return false
+    }
+    if codes[3] != 58 {
+        return false
+    }
+    var i = 1
+    while i < 6 {
+        if i != 3 and (codes[i] < 48 or codes[i] > 57) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+/// Write an event back out as JSON.
+///
+/// The attributes go in the order the specification's own example uses,
+/// which is not alphabetical and is what makes two implementations'
+/// output comparable by eye.
+pub fn render(event: CloudEvent) -> str {
+    var parts: [str] = ["\"specversion\":" +
+        json.render(json.text(event.spec_version)),
+        "\"type\":" + json.render(json.text(event.event_type)),
+        "\"source\":" + json.render(json.text(event.source)),
+        "\"id\":" + json.render(json.text(event.id))]
+    if event.subject != "" {
+        parts.push("\"subject\":" + json.render(json.text(event.subject)))
+    }
+    if event.time != "" {
+        parts.push("\"time\":" + json.render(json.text(event.time)))
+    }
+    if event.data_schema != "" {
+        parts.push("\"dataschema\":" +
+            json.render(json.text(event.data_schema)))
+    }
+    if event.data_content_type != "" {
+        parts.push("\"datacontenttype\":" +
+            json.render(json.text(event.data_content_type)))
+    }
+    for extension in event.extensions {
+        parts.push(json.render(json.text(extension.0)) + ":" +
+            json.render(json.text(extension.1)))
+    }
+    if event.data != "" {
+        var name = "\"data\":"
+        if event.data_is_binary {
+            name = "\"data_base64\":"
+        }
+        parts.push(name + json.render(json.text(event.data)))
+    }
+    var out = "\{"
+    var i = 0
+    while i < parts.len() {
+        if i > 0 {
+            out = out + ","
+        }
+        out = out + parts[i]
+        i = i + 1
+    }
+    return out + "}"
+}
+
+/// An extension attribute's value, or the empty string.
+pub fn extension_of(event: CloudEvent, name: str) -> str {
+    for extension in event.extensions {
+        if extension.0 == name {
+            return extension.1
+        }
+    }
+    return ""
+}
+
+/// The pair that identifies an event, for deduplication.
+///
+/// A consumer that has seen this pair has seen this event: the
+/// specification says a redelivery *may* reuse the id, so a consumer that
+/// keys on anything else counts a retry as a second event.
+pub fn identity_of(event: CloudEvent) -> str {
+    return event.source + " " + event.id
+}
+
+/// The headers a binary-mode HTTP delivery carries.
+///
+/// Binary mode puts the attributes in headers and the body in the body, so
+/// a proxy can route on `ce-type` without parsing anything. Structured mode
+/// puts the whole event in the body as JSON, which survives a transport
+/// that mangles headers. Both are specified; the choice is about what is
+/// between the two ends.
+pub fn binary_headers(event: CloudEvent) -> [(str, str)] {
+    var out: [(str, str)] = [("ce-specversion", event.spec_version),
+        ("ce-type", event.event_type), ("ce-source", event.source),
+        ("ce-id", event.id)]
+    if event.subject != "" {
+        out.push(("ce-subject", event.subject))
+    }
+    if event.time != "" {
+        out.push(("ce-time", event.time))
+    }
+    if event.data_schema != "" {
+        out.push(("ce-dataschema", event.data_schema))
+    }
+    for extension in event.extensions {
+        out.push(("ce-" + extension.0, extension.1))
+    }
+    if event.data_content_type != "" {
+        // The content type is the one attribute that is *not* prefixed: it
+        // is the body's own Content-Type, because that is what every proxy
+        // between here and there already understands.
+        out.push(("content-type", event.data_content_type))
+    }
+    return out
+}
+
+/// The content type a structured-mode delivery carries.
+pub fn structured_content_type() -> str {
+    return "application/cloudevents+json; charset=UTF-8"
+}

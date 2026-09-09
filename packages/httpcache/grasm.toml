@@ -1,0 +1,6 @@
+[package]
+name = "httpcache"
+version = "1.0.0"
+
+# Arithmetic and text. Opens nothing, and takes the clock as an argument.
+capabilities = []

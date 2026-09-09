@@ -1,0 +1,16 @@
+[package]
+name = "apiwire_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.cloudevents]
+path = "../cloudevents"
+version = "^1.0.0"
+
+[dependencies.problemjson]
+path = "../problemjson"
+version = "^1.0.0"
+
+[dependencies.httpcache]
+path = "../httpcache"
+version = "^1.0.0"

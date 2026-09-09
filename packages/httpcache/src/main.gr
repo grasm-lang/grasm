@@ -1,0 +1,276 @@
+// RFC 9111: whether a stored response may be used, and for how long.
+//
+// HTTP caching is four rules that fit on a page and are got wrong
+// constantly, usually in the direction of serving something stale to
+// somebody who should not have seen it. This is those rules, with the
+// clock as an argument so the answers can be tested.
+//
+// ## Freshness, and the order the sources are consulted
+//
+// `s-maxage` if this is a shared cache, then `max-age`, then `Expires`
+// minus `Date`, then a heuristic — and the first match wins, so a response
+// carrying both `max-age=60` and `Expires` an hour out is fresh for a
+// minute. The order exists to let an origin give a CDN and a browser
+// different answers with one response.
+//
+// ## Age is not "how long I have had it"
+//
+// A response may already have been sitting in another cache when it
+// arrived. `Age` says how long, `Date` says when the origin made it, and
+// the current age is the larger of the two readings plus the time since.
+// A cache that counts only from its own receipt serves an object stale by
+// however long the upstream cache held it.
+//
+// ## The directives that mean what they do not sound like
+//
+// `no-cache` does not mean "do not store": it means store it and
+// revalidate before every use. `no-store` is the one that means do not
+// store. `private` means a browser may keep it and a CDN may not, and a
+// CDN that ignores it serves one user's page to another — which is the
+// single most expensive bug in this area and has happened to household
+// names.
+//
+// ## What is missing here
+//
+// The `Vary` matching and the invalidation a POST performs. Both are real
+// and neither is a calculation; they need the request that produced the
+// stored response, and this package is about the response alone.
+
+type CacheError =
+    | BadDirective(text: str)
+    | NoFreshness()
+
+    /// How long a response may be used, and why.
+type Freshness = {
+    /// Seconds, or -1 when nothing says.
+    lifetime: i64,
+    /// `s-maxage`, `max-age`, `expires`, `heuristic` or `none`.
+    source: str,
+    /// The response's age now, in seconds.
+    age: i64,
+    fresh: bool,
+    /// True when the response must be revalidated whatever its age says.
+    must_revalidate: bool,
+}
+
+/// The cache directives of a `Cache-Control` header, lower-cased.
+///
+/// A directive with no value comes back with an empty one, so `no-store`
+/// and `max-age=0` are both here and are told apart by the caller rather
+/// than by two lookups.
+pub fn directives_of(header: str) -> [(str, str)] {
+    var out: [(str, str)] = []
+    for part in header.split(",") {
+        let piece = part.trim()
+        if piece == "" {
+            continue
+        }
+        let at = index_of(piece, "=")
+        if at < 0 {
+            out.push((piece.to_lower(), ""))
+        } else {
+            var value = piece.substr(at + 1, piece.len() - at - 1).trim()
+            if value.starts_with("\"") and value.ends_with("\"") and
+            value.len() >= 2 {
+                value = value.substr(1, value.len() - 2)
+            }
+            out.push((piece.substr(0, at).trim().to_lower(), value))
+        }
+    }
+    return out
+}
+
+fn index_of(text: str, needle: str) -> i64 {
+    var i = 0
+    while i + needle.len() <= text.len() {
+        if text.substr(i, needle.len()) == needle {
+            return i
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+/// Whether a directive is present.
+pub fn has_directive(directives: [(str, str)], name: str) -> bool {
+    for directive in directives {
+        if directive.0 == name {
+            return true
+        }
+    }
+    return false
+}
+
+/// A directive's value as a number, or -1.
+///
+/// A value that is not an integer makes the directive invalid, and the RFC
+/// asks a cache to treat such a response as stale — so -1 here means "say
+/// stale", not "no limit".
+pub fn seconds_of(directives: [(str, str)], name: str) -> i64 {
+    for directive in directives {
+        if directive.0 == name {
+            let value = directive.1.parse_int() ?? 0 - 1
+            if value < 0 {
+                return 0 - 1
+            }
+            return value
+        }
+    }
+    return 0 - 1
+}
+
+/// Whether a response may be stored at all.
+///
+/// `no-store` forbids it outright; `private` forbids it for a shared cache
+/// and permits it for a browser's own. Authorization in the request is the
+/// other half of this rule and belongs to the request, which this package
+/// does not see.
+pub fn may_store(directives: [(str, str)], shared: bool) -> bool {
+    if has_directive(directives, "no-store") {
+        return false
+    }
+    if shared and has_directive(directives, "private") {
+        return false
+    }
+    return true
+}
+
+/// Whether a stored response must be revalidated before every use.
+///
+/// `no-cache` is this, and its name is the reason people reach for it when
+/// they mean `no-store`.
+pub fn must_revalidate(directives: [(str, str)], shared: bool) -> bool {
+    if has_directive(directives, "no-cache") {
+        return true
+    }
+    if has_directive(directives, "must-revalidate") {
+        return true
+    }
+    if shared and has_directive(directives, "proxy-revalidate") {
+        return true
+    }
+    return false
+}
+
+/// The freshness lifetime, by the first rule that matches.
+pub fn lifetime_of(directives: [(str, str)], expires: i64, date: i64,
+    last_modified: i64, shared: bool) -> (i64, str) {
+    if shared {
+        let shared_age = seconds_of(directives, "s-maxage")
+        if has_directive(directives, "s-maxage") {
+            return (shared_age, "s-maxage")
+        }
+    }
+    if has_directive(directives, "max-age") {
+        return (seconds_of(directives, "max-age"), "max-age")
+    }
+    if expires >= 0 and date >= 0 {
+        return (expires - date, "expires")
+    }
+    // The heuristic every cache uses and none of them agree on: a tenth of
+    // the time since the object last changed. The RFC declines to specify
+    // one and only bounds the result, which is why two caches can hold the
+    // same object for different lengths of time and both be conforming.
+    if last_modified >= 0 and date >= 0 and date > last_modified {
+        return ((date - last_modified) / 10, "heuristic")
+    }
+    return (0 - 1, "none")
+}
+
+/// The response's age now, by RFC 9111's own arithmetic.
+///
+/// The larger of what `Age` claims and what the clocks say, plus the time
+/// since it was received. Taking only the second is the mistake that
+/// serves an object that was already old when it arrived.
+pub fn age_of(age_header: i64, date: i64, request_time: i64,
+    response_time: i64, now: i64) -> i64 {
+    var apparent = response_time - date
+    if apparent < 0 or date < 0 {
+        apparent = 0
+    }
+    var corrected = 0
+    if age_header >= 0 {
+        corrected = age_header + (response_time - request_time)
+    }
+    var initial = apparent
+    if corrected > initial {
+        initial = corrected
+    }
+    return initial + (now - response_time)
+}
+
+/// Whether a stored response is fresh, and everything the answer rests on.
+pub fn freshness_of(header: str, expires: i64, date: i64,
+    last_modified: i64, age_header: i64, request_time: i64,
+    response_time: i64, now: i64, shared: bool) -> Freshness {
+    let directives = directives_of(header)
+    let lifetime = lifetime_of(directives, expires, date, last_modified,
+        shared)
+    let age = age_of(age_header, date, request_time, response_time, now)
+    var fresh = false
+    if lifetime.0 >= 0 {
+        fresh = lifetime.0 > age
+    }
+    let revalidate = must_revalidate(directives, shared)
+    if revalidate {
+        fresh = false
+    }
+    return Freshness{ lifetime: lifetime.0, source: lifetime.1, age: age,
+        fresh: fresh, must_revalidate: revalidate }
+}
+
+/// The headers to send when revalidating.
+///
+/// `If-None-Match` from the entity tag if there is one, and
+/// `If-Modified-Since` from the last-modified date otherwise. Both when
+/// both are known, because a server that ignores one honours the other.
+pub fn revalidation_headers(etag: str,
+    last_modified_text: str) -> [(str, str)] {
+    var out: [(str, str)] = []
+    if etag != "" {
+        out.push(("If-None-Match", etag))
+    }
+    if last_modified_text != "" {
+        out.push(("If-Modified-Since", last_modified_text))
+    }
+    return out
+}
+
+/// Whether two entity tags match under the weak comparison.
+///
+/// Weak comparison ignores the `W/` prefix, and is what a conditional GET
+/// uses: two representations that are semantically the same but not
+/// byte-identical share a weak tag, and a client asking "has this changed"
+/// should be told no.
+pub fn tags_match_weak(a: str, b: str) -> bool {
+    return strip_weak(a) == strip_weak(b)
+}
+
+/// And the strong comparison, which a range request must use.
+///
+/// A range assembled from two representations that merely mean the same
+/// thing is a corrupt file, which is why this one keeps the prefix.
+pub fn tags_match_strong(a: str, b: str) -> bool {
+    if a.starts_with("W/") or b.starts_with("W/") {
+        return false
+    }
+    return a == b
+}
+
+fn strip_weak(tag: str) -> str {
+    if tag.starts_with("W/") {
+        return tag.substr(2, tag.len() - 2)
+    }
+    return tag
+}
+
+/// The statuses a cache may store without being told to.
+///
+/// Anything else needs explicit freshness information; a 500 with a
+/// `max-age` is cacheable and a 500 without one is not.
+pub fn is_heuristically_cacheable(status: i64) -> bool {
+    return status == 200 or status == 203 or status == 204 or
+    status == 206 or status == 300 or status == 301 or status == 308 or
+    status == 404 or status == 405 or status == 410 or status == 414 or
+    status == 501
+}

@@ -1,0 +1,220 @@
+// RFC 9457 problem details: a machine-readable error, instead of prose in a
+// field called `message`.
+//
+// Every API invents an error shape, and a client consuming five of them
+// writes five parsers for the same question: what went wrong, and is it
+// worth retrying. RFC 9457 — which replaced 7807 in 2023 — says the shape
+// once: a `type` URI naming the problem, a human-readable `title`, the HTTP
+// `status` repeated, a `detail` about this occurrence, and an `instance`
+// identifying it.
+//
+// ## The distinction that carries the value
+//
+// `title` describes the *class* of problem and does not change between
+// occurrences; `detail` describes this one. A client switches on `type` and
+// shows `detail`, and never parses either. That split is what makes the
+// format worth anything: an API that puts the account number in `title` has
+// given clients a string that changes on every call, and they will parse it.
+//
+// ## Extensions carry the data
+//
+// Anything beyond the five members is an extension, and that is where the
+// numbers go: which field failed validation, how many seconds until the
+// rate limit lifts, what the account's actual balance is. A client that
+// needs a number should find a number, not a sentence containing one.
+//
+// ## `type` is an identifier, not a URL to fetch
+//
+// It is a URI, and it does not have to resolve. `about:blank` means "no
+// more than the status code says", and is the default when `type` is
+// absent — which is why a problem document with no `type` is still valid
+// and still useless.
+
+import json
+
+type ProblemError =
+    | NotAnObject()
+    | BadStatus(status: i64)
+    | NotAProblem(content_type: str)
+
+    /// One problem.
+type Problem = {
+    /// A URI naming the class of problem; `about:blank` when absent.
+    kind: str,
+    /// What this class of problem is, unchanging between occurrences.
+    title: str,
+    /// The HTTP status, repeated so the document stands alone.
+    status: i64,
+    /// What went wrong this time.
+    detail: str,
+    /// A URI identifying this occurrence.
+    instance: str,
+    /// Everything else, in the order it appeared.
+    extensions: [(str, str)],
+}
+
+/// The media type a problem document is served as.
+pub fn content_type() -> str {
+    return "application/problem+json"
+}
+
+/// The `type` a document without one means.
+pub fn default_kind() -> str {
+    return "about:blank"
+}
+
+/// Whether a response's content type says it carries a problem.
+///
+/// The parameters after a semicolon are ignored, because a server is free to
+/// add `; charset=utf-8` and a client that compares the whole header rejects
+/// a document it should have read.
+pub fn is_problem_type(header: str) -> bool {
+    let at = index_of(header, ";")
+    var base = header
+    if at >= 0 {
+        base = header.substr(0, at)
+    }
+    return base.trim().to_lower() == content_type()
+}
+
+fn index_of(text: str, needle: str) -> i64 {
+    var i = 0
+    while i + needle.len() <= text.len() {
+        if text.substr(i, needle.len()) == needle {
+            return i
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+fn string_at(document: ref Json, key: str) -> str {
+    match json.get(document, key) {
+        Some(value) -> {
+            match json.as_str(value) {
+                Some(text) -> return text
+                None -> return json.render(value)
+            }
+        }
+        None -> return ""
+    }
+}
+
+/// Read a problem document.
+pub fn parse(text: str) -> Problem ! ProblemError {
+    var document = json.null()
+    match json.parse(text) {
+        Ok(parsed) -> document = parsed
+        Err(_e) -> fail(NotAnObject())
+    }
+    if json.kind(document) != "object" {
+        fail(NotAnObject())
+    }
+    var problem = Problem{ kind: default_kind(), title: "", status: 0,
+        detail: "", instance: "", extensions: [] }
+    let kind = string_at(document, "type")
+    if kind != "" {
+        problem.kind = kind
+    }
+    problem.title = string_at(document, "title")
+    problem.detail = string_at(document, "detail")
+    problem.instance = string_at(document, "instance")
+    match json.get(document, "status") {
+        Some(value) -> {
+            match json.as_int(value) {
+                Some(status) -> problem.status = status
+                None -> fail(BadStatus(0))
+            }
+        }
+        None -> problem.status = 0
+    }
+    if problem.status != 0 and (problem.status < 100 or
+        problem.status > 599) {
+        fail(BadStatus(problem.status))
+    }
+    for name in json.keys_of(document) {
+        if name == "type" or name == "title" or name == "status" or
+        name == "detail" or name == "instance" {
+            continue
+        }
+        problem.extensions.push((name, string_at(document, name)))
+    }
+    return problem
+}
+
+/// Write a problem document.
+///
+/// The five members come first and in the order the RFC lists them, then
+/// the extensions in the order they were added — so two renderings of the
+/// same problem compare byte for byte.
+pub fn render(problem: Problem) -> str {
+    var parts: [str] = []
+    if problem.kind != default_kind() {
+        parts.push("\"type\":" + json.render(json.text(problem.kind)))
+    }
+    if problem.title != "" {
+        parts.push("\"title\":" + json.render(json.text(problem.title)))
+    }
+    if problem.status != 0 {
+        parts.push("\"status\":{problem.status}")
+    }
+    if problem.detail != "" {
+        parts.push("\"detail\":" + json.render(json.text(problem.detail)))
+    }
+    if problem.instance != "" {
+        parts.push("\"instance\":" +
+            json.render(json.text(problem.instance)))
+    }
+    for extension in problem.extensions {
+        parts.push(json.render(json.text(extension.0)) + ":" +
+            json.render(json.text(extension.1)))
+    }
+    var out = "\{"
+    var i = 0
+    while i < parts.len() {
+        if i > 0 {
+            out = out + ","
+        }
+        out = out + parts[i]
+        i = i + 1
+    }
+    return out + "}"
+}
+
+/// An extension member's value, or the empty string.
+pub fn extension_of(problem: Problem, name: str) -> str {
+    for extension in problem.extensions {
+        if extension.0 == name {
+            return extension.1
+        }
+    }
+    return ""
+}
+
+/// A problem carrying nothing beyond its status.
+pub fn of_status(status: i64, title: str) -> Problem {
+    return Problem{ kind: default_kind(), title: title, status: status,
+        detail: "", instance: "", extensions: [] }
+}
+
+/// Whether a status is one a client should try again on.
+///
+/// The 5xx family and 429, and nothing else: a 400 retried is a 400, and a
+/// client that retries one is a client that turns its own bug into load on
+/// somebody else's service.
+pub fn is_retryable(status: i64) -> bool {
+    if status == 429 {
+        return true
+    }
+    return status >= 500 and status <= 599
+}
+
+/// Whether the problem says more than its status code does.
+///
+/// A document with `about:blank` and no detail carries nothing a client
+/// could not read off the status line, which is worth knowing before
+/// showing it to anybody.
+pub fn is_informative(problem: Problem) -> bool {
+    return problem.kind != default_kind() or problem.detail != "" or
+    problem.extensions.len() > 0
+}
