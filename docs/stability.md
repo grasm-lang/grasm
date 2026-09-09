@@ -26,7 +26,9 @@ stable clause is not a breaking change; the clause is the contract, not the bug.
 
 **`provisional`** — the behaviour is specified and tested, but the design is
 still being validated against real programs. It may change in a minor release
-with a migration note in the changelog. Most of the language is here today.
+with a migration note in the changelog. Most of the language was here at 1.0;
+after the promotions of 2026-09-10 it is 30 clauses of 239, and what is left
+is there for a reason the promotion audit records.
 
 **`experimental`** — may change or be removed in any release, without a
 deprecation period. New surface starts here.
