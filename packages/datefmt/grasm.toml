@@ -1,0 +1,7 @@
+[package]
+name = "datefmt"
+version = "1.0.0"
+
+[dependencies.time]
+path = "../time"
+version = "^1.0.0"

@@ -1,0 +1,181 @@
+// SipHash: a keyed hash short enough to use on every hash-table lookup.
+//
+// The problem it solves is not collisions by accident but collisions on
+// purpose. A hash table keyed by a fast unkeyed hash — FNV, djb2,
+// murmur — can be filled with keys that all land in one bucket by anybody
+// who can send it strings, and the lookups go from constant time to linear.
+// That is a denial of service against every web form, JSON parser and
+// header table in the process, and it needs no access at all.
+//
+// A keyed hash makes those keys unfindable without the key. Rust, Python,
+// Ruby, Perl, Redis and the Linux kernel all switched to this one after
+// the 2011 demonstrations, and they switched to *this* one because it is
+// fast enough to use on short strings, which is what a hash table hashes.
+//
+// ## Two round counts
+//
+// `hash` is SipHash-2-4, the version the paper specifies and the one every
+// published test vector is for. `hash_1_3` is SipHash-1-3, which is what
+// Rust's default hasher uses: fewer rounds, faster, and still keyed. Use
+// 2-4 unless something else has already chosen 1-3.
+//
+// ## This is not a message authentication code for messages
+//
+// Sixty-four bits is enough to stop a table being poisoned and is not
+// enough to authenticate a document. `hmac` is for that.
+
+/// Addition modulo 2^64, in halves so nothing overflows.
+fn add64(a: i64, b: i64) -> i64 {
+    let low = a.bit_and(4294967295) + b.bit_and(4294967295)
+    let high = a.ushr(32) + b.ushr(32) + low.ushr(32)
+    return high.shl(32).bit_or(low.bit_and(4294967295))
+}
+
+fn rotl(x: i64, n: i64) -> i64 {
+    return x.shl(n).bit_or(x.ushr(64 - n))
+}
+
+/// The four words of state, mixed in place.
+type SipState = { v0: i64, v1: i64, v2: i64, v3: i64 }
+
+fn round(inout s: SipState) {
+    s.v0 = add64(s.v0, s.v1)
+    s.v1 = rotl(s.v1, 13)
+    s.v1 = s.v1.bit_xor(s.v0)
+    s.v0 = rotl(s.v0, 32)
+    s.v2 = add64(s.v2, s.v3)
+    s.v3 = rotl(s.v3, 16)
+    s.v3 = s.v3.bit_xor(s.v2)
+    s.v0 = add64(s.v0, s.v3)
+    s.v3 = rotl(s.v3, 21)
+    s.v3 = s.v3.bit_xor(s.v0)
+    s.v2 = add64(s.v2, s.v1)
+    s.v1 = rotl(s.v1, 17)
+    s.v1 = s.v1.bit_xor(s.v2)
+    s.v2 = rotl(s.v2, 32)
+}
+
+fn rounds(inout s: SipState, count: i64) {
+    var i = 0
+    while i < count {
+        round(s)
+        i = i + 1
+    }
+}
+
+/// A little-endian 64-bit word from a key or a message.
+fn word_at(data: bytes, at: i64) -> i64 {
+    var out = 0
+    var i = 7
+    while i >= 0 {
+        out = out.shl(8).bit_or(data.at(at + i))
+        i = i - 1
+    }
+    return out
+}
+
+/// The core, with the round counts as arguments.
+///
+/// The two constants the state starts from are the ASCII of
+/// "somepseudorandomlygeneratedbytes", which is the paper's way of saying
+/// there is nothing up its sleeve.
+fn digest(key: bytes, message: bytes, compression: i64,
+    finalisation: i64) -> i64 {
+    let k0 = word_at(key, 0)
+    let k1 = word_at(key, 8)
+    var s = SipState{ v0: k0.bit_xor(8317987319222330741),
+        v1: k1.bit_xor(7237128888997146477),
+        v2: k0.bit_xor(7816392313619706465),
+        v3: k1.bit_xor(8387220255154660723) }
+    let whole = message.len() / 8 * 8
+    var at = 0
+    while at < whole {
+        let block = word_at(message, at)
+        s.v3 = s.v3.bit_xor(block)
+        rounds(s, compression)
+        s.v0 = s.v0.bit_xor(block)
+        at = at + 8
+    }
+    // The last block is the leftover bytes with the length in the top
+    // byte, so two messages differing only in trailing zero bytes do not
+    // hash the same.
+    var last = message.len().bit_and(255).shl(56)
+    var i = message.len() - 1
+    while i >= whole {
+        last = last.bit_or(message.at(i).shl((i - whole) * 8))
+        i = i - 1
+    }
+    s.v3 = s.v3.bit_xor(last)
+    rounds(s, compression)
+    s.v0 = s.v0.bit_xor(last)
+    s.v2 = s.v2.bit_xor(255)
+    rounds(s, finalisation)
+    return s.v0.bit_xor(s.v1).bit_xor(s.v2).bit_xor(s.v3)
+}
+
+/// Whether a key is the sixteen bytes SipHash takes.
+pub fn key_is_valid(key: bytes) -> bool {
+    return key.len() == 16
+}
+
+/// SipHash-2-4. The key must be sixteen bytes; a shorter one is padded
+/// with zeros, which is a weaker key and is reported by `key_is_valid`
+/// rather than refused, because a hash function that fails has no answer
+/// to give a hash table.
+pub fn hash(key: bytes, message: bytes) -> i64 {
+    return digest(padded(key), message, 2, 4)
+}
+
+/// SipHash-1-3, which is what Rust's default hasher uses.
+pub fn hash_1_3(key: bytes, message: bytes) -> i64 {
+    return digest(padded(key), message, 1, 3)
+}
+
+fn padded(key: bytes) -> bytes {
+    if key.len() == 16 {
+        return key
+    }
+    var out: [i64] = []
+    var i = 0
+    while i < 16 {
+        if i < key.len() {
+            out.push(key.at(i))
+        } else {
+            out.push(0)
+        }
+        i = i + 1
+    }
+    return bytes_of(out)
+}
+
+/// The digest as the sixteen hex characters every published vector is
+/// written in, little-endian, which is the order the bytes come off the
+/// wire and not the order the number is written.
+pub fn hex(value: i64) -> str {
+    let digits = "0123456789abcdef"
+    var out = ""
+    var i = 0
+    while i < 8 {
+        let byte = value.ushr(i * 8).bit_and(255)
+        out = out + digits.substr(byte / 16, 1) +
+        digits.substr(byte % 16, 1)
+        i = i + 1
+    }
+    return out
+}
+
+/// A key from a sixteen-byte seed a caller already has, as two words.
+pub fn key_of(low: i64, high: i64) -> bytes {
+    var out: [i64] = []
+    var i = 0
+    while i < 8 {
+        out.push(low.ushr(i * 8).bit_and(255))
+        i = i + 1
+    }
+    var j = 0
+    while j < 8 {
+        out.push(high.ushr(j * 8).bit_and(255))
+        j = j + 1
+    }
+    return bytes_of(out)
+}

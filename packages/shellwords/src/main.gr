@@ -1,0 +1,188 @@
+// Splitting a command line into words the way a shell quotes them, and
+// putting one back together so a shell reads it as written.
+//
+// A program that takes a command as a string — a task runner, a CI step, a
+// job definition — has to decide where the words are. `text.split(" ")` is
+// the usual answer and it breaks the first time a path has a space in it.
+//
+// ## What this deliberately does not do
+//
+// Expand anything. `$HOME`, `$(date)`, `*.txt` and `~` come out as those
+// characters, unchanged. A shell would expand them; a library handed a
+// string from a configuration file or a web form must not, because that is
+// the whole of command injection. Splitting and expanding are two jobs and
+// only one of them is safe to do to somebody else's text.
+//
+// ## The three quoting rules, which do not agree with each other
+//
+//   - **Backslash** outside quotes makes the next character literal.
+//   - **Single quotes** make everything literal, including backslashes;
+//     there is no way to write a single quote inside them.
+//   - **Double quotes** make everything literal except a backslash before
+//     another backslash or a double quote.
+//
+// So `a\ b` and `'a b'` and `"a b"` are the same word, and `'a\b'` and
+// `"a\b"` are different ones.
+//
+// An unclosed quote and a trailing backslash are errors rather than
+// guesses: a caller can ask for more input, and a caller that cannot needs
+// to say the line was malformed rather than run something shaped like what
+// was meant.
+
+type WordsError =
+    | Unclosed(quote: str)
+    | DanglingEscape()
+
+    /// Split a command line into words.
+pub fn split(line: str) -> [str] ! WordsError {
+    var out: [str] = []
+    var word = ""
+    var started = false
+    var i = 0
+    while i < line.len() {
+        let here = line.substr(i, 1)
+        if here == "\\" {
+            if i + 1 >= line.len() {
+                fail(DanglingEscape())
+            }
+            word = word + line.substr(i + 1, 1)
+            started = true
+            i = i + 2
+        } else if here == "'" {
+            let close = find_from(line, "'", i + 1)
+            if close < 0 {
+                fail(Unclosed("'"))
+            }
+            word = word + line.substr(i + 1, close - i - 1)
+            started = true
+            i = close + 1
+        } else if here == "\"" {
+            let done = try read_double(line, i + 1)
+            word = word + done.0
+            started = true
+            i = done.1
+        } else if is_space(here) {
+            if started {
+                out.push(word)
+                word = ""
+                started = false
+            }
+            i = i + 1
+        } else {
+            word = word + here
+            started = true
+            i = i + 1
+        }
+    }
+    if started {
+        out.push(word)
+    }
+    return out
+}
+
+/// The contents of a double-quoted run, and where it ended.
+///
+/// Inside double quotes a backslash is literal *unless* it precedes
+/// another backslash or a double quote — which is why `"C:\path"` keeps
+/// its backslash and `"say \"hi\""` does not.
+fn read_double(line: str, from: i64) -> (str, i64) ! WordsError {
+    var out = ""
+    var i = from
+    while i < line.len() {
+        let here = line.substr(i, 1)
+        if here == "\"" {
+            return (out, i + 1)
+        }
+        if here == "\\" and i + 1 < line.len() {
+            let next = line.substr(i + 1, 1)
+            if next == "\"" or next == "\\" {
+                out = out + next
+                i = i + 2
+                continue
+            }
+        }
+        out = out + here
+        i = i + 1
+    }
+    fail(Unclosed("\""))
+}
+
+fn is_space(character: str) -> bool {
+    return character == " " or character == "\t" or character == "\n" or
+    character == "\r"
+}
+
+fn find_from(text: str, needle: str, from: i64) -> i64 {
+    var i = from
+    while i < text.len() {
+        if text.substr(i, 1) == needle {
+            return i
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+/// Whether a word needs no quoting at all.
+///
+/// The safe set is deliberately small: anything outside it is quoted even
+/// when a particular shell would not need it, because the cost of quoting
+/// something unnecessarily is nothing and the cost of the reverse is a
+/// command the caller did not write.
+fn is_safe(character: str) -> bool {
+    let byte = character.to_bytes().at(0)
+    if (byte >= 65 and byte <= 90) or (byte >= 97 and byte <= 122) or
+    (byte >= 48 and byte <= 57) {
+        return true
+    }
+    return character == "_" or character == "@" or character == "%" or
+    character == "+" or character == "=" or character == ":" or
+    character == "," or character == "." or character == "/" or
+    character == "-"
+}
+
+/// One word, quoted so a shell reads it back as itself.
+///
+/// Single quotes, because they are the only quoting a shell does nothing
+/// inside. A single quote in the word ends the quoting, writes an escaped
+/// one, and starts it again — `'"'"'` — which is ugly and is what every
+/// shell requires.
+pub fn quote(word: str) -> str {
+    if word.len() == 0 {
+        return "''"
+    }
+    var plain = true
+    var i = 0
+    while i < word.len() {
+        if not is_safe(word.substr(i, 1)) {
+            plain = false
+            i = word.len()
+        } else {
+            i = i + 1
+        }
+    }
+    if plain {
+        return word
+    }
+    var out = "'"
+    var j = 0
+    while j < word.len() {
+        let here = word.substr(j, 1)
+        if here == "'" {
+            out = out + "'\"'\"'"
+        } else {
+            out = out + here
+        }
+        j = j + 1
+    }
+    return out + "'"
+}
+
+/// Words joined into a command line a shell will split the same way.
+pub fn join(words: [str]) -> str {
+    var parts: [str] = []
+    for word in words {
+        parts.push(quote(word))
+    }
+    return parts.join(" ")
+}

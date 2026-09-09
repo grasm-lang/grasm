@@ -1,0 +1,7 @@
+[package]
+name = "cidr"
+version = "1.0.0"
+
+[dependencies.ipaddr]
+path = "../ipaddr"
+version = "^1.0.0"

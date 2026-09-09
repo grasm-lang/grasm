@@ -1,0 +1,248 @@
+// Arithmetic on blocks of addresses: merging them, subtracting them, and
+// turning a range into the fewest blocks that cover it.
+//
+// `ipaddr` parses one block and answers questions about one address. This
+// is the part every allowlist, firewall rule generator and routing table
+// needs and nobody wants to write twice:
+//
+//   - **Merging.** `10.0.0.0/25` and `10.0.0.128/25` are one `/24`, and a
+//     list of a thousand rules is usually a list of forty once merged. A
+//     merge that only removes duplicates leaves the pair above as two.
+//   - **Subtracting.** "Everything in 10.0.0.0/8 except 10.1.2.0/24" is
+//     nine blocks, not one, and writing them out by hand is where the
+//     hole in the firewall comes from.
+//   - **Summarising a range.** `192.0.2.5` to `192.0.2.130` is five
+//     blocks. A tool that answers with one is answering a different
+//     question.
+//
+// ## Two properties everything here keeps
+//
+// The answer is always **sorted, minimal and non-overlapping**: no block
+// contains another, no two are adjacent, and merging the answer again
+// changes nothing. That is what makes the output safe to compare, hash or
+// write into a configuration file — two lists of the same addresses come
+// out identical however they were written.
+//
+// ## IPv4 only, and it says so
+//
+// An IPv6 address does not fit in the integer this uses, and a package
+// that silently handled half of them would be worse than one that handles
+// none. `ipaddr` draws the same line.
+import ipaddr
+
+type CidrError =
+    | NotAligned(text: str)
+    | BadPrefix(prefix: i64)
+    | NotASubnet()
+
+fn all_ones() -> i64 {
+    return 4294967295
+}
+
+/// The mask a prefix length stands for.
+pub fn mask_of(prefix: i64) -> i64 {
+    if prefix <= 0 {
+        return 0
+    }
+    if prefix >= 32 {
+        return all_ones()
+    }
+    return all_ones().bit_and(all_ones().shl(32 - prefix)).bit_and(
+        all_ones())
+}
+
+/// The first and last address of a block.
+pub fn bounds(block: Cidr) -> (i64, i64) {
+    let first = block.base.bit_and(mask_of(block.bits))
+    return (first, first.bit_or(all_ones().bit_xor(mask_of(block.bits))))
+}
+
+/// A block with its host bits cleared, which is the form everything else
+/// here assumes.
+pub fn normalise(block: Cidr) -> Cidr {
+    return Cidr{ base: block.base.bit_and(mask_of(block.bits)),
+        bits: block.bits }
+}
+
+/// Whether a block is written with host bits set — `10.0.0.1/24` rather
+/// than `10.0.0.0/24`.
+///
+/// Not an error here, because a configuration file full of them is a
+/// common and readable thing, but worth being able to ask about: a tool
+/// that compares two files textually will call those two lines different.
+pub fn is_aligned(block: Cidr) -> bool {
+    return block.base == block.base.bit_and(mask_of(block.bits))
+}
+
+/// Whether `outer` covers every address of `inner`.
+pub fn holds_block(outer: Cidr, inner: Cidr) -> bool {
+    let a = bounds(outer)
+    let b = bounds(inner)
+    return a.0 <= b.0 and b.1 <= a.1
+}
+
+/// Whether two blocks share any address at all.
+pub fn overlaps(a: Cidr, b: Cidr) -> bool {
+    let first = bounds(a)
+    let second = bounds(b)
+    return first.0 <= second.1 and second.0 <= first.1
+}
+
+/// The fewest blocks that cover a range of addresses exactly.
+///
+/// The greedy rule: at each step take the largest block that starts where
+/// the range does and does not run past its end. That is optimal, and it
+/// is the reason the answer to `192.0.2.5` through `192.0.2.130` is five
+/// blocks rather than one rounded-up `/24`, which would cover addresses
+/// nobody asked for.
+pub fn summarise(first: i64, last: i64) -> [Cidr] {
+    var out: [Cidr] = []
+    if last < first {
+        return out
+    }
+    var at = first
+    var going = true
+    while going {
+        var bits = 32
+        while bits > 0 {
+            let candidate = mask_of(bits - 1)
+            if at.bit_and(candidate) != at {
+                break
+            }
+            let size = all_ones().bit_xor(candidate)
+            if at + size > last {
+                break
+            }
+            bits = bits - 1
+        }
+        out.push(Cidr{ base: at, bits: bits })
+        let size = all_ones().bit_xor(mask_of(bits))
+        if at + size >= last {
+            going = false
+        } else {
+            at = at + size + 1
+        }
+    }
+    return out
+}
+
+/// Merge a list into the smallest equivalent one.
+pub fn collapse(blocks: [Cidr]) -> [Cidr] {
+    var ranges: [(i64, i64)] = []
+    for block in blocks {
+        ranges.push(bounds(block))
+    }
+    sort_ranges(ranges)
+    var merged: [(i64, i64)] = []
+    for range in ranges {
+        if merged.len() > 0 and range.0 <= merged[merged.len() - 1].1 + 1 {
+            if range.1 > merged[merged.len() - 1].1 {
+                merged[merged.len() - 1] = (merged[merged.len() - 1].0,
+                    range.1)
+            }
+        } else {
+            merged.push(range)
+        }
+    }
+    var out: [Cidr] = []
+    for range in merged {
+        for block in summarise(range.0, range.1) {
+            out.push(block)
+        }
+    }
+    return out
+}
+
+fn sort_ranges(inout ranges: [(i64, i64)]) {
+    var i = 1
+    while i < ranges.len() {
+        let here = ranges[i]
+        var j = i
+        while j > 0 and (ranges[j - 1].0 > here.0 or
+            (ranges[j - 1].0 == here.0 and ranges[j - 1].1 > here.1)) {
+            ranges[j] = ranges[j - 1]
+            j = j - 1
+        }
+        ranges[j] = here
+        i = i + 1
+    }
+}
+
+/// What is left of `block` once `removed` is taken out of it.
+pub fn exclude(block: Cidr, removed: Cidr) -> [Cidr] {
+    let outer = bounds(block)
+    let inner = bounds(removed)
+    if inner.1 < outer.0 or outer.1 < inner.0 {
+        return [normalise(block)]
+    }
+    var out: [Cidr] = []
+    if outer.0 < inner.0 {
+        for piece in summarise(outer.0, inner.0 - 1) {
+            out.push(piece)
+        }
+    }
+    if inner.1 < outer.1 {
+        for piece in summarise(inner.1 + 1, outer.1) {
+            out.push(piece)
+        }
+    }
+    return out
+}
+
+/// Everything in `blocks` that is not in `removed`.
+pub fn exclude_all(blocks: [Cidr], removed: [Cidr]) -> [Cidr] {
+    var kept = collapse(blocks)
+    for cut in collapse(removed) {
+        var next: [Cidr] = []
+        for block in kept {
+            for piece in exclude(block, cut) {
+                next.push(piece)
+            }
+        }
+        kept = next
+    }
+    return collapse(kept)
+}
+
+/// A block split into the blocks of a longer prefix that make it up.
+pub fn subnets(block: Cidr, prefix: i64) -> [Cidr] ! CidrError {
+    if prefix < block.bits or prefix > 32 {
+        fail(BadPrefix(prefix))
+    }
+    var out: [Cidr] = []
+    let range = bounds(block)
+    let step = all_ones().bit_xor(mask_of(prefix)) + 1
+    var at = range.0
+    while at <= range.1 {
+        out.push(Cidr{ base: at, bits: prefix })
+        if at + step - 1 >= range.1 {
+            return out
+        }
+        at = at + step
+    }
+    return out
+}
+
+/// The block of a shorter prefix that contains this one.
+pub fn supernet(block: Cidr, prefix: i64) -> Cidr ! CidrError {
+    if prefix < 0 or prefix > block.bits {
+        fail(BadPrefix(prefix))
+    }
+    return Cidr{ base: block.base.bit_and(mask_of(prefix)), bits: prefix }
+}
+
+/// How many addresses a list covers, once merged.
+pub fn count_addresses(blocks: [Cidr]) -> i64 {
+    var total = 0
+    for block in collapse(blocks) {
+        let range = bounds(block)
+        total = total + range.1 - range.0 + 1
+    }
+    return total
+}
+
+/// A block written out, always in its aligned form.
+pub fn render(block: Cidr) -> str {
+    return ipaddr.render(block.base.bit_and(mask_of(block.bits))) +
+    "/{block.bits}"
+}

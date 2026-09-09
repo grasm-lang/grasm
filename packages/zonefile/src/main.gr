@@ -1,0 +1,468 @@
+// DNS master files, RFC 1035 section 5 — the format a zone is written in.
+//
+// It is the format every authoritative server loads, every `dig axfr`
+// prints, and every DNS provider's import box takes. It is also full of
+// things that are implied rather than written, which is what makes a naive
+// reader wrong on real zones:
+//
+//   - **A blank owner means the previous one.** A line starting with
+//     whitespace inherits the name above it, so the second `NS` record in
+//     a zone usually has no name written on it at all.
+//   - **A name without a trailing dot is relative** to `$ORIGIN`, and `@`
+//     is the origin itself. `www` in `example.com.` is
+//     `www.example.com.`, and the same file loaded under a different
+//     origin means something else entirely.
+//   - **The TTL and the class are both optional and can be in either
+//     order**, so `www IN A 1.2.3.4`, `www 600 A 1.2.3.4` and
+//     `www 600 IN A 1.2.3.4` are all one record and a parser that expects
+//     fixed columns reads the type as the class.
+//   - **Parentheses join lines**, which every SOA record uses, and a
+//     semicolon starts a comment except inside a quoted string.
+//
+// ## What is not here
+//
+// `$INCLUDE`, which reads another file: a parser that touches the
+// filesystem cannot be handed a string, and every test of it needs a
+// directory. A caller that wants it can resolve the includes itself and
+// concatenate.
+
+type ZoneError =
+    | Unclosed(line: i64)
+    | NoOrigin(line: i64)
+    | Incomplete(line: i64)
+    | BadTtl(text: str, line: i64)
+    | Unsupported(directive: str, line: i64)
+
+    /// One resource record.
+type ZoneRecord = {
+    /// Absolute, with the trailing dot.
+    name: str,
+    ttl: i64,
+    /// `IN` almost always; `CH` and `HS` exist and nobody uses them.
+    class_name: str,
+    kind: str,
+    /// The rdata as fields, with domain names made absolute and quoted
+    /// strings still quoted.
+    data: [str],
+}
+
+/// What a zone amounts to.
+type Zone = {
+    origin: str,
+    records: [ZoneRecord],
+}
+
+fn is_space(character: str) -> bool {
+    return character == " " or character == "\t"
+}
+
+/// Strip comments and join parenthesised continuations, keeping a line
+/// number for each logical line.
+///
+/// A semicolon inside a quoted string is not a comment, and a newline
+/// inside parentheses is not a line ending. Doing either the simple way
+/// truncates every SOA record in the world.
+fn logical_lines(text: str) -> [(str, i64)] ! ZoneError {
+    var out: [(str, i64)] = []
+    var current = ""
+    var depth = 0
+    var start = 1
+    var number = 0
+    for raw in text.split("\n") {
+        number = number + 1
+        var quoted = false
+        var cleaned = ""
+        var i = 0
+        while i < raw.len() {
+            let here = raw.substr(i, 1)
+            if here == "\"" {
+                quoted = not quoted
+                cleaned = cleaned + here
+            } else if here == ";" and not quoted {
+                i = raw.len()
+                continue
+            } else if here == "(" and not quoted {
+                depth = depth + 1
+                cleaned = cleaned + " "
+            } else if here == ")" and not quoted {
+                depth = depth - 1
+                cleaned = cleaned + " "
+            } else {
+                cleaned = cleaned + here
+            }
+            i = i + 1
+        }
+        if current.len() == 0 {
+            start = number
+            current = cleaned
+        } else {
+            current = current + " " + cleaned
+        }
+        if depth == 0 {
+            if current.trim().len() > 0 {
+                out.push((current, start))
+            } else {
+                out.push((current, start))
+            }
+            current = ""
+        }
+    }
+    if depth != 0 {
+        fail(Unclosed(start))
+    }
+    return out
+}
+
+/// Split a line into fields, keeping a quoted string as one field with its
+/// quotes.
+fn fields_of(line: str) -> [str] {
+    var out: [str] = []
+    var current = ""
+    var started = false
+    var quoted = false
+    var i = 0
+    while i < line.len() {
+        let here = line.substr(i, 1)
+        if quoted {
+            current = current + here
+            if here == "\\" and i + 1 < line.len() {
+                current = current + line.substr(i + 1, 1)
+                i = i + 1
+            } else if here == "\"" {
+                quoted = false
+            }
+        } else if here == "\"" {
+            quoted = true
+            started = true
+            current = current + here
+        } else if is_space(here) {
+            if started {
+                out.push(current)
+                current = ""
+                started = false
+            }
+        } else {
+            current = current + here
+            started = true
+        }
+        i = i + 1
+    }
+    if started {
+        out.push(current)
+    }
+    return out
+}
+
+fn is_class(field: str) -> bool {
+    let upper = field.to_upper()
+    return upper == "IN" or upper == "CH" or upper == "HS" or
+    upper == "CS"
+}
+
+/// Whether a field is where the TTL goes.
+///
+/// A TTL is the only field that can start with a digit — a class is two
+/// letters and a type starts with one — so that is the test, and it has to
+/// be this rather than "is all digits" because `1h30m` is a legal TTL and
+/// a parser that misses it reads the *type* as the class.
+fn looks_like_ttl(field: str) -> bool {
+    if field.len() == 0 {
+        return false
+    }
+    let byte = field.to_bytes().at(0)
+    return byte >= 48 and byte <= 57
+}
+
+fn is_number(field: str) -> bool {
+    if field.len() == 0 {
+        return false
+    }
+    let raw = field.to_bytes()
+    var i = 0
+    while i < raw.len() {
+        if raw.at(i) < 48 or raw.at(i) > 57 {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+/// A TTL, which may be written `1h30m` as well as in seconds.
+pub fn parse_ttl(text: str) -> i64 ! ZoneError {
+    if is_number(text) {
+        return text.parse_int() ?? 0
+    }
+    var total = 0
+    var value = 0
+    var seen = false
+    var any = false
+    var i = 0
+    while i < text.len() {
+        let here = text.substr(i, 1).to_lower()
+        if is_number(here) {
+            value = value * 10 + (here.parse_int() ?? 0)
+            seen = true
+        } else {
+            if not seen {
+                fail(BadTtl(text, 0))
+            }
+            var unit = 1
+            if here == "m" {
+                unit = 60
+            } else if here == "h" {
+                unit = 3600
+            } else if here == "d" {
+                unit = 86400
+            } else if here == "w" {
+                unit = 604800
+            } else if here != "s" {
+                fail(BadTtl(text, 0))
+            }
+            total = total + value * unit
+            value = 0
+            seen = false
+            any = true
+        }
+        i = i + 1
+    }
+    if seen {
+        total = total + value
+        any = true
+    }
+    if not any {
+        fail(BadTtl(text, 0))
+    }
+    return total
+}
+
+/// Make a name absolute against an origin.
+pub fn absolute(name: str, origin: str) -> str {
+    if name == "@" {
+        return origin
+    }
+    if name.ends_with(".") {
+        return name
+    }
+    if origin.len() == 0 {
+        return name
+    }
+    return name + "." + origin
+}
+
+/// Which fields of an rdata are domain names, by record type.
+///
+/// A relative name in an rdata is relative to the same origin the owner is,
+/// and a reader that only absolutises the owner leaves `mail` in an MX
+/// record pointing at whatever the resolver's search list makes of it.
+fn name_fields(kind: str) -> [i64] {
+    if kind == "NS" or kind == "CNAME" or kind == "PTR" or
+    kind == "DNAME" {
+        return [0]
+    }
+    if kind == "MX" or kind == "AFSDB" or kind == "RT" or kind == "KX" {
+        return [1]
+    }
+    if kind == "SOA" {
+        return [0, 1]
+    }
+    if kind == "SRV" {
+        return [3]
+    }
+    if kind == "NAPTR" {
+        return [5]
+    }
+    return []
+}
+
+/// Read a zone.
+pub fn parse(text: str, origin: str, default_ttl: i64) -> Zone ! ZoneError {
+    var here_origin = origin
+    var ttl = default_ttl
+    var owner = ""
+    var records: [ZoneRecord] = []
+    for line in try logical_lines(text) {
+        let fields = fields_of(line.0)
+        if fields.len() == 0 {
+            continue
+        }
+        if fields[0].to_upper() == "$ORIGIN" {
+            if fields.len() < 2 {
+                fail(Incomplete(line.1))
+            }
+            here_origin = absolute(fields[1], here_origin)
+            continue
+        }
+        if fields[0].to_upper() == "$TTL" {
+            if fields.len() < 2 {
+                fail(Incomplete(line.1))
+            }
+            ttl = try parse_ttl(fields[1])
+            continue
+        }
+        if fields[0].starts_with("$") {
+            fail(Unsupported(fields[0], line.1))
+        }
+        var at = 0
+        if is_space(line.0.substr(0, 1)) {
+            if owner.len() == 0 {
+                fail(NoOrigin(line.1))
+            }
+        } else {
+            owner = absolute(fields[0], here_origin)
+            at = 1
+        }
+        var record_ttl = ttl
+        var class_name = "IN"
+        var seen_ttl = false
+        var seen_class = false
+        while at < fields.len() {
+            if not seen_ttl and looks_like_ttl(fields[at]) {
+                record_ttl = try parse_ttl(fields[at])
+                seen_ttl = true
+                at = at + 1
+            } else if not seen_class and is_class(fields[at]) {
+                class_name = fields[at].to_upper()
+                seen_class = true
+                at = at + 1
+            } else {
+                break
+            }
+        }
+        if at >= fields.len() {
+            fail(Incomplete(line.1))
+        }
+        let kind = fields[at].to_upper()
+        at = at + 1
+        var data: [str] = []
+        while at < fields.len() {
+            data.push(fields[at])
+            at = at + 1
+        }
+        for index in name_fields(kind) {
+            if index < data.len() {
+                data[index] = absolute(data[index], here_origin)
+            }
+        }
+        records.push(ZoneRecord{ name: owner, ttl: record_ttl,
+            class_name: class_name, kind: kind, data: data })
+    }
+    return Zone{ origin: here_origin, records: records }
+}
+
+/// One record written back out, in the one-per-line form `dig` prints.
+pub fn render(record: ZoneRecord) -> str {
+    return record.name + " {record.ttl} " + record.class_name + " " +
+    record.kind + " " + record.data.join(" ")
+}
+
+/// The records grouped the way a server holds them.
+///
+/// A file has lines; a zone has RRsets, and the two are not the same
+/// thing. Every record with one name, class and type is one set, and RFC
+/// 2181 says a set has a single TTL — so a file that writes two TTLs for
+/// one set is not describing two things, it is describing one badly. The
+/// *lowest* one wins, which is what section 5.2 says a receiver should do
+/// with a malformed set, and the same rdata written twice appears once.
+///
+/// `parse` keeps the lines because a formatter or a linter needs to see
+/// what was actually written. This is the other view.
+pub fn rrsets(zone: Zone) -> [ZoneRecord] {
+    var out: [ZoneRecord] = []
+    for record in zone.records {
+        var found = 0 - 1
+        var i = 0
+        while i < out.len() {
+            if out[i].name.to_lower() == record.name.to_lower() and
+            out[i].kind == record.kind and
+            out[i].class_name == record.class_name and
+            out[i].data == record.data {
+                found = i
+            }
+            i = i + 1
+        }
+        if found >= 0 {
+            if record.ttl < out[found].ttl {
+                out[found].ttl = record.ttl
+            }
+        } else {
+            out.push(record)
+        }
+    }
+    // The set's TTL is the lowest written for any member of it.
+    var j = 0
+    while j < out.len() {
+        var ttl = out[j].ttl
+        var k = 0
+        while k < zone.records.len() {
+            if zone.records[k].name.to_lower() == out[j].name.to_lower() and
+            zone.records[k].kind == out[j].kind and
+            zone.records[k].class_name == out[j].class_name and
+            zone.records[k].ttl < ttl {
+                ttl = zone.records[k].ttl
+            }
+            k = k + 1
+        }
+        out[j].ttl = ttl
+        j = j + 1
+    }
+    return out
+}
+
+/// The rules a zone can break that the format itself cannot catch.
+///
+/// Parsing and validating are different jobs and this is the second one,
+/// kept separate so a caller reading a zone to reformat it is not stopped
+/// by a rule it does not care about. Two rules matter in practice: a
+/// `CNAME` may not share a name with any other record, which is the one
+/// that breaks mail for a whole domain when somebody adds an MX beside a
+/// CNAME, and a name may not have two of them.
+pub fn problems(zone: Zone) -> [str] {
+    var out: [str] = []
+    for record in zone.records {
+        if record.kind != "CNAME" {
+            continue
+        }
+        var others = 0
+        var aliases = 0
+        for other in zone.records {
+            if other.name.to_lower() != record.name.to_lower() {
+                continue
+            }
+            if other.kind == "CNAME" {
+                aliases = aliases + 1
+            } else {
+                others = others + 1
+            }
+        }
+        if aliases > 1 and not held(out, record.name + " has two CNAMEs") {
+            out.push(record.name + " has two CNAMEs")
+        }
+        if others > 0 and
+        not held(out, record.name + " has a CNAME beside other records") {
+            out.push(record.name + " has a CNAME beside other records")
+        }
+    }
+    return out
+}
+
+fn held(seen: [str], text: str) -> bool {
+    for one in seen {
+        if one == text {
+            return true
+        }
+    }
+    return false
+}
+
+/// The records of one name and type, which is what a resolver answers with.
+pub fn lookup(zone: Zone, name: str, kind: str) -> [ZoneRecord] {
+    var out: [ZoneRecord] = []
+    for record in zone.records {
+        if record.name.to_lower() == name.to_lower() and
+        record.kind == kind.to_upper() {
+            out.push(record)
+        }
+    }
+    return out
+}

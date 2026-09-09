@@ -1,0 +1,271 @@
+// Five pieces of plumbing, each of which a program writes badly once and
+// then carries for years.
+//
+// Every expected value below came from the implementation that owns the
+// format: Python's `shlex`, `datetime` and `ipaddress`, the SipHash
+// reference vectors, and `dnspython`.
+import shellwords
+import datefmt
+import siphash
+import zonefile
+import cidr
+import ipaddr
+import time
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+// ----------------------------------------------------------- shellwords
+
+fn words(line: str) -> [str] {
+    return shellwords.split(line) ?? ["<error>"]
+}
+
+fn split_refused(line: str) -> bool {
+    match shellwords.split(line) {
+        Ok(_words) -> return false
+        Err(_why) -> return true
+    }
+}
+
+fn check_words(inout f: i64) / {io} {
+    print("-- shellwords: where the words are, without running anything")
+    say(f, "a space inside quotes is not a separator",
+        words("cp 'my file' /tmp") == ["cp", "my file", "/tmp"] and
+        words("cp \"my file\" /tmp") == ["cp", "my file", "/tmp"] and
+        words("cp my\\ file /tmp") == ["cp", "my file", "/tmp"])
+    say(f, "quotes can start and stop inside a word",
+        words("a'b'c") == ["abc"] and words("a\"b\"c") == ["abc"])
+    say(f, "single quotes take everything, double quotes take almost",
+        words("'a\\b'") == ["a\\b"] and words("\"a\\b\"") == ["a\\b"] and
+        words("\"a\\\"b\"") == ["a\"b"])
+    say(f, "an empty quoted string is a word, and nothing else is",
+        words("''").len() == 1 and words("  ").len() == 0)
+    say(f, "nothing is expanded, which is the whole point",
+        words("echo $HOME *.txt $(date)") ==
+        ["echo", "$HOME", "*.txt", "$(date)"])
+    say(f, "an unclosed quote is an error rather than a guess",
+        split_refused("'unclosed") and split_refused("x\"y") and
+        split_refused("\\"))
+    say(f, "and a quoted word survives being split again",
+        words(shellwords.quote("a'b \"c\" $d")) == ["a'b \"c\" $d"] and
+        shellwords.quote("plain") == "plain" and
+        shellwords.quote("") == "''")
+}
+
+// -------------------------------------------------------------- datefmt
+
+fn shown(pattern: str, millis: i64) -> str {
+    return datefmt.format(pattern, time.from_millis(millis), 0) ?? "<error>"
+}
+
+fn check_dates(inout f: i64) / {io} {
+    print("-- datefmt: the date format everything already speaks")
+    // 2024-02-29T13:45:07Z, a leap day in a leap year, on a Thursday.
+    let leap = 1709214307000
+    say(f, "the numeric directives, zero-padded the way C pads them",
+        shown("%Y-%m-%d", leap) == "2024-02-29" and
+        shown("%H:%M:%S", leap) == "13:45:07" and
+        shown("%j", leap) == "060")
+    say(f, "the names are English and the short ones are three letters",
+        shown("%A %a %B %b", leap) == "Thursday Thu February Feb")
+    say(f, "a twelve-hour clock needs the meridiem to be a time at all",
+        shown("%I:%M %p", leap) == "01:45 PM" and
+        shown("%I %p", 3600000) == "01 AM" and
+        shown("%I %p", 43200000) == "12 PM")
+    say(f, "the composites are the ones people actually type",
+        shown("%F %T", leap) == "2024-02-29 13:45:07" and
+        shown("%D", leap) == "02/29/24" and shown("%R", leap) == "13:45")
+    // 2025-12-29 is in ISO week 1 of 2026, which is the case that catches
+    // every home-made week number.
+    let crossover = 1766966400000
+    say(f, "the ISO week year is not always the calendar year",
+        shown("%G-W%V-%u", crossover) == "2026-W01-1" and
+        shown("%Y", crossover) == "2025")
+    say(f, "and the two other week numberings disagree with both",
+        shown("%U %W", crossover) == "52 52")
+    say(f, "a parse is strict: every literal has to be there",
+        parsed("%Y-%m-%d", "2024-02-29") == 1709164800000 and
+        parse_refused("%Y-%m-%d", "2024-02-29x") and
+        parse_refused("%Y-%m-%d", "2024-13-01") and
+        parse_refused("%H:%M", "25:00"))
+    say(f, "a day of the year is resolved after the year, not before",
+        parsed("%j %Y", "060 2024") == 1709164800000 and
+        parsed("%j %Y", "060 2023") == 1677628800000)
+    say(f, "and an offset is read in all four spellings it is written in",
+        offset("%z", "+0130") == 90 and offset("%z", "+01:30") == 90 and
+        offset("%z", "-05") == 0 - 300 and offset("%z", "Z") == 0)
+}
+
+fn parsed(pattern: str, text: str) -> i64 {
+    match datefmt.parse(pattern, text) {
+        Ok(found) -> return time.to_millis(found.stamp)
+        Err(_why) -> return 0 - 1
+    }
+}
+
+fn parse_refused(pattern: str, text: str) -> bool {
+    match datefmt.parse(pattern, text) {
+        Ok(_found) -> return false
+        Err(_why) -> return true
+    }
+}
+
+fn offset(pattern: str, text: str) -> i64 {
+    match datefmt.parse(pattern, text) {
+        Ok(found) -> return found.offset_minutes
+        Err(_why) -> return 99999
+    }
+}
+
+// -------------------------------------------------------------- siphash
+
+fn check_siphash(inout f: i64) / {io} {
+    print("-- siphash: a keyed hash, so a table cannot be poisoned")
+    var key: [i64] = []
+    var i = 0
+    while i < 16 {
+        key.push(i)
+        i = i + 1
+    }
+    say(f, "the paper's first vector, for the empty message",
+        siphash.hex(siphash.hash(bytes_of(key), bytes_of([]))) ==
+        "310e0edd47db6f72")
+    say(f, "and its third, for three bytes",
+        siphash.hex(siphash.hash(bytes_of(key), bytes_of([0, 1, 2]))) ==
+        "2d7efbd796666785")
+    say(f, "a different key gives a different digest for the same bytes",
+        siphash.hash(bytes_of(key), "hello".to_bytes()) !=
+        siphash.hash(siphash.key_of(1, 2), "hello".to_bytes()))
+    say(f, "the length is mixed in, so trailing zeros are not free",
+        siphash.hash(bytes_of(key), bytes_of([0])) !=
+        siphash.hash(bytes_of(key), bytes_of([0, 0])))
+    say(f, "one-three is a different function, not a shorter one",
+        siphash.hash_1_3(bytes_of(key), bytes_of([])) !=
+        siphash.hash(bytes_of(key), bytes_of([])))
+    say(f, "and a key of the wrong length is padded and said to be wrong",
+        not siphash.key_is_valid("short".to_bytes()) and
+        siphash.key_is_valid(bytes_of(key)))
+}
+
+// ------------------------------------------------------------- zonefile
+
+fn zone_of(text: str) -> Zone {
+    return zonefile.parse(text, "example.test.", 3600) ??
+    Zone{ origin: "", records: [] }
+}
+
+fn check_zone(inout f: i64) / {io} {
+    print("-- zonefile: what a master file leaves unwritten")
+    let text = "$ORIGIN example.test.\n$TTL 3600\n" +
+    "@   IN SOA ns1 admin.example.test. (\n" +
+    "      2024010101 ; serial\n" +
+    "      7200 3600 1209600 3600 )\n" +
+    "    IN NS   ns1\n" +
+    "    IN NS   ns2.example.test.\n" +
+    "www IN A    192.0.2.1\n" +
+    "www 600 IN AAAA 2001:db8::1\n" +
+    "mail 1h MX  10 mx\n" +
+    "txt IN TXT  \"hello; not a comment\"\n"
+    let zone = zone_of(text)
+    say(f, "a blank owner means the one above it",
+        zonefile.lookup(zone, "example.test.", "NS").len() == 2)
+    say(f, "a name without a dot is relative and one with a dot is not",
+        zonefile.lookup(zone, "example.test.", "NS")[0].data[0] ==
+        "ns1.example.test." and
+        zonefile.lookup(zone, "example.test.", "NS")[1].data[0] ==
+        "ns2.example.test.")
+    say(f, "a name inside an rdata is relative to the same origin",
+        zonefile.lookup(zone, "mail.example.test.", "MX")[0].data[1] ==
+        "mx.example.test.")
+    say(f, "parentheses join lines, which every SOA record needs",
+        zonefile.lookup(zone, "example.test.", "SOA")[0].data.len() == 7)
+    say(f, "a TTL may be written with units, and inherits when absent",
+        zonefile.lookup(zone, "mail.example.test.", "MX")[0].ttl == 3600 and
+        zonefile.lookup(zone, "www.example.test.", "AAAA")[0].ttl == 600 and
+        zonefile.lookup(zone, "www.example.test.", "A")[0].ttl == 3600)
+    say(f, "a semicolon inside quotes is not a comment",
+        zonefile.lookup(zone, "txt.example.test.", "TXT")[0].data[0] ==
+        "\"hello; not a comment\"")
+    say(f, "and a CNAME beside another record is reported, not accepted",
+        zonefile.problems(zone_of("$ORIGIN example.test.\n" +
+            "www IN CNAME other.test.\nwww IN A 192.0.2.1\n")).len() == 1 and
+        zonefile.problems(zone).len() == 0)
+}
+
+// ----------------------------------------------------------------- cidr
+
+fn blocks(text: str) -> [Cidr] {
+    var out: [Cidr] = []
+    for piece in text.split(",") {
+        match ipaddr.parse_cidr(piece) {
+            Ok(block) -> out.push(block)
+            Err(_why) -> {}
+        }
+    }
+    return out
+}
+
+fn shown_blocks(list: [Cidr]) -> str {
+    var out = ""
+    var first = true
+    for block in list {
+        if not first {
+            out = out + ","
+        }
+        first = false
+        out = out + cidr.render(block)
+    }
+    return out
+}
+
+fn check_cidr(inout f: i64) / {io} {
+    print("-- cidr: merging blocks, and the holes left by taking one out")
+    say(f, "two halves of a block merge into it",
+        shown_blocks(cidr.collapse(blocks("10.0.0.0/25,10.0.0.128/25"))) ==
+        "10.0.0.0/24")
+    say(f, "and a block inside another disappears into it",
+        shown_blocks(cidr.collapse(
+            blocks("10.0.0.0/8,10.1.2.0/24,192.0.2.0/24"))) ==
+        "10.0.0.0/8,192.0.2.0/24")
+    say(f, "adjacent blocks that are not siblings still merge",
+        shown_blocks(cidr.collapse(
+            blocks("10.0.0.0/25,10.0.0.128/26,10.0.0.192/26"))) ==
+        "10.0.0.0/24")
+    say(f, "taking a hole out of a block leaves several, not one",
+        shown_blocks(cidr.exclude_all(blocks("10.0.0.0/8"),
+            blocks("10.1.2.0/24"))).split(",").len() == 16)
+    say(f, "a range that is not a block summarises to the fewest blocks",
+        shown_blocks(cidr.summarise(ipaddr.parse("192.0.2.5") ?? 0,
+            ipaddr.parse("192.0.2.130") ?? 0)) ==
+        "192.0.2.5/32,192.0.2.6/31,192.0.2.8/29,192.0.2.16/28," +
+        "192.0.2.32/27,192.0.2.64/26,192.0.2.128/31,192.0.2.130/32")
+    say(f, "splitting and counting agree with each other",
+        (cidr.subnets(blocks("10.0.0.0/24")[0], 26) ?? []).len() == 4 and
+        cidr.count_addresses(blocks("10.0.0.0/24,10.0.0.0/25")) == 256)
+    say(f, "and a block written with host bits set says so and normalises",
+        not cidr.is_aligned(Cidr{ base: 167772161, bits: 24 }) and
+        cidr.render(Cidr{ base: 167772161, bits: 24 }) == "10.0.0.0/24" and
+        cidr.is_aligned(cidr.normalise(Cidr{ base: 167772161,
+            bits: 24 })))
+}
+
+fn main() / {io} {
+    var f = 0
+    check_words(f)
+    check_dates(f)
+    check_siphash(f)
+    check_zone(f)
+    check_cidr(f)
+    if f == 0 {
+        print("plumbing: every claim held")
+    } else {
+        print("plumbing: {f} claims failed")
+    }
+}

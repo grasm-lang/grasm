@@ -1,0 +1,32 @@
+[package]
+name = "plumbing_demo"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.shellwords]
+path = "../shellwords"
+version = "^1.0.0"
+
+[dependencies.datefmt]
+path = "../datefmt"
+version = "^1.0.0"
+
+[dependencies.siphash]
+path = "../siphash"
+version = "^1.0.0"
+
+[dependencies.zonefile]
+path = "../zonefile"
+version = "^1.0.0"
+
+[dependencies.cidr]
+path = "../cidr"
+version = "^1.0.0"
+
+[dependencies.ipaddr]
+path = "../ipaddr"
+version = "^1.0.0"
+
+[dependencies.time]
+path = "../time"
+version = "^1.0.0"
