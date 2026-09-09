@@ -1,0 +1,370 @@
+// The check digits on the identifiers a business system handles.
+//
+// A book number, a security identifier, a bank routing number and a phone's
+// serial all carry a digit computed from the rest. Checking it costs
+// microseconds and catches the overwhelming majority of typing errors —
+// every single-digit mistake, and most transpositions — before the number
+// reaches a database, a payment file or somebody else's API.
+//
+// The point is not that the number is *real*. A valid ISBN may be a book
+// nobody published. The point is that an invalid one is certainly wrong,
+// and finding that out at the edge is much cheaper than finding it out
+// three systems later.
+//
+// ## Four different schemes, and they are not interchangeable
+//
+//   - **Weighted sums mod 11** — ISBN-10, ISSN, SEDOL. The check character
+//     can be `X`, because eleven values need eleven symbols and there are
+//     only ten digits.
+//   - **Alternating weights mod 10** — ISBN-13, EAN, GTIN. Every valid
+//     ISBN-13 starts `978` or `979`, and the same arithmetic checks a
+//     barcode.
+//   - **Luhn** — IMEI, and the card numbers `luhn` already handles.
+//   - **Letters as numbers** — ISIN and CUSIP fold letters into two digits
+//     first, which is where a hand-written checker usually goes wrong: `A`
+//     is 10, so it contributes *two* digits to the weighted sum.
+//
+// A caller wanting a specific one should call it by name. `check` guesses
+// from the shape and is for the case where the shape is all there is.
+
+type CheckError =
+    | WrongLength(length: i64)
+    | BadCharacter(character: str)
+
+fn digit_of(character: str) -> i64 {
+    let byte = character.to_bytes().at(0)
+    if byte >= 48 and byte <= 57 {
+        return byte - 48
+    }
+    return 0 - 1
+}
+
+/// A letter's numeric value: `A` is 10 through `Z` is 35, which is how ISIN
+/// and CUSIP read letters.
+fn letter_value(character: str) -> i64 {
+    let byte = character.to_upper().to_bytes().at(0)
+    if byte >= 65 and byte <= 90 {
+        return byte - 55
+    }
+    return 0 - 1
+}
+
+/// Strip the separators people write and machines do not.
+pub fn tidy(text: str) -> str {
+    var out = ""
+    var i = 0
+    while i < text.len() {
+        let here = text.substr(i, 1)
+        if here != "-" and here != " " {
+            out = out + here
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn all_digits(text: str) -> bool {
+    var i = 0
+    while i < text.len() {
+        if digit_of(text.substr(i, 1)) < 0 {
+            return false
+        }
+        i = i + 1
+    }
+    return text.len() > 0
+}
+
+/// ISBN-10: weights ten down to two, sum modulo eleven, check digit is what
+/// makes it zero, written `X` when it is ten.
+pub fn isbn10_check(body: str) -> str ! CheckError {
+    if body.len() != 9 or not all_digits(body) {
+        fail(WrongLength(body.len()))
+    }
+    var total = 0
+    var i = 0
+    while i < 9 {
+        total = total + digit_of(body.substr(i, 1)) * (10 - i)
+        i = i + 1
+    }
+    let check = (11 - total % 11) % 11
+    if check == 10 {
+        return "X"
+    }
+    return "{check}"
+}
+
+pub fn isbn10_is_valid(text: str) -> bool {
+    let flat = tidy(text)
+    if flat.len() != 10 {
+        return false
+    }
+    let body = flat.substr(0, 9)
+    let last = flat.substr(9, 1).to_upper()
+    match isbn10_check(body) {
+        Ok(want) -> return want == last
+        Err(_why) -> return false
+    }
+}
+
+/// ISBN-13 and every other GTIN: weights one and three alternating.
+pub fn isbn13_check(body: str) -> str ! CheckError {
+    if body.len() != 12 or not all_digits(body) {
+        fail(WrongLength(body.len()))
+    }
+    return "{gtin_check(body)}"
+}
+
+fn gtin_check(body: str) -> i64 {
+    var total = 0
+    var i = 0
+    while i < body.len() {
+        var weight = 1
+        // The weights run three, one, three, one from the *right*, so
+        // whether a position is weighted three depends on the length.
+        if (body.len() - i) % 2 == 1 {
+            weight = 3
+        }
+        total = total + digit_of(body.substr(i, 1)) * weight
+        i = i + 1
+    }
+    return (10 - total % 10) % 10
+}
+
+pub fn isbn13_is_valid(text: str) -> bool {
+    let flat = tidy(text)
+    if flat.len() != 13 or not all_digits(flat) {
+        return false
+    }
+    if not flat.starts_with("978") and not flat.starts_with("979") {
+        return false
+    }
+    return gtin_check(flat.substr(0, 12)) == digit_of(flat.substr(12, 1))
+}
+
+/// Either length of ISBN.
+pub fn isbn_is_valid(text: str) -> bool {
+    return isbn10_is_valid(text) or isbn13_is_valid(text)
+}
+
+/// ISSN: eight characters, weights eight down to two, modulo eleven.
+pub fn issn_is_valid(text: str) -> bool {
+    let flat = tidy(text)
+    if flat.len() != 8 or not all_digits(flat.substr(0, 7)) {
+        return false
+    }
+    var total = 0
+    var i = 0
+    while i < 7 {
+        total = total + digit_of(flat.substr(i, 1)) * (8 - i)
+        i = i + 1
+    }
+    let check = (11 - total % 11) % 11
+    let last = flat.substr(7, 1).to_upper()
+    if check == 10 {
+        return last == "X"
+    }
+    return last == "{check}"
+}
+
+/// The digits a mixed run of letters and digits expands to, with a letter
+/// contributing both of its digits.
+fn expanded(text: str) -> [i64] ! CheckError {
+    var out: [i64] = []
+    var i = 0
+    while i < text.len() {
+        let here = text.substr(i, 1)
+        let digit = digit_of(here)
+        if digit >= 0 {
+            out.push(digit)
+        } else {
+            let value = letter_value(here)
+            if value < 0 {
+                fail(BadCharacter(here))
+            }
+            out.push(value / 10)
+            out.push(value % 10)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+/// Luhn over an already-expanded run of digits.
+fn luhn_check(digits: [i64]) -> i64 {
+    var total = 0
+    var i = digits.len() - 1
+    var double = true
+    while i >= 0 {
+        var value = digits[i]
+        if double {
+            value = value * 2
+            if value > 9 {
+                value = value - 9
+            }
+        }
+        total = total + value
+        double = not double
+        i = i - 1
+    }
+    return (10 - total % 10) % 10
+}
+
+/// ISIN: two letters of country, nine of national number, one check digit,
+/// with letters folded to digits before Luhn.
+pub fn isin_is_valid(text: str) -> bool {
+    let flat = tidy(text).to_upper()
+    if flat.len() != 12 {
+        return false
+    }
+    if letter_value(flat.substr(0, 1)) < 0 or
+    letter_value(flat.substr(1, 1)) < 0 {
+        return false
+    }
+    match expanded(flat.substr(0, 11)) {
+        Ok(digits) -> {
+            return luhn_check(digits) == digit_of(flat.substr(11, 1))
+        }
+        Err(_why) -> return false
+    }
+}
+
+/// CUSIP: nine characters, weights one and two alternating, and `*`, `@`
+/// and `#` are legal characters with values of their own.
+pub fn cusip_is_valid(text: str) -> bool {
+    let flat = tidy(text).to_upper()
+    if flat.len() != 9 {
+        return false
+    }
+    var total = 0
+    var i = 0
+    while i < 8 {
+        let here = flat.substr(i, 1)
+        var value = digit_of(here)
+        if value < 0 {
+            value = letter_value(here)
+            if value < 0 {
+                if here == "*" {
+                    value = 36
+                } else if here == "@" {
+                    value = 37
+                } else if here == "#" {
+                    value = 38
+                } else {
+                    return false
+                }
+            }
+        }
+        if i % 2 == 1 {
+            value = value * 2
+        }
+        total = total + value / 10 + value % 10
+        i = i + 1
+    }
+    return (10 - total % 10) % 10 == digit_of(flat.substr(8, 1))
+}
+
+/// SEDOL: seven characters with fixed weights, modulo ten, and no vowels —
+/// which is what stops a SEDOL being mistaken for a word.
+///
+/// Two rules beyond the arithmetic: the check character is always a digit,
+/// and an identifier beginning with a digit is an old-style one and has to
+/// be digits all the way. A new-style SEDOL begins with a letter, so
+/// `4JH2TZ6` is malformed however well its check digit works out.
+pub fn sedol_is_valid(text: str) -> bool {
+    let flat = tidy(text).to_upper()
+    if flat.len() != 7 {
+        return false
+    }
+    if digit_of(flat.substr(6, 1)) < 0 {
+        return false
+    }
+    if digit_of(flat.substr(0, 1)) >= 0 and not all_digits(flat) {
+        return false
+    }
+    let weights = [1, 3, 1, 7, 3, 9, 1]
+    var total = 0
+    var i = 0
+    while i < 7 {
+        let here = flat.substr(i, 1)
+        var value = digit_of(here)
+        if value < 0 {
+            if here == "A" or here == "E" or here == "I" or here == "O" or
+            here == "U" {
+                return false
+            }
+            value = letter_value(here)
+            if value < 0 {
+                return false
+            }
+        }
+        total = total + value * weights[i]
+        i = i + 1
+    }
+    return total % 10 == 0
+}
+
+/// An IMEI, which is Luhn over fifteen digits.
+pub fn imei_is_valid(text: str) -> bool {
+    let flat = tidy(text)
+    if flat.len() != 15 or not all_digits(flat) {
+        return false
+    }
+    var digits: [i64] = []
+    var i = 0
+    while i < 14 {
+        digits.push(digit_of(flat.substr(i, 1)))
+        i = i + 1
+    }
+    return luhn_check(digits) == digit_of(flat.substr(14, 1))
+}
+
+/// An American bank routing number: nine digits, weights three, seven and
+/// one, and the sum itself must be zero modulo ten.
+pub fn routing_is_valid(text: str) -> bool {
+    let flat = tidy(text)
+    if flat.len() != 9 or not all_digits(flat) {
+        return false
+    }
+    let weights = [3, 7, 1, 3, 7, 1, 3, 7, 1]
+    var total = 0
+    var i = 0
+    while i < 9 {
+        total = total + digit_of(flat.substr(i, 1)) * weights[i]
+        i = i + 1
+    }
+    return total % 10 == 0
+}
+
+/// Which of the schemes a string could be, by shape and by arithmetic.
+///
+/// More than one can hold — a fifteen-digit IMEI is not an ISBN, but a
+/// nine-digit CUSIP and a nine-digit routing number look alike — so this
+/// answers with everything that checks out rather than picking.
+pub fn check(text: str) -> [str] {
+    var out: [str] = []
+    if isbn10_is_valid(text) {
+        out.push("isbn10")
+    }
+    if isbn13_is_valid(text) {
+        out.push("isbn13")
+    }
+    if issn_is_valid(text) {
+        out.push("issn")
+    }
+    if isin_is_valid(text) {
+        out.push("isin")
+    }
+    if cusip_is_valid(text) {
+        out.push("cusip")
+    }
+    if sedol_is_valid(text) {
+        out.push("sedol")
+    }
+    if imei_is_valid(text) {
+        out.push("imei")
+    }
+    if routing_is_valid(text) {
+        out.push("routing")
+    }
+    return out
+}

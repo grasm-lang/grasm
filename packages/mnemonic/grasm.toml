@@ -1,0 +1,15 @@
+[package]
+name = "mnemonic"
+version = "1.0.0"
+
+[dependencies.crypto_hash]
+path = "../crypto_hash"
+version = "^1.0.0"
+
+[dependencies.sha512]
+path = "../sha512"
+version = "^1.0.0"
+
+[dependencies.unicodenorm]
+path = "../unicodenorm"
+version = "^1.0.0"

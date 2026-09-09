@@ -1,0 +1,98 @@
+// Base45, RFC 9285 — the encoding a QR code can hold cheaply.
+//
+// A QR code has an alphanumeric mode with its own 45-character alphabet,
+// and text that stays inside it packs into 5.5 bits per character instead
+// of 8. Base64 does not: its `+`, `/` and lower-case letters force the QR
+// encoder into byte mode and the code gets visibly bigger. That is the
+// whole reason this exists, and it is why the EU digital covid
+// certificates were base45 rather than base64.
+//
+// ## Two bytes become three characters
+//
+// A pair of bytes is one number below 65536, written in base 45 with the
+// *least* significant digit first — which is backwards from every other
+// base-N encoding and is the mistake every reimplementation makes. A
+// single trailing byte becomes two characters instead of three.
+//
+// ## Decoding is strict
+//
+// A group of three whose value exceeds 65535, a leftover of one character,
+// or any character outside the alphabet is an error. Base45 has no padding
+// and no whitespace, so there is nothing to be lenient about.
+
+type Base45Error =
+    | BadCharacter(character: str, at: i64)
+    | BadLength(length: i64)
+    | Overflow(value: i64)
+
+fn alphabet() -> str {
+    return "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ $%*+-./:"
+}
+
+fn value_of(character: str) -> i64 {
+    var i = 0
+    while i < 45 {
+        if alphabet().substr(i, 1) == character {
+            return i
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+/// Encode bytes.
+pub fn encode(data: bytes) -> str {
+    var out = ""
+    var i = 0
+    while i + 1 < data.len() {
+        var value = data.at(i) * 256 + data.at(i + 1)
+        out = out + alphabet().substr(value % 45, 1)
+        value = value / 45
+        out = out + alphabet().substr(value % 45, 1)
+        out = out + alphabet().substr(value / 45, 1)
+        i = i + 2
+    }
+    if i < data.len() {
+        var value = data.at(i)
+        out = out + alphabet().substr(value % 45, 1)
+        out = out + alphabet().substr(value / 45, 1)
+    }
+    return out
+}
+
+/// Decode a base45 string.
+pub fn decode(text: str) -> bytes ! Base45Error {
+    var digits: [i64] = []
+    var i = 0
+    while i < text.len() {
+        let here = text.substr(i, 1)
+        let value = value_of(here)
+        if value < 0 {
+            fail(BadCharacter(here, i))
+        }
+        digits.push(value)
+        i = i + 1
+    }
+    if digits.len() % 3 == 1 {
+        fail(BadLength(text.len()))
+    }
+    var out: [i64] = []
+    var at = 0
+    while at + 2 < digits.len() {
+        let value = digits[at] + digits[at + 1] * 45 + digits[at + 2] * 2025
+        if value > 65535 {
+            fail(Overflow(value))
+        }
+        out.push(value / 256)
+        out.push(value % 256)
+        at = at + 3
+    }
+    if at + 1 < digits.len() {
+        let value = digits[at] + digits[at + 1] * 45
+        if value > 255 {
+            fail(Overflow(value))
+        }
+        out.push(value)
+    }
+    return bytes_of(out)
+}

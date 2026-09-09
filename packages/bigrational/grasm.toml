@@ -1,0 +1,7 @@
+[package]
+name = "bigrational"
+version = "1.0.0"
+
+[dependencies.bigint]
+path = "../bigint"
+version = "^1.0.0"

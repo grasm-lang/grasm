@@ -1,0 +1,262 @@
+// Numbers that have to be exactly right, and the codes people copy by hand.
+//
+// The expected values came from Python's `fractions`, BIP-350's own test
+// vectors, `python-stdnum`, BIP-39's published vectors and RFC 9285.
+import bigrational
+import bech32
+import checkdigits
+import mnemonic
+import base45
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn from_hex(text: str) -> bytes {
+    var out: [i64] = []
+    var i = 0
+    while i + 1 < text.len() {
+        out.push(text.substr(i, 2).parse_int_base(16) ?? 0)
+        i = i + 2
+    }
+    return bytes_of(out)
+}
+
+fn to_hex(data: bytes) -> str {
+    let digits = "0123456789abcdef"
+    var out = ""
+    var i = 0
+    while i < data.len() {
+        out = out + digits.substr(data.at(i) / 16, 1) +
+        digits.substr(data.at(i) % 16, 1)
+        i = i + 1
+    }
+    return out
+}
+
+// ------------------------------------------------------------- rational
+
+fn value(text: str) -> BigRational {
+    return bigrational.parse(text) ?? bigrational.zero()
+}
+
+fn check_rational(inout f: i64) / {io} {
+    print("-- rational: a tenth plus a fifth is exactly three tenths")
+    say(f, "the sum a floating-point type gets wrong",
+        bigrational.render(bigrational.add(value("1/10"), value("2/10"))) ==
+        "3/10")
+    say(f, "and a third that adds back to one",
+        bigrational.render(bigrational.add(bigrational.add(value("1/3"),
+            value("1/3")), value("1/3"))) == "1")
+    say(f, "every value is in lowest terms, so equality is just equality",
+        bigrational.render(value("2/4")) == "1/2" and
+        bigrational.equal(value("2/4"), value("1/2")) and
+        bigrational.render(value("-2/-4")) == "1/2" and
+        bigrational.render(value("2/-4")) == "-1/2")
+    say(f, "the numbers may be as large as they need to be",
+        bigrational.render(bigrational.mul(
+            value("123456789012345678901234567890/7"),
+            value("7/1"))) == "123456789012345678901234567890")
+    say(f, "flooring rounds down rather than towards zero",
+        bigrational.render(whole(bigrational.floor(value("-1/2")))) == "-1" and
+        bigrational.render(whole(bigrational.floor(value("1/2")))) == "0")
+    say(f, "and rounding sends halves to the even side, which is unbiased",
+        bigrational.render(whole(bigrational.round(value("1/2")))) == "0" and
+        bigrational.render(whole(bigrational.round(value("3/2")))) == "2" and
+        bigrational.render(whole(bigrational.round(value("5/2")))) == "2" and
+        bigrational.render(whole(bigrational.round(value("-3/2")))) == "-2")
+    say(f, "a decimal expansion is as long as the caller asks for",
+        bigrational.to_decimal(value("1/3"), 5) == "0.33333" and
+        bigrational.to_decimal(value("2/3"), 5) == "0.66667" and
+        bigrational.to_decimal(value("1/8"), 3) == "0.125")
+    say(f, "and dividing by zero is refused rather than infinite",
+        div_refused(value("1/2"), bigrational.zero()))
+}
+
+fn whole(value: BigInt) -> BigRational {
+    return BigRational{ numerator: value,
+        denominator: bigrational.one().denominator }
+}
+
+fn div_refused(a: BigRational, b: BigRational) -> bool {
+    match bigrational.div(a, b) {
+        Ok(_answer) -> return false
+        Err(_why) -> return true
+    }
+}
+
+// --------------------------------------------------------------- bech32
+
+fn address_of(prefix: str, version: i64, program: str) -> str {
+    return bech32.encode_address(prefix, version, from_hex(program)) ??
+    "<error>"
+}
+
+fn decoded(prefix: str, text: str) -> str {
+    match bech32.decode_address(prefix, text) {
+        Ok(found) -> return "{found.version}/" + to_hex(found.program)
+        Err(_why) -> return "error"
+    }
+}
+
+fn check_bech32(inout f: i64) / {io} {
+    print("-- bech32: an address written to be read aloud and typed wrong")
+    say(f, "a version-zero address uses the original checksum",
+        address_of("bc", 0, "751e76e8199196d454941c45d1b3a323f1433bd6") ==
+        "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4")
+    say(f, "and a version-one address uses Bech32m",
+        address_of("bc", 1,
+            "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
+        == "bc1p0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqzk5jj0")
+    say(f, "a string is case-insensitive but may not be mixed",
+        decoded("bc", "BC1QW508D6QEJXTDG4Y5R3ZARVARY0C5XW7KV8F3T4") ==
+        "0/751e76e8199196d454941c45d1b3a323f1433bd6" and
+        decoded("tb",
+            "tb1p0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vq47Zagq")
+        == "error")
+    say(f, "the wrong checksum for the version is refused, both ways round",
+        decoded("bc",
+            "bc1p0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqh2y7hd")
+        == "error" and
+        decoded("bc", "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kemeawh") ==
+        "error")
+    say(f, "a program of the wrong length for its version is refused",
+        decoded("bc", "bc1pw5dgrnzv") == "error" and
+        decoded("bc", "BC1QR508D6QEJXTDG4Y5R3ZARVARYV98GJ9P") == "error")
+    say(f, "and so is padding that carries bits nobody meant",
+        decoded("bc",
+            "bc1p0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7v07qwwzcrf")
+        == "error" and
+        decoded("tb",
+            "tb1p0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vpggkg4j")
+        == "error")
+    say(f, "a short address is still an address",
+        decoded("bc", "BC1SW50QGDZ25J") == "16/751e")
+}
+
+// ---------------------------------------------------------- checkdigits
+
+fn check_identifiers(inout f: i64) / {io} {
+    print("-- checkdigits: the digit that says the number was typed right")
+    say(f, "both lengths of book number, separators and all",
+        checkdigits.isbn_is_valid("978-0-306-40615-7") and
+        checkdigits.isbn_is_valid("0-306-40615-2") and
+        not checkdigits.isbn_is_valid("978-0-306-40615-6"))
+    say(f, "an ISBN-10 whose check digit is ten is written X",
+        checkdigits.isbn10_is_valid("043942089X") and
+        not checkdigits.isbn10_is_valid("0439420890"))
+    say(f, "and an ISBN-13 has to begin 978 or 979 to be one",
+        checkdigits.isbn13_is_valid("9780306406157") and
+        not checkdigits.isbn13_is_valid("1230306406157"))
+    say(f, "a serial number, a security and a stock identifier",
+        checkdigits.issn_is_valid("0378-5955") and
+        checkdigits.isin_is_valid("US0378331005") and
+        checkdigits.cusip_is_valid("037833100") and
+        checkdigits.sedol_is_valid("0263494"))
+    say(f, "an ISIN folds its letters into two digits each before Luhn",
+        checkdigits.isin_is_valid("AU0000XVGZA3") and
+        not checkdigits.isin_is_valid("AU0000XVGZA4"))
+    say(f, "a SEDOL that starts with a digit has to be all digits",
+        not checkdigits.sedol_is_valid("4JH2TZ6") and
+        checkdigits.sedol_is_valid("B0YBKJ7"))
+    say(f, "a phone's serial and a bank's routing number",
+        checkdigits.imei_is_valid("356938035643809") and
+        checkdigits.routing_is_valid("011000015") and
+        not checkdigits.routing_is_valid("011000016"))
+    say(f, "and a number of ambiguous shape says every scheme it fits" +
+        " rather than picking one",
+        checkdigits.check("037833100") == ["cusip"] and
+        checkdigits.check("011000015") == ["cusip", "routing"])
+}
+
+// ------------------------------------------------------------- mnemonic
+
+fn phrase_of(entropy: str) -> str {
+    match mnemonic.from_entropy(from_hex(entropy)) {
+        Ok(words) -> return mnemonic.render(words)
+        Err(_why) -> return "<error>"
+    }
+}
+
+fn entropy_of(phrase: str) -> str {
+    match mnemonic.to_entropy(mnemonic.split(phrase)) {
+        Ok(entropy) -> return to_hex(entropy)
+        Err(_why) -> return "error"
+    }
+}
+
+fn check_mnemonic(inout f: i64) / {io} {
+    print("-- mnemonic: a key a person can copy down and check")
+    let all_zero = "00000000000000000000000000000000"
+    say(f, "the vector everybody's first test uses",
+        phrase_of(all_zero) == "abandon abandon abandon abandon abandon" +
+        " abandon abandon abandon abandon abandon abandon about")
+    say(f, "and the same phrase reads back as the same key",
+        entropy_of(phrase_of(all_zero)) == all_zero)
+    say(f, "twenty-four words for a 256-bit key, twelve for a 128-bit one",
+        mnemonic.split(phrase_of(all_zero)).len() == 12 and
+        mnemonic.split(phrase_of(all_zero + all_zero)).len() == 24)
+    say(f, "a wrong word is caught by the list",
+        entropy_of("abandon abandon abandon abandon abandon abandon" +
+            " abandon abandon abandon abandon abandon notaword") == "error")
+    say(f, "and a right word in the wrong place is caught by the checksum",
+        entropy_of("abandon abandon abandon abandon abandon abandon" +
+            " abandon abandon abandon abandon abandon abandon") == "error")
+    say(f, "a phrase of the wrong length is not a phrase",
+        entropy_of("abandon abandon about") == "error")
+    say(f, "the list is in the published order, which is the format",
+        mnemonic.word_at(0) == "abandon" and
+        mnemonic.word_at(2047) == "zoo" and
+        mnemonic.index_of("zoo") == 2047 and
+        mnemonic.index_of("notaword") == 0 - 1)
+}
+
+// --------------------------------------------------------------- base45
+
+fn check_base45(inout f: i64) / {io} {
+    print("-- base45: the encoding a QR code holds cheaply")
+    say(f, "RFC 9285's own examples",
+        base45.encode("AB".to_bytes()) == "BB8" and
+        base45.encode("Hello!!".to_bytes()) == "%69 VD92EX0" and
+        base45.encode("base-45".to_bytes()) == "UJCLQE7W581" and
+        base45.encode("ietf!".to_bytes()) == "QED8WEX0")
+    say(f, "each pair of bytes is one number, least significant first",
+        decoded45("BB8") == "4142" and decoded45("QED8WEX0") ==
+        "6965746621")
+    say(f, "a trailing odd byte becomes two characters, not three",
+        base45.encode(bytes_of([0])) == "00" and
+        base45.encode(bytes_of([255])) == "U5" and
+        decoded45("U5") == "ff")
+    say(f, "a group whose value is too large is refused",
+        decoded45("GGW") == "error" and decoded45("U6") == "error")
+    say(f, "a leftover single character is refused",
+        decoded45("G") == "error" and decoded45("BB8G") == "error")
+    say(f, "and a character outside the alphabet is refused",
+        decoded45("abc") == "error" and decoded45("~~~") == "error")
+}
+
+fn decoded45(text: str) -> str {
+    match base45.decode(text) {
+        Ok(data) -> return to_hex(data)
+        Err(_why) -> return "error"
+    }
+}
+
+fn main() / {io} {
+    var f = 0
+    check_rational(f)
+    check_bech32(f)
+    check_identifiers(f)
+    check_mnemonic(f)
+    check_base45(f)
+    if f == 0 {
+        print("codes: every claim held")
+    } else {
+        print("codes: {f} claims failed")
+    }
+}

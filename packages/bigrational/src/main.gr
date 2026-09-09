@@ -1,0 +1,275 @@
+// Exact fractions, on integers of any size.
+//
+// `rational` is the same idea on `i64`, and is the right one for a price or
+// a tax rate. This is for the case where the denominators grow: repeatedly
+// adding fractions with coprime denominators multiplies them, and the i64
+// version overflows silently a dozen terms in. Here it does not.
+//
+// `0.1 + 0.2 != 0.3` in every floating-point type there is, because a tenth
+// is not representable in binary. A tax calculation, an invoice split three
+// ways, a probability that has to sum to one, or a unit conversion that has
+// to be reversible all want the answer to be exactly right, and none of
+// them wants to think about how many digits to round to along the way.
+//
+// ## Always in lowest terms
+//
+// Every value here is reduced as it is made, with the sign on the
+// numerator and the denominator kept positive. So equality is comparing two
+// pairs of integers, `2/4` and `1/2` are the same value and print the same,
+// and no sequence of operations lets the denominator grow without bound
+// for no reason.
+//
+// ## What this is not
+//
+// A decimal type. A third has no decimal expansion and this represents it
+// exactly; `decimalnum` represents what a price is written as, which is a
+// different requirement, and rounding between them is the caller's
+// decision rather than a silent one.
+import bigint
+
+type BigRationalError =
+    | DivideByZero()
+    | NotANumber(text: str)
+
+    /// A fraction in lowest terms. The denominator is positive and never zero.
+type BigRational = {
+    numerator: BigInt,
+    denominator: BigInt,
+}
+
+fn one_big() -> BigInt {
+    return bigint.from_i64(1)
+}
+
+/// The greatest common divisor, by Euclid.
+fn gcd(a: BigInt, b: BigInt) -> BigInt {
+    var x = a
+    var y = b
+    if bigint.sign(x) < 0 {
+        x = bigint.negate(x)
+    }
+    if bigint.sign(y) < 0 {
+        y = bigint.negate(y)
+    }
+    while not bigint.is_zero(y) {
+        let next = bigint.rem(x, y) ?? bigint.zero()
+        x = y
+        y = next
+    }
+    return x
+}
+
+/// A fraction, reduced, with the sign moved onto the numerator.
+pub fn make(numerator: BigInt,
+    denominator: BigInt) -> BigRational ! BigRationalError {
+    if bigint.is_zero(denominator) {
+        fail(DivideByZero())
+    }
+    var top = numerator
+    var bottom = denominator
+    if bigint.sign(bottom) < 0 {
+        top = bigint.negate(top)
+        bottom = bigint.negate(bottom)
+    }
+    if bigint.is_zero(top) {
+        return BigRational{ numerator: bigint.zero(), denominator: one_big() }
+    }
+    let divisor = gcd(top, bottom)
+    return BigRational{ numerator: bigint.div(top, divisor) ?? top,
+        denominator: bigint.div(bottom, divisor) ?? bottom }
+}
+
+/// A whole number as a fraction.
+pub fn from_i64(value: i64) -> BigRational {
+    return BigRational{ numerator: bigint.from_i64(value),
+        denominator: one_big() }
+}
+
+pub fn zero() -> BigRational {
+    return from_i64(0)
+}
+
+pub fn one() -> BigRational {
+    return from_i64(1)
+}
+
+/// A fraction from two whole numbers.
+pub fn ratio(numerator: i64,
+    denominator: i64) -> BigRational ! BigRationalError {
+    return try make(bigint.from_i64(numerator),
+        bigint.from_i64(denominator))
+}
+
+pub fn add(a: BigRational, b: BigRational) -> BigRational {
+    let top = bigint.add(bigint.mul(a.numerator, b.denominator),
+        bigint.mul(b.numerator, a.denominator))
+    return make(top, bigint.mul(a.denominator, b.denominator)) ?? zero()
+}
+
+pub fn sub(a: BigRational, b: BigRational) -> BigRational {
+    return add(a, negate(b))
+}
+
+pub fn negate(a: BigRational) -> BigRational {
+    return BigRational{ numerator: bigint.negate(a.numerator),
+        denominator: a.denominator }
+}
+
+pub fn mul(a: BigRational, b: BigRational) -> BigRational {
+    return make(bigint.mul(a.numerator, b.numerator),
+        bigint.mul(a.denominator, b.denominator)) ?? zero()
+}
+
+pub fn div(a: BigRational, b: BigRational) -> BigRational ! BigRationalError {
+    if bigint.is_zero(b.numerator) {
+        fail(DivideByZero())
+    }
+    return try make(bigint.mul(a.numerator, b.denominator),
+        bigint.mul(a.denominator, b.numerator))
+}
+
+/// -1, 0 or 1.
+pub fn compare(a: BigRational, b: BigRational) -> i64 {
+    return bigint.compare(bigint.mul(a.numerator, b.denominator),
+        bigint.mul(b.numerator, a.denominator))
+}
+
+pub fn equal(a: BigRational, b: BigRational) -> bool {
+    return compare(a, b) == 0
+}
+
+pub fn is_whole(a: BigRational) -> bool {
+    return bigint.compare(a.denominator, one_big()) == 0
+}
+
+/// The absolute value.
+pub fn abs(a: BigRational) -> BigRational {
+    if bigint.sign(a.numerator) < 0 {
+        return negate(a)
+    }
+    return a
+}
+
+/// One over the fraction.
+pub fn reciprocal(a: BigRational) -> BigRational ! BigRationalError {
+    if bigint.is_zero(a.numerator) {
+        fail(DivideByZero())
+    }
+    return try make(a.denominator, a.numerator)
+}
+
+/// A whole power, including a negative one.
+pub fn power(a: BigRational, exponent: i64) -> BigRational ! BigRationalError {
+    if exponent == 0 {
+        return one()
+    }
+    if exponent < 0 {
+        return try reciprocal(try power(a, 0 - exponent))
+    }
+    return make(bigint.pow(a.numerator, exponent),
+        bigint.pow(a.denominator, exponent)) ?? zero()
+}
+
+/// The largest whole number no greater than the fraction.
+///
+/// Rounding *down*, not towards zero: `floor(-1/2)` is -1. Integer
+/// division truncates, so the negative case needs the extra step, and
+/// getting it wrong makes a schedule that is a day out only for dates
+/// before the epoch.
+pub fn floor(a: BigRational) -> BigInt {
+    let both = bigint.divmod(a.numerator, a.denominator) ??
+    (bigint.zero(), bigint.zero())
+    if bigint.sign(a.numerator) < 0 and not bigint.is_zero(both.1) {
+        return bigint.sub(both.0, one_big())
+    }
+    return both.0
+}
+
+/// The smallest whole number no less than the fraction.
+pub fn ceil(a: BigRational) -> BigInt {
+    return bigint.negate(floor(negate(a)))
+}
+
+/// The nearest whole number, halves going to the even one.
+///
+/// Half-to-even because half-up is biased: a column of prices rounded
+/// half-up totals more than the same column rounded exactly, and the error
+/// grows with the number of rows.
+pub fn round(a: BigRational) -> BigInt {
+    let low = floor(a)
+    let rest = sub(a, BigRational{ numerator: low, denominator: one_big() })
+    let half = ratio(1, 2) ?? zero()
+    let side = compare(rest, half)
+    if side < 0 {
+        return low
+    }
+    if side > 0 {
+        return bigint.add(low, one_big())
+    }
+    let parity = bigint.rem(low, bigint.from_i64(2)) ?? bigint.zero()
+    if bigint.is_zero(parity) {
+        return low
+    }
+    return bigint.add(low, one_big())
+}
+
+/// `3/4`, or just `3` when the denominator is one.
+pub fn render(a: BigRational) -> str {
+    if is_whole(a) {
+        return bigint.to_str(a.numerator)
+    }
+    return bigint.to_str(a.numerator) + "/" + bigint.to_str(a.denominator)
+}
+
+/// Read `3`, `-3/4` or `3 / 4`.
+pub fn parse(text: str) -> BigRational ! BigRationalError {
+    var top = text
+    var bottom = "1"
+    var i = 0
+    while i < text.len() {
+        if text.substr(i, 1) == "/" {
+            top = text.substr(0, i)
+            bottom = text.substr(i + 1, text.len() - i - 1)
+            i = text.len()
+        } else {
+            i = i + 1
+        }
+    }
+    var numerator = bigint.zero()
+    match bigint.parse(top.trim()) {
+        Ok(value) -> numerator = value
+        Err(_why) -> fail(NotANumber(text))
+    }
+    var denominator = one_big()
+    match bigint.parse(bottom.trim()) {
+        Ok(value) -> denominator = value
+        Err(_why) -> fail(NotANumber(text))
+    }
+    return try make(numerator, denominator)
+}
+
+/// The fraction as a decimal string with a given number of places,
+/// rounded half to even.
+///
+/// A third is `0.333` at three places and `0.3333333333` at ten: the
+/// caller says how much of an infinite expansion it wants, because the
+/// value itself has no opinion.
+pub fn to_decimal(a: BigRational, places: i64) -> str {
+    let scale = bigint.pow(bigint.from_i64(10), places)
+    let scaled = mul(a, BigRational{ numerator: scale,
+        denominator: one_big() })
+    var digits = bigint.to_str(round(scaled))
+    var sign = ""
+    if digits.starts_with("-") {
+        sign = "-"
+        digits = digits.substr(1, digits.len() - 1)
+    }
+    if places <= 0 {
+        return sign + digits
+    }
+    while digits.len() <= places {
+        digits = "0" + digits
+    }
+    return sign + digits.substr(0, digits.len() - places) + "." +
+    digits.substr(digits.len() - places, places)
+}

@@ -1,0 +1,24 @@
+[package]
+name = "codes_demo"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.bigrational]
+path = "../bigrational"
+version = "^1.0.0"
+
+[dependencies.bech32]
+path = "../bech32"
+version = "^1.0.0"
+
+[dependencies.checkdigits]
+path = "../checkdigits"
+version = "^1.0.0"
+
+[dependencies.mnemonic]
+path = "../mnemonic"
+version = "^1.0.0"
+
+[dependencies.base45]
+path = "../base45"
+version = "^1.0.0"

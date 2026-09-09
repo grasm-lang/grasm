@@ -1,0 +1,324 @@
+// Bech32 and Bech32m: an address format built to be read aloud and typed
+// wrong.
+//
+// The alphabet leaves out `1`, `b`, `i` and `o` so nothing looks like
+// anything else, the whole string is one case, and the six-character
+// checksum is a BCH code chosen to *locate* errors rather than only detect
+// them: any single mistake in a string of up to 89 characters can be
+// pointed at, and up to four can be caught. That is a different design
+// goal from a CRC, and it is why the format is used for addresses people
+// copy by hand.
+//
+// ## Two constants, and why there are two
+//
+// Bech32 (BIP-173) has an insertion weakness: a string ending in `p`
+// followed by any number of `q`s has the same checksum. It does not matter
+// for version-0 addresses, whose length is fixed, so those keep the
+// original constant. Everything from version 1 onwards uses Bech32m
+// (BIP-350), with a different constant and no such property. A decoder has
+// to check which one a string used and refuse the wrong pairing, or a
+// Taproot address with a mangled length verifies as valid.
+//
+// ## Case is not decoration
+//
+// A string must be all upper or all lower — mixed case is invalid, not
+// normalised, because the checksum is computed over the lower-case form
+// and a mixed string is evidence of something having been rewritten.
+
+type Bech32Error =
+    | NoSeparator(text: str)
+    | MixedCase(text: str)
+    | BadCharacter(character: str, at: i64)
+    | TooShort(length: i64)
+    | TooLong(length: i64)
+    | BadChecksum()
+    | BadPrefix(prefix: str)
+    | BadPadding()
+    | BadVersion(version: i64)
+    | WrongVariant()
+
+fn charset() -> str {
+    return "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
+}
+
+/// The original checksum constant.
+pub fn bech32_constant() -> i64 {
+    return 1
+}
+
+/// The Bech32m constant, which is the original one with a bit set that no
+/// insertion can reproduce.
+pub fn bech32m_constant() -> i64 {
+    return 734539939
+}
+
+fn polymod(values: [i64]) -> i64 {
+    let generator = [996825010, 642813549, 513874426, 1027748829,
+        705979059]
+    var check = 1
+    for value in values {
+        let top = check.ushr(25)
+        check = check.bit_and(33554431).shl(5).bit_xor(value)
+        var i = 0
+        while i < 5 {
+            if top.ushr(i).bit_and(1) == 1 {
+                check = check.bit_xor(generator[i])
+            }
+            i = i + 1
+        }
+    }
+    return check
+}
+
+fn expand_prefix(prefix: str) -> [i64] {
+    var out: [i64] = []
+    let raw = prefix.to_bytes()
+    var i = 0
+    while i < raw.len() {
+        out.push(raw.at(i).ushr(5))
+        i = i + 1
+    }
+    out.push(0)
+    var j = 0
+    while j < raw.len() {
+        out.push(raw.at(j).bit_and(31))
+        j = j + 1
+    }
+    return out
+}
+
+fn index_of(character: str) -> i64 {
+    var i = 0
+    while i < 32 {
+        if charset().substr(i, 1) == character {
+            return i
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+/// Encode a prefix and a run of five-bit groups.
+pub fn encode(prefix: str, data: [i64],
+    constant: i64) -> str ! Bech32Error {
+    if prefix.len() < 1 {
+        fail(BadPrefix(prefix))
+    }
+    var values = expand_prefix(prefix.to_lower())
+    for value in data {
+        values.push(value)
+    }
+    var i = 0
+    while i < 6 {
+        values.push(0)
+        i = i + 1
+    }
+    let check = polymod(values).bit_xor(constant)
+    var out = prefix.to_lower() + "1"
+    for value in data {
+        out = out + charset().substr(value, 1)
+    }
+    var j = 0
+    while j < 6 {
+        out = out + charset().substr(check.ushr(5 * (5 - j)).bit_and(31), 1)
+        j = j + 1
+    }
+    if out.len() > 90 {
+        fail(TooLong(out.len()))
+    }
+    return out
+}
+
+/// A decoded string: its prefix, its five-bit groups, and which of the two
+/// checksum constants it used.
+type Bech32Parts = {
+    prefix: str,
+    data: [i64],
+    /// `bech32_constant()` or `bech32m_constant()`.
+    constant: i64,
+}
+
+fn is_upper(character: str) -> bool {
+    let byte = character.to_bytes().at(0)
+    return byte >= 65 and byte <= 90
+}
+
+fn is_lower(character: str) -> bool {
+    let byte = character.to_bytes().at(0)
+    return byte >= 97 and byte <= 122
+}
+
+/// Decode, accepting either constant and reporting which one held.
+pub fn decode(text: str) -> Bech32Parts ! Bech32Error {
+    if text.len() > 90 {
+        fail(TooLong(text.len()))
+    }
+    var upper = false
+    var lower = false
+    var i = 0
+    while i < text.len() {
+        let here = text.substr(i, 1)
+        let byte = here.to_bytes().at(0)
+        if byte < 33 or byte > 126 {
+            fail(BadCharacter(here, i))
+        }
+        if is_upper(here) {
+            upper = true
+        }
+        if is_lower(here) {
+            lower = true
+        }
+        i = i + 1
+    }
+    if upper and lower {
+        fail(MixedCase(text))
+    }
+    let flat = text.to_lower()
+    var mark = 0 - 1
+    var j = 0
+    while j < flat.len() {
+        if flat.substr(j, 1) == "1" {
+            mark = j
+        }
+        j = j + 1
+    }
+    if mark < 1 or mark + 7 > flat.len() {
+        fail(NoSeparator(text))
+    }
+    let prefix = flat.substr(0, mark)
+    var data: [i64] = []
+    var k = mark + 1
+    while k < flat.len() {
+        let value = index_of(flat.substr(k, 1))
+        if value < 0 {
+            fail(BadCharacter(flat.substr(k, 1), k))
+        }
+        data.push(value)
+        k = k + 1
+    }
+    var values = expand_prefix(prefix)
+    for value in data {
+        values.push(value)
+    }
+    let check = polymod(values)
+    if check != bech32_constant() and check != bech32m_constant() {
+        fail(BadChecksum())
+    }
+    var payload: [i64] = []
+    var m = 0
+    while m + 6 < data.len() {
+        payload.push(data[m])
+        m = m + 1
+    }
+    return Bech32Parts{ prefix: prefix, data: payload, constant: check }
+}
+
+/// Regroup bits, which is what turns bytes into the five-bit groups the
+/// alphabet encodes and back.
+///
+/// Padding is the fiddly half: going to five bits, a partial group is
+/// padded with zeros; coming back, the leftover bits must be fewer than
+/// eight and all zero, or the string carried information a decoder would
+/// silently drop.
+pub fn regroup(data: [i64], from_bits: i64, to_bits: i64,
+    pad: bool) -> [i64] ! Bech32Error {
+    var accumulator = 0
+    var held = 0
+    var out: [i64] = []
+    let top = 1.shl(to_bits) - 1
+    for value in data {
+        if value < 0 or value >= 1.shl(from_bits) {
+            fail(BadPadding())
+        }
+        accumulator = accumulator.shl(from_bits).bit_or(value)
+        held = held + from_bits
+        while held >= to_bits {
+            held = held - to_bits
+            out.push(accumulator.ushr(held).bit_and(top))
+        }
+    }
+    if pad {
+        if held > 0 {
+            out.push(accumulator.shl(to_bits - held).bit_and(top))
+        }
+    } else if held >= from_bits or
+    accumulator.shl(to_bits - held).bit_and(top) != 0 {
+        fail(BadPadding())
+    }
+    return out
+}
+
+/// A segregated-witness address: a version, and the program bytes.
+type WitnessAddress = {
+    version: i64,
+    program: bytes,
+}
+
+/// Encode a witness address, choosing the constant the version requires.
+pub fn encode_address(prefix: str, version: i64,
+    program: bytes) -> str ! Bech32Error {
+    if version < 0 or version > 16 {
+        fail(BadVersion(version))
+    }
+    if program.len() < 2 or program.len() > 40 {
+        fail(TooShort(program.len()))
+    }
+    if version == 0 and program.len() != 20 and program.len() != 32 {
+        fail(TooShort(program.len()))
+    }
+    var octets: [i64] = []
+    var i = 0
+    while i < program.len() {
+        octets.push(program.at(i))
+        i = i + 1
+    }
+    var data = [version]
+    for value in try regroup(octets, 8, 5, true) {
+        data.push(value)
+    }
+    var constant = bech32m_constant()
+    if version == 0 {
+        constant = bech32_constant()
+    }
+    return try encode(prefix, data, constant)
+}
+
+/// Decode a witness address, refusing the wrong constant for its version.
+pub fn decode_address(prefix: str,
+    text: str) -> WitnessAddress ! Bech32Error {
+    let parts = try decode(text)
+    if parts.prefix != prefix.to_lower() {
+        fail(BadPrefix(parts.prefix))
+    }
+    if parts.data.len() < 1 {
+        fail(TooShort(parts.data.len()))
+    }
+    let version = parts.data[0]
+    if version > 16 {
+        fail(BadVersion(version))
+    }
+    var rest: [i64] = []
+    var i = 1
+    while i < parts.data.len() {
+        rest.push(parts.data[i])
+        i = i + 1
+    }
+    let program = try regroup(rest, 5, 8, false)
+    if program.len() < 2 or program.len() > 40 {
+        fail(TooShort(program.len()))
+    }
+    if version == 0 and program.len() != 20 and program.len() != 32 {
+        fail(TooShort(program.len()))
+    }
+    // The version decides which checksum the string had to use, and a
+    // string that used the other one is refused rather than accepted with
+    // a note.
+    var wanted = bech32m_constant()
+    if version == 0 {
+        wanted = bech32_constant()
+    }
+    if parts.constant != wanted {
+        fail(WrongVariant())
+    }
+    return WitnessAddress{ version: version, program: bytes_of(program) }
+}
