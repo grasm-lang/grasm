@@ -45,6 +45,25 @@ report.
 | `parwords` | multi-core throughput over *text* — the workers share values, not words |
 | `mandelbrot` | a pure float kernel — the workload "N times faster than Python" claims come from |
 
+## What a region costs, measured
+
+`tree` was run again with each round's work inside a `region` — the language's
+own answer to allocation-heavy code, where nothing is reference-counted and the
+whole set is freed at the closing brace. It came out **10% slower**, 50.7 ms
+against 45.6 ms, and its peak resident size was the same 5.2 MB.
+
+Neither half of that is a contradiction of what a region promises. The promise
+is scope — "everything the block allocates is provably unreachable after the
+brace" — and on this program refcounting already frees each round's tree at the
+end of the round, so there was no peak to save. The time went on bookkeeping:
+every allocation inside a region is pushed onto the region's list so the sweep
+can find it, and the sweep then frees the values one at a time exactly as the
+refcount would have.
+
+The implementation that would make a region *fast* is a bump arena — values
+laid down consecutively, the chunk released whole — and that is not what the
+runtime does today. Worth writing down because the opposite is easy to assume.
+
 ## How to read the numbers
 
 Grasm has two backends. `grasm run` is the tree-walking reference interpreter
