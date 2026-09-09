@@ -1,0 +1,223 @@
+// `.pcap` capture files, in both byte orders and both timestamp
+// resolutions.
+//
+// The header begins with a magic number that says which of four files
+// this is:
+//
+//   a1b2c3d4  big-endian, microseconds
+//   d4c3b2a1  little-endian, microseconds
+//   a1b23c4d  big-endian, nanoseconds
+//   4d3cb2a1  little-endian, nanoseconds
+//
+// A reader that assumes the host's byte order reads the packet lengths
+// backwards and either stops at the first packet or tries to allocate two
+// gigabytes. The nanosecond variants differ only in the magic and in what
+// the second timestamp field means, and a reader that ignores that
+// reports every capture as having happened in the first second.
+//
+// ## Captured length and original length are different numbers
+//
+// A capture taken with a snap length holds the first N bytes of each
+// packet and records how long the packet *was*. Code that uses the
+// original length to slice the buffer reads past the end of the file.
+
+type PcapError =
+    | NotAPcap()
+    | Truncated(at: i64)
+
+    /// The file header.
+type PcapHeader = {
+    /// Whether the file is written most-significant byte first.
+    big_endian: bool,
+    /// Whether timestamps carry nanoseconds rather than microseconds.
+    nanoseconds: bool,
+    major: i64,
+    minor: i64,
+    /// The largest packet the capture kept.
+    snap_length: i64,
+    /// The link type: 1 is Ethernet, 101 is raw IP, 113 is Linux cooked.
+    link_type: i64,
+}
+
+/// One packet.
+type PcapPacket = {
+    seconds: i64,
+    /// Micro- or nanoseconds, whichever the file records.
+    fraction: i64,
+    /// What the file holds.
+    captured_length: i64,
+    /// How long the packet was on the wire, which may be more.
+    original_length: i64,
+    data: bytes,
+}
+
+fn word32(data: bytes, at: i64, big_endian: bool) -> i64 {
+    if big_endian {
+        return data.at(at).shl(24).bit_or(data.at(at + 1).shl(16))
+            .bit_or(data.at(at + 2).shl(8)).bit_or(data.at(at + 3))
+    }
+    return data.at(at + 3).shl(24).bit_or(data.at(at + 2).shl(16))
+        .bit_or(data.at(at + 1).shl(8)).bit_or(data.at(at))
+}
+
+fn word16(data: bytes, at: i64, big_endian: bool) -> i64 {
+    if big_endian {
+        return data.at(at).shl(8).bit_or(data.at(at + 1))
+    }
+    return data.at(at + 1).shl(8).bit_or(data.at(at))
+}
+
+/// Read the file header.
+pub fn header(data: bytes) -> PcapHeader ! PcapError {
+    if data.len() < 24 {
+        fail(NotAPcap())
+    }
+    let magic = data.at(0).shl(24).bit_or(data.at(1).shl(16))
+        .bit_or(data.at(2).shl(8)).bit_or(data.at(3))
+    var big_endian = false
+    var nanoseconds = false
+    if magic == 2712847316 {
+        big_endian = true
+    } else if magic == 3569595041 {
+        big_endian = false
+    } else if magic == 2712812621 {
+        big_endian = true
+        nanoseconds = true
+    } else if magic == 1295823521 {
+        big_endian = false
+        nanoseconds = true
+    } else {
+        fail(NotAPcap())
+    }
+    return PcapHeader{ big_endian: big_endian, nanoseconds: nanoseconds,
+        major: word16(data, 4, big_endian),
+        minor: word16(data, 6, big_endian),
+        snap_length: word32(data, 16, big_endian),
+        link_type: word32(data, 20, big_endian) }
+}
+
+/// Read every packet.
+///
+/// A record whose captured length runs past the end of the file is a
+/// truncated capture, which is common — a capture stopped by a signal
+/// ends mid-record — and is reported rather than guessed at.
+pub fn packets(data: bytes) -> [PcapPacket] ! PcapError {
+    let head = try header(data)
+    var out: [PcapPacket] = []
+    var at = 24
+    while at + 16 <= data.len() {
+        let captured = word32(data, at + 8, head.big_endian)
+        let original = word32(data, at + 12, head.big_endian)
+        if captured < 0 or at + 16 + captured > data.len() {
+            fail(Truncated(at))
+        }
+        var body: [i64] = []
+        var i = 0
+        while i < captured {
+            body.push(data.at(at + 16 + i))
+            i = i + 1
+        }
+        out.push(PcapPacket{ seconds: word32(data, at, head.big_endian),
+            fraction: word32(data, at + 4, head.big_endian),
+            captured_length: captured, original_length: original,
+            data: bytes_of(body) })
+        at = at + 16 + captured
+    }
+    if at != data.len() {
+        fail(Truncated(at))
+    }
+    return out
+}
+
+/// A packet's time in milliseconds since the epoch, whichever resolution
+/// the file uses.
+pub fn millis_of(head: PcapHeader, packet: PcapPacket) -> i64 {
+    if head.nanoseconds {
+        return packet.seconds * 1000 + packet.fraction / 1000000
+    }
+    return packet.seconds * 1000 + packet.fraction / 1000
+}
+
+/// Whether a packet was cut short by the capture's snap length.
+pub fn was_truncated(packet: PcapPacket) -> bool {
+    return packet.captured_length < packet.original_length
+}
+
+/// The name of a link type, for the three a tool actually meets.
+pub fn link_name(link_type: i64) -> str {
+    if link_type == 0 {
+        return "null"
+    }
+    if link_type == 1 {
+        return "ethernet"
+    }
+    if link_type == 101 {
+        return "raw"
+    }
+    if link_type == 113 {
+        return "linux-cooked"
+    }
+    if link_type == 228 {
+        return "ipv4"
+    }
+    if link_type == 229 {
+        return "ipv6"
+    }
+    return "{link_type}"
+}
+
+fn put32(inout out: [i64], value: i64, big_endian: bool) {
+    if big_endian {
+        out.push(value.ushr(24).bit_and(255))
+        out.push(value.ushr(16).bit_and(255))
+        out.push(value.ushr(8).bit_and(255))
+        out.push(value.bit_and(255))
+    } else {
+        out.push(value.bit_and(255))
+        out.push(value.ushr(8).bit_and(255))
+        out.push(value.ushr(16).bit_and(255))
+        out.push(value.ushr(24).bit_and(255))
+    }
+}
+
+fn put16(inout out: [i64], value: i64, big_endian: bool) {
+    if big_endian {
+        out.push(value.ushr(8).bit_and(255))
+        out.push(value.bit_and(255))
+    } else {
+        out.push(value.bit_and(255))
+        out.push(value.ushr(8).bit_and(255))
+    }
+}
+
+/// Write a capture file.
+pub fn render(head: PcapHeader, list: [PcapPacket]) -> bytes {
+    var out: [i64] = []
+    // The magic is one number, written in the file's own byte order —
+    // which is what makes it a byte-order mark. Writing a different
+    // number for each order, as the four constants above might suggest,
+    // produces a file whose magic is the mirror of what it should be.
+    var magic = 2712847316
+    if head.nanoseconds {
+        magic = 2712812621
+    }
+    put32(out, magic, head.big_endian)
+    put16(out, head.major, head.big_endian)
+    put16(out, head.minor, head.big_endian)
+    put32(out, 0, head.big_endian)
+    put32(out, 0, head.big_endian)
+    put32(out, head.snap_length, head.big_endian)
+    put32(out, head.link_type, head.big_endian)
+    for packet in list {
+        put32(out, packet.seconds, head.big_endian)
+        put32(out, packet.fraction, head.big_endian)
+        put32(out, packet.data.len(), head.big_endian)
+        put32(out, packet.original_length, head.big_endian)
+        var i = 0
+        while i < packet.data.len() {
+            out.push(packet.data.at(i))
+            i = i + 1
+        }
+    }
+    return bytes_of(out)
+}

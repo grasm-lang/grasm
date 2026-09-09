@@ -1,0 +1,434 @@
+// IPv6 addresses: reading them, and writing the one spelling everything
+// else expects.
+//
+// `ipaddr` is IPv4 and says so. An IPv6 address does not fit in a 64-bit
+// integer, so it is kept here as two halves — and the arithmetic that
+// needs both is written out rather than hoped for.
+//
+// ## One address, many spellings
+//
+//   2001:0db8:0000:0000:0000:0000:0000:0001
+//   2001:db8:0:0:0:0:0:1
+//   2001:db8::1
+//   2001:DB8::1
+//
+// are one address, and RFC 5952 says the last-but-one is the form to
+// write: lower case, no leading zeros, and `::` replacing the *longest*
+// run of zero groups — the first of them when two runs tie, and never a
+// run of only one group. A log file, an allow-list and a certificate that
+// spell the same address differently do not match, and every one of those
+// comparisons is textual somewhere.
+//
+// ## The embedded IPv4 form is not decoration
+//
+// `::ffff:192.0.2.1` is how an IPv4 address appears on a dual-stack
+// socket. A server that logs the text and compares it against an IPv4
+// allow-list never matches, which is a firewall that quietly does
+// nothing.
+
+type Ip6Error =
+    | NotAnAddress(text: str)
+    | BadPrefix(bits: i64)
+
+    /// An address, as two 64-bit halves.
+type Ip6 = {
+    high: i64,
+    low: i64,
+}
+
+/// A block of addresses.
+type Ip6Cidr = {
+    base: Ip6,
+    bits: i64,
+}
+
+fn hex_value(character: str) -> i64 {
+    let byte = character.to_bytes().at(0)
+    if byte >= 48 and byte <= 57 {
+        return byte - 48
+    }
+    if byte >= 97 and byte <= 102 {
+        return byte - 87
+    }
+    if byte >= 65 and byte <= 70 {
+        return byte - 55
+    }
+    return 0 - 1
+}
+
+fn groups_to_address(groups: [i64]) -> Ip6 {
+    var high = 0
+    var low = 0
+    var i = 0
+    while i < 4 {
+        high = high.shl(16).bit_or(groups[i])
+        i = i + 1
+    }
+    while i < 8 {
+        low = low.shl(16).bit_or(groups[i])
+        i = i + 1
+    }
+    return Ip6{ high: high, low: low }
+}
+
+/// The eight sixteen-bit groups of an address.
+pub fn groups_of(address: Ip6) -> [i64] {
+    var out: [i64] = []
+    var i = 3
+    while i >= 0 {
+        out.push(address.high.ushr(i * 16).bit_and(65535))
+        i = i - 1
+    }
+    var j = 3
+    while j >= 0 {
+        out.push(address.low.ushr(j * 16).bit_and(65535))
+        j = j - 1
+    }
+    return out
+}
+
+fn parse_ipv4_tail(text: str) -> [i64] ! Ip6Error {
+    var parts: [i64] = []
+    for piece in text.split(".") {
+        if piece.len() == 0 or piece.len() > 3 {
+            fail(NotAnAddress(text))
+        }
+        var value = 0
+        var i = 0
+        while i < piece.len() {
+            let byte = piece.to_bytes().at(i)
+            if byte < 48 or byte > 57 {
+                fail(NotAnAddress(text))
+            }
+            value = value * 10 + (byte - 48)
+            i = i + 1
+        }
+        if value > 255 or (piece.len() > 1 and piece.starts_with("0")) {
+            fail(NotAnAddress(text))
+        }
+        parts.push(value)
+    }
+    if parts.len() != 4 {
+        fail(NotAnAddress(text))
+    }
+    return [parts[0] * 256 + parts[1], parts[2] * 256 + parts[3]]
+}
+
+/// Read an address. A zone identifier — `fe80::1%eth0` — is accepted and
+/// dropped, since it names an interface rather than part of the address.
+pub fn parse(text: str) -> Ip6 ! Ip6Error {
+    var body = text.trim()
+    var i = 0
+    while i < body.len() {
+        if body.substr(i, 1) == "%" {
+            body = body.substr(0, i)
+            i = body.len()
+        } else {
+            i = i + 1
+        }
+    }
+    if body.len() == 0 {
+        fail(NotAnAddress(text))
+    }
+    // The `::` may appear once, and stands for one or more zero groups.
+    var gap = 0 - 1
+    var j = 0
+    while j + 1 < body.len() {
+        if body.substr(j, 2) == "::" {
+            if gap >= 0 {
+                fail(NotAnAddress(text))
+            }
+            gap = j
+            j = j + 2
+        } else {
+            j = j + 1
+        }
+    }
+    var head: [i64] = []
+    var tail: [i64] = []
+    if gap < 0 {
+        head = try read_groups(body, text)
+        if head.len() != 8 {
+            fail(NotAnAddress(text))
+        }
+        return groups_to_address(head)
+    }
+    let before = body.substr(0, gap)
+    let after = body.substr(gap + 2, body.len() - gap - 2)
+    if before.len() > 0 {
+        head = try read_groups(before, text)
+    }
+    if after.len() > 0 {
+        tail = try read_groups(after, text)
+    }
+    if head.len() + tail.len() > 7 {
+        fail(NotAnAddress(text))
+    }
+    var groups: [i64] = []
+    for value in head {
+        groups.push(value)
+    }
+    var fill = 8 - head.len() - tail.len()
+    while fill > 0 {
+        groups.push(0)
+        fill = fill - 1
+    }
+    for value in tail {
+        groups.push(value)
+    }
+    return groups_to_address(groups)
+}
+
+/// A run of colon-separated groups, the last of which may be an IPv4
+/// address.
+fn read_groups(text: str, original: str) -> [i64] ! Ip6Error {
+    var out: [i64] = []
+    let pieces = text.split(":")
+    var i = 0
+    while i < pieces.len() {
+        let piece = pieces[i]
+        if piece.len() == 0 {
+            fail(NotAnAddress(original))
+        }
+        var dotted = false
+        var k = 0
+        while k < piece.len() {
+            if piece.substr(k, 1) == "." {
+                dotted = true
+            }
+            k = k + 1
+        }
+        if dotted {
+            if i + 1 != pieces.len() {
+                fail(NotAnAddress(original))
+            }
+            for value in try parse_ipv4_tail(piece) {
+                out.push(value)
+            }
+            return out
+        }
+        if piece.len() > 4 {
+            fail(NotAnAddress(original))
+        }
+        var value = 0
+        var j = 0
+        while j < piece.len() {
+            let digit = hex_value(piece.substr(j, 1))
+            if digit < 0 {
+                fail(NotAnAddress(original))
+            }
+            value = value * 16 + digit
+            j = j + 1
+        }
+        out.push(value)
+        i = i + 1
+    }
+    return out
+}
+
+fn hex_group(value: i64) -> str {
+    if value == 0 {
+        return "0"
+    }
+    let digits = "0123456789abcdef"
+    var out = ""
+    var started = false
+    var i = 3
+    while i >= 0 {
+        let nibble = value.ushr(i * 4).bit_and(15)
+        if nibble != 0 or started {
+            out = out + digits.substr(nibble, 1)
+            started = true
+        }
+        i = i - 1
+    }
+    return out
+}
+
+/// The canonical text of RFC 5952.
+///
+/// Lower case, no leading zeros, and `::` over the longest run of zero
+/// groups — the *first* such run when two are equal, and never a run of
+/// one, because `2001:db8:0:1::1` is not shorter than writing the zero.
+pub fn render(address: Ip6) -> str {
+    // RFC 5952 section 5: an IPv4-mapped address is written in the mixed
+    // form, because that is the form a person reading a log recognises as
+    // the IPv4 address it carries.
+    if is_ipv4_mapped(address) {
+        return "::ffff:" + ipv4_text(ipv4_of(address))
+    }
+    let groups = groups_of(address)
+    var best_at = 0 - 1
+    var best_len = 0
+    var run_at = 0 - 1
+    var run_len = 0
+    var i = 0
+    while i < 8 {
+        if groups[i] == 0 {
+            if run_at < 0 {
+                run_at = i
+                run_len = 0
+            }
+            run_len = run_len + 1
+            if run_len > best_len {
+                best_len = run_len
+                best_at = run_at
+            }
+        } else {
+            run_at = 0 - 1
+            run_len = 0
+        }
+        i = i + 1
+    }
+    if best_len < 2 {
+        best_at = 0 - 1
+    }
+    var out = ""
+    var j = 0
+    while j < 8 {
+        if j == best_at {
+            out = out + "::"
+            j = j + best_len
+            continue
+        }
+        if out.len() > 0 and not out.ends_with(":") {
+            out = out + ":"
+        }
+        out = out + hex_group(groups[j])
+        j = j + 1
+    }
+    if out.len() == 0 {
+        return "::"
+    }
+    return out
+}
+
+/// An IPv4 address in the dotted form.
+fn ipv4_text(value: i64) -> str {
+    return "{value.ushr(24).bit_and(255)}.{value.ushr(16).bit_and(255)}" +
+    ".{value.ushr(8).bit_and(255)}.{value.bit_and(255)}"
+}
+
+/// -1, 0 or 1.
+pub fn compare(a: Ip6, b: Ip6) -> i64 {
+    if a.high != b.high {
+        return if less_unsigned(a.high, b.high) { 0 - 1 } else { 1 }
+    }
+    if a.low != b.low {
+        return if less_unsigned(a.low, b.low) { 0 - 1 } else { 1 }
+    }
+    return 0
+}
+
+/// Unsigned comparison of two 64-bit halves.
+///
+/// The halves hold the top bit of a 128-bit number, so a signed
+/// comparison puts `ffff::` below `::` — which would make every address
+/// above `8000::` sort first.
+fn less_unsigned(a: i64, b: i64) -> bool {
+    if (a < 0) != (b < 0) {
+        return b < 0
+    }
+    return a < b
+}
+
+/// The mask of a prefix length, as two halves.
+fn mask_of(bits: i64) -> Ip6 {
+    if bits <= 0 {
+        return Ip6{ high: 0, low: 0 }
+    }
+    if bits >= 128 {
+        return Ip6{ high: 0 - 1, low: 0 - 1 }
+    }
+    if bits <= 64 {
+        var high = 0 - 1
+        if bits < 64 {
+            high = (0 - 1).shl(64 - bits)
+        }
+        return Ip6{ high: high, low: 0 }
+    }
+    var low = 0 - 1
+    if bits < 128 {
+        low = (0 - 1).shl(128 - bits)
+    }
+    return Ip6{ high: 0 - 1, low: low }
+}
+
+/// Read `2001:db8::/32`.
+pub fn parse_cidr(text: str) -> Ip6Cidr ! Ip6Error {
+    var body = text.trim()
+    var bits = 128
+    var i = 0
+    while i < body.len() {
+        if body.substr(i, 1) == "/" {
+            match body.substr(i + 1, body.len() - i - 1).parse_int() {
+                Some(value) -> bits = value
+                None -> fail(NotAnAddress(text))
+            }
+            body = body.substr(0, i)
+            i = body.len()
+        } else {
+            i = i + 1
+        }
+    }
+    if bits < 0 or bits > 128 {
+        fail(BadPrefix(bits))
+    }
+    let address = try parse(body)
+    let mask = mask_of(bits)
+    return Ip6Cidr{ base: Ip6{ high: address.high.bit_and(mask.high),
+        low: address.low.bit_and(mask.low) }, bits: bits }
+}
+
+/// Whether a block holds an address.
+pub fn holds(block: Ip6Cidr, address: Ip6) -> bool {
+    let mask = mask_of(block.bits)
+    return address.high.bit_and(mask.high) == block.base.high and
+    address.low.bit_and(mask.low) == block.base.low
+}
+
+/// The last address of a block.
+pub fn last_of(block: Ip6Cidr) -> Ip6 {
+    let mask = mask_of(block.bits)
+    return Ip6{ high: block.base.high.bit_or(mask.high.bit_xor(0 - 1)),
+        low: block.base.low.bit_or(mask.low.bit_xor(0 - 1)) }
+}
+
+/// A block written out.
+pub fn render_cidr(block: Ip6Cidr) -> str {
+    return render(block.base) + "/{block.bits}"
+}
+
+/// Whether an address is the IPv4-mapped form, `::ffff:a.b.c.d`.
+pub fn is_ipv4_mapped(address: Ip6) -> bool {
+    return address.high == 0 and address.low.ushr(32) == 65535
+}
+
+/// The IPv4 address inside a mapped one, as the integer `ipaddr` uses.
+pub fn ipv4_of(address: Ip6) -> i64 {
+    return address.low.bit_and(4294967295)
+}
+
+/// The mapped form of an IPv4 address.
+pub fn from_ipv4(value: i64) -> Ip6 {
+    return Ip6{ high: 0,
+        low: 65535.shl(32).bit_or(value.bit_and(4294967295)) }
+}
+
+/// Whether an address is in one of the ranges a public network will not
+/// route: the loopback, the unspecified address, link-local and the
+/// unique-local block.
+pub fn is_private(address: Ip6) -> bool {
+    if address.high == 0 and address.low == 0 {
+        return true
+    }
+    if address.high == 0 and address.low == 1 {
+        return true
+    }
+    // fe80::/10, the link-local block: the top ten bits.
+    if address.high.ushr(54) == 1018 {
+        return true
+    }
+    // fc00::/7, the unique-local block: the top seven.
+    return address.high.ushr(57) == 126
+}

@@ -1,0 +1,16 @@
+[package]
+name = "network_demo"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.ipv6]
+path = "../ipv6"
+version = "^1.0.0"
+
+[dependencies.packets]
+path = "../packets"
+version = "^1.0.0"
+
+[dependencies.pcapfile]
+path = "../pcapfile"
+version = "^1.0.0"

@@ -1,0 +1,8 @@
+[package]
+name = "v6test"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.ipv6]
+path = "../ipv6"
+version = "^1.0.0"

@@ -1,0 +1,385 @@
+// The headers on a packet: Ethernet, IPv4, IPv6, TCP, UDP and ICMP.
+//
+// What a capture file holds, what a firewall matches on, and what a
+// network tool has to read before it can say anything at all. The formats
+// are fixed and old and the mistakes in reading them are always the same
+// three:
+//
+//   - **The IPv4 header is variable length.** The low nibble of the first
+//     byte is its length in 32-bit words, and it is 5 in the overwhelming
+//     majority of packets — so code that assumes twenty bytes works
+//     until it meets a packet with options, and then reads the payload
+//     four bytes late for the rest of the connection.
+//   - **The TCP header is variable length too**, for the same reason, and
+//     the options are where the window scale lives.
+//   - **The checksum covers a pseudo-header.** A TCP or UDP checksum is
+//     computed over the addresses and the protocol number as well as the
+//     segment, so verifying it needs the IP header that carried it. A
+//     checker that leaves the pseudo-header out declares every packet
+//     corrupt.
+//
+// ## Lengths are what the wire says, not what arrived
+//
+// A truncated capture has a header claiming more than the bytes present.
+// Every reader here checks before it indexes, and answers with an error
+// rather than reading whatever follows in the buffer.
+import ipv6
+
+type PacketError =
+    | TooShort(what: str, needed: i64, found: i64)
+    | BadVersion(found: i64)
+
+    /// An Ethernet II frame.
+type EthernetFrame = {
+    /// Six bytes each, as they appear on the wire.
+    destination: bytes,
+    source: bytes,
+    /// The type of the payload; the VLAN tag, if any, is already removed.
+    ether_type: i64,
+    /// -1 when the frame carried no 802.1Q tag.
+    vlan: i64,
+    payload: bytes,
+}
+
+/// An IPv4 header.
+type Ipv4Header = {
+    length_words: i64,
+    dscp: i64,
+    ecn: i64,
+    total_length: i64,
+    identification: i64,
+    /// The don't-fragment and more-fragments flags.
+    dont_fragment: bool,
+    more_fragments: bool,
+    fragment_offset: i64,
+    ttl: i64,
+    protocol: i64,
+    checksum: i64,
+    source: i64,
+    destination: i64,
+    options: bytes,
+    payload: bytes,
+}
+
+/// An IPv6 header.
+type Ipv6Header = {
+    traffic_class: i64,
+    flow_label: i64,
+    payload_length: i64,
+    next_header: i64,
+    hop_limit: i64,
+    source: Ip6,
+    destination: Ip6,
+    payload: bytes,
+}
+
+/// A TCP header.
+type TcpHeader = {
+    source_port: i64,
+    destination_port: i64,
+    sequence: i64,
+    acknowledgement: i64,
+    length_words: i64,
+    flags: i64,
+    window: i64,
+    checksum: i64,
+    urgent: i64,
+    options: bytes,
+    payload: bytes,
+}
+
+/// A UDP header.
+type UdpHeader = {
+    source_port: i64,
+    destination_port: i64,
+    length: i64,
+    checksum: i64,
+    payload: bytes,
+}
+
+fn need(data: bytes, count: i64, what: str) -> bool ! PacketError {
+    if data.len() < count {
+        fail(TooShort(what, count, data.len()))
+    }
+    return true
+}
+
+fn slice(data: bytes, from: i64, count: i64) -> bytes {
+    var out: [i64] = []
+    var i = 0
+    while i < count and from + i < data.len() {
+        out.push(data.at(from + i))
+        i = i + 1
+    }
+    return bytes_of(out)
+}
+
+fn word16(data: bytes, at: i64) -> i64 {
+    return data.at(at).shl(8).bit_or(data.at(at + 1))
+}
+
+fn word32(data: bytes, at: i64) -> i64 {
+    return data.at(at).shl(24).bit_or(data.at(at + 1).shl(16))
+        .bit_or(data.at(at + 2).shl(8)).bit_or(data.at(at + 3))
+}
+
+/// Read an Ethernet II frame, removing a VLAN tag if there is one.
+pub fn ethernet(data: bytes) -> EthernetFrame ! PacketError {
+    try need(data, 14, "an Ethernet header")
+    var ether_type = word16(data, 12)
+    var at = 14
+    var vlan = 0 - 1
+    if ether_type == 33024 {
+        try need(data, 18, "an 802.1Q tag")
+        vlan = word16(data, 14).bit_and(4095)
+        ether_type = word16(data, 16)
+        at = 18
+    }
+    return EthernetFrame{ destination: slice(data, 0, 6),
+        source: slice(data, 6, 6), ether_type: ether_type, vlan: vlan,
+        payload: slice(data, at, data.len() - at) }
+}
+
+/// Read an IPv4 header.
+pub fn ipv4(data: bytes) -> Ipv4Header ! PacketError {
+    try need(data, 20, "an IPv4 header")
+    let version = data.at(0).ushr(4)
+    if version != 4 {
+        fail(BadVersion(version))
+    }
+    let words = data.at(0).bit_and(15)
+    if words < 5 {
+        fail(BadVersion(words))
+    }
+    let header_length = words * 4
+    try need(data, header_length, "an IPv4 header with its options")
+    let flags = data.at(6).ushr(5)
+    let total = word16(data, 2)
+    var payload_length = total - header_length
+    if payload_length < 0 or header_length + payload_length > data.len() {
+        // A capture may be cut short, and a length longer than what
+        // arrived is the truncation rather than a lie: take what is here.
+        payload_length = data.len() - header_length
+    }
+    return Ipv4Header{ length_words: words, dscp: data.at(1).ushr(2),
+        ecn: data.at(1).bit_and(3), total_length: total,
+        identification: word16(data, 4),
+        dont_fragment: flags.bit_and(2) == 2,
+        more_fragments: flags.bit_and(1) == 1,
+        fragment_offset: word16(data, 6).bit_and(8191) * 8,
+        ttl: data.at(8), protocol: data.at(9),
+        checksum: word16(data, 10), source: word32(data, 12),
+        destination: word32(data, 16),
+        options: slice(data, 20, header_length - 20),
+        payload: slice(data, header_length, payload_length) }
+}
+
+/// Read an IPv6 header. Extension headers are left in the payload, since
+/// which of them are present is the next header's business.
+pub fn ipv6_header(data: bytes) -> Ipv6Header ! PacketError {
+    try need(data, 40, "an IPv6 header")
+    let version = data.at(0).ushr(4)
+    if version != 6 {
+        fail(BadVersion(version))
+    }
+    let length = word16(data, 4)
+    var payload_length = length
+    if 40 + payload_length > data.len() {
+        payload_length = data.len() - 40
+    }
+    return Ipv6Header{
+        traffic_class: data.at(0).bit_and(15).shl(4)
+            .bit_or(data.at(1).ushr(4)),
+        flow_label: data.at(1).bit_and(15).shl(16)
+            .bit_or(word16(data, 2)),
+        payload_length: length, next_header: data.at(6),
+        hop_limit: data.at(7),
+        source: address_at(data, 8), destination: address_at(data, 24),
+        payload: slice(data, 40, payload_length) }
+}
+
+fn address_at(data: bytes, at: i64) -> Ip6 {
+    var high = 0
+    var low = 0
+    var i = 0
+    while i < 8 {
+        high = high.shl(8).bit_or(data.at(at + i))
+        i = i + 1
+    }
+    while i < 16 {
+        low = low.shl(8).bit_or(data.at(at + i))
+        i = i + 1
+    }
+    return Ip6{ high: high, low: low }
+}
+
+/// Read a TCP header.
+pub fn tcp(data: bytes) -> TcpHeader ! PacketError {
+    try need(data, 20, "a TCP header")
+    let words = data.at(12).ushr(4)
+    if words < 5 {
+        fail(BadVersion(words))
+    }
+    let header_length = words * 4
+    try need(data, header_length, "a TCP header with its options")
+    return TcpHeader{ source_port: word16(data, 0),
+        destination_port: word16(data, 2), sequence: word32(data, 4),
+        acknowledgement: word32(data, 8), length_words: words,
+        flags: data.at(13), window: word16(data, 14),
+        checksum: word16(data, 16), urgent: word16(data, 18),
+        options: slice(data, 20, header_length - 20),
+        payload: slice(data, header_length,
+            data.len() - header_length) }
+}
+
+/// Read a UDP header.
+pub fn udp(data: bytes) -> UdpHeader ! PacketError {
+    try need(data, 8, "a UDP header")
+    let length = word16(data, 0 + 4)
+    var payload_length = length - 8
+    if payload_length < 0 or 8 + payload_length > data.len() {
+        payload_length = data.len() - 8
+    }
+    return UdpHeader{ source_port: word16(data, 0),
+        destination_port: word16(data, 2), length: length,
+        checksum: word16(data, 6),
+        payload: slice(data, 8, payload_length) }
+}
+
+/// The names of the TCP flags a header carries, in the usual order.
+pub fn tcp_flag_names(flags: i64) -> [str] {
+    var out: [str] = []
+    let names = ["FIN", "SYN", "RST", "PSH", "ACK", "URG", "ECE", "CWR"]
+    var i = 0
+    while i < 8 {
+        if flags.ushr(i).bit_and(1) == 1 {
+            out.push(names[i])
+        }
+        i = i + 1
+    }
+    return out
+}
+
+/// The internet checksum: the one's-complement sum of sixteen-bit words,
+/// complemented.
+///
+/// An odd-length buffer is padded with a zero byte, which is part of the
+/// definition and not an implementation choice.
+pub fn checksum(data: bytes) -> i64 {
+    var total = 0
+    var i = 0
+    while i + 1 < data.len() {
+        total = total + word16(data, i)
+        i = i + 2
+    }
+    if i < data.len() {
+        total = total + data.at(i).shl(8)
+    }
+    while total.ushr(16) != 0 {
+        total = total.bit_and(65535) + total.ushr(16)
+    }
+    return total.bit_xor(65535).bit_and(65535)
+}
+
+/// Whether an IPv4 header's own checksum holds.
+///
+/// The field is zeroed before summing, which is what makes the check work
+/// and is the step most easily forgotten.
+pub fn ipv4_checksum_holds(data: bytes) -> bool {
+    if data.len() < 20 {
+        return false
+    }
+    let words = data.at(0).bit_and(15) * 4
+    if data.len() < words {
+        return false
+    }
+    var out: [i64] = []
+    var i = 0
+    while i < words {
+        if i == 10 or i == 11 {
+            out.push(0)
+        } else {
+            out.push(data.at(i))
+        }
+        i = i + 1
+    }
+    return checksum(bytes_of(out)) == word16(data, 10)
+}
+
+/// The pseudo-header a TCP or UDP checksum covers, for IPv4.
+///
+/// Twelve bytes: the two addresses, a zero, the protocol number and the
+/// length of what follows. Leaving it out is why a hand-written checker
+/// declares every packet corrupt.
+pub fn ipv4_pseudo_header(source: i64, destination: i64, protocol: i64,
+    length: i64) -> bytes {
+    var out: [i64] = []
+    var i = 3
+    while i >= 0 {
+        out.push(source.ushr(i * 8).bit_and(255))
+        i = i - 1
+    }
+    var j = 3
+    while j >= 0 {
+        out.push(destination.ushr(j * 8).bit_and(255))
+        j = j - 1
+    }
+    out.push(0)
+    out.push(protocol)
+    out.push(length.ushr(8).bit_and(255))
+    out.push(length.bit_and(255))
+    return bytes_of(out)
+}
+
+/// The name of an IP protocol number, for the ones a tool actually meets.
+pub fn protocol_name(number: i64) -> str {
+    if number == 1 {
+        return "ICMP"
+    }
+    if number == 2 {
+        return "IGMP"
+    }
+    if number == 6 {
+        return "TCP"
+    }
+    if number == 17 {
+        return "UDP"
+    }
+    if number == 41 {
+        return "IPv6"
+    }
+    if number == 47 {
+        return "GRE"
+    }
+    if number == 50 {
+        return "ESP"
+    }
+    if number == 58 {
+        return "ICMPv6"
+    }
+    if number == 132 {
+        return "SCTP"
+    }
+    return "{number}"
+}
+
+/// A MAC address written the way every tool prints one.
+pub fn mac_text(address: bytes) -> str {
+    let digits = "0123456789abcdef"
+    var out = ""
+    var i = 0
+    while i < address.len() {
+        if i > 0 {
+            out = out + ":"
+        }
+        out = out + digits.substr(address.at(i) / 16, 1) +
+        digits.substr(address.at(i) % 16, 1)
+        i = i + 1
+    }
+    return out
+}
+
+/// The address of an IPv6 header, as text.
+pub fn ipv6_text(address: Ip6) -> str {
+    return ipv6.render(address)
+}

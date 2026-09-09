@@ -1,0 +1,27 @@
+import ipv6
+
+fn main() / {io} {
+    var i = 0
+    while i + 1 < args().len() {
+        let what = args()[i]
+        let value = args()[i + 1]
+        if what == "render" {
+            match ipv6.parse(value) {
+                Ok(address) -> print(ipv6.render(address))
+                Err(_why) -> print("error")
+            }
+        } else if what == "cidr" {
+            match ipv6.parse_cidr(value) {
+                Ok(block) -> print(ipv6.render_cidr(block) + " " +
+                    ipv6.render(ipv6.last_of(block)))
+                Err(_why) -> print("error")
+            }
+        } else {
+            match ipv6.parse(value) {
+                Ok(address) -> print("{ipv6.is_private(address)}")
+                Err(_why) -> print("error")
+            }
+        }
+        i = i + 2
+    }
+}

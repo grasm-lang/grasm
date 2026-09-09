@@ -1,0 +1,229 @@
+// An address that does not fit in a word, the headers on a packet, and
+// the file a capture is kept in.
+//
+// The address claims were checked against Python's `ipaddress` and the
+// packet ones against `dpkt`.
+import ipv6
+import packets
+import pcapfile
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn from_hex(text: str) -> bytes {
+    var out: [i64] = []
+    var i = 0
+    while i + 1 < text.len() {
+        out.push(text.substr(i, 2).parse_int_base(16) ?? 0)
+        i = i + 2
+    }
+    return bytes_of(out)
+}
+
+fn to_hex(data: bytes) -> str {
+    let digits = "0123456789abcdef"
+    var out = ""
+    var i = 0
+    while i < data.len() {
+        out = out + digits.substr(data.at(i) / 16, 1) +
+        digits.substr(data.at(i) % 16, 1)
+        i = i + 1
+    }
+    return out
+}
+
+// ------------------------------------------------------------------ ipv6
+
+fn shown(text: str) -> str {
+    match ipv6.parse(text) {
+        Ok(address) -> return ipv6.render(address)
+        Err(_why) -> return "<error>"
+    }
+}
+
+fn check_addresses(inout f: i64) / {io} {
+    print("-- ipv6: one address, and the one spelling to write it in")
+    say(f, "four spellings of one address come back as one",
+        shown("2001:0db8:0000:0000:0000:0000:0000:0001") == "2001:db8::1"
+        and shown("2001:db8:0:0:0:0:0:1") == "2001:db8::1" and
+        shown("2001:DB8::1") == "2001:db8::1" and
+        shown("2001:db8::1") == "2001:db8::1")
+    say(f, "the double colon covers the longest run of zeros",
+        shown("2001:0:0:1:0:0:0:1") == "2001:0:0:1::1")
+    say(f, "and never a run of only one, which would not be shorter",
+        shown("2001:db8:0:1:1:1:1:1") == "2001:db8:0:1:1:1:1:1")
+    say(f, "the unspecified address and the loopback",
+        shown("::") == "::" and shown("::1") == "::1")
+    say(f, "an embedded IPv4 address is read and written as one number",
+        ipv6.is_ipv4_mapped(ipv6.parse("::ffff:192.0.2.1") ?? zero()) and
+        ipv6.ipv4_of(ipv6.parse("::ffff:192.0.2.1") ?? zero()) ==
+        3221225985)
+    say(f, "a zone identifier names an interface and not the address",
+        shown("fe80::1%eth0") == "fe80::1")
+    say(f, "a malformed address is refused rather than half-read",
+        shown("2001:db8::1::2") == "<error>" and
+        shown("2001:db8:::1") == "<error>" and
+        shown("12345::") == "<error>" and shown("") == "<error>")
+    say(f, "comparison is unsigned, so the top half of the space sorts" +
+        " above the bottom",
+        ipv6.compare(ipv6.parse("ffff::") ?? zero(),
+            ipv6.parse("::1") ?? zero()) > 0)
+    let block = ipv6.parse_cidr("2001:db8::/32") ??
+    Ip6Cidr{ base: zero(), bits: 0 }
+    say(f, "a block holds what is inside it and not what is beside it",
+        ipv6.holds(block, ipv6.parse("2001:db8:1234::1") ?? zero()) and
+        not ipv6.holds(block, ipv6.parse("2001:db9::1") ?? zero()))
+    say(f, "and a block's last address is the one before the next block",
+        ipv6.render(ipv6.last_of(block)) ==
+        "2001:db8:ffff:ffff:ffff:ffff:ffff:ffff")
+    say(f, "the ranges a public network will not route are known",
+        ipv6.is_private(ipv6.parse("::1") ?? zero()) and
+        ipv6.is_private(ipv6.parse("fe80::1") ?? zero()) and
+        ipv6.is_private(ipv6.parse("fd00::1") ?? zero()) and
+        not ipv6.is_private(ipv6.parse("2001:db8::1") ?? zero()))
+}
+
+fn zero() -> Ip6 {
+    return Ip6{ high: 0, low: 0 }
+}
+
+// --------------------------------------------------------------- packets
+
+fn check_packets(inout f: i64) / {io} {
+    print("-- packets: the header length is in the header")
+    // An Ethernet frame carrying IPv4 carrying TCP, with IP options.
+    let frame = from_hex("aabbccddeeff112233445566" + "0800" +
+        "46" + "00" + "0034" + "abcd" + "4000" + "40" + "06" + "0000" +
+        "c0000201" + "c0000202" + "00000000" +
+        "01bb" + "d431" + "11223344" + "55667788" + "5018" + "faf0" +
+        "0000" + "0000" + "68656c6c6f")
+    let ethernet = packets.ethernet(frame) ?? no_frame()
+    say(f, "the addresses and the type of an Ethernet frame",
+        packets.mac_text(ethernet.destination) ==
+        "aa:bb:cc:dd:ee:ff" and ethernet.ether_type == 2048 and
+        ethernet.vlan == 0 - 1)
+    let ip = packets.ipv4(ethernet.payload) ?? no_ipv4()
+    say(f, "an IPv4 header with options is longer than twenty bytes",
+        ip.length_words == 6 and ip.options.len() == 4 and
+        ip.protocol == 6 and packets.protocol_name(ip.protocol) == "TCP")
+    say(f, "the don't-fragment flag is read from the right bit",
+        ip.dont_fragment and not ip.more_fragments and
+        ip.fragment_offset == 0)
+    say(f, "and the payload starts after the options, not after twenty",
+        ip.payload.len() == 25)
+    let segment = packets.tcp(ip.payload) ?? no_tcp()
+    say(f, "the ports, and the flags by name",
+        segment.source_port == 443 and segment.destination_port == 54321
+        and packets.tcp_flag_names(segment.flags) == ["PSH", "ACK"])
+    say(f, "and the segment's own payload",
+        segment.payload.len() == 5 and
+        to_hex(segment.payload) == "68656c6c6f")
+    say(f, "a VLAN tag is removed and reported",
+        (packets.ethernet(from_hex("aabbccddeeff112233445566" +
+            "8100" + "0064" + "0800" + "45000014")) ?? no_frame()).vlan == 100)
+    say(f, "the internet checksum is the sum of words, complemented",
+        packets.checksum(from_hex("450000730000400040110000c0a80001" +
+            "c0a800c7")) == 47201)
+    say(f, "and a header's own checksum is checked with the field zeroed",
+        packets.ipv4_checksum_holds(from_hex(
+            "45000073000040004011b861c0a80001c0a800c7")) and
+        not packets.ipv4_checksum_holds(from_hex(
+            "45000073000040004011b862c0a80001c0a800c7")))
+    say(f, "a truncated header is refused rather than read past",
+        ipv4_refused(from_hex("4500")))
+}
+
+fn ipv4_refused(data: bytes) -> bool {
+    match packets.ipv4(data) {
+        Ok(_header) -> return false
+        Err(_why) -> return true
+    }
+}
+
+fn no_frame() -> EthernetFrame {
+    return EthernetFrame{ destination: bytes_of([]),
+        source: bytes_of([]), ether_type: 0, vlan: 0 - 1,
+        payload: bytes_of([]) }
+}
+
+fn no_ipv4() -> Ipv4Header {
+    return Ipv4Header{ length_words: 0, dscp: 0, ecn: 0,
+        total_length: 0, identification: 0, dont_fragment: false,
+        more_fragments: false, fragment_offset: 0, ttl: 0, protocol: 0,
+        checksum: 0, source: 0, destination: 0, options: bytes_of([]),
+        payload: bytes_of([]) }
+}
+
+fn no_tcp() -> TcpHeader {
+    return TcpHeader{ source_port: 0, destination_port: 0, sequence: 0,
+        acknowledgement: 0, length_words: 0, flags: 0, window: 0,
+        checksum: 0, urgent: 0, options: bytes_of([]),
+        payload: bytes_of([]) }
+}
+
+// -------------------------------------------------------------- pcapfile
+
+fn check_captures(inout f: i64) / {io} {
+    print("-- pcapfile: the magic number says which of four files it is")
+    let head = PcapHeader{ big_endian: false, nanoseconds: false,
+        major: 2, minor: 4, snap_length: 65535, link_type: 1 }
+    let one = PcapPacket{ seconds: 1700000000, fraction: 123456,
+        captured_length: 4, original_length: 60,
+        data: from_hex("deadbeef") }
+    let written = pcapfile.render(head, [one])
+    let read = pcapfile.header(written) ?? head
+    say(f, "a file written little-endian reads back little-endian",
+        not read.big_endian and not read.nanoseconds and
+        read.link_type == 1 and
+        pcapfile.link_name(read.link_type) == "ethernet")
+    let back = pcapfile.packets(written) ?? []
+    say(f, "and the packet comes back as it went in",
+        back.len() == 1 and to_hex(back[0].data) == "deadbeef" and
+        back[0].seconds == 1700000000)
+    say(f, "a packet cut short by the snap length says so",
+        pcapfile.was_truncated(back[0]) and
+        back[0].original_length == 60)
+    let big = pcapfile.render(PcapHeader{ big_endian: true,
+        nanoseconds: false, major: 2, minor: 4, snap_length: 65535,
+        link_type: 1 }, [one])
+    say(f, "the other byte order is read as well, and is a different file",
+        (pcapfile.header(big) ?? head).big_endian and
+        to_hex(big).substr(0, 8) == "a1b2c3d4" and
+        to_hex(written).substr(0, 8) == "d4c3b2a1")
+    let nano = pcapfile.render(PcapHeader{ big_endian: false,
+        nanoseconds: true, major: 2, minor: 4, snap_length: 65535,
+        link_type: 1 }, [one])
+    say(f, "and a nanosecond capture is told from a microsecond one",
+        (pcapfile.header(nano) ?? head).nanoseconds and
+        pcapfile.millis_of(read, back[0]) == 1700000000123 and
+        pcapfile.millis_of(pcapfile.header(nano) ?? head, back[0]) ==
+        1700000000000)
+    say(f, "a file that is not a capture is refused",
+        capture_refused(from_hex("00000000")) and
+        capture_refused(bytes_of([])))
+}
+
+fn capture_refused(data: bytes) -> bool {
+    match pcapfile.header(data) {
+        Ok(_head) -> return false
+        Err(_why) -> return true
+    }
+}
+
+fn main() / {io} {
+    var f = 0
+    check_addresses(f)
+    check_packets(f)
+    check_captures(f)
+    if f == 0 {
+        print("network: every claim held")
+    } else {
+        print("network: {f} claims failed")
+    }
+}

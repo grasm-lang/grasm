@@ -1,0 +1,7 @@
+[package]
+name = "packets"
+version = "1.0.0"
+
+[dependencies.ipv6]
+path = "../ipv6"
+version = "^1.0.0"
