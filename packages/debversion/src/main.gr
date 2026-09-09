@@ -1,0 +1,220 @@
+// Debian package versions, and the comparison dpkg does.
+//
+//   [epoch:]upstream[-revision]
+//
+// The ordering is its own algorithm and is not any of the obvious ones:
+//
+//   - **A run of digits compares as a number**, so `1.10` is above `1.9`.
+//   - **A run of non-digits compares character by character**, in an order
+//     that is *not* ASCII: `~` sorts before everything including the end
+//     of the string, letters sort before every other character, and the
+//     rest sort by their byte.
+//   - **`~` is why `1.0~rc1` is below `1.0`**, which is the whole reason
+//     the tilde exists — it is how a pre-release is named so that the
+//     release supersedes it.
+//
+// An epoch is a way of saying "the upstream numbering restarted": `1:1.0`
+// is above `2.0`, and it can never be removed once published.
+//
+// ## Why this matters outside Debian
+//
+// Anything that reads a `.deb`, an `apt` index, or a security advisory has
+// to answer "is the installed version at least the fixed one", and getting
+// the tilde wrong means reporting a machine as patched when it is running
+// the release candidate.
+
+type DebError =
+    | NotAVersion(text: str)
+
+    /// A version, taken apart.
+type DebVersion = {
+    epoch: i64,
+    upstream: str,
+    revision: str,
+}
+
+fn is_digit(character: str) -> bool {
+    let byte = character.to_bytes().at(0)
+    return byte >= 48 and byte <= 57
+}
+
+fn is_letter(character: str) -> bool {
+    let byte = character.to_bytes().at(0)
+    return (byte >= 65 and byte <= 90) or (byte >= 97 and byte <= 122)
+}
+
+fn all_digits(text: str) -> bool {
+    if text.len() == 0 {
+        return false
+    }
+    var i = 0
+    while i < text.len() {
+        if not is_digit(text.substr(i, 1)) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+/// Read a version.
+pub fn parse(text: str) -> DebVersion ! DebError {
+    let body = text.trim()
+    if body.len() == 0 {
+        fail(NotAVersion(text))
+    }
+    var epoch = 0
+    var rest = body
+    var i = 0
+    while i < rest.len() {
+        if rest.substr(i, 1) == ":" {
+            if not all_digits(rest.substr(0, i)) {
+                fail(NotAVersion(text))
+            }
+            epoch = rest.substr(0, i).parse_int() ?? 0
+            rest = rest.substr(i + 1, rest.len() - i - 1)
+            i = rest.len()
+        } else if is_digit(rest.substr(i, 1)) {
+            i = i + 1
+        } else {
+            i = rest.len()
+        }
+    }
+    // The revision is what follows the *last* hyphen; a hyphen earlier is
+    // part of the upstream version.
+    var cut = 0 - 1
+    var j = 0
+    while j < rest.len() {
+        if rest.substr(j, 1) == "-" {
+            cut = j
+        }
+        j = j + 1
+    }
+    var upstream = rest
+    var revision = ""
+    if cut >= 0 {
+        upstream = rest.substr(0, cut)
+        revision = rest.substr(cut + 1, rest.len() - cut - 1)
+    }
+    if upstream.len() == 0 {
+        fail(NotAVersion(text))
+    }
+    return DebVersion{ epoch: epoch, upstream: upstream,
+        revision: revision }
+}
+
+/// The order dpkg gives one character.
+///
+/// A tilde is below everything, including the end of the string; a letter
+/// is next; everything else comes after, in byte order. This is the whole
+/// of why `1.0~rc1` is older than `1.0` and `1.0a` is older than `1.0+`.
+fn rank(character: str) -> i64 {
+    if character.len() == 0 {
+        return 0
+    }
+    if character == "~" {
+        return 0 - 1
+    }
+    let byte = character.to_bytes().at(0)
+    if is_letter(character) {
+        return byte
+    }
+    return byte + 256
+}
+
+/// Compare one part — an upstream version or a revision.
+pub fn compare_part(a: str, b: str) -> i64 {
+    var i = 0
+    var j = 0
+    while i < a.len() or j < b.len() {
+        // A run of non-digits, compared character by character.
+        while (i < a.len() and not is_digit(a.substr(i, 1))) or
+        (j < b.len() and not is_digit(b.substr(j, 1))) {
+            let left = if i < a.len() and not is_digit(a.substr(i, 1)) {
+                a.substr(i, 1)
+            } else {
+                ""
+            }
+            let right = if j < b.len() and not is_digit(b.substr(j, 1)) {
+                b.substr(j, 1)
+            } else {
+                ""
+            }
+            if rank(left) != rank(right) {
+                return if rank(left) < rank(right) { 0 - 1 } else { 1 }
+            }
+            if left.len() > 0 {
+                i = i + 1
+            }
+            if right.len() > 0 {
+                j = j + 1
+            }
+        }
+        // A run of digits, compared as a number. Leading zeros are
+        // ignored, so `1.007` and `1.7` are the same version.
+        var left = 0
+        while i < a.len() and is_digit(a.substr(i, 1)) {
+            left = left * 10 + (a.substr(i, 1).parse_int() ?? 0)
+            i = i + 1
+        }
+        var right = 0
+        while j < b.len() and is_digit(b.substr(j, 1)) {
+            right = right * 10 + (b.substr(j, 1).parse_int() ?? 0)
+            j = j + 1
+        }
+        if left != right {
+            return if left < right { 0 - 1 } else { 1 }
+        }
+    }
+    return 0
+}
+
+/// -1, 0 or 1.
+pub fn compare(a: DebVersion, b: DebVersion) -> i64 {
+    if a.epoch != b.epoch {
+        return if a.epoch < b.epoch { 0 - 1 } else { 1 }
+    }
+    let upstream = compare_part(a.upstream, b.upstream)
+    if upstream != 0 {
+        return upstream
+    }
+    return compare_part(a.revision, b.revision)
+}
+
+/// Compare two written versions.
+pub fn compare_text(a: str, b: str) -> i64 ! DebError {
+    return compare(try parse(a), try parse(b))
+}
+
+/// The canonical spelling: the epoch is written only when it is not zero,
+/// and the revision only when there is one.
+pub fn render(version: DebVersion) -> str {
+    var out = ""
+    if version.epoch != 0 {
+        out = "{version.epoch}:"
+    }
+    out = out + version.upstream
+    if version.revision.len() > 0 {
+        out = out + "-" + version.revision
+    }
+    return out
+}
+
+/// Whether a version is at least a fixed one, which is the question a
+/// security advisory asks.
+pub fn at_least(installed: str, fixed: str) -> bool ! DebError {
+    return try compare_text(installed, fixed) >= 0
+}
+
+/// Whether a version names a pre-release: a tilde anywhere in the
+/// upstream part means the release will supersede it.
+pub fn is_prerelease(version: DebVersion) -> bool {
+    var i = 0
+    while i < version.upstream.len() {
+        if version.upstream.substr(i, 1) == "~" {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}

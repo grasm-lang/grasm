@@ -1,0 +1,596 @@
+// Python's version numbers, PEP 440, and the ordering nobody guesses right.
+//
+//   1.0.dev1 < 1.0a1 < 1.0a1.post1 < 1.0b1 < 1.0rc1 < 1.0 < 1.0.post1
+//
+// A development release comes *before* the alpha, a post-release after the
+// final, and `1.0` equals `1.0.0` equals `1!1.0` — no, that last one is a
+// different epoch and is greater. None of it falls out of comparing the
+// strings, and a package manager that sorts them as text installs the
+// alpha over the release.
+//
+// ## Spelling is not meaning
+//
+// `1.0RC1`, `1.0-rc-1`, `1.0.rc1`, `1.0c1` and `1.0rc1` are one version.
+// `normalise` writes the canonical spelling, and two versions that
+// normalise the same are equal however they were typed — which is what
+// stops a lock file and an index disagreeing about whether a release is
+// already installed.
+//
+// ## The local part is not ordered like the rest
+//
+// `1.0+ubuntu.1` compares against `1.0+ubuntu.2` segment by segment, with
+// numeric segments above alphabetic ones — the opposite of the release
+// part, where everything is numeric. And a version with a local part is
+// *greater* than the same version without one, which is why an index is
+// not allowed to publish them.
+
+type PepError =
+    | NotAVersion(text: str)
+
+    /// A version, taken apart.
+type PepVersion = {
+    epoch: i64,
+    /// The release segments, with trailing zeros kept as written.
+    release: [i64],
+    /// `a`, `b`, `rc` or the empty string.
+    pre_kind: str,
+    pre_number: i64,
+    /// -1 when there is no post-release.
+    post: i64,
+    /// -1 when there is no development release.
+    dev: i64,
+    /// The local segments, as written, lower-cased.
+    local: [str],
+}
+
+fn is_digit(character: str) -> bool {
+    if character.len() == 0 {
+        return false
+    }
+    let byte = character.to_bytes().at(0)
+    return byte >= 48 and byte <= 57
+}
+
+fn all_digits(text: str) -> bool {
+    if text.len() == 0 {
+        return false
+    }
+    var i = 0
+    while i < text.len() {
+        if not is_digit(text.substr(i, 1)) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+/// The canonical name of a pre-release marker.
+fn pre_name(word: str) -> str {
+    let flat = word.to_lower()
+    if flat == "a" or flat == "alpha" {
+        return "a"
+    }
+    if flat == "b" or flat == "beta" {
+        return "b"
+    }
+    if flat == "c" or flat == "rc" or flat == "pre" or flat == "preview" {
+        return "rc"
+    }
+    return ""
+}
+
+/// Where the strict scanner is.
+type PepReader = {
+    text: str,
+    at: i64,
+}
+
+fn peek(reader: PepReader) -> str {
+    if reader.at >= reader.text.len() {
+        return ""
+    }
+    return reader.text.substr(reader.at, 1)
+}
+
+/// A run of digits, or -1 when there is none.
+fn read_number(inout reader: PepReader) -> i64 {
+    var digits = ""
+    while is_digit(peek(reader)) {
+        digits = digits + peek(reader)
+        reader.at = reader.at + 1
+    }
+    if digits.len() == 0 {
+        return 0 - 1
+    }
+    return digits.parse_int() ?? 0
+}
+
+/// The optional separator PEP 440 allows before a marker: one of `-`,
+/// `_` or `.`, and never two.
+fn read_separator(inout reader: PepReader) -> bool {
+    let here = peek(reader)
+    if here == "-" or here == "_" or here == "." {
+        reader.at = reader.at + 1
+        return true
+    }
+    return false
+}
+
+/// A word of letters, lower-cased.
+fn read_word(inout reader: PepReader) -> str {
+    var out = ""
+    while is_letter(peek(reader)) {
+        out = out + peek(reader).to_lower()
+        reader.at = reader.at + 1
+    }
+    return out
+}
+
+fn is_letter(character: str) -> bool {
+    if character.len() == 0 {
+        return false
+    }
+    let byte = character.to_lower().to_bytes().at(0)
+    return byte >= 97 and byte <= 122
+}
+
+/// Read a version.
+///
+/// Strict, because PEP 440 is: `1.0.0.` and `1..0` and `1.0-` are not
+/// versions, and a parser that accepts them writes a lock file naming a
+/// release that no index will resolve.
+pub fn parse(text: str) -> PepVersion ! PepError {
+    var body = text.trim().to_lower()
+    if body.starts_with("v") {
+        body = body.substr(1, body.len() - 1)
+    }
+    var local: [str] = []
+    var at = 0 - 1
+    var i = 0
+    while i < body.len() {
+        if body.substr(i, 1) == "+" {
+            at = i
+            i = body.len()
+        } else {
+            i = i + 1
+        }
+    }
+    if at >= 0 {
+        let tail = body.substr(at + 1, body.len() - at - 1)
+        body = body.substr(0, at)
+        if tail.len() == 0 {
+            fail(NotAVersion(text))
+        }
+        for piece in split_local(tail) {
+            if piece.len() == 0 or not is_alphanumeric(piece) {
+                fail(NotAVersion(text))
+            }
+            local.push(piece)
+        }
+    }
+    var reader = PepReader{ text: body, at: 0 }
+    var out = PepVersion{ epoch: 0, release: [], pre_kind: "",
+        pre_number: 0, post: 0 - 1, dev: 0 - 1, local: local }
+    try read_epoch(out, reader, text)
+    try read_release(out, reader, text)
+    read_pre(out, reader)
+    read_post(out, reader)
+    read_dev(out, reader)
+    if reader.at != reader.text.len() {
+        fail(NotAVersion(text))
+    }
+    return out
+}
+
+fn is_alphanumeric(text: str) -> bool {
+    var i = 0
+    while i < text.len() {
+        if not is_digit(text.substr(i, 1)) and
+        not is_letter(text.substr(i, 1)) {
+            return false
+        }
+        i = i + 1
+    }
+    return text.len() > 0
+}
+
+/// The local part splits on any of the three separators.
+fn split_local(text: str) -> [str] {
+    var out: [str] = []
+    var current = ""
+    var i = 0
+    while i < text.len() {
+        let here = text.substr(i, 1)
+        if here == "." or here == "-" or here == "_" {
+            out.push(current)
+            current = ""
+        } else {
+            current = current + here
+        }
+        i = i + 1
+    }
+    out.push(current)
+    return out
+}
+
+fn read_epoch(inout out: PepVersion, inout reader: PepReader,
+    original: str) -> bool ! PepError {
+    let mark = reader.at
+    let value = read_number(reader)
+    if peek(reader) == "!" {
+        if value < 0 {
+            fail(NotAVersion(original))
+        }
+        out.epoch = value
+        reader.at = reader.at + 1
+        return true
+    }
+    reader.at = mark
+    return true
+}
+
+fn read_release(inout out: PepVersion, inout reader: PepReader,
+    original: str) -> bool ! PepError {
+    let first = read_number(reader)
+    if first < 0 {
+        fail(NotAVersion(original))
+    }
+    out.release.push(first)
+    // A dot continues the release only when a digit follows it; a dot
+    // before a marker is the marker's own separator.
+    while peek(reader) == "." and reader.at + 1 < reader.text.len() and
+    is_digit(reader.text.substr(reader.at + 1, 1)) {
+        reader.at = reader.at + 1
+        out.release.push(read_number(reader))
+    }
+    return true
+}
+
+fn read_pre(inout out: PepVersion, inout reader: PepReader) -> bool {
+    let mark = reader.at
+    let _separated = read_separator(reader)
+    let word = read_word(reader)
+    let kind = pre_name(word)
+    if kind.len() == 0 {
+        reader.at = mark
+        return true
+    }
+    out.pre_kind = kind
+    let _second = read_separator(reader)
+    let number = read_number(reader)
+    if number >= 0 {
+        out.pre_number = number
+    }
+    return true
+}
+
+fn read_post(inout out: PepVersion, inout reader: PepReader) -> bool {
+    let mark = reader.at
+    // The implicit form, `1.0-1`, which is the one shorthand the grammar
+    // allows and the one that reads as another release segment.
+    if peek(reader) == "-" {
+        reader.at = reader.at + 1
+        let number = read_number(reader)
+        if number >= 0 {
+            out.post = number
+            return true
+        }
+        reader.at = mark
+    }
+    let _separated = read_separator(reader)
+    let word = read_word(reader)
+    if word != "post" and word != "rev" and word != "r" {
+        reader.at = mark
+        return true
+    }
+    out.post = 0
+    let _second = read_separator(reader)
+    let number = read_number(reader)
+    if number >= 0 {
+        out.post = number
+    }
+    return true
+}
+
+fn read_dev(inout out: PepVersion, inout reader: PepReader) -> bool {
+    let mark = reader.at
+    let _separated = read_separator(reader)
+    if read_word(reader) != "dev" {
+        reader.at = mark
+        return true
+    }
+    out.dev = 0
+    let _second = read_separator(reader)
+    let number = read_number(reader)
+    if number >= 0 {
+        out.dev = number
+    }
+    return true
+}
+
+/// The canonical spelling.
+pub fn normalise(version: PepVersion) -> str {
+    var out = ""
+    if version.epoch > 0 {
+        out = "{version.epoch}!"
+    }
+    var parts: [str] = []
+    for number in version.release {
+        parts.push("{number}")
+    }
+    out = out + parts.join(".")
+    if version.pre_kind.len() > 0 {
+        out = out + version.pre_kind + "{version.pre_number}"
+    }
+    if version.post >= 0 {
+        out = out + ".post{version.post}"
+    }
+    if version.dev >= 0 {
+        out = out + ".dev{version.dev}"
+    }
+    if version.local.len() > 0 {
+        out = out + "+" + version.local.join(".")
+    }
+    return out
+}
+
+fn compare_release(a: [i64], b: [i64]) -> i64 {
+    var i = 0
+    while i < a.len() or i < b.len() {
+        let left = if i < a.len() { a[i] } else { 0 }
+        let right = if i < b.len() { b[i] } else { 0 }
+        if left < right {
+            return 0 - 1
+        }
+        if left > right {
+            return 1
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+/// The sort key of the pre-release part.
+///
+/// A development release sorts below every pre-release, and no
+/// pre-release at all sorts above them: `1.0.dev1 < 1.0a1 < 1.0`.
+fn pre_rank(version: PepVersion) -> i64 {
+    if version.pre_kind == "a" {
+        return 1
+    }
+    if version.pre_kind == "b" {
+        return 2
+    }
+    if version.pre_kind == "rc" {
+        return 3
+    }
+    return 4
+}
+
+/// -1, 0 or 1.
+pub fn compare(a: PepVersion, b: PepVersion) -> i64 {
+    if a.epoch != b.epoch {
+        return if a.epoch < b.epoch { 0 - 1 } else { 1 }
+    }
+    let release = compare_release(a.release, b.release)
+    if release != 0 {
+        return release
+    }
+    // A version that is *only* a development release sorts below one that
+    // has a pre-release, and below the plain release.
+    let a_only_dev = a.pre_kind.len() == 0 and a.post < 0 and a.dev >= 0
+    let b_only_dev = b.pre_kind.len() == 0 and b.post < 0 and b.dev >= 0
+    if a_only_dev != b_only_dev {
+        return if a_only_dev { 0 - 1 } else { 1 }
+    }
+    if pre_rank(a) != pre_rank(b) {
+        return if pre_rank(a) < pre_rank(b) { 0 - 1 } else { 1 }
+    }
+    if a.pre_kind.len() > 0 and a.pre_number != b.pre_number {
+        return if a.pre_number < b.pre_number { 0 - 1 } else { 1 }
+    }
+    if a.post != b.post {
+        return if a.post < b.post { 0 - 1 } else { 1 }
+    }
+    if a.dev != b.dev {
+        // No development release is greater than any, which is the
+        // reverse of every other field.
+        if a.dev < 0 {
+            return 1
+        }
+        if b.dev < 0 {
+            return 0 - 1
+        }
+        return if a.dev < b.dev { 0 - 1 } else { 1 }
+    }
+    return compare_local(a.local, b.local)
+}
+
+/// The local part: numeric segments above alphabetic ones, and a version
+/// with one above the same version without.
+fn compare_local(a: [str], b: [str]) -> i64 {
+    var i = 0
+    while i < a.len() or i < b.len() {
+        if i >= a.len() {
+            return 0 - 1
+        }
+        if i >= b.len() {
+            return 1
+        }
+        let left_numeric = all_digits(a[i])
+        let right_numeric = all_digits(b[i])
+        if left_numeric != right_numeric {
+            return if left_numeric { 1 } else { 0 - 1 }
+        }
+        if left_numeric {
+            let left = a[i].parse_int() ?? 0
+            let right = b[i].parse_int() ?? 0
+            if left != right {
+                return if left < right { 0 - 1 } else { 1 }
+            }
+        } else if a[i] != b[i] {
+            return if a[i] < b[i] { 0 - 1 } else { 1 }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+/// Whether a version is a pre-release, which an installer skips unless it
+/// was asked for them.
+pub fn is_prerelease(version: PepVersion) -> bool {
+    return version.pre_kind.len() > 0 or version.dev >= 0
+}
+
+/// One clause of a specifier: an operator and the version it names.
+type PepSpecifier = {
+    /// `==`, `!=`, `<=`, `>=`, `<`, `>`, `~=` or `===`.
+    operator: str,
+    /// As written, since `==1.0.*` needs the trailing star and `===`
+    /// compares the text rather than the version.
+    value_text: str,
+}
+
+/// Read a comma-separated specifier such as `>=1.0,<2,!=1.5`.
+pub fn parse_specifiers(text: str) -> [PepSpecifier] ! PepError {
+    var out: [PepSpecifier] = []
+    for piece in text.split(",") {
+        let body = piece.trim()
+        if body.len() == 0 {
+            continue
+        }
+        var operator = ""
+        for candidate in ["===", "==", "!=", "~=", "<=", ">=", "<", ">"] {
+            if operator.len() == 0 and body.starts_with(candidate) {
+                operator = candidate
+            }
+        }
+        if operator.len() == 0 {
+            fail(NotAVersion(body))
+        }
+        out.push(PepSpecifier{ operator: operator,
+            value_text: body.substr(operator.len(),
+                body.len() - operator.len()).trim() })
+    }
+    return out
+}
+
+/// Whether a version satisfies one clause.
+///
+/// `==1.4.*` is a prefix match on the release segments, `~=1.4.2` means
+/// "at least 1.4.2 and still 1.4", and `===` compares the strings
+/// exactly — three operators that a naive comparison gets wrong in three
+/// different ways.
+pub fn satisfies_one(version: PepVersion, spec: PepSpecifier,
+    written: str) -> bool ! PepError {
+    if spec.operator == "===" {
+        // Arbitrary equality, over the *canonical* spelling: `v1.0` and
+        // `1.0` are one version and `===1.0` accepts both, which is what
+        // the reference implementation does.
+        match parse(written) {
+            Ok(found) -> return normalise(found) == spec.value_text
+            Err(_why) -> return written.trim() == spec.value_text
+        }
+    }
+    if spec.operator == "==" or spec.operator == "!=" {
+        var held = false
+        if spec.value_text.ends_with(".*") {
+            let head = spec.value_text.substr(0,
+                spec.value_text.len() - 2)
+            held = has_prefix(version, try parse(head))
+        } else {
+            let other = try parse(spec.value_text)
+            held = compare(strip_local(version), strip_local(other)) == 0
+            if other.local.len() > 0 {
+                held = compare(version, other) == 0
+            }
+        }
+        if spec.operator == "==" {
+            return held
+        }
+        return not held
+    }
+    let other = try parse(spec.value_text)
+    if spec.operator == "~=" {
+        // `~=1.4.2` is `>=1.4.2, ==1.4.*`: the last segment is the one
+        // allowed to move.
+        if other.release.len() < 2 {
+            fail(NotAVersion(spec.value_text))
+        }
+        var head: [i64] = []
+        var i = 0
+        while i + 1 < other.release.len() {
+            head.push(other.release[i])
+            i = i + 1
+        }
+        let bound = PepVersion{ epoch: other.epoch, release: head,
+            pre_kind: "", pre_number: 0, post: 0 - 1, dev: 0 - 1,
+            local: [] }
+        return compare(version, other) >= 0 and has_prefix(version, bound)
+    }
+    // The ordered comparisons ignore the local part entirely.
+    let side = compare(strip_local(version), strip_local(other))
+    if spec.operator == "<=" {
+        return side <= 0
+    }
+    if spec.operator == ">=" {
+        return side >= 0
+    }
+    if spec.operator == "<" {
+        // A pre-release of the bound itself does not satisfy `<bound`.
+        if side < 0 and is_prerelease(version) and
+        compare_release(version.release, other.release) == 0 and
+        not is_prerelease(other) {
+            return false
+        }
+        return side < 0
+    }
+    if side > 0 and version.post >= 0 and
+    compare_release(version.release, other.release) == 0 and
+    other.post < 0 and not is_prerelease(other) {
+        // A post-release of the bound does not satisfy `>bound`.
+        return false
+    }
+    return side > 0
+}
+
+fn strip_local(version: PepVersion) -> PepVersion {
+    return PepVersion{ epoch: version.epoch, release: version.release,
+        pre_kind: version.pre_kind, pre_number: version.pre_number,
+        post: version.post, dev: version.dev, local: [] }
+}
+
+/// Whether a version's release begins with another's, which is what a
+/// `.*` specifier asks.
+fn has_prefix(version: PepVersion, head: PepVersion) -> bool {
+    if version.epoch != head.epoch {
+        return false
+    }
+    // A release shorter than the prefix is padded with zeros, since
+    // `1` and `1.0` are the same version — so `1` does match `==1.0.*`.
+    var i = 0
+    while i < head.release.len() {
+        let found = if i < version.release.len() {
+            version.release[i]
+        } else {
+            0
+        }
+        if found != head.release[i] {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+/// Whether a version satisfies every clause.
+pub fn satisfies(written: str, specifiers: str) -> bool ! PepError {
+    let version = try parse(written)
+    for spec in try parse_specifiers(specifiers) {
+        if not try satisfies_one(version, spec, written) {
+            return false
+        }
+    }
+    return true
+}

@@ -1,0 +1,7 @@
+[package]
+name = "pep508"
+version = "1.0.0"
+
+[dependencies.pep440]
+path = "../pep440"
+version = "^1.0.0"

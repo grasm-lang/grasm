@@ -1,0 +1,20 @@
+[package]
+name = "versions_demo"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.pep440]
+path = "../pep440"
+version = "^1.0.0"
+
+[dependencies.pep508]
+path = "../pep508"
+version = "^1.0.0"
+
+[dependencies.semverrange]
+path = "../semverrange"
+version = "^1.0.0"
+
+[dependencies.debversion]
+path = "../debversion"
+version = "^1.0.0"

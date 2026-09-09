@@ -1,0 +1,406 @@
+// Python dependency specifications, PEP 508.
+//
+//   requests[socks] >=2.28,<3 ; python_version >= "3.8" and extra == "dev"
+//
+// A line of a `requirements.txt`, an entry in a `pyproject.toml`, and what
+// a wheel's metadata carries are all this. Four parts, three of them
+// optional: a name, some extras, a version specifier, and an environment
+// marker.
+//
+// ## The marker decides whether the requirement exists at all
+//
+// `; sys_platform == "win32"` does not mean "install this on Windows and
+// something else elsewhere" — elsewhere the requirement is simply not
+// there. An installer that ignores markers installs Windows-only packages
+// on Linux and fails to build; one that treats an unknown variable as
+// false silently drops requirements.
+//
+// ## `in` is a substring test, not membership
+//
+// `'x86' in platform_machine` is true for `x86_64`, because the marker
+// grammar's `in` is Python's string containment. Reading it as equality —
+// or as list membership — is the mistake that makes a wheel install on the
+// wrong architecture.
+//
+// ## Names are compared after normalising
+//
+// `Flask`, `flask` and `FLASK-Login` versus `flask_login` are the same
+// project: runs of `-`, `_` and `.` collapse to one `-` and the whole
+// thing is lower-cased. A lock file that does not normalise records two
+// entries for one package.
+import pep440
+
+type PepRequirementError =
+    | NoName(text: str)
+    | BadMarker(text: str)
+    | BadVersion(text: str)
+
+    /// One marker comparison.
+type PepMarkerClause = {
+    left: str,
+    /// `==`, `!=`, `<`, `<=`, `>`, `>=`, `~=`, `===`, `in`, `not in`.
+    operator: str,
+    right: str,
+    /// Whether each side was written as a quoted string rather than as a
+    /// variable name.
+    left_literal: bool,
+    right_literal: bool,
+}
+
+/// A marker: tests joined by `and` and `or`, in the flat form the grammar
+/// allows once parentheses are resolved.
+type PepMarker = {
+    /// Alternatives, each of which is a set of tests that must all hold.
+    alternatives: [[PepMarkerClause]],
+}
+
+/// A whole requirement.
+type PepRequirement = {
+    name: str,
+    extras: [str],
+    specifiers: str,
+    /// The marker text as written; empty when there is none.
+    marker_text: str,
+    /// A direct URL reference, `name @ https://...`, or empty.
+    url: str,
+}
+
+fn is_name_char(character: str) -> bool {
+    let byte = character.to_bytes().at(0)
+    return (byte >= 65 and byte <= 90) or (byte >= 97 and byte <= 122) or
+    (byte >= 48 and byte <= 57) or character == "-" or
+    character == "_" or character == "."
+}
+
+/// The canonical form of a project name.
+pub fn normalise_name(name: str) -> str {
+    var out = ""
+    var last_dash = false
+    var i = 0
+    while i < name.len() {
+        let here = name.substr(i, 1).to_lower()
+        if here == "-" or here == "_" or here == "." {
+            if not last_dash {
+                out = out + "-"
+            }
+            last_dash = true
+        } else {
+            out = out + here
+            last_dash = false
+        }
+        i = i + 1
+    }
+    return out
+}
+
+/// Read a requirement.
+pub fn parse(text: str) -> PepRequirement ! PepRequirementError {
+    var body = text
+    var marker = ""
+    var i = 0
+    var quoted = false
+    while i < body.len() {
+        let here = body.substr(i, 1)
+        if here == "\"" or here == "'" {
+            quoted = not quoted
+        } else if here == ";" and not quoted {
+            marker = body.substr(i + 1, body.len() - i - 1).trim()
+            body = body.substr(0, i)
+            i = body.len()
+        }
+        i = i + 1
+    }
+    body = body.trim()
+    var name = ""
+    var at = 0
+    while at < body.len() and is_name_char(body.substr(at, 1)) {
+        name = name + body.substr(at, 1)
+        at = at + 1
+    }
+    if name.len() == 0 {
+        fail(NoName(text))
+    }
+    var extras: [str] = []
+    var rest = body.substr(at, body.len() - at).trim()
+    if rest.starts_with("[") {
+        var close = 0 - 1
+        var j = 0
+        while j < rest.len() {
+            if rest.substr(j, 1) == "]" {
+                close = j
+                j = rest.len()
+            } else {
+                j = j + 1
+            }
+        }
+        if close < 0 {
+            fail(NoName(text))
+        }
+        for piece in rest.substr(1, close - 1).split(",") {
+            if piece.trim().len() > 0 {
+                extras.push(normalise_name(piece.trim()))
+            }
+        }
+        rest = rest.substr(close + 1, rest.len() - close - 1).trim()
+    }
+    var url = ""
+    if rest.starts_with("@") {
+        url = rest.substr(1, rest.len() - 1).trim()
+        rest = ""
+    }
+    if rest.starts_with("(") and rest.ends_with(")") {
+        rest = rest.substr(1, rest.len() - 2).trim()
+    }
+    return PepRequirement{ name: name, extras: extras, specifiers: rest,
+        marker_text: marker, url: url }
+}
+
+fn is_space(character: str) -> bool {
+    return character == " " or character == "\t"
+}
+
+/// Split a marker into words, keeping a quoted string whole and dropping
+/// its quotes but remembering it was one.
+fn marker_words(text: str) -> [(str, bool)] {
+    var out: [(str, bool)] = []
+    var current = ""
+    var i = 0
+    while i < text.len() {
+        let here = text.substr(i, 1)
+        if here == "\"" or here == "'" {
+            var value = ""
+            i = i + 1
+            while i < text.len() and text.substr(i, 1) != here {
+                value = value + text.substr(i, 1)
+                i = i + 1
+            }
+            i = i + 1
+            out.push((value, true))
+            continue
+        }
+        if is_space(here) or here == "(" or here == ")" {
+            if current.len() > 0 {
+                out.push((current, false))
+                current = ""
+            }
+            if here == "(" or here == ")" {
+                out.push((here, false))
+            }
+            i = i + 1
+            continue
+        }
+        // An operator is its own word even without spaces round it.
+        if here == "=" or here == "!" or here == "<" or here == ">" or
+        here == "~" {
+            if current.len() > 0 {
+                out.push((current, false))
+                current = ""
+            }
+            var operator = here
+            var j = i + 1
+            while j < text.len() and (text.substr(j, 1) == "=" or
+                text.substr(j, 1) == "~") {
+                operator = operator + text.substr(j, 1)
+                j = j + 1
+            }
+            out.push((operator, false))
+            i = j
+            continue
+        }
+        current = current + here
+        i = i + 1
+    }
+    if current.len() > 0 {
+        out.push((current, false))
+    }
+    return out
+}
+
+/// Read a marker into alternatives of tests.
+///
+/// Parentheses are honoured only where they do not change the meaning —
+/// `and` binds tighter than `or`, so `a and (b or c)` is refused rather
+/// than flattened into something that is not the same question.
+pub fn parse_marker(text: str) -> PepMarker ! PepRequirementError {
+    if text.trim().len() == 0 {
+        return PepMarker{ alternatives: [] }
+    }
+    let words = marker_words(text)
+    var alternatives: [[PepMarkerClause]] = []
+    var current: [PepMarkerClause] = []
+    var i = 0
+    while i < words.len() {
+        if words[i].0 == "(" or words[i].0 == ")" {
+            i = i + 1
+            continue
+        }
+        if words[i].0.to_lower() == "and" {
+            i = i + 1
+            continue
+        }
+        if words[i].0.to_lower() == "or" {
+            alternatives.push(current)
+            current = []
+            i = i + 1
+            continue
+        }
+        if i + 2 >= words.len() {
+            fail(BadMarker(text))
+        }
+        var operator = words[i + 1].0.to_lower()
+        var right = i + 2
+        if operator == "not" and words[i + 2].0.to_lower() == "in" {
+            operator = "not in"
+            right = i + 3
+        }
+        if right >= words.len() {
+            fail(BadMarker(text))
+        }
+        current.push(PepMarkerClause{ left: words[i].0, operator: operator,
+            right: words[right].0, left_literal: words[i].1,
+            right_literal: words[right].1 })
+        i = right + 1
+    }
+    alternatives.push(current)
+    return PepMarker{ alternatives: alternatives }
+}
+
+fn lookup(environment: [(str, str)], name: str) -> str {
+    for one in environment {
+        if one.0 == name {
+            return one.1
+        }
+    }
+    return ""
+}
+
+fn side_value(environment: [(str, str)], text: str,
+    literal: bool) -> str {
+    if literal {
+        return text
+    }
+    return lookup(environment, text)
+}
+
+/// Whether a marker holds in an environment.
+///
+/// A variable the environment does not define reads as the empty string,
+/// which is what an installer does with `extra` when none was asked for —
+/// so `extra == "dev"` is false rather than an error.
+pub fn evaluate(marker: PepMarker,
+    environment: [(str, str)]) -> bool ! PepRequirementError {
+    if marker.alternatives.len() == 0 {
+        return true
+    }
+    for alternative in marker.alternatives {
+        var held = true
+        for clause in alternative {
+            if not try holds(clause, environment) {
+                held = false
+            }
+        }
+        if held {
+            return true
+        }
+    }
+    return false
+}
+
+fn holds(clause: PepMarkerClause,
+    environment: [(str, str)]) -> bool ! PepRequirementError {
+    let left = side_value(environment, clause.left, clause.left_literal)
+    let right = side_value(environment, clause.right, clause.right_literal)
+    if clause.operator == "in" {
+        return contains(right, left)
+    }
+    if clause.operator == "not in" {
+        return not contains(right, left)
+    }
+    // A comparison between two things that look like versions is a
+    // version comparison; anything else is a string comparison, which is
+    // what `platform_system == "Linux"` needs.
+    if looks_like_version(left) and looks_like_version(right) {
+        match pep440.satisfies(left, clause.operator + right) {
+            Ok(answer) -> return answer
+            Err(_why) -> {}
+        }
+    }
+    if clause.operator == "==" {
+        return left == right
+    }
+    if clause.operator == "!=" {
+        return left != right
+    }
+    if clause.operator == "<" {
+        return left < right
+    }
+    if clause.operator == "<=" {
+        return left <= right
+    }
+    if clause.operator == ">" {
+        return left > right
+    }
+    if clause.operator == ">=" {
+        return left >= right
+    }
+    fail(BadMarker(clause.operator))
+}
+
+fn contains(haystack: str, needle: str) -> bool {
+    if needle.len() == 0 {
+        return true
+    }
+    var i = 0
+    while i + needle.len() <= haystack.len() {
+        if haystack.substr(i, needle.len()) == needle {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn looks_like_version(text: str) -> bool {
+    if text.len() == 0 {
+        return false
+    }
+    let byte = text.to_bytes().at(0)
+    return byte >= 48 and byte <= 57
+}
+
+/// Whether a requirement applies, and if it does, whether a version
+/// satisfies it.
+pub fn applies(requirement: PepRequirement,
+    environment: [(str, str)]) -> bool ! PepRequirementError {
+    return try evaluate(try parse_marker(requirement.marker_text),
+        environment)
+}
+
+/// Whether a version satisfies a requirement's specifiers.
+pub fn accepts(requirement: PepRequirement,
+    version: str) -> bool ! PepRequirementError {
+    if requirement.specifiers.len() == 0 {
+        return true
+    }
+    match pep440.satisfies(version, requirement.specifiers) {
+        Ok(answer) -> return answer
+        Err(_why) -> fail(BadVersion(version))
+    }
+}
+
+/// The canonical spelling of a requirement.
+pub fn render(requirement: PepRequirement) -> str {
+    var out = normalise_name(requirement.name)
+    if requirement.extras.len() > 0 {
+        out = out + "[" + requirement.extras.join(",") + "]"
+    }
+    if requirement.url.len() > 0 {
+        out = out + "@ " + requirement.url
+    } else if requirement.specifiers.len() > 0 {
+        out = out + requirement.specifiers
+    }
+    if requirement.marker_text.len() > 0 {
+        out = out + "; " + requirement.marker_text
+    }
+    return out
+}

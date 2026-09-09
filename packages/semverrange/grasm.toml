@@ -1,0 +1,7 @@
+[package]
+name = "semverrange"
+version = "1.0.0"
+
+[dependencies.semver]
+path = "../semver"
+version = "^1.0.0"

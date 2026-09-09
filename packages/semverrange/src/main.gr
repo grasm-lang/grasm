@@ -1,0 +1,360 @@
+// npm-style version ranges, over the semantic versions `semver` parses.
+//
+//   ^1.2.3      >=1.2.3 <2.0.0        the default a package manager writes
+//   ~1.2.3      >=1.2.3 <1.3.0
+//   1.2.x       >=1.2.0 <1.3.0
+//   1.2 - 2.3   >=1.2.0 <=2.3.x       a hyphen range, spaces required
+//   >=1 <2 || 3 two alternatives, each a set of comparators
+//
+// A lock file, a dependency resolver and a "is this update safe" check all
+// need the same answer, and the shorthands are where it goes wrong.
+//
+// ## The caret is not "the same major"
+//
+// `^0.2.3` is `>=0.2.3 <0.3.0`, not `<1.0.0`: below one, the *minor*
+// version is the breaking one, because that is the convention every
+// zero-version package follows. And `^0.0.3` is `>=0.0.3 <0.0.4`. A
+// resolver that treats the caret as "same major" upgrades a
+// zero-versioned dependency across a breaking change.
+//
+// ## A pre-release only satisfies a range that mentions one
+//
+// `1.0.0-beta.1` does not satisfy `>=1.0.0`, even though it compares
+// greater than `1.0.0-alpha`. It satisfies `>=1.0.0-alpha` because that
+// comparator names a pre-release of the same version. Without this rule a
+// resolver installs a beta into a project that never asked for one.
+import semver
+
+type RangeSetError =
+    | NotARange(text: str)
+
+    /// One comparator: an operator and a version.
+type RangeComparator = {
+    /// `<`, `<=`, `>`, `>=` or `=`.
+    operator: str,
+    version: Version,
+}
+
+/// A range is alternatives, each of which is a set of comparators that
+/// must all hold.
+type VersionRange = {
+    alternatives: [[RangeComparator]],
+}
+
+fn is_digit(character: str) -> bool {
+    let byte = character.to_bytes().at(0)
+    return byte >= 48 and byte <= 57
+}
+
+fn is_wild(piece: str) -> bool {
+    return piece.len() == 0 or piece == "x" or piece == "X" or
+    piece == "*"
+}
+
+/// The parts of a partial version such as `1.2` or `1.x`, with -1 for a
+/// part that was left out or wild.
+fn parts_of(text: str) -> ([i64], str) {
+    var body = text
+    var pre = ""
+    var i = 0
+    while i < body.len() {
+        let here = body.substr(i, 1)
+        if here == "-" or here == "+" {
+            if here == "-" {
+                pre = body.substr(i + 1, body.len() - i - 1)
+            }
+            body = body.substr(0, i)
+            i = body.len()
+        } else {
+            i = i + 1
+        }
+    }
+    var out: [i64] = []
+    for piece in body.split(".") {
+        if is_wild(piece) {
+            out.push(0 - 1)
+        } else if all_digits(piece) {
+            out.push(piece.parse_int() ?? 0)
+        } else {
+            out.push(0 - 1)
+        }
+    }
+    while out.len() < 3 {
+        out.push(0 - 1)
+    }
+    return (out, pre)
+}
+
+fn all_digits(text: str) -> bool {
+    if text.len() == 0 {
+        return false
+    }
+    var i = 0
+    while i < text.len() {
+        if not is_digit(text.substr(i, 1)) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn version_of(parts: [i64], pre: str) -> Version {
+    return Version{ major: max_zero(parts[0]), minor: max_zero(parts[1]),
+        patch: max_zero(parts[2]), pre: pre }
+}
+
+fn max_zero(value: i64) -> i64 {
+    if value < 0 {
+        return 0
+    }
+    return value
+}
+
+/// A caret range, as comparators.
+fn caret(parts: [i64], pre: str) -> [RangeComparator] {
+    let low = version_of(parts, pre)
+    var high = Version{ major: low.major + 1, minor: 0, patch: 0,
+        pre: "0" }
+    if parts[0] == 0 {
+        if parts[1] < 0 {
+            high = Version{ major: 1, minor: 0, patch: 0, pre: "0" }
+        } else if parts[2] < 0 {
+            high = Version{ major: 0, minor: low.minor + 1, patch: 0,
+                pre: "0" }
+        } else if low.major == 0 and low.minor == 0 {
+            high = Version{ major: 0, minor: 0, patch: low.patch + 1,
+                pre: "0" }
+        } else {
+            high = Version{ major: 0, minor: low.minor + 1, patch: 0,
+                pre: "0" }
+        }
+    } else if parts[1] < 0 {
+        high = Version{ major: low.major + 1, minor: 0, patch: 0,
+            pre: "0" }
+    }
+    return [RangeComparator{ operator: ">=", version: low },
+        RangeComparator{ operator: "<", version: high }]
+}
+
+/// A tilde range: the last part given is the one allowed to move.
+fn tilde(parts: [i64], pre: str) -> [RangeComparator] {
+    let low = version_of(parts, pre)
+    var high = Version{ major: low.major + 1, minor: 0, patch: 0,
+        pre: "0" }
+    if parts[1] >= 0 {
+        high = Version{ major: low.major, minor: low.minor + 1, patch: 0,
+            pre: "0" }
+    }
+    return [RangeComparator{ operator: ">=", version: low },
+        RangeComparator{ operator: "<", version: high }]
+}
+
+/// An x-range: `1.2.x`, `1.x`, `*`.
+fn wildcard(parts: [i64], pre: str) -> [RangeComparator] {
+    if parts[0] < 0 {
+        return [RangeComparator{ operator: ">=",
+            version: Version{ major: 0, minor: 0, patch: 0, pre: "" } }]
+    }
+    let low = version_of(parts, pre)
+    if parts[1] < 0 {
+        return [RangeComparator{ operator: ">=", version: low },
+            RangeComparator{ operator: "<",
+                version: Version{ major: low.major + 1, minor: 0, patch: 0,
+                    pre: "0" } }]
+    }
+    return [RangeComparator{ operator: ">=", version: low },
+        RangeComparator{ operator: "<",
+            version: Version{ major: low.major, minor: low.minor + 1,
+                patch: 0, pre: "0" } }]
+}
+
+fn words_of(text: str) -> [str] {
+    var out: [str] = []
+    for piece in text.split(" ") {
+        if piece.trim().len() > 0 {
+            out.push(piece.trim())
+        }
+    }
+    return out
+}
+
+/// Read a range.
+pub fn parse(text: str) -> VersionRange ! RangeSetError {
+    var alternatives: [[RangeComparator]] = []
+    for part in text.split("||") {
+        alternatives.push(try comparators_of(part.trim()))
+    }
+    return VersionRange{ alternatives: alternatives }
+}
+
+fn comparators_of(text: str) -> [RangeComparator] ! RangeSetError {
+    var out: [RangeComparator] = []
+    let words = words_of(text)
+    if words.len() == 0 {
+        return [RangeComparator{ operator: ">=",
+            version: Version{ major: 0, minor: 0, patch: 0, pre: "" } }]
+    }
+    var i = 0
+    while i < words.len() {
+        // A hyphen range is three words: low, `-`, high.
+        if i + 2 < words.len() and words[i + 1] == "-" {
+            let low = parts_of(words[i])
+            let high = parts_of(words[i + 2])
+            out.push(RangeComparator{ operator: ">=",
+                version: version_of(low.0, low.1) })
+            if high.0[1] < 0 {
+                out.push(RangeComparator{ operator: "<",
+                    version: Version{ major: max_zero(high.0[0]) + 1,
+                        minor: 0, patch: 0, pre: "0" } })
+            } else if high.0[2] < 0 {
+                out.push(RangeComparator{ operator: "<",
+                    version: Version{ major: max_zero(high.0[0]),
+                        minor: max_zero(high.0[1]) + 1, patch: 0,
+                        pre: "0" } })
+            } else {
+                out.push(RangeComparator{ operator: "<=",
+                    version: version_of(high.0, high.1) })
+            }
+            i = i + 3
+            continue
+        }
+        // An operator may be separated from its version by spaces:
+        // `>= 1.0.0` is one comparator written as two words, and a
+        // reader that treats them separately refuses a range npm accepts.
+        var word = words[i]
+        if is_bare_operator(word) and i + 1 < words.len() {
+            word = word + words[i + 1]
+            i = i + 1
+        }
+        for one in try one_comparator(word) {
+            out.push(one)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+/// Whether a word is an operator with no version attached.
+fn is_bare_operator(word: str) -> bool {
+    return word == ">=" or word == "<=" or word == ">" or word == "<" or
+    word == "=" or word == "^" or word == "~"
+}
+
+fn one_comparator(word: str) -> [RangeComparator] ! RangeSetError {
+    if word.starts_with("^") {
+        let both = parts_of(word.substr(1, word.len() - 1))
+        return caret(both.0, both.1)
+    }
+    if word.starts_with("~") {
+        var rest = word.substr(1, word.len() - 1)
+        if rest.starts_with(">") {
+            rest = rest.substr(1, rest.len() - 1)
+        }
+        let both = parts_of(rest)
+        return tilde(both.0, both.1)
+    }
+    var operator = ""
+    for candidate in [">=", "<=", ">", "<", "="] {
+        if operator.len() == 0 and word.starts_with(candidate) {
+            operator = candidate
+        }
+    }
+    let rest = word.substr(operator.len(), word.len() - operator.len())
+    let both = parts_of(rest)
+    if operator.len() == 0 or operator == "=" {
+        if both.0[0] < 0 or both.0[1] < 0 or both.0[2] < 0 {
+            return wildcard(both.0, both.1)
+        }
+        return [RangeComparator{ operator: "=",
+            version: version_of(both.0, both.1) }]
+    }
+    if rest.len() == 0 {
+        fail(NotARange(word))
+    }
+    return [RangeComparator{ operator: operator,
+        version: version_of(both.0, both.1) }]
+}
+
+/// Whether a version satisfies one comparator.
+fn holds(version: Version, comparator: RangeComparator) -> bool {
+    let side = semver.compare(version, comparator.version)
+    if comparator.operator == "=" {
+        return side == 0
+    }
+    if comparator.operator == "<" {
+        return side < 0
+    }
+    if comparator.operator == "<=" {
+        return side <= 0
+    }
+    if comparator.operator == ">" {
+        return side > 0
+    }
+    return side >= 0
+}
+
+/// Whether a version satisfies a range.
+///
+/// A pre-release satisfies a range only when some comparator in the same
+/// alternative names a pre-release of the same major, minor and patch —
+/// which is the rule that keeps a beta out of a project that asked for
+/// `>=1.0.0`.
+pub fn satisfies(version: Version, range: VersionRange) -> bool {
+    for alternative in range.alternatives {
+        if satisfies_all(version, alternative) {
+            return true
+        }
+    }
+    return false
+}
+
+fn satisfies_all(version: Version, comparators: [RangeComparator]) -> bool {
+    for comparator in comparators {
+        if not holds(version, comparator) {
+            return false
+        }
+    }
+    if version.pre.len() == 0 {
+        return true
+    }
+    for comparator in comparators {
+        if comparator.version.pre.len() > 0 and
+        comparator.version.major == version.major and
+        comparator.version.minor == version.minor and
+        comparator.version.patch == version.patch {
+            return true
+        }
+    }
+    return false
+}
+
+/// Whether a written version satisfies a written range.
+pub fn matches(version: str, range: str) -> bool ! RangeSetError {
+    var found = Version{ major: 0, minor: 0, patch: 0, pre: "" }
+    match semver.parse(version) {
+        Ok(parsed) -> found = parsed
+        Err(_why) -> fail(NotARange(version))
+    }
+    return satisfies(found, try parse(range))
+}
+
+/// The highest of a list that satisfies a range, or the empty string.
+pub fn best(versions: [str], range: str) -> str ! RangeSetError {
+    let bounds = try parse(range)
+    var best = ""
+    var found = Version{ major: 0, minor: 0, patch: 0, pre: "" }
+    for written in versions {
+        match semver.parse(written) {
+            Ok(parsed) -> {
+                if satisfies(parsed, bounds) and
+                (best.len() == 0 or semver.compare(parsed, found) > 0) {
+                    best = written
+                    found = parsed
+                }
+            }
+            Err(_why) -> {}
+        }
+    }
+    return best
+}

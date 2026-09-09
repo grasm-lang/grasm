@@ -1,0 +1,207 @@
+// Four version schemes, and the four different orderings they impose.
+//
+// Every expected value was checked against the tool that owns the scheme:
+// Python's `packaging`, the npm range semantics, and dpkg's comparison.
+import pep440
+import pep508
+import semverrange
+import debversion
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+// ---------------------------------------------------------------- pep440
+
+fn pep_order(a: str, b: str) -> i64 {
+    let left = pep440.parse(a) ?? pep440.parse("0") ?? no_pep()
+    let right = pep440.parse(b) ?? pep440.parse("0") ?? no_pep()
+    return pep440.compare(left, right)
+}
+
+fn no_pep() -> PepVersion {
+    return PepVersion{ epoch: 0, release: [0], pre_kind: "",
+        pre_number: 0, post: 0 - 1, dev: 0 - 1, local: [] }
+}
+
+fn pep_text(text: str) -> str {
+    return pep440.normalise(pep440.parse(text) ?? no_pep())
+}
+
+fn check_pep440(inout f: i64) / {io} {
+    print("-- pep440: the ordering nobody guesses right")
+    say(f, "a development release is below the alpha, not above it",
+        pep_order("1.0.dev1", "1.0a1") < 0 and
+        pep_order("1.0a1", "1.0b1") < 0 and
+        pep_order("1.0rc1", "1.0") < 0 and
+        pep_order("1.0", "1.0.post1") < 0)
+    say(f, "trailing zeros do not change the version",
+        pep_order("1.0", "1.0.0") == 0 and pep_order("1", "1.0.0") == 0)
+    say(f, "an epoch outranks everything after it",
+        pep_order("1!1.0", "2.0") > 0)
+    say(f, "five spellings of one release candidate",
+        pep_text("1.0RC1") == "1.0rc1" and
+        pep_text("1.0-rc-1") == "1.0rc1" and
+        pep_text("1.0.rc1") == "1.0rc1" and
+        pep_text("1.0c1") == "1.0rc1" and
+        pep_text("v1.0rc1") == "1.0rc1")
+    say(f, "a local part sorts a version above the same one without",
+        pep_order("1.0+ubuntu1", "1.0") > 0 and
+        pep_order("1.0+ubuntu.2", "1.0+ubuntu.1") > 0)
+    say(f, "and its numeric segments outrank its alphabetic ones",
+        pep_order("1.0+1", "1.0+a") > 0)
+    say(f, "a wildcard specifier is a prefix match on the release",
+        satisfied("1.4.5", "==1.4.*") and not satisfied("1.5.0", "==1.4.*"))
+    say(f, "the compatible operator pins all but the last part given",
+        satisfied("1.4.6", "~=1.4.2") and
+        not satisfied("1.5.0", "~=1.4.2") and
+        not satisfied("1.4.1", "~=1.4.2"))
+    say(f, "an ordered comparison ignores the local part",
+        satisfied("1.0+local", ">=1.0") and satisfied("1.0+local", "<=1.0"))
+    say(f, "and a pre-release does not satisfy a bound below its release",
+        not satisfied("1.0rc1", ">=1.0") and satisfied("1.0rc1", ">=1.0rc1"))
+}
+
+fn satisfied(version: str, specifiers: str) -> bool {
+    return pep440.satisfies(version, specifiers) ?? false
+}
+
+// ---------------------------------------------------------------- pep508
+
+fn requirement_of(text: str) -> PepRequirement {
+    return pep508.parse(text) ?? PepRequirement{ name: "", extras: [],
+        specifiers: "", marker_text: "", url: "" }
+}
+
+fn check_pep508(inout f: i64) / {io} {
+    print("-- pep508: a requirement is four parts, three of them optional")
+    let one = requirement_of(
+        "requests[socks,security] >=2.28,<3 ; python_version >= \"3.8\"")
+    say(f, "the name, the extras, the specifiers and the marker",
+        one.name == "requests" and
+        one.extras == ["socks", "security"] and
+        one.specifiers == ">=2.28,<3" and
+        one.marker_text == "python_version >= \"3.8\"")
+    say(f, "a name is compared after collapsing its separators",
+        pep508.normalise_name("FLASK-Login") == "flask-login" and
+        pep508.normalise_name("flask_login") == "flask-login" and
+        pep508.normalise_name("a..b") == "a-b")
+    say(f, "a marker decides whether the requirement exists at all",
+        applies(one, [("python_version", "3.11")]) and
+        not applies(one, [("python_version", "3.7")]))
+    say(f, "in is a substring test, which is what it is in Python",
+        applies(requirement_of("x ; 'x86' in platform_machine"),
+            [("platform_machine", "x86_64")]) and
+        not applies(requirement_of("x ; 'arm' in platform_machine"),
+            [("platform_machine", "x86_64")]))
+    say(f, "an undefined variable reads as empty rather than failing",
+        not applies(requirement_of("x ; extra == \"dev\""), []) and
+        applies(requirement_of("x ; extra == \"dev\""),
+            [("extra", "dev")]))
+    say(f, "and or binds looser than and",
+        applies(requirement_of(
+            "x ; os_name == \"nt\" or python_version >= \"3.8\""),
+            [("os_name", "posix"), ("python_version", "3.11")]))
+    say(f, "a direct reference replaces the specifiers",
+        requirement_of("pkg @ https://example.test/pkg.whl").url ==
+        "https://example.test/pkg.whl")
+    say(f, "and a version is checked against the specifiers it carries",
+        accepts(one, "2.31.0") and not accepts(one, "3.0.0"))
+}
+
+fn applies(requirement: PepRequirement, environment: [(str, str)]) -> bool {
+    return pep508.applies(requirement, environment) ?? false
+}
+
+fn accepts(requirement: PepRequirement, version: str) -> bool {
+    return pep508.accepts(requirement, version) ?? false
+}
+
+// ----------------------------------------------------------- semverrange
+
+fn in_range(version: str, range: str) -> bool {
+    return semverrange.matches(version, range) ?? false
+}
+
+fn check_semver(inout f: i64) / {io} {
+    print("-- semverrange: the caret is not the same major")
+    say(f, "above one, the caret allows the minor and patch to move",
+        in_range("1.9.9", "^1.2.3") and not in_range("2.0.0", "^1.2.3") and
+        not in_range("1.2.2", "^1.2.3"))
+    say(f, "below one, the minor version is the breaking one",
+        in_range("0.2.9", "^0.2.3") and not in_range("0.3.0", "^0.2.3"))
+    say(f, "and below that, the patch is",
+        in_range("0.0.3", "^0.0.3") and not in_range("0.0.4", "^0.0.3"))
+    say(f, "the tilde lets the last part given move",
+        in_range("1.2.9", "~1.2.3") and not in_range("1.3.0", "~1.2.3") and
+        in_range("1.9.0", "~1") and not in_range("2.0.0", "~1"))
+    say(f, "an x-range is the same as leaving the part out",
+        in_range("1.2.9", "1.2.x") and not in_range("1.3.0", "1.2.x") and
+        in_range("9.9.9", "*"))
+    say(f, "a hyphen range includes both ends, rounded outward",
+        in_range("1.2.0", "1.2 - 2.3") and
+        in_range("2.3.9", "1.2 - 2.3") and
+        not in_range("2.4.0", "1.2 - 2.3"))
+    say(f, "alternatives are tried in turn",
+        in_range("3.0.0", ">=1 <2 || 3.x") and
+        in_range("1.5.0", ">=1 <2 || 3.x") and
+        not in_range("2.5.0", ">=1 <2 || 3.x"))
+    say(f, "and a pre-release only satisfies a range that names one",
+        not in_range("1.0.0-beta.1", ">=1.0.0") and
+        in_range("1.0.0-beta.1", ">=1.0.0-alpha") and
+        not in_range("2.0.0-beta.1", ">=1.0.0-alpha"))
+    say(f, "the best of a list is the highest that fits",
+        (semverrange.best(["1.0.0", "1.5.0", "2.0.0"], "^1.0.0") ?? "") ==
+        "1.5.0")
+}
+
+// ----------------------------------------------------------- debversion
+
+fn deb_order(a: str, b: str) -> i64 {
+    return debversion.compare_text(a, b) ?? 99
+}
+
+fn check_debian(inout f: i64) / {io} {
+    print("-- debversion: the tilde exists so a release supersedes its" +
+        " candidate")
+    say(f, "a tilde sorts below the empty string, so below the release",
+        deb_order("1.0~rc1", "1.0") < 0 and
+        deb_order("1.0~~", "1.0~") < 0 and
+        deb_order("1.0~", "1.0") < 0)
+    say(f, "a run of digits compares as a number",
+        deb_order("1.10", "1.9") > 0 and deb_order("1.007", "1.7") == 0)
+    say(f, "letters sort before every other character",
+        deb_order("1.0a", "1.0+") < 0)
+    say(f, "an epoch outranks the upstream version",
+        deb_order("1:1.0", "2.0") > 0)
+    say(f, "the revision is what follows the last hyphen",
+        (debversion.parse("1.0-1-2") ?? no_deb()).upstream == "1.0-1" and
+        (debversion.parse("1.0-1-2") ?? no_deb()).revision == "2")
+    say(f, "a revision breaks a tie in the upstream version",
+        deb_order("1.0-2", "1.0-1") > 0 and deb_order("1.0", "1.0-1") < 0)
+    say(f, "and the question a security advisory asks is answerable",
+        (debversion.at_least("1.2.3-4", "1.2.3-3") ?? false) and
+        not (debversion.at_least("1.2.3~rc1-1", "1.2.3-1") ?? true))
+}
+
+fn no_deb() -> DebVersion {
+    return DebVersion{ epoch: 0, upstream: "", revision: "" }
+}
+
+fn main() / {io} {
+    var f = 0
+    check_pep440(f)
+    check_pep508(f)
+    check_semver(f)
+    check_debian(f)
+    if f == 0 {
+        print("versions: every claim held")
+    } else {
+        print("versions: {f} claims failed")
+    }
+}
