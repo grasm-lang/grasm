@@ -1,0 +1,6 @@
+[package]
+name = "ion"
+version = "1.0.0"
+
+# Bytes. Opens nothing.
+capabilities = []

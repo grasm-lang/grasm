@@ -1,0 +1,576 @@
+// Cap'n Proto's wire format: pointers, and the arithmetic behind them.
+//
+// Like FlatBuffers, a Cap'n Proto message is read in place with no parsing
+// step. Unlike FlatBuffers, its indirection is a *pointer word* rather than
+// a vtable, and the difference shows up in what each format is good at:
+// FlatBuffers pays a level of indirection per table and gets cheap optional
+// fields; Cap'n Proto pays nothing per field and gets a struct whose layout
+// is fixed by its declared size.
+//
+// ## The four pointer kinds, in two bits
+//
+// Every pointer is one 64-bit word, and its bottom two bits say which of
+// four things it is:
+//
+//   0  a struct: a signed word offset, then the data section's size in
+//      words and the pointer section's size in words.
+//   1  a list: a signed word offset, a three-bit element size, and a count.
+//   2  a far pointer: this message is in more than one segment, and the
+//      real pointer is over there. The one case that makes a reader
+//      recursive.
+//   3  a capability, which only means something over an RPC connection.
+//
+// The offset is measured from the *end of the pointer word*, which is the
+// detail every first implementation gets wrong by one word.
+//
+// ## Fields are XORed with their defaults
+//
+// A field's stored value is the real value XOR the schema default. A field
+// left at its default is therefore zero on the wire, so a message of
+// defaults is a message of zeros and compresses to nothing. It also means a
+// reader must know the default to read the field at all — the bytes alone
+// do not say.
+//
+// ## Composite lists carry a tag
+//
+// A list of structs is element size 7, and its first word is a tag shaped
+// like a struct pointer whose offset field holds the element *count* rather
+// than an offset. The word count in the pointer is the whole list's size,
+// which is how a reader skips a list of structs without knowing the schema.
+
+type CapnError =
+    | TruncatedAt(word: i64)
+    | BadPointer(word: i64, kind: i64)
+    | NoSuchSegment(id: i64)
+    | BadFraming()
+    | Depth(word: i64)
+
+    /// A message: its segments, as word offsets into one buffer.
+type CapnMessage = {
+    data: bytes,
+    /// Where each segment starts, in bytes.
+    starts: [i64],
+    /// How long each segment is, in words.
+    lengths: [i64],
+}
+
+/// A struct, located.
+type CapnStruct = {
+    /// Where the data section starts, in bytes.
+    data_at: i64,
+    data_words: i64,
+    /// Where the pointer section starts, in bytes.
+    pointers_at: i64,
+    pointer_words: i64,
+    segment: i64,
+}
+
+/// A list, located.
+type CapnList = {
+    at: i64,
+    /// 0 void, 1 bit, 2 byte, 3 two bytes, 4 four, 5 eight, 6 pointer,
+    /// 7 composite.
+    element: i64,
+    count: i64,
+    /// For a composite list, the shape of each element.
+    data_words: i64,
+    pointer_words: i64,
+    segment: i64,
+}
+
+fn octet(message: CapnMessage, at: i64) -> i64 ! CapnError {
+    if at < 0 or at >= message.data.len() {
+        fail(TruncatedAt(at / 8))
+    }
+    return message.data.at(at)
+}
+
+/// One 64-bit little-endian word.
+pub fn word_at(message: CapnMessage, at: i64) -> i64 ! CapnError {
+    var value = 0
+    var i = 7
+    while i >= 0 {
+        value = value.shl(8) + (try octet(message, at + i))
+        i = i - 1
+    }
+    return value
+}
+
+/// Read the stream framing: a segment count, the sizes, then the segments.
+pub fn parse(data: bytes) -> CapnMessage ! CapnError {
+    if data.len() < 8 {
+        fail(BadFraming())
+    }
+    var count = 0
+    var i = 3
+    while i >= 0 {
+        count = count.shl(8) + data.at(i)
+        i = i - 1
+    }
+    count = count + 1
+    if count < 1 or count > 512 {
+        fail(BadFraming())
+    }
+    var lengths: [i64] = []
+    var s = 0
+    while s < count {
+        let at = 4 + s * 4
+        if at + 4 > data.len() {
+            fail(BadFraming())
+        }
+        var length = 0
+        var j = 3
+        while j >= 0 {
+            length = length.shl(8) + data.at(at + j)
+            j = j - 1
+        }
+        lengths.push(length)
+        s = s + 1
+    }
+    // The table is padded to a word boundary: with an even number of
+    // segments the four-byte count plus four bytes per segment is already a
+    // multiple of eight, and with an odd number four bytes of padding
+    // follow.
+    var start = 4 + count * 4
+    if start % 8 != 0 {
+        start = start + 4
+    }
+    var starts: [i64] = []
+    var k = 0
+    while k < count {
+        starts.push(start)
+        start = start + lengths[k] * 8
+        k = k + 1
+    }
+    if start > data.len() {
+        fail(BadFraming())
+    }
+    return CapnMessage{ data: data, starts: starts, lengths: lengths }
+}
+
+/// A message of one segment with no framing, as `capnp.to_bytes` writes for
+/// a single segment after the header is stripped.
+pub fn single_segment(data: bytes) -> CapnMessage {
+    return CapnMessage{ data: data, starts: [0],
+        lengths: [data.len() / 8] }
+}
+
+fn signed30(value: i64) -> i64 {
+    if value >= 536870912 {
+        return value - 1073741824
+    }
+    return value
+}
+
+fn signed29(value: i64) -> i64 {
+    if value >= 268435456 {
+        return value - 536870912
+    }
+    return value
+}
+
+/// Follow a pointer word to whatever it names.
+///
+/// `at` is the byte position of the pointer itself, because the offset is
+/// measured from the word after it.
+pub fn struct_pointer(message: CapnMessage, segment: i64, at: i64,
+    depth: i64) -> CapnStruct ! CapnError {
+    if depth > 64 {
+        fail(Depth(at / 8))
+    }
+    let word = try word_at(message, at)
+    if word == 0 {
+        // A null pointer is a struct of no words, which reads as every
+        // field at its default — which is exactly what an absent struct
+        // means.
+        return CapnStruct{ data_at: 0, data_words: 0, pointers_at: 0,
+            pointer_words: 0, segment: segment }
+    }
+    let kind = word.bit_and(3)
+    if kind == 2 {
+        let landed = try follow_far(message, word)
+        return try struct_pointer(message, landed.0, landed.1, depth + 1)
+    }
+    if kind != 0 {
+        fail(BadPointer(at / 8, kind))
+    }
+    let offset = signed30(word.ushr(2).bit_and(1073741823))
+    let data_words = word.ushr(32).bit_and(65535)
+    let pointer_words = word.ushr(48).bit_and(65535)
+    let data_at = at + 8 + offset * 8
+    return CapnStruct{ data_at: data_at, data_words: data_words,
+        pointers_at: data_at + data_words * 8,
+        pointer_words: pointer_words, segment: segment }
+}
+
+/// A far pointer, resolved to the segment and byte position it lands on.
+///
+/// The two-word form points at a landing pad holding the real pointer plus
+/// a tag; the one-word form points straight at the content. Both exist
+/// because a message that outgrows one segment has to be able to name
+/// things in another without rewriting what it already emitted.
+fn follow_far(message: CapnMessage, word: i64) -> (i64, i64) ! CapnError {
+    let offset = word.ushr(3).bit_and(536870911)
+    let segment = word.ushr(32).bit_and(4294967295)
+    if segment >= message.starts.len() {
+        fail(NoSuchSegment(segment))
+    }
+    let at = message.starts[segment] + offset * 8
+    // Bit 2 says whether the landing pad is one word or two, and a reader
+    // does the same thing either way: the pointer to follow is at that
+    // position. The distinction matters only to a writer deciding how much
+    // room to leave.
+    return (segment, at)
+}
+
+/// The root struct of a message.
+pub fn root_of(message: CapnMessage) -> CapnStruct ! CapnError {
+    if message.starts.len() == 0 {
+        fail(BadFraming())
+    }
+    return try struct_pointer(message, 0, message.starts[0], 0)
+}
+
+// ------------------------------------------------------ reading a struct
+
+/// A byte of the data section, or zero past its end.
+///
+/// Past the end rather than an error: a struct written by an older version
+/// of a schema is shorter than the reader expects, and every field it does
+/// not have reads as its default. That is how the format stays compatible
+/// in both directions, and a reader that raises here breaks it.
+fn data_octet(message: CapnMessage, item: CapnStruct,
+    at: i64) -> i64 ! CapnError {
+    if at < 0 or at >= item.data_words * 8 {
+        return 0
+    }
+    return try octet(message, item.data_at + at)
+}
+
+/// A one-bit field, XORed with its default.
+pub fn bool_field(message: CapnMessage, item: CapnStruct, bit: i64,
+    fallback: bool) -> bool ! CapnError {
+    let byte = try data_octet(message, item, bit / 8)
+    var value = byte.ushr(bit % 8).bit_and(1) == 1
+    if fallback {
+        return not value
+    }
+    return value
+}
+
+/// An unsigned byte field.
+pub fn u8_field(message: CapnMessage, item: CapnStruct, index: i64,
+    fallback: i64) -> i64 ! CapnError {
+    return (try data_octet(message, item, index)).bit_xor(fallback)
+        .bit_and(255)
+}
+
+/// A signed byte field.
+pub fn i8_field(message: CapnMessage, item: CapnStruct, index: i64,
+    fallback: i64) -> i64 ! CapnError {
+    let value = try u8_field(message, item, index, fallback.bit_and(255))
+    if value >= 128 {
+        return value - 256
+    }
+    return value
+}
+
+fn little(message: CapnMessage, item: CapnStruct, at: i64,
+    width: i64) -> i64 ! CapnError {
+    var value = 0
+    var i = width - 1
+    while i >= 0 {
+        value = value.shl(8) + (try data_octet(message, item, at + i))
+        i = i - 1
+    }
+    return value
+}
+
+/// A 16-bit field.
+pub fn i16_field(message: CapnMessage, item: CapnStruct, index: i64,
+    fallback: i64) -> i64 ! CapnError {
+    let value = (try little(message, item, index * 2, 2))
+        .bit_xor(fallback.bit_and(65535)).bit_and(65535)
+    if value >= 32768 {
+        return value - 65536
+    }
+    return value
+}
+
+/// A 32-bit field.
+pub fn i32_field(message: CapnMessage, item: CapnStruct, index: i64,
+    fallback: i64) -> i64 ! CapnError {
+    let value = (try little(message, item, index * 4, 4))
+        .bit_xor(fallback.bit_and(4294967295)).bit_and(4294967295)
+    if value >= 2147483648 {
+        return value - 4294967296
+    }
+    return value
+}
+
+/// A 64-bit field.
+pub fn i64_field(message: CapnMessage, item: CapnStruct, index: i64,
+    fallback: i64) -> i64 ! CapnError {
+    return (try little(message, item, index * 8, 8)).bit_xor(fallback)
+}
+
+/// A double field, XORed as bits.
+pub fn f64_field(message: CapnMessage, item: CapnStruct, index: i64,
+    fallback: f64) -> f64 ! CapnError {
+    return ((try little(message, item, index * 8, 8))
+            .bit_xor(fallback.to_bits())).from_bits()
+}
+
+/// A float field, widened.
+pub fn f32_field(message: CapnMessage, item: CapnStruct, index: i64,
+    fallback: f64) -> f64 ! CapnError {
+    // The default is XORed as the *float's* bits, so a schema default of
+    // 1.5 makes a stored 1.5 read as zeros on the wire.
+    let bits = (try little(message, item, index * 4, 4))
+        .bit_xor(narrow(fallback)).bit_and(4294967295)
+    return widen(bits)
+}
+
+/// A double's bit pattern narrowed to 32 bits, for the default XOR.
+fn narrow(value: f64) -> i64 {
+    let bits = value.to_bits()
+    let sign = bits.ushr(63).bit_and(1)
+    let exponent = bits.ushr(52).bit_and(2047)
+    let mantissa = bits.bit_and(4503599627370495)
+    if exponent == 0 and mantissa == 0 {
+        return sign.shl(31)
+    }
+    if exponent == 2047 {
+        return sign.shl(31) + 255.shl(23) + mantissa.ushr(29)
+    }
+    let narrowed = exponent - 896
+    if narrowed <= 0 {
+        return sign.shl(31)
+    }
+    if narrowed >= 255 {
+        return sign.shl(31) + 255.shl(23)
+    }
+    return sign.shl(31) + narrowed.shl(23) + mantissa.ushr(29)
+}
+
+fn widen(bits: i64) -> f64 {
+    let sign = bits.ushr(31).bit_and(1)
+    let exponent = bits.ushr(23).bit_and(255)
+    let mantissa = bits.bit_and(8388607)
+    if exponent == 0 and mantissa == 0 {
+        if sign == 1 {
+            return 0.0 - 0.0
+        }
+        return 0.0
+    }
+    if exponent == 255 {
+        return (sign.shl(63) + 2047.shl(52) + mantissa.shl(29)).from_bits()
+    }
+    return (sign.shl(63) + (exponent + 896).shl(52) +
+        mantissa.shl(29)).from_bits()
+}
+
+/// Where a pointer-section slot lives, or -1 when the struct is too short.
+fn pointer_at(item: CapnStruct, slot: i64) -> i64 {
+    if slot < 0 or slot >= item.pointer_words {
+        return 0 - 1
+    }
+    return item.pointers_at + slot * 8
+}
+
+/// A struct in a pointer slot.
+pub fn struct_field(message: CapnMessage, item: CapnStruct,
+    slot: i64) -> CapnStruct ! CapnError {
+    let at = pointer_at(item, slot)
+    if at < 0 {
+        return CapnStruct{ data_at: 0, data_words: 0, pointers_at: 0,
+            pointer_words: 0, segment: item.segment }
+    }
+    return try struct_pointer(message, item.segment, at, 0)
+}
+
+/// Whether a pointer slot holds anything.
+pub fn has_pointer(message: CapnMessage, item: CapnStruct,
+    slot: i64) -> bool {
+    let at = pointer_at(item, slot)
+    if at < 0 {
+        return false
+    }
+    match word_at(message, at) {
+        Ok(word) -> return word != 0
+        Err(_e) -> return false
+    }
+}
+
+/// A list in a pointer slot.
+pub fn list_field(message: CapnMessage, item: CapnStruct,
+    slot: i64) -> CapnList ! CapnError {
+    let at = pointer_at(item, slot)
+    if at < 0 {
+        return CapnList{ at: 0, element: 0, count: 0, data_words: 0,
+            pointer_words: 0, segment: item.segment }
+    }
+    return try list_pointer(message, item.segment, at)
+}
+
+/// Follow a list pointer.
+pub fn list_pointer(message: CapnMessage, segment: i64,
+    at: i64) -> CapnList ! CapnError {
+    let word = try word_at(message, at)
+    if word == 0 {
+        return CapnList{ at: 0, element: 0, count: 0, data_words: 0,
+            pointer_words: 0, segment: segment }
+    }
+    let kind = word.bit_and(3)
+    if kind == 2 {
+        let landed = try follow_far(message, word)
+        return try list_pointer(message, landed.0, landed.1)
+    }
+    if kind != 1 {
+        fail(BadPointer(at / 8, kind))
+    }
+    let offset = signed29(word.ushr(2).bit_and(1073741823))
+    let element = word.ushr(32).bit_and(7)
+    let count = word.ushr(35).bit_and(536870911)
+    let start = at + 8 + offset * 8
+    if element != 7 {
+        return CapnList{ at: start, element: element, count: count,
+            data_words: 0, pointer_words: 0, segment: segment }
+    }
+    // A composite list's first word is a tag: a struct pointer whose offset
+    // field holds the element count and whose sizes describe each element.
+    let tag = try word_at(message, start)
+    return CapnList{ at: start + 8, element: 7,
+        count: signed30(tag.ushr(2).bit_and(1073741823)),
+        data_words: tag.ushr(32).bit_and(65535),
+        pointer_words: tag.ushr(48).bit_and(65535), segment: segment }
+}
+
+/// How many bytes one element of a list takes.
+pub fn element_bytes(list: CapnList) -> i64 {
+    if list.element == 0 {
+        return 0
+    }
+    if list.element == 1 {
+        return 0
+    }
+    if list.element == 2 {
+        return 1
+    }
+    if list.element == 3 {
+        return 2
+    }
+    if list.element == 4 {
+        return 4
+    }
+    if list.element == 5 {
+        return 8
+    }
+    if list.element == 6 {
+        return 8
+    }
+    return (list.data_words + list.pointer_words) * 8
+}
+
+/// One struct of a composite list.
+pub fn list_struct(list: CapnList, index: i64) -> CapnStruct ! CapnError {
+    if index < 0 or index >= list.count {
+        fail(TruncatedAt(index))
+    }
+    let stride = (list.data_words + list.pointer_words) * 8
+    let at = list.at + index * stride
+    return CapnStruct{ data_at: at, data_words: list.data_words,
+        pointers_at: at + list.data_words * 8,
+        pointer_words: list.pointer_words, segment: list.segment }
+}
+
+/// One element of a list of scalars, read as an unsigned integer.
+pub fn list_scalar(message: CapnMessage, list: CapnList,
+    index: i64) -> i64 ! CapnError {
+    if index < 0 or index >= list.count {
+        fail(TruncatedAt(index))
+    }
+    if list.element == 1 {
+        let byte = try octet(message, list.at + index / 8)
+        return byte.ushr(index % 8).bit_and(1)
+    }
+    let width = element_bytes(list)
+    var value = 0
+    var i = width - 1
+    while i >= 0 {
+        value = value.shl(8) + (try octet(message, list.at + index * width +
+            i))
+        i = i - 1
+    }
+    return value
+}
+
+/// A text field: bytes with a terminating zero the count includes.
+pub fn text_field(message: CapnMessage, item: CapnStruct,
+    slot: i64) -> str ! CapnError {
+    let list = try list_field(message, item, slot)
+    if list.count == 0 {
+        return ""
+    }
+    return try decode_utf8(message, list.at, list.count - 1)
+}
+
+/// A data field, which is the same but without the terminator.
+pub fn data_field(message: CapnMessage, item: CapnStruct,
+    slot: i64) -> bytes ! CapnError {
+    let list = try list_field(message, item, slot)
+    var out: [i64] = []
+    var i = 0
+    while i < list.count {
+        out.push(try octet(message, list.at + i))
+        i = i + 1
+    }
+    return bytes_of(out)
+}
+
+/// One text of a list of texts.
+pub fn list_text(message: CapnMessage, list: CapnList,
+    index: i64) -> str ! CapnError {
+    if index < 0 or index >= list.count {
+        fail(TruncatedAt(index))
+    }
+    let at = list.at + index * 8
+    let inner = try list_pointer(message, list.segment, at)
+    if inner.count == 0 {
+        return ""
+    }
+    return try decode_utf8(message, inner.at, inner.count - 1)
+}
+
+fn decode_utf8(message: CapnMessage, from: i64,
+    length: i64) -> str ! CapnError {
+    var out = ""
+    var i = from
+    let stop = from + length
+    while i < stop {
+        let first = try octet(message, i)
+        if first < 128 {
+            out = out + first.to_char()
+            i = i + 1
+        } else if first >= 192 and first < 224 and i + 1 < stop {
+            out = out + ((first - 192) * 64 +
+                ((try octet(message, i + 1)) - 128)).to_char()
+            i = i + 2
+        } else if first >= 224 and first < 240 and i + 2 < stop {
+            out = out + ((first - 224) * 4096 +
+                ((try octet(message, i + 1)) - 128) * 64 +
+                ((try octet(message, i + 2)) - 128)).to_char()
+            i = i + 3
+        } else if first >= 240 and i + 3 < stop {
+            out = out + ((first - 240) * 262144 +
+                ((try octet(message, i + 1)) - 128) * 4096 +
+                ((try octet(message, i + 2)) - 128) * 64 +
+                ((try octet(message, i + 3)) - 128)).to_char()
+            i = i + 4
+        } else {
+            out = out + "\u{fffd}"
+            i = i + 1
+        }
+    }
+    return out
+}

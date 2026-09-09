@@ -1,0 +1,24 @@
+[package]
+name = "serialise4_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.ubjson]
+path = "../ubjson"
+version = "^1.0.0"
+
+[dependencies.ion]
+path = "../ion"
+version = "^1.0.0"
+
+[dependencies.thriftcompact]
+path = "../thriftcompact"
+version = "^1.0.0"
+
+[dependencies.flatbuffers]
+path = "../flatbuffers"
+version = "^1.0.0"
+
+[dependencies.capnp]
+path = "../capnp"
+version = "^1.0.0"

@@ -1,0 +1,650 @@
+// Universal Binary JSON: JSON's data model, written as bytes.
+//
+// The design goal was "binary JSON with no ambiguity and no loss", and the
+// result is a format where every value is a one-byte type marker followed by
+// its payload. There is no schema, nothing is optional, and a parser is
+// about two hundred lines — which is the whole appeal next to the formats
+// that need a compiler.
+//
+// ## What it buys over JSON
+//
+// Numbers do not go through decimal. A double stays eight bytes rather than
+// becoming seventeen digits and coming back not quite equal. Binary data is
+// a typed array rather than base64, which is a third smaller and does not
+// need a second encoding step. Lengths are known before the content, so a
+// reader can allocate once.
+//
+// ## What it does not buy
+//
+// It is not smaller than JSON for ordinary data. `{"a":1}` is seven bytes of
+// JSON and eight of UBJSON, because the marker overhead per value is one
+// byte and JSON's punctuation is often less. The win is on numbers, on
+// binary, and on not parsing text.
+//
+// ## The optimised containers
+//
+// A container may declare `$` for a shared type and `#` for a count, and
+// then omit both from every element. An array of a thousand bytes goes from
+// 2001 bytes to 1005. This is where implementations disagree: a count
+// without a type is legal, a type without a count is not, and a typed
+// container of `Z` (null) has a count and no payload at all — a run of a
+// million nulls in three bytes.
+
+type UbjsonError =
+    | TruncatedAt(at: i64)
+    | UnknownMarker(marker: str, at: i64)
+    | BadLength(length: i64, at: i64)
+    | TypeWithoutCount(at: i64)
+    | Depth(at: i64)
+
+    /// A decoded value.
+    ///
+    /// The integer widths are kept because UBJSON keeps them: a reader that
+    /// folded them all into one type could not write the bytes back.
+type Ubjson =
+    | Null
+    | True
+    | False
+    | NoOp
+    | Int8(v: i64)
+    | UInt8(v: i64)
+    | Int16(v: i64)
+    | Int32(v: i64)
+    | Int64(v: i64)
+    | Float32(v: f64)
+    | Float64(v: f64)
+    | HighPrecision(v: str)
+    | Char(v: str)
+    | Str(v: str)
+    | Array(items: [ref Ubjson])
+    | Object(keys: [str], values: [ref Ubjson])
+
+    /// Where a decoder is, so an error can say where it went wrong.
+type UbjsonReader = {
+    data: bytes,
+    at: i64,
+}
+
+fn need(inout reader: UbjsonReader, count: i64) -> bool ! UbjsonError {
+    if reader.at + count > reader.data.len() {
+        fail(TruncatedAt(reader.at))
+    }
+    return true
+}
+
+fn take(inout reader: UbjsonReader) -> i64 ! UbjsonError {
+    try need(reader, 1)
+    let value = reader.data.at(reader.at)
+    reader.at = reader.at + 1
+    return value
+}
+
+fn signed(value: i64, bits: i64) -> i64 {
+    var top = 1
+    var i = 0
+    while i < bits - 1 {
+        top = top * 2
+        i = i + 1
+    }
+    if value >= top {
+        return value - top * 2
+    }
+    return value
+}
+
+fn take_big_endian(inout reader: UbjsonReader,
+    count: i64) -> i64 ! UbjsonError {
+    try need(reader, count)
+    var value = 0
+    var i = 0
+    while i < count {
+        value = value * 256 + reader.data.at(reader.at + i)
+        i = i + 1
+    }
+    reader.at = reader.at + count
+    return value
+}
+
+/// The number of bytes a marker's payload takes, or -1 when it varies.
+pub fn payload_width(marker: str) -> i64 {
+    if marker == "i" or marker == "U" or marker == "C" {
+        return 1
+    }
+    if marker == "I" {
+        return 2
+    }
+    if marker == "l" or marker == "d" {
+        return 4
+    }
+    if marker == "L" or marker == "D" {
+        return 8
+    }
+    if marker == "Z" or marker == "T" or marker == "F" or marker == "N" {
+        return 0
+    }
+    return 0 - 1
+}
+
+/// Read one length: a marker and an integer, which must be non-negative.
+///
+/// A length may be written with any integer type, so a two-byte string can
+/// carry an eight-byte length. Refusing the negative case matters — a
+/// length of -1 read as unsigned is how a decoder is talked into allocating
+/// four gigabytes.
+fn read_length(inout reader: UbjsonReader) -> i64 ! UbjsonError {
+    let marker = (try take(reader)).to_char()
+    let value = try read_integer(reader, marker)
+    if value < 0 {
+        fail(BadLength(value, reader.at))
+    }
+    return value
+}
+
+fn read_integer(inout reader: UbjsonReader,
+    marker: str) -> i64 ! UbjsonError {
+    if marker == "i" {
+        return signed(try take(reader), 8)
+    }
+    if marker == "U" {
+        return try take(reader)
+    }
+    if marker == "I" {
+        return signed(try take_big_endian(reader, 2), 16)
+    }
+    if marker == "l" {
+        return signed(try take_big_endian(reader, 4), 32)
+    }
+    if marker == "L" {
+        return try take_big_endian(reader, 8)
+    }
+    fail(UnknownMarker(marker, reader.at))
+}
+
+fn read_text(inout reader: UbjsonReader) -> str ! UbjsonError {
+    let length = try read_length(reader)
+    try need(reader, length)
+    reader.at = reader.at + length
+    return from_utf8(reader.data, reader.at, length)
+}
+
+/// The bytes ending at `after` decoded as UTF-8.
+///
+/// UBJSON says strings are UTF-8 and says nothing about what to do with a
+/// sequence that is not, so this substitutes the replacement character
+/// rather than failing — which is what every other implementation does, and
+/// means a corrupt byte costs one character rather than the document.
+fn from_utf8(data: bytes, after: i64, length: i64) -> str {
+    var out = ""
+    var i = after - length
+    let stop = after
+    while i < stop {
+        let first = data.at(i)
+        if first < 128 {
+            out = out + first.to_char()
+            i = i + 1
+        } else if first >= 192 and first < 224 and i + 1 < stop {
+            out = out + ((first - 192) * 64 +
+                (data.at(i + 1) - 128)).to_char()
+            i = i + 2
+        } else if first >= 224 and first < 240 and i + 2 < stop {
+            out = out + ((first - 224) * 4096 +
+                (data.at(i + 1) - 128) * 64 +
+                (data.at(i + 2) - 128)).to_char()
+            i = i + 3
+        } else if first >= 240 and i + 3 < stop {
+            out = out + ((first - 240) * 262144 +
+                (data.at(i + 1) - 128) * 4096 +
+                (data.at(i + 2) - 128) * 64 +
+                (data.at(i + 3) - 128)).to_char()
+            i = i + 4
+        } else {
+            out = out + "\u{fffd}"
+            i = i + 1
+        }
+    }
+    return out
+}
+
+fn read_float(inout reader: UbjsonReader,
+    marker: str) -> f64 ! UbjsonError {
+    if marker == "d" {
+        return float_of_bits(try take_big_endian(reader, 4), true)
+    }
+    return float_of_bits(try take_big_endian(reader, 8), false)
+}
+
+fn float_of_bits(bits: i64, single: bool) -> f64 {
+    if not single {
+        return bits.from_bits()
+    }
+    // A 32-bit float widened to 64: move the sign, rebias the exponent by
+    // the difference between 127 and 1023, and shift the mantissa up by 29.
+    let sign = bits.ushr(31).bit_and(1)
+    let exponent = bits.ushr(23).bit_and(255)
+    let mantissa = bits.bit_and(8388607)
+    if exponent == 0 and mantissa == 0 {
+        if sign == 1 {
+            return 0.0 - 0.0
+        }
+        return 0.0
+    }
+    if exponent == 255 {
+        // Infinity and not-a-number both keep the top exponent.
+        return (sign.shl(63) + 2047.shl(52) + mantissa.shl(29)).from_bits()
+    }
+    return (sign.shl(63) + (exponent + 896).shl(52) +
+        mantissa.shl(29)).from_bits()
+}
+
+/// Read one value.
+pub fn decode(data: bytes) -> Ubjson ! UbjsonError {
+    var reader = UbjsonReader{ data: data, at: 0 }
+    return try read_value(reader, 0)
+}
+
+/// Read one value and say where the reader stopped, for a stream of them.
+pub fn decode_from(data: bytes,
+    at: i64) -> (Ubjson, i64) ! UbjsonError {
+    var reader = UbjsonReader{ data: data, at: at }
+    let value = try read_value(reader, 0)
+    return (value, reader.at)
+}
+
+fn read_value(inout reader: UbjsonReader,
+    depth: i64) -> Ubjson ! UbjsonError {
+    if depth > 200 {
+        fail(Depth(reader.at))
+    }
+    var marker = (try take(reader)).to_char()
+    // A no-op is filler a writer may emit at any point, including between a
+    // container's elements, and is not a value.
+    while marker == "N" {
+        marker = (try take(reader)).to_char()
+    }
+    if marker == "Z" {
+        return Null
+    }
+    if marker == "T" {
+        return True
+    }
+    if marker == "F" {
+        return False
+    }
+    if marker == "i" {
+        return Int8(signed(try take(reader), 8))
+    }
+    if marker == "U" {
+        return UInt8(try take(reader))
+    }
+    if marker == "I" {
+        return Int16(signed(try take_big_endian(reader, 2), 16))
+    }
+    if marker == "l" {
+        return Int32(signed(try take_big_endian(reader, 4), 32))
+    }
+    if marker == "L" {
+        return Int64(try take_big_endian(reader, 8))
+    }
+    if marker == "d" {
+        return Float32(try read_float(reader, "d"))
+    }
+    if marker == "D" {
+        return Float64(try read_float(reader, "D"))
+    }
+    if marker == "H" {
+        return HighPrecision(try read_text(reader))
+    }
+    if marker == "C" {
+        return Char((try take(reader)).to_char())
+    }
+    if marker == "S" {
+        return Str(try read_text(reader))
+    }
+    if marker == "[" {
+        return try read_array(reader, depth)
+    }
+    if marker == "\{" {
+        return try read_object(reader, depth)
+    }
+    fail(UnknownMarker(marker, reader.at - 1))
+}
+
+/// The `$` type and `#` count a container may declare, and whether it did.
+fn read_header(inout reader: UbjsonReader) -> (str, i64) ! UbjsonError {
+    var shared = ""
+    var count = 0 - 1
+    if reader.at < reader.data.len() and
+    reader.data.at(reader.at).to_char() == "$" {
+        reader.at = reader.at + 1
+        shared = (try take(reader)).to_char()
+        // A type without a count is not allowed: there would be no way to
+        // know where the container ends, since the elements no longer carry
+        // markers and the closing byte is a valid payload.
+        if reader.at >= reader.data.len() or
+        reader.data.at(reader.at).to_char() != "#" {
+            fail(TypeWithoutCount(reader.at))
+        }
+    }
+    if reader.at < reader.data.len() and
+    reader.data.at(reader.at).to_char() == "#" {
+        reader.at = reader.at + 1
+        count = try read_length(reader)
+    }
+    return (shared, count)
+}
+
+fn read_typed(inout reader: UbjsonReader, shared: str,
+    depth: i64) -> Ubjson ! UbjsonError {
+    if shared == "Z" {
+        return Null
+    }
+    if shared == "T" {
+        return True
+    }
+    if shared == "F" {
+        return False
+    }
+    if shared == "i" {
+        return Int8(signed(try take(reader), 8))
+    }
+    if shared == "U" {
+        return UInt8(try take(reader))
+    }
+    if shared == "I" {
+        return Int16(signed(try take_big_endian(reader, 2), 16))
+    }
+    if shared == "l" {
+        return Int32(signed(try take_big_endian(reader, 4), 32))
+    }
+    if shared == "L" {
+        return Int64(try take_big_endian(reader, 8))
+    }
+    if shared == "d" {
+        return Float32(try read_float(reader, "d"))
+    }
+    if shared == "D" {
+        return Float64(try read_float(reader, "D"))
+    }
+    if shared == "C" {
+        return Char((try take(reader)).to_char())
+    }
+    if shared == "S" {
+        return Str(try read_text(reader))
+    }
+    if shared == "H" {
+        return HighPrecision(try read_text(reader))
+    }
+    if shared == "[" or shared == "\{" {
+        // A container of containers still needs its own header read, so the
+        // marker is put back rather than consumed.
+        reader.at = reader.at - 1
+        return try read_value(reader, depth + 1)
+    }
+    fail(UnknownMarker(shared, reader.at))
+}
+
+fn read_array(inout reader: UbjsonReader,
+    depth: i64) -> Ubjson ! UbjsonError {
+    let header = try read_header(reader)
+    var items: [ref Ubjson] = []
+    if header.1 >= 0 {
+        var i = 0
+        while i < header.1 {
+            if header.0 == "" {
+                items.push(ref(try read_value(reader, depth + 1)))
+            } else {
+                items.push(ref(try read_typed(reader, header.0,
+                    depth + 1)))
+            }
+            i = i + 1
+        }
+        return Array(items)
+    }
+    while true {
+        try need(reader, 1)
+        if reader.data.at(reader.at).to_char() == "]" {
+            reader.at = reader.at + 1
+            return Array(items)
+        }
+        items.push(ref(try read_value(reader, depth + 1)))
+    }
+    return Array(items)
+}
+
+fn read_object(inout reader: UbjsonReader,
+    depth: i64) -> Ubjson ! UbjsonError {
+    let header = try read_header(reader)
+    var keys: [str] = []
+    var values: [ref Ubjson] = []
+    if header.1 >= 0 {
+        var i = 0
+        while i < header.1 {
+            keys.push(try read_text(reader))
+            if header.0 == "" {
+                values.push(ref(try read_value(reader, depth + 1)))
+            } else {
+                values.push(ref(try read_typed(reader, header.0,
+                    depth + 1)))
+            }
+            i = i + 1
+        }
+        return Object(keys, values)
+    }
+    while true {
+        try need(reader, 1)
+        if reader.data.at(reader.at).to_char() == "}" {
+            reader.at = reader.at + 1
+            return Object(keys, values)
+        }
+        keys.push(try read_text(reader))
+        values.push(ref(try read_value(reader, depth + 1)))
+    }
+    return Object(keys, values)
+}
+
+// --------------------------------------------------------------- writing
+
+fn push_big_endian(inout out: [i64], value: i64, count: i64) {
+    var i = count - 1
+    while i >= 0 {
+        out.push(value.ushr(i * 8).bit_and(255))
+        i = i - 1
+    }
+}
+
+fn push_text(inout out: [i64], text: str) {
+    let encoded = text.to_bytes()
+    push_length(out, encoded.len())
+    var i = 0
+    while i < encoded.len() {
+        out.push(encoded.at(i))
+        i = i + 1
+    }
+}
+
+/// A length, written in the narrowest integer type that holds it.
+///
+/// Narrowest, because a writer that always used `l` would be correct and
+/// would waste three bytes on every short string, and the round-trip test
+/// against another implementation would fail on the bytes while agreeing on
+/// the value.
+fn push_length(inout out: [i64], length: i64) {
+    if length < 256 {
+        // `U` rather than `i`: both are one byte below 128 and only `U`
+        // reaches 255, so for a quantity that cannot be negative it is
+        // never worse. Writers that pick `i` here produce different bytes
+        // for the same document, which is legal and is why two UBJSON
+        // libraries can disagree byte for byte while agreeing on every
+        // value.
+        out.push(85)
+        out.push(length)
+    } else if length < 32768 {
+        out.push(73)
+        push_big_endian(out, length, 2)
+    } else {
+        out.push(108)
+        push_big_endian(out, length, 4)
+    }
+}
+
+/// Write a value.
+pub fn encode(value: Ubjson) -> bytes {
+    var out: [i64] = []
+    write_value(out, value)
+    return bytes_of(out)
+}
+
+fn write_value(inout out: [i64], value: Ubjson) {
+    match value {
+        Null -> out.push(90)
+        True -> out.push(84)
+        False -> out.push(70)
+        NoOp -> out.push(78)
+        Int8(v) -> {
+            out.push(105)
+            out.push(v.bit_and(255))
+        }
+        UInt8(v) -> {
+            out.push(85)
+            out.push(v.bit_and(255))
+        }
+        Int16(v) -> {
+            out.push(73)
+            push_big_endian(out, v.bit_and(65535), 2)
+        }
+        Int32(v) -> {
+            out.push(108)
+            push_big_endian(out, v.bit_and(4294967295), 4)
+        }
+        Int64(v) -> {
+            out.push(76)
+            push_big_endian(out, v, 8)
+        }
+        Float32(v) -> {
+            out.push(100)
+            push_big_endian(out, single_bits(v), 4)
+        }
+        Float64(v) -> {
+            out.push(68)
+            push_big_endian(out, v.to_bits(), 8)
+        }
+        HighPrecision(v) -> {
+            out.push(72)
+            push_text(out, v)
+        }
+        Char(v) -> {
+            out.push(67)
+            out.push(v.codes()[0])
+        }
+        Str(v) -> {
+            out.push(83)
+            push_text(out, v)
+        }
+        Array(items) -> {
+            out.push(91)
+            for item in items {
+                write_value(out, item.value)
+            }
+            out.push(93)
+        }
+        Object(keys, values) -> {
+            out.push(123)
+            var i = 0
+            while i < keys.len() {
+                push_text(out, keys[i])
+                write_value(out, values[i].value)
+                i = i + 1
+            }
+            out.push(125)
+        }
+    }
+}
+
+/// A double narrowed to a 32-bit pattern, rounding to nearest even.
+fn single_bits(value: f64) -> i64 {
+    let bits = value.to_bits()
+    let sign = bits.ushr(63).bit_and(1)
+    let exponent = bits.ushr(52).bit_and(2047)
+    let mantissa = bits.bit_and(4503599627370495)
+    if exponent == 0 and mantissa == 0 {
+        return sign.shl(31)
+    }
+    if exponent == 2047 {
+        return sign.shl(31) + 255.shl(23) + mantissa.ushr(29)
+    }
+    let narrowed = exponent - 896
+    if narrowed <= 0 {
+        return sign.shl(31)
+    }
+    if narrowed >= 255 {
+        return sign.shl(31) + 255.shl(23)
+    }
+    // Round to nearest, ties to even, on the 29 bits being dropped.
+    var kept = mantissa.ushr(29)
+    let dropped = mantissa.bit_and(536870911)
+    if dropped > 268435456 or (dropped == 268435456 and
+        kept.bit_and(1) == 1) {
+        kept = kept + 1
+        if kept == 8388608 {
+            return sign.shl(31) + (narrowed + 1).shl(23)
+        }
+    }
+    return sign.shl(31) + narrowed.shl(23) + kept
+}
+
+/// The smallest integer marker that holds a value.
+///
+/// UBJSON has five integer widths and every writer has to choose. The
+/// specification says to use the smallest, and two writers that disagree
+/// produce different bytes for the same number — which is why a round-trip
+/// test has to compare values and a byte-identity test has to say which
+/// writer it is imitating.
+pub fn narrowest(value: i64) -> Ubjson {
+    // `U` for anything that fits in an unsigned byte, `i` only for the
+    // negatives it reaches. Both are one byte below 128, so the choice is
+    // arbitrary there and every writer has to make it the same way to
+    // produce the same bytes; this is py-ubjson's, and the specification's
+    // own examples agree.
+    if value >= 0 and value <= 255 {
+        return UInt8(value)
+    }
+    if value >= 0 - 128 and value < 0 {
+        return Int8(value)
+    }
+    if value >= 0 - 32768 and value <= 32767 {
+        return Int16(value)
+    }
+    if value >= 0 - 2147483648 and value <= 2147483647 {
+        return Int32(value)
+    }
+    return Int64(value)
+}
+
+/// The value as an integer, whatever width it was written in.
+pub fn as_integer(value: Ubjson) -> i64 ! UbjsonError {
+    match value {
+        Int8(v) -> return v
+        UInt8(v) -> return v
+        Int16(v) -> return v
+        Int32(v) -> return v
+        Int64(v) -> return v
+        _ -> fail(UnknownMarker("not an integer", 0))
+    }
+}
+
+/// A field of an object, by name.
+pub fn field_of(value: Ubjson, name: str) -> Ubjson ! UbjsonError {
+    match value {
+        Object(keys, values) -> {
+            var i = 0
+            while i < keys.len() {
+                if keys[i] == name {
+                    return values[i].value
+                }
+                i = i + 1
+            }
+            fail(UnknownMarker(name, 0))
+        }
+        _ -> fail(UnknownMarker("not an object", 0))
+    }
+}

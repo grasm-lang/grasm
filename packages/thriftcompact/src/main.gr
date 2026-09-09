@@ -1,0 +1,359 @@
+// Thrift's compact protocol: the wire format, without the code generator.
+//
+// Thrift is usually met through a compiler that turns a `.thrift` file into
+// classes. The wire format underneath is separately specified and is worth
+// having on its own: it is how you read a message from a service whose IDL
+// you do not have, how you write a proxy that forwards fields it does not
+// understand, and how you find out why two implementations disagree.
+//
+// ## Field ids are deltas, which is most of the saving
+//
+// A struct's fields are written in ascending id order and each header
+// carries the *difference* from the previous id. Almost every difference is
+// small, so almost every field header is one byte: four bits of delta and
+// four of type. When the delta will not fit, a zero delta signals that the
+// id follows as a zigzag varint.
+//
+// ## Zigzag, and why not two's complement
+//
+// A varint spends seven bits a byte, so a small number is one byte and a
+// negative number in two's complement has its top bit set and takes ten.
+// Zigzag maps -1 to 1, 1 to 2, -2 to 3: small magnitudes stay small
+// whichever way they point. Every format that stores signed integers as
+// varints does this, and the ones that forgot are the ones where a
+// timestamp difference of -1 costs ten bytes.
+//
+// ## Booleans are in the header
+//
+// A boolean field has no body: its value is in the type nibble, 1 for true
+// and 2 for false. This saves a byte per boolean and costs a special case
+// in every reader and writer, including inside lists, where booleans go
+// back to being one byte each.
+
+type ThriftError =
+    | TruncatedAt(at: i64)
+    | UnknownType(code: i64, at: i64)
+    | Overlong(at: i64)
+    | BadMessage(at: i64)
+    | Depth(at: i64)
+
+    /// A decoded value.
+type ThriftValue =
+    | ThriftStop
+    | ThriftBool(v: bool)
+    | ThriftByte(v: i64)
+    | ThriftI16(v: i64)
+    | ThriftI32(v: i64)
+    | ThriftI64(v: i64)
+    | ThriftDouble(v: f64)
+    | ThriftBinary(v: bytes)
+    | ThriftList(element: i64, items: [ref ThriftValue])
+    | ThriftSet(element: i64, items: [ref ThriftValue])
+    | ThriftMap(key_type: i64, value_type: i64, keys: [ref ThriftValue],
+    values: [ref ThriftValue])
+    | ThriftStruct(ids: [i64], types: [i64], values: [ref ThriftValue])
+
+type ThriftReader = {
+    data: bytes,
+    at: i64,
+}
+
+/// The type codes the compact protocol uses, which are not the ones the
+/// binary protocol uses.
+pub fn type_name(code: i64) -> str {
+    if code == 0 {
+        return "stop"
+    }
+    if code == 1 {
+        return "true"
+    }
+    if code == 2 {
+        return "false"
+    }
+    if code == 3 {
+        return "byte"
+    }
+    if code == 4 {
+        return "i16"
+    }
+    if code == 5 {
+        return "i32"
+    }
+    if code == 6 {
+        return "i64"
+    }
+    if code == 7 {
+        return "double"
+    }
+    if code == 8 {
+        return "binary"
+    }
+    if code == 9 {
+        return "list"
+    }
+    if code == 10 {
+        return "set"
+    }
+    if code == 11 {
+        return "map"
+    }
+    if code == 12 {
+        return "struct"
+    }
+    return "unknown"
+}
+
+fn need(inout reader: ThriftReader, count: i64) -> bool ! ThriftError {
+    if reader.at + count > reader.data.len() {
+        fail(TruncatedAt(reader.at))
+    }
+    return true
+}
+
+fn take(inout reader: ThriftReader) -> i64 ! ThriftError {
+    try need(reader, 1)
+    let value = reader.data.at(reader.at)
+    reader.at = reader.at + 1
+    return value
+}
+
+/// An unsigned varint: seven bits a byte, low first, the top bit meaning
+/// "more".
+pub fn read_varint(inout reader: ThriftReader) -> i64 ! ThriftError {
+    var value = 0
+    var shift = 0
+    var count = 0
+    while true {
+        let byte = try take(reader)
+        count = count + 1
+        if count > 10 {
+            fail(Overlong(reader.at))
+        }
+        value = value + byte.bit_and(127).shl(shift)
+        if byte < 128 {
+            return value
+        }
+        shift = shift + 7
+    }
+    return value
+}
+
+/// Zigzag: the mapping that keeps a small negative number small.
+pub fn zigzag_decode(value: i64) -> i64 {
+    return value.ushr(1).bit_xor(0 - value.bit_and(1))
+}
+
+/// The inverse, for writing.
+pub fn zigzag_encode(value: i64) -> i64 {
+    return value.shl(1).bit_xor(value.shr(63))
+}
+
+/// A signed varint, which is a varint of the zigzag.
+pub fn read_zigzag(inout reader: ThriftReader) -> i64 ! ThriftError {
+    return zigzag_decode(try read_varint(reader))
+}
+
+fn read_binary(inout reader: ThriftReader) -> bytes ! ThriftError {
+    let length = try read_varint(reader)
+    if length < 0 {
+        fail(BadMessage(reader.at))
+    }
+    try need(reader, length)
+    var out: [i64] = []
+    var i = 0
+    while i < length {
+        out.push(reader.data.at(reader.at + i))
+        i = i + 1
+    }
+    reader.at = reader.at + length
+    return bytes_of(out)
+}
+
+/// Read a struct: field headers until a stop byte.
+pub fn read_struct(inout reader: ThriftReader,
+    depth: i64) -> ThriftValue ! ThriftError {
+    if depth > 100 {
+        fail(Depth(reader.at))
+    }
+    var ids: [i64] = []
+    var types: [i64] = []
+    var values: [ref ThriftValue] = []
+    var previous = 0
+    while true {
+        let header = try take(reader)
+        if header == 0 {
+            return ThriftStruct(ids, types, values)
+        }
+        let kind = header.bit_and(15)
+        let delta = header.ushr(4).bit_and(15)
+        var id = 0
+        if delta == 0 {
+            id = try read_zigzag(reader)
+        } else {
+            id = previous + delta
+        }
+        previous = id
+        ids.push(id)
+        types.push(kind)
+        // A boolean field's value is the type nibble, so there is nothing
+        // to read for it.
+        if kind == 1 {
+            values.push(ref(ThriftBool(true)))
+        } else if kind == 2 {
+            values.push(ref(ThriftBool(false)))
+        } else {
+            values.push(ref(try read_value(reader, kind, depth + 1)))
+        }
+    }
+    return ThriftStruct(ids, types, values)
+}
+
+fn read_value(inout reader: ThriftReader, kind: i64,
+    depth: i64) -> ThriftValue ! ThriftError {
+    if depth > 100 {
+        fail(Depth(reader.at))
+    }
+    if kind == 1 {
+        return ThriftBool(true)
+    }
+    if kind == 2 {
+        return ThriftBool(false)
+    }
+    if kind == 3 {
+        let byte = try take(reader)
+        if byte >= 128 {
+            return ThriftByte(byte - 256)
+        }
+        return ThriftByte(byte)
+    }
+    if kind == 4 {
+        return ThriftI16(try read_zigzag(reader))
+    }
+    if kind == 5 {
+        return ThriftI32(try read_zigzag(reader))
+    }
+    if kind == 6 {
+        return ThriftI64(try read_zigzag(reader))
+    }
+    if kind == 7 {
+        // Little-endian in the compact protocol, big-endian in the binary
+        // one. The two protocols disagree about this and about nothing
+        // else in the double, which is a fine way to lose a day.
+        try need(reader, 8)
+        var bits = 0
+        var i = 7
+        while i >= 0 {
+            bits = bits * 256 + reader.data.at(reader.at + i)
+            i = i - 1
+        }
+        reader.at = reader.at + 8
+        return ThriftDouble(bits.from_bits())
+    }
+    if kind == 8 {
+        return ThriftBinary(try read_binary(reader))
+    }
+    if kind == 9 or kind == 10 {
+        let header = try take(reader)
+        var size = header.ushr(4).bit_and(15)
+        let element = header.bit_and(15)
+        // Fifteen means the size did not fit in the nibble and follows as a
+        // varint, which is the only escape in the format.
+        if size == 15 {
+            size = try read_varint(reader)
+        }
+        var items: [ref ThriftValue] = []
+        var j = 0
+        while j < size {
+            items.push(ref(try read_element(reader, element, depth + 1)))
+            j = j + 1
+        }
+        if kind == 10 {
+            return ThriftSet(element, items)
+        }
+        return ThriftList(element, items)
+    }
+    if kind == 11 {
+        let size = try read_varint(reader)
+        if size == 0 {
+            return ThriftMap(0, 0, [], [])
+        }
+        let types = try take(reader)
+        let key_type = types.ushr(4).bit_and(15)
+        let value_type = types.bit_and(15)
+        var keys: [ref ThriftValue] = []
+        var values: [ref ThriftValue] = []
+        var j = 0
+        while j < size {
+            keys.push(ref(try read_element(reader, key_type, depth + 1)))
+            values.push(ref(try read_element(reader, value_type,
+                depth + 1)))
+            j = j + 1
+        }
+        return ThriftMap(key_type, value_type, keys, values)
+    }
+    if kind == 12 {
+        return try read_struct(reader, depth + 1)
+    }
+    fail(UnknownType(kind, reader.at))
+}
+
+/// An element inside a container.
+///
+/// Booleans are the one difference from a field: inside a list they have a
+/// body of one byte, because there is no field header to hide in.
+fn read_element(inout reader: ThriftReader, kind: i64,
+    depth: i64) -> ThriftValue ! ThriftError {
+    if kind == 1 or kind == 2 {
+        return ThriftBool((try take(reader)) == 1)
+    }
+    return try read_value(reader, kind, depth)
+}
+
+/// Read a struct from the start of a buffer.
+pub fn decode_struct(data: bytes) -> ThriftValue ! ThriftError {
+    var reader = ThriftReader{ data: data, at: 0 }
+    return try read_struct(reader, 0)
+}
+
+/// A message header: the protocol byte, the version and type, the sequence
+/// id and the method name.
+pub fn decode_message(data: bytes) -> (str, i64, i64,
+    ThriftValue) ! ThriftError {
+    var reader = ThriftReader{ data: data, at: 0 }
+    let first = try take(reader)
+    if first != 130 {
+        fail(BadMessage(0))
+    }
+    let second = try take(reader)
+    if second.bit_and(31) != 1 {
+        fail(BadMessage(1))
+    }
+    let kind = second.ushr(5).bit_and(7)
+    let sequence = try read_varint(reader)
+    let name = try read_binary(reader)
+    var text = ""
+    var i = 0
+    while i < name.len() {
+        text = text + name.at(i).to_char()
+        i = i + 1
+    }
+    return (text, kind, sequence, try read_struct(reader, 0))
+}
+
+/// A struct's field, by id.
+pub fn field_of(value: ThriftValue,
+    id: i64) -> ThriftValue ! ThriftError {
+    match value {
+        ThriftStruct(ids, _types, values) -> {
+            var i = 0
+            while i < ids.len() {
+                if ids[i] == id {
+                    return values[i].value
+                }
+                i = i + 1
+            }
+            fail(UnknownType(id, 0))
+        }
+        _ -> fail(UnknownType(0, 0))
+    }
+}

@@ -1,0 +1,408 @@
+// FlatBuffers: read a field without parsing the message.
+//
+// Every other format here turns bytes into objects before you can ask a
+// question of them. FlatBuffers does not: the buffer *is* the object graph,
+// laid out so that reading field 3 of the root table is two loads and an
+// add. A message can be memory-mapped and one field read out of a gigabyte
+// without touching the rest, which is the entire reason the format exists
+// and the reason its layout looks the way it does.
+//
+// ## The vtable, which is the whole trick
+//
+// A table starts with a signed 32-bit offset *backwards* to its vtable. The
+// vtable is a list of 16-bit offsets, one per field, from the start of the
+// table to that field's data — or zero, meaning the field is absent. Absent
+// fields cost nothing, adding a field to a schema does not move the ones
+// before it, and two tables with the same field pattern share one vtable.
+//
+// Backwards, because the vtable is written after the table it describes: a
+// writer builds the buffer back to front, so it always knows the size of
+// what it has already emitted.
+//
+// ## Everything is aligned, and nothing is copied
+//
+// Scalars sit at their natural alignment so a reader can load them
+// directly. That costs padding — a table with an i8 and an i64 wastes seven
+// bytes — and buys a read that is a single instruction rather than four
+// shifts.
+//
+// ## Offsets are unsigned and relative
+//
+// A pointer to a string, a vector or another table is a 32-bit offset from
+// the location of the offset itself, forwards. Relative, so a buffer can be
+// copied anywhere; unsigned, so it can only point forwards, which makes
+// cycles unrepresentable and traversal terminating by construction.
+
+type FlatError =
+    | TruncatedAt(at: i64)
+    | BadOffset(at: i64, offset: i64)
+    | NoSuchField(slot: i64)
+    | NotAligned(at: i64, alignment: i64)
+    | BadIdentifier(found: str)
+
+    /// A table: where it starts, and where its vtable is.
+type Flat = {
+    data: bytes,
+    /// The table's own position in the buffer.
+    at: i64,
+    vtable: i64,
+    /// How many bytes the vtable covers, so a field beyond it reads as
+    /// absent rather than as whatever follows.
+    vtable_bytes: i64,
+}
+
+fn read_u8(data: bytes, at: i64) -> i64 ! FlatError {
+    if at < 0 or at >= data.len() {
+        fail(TruncatedAt(at))
+    }
+    return data.at(at)
+}
+
+/// A 16-bit unsigned integer, little-endian, which is what the format uses
+/// everywhere.
+pub fn read_u16(data: bytes, at: i64) -> i64 ! FlatError {
+    return (try read_u8(data, at)) + (try read_u8(data, at + 1)) * 256
+}
+
+/// A 32-bit unsigned integer.
+pub fn read_u32(data: bytes, at: i64) -> i64 ! FlatError {
+    return (try read_u16(data, at)) + (try read_u16(data, at + 2)) * 65536
+}
+
+/// A 32-bit signed integer, which is what a vtable offset is.
+pub fn read_i32(data: bytes, at: i64) -> i64 ! FlatError {
+    let value = try read_u32(data, at)
+    if value >= 2147483648 {
+        return value - 4294967296
+    }
+    return value
+}
+
+/// A 64-bit integer.
+pub fn read_i64(data: bytes, at: i64) -> i64 ! FlatError {
+    let low = try read_u32(data, at)
+    let high = try read_u32(data, at + 4)
+    return low + high.shl(32)
+}
+
+/// The root table of a buffer.
+///
+/// The first four bytes are the offset to it. A buffer may carry a
+/// four-character file identifier at offset 4, which a reader should check
+/// before trusting anything else — it is the only guard the format has
+/// against being handed the wrong file.
+pub fn root_of(data: bytes) -> Flat ! FlatError {
+    let at = try read_u32(data, 0)
+    return try table_at(data, at)
+}
+
+/// The identifier a buffer carries, or the empty string when it has none.
+pub fn identifier_of(data: bytes) -> str ! FlatError {
+    if data.len() < 8 {
+        return ""
+    }
+    var out = ""
+    var i = 4
+    while i < 8 {
+        let byte = try read_u8(data, i)
+        if byte == 0 {
+            return out
+        }
+        out = out + byte.to_char()
+        i = i + 1
+    }
+    return out
+}
+
+/// The table at a position, with its vtable resolved.
+pub fn table_at(data: bytes, at: i64) -> Flat ! FlatError {
+    let back = try read_i32(data, at)
+    let vtable = at - back
+    if vtable < 0 or vtable + 4 > data.len() {
+        fail(BadOffset(at, back))
+    }
+    let vtable_bytes = try read_u16(data, vtable)
+    if vtable_bytes < 4 or vtable + vtable_bytes > data.len() {
+        fail(BadOffset(vtable, vtable_bytes))
+    }
+    return Flat{ data: data, at: at, vtable: vtable,
+        vtable_bytes: vtable_bytes }
+}
+
+/// How large the table is, as its own vtable records it.
+pub fn table_bytes(table: Flat) -> i64 ! FlatError {
+    return try read_u16(table.data, table.vtable + 2)
+}
+
+/// Where a field lives, or zero when it is absent.
+///
+/// Slots are numbered from zero and each takes two bytes after the
+/// vtable's own four-byte header. A slot past the end of the vtable is
+/// absent, which is how a reader built against an old schema survives a new
+/// message.
+pub fn field_offset(table: Flat, slot: i64) -> i64 ! FlatError {
+    let at = 4 + slot * 2
+    if at + 2 > table.vtable_bytes {
+        return 0
+    }
+    return try read_u16(table.data, table.vtable + at)
+}
+
+/// Whether a field is present.
+pub fn has_field(table: Flat, slot: i64) -> bool {
+    match field_offset(table, slot) {
+        Ok(offset) -> return offset != 0
+        Err(_e) -> return false
+    }
+}
+
+fn field_at(table: Flat, slot: i64) -> i64 ! FlatError {
+    let offset = try field_offset(table, slot)
+    if offset == 0 {
+        fail(NoSuchField(slot))
+    }
+    return table.at + offset
+}
+
+/// A one-byte field, or its default when absent.
+///
+/// Absence *is* the default: FlatBuffers does not store a field equal to its
+/// schema default, so a reader that cannot supply the default cannot read
+/// the message. Every accessor here takes one for that reason.
+pub fn u8_field(table: Flat, slot: i64,
+    fallback: i64) -> i64 ! FlatError {
+    match field_offset(table, slot) {
+        Ok(offset) -> {
+            if offset == 0 {
+                return fallback
+            }
+            return try read_u8(table.data, table.at + offset)
+        }
+        Err(_e) -> return fallback
+    }
+}
+
+/// A boolean field.
+pub fn bool_field(table: Flat, slot: i64,
+    fallback: bool) -> bool ! FlatError {
+    var default_value = 0
+    if fallback {
+        default_value = 1
+    }
+    return (try u8_field(table, slot, default_value)) != 0
+}
+
+/// A 16-bit field.
+pub fn i16_field(table: Flat, slot: i64,
+    fallback: i64) -> i64 ! FlatError {
+    match field_offset(table, slot) {
+        Ok(offset) -> {
+            if offset == 0 {
+                return fallback
+            }
+            let value = try read_u16(table.data, table.at + offset)
+            if value >= 32768 {
+                return value - 65536
+            }
+            return value
+        }
+        Err(_e) -> return fallback
+    }
+}
+
+/// A 32-bit field.
+pub fn i32_field(table: Flat, slot: i64,
+    fallback: i64) -> i64 ! FlatError {
+    match field_offset(table, slot) {
+        Ok(offset) -> {
+            if offset == 0 {
+                return fallback
+            }
+            return try read_i32(table.data, table.at + offset)
+        }
+        Err(_e) -> return fallback
+    }
+}
+
+/// A 64-bit field.
+pub fn i64_field(table: Flat, slot: i64,
+    fallback: i64) -> i64 ! FlatError {
+    match field_offset(table, slot) {
+        Ok(offset) -> {
+            if offset == 0 {
+                return fallback
+            }
+            return try read_i64(table.data, table.at + offset)
+        }
+        Err(_e) -> return fallback
+    }
+}
+
+/// A double field.
+pub fn f64_field(table: Flat, slot: i64,
+    fallback: f64) -> f64 ! FlatError {
+    match field_offset(table, slot) {
+        Ok(offset) -> {
+            if offset == 0 {
+                return fallback
+            }
+            return (try read_i64(table.data, table.at + offset)).from_bits()
+        }
+        Err(_e) -> return fallback
+    }
+}
+
+/// A float field, widened.
+pub fn f32_field(table: Flat, slot: i64,
+    fallback: f64) -> f64 ! FlatError {
+    match field_offset(table, slot) {
+        Ok(offset) -> {
+            if offset == 0 {
+                return fallback
+            }
+            return widen(try read_u32(table.data, table.at + offset))
+        }
+        Err(_e) -> return fallback
+    }
+}
+
+fn widen(bits: i64) -> f64 {
+    let sign = bits.ushr(31).bit_and(1)
+    let exponent = bits.ushr(23).bit_and(255)
+    let mantissa = bits.bit_and(8388607)
+    if exponent == 0 and mantissa == 0 {
+        if sign == 1 {
+            return 0.0 - 0.0
+        }
+        return 0.0
+    }
+    if exponent == 255 {
+        return (sign.shl(63) + 2047.shl(52) + mantissa.shl(29)).from_bits()
+    }
+    return (sign.shl(63) + (exponent + 896).shl(52) +
+        mantissa.shl(29)).from_bits()
+}
+
+/// Where an offset field points, having followed it.
+fn follow(table: Flat, slot: i64) -> i64 ! FlatError {
+    let at = try field_at(table, slot)
+    let offset = try read_u32(table.data, at)
+    if offset == 0 {
+        fail(BadOffset(at, 0))
+    }
+    return at + offset
+}
+
+/// A string field.
+///
+/// A string is a 32-bit length followed by that many bytes and a
+/// zero terminator the length does not count — so the same buffer can be
+/// handed to C without copying.
+pub fn str_field(table: Flat, slot: i64) -> str ! FlatError {
+    let at = try follow(table, slot)
+    let length = try read_u32(table.data, at)
+    if at + 4 + length > table.data.len() {
+        fail(TruncatedAt(at))
+    }
+    return decode_utf8(table.data, at + 4, length)
+}
+
+fn decode_utf8(data: bytes, from: i64, length: i64) -> str {
+    var out = ""
+    var i = from
+    let stop = from + length
+    while i < stop {
+        let first = data.at(i)
+        if first < 128 {
+            out = out + first.to_char()
+            i = i + 1
+        } else if first >= 192 and first < 224 and i + 1 < stop {
+            out = out + ((first - 192) * 64 + (data.at(i + 1) - 128))
+                .to_char()
+            i = i + 2
+        } else if first >= 224 and first < 240 and i + 2 < stop {
+            out = out + ((first - 224) * 4096 +
+                (data.at(i + 1) - 128) * 64 +
+                (data.at(i + 2) - 128)).to_char()
+            i = i + 3
+        } else if first >= 240 and i + 3 < stop {
+            out = out + ((first - 240) * 262144 +
+                (data.at(i + 1) - 128) * 4096 +
+                (data.at(i + 2) - 128) * 64 +
+                (data.at(i + 3) - 128)).to_char()
+            i = i + 4
+        } else {
+            out = out + "\u{fffd}"
+            i = i + 1
+        }
+    }
+    return out
+}
+
+/// How many elements a vector field holds.
+pub fn vector_length(table: Flat, slot: i64) -> i64 ! FlatError {
+    match field_offset(table, slot) {
+        Ok(offset) -> {
+            if offset == 0 {
+                return 0
+            }
+            let at = try follow(table, slot)
+            return try read_u32(table.data, at)
+        }
+        Err(_e) -> return 0
+    }
+}
+
+/// Where a vector's elements start.
+pub fn vector_start(table: Flat, slot: i64) -> i64 ! FlatError {
+    return (try follow(table, slot)) + 4
+}
+
+/// One element of a vector of scalars, by width.
+pub fn vector_i32(table: Flat, slot: i64,
+    index: i64) -> i64 ! FlatError {
+    return try read_i32(table.data, (try vector_start(table, slot)) +
+        index * 4)
+}
+
+/// One element of a vector of bytes.
+pub fn vector_u8(table: Flat, slot: i64, index: i64) -> i64 ! FlatError {
+    return try read_u8(table.data, (try vector_start(table, slot)) + index)
+}
+
+/// One element of a vector of 64-bit integers.
+pub fn vector_i64(table: Flat, slot: i64,
+    index: i64) -> i64 ! FlatError {
+    return try read_i64(table.data, (try vector_start(table, slot)) +
+        index * 8)
+}
+
+/// One string of a vector of strings, following the element's own offset.
+pub fn vector_str(table: Flat, slot: i64, index: i64) -> str ! FlatError {
+    let at = (try vector_start(table, slot)) + index * 4
+    let target = at + (try read_u32(table.data, at))
+    let length = try read_u32(table.data, target)
+    return decode_utf8(table.data, target + 4, length)
+}
+
+/// One table of a vector of tables.
+pub fn vector_table(table: Flat, slot: i64,
+    index: i64) -> Flat ! FlatError {
+    let at = (try vector_start(table, slot)) + index * 4
+    return try table_at(table.data, at + (try read_u32(table.data, at)))
+}
+
+/// A field that is itself a table.
+pub fn table_field(table: Flat, slot: i64) -> Flat ! FlatError {
+    return try table_at(table.data, try follow(table, slot))
+}
+
+/// A struct field, which is inline rather than pointed at.
+///
+/// The difference matters: a struct has no vtable, cannot have fields added
+/// to it ever, and is stored inside its parent. That is the trade — a struct
+/// is one load away and a table is two, and a struct's schema is frozen for
+/// the life of the format.
+pub fn struct_at(table: Flat, slot: i64) -> i64 ! FlatError {
+    return try field_at(table, slot)
+}

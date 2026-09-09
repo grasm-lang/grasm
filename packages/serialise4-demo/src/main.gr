@@ -1,0 +1,538 @@
+import ubjson
+import ion
+import thriftcompact
+import flatbuffers
+import capnp
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn near(a: f64, b: f64, tolerance: f64) -> bool {
+    var d = a - b
+    if d < 0.0 {
+        d = 0.0 - d
+    }
+    return d < tolerance
+}
+
+fn from_hex(text: str) -> bytes {
+    var out: [i64] = []
+    var i = 0
+    while i + 1 < text.len() {
+        out.push(text.substr(i, 2).parse_int_base(16) ?? 0)
+        i = i + 2
+    }
+    return bytes_of(out)
+}
+
+fn to_hex(data: bytes) -> str {
+    let digits = "0123456789abcdef"
+    var out = ""
+    var i = 0
+    while i < data.len() {
+        out = out + digits.substr(data.at(i) / 16, 1) +
+        digits.substr(data.at(i) % 16, 1)
+        i = i + 1
+    }
+    return out
+}
+
+// ---------------------------------------------------------------- ubjson
+
+fn check_ubjson(inout f: i64) / {io} {
+    print("-- ubjson: JSON's model, one marker per value")
+    // py-ubjson writes these bytes for these values.
+    say(f, "a marker and no payload is the whole encoding of null and bool",
+        to_hex(ubjson.encode(Null)) == "5a" and
+        to_hex(ubjson.encode(True)) == "54" and
+        to_hex(ubjson.encode(False)) == "46")
+    say(f, "a string is a marker, a length in its own marker, then bytes",
+        to_hex(ubjson.encode(Str("hi"))) == "5355026869")
+    // The five integer widths, and the rule for choosing between them.
+    say(f, "the narrowest type that holds the value is the one to write",
+        marker_of(ubjson.narrowest(1)) == "u8" and
+        marker_of(ubjson.narrowest(255)) == "u8" and
+        marker_of(ubjson.narrowest(0 - 1)) == "i8" and
+        marker_of(ubjson.narrowest(0 - 200)) == "i16" and
+        marker_of(ubjson.narrowest(70000)) == "i32" and
+        marker_of(ubjson.narrowest(5000000000)) == "i64")
+    // And that a decoder keeps the width it found, so bytes round-trip.
+    let wide = ubjson.decode(from_hex("6c00000001")) ?? Null
+    say(f, "a decoder keeps the width, so the bytes come back unchanged",
+        marker_of(wide) == "i32" and
+        to_hex(ubjson.encode(wide)) == "6c00000001")
+    // The container forms, both of them.
+    let plain = ubjson.decode(from_hex("5b55015502550355045d")) ?? Null
+    say(f, "an array runs to a closing bracket when it has no count",
+        length_of(plain) == 4)
+    let counted = ubjson.decode(from_hex("5b24552355040102030 4"
+            .replace(" ", ""))) ?? Null
+    say(f, "and a typed counted array carries no markers at all",
+        length_of(counted) == 4 and
+        (ubjson.as_integer(item_of(counted, 3)) ?? 0) == 4)
+    // A hundred nulls in three bytes, which is the point of the optimised
+    // form.
+    let nulls = ubjson.decode(from_hex("5b245a235564")) ?? Null
+    say(f, "a typed array of null is a count and nothing else",
+        length_of(nulls) == 100)
+    // The rule that keeps it decodable.
+    say(f, "a type without a count is refused, since nothing would end it",
+        typed_without_count_refused())
+    // Objects, and reading a field out of one.
+    let object = ubjson.decode(from_hex("7b55016155015501625355037477" +
+        "6f7d")) ?? Null
+    say(f, "an object is keys without markers and values with them",
+        (ubjson.as_integer(ubjson.field_of(object, "a") ?? Null) ?? 0)
+        == 1 and text_of(ubjson.field_of(object, "b") ?? Null) == "two")
+    // Floats, where the format earns its keep against JSON.
+    let single = ubjson.decode(from_hex("6440490fdb")) ?? Null
+    say(f, "a float32 widens to the double it names, not to the decimal",
+        near(float_of(single), 3.1415927410125732, 0.0000000001))
+    say(f, "and a double round-trips exactly, which is the whole point",
+        to_hex(ubjson.encode(Float64(0.1))) == "44" +
+        "3fb999999999999a")
+    say(f, "a truncated document is an error rather than a short value",
+        truncated_refused())
+}
+
+fn marker_of(value: Ubjson) -> str {
+    match value {
+        Int8(_v) -> return "i8"
+        UInt8(_v) -> return "u8"
+        Int16(_v) -> return "i16"
+        Int32(_v) -> return "i32"
+        Int64(_v) -> return "i64"
+        _ -> return "other"
+    }
+}
+
+fn length_of(value: Ubjson) -> i64 {
+    match value {
+        Array(items) -> return items.len()
+        Object(keys, _values) -> return keys.len()
+        _ -> return 0 - 1
+    }
+}
+
+fn item_of(value: Ubjson, index: i64) -> Ubjson {
+    match value {
+        Array(items) -> return items[index].value
+        _ -> return Null
+    }
+}
+
+fn text_of(value: Ubjson) -> str {
+    match value {
+        Str(v) -> return v
+        _ -> return ""
+    }
+}
+
+fn float_of(value: Ubjson) -> f64 {
+    match value {
+        Float32(v) -> return v
+        Float64(v) -> return v
+        _ -> return 0.0
+    }
+}
+
+fn typed_without_count_refused() -> bool {
+    match ubjson.decode(from_hex("5b2455550155025d")) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+fn truncated_refused() -> bool {
+    match ubjson.decode(from_hex("5355ff68")) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+// ------------------------------------------------------------------- ion
+
+fn check_ion(inout f: i64) / {io} {
+    print("-- ion: a type nibble, a length nibble, and a symbol table")
+    say(f, "every document starts with the same four bytes",
+        to_hex(ion.version_marker()) == "e00100ea")
+    say(f, "and one that does not is refused rather than guessed at",
+        ion_refused("00000000"))
+    // The two escapes in the type byte.
+    let values = ion.decode(from_hex("e00100eab30f2101")) ?? []
+    say(f, "a length nibble of fifteen means null of that type",
+        values.len() == 1 and length_of_list(values[0]) == 2 and
+        is_null(item_of_list(values[0], 0)) and
+        integer_of(item_of_list(values[0], 1)) == 1)
+    // Sign lives in the type code, not in the number.
+    let negative = ion.decode(from_hex("e00100ea3101")) ?? []
+    say(f, "a negative integer is a different type, not a sign bit",
+        integer_of(negative[0]) == 0 - 1)
+    say(f, "and a decimal keeps a negative zero the sign bit would lose",
+        coefficient_of((ion.decode(from_hex("e00100ea528080")) ??
+            [])[0]) == 0)
+    // VarInt and VarUInt, which differ by one bit in the first byte.
+    say(f, "a VarUInt is seven bits a byte with the last one flagged",
+        var_uint_of("87") == 7 and var_uint_of("0187") == 135)
+    say(f, "and a VarInt spends a bit of the first byte on the sign",
+        var_int_of("c7") == 0 - 7 and var_int_of("87") == 7)
+    // Decimals, which is why Ion exists where JSON does not.
+    let decimal = ion.decode(from_hex("e00100ea52c17d")) ?? []
+    say(f, "a decimal is an exponent and a coefficient, kept exactly",
+        coefficient_of(decimal[0]) == 125 and exponent_of(decimal[0]) ==
+        0 - 1)
+    say(f, "so twelve point five is not 12.499999999999998",
+        ion.decimal_as_float(125, 0 - 1) == 12.5)
+    // The symbol table, which is what makes a stream of records small.
+    let table = ion.decode(from_hex("e00100eaed8183da87b8876d657373" +
+        "616765d48a826869")) ?? []
+    say(f, "the table is read and dropped, and its names come out in use",
+        table.len() == 1 and
+        field_text(table[0], "message") == "hi")
+    // Timestamps carry their offset and their precision.
+    let stamp = ion.decode(from_hex("e00100ea69800fdf8181808080c6")) ?? []
+    say(f, "a timestamp is a year and as much more as was recorded",
+        timestamp_of(stamp[0]) == "2015-01-01T00:00:00.000000Z")
+    say(f, "and a truncated document is an error, not a partial value",
+        ion_refused("e00100ea8e"))
+}
+
+fn length_of_list(value: IonValue) -> i64 {
+    match value {
+        IonList(items) -> return items.len()
+        _ -> return 0 - 1
+    }
+}
+
+fn item_of_list(value: IonValue, index: i64) -> IonValue {
+    match value {
+        IonList(items) -> return items[index].value
+        _ -> return IonNull
+    }
+}
+
+fn field_text(value: IonValue, name: str) -> str {
+    match ion.field_of(value, name) {
+        Ok(found) -> {
+            match found {
+                IonString(text) -> return text
+                _ -> return ""
+            }
+        }
+        Err(_e) -> return ""
+    }
+}
+
+fn is_null(value: IonValue) -> bool {
+    match value {
+        IonNull -> return true
+        _ -> return false
+    }
+}
+
+fn integer_of(value: IonValue) -> i64 {
+    match value {
+        IonInt(v) -> return v
+        _ -> return 0 - 999
+    }
+}
+
+fn coefficient_of(value: IonValue) -> i64 {
+    match value {
+        IonDecimal(c, _e) -> return c
+        _ -> return 0 - 999
+    }
+}
+
+fn exponent_of(value: IonValue) -> i64 {
+    match value {
+        IonDecimal(_c, e) -> return e
+        _ -> return 0 - 999
+    }
+}
+
+fn timestamp_of(value: IonValue) -> str {
+    match value {
+        IonTimestamp(text) -> return text
+        _ -> return ""
+    }
+}
+
+fn var_uint_of(hex: str) -> i64 {
+    var reader = IonReader{ data: from_hex(hex), at: 0,
+        symbols: ion.system_symbols() }
+    return ion.read_var_uint(reader) ?? 0 - 999
+}
+
+fn var_int_of(hex: str) -> i64 {
+    var reader = IonReader{ data: from_hex(hex), at: 0,
+        symbols: ion.system_symbols() }
+    return ion.read_var_int(reader) ?? 0 - 999
+}
+
+fn ion_refused(hex: str) -> bool {
+    match ion.decode(from_hex(hex)) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+// --------------------------------------------------------------- thrift
+
+fn check_thrift(inout f: i64) / {io} {
+    print("-- thriftcompact: field ids as deltas, integers as zigzag")
+    // Python's thrift library writes exactly these bytes.
+    say(f, "a boolean field has no body: the value is in the type nibble",
+        render_thrift("1100") == "\{1/1:true,}" and
+        render_thrift("1200") == "\{1/2:false,}")
+    say(f, "and the next field's id is written as a difference",
+        render_thrift("11150000") == "\{1/1:true,2/5:0,}")
+    say(f, "a delta that will not fit in four bits is a zigzag id instead",
+        render_thrift("05d00f0200") == "\{1000/5:1,}")
+    // Zigzag, which is why a small negative number is one byte.
+    say(f, "zigzag maps the small negatives onto the small positives",
+        thriftcompact.zigzag_encode(0) == 0 and
+        thriftcompact.zigzag_encode(0 - 1) == 1 and
+        thriftcompact.zigzag_encode(1) == 2 and
+        thriftcompact.zigzag_encode(0 - 2) == 3)
+    say(f, "and back again, which is a shift and an exclusive or",
+        thriftcompact.zigzag_decode(1) == 0 - 1 and
+        thriftcompact.zigzag_decode(4) == 2)
+    // The double, where the two Thrift protocols disagree.
+    say(f, "a double is little-endian here and big-endian in the other",
+        render_thrift("170000000000000c4000") == "\{1/7:f3.5,}")
+    // The size escape, which is the only one in the format.
+    say(f, "a container of fifteen or more elements says the size after",
+        render_thrift("19f61000020406080a0c0e10121416181a1c1e00") ==
+        "\{1/9:[6:0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,],}")
+    say(f, "an empty map is a single zero, with no type byte at all",
+        render_thrift("1b0000") == "\{1/11:m0/0:),}")
+    say(f, "and a boolean inside a list has a body again, unlike a field",
+        render_thrift("1921010200") == "\{1/9:[1:true,false,],}")
+    say(f, "a struct that never ends is an error rather than an empty one",
+        thrift_refused("11"))
+}
+
+fn render_thrift(hex: str) -> str {
+    match thriftcompact.decode_struct(from_hex(hex)) {
+        Ok(value) -> return show_thrift(value)
+        Err(_e) -> return "error"
+    }
+}
+
+fn show_thrift(value: ThriftValue) -> str {
+    match value {
+        ThriftStop -> return "stop"
+        ThriftBool(v) -> {
+            if v {
+                return "true"
+            }
+            return "false"
+        }
+        ThriftByte(v) -> return "{v}"
+        ThriftI16(v) -> return "{v}"
+        ThriftI32(v) -> return "{v}"
+        ThriftI64(v) -> return "{v}"
+        ThriftDouble(v) -> return "f{v}"
+        ThriftBinary(v) -> return "b" + to_hex(v)
+        ThriftList(element, items) -> {
+            var out = "[{element}:"
+            for item in items {
+                out = out + show_thrift(item.value) + ","
+            }
+            return out + "]"
+        }
+        ThriftSet(element, items) -> {
+            var out = "s{element}:"
+            for item in items {
+                out = out + show_thrift(item.value) + ","
+            }
+            return out + ")"
+        }
+        ThriftMap(key_type, value_type, keys, values) -> {
+            var out = "m{key_type}/{value_type}:"
+            var i = 0
+            while i < keys.len() {
+                out = out + show_thrift(keys[i].value) + "=" +
+                show_thrift(values[i].value) + ","
+                i = i + 1
+            }
+            return out + ")"
+        }
+        ThriftStruct(ids, types, values) -> {
+            var out = "\{"
+            var i = 0
+            while i < ids.len() {
+                out = out + "{ids[i]}/{types[i]}:" +
+                show_thrift(values[i].value) + ","
+                i = i + 1
+            }
+            return out + "}"
+        }
+    }
+}
+
+fn thrift_refused(hex: str) -> bool {
+    match thriftcompact.decode_struct(from_hex(hex)) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+// ---------------------------------------------------------- flatbuffers
+
+fn check_flatbuffers(inout f: i64) / {io} {
+    print("-- flatbuffers: a vtable, and no parsing step at all")
+    let data = from_hex(read_fixture())
+    let root = flatbuffers.root_of(data) ??
+    Flat{ data: data, at: 0, vtable: 0, vtable_bytes: 0 }
+    // The Python runtime built this buffer and reads the same values.
+    say(f, "the root is found through the offset in the first four bytes",
+        (flatbuffers.i32_field(root, 1, 0) ?? 0) == 1 and
+        (flatbuffers.str_field(root, 0) ?? "") == "alice")
+    say(f, "the identifier is four bytes at offset four, when there is one",
+        (flatbuffers.identifier_of(data) ?? "") == "TEST")
+    // Absence is the default, which is why every accessor takes one.
+    say(f, "a field equal to its default is not stored at all",
+        not flatbuffers.has_field(root, 7) and
+        (flatbuffers.i16_field(root, 7, 99) ?? 0) == 99)
+    say(f, "and a slot past the end of the vtable reads as absent too",
+        not flatbuffers.has_field(root, 40) and
+        (flatbuffers.i32_field(root, 40, 7) ?? 0) == 7)
+    // The vtable itself.
+    say(f, "the vtable says how long it is and how long the table is",
+        root.vtable_bytes >= 8 and
+        (flatbuffers.table_bytes(root) ?? 0) > 0)
+    // Vectors, of scalars and of strings and of tables.
+    say(f, "a vector is a length then the elements, laid out for a load",
+        (flatbuffers.vector_length(root, 5) ?? 0) == 3 and
+        (flatbuffers.vector_i32(root, 5, 0) ?? 0) == 1 and
+        (flatbuffers.vector_i32(root, 5, 2) ?? 0) == 3)
+    say(f, "a vector of strings is a vector of offsets to them",
+        (flatbuffers.vector_length(root, 4) ?? 0) == 2 and
+        (flatbuffers.vector_str(root, 4, 0) ?? "") == "x" and
+        (flatbuffers.vector_str(root, 4, 1) ?? "") == "y")
+    // A nested table, reached through one more offset.
+    let friend = flatbuffers.table_field(root, 6) ??
+    Flat{ data: data, at: 0, vtable: 0, vtable_bytes: 0 }
+    say(f, "a nested table is another vtable at another offset",
+        (flatbuffers.i32_field(friend, 1, 0) ?? 0) == 2 and
+        (flatbuffers.str_field(friend, 0) ?? "") == "bob")
+    say(f, "the numbers keep their width, sixty-four bits included",
+        (flatbuffers.i64_field(root, 8, 0) ?? 0) == 1099511627776)
+    say(f, "and a float32 field widens to the double it names",
+        (flatbuffers.f32_field(root, 9, 0.0) ?? 0.0) == 0.5)
+    say(f, "a buffer whose root offset points nowhere is refused",
+        flat_refused("ffffffff00000000"))
+}
+
+fn read_fixture() -> str {
+    return "20000000544553541800340030002c0020001f0018001400100000000800" +
+    "0400180000000000003f000000000001000054000000200000002c000000" +
+    "000000010000000000000c40000000000100000020000000030000000100" +
+    "0000020000000300000002000000380000002c00000005000000616c6963" +
+    "6500000008000c000800040008000000020000000400000003000000626f" +
+    "620001000000790000000100000078000000"
+}
+
+fn flat_refused(hex: str) -> bool {
+    match flatbuffers.root_of(from_hex(hex)) {
+        Ok(_v) -> return false
+        Err(_e) -> return true
+    }
+}
+
+// ---------------------------------------------------------------- capnp
+
+fn check_capnp(inout f: i64) / {io} {
+    print("-- capnp: four pointer kinds in two bits")
+    let message = capnp.parse(from_hex(capnp_fixture())) ??
+    CapnMessage{ data: from_hex(""), starts: [], lengths: [] }
+    let root = capnp.root_of(message) ??
+    CapnStruct{ data_at: 0, data_words: 0, pointers_at: 0,
+        pointer_words: 0, segment: 0 }
+    // pycapnp built this message from a schema and reads the same values.
+    say(f, "the framing is a segment count and the size of each",
+        message.starts.len() == 1 and message.lengths[0] > 0)
+    say(f, "a struct pointer carries its two section sizes",
+        root.data_words >= 3 and root.pointer_words >= 4)
+    say(f, "and the fields sit where the schema's allocator put them",
+        (capnp.i32_field(message, root, 0, 0) ?? 0) == 1 and
+        (capnp.f64_field(message, root, 1, 0.0) ?? 0.0) == 3.5 and
+        (capnp.bool_field(message, root, 32, false) ?? false) and
+        (capnp.i16_field(message, root, 3, 0) ?? 0) == 7 and
+        (capnp.i64_field(message, root, 2, 0) ?? 0) == 1099511627776)
+    // The XOR against the default, which is why zeros compress.
+    say(f, "a field is stored XORed with its default, so a default is zero",
+        (capnp.i32_field(message, root, 0, 1) ?? 0 - 1) == 0)
+    // Text is a list of bytes with a terminator the count includes.
+    say(f, "text is a byte list whose count includes the terminator",
+        (capnp.text_field(message, root, 0) ?? "") == "alice")
+    let tags = capnp.list_field(message, root, 1) ??
+    CapnList{ at: 0, element: 0, count: 0, data_words: 0,
+        pointer_words: 0, segment: 0 }
+    say(f, "a list of text is a list of pointers to lists of bytes",
+        tags.count == 2 and tags.element == 6 and
+        (capnp.list_text(message, tags, 0) ?? "") == "x")
+    let numbers = capnp.list_field(message, root, 2) ??
+    CapnList{ at: 0, element: 0, count: 0, data_words: 0,
+        pointer_words: 0, segment: 0 }
+    say(f, "and a list of four-byte scalars says so in three bits",
+        numbers.count == 3 and numbers.element == 4 and
+        capnp.element_bytes(numbers) == 4 and
+        (capnp.list_scalar(message, numbers, 2) ?? 0) == 3)
+    // A nested struct through a pointer, and an absent one.
+    let friend = capnp.struct_field(message, root, 3) ??
+    CapnStruct{ data_at: 0, data_words: 0, pointers_at: 0,
+        pointer_words: 0, segment: 0 }
+    say(f, "a null pointer is a struct of no words, all defaults",
+        capnp.has_pointer(message, root, 3) and
+        (capnp.i32_field(message, friend, 0, 0) ?? 0) == 2 and
+        (capnp.text_field(message, friend, 0) ?? "") == "bob")
+    say(f, "and a pointer slot past the end of the struct reads as null",
+        not capnp.has_pointer(message, root, 30))
+    say(f, "a framing that claims more segments than it holds is refused",
+        capnp_refused("ff00000000000000"))
+}
+
+fn capnp_fixture() -> str {
+    return "000000001700000000000000030004000100000001000700000000000000" +
+    "0c4000000000000100000d000000320000000d0000001600000019000000" +
+    "1c0000001c00000003000400616c69636500000005000000120000000500" +
+    "000012000000780000000000000079000000000000000100000002000000" +
+    "030000000000000002000000000000000000000000000000000000000000" +
+    "00000d000000220000000000000000000000000000000000000000000000" +
+    "00000000626f620000000000"
+}
+
+fn capnp_refused(hex: str) -> bool {
+    match capnp.parse(from_hex(hex)) {
+        Ok(message) -> {
+            match capnp.root_of(message) {
+                Ok(_v) -> return false
+                Err(_e) -> return true
+            }
+        }
+        Err(_e) -> return true
+    }
+}
+
+fn main() / {io} {
+    var f = 0
+    check_ubjson(f)
+    check_ion(f)
+    check_thrift(f)
+    check_flatbuffers(f)
+    check_capnp(f)
+    if f == 0 {
+        print("serialisation: every claim held")
+    } else {
+        print("serialisation: {f} claims failed")
+    }
+}
