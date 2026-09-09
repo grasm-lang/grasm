@@ -1,0 +1,52 @@
+import mboxfile
+
+fn to_hex(text: str) -> str {
+    let digits = "0123456789abcdef"
+    let raw = text.to_bytes()
+    var out = ""
+    var i = 0
+    while i < raw.len() {
+        out = out + digits.substr(raw.at(i) / 16, 1) +
+        digits.substr(raw.at(i) % 16, 1)
+        i = i + 1
+    }
+    return out
+}
+
+fn main() / {io} {
+    if args().len() < 2 {
+        return
+    }
+    let text = (read_bytes(args()[0]) ?? bytes_of([])).to_str()
+    let dialect = args()[1]
+    var pieces: [str] = []
+    for one in mboxfile.parse(text, dialect) {
+        var headers: [str] = []
+        for header in one.headers {
+            headers.push(header.0 + "=" + header.1)
+        }
+        pieces.push(one.envelope_sender + "\u{3}" + one.envelope_date +
+            "\u{3}" + headers.join("\u{4}") + "\u{3}" + one.body)
+    }
+    if args().len() > 2 {
+        // Write it back out and read it again, so the escaping is
+        // exercised rather than described.
+        let again = mboxfile.render(mboxfile.parse(text, dialect), dialect)
+        var second: [str] = []
+        for one in mboxfile.parse(again, dialect) {
+            var headers: [str] = []
+            for header in one.headers {
+                headers.push(header.0 + "=" + header.1)
+            }
+            second.push(one.envelope_sender + "\u{3}" + one.envelope_date +
+                "\u{3}" + headers.join("\u{4}") + "\u{3}" + one.body)
+        }
+        if second.join("\u{1}") == pieces.join("\u{1}") {
+            print("round trip holds")
+        } else {
+            print("round trip broke")
+        }
+        return
+    }
+    print(to_hex(pieces.join("\u{1}")))
+}

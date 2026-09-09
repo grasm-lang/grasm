@@ -1,0 +1,6 @@
+[package]
+name = "dkimsig"
+version = "1.0.0"
+
+# Reading and rewriting text. Opens nothing.
+capabilities = []

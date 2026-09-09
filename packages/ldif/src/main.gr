@@ -1,0 +1,300 @@
+// LDIF: the text form of a directory entry, which is how LDAP data is
+// exported, reviewed and loaded back.
+//
+//   dn: cn=Ada Lovelace,ou=people,dc=example,dc=test
+//   objectClass: inetOrgPerson
+//   cn: Ada Lovelace
+//   sn:: TG92ZWxhY2U=
+//   jpegPhoto:< file:///tmp/ada.jpg
+//
+// Every line is `name: value`, entries are separated by a blank line,
+// and three details decide whether a reader gets the values right:
+//
+//   - **A value may be base64.** `name:: text` means the value is
+//     base64, and it is used whenever the value begins or ends with a
+//     space, holds a newline, or is not ASCII. A reader that takes the
+//     text after the colon stores the base64 as the value — and the
+//     entry looks fine until somebody searches for the name.
+//   - **A line beginning with a space continues the one before it**,
+//     with the space removed and *nothing* put in its place. A reader
+//     that joins with a space corrupts every long value, and long
+//     values are exactly the ones that are folded.
+//   - **An attribute may appear more than once.** `objectClass` almost
+//     always does. A reader that builds a map of name to value keeps the
+//     last one and quietly loses the rest.
+//
+// ## Change records are a different shape
+//
+// A file may hold entries or *changes*: `changetype: add`, `delete`,
+// `modrdn` or `modify`, and a modify record has its own little language
+// of `add:`/`delete:`/`replace:` blocks separated by `-`. Both shapes are
+// read here, because a tool that reads only entries will silently do
+// nothing useful with half the files it is given.
+import bytes_codec
+
+type LdifError =
+    | NoDistinguishedName(line: i64)
+    | BadBase64(line: i64)
+
+    /// One attribute and one of its values.
+type LdifValue = {
+    name: str,
+    /// The decoded value. A `:<` reference keeps its URL here.
+    value: str,
+    /// Whether the file wrote it as base64.
+    was_base64: bool,
+    /// Whether the file gave a URL rather than a value.
+    is_url: bool,
+}
+
+/// One record: an entry, or a change to one.
+type LdifRecord = {
+    dn: str,
+    /// `add` for a plain entry, or the `changetype` given.
+    change_type: str,
+    values: [LdifValue],
+    /// For a `modify`, the operations in order, as
+    /// `(operation, attribute)`.
+    operations: [(str, str)],
+}
+
+fn is_space(character: str) -> bool {
+    return character == " " or character == "\t"
+}
+
+fn trim_right(text: str) -> str {
+    var end = text.len()
+    while end > 0 and is_space(text.substr(end - 1, 1)) {
+        end = end - 1
+    }
+    return text.substr(0, end)
+}
+
+fn trim(text: str) -> str {
+    var start = 0
+    while start < text.len() and is_space(text.substr(start, 1)) {
+        start = start + 1
+    }
+    return trim_right(text.substr(start, text.len() - start))
+}
+
+fn without_return(line: str) -> str {
+    if line.ends_with("\r") {
+        return line.substr(0, line.len() - 1)
+    }
+    return line
+}
+
+/// Join folded lines, drop comments, and answer the logical lines with
+/// the line number each started on.
+pub fn unfold(text: str) -> [(str, i64)] {
+    var out: [(str, i64)] = []
+    var number = 0
+    var in_comment = false
+    for raw in text.split("\n") {
+        number = number + 1
+        let line = without_return(raw)
+        if line.len() > 0 and line.substr(0, 1) == " " {
+            // A continuation of a comment is still a comment.
+            if in_comment {
+                continue
+            }
+            if out.len() > 0 {
+                let held = out[out.len() - 1]
+                out[out.len() - 1] = (held.0 +
+                    line.substr(1, line.len() - 1), held.1)
+                continue
+            }
+        }
+        in_comment = line.starts_with("#")
+        if in_comment {
+            continue
+        }
+        out.push((line, number))
+    }
+    return out
+}
+
+fn read_value(line: str, number: i64) -> LdifValue ! LdifError {
+    var colon = 0 - 1
+    var i = 0
+    while i < line.len() {
+        if line.substr(i, 1) == ":" {
+            colon = i
+            i = line.len()
+        } else {
+            i = i + 1
+        }
+    }
+    if colon < 0 {
+        return LdifValue{ name: line, value: "", was_base64: false,
+            is_url: false }
+    }
+    let name = line.substr(0, colon)
+    var rest = line.substr(colon + 1, line.len() - colon - 1)
+    if rest.starts_with(":") {
+        let body = trim(rest.substr(1, rest.len() - 1))
+        match bytes_codec.decode_base64(body) {
+            Some(raw) -> return LdifValue{ name: name, value: raw.to_str(),
+                was_base64: true, is_url: false }
+            None -> fail(BadBase64(number))
+        }
+    }
+    if rest.starts_with("<") {
+        return LdifValue{ name: name,
+            value: trim(rest.substr(1, rest.len() - 1)), was_base64: false,
+            is_url: true }
+    }
+    // Exactly one space after the colon is the separator; any more are
+    // part of the value, which is why a value that begins with a space
+    // has to be written in base64.
+    if rest.starts_with(" ") {
+        rest = rest.substr(1, rest.len() - 1)
+    }
+    return LdifValue{ name: name, value: rest, was_base64: false,
+        is_url: false }
+}
+
+/// Read a whole file.
+pub fn parse(text: str) -> [LdifRecord] ! LdifError {
+    var out: [LdifRecord] = []
+    var current = empty_record()
+    var started = false
+    for line in unfold(text) {
+        if trim(line.0).len() == 0 {
+            if started {
+                out.push(current)
+                current = empty_record()
+                started = false
+            }
+            continue
+        }
+        // A `-` closes one operation of a modify record and opens
+        // the next; the operations themselves are kept in order.
+        if line.0 == "-" {
+            continue
+        }
+        let value = try read_value(line.0, line.1)
+        let lower = value.name.to_lower()
+        if lower == "version" and not started {
+            continue
+        }
+        if lower == "dn" {
+            if started {
+                out.push(current)
+            }
+            current = empty_record()
+            current.dn = value.value
+            started = true
+            continue
+        }
+        if not started {
+            fail(NoDistinguishedName(line.1))
+        }
+        if lower == "changetype" {
+            current.change_type = value.value.to_lower()
+            continue
+        }
+        if current.change_type == "modify" and (lower == "add" or
+            lower == "delete" or lower == "replace") {
+            current.operations.push((lower, value.value))
+            continue
+        }
+        current.values.push(value)
+    }
+    if started {
+        out.push(current)
+    }
+    return out
+}
+
+fn empty_record() -> LdifRecord {
+    return LdifRecord{ dn: "", change_type: "add", values: [],
+        operations: [] }
+}
+
+/// Every value of one attribute, in the order the file had them.
+///
+/// Attribute names have no case in a directory, so neither does this.
+pub fn values_of(record: LdifRecord, name: str) -> [str] {
+    var out: [str] = []
+    for one in record.values {
+        if one.name.to_lower() == name.to_lower() {
+            out.push(one.value)
+        }
+    }
+    return out
+}
+
+/// The first value of an attribute, or the empty string.
+pub fn value_of(record: LdifRecord, name: str) -> str {
+    let list = values_of(record, name)
+    if list.len() == 0 {
+        return ""
+    }
+    return list[0]
+}
+
+fn needs_base64(value: str) -> bool {
+    if value.len() == 0 {
+        return false
+    }
+    if value.starts_with(" ") or value.starts_with(":") or
+    value.starts_with("<") or value.ends_with(" ") {
+        return true
+    }
+    let raw = value.to_bytes()
+    var i = 0
+    while i < raw.len() {
+        let byte = raw.at(i)
+        if byte >= 128 or byte < 32 {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+/// Write one `name: value` line, folded at 76 characters and written in
+/// base64 when the value needs it.
+pub fn render_value(one: LdifValue) -> str {
+    var line = ""
+    if one.is_url {
+        line = one.name + ":< " + one.value
+    } else if one.was_base64 or needs_base64(one.value) {
+        line = one.name + ":: " + bytes_codec.encode_base64(one.value.to_bytes())
+    } else {
+        line = one.name + ": " + one.value
+    }
+    if line.len() <= 76 {
+        return line
+    }
+    var out = line.substr(0, 76)
+    var at = 76
+    while at < line.len() {
+        var take = 75
+        if line.len() - at < take {
+            take = line.len() - at
+        }
+        out = out + "\n " + line.substr(at, take)
+        at = at + take
+    }
+    return out
+}
+
+/// Write a whole file.
+pub fn render(records: [LdifRecord]) -> str {
+    var out = ""
+    for record in records {
+        out = out + render_value(LdifValue{ name: "dn", value: record.dn,
+            was_base64: false, is_url: false }) + "\n"
+        if record.change_type != "add" or record.operations.len() > 0 {
+            out = out + "changetype: " + record.change_type + "\n"
+        }
+        for one in record.values {
+            out = out + render_value(one) + "\n"
+        }
+        out = out + "\n"
+    }
+    return out
+}

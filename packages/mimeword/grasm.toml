@@ -1,0 +1,10 @@
+[package]
+name = "mimeword"
+version = "1.0.0"
+
+# Reading and writing text. Opens nothing.
+capabilities = []
+
+[dependencies.bytes_codec]
+path = "../bytes"
+version = "^1.0.0"

@@ -1,0 +1,288 @@
+// mbox files: a mailbox as one text file, which is how mail archives,
+// `git format-patch` output and every list archive are stored.
+//
+//   From sender@example.test Mon Jan  1 00:00:00 2024
+//   From: Ada <ada@example.test>
+//   Subject: hello
+//
+//   the body
+//
+//   From other@example.test Tue Jan  2 00:00:00 2024
+//   ...
+//
+// A message begins at a line that starts with `From ` — and that is the
+// whole delimiter. There is no length, no separator that cannot occur in
+// a message, and no escape that every writer agrees on. The format's
+// famous problem is right there: a body line that begins with `From `
+// splits a message in two.
+//
+// ## The four dialects
+//
+//   `mboxo`   escapes `From ` at the start of a body line as `>From `
+//   `mboxrd`  also escapes `>From `, `>>From ` and so on, so unescaping
+//             is exact and reversible
+//   `mboxcl`  adds a `Content-Length:` header and trusts it
+//   `mboxcl2` uses the length and does no escaping at all
+//
+// This reads and writes `mboxo` and `mboxrd`, which are the two a text
+// file can be read as without trusting a header, and takes `"raw"` for
+// a caller that wants the body exactly as the file has it and will do
+// its own unescaping. `mboxrd` is the one to write: with `mboxo` a body
+// that really did contain `>From ` comes back as `From `, and there is
+// no way to tell the two apart afterwards.
+//
+// ## The `From ` line is not a header
+//
+// It carries an envelope sender and a date in a format that is not the
+// one used anywhere else in mail, and it is not part of the message. A
+// reader that keeps it in the header block reports a header called
+// `From ` — with a space — which no other tool has heard of.
+
+/// One message.
+type MboxMessage = {
+    /// The envelope sender from the `From ` line.
+    envelope_sender: str,
+    /// The rest of the `From ` line, which is a date in `ctime` form.
+    envelope_date: str,
+    /// The header block, unfolded lines not included; as written.
+    headers: [(str, str)],
+    /// The body, with any `>From ` escaping undone.
+    body: str,
+}
+
+fn is_space(character: str) -> bool {
+    return character == " " or character == "\t"
+}
+
+fn trim(text: str) -> str {
+    var start = 0
+    while start < text.len() and is_space(text.substr(start, 1)) {
+        start = start + 1
+    }
+    var end = text.len()
+    while end > start and is_space(text.substr(end - 1, 1)) {
+        end = end - 1
+    }
+    return text.substr(start, end - start)
+}
+
+fn without_return(line: str) -> str {
+    if line.ends_with("\r") {
+        return line.substr(0, line.len() - 1)
+    }
+    return line
+}
+
+/// Whether a line begins a message.
+pub fn is_separator(line: str) -> bool {
+    return line.starts_with("From ")
+}
+
+/// Undo the escaping of a body line.
+///
+/// In `mboxrd` a line of `>` followed by `From ` loses one `>`; in
+/// `mboxo` only `>From ` is unescaped, and a line that was really
+/// `>From ` in the message is indistinguishable from one that was
+/// `From `.
+fn unescaped(line: str, dialect: str) -> str {
+    if dialect == "raw" or not line.starts_with(">") {
+        return line
+    }
+    let mboxrd = dialect == "mboxrd"
+    var i = 0
+    while i < line.len() and line.substr(i, 1) == ">" {
+        i = i + 1
+    }
+    if not line.substr(i, line.len() - i).starts_with("From ") {
+        return line
+    }
+    if not mboxrd and i != 1 {
+        return line
+    }
+    return line.substr(1, line.len() - 1)
+}
+
+fn escaped(line: str, dialect: str) -> str {
+    if dialect == "raw" {
+        return line
+    }
+    let mboxrd = dialect == "mboxrd"
+    var i = 0
+    while i < line.len() and line.substr(i, 1) == ">" {
+        i = i + 1
+    }
+    if not line.substr(i, line.len() - i).starts_with("From ") {
+        return line
+    }
+    if not mboxrd and i != 0 {
+        return line
+    }
+    return ">" + line
+}
+
+/// Read the header block of one message.
+///
+/// A line beginning with a space or a tab continues the one before it,
+/// which is how a long header is written; the continuation is joined so
+/// the value is the whole value.
+pub fn parse_headers(lines: [str]) -> [(str, str)] {
+    var out: [(str, str)] = []
+    for raw in lines {
+        let line = without_return(raw)
+        if line.len() == 0 {
+            return out
+        }
+        if is_space(line.substr(0, 1)) and out.len() > 0 {
+            let held = out[out.len() - 1]
+            out[out.len() - 1] = (held.0, held.1 + " " + trim(line))
+            continue
+        }
+        var colon = 0 - 1
+        var i = 0
+        while i < line.len() {
+            if line.substr(i, 1) == ":" {
+                colon = i
+                i = line.len()
+            } else {
+                i = i + 1
+            }
+        }
+        if colon < 0 {
+            continue
+        }
+        out.push((line.substr(0, colon),
+            trim(line.substr(colon + 1, line.len() - colon - 1))))
+    }
+    return out
+}
+
+/// The value of a header, or the empty string. Header names do not have
+/// a case.
+pub fn header_of(headers: [(str, str)], name: str) -> str {
+    for one in headers {
+        if one.0.to_lower() == name.to_lower() {
+            return one.1
+        }
+    }
+    return ""
+}
+
+fn message_from(lines: [str], dialect: str) -> MboxMessage {
+    var out = MboxMessage{ envelope_sender: "", envelope_date: "",
+        headers: [], body: "" }
+    if lines.len() == 0 {
+        return out
+    }
+    let first = without_return(lines[0])
+    if is_separator(first) {
+        let rest = trim(first.substr(5, first.len() - 5))
+        var space = 0 - 1
+        var i = 0
+        while i < rest.len() {
+            if is_space(rest.substr(i, 1)) {
+                space = i
+                i = rest.len()
+            } else {
+                i = i + 1
+            }
+        }
+        if space < 0 {
+            out.envelope_sender = rest
+        } else {
+            out.envelope_sender = rest.substr(0, space)
+            out.envelope_date = trim(rest.substr(space + 1,
+                rest.len() - space - 1))
+        }
+    }
+    var header_lines: [str] = []
+    var at = 1
+    while at < lines.len() {
+        if without_return(lines[at]).len() == 0 {
+            at = at + 1
+            break
+        }
+        header_lines.push(lines[at])
+        at = at + 1
+    }
+    out.headers = parse_headers(header_lines)
+    var body: [str] = []
+    while at < lines.len() {
+        body.push(unescaped(without_return(lines[at]), dialect))
+        at = at + 1
+    }
+    // The blank line before the next `From ` belongs to the format, not
+    // to the message.
+    while body.len() > 0 and body[body.len() - 1].len() == 0 {
+        body.pop()
+    }
+    if body.len() > 0 {
+        out.body = body.join("\n") + "\n"
+    }
+    return out
+}
+
+/// Read a whole mailbox.
+pub fn parse(text: str, dialect: str) -> [MboxMessage] {
+    var out: [MboxMessage] = []
+    var current: [str] = []
+    var started = false
+    for raw in text.split("\n") {
+        if is_separator(without_return(raw)) {
+            if started {
+                out.push(message_from(current, dialect))
+            }
+            current = [raw]
+            started = true
+            continue
+        }
+        if started {
+            current.push(raw)
+        }
+    }
+    if started {
+        out.push(message_from(current, dialect))
+    }
+    return out
+}
+
+/// Write a mailbox back out.
+///
+/// Every body line that would look like a separator is escaped, which is
+/// the only thing keeping the file readable.
+pub fn render(messages: [MboxMessage], dialect: str) -> str {
+    var out = ""
+    for message in messages {
+        var line = "From " + message.envelope_sender
+        if message.envelope_date.len() > 0 {
+            line = line + " " + message.envelope_date
+        }
+        out = out + line + "\n"
+        for header in message.headers {
+            out = out + header.0 + ": " + header.1 + "\n"
+        }
+        out = out + "\n"
+        if message.body.len() > 0 {
+            var body = message.body
+            if body.ends_with("\n") {
+                body = body.substr(0, body.len() - 1)
+            }
+            for one in body.split("\n") {
+                out = out + escaped(one, dialect) + "\n"
+            }
+        }
+        out = out + "\n"
+    }
+    return out
+}
+
+/// The subject, the sender and the date of every message, which is what
+/// a listing shows.
+pub fn summaries(messages: [MboxMessage]) -> [(str, str, str)] {
+    var out: [(str, str, str)] = []
+    for one in messages {
+        out.push((header_of(one.headers, "From"),
+            header_of(one.headers, "Subject"),
+            header_of(one.headers, "Date")))
+    }
+    return out
+}

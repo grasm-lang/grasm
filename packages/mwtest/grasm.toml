@@ -1,0 +1,8 @@
+[package]
+name = "mwtest"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.mimeword]
+path = "../mimeword"
+version = "^1.0.0"

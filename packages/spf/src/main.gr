@@ -1,0 +1,686 @@
+// SPF records: which machines a domain says may send its mail.
+//
+//   v=spf1 ip4:192.0.2.0/24 include:_spf.example.com -all
+//   v=spf1 mx a:mail.example.com ~all
+//   v=spf1 exists:%{ir}.%{v}._spf.%{d2} -all
+//
+// The record is a list of *terms* read left to right, and the first
+// mechanism that matches decides the answer with its qualifier: `+`
+// pass, `-` fail, `~` softfail, `?` neutral, with `+` assumed. What is
+// not obvious, and is where records go wrong:
+//
+//   - **`-all` and `~all` are very different**, and both are ordinary
+//     mechanisms that only match because `all` always does. A record
+//     with a mechanism *after* `all` has written something that can
+//     never be reached.
+//   - **A modifier is not a mechanism.** `redirect=` and `exp=` may
+//     appear anywhere and are not read in order: `redirect` applies only
+//     if no mechanism matched, and a record with both `redirect` and
+//     `all` ignores the redirect entirely.
+//   - **Macros are a small language.** `%{ir}.%{v}._spf.%{d2}` reverses
+//     the sending address, names the address family, and keeps the last
+//     two labels of the domain. `exists:` and `exp=` are nearly useless
+//     without them, and a reader that treats a macro as literal text
+//     looks up a name containing a brace.
+//
+// ## What this does and does not do
+//
+// It reads a record, says whether it is well formed, and expands its
+// macros against a message's details. It does not resolve anything: an
+// `include:` or an `a:` is answered by DNS, and a lookup belongs to the
+// caller with a resolver, not to a parser. What it gives that caller is
+// the term list with the arguments already expanded, which is the part
+// that is fiddly and testable without a network.
+
+type SpfError =
+    | NotSpf(text: str)
+    | UnknownTerm(text: str)
+    | BadCidr(text: str)
+    | BadMacro(text: str)
+
+    /// One mechanism of a record.
+type SpfTerm = {
+    /// `all`, `include`, `a`, `mx`, `ptr`, `ip4`, `ip6` or `exists`.
+    kind: str,
+    /// `pass`, `fail`, `softfail` or `neutral`.
+    qualifier: str,
+    /// As written, macros not expanded; empty when there was none.
+    argument: str,
+    /// The `/24` part, or 32 for a mechanism that had none.
+    cidr4: i64,
+    /// The `//64` part, or 128.
+    cidr6: i64,
+    /// The whole term as it was written.
+    text: str,
+}
+
+/// A whole record.
+type SpfRecord = {
+    terms: [SpfTerm],
+    /// `redirect` and `exp`, in the order written.
+    modifiers: [(str, str)],
+}
+
+/// What a macro is expanded against.
+type SpfContext = {
+    /// The envelope sender, `local@domain`.
+    sender: str,
+    /// The domain being asked about, which is not always the sender's.
+    domain: str,
+    /// The connecting address, in its ordinary form.
+    ip: str,
+    /// Whether `ip` is an IPv6 address.
+    is_ipv6: bool,
+    /// The `HELO` name.
+    helo: str,
+    /// The name of the machine doing the checking.
+    receiver: str,
+    /// Seconds since the epoch, for `%{t}`.
+    timestamp: i64,
+}
+
+fn is_digit(character: str) -> bool {
+    return character >= "0" and character <= "9"
+}
+
+fn is_space(character: str) -> bool {
+    return character == " " or character == "\t" or character == "\n" or
+    character == "\r"
+}
+
+fn qualifier_of(character: str) -> str {
+    if character == "-" {
+        return "fail"
+    }
+    if character == "~" {
+        return "softfail"
+    }
+    if character == "?" {
+        return "neutral"
+    }
+    return "pass"
+}
+
+fn words_of(text: str) -> [str] {
+    var out: [str] = []
+    var current = ""
+    var i = 0
+    while i < text.len() {
+        if is_space(text.substr(i, 1)) {
+            if current.len() > 0 {
+                out.push(current)
+                current = ""
+            }
+        } else {
+            current = current + text.substr(i, 1)
+        }
+        i = i + 1
+    }
+    if current.len() > 0 {
+        out.push(current)
+    }
+    return out
+}
+
+fn index_of(text: str, needle: str) -> i64 {
+    var i = 0
+    while i < text.len() {
+        if text.substr(i, 1) == needle {
+            return i
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+/// Take the `/24` or `/24//64` off a mechanism's argument.
+fn split_cidr(argument: str, is_ip6: bool) -> (str, i64, i64) ! SpfError {
+    var body = argument
+    var four = 32
+    var six = 128
+    let double = find_double_slash(body)
+    if double >= 0 {
+        let tail = body.substr(double + 2, body.len() - double - 2)
+        match tail.parse_int() {
+            Some(value) -> six = value
+            None -> fail(BadCidr(argument))
+        }
+        body = body.substr(0, double)
+    }
+    let slash = last_slash(body)
+    if slash >= 0 {
+        let tail = body.substr(slash + 1, body.len() - slash - 1)
+        var read = 0
+        match tail.parse_int() {
+            Some(value) -> read = value
+            None -> fail(BadCidr(argument))
+        }
+        // After an `ip6` network a single slash is the IPv6 prefix; the
+        // `//` form is for the mechanisms that take both.
+        if is_ip6 {
+            six = read
+        } else {
+            four = read
+        }
+        body = body.substr(0, slash)
+    }
+    if four > 32 or six > 128 or four < 0 or six < 0 {
+        fail(BadCidr(argument))
+    }
+    return (body, four, six)
+}
+
+fn find_double_slash(text: str) -> i64 {
+    var i = 0
+    while i + 1 < text.len() {
+        if text.substr(i, 1) == "/" and text.substr(i + 1, 1) == "/" {
+            return i
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+fn last_slash(text: str) -> i64 {
+    var at = 0 - 1
+    var i = 0
+    while i < text.len() {
+        if text.substr(i, 1) == "/" {
+            at = i
+        }
+        i = i + 1
+    }
+    return at
+}
+
+fn is_mechanism(name: str) -> bool {
+    return name == "all" or name == "include" or name == "a" or
+    name == "mx" or name == "ptr" or name == "ip4" or name == "ip6" or
+    name == "exists"
+}
+
+/// Read a record. The `v=spf1` at the front is required.
+pub fn parse(text: str) -> SpfRecord ! SpfError {
+    let words = words_of(text)
+    if words.len() == 0 or words[0].to_lower() != "v=spf1" {
+        fail(NotSpf(text))
+    }
+    var out = SpfRecord{ terms: [], modifiers: [] }
+    var i = 1
+    while i < words.len() {
+        let word = words[i]
+        i = i + 1
+        // A modifier is `name=value`, and the `=` has to come before any
+        // `:` for the term to be one.
+        let equals = index_of(word, "=")
+        let colon = index_of(word, ":")
+        if equals > 0 and (colon < 0 or equals < colon) {
+            out.modifiers.push((word.substr(0, equals).to_lower(),
+                word.substr(equals + 1, word.len() - equals - 1)))
+            continue
+        }
+        var body = word
+        var qualifier = "pass"
+        let first = body.substr(0, 1)
+        if first == "+" or first == "-" or first == "~" or first == "?" {
+            qualifier = qualifier_of(first)
+            body = body.substr(1, body.len() - 1)
+        }
+        var name = body
+        var argument = ""
+        if colon >= 0 {
+            let at = index_of(body, ":")
+            name = body.substr(0, at)
+            argument = body.substr(at + 1, body.len() - at - 1)
+        } else {
+            let slash = last_slash(body)
+            if slash >= 0 {
+                name = body.substr(0, slash)
+                argument = body.substr(slash, body.len() - slash)
+            }
+        }
+        if not is_mechanism(name.to_lower()) {
+            fail(UnknownTerm(word))
+        }
+        if name.to_lower() == "all" and argument.len() > 0 {
+            fail(UnknownTerm(word))
+        }
+        var kept = argument
+        var four = 32
+        var six = 128
+        if name.to_lower() != "all" and name.to_lower() != "include" and
+        name.to_lower() != "exists" {
+            let split = try split_cidr(argument, name.to_lower() == "ip6")
+            kept = split.0
+            four = split.1
+            six = split.2
+        }
+        out.terms.push(SpfTerm{ kind: name.to_lower(),
+            qualifier: qualifier, argument: kept, cidr4: four, cidr6: six,
+            text: word })
+    }
+    return out
+}
+
+fn local_part(sender: str) -> str {
+    let at = index_of(sender, "@")
+    if at < 0 {
+        return "postmaster"
+    }
+    return sender.substr(0, at)
+}
+
+fn sender_domain(sender: str) -> str {
+    let at = last_at(sender)
+    if at < 0 {
+        return sender
+    }
+    return sender.substr(at + 1, sender.len() - at - 1)
+}
+
+fn last_at(text: str) -> i64 {
+    var at = 0 - 1
+    var i = 0
+    while i < text.len() {
+        if text.substr(i, 1) == "@" {
+            at = i
+        }
+        i = i + 1
+    }
+    return at
+}
+
+/// The address in the form `%{i}` wants: dotted for IPv4, and one nibble
+/// per label for IPv6.
+fn address_form(context: SpfContext) -> str {
+    if not context.is_ipv6 {
+        return context.ip
+    }
+    // An IPv4-mapped address *is* an IPv4 address: `::ffff:192.0.2.1`
+    // reaches an IPv4 host and a record matching on it says `ip4`.
+    let mapped = mapped_ipv4(context.ip)
+    if mapped.len() > 0 {
+        return mapped
+    }
+    var out: [str] = []
+    for piece in expanded_ipv6(context.ip) {
+        out.push(piece)
+    }
+    return out.join(".")
+}
+
+fn last_colon(text: str) -> i64 {
+    var at = 0 - 1
+    var i = 0
+    while i < text.len() {
+        if text.substr(i, 1) == ":" {
+            at = i
+        }
+        i = i + 1
+    }
+    return at
+}
+
+fn hex_of(value: i64) -> str {
+    let digits = "0123456789abcdef"
+    var out = ""
+    var left = value
+    var i = 0
+    while i < 4 {
+        out = digits.substr(left % 16, 1) + out
+        left = left / 16
+        i = i + 1
+    }
+    return out
+}
+
+/// The IPv4 address inside `::ffff:a.b.c.d`, or the empty string.
+fn mapped_ipv4(text: str) -> str {
+    let lower = text.to_lower()
+    if not lower.starts_with("::ffff:") {
+        return ""
+    }
+    let tail = lower.substr(7, lower.len() - 7)
+    if tail.split(".").len() != 4 {
+        return ""
+    }
+    return tail
+}
+
+/// Every nibble of an IPv6 address, in order, as lower-case hexadecimal.
+fn expanded_ipv6(text: str) -> [str] {
+    var body = text
+    // A dotted tail is two groups written the IPv4 way, which is how a
+    // mapped or a compatible address is spelled.
+    let dot = index_of(body, ".")
+    if dot >= 0 {
+        let cut = last_colon(body)
+        let dotted = body.substr(cut + 1, body.len() - cut - 1).split(".")
+        if dotted.len() == 4 {
+            let high = (dotted[0].parse_int() ?? 0) * 256 +
+            (dotted[1].parse_int() ?? 0)
+            let low = (dotted[2].parse_int() ?? 0) * 256 +
+            (dotted[3].parse_int() ?? 0)
+            body = body.substr(0, cut + 1) + hex_of(high) + ":" + hex_of(low)
+        }
+    }
+    var before: [str] = []
+    var after: [str] = []
+    var seen_gap = false
+    var current = ""
+    var i = 0
+    while i <= body.len() {
+        var here = ":"
+        if i < body.len() {
+            here = body.substr(i, 1)
+        }
+        if here == ":" {
+            if current.len() > 0 {
+                if seen_gap {
+                    after.push(current)
+                } else {
+                    before.push(current)
+                }
+                current = ""
+            } else if i > 0 and i < body.len() and
+            body.substr(i - 1, 1) == ":" {
+                seen_gap = true
+            }
+        } else {
+            current = current + here
+        }
+        i = i + 1
+    }
+    var groups: [str] = []
+    for one in before {
+        groups.push(one)
+    }
+    var missing = 8 - before.len() - after.len()
+    while missing > 0 {
+        groups.push("0")
+        missing = missing - 1
+    }
+    for one in after {
+        groups.push(one)
+    }
+    var out: [str] = []
+    for group in groups {
+        var padded = group.to_lower()
+        while padded.len() < 4 {
+            padded = "0" + padded
+        }
+        var j = 0
+        while j < 4 {
+            out.push(padded.substr(j, 1))
+            j = j + 1
+        }
+    }
+    return out
+}
+
+fn macro_value(letter: str, context: SpfContext) -> str {
+    let lower = letter.to_lower()
+    if lower == "s" {
+        return context.sender
+    }
+    if lower == "l" {
+        return local_part(context.sender)
+    }
+    if lower == "o" {
+        return sender_domain(context.sender)
+    }
+    if lower == "d" {
+        return context.domain
+    }
+    if lower == "i" {
+        return address_form(context)
+    }
+    if lower == "p" {
+        // The validated reverse name, which needs DNS; a caller with a
+        // resolver substitutes it, and `unknown` is what the standard
+        // says to use when there is none.
+        return "unknown"
+    }
+    if lower == "v" {
+        if context.is_ipv6 {
+            return "ip6"
+        }
+        return "in-addr"
+    }
+    if lower == "h" {
+        return context.helo
+    }
+    if lower == "c" {
+        return context.ip
+    }
+    if lower == "r" {
+        return context.receiver
+    }
+    if lower == "t" {
+        return "{context.timestamp}"
+    }
+    return ""
+}
+
+fn url_escaped(text: str) -> str {
+    let digits = "0123456789ABCDEF"
+    var out = ""
+    let raw = text.to_bytes()
+    var i = 0
+    while i < raw.len() {
+        let byte = raw.at(i)
+        let character = bytes_of([byte]).to_str()
+        if (byte >= 48 and byte <= 57) or (byte >= 65 and byte <= 90) or
+        (byte >= 97 and byte <= 122) or character == "-" or
+        character == "." or character == "_" or character == "~" {
+            out = out + character
+        } else {
+            out = out + "%" + digits.substr(byte / 16, 1) +
+            digits.substr(byte % 16, 1)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn split_on_any(text: str, delimiters: str) -> [str] {
+    var out: [str] = []
+    var current = ""
+    var i = 0
+    while i < text.len() {
+        let here = text.substr(i, 1)
+        var is_delimiter = false
+        var j = 0
+        while j < delimiters.len() {
+            if delimiters.substr(j, 1) == here {
+                is_delimiter = true
+                j = delimiters.len()
+            } else {
+                j = j + 1
+            }
+        }
+        if is_delimiter {
+            out.push(current)
+            current = ""
+        } else {
+            current = current + here
+        }
+        i = i + 1
+    }
+    out.push(current)
+    return out
+}
+
+fn transformed(value: str, digits: i64, reverse: bool,
+    delimiters: str) -> str {
+    var parts = split_on_any(value, delimiters)
+    if reverse {
+        var flipped: [str] = []
+        var i = parts.len() - 1
+        while i >= 0 {
+            flipped.push(parts[i])
+            i = i - 1
+        }
+        parts = flipped
+    }
+    if digits > 0 and digits < parts.len() {
+        var kept: [str] = []
+        var i = parts.len() - digits
+        while i < parts.len() {
+            kept.push(parts[i])
+            i = i + 1
+        }
+        parts = kept
+    }
+    return parts.join(".")
+}
+
+/// One `%{...}`, without its braces.
+fn one_macro(body: str, whole: str, context: SpfContext) -> str ! SpfError {
+    if body.len() == 0 {
+        fail(BadMacro(whole))
+    }
+    let letter = body.substr(0, 1)
+    var digits = 0
+    var reverse = false
+    var delimiters = "."
+    var k = 1
+    while k < body.len() and is_digit(body.substr(k, 1)) {
+        digits = digits * 10 + (body.substr(k, 1).parse_int() ?? 0)
+        k = k + 1
+    }
+    // `%{d0}` is not "keep no labels", it is not a macro: the standard
+    // says the count is one or more.
+    if k > 1 and digits == 0 {
+        fail(BadMacro(whole))
+    }
+    if k < body.len() and body.substr(k, 1).to_lower() == "r" {
+        reverse = true
+        k = k + 1
+    }
+    if k < body.len() {
+        delimiters = body.substr(k, body.len() - k)
+        for character in delimiters.chars() {
+            if character != "." and character != "-" and
+            character != "+" and character != "," and character != "/" and
+            character != "_" and character != "=" {
+                fail(BadMacro(whole))
+            }
+        }
+    }
+    let value = transformed(macro_value(letter, context), digits, reverse,
+        delimiters)
+    // An upper-case letter means the result is escaped for a URL, which
+    // is what `exp=` needs and `exists:` does not.
+    if letter >= "A" and letter <= "Z" {
+        return url_escaped(value)
+    }
+    return value
+}
+
+/// Expand the macros in a term's argument.
+///
+/// `%%` is a literal percent, `%_` a space and `%-` the escape `%20`;
+/// everything else is `%{letter…}`. An upper-case letter means the
+/// result is URL-escaped, which is what `exp=` needs and `exists:` does
+/// not.
+pub fn expand(text: str, context: SpfContext) -> str ! SpfError {
+    var out = ""
+    var i = 0
+    while i < text.len() {
+        let here = text.substr(i, 1)
+        if here != "%" {
+            out = out + here
+            i = i + 1
+            continue
+        }
+        if i + 1 >= text.len() {
+            fail(BadMacro(text))
+        }
+        let next = text.substr(i + 1, 1)
+        if next == "%" {
+            out = out + "%"
+            i = i + 2
+            continue
+        }
+        if next == "_" {
+            out = out + " "
+            i = i + 2
+            continue
+        }
+        if next == "-" {
+            out = out + "%20"
+            i = i + 2
+            continue
+        }
+        if next != "\{" {
+            fail(BadMacro(text))
+        }
+        var close = 0 - 1
+        var j = i + 2
+        while j < text.len() {
+            if text.substr(j, 1) == "}" {
+                close = j
+                j = text.len()
+            } else {
+                j = j + 1
+            }
+        }
+        if close < 0 {
+            fail(BadMacro(text))
+        }
+        out = out + (try one_macro(text.substr(i + 2, close - i - 2),
+            text, context))
+        i = close + 1
+    }
+    return out
+}
+
+/// A term's argument, expanded and defaulted.
+///
+/// A mechanism with no argument is about the domain being asked about,
+/// which is why `a` and `a:%{d}` mean the same thing.
+pub fn argument_of(term: SpfTerm, context: SpfContext) -> str ! SpfError {
+    if term.argument.len() == 0 {
+        return context.domain
+    }
+    return try expand(term.argument, context)
+}
+
+/// The mechanisms that can never be reached, because `all` came first.
+///
+/// This is the most common mistake in a published record and it is
+/// silent: the terms are simply never read.
+pub fn unreachable_terms(record: SpfRecord) -> [str] {
+    var out: [str] = []
+    var seen_all = false
+    for term in record.terms {
+        if seen_all {
+            out.push(term.text)
+        }
+        if term.kind == "all" {
+            seen_all = true
+        }
+    }
+    return out
+}
+
+/// How many DNS lookups evaluating the record would cost.
+///
+/// The standard's limit is ten, and a record over it fails with a
+/// permanent error however correct it looks.
+pub fn lookup_count(record: SpfRecord) -> i64 {
+    var out = 0
+    for term in record.terms {
+        if term.kind == "include" or term.kind == "a" or
+        term.kind == "mx" or term.kind == "ptr" or term.kind == "exists" {
+            out = out + 1
+        }
+    }
+    for modifier in record.modifiers {
+        if modifier.0 == "redirect" {
+            out = out + 1
+        }
+    }
+    return out
+}

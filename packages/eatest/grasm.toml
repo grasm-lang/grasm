@@ -1,0 +1,8 @@
+[package]
+name = "eatest"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.emailaddr]
+path = "../emailaddr"
+version = "^1.0.0"

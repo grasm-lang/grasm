@@ -1,0 +1,318 @@
+// Encoded words: how a mail header carries a subject that is not ASCII.
+//
+//   Subject: =?utf-8?B?w6ljaGVj?= =?utf-8?Q?_et_mat?=
+//
+// A header is ASCII by the standard that defined it, so anything else
+// is written as `=?charset?encoding?text?=` and put back together by the
+// reader. Three rules make this harder than a substitution:
+//
+//   - **Whitespace between two encoded words disappears.** It is there
+//     so the header can be folded, not because there is a space in the
+//     text: `=?utf-8?B?YQ==?= =?utf-8?B?Yg==?=` is `ab`, not `a b`.
+//     Whitespace between an encoded word and ordinary text stays.
+//   - **A word is at most 75 characters** including the markers, so a
+//     long subject is several words — and a multi-byte character may
+//     not be split across two of them, which is why the split is done
+//     on the *encoded* form and checked against the character
+//     boundaries.
+//   - **`Q` is not `quoted-printable`.** It is close, but `_` means a
+//     space, and the set of characters that must be escaped is
+//     different. Decoding one as the other gets underscores wrong in
+//     every header that has them.
+//
+// ## What this answers with
+//
+// A decoded word is bytes plus the charset it was written in, not a
+// string: `=?iso-8859-1?Q?caf=E9?=` is one byte 0xE9, and turning that
+// into a character needs a table this package does not carry. UTF-8 and
+// Latin-1 are converted for you because they cover nearly everything;
+// for the rest the caller has the bytes and the name, and the codepage
+// packages take it from there.
+import bytes_codec
+
+/// One piece of a header: some bytes, and what they were written in.
+type MimeWord = {
+    /// The bytes, decoded from base64 or Q but not from the charset.
+    raw: bytes,
+    /// Lower case, or the empty string for a run of plain ASCII.
+    charset: str,
+    /// The language tag from `=?utf-8*en?B?...?=`, usually empty.
+    language: str,
+}
+
+fn is_space(character: str) -> bool {
+    return character == " " or character == "\t" or character == "\n" or
+    character == "\r"
+}
+
+fn hex_value(character: str) -> i64 {
+    let lower = character.to_lower()
+    if lower >= "0" and lower <= "9" {
+        return lower.code_at(0) - "0".code_at(0)
+    }
+    if lower >= "a" and lower <= "f" {
+        return lower.code_at(0) - "a".code_at(0) + 10
+    }
+    return 0 - 1
+}
+
+/// Undo the `Q` encoding, which is quoted-printable with `_` for space.
+pub fn decode_q(text: str) -> bytes {
+    var out: [i64] = []
+    var i = 0
+    while i < text.len() {
+        let here = text.substr(i, 1)
+        if here == "_" {
+            out.push(32)
+            i = i + 1
+            continue
+        }
+        if here == "=" and i + 2 < text.len() {
+            let high = hex_value(text.substr(i + 1, 1))
+            let low = hex_value(text.substr(i + 2, 1))
+            if high >= 0 and low >= 0 {
+                out.push(high * 16 + low)
+                i = i + 3
+                continue
+            }
+        }
+        let raw = here.to_bytes()
+        var j = 0
+        while j < raw.len() {
+            out.push(raw.at(j))
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return bytes_of(out)
+}
+
+/// Whether the text at `at` begins an encoded word, and where it ends.
+///
+/// Answers the index just past the `?=`, or -1. A word may not contain a
+/// space, which is what stops `=?` in ordinary prose being read as one.
+fn word_ends(text: str, at: i64) -> i64 {
+    var i = at + 2
+    var questions = 0
+    while i < text.len() {
+        let here = text.substr(i, 1)
+        if is_space(here) {
+            return 0 - 1
+        }
+        if here == "?" {
+            questions = questions + 1
+            if questions == 3 and i + 1 < text.len() and
+            text.substr(i + 1, 1) == "=" {
+                return i + 2
+            }
+            if questions > 3 {
+                return 0 - 1
+            }
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+fn word_at(text: str, at: i64, ends: i64) -> Option[MimeWord] {
+    let body = text.substr(at + 2, ends - at - 4)
+    var fields = body.split("?")
+    if fields.len() != 3 {
+        return None
+    }
+    var charset = fields[0].to_lower()
+    var language = ""
+    var star = 0 - 1
+    var i = 0
+    while i < charset.len() {
+        if charset.substr(i, 1) == "*" {
+            star = i
+            i = charset.len()
+        } else {
+            i = i + 1
+        }
+    }
+    if star >= 0 {
+        language = charset.substr(star + 1, charset.len() - star - 1)
+        charset = charset.substr(0, star)
+    }
+    let how = fields[1].to_lower()
+    if how == "q" {
+        return Some(MimeWord{ raw: decode_q(fields[2]), charset: charset,
+            language: language })
+    }
+    if how == "b" {
+        match bytes_codec.decode_base64(fields[2]) {
+            Some(raw) -> return Some(MimeWord{ raw: raw, charset: charset,
+                language: language })
+            None -> return None
+        }
+    }
+    return None
+}
+
+/// Take a header value apart into its words.
+///
+/// Whitespace that sits between two encoded words is dropped, because it
+/// is there to let the header fold; whitespace anywhere else is kept.
+pub fn decode(text: str) -> [MimeWord] {
+    var out: [MimeWord] = []
+    var plain = ""
+    var last_was_encoded = false
+    var i = 0
+    while i < text.len() {
+        if text.substr(i, 1) == "=" and i + 1 < text.len() and
+        text.substr(i + 1, 1) == "?" {
+            let ends = word_ends(text, i)
+            if ends > 0 {
+                match word_at(text, i, ends) {
+                    Some(word) -> {
+                        // Only whitespace separates the two words, so it
+                        // was folding rather than text.
+                        if last_was_encoded and plain.trim().len() == 0 {
+                            plain = ""
+                        }
+                        if plain.len() > 0 {
+                            out.push(MimeWord{ raw: plain.to_bytes(),
+                                charset: "", language: "" })
+                            plain = ""
+                        }
+                        out.push(word)
+                        last_was_encoded = true
+                        i = ends
+                        continue
+                    }
+                    None -> {}
+                }
+            }
+        }
+        plain = plain + text.substr(i, 1)
+        i = i + 1
+    }
+    if plain.len() > 0 {
+        out.push(MimeWord{ raw: plain.to_bytes(), charset: "",
+            language: "" })
+    }
+    return joined(out)
+}
+
+/// Two encoded words in the same charset are one run of text, because
+/// the only reason there are two is that a header may not be long.
+fn joined(words: [MimeWord]) -> [MimeWord] {
+    var out: [MimeWord] = []
+    for word in words {
+        if out.len() > 0 and out[out.len() - 1].charset == word.charset and
+        out[out.len() - 1].language == word.language {
+            var raw: [i64] = []
+            let held = out[out.len() - 1].raw
+            var i = 0
+            while i < held.len() {
+                raw.push(held.at(i))
+                i = i + 1
+            }
+            var j = 0
+            while j < word.raw.len() {
+                raw.push(word.raw.at(j))
+                j = j + 1
+            }
+            out[out.len() - 1].raw = bytes_of(raw)
+            continue
+        }
+        out.push(word)
+    }
+    return out
+}
+
+/// The whole header as text, converting the charsets that can be
+/// converted without a table.
+///
+/// A word in a charset this does not know keeps its bytes, which is
+/// wrong to display and right to pass on; `decode` is the call to use
+/// when that matters.
+pub fn decode_text(text: str) -> str {
+    var out = ""
+    for word in decode(text) {
+        if word.charset == "iso-8859-1" or word.charset == "latin-1" or
+        word.charset == "iso8859-1" {
+            var i = 0
+            while i < word.raw.len() {
+                out = out + character_of(word.raw.at(i))
+                i = i + 1
+            }
+        } else {
+            out = out + word.raw.to_str()
+        }
+    }
+    return out
+}
+
+fn character_of(code: i64) -> str {
+    if code < 128 {
+        return bytes_of([code]).to_str()
+    }
+    return bytes_of([192 + code / 64, 128 + code % 64]).to_str()
+}
+
+fn needs_encoding(text: str) -> bool {
+    let raw = text.to_bytes()
+    var i = 0
+    while i < raw.len() {
+        if raw.at(i) >= 128 or raw.at(i) < 32 {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn q_character(byte: i64) -> str {
+    let digits = "0123456789ABCDEF"
+    if byte == 32 {
+        return "_"
+    }
+    if (byte >= 48 and byte <= 57) or (byte >= 65 and byte <= 90) or
+    (byte >= 97 and byte <= 122) {
+        return bytes_of([byte]).to_str()
+    }
+    return "=" + digits.substr(byte / 16, 1) + digits.substr(byte % 16, 1)
+}
+
+/// Write text as `Q`-encoded words, splitting at the length limit.
+///
+/// The split is made on whole characters: a UTF-8 sequence broken across
+/// two words decodes to nothing anybody wanted.
+pub fn encode_q(text: str, charset: str) -> str {
+    if not needs_encoding(text) {
+        return text
+    }
+    let opening = "=?" + charset + "?Q?"
+    var words: [str] = []
+    var current = ""
+    for character in text.chars() {
+        var piece = ""
+        let raw = character.to_bytes()
+        var i = 0
+        while i < raw.len() {
+            piece = piece + q_character(raw.at(i))
+            i = i + 1
+        }
+        if opening.len() + current.len() + piece.len() + 2 > 75 {
+            words.push(opening + current + "?=")
+            current = ""
+        }
+        current = current + piece
+    }
+    if current.len() > 0 {
+        words.push(opening + current + "?=")
+    }
+    return words.join(" ")
+}
+
+/// Write text as one base64 word, for a value that is mostly not ASCII.
+pub fn encode_b(text: str, charset: str) -> str {
+    if not needs_encoding(text) {
+        return text
+    }
+    return "=?" + charset + "?B?" + bytes_codec.encode_base64(text.to_bytes()) +
+    "?="
+}

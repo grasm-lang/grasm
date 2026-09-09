@@ -1,0 +1,362 @@
+// DKIM signatures: the header, and the exact bytes it is a signature
+// over.
+//
+//   DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed;
+//     d=example.test; s=selector; h=from:to:subject:date;
+//     bh=2jmj7l5rSw0yVb/vlWAYkK/YBwk=; b=dGhlIHNpZ25hdHVyZQ==
+//
+// Signing a message is easy; agreeing on *what was signed* is the whole
+// problem. A message is relayed by machines that fold headers
+// differently, change the case of header names, add or remove trailing
+// whitespace and normalise line endings — all of which are allowed and
+// none of which may break the signature. So DKIM signs a canonical form
+// rather than the bytes, and there are two of them:
+//
+//   `simple`   nothing changes, except that trailing empty lines of the
+//              body are removed and an empty body becomes one `CRLF`.
+//   `relaxed`  header names are lower-cased, folding is undone, runs of
+//              whitespace become one space, trailing whitespace goes,
+//              and the body is treated the same way line by line.
+//
+// `c=relaxed/simple` means relaxed headers and a simple body, and a
+// signer that mixes them up produces a signature that verifies nowhere.
+//
+// ## The signature header signs itself
+//
+// The `DKIM-Signature` header is part of what is signed, with its own
+// `b=` value emptied and *without* a trailing CRLF. Miss either detail
+// and every signature fails; there is no partial credit and no error
+// message that says which of the two it was.
+//
+// ## Header order is the signer's choice, and it is not the message's
+//
+// `h=from:to:subject` says which headers are signed *and in what order*
+// they are fed to the hash — from the bottom of the message up, so a
+// header named twice in `h=` takes the next one up each time. That rule
+// exists to stop a relay adding a second `From:` and changing what the
+// signature covers.
+//
+// ## What is here
+//
+// The header parsing and both canonicalisations, which is the part that
+// has to be exactly right and can be checked without a key. The signing
+// and verifying themselves are `rsa`, `ed25519` and `sha256`, which this
+// deliberately leaves to the caller that has the key.
+
+type DkimError =
+    | NoSignature()
+    | BadTagList(text: str)
+
+    /// A parsed `DKIM-Signature` header.
+type DkimSignature = {
+    /// The tags, in the order written.
+    tags: [(str, str)],
+    /// `simple` or `relaxed`.
+    header_canonicalisation: str,
+    body_canonicalisation: str,
+    /// The signed header names, lower-cased, in order.
+    signed_headers: [str],
+}
+
+fn is_space(character: str) -> bool {
+    return character == " " or character == "\t"
+}
+
+fn is_folding(character: str) -> bool {
+    return is_space(character) or character == "\r" or character == "\n"
+}
+
+fn trim(text: str) -> str {
+    var start = 0
+    while start < text.len() and is_folding(text.substr(start, 1)) {
+        start = start + 1
+    }
+    var end = text.len()
+    while end > start and is_folding(text.substr(end - 1, 1)) {
+        end = end - 1
+    }
+    return text.substr(start, end - start)
+}
+
+/// Read a `tag=value; tag=value` list, which is the shape DKIM, DMARC
+/// and every other mail policy record uses.
+pub fn parse_tags(text: str) -> [(str, str)] {
+    var out: [(str, str)] = []
+    for piece in text.split(";") {
+        let body = trim(piece)
+        if body.len() == 0 {
+            continue
+        }
+        var equals = 0 - 1
+        var i = 0
+        while i < body.len() {
+            if body.substr(i, 1) == "=" {
+                equals = i
+                i = body.len()
+            } else {
+                i = i + 1
+            }
+        }
+        if equals < 0 {
+            continue
+        }
+        // The whitespace inside a value is part of it as far as the
+        // syntax goes; it is the base64 tags that ignore it, and
+        // `base64_of` is what does that.
+        out.push((trim(body.substr(0, equals)),
+            trim(body.substr(equals + 1, body.len() - equals - 1))))
+    }
+    return out
+}
+
+/// The value of a base64 tag, with the folding whitespace taken out.
+///
+/// `b=` and `bh=` are written over several lines, and the whitespace
+/// that makes that possible is not part of the base64. Every other tag
+/// keeps its value as written.
+pub fn base64_of(tags: [(str, str)], name: str) -> str {
+    var out = ""
+    for character in tag_of(tags, name).chars() {
+        if not is_folding(character) {
+            out = out + character
+        }
+    }
+    return out
+}
+
+/// The value of a tag, or the empty string.
+pub fn tag_of(tags: [(str, str)], name: str) -> str {
+    for one in tags {
+        if one.0 == name {
+            return one.1
+        }
+    }
+    return ""
+}
+
+/// Read a `DKIM-Signature` header value.
+///
+/// A tag list with a piece that is not `name=value` is refused rather
+/// than read past: RFC 6376 makes a malformed signature header a
+/// permanent failure, and a verifier that skips the piece is verifying
+/// something the signer did not sign.
+pub fn parse(value: str) -> DkimSignature ! DkimError {
+    for piece in value.split(";") {
+        if trim(piece).len() == 0 {
+            continue
+        }
+        if not piece.contains("=") {
+            fail(BadTagList(value))
+        }
+    }
+    let tags = parse_tags(value)
+    if tags.len() == 0 {
+        fail(NoSignature())
+    }
+    var header_kind = "simple"
+    var body_kind = "simple"
+    let written = tag_of(tags, "c")
+    if written.len() > 0 {
+        let halves = written.split("/")
+        header_kind = halves[0].to_lower()
+        if halves.len() > 1 {
+            body_kind = halves[1].to_lower()
+        }
+    }
+    var signed: [str] = []
+    let list = tag_of(tags, "h")
+    if list.len() > 0 {
+        for one in list.split(":") {
+            if trim(one).len() > 0 {
+                signed.push(trim(one).to_lower())
+            }
+        }
+    }
+    return DkimSignature{ tags: tags,
+        header_canonicalisation: header_kind,
+        body_canonicalisation: body_kind, signed_headers: signed }
+}
+
+/// Undo folding and squeeze the whitespace of one header value.
+fn relaxed_value(value: str) -> str {
+    var out = ""
+    var pending = false
+    for character in value.chars() {
+        if is_folding(character) {
+            pending = out.len() > 0
+            continue
+        }
+        if pending {
+            out = out + " "
+            pending = false
+        }
+        out = out + character
+    }
+    return out
+}
+
+/// One header, canonicalised.
+///
+/// `simple` hands the header back exactly as it arrived; `relaxed`
+/// lower-cases the name, removes the space around the colon, undoes the
+/// folding and squeezes what is left.
+pub fn canonical_header(name: str, value: str, kind: str) -> str {
+    if kind == "relaxed" {
+        return name.to_lower() + ":" + relaxed_value(value) + "\r\n"
+    }
+    // The value arrives as the message had it, line ending included, so
+    // `simple` adds one only when it is missing.
+    let out = name + ":" + value
+    if out.ends_with("\r\n") {
+        return out
+    }
+    return out + "\r\n"
+}
+
+fn without_trailing_space(line: str) -> str {
+    var end = line.len()
+    while end > 0 and is_space(line.substr(end - 1, 1)) {
+        end = end - 1
+    }
+    return line.substr(0, end)
+}
+
+fn squeezed(line: str) -> str {
+    var out = ""
+    var pending = false
+    for character in line.chars() {
+        if is_space(character) {
+            pending = true
+            continue
+        }
+        // A run of whitespace becomes one space *wherever* it is: a
+        // body line keeps its indentation as a single space, unlike a
+        // header value, which loses it. The two rules are one sentence
+        // apart in the standard and are not the same.
+        if pending {
+            out = out + " "
+        }
+        pending = false
+        out = out + character
+    }
+    return out
+}
+
+/// The body, canonicalised.
+///
+/// Both forms remove the empty lines at the end. `simple` then adds one
+/// `CRLF` back, so an empty body hashes as `CRLF` and not as nothing;
+/// `relaxed` leaves an empty body empty. That single difference is the
+/// one most home-made signers get wrong.
+pub fn canonical_body(body: str, kind: str) -> str {
+    var lines: [str] = []
+    for raw in body.split("\n") {
+        var line = raw
+        if line.ends_with("\r") {
+            line = line.substr(0, line.len() - 1)
+        }
+        if kind == "relaxed" {
+            line = squeezed(without_trailing_space(line))
+        }
+        lines.push(line)
+    }
+    // A body ending in CRLF leaves an empty last piece, which is not a
+    // line.
+    if lines.len() > 0 and lines[lines.len() - 1].len() == 0 {
+        lines.pop()
+    }
+    while lines.len() > 0 and lines[lines.len() - 1].len() == 0 {
+        lines.pop()
+    }
+    if lines.len() == 0 {
+        if kind == "relaxed" {
+            return ""
+        }
+        return "\r\n"
+    }
+    var out = ""
+    for line in lines {
+        out = out + line + "\r\n"
+    }
+    return out
+}
+
+/// The signature header as it goes into the hash: its own `b=` emptied,
+/// canonicalised, and with no trailing `CRLF`.
+pub fn signable_header(name: str, value: str, kind: str) -> str {
+    var out = ""
+    var i = 0
+    var skipping = false
+    while i < value.len() {
+        let here = value.substr(i, 1)
+        if skipping {
+            if here == ";" {
+                skipping = false
+                out = out + here
+            }
+            i = i + 1
+            continue
+        }
+        // `b=` is emptied, and only `b=` — `bh=` is the body hash and is
+        // signed like any other tag.
+        if here == "b" and i + 1 < value.len() and
+        value.substr(i + 1, 1) == "=" and starts_a_tag(value, i) {
+            out = out + "b="
+            skipping = true
+            i = i + 2
+            continue
+        }
+        out = out + here
+        i = i + 1
+    }
+    let whole = canonical_header(name, out, kind)
+    return whole.substr(0, whole.len() - 2)
+}
+
+/// Whether the character at `at` begins a tag rather than sitting inside
+/// one.
+fn starts_a_tag(value: str, at: i64) -> bool {
+    var i = at - 1
+    while i >= 0 and is_folding(value.substr(i, 1)) {
+        i = i - 1
+    }
+    if i < 0 {
+        return true
+    }
+    return value.substr(i, 1) == ";"
+}
+
+/// The headers to hash, in the order the signature asks for them.
+///
+/// `h=` is read from the bottom of the message up: a name written twice
+/// takes the next one up each time, and a name with no header left is
+/// skipped. That is what stops a relay adding a second `From:` and
+/// changing what was signed.
+pub fn headers_to_hash(headers: [(str, str)],
+    signature: DkimSignature) -> [(str, str)] {
+    var used: [i64] = []
+    var out: [(str, str)] = []
+    for name in signature.signed_headers {
+        var at = 0 - 1
+        var i = headers.len() - 1
+        while i >= 0 {
+            var taken = false
+            for one in used {
+                if one == i {
+                    taken = true
+                }
+            }
+            if not taken and headers[i].0.to_lower() == name {
+                at = i
+                i = 0 - 1
+            } else {
+                i = i - 1
+            }
+        }
+        if at >= 0 {
+            used.push(at)
+            out.push(headers[at])
+        }
+    }
+    return out
+}

@@ -1,0 +1,6 @@
+[package]
+name = "spf"
+version = "1.0.0"
+
+# Parsing and expanding text. Opens nothing.
+capabilities = []

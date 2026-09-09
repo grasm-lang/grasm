@@ -1,0 +1,544 @@
+// Mail addresses as headers actually carry them.
+//
+//   To: Ada Lovelace <ada@example.test>, "Babbage, Charles" <cb@x.test>
+//   Cc: Team: a@x.test, b@x.test;, (a comment) c@x.test
+//
+// Splitting that on commas gets the second address wrong, because a
+// comma inside a quoted display name is part of the name. So is a `<`
+// inside quotes, and a comma inside a comment, and the group syntax
+// looks like an address with a colon in it. Every one of those appears
+// in real mail.
+//
+// ## What is an address and what is a label
+//
+// `Ada Lovelace <ada@example.test>` is one address whose *display name*
+// is `Ada Lovelace`. A sender comparing the whole string against a block
+// list never matches; a sender showing the display name to a person is
+// showing text the sender of the message chose, which is the oldest
+// phishing trick there is. Both halves are here separately for exactly
+// that reason.
+//
+// ## Quoting is not decoration
+//
+// A display name holding a comma, a colon, a bracket or a quote has to
+// be quoted when it is written back out, or the header means something
+// else on the next hop. `render` does that; a caller that joins the
+// pieces by hand will eventually send a header that splits into two
+// addresses.
+//
+// ## What this does not do
+//
+// It does not decode `=?utf-8?B?...?=` in a display name — that is
+// `mimeword`, and it runs after this — and it does not check that a
+// domain exists. What it checks is the syntax: that there is one `@`
+// outside quotes, that the local part is a dot-atom or a quoted string,
+// and that the domain is labels or an address literal.
+
+type EmailError =
+    | NoAddress(text: str)
+
+    /// One address, and the name written beside it.
+type EmailAddress = {
+    /// The unquoted display name, or the empty string.
+    display_name: str,
+    /// `local@domain`, with no angle brackets.
+    address: str,
+    /// The group this address was written inside, or the empty string.
+    group: str,
+}
+
+fn is_space(character: str) -> bool {
+    return character == " " or character == "\t" or character == "\n" or
+    character == "\r"
+}
+
+fn trim(text: str) -> str {
+    var start = 0
+    while start < text.len() and is_space(text.substr(start, 1)) {
+        start = start + 1
+    }
+    var end = text.len()
+    while end > start and is_space(text.substr(end - 1, 1)) {
+        end = end - 1
+    }
+    return text.substr(start, end - start)
+}
+
+/// Split a header value into the pieces the commas separate, ignoring
+/// commas inside quotes, comments and angle brackets.
+fn top_level_pieces(text: str) -> [str] {
+    var out: [str] = []
+    var current = ""
+    var quoted = false
+    var comments = 0
+    var angled = false
+    var i = 0
+    while i < text.len() {
+        let here = text.substr(i, 1)
+        if quoted {
+            current = current + here
+            if here == "\\" and i + 1 < text.len() {
+                current = current + text.substr(i + 1, 1)
+                i = i + 2
+                continue
+            }
+            if here == "\"" {
+                quoted = false
+            }
+            i = i + 1
+            continue
+        }
+        if comments > 0 {
+            if here == "\\" and i + 1 < text.len() {
+                current = current + here + text.substr(i + 1, 1)
+                i = i + 2
+                continue
+            }
+            current = current + here
+            if here == "(" {
+                comments = comments + 1
+            }
+            if here == ")" {
+                comments = comments - 1
+            }
+            i = i + 1
+            continue
+        }
+        if here == "\"" {
+            quoted = true
+            current = current + here
+            i = i + 1
+            continue
+        }
+        if here == "(" {
+            comments = 1
+            current = current + here
+            i = i + 1
+            continue
+        }
+        if here == "<" {
+            angled = true
+        }
+        if here == ">" {
+            angled = false
+        }
+        if here == "," and not angled {
+            out.push(current)
+            current = ""
+            i = i + 1
+            continue
+        }
+        current = current + here
+        i = i + 1
+    }
+    out.push(current)
+    return out
+}
+
+/// Remove the comments from a piece, which are notes and not content.
+fn without_comments(text: str) -> str {
+    var out = ""
+    var depth = 0
+    var quoted = false
+    var i = 0
+    while i < text.len() {
+        let here = text.substr(i, 1)
+        if quoted {
+            out = out + here
+            if here == "\\" and i + 1 < text.len() {
+                out = out + text.substr(i + 1, 1)
+                i = i + 2
+                continue
+            }
+            if here == "\"" {
+                quoted = false
+            }
+            i = i + 1
+            continue
+        }
+        if here == "\"" {
+            quoted = true
+            out = out + here
+            i = i + 1
+            continue
+        }
+        if here == "(" {
+            depth = depth + 1
+            i = i + 1
+            continue
+        }
+        if here == ")" {
+            if depth > 0 {
+                depth = depth - 1
+            }
+            i = i + 1
+            continue
+        }
+        if depth == 0 {
+            out = out + here
+        }
+        i = i + 1
+    }
+    return out
+}
+
+/// Take the quotes and their escapes off a display name.
+pub fn unquote(text: str) -> str {
+    let body = trim(text)
+    if body.len() < 2 or not body.starts_with("\"") or
+    not body.ends_with("\"") {
+        return body
+    }
+    var out = ""
+    var i = 1
+    while i < body.len() - 1 {
+        let here = body.substr(i, 1)
+        if here == "\\" and i + 1 < body.len() - 1 {
+            out = out + body.substr(i + 1, 1)
+            i = i + 2
+            continue
+        }
+        out = out + here
+        i = i + 1
+    }
+    return out
+}
+
+fn needs_quoting(name: str) -> bool {
+    for character in name.chars() {
+        if character == "(" or character == ")" or character == "<" or
+        character == ">" or character == "[" or character == "]" or
+        character == ":" or character == ";" or character == "@" or
+        character == "\\" or character == "," or character == "." or
+        character == "\"" {
+            return true
+        }
+    }
+    return false
+}
+
+/// Write a display name, quoting it when the syntax needs it.
+pub fn quote_name(name: str) -> str {
+    if name.len() == 0 or not needs_quoting(name) {
+        return name
+    }
+    var out = "\""
+    for character in name.chars() {
+        if character == "\"" or character == "\\" {
+            out = out + "\\"
+        }
+        out = out + character
+    }
+    return out + "\""
+}
+
+/// The text of the first comment in a piece, which is where a name
+/// often lives: `ada@example.test (Ada Lovelace)` names a person as
+/// surely as the angle-bracket form does.
+fn first_comment(text: str) -> str {
+    var depth = 0
+    var quoted = false
+    var out = ""
+    var i = 0
+    while i < text.len() {
+        let here = text.substr(i, 1)
+        if quoted {
+            if here == "\\" and i + 1 < text.len() {
+                i = i + 2
+                continue
+            }
+            if here == "\"" {
+                quoted = false
+            }
+            i = i + 1
+            continue
+        }
+        if here == "\"" and depth == 0 {
+            quoted = true
+            i = i + 1
+            continue
+        }
+        if here == "(" {
+            depth = depth + 1
+            if depth == 1 {
+                i = i + 1
+                continue
+            }
+        }
+        if here == ")" {
+            depth = depth - 1
+            if depth == 0 {
+                return out
+            }
+        }
+        if depth > 0 {
+            if here == "\\" and i + 1 < text.len() {
+                out = out + text.substr(i + 1, 1)
+                i = i + 2
+                continue
+            }
+            out = out + here
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+/// Read one address, with or without a display name.
+fn read_one(piece: str, group: str) -> Option[EmailAddress] {
+    let comment = first_comment(piece)
+    let body = trim(without_comments(piece))
+    if body.len() == 0 {
+        return None
+    }
+    // The last `<` outside quotes opens the address; everything before
+    // it is the display name.
+    var open = 0 - 1
+    var close = 0 - 1
+    var quoted = false
+    var i = 0
+    while i < body.len() {
+        let here = body.substr(i, 1)
+        if here == "\\" and quoted and i + 1 < body.len() {
+            i = i + 2
+            continue
+        }
+        if here == "\"" {
+            quoted = not quoted
+        }
+        if not quoted and here == "<" {
+            open = i
+            close = 0 - 1
+        }
+        if not quoted and here == ">" and open >= 0 and close < 0 {
+            close = i
+        }
+        i = i + 1
+    }
+    if open >= 0 {
+        var address = ""
+        if close > open {
+            address = body.substr(open + 1, close - open - 1)
+        } else {
+            address = body.substr(open + 1, body.len() - open - 1)
+        }
+        var name = unquote(trim(body.substr(0, open)))
+        if name.len() == 0 {
+            name = trim(comment)
+        }
+        return Some(EmailAddress{ display_name: name,
+            address: trim(address), group: group })
+    }
+    return Some(EmailAddress{ display_name: trim(comment), address: body,
+        group: group })
+}
+
+/// Read a whole header value: any number of addresses, and any groups.
+pub fn parse_list(text: str) -> [EmailAddress] {
+    var out: [EmailAddress] = []
+    var group = ""
+    for piece in top_level_pieces(text) {
+        var body = piece
+        // A group is `name: a, b;`, and the members belong to it until
+        // the semicolon closes it.
+        let colon = group_colon(body)
+        if colon >= 0 {
+            group = trim(unquote(without_comments(body.substr(0, colon))))
+            body = body.substr(colon + 1, body.len() - colon - 1)
+        }
+        var closes = false
+        if trim(without_comments(body)).ends_with(";") {
+            closes = true
+            let inner = trim(without_comments(body))
+            body = inner.substr(0, inner.len() - 1)
+        }
+        match read_one(body, group) {
+            Some(one) -> {
+                if one.address.len() > 0 or one.display_name.len() > 0 {
+                    out.push(one)
+                }
+            }
+            None -> {}
+        }
+        if closes {
+            group = ""
+        }
+    }
+    return out
+}
+
+/// Where a group's colon is, or -1. A colon inside quotes, inside a
+/// comment or inside angle brackets is not one.
+fn group_colon(text: str) -> i64 {
+    var quoted = false
+    var comments = 0
+    var angled = false
+    var i = 0
+    while i < text.len() {
+        let here = text.substr(i, 1)
+        if quoted {
+            if here == "\\" {
+                i = i + 2
+                continue
+            }
+            if here == "\"" {
+                quoted = false
+            }
+            i = i + 1
+            continue
+        }
+        if comments > 0 {
+            if here == "(" {
+                comments = comments + 1
+            }
+            if here == ")" {
+                comments = comments - 1
+            }
+            i = i + 1
+            continue
+        }
+        if here == "\"" {
+            quoted = true
+        } else if here == "(" {
+            comments = 1
+        } else if here == "<" {
+            angled = true
+        } else if here == ">" {
+            angled = false
+        } else if here == ":" and not angled {
+            return i
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+/// Read a header value that should hold exactly one address.
+pub fn parse_one(text: str) -> EmailAddress ! EmailError {
+    let list = parse_list(text)
+    if list.len() == 0 {
+        fail(NoAddress(text))
+    }
+    return list[0]
+}
+
+/// Write an address back out.
+pub fn render(one: EmailAddress) -> str {
+    if one.display_name.len() == 0 {
+        return one.address
+    }
+    return quote_name(one.display_name) + " <" + one.address + ">"
+}
+
+/// The part before the `@`, unquoted.
+pub fn local_of(address: str) -> str {
+    let at = at_sign(address)
+    if at < 0 {
+        return address
+    }
+    return unquote(address.substr(0, at))
+}
+
+/// The part after the `@`, lower-cased, because a domain is not case
+/// sensitive and a local part is.
+pub fn domain_of(address: str) -> str {
+    let at = at_sign(address)
+    if at < 0 {
+        return ""
+    }
+    return address.substr(at + 1, address.len() - at - 1).to_lower()
+}
+
+fn at_sign(address: str) -> i64 {
+    var quoted = false
+    var found = 0 - 1
+    var i = 0
+    while i < address.len() {
+        let here = address.substr(i, 1)
+        if here == "\\" and quoted {
+            i = i + 2
+            continue
+        }
+        if here == "\"" {
+            quoted = not quoted
+        } else if here == "@" and not quoted {
+            found = i
+        }
+        i = i + 1
+    }
+    return found
+}
+
+fn is_atom_character(character: str) -> bool {
+    if (character >= "a" and character <= "z") or
+    (character >= "A" and character <= "Z") or
+    (character >= "0" and character <= "9") {
+        return true
+    }
+    return character == "!" or character == "#" or character == "$" or
+    character == "%" or character == "&" or character == "'" or
+    character == "*" or character == "+" or character == "-" or
+    character == "/" or character == "=" or character == "?" or
+    character == "^" or character == "_" or character == "`" or
+    character == "\{" or character == "|" or character == "}" or
+    character == "~"
+}
+
+fn is_dot_atom(text: str) -> bool {
+    if text.len() == 0 or text.starts_with(".") or text.ends_with(".") {
+        return false
+    }
+    var previous_dot = false
+    for character in text.chars() {
+        if character == "." {
+            if previous_dot {
+                return false
+            }
+            previous_dot = true
+            continue
+        }
+        if not is_atom_character(character) {
+            return false
+        }
+        previous_dot = false
+    }
+    return true
+}
+
+/// Whether an address is syntactically an address.
+///
+/// This is the syntax and nothing else: no domain is looked up, and a
+/// valid address may still bounce.
+pub fn is_valid(address: str) -> bool {
+    let at = at_sign(address)
+    if at <= 0 or at == address.len() - 1 {
+        return false
+    }
+    let local = address.substr(0, at)
+    let domain = address.substr(at + 1, address.len() - at - 1)
+    if local.len() > 64 or address.len() > 254 {
+        return false
+    }
+    if local.starts_with("\"") {
+        if not local.ends_with("\"") or local.len() < 3 {
+            return false
+        }
+    } else if not is_dot_atom(local) {
+        return false
+    }
+    // An address literal is `[192.0.2.1]` or `[IPv6:...]`; anything else
+    // is labels.
+    if domain.starts_with("[") {
+        return domain.ends_with("]") and domain.len() > 2
+    }
+    if not is_dot_atom(domain) {
+        return false
+    }
+    for label in domain.split(".") {
+        if label.len() == 0 or label.len() > 63 or label.starts_with("-") or
+        label.ends_with("-") {
+            return false
+        }
+    }
+    return domain.contains(".")
+}

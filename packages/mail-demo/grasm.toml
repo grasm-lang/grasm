@@ -1,0 +1,28 @@
+[package]
+name = "mail_demo"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.mboxfile]
+path = "../mboxfile"
+version = "^1.0.0"
+
+[dependencies.emailaddr]
+path = "../emailaddr"
+version = "^1.0.0"
+
+[dependencies.mimeword]
+path = "../mimeword"
+version = "^1.0.0"
+
+[dependencies.dkimsig]
+path = "../dkimsig"
+version = "^1.0.0"
+
+[dependencies.spf]
+path = "../spf"
+version = "^1.0.0"
+
+[dependencies.ldif]
+path = "../ldif"
+version = "^1.0.0"

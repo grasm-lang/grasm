@@ -74,6 +74,9 @@ run_gate gemdiff        scripts/gem_version_diff.sh
 run_gate sniffdiff      scripts/sniff_diff.sh
 run_gate cpiodiff       scripts/cpio_diff.sh
 run_gate checksumdiff   scripts/checksum_diff.sh
+run_gate mimeworddiff   scripts/mimeword_diff.sh
+run_gate addressdiff    scripts/address_diff.sh
+run_gate mboxdiff       scripts/mbox_diff.sh
 run_gate kvcrash       scripts/kvstore_crash.sh
 run_gate zlibdiff      scripts/zlib_diff.sh
 run_gate casefolddiff  scripts/casefold_diff.sh

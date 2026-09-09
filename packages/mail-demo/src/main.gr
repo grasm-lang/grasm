@@ -1,0 +1,268 @@
+// A message from the mailbox it sits in to the policy that says whether
+// it should have arrived.
+//
+// Every expected value here was checked against the implementation that
+// owns the format: Python's `mailbox` and `email`, `dkimpy`, `pyspf` and
+// `ldif3`.
+import mboxfile
+import emailaddr
+import mimeword
+import dkimsig
+import spf
+import ldif
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+// ------------------------------------------------------------- mboxfile
+
+fn mailbox() -> str {
+    return "From ada@example.test Mon Jan  1 00:00:00 2024\n" +
+    "From: Ada <ada@example.test>\n" +
+    "Subject: a subject that was\n folded over two lines\n" +
+    "\n" +
+    "the body\n" +
+    ">From a line that had to be escaped\n" +
+    "\n" +
+    "From cb@example.test Tue Jan  2 00:00:00 2024\n" +
+    "From: Charles <cb@example.test>\n" +
+    "Subject: second\n" +
+    "\n" +
+    "another body\n" +
+    "\n"
+}
+
+fn check_mbox(inout f: i64) / {io} {
+    print("-- mboxfile: a body line that looks like a separator")
+    let messages = mboxfile.parse(mailbox(), "mboxrd")
+    say(f, "the file is split on `From ` and nothing else",
+        messages.len() == 2 and
+        messages[0].envelope_sender == "ada@example.test" and
+        messages[1].envelope_date == "Tue Jan  2 00:00:00 2024")
+    say(f, "a folded header is one header, joined",
+        mboxfile.header_of(messages[0].headers, "subject") ==
+        "a subject that was folded over two lines")
+    say(f, "a header name has no case",
+        mboxfile.header_of(messages[0].headers, "FROM") ==
+        "Ada <ada@example.test>")
+    say(f, "an escaped body line comes back as it was written",
+        messages[0].body == "the body\nFrom a line that had to be escaped\n")
+    let again = mboxfile.parse(mboxfile.render(messages, "mboxrd"),
+        "mboxrd")
+    say(f, "and writing it out and reading it back changes nothing",
+        again.len() == 2 and again[0].body == messages[0].body and
+        again[1].body == messages[1].body)
+    say(f, "the raw dialect hands the escaping back untouched",
+        mboxfile.parse(mailbox(), "raw")[0].body ==
+        "the body\n>From a line that had to be escaped\n")
+}
+
+// ------------------------------------------------------------ emailaddr
+
+fn check_addresses(inout f: i64) / {io} {
+    print("-- emailaddr: a comma inside a name is not a separator")
+    let list = emailaddr.parse_list("Ada Lovelace <ada@example.test>, " +
+        "\"Babbage, Charles\" <cb@x.test>, plain@x.test")
+    say(f, "three addresses, and the quoted comma did not split one",
+        list.len() == 3 and list[1].display_name == "Babbage, Charles" and
+        list[1].address == "cb@x.test")
+    say(f, "a display name is the sender's text, kept apart from the address",
+        list[0].display_name == "Ada Lovelace" and
+        list[0].address == "ada@example.test" and
+        list[2].display_name == "")
+    let commented = emailaddr.parse_list("c@x.test (Charlie)")
+    say(f, "a comment beside an address names it too",
+        commented.len() == 1 and commented[0].display_name == "Charlie")
+    let grouped = emailaddr.parse_list("Team: a@x.test, b@x.test;, c@x.test")
+    say(f, "a group's members remember the group, and the rest do not",
+        grouped.len() == 3 and grouped[0].group == "Team" and
+        grouped[1].group == "Team" and grouped[2].group == "")
+    say(f, "writing a name back out quotes it when the syntax needs it",
+        emailaddr.render(list[1]) == "\"Babbage, Charles\" <cb@x.test>" and
+        emailaddr.render(list[0]) == "Ada Lovelace <ada@example.test>")
+    say(f, "the syntax is checked, and a domain with no dot is not one",
+        emailaddr.is_valid("a@b.test") and
+        not emailaddr.is_valid("a@b") and
+        not emailaddr.is_valid("a@@b.test") and
+        not emailaddr.is_valid(".a@b.test"))
+    say(f, "a domain has no case and a local part does",
+        emailaddr.domain_of("Ada@Example.Test") == "example.test" and
+        emailaddr.local_of("Ada@Example.Test") == "Ada")
+}
+
+// ------------------------------------------------------------ mimeword
+
+fn check_words(inout f: i64) / {io} {
+    print("-- mimeword: the space between two encoded words is not a space")
+    let joined = mimeword.decode_text("=?utf-8?B?w6k=?= =?utf-8?B?Y2hlYw==?=")
+    say(f, "two encoded words in one charset are one run of text",
+        joined == "échec")
+    say(f, "and a space between a word and plain text stays",
+        mimeword.decode_text("=?utf-8?Q?caf=C3=A9?= is here") ==
+        "café is here")
+    say(f, "Q is not quoted-printable: an underscore is a space",
+        mimeword.decode_text("=?utf-8?Q?a_b?=") == "a b" and
+        mimeword.decode_text("=?utf-8?Q?a=5Fb?=") == "a_b")
+    let latin = mimeword.decode("=?iso-8859-1?Q?caf=E9?=")
+    say(f, "a word says which charset it is in, and the bytes are kept",
+        latin.len() == 1 and latin[0].charset == "iso-8859-1" and
+        latin[0].raw.len() == 4)
+    say(f, "and latin-1 is converted, because nearly every header is",
+        mimeword.decode_text("=?iso-8859-1?Q?caf=E9?=") == "café")
+    say(f, "something that is not a word is text, not an error",
+        mimeword.decode_text("=?utf-8?X?zzz?=") == "=?utf-8?X?zzz?=")
+    say(f, "writing a header back out escapes what has to be escaped",
+        mimeword.encode_q("plain", "utf-8") == "plain" and
+        mimeword.decode_text(mimeword.encode_q("café is here", "utf-8")) ==
+        "café is here" and
+        mimeword.decode_text(mimeword.encode_b("échec", "utf-8")) == "échec")
+}
+
+// ------------------------------------------------------------- dkimsig
+
+fn check_dkim(inout f: i64) / {io} {
+    print("-- dkimsig: the two canonicalisations, and why both exist")
+    let header = "DKIM-Signature"
+    let value = " v=1; a=rsa-sha256; c=relaxed/relaxed; d=example.test;\r\n" +
+    "\ts=selector; h=from:to:subject; bh=Ynk=; b=c2ln\r\n"
+    let signature = dkimsig.parse(value) ?? no_signature()
+    say(f, "the tags are read, folding and all",
+        dkimsig.tag_of(signature.tags, "d") == "example.test" and
+        dkimsig.base64_of(signature.tags, "b") == "c2ln" and
+        signature.signed_headers == ["from", "to", "subject"])
+    say(f, "c=relaxed/relaxed is two answers, not one",
+        signature.header_canonicalisation == "relaxed" and
+        signature.body_canonicalisation == "relaxed")
+    say(f, "relaxed lower-cases the name and squeezes the value",
+        dkimsig.canonical_header("SUBJECT", "  hello   there \r\n",
+            "relaxed") == "subject:hello there\r\n")
+    say(f, "simple hands the header back exactly as it arrived",
+        dkimsig.canonical_header("SUBJECT", "  hello   there \r\n",
+            "simple") == "SUBJECT:  hello   there \r\n")
+    say(f, "an empty body is one CRLF in simple and nothing in relaxed",
+        dkimsig.canonical_body("", "simple") == "\r\n" and
+        dkimsig.canonical_body("", "relaxed") == "")
+    say(f, "a body line keeps its indentation as a single space",
+        dkimsig.canonical_body("  leading\r\n", "relaxed") ==
+        " leading\r\n")
+    say(f, "the signature signs itself with its own b= emptied",
+        dkimsig.signable_header(header, value, "relaxed") ==
+        "dkim-signature:v=1; a=rsa-sha256; c=relaxed/relaxed;" +
+        " d=example.test; s=selector; h=from:to:subject; bh=Ynk=; b=")
+    let headers = [("Received", " one"), ("From", " a@x.test"),
+        ("From", " b@x.test"), ("Subject", " s")]
+    let hashed = dkimsig.headers_to_hash(headers,
+        dkimsig.parse("v=1; h=from:from") ?? no_signature())
+    say(f, "and a name written twice takes the next header up each time",
+        hashed.len() == 2 and hashed[0].1 == " b@x.test" and
+        hashed[1].1 == " a@x.test")
+}
+
+fn no_signature() -> DkimSignature {
+    return DkimSignature{ tags: [], header_canonicalisation: "simple",
+        body_canonicalisation: "simple", signed_headers: [] }
+}
+
+// ----------------------------------------------------------------- spf
+
+fn context() -> SpfContext {
+    return SpfContext{ sender: "strong-bad@email.example.com",
+        domain: "email.example.com", ip: "192.0.2.3", is_ipv6: false,
+        helo: "mx.example.org", receiver: "receiver.example.net",
+        timestamp: 1700000000 }
+}
+
+fn check_spf(inout f: i64) / {io} {
+    print("-- spf: the terms are read in order and the macros are a language")
+    let record = spf.parse("v=spf1 ip4:192.0.2.0/24 " +
+        "include:_spf.example.com a:mail.example.com/24 -all") ??
+    no_record()
+    say(f, "each mechanism carries its own qualifier, and + is assumed",
+        record.terms.len() == 4 and record.terms[0].qualifier == "pass" and
+        record.terms[3].qualifier == "fail" and
+        record.terms[3].kind == "all")
+    say(f, "a prefix belongs to the mechanism it was written on",
+        record.terms[0].cidr4 == 24 and record.terms[1].cidr4 == 32 and
+        record.terms[2].cidr4 == 24)
+    say(f, "a mechanism with no argument is about the domain being asked",
+        (spf.argument_of(record.terms[3], context()) ?? "") ==
+        "email.example.com")
+    say(f, "the ten-lookup limit is countable before anything is looked up",
+        spf.lookup_count(record) == 2)
+    say(f, "a mechanism after `all` can never be reached, and that is said",
+        spf.unreachable_terms(spf.parse("v=spf1 -all a:late.example.com") ??
+            no_record()) == ["a:late.example.com"])
+    say(f, "a macro reverses, trims and names the address family",
+        (spf.expand("%\{ir}.%\{v}._spf.%\{d2}", context()) ?? "") ==
+        "3.2.0.192.in-addr._spf.example.com")
+    say(f, "an upper-case letter means the result is escaped for a URL",
+        (spf.expand("%\{S}", context()) ?? "") ==
+        "strong-bad%40email.example.com")
+    say(f, "and something that is not a record is refused",
+        spf.parse("not an spf record") ?? no_record() == no_record())
+}
+
+fn no_record() -> SpfRecord {
+    return SpfRecord{ terms: [], modifiers: [] }
+}
+
+// ---------------------------------------------------------------- ldif
+
+fn check_ldif(inout f: i64) / {io} {
+    print("-- ldif: base64, folding, and an attribute written twice")
+    let text = "version: 1\n\n" +
+    "dn: cn=Ada Lovelace,ou=people,dc=example,dc=test\n" +
+    "objectClass: top\n" +
+    "objectClass: inetOrgPerson\n" +
+    "cn: Ada Lovelace\n" +
+    "sn:: TG92ZWxhY2U=\n" +
+    "description: a description long enough that it has to be fol\n" +
+    " ded across two lines\n" +
+    "jpegPhoto:< file:///tmp/ada.jpg\n"
+    let records = ldif.parse(text) ?? []
+    say(f, "the version line is not a record",
+        records.len() == 1 and
+        records[0].dn == "cn=Ada Lovelace,ou=people,dc=example,dc=test")
+    say(f, "an attribute written twice keeps both values, in order",
+        ldif.values_of(records[0], "objectclass") ==
+        ["top", "inetOrgPerson"])
+    say(f, "a value written in base64 is decoded, and it says it was",
+        ldif.value_of(records[0], "sn") == "Lovelace" and
+        records[0].values[3].was_base64)
+    say(f, "a folded value is joined with nothing put in the join",
+        ldif.value_of(records[0], "description") ==
+        "a description long enough that it has to be folded across two lines")
+    say(f, "a URL reference is a reference, not a value",
+        records[0].values[5].is_url and
+        ldif.value_of(records[0], "jpegphoto") == "file:///tmp/ada.jpg")
+    let written = ldif.render(records)
+    let again = ldif.parse(written) ?? []
+    say(f, "and writing it out and reading it back says the same thing",
+        again.len() == 1 and
+        ldif.value_of(again[0], "sn") == "Lovelace" and
+        ldif.values_of(again[0], "objectclass") ==
+        ["top", "inetOrgPerson"] and
+        ldif.value_of(again[0], "description") ==
+        ldif.value_of(records[0], "description"))
+}
+
+fn main() / {io} {
+    var f = 0
+    check_mbox(f)
+    check_addresses(f)
+    check_words(f)
+    check_dkim(f)
+    check_spf(f)
+    check_ldif(f)
+    if f == 0 {
+        print("mail: every claim held")
+    } else {
+        print("mail: {f} claims failed")
+    }
+}

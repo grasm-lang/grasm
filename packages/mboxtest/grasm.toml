@@ -1,0 +1,8 @@
+[package]
+name = "mboxtest"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.mboxfile]
+path = "../mboxfile"
+version = "^1.0.0"

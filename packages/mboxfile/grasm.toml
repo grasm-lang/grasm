@@ -1,0 +1,6 @@
+[package]
+name = "mboxfile"
+version = "1.0.0"
+
+# Reading and writing text. Opens nothing.
+capabilities = []
