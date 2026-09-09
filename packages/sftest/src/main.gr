@@ -1,0 +1,60 @@
+// The client end of the `sf_diff.sh` gate.
+//
+// A case is a kind — `item`, `list` or `dictionary` — and the raw field
+// value, hex-encoded because the suite is full of quotes, backslashes and
+// bytes no terminal will show. Out comes `error`, or the canonical form of
+// what was parsed, hex-encoded the same way. Comparing canonical forms
+// checks the parse and the serialisation at once, and a parser that reads
+// a field into the wrong shape cannot write it back.
+import structuredfields
+
+fn from_hex(text: str) -> str {
+    var out: [i64] = []
+    var i = 0
+    while i + 1 < text.len() {
+        out.push(text.substr(i, 2).parse_int_base(16) ?? 0)
+        i = i + 2
+    }
+    return bytes_of(out).to_str()
+}
+
+fn to_hex(text: str) -> str {
+    let digits = "0123456789abcdef"
+    let raw = text.to_bytes()
+    var out = ""
+    var i = 0
+    while i < raw.len() {
+        out = out + digits.substr(raw.at(i) / 16, 1) +
+        digits.substr(raw.at(i) % 16, 1)
+        i = i + 1
+    }
+    return out
+}
+
+fn main() / {io} {
+    var i = 0
+    while i + 1 < args().len() {
+        let kind = args()[i]
+        let raw = from_hex(args()[i + 1])
+        if kind == "item" {
+            match structuredfields.parse_item(raw) {
+                Ok(item) -> print(to_hex(
+                    structuredfields.serialise_item(item)))
+                Err(_why) -> print("error")
+            }
+        } else if kind == "list" {
+            match structuredfields.parse_list(raw) {
+                Ok(members) -> print(to_hex(
+                    structuredfields.serialise_list(members)))
+                Err(_why) -> print("error")
+            }
+        } else {
+            match structuredfields.parse_dictionary(raw) {
+                Ok(entries) -> print(to_hex(
+                    structuredfields.serialise_dictionary(entries)))
+                Err(_why) -> print("error")
+            }
+        }
+        i = i + 2
+    }
+}

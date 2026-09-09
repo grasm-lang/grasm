@@ -1,0 +1,8 @@
+[package]
+name = "sftest"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.structuredfields]
+path = "../structuredfields"
+version = "^1.0.0"

@@ -1,0 +1,853 @@
+// HTTP structured fields, RFC 9651 — one grammar for header values.
+//
+// Every HTTP header used to invent its own syntax, and every one of them
+// grew a parser with its own bugs and its own disagreements about
+// whitespace, quoting and duplicates. Structured fields is the answer: a
+// header declares itself an item, a list or a dictionary, and one parser
+// reads all of them. `Cache-Status`, `Priority`, `Accept-CH`,
+// `Signature-Input` and `Client-Hints` are already written in it.
+//
+// ## Why the parser is strict
+//
+// Two implementations that disagree about whether `1 ` is a valid integer
+// disagree about what the header said, and an intermediary that reserialises
+// it changes the meaning. So the grammar is exact: no leading space before
+// an item, no trailing space after one, no more than fifteen digits, no
+// more than three decimal places, and a byte sequence's base64 padding
+// bits must be zero. A field that does not parse is not "close enough" —
+// the specification says to ignore the whole field, and something that
+// guesses is worse than something that stops.
+//
+// ## Decimals are not floating point
+//
+// A decimal has at most three fractional digits and is held here as a
+// count of thousandths, exactly. `1.5` is 1500 and `0.001` is 1. A parser
+// that reads them as `f64` cannot round-trip `4.567` and produces a
+// different header than it received.
+//
+// ## What a caller gets
+//
+// `parse_item`, `parse_list` and `parse_dictionary`, because the header's
+// own definition says which of the three it is and no parser can tell from
+// the text. `serialise_*` writes the canonical form back, which is what a
+// signature covers.
+
+type SfError =
+    | Empty()
+    | Unexpected(character: str, at: i64)
+    | Trailing(at: i64)
+    | TooLong(what: str, length: i64)
+    | OutOfRange(what: str)
+    | BadEscape(at: i64)
+    | BadBase64()
+    | BadEncoding()
+
+    /// A bare item: one of the eight kinds a structured field can hold.
+type SfValue =
+    | SfInteger(value: i64)
+    /// Thousandths. `1.5` is 1500, exactly, and never a float.
+    | SfDecimal(units: i64)
+    | SfString(text: str)
+    | SfToken(text: str)
+    | SfBinary(data: bytes)
+    | SfBoolean(flag: bool)
+    /// Seconds since the Unix epoch, which may be negative.
+    | SfDate(seconds: i64)
+    /// Text meant to be shown to a person, which may be any Unicode.
+    | SfDisplay(text: str)
+
+    /// A parameter: a key and a value, the value being `?1` when only the key
+    /// was written.
+type SfParam = {
+    name: str,
+    value: ref SfValue,
+}
+
+/// A bare item with its parameters.
+type SfItem = {
+    value: ref SfValue,
+    params: [SfParam],
+}
+
+/// A member of a list or a dictionary: one item, or a parenthesised inner
+/// list with parameters of its own.
+type SfMember = {
+    /// True when this is an inner list; `items` is then its contents.
+    inner: bool,
+    item: SfItem,
+    items: [SfItem],
+    params: [SfParam],
+}
+
+/// A dictionary entry.
+type SfEntry = {
+    name: str,
+    member: SfMember,
+}
+
+/// Where the parser is.
+type SfReader = {
+    text: str,
+    at: i64,
+}
+
+fn peek(reader: SfReader) -> str {
+    if reader.at >= reader.text.len() {
+        return ""
+    }
+    return reader.text.substr(reader.at, 1)
+}
+
+fn is_digit(character: str) -> bool {
+    if character.len() == 0 {
+        return false
+    }
+    let byte = character.to_bytes().at(0)
+    return byte >= 48 and byte <= 57
+}
+
+fn is_alpha(character: str) -> bool {
+    if character.len() == 0 {
+        return false
+    }
+    let byte = character.to_bytes().at(0)
+    return (byte >= 65 and byte <= 90) or (byte >= 97 and byte <= 122)
+}
+
+fn is_lcalpha(character: str) -> bool {
+    if character.len() == 0 {
+        return false
+    }
+    let byte = character.to_bytes().at(0)
+    return byte >= 97 and byte <= 122
+}
+
+/// The token characters of RFC 9110, plus the two structured fields adds.
+fn is_tchar(character: str) -> bool {
+    if is_alpha(character) or is_digit(character) {
+        return true
+    }
+    return character == "!" or character == "#" or character == "$" or
+    character == "%" or character == "&" or character == "'" or
+    character == "*" or character == "+" or character == "-" or
+    character == "." or character == "^" or character == "_" or
+    character == "`" or character == "|" or character == "~"
+}
+
+fn skip_spaces(inout reader: SfReader) {
+    while peek(reader) == " " {
+        reader.at = reader.at + 1
+    }
+}
+
+/// Optional whitespace, which is spaces *and* tabs.
+fn skip_ows(inout reader: SfReader) {
+    while peek(reader) == " " or peek(reader) == "\t" {
+        reader.at = reader.at + 1
+    }
+}
+
+/// A key: lower-case letters, digits and four punctuation marks, starting
+/// with a letter or a star.
+fn parse_key(inout reader: SfReader) -> str ! SfError {
+    let head = peek(reader)
+    if not is_lcalpha(head) and head != "*" {
+        fail(Unexpected(head, reader.at))
+    }
+    var out = ""
+    while reader.at < reader.text.len() {
+        let here = peek(reader)
+        let ok = is_lcalpha(here) or is_digit(here) or here == "_" or
+        here == "-" or here == "." or here == "*"
+        if not ok {
+            return out
+        }
+        out = out + here
+        reader.at = reader.at + 1
+    }
+    return out
+}
+
+/// An integer or a decimal, which are told apart by whether a dot arrives.
+fn parse_number(inout reader: SfReader) -> ref SfValue ! SfError {
+    var negative = false
+    if peek(reader) == "-" {
+        negative = true
+        reader.at = reader.at + 1
+    }
+    if not is_digit(peek(reader)) {
+        fail(Unexpected(peek(reader), reader.at))
+    }
+    var digits = ""
+    var dot = 0 - 1
+    while reader.at < reader.text.len() {
+        let here = peek(reader)
+        if is_digit(here) {
+            digits = digits + here
+        } else if here == "." and dot < 0 {
+            if digits.len() > 12 {
+                fail(TooLong("decimal", digits.len()))
+            }
+            dot = digits.len()
+        } else {
+            break
+        }
+        reader.at = reader.at + 1
+        if dot < 0 and digits.len() > 15 {
+            fail(TooLong("integer", digits.len()))
+        }
+        if dot >= 0 and digits.len() - dot > 3 {
+            fail(TooLong("fraction", digits.len() - dot))
+        }
+    }
+    if dot < 0 {
+        var value = digits.parse_int() ?? 0
+        if negative {
+            value = 0 - value
+        }
+        return ref(SfInteger(value))
+    }
+    if dot == digits.len() {
+        // A dot with no digits after it.
+        fail(Unexpected(".", reader.at))
+    }
+    var scaled = digits
+    var places = digits.len() - dot
+    while places < 3 {
+        scaled = scaled + "0"
+        places = places + 1
+    }
+    var units = scaled.parse_int() ?? 0
+    if negative {
+        units = 0 - units
+    }
+    return ref(SfDecimal(units))
+}
+
+/// A quoted string. Only `\"` and `\\` are escapes, and only printable
+/// ASCII may appear.
+fn parse_string(inout reader: SfReader) -> ref SfValue ! SfError {
+    reader.at = reader.at + 1
+    var out = ""
+    while reader.at < reader.text.len() {
+        let here = peek(reader)
+        reader.at = reader.at + 1
+        if here == "\\" {
+            if reader.at >= reader.text.len() {
+                fail(BadEscape(reader.at))
+            }
+            let next = peek(reader)
+            if next != "\"" and next != "\\" {
+                fail(BadEscape(reader.at))
+            }
+            out = out + next
+            reader.at = reader.at + 1
+        } else if here == "\"" {
+            return ref(SfString(out))
+        } else {
+            let byte = here.to_bytes().at(0)
+            if byte < 32 or byte >= 127 {
+                fail(Unexpected(here, reader.at - 1))
+            }
+            out = out + here
+        }
+    }
+    fail(Unexpected("", reader.at))
+}
+
+fn parse_token(inout reader: SfReader) -> ref SfValue ! SfError {
+    var out = ""
+    while reader.at < reader.text.len() {
+        let here = peek(reader)
+        if not is_tchar(here) and here != ":" and here != "/" {
+            return ref(SfToken(out))
+        }
+        out = out + here
+        reader.at = reader.at + 1
+    }
+    return ref(SfToken(out))
+}
+
+fn base64_value(character: str) -> i64 {
+    let byte = character.to_bytes().at(0)
+    if byte >= 65 and byte <= 90 {
+        return byte - 65
+    }
+    if byte >= 97 and byte <= 122 {
+        return byte - 71
+    }
+    if byte >= 48 and byte <= 57 {
+        return byte + 4
+    }
+    if character == "+" {
+        return 62
+    }
+    if character == "/" {
+        return 63
+    }
+    return 0 - 1
+}
+
+/// A byte sequence, `:` base64 `:`.
+///
+/// Strict about the padding: `:aGk=:` is fine and `:aGk==:` is not, and the
+/// bits left over in the last character have to be zero. A decoder that
+/// shrugs at those accepts two spellings of one value, which is exactly
+/// what a canonical form exists to prevent.
+fn parse_binary(inout reader: SfReader) -> ref SfValue ! SfError {
+    reader.at = reader.at + 1
+    var digits = ""
+    var closed = false
+    while reader.at < reader.text.len() {
+        let here = peek(reader)
+        reader.at = reader.at + 1
+        if here == ":" {
+            closed = true
+            break
+        }
+        digits = digits + here
+    }
+    if not closed {
+        fail(BadBase64())
+    }
+    return ref(SfBinary(try decode_base64(digits)))
+}
+
+/// Base64, decoded the way RFC 9651 tells a recipient to.
+///
+/// Padding is synthesised when it is missing and the bits left over in the
+/// last character are ignored, because the specification says a recipient
+/// should do both — and then the *canonical* form is written back with the
+/// padding present and those bits zero. So `:aGVsbG8:` and `:iZ==:` are
+/// read, and what a signature covers is `:aGVsbG8=:` and `:iQ==:`. A
+/// decoder that refused them would reject fields the working group's own
+/// suite says to accept; one that kept the stray bits would have two
+/// spellings of one value.
+pub fn decode_base64(text: str) -> bytes ! SfError {
+    var body = text
+    var padding = 0
+    while body.ends_with("=") and padding < 2 {
+        body = body.substr(0, body.len() - 1)
+        padding = padding + 1
+    }
+    if body.ends_with("=") {
+        fail(BadBase64())
+    }
+    if body.len() % 4 == 1 {
+        fail(BadBase64())
+    }
+    var out: [i64] = []
+    var accumulator = 0
+    var held = 0
+    var i = 0
+    while i < body.len() {
+        let value = base64_value(body.substr(i, 1))
+        if value < 0 {
+            fail(BadBase64())
+        }
+        accumulator = accumulator.shl(6).bit_or(value)
+        held = held + 6
+        if held >= 8 {
+            held = held - 8
+            out.push(accumulator.ushr(held).bit_and(255))
+        }
+        i = i + 1
+    }
+    return bytes_of(out)
+}
+
+fn hex_value(character: str) -> i64 {
+    let byte = character.to_bytes().at(0)
+    if byte >= 48 and byte <= 57 {
+        return byte - 48
+    }
+    if byte >= 97 and byte <= 102 {
+        return byte - 87
+    }
+    return 0 - 1
+}
+
+/// Whether a run of octets is well-formed UTF-8.
+///
+/// Written here because `bytes.to_str` is lossy — it has to be, for the
+/// bytes a socket hands back — and a display string that is not valid
+/// UTF-8 must be refused rather than repaired. Overlong encodings, lone
+/// surrogates and anything past U+10FFFF are all rejected: each of them is
+/// a second spelling of something, and a second spelling is how a filter
+/// and the thing behind it come to disagree.
+fn is_utf8(octets: [i64]) -> bool {
+    var i = 0
+    while i < octets.len() {
+        let first = octets[i]
+        var length = 0
+        var lowest = 0
+        if first < 128 {
+            length = 1
+            lowest = 0
+        } else if first >= 194 and first <= 223 {
+            length = 2
+            lowest = 128
+        } else if first >= 224 and first <= 239 {
+            length = 3
+            lowest = 2048
+        } else if first >= 240 and first <= 244 {
+            length = 4
+            lowest = 65536
+        } else {
+            return false
+        }
+        if i + length > octets.len() {
+            return false
+        }
+        var value = first
+        if length == 2 {
+            value = first - 192
+        } else if length == 3 {
+            value = first - 224
+        } else if length == 4 {
+            value = first - 240
+        }
+        var j = 1
+        while j < length {
+            let next = octets[i + j]
+            if next < 128 or next > 191 {
+                return false
+            }
+            value = value * 64 + (next - 128)
+            j = j + 1
+        }
+        if value < lowest {
+            return false
+        }
+        if value >= 55296 and value <= 57343 {
+            return false
+        }
+        if value > 1114111 {
+            return false
+        }
+        i = i + length
+    }
+    return true
+}
+
+/// A display string: `%"..."` with percent-encoded UTF-8 inside.
+///
+/// The hex digits must be lower case and the result must be valid UTF-8,
+/// both so that one string has one spelling.
+fn parse_display(inout reader: SfReader) -> ref SfValue ! SfError {
+    reader.at = reader.at + 1
+    if peek(reader) != "\"" {
+        fail(Unexpected(peek(reader), reader.at))
+    }
+    reader.at = reader.at + 1
+    var octets: [i64] = []
+    while reader.at < reader.text.len() {
+        let here = peek(reader)
+        reader.at = reader.at + 1
+        if here == "%" {
+            if reader.at + 1 >= reader.text.len() {
+                fail(BadEscape(reader.at))
+            }
+            let high = hex_value(reader.text.substr(reader.at, 1))
+            let low = hex_value(reader.text.substr(reader.at + 1, 1))
+            if high < 0 or low < 0 {
+                fail(BadEscape(reader.at))
+            }
+            octets.push(high * 16 + low)
+            reader.at = reader.at + 2
+        } else if here == "\"" {
+            if not is_utf8(octets) {
+                fail(BadEncoding())
+            }
+            return ref(SfDisplay(bytes_of(octets).to_str()))
+        } else {
+            let byte = here.to_bytes().at(0)
+            if byte < 32 or byte >= 127 {
+                fail(Unexpected(here, reader.at - 1))
+            }
+            octets.push(byte)
+        }
+    }
+    fail(Unexpected("", reader.at))
+}
+
+/// One bare item, whichever of the eight kinds it is.
+fn parse_bare(inout reader: SfReader) -> ref SfValue ! SfError {
+    let head = peek(reader)
+    if head == "" {
+        fail(Empty())
+    }
+    if is_digit(head) or head == "-" {
+        return try parse_number(reader)
+    }
+    if head == "\"" {
+        return try parse_string(reader)
+    }
+    if head == ":" {
+        return try parse_binary(reader)
+    }
+    if head == "?" {
+        reader.at = reader.at + 1
+        let flag = peek(reader)
+        if flag != "0" and flag != "1" {
+            fail(Unexpected(flag, reader.at))
+        }
+        reader.at = reader.at + 1
+        return ref(SfBoolean(flag == "1"))
+    }
+    if head == "@" {
+        reader.at = reader.at + 1
+        let number = try parse_number(reader)
+        match number {
+            SfInteger(value) -> return ref(SfDate(value))
+            _ -> fail(Unexpected("@", reader.at))
+        }
+    }
+    if head == "%" {
+        return try parse_display(reader)
+    }
+    if is_alpha(head) or head == "*" {
+        return try parse_token(reader)
+    }
+    fail(Unexpected(head, reader.at))
+}
+
+fn parse_params(inout reader: SfReader) -> [SfParam] ! SfError {
+    var out: [SfParam] = []
+    while peek(reader) == ";" {
+        reader.at = reader.at + 1
+        skip_spaces(reader)
+        let name = try parse_key(reader)
+        var value = ref(SfBoolean(true))
+        if peek(reader) == "=" {
+            reader.at = reader.at + 1
+            value = try parse_bare(reader)
+        }
+        // A repeated key keeps the last value, which is what the
+        // specification says and is not what a naive append does.
+        var found = 0 - 1
+        var i = 0
+        while i < out.len() {
+            if out[i].name == name {
+                found = i
+            }
+            i = i + 1
+        }
+        if found >= 0 {
+            out[found] = SfParam{ name: name, value: value }
+        } else {
+            out.push(SfParam{ name: name, value: value })
+        }
+    }
+    return out
+}
+
+fn parse_item_at(inout reader: SfReader) -> SfItem ! SfError {
+    let value = try parse_bare(reader)
+    return SfItem{ value: value, params: try parse_params(reader) }
+}
+
+fn parse_inner(inout reader: SfReader) -> SfMember ! SfError {
+    reader.at = reader.at + 1
+    var items: [SfItem] = []
+    while reader.at < reader.text.len() {
+        skip_spaces(reader)
+        if peek(reader) == ")" {
+            reader.at = reader.at + 1
+            return SfMember{ inner: true,
+                item: SfItem{ value: ref(SfBoolean(true)), params: [] },
+                items: items, params: try parse_params(reader) }
+        }
+        items.push(try parse_item_at(reader))
+        let here = peek(reader)
+        if here != " " and here != ")" {
+            fail(Unexpected(here, reader.at))
+        }
+    }
+    fail(Unexpected("", reader.at))
+}
+
+fn parse_member(inout reader: SfReader) -> SfMember ! SfError {
+    if peek(reader) == "(" {
+        return try parse_inner(reader)
+    }
+    return SfMember{ inner: false, item: try parse_item_at(reader),
+        items: [], params: [] }
+}
+
+/// Read a field defined as a single item.
+pub fn parse_item(text: str) -> SfItem ! SfError {
+    var reader = SfReader{ text: text, at: 0 }
+    // Spaces only, not tabs: a field beginning with a tab is malformed,
+    // where one beginning with a space is not. The OWS after a comma is
+    // the other rule, and mixing them up accepts a field the specification
+    // says to throw away.
+    skip_spaces(reader)
+    let item = try parse_item_at(reader)
+    skip_spaces(reader)
+    if reader.at != reader.text.len() {
+        fail(Trailing(reader.at))
+    }
+    return item
+}
+
+/// Read a field defined as a list. An empty field is an empty list, which
+/// is the one case where nothing is not an error.
+pub fn parse_list(text: str) -> [SfMember] ! SfError {
+    var reader = SfReader{ text: text, at: 0 }
+    var out: [SfMember] = []
+    skip_spaces(reader)
+    if reader.at == reader.text.len() {
+        return out
+    }
+    var going = true
+    while going {
+        out.push(try parse_member(reader))
+        skip_ows(reader)
+        if reader.at == reader.text.len() {
+            return out
+        }
+        if peek(reader) != "," {
+            fail(Unexpected(peek(reader), reader.at))
+        }
+        reader.at = reader.at + 1
+        skip_ows(reader)
+        // A comma at the end, or two in a row, is a malformed field
+        // rather than an empty member.
+        if reader.at == reader.text.len() {
+            fail(Trailing(reader.at))
+        }
+    }
+    return out
+}
+
+/// Read a field defined as a dictionary.
+///
+/// A key written twice keeps the last value: a header that arrives with
+/// `a=1, a=2` says two, and a parser that keeps the first says one.
+pub fn parse_dictionary(text: str) -> [SfEntry] ! SfError {
+    var reader = SfReader{ text: text, at: 0 }
+    var out: [SfEntry] = []
+    skip_spaces(reader)
+    if reader.at == reader.text.len() {
+        return out
+    }
+    var going = true
+    while going {
+        let name = try parse_key(reader)
+        var member = SfMember{ inner: false,
+            item: SfItem{ value: ref(SfBoolean(true)),
+                params: try parse_params(reader) }, items: [], params: [] }
+        if peek(reader) == "=" {
+            reader.at = reader.at + 1
+            member = try parse_member(reader)
+        }
+        var found = 0 - 1
+        var i = 0
+        while i < out.len() {
+            if out[i].name == name {
+                found = i
+            }
+            i = i + 1
+        }
+        if found >= 0 {
+            out[found] = SfEntry{ name: name, member: member }
+        } else {
+            out.push(SfEntry{ name: name, member: member })
+        }
+        skip_ows(reader)
+        if reader.at == reader.text.len() {
+            return out
+        }
+        if peek(reader) != "," {
+            fail(Unexpected(peek(reader), reader.at))
+        }
+        reader.at = reader.at + 1
+        skip_ows(reader)
+        if reader.at == reader.text.len() {
+            fail(Trailing(reader.at))
+        }
+    }
+    return out
+}
+
+// --- writing it back out -------------------------------------------------
+//
+// The canonical form is what a signature covers and what a cache key is
+// built from, so two parsers that agree about the meaning and disagree
+// about the spelling still break things. Every choice below is the
+// specification's: no space after a comma inside a parameter, one space
+// between inner list members, three decimal places only when they are
+// needed, and a token written as it was.
+
+fn hex_digit(value: i64) -> str {
+    return "0123456789abcdef".substr(value, 1)
+}
+
+fn base64_digit(value: i64) -> str {
+    return ("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz" +
+        "0123456789+/").substr(value, 1)
+}
+
+/// Base64 with padding, which is the only spelling the format allows.
+pub fn encode_base64(data: bytes) -> str {
+    var out = ""
+    var i = 0
+    while i + 2 < data.len() {
+        let word = data.at(i).shl(16).bit_or(data.at(i + 1).shl(8))
+            .bit_or(data.at(i + 2))
+        out = out + base64_digit(word.ushr(18).bit_and(63)) +
+        base64_digit(word.ushr(12).bit_and(63)) +
+        base64_digit(word.ushr(6).bit_and(63)) +
+        base64_digit(word.bit_and(63))
+        i = i + 3
+    }
+    let left = data.len() - i
+    if left == 1 {
+        let word = data.at(i).shl(16)
+        out = out + base64_digit(word.ushr(18).bit_and(63)) +
+        base64_digit(word.ushr(12).bit_and(63)) + "=="
+    } else if left == 2 {
+        let word = data.at(i).shl(16).bit_or(data.at(i + 1).shl(8))
+        out = out + base64_digit(word.ushr(18).bit_and(63)) +
+        base64_digit(word.ushr(12).bit_and(63)) +
+        base64_digit(word.ushr(6).bit_and(63)) + "="
+    }
+    return out
+}
+
+/// A decimal written from its thousandths, with the trailing zeros the
+/// specification asks for: `1.5` is written `1.5` and `1.0` is `1.0`.
+fn decimal_text(units: i64) -> str {
+    var sign = ""
+    var value = units
+    if value < 0 {
+        sign = "-"
+        value = 0 - value
+    }
+    var fraction = "{value % 1000}"
+    while fraction.len() < 3 {
+        fraction = "0" + fraction
+    }
+    while fraction.len() > 1 and fraction.ends_with("0") {
+        fraction = fraction.substr(0, fraction.len() - 1)
+    }
+    return sign + "{value / 1000}." + fraction
+}
+
+/// One bare item, written out.
+pub fn serialise_value(value: ref SfValue) -> str {
+    match value {
+        SfInteger(number) -> return "{number}"
+        SfDecimal(units) -> return decimal_text(units)
+        SfString(text) -> {
+            var out = "\""
+            var i = 0
+            while i < text.len() {
+                let here = text.substr(i, 1)
+                if here == "\"" or here == "\\" {
+                    out = out + "\\"
+                }
+                out = out + here
+                i = i + 1
+            }
+            return out + "\""
+        }
+        SfToken(text) -> return text
+        SfBinary(data) -> return ":" + encode_base64(data) + ":"
+        SfBoolean(flag) -> {
+            if flag {
+                return "?1"
+            }
+            return "?0"
+        }
+        SfDate(seconds) -> return "@{seconds}"
+        SfDisplay(text) -> {
+            var out = "%\""
+            for byte in text.to_bytes().to_list() {
+                if byte == 37 or byte == 34 or byte < 32 or byte >= 127 {
+                    out = out + "%" + hex_digit(byte / 16) +
+                    hex_digit(byte % 16)
+                } else {
+                    out = out + byte.to_char()
+                }
+            }
+            return out + "\""
+        }
+    }
+}
+
+fn serialise_params(params: [SfParam]) -> str {
+    var out = ""
+    for param in params {
+        out = out + ";" + param.name
+        var bare = true
+        match param.value {
+            SfBoolean(flag) -> bare = flag
+            _ -> bare = false
+        }
+        if not bare {
+            out = out + "=" + serialise_value(param.value)
+        }
+    }
+    return out
+}
+
+/// An item with its parameters.
+pub fn serialise_item(item: SfItem) -> str {
+    return serialise_value(item.value) + serialise_params(item.params)
+}
+
+fn serialise_member(member: SfMember) -> str {
+    if not member.inner {
+        return serialise_item(member.item)
+    }
+    var out = "("
+    var first = true
+    for item in member.items {
+        if not first {
+            out = out + " "
+        }
+        first = false
+        out = out + serialise_item(item)
+    }
+    return out + ")" + serialise_params(member.params)
+}
+
+/// A list, written out.
+pub fn serialise_list(members: [SfMember]) -> str {
+    var parts: [str] = []
+    for member in members {
+        parts.push(serialise_member(member))
+    }
+    return parts.join(", ")
+}
+
+/// A dictionary, written out. A member whose value is `?1` and which has
+/// no parameters is written as the bare key, which is the form every
+/// example in the specification uses.
+pub fn serialise_dictionary(entries: [SfEntry]) -> str {
+    var parts: [str] = []
+    for entry in entries {
+        var bare = false
+        if not entry.member.inner {
+            match entry.member.item.value {
+                SfBoolean(flag) -> bare = flag
+                _ -> bare = false
+            }
+        }
+        if bare {
+            // `c;foo=bar`, not `c=?1;foo=bar`: a true value is the
+            // default and writing it back is not the canonical form.
+            parts.push(entry.name +
+                serialise_params(entry.member.item.params))
+        } else if not entry.member.inner {
+            parts.push(entry.name + "=" +
+                serialise_value(entry.member.item.value) +
+                serialise_params(entry.member.item.params))
+        } else {
+            parts.push(entry.name + "=" + serialise_member(entry.member))
+        }
+    }
+    return parts.join(", ")
+}

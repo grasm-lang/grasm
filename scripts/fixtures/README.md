@@ -15,6 +15,8 @@ here, and the code was correct every time.
 | `GraphemeBreakTest.txt`, `WordBreakTest.txt`, `SentenceBreakTest.txt` | the Unicode Consortium, UCD 17.0.0 | `segment_diff.sh` |
 | `NormalizationTest.txt` | the Unicode Consortium, UCD 17.0.0 | `normalise_diff.sh` |
 | `bip39-vectors.json` | the BIP-39 reference implementation | `bip39_diff.sh` |
+| `structured-field-tests/` | the HTTP working group's `structured-field-tests` | `sf_diff.sh` |
+| `LineBreakTest.txt` | the Unicode Consortium, UCD 17.0.0 | `linebreak_diff.sh` |
 | `h2-transcript.txt` | recorded from the Python `h2` library by `h2_capture.py` | `h2_diff.sh` |
 
 The Unicode files carry their own terms of use, which are in the files.

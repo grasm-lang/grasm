@@ -1,0 +1,138 @@
+// Wrapping text to a width, using the two answers that make it correct.
+//
+// `textwrap` splits on spaces and counts characters, which is right for
+// English in a monospace font and wrong everywhere else. This asks
+// `linebreak` where a line *may* be broken and `textwidth` how wide the
+// pieces are, so:
+//
+//   - Chinese and Japanese wrap, having no spaces to split on.
+//   - An ideograph counts as two columns and a combining accent as none,
+//     so a table of names in three scripts still lines up.
+//   - `1,000` and `(a)` are not broken through the middle, and a full stop
+//     does not start a line.
+//
+// ## Two ways to overflow
+//
+// A single piece can be wider than the width — a long URL, a word in a
+// narrow column. `wrap` leaves it alone and lets the line be too long,
+// because breaking a word where no break is allowed produces something
+// the reader has to reassemble. `wrap_hard` breaks it at a grapheme
+// cluster boundary instead, which is what a terminal does, and never
+// between a letter and its accent.
+//
+// ## Trailing spaces
+//
+// The spaces at the end of a wrapped line are dropped, since they are the
+// separator rather than content, and a line whose visible text fits but
+// whose trailing spaces do not is not too long.
+import linebreak
+import textwidth
+import graphemes
+
+fn characters_of(text: str) -> [str] {
+    return text.chars()
+}
+
+fn slice(characters: [str], from: i64, to: i64) -> str {
+    var out = ""
+    var i = from
+    while i < to {
+        out = out + characters[i]
+        i = i + 1
+    }
+    return out
+}
+
+fn trim_end(text: str) -> str {
+    var end = text.len()
+    while end > 0 and text.substr(end - 1, 1) == " " {
+        end = end - 1
+    }
+    return text.substr(0, end)
+}
+
+/// Wrap a paragraph to a column width.
+///
+/// Answers the lines, without their trailing spaces. A piece wider than
+/// the whole width is left on a line of its own rather than cut.
+pub fn wrap(text: str, columns: i64) -> [str] {
+    let characters = characters_of(text)
+    var lines: [str] = []
+    var start = 0
+    var last = 0
+    var used = 0
+    for mark in linebreak.boundaries(text) {
+        let piece = slice(characters, last, mark)
+        let width = textwidth.width_ignoring_controls(trim_end(piece))
+        if used > 0 and used + width > columns {
+            lines.push(trim_end(slice(characters, start, last)))
+            start = last
+            used = 0
+        }
+        used = used + textwidth.width_ignoring_controls(piece)
+        last = mark
+    }
+    if start < characters.len() {
+        lines.push(trim_end(slice(characters, start, characters.len())))
+    }
+    return lines
+}
+
+/// The same, but a piece that cannot fit on a line of its own is cut at a
+/// grapheme cluster boundary rather than left to overflow.
+pub fn wrap_hard(text: str, columns: i64) -> [str] {
+    var out: [str] = []
+    for line in wrap(text, columns) {
+        if textwidth.width_ignoring_controls(line) <= columns {
+            out.push(line)
+        } else {
+            for piece in cut(line, columns) {
+                out.push(piece)
+            }
+        }
+    }
+    return out
+}
+
+/// Cut a run that is too wide at cluster boundaries.
+fn cut(text: str, columns: i64) -> [str] {
+    var out: [str] = []
+    var current = ""
+    var used = 0
+    for cluster in graphemes.clusters(text) {
+        let width = textwidth.width_ignoring_controls(cluster)
+        if used > 0 and used + width > columns {
+            out.push(current)
+            current = ""
+            used = 0
+        }
+        current = current + cluster
+        used = used + width
+    }
+    if current.len() > 0 {
+        out.push(current)
+    }
+    return out
+}
+
+/// The width of the widest line, which is what a caller sizing a box
+/// wants.
+pub fn widest(lines: [str]) -> i64 {
+    var most = 0
+    for line in lines {
+        let width = textwidth.width_ignoring_controls(line)
+        if width > most {
+            most = width
+        }
+    }
+    return most
+}
+
+/// Wrap and pad every line to the same width, for a column in a table.
+pub fn column(text: str, columns: i64) -> [str] {
+    var out: [str] = []
+    for line in wrap_hard(text, columns) {
+        out.push(textwidth.pad_right(line, columns))
+    }
+    return out
+}

@@ -1,0 +1,15 @@
+[package]
+name = "wordwrap"
+version = "1.0.0"
+
+[dependencies.linebreak]
+path = "../linebreak"
+version = "^1.0.0"
+
+[dependencies.textwidth]
+path = "../textwidth"
+version = "^1.0.0"
+
+[dependencies.graphemes]
+path = "../graphemes"
+version = "^1.0.0"

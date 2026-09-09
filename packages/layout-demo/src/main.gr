@@ -1,0 +1,146 @@
+// A header format that one parser reads, and the two questions that have
+// to be answered before text can be put on a line.
+//
+// The structured field claims came from the HTTP working group's own test
+// suite, and the break positions from UAX #14's.
+import structuredfields
+import linebreak
+import wordwrap
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn text_of(codes: [i64]) -> str {
+    var out = ""
+    for code in codes {
+        out = out + code.to_char()
+    }
+    return out
+}
+
+// --------------------------------------------------- structuredfields
+
+fn item_back(raw: str) -> str {
+    match structuredfields.parse_item(raw) {
+        Ok(item) -> return structuredfields.serialise_item(item)
+        Err(_why) -> return "error"
+    }
+}
+
+fn list_back(raw: str) -> str {
+    match structuredfields.parse_list(raw) {
+        Ok(members) -> return structuredfields.serialise_list(members)
+        Err(_why) -> return "error"
+    }
+}
+
+fn dict_back(raw: str) -> str {
+    match structuredfields.parse_dictionary(raw) {
+        Ok(entries) -> return structuredfields.serialise_dictionary(entries)
+        Err(_why) -> return "error"
+    }
+}
+
+fn check_fields(inout f: i64) / {io} {
+    print("-- structuredfields: one grammar instead of a parser per header")
+    say(f, "a list of tokens, and the canonical spacing round the commas",
+        list_back("sugar, tea ,rum") == "sugar, tea, rum")
+    say(f, "a dictionary, where a true value is written as the bare key",
+        dict_back("a=?0, b, c; foo=bar") == "a=?0, b, c;foo=bar")
+    say(f, "an inner list keeps its own parameters",
+        list_back("(\"foo\" \"bar\");baz") == "(\"foo\" \"bar\");baz")
+    say(f, "a decimal is thousandths, not a float, so it round-trips",
+        item_back("4.567") == "4.567" and item_back("1.0") == "1.0" and
+        item_back("-0.001") == "-0.001")
+    say(f, "an integer of more than fifteen digits is refused",
+        item_back("999999999999999") == "999999999999999" and
+        item_back("9999999999999999") == "error")
+    say(f, "and a decimal with four places, or twelve digits before the" +
+        " point, likewise",
+        item_back("1.0001") == "error" and
+        item_back("1234567890123.0") == "error")
+    say(f, "a byte sequence is written back with its padding",
+        item_back(":aGVsbG8:") == ":aGVsbG8=:")
+    say(f, "a repeated key keeps the last value, not the first",
+        dict_back("a=1, b=2, a=3") == "a=3, b=2")
+    say(f, "leading whitespace before an item is not allowed",
+        item_back(" 1") == "1" and item_back("\t1") == "error")
+    say(f, "and a date and a display string are items like any other",
+        item_back("@1659578233") == "@1659578233" and
+        item_back("%\"f%c3%bc%c3%bc\"") == "%\"f%c3%bc%c3%bc\"")
+}
+
+// ---------------------------------------------------------- linebreak
+
+fn breaks(text: str) -> [i64] {
+    return linebreak.boundaries(text)
+}
+
+fn check_breaks(inout f: i64) / {io} {
+    print("-- linebreak: where a line may be broken, which is not spaces")
+    say(f, "a space is a break opportunity and the one after it is not",
+        breaks("one two") == [4, 7])
+    say(f, "a number keeps its separators and its currency symbol",
+        breaks("$1,234.00") == [9])
+    say(f, "and the full stop that ends the sentence stays with the" +
+        " number, the break coming after the space that follows it",
+        breaks("costs $1,234.00. yes") == [6, 17, 20])
+    say(f, "an opening bracket holds on to what follows it",
+        breaks("a (b)") == [2, 5])
+    say(f, "Chinese breaks between characters, having no spaces",
+        breaks(text_of([28450, 23383, 12398, 25945, 26360])).len() == 5)
+    say(f, "a hyphen may be broken after, but not inside a word that" +
+        " starts with one",
+        breaks("well-known") == [5, 10])
+    say(f, "a combining accent never starts a line",
+        breaks(text_of([97, 32, 101, 769, 102])) == [2, 5])
+    say(f, "and a flag is not broken between its two halves",
+        breaks(text_of([127467, 127479, 127465, 127466])) == [2, 4])
+}
+
+// ----------------------------------------------------------- wordwrap
+
+fn check_wrap(inout f: i64) / {io} {
+    print("-- wordwrap: the two answers together")
+    say(f, "an ordinary paragraph wraps at the spaces",
+        wordwrap.wrap("the quick brown fox jumps", 10) ==
+        ["the quick", "brown fox", "jumps"])
+    say(f, "a number is not broken to make a line fit",
+        wordwrap.wrap("pay $1,234.00 now", 8) == ["pay", "$1,234.00", "now"])
+    say(f, "Chinese wraps although it has no spaces",
+        wordwrap.wrap(text_of([28450, 23383, 12398, 25945, 26360]), 4)
+            .len() == 3)
+    say(f, "an ideograph counts as two columns, so the lines fit",
+        wordwrap.widest(wordwrap.wrap(text_of([28450, 23383, 12398,
+            25945, 26360]), 4)) == 4)
+    say(f, "a word wider than the column is left whole by default",
+        wordwrap.wrap("a supercalifragilistic word", 8) ==
+        ["a", "supercalifragilistic", "word"])
+    say(f, "and cut at a character boundary when that is asked for",
+        wordwrap.wrap_hard("a supercalifragilistic word", 8) ==
+        ["a", "supercal", "ifragili", "stic", "word"])
+    say(f, "a cut never separates a letter from its accent",
+        wordwrap.wrap_hard(text_of([120, 120, 120, 101, 769, 121]), 4) ==
+        ["xxx" + text_of([101, 769]), "y"])
+    say(f, "and a column is padded to its width in columns, not characters",
+        wordwrap.column(text_of([28450, 23383]), 6) ==
+        [text_of([28450, 23383]) + "  "])
+}
+
+fn main() / {io} {
+    var f = 0
+    check_fields(f)
+    check_breaks(f)
+    check_wrap(f)
+    if f == 0 {
+        print("layout: every claim held")
+    } else {
+        print("layout: {f} claims failed")
+    }
+}

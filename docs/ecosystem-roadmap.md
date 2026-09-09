@@ -14,7 +14,7 @@ plan that discovers them 300 packages in.
 | | |
 |---|---|
 | Started | 78 |
-| Now | 456 |
+| Now | 461 |
 | Tier 1 target | 200 |
 | Tier 2 target | 500 |
 | Tier 3 target | 800 |
@@ -249,6 +249,7 @@ says where the data came from and under what licence, which is the condition.
 | ~~Plumbing~~ | ~~`shellwords` `datefmt` `siphash` `zonefile` `cidr`~~ | Python's `shlex`, `datetime` and `ipaddress`, the SipHash paper's vectors, dnspython |
 | ~~Codes~~ | ~~`bigrational` `bech32` `checkdigits` `mnemonic` `base45`~~ | Python's `fractions`, BIP-350's and BIP-39's own vectors, python-stdnum, RFC 9285 |
 | ~~Unicode II~~ | ~~`sentencebreak` `casemap` `unicodescript` `numericvalue`~~ | the Consortium's SentenceBreakTest, Python's `str.upper`, the `regex` module's script property, `unicodedata` |
+| ~~Layout~~ | ~~`structuredfields` `linebreak` `wordwrap`~~ | the HTTP working group's structured-field suite, UAX #14's LineBreakTest |
 
 That is a hundred, in twenty batches, and the same rhythm as the first: five
 or six packages to a group demo, every claim an assertion, every batch checked

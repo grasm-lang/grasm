@@ -1,0 +1,16 @@
+[package]
+name = "layout_demo"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.structuredfields]
+path = "../structuredfields"
+version = "^1.0.0"
+
+[dependencies.linebreak]
+path = "../linebreak"
+version = "^1.0.0"
+
+[dependencies.wordwrap]
+path = "../wordwrap"
+version = "^1.0.0"

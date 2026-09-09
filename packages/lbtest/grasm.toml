@@ -1,0 +1,8 @@
+[package]
+name = "lbtest"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.linebreak]
+path = "../linebreak"
+version = "^1.0.0"
