@@ -17,7 +17,7 @@ fn to_hex(text: str) -> str {
     var i = 0
     while i < raw.len() {
         out = out + digits.substr(raw.at(i) / 16, 1) +
-            digits.substr(raw.at(i) % 16, 1)
+        digits.substr(raw.at(i) % 16, 1)
         i = i + 1
     }
     return out
@@ -33,7 +33,7 @@ fn main() / {io} {
                 name = "default"
             }
             out = out + name + "\u{2}" + entry.login + "\u{2}" +
-                entry.account + "\u{2}" + entry.password + "\u{1}"
+            entry.account + "\u{2}" + entry.password + "\u{1}"
         }
         print(to_hex(out))
         i = i + 1

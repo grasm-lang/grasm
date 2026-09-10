@@ -17,7 +17,7 @@ fn to_hex(text: str) -> str {
     var i = 0
     while i < raw.len() {
         out = out + digits.substr(raw.at(i) / 16, 1) +
-            digits.substr(raw.at(i) % 16, 1)
+        digits.substr(raw.at(i) % 16, 1)
         i = i + 1
     }
     return out
@@ -29,8 +29,8 @@ fn described(one: Purl) -> str {
         pieces.push(pair.0 + "=" + pair.1)
     }
     return one.kind + "\u{2}" + one.namespace + "\u{2}" + one.name +
-        "\u{2}" + one.version + "\u{2}" + pieces.join("&") + "\u{2}" +
-        one.subpath + "\u{2}" + purl.render(one)
+    "\u{2}" + one.version + "\u{2}" + pieces.join("&") + "\u{2}" +
+    one.subpath + "\u{2}" + purl.render(one)
 }
 
 fn main() / {io} {
