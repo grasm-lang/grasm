@@ -19,7 +19,7 @@ the scorecard takes the best of five runs and subtracts the process floor.
 | # | Goal | Target | Measured | |
 |---|---|---|---|---|
 | G1 | Time for a Go/TS dev to ship a real service | ≤ 1 week | — | **unmeasurable without users** |
-| G2 | Geomean vs Rust | ≥ 0.95× | **0.45×**, and **0.39×** with the process floor subtracted — 0 of 8 programs at or above. `scripts/bench.sh` computes both from the numbers it prints; the figure used to be worked out by hand and could only be retyped, not reproduced | **missed** — `tree` at 5.1× carries it; `parwords` 2.6×, the other six 1.6–2.3× |
+| G2 | Geomean vs Rust | ≥ 0.95× | **0.46×**, and **0.39×** with the process floor subtracted — 0 of 8 programs at or above. `scripts/bench.sh` computes both from the numbers it prints; the figure used to be worked out by hand and could only be retyped, not reproduced | **missed** — `tree` at 5.0× still carries it; `parwords` 2.6×, `sort` 1.9×, the rest 1.5–3.0×. Moved from 0.45× on 2026-09-10 when the allocation path stopped resolving three thread-locals per value |
 | G3 | Frontend throughput | ≥ 500k LOC/s | **535–547k** across consecutive runs on one machine | **met** |
 | G3 | Incremental edit-to-diagnostic | ≤ 50 ms | — | **not built** — there is no query engine |
 | G4 | Safe-subset guarantees | 100% | **223** programs identical across three engines, **223** leak-free, 27 agreeing on panic messages, **44** whole programs, 184 identical in the browser build, 28 builtins refusing under an empty journal, nine fuzzers clean — and the gap list the compiled backend refuses is down from 17 shapes to 1, which is polymorphic recursion and is permanent | **strongest area** |
@@ -159,14 +159,25 @@ with a known shape, not an open question — and it is the only thing between he
 and the goal.
 
 **G2's one real gap is the value representation, and it is not a missing
-optimisation.** As of the table above, six of the seven rows sit between 1.7×
-and 2.1× behind Rust, `parwords` at 2.9× and `tree` at 4.9×, so the geomean is
-mostly one row's problem rather than a spread. Three candidate causes were checked on `wordfreq`
-and none of them was it: the map is already a `HashMap` with sorting deferred to iteration, so
-[E-MAP-ORDER] costs nothing on insert; rewriting the program's string
-construction to one interpolation instead of a concatenation changed the time by
-nothing; and replacing the `RefCell` borrow that every allocation makes with a
-plain counter measured **zero** on a benchmark that allocates 800,000 times.
+optimisation.** As of the table above, the rows sit between 1.5× and 3.0×
+behind Rust with `tree` at 5.0×, so the geomean is mostly one row's problem
+rather than a spread. Three candidate causes were checked on `wordfreq` and
+none of them was it: the map is already a `HashMap` with sorting deferred to
+iteration, so [E-MAP-ORDER] costs nothing on insert; rewriting the program's
+string construction to one interpolation instead of a concatenation changed the
+time by nothing; and replacing the `RefCell` borrow that every allocation makes
+with a plain counter measured **zero** on a benchmark that allocates 800,000
+times.
+
+**Fixed, 2026-09-10: the allocation path resolved three thread-locals.** The
+`RefCell` above really was worth nothing on its own — what it was sitting next
+to was. `sample` on `tree` put `_tlv_get_addr` at the top of the profile with
+about a third of the samples: on macOS a thread-local is a call, and `alloc`
+reached three of them while releasing a value reached two. One structure now.
+`tree` 49 ms to 42, `wordfreq` 44 to 38, `parwords` 32 to 23, and G2 from 0.45×
+to 0.46× — which is the honest size of it. A third of one program's profile
+buys a hundredth of the geomean, because five of the eight rows barely allocate.
+`docs/performance.md` has the rest of the ledger.
 
 **Fixed, 2026-08-18: `(a..b).map(f)` is one loop, not two passes.** `sieve` 52 ms
 to 39 ms, and `range.map` on two million elements 20 ms to 7 ms — faster than the

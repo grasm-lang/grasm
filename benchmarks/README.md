@@ -89,23 +89,30 @@ primitive each one reaches for.
 
 | program  |   C |  Rust |  Go | Nim | Zig | grasm-native | grasm-interp | Python |
 |----------|----:|------:|----:|----:|----:|-------------:|-------------:|-------:|
-| fib      |   5 |     5 |   6 |   5 |   5 |           10 |         1632 |    129 |
-| sieve    |   7 |     7 |   7 |   9 |   7 |           15 |         2849 |    342 |
-| matmul   |   5 |     5 |   8 |   9 |   5 |           10 |         5998 |    900 |
-| wordfreq |  30 |    26 |  18 |  22 |   9 |           44 |          495 |    129 |
-| tree     |  20 |    10 |  20 |   — |   — |           49 |         1439 |    329 |
-| sort     |  36 |    11 |  48 |   — |   — |       **19** |          369 |    209 |
-| parmap   |  49 |    50 |  89 |   — |   — |          104 |       54,027 |  3,521 |
-| parwords |   8 |    11 |  10 |   — |   — |           32 |         1957 |    221 |
+| fib      |   5 |     5 |   6 |   6 |   6 |           11 |         1741 |    131 |
+| sieve    |   7 |     7 |   8 |   9 |   7 |           16 |         2930 |    357 |
+| matmul   |   5 |     5 |   8 |   9 |   6 |           10 |         6317 |    879 |
+| wordfreq |  31 |    26 |  17 |  22 |   9 |       **38** |          489 |    130 |
+| tree     |  21 |    10 |  21 |   — |   — |       **42** |         1572 |    333 |
+| sort     |  37 |    11 |  49 |   — |   — |       **19** |          382 |    215 |
+| parmap   |  54 |    49 |  87 |   — |   — |          104 |       54,583 |  3,539 |
+| parwords |   8 |    10 |  10 |   — |   — |       **23** |         2005 |    213 |
+
+`scripts/bench.sh` prints the geometric mean of Rust over Grasm at the bottom
+of the run, which is goal G2 in `docs/northstar.md`: **0.46x**, and **0.39x**
+with the floor subtracted. Parity is 1.00x. Nothing here is at or above it.
 
 Best of 5. **The harness floor is 2 ms** — what timing `/usr/bin/true` costs,
 which is fork, exec and wait rather than anything a program did. The top three
-rows are mostly floor: C's 5 ms `fib` is about 3 ms of work and Grasm's 10 ms
-about 8, which is nearer 2.7x than the 2x the raw numbers show. Subtract 2 from
+rows are mostly floor: C's 5 ms `fib` is about 3 ms of work and Grasm's 11 ms
+about 9, which is nearer 3x than the 2.2x the raw numbers show. Subtract 2 from
 every cell before taking a ratio on a short row.
 
-This run reproduces the previous one within 3 ms on every cell, and adds
-`parwords` — parallel work over strings rather than over integers, which is the
+The three bold cells are the ones the thread-local consolidation of
+2026-09-10 moved, and they are the three that allocate: `wordfreq` 44 to 38,
+`tree` 49 to 42, `parwords` 32 to 23. Every other cell reproduces the previous
+run within 2 ms, which is the noise floor of a row that short. An earlier run
+added `parwords` — parallel work over strings rather than over integers, which is the
 row that measures what `par_map` could not do until this month. Grasm's own
 figure for it moved 70 to 32 within the run that introduced it, because writing
 the benchmark is what found that building a string in a loop was quadratic. A benchmark that only ever agrees with itself is
