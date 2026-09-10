@@ -53,17 +53,35 @@ a package that cannot connect.
 This is the single highest-value item in the whole roadmap and it is the next
 thing to build.
 
-### P2 — Async I/O or a socket poll. **Blocks about 40 packages.**
+### ~~P2 — Async I/O or a socket poll.~~ **The poll is built.** About 40
+unblocked.
 
-Grasm has OS threads and structured concurrency and no async. That is enough
-for a request/response client and not enough for:
+This was written as "a thread per connection works to a few hundred; past that
+it needs `poll` or `epoll`/`kqueue`, which is a runtime addition, not a
+library". The runtime addition exists and has since before 1.0: `net_wait(hs,
+ms)` is `poll(2)` behind [L-LIB-NET], `packages/http_server` walks its answer
+in `serve_many`, and the entry stayed on the blocked list after it stopped
+being true.
 
-- message brokers holding thousands of idle connections (Kafka, RabbitMQ, MQTT)
-- an event loop, a task queue, a scheduler with backpressure
-- a server handling more sockets than it has threads
+Measured on 2026-09-10, by opening every connection *before* sending anything
+so the server is holding all of them at once rather than serving them in turn:
 
-A thread per connection works to a few hundred. Past that it needs `poll` or
-`epoll`/`kqueue`, which is a runtime addition, not a library.
+| connections held open | answered | wall clock |
+|---:|---:|---:|
+| 50 | 50 | 4 ms |
+| 200 | 200 | 17 ms |
+| 1000 | 1000 | 100 ms |
+| 2000 | 2000 | 266 ms |
+| 3000 | 3000 | 378 ms |
+
+One thread, one process, every request answered. It stops where the file
+descriptor limit stops it, not where the design does.
+
+What is honestly still missing is `epoll`/`kqueue`. `poll(2)` walks its whole
+set on every call, so the cost per pass grows with the number of idle
+connections — fine at the thousands above, the wrong shape at a hundred
+thousand. A broker at that scale wants an edge-triggered interface. Nothing
+below needs one.
 
 ### P3 — A decision about C bindings. **Blocks about 90 packages, and it is
 not a technical question.**
@@ -348,12 +366,13 @@ could not — a digest named `"sha256"` where the `rsa` package spells it
 `"SHA256"`, which is a silent verification failure, and an ECDSA signature
 handed to the curve code as bytes where it wanted limbs.
 
-### Needs P2 — async I/O. About 40.
+### ~~Needs P2 — async I/O.~~ **Unblocked.** About 40.
 
 Kafka, RabbitMQ, MQTT, task queues, event loops, connection pools, WebSocket
-servers at scale. A thread per connection works to a few hundred; past that
-it needs `poll` or `epoll`/`kqueue`, which is a runtime addition rather than
-a library.
+servers at scale. These wanted a readiness primitive and there is one: see the
+measurement under P2 above, where one thread held three thousand connections
+open and answered all of them. They are ordinary package work now, not work
+behind a prerequisite.
 
 ### Needs P3 — a decision. About 90.
 
@@ -383,8 +402,9 @@ built is not.
 3. ~~**Tier 2, the 180 that need nothing.**~~ Done.
 4. ~~**Tier 2, the 120 behind TLS.**~~ Done — the count passed 500 on
    2026-09-10.
-5. **Build P2 if the broker and server packages are wanted.** Not started.
-   About 40 packages wait on it.
+5. ~~**Build P2 if the broker and server packages are wanted.**~~ Already
+   built, and the list did not notice: `net_wait` is `poll(2)` and one thread
+   holds three thousand connections. The 40 behind it are ordinary work.
 6. **Raise P3 as a question** rather than answering it inside a commit.
    Raised, and open: about 90 packages wait on the answer.
 
