@@ -1,0 +1,24 @@
+import sshkey
+
+fn main() / {io} {
+    var i = 0
+    while i + 1 < args().len() {
+        let what = args()[i]
+        let line = args()[i + 1]
+        match sshkey.parse(line) {
+            Err(_e) -> print("error")
+            Ok(key) -> {
+                if what == "describe" {
+                    print(sshkey.describe(key))
+                } else if what == "md5" {
+                    print(sshkey.fingerprint_md5(key))
+                } else if what == "render" {
+                    print(sshkey.render(key))
+                } else {
+                    print(key.options.join("\u{1}"))
+                }
+            }
+        }
+        i = i + 2
+    }
+}

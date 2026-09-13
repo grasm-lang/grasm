@@ -9,6 +9,20 @@ migration note here; anything `experimental` may change in any release. See
 
 ### Added
 
+- **Three packages about who a machine lets in.** `unixcrypt` computes the
+  password hashes in `/etc/shadow` and `.htpasswd` — md5crypt, Apache's
+  `$apr1$`, sha256crypt and sha512crypt — which is what checking an existing
+  account database needs; none of them should be chosen for something new,
+  and `argon2`, `scrypt` and `bcrypt` were already here for that. `sshkey`
+  reads an `authorized_keys` line, its length-prefixed blob, and both
+  fingerprint formats `ssh-keygen -l` prints, and splits the options on the
+  commas that are not inside a quoted value — the difference between one
+  `command="a,b"` restriction and two. `crc64` is the ECMA-182 checksum `.xz`
+  uses by default, which `xzfile` could previously read past and not verify;
+  it now verifies it, and eight more gate cases flip each of those bytes in
+  turn. Checked against `openssl passwd`, the sha-crypt specification's own
+  vectors and `ssh-keygen`: `unixcryptdiff` and `sshkeydiff` are gates.
+
 - **Compression that compresses, and a reader for `.xz`.** `zlib` could read a
   deflate stream and could write exactly one kind — stored blocks, deflate's
   word for "no compression" — so `gzip`, `zip` and `png` could all emit files

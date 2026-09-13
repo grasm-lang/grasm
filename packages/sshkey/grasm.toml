@@ -1,0 +1,18 @@
+[package]
+name = "sshkey"
+version = "1.0.0"
+
+# Parsing text and hashing it. Reads no files.
+capabilities = []
+
+[dependencies.bytes_codec]
+path = "../bytes"
+version = "^1.0.0"
+
+[dependencies.crypto_hash]
+path = "../crypto_hash"
+version = "^1.0.0"
+
+[dependencies.md5]
+path = "../md5"
+version = "^1.0.0"

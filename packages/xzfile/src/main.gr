@@ -26,14 +26,15 @@
 //      updated. That is why it compresses better than deflate and why it is
 //      slower by a wide margin.
 //
-// The check at the end of each block is verified when it is CRC-32, which is
-// what `xz` uses by default. CRC-64 and SHA-256 streams are read and their
-// check is skipped rather than silently claimed — `checked_with` says which
-// happened, so a caller that needs the guarantee can ask.
+// The check at the end of each block is verified when it is CRC-32 or
+// CRC-64, the second of which is what `xz` uses by default. A SHA-256 check
+// is read and skipped rather than silently claimed; `check_kind` says which
+// a stream carries, so a caller that needs the guarantee can ask.
 //
 // Checked against Python's `lzma`, which is liblzma.
 
 import crc32
+import crc64
 
 let PROB_INIT = 1024
 let PROB_TOTAL = 2048
@@ -562,6 +563,18 @@ fn read_block(data: bytes, at: i64, check: i64,
             fail(XzBadCheck(want_crc, got_crc))
         }
         verified = true
+    } else if check == 4 {
+        if end + 8 > data.len() {
+            fail(XzTruncated(end))
+        }
+        let want_crc = crc64.from_bytes(data, end)
+        let got_crc = crc64.of(out)
+        if want_crc != got_crc {
+            // The two halves, because the error carries `i64`s and these
+            // are sixty-four bits wide already.
+            fail(XzBadCheck(want_crc.ushr(32), got_crc.ushr(32)))
+        }
+        verified = true
     }
     return XzBlock{
         data: out,
@@ -725,8 +738,8 @@ pub fn is_xz(data: bytes) -> bool {
 }
 
 /// Which integrity check the stream carries: 0 none, 1 CRC-32, 4 CRC-64,
-/// 10 SHA-256. Only CRC-32 is verified, and `decode` says nothing about the
-/// others rather than implying it checked them.
+/// 10 SHA-256. The first two are verified; a SHA-256 stream is read and
+/// `decode` says nothing about its check rather than implying it looked.
 pub fn check_kind(data: bytes) -> i64 {
     if not is_xz(data) {
         return -1

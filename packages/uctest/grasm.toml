@@ -1,0 +1,8 @@
+[package]
+name = "uctest"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.unixcrypt]
+path = "../unixcrypt"
+version = "^1.0.0"

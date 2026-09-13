@@ -171,6 +171,17 @@ for position, label in ((-6, "corrupt index"), (-2, "corrupt footer magic"),
                         (7, "corrupt header flags")):
     broken = bytearray(good); broken[position] ^= 0xff
     xz_cases.append((label, bytes(broken), None))
+
+# CRC-64 is what `xz` checks with by default, so every one of its eight bytes
+# has to be looked at. The check sits immediately before the index, whose
+# size the footer records.
+crc64_stream = lzma.compress(b"hello world hello world",
+                             check=lzma.CHECK_CRC64)
+backward = struct.unpack_from("<I", crc64_stream, len(crc64_stream) - 8)[0]
+check_at = len(crc64_stream) - 12 - (backward + 1) * 4 - 8
+for offset in range(8):
+    broken = bytearray(crc64_stream); broken[check_at + offset] ^= 0xff
+    xz_cases.append((f"crc64 byte {offset}", bytes(broken), None))
 xz_cases.append(("not xz", b"hello there this is not xz at all", None))
 xz_cases.append(("truncated", good[:20], None))
 xz_cases.append(("two streams",

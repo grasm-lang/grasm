@@ -1,0 +1,134 @@
+// Who a machine lets in, and the checksum `.xz` uses to say a file arrived
+// whole.
+import unixcrypt
+import sshkey
+import crc64
+import xzfile
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn check_unixcrypt(inout f: i64) / {io} {
+    // The vectors published with the sha-crypt specification.
+    say(f, "sha256crypt matches the specification's first vector",
+        (unixcrypt.hash_like("Hello world!".to_bytes(), "$5$saltstring") ??
+            "") ==
+        "$5$saltstring$5B8vYYiY.CVt1RlTTf8KbXBH3hsxY/GNooZaBBGWEc5")
+    say(f, "and sha512crypt matches its own",
+        (unixcrypt.hash_like("Hello world!".to_bytes(), "$6$saltstring") ??
+            "") == "$6$saltstring$svn8UoSVapNtMuq1ukKS4tPQd8iKwSMHWjl/O81" +
+        "7G3uBnIFNjnQJuesI68u4OTLiBFdcbYEdFCoEOfaS35inz1")
+    // What `openssl passwd -1` writes.
+    say(f, "md5crypt matches openssl",
+        (unixcrypt.hash_like("password".to_bytes(), "$1$abcdefgh") ?? "") ==
+        "$1$abcdefgh$G//4keteveJp0qb8z2DxG/")
+    say(f, "the right password verifies",
+        unixcrypt.verify("password".to_bytes(),
+            "$1$abcdefgh$G//4keteveJp0qb8z2DxG/"))
+    say(f, "and a wrong one does not",
+        not unixcrypt.verify("Password".to_bytes(),
+            "$1$abcdefgh$G//4keteveJp0qb8z2DxG/"))
+    // A salt longer than the scheme allows is truncated, not refused, which
+    // is what the C implementations do and what stored hashes rely on.
+    say(f, "a salt past sixteen characters is cut rather than refused",
+        (unixcrypt.hash_like("x".to_bytes(), "$5$0123456789abcdefGHIJ") ??
+            "").starts_with("$5$0123456789abcdef$"))
+    say(f, "the scheme is readable from the hash",
+        unixcrypt.scheme_of("$6$abc$def") == "6")
+    say(f, "and something that is not one of these says so",
+        unixcrypt.scheme_of("$2y$10$abcdef") == "")
+}
+
+fn check_sshkey(inout f: i64) / {io} {
+    let line = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGmXkrC21AoFc57T6PBM" +
+    "gdiD6D8woUt0S8SnwLM4OM3b thunder-compute-key"
+    let key = sshkey.parse(line) ?? sshkey.parse("x") ??
+    SshPublicKey{ kind: "", blob: "".to_bytes(), comment: "",
+        options: [] }
+    say(f, "the type is read from the line", key.kind == "ssh-ed25519")
+    say(f, "and the comment", key.comment == "thunder-compute-key")
+    say(f, "an ed25519 key is 256 bits", sshkey.bit_length(key) == 256)
+    say(f, "the line renders back unchanged", sshkey.render(key) == line)
+    say(f, "a fingerprint starts with SHA256:",
+        sshkey.fingerprint_sha256(key).starts_with("SHA256:"))
+    say(f, "and the md5 form has sixteen colon-separated bytes",
+        sshkey.fingerprint_md5(key).split(":").len() == 17)
+    // A blob whose inner type disagrees with the outer one is a mismatch
+    // worth refusing rather than a formatting quirk.
+    let wrong = "ssh-rsa AAAAC3NzaC1lZDI1NTE5AAAAIGmXkrC21AoFc57T6PBMgdi" +
+    "D6D8woUt0S8SnwLM4OM3b x"
+    say(f, "a type that disagrees with the blob is refused",
+        sshkey.parse(wrong) ?? SshPublicKey{ kind: "no", blob:
+            "".to_bytes(), comment: "", options: [] } == SshPublicKey{
+            kind: "no", blob: "".to_bytes(), comment: "", options: [] })
+    // Options are split on commas outside quotes, which is the difference
+    // between one restriction and two.
+    let restricted = sshkey.parse("command=\"echo a,b\",no-pty " + line) ??
+    SshPublicKey{ kind: "", blob: "".to_bytes(), comment: "",
+        options: [] }
+    say(f, "a quoted comma does not split an option",
+        restricted.options.len() == 2)
+    say(f, "and the command comes back whole",
+        sshkey.option_value(restricted, "command") == Some("echo a,b"))
+    say(f, "no-pty is present", sshkey.has_option(restricted, "no-pty"))
+    say(f, "and no-agent-forwarding is not",
+        not sshkey.has_option(restricted, "no-agent-forwarding"))
+}
+
+fn check_crc64(inout f: i64) / {io} {
+    // The check word published with the algorithm.
+    say(f, "CRC-64 of \"123456789\" is 995dc9bbdf1939fa",
+        crc64.hex(crc64.of("123456789".to_bytes())) == "995dc9bbdf1939fa")
+    say(f, "of nothing at all it is zero",
+        crc64.of("".to_bytes()) == 0)
+    let value = crc64.of("hello".to_bytes())
+    say(f, "eight bytes out and back is the same value",
+        crc64.from_bytes(crc64.to_bytes(value), 0) == value)
+    say(f, "and a checksum taken in two halves matches one taken whole",
+        crc64.finish(crc64.update(crc64.table(),
+            crc64.update(crc64.table(), crc64.start(), "hel".to_bytes()),
+            "lo".to_bytes())) == value)
+    // Which is the point: `.xz` defaults to this check, so the reader can
+    // now verify the files it reads most.
+    let file = bytes_of([253, 55, 122, 88, 90, 0, 0, 4, 230, 214, 180, 70,
+        2, 0, 33, 1, 22, 0, 0, 0, 116, 47, 229, 163, 1, 0, 11, 104, 101,
+        108, 108, 111, 32, 119, 111, 114, 108, 100, 10, 0, 161, 242, 255,
+        196, 106, 127, 191, 207, 0, 1, 36, 12, 166, 24, 216, 216, 31, 182,
+        243, 125, 1, 0, 0, 0, 0, 4, 89, 90])
+    say(f, "an .xz with a CRC-64 check decodes",
+        (xzfile.decode(file, 10000) ?? "".to_bytes()).to_str() ==
+        "hello world\n")
+    var damaged: [i64] = []
+    var i = 0
+    while i < file.len() {
+        if i == 41 {
+            damaged.push(file.at(i).bit_xor(255))
+        } else {
+            damaged.push(file.at(i))
+        }
+        i = i + 1
+    }
+    say(f, "and one whose check was damaged is refused",
+        (xzfile.decode(bytes_of(damaged), 10000) ?? "x".to_bytes())
+            .to_str() == "x")
+}
+
+fn main() / {io} {
+    var f = 0
+
+    check_unixcrypt(f)
+    check_sshkey(f)
+    check_crc64(f)
+
+    if f == 0 {
+        print("accounts: every claim held")
+    } else {
+        print("accounts: {f} failed")
+    }
+}

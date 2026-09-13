@@ -1,0 +1,20 @@
+[package]
+name = "accounts_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.unixcrypt]
+path = "../unixcrypt"
+version = "^1.0.0"
+
+[dependencies.sshkey]
+path = "../sshkey"
+version = "^1.0.0"
+
+[dependencies.crc64]
+path = "../crc64"
+version = "^1.0.0"
+
+[dependencies.xzfile]
+path = "../xzfile"
+version = "^1.0.0"

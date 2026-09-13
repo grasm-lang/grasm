@@ -1,0 +1,325 @@
+// OpenSSH public keys: the line in `authorized_keys`, what is inside it, and
+// the fingerprints people compare.
+//
+// The line is three fields — type, base64 blob, comment — and the blob is
+// the part that matters. It is a sequence of length-prefixed strings, four
+// bytes of big-endian length and then that many bytes, repeated. The first
+// string is the key type again, and it has to agree with the one written in
+// front: a line claiming `ssh-ed25519` whose blob says `ssh-rsa` is a
+// mismatch worth refusing rather than a formatting quirk.
+//
+// The fingerprint is the reason most callers are here. `ssh-keygen -l`
+// prints `SHA256:` followed by the base64 of a SHA-256 over the blob — the
+// raw blob, not the base64 text, and the base64 without its padding. With
+// `-E md5` it prints colon-separated hex of an MD5 instead, which is what
+// older systems display and what a good deal of documentation still quotes.
+// Both are here because a program that can only produce one of them cannot
+// check the other against what a user was told.
+//
+// `authorized_keys` lines may also carry options in front — `no-pty`,
+// `command="..."`, `from="..."` — comma-separated, and a quoted value may
+// contain a comma. Splitting on commas without knowing that turns one
+// `command="a,b"` into two options and loses the restriction, which is the
+// kind of bug that makes a key more powerful than its owner intended.
+//
+// Checked against `ssh-keygen -l`, in both fingerprint formats, over the key
+// types it will generate.
+
+import bytes_codec
+import crypto_hash
+import md5
+
+type SshKeyError =
+    | SshKeyMalformed(line: str)
+    | SshKeyNotBase64(text: str)
+    | SshKeyTypeMismatch(outer: str, inner: str)
+    | SshKeyTruncated(at: i64)
+
+    /// A public key as an `authorized_keys` line holds it.
+type SshPublicKey = {
+    /// The key type, as both the line and the blob spell it.
+    kind: str,
+    /// The wire encoding, which is what fingerprints are taken over.
+    blob: bytes,
+    /// Whatever followed the base64, usually `user@host`.
+    comment: str,
+    /// The options in front of the key, empty for an ordinary line.
+    options: [str],
+}
+
+fn read_u32(blob: bytes, at: i64) -> i64 {
+    return blob.at(at) * 16777216 + blob.at(at + 1) * 65536 +
+    blob.at(at + 2) * 256 + blob.at(at + 3)
+}
+
+/// The length-prefixed strings a blob is made of.
+pub fn fields(blob: bytes) -> [bytes] ! SshKeyError {
+    var out: [bytes] = []
+    var at = 0
+    while at < blob.len() {
+        if at + 4 > blob.len() {
+            fail(SshKeyTruncated(at))
+        }
+        let size = read_u32(blob, at)
+        if size < 0 or at + 4 + size > blob.len() {
+            fail(SshKeyTruncated(at))
+        }
+        var piece: [i64] = []
+        var i = 0
+        while i < size {
+            piece.push(blob.at(at + 4 + i))
+            i = i + 1
+        }
+        out.push(bytes_of(piece))
+        at = at + 4 + size
+    }
+    return out
+}
+
+/// The options in front of an `authorized_keys` line, split on the commas
+/// that are not inside a quoted value.
+fn split_options(text: str) -> [str] {
+    var out: [str] = []
+    var current = ""
+    var quoted = false
+    var i = 0
+    while i < text.len() {
+        let c = text.substr(i, 1)
+        if c == "\\" and quoted and i + 1 < text.len() {
+            current = current + c + text.substr(i + 1, 1)
+            i = i + 2
+            continue
+        }
+        if c == "\"" {
+            quoted = not quoted
+            current = current + c
+        } else if c == "," and not quoted {
+            out.push(current)
+            current = ""
+        } else {
+            current = current + c
+        }
+        i = i + 1
+    }
+    if current.len() > 0 {
+        out.push(current)
+    }
+    return out
+}
+
+/// Where the key type starts in an `authorized_keys` line: after any
+/// options, which are one unquoted-space-free run in front.
+fn key_starts_at(line: str) -> i64 {
+    let space = line.index_of(" ") ?? -1
+    if space < 0 {
+        return 0
+    }
+    let head = line.substr(0, space)
+    // A key type has no comma and no equals sign; options have at least one.
+    if (head.index_of(",") ?? -1) < 0 and (head.index_of("=") ?? -1) < 0 {
+        return 0
+    }
+    // The options run may itself contain a quoted space, so walk it.
+    var quoted = false
+    var i = 0
+    while i < line.len() {
+        let c = line.substr(i, 1)
+        if c == "\\" and quoted {
+            i = i + 2
+            continue
+        }
+        if c == "\"" {
+            quoted = not quoted
+        } else if c == " " and not quoted {
+            return i + 1
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+/// One `authorized_keys` or `.pub` line.
+pub fn parse(line: str) -> SshPublicKey ! SshKeyError {
+    let trimmed = line.trim()
+    if trimmed.len() == 0 or trimmed.starts_with("#") {
+        fail(SshKeyMalformed(line))
+    }
+    let start = key_starts_at(trimmed)
+    var options: [str] = []
+    if start > 0 {
+        options = split_options(trimmed.substr(0, start - 1))
+    }
+    let rest = trimmed.substr(start, trimmed.len() - start)
+    let first = rest.index_of(" ") ?? -1
+    if first < 0 {
+        fail(SshKeyMalformed(line))
+    }
+    let kind = rest.substr(0, first)
+    var tail = rest.substr(first + 1, rest.len() - first - 1).trim()
+    var comment = ""
+    let second = tail.index_of(" ") ?? -1
+    if second >= 0 {
+        comment = tail.substr(second + 1, tail.len() - second - 1).trim()
+        tail = tail.substr(0, second)
+    }
+    var blob = bytes_of([])
+    match bytes_codec.decode_base64(tail) {
+        Some(raw) -> blob = raw
+        None -> fail(SshKeyNotBase64(tail))
+    }
+    let inner = try fields(blob)
+    if inner.len() == 0 {
+        fail(SshKeyTruncated(0))
+    }
+    if inner[0].to_str() != kind {
+        fail(SshKeyTypeMismatch(kind, inner[0].to_str()))
+    }
+    return SshPublicKey{
+        kind: kind,
+        blob: blob,
+        comment: comment,
+        options: options,
+    }
+}
+
+/// The line back, which for a key with no options is what was read.
+pub fn render(key: SshPublicKey) -> str {
+    var out = ""
+    if key.options.len() > 0 {
+        out = key.options.join(",") + " "
+    }
+    out = out + key.kind + " " + bytes_codec.encode_base64(key.blob)
+    if key.comment.len() > 0 {
+        out = out + " " + key.comment
+    }
+    return out
+}
+
+/// `SHA256:` and the base64 of a SHA-256 over the blob, unpadded — what
+/// `ssh-keygen -l` prints.
+pub fn fingerprint_sha256(key: SshPublicKey) -> str {
+    let digest = bytes_codec.encode_base64(crypto_hash.sha256_of(key.blob))
+    var end = digest.len()
+    while end > 0 and digest.substr(end - 1, 1) == "=" {
+        end = end - 1
+    }
+    return "SHA256:" + digest.substr(0, end)
+}
+
+/// `MD5:` and colon-separated hex, which `ssh-keygen -l -E md5` prints and
+/// which a great deal of documentation still quotes.
+pub fn fingerprint_md5(key: SshPublicKey) -> str {
+    let raw = md5.hash(key.blob)
+    let digits = "0123456789abcdef"
+    var out = "MD5:"
+    var i = 0
+    while i < raw.len() {
+        if i > 0 {
+            out = out + ":"
+        }
+        out = out + digits.substr(raw.at(i) / 16, 1) +
+        digits.substr(raw.at(i) % 16, 1)
+        i = i + 1
+    }
+    return out
+}
+
+/// How many bits the key has, the way `ssh-keygen -l` counts them.
+///
+/// For RSA that is the bit length of the modulus, which is the last field
+/// and is stored as a signed big-endian number with a leading zero byte when
+/// the top bit is set. For the fixed-size types it is the size they are.
+pub fn bit_length(key: SshPublicKey) -> i64 {
+    if key.kind == "ssh-ed25519" {
+        return 256
+    }
+    if key.kind == "ssh-dss" {
+        return 1024
+    }
+    if key.kind.starts_with("ecdsa-sha2-nistp") {
+        return key.kind.substr(16, key.kind.len() - 16).parse_int() ?? 0
+    }
+    if key.kind != "ssh-rsa" {
+        return 0
+    }
+    let inner = fields(key.blob) ?? []
+    if inner.len() < 3 {
+        return 0
+    }
+    let modulus = inner[2]
+    var at = 0
+    while at < modulus.len() and modulus.at(at) == 0 {
+        at = at + 1
+    }
+    if at >= modulus.len() {
+        return 0
+    }
+    var top = modulus.at(at)
+    var bits = (modulus.len() - at - 1) * 8
+    while top > 0 {
+        bits = bits + 1
+        top = top / 2
+    }
+    return bits
+}
+
+/// The line `ssh-keygen -l` prints: bits, fingerprint, comment, and the type
+/// in brackets.
+pub fn describe(key: SshPublicKey) -> str {
+    var comment = key.comment
+    if comment.len() == 0 {
+        comment = "no comment"
+    }
+    return bit_length(key).to_str() + " " + fingerprint_sha256(key) + " " +
+    comment + " (" + type_label(key.kind) + ")"
+}
+
+/// The name `ssh-keygen` prints in brackets, which is not the wire name.
+fn type_label(kind: str) -> str {
+    if kind == "ssh-ed25519" {
+        return "ED25519"
+    }
+    if kind == "ssh-rsa" {
+        return "RSA"
+    }
+    if kind == "ssh-dss" {
+        return "DSA"
+    }
+    if kind.starts_with("ecdsa-sha2-") {
+        return "ECDSA"
+    }
+    if kind == "sk-ssh-ed25519@openssh.com" {
+        return "ED25519-SK"
+    }
+    if kind.starts_with("sk-ecdsa-sha2-") {
+        return "ECDSA-SK"
+    }
+    return kind
+}
+
+/// Whether an `authorized_keys` option is present, by name.
+pub fn has_option(key: SshPublicKey, name: str) -> bool {
+    for option in key.options {
+        if option == name or option.starts_with(name + "=") {
+            return true
+        }
+    }
+    return false
+}
+
+/// The value of a `name="value"` option, with the quotes removed.
+pub fn option_value(key: SshPublicKey, name: str) -> Option[str] {
+    for option in key.options {
+        if not option.starts_with(name + "=") {
+            continue
+        }
+        var value = option.substr(name.len() + 1,
+            option.len() - name.len() - 1)
+        if value.starts_with("\"") and value.ends_with("\"") and
+        value.len() >= 2 {
+            value = value.substr(1, value.len() - 2)
+        }
+        return Some(value.replace("\\\"", "\""))
+    }
+    return None
+}

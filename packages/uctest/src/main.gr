@@ -1,0 +1,34 @@
+import unixcrypt
+
+fn from_hex(text: str) -> bytes {
+    var out: [i64] = []
+    var i = 1
+    while i + 1 < text.len() {
+        out.push(text.substr(i, 2).parse_int_base(16) ?? 0)
+        i = i + 2
+    }
+    return bytes_of(out)
+}
+
+fn main() / {io} {
+    var i = 0
+    while i + 2 < args().len() {
+        let what = args()[i]
+        let password = from_hex(args()[i + 1])
+        let stored = args()[i + 2]
+        if what == "like" {
+            // Both answers from one computation: a sha512crypt at the
+            // round counts the specification's vectors use is seconds of
+            // work, and doing it twice doubles the gate for nothing.
+            var mark = "no"
+            if unixcrypt.verify(password, stored) {
+                mark = "yes"
+            }
+            print((unixcrypt.hash_like(password, stored) ?? "error") + " " +
+                mark)
+        } else {
+            print(unixcrypt.scheme_of(stored))
+        }
+        i = i + 3
+    }
+}

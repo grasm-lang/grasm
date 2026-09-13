@@ -1,0 +1,8 @@
+[package]
+name = "sktest"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.sshkey]
+path = "../sshkey"
+version = "^1.0.0"

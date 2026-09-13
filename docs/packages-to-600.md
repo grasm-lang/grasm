@@ -30,9 +30,9 @@ One rule is added, because the count is now large enough for it to matter:
 | | |
 |---|---|
 | At the close of the 200 plan | 513 |
-| Now | 543 |
+| Now | 548 |
 | Target | 600 |
-| Remaining | 57 |
+| Remaining | 52 |
 
 The count is directories under `packages/` that are not `*-demo`. Test
 harnesses are directories and are counted; they are real programs that the
@@ -61,10 +61,17 @@ Each line is a batch of about six, chosen so that everything in it has an
 implementation elsewhere to be checked against. A name in brackets is the
 thing it is checked against.
 
-- **Unix identity** — `unixcrypt` (`openssl passwd`), `sshkey`
-  (`ssh-keygen`), `terminfo` (`infocmp`)
+- **Japanese encodings** — `eucjp` and `iso2022jp` (Python `codecs`), which
+  share the JIS X 0208 table `shiftjis` already carries
 - **Names on the wire** — `idna` (Python `encodings.idna`), `countrycode`
-  (ISO 3166), `csvsniff` (`csv.Sniffer`)
+  (ISO 3166), `xmlc14n` (`ElementTree.canonicalize`)
+
+`terminfo` was on this list and came off it. The plan was to check it
+against `infocmp`, whose `-s i` flag is documented to print capabilities in
+the order the compiled file stores them; the `infocmp` on this machine
+ignores the flag and prints alphabetically, so there is no way to derive the
+index-to-name table from an outside source here. Writing the table from
+memory is exactly what rule 6 exists to prevent.
 - **Container formats** — `debfile`, `oggmeta`, `isobmff`
 
 ## What this still does not include

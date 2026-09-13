@@ -1,0 +1,402 @@
+// The password hashes in `/etc/shadow`, and in every `.htpasswd` file.
+//
+// Four schemes, told apart by the prefix of the stored string:
+//
+//   `$1$`     md5crypt, 1994. A thousand MD5s in a deliberately awkward
+//             order. Too fast to be worth anything today, and still what a
+//             great deal of deployed equipment stores.
+//   `$apr1$`  the same thing with a different prefix, which is what Apache's
+//             `htpasswd -m` writes and therefore what every `.htpasswd`
+//             checker has to accept.
+//   `$5$`     sha256crypt, 2007. Configurable rounds, 5000 by default.
+//   `$6$`     sha512crypt, same design, and the default on most Linux
+//             distributions for the last fifteen years.
+//
+// None of these should be chosen for something new — `packages/argon2`,
+// `packages/scrypt` and `packages/bcrypt` all exist and all are designed to
+// be expensive. What this is for is *checking* a hash somebody else stored:
+// reading an existing `/etc/shadow`, honouring an existing `.htpasswd`,
+// migrating an account database to something better without locking every
+// user out on the way.
+//
+// The awkwardness is not incidental. All four schemes build their input by
+// walking the bits of the password's length and appending either a NUL or
+// the first byte of the password, and the SHA ones then run a loop whose
+// every iteration appends the password, the salt, or both depending on the
+// iteration number modulo 3 and modulo 7. It reads like nonsense and it is
+// exactly specified; anything that looks tidier is a different function.
+//
+// The output alphabet is `./0-9A-Za-z`, in that order, six bits at a time,
+// least significant first, over bytes taken in a permuted order that differs
+// between the MD5 and SHA schemes. Getting the permutation wrong produces a
+// hash of the right length, made of the right characters, that never matches.
+//
+// Checked against `openssl passwd` for `$1$` and `$apr1$`, and against the
+// test vectors published with the sha-crypt specification for `$5$` and
+// `$6$`.
+
+import md5
+import crypto_hash
+import sha512
+
+let ALPHABET = "./0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+
+type CryptError =
+    | CryptUnknownScheme(prefix: str)
+    | CryptMalformed(text: str)
+
+fn concat(a: [i64], b: bytes) -> [i64] {
+    var out = a
+    var i = 0
+    while i < b.len() {
+        out.push(b.at(i))
+        i = i + 1
+    }
+    return out
+}
+
+fn take(data: bytes, count: i64) -> [i64] {
+    var out: [i64] = []
+    var i = 0
+    while i < count and i < data.len() {
+        out.push(data.at(i))
+        i = i + 1
+    }
+    return out
+}
+
+/// Three bytes as four characters, six bits at a time, least significant
+/// first — which is the reverse of how base64 does it.
+fn encode_group(inout out: str, b2: i64, b1: i64, b0: i64, count: i64) {
+    var value = b2 * 65536 + b1 * 256 + b0
+    var i = 0
+    while i < count {
+        out = out + ALPHABET.substr(value % 64, 1)
+        value = value / 64
+        i = i + 1
+    }
+}
+
+/// The md5crypt output order: not the digest's own, and not sorted.
+fn md5_encode(digest: bytes) -> str {
+    var out = ""
+    encode_group(out, digest.at(0), digest.at(6), digest.at(12), 4)
+    encode_group(out, digest.at(1), digest.at(7), digest.at(13), 4)
+    encode_group(out, digest.at(2), digest.at(8), digest.at(14), 4)
+    encode_group(out, digest.at(3), digest.at(9), digest.at(15), 4)
+    encode_group(out, digest.at(4), digest.at(10), digest.at(5), 4)
+    encode_group(out, 0, 0, digest.at(11), 2)
+    return out
+}
+
+/// md5crypt, and the identical `$apr1$` with a different magic string.
+pub fn md5_crypt(password: bytes, salt: str, magic: str) -> str {
+    let salt_bytes = salt.to_bytes()
+    var start: [i64] = []
+    start = concat(start, password)
+    start = concat(start, magic.to_bytes())
+    start = concat(start, salt_bytes)
+    var alt: [i64] = []
+    alt = concat(alt, password)
+    alt = concat(alt, salt_bytes)
+    alt = concat(alt, password)
+    let alt_digest = md5.hash(bytes_of(alt))
+    var length = password.len()
+    while length > 0 {
+        var chunk = length
+        if chunk > 16 {
+            chunk = 16
+        }
+        start = concat(start, bytes_of(take(alt_digest, chunk)))
+        length = length - chunk
+    }
+    // Then the bits of the length, low to high: a zero byte for a one bit
+    // and the password's first byte for a zero bit. Yes, that way round.
+    var bits = password.len()
+    while bits > 0 {
+        if bits % 2 == 1 {
+            start.push(0)
+        } else {
+            start.push(password.at(0))
+        }
+        bits = bits / 2
+    }
+    var digest = md5.hash(bytes_of(start))
+    var round = 0
+    while round < 1000 {
+        var next: [i64] = []
+        if round % 2 == 1 {
+            next = concat(next, password)
+        } else {
+            next = concat(next, digest)
+        }
+        if round % 3 != 0 {
+            next = concat(next, salt_bytes)
+        }
+        if round % 7 != 0 {
+            next = concat(next, password)
+        }
+        if round % 2 == 1 {
+            next = concat(next, digest)
+        } else {
+            next = concat(next, password)
+        }
+        digest = md5.hash(bytes_of(next))
+        round = round + 1
+    }
+    return magic + salt + "$" + md5_encode(digest)
+}
+
+/// The byte order sha256crypt writes its digest in.
+fn sha256_order() -> [i64] {
+    return [0, 10, 20, 21, 1, 11, 12, 22, 2, 3, 13, 23, 24, 4, 14, 15, 25, 5,
+        6, 16, 26, 27, 7, 17, 18, 28, 8, 9, 19, 29, 31, 30]
+}
+
+/// And the order sha512crypt writes its own, which is a different
+/// permutation of a longer digest.
+fn sha512_order() -> [i64] {
+    return [0, 21, 42, 22, 43, 1, 44, 2, 23, 3, 24, 45, 25, 46, 4, 47, 5, 26,
+        6, 27, 48, 28, 49, 7, 50, 8, 29, 9, 30, 51, 31, 52, 10, 53, 11, 32,
+        12, 33, 54, 34, 55, 13, 56, 14, 35, 15, 36, 57, 37, 58, 16, 59, 17,
+        38, 18, 39, 60, 40, 61, 19, 62, 20, 41, 63]
+}
+
+fn sha_encode(digest: bytes, order: [i64]) -> str {
+    var out = ""
+    var i = 0
+    while i + 2 < order.len() {
+        encode_group(out, digest.at(order[i]), digest.at(order[i + 1]),
+            digest.at(order[i + 2]), 4)
+        i = i + 3
+    }
+    if i + 1 < order.len() {
+        encode_group(out, 0, digest.at(order[i]), digest.at(order[i + 1]), 3)
+    } else {
+        encode_group(out, 0, 0, digest.at(order[i]), 2)
+    }
+    return out
+}
+
+fn sha_digest(data: bytes, wide: bool) -> bytes {
+    if wide {
+        return sha512.sha512(data)
+    }
+    return crypto_hash.sha256_of(data)
+}
+
+/// `count` bytes of `source`, repeating it as often as needed — which is how
+/// both sha-crypt schemes stretch a digest to the length of the password.
+fn repeated(source: bytes, count: i64) -> [i64] {
+    var out: [i64] = []
+    var left = count
+    while left >= source.len() and source.len() > 0 {
+        out = concat(out, source)
+        left = left - source.len()
+    }
+    return concat(out, bytes_of(take(source, left)))
+}
+
+fn sha_sequence(password: bytes, salt: bytes, wide: bool) -> bytes {
+    var alt: [i64] = []
+    alt = concat(alt, password)
+    alt = concat(alt, salt)
+    alt = concat(alt, password)
+    let alt_digest = sha_digest(bytes_of(alt), wide)
+    var start: [i64] = []
+    start = concat(start, password)
+    start = concat(start, salt)
+    start = concat(start, bytes_of(repeated(alt_digest, password.len())))
+    var bits = password.len()
+    while bits > 0 {
+        if bits % 2 == 1 {
+            start = concat(start, alt_digest)
+        } else {
+            start = concat(start, password)
+        }
+        bits = bits / 2
+    }
+    return sha_digest(bytes_of(start), wide)
+}
+
+fn sha_rounds(password: bytes, salt: bytes, first: bytes, rounds: i64,
+    wide: bool) -> bytes {
+    var p: [i64] = []
+    var i = 0
+    while i < password.len() {
+        p = concat(p, password)
+        i = i + 1
+    }
+    let p_bytes = bytes_of(repeated(sha_digest(bytes_of(p), wide),
+        password.len()))
+    var s: [i64] = []
+    var k = 0
+    while k < 16 + first.at(0) {
+        s = concat(s, salt)
+        k = k + 1
+    }
+    let s_bytes = bytes_of(repeated(sha_digest(bytes_of(s), wide),
+        salt.len()))
+    var digest = first
+    var round = 0
+    while round < rounds {
+        var next: [i64] = []
+        if round % 2 == 1 {
+            next = concat(next, p_bytes)
+        } else {
+            next = concat(next, digest)
+        }
+        if round % 3 != 0 {
+            next = concat(next, s_bytes)
+        }
+        if round % 7 != 0 {
+            next = concat(next, p_bytes)
+        }
+        if round % 2 == 1 {
+            next = concat(next, digest)
+        } else {
+            next = concat(next, p_bytes)
+        }
+        digest = sha_digest(bytes_of(next), wide)
+        round = round + 1
+    }
+    return digest
+}
+
+fn sha_crypt_under(password: bytes, salt: str, rounds: i64, wide: bool,
+    head: str) -> str {
+    let salt_bytes = salt.to_bytes()
+    let first = sha_sequence(password, salt_bytes, wide)
+    let digest = sha_rounds(password, salt_bytes, first, rounds, wide)
+    let order = if wide { sha512_order() } else { sha256_order() }
+    return head + salt + "$" + sha_encode(digest, order)
+}
+
+/// sha256crypt and sha512crypt, which differ only in the hash, the digest
+/// length and the output permutation.
+///
+/// The round count is written into the result only when it is not the
+/// default, which is what a fresh hash looks like. A hash that already
+/// spells out `rounds=5000` keeps it — see `hash_like`, which reproduces
+/// the setting it was given rather than normalising it.
+pub fn sha_crypt(password: bytes, salt: str, rounds: i64, wide: bool) -> str {
+    var head = if wide { "$6$" } else { "$5$" }
+    if rounds != 5000 {
+        head = head + "rounds=" + rounds.to_str() + "$"
+    }
+    return sha_crypt_under(password, salt, rounds, wide, head)
+}
+
+type CryptParts = {
+    scheme: str,
+    salt: str,
+    rounds: i64,
+    /// Whether the setting spelled the round count out. `$5$rounds=5000$x`
+    /// and `$5$x` are the same work and different strings, and a check
+    /// compares strings.
+    spelled: bool,
+}
+
+/// The scheme, salt and round count a setting announces.
+///
+/// A setting is either a whole stored hash or just its prefix — `$6$salt`
+/// with nothing after it — because that is what `crypt(3)` takes and what a
+/// caller hashing a new password has.
+fn split(setting: str) -> CryptParts ! CryptError {
+    if not setting.starts_with("$") {
+        fail(CryptMalformed(setting))
+    }
+    let pieces = setting.split("$")
+    if pieces.len() < 3 {
+        fail(CryptMalformed(setting))
+    }
+    let scheme = pieces[1]
+    var salt = pieces[2]
+    var rounds = 5000
+    var spelled = false
+    if salt.starts_with("rounds=") {
+        spelled = true
+        rounds = salt.substr(7, salt.len() - 7).parse_int() ?? 5000
+        // The specification clamps rather than refuses, and the vectors
+        // published with it include a count below the minimum to say so.
+        if rounds < 1000 {
+            rounds = 1000
+        }
+        if rounds > 999999999 {
+            rounds = 999999999
+        }
+        if pieces.len() < 4 {
+            fail(CryptMalformed(setting))
+        }
+        salt = pieces[3]
+    }
+    // The salt is at most sixteen characters, and the rest is ignored rather
+    // than rejected, because that is what the C implementations do.
+    if salt.len() > 16 {
+        salt = salt.substr(0, 16)
+    }
+    return CryptParts{
+        scheme: scheme,
+        salt: salt,
+        rounds: rounds,
+        spelled: spelled,
+    }
+}
+
+/// The hash of `password` under whatever scheme, salt and rounds `setting`
+/// announces — which is how both a new hash and a check are computed.
+pub fn hash_like(password: bytes, setting: str) -> str ! CryptError {
+    let parts = try split(setting)
+    if parts.scheme == "1" {
+        return md5_crypt(password, parts.salt, "$1$")
+    }
+    if parts.scheme == "apr1" {
+        return md5_crypt(password, parts.salt, "$apr1$")
+    }
+    if parts.scheme == "5" or parts.scheme == "6" {
+        let wide = parts.scheme == "6"
+        var head = if wide { "$6$" } else { "$5$" }
+        if parts.spelled {
+            head = head + "rounds=" + parts.rounds.to_str() + "$"
+        }
+        return sha_crypt_under(password, parts.salt, parts.rounds, wide,
+            head)
+    }
+    fail(CryptUnknownScheme(parts.scheme))
+}
+
+/// Whether `password` is the one `stored` was made from.
+///
+/// The comparison is over the whole string and takes the same time whatever
+/// differs, because a check that returns early tells a caller where the
+/// first wrong character is.
+pub fn verify(password: bytes, stored: str) -> bool {
+    let computed = hash_like(password, stored) ?? ""
+    if computed.len() != stored.len() or computed.len() == 0 {
+        return false
+    }
+    var same = 0
+    var i = 0
+    while i < computed.len() {
+        if computed.substr(i, 1) != stored.substr(i, 1) {
+            same = same + 1
+        }
+        i = i + 1
+    }
+    return same == 0
+}
+
+/// Which scheme a setting uses, as its `$`-delimited tag, or the empty
+/// string when it is not one of these.
+pub fn scheme_of(setting: str) -> str {
+    match split(setting) {
+        Ok(parts) -> {
+            if parts.scheme == "1" or parts.scheme == "apr1" or
+            parts.scheme == "5" or parts.scheme == "6" {
+                return parts.scheme
+            }
+            return ""
+        }
+        Err(_e) -> return ""
+    }
+}

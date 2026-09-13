@@ -1,0 +1,113 @@
+// CRC-64, the ECMA-182 polynomial, reflected — the one `.xz` files carry.
+//
+// `packages/crc32` covers the check in `.gz`, `.zip`, PNG and a hundred
+// protocols. `.xz` defaults to a different one, and `packages/xzfile` could
+// therefore read every stream `xz` writes by default and verify none of
+// them. That is the wrong way round: the check exists precisely because the
+// files are large and are moved across networks.
+//
+// The polynomial is 0x42F0E1EBA9EA3693, used reflected, which in the usual
+// shift-right formulation means the constant that appears in the code is
+// 0xC96C5795D7870F42 — the bits of the polynomial in the other order. Both
+// numbers are "the CRC-64 polynomial" and they are not interchangeable.
+//
+// Register width is exactly sixty-four bits, which is also the width of the
+// integers here, so every shift right has to be the logical one. An
+// arithmetic shift fills with the sign bit, and since the register starts as
+// all ones, an arithmetic shift produces all ones forever and a checksum
+// that is the same for every input.
+//
+// The value for "123456789" is 0x995DC9BBDF1939FA, which is the check word
+// published with the algorithm. Checked here against the eight bytes `xz`
+// itself writes after each block.
+
+let POLYNOMIAL = -3932672073523589310
+
+/// The 256-entry table, one entry per leading byte.
+pub fn table() -> [i64] {
+    var out: [i64] = []
+    var i = 0
+    while i < 256 {
+        var value = i
+        var bit = 0
+        while bit < 8 {
+            if value.bit_and(1) == 1 {
+                value = value.ushr(1).bit_xor(POLYNOMIAL)
+            } else {
+                value = value.ushr(1)
+            }
+            bit = bit + 1
+        }
+        out.push(value)
+        i = i + 1
+    }
+    return out
+}
+
+/// The value a fresh checksum starts from: every bit set.
+pub fn start() -> i64 {
+    return -1
+}
+
+/// `running` advanced over `data`, so a checksum can be taken over a stream
+/// nobody holds all of.
+pub fn update(t: [i64], running: i64, data: bytes) -> i64 {
+    var crc = running
+    var i = 0
+    while i < data.len() {
+        let index = crc.bit_xor(data.at(i)).bit_and(255)
+        crc = t[index].bit_xor(crc.ushr(8))
+        i = i + 1
+    }
+    return crc
+}
+
+/// The finished value, which is the register inverted.
+pub fn finish(running: i64) -> i64 {
+    return running.bit_xor(-1)
+}
+
+/// The checksum of `data`, which is what almost every caller wants.
+pub fn of(data: bytes) -> i64 {
+    return finish(update(table(), start(), data))
+}
+
+/// The same, reusing a table the caller built once.
+pub fn of_table(t: [i64], data: bytes) -> i64 {
+    return finish(update(t, start(), data))
+}
+
+/// The eight bytes a `.xz` block writes, least significant first.
+pub fn to_bytes(crc: i64) -> bytes {
+    var out: [i64] = []
+    var i = 0
+    while i < 8 {
+        out.push(crc.ushr(i * 8).bit_and(255))
+        i = i + 1
+    }
+    return bytes_of(out)
+}
+
+/// The value those eight bytes hold, read from `at`.
+pub fn from_bytes(data: bytes, at: i64) -> i64 {
+    var out = 0
+    var i = 7
+    while i >= 0 {
+        out = out.shl(8).bit_or(data.at(at + i))
+        i = i - 1
+    }
+    return out
+}
+
+/// The checksum as sixteen lower-case hexadecimal digits, which is how it is
+/// written down.
+pub fn hex(crc: i64) -> str {
+    let digits = "0123456789abcdef"
+    var out = ""
+    var i = 15
+    while i >= 0 {
+        out = out + digits.substr(crc.ushr(i * 4).bit_and(15), 1)
+        i = i - 1
+    }
+    return out
+}
