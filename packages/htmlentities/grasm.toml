@@ -1,0 +1,6 @@
+[package]
+name = "htmlentities"
+version = "1.0.0"
+
+# A lookup table and a scanner. Opens nothing.
+capabilities = []

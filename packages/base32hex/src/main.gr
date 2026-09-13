@@ -1,0 +1,166 @@
+// Base32 with the extended hex alphabet, RFC 4648 section 7.
+//
+// Same padding, same five-bits-to-a-character grouping, and a different
+// alphabet: `0123456789ABCDEFGHIJKLMNOPQRSTUV` rather than the letters-first
+// one in `packages/base32`. The difference matters for one reason, and it is
+// the reason the variant exists: because the alphabet is in ASCII order, the
+// encoding of a byte string sorts the same way the byte string does. Sort a
+// directory of encoded names and you have sorted the things they name.
+//
+// That property is why it turns up where ordering is load-bearing:
+//
+//   - NSEC3 records in DNSSEC, whose whole design is walking hashed names in
+//     order
+//   - key prefixes in ordered stores, where the sort is the index
+//   - `base32hexencode` in Python's `base64`, checked against here
+//
+// Decoding follows the strict reading: the input length must be a multiple
+// of eight, padding may only be at the end and only in the lengths the
+// standard allows, and the bits left over at the end of the last group must
+// be zero. A decoder that ignores those accepts several different inputs for
+// one output, which is how a value that was supposed to be canonical stops
+// being one.
+
+let ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUV"
+
+type B32hexError =
+    | B32hexLength(len: i64)
+    | B32hexCharacter(c: str)
+    | B32hexPadding(at: i64)
+    | B32hexTrailing(at: i64)
+
+    /// The encoding of `raw`, padded with `=` to a multiple of eight characters.
+pub fn encode(raw: bytes) -> str {
+    var out = ""
+    var at = 0
+    while at < raw.len() {
+        var group: [i64] = []
+        var n = 0
+        while n < 5 {
+            if at + n < raw.len() {
+                group.push(raw.at(at + n))
+            } else {
+                group.push(0)
+            }
+            n = n + 1
+        }
+        let left = raw.len() - at
+        // 1, 2, 3, 4 and 5 bytes become 2, 4, 5, 7 and 8 characters.
+        var chars = 8
+        if left == 1 {
+            chars = 2
+        } else if left == 2 {
+            chars = 4
+        } else if left == 3 {
+            chars = 5
+        } else if left == 4 {
+            chars = 7
+        }
+        var i = 0
+        while i < 8 {
+            if i < chars {
+                let bit = i * 5
+                let byte = bit / 8
+                let offset = bit % 8
+                var value = group[byte].shl(offset).bit_and(255).ushr(3)
+                if offset > 3 {
+                    value = value.bit_or(group[byte + 1].ushr(11 - offset))
+                }
+                out = out + ALPHABET.substr(value.bit_and(31), 1)
+            } else {
+                out = out + "="
+            }
+            i = i + 1
+        }
+        at = at + 5
+    }
+    return out
+}
+
+fn value_of(c: str) -> i64 {
+    return ALPHABET.index_of(c) ?? -1
+}
+
+/// The bytes `text` encodes, or why it is not a valid encoding.
+pub fn decode(text: str) -> bytes ! B32hexError {
+    if text.len() % 8 != 0 {
+        fail(B32hexLength(text.len()))
+    }
+    var out: [i64] = []
+    var at = 0
+    while at < text.len() {
+        var bits = 0
+        var accumulated = 0
+        var chars = 0
+        var padding = false
+        var i = 0
+        while i < 8 {
+            let c = text.substr(at + i, 1)
+            if c == "=" {
+                padding = true
+                i = i + 1
+                continue
+            }
+            if padding {
+                // `A=B=====` and friends: padding that is not a suffix.
+                fail(B32hexPadding(at))
+            }
+            let v = value_of(c)
+            if v < 0 {
+                fail(B32hexCharacter(c))
+            }
+            accumulated = accumulated.shl(5).bit_or(v)
+            bits = bits + 5
+            chars = chars + 1
+            while bits >= 8 {
+                out.push(accumulated.ushr(bits - 8).bit_and(255))
+                bits = bits - 8
+            }
+            i = i + 1
+        }
+        if chars != 8 and at + 8 != text.len() {
+            // A padded group that is not the last one.
+            fail(B32hexPadding(at))
+        }
+        if chars != 2 and chars != 4 and chars != 5 and chars != 7 and
+        chars != 8 {
+            fail(B32hexPadding(at))
+        }
+        if accumulated.bit_and(power_of_two(bits) - 1) != 0 {
+            // Bits past the last whole byte have to be zero, or two
+            // different inputs decode to one output.
+            fail(B32hexTrailing(at))
+        }
+        at = at + 8
+    }
+    return bytes_of(out)
+}
+
+fn power_of_two(n: i64) -> i64 {
+    var out = 1
+    var i = 0
+    while i < n {
+        out = out * 2
+        i = i + 1
+    }
+    return out
+}
+
+/// The encoding without trailing `=`, as NSEC3 and most key schemes write it.
+pub fn encode_unpadded(raw: bytes) -> str {
+    let padded = encode(raw)
+    var end = padded.len()
+    while end > 0 and padded.substr(end - 1, 1) == "=" {
+        end = end - 1
+    }
+    return padded.substr(0, end)
+}
+
+/// Decodes text written without padding, by putting the padding back.
+pub fn decode_unpadded(text: str) -> bytes ! B32hexError {
+    var padded = text
+    while padded.len() % 8 != 0 {
+        padded = padded + "="
+    }
+    return try decode(padded)
+}

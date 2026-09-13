@@ -1,0 +1,6 @@
+[package]
+name = "filemode"
+version = "1.0.0"
+
+# Arithmetic on a number. Touches no files.
+capabilities = []

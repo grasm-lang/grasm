@@ -1,0 +1,247 @@
+// "Did you mean?", with the algorithm Python uses rather than one that looks
+// close enough.
+//
+// Every command-line tool wants to answer an unknown subcommand with a
+// suggestion, and the usual reach is edit distance. That gives the wrong
+// answer often enough to notice: `levenshtein` scores `push` against `pull`
+// the same as against `punt`, because it counts operations and not how much
+// of the two strings actually lines up.
+//
+// `difflib` scores the other way round — twice the number of matched
+// elements over the total length of both sequences — and matches by finding
+// the longest run the two have in common, then recursing into what is left
+// on either side of it. That ratio is what `python -c 'improt sys'` uses to
+// suggest `import`, and it is worth having the same answers rather than
+// similar ones.
+//
+// Two details are easy to miss and both change results:
+//
+//   - **Auto-junk.** Once the second sequence is 200 elements or longer,
+//     anything appearing in more than `len/100 + 1` positions is dropped
+//     from the index entirely. Without it a long line of spaces makes the
+//     matcher quadratic; with it, the ratio for long inputs is *not* what
+//     the plain definition gives. Both behaviours are correct — they are
+//     different functions — and code that does not know about the cutoff
+//     disagrees with `difflib` exactly at length 200.
+//   - **Argument order.** The ratio is not symmetric. `difflib` puts the
+//     word being looked up second and each candidate first, and swapping
+//     them changes which suggestion wins.
+//
+// Checked against `difflib.SequenceMatcher` and `difflib.get_close_matches`.
+
+type CloseMatchRun = {
+    at_a: i64,
+    at_b: i64,
+    size: i64,
+}
+
+/// Where each element of `b` occurs, with over-common elements left out once
+/// `b` is long enough for them to matter.
+fn index_of_b(b: [str]) -> Map[str, [i64]] {
+    var index: Map[str, [i64]] = {}
+    var i = 0
+    while i < b.len() {
+        var seen = index.get(b[i]) ?? []
+        seen.push(i)
+        index.set(b[i], seen)
+        i = i + 1
+    }
+    if b.len() < 200 {
+        return index
+    }
+    let ceiling = b.len() / 100 + 1
+    var popular: [str] = []
+    for key in index.keys() {
+        if (index.get(key) ?? []).len() > ceiling {
+            popular.push(key)
+        }
+    }
+    for key in popular {
+        index.delete(key)
+    }
+    return index
+}
+
+/// The longest run shared by `a[a_lo..a_hi]` and `b[b_lo..b_hi]`, earliest
+/// in `a` and then earliest in `b` when several are the same length.
+fn longest_run(a: [str], b: [str], index: Map[str, [i64]], a_lo: i64,
+    a_hi: i64, b_lo: i64, b_hi: i64) -> CloseMatchRun {
+    var best_a = a_lo
+    var best_b = b_lo
+    var best = 0
+    var lengths: Map[i64, i64] = {}
+    var i = a_lo
+    while i < a_hi {
+        var next: Map[i64, i64] = {}
+        for j in index.get(a[i]) ?? [] {
+            if j < b_lo {
+                continue
+            }
+            if j >= b_hi {
+                break
+            }
+            let run = (lengths.get(j - 1) ?? 0) + 1
+            next.set(j, run)
+            if run > best {
+                best_a = i - run + 1
+                best_b = j - run + 1
+                best = run
+            }
+        }
+        lengths = next
+        i = i + 1
+    }
+    // Grow the run over anything equal on either side. With no junk function
+    // this is the whole of `difflib`'s four extension loops; the two that
+    // test for junk can never fire.
+    while best_a > a_lo and best_b > b_lo and
+    a[best_a - 1] == b[best_b - 1] {
+        best_a = best_a - 1
+        best_b = best_b - 1
+        best = best + 1
+    }
+    while best_a + best < a_hi and best_b + best < b_hi and
+    a[best_a + best] == b[best_b + best] {
+        best = best + 1
+    }
+    return CloseMatchRun{ at_a: best_a, at_b: best_b, size: best }
+}
+
+/// How many elements `a` and `b` have in common, counted the way the ratio
+/// counts them: the longest run, then the same question on each side of it.
+pub fn matched(a: [str], b: [str]) -> i64 {
+    let index = index_of_b(b)
+    var queue: [(i64, i64, i64, i64)] = [(0, a.len(), 0, b.len())]
+    var total = 0
+    while queue.len() > 0 {
+        let job = queue[queue.len() - 1]
+        queue.pop()
+        let run = longest_run(a, b, index, job.0, job.1, job.2, job.3)
+        if run.size == 0 {
+            continue
+        }
+        total = total + run.size
+        if job.0 < run.at_a and job.2 < run.at_b {
+            queue.push((job.0, run.at_a, job.2, run.at_b))
+        }
+        let after_a = run.at_a + run.size
+        let after_b = run.at_b + run.size
+        if after_a < job.1 and after_b < job.3 {
+            queue.push((after_a, job.1, after_b, job.3))
+        }
+    }
+    return total
+}
+
+/// Twice the matched count over the total length, between 0.0 and 1.0.
+pub fn ratio(a: [str], b: [str]) -> f64 {
+    let total = a.len() + b.len()
+    if total == 0 {
+        return 1.0
+    }
+    return 2.0 * matched(a, b).as_f64() / total.as_f64()
+}
+
+/// The same ratio for two strings, compared character by character.
+pub fn text_ratio(a: str, b: str) -> f64 {
+    return ratio(a.chars(), b.chars())
+}
+
+/// An upper bound on the ratio that costs one pass: how many elements the
+/// two have in common as multisets, ignoring order entirely.
+pub fn quick_ratio(a: [str], b: [str]) -> f64 {
+    var counts: Map[str, i64] = {}
+    for element in b {
+        counts.set(element, (counts.get(element) ?? 0) + 1)
+    }
+    var shared = 0
+    for element in a {
+        let left = counts.get(element) ?? 0
+        if left > 0 {
+            counts.set(element, left - 1)
+            shared = shared + 1
+        }
+    }
+    let total = a.len() + b.len()
+    if total == 0 {
+        return 1.0
+    }
+    return 2.0 * shared.as_f64() / total.as_f64()
+}
+
+/// A cheaper bound still: the ratio cannot beat twice the shorter length
+/// over the total.
+pub fn rough_ratio(a: [str], b: [str]) -> f64 {
+    let total = a.len() + b.len()
+    if total == 0 {
+        return 1.0
+    }
+    var shorter = a.len()
+    if b.len() < shorter {
+        shorter = b.len()
+    }
+    return 2.0 * shorter.as_f64() / total.as_f64()
+}
+
+/// The `count` candidates most like `word`, best first, dropping anything
+/// below `cutoff`.
+///
+/// Ties are broken by the candidate text, descending, which is what
+/// `difflib` does and is the difference between a stable suggestion and one
+/// that moves when the caller reorders its list.
+pub fn close_matches(word: str, candidates: [str], count: i64,
+    cutoff: f64) -> [str] {
+    let target = word.chars()
+    var scored: [(f64, str)] = []
+    for candidate in candidates {
+        let left = candidate.chars()
+        if rough_ratio(left, target) < cutoff {
+            continue
+        }
+        if quick_ratio(left, target) < cutoff {
+            continue
+        }
+        let score = ratio(left, target)
+        if score < cutoff {
+            continue
+        }
+        scored.push((score, candidate))
+    }
+    var order: [(f64, str)] = []
+    while scored.len() > 0 and order.len() < count {
+        var best = 0
+        var i = 1
+        while i < scored.len() {
+            if scored[i].0 > scored[best].0 or
+            (scored[i].0 == scored[best].0 and
+                scored[i].1 > scored[best].1) {
+                best = i
+            }
+            i = i + 1
+        }
+        order.push(scored[best])
+        var rest: [(f64, str)] = []
+        var k = 0
+        while k < scored.len() {
+            if k != best {
+                rest.push(scored[k])
+            }
+            k = k + 1
+        }
+        scored = rest
+    }
+    var out: [str] = []
+    for entry in order {
+        out.push(entry.1)
+    }
+    return out
+}
+
+/// The single best suggestion, or nothing when none is close enough.
+pub fn suggest(word: str, candidates: [str]) -> Option[str] {
+    let best = close_matches(word, candidates, 1, 0.6)
+    if best.len() == 0 {
+        return None
+    }
+    return Some(best[0])
+}

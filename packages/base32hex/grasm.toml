@@ -1,0 +1,6 @@
+[package]
+name = "base32hex"
+version = "1.0.0"
+
+# Pure encoding. Opens nothing.
+capabilities = []

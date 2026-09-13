@@ -1,0 +1,75 @@
+# Getting the package set to 600
+
+The tracker that `docs/packages-to-200.md` was, continued past the point it
+was written for. That document closed at 200 of 200; the count kept moving
+because packages kept being needed, and this picks the count up where it
+left off.
+
+## The rules, unchanged
+
+Every rule in `docs/packages-to-200.md` still applies, and the fifth one is
+the reason this is a list of batches rather than a list of packages:
+
+1. It is something a real program needs.
+2. It compiles, is formatted, and lints clean.
+3. Its types are prefixed — the whole set has to stay at zero collisions.
+4. A demo asserts against it, rather than printing.
+5. Demos are grouped, about six packages to one.
+6. Where a standard exists, it is checked against the standard.
+
+One rule is added, because the count is now large enough for it to matter:
+
+7. **A package that already exists under another name does not get written
+   again.** `difflib.unified_diff` was on the list for this push until
+   `packages/diffview` turned out to have `unified` already. Checking the
+   whole name list before starting a batch costs a minute and has caught
+   seven duplicates so far.
+
+## Where it stands
+
+| | |
+|---|---|
+| At the close of the 200 plan | 513 |
+| Now | 537 |
+| Target | 600 |
+| Remaining | 63 |
+
+The count is directories under `packages/` that are not `*-demo`. Test
+harnesses are directories and are counted; they are real programs that the
+gates run, and several of them are the only consumer a format parser has.
+
+## Batches
+
+### Done
+
+- [x] **Bytes written down** — `structpack` `quotedprintable` `encodings`
+  and the harnesses that check them, each byte-identical to the library
+  that owns the format
+- [x] **Holding something** — five packages about waiting, which is what a
+  poll is for
+- [x] **Decided long ago** — `md5` `uuidnamed` `base32hex` `filemode`
+  `htmlentities` `closematch`. Things nobody would choose today and
+  everybody still has to read: a broken hash, the UUID versions built on
+  it, an alphabet chosen so encodings sort, the ten characters `ls`
+  prints, HTML's 2231 named references, and the suggestion ranking every
+  "did you mean" copies. Checked against `hashlib`, `uuid`, `base64`,
+  `stat`, `html` and `difflib` — 590 cases, three new gates.
+
+### Next
+
+Each line is a batch of about six, chosen so that everything in it has an
+implementation elsewhere to be checked against. A name in brackets is the
+thing it is checked against.
+
+- **Compression** — `gzip` (RFC 1952 over the deflate `zlib` already has),
+  `xzfile` (Python `lzma`), and the pieces they need
+- **Unix identity** — `unixcrypt` (`openssl passwd`), `sshkey`
+  (`ssh-keygen`), `terminfo` (`infocmp`)
+- **Names on the wire** — `idna` (Python `encodings.idna`), `countrycode`
+  (ISO 3166), `csvsniff` (`csv.Sniffer`)
+- **Container formats** — `debfile`, `oggmeta`, `isobmff`
+
+## What this still does not include
+
+The same three: a web framework, an ORM, a game engine. Each is a project
+rather than a package, and the count is not a reason to change that.

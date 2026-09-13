@@ -1,0 +1,16 @@
+[package]
+name = "enctest4"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.base32hex]
+path = "../base32hex"
+version = "^1.0.0"
+
+[dependencies.filemode]
+path = "../filemode"
+version = "^1.0.0"
+
+[dependencies.htmlentities]
+path = "../htmlentities"
+version = "^1.0.0"

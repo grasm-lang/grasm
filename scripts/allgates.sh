@@ -81,6 +81,9 @@ run_gate wsserverdiff  scripts/wsserver_diff.sh
 run_gate respdiff      scripts/resp_diff.sh
 run_gate structdiff     scripts/struct_diff.sh
 run_gate encodingdiff   scripts/encoding_diff.sh
+run_gate md5diff        scripts/md5_diff.sh
+run_gate enc4diff       scripts/enc4_diff.sh
+run_gate closematchdiff scripts/closematch_diff.sh
 run_gate kvcrash       scripts/kvstore_crash.sh
 run_gate zlibdiff      scripts/zlib_diff.sh
 run_gate casefolddiff  scripts/casefold_diff.sh

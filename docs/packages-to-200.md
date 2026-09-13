@@ -64,6 +64,9 @@ asserts against it.
 already existed under another name; `docs/ecosystem-roadmap.md` says which,
 and what took their places.
 
+This document is finished. The count kept moving after it closed, and
+`docs/packages-to-600.md` picks it up from 513.
+
 ### Planned, and what became of it
 
 **Encoding** — `base58` `base85` `cbor` `msgpack` `bencode` `hexdump`

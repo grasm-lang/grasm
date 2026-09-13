@@ -1,0 +1,32 @@
+[package]
+name = "legacy_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.md5]
+path = "../md5"
+version = "^1.0.0"
+
+[dependencies.uuidnamed]
+path = "../uuidnamed"
+version = "^1.0.0"
+
+[dependencies.uuid]
+path = "../uuid"
+version = "^1.0.0"
+
+[dependencies.base32hex]
+path = "../base32hex"
+version = "^1.0.0"
+
+[dependencies.filemode]
+path = "../filemode"
+version = "^1.0.0"
+
+[dependencies.htmlentities]
+path = "../htmlentities"
+version = "^1.0.0"
+
+[dependencies.closematch]
+path = "../closematch"
+version = "^1.0.0"

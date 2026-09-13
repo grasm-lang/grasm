@@ -1,0 +1,43 @@
+import closematch
+
+fn from_hex(text: str) -> str {
+    var out: [i64] = []
+    var i = 1
+    while i + 1 < text.len() {
+        out.push(text.substr(i, 2).parse_int_base(16) ?? 0)
+        i = i + 2
+    }
+    return bytes_of(out).to_str()
+}
+
+fn main() / {io} {
+    var i = 0
+    while i + 2 < args().len() {
+        let what = args()[i]
+        let a = from_hex(args()[i + 1])
+        let b = from_hex(args()[i + 2])
+        if what == "matched" {
+            print(closematch.matched(a.chars(), b.chars()).to_str())
+            i = i + 3
+            continue
+        }
+        if what == "quick" {
+            let m = closematch.quick_ratio(a.chars(), b.chars())
+            print((m * 1000000.0).round().as_i64().to_str())
+            i = i + 3
+            continue
+        }
+        // `close <cutoff-and-count> <word> <candidates, tab separated>`
+        let head = args()[i + 1].split(",")
+        let cutoff = (head[0].parse_int() ?? 60).as_f64() / 100.0
+        let count = head[1].parse_int() ?? 3
+        let word = from_hex(args()[i + 2])
+        var candidates: [str] = []
+        for piece in from_hex(args()[i + 3]).split("\t") {
+            candidates.push(piece)
+        }
+        print(closematch.close_matches(word, candidates, count,
+            cutoff).join(","))
+        i = i + 4
+    }
+}

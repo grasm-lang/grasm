@@ -1,0 +1,18 @@
+[package]
+name = "uuidnamed"
+version = "1.0.0"
+
+# Hashing a name. Opens nothing.
+capabilities = []
+
+[dependencies.uuid]
+path = "../uuid"
+version = "^1.0.0"
+
+[dependencies.sha1]
+path = "../sha1"
+version = "^1.0.0"
+
+[dependencies.md5]
+path = "../md5"
+version = "^1.0.0"

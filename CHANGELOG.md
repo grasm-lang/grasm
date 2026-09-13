@@ -7,6 +7,21 @@ migration note here; anything `experimental` may change in any release. See
 
 ## Unreleased — since 1.0.0
 
+### Added
+
+- **Six packages for things that were decided a long time ago.** `md5`,
+  because a `MD5SUMS` file beside a download cannot be checked without it and
+  version 3 UUIDs name it in their definition; `uuidnamed`, the v3 and v5
+  UUIDs built on MD5 and SHA-1; `base32hex`, RFC 4648's other alphabet, whose
+  whole point is that encodings sort the way the bytes do; `filemode`, the ten
+  characters `ls -l` prints, including the three that replace an execute
+  column rather than adding one; `htmlentities`, all 2231 of HTML's named
+  references, where `htmlparse` knew a dozen; and `closematch`, the
+  `difflib` ratio behind every "did you mean", auto-junk cutoff included.
+  Checked against `hashlib`, `uuid`, `base64`, `stat`, `html` and `difflib`
+  over 590 cases: `md5diff`, `enc4diff` and `closematchdiff` are gates now.
+  `docs/packages-to-600.md` is the tracker from here; the 200 one is closed.
+
 ### Changed
 
 - **Fifty-three clauses promoted from `provisional` to `stable`**, taking the

@@ -1,0 +1,16 @@
+[package]
+name = "md5test"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.md5]
+path = "../md5"
+version = "^1.0.0"
+
+[dependencies.uuidnamed]
+path = "../uuidnamed"
+version = "^1.0.0"
+
+[dependencies.uuid]
+path = "../uuid"
+version = "^1.0.0"

@@ -1,0 +1,6 @@
+[package]
+name = "closematch"
+version = "1.0.0"
+
+# Comparison only. Opens nothing.
+capabilities = []

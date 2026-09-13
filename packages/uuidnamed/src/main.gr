@@ -1,0 +1,117 @@
+// The UUIDs that are not random: the same name always gives the same one.
+//
+//   v5(dns, "example.test")  ->  5c0f9d9f-... every time, on every machine
+//
+// `packages/uuid` makes v4 and v7, which need entropy and are different on
+// every call. Versions 3 and 5 are the other half: a hash of a namespace and
+// a name, so two systems that have never spoken can agree on an identifier
+// for the same thing without coordinating. That is what makes them worth
+// having — a v4 in a distributed system is a value that has to be shipped
+// around, and a v5 is one that can be computed wherever it is needed.
+//
+// ## The namespace is bytes, not text
+//
+// The four standard namespaces are UUIDs themselves, and they go into the
+// hash as their sixteen bytes in network order — not as the text with the
+// dashes. A generator that hashes the printed form produces identifiers
+// that are stable, wrong, and indistinguishable from right until somebody
+// compares with another implementation.
+//
+// ## Version 3 is MD5 and version 5 is SHA-1
+//
+// Both are broken for signatures and neither is used here for one: the
+// point is a deterministic spread, not unforgeability. v5 is the one to
+// choose — not because SHA-1 is sound, but because v3's MD5 is worse and
+// there is no reason to pick it for new work.
+//
+// ## The version and variant bits overwrite the hash
+//
+// Six bits of the digest are replaced: four for the version and two for the
+// variant. An implementation that appends them instead, or that forgets
+// them, produces a UUID that reads as version 0 and fails every validator
+// it meets.
+import uuid
+import sha1
+import md5
+
+/// The namespace for a fully qualified domain name.
+pub fn namespace_dns() -> bytes {
+    return bytes_of([107, 167, 184, 16, 157, 173, 17, 209, 128, 180, 0, 192,
+        79, 212, 48, 200])
+}
+
+/// The namespace for a URL.
+pub fn namespace_url() -> bytes {
+    return bytes_of([107, 167, 184, 17, 157, 173, 17, 209, 128, 180, 0, 192,
+        79, 212, 48, 200])
+}
+
+/// The namespace for an ISO OID.
+pub fn namespace_oid() -> bytes {
+    return bytes_of([107, 167, 184, 18, 157, 173, 17, 209, 128, 180, 0, 192,
+        79, 212, 48, 200])
+}
+
+/// The namespace for an X.500 distinguished name.
+pub fn namespace_x500() -> bytes {
+    return bytes_of([107, 167, 184, 20, 157, 173, 17, 209, 128, 180, 0, 192,
+        79, 212, 48, 200])
+}
+
+fn joined(left: bytes, right: bytes) -> bytes {
+    var out: [i64] = []
+    var i = 0
+    while i < left.len() {
+        out.push(left.at(i))
+        i = i + 1
+    }
+    var j = 0
+    while j < right.len() {
+        out.push(right.at(j))
+        j = j + 1
+    }
+    return bytes_of(out)
+}
+
+fn stamped(digest: bytes, version: i64) -> Uuid {
+    var raw: [i64] = []
+    var i = 0
+    while i < 16 {
+        raw.push(digest.at(i))
+        i = i + 1
+    }
+    // Four bits of byte six are the version, and the top two bits of byte
+    // eight are the variant. Both overwrite what the hash put there.
+    raw[6] = raw[6].bit_and(15).bit_or(version.shl(4))
+    raw[8] = raw[8].bit_and(63).bit_or(128)
+    return uuid.from_bytes(bytes_of(raw), version)
+}
+
+/// Version 5: SHA-1 of the namespace and the name.
+pub fn v5(namespace: bytes, name: str) -> Uuid {
+    return stamped(sha1.hash(joined(namespace, name.to_bytes())), 5)
+}
+
+/// Version 3: MD5 of the namespace and the name.
+///
+/// Here for reading identifiers somebody else made. For new ones use `v5`.
+pub fn v3(namespace: bytes, name: str) -> Uuid {
+    return stamped(md5.hash(joined(namespace, name.to_bytes())), 3)
+}
+
+/// A namespace by its name: `dns`, `url`, `oid` or `x500`.
+pub fn namespace_named(which: str) -> Option[bytes] {
+    if which == "dns" {
+        return Some(namespace_dns())
+    }
+    if which == "url" {
+        return Some(namespace_url())
+    }
+    if which == "oid" {
+        return Some(namespace_oid())
+    }
+    if which == "x500" {
+        return Some(namespace_x500())
+    }
+    return None
+}

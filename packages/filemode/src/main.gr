@@ -1,0 +1,148 @@
+// Unix file modes: the number in the inode, and the ten characters people
+// read it as.
+//
+// A mode is a file type in the top bits and twelve permission bits under it,
+// and every tool that lists, archives or restores files has to move between
+// that number and `drwxr-xr-x`. `tar`, `cpio` and `zip` all store the raw
+// number; `ls`, `find -printf` and every file browser show the string. Code
+// that guesses at the mapping gets the easy bits right and the awkward ones
+// wrong, and the awkward ones are the ones that matter: setuid, setgid and
+// the sticky bit each *replace* an execute character rather than adding a
+// column, and the letter they use says whether execute was also set.
+//
+//   mode 04755 -> `-rwsr-xr-x`   setuid, and the owner can execute
+//   mode 04655 -> `-rwSr-xr-x`   setuid, and the owner cannot
+//
+// Capital letters mean the same bit without the execute bit under it, which
+// is almost always a mistake in the file rather than in the reader.
+//
+// Checked against Python's `stat.filemode`, which is itself checked against
+// the `ls` on the machine it ships on.
+
+/// The twelve permission bits, without the file type.
+pub fn permissions(mode: i64) -> i64 {
+    return mode % 4096
+}
+
+/// The file type bits, which is `mode` with the permissions removed.
+pub fn file_type(mode: i64) -> i64 {
+    return (mode / 4096) % 16 * 4096
+}
+
+fn type_letter(mode: i64) -> str {
+    let kind = (mode / 4096) % 16
+    if kind == 1 {
+        return "p"
+    }
+    if kind == 2 {
+        return "c"
+    }
+    if kind == 4 {
+        return "d"
+    }
+    if kind == 6 {
+        return "b"
+    }
+    if kind == 8 {
+        return "-"
+    }
+    if kind == 10 {
+        return "l"
+    }
+    if kind == 12 {
+        return "s"
+    }
+    if kind == 14 {
+        return "w"
+    }
+    // Solaris doors, and anything a future kernel invents.
+    return "?"
+}
+
+fn bit(mode: i64, n: i64) -> bool {
+    return (mode / (2 ^ n)) % 2 == 1
+}
+
+/// One `rwx` triple, with `special` folded into its execute column.
+///
+/// `execute_bit` is which bit of the mode holds execute for this triple, and
+/// `set` and `unset` are the letters the special bit uses depending on
+/// whether execute is also on.
+fn triple(mode: i64, execute_bit: i64, special: bool, set: str,
+    unset: str) -> str {
+    var out = ""
+    if bit(mode, execute_bit + 2) {
+        out = out + "r"
+    } else {
+        out = out + "-"
+    }
+    if bit(mode, execute_bit + 1) {
+        out = out + "w"
+    } else {
+        out = out + "-"
+    }
+    let executable = bit(mode, execute_bit)
+    if special {
+        if executable {
+            out = out + set
+        } else {
+            out = out + unset
+        }
+    } else if executable {
+        out = out + "x"
+    } else {
+        out = out + "-"
+    }
+    return out
+}
+
+/// The ten-character rendering, as `ls -l` writes it.
+pub fn render(mode: i64) -> str {
+    return type_letter(mode) +
+    triple(mode, 6, bit(mode, 11), "s", "S") +
+    triple(mode, 3, bit(mode, 10), "s", "S") +
+    triple(mode, 0, bit(mode, 9), "t", "T")
+}
+
+/// The permission bits as the four-digit octal people type at `chmod`.
+pub fn octal(mode: i64) -> str {
+    let bits = permissions(mode)
+    var out = ""
+    var place = 3
+    while place >= 0 {
+        let digit = (bits / (8 ^ place)) % 8
+        out = out + digit.to_str()
+        place = place - 1
+    }
+    return out
+}
+
+/// Whether `mode` names a directory, which is the question most callers ask.
+pub fn is_dir(mode: i64) -> bool {
+    return (mode / 4096) % 16 == 4
+}
+
+/// Whether `mode` names a symbolic link, the other question they ask.
+pub fn is_link(mode: i64) -> bool {
+    return (mode / 4096) % 16 == 10
+}
+
+/// Whether `mode` names a plain file.
+pub fn is_regular(mode: i64) -> bool {
+    return (mode / 4096) % 16 == 8
+}
+
+/// The mode with everything `mask` selects cleared, which is what a process
+/// umask does to a file being created.
+pub fn apply_umask(mode: i64, mask: i64) -> i64 {
+    var out = 0
+    var n = 0
+    while n < 12 {
+        let keep = bit(mode, n) and not bit(mask, n)
+        if keep {
+            out = out + 2 ^ n
+        }
+        n = n + 1
+    }
+    return file_type(mode) + out
+}

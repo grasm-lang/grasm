@@ -1,0 +1,204 @@
+// MD5, which is broken, and which you will still have to compute.
+//
+// It has been unsafe for signatures since 2004 and collisions can be made to
+// order, so nothing here should be used to decide whether a file is the file
+// somebody sent. What it is still *required* for is reading things other
+// people wrote:
+//
+//   - a `MD5SUMS` file beside a download, which `packages/checksumfile`
+//     parses and cannot check without this
+//   - version 3 UUIDs, whose definition names MD5 and cannot be changed
+//   - HTTP digest authentication, which is still deployed
+//   - `Content-MD5`, ETags, and a long tail of storage APIs
+//
+// A package that refuses to implement it does not make those safer; it makes
+// them unreadable. The refusal belongs at the call site — pick SHA-256 for
+// anything new — and this says so rather than pretending the algorithm is
+// fine.
+//
+// ## Little-endian, which is the part people get wrong
+//
+// Every other hash in common use writes its length and its words big-endian.
+// MD5 does the opposite: the message length goes in as a little-endian
+// 64-bit count of *bits*, and the digest comes out as four little-endian
+// words. An implementation that follows SHA's convention produces a digest
+// that is exactly right, byte-reversed in groups of four, and wrong.
+
+/// The sixty-four per-round shift amounts, in order.
+fn shifts() -> [i64] {
+    return [7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
+        5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20,
+        4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
+        6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21]
+}
+
+/// The sine-derived constants: `floor(abs(sin(i + 1)) * 2^32)`.
+///
+/// Written out rather than computed, because computing them needs a sine
+/// this language does not promise to round the way the reference did, and a
+/// constant that is one bit out is a hash that is entirely wrong.
+fn constants() -> [i64] {
+    return [3614090360, 3905402710, 606105819, 3250441966, 4118548399,
+        1200080426, 2821735955, 4249261313, 1770035416, 2336552879,
+        4294925233, 2304563134, 1804603682, 4254626195, 2792965006,
+        1236535329, 4129170786, 3225465664, 643717713, 3921069994,
+        3593408605, 38016083, 3634488961, 3889429448, 568446438,
+        3275163606, 4107603335, 1163531501, 2850285829, 4243563512,
+        1735328473, 2368359562, 4294588738, 2272392833, 1839030562,
+        4259657740, 2763975236, 1272893353, 4139469664, 3200236656,
+        681279174, 3936430074, 3572445317, 76029189, 3654602809,
+        3873151461, 530742520, 3299628645, 4096336452, 1126891415,
+        2878612391, 4237533241, 1700485571, 2399980690, 4293915773,
+        2240044497, 1873313359, 4264355552, 2734768916, 1309151649,
+        4149444226, 3174756917, 718787259, 3951481745]
+}
+
+fn mask32(value: i64) -> i64 {
+    return value.bit_and(4294967295)
+}
+
+fn rotate_left(value: i64, by: i64) -> i64 {
+    let v = mask32(value)
+    return mask32(v.shl(by).bit_or(v.ushr(32 - by)))
+}
+
+/// The digest of a message, sixteen bytes.
+pub fn hash(message: bytes) -> bytes {
+    var words: [i64] = [1732584193, 4023233417, 2562383102, 271733878]
+    // The message, a one bit, zeros, and then the bit length — little-endian,
+    // which is where MD5 differs from every hash written after it.
+    var padded: [i64] = []
+    var i = 0
+    while i < message.len() {
+        padded.push(message.at(i))
+        i = i + 1
+    }
+    padded.push(128)
+    while padded.len() % 64 != 56 {
+        padded.push(0)
+    }
+    let bits = message.len() * 8
+    var k = 0
+    while k < 8 {
+        padded.push(bits.ushr(k * 8).bit_and(255))
+        k = k + 1
+    }
+    let shift = shifts()
+    let sine = constants()
+    var at = 0
+    while at < padded.len() {
+        var block: [i64] = []
+        var j = 0
+        while j < 16 {
+            let base = at + j * 4
+            block.push(padded[base] + padded[base + 1] * 256 +
+                padded[base + 2] * 65536 + padded[base + 3] * 16777216)
+            j = j + 1
+        }
+        var a = words[0]
+        var b = words[1]
+        var c = words[2]
+        var d = words[3]
+        var round = 0
+        while round < 64 {
+            var mixed = 0
+            var index = 0
+            if round < 16 {
+                mixed = b.bit_and(c).bit_or(mask32(b.bit_xor(4294967295))
+                        .bit_and(d))
+                index = round
+            } else if round < 32 {
+                mixed = d.bit_and(b).bit_or(mask32(d.bit_xor(4294967295))
+                        .bit_and(c))
+                index = (5 * round + 1) % 16
+            } else if round < 48 {
+                mixed = b.bit_xor(c).bit_xor(d)
+                index = (3 * round + 5) % 16
+            } else {
+                mixed = c.bit_xor(b.bit_or(mask32(d.bit_xor(4294967295))))
+                index = (7 * round) % 16
+            }
+            mixed = mask32(mixed + a + sine[round] + block[index])
+            a = d
+            d = c
+            c = b
+            b = mask32(b + rotate_left(mixed, shift[round]))
+            round = round + 1
+        }
+        words[0] = mask32(words[0] + a)
+        words[1] = mask32(words[1] + b)
+        words[2] = mask32(words[2] + c)
+        words[3] = mask32(words[3] + d)
+        at = at + 64
+    }
+    var out: [i64] = []
+    for word in words {
+        var n = 0
+        while n < 4 {
+            out.push(word.ushr(n * 8).bit_and(255))
+            n = n + 1
+        }
+    }
+    return bytes_of(out)
+}
+
+fn render(raw: bytes) -> str {
+    let digits = "0123456789abcdef"
+    var out = ""
+    var i = 0
+    while i < raw.len() {
+        out = out + digits.substr(raw.at(i) / 16, 1) +
+        digits.substr(raw.at(i) % 16, 1)
+        i = i + 1
+    }
+    return out
+}
+
+/// The digest as lower-case hexadecimal, which is how it is always written.
+pub fn hex(message: bytes) -> str {
+    return render(hash(message))
+}
+
+/// HMAC-MD5, which HTTP digest authentication and some older APIs still ask
+/// for.
+pub fn hmac(key: bytes, message: bytes) -> bytes {
+    var block: [i64] = []
+    var shortened = key
+    if key.len() > 64 {
+        shortened = hash(key)
+    }
+    var i = 0
+    while i < 64 {
+        if i < shortened.len() {
+            block.push(shortened.at(i))
+        } else {
+            block.push(0)
+        }
+        i = i + 1
+    }
+    var inner: [i64] = []
+    var outer: [i64] = []
+    var j = 0
+    while j < 64 {
+        inner.push(block[j].bit_xor(54))
+        outer.push(block[j].bit_xor(92))
+        j = j + 1
+    }
+    var k = 0
+    while k < message.len() {
+        inner.push(message.at(k))
+        k = k + 1
+    }
+    let first = hash(bytes_of(inner))
+    var m = 0
+    while m < first.len() {
+        outer.push(first.at(m))
+        m = m + 1
+    }
+    return hash(bytes_of(outer))
+}
+
+/// HMAC-MD5 as lower-case hexadecimal.
+pub fn hmac_hex(key: bytes, message: bytes) -> str {
+    return render(hmac(key, message))
+}

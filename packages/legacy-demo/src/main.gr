@@ -1,0 +1,171 @@
+// Six packages for things that were decided a long time ago and cannot be
+// redecided: a broken hash you still have to compute, the UUID versions
+// built on it, an alphabet chosen so encodings sort, the ten characters
+// `ls` prints, HTML's 2231 named references, and the suggestion ranking
+// every "did you mean" copies.
+import md5
+import uuidnamed
+import uuid
+import base32hex
+import filemode
+import htmlentities
+import closematch
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn check_md5(inout f: i64) / {io} {
+    // RFC 1321's own vectors, appendix A.5.
+    say(f, "the empty message hashes to d41d8...427e",
+        md5.hex("".to_bytes()) == "d41d8cd98f00b204e9800998ecf8427e")
+    say(f, "\"abc\" hashes to 90015...7f72",
+        md5.hex("abc".to_bytes()) == "900150983cd24fb0d6963f7d28e17f72")
+    say(f, "and the 80-byte vector hashes to 57edf...b67a",
+        md5.hex(("1234567890123456789012345678901234567890" +
+            "1234567890123456789012345678901234567890").to_bytes()) ==
+        "57edf4a22be3c955ac49da2e2107b67a")
+    // RFC 2202's first HMAC-MD5 vector: sixteen 0x0b bytes over "Hi There".
+    var key: [i64] = []
+    var i = 0
+    while i < 16 {
+        key.push(11)
+        i = i + 1
+    }
+    say(f, "RFC 2202's first HMAC-MD5 vector holds",
+        md5.hmac_hex(bytes_of(key), "Hi There".to_bytes()) ==
+        "9294727a3638bb1c13f48ef8158bfc9d")
+    say(f, "a digest is sixteen bytes", md5.hash("x".to_bytes()).len() == 16)
+}
+
+fn check_uuidnamed(inout f: i64) / {io} {
+    let dns = uuidnamed.namespace_dns()
+    let five = uuidnamed.v5(dns, "www.example.com")
+    say(f, "v5 of www.example.com in the DNS namespace is 2ed6657d...",
+        uuid.format(five) == "2ed6657d-e927-568b-95e1-2665a8aea6a2")
+    say(f, "and it says it is version 5", uuid.version(five) == 5)
+    let three = uuidnamed.v3(dns, "www.example.com")
+    say(f, "v3 of the same name is 5df41881...",
+        uuid.format(three) == "5df41881-3aed-3515-88a7-2f4a814cf09e")
+    say(f, "and it says it is version 3", uuid.version(three) == 3)
+    say(f, "the same name in a different namespace is a different uuid",
+        not uuid.equal(five, uuidnamed.v5(uuidnamed.namespace_url(),
+            "www.example.com")))
+    say(f, "naming a namespace that does not exist gives nothing",
+        uuidnamed.namespace_named("nope") == None)
+}
+
+fn check_base32hex(inout f: i64) / {io} {
+    // RFC 4648 section 10 gives the same inputs for every base32 variant.
+    say(f, "\"f\" encodes to CO======",
+        base32hex.encode("f".to_bytes()) == "CO======")
+    say(f, "\"foobar\" encodes to CPNMUOJ1E8======",
+        base32hex.encode("foobar".to_bytes()) == "CPNMUOJ1E8======")
+    say(f, "and decoding it gives the bytes back",
+        (base32hex.decode("CPNMUOJ1E8======") ?? "".to_bytes()).to_str() ==
+        "foobar")
+    // The point of the alphabet: encodings sort the way the bytes do.
+    let low = base32hex.encode_unpadded(bytes_of([0, 0, 0, 0, 1]))
+    let high = base32hex.encode_unpadded(bytes_of([0, 0, 0, 0, 2]))
+    say(f, "a larger value encodes to a larger string", low < high)
+    say(f, "a length that is not a multiple of eight is refused",
+        (base32hex.decode("ABC") ?? "x".to_bytes()).to_str() == "x")
+    say(f, "so is a character outside the alphabet",
+        (base32hex.decode("0000000W") ?? "x".to_bytes()).to_str() == "x")
+    // `V` is the last letter of this alphabet, where base32 stops at `7`.
+    say(f, "but V is in it",
+        (base32hex.decode("0000000V") ?? "".to_bytes()).at(4) == 31)
+}
+
+fn check_filemode(inout f: i64) / {io} {
+    say(f, "0100644 is -rw-r--r--", filemode.render(33188) == "-rw-r--r--")
+    say(f, "040755 is drwxr-xr-x", filemode.render(16877) == "drwxr-xr-x")
+    say(f, "0120777 is lrwxrwxrwx", filemode.render(41471) == "lrwxrwxrwx")
+    // The awkward ones: setuid replaces a column, and its letter says
+    // whether execute was set underneath.
+    say(f, "0104755 is -rwsr-xr-x",
+        filemode.render(35309) == "-rwsr-xr-x")
+    say(f, "0104655 is -rwSr-xr-x",
+        filemode.render(35245) == "-rwSr-xr-x")
+    say(f, "0102755 is -rwxr-sr-x",
+        filemode.render(34285) == "-rwxr-sr-x")
+    say(f, "0101777 is -rwxrwxrwt",
+        filemode.render(33791) == "-rwxrwxrwt")
+    // No type bits at all is not a file anyone has; `ls` prints `?`.
+    say(f, "a mode with no type bits renders as ?",
+        filemode.render(2541) == "?rwsr-xr-x")
+    say(f, "a directory says so", filemode.is_dir(16877))
+    say(f, "and a symlink is not a plain file",
+        filemode.is_link(41471) and not filemode.is_regular(41471))
+    say(f, "a umask of 022 takes the group and other write bits off",
+        filemode.octal(filemode.apply_umask(33206, 18)) == "0644")
+}
+
+fn check_htmlentities(inout f: i64) / {io} {
+    say(f, "there are 2231 named references",
+        htmlentities.name_count() == 2231)
+    say(f, "&amp; is an ampersand",
+        htmlentities.unescape("&amp;") == "&")
+    // A name without its semicolon still resolves, and what follows is text.
+    say(f, "&ampx is an ampersand and an x",
+        htmlentities.unescape("&ampx") == "&x")
+    say(f, "&notit; is a not sign followed by \"it;\"",
+        htmlentities.unescape("&notit;") == "\u{ac}it;")
+    say(f, "and &notin; is the whole name, not the short one",
+        htmlentities.unescape("&notin;") == "\u{2209}")
+    say(f, "&NotEqualTilde; is two characters",
+        htmlentities.unescape("&NotEqualTilde;").chars().len() == 2)
+    say(f, "&#147; is a left double quote, not a control character",
+        htmlentities.unescape("&#147;") == "\u{201c}")
+    say(f, "a surrogate is replaced",
+        htmlentities.unescape("&#xD800;") == "\u{fffd}")
+    say(f, "and a bare & is left alone",
+        htmlentities.unescape("a & b") == "a & b")
+}
+
+fn check_closematch(inout f: i64) / {io} {
+    let git = ["commit", "checkout", "branch", "clone", "push", "pull",
+        "status"]
+    say(f, "chekout suggests checkout",
+        closematch.suggest("chekout", git) == Some("checkout"))
+    say(f, "improt suggests import",
+        closematch.suggest("improt", ["import", "export", "report"]) ==
+        Some("import"))
+    say(f, "nothing close enough suggests nothing",
+        closematch.suggest("zzzzzz", git) == None)
+    say(f, "identical sequences match completely",
+        closematch.text_ratio("abc", "abc") == 1.0)
+    say(f, "disjoint ones match not at all",
+        closematch.text_ratio("abc", "xyz") == 0.0)
+    say(f, "two empty sequences are called identical",
+        closematch.text_ratio("", "") == 1.0)
+    // The ratio is not symmetric, which is why the order of the arguments
+    // is part of the interface rather than a detail.
+    say(f, "the matched count never exceeds the shorter sequence",
+        closematch.matched("abcd".chars(), "bcdef".chars()) <= 4)
+    say(f, "a tighter cutoff returns fewer suggestions",
+        closematch.close_matches("stat", git, 5, 0.9).len() <=
+        closematch.close_matches("stat", git, 5, 0.3).len())
+}
+
+fn main() / {io} {
+    var f = 0
+
+    check_md5(f)
+    check_uuidnamed(f)
+    check_base32hex(f)
+    check_filemode(f)
+    check_htmlentities(f)
+    check_closematch(f)
+
+    if f == 0 {
+        print("legacy: every claim held")
+    } else {
+        print("legacy: {f} failed")
+    }
+}
