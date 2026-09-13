@@ -1,0 +1,8 @@
+[package]
+name = "wstest"
+version = "0.1.0"
+capabilities = ["io", "net"]
+
+[dependencies.wsserver]
+path = "../wsserver"
+version = "^1.0.0"

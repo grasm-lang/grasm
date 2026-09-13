@@ -1,0 +1,44 @@
+import wsserver
+
+/// Echoes every message back, and says what it saw.
+///
+/// The run ends when nothing has happened for two passes rather than after a
+/// fixed number of messages: a client's closing ping arrives after its last
+/// message, and a server that stopped counting at the last message would
+/// reset the socket underneath it.
+fn main() / {io, net} {
+    match wsserver.listen(0) {
+        Ok(started) -> {
+            var server = started
+            print("port {wsserver.port_of(server)}")
+            var opened = 0
+            var messages = 0
+            var closed = 0
+            var idle = 0
+            while idle < 2 {
+                let events = wsserver.step(server, 2000)
+                if events.is_empty() {
+                    idle = idle + 1
+                } else {
+                    idle = 0
+                }
+                for event in events {
+                    if event.kind == "open" {
+                        opened = opened + 1
+                    } else if event.kind == "text" {
+                        messages = messages + 1
+                        wsserver.send_text(event.handle, "echo:" + event.text)
+                    } else if event.kind == "binary" {
+                        messages = messages + 1
+                        wsserver.send_binary(event.handle, event.payload)
+                    } else if event.kind == "close" {
+                        closed = closed + 1
+                    }
+                }
+            }
+            print("opened {opened} messages {messages} closed {closed}")
+            wsserver.shutdown(server)
+        }
+        Err(why) -> print("listen failed: {why}")
+    }
+}

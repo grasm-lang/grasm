@@ -1,0 +1,12 @@
+[package]
+name = "wsserver_demo"
+version = "1.0.0"
+capabilities = ["io", "net"]
+
+[dependencies.wsserver]
+path = "../wsserver"
+version = "^1.0.0"
+
+[dependencies.websocket]
+path = "../websocket"
+version = "^1.0.0"

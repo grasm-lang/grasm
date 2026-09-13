@@ -1,0 +1,14 @@
+[package]
+name = "wsserver"
+version = "1.0.0"
+
+# Holds sockets open and reads them. Nothing else.
+capabilities = ["net"]
+
+[dependencies.http]
+path = "../http"
+version = "^1.0.0"
+
+[dependencies.websocket]
+path = "../websocket"
+version = "^1.0.0"

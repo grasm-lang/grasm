@@ -1,0 +1,120 @@
+// Where a frame ends, and where the handshake's answer comes from.
+//
+// The socket half of `wsserver` is judged by `scripts/wsserver_diff.sh`,
+// which stands forty clients in front of it at once. This is the half that
+// can be asserted without opening anything: the rule that decides whether a
+// buffer holds a whole frame yet, which is what stands between a server and
+// rejecting perfectly good traffic because it arrived in two pieces.
+import wsserver
+import websocket
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+/// A client frame: masked, with the length written the way its size demands.
+fn client_frame(opcode: i64, payload_size: i64) -> bytes {
+    var out: [i64] = [128 + opcode]
+    if payload_size < 126 {
+        out.push(128 + payload_size)
+    } else if payload_size < 65536 {
+        out.push(128 + 126)
+        out.push(payload_size / 256)
+        out.push(payload_size % 256)
+    } else {
+        out.push(128 + 127)
+        var shift = 7
+        while shift >= 0 {
+            var left = payload_size
+            var i = 0
+            while i < shift {
+                left = left / 256
+                i = i + 1
+            }
+            out.push(left % 256)
+            shift = shift - 1
+        }
+    }
+    // The mask, then the payload it would cover.
+    for m in [1, 2, 3, 4] {
+        out.push(m)
+    }
+    var n = 0
+    while n < payload_size {
+        out.push(65)
+        n = n + 1
+    }
+    return bytes_of(out)
+}
+
+fn check_lengths(inout f: i64) / {io} {
+    print("-- wsserver: a read is not a message")
+    let small = client_frame(1, 5)
+    say(f, "a short frame is whole at header plus mask plus payload",
+        wsserver.complete_frame_at(small) == 11 and small.len() == 11)
+    var cut: [i64] = []
+    var i = 0
+    while i < 9 {
+        cut.push(small.at(i))
+        i = i + 1
+    }
+    say(f, "the same frame one byte short is not whole yet",
+        wsserver.complete_frame_at(bytes_of(cut)) == 0 - 1)
+    say(f, "two bytes is never enough to know, but it is enough to ask",
+        wsserver.complete_frame_at(bytes_of([129, 133])) == 0 - 1 and
+        wsserver.complete_frame_at(bytes_of([129])) == 0 - 1)
+    let medium = client_frame(1, 200)
+    say(f, "a two-byte length is read as two bytes, not as 126",
+        wsserver.complete_frame_at(medium) == 208 and medium.len() == 208)
+    let large = client_frame(2, 70000)
+    say(f, "an eight-byte length is read as eight",
+        wsserver.complete_frame_at(large) == 70014 and
+        large.len() == 70014)
+    var two: [i64] = []
+    for b in small.to_list() {
+        two.push(b)
+    }
+    for b in medium.to_list() {
+        two.push(b)
+    }
+    say(f, "a buffer holding two frames reports the first one's length",
+        wsserver.complete_frame_at(bytes_of(two)) == 11)
+}
+
+fn check_handshake(inout f: i64) / {io} {
+    print("-- wsserver: the answer the handshake owes")
+    // RFC 6455 section 1.3 works this exact pair out by hand.
+    say(f, "the accept token is the one the standard works out itself",
+        websocket.accept_for("dGhlIHNhbXBsZSBub25jZQ==") ==
+        "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=")
+    // Length-counting and mask-refusing are two jobs: the first has to
+    // measure an unmasked frame correctly in order for the second to be
+    // reached at all.
+    let unmasked = bytes_of([129, 5, 65, 65, 65, 65, 65])
+    say(f, "an unmasked frame is measured without a mask's four bytes",
+        wsserver.complete_frame_at(unmasked) == 7)
+    say(f, "and the decoder is what refuses it, because a server must",
+        websocket.decode(unmasked, true) ?? no_frame() == no_frame() and
+        websocket.decode(unmasked, false) ?? no_frame() != no_frame())
+}
+
+fn no_frame() -> (Frame, i64) {
+    return (Frame{ final: false, opcode: Continuation,
+        payload: bytes_of([]), masked: false, mask: bytes_of([]) }, 0 - 1)
+}
+
+fn main() / {io, net} {
+    var f = 0
+    check_lengths(f)
+    check_handshake(f)
+    if f == 0 {
+        print("wsserver: every claim held")
+    } else {
+        print("wsserver: {f} claims failed")
+    }
+}

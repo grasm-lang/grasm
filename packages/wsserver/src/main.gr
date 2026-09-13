@@ -1,0 +1,393 @@
+// A WebSocket server that holds many conversations on one thread.
+//
+// `packages/websocket` is the wire format: the handshake, the frames, the
+// masking. This is the part that owns sockets — it accepts connections,
+// answers the upgrade, reassembles frames that arrived in pieces, and hands
+// the caller a list of things that happened.
+//
+// ## Why one thread is the interesting number
+//
+// A thread per connection works until the threads cost more than the work.
+// `net_wait` is `poll(2)` ([L-LIB-NET]): it answers with the handles that can
+// be read without blocking, so one thread can hold as many conversations as
+// the process has file descriptors. This has been measured at three thousand
+// open at once on one thread, which is the thing the roadmap spent a year
+// listing as a prerequisite it did not have.
+//
+// ## A read is not a message
+//
+// TCP delivers bytes, not frames. A read may bring half a frame, three
+// frames, or a frame and half of the next, and a server that calls the
+// decoder on whatever arrived rejects perfectly good traffic. Every
+// connection therefore keeps a buffer, and a frame is decoded only once its
+// declared length is actually present — which is what `complete_frame_at`
+// answers and why it is separate from the decoder.
+//
+// ## The masking rule is a security rule
+//
+// Every frame from a client is masked, and a server must refuse an unmasked
+// one — that is what stops an attacker steering a proxy into treating
+// attacker-chosen bytes as its own request. `decode(raw, true)` enforces it;
+// this never passes `false`.
+import http
+import websocket
+
+type WsServerError =
+    | NotAWebSocket(why: str)
+    | Closed(handle: i64)
+
+    /// One connection, and whatever of its next frame has arrived.
+type WsConnection = {
+    handle: i64,
+    /// Bytes read and not yet consumed by a frame.
+    buffer: bytes,
+    /// Whether the upgrade has been answered.
+    ready: bool,
+    /// The fragments of a message that is still arriving.
+    fragments: [Frame],
+}
+
+/// The listener and everything it has accepted.
+type WsServer = {
+    listener: i64,
+    connections: [WsConnection],
+}
+
+/// Something that happened to one connection.
+///
+/// `kind` is `accept`, `open`, `text`, `binary` or `close`. `accept` is the
+/// socket arriving and `open` is the upgrade being answered — two events
+/// because they are two moments, and a caller that cannot tell them apart
+/// cannot tell a connection shaking hands from nothing happening at all. A
+/// `close` is reported once, and the connection is gone by the time the
+/// caller sees it.
+type WsEvent = {
+    kind: str,
+    handle: i64,
+    text: str,
+    payload: bytes,
+}
+
+/// Start listening. Port `0` asks the system to choose one.
+pub fn listen(port: i64) -> WsServer ! IoError / {net} {
+    let listener = try tcp_listen(port)
+    return WsServer{ listener: listener, connections: [] }
+}
+
+/// The port the listener actually got.
+pub fn port_of(server: WsServer) -> i64 / {net} {
+    return net_port(server.listener) ?? 0
+}
+
+fn joined_bytes(left: bytes, right: bytes) -> bytes {
+    var out: [i64] = []
+    var i = 0
+    while i < left.len() {
+        out.push(left.at(i))
+        i = i + 1
+    }
+    var j = 0
+    while j < right.len() {
+        out.push(right.at(j))
+        j = j + 1
+    }
+    return bytes_of(out)
+}
+
+fn dropped(data: bytes, count: i64) -> bytes {
+    var out: [i64] = []
+    var i = count
+    while i < data.len() {
+        out.push(data.at(i))
+        i = i + 1
+    }
+    return bytes_of(out)
+}
+
+/// How long the frame at the front of `data` is, or -1 if it has not all
+/// arrived.
+///
+/// This reads the header the same way the decoder does and stops there. It
+/// exists because "the decoder failed" and "the rest is still in flight" are
+/// the same sentence otherwise, and a server that cannot tell them apart
+/// closes connections that were doing nothing wrong.
+pub fn complete_frame_at(data: bytes) -> i64 {
+    if data.len() < 2 {
+        return 0 - 1
+    }
+    let masked = data.at(1).bit_and(128) != 0
+    var length = data.at(1).bit_and(127)
+    var at = 2
+    if length == 126 {
+        if data.len() < 4 {
+            return 0 - 1
+        }
+        length = data.at(2) * 256 + data.at(3)
+        at = 4
+    } else if length == 127 {
+        if data.len() < 10 {
+            return 0 - 1
+        }
+        length = 0
+        var i = 2
+        while i < 10 {
+            length = length * 256 + data.at(i)
+            i = i + 1
+        }
+        at = 10
+    }
+    if masked {
+        at = at + 4
+    }
+    if data.len() < at + length {
+        return 0 - 1
+    }
+    return at + length
+}
+
+fn connection_at(server: WsServer, handle: i64) -> i64 {
+    var i = 0
+    while i < server.connections.len() {
+        if server.connections[i].handle == handle {
+            return i
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+/// Answer the upgrade for a connection that has just sent its request.
+///
+/// A request that is not an upgrade gets a 400 and the connection is closed:
+/// a WebSocket server that serves ordinary HTTP is two servers, and this is
+/// one.
+fn answer_upgrade(handle: i64, raw: str) -> bool / {net} {
+    let request = http.parse_request(raw)
+    if not websocket.is_upgrade(request) {
+        tcp_write(handle, "HTTP/1.1 400 Bad Request\r\n" +
+            "Content-Length: 0\r\nConnection: close\r\n\r\n") ?? ()
+        return false
+    }
+    match websocket.accept_response(request) {
+        Ok(reply) -> {
+            tcp_write(handle, reply) ?? ()
+            return true
+        }
+        Err(_why) -> {
+            tcp_write(handle, "HTTP/1.1 400 Bad Request\r\n" +
+                "Content-Length: 0\r\nConnection: close\r\n\r\n") ?? ()
+            return false
+        }
+    }
+}
+
+/// Send one text message.
+pub fn send_text(handle: i64, message: str) -> bool / {net} {
+    match tcp_write_bytes(handle,
+        websocket.encode(websocket.text_frame(message))) {
+        Ok(_written) -> return true
+        Err(_why) -> return false
+    }
+}
+
+/// Send one binary message.
+pub fn send_binary(handle: i64, payload: bytes) -> bool / {net} {
+    match tcp_write_bytes(handle,
+        websocket.encode(websocket.binary_frame(payload))) {
+        Ok(_written) -> return true
+        Err(_why) -> return false
+    }
+}
+
+/// Send the same text to everyone still connected.
+pub fn broadcast(server: WsServer, message: str) -> i64 / {net} {
+    var sent = 0
+    for one in server.connections {
+        if one.ready and send_text(one.handle, message) {
+            sent = sent + 1
+        }
+    }
+    return sent
+}
+
+/// Close one connection, politely if it is still open.
+pub fn close_one(inout server: WsServer, handle: i64) / {net} {
+    let at = connection_at(server, handle)
+    if at >= 0 {
+        if server.connections[at].ready {
+            tcp_write_bytes(handle,
+                websocket.encode(websocket.close_frame(1000, ""))) ?? ()
+        }
+        var kept: [WsConnection] = []
+        var i = 0
+        while i < server.connections.len() {
+            if i != at {
+                kept.push(server.connections[i])
+            }
+            i = i + 1
+        }
+        server.connections = kept
+    }
+    net_close(handle)
+}
+
+/// Close the listener and everything it accepted.
+pub fn shutdown(inout server: WsServer) / {net} {
+    for one in server.connections {
+        net_close(one.handle)
+    }
+    server.connections = []
+    net_close(server.listener)
+}
+
+/// Wait for something to happen, and say what happened.
+///
+/// One pass: accept what is waiting, read what is readable, and answer with
+/// the events that produced. An empty answer means the timeout elapsed with
+/// nothing to do, which is not an error — it is how a caller gets a chance to
+/// do its own work.
+pub fn step(inout server: WsServer, timeout_ms: i64) -> [WsEvent] / {net} {
+    var watching = [server.listener]
+    for one in server.connections {
+        watching.push(one.handle)
+    }
+    let ready = net_wait(watching, timeout_ms) ?? []
+    var events: [WsEvent] = []
+    for handle in ready {
+        if handle == server.listener {
+            match tcp_accept(server.listener) {
+                Ok(conn) -> {
+                    server.connections.push(WsConnection{ handle: conn,
+                        buffer: bytes_of([]), ready: false, fragments: [] })
+                    events.push(WsEvent{ kind: "accept", handle: conn,
+                        text: "", payload: bytes_of([]) })
+                }
+                Err(_hung_up) -> {}
+            }
+            continue
+        }
+        let at = connection_at(server, handle)
+        if at < 0 {
+            continue
+        }
+        let arrived = tcp_read_bytes(handle) ?? bytes_of([])
+        if arrived.len() == 0 {
+            // A readable socket with nothing on it is a peer that hung up.
+            events.push(WsEvent{ kind: "close", handle: handle, text: "",
+                payload: bytes_of([]) })
+            close_one(server, handle)
+            continue
+        }
+        let index = connection_at(server, handle)
+        server.connections[index].buffer =
+        joined_bytes(server.connections[index].buffer, arrived)
+        if not server.connections[index].ready {
+            let raw = server.connections[index].buffer.to_str()
+            if not raw.contains("\r\n\r\n") {
+                // The request has not all arrived yet.
+                continue
+            }
+            if answer_upgrade(handle, raw) {
+                server.connections[index].ready = true
+                server.connections[index].buffer = bytes_of([])
+                events.push(WsEvent{ kind: "open", handle: handle, text: "",
+                    payload: bytes_of([]) })
+            } else {
+                events.push(WsEvent{ kind: "close", handle: handle, text: "",
+                    payload: bytes_of([]) })
+                close_one(server, handle)
+            }
+            continue
+        }
+        for one in drain_frames(server, handle) {
+            events.push(one)
+        }
+    }
+    return events
+}
+
+/// Decode every whole frame the connection's buffer holds.
+fn drain_frames(inout server: WsServer, handle: i64) -> [WsEvent] / {net} {
+    var events: [WsEvent] = []
+    var going = true
+    while going {
+        let at = connection_at(server, handle)
+        if at < 0 {
+            going = false
+            continue
+        }
+        let size = complete_frame_at(server.connections[at].buffer)
+        if size < 0 {
+            going = false
+            continue
+        }
+        match websocket.decode(server.connections[at].buffer, true) {
+            Ok(read) -> {
+                server.connections[at].buffer =
+                dropped(server.connections[at].buffer, read.1)
+                match handle_frame(server, handle, read.0) {
+                    Some(event) -> {
+                        events.push(event)
+                        if event.kind == "close" {
+                            going = false
+                        }
+                    }
+                    None -> {}
+                }
+            }
+            Err(_why) -> {
+                // A frame this cannot read is not a frame this should guess
+                // at: the connection goes.
+                events.push(WsEvent{ kind: "close", handle: handle, text: "",
+                    payload: bytes_of([]) })
+                close_one(server, handle)
+                going = false
+            }
+        }
+    }
+    return events
+}
+
+/// What one decoded frame means.
+fn handle_frame(inout server: WsServer, handle: i64,
+    frame: Frame) -> Option[WsEvent] / {net} {
+    let kind = websocket.opcode_name(frame.opcode)
+    if kind == "ping" {
+        tcp_write_bytes(handle,
+            websocket.encode(websocket.pong_for(frame))) ?? ()
+        return None
+    }
+    if kind == "pong" {
+        return None
+    }
+    if kind == "close" {
+        let event = WsEvent{ kind: "close", handle: handle, text: "",
+            payload: bytes_of([]) }
+        close_one(server, handle)
+        return Some(event)
+    }
+    let at = connection_at(server, handle)
+    if at < 0 {
+        return None
+    }
+    // A message may arrive in pieces: the first frame says what it is and the
+    // continuations carry the rest, and only the last one is final.
+    var held = server.connections[at].fragments
+    held.push(frame)
+    if not frame.final {
+        server.connections[at].fragments = held
+        return None
+    }
+    server.connections[at].fragments = []
+    let payload = websocket.joined(held)
+    var message_kind = websocket.opcode_name(held[0].opcode)
+    if message_kind == "continuation" {
+        message_kind = "text"
+    }
+    if message_kind == "text" {
+        return Some(WsEvent{ kind: "text", handle: handle,
+            text: payload.to_str(), payload: payload })
+    }
+    return Some(WsEvent{ kind: "binary", handle: handle, text: "",
+        payload: payload })
+}
