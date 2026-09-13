@@ -366,13 +366,18 @@ could not — a digest named `"sha256"` where the `rsa` package spells it
 `"SHA256"`, which is a silent verification failure, and an ECDSA signature
 handed to the curve code as bytes where it wanted limbs.
 
-### ~~Needs P2 — async I/O.~~ **Unblocked.** About 40.
+### ~~Needs P2 — async I/O.~~ **Unblocked, and the first one is written.**
 
 Kafka, RabbitMQ, MQTT, task queues, event loops, connection pools, WebSocket
 servers at scale. These wanted a readiness primitive and there is one: see the
 measurement under P2 above, where one thread held three thousand connections
 open and answered all of them. They are ordinary package work now, not work
 behind a prerequisite.
+
+`wsserver` is the first of them and the proof of it: a WebSocket server on one
+thread, checked by `scripts/wsserver_diff.sh` with forty clients in front of
+it at once, and during development by Python's `websockets` package at 250
+clients and 1,750 messages with every round trip agreeing.
 
 ### Needs P3 — a decision. About 90.
 
