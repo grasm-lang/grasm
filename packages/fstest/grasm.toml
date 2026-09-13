@@ -1,0 +1,8 @@
+[package]
+name = "fstest"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.formatspec]
+path = "../formatspec"
+version = "^1.0.0"

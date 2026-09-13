@@ -1,0 +1,374 @@
+// Python's format specification, the part after the colon in `{n:>8,d}`.
+//
+// Every templating layer eventually needs this. `packages/template` can
+// substitute a value into a string and `packages/numfmt` can group digits,
+// and between them sits the thing people actually write: a compact spec
+// saying how wide, which way aligned, padded with what, in which base, with
+// which separator. It is not a big grammar and it is a precisely defined
+// one, which makes "close enough" a bad answer — a report whose columns are
+// one character narrower than another tool's is a report that does not line
+// up.
+//
+// The grammar, in order, all parts optional:
+//
+//     [[fill]align][sign][#][0][width][grouping][.precision][type]
+//
+// The two details that catch people out:
+//
+//   - **Fill is only recognised when an alignment follows it.** In `{:*<8}`
+//     the fill is `*`; in `{:*8}` there is no alignment, so `*` is read as
+//     the start of the width and the whole spec is invalid. The parser has
+//     to look two characters ahead.
+//   - **A leading `0` is not a width digit.** `{:08}` means "pad with zeros,
+//     aligned after the sign", which is `{:0=8}` — so `-42` becomes
+//     `-0000042` and not `000000-42`. Treating the zero as part of the width
+//     gives 8, which is the same number and the wrong padding.
+//
+// Numbers and strings only. Floats are not handled: Python's float
+// formatting is correctly-rounded decimal conversion, which is a separate
+// and much larger piece of work, and claiming it without doing it would be
+// worse than leaving it out. `format_int` and `format_str` say in their
+// names what they take.
+//
+// Checked against Python's `format()`.
+
+type SpecError =
+    | SpecInvalid(spec: str)
+    | SpecUnknownType(kind: str)
+    | SpecNotAllowed(why: str)
+
+    /// A parsed specification.
+type FormatSpec = {
+    fill: str,
+    /// `<`, `>`, `^`, `=`, or empty for the type's default.
+    align: str,
+    /// `+`, `-`, ` `, or empty.
+    sign: str,
+    /// The `#` that puts `0b`, `0o` or `0x` in front.
+    alternate: bool,
+    /// A bare leading `0`. For a number that means `0=`; for a string it
+    /// means the fill is `0` and the alignment is still the default, which
+    /// is why it cannot be stored as an alignment.
+    zero: bool,
+    /// `,` or `_`, or empty.
+    grouping: str,
+    width: i64,
+    /// -1 for "not given".
+    precision: i64,
+    kind: str,
+}
+
+fn is_digit(c: str) -> bool {
+    return c >= "0" and c <= "9"
+}
+
+fn is_align(c: str) -> bool {
+    return c == "<" or c == ">" or c == "^" or c == "="
+}
+
+/// The specification `text` describes.
+pub fn parse(text: str) -> FormatSpec ! SpecError {
+    var spec = FormatSpec{
+        fill: " ",
+        align: "",
+        sign: "",
+        alternate: false,
+        zero: false,
+        grouping: "",
+        width: 0,
+        precision: 0 - 1,
+        kind: "",
+    }
+    var i = 0
+    // Fill is whatever precedes an alignment, and is only a fill because an
+    // alignment follows it.
+    if text.len() >= 2 and is_align(text.substr(1, 1)) {
+        spec.fill = text.substr(0, 1)
+        spec.align = text.substr(1, 1)
+        i = 2
+    } else if text.len() >= 1 and is_align(text.substr(0, 1)) {
+        spec.align = text.substr(0, 1)
+        i = 1
+    }
+    if i < text.len() {
+        let c = text.substr(i, 1)
+        if c == "+" or c == "-" or c == " " {
+            spec.sign = c
+            i = i + 1
+        }
+    }
+    if i < text.len() and text.substr(i, 1) == "#" {
+        spec.alternate = true
+        i = i + 1
+    }
+    if i < text.len() and text.substr(i, 1) == "0" {
+        // Not a width digit. For a number this is `0=` written shorter; for
+        // a string it is only a fill, and `0=` spelled out is refused.
+        if spec.align == "" {
+            spec.fill = "0"
+            spec.zero = true
+        }
+        i = i + 1
+    }
+    var digits = ""
+    while i < text.len() and is_digit(text.substr(i, 1)) {
+        digits = digits + text.substr(i, 1)
+        i = i + 1
+    }
+    if digits.len() > 0 {
+        spec.width = digits.parse_int() ?? 0
+    }
+    if i < text.len() {
+        let c = text.substr(i, 1)
+        if c == "," or c == "_" {
+            spec.grouping = c
+            i = i + 1
+        }
+    }
+    if i < text.len() and text.substr(i, 1) == "." {
+        i = i + 1
+        var places = ""
+        while i < text.len() and is_digit(text.substr(i, 1)) {
+            places = places + text.substr(i, 1)
+            i = i + 1
+        }
+        if places.len() == 0 {
+            fail(SpecInvalid(text))
+        }
+        spec.precision = places.parse_int() ?? 0
+    }
+    if i < text.len() {
+        spec.kind = text.substr(i, 1)
+        i = i + 1
+    }
+    if i != text.len() {
+        fail(SpecInvalid(text))
+    }
+    return spec
+}
+
+fn digits_for(kind: str) -> str {
+    if kind == "X" {
+        return "0123456789ABCDEF"
+    }
+    return "0123456789abcdef"
+}
+
+fn base_for(kind: str) -> i64 {
+    if kind == "b" {
+        return 2
+    }
+    if kind == "o" {
+        return 8
+    }
+    if kind == "x" or kind == "X" {
+        return 16
+    }
+    return 10
+}
+
+fn prefix_for(kind: str) -> str {
+    if kind == "b" {
+        return "0b"
+    }
+    if kind == "o" {
+        return "0o"
+    }
+    if kind == "x" {
+        return "0x"
+    }
+    if kind == "X" {
+        return "0X"
+    }
+    return ""
+}
+
+/// The digits of `value` in `base`, without a sign.
+fn digits_of(value: i64, base: i64, kind: str) -> str {
+    if value == 0 {
+        return "0"
+    }
+    let table = digits_for(kind)
+    var out = ""
+    var left = value
+    while left > 0 {
+        out = table.substr(left % base, 1) + out
+        left = left / base
+    }
+    return out
+}
+
+/// `text` with `separator` every three digits from the right — or every four
+/// for `_` in a base that is not ten, which is what Python does.
+fn grouped(text: str, separator: str, every: i64) -> str {
+    if separator == "" {
+        return text
+    }
+    var out = ""
+    var seen = 0
+    var i = text.len() - 1
+    while i >= 0 {
+        if seen > 0 and seen % every == 0 {
+            out = separator + out
+        }
+        out = text.substr(i, 1) + out
+        seen = seen + 1
+        i = i - 1
+    }
+    return out
+}
+
+fn pad(body: str, sign: str, spec: FormatSpec) -> str {
+    let whole = sign + body
+    if whole.len() >= spec.width {
+        return whole
+    }
+    let missing = spec.width - whole.len()
+    if spec.align == "=" {
+        return sign + repeat(spec.fill, missing) + body
+    }
+    if spec.align == "<" {
+        return whole + repeat(spec.fill, missing)
+    }
+    if spec.align == "^" {
+        let left = missing / 2
+        return repeat(spec.fill, left) + whole +
+        repeat(spec.fill, missing - left)
+    }
+    return repeat(spec.fill, missing) + whole
+}
+
+fn repeat(text: str, times: i64) -> str {
+    var out = ""
+    var i = 0
+    while i < times {
+        out = out + text
+        i = i + 1
+    }
+    return out
+}
+
+/// `value` formatted by `text`, which must be a specification for a number.
+pub fn format_int(value: i64, text: str) -> str ! SpecError {
+    var spec = try parse(text)
+    if spec.kind == "s" {
+        fail(SpecNotAllowed("`s` is for strings"))
+    }
+    if spec.precision >= 0 {
+        fail(SpecNotAllowed("precision means nothing for an integer"))
+    }
+    if spec.align == "" {
+        // Numbers are right-aligned unless told otherwise, and a bare `0`
+        // means the padding goes after the sign.
+        spec.align = if spec.zero { "=" } else { ">" }
+    }
+    if spec.kind == "c" {
+        if spec.sign != "" {
+            fail(SpecNotAllowed("a sign means nothing for `c`"))
+        }
+        if spec.grouping != "" {
+            fail(SpecNotAllowed("grouping means nothing for `c`"))
+        }
+        if spec.alternate {
+            fail(SpecNotAllowed("`#` means nothing for `c`"))
+        }
+        if value < 0 or value > 1114111 or
+        (value >= 55296 and value <= 57343) {
+            fail(SpecNotAllowed("not a character"))
+        }
+        return pad(value.to_char(), "", spec)
+    }
+    if spec.kind == "n" and spec.grouping != "" {
+        // `n` is `d` with the locale's own separator. There is no locale
+        // here, so it is `d` — but it still brings its own separator, and
+        // asking for a second one is refused.
+        fail(SpecNotAllowed("`n` brings its own separator"))
+    }
+    let base = base_for(spec.kind)
+    if spec.kind != "" and spec.kind != "d" and spec.kind != "n" and
+    base == 10 {
+        fail(SpecUnknownType(spec.kind))
+    }
+    if spec.grouping == "," and base != 10 {
+        fail(SpecNotAllowed("`,` needs a decimal presentation"))
+    }
+    var magnitude = value
+    var sign = ""
+    if value < 0 {
+        magnitude = 0 - value
+        sign = "-"
+    } else if spec.sign == "+" {
+        sign = "+"
+    } else if spec.sign == " " {
+        sign = " "
+    }
+    var digits = digits_of(magnitude, base, spec.kind)
+    var prefix = ""
+    if spec.alternate {
+        prefix = prefix_for(spec.kind)
+    }
+    let every = if base == 10 { 3 } else { 4 }
+    if spec.align != "=" {
+        return pad(prefix + grouped(digits, spec.grouping, every), sign,
+            spec)
+    }
+    // `=` puts the padding between the sign and the digits, and the prefix
+    // counts as part of the sign for that purpose: `0x0000ff`, never
+    // `0000 0xff`.
+    let head = sign + prefix
+    let target = spec.width - head.len()
+    if spec.fill != "0" or spec.grouping == "" {
+        var body = grouped(digits, spec.grouping, every)
+        if body.len() >= target {
+            return head + body
+        }
+        if spec.fill == "0" {
+            return head + repeat("0", target - body.len()) + body
+        }
+        return head + repeat(spec.fill, target - body.len()) + body
+    }
+    // Zero padding under a separator is itself separated, so `{:012,}` of
+    // nothing is `0,000,000,000` — thirteen characters for a width of
+    // twelve, because a group is never left short and a leading separator is
+    // never written.
+    while grouped(digits, spec.grouping, every).len() < target {
+        digits = "0" + digits
+    }
+    return head + grouped(digits, spec.grouping, every)
+}
+
+/// `value` formatted by `text`, which must be a specification for a string.
+pub fn format_str(value: str, text: str) -> str ! SpecError {
+    var spec = try parse(text)
+    if spec.kind != "" and spec.kind != "s" {
+        fail(SpecUnknownType(spec.kind))
+    }
+    if spec.sign != "" {
+        fail(SpecNotAllowed("a sign means nothing for a string"))
+    }
+    if spec.grouping != "" {
+        fail(SpecNotAllowed("grouping means nothing for a string"))
+    }
+    if spec.alternate {
+        fail(SpecNotAllowed("`#` means nothing for a string"))
+    }
+    if spec.align == "=" {
+        fail(SpecNotAllowed("`=` means nothing for a string"))
+    }
+    var body = value
+    if spec.precision >= 0 and body.len() > spec.precision {
+        body = body.substr(0, spec.precision)
+    }
+    if spec.align == "" {
+        spec.align = "<"
+    }
+    return pad(body, "", spec)
+}
+
+/// Whether `text` is a specification this understands at all.
+pub fn is_valid(text: str) -> bool {
+    match parse(text) {
+        Ok(_spec) -> return true
+        Err(_e) -> return false
+    }
+}

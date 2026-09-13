@@ -1,0 +1,6 @@
+[package]
+name = "picklefile"
+version = "1.0.0"
+
+# Parses bytes it is handed. Opens nothing, runs nothing.
+capabilities = []

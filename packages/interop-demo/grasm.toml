@@ -1,0 +1,12 @@
+[package]
+name = "interop_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.picklefile]
+path = "../picklefile"
+version = "^1.0.0"
+
+[dependencies.formatspec]
+path = "../formatspec"
+version = "^1.0.0"

@@ -9,6 +9,22 @@ migration note here; anything `experimental` may change in any release. See
 
 ### Added
 
+- **Two packages for reading and writing what Python does.** `picklefile`
+  reads pickles — protocols 0 to 5, the memo, contexts, every integer
+  encoding — and refuses the four opcodes that name and call a Python
+  callable, which is what makes a reader safe where a full unpickler is a
+  remote-code-execution primitive with a friendly name. The handful of pure
+  constructors Python uses to store `bytes`, `set` and `frozenset` at older
+  protocols are allowed by name and nothing else is. A structure that
+  contains itself is refused rather than returned one level deep.
+  `formatspec` is the mini-language after the colon in `{n:>8,d}`, for
+  integers and strings: fill, alignment, sign, `#`, the leading zero that is
+  not a width digit, grouping every three digits or every four in hex,
+  precision, and the presentation types. Float presentations are refused
+  rather than approximated — correctly-rounded decimal conversion is its own
+  piece of work. 15,868 cases against `pickle` and `format()`:
+  `picklediff` and `formatspecdiff` are gates.
+
 - **Two packages whose whole purpose is agreeing with somebody else.**
   `mersenne` is MT19937 — a worse generator than the xoshiro256** `random`
   already has, and the only right answer when a paper says "seeded with

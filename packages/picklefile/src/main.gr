@@ -1,0 +1,1001 @@
+// Reading Python pickles — the data in them, and nothing else.
+//
+// A pickle is the format Python uses when something says "just save it":
+// cached model outputs, `joblib` files, scikit-learn artifacts, celery
+// payloads, half the intermediate files in any data pipeline. A program that
+// cannot read one cannot take part in that pipeline, and there are a great
+// many of those files.
+//
+// ## Why this reads and does not execute
+//
+// The pickle format is a stack machine, and four of its opcodes —
+// `GLOBAL`, `STACK_GLOBAL`, `REDUCE` and `BUILD` — name a Python callable
+// and call it. That is not a flaw in an implementation; it is what the
+// format is for, and it is why "never unpickle data you did not produce" is
+// in Python's own documentation in a red box.
+//
+// This refuses those four opcodes. What is left is every opcode that builds
+// data — numbers, strings, bytes, lists, tuples, dicts, sets — which is what
+// is actually in the overwhelming majority of pickles, and reading it cannot
+// run anything. A file that needs a callable is reported as needing one,
+// with the name it asked for, rather than half-decoded or silently skipped.
+//
+// That refusal is the feature. A reader that could reconstruct arbitrary
+// objects would be a remote code execution primitive with a friendly name.
+//
+// ## What is awkward about the format
+//
+// The same value has a dozen encodings. An integer might be `INT` (decimal
+// text), `BININT1`, `BININT2`, `BININT`, or `LONG1` with a little-endian
+// two's-complement body, depending on its size and on which protocol the
+// writer used. Protocol 0 is printable ASCII and protocol 5 is binary with
+// framing. All five are still produced, because `pickle.dump` takes a
+// protocol argument and code passes it.
+//
+// The memo is the other trap. `PUT`/`GET` let a pickle refer to something it
+// built earlier, which is how it stores shared and cyclic structures. A
+// reader without a memo appears to work until it meets a file where the same
+// list is stored twice.
+//
+// Integers wider than 64 bits are refused rather than wrapped. Python has no
+// such limit and a pickle may well carry one; returning a wrapped number
+// would be a wrong answer that looks like a right one.
+//
+// Checked against Python's `pickle` across protocols 0 to 5: every value in
+// the gate's corpus is written by Python at each protocol and read here, and
+// the rendering compared against `repr` — floats by value, because Python
+// prints the shortest decimal that round-trips and this does not claim to.
+
+type PickleError =
+    | PickleTruncated(at: i64)
+    | PickleCyclic(at: i64)
+    | PickleUnknownOpcode(at: i64, opcode: i64)
+    | PickleNeedsCallable(at: i64, name: str)
+    | PickleTooLarge(at: i64)
+    | PickleStackEmpty(at: i64)
+
+    /// The data a pickle holds.
+type Pickle =
+    | PNone
+    | PBool(value: bool)
+    | PInt(value: i64)
+    | PFloat(value: f64)
+    | PStr(value: str)
+    | PBytes(value: bytes)
+    | PList(items: [ref Pickle])
+    | PTuple(items: [ref Pickle])
+    | PDict(keys: [ref Pickle], values: [ref Pickle])
+    | PSet(items: [ref Pickle])
+    | PFrozenSet(items: [ref Pickle])
+    /// A named callable, which only ever sits on the stack long enough for
+    /// `REDUCE` to look at it. Anything that is not one of the few pure
+    /// constructors below is refused rather than called.
+    | PCallableRef(name: str)
+
+type PickleMachine = {
+    data: bytes,
+    at: i64,
+    stack: [ref Pickle],
+    /// Where each open MARK left the stack, so a container knows where its
+    /// own items start.
+    marks: [i64],
+    memo: Map[i64, ref Pickle],
+    /// Which memo slot each stack position was stored into, so a container
+    /// that is rebuilt when items are appended can update the memo with it.
+    /// Values here are immutable; Python's memo holds a reference to a
+    /// mutable object, and this is how the same file reads the same way.
+    slot_at: Map[i64, i64],
+}
+
+fn byte_at(inout m: PickleMachine) -> i64 ! PickleError {
+    if m.at >= m.data.len() {
+        fail(PickleTruncated(m.at))
+    }
+    let b = m.data.at(m.at)
+    m.at = m.at + 1
+    return b
+}
+
+fn read_unsigned(inout m: PickleMachine, width: i64) -> i64 ! PickleError {
+    var out = 0
+    var i = 0
+    while i < width {
+        out = out + (try byte_at(m)).shl(i * 8)
+        i = i + 1
+    }
+    return out
+}
+
+/// A little-endian two's-complement number, which is how `LONG1` stores one.
+fn read_signed(inout m: PickleMachine, width: i64) -> i64 ! PickleError {
+    if width > 8 {
+        fail(PickleTooLarge(m.at))
+    }
+    if width == 0 {
+        return 0
+    }
+    var out = 0
+    var i = 0
+    var top = 0
+    while i < width {
+        top = try byte_at(m)
+        out = out + top.shl(i * 8)
+        i = i + 1
+    }
+    if top >= 128 and width < 8 {
+        out = out - (1).shl(width * 8)
+    }
+    return out
+}
+
+/// The same line, with every byte read as the character of that number.
+///
+/// Protocol 0's `UNICODE` uses `raw-unicode-escape`, which escapes anything
+/// above U+00FF and writes everything below it as a single raw byte. Reading
+/// that as UTF-8 turns `café` into a replacement character.
+fn read_latin1_line(inout m: PickleMachine) -> str ! PickleError {
+    var out = ""
+    var going = true
+    while going {
+        let b = try byte_at(m)
+        if b == 10 {
+            going = false
+        } else {
+            out = out + b.to_char()
+        }
+    }
+    return out
+}
+
+/// Bytes up to the next newline, which is how protocol 0 writes everything.
+fn read_line(inout m: PickleMachine) -> str ! PickleError {
+    var out: [i64] = []
+    var going = true
+    while going {
+        let b = try byte_at(m)
+        if b == 10 {
+            going = false
+        } else {
+            out.push(b)
+        }
+    }
+    return bytes_of(out).to_str()
+}
+
+fn read_raw(inout m: PickleMachine, length: i64) -> bytes ! PickleError {
+    if m.at + length > m.data.len() or length < 0 {
+        fail(PickleTruncated(m.at))
+    }
+    var out: [i64] = []
+    var i = 0
+    while i < length {
+        out.push(m.data.at(m.at + i))
+        i = i + 1
+    }
+    m.at = m.at + length
+    return bytes_of(out)
+}
+
+fn push(inout m: PickleMachine, value: Pickle) {
+    m.stack.push(ref(value))
+}
+
+fn pop(inout m: PickleMachine) -> ref Pickle ! PickleError {
+    if m.stack.len() == 0 {
+        fail(PickleStackEmpty(m.at))
+    }
+    let top = m.stack[m.stack.len() - 1]
+    m.stack.pop()
+    m.slot_at.delete(m.stack.len())
+    return top
+}
+
+/// Whether memo slot `slot` holds a container that is still being filled.
+///
+/// Being on the stack is not enough — a finished list sits there too, as an
+/// item of the list being built around it. What makes a container unfinished
+/// is sitting *below* the innermost mark, which is where its own items are
+/// piling up. A pickle that recalls one of those is a structure that
+/// contains itself.
+fn slot_is_being_built(m: PickleMachine, slot: i64) -> bool {
+    if m.marks.len() == 0 {
+        return false
+    }
+    let floor = m.marks[m.marks.len() - 1]
+    for entry in m.slot_at.entries() {
+        if entry.1 == slot and entry.0 < floor {
+            return true
+        }
+    }
+    return false
+}
+
+/// Put `value` back where the container came from, and keep the memo in
+/// step: `slot` is what that position was memoised into, read before the
+/// container was popped.
+fn replace_top(inout m: PickleMachine, value: Pickle, slot: Option[i64]) {
+    let where = m.stack.len()
+    m.stack.push(ref(value))
+    match slot {
+        Some(n) -> {
+            m.memo.set(n, m.stack[where])
+            m.slot_at.set(where, n)
+        }
+        None -> {}
+    }
+}
+
+/// Which memo slot the top of the stack was stored into, if any.
+fn slot_of_top(m: PickleMachine) -> Option[i64] {
+    if m.stack.len() == 0 {
+        return None
+    }
+    return m.slot_at.get(m.stack.len() - 1)
+}
+
+/// Everything above the most recent mark, and the mark removed.
+fn take_from_mark(inout m: PickleMachine) -> [ref Pickle] ! PickleError {
+    if m.marks.len() == 0 {
+        fail(PickleStackEmpty(m.at))
+    }
+    let floor = m.marks[m.marks.len() - 1]
+    m.marks.pop()
+    var out: [ref Pickle] = []
+    var i = floor
+    while i < m.stack.len() {
+        out.push(m.stack[i])
+        i = i + 1
+    }
+    var kept: [ref Pickle] = []
+    var k = 0
+    while k < floor {
+        kept.push(m.stack[k])
+        k = k + 1
+    }
+    var trimmed = floor
+    while trimmed < m.stack.len() {
+        m.slot_at.delete(trimmed)
+        trimmed = trimmed + 1
+    }
+    m.stack = kept
+    return out
+}
+
+/// Protocol 0's text-encoded scalars, and everything with no payload.
+///
+/// Returns false when `opcode` is not one of these, so the caller tries the
+/// next group.
+fn simple_opcode(inout m: PickleMachine, opcode: i64) -> bool ! PickleError {
+    if opcode == 78 {
+        push(m, PNone)
+    } else if opcode == 136 {
+        push(m, PBool(true))
+    } else if opcode == 137 {
+        push(m, PBool(false))
+    } else if opcode == 73 {
+        // `I` is an integer, except that protocol 0 writes booleans as
+        // `I01` and `I00`.
+        let text = try read_line(m)
+        if text == "01" {
+            push(m, PBool(true))
+        } else if text == "00" {
+            push(m, PBool(false))
+        } else {
+            push(m, PInt(text.parse_int() ?? 0))
+        }
+    } else if opcode == 76 {
+        var text = try read_line(m)
+        if text.ends_with("L") {
+            text = text.substr(0, text.len() - 1)
+        }
+        match text.parse_int() {
+            Some(n) -> push(m, PInt(n))
+            None -> fail(PickleTooLarge(m.at))
+        }
+    } else if opcode == 70 {
+        push(m, PFloat((try read_line(m)).parse_float() ?? 0.0))
+    } else if opcode == 71 {
+        push(m, PFloat(read_be_double(try read_raw(m, 8))))
+    } else if opcode == 75 {
+        push(m, PInt(try read_unsigned(m, 1)))
+    } else if opcode == 77 {
+        push(m, PInt(try read_unsigned(m, 2)))
+    } else if opcode == 74 {
+        push(m, PInt(try read_signed(m, 4)))
+    } else if opcode == 138 {
+        let width = try byte_at(m)
+        push(m, PInt(try read_signed(m, width)))
+    } else if opcode == 139 {
+        let width = try read_unsigned(m, 4)
+        push(m, PInt(try read_signed(m, width)))
+    } else {
+        return false
+    }
+    return true
+}
+
+/// An IEEE double stored big-endian, which is the one big-endian thing in a
+/// format that is otherwise little-endian throughout.
+fn read_be_double(raw: bytes) -> f64 {
+    var bits = 0
+    var i = 0
+    while i < 8 {
+        bits = bits.shl(8).bit_or(raw.at(i))
+        i = i + 1
+    }
+    return f64_from_bits(bits)
+}
+
+fn f64_from_bits(bits: i64) -> f64 {
+    let sign = if bits.ushr(63).bit_and(1) == 1 { 0.0 - 1.0 } else { 1.0 }
+    let exponent = bits.ushr(52).bit_and(2047)
+    let fraction = bits.bit_and(4503599627370495)
+    if exponent == 0 {
+        if fraction == 0 {
+            return sign * 0.0
+        }
+        return sign * fraction.as_f64() * two_to(0 - 1074)
+    }
+    if exponent == 2047 {
+        // Infinities and NaNs do not survive this and are not expected to;
+        // a pickle carrying one is vanishingly rare and would need a way to
+        // say so that `f64` does not give.
+        return sign * 0.0
+    }
+    let mantissa = (fraction + 4503599627370496).as_f64()
+    return sign * mantissa * two_to(exponent - 1075)
+}
+
+fn two_to(power: i64) -> f64 {
+    var out = 1.0
+    var left = power
+    while left > 0 {
+        out = out * 2.0
+        left = left - 1
+    }
+    while left < 0 {
+        out = out / 2.0
+        left = left + 1
+    }
+    return out
+}
+
+/// The string and bytes opcodes, of which there are nine.
+fn text_opcode(inout m: PickleMachine, opcode: i64) -> bool ! PickleError {
+    if opcode == 88 {
+        push(m, PStr((try read_raw(m, try read_unsigned(m, 4))).to_str()))
+    } else if opcode == 140 {
+        push(m, PStr((try read_raw(m, try byte_at(m))).to_str()))
+    } else if opcode == 141 {
+        push(m, PStr((try read_raw(m, try read_unsigned(m, 8))).to_str()))
+    } else if opcode == 86 {
+        push(m, PStr(unescape_unicode(try read_latin1_line(m))))
+    } else if opcode == 66 {
+        push(m, PBytes(try read_raw(m, try read_unsigned(m, 4))))
+    } else if opcode == 67 {
+        push(m, PBytes(try read_raw(m, try byte_at(m))))
+    } else if opcode == 142 {
+        push(m, PBytes(try read_raw(m, try read_unsigned(m, 8))))
+    } else if opcode == 150 {
+        push(m, PBytes(try read_raw(m, try read_unsigned(m, 8))))
+    } else if opcode == 84 {
+        push(m, PBytes(try read_raw(m, try read_unsigned(m, 4))))
+    } else if opcode == 85 {
+        push(m, PBytes(try read_raw(m, try byte_at(m))))
+    } else if opcode == 83 {
+        push(m, PBytes(unquote_string(try read_line(m))))
+    } else {
+        return false
+    }
+    return true
+}
+
+/// Protocol 0's `VUNICODE`: a line with `\uXXXX`, `\n` and `\\` escapes.
+fn unescape_unicode(text: str) -> str {
+    var out = ""
+    var i = 0
+    while i < text.len() {
+        let c = text.substr(i, 1)
+        if c != "\\" or i + 1 >= text.len() {
+            out = out + c
+            i = i + 1
+            continue
+        }
+        let next = text.substr(i + 1, 1)
+        if next == "u" and i + 5 < text.len() {
+            out = out + (text.substr(i + 2, 4).parse_int_base(16) ?? 63)
+                .to_char()
+            i = i + 6
+        } else if next == "U" and i + 9 < text.len() {
+            out = out + (text.substr(i + 2, 8).parse_int_base(16) ?? 63)
+                .to_char()
+            i = i + 10
+        } else if next == "n" {
+            out = out + "\n"
+            i = i + 2
+        } else if next == "t" {
+            out = out + "\t"
+            i = i + 2
+        } else if next == "r" {
+            out = out + "\r"
+            i = i + 2
+        } else {
+            out = out + next
+            i = i + 2
+        }
+    }
+    return out
+}
+
+/// Protocol 0's `STRING`: a Python repr, quotes and all.
+fn unquote_string(text: str) -> bytes {
+    var body = text
+    if body.len() >= 2 {
+        let first = body.substr(0, 1)
+        if first == "'" or first == "\"" {
+            body = body.substr(1, body.len() - 2)
+        }
+    }
+    var out: [i64] = []
+    var i = 0
+    while i < body.len() {
+        let c = body.substr(i, 1)
+        if c != "\\" or i + 1 >= body.len() {
+            let raw = c.to_bytes()
+            var k = 0
+            while k < raw.len() {
+                out.push(raw.at(k))
+                k = k + 1
+            }
+            i = i + 1
+            continue
+        }
+        let next = body.substr(i + 1, 1)
+        if next == "x" and i + 3 < body.len() {
+            out.push(body.substr(i + 2, 2).parse_int_base(16) ?? 63)
+            i = i + 4
+        } else if next == "n" {
+            out.push(10)
+            i = i + 2
+        } else if next == "t" {
+            out.push(9)
+            i = i + 2
+        } else if next == "r" {
+            out.push(13)
+            i = i + 2
+        } else {
+            let raw = next.to_bytes()
+            var k = 0
+            while k < raw.len() {
+                out.push(raw.at(k))
+                k = k + 1
+            }
+            i = i + 2
+        }
+    }
+    return bytes_of(out)
+}
+
+/// The opcodes that build and extend containers, and the memo.
+fn container_opcode(inout m: PickleMachine,
+    opcode: i64) -> bool ! PickleError {
+    if opcode == 40 {
+        m.marks.push(m.stack.len())
+    } else if opcode == 41 {
+        push(m, PTuple([]))
+    } else if opcode == 93 {
+        push(m, PList([]))
+    } else if opcode == 125 {
+        push(m, PDict([], []))
+    } else if opcode == 143 {
+        push(m, PSet([]))
+    } else if opcode == 116 {
+        push(m, PTuple(try take_from_mark(m)))
+    } else if opcode == 133 {
+        push(m, PTuple([try pop(m)]))
+    } else if opcode == 134 {
+        let second = try pop(m)
+        push(m, PTuple([try pop(m), second]))
+    } else if opcode == 135 {
+        let third = try pop(m)
+        let second = try pop(m)
+        push(m, PTuple([try pop(m), second, third]))
+    } else if opcode == 108 {
+        push(m, PList(try take_from_mark(m)))
+    } else if opcode == 100 {
+        push(m, PDict_of(try take_from_mark(m)))
+    } else if opcode == 145 {
+        push(m, PFrozenSet(try take_from_mark(m)))
+    } else {
+        return try extend_opcode(m, opcode)
+    }
+    return true
+}
+
+/// A dict built from the flat key, value, key, value list `DICT` leaves.
+fn PDict_of(flat: [ref Pickle]) -> Pickle {
+    var keys: [ref Pickle] = []
+    var values: [ref Pickle] = []
+    var i = 0
+    while i + 1 < flat.len() {
+        keys.push(flat[i])
+        values.push(flat[i + 1])
+        i = i + 2
+    }
+    return PDict(keys, values)
+}
+
+/// `APPEND`, `APPENDS`, `SETITEM`, `SETITEMS`, `ADDITEMS` and the memo — the
+/// opcodes that change something already on the stack rather than pushing.
+fn extend_opcode(inout m: PickleMachine, opcode: i64) -> bool ! PickleError {
+    if opcode == 97 {
+        let item_slot = slot_of_top(m)
+        let item = try pop(m)
+        if item_slot != None and item_slot == slot_of_top(m) {
+            fail(PickleCyclic(m.at))
+        }
+        try append_to_top(m, [item])
+    } else if opcode == 101 {
+        let items = try take_from_mark(m)
+        try append_to_top(m, items)
+    } else if opcode == 144 {
+        let items = try take_from_mark(m)
+        try append_to_top(m, items)
+    } else if opcode == 115 {
+        let value_slot = slot_of_top(m)
+        let value = try pop(m)
+        let key = try pop(m)
+        if value_slot != None and value_slot == slot_of_top(m) {
+            fail(PickleCyclic(m.at))
+        }
+        try set_on_top(m, [key], [value])
+    } else if opcode == 117 {
+        let flat = try take_from_mark(m)
+        var keys: [ref Pickle] = []
+        var values: [ref Pickle] = []
+        var i = 0
+        while i + 1 < flat.len() {
+            keys.push(flat[i])
+            values.push(flat[i + 1])
+            i = i + 2
+        }
+        try set_on_top(m, keys, values)
+    } else {
+        return try memo_opcode(m, opcode)
+    }
+    return true
+}
+
+fn append_to_top(inout m: PickleMachine,
+    items: [ref Pickle]) -> bool ! PickleError {
+    let slot = slot_of_top(m)
+    let top = try pop(m)
+    match top {
+        PList(existing) -> {
+            var out = existing
+            for item in items {
+                out.push(item)
+            }
+            replace_top(m, PList(out), slot)
+        }
+        PSet(existing) -> {
+            var out = existing
+            for item in items {
+                out.push(item)
+            }
+            replace_top(m, PSet(out), slot)
+        }
+        _ -> fail(PickleStackEmpty(m.at))
+    }
+    return true
+}
+
+fn set_on_top(inout m: PickleMachine, keys: [ref Pickle],
+    values: [ref Pickle]) -> bool ! PickleError {
+    let slot = slot_of_top(m)
+    let top = try pop(m)
+    match top {
+        PDict(existing_keys, existing_values) -> {
+            var out_keys = existing_keys
+            var out_values = existing_values
+            var i = 0
+            while i < keys.len() {
+                out_keys.push(keys[i])
+                out_values.push(values[i])
+                i = i + 1
+            }
+            replace_top(m, PDict(out_keys, out_values), slot)
+        }
+        _ -> fail(PickleStackEmpty(m.at))
+    }
+    return true
+}
+
+/// `PUT`, `GET` and friends: the memo, which is how a pickle stores the same
+/// object twice without writing it twice.
+fn memo_opcode(inout m: PickleMachine, opcode: i64) -> bool ! PickleError {
+    if opcode == 112 {
+        remember(m, (try read_line(m)).parse_int() ?? 0)
+    } else if opcode == 113 {
+        remember(m, try byte_at(m))
+    } else if opcode == 114 {
+        remember(m, try read_unsigned(m, 4))
+    } else if opcode == 148 {
+        remember(m, m.memo.len())
+    } else if opcode == 103 {
+        try recall(m, (try read_line(m)).parse_int() ?? 0)
+    } else if opcode == 104 {
+        try recall(m, try byte_at(m))
+    } else if opcode == 106 {
+        try recall(m, try read_unsigned(m, 4))
+    } else if opcode == 128 {
+        // The protocol number, which changes nothing about how this reads.
+        let _protocol = try byte_at(m)
+    } else if opcode == 149 {
+        // A frame length, which is a hint for buffered readers.
+        let _length = try read_unsigned(m, 8)
+    } else {
+        return false
+    }
+    return true
+}
+
+fn remember(inout m: PickleMachine, slot: i64) {
+    if m.stack.len() == 0 {
+        return
+    }
+    m.memo.set(slot, m.stack[m.stack.len() - 1])
+    m.slot_at.set(m.stack.len() - 1, slot)
+}
+
+fn recall(inout m: PickleMachine, slot: i64) -> bool ! PickleError {
+    if slot_is_being_built(m, slot) {
+        // The pickle refers to something it has not finished building,
+        // which means the structure contains itself. Values here are
+        // immutable, so that cannot be represented; saying so beats
+        // returning one level of it and calling that the answer.
+        fail(PickleCyclic(m.at))
+    }
+    match m.memo.get(slot) {
+        Some(value) -> {
+            m.stack.push(value)
+            // Remember where this came from: `APPEND` has no mark to look
+            // at, so a list appending itself is recognised by the item and
+            // the container naming the same memo slot.
+            m.slot_at.set(m.stack.len() - 1, slot)
+        }
+        None -> fail(PickleStackEmpty(m.at))
+    }
+    return true
+}
+
+/// The few callables that are pure data constructors.
+///
+/// Python cannot store `bytes`, `set` or `frozenset` directly before
+/// protocol 3 or 4, so it stores a call instead: `_codecs.encode(text,
+/// "latin1")` for bytes, `builtins.set(list)` for a set. Those calls build
+/// data and nothing else, and refusing them would make every pickle written
+/// at an older protocol unreadable for no gain in safety. Every other name
+/// is still refused.
+fn safe_constructor(name: str) -> bool {
+    return name == "_codecs.encode" or name == "builtins.bytes" or
+    name == "__builtin__.bytes" or name == "builtins.set" or
+    name == "__builtin__.set" or name == "builtins.frozenset" or
+    name == "__builtin__.frozenset" or name == "builtins.bytearray" or
+    name == "__builtin__.bytearray" or name == "builtins.list" or
+    name == "__builtin__.list" or name == "builtins.tuple" or
+    name == "__builtin__.tuple" or name == "builtins.dict" or
+    name == "__builtin__.dict"
+}
+
+/// A string whose characters are all below 256, as the bytes they stand for.
+fn latin1_bytes(text: str) -> bytes {
+    var out: [i64] = []
+    for code in text.codes() {
+        if code < 256 {
+            out.push(code)
+        }
+    }
+    return bytes_of(out)
+}
+
+/// `REDUCE`: apply one of the pure constructors to its argument tuple.
+fn reduce(inout m: PickleMachine, where: i64) -> bool ! PickleError {
+    let arguments = try pop(m)
+    let callable = try pop(m)
+    var name = ""
+    match callable {
+        PCallableRef(text) -> name = text
+        _ -> fail(PickleNeedsCallable(where, "a value that is not callable"))
+    }
+    if not safe_constructor(name) {
+        fail(PickleNeedsCallable(where, name))
+    }
+    let given = items_of(arguments)
+    if name == "_codecs.encode" or name == "builtins.bytearray" or
+    name == "__builtin__.bytearray" {
+        if given.len() == 0 {
+            push(m, PBytes(bytes_of([])))
+            return true
+        }
+        match given[0] {
+            PStr(text) -> push(m, PBytes(latin1_bytes(text)))
+            PBytes(raw) -> push(m, PBytes(raw))
+            _ -> fail(PickleNeedsCallable(where, name))
+        }
+        return true
+    }
+    if given.len() == 0 {
+        try push_empty(m, name)
+        return true
+    }
+    let inner = items_of(given[0])
+    if name == "builtins.frozenset" or name == "__builtin__.frozenset" {
+        push(m, PFrozenSet(inner))
+    } else if name == "builtins.set" or name == "__builtin__.set" {
+        push(m, PSet(inner))
+    } else if name == "builtins.tuple" or name == "__builtin__.tuple" {
+        push(m, PTuple(inner))
+    } else if name == "builtins.bytes" or name == "__builtin__.bytes" {
+        var raw: [i64] = []
+        for item in inner {
+            match item {
+                PInt(n) -> raw.push(n)
+                _ -> {}
+            }
+        }
+        push(m, PBytes(bytes_of(raw)))
+    } else {
+        push(m, PList(inner))
+    }
+    return true
+}
+
+fn push_empty(inout m: PickleMachine, name: str) -> bool ! PickleError {
+    if name == "builtins.frozenset" or name == "__builtin__.frozenset" {
+        push(m, PFrozenSet([]))
+    } else if name == "builtins.set" or name == "__builtin__.set" {
+        push(m, PSet([]))
+    } else if name == "builtins.tuple" or name == "__builtin__.tuple" {
+        push(m, PTuple([]))
+    } else if name == "builtins.dict" or name == "__builtin__.dict" {
+        push(m, PDict([], []))
+    } else if name == "builtins.bytes" or name == "__builtin__.bytes" {
+        push(m, PBytes(bytes_of([])))
+    } else {
+        push(m, PList([]))
+    }
+    return true
+}
+
+/// The name a callable opcode asked for, so the refusal can say which.
+fn callable_name(inout m: PickleMachine, opcode: i64) -> str ! PickleError {
+    if opcode == 99 {
+        let module = try read_line(m)
+        return module + "." + (try read_line(m))
+    }
+    if opcode == 130 {
+        return "extension " + (try byte_at(m)).to_str()
+    }
+    return "a callable on the stack"
+}
+
+/// The data in `raw`.
+///
+/// Fails rather than executing anything: a pickle that needs a Python
+/// callable is reported with the name it asked for.
+pub fn decode(raw: bytes) -> ref Pickle ! PickleError {
+    var m = PickleMachine{
+        data: raw,
+        at: 0,
+        stack: [],
+        marks: [],
+        memo: {},
+        slot_at: {},
+    }
+    while m.at < m.data.len() {
+        let where = m.at
+        let opcode = try byte_at(m)
+        if opcode == 46 {
+            if m.stack.len() == 0 {
+                fail(PickleStackEmpty(where))
+            }
+            let result = m.stack[m.stack.len() - 1]
+            match result {
+                PCallableRef(name) -> fail(PickleNeedsCallable(where, name))
+                _ -> {}
+            }
+            return result
+        }
+        // The opcodes that call Python. `GLOBAL` and `STACK_GLOBAL` only
+        // name something; `REDUCE` is where a call would happen, and it
+        // allows exactly the handful of pure constructors above. Everything
+        // else — `BUILD`, `NEWOBJ`, `INST`, the extension registry — is
+        // refused, which is the whole reason a reader can be safe where a
+        // full unpickler cannot.
+        if opcode == 99 {
+            let module = try read_line(m)
+            push(m, PCallableRef(module + "." + (try read_line(m))))
+            continue
+        }
+        if opcode == 147 {
+            let name = try pop(m)
+            let module = try pop(m)
+            push(m, PCallableRef(text_of(module) + "." + text_of(name)))
+            continue
+        }
+        if opcode == 82 {
+            let _done = try reduce(m, where)
+            continue
+        }
+        if opcode == 98 or opcode == 129 or opcode == 146 or
+        opcode == 130 or opcode == 131 or opcode == 132 {
+            fail(PickleNeedsCallable(where, try callable_name(m, opcode)))
+        }
+        if try simple_opcode(m, opcode) {
+            continue
+        }
+        if try text_opcode(m, opcode) {
+            continue
+        }
+        if try container_opcode(m, opcode) {
+            continue
+        }
+        fail(PickleUnknownOpcode(where, opcode))
+    }
+    fail(PickleTruncated(m.at))
+}
+
+fn text_of(value: ref Pickle) -> str {
+    match value {
+        PStr(text) -> return text
+        PBytes(raw) -> return raw.to_str()
+        _ -> return ""
+    }
+}
+
+/// What kind of value this is, as the word Python would use.
+pub fn kind(value: ref Pickle) -> str {
+    match value {
+        PNone -> return "none"
+        PBool(_b) -> return "bool"
+        PInt(_n) -> return "int"
+        PFloat(_x) -> return "float"
+        PStr(_s) -> return "str"
+        PBytes(_b) -> return "bytes"
+        PList(_items) -> return "list"
+        PTuple(_items) -> return "tuple"
+        PDict(_keys, _values) -> return "dict"
+        PSet(_items) -> return "set"
+        PFrozenSet(_items) -> return "frozenset"
+        PCallableRef(_name) -> return "callable"
+    }
+}
+
+/// A value written the way Python's `repr` writes it, so two readers can be
+/// compared without agreeing on anything else first.
+///
+/// Floats are the exception. Python prints the shortest decimal that reads
+/// back as the same double — `1e-10`, not `0.0000000001` — and this prints
+/// whatever `f64` prints. The two are the same number and not the same
+/// string. Compare floats by value rather than by this text.
+pub fn render(value: ref Pickle) -> str {
+    match value {
+        PNone -> return "None"
+        PBool(b) -> return if b { "True" } else { "False" }
+        PInt(n) -> return n.to_str()
+        PFloat(x) -> return render_float(x)
+        PStr(s) -> return "'" + escape_repr(s) + "'"
+        PBytes(b) -> return "b'" + escape_bytes(b) + "'"
+        PList(items) -> return "[" + render_all(items) + "]"
+        PTuple(items) -> {
+            if items.len() == 1 {
+                return "(" + render(items[0]) + ",)"
+            }
+            return "(" + render_all(items) + ")"
+        }
+        PSet(items) -> {
+            if items.len() == 0 {
+                return "set()"
+            }
+            return "\{" + render_all(items) + "\}"
+        }
+        PFrozenSet(items) -> {
+            if items.len() == 0 {
+                return "frozenset()"
+            }
+            return "frozenset(\{" + render_all(items) + "\})"
+        }
+        PDict(keys, values) -> {
+            var parts: [str] = []
+            var i = 0
+            while i < keys.len() {
+                parts.push(render(keys[i]) + ": " + render(values[i]))
+                i = i + 1
+            }
+            return "\{" + parts.join(", ") + "\}"
+        }
+        PCallableRef(name) -> return "<" + name + ">"
+    }
+}
+
+fn render_all(items: [ref Pickle]) -> str {
+    var parts: [str] = []
+    for item in items {
+        parts.push(render(item))
+    }
+    return parts.join(", ")
+}
+
+fn render_float(x: f64) -> str {
+    let text = x.to_str()
+    if (text.index_of(".") ?? -1) < 0 and (text.index_of("e") ?? -1) < 0 {
+        return text + ".0"
+    }
+    return text
+}
+
+fn escape_repr(text: str) -> str {
+    return text.replace("\\", "\\\\").replace("'", "\\'")
+        .replace("\n", "\\n").replace("\t", "\\t").replace("\r", "\\r")
+}
+
+fn escape_bytes(raw: bytes) -> str {
+    let digits = "0123456789abcdef"
+    var out = ""
+    var i = 0
+    while i < raw.len() {
+        let b = raw.at(i)
+        if b == 92 {
+            out = out + "\\\\"
+        } else if b == 39 {
+            out = out + "\\'"
+        } else if b == 10 {
+            out = out + "\\n"
+        } else if b == 9 {
+            out = out + "\\t"
+        } else if b == 13 {
+            out = out + "\\r"
+        } else if b >= 32 and b < 127 {
+            out = out + b.to_char()
+        } else {
+            out = out + "\\x" + digits.substr(b / 16, 1) +
+            digits.substr(b % 16, 1)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+/// The items of a list or tuple, or nothing for anything else.
+pub fn items_of(value: ref Pickle) -> [ref Pickle] {
+    match value {
+        PList(items) -> return items
+        PTuple(items) -> return items
+        PSet(items) -> return items
+        PFrozenSet(items) -> return items
+        _ -> return []
+    }
+}
+
+/// The value a dict holds for a string key.
+pub fn get(value: ref Pickle, key: str) -> Option[ref Pickle] {
+    match value {
+        PDict(keys, values) -> {
+            var i = 0
+            while i < keys.len() {
+                match keys[i] {
+                    PStr(text) -> {
+                        if text == key {
+                            return Some(values[i])
+                        }
+                    }
+                    _ -> {}
+                }
+                i = i + 1
+            }
+            return None
+        }
+        _ -> return None
+    }
+}

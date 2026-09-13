@@ -1,0 +1,114 @@
+// Reading what Python wrote, and formatting the way Python formats.
+import picklefile
+import formatspec
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn rendered(raw: bytes) -> str {
+    match picklefile.decode(raw) {
+        Ok(value) -> return picklefile.render(value)
+        Err(_e) -> return "error"
+    }
+}
+
+fn check_pickle(inout f: i64) / {io} {
+    // `pickle.dumps({"a": 1, "b": [1, 2]}, protocol=5)`
+    let document = bytes_of([128, 5, 149, 23, 0, 0, 0, 0, 0, 0, 0, 125, 148, 40, 140, 1,
+        97, 148, 75, 1, 140, 1, 98, 148, 93, 148, 40, 75, 1, 75, 2,
+        101, 117, 46])
+    say(f, "a protocol 5 dict reads back",
+        rendered(document) == "\{'a': 1, 'b': [1, 2]\}")
+    // The same value at protocol 0, which is printable ASCII throughout.
+    let ancient = "(dp0\nVa\np1\nI1\nsVb\np2\n(lp3\nI1\naI2\nas."
+    say(f, "and so does the same value at protocol 0",
+        rendered(ancient.to_bytes()) == "\{'a': 1, 'b': [1, 2]\}")
+    let kinds: ref Pickle ! PickleError =
+    picklefile.decode(bytes_of([73, 52, 50, 10, 46]))
+    match kinds {
+        Ok(value) -> say(f, "an integer knows it is one",
+            picklefile.kind(value) == "int")
+        Err(_e) -> say(f, "an integer knows it is one", false)
+    }
+    // The four opcodes that would call Python are refused, which is the
+    // whole reason a reader can be safe.
+    let dangerous = "cos\nsystem\n(S'echo hello'\ntR."
+    say(f, "a pickle that wants to call os.system is refused",
+        rendered(dangerous.to_bytes()) == "error")
+    // A structure containing itself cannot be represented and says so
+    // rather than returning one level of it.
+    let cyclic = bytes_of([128, 4, 149, 9, 0, 0, 0, 0, 0, 0, 0, 93, 148, 40, 75, 1, 104,
+        0, 101, 46])
+    say(f, "and so is one that contains itself",
+        rendered(cyclic) == "error")
+    say(f, "something that is not a pickle is refused too",
+        rendered("hello there".to_bytes()) == "error")
+}
+
+fn formatted(value: i64, spec: str) -> str {
+    return formatspec.format_int(value, spec) ?? "error"
+}
+
+fn formatted_text(value: str, spec: str) -> str {
+    return formatspec.format_str(value, spec) ?? "error"
+}
+
+fn check_formatspec(inout f: i64) / {io} {
+    say(f, "a width right-aligns a number", formatted(42, "8") == "      42")
+    say(f, "and left-aligns a string",
+        formatted_text("ab", "8") == "ab      ")
+    say(f, "a fill is only a fill when an alignment follows it",
+        formatted(42, "*<8") == "42******")
+    say(f, "and is part of the width otherwise",
+        formatted(42, "*8") == "error")
+    // A leading zero is not a width digit.
+    say(f, "0 pads after the sign, so -42 keeps its minus in front",
+        formatted(0 - 42, "08") == "-0000042")
+    say(f, "grouping puts a separator every three digits",
+        formatted(1234567, ",") == "1,234,567")
+    say(f, "and every four in hexadecimal",
+        formatted(4886718345, "_x") == "1_2345_6789")
+    say(f, "the alternate form writes the base in front",
+        formatted(255, "#x") == "0xff")
+    say(f, "and zero padding goes after it, never in front",
+        formatted(255, "#010x") == "0x000000ff")
+    // Padding under a separator is itself separated, which is why the
+    // result can be wider than the width asked for.
+    say(f, "zeros under a separator are separated too",
+        formatted(1234, "012,") == "0,000,001,234")
+    say(f, "a precision truncates a string",
+        formatted_text("hello", ".3") == "hel")
+    say(f, "and means nothing for an integer",
+        formatted(5, ".3") == "error")
+    say(f, "a sign means nothing for a string",
+        formatted_text("a", "+") == "error")
+    say(f, "`=` means nothing for a string either",
+        formatted_text("a", "0=8") == "error")
+    say(f, "but a bare 0 is a fill for one",
+        formatted_text("ab", "08") == "ab000000")
+    say(f, "`c` writes the character a number stands for",
+        formatted(65, "c") == "A")
+    say(f, "and refuses a number that is not one",
+        formatted(0 - 1, "c") == "error")
+    say(f, "a float presentation is refused rather than guessed at",
+        formatted(1, ".1f") == "error")
+}
+
+fn main() / {io} {
+    var f = 0
+
+    check_pickle(f)
+    check_formatspec(f)
+
+    if f == 0 {
+        print("interop: every claim held")
+    } else {
+        print("interop: {f} failed")
+    }
+}

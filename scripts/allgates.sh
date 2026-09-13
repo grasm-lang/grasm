@@ -91,6 +91,8 @@ run_gate japanesediff   scripts/japanese_diff.sh
 run_gate iso3166diff    scripts/iso3166_diff.sh
 run_gate mersennediff   scripts/mersenne_diff.sh
 run_gate gettextdiff    scripts/gettext_diff.sh
+run_gate picklediff     scripts/pickle_diff.sh
+run_gate formatspecdiff scripts/formatspec_diff.sh
 run_gate kvcrash       scripts/kvstore_crash.sh
 run_gate zlibdiff      scripts/zlib_diff.sh
 run_gate casefolddiff  scripts/casefold_diff.sh

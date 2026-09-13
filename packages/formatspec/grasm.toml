@@ -1,0 +1,6 @@
+[package]
+name = "formatspec"
+version = "1.0.0"
+
+# String building. Opens nothing.
+capabilities = []

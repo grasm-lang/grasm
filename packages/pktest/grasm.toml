@@ -1,0 +1,8 @@
+[package]
+name = "pktest"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.picklefile]
+path = "../picklefile"
+version = "^1.0.0"
