@@ -1,0 +1,14 @@
+[package]
+name = "sshprivkey"
+version = "1.0.0"
+
+# Parses bytes it is handed. Opens nothing and writes nothing.
+capabilities = []
+
+[dependencies.bytes_codec]
+path = "../bytes"
+version = "^1.0.0"
+
+[dependencies.sshkey]
+path = "../sshkey"
+version = "^1.0.0"

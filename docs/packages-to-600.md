@@ -30,9 +30,9 @@ One rule is added, because the count is now large enough for it to matter:
 | | |
 |---|---|
 | At the close of the 200 plan | 513 |
-| Now | 590 |
+| Now | 594 |
 | Target | 600 |
-| Remaining | 10 |
+| Remaining | 6 |
 
 The count is directories under `packages/` that are not `*-demo`. Test
 harnesses are directories and are counted; they are real programs that the

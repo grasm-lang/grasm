@@ -1,0 +1,16 @@
+[package]
+name = "signtest"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.sshprivkey]
+path = "../sshprivkey"
+version = "^1.0.0"
+
+[dependencies.allowedsigners]
+path = "../allowedsigners"
+version = "^1.0.0"
+
+[dependencies.gitstripspace]
+path = "../gitstripspace"
+version = "^1.0.0"

@@ -1,0 +1,267 @@
+// The file that says whose signature counts.
+//
+// A signature tells you that whoever holds a key signed something. An
+// `allowed_signers` file is what turns that into a name: it maps email
+// addresses to the keys that may sign for them, and `ssh-keygen -Y verify`
+// and `git log --show-signature` both read one. Without it a verified
+// signature means "signed by somebody", which is not the question anybody
+// is asking.
+//
+// A line is a list of principals, optional options, then a key:
+//
+//     alice@example.com ssh-ed25519 AAAA...
+//     *@example.com namespaces="git" ssh-ed25519 AAAA...
+//     bob@example.com valid-after="20240101",valid-before="20250101" ssh-rsa AAAA...
+//
+// The parts worth getting right:
+//
+//   - **Principals are comma-separated and may be patterns.** `*@example.com`
+//     matches a whole domain. A file with one entry per person and one with
+//     a pattern are both normal.
+//   - **Options come between the principals and the key**, are
+//     comma-separated, and a quoted value may contain a comma — so
+//     `namespaces="git,file"` is one option and not two. Splitting naively
+//     turns a restriction into a different, looser restriction.
+//   - **`namespaces` is a restriction, not a label.** A key limited to the
+//     `git` namespace must not verify a `file` signature, and a verifier
+//     that reads the option and ignores it has quietly widened what the
+//     key can do.
+//
+// Checked against `ssh-keygen -Y find-principals`, which answers exactly the
+// question this file exists to answer.
+
+import sshkey
+
+type AllowedError =
+    | AllowedMalformed(line: str)
+
+type AllowedEntry = {
+    /// The principals, as written: names or patterns.
+    principals: [str],
+    /// The options, as written, including their values.
+    options: [str],
+    /// The key type, such as `ssh-ed25519`.
+    key_type: str,
+    /// The key in base64, as the line holds it.
+    key: str,
+}
+
+fn split_outside_quotes(text: str, separator: str) -> [str] {
+    var out: [str] = []
+    var current = ""
+    var quoted = false
+    var i = 0
+    while i < text.len() {
+        let c = text.substr(i, 1)
+        if c == "\\" and quoted and i + 1 < text.len() {
+            current = current + c + text.substr(i + 1, 1)
+            i = i + 2
+            continue
+        }
+        if c == "\"" {
+            quoted = not quoted
+            current = current + c
+        } else if c == separator and not quoted {
+            out.push(current)
+            current = ""
+        } else {
+            current = current + c
+        }
+        i = i + 1
+    }
+    if current.len() > 0 {
+        out.push(current)
+    }
+    return out
+}
+
+/// The fields of a line, splitting on the spaces outside quotes.
+fn fields_of(line: str) -> [str] {
+    var out: [str] = []
+    var current = ""
+    var quoted = false
+    var i = 0
+    while i < line.len() {
+        let c = line.substr(i, 1)
+        if c == "\\" and quoted and i + 1 < line.len() {
+            current = current + c + line.substr(i + 1, 1)
+            i = i + 2
+            continue
+        }
+        if c == "\"" {
+            quoted = not quoted
+            current = current + c
+        } else if (c == " " or c == "\t") and not quoted {
+            if current.len() > 0 {
+                out.push(current)
+                current = ""
+            }
+        } else {
+            current = current + c
+        }
+        i = i + 1
+    }
+    if current.len() > 0 {
+        out.push(current)
+    }
+    return out
+}
+
+fn looks_like_key_type(field: str) -> bool {
+    return field.starts_with("ssh-") or field.starts_with("ecdsa-") or
+    field.starts_with("sk-")
+}
+
+/// A whole `allowed_signers` file.
+pub fn parse(text: str) -> [AllowedEntry] {
+    var out: [AllowedEntry] = []
+    for raw in text.split("\n") {
+        let line = raw.trim()
+        if line.len() == 0 or line.starts_with("#") {
+            continue
+        }
+        let fields = fields_of(line)
+        if fields.len() < 3 {
+            continue
+        }
+        // The key type is the first field that looks like one; whatever
+        // sits between it and the principals is options.
+        var at = 1
+        while at < fields.len() and not looks_like_key_type(fields[at]) {
+            at = at + 1
+        }
+        if at + 1 >= fields.len() {
+            continue
+        }
+        var options: [str] = []
+        var k = 1
+        while k < at {
+            for option in split_outside_quotes(fields[k], ",") {
+                options.push(option)
+            }
+            k = k + 1
+        }
+        out.push(AllowedEntry{
+            principals: split_outside_quotes(fields[0], ","),
+            options: options,
+            key_type: fields[at],
+            key: fields[at + 1],
+        })
+    }
+    return out
+}
+
+/// Whether a principal pattern matches a name. `*` stands for any run of
+/// characters and `?` for one.
+pub fn principal_matches(pattern: str, name: str) -> bool {
+    return glob_matches(pattern.chars(), 0, name.chars(), 0)
+}
+
+fn glob_matches(pattern: [str], p: i64, name: [str], n: i64) -> bool {
+    if p >= pattern.len() {
+        return n >= name.len()
+    }
+    if pattern[p] == "*" {
+        var i = n
+        while i <= name.len() {
+            if glob_matches(pattern, p + 1, name, i) {
+                return true
+            }
+            i = i + 1
+        }
+        return false
+    }
+    if n >= name.len() {
+        return false
+    }
+    if pattern[p] == "?" or pattern[p] == name[n] {
+        return glob_matches(pattern, p + 1, name, n + 1)
+    }
+    return false
+}
+
+/// The value of an option such as `namespaces`, with its quotes removed.
+pub fn option_value(entry: AllowedEntry, name: str) -> Option[str] {
+    for option in entry.options {
+        if not option.starts_with(name + "=") {
+            continue
+        }
+        var value = option.substr(name.len() + 1,
+            option.len() - name.len() - 1)
+        if value.len() >= 2 and value.starts_with("\"") and
+        value.ends_with("\"") {
+            value = value.substr(1, value.len() - 2)
+        }
+        return Some(value)
+    }
+    return None
+}
+
+/// Whether an entry allows signing in a namespace.
+///
+/// An entry with no `namespaces` option allows any; one with the option
+/// allows only what it lists, which is a restriction and not a label.
+pub fn allows_namespace(entry: AllowedEntry, namespace: str) -> bool {
+    match option_value(entry, "namespaces") {
+        None -> return true
+        Some(value) -> {
+            for allowed in value.split(",") {
+                if principal_matches(allowed.trim(), namespace) {
+                    return true
+                }
+            }
+            return false
+        }
+    }
+}
+
+/// The principals that may sign with a given key in a given namespace —
+/// which is what `ssh-keygen -Y find-principals` prints, one to a line.
+pub fn find_principals(entries: [AllowedEntry], key_type: str, key: str,
+    namespace: str) -> [str] {
+    var out: [str] = []
+    var seen: Map[str, bool] = {}
+    for entry in entries {
+        if entry.key_type != key_type or entry.key != key {
+            continue
+        }
+        if not allows_namespace(entry, namespace) {
+            continue
+        }
+        for principal in entry.principals {
+            if not seen.has(principal) {
+                seen.set(principal, true)
+                out.push(principal)
+            }
+        }
+    }
+    return out
+}
+
+/// Whether a named person may sign with a key, patterns included.
+pub fn is_allowed(entries: [AllowedEntry], principal: str, key_type: str,
+    key: str, namespace: str) -> bool {
+    for entry in entries {
+        if entry.key_type != key_type or entry.key != key {
+            continue
+        }
+        if not allows_namespace(entry, namespace) {
+            continue
+        }
+        for pattern in entry.principals {
+            if principal_matches(pattern, principal) {
+                return true
+            }
+        }
+    }
+    return false
+}
+
+/// An entry's key as an `authorized_keys` line, so its fingerprint can be
+/// taken.
+pub fn fingerprint(entry: AllowedEntry) -> str {
+    match sshkey.parse(entry.key_type + " " + entry.key) {
+        Ok(key) -> return sshkey.fingerprint_sha256(key)
+        Err(_e) -> return ""
+    }
+}

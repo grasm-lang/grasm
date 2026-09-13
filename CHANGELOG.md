@@ -9,6 +9,21 @@ migration note here; anything `experimental` may change in any release. See
 
 ### Added
 
+- **The three files around an SSH signature.** `sshprivkey` reads
+  `-----BEGIN OPENSSH PRIVATE KEY-----`, a format documented in OpenSSH's
+  own source and no RFC. An encrypted key still parses: the header and the
+  public key are never encrypted, so "is this key encrypted, and whose is
+  it?" — the question most callers actually have — is answerable without a
+  passphrase, and this never needs to hold one. `allowedsigners` reads the
+  file that turns a verified signature into a name, keeping the `namespaces`
+  option as the restriction it is rather than a label, and splitting options
+  on the commas outside quotes. `gitstripspace` cleans a commit message the
+  way `git stripspace` does, and takes the subject as the *first paragraph*
+  rather than the first line — which is what `git log --format=%s` prints and
+  what a tool taking the first line disagrees with. 74 cases against
+  `ssh-keygen -y`, `ssh-keygen -l`, `git stripspace` and `git log --format`;
+  `signingdiff` is a gate.
+
 - **A stable name for a change, and a way to check who signed something.**
   `patchid` reproduces `git patch-id`: the same fix cherry-picked onto three
   branches has three commit hashes and one patch id, because the line numbers

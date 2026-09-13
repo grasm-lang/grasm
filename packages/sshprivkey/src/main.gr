@@ -1,0 +1,274 @@
+// The `-----BEGIN OPENSSH PRIVATE KEY-----` file.
+//
+// OpenSSH replaced PEM for its own keys in 2014 and the new format is not
+// documented in any RFC — it is described in `PROTOCOL.key` in the OpenSSH
+// source and nowhere else. Anything that has to work with a key file rather
+// than a running agent has to read it: a deployment tool checking that the
+// key on disk matches the one in `authorized_keys`, a backup that must not
+// silently contain an encrypted key it cannot restore, a signer.
+//
+// The structure is OpenSSH's usual length-prefixed strings:
+//
+//     "openssh-key-v1\0" | cipher | kdf | kdf options | count
+//                        | public key | private section
+//
+// and the private section is itself a blob of the same kind, holding two
+// copies of a check number, then each key's type, its public part, its
+// private part, and a comment.
+//
+// ## Encryption, and what this does and does not do
+//
+// When the cipher is `none` the private section is plain and everything in
+// it can be read. When it is not — `aes256-ctr` with `bcrypt` is what
+// `ssh-keygen` writes for a key with a passphrase — the private section is
+// ciphertext and this does not decrypt it. What it *does* do is say so:
+// `is_encrypted` and `cipher` are readable without a passphrase, because
+// the header is never encrypted, and so is the public key, which is stored
+// in the clear for exactly this reason.
+//
+// That covers the question most callers actually have — "is this key
+// encrypted, and whose is it?" — without this package ever needing to hold
+// a passphrase.
+//
+// The two check numbers at the start of the private section are the trick
+// that makes a wrong passphrase detectable: they are written equal, so a
+// decryption that produces two different numbers is a decryption with the
+// wrong key. `check_numbers_agree` reports that for a key that was not
+// encrypted, where it should always hold.
+//
+// Checked against `ssh-keygen -y` and `ssh-keygen -l`, which print the
+// public key and its fingerprint from the private file.
+
+import bytes_codec
+import sshkey
+
+type SshPrivError =
+    | SshPrivNotArmoured(why: str)
+    | SshPrivNotBase64(text: str)
+    | SshPrivMagic(found: str)
+    | SshPrivTruncated(at: i64)
+    | SshPrivNoKeys
+
+let BEGIN = "-----BEGIN OPENSSH PRIVATE KEY-----"
+let END = "-----END OPENSSH PRIVATE KEY-----"
+
+/// What a private key file holds.
+type SshPrivateKey = {
+    /// `none` for a key with no passphrase.
+    cipher: str,
+    /// `none`, or `bcrypt` for one with.
+    kdf: str,
+    /// The public key in wire form, which is stored unencrypted.
+    public_key: bytes,
+    /// The comment, readable only when the key is not encrypted.
+    comment: str,
+    /// The private part, empty when the key is encrypted.
+    private_part: bytes,
+    /// Whether the two check numbers matched, which they always should for
+    /// an unencrypted key.
+    check_numbers_agree: bool,
+}
+
+fn read_u32(data: bytes, at: i64) -> i64 {
+    return data.at(at) * 16777216 + data.at(at + 1) * 65536 +
+    data.at(at + 2) * 256 + data.at(at + 3)
+}
+
+fn slice(data: bytes, from: i64, to: i64) -> bytes {
+    var out: [i64] = []
+    var i = from
+    while i < to and i < data.len() {
+        out.push(data.at(i))
+        i = i + 1
+    }
+    return bytes_of(out)
+}
+
+fn read_string(data: bytes, at: i64) -> (bytes, i64) ! SshPrivError {
+    if at + 4 > data.len() {
+        fail(SshPrivTruncated(at))
+    }
+    let size = read_u32(data, at)
+    if size < 0 or at + 4 + size > data.len() {
+        fail(SshPrivTruncated(at))
+    }
+    return (slice(data, at + 4, at + 4 + size), at + 4 + size)
+}
+
+/// The armour stripped and the base64 decoded.
+pub fn decode_armour(text: str) -> bytes ! SshPrivError {
+    var body = ""
+    var inside = false
+    for line in text.split("\n") {
+        let trimmed = line.trim()
+        if trimmed == BEGIN {
+            inside = true
+            continue
+        }
+        if trimmed == END {
+            inside = false
+            continue
+        }
+        if inside {
+            body = body + trimmed
+        }
+    }
+    if body.len() == 0 {
+        fail(SshPrivNotArmoured("no key between the markers"))
+    }
+    match bytes_codec.decode_base64(body) {
+        Some(raw) -> return raw
+        None -> fail(SshPrivNotBase64(body))
+    }
+}
+
+/// A private key file.
+///
+/// An encrypted key parses: the header and the public key are never
+/// encrypted, so its type, its fingerprint and the fact that it needs a
+/// passphrase are all readable without one.
+pub fn parse(text: str) -> SshPrivateKey ! SshPrivError {
+    let raw = try decode_armour(text)
+    if raw.len() < 15 {
+        fail(SshPrivTruncated(0))
+    }
+    let magic = slice(raw, 0, 14).to_str()
+    if magic != "openssh-key-v1" {
+        fail(SshPrivMagic(magic))
+    }
+    let cipher = try read_string(raw, 15)
+    let kdf = try read_string(raw, cipher.1)
+    let options = try read_string(raw, kdf.1)
+    if options.1 + 4 > raw.len() {
+        fail(SshPrivTruncated(options.1))
+    }
+    let count = read_u32(raw, options.1)
+    if count < 1 {
+        fail(SshPrivNoKeys)
+    }
+    let public = try read_string(raw, options.1 + 4)
+    let private = try read_string(raw, public.1)
+    let name = cipher.0.to_str()
+    if name != "none" {
+        return SshPrivateKey{
+            cipher: name,
+            kdf: kdf.0.to_str(),
+            public_key: public.0,
+            comment: "",
+            private_part: bytes_of([]),
+            check_numbers_agree: false,
+        }
+    }
+    let inner = private.0
+    if inner.len() < 8 {
+        fail(SshPrivTruncated(0))
+    }
+    // Two copies of the same number: a decryption that produces two
+    // different ones was done with the wrong passphrase.
+    let agree = read_u32(inner, 0) == read_u32(inner, 4)
+    let kind = try read_string(inner, 8)
+    var at = kind.1
+    // The key's own fields, whose number depends on its type, then the
+    // comment. Walking to the comment means walking them.
+    let fields = field_count(kind.0.to_str())
+    var i = 0
+    while i < fields {
+        at = (try read_string(inner, at)).1
+        i = i + 1
+    }
+    let comment = try read_string(inner, at)
+    return SshPrivateKey{
+        cipher: name,
+        kdf: kdf.0.to_str(),
+        public_key: public.0,
+        comment: comment.0.to_str(),
+        private_part: slice(inner, 8, comment.1),
+        check_numbers_agree: agree,
+    }
+}
+
+/// How many length-prefixed fields a key of this type carries before its
+/// comment.
+fn field_count(kind: str) -> i64 {
+    if kind == "ssh-ed25519" {
+        // The public point and then the seed with the point after it.
+        return 2
+    }
+    if kind == "ssh-rsa" {
+        // n, e, d, iqmp, p, q.
+        return 6
+    }
+    if kind == "ssh-dss" {
+        return 5
+    }
+    if kind.starts_with("ecdsa-sha2-") {
+        // The curve name, the point, and the secret.
+        return 3
+    }
+    if kind.starts_with("sk-") {
+        return 4
+    }
+    return 2
+}
+
+/// Whether the file needs a passphrase.
+pub fn is_encrypted(key: SshPrivateKey) -> bool {
+    return key.cipher != "none"
+}
+
+/// The key's type, such as `ssh-ed25519`.
+pub fn key_type(key: SshPrivateKey) -> str {
+    match read_string(key.public_key, 0) {
+        Ok(first) -> return first.0.to_str()
+        Err(_e) -> return ""
+    }
+}
+
+/// The public key as `ssh-keygen -y` prints it: type, base64, comment.
+pub fn public_line(key: SshPrivateKey) -> str {
+    var line = key_type(key) + " " +
+    bytes_codec.encode_base64(key.public_key)
+    if key.comment.len() > 0 {
+        line = line + " " + key.comment
+    }
+    return line
+}
+
+/// The `SHA256:` fingerprint, which is readable even for an encrypted key.
+pub fn fingerprint(key: SshPrivateKey) -> str {
+    match sshkey.parse(key_type(key) + " " +
+        bytes_codec.encode_base64(key.public_key)) {
+        Ok(parsed) -> return sshkey.fingerprint_sha256(parsed)
+        Err(_e) -> return ""
+    }
+}
+
+/// The 32-byte ed25519 seed, for an unencrypted ed25519 key.
+///
+/// Nothing else is exposed: the other key types' private parts are numbers
+/// whose meaning depends on the algorithm, and handing them out as bytes
+/// would invite somebody to use them as if they were not.
+pub fn ed25519_seed(key: SshPrivateKey) -> Option[bytes] {
+    if is_encrypted(key) or key_type(key) != "ssh-ed25519" {
+        return None
+    }
+    match read_string(key.private_part, 0) {
+        Ok(kind) -> {
+            match read_string(key.private_part, kind.1) {
+                Ok(public) -> {
+                    match read_string(key.private_part, public.1) {
+                        Ok(secret) -> {
+                            if secret.0.len() < 32 {
+                                return None
+                            }
+                            return Some(slice(secret.0, 0, 32))
+                        }
+                        Err(_e) -> return None
+                    }
+                }
+                Err(_e) -> return None
+            }
+        }
+        Err(_e) -> return None
+    }
+}

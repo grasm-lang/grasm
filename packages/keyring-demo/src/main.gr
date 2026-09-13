@@ -1,0 +1,143 @@
+// A key file, the file that says whose signature counts, and the commit
+// message that gets signed.
+import sshprivkey
+import allowedsigners
+import gitstripspace
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn check_sshprivkey(inout f: i64) / {io} {
+    // An ed25519 key with no passphrase, written by `ssh-keygen`.
+    let text = "-----BEGIN OPENSSH PRIVATE KEY-----\n" +
+    "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW\n" +
+    "QyNTUxOQAAACC0cQHOZzTo6rHfs/acSg4mypM0L7ZZRv+tgxGgjPTYRgAAAJjc+b3K3Pm9\n" +
+    "ygAAAAtzc2gtZWQyNTUxOQAAACC0cQHOZzTo6rHfs/acSg4mypM0L7ZZRv+tgxGgjPTYRg\n" +
+    "AAAEDMfi1gc7WdI/q+4/l+5OOdAnCnxfYb/YMYxJnulVX6N7RxAc5nNOjqsd+z9pxKDibK\n" +
+    "kzQvtllG/62DEaCM9NhGAAAADnNpZ25lckBleGFtcGxlAQIDBAUGBw==\n" +
+    "-----END OPENSSH PRIVATE KEY-----\n"
+    match sshprivkey.parse(text) {
+        Err(_e) -> say(f, "a private key parses", false)
+        Ok(key) -> {
+            say(f, "a private key parses", true)
+            say(f, "and says it needs no passphrase",
+                not sshprivkey.is_encrypted(key))
+            say(f, "with the cipher it was written with",
+                key.cipher == "none" and key.kdf == "none")
+            say(f, "the key type is readable",
+                sshprivkey.key_type(key) == "ssh-ed25519")
+            say(f, "so is the comment",
+                key.comment == "signer@example")
+            // The two check numbers are written equal; a decryption that
+            // produces different ones was done with the wrong passphrase.
+            say(f, "the two check numbers agree",
+                key.check_numbers_agree)
+            say(f, "the public key comes back as a line",
+                sshprivkey.public_line(key).starts_with("ssh-ed25519 "))
+            say(f, "and its fingerprint",
+                sshprivkey.fingerprint(key).starts_with("SHA256:"))
+            say(f, "the ed25519 seed is thirty-two bytes",
+                (sshprivkey.ed25519_seed(key) ?? "".to_bytes()).len() == 32)
+        }
+    }
+    say(f, "something that is not a key is refused",
+        (sshprivkey.parse("hello") ?? SshPrivateKey{ cipher: "!",
+            kdf: "", public_key: "".to_bytes(), comment: "",
+            private_part: "".to_bytes(), check_numbers_agree: false })
+            .cipher == "!")
+}
+
+fn check_allowedsigners(inout f: i64) / {io} {
+    let text = "alice@example.com ssh-ed25519 AAAAKEY1\n" +
+    "*@other.example namespaces=\"git\" ssh-ed25519 AAAAKEY1\n" +
+    "# a comment\n" +
+    "bob@example.com,carol@example.com ssh-ed25519 AAAAKEY2\n" +
+    "dave@example.com namespaces=\"git,file\" ssh-rsa AAAAKEY3\n"
+    let entries = allowedsigners.parse(text)
+    say(f, "the comment is not an entry", entries.len() == 4)
+    say(f, "a line may name several principals",
+        entries[2].principals.len() == 2)
+    say(f, "a named person is found",
+        allowedsigners.is_allowed(entries, "alice@example.com",
+            "ssh-ed25519", "AAAAKEY1", "git"))
+    // A pattern matches a whole domain.
+    say(f, "a pattern matches a whole domain",
+        allowedsigners.is_allowed(entries, "anyone@other.example",
+            "ssh-ed25519", "AAAAKEY1", "git"))
+    // `namespaces` is a restriction, not a label.
+    say(f, "and not outside the namespace it was given",
+        not allowedsigners.is_allowed(entries, "anyone@other.example",
+            "ssh-ed25519", "AAAAKEY1", "file"))
+    say(f, "a quoted comma keeps one option as one",
+        entries[3].options.len() == 1)
+    say(f, "and both namespaces in it are allowed",
+        allowedsigners.allows_namespace(entries[3], "file"))
+    say(f, "an entry with no namespaces option allows any",
+        allowedsigners.allows_namespace(entries[0], "anything"))
+    say(f, "the principals for a key are listed",
+        allowedsigners.find_principals(entries, "ssh-ed25519", "AAAAKEY2",
+            "git").len() == 2)
+    say(f, "and a key nobody lists has none",
+        allowedsigners.find_principals(entries, "ssh-ed25519", "NOPE",
+            "git").len() == 0)
+}
+
+fn check_gitstripspace(inout f: i64) / {io} {
+    say(f, "a run of blank lines becomes one",
+        gitstripspace.clean("a\n\n\n\nb\n", false) == "a\n\nb\n")
+    say(f, "blank lines at the ends go entirely",
+        gitstripspace.clean("\n\ntext\n\n\n", false) == "text\n")
+    say(f, "trailing whitespace comes off every line",
+        gitstripspace.clean("text   \nmore\t\n", false) == "text\nmore\n")
+    say(f, "a missing final newline is supplied",
+        gitstripspace.clean("text", false) == "text\n")
+    say(f, "a message of only blank lines is empty",
+        gitstripspace.clean("\n\n\n", false) == "")
+    // Comments are dropped only when they start at column zero.
+    say(f, "a comment at column zero is dropped",
+        gitstripspace.clean("a\n# c\nb\n", true) == "a\nb\n")
+    say(f, "and an indented one is not",
+        gitstripspace.clean("a\n  # c\nb\n", true) == "a\n  # c\nb\n")
+    say(f, "a semicolon is not a comment",
+        gitstripspace.clean("; s\na\n", true) == "; s\na\n")
+    // The subject is the first paragraph, not the first line.
+    say(f, "a one-line subject is that line",
+        gitstripspace.subject_of("subject\n\nbody\n") == "subject")
+    say(f, "a two-line first paragraph is a two-line subject",
+        gitstripspace.subject_of("first\nsecond\n\nbody\n") ==
+        "first second")
+    // The body keeps its own trailing newline, which is what
+    // `git log --format=%b` prints.
+    say(f, "the body is what follows it",
+        gitstripspace.body_of("subject\n\nbody here\n") == "body here\n")
+    say(f, "a message with no body has none",
+        gitstripspace.body_of("subject only\n") == "")
+    say(f, "and one that is only comments is empty",
+        gitstripspace.is_empty("# all\n# comments\n"))
+    // The subject is taken from the message as stored, comments and all,
+    // because whether they were removed was decided when the commit was
+    // made.
+    say(f, "a comment inside the first paragraph is part of the subject",
+        gitstripspace.subject_of("text\n# a comment\nmore\n") ==
+        "text # a comment more")
+}
+
+fn main() / {io} {
+    var f = 0
+
+    check_sshprivkey(f)
+    check_allowedsigners(f)
+    check_gitstripspace(f)
+
+    if f == 0 {
+        print("keyring: every claim held")
+    } else {
+        print("keyring: {f} failed")
+    }
+}

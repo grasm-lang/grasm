@@ -1,0 +1,124 @@
+// Cleaning up a commit message, the way git cleans one up.
+//
+// Every tool that writes a commit has to do this, and every one that does it
+// by hand does it slightly differently — which is why the same change
+// committed by two tools produces messages that differ in trailing
+// whitespace and blank lines, and why `git log` output does not line up.
+// git exposes its own version as `git stripspace`, and this is that:
+//
+//   - trailing whitespace comes off every line
+//   - a run of blank lines becomes one blank line
+//   - blank lines at the start and the end go entirely
+//   - the result ends in a newline, unless there is nothing left
+//
+// and, with comments stripped, lines whose *first* character is `#` are
+// dropped. First character: an indented `  # like this` is kept, because a
+// commit message may legitimately contain an indented example, and the
+// editor template git writes puts its comments at column zero.
+//
+// The subject and body are here too, because the rule for those is also
+// git's and is also got wrong: the subject is the first paragraph — not the
+// first line — so a message whose first two lines have no blank line
+// between them has a two-line subject, joined with a space. That is what
+// `git log --format=%s` prints, and a tool that takes the first line
+// instead disagrees with it exactly on the messages where it matters.
+
+/// The whitespace at the end of a line, removed.
+fn trim_end(line: str) -> str {
+    var end = line.len()
+    while end > 0 {
+        let c = line.substr(end - 1, 1)
+        if c != " " and c != "\t" and c != "\r" {
+            break
+        }
+        end = end - 1
+    }
+    return line.substr(0, end)
+}
+
+/// A message cleaned up the way `git stripspace` cleans one up.
+pub fn clean(text: str, strip_comments: bool) -> str {
+    var lines: [str] = []
+    for raw in text.split("\n") {
+        let line = trim_end(raw)
+        if strip_comments and line.starts_with("#") {
+            continue
+        }
+        lines.push(line)
+    }
+    var out: [str] = []
+    var blank_pending = false
+    for line in lines {
+        if line.len() == 0 {
+            // A blank line only becomes output if something follows it.
+            if out.len() > 0 {
+                blank_pending = true
+            }
+            continue
+        }
+        if blank_pending {
+            out.push("")
+            blank_pending = false
+        }
+        out.push(line)
+    }
+    if out.len() == 0 {
+        return ""
+    }
+    return out.join("\n") + "\n"
+}
+
+/// The subject: the first paragraph, joined into one line.
+///
+/// Not the first line. A message whose first two lines run together has a
+/// two-line subject, which is what `git log --format=%s` prints.
+pub fn subject_of(text: str) -> str {
+    // Comments are not stripped here. `git log --format=%s` reads the
+    // message as it was stored, and whether comments were removed was
+    // decided when the commit was made.
+    let cleaned = clean(text, false)
+    var parts: [str] = []
+    for line in cleaned.split("\n") {
+        if line.len() == 0 {
+            break
+        }
+        parts.push(line)
+    }
+    return parts.join(" ")
+}
+
+/// Everything after the subject's paragraph, with its own trailing newline
+/// kept — which is what `git log --format=%b` prints.
+pub fn body_of(text: str) -> str {
+    let cleaned = clean(text, false)
+    var lines = cleaned.split("\n")
+    var at = 0
+    while at < lines.len() and lines[at].len() > 0 {
+        at = at + 1
+    }
+    while at < lines.len() and lines[at].len() == 0 {
+        at = at + 1
+    }
+    var out: [str] = []
+    while at < lines.len() {
+        out.push(lines[at])
+        at = at + 1
+    }
+    let body = out.join("\n")
+    if body.trim().len() == 0 {
+        return ""
+    }
+    return body
+}
+
+/// Whether a message is empty once cleaned — which is what git checks
+/// before refusing to make the commit.
+pub fn is_empty(text: str) -> bool {
+    return clean(text, true).len() == 0
+}
+
+/// How long the subject is, which is the number every commit-message
+/// guideline is about.
+pub fn subject_length(text: str) -> i64 {
+    return subject_of(text).len()
+}
