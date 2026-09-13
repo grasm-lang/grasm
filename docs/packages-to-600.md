@@ -52,8 +52,35 @@ gates run, and several of them are the only consumer a format parser has.
   everybody still has to read: a broken hash, the UUID versions built on
   it, an alphabet chosen so encodings sort, the ten characters `ls`
   prints, HTML's 2231 named references, and the suggestion ranking every
-  "did you mean" copies. Checked against `hashlib`, `uuid`, `base64`,
-  `stat`, `html` and `difflib` — 590 cases, three new gates.
+  "did you mean" copies. 590 cases against `hashlib`, `uuid`, `base64`,
+  `stat`, `html` and `difflib`.
+- [x] **Compression that compresses** — `deflate` `gzip` `xzfile`. `zlib`
+  could read a deflate stream and could only write stored blocks, so every
+  producer in the tree emitted files nothing made smaller. Now there is an
+  encoder, the `.gz` container both ways, and a reader for `.xz` down to the
+  range decoder. 202 cases against `zlib`, `gzip` and `lzma`, corrupted
+  inputs included.
+- [x] **Who a machine lets in** — `unixcrypt` `sshkey` `crc64`. md5crypt,
+  apr1, sha256crypt and sha512crypt against `openssl passwd` and the
+  sha-crypt specification's own vectors; OpenSSH public keys and both
+  fingerprint formats against `ssh-keygen -l`; and the CRC-64 `.xz` checks
+  with by default, which `xzfile` could previously read and not verify.
+  97 cases.
+- [x] **Two more ways to write Japanese** — `eucjp` `iso2022jp` `iso3166`.
+  The Unix encoding of JIS X 0208 and the seven-bit one Japanese mail is
+  still in, both going through the table `shiftjis` already carried rather
+  than copying it; and the country codes, names and zones, taken from the tz
+  database's own tables. 27,789 cases against Python's codecs and against
+  `iso3166.tab`.
+- [x] **Agreeing with somebody else** — `mersenne` `gettextmo`. MT19937
+  seeded the way Python seeds it, for when "random" in a paper or a fixture
+  means that exact generator; and the compiled `.mo` catalogues every
+  translation in the world is stored in, plural rules evaluated rather than
+  guessed. 1,356 cases against `random` and `gettext`.
+- [x] **Reading what Python wrote** — `picklefile` `formatspec`. The pickle
+  format's data half, with the four opcodes that call Python refused; and
+  the mini-language after the colon in a format field, integers and strings.
+  15,868 cases against `pickle` and `format()`.
 
 ### Next
 
