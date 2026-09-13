@@ -1,0 +1,58 @@
+import saslprep
+import unicodeescape
+import passwdfile
+
+fn from_hex(text: str) -> str {
+    var out: [i64] = []
+    var i = 1
+    while i + 1 < text.len() {
+        out.push(text.substr(i, 2).parse_int_base(16) ?? 0)
+        i = i + 2
+    }
+    return bytes_of(out).to_str()
+}
+
+fn to_hex(text: str) -> str {
+    let digits = "0123456789abcdef"
+    let raw = text.to_bytes()
+    var out = ""
+    var i = 0
+    while i < raw.len() {
+        out = out + digits.substr(raw.at(i) / 16, 1) +
+        digits.substr(raw.at(i) % 16, 1)
+        i = i + 1
+    }
+    return out
+}
+
+fn main() / {io} {
+    var i = 0
+    while i + 1 < args().len() {
+        let what = args()[i]
+        let body = from_hex(args()[i + 1])
+        if what == "query" {
+            print(to_hex(saslprep.password(body) ?? "?refused?"))
+        } else if what == "stored" {
+            print(to_hex(saslprep.username(body) ?? "?refused?"))
+        } else if what == "unescape" {
+            print(to_hex(unicodeescape.decode(body) ?? "?refused?"))
+        } else if what == "users" {
+            var lines: [str] = []
+            for user in passwdfile.users(body) ?? [] {
+                lines.push(passwdfile.render_user(user))
+            }
+            print(to_hex(lines.join("\n")))
+        } else if what == "groups" {
+            var lines: [str] = []
+            for group in passwdfile.groups(body) ?? [] {
+                lines.push(passwdfile.render_group(group))
+            }
+            print(to_hex(lines.join("\n")))
+        } else if what == "escape" {
+            print(to_hex(unicodeescape.encode(body)))
+        } else {
+            print(to_hex(unicodeescape.encode_ascii_only(body)))
+        }
+        i = i + 2
+    }
+}

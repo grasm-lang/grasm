@@ -1,0 +1,16 @@
+[package]
+name = "preptest"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.saslprep]
+path = "../saslprep"
+version = "^1.0.0"
+
+[dependencies.unicodeescape]
+path = "../unicodeescape"
+version = "^1.0.0"
+
+[dependencies.passwdfile]
+path = "../passwdfile"
+version = "^1.0.0"

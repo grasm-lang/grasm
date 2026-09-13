@@ -9,6 +9,25 @@ migration note here; anything `experimental` may change in any release. See
 
 ### Added
 
+- **What happens to a password before it is hashed.** `saslprep` is RFC 4013,
+  which SCRAM requires and `postgres` therefore needs: two people typing what
+  they believe is the same password on two keyboards can produce different
+  bytes — a non-breaking space, a precomposed `é`, a fullwidth letter from an
+  IME — and without preparation one of those logins fails and nobody can say
+  why. It is nameprep with two differences: no case folding, because a
+  password is case-sensitive, and ASCII control characters prohibited where
+  nameprep leaves them alone. A *stored* string may not contain an unassigned
+  code point and a *query* string may, so that a password stored today still
+  verifies after a Unicode update; `prepare` takes which it is rather than
+  guessing. `unicodeescape` reads and writes the backslash escapes in a
+  source literal — where an unknown escape keeps both characters and a
+  truncated one is refused rather than guessed at. `passwdfile` reads
+  `/etc/passwd`, `/etc/group` and `/etc/shadow`, keeping apart the three
+  things a shadow field can mean: a hash, `*` or `!` for an account no
+  password will open, and *empty*, which means no password is needed at all.
+  82 cases against `stringprep`, `unicode_escape`, and `pwd` and `grp`
+  reading the same machine's files; `prepdiff` is a gate.
+
 - **Three files git keeps beside a repository.** `gitindex` reads
   `.git/index` — the staging area, which is a complete snapshot of the next
   commit rather than a list of changes, and where a merge conflict lives as

@@ -1,0 +1,122 @@
+// Preparing a password, reading a source literal, and the three files that
+// say who a machine's users are.
+import saslprep
+import unicodeescape
+import passwdfile
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn check_saslprep(inout f: i64) / {io} {
+    // RFC 4013's own examples.
+    say(f, "a soft hyphen is removed",
+        (saslprep.password("I\u{ad}X") ?? "") == "IX")
+    say(f, "an ordinary name is unchanged",
+        (saslprep.password("user") ?? "") == "user")
+    say(f, "case is not folded, because a password is case-sensitive",
+        (saslprep.password("USER") ?? "") == "USER")
+    say(f, "a feminine ordinal normalises to a letter",
+        (saslprep.password("\u{aa}") ?? "") == "a")
+    say(f, "and a roman numeral to two",
+        (saslprep.password("\u{2168}") ?? "") == "IX")
+    // Every kind of space becomes the ordinary one, so the same password
+    // typed on two keyboards matches.
+    say(f, "a non-breaking space becomes an ordinary one",
+        (saslprep.password("a\u{a0}b") ?? "") == "a b")
+    say(f, "and an ideographic one does too",
+        (saslprep.password("a\u{3000}b") ?? "") == "a b")
+    say(f, "two spellings of the same password compare equal",
+        saslprep.same("caf\u{e9}", "cafe\u{301}"))
+    // ASCII controls are prohibited here where nameprep leaves them alone.
+    say(f, "a control character is refused",
+        not saslprep.is_preparable("a\u{7}b", false))
+    // A stored string may not carry an unassigned code point; a query may.
+    say(f, "an unassigned code point is allowed in a password",
+        saslprep.is_preparable("a\u{9fff}b", false))
+    say(f, "and refused in a username",
+        not saslprep.is_preparable("a\u{9fff}b", true))
+}
+
+fn check_unicodeescape(inout f: i64) / {io} {
+    say(f, "the named escapes come back",
+        (unicodeescape.decode("a\\nb") ?? "") == "a\nb")
+    say(f, "a hex escape does too",
+        (unicodeescape.decode("\\x41\\x42") ?? "") == "AB")
+    say(f, "and a long one",
+        (unicodeescape.decode("\\U0001f600") ?? "") == "\u{1f600}")
+    // An unknown escape keeps both characters.
+    say(f, "an escape nobody defined keeps its backslash",
+        (unicodeescape.decode("a\\qb") ?? "") == "a\\qb")
+    // Octal takes up to three digits and stops at 255.
+    say(f, "an octal escape takes three digits and no more",
+        (unicodeescape.decode("\\1234") ?? "") == "S4")
+    // A truncated escape is refused rather than guessed at.
+    say(f, "a truncated hex escape is refused",
+        not unicodeescape.is_readable("\\u00"))
+    say(f, "and so is a lone surrogate, which a string cannot hold",
+        not unicodeescape.is_readable("\\ud800"))
+    say(f, "a line continuation produces nothing",
+        (unicodeescape.decode("a\\\nb") ?? "") == "ab")
+    say(f, "encoding writes the named escapes",
+        unicodeescape.encode("a\nb") == "a\\nb")
+    say(f, "and hex for anything above ASCII",
+        unicodeescape.encode("caf\u{e9}") == "caf\\xe9")
+    say(f, "text that needs nothing says so",
+        not unicodeescape.needs_escaping("plain text"))
+}
+
+fn check_passwdfile(inout f: i64) / {io} {
+    let passwd = "# a comment\nroot:x:0:0:root:/root:/bin/sh\n" +
+    "alice:x:1000:1000:Alice,,,:/home/alice:/bin/bash\n" +
+    "nobody:*:65534:65534::/nonexistent:/usr/sbin/nologin\n"
+    let people = passwdfile.users(passwd) ?? []
+    say(f, "the comment is not a record", people.len() == 3)
+    say(f, "a uid is read as a number", people[1].uid == 1000)
+    say(f, "and an empty field stays empty", people[2].gecos == "")
+    say(f, "a record written back is the line that was read",
+        passwdfile.render_user(people[1]) ==
+        "alice:x:1000:1000:Alice,,,:/home/alice:/bin/bash")
+    say(f, "a line with too few fields is refused",
+        (passwdfile.users("short:x:1\n") ?? []).len() == 0)
+    let group = "wheel:*:0:root,alice\nalice:x:1000:\n"
+    let groups = passwdfile.groups(group) ?? []
+    say(f, "group members are split on commas",
+        groups[0].members.len() == 2)
+    say(f, "and an empty member list is empty, not one empty name",
+        groups[1].members.len() == 0)
+    // A user's primary group does not list them, which is where most
+    // members actually are.
+    say(f, "a group's real membership includes its primary members",
+        passwdfile.members_of(groups, people, "alice").len() == 1)
+    let shadow = "root:$6$salt$hash:19000:0:99999:7:::\n" +
+    "locked:!:19000:0:99999:7:::\nopen::19000:0:99999:7:::\n"
+    let records = passwdfile.shadows(shadow) ?? []
+    say(f, "a hashed password is usable",
+        passwdfile.password_is_usable(records[0]))
+    // `!` means no password will ever match; empty means none is needed.
+    say(f, "a bang means no password will match",
+        not passwdfile.password_is_usable(records[1]))
+    say(f, "and an empty field means none is needed at all",
+        passwdfile.password_is_empty(records[2]) and
+        passwdfile.password_is_usable(records[2]))
+}
+
+fn main() / {io} {
+    var f = 0
+
+    check_saslprep(f)
+    check_unicodeescape(f)
+    check_passwdfile(f)
+
+    if f == 0 {
+        print("accounts2: every claim held")
+    } else {
+        print("accounts2: {f} failed")
+    }
+}

@@ -1,0 +1,6 @@
+[package]
+name = "passwdfile"
+version = "1.0.0"
+
+# Parses text it is handed. Opens no files itself.
+capabilities = []

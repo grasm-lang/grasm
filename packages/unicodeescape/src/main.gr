@@ -1,0 +1,231 @@
+// The backslash escapes in a source literal, both ways.
+//
+// `\n`, `\t`, `é`, `\x41`, `\101` — the notation almost every language
+// borrowed from C, and the notation Java `.properties` files, Python string
+// literals, and a great deal of generated configuration are written in.
+// Reading any of those means undoing it, and writing them means doing it.
+//
+// Two details are where implementations disagree, and both are about what
+// happens when the text is not quite right:
+//
+//   - **An unknown escape is not an error.** `\q` is a backslash followed
+//     by a `q`, both kept. That is what every reader in this family does,
+//     and a parser that rejects it fails on real files that were written by
+//     hand.
+//   - **A short escape is an error, not a short number.** `\u00` at the end
+//     of a string is refused rather than read as a null. An implementation
+//     that takes as many hex digits as it finds turns a truncated file into
+//     a plausible one.
+//
+// Octal escapes take *up to* three digits and stop early at a non-digit or
+// at a value above 255. `\1234` is the character 0o123 followed by a `4`.
+//
+// One deliberate divergence: `\ud800` names half of a surrogate pair, and
+// Python's codec produces it because its strings can hold one. A string here
+// is UTF-8 and cannot, so it is refused. There is no third option that is
+// not a lie about what came back.
+//
+// The encoder here writes what Python's `unicode_escape` writes: the named
+// escapes where they exist, `\xNN` below 256, `\uNNNN` below 65536, and
+// `\UNNNNNNNN` above — and a single quote left alone while a backslash is
+// doubled.
+//
+// Checked against Python's `unicode_escape` codec.
+
+type EscapeError =
+    | EscapeTruncated(at: i64)
+    | EscapeNotACharacter(at: i64, code: i64)
+
+let HEX = "0123456789abcdef"
+
+fn hex_value(c: str) -> i64 {
+    let lower = c.to_lower()
+    return HEX.index_of(lower) ?? -1
+}
+
+fn is_octal(c: str) -> bool {
+    return c >= "0" and c <= "7"
+}
+
+/// `text` with its escapes undone.
+///
+/// An escape this does not know keeps both characters, which is what the
+/// readers in this family do and what hand-written files rely on. One that
+/// is *truncated* is refused, because guessing at the missing digits turns
+/// a damaged file into a plausible one.
+pub fn decode(text: str) -> str ! EscapeError {
+    var out = ""
+    var i = 0
+    while i < text.len() {
+        let c = text.substr(i, 1)
+        if c != "\\" or i + 1 >= text.len() {
+            out = out + c
+            i = i + 1
+            continue
+        }
+        let next = text.substr(i + 1, 1)
+        if next == "n" {
+            out = out + "\n"
+            i = i + 2
+        } else if next == "t" {
+            out = out + "\t"
+            i = i + 2
+        } else if next == "r" {
+            out = out + "\r"
+            i = i + 2
+        } else if next == "a" {
+            out = out + "\u{7}"
+            i = i + 2
+        } else if next == "b" {
+            out = out + "\u{8}"
+            i = i + 2
+        } else if next == "f" {
+            out = out + "\u{c}"
+            i = i + 2
+        } else if next == "v" {
+            out = out + "\u{b}"
+            i = i + 2
+        } else if next == "0" and not is_octal(peek(text, i + 2)) {
+            out = out + "\u{0}"
+            i = i + 2
+        } else if next == "\\" or next == "'" or next == "\"" {
+            out = out + next
+            i = i + 2
+        } else if next == "\n" {
+            // A line continuation produces nothing at all.
+            i = i + 2
+        } else if next == "x" {
+            i = try take_hex(text, i, 2, out)
+        } else if next == "u" {
+            i = try take_hex(text, i, 4, out)
+        } else if next == "U" {
+            i = try take_hex(text, i, 8, out)
+        } else if is_octal(next) {
+            i = take_octal(text, i, out)
+        } else {
+            // Unknown: the backslash and the character both stay.
+            out = out + c + next
+            i = i + 2
+        }
+    }
+    return out
+}
+
+fn peek(text: str, at: i64) -> str {
+    if at >= text.len() {
+        return ""
+    }
+    return text.substr(at, 1)
+}
+
+/// Exactly `count` hex digits, and a code point a string can hold.
+fn take_hex(text: str, at: i64, count: i64,
+    inout out: str) -> i64 ! EscapeError {
+    var value = 0
+    var i = at + 2
+    var found = 0
+    while found < count and i < text.len() and
+    hex_value(text.substr(i, 1)) >= 0 {
+        value = value * 16 + hex_value(text.substr(i, 1))
+        i = i + 1
+        found = found + 1
+    }
+    if found < count {
+        fail(EscapeTruncated(at))
+    }
+    if value > 1114111 or (value >= 55296 and value <= 57343) {
+        fail(EscapeNotACharacter(at, value))
+    }
+    out = out + value.to_char()
+    return i
+}
+
+/// Up to three octal digits, stopping early at 255.
+fn take_octal(text: str, at: i64, inout out: str) -> i64 {
+    var value = 0
+    var i = at + 1
+    var found = 0
+    while found < 3 and i < text.len() and is_octal(text.substr(i, 1)) {
+        let next = value * 8 + (text.substr(i, 1).parse_int() ?? 0)
+        if next > 255 {
+            found = 3
+            continue
+        }
+        value = next
+        i = i + 1
+        found = found + 1
+    }
+    out = out + value.to_char()
+    return i
+}
+
+/// `text` with everything that needs escaping escaped, the way Python's
+/// `unicode_escape` writes it.
+pub fn encode(text: str) -> str {
+    var out = ""
+    for code in text.codes() {
+        if code == 10 {
+            out = out + "\\n"
+        } else if code == 9 {
+            out = out + "\\t"
+        } else if code == 13 {
+            out = out + "\\r"
+        } else if code == 92 {
+            out = out + "\\\\"
+        } else if code >= 32 and code < 127 {
+            out = out + code.to_char()
+        } else if code < 256 {
+            out = out + "\\x" + two_hex(code)
+        } else if code < 65536 {
+            out = out + "\\u" + two_hex(code / 256) + two_hex(code % 256)
+        } else {
+            out = out + "\\U" + two_hex(code.ushr(24).bit_and(255)) +
+            two_hex(code.ushr(16).bit_and(255)) +
+            two_hex(code.ushr(8).bit_and(255)) +
+            two_hex(code.bit_and(255))
+        }
+    }
+    return out
+}
+
+fn two_hex(value: i64) -> str {
+    return HEX.substr(value / 16, 1) + HEX.substr(value % 16, 1)
+}
+
+/// The same, but leaving anything printable and non-ASCII alone — which is
+/// what `raw_unicode_escape` does and what a `.properties` file wants when
+/// it is allowed to be UTF-8.
+pub fn encode_ascii_only(text: str) -> str {
+    var out = ""
+    for code in text.codes() {
+        if code < 128 {
+            out = out + encode(code.to_char())
+        } else if code < 65536 {
+            out = out + "\\u" + two_hex(code / 256) + two_hex(code % 256)
+        } else {
+            out = out + "\\U" + two_hex(code.ushr(24).bit_and(255)) +
+            two_hex(code.ushr(16).bit_and(255)) +
+            two_hex(code.ushr(8).bit_and(255)) +
+            two_hex(code.bit_and(255))
+        }
+    }
+    return out
+}
+
+/// Whether `text` is a literal this can read at all.
+pub fn is_readable(text: str) -> bool {
+    match decode(text) {
+        Ok(_result) -> return true
+        Err(_e) -> return false
+    }
+}
+
+/// Whether `text` contains anything that would need an escape.
+pub fn needs_escaping(text: str) -> bool {
+    for code in text.codes() {
+        if code < 32 or code > 126 or code == 92 {
+            return true
+        }
+    }
+    return false
+}

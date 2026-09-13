@@ -1,0 +1,327 @@
+// SASLprep (RFC 4013): what a password has to go through before it is
+// hashed.
+//
+// `packages/postgres` speaks SCRAM, and SCRAM says the password is
+// SASLprepped first. So does every other SASL mechanism worth using, and so
+// does the `AUTHENTICATE` step of modern IMAP and SMTP. The reason is not
+// tidiness: two people typing what they believe is the same password on two
+// keyboards can produce different bytes — a non-breaking space instead of a
+// space, a precomposed `é` instead of an `e` and an accent, a fullwidth
+// letter from a Japanese IME. Without preparation one of those logins
+// fails and nobody can say why.
+//
+// The steps, which are nameprep's with two differences:
+//
+//   1. **Map.** Non-ASCII spaces become an ordinary space; the characters
+//      that map to nothing are removed. Note what is *not* here: no case
+//      folding. A password is case-sensitive and `idna`'s preparation is
+//      not the same function.
+//   2. **Normalise, NFKC.**
+//   3. **Prohibit.** Control characters, the non-characters, private use,
+//      anything that changes text direction, and — unlike nameprep — plain
+//      ASCII control characters as well.
+//   4. **Check direction.** A string with right-to-left characters may not
+//      also contain left-to-right ones, and must begin and end
+//      right-to-left.
+//
+// There is one more rule, and it is the one that catches people: a
+// *stored* string may not contain an unassigned code point, while a *query*
+// string may. The reason is that a password stored today must still verify
+// after a Unicode update assigns that code point some behaviour. `prepare`
+// takes which kind it is being given rather than guessing.
+//
+// The tables are generated from Python's own `stringprep`, and the
+// normalisation is `unicodenorm`'s — which is current where RFC 3454 names
+// Unicode 3.2. For a password made of letters, digits and punctuation the
+// two agree; the gate says how many inputs it had to leave out.
+
+import unicodenorm
+
+fn table_space() -> str {
+    return "a0-a0 1680-1680 2000-200b 202f-202f 205f-205f 3000-3000 "
+}
+
+fn table_delete() -> str {
+    return "ad-ad 34f-34f 1806-1806 180b-180d 200b-200d 2060-2060 " +
+    "fe00-fe0f feff-feff "
+}
+
+fn table_prohibited() -> str {
+    return "0-1f 7f-a0 340-341 6dd-6dd 70f-70f 1680-1680 180e-180e " +
+    "2000-200f 2028-202f 205f-2063 206a-206f 2ff0-2ffb 3000-3000 " +
+    "d800-f8ff fdd0-fdef feff-feff fff9-ffff 1d173-1d17a " +
+    "1fffe-1ffff 2fffe-2ffff 3fffe-3ffff 4fffe-4ffff 5fffe-5ffff " +
+    "6fffe-6ffff 7fffe-7ffff 8fffe-8ffff 9fffe-9ffff afffe-affff " +
+    "bfffe-bffff cfffe-cffff dfffe-dffff e0001-e0001 e0020-e007f " +
+    "efffe-10ffff "
+}
+
+fn table_unassigned() -> str {
+    return "221-221 234-24f 2ae-2af 2ef-2ff 350-35f 370-373 376-379 " +
+    "37b-37d 37f-383 38b-38b 38d-38d 3a2-3a2 3cf-3cf 3f7-3ff " +
+    "487-487 4cf-4cf 4f6-4f7 4fa-4ff 510-530 557-558 560-560 " +
+    "588-588 58b-590 5a2-5a2 5ba-5ba 5c5-5cf 5eb-5ef 5f5-60b " +
+    "60d-61a 61c-61e 620-620 63b-63f 656-65f 6ee-6ef 6ff-6ff " +
+    "70e-70e 72d-72f 74b-77f 7b2-900 904-904 93a-93b 94e-94f " +
+    "955-957 971-980 984-984 98d-98e 991-992 9a9-9a9 9b1-9b1 " +
+    "9b3-9b5 9ba-9bb 9bd-9bd 9c5-9c6 9c9-9ca 9ce-9d6 9d8-9db " +
+    "9de-9de 9e4-9e5 9fb-a01 a03-a04 a0b-a0e a11-a12 a29-a29 " +
+    "a31-a31 a34-a34 a37-a37 a3a-a3b a3d-a3d a43-a46 a49-a4a " +
+    "a4e-a58 a5d-a5d a5f-a65 a75-a80 a84-a84 a8c-a8c a8e-a8e " +
+    "a92-a92 aa9-aa9 ab1-ab1 ab4-ab4 aba-abb ac6-ac6 aca-aca " +
+    "ace-acf ad1-adf ae1-ae5 af0-b00 b04-b04 b0d-b0e b11-b12 " +
+    "b29-b29 b31-b31 b34-b35 b3a-b3b b44-b46 b49-b4a b4e-b55 " +
+    "b58-b5b b5e-b5e b62-b65 b71-b81 b84-b84 b8b-b8d b91-b91 " +
+    "b96-b98 b9b-b9b b9d-b9d ba0-ba2 ba5-ba7 bab-bad bb6-bb6 " +
+    "bba-bbd bc3-bc5 bc9-bc9 bce-bd6 bd8-be6 bf3-c00 c04-c04 " +
+    "c0d-c0d c11-c11 c29-c29 c34-c34 c3a-c3d c45-c45 c49-c49 " +
+    "c4e-c54 c57-c5f c62-c65 c70-c81 c84-c84 c8d-c8d c91-c91 " +
+    "ca9-ca9 cb4-cb4 cba-cbd cc5-cc5 cc9-cc9 cce-cd4 cd7-cdd " +
+    "cdf-cdf ce2-ce5 cf0-d01 d04-d04 d0d-d0d d11-d11 d29-d29 " +
+    "d3a-d3d d44-d45 d49-d49 d4e-d56 d58-d5f d62-d65 d70-d81 " +
+    "d84-d84 d97-d99 db2-db2 dbc-dbc dbe-dbf dc7-dc9 dcb-dce " +
+    "dd5-dd5 dd7-dd7 de0-df1 df5-e00 e3b-e3e e5c-e80 e83-e83 " +
+    "e85-e86 e89-e89 e8b-e8c e8e-e93 e98-e98 ea0-ea0 ea4-ea4 " +
+    "ea6-ea6 ea8-ea9 eac-eac eba-eba ebe-ebf ec5-ec5 ec7-ec7 " +
+    "ece-ecf eda-edb ede-eff f48-f48 f6b-f70 f8c-f8f f98-f98 " +
+    "fbd-fbd fcd-fce fd0-fff 1022-1022 1028-1028 102b-102b " +
+    "1033-1035 103a-103f 105a-109f 10c6-10cf 10f9-10fa 10fc-10ff " +
+    "115a-115e 11a3-11a7 11fa-11ff 1207-1207 1247-1247 1249-1249 " +
+    "124e-124f 1257-1257 1259-1259 125e-125f 1287-1287 1289-1289 " +
+    "128e-128f 12af-12af 12b1-12b1 12b6-12b7 12bf-12bf 12c1-12c1 " +
+    "12c6-12c7 12cf-12cf 12d7-12d7 12ef-12ef 130f-130f 1311-1311 " +
+    "1316-1317 131f-131f 1347-1347 135b-1360 137d-139f 13f5-1400 " +
+    "1677-167f 169d-169f 16f1-16ff 170d-170d 1715-171f 1737-173f " +
+    "1754-175f 176d-176d 1771-1771 1774-177f 17dd-17df 17ea-17ff " +
+    "180f-180f 181a-181f 1878-187f 18aa-1dff 1e9c-1e9f 1efa-1eff " +
+    "1f16-1f17 1f1e-1f1f 1f46-1f47 1f4e-1f4f 1f58-1f58 1f5a-1f5a " +
+    "1f5c-1f5c 1f5e-1f5e 1f7e-1f7f 1fb5-1fb5 1fc5-1fc5 1fd4-1fd5 " +
+    "1fdc-1fdc 1ff0-1ff1 1ff5-1ff5 1fff-1fff 2053-2056 2058-205e " +
+    "2064-2069 2072-2073 208f-209f 20b2-20cf 20eb-20ff 213b-213c " +
+    "214c-2152 2184-218f 23cf-23ff 2427-243f 244b-245f 24ff-24ff " +
+    "2614-2615 2618-2618 267e-267f 268a-2700 2705-2705 270a-270b " +
+    "2728-2728 274c-274c 274e-274e 2753-2755 2757-2757 275f-2760 " +
+    "2795-2797 27b0-27b0 27bf-27cf 27ec-27ef 2b00-2e7f 2e9a-2e9a " +
+    "2ef4-2eff 2fd6-2fef 2ffc-2fff 3040-3040 3097-3098 3100-3104 " +
+    "312d-3130 318f-318f 31b8-31ef 321d-321f 3244-3250 327c-327e " +
+    "32cc-32cf 32ff-32ff 3377-337a 33de-33df 33ff-33ff 4db6-4dff " +
+    "9fa6-9fff a48d-a48f a4c7-abff d7a4-d7ff fa2e-fa2f fa6b-faff " +
+    "fb07-fb12 fb18-fb1c fb37-fb37 fb3d-fb3d fb3f-fb3f fb42-fb42 " +
+    "fb45-fb45 fbb2-fbd2 fd40-fd4f fd90-fd91 fdc8-fdcf fdfd-fdff " +
+    "fe10-fe1f fe24-fe2f fe47-fe48 fe53-fe53 fe67-fe67 fe6c-fe6f " +
+    "fe75-fe75 fefd-fefe ff00-ff00 ffbf-ffc1 ffc8-ffc9 ffd0-ffd1 " +
+    "ffd8-ffd9 ffdd-ffdf ffe7-ffe7 ffef-fff8 10000-102ff " +
+    "1031f-1031f 10324-1032f 1034b-103ff 10426-10427 1044e-1cfff " +
+    "1d0f6-1d0ff 1d127-1d129 1d1de-1d3ff 1d455-1d455 1d49d-1d49d " +
+    "1d4a0-1d4a1 1d4a3-1d4a4 1d4a7-1d4a8 1d4ad-1d4ad 1d4ba-1d4ba " +
+    "1d4bc-1d4bc 1d4c1-1d4c1 1d4c4-1d4c4 1d506-1d506 1d50b-1d50c " +
+    "1d515-1d515 1d51d-1d51d 1d53a-1d53a 1d53f-1d53f 1d545-1d545 " +
+    "1d547-1d549 1d551-1d551 1d6a4-1d6a7 1d7ca-1d7cd 1d800-1fffd " +
+    "2a6d7-2f7ff 2fa1e-2fffd 30000-3fffd 40000-4fffd 50000-5fffd " +
+    "60000-6fffd 70000-7fffd 80000-8fffd 90000-9fffd a0000-afffd " +
+    "b0000-bfffd c0000-cfffd d0000-dfffd e0000-e0000 e0002-e001f " +
+    "e0080-efffd "
+}
+
+fn table_rtl() -> str {
+    return "5be-5be 5c0-5c0 5c3-5c3 5d0-5ea 5f0-5f4 61b-61b 61f-61f " +
+    "621-63a 640-64a 66d-66f 671-6d5 6dd-6dd 6e5-6e6 6fa-6fe " +
+    "700-70d 710-710 712-72c 780-7a5 7b1-7b1 200f-200f fb1d-fb1d " +
+    "fb1f-fb28 fb2a-fb36 fb38-fb3c fb3e-fb3e fb40-fb41 fb43-fb44 " +
+    "fb46-fbb1 fbd3-fd3d fd50-fd8f fd92-fdc7 fdf0-fdfc fe70-fe74 " +
+    "fe76-fefc "
+}
+
+fn table_ltr() -> str {
+    return "41-5a 61-7a aa-aa b5-b5 ba-ba c0-d6 d8-f6 f8-220 222-233 " +
+    "250-2ad 2b0-2b8 2bb-2c1 2d0-2d1 2e0-2e4 2ee-2ee 37a-37a " +
+    "386-386 388-38a 38c-38c 38e-3a1 3a3-3ce 3d0-3f5 400-482 " +
+    "48a-4ce 4d0-4f5 4f8-4f9 500-50f 531-556 559-55f 561-587 " +
+    "589-589 903-903 905-939 93d-940 949-94c 950-950 958-961 " +
+    "964-970 982-983 985-98c 98f-990 993-9a8 9aa-9b0 9b2-9b2 " +
+    "9b6-9b9 9be-9c0 9c7-9c8 9cb-9cc 9d7-9d7 9dc-9dd 9df-9e1 " +
+    "9e6-9f1 9f4-9fa a05-a0a a0f-a10 a13-a28 a2a-a30 a32-a33 " +
+    "a35-a36 a38-a39 a3e-a40 a59-a5c a5e-a5e a66-a6f a72-a74 " +
+    "a83-a83 a85-a8b a8d-a8d a8f-a91 a93-aa8 aaa-ab0 ab2-ab3 " +
+    "ab5-ab9 abd-ac0 ac9-ac9 acb-acc ad0-ad0 ae0-ae0 ae6-aef " +
+    "b02-b03 b05-b0c b0f-b10 b13-b28 b2a-b30 b32-b33 b36-b39 " +
+    "b3d-b3e b40-b40 b47-b48 b4b-b4c b57-b57 b5c-b5d b5f-b61 " +
+    "b66-b70 b83-b83 b85-b8a b8e-b90 b92-b95 b99-b9a b9c-b9c " +
+    "b9e-b9f ba3-ba4 ba8-baa bae-bb5 bb7-bb9 bbe-bbf bc1-bc2 " +
+    "bc6-bc8 bca-bcc bd7-bd7 be7-bf2 c01-c03 c05-c0c c0e-c10 " +
+    "c12-c28 c2a-c33 c35-c39 c41-c44 c60-c61 c66-c6f c82-c83 " +
+    "c85-c8c c8e-c90 c92-ca8 caa-cb3 cb5-cb9 cbe-cbe cc0-cc4 " +
+    "cc7-cc8 cca-ccb cd5-cd6 cde-cde ce0-ce1 ce6-cef d02-d03 " +
+    "d05-d0c d0e-d10 d12-d28 d2a-d39 d3e-d40 d46-d48 d4a-d4c " +
+    "d57-d57 d60-d61 d66-d6f d82-d83 d85-d96 d9a-db1 db3-dbb " +
+    "dbd-dbd dc0-dc6 dcf-dd1 dd8-ddf df2-df4 e01-e30 e32-e33 " +
+    "e40-e46 e4f-e5b e81-e82 e84-e84 e87-e88 e8a-e8a e8d-e8d " +
+    "e94-e97 e99-e9f ea1-ea3 ea5-ea5 ea7-ea7 eaa-eab ead-eb0 " +
+    "eb2-eb3 ebd-ebd ec0-ec4 ec6-ec6 ed0-ed9 edc-edd f00-f17 " +
+    "f1a-f34 f36-f36 f38-f38 f3e-f47 f49-f6a f7f-f7f f85-f85 " +
+    "f88-f8b fbe-fc5 fc7-fcc fcf-fcf 1000-1021 1023-1027 1029-102a " +
+    "102c-102c 1031-1031 1038-1038 1040-1057 10a0-10c5 10d0-10f8 " +
+    "10fb-10fb 1100-1159 115f-11a2 11a8-11f9 1200-1206 1208-1246 " +
+    "1248-1248 124a-124d 1250-1256 1258-1258 125a-125d 1260-1286 " +
+    "1288-1288 128a-128d 1290-12ae 12b0-12b0 12b2-12b5 12b8-12be " +
+    "12c0-12c0 12c2-12c5 12c8-12ce 12d0-12d6 12d8-12ee 12f0-130e " +
+    "1310-1310 1312-1315 1318-131e 1320-1346 1348-135a 1361-137c " +
+    "13a0-13f4 1401-1676 1681-169a 16a0-16f0 1700-170c 170e-1711 " +
+    "1720-1731 1735-1736 1740-1751 1760-176c 176e-1770 1780-17b6 " +
+    "17be-17c5 17c7-17c8 17d4-17da 17dc-17dc 17e0-17e9 1810-1819 " +
+    "1820-1877 1880-18a8 1e00-1e9b 1ea0-1ef9 1f00-1f15 1f18-1f1d " +
+    "1f20-1f45 1f48-1f4d 1f50-1f57 1f59-1f59 1f5b-1f5b 1f5d-1f5d " +
+    "1f5f-1f7d 1f80-1fb4 1fb6-1fbc 1fbe-1fbe 1fc2-1fc4 1fc6-1fcc " +
+    "1fd0-1fd3 1fd6-1fdb 1fe0-1fec 1ff2-1ff4 1ff6-1ffc 200e-200e " +
+    "2071-2071 207f-207f 2102-2102 2107-2107 210a-2113 2115-2115 " +
+    "2119-211d 2124-2124 2126-2126 2128-2128 212a-212d 212f-2131 " +
+    "2133-2139 213d-213f 2145-2149 2160-2183 2336-237a 2395-2395 " +
+    "249c-24e9 3005-3007 3021-3029 3031-3035 3038-303c 3041-3096 " +
+    "309d-309f 30a1-30fa 30fc-30ff 3105-312c 3131-318e 3190-31b7 " +
+    "31f0-321c 3220-3243 3260-327b 327f-32b0 32c0-32cb 32d0-32fe " +
+    "3300-3376 337b-33dd 33e0-33fe 3400-4db5 4e00-9fa5 a000-a48c " +
+    "ac00-d7a3 d800-fa2d fa30-fa6a fb00-fb06 fb13-fb17 ff21-ff3a " +
+    "ff41-ff5a ff66-ffbe ffc2-ffc7 ffca-ffcf ffd2-ffd7 ffda-ffdc " +
+    "10300-1031e 10320-10323 10330-1034a 10400-10425 10428-1044d " +
+    "1d000-1d0f5 1d100-1d126 1d12a-1d166 1d16a-1d172 1d183-1d184 " +
+    "1d18c-1d1a9 1d1ae-1d1dd 1d400-1d454 1d456-1d49c 1d49e-1d49f " +
+    "1d4a2-1d4a2 1d4a5-1d4a6 1d4a9-1d4ac 1d4ae-1d4b9 1d4bb-1d4bb " +
+    "1d4bd-1d4c0 1d4c2-1d4c3 1d4c5-1d505 1d507-1d50a 1d50d-1d514 " +
+    "1d516-1d51c 1d51e-1d539 1d53b-1d53e 1d540-1d544 1d546-1d546 " +
+    "1d54a-1d550 1d552-1d6a3 1d6a8-1d7c9 20000-2a6d6 2f800-2fa1d " +
+    "f0000-ffffd 100000-10fffd "
+}
+
+
+type SaslError =
+    | SaslProhibited(code: i64)
+    | SaslUnassigned(code: i64)
+    | SaslBidi(why: str)
+
+let SPACE: [i64] = load(table_space())
+let DELETE: [i64] = load(table_delete())
+let PROHIBITED: [i64] = load(table_prohibited())
+let UNASSIGNED: [i64] = load(table_unassigned())
+let RTL: [i64] = load(table_rtl())
+let LTR: [i64] = load(table_ltr())
+
+fn load(packed: str) -> [i64] {
+    var out: [i64] = []
+    for entry in packed.split(" ") {
+        if entry.len() == 0 {
+            continue
+        }
+        let cut = entry.index_of("-") ?? -1
+        if cut < 0 {
+            continue
+        }
+        out.push(entry.substr(0, cut).parse_int_base(16) ?? 0)
+        out.push(entry.substr(cut + 1, entry.len() - cut - 1)
+                .parse_int_base(16) ?? 0)
+    }
+    return out
+}
+
+fn in_ranges(ranges: [i64], code: i64) -> bool {
+    var low = 0
+    var high = ranges.len() / 2 - 1
+    while low <= high {
+        let middle = (low + high) / 2
+        if code < ranges[middle * 2] {
+            high = middle - 1
+        } else if code > ranges[middle * 2 + 1] {
+            low = middle + 1
+        } else {
+            return true
+        }
+    }
+    return false
+}
+
+/// A password or username prepared for hashing or comparison.
+///
+/// `stored` says whether this is a value being written down — which may not
+/// contain an unassigned code point — or one being checked against a stored
+/// value, which may.
+pub fn prepare(text: str, stored: bool) -> str ! SaslError {
+    var mapped = ""
+    for code in text.codes() {
+        if in_ranges(DELETE, code) {
+            continue
+        }
+        if in_ranges(SPACE, code) {
+            // Every kind of space becomes the ordinary one, so a password
+            // typed with a non-breaking space still matches.
+            mapped = mapped + " "
+            continue
+        }
+        mapped = mapped + code.to_char()
+    }
+    let normalised = unicodenorm.nfkc(mapped)
+    var any_rtl = false
+    var any_ltr = false
+    for code in normalised.codes() {
+        // ASCII control characters are prohibited here where nameprep
+        // leaves them alone.
+        if code < 32 or code == 127 {
+            fail(SaslProhibited(code))
+        }
+        if in_ranges(PROHIBITED, code) {
+            fail(SaslProhibited(code))
+        }
+        if stored and in_ranges(UNASSIGNED, code) {
+            fail(SaslUnassigned(code))
+        }
+        if in_ranges(RTL, code) {
+            any_rtl = true
+        }
+        if in_ranges(LTR, code) {
+            any_ltr = true
+        }
+    }
+    if any_rtl {
+        if any_ltr {
+            fail(SaslBidi("a string mixes directions"))
+        }
+        let codes = normalised.codes()
+        if codes.len() > 0 and (not in_ranges(RTL, codes[0]) or
+            not in_ranges(RTL, codes[codes.len() - 1])) {
+            fail(SaslBidi("a right-to-left string must begin and end so"))
+        }
+    }
+    return normalised
+}
+
+/// A password, which is a query string: unassigned code points are allowed
+/// so that one stored before a Unicode update still verifies after it.
+pub fn password(text: str) -> str ! SaslError {
+    return try prepare(text, false)
+}
+
+/// A username, which is stored and therefore may not carry an unassigned
+/// code point.
+pub fn username(text: str) -> str ! SaslError {
+    return try prepare(text, true)
+}
+
+/// Whether `text` survives preparation at all.
+pub fn is_preparable(text: str, stored: bool) -> bool {
+    match prepare(text, stored) {
+        Ok(_result) -> return true
+        Err(_e) -> return false
+    }
+}
+
+/// Whether two strings are the same password once prepared, which is the
+/// comparison a server actually wants.
+pub fn same(a: str, b: str) -> bool {
+    match prepare(a, false) {
+        Ok(left) -> {
+            match prepare(b, false) {
+                Ok(right) -> return left == right
+                Err(_e) -> return false
+            }
+        }
+        Err(_e) -> return false
+    }
+}

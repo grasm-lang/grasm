@@ -30,9 +30,9 @@ One rule is added, because the count is now large enough for it to matter:
 | | |
 |---|---|
 | At the close of the 200 plan | 513 |
-| Now | 579 |
+| Now | 583 |
 | Target | 600 |
-| Remaining | 21 |
+| Remaining | 17 |
 
 The count is directories under `packages/` that are not `*-demo`. Test
 harnesses are directories and are counted; they are real programs that the
@@ -104,6 +104,12 @@ gates run, and several of them are the only consumer a format parser has.
   difference between unset and unspecified; and the file that says two
   commits were by the same person. 72 cases against `git ls-files
   --stage`, `git check-attr` and `git check-mailmap`.
+- [x] **Before the password is hashed** — `saslprep` `unicodeescape`
+  `passwdfile`. What SCRAM does to a password before hashing it, so two
+  keyboards produce the same bytes; the backslash escapes in a source
+  literal; and the three colon-separated files that say who a machine's
+  users are. 82 cases against `stringprep`, `unicode_escape`, `pwd` and
+  `grp`.
 
 ### Next
 

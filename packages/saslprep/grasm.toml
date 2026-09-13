@@ -1,0 +1,10 @@
+[package]
+name = "saslprep"
+version = "1.0.0"
+
+# Text in, text out. Opens nothing.
+capabilities = []
+
+[dependencies.unicodenorm]
+path = "../unicodenorm"
+version = "^1.0.0"

@@ -1,0 +1,238 @@
+// `/etc/passwd`, `/etc/group` and `/etc/shadow`, as text.
+//
+// Colon-separated, one record per line, and every tool that builds a
+// container image, audits a host, or writes a chroot has to read and write
+// them. The format is old enough that its rules are conventions rather than
+// a specification, and the conventions are what a naive split gets wrong:
+//
+//   - **A field may be empty and that means something.** An empty password
+//     field in `/etc/passwd` means the password lives in `/etc/shadow`; an
+//     empty one in `/etc/shadow` means *no password is required*, which is
+//     not the same as `*` or `!`, which mean the account cannot be logged
+//     into with one. Those three are routinely conflated and the difference
+//     is whether a machine can be logged into.
+//   - **A line may have too few fields.** Real files contain them —
+//     hand-edited, truncated by a full disk — and a reader that indexes
+//     blindly reads whatever is next in memory. Short lines are reported as
+//     malformed rather than padded.
+//   - **`/etc/group` members are comma-separated inside the fourth field**,
+//     and a user's *primary* group is not listed there at all: it is the
+//     GID in their passwd entry. A tool that lists group members without
+//     adding the primary members misses most of them.
+//   - **A comment or a blank line is allowed** and is not a record, though
+//     nothing in the format says so.
+//
+// Nothing here opens a file. It is handed the text, so the same code reads
+// a host's own `/etc/passwd`, a file inside an image being built, and a
+// fixture in a test.
+//
+// Checked against the `pwd` and `grp` modules reading the same machine's
+// files.
+
+type PasswdError =
+    | PasswdShortLine(line: str, fields: i64)
+
+    /// One `/etc/passwd` record.
+type PasswdUser = {
+    name: str,
+    /// `x` when the real one is in `/etc/shadow`, empty when there is none.
+    password: str,
+    uid: i64,
+    gid: i64,
+    /// The comment field, historically the person's name and phone number.
+    gecos: str,
+    home: str,
+    shell: str,
+}
+
+/// One `/etc/group` record.
+type PasswdGroup = {
+    name: str,
+    password: str,
+    gid: i64,
+    /// The members listed in the file, which does not include anyone whose
+    /// primary group this is.
+    members: [str],
+}
+
+/// One `/etc/shadow` record. Dates are days since 1970 and -1 for "unset",
+/// which the file writes as an empty field.
+type PasswdShadow = {
+    name: str,
+    /// The hash, or `*` or `!` for an account with no usable password, or
+    /// empty for one that needs none.
+    hash: str,
+    last_change: i64,
+    minimum_age: i64,
+    maximum_age: i64,
+    warning: i64,
+    inactive: i64,
+    expires: i64,
+}
+
+fn is_record(line: str) -> bool {
+    let trimmed = line.trim()
+    return trimmed.len() > 0 and not trimmed.starts_with("#")
+}
+
+fn number_or(text: str, fallback: i64) -> i64 {
+    if text.len() == 0 {
+        return fallback
+    }
+    return text.parse_int() ?? fallback
+}
+
+/// The users in a `/etc/passwd`.
+pub fn users(text: str) -> [PasswdUser] ! PasswdError {
+    var out: [PasswdUser] = []
+    for line in text.split("\n") {
+        if not is_record(line) {
+            continue
+        }
+        let parts = line.split(":")
+        if parts.len() < 7 {
+            fail(PasswdShortLine(line, parts.len()))
+        }
+        out.push(PasswdUser{
+            name: parts[0],
+            password: parts[1],
+            uid: number_or(parts[2], 0 - 1),
+            gid: number_or(parts[3], 0 - 1),
+            gecos: parts[4],
+            home: parts[5],
+            shell: parts[6],
+        })
+    }
+    return out
+}
+
+/// The groups in a `/etc/group`.
+pub fn groups(text: str) -> [PasswdGroup] ! PasswdError {
+    var out: [PasswdGroup] = []
+    for line in text.split("\n") {
+        if not is_record(line) {
+            continue
+        }
+        let parts = line.split(":")
+        if parts.len() < 4 {
+            fail(PasswdShortLine(line, parts.len()))
+        }
+        var members: [str] = []
+        if parts[3].len() > 0 {
+            for name in parts[3].split(",") {
+                if name.len() > 0 {
+                    members.push(name)
+                }
+            }
+        }
+        out.push(PasswdGroup{
+            name: parts[0],
+            password: parts[1],
+            gid: number_or(parts[2], 0 - 1),
+            members: members,
+        })
+    }
+    return out
+}
+
+/// The records in a `/etc/shadow`.
+pub fn shadows(text: str) -> [PasswdShadow] ! PasswdError {
+    var out: [PasswdShadow] = []
+    for line in text.split("\n") {
+        if not is_record(line) {
+            continue
+        }
+        let parts = line.split(":")
+        if parts.len() < 8 {
+            fail(PasswdShortLine(line, parts.len()))
+        }
+        out.push(PasswdShadow{
+            name: parts[0],
+            hash: parts[1],
+            last_change: number_or(parts[2], 0 - 1),
+            minimum_age: number_or(parts[3], 0 - 1),
+            maximum_age: number_or(parts[4], 0 - 1),
+            warning: number_or(parts[5], 0 - 1),
+            inactive: number_or(parts[6], 0 - 1),
+            expires: number_or(parts[7], 0 - 1),
+        })
+    }
+    return out
+}
+
+/// A user by name.
+pub fn find_user(list: [PasswdUser], name: str) -> Option[PasswdUser] {
+    for user in list {
+        if user.name == name {
+            return Some(user)
+        }
+    }
+    return None
+}
+
+/// A group by name.
+pub fn find_group(list: [PasswdGroup], name: str) -> Option[PasswdGroup] {
+    for group in list {
+        if group.name == name {
+            return Some(group)
+        }
+    }
+    return None
+}
+
+/// Everyone in a group, the members listed in the file *and* everyone whose
+/// primary group it is — which is where most of them usually are.
+pub fn members_of(list: [PasswdGroup], people: [PasswdUser],
+    name: str) -> [str] {
+    var out: [str] = []
+    var seen: Map[str, bool] = {}
+    match find_group(list, name) {
+        Some(group) -> {
+            for member in group.members {
+                if not seen.has(member) {
+                    seen.set(member, true)
+                    out.push(member)
+                }
+            }
+            for user in people {
+                if user.gid == group.gid and not seen.has(user.name) {
+                    seen.set(user.name, true)
+                    out.push(user.name)
+                }
+            }
+        }
+        None -> {}
+    }
+    return out
+}
+
+/// Whether an account can be logged into with a password at all.
+///
+/// An empty hash means no password is needed — which is not the same as
+/// `*` or `!`, both of which mean no password will ever match.
+pub fn password_is_usable(record: PasswdShadow) -> bool {
+    if record.hash.len() == 0 {
+        return true
+    }
+    return not record.hash.starts_with("*") and
+    not record.hash.starts_with("!")
+}
+
+/// Whether an account needs no password to log in, which is worth being
+/// able to ask about separately.
+pub fn password_is_empty(record: PasswdShadow) -> bool {
+    return record.hash.len() == 0
+}
+
+/// A user written back as a line, so a file read and written is unchanged.
+pub fn render_user(user: PasswdUser) -> str {
+    return user.name + ":" + user.password + ":" + user.uid.to_str() + ":" +
+    user.gid.to_str() + ":" + user.gecos + ":" + user.home + ":" +
+    user.shell
+}
+
+/// And a group.
+pub fn render_group(group: PasswdGroup) -> str {
+    return group.name + ":" + group.password + ":" + group.gid.to_str() +
+    ":" + group.members.join(",")
+}
