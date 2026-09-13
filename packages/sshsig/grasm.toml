@@ -1,0 +1,22 @@
+[package]
+name = "sshsig"
+version = "1.0.0"
+
+# Parsing and verifying bytes it is handed. Opens nothing.
+capabilities = []
+
+[dependencies.bytes_codec]
+path = "../bytes"
+version = "^1.0.0"
+
+[dependencies.sha512]
+path = "../sha512"
+version = "^1.0.0"
+
+[dependencies.ed25519]
+path = "../ed25519"
+version = "^1.0.0"
+
+[dependencies.sshkey]
+path = "../sshkey"
+version = "^1.0.0"

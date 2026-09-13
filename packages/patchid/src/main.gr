@@ -1,0 +1,182 @@
+// A stable name for a change, independent of where it landed.
+//
+// The same fix cherry-picked onto three branches produces three commits with
+// three different hashes, because a commit hash covers the parent, the tree,
+// the author and the date. `git patch-id` answers the other question: is
+// this the same *change*? It hashes the diff with the things that move
+// stripped out — the line numbers in each hunk header, and all whitespace —
+// so a patch applied at a different offset, or reflowed by a mail client on
+// the way, still hashes the same.
+//
+// That is what `git cherry`, `git rebase` and every "is this already
+// upstream?" check are built on, and it is why a rebase can drop a commit
+// it recognises as already applied.
+//
+// The rules, which are not written down anywhere but the source:
+//
+//   - Everything before the first `diff ` line is a commit message and is
+//     ignored entirely.
+//   - `index abc..def` lines are skipped: the blob hashes depend on the
+//     file's history, not on the change.
+//   - A hunk header is recognised and its line numbers are *not* hashed.
+//     The counts are used to know where the hunk ends and nothing else.
+//   - Every other line is hashed with all its whitespace removed. That is
+//     why a patch that survived a mail client's reflowing still matches.
+//
+// The consequence worth knowing: two changes that differ only in whitespace
+// have the same patch id. That is deliberate — it is what makes the identity
+// survive transport — and it means a patch id is not a checksum and must not
+// be used as one.
+//
+// Checked against `git patch-id`.
+
+import sha1
+
+fn is_space(c: str) -> bool {
+    return c == " " or c == "\t" or c == "\r" or c == "\n"
+}
+
+/// A line with every whitespace character taken out.
+fn without_space(line: str) -> str {
+    var out = ""
+    var i = 0
+    while i < line.len() {
+        let c = line.substr(i, 1)
+        if not is_space(c) {
+            out = out + c
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn is_letter(c: str) -> bool {
+    return (c >= "a" and c <= "z") or (c >= "A" and c <= "Z")
+}
+
+/// The two counts in `@@ -a,b +c,d @@`, which say how long the hunk is.
+///
+/// A count that is left out means one, which is the case for a hunk that
+/// touches a single line.
+fn hunk_counts(line: str) -> (i64, i64) {
+    var before = 1
+    var after = 1
+    var found = 0
+    var i = 0
+    while i < line.len() and found < 2 {
+        let c = line.substr(i, 1)
+        if c == "-" or c == "+" {
+            var j = i + 1
+            var digits = ""
+            while j < line.len() and line.substr(j, 1) >= "0" and
+            line.substr(j, 1) <= "9" {
+                digits = digits + line.substr(j, 1)
+                j = j + 1
+            }
+            if digits.len() == 0 {
+                i = i + 1
+                continue
+            }
+            var count = 1
+            if j < line.len() and line.substr(j, 1) == "," {
+                var k = j + 1
+                var more = ""
+                while k < line.len() and line.substr(k, 1) >= "0" and
+                line.substr(k, 1) <= "9" {
+                    more = more + line.substr(k, 1)
+                    k = k + 1
+                }
+                count = more.parse_int() ?? 1
+                j = k
+            }
+            if found == 0 {
+                before = count
+            } else {
+                after = count
+            }
+            found = found + 1
+            i = j
+            continue
+        }
+        i = i + 1
+    }
+    return (before, after)
+}
+
+/// The text `git patch-id` actually hashes, which is worth being able to
+/// look at when two patches that should match do not.
+pub fn canonical(diff: str) -> str {
+    var out = ""
+    var before = 0 - 1
+    var after = 0 - 1
+    var started = false
+    for line in diff.split("\n") {
+        if not started {
+            // Everything before the first `diff ` is a commit message.
+            if not line.starts_with("diff ") {
+                continue
+            }
+            started = true
+        }
+        if before == 0 - 1 {
+            if line.starts_with("index ") {
+                // Blob hashes are about the file's history, not the change.
+                continue
+            }
+            if line.starts_with("--- ") {
+                before = 1
+                after = 1
+            } else if line.len() > 0 and not is_letter(line.substr(0, 1)) {
+                return out
+            }
+        }
+        if before == 0 and after == 0 {
+            if line.starts_with("@@ -") {
+                let counts = hunk_counts(line)
+                before = counts.0
+                after = counts.1
+                // The line numbers move when a patch is applied elsewhere,
+                // so the header itself is not hashed at all.
+                continue
+            }
+            if not line.starts_with("diff ") {
+                return out
+            }
+            before = 0 - 1
+            after = 0 - 1
+        }
+        if line.len() > 0 {
+            let first = line.substr(0, 1)
+            if first == "-" or first == " " {
+                before = before - 1
+            }
+            if first == "+" or first == " " {
+                after = after - 1
+            }
+        }
+        out = out + without_space(line)
+    }
+    return out
+}
+
+/// The patch id of a diff: the SHA-1 of its canonical form.
+pub fn of(diff: str) -> str {
+    return sha1.hex(canonical(diff).to_bytes())
+}
+
+/// Whether two diffs are the same change, wherever each was applied.
+pub fn same_change(a: str, b: str) -> bool {
+    return of(a) == of(b)
+}
+
+/// How many files a diff touches, which is the other thing a caller
+/// comparing two of them usually wants.
+pub fn file_count(diff: str) -> i64 {
+    var count = 0
+    for line in diff.split("\n") {
+        if line.starts_with("diff ") {
+            count = count + 1
+        }
+    }
+    return count
+}

@@ -1,0 +1,119 @@
+// Naming a change, and checking who signed something.
+import patchid
+import sshsig
+import ed25519
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn sample() -> str {
+    return "diff --git a/a.txt b/a.txt\n" +
+    "index 1234567..89abcde 100644\n" +
+    "--- a/a.txt\n+++ b/a.txt\n" +
+    "@@ -1,3 +1,3 @@\n one\n-two\n+TWO\n three\n"
+}
+
+fn check_patchid(inout f: i64) / {io} {
+    // The value `git patch-id` gives for this diff.
+    say(f, "the patch id matches git's",
+        patchid.of(sample()) ==
+        "af6934946d4f501a09d24e0be38ce85f14700025")
+    // The same change applied somewhere else is the same change.
+    let moved = sample().replace("@@ -1,3 +1,3 @@", "@@ -101,3 +101,3 @@")
+    say(f, "a hunk at a different offset hashes the same",
+        patchid.same_change(sample(), moved))
+    // And so is one that a mail client reflowed.
+    let respaced = sample().replace("\n one", "\n  one")
+    say(f, "and so does one whose whitespace moved",
+        patchid.same_change(sample(), respaced))
+    // A commit message in front is not part of the change.
+    say(f, "a commit message in front changes nothing",
+        patchid.same_change(sample(), "subject\n\nbody\n\n" + sample()))
+    // A different change is a different id.
+    let other = sample().replace("+TWO", "+THREE")
+    say(f, "a different change is a different id",
+        not patchid.same_change(sample(), other))
+    say(f, "the blob hashes in the index line are not part of it",
+        patchid.same_change(sample(),
+            sample().replace("index 1234567..89abcde",
+                "index fedcba9..7654321")))
+    say(f, "and the files it touches can be counted",
+        patchid.file_count(sample()) == 1)
+    // The canonical form is the text that was hashed, which is worth
+    // being able to look at when two patches that should match do not.
+    say(f, "the canonical form has no whitespace in it",
+        (patchid.canonical(sample()).index_of(" ") ?? 0 - 1) == 0 - 1)
+}
+
+fn check_sshsig(inout f: i64) / {io} {
+    // A signature made by `ssh-keygen -Y sign -n file`.
+    let armoured = "-----BEGIN SSH SIGNATURE-----\n" +
+    "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgUcnQEiml6B7VCr4j+Wixn5y6QB\n" +
+    "zUlspBP8ksuzrBJqAAAAAEZmlsZQAAAAAAAAAGc2hhNTEyAAAAUwAAAAtzc2gtZWQyNTUx\n" +
+    "OQAAAEAYZRc+53iwmJnQc6LX5THJHH4xeoBE59vEkczLuf+9iQoFSJm3FRNuaVHtaldqZR\n" +
+    "8qm9sSj/HQSTLXdGK+f0wA\n" +
+    "-----END SSH SIGNATURE-----\n"
+    match sshsig.parse(armoured) {
+        Err(_e) -> say(f, "the signature parses", false)
+        Ok(signature) -> {
+            say(f, "the signature parses", true)
+            say(f, "at version 1", signature.version == 1)
+            say(f, "for the namespace it was made in",
+                signature.namespace == "file")
+            say(f, "hashing with sha512",
+                signature.hash_algorithm == "sha512")
+            say(f, "from an ed25519 key",
+                sshsig.key_type(signature) == "ssh-ed25519")
+            say(f, "which this can check",
+                sshsig.can_verify(signature) == "")
+            say(f, "and it verifies the message it was made over",
+                sshsig.verify(signature, "hello world\n".to_bytes()))
+            // The namespace is inside the signed data, so a signature made
+            // for one purpose cannot be replayed as one made for another.
+            say(f, "but not a different message",
+                not sshsig.verify(signature, "goodbye\n".to_bytes()))
+            say(f, "the signed data names the namespace",
+                (sshsig.signed_data("git", "sha512",
+                    "x".to_bytes()).to_str().index_of("git") ?? 0 - 1) > 0)
+            say(f, "and differs from the same message in another namespace",
+                sshsig.signed_data("git", "sha512", "x".to_bytes())
+                    .len() != 0 and
+                sshsig.signed_data("file", "sha512", "x".to_bytes())
+                    .to_str() !=
+                sshsig.signed_data("git", "sha512", "x".to_bytes())
+                    .to_str())
+            say(f, "the signer's fingerprint is readable",
+                sshsig.fingerprint(signature).starts_with("SHA256:"))
+            say(f, "and the signature armours back to itself",
+                sshsig.render(signature).starts_with(
+                    "-----BEGIN SSH SIGNATURE-----"))
+        }
+    }
+    say(f, "something that is not a signature is refused",
+        (sshsig.parse("hello") ?? SshSignature{ version: 0,
+            public_key: "".to_bytes(), namespace: "!", reserved:
+            "".to_bytes(), hash_algorithm: "", signature: "".to_bytes() })
+            .namespace == "!")
+        // The verification underneath is the tree's own ed25519.
+    say(f, "an ed25519 signature over nothing is not valid",
+        not ed25519.verify("".to_bytes(), "x".to_bytes(), "".to_bytes()))
+}
+
+fn main() / {io} {
+    var f = 0
+
+    check_patchid(f)
+    check_sshsig(f)
+
+    if f == 0 {
+        print("signing: every claim held")
+    } else {
+        print("signing: {f} failed")
+    }
+}

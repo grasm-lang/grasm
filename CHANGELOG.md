@@ -9,6 +9,24 @@ migration note here; anything `experimental` may change in any release. See
 
 ### Added
 
+- **A stable name for a change, and a way to check who signed something.**
+  `patchid` reproduces `git patch-id`: the same fix cherry-picked onto three
+  branches has three commit hashes and one patch id, because the line numbers
+  in each hunk header and all whitespace are stripped before hashing. That is
+  what `git cherry` and every "already upstream?" check are built on, and it
+  is why a patch that survived a mail client's reflowing still matches. The
+  consequence worth knowing is written in the source: two changes differing
+  only in whitespace share an id, so it is not a checksum. `sshsig` verifies
+  `ssh-keygen -Y sign` signatures — the format git uses to sign commits with
+  an SSH key, which needs no keyring beyond the `authorized_keys` people
+  already keep. What is signed is not the message but a structure naming the
+  namespace and holding a hash of it, which is what stops a signature made
+  for one purpose being replayed as another. ed25519 signatures are checked
+  cryptographically through the tree's own implementation; an RSA or ECDSA
+  one is parsed and reported rather than claimed, because a verifier that
+  returns true for what it did not examine is worse than none. 105 cases
+  against `git patch-id` and `ssh-keygen`; `gitsigndiff` is a gate.
+
 - **The parameter encoding behind every non-ASCII attachment name.**
   `rfc2231` reads `filename*=UTF-8''%D0%BE...` and the numbered
   continuations that split a long value across several parameters, joining

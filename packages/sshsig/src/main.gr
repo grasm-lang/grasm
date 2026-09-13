@@ -1,0 +1,300 @@
+// Verifying an SSH signature: `ssh-keygen -Y sign`, read back.
+//
+// People already have SSH keys and already trust each other's. That is the
+// whole appeal of the format: git can sign commits and tags with one, a
+// release can be signed with one, and the person checking it needs no
+// keyring beyond the `authorized_keys` they already keep. It is a much
+// smaller thing than OpenPGP and covers most of what OpenPGP was used for.
+//
+// The signature is an armoured blob of length-prefixed strings:
+//
+//     "SSHSIG" | version | publickey | namespace | reserved | hash | signature
+//
+// and the part that has to be right is what was actually signed. It is not
+// the message. It is:
+//
+//     "SSHSIG" | namespace | reserved | hash algorithm | H(message)
+//
+// The namespace is inside the signed data on purpose. A signature made for
+// `git` cannot be replayed as one made for `file`, and one made for a
+// namespace an application invents cannot be replayed anywhere else — which
+// is the property a bare "sign these bytes" primitive does not have and the
+// reason people keep building this wrapper badly.
+//
+// Verification here covers `ssh-ed25519`, which is what `ssh-keygen`
+// generates by default and what the overwhelming majority of these
+// signatures use. An RSA or ECDSA signature is parsed, reported by
+// algorithm, and *not* claimed to verify — `verify` returns false and
+// `can_verify` says why, rather than returning true for something nothing
+// checked.
+//
+// Checked against `ssh-keygen -Y sign` and `-Y verify`.
+
+import bytes_codec
+import sha512
+import ed25519
+import sshkey
+
+type SshSigError =
+    | SshSigNotArmoured(why: str)
+    | SshSigNotBase64(text: str)
+    | SshSigMagic(found: str)
+    | SshSigVersion(version: i64)
+    | SshSigTruncated(at: i64)
+
+    /// A parsed signature.
+type SshSignature = {
+    version: i64,
+    /// The signer's public key, in the same wire form an
+    /// `authorized_keys` line holds.
+    public_key: bytes,
+    /// What the signature is for: `git`, `file`, or whatever the
+    /// application chose.
+    namespace: str,
+    reserved: bytes,
+    /// `sha512` or `sha256`.
+    hash_algorithm: str,
+    /// The signature blob, itself a type name and the signature bytes.
+    signature: bytes,
+}
+
+let BEGIN = "-----BEGIN SSH SIGNATURE-----"
+let END = "-----END SSH SIGNATURE-----"
+
+fn read_u32(data: bytes, at: i64) -> i64 {
+    return data.at(at) * 16777216 + data.at(at + 1) * 65536 +
+    data.at(at + 2) * 256 + data.at(at + 3)
+}
+
+fn slice(data: bytes, from: i64, to: i64) -> bytes {
+    var out: [i64] = []
+    var i = from
+    while i < to and i < data.len() {
+        out.push(data.at(i))
+        i = i + 1
+    }
+    return bytes_of(out)
+}
+
+/// One length-prefixed string, and where the next one starts.
+fn read_string(data: bytes, at: i64) -> (bytes, i64) ! SshSigError {
+    if at + 4 > data.len() {
+        fail(SshSigTruncated(at))
+    }
+    let size = read_u32(data, at)
+    if size < 0 or at + 4 + size > data.len() {
+        fail(SshSigTruncated(at))
+    }
+    return (slice(data, at + 4, at + 4 + size), at + 4 + size)
+}
+
+fn push_string(inout out: [i64], value: bytes) {
+    var k = 3
+    while k >= 0 {
+        out.push(value.len().ushr(k * 8).bit_and(255))
+        k = k - 1
+    }
+    var i = 0
+    while i < value.len() {
+        out.push(value.at(i))
+        i = i + 1
+    }
+}
+
+/// The armour stripped and the base64 decoded.
+pub fn decode_armour(text: str) -> bytes ! SshSigError {
+    var body = ""
+    var inside = false
+    for line in text.split("\n") {
+        let trimmed = line.trim()
+        if trimmed == BEGIN {
+            inside = true
+            continue
+        }
+        if trimmed == END {
+            inside = false
+            continue
+        }
+        if inside {
+            body = body + trimmed
+        }
+    }
+    if body.len() == 0 {
+        fail(SshSigNotArmoured("no signature between the markers"))
+    }
+    match bytes_codec.decode_base64(body) {
+        Some(raw) -> return raw
+        None -> fail(SshSigNotBase64(body))
+    }
+}
+
+/// An armoured signature.
+pub fn parse(text: str) -> SshSignature ! SshSigError {
+    let raw = try decode_armour(text)
+    if raw.len() < 10 {
+        fail(SshSigTruncated(0))
+    }
+    let magic = slice(raw, 0, 6).to_str()
+    if magic != "SSHSIG" {
+        fail(SshSigMagic(magic))
+    }
+    let version = read_u32(raw, 6)
+    if version != 1 {
+        fail(SshSigVersion(version))
+    }
+    let key = try read_string(raw, 10)
+    let namespace = try read_string(raw, key.1)
+    let reserved = try read_string(raw, namespace.1)
+    let hash = try read_string(raw, reserved.1)
+    let signature = try read_string(raw, hash.1)
+    return SshSignature{
+        version: version,
+        public_key: key.0,
+        namespace: namespace.0.to_str(),
+        reserved: reserved.0,
+        hash_algorithm: hash.0.to_str(),
+        signature: signature.0,
+    }
+}
+
+/// What was actually signed: not the message, but a structure naming the
+/// namespace and holding a hash of it.
+///
+/// The namespace inside the signed data is what stops a signature made for
+/// one purpose being replayed as one made for another.
+pub fn signed_data(namespace: str, hash_algorithm: str,
+    message: bytes) -> bytes {
+    var out: [i64] = []
+    let magic = "SSHSIG".to_bytes()
+    var m = 0
+    while m < magic.len() {
+        out.push(magic.at(m))
+        m = m + 1
+    }
+    push_string(out, namespace.to_bytes())
+    push_string(out, bytes_of([]))
+    push_string(out, hash_algorithm.to_bytes())
+    if hash_algorithm == "sha256" {
+        push_string(out, sha512.sha512_256(message))
+    } else {
+        push_string(out, sha512.sha512(message))
+    }
+    return bytes_of(out)
+}
+
+/// The key type a signature was made with, such as `ssh-ed25519`.
+pub fn key_type(signature: SshSignature) -> str {
+    match read_string(signature.public_key, 0) {
+        Ok(first) -> return first.0.to_str()
+        Err(_e) -> return ""
+    }
+}
+
+/// The algorithm the signature itself was made with, which is not always
+/// the key's own type: an `ssh-rsa` key signs as `rsa-sha2-512` or
+/// `rsa-sha2-256`, because the key type predates the hash being negotiable.
+pub fn signature_algorithm(signature: SshSignature) -> str {
+    match read_string(signature.signature, 0) {
+        Ok(first) -> return first.0.to_str()
+        Err(_e) -> return ""
+    }
+}
+
+/// Whether this is a signature type that can be checked here, and why not
+/// when it cannot.
+pub fn can_verify(signature: SshSignature) -> str {
+    let kind = key_type(signature)
+    if kind == "ssh-ed25519" {
+        return ""
+    }
+    if kind == "" {
+        return "the signature names no key type"
+    }
+    return kind + " is not verified here"
+}
+
+/// Whether `signature` really is `message`, signed by the key it names.
+///
+/// False for a signature this cannot check, rather than true — a verifier
+/// that returns true for what it did not examine is worse than one that
+/// does not exist.
+pub fn verify(signature: SshSignature, message: bytes) -> bool {
+    if can_verify(signature) != "" {
+        return false
+    }
+    var public = bytes_of([])
+    match read_string(signature.public_key, 0) {
+        Ok(first) -> {
+            match read_string(signature.public_key, first.1) {
+                Ok(second) -> public = second.0
+                Err(_e) -> return false
+            }
+        }
+        Err(_e) -> return false
+    }
+    var raw = bytes_of([])
+    match read_string(signature.signature, 0) {
+        Ok(first) -> {
+            if first.0.to_str() != "ssh-ed25519" {
+                return false
+            }
+            match read_string(signature.signature, first.1) {
+                Ok(second) -> raw = second.0
+                Err(_e) -> return false
+            }
+        }
+        Err(_e) -> return false
+    }
+    let data = signed_data(signature.namespace, signature.hash_algorithm,
+        message)
+    return ed25519.verify(public, data, raw)
+}
+
+/// The signer's key as an `authorized_keys` line would hold it, so it can
+/// be compared against one.
+pub fn public_key_line(signature: SshSignature) -> str {
+    return key_type(signature) + " " +
+    bytes_codec.encode_base64(signature.public_key)
+}
+
+/// The `SHA256:` fingerprint of the signer's key, which is what an
+/// `allowed_signers` file holds and what a person is shown.
+pub fn fingerprint(signature: SshSignature) -> str {
+    match sshkey.parse(public_key_line(signature)) {
+        Ok(key) -> return sshkey.fingerprint_sha256(key)
+        Err(_e) -> return ""
+    }
+}
+
+/// The signature armoured again, which a file holding one looks like.
+pub fn render(signature: SshSignature) -> str {
+    var out: [i64] = []
+    let magic = "SSHSIG".to_bytes()
+    var m = 0
+    while m < magic.len() {
+        out.push(magic.at(m))
+        m = m + 1
+    }
+    var k = 3
+    while k >= 0 {
+        out.push(signature.version.ushr(k * 8).bit_and(255))
+        k = k - 1
+    }
+    push_string(out, signature.public_key)
+    push_string(out, signature.namespace.to_bytes())
+    push_string(out, signature.reserved)
+    push_string(out, signature.hash_algorithm.to_bytes())
+    push_string(out, signature.signature)
+    let body = bytes_codec.encode_base64(bytes_of(out))
+    var text = BEGIN + "\n"
+    var at = 0
+    while at < body.len() {
+        var take = body.len() - at
+        if take > 70 {
+            take = 70
+        }
+        text = text + body.substr(at, take) + "\n"
+        at = at + take
+    }
+    return text + END + "\n"
+}

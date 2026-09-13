@@ -1,0 +1,12 @@
+[package]
+name = "pidtest"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.patchid]
+path = "../patchid"
+version = "^1.0.0"
+
+[dependencies.sshsig]
+path = "../sshsig"
+version = "^1.0.0"

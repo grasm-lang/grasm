@@ -1,0 +1,16 @@
+[package]
+name = "signing_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.patchid]
+path = "../patchid"
+version = "^1.0.0"
+
+[dependencies.sshsig]
+path = "../sshsig"
+version = "^1.0.0"
+
+[dependencies.ed25519]
+path = "../ed25519"
+version = "^1.0.0"
