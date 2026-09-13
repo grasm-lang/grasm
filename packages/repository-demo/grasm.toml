@@ -1,0 +1,24 @@
+[package]
+name = "repository_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.gitrefs]
+path = "../gitrefs"
+version = "^1.0.0"
+
+[dependencies.gitreflog]
+path = "../gitreflog"
+version = "^1.0.0"
+
+[dependencies.gitmodules]
+path = "../gitmodules"
+version = "^1.0.0"
+
+[dependencies.gitdate]
+path = "../gitdate"
+version = "^1.0.0"
+
+[dependencies.gitobjectid]
+path = "../gitobjectid"
+version = "^1.0.0"

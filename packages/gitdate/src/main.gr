@@ -1,0 +1,221 @@
+// The timestamps in git objects, and the formats git prints them in.
+//
+// Every commit, tag and reflog entry carries the same pair: seconds since
+// the epoch, and the writer's offset from UTC as `+0530`. Both parts
+// matter. The seconds say when it happened; the offset says what the clock
+// on the author's wall said, which is what every git date format except
+// `unix` shows. Rendering a commit in the reader's own zone quietly rewrites
+// history — a commit made at 9am in Tokyo is not a commit made at midnight.
+//
+// The offset is stored and not derived, which is why it can be `+0530` or
+// `-0930` or, for a repository whose clock was wrong, `+1400`. It is text,
+// not a zone name: git never knew the zone, only the offset in force at the
+// time.
+//
+// The formats here are git's own, which is the point — a tool printing
+// dates beside git's own output should print the same ones:
+//
+//   `iso`         2026-09-13 15:23:23 +0400
+//   `iso-strict`  2026-09-13T15:23:23+04:00
+//   `rfc`         Sun, 13 Sep 2026 15:23:23 +0400
+//   `short`       2026-09-13
+//   `raw`         1789298603 +0400
+//   `unix`        1789298603
+//
+// `relative` — "3 days ago" — is deliberately absent. It depends on when it
+// is read, so it cannot be checked against git's own output, and a version
+// of it here would be a guess at a rounding rule nobody wrote down.
+//
+// Checked against `git log --date=`.
+
+type GitStamp = {
+    /// Seconds since the epoch, in UTC.
+    seconds: i64,
+    /// The writer's offset as written: `+0400`, `-0930`.
+    offset: str,
+}
+
+/// The `1789298603 +0400` pair a git object carries.
+pub fn parse(text: str) -> Option[GitStamp] {
+    let parts = text.trim().split(" ")
+    if parts.len() < 1 {
+        return None
+    }
+    match parts[0].parse_int() {
+        None -> return None
+        Some(seconds) -> {
+            var offset = "+0000"
+            if parts.len() > 1 {
+                offset = parts[1]
+            }
+            return Some(GitStamp{ seconds: seconds, offset: offset })
+        }
+    }
+}
+
+/// The offset in minutes, east of UTC positive.
+pub fn offset_minutes(stamp: GitStamp) -> i64 {
+    var text = stamp.offset
+    var sign = 1
+    if text.starts_with("-") {
+        sign = 0 - 1
+        text = text.substr(1, text.len() - 1)
+    } else if text.starts_with("+") {
+        text = text.substr(1, text.len() - 1)
+    }
+    if text.len() < 4 {
+        return 0
+    }
+    let hours = text.substr(0, 2).parse_int() ?? 0
+    let minutes = text.substr(2, 2).parse_int() ?? 0
+    return sign * (hours * 60 + minutes)
+}
+
+type CivilTime = {
+    year: i64,
+    month: i64,
+    day: i64,
+    hour: i64,
+    minute: i64,
+    second: i64,
+    /// 0 is Sunday.
+    weekday: i64,
+}
+
+/// The wall clock the writer saw: the instant shifted by their own offset.
+pub fn local_time(stamp: GitStamp) -> CivilTime {
+    return civil_of(stamp.seconds + offset_minutes(stamp) * 60)
+}
+
+/// Seconds since the epoch as a date and a time, without any zone.
+///
+/// The civil-from-days algorithm, which is exact for every year a 64-bit
+/// count of seconds can reach and does not need a table of month lengths.
+fn civil_of(seconds: i64) -> CivilTime {
+    var days = seconds / 86400
+    var rest = seconds % 86400
+    if rest < 0 {
+        rest = rest + 86400
+        days = days - 1
+    }
+    // 1970-01-01 was a Thursday, which is weekday 4.
+    var weekday = (days + 4) % 7
+    if weekday < 0 {
+        weekday = weekday + 7
+    }
+    // Shift the epoch to 0000-03-01 so that the leap day is last.
+    let shifted = days + 719468
+    var era = shifted / 146097
+    if shifted < 0 {
+        era = (shifted - 146096) / 146097
+    }
+    let day_of_era = shifted - era * 146097
+    let year_of_era = (day_of_era - day_of_era / 1460 +
+        day_of_era / 36524 - day_of_era / 146096) / 365
+    let year = year_of_era + era * 400
+    let day_of_year = day_of_era - (365 * year_of_era +
+        year_of_era / 4 - year_of_era / 100)
+    let month_prime = (5 * day_of_year + 2) / 153
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1
+    var month = month_prime + 3
+    if month_prime >= 10 {
+        month = month_prime - 9
+    }
+    return CivilTime{
+        year: if month <= 2 { year + 1 } else { year },
+        month: month,
+        day: day,
+        hour: rest / 3600,
+        minute: rest % 3600 / 60,
+        second: rest % 60,
+        weekday: weekday,
+    }
+}
+
+fn two(n: i64) -> str {
+    if n < 10 {
+        return "0" + n.to_str()
+    }
+    return n.to_str()
+}
+
+fn four(n: i64) -> str {
+    var out = n.to_str()
+    while out.len() < 4 {
+        out = "0" + out
+    }
+    return out
+}
+
+fn month_name(month: i64) -> str {
+    let names = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug",
+        "Sep", "Oct", "Nov", "Dec"]
+    if month < 1 or month > 12 {
+        return "???"
+    }
+    return names[month - 1]
+}
+
+fn weekday_name(weekday: i64) -> str {
+    let names = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+    if weekday < 0 or weekday > 6 {
+        return "???"
+    }
+    return names[weekday]
+}
+
+/// `git log --date=iso`.
+pub fn iso(stamp: GitStamp) -> str {
+    let t = local_time(stamp)
+    return four(t.year) + "-" + two(t.month) + "-" + two(t.day) + " " +
+    two(t.hour) + ":" + two(t.minute) + ":" + two(t.second) + " " +
+    stamp.offset
+}
+
+/// `git log --date=iso-strict`, which puts a colon in the offset and
+/// writes `Z` rather than `+00:00` for UTC — as RFC 3339 allows and git
+/// does.
+pub fn iso_strict(stamp: GitStamp) -> str {
+    let t = local_time(stamp)
+    var offset = stamp.offset
+    if offset_minutes(stamp) == 0 {
+        offset = "Z"
+    } else if offset.len() == 5 {
+        offset = offset.substr(0, 3) + ":" +
+        offset.substr(3, 2)
+    }
+    return four(t.year) + "-" + two(t.month) + "-" + two(t.day) + "T" +
+    two(t.hour) + ":" + two(t.minute) + ":" + two(t.second) + offset
+}
+
+/// `git log --date=rfc`, which is RFC 2822.
+pub fn rfc2822(stamp: GitStamp) -> str {
+    let t = local_time(stamp)
+    return weekday_name(t.weekday) + ", " + t.day.to_str() + " " +
+    month_name(t.month) + " " + four(t.year) + " " + two(t.hour) + ":" +
+    two(t.minute) + ":" + two(t.second) + " " + stamp.offset
+}
+
+/// `git log --date=short`.
+pub fn short(stamp: GitStamp) -> str {
+    let t = local_time(stamp)
+    return four(t.year) + "-" + two(t.month) + "-" + two(t.day)
+}
+
+/// `git log --date=raw`, which is what the object itself holds.
+pub fn raw(stamp: GitStamp) -> str {
+    return stamp.seconds.to_str() + " " + stamp.offset
+}
+
+/// `git log --date=unix`, which is the only format that drops the offset.
+pub fn unix(stamp: GitStamp) -> str {
+    return stamp.seconds.to_str()
+}
+
+/// The same instant as UTC, for a caller that wants to compare two commits
+/// rather than show one.
+pub fn utc_iso(stamp: GitStamp) -> str {
+    let t = civil_of(stamp.seconds)
+    return four(t.year) + "-" + two(t.month) + "-" + two(t.day) + "T" +
+    two(t.hour) + ":" + two(t.minute) + ":" + two(t.second) + "Z"
+}

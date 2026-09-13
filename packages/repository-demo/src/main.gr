@@ -1,0 +1,207 @@
+// The last four files a tool needs to read a git repository without git.
+import gitrefs
+import gitreflog
+import gitmodules
+import gitdate
+import gitobjectid
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn check_gitrefs(inout f: i64) / {io} {
+    let packed = "# pack-refs with: peeled fully-peeled sorted \n" +
+    "a4b2c275dfca9b4832c297131a0b00f7f2705563 refs/heads/master\n" +
+    "68d08b215011ae5bfc3d6fa3d44abd42c2b5284c refs/heads/other\n" +
+    "ef869a683298466b41b4933748079568687c4e44 refs/tags/annotated\n" +
+    "^68d08b215011ae5bfc3d6fa3d44abd42c2b5284c\n" +
+    "68d08b215011ae5bfc3d6fa3d44abd42c2b5284c refs/tags/light\n"
+    let entries = gitrefs.parse_packed(packed)
+    say(f, "the comment line is not a ref", entries.len() == 4)
+    say(f, "two branches were found", gitrefs.branches(entries).len() == 2)
+    say(f, "and two tags", gitrefs.tags(entries).len() == 2)
+    // A packed annotated tag is two lines: the tag object and what it
+    // points at.
+    say(f, "an annotated tag carries the commit it points at",
+        gitrefs.is_annotated_tag(gitrefs.find(entries,
+            "refs/tags/annotated") ?? empty_ref()))
+    say(f, "and resolving it gives the commit, not the tag object",
+        gitrefs.resolve(entries, "refs/tags/annotated") ==
+        Some("68d08b215011ae5bfc3d6fa3d44abd42c2b5284c"))
+    say(f, "a lightweight tag resolves to itself",
+        gitrefs.resolve(entries, "refs/tags/light") ==
+        Some("68d08b215011ae5bfc3d6fa3d44abd42c2b5284c"))
+    // A loose ref wins: `git pack-refs` writes the packed file and deletes
+    // the loose ones afterwards, so a loose ref that still exists is newer.
+    let loose = [gitrefs.parse_loose("refs/heads/master",
+        "1111111111111111111111111111111111111111\n")]
+    let merged = gitrefs.merge(entries, loose)
+    say(f, "a loose ref wins over a packed one",
+        gitrefs.resolve(merged, "refs/heads/master") ==
+        Some("1111111111111111111111111111111111111111"))
+    say(f, "and does not appear twice", merged.len() == 4)
+    // HEAD is symbolic and has to be followed.
+    let head = gitrefs.parse_loose("HEAD", "ref: refs/heads/master\n")
+    say(f, "HEAD is symbolic", head.symbolic == "refs/heads/master")
+    say(f, "and following it reaches the commit",
+        gitrefs.resolve(gitrefs.merge(merged, [head]), "HEAD") ==
+        Some("1111111111111111111111111111111111111111"))
+}
+
+fn empty_ref() -> RefEntry {
+    return RefEntry{ name: "", target: "", peeled: "", symbolic: "" }
+}
+
+fn check_gitreflog(inout f: i64) / {io} {
+    let text = "0000000000000000000000000000000000000000 " +
+    "68d08b215011ae5bfc3d6fa3d44abd42c2b5284c T Tester <t@e.com> " +
+    "1789298603 +0400\tcommit (initial): first\n" +
+    "68d08b215011ae5bfc3d6fa3d44abd42c2b5284c " +
+    "a4b2c275dfca9b4832c297131a0b00f7f2705563 T Tester <t@e.com> " +
+    "1789298603 +0400\tcommit: second\n"
+    let entries = gitreflog.parse(text)
+    say(f, "both moves were read", entries.len() == 2)
+    // The name may contain spaces, so the fields are found from the tab
+    // backwards rather than by splitting the line.
+    say(f, "a name with a space in it survives",
+        entries[0].name == "T Tester")
+    say(f, "and the address is separate", entries[0].email == "t@e.com")
+    say(f, "the first entry created the ref",
+        gitreflog.is_creation(entries[0]))
+    say(f, "the action is the word before the colon",
+        gitreflog.action_of(entries[1]) == "commit")
+    // HEAD@{0} is the newest, which is the end of the file.
+    say(f, "the newest entry is the one at position zero",
+        gitreflog.at(entries, 0) ==
+        Some("a4b2c275dfca9b4832c297131a0b00f7f2705563"))
+    say(f, "and position one is the move before it",
+        gitreflog.at(entries, 1) ==
+        Some("68d08b215011ae5bfc3d6fa3d44abd42c2b5284c"))
+    say(f, "nothing that far back is nothing",
+        gitreflog.at(entries, 9) == None)
+    say(f, "every commit the ref ever held can be listed",
+        gitreflog.reachable_ids(entries).len() == 2)
+    say(f, "and a line writes back as it was read",
+        gitreflog.render(entries[1]).ends_with("\tcommit: second"))
+}
+
+fn check_gitmodules(inout f: i64) / {io} {
+    let text = "[submodule \"lib\"]\n\tpath = vendor/lib\n" +
+    "\turl = https://example.com/lib.git\n\tbranch = main\n" +
+    "[submodule \"escaping\"]\n\tpath = ../../.git/hooks\n" +
+    "\turl = https://example.com/evil.git\n" +
+    "[submodule \"optionurl\"]\n\tpath = fine\n" +
+    "\turl = --upload-pack=touch /tmp/x\n"
+    let modules = gitmodules.parse(text)
+    say(f, "three submodules are declared", modules.len() == 3)
+    say(f, "with their paths and urls",
+        (gitmodules.find(modules, "lib") ?? empty_module()).path ==
+        "vendor/lib")
+    say(f, "and the branch one of them follows",
+        (gitmodules.find(modules, "lib") ?? empty_module()).branch ==
+        "main")
+    say(f, "one can be found by where it goes",
+        (gitmodules.find_by_path(modules, "vendor/lib") ??
+            empty_module()).name == "lib")
+    // A `.gitmodules` from a repository you did not write is untrusted.
+    say(f, "a path that escapes the working tree is refused",
+        not gitmodules.path_is_safe(gitmodules.find(modules, "escaping") ??
+            empty_module()))
+    say(f, "a url that is an option is refused",
+        not gitmodules.url_is_safe(gitmodules.find(modules, "optionurl") ??
+            empty_module()))
+    say(f, "an ordinary one is not",
+        gitmodules.is_safe(gitmodules.find(modules, "lib") ??
+            empty_module()))
+    say(f, "and the unsafe ones are the two named",
+        gitmodules.unsafe_modules(modules).len() == 2)
+}
+
+fn empty_module() -> GitModule {
+    return GitModule{ name: "", path: "", url: "", branch: "",
+        update: "", ignore: "", shallow: false }
+}
+
+fn check_gitdate(inout f: i64) / {io} {
+    let stamp = gitdate.parse("1789298603 +0400") ??
+    GitStamp{ seconds: 0, offset: "+0000" }
+    // What `git log --date=` prints for that commit.
+    say(f, "iso matches git", gitdate.iso(stamp) ==
+        "2026-09-13 15:23:23 +0400")
+    say(f, "iso-strict matches git", gitdate.iso_strict(stamp) ==
+        "2026-09-13T15:23:23+04:00")
+    say(f, "rfc matches git", gitdate.rfc2822(stamp) ==
+        "Sun, 13 Sep 2026 15:23:23 +0400")
+    say(f, "short matches git", gitdate.short(stamp) == "2026-09-13")
+    say(f, "raw is what the object holds",
+        gitdate.raw(stamp) == "1789298603 +0400")
+    say(f, "and unix drops the offset",
+        gitdate.unix(stamp) == "1789298603")
+    // The offset is the writer's wall clock, not the reader's.
+    let utc = gitdate.parse("1789298603 +0000") ??
+    GitStamp{ seconds: 0, offset: "+0000" }
+    say(f, "the same instant in another zone reads differently",
+        gitdate.iso(utc) == "2026-09-13 11:23:23 +0000")
+    say(f, "but is the same instant in UTC",
+        gitdate.utc_iso(utc) == gitdate.utc_iso(stamp))
+    // git writes `Z` rather than `+00:00`, as RFC 3339 allows.
+    say(f, "iso-strict writes Z for UTC",
+        gitdate.iso_strict(utc) == "2026-09-13T11:23:23Z")
+    say(f, "the epoch itself works",
+        gitdate.iso(gitdate.parse("0 +0000") ??
+            GitStamp{ seconds: 0, offset: "+0000" }) ==
+        "1970-01-01 00:00:00 +0000")
+    say(f, "and an offset with minutes in it",
+        gitdate.offset_minutes(gitdate.parse("0 +0545") ??
+            GitStamp{ seconds: 0, offset: "+0000" }) == 345)
+}
+
+fn check_gitobjectid(inout f: i64) / {io} {
+    let known = ["a4b2c275dfca9b4832c297131a0b00f7f2705563",
+        "a4b2c9900000000000000000000000000000ffff",
+        "68d08b215011ae5bfc3d6fa3d44abd42c2b5284c"]
+    say(f, "a forty-character id is a SHA-1 one",
+        gitobjectid.hash_size(known[0]) == 1)
+    say(f, "and a sixty-four-character one is SHA-256",
+        gitobjectid.hash_size(gitobjectid.null_id(256)) == 256)
+    say(f, "something that is not hexadecimal is not an id",
+        not gitobjectid.is_full("z4b2c275dfca9b4832c297131a0b00f7f2705563"))
+    // The all-zero id is not an object; it is git's way of writing nothing.
+    say(f, "the all-zero id is recognised as no object",
+        gitobjectid.is_null(gitobjectid.null_id(1)))
+    // An abbreviation is as short as this repository allows, and never
+    // shorter than seven.
+    say(f, "an unambiguous id shortens to seven characters",
+        gitobjectid.abbreviate(known, known[2]) == "68d08b2")
+    say(f, "and one that collides gets as many as it needs",
+        gitobjectid.abbreviate(known, known[0]) == "a4b2c27")
+    say(f, "an abbreviation expands back when it names one object",
+        gitobjectid.expand(known, "68d08b2") == Some(known[2]))
+    say(f, "and expands to nothing when it names several",
+        gitobjectid.expand(known, "a4b2c") == None)
+    say(f, "two ids of different lengths can still be the same object",
+        gitobjectid.same_object("68d08b2", known[2]))
+    say(f, "and two that differ are not",
+        not gitobjectid.same_object("68d08b2", known[0]))
+}
+
+fn main() / {io} {
+    var f = 0
+
+    check_gitrefs(f)
+    check_gitreflog(f)
+    check_gitmodules(f)
+    check_gitdate(f)
+    check_gitobjectid(f)
+
+    if f == 0 {
+        print("repository: every claim held")
+    } else {
+        print("repository: {f} failed")
+    }
+}

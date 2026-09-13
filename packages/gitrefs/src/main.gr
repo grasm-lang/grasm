@@ -1,0 +1,205 @@
+// Where a git repository's branches and tags actually live.
+//
+// A ref is a name pointing at an object, and there are two places it can be
+// written down. A *loose* ref is a file under `.git/refs/` holding a hash —
+// or, for a symbolic one such as `HEAD`, the text `ref: refs/heads/main`. A
+// *packed* ref lives in `.git/packed-refs`, which is what `git gc` and `git
+// pack-refs` produce so a repository with thousands of tags is not thousands
+// of files.
+//
+// The two coexist, and that is the part a reader has to get right: a name in
+// both places is the loose one. `git pack-refs` writes the packed file
+// first and deletes the loose files afterwards, so a repository interrupted
+// between the two has a stale packed entry and a correct loose one. Reading
+// the packed file alone gives the wrong answer for exactly the refs that
+// were being updated.
+//
+// The other detail is the `^` line. A packed annotated tag is written as two
+// lines: the tag object's own hash, then `^` and the hash of what it points
+// at. `git show-ref` prints only the first; a tool resolving a tag to a
+// commit needs the second. Both are here.
+//
+// Nothing opens a file: the packed text and the loose refs are handed in, so
+// the same code reads a repository on disk, one inside an archive, and a
+// fixture.
+
+type RefEntry = {
+    name: str,
+    /// The hash the name points at. For an annotated tag this is the tag
+    /// object, not the commit.
+    target: str,
+    /// The commit an annotated tag points at, empty otherwise.
+    peeled: str,
+    /// The name a symbolic ref points at, empty for a direct one.
+    symbolic: str,
+}
+
+/// A `.git/packed-refs` file.
+pub fn parse_packed(text: str) -> [RefEntry] {
+    var out: [RefEntry] = []
+    for raw in text.split("\n") {
+        let line = raw.trim()
+        if line.len() == 0 or line.starts_with("#") {
+            continue
+        }
+        if line.starts_with("^") {
+            // The object the tag on the previous line points at.
+            if out.len() > 0 {
+                out[out.len() - 1].peeled =
+                line.substr(1, line.len() - 1).trim()
+            }
+            continue
+        }
+        let space = line.index_of(" ") ?? -1
+        if space < 0 {
+            continue
+        }
+        out.push(RefEntry{
+            name: line.substr(space + 1, line.len() - space - 1).trim(),
+            target: line.substr(0, space),
+            peeled: "",
+            symbolic: "",
+        })
+    }
+    return out
+}
+
+/// One loose ref file: a hash, or `ref: ` and another name.
+pub fn parse_loose(name: str, text: str) -> RefEntry {
+    let body = text.trim()
+    if body.starts_with("ref: ") {
+        return RefEntry{
+            name: name,
+            target: "",
+            peeled: "",
+            symbolic: body.substr(5, body.len() - 5).trim(),
+        }
+    }
+    return RefEntry{
+        name: name,
+        target: body,
+        peeled: "",
+        symbolic: "",
+    }
+}
+
+/// The refs a repository has, loose ones winning over packed ones.
+///
+/// That order is not a preference: `git pack-refs` writes the packed file
+/// and then deletes the loose files, so a loose ref that still exists is
+/// either newer than the packed entry or the only copy.
+pub fn merge(packed: [RefEntry], loose: [RefEntry]) -> [RefEntry] {
+    var out: [RefEntry] = []
+    var overridden: Map[str, bool] = {}
+    for entry in loose {
+        overridden.set(entry.name, true)
+    }
+    for entry in packed {
+        if not overridden.has(entry.name) {
+            out.push(entry)
+        }
+    }
+    for entry in loose {
+        out.push(entry)
+    }
+    return sorted_by_name(out)
+}
+
+/// Sorted by name, which is the order `git show-ref` prints them in.
+fn sorted_by_name(entries: [RefEntry]) -> [RefEntry] {
+    var names: [str] = []
+    for entry in entries {
+        names.push(entry.name)
+    }
+    names.sort()
+    var out: [RefEntry] = []
+    for name in names {
+        for entry in entries {
+            if entry.name == name {
+                out.push(entry)
+            }
+        }
+    }
+    return out
+}
+
+/// The lines `git show-ref` prints: the hash and the name, and nothing
+/// about peeling.
+pub fn render_show_ref(entries: [RefEntry]) -> [str] {
+    var out: [str] = []
+    for entry in entries {
+        if entry.symbolic.len() > 0 or entry.target.len() == 0 {
+            continue
+        }
+        out.push(entry.target + " " + entry.name)
+    }
+    return out
+}
+
+/// A ref by name.
+pub fn find(entries: [RefEntry], name: str) -> Option[RefEntry] {
+    for entry in entries {
+        if entry.name == name {
+            return Some(entry)
+        }
+    }
+    return None
+}
+
+/// The commit a name ends at, following a symbolic ref and peeling a tag.
+///
+/// A symbolic ref may point at another symbolic ref, so this follows a
+/// bounded number of them rather than trusting the file not to loop.
+pub fn resolve(entries: [RefEntry], name: str) -> Option[str] {
+    var current = name
+    var steps = 0
+    while steps < 10 {
+        match find(entries, current) {
+            None -> return None
+            Some(entry) -> {
+                if entry.symbolic.len() > 0 {
+                    current = entry.symbolic
+                    steps = steps + 1
+                    continue
+                }
+                if entry.peeled.len() > 0 {
+                    return Some(entry.peeled)
+                }
+                return Some(entry.target)
+            }
+        }
+    }
+    return None
+}
+
+/// The branches, without the `refs/heads/` in front.
+pub fn branches(entries: [RefEntry]) -> [str] {
+    return names_under(entries, "refs/heads/")
+}
+
+/// The tags, without the `refs/tags/` in front.
+pub fn tags(entries: [RefEntry]) -> [str] {
+    return names_under(entries, "refs/tags/")
+}
+
+/// The remote-tracking branches.
+pub fn remote_branches(entries: [RefEntry]) -> [str] {
+    return names_under(entries, "refs/remotes/")
+}
+
+fn names_under(entries: [RefEntry], prefix: str) -> [str] {
+    var out: [str] = []
+    for entry in entries {
+        if entry.name.starts_with(prefix) {
+            out.push(entry.name.substr(prefix.len(),
+                entry.name.len() - prefix.len()))
+        }
+    }
+    return out
+}
+
+/// Whether a ref is an annotated tag, which is the case exactly when the
+/// packed file gave it a peeled line.
+pub fn is_annotated_tag(entry: RefEntry) -> bool {
+    return entry.peeled.len() > 0
+}

@@ -1,0 +1,10 @@
+[package]
+name = "gitmodules"
+version = "1.0.0"
+
+# Parses text it is handed. Opens nothing.
+capabilities = []
+
+[dependencies.gitconfig]
+path = "../gitconfig"
+version = "^1.0.0"

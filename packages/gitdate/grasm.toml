@@ -1,0 +1,6 @@
+[package]
+name = "gitdate"
+version = "1.0.0"
+
+# Arithmetic on a number. Opens nothing.
+capabilities = []

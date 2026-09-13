@@ -1,0 +1,166 @@
+// `.gitmodules`: what a repository says about the repositories inside it.
+//
+// A submodule is two things that have to agree. The *gitlink* in the tree —
+// a mode 160000 entry that `gitindex` already reads — says which commit of
+// the other repository this one wants. `.gitmodules` says where to get it
+// from and where to put it. Neither is enough alone: a checkout with the
+// gitlink and no `.gitmodules` cannot fetch, and one with `.gitmodules` and
+// no gitlink does not know which commit.
+//
+// The file is git's own configuration format, which `packages/gitconfig`
+// already reads, so this is the layer above it: which submodules are
+// declared, and the three things worth knowing about each.
+//
+//   `path`     where in the working tree it goes
+//   `url`      where to clone it from
+//   `branch`   which branch `--remote` should follow, if any
+//
+// Two of the rules matter for safety rather than convenience, and both come
+// from real vulnerabilities:
+//
+//   - **A path must stay inside the working tree.** A submodule declaring
+//     `path = ../../.git/hooks` writes into the parent repository's hook
+//     directory during a clone, which is arbitrary code execution on
+//     `git clone --recursive`. `path_is_safe` is the check.
+//   - **A URL beginning with a dash is an option, not a location.** A
+//     submodule whose `url` is `--upload-pack=...` hands an argument to the
+//     command git runs. `url_is_safe` is that check.
+//
+// A `.gitmodules` from a repository you did not write is untrusted input,
+// and these are the two questions to ask of it before acting.
+
+import gitconfig
+
+type GitModule = {
+    /// The subsection name, which is not necessarily the path.
+    name: str,
+    path: str,
+    url: str,
+    /// Empty when the module does not follow a branch.
+    branch: str,
+    /// `checkout`, `rebase`, `merge` or `none`, empty when unset.
+    update: str,
+    /// What `git status` and `git diff` should ignore: `all`, `dirty`,
+    /// `untracked` or empty.
+    ignore: str,
+    /// Whether the module is fetched shallowly by default.
+    shallow: bool,
+}
+
+/// The submodules a `.gitmodules` declares.
+pub fn parse(text: str) -> [GitModule] {
+    let entries = gitconfig.parse(text) ?? []
+    var out: [GitModule] = []
+    for name in gitconfig.subsections(entries, "submodule") {
+        let prefix = "submodule." + name + "."
+        out.push(GitModule{
+            name: name,
+            path: gitconfig.value_of(entries, prefix + "path"),
+            url: gitconfig.value_of(entries, prefix + "url"),
+            branch: gitconfig.value_of(entries, prefix + "branch"),
+            update: gitconfig.value_of(entries, prefix + "update"),
+            ignore: gitconfig.value_of(entries, prefix + "ignore"),
+            shallow: gitconfig.boolean_of(entries,
+                prefix + "shallow") ?? false,
+        })
+    }
+    return out
+}
+
+/// A submodule by the name it is declared under.
+pub fn find(modules: [GitModule], name: str) -> Option[GitModule] {
+    for module in modules {
+        if module.name == name {
+            return Some(module)
+        }
+    }
+    return None
+}
+
+/// A submodule by where it sits in the working tree, which is how the rest
+/// of git refers to one.
+pub fn find_by_path(modules: [GitModule], path: str) -> Option[GitModule] {
+    for module in modules {
+        if module.path == path {
+            return Some(module)
+        }
+    }
+    return None
+}
+
+/// Whether a declared path stays inside the working tree.
+///
+/// A submodule declaring `../../.git/hooks` writes into the parent
+/// repository's hooks during a recursive clone, which runs whatever it put
+/// there. Absolute paths and anything containing `..` are refused, as is a
+/// path naming `.git` itself.
+pub fn path_is_safe(module: GitModule) -> bool {
+    let path = module.path
+    if path.len() == 0 {
+        return false
+    }
+    if path.starts_with("/") or path.starts_with("\\") {
+        return false
+    }
+    // A drive letter, which is absolute on the systems that have them.
+    if path.len() >= 2 and path.substr(1, 1) == ":" {
+        return false
+    }
+    for part in path.replace("\\", "/").split("/") {
+        if part == ".." or part.to_lower() == ".git" {
+            return false
+        }
+    }
+    return true
+}
+
+/// Whether a declared URL is a location rather than an option.
+///
+/// A URL beginning with `-` is handed to the command git runs as an
+/// argument, which is how `--upload-pack=...` became a remote code
+/// execution. A URL with a newline in it is refused for the same reason.
+pub fn url_is_safe(module: GitModule) -> bool {
+    let url = module.url
+    if url.len() == 0 {
+        return false
+    }
+    if url.starts_with("-") {
+        return false
+    }
+    var i = 0
+    while i < url.len() {
+        let c = url.substr(i, 1)
+        if c == "\n" or c == "\r" or c == "\u{0}" {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+/// Whether a module is safe to act on at all, which is both questions.
+pub fn is_safe(module: GitModule) -> bool {
+    return path_is_safe(module) and url_is_safe(module)
+}
+
+/// The modules that are not, which is the list to report rather than the
+/// one to act on.
+pub fn unsafe_modules(modules: [GitModule]) -> [str] {
+    var out: [str] = []
+    for module in modules {
+        if not is_safe(module) {
+            out.push(module.name)
+        }
+    }
+    return out
+}
+
+/// The lines `git config -f .gitmodules --list` prints, which is the flat
+/// form of the same file.
+pub fn render_list(text: str) -> [str] {
+    var out: [str] = []
+    for entry in gitconfig.parse(text) ?? [] {
+        out.push(entry.name + "=" + entry.value)
+    }
+    return out
+}

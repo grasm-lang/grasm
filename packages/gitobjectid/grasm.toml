@@ -1,0 +1,6 @@
+[package]
+name = "gitobjectid"
+version = "1.0.0"
+
+# String handling. Opens nothing.
+capabilities = []

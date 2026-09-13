@@ -1,0 +1,115 @@
+import gitrefs
+import gitreflog
+import gitmodules
+import gitdate
+import gitobjectid
+
+fn from_hex(text: str) -> str {
+    var out: [i64] = []
+    var i = 1
+    while i + 1 < text.len() {
+        out.push(text.substr(i, 2).parse_int_base(16) ?? 0)
+        i = i + 2
+    }
+    return bytes_of(out).to_str()
+}
+
+fn to_hex(text: str) -> str {
+    let digits = "0123456789abcdef"
+    let raw = text.to_bytes()
+    var out = ""
+    var i = 0
+    while i < raw.len() {
+        out = out + digits.substr(raw.at(i) / 16, 1) +
+        digits.substr(raw.at(i) % 16, 1)
+        i = i + 1
+    }
+    return out
+}
+
+fn read_or_hex(where: str) -> str / {io} {
+    match read_file(where) {
+        Ok(text) -> return text
+        Err(_e) -> return from_hex(where)
+    }
+}
+
+fn main() / {io} {
+    var i = 0
+    while i + 1 < args().len() {
+        let what = args()[i]
+        if what == "showref" {
+            // `showref <packed-refs path> <head path>`
+            let packed = gitrefs.parse_packed(read_or_hex(args()[i + 1]))
+            print(to_hex(gitrefs.render_show_ref(packed).join("\n")))
+            i = i + 2
+            continue
+        }
+        if what == "reflog" {
+            var lines: [str] = []
+            for entry in gitreflog.parse(read_or_hex(args()[i + 1])) {
+                lines.push(entry.new_id + " " + gitreflog.action_of(entry))
+            }
+            print(to_hex(lines.join("\n")))
+            i = i + 2
+            continue
+        }
+        if what == "reflogwrite" {
+            var lines: [str] = []
+            for entry in gitreflog.parse(read_or_hex(args()[i + 1])) {
+                lines.push(gitreflog.render(entry))
+            }
+            print(to_hex(lines.join("\n")))
+            i = i + 2
+            continue
+        }
+        if what == "modules" {
+            print(to_hex(gitmodules.render_list(
+                read_or_hex(args()[i + 1])).join("\n")))
+            i = i + 2
+            continue
+        }
+        if what == "modulesafe" {
+            var names: [str] = []
+            for module in gitmodules.parse(read_or_hex(args()[i + 1])) {
+                var mark = "safe"
+                if not gitmodules.is_safe(module) {
+                    mark = "unsafe"
+                }
+                names.push(module.name + "=" + mark)
+            }
+            print(to_hex(names.join(",")))
+            i = i + 2
+            continue
+        }
+        if what == "abbrev" {
+            // `abbrev <one id per line> <the id to shorten>`
+            var known: [str] = []
+            for line in read_or_hex(args()[i + 1]).split("\n") {
+                if line.trim().len() > 0 {
+                    known.push(line.trim())
+                }
+            }
+            print(gitobjectid.abbreviate(known, from_hex(args()[i + 2])))
+            i = i + 3
+            continue
+        }
+        // `date <format> <seconds and offset>`
+        let stamp = gitdate.parse(from_hex(args()[i + 2])) ??
+        GitStamp{ seconds: 0, offset: "+0000" }
+        if what == "iso" {
+            print(gitdate.iso(stamp))
+        } else if what == "isostrict" {
+            print(gitdate.iso_strict(stamp))
+        } else if what == "rfc" {
+            print(gitdate.rfc2822(stamp))
+        } else if what == "short" {
+            print(gitdate.short(stamp))
+        } else if what == "raw" {
+            print(gitdate.raw(stamp))
+        } else {
+            print(gitdate.unix(stamp))
+        }
+        i = i + 3
+    }
+}

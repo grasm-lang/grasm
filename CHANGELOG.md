@@ -9,6 +9,27 @@ migration note here; anything `experimental` may change in any release. See
 
 ### Added
 
+- **Five packages that finish reading a git repository without git.**
+  `gitrefs` reads `packed-refs` and loose refs, with loose ones winning —
+  not a preference: `git pack-refs` writes the packed file and deletes the
+  loose files afterwards, so a loose ref that still exists is either newer or
+  the only copy. It also keeps the `^` line a packed annotated tag carries,
+  which `git show-ref` does not print and which a tool resolving a tag to a
+  commit needs. `gitreflog` reads where a ref has been, parsing from the tab
+  backwards because a name may contain spaces and most do. `gitmodules` reads
+  what a repository says about the repositories inside it, and asks the two
+  questions that come from real vulnerabilities: does the path stay inside
+  the working tree, and is the URL a location rather than an option.
+  `gitdate` renders the timestamp in an object the six ways git renders it,
+  in the writer's own offset rather than the reader's. `gitobjectid` computes
+  the shortest abbreviation unique in a given set of objects, which is what
+  `git rev-parse --short` prints and why a stored short id eventually stops
+  working. 156 cases against `git show-ref`, `git reflog`, `git config
+  --list`, `git log --date=` and `git rev-parse --short`; `repodiff` is a
+  gate.
+
+  **That is 600 packages.**
+
 - **The three files around an SSH signature.** `sshprivkey` reads
   `-----BEGIN OPENSSH PRIVATE KEY-----`, a format documented in OpenSSH's
   own source and no RFC. An encrypted key still parses: the header and the

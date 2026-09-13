@@ -1,0 +1,188 @@
+// The reflog: where a ref has been, which is how a lost commit is found.
+//
+// Every time a ref moves, git appends a line to `.git/logs/<ref>`. That file
+// is the reason `git reset --hard` is survivable: the commit is still there
+// and the reflog still names it, for ninety days by default. Anything
+// offering to undo a git operation reads this.
+//
+// One line per move, and every field is fixed:
+//
+//     <old sha> <new sha> <name> <email> <seconds> <offset>\t<message>
+//
+// The separator before the message is a tab, and everything before it is
+// space-separated — so the name may contain spaces and the parser has to
+// work backwards from the tab rather than forwards from the start. A parser
+// that splits the whole line on spaces loses every entry made by somebody
+// with a space in their name, which is most people.
+//
+// An all-zero old hash means the ref did not exist: the first line of a
+// branch's log, or the creation of a tag.
+//
+// The message is `checkout: moving from x to y`, `commit: subject`,
+// `reset: moving to HEAD~1` and so on — git's own wording, which is not a
+// format anything should parse. `action_of` splits off the part before the
+// colon, which is, and leaves the rest alone.
+//
+// Checked against `git reflog --format`.
+
+type ReflogEntry = {
+    /// The hash the ref pointed at before, all zeros when it did not exist.
+    old_id: str,
+    new_id: str,
+    name: str,
+    email: str,
+    /// Seconds since the epoch.
+    when: i64,
+    /// The writer's offset from UTC, as written: `+0100`, `-0500`.
+    offset: str,
+    message: str,
+}
+
+let ZERO = "0000000000000000000000000000000000000000"
+
+fn last_index_of(text: str, needle: str) -> i64 {
+    var found = 0 - 1
+    var i = 0
+    while i < text.len() {
+        if text.substr(i, 1) == needle {
+            found = i
+        }
+        i = i + 1
+    }
+    return found
+}
+
+/// One line.
+///
+/// Parsed from the tab backwards: the fields before it are fixed and the
+/// name in the middle may contain spaces.
+fn parse_line(line: str) -> Option[ReflogEntry] {
+    let tab = line.index_of("\t") ?? -1
+    var head = line
+    var message = ""
+    if tab >= 0 {
+        head = line.substr(0, tab)
+        message = line.substr(tab + 1, line.len() - tab - 1)
+    }
+    let offset_at = last_index_of(head, " ")
+    if offset_at < 0 {
+        return None
+    }
+    let when_at = last_index_of(head.substr(0, offset_at), " ")
+    if when_at < 0 {
+        return None
+    }
+    let first = head.index_of(" ") ?? -1
+    if first < 0 {
+        return None
+    }
+    let second = head.substr(first + 1, head.len() - first - 1)
+        .index_of(" ") ?? -1
+    if second < 0 {
+        return None
+    }
+    let new_at = first + 1 + second
+    if new_at >= when_at {
+        return None
+    }
+    let who = head.substr(new_at + 1, when_at - new_at - 1).trim()
+    let open = who.index_of("<") ?? -1
+    var name = who
+    var email = ""
+    if open >= 0 {
+        name = who.substr(0, open).trim()
+        let close = last_index_of(who, ">")
+        if close > open {
+            email = who.substr(open + 1, close - open - 1)
+        }
+    }
+    return Some(ReflogEntry{
+        old_id: head.substr(0, first),
+        new_id: head.substr(first + 1, new_at - first - 1),
+        name: name,
+        email: email,
+        when: head.substr(when_at + 1, offset_at - when_at - 1)
+            .parse_int() ?? 0,
+        offset: head.substr(offset_at + 1, head.len() - offset_at - 1),
+        message: message,
+    })
+}
+
+/// A whole reflog file, oldest entry first — which is how it is written and
+/// the reverse of how `git reflog` prints it.
+pub fn parse(text: str) -> [ReflogEntry] {
+    var out: [ReflogEntry] = []
+    for line in text.split("\n") {
+        if line.trim().len() == 0 {
+            continue
+        }
+        match parse_line(line) {
+            Some(entry) -> out.push(entry)
+            None -> {}
+        }
+    }
+    return out
+}
+
+/// The entries newest first, which is the order `git reflog` prints and the
+/// order `HEAD@{0}` counts in.
+pub fn newest_first(entries: [ReflogEntry]) -> [ReflogEntry] {
+    var out: [ReflogEntry] = []
+    var i = entries.len() - 1
+    while i >= 0 {
+        out.push(entries[i])
+        i = i - 1
+    }
+    return out
+}
+
+/// `HEAD@{n}`: the ref's value n moves ago.
+pub fn at(entries: [ReflogEntry], n: i64) -> Option[str] {
+    let ordered = newest_first(entries)
+    if n < 0 or n >= ordered.len() {
+        return None
+    }
+    return Some(ordered[n].new_id)
+}
+
+/// The word before the colon in the message — `commit`, `checkout`,
+/// `reset`, `merge`. The rest is prose and is left alone.
+pub fn action_of(entry: ReflogEntry) -> str {
+    let colon = entry.message.index_of(":") ?? -1
+    if colon < 0 {
+        return entry.message
+    }
+    return entry.message.substr(0, colon)
+}
+
+/// Whether an entry created the ref, which an all-zero old hash means.
+pub fn is_creation(entry: ReflogEntry) -> bool {
+    return entry.old_id == ZERO
+}
+
+/// Every object the ref has ever pointed at, newest first — the list a tool
+/// offering to undo something has to show.
+pub fn reachable_ids(entries: [ReflogEntry]) -> [str] {
+    var out: [str] = []
+    var seen: Map[str, bool] = {}
+    for entry in newest_first(entries) {
+        if not seen.has(entry.new_id) {
+            seen.set(entry.new_id, true)
+            out.push(entry.new_id)
+        }
+    }
+    for entry in newest_first(entries) {
+        if entry.old_id != ZERO and not seen.has(entry.old_id) {
+            seen.set(entry.old_id, true)
+            out.push(entry.old_id)
+        }
+    }
+    return out
+}
+
+/// A line written back exactly as it was read.
+pub fn render(entry: ReflogEntry) -> str {
+    return entry.old_id + " " + entry.new_id + " " + entry.name + " <" +
+    entry.email + "> " + entry.when.to_str() + " " + entry.offset +
+    "\t" + entry.message
+}
