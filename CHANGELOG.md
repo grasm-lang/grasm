@@ -9,6 +9,34 @@ migration note here; anything `experimental` may change in any release. See
 
 ### Added
 
+- **The shortest decimal that reads back as the same double.**
+  `shortestfloat` prints `0.1 + 0.2` as `0.30000000000000004` — not `0.3`,
+  which is a different number, and not `0.29999999999999999`, which is the
+  same number and does not look like it. It is done with exact integer
+  arithmetic over `bigint` rather than in floating point: a double is
+  `m × 2^e`, so rounding it to k digits is a question about integers. Slow
+  and right, where the fast algorithms are several hundred lines of tables
+  and proofs. `formatspec` and `picklefile` each had to write down a float
+  caveat for want of this. 22,653 cases against `repr` and `%.*f`, including
+  eighteen thousand random bit patterns.
+
+- **Internationalised domain names.** `idna` is IDNA2003 — nameprep's four
+  steps, with the tables generated from Python's own `stringprep` — so that
+  `MÜNCHEN.de` and `münchen.de` become the same bytes. `punycode` gained a
+  decoder, and lost a bug: RFC 3492 appends the delimiter after the basic
+  code points whether or not anything follows, so an all-ASCII label encodes
+  to `example-`; without it a decoder reads the whole label as encoded digits
+  and produces three characters nobody asked for. `encode_domain` never hit
+  the case, which is why it went unnoticed. `idnadiff` and `floatreprdiff`
+  are gates.
+
+### Fixed
+
+- **`punycode.encode` left off the delimiter for an all-ASCII label**, which
+  made its output undecodable by every other implementation. `encode_domain`
+  is unaffected — it leaves ASCII labels alone — and the demo that asserted
+  the old behaviour now asserts the RFC's.
+
 - **Two formats the other end still speaks.** `xmlrpcwire` marshals XML-RPC
   request and response bodies — supervisord, Odoo, a good deal of WordPress
   and a long tail of internal services — where the type of every value is

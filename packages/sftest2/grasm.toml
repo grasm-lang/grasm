@@ -1,0 +1,8 @@
+[package]
+name = "sftest2"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.shortestfloat]
+path = "../shortestfloat"
+version = "^1.0.0"

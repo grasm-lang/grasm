@@ -95,6 +95,8 @@ run_gate picklediff     scripts/pickle_diff.sh
 run_gate formatspecdiff scripts/formatspec_diff.sh
 run_gate xmlrpcdiff     scripts/xmlrpc_diff.sh
 run_gate difftextdiff   scripts/difftext_diff.sh
+run_gate floatreprdiff  scripts/shortestfloat_diff.sh
+run_gate idnadiff       scripts/idna_diff.sh
 run_gate kvcrash       scripts/kvstore_crash.sh
 run_gate zlibdiff      scripts/zlib_diff.sh
 run_gate casefolddiff  scripts/casefold_diff.sh

@@ -30,9 +30,9 @@ One rule is added, because the count is now large enough for it to matter:
 | | |
 |---|---|
 | At the close of the 200 plan | 513 |
-| Now | 565 |
+| Now | 570 |
 | Target | 600 |
-| Remaining | 35 |
+| Remaining | 30 |
 
 The count is directories under `packages/` that are not `*-demo`. Test
 harnesses are directories and are counted; they are real programs that the
@@ -86,6 +86,12 @@ gates run, and several of them are the only consumer a format parser has.
   written down; and unified and context diffs byte-identical to
   `difflib`'s, because a hunk header that is off by one is a diff `patch`
   rejects. 404 cases against `xmlrpc.client` and `difflib`.
+- [x] **Names, and numbers as names** — `shortestfloat` `idna`. The shortest
+  decimal that reads back as the same double, done with exact integers
+  rather than floating point; and IDNA2003 with nameprep, whose tables
+  were generated from Python's own `stringprep`. `punycode` gained a
+  decoder and lost a bug. 22,774 cases against `repr`, `%.*f` and
+  `encodings.idna`.
 
 ### Next
 
@@ -93,12 +99,9 @@ Each line is a batch of about six, chosen so that everything in it has an
 implementation elsewhere to be checked against. A name in brackets is the
 thing it is checked against.
 
-- **Names on the wire** — `idna` (Python `encodings.idna`), whose
-  nameprep tables can be generated from Python's own `stringprep`
-- **The shortest float** — `shortestfloat`, the round-tripping decimal
-  Python's `repr` prints. `formatspec` and `picklefile` both had to
-  document a float caveat for want of it, and `json` would use it too.
-  Checkable against `repr(float)` over millions of random doubles.
+- **Float presentations for `formatspec`** — `shortestfloat` exists now, so
+  the `f`, `e`, `g` and `%` types it refuses can be implemented. That is an
+  edit rather than a package and does not move the count.
 
 `terminfo` was on this list and came off it. The plan was to check it
 against `infocmp`, whose `-s i` flag is documented to print capabilities in

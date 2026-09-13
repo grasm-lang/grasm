@@ -1,0 +1,10 @@
+[package]
+name = "shortestfloat"
+version = "1.0.0"
+
+# Arithmetic. Opens nothing.
+capabilities = []
+
+[dependencies.bigint]
+path = "../bigint"
+version = "^1.0.0"

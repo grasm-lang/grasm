@@ -1,0 +1,14 @@
+[package]
+name = "idna"
+version = "1.0.0"
+
+# Text in, text out. Opens nothing.
+capabilities = []
+
+[dependencies.punycode]
+path = "../punycode"
+version = "^1.0.0"
+
+[dependencies.unicodenorm]
+path = "../unicodenorm"
+version = "^1.0.0"

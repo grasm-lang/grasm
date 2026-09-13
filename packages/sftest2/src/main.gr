@@ -1,0 +1,21 @@
+import shortestfloat
+
+fn main() / {io} {
+    var i = 0
+    while i + 1 < args().len() {
+        // Values arrive as their raw bit pattern read as a signed 64-bit
+        // number, so nothing is lost on the way in and the sign bit does
+        // not overflow the parse.
+        let bits = args()[i + 1].parse_int() ?? 0
+        let value = bits.from_bits()
+        if args()[i] == "repr" {
+            print(shortestfloat.repr(value))
+        } else if args()[i] == "digits" {
+            print(shortestfloat.significant_digits(value).to_str())
+        } else {
+            let parts = args()[i].split(":")
+            print(shortestfloat.fixed(value, parts[1].parse_int() ?? 0))
+        }
+        i = i + 2
+    }
+}

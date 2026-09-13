@@ -1,0 +1,114 @@
+// Two things that have to come out the same as everybody else's: a domain
+// name, and a number printed as text.
+import idna
+import punycode
+import shortestfloat
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn check_idna(inout f: i64) / {io} {
+    say(f, "munchen.de becomes xn--mnchen-3ya.de",
+        (idna.encode_domain("m\u{fc}nchen.de") ?? "") ==
+        "xn--mnchen-3ya.de")
+    say(f, "and comes back",
+        (idna.decode_domain("xn--mnchen-3ya.de") ?? "") ==
+        "m\u{fc}nchen.de")
+    // Case is folded in the label that needs encoding and left exactly
+    // alone in the one that does not, because an ASCII label is returned
+    // unchanged. `xn--mnchen-3ya.DE` is what every implementation produces.
+    say(f, "case is folded where a label is encoded and kept where it is not",
+        (idna.encode_domain("M\u{dc}NCHEN.DE") ?? "") ==
+        "xn--mnchen-3ya.DE")
+    say(f, "an ASCII name is left alone",
+        (idna.encode_domain("example.com") ?? "") == "example.com")
+    say(f, "a trailing dot is kept, because it means something",
+        (idna.encode_domain("example.com.") ?? "") == "example.com.")
+    // Three of the four separators a domain may use are not a full stop.
+    say(f, "an ideographic full stop separates labels too",
+        (idna.encode_domain("m\u{fc}nchen\u{3002}de") ?? "") ==
+        "xn--mnchen-3ya.de")
+    // Nameprep is where two names that look the same become one.
+    say(f, "a soft hyphen is invisible and is dropped",
+        (idna.nameprep("a\u{ad}b") ?? "") == "ab")
+    say(f, "a ligature becomes the letters it stands for",
+        (idna.nameprep("\u{fb01}") ?? "") == "fi")
+    say(f, "fullwidth letters collapse to ASCII",
+        (idna.nameprep("\u{ff26}\u{ff35}\u{ff2c}\u{ff2c}") ?? "") == "full")
+    say(f, "and capital sharp s becomes two letters",
+        (idna.nameprep("\u{1e9e}") ?? "") == "ss")
+    // An ASCII space is *not* refused: nameprep's prohibited tables are
+    // the non-ASCII ones, and an all-ASCII label never reaches nameprep at
+    // all. Whoever needs a name without spaces has to say so themselves.
+    say(f, "an ASCII space passes through, which surprises people",
+        (idna.encode_domain("a b.com") ?? "!") == "a b.com")
+    // An ideographic space normalises to an ASCII one and passes too. What
+    // is actually refused is anything that changes how the rest renders.
+    say(f, "an ideographic space normalises to an ASCII one and passes",
+        (idna.encode_domain("a\u{3000}b.com") ?? "!") == "a b.com")
+    say(f, "a left-to-right mark is refused",
+        (idna.encode_domain("a\u{200e}b.com") ?? "!") == "!")
+    say(f, "so is a private use character",
+        (idna.encode_domain("a\u{e000}b.com") ?? "!") == "!")
+    say(f, "and so is a label of seventy characters",
+        (idna.encode_domain("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" +
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.com") ?? "!") == "!")
+    // The delimiter follows the basic code points whether or not anything
+    // comes after it.
+    say(f, "punycode puts a delimiter after ASCII even with nothing after",
+        punycode.encode("example") == "example-")
+    say(f, "and decoding is the encoder run backwards",
+        (punycode.decode("mnchen-3ya") ?? "") == "m\u{fc}nchen")
+    say(f, "a label that is not punycode is refused",
+        (punycode.decode("!!!") ?? "!") == "!")
+}
+
+fn check_shortestfloat(inout f: i64) / {io} {
+    // The number everybody quotes.
+    say(f, "0.1 + 0.2 prints as 0.30000000000000004",
+        shortestfloat.repr(0.1 + 0.2) == "0.30000000000000004")
+    say(f, "0.1 prints as 0.1", shortestfloat.repr(0.1) == "0.1")
+    say(f, "a whole number still looks like a float",
+        shortestfloat.repr(100.0) == "100.0")
+    say(f, "and keeps its sign at zero",
+        shortestfloat.repr((0.0 - 1.0) * 0.0) == "-0.0")
+    // The layout switches to an exponent at 1e17 and below 1e-4.
+    say(f, "1e15 is written out in full",
+        shortestfloat.repr(1000000000000000.0) == "1000000000000000.0")
+    say(f, "1e16 is not", shortestfloat.repr(10000000000000000.0) == "1e+16")
+    say(f, "0.0001 is written out in full",
+        shortestfloat.repr(0.0001) == "0.0001")
+    say(f, "0.00001 is not", shortestfloat.repr(0.00001) == "1e-05")
+    say(f, "the smallest subnormal is 5e-324",
+        shortestfloat.repr(5e-324) == "5e-324")
+    say(f, "one third takes sixteen digits",
+        shortestfloat.significant_digits(1.0 / 3.0) == 16)
+    say(f, "and a half takes one",
+        shortestfloat.significant_digits(0.5) == 1)
+    say(f, "every printed value reads back as itself",
+        shortestfloat.round_trips(shortestfloat.repr(0.1 + 0.2), 0.1 + 0.2))
+    say(f, "fixed places round half to even",
+        shortestfloat.fixed(2.5, 0) == "2" and
+        shortestfloat.fixed(3.5, 0) == "4")
+    say(f, "and print exactly what was asked for",
+        shortestfloat.fixed(1.0 / 3.0, 6) == "0.333333")
+}
+
+fn main() / {io} {
+    var f = 0
+
+    check_idna(f)
+    check_shortestfloat(f)
+
+    if f == 0 {
+        print("names: every claim held")
+    } else {
+        print("names: {f} failed")
+    }
+}

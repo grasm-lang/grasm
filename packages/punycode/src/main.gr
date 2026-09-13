@@ -53,7 +53,11 @@ pub fn encode(label: str) -> str {
             basic = basic + 1
         }
     }
-    if basic > 0 and basic < codes.len() {
+    // The delimiter follows the basic code points whether or not any
+    // others come after it. A label that is all ASCII still ends in `-`,
+    // and a decoder handed one without it reads the whole thing as encoded
+    // digits and produces three characters nobody asked for.
+    if basic > 0 {
         out = out + "-"
     }
     if basic == codes.len() {
@@ -157,4 +161,106 @@ pub fn is_confusable(label: str) -> bool {
         }
     }
     return has_latin and has_other
+}
+
+/// Punycode back to a label, without the `xn--` prefix.
+///
+/// The decoder is the encoder run backwards, and the one thing it must not
+/// do is trust its input: a crafted label can name a code point far outside
+/// Unicode, or ask for an insertion position past the end of what has been
+/// decoded. Both are refused rather than wrapped or clamped.
+pub fn decode(text: str) -> str ! PunyError {
+    var output: [i64] = []
+    var at = 0
+    // Everything before the last hyphen is literal ASCII.
+    var split = 0 - 1
+    var i = 0
+    while i < text.len() {
+        if text.substr(i, 1) == "-" {
+            split = i
+        }
+        i = i + 1
+    }
+    if split >= 0 {
+        for code in text.substr(0, split).codes() {
+            if code >= 128 {
+                fail(NotPunycode(text))
+            }
+            output.push(code)
+        }
+        at = split + 1
+    }
+    var n = initial_n()
+    var bias = initial_bias()
+    var position = 0
+    while at < text.len() {
+        let previous = position
+        var weight = 1
+        var k = base()
+        var going = true
+        while going {
+            if at >= text.len() {
+                fail(NotPunycode(text))
+            }
+            let digit = char_digit(text.substr(at, 1))
+            at = at + 1
+            if digit < 0 {
+                fail(NotPunycode(text))
+            }
+            position = position + digit * weight
+            var threshold = tmin()
+            if k > bias + tmax() {
+                threshold = tmax()
+            } else if k > bias {
+                threshold = k - bias
+            }
+            if digit < threshold {
+                going = false
+            } else {
+                weight = weight * (base() - threshold)
+                k = k + base()
+            }
+            if position > 1114111 * 100 {
+                fail(NotPunycode(text))
+            }
+        }
+        bias = adapt(position - previous, output.len() + 1, previous == 0)
+        n = n + position / (output.len() + 1)
+        position = position % (output.len() + 1)
+        if n > 1114111 or (n >= 55296 and n <= 57343) {
+            fail(NotPunycode(text))
+        }
+        var rebuilt: [i64] = []
+        var j = 0
+        while j < output.len() {
+            if j == position {
+                rebuilt.push(n)
+            }
+            rebuilt.push(output[j])
+            j = j + 1
+        }
+        if position >= output.len() {
+            rebuilt.push(n)
+        }
+        output = rebuilt
+        position = position + 1
+    }
+    var out = ""
+    for code in output {
+        out = out + code.to_char()
+    }
+    return out
+}
+
+/// A whole domain from its `xn--` labels back to text.
+pub fn decode_domain(domain: str) -> str ! PunyError {
+    var parts: [str] = []
+    for label in domain.split(".") {
+        if label.to_lower().starts_with("xn--") {
+            parts.push(try decode(label.substr(4, label.len() - 4)))
+        } else {
+            parts.push(label)
+        }
+    }
+    return parts.join(".")
 }

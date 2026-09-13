@@ -1,0 +1,8 @@
+[package]
+name = "idnatest"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.idna]
+path = "../idna"
+version = "^1.0.0"

@@ -1,0 +1,8 @@
+[package]
+name = "punytest"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.punycode]
+path = "../punycode"
+version = "^1.0.0"

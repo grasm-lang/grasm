@@ -1,0 +1,16 @@
+[package]
+name = "names_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.idna]
+path = "../idna"
+version = "^1.0.0"
+
+[dependencies.punycode]
+path = "../punycode"
+version = "^1.0.0"
+
+[dependencies.shortestfloat]
+path = "../shortestfloat"
+version = "^1.0.0"

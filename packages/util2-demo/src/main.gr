@@ -12,14 +12,20 @@ fn say(inout f: i64, name: str, held: bool) / {io} {
     }
 }
 
-fn main() / {io} {
-    var f = 0
-
+fn check_punycode(inout f: i64) / {io} {
     print("-- punycode, against RFC 3492 and the homograph attack")
     // The RFC's own German example.
     say(f, "bucher -> bcher-kva", punycode.encode("b\u{fc}cher") == "bcher-kva")
     say(f, "munchen -> mnchen-3ya", punycode.encode("m\u{fc}nchen") == "mnchen-3ya")
-    say(f, "pure ascii is unchanged", punycode.encode("example") == "example")
+    // RFC 3492 appends the delimiter after the basic code points whether or
+    // not anything follows it, so even an all-ASCII label ends in `-`.
+    // `encode_domain` never produces one, because it leaves ASCII labels
+    // alone; a decoder handed `example` without the delimiter reads the
+    // whole thing as encoded digits.
+    say(f, "pure ascii still ends in the delimiter",
+        punycode.encode("example") == "example-")
+    say(f, "and a domain leaves an ascii label alone",
+        punycode.encode_domain("example.com") == "example.com")
     say(f, "a domain gets the xn-- prefix",
         punycode.encode_domain("m\u{fc}nchen.de") == "xn--mnchen-3ya.de")
     say(f, "an ascii domain is untouched",
@@ -30,7 +36,14 @@ fn main() / {io} {
     say(f, "Cyrillic-a apple is flagged confusable",
         punycode.is_confusable("\u{430}pple"))
     say(f, "real apple is not", not punycode.is_confusable("apple"))
-    say(f, "and pure Cyrillic is not either", not punycode.is_confusable("\u{43F}\u{440}"))
+    say(f, "and pure Cyrillic is not either",
+        not punycode.is_confusable("\u{43F}\u{440}"))
+}
+
+fn main() / {io} {
+    var f = 0
+
+    check_punycode(f)
 
     print("-- top-k without sorting the whole list")
     var t = topk.new_topk(3)
