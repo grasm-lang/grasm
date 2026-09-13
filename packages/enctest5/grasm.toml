@@ -1,0 +1,20 @@
+[package]
+name = "enctest5"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.utf7]
+path = "../utf7"
+version = "^1.0.0"
+
+[dependencies.utf32]
+path = "../utf32"
+version = "^1.0.0"
+
+[dependencies.iso2022kr]
+path = "../iso2022kr"
+version = "^1.0.0"
+
+[dependencies.hzgb]
+path = "../hzgb"
+version = "^1.0.0"

@@ -1,0 +1,6 @@
+[package]
+name = "utf7"
+version = "1.0.0"
+
+# Text in, text out. Opens nothing.
+capabilities = []

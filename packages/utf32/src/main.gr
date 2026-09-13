@@ -1,0 +1,147 @@
+// UTF-32: one fixed-width number per character.
+//
+// `packages/utf16` covers the encoding with surrogate pairs. This is the one
+// without them: four bytes per code point, no variable length, no pairs to
+// reassemble. That makes it the wrong choice for storage — it is four times
+// the size of ASCII text in UTF-8 — and the right choice for anything that
+// indexes by character, which is why `wchar_t` is UTF-32 on Linux and why
+// several Unicode data formats use it.
+//
+// The two things a reader has to enforce:
+//
+//   - **Surrogates are not characters.** D800..DFFF exist only to let UTF-16
+//     express what it cannot hold directly. A UTF-32 unit in that range came
+//     from a broken conversion, and passing it through produces a string
+//     that cannot be written back out as UTF-8.
+//   - **Unicode stops at 0x10FFFF.** A four-byte field holds four billion
+//     values and only 1,114,112 of them mean anything.
+//
+// Both are refused rather than replaced, because a caller that wanted a
+// replacement character can ask for one and a caller that wanted the truth
+// cannot get it back afterwards.
+//
+// A byte order mark is a real code point (U+FEFF) at the start of a
+// document, and the same four bytes read the other way round are U+FFFE0000,
+// which is not a character at all — that is the whole trick, and it is why
+// a mark can be detected rather than guessed.
+//
+// Checked against Python's `utf-32`, `utf-32-le` and `utf-32-be` codecs.
+
+type Utf32Error =
+    | Utf32Truncated(at: i64)
+    | Utf32Surrogate(at: i64, code: i64)
+    | Utf32OutOfRange(at: i64, code: i64)
+
+let MARK = 65279
+
+fn read_unit(data: bytes, at: i64, big: bool) -> i64 {
+    if big {
+        return data.at(at) * 16777216 + data.at(at + 1) * 65536 +
+        data.at(at + 2) * 256 + data.at(at + 3)
+    }
+    return data.at(at) + data.at(at + 1) * 256 + data.at(at + 2) * 65536 +
+    data.at(at + 3) * 16777216
+}
+
+fn push_unit(inout out: [i64], code: i64, big: bool) {
+    if big {
+        var k = 3
+        while k >= 0 {
+            out.push(code.ushr(k * 8).bit_and(255))
+            k = k - 1
+        }
+        return
+    }
+    var k = 0
+    while k < 4 {
+        out.push(code.ushr(k * 8).bit_and(255))
+        k = k + 1
+    }
+}
+
+/// `data` read with a known byte order, without looking for a mark.
+pub fn decode_with(data: bytes, big: bool) -> str ! Utf32Error {
+    if data.len() % 4 != 0 {
+        fail(Utf32Truncated(data.len()))
+    }
+    var out = ""
+    var at = 0
+    while at < data.len() {
+        let code = read_unit(data, at, big)
+        if code >= 55296 and code <= 57343 {
+            fail(Utf32Surrogate(at, code))
+        }
+        if code > 1114111 or code < 0 {
+            fail(Utf32OutOfRange(at, code))
+        }
+        out = out + code.to_char()
+        at = at + 4
+    }
+    return out
+}
+
+/// Which byte order a document announces: 1 big-endian, 0 little-endian,
+/// -1 for no mark at all.
+pub fn byte_order(data: bytes) -> i64 {
+    if data.len() < 4 {
+        return 0 - 1
+    }
+    if read_unit(data, 0, true) == MARK {
+        return 1
+    }
+    if read_unit(data, 0, false) == MARK {
+        return 0
+    }
+    return 0 - 1
+}
+
+/// `data` read the way a document says to read it.
+///
+/// With no mark the order is little-endian, which is what every codec that
+/// has to guess assumes and what the machines that write these are.
+pub fn decode(data: bytes) -> str ! Utf32Error {
+    let order = byte_order(data)
+    if order < 0 {
+        return try decode_with(data, false)
+    }
+    var rest: [i64] = []
+    var i = 4
+    while i < data.len() {
+        rest.push(data.at(i))
+        i = i + 1
+    }
+    return try decode_with(bytes_of(rest), order == 1)
+}
+
+/// `text` in a chosen byte order, with a mark if asked for.
+pub fn encode_with(text: str, big: bool, mark: bool) -> bytes {
+    var out: [i64] = []
+    if mark {
+        push_unit(out, MARK, big)
+    }
+    for code in text.codes() {
+        push_unit(out, code, big)
+    }
+    return bytes_of(out)
+}
+
+/// `text` little-endian with a mark, which is what `utf-32` means.
+pub fn encode(text: str) -> bytes {
+    return encode_with(text, false, true)
+}
+
+/// Whether `data` is a valid document in the given order.
+pub fn is_valid(data: bytes, big: bool) -> bool {
+    match decode_with(data, big) {
+        Ok(_text) -> return true
+        Err(_e) -> return false
+    }
+}
+
+/// How many characters `data` holds, which for this encoding is a division.
+pub fn char_count(data: bytes) -> i64 {
+    if byte_order(data) >= 0 {
+        return data.len() / 4 - 1
+    }
+    return data.len() / 4
+}

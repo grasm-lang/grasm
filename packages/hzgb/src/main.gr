@@ -1,0 +1,170 @@
+// HZ: Chinese text for a seven-bit world, invented for Usenet in 1989.
+//
+// The third of the escape-based encodings here, after `iso2022jp` and
+// `iso2022kr`, and the odd one out: it was designed by users rather than a
+// standards body, for `soc.culture.china`, where the mail gateways of the
+// day mangled anything with the high bit set. It is still what a good deal
+// of archived Chinese Usenet and mailing-list traffic is in, and Python
+// ships a codec for it.
+//
+// The switches are `~{` and `~}` rather than escape sequences, which makes
+// the format readable in a way ISO 2022 is not — a line of HZ looks like
+// `~{<:Ky2;S{~}` and you can see where the Chinese starts. Inside a run,
+// pairs of bytes are GB 2312 with the high bits off.
+//
+// Two rules are worth stating because they are where implementations
+// diverge:
+//
+//   - **`~~` is a literal tilde**, and `~\n` is a line continuation that
+//     produces nothing at all. Any other `~` outside a run is just a tilde,
+//     which means an encoder has to escape every tilde in ASCII text and a
+//     decoder has to accept the ones that were not escaped.
+//   - **A run does not survive a line ending.** The standard says a line
+//     must end outside a run, and the practical reason is that mail
+//     software of the period split long lines wherever it liked.
+//
+// The character set is GB 2312, which `packages/gb18030` already carries as
+// a subset; this converts between byte layouts rather than keeping a second
+// copy.
+//
+// Checked against Python's `hz` codec.
+
+import gb18030
+
+type HzError =
+    | HzInvalid(at: i64, byte: i64)
+    | HzTruncated(at: i64)
+    | HzUnencodable(at: i64, code: i64)
+
+    /// The text `data` holds.
+pub fn decode(data: bytes) -> str ! HzError {
+    var out = ""
+    var inside = false
+    var at = 0
+    while at < data.len() {
+        let b = data.at(at)
+        if b > 127 {
+            fail(HzInvalid(at, b))
+        }
+        if b == 126 {
+            if at + 1 >= data.len() {
+                fail(HzTruncated(at))
+            }
+            let next = data.at(at + 1)
+            if next == 123 {
+                inside = true
+                at = at + 2
+                continue
+            }
+            if next == 125 {
+                inside = false
+                at = at + 2
+                continue
+            }
+            if next == 126 {
+                out = out + "~"
+                at = at + 2
+                continue
+            }
+            if next == 10 {
+                // A continuation: the line break itself disappears.
+                at = at + 2
+                continue
+            }
+            out = out + "~"
+            at = at + 1
+            continue
+        }
+        if not inside or b == 10 or b == 13 {
+            if b == 10 or b == 13 {
+                inside = false
+            }
+            out = out + b.to_char()
+            at = at + 1
+            continue
+        }
+        if at + 1 >= data.len() {
+            fail(HzTruncated(at))
+        }
+        let second = data.at(at + 1)
+        if b < 33 or b > 126 or second < 33 or second > 126 {
+            fail(HzInvalid(at, b))
+        }
+        let code = gb18030.pair_to_code(b + 128, second + 128)
+        if code < 0 {
+            fail(HzInvalid(at, b))
+        }
+        out = out + code.to_char()
+        at = at + 2
+    }
+    return out
+}
+
+/// `text` as HZ.
+pub fn encode(text: str) -> bytes ! HzError {
+    return try encode_with(gb18030.encoder(), text)
+}
+
+/// The same, reusing a table built once.
+pub fn encode_with(table: Gb18030Encoder, text: str) -> bytes ! HzError {
+    var out: [i64] = []
+    var inside = false
+    var at = 0
+    for code in text.codes() {
+        if code < 128 {
+            if inside {
+                out.push(126)
+                out.push(125)
+                inside = false
+            }
+            out.push(code)
+            if code == 126 {
+                // Every literal tilde is doubled, or a decoder reads it as
+                // the start of a switch.
+                out.push(126)
+            }
+            at = at + 1
+            continue
+        }
+        match table.map.get(code) {
+            Some(packed) -> {
+                let lead = packed / 256
+                let trail = packed % 256
+                if lead < 161 or lead > 247 or trail < 161 or trail > 254 {
+                    // Outside GB 2312 proper: GBK has more than HZ can say.
+                    fail(HzUnencodable(at, code))
+                }
+                if not inside {
+                    out.push(126)
+                    out.push(123)
+                    inside = true
+                }
+                out.push(lead - 128)
+                out.push(trail - 128)
+            }
+            None -> fail(HzUnencodable(at, code))
+        }
+        at = at + 1
+    }
+    if inside {
+        out.push(126)
+        out.push(125)
+    }
+    return bytes_of(out)
+}
+
+/// Whether `data` is a valid HZ document.
+pub fn is_valid(data: bytes) -> bool {
+    match decode(data) {
+        Ok(_text) -> return true
+        Err(_e) -> return false
+    }
+}
+
+/// Whether `text` can be written in HZ at all.
+pub fn is_encodable(text: str) -> bool {
+    match encode(text) {
+        Ok(_data) -> return true
+        Err(_e) -> return false
+    }
+}

@@ -9,6 +9,24 @@ migration note here; anything `experimental` may change in any release. See
 
 ### Added
 
+- **Four more encodings, three of them seven-bit.** `utf7` is what non-ASCII
+  looked like before 8BITMIME and is the basis of the encoding IMAP uses for
+  mailbox names, so a client without it cannot show a folder by the name its
+  owner gave it. Its awkward parts are all in the encoder: the base64 is of
+  UTF-16 rather than UTF-8, the run has no padding, and the closing `-` is
+  written only when what follows could be mistaken for more of the run — a
+  `+` already inside a run is just another character, while one interrupting
+  plain text is its own escape. `utf32` is the fixed-width encoding without
+  surrogate pairs, which refuses surrogates and anything past 0x10FFFF
+  rather than passing them through. `iso2022kr` and `hzgb` are the Korean
+  and Chinese escape encodings; both go through the tables `euckr` and
+  `gb18030` already carry rather than keeping a second copy, and both have
+  one rule that catches implementations which assume they resemble
+  ISO-2022-JP: Korean's designator appears once, before the first shifted
+  run and never again, and HZ's switches are `~{` and `~}` with `~~` for a
+  literal tilde. 700 cases against Python's codecs; `encoding5diff` is a
+  gate.
+
 - **The shortest decimal that reads back as the same double.**
   `shortestfloat` prints `0.1 + 0.2` as `0.30000000000000004` — not `0.3`,
   which is a different number, and not `0.29999999999999999`, which is the

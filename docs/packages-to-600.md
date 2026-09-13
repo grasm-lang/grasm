@@ -30,9 +30,9 @@ One rule is added, because the count is now large enough for it to matter:
 | | |
 |---|---|
 | At the close of the 200 plan | 513 |
-| Now | 570 |
+| Now | 575 |
 | Target | 600 |
-| Remaining | 30 |
+| Remaining | 25 |
 
 The count is directories under `packages/` that are not `*-demo`. Test
 harnesses are directories and are counted; they are real programs that the
@@ -92,6 +92,12 @@ gates run, and several of them are the only consumer a format parser has.
   were generated from Python's own `stringprep`. `punycode` gained a
   decoder and lost a bug. 22,774 cases against `repr`, `%.*f` and
   `encodings.idna`.
+- [x] **Seven bits, four ways** — `utf7` `utf32` `iso2022kr` `hzgb`. The
+  encoding IMAP mailbox names are built on, the fixed-width one without
+  surrogates, the Korean escape encoding whose designator appears once,
+  and the tilde-based one invented for Usenet in 1989. The two CJK ones go
+  through the tables `euckr` and `gb18030` already carry. 700 cases
+  against Python's codecs.
 
 ### Next
 

@@ -1,0 +1,159 @@
+// ISO-2022-KR: Korean text down a seven-bit pipe.
+//
+// The Korean counterpart to `packages/iso2022jp`, and the encoding a great
+// deal of older Korean email is in. Same idea — every byte under 0x80, with
+// escape sequences saying which character set applies — and one difference
+// that catches every implementation that assumes the two are alike:
+//
+// **The designator appears once, at the very start of the document.** A
+// stream begins with `ESC $ ) C`, which says "the shifted-out set in this
+// message is KS X 1001", and that sequence never appears again no matter
+// how many times the text switches. Switching is done with shift-out
+// (0x0E) and shift-in (0x0F) instead, one byte each.
+//
+// So a decoder that looks for a designator before each run finds one and
+// then never finds another, and a *encoder* that emits one per run produces
+// something no Korean mail client reads. The designator is a property of
+// the message, not of the run.
+//
+// The character set underneath is KS X 1001, which `packages/euckr` already
+// carries; this converts between the two byte layouts rather than keeping a
+// second copy of 8,224 characters.
+//
+// Checked against Python's `iso2022_kr` codec.
+
+import euckr
+
+type IsoKrError =
+    | IsoKrInvalid(at: i64, byte: i64)
+    | IsoKrTruncated(at: i64)
+    | IsoKrUnencodable(at: i64, code: i64)
+
+let SHIFT_OUT = 14
+let SHIFT_IN = 15
+let ESCAPE = 27
+
+/// The text `data` holds.
+pub fn decode(data: bytes) -> str ! IsoKrError {
+    var out = ""
+    var shifted = false
+    var at = 0
+    while at < data.len() {
+        let b = data.at(at)
+        if b == ESCAPE {
+            // The one designator, `ESC $ ) C`, wherever it appears.
+            if at + 3 < data.len() and data.at(at + 1) == 36 and
+            data.at(at + 2) == 41 and data.at(at + 3) == 67 {
+                at = at + 4
+                continue
+            }
+            fail(IsoKrInvalid(at, b))
+        }
+        if b == SHIFT_OUT {
+            shifted = true
+            at = at + 1
+            continue
+        }
+        if b == SHIFT_IN {
+            shifted = false
+            at = at + 1
+            continue
+        }
+        if b > 127 {
+            fail(IsoKrInvalid(at, b))
+        }
+        if not shifted or b == 10 or b == 13 {
+            // A line ending leaves the shifted set, which is what every
+            // mailer does and what the standard asks for.
+            if b == 10 or b == 13 {
+                shifted = false
+            }
+            out = out + b.to_char()
+            at = at + 1
+            continue
+        }
+        if at + 1 >= data.len() {
+            fail(IsoKrTruncated(at))
+        }
+        let second = data.at(at + 1)
+        if b < 33 or b > 126 or second < 33 or second > 126 {
+            fail(IsoKrInvalid(at, b))
+        }
+        // The seven-bit pair is the EUC-KR pair with the high bits off.
+        let code = euckr.pair_to_code(b + 128, second + 128)
+        if code < 0 {
+            fail(IsoKrInvalid(at, b))
+        }
+        out = out + code.to_char()
+        at = at + 2
+    }
+    return out
+}
+
+/// `text` as ISO-2022-KR, with the designator once at the front.
+pub fn encode(text: str) -> bytes ! IsoKrError {
+    return try encode_with(euckr.encoder(), text)
+}
+
+/// The same, reusing a table built once.
+pub fn encode_with(table: EucKrEncoder, text: str) -> bytes ! IsoKrError {
+    // The designator goes in just before the first shifted run, and a
+    // stream with no Korean in it has none at all. The standard describes
+    // it as a property of the message; every implementation writes it
+    // lazily, and one written eagerly disagrees with all of them on plain
+    // ASCII.
+    var out: [i64] = []
+    var announced = false
+    var shifted = false
+    var at = 0
+    for code in text.codes() {
+        if code < 128 {
+            if shifted {
+                out.push(SHIFT_IN)
+                shifted = false
+            }
+            out.push(code)
+            at = at + 1
+            continue
+        }
+        match table.map.get(code) {
+            Some(packed) -> {
+                if not announced {
+                    out.push(ESCAPE)
+                    out.push(36)
+                    out.push(41)
+                    out.push(67)
+                    announced = true
+                }
+                if not shifted {
+                    out.push(SHIFT_OUT)
+                    shifted = true
+                }
+                out.push(packed / 256 - 128)
+                out.push(packed % 256 - 128)
+            }
+            None -> fail(IsoKrUnencodable(at, code))
+        }
+        at = at + 1
+    }
+    if shifted {
+        out.push(SHIFT_IN)
+    }
+    return bytes_of(out)
+}
+
+/// Whether `data` is a valid stream.
+pub fn is_valid(data: bytes) -> bool {
+    match decode(data) {
+        Ok(_text) -> return true
+        Err(_e) -> return false
+    }
+}
+
+/// Whether `text` can be written at all.
+pub fn is_encodable(text: str) -> bool {
+    match encode(text) {
+        Ok(_data) -> return true
+        Err(_e) -> return false
+    }
+}

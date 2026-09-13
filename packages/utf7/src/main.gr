@@ -1,0 +1,258 @@
+// UTF-7: Unicode that survives a seven-bit pipe.
+//
+// This is what non-ASCII text looks like in mail and news from before
+// 8BITMIME was everywhere, and — the reason it still matters — it is the
+// basis of the encoding IMAP uses for mailbox names. A client that cannot
+// read it cannot show a folder called "Wysłane" or "送信済み" by the name
+// its owner gave it.
+//
+// The design is the opposite of UTF-8's. Most characters are written as
+// themselves; anything else goes into a base64 run introduced by `+` and
+// ended by `-`. So `héllo wörld` is `h+AOk-llo w+APY-rld`, and the plus
+// sign itself has to be escaped as `+-`.
+//
+// Three things are easy to get wrong:
+//
+//   - **The base64 is of UTF-16, not UTF-8.** A character outside the basic
+//     plane becomes a surrogate pair first and then four base64-encoded
+//     bytes: `😀` is `+2D3eAA-`. Encoding its UTF-8 instead produces a run
+//     that decodes to something else entirely.
+//   - **The run has no padding.** Base64 normally pads to a multiple of
+//     four characters with `=`; here it stops when the bits run out, and
+//     the leftover bits must be zero.
+//   - **Three printable ASCII characters are not written as themselves.**
+//     `+` introduces a run, and `\` and `~` are excluded because the
+//     standard's "direct" set predates their being safe everywhere. An
+//     encoder that passes them through produces output other decoders read
+//     differently.
+//
+// Checked against Python's `utf-7` codec.
+
+let DIGITS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+type Utf7Error =
+    | Utf7BadDigit(at: i64, c: str)
+    | Utf7LeftoverBits(at: i64)
+    | Utf7Truncated(at: i64)
+    | Utf7Surrogate(at: i64)
+
+    /// Whether a character is written as itself.
+    ///
+    /// Tab, newline and carriage return, and everything printable except `+`,
+    /// `\` and `~`.
+pub fn is_direct(code: i64) -> bool {
+    if code == 9 or code == 10 or code == 13 {
+        return true
+    }
+    if code < 32 or code > 126 {
+        return false
+    }
+    return code != 43 and code != 92 and code != 126
+}
+
+fn digit_of(c: str) -> i64 {
+    return DIGITS.index_of(c) ?? -1
+}
+
+/// The UTF-16 code units of a string, surrogate pairs and all.
+fn utf16_units(text: str) -> [i64] {
+    var out: [i64] = []
+    for code in text.codes() {
+        if code < 65536 {
+            out.push(code)
+            continue
+        }
+        let rest = code - 65536
+        out.push(55296 + rest.ushr(10))
+        out.push(56320 + rest.bit_and(1023))
+    }
+    return out
+}
+
+/// A run of code units as unpadded base64 of their big-endian bytes.
+fn encode_run(units: [i64]) -> str {
+    var bits = 0
+    var held = 0
+    var out = ""
+    for unit in units {
+        held = held.shl(16).bit_or(unit)
+        bits = bits + 16
+        while bits >= 6 {
+            out = out + DIGITS.substr(held.ushr(bits - 6).bit_and(63), 1)
+            bits = bits - 6
+        }
+    }
+    if bits > 0 {
+        out = out + DIGITS.substr(held.shl(6 - bits).bit_and(63), 1)
+    }
+    return out
+}
+
+/// Whether closing a run before `code` needs the `-`.
+///
+/// Only when the character that follows could be read as part of the run:
+/// a base64 digit, or the terminator itself. `+AOk!` needs nothing after
+/// the run because `!` cannot continue it; `+AOk-A` does, because `A` can.
+fn needs_terminator(code: i64) -> bool {
+    if code == 45 {
+        return true
+    }
+    return digit_of(code.to_char()) >= 0
+}
+
+/// `text` as UTF-7.
+pub fn encode(text: str) -> str {
+    let codes = text.codes()
+    var out = ""
+    var run: [i64] = []
+    var i = 0
+    while i < codes.len() {
+        let code = codes[i]
+        if code == 43 and run.len() > 0 {
+            // A plus inside a run is just another character to encode.
+            // Only one that interrupts direct text needs the `+-` escape.
+            run.push(code)
+            i = i + 1
+            continue
+        }
+        if is_direct(code) or code == 43 {
+            if run.len() > 0 {
+                out = out + "+" + encode_run(run)
+                // A run at the end of the text always closes; one in the
+                // middle closes only if what follows could continue it.
+                if needs_terminator(code) {
+                    out = out + "-"
+                }
+                run = []
+            }
+            if code == 43 {
+                // The one character that is its own escape.
+                out = out + "+-"
+            } else {
+                out = out + code.to_char()
+            }
+            i = i + 1
+            continue
+        }
+        if code < 65536 {
+            run.push(code)
+        } else {
+            let rest = code - 65536
+            run.push(55296 + rest.ushr(10))
+            run.push(56320 + rest.bit_and(1023))
+        }
+        i = i + 1
+    }
+    if run.len() > 0 {
+        out = out + "+" + encode_run(run) + "-"
+    }
+    return out
+}
+
+/// Code units back to text, pairing surrogates as it goes.
+fn from_units(units: [i64], at: i64) -> str ! Utf7Error {
+    var out = ""
+    var i = 0
+    while i < units.len() {
+        let unit = units[i]
+        if unit >= 55296 and unit <= 56319 {
+            if i + 1 >= units.len() {
+                fail(Utf7Truncated(at))
+            }
+            let low = units[i + 1]
+            if low < 56320 or low > 57343 {
+                fail(Utf7Surrogate(at))
+            }
+            out = out + (65536 + (unit - 55296) * 1024 + low - 56320)
+                .to_char()
+            i = i + 2
+            continue
+        }
+        if unit >= 56320 and unit <= 57343 {
+            // A trailing surrogate with nothing in front of it.
+            fail(Utf7Surrogate(at))
+        }
+        out = out + unit.to_char()
+        i = i + 1
+    }
+    return out
+}
+
+/// `text` read as UTF-7.
+pub fn decode(text: str) -> str ! Utf7Error {
+    var out = ""
+    var i = 0
+    while i < text.len() {
+        let c = text.substr(i, 1)
+        if c != "+" {
+            out = out + c
+            i = i + 1
+            continue
+        }
+        i = i + 1
+        if i < text.len() and text.substr(i, 1) == "-" {
+            out = out + "+"
+            i = i + 1
+            continue
+        }
+        var held = 0
+        var bits = 0
+        var units: [i64] = []
+        let started = i
+        if i < text.len() and digit_of(text.substr(i, 1)) < 0 {
+            // `+` must introduce something: a run, or the `-` that makes it
+            // a literal plus, and the second case is already gone. At the
+            // very end of the input it introduces nothing and that is
+            // allowed.
+            fail(Utf7BadDigit(started, text.substr(i, 1)))
+        }
+        while i < text.len() and digit_of(text.substr(i, 1)) >= 0 {
+            held = held.shl(6).bit_or(digit_of(text.substr(i, 1)))
+            bits = bits + 6
+            if bits >= 16 {
+                units.push(held.ushr(bits - 16).bit_and(65535))
+                bits = bits - 16
+            }
+            i = i + 1
+        }
+        // The bits past the last whole code unit are padding and must be
+        // zero, or two different runs decode to one string.
+        if held.bit_and(power_of_two(bits) - 1) != 0 {
+            fail(Utf7LeftoverBits(started))
+        }
+        out = out + (try from_units(units, started))
+        if i < text.len() and text.substr(i, 1) == "-" {
+            i = i + 1
+        }
+    }
+    return out
+}
+
+fn power_of_two(n: i64) -> i64 {
+    var out = 1
+    var i = 0
+    while i < n {
+        out = out * 2
+        i = i + 1
+    }
+    return out
+}
+
+/// Whether `text` is a valid UTF-7 document.
+pub fn is_valid(text: str) -> bool {
+    match decode(text) {
+        Ok(_result) -> return true
+        Err(_e) -> return false
+    }
+}
+
+/// Whether `text` would pass through unchanged, which is the common case
+/// and worth not doing the work for.
+pub fn needs_encoding(text: str) -> bool {
+    for code in text.codes() {
+        if not is_direct(code) {
+            return true
+        }
+    }
+    return false
+}

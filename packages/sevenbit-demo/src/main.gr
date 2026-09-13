@@ -1,0 +1,124 @@
+// Three ways of putting Unicode through a seven-bit pipe, and the one that
+// does the opposite.
+import utf7
+import utf32
+import iso2022kr
+import hzgb
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn hex_of(raw: bytes) -> str {
+    let digits = "0123456789abcdef"
+    var out = ""
+    var i = 0
+    while i < raw.len() {
+        out = out + digits.substr(raw.at(i) / 16, 1) +
+        digits.substr(raw.at(i) % 16, 1)
+        i = i + 1
+    }
+    return out
+}
+
+fn check_utf7(inout f: i64) / {io} {
+    say(f, "ASCII passes through unchanged",
+        utf7.encode("hello world") == "hello world")
+    say(f, "an accented letter becomes a base64 run",
+        utf7.encode("h\u{e9}llo") == "h+AOk-llo")
+    // The run closes with `-` only when what follows could continue it.
+    say(f, "a run before a letter is closed",
+        utf7.encode("\u{e9}A") == "+AOk-A")
+    say(f, "and one before a space is not",
+        utf7.encode("\u{e9} ") == "+AOk ")
+    say(f, "a plus sign is its own escape", utf7.encode("a+b") == "a+-b")
+    // ...unless a run is already open, in which case it joins it.
+    say(f, "but inside a run it is just another character",
+        utf7.encode("\u{e9}+\u{e9}") == "+AOkAKwDp-")
+    // The base64 is of UTF-16, so anything outside the basic plane is a
+    // surrogate pair first.
+    say(f, "an emoji becomes four base64-encoded bytes",
+        utf7.encode("\u{1f600}") == "+2D3eAA-")
+    say(f, "and comes back whole",
+        (utf7.decode("+2D3eAA-") ?? "") == "\u{1f600}")
+    say(f, "a run with rubbish in it is refused",
+        not utf7.is_valid("+!!!-"))
+    say(f, "text that needs no encoding says so",
+        not utf7.needs_encoding("plain ascii"))
+}
+
+fn check_utf32(inout f: i64) / {io} {
+    say(f, "one character is four bytes",
+        utf32.encode_with("A", false, false).len() == 4)
+    say(f, "little-endian puts the low byte first",
+        hex_of(utf32.encode_with("A", false, false)) == "41000000")
+    say(f, "and big-endian the other way",
+        hex_of(utf32.encode_with("A", true, false)) == "00000041")
+    say(f, "a mark announces the order",
+        utf32.byte_order(utf32.encode("A")) == 0)
+    say(f, "and is not counted as a character",
+        utf32.char_count(utf32.encode("hello")) == 5)
+    say(f, "an emoji needs no pair here",
+        utf32.encode_with("\u{1f600}", false, false).len() == 4)
+    // Two things a reader has to refuse.
+    say(f, "a surrogate is not a character",
+        not utf32.is_valid(bytes_of([0, 216, 0, 0]), false))
+    say(f, "and neither is anything past 0x10FFFF",
+        not utf32.is_valid(bytes_of([0, 0, 17, 0]), false))
+    say(f, "a length that is not a multiple of four is refused",
+        not utf32.is_valid(bytes_of([97, 98, 99]), false))
+}
+
+fn check_iso2022kr(inout f: i64) / {io} {
+    // The designator goes in just before the first Korean, not at the top.
+    say(f, "a stream with no Korean has no designator",
+        hex_of(iso2022kr.encode("hello") ?? "".to_bytes()) ==
+        "68656c6c6f")
+    let mixed = iso2022kr.encode("a\u{d55c}b") ?? "".to_bytes()
+    say(f, "and one with Korean announces itself before the first run",
+        hex_of(mixed) == "611b2429430e47510f62")
+    say(f, "which reads back",
+        (iso2022kr.decode(mixed) ?? "") == "a\u{d55c}b")
+    say(f, "every byte is under 0x80", iso2022kr.is_valid(mixed))
+    say(f, "a high byte is refused",
+        not iso2022kr.is_valid(bytes_of([27, 36, 41, 67, 200])))
+}
+
+fn check_hz(inout f: i64) / {io} {
+    say(f, "ASCII is left alone",
+        hex_of(hzgb.encode("hello") ?? "".to_bytes()) == "68656c6c6f")
+    say(f, "Chinese goes between the tilde-brace markers",
+        (hzgb.encode("a\u{4e2d}b") ?? "".to_bytes()).to_str() ==
+        "a~\{VP~\}b")
+    say(f, "which reads back",
+        (hzgb.decode("a~\{VP~\}b".to_bytes()) ?? "") == "a\u{4e2d}b")
+    // A literal tilde is doubled, and `~` before a newline disappears.
+    say(f, "a tilde is doubled",
+        (hzgb.encode("a~b") ?? "".to_bytes()).to_str() == "a~~b")
+    say(f, "and comes back single",
+        (hzgb.decode("a~~b".to_bytes()) ?? "") == "a~b")
+    say(f, "a tilde before a newline is a continuation and vanishes",
+        (hzgb.decode("a~\nb".to_bytes()) ?? "") == "ab")
+    say(f, "a high byte is refused",
+        not hzgb.is_valid(bytes_of([126, 123, 200, 200])))
+}
+
+fn main() / {io} {
+    var f = 0
+
+    check_utf7(f)
+    check_utf32(f)
+    check_iso2022kr(f)
+    check_hz(f)
+
+    if f == 0 {
+        print("sevenbit: every claim held")
+    } else {
+        print("sevenbit: {f} failed")
+    }
+}

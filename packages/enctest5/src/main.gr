@@ -1,0 +1,64 @@
+import utf7
+import utf32
+import iso2022kr
+import hzgb
+
+fn from_hex(text: str) -> bytes {
+    var out: [i64] = []
+    var i = 1
+    while i + 1 < text.len() {
+        out.push(text.substr(i, 2).parse_int_base(16) ?? 0)
+        i = i + 2
+    }
+    return bytes_of(out)
+}
+
+fn to_hex(raw: bytes) -> str {
+    let digits = "0123456789abcdef"
+    var out = ""
+    var i = 0
+    while i < raw.len() {
+        out = out + digits.substr(raw.at(i) / 16, 1) +
+        digits.substr(raw.at(i) % 16, 1)
+        i = i + 1
+    }
+    return out
+}
+
+fn text_hex(text: str) -> str {
+    return to_hex(text.to_bytes())
+}
+
+fn main() / {io} {
+    var i = 0
+    while i + 1 < args().len() {
+        let what = args()[i]
+        let raw = from_hex(args()[i + 1])
+        if what == "u7enc" {
+            print(text_hex(utf7.encode(raw.to_str())))
+        } else if what == "u7dec" {
+            print(text_hex(utf7.decode(raw.to_str()) ?? "?refused?"))
+        } else if what == "u32le" {
+            print(to_hex(utf32.encode_with(raw.to_str(), false, false)))
+        } else if what == "u32be" {
+            print(to_hex(utf32.encode_with(raw.to_str(), true, false)))
+        } else if what == "u32bom" {
+            print(to_hex(utf32.encode(raw.to_str())))
+        } else if what == "u32dec" {
+            print(text_hex(utf32.decode(raw) ?? "?refused?"))
+        } else if what == "u32decle" {
+            print(text_hex(utf32.decode_with(raw, false) ?? "?refused?"))
+        } else if what == "krenc" {
+            print(to_hex(iso2022kr.encode(raw.to_str()) ??
+                "?refused?".to_bytes()))
+        } else if what == "krdec" {
+            print(text_hex(iso2022kr.decode(raw) ?? "?refused?"))
+        } else if what == "hzenc" {
+            print(to_hex(hzgb.encode(raw.to_str()) ??
+                "?refused?".to_bytes()))
+        } else {
+            print(text_hex(hzgb.decode(raw) ?? "?refused?"))
+        }
+        i = i + 2
+    }
+}

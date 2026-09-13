@@ -1,0 +1,10 @@
+[package]
+name = "iso2022kr"
+version = "1.0.0"
+
+# Bytes to text and back. Opens nothing.
+capabilities = []
+
+[dependencies.euckr]
+path = "../euckr"
+version = "^1.0.0"
