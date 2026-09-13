@@ -1,0 +1,189 @@
+// `.mailmap`: the file that says two commits were by the same person.
+//
+// Over a long project people change employer, change laptop, commit once
+// from a machine whose `user.email` was never set, and appear in `git
+// shortlog` three times. A `.mailmap` fixes that after the fact without
+// rewriting history, which is the only way to fix it that does not break
+// every existing hash.
+//
+// Any tool that counts contributions, attributes a change, or builds a
+// contributor list has to apply it, and a tool that does not produces
+// numbers that are wrong in a way its readers will notice and its author
+// will not.
+//
+// Four line forms, and which parts are compared is the whole of the
+// difficulty:
+//
+//   `Proper Name <proper@email>`
+//       Rewrites the *name* of anyone committing as `proper@email`.
+//
+//   `<proper@email> <commit@email>`
+//       Rewrites the *email* of anyone committing as `commit@email`,
+//       whatever name they used.
+//
+//   `Proper Name <proper@email> <commit@email>`
+//       Both, matched on the email alone.
+//
+//   `Proper Name <proper@email> Commit Name <commit@email>`
+//       Both, matched on the name *and* the email together — which is how
+//       two people who once shared a machine account are told apart.
+//
+// Emails are compared without regard to case; names are compared exactly.
+// A more specific entry — one that names a commit name as well as an email
+// — is tried before a less specific one, or the person who shared the
+// account would be rewritten to whoever comes first in the file.
+//
+// Checked against `git check-mailmap`.
+
+type MailmapEntry = {
+    proper_name: str,
+    proper_email: str,
+    /// Empty when the entry matches on email alone.
+    commit_name: str,
+    commit_email: str,
+}
+
+type Mailmap = {
+    entries: [MailmapEntry],
+}
+
+/// The `Name <email>` pairs on a line, in order.
+fn pairs_of(line: str) -> [(str, str)] {
+    var out: [(str, str)] = []
+    var name = ""
+    var i = 0
+    while i < line.len() {
+        let c = line.substr(i, 1)
+        if c != "<" {
+            name = name + c
+            i = i + 1
+            continue
+        }
+        let close = find_from(line, ">", i)
+        if close < 0 {
+            return out
+        }
+        out.push((name.trim(), line.substr(i + 1, close - i - 1).trim()))
+        name = ""
+        i = close + 1
+    }
+    return out
+}
+
+fn find_from(text: str, needle: str, from: i64) -> i64 {
+    var i = from
+    while i < text.len() {
+        if text.substr(i, 1) == needle {
+            return i
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+/// A whole `.mailmap`.
+pub fn parse(text: str) -> Mailmap {
+    var entries: [MailmapEntry] = []
+    for raw in text.split("\n") {
+        var line = raw
+        let hash = line.index_of("#") ?? -1
+        if hash >= 0 {
+            line = line.substr(0, hash)
+        }
+        line = line.trim()
+        if line.len() == 0 {
+            continue
+        }
+        let pairs = pairs_of(line)
+        if pairs.len() == 0 {
+            continue
+        }
+        if pairs.len() == 1 {
+            entries.push(MailmapEntry{
+                proper_name: pairs[0].0,
+                proper_email: pairs[0].1,
+                commit_name: "",
+                commit_email: pairs[0].1,
+            })
+            continue
+        }
+        entries.push(MailmapEntry{
+            proper_name: pairs[0].0,
+            proper_email: pairs[0].1,
+            commit_name: pairs[1].0,
+            commit_email: pairs[1].1,
+        })
+    }
+    return Mailmap{ entries: entries }
+}
+
+fn same_email(a: str, b: str) -> bool {
+    return a.to_lower() == b.to_lower()
+}
+
+/// The canonical name and email for a commit's name and email.
+///
+/// An entry that names a commit name as well as an email is tried first:
+/// otherwise two people who once shared an account would both be rewritten
+/// to whichever appears earlier in the file.
+pub fn resolve(map: Mailmap, name: str, email: str) -> (str, str) {
+    for entry in map.entries {
+        if entry.commit_name.len() == 0 {
+            continue
+        }
+        if entry.commit_name == name and
+        same_email(entry.commit_email, email) {
+            return (proper_or(entry.proper_name, name), entry.proper_email)
+        }
+    }
+    for entry in map.entries {
+        if entry.commit_name.len() > 0 {
+            continue
+        }
+        if same_email(entry.commit_email, email) {
+            return (proper_or(entry.proper_name, name), entry.proper_email)
+        }
+    }
+    return (name, email)
+}
+
+fn proper_or(proper: str, fallback: str) -> str {
+    if proper.len() == 0 {
+        return fallback
+    }
+    return proper
+}
+
+/// The same, written back as `Name <email>` — the form `git check-mailmap`
+/// takes and prints.
+pub fn resolve_line(map: Mailmap, line: str) -> str {
+    let pairs = pairs_of(line)
+    if pairs.len() == 0 {
+        return line
+    }
+    let found = resolve(map, pairs[0].0, pairs[0].1)
+    if found.0.len() == 0 {
+        return "<" + found.1 + ">"
+    }
+    return found.0 + " <" + found.1 + ">"
+}
+
+/// Every email the map rewrites, which is the list a contributor tool wants
+/// to check its own data against.
+pub fn mapped_emails(map: Mailmap) -> [str] {
+    var out: [str] = []
+    var seen: Map[str, bool] = {}
+    for entry in map.entries {
+        let key = entry.commit_email.to_lower()
+        if not seen.has(key) {
+            seen.set(key, true)
+            out.push(entry.commit_email)
+        }
+    }
+    return out
+}
+
+/// How many entries the map holds.
+pub fn count(map: Mailmap) -> i64 {
+    return map.entries.len()
+}

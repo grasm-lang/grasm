@@ -9,6 +9,23 @@ migration note here; anything `experimental` may change in any release. See
 
 ### Added
 
+- **Three files git keeps beside a repository.** `gitindex` reads
+  `.git/index` — the staging area, which is a complete snapshot of the next
+  commit rather than a list of changes, and where a merge conflict lives as
+  three entries for one path instead of one. All three index versions,
+  including version 4, which reuses part of the previous path and does not
+  pad, so a reader that assumes padding reads rubbish from the second entry
+  onwards. The trailing SHA-1 is verified, because a truncated index is
+  otherwise indistinguishable from a valid one until the names stop making
+  sense. `gitattributes` reads what a repository says about each path,
+  expands macros, and keeps *unset* and *unspecified* apart — the second
+  means "fall back to git's own guess", and collapsing them gives the
+  opposite behaviour on the files where it matters. `mailmap` applies the
+  file that says two commits were by the same person, including the form
+  that tells apart two people who once shared a machine account. 72 cases
+  against `git ls-files --stage`, `git check-attr` and `git check-mailmap`;
+  `gitfilediff` is a gate.
+
 - **Four more encodings, three of them seven-bit.** `utf7` is what non-ASCII
   looked like before 8BITMIME and is the basis of the encoding IMAP uses for
   mailbox names, so a client without it cannot show a folder by the name its

@@ -1,0 +1,128 @@
+// Three files git keeps beside a repository, and what they say.
+import gitindex
+import gitattributes
+import mailmap
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn check_gitindex(inout f: i64) / {io} {
+    // A version 2 index holding one path, written by git.
+    let file = bytes_of([68, 73, 82, 67, 0, 0, 0, 2, 0, 0, 0, 1, 106, 166, 126, 58, 11,
+        10, 47, 229, 106, 166, 126, 58, 11, 10, 47, 229, 1, 0, 0, 19,
+        10, 52, 156, 107, 0, 0, 129, 164, 0, 0, 1, 245, 0, 0, 0, 20,
+        0, 0, 0, 6, 206, 1, 54, 37, 3, 11, 168, 219, 169, 6, 247, 86,
+        150, 127, 158, 156, 163, 148, 70, 74, 0, 5, 97, 46, 116, 120,
+        116, 0, 0, 0, 0, 0, 80, 114, 189, 37, 47, 110, 95, 197, 142,
+        94, 60, 239, 211, 24, 172, 56, 255, 247, 19, 154])
+    match gitindex.decode(file) {
+        Err(_e) -> say(f, "an index parses", false)
+        Ok(index) -> {
+            say(f, "an index parses", true)
+            say(f, "and says which version it is", index.version == 2)
+            say(f, "with one entry", index.entries.len() == 1)
+            say(f, "naming the path", index.entries[0].path == "a.txt")
+            say(f, "at stage 0", index.entries[0].stage == 0)
+            say(f, "and nothing is in conflict",
+                gitindex.conflicted(index).len() == 0)
+            say(f, "the line matches what ls-files prints",
+                gitindex.render_stage(index)[0] ==
+                "100644 ce013625030ba8dba906f756967f9e9ca394464a" +
+                " 0\ta.txt")
+        }
+    }
+    say(f, "something that is not an index is refused",
+        (gitindex.decode("hello there".to_bytes()) ??
+            GitIndex{ version: 0, entries: [], extensions: [] })
+            .version == 0)
+        // git quotes a path with a byte outside printable ASCII.
+    say(f, "a path with an accent is quoted the way git quotes it",
+        gitindex.quote_path("caf\u{e9}.txt") == "\"caf\\303\\251.txt\"")
+    say(f, "and an ordinary one is not",
+        gitindex.quote_path("a.txt") == "a.txt")
+}
+
+fn check_gitattributes(inout f: i64) / {io} {
+    let text = "*.txt text\n*.bin -text\n*.md text=auto\n" +
+    "docs/**/*.txt !text\n[attr]binary -diff -merge -text\n*.png binary\n"
+    let file = gitattributes.parse(text)
+    say(f, "a plain attribute is set",
+        gitattributes.attribute_for(file, "a.txt", false, "text") == "set")
+    say(f, "a minus unsets it",
+        gitattributes.attribute_for(file, "a.bin", false, "text") ==
+        "unset")
+    say(f, "an equals gives it a value",
+        gitattributes.attribute_for(file, "a.md", false, "text") == "auto")
+    // Unspecified is not the same as unset: it means fall back to the
+    // default, which for `text` means guessing from the content.
+    say(f, "and a bang makes it unspecified",
+        gitattributes.attribute_for(file, "docs/deep/a.txt", false,
+            "text") == "unspecified")
+    say(f, "a path nothing matches is unspecified too",
+        gitattributes.attribute_for(file, "other", false, "text") ==
+        "unspecified")
+    // A macro stands for the attributes it was defined as.
+    say(f, "a macro expands to what it was defined as",
+        gitattributes.attribute_for(file, "a.png", false, "diff") ==
+        "unset")
+    say(f, "and the macro name is set as well",
+        gitattributes.attribute_for(file, "a.png", false, "binary") ==
+        "set")
+    say(f, "the macros are listed",
+        gitattributes.macros(file) == ["binary"])
+}
+
+fn check_mailmap(inout f: i64) / {io} {
+    let text = "Proper Name <proper@example.com>\n" +
+    "<new@example.com> <old@example.com>\n" +
+    "Both Fixed <both@example.com> <wrong@example.com>\n" +
+    "Shared One <one@example.com> Machine Account <shared@example.com>\n" +
+    "Shared Two <two@example.com> Other Person <shared@example.com>\n"
+    let map = mailmap.parse(text)
+    say(f, "five entries were read", mailmap.count(map) == 5)
+    say(f, "a name-only entry rewrites the name",
+        mailmap.resolve_line(map, "Anything <proper@example.com>") ==
+        "Proper Name <proper@example.com>")
+    say(f, "an email-only entry rewrites the email",
+        mailmap.resolve_line(map, "Someone <old@example.com>") ==
+        "Someone <new@example.com>")
+    say(f, "and does so whatever the case of the address",
+        mailmap.resolve_line(map, "Someone <OLD@EXAMPLE.COM>") ==
+        "Someone <new@example.com>")
+    say(f, "a both entry rewrites both",
+        mailmap.resolve_line(map, "Someone <wrong@example.com>") ==
+        "Both Fixed <both@example.com>")
+    // Two people who shared a machine account are told apart by name.
+    say(f, "a shared account is split by the commit name",
+        mailmap.resolve_line(map,
+            "Machine Account <shared@example.com>") ==
+        "Shared One <one@example.com>")
+    say(f, "and the other half goes the other way",
+        mailmap.resolve_line(map, "Other Person <shared@example.com>") ==
+        "Shared Two <two@example.com>")
+    say(f, "somebody the map does not name is left alone",
+        mailmap.resolve_line(map, "Nobody <nobody@example.com>") ==
+        "Nobody <nobody@example.com>")
+    say(f, "and the mapped addresses can be listed",
+        mailmap.mapped_emails(map).len() == 4)
+}
+
+fn main() / {io} {
+    var f = 0
+
+    check_gitindex(f)
+    check_gitattributes(f)
+    check_mailmap(f)
+
+    if f == 0 {
+        print("staging: every claim held")
+    } else {
+        print("staging: {f} failed")
+    }
+}

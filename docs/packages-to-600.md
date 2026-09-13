@@ -30,9 +30,9 @@ One rule is added, because the count is now large enough for it to matter:
 | | |
 |---|---|
 | At the close of the 200 plan | 513 |
-| Now | 575 |
+| Now | 579 |
 | Target | 600 |
-| Remaining | 25 |
+| Remaining | 21 |
 
 The count is directories under `packages/` that are not `*-demo`. Test
 harnesses are directories and are counted; they are real programs that the
@@ -98,6 +98,12 @@ gates run, and several of them are the only consumer a format parser has.
   and the tilde-based one invented for Usenet in 1989. The two CJK ones go
   through the tables `euckr` and `gb18030` already carry. 700 cases
   against Python's codecs.
+- [x] **What git keeps beside a repository** — `gitindex` `gitattributes`
+  `mailmap`. The staging area as a file, at all three index versions and
+  mid-conflict; what the repository says about each path, macros and the
+  difference between unset and unspecified; and the file that says two
+  commits were by the same person. 72 cases against `git ls-files
+  --stage`, `git check-attr` and `git check-mailmap`.
 
 ### Next
 

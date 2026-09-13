@@ -1,0 +1,363 @@
+// `.git/index`: the staging area, as a file.
+//
+// The index is the least understood of git's three trees and the one a tool
+// most often needs to read. It is not a list of changed files — it is a
+// complete snapshot of what the next commit would contain, one entry per
+// path, with the blob hash and enough `stat` data to decide whether the
+// working copy has moved underneath it. "Changed files" is what you get by
+// comparing it against the working tree, and "staged files" by comparing it
+// against `HEAD`.
+//
+// It is also where a merge conflict lives. A path in conflict has *three*
+// entries — stage 1 for the common ancestor, 2 for ours, 3 for theirs —
+// where an ordinary path has one at stage 0. A reader that assumes one entry
+// per path silently loses two thirds of a conflict.
+//
+// ## Three versions, and the one that is not like the others
+//
+// Versions 2 and 3 store each path as a NUL-terminated string, padded with
+// more NULs so the next entry starts on an eight-byte boundary. Version 4
+// does neither: it stores how many characters of the previous path to reuse
+// and only the rest, and it does not pad. That makes a v4 index much smaller
+// for a deep tree and makes a reader that assumes padding read rubbish from
+// the second entry onwards.
+//
+// Version 3 adds a second flags field, present only on entries that say so,
+// which is how `skip-worktree` and `intent-to-add` are recorded. An entry
+// without the extended bit has no such field, so the length of an entry
+// depends on its own contents.
+//
+// ## What is checked
+//
+// The trailing SHA-1 over everything before it. git writes it and checks it,
+// and a truncated or corrupted index is otherwise indistinguishable from a
+// valid one until the path names stop making sense.
+//
+// Checked against `git ls-files --stage` on indexes git itself wrote.
+
+import sha1
+
+type GitIndexError =
+    | GitIndexNotIndex(magic: str)
+    | GitIndexVersion(version: i64)
+    | GitIndexTruncated(at: i64)
+    | GitIndexChecksum(want: str, got: str)
+
+    /// One path in the index.
+type GitIndexEntry = {
+    path: str,
+    /// The file mode, as `ls-files` prints it: 100644, 100755, 120000,
+    /// or 160000 for a submodule.
+    mode: i64,
+    /// The blob hash, lower-case hexadecimal.
+    oid: str,
+    /// 0 for an ordinary path; 1, 2 or 3 for the three sides of a conflict.
+    stage: i64,
+    size: i64,
+    mtime: i64,
+    /// The bit that tells git not to look at the file on disk.
+    assume_valid: bool,
+    /// Set when the entry carries the version 3 flags word.
+    extended: bool,
+}
+
+type GitIndex = {
+    version: i64,
+    entries: [GitIndexEntry],
+    /// The extension names present, in order — `TREE`, `REUC` and so on.
+    extensions: [str],
+}
+
+fn read_u32(data: bytes, at: i64) -> i64 {
+    return data.at(at) * 16777216 + data.at(at + 1) * 65536 +
+    data.at(at + 2) * 256 + data.at(at + 3)
+}
+
+fn read_u16(data: bytes, at: i64) -> i64 {
+    return data.at(at) * 256 + data.at(at + 1)
+}
+
+fn hex_at(data: bytes, at: i64, length: i64) -> str {
+    let digits = "0123456789abcdef"
+    var out = ""
+    var i = 0
+    while i < length {
+        out = out + digits.substr(data.at(at + i) / 16, 1) +
+        digits.substr(data.at(at + i) % 16, 1)
+        i = i + 1
+    }
+    return out
+}
+
+fn text_at(data: bytes, at: i64, length: i64) -> str {
+    var out: [i64] = []
+    var i = 0
+    while i < length {
+        out.push(data.at(at + i))
+        i = i + 1
+    }
+    return bytes_of(out).to_str()
+}
+
+/// The variable-width integer version 4 uses for the prefix length.
+///
+/// Not the usual little-endian varint: each continuation adds one before
+/// shifting, so the encoding has no redundant representations.
+fn read_varint(data: bytes, at: i64) -> (i64, i64) {
+    var b = data.at(at)
+    var value = b.bit_and(127)
+    var i = at + 1
+    while b.bit_and(128) != 0 {
+        b = data.at(i)
+        value = (value + 1).shl(7).bit_or(b.bit_and(127))
+        i = i + 1
+    }
+    return (value, i)
+}
+
+type GitEntryRead = {
+    entry: GitIndexEntry,
+    next: i64,
+}
+
+fn read_entry(data: bytes, at: i64, version: i64,
+    previous: str) -> GitEntryRead ! GitIndexError {
+    if at + 62 > data.len() {
+        fail(GitIndexTruncated(at))
+    }
+    let mtime = read_u32(data, at + 8)
+    let mode = read_u32(data, at + 24)
+    let size = read_u32(data, at + 36)
+    let oid = hex_at(data, at + 40, 20)
+    let flags = read_u16(data, at + 60)
+    var cursor = at + 62
+    var extended = false
+    if version >= 3 and flags.bit_and(16384) != 0 {
+        extended = true
+        cursor = cursor + 2
+    }
+    var path = ""
+    if version >= 4 {
+        // The path is the previous one with some of its front reused.
+        let read = read_varint(data, cursor)
+        cursor = read.1
+        var end = cursor
+        while end < data.len() and data.at(end) != 0 {
+            end = end + 1
+        }
+        let keep = previous.len() - read.0
+        if keep < 0 or keep > previous.len() {
+            fail(GitIndexTruncated(cursor))
+        }
+        path = previous.substr(0, keep) + text_at(data, cursor, end - cursor)
+        cursor = end + 1
+    } else {
+        var end = cursor
+        while end < data.len() and data.at(end) != 0 {
+            end = end + 1
+        }
+        path = text_at(data, cursor, end - cursor)
+        cursor = end + 1
+        // Padded with NULs so the next entry starts on an eight-byte
+        // boundary, counted from the start of this one.
+        while (cursor - at) % 8 != 0 {
+            cursor = cursor + 1
+        }
+    }
+    if cursor > data.len() {
+        fail(GitIndexTruncated(cursor))
+    }
+    return GitEntryRead{
+        entry: GitIndexEntry{
+            path: path,
+            mode: mode,
+            oid: oid,
+            stage: flags.ushr(12).bit_and(3),
+            size: size,
+            mtime: mtime,
+            assume_valid: flags.bit_and(32768) != 0,
+            extended: extended,
+        },
+        next: cursor,
+    }
+}
+
+/// An index file.
+pub fn decode(data: bytes) -> GitIndex ! GitIndexError {
+    if data.len() < 12 {
+        fail(GitIndexTruncated(0))
+    }
+    let magic = text_at(data, 0, 4)
+    if magic != "DIRC" {
+        fail(GitIndexNotIndex(magic))
+    }
+    let version = read_u32(data, 4)
+    if version < 2 or version > 4 {
+        fail(GitIndexVersion(version))
+    }
+    let count = read_u32(data, 8)
+    var entries: [GitIndexEntry] = []
+    var at = 12
+    var previous = ""
+    var i = 0
+    while i < count {
+        let read = try read_entry(data, at, version, previous)
+        previous = read.entry.path
+        entries.push(read.entry)
+        at = read.next
+        i = i + 1
+    }
+    var extensions: [str] = []
+    while at + 8 <= data.len() - 20 {
+        extensions.push(text_at(data, at, 4))
+        at = at + 8 + read_u32(data, at + 4)
+    }
+    return GitIndex{
+        version: version,
+        entries: entries,
+        extensions: extensions,
+    }
+}
+
+/// Whether the trailing checksum matches what the rest of the file hashes
+/// to — the only thing that distinguishes a truncated index from a short
+/// one.
+pub fn checksum_holds(data: bytes) -> bool {
+    if data.len() < 20 {
+        return false
+    }
+    var body: [i64] = []
+    var i = 0
+    while i < data.len() - 20 {
+        body.push(data.at(i))
+        i = i + 1
+    }
+    let digits = "0123456789abcdef"
+    var want = ""
+    var k = data.len() - 20
+    while k < data.len() {
+        want = want + digits.substr(data.at(k) / 16, 1) +
+        digits.substr(data.at(k) % 16, 1)
+        k = k + 1
+    }
+    return sha1.hex(bytes_of(body)) == want
+}
+
+/// A path the way `git ls-files` prints it by default.
+///
+/// git wraps a path in double quotes and escapes it whenever it contains a
+/// byte that is not printable ASCII, a quote or a backslash — so a file with
+/// an accent in its name shows as `"caf\303\251"`. That is a display
+/// convention (`core.quotePath`), not what the index holds: the index holds
+/// the raw bytes. Both are here because a tool comparing its own output
+/// against git's needs the convention, and a tool opening the file needs the
+/// bytes.
+pub fn quote_path(path: str) -> str {
+    let raw = path.to_bytes()
+    var needs = false
+    var i = 0
+    while i < raw.len() {
+        let b = raw.at(i)
+        if b < 32 or b > 126 or b == 34 or b == 92 {
+            needs = true
+        }
+        i = i + 1
+    }
+    if not needs {
+        return path
+    }
+    var out = "\""
+    i = 0
+    while i < raw.len() {
+        let b = raw.at(i)
+        if b == 34 or b == 92 {
+            out = out + "\\" + b.to_char()
+        } else if b == 7 {
+            out = out + "\\a"
+        } else if b == 8 {
+            out = out + "\\b"
+        } else if b == 12 {
+            out = out + "\\f"
+        } else if b == 10 {
+            out = out + "\\n"
+        } else if b == 13 {
+            out = out + "\\r"
+        } else if b == 9 {
+            out = out + "\\t"
+        } else if b == 11 {
+            out = out + "\\v"
+        } else if b < 32 or b > 126 {
+            out = out + "\\" + (b / 64).to_str() +
+            ((b / 8) % 8).to_str() + (b % 8).to_str()
+        } else {
+            out = out + b.to_char()
+        }
+        i = i + 1
+    }
+    return out + "\""
+}
+
+/// A mode as the six octal digits `ls-files` prints.
+fn octal_mode(mode: i64) -> str {
+    var out = ""
+    var place = 5
+    while place >= 0 {
+        out = out + ((mode / (8 ^ place)) % 8).to_str()
+        place = place - 1
+    }
+    return out
+}
+
+/// The lines `git ls-files --stage` prints: mode, hash, stage, then a tab
+/// and the path.
+pub fn render_stage(index: GitIndex) -> [str] {
+    var out: [str] = []
+    for entry in index.entries {
+        let mode = octal_mode(entry.mode)
+        out.push(mode + " " + entry.oid + " " + entry.stage.to_str() +
+            "\t" + entry.path)
+    }
+    return out
+}
+
+/// The same lines with paths quoted as `git ls-files` quotes them.
+pub fn render_stage_quoted(index: GitIndex) -> [str] {
+    var out: [str] = []
+    for entry in index.entries {
+        out.push(octal_mode(entry.mode) + " " + entry.oid + " " +
+            entry.stage.to_str() + "\t" + quote_path(entry.path))
+    }
+    return out
+}
+
+/// The paths in conflict: the ones with an entry above stage 0.
+pub fn conflicted(index: GitIndex) -> [str] {
+    var seen: Map[str, bool] = {}
+    var out: [str] = []
+    for entry in index.entries {
+        if entry.stage > 0 and not seen.has(entry.path) {
+            seen.set(entry.path, true)
+            out.push(entry.path)
+        }
+    }
+    return out
+}
+
+/// The entry for a path at stage 0, which is the ordinary case.
+pub fn find(index: GitIndex, path: str) -> Option[GitIndexEntry] {
+    for entry in index.entries {
+        if entry.path == path and entry.stage == 0 {
+            return Some(entry)
+        }
+    }
+    return None
+}
+
+/// How many paths the index names, counting a conflict once.
+pub fn path_count(index: GitIndex) -> i64 {
+    var seen: Map[str, bool] = {}
+    for entry in index.entries {
+        seen.set(entry.path, true)
+    }
+    return seen.len()
+}

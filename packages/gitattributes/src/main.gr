@@ -1,0 +1,244 @@
+// `.gitattributes`: what git has been told about each path.
+//
+// This is the file that decides whether a path is text, what its line
+// endings become on checkout, whether `diff` should try to read it, which
+// filter it passes through, and whether `git archive` includes it. A tool
+// that processes a repository and ignores it treats generated files as
+// source, tries to diff binaries, and writes the wrong line endings on
+// Windows.
+//
+// A line is a pattern — the same patterns `.gitignore` uses, and
+// `packages/gitignore` already matches them — followed by attributes. Each
+// attribute takes one of four states, and the fourth is the one people miss:
+//
+//   `text`        set
+//   `-text`       unset
+//   `text=auto`   set to a value
+//   `!text`       *unspecified*, which is not the same as unset
+//
+// "Unset" means git knows the answer is no. "Unspecified" means the file
+// says nothing and git should fall back to its own default — which for
+// `text` means guessing from the content. A reader that collapses the two
+// gets the opposite behaviour on exactly the files where it matters.
+//
+// Later lines win over earlier ones, which is the reverse of most
+// configuration formats and the same as `.gitignore`.
+//
+// ## Macros
+//
+// A line beginning `[attr]name` defines a macro: `[attr]binary -diff -merge
+// -text` means that writing `binary` on a path sets those three. Macros may
+// only be defined at the top level, and expanding them is not optional —
+// `binary` is a macro and nothing else, so a reader that treats it as an
+// ordinary attribute reports `binary: set` where git reports three
+// attributes with values.
+//
+// Checked against `git check-attr`.
+
+import gitignore
+
+/// What a path's attribute is: `set`, `unset`, `unspecified`, or a value.
+type AttrState = {
+    name: str,
+    /// `set`, `unset`, `unspecified`, or `value`.
+    kind: str,
+    /// Only meaningful when `kind` is `value`.
+    value: str,
+}
+
+type AttrRule = {
+    rule: IgnoreRule,
+    states: [AttrState],
+}
+
+type AttrFile = {
+    rules: [AttrRule],
+    macro_names: [str],
+    macro_states: [[AttrState]],
+}
+
+fn state_of(word: str) -> AttrState {
+    if word.starts_with("!") {
+        return AttrState{
+            name: word.substr(1, word.len() - 1),
+            kind: "unspecified",
+            value: "",
+        }
+    }
+    if word.starts_with("-") {
+        return AttrState{
+            name: word.substr(1, word.len() - 1),
+            kind: "unset",
+            value: "",
+        }
+    }
+    let cut = word.index_of("=") ?? -1
+    if cut >= 0 {
+        return AttrState{
+            name: word.substr(0, cut),
+            kind: "value",
+            value: word.substr(cut + 1, word.len() - cut - 1),
+        }
+    }
+    return AttrState{ name: word, kind: "set", value: "" }
+}
+
+fn words_of(text: str) -> [str] {
+    var out: [str] = []
+    var current = ""
+    var i = 0
+    while i < text.len() {
+        let c = text.substr(i, 1)
+        if c == " " or c == "\t" {
+            if current.len() > 0 {
+                out.push(current)
+                current = ""
+            }
+        } else {
+            current = current + c
+        }
+        i = i + 1
+    }
+    if current.len() > 0 {
+        out.push(current)
+    }
+    return out
+}
+
+/// The pattern at the start of a line, which may be quoted if it has a
+/// space in it.
+fn split_pattern(line: str) -> (str, str) {
+    if line.starts_with("\"") {
+        var i = 1
+        while i < line.len() and line.substr(i, 1) != "\"" {
+            if line.substr(i, 1) == "\\" {
+                i = i + 1
+            }
+            i = i + 1
+        }
+        return (line.substr(1, i - 1),
+            line.substr(i + 1, line.len() - i - 1))
+    }
+    let space = line.index_of(" ") ?? -1
+    let tab = line.index_of("\t") ?? -1
+    var cut = space
+    if tab >= 0 and (cut < 0 or tab < cut) {
+        cut = tab
+    }
+    if cut < 0 {
+        return (line, "")
+    }
+    return (line.substr(0, cut), line.substr(cut, line.len() - cut))
+}
+
+/// A whole `.gitattributes`.
+pub fn parse(text: str) -> AttrFile {
+    var rules: [AttrRule] = []
+    var macro_names: [str] = []
+    var macro_states: [[AttrState]] = []
+    for raw in text.split("\n") {
+        let line = raw.trim()
+        if line.len() == 0 or line.starts_with("#") {
+            continue
+        }
+        if line.starts_with("[attr]") {
+            let body = split_pattern(line.substr(6, line.len() - 6))
+            var states: [AttrState] = []
+            for word in words_of(body.1) {
+                states.push(state_of(word))
+            }
+            macro_names.push(body.0)
+            macro_states.push(states)
+            continue
+        }
+        let split = split_pattern(line)
+        // A pattern with no slash matches at any depth, which is what
+        // `.gitignore` calls unanchored.
+        match gitignore.rule_of(split.0) {
+            Some(rule) -> {
+                var states: [AttrState] = []
+                for word in words_of(split.1) {
+                    states.push(state_of(word))
+                }
+                rules.push(AttrRule{ rule: rule, states: states })
+            }
+            None -> {}
+        }
+    }
+    return AttrFile{
+        rules: rules,
+        macro_names: macro_names,
+        macro_states: macro_states,
+    }
+}
+
+/// A macro expanded into the attributes it stands for, or just itself.
+fn expand(file: AttrFile, state: AttrState) -> [AttrState] {
+    var i = 0
+    while i < file.macro_names.len() {
+        if file.macro_names[i] == state.name {
+            var out: [AttrState] = [state]
+            for inner in file.macro_states[i] {
+                out.push(inner)
+            }
+            return out
+        }
+        i = i + 1
+    }
+    return [state]
+}
+
+/// Every attribute that applies to `path`, later lines overriding earlier.
+pub fn attributes_for(file: AttrFile, path: str,
+    is_dir: bool) -> [AttrState] {
+    var names: [str] = []
+    var found: Map[str, AttrState] = {}
+    for rule in file.rules {
+        if not gitignore.rule_matches(rule.rule, path, is_dir) {
+            continue
+        }
+        for state in rule.states {
+            for expanded in expand(file, state) {
+                if not found.has(expanded.name) {
+                    names.push(expanded.name)
+                }
+                found.set(expanded.name, expanded)
+            }
+        }
+    }
+    var out: [AttrState] = []
+    for name in names {
+        match found.get(name) {
+            Some(state) -> out.push(state)
+            None -> {}
+        }
+    }
+    return out
+}
+
+/// One attribute's state for a path, as `git check-attr` prints it:
+/// `set`, `unset`, `unspecified`, or the value.
+pub fn attribute_for(file: AttrFile, path: str, is_dir: bool,
+    name: str) -> str {
+    for state in attributes_for(file, path, is_dir) {
+        if state.name != name {
+            continue
+        }
+        if state.kind == "value" {
+            return state.value
+        }
+        return state.kind
+    }
+    return "unspecified"
+}
+
+/// Whether a path is marked as text, unmarked, or left to git to guess.
+pub fn text_state(file: AttrFile, path: str) -> str {
+    return attribute_for(file, path, false, "text")
+}
+
+/// The macros a file defines, which are the names that are not ordinary
+/// attributes.
+pub fn macros(file: AttrFile) -> [str] {
+    return file.macro_names
+}

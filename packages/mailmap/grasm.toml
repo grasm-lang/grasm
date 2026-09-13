@@ -1,0 +1,6 @@
+[package]
+name = "mailmap"
+version = "1.0.0"
+
+# Parses text it is handed. Opens nothing.
+capabilities = []

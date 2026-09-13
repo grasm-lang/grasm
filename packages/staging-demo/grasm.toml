@@ -1,0 +1,16 @@
+[package]
+name = "staging_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.gitindex]
+path = "../gitindex"
+version = "^1.0.0"
+
+[dependencies.gitattributes]
+path = "../gitattributes"
+version = "^1.0.0"
+
+[dependencies.mailmap]
+path = "../mailmap"
+version = "^1.0.0"
