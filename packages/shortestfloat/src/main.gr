@@ -284,6 +284,49 @@ pub fn repr(value: f64) -> str {
     return build(found.digits, found.point, found.negative)
 }
 
+/// `value` rounded to exactly `count` significant digits.
+///
+/// The digits and where the point goes, so a caller can lay them out as
+/// fixed or as scientific without rounding twice — which is the thing that
+/// makes a formatter disagree with every other one at the last digit.
+pub fn significant(value: f64, count: i64) -> FloatParts {
+    let bits = value.to_bits()
+    let negative = bits.ushr(63).bit_and(1) == 1
+    let raw_exponent = bits.ushr(SIGNIFICAND_BITS).bit_and(EXPONENT_MASK)
+    let fraction = bits.bit_and(4503599627370495)
+    if raw_exponent == EXPONENT_MASK {
+        return parts(value)
+    }
+    if raw_exponent == 0 and fraction == 0 {
+        var zeros = ""
+        var i = 0
+        while i < count {
+            zeros = zeros + "0"
+            i = i + 1
+        }
+        return FloatParts{
+            negative: negative,
+            digits: if count > 0 { zeros } else { "0" },
+            point: 1,
+            special: "",
+        }
+    }
+    var mantissa = bigint.from_i64(fraction)
+    var exponent = 0 - BIAS + 1
+    if raw_exponent != 0 {
+        mantissa = bigint.from_i64(fraction + 4503599627370496)
+        exponent = raw_exponent - BIAS
+    }
+    let point = decimal_point(mantissa, exponent)
+    let found = digits_at(mantissa, exponent, point, count)
+    return FloatParts{
+        negative: negative,
+        digits: found.0,
+        point: found.1,
+        special: "",
+    }
+}
+
 /// How many significant digits it takes to write `value` back exactly.
 pub fn significant_digits(value: f64) -> i64 {
     let found = parts(value)

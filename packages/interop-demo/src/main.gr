@@ -1,6 +1,7 @@
 // Reading what Python wrote, and formatting the way Python formats.
 import picklefile
 import formatspec
+import shortestfloat
 
 fn say(inout f: i64, name: str, held: bool) / {io} {
     if held {
@@ -96,8 +97,55 @@ fn check_formatspec(inout f: i64) / {io} {
         formatted(65, "c") == "A")
     say(f, "and refuses a number that is not one",
         formatted(0 - 1, "c") == "error")
-    say(f, "a float presentation is refused rather than guessed at",
+    say(f, "a float presentation is refused for an integer",
         formatted(1, ".1f") == "error")
+}
+
+fn formatted_float(value: f64, spec: str) -> str {
+    return formatspec.format_float(value, spec) ?? "error"
+}
+
+fn check_float_specs(inout f: i64) / {io} {
+    // `f` is fixed with six places unless told otherwise.
+    say(f, "f defaults to six places",
+        formatted_float(1.5, "f") == "1.500000")
+    say(f, "and rounds half to even",
+        formatted_float(2.5, ".0f") == "2" and
+        formatted_float(3.5, ".0f") == "4")
+    // `e` always writes at least two exponent digits.
+    say(f, "e writes at least two exponent digits",
+        formatted_float(1.0, ".0e") == "1e+00")
+    say(f, "and a large exponent gets three",
+        formatted_float(1e100, ".0e") == "1e+100")
+    // `g` counts significant digits and chooses the notation on the
+    // exponent *after* rounding.
+    say(f, "g strips the trailing zeros",
+        formatted_float(1.0, "g") == "1")
+    say(f, "and rounding can move the exponent into scientific",
+        formatted_float(99.9, ".2g") == "1e+02")
+    say(f, "while a precision of zero means one digit",
+        formatted_float(99.9, ".1g") == "1e+02")
+    // A precision with no type switches to an exponent one step sooner
+    // and keeps a digit after the point.
+    say(f, "a precision with no type keeps a digit after the point",
+        formatted_float(0.0, ".3") == "0.0")
+    say(f, "and switches to an exponent sooner than g does",
+        formatted_float(0.0, ".1") == "0e+00" and
+        formatted_float(0.0, ".1g") == "0")
+    say(f, "no type and no precision is repr",
+        formatted_float(0.1 + 0.2, "") == "0.30000000000000004")
+    say(f, "the alternate form keeps a bare point",
+        formatted_float(1.0, "#.0f") == "1.")
+    say(f, "a percentage multiplies by a hundred",
+        formatted_float(0.125, ".2%") == "12.50%")
+    say(f, "grouping separates the whole part only",
+        formatted_float(1234.5, ",.2f") == "1,234.50")
+    say(f, "and zero padding under a separator is separated too",
+        formatted_float(0.0, "012,.2f") == "0,000,000.00")
+    say(f, "an infinity pads with zeros and has none to group",
+        formatted_float(1.0 / 0.0, "012,.2f") == "000000000inf")
+    say(f, "and the shortest decimal is the one repr prints",
+        shortestfloat.repr(0.1) == "0.1")
 }
 
 fn main() / {io} {
@@ -105,6 +153,7 @@ fn main() / {io} {
 
     check_pickle(f)
     check_formatspec(f)
+    check_float_specs(f)
 
     if f == 0 {
         print("interop: every claim held")

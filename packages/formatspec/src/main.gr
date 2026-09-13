@@ -24,13 +24,29 @@
 //     `-0000042` and not `000000-42`. Treating the zero as part of the width
 //     gives 8, which is the same number and the wrong padding.
 //
-// Numbers and strings only. Floats are not handled: Python's float
-// formatting is correctly-rounded decimal conversion, which is a separate
-// and much larger piece of work, and claiming it without doing it would be
-// worse than leaving it out. `format_int` and `format_str` say in their
-// names what they take.
+// Floats were left out of this until `packages/shortestfloat` existed,
+// because doing them means correctly-rounded decimal conversion and
+// claiming it without doing it would be worse than leaving it out. They are
+// here now, and the presentation types are where the remaining surprises
+// live:
+//
+//   `f`   fixed, six places unless told otherwise
+//   `e`   scientific, six places, and the exponent always at least two
+//         digits — `1e+05`, never `1e+5`
+//   `g`   whichever of the two is shorter, by a rule about the exponent,
+//         and then with the trailing zeros taken off
+//   `%`   multiplied by a hundred and formatted as `f`, with a `%` after
+//   ``    no type at all, which is `repr` and not `g`
+//
+// `g` is the one worth reading twice. Its precision counts *significant*
+// digits rather than places, a precision of zero means one, and the choice
+// between fixed and scientific is made on the exponent of the value after
+// rounding — so `{:.2g}` of 99.9 is `1e+02`, because rounding to two digits
+// moved the exponent.
 //
 // Checked against Python's `format()`.
+
+import shortestfloat
 
 type SpecError =
     | SpecInvalid(spec: str)
@@ -370,5 +386,313 @@ pub fn is_valid(text: str) -> bool {
     match parse(text) {
         Ok(_spec) -> return true
         Err(_e) -> return false
+    }
+}
+
+/// The digits of `value` laid out as fixed notation with `places` after the
+/// point, without a sign.
+fn fixed_body(value: f64, places: i64) -> str {
+    let text = shortestfloat.fixed(value, places)
+    if text.starts_with("-") {
+        return text.substr(1, text.len() - 1)
+    }
+    return text
+}
+
+/// The exponent part: `e`, a sign, and at least two digits.
+fn exponent_text(power: i64, marker: str) -> str {
+    var value = power
+    var sign = "+"
+    if value < 0 {
+        sign = "-"
+        value = 0 - value
+    }
+    var digits = value.to_str()
+    if digits.len() < 2 {
+        digits = "0" + digits
+    }
+    return marker + sign + digits
+}
+
+/// `value` in scientific notation with `places` digits after the point.
+fn scientific_body(value: f64, places: i64, marker: str) -> str {
+    let found = shortestfloat.significant(value, places + 1)
+    var body = found.digits.substr(0, 1)
+    if places > 0 {
+        body = body + "." + found.digits.substr(1, places)
+    }
+    return body + exponent_text(found.point - 1, marker)
+}
+
+/// The `g` rule: significant digits, and the choice between the two
+/// notations made on the exponent *after* rounding.
+///
+/// `ceiling` is the exponent at which it switches to scientific. It is the
+/// precision for `g` and one less for a specification with a precision and
+/// no type at all, which is why `{:.1}` of zero is `0e+00` and `{:.1g}` is
+/// `0`.
+fn general_body(value: f64, precision: i64, marker: str, alternate: bool,
+    ceiling: i64) -> str {
+    var digits = precision
+    if digits < 1 {
+        digits = 1
+    }
+    let found = shortestfloat.significant(value, digits)
+    let power = found.point - 1
+    if power < 0 - 4 or power >= ceiling {
+        let body = scientific_body(value, digits - 1, marker)
+        if alternate {
+            return body
+        }
+        return strip_zeros_before(body, marker)
+    }
+    let body = fixed_body(value, digits - 1 - power)
+    if alternate {
+        return body
+    }
+    return strip_zeros_before(body, "")
+}
+
+/// Trailing zeros after the point taken off, and the point with them —
+/// which `g` does and `#g` does not.
+fn strip_zeros_before(text: str, marker: str) -> str {
+    var head = text
+    var tail = ""
+    if marker.len() > 0 {
+        let at = head.index_of(marker) ?? -1
+        if at >= 0 {
+            tail = head.substr(at, head.len() - at)
+            head = head.substr(0, at)
+        }
+    }
+    if (head.index_of(".") ?? -1) < 0 {
+        return head + tail
+    }
+    var end = head.len()
+    while end > 0 and head.substr(end - 1, 1) == "0" {
+        end = end - 1
+    }
+    if end > 0 and head.substr(end - 1, 1) == "." {
+        end = end - 1
+    }
+    return head.substr(0, end) + tail
+}
+
+fn is_special(value: f64) -> str {
+    let found = shortestfloat.parts(value)
+    if found.special == "-inf" {
+        return "inf"
+    }
+    return found.special
+}
+
+/// `value` formatted by `text`, which must be a specification for a number.
+pub fn format_float(value: f64, text: str) -> str ! SpecError {
+    var spec = try parse(text)
+    if spec.kind == "s" or spec.kind == "c" or spec.kind == "b" or
+    spec.kind == "o" or spec.kind == "x" or spec.kind == "X" or
+    spec.kind == "d" {
+        fail(SpecNotAllowed("`" + spec.kind + "` is for integers"))
+    }
+    if spec.align == "" {
+        spec.align = if spec.zero { "=" } else { ">" }
+    }
+    var sign = ""
+    if shortestfloat.parts(value).negative {
+        sign = "-"
+    } else if spec.sign == "+" {
+        sign = "+"
+    } else if spec.sign == " " {
+        sign = " "
+    }
+    let special = is_special(value)
+    if special != "" {
+        var word = special
+        if spec.kind == "E" or spec.kind == "F" or spec.kind == "G" {
+            word = word.to_upper()
+        }
+        if spec.kind == "%" {
+            word = word + "%"
+        }
+        return place(word, sign, spec)
+    }
+    var body = ""
+    var magnitude = value
+    if sign == "-" {
+        magnitude = 0.0 - value
+    }
+    if spec.kind == "f" or spec.kind == "F" {
+        body = fixed_body(magnitude, default_precision(spec, 6))
+    } else if spec.kind == "e" {
+        body = scientific_body(magnitude, default_precision(spec, 6), "e")
+    } else if spec.kind == "E" {
+        body = scientific_body(magnitude, default_precision(spec, 6), "E")
+    } else if spec.kind == "%" {
+        body = fixed_body(magnitude * 100.0,
+            default_precision(spec, 6)) + "%"
+    } else if spec.kind == "g" or spec.kind == "n" {
+        let places = default_precision(spec, 6)
+        body = general_body(magnitude, places, "e", spec.alternate,
+            larger(places, 1))
+    } else if spec.kind == "G" {
+        let places = default_precision(spec, 6)
+        body = general_body(magnitude, places, "E", spec.alternate,
+            larger(places, 1))
+    } else if spec.kind == "" {
+        if spec.precision >= 0 {
+            // A precision with no type is `g` that switches to an exponent
+            // one step sooner and keeps at least one digit after the point.
+            body = with_point(general_body(magnitude, spec.precision, "e",
+                spec.alternate, larger(spec.precision, 1) - 1))
+        } else {
+            // No type and no precision is `repr`.
+            body = shortestfloat.repr(magnitude)
+        }
+    } else {
+        fail(SpecUnknownType(spec.kind))
+    }
+    if spec.alternate {
+        // The alternate form keeps the point even with nothing after it.
+        body = with_bare_point(body)
+    }
+    if spec.grouping != "" {
+        body = grouped_before_point(body, spec.grouping)
+    }
+    return place(body, sign, spec)
+}
+
+fn larger(a: i64, b: i64) -> i64 {
+    return if a > b { a } else { b }
+}
+
+/// A body with `.0` after it when it has no point at all, which a
+/// specification with a precision and no type asks for.
+fn with_point(body: str) -> str {
+    if (body.index_of(".") ?? -1) >= 0 or (body.index_of("e") ?? -1) >= 0 {
+        return body
+    }
+    return body + ".0"
+}
+
+/// A body with a bare `.` after its digits when it has none, which `#`
+/// asks for.
+fn with_bare_point(body: str) -> str {
+    let split = split_at_suffix(body)
+    if (split.0.index_of(".") ?? -1) >= 0 {
+        return body
+    }
+    return split.0 + "." + split.1
+}
+
+/// A body split into its digits and whatever follows them — an exponent, a
+/// percent sign, or nothing.
+fn split_at_suffix(body: str) -> (str, str) {
+    var at = body.len()
+    var i = 0
+    while i < body.len() {
+        let c = body.substr(i, 1)
+        if c == "e" or c == "E" or c == "%" {
+            at = i
+            i = body.len()
+        }
+        i = i + 1
+    }
+    return (body.substr(0, at), body.substr(at, body.len() - at))
+}
+
+/// The body, its sign, and the padding — with zero fill under a separator
+/// grouped along with the digits, as it is for an integer.
+fn place(body: str, sign: str, spec: FormatSpec) -> str {
+    if spec.align != "=" {
+        return pad(body, sign, spec)
+    }
+    let target = spec.width - sign.len()
+    // An infinity has no digits to group, so its padding is plain zeros.
+    if spec.fill != "0" or spec.grouping == "" or not has_digit(body) {
+        if body.len() >= target {
+            return sign + body
+        }
+        return sign + repeat(spec.fill, target - body.len()) + body
+    }
+    var whole = ""
+    var rest = body
+    let point = body.index_of(".") ?? -1
+    let suffix = split_at_suffix(body)
+    var digits = suffix.0
+    var tail = suffix.1
+    if point >= 0 {
+        digits = body.substr(0, point)
+        tail = body.substr(point, suffix.0.len() - point) + suffix.1
+    }
+    // The digits arrive already separated; the padding has to be grouped
+    // together with them, so the separators come out and go back in once.
+    whole = without(digits, spec.grouping)
+    rest = tail
+    while grouped(whole, spec.grouping, 3).len() + rest.len() < target {
+        whole = "0" + whole
+    }
+    return sign + grouped(whole, spec.grouping, 3) + rest
+}
+
+fn default_precision(spec: FormatSpec, fallback: i64) -> i64 {
+    if spec.precision < 0 {
+        return fallback
+    }
+    return spec.precision
+}
+
+/// A separator every three digits, in the whole part only.
+fn grouped_before_point(body: str, separator: str) -> str {
+    var end = body.len()
+    var i = 0
+    while i < body.len() {
+        let c = body.substr(i, 1)
+        if c == "." or c == "e" or c == "E" or c == "%" {
+            end = i
+            i = body.len()
+        }
+        i = i + 1
+    }
+    return grouped(body.substr(0, end), separator, 3) +
+    body.substr(end, body.len() - end)
+}
+
+fn has_digit(text: str) -> bool {
+    var i = 0
+    while i < text.len() {
+        if is_digit(text.substr(i, 1)) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn without(text: str, separator: str) -> str {
+    if separator.len() == 0 {
+        return text
+    }
+    var out = ""
+    var i = 0
+    while i < text.len() {
+        let c = text.substr(i, 1)
+        if c != separator {
+            out = out + c
+        }
+        i = i + 1
+    }
+    return out
+}
+
+/// Whether a specification is one a float can be formatted by.
+pub fn is_float_spec(text: str) -> bool {
+    match parse(text) {
+        Err(_e) -> return false
+        Ok(spec) -> {
+            return spec.kind == "" or spec.kind == "f" or
+            spec.kind == "F" or spec.kind == "e" or spec.kind == "E" or
+            spec.kind == "g" or spec.kind == "G" or
+            spec.kind == "n" or spec.kind == "%"
+        }
     }
 }

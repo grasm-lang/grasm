@@ -10,3 +10,7 @@ version = "^1.0.0"
 [dependencies.formatspec]
 path = "../formatspec"
 version = "^1.0.0"
+
+[dependencies.shortestfloat]
+path = "../shortestfloat"
+version = "^1.0.0"

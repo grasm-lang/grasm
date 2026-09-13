@@ -27,6 +27,17 @@ fn main() / {io} {
     var i = 0
     while i + 2 < args().len() {
         let spec = from_hex(args()[i + 2])
+        if args()[i] == "float" {
+            // The value arrives as its raw bit pattern, so nothing is lost
+            // on the way in.
+            let value = (args()[i + 1].parse_int() ?? 0).from_bits()
+            match formatspec.format_float(value, spec) {
+                Ok(text) -> print(to_hex(text))
+                Err(_e) -> print("error")
+            }
+            i = i + 3
+            continue
+        }
         if args()[i] == "int" {
             match formatspec.format_int(args()[i + 1].parse_int() ?? 0,
                 spec) {

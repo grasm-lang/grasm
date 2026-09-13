@@ -7,6 +7,21 @@ migration note here; anything `experimental` may change in any release. See
 
 ## Unreleased — since 1.0.0
 
+### Changed
+
+- **`formatspec` formats floats now.** It refused `f`, `e`, `g`, `%` and the
+  bare precision because doing them means correctly-rounded decimal
+  conversion, and claiming that without doing it would have been worse than
+  leaving it out. `shortestfloat` supplied the conversion, so the caveat is
+  gone and the gate grew from 15,519 cases to 19,567 — every presentation
+  type over a hundred doubles including the infinities and the subnormals.
+  `g` is the one worth reading twice: its precision counts significant
+  digits, a precision of zero means one, and the choice between fixed and
+  scientific is made on the exponent *after* rounding, so `{:.2g}` of 99.9
+  is `1e+02`. A bare precision with no type is `g` that switches to an
+  exponent one step sooner and keeps a digit after the point, which is why
+  `{:.1}` of zero is `0e+00` where `{:.1g}` is `0`.
+
 ### Added
 
 - **Five packages that finish reading a git repository without git.**

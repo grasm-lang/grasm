@@ -4,3 +4,7 @@ version = "1.0.0"
 
 # String building. Opens nothing.
 capabilities = []
+
+[dependencies.shortestfloat]
+path = "../shortestfloat"
+version = "^1.0.0"
