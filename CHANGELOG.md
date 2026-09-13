@@ -9,6 +9,22 @@ migration note here; anything `experimental` may change in any release. See
 
 ### Added
 
+- **Two formats the other end still speaks.** `xmlrpcwire` marshals XML-RPC
+  request and response bodies — supervisord, Odoo, a good deal of WordPress
+  and a long tail of internal services — where the type of every value is
+  written down in the document, so a reader never has to guess whether `1`
+  was a number or a string. It gets the three rules implementations disagree
+  about right: an untyped `<value>` is a string, `<i4>` is `<int>` under the
+  original implementation's name, and a fault travels with HTTP 200, so a
+  client that only reads the status sees success. `difftext` writes unified
+  and context diffs byte-identical to `difflib`'s, which matters exactly
+  when the output is fed to something else: `patch` rejects a diff whose
+  `@@` line is off by one, and both of the ways to get it wrong — a
+  one-line range written `-5,1`, an empty range written `-1,0` — look
+  reasonable. It builds on `closematch`, which gained `matching_blocks`.
+  404 cases against `xmlrpc.client` and `difflib`: `xmlrpcdiff` and
+  `difftextdiff` are gates.
+
 - **Two packages for reading and writing what Python does.** `picklefile`
   reads pickles — protocols 0 to 5, the memo, contexts, every integer
   encoding — and refuses the four opcodes that name and call a Python

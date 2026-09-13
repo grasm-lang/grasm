@@ -30,9 +30,9 @@ One rule is added, because the count is now large enough for it to matter:
 | | |
 |---|---|
 | At the close of the 200 plan | 513 |
-| Now | 561 |
+| Now | 565 |
 | Target | 600 |
-| Remaining | 39 |
+| Remaining | 35 |
 
 The count is directories under `packages/` that are not `*-demo`. Test
 harnesses are directories and are counted; they are real programs that the
@@ -81,6 +81,11 @@ gates run, and several of them are the only consumer a format parser has.
   format's data half, with the four opcodes that call Python refused; and
   the mini-language after the colon in a format field, integers and strings.
   15,868 cases against `pickle` and `format()`.
+- [x] **Formats the other end still speaks** — `xmlrpcwire` `difftext`.
+  XML-RPC request and response bodies, where the type of every value is
+  written down; and unified and context diffs byte-identical to
+  `difflib`'s, because a hunk header that is off by one is a diff `patch`
+  rejects. 404 cases against `xmlrpc.client` and `difflib`.
 
 ### Next
 
@@ -88,8 +93,12 @@ Each line is a batch of about six, chosen so that everything in it has an
 implementation elsewhere to be checked against. A name in brackets is the
 thing it is checked against.
 
-- **Names on the wire** — `idna` (Python `encodings.idna`), `countrycode`
-  (ISO 3166), `xmlc14n` (`ElementTree.canonicalize`)
+- **Names on the wire** — `idna` (Python `encodings.idna`), whose
+  nameprep tables can be generated from Python's own `stringprep`
+- **The shortest float** — `shortestfloat`, the round-tripping decimal
+  Python's `repr` prints. `formatspec` and `picklefile` both had to
+  document a float caveat for want of it, and `json` would use it too.
+  Checkable against `repr(float)` over millions of random doubles.
 
 `terminfo` was on this list and came off it. The plan was to check it
 against `infocmp`, whose `-s i` flag is documented to print capabilities in

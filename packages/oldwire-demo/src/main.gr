@@ -1,0 +1,112 @@
+// A protocol from 1998 and a diff format from 1990, both still the thing
+// the other end expects.
+import xmlrpcwire
+import difftext
+import closematch
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn check_xmlrpc(inout f: i64) / {io} {
+    let call = xmlrpcwire.render_call("add",
+        [ref(RpcInt(1)), ref(RpcInt(2))])
+    say(f, "a call names its method",
+        (call.index_of("<methodName>add</methodName>") ?? -1) > 0)
+    match xmlrpcwire.decode(call) {
+        Err(_e) -> say(f, "and reads back", false)
+        Ok(document) -> {
+            say(f, "and reads back", document.method == "add")
+            say(f, "with both parameters", document.params.len() == 2)
+            say(f, "typed as integers",
+                xmlrpcwire.kind(document.params[0]) == "int")
+        }
+    }
+    // A `<value>` with no type element is a string. Implementations that
+    // default to a number disagree with everybody exactly where it matters.
+    let bare = "<?xml version='1.0'?><methodResponse><params><param>" +
+    "<value>7</value></param></params></methodResponse>"
+    match xmlrpcwire.decode(bare) {
+        Err(_e) -> say(f, "an untyped value is a string, not a number",
+            false)
+        Ok(document) -> say(f, "an untyped value is a string, not a number",
+            xmlrpcwire.kind(document.params[0]) == "string")
+    }
+    // `i4` is `int` under the name the original implementation used.
+    let older = "<?xml version='1.0'?><methodResponse><params><param>" +
+    "<value><i4>7</i4></value></param></params></methodResponse>"
+    match xmlrpcwire.decode(older) {
+        Err(_e) -> say(f, "i4 is int under another name", false)
+        Ok(document) -> say(f, "i4 is int under another name",
+            xmlrpcwire.kind(document.params[0]) == "int")
+    }
+    // A fault travels with HTTP 200, so a client that only reads the status
+    // sees success.
+    let fault = xmlrpcwire.render_fault(0 - 32601, "method not found")
+    match xmlrpcwire.decode(fault) {
+        Err(_e) -> say(f, "a fault says it is one", false)
+        Ok(document) -> {
+            say(f, "a fault says it is one", document.fault)
+            say(f, "and carries its code",
+                xmlrpcwire.fault_code(document) == Some(0 - 32601))
+        }
+    }
+    say(f, "something that is not a document is refused",
+        (xmlrpcwire.decode("not xml") ??
+            RpcDocument{ method: "!", params: [], fault: false }).method ==
+        "!")
+}
+
+fn check_difftext(inout f: i64) / {io} {
+    let before = ["one\n", "two\n", "three\n", "four\n", "five\n"]
+    let after = ["one\n", "two\n", "THREE\n", "four\n", "five\n"]
+    let diff = difftext.unified(before, after, "a", "b", 3, "\n")
+    say(f, "a diff starts with the two file lines",
+        diff[0] == "--- a\n" and diff[1] == "+++ b\n")
+    say(f, "and has one hunk covering the whole file",
+        diff[2] == "@@ -1,5 +1,5 @@\n")
+    say(f, "the changed line goes out and comes back",
+        diff[5] == "-three\n" and diff[6] == "+THREE\n")
+    // A range of one line has no comma.
+    let single = difftext.unified(["a\n"], ["b\n"], "a", "b", 3, "\n")
+    say(f, "a one-line range is written without a comma",
+        single[2] == "@@ -1 +1 @@\n")
+    // An empty range counts back, so an insertion at the top says 0,0.
+    let inserted = difftext.unified([], ["a\n"], "a", "b", 3, "\n")
+    say(f, "an insertion into nothing says -0,0",
+        inserted[2] == "@@ -0,0 +1 @@\n")
+    say(f, "two identical files produce no diff at all",
+        difftext.unified(before, before, "a", "b", 3, "\n").len() == 0)
+    say(f, "and are recognised as identical",
+        difftext.same(before, before))
+    let spans = difftext.opcodes(before, after)
+    say(f, "the opcodes cover both sequences end to end",
+        spans[0].a_from == 0 and
+        spans[spans.len() - 1].a_to == before.len())
+    say(f, "and name the change a replacement",
+        spans[1].tag == "replace")
+    let older = difftext.context(before, after, "a", "b", 3, "\n")
+    say(f, "a context diff marks changed lines with an exclamation",
+        older[6] == "! three\n")
+    // The matcher underneath is the one the suggestion ranking uses.
+    say(f, "the matching blocks end with a zero-length one",
+        closematch.matching_blocks(["a"], ["a"])[1].2 == 0)
+}
+
+fn main() / {io} {
+    var f = 0
+
+    check_xmlrpc(f)
+    check_difftext(f)
+
+    if f == 0 {
+        print("oldwire: every claim held")
+    } else {
+        print("oldwire: {f} failed")
+    }
+}

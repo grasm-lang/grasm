@@ -1,0 +1,8 @@
+[package]
+name = "rpctest"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.xmlrpcwire]
+path = "../xmlrpcwire"
+version = "^1.0.0"

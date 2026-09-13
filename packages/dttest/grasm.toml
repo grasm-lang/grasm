@@ -1,0 +1,8 @@
+[package]
+name = "dttest"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.difftext]
+path = "../difftext"
+version = "^1.0.0"

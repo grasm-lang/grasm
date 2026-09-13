@@ -107,12 +107,17 @@ fn longest_run(a: [str], b: [str], index: Map[str, [i64]], a_lo: i64,
     return CloseMatchRun{ at_a: best_a, at_b: best_b, size: best }
 }
 
-/// How many elements `a` and `b` have in common, counted the way the ratio
-/// counts them: the longest run, then the same question on each side of it.
-pub fn matched(a: [str], b: [str]) -> i64 {
+/// Every run the two sequences share, in order, with adjacent runs merged
+/// and a zero-length run at the end.
+///
+/// The trailing `(len(a), len(b), 0)` is not decoration: it is what lets a
+/// consumer walk the blocks and find the final insertion or deletion
+/// without special-casing the end. `difflib` returns it too, and code
+/// written against one works against the other because of it.
+pub fn matching_blocks(a: [str], b: [str]) -> [(i64, i64, i64)] {
     let index = index_of_b(b)
     var queue: [(i64, i64, i64, i64)] = [(0, a.len(), 0, b.len())]
-    var total = 0
+    var found: [(i64, i64, i64)] = []
     while queue.len() > 0 {
         let job = queue[queue.len() - 1]
         queue.pop()
@@ -120,7 +125,7 @@ pub fn matched(a: [str], b: [str]) -> i64 {
         if run.size == 0 {
             continue
         }
-        total = total + run.size
+        found.push((run.at_a, run.at_b, run.size))
         if job.0 < run.at_a and job.2 < run.at_b {
             queue.push((job.0, run.at_a, job.2, run.at_b))
         }
@@ -129,6 +134,37 @@ pub fn matched(a: [str], b: [str]) -> i64 {
         if after_a < job.1 and after_b < job.3 {
             queue.push((after_a, job.1, after_b, job.3))
         }
+    }
+    found.sort()
+    var merged: [(i64, i64, i64)] = []
+    var at_a = 0
+    var at_b = 0
+    var size = 0
+    for block in found {
+        if at_a + size == block.0 and at_b + size == block.1 {
+            size = size + block.2
+        } else {
+            if size > 0 {
+                merged.push((at_a, at_b, size))
+            }
+            at_a = block.0
+            at_b = block.1
+            size = block.2
+        }
+    }
+    if size > 0 {
+        merged.push((at_a, at_b, size))
+    }
+    merged.push((a.len(), b.len(), 0))
+    return merged
+}
+
+/// How many elements `a` and `b` have in common, counted the way the ratio
+/// counts them: the longest run, then the same question on each side of it.
+pub fn matched(a: [str], b: [str]) -> i64 {
+    var total = 0
+    for block in matching_blocks(a, b) {
+        total = total + block.2
     }
     return total
 }

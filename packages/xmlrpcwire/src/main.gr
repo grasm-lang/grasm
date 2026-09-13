@@ -1,0 +1,359 @@
+// XML-RPC: the request and response bodies, not the transport.
+//
+// XML-RPC is from 1998 and is still what supervisord, Odoo, a great deal of
+// WordPress, several build systems and a long tail of internal services
+// speak. It is the interoperable thing to reach for when the other end is
+// old, and it has one property nothing newer has: the type of every value is
+// written down in the document, so a reader never has to guess whether `1`
+// was a number or a string.
+//
+// This is the marshalling only. Sending it is `packages/http_client`'s job,
+// which is the right division: XML-RPC over HTTP is the usual arrangement
+// and not the only one.
+//
+// ## The parts that are easy to get wrong
+//
+// **`<value>` with no type is a string.** `<value>7</value>` is the text
+// "7", not the number seven. Implementations that default to a number
+// disagree with every other implementation exactly where it matters.
+//
+// **`<int>` and `<i4>` are the same type.** Both appear in real traffic;
+// the specification names `int` and the original implementation emitted
+// `i4`.
+//
+// **A fault is not an error code.** It is a `methodResponse` carrying a
+// struct with `faultCode` and `faultString`, transported with HTTP 200. A
+// client that only looks at the HTTP status sees success.
+//
+// **Whitespace is part of the wire format.** The reference implementation
+// writes one element per line in a fixed layout, and this writes the same
+// bytes, so a document round-trips through both without changing.
+//
+// Checked against Python's `xmlrpc.client`, which is the reference the rest
+// of the world was written against.
+
+import xml
+import bytes_codec
+
+type RpcError =
+    | RpcMalformed(why: str)
+    | RpcUnknownType(name: str)
+    | RpcNotXml(why: str)
+
+    /// A value as XML-RPC types them.
+type RpcValue =
+    | RpcInt(value: i64)
+    | RpcBool(value: bool)
+    | RpcStr(value: str)
+    | RpcDouble(value: f64)
+    | RpcDate(value: str)
+    | RpcBase64(value: bytes)
+    | RpcArray(items: [ref RpcValue])
+    | RpcStruct(names: [str], values: [ref RpcValue])
+    | RpcNil
+
+    /// A parsed document: a call, a reply, or a fault.
+type RpcDocument = {
+    /// The method name, empty for a response.
+    method: str,
+    /// The parameters of a call, or the single value of a reply.
+    params: [ref RpcValue],
+    /// Whether this is a fault, in which case `params` holds the struct.
+    fault: bool,
+}
+
+fn wrapped_base64(raw: bytes) -> str {
+    if raw.len() == 0 {
+        return ""
+    }
+    let encoded = bytes_codec.encode_base64(raw)
+    var out = ""
+    var at = 0
+    while at < encoded.len() {
+        var take = encoded.len() - at
+        if take > 76 {
+            take = 76
+        }
+        out = out + encoded.substr(at, take) + "\n"
+        at = at + take
+    }
+    return out
+}
+
+/// Whitespace inside a base64 body is layout, not data.
+fn without_space(text: str) -> str {
+    var out = ""
+    var i = 0
+    while i < text.len() {
+        let c = text.substr(i, 1)
+        if c != " " and c != "\n" and c != "\r" and c != "\t" {
+            out = out + c
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn escape(text: str) -> str {
+    return text.replace("&", "&amp;").replace("<", "&lt;")
+        .replace(">", "&gt;")
+}
+
+/// One value, in the layout the reference implementation writes.
+pub fn render_value(value: ref RpcValue) -> str {
+    match value {
+        RpcInt(n) -> return "<value><int>" + n.to_str() + "</int></value>\n"
+        RpcBool(b) -> {
+            let digit = if b { "1" } else { "0" }
+            return "<value><boolean>" + digit + "</boolean></value>\n"
+        }
+        RpcStr(text) -> {
+            return "<value><string>" + escape(text) + "</string></value>\n"
+        }
+        RpcDouble(x) -> {
+            return "<value><double>" + x.to_str() + "</double></value>\n"
+        }
+        RpcDate(text) -> {
+            return "<value><dateTime.iso8601>" + text +
+            "</dateTime.iso8601></value>\n"
+        }
+        RpcBase64(raw) -> {
+            // MIME-wrapped at 76 characters with a trailing newline, and
+            // nothing at all for no bytes, which is what
+            // `base64.encodebytes` produces and therefore what is on the
+            // wire.
+            return "<value><base64>\n" + wrapped_base64(raw) +
+            "</base64></value>\n"
+        }
+        // `nil` is the one element with no newline after it, which is a
+        // quirk of the reference implementation and is on the wire.
+        RpcNil -> return "<value><nil/></value>"
+        RpcArray(items) -> {
+            var out = "<value><array><data>\n"
+            for item in items {
+                out = out + render_value(item)
+            }
+            return out + "</data></array></value>\n"
+        }
+        RpcStruct(names, values) -> {
+            var out = "<value><struct>\n"
+            var i = 0
+            while i < names.len() {
+                out = out + "<member>\n<name>" + escape(names[i]) +
+                "</name>\n" + render_value(values[i]) + "</member>\n"
+                i = i + 1
+            }
+            return out + "</struct></value>\n"
+        }
+    }
+}
+
+fn render_params(params: [ref RpcValue]) -> str {
+    var out = "<params>\n"
+    for value in params {
+        out = out + "<param>\n" + render_value(value) + "</param>\n"
+    }
+    return out + "</params>\n"
+}
+
+/// A `methodCall` document.
+pub fn render_call(method: str, params: [ref RpcValue]) -> str {
+    return "<?xml version='1.0'?>\n<methodCall>\n<methodName>" +
+    escape(method) + "</methodName>\n" + render_params(params) +
+    "</methodCall>\n"
+}
+
+/// A `methodResponse` carrying one value, which is all a reply may carry.
+pub fn render_response(value: ref RpcValue) -> str {
+    return "<?xml version='1.0'?>\n<methodResponse>\n" +
+    render_params([value]) + "</methodResponse>\n"
+}
+
+/// A `methodResponse` carrying a fault — which travels with HTTP 200, and
+/// is the reason a client that only reads the status sees success.
+pub fn render_fault(code: i64, why: str) -> str {
+    let body = RpcStruct(["faultCode", "faultString"],
+        [ref(RpcInt(code)), ref(RpcStr(why))])
+    return "<?xml version='1.0'?>\n<methodResponse>\n<fault>\n" +
+    render_value(ref(body)) + "</fault>\n</methodResponse>\n"
+}
+
+fn text_under(node: ref Node) -> str {
+    var out = ""
+    for child in xml.children_of(node) {
+        match child {
+            Text(content) -> out = out + content
+            _ -> {}
+        }
+    }
+    return out
+}
+
+/// The first element child, or nothing when a `<value>` holds bare text.
+fn only_element(node: ref Node) -> Option[ref Node] {
+    for child in xml.children_of(node) {
+        match child {
+            Element(_name, _attrs, _children) -> return Some(child)
+            _ -> {}
+        }
+    }
+    return None
+}
+
+/// One `<value>` element.
+pub fn read_value(node: ref Node) -> ref RpcValue ! RpcError {
+    match only_element(node) {
+        // A `<value>` with no type element is a string, which is the rule
+        // implementations most often get wrong.
+        None -> return ref(RpcStr(text_under(node)))
+        Some(typed) -> {
+            let name = xml.name_of(typed)
+            let body = text_under(typed)
+            if name == "int" or name == "i4" {
+                return ref(RpcInt(body.trim().parse_int() ?? 0))
+            }
+            if name == "boolean" {
+                return ref(RpcBool(body.trim() == "1"))
+            }
+            if name == "string" {
+                return ref(RpcStr(body))
+            }
+            if name == "double" {
+                return ref(RpcDouble(body.trim().parse_float() ?? 0.0))
+            }
+            if name == "dateTime.iso8601" {
+                return ref(RpcDate(body.trim()))
+            }
+            if name == "base64" {
+                match bytes_codec.decode_base64(without_space(body)) {
+                    Some(raw) -> return ref(RpcBase64(raw))
+                    None -> fail(RpcMalformed("base64"))
+                }
+            }
+            if name == "nil" {
+                return ref(RpcNil)
+            }
+            if name == "array" {
+                return try read_array(typed)
+            }
+            if name == "struct" {
+                return try read_struct(typed)
+            }
+            fail(RpcUnknownType(name))
+        }
+    }
+}
+
+fn read_array(typed: ref Node) -> ref RpcValue ! RpcError {
+    var items: [ref RpcValue] = []
+    for data in xml.elements(typed, "data") {
+        for value in xml.elements(data, "value") {
+            items.push(try read_value(value))
+        }
+    }
+    return ref(RpcArray(items))
+}
+
+fn read_struct(typed: ref Node) -> ref RpcValue ! RpcError {
+    var names: [str] = []
+    var values: [ref RpcValue] = []
+    for member in xml.elements(typed, "member") {
+        var name = ""
+        for named in xml.elements(member, "name") {
+            name = text_under(named)
+        }
+        for value in xml.elements(member, "value") {
+            names.push(name)
+            values.push(try read_value(value))
+        }
+    }
+    return ref(RpcStruct(names, values))
+}
+
+fn read_params(node: ref Node) -> [ref RpcValue] ! RpcError {
+    var out: [ref RpcValue] = []
+    for params in xml.elements(node, "params") {
+        for param in xml.elements(params, "param") {
+            for value in xml.elements(param, "value") {
+                out.push(try read_value(value))
+            }
+        }
+    }
+    return out
+}
+
+/// A whole document, call or response.
+pub fn decode(text: str) -> RpcDocument ! RpcError {
+    var root = ref(Text(""))
+    match xml.parse(text) {
+        Ok(node) -> root = node
+        Err(problem) -> fail(RpcNotXml(problem.why))
+    }
+    let name = xml.name_of(root)
+    if name == "methodCall" {
+        var method = ""
+        for named in xml.elements(root, "methodName") {
+            method = text_under(named)
+        }
+        return RpcDocument{
+            method: method,
+            params: try read_params(root),
+            fault: false,
+        }
+    }
+    if name != "methodResponse" {
+        fail(RpcMalformed(name))
+    }
+    for fault in xml.elements(root, "fault") {
+        for value in xml.elements(fault, "value") {
+            return RpcDocument{
+                method: "",
+                params: [try read_value(value)],
+                fault: true,
+            }
+        }
+    }
+    return RpcDocument{
+        method: "",
+        params: try read_params(root),
+        fault: false,
+    }
+}
+
+/// The `faultCode` a fault carries, or nothing when the document is not one.
+pub fn fault_code(document: RpcDocument) -> Option[i64] {
+    if not document.fault or document.params.len() == 0 {
+        return None
+    }
+    match document.params[0] {
+        RpcStruct(names, values) -> {
+            var i = 0
+            while i < names.len() {
+                if names[i] == "faultCode" {
+                    match values[i] {
+                        RpcInt(code) -> return Some(code)
+                        _ -> return None
+                    }
+                }
+                i = i + 1
+            }
+            return None
+        }
+        _ -> return None
+    }
+}
+
+/// What kind of value this is, as the specification names it.
+pub fn kind(value: ref RpcValue) -> str {
+    match value {
+        RpcInt(_n) -> return "int"
+        RpcBool(_b) -> return "boolean"
+        RpcStr(_s) -> return "string"
+        RpcDouble(_x) -> return "double"
+        RpcDate(_d) -> return "dateTime.iso8601"
+        RpcBase64(_b) -> return "base64"
+        RpcArray(_items) -> return "array"
+        RpcStruct(_names, _values) -> return "struct"
+        RpcNil -> return "nil"
+    }
+}

@@ -1,0 +1,293 @@
+// Unified and context diffs, byte-identical to the ones `difflib` writes.
+//
+// `packages/diffview` already produces a readable diff. This produces the
+// *same* diff a Python script would — same hunk headers, same context, same
+// grouping — and that difference matters exactly once, which is when the
+// output has to be fed to something else. `patch` and `git apply` accept a
+// unified diff and reject one whose `@@` line is off by one; a review tool
+// that stores diffs from two producers wants them comparable; a test whose
+// expected output came from a Python script wants the same bytes.
+//
+// The hunk header is where the disagreements happen:
+//
+//   - A range of one line is written `@@ -5 +5 @@`, with no comma. Writing
+//     `-5,1` is legal to a human and a mismatch to a test.
+//   - An *empty* range counts back one: a hunk that inserts at the top of a
+//     file says `-0,0`. Writing `-1,0` puts the insertion after the first
+//     line.
+//
+// Both are in `difflib`'s `_format_range_unified`, both are in the unified
+// diff format, and both are easy to get subtly wrong from the description
+// alone — which is why this is checked against `difflib` line for line
+// rather than against a reading of the specification.
+//
+// Lines keep their own line endings, as `difflib` expects: pass
+// `text.split_keepends()`-style input, or pass lines without endings and
+// set `lineterm` to the empty string. Mixing the two produces a diff that
+// looks right and has no blank line where the file did.
+
+import closematch
+
+type DiffOp = {
+    /// `equal`, `replace`, `delete` or `insert`.
+    tag: str,
+    a_from: i64,
+    a_to: i64,
+    b_from: i64,
+    b_to: i64,
+}
+
+/// How to turn `a` into `b`, as a run of tagged spans covering both.
+pub fn opcodes(a: [str], b: [str]) -> [DiffOp] {
+    var out: [DiffOp] = []
+    var i = 0
+    var j = 0
+    for block in closematch.matching_blocks(a, b) {
+        var tag = ""
+        if i < block.0 and j < block.1 {
+            tag = "replace"
+        } else if i < block.0 {
+            tag = "delete"
+        } else if j < block.1 {
+            tag = "insert"
+        }
+        if tag != "" {
+            out.push(DiffOp{
+                tag: tag,
+                a_from: i,
+                a_to: block.0,
+                b_from: j,
+                b_to: block.1,
+            })
+        }
+        i = block.0 + block.2
+        j = block.1 + block.2
+        if block.2 > 0 {
+            out.push(DiffOp{
+                tag: "equal",
+                a_from: block.0,
+                a_to: i,
+                b_from: block.1,
+                b_to: j,
+            })
+        }
+    }
+    return out
+}
+
+fn smaller(a: i64, b: i64) -> i64 {
+    return if a < b { a } else { b }
+}
+
+fn larger(a: i64, b: i64) -> i64 {
+    return if a > b { a } else { b }
+}
+
+/// The opcodes split into hunks, each carrying `context` unchanged lines on
+/// either side, with runs of unchanged lines longer than twice that split
+/// between hunks.
+pub fn grouped_opcodes(a: [str], b: [str], context: i64) -> [[DiffOp]] {
+    var codes = opcodes(a, b)
+    if codes.len() == 0 {
+        codes = [DiffOp{
+            tag: "equal",
+            a_from: 0,
+            a_to: 1,
+            b_from: 0,
+            b_to: 1,
+        }]
+    }
+    // Trim the unchanged runs at each end down to the context.
+    if codes[0].tag == "equal" {
+        codes[0].a_from = larger(codes[0].a_from, codes[0].a_to - context)
+        codes[0].b_from = larger(codes[0].b_from, codes[0].b_to - context)
+    }
+    let last = codes.len() - 1
+    if codes[last].tag == "equal" {
+        codes[last].a_to = smaller(codes[last].a_to,
+            codes[last].a_from + context)
+        codes[last].b_to = smaller(codes[last].b_to,
+            codes[last].b_from + context)
+    }
+    var groups: [[DiffOp]] = []
+    var group: [DiffOp] = []
+    for code in codes {
+        var span = code
+        if span.tag == "equal" and span.a_to - span.a_from > context * 2 {
+            group.push(DiffOp{
+                tag: "equal",
+                a_from: span.a_from,
+                a_to: smaller(span.a_to, span.a_from + context),
+                b_from: span.b_from,
+                b_to: smaller(span.b_to, span.b_from + context),
+            })
+            groups.push(group)
+            group = []
+            span.a_from = larger(span.a_from, span.a_to - context)
+            span.b_from = larger(span.b_from, span.b_to - context)
+        }
+        group.push(span)
+    }
+    if group.len() > 0 and
+    not (group.len() == 1 and group[0].tag == "equal") {
+        groups.push(group)
+    }
+    return groups
+}
+
+/// A unified-diff range: one line has no comma, and an empty one counts
+/// back, so an insertion at the top of a file says `0,0`.
+fn unified_range(start: i64, stop: i64) -> str {
+    let length = stop - start
+    var beginning = start + 1
+    if length == 1 {
+        return beginning.to_str()
+    }
+    if length == 0 {
+        beginning = beginning - 1
+    }
+    return beginning.to_str() + "," + length.to_str()
+}
+
+/// A context-diff range, which counts differently again: it names the first
+/// and last line rather than a start and a length.
+fn context_range(start: i64, stop: i64) -> str {
+    var beginning = start + 1
+    if stop - start == 0 {
+        beginning = beginning - 1
+    }
+    if stop - start <= 1 {
+        return beginning.to_str()
+    }
+    return beginning.to_str() + "," + stop.to_str()
+}
+
+fn slice(lines: [str], from: i64, to: i64) -> [str] {
+    var out: [str] = []
+    var i = from
+    while i < to {
+        out.push(lines[i])
+        i = i + 1
+    }
+    return out
+}
+
+/// The unified diff of `a` and `b`, as a list of lines.
+///
+/// `line_end` is appended to the header lines only, because every other line
+/// carries whatever ending the input line had.
+pub fn unified(a: [str], b: [str], from_file: str, to_file: str,
+    context: i64, line_end: str) -> [str] {
+    var out: [str] = []
+    var started = false
+    for group in grouped_opcodes(a, b, context) {
+        if not started {
+            started = true
+            out.push("--- " + from_file + line_end)
+            out.push("+++ " + to_file + line_end)
+        }
+        let first = group[0]
+        let last = group[group.len() - 1]
+        out.push("@@ -" + unified_range(first.a_from, last.a_to) + " +" +
+            unified_range(first.b_from, last.b_to) + " @@" + line_end)
+        for code in group {
+            if code.tag == "equal" {
+                for line in slice(a, code.a_from, code.a_to) {
+                    out.push(" " + line)
+                }
+                continue
+            }
+            if code.tag == "replace" or code.tag == "delete" {
+                for line in slice(a, code.a_from, code.a_to) {
+                    out.push("-" + line)
+                }
+            }
+            if code.tag == "replace" or code.tag == "insert" {
+                for line in slice(b, code.b_from, code.b_to) {
+                    out.push("+" + line)
+                }
+            }
+        }
+    }
+    return out
+}
+
+/// The context diff, which is the older format `diff -c` writes and which
+/// some tools still only accept.
+pub fn context(a: [str], b: [str], from_file: str, to_file: str,
+    context_lines: i64, line_end: str) -> [str] {
+    var out: [str] = []
+    var started = false
+    for group in grouped_opcodes(a, b, context_lines) {
+        if not started {
+            started = true
+            out.push("*** " + from_file + line_end)
+            out.push("--- " + to_file + line_end)
+        }
+        let first = group[0]
+        let last = group[group.len() - 1]
+        out.push("***************" + line_end)
+        out.push("*** " + context_range(first.a_from, last.a_to) +
+            " ****" + line_end)
+        if has_change(group, true) {
+            for code in group {
+                if code.tag != "insert" {
+                    for line in slice(a, code.a_from, code.a_to) {
+                        out.push(prefix_for(code.tag, true) + line)
+                    }
+                }
+            }
+        }
+        out.push("--- " + context_range(first.b_from, last.b_to) +
+            " ----" + line_end)
+        if has_change(group, false) {
+            for code in group {
+                if code.tag != "delete" {
+                    for line in slice(b, code.b_from, code.b_to) {
+                        out.push(prefix_for(code.tag, false) + line)
+                    }
+                }
+            }
+        }
+    }
+    return out
+}
+
+fn has_change(group: [DiffOp], left: bool) -> bool {
+    let other = if left { "insert" } else { "delete" }
+    for code in group {
+        if code.tag != "equal" and code.tag != other {
+            return true
+        }
+    }
+    return false
+}
+
+fn prefix_for(tag: str, left: bool) -> str {
+    if tag == "equal" {
+        return "  "
+    }
+    if tag == "replace" {
+        return "! "
+    }
+    if left {
+        return "- "
+    }
+    return "+ "
+}
+
+/// Whether the two sequences are the same, which is the question a caller
+/// asks before deciding whether to produce a diff at all.
+pub fn same(a: [str], b: [str]) -> bool {
+    if a.len() != b.len() {
+        return false
+    }
+    var i = 0
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}

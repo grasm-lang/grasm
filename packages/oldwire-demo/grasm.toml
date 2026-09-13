@@ -1,0 +1,16 @@
+[package]
+name = "oldwire_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.xmlrpcwire]
+path = "../xmlrpcwire"
+version = "^1.0.0"
+
+[dependencies.difftext]
+path = "../difftext"
+version = "^1.0.0"
+
+[dependencies.closematch]
+path = "../closematch"
+version = "^1.0.0"

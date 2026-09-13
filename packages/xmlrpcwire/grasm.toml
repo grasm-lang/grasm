@@ -1,0 +1,14 @@
+[package]
+name = "xmlrpcwire"
+version = "1.0.0"
+
+# Text in, text out. Opens no sockets.
+capabilities = []
+
+[dependencies.xml]
+path = "../xml"
+version = "^1.0.0"
+
+[dependencies.bytes_codec]
+path = "../bytes"
+version = "^1.0.0"
