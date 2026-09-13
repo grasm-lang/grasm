@@ -9,8 +9,10 @@ migration note here; anything `experimental` may change in any release. See
 
 ### Changed
 
-- **Forty-nine clauses promoted from `provisional` to `stable`**, taking the
-  stable set to 163 of 239. Nothing about the language changed; what changed is
+- **Fifty-three clauses promoted from `provisional` to `stable`**, taking the
+  stable set to 167 of 239 — forty-nine on 2026-09-10 and four more on
+  2026-09-13, when their clause texts passed a month unchanged and the same
+  audit cleared them. Nothing about the language changed; what changed is
   what 1.0 promises not to break. Each was checked against the five-part test in
   `docs/stability.md` on its own evidence — a conformance program passing under
   both engines, a program history with no expectation ever reversed, an age past

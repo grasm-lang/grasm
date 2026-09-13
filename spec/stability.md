@@ -13,11 +13,11 @@ so this file cannot drift away from the specification it describes.
 implementation moved in nearly every evaluation round, which is what
 criterion 5 forbids. Saying so was cheaper than defending the listing.
 
-**49 clauses were promoted on 2026-09-10**, each on its own evidence against
-the five-part test in `docs/stability.md`. The audit is reproducible and 30
+**53 clauses promoted, 2026-09-10 and 2026-09-13**, each on its evidence against
+the five-part test in `docs/stability.md`. The audit is reproducible and 26
 clauses did not pass it; the commit that promoted these says why each failed.
 
-Today: 163 stable, 30 provisional, 46 experimental, of 239.
+Today: 167 stable, 26 provisional, 46 experimental, of 239.
 
 ## Stable
 
@@ -37,6 +37,7 @@ Will not change incompatibly before 2.0.
 - `E-EQ-STRUCTURAL` — stable
 - `E-ERR-PROPAGATE` — stable
 - `E-HANDLER-INNERMOST` — stable
+- `E-HANDLER-OPS` — stable
 - `E-HANDLER-SCOPE` — stable
 - `E-IF-DIVERGE` — stable
 - `E-IF-VALUE` — stable
@@ -100,6 +101,7 @@ Will not change incompatibly before 2.0.
 - `L-KEYWORD` — stable
 - `L-LIB-AS-I64` — stable
 - `L-LIB-CMP` — stable
+- `L-LIB-EXIT` — stable
 - `L-LIB-FIXED` — stable
 - `L-LIB-FREE` — stable
 - `L-LIB-IO` — stable
@@ -136,6 +138,8 @@ Will not change incompatibly before 2.0.
 - `T-FALLIBLE` — stable
 - `T-FALLIBLE-COALESCE` — stable
 - `T-FALLIBLE-UNHANDLED` — stable
+- `T-FALLIBLE-UNIT` — stable
+- `T-FALLIBLE-VALUE` — stable
 - `T-FIELD-CALL` — stable
 - `T-FN-VALUE` — stable
 - `T-GENERIC-FN` — stable
@@ -201,21 +205,17 @@ for "no problem found" to mean anything.
 - `E-CLOSURE-CAPTURE` — provisional
 - `E-CONST` — provisional
 - `E-HANDLER-MISSING` — provisional
-- `E-HANDLER-OPS` — provisional
 - `E-HANDLER-OWN-ROW` — provisional
 - `E-RECURSION-DEPTH` — provisional
 - `G-NEST-LIMIT` — provisional
 - `L-LIB-CLOCK` — provisional
 - `L-LIB-CODES` — provisional
-- `L-LIB-EXIT` — provisional
 - `L-LIB-PARSE` — provisional
 - `L-LIB-REMOVE` — provisional
 - `L-LIB-STR` — provisional
 - `L-UFCS` — provisional
 - `T-EFFECT-ROW` — provisional
 - `T-EMPTY-LIT` — provisional
-- `T-FALLIBLE-UNIT` — provisional
-- `T-FALLIBLE-VALUE` — provisional
 - `T-FN-TYPE` — provisional
 - `T-GENERIC-TYPE` — provisional
 - `T-INT-ALIAS` — provisional
