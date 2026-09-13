@@ -1,0 +1,176 @@
+// Readiness and time in one wait.
+//
+// `net_wait` answers "which of these can be read", and every real loop also
+// needs "and wake me in 200 milliseconds" — to retry a connection, to flush a
+// batch, to time a request out. A program that keeps the two apart either
+// polls on a short timeout and burns a core, or waits on the sockets and
+// misses its own deadline. This computes the one number that satisfies both:
+// wait no longer than the soonest timer is due.
+//
+// ## The timeout is a deadline, not a duration
+//
+// A loop that waits "100 ms" each pass drifts: the work between passes is not
+// free, so a 100 ms timer fires every 100-plus-something. Timers here hold the
+// time they are *due*, the wait is the gap between now and the soonest of
+// them, and a repeating timer's next due time is computed from the last one
+// rather than from when it happened to be noticed. The drift stays bounded
+// instead of accumulating.
+//
+// ## Time is a parameter
+//
+// Every function that needs the clock takes it. That is what makes a loop
+// testable: the demo beside this package winds time forward by hand and
+// asserts which timers fired, with no sleeping and no flakiness. The caller
+// passes `monotonic_millis()` in the program that runs for real.
+
+/// One timer. `period` of zero is one-shot.
+type LoopTimer = {
+    id: i64,
+    /// When it should next fire, on the caller's clock.
+    due: i64,
+    period: i64,
+}
+
+/// The handles being watched and the timers waiting.
+type EventLoop = {
+    handles: [i64],
+    timers: [LoopTimer],
+}
+
+/// An empty loop.
+pub fn new() -> EventLoop {
+    return EventLoop{ handles: [], timers: [] }
+}
+
+/// Watch a handle for readability. Watching one twice watches it once.
+pub fn watch(inout machine: EventLoop, handle: i64) {
+    for one in machine.handles {
+        if one == handle {
+            return
+        }
+    }
+    machine.handles.push(handle)
+}
+
+/// Stop watching a handle.
+pub fn unwatch(inout machine: EventLoop, handle: i64) {
+    var kept: [i64] = []
+    for one in machine.handles {
+        if one != handle {
+            kept.push(one)
+        }
+    }
+    machine.handles = kept
+}
+
+/// Fire `id` once, `delay` milliseconds from `now`.
+pub fn after(inout machine: EventLoop, id: i64, now: i64, delay: i64) {
+    cancel(machine, id)
+    machine.timers.push(LoopTimer{ id: id, due: now + delay, period: 0 })
+}
+
+/// Fire `id` every `period` milliseconds, starting one period from `now`.
+pub fn every(inout machine: EventLoop, id: i64, now: i64, period: i64) {
+    cancel(machine, id)
+    var gap = period
+    if gap < 1 {
+        gap = 1
+    }
+    machine.timers.push(LoopTimer{ id: id, due: now + gap, period: gap })
+}
+
+/// Forget a timer. Answers whether there was one.
+pub fn cancel(inout machine: EventLoop, id: i64) -> bool {
+    var kept: [LoopTimer] = []
+    var found = false
+    for one in machine.timers {
+        if one.id == id {
+            found = true
+        } else {
+            kept.push(one)
+        }
+    }
+    machine.timers = kept
+    return found
+}
+
+/// Milliseconds until the soonest timer is due, or -1 when there is none.
+///
+/// Never negative: a timer already due asks for a wait of zero, which is a
+/// poll rather than a block.
+pub fn next_deadline(machine: EventLoop, now: i64) -> i64 {
+    var soonest = 0 - 1
+    for one in machine.timers {
+        var wait = one.due - now
+        if wait < 0 {
+            wait = 0
+        }
+        if soonest < 0 or wait < soonest {
+            soonest = wait
+        }
+    }
+    return soonest
+}
+
+/// The timers whose time has come, and the loop moved on past them.
+///
+/// A repeating timer's next due time is its *old* due time plus its period,
+/// so a loop that was late does not push the schedule later still. One that
+/// was very late — more than a whole period — skips rather than firing in a
+/// burst to catch up, because a burst is never what the caller wanted.
+pub fn fired(inout machine: EventLoop, now: i64) -> [i64] {
+    var out: [i64] = []
+    var kept: [LoopTimer] = []
+    for one in machine.timers {
+        if one.due > now {
+            kept.push(one)
+            continue
+        }
+        out.push(one.id)
+        if one.period > 0 {
+            var next = one.due + one.period
+            while next <= now {
+                next = next + one.period
+            }
+            kept.push(LoopTimer{ id: one.id, due: next, period: one.period })
+        }
+    }
+    machine.timers = kept
+    return out
+}
+
+/// How long a wait should be, given the caller's own ceiling.
+///
+/// `ceiling` is the longest the caller is willing to block — a loop that also
+/// watches something this does not know about still wants to come back.
+pub fn wait_for(machine: EventLoop, now: i64, ceiling: i64) -> i64 {
+    let soonest = next_deadline(machine, now)
+    if soonest < 0 {
+        return ceiling
+    }
+    if soonest < ceiling {
+        return soonest
+    }
+    return ceiling
+}
+
+/// One pass: block until a handle is readable or a timer is due.
+///
+/// Answers the readable handles and the fired timer ids. Both may be empty,
+/// which means the ceiling elapsed with nothing to do.
+pub fn turn(inout machine: EventLoop, now: i64,
+    ceiling: i64) -> ([i64], [i64]) / {net} {
+    let ready = net_wait(machine.handles, wait_for(machine, now, ceiling)) ??
+    []
+    return (ready, fired(machine, now + wait_for(machine, now, ceiling)))
+}
+
+/// How many timers are waiting.
+pub fn timer_count(machine: EventLoop) -> i64 {
+    return machine.timers.len()
+}
+
+/// How many handles are watched.
+pub fn handle_count(machine: EventLoop) -> i64 {
+    return machine.handles.len()
+}

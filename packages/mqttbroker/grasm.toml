@@ -1,0 +1,10 @@
+[package]
+name = "mqttbroker"
+version = "1.0.0"
+
+# Holds sockets open and reads them.
+capabilities = ["net"]
+
+[dependencies.mqtt]
+path = "../mqtt"
+version = "^1.0.0"

@@ -1,0 +1,29 @@
+import respserver
+
+/// Serves RESP until nothing has happened for two passes.
+fn main() / {io, net} {
+    if not args().contains("serve") {
+        print("run with `-- serve` to listen")
+        return
+    }
+    match respserver.listen(0) {
+        Ok(started) -> {
+            var server = started
+            print("port {respserver.port_of(server)}")
+            var ran = 0
+            var idle = 0
+            while idle < 2 {
+                let did = respserver.step(server, 2000)
+                if did == 0 {
+                    idle = idle + 1
+                } else {
+                    idle = 0
+                    ran = ran + did
+                }
+            }
+            print("commands {ran}")
+            respserver.shutdown(server)
+        }
+        Err(why) -> print("listen failed: {why}")
+    }
+}

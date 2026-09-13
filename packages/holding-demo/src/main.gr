@@ -1,0 +1,221 @@
+// Five packages about holding something: work, connections, time, keys and
+// subscriptions.
+//
+// The socket halves are judged by `scripts/resp_diff.sh` and
+// `scripts/mqtt_broker_diff.sh`, which put `redis-py` and `paho-mqtt` in
+// front of them. These are the claims that can be asserted without opening
+// anything, and they are the ones where a wrong answer is silent.
+import taskqueue
+import connpool
+import eventloop
+import respserver
+import mqttbroker
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+// ------------------------------------------------------------- taskqueue
+
+fn check_queue(inout f: i64) / {io} {
+    print("-- taskqueue: what a full queue does is a property of the work")
+    var refusing = taskqueue.new(2, "refuse") ?? no_queue()
+    say(f, "a refusing queue turns the third item away",
+        taskqueue.push(refusing, "a") and taskqueue.push(refusing, "b") and
+        not taskqueue.push(refusing, "c") and taskqueue.len(refusing) == 2)
+    say(f, "and says so in the count, which is the only way anybody knows",
+        refusing.dropped == 1 and refusing.accepted == 2)
+    var oldest = taskqueue.new(2, "oldest") ?? no_queue()
+    taskqueue.push(oldest, "a")
+    taskqueue.push(oldest, "b")
+    say(f, "an oldest-first queue makes room and keeps the newest",
+        taskqueue.push(oldest, "c") and
+        taskqueue.peek_all(oldest) == ["b", "c"])
+    var newest = taskqueue.new(2, "newest") ?? no_queue()
+    taskqueue.push(newest, "a")
+    taskqueue.push(newest, "b")
+    say(f, "a newest-first queue drops what arrived and keeps the queue",
+        not taskqueue.push(newest, "c") and
+        taskqueue.peek_all(newest) == ["a", "b"])
+    say(f, "pressure is the count against the bound, not the count",
+        taskqueue.pressure(refusing) == 100 and
+        taskqueue.should_slow(refusing, 80) and
+        not taskqueue.should_slow(taskqueue.new(10, "refuse") ?? no_queue(),
+            1))
+    var batch = taskqueue.new(10, "refuse") ?? no_queue()
+    for one in ["a", "b", "c"] {
+        taskqueue.push(batch, one)
+    }
+    say(f, "a worker asking for four gets the three that are there",
+        taskqueue.pop_batch(batch, 4) == ["a", "b", "c"] and
+        taskqueue.len(batch) == 0)
+    say(f, "a policy this does not know is refused rather than guessed",
+        taskqueue.new(4, "whatever") ?? no_queue() == no_queue())
+}
+
+fn no_queue() -> TaskQueue {
+    return TaskQueue{ items: [], limit: 0 - 1, policy: "", accepted: 0,
+        dropped: 0, high_water: 0 }
+}
+
+// -------------------------------------------------------------- connpool
+
+fn check_pool(inout f: i64) / {io} {
+    print("-- connpool: the four ways a pool goes wrong")
+    var pool = connpool.new(2) ?? no_pool()
+    say(f, "an empty pool has room and hands out nothing",
+        connpool.has_room(pool) and connpool.take(pool) ?? no_conn() ==
+        no_conn())
+    let first = connpool.opened_new(pool, 11)
+    let second = connpool.opened_new(pool, 12)
+    say(f, "two opened fills the limit, and the pool says so",
+        connpool.size(pool) == 2 and not connpool.has_room(pool) and
+        pool.in_use == 2)
+    connpool.give_back(pool, first, 100)
+    say(f, "giving one back frees a borrow without freeing the connection",
+        pool.in_use == 1 and connpool.size(pool) == 2)
+    match connpool.take(pool) {
+        Some(one) -> {
+            say(f, "taking it back counts as a reuse, not as an open",
+                one.handle == 11 and one.uses == 2 and pool.reused == 1 and
+                pool.opened == 2)
+            connpool.give_back(pool, one, 200)
+        }
+        None -> say(f, "taking it back counts as a reuse", false)
+    }
+    connpool.discard(pool, second)
+    say(f, "a broken connection is discarded rather than returned",
+        pool.discarded == 1 and pool.in_use == 0 and
+        connpool.has_room(pool))
+    say(f, "an idle connection older than the cutoff is handed back to close",
+        connpool.stale_before(pool, 300) == [11] and pool.evicted == 1)
+    say(f, "and a pool with no limit at all is refused",
+        connpool.new(0) ?? no_pool() == no_pool())
+}
+
+fn no_pool() -> ConnPool {
+    return ConnPool{ idle: [], in_use: 0 - 1, limit: 0, opened: 0,
+        reused: 0, discarded: 0, evicted: 0 }
+}
+
+fn no_conn() -> PooledConn {
+    return PooledConn{ handle: 0 - 1, idle_since: 0, uses: 0 }
+}
+
+// ------------------------------------------------------------- eventloop
+
+fn check_loop(inout f: i64) / {io} {
+    print("-- eventloop: a timeout is a deadline, not a duration")
+    var machine = eventloop.new()
+    eventloop.after(machine, 1, 1000, 50)
+    eventloop.after(machine, 2, 1000, 200)
+    say(f, "the wait is however long the soonest timer has left",
+        eventloop.next_deadline(machine, 1000) == 50 and
+        eventloop.next_deadline(machine, 1030) == 20)
+    say(f, "a timer already due asks for a poll, not a negative wait",
+        eventloop.next_deadline(machine, 1100) == 0)
+    say(f, "the caller's ceiling wins when it is shorter",
+        eventloop.wait_for(machine, 1000, 10) == 10 and
+        eventloop.wait_for(machine, 1000, 500) == 50)
+    say(f, "with no timers at all the ceiling is the answer",
+        eventloop.wait_for(eventloop.new(), 1000, 250) == 250)
+    say(f, "only the timers that are due come back",
+        eventloop.fired(machine, 1060) == [1] and
+        eventloop.timer_count(machine) == 1)
+    var repeating = eventloop.new()
+    eventloop.every(repeating, 7, 0, 100)
+    say(f, "a repeat fires once per period and not once per pass",
+        eventloop.fired(repeating, 100) == [7] and
+        eventloop.fired(repeating, 150) == [] and
+        eventloop.fired(repeating, 200) == [7])
+    // Late by three periods: the next due time is ahead of now, so the loop
+    // does not fire three times in a row trying to catch up.
+    say(f, "a loop that was late skips rather than firing in a burst",
+        eventloop.fired(repeating, 560) == [7] and
+        eventloop.fired(repeating, 570) == [])
+    eventloop.watch(machine, 3)
+    eventloop.watch(machine, 3)
+    say(f, "watching a handle twice watches it once",
+        eventloop.handle_count(machine) == 1)
+    eventloop.unwatch(machine, 3)
+    say(f, "and cancelling says whether there was anything to cancel",
+        eventloop.handle_count(machine) == 0 and
+        eventloop.cancel(machine, 2) and not eventloop.cancel(machine, 99))
+}
+
+// ------------------------------------------------------------ respserver
+
+fn fresh_resp() -> RespServer {
+    return RespServer{ listener: 0 - 1, clients: [], data: map(),
+        commands: 0, expiry: map() }
+}
+
+fn check_resp(inout f: i64) / {io, net} {
+    print("-- respserver: five reply types, and one that is not the others")
+    var server = fresh_resp()
+    say(f, "a status is a simple string and data is a bulk string",
+        respserver.run(server, ["PING"]) == "+PONG\r\n" and
+        respserver.run(server, ["ECHO", "hi"]) == "$2\r\nhi\r\n")
+    say(f, "a missing key is the null bulk string, not the empty one",
+        respserver.run(server, ["GET", "nothing"]) == "$-1\r\n" and
+        respserver.nil_reply() != respserver.bulk(""))
+    say(f, "set then get gives the value back",
+        respserver.run(server, ["SET", "k", "v"]) == "+OK\r\n" and
+        respserver.run(server, ["GET", "k"]) == "$3\r\nv\r\n" == false and
+        respserver.run(server, ["GET", "k"]) == "$1\r\nv\r\n")
+    say(f, "a counter starts at nothing and counts",
+        respserver.run(server, ["INCR", "n"]) == ":1\r\n" and
+        respserver.run(server, ["INCRBY", "n", "4"]) == ":5\r\n" and
+        respserver.run(server, ["DECR", "n"]) == ":4\r\n")
+    say(f, "counting a word is an error rather than a zero",
+        respserver.run(server, ["INCR", "k"]).starts_with("-ERR"))
+    say(f, "a bulk length is bytes, not characters",
+        respserver.bulk("café") == "$5\r\ncafé\r\n")
+    say(f, "an unknown command is an error naming itself",
+        respserver.run(server, ["NOPE"]).contains("unknown command 'NOPE'"))
+}
+
+// ------------------------------------------------------------ mqttbroker
+
+fn check_broker(inout f: i64) / {io} {
+    print("-- mqttbroker: a subscription is a filter, not a topic")
+    say(f, "CONNACK is four bytes and says the return code",
+        mqttbroker.connack(0).to_list() == [32, 2, 0, 0])
+    say(f, "SUBACK carries the packet id and what was granted per filter",
+        mqttbroker.suback(258, [0, 0]).to_list() == [144, 4, 1, 2, 0, 0])
+    say(f, "UNSUBACK carries only the packet id",
+        mqttbroker.unsuback(7).to_list() == [176, 2, 0, 7])
+    // A CONNECT payload: protocol name, version, flags, keep-alive, id.
+    var connect: [i64] = [0, 4, 77, 81, 84, 84, 4, 2, 0, 60, 0, 3, 97, 98, 99]
+    say(f, "the client id is read from past the header, not from the front",
+        mqttbroker.client_id_of(bytes_of(connect)) == "abc")
+    // A SUBSCRIBE payload: packet id, then filter and quality pairs.
+    var subscribe: [i64] = [0, 9, 0, 5, 110, 101, 119, 115, 47, 1,
+        0, 1, 35, 0]
+    let asked = mqttbroker.subscriptions_of(bytes_of(subscribe))
+    say(f, "the filters and the quality each asked for are read in order",
+        asked.0 == 9 and asked.1.len() == 2 and asked.1[0].0 == "news/" and
+        asked.1[0].1 == 1 and asked.1[1].0 == "#" and asked.1[1].1 == 0)
+    let dropped = mqttbroker.unsubscriptions_of(bytes_of([0, 9, 0, 1, 35]))
+    say(f, "an unsubscribe names filters and carries no quality",
+        dropped.0 == 9 and dropped.1 == ["#"])
+}
+
+fn main() / {io, net} {
+    var f = 0
+    check_queue(f)
+    check_pool(f)
+    check_loop(f)
+    check_resp(f)
+    check_broker(f)
+    if f == 0 {
+        print("holding: every claim held")
+    } else {
+        print("holding: {f} claims failed")
+    }
+}

@@ -1,0 +1,420 @@
+// The other side of `packages/mqtt`: a broker.
+//
+// A client library can be checked against a broker, and a broker can only be
+// checked against somebody else's client. This is the second half, and what
+// makes it worth having is that `paho-mqtt` will talk to it.
+//
+// ## A subscription is a filter, not a topic
+//
+// `sensor/+/temperature` matches one level, `sensor/#` matches the rest, and
+// `+` matches an empty level, so `sport/+` matches `sport/` but not `sport`.
+// Getting that wrong does not fail loudly: a subscriber simply never receives
+// a message somebody is sure they published. The matching lives in
+// `packages/mqtt` where it is tested against the specification's own table,
+// and this calls it rather than writing a second one.
+//
+// ## The broker may grant less than it was asked
+//
+// A SUBACK says, per filter, what quality of service the broker will
+// actually deliver at, and a client that asked for 1 and was granted 0 is
+// expected to carry on. This grants 0: every delivery is fire-and-forget,
+// which needs no acknowledgement table and no redelivery timer, and it is
+// what the SUBACK says rather than what a caller has to guess.
+//
+// ## What arrives is not what was sent
+//
+// TCP delivers bytes. A read may carry half a packet or three, so every
+// session keeps a buffer and a packet is taken out only once its remaining
+// length says all of it is present — which is what `mqtt.packet_length`
+// answers and why the broker asks before it parses.
+//
+// ## What it is not
+//
+// Sessions do not survive a disconnect, QoS 2 is not spoken, and there is no
+// persistence. It is a broker for testing a client and for standing in for
+// one in a test suite.
+import mqtt
+
+/// One connected client.
+type MqttSession = {
+    handle: i64,
+    client_id: str,
+    /// The filters it asked for, with the quality granted.
+    filters: [(str, i64)],
+    buffer: bytes,
+    connected: bool,
+}
+
+/// The broker.
+type MqttBroker = {
+    listener: i64,
+    sessions: [MqttSession],
+    /// The last message published to each topic with the retain flag.
+    retained: [(str, bytes)],
+    delivered: i64,
+}
+
+/// Start listening. Port `0` asks the system to choose.
+pub fn listen(port: i64) -> MqttBroker ! IoError / {net} {
+    let listener = try tcp_listen(port)
+    return MqttBroker{ listener: listener, sessions: [], retained: [],
+        delivered: 0 }
+}
+
+/// The port the listener got.
+pub fn port_of(broker: MqttBroker) -> i64 / {net} {
+    return net_port(broker.listener) ?? 0
+}
+
+fn session_at(broker: MqttBroker, handle: i64) -> i64 {
+    var i = 0
+    while i < broker.sessions.len() {
+        if broker.sessions[i].handle == handle {
+            return i
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+fn take_bytes(data: bytes, from: i64, count: i64) -> bytes {
+    var out: [i64] = []
+    var i = from
+    while i < from + count and i < data.len() {
+        out.push(data.at(i))
+        i = i + 1
+    }
+    return bytes_of(out)
+}
+
+fn joined(left: bytes, right: bytes) -> bytes {
+    var out: [i64] = []
+    var i = 0
+    while i < left.len() {
+        out.push(left.at(i))
+        i = i + 1
+    }
+    var j = 0
+    while j < right.len() {
+        out.push(right.at(j))
+        j = j + 1
+    }
+    return bytes_of(out)
+}
+
+/// CONNACK: session not present, and the return code.
+pub fn connack(code: i64) -> bytes {
+    return bytes_of([32, 2, 0, code])
+}
+
+/// SUBACK for one packet id, granting a quality per filter.
+pub fn suback(packet_id: i64, granted: [i64]) -> bytes {
+    var body: [i64] = [packet_id.ushr(8), packet_id.bit_and(255)]
+    for one in granted {
+        body.push(one)
+    }
+    var out: [i64] = [144, body.len()]
+    for b in body {
+        out.push(b)
+    }
+    return bytes_of(out)
+}
+
+/// UNSUBACK for one packet id.
+pub fn unsuback(packet_id: i64) -> bytes {
+    return bytes_of([176, 2, packet_id.ushr(8), packet_id.bit_and(255)])
+}
+
+/// The client id a CONNECT carries, or the empty string.
+pub fn client_id_of(payload: bytes) -> str {
+    // Protocol name, version, flags, keep-alive, then the id.
+    match mqtt.read_string(payload, 0) {
+        Ok(name) -> {
+            let at = name.1 + 4
+            match mqtt.read_string(payload, at) {
+                Ok(id) -> return id.0
+                Err(_why) -> return ""
+            }
+        }
+        Err(_why) -> return ""
+    }
+}
+
+/// The filters a SUBSCRIBE asks for, with the quality each asked for.
+pub fn subscriptions_of(payload: bytes) -> (i64, [(str, i64)]) {
+    if payload.len() < 2 {
+        return (0, [])
+    }
+    let packet_id = payload.at(0) * 256 + payload.at(1)
+    var out: [(str, i64)] = []
+    var at = 2
+    var going = true
+    while going and at < payload.len() {
+        match mqtt.read_string(payload, at) {
+            Ok(read) -> {
+                if read.1 >= payload.len() {
+                    going = false
+                } else {
+                    out.push((read.0, payload.at(read.1)))
+                    at = read.1 + 1
+                }
+            }
+            Err(_why) -> going = false
+        }
+    }
+    return (packet_id, out)
+}
+
+/// The filters an UNSUBSCRIBE names.
+pub fn unsubscriptions_of(payload: bytes) -> (i64, [str]) {
+    if payload.len() < 2 {
+        return (0, [])
+    }
+    let packet_id = payload.at(0) * 256 + payload.at(1)
+    var out: [str] = []
+    var at = 2
+    var going = true
+    while going and at < payload.len() {
+        match mqtt.read_string(payload, at) {
+            Ok(read) -> {
+                out.push(read.0)
+                at = read.1
+            }
+            Err(_why) -> going = false
+        }
+    }
+    return (packet_id, out)
+}
+
+/// Send one message to every session whose filters match the topic.
+///
+/// Answers how many were sent. Delivery is at the quality the broker
+/// granted, which is zero, so nothing here waits for an acknowledgement.
+pub fn deliver(inout broker: MqttBroker, topic: str,
+    payload: bytes) -> i64 / {net} {
+    var sent = 0
+    for session in broker.sessions {
+        if not session.connected {
+            continue
+        }
+        var wants = false
+        for one in session.filters {
+            if mqtt.matches(one.0, topic) {
+                wants = true
+            }
+        }
+        if not wants {
+            continue
+        }
+        match mqtt.publish(MqttPublish{ topic: topic, qos: 0, retain: false,
+            duplicate: false, packet_id: 0, payload: payload }) {
+            Ok(frame) -> {
+                tcp_write_bytes(session.handle, frame) ?? ()
+                sent = sent + 1
+            }
+            Err(_why) -> {}
+        }
+    }
+    broker.delivered = broker.delivered + sent
+    return sent
+}
+
+fn remember(inout broker: MqttBroker, topic: str, payload: bytes) {
+    var kept: [(str, bytes)] = []
+    for one in broker.retained {
+        if one.0 != topic {
+            kept.push(one)
+        }
+    }
+    // An empty retained payload clears it, which is the specification's way
+    // of saying "forget what I said".
+    if payload.len() > 0 {
+        kept.push((topic, payload))
+    }
+    broker.retained = kept
+}
+
+/// Send whatever was retained on the topics a new subscription covers.
+fn send_retained(inout broker: MqttBroker, handle: i64,
+    filter: str) -> i64 / {net} {
+    var sent = 0
+    for one in broker.retained {
+        if not mqtt.matches(filter, one.0) {
+            continue
+        }
+        match mqtt.publish(MqttPublish{ topic: one.0, qos: 0, retain: true,
+            duplicate: false, packet_id: 0, payload: one.1 }) {
+            Ok(frame) -> {
+                tcp_write_bytes(handle, frame) ?? ()
+                sent = sent + 1
+            }
+            Err(_why) -> {}
+        }
+    }
+    return sent
+}
+
+/// Act on one packet from one session. Answers how many messages it caused.
+fn handle_packet(inout broker: MqttBroker, handle: i64,
+    packet: MqttPacket) -> i64 / {net} {
+    let at = session_at(broker, handle)
+    if at < 0 {
+        return 0
+    }
+    if packet.kind == 1 {
+        broker.sessions[at].client_id = client_id_of(packet.payload)
+        broker.sessions[at].connected = true
+        tcp_write_bytes(handle, connack(0)) ?? ()
+        return 0
+    }
+    if packet.kind == 3 {
+        match mqtt.parse_publish(mqtt.serialise(packet)) {
+            Ok(message) -> {
+                if message.retain {
+                    remember(broker, message.topic, message.payload)
+                }
+                // QoS 1 owes the publisher an acknowledgement before
+                // anything is fanned out, because the publisher is waiting
+                // on it and a broker that delivers first and acknowledges
+                // later has told nobody anything useful.
+                if message.qos == 1 {
+                    tcp_write_bytes(handle, bytes_of([64, 2,
+                        message.packet_id.ushr(8),
+                        message.packet_id.bit_and(255)])) ?? ()
+                }
+                return deliver(broker, message.topic, message.payload)
+            }
+            Err(_why) -> return 0
+        }
+    }
+    if packet.kind == 8 {
+        let asked = subscriptions_of(packet.payload)
+        var granted: [i64] = []
+        var held = broker.sessions[at].filters
+        for one in asked.1 {
+            held.push((one.0, 0))
+            granted.push(0)
+        }
+        broker.sessions[at].filters = held
+        tcp_write_bytes(handle, suback(asked.0, granted)) ?? ()
+        var sent = 0
+        for one in asked.1 {
+            sent = sent + send_retained(broker, handle, one.0)
+        }
+        return sent
+    }
+    if packet.kind == 10 {
+        let asked = unsubscriptions_of(packet.payload)
+        var kept: [(str, i64)] = []
+        for held in broker.sessions[at].filters {
+            var drop = false
+            for name in asked.1 {
+                if name == held.0 {
+                    drop = true
+                }
+            }
+            if not drop {
+                kept.push(held)
+            }
+        }
+        broker.sessions[at].filters = kept
+        tcp_write_bytes(handle, unsuback(asked.0)) ?? ()
+        return 0
+    }
+    if packet.kind == 12 {
+        tcp_write_bytes(handle, mqtt.empty_packet(13)) ?? ()
+        return 0
+    }
+    if packet.kind == 14 {
+        close_one(broker, handle)
+        return 0
+    }
+    return 0
+}
+
+/// One pass: accept what is waiting, act on what has arrived.
+///
+/// Answers how many messages were delivered to subscribers.
+pub fn step(inout broker: MqttBroker, timeout_ms: i64) -> i64 / {net} {
+    var watching = [broker.listener]
+    for one in broker.sessions {
+        watching.push(one.handle)
+    }
+    let ready = net_wait(watching, timeout_ms) ?? []
+    var delivered = 0
+    for handle in ready {
+        if handle == broker.listener {
+            match tcp_accept(broker.listener) {
+                Ok(conn) -> broker.sessions.push(MqttSession{ handle: conn,
+                    client_id: "", filters: [], buffer: bytes_of([]),
+                    connected: false })
+                Err(_hung_up) -> {}
+            }
+            continue
+        }
+        let at = session_at(broker, handle)
+        if at < 0 {
+            continue
+        }
+        let arrived = tcp_read_bytes(handle) ?? bytes_of([])
+        if arrived.len() == 0 {
+            close_one(broker, handle)
+            continue
+        }
+        broker.sessions[at].buffer =
+        joined(broker.sessions[at].buffer, arrived)
+        var going = true
+        while going {
+            let here = session_at(broker, handle)
+            if here < 0 {
+                going = false
+                continue
+            }
+            let buffer = broker.sessions[here].buffer
+            let size = mqtt.packet_length(buffer, 0)
+            if size < 0 or size > buffer.len() {
+                going = false
+                continue
+            }
+            match mqtt.parse(take_bytes(buffer, 0, size)) {
+                Ok(packet) -> {
+                    broker.sessions[here].buffer =
+                    take_bytes(buffer, size, buffer.len() - size)
+                    delivered = delivered + handle_packet(broker, handle,
+                        packet)
+                }
+                Err(_why) -> {
+                    close_one(broker, handle)
+                    going = false
+                }
+            }
+        }
+    }
+    return delivered
+}
+
+/// Close one session.
+pub fn close_one(inout broker: MqttBroker, handle: i64) / {net} {
+    var kept: [MqttSession] = []
+    for one in broker.sessions {
+        if one.handle != handle {
+            kept.push(one)
+        }
+    }
+    broker.sessions = kept
+    net_close(handle)
+}
+
+/// Close everything.
+pub fn shutdown(inout broker: MqttBroker) / {net} {
+    for one in broker.sessions {
+        net_close(one.handle)
+    }
+    broker.sessions = []
+    net_close(broker.listener)
+}
+
+/// How many sessions are connected.
+pub fn session_count(broker: MqttBroker) -> i64 {
+    return broker.sessions.len()
+}

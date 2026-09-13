@@ -1,0 +1,450 @@
+// The other side of `packages/redis`: a server that speaks RESP.
+//
+// A client package can only be judged against a server, and a server can only
+// be judged against somebody else's client. This is the second half, and what
+// makes it worth having is that `redis-py` will talk to it — a client written
+// by people who have never seen this code and who implemented the protocol
+// from the specification.
+//
+// ## A command is an array of bulk strings and nothing else
+//
+// `SET k v` arrives as `*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n`. Inline
+// commands — the telnet form — are a legacy shape a real client never sends,
+// so this does not accept them: a server that guesses between two framings
+// gets the guess wrong on a key whose bytes look like a newline.
+//
+// ## The reply types are five, and mixing them up breaks the client
+//
+//   `+OK`        a simple string: a status, never data
+//   `-ERR why`   an error, which the client raises rather than returns
+//   `:12`        an integer, which the client gives as a number
+//   `$3\r\nfoo`  a bulk string, the only one that may hold arbitrary bytes
+//   `*2\r\n...`  an array
+//
+// `$-1` is the null bulk string and is what `GET` on a missing key answers.
+// A server that answers `$0\r\n\r\n` there has said "the empty string", and
+// every client will believe it — which is how a cache lookup starts
+// returning empty values instead of misses.
+//
+// ## What it is not
+//
+// It is a key-value server for testing a client and for standing in for one
+// in a test suite: strings, counters, expiry by count of commands rather than
+// by clock, and no persistence. It is not Redis, and the difference is in
+// every direction at once.
+import redis
+
+/// One connected client, and whatever of its next command has arrived.
+type RespConn = {
+    handle: i64,
+    buffer: str,
+}
+
+/// The server: its listener, its clients, and the data.
+type RespServer = {
+    listener: i64,
+    clients: [RespConn],
+    data: Map[str, str],
+    /// How many commands have been answered, which is also the clock
+    /// `EXPIRE` counts against.
+    commands: i64,
+    expiry: Map[str, i64],
+}
+
+/// Start listening. Port `0` asks the system to choose.
+pub fn listen(port: i64) -> RespServer ! IoError / {net} {
+    let listener = try tcp_listen(port)
+    return RespServer{ listener: listener, clients: [], data: map(),
+        commands: 0, expiry: map() }
+}
+
+/// The port the listener got.
+pub fn port_of(server: RespServer) -> i64 / {net} {
+    return net_port(server.listener) ?? 0
+}
+
+/// `+text`, a status rather than data.
+pub fn simple(text: str) -> str {
+    return "+" + text + "\r\n"
+}
+
+/// `-ERR text`, which a client raises.
+pub fn error(text: str) -> str {
+    return "-ERR " + text + "\r\n"
+}
+
+/// `:n`.
+pub fn integer(value: i64) -> str {
+    return ":{value}\r\n"
+}
+
+/// `$len\r\ntext\r\n` — the only reply that may carry arbitrary bytes.
+pub fn bulk(text: str) -> str {
+    return "${text.to_bytes().len()}\r\n" + text + "\r\n"
+}
+
+/// `$-1`, the null bulk string: *no value*, which is not the empty string.
+pub fn nil_reply() -> str {
+    return "$-1\r\n"
+}
+
+/// `*n` followed by the items, already encoded.
+pub fn array(items: [str]) -> str {
+    var out = "*{items.len()}\r\n"
+    for one in items {
+        out = out + one
+    }
+    return out
+}
+
+fn upper(text: str) -> str {
+    return text.to_upper()
+}
+
+/// Whether a key has outlived its `EXPIRE`, counted in commands.
+fn is_expired(server: RespServer, key: str) -> bool {
+    match server.expiry.get(key) {
+        Some(at) -> return server.commands >= at
+        None -> return false
+    }
+}
+
+fn forget(inout server: RespServer, key: str) {
+    server.data.delete(key)
+    server.expiry.delete(key)
+}
+
+/// Run one command and answer with the reply, already encoded.
+///
+/// Separate from the socket so it can be tested without one: every claim the
+/// demo beside this package makes goes through here.
+pub fn run(inout server: RespServer, parts: [str]) -> str {
+    server.commands = server.commands + 1
+    if parts.is_empty() {
+        return error("empty command")
+    }
+    let name = upper(parts[0])
+    if name == "PING" {
+        if parts.len() > 1 {
+            return bulk(parts[1])
+        }
+        return simple("PONG")
+    }
+    if name == "ECHO" {
+        if parts.len() != 2 {
+            return error("wrong number of arguments for 'echo' command")
+        }
+        return bulk(parts[1])
+    }
+    match run_strings(server, name, parts) {
+        Some(reply) -> return reply
+        None -> {}
+    }
+    match run_counters(server, name, parts) {
+        Some(reply) -> return reply
+        None -> {}
+    }
+    match run_keys(server, name, parts) {
+        Some(reply) -> return reply
+        None -> {}
+    }
+    if name == "HELLO" {
+        // A modern client opens with this and *raises* on an error rather
+        // than falling back, so refusing it refuses the connection. The
+        // reply is the RESP2 shape: a flat array read as alternating keys
+        // and values. Protocol 3 is not spoken, and saying `proto 2` is how
+        // a client is told so.
+        if parts.len() > 1 and parts[1] != "2" {
+            return error("NOPROTO unsupported protocol version")
+        }
+        return array([bulk("server"), bulk("grasm-respserver"),
+            bulk("version"), bulk("1.0.0"), bulk("proto"), integer(2),
+            bulk("id"), integer(1), bulk("mode"), bulk("standalone"),
+            bulk("role"), bulk("master"), bulk("modules"), array([])])
+    }
+    if name == "SELECT" or name == "CLIENT" or name == "CONFIG" {
+        return simple("OK")
+    }
+    if name == "COMMAND" {
+        return array([])
+    }
+    if name == "QUIT" {
+        return simple("OK")
+    }
+    return error("unknown command '" + parts[0] + "'")
+}
+
+/// The commands that read and write a string value.
+///
+/// A command table is a long function by nature, and the linter is right
+/// that a hundred-statement one is hard to read. The split is by what the
+/// commands touch rather than by where the line count happened to fall.
+fn run_strings(inout server: RespServer, name: str,
+    parts: [str]) -> Option[str] {
+    if name == "SET" {
+        if parts.len() < 3 {
+            return Some(error("wrong number of arguments for 'set' command"))
+        }
+        server.data.set(parts[1], parts[2])
+        server.expiry.delete(parts[1])
+        return Some(simple("OK"))
+    }
+    if name == "GET" {
+        if parts.len() != 2 {
+            return Some(error("wrong number of arguments for 'get' command"))
+        }
+        if is_expired(server, parts[1]) {
+            forget(server, parts[1])
+        }
+        match server.data.get(parts[1]) {
+            Some(value) -> return Some(bulk(value))
+            None -> return Some(nil_reply())
+        }
+    }
+    if name == "APPEND" {
+        if parts.len() != 3 {
+            return Some(error(
+                "wrong number of arguments for 'append' command"))
+        }
+        var current = server.data.get(parts[1]) ?? ""
+        current = current + parts[2]
+        server.data.set(parts[1], current)
+        return Some(integer(current.to_bytes().len()))
+    }
+    if name == "STRLEN" {
+        let value = server.data.get(parts[1]) ?? ""
+        return Some(integer(value.to_bytes().len()))
+    }
+    return None
+}
+
+/// The commands that count.
+fn run_counters(inout server: RespServer, name: str,
+    parts: [str]) -> Option[str] {
+    if name != "INCR" and name != "DECR" and name != "INCRBY" and
+    name != "DECRBY" {
+        return None
+    }
+    // A client's `decr` is often `DECRBY key 1` on the wire, so the four are
+    // one implementation: refusing `INCRBY` refuses `incr` from half the
+    // clients that exist.
+    let by_amount = name == "INCRBY" or name == "DECRBY"
+    if (by_amount and parts.len() != 3) or
+    (not by_amount and parts.len() != 2) {
+        return Some(error("wrong number of arguments"))
+    }
+    var step = 1
+    if by_amount {
+        match parts[2].parse_int() {
+            Some(n) -> step = n
+            None -> return Some(error(
+                "value is not an integer or out of range"))
+        }
+    }
+    if name == "DECR" or name == "DECRBY" {
+        step = 0 - step
+    }
+    var current = 0
+    match server.data.get(parts[1]) {
+        Some(value) -> {
+            match value.parse_int() {
+                Some(n) -> current = n
+                None -> return Some(error(
+                    "value is not an integer or out of range"))
+            }
+        }
+        None -> current = 0
+    }
+    let next = current + step
+    server.data.set(parts[1], "{next}")
+    return Some(integer(next))
+}
+
+/// The commands about keys rather than values.
+fn run_keys(inout server: RespServer, name: str,
+    parts: [str]) -> Option[str] {
+    if name == "DEL" {
+        var gone = 0
+        var i = 1
+        while i < parts.len() {
+            if server.data.has(parts[i]) {
+                forget(server, parts[i])
+                gone = gone + 1
+            }
+            i = i + 1
+        }
+        return Some(integer(gone))
+    }
+    if name == "EXISTS" {
+        var found = 0
+        var i = 1
+        while i < parts.len() {
+            if is_expired(server, parts[i]) {
+                forget(server, parts[i])
+            }
+            if server.data.has(parts[i]) {
+                found = found + 1
+            }
+            i = i + 1
+        }
+        return Some(integer(found))
+    }
+    if name == "EXPIRE" {
+        if parts.len() != 3 {
+            return Some(error(
+                "wrong number of arguments for 'expire' command"))
+        }
+        if not server.data.has(parts[1]) {
+            return Some(integer(0))
+        }
+        let after = parts[2].parse_int() ?? 0
+        server.expiry.set(parts[1], server.commands + after)
+        return Some(integer(1))
+    }
+    if name == "TTL" {
+        match server.expiry.get(parts[1]) {
+            Some(at) -> return Some(integer(at - server.commands))
+            None -> {
+                if server.data.has(parts[1]) {
+                    return Some(integer(0 - 1))
+                }
+                return Some(integer(0 - 2))
+            }
+        }
+    }
+    if name == "TYPE" {
+        if server.data.has(parts[1]) {
+            return Some(simple("string"))
+        }
+        return Some(simple("none"))
+    }
+    if name == "KEYS" {
+        var out: [str] = []
+        for key in server.data.keys() {
+            if not is_expired(server, key) {
+                out.push(bulk(key))
+            }
+        }
+        return Some(array(out))
+    }
+    if name == "DBSIZE" {
+        return Some(integer(server.data.len()))
+    }
+    if name == "FLUSHALL" or name == "FLUSHDB" {
+        server.data = map()
+        server.expiry = map()
+        return Some(simple("OK"))
+    }
+    return None
+}
+
+/// Read the commands a buffer holds, leaving any part-arrived one behind.
+fn take_commands(inout conn: RespConn) -> [[str]] {
+    var out: [[str]] = []
+    var going = true
+    while going {
+        if not redis.is_complete(conn.buffer) {
+            going = false
+            continue
+        }
+        match redis.parse(conn.buffer) {
+            Ok(read) -> {
+                var parts: [str] = []
+                for item in redis.items_of(read.0) {
+                    match redis.text_of(item) {
+                        Some(text) -> parts.push(text)
+                        None -> {}
+                    }
+                }
+                if parts.is_empty() {
+                    // Not an array of bulk strings: the inline form, or
+                    // something this does not speak.
+                    going = false
+                    continue
+                }
+                out.push(parts)
+                conn.buffer = conn.buffer.substr(read.1,
+                    conn.buffer.len() - read.1)
+            }
+            Err(_why) -> going = false
+        }
+    }
+    return out
+}
+
+fn client_at(server: RespServer, handle: i64) -> i64 {
+    var i = 0
+    while i < server.clients.len() {
+        if server.clients[i].handle == handle {
+            return i
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+/// One pass: accept what is waiting, answer what has arrived.
+///
+/// Answers how many commands were run, so a caller can stop after a number of
+/// them rather than only on a timeout.
+pub fn step(inout server: RespServer, timeout_ms: i64) -> i64 / {net} {
+    var watching = [server.listener]
+    for one in server.clients {
+        watching.push(one.handle)
+    }
+    let ready = net_wait(watching, timeout_ms) ?? []
+    var ran = 0
+    for handle in ready {
+        if handle == server.listener {
+            match tcp_accept(server.listener) {
+                Ok(conn) -> server.clients.push(RespConn{ handle: conn,
+                    buffer: "" })
+                Err(_hung_up) -> {}
+            }
+            continue
+        }
+        let at = client_at(server, handle)
+        if at < 0 {
+            continue
+        }
+        let arrived = tcp_read(handle) ?? ""
+        if arrived.len() == 0 {
+            close_one(server, handle)
+            continue
+        }
+        server.clients[at].buffer = server.clients[at].buffer + arrived
+        var conn = server.clients[at]
+        let commands = take_commands(conn)
+        server.clients[at] = conn
+        for parts in commands {
+            let reply = run(server, parts)
+            tcp_write(handle, reply) ?? ()
+            ran = ran + 1
+            if upper(parts[0]) == "QUIT" {
+                close_one(server, handle)
+            }
+        }
+    }
+    return ran
+}
+
+/// Close one client.
+pub fn close_one(inout server: RespServer, handle: i64) / {net} {
+    var kept: [RespConn] = []
+    for one in server.clients {
+        if one.handle != handle {
+            kept.push(one)
+        }
+    }
+    server.clients = kept
+    net_close(handle)
+}
+
+/// Close everything.
+pub fn shutdown(inout server: RespServer) / {net} {
+    for one in server.clients {
+        net_close(one.handle)
+    }
+    server.clients = []
+    net_close(server.listener)
+}

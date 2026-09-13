@@ -78,6 +78,7 @@ run_gate mimeworddiff   scripts/mimeword_diff.sh
 run_gate addressdiff    scripts/address_diff.sh
 run_gate mboxdiff       scripts/mbox_diff.sh
 run_gate wsserverdiff  scripts/wsserver_diff.sh
+run_gate respdiff      scripts/resp_diff.sh
 run_gate kvcrash       scripts/kvstore_crash.sh
 run_gate zlibdiff      scripts/zlib_diff.sh
 run_gate casefolddiff  scripts/casefold_diff.sh

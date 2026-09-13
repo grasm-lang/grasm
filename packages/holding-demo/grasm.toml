@@ -1,0 +1,24 @@
+[package]
+name = "holding_demo"
+version = "1.0.0"
+capabilities = ["io", "net"]
+
+[dependencies.taskqueue]
+path = "../taskqueue"
+version = "^1.0.0"
+
+[dependencies.connpool]
+path = "../connpool"
+version = "^1.0.0"
+
+[dependencies.eventloop]
+path = "../eventloop"
+version = "^1.0.0"
+
+[dependencies.respserver]
+path = "../respserver"
+version = "^1.0.0"
+
+[dependencies.mqttbroker]
+path = "../mqttbroker"
+version = "^1.0.0"

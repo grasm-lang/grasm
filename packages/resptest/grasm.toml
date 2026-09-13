@@ -1,0 +1,8 @@
+[package]
+name = "resptest"
+version = "0.1.0"
+capabilities = ["io", "net"]
+
+[dependencies.respserver]
+path = "../respserver"
+version = "^1.0.0"

@@ -1,0 +1,168 @@
+// A pool of connections, and the four ways one goes wrong.
+//
+// Opening a connection costs a round trip and, over TLS, several. A pool is
+// how a program stops paying that per request. What it has to get right is
+// not the reuse — that part is a list — but the four cases underneath:
+//
+//   - **A connection can go stale while idle.** The peer closed it, a
+//     middlebox timed it out, or a load balancer moved. A pool that hands
+//     one back gets an error the caller cannot tell from a real failure, so
+//     every idle connection has an age and `stale_before` takes them out.
+//   - **A borrowed connection can be lost.** If a caller never gives it back
+//     the pool leaks capacity until it deadlocks, so the count of borrowed
+//     ones is part of the type and `in_use` is readable.
+//   - **The limit is the point.** A pool that opens a connection whenever
+//     one is wanted is not a pool, and the database it is pointed at will
+//     say so. `take` answers `None` when the limit is reached, and the
+//     caller decides whether to wait or fail.
+//   - **A broken connection must not go back.** `discard` exists beside
+//     `give_back` because the caller is the only one who knows the answer
+//     never arrived, and a pool that assumes otherwise poisons itself.
+//
+// This owns no sockets. It is handed handles — integers here, whatever the
+// caller's dialer returns — and it says which one to use. Dialing and closing
+// stay with the caller, because a pool that dials cannot be tested without a
+// server and a pool that closes has opinions about shutdown.
+
+type ConnPoolError =
+    | BadLimit(limit: i64)
+
+    /// One connection the pool is holding.
+type PooledConn = {
+    handle: i64,
+    /// When it last went back to the pool, on the caller's clock.
+    idle_since: i64,
+    /// How many times it has been handed out.
+    uses: i64,
+}
+
+/// The pool.
+type ConnPool = {
+    idle: [PooledConn],
+    /// How many are out with callers.
+    in_use: i64,
+    /// The most that may exist at once, idle and borrowed together.
+    limit: i64,
+    /// Totals worth watching.
+    opened: i64,
+    reused: i64,
+    discarded: i64,
+    evicted: i64,
+}
+
+/// A pool that will hold at most `limit` connections.
+pub fn new(limit: i64) -> ConnPool ! ConnPoolError {
+    if limit <= 0 {
+        fail(BadLimit(limit))
+    }
+    return ConnPool{ idle: [], in_use: 0, limit: limit, opened: 0,
+        reused: 0, discarded: 0, evicted: 0 }
+}
+
+/// How many exist at all: idle plus borrowed.
+pub fn size(pool: ConnPool) -> i64 {
+    return pool.idle.len() + pool.in_use
+}
+
+/// Whether another connection may be opened right now.
+pub fn has_room(pool: ConnPool) -> bool {
+    return size(pool) < pool.limit
+}
+
+/// Take an idle connection, if there is one.
+///
+/// Answers `None` both when the pool is empty and when it is at its limit,
+/// and `has_room` is what tells those apart: empty with room means dial,
+/// empty without means wait.
+pub fn take(inout pool: ConnPool) -> Option[PooledConn] {
+    if pool.idle.is_empty() {
+        return None
+    }
+    // Newest first: the least likely to have gone stale while nobody looked.
+    let at = pool.idle.len() - 1
+    var one = pool.idle[at]
+    var kept: [PooledConn] = []
+    var i = 0
+    while i < at {
+        kept.push(pool.idle[i])
+        i = i + 1
+    }
+    pool.idle = kept
+    pool.in_use = pool.in_use + 1
+    pool.reused = pool.reused + 1
+    one.uses = one.uses + 1
+    return Some(one)
+}
+
+/// Record that the caller dialled a new connection.
+///
+/// The pool does not dial; it counts. Calling this when `has_room` is false
+/// is the caller going over its own limit, and the pool records it rather
+/// than refusing, because the connection exists either way and a count that
+/// lies is worse than a count that is uncomfortable.
+pub fn opened_new(inout pool: ConnPool, handle: i64) -> PooledConn {
+    pool.in_use = pool.in_use + 1
+    pool.opened = pool.opened + 1
+    return PooledConn{ handle: handle, idle_since: 0, uses: 1 }
+}
+
+/// Give one back, ready to be used again.
+pub fn give_back(inout pool: ConnPool, conn: PooledConn, now: i64) {
+    if pool.in_use > 0 {
+        pool.in_use = pool.in_use - 1
+    }
+    var one = conn
+    one.idle_since = now
+    pool.idle.push(one)
+}
+
+/// Throw one away: the caller knows it is broken.
+pub fn discard(inout pool: ConnPool, _conn: PooledConn) {
+    if pool.in_use > 0 {
+        pool.in_use = pool.in_use - 1
+    }
+    pool.discarded = pool.discarded + 1
+}
+
+/// Take out every idle connection that went idle before `cutoff`.
+///
+/// Answers the handles, because closing them is the caller's job — the pool
+/// does not own sockets and a pool that closed them would be guessing about
+/// shutdown order.
+pub fn stale_before(inout pool: ConnPool, cutoff: i64) -> [i64] {
+    var kept: [PooledConn] = []
+    var gone: [i64] = []
+    for one in pool.idle {
+        if one.idle_since < cutoff {
+            gone.push(one.handle)
+        } else {
+            kept.push(one)
+        }
+    }
+    pool.idle = kept
+    pool.evicted = pool.evicted + gone.len()
+    return gone
+}
+
+/// Take everything out, for shutdown.
+pub fn drain(inout pool: ConnPool) -> [i64] {
+    var gone: [i64] = []
+    for one in pool.idle {
+        gone.push(one.handle)
+    }
+    pool.idle = []
+    return gone
+}
+
+/// How busy it is, from 0 to 100, counting borrowed against the limit.
+pub fn saturation(pool: ConnPool) -> i64 {
+    return pool.in_use * 100 / pool.limit
+}
+
+/// The numbers somebody will want on a dashboard.
+pub fn stats(pool: ConnPool) -> [(str, i64)] {
+    return [("idle", pool.idle.len()), ("in_use", pool.in_use),
+        ("limit", pool.limit), ("opened", pool.opened),
+        ("reused", pool.reused), ("discarded", pool.discarded),
+        ("evicted", pool.evicted)]
+}

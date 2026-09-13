@@ -1,0 +1,8 @@
+[package]
+name = "mqbtest"
+version = "0.1.0"
+capabilities = ["io", "net"]
+
+[dependencies.mqttbroker]
+path = "../mqttbroker"
+version = "^1.0.0"

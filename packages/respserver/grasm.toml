@@ -1,0 +1,10 @@
+[package]
+name = "respserver"
+version = "1.0.0"
+
+# Holds sockets open and reads them.
+capabilities = ["net"]
+
+[dependencies.redis]
+path = "../redis"
+version = "^1.0.0"

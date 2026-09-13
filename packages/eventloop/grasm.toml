@@ -1,0 +1,6 @@
+[package]
+name = "eventloop"
+version = "1.0.0"
+
+# Waits on handles the caller opened.
+capabilities = ["net"]

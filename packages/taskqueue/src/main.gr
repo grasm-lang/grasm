@@ -1,0 +1,167 @@
+// A bounded queue, and what it does when it is full.
+//
+// An unbounded queue is not a queue, it is a memory leak with a
+// first-in-first-out interface: a producer that outruns its consumer fills
+// memory until the process dies, and the failure arrives an hour after the
+// cause. The bound is what makes the overload visible at the moment it
+// happens, which is the only moment anything can be done about it.
+//
+// ## The three answers to "the queue is full"
+//
+//   `refuse`  the push fails and the producer is told. Correct when the
+//             producer can slow down, retry, or return an error upwards —
+//             which is what a request handler should do.
+//   `oldest`  the front is dropped to make room. Correct for a feed of
+//             samples where the newest matters and history does not:
+//             metrics, positions, prices.
+//   `newest`  the push is dropped. Correct when what is already queued is
+//             work somebody is waiting on and the new item is not.
+//
+// Which one is right is a property of the *work*, not of the queue, so it is
+// a parameter and there is no default. A queue that silently picks one has
+// picked wrong for half its callers.
+//
+// ## What it counts
+//
+// Every queue that matters is watched, so the counts are part of the type
+// rather than something a caller wraps around it: how many were taken in,
+// how many were dropped, and the high-water mark. A queue that never reports
+// a drop is a queue nobody knows is dropping.
+
+type TaskQueueError =
+    | BadPolicy(name: str)
+
+    /// A bounded queue of strings, with the numbers somebody will ask for.
+type TaskQueue = {
+    items: [str],
+    /// The most it will hold. Zero means it holds nothing at all.
+    limit: i64,
+    /// `refuse`, `oldest` or `newest`.
+    policy: str,
+    /// How many pushes were accepted.
+    accepted: i64,
+    /// How many items were dropped, whichever end they went from.
+    dropped: i64,
+    /// The most it ever held at once.
+    high_water: i64,
+}
+
+/// A queue that holds `limit` items and answers a full push with `policy`.
+pub fn new(limit: i64, policy: str) -> TaskQueue ! TaskQueueError {
+    if policy != "refuse" and policy != "oldest" and policy != "newest" {
+        fail(BadPolicy(policy))
+    }
+    var bound = limit
+    if bound < 0 {
+        bound = 0
+    }
+    return TaskQueue{ items: [], limit: bound, policy: policy, accepted: 0,
+        dropped: 0, high_water: 0 }
+}
+
+/// How many are waiting.
+pub fn len(queue: TaskQueue) -> i64 {
+    return queue.items.len()
+}
+
+/// Whether another push would have to drop or refuse.
+pub fn is_full(queue: TaskQueue) -> bool {
+    return queue.items.len() >= queue.limit
+}
+
+/// Add one. Answers whether it was accepted.
+///
+/// `false` means the item is not in the queue — under `refuse` because it was
+/// turned away, under `newest` because it was dropped on arrival. Under
+/// `oldest` a push always succeeds and something else may have gone, which is
+/// why `dropped` is worth reading rather than only the answer.
+pub fn push(inout queue: TaskQueue, item: str) -> bool {
+    if queue.limit == 0 {
+        queue.dropped = queue.dropped + 1
+        return false
+    }
+    if queue.items.len() >= queue.limit {
+        if queue.policy == "refuse" {
+            queue.dropped = queue.dropped + 1
+            return false
+        }
+        if queue.policy == "newest" {
+            queue.dropped = queue.dropped + 1
+            return false
+        }
+        // `oldest`: the front goes to make room.
+        var kept: [str] = []
+        var i = 1
+        while i < queue.items.len() {
+            kept.push(queue.items[i])
+            i = i + 1
+        }
+        queue.items = kept
+        queue.dropped = queue.dropped + 1
+    }
+    queue.items.push(item)
+    queue.accepted = queue.accepted + 1
+    if queue.items.len() > queue.high_water {
+        queue.high_water = queue.items.len()
+    }
+    return true
+}
+
+/// Take the oldest, or nothing.
+pub fn pop(inout queue: TaskQueue) -> Option[str] {
+    if queue.items.is_empty() {
+        return None
+    }
+    let front = queue.items[0]
+    var kept: [str] = []
+    var i = 1
+    while i < queue.items.len() {
+        kept.push(queue.items[i])
+        i = i + 1
+    }
+    queue.items = kept
+    return Some(front)
+}
+
+/// Take up to `count`, oldest first. A worker asking for a batch asks once.
+pub fn pop_batch(inout queue: TaskQueue, count: i64) -> [str] {
+    var out: [str] = []
+    var i = 0
+    while i < count {
+        match pop(queue) {
+            Some(one) -> out.push(one)
+            None -> i = count
+        }
+        i = i + 1
+    }
+    return out
+}
+
+/// How full it is, from 0 to 100.
+///
+/// Backpressure is a decision made on this number rather than on the count,
+/// because the count means nothing without the bound beside it.
+pub fn pressure(queue: TaskQueue) -> i64 {
+    if queue.limit == 0 {
+        return 100
+    }
+    return queue.items.len() * 100 / queue.limit
+}
+
+/// Whether a producer should slow down: the queue is past `mark` per cent.
+pub fn should_slow(queue: TaskQueue, mark: i64) -> bool {
+    return pressure(queue) >= mark
+}
+
+/// Everything waiting, oldest first, without taking any of it.
+pub fn peek_all(queue: TaskQueue) -> [str] {
+    return queue.items
+}
+
+/// Throw the lot away, counting what went.
+pub fn clear(inout queue: TaskQueue) -> i64 {
+    let gone = queue.items.len()
+    queue.dropped = queue.dropped + gone
+    queue.items = []
+    return gone
+}

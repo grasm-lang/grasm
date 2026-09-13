@@ -1,0 +1,29 @@
+import mqttbroker
+
+/// Brokers until nothing has happened for three passes.
+fn main() / {io, net} {
+    if not args().contains("serve") {
+        print("run with `-- serve` to listen")
+        return
+    }
+    match mqttbroker.listen(0) {
+        Ok(started) -> {
+            var broker = started
+            print("port {mqttbroker.port_of(broker)}")
+            var delivered = 0
+            var idle = 0
+            while idle < 3 {
+                let did = mqttbroker.step(broker, 2000)
+                if did == 0 and mqttbroker.session_count(broker) == 0 {
+                    idle = idle + 1
+                } else {
+                    idle = 0
+                    delivered = delivered + did
+                }
+            }
+            print("delivered {delivered}")
+            mqttbroker.shutdown(broker)
+        }
+        Err(why) -> print("listen failed: {why}")
+    }
+}

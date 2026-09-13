@@ -1,0 +1,6 @@
+[package]
+name = "taskqueue"
+version = "1.0.0"
+
+# Holding work in memory. Opens nothing.
+capabilities = []
