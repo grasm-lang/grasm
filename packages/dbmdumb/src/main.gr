@@ -1,0 +1,265 @@
+// The simplest key-value file format that is still in use.
+//
+// Python's `dbm.dumb` is the fallback its `dbm` module uses when no real
+// database library is available, and `shelve` is built on `dbm`. That makes
+// it the format a surprising amount of small Python software stores its
+// state in — and, because it is pure Python with no library behind it, the
+// one most likely to be sitting in a directory that has outlived the
+// program that wrote it.
+//
+// Two files. The index is text, one line per key:
+//
+//     'alpha', (0, 3)
+//     'beta', (512, 12)
+//
+// which is a Python tuple repr: the key, then the offset into the data file
+// and the length. The data file is a flat blob where every value starts on a
+// 512-byte boundary and the space after it is left as zeros. That is the
+// whole format, and it is why a `.dat` is always a round number of blocks
+// and usually mostly empty.
+//
+// The awkward part is the key. It is written as Python's `repr` of the key
+// *decoded as ISO-8859-1*, and the file itself is then written as
+// ISO-8859-1 — so the index is not UTF-8, and a key holding the byte 0xFF
+// is one raw 0xFF byte in the file rather than the two bytes UTF-8 would
+// use. Reading the index as text mangles exactly those keys. It is taken as
+// bytes here for that reason.
+//
+// A key holding a quote appears with the *other* quote character around it,
+// as `repr` chooses, and one holding a comma is why a reader that splits
+// the line on commas gets the wrong answer.
+//
+// `render_key` writes `\xNN` for every byte outside printable ASCII. That is
+// a valid repr and is not always the one Python wrote: Python leaves a
+// printable Latin-1 character such as `ÿ` as itself. Reading is exact;
+// writing agrees byte for byte on ASCII keys, which is what a program
+// writing its own database produces.
+//
+// Nothing here opens a file: it is handed the index text and the data
+// bytes, so the same code reads a database on disk and one in a test.
+//
+// Checked against `dbm.dumb` writing the files.
+
+type DumbError =
+    | DumbBadLine(line: str)
+    | DumbOutOfRange(at: i64, size: i64)
+
+type DumbEntry = {
+    key: bytes,
+    offset: i64,
+    size: i64,
+}
+
+/// The block a value is padded out to. Every offset is a multiple of it.
+pub fn block_size() -> i64 {
+    return 512
+}
+
+fn hex_digit(b: i64) -> i64 {
+    return "0123456789abcdef".index_of(b.to_char().to_lower()) ?? -1
+}
+
+/// A Python string literal, as `repr` writes one, read as bytes.
+///
+/// Every byte is one character, because the file is ISO-8859-1. The quote
+/// character is whichever `repr` chose, and the escapes are the ones it
+/// writes: `\\`, the quote, `\n`, `\r`, `\t`, and `\xNN`.
+fn read_repr(data: bytes, from: i64) -> (bytes, i64) {
+    var i = from
+    while i < data.len() and data.at(i) == 32 {
+        i = i + 1
+    }
+    if i >= data.len() {
+        return (bytes_of([]), 0 - 1)
+    }
+    let quote = data.at(i)
+    if quote != 39 and quote != 34 {
+        return (bytes_of([]), 0 - 1)
+    }
+    i = i + 1
+    var out: [i64] = []
+    while i < data.len() {
+        let b = data.at(i)
+        if b == quote {
+            return (bytes_of(out), i + 1)
+        }
+        if b != 92 or i + 1 >= data.len() {
+            out.push(b)
+            i = i + 1
+            continue
+        }
+        let next = data.at(i + 1)
+        if next == 120 and i + 3 < data.len() and
+        hex_digit(data.at(i + 2)) >= 0 and
+        hex_digit(data.at(i + 3)) >= 0 {
+            out.push(hex_digit(data.at(i + 2)) * 16 +
+                hex_digit(data.at(i + 3)))
+            i = i + 4
+        } else if next == 110 {
+            out.push(10)
+            i = i + 2
+        } else if next == 114 {
+            out.push(13)
+            i = i + 2
+        } else if next == 116 {
+            out.push(9)
+            i = i + 2
+        } else {
+            out.push(next)
+            i = i + 2
+        }
+    }
+    return (bytes_of([]), 0 - 1)
+}
+
+fn line_text(data: bytes, from: i64, to: i64) -> str {
+    var out = ""
+    var i = from
+    while i < to {
+        out = out + data.at(i).to_char()
+        i = i + 1
+    }
+    return out
+}
+
+/// The index file, one entry per line.
+///
+/// Taken as bytes rather than text: the file is ISO-8859-1, and reading it
+/// as UTF-8 mangles every key holding a byte above 0x7F.
+pub fn read_index(data: bytes) -> [DumbEntry] ! DumbError {
+    var out: [DumbEntry] = []
+    var at = 0
+    while at < data.len() {
+        var end = at
+        while end < data.len() and data.at(end) != 10 {
+            end = end + 1
+        }
+        if end == at {
+            at = end + 1
+            continue
+        }
+        let read = read_repr(data, at)
+        if read.1 < 0 or read.1 > end {
+            fail(DumbBadLine(line_text(data, at, end)))
+        }
+        let rest = line_text(data, read.1, end)
+        let open = rest.index_of("(") ?? -1
+        let close = rest.index_of(")") ?? -1
+        if open < 0 or close < open {
+            fail(DumbBadLine(line_text(data, at, end)))
+        }
+        let numbers = rest.substr(open + 1, close - open - 1).split(",")
+        if numbers.len() < 2 {
+            fail(DumbBadLine(line_text(data, at, end)))
+        }
+        out.push(DumbEntry{
+            key: read.0,
+            offset: numbers[0].trim().parse_int() ?? 0 - 1,
+            size: numbers[1].trim().parse_int() ?? 0 - 1,
+        })
+        at = end + 1
+    }
+    return out
+}
+
+/// The value an entry names, out of the data file.
+pub fn value_of(data: bytes, entry: DumbEntry) -> bytes ! DumbError {
+    if entry.offset < 0 or entry.size < 0 or
+    entry.offset + entry.size > data.len() {
+        fail(DumbOutOfRange(entry.offset, entry.size))
+    }
+    var out: [i64] = []
+    var i = 0
+    while i < entry.size {
+        out.push(data.at(entry.offset + i))
+        i = i + 1
+    }
+    return bytes_of(out)
+}
+
+/// The value for a key, or nothing.
+pub fn get(index: [DumbEntry], data: bytes,
+    key: bytes) -> Option[bytes] {
+    for entry in index {
+        if same_bytes(entry.key, key) {
+            match value_of(data, entry) {
+                Ok(value) -> return Some(value)
+                Err(_e) -> return None
+            }
+        }
+    }
+    return None
+}
+
+fn same_bytes(a: bytes, b: bytes) -> bool {
+    if a.len() != b.len() {
+        return false
+    }
+    var i = 0
+    while i < a.len() {
+        if a.at(i) != b.at(i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+/// Every key, in the order the index lists them.
+pub fn keys(index: [DumbEntry]) -> [bytes] {
+    var out: [bytes] = []
+    for entry in index {
+        out.push(entry.key)
+    }
+    return out
+}
+
+/// A key written the way the index writes one, `repr` and all.
+pub fn render_key(key: bytes) -> str {
+    var quote = "'"
+    var has_single = false
+    var has_double = false
+    var i = 0
+    while i < key.len() {
+        if key.at(i) == 39 {
+            has_single = true
+        }
+        if key.at(i) == 34 {
+            has_double = true
+        }
+        i = i + 1
+    }
+    if has_single and not has_double {
+        quote = "\""
+    }
+    var out = quote
+    i = 0
+    while i < key.len() {
+        let b = key.at(i)
+        if b == 92 {
+            out = out + "\\\\"
+        } else if b.to_char() == quote {
+            out = out + "\\" + quote
+        } else if b == 10 {
+            out = out + "\\n"
+        } else if b == 13 {
+            out = out + "\\r"
+        } else if b == 9 {
+            out = out + "\\t"
+        } else if b >= 32 and b < 127 {
+            out = out + b.to_char()
+        } else {
+            let digits = "0123456789abcdef"
+            out = out + "\\x" + digits.substr(b / 16, 1) +
+            digits.substr(b % 16, 1)
+        }
+        i = i + 1
+    }
+    return out + quote
+}
+
+/// An index line for an entry.
+pub fn render_line(entry: DumbEntry) -> str {
+    return render_key(entry.key) + ", (" + entry.offset.to_str() + ", " +
+    entry.size.to_str() + ")"
+}

@@ -1,0 +1,369 @@
+// The header parameters that carry a filename in a language.
+//
+// `Content-Disposition: attachment; filename="report.pdf"` is easy. The
+// problem RFC 2231 solves is what to do when the filename is
+// `отчёт.pdf`, or when it is three hundred characters long, because a
+// header parameter is a quoted ASCII string with a line-length limit and
+// neither of those fits.
+//
+// Two mechanisms, and they combine:
+//
+//   `filename*=UTF-8''%D0%BE%D1%82%D1%87%D1%91%D1%82.pdf`
+//       The `*` after the name says the value is `charset'language'` and
+//       then percent-encoded bytes. The language is almost always empty and
+//       the two apostrophes are still required.
+//
+//   `filename*0*=UTF-8''%D0%BE; filename*1*=%D1%82`
+//       A long value split into numbered pieces, joined in numeric order.
+//       Only piece zero carries the charset. A piece whose number is
+//       followed by `*` is percent-encoded and one whose number is not is
+//       literal, and a single value may mix the two.
+//
+// Every file upload with a non-ASCII name depends on this, and so does
+// every mail attachment from outside the English-speaking world. The
+// failure mode when it is not implemented is a downloaded file called
+// `_______.pdf`, or `filename*0*` shown to a user as a filename.
+//
+// Percent-decoding gives bytes; turning bytes into text needs the charset,
+// and this decodes the two that account for almost all of it — UTF-8 and
+// ISO-8859-1 — and hands anything else back with its charset named, rather
+// than guessing. A wrong guess produces a filename that looks plausible and
+// is not the one that was sent.
+//
+// Checked against Python's `email` package, which is what the other end of
+// most of these messages is running.
+
+type Rfc2231Param = {
+    name: str,
+    /// The assembled value, decoded when the charset is one this knows.
+    value: str,
+    /// The charset the sender named, empty for an ordinary parameter.
+    charset: str,
+    /// The language the sender named, almost always empty.
+    language: str,
+    /// False when the charset is one this does not decode, in which case
+    /// `value` still holds the raw bytes as ISO-8859-1.
+    decoded: bool,
+}
+
+fn hex_value(c: str) -> i64 {
+    return "0123456789abcdef".index_of(c.to_lower()) ?? -1
+}
+
+/// Percent-decoding, which gives bytes rather than text.
+fn percent_bytes(text: str) -> [i64] {
+    var out: [i64] = []
+    var i = 0
+    while i < text.len() {
+        let c = text.substr(i, 1)
+        if c == "%" and i + 2 < text.len() and
+        hex_value(text.substr(i + 1, 1)) >= 0 and
+        hex_value(text.substr(i + 2, 1)) >= 0 {
+            out.push(hex_value(text.substr(i + 1, 1)) * 16 +
+                hex_value(text.substr(i + 2, 1)))
+            i = i + 3
+            continue
+        }
+        let raw = c.to_bytes()
+        var k = 0
+        while k < raw.len() {
+            out.push(raw.at(k))
+            k = k + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+/// Bytes as text, for the two charsets that account for almost all of this.
+fn decode_bytes(raw: [i64], charset: str) -> (str, bool) {
+    let name = charset.to_lower()
+    if name == "utf-8" or name == "utf8" or name == "us-ascii" or
+    name == "ascii" {
+        return (bytes_of(raw).to_str(), true)
+    }
+    if name == "iso-8859-1" or name == "latin-1" or
+    name == "latin1" or name == "iso8859-1" {
+        var out = ""
+        for b in raw {
+            out = out + b.to_char()
+        }
+        return (out, true)
+    }
+    if name == "" {
+        // An extended value with no charset at all is malformed. The
+        // receiving end reads it as ASCII and replaces what it cannot,
+        // which is visibly wrong rather than plausibly wrong — guessing
+        // UTF-8 would produce a filename that looks right and is not.
+        var out = ""
+        for b in raw {
+            if b < 128 {
+                out = out + b.to_char()
+            } else {
+                out = out + (65533).to_char()
+            }
+        }
+        return (out, false)
+    }
+    // A charset this does not know: hand back the bytes as characters and
+    // say so, so a caller holding a decoder for it can finish the job.
+    var out = ""
+    for b in raw {
+        out = out + b.to_char()
+    }
+    return (out, false)
+}
+
+/// Split a header value on the semicolons that are not inside quotes.
+fn split_parameters(text: str) -> [str] {
+    var out: [str] = []
+    var current = ""
+    var quoted = false
+    var i = 0
+    while i < text.len() {
+        let c = text.substr(i, 1)
+        if c == "\\" and quoted and i + 1 < text.len() {
+            current = current + c + text.substr(i + 1, 1)
+            i = i + 2
+            continue
+        }
+        if c == "\"" {
+            quoted = not quoted
+            current = current + c
+        } else if c == ";" and not quoted {
+            out.push(current)
+            current = ""
+        } else {
+            current = current + c
+        }
+        i = i + 1
+    }
+    out.push(current)
+    return out
+}
+
+fn unquote(text: str) -> str {
+    var body = text.trim()
+    if body.len() >= 2 and body.starts_with("\"") and body.ends_with("\"") {
+        body = body.substr(1, body.len() - 2)
+        return body.replace("\\\"", "\"").replace("\\\\", "\\")
+    }
+    return body
+}
+
+type RawParam = {
+    name: str,
+    /// -1 when the parameter has no continuation number.
+    section: i64,
+    extended: bool,
+    body: str,
+}
+
+fn read_raw(piece: str) -> Option[RawParam] {
+    let cut = piece.index_of("=") ?? -1
+    if cut < 0 {
+        return None
+    }
+    var key = piece.substr(0, cut).trim().to_lower()
+    let body = piece.substr(cut + 1, piece.len() - cut - 1)
+    var extended = false
+    if key.ends_with("*") {
+        extended = true
+        key = key.substr(0, key.len() - 1)
+    }
+    var section = 0 - 1
+    let star = last_index_of(key, "*")
+    if star >= 0 {
+        let digits = key.substr(star + 1, key.len() - star - 1)
+        match digits.parse_int() {
+            Some(n) -> {
+                section = n
+                key = key.substr(0, star)
+            }
+            None -> {}
+        }
+    }
+    return Some(RawParam{
+        name: key,
+        section: section,
+        extended: extended,
+        body: body,
+    })
+}
+
+fn last_index_of(text: str, needle: str) -> i64 {
+    var found = 0 - 1
+    var i = 0
+    while i < text.len() {
+        if text.substr(i, 1) == needle {
+            found = i
+        }
+        i = i + 1
+    }
+    return found
+}
+
+/// The parameters of a header value such as a `Content-Disposition`,
+/// with continuations joined and extended values decoded.
+pub fn parse(text: str) -> [Rfc2231Param] {
+    var names: [str] = []
+    var pieces: Map[str, [RawParam]] = {}
+    var first = true
+    for piece in split_parameters(text) {
+        if first {
+            // The part before the first semicolon is the value itself.
+            first = false
+            continue
+        }
+        match read_raw(piece) {
+            Some(raw) -> {
+                if not pieces.has(raw.name) {
+                    names.push(raw.name)
+                    pieces.set(raw.name, [])
+                }
+                var list = pieces.get(raw.name) ?? []
+                list.push(raw)
+                pieces.set(raw.name, list)
+            }
+            None -> {}
+        }
+    }
+    var out: [Rfc2231Param] = []
+    for name in names {
+        out.push(assemble(name, pieces.get(name) ?? []))
+    }
+    return out
+}
+
+/// The value before the first semicolon — the disposition or media type.
+pub fn head_of(text: str) -> str {
+    return split_parameters(text)[0].trim()
+}
+
+fn assemble(name: str, parts: [RawParam]) -> Rfc2231Param {
+    var charset = ""
+    var language = ""
+    var raw: [i64] = []
+    var any_extended = false
+    var section = 0
+    var going = true
+    // Pieces are joined in numeric order, and a gap ends the value: a
+    // missing `*1` means everything from `*2` on was never ours to read.
+    while going {
+        var found = false
+        for part in parts {
+            let number = if part.section < 0 { 0 } else { part.section }
+            if number != section {
+                continue
+            }
+            if part.section < 0 and parts.len() > 1 {
+                continue
+            }
+            found = true
+            var body = unquote(part.body)
+            if part.extended {
+                any_extended = true
+                if section == 0 {
+                    let split = split_prefix(body)
+                    charset = split.0
+                    language = split.1
+                    body = split.2
+                }
+                for b in percent_bytes(body) {
+                    raw.push(b)
+                }
+            } else {
+                let bytes_here = body.to_bytes()
+                var k = 0
+                while k < bytes_here.len() {
+                    raw.push(bytes_here.at(k))
+                    k = k + 1
+                }
+            }
+        }
+        if not found {
+            going = false
+        }
+        section = section + 1
+    }
+    let decoded = decode_bytes(raw, charset)
+    return Rfc2231Param{
+        name: name,
+        value: decoded.0,
+        charset: if any_extended { charset } else { "" },
+        language: language,
+        decoded: decoded.1,
+    }
+}
+
+/// `charset'language'value` split into its three parts.
+fn split_prefix(body: str) -> (str, str, str) {
+    let first = body.index_of("'") ?? -1
+    if first < 0 {
+        return ("", "", body)
+    }
+    let rest = body.substr(first + 1, body.len() - first - 1)
+    let second = rest.index_of("'") ?? -1
+    if second < 0 {
+        return (body.substr(0, first), "", rest)
+    }
+    return (body.substr(0, first), rest.substr(0, second),
+        rest.substr(second + 1, rest.len() - second - 1))
+}
+
+/// One parameter by name.
+pub fn get(params: [Rfc2231Param], name: str) -> Option[str] {
+    for param in params {
+        if param.name == name.to_lower() {
+            return Some(param.value)
+        }
+    }
+    return None
+}
+
+fn needs_encoding(text: str) -> bool {
+    for code in text.codes() {
+        if code > 126 or code < 32 {
+            return true
+        }
+    }
+    return false
+}
+
+/// A parameter written the way a sender should write it: plain when it can
+/// be, extended when it cannot.
+pub fn render(name: str, value: str, charset: str) -> str {
+    if not needs_encoding(value) and (value.index_of("\"") ?? -1) < 0 {
+        return name + "=\"" + value + "\""
+    }
+    var out = name + "*=" + charset + "''"
+    let raw = value.to_bytes()
+    var i = 0
+    while i < raw.len() {
+        let b = raw.at(i)
+        if is_attribute_char(b) {
+            out = out + b.to_char()
+        } else {
+            out = out + "%" + two_hex(b)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn two_hex(value: i64) -> str {
+    let digits = "0123456789ABCDEF"
+    return digits.substr(value / 16, 1) + digits.substr(value % 16, 1)
+}
+
+/// The characters RFC 2231 lets through unencoded.
+fn is_attribute_char(b: i64) -> bool {
+    if (b >= 48 and b <= 57) or (b >= 65 and b <= 90) or
+    (b >= 97 and b <= 122) {
+        return true
+    }
+    // `!#$&+-.^_`|~` — everything else is encoded.
+    return b == 33 or b == 35 or b == 36 or b == 38 or b == 43 or
+    b == 45 or b == 46 or b == 94 or b == 95 or b == 96 or
+    b == 124 or b == 126
+}

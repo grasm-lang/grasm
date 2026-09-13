@@ -1,0 +1,10 @@
+[package]
+name = "base64mime"
+version = "1.0.0"
+
+# Bytes in, text out. Opens nothing.
+capabilities = []
+
+[dependencies.bytes_codec]
+path = "../bytes"
+version = "^1.0.0"

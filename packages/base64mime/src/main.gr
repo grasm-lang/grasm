@@ -1,0 +1,130 @@
+// Base64 as MIME writes it: wrapped, and forgiving on the way back.
+//
+// `packages/bytes` encodes and decodes base64. What it does not do is the
+// part every mail and HTTP body needs: break the output into lines, and
+// accept an input whose lines were broken by somebody else. A header field
+// or a message body is a sequence of lines, and an encoder that emits one
+// line of forty thousand characters produces a message that some relays
+// truncate and some reject.
+//
+// The line length is 76 characters, which is not arbitrary: RFC 2045 allows
+// 76 plus the ending, and 76 is the largest multiple of four that fits. A
+// multiple of four matters because a base64 line that ends mid-group is
+// legal and slower to read, and because some decoders written before 1996
+// refuse it.
+//
+// Decoding goes the other way and has to be generous. Real messages contain
+// lines broken at 64, at 72, at 76; CRLF endings; trailing spaces from a
+// mail client that reflowed the text; and padding that is missing because
+// somebody's encoder was written from the RFC's prose rather than its
+// grammar. All of that is accepted. What is not accepted is a character
+// outside the alphabet, because that means the body was corrupted rather
+// than merely re-wrapped, and reading it anyway produces bytes that look
+// like data.
+//
+// Checked against Python's `base64.encodebytes` and `decodebytes`, which
+// are what the other end of most of these messages is running.
+
+import bytes_codec
+
+type Base64MimeError =
+    | Base64MimeCharacter(at: i64, c: str)
+    | Base64MimeLength(len: i64)
+
+    /// `raw` encoded and broken into lines of `width` characters.
+    ///
+    /// Every line ends with `line_end`, including the last, which is what
+    /// `base64.encodebytes` produces and what a MIME body wants. Nothing at all
+    /// is produced for no bytes — not an empty line.
+pub fn encode_with(raw: bytes, width: i64, line_end: str) -> str {
+    if raw.len() == 0 {
+        return ""
+    }
+    let body = bytes_codec.encode_base64(raw)
+    var out = ""
+    var at = 0
+    while at < body.len() {
+        var take = body.len() - at
+        if take > width {
+            take = width
+        }
+        out = out + body.substr(at, take) + line_end
+        at = at + take
+    }
+    return out
+}
+
+/// The usual thing: 76 characters to a line, each ending in a newline.
+pub fn encode(raw: bytes) -> str {
+    return encode_with(raw, 76, "\n")
+}
+
+/// The same with CRLF endings, which is what goes on the wire.
+pub fn encode_crlf(raw: bytes) -> str {
+    return encode_with(raw, 76, "\r\n")
+}
+
+fn is_base64_char(c: str) -> bool {
+    return (c >= "A" and c <= "Z") or (c >= "a" and c <= "z") or
+    (c >= "0" and c <= "9") or c == "+" or c == "/"
+}
+
+fn is_space(c: str) -> bool {
+    return c == " " or c == "\t" or c == "\n" or c == "\r"
+}
+
+/// `text` decoded, however it was wrapped.
+///
+/// Line breaks, indentation and trailing spaces are ignored; missing
+/// padding is supplied; a character outside the alphabet is refused.
+pub fn decode(text: str) -> bytes ! Base64MimeError {
+    var body = ""
+    var i = 0
+    while i < text.len() {
+        let c = text.substr(i, 1)
+        if is_space(c) {
+            i = i + 1
+            continue
+        }
+        if c == "=" {
+            // Padding, wherever it is: the length decides how much is real.
+            i = i + 1
+            continue
+        }
+        if not is_base64_char(c) {
+            fail(Base64MimeCharacter(i, c))
+        }
+        body = body + c
+        i = i + 1
+    }
+    if body.len() % 4 == 1 {
+        // One character cannot be the tail of anything.
+        fail(Base64MimeLength(body.len()))
+    }
+    while body.len() % 4 != 0 {
+        body = body + "="
+    }
+    match bytes_codec.decode_base64(body) {
+        Some(raw) -> return raw
+        None -> fail(Base64MimeLength(body.len()))
+    }
+}
+
+/// Whether `text` is something this will decode.
+pub fn is_valid(text: str) -> bool {
+    match decode(text) {
+        Ok(_raw) -> return true
+        Err(_e) -> return false
+    }
+}
+
+/// How many characters the encoding of `n` bytes takes, wrapping included —
+/// which is what a caller sizing a buffer or a quota wants.
+pub fn encoded_length(n: i64, width: i64, ending: i64) -> i64 {
+    if n == 0 {
+        return 0
+    }
+    let characters = (n + 2) / 3 * 4
+    let lines = (characters + width - 1) / width
+    return characters + lines * ending
+}

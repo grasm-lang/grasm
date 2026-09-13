@@ -100,6 +100,7 @@ run_gate idnadiff       scripts/idna_diff.sh
 run_gate encoding5diff  scripts/encoding5_diff.sh
 run_gate gitfilediff    scripts/git_diff.sh
 run_gate prepdiff       scripts/prep_diff.sh
+run_gate paramdiff      scripts/param_diff.sh
 run_gate kvcrash       scripts/kvstore_crash.sh
 run_gate zlibdiff      scripts/zlib_diff.sh
 run_gate casefolddiff  scripts/casefold_diff.sh

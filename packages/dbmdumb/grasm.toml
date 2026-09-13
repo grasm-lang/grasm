@@ -1,0 +1,6 @@
+[package]
+name = "dbmdumb"
+version = "1.0.0"
+
+# Parses the two files it is handed. Opens neither itself.
+capabilities = []

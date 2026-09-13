@@ -1,0 +1,118 @@
+import rfc2231
+import dbmdumb
+import base64mime
+
+fn from_hex(text: str) -> str {
+    var out: [i64] = []
+    var i = 1
+    while i + 1 < text.len() {
+        out.push(text.substr(i, 2).parse_int_base(16) ?? 0)
+        i = i + 2
+    }
+    return bytes_of(out).to_str()
+}
+
+fn to_hex(text: str) -> str {
+    let digits = "0123456789abcdef"
+    let raw = text.to_bytes()
+    var out = ""
+    var i = 0
+    while i < raw.len() {
+        out = out + digits.substr(raw.at(i) / 16, 1) +
+        digits.substr(raw.at(i) % 16, 1)
+        i = i + 1
+    }
+    return out
+}
+
+fn from_hex_bytes(text: str) -> bytes {
+    var out: [i64] = []
+    var i = 1
+    while i + 1 < text.len() {
+        out.push(text.substr(i, 2).parse_int_base(16) ?? 0)
+        i = i + 2
+    }
+    return bytes_of(out)
+}
+
+fn bytes_hex(raw: bytes) -> str {
+    let digits = "0123456789abcdef"
+    var out = ""
+    var i = 0
+    while i < raw.len() {
+        out = out + digits.substr(raw.at(i) / 16, 1) +
+        digits.substr(raw.at(i) % 16, 1)
+        i = i + 1
+    }
+    return out
+}
+
+fn main() / {io} {
+    var i = 0
+    while i + 1 < args().len() {
+        if args()[i] == "b64enc" {
+            print(to_hex(base64mime.encode(from_hex_bytes(args()[i + 1]))))
+            i = i + 2
+            continue
+        }
+        if args()[i] == "b64dec" {
+            print(bytes_hex(base64mime.decode(from_hex(args()[i + 1])) ??
+                "?refused?".to_bytes()))
+            i = i + 2
+            continue
+        }
+        if args()[i] == "dbmkeys" {
+            var names: [str] = []
+            for key in dbmdumb.keys(dbmdumb.read_index(
+                from_hex_bytes(args()[i + 1])) ?? []) {
+                names.push(bytes_hex(key))
+            }
+            print(names.join(","))
+            i = i + 2
+            continue
+        }
+        if args()[i] == "dbmline" {
+            var lines: [str] = []
+            let entries = dbmdumb.read_index(
+                from_hex_bytes(args()[i + 1])) ?? []
+            for entry in entries {
+                lines.push(dbmdumb.render_line(entry))
+            }
+            print(to_hex(lines.join("\n")))
+            i = i + 2
+            continue
+        }
+        if i + 2 >= args().len() {
+            return
+        }
+        let what = args()[i]
+        let header = from_hex(args()[i + 1])
+        let name = from_hex(args()[i + 2])
+        if what == "dbmget" {
+            // `dbmget <index text> <key hex> <data hex>`
+            let index = dbmdumb.read_index(from_hex_bytes(args()[i + 1])) ?? []
+            print(bytes_hex(dbmdumb.get(index,
+                from_hex_bytes(args()[i + 3]),
+                from_hex_bytes(args()[i + 2])) ?? "?missing?".to_bytes()))
+            i = i + 4
+            continue
+        }
+        if what == "get" {
+            print(to_hex(rfc2231.get(rfc2231.parse(header), name) ??
+                "?missing?"))
+        } else if what == "charset" {
+            var found = "?missing?"
+            for param in rfc2231.parse(header) {
+                if param.name == name {
+                    found = param.charset + "|" + param.language
+                }
+            }
+            print(to_hex(found))
+        } else if what == "head" {
+            print(to_hex(rfc2231.head_of(header)))
+        } else {
+            print(to_hex(rfc2231.render(name, header, "utf-8")))
+        }
+        i = i + 3
+    }
+}

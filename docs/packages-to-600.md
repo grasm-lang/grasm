@@ -30,9 +30,9 @@ One rule is added, because the count is now large enough for it to matter:
 | | |
 |---|---|
 | At the close of the 200 plan | 513 |
-| Now | 583 |
+| Now | 587 |
 | Target | 600 |
-| Remaining | 17 |
+| Remaining | 13 |
 
 The count is directories under `packages/` that are not `*-demo`. Test
 harnesses are directories and are counted; they are real programs that the
@@ -110,6 +110,11 @@ gates run, and several of them are the only consumer a format parser has.
   literal; and the three colon-separated files that say who a machine's
   users are. 82 cases against `stringprep`, `unicode_escape`, `pwd` and
   `grp`.
+- [x] **A filename in a header** — `rfc2231` `base64mime` `dbmdumb`. The
+  parameter encoding every non-ASCII attachment name depends on,
+  continuations and all; base64 wrapped the way MIME wraps it and read
+  back however somebody else wrapped it; and the two-file key-value format
+  `shelve` is built on. 74 cases against `email`, `base64` and `dbm.dumb`.
 
 ### Next
 
@@ -120,6 +125,19 @@ thing it is checked against.
 - **Float presentations for `formatspec`** — `shortestfloat` exists now, so
   the `f`, `e`, `g` and `%` types it refuses can be implemented. That is an
   edit rather than a package and does not move the count.
+
+`gittrailers` was started and dropped. `git interpret-trailers --parse`
+looked like a clean oracle, and probing it showed the rule for what counts
+as a trailer block is not the one the manual describes: a last paragraph of
+two lines with one trailer is accepted, one of five lines with one trailer
+is not, and a non-trailer line containing a colon changes the answer again.
+Reproducing a heuristic that is not written down anywhere is guessing, which
+is what rule 6 exists to prevent.
+
+`imapname` was dropped for the same reason. Modified UTF-7 for IMAP mailbox
+names is a small change to `utf7`, and nothing on this machine implements it
+— not Python, not `iconv` — so there is nothing to check it against but RFC
+3501's single example.
 
 `terminfo` was on this list and came off it. The plan was to check it
 against `infocmp`, whose `-s i` flag is documented to print capabilities in

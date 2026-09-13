@@ -1,0 +1,142 @@
+// A filename in a header, a body in base64, and the simplest key-value file
+// still in use.
+import rfc2231
+import dbmdumb
+import base64mime
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn check_rfc2231(inout f: i64) / {io} {
+    let plain = rfc2231.parse("attachment; filename=\"report.pdf\"")
+    say(f, "an ordinary parameter comes back",
+        rfc2231.get(plain, "filename") == Some("report.pdf"))
+    say(f, "and the disposition in front of it",
+        rfc2231.head_of("attachment; filename=\"a\"") == "attachment")
+    // The extended form: charset, language, then percent-encoded bytes.
+    let extended = rfc2231.parse(
+        "attachment; filename*=UTF-8''na%C3%AFve.txt")
+    say(f, "an extended parameter is decoded",
+        rfc2231.get(extended, "filename") == Some("na\u{ef}ve.txt"))
+    // A long value split across numbered pieces, joined in order.
+    let split = rfc2231.parse(
+        "attachment; filename*0*=UTF-8''%D0%BE; filename*1*=%D1%82")
+    say(f, "continuations are joined in numeric order",
+        rfc2231.get(split, "filename") == Some("\u{43e}\u{442}"))
+    // A single value may mix encoded and literal pieces.
+    let mixed = rfc2231.parse("attachment; filename*0*=UTF-8''caf; " +
+        "filename*1=e; filename*2*=%CC%81")
+    say(f, "and a value may mix encoded and literal pieces",
+        rfc2231.get(mixed, "filename") == Some("cafe\u{301}"))
+    say(f, "the charset is reported",
+        rfc2231.parse("a; b*=iso-8859-1''x")[0].charset == "iso-8859-1")
+    say(f, "and so is the language",
+        rfc2231.parse("a; b*=UTF-8'en'x")[0].language == "en")
+    // A charset nobody here decodes is named rather than guessed at.
+    let unknown = rfc2231.parse("a; b*=unknown-8bit''%41")
+    say(f, "an unknown charset is reported as undecoded",
+        not unknown[0].decoded)
+    say(f, "a parameter that is not there is not there",
+        rfc2231.get(plain, "creation-date") == None)
+    // Writing: plain when it can be, extended when it cannot.
+    say(f, "an ASCII value is written plainly",
+        rfc2231.render("filename", "a.txt", "utf-8") ==
+        "filename=\"a.txt\"")
+    say(f, "and one that needs it is written extended",
+        rfc2231.render("filename", "na\u{ef}ve.txt", "utf-8") ==
+        "filename*=utf-8''na%C3%AFve.txt")
+}
+
+fn check_base64mime(inout f: i64) / {io} {
+    say(f, "no bytes produce nothing at all, not an empty line",
+        base64mime.encode("".to_bytes()) == "")
+    say(f, "a short body is one line ending in a newline",
+        base64mime.encode("hello".to_bytes()) == "aGVsbG8=\n")
+    // 57 bytes is exactly one 76-character line.
+    var long_bytes: [i64] = []
+    var i = 0
+    while i < 120 {
+        long_bytes.push(65 + i % 26)
+        i = i + 1
+    }
+    let wrapped = base64mime.encode(bytes_of(long_bytes))
+    say(f, "a long body is wrapped at 76 characters",
+        wrapped.split("\n")[0].len() == 76)
+    say(f, "and every line ends in one", wrapped.ends_with("\n"))
+    // Decoding has to accept whatever somebody else's encoder produced.
+    say(f, "a body wrapped somewhere else still decodes",
+        (base64mime.decode("aGVs\r\nbG8=") ?? "".to_bytes()).to_str() ==
+        "hello")
+    say(f, "so does one with the padding missing",
+        (base64mime.decode("aGVsbG8") ?? "".to_bytes()).to_str() == "hello")
+    say(f, "and one with spaces in it",
+        (base64mime.decode("  aGVs bG8=  ") ?? "".to_bytes()).to_str() ==
+        "hello")
+    // A character outside the alphabet means corruption, not re-wrapping.
+    say(f, "a character outside the alphabet is refused",
+        not base64mime.is_valid("aGV!bG8="))
+    say(f, "and a single leftover character is too",
+        not base64mime.is_valid("a"))
+    say(f, "the encoded length can be worked out in advance",
+        base64mime.encoded_length(120, 76, 1) ==
+        base64mime.encode(bytes_of(long_bytes)).len())
+}
+
+fn check_dbmdumb(inout f: i64) / {io} {
+    // An index as `dbm.dumb` writes one.
+    let index = "'alpha', (0, 3)\n'beta', (512, 12)\n".to_bytes()
+    let entries = dbmdumb.read_index(index) ?? []
+    say(f, "two entries were read", entries.len() == 2)
+    say(f, "with their offsets", entries[1].offset == 512)
+    say(f, "and their sizes", entries[1].size == 12)
+    // Every value starts on a 512-byte boundary.
+    say(f, "values start on a block boundary",
+        entries[1].offset % dbmdumb.block_size() == 0)
+    var data: [i64] = []
+    var i = 0
+    while i < 1024 {
+        data.push(0)
+        i = i + 1
+    }
+    data[0] = 111
+    data[1] = 110
+    data[2] = 101
+    say(f, "a value is read out of the data file",
+        (dbmdumb.value_of(bytes_of(data), entries[0]) ??
+            "".to_bytes()).to_str() == "one")
+    say(f, "and by key",
+        (dbmdumb.get(entries, bytes_of(data), "alpha".to_bytes()) ??
+            "".to_bytes()).to_str() == "one")
+    say(f, "a key that is not there is not there",
+        dbmdumb.get(entries, bytes_of(data), "none".to_bytes()) == None)
+    // The key is a Python repr, so the quote character depends on the key.
+    say(f, "a key holding a quote is written with the other quote",
+        dbmdumb.render_key("it's".to_bytes()) == "\"it's\"")
+    say(f, "and an ordinary one with the usual quote",
+        dbmdumb.render_key("alpha".to_bytes()) == "'alpha'")
+    say(f, "an index line is written back as it was read",
+        dbmdumb.render_line(entries[0]) == "'alpha', (0, 3)")
+    say(f, "a line that is not one is refused",
+        (dbmdumb.read_index("not an index line\n".to_bytes()) ?? [])
+            .len() == 0)
+}
+
+fn main() / {io} {
+    var f = 0
+
+    check_rfc2231(f)
+    check_base64mime(f)
+    check_dbmdumb(f)
+
+    if f == 0 {
+        print("headers: every claim held")
+    } else {
+        print("headers: {f} failed")
+    }
+}

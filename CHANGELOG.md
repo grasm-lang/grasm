@@ -9,6 +9,22 @@ migration note here; anything `experimental` may change in any release. See
 
 ### Added
 
+- **The parameter encoding behind every non-ASCII attachment name.**
+  `rfc2231` reads `filename*=UTF-8''%D0%BE...` and the numbered
+  continuations that split a long value across several parameters, joining
+  them in order and decoding the two charsets that account for almost all of
+  it. A charset it does not know is reported as undecoded rather than
+  guessed at, because a wrong guess produces a filename that looks plausible
+  and is not the one that was sent. `base64mime` wraps base64 at 76
+  characters the way a MIME body needs and reads back whatever somebody
+  else's encoder produced — broken at 64, at 72, with CRLF, with the padding
+  missing — while still refusing a character outside the alphabet, which
+  means corruption rather than re-wrapping. `dbmdumb` reads the two-file
+  format `dbm.dumb` writes and `shelve` is built on; its index is
+  ISO-8859-1 rather than UTF-8, so it is taken as bytes, which is what a
+  key holding 0xFF needs. 74 cases against `email`, `base64` and `dbm.dumb`;
+  `paramdiff` is a gate.
+
 - **What happens to a password before it is hashed.** `saslprep` is RFC 4013,
   which SCRAM requires and `postgres` therefore needs: two people typing what
   they believe is the same password on two keyboards can produce different

@@ -1,0 +1,16 @@
+[package]
+name = "paramtest"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.rfc2231]
+path = "../rfc2231"
+version = "^1.0.0"
+
+[dependencies.dbmdumb]
+path = "../dbmdumb"
+version = "^1.0.0"
+
+[dependencies.base64mime]
+path = "../base64mime"
+version = "^1.0.0"
