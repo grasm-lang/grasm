@@ -127,7 +127,7 @@ def talk(port, results, index):
 
 def main():
     clients = int(os.environ.get("WS_CLIENTS", "40"))
-    server = subprocess.Popen([GRASM, "run", HARNESS],
+    server = subprocess.Popen([GRASM, "run", HARNESS, "--", "serve"],
                               stdout=subprocess.PIPE, text=True)
     first = server.stdout.readline()
     found = re.search(r"port (\d+)", first)

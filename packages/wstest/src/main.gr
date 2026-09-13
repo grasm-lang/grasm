@@ -7,6 +7,13 @@ import wsserver
 /// message, and a server that stopped counting at the last message would
 /// reset the socket underneath it.
 fn main() / {io, net} {
+    // The corpus does not open sockets by default: a gate that depends on
+    // the loopback network fails for reasons that have nothing to do with
+    // the language, and `packages/http_server-demo` draws the same line.
+    if not args().contains("serve") {
+        print("run with `-- serve` to listen")
+        return
+    }
     match wsserver.listen(0) {
         Ok(started) -> {
             var server = started
