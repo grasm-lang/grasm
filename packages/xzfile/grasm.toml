@@ -1,0 +1,10 @@
+[package]
+name = "xzfile"
+version = "1.0.0"
+
+# Bytes in, bytes out. Opens nothing.
+capabilities = []
+
+[dependencies.crc32]
+path = "../crc32"
+version = "^1.0.0"

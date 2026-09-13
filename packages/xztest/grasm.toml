@@ -1,0 +1,8 @@
+[package]
+name = "xztest"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.xzfile]
+path = "../xzfile"
+version = "^1.0.0"

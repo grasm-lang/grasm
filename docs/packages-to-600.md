@@ -30,9 +30,9 @@ One rule is added, because the count is now large enough for it to matter:
 | | |
 |---|---|
 | At the close of the 200 plan | 513 |
-| Now | 537 |
+| Now | 543 |
 | Target | 600 |
-| Remaining | 63 |
+| Remaining | 57 |
 
 The count is directories under `packages/` that are not `*-demo`. Test
 harnesses are directories and are counted; they are real programs that the
@@ -61,8 +61,6 @@ Each line is a batch of about six, chosen so that everything in it has an
 implementation elsewhere to be checked against. A name in brackets is the
 thing it is checked against.
 
-- **Compression** — `gzip` (RFC 1952 over the deflate `zlib` already has),
-  `xzfile` (Python `lzma`), and the pieces they need
 - **Unix identity** — `unixcrypt` (`openssl passwd`), `sshkey`
   (`ssh-keygen`), `terminfo` (`infocmp`)
 - **Names on the wire** — `idna` (Python `encodings.idna`), `countrycode`

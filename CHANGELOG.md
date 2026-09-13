@@ -9,6 +9,22 @@ migration note here; anything `experimental` may change in any release. See
 
 ### Added
 
+- **Compression that compresses, and a reader for `.xz`.** `zlib` could read a
+  deflate stream and could write exactly one kind — stored blocks, deflate's
+  word for "no compression" — so `gzip`, `zip` and `png` could all emit files
+  that other tools accept and that nothing made smaller. `deflate` is the
+  encoder: LZ77 matching through hash chains, fixed-Huffman blocks, and a
+  stored block whenever that is smaller, so incompressible input costs five
+  bytes rather than growing. `gzip` is RFC 1952 in both directions, with the
+  optional header fields, multiple members, and the trailer actually
+  verified. `xzfile` reads `.xz` down to the range decoder — container,
+  LZMA2 chunking with its state resets, LZMA itself, and the index and footer
+  checked, which is what catches a file whose blocks each decoded cleanly and
+  which is still not the file that was written. Checked against Python's
+  `zlib`, `gzip` and `lzma` over 194 cases including corrupted ones;
+  `compressdiff` is a gate. Dynamic Huffman blocks are not implemented and
+  the roadmap says so rather than the package implying otherwise.
+
 - **Six packages for things that were decided a long time ago.** `md5`,
   because a `MD5SUMS` file beside a download cannot be checked without it and
   version 3 UUIDs name it in their definition; `uuidnamed`, the v3 and v5

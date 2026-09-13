@@ -1,0 +1,8 @@
+[package]
+name = "gztest"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.gzip]
+path = "../gzip"
+version = "^1.0.0"

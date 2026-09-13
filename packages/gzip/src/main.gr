@@ -1,0 +1,266 @@
+// The gzip container, RFC 1952. The wrapper, not the compression.
+//
+// A `.gz` file is a deflate stream with ten bytes in front of it and eight
+// behind, and most of the difficulty is in what the header is allowed to
+// carry: an original filename, a comment, an arbitrary extra field, and a
+// checksum over the header itself, each present only if a flag bit says so
+// and each variable length. A reader that assumes the header is ten bytes
+// works on every file `gzip` makes from stdin and fails on every file it
+// makes from a named file, because that one carries the name.
+//
+// Two things here are not decoration:
+//
+//   - **The trailer is checked.** Four bytes of CRC-32 over the
+//     uncompressed data and four bytes of its length, and both are
+//     verified. This is the only integrity check a `.gz` has, and a reader
+//     that skips it silently returns half a file when a download was cut
+//     short — the deflate stream ends cleanly at a block boundary and
+//     nothing else complains.
+//   - **A file may hold several members.** Concatenating two `.gz` files
+//     produces a valid `.gz` whose contents are the concatenation, and
+//     tools rely on it: that is how `zcat *.gz` and rotated logs work. A
+//     reader that stops after the first member loses data on input that
+//     every other implementation reads whole.
+//
+// The length in the trailer is the uncompressed size modulo 2^32, which is
+// a fact about 1992 and not a bug. Files larger than 4 GiB carry a length
+// that is simply wrong, so it is checked modulo 2^32 as the standard says
+// and not treated as a size.
+//
+// Checked against Python's `gzip` in both directions: every file it writes
+// at every level is read here, and every file written here is read by it.
+
+import zlib
+import deflate
+import crc32
+
+type GzipError =
+    | GzipNotGzip(at: i64)
+    | GzipMethod(method: i64)
+    | GzipTruncated(at: i64)
+    | GzipBadCrc(want: i64, got: i64)
+    | GzipBadLength(want: i64, got: i64)
+    | GzipBadHeaderCrc(want: i64, got: i64)
+
+    /// One member of a `.gz` file.
+type GzipMember = {
+    /// The uncompressed bytes.
+    data: bytes,
+    /// The original filename, if the header carried one.
+    name: str,
+    /// The comment, if the header carried one.
+    comment: str,
+    /// Seconds since the epoch, or 0 for "not recorded".
+    modified: i64,
+    /// The operating system byte, 255 for "unknown".
+    system: i64,
+}
+
+fn read_u16(data: bytes, at: i64) -> i64 {
+    return data.at(at) + data.at(at + 1) * 256
+}
+
+fn read_u32(data: bytes, at: i64) -> i64 {
+    return data.at(at) + data.at(at + 1) * 256 + data.at(at + 2) * 65536 +
+    data.at(at + 3) * 16777216
+}
+
+/// The end of a zero-terminated string starting at `at`, one past the zero.
+fn end_of_string(data: bytes, at: i64) -> i64 {
+    var i = at
+    while i < data.len() and data.at(i) != 0 {
+        i = i + 1
+    }
+    return i + 1
+}
+
+fn slice_text(data: bytes, from: i64, to: i64) -> str {
+    var out: [i64] = []
+    var i = from
+    while i < to - 1 {
+        out.push(data.at(i))
+        i = i + 1
+    }
+    return bytes_of(out).to_str()
+}
+
+fn slice_bytes(data: bytes, from: i64, to: i64) -> bytes {
+    var out: [i64] = []
+    var i = from
+    while i < to and i < data.len() {
+        out.push(data.at(i))
+        i = i + 1
+    }
+    return bytes_of(out)
+}
+
+type GzipHeader = {
+    name: str,
+    comment: str,
+    modified: i64,
+    system: i64,
+    body_at: i64,
+}
+
+fn read_header(data: bytes, at: i64) -> GzipHeader ! GzipError {
+    if at + 10 > data.len() {
+        fail(GzipTruncated(at))
+    }
+    if data.at(at) != 31 or data.at(at + 1) != 139 {
+        fail(GzipNotGzip(at))
+    }
+    if data.at(at + 2) != 8 {
+        // Deflate is method 8 and nothing else was ever defined.
+        fail(GzipMethod(data.at(at + 2)))
+    }
+    let flags = data.at(at + 3)
+    var i = at + 10
+    if flags.bit_and(4) != 0 {
+        if i + 2 > data.len() {
+            fail(GzipTruncated(i))
+        }
+        i = i + 2 + read_u16(data, i)
+    }
+    var name = ""
+    if flags.bit_and(8) != 0 {
+        let end = end_of_string(data, i)
+        name = slice_text(data, i, end)
+        i = end
+    }
+    var comment = ""
+    if flags.bit_and(16) != 0 {
+        let end = end_of_string(data, i)
+        comment = slice_text(data, i, end)
+        i = end
+    }
+    if flags.bit_and(2) != 0 {
+        if i + 2 > data.len() {
+            fail(GzipTruncated(i))
+        }
+        let want = read_u16(data, i)
+        let got = crc32.of(slice_bytes(data, at, i)).bit_and(65535)
+        if want != got {
+            fail(GzipBadHeaderCrc(want, got))
+        }
+        i = i + 2
+    }
+    if i > data.len() {
+        fail(GzipTruncated(i))
+    }
+    return GzipHeader{
+        name: name,
+        comment: comment,
+        modified: read_u32(data, at + 4),
+        system: data.at(at + 9),
+        body_at: i,
+    }
+}
+
+/// Every member of `data`, in order, with each trailer verified.
+///
+/// `limit` caps the uncompressed size of a single member, so a crafted file
+/// cannot ask for more memory than the caller is willing to spend.
+pub fn decode(data: bytes, limit: i64) -> [GzipMember] ! GzipError {
+    var out: [GzipMember] = []
+    var at = 0
+    while at < data.len() {
+        let header = try read_header(data, at)
+        var body = bytes_of([])
+        var used = 0
+        match zlib.inflate_prefix(slice_bytes(data, header.body_at,
+            data.len()), limit) {
+            Ok(pair) -> {
+                body = pair.0
+                used = pair.1
+            }
+            Err(_e) -> fail(GzipTruncated(header.body_at))
+        }
+        let trailer = header.body_at + used
+        if trailer + 8 > data.len() {
+            fail(GzipTruncated(trailer))
+        }
+        let want_crc = read_u32(data, trailer)
+        let got_crc = crc32.of(body)
+        if want_crc != got_crc {
+            fail(GzipBadCrc(want_crc, got_crc))
+        }
+        let want_size = read_u32(data, trailer + 4)
+        // The recorded size is modulo 2^32, which is a fact about 1992.
+        let got_size = body.len() % 4294967296
+        if want_size != got_size {
+            fail(GzipBadLength(want_size, got_size))
+        }
+        out.push(GzipMember{
+            data: body,
+            name: header.name,
+            comment: header.comment,
+            modified: header.modified,
+            system: header.system,
+        })
+        at = trailer + 8
+    }
+    return out
+}
+
+/// The uncompressed contents of every member run together, which is what
+/// `zcat` prints.
+pub fn decode_all(data: bytes, limit: i64) -> bytes ! GzipError {
+    var out: [i64] = []
+    for member in try decode(data, limit) {
+        var i = 0
+        while i < member.data.len() {
+            out.push(member.data.at(i))
+            i = i + 1
+        }
+    }
+    return bytes_of(out)
+}
+
+fn push_u32(inout out: [i64], value: i64) {
+    var k = 0
+    while k < 4 {
+        out.push(value.ushr(k * 8).bit_and(255))
+        k = k + 1
+    }
+}
+
+/// `data` as a single-member `.gz`.
+///
+/// An empty `name` leaves the filename out rather than recording an empty
+/// one, and `modified` of 0 means "not recorded", both as the standard says.
+pub fn encode(data: bytes, name: str, modified: i64) -> bytes {
+    var out: [i64] = [31, 139, 8]
+    if name.len() > 0 {
+        out.push(8)
+    } else {
+        out.push(0)
+    }
+    push_u32(out, modified)
+    // No opinion about how hard the compressor tried, and an unknown system:
+    // recording one would make the output depend on where it was built.
+    out.push(0)
+    out.push(255)
+    if name.len() > 0 {
+        let raw = name.to_bytes()
+        var n = 0
+        while n < raw.len() {
+            out.push(raw.at(n))
+            n = n + 1
+        }
+        out.push(0)
+    }
+    let body = deflate.compress(data)
+    var i = 0
+    while i < body.len() {
+        out.push(body.at(i))
+        i = i + 1
+    }
+    push_u32(out, crc32.of(data))
+    push_u32(out, data.len() % 4294967296)
+    return bytes_of(out)
+}
+
+/// Whether `data` starts with the two bytes every `.gz` starts with.
+pub fn is_gzip(data: bytes) -> bool {
+    return data.len() >= 2 and data.at(0) == 31 and data.at(1) == 139
+}

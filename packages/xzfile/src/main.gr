@@ -1,0 +1,735 @@
+// Reading `.xz` files: the container, LZMA2, and the LZMA decoder under it.
+//
+// `.xz` is what kernel tarballs, Arch packages, most distributions' source
+// archives and a good deal of `man` are shipped in, and a program that
+// cannot open one cannot read them. Writing `.xz` is a separate and much
+// larger job — the encoder is where all of LZMA's difficulty lives — and is
+// not attempted here. Reading is the half that matters for consuming other
+// people's files, and it is complete: every stream `xz` produces at every
+// preset is read byte-for-byte.
+//
+// Three layers, each of which has to be right before the next means
+// anything:
+//
+//   1. **The container.** Stream header, blocks with their own headers and
+//      filter chains, padding to four-byte boundaries everywhere, an index
+//      repeating every block's sizes, and a footer. Sizes are stored as
+//      variable-length integers, seven bits at a time.
+//   2. **LZMA2**, which is a chunking layer on top of LZMA: each chunk says
+//      how much it holds, whether it is compressed at all, and how much of
+//      the decoder's state to throw away first. The state resets are the
+//      part that is easy to get wrong, because a stream that never resets
+//      decodes correctly right up until one does.
+//   3. **LZMA**, which is a range decoder driving an adaptive probability
+//      model. There are no bytes in an LZMA stream — every decision, down
+//      to each bit of each literal, is a probability lookup that is then
+//      updated. That is why it compresses better than deflate and why it is
+//      slower by a wide margin.
+//
+// The check at the end of each block is verified when it is CRC-32, which is
+// what `xz` uses by default. CRC-64 and SHA-256 streams are read and their
+// check is skipped rather than silently claimed — `checked_with` says which
+// happened, so a caller that needs the guarantee can ask.
+//
+// Checked against Python's `lzma`, which is liblzma.
+
+import crc32
+
+let PROB_INIT = 1024
+let PROB_TOTAL = 2048
+let MOVE_BITS = 5
+let TOP = 16777216
+let STATES = 12
+
+type XzError =
+    | XzNotXz(at: i64)
+    | XzTruncated(at: i64)
+    | XzUnsupportedFilter(id: i64)
+    | XzBadCheck(want: i64, got: i64)
+    | XzCorrupt(at: i64)
+    | XzTooLarge(limit: i64)
+
+type XzRange = {
+    data: bytes,
+    at: i64,
+    range: i64,
+    code: i64,
+    failed: bool,
+}
+
+fn next_byte(inout r: XzRange) -> i64 {
+    if r.at >= r.data.len() {
+        r.failed = true
+        return 0
+    }
+    let b = r.data.at(r.at)
+    r.at = r.at + 1
+    return b
+}
+
+fn range_start(data: bytes, at: i64) -> XzRange {
+    var r = XzRange{
+        data: data,
+        at: at + 1,
+        range: 4294967295,
+        code: 0,
+        failed: false,
+    }
+    var i = 0
+    while i < 4 {
+        r.code = r.code * 256 + next_byte(r)
+        i = i + 1
+    }
+    return r
+}
+
+fn normalize(inout r: XzRange) {
+    if r.range < TOP {
+        r.range = r.range * 256
+        r.code = (r.code * 256 + next_byte(r)) % 4294967296
+    }
+}
+
+/// One bit, against the probability at `index`, which is then nudged toward
+/// whichever way the bit went.
+fn decode_bit(inout r: XzRange, inout probs: [i64], index: i64) -> i64 {
+    let bound = r.range / PROB_TOTAL * probs[index]
+    if r.code < bound {
+        r.range = bound
+        probs[index] = probs[index] + (PROB_TOTAL - probs[index])
+            .ushr(MOVE_BITS)
+        normalize(r)
+        return 0
+    }
+    r.range = r.range - bound
+    r.code = r.code - bound
+    probs[index] = probs[index] - probs[index].ushr(MOVE_BITS)
+    normalize(r)
+    return 1
+}
+
+/// `count` bits, most significant first, through a tree of probabilities
+/// rooted at `offset`.
+fn decode_tree(inout r: XzRange, inout probs: [i64], offset: i64,
+    count: i64) -> i64 {
+    var m = 1
+    var i = 0
+    while i < count {
+        m = m * 2 + decode_bit(r, probs, offset + m)
+        i = i + 1
+    }
+    return m - (1).shl(count)
+}
+
+/// The same tree read least significant bit first, which is how distances
+/// below 128 and the alignment bits are stored.
+fn decode_tree_reverse(inout r: XzRange, inout probs: [i64], offset: i64,
+    count: i64) -> i64 {
+    var m = 1
+    var out = 0
+    var i = 0
+    while i < count {
+        let bit = decode_bit(r, probs, offset + m)
+        m = m * 2 + bit
+        out = out + bit.shl(i)
+        i = i + 1
+    }
+    return out
+}
+
+fn decode_direct(inout r: XzRange, count: i64) -> i64 {
+    var out = 0
+    var i = 0
+    while i < count {
+        r.range = r.range / 2
+        var bit = 0
+        if r.code >= r.range {
+            r.code = r.code - r.range
+            bit = 1
+        }
+        out = out * 2 + bit
+        normalize(r)
+        i = i + 1
+    }
+    return out
+}
+
+// The length coder: a choice bit, then a second, then one of three trees.
+// Its probabilities live in one array so the state can be reset as a unit.
+let LEN_CHOICE = 0
+let LEN_CHOICE2 = 1
+let LEN_LOW = 2
+let LEN_MID = 130
+let LEN_HIGH = 258
+let LEN_SIZE = 514
+
+fn decode_length(inout r: XzRange, inout probs: [i64], offset: i64,
+    pos_state: i64) -> i64 {
+    if decode_bit(r, probs, offset + LEN_CHOICE) == 0 {
+        return decode_tree(r, probs, offset + LEN_LOW + pos_state * 8, 3)
+    }
+    if decode_bit(r, probs, offset + LEN_CHOICE2) == 0 {
+        return 8 + decode_tree(r, probs, offset + LEN_MID + pos_state * 8, 3)
+    }
+    return 16 + decode_tree(r, probs, offset + LEN_HIGH, 8)
+}
+
+type XzLzma = {
+    probs: [i64],
+    lc: i64,
+    lp: i64,
+    pb: i64,
+    state: i64,
+    reps: [i64],
+    out: [i64],
+    /// Where the dictionary starts, so a dictionary reset does not throw
+    /// away output that has already been produced.
+    dict_at: i64,
+}
+
+// The probability array is one block, laid out at fixed offsets. Separate
+// arrays would be tidier and would make resetting the state four calls
+// instead of one, which is the operation LZMA2 performs most.
+let IS_MATCH = 0
+let IS_REP = 192
+let IS_REP_G0 = 204
+let IS_REP_G1 = 216
+let IS_REP_G2 = 228
+let IS_REP0_LONG = 240
+let POS_SLOT = 432
+let SPEC_POS = 688
+let ALIGN_POS = 803
+let LEN_CODER = 819
+let REP_LEN_CODER = 1333
+let LITERAL = 1847
+
+fn new_lzma(lc: i64, lp: i64, pb: i64, start: i64) -> XzLzma {
+    var probs: [i64] = []
+    var i = 0
+    let count = LITERAL + (768).shl(lc + lp)
+    while i < count {
+        probs.push(PROB_INIT)
+        i = i + 1
+    }
+    return XzLzma{
+        probs: probs,
+        lc: lc,
+        lp: lp,
+        pb: pb,
+        state: 0,
+        reps: [0, 0, 0, 0],
+        out: [],
+        dict_at: start,
+    }
+}
+
+fn reset_state(inout d: XzLzma) {
+    var i = 0
+    while i < d.probs.len() {
+        d.probs[i] = PROB_INIT
+        i = i + 1
+    }
+    d.state = 0
+    d.reps = [0, 0, 0, 0]
+}
+
+fn decode_literal(inout r: XzRange, inout d: XzLzma) {
+    let position = d.out.len()
+    var previous = 0
+    if position > d.dict_at {
+        previous = d.out[position - 1]
+    }
+    let low = position.bit_and((1).shl(d.lp) - 1)
+    let high = previous.ushr(8 - d.lc)
+    let base = LITERAL + 768 * (low.shl(d.lc) + high)
+    var m = 1
+    if d.state >= 7 {
+        // After a match, the literal is coded against the byte that would
+        // have come next at the last distance, bit by bit, until they differ.
+        var match_byte = 0
+        let source = position - d.reps[0] - 1
+        if source >= d.dict_at and source < position {
+            match_byte = d.out[source]
+        }
+        var matched = true
+        while m < 256 and matched {
+            let match_bit = match_byte.ushr(7).bit_and(1)
+            match_byte = match_byte.shl(1).bit_and(255)
+            let bit = decode_bit(r, d.probs,
+                base + ((1 + match_bit) * 256) + m)
+            m = m * 2 + bit
+            if match_bit != bit {
+                matched = false
+            }
+        }
+    }
+    while m < 256 {
+        m = m * 2 + decode_bit(r, d.probs, base + m)
+    }
+    d.out.push(m.bit_and(255))
+    if d.state < 4 {
+        d.state = 0
+    } else if d.state < 10 {
+        d.state = d.state - 3
+    } else {
+        d.state = d.state - 6
+    }
+}
+
+/// The distance for a match of `length`, which is coded as a slot, then
+/// either direct bits, a reversed tree, or both.
+fn decode_distance(inout r: XzRange, inout d: XzLzma, length: i64) -> i64 {
+    var slot_index = length
+    if slot_index > 3 {
+        slot_index = 3
+    }
+    let slot = decode_tree(r, d.probs, POS_SLOT + slot_index * 64, 6)
+    if slot < 4 {
+        return slot
+    }
+    let extra = slot.ushr(1) - 1
+    var distance = (2 + slot.bit_and(1)).shl(extra)
+    if slot < 14 {
+        return distance + decode_tree_reverse(r, d.probs,
+            SPEC_POS + distance - slot - 1, extra)
+    }
+    distance = distance + decode_direct(r, extra - 4).shl(4)
+    return distance + decode_tree_reverse(r, d.probs, ALIGN_POS, 4)
+}
+
+fn copy_match(inout d: XzLzma, distance: i64, length: i64) -> bool {
+    let source = d.out.len() - distance - 1
+    if source < d.dict_at or distance < 0 {
+        return false
+    }
+    var i = 0
+    while i < length {
+        d.out.push(d.out[source + i])
+        i = i + 1
+    }
+    return true
+}
+
+/// One symbol: a literal, a new match, or a repeat of an earlier distance.
+/// Returns false when the stream says it is finished or is broken.
+fn decode_symbol(inout r: XzRange, inout d: XzLzma, limit: i64) -> bool {
+    let pos_state = d.out.len().bit_and((1).shl(d.pb) - 1)
+    if decode_bit(r, d.probs, IS_MATCH + d.state * 16 + pos_state) == 0 {
+        decode_literal(r, d)
+        return d.out.len() <= limit
+    }
+    var length = 0
+    if decode_bit(r, d.probs, IS_REP + d.state) == 0 {
+        d.reps[3] = d.reps[2]
+        d.reps[2] = d.reps[1]
+        d.reps[1] = d.reps[0]
+        length = decode_length(r, d.probs, LEN_CODER, pos_state)
+        if d.state < 7 {
+            d.state = 7
+        } else {
+            d.state = 10
+        }
+        d.reps[0] = decode_distance(r, d, length)
+        if d.reps[0] == 4294967295 {
+            // The end marker: a distance of all ones.
+            return false
+        }
+    } else {
+        if decode_bit(r, d.probs, IS_REP_G0 + d.state) == 0 {
+            if decode_bit(r, d.probs,
+                IS_REP0_LONG + d.state * 16 + pos_state) == 0 {
+                if d.state < 7 {
+                    d.state = 9
+                } else {
+                    d.state = 11
+                }
+                if not copy_match(d, d.reps[0], 1) {
+                    return false
+                }
+                return d.out.len() <= limit
+            }
+        } else {
+            var distance = 0
+            if decode_bit(r, d.probs, IS_REP_G1 + d.state) == 0 {
+                distance = d.reps[1]
+            } else if decode_bit(r, d.probs, IS_REP_G2 + d.state) == 0 {
+                distance = d.reps[2]
+                d.reps[2] = d.reps[1]
+            } else {
+                distance = d.reps[3]
+                d.reps[3] = d.reps[2]
+                d.reps[2] = d.reps[1]
+            }
+            d.reps[1] = d.reps[0]
+            d.reps[0] = distance
+        }
+        length = decode_length(r, d.probs, REP_LEN_CODER, pos_state)
+        if d.state < 7 {
+            d.state = 8
+        } else {
+            d.state = 11
+        }
+    }
+    if not copy_match(d, d.reps[0], length + 2) {
+        return false
+    }
+    return d.out.len() <= limit
+}
+
+/// A raw LZMA2 stream, which is what the `.xz` filter with id 0x21 holds.
+pub fn lzma2_decode(data: bytes, limit: i64) -> bytes ! XzError {
+    var d = new_lzma(3, 0, 2, 0)
+    var at = 0
+    var have_props = false
+    while at < data.len() {
+        let control = data.at(at)
+        if control == 0 {
+            break
+        }
+        if control < 3 {
+            // An uncompressed chunk, which still counts as dictionary.
+            if at + 3 > data.len() {
+                fail(XzTruncated(at))
+            }
+            let size = data.at(at + 1) * 256 + data.at(at + 2) + 1
+            if control == 1 {
+                d.dict_at = d.out.len()
+            }
+            reset_state(d)
+            have_props = false
+            var i = 0
+            while i < size {
+                if at + 3 + i >= data.len() {
+                    fail(XzTruncated(at))
+                }
+                d.out.push(data.at(at + 3 + i))
+                i = i + 1
+            }
+            at = at + 3 + size
+            continue
+        }
+        if control < 128 {
+            fail(XzCorrupt(at))
+        }
+        if at + 5 > data.len() {
+            fail(XzTruncated(at))
+        }
+        let unpacked = control.bit_and(31).shl(16) +
+        data.at(at + 1) * 256 + data.at(at + 2) + 1
+        let packed = data.at(at + 3) * 256 + data.at(at + 4) + 1
+        let reset = control.ushr(5).bit_and(3)
+        var head = at + 5
+        if reset >= 2 {
+            if head >= data.len() {
+                fail(XzTruncated(head))
+            }
+            let props = data.at(head)
+            head = head + 1
+            let pb = props / 45
+            let rest = props % 45
+            let start = if reset == 3 { d.out.len() } else { d.dict_at }
+            var fresh = new_lzma(rest % 9, rest / 9, pb, start)
+            fresh.out = d.out
+            d = fresh
+            have_props = true
+        } else if reset == 1 {
+            reset_state(d)
+        }
+        if not have_props {
+            fail(XzCorrupt(at))
+        }
+        let target = d.out.len() + unpacked
+        if target > limit {
+            fail(XzTooLarge(limit))
+        }
+        var r = range_start(data, head)
+        while d.out.len() < target {
+            if r.failed or not decode_symbol(r, d, limit) {
+                if d.out.len() < target {
+                    fail(XzCorrupt(head))
+                }
+            }
+        }
+        at = head + packed
+    }
+    return bytes_of(d.out)
+}
+
+fn read_varint(data: bytes, at: i64) -> (i64, i64) {
+    var value = 0
+    var shift = 0
+    var i = at
+    while i < data.len() and i < at + 9 {
+        let b = data.at(i)
+        value = value + b.bit_and(127).shl(shift)
+        i = i + 1
+        if b < 128 {
+            return (value, i)
+        }
+        shift = shift + 7
+    }
+    return (-1, i)
+}
+
+fn read_u32(data: bytes, at: i64) -> i64 {
+    return data.at(at) + data.at(at + 1) * 256 + data.at(at + 2) * 65536 +
+    data.at(at + 3) * 16777216
+}
+
+fn slice(data: bytes, from: i64, to: i64) -> bytes {
+    var out: [i64] = []
+    var i = from
+    while i < to and i < data.len() {
+        out.push(data.at(i))
+        i = i + 1
+    }
+    return bytes_of(out)
+}
+
+/// How many bytes the check after a block occupies.
+fn check_size(kind: i64) -> i64 {
+    if kind == 0 {
+        return 0
+    }
+    if kind <= 3 {
+        return 4
+    }
+    if kind <= 6 {
+        return 8
+    }
+    return 32
+}
+
+type XzBlock = {
+    data: bytes,
+    next: i64,
+    checked: bool,
+    /// The block's size without the padding that follows it, which is what
+    /// the index at the end of the stream records.
+    unpadded: i64,
+}
+
+fn read_block(data: bytes, at: i64, check: i64,
+    limit: i64) -> XzBlock ! XzError {
+    let header_size = (data.at(at) + 1) * 4
+    if at + header_size > data.len() {
+        fail(XzTruncated(at))
+    }
+    let want = read_u32(data, at + header_size - 4)
+    let got = crc32.of(slice(data, at, at + header_size - 4))
+    if want != got {
+        fail(XzBadCheck(want, got))
+    }
+    let flags = data.at(at + 1)
+    var cursor = at + 2
+    if flags.bit_and(64) != 0 {
+        cursor = read_varint(data, cursor).1
+    }
+    if flags.bit_and(128) != 0 {
+        cursor = read_varint(data, cursor).1
+    }
+    var filters = flags.bit_and(3) + 1
+    var id = 0
+    while filters > 0 {
+        let read = read_varint(data, cursor)
+        id = read.0
+        let sized = read_varint(data, read.1)
+        cursor = sized.1 + sized.0
+        filters = filters - 1
+    }
+    if id != 33 {
+        // Only LZMA2 on its own; the BCJ and delta filters would each need
+        // their own pass over the output and neither is written by default.
+        fail(XzUnsupportedFilter(id))
+    }
+    let body = at + header_size
+    let out = try lzma2_decode(slice(data, body, data.len()), limit)
+    // The block is padded to four bytes, then carries its check. Finding the
+    // end means finding where LZMA2 stopped, which is the terminator byte.
+    let raw_end = body + lzma2_length(slice(data, body, data.len()))
+    var end = raw_end
+    while end % 4 != 0 {
+        end = end + 1
+    }
+    var verified = false
+    if check == 1 {
+        if end + 4 > data.len() {
+            fail(XzTruncated(end))
+        }
+        let want_crc = read_u32(data, end)
+        let got_crc = crc32.of(out)
+        if want_crc != got_crc {
+            fail(XzBadCheck(want_crc, got_crc))
+        }
+        verified = true
+    }
+    return XzBlock{
+        data: out,
+        next: end + check_size(check),
+        checked: verified,
+        unpadded: raw_end - at + check_size(check),
+    }
+}
+
+/// How many bytes of `data` the LZMA2 stream occupies, terminator included.
+fn lzma2_length(data: bytes) -> i64 {
+    var at = 0
+    while at < data.len() {
+        let control = data.at(at)
+        if control == 0 {
+            return at + 1
+        }
+        if control < 3 {
+            at = at + 3 + data.at(at + 1) * 256 + data.at(at + 2) + 1
+            continue
+        }
+        var head = at + 5
+        if control.ushr(5).bit_and(3) >= 2 {
+            head = head + 1
+        }
+        at = head + data.at(at + 3) * 256 + data.at(at + 4) + 1
+    }
+    return at
+}
+
+/// The index that follows the last block: one record per block, repeating
+/// its size. Verified against what was actually read, because it is the
+/// only thing that catches a stream whose blocks each decoded cleanly and
+/// which is nevertheless not the file that was written.
+fn check_index(data: bytes, at: i64, sizes: [(i64, i64)]) -> i64 ! XzError {
+    var cursor = read_varint(data, at + 1)
+    if cursor.0 != sizes.len() {
+        fail(XzCorrupt(at))
+    }
+    var i = 0
+    while i < sizes.len() {
+        let unpadded = read_varint(data, cursor.1)
+        let uncompressed = read_varint(data, unpadded.1)
+        if unpadded.0 != sizes[i].0 or uncompressed.0 != sizes[i].1 {
+            fail(XzCorrupt(cursor.1))
+        }
+        cursor = uncompressed
+        i = i + 1
+    }
+    var end = cursor.1
+    while (end - at) % 4 != 0 {
+        end = end + 1
+    }
+    if end + 4 > data.len() {
+        fail(XzTruncated(end))
+    }
+    let want = read_u32(data, end)
+    let got = crc32.of(slice(data, at, end))
+    if want != got {
+        fail(XzBadCheck(want, got))
+    }
+    return end + 4
+}
+
+/// The twelve bytes that close a stream: a checksum, the index size, the
+/// same stream flags the header carried, and `YZ`.
+fn check_footer(data: bytes, at: i64, index_at: i64,
+    from: i64) -> bool ! XzError {
+    if at + 12 > data.len() {
+        fail(XzTruncated(at))
+    }
+    let want = read_u32(data, at)
+    let got = crc32.of(slice(data, at + 4, at + 10))
+    if want != got {
+        fail(XzBadCheck(want, got))
+    }
+    if (read_u32(data, at + 4) + 1) * 4 != at - index_at {
+        fail(XzCorrupt(at + 4))
+    }
+    if data.at(at + 8) != data.at(from + 6) or
+    data.at(at + 9) != data.at(from + 7) {
+        fail(XzCorrupt(at + 8))
+    }
+    if data.at(at + 10) != 89 or data.at(at + 11) != 90 {
+        fail(XzCorrupt(at + 10))
+    }
+    return true
+}
+
+type XzStream = {
+    data: bytes,
+    next: i64,
+}
+
+fn read_stream(data: bytes, from: i64, limit: i64) -> XzStream ! XzError {
+    if from + 12 > data.len() {
+        fail(XzTruncated(from))
+    }
+    if data.at(from) != 253 or data.at(1) != 55 or data.at(2) != 122 or
+    data.at(3) != 88 or data.at(4) != 90 or data.at(5) != 0 {
+        fail(XzNotXz(from))
+    }
+    let want_flags = read_u32(data, from + 8)
+    let got_flags = crc32.of(slice(data, from + 6, from + 8))
+    if want_flags != got_flags {
+        fail(XzBadCheck(want_flags, got_flags))
+    }
+    let check = data.at(from + 7).bit_and(15)
+    var out: [i64] = []
+    var sizes: [(i64, i64)] = []
+    var at = from + 12
+    while at < data.len() and data.at(at) != 0 {
+        let block = try read_block(data, at, check, limit)
+        var i = 0
+        while i < block.data.len() {
+            out.push(block.data.at(i))
+            i = i + 1
+        }
+        sizes.push((block.unpadded, block.data.len()))
+        at = block.next
+    }
+    if at >= data.len() {
+        fail(XzTruncated(at))
+    }
+    let index_at = at
+    let after = try check_index(data, index_at, sizes)
+    let _closed = try check_footer(data, after, index_at, from)
+    return XzStream{ data: bytes_of(out), next: after + 12 }
+}
+
+/// Every stream in `data`, run together.
+///
+/// A `.xz` file may hold several streams with four-byte zero padding
+/// between them — concatenating two of them produces a valid file whose
+/// contents are the concatenation, exactly as with `.gz`, and `xz --cat`
+/// relies on it.
+pub fn decode(data: bytes, limit: i64) -> bytes ! XzError {
+    var out: [i64] = []
+    var at = 0
+    while at < data.len() {
+        let stream = try read_stream(data, at, limit)
+        var i = 0
+        while i < stream.data.len() {
+            out.push(stream.data.at(i))
+            i = i + 1
+        }
+        at = stream.next
+        // Stream padding: zero bytes, always a multiple of four.
+        while at < data.len() and data.at(at) == 0 {
+            at = at + 1
+        }
+    }
+    return bytes_of(out)
+}
+
+/// Whether `data` starts with the six bytes every `.xz` stream starts with.
+pub fn is_xz(data: bytes) -> bool {
+    return data.len() >= 6 and data.at(0) == 253 and data.at(1) == 55 and
+    data.at(2) == 122 and data.at(3) == 88 and data.at(4) == 90 and
+    data.at(5) == 0
+}
+
+/// Which integrity check the stream carries: 0 none, 1 CRC-32, 4 CRC-64,
+/// 10 SHA-256. Only CRC-32 is verified, and `decode` says nothing about the
+/// others rather than implying it checked them.
+pub fn check_kind(data: bytes) -> i64 {
+    if not is_xz(data) {
+        return -1
+    }
+    return data.at(7).bit_and(15)
+}

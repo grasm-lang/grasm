@@ -1,0 +1,163 @@
+// Compression that compresses: the encoder `zlib` did not have, the `.gz`
+// container around it, and a reader for `.xz`.
+import deflate
+import gzip
+import xzfile
+import zlib
+import crc32
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn repeated(text: str, times: i64) -> bytes {
+    var out = ""
+    var i = 0
+    while i < times {
+        out = out + text
+        i = i + 1
+    }
+    return out.to_bytes()
+}
+
+fn check_deflate(inout f: i64) / {io} {
+    let text = repeated("the quick brown fox jumps over the lazy dog ", 40)
+    let squeezed = deflate.compress(text)
+    say(f, "repetitive text gets much smaller",
+        squeezed.len() * 8 < text.len())
+    say(f, "and our own reader gets it back",
+        (zlib.inflate(squeezed, 100000) ?? "".to_bytes()).to_str() ==
+        text.to_str())
+    // The back-reference finder is the half that does the work; the Huffman
+    // coding on top is the smaller win.
+    say(f, "nearly all of it was found as back-references",
+        deflate.matched_bytes(text) * 10 > text.len() * 9)
+    // Data with nothing to find must not grow by more than a block header.
+    var noise: [i64] = []
+    var i = 0
+    while i < 4000 {
+        noise.push((i * 2654435761 + i / 7) % 251)
+        i = i + 1
+    }
+    let raw = bytes_of(noise)
+    say(f, "and data with nothing to find grows by at most five bytes",
+        deflate.compress(raw).len() <= raw.len() + 5)
+    say(f, "an empty input is still a valid stream",
+        (zlib.inflate(deflate.compress("".to_bytes()), 10) ??
+            "x".to_bytes()).len() == 0)
+    let wrapped = deflate.compress_zlib(text, zlib.adler32(text))
+    say(f, "the zlib wrapper announces deflate with a 32K window",
+        wrapped.at(0) == 120)
+    say(f, "and its header is a multiple of 31",
+        (wrapped.at(0) * 256 + wrapped.at(1)) % 31 == 0)
+}
+
+fn check_gzip(inout f: i64) / {io} {
+    let payload = repeated("log line, with a timestamp and a message\n", 50)
+    let file = gzip.encode(payload, "app.log", 1700000000)
+    say(f, "a .gz starts with 1f 8b", gzip.is_gzip(file))
+    let members = gzip.decode(file, 1000000) ?? []
+    say(f, "one member came back", members.len() == 1)
+    say(f, "with the bytes that went in",
+        members[0].data.to_str() == payload.to_str())
+    say(f, "and the filename the header recorded",
+        members[0].name == "app.log")
+    say(f, "and the time", members[0].modified == 1700000000)
+    // Concatenating two .gz files is a valid .gz holding both.
+    let both = gzip.encode("first\n".to_bytes(), "", 0)
+    var joined: [i64] = []
+    var i = 0
+    while i < both.len() {
+        joined.push(both.at(i))
+        i = i + 1
+    }
+    let second = gzip.encode("second\n".to_bytes(), "", 0)
+    var k = 0
+    while k < second.len() {
+        joined.push(second.at(k))
+        k = k + 1
+    }
+    say(f, "two .gz files run together read as two members",
+        (gzip.decode(bytes_of(joined), 100000) ?? []).len() == 2)
+    say(f, "and zcat would print both",
+        (gzip.decode_all(bytes_of(joined), 100000) ??
+            "".to_bytes()).to_str() == "first\nsecond\n")
+    // The trailer is the only integrity check a .gz has.
+    var broken: [i64] = []
+    var n = 0
+    while n < file.len() {
+        if n == file.len() - 5 {
+            broken.push(file.at(n).bit_xor(255))
+        } else {
+            broken.push(file.at(n))
+        }
+        n = n + 1
+    }
+    say(f, "a wrong checksum in the trailer is refused",
+        (gzip.decode(bytes_of(broken), 1000000) ?? []).len() == 0)
+    say(f, "and so is something that is not a .gz at all",
+        (gzip.decode("hello there".to_bytes(), 1000) ?? []).len() == 0)
+}
+
+fn check_xz(inout f: i64) / {io} {
+    // Written by `xz -6`, which is the default, holding
+    // "hello world\n". Its check is CRC-64, which is also the default and
+    // is read rather than verified -- `check_kind` is how a caller finds
+    // that out instead of assuming.
+    let file = bytes_of([253, 55, 122, 88, 90, 0, 0, 4, 230, 214, 180, 70, 2, 0, 33, 1, 22,
+        0, 0, 0, 116, 47, 229, 163, 1, 0, 11, 104, 101, 108, 108, 111, 32,
+        119, 111, 114, 108, 100, 10, 0, 161, 242, 255, 196, 106, 127, 191,
+        207, 0, 1, 36, 12, 166, 24, 216, 216, 31, 182, 243, 125, 1, 0, 0,
+        0, 0, 4, 89, 90])
+    say(f, "an .xz starts with fd 37 7a 58 5a 00", xzfile.is_xz(file))
+    say(f, "the default check is CRC-64", xzfile.check_kind(file) == 4)
+    say(f, "and it decodes to what went in",
+        (xzfile.decode(file, 100000) ?? "".to_bytes()).to_str() ==
+        "hello world\n")
+    var broken: [i64] = []
+    var i = 0
+    while i < file.len() {
+        if i == 2 {
+            broken.push(0)
+        } else {
+            broken.push(file.at(i))
+        }
+        i = i + 1
+    }
+    say(f, "a damaged magic is refused",
+        (xzfile.decode(bytes_of(broken), 100000) ?? "x".to_bytes())
+            .to_str() == "x")
+    say(f, "and so is a file that is not one",
+        (xzfile.decode("hello".to_bytes(), 100000) ?? "x".to_bytes())
+            .to_str() == "x")
+    say(f, "something that is not .xz says so",
+        xzfile.check_kind("hello".to_bytes()) == -1)
+}
+
+fn check_crc(inout f: i64) / {io} {
+    // The check both containers rely on, against the value everyone quotes.
+    say(f, "CRC-32 of \"123456789\" is 0xCBF43926",
+        crc32.of("123456789".to_bytes()) == 3421780262)
+    say(f, "and of nothing at all is zero",
+        crc32.of("".to_bytes()) == 0)
+}
+
+fn main() / {io} {
+    var f = 0
+
+    check_deflate(f)
+    check_gzip(f)
+    check_xz(f)
+    check_crc(f)
+
+    if f == 0 {
+        print("squeeze: every claim held")
+    } else {
+        print("squeeze: {f} failed")
+    }
+}

@@ -1,0 +1,24 @@
+[package]
+name = "squeeze_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.deflate]
+path = "../deflate"
+version = "^1.0.0"
+
+[dependencies.gzip]
+path = "../gzip"
+version = "^1.0.0"
+
+[dependencies.xzfile]
+path = "../xzfile"
+version = "^1.0.0"
+
+[dependencies.zlib]
+path = "../zlib"
+version = "^1.0.0"
+
+[dependencies.crc32]
+path = "../crc32"
+version = "^1.0.0"

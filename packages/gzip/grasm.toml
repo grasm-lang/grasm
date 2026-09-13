@@ -1,0 +1,18 @@
+[package]
+name = "gzip"
+version = "1.0.0"
+
+# Bytes in, bytes out. Opens nothing.
+capabilities = []
+
+[dependencies.zlib]
+path = "../zlib"
+version = "^1.0.0"
+
+[dependencies.deflate]
+path = "../deflate"
+version = "^1.0.0"
+
+[dependencies.crc32]
+path = "../crc32"
+version = "^1.0.0"

@@ -420,3 +420,20 @@ TLS client is not finished, there will be no `stripe` package that speaks the
 Stripe wire format to a socket nobody can open — that is a stub with a
 convincing name, and the rule against those is the reason this document
 exists.
+
+## Known incompleteness in the compression packages
+
+`deflate` writes fixed-Huffman blocks and stored blocks, and picks whichever
+is smaller. It does not write dynamic-Huffman blocks, which describe their
+own code tables and are where `zlib -9` spends its time; on the gate's own
+corpus that is 17.8 per cent of the input against `zlib`'s 13.8. Adding them
+needs the code-length alphabet, a Huffman code for that alphabet, and the
+run-length encoding of the lengths — three more pieces, each with its own
+edge cases, for roughly another quarter off text.
+
+`xzfile` reads and does not write. The LZMA encoder is a much larger job than
+the decoder — the decoder follows a specification, the encoder is a search
+problem — and nothing in the tree needs to produce `.xz`.
+
+Both are deliberate stopping points rather than oversights, written down here
+so nobody has to read the source to find out.

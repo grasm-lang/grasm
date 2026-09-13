@@ -1,0 +1,380 @@
+// Deflate, the compressing half. RFC 1951.
+//
+// `packages/zlib` could already read a deflate stream and could only write
+// one kind: stored blocks, which is deflate's word for "no compression". So
+// every producer in the tree — `gzip`, `zip`, `png` — could emit a file
+// other tools accept and none of them made it smaller. That is a strange
+// thing for a compression library to do and this fixes it.
+//
+// Three pieces, none of them optional:
+//
+//   1. **A back-reference finder.** Deflate's compression is entirely "this
+//      run of bytes appeared N bytes ago, M long"; the Huffman coding on top
+//      is a second, smaller win. Matches are found through a hash of three
+//      bytes chained back through the window, and the chain is walked a
+//      bounded number of times because the unbounded version is quadratic
+//      on the inputs that matter most — long runs of one byte.
+//   2. **A bit writer that packs the way deflate packs.** This is where
+//      implementations break. Ordinary bit fields go in least significant
+//      bit first; Huffman codes go in most significant bit first. Both, in
+//      the same stream, into the same bytes. Getting one of them backwards
+//      produces a stream that starts decoding and then fails somewhere in
+//      the middle, which is the hardest kind of wrong to read.
+//   3. **A choice per block.** Fixed Huffman codes cost nothing to describe
+//      and are close to optimal for text; a stored block is smaller than
+//      either for data that does not compress. Both are emitted and the
+//      smaller one is kept, so the output is never larger than the input by
+//      more than the five bytes a stored block costs.
+//
+// What is deliberately not here is dynamic Huffman blocks, which describe
+// their own code tables and are what `zlib -9` spends its time on. They are
+// worth perhaps another ten per cent on text and they need the code-length
+// alphabet, its own Huffman code, and the run-length encoding of that; the
+// note in `docs/ecosystem-roadmap.md` says so rather than this pretending to
+// be finished.
+//
+// Checked by decompressing everything it writes with Python's `zlib`, which
+// is the reference implementation.
+
+let WINDOW = 32768
+let MIN_MATCH = 3
+let MAX_MATCH = 258
+let HASH_SIZE = 16384
+let MAX_CHAIN = 64
+
+type DeflateBits = {
+    out: [i64],
+    partial: i64,
+    filled: i64,
+}
+
+fn new_bits() -> DeflateBits {
+    return DeflateBits{ out: [], partial: 0, filled: 0 }
+}
+
+/// `count` bits of `value`, least significant first, which is how deflate
+/// writes everything that is not a Huffman code.
+fn put_bits(inout b: DeflateBits, value: i64, count: i64) {
+    var left = count
+    var v = value
+    while left > 0 {
+        b.partial = b.partial.bit_or(v.bit_and(1).shl(b.filled))
+        b.filled = b.filled + 1
+        v = v.ushr(1)
+        left = left - 1
+        if b.filled == 8 {
+            b.out.push(b.partial)
+            b.partial = 0
+            b.filled = 0
+        }
+    }
+}
+
+/// A Huffman code, most significant bit first, which is how deflate writes
+/// those and only those.
+fn put_code(inout b: DeflateBits, code: i64, count: i64) {
+    var left = count
+    while left > 0 {
+        b.partial = b.partial.bit_or(code.ushr(left - 1).bit_and(1)
+                .shl(b.filled))
+        b.filled = b.filled + 1
+        left = left - 1
+        if b.filled == 8 {
+            b.out.push(b.partial)
+            b.partial = 0
+            b.filled = 0
+        }
+    }
+}
+
+fn align(inout b: DeflateBits) {
+    if b.filled > 0 {
+        b.out.push(b.partial)
+        b.partial = 0
+        b.filled = 0
+    }
+}
+
+/// The length codes, 257..285, as (first length, extra bits).
+fn length_base() -> [i64] {
+    return [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43,
+        51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258]
+}
+
+fn length_extra() -> [i64] {
+    return [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4,
+        4, 4, 5, 5, 5, 5, 0]
+}
+
+/// The distance codes, 0..29, as (first distance, extra bits).
+fn distance_base() -> [i64] {
+    return [1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257,
+        385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289,
+        16385, 24577]
+}
+
+fn distance_extra() -> [i64] {
+    return [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9,
+        10, 10, 11, 11, 12, 12, 13, 13]
+}
+
+/// A literal or length symbol in the fixed code, as (code, bit count).
+fn fixed_literal(symbol: i64) -> (i64, i64) {
+    if symbol < 144 {
+        return (48 + symbol, 8)
+    }
+    if symbol < 256 {
+        return (400 + symbol - 144, 9)
+    }
+    if symbol < 280 {
+        return (symbol - 256, 7)
+    }
+    return (192 + symbol - 280, 8)
+}
+
+fn length_code_for(length: i64) -> i64 {
+    let base = length_base()
+    var i = 28
+    while i > 0 and base[i] > length {
+        i = i - 1
+    }
+    return i
+}
+
+fn distance_code_for(distance: i64) -> i64 {
+    let base = distance_base()
+    var i = 29
+    while i > 0 and base[i] > distance {
+        i = i - 1
+    }
+    return i
+}
+
+fn hash_at(data: bytes, at: i64) -> i64 {
+    if at + 2 >= data.len() {
+        return -1
+    }
+    let mixed = data.at(at) * 65536 + data.at(at + 1) * 256 + data.at(at + 2)
+    return mixed * 2654435761 % HASH_SIZE
+}
+
+/// How far the bytes at `a` and `b` agree, up to the longest match deflate
+/// can name.
+fn run_length(data: bytes, a: i64, b: i64) -> i64 {
+    var n = 0
+    while n < MAX_MATCH and b + n < data.len() and
+    data.at(a + n) == data.at(b + n) {
+        n = n + 1
+    }
+    return n
+}
+
+type DeflateMatch = {
+    distance: i64,
+    length: i64,
+}
+
+/// The longest back-reference for the bytes at `at`, or a length below the
+/// minimum when there is none worth naming.
+fn find_match(data: bytes, at: i64, heads: Map[i64, i64],
+    previous: [i64]) -> DeflateMatch {
+    var best = DeflateMatch{ distance: 0, length: 0 }
+    let key = hash_at(data, at)
+    if key < 0 {
+        return best
+    }
+    var candidate = heads.get(key) ?? -1
+    var tries = 0
+    while candidate >= 0 and tries < MAX_CHAIN {
+        let distance = at - candidate
+        if distance > WINDOW or distance <= 0 {
+            break
+        }
+        let length = run_length(data, candidate, at)
+        if length > best.length {
+            best = DeflateMatch{ distance: distance, length: length }
+            if length >= MAX_MATCH {
+                break
+            }
+        }
+        candidate = previous[candidate]
+        tries = tries + 1
+    }
+    if best.length < MIN_MATCH {
+        return DeflateMatch{ distance: 0, length: 0 }
+    }
+    return best
+}
+
+/// The whole input as literals and back-references, in order.
+///
+/// A symbol is `(literal, 0)` or `(length, distance)`, which is enough for
+/// both the size estimate and the encoder without carrying a type around.
+fn to_symbols(data: bytes) -> [(i64, i64)] {
+    var symbols: [(i64, i64)] = []
+    var heads: Map[i64, i64] = {}
+    var previous: [i64] = []
+    var i = 0
+    while i < data.len() {
+        previous.push(-1)
+        i = i + 1
+    }
+    var at = 0
+    while at < data.len() {
+        let found = find_match(data, at, heads, previous)
+        let key = hash_at(data, at)
+        if key >= 0 {
+            previous[at] = heads.get(key) ?? -1
+            heads.set(key, at)
+        }
+        if found.length >= MIN_MATCH {
+            symbols.push((found.length, found.distance))
+            // Every position inside a match still has to enter the chain, or
+            // the next match search cannot see across it.
+            var step = 1
+            while step < found.length and at + step < data.len() {
+                let inner = hash_at(data, at + step)
+                if inner >= 0 {
+                    previous[at + step] = heads.get(inner) ?? -1
+                    heads.set(inner, at + step)
+                }
+                step = step + 1
+            }
+            at = at + found.length
+        } else {
+            symbols.push((data.at(at), 0))
+            at = at + 1
+        }
+    }
+    return symbols
+}
+
+/// What the fixed-code block would cost, in bits, without writing it.
+fn fixed_cost(symbols: [(i64, i64)]) -> i64 {
+    let extra = length_extra()
+    let distance_bits = distance_extra()
+    var bits = 7
+    for symbol in symbols {
+        if symbol.1 == 0 {
+            bits = bits + fixed_literal(symbol.0).1
+        } else {
+            let code = length_code_for(symbol.0)
+            bits = bits + fixed_literal(257 + code).1 + extra[code]
+            bits = bits + 5 + distance_bits[distance_code_for(symbol.1)]
+        }
+    }
+    return bits
+}
+
+fn write_fixed(inout b: DeflateBits, symbols: [(i64, i64)], last: bool) {
+    let lengths = length_base()
+    let extra = length_extra()
+    let distances = distance_base()
+    let distance_bits = distance_extra()
+    if last {
+        put_bits(b, 1, 1)
+    } else {
+        put_bits(b, 0, 1)
+    }
+    put_bits(b, 1, 2)
+    for symbol in symbols {
+        if symbol.1 == 0 {
+            let code = fixed_literal(symbol.0)
+            put_code(b, code.0, code.1)
+            continue
+        }
+        let length_code = length_code_for(symbol.0)
+        let written = fixed_literal(257 + length_code)
+        put_code(b, written.0, written.1)
+        put_bits(b, symbol.0 - lengths[length_code], extra[length_code])
+        let distance_code = distance_code_for(symbol.1)
+        put_code(b, distance_code, 5)
+        put_bits(b, symbol.1 - distances[distance_code],
+            distance_bits[distance_code])
+    }
+    let stop = fixed_literal(256)
+    put_code(b, stop.0, stop.1)
+}
+
+/// Stored blocks: a header, a length, its complement, and the bytes.
+fn write_stored(inout b: DeflateBits, data: bytes) {
+    var at = 0
+    if data.len() == 0 {
+        put_bits(b, 1, 1)
+        put_bits(b, 0, 2)
+        align(b)
+        put_bits(b, 0, 16)
+        put_bits(b, 65535, 16)
+        return
+    }
+    while at < data.len() {
+        var take = data.len() - at
+        if take > 65535 {
+            take = 65535
+        }
+        let last = at + take >= data.len()
+        if last {
+            put_bits(b, 1, 1)
+        } else {
+            put_bits(b, 0, 1)
+        }
+        put_bits(b, 0, 2)
+        align(b)
+        put_bits(b, take, 16)
+        put_bits(b, 65535 - take, 16)
+        var i = 0
+        while i < take {
+            b.out.push(data.at(at + i))
+            i = i + 1
+        }
+        at = at + take
+    }
+}
+
+/// `data` as a raw deflate stream, RFC 1951.
+///
+/// Whichever of a fixed-Huffman block and a stored block is smaller wins, so
+/// incompressible input costs five bytes rather than growing.
+pub fn compress(data: bytes) -> bytes {
+    let symbols = to_symbols(data)
+    let coded = (fixed_cost(symbols) + 7) / 8
+    let stored = 5 * ((data.len() + 65534) / 65535) + data.len()
+    var bits = new_bits()
+    if data.len() > 0 and coded < stored {
+        write_fixed(bits, symbols, true)
+    } else {
+        write_stored(bits, data)
+    }
+    align(bits)
+    return bytes_of(bits.out)
+}
+
+/// The same stream wrapped as zlib, RFC 1950: two header bytes and an Adler
+/// checksum of the uncompressed data.
+pub fn compress_zlib(data: bytes, adler: i64) -> bytes {
+    var out: [i64] = [120, 156]
+    let body = compress(data)
+    var i = 0
+    while i < body.len() {
+        out.push(body.at(i))
+        i = i + 1
+    }
+    var k = 3
+    while k >= 0 {
+        out.push(adler.ushr(k * 8).bit_and(255))
+        k = k - 1
+    }
+    return bytes_of(out)
+}
+
+/// How many bytes the back-reference finder managed to remove, which is the
+/// number worth asserting on: the Huffman coding is the smaller half.
+pub fn matched_bytes(data: bytes) -> i64 {
+    var total = 0
+    for symbol in to_symbols(data) {
+        if symbol.1 != 0 {
+            total = total + symbol.0
+        }
+    }
+    return total
+}

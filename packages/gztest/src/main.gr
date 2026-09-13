@@ -1,0 +1,53 @@
+import gzip
+
+fn from_hex(text: str) -> bytes {
+    var out: [i64] = []
+    var i = 1
+    while i + 1 < text.len() {
+        out.push(text.substr(i, 2).parse_int_base(16) ?? 0)
+        i = i + 2
+    }
+    return bytes_of(out)
+}
+
+fn to_hex(raw: bytes) -> str {
+    let digits = "0123456789abcdef"
+    var out = ""
+    var i = 0
+    while i < raw.len() {
+        out = out + digits.substr(raw.at(i) / 16, 1) +
+        digits.substr(raw.at(i) % 16, 1)
+        i = i + 1
+    }
+    return out
+}
+
+fn describe(data: bytes) -> str / {io} {
+    match gzip.decode(data, 4000000) {
+        Err(_e) -> return "error"
+        Ok(members) -> {
+            var parts: [str] = []
+            for member in members {
+                parts.push(to_hex(member.data) + "|" + member.name + "|" +
+                    member.modified.to_str() + "|" + member.comment)
+            }
+            return parts.join(" ")
+        }
+    }
+}
+
+fn main() / {io} {
+    var i = 0
+    while i + 1 < args().len() {
+        let what = args()[i]
+        if what == "read" {
+            print(describe(from_hex(args()[i + 1])))
+            i = i + 2
+            continue
+        }
+        // `write <name> <data>`
+        print(to_hex(gzip.encode(from_hex(args()[i + 2]),
+            args()[i + 1].substr(1, args()[i + 1].len() - 1), 0)))
+        i = i + 3
+    }
+}
