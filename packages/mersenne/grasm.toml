@@ -1,0 +1,6 @@
+[package]
+name = "mersenne"
+version = "1.0.0"
+
+# Arithmetic on an array. Opens nothing.
+capabilities = []

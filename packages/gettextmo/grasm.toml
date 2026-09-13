@@ -1,0 +1,6 @@
+[package]
+name = "gettextmo"
+version = "1.0.0"
+
+# Parses bytes it is handed. Opens no files.
+capabilities = []

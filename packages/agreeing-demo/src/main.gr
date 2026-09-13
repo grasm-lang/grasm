@@ -1,0 +1,188 @@
+// Two packages that exist to agree with somebody else: the generator whose
+// numbers other languages produce, and the catalogues every translation in
+// the world is stored in.
+import mersenne
+import gettextmo
+import random
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn check_mersenne(inout f: i64) / {io} {
+    // What `random.seed(0); random.getrandbits(32)` gives in Python.
+    var r = mersenne.python_seeded(0)
+    say(f, "seed 0 gives 3626764237 first",
+        mersenne.next_u32(r) == 3626764237)
+    say(f, "then 1654615998", mersenne.next_u32(r) == 1654615998)
+    // The reference init_genrand, which is a different seeding and a
+    // different stream from the same algorithm.
+    var reference = mersenne.seeded(5489)
+    say(f, "the reference seed gives 3499211612",
+        mersenne.next_u32(reference) == 3499211612)
+    say(f, "an integer seed becomes 32-bit words, least significant first",
+        mersenne.python_key(4294967297) == [1, 1])
+    say(f, "and zero becomes a single zero word",
+        mersenne.python_key(0) == [0])
+    say(f, "a negative seed is used by its magnitude",
+        mersenne.python_key(0 - 7) == [7])
+    var counts = mersenne.python_seeded(1)
+    var below = 0
+    var i = 0
+    while i < 200 {
+        if mersenne.below(counts, 10) >= 10 {
+            below = below + 1
+        }
+        i = i + 1
+    }
+    say(f, "nothing below ten comes back ten or more", below == 0)
+    var doubles = mersenne.python_seeded(2)
+    let first = mersenne.next_double(doubles)
+    say(f, "a double lands in [0, 1)", first >= 0.0 and first < 1.0)
+    // The other generator is still the one to use when agreement is not
+    // the point.
+    var other = random.seeded(1)
+    say(f, "and the tree's own generator is a different one",
+        random.next(other) != 0)
+}
+
+fn english() -> bytes {
+    // A catalogue written by hand, little-endian, with a header, a plain
+    // message, a plural pair and a message with a context.
+    let header = "Content-Type: text/plain; charset=UTF-8\nLanguage: en\n" +
+    "Plural-Forms: nplurals=2; plural=(n != 1);\n"
+    var keys: [str] = ["", "Cancel", "file\u{0}files", "menu\u{4}Open"]
+    var values: [str] = [header, "Cancel", "file\u{0}files", "Open"]
+    var out: [i64] = []
+    // Magic, read little-endian whichever way the rest is packed.
+    for byte in [222, 18, 4, 149] {
+        out.push(byte)
+    }
+    let count = keys.len()
+    let table = 28
+    push_u32(out, 0)
+    push_u32(out, count)
+    push_u32(out, table)
+    push_u32(out, table + count * 8)
+    push_u32(out, 0)
+    push_u32(out, 0)
+    let pool = table + count * 16
+    var offsets: [i64] = []
+    var at = pool
+    for text in keys {
+        offsets.push(at)
+        at = at + text.to_bytes().len() + 1
+    }
+    for text in values {
+        offsets.push(at)
+        at = at + text.to_bytes().len() + 1
+    }
+    var k = 0
+    while k < count {
+        push_u32(out, keys[k].to_bytes().len())
+        push_u32(out, offsets[k])
+        k = k + 1
+    }
+    k = 0
+    while k < count {
+        push_u32(out, values[k].to_bytes().len())
+        push_u32(out, offsets[count + k])
+        k = k + 1
+    }
+    for text in keys {
+        push_text(out, text)
+    }
+    for text in values {
+        push_text(out, text)
+    }
+    return bytes_of(out)
+}
+
+fn push_u32(inout out: [i64], value: i64) {
+    var k = 0
+    while k < 4 {
+        out.push(value.ushr(k * 8).bit_and(255))
+        k = k + 1
+    }
+}
+
+fn push_text(inout out: [i64], text: str) {
+    let raw = text.to_bytes()
+    var i = 0
+    while i < raw.len() {
+        out.push(raw.at(i))
+        i = i + 1
+    }
+    out.push(0)
+}
+
+fn check_gettextmo(inout f: i64) / {io} {
+    let catalogue: MoCatalogue ! MoError = gettextmo.decode(english())
+    match catalogue {
+        Err(_e) -> {
+            say(f, "the catalogue parses", false)
+            return
+        }
+        Ok(c) -> {
+            say(f, "the catalogue parses", true)
+            say(f, "a message comes back", gettextmo.get(c, "Cancel") ==
+                "Cancel")
+            say(f, "an untranslated one comes back as itself",
+                gettextmo.get(c, "Nothing") == "Nothing")
+            say(f, "the header says which language",
+                gettextmo.header(c, "Language") == Some("en"))
+            say(f, "and how many plural forms", c.plural_count == 2)
+            say(f, "one file is singular",
+                gettextmo.get_plural(c, "file", "files", 1) == "file")
+            say(f, "and two are plural",
+                gettextmo.get_plural(c, "file", "files", 2) == "files")
+            say(f, "and zero is plural in English",
+                gettextmo.get_plural(c, "file", "files", 0) == "files")
+            say(f, "a message with a context is found by it",
+                gettextmo.get_in_context(c, "menu", "Open") == "Open")
+            say(f, "and is not found without it",
+                gettextmo.get(c, "Open") == "Open")
+        }
+    }
+    // The rule is a C expression and languages differ wildly; Polish has
+    // three forms and the boundaries are not where anyone would guess.
+    let polish = "(n==1 ? 0 : n%10>=2 && n%10<=4 && (n%100<10 || " +
+    "n%100>=20) ? 1 : 2)"
+    say(f, "Polish puts 1 in the first form",
+        gettextmo.evaluate(polish, 1) == 0)
+    say(f, "22 in the second", gettextmo.evaluate(polish, 22) == 1)
+    say(f, "12 in the third", gettextmo.evaluate(polish, 12) == 2)
+    say(f, "and 0 in the third too", gettextmo.evaluate(polish, 0) == 2)
+    say(f, "Japanese has one form for everything",
+        gettextmo.evaluate("0", 7) == 0)
+    say(f, "and something that is not a mo file is refused",
+        (gettextmo.decode("hello there".to_bytes()) ?? c_empty())
+            .entries.len() == 0)
+}
+
+fn c_empty() -> MoCatalogue {
+    return MoCatalogue{
+        entries: {},
+        headers: {},
+        plural_count: 1,
+        plural_rule: "0",
+    }
+}
+
+fn main() / {io} {
+    var f = 0
+
+    check_mersenne(f)
+    check_gettextmo(f)
+
+    if f == 0 {
+        print("agreeing: every claim held")
+    } else {
+        print("agreeing: {f} failed")
+    }
+}

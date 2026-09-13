@@ -1,0 +1,33 @@
+import mersenne
+
+fn main() / {io} {
+    var i = 0
+    while i + 2 < args().len() {
+        let what = args()[i]
+        let seed = args()[i + 1].parse_int() ?? 0
+        let count = args()[i + 2].parse_int() ?? 0
+        var r = mersenne.python_seeded(seed)
+        var parts: [str] = []
+        var k = 0
+        while k < count {
+            if what == "bits32" {
+                parts.push(mersenne.next_u32(r).to_str())
+            } else if what == "bits7" {
+                parts.push(mersenne.next_bits(r, 7).to_str())
+            } else if what == "bits53" {
+                parts.push(mersenne.next_bits(r, 53).to_str())
+            } else if what == "below" {
+                parts.push(mersenne.below(r, 1000).to_str())
+            } else {
+                // Doubles compared as the 53-bit integer they came from, so
+                // the comparison does not depend on how either side prints
+                // a float.
+                parts.push((mersenne.next_double(r) *
+                    9007199254740992.0).round().as_i64().to_str())
+            }
+            k = k + 1
+        }
+        print(parts.join(","))
+        i = i + 3
+    }
+}

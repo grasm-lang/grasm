@@ -9,6 +9,20 @@ migration note here; anything `experimental` may change in any release. See
 
 ### Added
 
+- **Two packages whose whole purpose is agreeing with somebody else.**
+  `mersenne` is MT19937 — a worse generator than the xoshiro256** `random`
+  already has, and the only right answer when a paper says "seeded with
+  12345" or a fixture came out of a Python script, because "random" in those
+  sentences means this exact algorithm. Seeding is what differs between
+  languages, not the generator, so `python_seeded` reproduces what
+  `random.seed(n)` does. `gettextmo` reads compiled `.mo` catalogues, which
+  is what `msgfmt` produces and what every translation that exists is stored
+  in: both byte orders, contexts and plurals hidden inside the key, and the
+  `Plural-Forms` rule evaluated as the C expression it is — Japanese has one
+  form, English two, Polish three, Arabic six, and a reader that hardcodes
+  "one or many" is wrong for most of the world. 1,356 cases against Python's
+  `random` and `gettext`: `mersennediff` and `gettextdiff` are gates.
+
 - **Two more ways to write Japanese, and the country table.** `eucjp` is the
   Unix encoding of JIS X 0208 — every byte of a multi-byte character has its
   high bit set, which is the property Shift-JIS gives up and the argument

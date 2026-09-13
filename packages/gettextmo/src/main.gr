@@ -1,0 +1,380 @@
+// Compiled translation catalogues: the `.mo` files gettext reads.
+//
+// `packages/i18n` can hold a catalogue that a program builds at startup.
+// Every translation that exists in the world is in a `.mo` file instead,
+// produced by `msgfmt` from a `.po` that a translator edited, and a program
+// that cannot read one cannot use any of them.
+//
+// The format is deliberately dull — two tables of (length, offset) pairs and
+// a string pool — and three things in it are not:
+//
+//   1. **Byte order is announced, not assumed.** The magic number is
+//      0x950412DE one way round and 0xDE120495 the other, and which one a
+//      file uses depends on the machine `msgfmt` ran on. A reader that
+//      handles one of them works until somebody hands it a file from the
+//      other kind of machine.
+//   2. **Context and plurals hide inside the key.** A message with a context
+//      is stored as `context`, a `0x04` byte, then the message; a message
+//      with plurals is stored as the singular, a NUL, then the plural, and
+//      its translation is every plural form separated by NULs. Nothing in
+//      the header says which a given entry is — the separators are the only
+//      signal.
+//   3. **The plural rule is a C expression in a header string.** A catalogue
+//      says `nplurals=3; plural=(n%10==1 && n%100!=11 ? 0 : ...)` and means
+//      it: picking the right form requires evaluating that. Languages differ
+//      wildly — Japanese has one form, English two, Polish three, Arabic six
+//      — so a reader that hardcodes "one or many" is wrong for most of the
+//      world's users, which is an unusual way to fail at internationalising
+//      something.
+//
+// Checked against Python's `gettext.GNUTranslations` over catalogues
+// `msgfmt` produced, in both byte orders.
+
+type MoError =
+    | MoNotMo(magic: i64)
+    | MoTruncated(at: i64)
+    | MoBadOffset(at: i64)
+
+    /// A catalogue, ready to be looked up in.
+type MoCatalogue = {
+    /// Key to translation, with plural forms joined by NUL as stored.
+    entries: Map[str, str],
+    /// The metadata from the empty-key entry, parsed into a map.
+    headers: Map[str, str],
+    /// How many plural forms this language has.
+    plural_count: i64,
+    /// The expression that chooses between them, as written.
+    plural_rule: str,
+}
+
+fn read_u32(data: bytes, at: i64, big: bool) -> i64 {
+    if big {
+        return data.at(at) * 16777216 + data.at(at + 1) * 65536 +
+        data.at(at + 2) * 256 + data.at(at + 3)
+    }
+    return data.at(at) + data.at(at + 1) * 256 + data.at(at + 2) * 65536 +
+    data.at(at + 3) * 16777216
+}
+
+fn slice_text(data: bytes, from: i64, length: i64) -> str {
+    var out: [i64] = []
+    var i = 0
+    while i < length and from + i < data.len() {
+        out.push(data.at(from + i))
+        i = i + 1
+    }
+    return bytes_of(out).to_str()
+}
+
+/// The `Name: value` lines in the empty-key entry.
+fn read_headers(text: str) -> Map[str, str] {
+    var out: Map[str, str] = {}
+    for line in text.split("\n") {
+        let cut = line.index_of(":") ?? -1
+        if cut < 0 {
+            continue
+        }
+        out.set(line.substr(0, cut).trim(),
+            line.substr(cut + 1, line.len() - cut - 1).trim())
+    }
+    return out
+}
+
+/// `nplurals` and the `plural=` expression out of the `Plural-Forms` header.
+fn read_plural_forms(header: str) -> (i64, str) {
+    var count = 2
+    var rule = "n != 1"
+    for piece in header.split(";") {
+        let part = piece.trim()
+        if part.starts_with("nplurals") {
+            let cut = part.index_of("=") ?? -1
+            if cut >= 0 {
+                count = part.substr(cut + 1, part.len() - cut - 1).trim()
+                    .parse_int() ?? 2
+            }
+        } else if part.starts_with("plural") {
+            let cut = part.index_of("=") ?? -1
+            if cut >= 0 {
+                rule = part.substr(cut + 1, part.len() - cut - 1).trim()
+            }
+        }
+    }
+    return (count, rule)
+}
+
+/// A `.mo` file.
+pub fn decode(data: bytes) -> MoCatalogue ! MoError {
+    if data.len() < 20 {
+        fail(MoTruncated(0))
+    }
+    let little = read_u32(data, 0, false)
+    var big = false
+    if little == 2500072158 {
+        big = false
+    } else if little == 3725722773 {
+        big = true
+    } else {
+        fail(MoNotMo(little))
+    }
+    let count = read_u32(data, 8, big)
+    let originals = read_u32(data, 12, big)
+    let translations = read_u32(data, 16, big)
+    var entries: Map[str, str] = {}
+    var i = 0
+    while i < count {
+        let key_at = originals + i * 8
+        let value_at = translations + i * 8
+        if key_at + 8 > data.len() or value_at + 8 > data.len() {
+            fail(MoTruncated(key_at))
+        }
+        let key_length = read_u32(data, key_at, big)
+        let key_offset = read_u32(data, key_at + 4, big)
+        let value_length = read_u32(data, value_at, big)
+        let value_offset = read_u32(data, value_at + 4, big)
+        if key_offset + key_length > data.len() or
+        value_offset + value_length > data.len() {
+            fail(MoBadOffset(key_at))
+        }
+        entries.set(slice_text(data, key_offset, key_length),
+            slice_text(data, value_offset, value_length))
+        i = i + 1
+    }
+    let metadata = entries.get("") ?? ""
+    let headers = read_headers(metadata)
+    let forms = read_plural_forms(headers.get("Plural-Forms") ?? "")
+    return MoCatalogue{
+        entries: entries,
+        headers: headers,
+        plural_count: forms.0,
+        plural_rule: forms.1,
+    }
+}
+
+/// The translation for `key`, or `key` itself when there is none — which is
+/// what gettext does and why an untranslated program still reads.
+pub fn get(c: MoCatalogue, key: str) -> str {
+    match c.entries.get(key) {
+        Some(text) -> return text
+        None -> return key
+    }
+}
+
+/// The translation for `key` in `context`, which is how two identical words
+/// with different meanings are told apart.
+pub fn get_in_context(c: MoCatalogue, context: str, key: str) -> str {
+    match c.entries.get(context + "\u{4}" + key) {
+        Some(text) -> return text
+        None -> return key
+    }
+}
+
+/// The right plural form for `n`, by evaluating the catalogue's own rule.
+pub fn get_plural(c: MoCatalogue, singular: str, plural: str,
+    n: i64) -> str {
+    let key = singular + "\u{0}" + plural
+    match c.entries.get(key) {
+        Some(text) -> {
+            let forms = text.split("\u{0}")
+            var which = evaluate(c.plural_rule, n)
+            if which < 0 or which >= forms.len() {
+                which = 0
+            }
+            return forms[which]
+        }
+        None -> {
+            if n == 1 {
+                return singular
+            }
+            return plural
+        }
+    }
+}
+
+/// Every key in the catalogue, the metadata entry included.
+pub fn keys(c: MoCatalogue) -> [str] {
+    var out: [str] = []
+    for key in c.entries.keys() {
+        out.push(key)
+    }
+    out.sort()
+    return out
+}
+
+/// One value from the metadata, such as `Content-Type` or `Language`.
+pub fn header(c: MoCatalogue, name: str) -> Option[str] {
+    return c.headers.get(name)
+}
+
+// ---- The plural expression.
+//
+// A C conditional expression over one variable. Small enough to parse with
+// precedence climbing and not small enough to guess at: `n%10==1 &&
+// n%100!=11 ? 0 : 1` needs `%` above `==` above `&&` above `?:`, and getting
+// the order wrong gives an answer that is right for n=1 and wrong later.
+
+type MoParser = {
+    text: str,
+    at: i64,
+    n: i64,
+}
+
+fn skip_spaces(inout p: MoParser) {
+    while p.at < p.text.len() and p.text.substr(p.at, 1) == " " {
+        p.at = p.at + 1
+    }
+}
+
+fn looking_at(inout p: MoParser, token: str) -> bool {
+    skip_spaces(p)
+    if p.at + token.len() > p.text.len() {
+        return false
+    }
+    return p.text.substr(p.at, token.len()) == token
+}
+
+fn eat(inout p: MoParser, token: str) -> bool {
+    if looking_at(p, token) {
+        p.at = p.at + token.len()
+        return true
+    }
+    return false
+}
+
+fn parse_atom(inout p: MoParser) -> i64 {
+    skip_spaces(p)
+    if eat(p, "(") {
+        let value = parse_ternary(p)
+        let _closed = eat(p, ")")
+        return value
+    }
+    if eat(p, "!") {
+        if parse_atom(p) == 0 {
+            return 1
+        }
+        return 0
+    }
+    if eat(p, "n") {
+        return p.n
+    }
+    var digits = ""
+    while p.at < p.text.len() and p.text.substr(p.at, 1) >= "0" and
+    p.text.substr(p.at, 1) <= "9" {
+        digits = digits + p.text.substr(p.at, 1)
+        p.at = p.at + 1
+    }
+    return digits.parse_int() ?? 0
+}
+
+fn parse_product(inout p: MoParser) -> i64 {
+    var left = parse_atom(p)
+    var going = true
+    while going {
+        if eat(p, "*") {
+            left = left * parse_atom(p)
+        } else if eat(p, "/") {
+            let right = parse_atom(p)
+            if right != 0 {
+                left = left / right
+            }
+        } else if eat(p, "%") {
+            let right = parse_atom(p)
+            if right != 0 {
+                left = left % right
+            }
+        } else {
+            going = false
+        }
+    }
+    return left
+}
+
+fn parse_sum(inout p: MoParser) -> i64 {
+    var left = parse_product(p)
+    var going = true
+    while going {
+        if eat(p, "+") {
+            left = left + parse_product(p)
+        } else if eat(p, "-") {
+            left = left - parse_product(p)
+        } else {
+            going = false
+        }
+    }
+    return left
+}
+
+fn parse_comparison(inout p: MoParser) -> i64 {
+    var left = parse_sum(p)
+    var going = true
+    while going {
+        // The two-character operators have to be tried first, or `<=` is
+        // read as `<` and then a stray `=`.
+        if eat(p, "<=") {
+            left = if left <= parse_sum(p) { 1 } else { 0 }
+        } else if eat(p, ">=") {
+            left = if left >= parse_sum(p) { 1 } else { 0 }
+        } else if eat(p, "<") {
+            left = if left < parse_sum(p) { 1 } else { 0 }
+        } else if eat(p, ">") {
+            left = if left > parse_sum(p) { 1 } else { 0 }
+        } else {
+            going = false
+        }
+    }
+    return left
+}
+
+fn parse_equality(inout p: MoParser) -> i64 {
+    var left = parse_comparison(p)
+    var going = true
+    while going {
+        if eat(p, "==") {
+            left = if left == parse_comparison(p) { 1 } else { 0 }
+        } else if eat(p, "!=") {
+            left = if left != parse_comparison(p) { 1 } else { 0 }
+        } else {
+            going = false
+        }
+    }
+    return left
+}
+
+fn parse_and(inout p: MoParser) -> i64 {
+    var left = parse_equality(p)
+    while eat(p, "&&") {
+        let right = parse_equality(p)
+        left = if left != 0 and right != 0 { 1 } else { 0 }
+    }
+    return left
+}
+
+fn parse_or(inout p: MoParser) -> i64 {
+    var left = parse_and(p)
+    while eat(p, "||") {
+        let right = parse_and(p)
+        left = if left != 0 or right != 0 { 1 } else { 0 }
+    }
+    return left
+}
+
+fn parse_ternary(inout p: MoParser) -> i64 {
+    let condition = parse_or(p)
+    if not eat(p, "?") {
+        return condition
+    }
+    let yes = parse_ternary(p)
+    let _colon = eat(p, ":")
+    let no = parse_ternary(p)
+    if condition != 0 {
+        return yes
+    }
+    return no
+}
+
+/// The value of a gettext plural expression for a given `n`.
+///
+/// A rule that does not parse gives 0, which is the form every language has.
+pub fn evaluate(rule: str, n: i64) -> i64 {
+    var p = MoParser{ text: rule, at: 0, n: n }
+    return parse_ternary(p)
+}

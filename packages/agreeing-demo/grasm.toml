@@ -1,0 +1,16 @@
+[package]
+name = "agreeing_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.mersenne]
+path = "../mersenne"
+version = "^1.0.0"
+
+[dependencies.gettextmo]
+path = "../gettextmo"
+version = "^1.0.0"
+
+[dependencies.random]
+path = "../random"
+version = "^1.0.0"

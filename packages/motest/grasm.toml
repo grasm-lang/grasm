@@ -1,0 +1,8 @@
+[package]
+name = "motest"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.gettextmo]
+path = "../gettextmo"
+version = "^1.0.0"
