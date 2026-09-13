@@ -1,0 +1,8 @@
+[package]
+name = "sptest"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.structpack]
+path = "../structpack"
+version = "^1.0.0"

@@ -1,0 +1,6 @@
+[package]
+name = "structpack"
+version = "1.0.0"
+
+# Turning numbers into bytes and back. Opens nothing.
+capabilities = []

@@ -1,0 +1,53 @@
+import structpack
+
+fn to_hex(raw: bytes) -> str {
+    let digits = "0123456789abcdef"
+    var out = ""
+    var i = 0
+    while i < raw.len() {
+        out = out + digits.substr(raw.at(i) / 16, 1) +
+        digits.substr(raw.at(i) % 16, 1)
+        i = i + 1
+    }
+    return out
+}
+
+fn main() / {io} {
+    // `size <format>` or `pack <format> <n,n,n> <text|text>`.
+    var i = 0
+    while i < args().len() {
+        let what = args()[i]
+        if what == "size" {
+            match structpack.size(args()[i + 1]) {
+                Ok(n) -> print("{n}")
+                Err(_why) -> print("error")
+            }
+            i = i + 2
+            continue
+        }
+        let format = args()[i + 1]
+        var numbers: [i64] = []
+        if args()[i + 2].len() > 0 {
+            for piece in args()[i + 2].split(",") {
+                numbers.push(piece.parse_int() ?? 0)
+            }
+        }
+        var texts: [str] = []
+        if args()[i + 3].len() > 0 {
+            for piece in args()[i + 3].split("|") {
+                texts.push(piece)
+            }
+        }
+        match structpack.pack(format, numbers, texts) {
+            Ok(raw) -> {
+                var back: [str] = []
+                for n in structpack.unpack(format, raw) ?? [] {
+                    back.push("{n}")
+                }
+                print(to_hex(raw) + "\u{2}" + back.join(","))
+            }
+            Err(_why) -> print("error")
+        }
+        i = i + 4
+    }
+}

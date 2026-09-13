@@ -1,0 +1,6 @@
+[package]
+name = "quotedprintable"
+version = "1.0.0"
+
+# Turning bytes into text and back. Opens nothing.
+capabilities = []

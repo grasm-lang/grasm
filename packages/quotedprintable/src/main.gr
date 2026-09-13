@@ -1,0 +1,229 @@
+// Quoted-printable: bytes carried through a channel that only passes text.
+//
+//   "café" becomes "caf=C3=A9"
+//   a line of 80 characters becomes two, joined by "=\r\n"
+//
+// Mail transports were allowed to be seven-bit, to rewrite line endings, and
+// to refuse lines past 78 characters, so a body that is *mostly* text is
+// encoded in a way that keeps it readable: the printable bytes stay, the rest
+// become `=XX`, and long lines are broken with a soft break that the decoder
+// removes.
+//
+// ## The soft break is the whole trick, and it is invisible
+//
+// `=` at the end of a line means "this line continues" and is not part of
+// the text. A decoder that treats it as data produces a body with stray `=`
+// characters; an encoder that omits it produces lines a transport may
+// truncate. Neither failure is visible in the common case, because short
+// ASCII text needs no encoding at all.
+//
+// ## Trailing whitespace has to be encoded
+//
+// A transport may strip spaces at the end of a line, so a space or tab that
+// really is at the end is written `=20` or `=09`. An encoder that leaves it
+// alone produces a message whose body changes in transit, and a signature
+// over that body then fails for no visible reason.
+
+type QuotedError =
+    | BadEscape(at: i64)
+
+fn is_hex(character: str) -> bool {
+    let upper = character.to_upper()
+    return (upper >= "0" and upper <= "9") or (upper >= "A" and upper <= "F")
+}
+
+fn hex_value(character: str) -> i64 {
+    let upper = character.to_upper()
+    if upper >= "0" and upper <= "9" {
+        return upper.code_at(0) - "0".code_at(0)
+    }
+    return upper.code_at(0) - "A".code_at(0) + 10
+}
+
+fn hex_pair(byte: i64) -> str {
+    let digits = "0123456789ABCDEF"
+    return "=" + digits.substr(byte / 16, 1) + digits.substr(byte % 16, 1)
+}
+
+/// Whether a byte may be written as itself.
+///
+/// Printable ASCII except `=`, which always escapes because it is the escape
+/// character. Space and tab are literal *except* at the end of a line, which
+/// the encoder handles rather than this.
+pub fn is_literal(byte: i64) -> bool {
+    if byte == 61 {
+        return false
+    }
+    return (byte >= 33 and byte <= 126) or byte == 32 or byte == 9
+}
+
+/// Encode, breaking lines so none exceeds 76 characters.
+///
+/// `crlf` says what a line break is written as. A mail body wants `true`,
+/// because RFC 2045 says a line ends with CRLF; a file being written for a
+/// Unix tool wants `false`, and then the line endings already in the input
+/// are passed through as they were. Both are common and neither is a
+/// default worth guessing at.
+pub fn encode(data: bytes, crlf: bool) -> str {
+    // What a soft break is written as. The line endings already in the
+    // input are a separate question, answered below.
+    var ending = "\n"
+    if crlf {
+        ending = "\r\n"
+    }
+    var out = ""
+    var column = 0
+    var i = 0
+    while i < data.len() {
+        let byte = data.at(i)
+        // A line ending is `\n`, and a `\r` immediately before one
+        // belongs to it. A `\r` on its own is *not* a line ending — it is
+        // passed through as itself and keeps counting toward the line
+        // length, which is what every implementation does and what a
+        // reader of the standard would not guess.
+        if byte == 10 or (byte == 13 and i + 1 < data.len() and
+            data.at(i + 1) == 10) {
+            out = trimmed_tail(out)
+            if crlf {
+                out = out + "\r\n"
+            } else {
+                // The input's own ending goes through as it was: a body
+                // that arrived with CRLF keeps it.
+                if byte == 13 {
+                    out = out + "\r\n"
+                } else {
+                    out = out + "\n"
+                }
+            }
+            column = 0
+            i = i + 1
+            if byte == 13 {
+                i = i + 1
+            }
+            continue
+        }
+        var piece = ""
+        if byte == 13 {
+            // A lone carriage return goes through as itself, and it counts
+            // toward the line length like anything else — so a break may
+            // have to come before it rather than after.
+            piece = bytes_of([13]).to_str()
+        } else if is_literal(byte) {
+            piece = bytes_of([byte]).to_str()
+        } else {
+            piece = hex_pair(byte)
+        }
+        // A soft break needs a character of its own, so the room for
+        // content is 75. The exception is a single character at the very
+        // end: nothing follows it, so no break can be needed after it and
+        // the line may reach 76. An *escape* at the end does not get that
+        // — it is three characters and the rule that reserves room for the
+        // break is applied to it whether or not the break turns out to be
+        // needed. The two cases differing is not tidy; it is what every
+        // implementation does, and matching it is the difference between
+        // producing the same bytes as everyone else and producing
+        // something that merely decodes the same.
+        var room = 75
+        if i == data.len() - 1 and piece.len() == 1 {
+            room = 76
+        }
+        if column + piece.len() > room {
+            out = out + "=" + ending
+            column = 0
+        }
+        out = out + piece
+        column = column + piece.len()
+        i = i + 1
+    }
+    return trimmed_tail(out)
+}
+
+/// Whitespace at the end of a line is encoded rather than left to be
+/// stripped in transit.
+fn trimmed_tail(text: str) -> str {
+    if text.len() == 0 {
+        return text
+    }
+    let last = text.substr(text.len() - 1, 1)
+    if last != " " and last != "\t" {
+        return text
+    }
+    var byte = 32
+    if last == "\t" {
+        byte = 9
+    }
+    return text.substr(0, text.len() - 1) + hex_pair(byte)
+}
+
+/// Decode, removing soft breaks.
+///
+/// A `=` that is not followed by two hexadecimal digits or a line ending is
+/// left as itself: mail arrives malformed, and a decoder that refuses the
+/// whole body over one stray character has lost the message.
+pub fn decode(text: str) -> bytes {
+    var out: [i64] = []
+    var i = 0
+    while i < text.len() {
+        let here = text.substr(i, 1)
+        if here != "=" {
+            let raw = here.to_bytes()
+            var k = 0
+            while k < raw.len() {
+                out.push(raw.at(k))
+                k = k + 1
+            }
+            i = i + 1
+            continue
+        }
+        // A `=` with nothing after it is a soft break at the end of the
+        // input: the line was going to continue and the text stopped.
+        if i == text.len() - 1 {
+            i = i + 1
+            continue
+        }
+        // A soft break: `=` then a line ending, both of which go.
+        if i + 2 < text.len() and text.substr(i + 1, 2) == "\r\n" {
+            i = i + 3
+            continue
+        }
+        if i + 1 < text.len() and text.substr(i + 1, 1) == "\n" {
+            i = i + 2
+            continue
+        }
+        if i + 2 < text.len() and is_hex(text.substr(i + 1, 1)) and
+        is_hex(text.substr(i + 2, 1)) {
+            out.push(hex_value(text.substr(i + 1, 1)) * 16 +
+                hex_value(text.substr(i + 2, 1)))
+            i = i + 3
+            continue
+        }
+        out.push(61)
+        i = i + 1
+    }
+    return bytes_of(out)
+}
+
+/// Encode for a header rather than a body: no line breaking, and space
+/// becomes `_`.
+///
+/// This is RFC 2047's `Q`, which is *not* quoted-printable however much it
+/// looks like it — `packages/mimeword` is where a whole header is put
+/// together, and this is the piece it uses.
+pub fn encode_header(text: str) -> str {
+    var out = ""
+    let raw = text.to_bytes()
+    var i = 0
+    while i < raw.len() {
+        let byte = raw.at(i)
+        if byte == 32 {
+            out = out + "_"
+        } else if (byte >= 48 and byte <= 57) or
+        (byte >= 65 and byte <= 90) or (byte >= 97 and byte <= 122) {
+            out = out + bytes_of([byte]).to_str()
+        } else {
+            out = out + hex_pair(byte)
+        }
+        i = i + 1
+    }
+    return out
+}

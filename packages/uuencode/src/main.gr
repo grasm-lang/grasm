@@ -1,0 +1,211 @@
+// uuencode: three bytes as four characters, and the format Usenet ran on.
+//
+//   begin 644 hello.txt
+//   %:&5L;&\`
+//   `
+//   end
+//
+// It predates base64 and still turns up: in mail archives, in `.uue` files,
+// and as the encoding `binascii` in Python and `uuencode` in coreutils both
+// still implement. The interesting part is not the alphabet — it is the
+// length byte at the front of every line, which is the thing a hand-written
+// decoder forgets.
+//
+// ## Every line says how many bytes it holds
+//
+// The first character of a data line is the count, encoded the same way as
+// the data: value plus 32. A full line holds 45 bytes and starts with `M`.
+// The last line holds fewer and starts with something else, and a decoder
+// that reads a whole line's worth regardless produces trailing rubbish that
+// looks like part of the file.
+//
+// ## Space or backtick, and both mean zero
+//
+// A zero value encodes as space (32), which mail transports strip. The
+// convention everything since has followed is to write a backtick (96)
+// instead, and to accept either when reading. A decoder that accepts only
+// space cannot read the files everything actually produces; an encoder that
+// writes only space produces files that arrive corrupted.
+//
+// ## The mode is not decoration
+//
+// `begin 644 name` carries the permission bits. A tool that unpacks the
+// file and ignores them writes a script nobody can run, or worse, one
+// anybody can write.
+
+type UuencodeError =
+    | NoBegin()
+    | BadLength(line: i64)
+    | BadCharacter(character: str, line: i64)
+
+    /// What a `begin` line says.
+type UuHeader = {
+    /// Permission bits, as a number — `644` reads as 420.
+    mode: i64,
+    name: str,
+}
+
+fn digit(value: i64) -> str {
+    // Zero is a space here, which is what `uuencode` and `binascii` both
+    // write inside a line. The *terminating* line is the one that gets a
+    // backtick instead, because a lone trailing space does not survive a
+    // mail transport, and a reader accepts either.
+    return bytes_of([value % 64 + 32]).to_str()
+}
+
+fn value_of(character: str) -> i64 {
+    let code = character.code_at(0)
+    if code == 96 {
+        return 0
+    }
+    return (code - 32) % 64
+}
+
+/// One line: the length character, then the data.
+pub fn encode_line(chunk: bytes) -> str {
+    var out = digit(chunk.len())
+    var at = 0
+    while at < chunk.len() {
+        var group = 0
+        var i = 0
+        while i < 3 {
+            var byte = 0
+            if at + i < chunk.len() {
+                byte = chunk.at(at + i)
+            }
+            group = group * 256 + byte
+            i = i + 1
+        }
+        out = out + digit(group / 262144) + digit(group / 4096 % 64) +
+        digit(group / 64 % 64) + digit(group % 64)
+        at = at + 3
+    }
+    return out
+}
+
+/// The whole thing, `begin` and `end` included.
+pub fn encode(data: bytes, mode: i64, name: str) -> str {
+    var out = "begin {octal(mode)} " + name + "\n"
+    var at = 0
+    while at < data.len() {
+        var chunk: [i64] = []
+        var i = 0
+        while i < 45 and at + i < data.len() {
+            chunk.push(data.at(at + i))
+            i = i + 1
+        }
+        out = out + encode_line(bytes_of(chunk)) + "\n"
+        at = at + 45
+    }
+    // A zero-length line closes the data, and then `end`.
+    return out + "`\nend\n"
+}
+
+fn octal(value: i64) -> str {
+    if value == 0 {
+        return "0"
+    }
+    var out = ""
+    var left = value
+    while left > 0 {
+        out = "{left % 8}" + out
+        left = left / 8
+    }
+    return out
+}
+
+/// The `begin` line, read.
+pub fn header_of(text: str) -> UuHeader ! UuencodeError {
+    for line in text.split("\n") {
+        if not line.starts_with("begin ") {
+            continue
+        }
+        let rest = line.substr(6, line.len() - 6)
+        var at = 0
+        while at < rest.len() and rest.substr(at, 1) != " " {
+            at = at + 1
+        }
+        var mode = 0
+        for character in rest.substr(0, at).chars() {
+            mode = mode * 8 + (character.parse_int() ?? 0)
+        }
+        return UuHeader{ mode: mode,
+            name: rest.substr(at + 1, rest.len() - at - 1).trim() }
+    }
+    fail(NoBegin())
+}
+
+/// One data line's bytes.
+pub fn decode_line(line: str) -> bytes ! UuencodeError {
+    if line.len() == 0 {
+        return bytes_of([])
+    }
+    let wanted = value_of(line.substr(0, 1))
+    var out: [i64] = []
+    var at = 1
+    while at < line.len() and out.len() < wanted {
+        var group = 0
+        var i = 0
+        while i < 4 {
+            var value = 0
+            if at + i < line.len() {
+                value = value_of(line.substr(at + i, 1))
+            }
+            group = group * 64 + value
+            i = i + 1
+        }
+        // The count is what says how many of the three bytes are real.
+        var k = 0
+        while k < 3 and out.len() < wanted {
+            out.push(group / power256(2 - k) % 256)
+            k = k + 1
+        }
+        at = at + 4
+    }
+    if out.len() < wanted {
+        fail(BadLength(0))
+    }
+    return bytes_of(out)
+}
+
+fn power256(n: i64) -> i64 {
+    var out = 1
+    var i = 0
+    while i < n {
+        out = out * 256
+        i = i + 1
+    }
+    return out
+}
+
+/// The whole thing, decoded. Everything before `begin` and after `end` is
+/// ignored, which is how a file inside a mail message is read.
+pub fn decode(text: str) -> bytes ! UuencodeError {
+    var out: [i64] = []
+    var started = false
+    for raw in text.split("\n") {
+        var line = raw
+        if line.ends_with("\r") {
+            line = line.substr(0, line.len() - 1)
+        }
+        if not started {
+            if line.starts_with("begin ") {
+                started = true
+            }
+            continue
+        }
+        if line == "end" {
+            return bytes_of(out)
+        }
+        if line.len() == 0 or value_of(line.substr(0, 1)) == 0 {
+            continue
+        }
+        for byte in (try decode_line(line)).to_list() {
+            out.push(byte)
+        }
+    }
+    if not started {
+        fail(NoBegin())
+    }
+    return bytes_of(out)
+}

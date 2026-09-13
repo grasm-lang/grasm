@@ -1,0 +1,16 @@
+[package]
+name = "enctest3"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.quotedprintable]
+path = "../quotedprintable"
+version = "^1.0.0"
+
+[dependencies.ascii85]
+path = "../ascii85"
+version = "^1.0.0"
+
+[dependencies.uuencode]
+path = "../uuencode"
+version = "^1.0.0"

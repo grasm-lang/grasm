@@ -1,0 +1,20 @@
+[package]
+name = "encodings3_demo"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.structpack]
+path = "../structpack"
+version = "^1.0.0"
+
+[dependencies.quotedprintable]
+path = "../quotedprintable"
+version = "^1.0.0"
+
+[dependencies.ascii85]
+path = "../ascii85"
+version = "^1.0.0"
+
+[dependencies.uuencode]
+path = "../uuencode"
+version = "^1.0.0"

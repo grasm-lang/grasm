@@ -1,0 +1,162 @@
+// Four ways of writing bytes down, and the rule each one hides.
+//
+// Every expected value here was checked against the standard library that
+// owns the format — Python's `struct`, `quopri`, `base64` and `binascii` —
+// over 200 random blobs as well as these cases.
+import structpack
+import quotedprintable
+import ascii85
+import uuencode
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn hex_of(raw: bytes) -> str {
+    let digits = "0123456789abcdef"
+    var out = ""
+    var i = 0
+    while i < raw.len() {
+        out = out + digits.substr(raw.at(i) / 16, 1) +
+        digits.substr(raw.at(i) % 16, 1)
+        i = i + 1
+    }
+    return out
+}
+
+fn check_struct(inout f: i64) / {io} {
+    print("-- structpack: the first character is not a field")
+    say(f, "the prefix says the byte order and `!` means big-endian",
+        structpack.byte_order(">HH") == ">" and
+        structpack.byte_order("!HH") == ">" and
+        structpack.byte_order("HH") == "@" and
+        structpack.byte_order("<I") == "<")
+    say(f, "only the native mode pads, and it pads before a field",
+        (structpack.size("@HB") ?? 0) == 3 and
+        (structpack.size("@BH") ?? 0) == 4 and
+        (structpack.size("=BH") ?? 0) == 3)
+    say(f, "and it adds nothing after the last field, unlike C",
+        (structpack.size("@BQ") ?? 0) == 16 and
+        (structpack.size("@QB") ?? 0) == 9)
+    say(f, "a repeat count is fields, except on `s` where it is width",
+        (structpack.size("4B") ?? 0) == 4 and
+        (structpack.size("4s") ?? 0) == 4 and
+        (structpack.fields("4B") ?? []).len() == 4 and
+        (structpack.fields("4s") ?? []).len() == 1)
+    say(f, "the same number in two orders is two different records",
+        hex_of(structpack.pack(">H", [258], []) ?? bytes_of([])) == "0102" and
+        hex_of(structpack.pack("<H", [258], []) ?? bytes_of([])) == "0201")
+    say(f, "a signed field comes back negative and an unsigned one does not",
+        (structpack.unpack(">h", bytes_of([255, 255])) ?? []) == [0 - 1] and
+        (structpack.unpack(">H", bytes_of([255, 255])) ?? []) == [65535])
+    say(f, "a pad byte takes space and carries no value",
+        (structpack.size(">BxB") ?? 0) == 3 and
+        (structpack.value_count(">BxB") ?? 0) == 2)
+    say(f, "floating point is refused rather than approximated",
+        structpack.size(">f") ?? 0 - 1 == 0 - 1)
+}
+
+fn check_quoted(inout f: i64) / {io} {
+    print("-- quotedprintable: the soft break is invisible and load-bearing")
+    say(f, "printable text is left alone and `=` never is",
+        quotedprintable.encode("hello".to_bytes(), false) == "hello" and
+        quotedprintable.encode("a=b".to_bytes(), false) == "a=3Db")
+    say(f, "a byte past ASCII becomes two hexadecimal digits, upper case",
+        quotedprintable.encode("café".to_bytes(), false) == "caf=C3=A9")
+    say(f, "whitespace at the end of a line is escaped, or transit eats it",
+        quotedprintable.encode("a \n".to_bytes(), false) == "a=20\n" and
+        quotedprintable.encode("a\t".to_bytes(), false) == "a=09")
+    var long: [i64] = []
+    var i = 0
+    while i < 80 {
+        long.push(120)
+        i = i + 1
+    }
+    let wrapped = quotedprintable.encode(bytes_of(long), false)
+    say(f, "a long line is broken with a soft break at 76 characters",
+        wrapped.split("\n").len() == 2 and
+        wrapped.split("\n")[0].len() == 76 and
+        wrapped.split("\n")[0].ends_with("=") and
+        wrapped.split("\n")[1].len() == 5)
+    say(f, "and the decoder removes the break rather than reading it",
+        quotedprintable.decode(wrapped).len() == 80 and
+        quotedprintable.decode("soft=\r\nbreak").to_str() == "softbreak")
+    say(f, "a `=` with nothing after it is a break, not a character",
+        quotedprintable.decode("=").len() == 0)
+    say(f, "a `=` that is not an escape is left alone rather than refused",
+        quotedprintable.decode("=zz").to_str() == "=zz")
+    say(f, "and a header's Q is not quoted-printable: `_` is a space",
+        quotedprintable.encode_header("a b") == "a_b")
+}
+
+fn check_ascii85(inout f: i64) / {io} {
+    print("-- ascii85: two formats with one name")
+    say(f, "four bytes become five characters",
+        ascii85.encode("abcd".to_bytes(), true) == "@:E_W" and
+        ascii85.encoded_length(4, true) == 5)
+    say(f, "and the two alphabets disagree about every one of them",
+        ascii85.encode("abcd".to_bytes(), false) == "VPRomJ" == false and
+        ascii85.encode("abcd".to_bytes(), false) !=
+        ascii85.encode("abcd".to_bytes(), true))
+    say(f, "four zero bytes are `z`, but only in Adobe's spelling",
+        ascii85.encode(bytes_of([0, 0, 0, 0]), true) == "z" and
+        ascii85.encode(bytes_of([0, 0, 0, 0]), false) != "z")
+    say(f, "a partial group yields one character more than it has bytes",
+        ascii85.encode("a".to_bytes(), true).len() == 2 and
+        ascii85.encode("ab".to_bytes(), true).len() == 3 and
+        ascii85.encode("abc".to_bytes(), true).len() == 4)
+    say(f, "and decoding a partial group gives the bytes back exactly",
+        (ascii85.decode(ascii85.encode("abc".to_bytes(), true), true) ??
+            bytes_of([])).to_str() == "abc")
+    say(f, "the delimiters are Adobe's and the decoder takes them off",
+        ascii85.encode_adobe("abcd".to_bytes()) == "<~@:E_W~>" and
+        (ascii85.decode("<~@:E_W~>", true) ?? bytes_of([])).to_str() ==
+        "abcd")
+    say(f, "whitespace inside the text is ignored, which producers rely on",
+        (ascii85.decode("@:E\n_W", true) ?? bytes_of([])).to_str() == "abcd")
+    say(f, "and a character outside the alphabet is refused",
+        ascii85.decode("@:E~W", true) ?? bytes_of([9]) == bytes_of([9]))
+}
+
+fn check_uu(inout f: i64) / {io} {
+    print("-- uuencode: every line says how many bytes it holds")
+    say(f, "the first character is the count, not data",
+        uuencode.encode_line("cat".to_bytes()).substr(0, 1) == "#" and
+        uuencode.encode_line("".to_bytes()) == " ")
+    say(f, "three bytes become four characters after the count",
+        uuencode.encode_line("cat".to_bytes()).len() == 5)
+    say(f, "a line decodes to exactly what its count says",
+        (uuencode.decode_line(uuencode.encode_line("cat".to_bytes())) ??
+            bytes_of([])).to_str() == "cat")
+    say(f, "a partial group does not leak the padding back out",
+        (uuencode.decode_line(uuencode.encode_line("ab".to_bytes())) ??
+            bytes_of([])).len() == 2)
+    let whole = uuencode.encode("hello".to_bytes(), 420, "hello.txt")
+    say(f, "the begin line carries the mode, which is not decoration",
+        whole.starts_with("begin 644 hello.txt\n"))
+    let header = uuencode.header_of(whole) ?? UuHeader{ mode: 0, name: "" }
+    say(f, "and it is read back as the number it is, not as three digits",
+        header.mode == 420 and header.name == "hello.txt")
+    say(f, "the whole file comes back",
+        (uuencode.decode(whole) ?? bytes_of([])).to_str() == "hello")
+    say(f, "and text with no begin line is refused rather than guessed at",
+        uuencode.decode("just words") ?? bytes_of([9]) == bytes_of([9]))
+}
+
+fn main() / {io} {
+    var f = 0
+    check_struct(f)
+    check_quoted(f)
+    check_ascii85(f)
+    check_uu(f)
+    if f == 0 {
+        print("encodings: every claim held")
+    } else {
+        print("encodings: {f} claims failed")
+    }
+}

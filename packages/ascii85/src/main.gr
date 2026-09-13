@@ -1,0 +1,238 @@
+// Ascii85 and Base85: four bytes as five characters, in the two spellings
+// that are not compatible.
+//
+//   Adobe   <~87cURD]j7BEbo80~>    used by PostScript and PDF
+//   RFC 1924 / Z85 alphabet        used by ZeroMQ and Git's binary patches
+//
+// Base64 costs a third in size; this costs a quarter, which is why formats
+// that carry binary inside text keep choosing it. What they do not share is
+// the alphabet, the `z` shorthand for four zero bytes, or the delimiters, so
+// "base85" names two formats and picking the wrong one produces plausible
+// rubbish rather than an error.
+//
+// ## The two alphabets
+//
+// Adobe's runs from `!` (33) to `u` (117) in character order, so the value
+// of a character is its code minus 33. The RFC 1924 alphabet is a chosen
+// list — digits, then upper case, then lower case, then punctuation — and
+// the value of a character is its position in that list. A decoder using
+// one on the other's text produces bytes, and no complaint.
+//
+// ## `z` is four zero bytes, and only Adobe has it
+//
+// A group of four zeros encodes as `z` rather than `!!!!!`. It is legal only
+// at a group boundary, and an encoder that emits it inside a partial group
+// has written something no decoder can read back.
+//
+// ## The last group is padded and then trimmed
+//
+// A trailing group of one, two or three bytes is padded with zero bytes to
+// four, encoded, and then only the first `n + 1` characters are kept. A
+// decoder does the reverse: pad the group with `u` (the highest digit), and
+// keep `n - 1` bytes. Getting the padding character wrong changes the last
+// byte and nothing else, which is the kind of defect that survives a test
+// suite made of round trips.
+
+type Ascii85Error =
+    | BadCharacter(character: str, at: i64)
+    | BadGroup(at: i64)
+
+fn rfc_alphabet() -> str {
+    return "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ" +
+    "abcdefghijklmnopqrstuvwxyz!#$%&()*+-;<=>?@^_`" + "\{|}~"
+}
+
+fn power85(n: i64) -> i64 {
+    var out = 1
+    var i = 0
+    while i < n {
+        out = out * 85
+        i = i + 1
+    }
+    return out
+}
+
+fn digit_of(value: i64, adobe: bool) -> str {
+    if adobe {
+        return bytes_of([value + 33]).to_str()
+    }
+    return rfc_alphabet().substr(value, 1)
+}
+
+fn value_of(character: str, adobe: bool) -> i64 {
+    if adobe {
+        let code = character.code_at(0)
+        if code < 33 or code > 117 {
+            return 0 - 1
+        }
+        return code - 33
+    }
+    let table = rfc_alphabet()
+    var i = 0
+    while i < table.len() {
+        if table.substr(i, 1) == character {
+            return i
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+/// Encode. `adobe` chooses the `!`-based alphabet and the `z` shorthand;
+/// otherwise the RFC 1924 alphabet, which has neither.
+pub fn encode(data: bytes, adobe: bool) -> str {
+    var out = ""
+    var at = 0
+    while at < data.len() {
+        var group = 0
+        var have = 0
+        var i = 0
+        while i < 4 {
+            var byte = 0
+            if at + i < data.len() {
+                byte = data.at(at + i)
+                have = have + 1
+            }
+            group = group * 256 + byte
+            i = i + 1
+        }
+        if adobe and have == 4 and group == 0 {
+            out = out + "z"
+            at = at + 4
+            continue
+        }
+        var digits: [str] = []
+        var left = group
+        var k = 0
+        while k < 5 {
+            digits.push(digit_of(left % 85, adobe))
+            left = left / 85
+            k = k + 1
+        }
+        // The digits came out least significant first.
+        var j = 4
+        var written = 0
+        while j >= 0 and written < have + 1 {
+            out = out + digits[j]
+            written = written + 1
+            j = j - 1
+        }
+        at = at + 4
+    }
+    return out
+}
+
+/// Encode with Adobe's delimiters, which is what a PDF stream carries.
+pub fn encode_adobe(data: bytes) -> str {
+    return "<~" + encode(data, true) + "~>"
+}
+
+fn without_delimiters(text: str) -> str {
+    var body = text
+    if body.starts_with("<~") {
+        body = body.substr(2, body.len() - 2)
+    }
+    if body.ends_with("~>") {
+        body = body.substr(0, body.len() - 2)
+    }
+    return body
+}
+
+fn is_space(character: str) -> bool {
+    return character == " " or character == "\n" or character == "\r" or
+    character == "\t"
+}
+
+/// Decode. Whitespace is ignored, which every producer relies on.
+pub fn decode(text: str, adobe: bool) -> bytes ! Ascii85Error {
+    var out: [i64] = []
+    var group: [i64] = []
+    var at = 0
+    let body = without_delimiters(text)
+    while at < body.len() {
+        let character = body.substr(at, 1)
+        at = at + 1
+        if is_space(character) {
+            continue
+        }
+        if adobe and character == "z" {
+            if group.len() != 0 {
+                fail(BadGroup(at))
+            }
+            var i = 0
+            while i < 4 {
+                out.push(0)
+                i = i + 1
+            }
+            continue
+        }
+        let value = value_of(character, adobe)
+        if value < 0 {
+            fail(BadCharacter(character, at))
+        }
+        group.push(value)
+        if group.len() == 5 {
+            var number = 0
+            for one in group {
+                number = number * 85 + one
+            }
+            var shift = 3
+            while shift >= 0 {
+                out.push(number / power_of_256(shift) % 256)
+                shift = shift - 1
+            }
+            group = []
+        }
+    }
+    if group.len() == 1 {
+        fail(BadGroup(at))
+    }
+    if group.len() > 1 {
+        // A partial group is padded with the highest digit and yields one
+        // byte fewer than it has digits.
+        let kept = group.len() - 1
+        var padded = group
+        while padded.len() < 5 {
+            padded.push(84)
+        }
+        var number = 0
+        for one in padded {
+            number = number * 85 + one
+        }
+        var shift = 3
+        var written = 0
+        while shift >= 0 and written < kept {
+            out.push(number / power_of_256(shift) % 256)
+            written = written + 1
+            shift = shift - 1
+        }
+    }
+    return bytes_of(out)
+}
+
+fn power_of_256(n: i64) -> i64 {
+    var out = 1
+    var i = 0
+    while i < n {
+        out = out * 256
+        i = i + 1
+    }
+    return out
+}
+
+/// How long the encoding of `n` bytes is, before any delimiters.
+pub fn encoded_length(n: i64, adobe: bool) -> i64 {
+    if n == 0 {
+        return 0
+    }
+    let whole = n / 4
+    let rest = n % 4
+    var out = whole * 5
+    if rest > 0 {
+        out = out + rest + 1
+    }
+    if adobe {
+        return out
+    }
+    return out
+}

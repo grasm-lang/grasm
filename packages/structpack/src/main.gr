@@ -1,0 +1,398 @@
+// Fixed binary records, described the way Python's `struct` describes them.
+//
+//   ">HHI"    two shorts and a long, big-endian
+//   "<4sB"    four bytes of text and a byte, little-endian
+//   "=IqQ"    the machine's order, without the machine's padding
+//
+// Every binary format is a sequence of fields at known offsets, and a reader
+// written by hand is a column of `data.at(i) * 256 + data.at(i + 1)` lines
+// that nobody can check against the specification it came from. A format
+// string can be checked: it sits next to the table in the document it was
+// read from and it is one line.
+//
+// ## The first character is not a field
+//
+// `<` little-endian, `>` big-endian, `!` network order — which *is*
+// big-endian — `=` the machine's own, and `@` the machine's own *with its
+// padding*. A format with no prefix means `@`, which is the one that pads,
+// so `@HI` is eight bytes on a machine that aligns a four-byte integer and
+// `=HI` is six. Reading a file with the wrong one of those gives every field
+// after the first the wrong value, and nothing announces it.
+//
+// ## Padding is the part people get wrong
+//
+// Only `@` pads. It inserts bytes *before* a field so the field starts at a
+// multiple of its own size — what a C compiler does — and, unlike C, adds
+// nothing after the last field: `@HB` is three bytes here and four in a C
+// struct. That is the rule Python's `struct` follows and the one a format
+// string read from Python code will have been written against. Every other
+// prefix packs fields end to end with no padding at all.
+//
+// ## What it does not do
+//
+// Floats. `f` and `d` need IEEE-754 bit layout, which is a package of its
+// own and one this does not depend on; a format string naming them is
+// refused rather than approximated.
+
+type StructError =
+    | BadFormat(why: str)
+    | Truncated(needed: i64, had: i64)
+    | WrongCount(wanted: i64, given: i64)
+    | OutOfRange(value: i64, code: str)
+
+    /// One field of a format string.
+type StructField = {
+    /// The letter, without its repeat count.
+    code: str,
+    /// How many of it. For `s` this is the length of one string field.
+    count: i64,
+    /// Bytes one of it occupies.
+    size: i64,
+    signed: bool,
+}
+
+fn is_digit(character: str) -> bool {
+    return character >= "0" and character <= "9"
+}
+
+fn size_of(code: str) -> i64 {
+    if code == "x" or code == "b" or code == "B" or code == "c" or
+    code == "s" or code == "?" {
+        return 1
+    }
+    if code == "h" or code == "H" {
+        return 2
+    }
+    if code == "i" or code == "I" or code == "l" or code == "L" {
+        return 4
+    }
+    if code == "q" or code == "Q" or code == "n" or code == "N" {
+        return 8
+    }
+    return 0
+}
+
+fn is_signed(code: str) -> bool {
+    return code == "b" or code == "h" or code == "i" or code == "l" or
+    code == "q" or code == "n"
+}
+
+/// Whether the format begins with a byte-order mark, and which.
+///
+/// Answers one of `<`, `>`, `=`, `@`. `!` is `>`, because network order is
+/// big-endian and saying so once here is better than saying it at every
+/// comparison.
+pub fn byte_order(format: str) -> str {
+    if format.len() == 0 {
+        return "@"
+    }
+    let first = format.substr(0, 1)
+    if first == "!" {
+        return ">"
+    }
+    if first == "<" or first == ">" or first == "=" or first == "@" {
+        return first
+    }
+    return "@"
+}
+
+fn has_prefix(format: str) -> bool {
+    if format.len() == 0 {
+        return false
+    }
+    let first = format.substr(0, 1)
+    return first == "<" or first == ">" or first == "=" or first == "@" or
+    first == "!"
+}
+
+/// Whether this format's mode inserts padding, which only `@` does.
+pub fn pads(format: str) -> bool {
+    return byte_order(format) == "@"
+}
+
+/// The fields a format string names.
+pub fn fields(format: str) -> [StructField] ! StructError {
+    var out: [StructField] = []
+    var i = 0
+    if has_prefix(format) {
+        i = 1
+    }
+    while i < format.len() {
+        var count = 0
+        var digits = 0
+        while i < format.len() and is_digit(format.substr(i, 1)) {
+            count = count * 10 + (format.substr(i, 1).parse_int() ?? 0)
+            digits = digits + 1
+            i = i + 1
+        }
+        if digits == 0 {
+            count = 1
+        }
+        if i >= format.len() {
+            fail(BadFormat("a repeat count with no code after it"))
+        }
+        let code = format.substr(i, 1)
+        i = i + 1
+        if code == "f" or code == "d" or code == "e" {
+            fail(BadFormat("floating point is not packed here: " + code))
+        }
+        let size = size_of(code)
+        if size == 0 {
+            fail(BadFormat("unknown code " + code))
+        }
+        if code == "c" {
+            // `c` is one byte of text rather than a number: `3c` is three
+            // one-byte text fields, where `3s` is one three-byte field.
+            var n = 0
+            while n < count {
+                out.push(StructField{ code: "c", count: 1, size: 1,
+                    signed: false })
+                n = n + 1
+            }
+            continue
+        }
+        if code == "s" {
+            // `4s` is one field four bytes wide, not four fields.
+            out.push(StructField{ code: code, count: count, size: count,
+                signed: false })
+            continue
+        }
+        var n = 0
+        while n < count {
+            out.push(StructField{ code: code, count: 1, size: size,
+                signed: is_signed(code) })
+            n = n + 1
+        }
+    }
+    return out
+}
+
+fn aligned(at: i64, to: i64) -> i64 {
+    if to <= 1 or at % to == 0 {
+        return at
+    }
+    return at + to - at % to
+}
+
+/// How many bytes a record in this format occupies.
+///
+/// Under `@` this includes the padding inserted *before* a field to line it
+/// up, and nothing after the last one — which is where this differs from C's
+/// `sizeof`, and is what Python's `struct` answers. A reader stepping an
+/// array of records in native mode has to round the stride up itself.
+pub fn size(format: str) -> i64 ! StructError {
+    let list = try fields(format)
+    let padding = pads(format)
+    var at = 0
+    for one in list {
+        if one.code == "x" {
+            at = at + 1
+            continue
+        }
+        var alignment = one.size
+        if one.code == "s" or one.code == "c" {
+            alignment = 1
+        }
+        if padding {
+            at = aligned(at, alignment)
+        }
+        at = at + one.size
+    }
+    return at
+}
+
+/// How many values `pack` wants, which is not the count of fields: a `4s`
+/// takes one string and an `x` takes nothing.
+pub fn value_count(format: str) -> i64 ! StructError {
+    var out = 0
+    for one in try fields(format) {
+        if one.code != "x" {
+            out = out + 1
+        }
+    }
+    return out
+}
+
+fn write_number(inout out: [i64], value: i64, width: i64, big_endian: bool) {
+    var bytes_out: [i64] = []
+    var left = value
+    var i = 0
+    while i < width {
+        bytes_out.push(left % 256)
+        // An arithmetic shift keeps the sign, which is what a negative
+        // number's two's complement bytes need.
+        left = left.shr(8)
+        i = i + 1
+    }
+    if big_endian {
+        var j = bytes_out.len() - 1
+        while j >= 0 {
+            out.push(bytes_out[j].bit_and(255))
+            j = j - 1
+        }
+    } else {
+        for b in bytes_out {
+            out.push(b.bit_and(255))
+        }
+    }
+}
+
+fn read_number(data: bytes, at: i64, width: i64, big_endian: bool,
+    signed: bool) -> i64 {
+    var out = 0
+    var i = 0
+    while i < width {
+        var index = at + i
+        if not big_endian {
+            index = at + width - 1 - i
+        }
+        out = out * 256 + data.at(index)
+        i = i + 1
+    }
+    if signed and width < 8 {
+        var top = 1
+        var k = 0
+        while k < width * 8 - 1 {
+            top = top * 2
+            k = k + 1
+        }
+        if out >= top {
+            return out - top * 2
+        }
+    }
+    return out
+}
+
+/// Numbers and text, packed.
+///
+/// `texts` supplies the `s` fields in order and `numbers` everything else,
+/// because a list in this language holds one type and a record holds two.
+pub fn pack(format: str, numbers: [i64],
+    texts: [str]) -> bytes ! StructError {
+    let list = try fields(format)
+    let big_endian = byte_order(format) == ">"
+    let padding = pads(format)
+    var out: [i64] = []
+    var next_number = 0
+    var next_text = 0
+    for one in list {
+        if one.code == "x" {
+            out.push(0)
+            continue
+        }
+        var alignment = one.size
+        if one.code == "s" or one.code == "c" {
+            alignment = 1
+        }
+        if padding {
+            while out.len() < aligned(out.len(), alignment) {
+                out.push(0)
+            }
+        }
+        if one.code == "s" or one.code == "c" {
+            if next_text >= texts.len() {
+                fail(WrongCount(next_text + 1, texts.len()))
+            }
+            let raw = texts[next_text].to_bytes()
+            next_text = next_text + 1
+            var i = 0
+            while i < one.size {
+                if i < raw.len() {
+                    out.push(raw.at(i))
+                } else {
+                    out.push(0)
+                }
+                i = i + 1
+            }
+            continue
+        }
+        if next_number >= numbers.len() {
+            fail(WrongCount(next_number + 1, numbers.len()))
+        }
+        let value = numbers[next_number]
+        next_number = next_number + 1
+        if one.code == "?" {
+            out.push(if value != 0 { 1 } else { 0 })
+            continue
+        }
+        write_number(out, value, one.size, big_endian)
+    }
+    return bytes_of(out)
+}
+
+/// The numbers a record holds, in order. `s` fields are skipped; `unpack_text`
+/// answers those.
+pub fn unpack(format: str, data: bytes) -> [i64] ! StructError {
+    let list = try fields(format)
+    let big_endian = byte_order(format) == ">"
+    let padding = pads(format)
+    let needed = try size(format)
+    if data.len() < needed {
+        fail(Truncated(needed, data.len()))
+    }
+    var out: [i64] = []
+    var at = 0
+    for one in list {
+        if one.code == "x" {
+            at = at + 1
+            continue
+        }
+        var alignment = one.size
+        if one.code == "s" or one.code == "c" {
+            alignment = 1
+        }
+        if padding {
+            at = aligned(at, alignment)
+        }
+        if one.code == "s" or one.code == "c" {
+            at = at + one.size
+            continue
+        }
+        if one.code == "?" {
+            out.push(if data.at(at) != 0 { 1 } else { 0 })
+            at = at + 1
+            continue
+        }
+        out.push(read_number(data, at, one.size, big_endian, one.signed))
+        at = at + one.size
+    }
+    return out
+}
+
+/// The `s` fields a record holds, in order, with trailing zero bytes kept —
+/// a fixed-width text field is bytes, and trimming them is the caller's
+/// decision rather than this one's.
+pub fn unpack_text(format: str, data: bytes) -> [str] ! StructError {
+    let list = try fields(format)
+    let padding = pads(format)
+    let needed = try size(format)
+    if data.len() < needed {
+        fail(Truncated(needed, data.len()))
+    }
+    var out: [str] = []
+    var at = 0
+    for one in list {
+        if one.code == "x" {
+            at = at + 1
+            continue
+        }
+        var alignment = one.size
+        if one.code == "s" or one.code == "c" {
+            alignment = 1
+        }
+        if padding {
+            at = aligned(at, alignment)
+        }
+        if one.code == "s" or one.code == "c" {
+            var raw: [i64] = []
+            var i = 0
+            while i < one.size {
+                raw.push(data.at(at + i))
+                i = i + 1
+            }
+            out.push(bytes_of(raw).to_str())
+        }
+        at = at + one.size
+    }
+    return out
+}
