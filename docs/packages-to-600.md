@@ -30,9 +30,9 @@ One rule is added, because the count is now large enough for it to matter:
 | | |
 |---|---|
 | At the close of the 200 plan | 513 |
-| Now | 548 |
+| Now | 553 |
 | Target | 600 |
-| Remaining | 52 |
+| Remaining | 47 |
 
 The count is directories under `packages/` that are not `*-demo`. Test
 harnesses are directories and are counted; they are real programs that the
@@ -61,8 +61,6 @@ Each line is a batch of about six, chosen so that everything in it has an
 implementation elsewhere to be checked against. A name in brackets is the
 thing it is checked against.
 
-- **Japanese encodings** — `eucjp` and `iso2022jp` (Python `codecs`), which
-  share the JIS X 0208 table `shiftjis` already carries
 - **Names on the wire** — `idna` (Python `encodings.idna`), `countrycode`
   (ISO 3166), `xmlc14n` (`ElementTree.canonicalize`)
 

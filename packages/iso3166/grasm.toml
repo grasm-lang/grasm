@@ -1,0 +1,6 @@
+[package]
+name = "iso3166"
+version = "1.0.0"
+
+# A table. Reads no files.
+capabilities = []

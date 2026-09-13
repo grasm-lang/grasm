@@ -1,0 +1,226 @@
+// ISO-2022-JP: Japanese text that fits down a seven-bit pipe.
+//
+// This is what Japanese email is in. Not "was" — the header
+// `Content-Type: text/plain; charset=ISO-2022-JP` is still what a large
+// share of Japanese mail carries, because SMTP was seven-bit clean and
+// mailers that worked were not replaced. Anything that reads mail in
+// Japanese has to read this.
+//
+// It is not a character encoding in the way the others are. It is a
+// *stateful* one: the bytes are all below 0x80, and escape sequences switch
+// which character set the following bytes belong to.
+//
+//   `ESC ( B`   ASCII
+//   `ESC ( J`   JIS X 0201 Roman, which is ASCII with two changes: 0x5C is
+//               a yen sign and 0x7E is an overline
+//   `ESC $ @`   JIS X 0208-1978, two bytes a character
+//   `ESC $ B`   JIS X 0208-1983, two bytes a character
+//
+// Statefulness is the whole difficulty. A decoder has to carry the current
+// set across every byte, and the same byte 0x41 is `A` in one state and part
+// of a kanji in another. Cutting such a stream at an arbitrary point — a
+// line-wrap, a buffer boundary, a truncated message — leaves the remainder
+// undecodable, which is why the standard says a line must end in ASCII and
+// why an encoder that forgets to switch back produces mail that renders as
+// mojibake from the first line break onwards.
+//
+// The two JIS X 0208 sets are the same characters here. The 1978 and 1983
+// standards differ on a couple of dozen glyph shapes and swapped a few code
+// points; treating them as one is what every practical decoder does, and the
+// alternative is a second 6,879-entry table for a difference nobody can see
+// in the output.
+//
+// Checked against Python's `iso2022_jp` codec.
+
+import shiftjis
+
+type IsoJpError =
+    | IsoJpInvalid(at: i64, byte: i64)
+    | IsoJpTruncated(at: i64)
+    | IsoJpUnknownSet(at: i64)
+    | IsoJpUnencodable(at: i64, code: i64)
+
+let ASCII = 0
+let ROMAN = 1
+let KANJI = 2
+
+fn jis_to_pair(row: i64, cell: i64) -> (i64, i64) {
+    var lead = (row + 257) / 2
+    if row > 62 {
+        lead = (row + 385) / 2
+    }
+    var trail = cell + 158
+    if row % 2 == 1 {
+        trail = cell + 63
+        if cell >= 64 {
+            trail = trail + 1
+        }
+    }
+    return (lead, trail)
+}
+
+fn pair_to_jis(lead: i64, trail: i64) -> (i64, i64) {
+    var row = 0
+    var cell = 0
+    if lead < 224 {
+        row = lead * 2 - 257
+    } else {
+        row = lead * 2 - 385
+    }
+    if trail >= 159 {
+        row = row + 1
+        cell = trail - 158
+    } else {
+        cell = trail - 63
+        if trail >= 128 {
+            cell = cell - 1
+        }
+    }
+    return (row, cell)
+}
+
+/// Which set an escape sequence at `at` selects, and how long it is.
+fn escape_at(data: bytes, at: i64) -> (i64, i64) {
+    if at + 2 >= data.len() {
+        return (0 - 1, 0)
+    }
+    let second = data.at(at + 1)
+    let third = data.at(at + 2)
+    if second == 40 and third == 66 {
+        return (ASCII, 3)
+    }
+    if second == 40 and third == 74 {
+        return (ROMAN, 3)
+    }
+    if second == 36 and (third == 64 or third == 66) {
+        return (KANJI, 3)
+    }
+    // `ESC $ ( D` is JIS X 0212, which no table here carries.
+    return (0 - 1, 0)
+}
+
+/// The text `data` holds.
+pub fn decode(data: bytes) -> str ! IsoJpError {
+    var out = ""
+    var state = ASCII
+    var at = 0
+    while at < data.len() {
+        let b = data.at(at)
+        if b == 27 {
+            let found = escape_at(data, at)
+            if found.0 < 0 {
+                fail(IsoJpUnknownSet(at))
+            }
+            state = found.0
+            at = at + found.1
+            continue
+        }
+        if b > 127 {
+            // The point of the encoding is that this cannot happen.
+            fail(IsoJpInvalid(at, b))
+        }
+        if state != KANJI {
+            if state == ROMAN and b == 92 {
+                out = out + (165).to_char()
+            } else if state == ROMAN and b == 126 {
+                out = out + (8254).to_char()
+            } else {
+                out = out + b.to_char()
+            }
+            at = at + 1
+            continue
+        }
+        if b == 10 or b == 13 {
+            // A line ending inside kanji mode returns to ASCII, which is
+            // what every mailer does and what the standard asks for.
+            state = ASCII
+            out = out + b.to_char()
+            at = at + 1
+            continue
+        }
+        if at + 1 >= data.len() {
+            fail(IsoJpTruncated(at))
+        }
+        let second = data.at(at + 1)
+        if b < 33 or b > 126 or second < 33 or second > 126 {
+            fail(IsoJpInvalid(at, b))
+        }
+        let pair = jis_to_pair(b - 32, second - 32)
+        let code = shiftjis.pair_to_code(pair.0, pair.1)
+        if code < 0 {
+            fail(IsoJpInvalid(at, b))
+        }
+        out = out + code.to_char()
+        at = at + 2
+    }
+    return out
+}
+
+fn push_escape(inout out: [i64], set: i64) {
+    out.push(27)
+    if set == KANJI {
+        out.push(36)
+        out.push(66)
+    } else {
+        out.push(40)
+        out.push(66)
+    }
+}
+
+/// `text` as ISO-2022-JP, ending in ASCII as the standard requires.
+pub fn encode(text: str) -> bytes ! IsoJpError {
+    return try encode_with(shiftjis.encoder(), text)
+}
+
+/// The same, reusing a table built once.
+pub fn encode_with(table: ShiftJisEncoder, text: str) -> bytes ! IsoJpError {
+    var out: [i64] = []
+    var state = ASCII
+    var at = 0
+    for code in text.codes() {
+        if code < 128 {
+            if state != ASCII {
+                push_escape(out, ASCII)
+                state = ASCII
+            }
+            out.push(code)
+            at = at + 1
+            continue
+        }
+        match table.map.get(code) {
+            Some(packed) -> {
+                if state != KANJI {
+                    push_escape(out, KANJI)
+                    state = KANJI
+                }
+                let jis = pair_to_jis(packed / 256, packed % 256)
+                out.push(jis.0 + 32)
+                out.push(jis.1 + 32)
+            }
+            None -> fail(IsoJpUnencodable(at, code))
+        }
+        at = at + 1
+    }
+    // A stream that ends in kanji mode is a stream the next reader cannot
+    // start, so it always ends in ASCII.
+    if state != ASCII {
+        push_escape(out, ASCII)
+    }
+    return bytes_of(out)
+}
+
+/// Whether `data` is a valid ISO-2022-JP stream.
+pub fn is_valid(data: bytes) -> bool {
+    match decode(data) {
+        Ok(_text) -> return true
+        Err(_e) -> return false
+    }
+}
+
+/// Whether `text` can be written in ISO-2022-JP at all.
+pub fn is_encodable(text: str) -> bool {
+    match encode(text) {
+        Ok(_data) -> return true
+        Err(_e) -> return false
+    }
+}

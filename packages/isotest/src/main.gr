@@ -1,0 +1,24 @@
+import iso3166
+
+fn main() / {io} {
+    if args().len() == 0 {
+        for code in iso3166.codes() {
+            print(code + "\t" + (iso3166.name_of(code) ?? "") + "\t" +
+                iso3166.zones_of(code).join(","))
+        }
+        return
+    }
+    var i = 0
+    while i + 1 < args().len() {
+        let what = args()[i]
+        let arg = args()[i + 1]
+        if what == "name" {
+            print(iso3166.name_of(arg) ?? "-")
+        } else if what == "zones" {
+            print(iso3166.zones_of(arg).join(","))
+        } else {
+            print(iso3166.country_of_zone(arg) ?? "-")
+        }
+        i = i + 2
+    }
+}

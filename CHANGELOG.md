@@ -9,6 +9,22 @@ migration note here; anything `experimental` may change in any release. See
 
 ### Added
 
+- **Two more ways to write Japanese, and the country table.** `eucjp` is the
+  Unix encoding of JIS X 0208 — every byte of a multi-byte character has its
+  high bit set, which is the property Shift-JIS gives up and the argument
+  that produced UTF-8. `iso2022jp` is the seven-bit, stateful one that
+  Japanese email is still in, where escape sequences switch character set and
+  a stream that ends in kanji is a stream the next reader cannot start. Both
+  go through the 6,879-entry table `shiftjis` already carried rather than
+  copying it; the conversion between the two byte layouts is arithmetic.
+  `iso3166` is the country codes, their names and the time zones each uses,
+  taken from the tz database's `iso3166.tab` and `zone.tab` — which is also
+  what the gate re-reads, so a tzdata update fails the gate instead of
+  leaving the table quietly stale. The alpha-3 and numeric codes are
+  deliberately absent: no table on a normal machine carries them, and
+  writing 249 of them from memory is the thing rule 6 exists to prevent.
+  27,789 cases: `japanesediff` and `iso3166diff` are gates.
+
 - **Three packages about who a machine lets in.** `unixcrypt` computes the
   password hashes in `/etc/shadow` and `.htpasswd` — md5crypt, Apache's
   `$apr1$`, sha256crypt and sha512crypt — which is what checking an existing

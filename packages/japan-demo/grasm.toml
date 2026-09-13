@@ -1,0 +1,20 @@
+[package]
+name = "japan_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.eucjp]
+path = "../eucjp"
+version = "^1.0.0"
+
+[dependencies.iso2022jp]
+path = "../iso2022jp"
+version = "^1.0.0"
+
+[dependencies.shiftjis]
+path = "../shiftjis"
+version = "^1.0.0"
+
+[dependencies.iso3166]
+path = "../iso3166"
+version = "^1.0.0"

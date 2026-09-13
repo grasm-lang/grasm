@@ -1,0 +1,380 @@
+// The ISO 3166-1 alpha-2 country codes, their English names, and which time
+// zones each one uses.
+//
+// Any program that takes an address, prices something, ships something or
+// shows a local time needs to turn `DE` into "Germany" and `DE` into
+// `Europe/Berlin`. Neither mapping is derivable and both change — Czechia
+// became `CZ` in 1993, South Sudan appeared in 2011, the zone list moves
+// every year — so the only correct version is one taken from a source that
+// is maintained.
+//
+// This table comes from the time zone database's `iso3166.tab` and
+// `zone.tab`, which are in the public domain, are updated several times a
+// year, and are on every machine that can tell the time. That is also what
+// the gate checks against: it re-reads those files and compares, so an
+// update to the system's tzdata shows up as a failing gate rather than as
+// quietly stale data here.
+//
+// ## What is deliberately missing
+//
+// The alpha-3 and numeric codes. ISO sells the standard that defines them
+// and no table on a normal machine carries them, so writing them here would
+// mean writing 249 three-letter codes from memory — which is exactly the
+// kind of invention that has already been caught four times in this project.
+// `alpha3_of` does not exist rather than existing and being wrong.
+//
+// The names here are the tz database's, which depart from ISO's in a few
+// places on purpose: "Samoa (American)" rather than "American Samoa" so that
+// a sorted list groups them, and "Turkey" rather than "Türkiye" to avoid
+// churn. The file says so itself, and this follows the file.
+
+fn packed_names_0() -> str {
+    return "AD=Andorra|AE=United Arab Emirates|AF=Afghanistan|" +
+    "AG=Antigua & Barbuda|AI=Anguilla|AL=Albania|AM=Armenia|" +
+    "AO=Angola|AQ=Antarctica|AR=Argentina|AS=Samoa (American)|" +
+    "AT=Austria|AU=Australia|AW=Aruba|AX=Åland Islands|" +
+    "AZ=Azerbaijan|BA=Bosnia & Herzegovina|BB=Barbados|" +
+    "BD=Bangladesh|BE=Belgium|BF=Burkina Faso|BG=Bulgaria|" +
+    "BH=Bahrain|BI=Burundi|BJ=Benin|"
+}
+
+fn packed_names_1() -> str {
+    return "BL=St Barthelemy|BM=Bermuda|BN=Brunei|BO=Bolivia|" +
+    "BQ=Caribbean NL|BR=Brazil|BS=Bahamas|BT=Bhutan|" +
+    "BV=Bouvet Island|BW=Botswana|BY=Belarus|BZ=Belize|CA=Canada|" +
+    "CC=Cocos (Keeling) Islands|CD=Congo (Dem. Rep.)|" +
+    "CF=Central African Rep.|CG=Congo (Rep.)|CH=Switzerland|" +
+    "CI=Côte d’Ivoire|CK=Cook Islands|CL=Chile|CM=Cameroon|" +
+    "CN=China|CO=Colombia|CR=Costa Rica|"
+}
+
+fn packed_names_2() -> str {
+    return "CU=Cuba|CV=Cape Verde|CW=Curaçao|CX=Christmas Island|" +
+    "CY=Cyprus|CZ=Czech Republic|DE=Germany|DJ=Djibouti|" +
+    "DK=Denmark|DM=Dominica|DO=Dominican Republic|DZ=Algeria|" +
+    "EC=Ecuador|EE=Estonia|EG=Egypt|EH=Western Sahara|ER=Eritrea|" +
+    "ES=Spain|ET=Ethiopia|FI=Finland|FJ=Fiji|FK=Falkland Islands|" +
+    "FM=Micronesia|FO=Faroe Islands|FR=France|"
+}
+
+fn packed_names_3() -> str {
+    return "GA=Gabon|GB=Britain (UK)|GD=Grenada|GE=Georgia|" +
+    "GF=French Guiana|GG=Guernsey|GH=Ghana|GI=Gibraltar|" +
+    "GL=Greenland|GM=Gambia|GN=Guinea|GP=Guadeloupe|" +
+    "GQ=Equatorial Guinea|GR=Greece|" +
+    "GS=South Georgia & the South Sandwich Islands|GT=Guatemala|" +
+    "GU=Guam|GW=Guinea-Bissau|GY=Guyana|HK=Hong Kong|" +
+    "HM=Heard Island & McDonald Islands|HN=Honduras|HR=Croatia|" +
+    "HT=Haiti|HU=Hungary|"
+}
+
+fn packed_names_4() -> str {
+    return "ID=Indonesia|IE=Ireland|IL=Israel|IM=Isle of Man|IN=India|" +
+    "IO=British Indian Ocean Territory|IQ=Iraq|IR=Iran|IS=Iceland|" +
+    "IT=Italy|JE=Jersey|JM=Jamaica|JO=Jordan|JP=Japan|KE=Kenya|" +
+    "KG=Kyrgyzstan|KH=Cambodia|KI=Kiribati|KM=Comoros|" +
+    "KN=St Kitts & Nevis|KP=Korea (North)|KR=Korea (South)|" +
+    "KW=Kuwait|KY=Cayman Islands|KZ=Kazakhstan|"
+}
+
+fn packed_names_5() -> str {
+    return "LA=Laos|LB=Lebanon|LC=St Lucia|LI=Liechtenstein|LK=Sri Lanka|" +
+    "LR=Liberia|LS=Lesotho|LT=Lithuania|LU=Luxembourg|LV=Latvia|" +
+    "LY=Libya|MA=Morocco|MC=Monaco|MD=Moldova|ME=Montenegro|" +
+    "MF=St Martin (French)|MG=Madagascar|MH=Marshall Islands|" +
+    "MK=North Macedonia|ML=Mali|MM=Myanmar (Burma)|MN=Mongolia|" +
+    "MO=Macau|MP=Northern Mariana Islands|MQ=Martinique|"
+}
+
+fn packed_names_6() -> str {
+    return "MR=Mauritania|MS=Montserrat|MT=Malta|MU=Mauritius|" +
+    "MV=Maldives|MW=Malawi|MX=Mexico|MY=Malaysia|MZ=Mozambique|" +
+    "NA=Namibia|NC=New Caledonia|NE=Niger|NF=Norfolk Island|" +
+    "NG=Nigeria|NI=Nicaragua|NL=Netherlands|NO=Norway|NP=Nepal|" +
+    "NR=Nauru|NU=Niue|NZ=New Zealand|OM=Oman|PA=Panama|PE=Peru|" +
+    "PF=French Polynesia|"
+}
+
+fn packed_names_7() -> str {
+    return "PG=Papua New Guinea|PH=Philippines|PK=Pakistan|PL=Poland|" +
+    "PM=St Pierre & Miquelon|PN=Pitcairn|PR=Puerto Rico|" +
+    "PS=Palestine|PT=Portugal|PW=Palau|PY=Paraguay|QA=Qatar|" +
+    "RE=Réunion|RO=Romania|RS=Serbia|RU=Russia|RW=Rwanda|" +
+    "SA=Saudi Arabia|SB=Solomon Islands|SC=Seychelles|SD=Sudan|" +
+    "SE=Sweden|SG=Singapore|SH=St Helena|SI=Slovenia|"
+}
+
+fn packed_names_8() -> str {
+    return "SJ=Svalbard & Jan Mayen|SK=Slovakia|SL=Sierra Leone|" +
+    "SM=San Marino|SN=Senegal|SO=Somalia|SR=Suriname|" +
+    "SS=South Sudan|ST=Sao Tome & Principe|SV=El Salvador|" +
+    "SX=St Maarten (Dutch)|SY=Syria|SZ=Eswatini (Swaziland)|" +
+    "TC=Turks & Caicos Is|TD=Chad|TF=French S. Terr.|TG=Togo|" +
+    "TH=Thailand|TJ=Tajikistan|TK=Tokelau|TL=East Timor|" +
+    "TM=Turkmenistan|TN=Tunisia|TO=Tonga|TR=Turkey|"
+}
+
+fn packed_names_9() -> str {
+    return "TT=Trinidad & Tobago|TV=Tuvalu|TW=Taiwan|TZ=Tanzania|" +
+    "UA=Ukraine|UG=Uganda|UM=US minor outlying islands|" +
+    "US=United States|UY=Uruguay|UZ=Uzbekistan|VA=Vatican City|" +
+    "VC=St Vincent|VE=Venezuela|VG=Virgin Islands (UK)|" +
+    "VI=Virgin Islands (US)|VN=Vietnam|VU=Vanuatu|" +
+    "WF=Wallis & Futuna|WS=Samoa (western)|YE=Yemen|YT=Mayotte|" +
+    "ZA=South Africa|ZM=Zambia|ZW=Zimbabwe|"
+}
+
+fn packed_names() -> str {
+    return packed_names_0() +
+    packed_names_1() +
+    packed_names_2() +
+    packed_names_3() +
+    packed_names_4() +
+    packed_names_5() +
+    packed_names_6() +
+    packed_names_7() +
+    packed_names_8() +
+    packed_names_9()
+}
+
+fn packed_zones_0() -> str {
+    return "AD=Europe/Andorra|AE=Asia/Dubai|AF=Asia/Kabul|" +
+    "AG=America/Antigua|AI=America/Anguilla|AL=Europe/Tirane|" +
+    "AM=Asia/Yerevan|AO=Africa/Luanda|" +
+    "AQ=Antarctica/McMurdo,Antarctica/Casey,Antarctica/Davis,Antarctica/DumontDUrville,Antarctica/Mawson,Antarctica/Palmer,Antarctica/Rothera,Antarctica/Syowa,Antarctica/Troll,Antarctica/Vostok|" +
+    "AR=America/Argentina/Buenos_Aires,America/Argentina/Cordoba,America/Argentina/Salta,America/Argentina/Jujuy,America/Argentina/Tucuman,America/Argentina/Catamarca,America/Argentina/La_Rioja,America/Argentina/San_Juan,America/Argentina/Mendoza,America/Argentina/San_Luis,America/Argentina/Rio_Gallegos,America/Argentina/Ushuaia|" +
+    "AS=Pacific/Pago_Pago|AT=Europe/Vienna|" +
+    "AU=Australia/Lord_Howe,Antarctica/Macquarie,Australia/Hobart,Australia/Melbourne,Australia/Sydney,Australia/Broken_Hill,Australia/Brisbane,Australia/Lindeman,Australia/Adelaide,Australia/Darwin,Australia/Perth,Australia/Eucla|" +
+    "AW=America/Aruba|AX=Europe/Mariehamn|AZ=Asia/Baku|" +
+    "BA=Europe/Sarajevo|BB=America/Barbados|BD=Asia/Dhaka|" +
+    "BE=Europe/Brussels|BF=Africa/Ouagadougou|BG=Europe/Sofia|" +
+    "BH=Asia/Bahrain|BI=Africa/Bujumbura|BJ=Africa/Porto-Novo|"
+}
+
+fn packed_zones_1() -> str {
+    return "BL=America/St_Barthelemy|BM=Atlantic/Bermuda|BN=Asia/Brunei|" +
+    "BO=America/La_Paz|BQ=America/Kralendijk|" +
+    "BR=America/Noronha,America/Belem,America/Fortaleza,America/Recife,America/Araguaina,America/Maceio,America/Bahia,America/Sao_Paulo,America/Campo_Grande,America/Cuiaba,America/Santarem,America/Porto_Velho,America/Boa_Vista,America/Manaus,America/Eirunepe,America/Rio_Branco|" +
+    "BS=America/Nassau|BT=Asia/Thimphu|BW=Africa/Gaborone|" +
+    "BY=Europe/Minsk|BZ=America/Belize|" +
+    "CA=America/St_Johns,America/Halifax,America/Glace_Bay,America/Moncton,America/Goose_Bay,America/Blanc-Sablon,America/Toronto,America/Iqaluit,America/Atikokan,America/Winnipeg,America/Resolute,America/Rankin_Inlet,America/Regina,America/Swift_Current,America/Edmonton,America/Cambridge_Bay,America/Inuvik,America/Vancouver,America/Creston,America/Dawson_Creek,America/Fort_Nelson,America/Whitehorse,America/Dawson|" +
+    "CC=Indian/Cocos|CD=Africa/Kinshasa,Africa/Lubumbashi|" +
+    "CF=Africa/Bangui|CG=Africa/Brazzaville|CH=Europe/Zurich|" +
+    "CI=Africa/Abidjan|CK=Pacific/Rarotonga|" +
+    "CL=America/Santiago,America/Coyhaique,America/Punta_Arenas,Pacific/Easter|" +
+    "CM=Africa/Douala|CN=Asia/Shanghai,Asia/Urumqi|" +
+    "CO=America/Bogota|CR=America/Costa_Rica|CU=America/Havana|"
+}
+
+fn packed_zones_2() -> str {
+    return "CV=Atlantic/Cape_Verde|CW=America/Curacao|" +
+    "CX=Indian/Christmas|CY=Asia/Nicosia,Asia/Famagusta|" +
+    "CZ=Europe/Prague|DE=Europe/Berlin,Europe/Busingen|" +
+    "DJ=Africa/Djibouti|DK=Europe/Copenhagen|DM=America/Dominica|" +
+    "DO=America/Santo_Domingo|DZ=Africa/Algiers|" +
+    "EC=America/Guayaquil,Pacific/Galapagos|EE=Europe/Tallinn|" +
+    "EG=Africa/Cairo|EH=Africa/El_Aaiun|ER=Africa/Asmara|" +
+    "ES=Europe/Madrid,Africa/Ceuta,Atlantic/Canary|" +
+    "ET=Africa/Addis_Ababa|FI=Europe/Helsinki|FJ=Pacific/Fiji|" +
+    "FK=Atlantic/Stanley|" +
+    "FM=Pacific/Chuuk,Pacific/Pohnpei,Pacific/Kosrae|" +
+    "FO=Atlantic/Faroe|FR=Europe/Paris|GA=Africa/Libreville|"
+}
+
+fn packed_zones_3() -> str {
+    return "GB=Europe/London|GD=America/Grenada|GE=Asia/Tbilisi|" +
+    "GF=America/Cayenne|GG=Europe/Guernsey|GH=Africa/Accra|" +
+    "GI=Europe/Gibraltar|" +
+    "GL=America/Nuuk,America/Danmarkshavn,America/Scoresbysund,America/Thule|" +
+    "GM=Africa/Banjul|GN=Africa/Conakry|GP=America/Guadeloupe|" +
+    "GQ=Africa/Malabo|GR=Europe/Athens|GS=Atlantic/South_Georgia|" +
+    "GT=America/Guatemala|GU=Pacific/Guam|GW=Africa/Bissau|" +
+    "GY=America/Guyana|HK=Asia/Hong_Kong|HN=America/Tegucigalpa|" +
+    "HR=Europe/Zagreb|HT=America/Port-au-Prince|" +
+    "HU=Europe/Budapest|" +
+    "ID=Asia/Jakarta,Asia/Pontianak,Asia/Makassar,Asia/Jayapura|" +
+    "IE=Europe/Dublin|"
+}
+
+fn packed_zones_4() -> str {
+    return "IL=Asia/Jerusalem|IM=Europe/Isle_of_Man|IN=Asia/Kolkata|" +
+    "IO=Indian/Chagos|IQ=Asia/Baghdad|IR=Asia/Tehran|" +
+    "IS=Atlantic/Reykjavik|IT=Europe/Rome|JE=Europe/Jersey|" +
+    "JM=America/Jamaica|JO=Asia/Amman|JP=Asia/Tokyo|" +
+    "KE=Africa/Nairobi|KG=Asia/Bishkek|KH=Asia/Phnom_Penh|" +
+    "KI=Pacific/Tarawa,Pacific/Kanton,Pacific/Kiritimati|" +
+    "KM=Indian/Comoro|KN=America/St_Kitts|KP=Asia/Pyongyang|" +
+    "KR=Asia/Seoul|KW=Asia/Kuwait|KY=America/Cayman|" +
+    "KZ=Asia/Almaty,Asia/Qyzylorda,Asia/Qostanay,Asia/Aqtobe,Asia/Aqtau,Asia/Atyrau,Asia/Oral|" +
+    "LA=Asia/Vientiane|LB=Asia/Beirut|"
+}
+
+fn packed_zones_5() -> str {
+    return "LC=America/St_Lucia|LI=Europe/Vaduz|LK=Asia/Colombo|" +
+    "LR=Africa/Monrovia|LS=Africa/Maseru|LT=Europe/Vilnius|" +
+    "LU=Europe/Luxembourg|LV=Europe/Riga|LY=Africa/Tripoli|" +
+    "MA=Africa/Casablanca|MC=Europe/Monaco|MD=Europe/Chisinau|" +
+    "ME=Europe/Podgorica|MF=America/Marigot|" +
+    "MG=Indian/Antananarivo|MH=Pacific/Majuro,Pacific/Kwajalein|" +
+    "MK=Europe/Skopje|ML=Africa/Bamako|MM=Asia/Yangon|" +
+    "MN=Asia/Ulaanbaatar,Asia/Hovd|MO=Asia/Macau|" +
+    "MP=Pacific/Saipan|MQ=America/Martinique|MR=Africa/Nouakchott|" +
+    "MS=America/Montserrat|"
+}
+
+fn packed_zones_6() -> str {
+    return "MT=Europe/Malta|MU=Indian/Mauritius|MV=Indian/Maldives|" +
+    "MW=Africa/Blantyre|" +
+    "MX=America/Mexico_City,America/Cancun,America/Merida,America/Monterrey,America/Matamoros,America/Chihuahua,America/Ciudad_Juarez,America/Ojinaga,America/Mazatlan,America/Bahia_Banderas,America/Hermosillo,America/Tijuana|" +
+    "MY=Asia/Kuala_Lumpur,Asia/Kuching|MZ=Africa/Maputo|" +
+    "NA=Africa/Windhoek|NC=Pacific/Noumea|NE=Africa/Niamey|" +
+    "NF=Pacific/Norfolk|NG=Africa/Lagos|NI=America/Managua|" +
+    "NL=Europe/Amsterdam|NO=Europe/Oslo|NP=Asia/Kathmandu|" +
+    "NR=Pacific/Nauru|NU=Pacific/Niue|" +
+    "NZ=Pacific/Auckland,Pacific/Chatham|OM=Asia/Muscat|" +
+    "PA=America/Panama|PE=America/Lima|" +
+    "PF=Pacific/Tahiti,Pacific/Marquesas,Pacific/Gambier|" +
+    "PG=Pacific/Port_Moresby,Pacific/Bougainville|PH=Asia/Manila|"
+}
+
+fn packed_zones_7() -> str {
+    return "PK=Asia/Karachi|PL=Europe/Warsaw|PM=America/Miquelon|" +
+    "PN=Pacific/Pitcairn|PR=America/Puerto_Rico|" +
+    "PS=Asia/Gaza,Asia/Hebron|" +
+    "PT=Europe/Lisbon,Atlantic/Madeira,Atlantic/Azores|" +
+    "PW=Pacific/Palau|PY=America/Asuncion|QA=Asia/Qatar|" +
+    "RE=Indian/Reunion|RO=Europe/Bucharest|RS=Europe/Belgrade|" +
+    "RU=Europe/Kaliningrad,Europe/Moscow,Europe/Kirov,Europe/Volgograd,Europe/Astrakhan,Europe/Saratov,Europe/Ulyanovsk,Europe/Samara,Asia/Yekaterinburg,Asia/Omsk,Asia/Novosibirsk,Asia/Barnaul,Asia/Tomsk,Asia/Novokuznetsk,Asia/Krasnoyarsk,Asia/Irkutsk,Asia/Chita,Asia/Yakutsk,Asia/Khandyga,Asia/Vladivostok,Asia/Ust-Nera,Asia/Magadan,Asia/Sakhalin,Asia/Srednekolymsk,Asia/Kamchatka,Asia/Anadyr|" +
+    "RW=Africa/Kigali|SA=Asia/Riyadh|SB=Pacific/Guadalcanal|" +
+    "SC=Indian/Mahe|SD=Africa/Khartoum|SE=Europe/Stockholm|" +
+    "SG=Asia/Singapore|SH=Atlantic/St_Helena|SI=Europe/Ljubljana|" +
+    "SJ=Arctic/Longyearbyen|SK=Europe/Bratislava|"
+}
+
+fn packed_zones_8() -> str {
+    return "SL=Africa/Freetown|SM=Europe/San_Marino|SN=Africa/Dakar|" +
+    "SO=Africa/Mogadishu|SR=America/Paramaribo|SS=Africa/Juba|" +
+    "ST=Africa/Sao_Tome|SV=America/El_Salvador|" +
+    "SX=America/Lower_Princes|SY=Asia/Damascus|SZ=Africa/Mbabane|" +
+    "TC=America/Grand_Turk|TD=Africa/Ndjamena|TF=Indian/Kerguelen|" +
+    "TG=Africa/Lome|TH=Asia/Bangkok|TJ=Asia/Dushanbe|" +
+    "TK=Pacific/Fakaofo|TL=Asia/Dili|TM=Asia/Ashgabat|" +
+    "TN=Africa/Tunis|TO=Pacific/Tongatapu|TR=Europe/Istanbul|" +
+    "TT=America/Port_of_Spain|TV=Pacific/Funafuti|"
+}
+
+fn packed_zones_9() -> str {
+    return "TW=Asia/Taipei|TZ=Africa/Dar_es_Salaam|" +
+    "UA=Europe/Simferopol,Europe/Kyiv|UG=Africa/Kampala|" +
+    "UM=Pacific/Midway,Pacific/Wake|" +
+    "US=America/New_York,America/Detroit,America/Kentucky/Louisville,America/Kentucky/Monticello,America/Indiana/Indianapolis,America/Indiana/Vincennes,America/Indiana/Winamac,America/Indiana/Marengo,America/Indiana/Petersburg,America/Indiana/Vevay,America/Chicago,America/Indiana/Tell_City,America/Indiana/Knox,America/Menominee,America/North_Dakota/Center,America/North_Dakota/New_Salem,America/North_Dakota/Beulah,America/Denver,America/Boise,America/Phoenix,America/Los_Angeles,America/Anchorage,America/Juneau,America/Sitka,America/Metlakatla,America/Yakutat,America/Nome,America/Adak,Pacific/Honolulu|" +
+    "UY=America/Montevideo|UZ=Asia/Samarkand,Asia/Tashkent|" +
+    "VA=Europe/Vatican|VC=America/St_Vincent|VE=America/Caracas|" +
+    "VG=America/Tortola|VI=America/St_Thomas|VN=Asia/Ho_Chi_Minh|" +
+    "VU=Pacific/Efate|WF=Pacific/Wallis|WS=Pacific/Apia|" +
+    "YE=Asia/Aden|YT=Indian/Mayotte|ZA=Africa/Johannesburg|" +
+    "ZM=Africa/Lusaka|ZW=Africa/Harare|"
+}
+
+fn packed_zones() -> str {
+    return packed_zones_0() +
+    packed_zones_1() +
+    packed_zones_2() +
+    packed_zones_3() +
+    packed_zones_4() +
+    packed_zones_5() +
+    packed_zones_6() +
+    packed_zones_7() +
+    packed_zones_8() +
+    packed_zones_9()
+}
+
+let NAMES: Map[str, str] = load(packed_names())
+let ZONES: Map[str, str] = load(packed_zones())
+
+fn load(packed: str) -> Map[str, str] {
+    var out: Map[str, str] = {}
+    for entry in packed.split("|") {
+        if entry.len() == 0 {
+            continue
+        }
+        let cut = entry.index_of("=") ?? -1
+        if cut < 0 {
+            continue
+        }
+        out.set(entry.substr(0, cut),
+            entry.substr(cut + 1, entry.len() - cut - 1))
+    }
+    return out
+}
+
+/// The English name for an alpha-2 code, upper or lower case.
+pub fn name_of(code: str) -> Option[str] {
+    return NAMES.get(code.to_upper())
+}
+
+/// Whether `code` is an assigned alpha-2 country code.
+pub fn is_country(code: str) -> bool {
+    return NAMES.has(code.to_upper())
+}
+
+/// Every assigned code, in order.
+pub fn codes() -> [str] {
+    var out: [str] = []
+    for key in NAMES.keys() {
+        out.push(key)
+    }
+    out.sort()
+    return out
+}
+
+/// How many there are, which is a number worth being able to assert.
+pub fn count() -> i64 {
+    return NAMES.len()
+}
+
+/// The time zone names a country uses, in the order `zone.tab` lists them —
+/// which puts the most populous first.
+pub fn zones_of(code: str) -> [str] {
+    match ZONES.get(code.to_upper()) {
+        Some(list) -> return list.split(",")
+        None -> return []
+    }
+}
+
+/// The one zone a country uses, when it uses exactly one.
+///
+/// Most countries do. The ones that do not — the United States, Russia,
+/// Australia and a dozen others — cannot be given a single answer, and a
+/// caller that wants one has to ask a person which.
+pub fn single_zone(code: str) -> Option[str] {
+    let list = zones_of(code)
+    if list.len() == 1 {
+        return Some(list[0])
+    }
+    return None
+}
+
+/// The country a zone belongs to, which is the lookup a timestamp needs.
+pub fn country_of_zone(zone: str) -> Option[str] {
+    for entry in ZONES.entries() {
+        for name in entry.1.split(",") {
+            if name == zone {
+                return Some(entry.0)
+            }
+        }
+    }
+    return None
+}
+
+/// The codes with more than one zone, which is the list a user interface has
+/// to ask about.
+pub fn multi_zone_codes() -> [str] {
+    var out: [str] = []
+    for code in codes() {
+        if zones_of(code).len() > 1 {
+            out.push(code)
+        }
+    }
+    return out
+}

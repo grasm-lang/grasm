@@ -1,0 +1,180 @@
+// EUC-JP: the other way of writing the same Japanese characters.
+//
+// `packages/shiftjis` covers the encoding Microsoft chose in 1982. EUC-JP is
+// what the Unix side chose instead, and it is what a great deal of Japanese
+// mail, Usenet, and older web content is in — and what `ja_JP.eucJP` locales
+// still mean. Both encode JIS X 0208, the same 6,879 characters; they
+// disagree entirely about which bytes to use.
+//
+// The difference is worth understanding because it is the whole argument
+// that produced UTF-8. Shift-JIS packs the two-byte characters into the gaps
+// around ASCII, so a trail byte can be `\` or `[` and a naive byte scan
+// splits a kanji in half. EUC-JP refuses to do that: **every byte of a
+// multi-byte character has its high bit set**, so no byte of one can be
+// mistaken for ASCII. The cost is that it cannot also keep the single-byte
+// katakana in one byte, so those take two — `0x8E` and then the katakana.
+//
+// The arithmetic between the two is simple and is the reason this package is
+// small. A JIS X 0208 character has a row and a cell, both 1..94. EUC-JP
+// writes them as `row + 0xA0`, `cell + 0xA0`. Shift-JIS folds two rows into
+// one lead byte and skips `0x7F`, which is the `+ 1` below and the only
+// awkward part. Going through Shift-JIS means one table in the tree rather
+// than two copies of the same 6,879 characters.
+//
+// ## What is not here
+//
+// A three-byte sequence starting `0x8F` is JIS X 0212, a supplementary set
+// of 6,067 more characters that no table in this tree carries. Those are
+// refused rather than decoded wrongly or silently dropped. They are rare —
+// most EUC-JP in the world is JIS X 0208 and ASCII — and a decoder that
+// pretended otherwise would be worse than one that says so.
+//
+// Checked against Python's `euc_jp` codec over every character both know.
+
+import shiftjis
+
+type EucJpError =
+    | EucJpInvalid(at: i64, byte: i64)
+    | EucJpTruncated(at: i64)
+    | EucJpSupplementary(at: i64)
+    | EucJpUnencodable(at: i64, code: i64)
+
+    /// The Shift-JIS byte pair for a JIS X 0208 row and cell, both 1-based.
+    ///
+    /// Shift-JIS puts two JIS rows in each lead byte and steps over `0x7F`,
+    /// which is the only part of this that is not addition.
+fn jis_to_pair(row: i64, cell: i64) -> (i64, i64) {
+    var lead = (row + 257) / 2
+    if row > 62 {
+        lead = (row + 385) / 2
+    }
+    var trail = cell + 158
+    if row % 2 == 1 {
+        trail = cell + 63
+        if cell >= 64 {
+            trail = trail + 1
+        }
+    }
+    return (lead, trail)
+}
+
+/// And back, which encoding needs.
+fn pair_to_jis(lead: i64, trail: i64) -> (i64, i64) {
+    var row = 0
+    var cell = 0
+    if lead < 224 {
+        row = lead * 2 - 257
+    } else {
+        row = lead * 2 - 385
+    }
+    if trail >= 159 {
+        row = row + 1
+        cell = trail - 158
+    } else {
+        cell = trail - 63
+        if trail >= 128 {
+            cell = cell - 1
+        }
+    }
+    return (row, cell)
+}
+
+/// The text `data` holds.
+pub fn decode(data: bytes) -> str ! EucJpError {
+    var out = ""
+    var at = 0
+    while at < data.len() {
+        let b = data.at(at)
+        if b < 128 {
+            out = out + b.to_char()
+            at = at + 1
+            continue
+        }
+        if b == 142 {
+            // Half-width katakana, which Shift-JIS keeps in one byte and
+            // this cannot.
+            if at + 1 >= data.len() {
+                fail(EucJpTruncated(at))
+            }
+            let k = data.at(at + 1)
+            if k < 161 or k > 223 {
+                fail(EucJpInvalid(at + 1, k))
+            }
+            out = out + (65377 + k - 161).to_char()
+            at = at + 2
+            continue
+        }
+        if b == 143 {
+            fail(EucJpSupplementary(at))
+        }
+        if b < 161 or b > 254 {
+            fail(EucJpInvalid(at, b))
+        }
+        if at + 1 >= data.len() {
+            fail(EucJpTruncated(at))
+        }
+        let second = data.at(at + 1)
+        if second < 161 or second > 254 {
+            fail(EucJpInvalid(at + 1, second))
+        }
+        let pair = jis_to_pair(b - 160, second - 160)
+        let code = shiftjis.pair_to_code(pair.0, pair.1)
+        if code < 0 {
+            fail(EucJpInvalid(at, b))
+        }
+        out = out + code.to_char()
+        at = at + 2
+    }
+    return out
+}
+
+/// `text` as EUC-JP, or which character could not be written.
+pub fn encode(text: str) -> bytes ! EucJpError {
+    let table = shiftjis.encoder()
+    return try encode_with(table, text)
+}
+
+/// The same, reusing a table built once, which a document needs.
+pub fn encode_with(table: ShiftJisEncoder, text: str) -> bytes ! EucJpError {
+    var out: [i64] = []
+    var at = 0
+    for code in text.codes() {
+        if code < 128 {
+            out.push(code)
+            at = at + 1
+            continue
+        }
+        if code >= 65377 and code <= 65439 {
+            out.push(142)
+            out.push(code - 65377 + 161)
+            at = at + 1
+            continue
+        }
+        match table.map.get(code) {
+            Some(packed) -> {
+                let jis = pair_to_jis(packed / 256, packed % 256)
+                out.push(jis.0 + 160)
+                out.push(jis.1 + 160)
+            }
+            None -> fail(EucJpUnencodable(at, code))
+        }
+        at = at + 1
+    }
+    return bytes_of(out)
+}
+
+/// Whether every byte of `data` is a valid EUC-JP sequence.
+pub fn is_valid(data: bytes) -> bool {
+    match decode(data) {
+        Ok(_text) -> return true
+        Err(_e) -> return false
+    }
+}
+
+/// Whether `text` can be written in EUC-JP at all.
+pub fn is_encodable(text: str) -> bool {
+    match encode(text) {
+        Ok(_data) -> return true
+        Err(_e) -> return false
+    }
+}

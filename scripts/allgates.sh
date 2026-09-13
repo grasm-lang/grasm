@@ -87,6 +87,8 @@ run_gate closematchdiff scripts/closematch_diff.sh
 run_gate compressdiff   scripts/compress_diff.sh
 run_gate unixcryptdiff  scripts/unixcrypt_diff.sh
 run_gate sshkeydiff     scripts/sshkey_diff.sh
+run_gate japanesediff   scripts/japanese_diff.sh
+run_gate iso3166diff    scripts/iso3166_diff.sh
 run_gate kvcrash       scripts/kvstore_crash.sh
 run_gate zlibdiff      scripts/zlib_diff.sh
 run_gate casefolddiff  scripts/casefold_diff.sh

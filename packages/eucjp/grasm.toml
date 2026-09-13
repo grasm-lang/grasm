@@ -1,0 +1,10 @@
+[package]
+name = "eucjp"
+version = "1.0.0"
+
+# Bytes to text and back. Opens nothing.
+capabilities = []
+
+[dependencies.shiftjis]
+path = "../shiftjis"
+version = "^1.0.0"

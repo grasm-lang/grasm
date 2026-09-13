@@ -1,0 +1,110 @@
+// Three encodings of one character set, and the country table that says
+// which clock a place runs on.
+import eucjp
+import iso2022jp
+import shiftjis
+import iso3166
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn hex_of(raw: bytes) -> str {
+    let digits = "0123456789abcdef"
+    var out = ""
+    var i = 0
+    while i < raw.len() {
+        out = out + digits.substr(raw.at(i) / 16, 1) +
+        digits.substr(raw.at(i) % 16, 1)
+        i = i + 1
+    }
+    return out
+}
+
+fn check_eucjp(inout f: i64) / {io} {
+    let word = "日本語"
+    say(f, "\"日本語\" is six bytes in EUC-JP",
+        (eucjp.encode(word) ?? "".to_bytes()).len() == 6)
+    say(f, "and every one of them has its high bit set",
+        hex_of(eucjp.encode(word) ?? "".to_bytes()) == "c6fccbdcb8ec")
+    say(f, "which decodes back to what went in",
+        (eucjp.decode(eucjp.encode(word) ?? "".to_bytes()) ?? "") == word)
+    // Shift-JIS puts the same characters in bytes that overlap ASCII; this
+    // is the difference the two encodings exist to argue about.
+    say(f, "Shift-JIS writes the same word in different bytes",
+        hex_of(shiftjis.encode(word) ?? "".to_bytes()) == "93fa967b8cea")
+    say(f, "ASCII passes through unchanged",
+        hex_of(eucjp.encode("hello") ?? "".to_bytes()) == "68656c6c6f")
+    // Half-width katakana cost one byte in Shift-JIS and two here.
+    say(f, "half-width katakana take two bytes",
+        (eucjp.encode("ｱ") ?? "".to_bytes()).len() == 2)
+    say(f, "and start with 8e",
+        (eucjp.encode("ｱ") ?? "".to_bytes()).at(0) == 142)
+    say(f, "a three-byte 8f sequence is JIS X 0212 and is refused",
+        not eucjp.is_valid(bytes_of([143, 161, 161])))
+    say(f, "a lone high byte is refused",
+        not eucjp.is_valid(bytes_of([200])))
+}
+
+fn check_iso2022jp(inout f: i64) / {io} {
+    let word = "日本語"
+    let encoded = iso2022jp.encode(word) ?? "".to_bytes()
+    say(f, "every byte is below 0x80, which is the point",
+        iso2022jp.is_valid(encoded))
+    say(f, "the stream switches into kanji and back out",
+        hex_of(encoded) == "1b2442467c4b5c386c1b2842")
+    say(f, "and decodes to what went in",
+        (iso2022jp.decode(encoded) ?? "") == word)
+    say(f, "a stream that is pure ASCII needs no escapes",
+        hex_of(iso2022jp.encode("hello") ?? "".to_bytes()) == "68656c6c6f")
+    // An encoder that forgets to switch back produces mail that is
+    // mojibake from the next line onwards, so text that ends in kanji
+    // still ends with the escape back to ASCII.
+    let ends_in_kanji = iso2022jp.encode("あ") ?? "".to_bytes()
+    say(f, "text ending in kanji still ends in the ASCII escape",
+        hex_of(ends_in_kanji) == "1b244224221b2842")
+    say(f, "1978 and 1983 select the same characters",
+        (iso2022jp.decode(bytes_of([27, 36, 64, 70, 124, 27, 40, 66])) ??
+            "") == "日")
+    say(f, "an escape this does not know is refused",
+        not iso2022jp.is_valid(bytes_of([27, 36, 40, 68, 33, 33])))
+    say(f, "and a high byte is refused, because there are none",
+        not iso2022jp.is_valid(bytes_of([200])))
+}
+
+fn check_iso3166(inout f: i64) / {io} {
+    say(f, "there are 249 assigned codes", iso3166.count() == 249)
+    say(f, "JP is Japan", iso3166.name_of("JP") == Some("Japan"))
+    say(f, "and jp is too, because case is not information",
+        iso3166.name_of("jp") == Some("Japan"))
+    say(f, "Japan runs on one clock",
+        iso3166.single_zone("JP") == Some("Asia/Tokyo"))
+    say(f, "the United States does not",
+        iso3166.single_zone("US") == None)
+    say(f, "and has more than twenty zones",
+        iso3166.zones_of("US").len() > 20)
+    say(f, "a zone maps back to its country",
+        iso3166.country_of_zone("Asia/Tokyo") == Some("JP"))
+    say(f, "ZZ is not a country", not iso3166.is_country("ZZ"))
+    say(f, "and the codes come back sorted",
+        iso3166.codes()[0] == "AD")
+}
+
+fn main() / {io} {
+    var f = 0
+
+    check_eucjp(f)
+    check_iso2022jp(f)
+    check_iso3166(f)
+
+    if f == 0 {
+        print("japan: every claim held")
+    } else {
+        print("japan: {f} failed")
+    }
+}

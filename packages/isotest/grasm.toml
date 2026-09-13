@@ -1,0 +1,8 @@
+[package]
+name = "isotest"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.iso3166]
+path = "../iso3166"
+version = "^1.0.0"
