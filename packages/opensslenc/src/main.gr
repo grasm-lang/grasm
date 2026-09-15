@@ -1,0 +1,383 @@
+// Files encrypted with `openssl enc`, and files `openssl enc` can decrypt.
+//
+// `openssl enc -aes-256-cbc -pbkdf2 -in secrets.tar -out secrets.tar.enc` is
+// how a great many backups, deploy secrets and CI artifacts are encrypted,
+// because every machine has the command. The format is OpenSSL's own and
+// documented mostly by its source:
+//
+//     Salted__ <8-byte salt> <ciphertext>
+//
+// - With a password, the key and IV come from the password and the salt.
+//   `-pbkdf2` (or `-iter`) uses PBKDF2-HMAC with 10,000 iterations by
+//   default; without it, the legacy `EVP_BytesToKey` with one round of the
+//   digest — SHA-256 since OpenSSL 1.1.0, MD5 before, which is why a file
+//   from an old machine needs `-md md5` on a new one.
+// - `-nosalt` leaves the header out and derives from the password alone.
+// - `-K` and `-iv` give the key and IV in hex, with no header; a short hex
+//   string is padded with zero bytes, as OpenSSL pads it.
+// - CBC and ECB pad with PKCS#7 unless `-nopad`; CTR needs no padding.
+//   Decryption with the wrong password fails as `bad decrypt` — usually;
+//   one wrong key in 256 happens to leave valid padding, in OpenSSL too.
+// - `-a` wraps the output in base64 lines of 64 characters.
+//
+// `packages/aes` is the block cipher, and it is a table-driven software AES:
+// its warning about cache timing applies here.
+//
+// Checked against `openssl enc` with fixed salts, both directions, over
+// AES-128, -192 and -256 in CBC, ECB and CTR, both key derivations and three
+// digests.
+
+import aes
+import crypto_hash
+import md5
+import sha1
+import bytes_codec
+
+type EncError =
+    | EncUnknownCipher(name: str)
+    | EncUnknownDigest(name: str)
+    | EncBadMagic
+    | EncBadDecrypt
+    | EncNotBlockMultiple(length: i64)
+    | EncKeyTooLong(what: str)
+
+type EncOptions = {
+    /// `aes-128-cbc`, `aes-256-ctr`, `aes-192-ecb` and so on.
+    cipher: str,
+    password: bytes,
+    /// Eight bytes to salt with when encrypting; empty for `-nosalt`.
+    salt: bytes,
+    /// Whether decryption expects a salt header.
+    salted: bool,
+    pbkdf2: bool,
+    iterations: i64,
+    /// `sha256`, `sha1` or `md5`.
+    digest: str,
+    padding: bool,
+    /// A raw key (`-K`); when set, the password is not used.
+    key: bytes,
+    iv: bytes,
+}
+
+/// `openssl enc` with a password, PBKDF2 and its defaults.
+pub fn with_password(cipher: str, password: str, salt: bytes) -> EncOptions {
+    return EncOptions{ cipher: cipher, password: password.to_bytes(),
+        salt: salt, salted: salt.len() > 0, pbkdf2: true, iterations: 10000,
+        digest: "sha256", padding: true, key: bytes_of([]), iv: bytes_of([]) }
+}
+
+fn cipher_shape(name: str) -> (i64, str) ! EncError {
+    let sizes = ["aes-128-", "aes-192-", "aes-256-"]
+    var i = 0
+    while i < sizes.len() {
+        if name.starts_with(sizes[i]) {
+            let mode = name.substr(8, name.len())
+            if mode == "cbc" or mode == "ecb" or mode == "ctr" {
+                return (16 + 8 * i, mode)
+            }
+        }
+        i = i + 1
+    }
+    fail(EncUnknownCipher(name))
+}
+
+fn digest(name: str, data: bytes) -> bytes ! EncError {
+    if name == "sha256" {
+        return crypto_hash.sha256_of(data)
+    }
+    if name == "sha1" {
+        return sha1.hash(data)
+    }
+    if name == "md5" {
+        return md5.hash(data)
+    }
+    fail(EncUnknownDigest(name))
+}
+
+fn xor_with(data: bytes, value: i64) -> bytes {
+    var out: [i64] = []
+    var i = 0
+    while i < data.len() {
+        out.push(data.at(i).bit_xor(value))
+        i = i + 1
+    }
+    return bytes_of(out)
+}
+
+fn concat(a: bytes, b: bytes) -> bytes {
+    var out: [i64] = []
+    var i = 0
+    while i < a.len() {
+        out.push(a.at(i))
+        i = i + 1
+    }
+    i = 0
+    while i < b.len() {
+        out.push(b.at(i))
+        i = i + 1
+    }
+    return bytes_of(out)
+}
+
+fn hmac(name: str, key_given: bytes, message: bytes) -> bytes ! EncError {
+    // SHA-256, SHA-1 and MD5 all work in 64-byte blocks.
+    let block = 64
+    var key = key_given
+    if key.len() > block {
+        key = try digest(name, key)
+    }
+    var padded: [i64] = []
+    var i = 0
+    while i < block {
+        padded.push(if i < key.len() { key.at(i) } else { 0 })
+        i = i + 1
+    }
+    let k = bytes_of(padded)
+    let inner = try digest(name, concat(xor_with(k, 54), message))
+    return try digest(name, concat(xor_with(k, 92), inner))
+}
+
+/// PBKDF2 with HMAC over the named digest.
+pub fn pbkdf2(name: str, password: bytes, salt: bytes, iterations: i64,
+    length: i64) -> bytes ! EncError {
+    var out: [i64] = []
+    var index = 1
+    while out.len() < length {
+        let counter = bytes_of([index.ushr(24).bit_and(255),
+            index.ushr(16).bit_and(255), index.ushr(8).bit_and(255),
+            index.bit_and(255)])
+        var u = try hmac(name, password, concat(salt, counter))
+        var t: [i64] = []
+        var i = 0
+        while i < u.len() {
+            t.push(u.at(i))
+            i = i + 1
+        }
+        var round = 1
+        while round < iterations {
+            u = try hmac(name, password, u)
+            i = 0
+            while i < u.len() {
+                t[i] = t[i].bit_xor(u.at(i))
+                i = i + 1
+            }
+            round = round + 1
+        }
+        for b in t {
+            out.push(b)
+        }
+        index = index + 1
+    }
+    return bytes_of(out).slice(0, length)
+}
+
+/// `EVP_BytesToKey` with one iteration: digests of the previous digest,
+/// the password and the salt, joined until there are enough bytes.
+pub fn bytes_to_key(name: str, password: bytes, salt: bytes,
+    length: i64) -> bytes ! EncError {
+    var out = bytes_of([])
+    var previous = bytes_of([])
+    while out.len() < length {
+        previous = try digest(name, concat(concat(previous, password), salt))
+        out = concat(out, previous)
+    }
+    return out.slice(0, length)
+}
+
+/// A hex key or IV as `-K` and `-iv` read it, zero-padded to `length`.
+pub fn from_hex_padded(text: str, length: i64, what: str) -> bytes ! EncError {
+    var out: [i64] = []
+    var i = 0
+    while i + 1 < text.len() {
+        out.push(text.substr(i, 2).parse_int_base(16) ?? 0)
+        i = i + 2
+    }
+    if i < text.len() {
+        out.push((text.substr(i, 1).parse_int_base(16) ?? 0) * 16)
+    }
+    if out.len() > length {
+        fail(EncKeyTooLong(what))
+    }
+    while out.len() < length {
+        out.push(0)
+    }
+    return bytes_of(out)
+}
+
+/// The key and IV these options produce, given the salt to use.
+pub fn derive(o: EncOptions, salt: bytes) -> (bytes, bytes) ! EncError {
+    let shape = try cipher_shape(o.cipher)
+    let iv_length = if shape.1 == "ecb" { 0 } else { 16 }
+    if o.key.len() > 0 {
+        return (o.key, o.iv)
+    }
+    let material = if o.pbkdf2 {
+        try pbkdf2(o.digest, o.password, salt, o.iterations,
+            shape.0 + iv_length)
+    } else {
+        try bytes_to_key(o.digest, o.password, salt, shape.0 + iv_length)
+    }
+    return (material.slice(0, shape.0), material.slice(shape.0,
+        shape.0 + iv_length))
+}
+
+fn increment(counter: [i64]) -> [i64] {
+    var c = counter
+    var i = 15
+    while i >= 0 {
+        c[i] = (c[i] + 1) % 256
+        if c[i] != 0 {
+            break
+        }
+        i = i - 1
+    }
+    return c
+}
+
+fn transform(o: EncOptions, key: bytes, iv: bytes, data: bytes,
+    decrypting: bool) -> bytes ! EncError {
+    let shape = try cipher_shape(o.cipher)
+    let cipher = aes.new_cipher(key)
+    var out: [i64] = []
+    var chain: [i64] = []
+    var i = 0
+    while i < 16 {
+        chain.push(if i < iv.len() { iv.at(i) } else { 0 })
+        i = i + 1
+    }
+    var at = 0
+    while at < data.len() {
+        let end = if at + 16 < data.len() { at + 16 } else { data.len() }
+        let block = data.slice(at, end)
+        if shape.1 == "ctr" {
+            let stream = aes.encrypt_with(cipher, bytes_of(chain))
+            var k = 0
+            while k < block.len() {
+                out.push(block.at(k).bit_xor(stream.at(k)))
+                k = k + 1
+            }
+            chain = increment(chain)
+        } else if decrypting {
+            let plain = aes.decrypt_with(cipher, block)
+            var k = 0
+            while k < 16 {
+                out.push(if shape.1 == "cbc" { plain.at(k).bit_xor(chain[k]) }
+                    else { plain.at(k) })
+                chain[k] = block.at(k)
+                k = k + 1
+            }
+        } else {
+            var mixed: [i64] = []
+            var k = 0
+            while k < 16 {
+                mixed.push(if shape.1 == "cbc" { block.at(k).bit_xor(chain[k]) }
+                    else { block.at(k) })
+                k = k + 1
+            }
+            let sealed = aes.encrypt_with(cipher, bytes_of(mixed))
+            k = 0
+            while k < 16 {
+                out.push(sealed.at(k))
+                chain[k] = sealed.at(k)
+                k = k + 1
+            }
+        }
+        at = end
+    }
+    return bytes_of(out)
+}
+
+fn pkcs7(data: bytes) -> bytes {
+    let n = 16 - data.len() % 16
+    var out: [i64] = []
+    var i = 0
+    while i < data.len() {
+        out.push(data.at(i))
+        i = i + 1
+    }
+    i = 0
+    while i < n {
+        out.push(n)
+        i = i + 1
+    }
+    return bytes_of(out)
+}
+
+/// What `openssl enc -e` writes.
+pub fn encrypt(data: bytes, o: EncOptions) -> bytes ! EncError {
+    let shape = try cipher_shape(o.cipher)
+    let keys = try derive(o, o.salt)
+    var body = data
+    if shape.1 != "ctr" {
+        if o.padding {
+            body = pkcs7(data)
+        } else if data.len() % 16 != 0 {
+            fail(EncNotBlockMultiple(data.len()))
+        }
+    }
+    let sealed = try transform(o, keys.0, keys.1, body, false)
+    if o.key.len() == 0 and o.salt.len() > 0 {
+        return concat(concat("Salted__".to_bytes(), o.salt), sealed)
+    }
+    return sealed
+}
+
+/// What `openssl enc -d` recovers.
+pub fn decrypt(data: bytes, o: EncOptions) -> bytes ! EncError {
+    let shape = try cipher_shape(o.cipher)
+    var salt = bytes_of([])
+    var body = data
+    if o.key.len() == 0 and o.salted {
+        if data.len() < 16 or data.slice(0, 8).to_str() != "Salted__" {
+            fail(EncBadMagic)
+        }
+        salt = data.slice(8, 16)
+        body = data.slice(16, data.len())
+    }
+    let keys = try derive(o, salt)
+    if shape.1 == "ctr" {
+        return try transform(o, keys.0, keys.1, body, true)
+    }
+    if body.len() % 16 != 0 {
+        fail(EncBadDecrypt)
+    }
+    let plain = try transform(o, keys.0, keys.1, body, true)
+    if not o.padding {
+        return plain
+    }
+    if plain.len() == 0 {
+        fail(EncBadDecrypt)
+    }
+    let n = plain.at(plain.len() - 1)
+    if n < 1 or n > 16 {
+        fail(EncBadDecrypt)
+    }
+    var i = plain.len() - n
+    while i < plain.len() {
+        if plain.at(i) != n {
+            fail(EncBadDecrypt)
+        }
+        i = i + 1
+    }
+    return plain.slice(0, plain.len() - n)
+}
+
+/// Base64 the way `-a` writes it: lines of 64 characters, each ending in a
+/// newline.
+pub fn armor(data: bytes) -> str {
+    let body = bytes_codec.encode_base64(data)
+    var out = ""
+    var at = 0
+    while at < body.len() {
+        let take = if body.len() - at > 64 { 64 } else { body.len() - at }
+        out = out + body.substr(at, take) + "\n"
+        at = at + take
+    }
+    return out
+}
+
+/// The bytes inside `-a` output.
+pub fn unarmor(text: str) -> bytes {
+    return bytes_codec.decode_base64(text.replace("\n", "").replace("\r", "")) ??
+    bytes_of([])
+}

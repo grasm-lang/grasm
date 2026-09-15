@@ -1,0 +1,10 @@
+[package]
+name = "posixcksum"
+version = "1.0.0"
+
+# Arithmetic over bytes it is given. Opens nothing.
+capabilities = []
+
+[dependencies.crc32]
+path = "../crc32"
+version = "^1.0.0"

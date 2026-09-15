@@ -1,0 +1,97 @@
+import posixcksum
+import opensslenc
+import sshcert
+import terminfo
+
+fn from_hex_bytes(text: str) -> bytes {
+    var out: [i64] = []
+    var i = 1
+    while i + 1 < text.len() {
+        out.push(text.substr(i, 2).parse_int_base(16) ?? 0)
+        i = i + 2
+    }
+    return bytes_of(out)
+}
+
+fn hex(raw: bytes) -> str {
+    let digits = "0123456789abcdef"
+    var out = ""
+    var i = 0
+    while i < raw.len() {
+        out = out + digits.substr(raw.at(i) / 16, 1) +
+        digits.substr(raw.at(i) % 16, 1)
+        i = i + 1
+    }
+    return out
+}
+
+fn th(text: str) -> str {
+    return hex(text.to_bytes())
+}
+
+/// `cipher,password,salthex,pbkdf2,iterations,digest,pad,keyhex,ivhex`
+fn options_of(spec: str) -> EncOptions {
+    let p = spec.split(",")
+    let salt = from_hex_bytes(":" + p[2])
+    return EncOptions{ cipher: p[0], password: from_hex_bytes(":" + p[1]),
+        salt: salt, salted: salt.len() > 0 or p[2] == "-", pbkdf2: p[3] == "1",
+        iterations: p[4].parse_int() ?? 1, digest: p[5], padding: p[6] == "1",
+        key: from_hex_bytes(":" + p[7]), iv: from_hex_bytes(":" + p[8]) }
+}
+
+fn run_enc(what: str, data: bytes, spec: str) -> str {
+    let o = options_of(spec)
+    if what == "enc" {
+        return match opensslenc.encrypt(data, o) {
+            Ok(out) -> hex(out)
+            Err(_e) -> th("?")
+        }
+    }
+    return match opensslenc.decrypt(data, o) {
+        Ok(out) -> hex(out)
+        Err(_e) -> th("?")
+    }
+}
+
+// Every command is `<name> <hex argument> <hex argument>`, three words.
+fn main() / {io} {
+    var i = 0
+    while i + 2 < args().len() {
+        let what = args()[i]
+        let raw = from_hex_bytes(args()[i + 1])
+        let b = from_hex_bytes(args()[i + 2]).to_str()
+        if what == "ck" {
+            let path = raw.to_str()
+            let data = read_bytes(path) ?? bytes_of([])
+            let algorithm = b.parse_int() ?? 0
+            if algorithm == 9 {
+                print(th(posixcksum.sum_line(data, path)))
+            } else {
+                print(th(posixcksum.line(data, algorithm, path) ?? "?"))
+            }
+        } else if what == "enc" or what == "dec" {
+            print(run_enc(what, raw, b))
+        } else if what == "cert" {
+            print(th(match sshcert.parse(raw.to_str()) {
+                Ok(c) -> sshcert.listing(c, b) ?? "?"
+                Err(_e) -> "?"
+            }))
+        } else if what == "certv" {
+            print(match sshcert.parse(raw.to_str()) {
+                Ok(c) -> match sshcert.verify(c) {
+                    Ok(yes) -> if yes { "yes" } else { "no" }
+                    Err(_e) -> "unverifiable"
+                }
+                Err(_e) -> "no"
+            })
+        } else {
+            let path = raw.to_str()
+            let data = read_bytes(path) ?? bytes_of([])
+            print(th(match terminfo.parse(data) {
+                Ok(e) -> terminfo.render(e, path, b == "x")
+                Err(_e) -> "?"
+            }))
+        }
+        i = i + 3
+    }
+}

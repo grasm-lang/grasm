@@ -31,9 +31,9 @@ One more is added, because this stretch leans on it:
 | | |
 |---|---|
 | At the close of the 600 plan | 600 |
-| Now | 629 |
+| Now | 634 |
 | Target | 650 |
-| Remaining | 21 |
+| Remaining | 16 |
 
 The count is directories under `packages/` that are not `*-demo`. Test
 harnesses are counted.
@@ -67,12 +67,13 @@ harnesses are counted.
   itself: `check-ref-format`, `config --get-color`, `check-mailmap`,
   `shortlog`, `diff --raw` over generated repositories and `bundle
   create`/`list-heads`. `mailmap` was rewritten on the way to match git.
+- [x] **Unix tools** — `posixcksum` `opensslenc` `sshcert` `terminfo`, and
+  the harness `unixtest`. 8,452 cases against `cksum`, `sum`, `openssl enc`,
+  `ssh-keygen -L` and `infocmp -1` over all 2,684 system terminfo entries.
 
 ### Next
 
 Each line has an implementation to be checked against on this machine.
 
-- **Unix tools** — `posixcksum` (`cksum`, `sum`), `sshcert` (`ssh-keygen
-  -L`), `opensslenc` (`openssl enc`), `terminfo` (derived from `tic` itself)
 - **Other languages' formats** — `rubymarshal` (`ruby`), `perlpack` (`perl`),
   `pytokenize` (`tokenize`)

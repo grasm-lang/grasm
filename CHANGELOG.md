@@ -9,6 +9,16 @@ migration note here; anything `experimental` may change in any release. See
 
 ### Added
 
+- **Four formats the Unix toolbox writes.** `posixcksum` is `cksum`'s POSIX
+  CRC and the two historic `sum` algorithms. `opensslenc` reads and writes
+  `openssl enc` files — `Salted__` headers, PBKDF2 or the legacy
+  `EVP_BytesToKey`, AES in CBC, ECB and CTR — and `aes` gained the inverse
+  cipher it needs. `sshcert` reads OpenSSH certificates, prints what
+  `ssh-keygen -L` prints and verifies Ed25519, P-256 and RSA CA signatures.
+  `terminfo` reads compiled terminfo entries with a capability table
+  generated from `infocmp` itself, and prints them as `infocmp -1` does for
+  every entry on the system. 8,452 cases against the tools; `unixdiff` is a
+  gate.
 - **More of git without git.** `gitrefname` is `git check-ref-format`:
   which names git accepts for a ref or a branch, with refspec patterns and
   normalizing. `gitcolor` turns `color.*` settings into the escape codes git

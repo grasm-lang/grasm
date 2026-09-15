@@ -1,0 +1,488 @@
+// OpenSSH certificates: a key, who it is for, and a CA's signature on both.
+//
+// An OpenSSH certificate is how an organisation lets people log in without
+// copying keys onto every server: a CA signs a user's key together with the
+// principals it may log in as, a validity window and restrictions, and the
+// server trusts the CA. Bastions, access brokers and audit tools all need to
+// read one — to show who a certificate was issued to and until when, to
+// refuse one whose window has closed, to check that the CA really signed it.
+//
+// This reads the format in OpenSSH's `PROTOCOL.certkeys`, prints what
+// `ssh-keygen -L` prints, and checks the CA's signature for the CA key types
+// the rest of this set can verify: Ed25519, ECDSA over P-256, and RSA with
+// SHA-256 or SHA-512. A certificate signed with another real key type is
+// reported as not checkable here rather than as valid; one whose CA key is
+// not a key type at all is simply not valid.
+//
+// Things a quick reader gets wrong:
+//
+// - A certificate's fingerprint is the fingerprint of the *plain* key inside
+//   it, not of the certificate blob — so it matches the user's own `.pub`.
+// - The signature covers every byte of the certificate before the signature
+//   field, which includes the CA's key; the signature *algorithm* can differ
+//   from the CA key's type (`rsa-sha2-512` for an `ssh-rsa` key).
+// - Validity bounds are unsigned 64-bit seconds, so "forever" is
+//   `0xffffffffffffffff`, which does not fit in a signed number.
+// - A critical option's value and an extension's are themselves wrapped in
+//   a length-prefixed string; `force-command` and `source-address` hold one
+//   string inside that, and unknown options are shown in hex.
+//
+// Checked against `ssh-keygen -L` over certificates `ssh-keygen -s` issued
+// for every key type, with principals, options and validity windows, and
+// against its refusal of certificates whose signatures were tampered with.
+
+import bytes_codec
+import crypto_hash
+import sshkey
+import ed25519
+import p256
+import rsa
+import bigint
+
+type SshCertError =
+    | SshCertMalformed(why: str)
+    | SshCertUnverifiable(kind: str)
+
+type SshCertOption = {
+    name: str,
+    data: bytes,
+}
+
+type SshCertificate = {
+    /// The certificate type, like `ssh-ed25519-cert-v01@openssh.com`.
+    kind: str,
+    nonce: bytes,
+    /// The plain public key's wire encoding.
+    key_blob: bytes,
+    serial_high: i64,
+    serial_low: i64,
+    /// 1 for a user certificate, 2 for a host certificate.
+    cert_type: i64,
+    key_id: str,
+    principals: [str],
+    valid_after_high: i64,
+    valid_after_low: i64,
+    valid_before_high: i64,
+    valid_before_low: i64,
+    critical_options: [SshCertOption],
+    extensions: [SshCertOption],
+    reserved: bytes,
+    signature_key: bytes,
+    signature: bytes,
+    /// Every byte the signature covers.
+    signed: bytes,
+    comment: str,
+}
+
+type CertReader = {
+    data: bytes,
+    at: i64,
+}
+
+fn read_u32(r: CertReader) -> (i64, CertReader) ! SshCertError {
+    if r.at + 4 > r.data.len() {
+        fail(SshCertMalformed("truncated"))
+    }
+    let d = r.data
+    let v = d.at(r.at) * 16777216 + d.at(r.at + 1) * 65536 +
+    d.at(r.at + 2) * 256 + d.at(r.at + 3)
+    return (v, CertReader{ data: d, at: r.at + 4 })
+}
+
+fn read_string(r: CertReader) -> (bytes, CertReader) ! SshCertError {
+    let size = try read_u32(r)
+    let next = size.1
+    if next.at + size.0 > next.data.len() {
+        fail(SshCertMalformed("truncated"))
+    }
+    return (next.data.slice(next.at, next.at + size.0),
+        CertReader{ data: next.data, at: next.at + size.0 })
+}
+
+fn put_string(inout out: [i64], data: bytes) {
+    let n = data.len()
+    out.push(n.ushr(24).bit_and(255))
+    out.push(n.ushr(16).bit_and(255))
+    out.push(n.ushr(8).bit_and(255))
+    out.push(n.bit_and(255))
+    var i = 0
+    while i < data.len() {
+        out.push(data.at(i))
+        i = i + 1
+    }
+}
+
+/// How many key fields follow the nonce for each certificate type, and the
+/// plain type they belong to.
+fn plain_shape(kind: str) -> (str, i64) ! SshCertError {
+    let suffix = "-cert-v01@openssh.com"
+    if not kind.ends_with(suffix) {
+        fail(SshCertMalformed("not a certificate type: " + kind))
+    }
+    let base = kind.substr(0, kind.len() - suffix.len())
+    if base == "ssh-rsa" or base == "ecdsa-sha2-nistp256" or
+    base == "ecdsa-sha2-nistp384" or base == "ecdsa-sha2-nistp521" or
+    base == "sk-ssh-ed25519" {
+        return (if base.starts_with("sk-") { base + "@openssh.com" } else {
+            base }, 2)
+    }
+    if base == "ssh-ed25519" {
+        return (base, 1)
+    }
+    if base == "ssh-dss" {
+        return (base, 4)
+    }
+    if base == "sk-ecdsa-sha2-nistp256" {
+        return (base + "@openssh.com", 3)
+    }
+    fail(SshCertMalformed("unknown certificate type: " + kind))
+}
+
+fn read_options(blob: bytes) -> [SshCertOption] ! SshCertError {
+    var out: [SshCertOption] = []
+    var r = CertReader{ data: blob, at: 0 }
+    while r.at < blob.len() {
+        let name = try read_string(r)
+        let data = try read_string(name.1)
+        out.push(SshCertOption{ name: name.0.to_str(), data: data.0 })
+        r = data.1
+    }
+    return out
+}
+
+fn read_list(blob: bytes) -> [str] ! SshCertError {
+    var out: [str] = []
+    var r = CertReader{ data: blob, at: 0 }
+    while r.at < blob.len() {
+        let s = try read_string(r)
+        out.push(s.0.to_str())
+        r = s.1
+    }
+    return out
+}
+
+fn read_body(kind: str, r0: CertReader) -> (SshCertificate, CertReader) ! SshCertError {
+    let shape = try plain_shape(kind)
+    let nonce = try read_string(r0)
+    var r = nonce.1
+    var key: [i64] = []
+    put_string(key, shape.0.to_bytes())
+    var i = 0
+    while i < shape.1 {
+        let field = try read_string(r)
+        put_string(key, field.0)
+        r = field.1
+        i = i + 1
+    }
+    let serial_high = try read_u32(r)
+    let serial_low = try read_u32(serial_high.1)
+    let cert_type = try read_u32(serial_low.1)
+    let key_id = try read_string(cert_type.1)
+    let principals = try read_string(key_id.1)
+    let after_high = try read_u32(principals.1)
+    let after_low = try read_u32(after_high.1)
+    let before_high = try read_u32(after_low.1)
+    let before_low = try read_u32(before_high.1)
+    let critical = try read_string(before_low.1)
+    let extensions = try read_string(critical.1)
+    let reserved = try read_string(extensions.1)
+    let signature_key = try read_string(reserved.1)
+    return (SshCertificate{ kind: kind, nonce: nonce.0,
+        key_blob: bytes_of(key), serial_high: serial_high.0,
+        serial_low: serial_low.0, cert_type: cert_type.0,
+        key_id: key_id.0.to_str(), principals: try read_list(principals.0),
+        valid_after_high: after_high.0, valid_after_low: after_low.0,
+        valid_before_high: before_high.0, valid_before_low: before_low.0,
+        critical_options: try read_options(critical.0),
+        extensions: try read_options(extensions.0), reserved: reserved.0,
+        signature_key: signature_key.0, signature: bytes_of([]),
+        signed: bytes_of([]), comment: "" }, signature_key.1)
+}
+
+/// A certificate from its wire encoding.
+pub fn from_blob(blob: bytes) -> SshCertificate ! SshCertError {
+    let kind = try read_string(CertReader{ data: blob, at: 0 })
+    let body = try read_body(kind.0.to_str(), kind.1)
+    var cert = body.0
+    cert.signed = blob.slice(0, body.1.at)
+    let signature = try read_string(body.1)
+    if signature.1.at != blob.len() {
+        fail(SshCertMalformed("data after the signature"))
+    }
+    cert.signature = signature.0
+    return cert
+}
+
+/// A certificate from a `-cert.pub` line: type, base64, comment.
+pub fn parse(line: str) -> SshCertificate ! SshCertError {
+    let words = line.trim().split(" ")
+    if words.len() < 2 {
+        fail(SshCertMalformed("expected a type and base64"))
+    }
+    match bytes_codec.decode_base64(words[1]) {
+        Some(blob) -> {
+            var cert = try from_blob(blob)
+            if cert.kind != words[0] {
+                fail(SshCertMalformed("the line and the blob disagree on type"))
+            }
+            cert.comment = words.slice(2, words.len()).join(" ")
+            return cert
+        }
+        None -> fail(SshCertMalformed("not base64"))
+    }
+}
+
+fn first_string(blob: bytes) -> str {
+    return match read_string(CertReader{ data: blob, at: 0 }) {
+        Ok(s) -> s.0.to_str()
+        Err(_e) -> ""
+    }
+}
+
+/// The algorithm the CA signed with, from the signature itself.
+pub fn signature_type(cert: SshCertificate) -> str {
+    return first_string(cert.signature)
+}
+
+/// `ssh-keygen`'s short name for a key type, `-CERT` added for a
+/// certificate.
+pub fn type_label(kind: str) -> str {
+    let cert = kind.ends_with("-cert-v01@openssh.com")
+    let base = if cert { kind.substr(0, kind.len() - 21) } else { kind }
+    var label = base
+    if base == "ssh-rsa" {
+        label = "RSA"
+    } else if base == "ssh-dss" {
+        label = "DSA"
+    } else if base == "ssh-ed25519" {
+        label = "ED25519"
+    } else if base.starts_with("ecdsa-sha2-") {
+        label = "ECDSA"
+    } else if base.starts_with("sk-ecdsa-sha2-") {
+        label = "ECDSA-SK"
+    } else if base.starts_with("sk-ssh-ed25519") {
+        label = "ED25519-SK"
+    }
+    return if cert { label + "-CERT" } else { label }
+}
+
+fn fingerprint(blob: bytes) -> str {
+    let key = SshPublicKey{ kind: first_string(blob), blob: blob,
+        comment: "", options: [] }
+    return sshkey.fingerprint_sha256(key)
+}
+
+fn u64_text(high: i64, low: i64) -> str {
+    let value = bigint.add(bigint.mul(bigint.from_i64(high),
+        bigint.from_i64(4294967296)), bigint.from_i64(low))
+    return bigint.to_str(value)
+}
+
+fn two(n: i64) -> str {
+    return "{n}".pad_start(2, "0")
+}
+
+/// Seconds since the epoch as `ssh-keygen` writes them, in UTC.
+fn utc_text(high: i64, low: i64) -> str {
+    // Anything past the year 292 billion is clamped, as OpenSSH clamps to
+    // its largest time_t; no real certificate is near that.
+    let seconds = if high >= 2147483648 { 9223372036854775807 } else {
+        high * 4294967296 + low }
+    let days = seconds / 86400
+    let rest = seconds % 86400
+    let z = days + 719468
+    let era = z / 146097
+    let doe = z - era * 146097
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100)
+    let mp = (5 * doy + 2) / 153
+    let day = doy - (153 * mp + 2) / 5 + 1
+    let month = if mp < 10 { mp + 3 } else { mp - 9 }
+    let year = yoe + era * 400 + (if month <= 2 { 1 } else { 0 })
+    return "{year}-{two(month)}-{two(day)}T{two(rest / 3600)}:" +
+    "{two(rest / 60 % 60)}:{two(rest % 60)}"
+}
+
+/// The `Valid:` line's text: `forever`, `before ...`, `after ...` or
+/// `from ... to ...`, in UTC.
+pub fn validity(cert: SshCertificate) -> str {
+    let starts = cert.valid_after_high != 0 or cert.valid_after_low != 0
+    let ends = cert.valid_before_high != 4294967295 or
+    cert.valid_before_low != 4294967295
+    if not starts and not ends {
+        return "forever"
+    }
+    let from = utc_text(cert.valid_after_high, cert.valid_after_low)
+    let to = utc_text(cert.valid_before_high, cert.valid_before_low)
+    if not starts {
+        return "before " + to
+    }
+    if not ends {
+        return "after " + from
+    }
+    return "from " + from + " to " + to
+}
+
+fn hex(data: bytes) -> str {
+    let digits = "0123456789abcdef"
+    var out = ""
+    var i = 0
+    while i < data.len() {
+        out = out + digits.substr(data.at(i) / 16, 1) +
+        digits.substr(data.at(i) % 16, 1)
+        i = i + 1
+    }
+    return out
+}
+
+fn option_lines(options: [SshCertOption], critical: bool) -> str ! SshCertError {
+    var out = ""
+    let flags = ["permit-X11-forwarding", "permit-agent-forwarding",
+        "permit-port-forwarding", "permit-pty", "permit-user-rc",
+        "no-touch-required"]
+    for o in options {
+        out = out + "                " + o.name
+        if not critical and flags.contains(o.name) {
+            out = out + "\n"
+        } else if critical and (o.name == "force-command" or
+            o.name == "source-address") {
+            let inner = try read_string(CertReader{ data: o.data, at: 0 })
+            out = out + " " + inner.0.to_str() + "\n"
+        } else if critical and o.name == "verify-required" {
+            out = out + "\n"
+        } else if o.data.len() > 0 {
+            out = out + " UNKNOWN OPTION: " + hex(o.data) +
+            " (len {o.data.len()})\n"
+        } else {
+            out = out + " UNKNOWN FLAG OPTION\n"
+        }
+    }
+    return out
+}
+
+/// What `ssh-keygen -L -f <name>` prints, with times in UTC.
+pub fn listing(cert: SshCertificate, name: str) -> str ! SshCertError {
+    let kind_name = if cert.cert_type == 1 { "user" } else if cert.cert_type == 2 {
+        "host" } else { "unknown" }
+    var out = name + ":\n"
+    out = out + "        Type: " + cert.kind + " " + kind_name + " certificate\n"
+    out = out + "        Public key: " + type_label(cert.kind) + " " +
+    fingerprint(cert.key_blob) + "\n"
+    out = out + "        Signing CA: " + type_label(first_string(cert.signature_key)) +
+    " " + fingerprint(cert.signature_key) + " (using " + signature_type(cert) +
+    ")\n"
+    out = out + "        Key ID: \"" + cert.key_id + "\"\n"
+    out = out + "        Serial: " + u64_text(cert.serial_high, cert.serial_low) +
+    "\n"
+    out = out + "        Valid: " + validity(cert) + "\n"
+    out = out + "        Principals: "
+    if cert.principals.len() == 0 {
+        out = out + "(none)\n"
+    } else {
+        for p in cert.principals {
+            out = out + "\n                " + p
+        }
+        out = out + "\n"
+    }
+    out = out + "        Critical Options: "
+    out = out + (if cert.critical_options.len() == 0 { "(none)\n" } else {
+        "\n" + try option_lines(cert.critical_options, true) })
+    out = out + "        Extensions: "
+    out = out + (if cert.extensions.len() == 0 { "(none)\n" } else {
+        "\n" + try option_lines(cert.extensions, false) })
+    return out
+}
+
+fn strings_of(blob: bytes) -> [bytes] {
+    var out: [bytes] = []
+    var r = CertReader{ data: blob, at: 0 }
+    while r.at < blob.len() {
+        match read_string(r) {
+            Ok(s) -> {
+                out.push(s.0)
+                r = s.1
+            }
+            Err(_e) -> return out
+        }
+    }
+    return out
+}
+
+fn fixed32(value: bytes) -> bytes {
+    var out: [i64] = []
+    var start = 0
+    while start < value.len() - 32 and value.at(start) == 0 {
+        start = start + 1
+    }
+    var pad = 32 - (value.len() - start)
+    while pad > 0 {
+        out.push(0)
+        pad = pad - 1
+    }
+    var i = start
+    while i < value.len() {
+        out.push(value.at(i))
+        i = i + 1
+    }
+    return bytes_of(out)
+}
+
+/// Whether the CA's signature is valid: a certificate signed with a CA key
+/// type this cannot check is an error, not a yes or a no.
+pub fn verify(cert: SshCertificate) -> bool ! SshCertError {
+    let ca = strings_of(cert.signature_key)
+    let sig = strings_of(cert.signature)
+    if ca.len() < 2 or sig.len() < 2 {
+        return false
+    }
+    let ca_type = ca[0].to_str()
+    let algorithm = sig[0].to_str()
+    if ca_type == "ssh-ed25519" {
+        return algorithm == "ssh-ed25519" and
+        ed25519.verify(ca[1], cert.signed, sig[1])
+    }
+    if ca_type == "ssh-rsa" and ca.len() == 3 {
+        let hash = if algorithm == "rsa-sha2-256" { rsa.SHA256 } else if algorithm ==
+        "rsa-sha2-512" { rsa.SHA512 } else { "" }
+        if algorithm == "ssh-rsa" {
+            fail(SshCertUnverifiable(algorithm))
+        }
+        if hash == "" {
+            return false
+        }
+        return match rsa.key_from_bytes(ca[2], ca[1]) {
+            Ok(k) -> rsa.verify_pkcs1(k, hash, cert.signed, sig[1])
+            Err(_e) -> false
+        }
+    }
+    if ca_type == "ecdsa-sha2-nistp256" and ca.len() == 3 {
+        let point = ca[2]
+        let parts = strings_of(sig[1])
+        if algorithm != ca_type or point.len() != 65 or point.at(0) != 4 or
+        parts.len() != 2 or parts[0].len() > 33 or parts[1].len() > 33 {
+            return false
+        }
+        let digest = crypto_hash.sha256_of(cert.signed)
+        return p256.verify(p256.from_bytes(point.slice(1, 33)),
+            p256.from_bytes(point.slice(33, 65)), p256.from_bytes(digest),
+            p256.from_bytes(fixed32(parts[0])), p256.from_bytes(fixed32(parts[1])))
+    }
+    let known = ["ecdsa-sha2-nistp384", "ecdsa-sha2-nistp521", "ssh-dss",
+        "sk-ecdsa-sha2-nistp256@openssh.com", "sk-ssh-ed25519@openssh.com"]
+    if known.contains(ca_type) {
+        fail(SshCertUnverifiable(ca_type))
+    }
+    // Not a key type at all, which a certificate OpenSSH wrote never has.
+    return false
+}
+
+/// Whether the certificate is valid at `now`, seconds since the epoch:
+/// after its start and before its end.
+pub fn is_current(cert: SshCertificate, now: i64) -> bool {
+    let after = if cert.valid_after_high >= 2147483648 { 9223372036854775807 }
+    else { cert.valid_after_high * 4294967296 + cert.valid_after_low }
+    let before = if cert.valid_before_high >= 2147483648 {
+        9223372036854775807 } else {
+        cert.valid_before_high * 4294967296 + cert.valid_before_low }
+    return now >= after and now < before
+}

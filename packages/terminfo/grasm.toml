@@ -1,0 +1,6 @@
+[package]
+name = "terminfo"
+version = "1.0.0"
+
+# Reads the bytes it is given. Opens nothing.
+capabilities = []

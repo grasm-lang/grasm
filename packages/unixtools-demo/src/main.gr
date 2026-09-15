@@ -1,0 +1,147 @@
+// Four formats the Unix toolbox writes, read and written without the tools.
+import posixcksum
+import opensslenc
+import sshcert
+import terminfo
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn hex(raw: bytes) -> str {
+    let digits = "0123456789abcdef"
+    var out = ""
+    var i = 0
+    while i < raw.len() {
+        out = out + digits.substr(raw.at(i) / 16, 1) +
+        digits.substr(raw.at(i) % 16, 1)
+        i = i + 1
+    }
+    return out
+}
+
+fn from_hex(text: str) -> bytes {
+    var out: [i64] = []
+    var i = 0
+    while i + 1 < text.len() {
+        out.push(text.substr(i, 2).parse_int_base(16) ?? 0)
+        i = i + 2
+    }
+    return bytes_of(out)
+}
+
+fn check_posixcksum(inout f: i64) / {io} {
+    let hello = "hello\n".to_bytes()
+    say(f, "cksum is the POSIX CRC over the data and its length",
+        (posixcksum.line(hello, 0, "") ?? "") == "3015617425 6")
+    say(f, "an empty file is all ones, because of the length",
+        (posixcksum.of(bytes_of([]), 0) ?? 0) == 4294967295)
+    say(f, "BSD sum counts 1024-byte blocks",
+        posixcksum.sum_line(hello, "") == "36979 1")
+    say(f, "System V sum folds the byte total",
+        (posixcksum.line(hello, 2, "") ?? "") == "542 1")
+    let first = posixcksum.update(posixcksum.start(0) ?? CksumState{
+        algorithm: 0, value: 0, length: 0 }, "hel".to_bytes())
+    say(f, "and the checksum can be taken in pieces",
+        posixcksum.checksum(posixcksum.update(first, "lo\n".to_bytes())) ==
+        3015617425)
+}
+
+fn check_opensslenc(inout f: i64) / {io} {
+    var raw = opensslenc.with_password("aes-128-cbc", "", bytes_of([]))
+    raw.key = from_hex("000102030405060708090a0b0c0d0e0f")
+    raw.iv = from_hex("101112131415161718191a1b1c1d1e1f")
+    let sealed = opensslenc.encrypt("attack at dawn".to_bytes(), raw) ??
+    bytes_of([])
+    say(f, "a raw key and IV give openssl's ciphertext",
+        hex(sealed) == "94a32ff64eb6fe363a58ef9b5fd44fee")
+    say(f, "and decrypt back",
+        (opensslenc.decrypt(sealed, raw) ?? bytes_of([])).to_str() ==
+        "attack at dawn")
+    var password = opensslenc.with_password("aes-256-ctr", "secret",
+        "01234567".to_bytes())
+    password.iterations = 3
+    let salted = opensslenc.encrypt("data".to_bytes(), password) ?? bytes_of([])
+    say(f, "a password-based file starts with Salted__ and its salt",
+        salted.slice(0, 16).to_str() == "Salted__01234567")
+    var wrong = password
+    wrong.password = "guess".to_bytes()
+    say(f, "the wrong password does not give the data back",
+        match opensslenc.decrypt(salted, wrong) {
+            Ok(out) -> out.to_str() != "data"
+            Err(_e) -> true
+    })
+}
+
+let CERT = "ssh-ed25519-cert-v01@openssh.com AAAAIHNzaC1lZDI1NTE5LWNlcnQtdjAxQG9wZW5zc2guY29tAAAAICfzGSRB6Ewk1k3MLNWqJoSAC2e+uBU1gBWz2xKygMskAAAAIO14LJQakDed7YZ1U7tyyq826nsFu98xmu3y9yaJ9maqAAAAAAAAAAcAAAABAAAACmRlcGxveSBrZXkAAAAKAAAABmRlcGxveQAAAABpVbkAAAAAAGs27IAAAAAAAAAAEgAAAApwZXJtaXQtcHR5AAAAAAAAAAAAAAAzAAAAC3NzaC1lZDI1NTE5AAAAIFQM4qdxurSSFS75WLomBXCy1YcgHEaYGyhjvlp6tbrKAAAAUwAAAAtzc2gtZWQyNTUxOQAAAEAYhujZ5SbCLvkE3cMg5qReKCc2ei5jib/Bpych6cSntSsvfN7brGtW7Zc2kozaKP45pRK9G65GbcAbqGhyqLoP deploy@example.com"
+
+fn check_sshcert(inout f: i64) / {io} {
+    match sshcert.parse(CERT) {
+        Ok(cert) -> {
+            say(f, "the principals and key ID are read",
+                cert.principals == ["deploy"] and cert.key_id == "deploy key")
+            say(f, "validity is written as ssh-keygen writes it",
+                sshcert.validity(cert) ==
+                "from 2026-01-01T00:00:00 to 2027-01-01T00:00:00")
+            say(f, "the certified key's fingerprint is the plain key's",
+                (sshcert.listing(cert, "c") ?? "").contains(
+                    "Public key: ED25519-CERT SHA256:GUC/i2BB29MSI5Dhnnvfspi9uNPyehQg0a5DWSgnLxI"))
+            say(f, "the CA's signature verifies",
+                sshcert.verify(cert) ?? false)
+            say(f, "it is current in mid-2026 and not in 2028",
+                sshcert.is_current(cert, 1780000000) and
+                not sshcert.is_current(cert, 1830000000))
+            var forged = cert
+            forged.signed = forged.signed.slice(0, forged.signed.len() - 1)
+            say(f, "signed bytes that differ by one byte do not verify",
+                not (sshcert.verify(forged) ?? true))
+        }
+        Err(_e) -> say(f, "the certificate parses", false)
+    }
+}
+
+fn check_terminfo(inout f: i64) / {io} {
+    // A compiled entry: am, cols#80, bel and cup.
+    let data = bytes_of([26, 1, 21, 0, 2, 0, 1, 0, 11, 0, 19, 0, 100, 101,
+        109, 111, 124, 97, 32, 100, 101, 109, 111, 32, 116, 101, 114, 109,
+        105, 110, 97, 108, 0, 0, 1, 0, 80, 0, 255, 255, 0, 0, 255, 255, 255,
+        255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 2, 0,
+        7, 0, 27, 91, 37, 105, 37, 112, 49, 37, 100, 59, 37, 112, 50, 37, 100,
+        72, 0])
+    match terminfo.parse(data) {
+        Ok(entry) -> {
+            say(f, "capabilities are found by position",
+                (terminfo.find(entry, "cols") ?? TerminfoCap{ name: "",
+                    kind: "", state: "", number: 0, text: bytes_of([]),
+                    extended: false }).number == 80)
+            say(f, "and printed as infocmp prints them",
+                terminfo.render(entry, "tidemo/64/demo", false) ==
+                "#\tReconstructed via infocmp from file: tidemo/64/demo\n" +
+                "demo|a demo terminal,\n\tam,\n\tcols#80,\n\tbel=^G,\n" +
+                "\tcup=\\E[%i%p1%d;%p2%dH,\n")
+        }
+        Err(_e) -> say(f, "the entry parses", false)
+    }
+    say(f, "acsc pairs out of order are sorted",
+        terminfo.repair_acsc("qqaa".to_bytes()).to_str() == "aaqq")
+}
+
+fn main() / {io} {
+    var f = 0
+
+    check_posixcksum(f)
+    check_opensslenc(f)
+    check_sshcert(f)
+    check_terminfo(f)
+
+    if f == 0 {
+        print("unixtools: every claim held")
+    } else {
+        print("unixtools: {f} failed")
+    }
+}

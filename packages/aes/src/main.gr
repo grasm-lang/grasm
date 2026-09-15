@@ -79,10 +79,10 @@ pub fn sbox() -> [i64] {
     }
     var s: [i64] = []
     for i in 0..256 {
-        let x = inverse[i]
+        let v = inverse[i]
         // The affine step, written as the rotations it is defined by.
-        let t = x.bit_xor(rotl8(x, 1)).bit_xor(rotl8(x, 2))
-            .bit_xor(rotl8(x, 3)).bit_xor(rotl8(x, 4)).bit_xor(99)
+        let t = v.bit_xor(rotl8(v, 1)).bit_xor(rotl8(v, 2))
+            .bit_xor(rotl8(v, 3)).bit_xor(rotl8(v, 4)).bit_xor(99)
         s.push(m8(t))
     }
     s
@@ -183,6 +183,60 @@ pub fn encrypt_with(c: Cipher, block: bytes) -> bytes {
     shift_rows(state)
     add_round_key(state, round_keys, rounds)
     bytes_of(state)
+}
+
+/// Decrypt one sixteen-byte block: the inverse cipher, which CBC and ECB
+/// decryption need and CTR and GCM do not.
+pub fn decrypt_with(c: Cipher, block: bytes) -> bytes {
+    let inv = inverse_sbox(c.table)
+    let round_keys = c.round_keys
+    let rounds = round_keys.len() / 4 - 1
+    var state: [i64] = []
+    for i in 0..16 {
+        state.push(block.at(i))
+    }
+    add_round_key(state, round_keys, rounds)
+    var r = rounds - 1
+    while r >= 1 {
+        inv_shift_rows(state)
+        sub_bytes(state, inv)
+        add_round_key(state, round_keys, r)
+        inv_mix_columns(state)
+        r = r - 1
+    }
+    inv_shift_rows(state)
+    sub_bytes(state, inv)
+    add_round_key(state, round_keys, 0)
+    bytes_of(state)
+}
+
+fn inv_shift_rows(inout state: [i64]) {
+    for r in 1..4 {
+        var row: [i64] = []
+        for c in 0..4 {
+            row.push(state[c * 4 + r])
+        }
+        for c in 0..4 {
+            state[c * 4 + r] = row[(c + 4 - r) % 4]
+        }
+    }
+}
+
+fn inv_mix_columns(inout state: [i64]) {
+    for c in 0..4 {
+        let a0 = state[c * 4]
+        let a1 = state[c * 4 + 1]
+        let a2 = state[c * 4 + 2]
+        let a3 = state[c * 4 + 3]
+        state[c * 4] = gf_mul(a0, 14).bit_xor(gf_mul(a1, 11)).bit_xor(gf_mul(a2,
+            13)).bit_xor(gf_mul(a3, 9))
+        state[c * 4 + 1] = gf_mul(a0, 9).bit_xor(gf_mul(a1, 14)).bit_xor(gf_mul(a2,
+            11)).bit_xor(gf_mul(a3, 13))
+        state[c * 4 + 2] = gf_mul(a0, 13).bit_xor(gf_mul(a1, 9)).bit_xor(gf_mul(a2,
+            14)).bit_xor(gf_mul(a3, 11))
+        state[c * 4 + 3] = gf_mul(a0, 11).bit_xor(gf_mul(a1, 13)).bit_xor(gf_mul(a2,
+            9)).bit_xor(gf_mul(a3, 14))
+    }
 }
 
 fn add_round_key(inout state: [i64], w: [i64], round: i64) {

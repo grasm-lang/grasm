@@ -109,6 +109,7 @@ run_gate text2diff      scripts/text2_diff.sh
 run_gate net3diff       scripts/net3_diff.sh
 run_gate pydatadiff     scripts/pydata_diff.sh
 run_gate gitwirediff    scripts/gitwire_diff.sh
+run_gate unixdiff       scripts/unix_diff.sh
 run_gate kvcrash       scripts/kvstore_crash.sh
 run_gate zlibdiff      scripts/zlib_diff.sh
 run_gate casefolddiff  scripts/casefold_diff.sh

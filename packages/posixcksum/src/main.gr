@@ -1,0 +1,151 @@
+// The checksums `cksum` and `sum` print.
+//
+// A release page says `cksum: 3015617425 6`, an old tape archive has a
+// `sum` listing next to it, an installer script compares against the output
+// of `cksum -o 1`. None of these is the CRC-32 that zip, gzip and PNG use,
+// and a program that checks them with that CRC gets a different number:
+//
+// - **`cksum`** is the POSIX CRC: the ISO 8802-3 polynomial run most
+//   significant bit first, over the data *and then its length* in as few
+//   bytes as it takes, least significant first, the result inverted. The
+//   length is what makes an empty file `4294967295` rather than 0.
+// - **Algorithm 1**, `sum` on BSD and `sum -r` on System V: sixteen bits,
+//   rotated right one place before each byte is added. The size is in blocks
+//   of 1024 bytes, rounded up.
+// - **Algorithm 2**, `sum` on System V: the bytes added up, folded twice to
+//   sixteen bits. The size is in blocks of 512.
+// - **Algorithm 3** is the CRC-32 zip uses, which `packages/crc32` computes;
+//   it is here so one call answers for all four `-o` choices.
+//
+// Each is also offered as a running state for data that arrives in pieces.
+//
+// Checked against `cksum`, `cksum -o 1`, `-o 2`, `-o 3` and `sum` on files
+// of every size around the block boundaries and larger.
+
+import crc32
+
+type CksumError =
+    | CksumUnknownAlgorithm(algorithm: i64)
+
+/// A checksum in progress: the running value and how many bytes it has seen.
+type CksumState = {
+    algorithm: i64,
+    value: i64,
+    length: i64,
+}
+
+let MASK = 4294967295
+
+fn posix_table() -> [i64] {
+    var t: [i64] = []
+    var n = 0
+    while n < 256 {
+        var c = n.shl(24)
+        var k = 0
+        while k < 8 {
+            if c.bit_and(2147483648) != 0 {
+                c = c.shl(1).bit_xor(79764919).bit_and(MASK)
+            } else {
+                c = c.shl(1).bit_and(MASK)
+            }
+            k = k + 1
+        }
+        t.push(c)
+        n = n + 1
+    }
+    return t
+}
+
+let POSIX = posix_table()
+let ZIP = crc32.table()
+
+fn posix_byte(c: i64, b: i64) -> i64 {
+    return c.shl(8).bit_and(MASK).bit_xor(POSIX[c.ushr(24).bit_xor(b)])
+}
+
+/// A fresh state for algorithm 0 (`cksum`'s default) or `-o` 1, 2 or 3.
+pub fn start(algorithm: i64) -> CksumState ! CksumError {
+    if algorithm < 0 or algorithm > 3 {
+        fail(CksumUnknownAlgorithm(algorithm))
+    }
+    let value = if algorithm == 3 { crc32.start() } else { 0 }
+    return CksumState{ algorithm: algorithm, value: value, length: 0 }
+}
+
+/// The state after more bytes.
+pub fn update(state: CksumState, data: bytes) -> CksumState {
+    var v = state.value
+    var i = 0
+    if state.algorithm == 0 {
+        while i < data.len() {
+            v = posix_byte(v, data.at(i))
+            i = i + 1
+        }
+    } else if state.algorithm == 1 {
+        while i < data.len() {
+            v = (v.ushr(1) + (v.bit_and(1) * 32768) + data.at(i)).bit_and(65535)
+            i = i + 1
+        }
+    } else if state.algorithm == 2 {
+        while i < data.len() {
+            v = (v + data.at(i)).bit_and(MASK)
+            i = i + 1
+        }
+    } else {
+        v = crc32.update(ZIP, v, data)
+    }
+    return CksumState{ algorithm: state.algorithm, value: v,
+        length: state.length + data.len() }
+}
+
+/// The checksum of everything the state has seen.
+pub fn checksum(state: CksumState) -> i64 {
+    if state.algorithm == 0 {
+        var v = state.value
+        var n = state.length
+        while n > 0 {
+            v = posix_byte(v, n.bit_and(255))
+            n = n.ushr(8)
+        }
+        return v.bit_xor(MASK)
+    }
+    if state.algorithm == 2 {
+        let s = state.value
+        let r = s.bit_and(65535) + s.ushr(16)
+        return r.bit_and(65535) + r.ushr(16)
+    }
+    if state.algorithm == 3 {
+        return crc32.finish(state.value)
+    }
+    return state.value
+}
+
+/// The size column: bytes for algorithms 0 and 3, blocks of 1024 for 1 and
+/// of 512 for 2, a partial block counting as one.
+pub fn size_of(state: CksumState) -> i64 {
+    if state.algorithm == 1 {
+        return (state.length + 1023) / 1024
+    }
+    if state.algorithm == 2 {
+        return (state.length + 511) / 512
+    }
+    return state.length
+}
+
+/// The checksum of a whole buffer.
+pub fn of(data: bytes, algorithm: i64) -> i64 ! CksumError {
+    return checksum(update(try start(algorithm), data))
+}
+
+/// The line `cksum` prints: checksum, size and name, or no name for
+/// standard input.
+pub fn line(data: bytes, algorithm: i64, name: str) -> str ! CksumError {
+    let state = update(try start(algorithm), data)
+    let text = "{checksum(state)} {size_of(state)}"
+    return if name.len() == 0 { text } else { text + " " + name }
+}
+
+/// The line `sum` prints, which is algorithm 1's.
+pub fn sum_line(data: bytes, name: str) -> str {
+    return line(data, 1, name) ?? ""
+}

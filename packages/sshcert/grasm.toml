@@ -1,0 +1,34 @@
+[package]
+name = "sshcert"
+version = "1.0.0"
+
+# Reads certificates it is given. Opens nothing.
+capabilities = []
+
+[dependencies.bytes_codec]
+path = "../bytes"
+version = "^1.0.0"
+
+[dependencies.crypto_hash]
+path = "../crypto_hash"
+version = "^1.0.0"
+
+[dependencies.sshkey]
+path = "../sshkey"
+version = "^1.0.0"
+
+[dependencies.ed25519]
+path = "../ed25519"
+version = "^1.0.0"
+
+[dependencies.p256]
+path = "../p256"
+version = "^1.0.0"
+
+[dependencies.rsa]
+path = "../rsa"
+version = "^1.0.0"
+
+[dependencies.bigint]
+path = "../bigint"
+version = "^1.0.0"
