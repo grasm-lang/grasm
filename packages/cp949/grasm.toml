@@ -1,0 +1,6 @@
+[package]
+name = "cp949"
+version = "1.0.0"
+
+# Bytes to text and back. Opens nothing.
+capabilities = []

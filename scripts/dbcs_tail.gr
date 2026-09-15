@@ -1,0 +1,227 @@
+
+fn hex_value(text: str) -> i64 {
+    return text.parse_int_base(16) ?? 0
+}
+
+fn load_pairs(packed: str) -> Map[i64, i64] {
+    var out: Map[i64, i64] = {}
+    for entry in packed.split(" ") {
+        let cut = entry.index_of(":") ?? -1
+        if cut < 0 {
+            continue
+        }
+        out.set(hex_value(entry.substr(0, cut)),
+            hex_value(entry.substr(cut + 1, entry.len() - cut - 1)))
+    }
+    return out
+}
+
+fn load_sequences(packed: str) -> Map[i64, [i64]] {
+    var out: Map[i64, [i64]] = {}
+    for entry in packed.split(" ") {
+        let cut = entry.index_of(":") ?? -1
+        if cut < 0 {
+            continue
+        }
+        var codes: [i64] = []
+        for piece in entry.substr(cut + 1, entry.len() - cut - 1).split(",") {
+            codes.push(hex_value(piece))
+        }
+        out.set(hex_value(entry.substr(0, cut)), codes)
+    }
+    return out
+}
+
+let SINGLES: Map[i64, i64] = load_pairs(packed_singles())
+let SEQUENCES: Map[i64, [i64]] = load_sequences(packed_sequences())
+let PREFERRED: Map[i64, i64] = load_pairs(packed_preferred())
+
+fn lead_index(lead: i64) -> i64 {
+    var i = 0
+    for candidate in leads() {
+        if candidate == lead {
+            return i
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+/// Whether a byte starts a two-byte character.
+pub fn is_lead(byte: i64) -> bool {
+    return lead_index(byte) >= 0
+}
+
+/// The code point a lead and trail byte stand for, or -1.
+pub fn pair_to_code(lead: i64, trail: i64) -> i64 {
+    let row = lead_index(lead)
+    if row < 0 or trail < 64 or trail > 255 {
+        return 0 - 1
+    }
+    let column = trail - 64
+    let code = hex_value(rows()[row].substr(column * WIDTH, WIDTH))
+    if code == 0 {
+        return 0 - 1
+    }
+    return code
+}
+
+/// Bytes to text.
+pub fn decode(data: bytes) -> str ! PREFIXError {
+    var out = ""
+    var at = 0
+    while at < data.len() {
+        let b = data.at(at)
+        if b < 128 {
+            out = out + b.to_char()
+            at = at + 1
+            continue
+        }
+        match SINGLES.get(b) {
+            Some(code) -> {
+                out = out + code.to_char()
+                at = at + 1
+                continue
+            }
+            None -> {}
+        }
+        if not is_lead(b) {
+            fail(PREFIXInvalid(at, b))
+        }
+        if at + 1 >= data.len() {
+            fail(PREFIXTruncated(at))
+        }
+        let trail = data.at(at + 1)
+        match SEQUENCES.get(b * 256 + trail) {
+            Some(codes) -> {
+                for code in codes {
+                    out = out + code.to_char()
+                }
+                at = at + 2
+                continue
+            }
+            None -> {}
+        }
+        let code = pair_to_code(b, trail)
+        if code < 0 {
+            fail(PREFIXInvalid(at, b))
+        }
+        out = out + code.to_char()
+        at = at + 2
+    }
+    return out
+}
+
+/// A reverse table, built once: the first pair in table order for each code
+/// point, then the reference encoder's own preferences on top.
+pub fn encoder() -> PREFIXEncoder {
+    var out: Map[i64, i64] = {}
+    var row = 0
+    for text in rows() {
+        let lead = leads()[row]
+        var column = 0
+        while column * WIDTH < text.len() {
+            let code = hex_value(text.substr(column * WIDTH, WIDTH))
+            if code != 0 and not out.has(code) {
+                out.set(code, lead * 256 + 64 + column)
+            }
+            column = column + 1
+        }
+        row = row + 1
+    }
+    for entry in SINGLES.entries() {
+        if not out.has(entry.1) {
+            out.set(entry.1, entry.0)
+        }
+    }
+    for entry in PREFERRED.entries() {
+        out.set(entry.0, entry.1)
+    }
+    return PREFIXEncoder { map: out }
+}
+
+/// The pair a two-code-point sequence encodes to, when there is one.
+fn sequence_pair(first: i64, second: i64) -> i64 {
+    for entry in SEQUENCES.entries() {
+        if entry.1.len() == 2 and entry.1[0] == first and
+            entry.1[1] == second {
+            return entry.0
+        }
+    }
+    return 0 - 1
+}
+
+/// Text to bytes, with a prepared table.
+pub fn encode_with(table: PREFIXEncoder, text: str) -> bytes ! PREFIXError {
+    var out: [i64] = []
+    let codes = text.codes()
+    var at = 0
+    while at < codes.len() {
+        let code = codes[at]
+        if code < 128 {
+            out.push(code)
+            at = at + 1
+            continue
+        }
+        // A base letter and a combining mark may have a pair of their own,
+        // which wins over encoding the two separately.
+        if at + 1 < codes.len() {
+            let joined = sequence_pair(code, codes[at + 1])
+            if joined >= 0 {
+                out.push(joined / 256)
+                out.push(joined % 256)
+                at = at + 2
+                continue
+            }
+        }
+        match table.map.get(code) {
+            Some(packed) -> {
+                if packed < 256 {
+                    out.push(packed)
+                } else {
+                    out.push(packed / 256)
+                    out.push(packed % 256)
+                }
+            }
+            None -> fail(PREFIXUnencodable(at, code))
+        }
+        at = at + 1
+    }
+    return bytes_of(out)
+}
+
+/// Text to bytes, building the table first.
+pub fn encode(text: str) -> bytes ! PREFIXError {
+    return try encode_with(encoder(), text)
+}
+
+/// Whether every character can be written.
+pub fn is_encodable(text: str) -> bool {
+    match encode(text) {
+        Ok(_data) -> return true
+        Err(_e) -> return false
+    }
+}
+
+/// Whether every byte sequence is a valid character.
+pub fn is_valid(data: bytes) -> bool {
+    match decode(data) {
+        Ok(_text) -> return true
+        Err(_e) -> return false
+    }
+}
+
+/// How many two-byte characters the table holds.
+pub fn table_size() -> i64 {
+    var count = 0
+    for text in rows() {
+        var column = 0
+        while column * WIDTH < text.len() {
+            if hex_value(text.substr(column * WIDTH, WIDTH)) != 0 {
+                count = count + 1
+            }
+            column = column + 1
+        }
+    }
+    return count
+}

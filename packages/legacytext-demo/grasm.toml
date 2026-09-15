@@ -1,0 +1,24 @@
+[package]
+name = "legacytext_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.cp932]
+path = "../cp932"
+version = "^1.0.0"
+
+[dependencies.cp949]
+path = "../cp949"
+version = "^1.0.0"
+
+[dependencies.big5hkscs]
+path = "../big5hkscs"
+version = "^1.0.0"
+
+[dependencies.ebcdic]
+path = "../ebcdic"
+version = "^1.0.0"
+
+[dependencies.shiftjis]
+path = "../shiftjis"
+version = "^1.0.0"

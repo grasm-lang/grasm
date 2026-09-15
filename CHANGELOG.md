@@ -7,6 +7,22 @@ migration note here; anything `experimental` may change in any release. See
 
 ## Unreleased — since 1.0.0
 
+### Added
+
+- **The encodings text actually arrives in, as opposed to the ones it is
+  labelled with.** `cp932` is the Shift-JIS Windows writes — with NEC's
+  circled numbers and IBM's extended kanji, and with Microsoft's mapping of
+  the six characters where it and JIS disagree, which is the "wave dash
+  problem". `cp949` is Korean with all 11,172 modern syllables, where EUC-KR
+  has 2,350. `big5hkscs` is Traditional Chinese as Hong Kong writes it, with
+  about 1,700 characters outside the Basic Multilingual Plane and four byte
+  pairs that are a letter and a combining mark. `ebcdic` is five mainframe
+  code pages, and splits record files on EBCDIC's own newline, which does not
+  decode to `\n`. None of the tables were typed: `scripts/gen_dbcs.py`
+  decodes every byte pair with Python's own codec and writes the package.
+  107,765 cases in both directions; `dbcsdiff` is a gate.
+  `docs/packages-to-650.md` is the tracker from here.
+
 ### Changed
 
 - **`formatspec` formats floats now.** It refused `f`, `e`, `g`, `%` and the

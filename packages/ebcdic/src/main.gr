@@ -1,0 +1,248 @@
+// EBCDIC: the character encoding mainframes still write.
+//
+// Banks, insurers, airlines and governments run IBM mainframes, and the
+// data those machines produce — fixed-width record files, COBOL copybooks,
+// print streams, batch exports that arrive nightly over SFTP — is EBCDIC,
+// not ASCII. It is a different encoding from the ground up, not a variant:
+// the letters are not even contiguous (`I` is 0xC9 and `J` is 0xD1), digits
+// sort after letters, and a program that reads it as Latin-1 produces
+// rubbish that does not look like rubbish until somebody checks a name.
+//
+// There is no single EBCDIC. Each country's code page moves the punctuation
+// and the national letters to different bytes, so `[` is 0xBA in one and
+// 0x4A in another, and the same file read with the wrong page swaps
+// brackets for letters. This package carries five of them, named the way
+// Python and IBM name them:
+//
+//   `cp037`  US, Canada and much of the English-speaking mainframe world
+//   `cp273`  Germany and Austria
+//   `cp500`  the international page, and the common interchange one
+//   `cp1026`  Turkey
+//   `cp1140`  cp037 with the euro sign where the currency sign was
+//
+// One byte deserves a sentence. EBCDIC has its own newline, 0x15 (NEL),
+// which decodes to U+0085 rather than to `\n`. A record file split on 0x25
+// (LF) finds nothing, and one converted to text and then split on `\n` finds
+// nothing either. `records` below splits on NEL because that is what the
+// files use.
+//
+// The tables come from Python's own codecs, byte by byte, rather than from
+// a mapping file typed out, and the gate checks all 256 bytes of every page
+// in both directions.
+
+type EbcdicError =
+    | EbcdicUnknownPage(name: str)
+    | EbcdicUnencodable(at: i64, codepoint: i64)
+
+    /// The code page names this package carries.
+pub fn pages() -> [str] {
+    return ["cp037", "cp273", "cp500", "cp1026", "cp1140"]
+}
+
+/// 256 code points, four hexadecimal digits each, for a page.
+fn table_of(page: str) -> str {
+    if page == "cp037" {
+        return "0000000100020003009C00090086007F0097008D008E000B000C000D000E000F" +
+        "0010001100120013009D008500080087001800190092008F001C001D001E001F" +
+        "00800081008200830084000A0017001B00880089008A008B008C000500060007" +
+        "0090009100160093009400950096000400980099009A009B00140015009E001A" +
+        "002000A000E200E400E000E100E300E500E700F100A2002E003C0028002B007C" +
+        "002600E900EA00EB00E800ED00EE00EF00EC00DF00210024002A0029003B00AC" +
+        "002D002F00C200C400C000C100C300C500C700D100A6002C0025005F003E003F" +
+        "00F800C900CA00CB00C800CD00CE00CF00CC0060003A002300400027003D0022" +
+        "00D800610062006300640065006600670068006900AB00BB00F000FD00FE00B1" +
+        "00B0006A006B006C006D006E006F00700071007200AA00BA00E600B800C600A4" +
+        "00B5007E0073007400750076007700780079007A00A100BF00D000DD00DE00AE" +
+        "005E00A300A500B700A900A700B600BC00BD00BE005B005D00AF00A800B400D7" +
+        "007B00410042004300440045004600470048004900AD00F400F600F200F300F5" +
+        "007D004A004B004C004D004E004F00500051005200B900FB00FC00F900FA00FF" +
+        "005C00F70053005400550056005700580059005A00B200D400D600D200D300D5" +
+        "003000310032003300340035003600370038003900B300DB00DC00D900DA009F"
+    }
+    if page == "cp273" {
+        return "0000000100020003009C00090086007F0097008D008E000B000C000D000E000F" +
+        "0010001100120013009D008500080087001800190092008F001C001D001E001F" +
+        "00800081008200830084000A0017001B00880089008A008B008C000500060007" +
+        "0090009100160093009400950096000400980099009A009B00140015009E001A" +
+        "002000A000E2007B00E000E100E300E500E700F100C4002E003C0028002B0021" +
+        "002600E900EA00EB00E800ED00EE00EF00EC007E00DC0024002A0029003B005E" +
+        "002D002F00C2005B00C000C100C300C500C700D100F6002C0025005F003E003F" +
+        "00F800C900CA00CB00C800CD00CE00CF00CC0060003A002300A70027003D0022" +
+        "00D800610062006300640065006600670068006900AB00BB00F000FD00FE00B1" +
+        "00B0006A006B006C006D006E006F00700071007200AA00BA00E600B800C600A4" +
+        "00B500DF0073007400750076007700780079007A00A100BF00D000DD00DE00AE" +
+        "00A200A300A500B700A9004000B600BC00BD00BE00AC007C203E00A800B400D7" +
+        "00E400410042004300440045004600470048004900AD00F400A600F200F300F5" +
+        "00FC004A004B004C004D004E004F00500051005200B900FB007D00F900FA00FF" +
+        "00D600F70053005400550056005700580059005A00B200D4005C00D200D300D5" +
+        "003000310032003300340035003600370038003900B300DB005D00D900DA009F"
+    }
+    if page == "cp500" {
+        return "0000000100020003009C00090086007F0097008D008E000B000C000D000E000F" +
+        "0010001100120013009D008500080087001800190092008F001C001D001E001F" +
+        "00800081008200830084000A0017001B00880089008A008B008C000500060007" +
+        "0090009100160093009400950096000400980099009A009B00140015009E001A" +
+        "002000A000E200E400E000E100E300E500E700F1005B002E003C0028002B0021" +
+        "002600E900EA00EB00E800ED00EE00EF00EC00DF005D0024002A0029003B005E" +
+        "002D002F00C200C400C000C100C300C500C700D100A6002C0025005F003E003F" +
+        "00F800C900CA00CB00C800CD00CE00CF00CC0060003A002300400027003D0022" +
+        "00D800610062006300640065006600670068006900AB00BB00F000FD00FE00B1" +
+        "00B0006A006B006C006D006E006F00700071007200AA00BA00E600B800C600A4" +
+        "00B5007E0073007400750076007700780079007A00A100BF00D000DD00DE00AE" +
+        "00A200A300A500B700A900A700B600BC00BD00BE00AC007C00AF00A800B400D7" +
+        "007B00410042004300440045004600470048004900AD00F400F600F200F300F5" +
+        "007D004A004B004C004D004E004F00500051005200B900FB00FC00F900FA00FF" +
+        "005C00F70053005400550056005700580059005A00B200D400D600D200D300D5" +
+        "003000310032003300340035003600370038003900B300DB00DC00D900DA009F"
+    }
+    if page == "cp1026" {
+        return "0000000100020003009C00090086007F0097008D008E000B000C000D000E000F" +
+        "0010001100120013009D008500080087001800190092008F001C001D001E001F" +
+        "00800081008200830084000A0017001B00880089008A008B008C000500060007" +
+        "0090009100160093009400950096000400980099009A009B00140015009E001A" +
+        "002000A000E200E400E000E100E300E5007B00F100C7002E003C0028002B0021" +
+        "002600E900EA00EB00E800ED00EE00EF00EC00DF011E0130002A0029003B005E" +
+        "002D002F00C200C400C000C100C300C5005B00D1015F002C0025005F003E003F" +
+        "00F800C900CA00CB00C800CD00CE00CF00CC0131003A00D6015E0027003D00DC" +
+        "00D800610062006300640065006600670068006900AB00BB007D006000A600B1" +
+        "00B0006A006B006C006D006E006F00700071007200AA00BA00E600B800C600A4" +
+        "00B500F60073007400750076007700780079007A00A100BF005D0024004000AE" +
+        "00A200A300A500B700A900A700B600BC00BD00BE00AC007C00AF00A800B400D7" +
+        "00E700410042004300440045004600470048004900AD00F4007E00F200F300F5" +
+        "011F004A004B004C004D004E004F00500051005200B900FB005C00F900FA00FF" +
+        "00FC00F70053005400550056005700580059005A00B200D4002300D200D300D5" +
+        "003000310032003300340035003600370038003900B300DB002200D900DA009F"
+    }
+    if page == "cp1140" {
+        return "0000000100020003009C00090086007F0097008D008E000B000C000D000E000F" +
+        "0010001100120013009D008500080087001800190092008F001C001D001E001F" +
+        "00800081008200830084000A0017001B00880089008A008B008C000500060007" +
+        "0090009100160093009400950096000400980099009A009B00140015009E001A" +
+        "002000A000E200E400E000E100E300E500E700F100A2002E003C0028002B007C" +
+        "002600E900EA00EB00E800ED00EE00EF00EC00DF00210024002A0029003B00AC" +
+        "002D002F00C200C400C000C100C300C500C700D100A6002C0025005F003E003F" +
+        "00F800C900CA00CB00C800CD00CE00CF00CC0060003A002300400027003D0022" +
+        "00D800610062006300640065006600670068006900AB00BB00F000FD00FE00B1" +
+        "00B0006A006B006C006D006E006F00700071007200AA00BA00E600B800C620AC" +
+        "00B5007E0073007400750076007700780079007A00A100BF00D000DD00DE00AE" +
+        "005E00A300A500B700A900A700B600BC00BD00BE005B005D00AF00A800B400D7" +
+        "007B00410042004300440045004600470048004900AD00F400F600F200F300F5" +
+        "007D004A004B004C004D004E004F00500051005200B900FB00FC00F900FA00FF" +
+        "005C00F70053005400550056005700580059005A00B200D400D600D200D300D5" +
+        "003000310032003300340035003600370038003900B300DB00DC00D900DA009F"
+    }
+    return ""
+}
+
+fn code_at(table: str, byte: i64) -> i64 {
+    return table.substr(byte * 4, 4).parse_int_base(16) ?? 0
+}
+
+/// Whether a page name is one this carries.
+pub fn has_page(page: str) -> bool {
+    return table_of(page.to_lower()).len() == 1024
+}
+
+/// Bytes to text in a page. Every byte is a character, so this cannot fail
+/// on the data — only on a page it does not know.
+pub fn decode(data: bytes, page: str) -> str ! EbcdicError {
+    let table = table_of(page.to_lower())
+    if table.len() != 1024 {
+        fail(EbcdicUnknownPage(page))
+    }
+    var out = ""
+    var i = 0
+    while i < data.len() {
+        out = out + code_at(table, data.at(i)).to_char()
+        i = i + 1
+    }
+    return out
+}
+
+/// A reverse table for a page, built once.
+fn reverse(table: str) -> Map[i64, i64] {
+    var out: Map[i64, i64] = {}
+    var b = 0
+    while b < 256 {
+        let code = code_at(table, b)
+        if not out.has(code) {
+            out.set(code, b)
+        }
+        b = b + 1
+    }
+    return out
+}
+
+/// Text to bytes in a page.
+pub fn encode(text: str, page: str) -> bytes ! EbcdicError {
+    let table = table_of(page.to_lower())
+    if table.len() != 1024 {
+        fail(EbcdicUnknownPage(page))
+    }
+    let back = reverse(table)
+    var out: [i64] = []
+    var at = 0
+    for code in text.codes() {
+        match back.get(code) {
+            Some(b) -> out.push(b)
+            None -> fail(EbcdicUnencodable(at, code))
+        }
+        at = at + 1
+    }
+    return bytes_of(out)
+}
+
+/// Whether every character in `text` exists in a page.
+pub fn is_encodable(text: str, page: str) -> bool {
+    match encode(text, page) {
+        Ok(_data) -> return true
+        Err(_e) -> return false
+    }
+}
+
+/// A record file split into records on EBCDIC's own newline, 0x15, and each
+/// record decoded.
+///
+/// Not on 0x25, which is EBCDIC's line feed and which the files do not use,
+/// and not on `\n` after decoding, which NEL does not become.
+pub fn records(data: bytes, page: str) -> [str] ! EbcdicError {
+    var out: [str] = []
+    var current: [i64] = []
+    var i = 0
+    while i < data.len() {
+        let b = data.at(i)
+        if b == 21 {
+            out.push(try decode(bytes_of(current), page))
+            current = []
+        } else {
+            current.push(b)
+        }
+        i = i + 1
+    }
+    if current.len() > 0 {
+        out.push(try decode(bytes_of(current), page))
+    }
+    return out
+}
+
+/// Fixed-width records, which is the other way mainframe files are laid
+/// out: no separators at all, every record the same number of bytes.
+pub fn fixed_records(data: bytes, width: i64,
+    page: str) -> [str] ! EbcdicError {
+    var out: [str] = []
+    if width <= 0 {
+        return out
+    }
+    var at = 0
+    while at < data.len() {
+        var chunk: [i64] = []
+        var i = 0
+        while i < width and at + i < data.len() {
+            chunk.push(data.at(at + i))
+            i = i + 1
+        }
+        out.push(try decode(bytes_of(chunk), page))
+        at = at + width
+    }
+    return out
+}

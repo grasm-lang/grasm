@@ -1,0 +1,118 @@
+// The encodings text actually arrives in, as opposed to the ones it is
+// labelled with.
+import cp932
+import cp949
+import big5hkscs
+import ebcdic
+import shiftjis
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn hex_of(raw: bytes) -> str {
+    let digits = "0123456789abcdef"
+    var out = ""
+    var i = 0
+    while i < raw.len() {
+        out = out + digits.substr(raw.at(i) / 16, 1) +
+        digits.substr(raw.at(i) % 16, 1)
+        i = i + 1
+    }
+    return out
+}
+
+fn check_cp932(inout f: i64) / {io} {
+    // The wave dash problem: JIS and Microsoft disagree about 0x8160.
+    say(f, "CP932 reads 0x8160 as a fullwidth tilde",
+        (cp932.decode(bytes_of([129, 96])) ?? "") == "\u{ff5e}")
+    say(f, "and writes the JIS wave dash to the same bytes",
+        hex_of(cp932.encode("\u{301c}") ?? "".to_bytes()) == "8160")
+    // NEC's row 13 and IBM's extensions, which JIS Shift-JIS has no bytes
+    // for.
+    say(f, "a circled number is in CP932",
+        hex_of(cp932.encode("\u{2460}") ?? "".to_bytes()) == "8740")
+    say(f, "and so is a unit symbol",
+        hex_of(cp932.encode("\u{3349}") ?? "".to_bytes()) == "875f")
+    say(f, "neither is in JIS Shift-JIS",
+        not shiftjis.is_encodable("\u{2460}"))
+    say(f, "CP932 holds more pairs than JIS Shift-JIS",
+        cp932.table_size() > shiftjis.table_size())
+    say(f, "a lead byte with nothing after it is refused",
+        not cp932.is_valid(bytes_of([65, 129])))
+}
+
+fn check_cp949(inout f: i64) / {io} {
+    // A syllable outside KS X 1001's 2,350.
+    say(f, "a syllable EUC-KR has no pair for is two bytes in CP949",
+        hex_of(cp949.encode("\u{b620}") ?? "".to_bytes()) == "8c63")
+    say(f, "and a common one keeps its EUC-KR bytes",
+        hex_of(cp949.encode("\u{ac00}") ?? "".to_bytes()) == "b0a1")
+    say(f, "every modern syllable is in the table",
+        cp949.table_size() > 17000)
+    say(f, "and the round trip is exact",
+        (cp949.decode(cp949.encode("\u{b620}\u{ac00}") ??
+            "".to_bytes()) ?? "") == "\u{b620}\u{ac00}")
+}
+
+fn check_big5hkscs(inout f: i64) / {io} {
+    // Four pairs are a base letter and a combining mark.
+    say(f, "0x8862 is two code points",
+        (big5hkscs.decode(bytes_of([136, 98])) ?? "").codes().len() == 2)
+    say(f, "and encoding those two gives the pair back",
+        hex_of(big5hkscs.encode("\u{ca}\u{304}") ?? "".to_bytes()) ==
+        "8862")
+    say(f, "while the letter alone has a pair of its own",
+        hex_of(big5hkscs.encode("\u{ca}") ?? "".to_bytes()) == "8866")
+    // About 1,700 of its characters are outside the BMP.
+    say(f, "the table holds more than eighteen thousand pairs",
+        big5hkscs.table_size() > 18000)
+    say(f, "an emoji is still not in it",
+        not big5hkscs.is_encodable("\u{1f600}"))
+}
+
+fn check_ebcdic(inout f: i64) / {io} {
+    say(f, "EBCDIC HELLO is c8c5d3d3d6",
+        (ebcdic.decode(bytes_of([200, 197, 211, 211, 214]), "cp037") ?? "") ==
+        "HELLO")
+    // The letters are not contiguous.
+    say(f, "I is 0xC9 and J is 0xD1",
+        hex_of(ebcdic.encode("IJ", "cp037") ?? "".to_bytes()) == "c9d1")
+    // Each country's page moves the punctuation.
+    say(f, "brackets are different bytes in cp037",
+        hex_of(ebcdic.encode("[]", "cp037") ?? "".to_bytes()) == "babb")
+    say(f, "and in cp500",
+        hex_of(ebcdic.encode("[]", "cp500") ?? "".to_bytes()) == "4a5a")
+    // EBCDIC's newline is its own byte and its own code point.
+    say(f, "0x15 is NEL, not a line feed",
+        (ebcdic.decode(bytes_of([21]), "cp037") ?? "") == "\u{85}")
+    let file = bytes_of([200, 197, 211, 211, 214, 21, 198, 214, 214])
+    say(f, "a record file splits on NEL",
+        (ebcdic.records(file, "cp037") ?? []).len() == 2)
+    say(f, "fixed-width records split on the width",
+        (ebcdic.fixed_records(bytes_of([200, 197, 211, 211]), 2,
+            "cp037") ?? []).len() == 2)
+    say(f, "a page nobody carries is refused",
+        not ebcdic.has_page("cp9999"))
+    say(f, "five pages are carried", ebcdic.pages().len() == 5)
+}
+
+fn main() / {io} {
+    var f = 0
+
+    check_cp932(f)
+    check_cp949(f)
+    check_big5hkscs(f)
+    check_ebcdic(f)
+
+    if f == 0 {
+        print("legacytext: every claim held")
+    } else {
+        print("legacytext: {f} failed")
+    }
+}

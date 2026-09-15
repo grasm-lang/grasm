@@ -1,0 +1,72 @@
+import cp932
+import cp949
+import big5hkscs
+import ebcdic
+
+fn from_hex(text: str) -> bytes {
+    var out: [i64] = []
+    var i = 1
+    while i + 1 < text.len() {
+        out.push(text.substr(i, 2).parse_int_base(16) ?? 0)
+        i = i + 2
+    }
+    return bytes_of(out)
+}
+
+fn to_hex(raw: bytes) -> str {
+    let digits = "0123456789abcdef"
+    var out = ""
+    var i = 0
+    while i < raw.len() {
+        out = out + digits.substr(raw.at(i) / 16, 1) +
+        digits.substr(raw.at(i) % 16, 1)
+        i = i + 1
+    }
+    return out
+}
+
+fn refused() -> bytes {
+    return "?refused?".to_bytes()
+}
+
+// Each command is `<codec>.<dec|enc> <hex>`; decoding prints the UTF-8 of
+// the text in hex, encoding prints the bytes in hex. Encoders are built once
+// per run, because a document's worth of characters would otherwise rebuild
+// a table of eighteen thousand entries every time.
+fn main() / {io} {
+    let t932 = cp932.encoder()
+    let t949 = cp949.encoder()
+    let thk = big5hkscs.encoder()
+    var i = 0
+    while i + 1 < args().len() {
+        let what = args()[i]
+        let raw = from_hex(args()[i + 1])
+        if what == "cp932.dec" {
+            print(to_hex((cp932.decode(raw) ?? "?refused?").to_bytes()))
+        } else if what == "cp932.enc" {
+            print(to_hex(cp932.encode_with(t932, raw.to_str()) ?? refused()))
+        } else if what == "cp949.dec" {
+            print(to_hex((cp949.decode(raw) ?? "?refused?").to_bytes()))
+        } else if what == "cp949.enc" {
+            print(to_hex(cp949.encode_with(t949, raw.to_str()) ?? refused()))
+        } else if what == "big5hkscs.dec" {
+            print(to_hex((big5hkscs.decode(raw) ?? "?refused?").to_bytes()))
+        } else if what == "big5hkscs.enc" {
+            print(to_hex(big5hkscs.encode_with(thk, raw.to_str()) ??
+                refused()))
+        } else {
+            // `ebcdic.<page>.<dec|enc>`
+            let parts = what.split(".")
+            if parts.len() == 3 and parts[2] == "dec" {
+                print(to_hex((ebcdic.decode(raw, parts[1]) ?? "?refused?")
+                        .to_bytes()))
+            } else if parts.len() == 3 {
+                print(to_hex(ebcdic.encode(raw.to_str(), parts[1]) ??
+                    refused()))
+            } else {
+                print("?unknown?")
+            }
+        }
+        i = i + 2
+    }
+}
