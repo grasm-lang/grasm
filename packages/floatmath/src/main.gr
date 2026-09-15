@@ -1,0 +1,639 @@
+// The floating-point operations that have exactly one right answer.
+//
+// Most of `math` is approximation: `sin` and `exp` are as good as the
+// library that computes them, and two libraries differ in the last bit. The
+// operations here are different. Each has a single correctly rounded result
+// that IEEE 754 or the C standard fixes, and a program that needs one —
+// summing money-like values without drift, stepping through every float in a
+// range, writing a float so it reads back bit for bit — needs that exact
+// result and not a near miss.
+//
+// - `fsum` is exact summation: the sum of the true values of the inputs,
+//   rounded once. Adding `0.1` to a total ten times gives
+//   `0.9999999999999999`; `fsum` of the same ten is `1.0`. This is Shewchuk's algorithm with CPython's
+//   correction for rounding across partials, ported from `math_fsum`.
+// - `nextafter`, `ulp`, `frexp` and `ldexp` move by exact binary amounts,
+//   `ldexp` rounding half to even when a result falls into the subnormals.
+// - `fmod` is the exact remainder, computed on the significands so no
+//   precision is lost however far apart the operands are, and `remainder` is
+//   IEEE's, rounding the quotient to nearest even.
+// - `to_hex` and `from_hex` are `float.hex` and `float.fromhex`, the only
+//   text form of a float that never needs rounding to write, and which reads
+//   back with correct half-even rounding when it has more digits than fit.
+//
+// Every function fails where Python raises: `fsum` on `inf + -inf` or
+// intermediate overflow, `ldexp` on overflow, `fmod` and `remainder` on a
+// zero divisor or an infinite dividend.
+//
+// Checked against Python's `math` module and `float.hex`/`float.fromhex`.
+
+type FloatMathError =
+    | FloatMathOverflow(what: str)
+    | FloatMathDomain(what: str)
+    | FloatMathSyntax(text: str)
+
+let SIGN = -9223372036854775807 - 1
+let TWO52 = 4503599627370496
+let INF = (9218868437227405312).from_bits()
+
+fn is_nan(x: f64) -> bool {
+    return x != x
+}
+
+fn is_inf(x: f64) -> bool {
+    return x == INF or x == 0.0 - INF
+}
+
+fn is_finite(x: f64) -> bool {
+    return not is_nan(x) and not is_inf(x)
+}
+
+fn fabs(x: f64) -> f64 {
+    return from_parts(false, raw_exponent(x), raw_fraction(x))
+}
+
+fn is_negative(x: f64) -> bool {
+    return x.to_bits() < 0
+}
+
+fn raw_exponent(x: f64) -> i64 {
+    let bits = x.to_bits()
+    let unsigned = if bits < 0 { bits - SIGN } else { bits }
+    return unsigned / TWO52
+}
+
+fn raw_fraction(x: f64) -> i64 {
+    let bits = x.to_bits()
+    let unsigned = if bits < 0 { bits - SIGN } else { bits }
+    return unsigned % TWO52
+}
+
+fn from_parts(negative: bool, exponent: i64, fraction: i64) -> f64 {
+    let magnitude = exponent * TWO52 + fraction
+    return (if negative { magnitude + SIGN } else { magnitude }).from_bits()
+}
+
+/// `copysign(magnitude, sign)`.
+pub fn copysign(magnitude: f64, sign: f64) -> f64 {
+    return from_parts(is_negative(sign), raw_exponent(magnitude),
+        raw_fraction(magnitude))
+}
+
+fn bit_length(n: i64) -> i64 {
+    var count = 0
+    var v = n
+    while v > 0 {
+        v = v / 2
+        count = count + 1
+    }
+    return count
+}
+
+/// `m × 2^e`, for a non-negative `m` below 2^62, rounded half to even to a
+/// double. `None` when it overflows.
+fn round_to_double(negative: bool, m: i64, e: i64) -> Option[f64] {
+    let top = bit_length(m) + e
+    // The exponent of the lowest bit a double of this size keeps.
+    let lsb = (if top > -1021 { top } else { -1021 }) - 53
+    var kept = m
+    var exponent = e
+    if lsb > e {
+        let shift = lsb - e
+        exponent = lsb
+        if shift > 62 {
+            // Below half the smallest step, since `m` is below 2^62.
+            kept = 0
+        } else {
+            let divisor = pow2(shift)
+            kept = m / divisor
+            let rest = m % divisor
+            let half = divisor / 2
+            if rest > half or (rest == half and kept % 2 == 1) {
+                kept = kept + 1
+            }
+        }
+    }
+    if kept == 0 {
+        return Some(from_parts(negative, 0, 0))
+    }
+    while kept >= TWO52 * 2 {
+        kept = kept / 2
+        exponent = exponent + 1
+    }
+    while kept < TWO52 and exponent > -1074 {
+        kept = kept * 2
+        exponent = exponent - 1
+    }
+    if kept < TWO52 {
+        return Some(from_parts(negative, 0, kept))
+    }
+    let biased = exponent + 52 + 1023
+    if biased >= 2047 {
+        return None
+    }
+    return Some(from_parts(negative, biased, kept - TWO52))
+}
+
+/// The significand as an integer and its exponent: `|x| = m × 2^e`.
+fn decompose(x: f64) -> (i64, i64) {
+    let exponent = raw_exponent(x)
+    let fraction = raw_fraction(x)
+    if exponent == 0 {
+        return (fraction, -1074)
+    }
+    return (fraction + TWO52, exponent - 1075)
+}
+
+/// `math.frexp`: `x = m × 2^e` with `0.5 <= |m| < 1`, or `(x, 0)` for zero,
+/// infinities and NaN.
+pub fn frexp(x: f64) -> (f64, i64) {
+    if x == 0.0 or not is_finite(x) {
+        return (x, 0)
+    }
+    let parts = decompose(x)
+    let length = bit_length(parts.0)
+    let normal = parts.0 * pow2(53 - length)
+    return (from_parts(is_negative(x), 1022, normal - TWO52),
+        parts.1 + length)
+}
+
+fn pow2(n: i64) -> i64 {
+    var v = 1
+    var k = 0
+    while k < n {
+        v = v * 2
+        k = k + 1
+    }
+    return v
+}
+
+/// `math.ldexp`: `x × 2^i`, rounded half to even into the subnormals, and a
+/// failure where the result overflows.
+pub fn ldexp(x: f64, i: i64) -> f64 ! FloatMathError {
+    if x == 0.0 or not is_finite(x) {
+        return x
+    }
+    let parts = decompose(x)
+    let clamped = if i > 5000 { 5000 } else if i < -5000 { -5000 } else { i }
+    match round_to_double(is_negative(x), parts.0, parts.1 + clamped) {
+        Some(v) -> return v
+        None -> fail(FloatMathOverflow("ldexp"))
+    }
+}
+
+/// `math.nextafter(x, toward)`: the adjacent float in that direction.
+pub fn nextafter(x: f64, toward: f64) -> f64 {
+    if is_nan(x) {
+        return x
+    }
+    if is_nan(toward) {
+        return toward
+    }
+    if x == toward {
+        return toward
+    }
+    if x == 0.0 {
+        return from_parts(is_negative(toward), 0, 1)
+    }
+    let bits = x.to_bits()
+    let away = (x < toward) != is_negative(x)
+    return (if away { bits + 1 } else { bits - 1 }).from_bits()
+}
+
+/// `math.nextafter(x, toward, steps=steps)`: `steps` floats along, stopping
+/// at `toward`. A negative `steps` is refused.
+pub fn nextafter_steps(x: f64, toward: f64, steps: i64) -> f64 ! FloatMathError {
+    if steps < 0 {
+        fail(FloatMathDomain("steps must be a non-negative integer"))
+    }
+    if steps == 0 {
+        return x
+    }
+    if is_nan(x) {
+        return x
+    }
+    if is_nan(toward) {
+        return toward
+    }
+    let ux = x.to_bits()
+    let uy = toward.to_bits()
+    if ux == uy {
+        return x
+    }
+    let ax = if ux < 0 { ux - SIGN } else { ux }
+    let ay = if uy < 0 { uy - SIGN } else { uy }
+    if (ux < 0) != (uy < 0) {
+        if ay <= steps and ax <= steps - ay {
+            return toward
+        }
+        if ax < steps {
+            let magnitude = steps - ax
+            return (if uy < 0 { magnitude + SIGN } else { magnitude }).from_bits()
+        }
+        return (ux - steps).from_bits()
+    }
+    if ax > ay {
+        return if ax - ay >= steps { (ux - steps).from_bits() } else { toward }
+    }
+    return if ay - ax >= steps { (ux + steps).from_bits() } else { toward }
+}
+
+/// `math.ulp`: the gap between `|x|` and the next float above it.
+pub fn ulp(x: f64) -> f64 {
+    if is_nan(x) {
+        return x
+    }
+    let a = fabs(x)
+    if is_inf(a) {
+        return a
+    }
+    let up = nextafter(a, INF)
+    if is_inf(up) {
+        return a - nextafter(a, 0.0 - INF)
+    }
+    return up - a
+}
+
+/// The exact remainder of finite `x` by finite non-zero `y`, with the sign
+/// of `x`, computed on the significands: `|x| = mx × 2^ex`, `|y| = my × 2^ey`.
+fn exact_fmod(x: f64, y: f64) -> f64 {
+    if fabs(x) < fabs(y) {
+        return x
+    }
+    let px = decompose(x)
+    let py = decompose(y)
+    var r = 0
+    var e = py.1
+    if px.1 >= py.1 {
+        // mx × 2^(ex - ey) modulo my, doubling one bit at a time so every
+        // step stays below 2^54.
+        r = px.0 % py.0
+        var steps = px.1 - py.1
+        while steps > 0 {
+            r = (r * 2) % py.0
+            steps = steps - 1
+        }
+    } else {
+        // |x| >= |y| with the lower exponent, so my × 2^(ey - ex) <= mx.
+        r = px.0 % (py.0 * pow2(py.1 - px.1))
+        e = px.1
+    }
+    return copysign(round_to_double(false, r, e) ?? 0.0, x)
+}
+
+/// `math.fmod(x, y)`: the exact remainder with the sign of `x`.
+pub fn fmod(x: f64, y: f64) -> f64 ! FloatMathError {
+    if is_nan(x) or is_nan(y) {
+        return if is_nan(x) { x } else { y }
+    }
+    if is_inf(y) and is_finite(x) {
+        return x
+    }
+    if is_inf(x) or y == 0.0 {
+        fail(FloatMathDomain("fmod"))
+    }
+    return exact_fmod(x, y)
+}
+
+/// `math.remainder(x, y)`: `x - n × y` for the integer `n` nearest `x / y`,
+/// ties to even.
+pub fn remainder(x: f64, y: f64) -> f64 ! FloatMathError {
+    if is_nan(x) {
+        return x
+    }
+    if is_nan(y) {
+        return y
+    }
+    if is_inf(x) or y == 0.0 {
+        fail(FloatMathDomain("remainder"))
+    }
+    if is_inf(y) {
+        return x
+    }
+    let absx = fabs(x)
+    let absy = fabs(y)
+    let m = exact_fmod(absx, absy)
+    let c = absy - m
+    var r = m
+    if m > c {
+        r = -1.0 * c
+    } else if m == c {
+        r = m - 2.0 * exact_fmod(0.5 * (absx - m), absy)
+    }
+    return copysign(1.0, x) * r
+}
+
+/// `math.modf`: the fractional and integral parts, both with the sign of `x`.
+pub fn modf(x: f64) -> (f64, f64) {
+    if is_nan(x) {
+        return (x, x)
+    }
+    if is_inf(x) {
+        return (copysign(0.0, x), x)
+    }
+    let whole = if is_negative(x) { copysign((0.0 - x).floor(), x) } else {
+        x.floor() }
+    return (copysign(x - whole, x), whole)
+}
+
+/// `math.isclose`, with Python's defaults when called as
+/// `isclose(a, b, 1e-09, 0.0)`.
+pub fn isclose(a: f64, b: f64, rel_tol: f64, abs_tol: f64) -> bool ! FloatMathError {
+    if rel_tol < 0.0 or abs_tol < 0.0 {
+        fail(FloatMathDomain("tolerances must be non-negative"))
+    }
+    if a == b {
+        return true
+    }
+    if is_inf(a) or is_inf(b) {
+        return false
+    }
+    let diff = fabs(b - a)
+    return diff <= fabs(rel_tol * b) or diff <= fabs(rel_tol * a) or
+    diff <= abs_tol
+}
+
+/// `math.fsum`: the correctly rounded sum of the exact values.
+pub fn fsum(values: [f64]) -> f64 ! FloatMathError {
+    var partials: [f64] = []
+    var special = 0.0
+    var inf_sum = 0.0
+    var saw_special = false
+    for value in values {
+        var x = value
+        var kept: [f64] = []
+        for p in partials {
+            var y = p
+            if fabs(x) < fabs(y) {
+                let t = x
+                x = y
+                y = t
+            }
+            let hi = x + y
+            let lo = y - (hi - x)
+            if lo != 0.0 {
+                kept.push(lo)
+            }
+            x = hi
+        }
+        partials = kept
+        if x != 0.0 {
+            if not is_finite(x) {
+                if is_finite(value) {
+                    fail(FloatMathOverflow("intermediate overflow in fsum"))
+                }
+                if is_inf(value) {
+                    inf_sum = inf_sum + value
+                }
+                special = special + value
+                saw_special = true
+                partials = []
+            } else {
+                partials.push(x)
+            }
+        }
+    }
+    if saw_special {
+        if is_nan(inf_sum) {
+            fail(FloatMathDomain("-inf + inf in fsum"))
+        }
+        return special
+    }
+    return settle(partials)
+}
+
+/// The partials summed from the top until the sum becomes inexact, with the
+/// half-even correction across partials.
+fn settle(partials: [f64]) -> f64 {
+    var n = partials.len()
+    if n == 0 {
+        return 0.0
+    }
+    n = n - 1
+    var hi = partials[n]
+    var lo = 0.0
+    while n > 0 {
+        let x = hi
+        n = n - 1
+        let y = partials[n]
+        hi = x + y
+        lo = y - (hi - x)
+        if lo != 0.0 {
+            break
+        }
+    }
+    if n > 0 and ((lo < 0.0 and partials[n - 1] < 0.0) or
+        (lo > 0.0 and partials[n - 1] > 0.0)) {
+        let y = lo * 2.0
+        let x = hi + y
+        if y == x - hi {
+            hi = x
+        }
+    }
+    return hi
+}
+
+fn hex_digit(v: i64) -> str {
+    return "0123456789abcdef".substr(v, 1)
+}
+
+/// `float.hex()`: `0x1.8000000000000p+0` for 1.5, `inf`, `nan`.
+pub fn to_hex(x: f64) -> str {
+    if is_nan(x) {
+        return "nan"
+    }
+    if is_inf(x) {
+        return if x > 0.0 { "inf" } else { "-inf" }
+    }
+    let sign = if is_negative(x) { "-" } else { "" }
+    let exponent = raw_exponent(x)
+    let fraction = raw_fraction(x)
+    if exponent == 0 and fraction == 0 {
+        return sign + "0x0.0p+0"
+    }
+    let lead = if exponent == 0 { "0" } else { "1" }
+    let e = if exponent == 0 { -1022 } else { exponent - 1023 }
+    var digits = ""
+    var shift = TWO52 / 16
+    var rest = fraction
+    var k = 0
+    while k < 13 {
+        digits = digits + hex_digit(rest / shift)
+        rest = rest % shift
+        shift = shift / 16
+        k = k + 1
+    }
+    let esign = if e < 0 { "-" } else { "+" }
+    let magnitude = if e < 0 { 0 - e } else { e }
+    return "{sign}0x{lead}.{digits}p{esign}{magnitude}"
+}
+
+fn is_c_space(c: str) -> bool {
+    return c == " " or c == "\t" or c == "\n" or c == "\r" or c == "\u{b}" or
+    c == "\u{c}"
+}
+
+fn hex_value(c: str) -> i64 {
+    let at = "0123456789abcdef".index_of(c.to_lower()) ?? -1
+    return if c.len() == 1 { at } else { -1 }
+}
+
+/// Where an `inf`, `infinity` or `nan` (any case, optionally signed) starting
+/// at `at` ends, and its value; `at` itself when there is none.
+fn special_at(chars: [str], at: i64) -> (i64, f64) {
+    var i = at
+    var negative = false
+    if i < chars.len() and (chars[i] == "+" or chars[i] == "-") {
+        negative = chars[i] == "-"
+        i = i + 1
+    }
+    var word = ""
+    var k = i
+    while k < chars.len() and k < i + 8 {
+        word = word + chars[k].to_lower()
+        k = k + 1
+    }
+    if word.starts_with("infinity") {
+        return (i + 8, if negative { 0.0 - INF } else { INF })
+    }
+    if word.starts_with("inf") {
+        return (i + 3, if negative { 0.0 - INF } else { INF })
+    }
+    if word.starts_with("nan") {
+        let nan = (9221120237041090560).from_bits()
+        return (i + 3, if negative { copysign(nan, -1.0) } else { nan })
+    }
+    return (at, 0.0)
+}
+
+/// `float.fromhex(text)`.
+pub fn from_hex(text: str) -> f64 ! FloatMathError {
+    let chars = text.chars()
+    var s = 0
+    while s < chars.len() and is_c_space(chars[s]) {
+        s = s + 1
+    }
+    let special = special_at(chars, s)
+    if special.0 != s {
+        return try finish(chars, special.0, special.1, text)
+    }
+    var negative = false
+    if s < chars.len() and (chars[s] == "-" or chars[s] == "+") {
+        negative = chars[s] == "-"
+        s = s + 1
+    }
+    if s + 1 < chars.len() and chars[s] == "0" and
+    (chars[s + 1] == "x" or chars[s + 1] == "X") {
+        s = s + 2
+    }
+    var digits: [i64] = []
+    var fraction_digits = 0
+    while s < chars.len() and hex_value(chars[s]) >= 0 {
+        digits.push(hex_value(chars[s]))
+        s = s + 1
+    }
+    if s < chars.len() and chars[s] == "." {
+        s = s + 1
+        while s < chars.len() and hex_value(chars[s]) >= 0 {
+            digits.push(hex_value(chars[s]))
+            fraction_digits = fraction_digits + 1
+            s = s + 1
+        }
+    }
+    if digits.len() == 0 {
+        fail(FloatMathSyntax(text))
+    }
+    var exp = 0
+    if s < chars.len() and (chars[s] == "p" or chars[s] == "P") {
+        s = s + 1
+        let read = try exponent_at(chars, s, text)
+        exp = read.0
+        s = read.1
+    }
+    let value = try hex_value_of(digits, exp - 4 * fraction_digits, negative)
+    return try finish(chars, s, value, text)
+}
+
+/// A C `strtol` exponent at `at`: a sign and at least one digit, saturating.
+fn exponent_at(chars: [str], at: i64, text: str) -> (i64, i64) ! FloatMathError {
+    var s = at
+    var negative = false
+    if s < chars.len() and (chars[s] == "-" or chars[s] == "+") {
+        negative = chars[s] == "-"
+        s = s + 1
+    }
+    let start = s
+    var value = 0
+    while s < chars.len() and chars[s] >= "0" and chars[s] <= "9" and
+    chars[s].len() == 1 {
+        if value < 100000000000000000 {
+            value = value * 10 + (chars[s].code_at(0) - 48)
+        }
+        s = s + 1
+    }
+    if s == start {
+        fail(FloatMathSyntax(text))
+    }
+    return (if negative { 0 - value } else { value }, s)
+}
+
+fn finish(chars: [str], at: i64, value: f64, text: str) -> f64 ! FloatMathError {
+    var s = at
+    while s < chars.len() and is_c_space(chars[s]) {
+        s = s + 1
+    }
+    if s != chars.len() {
+        fail(FloatMathSyntax(text))
+    }
+    return value
+}
+
+/// The hex digits `digits` (most significant first) times `2^exp`,
+/// correctly rounded.
+fn hex_value_of(all_digits: [i64], exp: i64, negative: bool) -> f64 ! FloatMathError {
+    var first = 0
+    while first < all_digits.len() and all_digits[first] == 0 {
+        first = first + 1
+    }
+    let digits = all_digits.slice(first, all_digits.len())
+    let zero = from_parts(negative, 0, 0)
+    if digits.len() == 0 or exp < -1000000000000 {
+        return zero
+    }
+    let top = exp + 4 * (digits.len() - 1) + bit_length(digits[0])
+    if top < -1074 {
+        return zero
+    }
+    if top > 1024 {
+        fail(FloatMathOverflow("hexadecimal value too large to represent as a float"))
+    }
+    let lsb = (if top > -1021 { top } else { -1021 }) - 53
+    let shift = lsb - exp
+    var kept = 0
+    var round = 0
+    var sticky = false
+    var k = 4 * digits.len() - 1
+    while k >= 0 {
+        let digit = digits[digits.len() - 1 - k / 4]
+        let bit = (digit / pow2(k % 4)) % 2
+        if k >= shift {
+            kept = kept * 2 + bit
+        } else if k == shift - 1 {
+            round = bit
+        } else if bit == 1 {
+            sticky = true
+        }
+        k = k - 1
+    }
+    var scale = exp
+    if shift > 0 {
+        scale = lsb
+        if round == 1 and (sticky or kept % 2 == 1) {
+            kept = kept + 1
+        }
+    }
+    match round_to_double(negative, kept, scale) {
+        Some(v) -> return v
+        None -> fail(FloatMathOverflow("hexadecimal value too large to represent as a float"))
+    }
+}

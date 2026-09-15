@@ -9,6 +9,19 @@ migration note here; anything `experimental` may change in any release. See
 
 ### Added
 
+- **The formats Python writes its own data in.** `pyliteral` reads exactly
+  what `ast.literal_eval` reads — every number notation, every string
+  prefix and escape, containers, and the one sum that writes a complex
+  number — keeps Python's idea of which dict keys are equal, and writes
+  values back as `repr` does, with the unprintable characters escaped from
+  a table generated out of Python's Unicode database. `pymarshal` reads
+  `marshal` data at every version, back-references included, and writes it
+  byte for byte as versions 0 to 2 do. `prettyrepr` is `pprint.pformat` with
+  every option. `floatmath` is the float operations with one right answer:
+  `fsum`, `nextafter`, `ulp`, `frexp`, `ldexp`, exact `fmod`, IEEE
+  `remainder`, and `float.hex`/`float.fromhex` with half-even rounding.
+  `getopt` is `getopt.getopt` and `gnu_getopt`, including 3.14's optional
+  values. 91,589 cases against Python; `pydatadiff` is a gate.
 - **The network as the C library describes it.** `inetaton` reads IPv4
   addresses as `inet_aton` does — `127.1`, octal `017`, hex `0x7f`, text
   after a space ignored — which is what a check has to use when another
@@ -210,6 +223,28 @@ migration note here; anything `experimental` may change in any release. See
   are gates.
 
 ### Fixed
+
+- **A write that ended at a reference-valued field went through the
+  reference instead of replacing it, in the interpreter.** `node.next =
+  other`, where `node` is a `ref` and `next` holds one, wrote `other` over
+  whatever the old `next` pointed at: the field kept its old reference, and
+  every other holder of that node saw it replaced — or, when the shapes did
+  not match, the next read panicked `has no field`. The compiled backend
+  replaced the field, so the two disagreed. A path ending at a reference now
+  names the place holding it, which is what [T-REF-WRITE] says, and
+  `T-REF-WRITE.gr` checks both a field reached through a reference and one in
+  a plain struct. Found by `pyliteral`, whose parse tree is exactly this
+  shape.
+
+- **`shortestfloat` printed 46 powers of two with a digit too many.** At a
+  power of two the doubles below are half as far away as the doubles above,
+  so the interval that reads back as the double is lopsided, and the nearest
+  decimal of a given length can fall outside it while the neighbour on the
+  other side falls inside. It tried only the nearest; `2^-381` came out as
+  `5.0758836746312984e-116` where Python prints `5.075883674631299e-116`.
+  Both neighbours are tried now, nearest first, and the gate covers every
+  power of two — random doubles almost never have an all-zero mantissa,
+  which is how 22,751 cases missed it. Found by `pymarshal`'s differential.
 
 - **`punycode.encode` left off the delimiter for an all-ASCII label**, which
   made its output undecodable by every other implementation. `encode_domain`

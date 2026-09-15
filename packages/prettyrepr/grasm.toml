@@ -1,0 +1,10 @@
+[package]
+name = "prettyrepr"
+version = "1.0.0"
+
+# Values to text. Opens nothing.
+capabilities = []
+
+[dependencies.pyliteral]
+path = "../pyliteral"
+version = "^1.0.0"

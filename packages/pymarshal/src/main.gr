@@ -1,0 +1,642 @@
+// Python's `marshal` format, for the data it carries.
+//
+// `marshal` is the serialisation Python uses for itself: the body of every
+// `.pyc` file, the cache files of several build tools, and the fastest way a
+// Python program has to write plain data. Unlike `pickle` it cannot name a
+// class or call anything, so there is no code-execution risk in reading it —
+// but it is also undocumented and changes between versions, and the only
+// description of it is `Python/marshal.c`. This is that file, for data:
+//
+// - `None`, `True`, `False`, `...`, integers of any size (32-bit, or 15-bit
+//   digits for larger ones), floats and complex numbers as text (versions 0
+//   and 1) or as IEEE bytes (2 and later);
+// - bytes and str in all seven string encodings the versions have used,
+//   interned or not;
+// - tuples, lists, dicts, sets and frozensets, with the short tuple form of
+//   version 4;
+// - back-references: version 3 and later write an object once and point at
+//   it again, and a reader that ignores the flag reads every later reference
+//   as garbage.
+//
+// Values are `pyliteral`'s, so a dict keeps Python's idea of which keys are
+// equal and `pyliteral.repr` prints what was read.
+//
+// Refused, each with the reason: code objects, `StopIteration` and slices,
+// which are not data; a reference to a container that is still being read,
+// which would make a cycle `PyValue` cannot hold; and a str that decodes to
+// a lone surrogate.
+//
+// `dumps` writes what `marshal.dumps` writes, byte for byte, for versions 0
+// to 2. From version 3 Python sets the reference flag on objects according
+// to their reference counts inside the interpreter, which no other program
+// can reproduce; `dumps` sets it on nothing, which every version of `loads`
+// reads back to the same value.
+//
+// Checked against `marshal.loads` and `marshal.dumps` at every version.
+
+import bigint
+import pyliteral
+import shortestfloat
+
+type MarshalError =
+    | MarshalTruncated(at: i64)
+    | MarshalUnknownType(at: i64, code: i64)
+    | MarshalBadData(at: i64, why: str)
+    | MarshalRefused(at: i64, what: str)
+    | MarshalUnhashable(at: i64)
+    | MarshalVersion(version: i64)
+
+type MarshalReader = {
+    data: bytes,
+    at: i64,
+    refs: [ref PyValue],
+    filled: [bool],
+}
+
+let FLAG_REF = 128
+
+fn need(r: MarshalReader, count: i64) -> () ! MarshalError {
+    if r.at + count > r.data.len() or count < 0 {
+        fail(MarshalTruncated(r.at))
+    }
+}
+
+fn read_byte(inout r: MarshalReader) -> i64 ! MarshalError {
+    try need(r, 1)
+    let b = r.data.at(r.at)
+    r.at = r.at + 1
+    return b
+}
+
+fn read_int32(inout r: MarshalReader) -> i64 ! MarshalError {
+    try need(r, 4)
+    let d = r.data
+    let v = d.at(r.at) + d.at(r.at + 1) * 256 + d.at(r.at + 2) * 65536 +
+    d.at(r.at + 3) * 16777216
+    r.at = r.at + 4
+    return if v >= 2147483648 { v - 4294967296 } else { v }
+}
+
+fn read_int64(inout r: MarshalReader) -> BigInt ! MarshalError {
+    let low = try read_int32(r)
+    let high = try read_int32(r)
+    let unsigned_low = if low < 0 { low + 4294967296 } else { low }
+    return bigint.add(bigint.mul(bigint.from_i64(high),
+        bigint.from_i64(4294967296)), bigint.from_i64(unsigned_low))
+}
+
+fn take_bytes(inout r: MarshalReader, count: i64) -> bytes ! MarshalError {
+    try need(r, count)
+    let out = r.data.slice(r.at, r.at + count)
+    r.at = r.at + count
+    return out
+}
+
+fn read_float64(inout r: MarshalReader) -> f64 ! MarshalError {
+    let raw = try take_bytes(r, 8)
+    var bits = 0
+    var i = 7
+    while i >= 0 {
+        bits = bits.shl(8).bit_or(raw.at(i))
+        i = i - 1
+    }
+    return bits.from_bits()
+}
+
+fn read_text_float(inout r: MarshalReader) -> f64 ! MarshalError {
+    let start = r.at
+    let n = try read_byte(r)
+    let text = latin1(try take_bytes(r, n))
+    match strict_float(text) {
+        Some(x) -> return x
+        None -> fail(MarshalBadData(start, "could not convert string to float"))
+    }
+}
+
+/// A float as `PyOS_string_to_double` reads one: a sign, then `inf`,
+/// `infinity` or `nan` in any case, or decimal digits with an optional point
+/// and exponent — and nothing else, not even a space.
+fn strict_float(text: str) -> Option[f64] {
+    var body = text
+    var sign = ""
+    if body.starts_with("-") or body.starts_with("+") {
+        sign = body.substr(0, 1)
+        body = body.substr(1, body.len())
+    }
+    let lower = body.to_lower()
+    if lower == "nan" {
+        return "nan".parse_float()
+    }
+    if lower == "inf" or lower == "infinity" {
+        return (if sign == "-" { "-inf" } else { "inf" }).parse_float()
+    }
+    let codes = body.codes()
+    var i = 0
+    var mantissa_digits = 0
+    while i < codes.len() and codes[i] >= 48 and codes[i] <= 57 {
+        i = i + 1
+        mantissa_digits = mantissa_digits + 1
+    }
+    var normal = body.substr(0, i)
+    if i < codes.len() and codes[i] == 46 {
+        let point = i
+        i = i + 1
+        while i < codes.len() and codes[i] >= 48 and codes[i] <= 57 {
+            i = i + 1
+            mantissa_digits = mantissa_digits + 1
+        }
+        normal = (if point == 0 { "0" } else { normal }) + "." +
+        body.substr(point + 1, i - point - 1) + "0"
+    }
+    if mantissa_digits == 0 {
+        return None
+    }
+    if i < codes.len() and (codes[i] == 101 or codes[i] == 69) {
+        let e = i
+        i = i + 1
+        if i < codes.len() and (codes[i] == 43 or codes[i] == 45) {
+            i = i + 1
+        }
+        let digits_start = i
+        while i < codes.len() and codes[i] >= 48 and codes[i] <= 57 {
+            i = i + 1
+        }
+        if i == digits_start {
+            return None
+        }
+        normal = normal + "e" + body.substr(e + 1, i - e - 1)
+    }
+    if i != codes.len() {
+        return None
+    }
+    return (sign + normal).parse_float()
+}
+
+fn read_long(inout r: MarshalReader) -> BigInt ! MarshalError {
+    let start = r.at
+    let n = try read_int32(r)
+    let count = if n < 0 { 0 - n } else { n }
+    var value = bigint.zero()
+    var scale = bigint.from_i64(1)
+    let base = bigint.from_i64(32768)
+    var i = 0
+    var last = 0
+    while i < count {
+        try need(r, 2)
+        let digit = r.data.at(r.at) + r.data.at(r.at + 1) * 256
+        r.at = r.at + 2
+        if digit >= 32768 {
+            fail(MarshalBadData(start, "digit out of range in long"))
+        }
+        value = bigint.add(value, bigint.mul(scale, bigint.from_i64(digit)))
+        scale = bigint.mul(scale, base)
+        last = digit
+        i = i + 1
+    }
+    if count > 0 and last == 0 {
+        fail(MarshalBadData(start, "unnormalized long data"))
+    }
+    return if n < 0 { bigint.negate(value) } else { value }
+}
+
+fn latin1(raw: bytes) -> str {
+    var out = ""
+    var i = 0
+    while i < raw.len() {
+        out = out + raw.at(i).to_char()
+        i = i + 1
+    }
+    return out
+}
+
+fn read_utf8(inout r: MarshalReader, start: i64) -> str ! MarshalError {
+    let n = try read_int32(r)
+    let raw = try take_bytes(r, n)
+    // `surrogatepass`: three-byte encodings of surrogates are allowed by
+    // Python and cannot be held by a Grasm str.
+    var i = 0
+    while i + 2 < raw.len() {
+        if raw.at(i) == 237 and raw.at(i + 1) >= 160 {
+            fail(MarshalRefused(start, "a lone surrogate"))
+        }
+        i = i + 1
+    }
+    let text = raw.to_str()
+    if text.to_bytes() != raw {
+        fail(MarshalBadData(start, "invalid UTF-8"))
+    }
+    return text
+}
+
+/// Reserves a reference slot for an object whose flag is set, before its
+/// contents are read, as `marshal.c` does for containers.
+fn reserve(inout r: MarshalReader, flagged: bool) -> i64 {
+    if not flagged {
+        return -1
+    }
+    r.refs.push(ref(PyNone))
+    r.filled.push(false)
+    return r.refs.len() - 1
+}
+
+fn fill(inout r: MarshalReader, slot: i64, value: ref PyValue) {
+    if slot >= 0 {
+        r.refs[slot] = value
+        r.filled[slot] = true
+    }
+}
+
+fn read_items(inout r: MarshalReader, count: i64) -> [ref PyValue] ! MarshalError {
+    if count < 0 {
+        fail(MarshalBadData(r.at, "size out of range"))
+    }
+    var items: [ref PyValue] = []
+    var i = 0
+    while i < count {
+        items.push(try read_object(r))
+        i = i + 1
+    }
+    return items
+}
+
+fn read_dict(inout r: MarshalReader, start: i64) -> ref PyValue ! MarshalError {
+    var keys: [ref PyValue] = []
+    var values: [ref PyValue] = []
+    while true {
+        try need(r, 1)
+        if r.data.at(r.at) == 48 {
+            r.at = r.at + 1
+            break
+        }
+        let key = try read_object(r)
+        try need(r, 1)
+        if r.data.at(r.at) == 48 {
+            r.at = r.at + 1
+            break
+        }
+        let value = try read_object(r)
+        if not pyliteral.is_hashable(key) {
+            fail(MarshalUnhashable(start))
+        }
+        var found = -1
+        var j = 0
+        while j < keys.len() and found < 0 {
+            if pyliteral.equals(keys[j], key) {
+                found = j
+            }
+            j = j + 1
+        }
+        if found >= 0 {
+            values[found] = value
+        } else {
+            keys.push(key)
+            values.push(value)
+        }
+    }
+    return ref(PyDict(keys, values))
+}
+
+fn unique_members(items: [ref PyValue], start: i64) -> [ref PyValue] ! MarshalError {
+    var out: [ref PyValue] = []
+    for item in items {
+        if not pyliteral.is_hashable(item) {
+            fail(MarshalUnhashable(start))
+        }
+        var seen = false
+        for o in out {
+            if pyliteral.equals(o, item) {
+                seen = true
+            }
+        }
+        if not seen {
+            out.push(item)
+        }
+    }
+    return out
+}
+
+fn read_reference(inout r: MarshalReader, start: i64) -> ref PyValue ! MarshalError {
+    let index = try read_int32(r)
+    if index < 0 or index >= r.refs.len() {
+        fail(MarshalBadData(start, "invalid reference"))
+    }
+    if not r.filled[index] {
+        fail(MarshalRefused(start, "a reference to a container still being read"))
+    }
+    return r.refs[index]
+}
+
+fn read_scalar(inout r: MarshalReader, code: i64, start: i64) -> Option[ref PyValue] ! MarshalError {
+    if code == 78 {
+        return Some(ref(PyNone))
+    }
+    if code == 70 or code == 84 {
+        return Some(ref(PyBool(code == 84)))
+    }
+    if code == 46 {
+        return Some(ref(PyEllipsis))
+    }
+    if code == 105 {
+        return Some(ref(PyInt(bigint.from_i64(try read_int32(r)))))
+    }
+    if code == 73 {
+        return Some(ref(PyInt(try read_int64(r))))
+    }
+    if code == 108 {
+        return Some(ref(PyInt(try read_long(r))))
+    }
+    if code == 102 {
+        return Some(ref(PyFloat(try read_text_float(r))))
+    }
+    if code == 103 {
+        return Some(ref(PyFloat(try read_float64(r))))
+    }
+    if code == 120 {
+        let real = try read_text_float(r)
+        return Some(ref(PyComplex(real, try read_text_float(r))))
+    }
+    if code == 121 {
+        let real = try read_float64(r)
+        return Some(ref(PyComplex(real, try read_float64(r))))
+    }
+    return try read_string(r, code, start)
+}
+
+fn read_string(inout r: MarshalReader, code: i64, start: i64) -> Option[ref PyValue] ! MarshalError {
+    if code == 115 {
+        let n = try read_int32(r)
+        return Some(ref(PyBytes(try take_bytes(r, n))))
+    }
+    if code == 116 or code == 117 {
+        return Some(ref(PyStr(try read_utf8(r, start))))
+    }
+    if code == 97 or code == 65 {
+        let n = try read_int32(r)
+        return Some(ref(PyStr(latin1(try take_bytes(r, n)))))
+    }
+    if code == 122 or code == 90 {
+        let n = try read_byte(r)
+        return Some(ref(PyStr(latin1(try take_bytes(r, n)))))
+    }
+    return None
+}
+
+fn read_object(inout r: MarshalReader) -> ref PyValue ! MarshalError {
+    let start = r.at
+    let tagged = try read_byte(r)
+    let flagged = tagged >= FLAG_REF
+    let code = tagged % FLAG_REF
+    if code == 114 {
+        return try read_reference(r, start)
+    }
+    if code == 48 {
+        fail(MarshalBadData(start, "NULL object in marshal data"))
+    }
+    if code == 99 or code == 83 or code == 58 {
+        fail(MarshalRefused(start, "a code object, StopIteration or slice"))
+    }
+    let slot = reserve(r, flagged)
+    match try read_scalar(r, code, start) {
+        Some(v) -> {
+            fill(r, slot, v)
+            return v
+        }
+        None -> {}
+    }
+    var value = ref(PyNone)
+    if code == 40 or code == 41 or code == 91 {
+        let n = if code == 41 { try read_byte(r) } else {
+            try read_int32(r) }
+        let items = try read_items(r, n)
+        value = if code == 91 { ref(PyList(items)) } else {
+            ref(PyTuple(items)) }
+    } else if code == 123 {
+        value = try read_dict(r, start)
+    } else if code == 60 or code == 62 {
+        let n = try read_int32(r)
+        let items = try unique_members(try read_items(r, n), start)
+        value = if code == 60 { ref(PySet(items)) } else {
+            ref(PyFrozenSet(items)) }
+    } else {
+        fail(MarshalUnknownType(start, code))
+    }
+    fill(r, slot, value)
+    return value
+}
+
+/// The first value in `data`, as `marshal.loads` reads it; anything after
+/// it is ignored, as Python ignores it.
+pub fn loads(data: bytes) -> ref PyValue ! MarshalError {
+    var r = MarshalReader{ data: data, at: 0, refs: [], filled: [] }
+    return try read_object(r)
+}
+
+/// The value and how many bytes it took.
+pub fn load_prefix(data: bytes) -> (ref PyValue, i64) ! MarshalError {
+    var r = MarshalReader{ data: data, at: 0, refs: [], filled: [] }
+    let v = try read_object(r)
+    return (v, r.at)
+}
+
+// ---------------------------------------------------------------------------
+// Writing
+
+fn push_int32(inout out: [i64], v: i64) {
+    let u = if v < 0 { v + 4294967296 } else { v }
+    out.push(u % 256)
+    out.push(u / 256 % 256)
+    out.push(u / 65536 % 256)
+    out.push(u / 16777216 % 256)
+}
+
+fn push_float64(inout out: [i64], x: f64) {
+    let bits = x.to_bits()
+    var i = 0
+    while i < 8 {
+        out.push(bits.ushr(i * 8).bit_and(255))
+        i = i + 1
+    }
+}
+
+fn push_raw(inout out: [i64], raw: bytes) {
+    var i = 0
+    while i < raw.len() {
+        out.push(raw.at(i))
+        i = i + 1
+    }
+}
+
+/// `%.17g`, which is how versions 0 and 1 write a float.
+pub fn g17(x: f64) -> str {
+    if x != x {
+        return "nan"
+    }
+    if x - x != 0.0 {
+        return if x > 0.0 { "inf" } else { "-inf" }
+    }
+    let p = shortestfloat.significant(x, 17)
+    let sign = if p.negative { "-" } else { "" }
+    if x == 0.0 {
+        return sign + "0"
+    }
+    let exponent = p.point - 1
+    var digits = p.digits
+    if exponent < -4 or exponent >= 17 {
+        var mantissa = digits.substr(0, 1) + "." + digits.substr(1, 16)
+        while mantissa.ends_with("0") {
+            mantissa = mantissa.substr(0, mantissa.len() - 1)
+        }
+        if mantissa.ends_with(".") {
+            mantissa = mantissa.substr(0, mantissa.len() - 1)
+        }
+        let esign = if exponent < 0 { "-" } else { "+" }
+        let magnitude = if exponent < 0 { 0 - exponent } else { exponent }
+        return sign + mantissa + "e" + esign + "{magnitude}".pad_start(2, "0")
+    }
+    var whole = ""
+    var fraction = ""
+    if p.point <= 0 {
+        whole = "0"
+        fraction = "0".repeat(0 - p.point) + digits
+    } else {
+        whole = digits.substr(0, p.point)
+        fraction = digits.substr(p.point, digits.len())
+    }
+    while fraction.ends_with("0") {
+        fraction = fraction.substr(0, fraction.len() - 1)
+    }
+    return sign + whole + (if fraction.len() > 0 { "." + fraction } else { "" })
+}
+
+fn push_text_float(inout out: [i64], x: f64) {
+    let text = g17(x)
+    out.push(text.len())
+    push_raw(out, text.to_bytes())
+}
+
+fn is_ascii(text: str) -> bool {
+    for c in text.codes() {
+        if c >= 128 {
+            return false
+        }
+    }
+    return true
+}
+
+fn write_int(inout out: [i64], n: BigInt) {
+    match bigint.to_i64(n) {
+        Some(v) -> {
+            if v >= -2147483648 and v <= 2147483647 {
+                out.push(105)
+                push_int32(out, v)
+                return
+            }
+        }
+        None -> {}
+    }
+    var digits: [i64] = []
+    var left = if bigint.sign(n) < 0 { bigint.negate(n) } else { n }
+    let base = bigint.from_i64(32768)
+    while not bigint.is_zero(left) {
+        let qr = bigint.divmod(left, base) ?? (bigint.zero(), bigint.zero())
+        digits.push(bigint.to_i64(qr.1) ?? 0)
+        left = qr.0
+    }
+    out.push(108)
+    push_int32(out, if bigint.sign(n) < 0 { 0 - digits.len() } else {
+        digits.len() })
+    for d in digits {
+        out.push(d % 256)
+        out.push(d / 256)
+    }
+}
+
+fn write_str(inout out: [i64], text: str, version: i64) {
+    let raw = text.to_bytes()
+    if version >= 4 and is_ascii(text) {
+        if raw.len() < 256 {
+            out.push(122)
+            out.push(raw.len())
+        } else {
+            out.push(97)
+            push_int32(out, raw.len())
+        }
+    } else {
+        out.push(117)
+        push_int32(out, raw.len())
+    }
+    push_raw(out, raw)
+}
+
+fn write_sequence(inout out: [i64], code: i64, items: [ref PyValue],
+    version: i64) {
+    if code == 40 and version >= 4 and items.len() < 256 {
+        out.push(41)
+        out.push(items.len())
+    } else {
+        out.push(code)
+        push_int32(out, items.len())
+    }
+    for item in items {
+        write_object(out, item, version)
+    }
+}
+
+fn write_object(inout out: [i64], value: ref PyValue, version: i64) {
+    match value {
+        PyNone -> out.push(78)
+        PyBool(b) -> out.push(if b { 84 } else { 70 })
+        PyEllipsis -> out.push(46)
+        PyInt(n) -> write_int(out, n)
+        PyFloat(x) -> {
+            if version > 1 {
+                out.push(103)
+                push_float64(out, x)
+            } else {
+                out.push(102)
+                push_text_float(out, x)
+            }
+        }
+        PyComplex(re, im) -> {
+            if version > 1 {
+                out.push(121)
+                push_float64(out, re)
+                push_float64(out, im)
+            } else {
+                out.push(120)
+                push_text_float(out, re)
+                push_text_float(out, im)
+            }
+        }
+        PyStr(s) -> write_str(out, s, version)
+        PyBytes(b) -> {
+            out.push(115)
+            push_int32(out, b.len())
+            push_raw(out, b)
+        }
+        PyTuple(items) -> write_sequence(out, 40, items, version)
+        PyList(items) -> write_sequence(out, 91, items, version)
+        PySet(items) -> write_sequence(out, 60, items, version)
+        PyFrozenSet(items) -> write_sequence(out, 62, items, version)
+        PyDict(keys, values) -> {
+            out.push(123)
+            var i = 0
+            while i < keys.len() {
+                write_object(out, keys[i], version)
+                write_object(out, values[i], version)
+                i = i + 1
+            }
+            out.push(48)
+        }
+    }
+}
+
+/// `marshal.dumps(value, version)`, for versions 0 to 5.
+pub fn dumps(value: ref PyValue, version: i64) -> bytes ! MarshalError {
+    if version < 0 or version > 5 {
+        fail(MarshalVersion(version))
+    }
+    var out: [i64] = []
+    write_object(out, value, version)
+    return bytes_of(out)
+}

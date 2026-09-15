@@ -1,0 +1,191 @@
+import getopt
+import floatmath
+import pyliteral
+import pymarshal
+import prettyrepr
+
+fn from_hex_bytes(text: str) -> bytes {
+    var out: [i64] = []
+    var i = 1
+    while i + 1 < text.len() {
+        out.push(text.substr(i, 2).parse_int_base(16) ?? 0)
+        i = i + 2
+    }
+    return bytes_of(out)
+}
+
+fn hex(raw: bytes) -> str {
+    let digits = "0123456789abcdef"
+    var out = ""
+    var i = 0
+    while i < raw.len() {
+        out = out + digits.substr(raw.at(i) / 16, 1) +
+        digits.substr(raw.at(i) % 16, 1)
+        i = i + 1
+    }
+    return out
+}
+
+fn th(text: str) -> str {
+    return hex(text.to_bytes())
+}
+
+fn split1(text: str) -> [str] {
+    if text.len() == 0 {
+        return []
+    }
+    return text.split("\u{1}")
+}
+
+fn float_of(text: str) -> f64 {
+    return (text.parse_int() ?? 0).from_bits()
+}
+
+fn bits(x: f64) -> str {
+    return "{x.to_bits()}"
+}
+
+fn parse_options(spec: [str], argv: [str],
+    longs: [str]) -> GetoptResult ! GetoptError {
+    if spec[0] == "std" {
+        return try getopt.getopt(argv, spec[1], longs)
+    }
+    return try getopt.gnu_getopt(argv, spec[1], longs, spec[3] == "1")
+}
+
+fn run_getopt(argv_text: str, spec_text: str) -> str {
+    let spec = spec_text.split("\u{2}")
+    let argv = split1(argv_text)
+    let longs = split1(spec[2])
+    match parse_options(spec, argv, longs) {
+        Ok(r) -> {
+            var parts: [str] = []
+            for item in r.options {
+                if item.is_arguments {
+                    parts.push("@" + item.arguments.join("\u{4}"))
+                } else {
+                    parts.push(item.option + "=" + item.value)
+                }
+            }
+            return th(parts.join("\u{1}") + "\u{3}" + r.arguments.join("\u{1}"))
+        }
+        Err(e) -> return th("?" + getopt.option_of(e) + "|" + getopt.message_of(e))
+    }
+}
+
+fn two(text: str) -> (f64, f64) {
+    let p = text.split(",")
+    return (float_of(p[0]), float_of(p[1]))
+}
+
+fn fallible(value: f64 ! FloatMathError) -> str {
+    return match value {
+        Ok(x) -> bits(x)
+        Err(_e) -> "?"
+    }
+}
+
+fn run_float(what: str, a: str, b: str) -> str {
+    if what == "ffsum" {
+        var values: [f64] = []
+        for p in split1(a) {
+            values.push(float_of(p))
+        }
+        return fallible(floatmath.fsum(values))
+    }
+    if what == "fnext" {
+        return bits(floatmath.nextafter(float_of(a), float_of(b)))
+    }
+    if what == "fsteps" {
+        let p = b.split(",")
+        return fallible(floatmath.nextafter_steps(float_of(a), float_of(p[0]),
+            p[1].parse_int() ?? 0))
+    }
+    if what == "fulp" {
+        return bits(floatmath.ulp(float_of(a)))
+    }
+    if what == "ffrexp" {
+        let r = floatmath.frexp(float_of(a))
+        return bits(r.0) + "," + "{r.1}"
+    }
+    if what == "fldexp" {
+        return fallible(floatmath.ldexp(float_of(a), b.parse_int() ?? 0))
+    }
+    if what == "ffmod" {
+        return fallible(floatmath.fmod(float_of(a), float_of(b)))
+    }
+    if what == "frem" {
+        return fallible(floatmath.remainder(float_of(a), float_of(b)))
+    }
+    if what == "fmodf" {
+        let r = floatmath.modf(float_of(a))
+        return bits(r.0) + "," + bits(r.1)
+    }
+    if what == "fclose" {
+        let ab = two(a)
+        let tol = two(b)
+        return match floatmath.isclose(ab.0, ab.1, tol.0, tol.1) {
+            Ok(yes) -> if yes { "yes" } else { "no" }
+            Err(_e) -> "?"
+        }
+    }
+    if what == "fhex" {
+        return th(floatmath.to_hex(float_of(a)))
+    }
+    return fallible(floatmath.from_hex(a))
+}
+
+fn options_of(text: str) -> PrettyOptions {
+    let p = text.split(",")
+    return PrettyOptions{ indent: p[0].parse_int() ?? 1,
+        width: p[1].parse_int() ?? 80, depth: p[2].parse_int() ?? 0,
+        compact: p[3] == "1", sort_dicts: p[4] == "1",
+        underscore_numbers: p[5] == "1" }
+}
+
+fn run_python(what: str, a: str, b: str, raw: bytes) -> str {
+    if what == "lit" {
+        return th(match pyliteral.literal_eval(a) {
+            Ok(v) -> pyliteral.repr(v)
+            Err(_e) -> "?"
+        })
+    }
+    if what == "mload" {
+        return th(match pymarshal.loads(raw) {
+            Ok(v) -> pyliteral.repr(v)
+            Err(_e) -> "?"
+        })
+    }
+    if what == "mdump" {
+        return match pyliteral.literal_eval(a) {
+            Ok(v) -> match pymarshal.dumps(v, b.parse_int() ?? 0) {
+                Ok(data) -> hex(data)
+                Err(_e) -> th("?")
+            }
+            Err(_e) -> th("?")
+        }
+    }
+    return th(match pyliteral.literal_eval(a) {
+        Ok(v) -> prettyrepr.pformat(v, options_of(b)) ?? "?"
+        Err(_e) -> "?"
+    })
+}
+
+// Every command is `<name> <hex argument> <hex argument>`, three words.
+fn main() / {io} {
+    var i = 0
+    while i + 2 < args().len() {
+        let what = args()[i]
+        let raw = from_hex_bytes(args()[i + 1])
+        let a = raw.to_str()
+        let b = from_hex_bytes(args()[i + 2]).to_str()
+        if what == "gopt" {
+            print(run_getopt(a, b))
+        } else if what.starts_with("f") {
+            print(run_float(what, a, b))
+        } else {
+            print(run_python(what, a, b, raw))
+        }
+        i = i + 3
+    }
+}

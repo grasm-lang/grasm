@@ -1,0 +1,471 @@
+// Python values laid out the way `pprint` lays them out.
+//
+// `pprint.pformat` output is everywhere Python data is shown to a person:
+// test failure messages, debugger panes, notebook cells, `--dump` flags,
+// fixtures checked into repositories. A tool that diffs, regenerates or
+// displays those needs to produce the same text, down to where a long
+// string is split and which column a nested dict's values start in, or
+// every regenerated file is a diff of whitespace.
+//
+// This is `PrettyPrinter` ported from the Python 3.14 source for the values
+// `pyliteral` holds, with every option: `indent`, `width`, `depth`,
+// `compact`, `sort_dicts` and `underscore_numbers`. The rules worth knowing:
+//
+// - A value is written on one line if its flat `repr` fits in what is left
+//   of the width, counting the characters that must follow it — a closing
+//   bracket, or the comma after an item that is not the last.
+// - Otherwise a dict, list, tuple or set puts one item per line; `compact`
+//   packs as many as fit on each line instead. Numbers, `None` and the like
+//   are never broken, however long.
+// - A long str is broken at whitespace into adjacent literals, and at the
+//   top level wrapped in parentheses so the result still reads back as one
+//   string; bytes are broken every four bytes.
+// - Dict keys and set members are sorted: by Python's `<`, and where that
+//   raises, by the name of the type.
+//
+// One difference is forced. A set that fits on one line is written by
+// Python in its hash-table order, which for strings changes with every
+// process; here it is in the sorted order `pprint` uses for sets it breaks
+// across lines, which is also what Python prints for most small sets of
+// integers. Two unorderable values of one type are ordered by `repr`, where
+// Python uses their memory addresses.
+//
+// Checked against `pprint.pformat` over every combination of the options.
+
+import pyliteral
+
+type PrettyOptions = {
+    indent: i64,
+    width: i64,
+    /// Levels below which containers are written `...`; 0 for no limit.
+    depth: i64,
+    compact: bool,
+    sort_dicts: bool,
+    underscore_numbers: bool,
+}
+
+type PrettyError =
+    | PrettyBadOption(why: str)
+
+    /// `PrettyPrinter()`'s defaults: indent 1, width 80, no depth limit, not
+    /// compact, dicts sorted, no underscores.
+pub fn defaults() -> PrettyOptions {
+    return PrettyOptions{ indent: 1, width: 80, depth: 0, compact: false,
+        sort_dicts: true, underscore_numbers: false }
+}
+
+fn spaces(n: i64) -> str {
+    return if n > 0 { " ".repeat(n) } else { "" }
+}
+
+fn with_underscores(digits: str) -> str {
+    let negative = digits.starts_with("-")
+    let body = if negative { digits.substr(1, digits.len()) } else { digits }
+    var out = ""
+    var i = 0
+    while i < body.len() {
+        if i > 0 and (body.len() - i) % 3 == 0 {
+            out = out + "_"
+        }
+        out = out + body.substr(i, 1)
+        i = i + 1
+    }
+    return (if negative { "-" } else { "" }) + out
+}
+
+fn sorted_items(keys: [ref PyValue], values: [ref PyValue],
+    sort: bool) -> [(ref PyValue, ref PyValue)] {
+    var order: [ref PyValue] = keys
+    if sort {
+        order = pyliteral.sort_values(keys)
+    }
+    var out: [(ref PyValue, ref PyValue)] = []
+    for k in order {
+        var i = 0
+        while i < keys.len() {
+            if keys[i] == k {
+                out.push((k, values[i]))
+            }
+            i = i + 1
+        }
+    }
+    return out
+}
+
+/// The one-line form, `PrettyPrinter._safe_repr`.
+pub fn safe_repr(o: PrettyOptions, value: ref PyValue, level: i64) -> str {
+    let limited = o.depth > 0 and level >= o.depth
+    match value {
+        PyInt(_n) -> {
+            let text = pyliteral.repr(value)
+            return if o.underscore_numbers { with_underscores(text) } else {
+                text }
+        }
+        PyDict(keys, values) -> {
+            if keys.len() == 0 {
+                return "\{\}"
+            }
+            if limited {
+                return "\{...\}"
+            }
+            var parts: [str] = []
+            for item in sorted_items(keys, values, o.sort_dicts) {
+                parts.push(safe_repr(o, item.0, level + 1) + ": " +
+                    safe_repr(o, item.1, level + 1))
+            }
+            return "\{" + parts.join(", ") + "\}"
+        }
+        PyList(items) -> {
+            if items.len() == 0 {
+                return "[]"
+            }
+            return "[" + (if limited { "..." } else {
+                joined(o, items, level) }) + "]"
+        }
+        PyTuple(items) -> {
+            if items.len() == 0 {
+                return "()"
+            }
+            let body = if limited { "..." } else { joined(o, items, level) }
+            return "(" + body + (if items.len() == 1 { ",)" } else { ")" })
+        }
+        _ -> return pyliteral.repr(value)
+    }
+}
+
+fn joined(o: PrettyOptions, items: [ref PyValue], level: i64) -> str {
+    var parts: [str] = []
+    for item in items {
+        parts.push(safe_repr(o, item, level + 1))
+    }
+    return parts.join(", ")
+}
+
+/// `pprint.pformat(value, ...)` with these options.
+pub fn pformat(value: ref PyValue, o: PrettyOptions) -> str ! PrettyError {
+    if o.indent < 0 {
+        fail(PrettyBadOption("indent must be >= 0"))
+    }
+    if o.depth < 0 {
+        fail(PrettyBadOption("depth must be > 0"))
+    }
+    if o.width == 0 {
+        fail(PrettyBadOption("width must be != 0"))
+    }
+    var out: [str] = []
+    format_value(o, out, value, 0, 0, 0)
+    return out.join("")
+}
+
+/// `pprint.pformat` with the defaults.
+pub fn pformat_default(value: ref PyValue) -> str {
+    return pformat(value, defaults()) ?? ""
+}
+
+fn format_value(o: PrettyOptions, inout out: [str], value: ref PyValue,
+    indent: i64, allowance: i64, level: i64) {
+    let rep = safe_repr(o, value, level)
+    let max_width = o.width - indent - allowance
+    if rep.len() > max_width {
+        match value {
+            PyDict(keys, values) -> {
+                pprint_dict(o, out, keys, values, indent, allowance, level + 1)
+                return
+            }
+            PyList(items) -> {
+                out.push("[")
+                format_items(o, out, items, indent, allowance + 1, level + 1)
+                out.push("]")
+                return
+            }
+            PyTuple(items) -> {
+                out.push("(")
+                let end = if items.len() == 1 { ",)" } else { ")" }
+                format_items(o, out, items, indent, allowance + end.len(),
+                    level + 1)
+                out.push(end)
+                return
+            }
+            PySet(items) -> {
+                pprint_set(o, out, items, "", indent, allowance, level + 1)
+                return
+            }
+            PyFrozenSet(items) -> {
+                pprint_set(o, out, items, "frozenset", indent, allowance,
+                    level + 1)
+                return
+            }
+            PyStr(s) -> {
+                pprint_str(o, out, s, indent, allowance, level + 1)
+                return
+            }
+            PyBytes(b) -> {
+                pprint_bytes(o, out, b, indent, allowance, level + 1)
+                return
+            }
+            _ -> {}
+        }
+    }
+    out.push(rep)
+}
+
+fn pprint_dict(o: PrettyOptions, inout out: [str], keys: [ref PyValue],
+    values: [ref PyValue], indent: i64, allowance: i64, level: i64) {
+    out.push("\{")
+    if o.indent > 1 {
+        out.push(spaces(o.indent - 1))
+    }
+    if keys.len() > 0 {
+        let items = sorted_items(keys, values, o.sort_dicts)
+        let inner = indent + o.indent
+        let delimiter = ",\n" + spaces(inner)
+        var i = 0
+        while i < items.len() {
+            let last = i == items.len() - 1
+            let rep = safe_repr(o, items[i].0, level)
+            out.push(rep)
+            out.push(": ")
+            format_value(o, out, items[i].1, inner + rep.len() + 2,
+                if last { allowance + 1 } else { 1 }, level)
+            if not last {
+                out.push(delimiter)
+            }
+            i = i + 1
+        }
+    }
+    out.push("\}")
+}
+
+fn pprint_set(o: PrettyOptions, inout out: [str], items: [ref PyValue],
+    name: str, indent_given: i64, allowance: i64, level: i64) {
+    if items.len() == 0 {
+        out.push(if name == "" { "set()" } else { "frozenset()" })
+        return
+    }
+    var indent = indent_given
+    var end = "\}"
+    if name == "" {
+        out.push("\{")
+    } else {
+        out.push(name + "(\{")
+        end = "\})"
+        indent = indent + name.len() + 1
+    }
+    format_items(o, out, pyliteral.sort_values(items), indent,
+        allowance + end.len(), level)
+    out.push(end)
+}
+
+fn format_items(o: PrettyOptions, inout out: [str], items: [ref PyValue],
+    indent_given: i64, allowance: i64, level: i64) {
+    let indent = indent_given + o.indent
+    if o.indent > 1 {
+        out.push(spaces(o.indent - 1))
+    }
+    let delimiter_nl = ",\n" + spaces(indent)
+    var delimiter = ""
+    var width = o.width - indent + 1
+    var max_width = width
+    var i = 0
+    while i < items.len() {
+        let last = i == items.len() - 1
+        if last {
+            max_width = max_width - allowance
+            width = width - allowance
+        }
+        if o.compact {
+            let rep = safe_repr(o, items[i], level)
+            let w = rep.len() + 2
+            if width < w {
+                width = max_width
+                if delimiter != "" {
+                    delimiter = delimiter_nl
+                }
+            }
+            if width >= w {
+                width = width - w
+                out.push(delimiter)
+                delimiter = ", "
+                out.push(rep)
+                i = i + 1
+                continue
+            }
+        }
+        out.push(delimiter)
+        delimiter = delimiter_nl
+        format_value(o, out, items[i], indent, if last { allowance } else { 1 },
+            level)
+        i = i + 1
+    }
+}
+
+fn is_line_break(c: i64) -> bool {
+    return c == 10 or c == 13 or c == 11 or c == 12 or c == 28 or c == 29 or
+    c == 30 or c == 133 or c == 8232 or c == 8233
+}
+
+/// `text.splitlines(keepends=True)`.
+fn lines_keeping_ends(text: str) -> [str] {
+    let codes = text.codes()
+    var out: [str] = []
+    var start = 0
+    var i = 0
+    while i < codes.len() {
+        if is_line_break(codes[i]) {
+            var end = i + 1
+            if codes[i] == 13 and i + 1 < codes.len() and codes[i + 1] == 10 {
+                end = i + 2
+            }
+            out.push(text.substr(start, end - start))
+            start = end
+            i = end
+        } else {
+            i = i + 1
+        }
+    }
+    if start < codes.len() {
+        out.push(text.substr(start, codes.len() - start))
+    }
+    return out
+}
+
+fn is_space(c: i64) -> bool {
+    if c == 32 or (c >= 9 and c <= 13) or (c >= 28 and c <= 31) {
+        return true
+    }
+    return c == 133 or c == 160 or c == 5760 or (c >= 8192 and c <= 8202) or
+    c == 8232 or c == 8233 or c == 8239 or c == 8287 or c == 12288
+}
+
+/// `re.findall(r'\S*\s*', line)` without the empty match at the end: runs
+/// of non-space followed by runs of space.
+fn word_parts(line: str) -> [str] {
+    let codes = line.codes()
+    var out: [str] = []
+    var i = 0
+    while i < codes.len() {
+        let start = i
+        while i < codes.len() and not is_space(codes[i]) {
+            i = i + 1
+        }
+        while i < codes.len() and is_space(codes[i]) {
+            i = i + 1
+        }
+        out.push(line.substr(start, i - start))
+    }
+    return out
+}
+
+fn pprint_str(o: PrettyOptions, inout out: [str], text: str, indent_given: i64,
+    allowance_given: i64, level: i64) {
+    if text.len() == 0 {
+        out.push(pyliteral.repr_str(text))
+        return
+    }
+    var indent = indent_given
+    var allowance = allowance_given
+    if level == 1 {
+        indent = indent + 1
+        allowance = allowance + 1
+    }
+    let lines = lines_keeping_ends(text)
+    var chunks: [str] = []
+    var max_width1 = o.width - indent
+    let max_width = o.width - indent
+    var rep = ""
+    var i = 0
+    while i < lines.len() {
+        rep = pyliteral.repr_str(lines[i])
+        if i == lines.len() - 1 {
+            max_width1 = max_width1 - allowance
+        }
+        if rep.len() <= max_width1 {
+            chunks.push(rep)
+        } else {
+            let parts = word_parts(lines[i])
+            var max_width2 = max_width
+            var current = ""
+            var j = 0
+            while j < parts.len() {
+                let candidate = current + parts[j]
+                if j == parts.len() - 1 and i == lines.len() - 1 {
+                    max_width2 = max_width2 - allowance
+                }
+                if pyliteral.repr_str(candidate).len() > max_width2 {
+                    if current.len() > 0 {
+                        chunks.push(pyliteral.repr_str(current))
+                    }
+                    current = parts[j]
+                } else {
+                    current = candidate
+                }
+                j = j + 1
+            }
+            if current.len() > 0 {
+                chunks.push(pyliteral.repr_str(current))
+            }
+        }
+        i = i + 1
+    }
+    if chunks.len() == 1 {
+        out.push(rep)
+        return
+    }
+    if level == 1 {
+        out.push("(")
+    }
+    var k = 0
+    while k < chunks.len() {
+        if k > 0 {
+            out.push("\n" + spaces(indent))
+        }
+        out.push(chunks[k])
+        k = k + 1
+    }
+    if level == 1 {
+        out.push(")")
+    }
+}
+
+fn pprint_bytes(o: PrettyOptions, inout out: [str], data: bytes,
+    indent_given: i64, allowance_given: i64, level: i64) {
+    if data.len() <= 4 {
+        out.push(pyliteral.repr_bytes(data))
+        return
+    }
+    var indent = indent_given
+    var allowance = allowance_given
+    let parens = level == 1
+    if parens {
+        indent = indent + 1
+        allowance = allowance + 1
+        out.push("(")
+    }
+    var width = o.width - indent
+    let last = data.len() / 4 * 4
+    // The current run is always `data[start..i]`, so a candidate is a
+    // longer slice rather than a concatenation.
+    var start = 0
+    var reps: [str] = []
+    var i = 0
+    while i < data.len() {
+        let end = if i + 4 < data.len() { i + 4 } else { data.len() }
+        if i == last {
+            width = width - allowance
+        }
+        if pyliteral.repr_bytes(data.slice(start, end)).len() > width {
+            if i > start {
+                reps.push(pyliteral.repr_bytes(data.slice(start, i)))
+            }
+            start = i
+        }
+        i = i + 4
+    }
+    if data.len() > start {
+        reps.push(pyliteral.repr_bytes(data.slice(start, data.len())))
+    }
+    out.push(reps.join("\n" + spaces(indent)))
+    if parens {
+        out.push(")")
+    }
+}

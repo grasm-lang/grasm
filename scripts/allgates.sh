@@ -107,6 +107,7 @@ run_gate repodiff       scripts/repo_diff.sh
 run_gate dbcsdiff       scripts/dbcs_diff.sh
 run_gate text2diff      scripts/text2_diff.sh
 run_gate net3diff       scripts/net3_diff.sh
+run_gate pydatadiff     scripts/pydata_diff.sh
 run_gate kvcrash       scripts/kvstore_crash.sh
 run_gate zlibdiff      scripts/zlib_diff.sh
 run_gate casefolddiff  scripts/casefold_diff.sh

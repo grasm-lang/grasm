@@ -262,13 +262,11 @@ fn deepest_ref(root: &Value, segs: &[Seg]) -> Option<(usize, u32, u32)> {
         return None;
     }
     let mut cur = root;
-    let mut found: Option<(usize, u32, u32)> = None;
     for (i, seg) in segs.iter().enumerate() {
         if let Value::Ref(slot, gen) = cur {
-            found = Some((i, *slot, *gen));
             // Anything past a reference is inside the slab, and the caller
             // takes it from there.
-            return found;
+            return Some((i, *slot, *gen));
         }
         cur = match (cur, seg) {
             (Value::Struct { fields, .. }, Seg::Field(f)) => {
@@ -279,10 +277,12 @@ fn deepest_ref(root: &Value, segs: &[Seg]) -> Option<(usize, u32, u32)> {
             _ => return None,
         };
     }
-    if let Value::Ref(slot, gen) = cur {
-        found = Some((segs.len(), *slot, *gen));
-    }
-    found
+    // A path that *ends* at a reference names the place holding it, not
+    // what it points at: `n.next = other` replaces the field. Following it
+    // wrote `other` over the old referent instead, so the field kept its old
+    // reference, and everything else sharing that referent saw it change —
+    // while the compiled program replaced the field.
+    None
 }
 
 fn assign_into(root: &mut Value, segs: &[Seg], v: Value) -> Result<(), Flow> {

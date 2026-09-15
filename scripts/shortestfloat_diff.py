@@ -33,6 +33,13 @@ for exponent in range(-320, 309):
         values.append(float("1e%d" % exponent))
     except Exception:
         pass
+# Every power of two. The doubles below one are half as far away as the
+# doubles above it, so its round-trip interval is lopsided and the nearest
+# decimal of a given length can miss it while the other neighbour does not:
+# random doubles almost never have an all-zero mantissa, and 2^-381 printed
+# with seventeen digits where sixteen read back.
+for exponent in range(-1074, 1024):
+    values.append(2.0 ** exponent)
 for _ in range(18000):
     values.append(struct.unpack("<d", struct.pack("<Q",
                                                   random.getrandbits(64)))[0])

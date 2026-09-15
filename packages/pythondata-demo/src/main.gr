@@ -1,0 +1,177 @@
+// The formats Python writes its own data in, read and written without it.
+import getopt
+import floatmath
+import pyliteral
+import pymarshal
+import prettyrepr
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn describe(r: GetoptResult) -> str {
+    var parts: [str] = []
+    for item in r.options {
+        parts.push(item.option + "=" + item.value)
+    }
+    return parts.join(" ") + " | " + r.arguments.join(" ")
+}
+
+fn check_getopt(inout f: i64) / {io} {
+    say(f, "an attached value ends the word",
+        match getopt.getopt(["-abfile", "x"], "ab:", []) {
+            Ok(r) -> describe(r) == "-a= -b=file | x"
+            Err(_e) -> false
+    })
+    say(f, "an optional value is only taken when attached",
+        match getopt.getopt(["-cfile", "-c", "file"], "c::", []) {
+            Ok(r) -> describe(r) == "-c=file -c= | file"
+            Err(_e) -> false
+    })
+    say(f, "a unique prefix names a long option",
+        match getopt.getopt(["--verb"], "", ["verbose", "output="]) {
+            Ok(r) -> describe(r) == "--verbose= | "
+            Err(_e) -> false
+    })
+    say(f, "an ambiguous prefix is refused with Python's message",
+        match getopt.getopt(["--ver"], "", ["verbose", "version"]) {
+            Ok(_r) -> false
+            Err(e) -> getopt.message_of(e) ==
+            "option --ver not a unique prefix; possible options: verbose, version"
+    })
+    say(f, "GNU mode collects arguments until --",
+        match getopt.gnu_getopt(["x", "-a", "--", "-b"], "ab", [], false) {
+            Ok(r) -> describe(r) == "-a= | x -b"
+            Err(_e) -> false
+    })
+}
+
+fn check_floatmath(inout f: i64) / {io} {
+    var total = 0.0
+    var tenths: [f64] = []
+    var i = 0
+    while i < 10 {
+        total = total + 0.1
+        tenths.push(0.1)
+        i = i + 1
+    }
+    say(f, "adding 0.1 ten times drifts", total != 1.0)
+    say(f, "and fsum of the same ten is exactly 1",
+        (floatmath.fsum(tenths) ?? 0.0) == 1.0)
+    say(f, "fsum rounds half-even across partials",
+        (floatmath.fsum([1e-16, 1.0, 1e16]) ?? 0.0) == 10000000000000002.0)
+    say(f, "the next float after 1 is one ulp away",
+        floatmath.nextafter(1.0, 2.0) - 1.0 == floatmath.ulp(1.0))
+    say(f, "fmod keeps the dividend's sign",
+        (floatmath.fmod(-7.0, 3.0) ?? 0.0) == -1.0)
+    say(f, "remainder rounds the quotient to even",
+        (floatmath.remainder(5.0, 2.0) ?? 0.0) == 1.0 and
+        (floatmath.remainder(7.0, 2.0) ?? 0.0) == -1.0)
+    say(f, "0.1 as hex is what float.hex writes",
+        floatmath.to_hex(0.1) == "0x1.999999999999ap-4")
+    say(f, "and reads back to the same double",
+        (floatmath.from_hex("0x1.999999999999ap-4") ?? 0.0) == 0.1)
+    say(f, "a tie in extra hex digits rounds to even",
+        (floatmath.from_hex("0x1.00000000000008p0") ?? 0.0) == 1.0 and
+        floatmath.to_hex(floatmath.from_hex("0x1.00000000000018p0") ?? 0.0) ==
+        "0x1.0000000000002p+0")
+}
+
+fn shown(text: str) -> str {
+    return match pyliteral.literal_eval(text) {
+        Ok(v) -> pyliteral.repr(v)
+        Err(_e) -> "?"
+    }
+}
+
+fn check_pyliteral(inout f: i64) / {io} {
+    say(f, "1, 1.0 and True are one dict key",
+        shown("\{1: 'a', 1.0: 'b', True: 'c'\}") == "\{1: 'c'\}")
+    say(f, "a complex number keeps its negative zero",
+        shown("-1-0j") == "(-1-0j)")
+    say(f, "repr picks the quote that needs no escape",
+        shown("'it\\'s'") == "\"it's\"")
+    say(f, "every integer notation is read", shown("0x_ff") == "255")
+    say(f, "an expression is refused", shown("10**2") == "?")
+    say(f, "so is a name, which literal_eval would never run",
+        shown("__import__('os')") == "?")
+    say(f, "an unhashable set member is refused", shown("\{[1]\}") == "?")
+}
+
+fn check_pymarshal(inout f: i64) / {io} {
+    let written = match pyliteral.literal_eval("[1, 'a']") {
+        Ok(v) -> pymarshal.dumps(v, 2) ?? bytes_of([])
+        Err(_e) -> bytes_of([])
+    }
+    say(f, "version 2 writes a list as Python does",
+        written == bytes_of([91, 2, 0, 0, 0, 105, 1, 0, 0, 0, 117, 1, 0, 0, 0,
+            97]))
+    say(f, "version 0 writes a float as %.17g text",
+        pymarshal.g17(0.1) == "0.10000000000000001")
+    // Version 4 as Python wrote it, reference flags and short ASCII.
+    let flagged = bytes_of([219, 2, 0, 0, 0, 233, 1, 0, 0, 0, 218, 1, 97])
+    say(f, "reference flags and short strings are read",
+        match pymarshal.loads(flagged) {
+            Ok(v) -> pyliteral.repr(v) == "[1, 'a']"
+            Err(_e) -> false
+    })
+    say(f, "a reference to nothing yet read is refused",
+        match pymarshal.loads(bytes_of([114, 0, 0, 0, 0])) {
+            Ok(_v) -> false
+            Err(_e) -> true
+    })
+    say(f, "code objects are not data",
+        match pymarshal.loads(bytes_of([99])) {
+            Ok(_v) -> false
+            Err(_e) -> true
+    })
+}
+
+fn pretty(text: str, width: i64, compact: bool) -> str {
+    var o = prettyrepr.defaults()
+    o.width = width
+    o.compact = compact
+    return match pyliteral.literal_eval(text) {
+        Ok(v) -> prettyrepr.pformat(v, o) ?? "?"
+        Err(_e) -> "?"
+    }
+}
+
+fn check_prettyrepr(inout f: i64) / {io} {
+    say(f, "dict keys are sorted",
+        pretty("\{'b': [1, 2], 'a': 'x'\}", 80, false) ==
+        "\{'a': 'x', 'b': [1, 2]\}")
+    say(f, "a long string breaks at spaces",
+        pretty("['a b c d e f']", 12, false) == "['a b c d '\n 'e f']")
+    let compact = pretty("[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]", 20, true)
+    say(f, "compact packs items onto lines",
+        compact == "[0, 1, 2, 3, 4, 5,\n 6, 7, 8, 9]")
+    var o = prettyrepr.defaults()
+    o.underscore_numbers = true
+    say(f, "numbers can be grouped",
+        match pyliteral.literal_eval("10000000000") {
+            Ok(v) -> (prettyrepr.pformat(v, o) ?? "") == "10_000_000_000"
+            Err(_e) -> false
+    })
+}
+
+fn main() / {io} {
+    var f = 0
+
+    check_getopt(f)
+    check_floatmath(f)
+    check_pyliteral(f)
+    check_pymarshal(f)
+    check_prettyrepr(f)
+
+    if f == 0 {
+        print("pythondata: every claim held")
+    } else {
+        print("pythondata: {f} failed")
+    }
+}

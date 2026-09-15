@@ -1,0 +1,6 @@
+[package]
+name = "getopt"
+version = "1.0.0"
+
+# Reads the argument list it is given. Opens nothing.
+capabilities = []

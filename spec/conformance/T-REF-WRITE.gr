@@ -7,6 +7,8 @@
 //! 42 [1, 99, 7]
 //! 5
 //! 6 6
+//! 7 2 7
+//! 8 2
 // A reference is written through the same way it is read through.
 //
 // The binding's own mutability is not the question — writing through a
@@ -73,4 +75,17 @@ fn main() {
     let alias = o.r
     alias.v = 6
     print("{i.v} {o.r.v}")
+    // A path that ends at a reference replaces the reference held there; it
+    // does not write over what the old one pointed at. The interpreter
+    // followed it and overwrote the old referent, so the field kept pointing
+    // at the old node and every other holder of that node saw it replaced.
+    let first = ref(Inner{ v: 2, xs: [] })
+    let second = ref(Inner{ v: 3, xs: [] })
+    let holder = ref(Outer{ r: first, tag: "h" })
+    holder.r = second
+    holder.r.v = 7
+    print("{holder.r.v} {first.v} {second.v}")
+    var plain = Outer{ r: first, tag: "p" }
+    plain.r = ref(Inner{ v: 8, xs: [] })
+    print("{plain.r.v} {first.v}")
 }

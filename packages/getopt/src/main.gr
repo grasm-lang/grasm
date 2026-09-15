@@ -1,0 +1,266 @@
+// Command-line options the way `getopt` reads them.
+//
+// `packages/cli` is for a program designing its own interface. This is for a
+// program that has to accept an interface someone else already wrote down
+// as a `getopt` string — `"ab:c::"` and `["verbose", "output=", "color=?"]`
+// — because it is replacing a shell script, a C tool or a Python script, and
+// every existing invocation has to keep meaning what it meant. The rules are
+// old, specific and full of cases where two readers disagree:
+//
+// - `-abfile` is `-a`, then `-b` with the value `file`, because `b` takes a
+//   value and the rest of the word is it. `-b file` is the same.
+// - `c::` takes a value only when it is attached: `-cfile` has one, and
+//   `-c file` does not — `file` is then an ordinary argument.
+// - A long option can be abbreviated to any unique prefix: `--verb` is
+//   `--verbose`. An exact name wins over longer names it is a prefix of.
+// - `--` ends the options, and `-` on its own is an argument, not an option.
+// - `getopt` stops at the first argument that is not an option. `gnu` mode
+//   keeps going and collects the arguments, which is what GNU tools do,
+//   unless the short options start with `+` or `POSIXLY_CORRECT` is set.
+//   Short options starting with `-` return the arguments in order, each run
+//   of them as an entry of its own between the options.
+//
+// Checked against Python's `getopt.getopt` and `getopt.gnu_getopt`,
+// including the optional values Python 3.14 added.
+
+type GetoptError =
+    | GetoptUnknown(option: str, long: bool)
+    | GetoptNeedsValue(option: str, long: bool)
+    | GetoptTakesNoValue(option: str)
+    | GetoptAmbiguous(option: str, candidates: [str])
+
+    /// One option and its value, or — in return-in-order mode — a run of
+    /// arguments, with `is_arguments` set and the run in `arguments`.
+type GetoptItem = {
+    option: str,
+    value: str,
+    is_arguments: bool,
+    arguments: [str],
+}
+
+type GetoptResult = {
+    options: [GetoptItem],
+    arguments: [str],
+}
+
+fn option_item(option: str, value: str) -> GetoptItem {
+    return GetoptItem{ option: option, value: value, is_arguments: false,
+        arguments: [] }
+}
+
+/// How a long option takes a value: 0 not at all, 1 required, 2 optional;
+/// and its full name.
+fn long_kind(name: str, longs: [str]) -> (i64, str) ! GetoptError {
+    var candidates: [str] = []
+    for o in longs {
+        if o.starts_with(name) {
+            candidates.push(o)
+        }
+    }
+    if candidates.len() == 0 {
+        fail(GetoptUnknown(name, true))
+    }
+    if candidates.contains(name) {
+        return (0, name)
+    }
+    if candidates.contains(name + "=") {
+        return (1, name)
+    }
+    if candidates.contains(name + "=?") {
+        return (2, name)
+    }
+    if candidates.len() > 1 {
+        fail(GetoptAmbiguous(name, candidates))
+    }
+    let only = candidates[0]
+    if only.ends_with("=?") {
+        return (2, only.substr(0, only.len() - 2))
+    }
+    if only.ends_with("=") {
+        return (1, only.substr(0, only.len() - 1))
+    }
+    return (0, only)
+}
+
+/// Reads one `--name[=value]` word, taking the next argument as the value
+/// when one is required and not attached. Returns how many of `rest` it used.
+fn read_long(out: [GetoptItem], word: str, longs: [str],
+    rest: [str]) -> ([GetoptItem], i64) ! GetoptError {
+    var options = out
+    var name = word
+    var value = ""
+    var attached = false
+    match word.index_of("=") {
+        Some(eq) -> {
+            name = word.substr(0, eq)
+            value = word.substr(eq + 1, word.len())
+            attached = true
+        }
+        None -> {}
+    }
+    let kind = try long_kind(name, longs)
+    var used = 0
+    if kind.0 == 1 and not attached {
+        if rest.len() == 0 {
+            fail(GetoptNeedsValue(kind.1, true))
+        }
+        value = rest[0]
+        used = 1
+    }
+    if kind.0 == 0 and attached {
+        fail(GetoptTakesNoValue(kind.1))
+    }
+    options.push(option_item("--" + kind.1, value))
+    return (options, used)
+}
+
+/// How a short option takes a value: 0 not at all, 1 required, 2 optional.
+fn short_kind(c: str, shorts: str) -> i64 ! GetoptError {
+    let letters = shorts.chars()
+    var i = 0
+    while i < letters.len() {
+        if letters[i] == c and c != ":" {
+            if i + 1 >= letters.len() or letters[i + 1] != ":" {
+                return 0
+            }
+            if i + 2 < letters.len() and letters[i + 2] == ":" {
+                return 2
+            }
+            return 1
+        }
+        i = i + 1
+    }
+    fail(GetoptUnknown(c, false))
+}
+
+/// Reads one `-abc` word. Returns how many of `rest` it used.
+fn read_shorts(out: [GetoptItem], word: str, shorts: str,
+    rest: [str]) -> ([GetoptItem], i64) ! GetoptError {
+    var options = out
+    let letters = word.chars()
+    var used = 0
+    var i = 0
+    while i < letters.len() {
+        let c = letters[i]
+        let kind = try short_kind(c, shorts)
+        i = i + 1
+        if kind == 0 {
+            options.push(option_item("-" + c, ""))
+            continue
+        }
+        var value = word.substr(i, word.len())
+        if i >= letters.len() and kind == 1 {
+            if rest.len() == 0 {
+                fail(GetoptNeedsValue(c, false))
+            }
+            value = rest[0]
+            used = 1
+        }
+        options.push(option_item("-" + c, value))
+        break
+    }
+    return (options, used)
+}
+
+/// `getopt.getopt`: options until the first argument that is not one.
+pub fn getopt(argv: [str], shorts: str, longs: [str]) -> GetoptResult ! GetoptError {
+    var options: [GetoptItem] = []
+    var at = 0
+    while at < argv.len() and argv[at].starts_with("-") and argv[at] != "-" {
+        let word = argv[at]
+        at = at + 1
+        if word == "--" {
+            break
+        }
+        let rest = argv.slice(at, argv.len())
+        let step = if word.starts_with("--") {
+            try read_long(options, word.substr(2, word.len()), longs, rest)
+        } else {
+            try read_shorts(options, word.substr(1, word.len()), shorts, rest)
+        }
+        options = step.0
+        at = at + step.1
+    }
+    return GetoptResult{ options: options,
+        arguments: argv.slice(at, argv.len()) }
+}
+
+/// `getopt.gnu_getopt`: options and arguments intermixed. `posixly_correct`
+/// stands for the environment variable, which stops at the first argument
+/// as `getopt` does; so does a `+` at the start of `shorts`, and a `-` there
+/// returns the arguments in order among the options.
+pub fn gnu_getopt(argv: [str], shorts_given: str, longs: [str],
+    posixly_correct: bool) -> GetoptResult ! GetoptError {
+    var shorts = shorts_given
+    var in_order = false
+    var options_first = posixly_correct
+    if shorts.starts_with("-") {
+        shorts = shorts.substr(1, shorts.len())
+        in_order = true
+        options_first = false
+    } else if shorts.starts_with("+") {
+        shorts = shorts.substr(1, shorts.len())
+        options_first = true
+    }
+    var options: [GetoptItem] = []
+    var arguments: [str] = []
+    var at = 0
+    while at < argv.len() {
+        let word = argv[at]
+        if word == "--" {
+            arguments = arguments + argv.slice(at + 1, argv.len())
+            break
+        }
+        let is_long = word.substr(0, 2) == "--"
+        let is_short = not is_long and word.substr(0, 1) == "-" and word != "-"
+        if not is_long and not is_short {
+            if options_first {
+                arguments = arguments + argv.slice(at, argv.len())
+                break
+            }
+            arguments.push(word)
+            at = at + 1
+            continue
+        }
+        if in_order and arguments.len() > 0 {
+            options.push(GetoptItem{ option: "", value: "", is_arguments: true,
+                arguments: arguments })
+            arguments = []
+        }
+        at = at + 1
+        let rest = argv.slice(at, argv.len())
+        let step = if is_long {
+            try read_long(options, word.substr(2, word.len()), longs, rest)
+        } else {
+            try read_shorts(options, word.substr(1, word.len()), shorts, rest)
+        }
+        options = step.0
+        at = at + step.1
+    }
+    return GetoptResult{ options: options, arguments: arguments }
+}
+
+/// The option a failure is about, without its dashes, as `GetoptError.opt`.
+pub fn option_of(e: GetoptError) -> str {
+    return match e {
+        GetoptUnknown(o, _l) -> o
+        GetoptNeedsValue(o, _l) -> o
+        GetoptTakesNoValue(o) -> o
+        GetoptAmbiguous(o, _c) -> o
+    }
+}
+
+/// The message Python's `GetoptError` carries.
+pub fn message_of(e: GetoptError) -> str {
+    return match e {
+        GetoptUnknown(o, long) -> if long { "option --{o} not recognized" }
+        else { "option -{o} not recognized" }
+        GetoptNeedsValue(o, long) -> if long {
+            "option --{o} requires argument" } else {
+            "option -{o} requires argument" }
+        GetoptTakesNoValue(o) -> "option --{o} must not have an argument"
+        GetoptAmbiguous(o, c) ->
+        "option --{o} not a unique prefix; possible options: " +
+        c.join(", ")
+    }
+}

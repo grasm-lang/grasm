@@ -1,0 +1,6 @@
+[package]
+name = "floatmath"
+version = "1.0.0"
+
+# Arithmetic on floats. Opens nothing.
+capabilities = []

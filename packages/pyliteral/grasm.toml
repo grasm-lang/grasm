@@ -1,0 +1,14 @@
+[package]
+name = "pyliteral"
+version = "1.0.0"
+
+# Text to values and back. Opens nothing.
+capabilities = []
+
+[dependencies.bigint]
+path = "../bigint"
+version = "^1.0.0"
+
+[dependencies.shortestfloat]
+path = "../shortestfloat"
+version = "^1.0.0"

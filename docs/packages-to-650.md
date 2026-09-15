@@ -31,9 +31,9 @@ One more is added, because this stretch leans on it:
 | | |
 |---|---|
 | At the close of the 600 plan | 600 |
-| Now | 617 |
+| Now | 623 |
 | Target | 650 |
-| Remaining | 33 |
+| Remaining | 27 |
 
 The count is directories under `packages/` that are not `*-demo`. Test
 harnesses are counted.
@@ -55,14 +55,18 @@ harnesses are counted.
   `maildir` `ftpwire`, and the harness `nettest3`. 146,551 cases against
   `socket`, `email.utils`, `mailbox` and `ftplib`, service lookups against
   this machine's own `/etc/services`.
+- [x] **Python's data formats** — `pyliteral` `pymarshal` `prettyrepr`
+  `floatmath` `getopt`, and the harness `pydatatest`. 91,589 cases against
+  `ast.literal_eval`, `marshal`, `pprint`, `math` and `getopt`. `shelvefile`
+  was dropped from the plan — `shelve` sits on whichever `dbm` the machine
+  has — and `prettyrepr` took its place. Two defects found on the way, both
+  outside this batch: the interpreter's write through a reference-valued
+  field, and `shortestfloat` at powers of two.
 
 ### Next
 
 Each line has an implementation to be checked against on this machine.
 
-- **Python's data formats** — `pyliteral` (`ast.literal_eval`), `pymarshal`
-  (`marshal`), `shelvefile` (`shelve`), `getopt` (`getopt.gnu_getopt`),
-  `floatmath` (`math.fsum`, `nextafter`, `ulp`)
 - **More of git** — `gitrefname` (`git check-ref-format`), `gitbundle` (`git
   bundle list-heads`), `gitcolor` (`git config --get-color`), `gitrawdiff`
   (`git diff --raw`), `shortlog` (`git shortlog`)

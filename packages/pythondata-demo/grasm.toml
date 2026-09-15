@@ -1,0 +1,24 @@
+[package]
+name = "pythondata_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.getopt]
+path = "../getopt"
+version = "^1.0.0"
+
+[dependencies.floatmath]
+path = "../floatmath"
+version = "^1.0.0"
+
+[dependencies.pyliteral]
+path = "../pyliteral"
+version = "^1.0.0"
+
+[dependencies.pymarshal]
+path = "../pymarshal"
+version = "^1.0.0"
+
+[dependencies.prettyrepr]
+path = "../prettyrepr"
+version = "^1.0.0"

@@ -138,7 +138,11 @@ fn decimal_point(mantissa: BigInt, exponent: i64) -> i64 {
 fn digits_at(mantissa: BigInt, exponent: i64, point: i64,
     k: i64) -> (str, i64) {
     let pair = scaled(mantissa, exponent, k - point)
-    var value = rounded_quotient(pair.0, pair.1)
+    return laid_out(rounded_quotient(pair.0, pair.1), point, k)
+}
+
+/// `value` as exactly `k` digits and the point that goes with them.
+fn laid_out(value: BigInt, point: i64, k: i64) -> (str, i64) {
     var text = bigint.to_str(value)
     if text.len() > k {
         // Rounding carried into a new digit: 999 became 1000.
@@ -148,6 +152,35 @@ fn digits_at(mantissa: BigInt, exponent: i64, point: i64,
         text = "0" + text
     }
     return (text, point)
+}
+
+/// The `k`-digit decimals on either side of the value, nearest first: the
+/// correctly rounded one, then the other one, if the value is not already a
+/// `k`-digit decimal.
+///
+/// Both are needed. At a power of two the doubles below are half as far
+/// away as the doubles above, so the interval that reads back as this double
+/// is lopsided, and the nearest `k`-digit decimal can fall outside it while
+/// the one on the other side falls inside. `0x2800000000000000` is
+/// `5.075883674631299e-116`: rounded to sixteen digits it is `...298`, which
+/// reads back as the double below, and `...299` is the shortest string
+/// Python prints.
+fn candidates_at(mantissa: BigInt, exponent: i64, point: i64,
+    k: i64) -> [(str, i64)] {
+    let pair = scaled(mantissa, exponent, k - point)
+    let nearest = rounded_quotient(pair.0, pair.1)
+    let split = bigint.divmod(pair.0, pair.1) ?? (bigint.zero(), bigint.zero())
+    var out = [laid_out(nearest, point, k)]
+    if bigint.is_zero(split.1) {
+        return out
+    }
+    let floor = split.0
+    let other = if bigint.compare(nearest, floor) == 0 {
+        bigint.add(floor, bigint.from_i64(1)) } else { floor }
+    if not bigint.is_zero(other) {
+        out.push(laid_out(other, point, k))
+    }
+    return out
 }
 
 fn build(digits: str, point: i64, negative: bool) -> str {
@@ -233,10 +266,10 @@ pub fn parts(value: f64) -> FloatParts {
     let point = decimal_point(mantissa, exponent)
     var k = 1
     while k <= 17 {
-        let candidate = digits_at(mantissa, exponent, point, k)
         // Seventeen digits always distinguish one double from every other,
         // so the loop always ends; anything shorter has to be checked.
         if k == 17 {
+            let candidate = digits_at(mantissa, exponent, point, k)
             return FloatParts{
                 negative: negative,
                 digits: candidate.0,
@@ -244,19 +277,21 @@ pub fn parts(value: f64) -> FloatParts {
                 special: "",
             }
         }
-        let text = build(candidate.0, candidate.1, false)
-        match text.parse_float() {
-            Some(back) -> {
-                if back.to_bits() == bits.bit_and(9223372036854775807) {
-                    return FloatParts{
-                        negative: negative,
-                        digits: candidate.0,
-                        point: candidate.1,
-                        special: "",
+        for candidate in candidates_at(mantissa, exponent, point, k) {
+            let text = build(candidate.0, candidate.1, false)
+            match text.parse_float() {
+                Some(back) -> {
+                    if back.to_bits() == bits.bit_and(9223372036854775807) {
+                        return FloatParts{
+                            negative: negative,
+                            digits: candidate.0,
+                            point: candidate.1,
+                            special: "",
+                        }
                     }
                 }
+                None -> {}
             }
-            None -> {}
         }
         k = k + 1
     }
