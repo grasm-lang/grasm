@@ -1,0 +1,10 @@
+[package]
+name = "gitrawdiff"
+version = "1.0.0"
+
+# Reads the output it is given. Opens nothing.
+capabilities = []
+
+[dependencies.gitindex]
+path = "../gitindex"
+version = "^1.0.0"

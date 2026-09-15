@@ -1,0 +1,6 @@
+[package]
+name = "gitrefname"
+version = "1.0.0"
+
+# Checks names it is given. Opens nothing.
+capabilities = []

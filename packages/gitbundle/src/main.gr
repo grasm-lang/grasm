@@ -1,0 +1,226 @@
+// Git bundles: a repository's history in one file.
+//
+// `git bundle create` writes history to a file that can be carried where no
+// network reaches — an air-gapped build, a USB stick, an email attachment,
+// a CI cache — and `git clone` and `git fetch` read it like a remote. Hosts
+// also use bundles to seed clones (`bundle-uri`), so a server serving them,
+// or a tool deciding whether one can be applied, has to read the header
+// the way git does:
+//
+//     # v2 git bundle
+//     -3f2e...  subject of a commit the receiver must already have
+//     9a4b... refs/heads/main
+//     9a4b... HEAD
+//
+//     PACK....
+//
+// - The first line says the version. Version 3 adds capability lines
+//   starting with `@`: the object format (`sha1` or `sha256`, which sets
+//   how long every object name is) and a `filter`, for a bundle made with
+//   `--filter` that deliberately leaves objects out. An unknown capability
+//   is an error, because a reader that ignores one misreads the bundle.
+// - A line starting with `-` is a prerequisite: an object the receiver
+//   needs already, followed by whatever comment the writer chose.
+// - Any other line is an object name, a space and a ref name.
+// - Trailing whitespace on each header line is ignored, and the header ends
+//   at the first empty line, or where the lines run out — a final line with
+//   no newline is not read at all. The packfile follows.
+//
+// Checked against `git bundle list-heads` and `git bundle create`, for v2
+// and v3 bundles, full and incremental, SHA-1 and SHA-256, with filters.
+
+type BundleError =
+    | BundleNotABundle
+    | BundleBadHeader(line: str)
+    | BundleUnknownCapability(capability: str)
+
+type BundlePrerequisite = {
+    id: str,
+    comment: str,
+}
+
+type BundleRef = {
+    id: str,
+    name: str,
+}
+
+type GitBundle = {
+    version: i64,
+    object_format: str,
+    filter: str,
+    prerequisites: [BundlePrerequisite],
+    refs: [BundleRef],
+    pack_offset: i64,
+}
+
+fn is_git_space(b: i64) -> bool {
+    return b == 32 or b == 9 or b == 10 or b == 13
+}
+
+fn is_hex(c: i64) -> bool {
+    return (c >= 48 and c <= 57) or (c >= 97 and c <= 102) or
+    (c >= 65 and c <= 70)
+}
+
+/// The object name at the start of `line` and what follows it, for the
+/// hash length `width`.
+fn object_name(line: bytes, width: i64) -> Option[str] {
+    if line.len() < width {
+        return None
+    }
+    var i = 0
+    while i < width {
+        if not is_hex(line.at(i)) {
+            return None
+        }
+        i = i + 1
+    }
+    return Some(line.slice(0, width).to_str().to_lower())
+}
+
+fn capability(bundle: GitBundle, text: str) -> GitBundle ! BundleError {
+    var b = bundle
+    if text.starts_with("object-format=") {
+        let name = text.substr(14, text.len())
+        if name != "sha1" and name != "sha256" {
+            fail(BundleUnknownCapability(text))
+        }
+        b.object_format = name
+        return b
+    }
+    if text.starts_with("filter=") {
+        b.filter = text.substr(7, text.len())
+        return b
+    }
+    fail(BundleUnknownCapability(text))
+}
+
+/// Reads one header line (the prerequisite or ref it names) into `bundle`.
+fn header_line(bundle: GitBundle, line: bytes) -> GitBundle ! BundleError {
+    var b = bundle
+    let text = line.to_str()
+    if b.version == 3 and text.starts_with("@") {
+        return try capability(b, text.substr(1, text.len()))
+    }
+    let prerequisite = text.starts_with("-")
+    let body = if prerequisite { line.slice(1, line.len()) } else { line }
+    let width = if b.object_format == "sha256" { 64 } else { 40 }
+    match object_name(body, width) {
+        Some(id) -> {
+            let rest = body.slice(width, body.len())
+            if rest.len() > 0 and not is_git_space(rest.at(0)) {
+                fail(BundleBadHeader(text))
+            }
+            let after = if rest.len() > 0 { rest.slice(1, rest.len()).to_str() }
+            else { "" }
+            if prerequisite {
+                b.prerequisites.push(BundlePrerequisite{ id: id,
+                    comment: after })
+            } else {
+                if rest.len() == 0 {
+                    fail(BundleBadHeader(text))
+                }
+                b.refs.push(BundleRef{ id: id, name: after })
+            }
+            return b
+        }
+        None -> fail(BundleBadHeader(text))
+    }
+}
+
+/// The header of a bundle file, and where its packfile starts.
+pub fn parse_header(data: bytes) -> GitBundle ! BundleError {
+    var bundle = GitBundle{ version: 0, object_format: "sha1", filter: "",
+        prerequisites: [], refs: [], pack_offset: 0 }
+    var start = 0
+    var first = true
+    var i = 0
+    while i < data.len() {
+        if data.at(i) != 10 {
+            i = i + 1
+            continue
+        }
+        let line = data.slice(start, i + 1)
+        start = i + 1
+        i = i + 1
+        if first {
+            let sig = line.to_str()
+            if sig == "# v2 git bundle\n" {
+                bundle.version = 2
+            } else if sig == "# v3 git bundle\n" {
+                bundle.version = 3
+            } else {
+                fail(BundleNotABundle)
+            }
+            first = false
+            continue
+        }
+        if line.len() == 1 {
+            bundle.pack_offset = start
+            return bundle
+        }
+        var end = line.len()
+        while end > 0 and is_git_space(line.at(end - 1)) {
+            end = end - 1
+        }
+        bundle = try header_line(bundle, line.slice(0, end))
+    }
+    if first {
+        fail(BundleNotABundle)
+    }
+    // Git reads the header a whole line at a time: a last line with no
+    // newline is not read at all, and running out of lines ends the header
+    // as an empty line would.
+    bundle.pack_offset = data.len()
+    return bundle
+}
+
+/// The packfile a bundle carries.
+pub fn pack_of(data: bytes) -> bytes ! BundleError {
+    let header = try parse_header(data)
+    return data.slice(header.pack_offset, data.len())
+}
+
+/// The lines `git bundle list-heads` prints: every ref, or only those whose
+/// names are given.
+pub fn list_heads(bundle: GitBundle, names: [str]) -> [str] {
+    var out: [str] = []
+    for r in bundle.refs {
+        if names.len() == 0 or names.contains(r.name) {
+            out.push(r.id + " " + r.name)
+        }
+    }
+    return out
+}
+
+/// A header as `git bundle create` writes it. Version 3 is written when it
+/// is asked for, and whenever SHA-256 or a filter needs it.
+pub fn render_header(bundle: GitBundle) -> bytes {
+    let v3 = bundle.version == 3 or bundle.object_format == "sha256" or
+    bundle.filter.len() > 0
+    var out = if v3 { "# v3 git bundle\n" } else { "# v2 git bundle\n" }
+    if v3 {
+        out = out + "@object-format=" + bundle.object_format + "\n"
+        if bundle.filter.len() > 0 {
+            out = out + "@filter=" + bundle.filter + "\n"
+        }
+    }
+    for p in bundle.prerequisites {
+        out = out + "-" + p.id + (if p.comment.len() > 0 { " " + p.comment }
+            else { "" }) + "\n"
+    }
+    for r in bundle.refs {
+        out = out + r.id + " " + r.name + "\n"
+    }
+    return (out + "\n").to_bytes()
+}
+
+/// Whether every prerequisite is among the objects `have`.
+pub fn can_apply(bundle: GitBundle, have: [str]) -> bool {
+    for p in bundle.prerequisites {
+        if not have.contains(p.id) {
+            return false
+        }
+    }
+    return true
+}

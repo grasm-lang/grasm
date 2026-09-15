@@ -1,0 +1,6 @@
+[package]
+name = "gitcolor"
+version = "1.0.0"
+
+# Text to escape codes. Opens nothing.
+capabilities = []

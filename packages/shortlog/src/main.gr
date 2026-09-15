@@ -1,0 +1,189 @@
+// `git shortlog`: who wrote what, from a log.
+//
+// Release notes, contributor lists and "thanks to" sections are made from
+// `git shortlog`, and so are the author counts in project dashboards. This
+// is the command's reading of a log — the text `git log` prints, which is
+// what `git shortlog` reads from its standard input — and its output,
+// byte for byte, without a repository or git.
+//
+// What it does that a quick script gets wrong:
+//
+// - An author is who the `.mailmap` says they are. Two spellings of one
+//   name, or one person with a work and a personal address, are one entry
+//   after mapping and two before; `mailmap` is what does the mapping.
+// - Authors are sorted by name, as bytes, and with `numbered` by how many
+//   commits each has, most first, keeping name order between equals.
+// - Subjects are listed oldest first, although the log is newest first.
+//   A leading `[PATCH ...]` is taken off, as is surrounding whitespace.
+// - Only the first line after an author's headers counts as the subject,
+//   and a commit whose message is empty takes whatever line comes next.
+//
+// Checked against `git shortlog` reading the same log, with `-s`, `-n`,
+// `-e`, `-c` and a `.mailmap`.
+
+import mailmap
+
+type ShortlogOptions = {
+    summary: bool,
+    numbered: bool,
+    email: bool,
+    /// Group by committer rather than author.
+    committer: bool,
+}
+
+type ShortlogEntry = {
+    who: str,
+    subjects: [str],
+}
+
+/// `git shortlog` with no options.
+pub fn defaults() -> ShortlogOptions {
+    return ShortlogOptions{ summary: false, numbered: false, email: false,
+        committer: false }
+}
+
+/// Git's own `isspace`, which is space, tab, newline and carriage return —
+/// not the C library's, which adds vertical tab and form feed.
+fn is_space(c: str) -> bool {
+    return c == " " or c == "\t" or c == "\n" or c == "\r"
+}
+
+fn trim_start(text: str) -> str {
+    let chars = text.chars()
+    var i = 0
+    while i < chars.len() and is_space(chars[i]) {
+        i = i + 1
+    }
+    return text.substr(i, text.len())
+}
+
+fn trim_end(text: str) -> str {
+    let chars = text.chars()
+    var end = chars.len()
+    while end > 0 and is_space(chars[end - 1]) {
+        end = end - 1
+    }
+    return text.substr(0, end)
+}
+
+/// The name and address of an ident line, as `split_ident_line` finds
+/// them: the name is everything before `<` less trailing space, and the
+/// address runs to the first `>`.
+pub fn split_ident(line: str) -> Option[(str, str)] {
+    let open = line.index_of("<") ?? -1
+    if open < 0 {
+        return None
+    }
+    let rest = line.substr(open + 1, line.len())
+    let close = rest.index_of(">") ?? -1
+    if close < 0 {
+        return None
+    }
+    return Some((trim_end(line.substr(0, open)), rest.substr(0, close)))
+}
+
+/// A subject as shortlog lists it: leading space gone, then a leading
+/// `[PATCH...]` gone, then space before and after the rest gone.
+pub fn clean_subject(line: str) -> str {
+    var text = trim_start(line)
+    if text.starts_with("[PATCH") {
+        match text.index_of("]") {
+            Some(close) -> text = text.substr(close + 1, text.len())
+            None -> {}
+        }
+    }
+    return trim_end(trim_start(text))
+}
+
+fn find_entry(entries: [ShortlogEntry], who: str) -> i64 {
+    var i = 0
+    while i < entries.len() {
+        if entries[i].who == who {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+/// The log's commits grouped by author, names as the mailmap maps them.
+pub fn group(log: str, map: Mailmap, options: ShortlogOptions) -> [ShortlogEntry] {
+    let lines = log.split("\n")
+    let prefixes = if options.committer { ["Commit: ", "committer "] } else {
+        ["Author: ", "author "] }
+    var entries: [ShortlogEntry] = []
+    var i = 0
+    while i < lines.len() {
+        let line = lines[i]
+        i = i + 1
+        var ident = ""
+        if line.starts_with(prefixes[0]) {
+            ident = line.substr(prefixes[0].len(), line.len())
+        } else if line.starts_with(prefixes[1]) {
+            ident = line.substr(prefixes[1].len(), line.len())
+        } else {
+            continue
+        }
+        // Headers run to the first empty line; blank lines follow it; the
+        // next line is the subject.
+        while i < lines.len() and lines[i].len() > 0 {
+            i = i + 1
+        }
+        i = i + 1
+        while i < lines.len() and lines[i].len() == 0 {
+            i = i + 1
+        }
+        let subject = if i < lines.len() { lines[i] } else { "" }
+        i = i + 1
+        match split_ident(ident) {
+            Some(parts) -> {
+                let mapped = mailmap.resolve(map, parts.0, parts.1)
+                let who = if options.email { mapped.0 + " <" + mapped.1 + ">" }
+                else { mapped.0 }
+                let at = find_entry(entries, who)
+                if at >= 0 {
+                    entries[at].subjects.push(clean_subject(subject))
+                } else {
+                    entries.push(ShortlogEntry{ who: who,
+                        subjects: [clean_subject(subject)] })
+                }
+            }
+            None -> {}
+        }
+    }
+    return order(entries, options.numbered)
+}
+
+fn order(entries: [ShortlogEntry], numbered: bool) -> [ShortlogEntry] {
+    var sorted = entries
+    sorted.sort_by(|e| e.who)
+    if numbered {
+        sorted.sort_by(|e| 0 - e.subjects.len())
+    }
+    return sorted
+}
+
+/// The text `git shortlog` prints for these entries.
+pub fn render(entries: [ShortlogEntry], options: ShortlogOptions) -> str {
+    var out = ""
+    for e in entries {
+        if options.summary {
+            out = out + "{e.subjects.len()}".pad_start(6, " ") + "\t" + e.who +
+            "\n"
+            continue
+        }
+        out = out + e.who + " ({e.subjects.len()}):\n"
+        var j = e.subjects.len() - 1
+        while j >= 0 {
+            out = out + "      " + e.subjects[j] + "\n"
+            j = j - 1
+        }
+        out = out + "\n"
+    }
+    return out
+}
+
+/// `git shortlog` over a log and a `.mailmap`'s text.
+pub fn shortlog(log: str, mailmap_text: str, options: ShortlogOptions) -> str {
+    return render(group(log, mailmap.parse(mailmap_text), options), options)
+}

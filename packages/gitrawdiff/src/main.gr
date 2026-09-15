@@ -1,0 +1,283 @@
+// `git diff --raw`: what changed, without the content.
+//
+// The raw format is the diff output meant for programs. `git diff --raw`,
+// `git log --raw`, `git diff-tree` and `git show --raw` print it, and it is
+// what CI systems, code-review tools and deploy scripts read to learn which
+// files a change touched, whether a file was renamed or copied and from
+// where, and whether its mode changed:
+//
+//     :100644 100644 5716ca5987cbf97d6bb54920bea6adde242d87e6 76018072e09c5d31c8c6e3113b8aa0fe625195ca M	src/main.gr
+//     :100644 100644 1111... 2222... R086	old name	new name
+//     ::100644 100644 100644 aaaa... bbbb... cccc... MM	merged.txt
+//
+// Details that decide whether a reader is correct:
+//
+// - A rename or copy carries a similarity score and two paths; nothing else
+//   does, except a broken-up modification (`-B`), which has a score and one.
+// - A path is C-quoted when it has a tab, newline, quote, backslash, control
+//   character or — with git's default `core.quotePath` — any byte above 127,
+//   so a file named `résumé.txt` appears as `"r\303\251sum\303\251.txt"`.
+//   Splitting on tabs before unquoting gets a path with a tab wrong.
+// - With `-z` nothing is quoted and fields end in NUL instead.
+// - A merge's combined form starts with one colon per parent, and has one
+//   mode, one object and one status letter per parent.
+//
+// Checked against `git diff --raw`, with and without `-z`, over repositories
+// built with renames, copies, mode and type changes and hostile file names.
+
+import gitindex
+
+type RawDiffError =
+    | RawDiffMalformed(line: str, why: str)
+
+/// One line of raw output. For an ordinary diff there is one source mode,
+/// source object and status letter; a merge's combined form has one per
+/// parent. `score` is -1 when the status has none.
+type RawDiffEntry = {
+    src_modes: [str],
+    dst_mode: str,
+    src_ids: [str],
+    dst_id: str,
+    status: str,
+    score: i64,
+    path: str,
+    new_path: str,
+}
+
+fn digit_value(c: i64) -> i64 {
+    return if c >= 48 and c <= 57 { c - 48 } else { -1 }
+}
+
+/// A C-quoted path back to its bytes, or the text itself if unquoted.
+pub fn unquote(text: str) -> str ! RawDiffError {
+    if not text.starts_with("\"") {
+        return text
+    }
+    let raw = text.to_bytes()
+    if raw.len() < 2 or raw.at(raw.len() - 1) != 34 {
+        fail(RawDiffMalformed(text, "an unterminated quoted path"))
+    }
+    var out: [i64] = []
+    var i = 1
+    while i < raw.len() - 1 {
+        let b = raw.at(i)
+        if b != 92 {
+            out.push(b)
+            i = i + 1
+            continue
+        }
+        if i + 1 >= raw.len() - 1 {
+            fail(RawDiffMalformed(text, "a backslash at the end"))
+        }
+        let e = raw.at(i + 1)
+        let simple = "abfnrtv\\\""
+        let values = [7, 8, 12, 10, 13, 9, 11, 92, 34]
+        let at = simple.index_of(e.to_char()) ?? -1
+        if at >= 0 {
+            out.push(values[at])
+            i = i + 2
+            continue
+        }
+        if i + 3 > raw.len() - 2 {
+            fail(RawDiffMalformed(text, "a short octal escape"))
+        }
+        let d1 = digit_value(e)
+        let d2 = digit_value(raw.at(i + 2))
+        let d3 = digit_value(raw.at(i + 3))
+        if d1 < 0 or d1 > 3 or d2 < 0 or d2 > 7 or d3 < 0 or d3 > 7 {
+            fail(RawDiffMalformed(text, "an unknown escape"))
+        }
+        out.push(d1 * 64 + d2 * 8 + d3)
+        i = i + 4
+    }
+    return bytes_of(out).to_str()
+}
+
+/// Splits `:modes ids status` into its fields.
+fn header_fields(header: str) -> RawDiffEntry ! RawDiffError {
+    var colons = 0
+    while colons < header.len() and header.substr(colons, 1) == ":" {
+        colons = colons + 1
+    }
+    let fields = header.substr(colons, header.len()).split(" ")
+    if colons == 0 or fields.len() != 2 * (colons + 1) + 1 {
+        fail(RawDiffMalformed(header, "the wrong number of fields"))
+    }
+    let status_field = fields[fields.len() - 1]
+    var status = status_field
+    var score = -1
+    if colons == 1 and status_field.len() > 1 {
+        status = status_field.substr(0, 1)
+        score = status_field.substr(1, status_field.len()).parse_int() ?? -2
+        if score < 0 {
+            fail(RawDiffMalformed(header, "a score that is not a number"))
+        }
+    }
+    if status.len() != colons {
+        fail(RawDiffMalformed(header, "a status for each parent"))
+    }
+    return RawDiffEntry{ src_modes: fields.slice(0, colons),
+        dst_mode: fields[colons], src_ids: fields.slice(colons + 1,
+            2 * colons + 1), dst_id: fields[2 * colons + 1], status: status,
+        score: score, path: "", new_path: "" }
+}
+
+/// Whether an entry carries a second path: a rename or a copy.
+pub fn has_two_paths(e: RawDiffEntry) -> bool {
+    return e.status == "R" or e.status == "C"
+}
+
+/// Raw output as git prints it without `-z`.
+pub fn parse(text: str) -> [RawDiffEntry] ! RawDiffError {
+    var out: [RawDiffEntry] = []
+    for line in text.split("\n") {
+        if line.len() == 0 {
+            continue
+        }
+        let tab = line.index_of("\t") ?? -1
+        if tab < 0 {
+            fail(RawDiffMalformed(line, "no path"))
+        }
+        var e = try header_fields(line.substr(0, tab))
+        let paths = line.substr(tab + 1, line.len())
+        if has_two_paths(e) {
+            let split = try two_paths(paths, line)
+            e.path = split.0
+            e.new_path = split.1
+        } else {
+            e.path = try unquote(paths)
+        }
+        out.push(e)
+    }
+    return out
+}
+
+/// The two tab-separated paths of a rename, either of which may be quoted
+/// — and a quoted one may contain an escaped tab but never a real one.
+fn two_paths(paths: str, line: str) -> (str, str) ! RawDiffError {
+    var cut = -1
+    if paths.starts_with("\"") {
+        let raw = paths.to_bytes()
+        var i = 1
+        while i < raw.len() and cut < 0 {
+            if raw.at(i) == 92 {
+                i = i + 2
+            } else if raw.at(i) == 34 {
+                cut = i + 1
+            } else {
+                i = i + 1
+            }
+        }
+        if cut < 0 or cut >= raw.len() or raw.at(cut) != 9 {
+            fail(RawDiffMalformed(line, "a rename without a second path"))
+        }
+        let first = raw.slice(0, cut).to_str()
+        let second = raw.slice(cut + 1, raw.len()).to_str()
+        return (try unquote(first), try unquote(second))
+    }
+    cut = paths.index_of("\t") ?? -1
+    if cut < 0 {
+        fail(RawDiffMalformed(line, "a rename without a second path"))
+    }
+    return (paths.substr(0, cut), try unquote(paths.substr(cut + 1,
+        paths.len())))
+}
+
+/// Raw output as git prints it with `-z`: a header, then each path, all
+/// ending in NUL.
+pub fn parse_z(data: bytes) -> [RawDiffEntry] ! RawDiffError {
+    var fields: [str] = []
+    var start = 0
+    var i = 0
+    while i < data.len() {
+        if data.at(i) == 0 {
+            fields.push(data.slice(start, i).to_str())
+            start = i + 1
+        }
+        i = i + 1
+    }
+    var out: [RawDiffEntry] = []
+    var at = 0
+    while at < fields.len() {
+        var e = try header_fields(fields[at])
+        if at + 1 >= fields.len() {
+            fail(RawDiffMalformed(fields[at], "no path"))
+        }
+        e.path = fields[at + 1]
+        at = at + 2
+        if has_two_paths(e) {
+            if at >= fields.len() {
+                fail(RawDiffMalformed(fields[at - 2], "no second path"))
+            }
+            e.new_path = fields[at]
+            at = at + 1
+        }
+        out.push(e)
+    }
+    return out
+}
+
+fn header_text(e: RawDiffEntry) -> str {
+    var out = ":".repeat(e.src_modes.len())
+    out = out + e.src_modes.join(" ") + " " + e.dst_mode + " " +
+    e.src_ids.join(" ") + " " + e.dst_id + " " + e.status
+    if e.score >= 0 {
+        out = out + "{e.score}".pad_start(3, "0")
+    }
+    return out
+}
+
+/// Entries written back as git writes them without `-z`, paths quoted.
+pub fn render(entries: [RawDiffEntry]) -> str {
+    var out = ""
+    for e in entries {
+        out = out + header_text(e) + "\t" + gitindex.quote_path(e.path)
+        if has_two_paths(e) {
+            out = out + "\t" + gitindex.quote_path(e.new_path)
+        }
+        out = out + "\n"
+    }
+    return out
+}
+
+/// Entries written back as git writes them with `-z`.
+pub fn render_z(entries: [RawDiffEntry]) -> bytes {
+    var out: [i64] = []
+    for e in entries {
+        var parts = [header_text(e), e.path]
+        if has_two_paths(e) {
+            parts.push(e.new_path)
+        }
+        for p in parts {
+            let raw = p.to_bytes()
+            var i = 0
+            while i < raw.len() {
+                out.push(raw.at(i))
+                i = i + 1
+            }
+            out.push(0)
+        }
+    }
+    return bytes_of(out)
+}
+
+/// What a status letter means.
+pub fn status_name(letter: str) -> str {
+    let letters = ["A", "C", "D", "M", "R", "T", "U", "X", "B"]
+    let names = ["added", "copied", "deleted", "modified", "renamed",
+        "type changed", "unmerged", "unknown", "broken pair"]
+    var i = 0
+    while i < letters.len() {
+        if letters[i] == letter {
+            return names[i]
+        }
+        i = i + 1
+    }
+    return "unknown"
+}
+
+/// The path an entry leaves behind: the new path of a rename or copy, the
+/// only path otherwise.
+pub fn final_path(e: RawDiffEntry) -> str {
+    return if has_two_paths(e) { e.new_path } else { e.path }
+}

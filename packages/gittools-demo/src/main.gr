@@ -1,0 +1,138 @@
+// The text git's plumbing reads and writes, without git.
+import gitrefname
+import gitcolor
+import shortlog
+import mailmap
+import gitrawdiff
+import gitbundle
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn check_gitrefname(inout f: i64) / {io} {
+    let strict = gitrefname.strict()
+    say(f, "a full branch ref is valid",
+        gitrefname.is_valid("refs/heads/main", strict))
+    say(f, "one level is not, unless allowed",
+        not gitrefname.is_valid("main", strict))
+    say(f, "two dots would read as a range",
+        not gitrefname.is_valid("refs/heads/a..b", strict))
+    say(f, "@\{ would read as a reflog lookup",
+        not gitrefname.is_valid("refs/heads/x@\{1\}", strict))
+    say(f, "a hidden component and a lock file are refused",
+        not gitrefname.is_valid("refs/heads/.hidden", strict) and
+        not gitrefname.is_valid("refs/heads/a.lock", strict))
+    var pattern = strict
+    pattern.refspec_pattern = true
+    say(f, "a star needs a refspec pattern",
+        not gitrefname.is_valid("refs/*/x", strict) and
+        gitrefname.is_valid("refs/*/x", pattern))
+    var normal = strict
+    normal.normalize = true
+    say(f, "normalizing collapses slashes",
+        (gitrefname.check("//refs//heads/x", normal) ?? "") == "refs/heads/x")
+    say(f, "a branch may not start with a dash",
+        not gitrefname.is_valid_branch("-x"))
+}
+
+fn check_gitcolor(inout f: i64) / {io} {
+    say(f, "bold red is the escape git writes",
+        (gitcolor.escape("bold red") ?? "") == "\u{1b}[1;31m")
+    say(f, "normal fills the foreground and writes nothing",
+        (gitcolor.escape("normal #ffaa00 ul") ?? "") ==
+        "\u{1b}[4;48;2;255;170;0m")
+    say(f, "color names ignore case and attributes do not",
+        gitcolor.is_valid("RED") and not gitcolor.is_valid("BOLD"))
+    say(f, "a third color is an error",
+        not gitcolor.is_valid("red blue green"))
+}
+
+fn check_shortlog(inout f: i64) / {io} {
+    let log = "commit 1\nAuthor: Jane <j@x>\n\n    [PATCH] Second\n\n" +
+    "commit 2\nAuthor: Bob <b@x>\n\n    Only\n\n" +
+    "commit 3\nAuthor: Jane <j@x>\n\n    First\n"
+    var numbered = shortlog.defaults()
+    numbered.numbered = true
+    say(f, "most commits first, oldest subject first, [PATCH] dropped",
+        shortlog.shortlog(log, "", numbered) ==
+        "Jane (2):\n      First\n      Second\n\nBob (1):\n      Only\n\n")
+    var summary = shortlog.defaults()
+    summary.summary = true
+    summary.email = true
+    say(f, "a name-only mailmap entry keeps the commit's address",
+        shortlog.shortlog("commit 1\nAuthor: Jane <J@X>\n\n    s\n",
+            "Jane Doe <j@x>\n", summary) == "     1\tJane Doe <J@X>\n")
+    let map = mailmap.parse("Jane Doe <j@x>\n<new@x> <J@x>\n")
+    say(f, "mailmap entries for one address accumulate",
+        mailmap.resolve_line(map, "jane <j@X>") == "Jane Doe <new@x>")
+}
+
+fn check_gitrawdiff(inout f: i64) / {io} {
+    let zero = "0000000000000000000000000000000000000000"
+    let one = "1111111111111111111111111111111111111111"
+    let text = ":100644 100644 {zero} {one} R086\t\"tab\\there\"\t\"r\\303\\251sum\\303\\251\"\n" +
+    ":000000 100755 {zero} {one} A\tplain name\n"
+    match gitrawdiff.parse(text) {
+        Ok(entries) -> {
+            say(f, "a rename has a score and two paths",
+                entries[0].status == "R" and entries[0].score == 86 and
+                entries[0].path == "tab\there")
+            say(f, "a quoted path is decoded, octal bytes and all",
+                gitrawdiff.final_path(entries[0]) == "résumé")
+            say(f, "an unquoted path is taken as it is",
+                entries[1].path == "plain name" and entries[1].score == -1)
+            say(f, "and written back quoted where git quotes",
+                gitrawdiff.render(entries) == text)
+        }
+        Err(_e) -> say(f, "raw output parses", false)
+    }
+}
+
+fn check_gitbundle(inout f: i64) / {io} {
+    let id = "7ea39ab4a2c9a937a4186362fc50d8a76848ac16"
+    let base = "d0a967400d4716b149bce4942bf2f86cfd12378e"
+    let header = "# v2 git bundle\n-{base} one\n{id} HEAD\n\nPACK"
+    match gitbundle.parse_header(header.to_bytes()) {
+        Ok(b) -> {
+            say(f, "a prerequisite and a ref are read",
+                b.prerequisites[0].id == base and
+                gitbundle.list_heads(b, []) == [id + " HEAD"])
+            say(f, "the packfile starts after the empty line",
+                b.pack_offset == header.len() - 4)
+            say(f, "the header is written back byte for byte",
+                gitbundle.render_header(b) ==
+                header.substr(0, header.len() - 4).to_bytes())
+            say(f, "it cannot apply without its prerequisite",
+                not gitbundle.can_apply(b, []) and
+                gitbundle.can_apply(b, [base]))
+        }
+        Err(_e) -> say(f, "the bundle header parses", false)
+    }
+    say(f, "an unknown v3 capability is refused",
+        match gitbundle.parse_header("# v3 git bundle\n@unknown=1\n\n".to_bytes()) {
+            Ok(_b) -> false
+            Err(_e) -> true
+    })
+}
+
+fn main() / {io} {
+    var f = 0
+
+    check_gitrefname(f)
+    check_gitcolor(f)
+    check_shortlog(f)
+    check_gitrawdiff(f)
+    check_gitbundle(f)
+
+    if f == 0 {
+        print("gittools: every claim held")
+    } else {
+        print("gittools: {f} failed")
+    }
+}

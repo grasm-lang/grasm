@@ -28,123 +28,160 @@
 //       Both, matched on the name *and* the email together — which is how
 //       two people who once shared a machine account are told apart.
 //
-// Emails are compared without regard to case; names are compared exactly.
-// A more specific entry — one that names a commit name as well as an email
-// — is tried before a less specific one, or the person who shared the
-// account would be rewritten to whoever comes first in the file.
+// Emails and names are both compared without regard to ASCII case. An
+// entry that names a commit name as well as an email is tried before the
+// plain entries for that email, or the person who shared the account would
+// be rewritten to whoever comes first in the file.
 //
-// Checked against `git check-mailmap`.
+// Entries for one email accumulate the way git's `add_mapping` accumulates
+// them: `Jane <jane@x>` and then `<new@x> <jane@x>` together give both the
+// name and the address, a later name replaces an earlier one, and an entry
+// that only fixes a name leaves the commit's own spelling of the address
+// alone — `JANE@X` stays `JANE@X`. Only a line whose first character is `#`
+// is a comment, and addresses are taken exactly as written between the
+// brackets.
+//
+// Checked against `git check-mailmap` and `git shortlog`.
 
 type MailmapEntry = {
+    /// Empty when the line gives no name.
     proper_name: str,
     proper_email: str,
     /// Empty when the entry matches on email alone.
     commit_name: str,
     commit_email: str,
+    /// Whether the line gives a second address, so the first one replaces
+    /// the commit's.
+    rewrites_email: bool,
 }
 
 type Mailmap = {
     entries: [MailmapEntry],
 }
 
-/// The `Name <email>` pairs on a line, in order.
-fn pairs_of(line: str) -> [(str, str)] {
-    var out: [(str, str)] = []
-    var name = ""
-    var i = 0
-    while i < line.len() {
-        let c = line.substr(i, 1)
-        if c != "<" {
-            name = name + c
-            i = i + 1
-            continue
-        }
-        let close = find_from(line, ">", i)
-        if close < 0 {
-            return out
-        }
-        out.push((name.trim(), line.substr(i + 1, close - i - 1).trim()))
-        name = ""
-        i = close + 1
-    }
-    return out
+/// Git's `isspace`: space, tab, newline, carriage return.
+fn is_space(c: str) -> bool {
+    return c == " " or c == "\t" or c == "\n" or c == "\r"
 }
 
-fn find_from(text: str, needle: str, from: i64) -> i64 {
-    var i = from
-    while i < text.len() {
-        if text.substr(i, 1) == needle {
-            return i
-        }
-        i = i + 1
+fn trim_git(text: str) -> str {
+    let chars = text.chars()
+    var start = 0
+    var end = chars.len()
+    while start < end and is_space(chars[start]) {
+        start = start + 1
     }
-    return 0 - 1
+    while end > start and is_space(chars[end - 1]) {
+        end = end - 1
+    }
+    return text.substr(start, end - start)
 }
 
-/// A whole `.mailmap`.
+/// `parse_name_and_email`: the name before the first `<` (trimmed), the
+/// address up to the next `>` (as written), and the text after it — or
+/// `None` when there is no such pair, or the address is empty and that is
+/// not allowed.
+fn name_and_email(text: str, allow_empty: bool) -> Option[(str, str, str)] {
+    let left = text.index_of("<") ?? -1
+    if left < 0 {
+        return None
+    }
+    let after = text.substr(left + 1, text.len())
+    let right = after.index_of(">") ?? -1
+    if right < 0 or (right == 0 and not allow_empty) {
+        return None
+    }
+    return Some((trim_git(text.substr(0, left)), after.substr(0, right),
+        after.substr(right + 1, after.len())))
+}
+
+/// A whole `.mailmap`, one entry per line that has an address.
 pub fn parse(text: str) -> Mailmap {
     var entries: [MailmapEntry] = []
-    for raw in text.split("\n") {
-        var line = raw
-        let hash = line.index_of("#") ?? -1
-        if hash >= 0 {
-            line = line.substr(0, hash)
-        }
-        line = line.trim()
-        if line.len() == 0 {
+    for line in text.split("\n") {
+        if line.starts_with("#") {
             continue
         }
-        let pairs = pairs_of(line)
-        if pairs.len() == 0 {
-            continue
+        match name_and_email(line, false) {
+            Some(first) -> {
+                var commit_name = ""
+                var commit_email = first.1
+                var rewrites = false
+                if first.2.len() > 0 {
+                    match name_and_email(first.2, true) {
+                        Some(second) -> {
+                            commit_name = second.0
+                            commit_email = second.1
+                            rewrites = true
+                        }
+                        None -> {}
+                    }
+                }
+                entries.push(MailmapEntry{ proper_name: first.0,
+                    proper_email: first.1, commit_name: commit_name,
+                    commit_email: commit_email, rewrites_email: rewrites })
+            }
+            None -> {}
         }
-        if pairs.len() == 1 {
-            entries.push(MailmapEntry{
-                proper_name: pairs[0].0,
-                proper_email: pairs[0].1,
-                commit_name: "",
-                commit_email: pairs[0].1,
-            })
-            continue
-        }
-        entries.push(MailmapEntry{
-            proper_name: pairs[0].0,
-            proper_email: pairs[0].1,
-            commit_name: pairs[1].0,
-            commit_email: pairs[1].1,
-        })
     }
     return Mailmap{ entries: entries }
 }
 
-fn same_email(a: str, b: str) -> bool {
-    return a.to_lower() == b.to_lower()
+/// ASCII case folding, which is what `strcasecmp` does.
+fn fold(text: str) -> str {
+    var out = ""
+    for c in text.chars() {
+        let code = c.code_at(0)
+        out = out + (if code >= 65 and code <= 90 { (code + 32).to_char() }
+            else { c })
+    }
+    return out
 }
 
-/// The canonical name and email for a commit's name and email.
-///
-/// An entry that names a commit name as well as an email is tried first:
-/// otherwise two people who once shared an account would both be rewritten
-/// to whichever appears earlier in the file.
+/// The canonical name and email for a commit's name and email, as git's
+/// `map_user` finds them.
 pub fn resolve(map: Mailmap, name: str, email: str) -> (str, str) {
+    let key = fold(email)
+    var found = false
+    var simple_name = ""
+    var simple_email = ""
+    var named: [MailmapEntry] = []
     for entry in map.entries {
+        if fold(entry.commit_email) != key {
+            continue
+        }
+        found = true
         if entry.commit_name.len() == 0 {
+            if entry.proper_name.len() > 0 {
+                simple_name = entry.proper_name
+            }
+            if entry.rewrites_email {
+                simple_email = entry.proper_email
+            }
             continue
         }
-        if entry.commit_name == name and
-        same_email(entry.commit_email, email) {
-            return (proper_or(entry.proper_name, name), entry.proper_email)
+        // A later line for the same commit name replaces an earlier one.
+        var kept: [MailmapEntry] = []
+        for n in named {
+            if fold(n.commit_name) != fold(entry.commit_name) {
+                kept.push(n)
+            }
+        }
+        kept.push(entry)
+        named = kept
+    }
+    if not found {
+        return (name, email)
+    }
+    if name.len() > 0 {
+        for n in named {
+            if fold(n.commit_name) == fold(name) {
+                return (proper_or(n.proper_name, name),
+                    if n.rewrites_email { n.proper_email } else { email })
+            }
         }
     }
-    for entry in map.entries {
-        if entry.commit_name.len() > 0 {
-            continue
-        }
-        if same_email(entry.commit_email, email) {
-            return (proper_or(entry.proper_name, name), entry.proper_email)
-        }
-    }
-    return (name, email)
+    return (proper_or(simple_name, name), proper_or(simple_email, email))
 }
 
 fn proper_or(proper: str, fallback: str) -> str {
@@ -157,11 +194,23 @@ fn proper_or(proper: str, fallback: str) -> str {
 /// The same, written back as `Name <email>` — the form `git check-mailmap`
 /// takes and prints.
 pub fn resolve_line(map: Mailmap, line: str) -> str {
-    let pairs = pairs_of(line)
-    if pairs.len() == 0 {
+    let open = line.index_of("<") ?? -1
+    if open < 0 {
         return line
     }
-    let found = resolve(map, pairs[0].0, pairs[0].1)
+    let rest = line.substr(open + 1, line.len())
+    let close = rest.index_of(">") ?? -1
+    if close < 0 {
+        return line
+    }
+    var name = line.substr(0, open)
+    let chars = name.chars()
+    var end = chars.len()
+    while end > 0 and is_space(chars[end - 1]) {
+        end = end - 1
+    }
+    name = name.substr(0, end)
+    let found = resolve(map, name, rest.substr(0, close))
     if found.0.len() == 0 {
         return "<" + found.1 + ">"
     }
@@ -174,7 +223,7 @@ pub fn mapped_emails(map: Mailmap) -> [str] {
     var out: [str] = []
     var seen: Map[str, bool] = {}
     for entry in map.entries {
-        let key = entry.commit_email.to_lower()
+        let key = fold(entry.commit_email)
         if not seen.has(key) {
             seen.set(key, true)
             out.push(entry.commit_email)

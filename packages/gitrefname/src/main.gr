@@ -1,0 +1,181 @@
+// Which names git accepts for a branch, a tag or any other ref.
+//
+// A ref name is a path under `.git`, so git refuses the ones that would be
+// dangerous or ambiguous as paths or in revision syntax: `..` would read as
+// a range, `@{` as a reflog lookup, `~` and `^` as ancestry, `:` as a
+// refspec, a component starting with `.` as a hidden file, one ending in
+// `.lock` as git's own lock file, and a control character as anything at
+// all. A server that creates branches from user input, a CI system that
+// names refs after pull requests, and a tool that writes `packed-refs`
+// directly all need to refuse exactly what git refuses — accepting more
+// makes a ref git cannot read, and accepting less refuses names people use.
+//
+// The rules, from `check_refname_format` in git's `refs.c`:
+//
+// - no component may be empty, begin with `.`, or end with `.lock`;
+// - the name may not contain `..`, `@{`, a control character, a space, or
+//   any of `~ ^ : ? [ \`, nor end with `.`;
+// - `*` is refused unless the name is a refspec pattern, and then only one;
+// - the name may not be exactly `@`;
+// - it needs at least two components unless one level is allowed —
+//   `refs/heads/main` passes and `main` does not, which is why
+//   `check-ref-format --branch` exists.
+//
+// Bytes above 127 are allowed, so a UTF-8 name is a valid ref.
+//
+// Checked against `git check-ref-format`, with and without
+// `--allow-onelevel`, `--refspec-pattern` and `--normalize`.
+
+type RefNameOptions = {
+    allow_onelevel: bool,
+    refspec_pattern: bool,
+    normalize: bool,
+}
+
+type RefNameError =
+    | RefNameInvalid(name: str, why: str)
+
+/// `git check-ref-format` with no options.
+pub fn strict() -> RefNameOptions {
+    return RefNameOptions{ allow_onelevel: false, refspec_pattern: false,
+        normalize: false }
+}
+
+/// What a byte means in a ref name: 0 ordinary, 1 the end of a component, 2
+/// a dot, 3 an open brace, 4 refused, 5 a star.
+fn disposition(b: i64) -> i64 {
+    if b == 47 {
+        return 1
+    }
+    if b == 46 {
+        return 2
+    }
+    if b == 123 {
+        return 3
+    }
+    if b == 42 {
+        return 5
+    }
+    if b < 32 or b == 127 or b == 32 or b == 58 or b == 63 or b == 91 or
+    b == 92 or b == 94 or b == 126 {
+        return 4
+    }
+    return 0
+}
+
+/// `collapse_slashes`: leading slashes removed and runs of slashes made one.
+pub fn collapse_slashes(name: str) -> str {
+    var out = ""
+    var previous_slash = true
+    for c in name.chars() {
+        if c == "/" {
+            if not previous_slash {
+                out = out + c
+            }
+            previous_slash = true
+        } else {
+            out = out + c
+            previous_slash = false
+        }
+    }
+    return out
+}
+
+/// The length of the component at `start`, or why it is refused. `star` is
+/// whether a `*` may still appear; the second value says whether one did.
+fn component(raw: bytes, start: i64, star: bool) -> (i64, bool) ! RefNameError {
+    var i = start
+    var last = 0
+    var star_left = star
+    while i < raw.len() {
+        let b = raw.at(i)
+        let d = disposition(b)
+        if d == 1 {
+            break
+        }
+        if d == 2 and last == 46 {
+            fail(RefNameInvalid("", "contains .."))
+        }
+        if d == 3 and last == 64 {
+            fail(RefNameInvalid("", "contains @\{"))
+        }
+        if d == 4 {
+            fail(RefNameInvalid("", "contains a character a ref cannot"))
+        }
+        if d == 5 {
+            if not star_left {
+                fail(RefNameInvalid("", "contains *"))
+            }
+            star_left = false
+        }
+        last = b
+        i = i + 1
+    }
+    let length = i - start
+    if length == 0 {
+        fail(RefNameInvalid("", "has an empty component"))
+    }
+    if raw.at(start) == 46 {
+        fail(RefNameInvalid("", "has a component starting with ."))
+    }
+    if length >= 5 and raw.slice(i - 5, i).to_str() == ".lock" {
+        fail(RefNameInvalid("", "has a component ending with .lock"))
+    }
+    return (length, star_left)
+}
+
+fn check_raw(name: str, options: RefNameOptions) -> () ! RefNameError {
+    if name == "@" {
+        fail(RefNameInvalid(name, "is @"))
+    }
+    let raw = name.to_bytes()
+    var start = 0
+    var components = 0
+    var star = options.refspec_pattern
+    var last_length = 0
+    while true {
+        let found = match component(raw, start, star) {
+            Ok(c) -> c
+            Err(e) -> fail(RefNameInvalid(name, match e {
+                RefNameInvalid(_n, why) -> why
+            }))
+        }
+        star = found.1
+        last_length = found.0
+        components = components + 1
+        if start + found.0 >= raw.len() {
+            break
+        }
+        start = start + found.0 + 1
+    }
+    if raw.at(start + last_length - 1) == 46 {
+        fail(RefNameInvalid(name, "ends with ."))
+    }
+    if not options.allow_onelevel and components < 2 {
+        fail(RefNameInvalid(name, "has only one component"))
+    }
+}
+
+/// The name git would store, or why it refuses: with `normalize`, slashes
+/// are collapsed first, as `check-ref-format --normalize` does.
+pub fn check(name: str, options: RefNameOptions) -> str ! RefNameError {
+    let checked = if options.normalize { collapse_slashes(name) } else { name }
+    try check_raw(checked, options)
+    return checked
+}
+
+/// Whether git accepts `name` as a ref under these options.
+pub fn is_valid(name: str, options: RefNameOptions) -> bool {
+    return match check(name, options) {
+        Ok(_n) -> true
+        Err(_e) -> false
+    }
+}
+
+/// Whether `name` is a valid branch name: `refs/heads/<name>` checks, and
+/// the name does not start with `-`, which git refuses because it would
+/// read as an option.
+pub fn is_valid_branch(name: str) -> bool {
+    return not name.starts_with("-") and name != "HEAD" and
+    is_valid("refs/heads/" + name, strict())
+}

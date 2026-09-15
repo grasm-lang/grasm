@@ -1,0 +1,287 @@
+// Git's color specifications, turned into the escape codes git writes.
+//
+// `color.diff.old = red bold`, `color.branch.current = "#ffaa00 ul"`,
+// `color.decorate.HEAD = brightcyan reverse`: a git color is a few words, and
+// every tool that shows git output in git's colors — a web view of a diff, a
+// prompt, a TUI — has to turn the user's words into the same escape sequence
+// git would, or the colors the user configured are not the colors they see.
+//
+// The grammar, from `color_parse_mem` in git's `color.c`:
+//
+// - `reset`, then up to two colors — the first is the foreground, the
+//   second the background — and any number of attributes, in any order;
+// - a color is `normal`, `default`, one of the eight names or its `bright`
+//   form, a number from -1 to 255, `#rrggbb` or `#rgb`, and names are
+//   matched without regard to case;
+// - an attribute is `bold`, `dim`, `italic`, `ul`, `blink`, `reverse` or
+//   `strike`, or one of them after `no` or `no-` to turn it off — and these
+//   *are* case-sensitive, so `BOLD` is an error where `RED` is not;
+// - `normal` and `-1` fill a color slot and write nothing, so `normal red`
+//   is a red background on the terminal's own foreground;
+// - numbers 0 to 15 are written as the portable 30–37 and 90–97 codes
+//   rather than as 256-color codes.
+//
+// Checked against `git config --get-color`.
+
+type GitColorError =
+    | GitColorInvalid(spec: str)
+
+/// A parsed color: `kind` is `normal`, `ansi` (a 30–37 or 90–97 code, or
+/// 39), `256` or `rgb`.
+type GitColor = {
+    kind: str,
+    value: i64,
+    red: i64,
+    green: i64,
+    blue: i64,
+}
+
+let NAMES = ["black", "red", "green", "yellow", "blue", "magenta", "cyan",
+    "white"]
+
+/// Git's own `isspace`, which is space, tab, newline and carriage return —
+/// not the C library's, which adds vertical tab and form feed.
+fn is_space(c: str) -> bool {
+    return c == " " or c == "\t" or c == "\n" or c == "\r"
+}
+
+fn words(spec: str) -> [str] {
+    var out: [str] = []
+    var current = ""
+    for c in spec.chars() {
+        if is_space(c) {
+            if current.len() > 0 {
+                out.push(current)
+                current = ""
+            }
+        } else {
+            current = current + c
+        }
+    }
+    if current.len() > 0 {
+        out.push(current)
+    }
+    return out
+}
+
+fn ascii_lower(text: str) -> str {
+    var out = ""
+    for c in text.chars() {
+        let code = c.code_at(0)
+        out = out + (if code >= 65 and code <= 90 { (code + 32).to_char() }
+            else { c })
+    }
+    return out
+}
+
+fn hex_digit(c: str) -> i64 {
+    return "0123456789abcdef".index_of(ascii_lower(c)) ?? -1
+}
+
+fn hex_pair(text: str, at: i64) -> i64 {
+    let high = hex_digit(text.substr(at, 1))
+    let low = hex_digit(text.substr(at + 1, 1))
+    return if high < 0 or low < 0 { -1 } else { high * 16 + low }
+}
+
+fn plain(kind: str, value: i64) -> Option[GitColor] {
+    return Some(GitColor{ kind: kind, value: value, red: 0, green: 0, blue: 0 })
+}
+
+/// A C `strtol` reading of the whole word in base 10, or `None` if any of
+/// it is left over. Saturates as `strtol` does.
+fn whole_number(word: str) -> Option[i64] {
+    var body = word
+    var negative = false
+    if body.starts_with("+") or body.starts_with("-") {
+        negative = body.starts_with("-")
+        body = body.substr(1, body.len())
+    }
+    if body.len() == 0 {
+        return None
+    }
+    var value = 0
+    for c in body.chars() {
+        let d = "0123456789".index_of(c) ?? -1
+        if d < 0 or c.len() != 1 {
+            return None
+        }
+        if value < 100000000000 {
+            value = value * 10 + d
+        }
+    }
+    return Some(if negative { 0 - value } else { value })
+}
+
+fn rgb(word: str) -> Option[GitColor] {
+    if not word.starts_with("#") or word.len() != word.to_bytes().len() {
+        return None
+    }
+    if word.len() == 7 {
+        let r = hex_pair(word, 1)
+        let g = hex_pair(word, 3)
+        let b = hex_pair(word, 5)
+        if r >= 0 and g >= 0 and b >= 0 {
+            return Some(GitColor{ kind: "rgb", value: 0, red: r, green: g,
+                blue: b })
+        }
+    }
+    if word.len() == 4 {
+        let r = hex_digit(word.substr(1, 1))
+        let g = hex_digit(word.substr(2, 1))
+        let b = hex_digit(word.substr(3, 1))
+        if r >= 0 and g >= 0 and b >= 0 {
+            return Some(GitColor{ kind: "rgb", value: 0, red: r * 17,
+                green: g * 17, blue: b * 17 })
+        }
+    }
+    return None
+}
+
+/// One word as a color, if it is one.
+pub fn parse_color(word: str) -> Option[GitColor] {
+    let lower = ascii_lower(word)
+    if lower == "normal" {
+        return plain("normal", 0)
+    }
+    if lower == "default" {
+        return plain("ansi", 39)
+    }
+    match rgb(word) {
+        Some(c) -> return Some(c)
+        None -> {}
+    }
+    var i = 0
+    while i < NAMES.len() {
+        if lower == NAMES[i] {
+            return plain("ansi", 30 + i)
+        }
+        if lower == "bright" + NAMES[i] {
+            return plain("ansi", 90 + i)
+        }
+        i = i + 1
+    }
+    let n = whole_number(word) ?? -2
+    if n == -1 {
+        return plain("normal", 0)
+    }
+    if n >= 0 and n < 8 {
+        return plain("ansi", 30 + n)
+    }
+    if n >= 8 and n < 16 {
+        return plain("ansi", 90 + n - 8)
+    }
+    if n >= 16 and n < 256 {
+        return plain("256", n)
+    }
+    return None
+}
+
+/// One word as an attribute: the SGR number it sets, or -1.
+pub fn parse_attribute(word: str) -> i64 {
+    var name = word
+    var negate = false
+    if name.starts_with("no") {
+        name = name.substr(2, name.len())
+        if name.starts_with("-") {
+            name = name.substr(1, name.len())
+        }
+        negate = true
+    }
+    let names = ["bold", "dim", "italic", "ul", "blink", "reverse", "strike"]
+    let on = [1, 2, 3, 4, 5, 7, 9]
+    let off = [22, 22, 23, 24, 25, 27, 29]
+    var i = 0
+    while i < names.len() {
+        if names[i] == name {
+            return if negate { off[i] } else { on[i] }
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+fn sgr(c: GitColor, background: bool) -> str {
+    let digit = if background { "4" } else { "3" }
+    if c.kind == "ansi" {
+        return "{c.value + (if background { 10 } else { 0 })}"
+    }
+    if c.kind == "256" {
+        return digit + "8;5;{c.value}"
+    }
+    return digit + "8;2;{c.red};{c.green};{c.blue}"
+}
+
+/// The escape sequence git writes for a color specification, or the empty
+/// string for one that sets nothing.
+pub fn escape(spec: str) -> str ! GitColorError {
+    var reset = false
+    var attributes: [bool] = []
+    var k = 0
+    while k < 30 {
+        attributes.push(false)
+        k = k + 1
+    }
+    var colors: [GitColor] = []
+    for word in words(spec) {
+        if ascii_lower(word) == "reset" {
+            reset = true
+            continue
+        }
+        match parse_color(word) {
+            Some(c) -> {
+                if colors.len() >= 2 {
+                    fail(GitColorInvalid(spec))
+                }
+                colors.push(c)
+                continue
+            }
+            None -> {}
+        }
+        let a = parse_attribute(word)
+        if a < 0 {
+            fail(GitColorInvalid(spec))
+        }
+        attributes[a] = true
+    }
+    var parts: [str] = []
+    if reset {
+        parts.push("")
+    }
+    var i = 0
+    while i < attributes.len() {
+        if attributes[i] {
+            parts.push("{i}")
+        }
+        i = i + 1
+    }
+    var c = 0
+    while c < colors.len() {
+        if colors[c].kind != "normal" {
+            parts.push(sgr(colors[c], c == 1))
+        }
+        c = c + 1
+    }
+    if parts.len() == 0 {
+        return ""
+    }
+    return "\u{1b}[" + parts.join(";") + "m"
+}
+
+/// Whether git accepts the specification.
+pub fn is_valid(spec: str) -> bool {
+    return match escape(spec) {
+        Ok(_e) -> true
+        Err(_e) -> false
+    }
+}
+
+/// `text` wrapped in the specification's escape and a reset, as git colors
+/// a span; unchanged when the specification sets nothing.
+pub fn paint(spec: str, text: str) -> str ! GitColorError {
+    let open = try escape(spec)
+    if open.len() == 0 {
+        return text
+    }
+    return open + text + "\u{1b}[m"
+}

@@ -9,6 +9,15 @@ migration note here; anything `experimental` may change in any release. See
 
 ### Added
 
+- **More of git without git.** `gitrefname` is `git check-ref-format`:
+  which names git accepts for a ref or a branch, with refspec patterns and
+  normalizing. `gitcolor` turns `color.*` settings into the escape codes git
+  writes. `shortlog` is `git shortlog` over a log's text, with `-s`, `-n`,
+  `-e`, `-c` and the `.mailmap`. `gitrawdiff` reads and writes `git diff
+  --raw`, quoted paths, renames, copies and the combined form of a merge,
+  with and without `-z`. `gitbundle` reads and writes bundle headers,
+  versions 2 and 3, SHA-1 and SHA-256, with filters. 31,154 cases against
+  git itself; `gitwirediff` is a gate.
 - **The formats Python writes its own data in.** `pyliteral` reads exactly
   what `ast.literal_eval` reads — every number notation, every string
   prefix and escape, containers, and the one sum that writes a complex
@@ -223,6 +232,21 @@ migration note here; anything `experimental` may change in any release. See
   are gates.
 
 ### Fixed
+
+- **`mailmap` did not map the way git does.** An entry that only fixes a
+  name replaced the commit's address with the entry's spelling of it, so
+  `Jane <JANE@X>` under `Jane Doe <jane@x>` became `jane@x` where git keeps
+  `JANE@X`; names were compared exactly where git ignores their case; two
+  lines for one address did not combine, where git takes the name from one
+  and the address from the other; a `#` anywhere started a comment, where
+  only one at the start of a line does; and addresses were trimmed. It is
+  now `read_mailmap_line`, `add_mapping` and `map_user` as git has them,
+  checked by 2,400 `git check-mailmap` cases over generated mailmaps as well
+  as the original 72. Found by `shortlog`'s differential.
+
+- **`grasm fmt` indented the doc comment of any declaration that followed a
+  sum type**, taking the indent of the last variant. A comment now takes the
+  indent of the code after it; the tree is reformatted.
 
 - **A write that ended at a reference-valued field went through the
   reference instead of replacing it, in the interpreter.** `node.next =

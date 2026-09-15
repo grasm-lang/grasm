@@ -31,9 +31,9 @@ One more is added, because this stretch leans on it:
 | | |
 |---|---|
 | At the close of the 600 plan | 600 |
-| Now | 623 |
+| Now | 629 |
 | Target | 650 |
-| Remaining | 27 |
+| Remaining | 21 |
 
 The count is directories under `packages/` that are not `*-demo`. Test
 harnesses are counted.
@@ -62,14 +62,16 @@ harnesses are counted.
   has — and `prettyrepr` took its place. Two defects found on the way, both
   outside this batch: the interpreter's write through a reference-valued
   field, and `shortestfloat` at powers of two.
+- [x] **More of git** — `gitrefname` `gitcolor` `shortlog` `gitrawdiff`
+  `gitbundle`, and the harness `gitwiretest`. 31,154 cases against git
+  itself: `check-ref-format`, `config --get-color`, `check-mailmap`,
+  `shortlog`, `diff --raw` over generated repositories and `bundle
+  create`/`list-heads`. `mailmap` was rewritten on the way to match git.
 
 ### Next
 
 Each line has an implementation to be checked against on this machine.
 
-- **More of git** — `gitrefname` (`git check-ref-format`), `gitbundle` (`git
-  bundle list-heads`), `gitcolor` (`git config --get-color`), `gitrawdiff`
-  (`git diff --raw`), `shortlog` (`git shortlog`)
 - **Unix tools** — `posixcksum` (`cksum`, `sum`), `sshcert` (`ssh-keygen
   -L`), `opensslenc` (`openssl enc`), `terminfo` (derived from `tic` itself)
 - **Other languages' formats** — `rubymarshal` (`ruby`), `perlpack` (`perl`),

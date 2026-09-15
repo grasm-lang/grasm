@@ -1,0 +1,10 @@
+[package]
+name = "shortlog"
+version = "1.0.0"
+
+# Reads the log it is given. Opens nothing.
+capabilities = []
+
+[dependencies.mailmap]
+path = "../mailmap"
+version = "^1.0.0"

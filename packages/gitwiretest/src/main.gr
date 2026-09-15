@@ -1,0 +1,116 @@
+import gitrefname
+import gitcolor
+import shortlog
+import gitrawdiff
+import gitbundle
+import mailmap
+
+fn from_hex_bytes(text: str) -> bytes {
+    var out: [i64] = []
+    var i = 1
+    while i + 1 < text.len() {
+        out.push(text.substr(i, 2).parse_int_base(16) ?? 0)
+        i = i + 2
+    }
+    return bytes_of(out)
+}
+
+fn hex(raw: bytes) -> str {
+    let digits = "0123456789abcdef"
+    var out = ""
+    var i = 0
+    while i < raw.len() {
+        out = out + digits.substr(raw.at(i) / 16, 1) +
+        digits.substr(raw.at(i) % 16, 1)
+        i = i + 1
+    }
+    return out
+}
+
+fn th(text: str) -> str {
+    return hex(text.to_bytes())
+}
+
+fn canonical(entries: [RawDiffEntry]) -> str {
+    var lines: [str] = []
+    for e in entries {
+        lines.push(e.src_modes.join(",") + " " + e.dst_mode + " " +
+            e.src_ids.join(",") + " " + e.dst_id + " " + e.status + " " +
+            "{e.score}" + "\u{2}" + e.path + "\u{2}" + e.new_path)
+    }
+    return lines.join("\u{1}")
+}
+
+fn run_raw(what: str, a: str, raw: bytes) -> str {
+    if what == "rawz" {
+        return th(match gitrawdiff.parse_z(raw) {
+            Ok(entries) -> canonical(entries)
+            Err(_e) -> "?"
+        })
+    }
+    return th(match gitrawdiff.parse(a) {
+        Ok(entries) -> if what == "rawp" { canonical(entries) } else {
+            gitrawdiff.render(entries) }
+        Err(_e) -> "?"
+    })
+}
+
+fn run_bundle(what: str, raw: bytes) -> str {
+    match gitbundle.parse_header(raw) {
+        Ok(b) -> {
+            if what == "bndw" {
+                return hex(gitbundle.render_header(b))
+            }
+            if what == "bnlh" {
+                return th(gitbundle.list_heads(b, []).join("\u{1}"))
+            }
+            var prereqs: [str] = []
+            for p in b.prerequisites {
+                prereqs.push(p.id + " " + p.comment)
+            }
+            return th("{b.version}\u{2}" + b.object_format + "\u{2}" + b.filter +
+                "\u{2}" + prereqs.join("\u{1}") + "\u{2}" +
+                gitbundle.list_heads(b, []).join("\u{1}") + "\u{2}" +
+                "{b.pack_offset}")
+        }
+        Err(_e) -> return th("?")
+    }
+}
+
+fn run_shortlog(log: str, spec: str) -> str {
+    let parts = spec.split("\u{2}")
+    let flags = parts[1]
+    let options = ShortlogOptions{ summary: flags.contains("s"),
+        numbered: flags.contains("n"), email: flags.contains("e"),
+        committer: flags.contains("c") }
+    return th(shortlog.shortlog(log, parts[0], options))
+}
+
+// Every command is `<name> <hex argument> <hex argument>`, three words.
+fn main() / {io} {
+    var i = 0
+    while i + 2 < args().len() {
+        let what = args()[i]
+        let raw = from_hex_bytes(args()[i + 1])
+        let a = raw.to_str()
+        let b = from_hex_bytes(args()[i + 2]).to_str()
+        if what == "rfn" {
+            let options = RefNameOptions{ allow_onelevel: b.contains("o"),
+                refspec_pattern: b.contains("p"), normalize: b.contains("n") }
+            print(th(gitrefname.check(a, options) ?? "\u{0}?"))
+        } else if what == "rbr" {
+            print(if gitrefname.is_valid_branch(a) { "yes" } else { "no" })
+        } else if what == "gcol" {
+            print(th(gitcolor.escape(a) ?? "?"))
+        } else if what == "mmap" {
+            print(th(mailmap.resolve_line(mailmap.parse(a), b)))
+        } else if what == "slog" {
+            print(run_shortlog(a, b))
+        } else if what.starts_with("raw") {
+            print(run_raw(what, a, raw))
+        } else {
+            print(run_bundle(what, raw))
+        }
+        i = i + 3
+    }
+}
