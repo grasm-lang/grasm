@@ -1,0 +1,462 @@
+// Dates in mail headers, read the forgiving way mail software reads them.
+//
+// RFC 5322 specifies `Fri, 09 Nov 2001 01:08:47 -0800` and almost every
+// program writes it. What arrives is looser: the day name missing or glued
+// to the comma, two-digit years, the month before the day, `EST` instead of
+// an offset, dots between the time's fields, the RFC 850 form
+// `Friday, 09-Nov-01`. A strict parser refuses real mail; this reads what
+// Python's `email.utils.parsedate_tz` reads, ported from its source, because
+// that is the reading most archives, spam filters and mail tools share.
+//
+// Two things about the result are easy to lose:
+//
+// - **`-0000` is not `+0000`.** The first says the writer did not know its
+//   zone and the time is UTC only nominally; the second says the writer was
+//   in UTC. `parse` keeps that difference as a missing zone, the same as a
+//   zone it does not recognise, and `zone_or_utc` is the reading
+//   `parsedate_tz` returns, which collapses both to zero.
+// - **The fields are not checked.** `31 Feb 2001 25:99:00` parses, as it does
+//   in Python, because the parser's job is to find the fields. `validate`
+//   is the check `parsedate_to_datetime` makes when it builds a datetime from
+//   them, and `timestamp` does the arithmetic `calendar.timegm` does, which
+//   lets an hour of 25 carry into the next day.
+//
+// Writing goes the other way: `format` is `email.utils.formatdate`, `-0000`
+// for UTC unless the header is for HTTP, where it must say `GMT`, and
+// `format_at` writes the local time and offset of a given zone.
+//
+// Numbers are read as Python's `int` reads them — a sign, and single
+// underscores between digits — except that a number of more than twelve
+// significant digits is refused, where Python carries it, so that no
+// arithmetic on the fields can overflow. No date has such a field.
+//
+// Checked against `email.utils.parsedate_tz`, `parsedate_to_datetime`,
+// `mktime_tz`, `formatdate` and `format_datetime`.
+
+type Rfc2822Date = {
+    year: i64,
+    month: i64,
+    day: i64,
+    hour: i64,
+    minute: i64,
+    second: i64,
+    zone: Option[i64],
+}
+
+type Rfc2822Error =
+    | Rfc2822Unreadable(text: str)
+    | Rfc2822OutOfRange(what: str)
+
+let MONTHS = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep",
+    "oct", "nov", "dec", "january", "february", "march", "april", "may",
+    "june", "july", "august", "september", "october", "november", "december"]
+
+let DAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+
+let ZONE_NAMES = ["UT", "UTC", "GMT", "Z", "AST", "ADT", "EST", "EDT", "CST",
+    "CDT", "MST", "MDT", "PST", "PDT"]
+
+let ZONE_VALUES = [0, 0, 0, 0, -400, -300, -500, -400, -600, -500, -700, -600,
+    -800, -700]
+
+fn is_space(code: i64) -> bool {
+    if code == 32 or (code >= 9 and code <= 13) or
+    (code >= 28 and code <= 31) {
+        return true
+    }
+    return code == 133 or code == 160 or code == 5760 or
+    (code >= 8192 and code <= 8202) or code == 8232 or code == 8233 or
+    code == 8239 or code == 8287 or code == 12288
+}
+
+/// `text.split()`: runs of whitespace, no empty words.
+fn py_words(text: str) -> [str] {
+    var out: [str] = []
+    var start = -1
+    var i = 0
+    let codes = text.codes()
+    while i < codes.len() {
+        if is_space(codes[i]) {
+            if start >= 0 {
+                out.push(text.substr(start, i - start))
+                start = -1
+            }
+        } else if start < 0 {
+            start = i
+        }
+        i = i + 1
+    }
+    if start >= 0 {
+        out.push(text.substr(start, codes.len() - start))
+    }
+    return out
+}
+
+fn last_of(text: str) -> str {
+    return text.substr(text.len() - 1, 1)
+}
+
+fn position(list: [str], item: str) -> i64 {
+    var i = 0
+    while i < list.len() {
+        if list[i] == item {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+fn find_from_end(text: str, what: str) -> i64 {
+    var i = text.len() - 1
+    while i >= 0 {
+        if text.substr(i, 1) == what {
+            return i
+        }
+        i = i - 1
+    }
+    return -1
+}
+
+/// Python's `int(text)` for ASCII digits: surrounding whitespace, a sign,
+/// and underscores only singly between digits.
+pub fn py_int(text: str) -> Option[i64] {
+    let codes = text.codes()
+    var start = 0
+    var end = codes.len()
+    while start < end and is_space(codes[start]) {
+        start = start + 1
+    }
+    while end > start and is_space(codes[end - 1]) {
+        end = end - 1
+    }
+    var negative = false
+    if start < end and (codes[start] == 43 or codes[start] == 45) {
+        negative = codes[start] == 45
+        start = start + 1
+    }
+    if start >= end {
+        return None
+    }
+    var value = 0
+    var digits = 0
+    var i = start
+    while i < end {
+        let c = codes[i]
+        if c >= 48 and c <= 57 {
+            if value > 0 or c != 48 {
+                digits = digits + 1
+            }
+            if digits > 12 {
+                return None
+            }
+            value = value * 10 + (c - 48)
+        } else if c == 95 {
+            let next_is_digit = i + 1 < end and codes[i + 1] >= 48 and
+            codes[i + 1] <= 57
+            if i == start or not next_is_digit {
+                return None
+            }
+        } else {
+            return None
+        }
+        i = i + 1
+    }
+    return Some(if negative { 0 - value } else { value })
+}
+
+fn starts_with_digit(text: str) -> bool {
+    let c = text.code_at(0)
+    return c >= 48 and c <= 57
+}
+
+/// The day, month, year, time and zone words, after the day name is taken
+/// off and the two layouts that are not five words are rearranged.
+fn five_words(text: str) -> [str] ! Rfc2822Error {
+    var data = py_words(text)
+    if data.len() == 0 {
+        fail(Rfc2822Unreadable(text))
+    }
+    if data[0].ends_with(",") or position(DAYS, data[0].to_lower()) >= 0 {
+        data = data.slice(1, data.len())
+    } else {
+        let comma = find_from_end(data[0], ",")
+        if comma >= 0 {
+            data[0] = data[0].substr(comma + 1, data[0].len())
+        }
+    }
+    if data.len() == 3 {
+        let stuff = data[0].split("-")
+        if stuff.len() == 3 {
+            data = stuff + data.slice(1, data.len())
+        }
+    }
+    if data.len() == 4 {
+        let s = data[3]
+        var cut = s.index_of("+") ?? -1
+        if cut == -1 {
+            cut = s.index_of("-") ?? -1
+        }
+        if cut > 0 {
+            data = data.slice(0, 3) + [s.substr(0, cut), s.substr(cut,
+                s.len())]
+        } else {
+            data.push("")
+        }
+    }
+    if data.len() < 5 {
+        fail(Rfc2822Unreadable(text))
+    }
+    return data.slice(0, 5)
+}
+
+/// The hour, minute and second words of a time.
+fn clock_words(tm: str) -> [str] ! Rfc2822Error {
+    let parts = tm.split(":")
+    if parts.len() == 2 {
+        return [parts[0], parts[1], "0"]
+    }
+    if parts.len() == 3 {
+        return parts
+    }
+    if parts.len() == 1 and tm.contains(".") {
+        let dotted = tm.split(".")
+        if dotted.len() == 2 {
+            return [dotted[0], dotted[1], "0"]
+        }
+        if dotted.len() == 3 {
+            return dotted
+        }
+    }
+    fail(Rfc2822Unreadable(tm))
+}
+
+fn number(word: str) -> i64 ! Rfc2822Error {
+    match py_int(word) {
+        Some(v) -> return v
+        None -> fail(Rfc2822Unreadable(word))
+    }
+}
+
+/// A zone word as seconds east of UTC, or `None` for `-0000`, an empty
+/// zone, and a zone that is not a number or a known name.
+fn zone_seconds(word: str) -> Option[i64] {
+    let tz = word.to_upper()
+    var offset = 0
+    let named = position(ZONE_NAMES, tz)
+    if named >= 0 {
+        offset = ZONE_VALUES[named]
+    } else {
+        match py_int(tz) {
+            Some(v) -> offset = v
+            None -> return None
+        }
+        if offset == 0 and tz.starts_with("-") {
+            return None
+        }
+    }
+    let magnitude = if offset < 0 { 0 - offset } else { offset }
+    let seconds = (magnitude / 100) * 3600 + (magnitude % 100) * 60
+    return Some(if offset < 0 { 0 - seconds } else { seconds })
+}
+
+/// A date header's fields, as `email.utils._parsedate_tz` finds them.
+pub fn parse(text: str) -> Option[Rfc2822Date] {
+    match read(text) {
+        Ok(date) -> return Some(date)
+        Err(_e) -> return None
+    }
+}
+
+fn read(text: str) -> Rfc2822Date ! Rfc2822Error {
+    let data = try five_words(text)
+    var dd = data[0]
+    var mm = data[1].to_lower()
+    var yy = data[2]
+    var tm = data[3]
+    var tz = data[4]
+    if dd.len() == 0 or mm.len() == 0 or yy.len() == 0 {
+        fail(Rfc2822Unreadable(text))
+    }
+    var month = position(MONTHS, mm)
+    if month < 0 {
+        let swapped = dd.to_lower()
+        dd = mm
+        mm = swapped
+        month = position(MONTHS, mm)
+        if month < 0 {
+            fail(Rfc2822Unreadable(text))
+        }
+    }
+    month = month % 12 + 1
+    if last_of(dd) == "," {
+        dd = dd.substr(0, dd.len() - 1)
+    }
+    if (yy.index_of(":") ?? -1) > 0 {
+        let held = yy
+        yy = tm
+        tm = held
+    }
+    if last_of(yy) == "," {
+        yy = yy.substr(0, yy.len() - 1)
+        if yy.len() == 0 {
+            fail(Rfc2822Unreadable(text))
+        }
+    }
+    if not starts_with_digit(yy) {
+        let held = yy
+        yy = tz
+        tz = held
+    }
+    if last_of(tm) == "," {
+        tm = tm.substr(0, tm.len() - 1)
+    }
+    let clock = try clock_words(tm)
+    var year = try number(yy)
+    let day = try number(dd)
+    let hour = try number(clock[0])
+    let minute = try number(clock[1])
+    let second = try number(clock[2])
+    if year < 100 {
+        year = if year > 68 { year + 1900 } else { year + 2000 }
+    }
+    return Rfc2822Date{ year: year, month: month, day: day, hour: hour,
+        minute: minute, second: second, zone: zone_seconds(tz) }
+}
+
+/// The zone, with "unknown" read as UTC — what `parsedate_tz` returns.
+pub fn zone_or_utc(date: Rfc2822Date) -> i64 {
+    return date.zone ?? 0
+}
+
+fn is_leap(year: i64) -> bool {
+    return (year % 4 == 0 and year % 100 != 0) or year % 400 == 0
+}
+
+fn month_length(year: i64, month: i64) -> i64 {
+    let lengths = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    if month == 2 and is_leap(year) {
+        return 29
+    }
+    return lengths[month - 1]
+}
+
+fn floor_div(a: i64, b: i64) -> i64 {
+    let q = a / b
+    if (a % b != 0) and ((a < 0) != (b < 0)) {
+        return q - 1
+    }
+    return q
+}
+
+/// Days from 1970-01-01 to a date in the proleptic Gregorian calendar.
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year }
+    let era = floor_div(y, 400)
+    let yoe = y - era * 400
+    let shifted = if month > 2 { month - 3 } else { month + 9 }
+    let doy = (153 * shifted + 2) / 5 + day - 1
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy
+    return era * 146097 + doe - 719468
+}
+
+/// Seconds since the epoch, as `email.utils.mktime_tz(parsedate_tz(text))`
+/// computes them: fields past their range carry, an unknown zone is UTC.
+pub fn timestamp(date: Rfc2822Date) -> i64 ! Rfc2822Error {
+    if date.year < 1 or date.year > 9999 {
+        fail(Rfc2822OutOfRange("year {date.year}"))
+    }
+    let days = days_from_civil(date.year, date.month, 1) + date.day - 1
+    let seconds = ((days * 24 + date.hour) * 60 + date.minute) * 60 +
+    date.second
+    return seconds - zone_or_utc(date)
+}
+
+/// The fields refused where `email.utils.parsedate_to_datetime` refuses
+/// them: out of their calendar ranges, or a zone a day or more from UTC.
+pub fn validate(date: Rfc2822Date) -> Rfc2822Date ! Rfc2822Error {
+    if date.year < 1 or date.year > 9999 {
+        fail(Rfc2822OutOfRange("year"))
+    }
+    if date.day < 1 or date.day > month_length(date.year, date.month) {
+        fail(Rfc2822OutOfRange("day"))
+    }
+    if date.hour < 0 or date.hour > 23 {
+        fail(Rfc2822OutOfRange("hour"))
+    }
+    if date.minute < 0 or date.minute > 59 {
+        fail(Rfc2822OutOfRange("minute"))
+    }
+    if date.second < 0 or date.second > 59 {
+        fail(Rfc2822OutOfRange("second"))
+    }
+    let zone = zone_or_utc(date)
+    if zone <= -86400 or zone >= 86400 {
+        fail(Rfc2822OutOfRange("zone"))
+    }
+    return date
+}
+
+/// The date in `text` checked as a real moment.
+pub fn parse_checked(text: str) -> Rfc2822Date ! Rfc2822Error {
+    match parse(text) {
+        Some(date) -> return try validate(date)
+        None -> fail(Rfc2822Unreadable(text))
+    }
+}
+
+fn two(n: i64) -> str {
+    return "{n}".pad_start(2, "0")
+}
+
+fn civil_text(local: i64) -> str ! Rfc2822Error {
+    if local < -62135596800 or local > 253402300799 {
+        fail(Rfc2822OutOfRange("time {local}"))
+    }
+    let days = floor_div(local, 86400)
+    let rest = local - days * 86400
+    let z = days + 719468
+    let era = floor_div(z, 146097)
+    let doe = z - era * 146097
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100)
+    let mp = (5 * doy + 2) / 153
+    let day = doy - (153 * mp + 2) / 5 + 1
+    let month = if mp < 10 { mp + 3 } else { mp - 9 }
+    let year = yoe + era * 400 + (if month <= 2 { 1 } else { 0 })
+    let names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    let months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug",
+        "Sep", "Oct", "Nov", "Dec"]
+    let weekday = names[((days + 3) % 7 + 7) % 7]
+    return "{weekday}, {two(day)} {months[month - 1]} " +
+    "{"{year}".pad_start(4, "0")} {two(rest / 3600)}:" +
+    "{two(rest / 60 % 60)}:{two(rest % 60)}"
+}
+
+/// `email.utils.formatdate(seconds)`: UTC, written `-0000` because the
+/// header does not know the writer's zone — or `GMT` when `for_http`,
+/// which HTTP requires.
+pub fn format(seconds: i64, for_http: bool) -> str ! Rfc2822Error {
+    let text = try civil_text(seconds)
+    return text + (if for_http { " GMT" } else { " -0000" })
+}
+
+/// The local time and offset of a zone `offset` seconds east of UTC, as
+/// `email.utils.format_datetime` writes an aware datetime. An offset with
+/// seconds in it is written with them, as Python's `%z` does.
+pub fn format_at(seconds: i64, offset: i64) -> str ! Rfc2822Error {
+    if offset <= -86400 or offset >= 86400 {
+        fail(Rfc2822OutOfRange("zone"))
+    }
+    // Python finds the UTC moment first and only then moves it into the
+    // zone, so both have to be representable.
+    let _utc = try civil_text(seconds)
+    let text = try civil_text(seconds + offset)
+    let sign = if offset < 0 { "-" } else { "+" }
+    let size = if offset < 0 { 0 - offset } else { offset }
+    var zone = "{sign}{two(size / 3600)}{two(size / 60 % 60)}"
+    if size % 60 != 0 {
+        zone = zone + two(size % 60)
+    }
+    return text + " " + zone
+}

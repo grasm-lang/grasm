@@ -1,0 +1,6 @@
+[package]
+name = "maildir"
+version = "1.0.0"
+
+# File names and flags. Opens nothing; the caller does the renames.
+capabilities = []

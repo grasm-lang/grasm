@@ -1,0 +1,6 @@
+[package]
+name = "ftpwire"
+version = "1.0.0"
+
+# Control-connection text. Opens nothing.
+capabilities = []

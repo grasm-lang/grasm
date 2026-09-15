@@ -1,0 +1,278 @@
+import inetaton
+import netdb
+import rfc2822date
+import maildir
+import ftpwire
+
+fn from_hex(text: str) -> str {
+    var out: [i64] = []
+    var i = 1
+    while i + 1 < text.len() {
+        out.push(text.substr(i, 2).parse_int_base(16) ?? 0)
+        i = i + 2
+    }
+    return bytes_of(out).to_str()
+}
+
+fn hex(raw: bytes) -> str {
+    let digits = "0123456789abcdef"
+    var out = ""
+    var i = 0
+    while i < raw.len() {
+        out = out + digits.substr(raw.at(i) / 16, 1) +
+        digits.substr(raw.at(i) % 16, 1)
+        i = i + 1
+    }
+    return out
+}
+
+fn th(text: str) -> str {
+    return hex(text.to_bytes())
+}
+
+fn lines_of(text: str) -> [str] {
+    if text.len() == 0 {
+        return []
+    }
+    return text.split("\u{1}")
+}
+
+fn number(text: str) -> i64 {
+    return text.parse_int() ?? 0
+}
+
+fn run_inet(what: str, a: str) -> str {
+    if what == "aton" {
+        return hex(inetaton.aton(a) ?? "?".to_bytes())
+    }
+    if what == "pton" {
+        return hex(inetaton.pton(a) ?? "?".to_bytes())
+    }
+    var values: [i64] = []
+    for part in lines_of(a) {
+        values.push(number(part))
+    }
+    return th(inetaton.ntoa(bytes_of(values)) ?? "?")
+}
+
+fn describe_date(d: Rfc2822Date) -> str {
+    let zone = match d.zone {
+        Some(z) -> "{z}"
+        None -> "none"
+    }
+    return "{d.year},{d.month},{d.day},{d.hour},{d.minute},{d.second},{zone}"
+}
+
+fn run_date(what: str, a: str, b: str) -> str {
+    if what == "dparse" {
+        match rfc2822date.parse(a) {
+            Some(d) -> return describe_date(d)
+            None -> return "?"
+        }
+    }
+    if what == "dstamp" {
+        match rfc2822date.parse(a) {
+            Some(d) -> return match rfc2822date.timestamp(d) {
+                Ok(t) -> "{t}"
+                Err(_e) -> "?"
+            }
+            None -> return "?"
+        }
+    }
+    if what == "dcheck" {
+        return match rfc2822date.parse_checked(a) {
+            Ok(_d) -> "ok"
+            Err(_e) -> "no"
+        }
+    }
+    if what == "dfmt" {
+        return th(rfc2822date.format(number(a), b == "gmt") ?? "?")
+    }
+    return th(rfc2822date.format_at(number(a), number(b)) ?? "?")
+}
+
+fn run_maildir(what: str, a: str, b: str) -> str {
+    if what == "mkey" {
+        return th(maildir.key_of(a, b))
+    }
+    if what == "minfo" {
+        return th(maildir.info_of(a, b))
+    }
+    if what == "mset" {
+        return th(maildir.set_flags(a))
+    }
+    if what == "madd" {
+        return th(maildir.add_flag(a, b))
+    }
+    if what == "mrem" {
+        return th(maildir.remove_flag(a, b))
+    }
+    if what == "mtombox" {
+        let m = maildir.to_mbox(a, b)
+        let present = if m.has_headers { "yes" } else { "no" }
+        return th(m.status + "\u{1}" + m.x_status + "\u{1}" + present)
+    }
+    if what == "mfrommbox" {
+        let p = maildir.from_mbox(a, b)
+        return th(p.subdir + "\u{1}" + p.info)
+    }
+    if what == "mtomh" {
+        return th(maildir.to_mh(a).join(","))
+    }
+    if what == "mfrommh" {
+        let p = maildir.from_mh(lines_of(a))
+        return th(p.subdir + "\u{1}" + p.info)
+    }
+    if what == "mtobabyl" {
+        return th(maildir.to_babyl(a).join(","))
+    }
+    if what == "mfrom" {
+        return th(maildir.from_line(number(a)))
+    }
+    if what == "muniq" {
+        let n = a.split(",")
+        return th(maildir.unique_name(number(n[0]), number(n[1]),
+            number(n[2]), number(n[3]), b))
+    }
+    var subdirs: [str] = []
+    var names: [str] = []
+    for entry in lines_of(a) {
+        let cut = entry.index_of("/") ?? 0
+        subdirs.push(entry.substr(0, cut))
+        names.push(entry.substr(cut + 1, entry.len()))
+    }
+    var parts: [str] = []
+    for pair in maildir.table(subdirs, names, b) {
+        parts.push(pair.0 + "=" + pair.1)
+    }
+    return th(parts.join("\u{1}"))
+}
+
+fn endpoint(e: FtpEndpoint) -> str {
+    return e.host + "\u{1}" + "{e.port}"
+}
+
+fn optional(value: Option[i64] ! FtpError) -> str {
+    return match value {
+        Ok(v) -> match v {
+            Some(n) -> "{n}"
+            None -> "none"
+        }
+        Err(_e) -> "?"
+    }
+}
+
+fn run_ftp_replies(what: str, a: str, b: str) -> str {
+    if what == "flines" {
+        return th(match ftpwire.lines_of(a) {
+            Ok(lines) -> lines.join("\u{1}")
+            Err(_e) -> "?"
+        })
+    }
+    if what == "freply" {
+        return th(match ftpwire.read_reply(lines_of(a), number(b)) {
+            Ok(r) -> r.text + "\u{2}" + "{r.next}"
+            Err(_e) -> "?"
+        })
+    }
+    if what == "fclass" {
+        return ftpwire.classify(a)
+    }
+    if what == "f150" {
+        return optional(ftpwire.parse150(a))
+    }
+    if what == "f213" {
+        return optional(ftpwire.parse213(a))
+    }
+    if what == "f227" {
+        return th(match ftpwire.parse227(a) {
+            Ok(e) -> endpoint(e)
+            Err(_e) -> "?"
+        })
+    }
+    if what == "f229" {
+        return th(match ftpwire.parse229(a, b) {
+            Ok(e) -> endpoint(e)
+            Err(_e) -> "?"
+        })
+    }
+    return th(ftpwire.parse257(a) ?? "?")
+}
+
+fn run_ftp_commands(what: str, a: str, b: str) -> str {
+    if what == "fmlsd" {
+        let listing = ftpwire.parse_mlsd(a)
+        var facts: [str] = []
+        for fact in listing.facts {
+            facts.push(fact.0 + "=" + fact.1)
+        }
+        return th(listing.name + "\u{2}" + facts.join("\u{1}"))
+    }
+    if what == "fport" {
+        return th(ftpwire.port_command(a, number(b)))
+    }
+    if what == "feprt" {
+        let n = b.split(",")
+        return th(ftpwire.eprt_command(number(n[0]), a, number(n[1])))
+    }
+    if what == "fcmd" {
+        return th(ftpwire.command_line(a) ?? "?")
+    }
+    return th(ftpwire.mask_password(a))
+}
+
+fn run_netdb(what: str, a: str, b: str, services: NetdbServices,
+    protocols: [NetdbProtocol]) -> str {
+    if what == "svcname" {
+        return match netdb.service_by_name(services, a, b) {
+            Some(e) -> "{e.port}"
+            None -> "?"
+        }
+    }
+    if what == "svcport" {
+        return th(match netdb.service_by_port(services, number(a), b) {
+            Some(e) -> e.name
+            None -> "?"
+        })
+    }
+    return match netdb.protocol_by_name(protocols, a) {
+        Some(p) -> "{p.number}"
+        None -> "?"
+    }
+}
+
+// Every command is `<name> <hex argument> <hex argument>`, three words.
+fn main() / {io} {
+    var services = netdb.load_services("")
+    var protocols: [NetdbProtocol] = []
+    var loaded = false
+    var i = 0
+    while i + 2 < args().len() {
+        let what = args()[i]
+        let a = from_hex(args()[i + 1])
+        let b = from_hex(args()[i + 2])
+        let family = what.substr(0, 1)
+        if what == "aton" or what == "pton" or what == "ntoa" {
+            print(run_inet(what, a))
+        } else if family == "d" {
+            print(run_date(what, a, b))
+        } else if family == "m" {
+            print(run_maildir(what, a, b))
+        } else if what == "fmlsd" or what == "fport" or what == "feprt" or
+        what == "fcmd" or what == "fmask" {
+            print(run_ftp_commands(what, a, b))
+        } else if family == "f" {
+            print(run_ftp_replies(what, a, b))
+        } else {
+            if not loaded {
+                services = netdb.load_services(read_file("/etc/services") ??
+                    "")
+                protocols = netdb.parse_protocols(read_file("/etc/protocols")
+                    ?? "")
+                loaded = true
+            }
+            print(run_netdb(what, a, b, services, protocols))
+        }
+        i = i + 3
+    }
+}

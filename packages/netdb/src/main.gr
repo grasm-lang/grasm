@@ -1,0 +1,213 @@
+// `/etc/services` and `/etc/protocols`: names for ports and protocol numbers.
+//
+// `getservbyname("http", "tcp")` is 80 because a line in `/etc/services`
+// says so, and every Unix program that accepts a service name where a port
+// is expected — `ssh -p`, `nc`, `iptables`, `inetd.conf`, `/etc/hosts.allow`
+// — reads that file. So does any program that prints a port the way `netstat`
+// and `lsof` do. This reads the same files the C library does and answers
+// the same lookups, without a C library.
+//
+// Lookups follow the order that the C library's answers depend on:
+//
+// - The **first** matching line wins. `compressnet` is listed on port 2 and
+//   again on port 3, and it is 2; port 512 is `exec` over TCP and `biff`
+//   over UDP, and asked for without a protocol it is whichever line came
+//   first.
+// - A name matches a line's name or any of its aliases, and names and
+//   protocols are compared exactly: `HTTP` is not `http`.
+// - Everything after `#` is a comment, and a line needs at least a name and
+//   a `port/protocol` to count. A line that begins with whitespace has its
+//   first word read as the name, so the unnamed reservations in the file
+//   are never found — which is also what the C library does.
+//
+// Checked against Python's `socket.getservbyname`, `getservbyport` and
+// `getprotobyname` on this machine's own files.
+
+type NetdbService = {
+    name: str,
+    port: i64,
+    protocol: str,
+    aliases: [str],
+}
+
+type NetdbProtocol = {
+    name: str,
+    number: i64,
+    aliases: [str],
+}
+
+type NetdbServices = {
+    entries: [NetdbService],
+    by_name: Map[str, i64],
+    by_port: Map[str, i64],
+}
+
+fn words(line: str) -> [str] {
+    let cut = line.index_of("#") ?? line.len()
+    var out: [str] = []
+    var start = -1
+    let body = line.substr(0, cut)
+    let codes = body.codes()
+    var i = 0
+    while i <= codes.len() {
+        let blank = i == codes.len() or codes[i] == 32 or codes[i] == 9 or
+        codes[i] == 10 or codes[i] == 13
+        if blank {
+            if start >= 0 {
+                out.push(body.substr(start, i - start))
+                start = -1
+            }
+        } else if start < 0 {
+            start = i
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn all_digits(text: str) -> bool {
+    if text.len() == 0 {
+        return false
+    }
+    for c in text.codes() {
+        if c < 48 or c > 57 {
+            return false
+        }
+    }
+    return true
+}
+
+/// The entries of a services file, in file order.
+pub fn parse_services(text: str) -> [NetdbService] {
+    var out: [NetdbService] = []
+    for line in text.split("\n") {
+        let w = words(line)
+        if w.len() < 2 {
+            continue
+        }
+        let slash = w[1].index_of("/") ?? -1
+        if slash < 1 {
+            continue
+        }
+        let number = w[1].substr(0, slash)
+        if not all_digits(number) or number.len() > 5 {
+            continue
+        }
+        let port = number.parse_int() ?? 0
+        if port > 65535 {
+            continue
+        }
+        out.push(NetdbService{ name: w[0], port: port,
+            protocol: w[1].substr(slash + 1, w[1].len()),
+            aliases: w.slice(2, w.len()) })
+    }
+    return out
+}
+
+/// The entries indexed for lookup, keeping the first line for each key.
+pub fn index_services(entries: [NetdbService]) -> NetdbServices {
+    var by_name: Map[str, i64] = {}
+    var by_port: Map[str, i64] = {}
+    var i = 0
+    while i < entries.len() {
+        let e = entries[i]
+        let keys = ["{e.port}/{e.protocol}", "{e.port}/"]
+        for key in keys {
+            if not by_port.has(key) {
+                by_port.set(key, i)
+            }
+        }
+        for name in [e.name] + e.aliases {
+            for key in [name + "/" + e.protocol, name + "/"] {
+                if not by_name.has(key) {
+                    by_name.set(key, i)
+                }
+            }
+        }
+        i = i + 1
+    }
+    return NetdbServices{ entries: entries, by_name: by_name,
+        by_port: by_port }
+}
+
+/// A services file, parsed and indexed.
+pub fn load_services(text: str) -> NetdbServices {
+    return index_services(parse_services(text))
+}
+
+/// `getservbyname(name, protocol)`; an empty `protocol` matches any.
+pub fn service_by_name(db: NetdbServices, name: str,
+    protocol: str) -> Option[NetdbService] {
+    match db.by_name.get(name + "/" + protocol) {
+        Some(i) -> return Some(db.entries[i])
+        None -> return None
+    }
+}
+
+/// `getservbyport(port, protocol)`; an empty `protocol` matches any.
+pub fn service_by_port(db: NetdbServices, port: i64,
+    protocol: str) -> Option[NetdbService] {
+    match db.by_port.get("{port}/{protocol}") {
+        Some(i) -> return Some(db.entries[i])
+        None -> return None
+    }
+}
+
+/// A port given as a number or a service name, the way programs that accept
+/// either read it.
+pub fn resolve_port(db: NetdbServices, text: str,
+    protocol: str) -> Option[i64] {
+    if all_digits(text) and text.len() <= 5 {
+        let n = text.parse_int() ?? 65536
+        return if n <= 65535 { Some(n) } else { None }
+    }
+    match service_by_name(db, text, protocol) {
+        Some(e) -> return Some(e.port)
+        None -> return None
+    }
+}
+
+/// An entry as a services line.
+pub fn render_service(e: NetdbService) -> str {
+    var line = e.name.pad_end(16, " ") + " " + "{e.port}/{e.protocol}"
+    if e.aliases.len() > 0 {
+        line = line + " " + e.aliases.join(" ")
+    }
+    return line
+}
+
+/// The entries of a protocols file, in file order.
+pub fn parse_protocols(text: str) -> [NetdbProtocol] {
+    var out: [NetdbProtocol] = []
+    for line in text.split("\n") {
+        let w = words(line)
+        if w.len() < 2 or not all_digits(w[1]) or w[1].len() > 3 {
+            continue
+        }
+        out.push(NetdbProtocol{ name: w[0], number: w[1].parse_int() ?? 0,
+            aliases: w.slice(2, w.len()) })
+    }
+    return out
+}
+
+/// `getprotobyname(name)`, matching names and aliases, first line winning.
+pub fn protocol_by_name(entries: [NetdbProtocol],
+    name: str) -> Option[NetdbProtocol] {
+    for e in entries {
+        if e.name == name or e.aliases.contains(name) {
+            return Some(e)
+        }
+    }
+    return None
+}
+
+/// `getprotobynumber(number)`.
+pub fn protocol_by_number(entries: [NetdbProtocol],
+    number: i64) -> Option[NetdbProtocol] {
+    for e in entries {
+        if e.number == number {
+            return Some(e)
+        }
+    }
+    return None
+}

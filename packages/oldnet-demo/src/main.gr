@@ -1,0 +1,191 @@
+// The network as the C library and forty-year-old protocols describe it.
+import inetaton
+import netdb
+import rfc2822date
+import maildir
+import ftpwire
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn check_inetaton(inout f: i64) / {io} {
+    say(f, "127.1 is the loopback address",
+        inetaton.aton_value("127.1") == Some(2130706433))
+    say(f, "a leading zero makes a part octal",
+        inetaton.render(inetaton.aton_value("017.0.0.1") ?? 0) == "15.0.0.1")
+    say(f, "and 0x makes it hexadecimal",
+        inetaton.aton_value("0x7f.1") == Some(2130706433))
+    say(f, "text after a space is ignored",
+        inetaton.is_valid("1.2.3.4 trailing"))
+    say(f, "an octal part with an 8 in it is refused",
+        not inetaton.is_valid("08.1.1.1"))
+    say(f, "the strict reading refuses three parts",
+        inetaton.pton_value("127.0.1").is_none())
+    say(f, "and reads a leading zero as decimal",
+        inetaton.pton_value("010.0.0.1") == Some(167772161))
+    say(f, "four bytes print as a dotted quad",
+        (inetaton.ntoa(bytes_of([192, 168, 0, 1])) ?? "") == "192.168.0.1")
+}
+
+let SERVICES = "# comment line\n" + "compressnet       2/udp  # Management\n" +
+"compressnet       3/udp  # Compression\n" + "exec  512/tcp\n" +
+"comsat  512/udp biff # mail notification\n" +
+"http  80/tcp  www www-http  # World Wide Web\n" +
+"        24/udp     # any private mail system\n"
+
+fn check_netdb(inout f: i64) / {io} {
+    let db = netdb.load_services(SERVICES)
+    say(f, "an alias finds its line",
+        (netdb.resolve_port(db, "www", "tcp") ?? 0) == 80)
+    say(f, "the first line for a name wins",
+        (netdb.resolve_port(db, "compressnet", "") ?? 0) == 2)
+    say(f, "a port answers by protocol",
+        match netdb.service_by_port(db, 512, "udp") {
+            Some(e) -> e.name == "comsat"
+            None -> false
+    })
+    say(f, "and without one, by file order",
+        match netdb.service_by_port(db, 512, "") {
+            Some(e) -> e.name == "exec"
+            None -> false
+    })
+    say(f, "names are compared exactly",
+        netdb.service_by_name(db, "HTTP", "").is_none())
+    say(f, "words in a comment are not aliases",
+        netdb.service_by_name(db, "mail", "").is_none())
+    say(f, "an unnamed reservation is never found",
+        netdb.service_by_port(db, 24, "").is_none())
+    let protocols = netdb.parse_protocols("tcp\t6\tTCP\nudp\t17\tUDP\n")
+    say(f, "a protocol is found by its alias",
+        match netdb.protocol_by_name(protocols, "UDP") {
+            Some(p) -> p.number == 17
+            None -> false
+    })
+}
+
+fn check_rfc2822date(inout f: i64) / {io} {
+    let unknown = rfc2822date.parse("Fri, 09 Nov 2001 01:08:47 -0000")
+    say(f, "-0000 says the zone is unknown",
+        match unknown {
+            Some(d) -> d.zone.is_none() and d.year == 2001 and d.day == 9
+            None -> false
+    })
+    say(f, "and +0000 says it is UTC",
+        match rfc2822date.parse("Fri, 09 Nov 2001 01:08:47 +0000") {
+            Some(d) -> d.zone == Some(0)
+            None -> false
+    })
+    say(f, "a named American zone is an offset",
+        match rfc2822date.parse("Mon, 20 Nov 1995 19:12:08 EST") {
+            Some(d) -> d.zone == Some(-18000)
+            None -> false
+    })
+    say(f, "the RFC 850 form with a two-digit year is read",
+        match rfc2822date.parse("Friday, 09-Nov-01 01:08:47 GMT") {
+            Some(d) -> d.year == 2001 and d.month == 11
+            None -> false
+    })
+    say(f, "the moment is what mktime_tz computes",
+        match rfc2822date.parse("Mon, 20 Nov 1995 19:12:08 -0500") {
+            Some(d) -> (rfc2822date.timestamp(d) ?? 0) == 816912728
+            None -> false
+    })
+    say(f, "an impossible date parses but does not validate",
+        rfc2822date.parse("31 Feb 2001 25:99:00").is_some() and
+        match rfc2822date.parse_checked("31 Feb 2001 25:99:00") {
+            Ok(_d) -> false
+            Err(_e) -> true
+    })
+    say(f, "a header written for mail says -0000",
+        (rfc2822date.format(1004396927, false) ?? "") ==
+        "Mon, 29 Oct 2001 23:08:47 -0000")
+    say(f, "and for HTTP says GMT",
+        (rfc2822date.format(1004396927, true) ?? "").ends_with(" GMT"))
+    say(f, "a zone's local time is written with its offset",
+        (rfc2822date.format_at(0, 19800) ?? "") ==
+        "Thu, 01 Jan 1970 05:30:00 +0530")
+}
+
+fn check_maildir(inout f: i64) / {io} {
+    let name = "1700000000.M12P34Q5.host:2,S"
+    say(f, "the key stops at the first colon",
+        maildir.key_of(name, ":") == "1700000000.M12P34Q5.host")
+    say(f, "and the info starts after the last",
+        maildir.info_of(name, ":") == "2,S")
+    let replied = maildir.add_flag("2,S", "R")
+    say(f, "flags are kept in ASCII order", replied == "2,RS")
+    say(f, "setting flags outright keeps a repeat",
+        maildir.set_flags("SSR") == "2,RSS")
+    say(f, "removing from no flags leaves the info alone",
+        maildir.remove_flag("1,experimental", "S") == "1,experimental")
+    let mbox = maildir.to_mbox(replied, "cur")
+    say(f, "seen and old become mbox's Status",
+        mbox.status == "RO" and mbox.x_status == "A")
+    say(f, "and come back the same way",
+        maildir.from_mbox("RO", "A").info == "2,RS")
+    say(f, "an unseen message is in MH's unseen sequence",
+        maildir.to_mh("2,") == ["unseen"])
+    say(f, "a host name cannot put a slash in a file name",
+        maildir.unique_name(1, 2, 3, 4, "a/b").ends_with(".a\\057b"))
+    say(f, "the From line pads the day with a space",
+        maildir.from_line(0) == "MAILER-DAEMON Thu Jan  1 00:00:00 1970")
+}
+
+fn check_ftpwire(inout f: i64) / {io} {
+    let lines = ftpwire.lines_of("220-Welcome\r\n220-to\r\n221 not yet\r\n" +
+        "220 ready\r\n331 password\r\n") ?? []
+    let next = match ftpwire.read_reply(lines, 0) {
+        Ok(r) -> if r.text.ends_with("\n220 ready") { r.next } else { -1 }
+        Err(_e) -> -1
+    }
+    say(f, "a multi-line reply ends at its own code", next == 4)
+    say(f, "and the next reply starts after it",
+        match ftpwire.read_reply(lines, next) {
+            Ok(r) -> r.text == "331 password"
+            Err(_e) -> false
+    })
+    say(f, "passive mode finds six numbers",
+        match ftpwire.parse227("227 Entering Passive Mode (192,168,1,2,19,137)") {
+            Ok(e) -> e.host == "192.168.1.2" and e.port == 5001
+            Err(_e) -> false
+    })
+    say(f, "extended passive mode carries only a port",
+        match ftpwire.parse229("229 Extended (|||6446|)", "10.0.0.1") {
+            Ok(e) -> e.host == "10.0.0.1" and e.port == 6446
+            Err(_e) -> false
+    })
+    say(f, "a quoted directory name has its quotes undone",
+        (ftpwire.parse257("257 \"/a \"\"b\"\"\" created") ?? "") == "/a \"b\"")
+    say(f, "a transfer size is read from a 150 reply",
+        (ftpwire.parse150("150 Opening data connection (1234 bytes)") ??
+            None) == Some(1234))
+    say(f, "an MLSD line has lowercased facts",
+        ftpwire.parse_mlsd("Type=file;Size=12; notes.txt").facts[0] ==
+        ("type", "file"))
+    say(f, "a file name with a line break cannot become a command",
+        (ftpwire.command_line("RETR a\r\nDELE b") ?? "!") == "!")
+    say(f, "a password is masked for the log",
+        ftpwire.mask_password("PASS secret\r\n") == "PASS ******\r\n")
+}
+
+fn main() / {io} {
+    var f = 0
+
+    check_inetaton(f)
+    check_netdb(f)
+    check_rfc2822date(f)
+    check_maildir(f)
+    check_ftpwire(f)
+
+    if f == 0 {
+        print("oldnet: every claim held")
+    } else {
+        print("oldnet: {f} failed")
+    }
+}

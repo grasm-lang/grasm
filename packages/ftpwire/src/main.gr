@@ -1,0 +1,411 @@
+// The text of the FTP control connection, without the connection.
+//
+// FTP is still how a good deal of data moves between businesses — bank
+// statements, EDI, firmware drops, scientific archives — and what a client
+// has to get right is almost entirely text: which line ends a multi-line
+// reply, where the address is in a passive-mode reply, how a directory name
+// with a quote in it is quoted. This is that text, read the way Python's
+// `ftplib` reads it, because a client that disagrees with `ftplib` about a
+// server's reply disagrees with a great many scripts.
+//
+// - **Replies.** A reply whose fourth character is `-` continues until a line
+//   starting with the same three digits *not* followed by `-`. Lines in
+//   between may start with anything, including other codes. `read_reply`
+//   joins them with `\n` as `ftplib` does.
+// - **Passive mode.** A `227` reply's six numbers are found anywhere in the
+//   text, since servers disagree about the parentheses; the address they give
+//   is only a suggestion, which is why `ftplib` ignores it by default and
+//   connects to the control connection's peer instead. `229` carries only a
+//   port, between four copies of a delimiter the server chooses.
+// - **Directory names.** A `257` reply quotes the name and doubles any quote
+//   inside it, and a server that does not quote at all gets an empty name.
+// - **MLSD.** Each line is `fact=value;fact=value; name`, facts lowercased.
+//
+// Nothing here reads a socket. Lines go in and values come out, so the same
+// code serves a client, a proxy that rewrites passive replies, and a test
+// that replays a captured session.
+//
+// Checked against `ftplib`'s `parse150`, `parse227`, `parse229`, `parse257`,
+// `FTP.getline`, `getmultiline`, `getresp`, `mlsd`, `sendport`, `sendeprt`,
+// `putline` and `size`.
+
+type FtpError =
+    | FtpUnexpectedReply(reply: str)
+    | FtpMalformed(reply: str)
+    | FtpEndOfStream
+    | FtpLineTooLong(size: i64)
+    | FtpNewlineInCommand(command: str)
+
+type FtpReply = {
+    text: str,
+    next: i64,
+}
+
+type FtpEndpoint = {
+    host: str,
+    port: i64,
+}
+
+type FtpListing = {
+    name: str,
+    facts: [(str, str)],
+}
+
+let MAX_LINE = 8192
+
+fn is_space(code: i64) -> bool {
+    if code == 32 or (code >= 9 and code <= 13) or
+    (code >= 28 and code <= 31) {
+        return true
+    }
+    return code == 133 or code == 160 or code == 5760 or
+    (code >= 8192 and code <= 8202) or code == 8232 or code == 8233 or
+    code == 8239 or code == 8287 or code == 12288
+}
+
+fn is_digit(code: i64) -> bool {
+    return code >= 48 and code <= 57
+}
+
+/// Python's `int(text)` over ASCII digits, refusing more than eighteen
+/// significant digits.
+fn py_int(text: str) -> Option[i64] {
+    let codes = text.codes()
+    var start = 0
+    var end = codes.len()
+    while start < end and is_space(codes[start]) {
+        start = start + 1
+    }
+    while end > start and is_space(codes[end - 1]) {
+        end = end - 1
+    }
+    var negative = false
+    if start < end and (codes[start] == 43 or codes[start] == 45) {
+        negative = codes[start] == 45
+        start = start + 1
+    }
+    if start >= end {
+        return None
+    }
+    var value = 0
+    var digits = 0
+    var i = start
+    while i < end {
+        let c = codes[i]
+        if is_digit(c) {
+            if value > 0 or c != 48 {
+                digits = digits + 1
+            }
+            if digits > 18 {
+                return None
+            }
+            value = value * 10 + (c - 48)
+        } else if c != 95 or i == start or i + 1 >= end or
+        not is_digit(codes[i + 1]) {
+            return None
+        }
+        i = i + 1
+    }
+    return Some(if negative { 0 - value } else { value })
+}
+
+/// A stream's lines as `FTP.getline` returns them. `ftplib` reads the
+/// socket through a text wrapper in universal-newline mode, so `\r\n`, a
+/// lone `\r` and `\n` all end a line and none of them is returned. A line
+/// longer than 8192 characters, counting its end as one, is refused.
+pub fn lines_of(stream: str) -> [str] ! FtpError {
+    var out: [str] = []
+    let codes = stream.codes()
+    var start = 0
+    var i = 0
+    while i < codes.len() {
+        let c = codes[i]
+        if c == 10 or c == 13 {
+            if i - start + 1 > MAX_LINE {
+                fail(FtpLineTooLong(i - start + 1))
+            }
+            out.push(stream.substr(start, i - start))
+            if c == 13 and i + 1 < codes.len() and codes[i + 1] == 10 {
+                i = i + 1
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    if start < codes.len() {
+        if codes.len() - start > MAX_LINE {
+            fail(FtpLineTooLong(codes.len() - start))
+        }
+        out.push(stream.substr(start, codes.len() - start))
+    }
+    return out
+}
+
+/// The reply starting at `lines[at]`, a multi-line reply joined with `\n`,
+/// and the index of the line after it.
+pub fn read_reply(lines: [str], at: i64) -> FtpReply ! FtpError {
+    if at >= lines.len() {
+        fail(FtpEndOfStream)
+    }
+    var text = lines[at]
+    var next = at + 1
+    if text.substr(3, 1) == "-" {
+        let code = text.substr(0, 3)
+        while true {
+            if next >= lines.len() {
+                fail(FtpEndOfStream)
+            }
+            let line = lines[next]
+            next = next + 1
+            text = text + "\n" + line
+            if line.substr(0, 3) == code and line.substr(3, 1) != "-" {
+                break
+            }
+        }
+    }
+    return FtpReply{ text: text, next: next }
+}
+
+/// What `FTP.getresp` makes of a reply: `ok` for 1xx, 2xx and 3xx, `temp`
+/// for 4xx, `perm` for 5xx, and `proto` for anything else.
+pub fn classify(reply: str) -> str {
+    let c = reply.substr(0, 1)
+    if c == "1" or c == "2" or c == "3" {
+        return "ok"
+    }
+    if c == "4" {
+        return "temp"
+    }
+    if c == "5" {
+        return "perm"
+    }
+    return "proto"
+}
+
+fn expect(reply: str, code: str) -> () ! FtpError {
+    if reply.substr(0, 3) != code {
+        fail(FtpUnexpectedReply(reply))
+    }
+}
+
+/// The transfer size a `150` reply announces as `(N bytes)`, if it does.
+/// Only the first line is looked at, and the last such group on it wins.
+pub fn parse150(reply: str) -> Option[i64] ! FtpError {
+    try expect(reply, "150")
+    if reply.substr(3, 1) != " " {
+        return None
+    }
+    let line = reply.substr(0, reply.index_of("\n") ?? reply.len())
+    let codes = line.codes()
+    var p = codes.len() - 2
+    while p >= 4 {
+        if codes[p] == 32 and codes[p + 1] == 40 {
+            var q = p + 2
+            while q < codes.len() and is_digit(codes[q]) {
+                q = q + 1
+            }
+            let tail = line.substr(q, 7).to_lower()
+            if q > p + 2 and tail == " bytes)" {
+                return py_int(line.substr(p + 2, q - p - 2))
+            }
+        }
+        p = p - 1
+    }
+    return None
+}
+
+fn digit_run_end(codes: [i64], from: i64) -> i64 {
+    var i = from
+    while i < codes.len() and is_digit(codes[i]) {
+        i = i + 1
+    }
+    return i
+}
+
+/// The address and port in a `227` reply to `PASV`: the first six
+/// comma-separated numbers anywhere in it. The address is written as the
+/// server wrote its numbers, leading zeros and all.
+pub fn parse227(reply: str) -> FtpEndpoint ! FtpError {
+    try expect(reply, "227")
+    let codes = reply.codes()
+    var start = 0
+    while start < codes.len() {
+        if is_digit(codes[start]) and (start == 0 or
+            not is_digit(codes[start - 1])) {
+            var groups: [str] = []
+            var at = start
+            while groups.len() < 6 {
+                let end = digit_run_end(codes, at)
+                if end == at {
+                    break
+                }
+                groups.push(reply.substr(at, end - at))
+                if groups.len() < 6 {
+                    if end >= codes.len() or codes[end] != 44 {
+                        break
+                    }
+                    at = end + 1
+                }
+            }
+            if groups.len() == 6 {
+                let high = py_int(groups[4]) ?? 0
+                let low = py_int(groups[5]) ?? 0
+                return FtpEndpoint{ host: groups.slice(0, 4).join("."),
+                    port: high * 256 + low }
+            }
+        }
+        start = start + 1
+    }
+    fail(FtpMalformed(reply))
+}
+
+/// The port in a `229` reply to `EPSV`, which comes back with `host` —
+/// the control connection's peer — because the reply carries no address.
+pub fn parse229(reply: str, host: str) -> FtpEndpoint ! FtpError {
+    try expect(reply, "229")
+    let left = reply.index_of("(") ?? -1
+    if left < 0 {
+        fail(FtpMalformed(reply))
+    }
+    let after = reply.substr(left + 1, reply.len())
+    let close = after.index_of(")") ?? -1
+    if close < 0 {
+        fail(FtpMalformed(reply))
+    }
+    let right = left + 1 + close
+    if reply.substr(left + 1, 1) != reply.substr(right - 1, 1) {
+        fail(FtpMalformed(reply))
+    }
+    let delimiter = reply.substr(left + 1, 1)
+    let parts = reply.substr(left + 1, right - left - 1).split(delimiter)
+    if parts.len() != 5 {
+        fail(FtpMalformed(reply))
+    }
+    match py_int(parts[3]) {
+        Some(port) -> return FtpEndpoint{ host: host, port: port }
+        None -> fail(FtpMalformed(reply))
+    }
+}
+
+/// The directory name in a `257` reply, with doubled quotes undone. A reply
+/// that does not quote the name gives an empty one, as `ftplib` does.
+pub fn parse257(reply: str) -> str ! FtpError {
+    try expect(reply, "257")
+    if reply.substr(3, 2) != " \"" {
+        return ""
+    }
+    var name = ""
+    var i = 5
+    let n = reply.len()
+    while i < n {
+        let c = reply.substr(i, 1)
+        i = i + 1
+        if c == "\"" {
+            if i >= n or reply.substr(i, 1) != "\"" {
+                break
+            }
+            i = i + 1
+        }
+        name = name + c
+    }
+    return name
+}
+
+/// The size in a `213` reply to `SIZE`, or `None` for any other reply.
+pub fn parse213(reply: str) -> Option[i64] ! FtpError {
+    if reply.substr(0, 3) != "213" {
+        return None
+    }
+    match py_int(reply.substr(3, reply.len())) {
+        Some(size) -> return Some(size)
+        None -> fail(FtpMalformed(reply))
+    }
+}
+
+fn strip_line_end(line: str) -> str {
+    var end = line.len()
+    while end > 0 {
+        let c = line.substr(end - 1, 1)
+        if c != "\r" and c != "\n" {
+            break
+        }
+        end = end - 1
+    }
+    return line.substr(0, end)
+}
+
+/// One line of an `MLSD` listing: the name, and the facts in the order they
+/// were first given, names lowercased, a repeated fact keeping its last
+/// value.
+pub fn parse_mlsd(line: str) -> FtpListing {
+    let stripped = strip_line_end(line)
+    let space = stripped.index_of(" ") ?? -1
+    let facts_text = if space < 0 { stripped } else {
+        stripped.substr(0, space) }
+    let name = if space < 0 { "" } else {
+        stripped.substr(space + 1, stripped.len()) }
+    var keys: [str] = []
+    var values: [str] = []
+    let body = facts_text.substr(0, facts_text.len() - 1)
+    for fact in if body.len() == 0 { [""] } else { body.split(";") } {
+        let eq = fact.index_of("=") ?? -1
+        let key = (if eq < 0 { fact } else { fact.substr(0, eq) }).to_lower()
+        let value = if eq < 0 { "" } else { fact.substr(eq + 1, fact.len()) }
+        var at = 0
+        while at < keys.len() and keys[at] != key {
+            at = at + 1
+        }
+        if at < keys.len() {
+            values[at] = value
+        } else {
+            keys.push(key)
+            values.push(value)
+        }
+    }
+    var facts: [(str, str)] = []
+    var i = 0
+    while i < keys.len() {
+        facts.push((keys[i], values[i]))
+        i = i + 1
+    }
+    return FtpListing{ name: name, facts: facts }
+}
+
+fn floor_div(a: i64, b: i64) -> i64 {
+    let q = a / b
+    if a % b != 0 and ((a < 0) != (b < 0)) {
+        return q - 1
+    }
+    return q
+}
+
+/// The `PORT` command for an IPv4 address and port.
+pub fn port_command(host: str, port: i64) -> str {
+    let high = floor_div(port, 256)
+    let low = port - high * 256
+    return "PORT " + host.replace(".", ",") + ",{high},{low}"
+}
+
+/// The `EPRT` command: family 1 for IPv4, 2 for IPv6.
+pub fn eprt_command(family: i64, host: str, port: i64) -> str {
+    return "EPRT |{family}|{host}|{port}|"
+}
+
+/// A command as it goes on the wire, refused if it has a line break in it —
+/// which is how a file name from outside becomes a second command.
+pub fn command_line(command: str) -> str ! FtpError {
+    if command.contains("\r") or command.contains("\n") {
+        fail(FtpNewlineInCommand(command))
+    }
+    return command + "\r\n"
+}
+
+/// A line with a `PASS` command's argument replaced by stars, for a log.
+pub fn mask_password(line: str) -> str {
+    let head = line.substr(0, 5)
+    if head != "pass " and head != "PASS " {
+        return line
+    }
+    let kept = strip_line_end(line).len()
+    return head + "*".repeat(kept - 5) + line.substr(kept, line.len())
+}

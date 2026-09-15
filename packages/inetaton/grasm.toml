@@ -1,0 +1,6 @@
+[package]
+name = "inetaton"
+version = "1.0.0"
+
+# Text to addresses and back. Opens nothing.
+capabilities = []

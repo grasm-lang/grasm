@@ -1,0 +1,224 @@
+// IPv4 addresses the way the C library reads them.
+//
+// `packages/ipaddr` reads a dotted quad strictly, which is right for input a
+// person typed into a form. It is wrong for the other place addresses come
+// from: configuration files, `ping`, `/etc/hosts`, URLs in old software —
+// everything that hands the text to `inet_aton` and takes what comes back.
+// That function has accepted far more than four decimal octets since 4.2BSD:
+//
+// - one, two or three parts, the last one filling the remaining bits, so
+//   `127.1` is `127.0.0.1` and `10.65536` is `10.1.0.0`, and a bare
+//   `2130706433` is `127.0.0.1`;
+// - each part in C notation, so `0x7f.1` is hexadecimal and `017.0.0.1` is
+//   octal — fifteen, not seventeen — which is how an address with a leading
+//   zero goes somewhere nobody meant;
+// - anything after trailing whitespace ignored, so `1.2.3.4 junk` is valid.
+//
+// Those are the rules a security check has to use if it is deciding whether
+// text names an address that some other program will connect to, and they
+// are the rules here. `pton` is the strict reading `inet_pton` does, for the
+// opposite need.
+//
+// The single-part form stores the whole number in an unsigned long and keeps
+// the low 32 bits, so `4294967296` is `0.0.0.0`; the octet checks look at all
+// 64. Both are followed exactly.
+//
+// Checked against Python's `socket.inet_aton`, `inet_ntoa` and `inet_pton`,
+// which call the system's C library.
+
+type InetError =
+    | InetMalformed(text: str)
+
+let LOW = 4294967296
+
+fn is_digit(b: i64) -> bool {
+    return b >= 48 and b <= 57
+}
+
+fn hex_value(b: i64) -> i64 {
+    if is_digit(b) {
+        return b - 48
+    }
+    if b >= 97 and b <= 102 {
+        return b - 87
+    }
+    if b >= 65 and b <= 70 {
+        return b - 55
+    }
+    return -1
+}
+
+fn is_c_space(b: i64) -> bool {
+    return b == 32 or (b >= 9 and b <= 13)
+}
+
+/// A part as an unsigned long: its low and high 32 bits, both wrapped the
+/// way the C accumulation wraps.
+type InetPart = {
+    low: i64,
+    high: i64,
+}
+
+fn grow(part: InetPart, base: i64, digit: i64) -> InetPart {
+    let low = part.low * base + digit
+    let carry = low / LOW
+    return InetPart{ low: low % LOW, high: (part.high * base + carry) % LOW }
+}
+
+fn fits(part: InetPart, limit: i64) -> bool {
+    return part.high == 0 and part.low <= limit
+}
+
+/// The parts before the last dot, which are bytes, and the last part, which
+/// fills whatever bits they leave.
+fn assemble(parts: [i64], last: InetPart) -> Option[i64] {
+    let limits = [4294967295, 16777215, 65535, 255]
+    if parts.len() > 0 and not fits(last, limits[parts.len()]) {
+        return None
+    }
+    var value = last.low
+    var shift = 16777216
+    for p in parts {
+        value = value + p * shift
+        shift = shift / 256
+    }
+    return Some(value)
+}
+
+/// The address as a 32-bit number, or `None` where `inet_aton` returns 0.
+pub fn aton_value(text: str) -> Option[i64] {
+    let raw = text.to_bytes()
+    var at = 0
+    var parts: [i64] = []
+    var part = InetPart{ low: 0, high: 0 }
+    var digit = false
+    var c = if raw.len() > 0 { raw.at(0) } else { 0 }
+    while true {
+        if not is_digit(c) {
+            return None
+        }
+        part = InetPart{ low: 0, high: 0 }
+        var base = 10
+        digit = false
+        if c == 48 {
+            at = at + 1
+            c = if at < raw.len() { raw.at(at) } else { 0 }
+            if c == 120 or c == 88 {
+                base = 16
+                at = at + 1
+                c = if at < raw.len() { raw.at(at) } else { 0 }
+            } else {
+                base = 8
+                digit = true
+            }
+        }
+        while true {
+            if is_digit(c) {
+                if base == 8 and (c == 56 or c == 57) {
+                    return None
+                }
+                part = grow(part, base, c - 48)
+            } else if base == 16 and hex_value(c) >= 0 {
+                part = grow(part, 16, hex_value(c))
+            } else {
+                break
+            }
+            digit = true
+            at = at + 1
+            c = if at < raw.len() { raw.at(at) } else { 0 }
+        }
+        if c != 46 {
+            break
+        }
+        if parts.len() >= 3 or not fits(part, 255) {
+            return None
+        }
+        parts.push(part.low)
+        at = at + 1
+        c = if at < raw.len() { raw.at(at) } else { 0 }
+    }
+    if at < raw.len() and not is_c_space(c) {
+        return None
+    }
+    if not digit {
+        return None
+    }
+    return assemble(parts, part)
+}
+
+/// The four bytes `inet_aton` writes, most significant first.
+pub fn aton(text: str) -> bytes ! InetError {
+    match aton_value(text) {
+        Some(v) -> return value_bytes(v)
+        None -> fail(InetMalformed(text))
+    }
+}
+
+fn value_bytes(v: i64) -> bytes {
+    return bytes_of([v / 16777216 % 256, v / 65536 % 256, v / 256 % 256,
+        v % 256])
+}
+
+/// Whether `inet_aton` accepts `text`.
+pub fn is_valid(text: str) -> bool {
+    return aton_value(text).is_some()
+}
+
+/// Four bytes as a dotted quad, which is all `inet_ntoa` ever writes.
+pub fn ntoa(packed: bytes) -> str ! InetError {
+    if packed.len() != 4 {
+        fail(InetMalformed("{packed.len()} bytes"))
+    }
+    return "{packed.at(0)}.{packed.at(1)}.{packed.at(2)}.{packed.at(3)}"
+}
+
+/// A number as a dotted quad.
+pub fn render(value: i64) -> str {
+    return ntoa(value_bytes(value)) ?? ""
+}
+
+/// The strict reading `inet_pton` does: exactly four decimal parts, each no
+/// more than 255, and nothing after them. A leading zero is decimal here, so
+/// `010` is ten — and this C library allows any number of them, so
+/// `0000255` is 255.
+pub fn pton_value(text: str) -> Option[i64] {
+    let raw = text.to_bytes()
+    var value = 0
+    var octets = 0
+    var current = 0
+    var digits = 0
+    var at = 0
+    while at < raw.len() {
+        let c = raw.at(at)
+        if is_digit(c) {
+            current = current * 10 + (c - 48)
+            digits = digits + 1
+            if current > 255 {
+                return None
+            }
+        } else if c == 46 {
+            if digits == 0 or octets == 3 {
+                return None
+            }
+            value = value * 256 + current
+            octets = octets + 1
+            current = 0
+            digits = 0
+        } else {
+            return None
+        }
+        at = at + 1
+    }
+    if digits == 0 or octets != 3 {
+        return None
+    }
+    return Some(value * 256 + current)
+}
+
+/// `inet_pton(AF_INET, text)`.
+pub fn pton(text: str) -> bytes ! InetError {
+    match pton_value(text) {
+        Some(v) -> return value_bytes(v)
+        None -> fail(InetMalformed(text))
+    }
+}

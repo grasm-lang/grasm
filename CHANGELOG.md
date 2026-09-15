@@ -9,6 +9,19 @@ migration note here; anything `experimental` may change in any release. See
 
 ### Added
 
+- **The network as the C library describes it.** `inetaton` reads IPv4
+  addresses as `inet_aton` does — `127.1`, octal `017`, hex `0x7f`, text
+  after a space ignored — which is what a check has to use when another
+  program will connect to the address; `pton` is the strict reading.
+  `netdb` answers `getservbyname`, `getservbyport` and `getprotobyname` from
+  the files themselves. `rfc2822date` reads mail dates as
+  `email.utils.parsedate_tz` does, keeping `-0000` apart from `+0000`, and
+  writes them as `formatdate`. `maildir` is Maildir's file-name rules and
+  flag conversions to mbox, MH and Babyl, as Python's `mailbox` has them.
+  `ftpwire` is the control connection's text as `ftplib` reads it:
+  multi-line replies, passive-mode replies, quoted directory names, MLSD.
+  146,551 cases against Python and this machine's C library; `net3diff` is
+  a gate.
 - **Python's text tools.** `ndiff` is `difflib.Differ` line for line — the
   fuzzy pairing of similar lines and the `? ` lines marking what changed
   within one — and `restore` recovers either side from its output.

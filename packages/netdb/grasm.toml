@@ -1,0 +1,6 @@
+[package]
+name = "netdb"
+version = "1.0.0"
+
+# Reads text it is given; the caller reads the file.
+capabilities = []

@@ -1,0 +1,338 @@
+// Maildir: one file per message, and the state of a message in its name.
+//
+// A Maildir is three directories. A delivery is written into `tmp` under a
+// name nothing else will choose, then renamed into `new`, so a reader never
+// sees half a message and no lock is ever taken. A mail reader that has
+// looked at a message moves it to `cur` and appends an "info" to its name:
+// `1700000000.M12P34Q5.host:2,RS` is a message that has been replied to
+// (`R`) and seen (`S`). Everything a program needs to know about a message
+// without opening it is in that name, which is why the name rules are the
+// format, and why they are all this package is.
+//
+// The details that break interoperability are small:
+//
+// - The key is the name up to the **first** colon, and the info is the part
+//   after the **last** one.
+// - Flags are single letters kept in ASCII order, so two programs setting
+//   the same flags write the same file name — and a reader that compares
+//   names rather than flag sets otherwise sees a message change.
+// - Adding or removing a flag treats the flags as a set, but setting them
+//   outright does not: `set_flags("SSR")` writes `2,RSS`, as Python does.
+// - Removing a flag from a message with none leaves the info alone, even an
+//   info that is not in the `2,` form at all.
+//
+// Converting to and from mbox follows Python's `mailbox` module, which is
+// what most migration scripts are: Maildir's `S`een becomes mbox's `R`ead,
+// `R`eplied becomes `A`nswered, `T`rashed becomes `D`eleted, and being in
+// `cur` becomes `O`ld. MH sequences and Babyl labels are the same idea
+// again.
+//
+// Checked against Python's `mailbox.MaildirMessage`, its conversions to and
+// from `mboxMessage`, `MHMessage` and `BabylMessage`, and `Maildir`'s naming.
+
+type MaildirMbox = {
+    status: str,
+    x_status: str,
+    has_headers: bool,
+}
+
+type MaildirPlace = {
+    subdir: str,
+    info: str,
+}
+
+/// The key a message is known by: its file name up to the first `colon`.
+pub fn key_of(filename: str, colon: str) -> str {
+    let cut = filename.index_of(colon) ?? filename.len()
+    return filename.substr(0, cut)
+}
+
+/// The info a file name carries: the part after the last `colon`, or
+/// nothing when there is no colon.
+pub fn info_of(filename: str, colon: str) -> str {
+    if not filename.contains(colon) {
+        return ""
+    }
+    let parts = filename.split(colon)
+    return parts[parts.len() - 1]
+}
+
+/// The file name for a key and an info; an empty info adds no colon.
+pub fn filename(key: str, info: str, colon: str) -> str {
+    if info.len() == 0 {
+        return key
+    }
+    return key + colon + info
+}
+
+/// The flags in an info of the `2,` form, or none.
+pub fn flags_of(info: str) -> str {
+    if info.starts_with("2,") {
+        return info.substr(2, info.len())
+    }
+    return ""
+}
+
+fn sorted_letters(letters: [str]) -> str {
+    var copy = letters
+    copy.sort()
+    return copy.join("")
+}
+
+fn letter_set(text: str) -> [str] {
+    var out: [str] = []
+    for c in text.chars() {
+        if not out.contains(c) {
+            out.push(c)
+        }
+    }
+    return out
+}
+
+/// The info with exactly `flags` set, sorted and not deduplicated.
+pub fn set_flags(flags: str) -> str {
+    return "2," + sorted_letters(flags.chars())
+}
+
+/// The info with every letter of `flag` added to those already set.
+pub fn add_flag(info: str, flag: str) -> str {
+    return "2," + sorted_letters(letter_set(flags_of(info) + flag))
+}
+
+/// The info with every letter of `flag` removed. With no flags set, the
+/// info is returned as it was.
+pub fn remove_flag(info: str, flag: str) -> str {
+    let current = flags_of(info)
+    if current.len() == 0 {
+        return info
+    }
+    var kept: [str] = []
+    for c in letter_set(current) {
+        if not flag.contains(c) {
+            kept.push(c)
+        }
+    }
+    return "2," + sorted_letters(kept)
+}
+
+/// Whether `flags` has the letter `flag`.
+pub fn has_flag(info: str, flag: str) -> bool {
+    return flags_of(info).contains(flag)
+}
+
+/// The name `Maildir` gives a new delivery: seconds, microseconds, process
+/// id, a per-process counter and the host name, with the two characters a
+/// file name cannot carry in a host name written as octal escapes.
+pub fn unique_name(seconds: i64, micros: i64, pid: i64, counter: i64,
+    hostname: str) -> str {
+    let host = hostname.replace("/", "\\057").replace(":", "\\072")
+    return "{seconds}.M{micros}P{pid}Q{counter}.{host}"
+}
+
+/// A folder's name from a directory entry of a Maildir++ tree, where
+/// folders are hidden directories.
+pub fn folder_of(entry: str) -> Option[str] {
+    if entry.len() > 1 and entry.starts_with(".") {
+        return Some(entry.substr(1, entry.len()))
+    }
+    return None
+}
+
+/// The directory entry for a folder.
+pub fn folder_entry(folder: str) -> str {
+    return "." + folder
+}
+
+/// Whether a file in `tmp` has been there long enough to delete: 36 hours
+/// since it was last read.
+pub fn is_stale(now: i64, accessed: i64) -> bool {
+    return now - accessed > 129600
+}
+
+/// Key to path within the Maildir, from the entries of `new` and `cur` in
+/// listing order. Hidden names are skipped, and a key seen twice keeps the
+/// later path at the place the key was first seen.
+pub fn table(subdirs: [str], names: [str], colon: str) -> [(str, str)] {
+    var keys: [str] = []
+    var paths: [str] = []
+    var i = 0
+    while i < names.len() {
+        let name = names[i]
+        if not name.starts_with(".") {
+            let key = key_of(name, colon)
+            let path = subdirs[i] + "/" + name
+            var at = 0
+            while at < keys.len() and keys[at] != key {
+                at = at + 1
+            }
+            if at < keys.len() {
+                paths[at] = path
+            } else {
+                keys.push(key)
+                paths.push(path)
+            }
+        }
+        i = i + 1
+    }
+    var out: [(str, str)] = []
+    var j = 0
+    while j < keys.len() {
+        out.push((keys[j], paths[j]))
+        j = j + 1
+    }
+    return out
+}
+
+fn mbox_from_letters(letters: [str]) -> MaildirMbox {
+    var status = ""
+    var x_status = ""
+    for flag in ["R", "O"] {
+        if letters.contains(flag) {
+            status = status + flag
+        }
+    }
+    var rest: [str] = []
+    for flag in letters {
+        if flag != "R" and flag != "O" and flag != "D" and flag != "F" and
+        flag != "A" {
+            rest.push(flag)
+        }
+    }
+    for flag in ["D", "F", "A"] {
+        if letters.contains(flag) {
+            x_status = x_status + flag
+        }
+    }
+    return MaildirMbox{ status: status, x_status: x_status + sorted_letters(
+        rest), has_headers: true }
+}
+
+/// An mbox message's `Status` and `X-Status` headers for a Maildir message
+/// with `info` in `subdir`. A message with none of the flags mbox has gets
+/// no headers at all.
+pub fn to_mbox(info: str, subdir: str) -> MaildirMbox {
+    let flags = flags_of(info)
+    var letters: [str] = []
+    if flags.contains("S") {
+        letters.push("R")
+    }
+    if subdir == "cur" {
+        letters.push("O")
+    }
+    if flags.contains("T") {
+        letters.push("D")
+    }
+    if flags.contains("F") {
+        letters.push("F")
+    }
+    if flags.contains("R") {
+        letters.push("A")
+    }
+    if letters.len() == 0 {
+        return MaildirMbox{ status: "", x_status: "", has_headers: false }
+    }
+    return mbox_from_letters(letters)
+}
+
+/// The subdirectory and info for an mbox message with these `Status` and
+/// `X-Status` header values.
+pub fn from_mbox(status: str, x_status: str) -> MaildirPlace {
+    let flags = status + x_status
+    var subdir = "new"
+    var info = ""
+    if flags.contains("O") {
+        subdir = "cur"
+    }
+    let pairs = [("F", "F"), ("A", "R"), ("R", "S"), ("D", "T")]
+    for pair in pairs {
+        if flags.contains(pair.0) {
+            info = add_flag(info, pair.1)
+        }
+    }
+    return MaildirPlace{ subdir: subdir, info: info }
+}
+
+/// The MH sequences a Maildir message belongs in.
+pub fn to_mh(info: str) -> [str] {
+    let flags = flags_of(info)
+    var out: [str] = []
+    if not flags.contains("S") {
+        out.push("unseen")
+    }
+    if flags.contains("R") {
+        out.push("replied")
+    }
+    if flags.contains("F") {
+        out.push("flagged")
+    }
+    return out
+}
+
+/// The subdirectory and info for an MH message in these sequences. MH has
+/// no "new", so it is always `cur`.
+pub fn from_mh(sequences: [str]) -> MaildirPlace {
+    var info = ""
+    if not sequences.contains("unseen") {
+        info = add_flag(info, "S")
+    }
+    if sequences.contains("flagged") {
+        info = add_flag(info, "F")
+    }
+    if sequences.contains("replied") {
+        info = add_flag(info, "R")
+    }
+    return MaildirPlace{ subdir: "cur", info: info }
+}
+
+/// The Babyl labels for a Maildir message.
+pub fn to_babyl(info: str) -> [str] {
+    let flags = flags_of(info)
+    var out: [str] = []
+    if not flags.contains("S") {
+        out.push("unseen")
+    }
+    if flags.contains("T") {
+        out.push("deleted")
+    }
+    if flags.contains("R") {
+        out.push("answered")
+    }
+    if flags.contains("P") {
+        out.push("forwarded")
+    }
+    return out
+}
+
+fn floor_div(a: i64, b: i64) -> i64 {
+    let q = a / b
+    if a % b != 0 and ((a < 0) != (b < 0)) {
+        return q - 1
+    }
+    return q
+}
+
+/// The `From ` line Python writes when a Maildir message becomes an mbox
+/// one: `MAILER-DAEMON` and the delivery time as `asctime` writes it in UTC,
+/// the day of the month padded with a space.
+pub fn from_line(seconds: i64) -> str {
+    let days = floor_div(seconds, 86400)
+    let rest = seconds - days * 86400
+    let z = days + 719468
+    let era = floor_div(z, 146097)
+    let doe = z - era * 146097
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100)
+    let mp = (5 * doy + 2) / 153
+    let day = doy - (153 * mp + 2) / 5 + 1
+    let month = if mp < 10 { mp + 3 } else { mp - 9 }
+    let year = yoe + era * 400 + (if month <= 2 { 1 } else { 0 })
+    let names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    let months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug",
+        "Sep", "Oct", "Nov", "Dec"]
+    let weekday = names[((days + 3) % 7 + 7) % 7]
+    let clock = "{rest / 3600}".pad_start(2, "0") + ":" +
+    "{rest / 60 % 60}".pad_start(2, "0") + ":" +
+    "{rest % 60}".pad_start(2, "0")
+    return "MAILER-DAEMON {weekday} {months[month - 1]} " +
+    "{"{day}".pad_start(2, " ")} {clock} {year}"
+}

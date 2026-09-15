@@ -1,0 +1,24 @@
+[package]
+name = "oldnet_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.inetaton]
+path = "../inetaton"
+version = "^1.0.0"
+
+[dependencies.netdb]
+path = "../netdb"
+version = "^1.0.0"
+
+[dependencies.rfc2822date]
+path = "../rfc2822date"
+version = "^1.0.0"
+
+[dependencies.maildir]
+path = "../maildir"
+version = "^1.0.0"
+
+[dependencies.ftpwire]
+path = "../ftpwire"
+version = "^1.0.0"

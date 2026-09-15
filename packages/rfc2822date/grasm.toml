@@ -1,0 +1,6 @@
+[package]
+name = "rfc2822date"
+version = "1.0.0"
+
+# Header text to dates and back. Opens nothing.
+capabilities = []
