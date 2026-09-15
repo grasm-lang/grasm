@@ -1,0 +1,24 @@
+[package]
+name = "texttest2"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.z85]
+path = "../z85"
+version = "^1.0.0"
+
+[dependencies.stringtemplate]
+path = "../stringtemplate"
+version = "^1.0.0"
+
+[dependencies.expandvars]
+path = "../expandvars"
+version = "^1.0.0"
+
+[dependencies.formatfield]
+path = "../formatfield"
+version = "^1.0.0"
+
+[dependencies.ndiff]
+path = "../ndiff"
+version = "^1.0.0"

@@ -1,0 +1,123 @@
+// Five small shapes text takes on its way through a program.
+import z85
+import stringtemplate
+import expandvars
+import formatfield
+import ndiff
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn check_z85(inout f: i64) / {io} {
+    // The specification's own example.
+    let raw = bytes_of([134, 79, 210, 111, 181, 89, 247, 91])
+    say(f, "the specification's example encodes to HelloWorld",
+        z85.encode(raw) == "HelloWorld")
+    say(f, "and decodes back",
+        (z85.decode("HelloWorld") ?? "".to_bytes()).len() == 8)
+    // A short final group is padded and trimmed, as Python does.
+    say(f, "one byte is two characters", z85.encode(bytes_of([0])).len() == 2)
+    say(f, "and the strict encoder refuses it",
+        (z85.encode_strict(bytes_of([0])) ?? "!") == "!")
+    say(f, "a character outside the alphabet is refused",
+        not z85.is_valid("Hel~o"))
+    say(f, "and five digits past four bytes are refused",
+        not z85.is_valid("#####"))
+}
+
+fn check_stringtemplate(inout f: i64) / {io} {
+    let names = ["who", "what"]
+    let values = ["tim", "kung pao"]
+    say(f, "names are substituted",
+        (stringtemplate.substitute("$who likes $what", names, values) ??
+            "") == "tim likes kung pao")
+    say(f, "braces delimit a name",
+        (stringtemplate.substitute("$\{who\}s", names, values) ?? "") ==
+        "tims")
+    say(f, "two dollars are one",
+        (stringtemplate.substitute("$$5", names, values) ?? "") == "$5")
+    say(f, "an unknown name fails substitute",
+        (stringtemplate.substitute("$nobody", names, values) ?? "!") == "!")
+    say(f, "and is left alone by safe_substitute",
+        stringtemplate.safe_substitute("$nobody here", names, values) ==
+        "$nobody here")
+    say(f, "a stray dollar is invalid", not stringtemplate.is_valid("$ 5"))
+    say(f, "the names a template uses come back in order",
+        stringtemplate.identifiers("$who $what $who") == ["who", "what"])
+}
+
+fn check_expandvars(inout f: i64) / {io} {
+    let names = ["HOME", "A"]
+    let values = ["/home/u", "1"]
+    say(f, "a variable expands",
+        expandvars.expand_vars("$A/x", names, values) == "1/x")
+    say(f, "an unset one is left as written",
+        expandvars.expand_vars("$UNSET/", names, values) == "$UNSET/")
+    say(f, "braces delimit a name",
+        expandvars.expand_vars("$\{A\}b", names, values) == "1b")
+    say(f, "a tilde at the front is home",
+        expandvars.expand_user("~/bin", "/home/u", [], []) == "/home/u/bin")
+    say(f, "and anywhere else is a character",
+        expandvars.expand_user("a/~/b", "/home/u", [], []) == "a/~/b")
+    say(f, "a home of slash does not double the slash",
+        expandvars.expand_user("~/x", "/", [], []) == "/x")
+}
+
+fn check_formatfield(inout f: i64) / {io} {
+    say(f, "a template with a spec fills in",
+        (formatfield.format("\{name:>10\}|\{size\}", [], ["name", "size"],
+            ["file", "12"]) ?? "") == "      file|12")
+    say(f, "automatic numbering counts up",
+        (formatfield.format("\{\}-\{\}", ["a", "b"], [], []) ?? "") == "a-b")
+    say(f, "and may not be mixed with manual",
+        (formatfield.format("\{0\}\{\}", ["a", "b"], [], []) ?? "!") == "!")
+    say(f, "doubled braces are literal",
+        (formatfield.format("\{\{x\}\}", [], [], []) ?? "") == "\{x\}")
+    say(f, "a spec may contain a field of its own",
+        (formatfield.format("\{0:\{1\}\}", ["x", ">3"], [], []) ?? "") ==
+        "  x")
+    say(f, "a lone closing brace is refused",
+        not formatfield.is_valid("a\}b"))
+    // A name ends at `:` or `!` except inside brackets.
+    say(f, "a colon inside brackets stays in the name",
+        (formatfield.field_names("\{a[:]\}") ?? []) == ["a[:]"])
+    say(f, "and !r quotes the value",
+        (formatfield.format("\{0!r\}", ["it's"], [], []) ?? "") == "\"it's\"")
+}
+
+fn check_ndiff(inout f: i64) / {io} {
+    let delta = ndiff.compare(["recieve\n"], ["receive\n"])
+    say(f, "a small change is paired and marked", delta.len() == 4)
+    say(f, "the removed line comes first", delta[0] == "- recieve\n")
+    say(f, "with the stray letter marked under it", delta[1] == "?     -\n")
+    say(f, "and the added one marked under its own",
+        delta[3] == "?    +\n")
+    let rewritten = ndiff.compare(["completely different\n"],
+        ["nothing alike at all\n"])
+    say(f, "a line rewritten from scratch is not paired",
+        rewritten.len() == 2)
+    say(f, "and either side can be restored from the delta",
+        ndiff.restore(delta, 2) == ["receive\n"])
+}
+
+fn main() / {io} {
+    var f = 0
+
+    check_z85(f)
+    check_stringtemplate(f)
+    check_expandvars(f)
+    check_formatfield(f)
+    check_ndiff(f)
+
+    if f == 0 {
+        print("textshape: every claim held")
+    } else {
+        print("textshape: {f} failed")
+    }
+}

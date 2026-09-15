@@ -37,7 +37,7 @@ type CloseMatchRun = {
 
 /// Where each element of `b` occurs, with over-common elements left out once
 /// `b` is long enough for them to matter.
-fn index_of_b(b: [str]) -> Map[str, [i64]] {
+fn index_of_b(b: [str], junk: [str]) -> Map[str, [i64]] {
     var index: Map[str, [i64]] = {}
     var i = 0
     while i < b.len() {
@@ -45,6 +45,11 @@ fn index_of_b(b: [str]) -> Map[str, [i64]] {
         seen.push(i)
         index.set(b[i], seen)
         i = i + 1
+    }
+    // Junk the caller named comes out of the index entirely, before the
+    // popular-element rule looks at what is left.
+    for element in junk {
+        index.delete(element)
     }
     if b.len() < 200 {
         return index
@@ -64,8 +69,17 @@ fn index_of_b(b: [str]) -> Map[str, [i64]] {
 
 /// The longest run shared by `a[a_lo..a_hi]` and `b[b_lo..b_hi]`, earliest
 /// in `a` and then earliest in `b` when several are the same length.
+fn is_junk(junk: [str], element: str) -> bool {
+    for candidate in junk {
+        if candidate == element {
+            return true
+        }
+    }
+    return false
+}
+
 fn longest_run(a: [str], b: [str], index: Map[str, [i64]], a_lo: i64,
-    a_hi: i64, b_lo: i64, b_hi: i64) -> CloseMatchRun {
+    a_hi: i64, b_lo: i64, b_hi: i64, junk: [str]) -> CloseMatchRun {
     var best_a = a_lo
     var best_b = b_lo
     var best = 0
@@ -91,16 +105,29 @@ fn longest_run(a: [str], b: [str], index: Map[str, [i64]], a_lo: i64,
         lengths = next
         i = i + 1
     }
-    // Grow the run over anything equal on either side. With no junk function
-    // this is the whole of `difflib`'s four extension loops; the two that
-    // test for junk can never fire.
+    // Grow the run over equal elements that are not junk, then over equal
+    // ones that are — `difflib`'s four extension loops, in its order. The
+    // order matters: a run is found free of junk first and only then allowed
+    // to swallow the junk beside it.
     while best_a > a_lo and best_b > b_lo and
-    a[best_a - 1] == b[best_b - 1] {
+    not is_junk(junk, b[best_b - 1]) and a[best_a - 1] == b[best_b - 1] {
         best_a = best_a - 1
         best_b = best_b - 1
         best = best + 1
     }
     while best_a + best < a_hi and best_b + best < b_hi and
+    not is_junk(junk, b[best_b + best]) and
+    a[best_a + best] == b[best_b + best] {
+        best = best + 1
+    }
+    while best_a > a_lo and best_b > b_lo and
+    is_junk(junk, b[best_b - 1]) and a[best_a - 1] == b[best_b - 1] {
+        best_a = best_a - 1
+        best_b = best_b - 1
+        best = best + 1
+    }
+    while best_a + best < a_hi and best_b + best < b_hi and
+    is_junk(junk, b[best_b + best]) and
     a[best_a + best] == b[best_b + best] {
         best = best + 1
     }
@@ -115,13 +142,24 @@ fn longest_run(a: [str], b: [str], index: Map[str, [i64]], a_lo: i64,
 /// without special-casing the end. `difflib` returns it too, and code
 /// written against one works against the other because of it.
 pub fn matching_blocks(a: [str], b: [str]) -> [(i64, i64, i64)] {
-    let index = index_of_b(b)
+    return matching_blocks_with_junk(a, b, [])
+}
+
+/// The same, with some elements treated as junk: never the basis of a
+/// match, only swallowed by one that is already there. `difflib.ndiff`
+/// treats spaces and tabs this way when it compares two lines character by
+/// character, which is why an indentation change does not dominate the
+/// markers under the line.
+pub fn matching_blocks_with_junk(a: [str], b: [str],
+    junk: [str]) -> [(i64, i64, i64)] {
+    let index = index_of_b(b, junk)
     var queue: [(i64, i64, i64, i64)] = [(0, a.len(), 0, b.len())]
     var found: [(i64, i64, i64)] = []
     while queue.len() > 0 {
         let job = queue[queue.len() - 1]
         queue.pop()
-        let run = longest_run(a, b, index, job.0, job.1, job.2, job.3)
+        let run = longest_run(a, b, index, job.0, job.1, job.2, job.3,
+            junk)
         if run.size == 0 {
             continue
         }

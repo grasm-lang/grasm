@@ -1,0 +1,187 @@
+// `$name` substitution, the simple kind.
+//
+// `packages/template` is a templating language, with loops and conditions.
+// This is the other end: the `$user` in an email body, the `${HOME}` in a
+// configuration value, the `$1` in a translated string — substitution with
+// no logic at all, where the safety comes from there being nothing to
+// evaluate. It is Python's `string.Template`, and it is what a great deal of
+// configuration handed between Python and other programs is written in.
+//
+// The rules, all of which matter:
+//
+//   - `$$` is a literal dollar sign.
+//   - `$name` takes the longest identifier after the dollar: letters,
+//     digits and underscores, not starting with a digit, ASCII only.
+//   - `${name}` delimits it, so `${noun}s` works where `$nouns` would not.
+//   - Anything else after a `$` is an invalid placeholder. `substitute`
+//     refuses the whole template; `safe_substitute` leaves it exactly as
+//     written, and leaves unknown names as written too.
+//
+// The distinction between the two is the reason this exists as a package
+// rather than a `replace` loop. A template built from user input must never
+// fail on a stray `$` in the middle of a sentence, and a template written by
+// a developer should fail loudly when a name is misspelled, and those are
+// different calls.
+//
+// Checked against Python's `string.Template`.
+
+type StringTemplateError =
+    | TemplateMissing(name: str)
+    | TemplateInvalid(at: i64)
+
+fn is_start(c: str) -> bool {
+    return (c >= "a" and c <= "z") or (c >= "A" and c <= "Z") or c == "_"
+}
+
+fn is_part(c: str) -> bool {
+    return is_start(c) or (c >= "0" and c <= "9")
+}
+
+/// What follows a `$` at `at`: the kind of placeholder, the name, and how
+/// many characters it occupies including the dollar.
+///
+/// Kind is `escaped`, `named`, `braced` or `invalid`.
+fn placeholder_at(text: str, at: i64) -> (str, str, i64) {
+    if at + 1 >= text.len() {
+        return ("invalid", "", 1)
+    }
+    let next = text.substr(at + 1, 1)
+    if next == "$" {
+        return ("escaped", "", 2)
+    }
+    if is_start(next) {
+        var end = at + 2
+        while end < text.len() and is_part(text.substr(end, 1)) {
+            end = end + 1
+        }
+        return ("named", text.substr(at + 1, end - at - 1), end - at)
+    }
+    if next == "\{" {
+        let start = at + 2
+        if start < text.len() and is_start(text.substr(start, 1)) {
+            var end = start + 1
+            while end < text.len() and is_part(text.substr(end, 1)) {
+                end = end + 1
+            }
+            if end < text.len() and text.substr(end, 1) == "\}" {
+                return ("braced", text.substr(start, end - start),
+                    end - at + 1)
+            }
+        }
+    }
+    return ("invalid", "", 1)
+}
+
+fn lookup(names: [str], values: [str], name: str) -> Option[str] {
+    var i = 0
+    while i < names.len() {
+        if names[i] == name {
+            return Some(values[i])
+        }
+        i = i + 1
+    }
+    return None
+}
+
+/// Every placeholder filled, or an error naming the first that could not be.
+///
+/// `names` and `values` are parallel lists, which keeps the call site
+/// readable without inventing a map type for one function.
+pub fn substitute(text: str, names: [str],
+    values: [str]) -> str ! StringTemplateError {
+    var out = ""
+    var i = 0
+    while i < text.len() {
+        let c = text.substr(i, 1)
+        if c != "$" {
+            out = out + c
+            i = i + 1
+            continue
+        }
+        let found = placeholder_at(text, i)
+        if found.0 == "escaped" {
+            out = out + "$"
+        } else if found.0 == "invalid" {
+            fail(TemplateInvalid(i))
+        } else {
+            match lookup(names, values, found.1) {
+                Some(value) -> out = out + value
+                None -> fail(TemplateMissing(found.1))
+            }
+        }
+        i = i + found.2
+    }
+    return out
+}
+
+/// The same, never failing: an unknown name or an invalid placeholder is
+/// left exactly as written, which is what a template built from user input
+/// needs.
+pub fn safe_substitute(text: str, names: [str], values: [str]) -> str {
+    var out = ""
+    var i = 0
+    while i < text.len() {
+        let c = text.substr(i, 1)
+        if c != "$" {
+            out = out + c
+            i = i + 1
+            continue
+        }
+        let found = placeholder_at(text, i)
+        if found.0 == "escaped" {
+            out = out + "$"
+        } else if found.0 == "invalid" {
+            out = out + "$"
+        } else {
+            match lookup(names, values, found.1) {
+                Some(value) -> out = out + value
+                None -> out = out + text.substr(i, found.2)
+            }
+        }
+        i = i + found.2
+    }
+    return out
+}
+
+/// The names a template uses, in first-seen order, once each.
+pub fn identifiers(text: str) -> [str] {
+    var out: [str] = []
+    var i = 0
+    while i < text.len() {
+        if text.substr(i, 1) != "$" {
+            i = i + 1
+            continue
+        }
+        let found = placeholder_at(text, i)
+        if found.0 == "named" or found.0 == "braced" {
+            var seen = false
+            for name in out {
+                if name == found.1 {
+                    seen = true
+                }
+            }
+            if not seen {
+                out.push(found.1)
+            }
+        }
+        i = i + found.2
+    }
+    return out
+}
+
+/// Whether a template has no invalid placeholder in it.
+pub fn is_valid(text: str) -> bool {
+    var i = 0
+    while i < text.len() {
+        if text.substr(i, 1) != "$" {
+            i = i + 1
+            continue
+        }
+        let found = placeholder_at(text, i)
+        if found.0 == "invalid" {
+            return false
+        }
+        i = i + found.2
+    }
+    return true
+}

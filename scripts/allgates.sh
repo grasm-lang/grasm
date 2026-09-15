@@ -105,6 +105,7 @@ run_gate gitsigndiff    scripts/gitsign_diff.sh
 run_gate signingdiff    scripts/signing_diff.sh
 run_gate repodiff       scripts/repo_diff.sh
 run_gate dbcsdiff       scripts/dbcs_diff.sh
+run_gate text2diff      scripts/text2_diff.sh
 run_gate kvcrash       scripts/kvstore_crash.sh
 run_gate zlibdiff      scripts/zlib_diff.sh
 run_gate casefolddiff  scripts/casefold_diff.sh

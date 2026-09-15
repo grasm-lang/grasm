@@ -31,9 +31,9 @@ One more is added, because this stretch leans on it:
 | | |
 |---|---|
 | At the close of the 600 plan | 600 |
-| Now | 605 |
+| Now | 611 |
 | Target | 650 |
-| Remaining | 45 |
+| Remaining | 39 |
 
 The count is directories under `packages/` that are not `*-demo`. Test
 harnesses are counted.
@@ -48,13 +48,15 @@ harnesses are counted.
   107,765 cases against Python's codecs — every character each one knows,
   in both directions.
 
+- [x] **Python's text tools** — `ndiff` `formatfield` `stringtemplate`
+  `expandvars` `z85`, and the harness `texttest2`. 37,750 cases against
+  `difflib`, `string` and `os.path`, including every string of up to five
+  characters from `{}!:[]a0` through `Formatter.parse`.
+
 ### Next
 
 Each line has an implementation to be checked against on this machine.
 
-- **Python's text tools** — `ndiff` (`difflib.Differ`), `stringtemplate`
-  (`string.Template`), `formatfield` (`string.Formatter.parse`), `z85`
-  (`base64.z85encode`), `expandvars` (`os.path.expandvars`)
 - **Network odds and ends** — `inetaton` (`socket.inet_aton`), `netdb`
   (`/etc/services` and `socket.getservbyname`), `rfc2822date`
   (`email.utils`), `maildir` (`mailbox.MaildirMessage`), `ftpwire`

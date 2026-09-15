@@ -1,0 +1,6 @@
+[package]
+name = "expandvars"
+version = "1.0.0"
+
+# String handling. Reads no environment itself.
+capabilities = []

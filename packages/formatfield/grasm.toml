@@ -1,0 +1,10 @@
+[package]
+name = "formatfield"
+version = "1.0.0"
+
+# String building. Opens nothing.
+capabilities = []
+
+[dependencies.formatspec]
+path = "../formatspec"
+version = "^1.0.0"

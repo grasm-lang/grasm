@@ -9,6 +9,17 @@ migration note here; anything `experimental` may change in any release. See
 
 ### Added
 
+- **Python's text tools.** `ndiff` is `difflib.Differ` line for line — the
+  fuzzy pairing of similar lines and the `? ` lines marking what changed
+  within one — and `restore` recovers either side from its output.
+  `formatfield` parses and fills `str.format` templates with Python's own
+  field grammar, including the corners where `{[}` is a field and `{!}}` is
+  a conversion. `stringtemplate` is `string.Template`, `expandvars` is
+  `os.path.expandvars` and `expanduser`, and `z85` is ZeroMQ's base-85 as
+  `base64.z85encode` writes it. `closematch` gained difflib's junk
+  elements, which `ndiff` needs. 37,750 cases against Python, including
+  every string of up to five characters from the field grammar's alphabet;
+  `text2diff` is a gate.
 - **The encodings text actually arrives in, as opposed to the ones it is
   labelled with.** `cp932` is the Shift-JIS Windows writes — with NEC's
   circled numbers and IBM's extended kanji, and with Microsoft's mapping of

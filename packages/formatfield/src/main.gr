@@ -1,0 +1,394 @@
+// `"{name:>10} {size}"` — the whole format string, not just the spec.
+//
+// `packages/formatspec` handles what comes after the colon. This handles the
+// rest: finding the replacement fields in a string, the escaped braces
+// between them, the field names with their `.attribute` and `[index]`
+// parts, the `!r` conversion, and a spec that itself contains fields. That
+// is what a program needs to accept a user's output template — a log
+// format, a `--format` flag, a filename pattern — and to reject one that is
+// malformed before it is ever used.
+//
+// The parsing rules are Python's `string.Formatter.parse`, and they have
+// edges worth knowing:
+//
+//   - `{{` and `}}` are literal braces, and a literal run is split at each
+//     one: `"a{{b"` is the literal `a{` followed by the literal `b`.
+//   - A lone `}` anywhere is an error. A lone `{` at the end is an error.
+//   - A field name ends at the first `!` or `:` — except inside `[...]`,
+//     so `{a[:]}` is a field named `a[:]` with no spec.
+//   - The spec runs to the matching `}`, counting nested braces, so
+//     `{a:{b:{c}}}` has the spec `{b:{c}}`.
+//   - A name that is all digits is a position; an empty name takes the next
+//     position; and a string may not mix the two.
+//
+// Values here are strings, and a field's spec is handed to `formatspec`.
+// Attribute access on a value is refused rather than guessed at, because a
+// string has no attributes worth naming and pretending otherwise would make
+// a template that works here fail in Python.
+//
+// Checked against `string.Formatter().parse` exhaustively over every short
+// string of the characters that matter, and against `str.format`.
+
+import formatspec
+
+type FieldError =
+    | FieldSingleClose(at: i64)
+    | FieldSingleOpen(at: i64)
+    | FieldUnmatched(at: i64)
+    | FieldConversion(at: i64)
+    | FieldName(name: str)
+    | FieldNumbering(why: str)
+    | FieldMissing(name: str)
+    | FieldSpec(spec: str)
+
+    /// One piece of a format string: literal text, and the field after it if
+    /// there is one.
+type FormatPiece = {
+    literal: str,
+    /// Whether a field follows the literal.
+    has_field: bool,
+    name: str,
+    spec: str,
+    /// The conversion character, or empty for none.
+    conversion: str,
+}
+
+/// The pieces of a format string, as `Formatter.parse` yields them.
+pub fn parse(text: str) -> [FormatPiece] ! FieldError {
+    var out: [FormatPiece] = []
+    var at = 0
+    while at < text.len() {
+        let literal_start = at
+        var c = ""
+        var markup = false
+        while at < text.len() {
+            c = text.substr(at, 1)
+            at = at + 1
+            if c == "\{" or c == "\}" {
+                markup = true
+                break
+            }
+        }
+        var literal_end = at
+        if markup {
+            let at_end = at >= text.len()
+            if c == "\}" and (at_end or text.substr(at, 1) != "\}") {
+                fail(FieldSingleClose(at - 1))
+            }
+            if c == "\{" and at_end {
+                fail(FieldSingleOpen(at - 1))
+            }
+            if text.substr(at, 1) == c {
+                // `{{` or `}}`: the first brace stays in the literal and the
+                // second is skipped.
+                at = at + 1
+                markup = false
+            } else {
+                literal_end = at - 1
+            }
+        }
+        let literal = text.substr(literal_start, literal_end - literal_start)
+        if not markup {
+            out.push(FormatPiece{ literal: literal, has_field: false,
+                name: "", spec: "", conversion: "" })
+            continue
+        }
+        let field = try read_field(text, at)
+        out.push(FormatPiece{ literal: literal, has_field: true,
+            name: field.0, spec: field.1, conversion: field.2 })
+        at = field.3
+    }
+    return out
+}
+
+/// The field starting just after a `{` at `at`: name, spec, conversion, and
+/// where the text resumes after it.
+///
+/// This consumes the string rather than finding the closing brace first,
+/// because the rules for where the field ends depend on what came before:
+/// a `[` hides everything up to its `]`, a `!` takes the very next
+/// character as the conversion whatever it is — even a brace — and only the
+/// spec counts nested braces.
+fn read_field(text: str, at: i64) -> (str, str, str, i64) ! FieldError {
+    var i = at
+    var c = ""
+    var stopped = false
+    while i < text.len() {
+        c = text.substr(i, 1)
+        i = i + 1
+        if c == "\{" {
+            fail(FieldName(text.substr(at, i - at)))
+        }
+        if c == "[" {
+            while i < text.len() and text.substr(i, 1) != "]" {
+                i = i + 1
+            }
+            continue
+        }
+        if c == "\}" or c == ":" or c == "!" {
+            stopped = true
+            break
+        }
+    }
+    if not stopped {
+        // Ran off the end still inside the name.
+        fail(FieldUnmatched(at - 1))
+    }
+    let name = text.substr(at, i - 1 - at)
+    if c == "\}" {
+        return (name, "", "", i)
+    }
+    var conversion = ""
+    if c == "!" {
+        if i >= text.len() {
+            fail(FieldConversion(i))
+        }
+        conversion = text.substr(i, 1)
+        i = i + 1
+        if i < text.len() {
+            let after = text.substr(i, 1)
+            i = i + 1
+            if after == "\}" {
+                return (name, "", conversion, i)
+            }
+            if after != ":" {
+                fail(FieldConversion(i - 1))
+            }
+        }
+    }
+    let spec_start = i
+    var count = 1
+    while i < text.len() {
+        let d = text.substr(i, 1)
+        i = i + 1
+        if d == "\{" {
+            count = count + 1
+        } else if d == "\}" {
+            count = count - 1
+            if count == 0 {
+                return (name, text.substr(spec_start, i - 1 - spec_start),
+                    conversion, i)
+            }
+        }
+    }
+    fail(FieldUnmatched(spec_start))
+}
+
+/// A field name split into its first part and the `.attribute` and
+/// `[index]` steps after it, each written as `.name` or `[key]`.
+pub fn split_name(name: str) -> (str, [str]) ! FieldError {
+    var i = 0
+    while i < name.len() {
+        let c = name.substr(i, 1)
+        if c == "." or c == "[" {
+            break
+        }
+        i = i + 1
+    }
+    let first = name.substr(0, i)
+    var steps: [str] = []
+    while i < name.len() {
+        let c = name.substr(i, 1)
+        if c == "." {
+            var end = i + 1
+            while end < name.len() and name.substr(end, 1) != "." and
+            name.substr(end, 1) != "[" {
+                end = end + 1
+            }
+            if end == i + 1 {
+                fail(FieldName(name))
+            }
+            steps.push("." + name.substr(i + 1, end - i - 1))
+            i = end
+        } else if c == "[" {
+            var end = i + 1
+            while end < name.len() and name.substr(end, 1) != "]" {
+                end = end + 1
+            }
+            if end >= name.len() {
+                fail(FieldName(name))
+            }
+            steps.push("[" + name.substr(i + 1, end - i - 1) + "]")
+            i = end + 1
+            if i < name.len() and name.substr(i, 1) != "." and
+            name.substr(i, 1) != "[" {
+                fail(FieldName(name))
+            }
+        } else {
+            fail(FieldName(name))
+        }
+    }
+    return (first, steps)
+}
+
+fn is_digits(text: str) -> bool {
+    if text.len() == 0 {
+        return false
+    }
+    var i = 0
+    while i < text.len() {
+        let c = text.substr(i, 1)
+        if c < "0" or c > "9" {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+type FieldState = {
+    automatic: i64,
+    manual: bool,
+}
+
+fn resolve(state: FieldState, name: str, positional: [str], names: [str],
+    values: [str]) -> (str, FieldState) ! FieldError {
+    var next = state
+    let split = try split_name(name)
+    var value = ""
+    if split.0.len() == 0 {
+        if state.manual {
+            fail(FieldNumbering("manual then automatic"))
+        }
+        if state.automatic >= positional.len() {
+            fail(FieldMissing(state.automatic.to_str()))
+        }
+        value = positional[state.automatic]
+        next.automatic = state.automatic + 1
+    } else if is_digits(split.0) {
+        if state.automatic > 0 {
+            fail(FieldNumbering("automatic then manual"))
+        }
+        next.manual = true
+        let index = split.0.parse_int() ?? 0
+        if index >= positional.len() {
+            fail(FieldMissing(split.0))
+        }
+        value = positional[index]
+    } else {
+        var found = false
+        var i = 0
+        while i < names.len() {
+            if names[i] == split.0 {
+                value = values[i]
+                found = true
+            }
+            i = i + 1
+        }
+        if not found {
+            fail(FieldMissing(split.0))
+        }
+    }
+    for step in split.1 {
+        if step.starts_with(".") {
+            // Strings have no attributes worth reaching for.
+            fail(FieldName(name))
+        }
+        let key = step.substr(1, step.len() - 2)
+        if not is_digits(key) {
+            fail(FieldName(name))
+        }
+        let index = key.parse_int() ?? 0
+        let chars = value.chars()
+        if index >= chars.len() {
+            fail(FieldMissing(name))
+        }
+        value = chars[index]
+    }
+    return (value, next)
+}
+
+/// A string's `repr`, for `!r`: quoted with `'` unless it contains `'` and
+/// not `"`, backslashes and control characters escaped.
+pub fn repr_of(value: str) -> str {
+    var quote = "'"
+    if (value.index_of("'") ?? -1) >= 0 and (value.index_of("\"") ?? -1) < 0 {
+        quote = "\""
+    }
+    var out = quote
+    for code in value.codes() {
+        let c = code.to_char()
+        if c == "\\" {
+            out = out + "\\\\"
+        } else if c == quote {
+            out = out + "\\" + quote
+        } else if code == 10 {
+            out = out + "\\n"
+        } else if code == 13 {
+            out = out + "\\r"
+        } else if code == 9 {
+            out = out + "\\t"
+        } else if code < 32 or code == 127 {
+            let digits = "0123456789abcdef"
+            out = out + "\\x" + digits.substr(code / 16, 1) +
+            digits.substr(code % 16, 1)
+        } else {
+            out = out + c
+        }
+    }
+    return out + quote
+}
+
+/// A format string with its fields filled from string values.
+///
+/// Positional values fill `{}` and `{0}`; named ones fill `{name}`. A spec
+/// may itself contain fields, which are filled first.
+pub fn format(text: str, positional: [str], names: [str],
+    values: [str]) -> str ! FieldError {
+    var state = FieldState{ automatic: 0, manual: false }
+    var out = ""
+    for piece in try parse(text) {
+        out = out + piece.literal
+        if not piece.has_field {
+            continue
+        }
+        let found = try resolve(state, piece.name, positional, names, values)
+        state = found.1
+        var value = found.0
+        if piece.conversion == "r" or piece.conversion == "a" {
+            value = repr_of(value)
+        } else if piece.conversion != "" and piece.conversion != "s" {
+            fail(FieldConversion(0))
+        }
+        var spec = piece.spec
+        if (spec.index_of("\{") ?? -1) >= 0 {
+            // A nested field in the spec shares the numbering of the outer
+            // string, which is why this goes through the same state.
+            var inner = ""
+            for part in try parse(spec) {
+                inner = inner + part.literal
+                if part.has_field {
+                    let nested = try resolve(state, part.name, positional,
+                        names, values)
+                    state = nested.1
+                    inner = inner + nested.0
+                }
+            }
+            spec = inner
+        }
+        match formatspec.format_str(value, spec) {
+            Ok(text_value) -> out = out + text_value
+            Err(_e) -> fail(FieldSpec(spec))
+        }
+    }
+    return out
+}
+
+/// The names a format string refers to, as written, in order.
+pub fn field_names(text: str) -> [str] ! FieldError {
+    var out: [str] = []
+    for piece in try parse(text) {
+        if piece.has_field {
+            out.push(piece.name)
+        }
+    }
+    return out
+}
+
+/// Whether a format string parses at all.
+pub fn is_valid(text: str) -> bool {
+    match parse(text) {
+        Ok(_pieces) -> return true
+        Err(_e) -> return false
+    }
+}

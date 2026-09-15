@@ -1,0 +1,300 @@
+// A diff for people, with the changed characters marked under each line.
+//
+// `packages/difftext` writes unified and context diffs, which are for
+// `patch`. This writes the other kind: every line of both inputs, prefixed
+// `- `, `+ ` or two spaces, and — for a line that changed a little rather
+// than a lot — a `? ` line underneath with `^`, `-` and `+` in the columns
+// that differ. It is what `difflib.ndiff` produces and what a test runner
+// prints when two strings should have been equal, and reading it is the
+// fastest way to see that `recieve` should have been `receive`.
+//
+//     - one
+//     ?  ^
+//     + ore
+//     ?  ^
+//
+// The hard part is deciding which lines "changed a little". Given a block
+// of removed lines and a block of added ones, it looks for the most similar
+// pair, character by character, and only pairs them when the similarity
+// ratio beats 0.75; a line rewritten from scratch is shown as a plain
+// removal and addition. The search is bounded to a window of ten lines on
+// either side of where the partner would be, which is the change CPython
+// made to stop a pathological input taking cubic time.
+//
+// Two details make the markers readable rather than noisy, and both are
+// here:
+//
+//   - **Spaces and tabs are junk** in the character comparison: never the
+//     basis of a match, only absorbed by one. An indentation change does not
+//     drown the real difference in markers.
+//   - **Whitespace in the original line is kept under it.** Where a column
+//     is unchanged and the line has a tab there, the `?` line has a tab
+//     there too, so the markers line up in a terminal instead of drifting by
+//     the width of every tab to their left.
+//
+// Checked against `difflib.ndiff`.
+
+import closematch
+import difftext
+
+let CUTOFF_TOP = 74999
+let CUTOFF_BOTTOM = 100000
+let WINDOW = 10
+
+fn character_junk() -> [str] {
+    return [" ", "\t"]
+}
+
+/// A ratio held as a fraction, so that comparing two of them is exact
+/// rather than a question about how floats round.
+type NdiffRatio = {
+    top: i64,
+    bottom: i64,
+}
+
+fn above(a: NdiffRatio, b: NdiffRatio) -> bool {
+    return a.top * b.bottom > b.top * a.bottom
+}
+
+fn fraction(matched: i64, total: i64) -> NdiffRatio {
+    if total == 0 {
+        return NdiffRatio{ top: 1, bottom: 1 }
+    }
+    return NdiffRatio{ top: 2 * matched, bottom: total }
+}
+
+fn rough(a: [str], b: [str]) -> NdiffRatio {
+    let shorter = if a.len() < b.len() { a.len() } else { b.len() }
+    return fraction(shorter, a.len() + b.len())
+}
+
+fn quick(a: [str], b: [str]) -> NdiffRatio {
+    var counts: Map[str, i64] = {}
+    for element in b {
+        counts.set(element, (counts.get(element) ?? 0) + 1)
+    }
+    var shared = 0
+    for element in a {
+        let left = counts.get(element) ?? 0
+        if left > 0 {
+            counts.set(element, left - 1)
+            shared = shared + 1
+        }
+    }
+    return fraction(shared, a.len() + b.len())
+}
+
+fn full(a: [str], b: [str]) -> NdiffRatio {
+    var matched = 0
+    for block in closematch.matching_blocks_with_junk(a, b,
+        character_junk()) {
+        matched = matched + block.2
+    }
+    return fraction(matched, a.len() + b.len())
+}
+
+fn dump(inout out: [str], tag: str, lines: [str], from: i64, to: i64) {
+    var i = from
+    while i < to {
+        out.push(tag + " " + lines[i])
+        i = i + 1
+    }
+}
+
+fn plain_replace(inout out: [str], a: [str], a_lo: i64, a_hi: i64,
+    b: [str], b_lo: i64, b_hi: i64) {
+    // Whichever block is shorter goes first, which is what keeps the
+    // output from reading as a long removal and then a long addition.
+    if b_hi - b_lo < a_hi - a_lo {
+        dump(out, "+", b, b_lo, b_hi)
+        dump(out, "-", a, a_lo, a_hi)
+    } else {
+        dump(out, "-", a, a_lo, a_hi)
+        dump(out, "+", b, b_lo, b_hi)
+    }
+}
+
+fn helper(inout out: [str], a: [str], a_lo: i64, a_hi: i64, b: [str],
+    b_lo: i64, b_hi: i64) {
+    if a_lo < a_hi {
+        if b_lo < b_hi {
+            plain_replace(out, a, a_lo, a_hi, b, b_lo, b_hi)
+        } else {
+            dump(out, "-", a, a_lo, a_hi)
+        }
+    } else if b_lo < b_hi {
+        dump(out, "+", b, b_lo, b_hi)
+    }
+}
+
+/// Whether a character counts as whitespace for keeping it under a line.
+fn is_space(c: str) -> bool {
+    let code = c.codes()[0]
+    if code == 32 or (code >= 9 and code <= 13) or
+    (code >= 28 and code <= 31) {
+        return true
+    }
+    return code == 133 or code == 160 or code == 5760 or
+    (code >= 8192 and code <= 8202) or code == 8232 or code == 8233 or
+    code == 8239 or code == 8287 or code == 12288
+}
+
+/// The markers with the original whitespace kept where a column is
+/// unchanged, and the trailing blanks taken off.
+fn keep_whitespace(line: [str], tags: str) -> str {
+    var out = ""
+    var i = 0
+    while i < tags.len() and i < line.len() {
+        let tag = tags.substr(i, 1)
+        if tag == " " and is_space(line[i]) {
+            out = out + line[i]
+        } else {
+            out = out + tag
+        }
+        i = i + 1
+    }
+    var end = out.len()
+    while end > 0 {
+        let c = out.substr(end - 1, 1)
+        if not is_space(c) {
+            break
+        }
+        end = end - 1
+    }
+    return out.substr(0, end)
+}
+
+fn marked_pair(inout out: [str], a_line: str, b_line: str) {
+    let a = a_line.chars()
+    let b = b_line.chars()
+    var a_tags = ""
+    var b_tags = ""
+    var i = 0
+    var j = 0
+    for block in closematch.matching_blocks_with_junk(a, b,
+        character_junk()) {
+        let la = block.0 - i
+        let lb = block.1 - j
+        if la > 0 and lb > 0 {
+            a_tags = a_tags + repeat("^", la)
+            b_tags = b_tags + repeat("^", lb)
+        } else if la > 0 {
+            a_tags = a_tags + repeat("-", la)
+        } else if lb > 0 {
+            b_tags = b_tags + repeat("+", lb)
+        }
+        a_tags = a_tags + repeat(" ", block.2)
+        b_tags = b_tags + repeat(" ", block.2)
+        i = block.0 + block.2
+        j = block.1 + block.2
+    }
+    let a_marks = keep_whitespace(a, a_tags)
+    let b_marks = keep_whitespace(b, b_tags)
+    out.push("- " + a_line)
+    if a_marks.len() > 0 {
+        out.push("? " + a_marks + "\n")
+    }
+    out.push("+ " + b_line)
+    if b_marks.len() > 0 {
+        out.push("? " + b_marks + "\n")
+    }
+}
+
+fn repeat(text: str, times: i64) -> str {
+    var out = ""
+    var i = 0
+    while i < times {
+        out = out + text
+        i = i + 1
+    }
+    return out
+}
+
+fn larger(a: i64, b: i64) -> i64 {
+    return if a > b { a } else { b }
+}
+
+fn smaller(a: i64, b: i64) -> i64 {
+    return if a < b { a } else { b }
+}
+
+fn fancy_replace(inout out: [str], a: [str], a_lo: i64, a_hi: i64,
+    b: [str], b_lo: i64, b_hi: i64) {
+    let cutoff = NdiffRatio{ top: CUTOFF_TOP, bottom: CUTOFF_BOTTOM }
+    var dump_i = a_lo
+    var dump_j = b_lo
+    var j = b_lo
+    while j < b_hi {
+        let right = b[j].chars()
+        let equivalent = a_lo + (j - b_lo)
+        let from = larger(equivalent - WINDOW, dump_i)
+        let to = smaller(equivalent + WINDOW + 1, a_hi)
+        if from >= to {
+            break
+        }
+        var best = cutoff
+        var best_i = 0 - 1
+        var i = from
+        while i < to {
+            let left = a[i].chars()
+            if above(rough(left, right), best) and
+            above(quick(left, right), best) {
+                let score = full(left, right)
+                if above(score, best) {
+                    best = score
+                    best_i = i
+                }
+            }
+            i = i + 1
+        }
+        if best_i < 0 {
+            j = j + 1
+            continue
+        }
+        helper(out, a, dump_i, best_i, b, dump_j, j)
+        if a[best_i] != b[j] {
+            marked_pair(out, a[best_i], b[j])
+        } else {
+            out.push("  " + a[best_i])
+        }
+        dump_i = best_i + 1
+        dump_j = j + 1
+        j = j + 1
+    }
+    helper(out, a, dump_i, a_hi, b, dump_j, b_hi)
+}
+
+/// Two lists of lines compared, as `difflib.ndiff` compares them.
+///
+/// Lines keep their own endings, and so does every `? ` line, which ends in
+/// a newline of its own.
+pub fn compare(a: [str], b: [str]) -> [str] {
+    var out: [str] = []
+    for code in difftext.opcodes(a, b) {
+        if code.tag == "replace" {
+            fancy_replace(out, a, code.a_from, code.a_to, b, code.b_from,
+                code.b_to)
+        } else if code.tag == "delete" {
+            dump(out, "-", a, code.a_from, code.a_to)
+        } else if code.tag == "insert" {
+            dump(out, "+", b, code.b_from, code.b_to)
+        } else {
+            dump(out, " ", a, code.a_from, code.a_to)
+        }
+    }
+    return out
+}
+
+/// One side of an ndiff back out of it: `1` for the first sequence, `2` for
+/// the second — which is `difflib.restore`, and what makes the format a
+/// complete record rather than a summary.
+pub fn restore(delta: [str], which: i64) -> [str] {
+    let keep = if which == 1 { "- " } else { "+ " }
+    var out: [str] = []
+    for line in delta {
+        if line.starts_with(keep) or line.starts_with("  ") {
+            out.push(line.substr(2, line.len() - 2))
+        }
+    }
+    return out
+}

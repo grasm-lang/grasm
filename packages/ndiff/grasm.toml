@@ -1,0 +1,14 @@
+[package]
+name = "ndiff"
+version = "1.0.0"
+
+# Comparison and string building. Opens nothing.
+capabilities = []
+
+[dependencies.closematch]
+path = "../closematch"
+version = "^1.0.0"
+
+[dependencies.difftext]
+path = "../difftext"
+version = "^1.0.0"

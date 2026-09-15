@@ -1,0 +1,121 @@
+// Z85: base85 that survives being pasted into source code.
+//
+// `packages/ascii85` and `packages/base85` already carry Adobe's and
+// RFC 1924's alphabets. Z85 is ZeroMQ's, and it exists because both of those
+// use characters that break things: Ascii85 uses `"` and `\` and `'`, which
+// need escaping in every string literal, and `<~ ~>` framing. Z85 picks 85
+// characters that need no escaping in C, JSON, XML or a shell — which is why
+// CurveZMQ keys, several configuration formats and a fair amount of
+// generated code carry binary this way.
+//
+// Four bytes become five characters, big-endian, most significant digit
+// first. The specification says input must be a multiple of four bytes and
+// output a multiple of five. Python's `base64.z85encode` relaxes that the
+// way Ascii85 does: a short final group is padded with zeros, encoded, and
+// the extra characters dropped — so one byte is two characters, two are
+// three, three are four. This follows Python, because a file written by one
+// has to read with the other, and `encode_strict` is here for a peer that
+// insists on the specification.
+//
+// Checked against Python's `base64.z85encode` and `z85decode`.
+
+let ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ" +
+".-:+=^!/*?&<>()[]\{\}@%$#"
+
+type Z85Error =
+    | Z85Character(at: i64, c: str)
+    | Z85Length(len: i64)
+    | Z85Overflow(at: i64)
+
+fn digit_of(c: str) -> i64 {
+    return ALPHABET.index_of(c) ?? -1
+}
+
+/// `raw` as Z85, a short final group allowed and trimmed.
+pub fn encode(raw: bytes) -> str {
+    var out = ""
+    var at = 0
+    while at < raw.len() {
+        var value = 0
+        var taken = 0
+        var i = 0
+        while i < 4 {
+            var b = 0
+            if at + i < raw.len() {
+                b = raw.at(at + i)
+                taken = taken + 1
+            }
+            value = value * 256 + b
+            i = i + 1
+        }
+        var group = ""
+        var k = 0
+        while k < 5 {
+            group = ALPHABET.substr(value % 85, 1) + group
+            value = value / 85
+            k = k + 1
+        }
+        // A short group loses as many characters as it was short of bytes.
+        out = out + group.substr(0, taken + 1)
+        at = at + 4
+    }
+    return out
+}
+
+/// `raw` as the specification writes it: four bytes at a time, or nothing.
+pub fn encode_strict(raw: bytes) -> str ! Z85Error {
+    if raw.len() % 4 != 0 {
+        fail(Z85Length(raw.len()))
+    }
+    return encode(raw)
+}
+
+/// Text back to bytes. A short final group is padded with the highest
+/// digit and its extra bytes dropped, which is the inverse of `encode`.
+pub fn decode(text: str) -> bytes ! Z85Error {
+    var out: [i64] = []
+    var at = 0
+    while at < text.len() {
+        var value = 0
+        var taken = 0
+        var i = 0
+        while i < 5 {
+            var digit = 84
+            if at + i < text.len() {
+                let c = text.substr(at + i, 1)
+                digit = digit_of(c)
+                if digit < 0 {
+                    fail(Z85Character(at + i, c))
+                }
+                taken = taken + 1
+            }
+            value = value * 85 + digit
+            i = i + 1
+        }
+        if value > 4294967295 {
+            // Five digits can name more than four bytes can hold.
+            fail(Z85Overflow(at))
+        }
+        var group: [i64] = []
+        var k = 0
+        while k < 4 {
+            group.push(value.ushr((3 - k) * 8).bit_and(255))
+            k = k + 1
+        }
+        var j = 0
+        while j < taken - 1 {
+            out.push(group[j])
+            j = j + 1
+        }
+        at = at + 5
+    }
+    return bytes_of(out)
+}
+
+/// Whether `text` is something this will decode.
+pub fn is_valid(text: str) -> bool {
+    match decode(text) {
+        Ok(_raw) -> return true
+        Err(_e) -> return false
+    }
+}
