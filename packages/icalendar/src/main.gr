@@ -40,7 +40,7 @@ type CalendarError =
     | NotACalendar()
     | BadDate(text: str)
 
-    /// One component: its name, its properties and the components inside it.
+/// One component: its name, its properties and the components inside it.
 type CalComponent = {
     name: str,
     properties: [ContentLine],

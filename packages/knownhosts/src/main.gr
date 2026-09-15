@@ -33,7 +33,7 @@ import bytes_codec
 type KnownHostsError =
     | BadHash(line: i64)
 
-    /// One line of the file.
+/// One line of the file.
 type KnownHostEntry = {
     /// `@cert-authority`, `@revoked`, or the empty string.
     marker: str,

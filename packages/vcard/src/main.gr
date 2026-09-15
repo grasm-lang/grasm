@@ -28,7 +28,7 @@ type CardError =
     | NotACard()
     | Unbalanced()
 
-    /// One card: its properties, in the order they were written.
+/// One card: its properties, in the order they were written.
 type VCard = {
     properties: [ContentLine],
 }

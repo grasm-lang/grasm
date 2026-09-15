@@ -54,11 +54,11 @@ type RangeError =
     | RangeEmpty
     | RangeTooMany(given: i64, limit: i64)
 
-    /// The most ranges a single request may ask for.
-    ///
-    /// A request with ten thousand one-byte ranges makes a server assemble a
-    /// multipart body far larger than the resource. Every real server caps this;
-    /// the cap is the defence.
+/// The most ranges a single request may ask for.
+///
+/// A request with ten thousand one-byte ranges makes a server assemble a
+/// multipart body far larger than the resource. Every real server caps this;
+/// the cap is the defence.
 pub fn range_limit() -> i64 {
     return 100
 }

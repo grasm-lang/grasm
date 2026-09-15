@@ -35,11 +35,11 @@ type QuantityError =
     | TooLarge(text: str)
     | NotWhole(text: str)
 
-    /// An exact value: `units` times ten to the `scale`.
-    ///
-    /// A binary suffix multiplies `units` rather than moving `scale`, because
-    /// 1024 is not a power of ten and pretending otherwise is where the
-    /// rounding creeps in.
+/// An exact value: `units` times ten to the `scale`.
+///
+/// A binary suffix multiplies `units` rather than moving `scale`, because
+/// 1024 is not a power of ten and pretending otherwise is where the
+/// rounding creeps in.
 type KubeQuantity = {
     units: BigInt,
     scale: i64,

@@ -35,7 +35,7 @@ type PepRequirementError =
     | BadMarker(text: str)
     | BadVersion(text: str)
 
-    /// One marker comparison.
+/// One marker comparison.
 type PepMarkerClause = {
     left: str,
     /// `==`, `!=`, `<`, `<=`, `>`, `>=`, `~=`, `===`, `in`, `not in`.

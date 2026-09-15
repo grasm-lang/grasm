@@ -30,7 +30,7 @@ type IbanError =
     | BadCharacter(at: i64)
     | CheckFailed(remainder: i64)
 
-    /// Country code and total IBAN length, flat.
+/// Country code and total IBAN length, flat.
 fn lengths() -> [str] {
     return [
         "AD", "24", "AE", "23", "AL", "28", "AT", "20", "AZ", "28",

@@ -27,11 +27,11 @@ type LocaleError =
     | Malformed(tag: str, why: str)
     | UnknownLocale(tag: str)
 
-    /// Parse a BCP 47 tag.
-    ///
-    /// Case is normalised rather than preserved: `EN-latn-us` and `en-Latn-US`
-    /// are the same tag, and a comparison that says otherwise is a bug waiting
-    /// for its first non-English user.
+/// Parse a BCP 47 tag.
+///
+/// Case is normalised rather than preserved: `EN-latn-us` and `en-Latn-US`
+/// are the same tag, and a comparison that says otherwise is a bug waiting
+/// for its first non-English user.
 pub fn parse(tag: str) -> LocaleTag ! LocaleError {
     let text = tag.trim().replace("_", "-")
     if text == "" {

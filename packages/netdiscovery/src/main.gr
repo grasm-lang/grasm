@@ -59,7 +59,7 @@ type DiscoveryError =
     | DiscoveryBadTxt(at: i64)
     | DiscoveryNotSsdp(line: str)
 
-    /// The multicast address and port DNS-SD uses on IPv4.
+/// The multicast address and port DNS-SD uses on IPv4.
 pub fn mdns_address() -> str {
     return "224.0.0.251"
 }

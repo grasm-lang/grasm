@@ -43,7 +43,7 @@ type MlError =
     | NotFitted()
     | EmptyCluster(index: i64)
 
-    /// A fitted model: where the centres ended up and what it cost.
+/// A fitted model: where the centres ended up and what it cost.
 type KMeans = {
     centres: [[f64]],
     /// Which cluster each point was given, in the order the points came in.

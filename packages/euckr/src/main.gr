@@ -36,12 +36,12 @@ type EucKrError =
     | Truncated(at: i64)
     | Unencodable(at: i64, codepoint: i64)
 
-    /// A prepared reverse table.
-    ///
-    /// Decoding is a lookup and needs nothing prepared. Encoding is the other
-    /// way round, and searching a table of thousands of entries for every
-    /// character would make encoding quadratic in the size of the table. A caller
-    /// encoding more than a line of text builds one of these once.
+/// A prepared reverse table.
+///
+/// Decoding is a lookup and needs nothing prepared. Encoding is the other
+/// way round, and searching a table of thousands of entries for every
+/// character would make encoding quadratic in the size of the table. A caller
+/// encoding more than a line of text builds one of these once.
 type EucKrEncoder = { map: Map[i64, i64] }
 
 fn leads() -> [i64] {

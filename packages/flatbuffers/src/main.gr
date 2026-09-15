@@ -40,7 +40,7 @@ type FlatError =
     | NotAligned(at: i64, alignment: i64)
     | BadIdentifier(found: str)
 
-    /// A table: where it starts, and where its vtable is.
+/// A table: where it starts, and where its vtable is.
 type Flat = {
     data: bytes,
     /// The table's own position in the buffer.

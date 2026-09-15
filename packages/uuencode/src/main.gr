@@ -38,7 +38,7 @@ type UuencodeError =
     | BadLength(line: i64)
     | BadCharacter(character: str, line: i64)
 
-    /// What a `begin` line says.
+/// What a `begin` line says.
 type UuHeader = {
     /// Permission bits, as a number — `644` reads as 420.
     mode: i64,

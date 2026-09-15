@@ -33,7 +33,7 @@ type ZoneError =
     | BadTtl(text: str, line: i64)
     | Unsupported(directive: str, line: i64)
 
-    /// One resource record.
+/// One resource record.
 type ZoneRecord = {
     /// Absolute, with the trailing dot.
     name: str,

@@ -35,7 +35,7 @@ type SshKeyError =
     | SshKeyTypeMismatch(outer: str, inner: str)
     | SshKeyTruncated(at: i64)
 
-    /// A public key as an `authorized_keys` line holds it.
+/// A public key as an `authorized_keys` line holds it.
 type SshPublicKey = {
     /// The key type, as both the line and the blob spell it.
     kind: str,

@@ -14,7 +14,7 @@ type Wait =
     | AtDate(text: str)
     | Absent
 
-    /// What the header says, without guessing at a date's value.
+/// What the header says, without guessing at a date's value.
 pub fn parse(header: str) -> Wait {
     let text = header.trim()
     if text == "" {

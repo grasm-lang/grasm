@@ -40,7 +40,7 @@ type EntropyError =
     | Empty()
     | BadAlphabet(size: i64)
 
-    /// Which kinds of character a string uses.
+/// Which kinds of character a string uses.
 type Alphabet = {
     lower: bool,
     upper: bool,

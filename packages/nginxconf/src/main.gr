@@ -33,7 +33,7 @@ type NginxError =
     | Unterminated(line: i64)
     | UnclosedQuote(line: i64)
 
-    /// One directive.
+/// One directive.
 type NginxDirective = {
     name: str,
     args: [str],

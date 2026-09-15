@@ -70,11 +70,11 @@ type KeyRead = {
 type KeyError =
     | KeyEmpty
 
-    /// The milliseconds to wait before deciding a lone escape was Escape.
-    ///
-    /// Long enough that a terminal's own sequence arrives in one read, short
-    /// enough that a person does not notice. 25 to 50 is the range every
-    /// implementation lands in; this is the middle of it.
+/// The milliseconds to wait before deciding a lone escape was Escape.
+///
+/// Long enough that a terminal's own sequence arrives in one read, short
+/// enough that a person does not notice. 25 to 50 is the range every
+/// implementation lands in; this is the middle of it.
 pub fn escape_timeout_millis() -> i64 {
     return 30
 }

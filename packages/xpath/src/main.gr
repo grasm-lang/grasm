@@ -56,7 +56,7 @@ type XPathError =
     | XPathMalformed(path: str, at: i64)
     | XPathEmptyStep(path: str)
 
-    /// Split a path into steps.
+/// Split a path into steps.
 pub fn compile(path: str) -> [XPathStep] ! XPathError {
     if path == "" {
         fail(XPathEmptyStep(path))

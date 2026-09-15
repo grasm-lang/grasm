@@ -17,9 +17,9 @@ type Tok =
     | TLParen
     | TRParen
 
-    // The tree. Recursive sum types need `ref` here: a variant that holds another
-    // node of its own type has no fixed size, and `ref T` is the copyable
-    // generational handle that gives it one ([T-REF-GENERATIONAL]).
+// The tree. Recursive sum types need `ref` here: a variant that holds another
+// node of its own type has no fixed size, and `ref T` is the copyable
+// generational handle that gives it one ([T-REF-GENERATIONAL]).
 type Node =
     | Num(v: f64)
     | Neg(e: ref Node)

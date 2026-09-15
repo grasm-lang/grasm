@@ -48,7 +48,7 @@ type AstarError =
     | AstarNegativeCost(from: i64, to: i64, cost: i64)
     | AstarBudgetSpent(expanded: i64)
 
-    /// A binary min-heap keyed by `f`, with the node beside it.
+/// A binary min-heap keyed by `f`, with the node beside it.
 type AstarHeap = {
     key: [i64],
     node: [i64],

@@ -58,7 +58,7 @@ fn mul32(a: i64, b: i64) -> i64 {
 fn hash4(data: bytes, at: i64) -> i64 {
     let v = mask32(data.at(at).bit_or(data.at(at + 1).shl(8))
             .bit_or(data.at(at + 2).shl(16)).bit_or(data.at(at + 3).shl(24)))
-        // Knuth's multiplicative hash; the top twelve bits index the table.
+    // Knuth's multiplicative hash; the top twelve bits index the table.
     return mul32(v, 2654435761).ushr(20)
 }
 

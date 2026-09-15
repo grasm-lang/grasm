@@ -43,7 +43,7 @@ type GitIndexError =
     | GitIndexTruncated(at: i64)
     | GitIndexChecksum(want: str, got: str)
 
-    /// One path in the index.
+/// One path in the index.
 type GitIndexEntry = {
     path: str,
     /// The file mode, as `ls-files` prints it: 100644, 100755, 120000,

@@ -35,7 +35,7 @@ type MoError =
     | MoTruncated(at: i64)
     | MoBadOffset(at: i64)
 
-    /// A catalogue, ready to be looked up in.
+/// A catalogue, ready to be looked up in.
 type MoCatalogue = {
     /// Key to translation, with plural forms joined by NUL as stored.
     entries: Map[str, str],

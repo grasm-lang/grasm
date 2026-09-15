@@ -60,7 +60,7 @@ type ChangelogError =
     | NotSemver(text: str)
     | UnknownSection(name: str)
 
-    /// The six sections, in the order Keep a Changelog lists them.
+/// The six sections, in the order Keep a Changelog lists them.
 pub fn sections() -> [str] {
     return ["Added", "Changed", "Deprecated", "Removed", "Fixed", "Security"]
 }

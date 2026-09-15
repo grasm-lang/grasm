@@ -31,7 +31,7 @@
 type TaskQueueError =
     | BadPolicy(name: str)
 
-    /// A bounded queue of strings, with the numbers somebody will ask for.
+/// A bounded queue of strings, with the numbers somebody will ask for.
 type TaskQueue = {
     items: [str],
     /// The most it will hold. Zero means it holds nothing at all.

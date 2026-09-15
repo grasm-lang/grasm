@@ -18,7 +18,7 @@ type BencodeError =
     | Truncated
     | NotCanonical(why: str)
 
-    /// A parsed document: nodes in a flat arena, `root` first.
+/// A parsed document: nodes in a flat arena, `root` first.
 type Bdoc = {
     node: [Bval],
 }

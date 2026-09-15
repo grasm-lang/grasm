@@ -42,7 +42,7 @@ type KdfError =
     | BadParameter(name: str, value: str)
     | MissingParameter(name: str)
 
-    /// A parsed crypt string.
+/// A parsed crypt string.
 type Crypt = {
     /// `argon2id`, `argon2i`, `scrypt`, `pbkdf2-sha256`, `pbkdf2-sha512`,
     /// `sha256-crypt`, `sha512-crypt` or `bcrypt`.

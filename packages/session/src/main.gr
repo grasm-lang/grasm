@@ -64,12 +64,12 @@ type WebSessionError =
     | SessionTooLarge(size: i64, limit: i64)
     | SessionBadKey(name: str)
 
-    /// The largest cookie a browser is required to keep.
-    ///
-    /// 4096 bytes including the name and the attributes. A session that grows past
-    /// it is not truncated by the browser — the whole cookie is dropped, and the
-    /// user is silently logged out. Refusing here turns that into an error at the
-    /// point the data was added.
+/// The largest cookie a browser is required to keep.
+///
+/// 4096 bytes including the name and the attributes. A session that grows past
+/// it is not truncated by the browser — the whole cookie is dropped, and the
+/// user is silently logged out. Refusing here turns that into an error at the
+/// point the data was added.
 pub fn cookie_limit() -> i64 {
     return 4096
 }

@@ -46,7 +46,7 @@ type PurlError =
     | BadVersion(version: str)
     | QualifierRequired(key: str)
 
-    /// A package URL, taken apart and normalised.
+/// A package URL, taken apart and normalised.
 type Purl = {
     /// Always lower case. `type` is a word this language keeps.
     kind: str,

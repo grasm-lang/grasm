@@ -47,7 +47,7 @@ type DkimError =
     | NoSignature()
     | BadTagList(text: str)
 
-    /// A parsed `DKIM-Signature` header.
+/// A parsed `DKIM-Signature` header.
 type DkimSignature = {
     /// The tags, in the order written.
     tags: [(str, str)],

@@ -36,7 +36,7 @@ type LdifError =
     | NoDistinguishedName(line: i64)
     | BadBase64(line: i64)
 
-    /// One attribute and one of its values.
+/// One attribute and one of its values.
 type LdifValue = {
     name: str,
     /// The decoded value. A `:<` reference keeps its URL here.

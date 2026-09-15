@@ -28,7 +28,7 @@ import semver
 type RangeSetError =
     | NotARange(text: str)
 
-    /// One comparator: an operator and a version.
+/// One comparator: an operator and a version.
 type RangeComparator = {
     /// `<`, `<=`, `>`, `>=` or `=`.
     operator: str,

@@ -36,7 +36,7 @@ type HzError =
     | HzTruncated(at: i64)
     | HzUnencodable(at: i64, code: i64)
 
-    /// The text `data` holds.
+/// The text `data` holds.
 pub fn decode(data: bytes) -> str ! HzError {
     var out = ""
     var inside = false

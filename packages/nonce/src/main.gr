@@ -22,12 +22,12 @@ type NonceError =
     | WrongLength(want: i64, got: i64)
     | AlreadyUsed(which: str)
 
-    /// A counter nonce: a fixed prefix, then a counter that never repeats for
-    /// that prefix.
-    ///
-    /// This is what AES-GCM and ChaCha20-Poly1305 want, and it beats random
-    /// nonces at 96 bits: random 96-bit nonces collide at about 2^48 messages,
-    /// which is reachable, and a counter does not collide at all.
+/// A counter nonce: a fixed prefix, then a counter that never repeats for
+/// that prefix.
+///
+/// This is what AES-GCM and ChaCha20-Poly1305 want, and it beats random
+/// nonces at 96 bits: random 96-bit nonces collide at about 2^48 messages,
+/// which is reachable, and a counter does not collide at all.
 type NonceCounter = {
     prefix: bytes,
     next: i64,

@@ -59,7 +59,7 @@ type LrParseError =
     | LeftRecursive(name: str)
     | TooManySteps(steps: i64)
 
-    /// A production with a dot in it.
+/// A production with a dot in it.
 type Item = {
     /// Which production, by index.
     production: i64,

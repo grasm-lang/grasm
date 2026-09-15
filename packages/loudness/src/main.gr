@@ -59,7 +59,7 @@ type LoudnessError =
     | TooShort(samples: i64, needed: i64)
     | NoChannels()
 
-    /// The absolute gate: quieter than this is silence.
+/// The absolute gate: quieter than this is silence.
 pub fn absolute_gate() -> f64 {
     return 0.0 - 70.0
 }

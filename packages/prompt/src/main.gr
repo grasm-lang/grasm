@@ -51,10 +51,10 @@ type PromptError =
     | PromptNoChoices
     | PromptNoTerminal(question: str)
 
-    /// The question, with its options shown the way people expect.
-    ///
-    /// The capital letter is the default, which is the convention every command
-    /// line tool follows and every user reads without thinking.
+/// The question, with its options shown the way people expect.
+///
+/// The capital letter is the default, which is the convention every command
+/// line tool follows and every user reads without thinking.
 pub fn render_confirm(question: str, default_yes: Option[bool]) -> str {
     match default_yes {
         Some(yes) -> {

@@ -54,10 +54,10 @@ type GroupError =
     | GroupEmpty
     | GroupNoFrames
 
-    /// Replace the parts of a message that vary between occurrences.
-    ///
-    /// The order matters: the longest and most specific patterns first, so that a
-    /// UUID is replaced as a UUID rather than as five separate hex runs.
+/// Replace the parts of a message that vary between occurrences.
+///
+/// The order matters: the longest and most specific patterns first, so that a
+/// UUID is replaced as a UUID rather than as five separate hex runs.
 pub fn normalise_message(text: str) -> str {
     var out = ""
     var i = 0

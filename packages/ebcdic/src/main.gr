@@ -34,7 +34,7 @@ type EbcdicError =
     | EbcdicUnknownPage(name: str)
     | EbcdicUnencodable(at: i64, codepoint: i64)
 
-    /// The code page names this package carries.
+/// The code page names this package carries.
 pub fn pages() -> [str] {
     return ["cp037", "cp273", "cp500", "cp1026", "cp1140"]
 }

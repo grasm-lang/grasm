@@ -40,11 +40,11 @@ type SqlEscapeError =
     | SqlNulInValue(at: i64)
     | SqlIdentifierTooLong(length: i64, limit: i64)
 
-    /// The longest identifier a dialect accepts.
-    ///
-    /// PostgreSQL truncates at 63 bytes *silently*, which is worse than refusing:
-    /// two different long names become the same object and the second `CREATE`
-    /// fails with a message about the first. This refuses instead.
+/// The longest identifier a dialect accepts.
+///
+/// PostgreSQL truncates at 63 bytes *silently*, which is worse than refusing:
+/// two different long names become the same object and the second `CREATE`
+/// fails with a message about the first. This refuses instead.
 pub fn identifier_limit(d: SqlDialect) -> i64 {
     match d {
         SqlPostgres -> return 63

@@ -42,7 +42,7 @@ type WebhookError =
     | FromTheFuture(skew: i64)
     | UnknownScheme(name: str)
 
-    /// What a check decided.
+/// What a check decided.
 type WebhookCheck = {
     valid: bool,
     /// The timestamp the header carried, or -1 when the scheme has none.

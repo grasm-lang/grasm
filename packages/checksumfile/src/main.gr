@@ -28,7 +28,7 @@
 type ChecksumError =
     | NotAChecksumLine(line: i64)
 
-    /// One entry.
+/// One entry.
 type ChecksumEntry = {
     /// Lower-cased hex.
     digest: str,

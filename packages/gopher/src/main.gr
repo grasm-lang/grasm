@@ -40,7 +40,7 @@ type GopherError =
     | GopherBadPort(line: i64, text: str)
     | GopherEmptyLine(line: i64)
 
-    /// The port gopher servers listen on.
+/// The port gopher servers listen on.
 pub fn port() -> i64 {
     return 70
 }

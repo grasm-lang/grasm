@@ -30,7 +30,7 @@ type Ip6Error =
     | NotAnAddress(text: str)
     | BadPrefix(bits: i64)
 
-    /// An address, as two 64-bit halves.
+/// An address, as two 64-bit halves.
 type Ip6 = {
     high: i64,
     low: i64,

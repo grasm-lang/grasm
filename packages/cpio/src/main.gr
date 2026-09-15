@@ -35,7 +35,7 @@ type CpioError =
     | BadMagic(at: i64)
     | BadNumber(text: str)
 
-    /// One entry of an archive.
+/// One entry of an archive.
 type CpioEntry = {
     name: str,
     mode: i64,

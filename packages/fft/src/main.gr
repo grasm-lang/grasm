@@ -30,7 +30,7 @@ type FftError =
     | FftEmpty
     | FftLengthMismatch(a: i64, b: i64)
 
-    /// Whether `n` is a power of two — the case radix-2 handles directly.
+/// Whether `n` is a power of two — the case radix-2 handles directly.
 pub fn is_power_of_two(n: i64) -> bool {
     if n < 1 {
         return false

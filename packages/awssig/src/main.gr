@@ -42,7 +42,7 @@ type SigError =
     | BadRegion(text: str)
     | NotCanonical(why: str)
 
-    /// A request, in the form the signer needs it.
+/// A request, in the form the signer needs it.
 type Signed = {
     method: str,
     /// The path, already URI-decoded; the signer encodes it.

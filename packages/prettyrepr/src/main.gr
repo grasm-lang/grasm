@@ -47,8 +47,8 @@ type PrettyOptions = {
 type PrettyError =
     | PrettyBadOption(why: str)
 
-    /// `PrettyPrinter()`'s defaults: indent 1, width 80, no depth limit, not
-    /// compact, dicts sorted, no underscores.
+/// `PrettyPrinter()`'s defaults: indent 1, width 80, no depth limit, not
+/// compact, dicts sorted, no underscores.
 pub fn defaults() -> PrettyOptions {
     return PrettyOptions{ indent: 1, width: 80, depth: 0, compact: false,
         sort_dicts: true, underscore_numbers: false }

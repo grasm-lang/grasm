@@ -50,7 +50,7 @@ type BcryptError =
     | Malformed(text: str)
     | UnknownVersion(tag: str)
 
-    /// The longest password the key schedule can consume.
+/// The longest password the key schedule can consume.
 pub fn max_password_bytes() -> i64 {
     return 72
 }

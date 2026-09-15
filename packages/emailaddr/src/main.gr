@@ -37,7 +37,7 @@
 type EmailError =
     | NoAddress(text: str)
 
-    /// One address, and the name written beside it.
+/// One address, and the name written beside it.
 type EmailAddress = {
     /// The unquoted display name, or the empty string.
     display_name: str,

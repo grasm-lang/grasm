@@ -27,7 +27,7 @@
 type ConnPoolError =
     | BadLimit(limit: i64)
 
-    /// One connection the pool is holding.
+/// One connection the pool is holding.
 type PooledConn = {
     handle: i64,
     /// When it last went back to the pool, on the caller's clock.

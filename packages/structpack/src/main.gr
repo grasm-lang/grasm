@@ -40,7 +40,7 @@ type StructError =
     | WrongCount(wanted: i64, given: i64)
     | OutOfRange(value: i64, code: str)
 
-    /// One field of a format string.
+/// One field of a format string.
 type StructField = {
     /// The letter, without its repeat count.
     code: str,

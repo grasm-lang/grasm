@@ -14,7 +14,7 @@ type IpError =
     | NotAnAddress(text: str)
     | NotACidr(text: str)
 
-    /// A dotted quad as one 32-bit number.
+/// A dotted quad as one 32-bit number.
 pub fn parse(text: str) -> i64 ! IpError {
     let parts = text.split(".")
     if parts.len() != 4 {

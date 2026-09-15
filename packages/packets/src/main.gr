@@ -29,7 +29,7 @@ type PacketError =
     | TooShort(what: str, needed: i64, found: i64)
     | BadVersion(found: i64)
 
-    /// An Ethernet II frame.
+/// An Ethernet II frame.
 type EthernetFrame = {
     /// Six bytes each, as they appear on the wire.
     destination: bytes,

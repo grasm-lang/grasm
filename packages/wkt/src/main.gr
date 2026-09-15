@@ -35,10 +35,10 @@ type WktError =
     | UnclosedRing(ring: i64)
     | NotEnoughPoints(want: i64, got: i64)
 
-    /// A point, taking longitude and latitude in the order they are *spoken*.
-    ///
-    /// Named for what it takes, because the whole trap in this format is the
-    /// other order.
+/// A point, taking longitude and latitude in the order they are *spoken*.
+///
+/// Named for what it takes, because the whole trap in this format is the
+/// other order.
 pub fn point_from_lat_lon(latitude: f64, longitude: f64) -> Geometry {
     return WktPoint(longitude, latitude)
 }

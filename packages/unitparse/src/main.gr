@@ -43,7 +43,7 @@ type UnitParseError =
     | UnknownSymbol(name: str)
     | EmptyUnit()
 
-    /// A parsed unit: what to multiply by, and what it measures.
+/// A parsed unit: what to multiply by, and what it measures.
 type ParsedUnit = {
     factor: f64,
     dimension: Dimension,

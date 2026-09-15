@@ -45,7 +45,7 @@ type DeltaError =
     | Truncated(at: i64)
     | NotCanonical(at: i64)
 
-    /// Differences between neighbours, first value kept as it is.
+/// Differences between neighbours, first value kept as it is.
 pub fn delta(values: [i64]) -> [i64] {
     var out: [i64] = []
     var i = 0

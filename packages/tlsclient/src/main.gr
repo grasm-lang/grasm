@@ -50,7 +50,7 @@ type ClientError =
     | Closed()
     | Protocol(why: str)
 
-    /// An open connection, and everything needed to keep talking on it.
+/// An open connection, and everything needed to keep talking on it.
 type TlsConnection = {
     socket: i64,
     read_keys: TrafficKeys,

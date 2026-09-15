@@ -45,7 +45,7 @@ type AvroIncompatibility = {
 type AvroCompatError =
     | AvroSchemaUnreadable(why: str)
 
-    /// Whether a reader schema can read data written with a writer schema.
+/// Whether a reader schema can read data written with a writer schema.
 pub fn can_read(writer: ref AvroSchema, reader: ref AvroSchema) -> bool {
     return incompatibilities(writer, reader).len() == 0
 }

@@ -29,7 +29,7 @@ type DockerError =
     | Empty()
     | NoInstruction(line: i64)
 
-    /// One instruction.
+/// One instruction.
 type DockerInstruction = {
     /// Upper-cased.
     keyword: str,

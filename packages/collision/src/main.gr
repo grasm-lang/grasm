@@ -57,7 +57,7 @@ type CollError =
     | CollNotConvex(at: i64)
     | CollTooFewPoints(given: i64)
 
-    /// The tolerance every comparison here uses.
+/// The tolerance every comparison here uses.
 pub fn epsilon() -> f64 {
     return 0.000001
 }

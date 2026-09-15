@@ -45,12 +45,12 @@ type TuiError =
     | TuiBadSize(width: i64, height: i64)
     | TuiBadSplit(at: i64, of: i64)
 
-    /// How many columns a code point occupies.
-    ///
-    /// Zero for a combining mark or a zero-width space, two for the East Asian
-    /// wide and fullwidth ranges and the common emoji blocks, one otherwise.
-    /// A control character is zero, because it is not printable and counting it
-    /// as one is how a stray byte shifts a whole line.
+/// How many columns a code point occupies.
+///
+/// Zero for a combining mark or a zero-width space, two for the East Asian
+/// wide and fullwidth ranges and the common emoji blocks, one otherwise.
+/// A control character is zero, because it is not printable and counting it
+/// as one is how a stray byte shifts a whole line.
 pub fn code_width(code: i64) -> i64 {
     if code == 0 {
         return 0

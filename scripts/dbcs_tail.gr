@@ -137,14 +137,14 @@ pub fn encoder() -> PREFIXEncoder {
     for entry in PREFERRED.entries() {
         out.set(entry.0, entry.1)
     }
-    return PREFIXEncoder { map: out }
+    return PREFIXEncoder{ map: out }
 }
 
 /// The pair a two-code-point sequence encodes to, when there is one.
 fn sequence_pair(first: i64, second: i64) -> i64 {
     for entry in SEQUENCES.entries() {
         if entry.1.len() == 2 and entry.1[0] == first and
-            entry.1[1] == second {
+        entry.1[1] == second {
             return entry.0
         }
     }

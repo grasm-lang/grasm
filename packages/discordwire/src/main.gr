@@ -26,8 +26,8 @@ type DiscordError =
     | UnknownPermission(name: str)
     | NotASnowflake(text: str)
 
-    /// Milliseconds between the Unix epoch and Discord's, the first moment of
-    /// 2015. Every snowflake is counted from here.
+/// Milliseconds between the Unix epoch and Discord's, the first moment of
+/// 2015. Every snowflake is counted from here.
 pub fn epoch_millis() -> i64 {
     return 1420070400000
 }

@@ -50,7 +50,7 @@ type HtmlError =
     | HtmlUnterminatedTag(at: i64)
     | HtmlTooDeep(depth: i64)
 
-    /// The elements that never have children or an end tag.
+/// The elements that never have children or an end tag.
 pub fn is_void(tag: str) -> bool {
     let voids = ["area", "base", "br", "col", "embed", "hr", "img", "input",
         "link", "meta", "param", "source", "track", "wbr"]

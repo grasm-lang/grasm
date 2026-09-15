@@ -42,7 +42,7 @@ type SfError =
     | BadBase64()
     | BadEncoding()
 
-    /// A bare item: one of the eight kinds a structured field can hold.
+/// A bare item: one of the eight kinds a structured field can hold.
 type SfValue =
     | SfInteger(value: i64)
     /// Thousandths. `1.5` is 1500, exactly, and never a float.
@@ -56,8 +56,8 @@ type SfValue =
     /// Text meant to be shown to a person, which may be any Unicode.
     | SfDisplay(text: str)
 
-    /// A parameter: a key and a value, the value being `?1` when only the key
-    /// was written.
+/// A parameter: a key and a value, the value being `?1` when only the key
+/// was written.
 type SfParam = {
     name: str,
     value: ref SfValue,

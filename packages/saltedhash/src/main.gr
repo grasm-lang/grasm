@@ -45,7 +45,7 @@ type SaltError =
     | MalformedRecord(text: str)
     | EmptySecret()
 
-    /// A stored credential: the hash, and everything around it.
+/// A stored credential: the hash, and everything around it.
 type Credential = {
     /// The crypt string, which carries the scheme and its cost.
     stored: str,

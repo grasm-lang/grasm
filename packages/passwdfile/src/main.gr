@@ -32,7 +32,7 @@
 type PasswdError =
     | PasswdShortLine(line: str, fields: i64)
 
-    /// One `/etc/passwd` record.
+/// One `/etc/passwd` record.
 type PasswdUser = {
     name: str,
     /// `x` when the real one is in `/etc/shadow`, empty when there is none.

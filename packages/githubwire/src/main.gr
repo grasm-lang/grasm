@@ -30,10 +30,10 @@ import linkheader
 type GithubError =
     | NotAnObject()
 
-    /// The headers every request should carry.
-    ///
-    /// The version header is not optional in practice: without it GitHub
-    /// serves whatever it currently calls the default, which changes.
+/// The headers every request should carry.
+///
+/// The version header is not optional in practice: without it GitHub
+/// serves whatever it currently calls the default, which changes.
 pub fn api_headers(token: str, version: str) -> [(str, str)] {
     var out = [("Accept", "application/vnd.github+json"),
         ("X-GitHub-Api-Version", version)]

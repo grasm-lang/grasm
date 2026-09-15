@@ -44,7 +44,7 @@ type H2Error =
     | UnknownType(kind: i64)
     | BadSetting(id: i64, value: i64)
 
-    /// One frame.
+/// One frame.
 type H2Frame = {
     kind: i64,
     flags: i64,

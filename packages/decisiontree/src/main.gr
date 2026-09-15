@@ -38,8 +38,8 @@ type CartError =
     | BadDepth(depth: i64)
     | NotFitted()
 
-    /// One node. A leaf has `feature` of -1 and its answer in `label`; a split
-    /// has the two child indices.
+/// One node. A leaf has `feature` of -1 and its answer in `label`; a split
+/// has the two child indices.
 type CartNode = {
     feature: i64,
     threshold: f64,

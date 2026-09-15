@@ -39,10 +39,10 @@ type EucJpError =
     | EucJpSupplementary(at: i64)
     | EucJpUnencodable(at: i64, code: i64)
 
-    /// The Shift-JIS byte pair for a JIS X 0208 row and cell, both 1-based.
-    ///
-    /// Shift-JIS puts two JIS rows in each lead byte and steps over `0x7F`,
-    /// which is the only part of this that is not addition.
+/// The Shift-JIS byte pair for a JIS X 0208 row and cell, both 1-based.
+///
+/// Shift-JIS puts two JIS rows in each lead byte and steps over `0x7F`,
+/// which is the only part of this that is not addition.
 fn jis_to_pair(row: i64, cell: i64) -> (i64, i64) {
     var lead = (row + 257) / 2
     if row > 62 {

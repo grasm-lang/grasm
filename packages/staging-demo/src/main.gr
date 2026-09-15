@@ -41,7 +41,7 @@ fn check_gitindex(inout f: i64) / {io} {
         (gitindex.decode("hello there".to_bytes()) ??
             GitIndex{ version: 0, entries: [], extensions: [] })
             .version == 0)
-        // git quotes a path with a byte outside printable ASCII.
+    // git quotes a path with a byte outside printable ASCII.
     say(f, "a path with an accent is quoted the way git quotes it",
         gitindex.quote_path("caf\u{e9}.txt") == "\"caf\\303\\251.txt\"")
     say(f, "and an ordinary one is not",

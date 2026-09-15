@@ -37,10 +37,10 @@ type UbjsonError =
     | TypeWithoutCount(at: i64)
     | Depth(at: i64)
 
-    /// A decoded value.
-    ///
-    /// The integer widths are kept because UBJSON keeps them: a reader that
-    /// folded them all into one type could not write the bytes back.
+/// A decoded value.
+///
+/// The integer widths are kept because UBJSON keeps them: a reader that
+/// folded them all into one type could not write the bytes back.
 type Ubjson =
     | Null
     | True
@@ -59,7 +59,7 @@ type Ubjson =
     | Array(items: [ref Ubjson])
     | Object(keys: [str], values: [ref Ubjson])
 
-    /// Where a decoder is, so an error can say where it went wrong.
+/// Where a decoder is, so an error can say where it went wrong.
 type UbjsonReader = {
     data: bytes,
     at: i64,

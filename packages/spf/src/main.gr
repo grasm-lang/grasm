@@ -38,7 +38,7 @@ type SpfError =
     | BadCidr(text: str)
     | BadMacro(text: str)
 
-    /// One mechanism of a record.
+/// One mechanism of a record.
 type SpfTerm = {
     /// `all`, `include`, `a`, `mx`, `ptr`, `ip4`, `ip6` or `exists`.
     kind: str,

@@ -34,9 +34,9 @@ type HpackError =
     | TableTooLarge(size: i64)
     | Overlong(length: i64)
 
-    /// The static table, RFC 7541 appendix A. Sixty-one entries every connection
-    /// starts with, so the commonest headers cost one byte before anything has
-    /// been sent at all.
+/// The static table, RFC 7541 appendix A. Sixty-one entries every connection
+/// starts with, so the commonest headers cost one byte before anything has
+/// been sent at all.
 pub fn static_table() -> [HeaderPair] {
     [pair(":authority", ""), pair(":method", "GET"), pair(":method", "POST"),
         pair(":path", "/"), pair(":path", "/index.html"),

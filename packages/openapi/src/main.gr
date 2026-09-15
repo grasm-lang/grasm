@@ -62,7 +62,7 @@ type OpenApiError =
     | OpenApiBadVersion(version: str)
     | OpenApiBadRef(target: str)
 
-    /// The methods an OpenAPI path item may carry.
+/// The methods an OpenAPI path item may carry.
 pub fn methods() -> [str] {
     return ["get", "put", "post", "delete", "options", "head", "patch",
         "trace"]

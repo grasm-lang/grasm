@@ -48,15 +48,15 @@ type UtError =
     | BadLength(spec: str)
     | Composite(name: str)
 
-    /// What a variable holds. A template treats these three differently, and a
-    /// caller that flattens a list to a comma-joined string before calling has
-    /// already thrown away what `*` needs.
+/// What a variable holds. A template treats these three differently, and a
+/// caller that flattens a list to a comma-joined string before calling has
+/// already thrown away what `*` needs.
 type UtValue =
     | UtText(text: str)
     | UtList(items: [str])
     | UtPairs(pairs: [(str, str)])
 
-    /// A variable with a value.
+/// A variable with a value.
 pub fn text(name: str, value: str) -> (str, UtValue) {
     return (name, UtText(value))
 }

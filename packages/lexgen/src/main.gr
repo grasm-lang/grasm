@@ -56,7 +56,7 @@ type LexError =
     | EmptyExpression()
     | NoRules()
 
-    /// One NFA state: transitions on a character range, and epsilon moves.
+/// One NFA state: transitions on a character range, and epsilon moves.
 type NfaState = {
     /// Character ranges and where they go, as (low, high, target).
     moves: [(i64, i64, i64)],

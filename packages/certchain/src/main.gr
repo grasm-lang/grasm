@@ -61,7 +61,7 @@ type ChainError =
     | UntrustedRoot(subject: str)
     | Cycle(subject: str)
 
-    /// The key-usage bits, in the order the BIT STRING writes them.
+/// The key-usage bits, in the order the BIT STRING writes them.
 pub let DIGITAL_SIGNATURE = 128
 pub let KEY_ENCIPHERMENT = 32
 pub let KEY_CERT_SIGN = 4

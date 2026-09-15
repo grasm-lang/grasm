@@ -55,8 +55,8 @@ type HsError =
     | UnsupportedVersion(version: i64)
     | HelloRetry()
 
-    /// One handshake message: its type and its body, without the four-byte
-    /// header.
+/// One handshake message: its type and its body, without the four-byte
+/// header.
 type HandshakeMessage = {
     kind: i64,
     body: bytes,

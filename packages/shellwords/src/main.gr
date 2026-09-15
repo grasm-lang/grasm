@@ -33,7 +33,7 @@ type WordsError =
     | Unclosed(quote: str)
     | DanglingEscape()
 
-    /// Split a command line into words.
+/// Split a command line into words.
 pub fn split(line: str) -> [str] ! WordsError {
     var out: [str] = []
     var word = ""

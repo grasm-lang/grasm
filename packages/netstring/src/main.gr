@@ -34,7 +34,7 @@ type NetError =
     | NetBadType(tag: i64, at: i64)
     | NetOddDictionary(at: i64)
 
-    /// A payload and where the next one starts.
+/// A payload and where the next one starts.
 type NetFrame = {
     payload: bytes,
     next: i64,
@@ -50,11 +50,11 @@ type TnetValue =
     | TnetList(items: [ref TnetValue])
     | TnetDict(keys: [str], values: [ref TnetValue])
 
-    /// The largest payload this will accept, unless a caller says otherwise.
-    ///
-    /// A length prefix read from a socket is attacker-controlled, and `999999999:`
-    /// is ten bytes that asks for a gigabyte. A default cap means the refusal
-    /// happens before the allocation rather than after it.
+/// The largest payload this will accept, unless a caller says otherwise.
+///
+/// A length prefix read from a socket is attacker-controlled, and `999999999:`
+/// is ten bytes that asks for a gigabyte. A default cap means the refusal
+/// happens before the allocation rather than after it.
 pub fn default_limit() -> i64 {
     return 16777216
 }

@@ -29,7 +29,7 @@ type B32hexError =
     | B32hexPadding(at: i64)
     | B32hexTrailing(at: i64)
 
-    /// The encoding of `raw`, padded with `=` to a multiple of eight characters.
+/// The encoding of `raw`, padded with `=` to a multiple of eight characters.
 pub fn encode(raw: bytes) -> str {
     var out = ""
     var at = 0

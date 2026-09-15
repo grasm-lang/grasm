@@ -47,10 +47,10 @@ type MatchError =
     | RaggedCosts(row: i64)
     | NoRows()
 
-    /// Maximum bipartite matching by Hopcroft-Karp.
-    ///
-    /// `adjacency[i]` lists the right-hand vertices the left-hand vertex `i` may
-    /// pair with. The result maps each left vertex to its partner, or -1.
+/// Maximum bipartite matching by Hopcroft-Karp.
+///
+/// `adjacency[i]` lists the right-hand vertices the left-hand vertex `i` may
+/// pair with. The result maps each left vertex to its partner, or -1.
 pub fn maximum_matching(adjacency: [[i64]], right_size: i64) -> [i64] {
     let left_size = adjacency.len()
     var pair_left: [i64] = []

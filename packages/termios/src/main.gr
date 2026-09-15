@@ -40,12 +40,12 @@ type TtyError =
     | NotATerminal(fd: i64)
     | Refused(call: str, code: i64)
 
-    /// Whether the descriptor is a terminal at all.
-    ///
-    /// Asked before anything else, because `tcgetattr` on a pipe fails with the
-    /// same `-1` it returns for a terminal that refused, and a program that cannot
-    /// tell them apart reports "your terminal refused" when the answer is "you
-    /// redirected me to a file".
+/// Whether the descriptor is a terminal at all.
+///
+/// Asked before anything else, because `tcgetattr` on a pipe fails with the
+/// same `-1` it returns for a terminal that refused, and a program that cannot
+/// tell them apart reports "your terminal refused" when the answer is "you
+/// redirected me to a file".
 pub fn is_terminal(fd: i64) -> bool / {io, unsafe} {
     unsafe { isatty(fd) == 1 }
 }

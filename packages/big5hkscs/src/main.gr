@@ -29,8 +29,8 @@ type Big5HkscsError =
     | Big5HkscsTruncated(at: i64)
     | Big5HkscsUnencodable(at: i64, codepoint: i64)
 
-    /// A prepared reverse table, built once for a document rather than
-    /// searched for every character.
+/// A prepared reverse table, built once for a document rather than
+/// searched for every character.
 type Big5HkscsEncoder = { map: Map[i64, i64] }
 
 let WIDTH = 6

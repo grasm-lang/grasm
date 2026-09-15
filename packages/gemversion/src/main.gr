@@ -32,7 +32,7 @@
 type GemError =
     | Malformed(text: str)
 
-    /// One run of a version: all digits, or all letters.
+/// One run of a version: all digits, or all letters.
 type GemSegment = {
     /// Whether the run was digits, which decides how it compares.
     numeric: bool,

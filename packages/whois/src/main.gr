@@ -45,7 +45,7 @@ type WhoisError =
     | WhoisEmpty
     | WhoisNoQuery
 
-    /// The port every WHOIS server listens on.
+/// The port every WHOIS server listens on.
 pub fn port() -> i64 {
     return 43
 }

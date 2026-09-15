@@ -25,10 +25,10 @@ type CurrencyError =
     | UnknownCode(code: str)
     | NotMinorUnits(code: str, amount: i64)
 
-    /// The table, flat: code, numeric, minor units, symbol, name.
-    ///
-    /// The currencies with a minor unit other than two are all here, because
-    /// those are the ones an assumption gets wrong.
+/// The table, flat: code, numeric, minor units, symbol, name.
+///
+/// The currencies with a minor unit other than two are all here, because
+/// those are the ones an assumption gets wrong.
 fn table() -> [str] {
     return [
         "USD", "840", "2", "$", "US Dollar",

@@ -42,7 +42,7 @@ type GzipError =
     | GzipBadLength(want: i64, got: i64)
     | GzipBadHeaderCrc(want: i64, got: i64)
 
-    /// One member of a `.gz` file.
+/// One member of a `.gz` file.
 type GzipMember = {
     /// The uncompressed bytes.
     data: bytes,

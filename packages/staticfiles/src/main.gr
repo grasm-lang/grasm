@@ -45,12 +45,12 @@ type StaticError =
     | StaticEmpty
     | StaticHidden(name: str)
 
-    /// Undo one layer of percent-encoding.
-    ///
-    /// One layer, deliberately. Decoding until nothing changes is what turns
-    /// `%252e` into `.` and lets a doubly-encoded traversal through — the client
-    /// encoded it once, so the server decodes it once, and a `%25` that survives
-    /// is a literal percent sign.
+/// Undo one layer of percent-encoding.
+///
+/// One layer, deliberately. Decoding until nothing changes is what turns
+/// `%252e` into `.` and lets a doubly-encoded traversal through — the client
+/// encoded it once, so the server decodes it once, and a `%25` that survives
+/// is a literal percent sign.
 pub fn percent_decode(s: str) -> str ! StaticError {
     var out = ""
     var i = 0

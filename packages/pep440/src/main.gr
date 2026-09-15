@@ -27,7 +27,7 @@
 type PepError =
     | NotAVersion(text: str)
 
-    /// A version, taken apart.
+/// A version, taken apart.
 type PepVersion = {
     epoch: i64,
     /// The release segments, with trailing zeros kept as written.

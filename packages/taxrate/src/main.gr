@@ -50,7 +50,7 @@ type TaxError =
     | NoSuchCountry(code: str)
     | NegativeRate(basis_points: i64)
 
-    /// When this table was last checked against the Commission's published list.
+/// When this table was last checked against the Commission's published list.
 pub fn rates_as_of() -> str {
     return "2026-01-01"
 }

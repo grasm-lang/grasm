@@ -55,7 +55,7 @@ type TraceError =
     | TraceTooManyEntries(count: i64)
     | TraceBadKey(key: str)
 
-    /// The version this writes.
+/// The version this writes.
 pub fn version() -> str {
     return "00"
 }

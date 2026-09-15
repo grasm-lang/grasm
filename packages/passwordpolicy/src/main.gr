@@ -38,7 +38,7 @@ type PolicyError =
     | Blocked(reason: str)
     | BadPrefix(prefix: str)
 
-    /// The rules a policy actually enforces.
+/// The rules a policy actually enforces.
 type PasswordPolicy = {
     /// Eight for a password a person chose; six for one that was generated.
     least_length: i64,

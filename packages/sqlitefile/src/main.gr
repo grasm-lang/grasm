@@ -38,7 +38,7 @@ type SqlValue =
     | SqlText(s: str)
     | SqlBlob(data: bytes)
 
-    /// One row: its rowid and its column values.
+/// One row: its rowid and its column values.
 type SqlRow = {
     rowid: i64,
     value: [SqlValue],

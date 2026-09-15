@@ -53,7 +53,7 @@ type H2ClientError =
     | StreamReset(code: i64)
     | Closed()
 
-    /// A response.
+/// A response.
 type H2Reply = {
     status: i64,
     headers: [(str, str)],

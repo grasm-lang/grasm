@@ -35,7 +35,7 @@ type PeError =
     | Truncated(at: i64)
     | BadMagic(value: i64)
 
-    /// The COFF header, which is the same in both forms.
+/// The COFF header, which is the same in both forms.
 type PeHeader = {
     machine: i64,
     section_count: i64,

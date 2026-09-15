@@ -46,10 +46,10 @@ type VatError =
     | BadFormat(country: str, number: str)
     | BadChecksum(country: str, number: str)
 
-    /// The prefix Greece uses is `EL`, not `GR`.
-    ///
-    /// It is the one country whose VAT prefix is not its ISO 3166 code, and every
-    /// system that assumed otherwise has a special case for it somewhere.
+/// The prefix Greece uses is `EL`, not `GR`.
+///
+/// It is the one country whose VAT prefix is not its ISO 3166 code, and every
+/// system that assumed otherwise has a special case for it somewhere.
 pub fn greek_prefix() -> str {
     return "EL"
 }

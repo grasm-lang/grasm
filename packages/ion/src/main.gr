@@ -40,7 +40,7 @@ type IonError =
     | NoSuchSymbol(id: i64)
     | NotAContainer(at: i64)
 
-    /// A decoded value. Ion's types, with the ones this reads.
+/// A decoded value. Ion's types, with the ones this reads.
 type IonValue =
     | IonNull
     | IonBool(v: bool)

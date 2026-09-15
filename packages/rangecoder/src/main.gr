@@ -54,9 +54,9 @@ type RangeCoderError =
     | Truncated(at: i64)
     | BadStream(at: i64)
 
-    /// Cumulative frequencies: `bounds[i]` to `bounds[i + 1]` is symbol `i`'s
-    /// share of the range, and `bounds` has one more entry than there are
-    /// symbols.
+/// Cumulative frequencies: `bounds[i]` to `bounds[i + 1]` is symbol `i`'s
+/// share of the range, and `bounds` has one more entry than there are
+/// symbols.
 type RangeModel = { bounds: [i64] }
 
 fn top() -> i64 {

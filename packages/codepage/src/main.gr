@@ -52,7 +52,7 @@ type CodepageError =
     | UnknownPage(name: str)
     | Unencodable(at: i64, codepoint: i64)
 
-    /// The pages this knows, by the names people write in configuration files.
+/// The pages this knows, by the names people write in configuration files.
 pub fn names() -> [str] {
     return ["cp437", "cp850", "cp852", "cp866", "cp1250", "cp1251", "cp1252", "cp1253", "cp1254", "cp1255", "cp1256", "cp1257", "latin1", "latin2", "latin9", "koi8r", "koi8u", "macroman", "cp874"]
 }

@@ -54,11 +54,11 @@ type EtagError =
     | EtagMalformed(text: str)
     | EtagEmpty
 
-    /// The tag for a body, as a quoted strong tag.
-    ///
-    /// A hash of the bytes, so two servers with the same content produce the same
-    /// tag — which matters behind a load balancer, where a tag derived from an
-    /// inode number or a process-local counter makes every cache hit a miss.
+/// The tag for a body, as a quoted strong tag.
+///
+/// A hash of the bytes, so two servers with the same content produce the same
+/// tag — which matters behind a load balancer, where a tag derived from an
+/// inode number or a process-local counter makes every cache hit a miss.
 pub fn strong_of(body: bytes) -> str {
     let digest = crypto_hash.hex_of(crypto_hash.sha256_of(body))
     return "\"" + digest.substr(0, 32) + "\""

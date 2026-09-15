@@ -32,7 +32,7 @@ type MachoError =
     | NotMacho()
     | Truncated(at: i64)
 
-    /// One architecture inside a fat file.
+/// One architecture inside a fat file.
 type MachFatEntry = {
     cpu_type: i64,
     cpu_subtype: i64,

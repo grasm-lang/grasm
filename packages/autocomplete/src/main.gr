@@ -38,7 +38,7 @@ type CompleteMatch = {
 type CompleteError =
     | CompleteEmptyQuery
 
-    /// A match at the start of the candidate.
+/// A match at the start of the candidate.
 pub fn bonus_start() -> i64 {
     return 30
 }

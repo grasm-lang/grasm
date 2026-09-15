@@ -79,7 +79,7 @@ type ProtoError =
     | ProtoDuplicateNumber(name: str, number: i64)
     | ProtoUnterminated(at: i64)
 
-    /// The largest field number the format allows.
+/// The largest field number the format allows.
 pub fn max_field_number() -> i64 {
     return 536870911
 }

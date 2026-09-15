@@ -37,7 +37,7 @@ type CpeError =
     | WrongFieldCount(text: str)
     | BadEscape(text: str)
 
-    /// One attribute: a string, or one of the two logical values.
+/// One attribute: a string, or one of the two logical values.
 type CpeValue = {
     /// `any`, `na` or `text`.
     kind: str,

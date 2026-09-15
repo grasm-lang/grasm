@@ -49,7 +49,7 @@ type BootError =
     | BadLevel(level: f64)
     | Degenerate(reason: str)
 
-    /// An interval and how it was arrived at.
+/// An interval and how it was arrived at.
 type BootInterval = {
     low: f64,
     high: f64,

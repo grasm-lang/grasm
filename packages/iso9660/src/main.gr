@@ -36,7 +36,7 @@ type Iso9660Error =
     | Truncated(at: i64)
     | NoPrimary()
 
-    /// A volume descriptor: what kind, and where it is.
+/// A volume descriptor: what kind, and where it is.
 type IsoVolume = {
     /// 1 primary, 2 supplementary (Joliet), 255 terminator.
     kind: i64,

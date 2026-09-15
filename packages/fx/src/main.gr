@@ -58,10 +58,10 @@ type FxError =
     | ZeroDenominator()
     | CurrencyMismatch(expected: str, found: str)
 
-    /// A rate from a decimal written as digits and a scale.
-    ///
-    /// `rate("EUR", "DEM", 195583, 5)` is 1.95583 exactly. The scale is the
-    /// number of decimal places, so no float ever touches the number.
+/// A rate from a decimal written as digits and a scale.
+///
+/// `rate("EUR", "DEM", 195583, 5)` is 1.95583 exactly. The scale is the
+/// number of decimal places, so no float ever touches the number.
 pub fn rate(from_code: str, to_code: str, digits: i64,
     scale: i64) -> FxRate {
     var denominator = 1

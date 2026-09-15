@@ -52,11 +52,11 @@ type LogError =
     | LogBadRate(rate: i64)
     | LogNoKey
 
-    /// The scale the bucket arithmetic uses.
-    ///
-    /// A thousandth of a token, so a rate of one line every ten seconds is
-    /// representable without floating point — which keeps the decision identical
-    /// on every engine.
+/// The scale the bucket arithmetic uses.
+///
+/// A thousandth of a token, so a rate of one line every ten seconds is
+/// representable without floating point — which keeps the decision identical
+/// on every engine.
 pub fn scale() -> i64 {
     return 1000
 }

@@ -53,7 +53,7 @@ type TriangulateError =
     | SelfIntersecting()
     | NoEarFound(remaining: i64)
 
-    /// Whether the vertices are listed counter-clockwise.
+/// Whether the vertices are listed counter-clockwise.
 pub fn is_counter_clockwise(polygon: [Vec2]) -> bool {
     return signed_area(polygon) > 0.0
 }

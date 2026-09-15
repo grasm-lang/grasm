@@ -46,7 +46,7 @@ type CpError =
     | BadCount(count: i64)
     | BadWidth(width: i64)
 
-    /// A stretch of the series with one level.
+/// A stretch of the series with one level.
 type CpSegment = {
     /// The first index in the segment.
     start: i64,

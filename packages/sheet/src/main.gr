@@ -32,7 +32,7 @@ type Expr =
     | Div(left: i64, right: i64)
     | Sum(cells: [str])
 
-    // `SheetCell`, since `gc` declares a `Cell` and types share one namespace.
+// `SheetCell`, since `gc` declares a `Cell` and types share one namespace.
 type SheetCell = {
     name: str,
     // The expression tree, flattened: `nodes` holds it and `root` is the top.

@@ -35,7 +35,7 @@ type PointerError =
     | OutOfRange(token: str)
     | NotAContainer(token: str)
 
-    /// Split a pointer into its tokens, unescaped.
+/// Split a pointer into its tokens, unescaped.
 pub fn parse(pointer: str) -> [str] ! PointerError {
     if pointer.len() == 0 {
         return []

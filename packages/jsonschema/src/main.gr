@@ -51,11 +51,11 @@ type SchemaError =
     | SchemaBadPattern(pattern: str)
     | SchemaTooDeep(depth: i64)
 
-    /// Validate a value against a schema, returning every problem.
-    ///
-    /// Every problem, not the first: a form with four bad fields should show four
-    /// messages, and a validator that stops at the first turns one round trip into
-    /// four.
+/// Validate a value against a schema, returning every problem.
+///
+/// Every problem, not the first: a form with four bad fields should show four
+/// messages, and a validator that stops at the first turns one round trip into
+/// four.
 pub fn validate(schema: ref Json,
     value: ref Json) -> [SchemaProblem] ! SchemaError {
     var out: [SchemaProblem] = []

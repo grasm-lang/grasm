@@ -71,7 +71,7 @@ type SunError =
     | AlwaysUp(latitude: f64)
     | AlwaysDown(latitude: f64)
 
-    /// Midnight UTC on a date, as a POSIX instant.
+/// Midnight UTC on a date, as a POSIX instant.
 pub fn midnight(year: i64, month: i64, day: i64) -> i64 {
     return days_from_epoch(year, month, day) * 86400
 }

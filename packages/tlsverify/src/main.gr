@@ -52,7 +52,7 @@ type TlsError =
     | UnsupportedScheme(scheme: i64)
     | Expired(subject: str)
 
-    /// What a verification decided, and why.
+/// What a verification decided, and why.
 type TlsSession = {
     trusted: bool,
     /// The names the leaf certificate carries.

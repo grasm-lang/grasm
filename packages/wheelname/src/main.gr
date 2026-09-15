@@ -38,7 +38,7 @@ type WheelError =
     | BadBuildTag(text: str)
     | NotASdist(name: str)
 
-    /// A wheel's file name, taken apart.
+/// A wheel's file name, taken apart.
 type WheelName = {
     /// Normalised, so it can be compared.
     distribution: str,

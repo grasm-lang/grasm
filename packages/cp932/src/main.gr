@@ -29,8 +29,8 @@ type Cp932Error =
     | Cp932Truncated(at: i64)
     | Cp932Unencodable(at: i64, codepoint: i64)
 
-    /// A prepared reverse table, built once for a document rather than
-    /// searched for every character.
+/// A prepared reverse table, built once for a document rather than
+/// searched for every character.
 type Cp932Encoder = { map: Map[i64, i64] }
 
 let WIDTH = 4

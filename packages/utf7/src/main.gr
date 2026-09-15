@@ -36,10 +36,10 @@ type Utf7Error =
     | Utf7Truncated(at: i64)
     | Utf7Surrogate(at: i64)
 
-    /// Whether a character is written as itself.
-    ///
-    /// Tab, newline and carriage return, and everything printable except `+`,
-    /// `\` and `~`.
+/// Whether a character is written as itself.
+///
+/// Tab, newline and carriage return, and everything printable except `+`,
+/// `\` and `~`.
 pub fn is_direct(code: i64) -> bool {
     if code == 9 or code == 10 or code == 13 {
         return true

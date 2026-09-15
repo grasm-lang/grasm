@@ -35,7 +35,7 @@ type RpmFileError =
     | Truncated(at: i64)
     | BadHeader(at: i64)
 
-    /// The 96-byte lead.
+/// The 96-byte lead.
 type RpmLead = {
     major: i64,
     minor: i64,

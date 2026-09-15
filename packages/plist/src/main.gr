@@ -53,11 +53,11 @@ type PlistError =
     | PlistOddDictionary(at: i64)
     | PlistTooDeep(depth: i64)
 
-    /// Seconds between the Unix epoch and the one Apple chose.
-    ///
-    /// Apple's reference date is 2001-01-01T00:00:00Z. Adding this to a plist
-    /// date gives a Unix timestamp; forgetting to is a date in 1970 that looks
-    /// plausible.
+/// Seconds between the Unix epoch and the one Apple chose.
+///
+/// Apple's reference date is 2001-01-01T00:00:00Z. Adding this to a plist
+/// date gives a Unix timestamp; forgetting to is a date in 1970 that looks
+/// plausible.
 pub fn epoch_offset() -> f64 {
     return 978307200.0
 }

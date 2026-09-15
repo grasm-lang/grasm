@@ -42,7 +42,7 @@ type SshSigError =
     | SshSigVersion(version: i64)
     | SshSigTruncated(at: i64)
 
-    /// A parsed signature.
+/// A parsed signature.
 type SshSignature = {
     version: i64,
     /// The signer's public key, in the same wire form an

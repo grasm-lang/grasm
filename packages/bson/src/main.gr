@@ -59,7 +59,7 @@ type BsonError =
     | BsonArrayKeyOutOfOrder(expected: str, found: str)
     | BsonTrailingBytes(at: i64)
 
-    /// A reader's position in a buffer.
+/// A reader's position in a buffer.
 type BsonReader = {
     data: bytes,
     at: i64,

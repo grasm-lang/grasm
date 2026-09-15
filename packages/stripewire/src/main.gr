@@ -33,9 +33,9 @@ type StripeError =
     | NotAnObject()
     | NoError()
 
-    /// A value in a request body. Deliberately without a floating-point case:
-    /// every amount in Stripe's API is an integer of the currency's smallest
-    /// unit, and a client that can send `19.99` is a client that will.
+/// A value in a request body. Deliberately without a floating-point case:
+/// every amount in Stripe's API is an integer of the currency's smallest
+/// unit, and a client that can send `19.99` is a client that will.
 type StripeValue =
     | SvText(text: str)
     | SvInt(number: i64)

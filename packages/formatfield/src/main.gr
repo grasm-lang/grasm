@@ -41,8 +41,8 @@ type FieldError =
     | FieldMissing(name: str)
     | FieldSpec(spec: str)
 
-    /// One piece of a format string: literal text, and the field after it if
-    /// there is one.
+/// One piece of a format string: literal text, and the field after it if
+/// there is one.
 type FormatPiece = {
     literal: str,
     /// Whether a field follows the literal.

@@ -37,7 +37,7 @@
 type RpmError =
     | BadEpoch(text: str)
 
-    /// An epoch, version and release, which is what `rpm` compares.
+/// An epoch, version and release, which is what `rpm` compares.
 type RpmEvr = {
     /// Zero when the version did not name one, which is what `rpm`
     /// assumes.

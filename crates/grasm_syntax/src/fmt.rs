@@ -33,10 +33,10 @@ pub fn format_src(src: &str) -> String {
     // Mode stack survives across lines (block comments, not strings — strings
     // cannot span lines in Grasm).
     let mut stack: Vec<Mode> = vec![Mode::Code];
-    // Extra indent the previous line took, for comment lines to inherit.
-    let mut last_extra: i32 = 0;
+    let lines: Vec<&str> = src.split_inclusive('\n').collect();
 
-    for line in src.split_inclusive('\n') {
+    for (index, line) in lines.iter().enumerate() {
+        let line: &str = line;
         let (content, newline) = match line.strip_suffix('\n') {
             Some(c) => (c.strip_suffix('\r').unwrap_or(c), "\n"),
             None => (line, ""),
@@ -73,16 +73,23 @@ pub fn format_src(src: &str) -> String {
             // and so does a method chain broken onto its own lines — `.trim()`
             // under the value it applies to. Without this the continuation
             // landed at the same level as the statement that owns it.
-            // A comment sitting inside a broken-up chain belongs to the chain
-            // and keeps its level, so a comment-only line inherits whatever
-            // the line above it got rather than snapping back to the
-            // statement's own indent.
+            // A comment takes the level of the code it comments on, which is
+            // the next line that is not a comment or blank: one sitting inside
+            // a broken-up chain or between two variants stays with them, and
+            // one after the last variant, above the next declaration, goes
+            // back out with it. Inheriting from the line *above* instead
+            // indented the doc comment of every function that followed a sum
+            // type — 384 of them across 191 packages.
+            let continues = |text: &str| text.starts_with('|') || text.starts_with('.');
             let pipe_extra = if trimmed.starts_with("//") {
-                last_extra
+                let next = lines[index + 1..]
+                    .iter()
+                    .map(|l| l.trim())
+                    .find(|l| !l.is_empty() && !l.starts_with("//"));
+                i32::from(next.is_some_and(continues))
             } else {
-                i32::from(trimmed.starts_with('|') || trimmed.starts_with('.'))
+                i32::from(continues(trimmed))
             };
-            last_extra = pipe_extra;
             // Leading closers land this line back at the level whose opening
             // line they close.
             let after_closers = depth - lead_closers;
@@ -746,6 +753,16 @@ mod tests {
         assert!(got.contains("    print(\"a {x} } { b\")"));
         assert!(got.contains("    let y = 1"));
         assert!(got.ends_with("}\n"));
+    }
+
+    #[test]
+    fn doc_comment_after_sum_type_is_not_indented() {
+        let src = "type A =\n    | B\n    /// Doc for C.\n    | C\n\n/// Doc.\npub fn f() -> i64 {\n    return 1\n}\n";
+        let got = format_src(src);
+        assert!(got.contains("\n    /// Doc for C.\n    | C\n"), "{got}");
+        assert!(got.contains("\n\n/// Doc.\npub fn f()"), "{got}");
+        let chain = "fn f() {\n    let x = y\n        // why\n        .trim()\n}\n";
+        assert_eq!(format_src(chain), chain);
     }
 
     #[test]

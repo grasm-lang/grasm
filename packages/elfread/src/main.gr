@@ -35,7 +35,7 @@ type ElfError =
     | Truncated(at: i64)
     | BadClass(value: i64)
 
-    /// The file header, whatever the class and byte order.
+/// The file header, whatever the class and byte order.
 type ElfHeader = {
     /// 32 or 64.
     class_bits: i64,

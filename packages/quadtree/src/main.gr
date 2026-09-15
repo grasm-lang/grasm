@@ -47,7 +47,7 @@ type QuadError =
     | QuadOutsideBounds(id: i64)
     | QuadBadCapacity(capacity: i64)
 
-    /// A tree covering a region.
+/// A tree covering a region.
 pub fn new_tree(bounds: Rect, capacity: i64,
     max_depth: i64) -> Quadtree ! QuadError {
     if capacity < 1 {

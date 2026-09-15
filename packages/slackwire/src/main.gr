@@ -30,9 +30,9 @@ type SlackError =
     | UnknownBlock(kind: str)
     | NotBlocks()
 
-    /// The string Slack signs. The body is the bytes as they arrived: a
-    /// framework that re-serialises the form data changes the order and the
-    /// signature stops matching.
+/// The string Slack signs. The body is the bytes as they arrived: a
+/// framework that re-serialises the form data changes the order and the
+/// signature stops matching.
 pub fn signing_base(timestamp: str, body: str) -> str {
     return "v0:" + timestamp + ":" + body
 }

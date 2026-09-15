@@ -64,7 +64,7 @@ type SloError =
     | SloEmptyWindow
     | SloNoRequests
 
-    /// Thirty days, the usual SLO window.
+/// Thirty days, the usual SLO window.
 pub fn thirty_days() -> i64 {
     return 30 * 24 * 3600
 }

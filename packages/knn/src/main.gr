@@ -37,7 +37,7 @@ type KnnError =
     | BadNeighbourCount(k: i64)
     | NoVariation(column: i64)
 
-    /// One neighbour: which training row, and how far.
+/// One neighbour: which training row, and how far.
 type Neighbour = {
     index: i64,
     distance: f64,

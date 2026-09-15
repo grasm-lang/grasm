@@ -70,7 +70,7 @@ type AvroValue =
     | AvMap(keys: [str], values: [ref AvroValue])
     | AvFixed(data: bytes)
 
-    /// A container file: the writer's schema, the codec, and the records.
+/// A container file: the writer's schema, the codec, and the records.
 type AvroFile = {
     schema: ref AvroSchema,
     codec: str,

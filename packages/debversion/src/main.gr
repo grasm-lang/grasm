@@ -26,7 +26,7 @@
 type DebError =
     | NotAVersion(text: str)
 
-    /// A version, taken apart.
+/// A version, taken apart.
 type DebVersion = {
     epoch: i64,
     upstream: str,

@@ -53,7 +53,7 @@ type SpecError =
     | SpecUnknownType(kind: str)
     | SpecNotAllowed(why: str)
 
-    /// A parsed specification.
+/// A parsed specification.
 type FormatSpec = {
     fill: str,
     /// `<`, `>`, `^`, `=`, or empty for the type's default.

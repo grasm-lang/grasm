@@ -39,7 +39,7 @@ type MetricError =
     | NoPositives()
     | NotAProbability(value: f64)
 
-    /// The counts of a two-class outcome.
+/// The counts of a two-class outcome.
 type Confusion = {
     true_positive: i64,
     false_positive: i64,

@@ -40,7 +40,7 @@ type CacheError =
     | BadDirective(text: str)
     | NoFreshness()
 
-    /// How long a response may be used, and why.
+/// How long a response may be used, and why.
 type Freshness = {
     /// Seconds, or -1 when nothing says.
     lifetime: i64,

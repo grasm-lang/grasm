@@ -54,7 +54,7 @@ type PickleError =
     | PickleTooLarge(at: i64)
     | PickleStackEmpty(at: i64)
 
-    /// The data a pickle holds.
+/// The data a pickle holds.
 type Pickle =
     | PNone
     | PBool(value: bool)

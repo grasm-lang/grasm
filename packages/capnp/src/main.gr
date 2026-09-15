@@ -45,7 +45,7 @@ type CapnError =
     | BadFraming()
     | Depth(word: i64)
 
-    /// A message: its segments, as word offsets into one buffer.
+/// A message: its segments, as word offsets into one buffer.
 type CapnMessage = {
     data: bytes,
     /// Where each segment starts, in bytes.

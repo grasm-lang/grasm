@@ -38,11 +38,11 @@ type MnemonicError =
     | UnknownWord(word: str)
     | BadChecksum()
 
-    /// The BIP-39 English wordlist, in its published order: the index of
-    /// a word *is* eleven bits of the entropy, so the order is the format
-    /// and not a convenience. Every word is unique in its first four
-    /// letters, which is what makes a mnemonic recoverable from a
-    /// half-legible piece of paper.
+/// The BIP-39 English wordlist, in its published order: the index of
+/// a word *is* eleven bits of the entropy, so the order is the format
+/// and not a convenience. Every word is unique in its first four
+/// letters, which is what makes a mnemonic recoverable from a
+/// half-legible piece of paper.
 fn wordlist() -> [str] {
     return [
         "abandon", "ability", "able", "about", "above", "absent", "absorb",

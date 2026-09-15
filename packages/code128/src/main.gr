@@ -42,8 +42,8 @@ type Code128Error =
     | NotEncodable(character: str, at: i64)
     | Empty()
 
-    /// The number of modules in a symbol, which is where the name comes from —
-    /// eleven modules, three bars, three spaces.
+/// The number of modules in a symbol, which is where the name comes from —
+/// eleven modules, three bars, three spaces.
 pub fn modules_per_symbol() -> i64 {
     return 11
 }

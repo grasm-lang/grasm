@@ -40,8 +40,8 @@ type EventError =
     | BothBodies()
     | BadTime(text: str)
 
-    /// One event: the attributes that are always there, the ones that are
-    /// sometimes there, and the body.
+/// One event: the attributes that are always there, the ones that are
+/// sometimes there, and the body.
 type CloudEvent = {
     id: str,
     source: str,

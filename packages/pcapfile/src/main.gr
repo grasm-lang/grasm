@@ -25,7 +25,7 @@ type PcapError =
     | NotAPcap()
     | Truncated(at: i64)
 
-    /// The file header.
+/// The file header.
 type PcapHeader = {
     /// Whether the file is written most-significant byte first.
     big_endian: bool,

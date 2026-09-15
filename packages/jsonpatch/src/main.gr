@@ -44,7 +44,7 @@ type JsonPatchError =
     | IntoItself(at: i64, pointer: str)
     | RootRemoved(at: i64)
 
-    /// Apply a patch, or answer why it did not apply.
+/// Apply a patch, or answer why it did not apply.
 pub fn apply(document: ref Json,
     patch: ref Json) -> ref Json ! JsonPatchError {
     match patch {

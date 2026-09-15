@@ -30,7 +30,7 @@
 type NetrcError =
     | Unterminated(name: str)
 
-    /// One entry.
+/// One entry.
 type NetrcEntry = {
     /// The host, or the empty string for the `default` entry.
     machine: str,

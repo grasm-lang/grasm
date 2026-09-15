@@ -42,7 +42,7 @@ type AnovaError =
     | Unbalanced(reason: str)
     | BadLevel(level: f64)
 
-    /// One line of an ANOVA table.
+/// One line of an ANOVA table.
 type AnovaRow = {
     /// `between`, `within`, `total`, or a factor's name.
     source: str,

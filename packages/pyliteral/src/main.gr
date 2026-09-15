@@ -62,8 +62,8 @@ type PyLiteralError =
     | PyLiteralUnhashable(at: i64)
     | PyLiteralUnsupported(at: i64, why: str)
 
-    /// One token: `kind` is `num`, `str`, `bytes`, `name`, `op`, `newline` or
-    /// `end`, with its text, and for literals the value.
+/// One token: `kind` is `num`, `str`, `bytes`, `name`, `op`, `newline` or
+/// `end`, with its text, and for literals the value.
 type PyToken = {
     kind: str,
     text: str,

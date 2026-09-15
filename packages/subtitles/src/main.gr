@@ -29,7 +29,7 @@ type SubtitleError =
     | NoHeader()
     | OutOfOrder(index: i64)
 
-    /// One cue.
+/// One cue.
 type Cue = {
     /// The SRT number, or the WebVTT identifier, or the empty string.
     id: str,

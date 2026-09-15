@@ -36,12 +36,12 @@ type S3Error =
     | NotXml(why: str)
     | NotAListing()
 
-    /// Whether a bucket name is legal at all.
-    ///
-    /// The rules are AWS's: three to sixty-three characters, lower-case
-    /// letters, digits, dots and hyphens, starting and ending with a letter or
-    /// a digit, no two adjacent dots, and not shaped like an IP address —
-    /// `192.168.5.4` would be ambiguous with a host.
+/// Whether a bucket name is legal at all.
+///
+/// The rules are AWS's: three to sixty-three characters, lower-case
+/// letters, digits, dots and hyphens, starting and ending with a letter or
+/// a digit, no two adjacent dots, and not shaped like an IP address —
+/// `192.168.5.4` would be ambiguous with a host.
 pub fn check_bucket(name: str) -> bool ! S3Error {
     if name.len() < 3 or name.len() > 63 {
         fail(BadBucket(name, "a name is three to sixty-three characters"))

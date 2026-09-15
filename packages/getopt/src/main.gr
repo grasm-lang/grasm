@@ -29,8 +29,8 @@ type GetoptError =
     | GetoptTakesNoValue(option: str)
     | GetoptAmbiguous(option: str, candidates: [str])
 
-    /// One option and its value, or — in return-in-order mode — a run of
-    /// arguments, with `is_arguments` set and the run in `arguments`.
+/// One option and its value, or — in return-in-order mode — a run of
+/// arguments, with `is_arguments` set and the run in `arguments`.
 type GetoptItem = {
     option: str,
     value: str,

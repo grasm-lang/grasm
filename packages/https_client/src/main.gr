@@ -41,7 +41,7 @@ type HttpsError =
     | TooManyRedirects(count: i64)
     | Closed()
 
-    /// A response.
+/// A response.
 type HttpsReply = {
     status: i64,
     /// The reason phrase, which carries no meaning and is logged anyway.

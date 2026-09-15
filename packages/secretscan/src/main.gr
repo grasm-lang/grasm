@@ -41,7 +41,7 @@ type ScanError =
     | BadPattern(rule: str, why: str)
     | NoSuchRule(id: str)
 
-    /// One rule: what to look for, and how random the result has to be.
+/// One rule: what to look for, and how random the result has to be.
 type ScanRule = {
     id: str,
     description: str,

@@ -37,7 +37,7 @@ type ProblemError =
     | BadStatus(status: i64)
     | NotAProblem(content_type: str)
 
-    /// One problem.
+/// One problem.
 type Problem = {
     /// A URI naming the class of problem; `about:blank` when absent.
     kind: str,

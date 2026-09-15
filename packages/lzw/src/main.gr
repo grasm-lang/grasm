@@ -64,7 +64,7 @@ type LzwError =
     | NotCompress(magic: i64)
     | WidthOutOfRange(width: i64)
 
-    /// The clear code, which every variant puts at 256.
+/// The clear code, which every variant puts at 256.
 pub fn clear_code() -> i64 {
     return 256
 }

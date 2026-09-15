@@ -140,8 +140,8 @@ fn check_csp(inout f: i64) / {io} {
         not csp.falls_back("frame-ancestors") and
         csp.effective_sources(policy_of("default-src 'self'"), "base-uri")
             .len() == 0)
-        // Which is why an injected <base> works against a policy that looks
-        // complete.
+    // Which is why an injected <base> works against a policy that looks
+    // complete.
     say(f, "so a policy of default-src alone leaves base-uri unrestricted",
         contains(csp.weaknesses(policy_of("default-src 'self'")),
             "no base-uri: an injected <base> can redirect every relative " +
@@ -260,8 +260,8 @@ fn check_hsts(inout f: i64) / {io} {
         hsts_of("  max-age = 300 ;  includeSubDomains  ").max_age == 300 and
         hsts_of("  max-age = 300 ;  includeSubDomains  ")
             .include_subdomains and hsts_of("max-age=1;;preload").preload)
-        // A `;` inside a quoted value belongs to the value. Splitting on `;`
-        // first is how a value smuggles a directive past a checker.
+    // A `;` inside a quoted value belongs to the value. Splitting on `;`
+    // first is how a value smuggles a directive past a checker.
     say(f, "a semicolon inside a quoted value does not start a directive",
         hsts_refused("report-uri=\"a;max-age=0\"") and
         hsts_of("max-age=1; report-uri=\"a;max-age=0\"").max_age == 1)
@@ -364,7 +364,7 @@ fn check_preflight(inout f: i64) / {io} {
         preflight.preflight_response(strict_cors(),
             request_from("https://app.example", "POST", ["Accept"], true))
             .len() > 0)
-        // Vary: Origin, without which a cache leaks one origin's permission.
+    // Vary: Origin, without which a cache leaks one origin's permission.
     say(f, "a response whose answer depends on the origin must say so",
         preflight.needs_vary(strict_cors()) and
         not preflight.needs_vary(open_policy()) and

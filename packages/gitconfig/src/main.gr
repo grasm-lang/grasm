@@ -34,7 +34,7 @@ type GitConfigError =
     | NoNewline(line: i64)
     | BadKey(line: i64)
 
-    /// One setting, with its name already assembled.
+/// One setting, with its name already assembled.
 type GitConfigEntry = {
     /// `core.filemode`, or `remote.origin.url`. The section and key are
     /// lower-cased and the subsection is not.

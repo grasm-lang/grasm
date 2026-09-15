@@ -32,10 +32,10 @@ type LinError =
     | LinNotPositiveDefinite
     | LinNoConvergence(sweeps: i64)
 
-    /// An LU factorisation with partial pivoting: `P A = L U`.
-    ///
-    /// `L` and `U` share one array, because `L` has a unit diagonal that does not
-    /// need storing: below the diagonal is `L`, on and above it is `U`.
+/// An LU factorisation with partial pivoting: `P A = L U`.
+///
+/// `L` and `U` share one array, because `L` has a unit diagonal that does not
+/// need storing: below the diagonal is `L`, on and above it is `U`.
 type LinLu = {
     n: i64,
     packed: [f64],

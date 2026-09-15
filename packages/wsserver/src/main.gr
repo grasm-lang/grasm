@@ -36,7 +36,7 @@ type WsServerError =
     | NotAWebSocket(why: str)
     | Closed(handle: i64)
 
-    /// One connection, and whatever of its next frame has arrived.
+/// One connection, and whatever of its next frame has arrived.
 type WsConnection = {
     handle: i64,
     /// Bytes read and not yet consumed by a frame.

@@ -20,7 +20,7 @@ type MoneyError =
     | CurrencyMismatch(a: str, b: str)
     | UnknownCurrency(code: str)
 
-    /// Decimal places for a currency. The three shapes that actually exist.
+/// Decimal places for a currency. The three shapes that actually exist.
 pub fn exponent_of(code: str) -> i64 {
     let none = ["JPY", "KRW", "VND", "CLP", "ISK", "UGX", "XAF", "XOF"]
     for c in none {

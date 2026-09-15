@@ -42,7 +42,7 @@ type PolyError =
     | PolyRootsNotFound(iterations: i64)
     | PolySingularFit
 
-    /// A quotient and a remainder, which is what dividing gives you.
+/// A quotient and a remainder, which is what dividing gives you.
 type PolyDivision = {
     quotient: Polynomial,
     remainder: Polynomial,

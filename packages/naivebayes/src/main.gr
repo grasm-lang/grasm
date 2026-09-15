@@ -41,7 +41,7 @@ type NbError =
     | BadSmoothing(alpha: f64)
     | NegativeCount(value: f64)
 
-    /// A fitted Gaussian model: a mean and a variance per feature per class.
+/// A fitted Gaussian model: a mean and a variance per feature per class.
 type Gaussian = {
     /// `means[class][feature]`.
     means: [[f64]],

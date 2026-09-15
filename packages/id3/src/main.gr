@@ -60,7 +60,7 @@ type Id3Error =
     | UnsupportedVersion(major: i64)
     | Truncated(at: i64)
 
-    /// A synchsafe integer: seven bits a byte, top bit always clear.
+/// A synchsafe integer: seven bits a byte, top bit always clear.
 pub fn read_synchsafe(data: bytes, at: i64) -> i64 {
     if at + 4 > data.len() {
         return 0

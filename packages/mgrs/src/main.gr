@@ -37,7 +37,7 @@ type MgrsError =
     | BadPrecision(digits: i64)
     | BadReference(text: str)
 
-    /// The column letters, in the order the standard cycles them.
+/// The column letters, in the order the standard cycles them.
 pub fn column_letters() -> str {
     return "ABCDEFGHJKLMNPQRSTUVWXYZ"
 }

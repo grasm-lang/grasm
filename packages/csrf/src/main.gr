@@ -52,7 +52,7 @@ type CsrfError =
     | CsrfNoSecret
     | CsrfShortRandom(given: i64, needed: i64)
 
-    /// How many bytes of randomness a token carries.
+/// How many bytes of randomness a token carries.
 pub fn token_bytes() -> i64 {
     return 32
 }

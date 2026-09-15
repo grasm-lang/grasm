@@ -34,12 +34,12 @@ type Entry = {
 type WalError =
     | Io(path: str)
 
-    /// Append one write, and optionally make it durable.
-    ///
-    /// `durable` is the caller's decision and it is the whole performance story of
-    /// a store: syncing every write is slow and correct, syncing none is fast and
-    /// loses acknowledged data. A store that offers both must be honest about
-    /// which one it is doing, so this takes the flag rather than choosing.
+/// Append one write, and optionally make it durable.
+///
+/// `durable` is the caller's decision and it is the whole performance story of
+/// a store: syncing every write is slow and correct, syncing none is fast and
+/// loses acknowledged data. A store that offers both must be honest about
+/// which one it is doing, so this takes the flag rather than choosing.
 pub fn append(path: str, e: Entry, durable: bool) -> () ! WalError / {io} {
     var payload: [i64] = []
     payload.push(if e.deleted { 2 } else { 1 })

@@ -100,7 +100,7 @@ fn check_sshsig(inout f: i64) / {io} {
             public_key: "".to_bytes(), namespace: "!", reserved:
             "".to_bytes(), hash_algorithm: "", signature: "".to_bytes() })
             .namespace == "!")
-        // The verification underneath is the tree's own ed25519.
+    // The verification underneath is the tree's own ed25519.
     say(f, "an ed25519 signature over nothing is not valid",
         not ed25519.verify("".to_bytes(), "x".to_bytes(), "".to_bytes()))
 }

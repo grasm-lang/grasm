@@ -20,7 +20,7 @@ type MultipartError =
     | NoBoundary
     | Malformed(at: i64)
 
-    /// The boundary from a `Content-Type: multipart/form-data; boundary=...`.
+/// The boundary from a `Content-Type: multipart/form-data; boundary=...`.
 pub fn boundary_of(content_type: str) -> Option[str] {
     for piece in content_type.split(";") {
         let p = piece.trim()

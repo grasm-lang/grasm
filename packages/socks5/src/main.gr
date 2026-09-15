@@ -40,19 +40,19 @@ type SocksMethod =
     | SocksNoneAcceptable
     | SocksOther(code: i64)
 
-    /// The three commands.
+/// The three commands.
 type SocksCommand =
     | SocksConnect
     | SocksBind
     | SocksUdpAssociate
 
-    /// An address, in one of the three forms the protocol carries.
+/// An address, in one of the three forms the protocol carries.
 type SocksAddress =
     | SocksIpv4(octets: [i64])
     | SocksDomain(name: str)
     | SocksIpv6(octets: [i64])
 
-    /// A parsed request or reply.
+/// A parsed request or reply.
 type SocksMessage = {
     /// For a request: the command. For a reply: the status.
     code: i64,
@@ -69,7 +69,7 @@ type SocksError =
     | SocksNoMethods
     | SocksBadCredentials(why: str)
 
-    /// The protocol's version byte.
+/// The protocol's version byte.
 pub fn version() -> i64 {
     return 5
 }

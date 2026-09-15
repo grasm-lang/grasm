@@ -33,7 +33,7 @@ type BibError =
     | NoKey(at: i64)
     | BadEntry(at: i64)
 
-    /// One field of an entry.
+/// One field of an entry.
 type BibField = {
     /// Lower-cased, since BibTeX does not distinguish.
     name: str,

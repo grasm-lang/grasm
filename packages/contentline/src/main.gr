@@ -29,8 +29,8 @@ type LineError =
     | NoValue(line: i64)
     | UnclosedQuote(line: i64)
 
-    /// One parameter. The value may have been quoted, which the parser
-    /// records because writing it back needs to know.
+/// One parameter. The value may have been quoted, which the parser
+/// records because writing it back needs to know.
 type LineParam = {
     name: str,
     values: [str],

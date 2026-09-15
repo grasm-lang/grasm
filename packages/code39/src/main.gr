@@ -40,7 +40,7 @@ type Code39Error =
     | NotEncodable(character: str, at: i64)
     | Empty()
 
-    /// The pattern for `*`, which delimits every symbol.
+/// The pattern for `*`, which delimits every symbol.
 pub fn delimiter_pattern() -> str {
     return "100010111011101"
 }

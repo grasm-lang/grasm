@@ -30,7 +30,7 @@ type GeoJsonError =
     | BadCoordinates(why: str)
     | HasCrs
 
-    /// A feature: a geometry with properties and an optional id.
+/// A feature: a geometry with properties and an optional id.
 type GeoFeature = {
     geometry: Geometry,
     /// Property names and their values as text, which is what a map label,

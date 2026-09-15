@@ -404,7 +404,7 @@ pub fn gcm_seal_with(c: Cipher, nonce: bytes, aad: bytes, plaintext: bytes) -> b
 type GcmError =
     | NotAuthentic
 
-    /// Open, verifying before decrypting.
+/// Open, verifying before decrypting.
 pub fn gcm_open(key: bytes, nonce: bytes, aad: bytes, sealed: bytes) -> bytes ! GcmError {
     try gcm_open_with(new_cipher(key), nonce, aad, sealed)
 }

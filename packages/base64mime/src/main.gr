@@ -31,11 +31,11 @@ type Base64MimeError =
     | Base64MimeCharacter(at: i64, c: str)
     | Base64MimeLength(len: i64)
 
-    /// `raw` encoded and broken into lines of `width` characters.
-    ///
-    /// Every line ends with `line_end`, including the last, which is what
-    /// `base64.encodebytes` produces and what a MIME body wants. Nothing at all
-    /// is produced for no bytes — not an empty line.
+/// `raw` encoded and broken into lines of `width` characters.
+///
+/// Every line ends with `line_end`, including the last, which is what
+/// `base64.encodebytes` produces and what a MIME body wants. Nothing at all
+/// is produced for no bytes — not an empty line.
 pub fn encode_with(raw: bytes, width: i64, line_end: str) -> str {
     if raw.len() == 0 {
         return ""

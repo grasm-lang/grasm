@@ -31,7 +31,7 @@ type BigRationalError =
     | DivideByZero()
     | NotANumber(text: str)
 
-    /// A fraction in lowest terms. The denominator is positive and never zero.
+/// A fraction in lowest terms. The denominator is positive and never zero.
 type BigRational = {
     numerator: BigInt,
     denominator: BigInt,

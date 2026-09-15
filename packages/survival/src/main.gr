@@ -49,7 +49,7 @@ type SurvError =
     | NoMedian()
     | BadLevel(level: f64)
 
-    /// One step of the curve.
+/// One step of the curve.
 type SurvPoint = {
     time: f64,
     /// How many were still being followed just before this time.

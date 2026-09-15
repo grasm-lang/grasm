@@ -37,7 +37,7 @@ type GrpcError =
     | NoStatus()
     | BadStatus(text: str)
 
-    /// One message off the wire.
+/// One message off the wire.
 type GrpcMessage = {
     compressed: bool,
     body: bytes,

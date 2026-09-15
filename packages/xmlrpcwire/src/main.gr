@@ -40,7 +40,7 @@ type RpcError =
     | RpcUnknownType(name: str)
     | RpcNotXml(why: str)
 
-    /// A value as XML-RPC types them.
+/// A value as XML-RPC types them.
 type RpcValue =
     | RpcInt(value: i64)
     | RpcBool(value: bool)
@@ -52,7 +52,7 @@ type RpcValue =
     | RpcStruct(names: [str], values: [ref RpcValue])
     | RpcNil
 
-    /// A parsed document: a call, a reply, or a fault.
+/// A parsed document: a call, a reply, or a fault.
 type RpcDocument = {
     /// The method name, empty for a response.
     method: str,

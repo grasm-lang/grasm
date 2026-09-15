@@ -57,14 +57,14 @@ type DerWriteError =
     | UnusedBitsOutOfRange(bits: i64)
     | YearOutOfRange(year: i64)
 
-    // ------------------------------------------------------------------ lengths
+// ------------------------------------------------------------------ lengths
 
-    /// The length octets for a body of `n` bytes, in the one form DER permits.
-    ///
-    /// Short form under 128, long form above it with no leading zero. A body of
-    /// 127 bytes writes `7F`; 128 writes `81 80`; 256 writes `82 01 00`. Writing
-    /// `81 7F` for 127 is legal BER and invalid DER, and is what an encoder that
-    /// always uses the long form produces.
+/// The length octets for a body of `n` bytes, in the one form DER permits.
+///
+/// Short form under 128, long form above it with no leading zero. A body of
+/// 127 bytes writes `7F`; 128 writes `81 80`; 256 writes `82 01 00`. Writing
+/// `81 7F` for 127 is legal BER and invalid DER, and is what an encoder that
+/// always uses the long form produces.
 pub fn length(n: i64) -> bytes ! DerWriteError {
     if n < 0 {
         fail(LengthNegative(n))

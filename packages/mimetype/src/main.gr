@@ -23,10 +23,10 @@ type MediaTypeError =
     | NoSlash(text: str)
     | EmptyPart(text: str)
 
-    /// The default for content nobody could identify.
-    ///
-    /// It is deliberately useless: a browser will download it rather than render
-    /// it, which is the right thing to do with an unidentified file.
+/// The default for content nobody could identify.
+///
+/// It is deliberately useless: a browser will download it rather than render
+/// it, which is the right thing to do with an unidentified file.
 pub fn unknown() -> str {
     return "application/octet-stream"
 }

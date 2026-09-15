@@ -37,7 +37,7 @@ type ThriftError =
     | BadMessage(at: i64)
     | Depth(at: i64)
 
-    /// A decoded value.
+/// A decoded value.
 type ThriftValue =
     | ThriftStop
     | ThriftBool(v: bool)

@@ -48,7 +48,7 @@ type DimensionError =
     | NotAnInteger(numerator: i64, denominator: i64)
     | Mismatch(left: str, right: str)
 
-    /// A rational exponent, kept exact.
+/// A rational exponent, kept exact.
 type Exponent = {
     numerator: i64,
     denominator: i64,

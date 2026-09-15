@@ -46,7 +46,7 @@ type Asn1Error =
     | LengthTooLarge(at: i64)
     | Trailing(at: i64)
 
-    /// Every node of the document, outermost first, in the order it is written.
+/// Every node of the document, outermost first, in the order it is written.
 pub fn parse(der: bytes) -> [DerNode] ! Asn1Error {
     var out: [DerNode] = []
     try walk(der, 0, der.len(), 0, out)
