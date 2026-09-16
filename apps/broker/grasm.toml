@@ -1,0 +1,15 @@
+[package]
+name = "broker"
+version = "0.1.0"
+entry = "src/main.gr"
+
+# Its own log directory and the socket it serves. Nothing else.
+capabilities = ["io", "net"]
+
+[dependencies.brokerwire]
+path = "../../packages/brokerwire"
+version = "^1.0.0"
+
+[dependencies.topiclog]
+path = "../../packages/topiclog"
+version = "^1.0.0"

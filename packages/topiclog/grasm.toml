@@ -1,0 +1,10 @@
+[package]
+name = "topiclog"
+version = "1.0.0"
+
+# Reads and writes the log directory it is given.
+capabilities = ["io"]
+
+[dependencies.crc32]
+path = "../crc32"
+version = "^1.0.0"

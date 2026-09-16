@@ -7493,13 +7493,45 @@ this case",
                         let mut vals = Vec::with_capacity(args.len());
                         let mut inout_args: Vec<(cranelift_codegen::ir::StackSlot, Variable, VType)> =
                             Vec::new();
+                        // And an `inout` argument that names a *place* rather
+                        // than a binding — `store.append(s.logs[i], x)`, which
+                        // is what a program keeping several of a package's
+                        // values in a struct writes. The same-module path
+                        // reads the place, calls, and writes back; this one
+                        // refused, so a program the interpreter ran could not
+                        // be built the moment the state lived in a list.
+                        let mut inout_places: Vec<(
+                            cranelift_codegen::ir::StackSlot,
+                            Variable,
+                            VType,
+                            Vec<PlaceSeg<'_>>,
+                            VType,
+                        )> = Vec::new();
                         for (i, (a, want)) in args.iter().zip(&params).enumerate() {
                             if modes.get(i).copied() == Some(ParamMode::Inout) {
                                 let Expr::Ident(aid) = a else {
-                                    return nope(
-                                        a.span(),
-                                        "`inout` arguments that aren't plain variables",
+                                    let (root_id, path) = self.place_path(a)?;
+                                    let Some((var, root_t)) = self.lookup(&root_id.name) else {
+                                        return nope(root_id.span, "an unknown `inout` argument");
+                                    };
+                                    let cur = self.b.use_var(var);
+                                    // Taken rather than copied, so the callee
+                                    // mutates what it was handed instead of a
+                                    // copy of it.
+                                    let held = self.read_place_boxed(cur, &path, &root_t, true)?;
+                                    let (raw, _) = self.unbox(held, want)?;
+                                    let slot = self.b.create_sized_stack_slot(
+                                        cranelift_codegen::ir::StackSlotData::new(
+                                            cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                                            8,
+                                            3,
+                                        ),
                                     );
+                                    self.b.ins().stack_store(raw, slot, 0);
+                                    let addr = self.b.ins().stack_addr(ptr_ty, slot, 0);
+                                    vals.push(addr);
+                                    inout_places.push((slot, var, root_t, path, want.clone()));
+                                    continue;
                                 };
                                 let Some((avar, avt)) = self.lookup(&aid.name) else {
                                     return nope(aid.span, "an unknown `inout` argument");
@@ -7530,6 +7562,15 @@ this case",
                         for (slot, var, vt) in inout_args {
                             let updated = self.b.ins().stack_load(vt.cl(), slot, 0);
                             self.b.def_var(var, updated);
+                        }
+                        for (slot, var, root_t, path, want) in inout_places {
+                            let updated = self.b.ins().stack_load(want.cl(), slot, 0);
+                            // Boxed again on the way back: a place holds a box.
+                            let updated = self.box_value(updated, &want);
+                            let cur = self.b.use_var(var);
+                            self.begin_write();
+                            let new_root = self.write_place(span, cur, &path, &root_t, updated)?;
+                            self.b.def_var(var, new_root);
                         }
                         return Ok(if ret == VType::Unit {
                             None
@@ -8448,27 +8489,63 @@ this case",
                     // passing a pointer to the caller's slot.
                     let mut recv_slot: Option<(cranelift_codegen::ir::StackSlot, Variable, VType)> =
                         None;
+                    // An `inout` receiver or argument that names a *place* —
+                    // `q.push(x)` where `q` is `s.queues[i]`, which is what a
+                    // call into a module holding its state in a struct looks
+                    // like. The same read-take-call-write-back the free-call
+                    // path does; this one refused to compile it, and the
+                    // interpreter ran it, so a program that worked under
+                    // `grasm run` could not be built.
+                    let mut inout_places: Vec<(
+                        cranelift_codegen::ir::StackSlot,
+                        Variable,
+                        VType,
+                        Vec<PlaceSeg<'_>>,
+                        VType,
+                    )> = Vec::new();
                     if modes.first().copied() == Some(ParamMode::Inout) {
-                        let Expr::Ident(rid) = recv else {
-                            return nope(span, "`inout` receivers that aren't plain variables");
-                        };
-                        let Some((rvar, rvt)) = self.lookup(&rid.name) else {
-                            return nope(rid.span, "an unknown `inout` receiver");
-                        };
-                        // `rv` was an owned +1 read of the same value; release it.
-                        self.dec_if_boxed(rv, &rvt);
-                        let slot = self.b.create_sized_stack_slot(
-                            cranelift_codegen::ir::StackSlotData::new(
-                                cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
-                                8,
-                                3,
-                            ),
-                        );
-                        let cur = self.b.use_var(rvar);
-                        self.b.ins().stack_store(cur, slot, 0);
-                        let addr = self.b.ins().stack_addr(ptr_ty, slot, 0);
-                        vals.push(addr);
-                        recv_slot = Some((slot, rvar, rvt));
+                        if let Expr::Ident(rid) = recv {
+                            let Some((rvar, rvt)) = self.lookup(&rid.name) else {
+                                return nope(rid.span, "an unknown `inout` receiver");
+                            };
+                            // `rv` was an owned +1 read of the same value; release it.
+                            self.dec_if_boxed(rv, &rvt);
+                            let slot = self.b.create_sized_stack_slot(
+                                cranelift_codegen::ir::StackSlotData::new(
+                                    cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                                    8,
+                                    3,
+                                ),
+                            );
+                            let cur = self.b.use_var(rvar);
+                            self.b.ins().stack_store(cur, slot, 0);
+                            let addr = self.b.ins().stack_addr(ptr_ty, slot, 0);
+                            vals.push(addr);
+                            recv_slot = Some((slot, rvar, rvt));
+                        } else {
+                            let want = params[0].clone();
+                            let (root_id, path) = self.place_path(recv)?;
+                            let Some((var, root_t)) = self.lookup(&root_id.name) else {
+                                return nope(root_id.span, "an unknown `inout` receiver");
+                            };
+                            self.dec_if_boxed(rv, &rt);
+                            let cur = self.b.use_var(var);
+                            // Taken rather than copied, so the callee's
+                            // mutation does not copy what it was handed.
+                            let held = self.read_place_boxed(cur, &path, &root_t, true)?;
+                            let (raw, _) = self.unbox(held, &want)?;
+                            let slot = self.b.create_sized_stack_slot(
+                                cranelift_codegen::ir::StackSlotData::new(
+                                    cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                                    8,
+                                    3,
+                                ),
+                            );
+                            self.b.ins().stack_store(raw, slot, 0);
+                            let addr = self.b.ins().stack_addr(ptr_ty, slot, 0);
+                            vals.push(addr);
+                            inout_places.push((slot, var, root_t, path, want));
+                        }
                     } else if is_extern && matches!(params.first(), Some(VType::Str | VType::Bytes))
                     {
                         let want = params[0].clone();
@@ -8486,10 +8563,25 @@ this case",
                     for (i, (a, want)) in args.iter().zip(params.iter().skip(1)).enumerate() {
                         if modes.get(i + 1).copied() == Some(ParamMode::Inout) {
                             let Expr::Ident(aid) = a else {
-                                return nope(
-                                    a.span(),
-                                    "`inout` arguments that aren't plain variables",
+                                let (root_id, path) = self.place_path(a)?;
+                                let Some((var, root_t)) = self.lookup(&root_id.name) else {
+                                    return nope(root_id.span, "an unknown `inout` argument");
+                                };
+                                let cur = self.b.use_var(var);
+                                let held = self.read_place_boxed(cur, &path, &root_t, true)?;
+                                let (raw, _) = self.unbox(held, want)?;
+                                let slot = self.b.create_sized_stack_slot(
+                                    cranelift_codegen::ir::StackSlotData::new(
+                                        cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                                        8,
+                                        3,
+                                    ),
                                 );
+                                self.b.ins().stack_store(raw, slot, 0);
+                                let addr = self.b.ins().stack_addr(ptr_ty, slot, 0);
+                                vals.push(addr);
+                                inout_places.push((slot, var, root_t, path, want.clone()));
+                                continue;
                             };
                             let Some((avar, avt)) = self.lookup(&aid.name) else {
                                 return nope(aid.span, "an unknown `inout` argument");
@@ -8533,6 +8625,15 @@ this case",
                     for (slot, avar, avt) in arg_slots {
                         let updated = self.b.ins().stack_load(avt.cl(), slot, 0);
                         self.b.def_var(avar, updated);
+                    }
+                    for (slot, var, root_t, path, want) in inout_places {
+                        let updated = self.b.ins().stack_load(want.cl(), slot, 0);
+                        // Boxed again on the way back: a place holds a box.
+                        let updated = self.box_value(updated, &want);
+                        let cur = self.b.use_var(var);
+                        self.begin_write();
+                        let new_root = self.write_place(span, cur, &path, &root_t, updated)?;
+                        self.b.def_var(var, new_root);
                     }
                     // The C call is over: free the temporary copies and release
                     // the boxed values that backed the pointers.

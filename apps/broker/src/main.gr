@@ -1,0 +1,1054 @@
+// A message broker: topics, an append-only log per topic, subscribers that
+// follow it, and a peer that replicates it.
+//
+// This exists to put the language's network surface under the load a broker
+// actually sees, and to say plainly what that surface is. Grasm has no thread
+// a program can put a socket on: `spawn` does not carry `net`, and
+// `parallel` is not multicore. What it has is `net_wait`, which answers with
+// the handles that can be read without blocking — so this is one process, one
+// loop, many connections, which is how nginx and Redis are built and is not
+// how Kafka is built.
+//
+// What that buys, and what it costs, is measured rather than asserted:
+// `scripts/broker_test.sh` runs a real server over a real socket, publishes
+// through it, kills it with SIGKILL in the middle of a write, restarts it,
+// and checks that the log is intact and the offsets continue. The numbers it
+// prints are this machine's, and the ceiling is the loop: one slow consumer
+// holds the turn, because `tcp_write` blocks until the kernel takes the
+// bytes. Batches are bounded so that turn is short.
+//
+// The pieces are packages, so they are testable without a socket:
+// `packages/brokerwire` is the framing, `packages/topiclog` is the storage
+// and its recovery. What is left here is the loop, the subscriptions, and
+// replication — a follower is a subscriber that appends what it receives at
+// the offsets the leader gave.
+//
+//   broker serve --dir D --port P [--peer host:port --topics a,b] [--ticks N]
+//   broker bench --port P [--connections N] [--messages M] [--size S]
+//   broker verify --port P --topic T --expect N
+//   broker selftest
+
+import brokerwire
+import topiclog
+
+let MAX_FRAME = 16777216
+let BATCH_RECORDS = 256
+let BATCH_BYTES = 262144
+
+/// One subscription: where this connection has read up to on a topic.
+type Subscription = {
+    topic: str,
+    next_offset: i64,
+}
+
+/// An acknowledgement owed to a connection: which publish, and the offset it
+/// was promised. The frame is built after the batch reaches the disk, so an
+/// acknowledgement is never written for a record that failed to land.
+type PendingAck = {
+    correlation: i64,
+    offset: i64,
+    topic: i64,
+}
+
+/// A connection, what has arrived on it that is not yet a whole frame, and
+/// what is owed to it. Replies are buffered and written once a tick: a write
+/// per frame is a syscall per message, which is most of what a broker of
+/// this shape spends.
+type Conn = {
+    handle: i64,
+    buffer: bytes,
+    /// How far into `buffer` the frames have been read. A cursor rather than
+    /// a re-slice: slicing the remainder after every frame copies the whole
+    /// buffer per message, which is quadratic in a pipelined batch.
+    read_at: i64,
+    out: bytes,
+    acks: [PendingAck],
+    subscriptions: [Subscription],
+    /// A follower's link to its leader reads records instead of requests.
+    replicating: bool,
+    frames: i64,
+}
+
+type Server = {
+    dir: str,
+    topics: [str],
+    logs: [TopicLog],
+    /// This tick's publishes, per topic, and whether any of them asked for
+    /// durability.
+    pending: [[bytes]],
+    pending_sync: [bool],
+    conns: [Conn],
+    /// Where each connection sits, the wait set, and the connections that owe
+    /// something or follow a topic. A tick costs what it handles rather than
+    /// what is connected: with a thousand idle connections, walking all of
+    /// them once a turn is the whole turn.
+    seat_of: Map[i64, i64],
+    waiting: [i64],
+    dirty: [i64],
+    is_dirty: Map[i64, bool],
+    subscribers: [i64],
+    leader: bool,
+    published: i64,
+    delivered: i64,
+    bytes_in: i64,
+    bytes_out: i64,
+    errors: i64,
+    recovered: i64,
+}
+
+// --- topics -----------------------------------------------------------------
+
+fn topic_index(s: Server, topic: str) -> i64 {
+    var i = 0
+    while i < s.topics.len() {
+        if s.topics[i] == topic {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+/// The log for a topic, opened on first use. A broker that refused unknown
+/// topics would need a creation call before every first publish; one that
+/// opens them lazily needs a name that is safe as a path, which is what is
+/// checked here.
+fn ensure_topic(inout s: Server, topic: str) -> i64 ! TopicLogError / {io} {
+    let at = topic_index(s, topic)
+    if at >= 0 {
+        return at
+    }
+    let log = try topiclog.open(s.dir, topic, 8388608)
+    s.recovered = s.recovered + log.recovered_bytes
+    s.topics.push(topic)
+    s.logs.push(log)
+    s.pending.push([])
+    s.pending_sync.push(false)
+    return s.topics.len() - 1
+}
+
+fn safe_topic(topic: str) -> bool {
+    if topic.len() == 0 or topic.len() > 200 {
+        return false
+    }
+    for c in topic.codes() {
+        let letter = (c >= 97 and c <= 122) or (c >= 65 and c <= 90)
+        let digit = c >= 48 and c <= 57
+        if not letter and not digit and c != 45 and c != 46 and c != 95 {
+            return false
+        }
+        if c == 46 and topic.contains("..") {
+            return false
+        }
+    }
+    return true
+}
+
+// --- serving ----------------------------------------------------------------
+
+/// A frame into a connection's outgoing buffer, written at the end of the
+/// tick.
+fn queue(inout s: Server, index: i64, f: Frame) {
+    // Marked in place rather than through a helper: passing the server to a
+    // second function once per frame costs more than the bookkeeping saves.
+    let handle = s.conns[index].handle
+    if not (s.is_dirty.get(handle) ?? false) {
+        s.is_dirty.set(handle, true)
+        s.dirty.push(handle)
+    }
+    // `concat` copies, and appending frame by frame is quadratic in the
+    // number of frames a tick owes one connection — but a copy of a few
+    // kilobytes is a `memcpy`, and the alternative measured here (a list of
+    // byte values, joined once) was slower: a list element is a machine word
+    // and a byte is not.
+    s.conns[index].out = s.conns[index].out.concat(brokerwire.encode(f))
+}
+
+/// One frame, written now. Used by the clients, which have one conversation
+/// and nothing to batch it with.
+fn write_frame(handle: i64, f: Frame) -> i64 / {io, net} {
+    let data = brokerwire.encode(f)
+    match tcp_write_bytes(handle, data) {
+        Ok(_x) -> return data.len()
+        Err(_gone) -> return 0
+    }
+}
+
+/// One request frame, answered.
+fn handle_frame(inout s: Server, index: i64, f: Frame) / {io, net} {
+    if f.opcode == brokerwire.PING {
+        queue(s, index, brokerwire.frame(brokerwire.PONG, f.correlation))
+        return
+    }
+    if f.opcode == brokerwire.STATS {
+        var reply = brokerwire.frame(brokerwire.STATS_OK, f.correlation)
+        reply.text = stats_text(s)
+        queue(s, index, reply)
+        return
+    }
+    if f.opcode == brokerwire.RECORDS and s.conns[index].replicating {
+        follow(s, f)
+        return
+    }
+    if not safe_topic(f.topic) {
+        refuse(s, index, f, brokerwire.ERROR_UNKNOWN_TOPIC,
+            "a topic is letters, digits, dash, dot or underscore")
+        return
+    }
+    if f.opcode == brokerwire.PUBLISH {
+        publish(s, index, f)
+        return
+    }
+    if f.opcode == brokerwire.FETCH {
+        serve_fetch(s, index, f)
+        return
+    }
+    if f.opcode == brokerwire.SUBSCRIBE {
+        add_subscription(s, index, f)
+        return
+    }
+    if f.opcode == brokerwire.UNSUBSCRIBE {
+        var kept: [Subscription] = []
+        for sub in s.conns[index].subscriptions {
+            if sub.topic != f.topic {
+                kept.push(sub)
+            }
+        }
+        s.conns[index].subscriptions = kept
+        return
+    }
+    refuse(s, index, f, brokerwire.ERROR_PROTOCOL,
+        "unexpected " + brokerwire.opcode_name(f.opcode))
+}
+
+/// A publish joins this tick's batch for its topic and is promised the
+/// offset that batch will give it. Nothing is written here: the batch goes
+/// to the disk once, at the end of the tick, and the acknowledgements follow
+/// it.
+fn publish(inout s: Server, index: i64, f: Frame) / {io, net} {
+    if not s.leader {
+        refuse(s, index, f, brokerwire.ERROR_PROTOCOL,
+            "this node follows a leader; publish there")
+        return
+    }
+    match ensure_topic(s, f.topic) {
+        Ok(at) -> {
+            let offset = s.logs[at].end_offset + s.pending[at].len()
+            s.pending[at].push(f.payload)
+            if f.durable {
+                s.pending_sync[at] = true
+            }
+            s.conns[index].acks.push(PendingAck{ correlation: f.correlation,
+                offset: offset, topic: at })
+            let owner = s.conns[index].handle
+            if not (s.is_dirty.get(owner) ?? false) {
+                s.is_dirty.set(owner, true)
+                s.dirty.push(owner)
+            }
+        }
+        Err(_e) -> refuse(s, index, f, brokerwire.ERROR_STORAGE,
+            "cannot open the topic")
+    }
+}
+
+/// This tick's publishes, one write per topic and one `sync` if any of them
+/// asked for it.
+fn flush_appends(inout s: Server) / {io, net} {
+    var at = 0
+    while at < s.topics.len() {
+        if s.pending[at].len() > 0 {
+            let count = s.pending[at].len()
+            match topiclog.append_batch(s.logs[at], s.pending[at],
+                now_millis()) {
+                Ok(_written) -> s.published = s.published + count
+                Err(_e) -> s.errors = s.errors + 1
+            }
+            if s.pending_sync[at] {
+                match topiclog.sync(s.logs[at]) {
+                    Ok(_x) -> {}
+                    Err(_e) -> {}
+                }
+            }
+            s.pending[at] = []
+            s.pending_sync[at] = false
+        }
+        at = at + 1
+    }
+}
+
+/// What every connection is owed, in one write each: the frames queued
+/// during the tick, then an acknowledgement per publish that landed.
+fn flush_out(inout s: Server) / {io, net} {
+    for handle in s.dirty {
+        let index = s.seat_of.get(handle) ?? -1
+        if index < 0 {
+            continue
+        }
+        for owed in s.conns[index].acks {
+            let end = if owed.topic < s.logs.len() {
+                s.logs[owed.topic].end_offset } else { owed.offset + 1 }
+            let landed = owed.offset < end
+            let reply = if landed {
+                brokerwire.ack(owed.correlation, owed.offset, end)
+            } else {
+                brokerwire.error(owed.correlation, brokerwire.ERROR_STORAGE,
+                    "the batch holding this record did not reach the disk")
+            }
+            queue(s, index, reply)
+        }
+        s.conns[index].acks = []
+        if s.conns[index].out.len() > 0 {
+            let out = s.conns[index].out
+            s.conns[index].out = bytes_of([])
+            s.bytes_out = s.bytes_out + out.len()
+            match tcp_write_bytes(s.conns[index].handle, out) {
+                Ok(_x) -> {}
+                Err(_gone) -> {}
+            }
+        }
+    }
+    s.dirty = []
+    s.is_dirty = {}
+}
+
+fn refuse(inout s: Server, index: i64, f: Frame, code: i64, why: str) / {io, net} {
+    s.errors = s.errors + 1
+    queue(s, index, brokerwire.error(f.correlation, code, why))
+}
+
+fn to_wire(rs: [LogRecord]) -> [WireRecord] {
+    var out: [WireRecord] = []
+    for r in rs {
+        out.push(WireRecord{ offset: r.offset, time_ms: r.time_ms,
+            payload: r.payload })
+    }
+    return out
+}
+
+fn serve_fetch(inout s: Server, index: i64, f: Frame) / {io, net} {
+    match ensure_topic(s, f.topic) {
+        Ok(at) -> {
+            let limit = if f.limit > 0 and f.limit < BATCH_RECORDS { f.limit } else {
+                BATCH_RECORDS }
+            let budget = if f.max_bytes > 0 and f.max_bytes < BATCH_BYTES{
+                f.max_bytes } else { BATCH_BYTES }
+            match topiclog.read_from(s.logs[at], f.offset, limit, budget) {
+                Ok(rs) -> {
+                    s.delivered = s.delivered + rs.len()
+                    queue(s, index, brokerwire.records(f.correlation, f.topic,
+                        to_wire(rs), s.logs[at].end_offset))
+                }
+                Err(e) -> {
+                    let code = match e {
+                        TopicLogExpired(_o, _f) -> brokerwire.ERROR_EXPIRED
+                        TopicLogFuture(_o, _e2) -> brokerwire.ERROR_FUTURE
+                        _ -> brokerwire.ERROR_STORAGE
+                    }
+                    refuse(s, index, f, code, "cannot read from that offset")
+                }
+            }
+        }
+        Err(_e) -> refuse(s, index, f, brokerwire.ERROR_STORAGE,
+            "cannot open the topic")
+    }
+}
+
+fn add_subscription(inout s: Server, index: i64, f: Frame) / {io, net} {
+    match ensure_topic(s, f.topic) {
+        Ok(at) -> {
+            let start = if f.offset < 0 { s.logs[at].end_offset } else { f.offset }
+            var kept: [Subscription] = []
+            for sub in s.conns[index].subscriptions {
+                if sub.topic != f.topic {
+                    kept.push(sub)
+                }
+            }
+            kept.push(Subscription{ topic: f.topic, next_offset: start })
+            let was_empty = s.conns[index].subscriptions.len() == 0
+            s.conns[index].subscriptions = kept
+            if was_empty {
+                s.subscribers.push(s.conns[index].handle)
+            }
+        }
+        Err(_e) -> refuse(s, index, f, brokerwire.ERROR_STORAGE,
+            "cannot open the topic")
+    }
+}
+
+/// A batch to every subscriber that is behind. Bounded, because this loop is
+/// the only one there is: a subscriber that is a million records behind gets
+/// a batch a turn rather than a million records while everyone else waits.
+fn push_subscriptions(inout s: Server) / {io, net} {
+    var still: [i64] = []
+    for handle in s.subscribers {
+        let index = s.seat_of.get(handle) ?? -1
+        if index < 0 or s.conns[index].subscriptions.len() == 0 {
+            continue
+        }
+        still.push(handle)
+        var moved: [Subscription] = []
+        for sub in s.conns[index].subscriptions {
+            var next = sub.next_offset
+            let at = topic_index(s, sub.topic)
+            if at >= 0 and next < s.logs[at].end_offset {
+                match topiclog.read_from(s.logs[at], next, BATCH_RECORDS,
+                    BATCH_BYTES) {
+                    Ok(rs) -> {
+                        if rs.len() > 0 {
+                            s.delivered = s.delivered + rs.len()
+                            queue(s, index, brokerwire.records(0, sub.topic,
+                                to_wire(rs), s.logs[at].end_offset))
+                            next = rs[rs.len() - 1].offset + 1
+                        }
+                    }
+                    Err(_e) -> {}
+                }
+            }
+            moved.push(Subscription{ topic: sub.topic, next_offset: next })
+        }
+        s.conns[index].subscriptions = moved
+    }
+    s.subscribers = still
+}
+
+/// Records arriving from the leader, appended at the offsets the leader gave
+/// them. An offset that is not the one expected means the streams have
+/// diverged, which is reported rather than papered over.
+fn follow(inout s: Server, f: Frame) / {io, net} {
+    match ensure_topic(s, f.topic) {
+        Ok(at) -> {
+            for r in f.records {
+                if r.offset == s.logs[at].end_offset {
+                    match topiclog.append(s.logs[at], r.payload, r.time_ms) {
+                        Ok(_o) -> s.published = s.published + 1
+                        Err(_e) -> s.errors = s.errors + 1
+                    }
+                } else if r.offset > s.logs[at].end_offset {
+                    s.errors = s.errors + 1
+                    print("replication gap on {f.topic}: have {s.logs[at].end_offset}, leader sent {r.offset}")
+                }
+            }
+        }
+        Err(_e) -> s.errors = s.errors + 1
+    }
+}
+
+fn stats_text(s: Server) -> str {
+    var out = "node " + (if s.leader { "leader" } else { "follower" }) + "\n"
+    out = out + "connections {s.conns.len()}\n"
+    out = out + "published {s.published}\ndelivered {s.delivered}\n"
+    out = out + "bytes_in {s.bytes_in}\nbytes_out {s.bytes_out}\n"
+    out = out + "errors {s.errors}\nrecovered_bytes {s.recovered}\n"
+    var i = 0
+    while i < s.topics.len() {
+        let log = s.logs[i]
+        out = out + "topic {s.topics[i]} first {topiclog.first_offset(log)}" +
+        " end {log.end_offset} bytes {topiclog.size_bytes(log)}" +
+        " segments {log.segments.len()}\n"
+        i = i + 1
+    }
+    return out
+}
+
+/// Everything that arrived on one connection, decoded as far as it goes.
+fn read_conn(inout s: Server, index: i64) -> bool / {io, net} {
+    let handle = s.conns[index].handle
+    let arrived = match tcp_read_bytes(handle) {
+        Ok(d) -> d
+        Err(_e) -> bytes_of([])
+    }
+    if arrived.len() == 0 {
+        return false
+    }
+    s.bytes_in = s.bytes_in + arrived.len()
+    if s.conns[index].buffer.len() == 0 {
+        s.conns[index].buffer = arrived
+        s.conns[index].read_at = 0
+    } else {
+        s.conns[index].buffer = s.conns[index].buffer.concat(arrived)
+    }
+    while true {
+        let buffer = s.conns[index].buffer
+        let at = s.conns[index].read_at
+        match brokerwire.decode_at(buffer, at, MAX_FRAME) {
+            Ok(found) -> {
+                match found {
+                    Some(pair) -> {
+                        s.conns[index].read_at = pair.1
+                        s.conns[index].frames = s.conns[index].frames + 1
+                        handle_frame(s, index, pair.0)
+                    }
+                    None -> break
+                }
+            }
+            Err(_e) -> {
+                // A length that is not a length: the stream is not this
+                // protocol, and the connection goes.
+                s.errors = s.errors + 1
+                return false
+            }
+        }
+    }
+    // Compacted once per read rather than once per frame.
+    let at = s.conns[index].read_at
+    if at > 0 {
+        let buffer = s.conns[index].buffer
+        s.conns[index].buffer = if at >= buffer.len() { bytes_of([]) } else {
+            buffer.slice(at, buffer.len()) }
+        s.conns[index].read_at = 0
+    }
+    return true
+}
+
+fn add_conn(inout s: Server, conn: Conn) {
+    s.conns.push(conn)
+    s.seat_of.set(conn.handle, s.conns.len() - 1)
+    s.waiting.push(conn.handle)
+}
+
+fn drop_conn(inout s: Server, index: i64) / {io, net} {
+    net_close(s.conns[index].handle)
+    var kept: [Conn] = []
+    var i = 0
+    while i < s.conns.len() {
+        if i != index {
+            kept.push(s.conns[i])
+        }
+        i = i + 1
+    }
+    s.conns = kept
+    // The seats move when one goes, so they are numbered again; a
+    // disconnection is rare next to a message.
+    s.seat_of = {}
+    s.waiting = [s.waiting[0]]
+    i = 0
+    while i < s.conns.len() {
+        s.seat_of.set(s.conns[i].handle, i)
+        s.waiting.push(s.conns[i].handle)
+        i = i + 1
+    }
+}
+
+fn connect_to_leader(inout s: Server, host: str, port: i64,
+    topics: [str]) / {io, net} {
+    match tcp_connect(host, port) {
+        Ok(handle) -> {
+            let conn = Conn{ handle: handle, buffer: bytes_of([]), read_at: 0,
+                out: bytes_of([]), acks: [], subscriptions: [],
+                replicating: true, frames: 0 }
+            add_conn(s, conn)
+            for topic in topics {
+                match ensure_topic(s, topic) {
+                    Ok(at) -> {
+                        let from = s.logs[at].end_offset
+                        let _n = write_frame(handle,
+                            brokerwire.subscribe(0, topic, from))
+                        print("following {host}:{port} for {topic} from {from}")
+                    }
+                    Err(_e) -> s.errors = s.errors + 1
+                }
+            }
+        }
+        Err(_e) -> print("cannot reach the leader at {host}:{port}")
+    }
+}
+
+fn serve(dir: str, port: i64, peer_host: str, peer_port: i64, topics: [str],
+    ticks: i64) / {io, net} {
+    match make_dir(dir) {
+        Ok(_x) -> {}
+        Err(_e) -> {}
+    }
+    var s = Server{ dir: dir, topics: [], logs: [], pending: [],
+        pending_sync: [], conns: [], seat_of: {}, waiting: [], dirty: [],
+        is_dirty: {}, subscribers: [], leader: peer_host == "", published: 0,
+        delivered: 0, bytes_in: 0, bytes_out: 0, errors: 0, recovered: 0 }
+    for topic in topics {
+        match ensure_topic(s, topic) {
+            Ok(_at) -> {}
+            Err(_e) -> print("cannot open topic {topic}")
+        }
+    }
+    match tcp_listen(port) {
+        Err(_e) -> print("cannot listen on {port}")
+        Ok(listener) -> {
+            s.waiting = [listener]
+            let bound = net_port(listener) ?? port
+            print("broker listening on {bound} dir {dir} " +
+                (if s.leader { "leader" } else { "follower" }))
+            if s.recovered > 0 {
+                print("recovered: dropped {s.recovered} torn bytes at startup")
+            }
+            if peer_host != "" {
+                connect_to_leader(s, peer_host, peer_port, topics)
+            }
+            var tick = 0
+            while ticks < 0 or tick < ticks {
+                let ready = net_wait(s.waiting, 50) ?? []
+                var dead: [i64] = []
+                for handle in ready {
+                    if handle == listener {
+                        match tcp_accept(listener) {
+                            Ok(conn) -> add_conn(s, Conn{ handle: conn,
+                                buffer: bytes_of([]), read_at: 0,
+                                out: bytes_of([]), acks: [], subscriptions: [],
+                                replicating: false, frames: 0 })
+                            Err(_e) -> {}
+                        }
+                    } else {
+                        match s.seat_of.get(handle) {
+                            Some(index) -> {
+                                if not read_conn(s, index) {
+                                    dead.push(handle)
+                                }
+                            }
+                            None -> {}
+                        }
+                    }
+                }
+                // Dropped after the pass, so the indexes stay valid while it
+                // runs.
+                for handle in dead {
+                    var index = 0
+                    while index < s.conns.len() {
+                        if s.conns[index].handle == handle {
+                            drop_conn(s, index)
+                            break
+                        }
+                        index = index + 1
+                    }
+                }
+                flush_appends(s)
+                push_subscriptions(s)
+                flush_out(s)
+                tick = tick + 1
+            }
+            net_close(listener)
+            print(stats_text(s))
+        }
+    }
+}
+
+// --- client -----------------------------------------------------------------
+
+/// Reads until one whole frame has arrived, which is what a client that has
+/// just written a request needs.
+fn read_frame(handle: i64, inout buffer: bytes) -> Option[Frame] / {io, net} {
+    while true {
+        match brokerwire.decode(buffer, MAX_FRAME) {
+            Ok(found) -> {
+                match found {
+                    Some(pair) -> {
+                        buffer = buffer.slice(pair.1, buffer.len())
+                        return Some(pair.0)
+                    }
+                    None -> {}
+                }
+            }
+            Err(_e) -> return None
+        }
+        let arrived = match tcp_read_bytes(handle) {
+            Ok(d) -> d
+            Err(_e) -> bytes_of([])
+        }
+        if arrived.len() == 0 {
+            return None
+        }
+        buffer = buffer.concat(arrived)
+    }
+    return None
+}
+
+fn payload_of(size: i64, n: i64) -> bytes {
+    var out: [i64] = []
+    var i = 0
+    while i < size {
+        out.push(48 + (n + i) % 10)
+        i = i + 1
+    }
+    return bytes_of(out)
+}
+
+/// Publishes `messages` records over `connections` sockets, in flight
+/// `depth` at a time, and prints what that came to.
+fn bench(port: i64, connections: i64, messages: i64, size: i64, depth: i64,
+    topic: str, durable: bool) / {io, net} {
+    var handles: [i64] = []
+    var buffers: [bytes] = []
+    var refused = 0
+    var why = ""
+    var c = 0
+    while c < connections {
+        match tcp_connect("127.0.0.1", port) {
+            Ok(h) -> {
+                handles.push(h)
+                buffers.push(bytes_of([]))
+            }
+            Err(e) -> {
+                refused = refused + 1
+                why = "{e}"
+            }
+        }
+        c = c + 1
+    }
+    if refused > 0 {
+        print("bench: {refused} of {connections} connections refused: {why}")
+    }
+    if handles.len() == 0 {
+        print("no connections")
+        return
+    }
+    let started = monotonic_millis()
+    var sent = 0
+    var acked = 0
+    var bytes_written = 0
+    while acked < messages {
+        var i = 0
+        while i < handles.len() and sent < messages {
+            var in_flight = 0
+            while in_flight < depth and sent < messages {
+                let data = brokerwire.encode(brokerwire.publish(sent, topic,
+                    payload_of(size, sent), durable))
+                match tcp_write_bytes(handles[i], data) {
+                    Ok(_x) -> {
+                        bytes_written = bytes_written + data.len()
+                        sent = sent + 1
+                        in_flight = in_flight + 1
+                    }
+                    Err(_e) -> in_flight = depth
+                }
+            }
+            var got = 0
+            while got < in_flight {
+                match read_frame(handles[i], buffers[i]) {
+                    Some(f) -> {
+                        if f.opcode == brokerwire.ACK {
+                            acked = acked + 1
+                        }
+                        got = got + 1
+                    }
+                    None -> {
+                        got = in_flight
+                        acked = messages
+                    }
+                }
+            }
+            i = i + 1
+        }
+    }
+    let elapsed = monotonic_millis() - started
+    for h in handles {
+        net_close(h)
+    }
+    let seconds = if elapsed > 0 { elapsed.as_f64() / 1000.0 } else { 0.001 }
+    let rate = (acked.as_f64() / seconds).as_i64()
+    let mb = (bytes_written.as_f64() / 1048576.0 / seconds)
+    print("bench: {acked} acknowledged on {handles.len()} connections in " +
+        "{elapsed} ms — {rate} messages/second, {mb.to_fixed(1)} MB/s in")
+}
+
+/// Reads a topic from the beginning and checks that every record is the one
+/// `bench` wrote, which is what proves the log and not just the socket.
+fn verify(port: i64, topic: str, expect: i64, size: i64) / {io, net} {
+    match tcp_connect("127.0.0.1", port) {
+        Err(_e) -> print("verify: cannot connect")
+        Ok(handle) -> {
+            var buffer = bytes_of([])
+            var at = 0
+            var wrong = 0
+            var end = 0
+            while at < expect {
+                let _n = write_frame(handle, brokerwire.fetch(1, topic, at,
+                    BATCH_RECORDS, BATCH_BYTES))
+                match read_frame(handle, buffer) {
+                    Some(f) -> {
+                        if f.opcode != brokerwire.RECORDS or f.records.len() == 0 {
+                            print("verify: stopped at {at} with " +
+                                brokerwire.opcode_name(f.opcode) + " " + f.text)
+                            at = expect
+                        } else {
+                            end = f.end_offset
+                            for r in f.records {
+                                if r.payload != payload_of(size, r.offset) {
+                                    wrong = wrong + 1
+                                }
+                                at = r.offset + 1
+                            }
+                        }
+                    }
+                    None -> {
+                        print("verify: connection ended at {at}")
+                        at = expect
+                    }
+                }
+            }
+            net_close(handle)
+            print("verify: read {at} records, end offset {end}, {wrong} wrong")
+        }
+    }
+}
+
+/// Subscribes and counts what arrives, which is the push path rather than
+/// the fetch one: the server decides when to send.
+fn tail(port: i64, topic: str, from: i64, expect: i64, size: i64) / {io, net} {
+    match tcp_connect("127.0.0.1", port) {
+        Err(_e) -> print("tail: cannot connect")
+        Ok(handle) -> {
+            var buffer = bytes_of([])
+            let _n = write_frame(handle, brokerwire.subscribe(0, topic, from))
+            var seen = 0
+            var wrong = 0
+            var next = from
+            let started = monotonic_millis()
+            while seen < expect {
+                match read_frame(handle, buffer) {
+                    Some(f) -> {
+                        if f.opcode == brokerwire.RECORDS {
+                            for r in f.records {
+                                if r.offset != next {
+                                    wrong = wrong + 1
+                                }
+                                if r.payload != payload_of(size, r.offset) {
+                                    wrong = wrong + 1
+                                }
+                                next = r.offset + 1
+                                seen = seen + 1
+                            }
+                        }
+                    }
+                    None -> {
+                        print("tail: connection ended after {seen}")
+                        seen = expect
+                    }
+                }
+            }
+            let elapsed = monotonic_millis() - started
+            net_close(handle)
+            print("tail: {seen} records in {elapsed} ms, {wrong} out of order or wrong")
+        }
+    }
+}
+
+fn stats(port: i64) / {io, net} {
+    match tcp_connect("127.0.0.1", port) {
+        Err(_e) -> print("stats: cannot connect")
+        Ok(handle) -> {
+            var buffer = bytes_of([])
+            let _n = write_frame(handle, brokerwire.frame(brokerwire.STATS, 7))
+            match read_frame(handle, buffer) {
+                Some(f) -> print(f.text)
+                None -> print("stats: no answer")
+            }
+            net_close(handle)
+        }
+    }
+}
+
+// --- offline self-test ------------------------------------------------------
+//
+// The protocol and the storage, driven without a socket, so the three engines
+// agree on it and a gate can check the parts a network test cannot reach:
+// what a torn record does, what an expired offset does, what a frame split
+// across two reads does.
+
+fn say(inout failures: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        failures = failures + 1
+    }
+}
+
+fn selftest(dir: str) / {io} {
+    var f = 0
+    // Framing.
+    let one = brokerwire.encode(brokerwire.publish(9, "t", "hello".to_bytes(),
+        true))
+    let two = brokerwire.encode(brokerwire.subscribe(10, "t", 5))
+    let stream = one.concat(two)
+    say(f, "a frame decodes with its fields",
+        match brokerwire.decode(one, MAX_FRAME) ?? None {
+            Some(pair) -> pair.0.topic == "t" and pair.0.correlation == 9 and
+            pair.0.payload.to_str() == "hello" and pair.0.durable and
+            pair.1 == one.len()
+            None -> false
+    })
+    say(f, "half a frame decodes to nothing",
+        match brokerwire.decode(stream.slice(0, one.len() - 1), MAX_FRAME) ?? Some((
+            brokerwire.frame(0, 0), 0)) {
+            Some(_pair) -> false
+            None -> true
+    })
+    say(f, "two frames in one read are read one at a time",
+        match brokerwire.decode(stream, MAX_FRAME) ?? None {
+            Some(pair) -> pair.1 == one.len()
+            None -> false
+    })
+    say(f, "a length past the limit is refused",
+        match brokerwire.decode(bytes_of([255, 255, 255, 255, 1]), MAX_FRAME) {
+            Ok(_x) -> false
+            Err(_e) -> true
+    })
+    // Storage. The claims below are about a log that starts empty, so the
+    // directory is cleared first: a test that only holds the first time it is
+    // run is not a test.
+    let topic = "selftest"
+    match make_dir(dir) {
+        Ok(_x) -> {}
+        Err(_e) -> {}
+    }
+    match list_dir(dir + "/" + topic) {
+        Ok(existing) -> {
+            for name in existing {
+                match remove_file(dir + "/" + topic + "/" + name) {
+                    Ok(_x) -> {}
+                    Err(_e) -> {}
+                }
+            }
+        }
+        Err(_e) -> {}
+    }
+    match topiclog.open(dir, topic, 256) {
+        Err(_e) -> say(f, "the log opens", false)
+        Ok(opened) -> {
+            var log = opened
+            var offsets: [i64] = []
+            var i = 0
+            while i < 40 {
+                offsets.push(topiclog.append(log, payload_of(32, i), 1700 + i) ??
+                    -1)
+                i = i + 1
+            }
+            say(f, "offsets are consecutive from zero",
+                offsets[0] == 0 and offsets[39] == 39 and log.end_offset == 40)
+            say(f, "a 256-byte segment holds four 60-byte records",
+                log.segments.len() == 10)
+            say(f, "a read starts where it is asked to",
+                match topiclog.read_from(log, 37, 10, 65536) {
+                    Ok(rs) -> rs.len() == 3 and rs[0].offset == 37 and
+                    rs[2].payload == payload_of(32, 39)
+                    Err(_e) -> false
+            })
+            say(f, "a read past the end is refused",
+                match topiclog.read_from(log, 41, 10, 65536) {
+                    Ok(_rs) -> false
+                    Err(_e) -> true
+            })
+            say(f, "a budget of one byte still gives one record",
+                match topiclog.read_from(log, 0, 10, 1) {
+                    Ok(rs) -> rs.len() == 1
+                    Err(_e) -> false
+            })
+            // A torn tail: half a record appended by hand, as a kill leaves.
+            let last = log.segments[log.segments.len() - 1].path
+            let torn = topiclog.encode(40, 1700, payload_of(32, 40))
+            match append_bytes(last, torn.slice(0, torn.len() - 7)) {
+                Ok(_x) -> {}
+                Err(_e) -> {}
+            }
+            match topiclog.open(dir, topic, 256) {
+                Err(_e) -> say(f, "a torn tail is recovered", false)
+                Ok(again) -> {
+                    say(f, "a torn record is dropped and its offset reused",
+                        again.recovered_bytes == torn.len() - 7 and
+                        again.end_offset == 40)
+                    var reopened = again
+                    say(f, "and the log takes the next record",
+                        (topiclog.append(reopened, "after".to_bytes(), 1800) ??
+                            -1) == 40)
+                }
+            }
+            // Retention.
+            match topiclog.open(dir, topic, 256) {
+                Err(_e) -> say(f, "the log reopens for retention", false)
+                Ok(held) -> {
+                    var kept = held
+                    let dropped = topiclog.expire(kept, 300) ?? 0
+                    say(f, "retention drops whole segments", dropped > 0)
+                    say(f, "and an expired offset is refused",
+                        match topiclog.read_from(kept, 0, 1, 64) {
+                            Ok(_rs) -> false
+                            Err(_e) -> true
+                    })
+                }
+            }
+        }
+    }
+    if f == 0 {
+        print("broker selftest: every claim held")
+    } else {
+        print("broker selftest: {f} failed")
+    }
+}
+
+// --- arguments --------------------------------------------------------------
+
+fn flag(name: str, fallback: str) -> str / {io} {
+    let all = args()
+    var i = 0
+    while i + 1 < all.len() {
+        if all[i] == "--" + name {
+            return all[i + 1]
+        }
+        i = i + 1
+    }
+    return fallback
+}
+
+fn number_flag(name: str, fallback: i64) -> i64 / {io} {
+    return flag(name, "{fallback}").parse_int() ?? fallback
+}
+
+fn has_flag(name: str) -> bool / {io} {
+    for a in args() {
+        if a == "--" + name {
+            return true
+        }
+    }
+    return false
+}
+
+fn split_list(text: str) -> [str] {
+    if text.len() == 0 {
+        return []
+    }
+    return text.split(",")
+}
+
+fn main() / {io, net} {
+    let all = args()
+    let mode = if all.len() > 0 { all[0] } else { "selftest" }
+    if mode == "serve" {
+        let peer = flag("peer", "")
+        let colon = peer.index_of(":") ?? -1
+        let host = if colon > 0 { peer.substr(0, colon) } else { "" }
+        let peer_port = if colon > 0 {
+            peer.substr(colon + 1, peer.len()).parse_int() ?? 0 } else { 0 }
+        serve(flag("dir", "broker-data"), number_flag("port", 9099), host,
+            peer_port, split_list(flag("topics", "")), number_flag("ticks", -1))
+    } else if mode == "bench" {
+        bench(number_flag("port", 9099), number_flag("connections", 8),
+            number_flag("messages", 10000), number_flag("size", 128),
+            number_flag("depth", 64), flag("topic", "bench"),
+            has_flag("durable"))
+    } else if mode == "verify" {
+        verify(number_flag("port", 9099), flag("topic", "bench"),
+            number_flag("expect", 10000), number_flag("size", 128))
+    } else if mode == "tail" {
+        tail(number_flag("port", 9099), flag("topic", "bench"),
+            number_flag("from", 0), number_flag("expect", 10000),
+            number_flag("size", 128))
+    } else if mode == "stats" {
+        stats(number_flag("port", 9099))
+    } else if mode == "selftest" {
+        selftest(flag("dir", "broker-selftest"))
+    } else {
+        print("broker serve   --dir D --port P [--peer host:port --topics a,b] [--ticks N]")
+        print("broker bench   --port P [--connections N] [--messages M] [--size S] [--depth D] [--durable]")
+        print("broker verify  --port P --topic T --expect N [--size S]")
+        print("broker tail    --port P --topic T --expect N [--from O] [--size S]")
+        print("broker stats   --port P")
+        print("broker selftest --dir D")
+    }
+}

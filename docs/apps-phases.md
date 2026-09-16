@@ -323,7 +323,102 @@ not replace them. It narrows what they would be looking for.
 
 ---
 
-# What the three phases found, together
+# Phase 4 — infrastructure
+
+**The question.** The first three phases built programs that *use* a network.
+This one asks whether the language can be the thing on the other end of the
+socket: a server holding its own on-disk format, answering many connections at
+once, and keeping a second copy of itself in step. It is the first application
+whose correctness is about what survives being killed.
+
+## `apps/broker`
+
+A message broker. Topics, an append-only log per topic, subscribers that
+follow it as it is written, and a peer that replicates it. Two packages carry
+the parts that do not need a socket: `packages/brokerwire` is the framing,
+`packages/topiclog` is the storage, its segments and its recovery.
+
+**Shape, and why it is the only one available.** Grasm has no thread a program
+can put a socket on — `spawn` does not carry `net`, `parallel` is not
+multicore — so a broker here is one process, one loop over `net_wait`, many
+connections. That is how nginx and Redis are built and is not how Kafka is
+built, and the consequences are not hidden: one slow consumer holds the turn,
+because `tcp_write` blocks until the kernel takes the bytes and the language
+offers no writability readiness and no partial write. Batches are bounded so
+the turn stays short. A follower is a subscriber that appends what it receives
+at the offsets the leader gave it, which is one protocol rather than two.
+
+**What it found.**
+
+1. **The compiled backend refused `inout` places through two of its three call
+   paths.** Passing `s.logs[at]` to a package function that appends to it —
+   the ordinary shape of a server that keeps its state in one struct — was
+   rejected with "inout arguments that aren't plain variables" for a
+   module-qualified call and for a method receiver, though a plain call
+   accepted it and the interpreter accepted all three. Fixed in
+   `crates/grasm_native`; `spec/conformance/T-INOUT-PLACE-ARG.gr` is the
+   regression case and the broker gate covers the module form.
+
+2. **A self-test that wrote files only held the first time it was run.** The
+   second run read the first run's segments and reported seven failures. A
+   test that passes only on a clean checkout is not a test, so the self-test
+   now clears its own directory — and the gate runs it twice and compares.
+
+3. **`grasm build` without `--native` bundles the interpreter, and for a
+   server that is a sixtyfold difference.** The same broker served 448
+   messages a second bundled and 29,735 compiled. This is documented
+   behaviour, not a defect — `agreetest` exists because the bundled build is a
+   supported way to run a program — but nothing had ever measured what it
+   costs a program that runs for more than a second, and a profile of the
+   bundled binary is a profile of `eval_expr`.
+
+4. **Two per-byte loops cost more than everything else put together.**
+   `brokerwire` copied a payload into a frame one byte at a time through an
+   `[i64]`, and `topiclog` rebuilt CRC-32's 256-entry table for every record
+   it wrote. Neither is wrong in the library each came from; both are wrong at
+   forty thousand records a second. Copying blobs whole and keeping the table
+   on the log took 128-byte records from 29.7k to 44.8k a second and
+   4-kilobyte records from 13 MB/s to 45 MB/s.
+
+**What it measured.** One connection reaches the same rate as eight, so the
+ceiling is the loop's per-message work and not its connection handling.
+Throughput *rises* with pipeline depth — 23.3k a second at four in flight,
+46.4k at 128 — which is the batching working: per-tick costs amortise instead
+of compounding.
+
+| connections | 128-byte records a second |
+|---|---|
+| 1 | 38,211 |
+| 8 | 37,313 |
+| 64 | 29,524 |
+| 256 | 26,357 |
+| 512 | 20,661 |
+| 1024 | 14,423 |
+
+The falloff from 8 to 1024 was steeper before this phase — 6,943 a second at
+512 — because every tick walked every connection to build the wait set, the
+handle index and the flush list. Keeping those incrementally makes a tick cost
+what it handles rather than what is connected, and 512 connections went from
+6.9k to 20.7k a second. On one core, in one thread, with no `unsafe` anywhere
+in the program.
+
+**What the gate checks**, in `scripts/broker_test.sh`, seventeen claims: the
+three engines agree on the deterministic self-test and it repeats; a live
+server publishes, fetches and subscribes over a real socket; SIGKILL during a
+write loses only what was never acknowledged, the log reopens, every surviving
+record reads back whole, and the offsets continue rather than restart; and a
+follower catches up to the leader and its segment files match byte for byte.
+
+**What it does not show.** Nothing here is multicore, so a second core would
+need a second process and a partitioning scheme this does not have. There is
+no `fsync` policy beyond "when the publisher asked", no leader election, no
+consumer groups, and no authentication. The blocking-write hazard is real and
+bounded rather than solved: a consumer that stops reading still holds the turn
+until the kernel takes its bytes.
+
+---
+
+# What the four phases found, together
 
 | phase | application | libraries | defects |
 |---|---|---|---|
@@ -331,15 +426,18 @@ not replace them. It narrows what they would be looking for.
 | 1, scale | `logpipe` | 7 | **0** |
 | 2, composition | `apigateway` | 16 | 3 — F82, F83, F84 |
 | 3, use | `grlint` | 5 | 1 in the tool, 4 in this session's code |
+| 4, infrastructure | `broker` | 2 (its own) | 2 — a backend refusal and a self-test that held only once |
 
-**Seven defects and one clean result.** The clean one is `logpipe`, and it is
+**Nine defects and one clean result.** The clean one is `logpipe`, and it is
 recorded as plainly as the others: this axis, with these libraries, at this
 scale, produced no disagreement.
 
-The pattern across all four: **an application finds what the shape of a real
+The pattern across all five: **an application finds what the shape of a real
 program reaches, and nothing else.** `linkstore` found library misuse.
 `apigateway` found three language defects, every one needing a program with
 sixteen dependencies to exist at all. `grlint` found four places where correct
-code did not say so. None of the seven was reachable by any of the 2,177
+code did not say so. `broker` found a hole in the compiled backend that only
+a program keeping its state in one struct and handing pieces of it to a
+package would meet. None of the nine was reachable by any of the 2,177
 generated programs, and none of them is the kind a generator could be extended
 to reach — they are consequences of *size* and *combination*, not of shape.

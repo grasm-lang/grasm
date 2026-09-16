@@ -1,0 +1,448 @@
+// An append-only log of records, in segments, that survives being killed.
+//
+// This is the storage a message broker keeps per topic: producers append,
+// consumers read from an offset they choose and read again later from where
+// they stopped, and nothing is ever rewritten. The properties that matter are
+// the ones a crash tests:
+//
+// - **Every record carries its own length, offset, time and CRC-32.** A
+//   process killed in the middle of `append` leaves a record that is short or
+//   whose CRC does not match, and `open` finds it, truncates the file to the
+//   last whole record and says how many bytes it dropped. A reader never sees
+//   half a record, and the offset that torn record would have had is handed
+//   out again.
+// - **Segments roll at a size.** One file per topic would have to be rewritten
+//   to expire anything; with segments, retention is unlinking whole files, and
+//   a reader that is far behind reads an old file while producers append to
+//   the newest one.
+// - **Offsets are the log's own numbering**, not byte positions, so a
+//   consumer's stored position stays meaningful when segments are deleted
+//   under it — reading from an offset that has been expired says so rather
+//   than returning the wrong records.
+// - **`sync` is separate from `append`.** Making every append durable costs a
+//   disk write per message; a broker that acknowledges in batches syncs once
+//   per batch, and one that acknowledges immediately syncs per record. Which
+//   of those is right is the caller's decision, so both are reachable.
+//
+// The in-memory index is one position per record, which is what makes a read
+// from an arbitrary offset a seek rather than a scan. At sixteen bytes a
+// record that is 16 MB per million records: a broker holding more than that
+// wants a sparse index, and this one says so rather than pretending.
+
+import crc32
+
+type TopicLogError =
+    | TopicLogIo(path: str, why: str)
+    | TopicLogExpired(offset: i64, first: i64)
+    | TopicLogFuture(offset: i64, end: i64)
+    | TopicLogCorrupt(path: str, at: i64)
+
+/// One record as it sits in the log.
+type LogRecord = {
+    offset: i64,
+    time_ms: i64,
+    payload: bytes,
+}
+
+/// A segment on disk and where each of its records begins.
+type LogSegment = {
+    path: str,
+    base_offset: i64,
+    /// Byte position of each record, by offset from `base_offset`.
+    positions: [i64],
+    bytes: i64,
+}
+
+type TopicLog = {
+    dir: str,
+    topic: str,
+    segment_bytes: i64,
+    segments: [LogSegment],
+    /// The offset the next append will have.
+    end_offset: i64,
+    /// Bytes dropped by the last recovery, which is what a crash left behind.
+    recovered_bytes: i64,
+    /// The CRC table, built once when the log is opened.
+    //
+    // `crc32.of` builds its 256 entries per call, which is the right trade
+    // for a checksum of a file and the wrong one for a log taking tens of
+    // thousands of records a second: the table cost more than the checksum.
+    crc: [i64],
+}
+
+let HEADER = 28
+let MAGIC = 156
+let VERSION = 1
+
+fn put_u32(inout out: [i64], v: i64) {
+    out.push(v.ushr(24).bit_and(255))
+    out.push(v.ushr(16).bit_and(255))
+    out.push(v.ushr(8).bit_and(255))
+    out.push(v.bit_and(255))
+}
+
+fn put_u64(inout out: [i64], v: i64) {
+    put_u32(out, v.ushr(32).bit_and(4294967295))
+    put_u32(out, v.bit_and(4294967295))
+}
+
+fn u32_at(data: bytes, at: i64) -> i64 {
+    return data.at(at) * 16777216 + data.at(at + 1) * 65536 +
+    data.at(at + 2) * 256 + data.at(at + 3)
+}
+
+fn u64_at(data: bytes, at: i64) -> i64 {
+    return u32_at(data, at) * 4294967296 + u32_at(data, at + 4)
+}
+
+/// One record's bytes: a 28-byte header, then the payload.
+pub fn encode(offset: i64, time_ms: i64, payload: bytes) -> bytes {
+    return encode_with(crc32.table(), offset, time_ms, payload)
+}
+
+/// The same, with a CRC table the caller keeps.
+pub fn encode_with(t: [i64], offset: i64, time_ms: i64,
+    payload: bytes) -> bytes {
+    var head: [i64] = []
+    head.push(MAGIC)
+    head.push(VERSION)
+    head.push(0)
+    head.push(0)
+    put_u32(head, payload.len())
+    put_u64(head, offset)
+    put_u64(head, time_ms)
+    let header = bytes_of(head)
+    // Checksummed in two pieces rather than one, so the payload is not copied
+    // a second time only to be read once.
+    let checksum = crc32.finish(crc32.update(t,
+        crc32.update(t, crc32.start(), header), payload))
+    var tail: [i64] = []
+    put_u32(tail, checksum)
+    return header.concat(bytes_of(tail)).concat(payload)
+}
+
+/// The record beginning at `at`, if the bytes there are a whole one whose
+/// CRC matches.
+pub fn decode(data: bytes, at: i64) -> Option[LogRecord] {
+    return decode_with(crc32.table(), data, at)
+}
+
+/// The same, with a CRC table the caller keeps.
+pub fn decode_with(t: [i64], data: bytes, at: i64) -> Option[LogRecord] {
+    if at + HEADER > data.len() {
+        return None
+    }
+    if data.at(at) != MAGIC or data.at(at + 1) != VERSION {
+        return None
+    }
+    let length = u32_at(data, at + 4)
+    if length < 0 or at + HEADER + length > data.len() {
+        return None
+    }
+    let header = data.slice(at, at + 24)
+    let payload = data.slice(at + HEADER, at + HEADER + length)
+    if crc32.finish(crc32.update(t, crc32.update(t, crc32.start(), header),
+        payload)) != u32_at(data, at + 24) {
+        return None
+    }
+    return Some(LogRecord{ offset: u64_at(data, at + 8),
+        time_ms: u64_at(data, at + 16), payload: payload })
+}
+
+fn segment_name(base: i64) -> str {
+    return "{base}".pad_start(20, "0") + ".log"
+}
+
+fn segment_path(dir: str, topic: str, base: i64) -> str {
+    return dir + "/" + topic + "/" + segment_name(base)
+}
+
+/// Scans a segment, returning where each record starts and where the whole
+/// records end — which is not the file's length when a crash tore the last
+/// one.
+fn scan(t: [i64], path: str) -> ([i64], i64) ! TopicLogError / {io} {
+    let data = match read_bytes(path) {
+        Ok(d) -> d
+        Err(_e) -> fail(TopicLogIo(path, "cannot read"))
+    }
+    var positions: [i64] = []
+    var at = 0
+    while at < data.len() {
+        match decode_with(t, data, at) {
+            Some(r) -> {
+                positions.push(at)
+                at = at + HEADER + r.payload.len()
+            }
+            None -> break
+        }
+    }
+    return (positions, at)
+}
+
+fn digits_of(name: str) -> Option[i64] {
+    if not name.ends_with(".log") {
+        return None
+    }
+    return name.substr(0, name.len() - 4).parse_int()
+}
+
+/// Opens a topic's log, recovering the tail of the last segment if a crash
+/// left one behind.
+pub fn open(dir: str, topic: str, segment_bytes: i64) -> TopicLog ! TopicLogError / {io} {
+    let topic_dir = dir + "/" + topic
+    match make_dir(topic_dir) {
+        Ok(_x) -> {}
+        Err(_e) -> fail(TopicLogIo(topic_dir, "cannot create"))
+    }
+    var bases: [i64] = []
+    match list_dir(topic_dir) {
+        Ok(names) -> {
+            for name in names {
+                match digits_of(name) {
+                    Some(base) -> bases.push(base)
+                    None -> {}
+                }
+            }
+        }
+        Err(_e) -> fail(TopicLogIo(topic_dir, "cannot list"))
+    }
+    bases.sort()
+    let table = crc32.table()
+    var segments: [LogSegment] = []
+    var end_offset = 0
+    var recovered = 0
+    var i = 0
+    while i < bases.len() {
+        let path = segment_path(dir, topic, bases[i])
+        let found = try scan(table, path)
+        let size = file_size(path) ?? found.1
+        if found.1 != size {
+            // A torn tail: keep what is whole and drop the rest.
+            let whole = match read_bytes_at(path, 0, found.1) {
+                Ok(d) -> d
+                Err(_e) -> fail(TopicLogIo(path, "cannot read"))
+            }
+            match write_bytes(path, whole) {
+                Ok(_x) -> {}
+                Err(_e) -> fail(TopicLogIo(path, "cannot truncate"))
+            }
+            recovered = recovered + (size - found.1)
+        }
+        segments.push(LogSegment{ path: path, base_offset: bases[i],
+            positions: found.0, bytes: found.1 })
+        end_offset = bases[i] + found.0.len()
+        i = i + 1
+    }
+    if segments.len() == 0 {
+        let path = segment_path(dir, topic, 0)
+        match write_bytes(path, bytes_of([])) {
+            Ok(_x) -> {}
+            Err(_e) -> fail(TopicLogIo(path, "cannot create"))
+        }
+        segments.push(LogSegment{ path: path, base_offset: 0, positions: [],
+            bytes: 0 })
+    }
+    return TopicLog{ dir: dir, topic: topic, segment_bytes: segment_bytes,
+        segments: segments, end_offset: end_offset, recovered_bytes: recovered,
+        crc: table }
+}
+
+/// Appends one record, rolling to a new segment when the current one is
+/// full, and answers the offset it was given.
+pub fn append(inout log: TopicLog, payload: bytes, now_ms: i64) -> i64 ! TopicLogError / {io} {
+    let offset = log.end_offset
+    let record = encode_with(log.crc, offset, now_ms, payload)
+    var last = log.segments.len() - 1
+    if log.segments[last].bytes > 0 and
+    log.segments[last].bytes + record.len() > log.segment_bytes {
+        let path = segment_path(log.dir, log.topic, offset)
+        match write_bytes(path, bytes_of([])) {
+            Ok(_x) -> {}
+            Err(_e) -> fail(TopicLogIo(path, "cannot create"))
+        }
+        log.segments.push(LogSegment{ path: path, base_offset: offset,
+            positions: [], bytes: 0 })
+        last = last + 1
+    }
+    match append_bytes(log.segments[last].path, record) {
+        Ok(_x) -> {}
+        Err(_e) -> fail(TopicLogIo(log.segments[last].path, "cannot append"))
+    }
+    log.segments[last].positions.push(log.segments[last].bytes)
+    log.segments[last].bytes = log.segments[last].bytes + record.len()
+    log.end_offset = offset + 1
+    return offset
+}
+
+/// Appends many records with one write per segment, which is what a server
+/// that takes a tick's worth of publishes at a time wants: the syscall and
+/// the `sync` are per batch rather than per record, and the offsets are
+/// consecutive from the first one returned.
+pub fn append_batch(inout log: TopicLog, payloads: [bytes],
+    now_ms: i64) -> (i64, i64) ! TopicLogError / {io} {
+    let first = log.end_offset
+    if payloads.len() == 0 {
+        return (first, 0)
+    }
+    var blob = bytes_of([])
+    var starts: [i64] = []
+    var last = log.segments.len() - 1
+    var at = log.segments[last].bytes
+    var i = 0
+    while i < payloads.len() {
+        let record = encode_with(log.crc, log.end_offset + i, now_ms,
+            payloads[i])
+        if at > 0 and at + record.len() > log.segment_bytes {
+            // The segment is full: write what is held, then roll.
+            try flush(log, last, blob, starts)
+            blob = bytes_of([])
+            starts = []
+            let base = log.end_offset + i
+            let path = segment_path(log.dir, log.topic, base)
+            match write_bytes(path, bytes_of([])) {
+                Ok(_x) -> {}
+                Err(_e) -> fail(TopicLogIo(path, "cannot create"))
+            }
+            log.segments.push(LogSegment{ path: path, base_offset: base,
+                positions: [], bytes: 0 })
+            last = last + 1
+            at = 0
+        }
+        starts.push(at)
+        blob = blob.concat(record)
+        at = at + record.len()
+        i = i + 1
+    }
+    try flush(log, last, blob, starts)
+    log.end_offset = first + payloads.len()
+    return (first, payloads.len())
+}
+
+fn flush(inout log: TopicLog, segment: i64, blob: bytes,
+    starts: [i64]) -> () ! TopicLogError / {io} {
+    if blob.len() == 0 {
+        return ()
+    }
+    match append_bytes(log.segments[segment].path, blob) {
+        Ok(_x) -> {}
+        Err(_e) -> fail(TopicLogIo(log.segments[segment].path, "cannot append"))
+    }
+    for start in starts {
+        log.segments[segment].positions.push(start)
+    }
+    log.segments[segment].bytes = log.segments[segment].bytes + blob.len()
+}
+
+/// Appends a record that already carries an offset, which is what a
+/// follower does with what it fetched: the offsets have to stay the leader's.
+pub fn append_replicated(inout log: TopicLog, record: LogRecord) -> () ! TopicLogError / {io} {
+    if record.offset != log.end_offset {
+        fail(TopicLogFuture(record.offset, log.end_offset))
+    }
+    let _offset = try append(log, record.payload, record.time_ms)
+}
+
+/// The offset of the oldest record still held.
+pub fn first_offset(log: TopicLog) -> i64 {
+    return log.segments[0].base_offset
+}
+
+fn segment_for(log: TopicLog, offset: i64) -> i64 {
+    var i = log.segments.len() - 1
+    while i > 0 and log.segments[i].base_offset > offset {
+        i = i - 1
+    }
+    return i
+}
+
+/// Records from `offset` on, up to `max_records` of them and `max_bytes` of
+/// payload — whichever comes first, and always at least one record so a
+/// reader cannot be stuck behind a record larger than its budget.
+pub fn read_from(log: TopicLog, offset: i64, max_records: i64,
+    max_bytes: i64) -> [LogRecord] ! TopicLogError / {io} {
+    if offset < first_offset(log) {
+        fail(TopicLogExpired(offset, first_offset(log)))
+    }
+    if offset > log.end_offset {
+        fail(TopicLogFuture(offset, log.end_offset))
+    }
+    var out: [LogRecord] = []
+    var taken = 0
+    var at = offset
+    var index = segment_for(log, offset)
+    while at < log.end_offset and out.len() < max_records {
+        let segment = log.segments[index]
+        let within = at - segment.base_offset
+        if within >= segment.positions.len() {
+            index = index + 1
+            if index >= log.segments.len() {
+                break
+            }
+            continue
+        }
+        let start = segment.positions[within]
+        let stop = if within + 1 < segment.positions.len() {
+            segment.positions[within + 1] } else { segment.bytes }
+        let data = match read_bytes_at(segment.path, start, stop - start) {
+            Ok(d) -> d
+            Err(_e) -> fail(TopicLogIo(segment.path, "cannot read"))
+        }
+        match decode_with(log.crc, data, 0) {
+            Some(r) -> {
+                out.push(r)
+                taken = taken + r.payload.len()
+            }
+            None -> fail(TopicLogCorrupt(segment.path, start))
+        }
+        at = at + 1
+        if taken >= max_bytes {
+            break
+        }
+    }
+    return out
+}
+
+/// Everything written so far on the disk, which is what an acknowledgement
+/// promising durability has to wait for.
+pub fn sync(log: TopicLog) -> () ! TopicLogError / {io} {
+    let path = log.segments[log.segments.len() - 1].path
+    match sync_file(path) {
+        Ok(_x) -> {}
+        Err(_e) -> fail(TopicLogIo(path, "cannot sync"))
+    }
+}
+
+/// Drops whole segments until only `keep_bytes` are left, which is retention:
+/// the oldest offsets stop being readable and their files go away.
+pub fn expire(inout log: TopicLog, keep_bytes: i64) -> i64 ! TopicLogError / {io} {
+    var total = 0
+    for s in log.segments {
+        total = total + s.bytes
+    }
+    var dropped = 0
+    while log.segments.len() > 1 and total > keep_bytes {
+        let first = log.segments[0]
+        match remove_file(first.path) {
+            Ok(_x) -> {}
+            Err(_e) -> fail(TopicLogIo(first.path, "cannot remove"))
+        }
+        total = total - first.bytes
+        dropped = dropped + first.bytes
+        log.segments = log.segments.slice(1, log.segments.len())
+    }
+    return dropped
+}
+
+/// How many bytes the log holds.
+pub fn size_bytes(log: TopicLog) -> i64 {
+    var total = 0
+    for s in log.segments {
+        total = total + s.bytes
+    }
+    return total
+}
+
+/// How many records it holds.
+pub fn count(log: TopicLog) -> i64 {
+    return log.end_offset - first_offset(log)
+}

@@ -9,6 +9,19 @@ migration note here; anything `experimental` may change in any release. See
 
 ### Added
 
+- **A message broker, and what it took to make one.** `apps/broker` serves
+  topics over a length-framed binary protocol, keeps an append-only log per
+  topic in segments with a CRC per record, delivers to subscribers as records
+  are written, and replicates to a follower — which is a subscriber that
+  appends at the leader's offsets, so there is one protocol rather than two.
+  `brokerwire` is the framing and `topiclog` the storage, both usable without
+  a socket. It is one process and one `net_wait` loop, because `spawn` does
+  not carry `net` and `parallel` is not multicore; `docs/apps-phases.md`
+  records the numbers and the ceiling. `brokertest` is a gate: three engines
+  agree on the self-test, a live server publishes and subscribes over a real
+  socket, SIGKILL during a write loses only what was never acknowledged and
+  the offsets continue, and a follower's segments match the leader's byte for
+  byte.
 - **Four formats the Unix toolbox writes.** `posixcksum` is `cksum`'s POSIX
   CRC and the two historic `sum` algorithms. `opensslenc` reads and writes
   `openssl enc` files — `Salted__` headers, PBKDF2 or the legacy
@@ -242,6 +255,14 @@ migration note here; anything `experimental` may change in any release. See
   are gates.
 
 ### Fixed
+
+- **The compiled backend refused an `inout` argument that was not a plain
+  variable**, through a module-qualified call and through a method receiver —
+  "inout arguments that aren't plain variables" — though a plain call accepted
+  one and the interpreter accepted all three. So a program keeping its state
+  in one struct could not hand a piece of it to a package function that
+  appends to it. `spec/conformance/T-INOUT-PLACE-ARG.gr` is the regression
+  case.
 
 - **`mailmap` did not map the way git does.** An entry that only fixes a
   name replaced the commit's address with the entry's spelling of it, so

@@ -1,0 +1,6 @@
+[package]
+name = "brokerwire"
+version = "1.0.0"
+
+# Bytes in, frames out. Opens nothing.
+capabilities = []

@@ -1,0 +1,371 @@
+// The frames a broker and its clients exchange.
+//
+// A stream is not a sequence of messages: a read returns whatever has
+// arrived, which is half a frame, or three frames and a bit. Every protocol
+// over TCP has to say where a message ends, and getting that wrong is how a
+// server ends up reading a length from the middle of a payload. So every
+// frame here begins with its own length, `decode` takes whatever has arrived
+// and answers with a frame *and how many bytes it used* — or nothing, meaning
+// the rest has not arrived yet — and a caller keeps the remainder for next
+// time.
+//
+//     u32 length   the bytes after this field
+//     u8  opcode
+//     u32 correlation   echoed in the reply, so a client may have several in
+//                       flight on one connection
+//     …payload, per opcode
+//
+// The opcodes are the smallest set a broker needs: publish a record, fetch a
+// range of them, subscribe so they arrive as they are written, ask for
+// statistics, and a ping to keep a connection warm. Replication is not a
+// separate protocol — a follower is a subscriber that writes what it receives
+// to its own log, which is one fewer thing to get wrong.
+//
+// Lengths are checked against what has arrived before anything is read, and a
+// frame larger than `max_frame` is refused rather than buffered, because a
+// length field is the one number an attacker sets for free.
+
+type WireError =
+    | WireTooLarge(length: i64)
+    | WireMalformed(at: i64)
+
+/// One record on the wire: the offset the log gave it, when it was written,
+/// and the bytes.
+type WireRecord = {
+    offset: i64,
+    time_ms: i64,
+    payload: bytes,
+}
+
+/// A decoded frame. Which fields carry meaning depends on `opcode`.
+type Frame = {
+    opcode: i64,
+    correlation: i64,
+    topic: str,
+    offset: i64,
+    end_offset: i64,
+    limit: i64,
+    max_bytes: i64,
+    durable: bool,
+    payload: bytes,
+    records: [WireRecord],
+    text: str,
+    code: i64,
+}
+
+pub let PUBLISH = 1
+pub let FETCH = 2
+pub let SUBSCRIBE = 3
+pub let PING = 4
+pub let STATS = 5
+pub let UNSUBSCRIBE = 6
+pub let ACK = 128
+pub let RECORDS = 129
+pub let PONG = 130
+pub let STATS_OK = 131
+pub let ERROR = 255
+
+/// An empty frame of an opcode, to be filled in.
+pub fn frame(opcode: i64, correlation: i64) -> Frame {
+    return Frame{ opcode: opcode, correlation: correlation, topic: "",
+        offset: 0, end_offset: 0, limit: 0, max_bytes: 0, durable: false,
+        payload: bytes_of([]), records: [], text: "", code: 0 }
+}
+
+fn put_u16(inout out: [i64], v: i64) {
+    out.push(v.ushr(8).bit_and(255))
+    out.push(v.bit_and(255))
+}
+
+fn put_u32(inout out: [i64], v: i64) {
+    out.push(v.ushr(24).bit_and(255))
+    out.push(v.ushr(16).bit_and(255))
+    out.push(v.ushr(8).bit_and(255))
+    out.push(v.bit_and(255))
+}
+
+fn put_u64(inout out: [i64], v: i64) {
+    put_u32(out, v.ushr(32).bit_and(4294967295))
+    put_u32(out, v.bit_and(4294967295))
+}
+
+fn put_text(inout out: [i64], text: str) {
+    let raw = text.to_bytes()
+    put_u16(out, raw.len())
+    var i = 0
+    while i < raw.len() {
+        out.push(raw.at(i))
+        i = i + 1
+    }
+}
+
+/// A frame under construction: the fields written so far, and the payloads
+/// already closed off behind them.
+//
+// Copying a payload a byte at a time costs more than the rest of a frame put
+// together — at four kilobytes a record it was the whole cost of publishing,
+// and a client saturated a core before the server was half busy. So a blob is
+// kept whole and joined at the end, and only the small scalar fields go
+// through a list.
+type Parts = {
+    done: bytes,
+    now: [i64],
+}
+
+fn seal(inout p: Parts) {
+    if p.now.len() > 0 {
+        p.done = p.done.concat(bytes_of(p.now))
+        p.now = []
+    }
+}
+
+fn put_blob_part(inout p: Parts, data: bytes) {
+    put_u32(p.now, data.len())
+    seal(p)
+    p.done = p.done.concat(data)
+}
+
+/// A frame's bytes, length prefix and all.
+pub fn encode(f: Frame) -> bytes {
+    var parts = Parts{ done: bytes_of([]), now: [] }
+    var body = parts.now
+    body.push(f.opcode)
+    put_u32(body, f.correlation)
+    if f.opcode == PUBLISH {
+        put_text(body, f.topic)
+        parts.now = body
+        put_blob_part(parts, f.payload)
+        body = parts.now
+        body.push(if f.durable { 1 } else { 0 })
+    } else if f.opcode == FETCH {
+        put_text(body, f.topic)
+        put_u64(body, f.offset)
+        put_u32(body, f.limit)
+        put_u32(body, f.max_bytes)
+    } else if f.opcode == SUBSCRIBE or f.opcode == UNSUBSCRIBE {
+        put_text(body, f.topic)
+        put_u64(body, f.offset)
+    } else if f.opcode == ACK {
+        put_u64(body, f.offset)
+        put_u64(body, f.end_offset)
+    } else if f.opcode == RECORDS {
+        put_text(body, f.topic)
+        put_u32(body, f.records.len())
+        for r in f.records {
+            put_u64(body, r.offset)
+            put_u64(body, r.time_ms)
+            parts.now = body
+            put_blob_part(parts, r.payload)
+            body = parts.now
+        }
+        put_u64(body, f.end_offset)
+    } else if f.opcode == STATS or f.opcode == STATS_OK {
+        put_text(body, f.topic)
+        parts.now = body
+        put_blob_part(parts, f.text.to_bytes())
+        body = parts.now
+    } else if f.opcode == ERROR {
+        put_u16(body, f.code)
+        put_text(body, f.text)
+    }
+    parts.now = body
+    seal(parts)
+    var head: [i64] = []
+    put_u32(head, parts.done.len())
+    return bytes_of(head).concat(parts.done)
+}
+
+type Cursor = {
+    data: bytes,
+    at: i64,
+    end: i64,
+}
+
+fn need(c: Cursor, n: i64) -> () ! WireError {
+    if c.at + n > c.end {
+        fail(WireMalformed(c.at))
+    }
+}
+
+fn u16_at(inout c: Cursor) -> i64 ! WireError {
+    try need(c, 2)
+    let v = c.data.at(c.at) * 256 + c.data.at(c.at + 1)
+    c.at = c.at + 2
+    return v
+}
+
+fn u32_at(inout c: Cursor) -> i64 ! WireError {
+    try need(c, 4)
+    let v = c.data.at(c.at) * 16777216 + c.data.at(c.at + 1) * 65536 +
+    c.data.at(c.at + 2) * 256 + c.data.at(c.at + 3)
+    c.at = c.at + 4
+    return v
+}
+
+fn u64_at(inout c: Cursor) -> i64 ! WireError {
+    let high = try u32_at(c)
+    let low = try u32_at(c)
+    return high * 4294967296 + low
+}
+
+fn text_at(inout c: Cursor) -> str ! WireError {
+    let n = try u16_at(c)
+    try need(c, n)
+    let out = c.data.slice(c.at, c.at + n).to_str()
+    c.at = c.at + n
+    return out
+}
+
+fn blob_at(inout c: Cursor) -> bytes ! WireError {
+    let n = try u32_at(c)
+    if n < 0 {
+        fail(WireMalformed(c.at))
+    }
+    try need(c, n)
+    let out = c.data.slice(c.at, c.at + n)
+    c.at = c.at + n
+    return out
+}
+
+/// The first whole frame in `data` and how many bytes it used, or `None`
+/// when the rest of it has not arrived.
+pub fn decode(data: bytes, max_frame: i64) -> Option[(Frame, i64)] ! WireError {
+    return try decode_at(data, 0, max_frame)
+}
+
+/// The same, starting at `from` — so a server holding a read buffer moves a
+/// cursor instead of re-slicing what is left after every frame, which is a
+/// copy of the whole buffer per message.
+pub fn decode_at(data: bytes, from: i64, max_frame: i64) -> Option[(Frame, i64)] ! WireError {
+    if data.len() - from < 4 {
+        return None
+    }
+    var head = Cursor{ data: data, at: from, end: data.len() }
+    let length = try u32_at(head)
+    if length < 5 or length > max_frame {
+        fail(WireTooLarge(length))
+    }
+    if data.len() - from < 4 + length {
+        return None
+    }
+    var c = Cursor{ data: data, at: from + 4, end: from + 4 + length }
+    let opcode = c.data.at(c.at)
+    c.at = c.at + 1
+    var f = frame(opcode, try u32_at(c))
+    if opcode == PUBLISH {
+        f.topic = try text_at(c)
+        f.payload = try blob_at(c)
+        try need(c, 1)
+        f.durable = c.data.at(c.at) == 1
+        c.at = c.at + 1
+    } else if opcode == FETCH {
+        f.topic = try text_at(c)
+        f.offset = try u64_at(c)
+        f.limit = try u32_at(c)
+        f.max_bytes = try u32_at(c)
+    } else if opcode == SUBSCRIBE or opcode == UNSUBSCRIBE {
+        f.topic = try text_at(c)
+        f.offset = try u64_at(c)
+    } else if opcode == ACK {
+        f.offset = try u64_at(c)
+        f.end_offset = try u64_at(c)
+    } else if opcode == RECORDS {
+        f.topic = try text_at(c)
+        let count = try u32_at(c)
+        var i = 0
+        while i < count {
+            let offset = try u64_at(c)
+            let time_ms = try u64_at(c)
+            f.records.push(WireRecord{ offset: offset, time_ms: time_ms,
+                payload: try blob_at(c) })
+            i = i + 1
+        }
+        f.end_offset = try u64_at(c)
+    } else if opcode == STATS or opcode == STATS_OK {
+        f.topic = try text_at(c)
+        f.text = (try blob_at(c)).to_str()
+    } else if opcode == ERROR {
+        f.code = try u16_at(c)
+        f.text = try text_at(c)
+    } else if opcode != PING and opcode != PONG {
+        fail(WireMalformed(4))
+    }
+    return Some((f, from + 4 + length))
+}
+
+/// A publish frame.
+pub fn publish(correlation: i64, topic: str, payload: bytes,
+    durable: bool) -> Frame {
+    var f = frame(PUBLISH, correlation)
+    f.topic = topic
+    f.payload = payload
+    f.durable = durable
+    return f
+}
+
+/// A fetch frame.
+pub fn fetch(correlation: i64, topic: str, offset: i64, limit: i64,
+    max_bytes: i64) -> Frame {
+    var f = frame(FETCH, correlation)
+    f.topic = topic
+    f.offset = offset
+    f.limit = limit
+    f.max_bytes = max_bytes
+    return f
+}
+
+/// A subscribe frame.
+pub fn subscribe(correlation: i64, topic: str, offset: i64) -> Frame {
+    var f = frame(SUBSCRIBE, correlation)
+    f.topic = topic
+    f.offset = offset
+    return f
+}
+
+/// An acknowledgement of a publish.
+pub fn ack(correlation: i64, offset: i64, end_offset: i64) -> Frame {
+    var f = frame(ACK, correlation)
+    f.offset = offset
+    f.end_offset = end_offset
+    return f
+}
+
+/// A batch of records.
+pub fn records(correlation: i64, topic: str, rs: [WireRecord],
+    end_offset: i64) -> Frame {
+    var f = frame(RECORDS, correlation)
+    f.topic = topic
+    f.records = rs
+    f.end_offset = end_offset
+    return f
+}
+
+/// A refusal, with the code a client can branch on and the text a person
+/// reads.
+pub fn error(correlation: i64, code: i64, text: str) -> Frame {
+    var f = frame(ERROR, correlation)
+    f.code = code
+    f.text = text
+    return f
+}
+
+pub let ERROR_UNKNOWN_TOPIC = 1
+pub let ERROR_EXPIRED = 2
+pub let ERROR_FUTURE = 3
+pub let ERROR_STORAGE = 4
+pub let ERROR_PROTOCOL = 5
+pub let ERROR_TOO_LARGE = 6
+
+/// What a frame is, for a log line.
+pub fn opcode_name(opcode: i64) -> str {
+    let names = [(PUBLISH, "publish"), (FETCH, "fetch"),
+        (SUBSCRIBE, "subscribe"), (PING, "ping"), (STATS, "stats"),
+        (UNSUBSCRIBE, "unsubscribe"), (ACK, "ack"), (RECORDS, "records"),
+        (PONG, "pong"), (STATS_OK, "stats-ok"), (ERROR, "error")]
+    for pair in names {
+        if pair.0 == opcode {
+            return pair.1
+        }
+    }
+    return "opcode {opcode}"
+}
