@@ -16,8 +16,21 @@
 //
 //   - Everything before the first `diff ` line is a commit message and is
 //     ignored entirely.
-//   - `index abc..def` lines are skipped: the blob hashes depend on the
-//     file's history, not on the change.
+//   - `index abc..def` lines are skipped for a text diff: the blob hashes
+//     depend on the file's history, not on the change.
+//   - **A binary diff is the exception**, and it is the one place the rule
+//     inverts. There are no hunks to hash, so the identity has to come from
+//     somewhere: git hashes the `diff --git` line and then the two blob
+//     hashes off the `index` line — not the `Binary files … differ` line,
+//     which contributes nothing, and not the file mode. So two binary
+//     changes are "the same change" only when the before and after blobs are
+//     the same, which is as close to an answer as exists without the content.
+//   - And the `diff --git` line of whatever file comes *after* a binary one
+//     is not hashed at all: git has already consumed it as the thing that
+//     ended the binary section. It is a quirk of the parser rather than a
+//     decision, and a reimplementation that does the obvious thing disagrees
+//     with git on every commit that touches a binary file and nothing else —
+//     which is how this was found, by a `.wasm` landing in the corpus.
 //   - A hunk header is recognised and its line numbers are *not* hashed.
 //     The counts are used to know where the hunk ends and nothing else.
 //   - Every other line is hashed with all its whitespace removed. That is
@@ -103,6 +116,20 @@ fn hunk_counts(line: str) -> (i64, i64) {
     return (before, after)
 }
 
+/// The two blob hashes on an `index` line, joined — `index abc..def 100644`
+/// gives `abcdef`. Anything else on the line, including the mode, is not
+/// part of what git hashes.
+fn index_blobs(line: str) -> str {
+    let rest = line.substr(6, line.len() - 6)
+    let end = rest.index_of(" ") ?? rest.len()
+    let pair = rest.substr(0, end)
+    let dots = pair.index_of("..") ?? 0 - 1
+    if dots < 0 {
+        return pair
+    }
+    return pair.substr(0, dots) + pair.substr(dots + 2, pair.len() - dots - 2)
+}
+
 /// The text `git patch-id` actually hashes, which is worth being able to
 /// look at when two patches that should match do not.
 pub fn canonical(diff: str) -> str {
@@ -110,6 +137,12 @@ pub fn canonical(diff: str) -> str {
     var before = 0 - 1
     var after = 0 - 1
     var started = false
+    // The blob hashes of the `index` line, kept in case this file turns out
+    // to be binary and they become the only thing there is to hash.
+    var blobs = ""
+    // Set when a binary section has just closed: the next `diff --git` line
+    // is what closed it, and git does not hash it.
+    var swallow = false
     for line in diff.split("\n") {
         if not started {
             // Everything before the first `diff ` is a commit message.
@@ -120,7 +153,21 @@ pub fn canonical(diff: str) -> str {
         }
         if before == 0 - 1 {
             if line.starts_with("index ") {
-                // Blob hashes are about the file's history, not the change.
+                // Blob hashes are about the file's history, not the change —
+                // unless there is no change to hash, which is what a binary
+                // diff is.
+                blobs = index_blobs(line)
+                continue
+            }
+            if line.starts_with("Binary files ") or
+            line.starts_with("GIT binary patch") {
+                out = out + blobs
+                blobs = ""
+                swallow = true
+                continue
+            }
+            if swallow and line.starts_with("diff ") {
+                swallow = false
                 continue
             }
             if line.starts_with("--- ") {

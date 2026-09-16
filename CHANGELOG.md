@@ -292,6 +292,15 @@ migration note here; anything `experimental` may change in any release. See
 
 ### Fixed
 
+- **`patchid` disagreed with `git patch-id` about binary files.** A binary
+  diff has no hunks, so git hashes the `diff --git` line and the two blob
+  hashes off the `index` line — not the `Binary files … differ` line, which
+  contributes nothing — and then does not hash the `diff --git` line of
+  whatever file comes next, having already consumed it. Both were wrong here,
+  which made the id wrong for every commit touching a binary file. Found when
+  a rebuilt `.wasm` entered the gate's corpus, which is this repository's own
+  history.
+
 - **`jsnumber` lost the sign of negative zero.** `Number("-0")` and
   `parseFloat("-0")` applied the sign by subtracting from zero, and IEEE-754
   says `0.0 - 0.0` is *positive* zero — so `-0` parsed to `0`, and with it
