@@ -1,0 +1,480 @@
+// `printf`'s format string, which four decades of programs are written in.
+//
+// C's, and after it Perl's, Ruby's, PHP's and every shell's `printf`. The
+// grammar is small and almost every reimplementation of it is wrong in the
+// same three places:
+//
+//   - **`%.0f` of 0.5 is "0" and of 1.5 is "2".** The rounding is
+//     round-half-to-even, done on the *binary* value, so it is neither "round
+//     half up" nor a decimal operation. Anything that implements it as
+//     "add 0.5 and truncate" disagrees with C on exactly half the ties.
+//   - **A flag is not a modifier of the width.** `%-05d` is left-aligned and
+//     the zero does nothing; `%05.2f` pads with zeroes *after* the sign;
+//     `%+.0f` of -0.0 is "-0". Getting this right is a table, not a guess.
+//   - **`%g` removes trailing zeroes and `%#g` does not**, and the choice of
+//     exponent form depends on the exponent *after* rounding to the
+//     precision, so `%.1g` of 0.0000999 is "0.0001" and not "1e-04".
+//
+// Argument types are the caller's problem in C and a refusal here: a value is
+// handed in as an integer, a float or a string, and `%d` of a string is an
+// error rather than whatever the stack happened to hold.
+//
+// Positional arguments (`%2$s`) and `*` widths are supported because every
+// translation file in the world uses the first and every dynamic column
+// width uses the second.
+import formatspec
+import shortestfloat
+
+type CFormatError =
+    | UnknownConversion(letter: str)
+    | MissingArgument(index: i64)
+    | WrongKind(index: i64, wanted: str)
+    | BadFormat(at: i64, why: str)
+
+/// One argument. C reads whatever the type says; this says it first.
+type Arg =
+    | Int(value: i64)
+    | Float(value: f64)
+    | Text(value: str)
+
+type Spec = {
+    minus: bool,
+    plus: bool,
+    space: bool,
+    zero: bool,
+    hash: bool,
+    width: i64,
+    has_width: bool,
+    precision: i64,
+    has_precision: bool,
+    letter: str,
+    /// `%2$s` — which argument, one-based, or 0 for "the next one".
+    position: i64,
+}
+
+fn blank_spec() -> Spec {
+    return Spec{ minus: false, plus: false, space: false, zero: false,
+        hash: false, width: 0, has_width: false, precision: 0,
+        has_precision: false, letter: "", position: 0 }
+}
+
+fn is_digit(c: str) -> bool {
+    return c >= "0" and c <= "9"
+}
+
+fn digits_at(chars: [str], from: i64) -> (i64, i64) {
+    var value = 0
+    var i = from
+    while i < chars.len() and is_digit(chars[i]) {
+        value = value * 10 + (chars[i].parse_int() ?? 0)
+        i = i + 1
+    }
+    return (value, i)
+}
+
+/// Everything between the `%` and the conversion letter.
+fn parse_spec(chars: [str], from: i64) -> (Spec, i64) ! CFormatError {
+    var spec = blank_spec()
+    var i = from
+    // `%2$s`: a number followed by `$` is a position, not a width. It has to
+    // be read before the flags, and put back if the `$` is not there.
+    let maybe = digits_at(chars, i)
+    if maybe.1 > i and maybe.1 < chars.len() and chars[maybe.1] == "$" {
+        spec.position = maybe.0
+        i = maybe.1 + 1
+    }
+    var reading = true
+    while reading and i < chars.len() {
+        let c = chars[i]
+        if c == "-" {
+            spec.minus = true
+        } else if c == "+" {
+            spec.plus = true
+        } else if c == " " {
+            spec.space = true
+        } else if c == "0" {
+            spec.zero = true
+        } else if c == "#" {
+            spec.hash = true
+        } else {
+            reading = false
+        }
+        if reading {
+            i = i + 1
+        }
+    }
+    if i < chars.len() and chars[i] == "*" {
+        spec.has_width = true
+        spec.width = -1
+        i = i + 1
+    } else {
+        let found = digits_at(chars, i)
+        if found.1 > i {
+            spec.has_width = true
+            spec.width = found.0
+            i = found.1
+        }
+    }
+    if i < chars.len() and chars[i] == "." {
+        i = i + 1
+        spec.has_precision = true
+        if i < chars.len() and chars[i] == "*" {
+            spec.precision = -1
+            i = i + 1
+        } else {
+            let found = digits_at(chars, i)
+            spec.precision = found.0
+            i = found.1
+        }
+    }
+    // Length modifiers say what C should read off the stack, and mean nothing
+    // when the argument carries its own type.
+    while i < chars.len() and (chars[i] == "h" or chars[i] == "l" or
+        chars[i] == "L" or chars[i] == "q" or chars[i] == "j" or
+        chars[i] == "z" or chars[i] == "t") {
+        i = i + 1
+    }
+    if i >= chars.len() {
+        fail(BadFormat(from, "the format ends in the middle of a conversion"))
+    }
+    spec.letter = chars[i]
+    return (spec, i + 1)
+}
+
+fn as_int(a: Arg, index: i64) -> i64 ! CFormatError {
+    match a {
+        Int(v) -> return v
+        Float(x) -> return x.as_i64()
+        Text(_t) -> fail(WrongKind(index, "a number"))
+    }
+}
+
+fn as_float(a: Arg, index: i64) -> f64 ! CFormatError {
+    match a {
+        Int(v) -> return v.as_f64()
+        Float(x) -> return x
+        Text(_t) -> fail(WrongKind(index, "a number"))
+    }
+}
+
+fn as_text(a: Arg) -> str {
+    match a {
+        Int(v) -> return "{v}"
+        Float(x) -> return shortestfloat.repr(x)
+        Text(t) -> return t
+    }
+}
+
+fn digits_in_base(value: i64, base: i64, upper: bool) -> str {
+    if value == 0 {
+        return "0"
+    }
+    let alphabet = if upper { "0123456789ABCDEF" } else { "0123456789abcdef" }
+    var n = value
+    var out = ""
+    while n > 0 {
+        out = alphabet.substr(n % base, 1) + out
+        n = n / base
+    }
+    return out
+}
+
+/// An unsigned value's digits, for the conversions that have no sign.
+//
+// A negative integer in `%x` is its two's complement, the same 64 bits C
+// would have read — which is why -1 is `ffffffffffffffff` and not `-1`.
+fn unsigned_digits(value: i64, base: i64, upper: bool) -> str {
+    if value >= 0 {
+        return digits_in_base(value, base, upper)
+    }
+    // Split the shift so the top bit does not overflow a signed divide.
+    let low = value.bit_and(4294967295)
+    let high = value.ushr(32).bit_and(4294967295)
+    if high == 0 {
+        return digits_in_base(low, base, upper)
+    }
+    var out = ""
+    var carry = high
+    var rest = low
+    // Long division by the base over the two halves, most significant first.
+    var top = carry
+    var bottom = rest
+    while top > 0 or bottom > 0 {
+        let acc = top % base
+        let next_top = top / base
+        let joined = acc * 4294967296 + bottom
+        let next_bottom = joined / base
+        let digit = joined % base
+        out = (if upper { "0123456789ABCDEF" } else {
+            "0123456789abcdef" }).substr(digit, 1) + out
+        top = next_top
+        bottom = next_bottom
+    }
+    return out
+}
+
+fn pad(body: str, prefix: str, spec: Spec) -> str {
+    return pad_kind(body, prefix, spec, false)
+}
+
+/// The same, told whether this is an integer conversion.
+//
+// A precision turns off zero padding for `%d` and its relatives — the
+// precision already says how many digits there are — and does not for `%f`,
+// where it says how many come after the point. One flag, two rules, and
+// using the integer rule for floats makes `%012.3f` eight spaces wide.
+fn pad_kind(body: str, prefix: str, spec: Spec, integral: bool) -> str {
+    let whole = prefix + body
+    // A width is a count of *bytes*, as it is in C: `%10s` of a two-byte
+    // character pads to eight spaces, not nine. Counting characters instead
+    // makes every column line up in a terminal and none of them line up with
+    // what every other `printf` on the machine produced.
+    let used = whole.to_bytes().len()
+    if not spec.has_width or spec.width <= used {
+        return whole
+    }
+    let gap = spec.width - used
+    if spec.minus {
+        return whole + "".pad_end(gap, " ")
+    }
+    // Zero padding goes after the sign and after `0x`, which is the only
+    // reason the prefix is carried separately.
+    if spec.zero and not (integral and spec.has_precision) {
+        return prefix + "".pad_end(gap, "0") + body
+    }
+    return "".pad_end(gap, " ") + whole
+}
+
+/// The first `limit` bytes of a string, cut at a character boundary.
+//
+// A precision counts bytes in C, and a half-written character is what C
+// produces when the cut lands inside one. A `str` here cannot hold that, so
+// the cut moves back to the last whole character that fits — the only
+// deliberate difference between this package and `printf`, and it only shows
+// on text outside ASCII.
+fn cut_bytes(text: str, limit: i64) -> str {
+    if text.to_bytes().len() <= limit {
+        return text
+    }
+    var out = ""
+    var used = 0
+    for c in text.chars() {
+        let width = c.to_bytes().len()
+        if used + width > limit {
+            return out
+        }
+        out = out + c
+        used = used + width
+    }
+    return out
+}
+
+fn sign_of(negative: bool, spec: Spec) -> str {
+    if negative {
+        return "-"
+    }
+    if spec.plus {
+        return "+"
+    }
+    if spec.space {
+        return " "
+    }
+    return ""
+}
+
+fn integer_text(value: i64, spec: Spec) -> str {
+    let l = spec.letter
+    if l == "u" {
+        // Unsigned: the same 64 bits, read without a sign, which is what C
+        // does with a negative value in `%u`.
+        var body = unsigned_digits(value, 10, false)
+        if spec.has_precision and spec.precision > body.len() {
+            body = "".pad_end(spec.precision - body.len(), "0") + body
+        }
+        return pad_kind(body, "", spec, true)
+    }
+    if l == "d" or l == "i" {
+        let negative = value < 0
+        // The magnitude, taken without negating: the most negative i64 has no
+        // positive counterpart, and negating it is the one case that wraps.
+        var body = if negative { unsigned_digits(0 - value, 10, false) } else {
+            digits_in_base(value, 10, false) }
+        if negative and value == 0 - 9223372036854775807 - 1 {
+            body = "9223372036854775808"
+        }
+        if spec.has_precision and spec.precision > body.len() {
+            body = "".pad_end(spec.precision - body.len(), "0") + body
+        }
+        return pad_kind(body, sign_of(negative, spec), spec, true)
+    }
+    let hexy = l == "x" or l == "X"
+    let base = if l == "o" { 8 } else if l == "b" or l == "B" { 2 } else {
+        if hexy { 16 } else { 10 } }
+    var body = unsigned_digits(value, base, l == "X")
+    if spec.has_precision and spec.precision > body.len() {
+        body = "".pad_end(spec.precision - body.len(), "0") + body
+    }
+    var prefix = ""
+    if spec.hash and value != 0 {
+        if l == "x" {
+            prefix = "0x"
+        } else if l == "X" {
+            prefix = "0X"
+        } else if l == "b" {
+            prefix = "0b"
+        } else if l == "B" {
+            prefix = "0B"
+        } else if l == "o" and not body.starts_with("0") {
+            body = "0" + body
+        }
+    }
+    return pad_kind(body, prefix, spec, true)
+}
+
+fn special_text(x: f64, upper: bool) -> str {
+    if x != x {
+        return if upper { "NAN" } else { "NaN" }
+    }
+    return if upper { "INF" } else { "Inf" }
+}
+
+fn is_special(x: f64) -> bool {
+    return x != x or x * 0.5 == x and x != 0.0
+}
+
+fn float_text(x: f64, spec: Spec) -> str ! CFormatError {
+    let l = spec.letter
+    let upper = l == "E" or l == "F" or l == "G"
+    let negative = shortestfloat.parts(x).negative
+    if is_special(x) {
+        // A special value has no digits to pad with zeroes, so the zero flag
+        // is ignored — as it is in C.
+        var flat = spec
+        flat.zero = false
+        return pad(special_text(x, upper), sign_of(negative, spec), flat)
+    }
+    let precision = if spec.has_precision { spec.precision } else { 6 }
+    let kind = l.to_lower()
+    // Python's format specification and C's conversions are the same
+    // operation for `e`, `f` and `g`: the same rounding of the same binary
+    // value to the same number of places.
+    var want = "." + "{precision}" + kind
+    if kind == "g" and spec.hash {
+        want = "#" + want
+    }
+    let magnitude = if negative { x * (0.0 - 1.0) } else { x }
+    var body = match formatspec.format_float(magnitude, want) {
+        Ok(v) -> v
+        Err(_e) -> fail(BadFormat(0, "cannot format this number"))
+    }
+    if upper {
+        body = body.to_upper()
+    }
+    if spec.hash and (kind == "f" or kind == "e") and precision == 0 {
+        // `%#.0f` keeps the point that would otherwise be dropped.
+        let cut = body.index_of("e") ?? -1
+        if cut < 0 {
+            body = body + "."
+        } else {
+            body = body.substr(0, cut) + "." + body.substr(cut,
+                body.len() - cut)
+        }
+    }
+    return pad(body, sign_of(negative, spec), spec)
+}
+
+/// A format string and its arguments, as C would join them.
+pub fn format(template: str, args: [Arg]) -> str ! CFormatError {
+    let chars = template.chars()
+    var out = ""
+    var next = 0
+    var i = 0
+    while i < chars.len() {
+        if chars[i] != "%" {
+            out = out + chars[i]
+            i = i + 1
+            continue
+        }
+        if i + 1 < chars.len() and chars[i + 1] == "%" {
+            out = out + "%"
+            i = i + 2
+            continue
+        }
+        let parsed = try parse_spec(chars, i + 1)
+        var spec = parsed.0
+        i = parsed.1
+        // A `*` takes its value from the arguments, before the value it
+        // describes — and a negative width means left alignment, which is how
+        // `printf("%*d", -6, x)` works.
+        if spec.has_width and spec.width == -1 {
+            if next >= args.len() {
+                fail(MissingArgument(next))
+            }
+            let w = try as_int(args[next], next)
+            next = next + 1
+            if w < 0 {
+                spec.minus = true
+                spec.width = 0 - w
+            } else {
+                spec.width = w
+            }
+        }
+        if spec.has_precision and spec.precision == -1 {
+            if next >= args.len() {
+                fail(MissingArgument(next))
+            }
+            spec.precision = try as_int(args[next], next)
+            next = next + 1
+            if spec.precision < 0 {
+                spec.has_precision = false
+            }
+        }
+        if spec.letter == "%" {
+            out = out + "%"
+            continue
+        }
+        let at = if spec.position > 0 { spec.position - 1 } else { next }
+        if at >= args.len() or at < 0 {
+            fail(MissingArgument(at))
+        }
+        if spec.position == 0 {
+            next = next + 1
+        }
+        let arg = args[at]
+        let l = spec.letter
+        if l == "d" or l == "i" or l == "u" or l == "x" or l == "X" or
+        l == "o" or l == "b" or l == "B" {
+            out = out + integer_text(try as_int(arg, at), spec)
+        } else if l == "f" or l == "F" or l == "e" or l == "E" or l == "g" or
+        l == "G" {
+            out = out + (try float_text(try as_float(arg, at), spec))
+        } else if l == "c" {
+            // C writes one byte; this writes the character, because a `str`
+            // here is UTF-8 and a lone byte above 127 is not one. For a code
+            // point under 128 the two are the same, and above it this is the
+            // one place this package says something C does not.
+            let code = try as_int(arg, at)
+            out = out + pad(code.to_char(), "", spec)
+        } else if l == "s" {
+            var body = as_text(arg)
+            if spec.has_precision {
+                body = cut_bytes(body, spec.precision)
+            }
+            out = out + pad(body, "", spec)
+        } else {
+            fail(UnknownConversion(l))
+        }
+    }
+    return out
+}
+
+/// What went wrong, for a person.
+pub fn message_of(e: CFormatError) -> str {
+    match e {
+        UnknownConversion(l) -> return "`%" + l + "` is not a conversion"
+        MissingArgument(n) -> return "the format wants an argument " +
+        "that was not given (number {n + 1})"
+        WrongKind(n, wanted) -> return "argument {n + 1} has to be " + wanted
+        BadFormat(at, why) -> return "at character {at}: " + why
+    }
+}

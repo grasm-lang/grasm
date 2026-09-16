@@ -1,0 +1,6 @@
+[package]
+name = "shlex"
+version = "1.0.0"
+
+# Splits and quotes a command line. Runs nothing.
+capabilities = []

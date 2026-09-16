@@ -9,6 +9,18 @@ migration note here; anything `experimental` may change in any release. See
 
 ### Added
 
+- **Five formats a program speaks to sit between other programs.** `shlex`
+  splits a command line the way a shell does and quotes so a filename with a
+  space in it survives being one. `querystring` is Node's: a key with no `=`,
+  a repeated key, a `+` that is a space in a query and a plus everywhere else,
+  and a broken escape left alone. `cformat` is `printf` — round-half-to-even
+  on the binary value, flags that are a table rather than a guess, positional
+  arguments and `*` widths. `configparser` is Python's INI, which lower-cases
+  keys, takes `:` as a separator, joins an indented line with a newline and
+  interpolates. `pytokenize` splits Python source the way `tokenize` does,
+  indentation stack and f-strings included. Checked against Python, Node and
+  Perl, with every Python file in `scripts/` tokenized token for token;
+  `lang2diff` is a gate. **That is 650 packages.**
 - **How five other languages write things down.** `jsnumber` is JavaScript's
   number-to-string and back — shortest round-trip, `toFixed`, `toExponential`,
   `toPrecision`, `Number` and `parseFloat`, which disagree with each other on

@@ -1,0 +1,14 @@
+[package]
+name = "cformat"
+version = "1.0.0"
+
+# Formats values the way C's printf does. Writes nothing anywhere.
+capabilities = []
+
+[dependencies.formatspec]
+path = "../formatspec"
+version = "^1.0.0"
+
+[dependencies.shortestfloat]
+path = "../shortestfloat"
+version = "^1.0.0"

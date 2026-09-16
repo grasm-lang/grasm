@@ -1,0 +1,679 @@
+// Python source, split into the tokens `tokenize` produces.
+//
+// A tokenizer for a language with significant indentation is not a scanner
+// with a bigger table: three of its rules are about *state* rather than about
+// characters, and each one is where a hand-written Python lexer goes wrong.
+//
+//   - **Indentation is a stack, and a dedent has to match a level that is on
+//     it.** Four spaces in, then two out, is not a dedent to two — it is an
+//     error, because there was never a level at two. The stack is also what
+//     makes a single physical line emit several `DEDENT`s at once.
+//   - **Inside brackets, a newline is nothing at all.** No `NEWLINE` token, no
+//     `INDENT`, no continuation backslash needed. The depth counter is the
+//     whole difference between a line break that ends a statement and one that
+//     is whitespace.
+//   - **A blank or comment-only line has no indentation.** It emits `NL`, not
+//     `NEWLINE`, and never changes the stack — which is why a comment written
+//     at the wrong indent is legal and a statement at the same indent is not.
+//
+// Numbers and strings carry their own traps: `1_000` and `0x_ff` are legal and
+// `1__0` is not, `1.e5` is a float, `0777` is an error where `0o777` is fine,
+// a string prefix may be any case and any order (`Rb''`), and a triple-quoted
+// string runs across lines while an unterminated single-quoted one does not.
+//
+// The token names and the positions are `tokenize`'s: one-based lines,
+// zero-based columns, and the half-open `(line, column)` pairs it reports.
+
+type TokenizeError =
+    | UnterminatedString(line: i64, column: i64)
+    | BadDedent(line: i64, column: i64)
+    | BadCharacter(line: i64, column: i64, what: str)
+
+/// One token, named as `token.tok_name` names it.
+type SourceToken = {
+    kind: str,
+    text: str,
+    start_line: i64,
+    start_column: i64,
+    end_line: i64,
+    end_column: i64,
+}
+
+type PyCursor = {
+    lines: [str],
+    /// Zero-based index of the line being read.
+    at: i64,
+    /// Zero-based column within it.
+    column: i64,
+    indents: [i64],
+    depth: i64,
+    /// Whether the last line ended inside a continuation.
+    continued: bool,
+    out: [SourceToken],
+}
+
+fn is_digit(c: str) -> bool {
+    return c >= "0" and c <= "9"
+}
+
+fn is_name_start(c: str) -> bool {
+    return (c >= "a" and c <= "z") or (c >= "A" and c <= "Z") or c == "_" or
+    c.to_bytes().len() > 1
+}
+
+fn is_name_part(c: str) -> bool {
+    return is_name_start(c) or is_digit(c)
+}
+
+fn is_quote(c: str) -> bool {
+    return c == "\"" or c == "'"
+}
+
+/// The operators, longest first, so `**=` is never read as `**` then `=`.
+fn operators() -> [str] {
+    return ["**=", "//=", ">>=", "<<=", "...", "!=", ">=", "<=", "==", "->",
+        ":=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "@=", "~=",
+        "**", "//", "<<", ">>", "+", "-", "*", "/", "%", "@", "&", "|", "^",
+        "~", "<", ">", "(", ")", "[", "]", "\{", "\}", ",", ":", ".", ";",
+        "="]
+}
+
+fn push(inout c: PyCursor, kind: str, text: str, from_line: i64, from_col: i64,
+    to_line: i64, to_col: i64) {
+    c.out.push(SourceToken{ kind: kind, text: text, start_line: from_line,
+        start_column: from_col, end_line: to_line, end_column: to_col })
+}
+
+/// A string prefix: any case, any order, at most one of each group.
+fn prefix_length(line: str, from: i64) -> i64 {
+    let chars = line.chars()
+    var i = from
+    var seen = ""
+    while i < chars.len() and i - from < 3 {
+        let c = chars[i].to_lower()
+        if c != "r" and c != "b" and c != "u" and c != "f" {
+            break
+        }
+        if seen.contains(c) {
+            break
+        }
+        seen = seen + c
+        i = i + 1
+    }
+    if i < chars.len() and is_quote(chars[i]) {
+        return i - from
+    }
+    return 0
+}
+
+/// The end of a string that begins at `from` on the current line, following
+/// it across lines when it is triple-quoted.
+fn read_string(inout c: PyCursor, from: i64) -> (str, i64, i64) ! TokenizeError {
+    let line = c.lines[c.at]
+    let chars = line.chars()
+    let skip = prefix_length(line, from)
+    var i = from + skip
+    let quote = chars[i]
+    var triple = false
+    if i + 2 < chars.len() and chars[i + 1] == quote and chars[i + 2] == quote {
+        triple = true
+    }
+    var text = ""
+    var k = from
+    while k < i {
+        text = text + chars[k]
+        k = k + 1
+    }
+    let fence = if triple { 3 } else { 1 }
+    var f = 0
+    while f < fence {
+        text = text + quote
+        f = f + 1
+    }
+    i = i + fence
+    var here = c.at
+    var body = c.lines[here].chars()
+    while true {
+        if i >= body.len() {
+            if not triple {
+                fail(UnterminatedString(c.at + 1, from))
+            }
+            text = text + "\n"
+            here = here + 1
+            if here >= c.lines.len() {
+                fail(UnterminatedString(c.at + 1, from))
+            }
+            body = c.lines[here].chars()
+            i = 0
+            continue
+        }
+        // A backslash protects the next character even in a raw string: `r"\""`
+        // holds a backslash and a quote and does not end there. Both
+        // characters are kept either way — the token's text is the source
+        // text — so raw and cooked differ in meaning and not in scanning.
+        if body[i] == "\\" and i + 1 < body.len() {
+            text = text + body[i] + body[i + 1]
+            i = i + 2
+            continue
+        }
+        if body[i] == "\\" and i + 1 >= body.len() {
+            // A backslash at the end of a line continues the string, raw or
+            // not: the line break is what it escapes.
+            text = text + "\\" + "\n"
+            here = here + 1
+            if here >= c.lines.len() {
+                fail(UnterminatedString(c.at + 1, from))
+            }
+            body = c.lines[here].chars()
+            i = 0
+            continue
+        }
+        if body[i] == quote {
+            if not triple {
+                text = text + quote
+                return (text, here, i + 1)
+            }
+            if i + 2 < body.len() and body[i + 1] == quote and
+            body[i + 2] == quote {
+                text = text + quote + quote + quote
+                return (text, here, i + 3)
+            }
+        }
+        text = text + body[i]
+        i = i + 1
+    }
+    return (text, here, i)
+}
+
+/// The end of a number beginning at `from`.
+//
+// Underscores are allowed between digits and nowhere else, `.` may start or
+// end one, and an exponent's sign belongs to the number rather than to the
+// arithmetic after it.
+fn read_number(line: str, from: i64) -> i64 {
+    let chars = line.chars()
+    var i = from
+    var seen_point = false
+    var seen_exp = false
+    if chars[i] == "0" and i + 1 < chars.len() {
+        let marker = chars[i + 1].to_lower()
+        if marker == "x" or marker == "o" or marker == "b" {
+            i = i + 2
+            while i < chars.len() and (is_digit(chars[i]) or chars[i] == "_" or
+                (marker == "x" and ((chars[i].to_lower() >= "a" and
+                    chars[i].to_lower() <= "f")))) {
+                i = i + 1
+            }
+            if i < chars.len() and (chars[i] == "l" or chars[i] == "L") {
+                i = i + 1
+            }
+            return i
+        }
+    }
+    while i < chars.len() {
+        let c = chars[i]
+        if is_digit(c) or c == "_" {
+            i = i + 1
+        } else if c == "." and not seen_point and not seen_exp {
+            seen_point = true
+            i = i + 1
+        } else if (c == "e" or c == "E") and not seen_exp and i + 1 <
+        chars.len() and (is_digit(chars[i + 1]) or ((chars[i + 1] == "+" or
+            chars[i + 1] == "-") and i + 2 < chars.len() and
+            is_digit(chars[i + 2]))) {
+            seen_exp = true
+            i = i + 1
+            if chars[i] == "+" or chars[i] == "-" {
+                i = i + 1
+            }
+        } else if c == "j" or c == "J" {
+            i = i + 1
+            return i
+        } else {
+            break
+        }
+    }
+    return i
+}
+
+fn blank_or_comment(line: str) -> bool {
+    let t = line.trim()
+    return t.len() == 0 or t.starts_with("#")
+}
+
+fn leading_width(line: str) -> (i64, i64) {
+    let chars = line.chars()
+    var i = 0
+    var width = 0
+    while i < chars.len() {
+        if chars[i] == " " {
+            width = width + 1
+        } else if chars[i] == "\t" {
+            // A tab advances to the next multiple of eight, which is what
+            // `tokenize` assumes and what makes mixed indentation ambiguous.
+            width = width + 8 - width % 8
+        } else if chars[i] == "\u{c}" {
+            width = 0
+        } else {
+            break
+        }
+        i = i + 1
+    }
+    return (width, i)
+}
+
+/// Whether a string beginning here is an f-string, which is tokenized as a
+/// start, the pieces between the braces, and an end — rather than as one
+/// `STRING`. Python did the second until 3.12 and does the first now.
+fn is_fstring(line: str, from: i64) -> bool {
+    let skip = prefix_length(line, from)
+    if skip == 0 {
+        return false
+    }
+    return line.substr(from, skip).to_lower().contains("f")
+}
+
+/// One name, number, string or operator at `i`, for the expression inside an
+/// f-string's braces. Answers the column after it.
+fn emit_one(inout c: PyCursor, line: str, i: i64) -> i64 ! TokenizeError {
+    let chars = line.chars()
+    let ch = chars[i]
+    if is_quote(ch) or (is_name_start(ch) and prefix_length(line, i) > 0) {
+        let found = try read_string(c, i)
+        push(c, "STRING", found.0, c.at + 1, i, found.1 + 1, found.2)
+        return found.2
+    }
+    if is_name_start(ch) {
+        var k = i
+        while k < chars.len() and is_name_part(chars[k]) {
+            k = k + 1
+        }
+        push(c, "NAME", line.substr(i, k - i), c.at + 1, i, c.at + 1, k)
+        return k
+    }
+    if is_digit(ch) or (ch == "." and i + 1 < chars.len() and
+        is_digit(chars[i + 1])) {
+        let k = read_number(line, i)
+        push(c, "NUMBER", line.substr(i, k - i), c.at + 1, i, c.at + 1, k)
+        return k
+    }
+    var matched = ""
+    for op in operators() {
+        if matched == "" and i + op.len() <= chars.len() and
+        line.substr(i, op.len()) == op {
+            matched = op
+        }
+    }
+    if matched == "" {
+        fail(BadCharacter(c.at + 1, i, ch))
+    }
+    push(c, "OP", matched, c.at + 1, i, c.at + 1, i + matched.len())
+    return i + matched.len()
+}
+
+fn flush_middle(inout c: PyCursor, text: str, from_line: i64, from_col: i64,
+    to_line: i64, to_col: i64) {
+    if text.len() > 0 {
+        push(c, "FSTRING_MIDDLE", text, from_line + 1, from_col, to_line + 1,
+            to_col)
+    }
+}
+
+/// One `{...}` inside an f-string: the expression, an optional `!r`, an
+/// optional `:spec`, and the closing brace. Answers the column after it.
+fn read_replacement(inout c: PyCursor, line: str, from: i64) -> i64 ! TokenizeError {
+    let chars = line.chars()
+    var i = from
+    push(c, "OP", "\{", c.at + 1, i, c.at + 1, i + 1)
+    i = i + 1
+    var depth = 0
+    while i < chars.len() {
+        let e = chars[i]
+        if e == " " or e == "\t" {
+            i = i + 1
+            continue
+        }
+        if depth == 0 and (e == "\}" or e == ":" or (e == "!" and
+            i + 1 < chars.len() and chars[i + 1] != "=")) {
+            break
+        }
+        if e == "(" or e == "[" or e == "\{" {
+            depth = depth + 1
+        } else if e == ")" or e == "]" or e == "\}" {
+            depth = depth - 1
+        }
+        i = try emit_one(c, line, i)
+    }
+    if i < chars.len() and chars[i] == "!" {
+        push(c, "OP", "!", c.at + 1, i, c.at + 1, i + 1)
+        i = i + 1
+        if i < chars.len() {
+            push(c, "NAME", chars[i], c.at + 1, i, c.at + 1, i + 1)
+            i = i + 1
+        }
+    }
+    if i < chars.len() and chars[i] == ":" {
+        push(c, "OP", ":", c.at + 1, i, c.at + 1, i + 1)
+        i = i + 1
+        // A spec is literal text, except that it may hold
+        // replacements of its own — `{x:{width}}` is how a width is
+        // computed — and those are expressions again.
+        var spec = ""
+        var spec_from = i
+        while i < chars.len() and chars[i] != "\}" {
+            if chars[i] == "\{" {
+                flush_middle(c, spec, c.at, spec_from, c.at, i)
+                spec = ""
+                push(c, "OP", "\{", c.at + 1, i, c.at + 1, i + 1)
+                i = i + 1
+                while i < chars.len() and chars[i] != "\}" {
+                    if chars[i] == " " {
+                        i = i + 1
+                        continue
+                    }
+                    i = try emit_one(c, line, i)
+                }
+                if i < chars.len() {
+                    push(c, "OP", "\}", c.at + 1, i, c.at + 1, i + 1)
+                    i = i + 1
+                }
+                spec_from = i
+                continue
+            }
+            spec = spec + chars[i]
+            i = i + 1
+        }
+        flush_middle(c, spec, c.at, spec_from, c.at, i)
+        if spec.len() == 0 and spec_from == i {
+            // An empty run still marks where the spec ended, which is
+            // what the real tokenizer reports after a nested field.
+            push(c, "FSTRING_MIDDLE", "", c.at + 1, i, c.at + 1, i)
+        }
+    }
+    if i < chars.len() and chars[i] == "\}" {
+        push(c, "OP", "\}", c.at + 1, i, c.at + 1, i + 1)
+        i = i + 1
+    }
+    return i
+}
+
+/// An f-string, as `FSTRING_START`, the literal runs and the expressions
+/// between them, and `FSTRING_END`.
+//
+// Two details that are only visible against the real tokenizer: a doubled
+// `{{` becomes one character *and ends the run it is in*, while a doubled
+// `}}` becomes one character and does not; and a format spec after `:` is a
+// literal run rather than an expression, so `:>10` is one `FSTRING_MIDDLE`
+// and not three operators.
+fn read_fstring(inout c: PyCursor, from: i64) -> i64 ! TokenizeError {
+    let first = c.lines[c.at]
+    let skip = prefix_length(first, from)
+    var i = from + skip
+    let opening = first.chars()
+    let quote = opening[i]
+    let triple = i + 2 < opening.len() and opening[i + 1] == quote and
+    opening[i + 2] == quote
+    let fence = if triple { 3 } else { 1 }
+    push(c, "FSTRING_START", first.substr(from, skip + fence), c.at + 1, from,
+        c.at + 1, from + skip + fence)
+    i = i + fence
+    var text = ""
+    var run_line = c.at
+    var run_from = i
+    while true {
+        var line = c.lines[c.at]
+        var chars = line.chars()
+        if i >= chars.len() {
+            // Only a triple-quoted f-string may reach the end of a line, and
+            // the run it was in carries on across the break: a literal of
+            // `c\nd` is one `FSTRING_MIDDLE` that starts on one line and ends
+            // on the next.
+            if not triple {
+                fail(UnterminatedString(c.at + 1, from))
+            }
+            text = text + "\n"
+            c.at = c.at + 1
+            if c.at >= c.lines.len() {
+                fail(UnterminatedString(c.at, from))
+            }
+            i = 0
+            continue
+        }
+        let ch = chars[i]
+        let closing = ch == quote and (not triple or (i + 2 < chars.len() and
+            chars[i + 1] == quote and chars[i + 2] == quote))
+        if closing {
+            flush_middle(c, text, run_line, run_from, c.at, i)
+            push(c, "FSTRING_END", line.substr(i, fence), c.at + 1, i,
+                c.at + 1, i + fence)
+            return i + fence
+        }
+        // A doubled brace is one character, and it *ends the run it is in*:
+        // the span stops at the first of the pair and the next run begins
+        // after the second. Both braces behave the same way, which is only
+        // visible against the real tokenizer — `f"a}}}}b"` is three runs.
+        if (ch == "\{" or ch == "\}") and i + 1 < chars.len() and
+        chars[i + 1] == ch {
+            flush_middle(c, text + ch, run_line, run_from, c.at, i + 1)
+            text = ""
+            i = i + 2
+            run_line = c.at
+            run_from = i
+            continue
+        }
+        if ch == "\{" {
+            flush_middle(c, text, run_line, run_from, c.at, i)
+            text = ""
+            i = try read_replacement(c, line, i)
+            run_line = c.at
+            run_from = i
+            continue
+        }
+        if ch == "\\" and i + 1 < chars.len() {
+            text = text + ch + chars[i + 1]
+            i = i + 2
+            continue
+        }
+        text = text + ch
+        i = i + 1
+    }
+    fail(UnterminatedString(c.at + 1, from))
+}
+
+/// A blank or comment-only line: `NL`, never `NEWLINE`, and no change to the
+/// indentation stack. That is what makes a comment at any indent legal.
+fn empty_line(inout c: PyCursor, line: str) {
+    let found = leading_width(line)
+    if line.trim().starts_with("#") {
+        push(c, "COMMENT", line.substr(found.1, line.len() - found.1),
+            c.at + 1, found.1, c.at + 1, line.len())
+        push(c, "NL", "\n", c.at + 1, line.len(), c.at + 1, line.len() + 1)
+    } else {
+        push(c, "NL", "\n", c.at + 1, found.1, c.at + 1, found.1 + 1)
+    }
+}
+
+/// The indentation at the start of a statement: one `INDENT`, or as many
+/// `DEDENT`s as levels the line closes, and the column the statement starts
+/// at.
+//
+// A dedent has to land on a level that is on the stack: four in and then two
+// out is not a dedent to two, it is an error, because there was never a level
+// at two.
+fn open_line(inout c: PyCursor, line: str) -> i64 ! TokenizeError {
+    let found = leading_width(line)
+    let width = found.0
+    let i = found.1
+    if width > c.indents[c.indents.len() - 1] {
+        c.indents.push(width)
+        push(c, "INDENT", line.substr(0, i), c.at + 1, 0, c.at + 1, i)
+        return i
+    }
+    while c.indents.len() > 1 and width < c.indents[c.indents.len() - 1] {
+        let _gone = c.indents.pop()
+        push(c, "DEDENT", "", c.at + 1, i, c.at + 1, i)
+    }
+    if width != c.indents[c.indents.len() - 1] {
+        fail(BadDedent(c.at + 1, i))
+    }
+    return i
+}
+
+/// The tokens of one physical line, from column `from`.
+///
+/// Answers where a string left the scan when it ran across lines — the line
+/// to carry on at is in the cursor — or -1 when the line ended normally.
+fn scan_line(inout c: PyCursor, line: str, from: i64, inout joined: bool,
+    inout wrote: bool) -> i64 ! TokenizeError {
+    let chars = line.chars()
+    var i = from
+    while i < chars.len() {
+        let ch = chars[i]
+        if ch == " " or ch == "\t" or ch == "\u{c}" {
+            i = i + 1
+            continue
+        }
+        if ch == "#" {
+            push(c, "COMMENT", line.substr(i, line.len() - i), c.at + 1,
+                i, c.at + 1, line.len())
+            i = chars.len()
+            break
+        }
+        if ch == "\\" and i + 1 >= chars.len() {
+            // An explicit continuation: the next line is this one.
+            joined = true
+            i = i + 1
+            break
+        }
+        if is_fstring(line, i) {
+            let was = c.at
+            i = try read_fstring(c, i)
+            wrote = true
+            if c.at != was {
+                // A triple-quoted f-string ran across lines; the rest of this
+                // logical line is on the line it ended on.
+                return i
+            }
+            continue
+        }
+        if is_quote(ch) or (is_name_start(ch) and
+            prefix_length(line, i) > 0) {
+            let from_col = i
+            let from_line = c.at
+            let found = try read_string(c, i)
+            push(c, "STRING", found.0, from_line + 1, from_col,
+                found.1 + 1, found.2)
+            wrote = true
+            if found.1 != c.at {
+                // The string ran across lines: the rest of this logical
+                // line is on the line it ended on.
+                c.at = found.1
+                return found.2
+            }
+            i = found.2
+            continue
+        }
+        i = try emit_one(c, line, i)
+        wrote = true
+        // Brackets are what decide whether the next line break ends a
+        // statement, so the depth is read back off the token just made.
+        let last = c.out[c.out.len() - 1]
+        if last.kind == "OP" {
+            if last.text == "(" or last.text == "[" or last.text == "\{" {
+                c.depth = c.depth + 1
+            } else if last.text == ")" or last.text == "]" or
+            last.text == "\}" {
+                c.depth = if c.depth > 0 { c.depth - 1 } else { 0 }
+            }
+        }
+    }
+    return -1
+}
+
+/// The token that ends a physical line.
+//
+// `NEWLINE` ends a statement and `NL` does not, and which one this is depends
+// on state rather than on the line: inside brackets, or after a backslash, a
+// line break is whitespace.
+fn close_line(inout c: PyCursor, line: str, wrote: bool, joined: bool) {
+    if joined {
+        return ()
+    }
+    let kind = if c.depth > 0 or not wrote { "NL" } else { "NEWLINE" }
+    push(c, kind, "\n", c.at + 1, line.len(), c.at + 1, line.len() + 1)
+}
+
+/// Every token in a source file, `ENDMARKER` included.
+pub fn tokenize(source: str) -> [SourceToken] ! TokenizeError {
+    var lines = source.split("\n")
+    // A trailing newline leaves an empty last element, which is not a line.
+    if lines.len() > 0 and lines[lines.len() - 1] == "" {
+        lines = lines.slice(0, lines.len() - 1)
+    }
+    var c = PyCursor{ lines: lines, at: 0, column: 0, indents: [0], depth: 0,
+        continued: false, out: [] }
+    var joined = false
+    // Where to carry on when a string ran across lines: the scan has to
+    // resume in the *middle* of the line the string ended on, with no
+    // indentation handling, because that line's first characters were inside
+    // the string rather than at the start of a statement.
+    var resume = -1
+    var wrote = false
+    while c.at < c.lines.len() {
+        let line = c.lines[c.at]
+        var i = 0
+        if resume >= 0 {
+            i = resume
+            resume = -1
+        } else if c.depth == 0 and not joined {
+            if blank_or_comment(line) {
+                empty_line(c, line)
+                c.at = c.at + 1
+                continue
+            }
+            i = try open_line(c, line)
+        }
+        joined = false
+        let stopped = try scan_line(c, line, i, joined, wrote)
+        if stopped >= 0 {
+            resume = stopped
+            continue
+        }
+        close_line(c, line, wrote, joined)
+        wrote = false
+        c.at = c.at + 1
+    }
+    let last = c.lines.len() + 1
+    while c.indents.len() > 1 {
+        let _gone = c.indents.pop()
+        push(c, "DEDENT", "", last, 0, last, 0)
+    }
+    push(c, "ENDMARKER", "", last, 0, last, 0)
+    return c.out
+}
+
+/// The tokens as `python -m tokenize` prints them, one per line.
+pub fn describe(tokens: [SourceToken]) -> str {
+    var out: [str] = []
+    for t in tokens {
+        out.push("{t.start_line},{t.start_column}-{t.end_line}," +
+            "{t.end_column}:\t" + t.kind + "\t" + t.text)
+    }
+    return out.join("\n")
+}
+
+/// What went wrong, for a person.
+pub fn message_of(e: TokenizeError) -> str {
+    match e {
+        UnterminatedString(line, column) -> {
+            return "line {line}, column {column}: the string never ends"
+        }
+        BadDedent(line, _column) -> {
+            return "line {line}: this indentation matches no outer block"
+        }
+        BadCharacter(line, column, what) -> {
+            return "line {line}, column {column}: `" + what +
+            "` is not Python"
+        }
+    }
+}

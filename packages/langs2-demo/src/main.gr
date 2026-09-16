@@ -1,0 +1,250 @@
+// Five formats a program has to speak to sit between other programs.
+//
+// A command line, a query string, a `printf` template, an INI file and Python
+// source. Each is checked against the implementation everyone else uses —
+// Python, Node and Perl — by `scripts/lang2_diff.sh`; what is below is the
+// handful of cases where the obvious answer is the wrong one.
+import cformat
+import configparser
+import pytokenize
+import querystring
+import shlex
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+// --------------------------------------------------------------------- shlex
+
+fn check_shlex(inout f: i64) / {io} {
+    print("-- shlex: a command line, split the way a shell splits it")
+    // Quotes glue rather than delimit, so this is one word and not two.
+    say(f, "'a b'c is one word", (shlex.split("'a b'c", false) ?? []) ==
+        ["a bc"])
+    // And an empty quoted word survives as an argument.
+    say(f, "'' is an empty argument, not no argument",
+        (shlex.split("x '' y", false) ?? []) == ["x", "", "y"])
+    // A backslash inside double quotes escapes only two characters; before
+    // anything else it stays.
+    say(f, "\"a\\nb\" keeps the backslash",
+        (shlex.split("\"a\\nb\"", false) ?? []) == ["a\\nb"])
+    say(f, "and \"a\\\"b\" takes the quote",
+        (shlex.split("\"a\\\"b\"", false) ?? []) == ["a\"b"])
+    // A vertical tab is not whitespace here, whatever `isspace` says.
+    say(f, "a vertical tab does not split a word",
+        (shlex.split("a\u{b}b", false) ?? []) == ["a\u{b}b"])
+    // With comments on, `#` ends the word it is in.
+    say(f, "a#b with comments on is just a",
+        (shlex.split("a#b", true) ?? []) == ["a"])
+    say(f, "and with them off it is one word",
+        (shlex.split("a#b", false) ?? []) == ["a#b"])
+    // The refusals: both mean the string was cut off somewhere.
+    say(f, "an unterminated quote is refused", match shlex.split("'a", false) {
+        Ok(_x) -> false
+        Err(_e) -> true
+    })
+    say(f, "and so is a trailing backslash", match shlex.split("a\\", false) {
+        Ok(_x) -> false
+        Err(_e) -> true
+    })
+    // Quoting is the inverse, and the round trip is what it is for.
+    let awkward = ["it's", "a b", "$x", "`y`", "", "a\nb", "--flag=a b"]
+    say(f, "quoting and splitting are inverses",
+        (shlex.split(shlex.join(awkward), false) ?? []) == awkward)
+    say(f, "and a single quote is written by closing and reopening",
+        shlex.quote("it's") == "'it'\"'\"'s'")
+}
+
+// --------------------------------------------------------------- querystring
+
+fn check_querystring(inout f: i64) / {io} {
+    print("-- querystring: the half of a URL after the question mark")
+    // A key with no `=` is a key with an empty value.
+    say(f, "`a` alone parses to a with an empty value",
+        querystring.stringify(querystring.parse("a")) == "a=")
+    // A repeated key keeps every value, in order.
+    say(f, "a repeated key keeps both values",
+        querystring.all(querystring.parse("a=1&a=2"), "a") == ["1", "2"])
+    // `+` is a space in a query field and a plus everywhere else.
+    say(f, "+ is a space when a query is parsed",
+        (querystring.first(querystring.parse("a=b+c"), "a") ?? "") == "b c")
+    say(f, "and stays a plus when a string is unescaped",
+        querystring.unescape("b+c") == "b+c")
+    // A space encodes as %20, so escape and unescape are inverses and
+    // parse and stringify are not quite.
+    say(f, "a space escapes to %20 rather than to +",
+        querystring.escape("b c") == "b%20c")
+    // A broken escape is passed through rather than thrown away.
+    say(f, "a broken escape is left alone",
+        querystring.unescape("%zz") == "%zz")
+    // A *valid* escape for an invalid byte is decoded, and what comes back
+    // is not the byte: a string here is UTF-8, so a lone 0xE4 becomes the
+    // replacement character — which is what Node answers too.
+    say(f, "but a valid escape for an invalid byte is still decoded",
+        querystring.unescape("a%E4") != "a%E4")
+    // `;` stopped being a separator, so it is part of the value now.
+    say(f, "a semicolon is not a separator",
+        (querystring.first(querystring.parse("a=1;b=2"), "a") ?? "") == "1;b=2")
+    say(f, "and a second = belongs to the value",
+        (querystring.first(querystring.parse("a=b=c"), "a") ?? "") == "b=c")
+}
+
+// ------------------------------------------------------------------- cformat
+
+fn check_cformat(inout f: i64) / {io} {
+    print("-- cformat: printf, whose rounding is not what arithmetic teaches")
+    // Round half to even, on the binary value: 0.5 goes down and 1.5 goes up.
+    say(f, "%.0f of 0.5 is 0 and of 1.5 is 2",
+        (cformat.format("%.0f", [Float(0.5)]) ?? "?") == "0" and
+        (cformat.format("%.0f", [Float(1.5)]) ?? "?") == "2")
+    say(f, "and 2.5 goes down to 2, not up to 3",
+        (cformat.format("%.0f", [Float(2.5)]) ?? "?") == "2")
+    // A precision turns off zero padding for integers and not for floats.
+    say(f, "%05.2d is padded with spaces",
+        (cformat.format("%08.4d|", [Int(42)]) ?? "?") == "    0042|")
+    say(f, "and %012.3f is padded with zeroes",
+        (cformat.format("%012.3f", [Float(1.5)]) ?? "?") == "00000001.500")
+    // Zeroes go after the sign, not before it.
+    say(f, "the zero padding goes after the sign",
+        (cformat.format("%+08.2f", [Float(0.0 - 1.5)]) ?? "?") == "-0001.50")
+    // `%g` drops trailing zeroes and `%#g` keeps them.
+    say(f, "%g drops trailing zeroes and %#g keeps them",
+        (cformat.format("%g", [Float(1.0)]) ?? "?") == "1" and
+        (cformat.format("%#g", [Float(1.0)]) ?? "?") == "1.00000")
+    // A negative value in `%x` is the bits, not a minus sign.
+    say(f, "%x of -1 is the whole word",
+        (cformat.format("%x", [Int(0 - 1)]) ?? "?") == "ffffffffffffffff")
+    say(f, "and %u of -1 is its unsigned value",
+        (cformat.format("%u", [Int(0 - 1)]) ?? "?") == "18446744073709551615")
+    // Positional arguments and `*` widths.
+    say(f, "%2$s-%1$s reads the arguments in the order asked for",
+        (cformat.format("%2$s-%1$s", [Text("a"), Text("b")]) ?? "?") == "b-a")
+    say(f, "and a * takes the width from an argument",
+        (cformat.format("%*d", [Int(6), Int(42)]) ?? "?") == "    42")
+    // A width counts bytes, as it does in C.
+    say(f, "a width counts bytes rather than characters",
+        (cformat.format("%4s|", [Text("é")]) ?? "?") == "  é|")
+    // The kinds are checked rather than guessed.
+    say(f, "a string handed to %d is refused", match
+        cformat.format("%d", [Text("x")]) {
+            Ok(_v) -> false
+            Err(_e) -> true
+    })
+}
+
+// -------------------------------------------------------------- configparser
+
+fn check_configparser(inout f: i64) / {io} {
+    print("-- configparser: Python's INI, which is not everyone's INI")
+    let text = "[DEFAULT]\nd = 9\n[Section]\nName = 1\ny: 2\n" +
+    "  continued\nbin = %(Name)s/x\n"
+    let c = configparser.read(text, true, false) ??
+    configparser.empty(false)
+    // Keys are lower-cased and sections are not.
+    say(f, "a key is lower-cased and a section is not",
+        (configparser.get(c, "Section", "name") ?? "?") == "1" and
+        configparser.sections(c) == ["Section"])
+    // `:` separates too.
+    say(f, "a colon separates as well as an equals sign",
+        (configparser.get(c, "Section", "y") ?? "?").starts_with("2"))
+    // A continuation is joined with a newline, not a space.
+    say(f, "an indented line continues the value with a newline",
+        (configparser.get(c, "Section", "y") ?? "?") == "2\ncontinued")
+    // `DEFAULT` is inherited by every section that exists.
+    say(f, "DEFAULT is inherited",
+        (configparser.get(c, "Section", "d") ?? "?") == "9")
+    say(f, "but not by a section that does not exist", match
+        configparser.get(c, "Missing", "d") {
+            Ok(_v) -> false
+            Err(_e) -> true
+    })
+    // Interpolation, and the loop that has to be refused rather than hang.
+    say(f, "a value is interpolated",
+        (configparser.get(c, "Section", "bin") ?? "?") == "1/x")
+    let loopy = configparser.read("[a]\nx = %(y)s\ny = %(x)s\n", true, false) ??
+    configparser.empty(false)
+    say(f, "and a loop is an error rather than a hang", match
+        configparser.get(loopy, "a", "x") {
+            Ok(_v) -> false
+            Err(_e) -> true
+    })
+    // The eight boolean words, and nothing else.
+    say(f, "on and off are booleans and yesplease is not",
+        configparser.as_bool("on") == Some(true) and
+        configparser.as_bool("OFF") == Some(false) and
+        configparser.as_bool("yesplease") == None)
+}
+
+// ---------------------------------------------------------------- pytokenize
+
+fn count_of(tokens: [SourceToken], kind: str) -> i64 {
+    var n = 0
+    for t in tokens {
+        if t.kind == kind {
+            n = n + 1
+        }
+    }
+    return n
+}
+
+fn check_pytokenize(inout f: i64) / {io} {
+    print("-- pytokenize: Python source, with the indentation as a stack")
+    let nested = "if a:\n    if b:\n        c = 1\n    d = 2\ne = 3\n"
+    let tokens = pytokenize.tokenize(nested) ?? []
+    say(f, "two levels in and two out is two INDENTs and two DEDENTs",
+        count_of(tokens, "INDENT") == 2 and count_of(tokens, "DEDENT") == 2)
+    // A dedent has to land on a level that was pushed.
+    say(f, "a dedent to a level that never existed is refused", match
+        pytokenize.tokenize("if a:\n        b = 1\n    c = 2\n") {
+            Ok(_x) -> false
+            Err(_e) -> true
+    })
+    // Inside brackets a newline is nothing at all.
+    let wrapped = pytokenize.tokenize("x = (1,\n     2)\n") ?? []
+    say(f, "a newline inside brackets is not a NEWLINE",
+        count_of(wrapped, "NEWLINE") == 1 and count_of(wrapped, "NL") == 1 and
+        count_of(wrapped, "INDENT") == 0)
+    // A comment-only line emits NL and changes no indentation.
+    let commented = pytokenize.tokenize("    # deep\nx = 1\n") ?? []
+    say(f, "a comment at the wrong indent changes nothing",
+        count_of(commented, "INDENT") == 0 and
+        count_of(commented, "COMMENT") == 1)
+    // f-strings are taken apart rather than kept whole.
+    let fstring = pytokenize.tokenize("x = f'a\{y!r:>4\}b'\n") ?? []
+    say(f, "an f-string is a start, its pieces, and an end",
+        count_of(fstring, "FSTRING_START") == 1 and
+        count_of(fstring, "FSTRING_END") == 1 and
+        count_of(fstring, "FSTRING_MIDDLE") == 3)
+    // A doubled brace is one character and ends the run it is in.
+    let doubled = pytokenize.tokenize("x = f'a\u{7d}\u{7d}b'\n") ?? []
+    say(f, "and a doubled brace splits the literal in two",
+        count_of(doubled, "FSTRING_MIDDLE") == 2)
+    // Numbers: underscores, hexadecimal, and a point at either end.
+    let numbers = pytokenize.tokenize("a = 1_000 + 0x_ff + .5 + 5. + 1j\n") ??
+    []
+    say(f, "every shape of number is one token",
+        count_of(numbers, "NUMBER") == 5)
+    // A string prefix may be any case and any order.
+    let prefixed = pytokenize.tokenize("a = Rb'x' + bR'y' + u'z'\n") ?? []
+    say(f, "and so is every shape of string prefix",
+        count_of(prefixed, "STRING") == 3)
+}
+
+fn main() / {io} {
+    var f = 0
+    check_shlex(f)
+    check_querystring(f)
+    check_cformat(f)
+    check_configparser(f)
+    check_pytokenize(f)
+    if f == 0 {
+        print("langs2: every claim held")
+    } else {
+        print("langs2: {f} claims failed")
+    }
+}

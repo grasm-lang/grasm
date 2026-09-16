@@ -1,0 +1,6 @@
+[package]
+name = "configparser"
+version = "1.0.0"
+
+# Reads and writes Python's INI dialect. Opens no files itself.
+capabilities = []

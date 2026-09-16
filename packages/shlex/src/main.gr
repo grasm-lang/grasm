@@ -1,0 +1,197 @@
+// Splitting a command line the way a POSIX shell does, and quoting so it
+// survives being one.
+//
+// This is the function every program that builds a command string needs and
+// almost every one gets wrong. The failure is not cosmetic: a filename with a
+// space in it becomes two arguments, and a filename with a quote in it becomes
+// whatever the shell decides the rest of the line means. `quote` exists so
+// that never happens, and it is deliberately conservative — anything outside a
+// small safe set is wrapped in single quotes, because guessing which
+// characters this shell treats specially is how a program becomes a
+// vulnerability on a system it was not tested on.
+//
+// The rules, which are Python's `shlex` in POSIX mode and the shell's:
+//
+//   - **Single quotes take everything.** No escape means anything inside them,
+//     including a backslash. So `'it'\''s'` — close, escape, reopen — is how a
+//     single quote is written at all, and what `quote` produces.
+//   - **Double quotes take everything but the backslash**, and then only
+//     before another backslash or a double quote. `"a\nb"` is a backslash and
+//     an `n`, not a newline.
+//   - **A backslash outside quotes escapes the next character**, whatever it
+//     is, including a space and including a newline.
+//   - **Quotes glue rather than delimit.** `'a b'c` is one word, `a bc`, and
+//     `''` is an empty word that survives. A splitter that treats a quote as a
+//     word boundary produces a different — and wrong — number of arguments.
+//   - **A comment runs to the end of the line**, but only when `comments` is
+//     asked for; otherwise `#` is an ordinary character, which is why
+//     `shlex.split("a#b")` is one word.
+//
+// Unterminated quotes and a trailing backslash are refused rather than
+// guessed at, because both mean the string was cut off somewhere and the rest
+// of it changes the answer.
+
+type ShlexError =
+    | UnclosedQuote(quote: str)
+    | DanglingEscape
+
+let SPACE = 32
+let TAB = 9
+let NEWLINE = 10
+let RETURN = 13
+let SINGLE = 39
+let DOUBLE = 34
+let BACKSLASH = 92
+let HASH = 35
+
+/// The four characters that separate words.
+//
+// Not `\v` and not `\f`: a shell's `IFS` and Python's `shlex` both stop at
+// space, tab, carriage return and newline, so a vertical tab is an ordinary
+// character inside a word. Treating "whitespace" as a category rather than as
+// this list splits words that should not be split.
+fn is_space(c: i64) -> bool {
+    return c == SPACE or c == TAB or c == NEWLINE or c == RETURN
+}
+
+/// The words of a command line.
+///
+/// `comments` decides whether `#` starts one; a shell reading a script says
+/// yes and `shlex.split` says no unless asked.
+pub fn split(line: str, comments: bool) -> [str] ! ShlexError {
+    let codes = line.codes()
+    var out: [str] = []
+    var word: [i64] = []
+    // A word exists as soon as a quote opens, even if nothing goes into it:
+    // `''` is an empty argument and has to survive as one.
+    var started = false
+    var i = 0
+    while i < codes.len() {
+        let c = codes[i]
+        if is_space(c) {
+            if started {
+                out.push(text_of(word))
+                word = []
+                started = false
+            }
+            i = i + 1
+        } else if comments and c == HASH {
+            // A comment character ends the word it is in, rather than
+            // needing to start one: `a#b` with comments on is just `a`.
+            if started {
+                out.push(text_of(word))
+                word = []
+                started = false
+            }
+            while i < codes.len() and codes[i] != NEWLINE {
+                i = i + 1
+            }
+        } else if c == BACKSLASH {
+            if i + 1 >= codes.len() {
+                fail(DanglingEscape)
+            }
+            word.push(codes[i + 1])
+            started = true
+            i = i + 2
+        } else if c == SINGLE {
+            started = true
+            i = i + 1
+            while i < codes.len() and codes[i] != SINGLE {
+                word.push(codes[i])
+                i = i + 1
+            }
+            if i >= codes.len() {
+                fail(UnclosedQuote("'"))
+            }
+            i = i + 1
+        } else if c == DOUBLE {
+            started = true
+            i = i + 1
+            var closed = false
+            while i < codes.len() {
+                if codes[i] == DOUBLE {
+                    closed = true
+                    i = i + 1
+                    break
+                }
+                if codes[i] == BACKSLASH and i + 1 < codes.len() and
+                (codes[i + 1] == DOUBLE or codes[i + 1] == BACKSLASH) {
+                    word.push(codes[i + 1])
+                    i = i + 2
+                } else {
+                    word.push(codes[i])
+                    i = i + 1
+                }
+            }
+            if not closed {
+                fail(UnclosedQuote("\""))
+            }
+        } else {
+            word.push(c)
+            started = true
+            i = i + 1
+        }
+    }
+    if started {
+        out.push(text_of(word))
+    }
+    return out
+}
+
+fn text_of(codes: [i64]) -> str {
+    var out = ""
+    for c in codes {
+        out = out + c.to_char()
+    }
+    return out
+}
+
+/// Characters a shell leaves alone. Everything else gets quoted, including
+/// the ones that are probably safe: a list of exceptions is a list of things
+/// to be wrong about later.
+fn is_safe(c: i64) -> bool {
+    let letter = (c >= 97 and c <= 122) or (c >= 65 and c <= 90)
+    let digit = c >= 48 and c <= 57
+    return letter or digit or c == 64 or c == 37 or c == 43 or c == 61 or
+    c == 58 or c == 44 or c == 46 or c == 47 or c == 45 or c == 95
+}
+
+/// One argument, safe to paste into a command line.
+///
+/// The empty string becomes `''` rather than nothing, which is the difference
+/// between passing an empty argument and passing none.
+pub fn quote(word: str) -> str {
+    if word.len() == 0 {
+        return "''"
+    }
+    var needs = false
+    for c in word.codes() {
+        if not is_safe(c) {
+            needs = true
+        }
+    }
+    if not needs {
+        return word
+    }
+    // A single quote cannot appear inside single quotes at all, so the run is
+    // closed, the quote is written on its own in double quotes, and the run
+    // reopens: `it's` becomes `'it'"'"'s'`.
+    return "'" + word.split("'").join("'\"'\"'") + "'"
+}
+
+/// A whole command line from its arguments.
+pub fn join(words: [str]) -> str {
+    var parts: [str] = []
+    for word in words {
+        parts.push(quote(word))
+    }
+    return parts.join(" ")
+}
+
+/// What went wrong, for a person.
+pub fn message_of(e: ShlexError) -> str {
+    match e {
+        UnclosedQuote(_q) -> return "No closing quotation"
+        DanglingEscape -> return "No escaped character"
+    }
+}

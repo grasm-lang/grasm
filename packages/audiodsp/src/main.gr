@@ -32,10 +32,13 @@ type DspError =
     | BadQ(q: f64)
     | BadRange(what: str)
 
-/// A second-order section, normalized by a0 — a biquad, named for what it is
-/// rather than for the shape of its equation, because `loudness` already has
-/// a `Biquad` and types share one namespace across a program ([T-MODULE-NS]).
-type Section = {
+/// One stage of a filter: a second-order section, normalized by a0.
+//
+// Not `Biquad` and not `Section`: both are taken, by `loudness` and by
+// `configparser`, and types share one namespace across a whole program
+// ([T-MODULE-NS]). A name is worth spending a moment on when the alternative
+// is that two packages cannot be used together.
+type FilterStage = {
     b0: f64,
     b1: f64,
     b2: f64,
@@ -358,12 +361,12 @@ pub fn trim_silence(buf: [f64], threshold_db: f64) -> [f64] {
 // --- filters ----------------------------------------------------------------
 
 /// A section built from coefficients already divided by a0.
-pub fn biquad(b0: f64, b1: f64, b2: f64, a1: f64, a2: f64) -> Section {
-    return Section{ b0: b0, b1: b1, b2: b2, a1: a1, a2: a2 }
+pub fn biquad(b0: f64, b1: f64, b2: f64, a1: f64, a2: f64) -> FilterStage {
+    return FilterStage{ b0: b0, b1: b1, b2: b2, a1: a1, a2: a2 }
 }
 
-fn normalised(b0: f64, b1: f64, b2: f64, a0: f64, a1: f64, a2: f64) -> Section {
-    return Section{ b0: b0 / a0, b1: b1 / a0, b2: b2 / a0, a1: a1 / a0,
+fn normalised(b0: f64, b1: f64, b2: f64, a0: f64, a1: f64, a2: f64) -> FilterStage {
+    return FilterStage{ b0: b0 / a0, b1: b1 / a0, b2: b2 / a0, a1: a1 / a0,
         a2: a2 / a0 }
 }
 
@@ -373,7 +376,7 @@ fn omega(rate: i64, hz: f64) -> f64 {
 
 /// A two-pole low-pass at `hz`, resonance `q` — the cookbook's LPF, which is
 /// what `lowpass` is in ffmpeg and `BiquadFilterNode` in a browser.
-pub fn lowpass(rate: i64, hz: f64, q: f64) -> Section ! DspError {
+pub fn lowpass(rate: i64, hz: f64, q: f64) -> FilterStage ! DspError {
     if rate <= 0 {
         fail(BadRate(rate))
     }
@@ -388,7 +391,7 @@ pub fn lowpass(rate: i64, hz: f64, q: f64) -> Section ! DspError {
 }
 
 /// The same shape, the other way up.
-pub fn highpass(rate: i64, hz: f64, q: f64) -> Section ! DspError {
+pub fn highpass(rate: i64, hz: f64, q: f64) -> FilterStage ! DspError {
     if rate <= 0 {
         fail(BadRate(rate))
     }
@@ -403,7 +406,7 @@ pub fn highpass(rate: i64, hz: f64, q: f64) -> Section ! DspError {
 }
 
 /// A band around `hz`, at constant 0 dB peak gain.
-pub fn bandpass(rate: i64, hz: f64, q: f64) -> Section ! DspError {
+pub fn bandpass(rate: i64, hz: f64, q: f64) -> FilterStage ! DspError {
     if rate <= 0 {
         fail(BadRate(rate))
     }
@@ -417,7 +420,7 @@ pub fn bandpass(rate: i64, hz: f64, q: f64) -> Section ! DspError {
 }
 
 /// A notch: everything but a band around `hz`.
-pub fn notch(rate: i64, hz: f64, q: f64) -> Section ! DspError {
+pub fn notch(rate: i64, hz: f64, q: f64) -> FilterStage ! DspError {
     if rate <= 0 {
         fail(BadRate(rate))
     }
@@ -431,7 +434,7 @@ pub fn notch(rate: i64, hz: f64, q: f64) -> Section ! DspError {
 }
 
 /// A bell: `db` of boost or cut around `hz`, the band of an equaliser.
-pub fn peaking(rate: i64, hz: f64, q: f64, db: f64) -> Section ! DspError {
+pub fn peaking(rate: i64, hz: f64, q: f64, db: f64) -> FilterStage ! DspError {
     if rate <= 0 {
         fail(BadRate(rate))
     }
@@ -447,7 +450,7 @@ pub fn peaking(rate: i64, hz: f64, q: f64, db: f64) -> Section ! DspError {
 }
 
 /// A shelf that lifts or drops everything below `hz`.
-pub fn lowshelf(rate: i64, hz: f64, q: f64, db: f64) -> Section ! DspError {
+pub fn lowshelf(rate: i64, hz: f64, q: f64, db: f64) -> FilterStage ! DspError {
     if rate <= 0 {
         fail(BadRate(rate))
     }
@@ -468,7 +471,7 @@ pub fn lowshelf(rate: i64, hz: f64, q: f64, db: f64) -> Section ! DspError {
 }
 
 /// And the one above it.
-pub fn highshelf(rate: i64, hz: f64, q: f64, db: f64) -> Section ! DspError {
+pub fn highshelf(rate: i64, hz: f64, q: f64, db: f64) -> FilterStage ! DspError {
     if rate <= 0 {
         fail(BadRate(rate))
     }
@@ -489,7 +492,7 @@ pub fn highshelf(rate: i64, hz: f64, q: f64, db: f64) -> Section ! DspError {
 }
 
 /// One pass of a section over a buffer, starting from silence.
-pub fn filter(buf: [f64], f: Section) -> [f64] {
+pub fn filter(buf: [f64], f: FilterStage) -> [f64] {
     var x1 = 0.0
     var x2 = 0.0
     var y1 = 0.0
@@ -509,7 +512,7 @@ pub fn filter(buf: [f64], f: Section) -> [f64] {
 /// Forwards and then backwards, which cancels the phase shift and doubles the
 /// slope — what `filtfilt` does, and what an editor's "no phase smearing"
 /// option means.
-pub fn filter_twice(buf: [f64], f: Section) -> [f64] {
+pub fn filter_twice(buf: [f64], f: FilterStage) -> [f64] {
     return reverse(filter(reverse(filter(buf, f)), f))
 }
 

@@ -1,0 +1,24 @@
+[package]
+name = "langtest2"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.shlex]
+path = "../shlex"
+version = "^1.0.0"
+
+[dependencies.querystring]
+path = "../querystring"
+version = "^1.0.0"
+
+[dependencies.cformat]
+path = "../cformat"
+version = "^1.0.0"
+
+[dependencies.configparser]
+path = "../configparser"
+version = "^1.0.0"
+
+[dependencies.pytokenize]
+path = "../pytokenize"
+version = "^1.0.0"

@@ -31,9 +31,9 @@ One more is added, because this stretch leans on it:
 | | |
 |---|---|
 | At the close of the 600 plan | 600 |
-| Now | 644 |
+| Now | 650 |
 | Target | 650 |
-| Remaining | 6 |
+| Remaining | 0 |
 
 The count is directories under `packages/` that are not `*-demo`. Test
 harnesses are counted.
@@ -82,8 +82,16 @@ harnesses are counted.
   `topiclog` for `apps/broker`, `audiodsp` `audiotest` for `apps/mixer`.
   22 cases against ffmpeg's own filters, and the two application gates.
 
-### Next
+- [x] **Five formats a program speaks to sit between other programs** —
+  `shlex` `querystring` `cformat` `configparser` `pytokenize`, and the harness
+  `langtest2`. 40,000-odd cases against Python, Node and Perl, including every
+  Python file in `scripts/` tokenized token for token against `tokenize`
+  itself. Found that `cformat` applied the integer rule for zero padding to
+  floats, that `querystring.unescape` turned `+` into a space where Node does
+  not, and four places where the f-string tokenizer disagreed with CPython
+  about where a literal run ends.
 
-Each line has an implementation to be checked against on this machine.
+## Done
 
-- **What is left** — `pytokenize` (`tokenize`)
+That is 650. The count is directories under `packages/` that are not
+`*-demo`; test harnesses are counted and demos are not.

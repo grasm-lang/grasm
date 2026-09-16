@@ -1,0 +1,6 @@
+[package]
+name = "querystring"
+version = "1.0.0"
+
+# Parses and writes the query half of a URL. Opens nothing.
+capabilities = []

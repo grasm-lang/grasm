@@ -1,0 +1,180 @@
+// The query half of a URL, the way Node writes and reads it.
+//
+// `a=1&b=2` looks like it needs no library, and then the cases arrive: a key
+// with no `=`, an `=` with no key, a key that repeats, a `+` that means a
+// space in this half of the URL and a plus sign in the rest of it, and a
+// percent escape that is not valid hexadecimal.
+//
+// The answers here are Node's `querystring`, and each one is a decision
+// rather than an accident:
+//
+//   - **`a` alone is `a=""`,** not a missing key and not a key with no value.
+//   - **A repeated key becomes a list**, in the order it appeared — which is
+//     why `parse` answers with a list per key rather than one string, and the
+//     caller decides whether more than one is an error.
+//   - **`+` decodes to a space**, and a space encodes to `%20` rather than to
+//     `+`. Those are not inverses, and both halves are what Node does.
+//   - **A broken escape is left alone.** `%zz` decodes to `%zz`, because
+//     throwing away input that a person typed is worse than passing it on.
+//   - **`;` is not a separator.** It was once, and it is not now, so
+//     `a=1;b=2` is one key whose value contains a semicolon.
+//
+// Encoding keeps the unreserved set of RFC 3986 plus nothing else: anything
+// outside `A-Za-z0-9-_.!~*'()` is written as percent-escaped UTF-8.
+
+/// One key and everything that was given for it, in the order it appeared.
+type QueryPair = {
+    key: str,
+    values: [str],
+}
+
+fn hex_value(c: i64) -> i64 {
+    if c >= 48 and c <= 57 {
+        return c - 48
+    }
+    if c >= 97 and c <= 102 {
+        return c - 87
+    }
+    if c >= 65 and c <= 70 {
+        return c - 55
+    }
+    return -1
+}
+
+/// One escaped field, percent-decoded.
+//
+// `+` is left alone. It becomes a space when a *query* is parsed and not when
+// a string is unescaped, which is Node's split too — `unescape` is the
+// inverse of `escape`, and `escape` never writes a `+`.
+pub fn unescape(text: str) -> str {
+    return decode(text, false)
+}
+
+/// The same, with `+` read as a space, which is what a query field means.
+pub fn unescape_plus(text: str) -> str {
+    return decode(text, true)
+}
+
+fn decode(text: str, plus_is_space: bool) -> str {
+    let raw = text.to_bytes()
+    var out: [i64] = []
+    var i = 0
+    while i < raw.len() {
+        let c = raw.at(i)
+        if c == 43 and plus_is_space {
+            out.push(32)
+            i = i + 1
+        } else if c == 37 and i + 2 < raw.len() {
+            let hi = hex_value(raw.at(i + 1))
+            let lo = hex_value(raw.at(i + 2))
+            if hi < 0 or lo < 0 {
+                // Not hexadecimal: the escape was never one, so it stays.
+                out.push(c)
+                i = i + 1
+            } else {
+                out.push(hi * 16 + lo)
+                i = i + 3
+            }
+        } else {
+            out.push(c)
+            i = i + 1
+        }
+    }
+    return bytes_of(out).to_str()
+}
+
+fn is_unreserved(c: i64) -> bool {
+    let letter = (c >= 97 and c <= 122) or (c >= 65 and c <= 90)
+    let digit = c >= 48 and c <= 57
+    return letter or digit or c == 45 or c == 95 or c == 46 or c == 33 or
+    c == 126 or c == 42 or c == 39 or c == 40 or c == 41
+}
+
+/// One field, escaped. A space becomes `%20`, not `+`.
+pub fn escape(text: str) -> str {
+    let raw = text.to_bytes()
+    let digits = "0123456789ABCDEF"
+    var out = ""
+    var i = 0
+    while i < raw.len() {
+        let c = raw.at(i)
+        if is_unreserved(c) {
+            out = out + c.to_char()
+        } else {
+            out = out + "%" + digits.substr(c / 16, 1) + digits.substr(c % 16, 1)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+/// The pairs of a query string, keys in the order they first appeared.
+pub fn parse(query: str) -> [QueryPair] {
+    var out: [QueryPair] = []
+    if query.len() == 0 {
+        return out
+    }
+    for field in query.split("&") {
+        if field.len() == 0 {
+            continue
+        }
+        let cut = field.index_of("=") ?? -1
+        let key = if cut < 0 { unescape_plus(field) } else {
+            unescape_plus(field.substr(0, cut)) }
+        let value = if cut < 0 { "" } else {
+            unescape_plus(field.substr(cut + 1, field.len() - cut - 1)) }
+        var found = false
+        var i = 0
+        while i < out.len() {
+            if out[i].key == key {
+                out[i].values.push(value)
+                found = true
+            }
+            i = i + 1
+        }
+        if not found {
+            out.push(QueryPair{ key: key, values: [value] })
+        }
+    }
+    return out
+}
+
+/// The value given for a key, or the first of several.
+pub fn first(pairs: [QueryPair], key: str) -> Option[str] {
+    for pair in pairs {
+        if pair.key == key and pair.values.len() > 0 {
+            return Some(pair.values[0])
+        }
+    }
+    return None
+}
+
+/// Every value given for a key.
+pub fn all(pairs: [QueryPair], key: str) -> [str] {
+    for pair in pairs {
+        if pair.key == key {
+            return pair.values
+        }
+    }
+    return []
+}
+
+/// The pairs written back out. A key with several values is written several
+/// times, which is how it was read.
+pub fn stringify(pairs: [QueryPair]) -> str {
+    var fields: [str] = []
+    for pair in pairs {
+        if pair.values.len() == 0 {
+            fields.push(escape(pair.key) + "=")
+        }
+        for value in pair.values {
+            fields.push(escape(pair.key) + "=" + escape(value))
+        }
+    }
+    return fields.join("&")
+}
+
+/// One key and one value, which is the common case.
+pub fn pair(key: str, value: str) -> QueryPair {
+    return QueryPair{ key: key, values: [value] }
+}

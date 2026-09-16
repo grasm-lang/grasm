@@ -1,0 +1,6 @@
+[package]
+name = "pytokenize"
+version = "1.0.0"
+
+# Splits Python source into tokens. Reads nothing from anywhere.
+capabilities = []
