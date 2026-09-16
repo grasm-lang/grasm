@@ -4,6 +4,11 @@
 //! 1 [2]
 //! 8 [9]
 //! [0, 1]
+//! 3 [+2]
+//! 15 [+5]
+//! 7 [+2, +4]
+//! 30 [+5, +15]
+//! 9 [+2, +4, +2]
 // Mutating a list held in a struct field, and taking from it.
 //
 // `vm.stack.pop()` is the core operation of anything keeping a stack in a
@@ -23,4 +28,47 @@ fn main() {
     // And the mutating methods that were already reachable stay so.
     vm.mem.sort()
     print("{vm.mem}")
+
+    places_as_arguments()
+}
+
+// And the same clause's other half: an `inout` *argument* may be a place too,
+// through every call form. A plain call read one already; a call through a
+// method receiver did not, and neither did a call qualified by a module, and
+// both refused outright — "inout arguments that aren't plain variables". So a
+// server keeping its state in one struct could not hand a piece of that state
+// to a package function that appends to it. The module-qualified form needs a
+// package, which a conformance case does not have; `scripts/broker_test.sh`
+// covers it, where it was first hit.
+type Counter = { n: i64, tags: [str] }
+
+type Box = { one: Counter, many: [Counter] }
+
+fn bump(inout c: Counter, by: i64) {
+    c.n = c.n + by
+    c.tags.push("+{by}")
+}
+
+fn places_as_arguments() {
+    var b = Box{ one: Counter{ n: 1, tags: [] },
+        many: [Counter{ n: 10, tags: [] }] }
+
+    // A field of a struct, and an element of a list in a field.
+    bump(b.one, 2)
+    bump(b.many[0], 5)
+    print("{b.one.n} {b.one.tags}")
+    print("{b.many[0].n} {b.many[0].tags}")
+
+    // The same places as a method receiver, which is a second path through
+    // the backend and was refused by that one too.
+    b.one.bump(4)
+    b.many[0].bump(15)
+    print("{b.one.n} {b.one.tags}")
+    print("{b.many[0].n} {b.many[0].tags}")
+
+    // An index that is computed, so the place cannot be read at compile time.
+    var which = [b.one]
+    let at = which.len() - 1
+    bump(which[at], 2)
+    print("{which[at].n} {which[at].tags}")
 }

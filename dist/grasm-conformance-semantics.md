@@ -1519,7 +1519,65 @@ fn main() {
 //! true
 //! true
 //! P{a: 9, b: v4}
+//! 6 jobs, in order
+//! 0 1 4 9 16 25
+//! same as one core
+//! 3 kept
 type P = { a: i64, b: str }
+
+/// A short list whose elements are expensive is worth splitting, and says the
+/// same thing however it was split.
+type Job = { n: i64, label: str }
+
+/// Expensive enough that the runtime chooses to spread six elements, and
+/// exact, so the answer cannot depend on how they were divided.
+//
+// The count used to be the whole question: fewer than 256 elements meant one
+// core, whatever was in them, so a thousand-element `x * x` was threaded and
+// six elements of real work were not. What the clause promises is the answer,
+// and the answer is the same either way — which is why this file can be
+// written at all.
+fn work(j: Job) -> i64 {
+    var spin = 0
+    var i = 0
+    while i < 400000 {
+        spin = (spin + i) % 7919
+        i = i + 1
+    }
+    return j.n * j.n + spin * 0
+}
+
+fn heavy_even(j: Job) -> bool {
+    var spin = 0
+    var i = 0
+    while i < 400000 {
+        spin = (spin + i) % 7919
+        i = i + 1
+    }
+    return j.n % 2 == 0 and spin >= 0
+}
+
+fn few_but_expensive() {
+    var jobs: [Job] = []
+    var k = 0
+    while k < 6 {
+        jobs.push(Job{ n: k, label: "j{k}" })
+        k = k + 1
+    }
+    let done = jobs.par_map(|j| work(j))
+    print("{done.len()} jobs, in order")
+    var line = ""
+    for v in done {
+        line = line + (if line == "" { "" } else { " " }) + "{v}"
+    }
+    print(line)
+    var serial: [i64] = []
+    for j in jobs {
+        serial.push(work(j))
+    }
+    print(if serial == done { "same as one core" } else { "DIFFERENT" })
+    print("{jobs.par_filter(|j| heavy_even(j)).len()} kept")
+}
 
 fn main() {
     // Enough elements to cross the threshold where workers are used, so this
@@ -1552,6 +1610,8 @@ fn main() {
 
     let ps = xs.par_map(|x| P{ a: x, b: "v{x % 5}" })
     print("{ps[9]}")
+
+    few_but_expensive()
 }
 ```
 
