@@ -25,7 +25,7 @@
 // frame larger than `max_frame` is refused rather than buffered, because a
 // length field is the one number an attacker sets for free.
 
-type WireError =
+type BrokerWireError =
     | WireTooLarge(length: i64)
     | WireMalformed(at: i64)
 
@@ -38,7 +38,11 @@ type WireRecord = {
 }
 
 /// A decoded frame. Which fields carry meaning depends on `opcode`.
-type Frame = {
+//
+// `WireFrame` rather than `Frame`, and `WireCursor` rather than `Cursor`,
+// because types share one namespace across a whole program ([T-MODULE-NS])
+// and `websocket` and `sexpr` were there first.
+type WireFrame = {
     opcode: i64,
     correlation: i64,
     topic: str,
@@ -66,8 +70,8 @@ pub let STATS_OK = 131
 pub let ERROR = 255
 
 /// An empty frame of an opcode, to be filled in.
-pub fn frame(opcode: i64, correlation: i64) -> Frame {
-    return Frame{ opcode: opcode, correlation: correlation, topic: "",
+pub fn wire_frame(opcode: i64, correlation: i64) -> WireFrame {
+    return WireFrame{ opcode: opcode, correlation: correlation, topic: "",
         offset: 0, end_offset: 0, limit: 0, max_bytes: 0, durable: false,
         payload: bytes_of([]), records: [], text: "", code: 0 }
 }
@@ -126,7 +130,7 @@ fn put_blob_part(inout p: Parts, data: bytes) {
 }
 
 /// A frame's bytes, length prefix and all.
-pub fn encode(f: Frame) -> bytes {
+pub fn encode(f: WireFrame) -> bytes {
     var parts = Parts{ done: bytes_of([]), now: [] }
     var body = parts.now
     body.push(f.opcode)
@@ -175,26 +179,26 @@ pub fn encode(f: Frame) -> bytes {
     return bytes_of(head).concat(parts.done)
 }
 
-type Cursor = {
+type WireCursor = {
     data: bytes,
     at: i64,
     end: i64,
 }
 
-fn need(c: Cursor, n: i64) -> () ! WireError {
+fn need(c: WireCursor, n: i64) -> () ! BrokerWireError {
     if c.at + n > c.end {
         fail(WireMalformed(c.at))
     }
 }
 
-fn u16_at(inout c: Cursor) -> i64 ! WireError {
+fn u16_at(inout c: WireCursor) -> i64 ! BrokerWireError {
     try need(c, 2)
     let v = c.data.at(c.at) * 256 + c.data.at(c.at + 1)
     c.at = c.at + 2
     return v
 }
 
-fn u32_at(inout c: Cursor) -> i64 ! WireError {
+fn u32_at(inout c: WireCursor) -> i64 ! BrokerWireError {
     try need(c, 4)
     let v = c.data.at(c.at) * 16777216 + c.data.at(c.at + 1) * 65536 +
     c.data.at(c.at + 2) * 256 + c.data.at(c.at + 3)
@@ -202,13 +206,13 @@ fn u32_at(inout c: Cursor) -> i64 ! WireError {
     return v
 }
 
-fn u64_at(inout c: Cursor) -> i64 ! WireError {
+fn u64_at(inout c: WireCursor) -> i64 ! BrokerWireError {
     let high = try u32_at(c)
     let low = try u32_at(c)
     return high * 4294967296 + low
 }
 
-fn text_at(inout c: Cursor) -> str ! WireError {
+fn text_at(inout c: WireCursor) -> str ! BrokerWireError {
     let n = try u16_at(c)
     try need(c, n)
     let out = c.data.slice(c.at, c.at + n).to_str()
@@ -216,7 +220,7 @@ fn text_at(inout c: Cursor) -> str ! WireError {
     return out
 }
 
-fn blob_at(inout c: Cursor) -> bytes ! WireError {
+fn blob_at(inout c: WireCursor) -> bytes ! BrokerWireError {
     let n = try u32_at(c)
     if n < 0 {
         fail(WireMalformed(c.at))
@@ -229,18 +233,18 @@ fn blob_at(inout c: Cursor) -> bytes ! WireError {
 
 /// The first whole frame in `data` and how many bytes it used, or `None`
 /// when the rest of it has not arrived.
-pub fn decode(data: bytes, max_frame: i64) -> Option[(Frame, i64)] ! WireError {
+pub fn decode(data: bytes, max_frame: i64) -> Option[(WireFrame, i64)] ! BrokerWireError {
     return try decode_at(data, 0, max_frame)
 }
 
 /// The same, starting at `from` — so a server holding a read buffer moves a
 /// cursor instead of re-slicing what is left after every frame, which is a
 /// copy of the whole buffer per message.
-pub fn decode_at(data: bytes, from: i64, max_frame: i64) -> Option[(Frame, i64)] ! WireError {
+pub fn decode_at(data: bytes, from: i64, max_frame: i64) -> Option[(WireFrame, i64)] ! BrokerWireError {
     if data.len() - from < 4 {
         return None
     }
-    var head = Cursor{ data: data, at: from, end: data.len() }
+    var head = WireCursor{ data: data, at: from, end: data.len() }
     let length = try u32_at(head)
     if length < 5 or length > max_frame {
         fail(WireTooLarge(length))
@@ -248,10 +252,10 @@ pub fn decode_at(data: bytes, from: i64, max_frame: i64) -> Option[(Frame, i64)]
     if data.len() - from < 4 + length {
         return None
     }
-    var c = Cursor{ data: data, at: from + 4, end: from + 4 + length }
+    var c = WireCursor{ data: data, at: from + 4, end: from + 4 + length }
     let opcode = c.data.at(c.at)
     c.at = c.at + 1
-    var f = frame(opcode, try u32_at(c))
+    var f = wire_frame(opcode, try u32_at(c))
     if opcode == PUBLISH {
         f.topic = try text_at(c)
         f.payload = try blob_at(c)
@@ -295,8 +299,8 @@ pub fn decode_at(data: bytes, from: i64, max_frame: i64) -> Option[(Frame, i64)]
 
 /// A publish frame.
 pub fn publish(correlation: i64, topic: str, payload: bytes,
-    durable: bool) -> Frame {
-    var f = frame(PUBLISH, correlation)
+    durable: bool) -> WireFrame {
+    var f = wire_frame(PUBLISH, correlation)
     f.topic = topic
     f.payload = payload
     f.durable = durable
@@ -305,8 +309,8 @@ pub fn publish(correlation: i64, topic: str, payload: bytes,
 
 /// A fetch frame.
 pub fn fetch(correlation: i64, topic: str, offset: i64, limit: i64,
-    max_bytes: i64) -> Frame {
-    var f = frame(FETCH, correlation)
+    max_bytes: i64) -> WireFrame {
+    var f = wire_frame(FETCH, correlation)
     f.topic = topic
     f.offset = offset
     f.limit = limit
@@ -315,16 +319,16 @@ pub fn fetch(correlation: i64, topic: str, offset: i64, limit: i64,
 }
 
 /// A subscribe frame.
-pub fn subscribe(correlation: i64, topic: str, offset: i64) -> Frame {
-    var f = frame(SUBSCRIBE, correlation)
+pub fn subscribe(correlation: i64, topic: str, offset: i64) -> WireFrame {
+    var f = wire_frame(SUBSCRIBE, correlation)
     f.topic = topic
     f.offset = offset
     return f
 }
 
 /// An acknowledgement of a publish.
-pub fn ack(correlation: i64, offset: i64, end_offset: i64) -> Frame {
-    var f = frame(ACK, correlation)
+pub fn ack(correlation: i64, offset: i64, end_offset: i64) -> WireFrame {
+    var f = wire_frame(ACK, correlation)
     f.offset = offset
     f.end_offset = end_offset
     return f
@@ -332,8 +336,8 @@ pub fn ack(correlation: i64, offset: i64, end_offset: i64) -> Frame {
 
 /// A batch of records.
 pub fn records(correlation: i64, topic: str, rs: [WireRecord],
-    end_offset: i64) -> Frame {
-    var f = frame(RECORDS, correlation)
+    end_offset: i64) -> WireFrame {
+    var f = wire_frame(RECORDS, correlation)
     f.topic = topic
     f.records = rs
     f.end_offset = end_offset
@@ -342,8 +346,8 @@ pub fn records(correlation: i64, topic: str, rs: [WireRecord],
 
 /// A refusal, with the code a client can branch on and the text a person
 /// reads.
-pub fn error(correlation: i64, code: i64, text: str) -> Frame {
-    var f = frame(ERROR, correlation)
+pub fn error(correlation: i64, code: i64, text: str) -> WireFrame {
+    var f = wire_frame(ERROR, correlation)
     f.code = code
     f.text = text
     return f
