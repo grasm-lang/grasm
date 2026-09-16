@@ -1,0 +1,349 @@
+// Tcl lists: how `list` quotes elements and how Tcl splits them again.
+//
+// Tcl has no data types but the string, so its list is a string with a
+// quoting rule, and that rule is in more places than Tcl programs: `expect`
+// scripts, `tkinter` (which hands Python values to Tcl as lists), EDA tool
+// configuration, `fileevent` protocols between Tcl processes, and a good
+// deal of network-equipment automation. A program that talks to any of them
+// has to produce lists Tcl splits back into the same elements, and read the
+// lists Tcl produces.
+//
+// Quoting, from `Tcl_ScanElement` and `Tcl_ConvertElement` in Tcl 8.5:
+//
+// - an element with nothing special is written as it is;
+// - one with a space, `[`, `$`, `;` or a backslash, or that starts with `{`
+//   or `"`, or is empty, is put in braces — if its braces balance;
+// - one whose braces do not balance, or that ends in a backslash or has a
+//   backslash before a newline, is written with backslashes instead, and
+//   then every brace in it is escaped too;
+// - the first element of a list is also quoted when it starts with `#`, so
+//   the list cannot be read as a comment.
+//
+// Splitting, from `TclFindElement`: an element in braces is taken exactly
+// as written, one in quotes or bare has its backslash sequences replaced —
+// `\n`, `\x41`, `é`, `\101`, and a backslash-newline with the spaces
+// after it becoming one space — and braces or quotes followed by anything
+// but a space are an error.
+//
+// The one difference: `\uD800` and the other surrogates, which Tcl 8.5
+// stores as bytes no UTF-8 reader accepts, become U+FFFD.
+//
+// Checked against `tclsh` 8.5: `list` over elements made of every character
+// the rules mention, and `llength` and `lindex` over lists built to break
+// them.
+
+type TclListError =
+    | TclUnmatchedBrace
+    | TclUnmatchedQuote
+    | TclGarbageAfterBrace(text: str)
+    | TclGarbageAfterQuote(text: str)
+
+fn is_space(c: i64) -> bool {
+    return c == 32 or (c >= 9 and c <= 13)
+}
+
+fn is_hex(c: i64) -> bool {
+    return (c >= 48 and c <= 57) or (c >= 97 and c <= 102) or (c >= 65 and c <= 70)
+}
+
+fn hex_value(c: i64) -> i64 {
+    return if c <= 57 { c - 48 } else if c >= 97 { c - 87 } else { c - 55 }
+}
+
+/// The backslash sequence at `at`: the code point it stands for and how many
+/// code points it takes, as `Tcl_UtfBackslash` reads it.
+pub fn backslash(codes: [i64], at: i64) -> (i64, i64) {
+    if at + 1 >= codes.len() {
+        return (92, 1)
+    }
+    let c = codes[at + 1]
+    let simple = [(97, 7), (98, 8), (102, 12), (110, 10), (114, 13), (116, 9),
+        (118, 11)]
+    for pair in simple {
+        if c == pair.0 {
+            return (pair.1, 2)
+        }
+    }
+    if c == 120 or c == 117 {
+        var i = at + 2
+        var value = 0
+        let limit = if c == 117 { at + 6 } else { at + 128 }
+        while i < codes.len() and i < limit and is_hex(codes[i]) {
+            value = (value * 16 + hex_value(codes[i])) % 4294967296
+            i = i + 1
+        }
+        if i == at + 2 {
+            return (c, 2)
+        }
+        let point = if c == 120 { value % 256 } else { value }
+        // Tcl 8.5 writes a lone surrogate as three bytes no UTF-8 reader
+        // accepts; a Grasm str cannot hold one, so it becomes U+FFFD.
+        return (if point >= 55296 and point <= 57343 { 65533 } else { point },
+            i - at)
+    }
+    if c == 10 {
+        var i = at + 2
+        while i < codes.len() and i < at + 128 and (codes[i] == 32 or codes[i] == 9) {
+            i = i + 1
+        }
+        return (32, i - at)
+    }
+    if c >= 48 and c <= 55 {
+        var value = c - 48
+        var count = 2
+        if at + 2 < codes.len() and codes[at + 2] >= 48 and codes[at + 2] <= 55 {
+            value = value * 8 + codes[at + 2] - 48
+            count = 3
+            if at + 3 < codes.len() and codes[at + 3] >= 48 and codes[at + 3] <= 55 {
+                value = value * 8 + codes[at + 3] - 48
+                count = 4
+            }
+        }
+        return (value % 256, count)
+    }
+    return (c, 2)
+}
+
+/// Whether an element is written in braces (`1`), as it is (`0`), or with
+/// backslashes (`2`), and whether its braces are unmatched.
+fn scan(codes: [i64]) -> (i64, bool) {
+    var use_braces = codes.len() == 0 or codes[0] == 123 or codes[0] == 34
+    var forbid = false
+    var unmatched = false
+    var level = 0
+    var i = 0
+    while i < codes.len() {
+        let c = codes[i]
+        if c == 123 {
+            level = level + 1
+        } else if c == 125 {
+            level = level - 1
+            if level < 0 {
+                forbid = true
+                unmatched = true
+            }
+        } else if c == 91 or c == 36 or c == 59 or c == 32 or (c >= 9 and c <= 13) {
+            use_braces = true
+        } else if c == 92 {
+            if i + 1 == codes.len() or codes[i + 1] == 10 {
+                // Replaces every earlier finding, as Tcl's assignment does.
+                use_braces = false
+                forbid = true
+                unmatched = true
+            } else {
+                i = i + backslash(codes, i).1 - 1
+                use_braces = true
+            }
+        }
+        i = i + 1
+    }
+    if level != 0 {
+        use_braces = false
+        forbid = true
+        unmatched = true
+    }
+    let mode = if use_braces and not forbid { 1 } else if use_braces or forbid {
+        2 } else { 0 }
+    return (mode, unmatched)
+}
+
+/// One element as `list` writes it; `first` is whether it opens the list,
+/// where a leading `#` has to be quoted.
+pub fn quote(element: str, first: bool) -> str {
+    let codes = element.codes()
+    if codes.len() == 0 {
+        return "\{\}"
+    }
+    let found = scan(codes)
+    let hash = first and codes[0] == 35
+    // A leading `#` asks for braces; whether it gets them is still up to the
+    // braces inside.
+    let braced = found.0 == 1 or (hash and found.0 == 0)
+    if braced {
+        return "\{" + element + "\}"
+    }
+    // Everything else goes through the escaping loop, which leaves an
+    // element with nothing special unchanged.
+    var unmatched = found.1
+    var out = ""
+    var i = 0
+    if codes[0] == 123 {
+        out = "\\\{"
+        unmatched = true
+        i = 1
+    } else if hash {
+        out = "\\#"
+        i = 1
+    }
+    while i < codes.len() {
+        let c = codes[i]
+        if c == 93 or c == 91 or c == 36 or c == 59 or c == 32 or c == 92 or
+        c == 34 {
+            out = out + "\\" + c.to_char()
+        } else if c == 123 or c == 125 {
+            out = out + (if unmatched { "\\" } else { "" }) + c.to_char()
+        } else if c == 12 {
+            out = out + "\\f"
+        } else if c == 10 {
+            out = out + "\\n"
+        } else if c == 13 {
+            out = out + "\\r"
+        } else if c == 9 {
+            out = out + "\\t"
+        } else if c == 11 {
+            out = out + "\\v"
+        } else {
+            out = out + c.to_char()
+        }
+        i = i + 1
+    }
+    return out
+}
+
+/// A list of elements as `list` builds it.
+pub fn merge(elements: [str]) -> str {
+    var parts: [str] = []
+    var i = 0
+    while i < elements.len() {
+        parts.push(quote(elements[i], i == 0))
+        i = i + 1
+    }
+    return parts.join(" ")
+}
+
+fn collapse(codes: [i64], from: i64, to: i64) -> str {
+    var out = ""
+    var i = from
+    while i < to {
+        if codes[i] == 92 {
+            let b = backslash(codes.slice(0, to), i)
+            out = out + b.0.to_char()
+            i = i + b.1
+        } else {
+            out = out + codes[i].to_char()
+            i = i + 1
+        }
+    }
+    return out
+}
+
+fn garbage(codes: [i64], at: i64) -> str {
+    var out = ""
+    var i = at
+    while i < codes.len() and not is_space(codes[i]) and i < at + 20 {
+        out = out + codes[i].to_char()
+        i = i + 1
+    }
+    return out
+}
+
+/// The element starting at or after `at`: its text and where scanning
+/// resumes, or `None` at the end of the list.
+fn element_at(codes: [i64], at: i64) -> Option[(str, i64)] ! TclListError {
+    var p = at
+    while p < codes.len() and is_space(codes[p]) {
+        p = p + 1
+    }
+    if p == codes.len() {
+        return None
+    }
+    var braces = 0
+    var quoted = false
+    if codes[p] == 123 {
+        braces = 1
+        p = p + 1
+    } else if codes[p] == 34 {
+        quoted = true
+        p = p + 1
+    }
+    let start = p
+    var end = -1
+    while p < codes.len() and end < 0 {
+        let c = codes[p]
+        if c == 123 and braces > 0 {
+            braces = braces + 1
+        } else if c == 125 and braces > 1 {
+            braces = braces - 1
+        } else if c == 125 and braces == 1 {
+            end = p
+            if p + 1 < codes.len() and not is_space(codes[p + 1]) {
+                fail(TclGarbageAfterBrace(garbage(codes, p + 1)))
+            }
+            p = p + 1
+            continue
+        } else if c == 92 {
+            p = p + backslash(codes, p).1 - 1
+        } else if is_space(c) and braces == 0 and not quoted {
+            end = p
+            continue
+        } else if c == 34 and quoted {
+            end = p
+            if p + 1 < codes.len() and not is_space(codes[p + 1]) {
+                fail(TclGarbageAfterQuote(garbage(codes, p + 1)))
+            }
+            p = p + 1
+            continue
+        }
+        p = p + 1
+    }
+    if end < 0 {
+        if braces > 0 {
+            fail(TclUnmatchedBrace)
+        }
+        if quoted {
+            fail(TclUnmatchedQuote)
+        }
+        end = codes.len()
+    }
+    var text = ""
+    if braces > 0 {
+        var i = start
+        while i < end {
+            text = text + codes[i].to_char()
+            i = i + 1
+        }
+    } else {
+        text = collapse(codes, start, end)
+    }
+    return Some((text, p))
+}
+
+/// The elements of a list, as `Tcl_SplitList` finds them.
+pub fn split(list: str) -> [str] ! TclListError {
+    let codes = list.codes()
+    var out: [str] = []
+    var at = 0
+    while true {
+        match try element_at(codes, at) {
+            Some(found) -> {
+                out.push(found.0)
+                at = found.1
+            }
+            None -> break
+        }
+    }
+    return out
+}
+
+/// `llength`.
+pub fn length(list: str) -> i64 ! TclListError {
+    return (try split(list)).len()
+}
+
+/// `lindex list index`, or the empty string past the end.
+pub fn index(list: str, i: i64) -> str ! TclListError {
+    let elements = try split(list)
+    return if i >= 0 and i < elements.len() { elements[i] } else { "" }
+}
+
+/// Tcl's message for a failure.
+pub fn message_of(e: TclListError) -> str {
+    return match e {
+        TclUnmatchedBrace -> "unmatched open brace in list"
+        TclUnmatchedQuote -> "unmatched open quote in list"
+        TclGarbageAfterBrace(t) -> "list element in braces followed by \"" + t +
+        "\" instead of space"
+        TclGarbageAfterQuote(t) -> "list element in quotes followed by \"" + t +
+        "\" instead of space"
+    }
+}

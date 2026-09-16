@@ -1,0 +1,14 @@
+[package]
+name = "perlpack"
+version = "1.0.0"
+
+# Bytes to values and back. Opens nothing.
+capabilities = []
+
+[dependencies.bigint]
+path = "../bigint"
+version = "^1.0.0"
+
+[dependencies.luaformat]
+path = "../luaformat"
+version = "^1.0.0"

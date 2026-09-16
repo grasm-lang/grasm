@@ -1,0 +1,408 @@
+// Numbers the way JavaScript writes and reads them.
+//
+// A value that goes through a browser, a Node service or a JSON document
+// produced by one comes back as JavaScript's text for it, and that text has
+// rules of its own: `1e21` where Python writes `1e+21`, `0.000001` where it
+// switches to an exponent one place later, `(2.5).toFixed(0)` is `"3"`
+// because ties go up rather than to even, and `(1.005).toFixed(2)` is
+// `"1.00"` because the double nearest 1.005 is below it. Reading is its own
+// set of rules too: `Number(" 0x1F ")` is 31, `Number("")` is 0,
+// `Number("1_0")` is NaN, and `parseFloat` stops at the first character
+// that does not fit.
+//
+// This is ECMAScript's `Number::toString`, `toFixed`, `toExponential`,
+// `toPrecision`, `Number(string)` and `parseFloat`, following the
+// specification's steps. Where the specification says to pick the digits
+// closest to the value and, on a tie, the larger, that is computed exactly
+// on the double's binary value, so the last digit matches an engine that
+// does the same.
+//
+// Radix conversion (`toString(2)` and the like) is left out: the
+// specification leaves its digits to the implementation.
+//
+// Checked against Node's V8.
+
+import bigint
+import shortestfloat
+
+type JsNumberError =
+    | JsRangeError(what: str)
+
+let NAN = (9221120237041090560).from_bits()
+let INFINITY = (9218868437227405312).from_bits()
+
+fn is_nan(x: f64) -> bool {
+    return x != x
+}
+
+fn is_finite(x: f64) -> bool {
+    return x - x == 0.0
+}
+
+/// `Number::toString(x)`.
+pub fn to_string(x: f64) -> str {
+    if is_nan(x) {
+        return "NaN"
+    }
+    if x == 0.0 {
+        return "0"
+    }
+    if x < 0.0 {
+        return "-" + to_string(0.0 - x)
+    }
+    if not is_finite(x) {
+        return "Infinity"
+    }
+    let p = shortestfloat.parts(x)
+    return layout(p.digits, p.point)
+}
+
+/// Digits `s` with the point `n` places in, laid out as `Number::toString`
+/// lays them out.
+fn layout(s: str, n: i64) -> str {
+    let k = s.len()
+    if k <= n and n <= 21 {
+        return s + "0".repeat(n - k)
+    }
+    if 0 < n and n <= 21 {
+        return s.substr(0, n) + "." + s.substr(n, k)
+    }
+    if - 6 < n and n <= 0 {
+        return "0." + "0".repeat(0 - n) + s
+    }
+    let exponent = n - 1
+    let sign = if exponent < 0 { "-" } else { "+" }
+    let magnitude = if exponent < 0 { 0 - exponent } else { exponent }
+    if k == 1 {
+        return s + "e" + sign + "{magnitude}"
+    }
+    return s.substr(0, 1) + "." + s.substr(1, k) + "e" + sign + "{magnitude}"
+}
+
+/// A positive finite double as `(mantissa, exponent)`: the value is
+/// `mantissa × 2^exponent` exactly.
+fn exact(x: f64) -> (BigInt, i64) {
+    let bits = x.to_bits()
+    let raw = bits.ushr(52).bit_and(2047)
+    let fraction = bits.bit_and(4503599627370495)
+    if raw == 0 {
+        return (bigint.from_i64(fraction), -1074)
+    }
+    return (bigint.from_i64(fraction + 4503599627370496), raw - 1075)
+}
+
+/// `x × 10^scale`, rounded to an integer with ties going up.
+fn scaled_half_up(x: f64, scale: i64) -> BigInt {
+    let parts = exact(x)
+    var top = parts.0
+    var bottom = bigint.from_i64(1)
+    let two = bigint.from_i64(2)
+    if parts.1 >= 0 {
+        top = bigint.mul(top, bigint.pow(two, parts.1))
+    } else {
+        bottom = bigint.pow(two, 0 - parts.1)
+    }
+    if scale >= 0 {
+        top = bigint.mul(top, bigint.pow(bigint.from_i64(10), scale))
+    } else {
+        bottom = bigint.mul(bottom, bigint.pow(bigint.from_i64(10), 0 - scale))
+    }
+    let split = bigint.divmod(top, bottom) ?? (bigint.zero(), bigint.zero())
+    if bigint.compare(bigint.mul(split.1, two), bottom) >= 0 {
+        return bigint.add(split.0, bigint.from_i64(1))
+    }
+    return split.0
+}
+
+/// `Number.prototype.toFixed(digits)`.
+pub fn to_fixed(value: f64, digits: i64) -> str ! JsNumberError {
+    if digits < 0 or digits > 100 {
+        fail(JsRangeError("toFixed() digits argument must be between 0 and 100"))
+    }
+    if is_nan(value) {
+        return "NaN"
+    }
+    var x = value
+    var sign = ""
+    if x < 0.0 {
+        sign = "-"
+        x = 0.0 - x
+    }
+    if x >= 1000000000000000000000.0 {
+        return sign + to_string(x)
+    }
+    var m = if x == 0.0 { "0" } else { bigint.to_str(scaled_half_up(x, digits)) }
+    if digits == 0 {
+        return sign + m
+    }
+    if m.len() <= digits {
+        m = "0".repeat(digits + 1 - m.len()) + m
+    }
+    let cut = m.len() - digits
+    return sign + m.substr(0, cut) + "." + m.substr(cut, digits)
+}
+
+/// The `count` digits nearest `x` (ties up) and the decimal exponent of
+/// the first: `x ≈ d.ddd × 10^exponent`.
+fn digits_of(x: f64, count: i64) -> (str, i64) {
+    let p = shortestfloat.parts(x)
+    var exponent = p.point - 1
+    var n = scaled_half_up(x, count - 1 - exponent)
+    var text = bigint.to_str(n)
+    // The shortest digits can round across a power of ten that the exact
+    // value does not reach, or the other way; one step either way fixes it.
+    if text.len() < count {
+        exponent = exponent - 1
+        n = scaled_half_up(x, count - 1 - exponent)
+        text = bigint.to_str(n)
+    }
+    if text.len() > count {
+        exponent = exponent + 1
+        n = scaled_half_up(x, count - 1 - exponent)
+        text = bigint.to_str(n)
+    }
+    return (text, exponent)
+}
+
+fn exponent_text(e: i64) -> str {
+    return "e" + (if e < 0 { "-" } else { "+" }) + "{if e < 0 { 0 - e } else { e }}"
+}
+
+fn special(x: f64) -> Option[str] {
+    if is_nan(x) {
+        return Some("NaN")
+    }
+    if not is_finite(x) {
+        return Some(if x > 0.0 { "Infinity" } else { "-Infinity" })
+    }
+    return None
+}
+
+/// `Number.prototype.toExponential(digits)`; a negative `digits` stands for
+/// leaving the argument out, which gives as many digits as the value needs.
+pub fn to_exponential(value: f64, digits: i64) -> str ! JsNumberError {
+    match special(value) {
+        Some(s) -> return s
+        None -> {}
+    }
+    if digits > 100 {
+        fail(JsRangeError("toExponential() argument must be between 0 and 100"))
+    }
+    let sign = if value < 0.0 { "-" } else { "" }
+    let x = if value < 0.0 { 0.0 - value } else { value }
+    var s = ""
+    var e = 0
+    if x == 0.0 {
+        s = "0".repeat(if digits < 0 { 1 } else { digits + 1 })
+    } else if digits < 0 {
+        let p = shortestfloat.parts(x)
+        s = p.digits
+        e = p.point - 1
+    } else {
+        let found = digits_of(x, digits + 1)
+        s = found.0
+        e = found.1
+    }
+    let body = if s.len() == 1 { s } else { s.substr(0, 1) + "." + s.substr(1, s.len()) }
+    return sign + body + exponent_text(e)
+}
+
+/// `Number.prototype.toPrecision(precision)`; a negative `precision` stands
+/// for leaving the argument out.
+pub fn to_precision(value: f64, precision: i64) -> str ! JsNumberError {
+    if precision < 0 {
+        return to_string(value)
+    }
+    match special(value) {
+        Some(s) -> return s
+        None -> {}
+    }
+    if precision < 1 or precision > 100 {
+        fail(JsRangeError("toPrecision() argument must be between 1 and 100"))
+    }
+    let sign = if value < 0.0 { "-" } else { "" }
+    let x = if value < 0.0 { 0.0 - value } else { value }
+    var s = "0".repeat(precision)
+    var e = 0
+    if x != 0.0 {
+        let found = digits_of(x, precision)
+        s = found.0
+        e = found.1
+    }
+    if x != 0.0 and (e < -6 or e >= precision) {
+        let body = if precision == 1 { s } else {
+            s.substr(0, 1) + "." + s.substr(1, s.len()) }
+        return sign + body + exponent_text(e)
+    }
+    if e == precision - 1 {
+        return sign + s
+    }
+    if e >= 0 {
+        return sign + s.substr(0, e + 1) + "." + s.substr(e + 1, s.len())
+    }
+    return sign + "0." + "0".repeat(0 - (e + 1)) + s
+}
+
+/// JavaScript's white space and line terminators, which `Number` and
+/// `parseFloat` trim.
+pub fn is_js_space(c: i64) -> bool {
+    return c == 9 or c == 10 or c == 11 or c == 12 or c == 13 or c == 32 or
+    c == 160 or c == 5760 or (c >= 8192 and c <= 8202) or c == 8232 or
+    c == 8233 or c == 8239 or c == 8287 or c == 12288 or c == 65279
+}
+
+fn is_digit(c: i64) -> bool {
+    return c >= 48 and c <= 57
+}
+
+/// The longest prefix of `codes` from `at` that is a decimal literal:
+/// digits, a point, an exponent. Returns where it ends, or `at`.
+fn decimal_end(codes: [i64], at: i64) -> i64 {
+    var i = at
+    var digits = 0
+    while i < codes.len() and is_digit(codes[i]) {
+        i = i + 1
+        digits = digits + 1
+    }
+    if i < codes.len() and codes[i] == 46 {
+        var j = i + 1
+        var fraction = 0
+        while j < codes.len() and is_digit(codes[j]) {
+            j = j + 1
+            fraction = fraction + 1
+        }
+        if digits + fraction > 0 {
+            i = j
+            digits = digits + fraction
+        }
+    }
+    if digits == 0 {
+        return at
+    }
+    if i < codes.len() and (codes[i] == 101 or codes[i] == 69) {
+        var j = i + 1
+        if j < codes.len() and (codes[j] == 43 or codes[j] == 45) {
+            j = j + 1
+        }
+        let start = j
+        while j < codes.len() and is_digit(codes[j]) {
+            j = j + 1
+        }
+        if j > start {
+            i = j
+        }
+    }
+    return i
+}
+
+fn text_of(codes: [i64], from: i64, to: i64) -> str {
+    var out = ""
+    var i = from
+    while i < to {
+        out = out + codes[i].to_char()
+        i = i + 1
+    }
+    return out
+}
+
+fn decimal_value(text: str) -> f64 {
+    var t = text
+    if t.starts_with(".") {
+        t = "0" + t
+    }
+    t = t.replace(".e", ".0e").replace(".E", ".0E")
+    if t.ends_with(".") {
+        t = t + "0"
+    }
+    return t.parse_float() ?? NAN
+}
+
+/// `parseFloat(text)`.
+/// The sign applied, negative zero included.
+//
+// `0.0 - x` is not negation: IEEE-754 says `0.0 - 0.0` is *positive* zero, so
+// a parser that subtracts loses the sign of `-0` — and `Object.is(-0, 0)` is
+// false in JavaScript, `1/-0` is `-Infinity`, and `(-0).toString()` is "0"
+// while `(-0).toFixed(1)` is "-0.0". Multiplying keeps it.
+fn negated(x: f64) -> f64 {
+    return x * (0.0 - 1.0)
+}
+
+pub fn parse_float(text: str) -> f64 {
+    let codes = text.codes()
+    var i = 0
+    while i < codes.len() and is_js_space(codes[i]) {
+        i = i + 1
+    }
+    var negative = false
+    if i < codes.len() and (codes[i] == 43 or codes[i] == 45) {
+        negative = codes[i] == 45
+        i = i + 1
+    }
+    let rest = text_of(codes, i, codes.len())
+    if rest.starts_with("Infinity") {
+        return if negative { 0.0 - INFINITY } else { INFINITY }
+    }
+    let end = decimal_end(codes, i)
+    if end == i {
+        return NAN
+    }
+    let value = decimal_value(text_of(codes, i, end))
+    return if negative { negated(value) } else { value }
+}
+
+fn radix_value(codes: [i64], from: i64, to: i64, radix: i64) -> f64 {
+    var value = bigint.zero()
+    let base = bigint.from_i64(radix)
+    var i = from
+    while i < to {
+        let c = codes[i]
+        let d = if is_digit(c) { c - 48 } else if c >= 97 { c - 87 } else {
+            c - 55 }
+        if d < 0 or d >= radix {
+            return NAN
+        }
+        value = bigint.add(bigint.mul(value, base), bigint.from_i64(d))
+        i = i + 1
+    }
+    return bigint.to_str(value).parse_float() ?? INFINITY
+}
+
+/// `Number(text)`: the whole text, trimmed, must be a number.
+pub fn number(text: str) -> f64 {
+    let codes = text.codes()
+    var start = 0
+    var end = codes.len()
+    while start < end and is_js_space(codes[start]) {
+        start = start + 1
+    }
+    while end > start and is_js_space(codes[end - 1]) {
+        end = end - 1
+    }
+    if start == end {
+        return 0.0
+    }
+    if end - start > 2 and codes[start] == 48 {
+        let marker = codes[start + 1]
+        let radix = if marker == 120 or marker == 88 { 16 } else if marker ==
+        111 or marker == 79 { 8 } else if marker == 98 or marker == 66 { 2 } else {
+            0 }
+        if radix > 0 {
+            return radix_value(codes, start + 2, end, radix)
+        }
+    }
+    var i = start
+    var negative = false
+    if codes[i] == 43 or codes[i] == 45 {
+        negative = codes[i] == 45
+        i = i + 1
+    }
+    if text_of(codes, i, end) == "Infinity" {
+        return if negative { 0.0 - INFINITY } else { INFINITY }
+    }
+    if decimal_end(codes, i) != end or i == end {
+        return NAN
+    }
+    let value = decimal_value(text_of(codes, i, end))
+    return if negative { negated(value) } else { value }
+}

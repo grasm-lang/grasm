@@ -31,9 +31,9 @@ One more is added, because this stretch leans on it:
 | | |
 |---|---|
 | At the close of the 600 plan | 600 |
-| Now | 634 |
+| Now | 644 |
 | Target | 650 |
-| Remaining | 16 |
+| Remaining | 6 |
 
 The count is directories under `packages/` that are not `*-demo`. Test
 harnesses are counted.
@@ -71,9 +71,19 @@ harnesses are counted.
   the harness `unixtest`. 8,452 cases against `cksum`, `sum`, `openssl enc`,
   `ssh-keygen -L` and `infocmp -1` over all 2,684 system terminfo entries.
 
+- [x] **How five other languages write things down** — `jsnumber` `tcllist`
+  `luaformat` `rubymarshal` `perlpack`, and the harness `langtest`. 75,569
+  cases against node, tclsh, lua, ruby and perl: JavaScript's six different
+  number-to-string functions, Tcl's list quoting and splitting, what Lua's
+  `%q` writes and `load` reads, Ruby's `Marshal` with its back-references, and
+  every letter of Perl's `pack`. Found that `jsnumber` lost the sign of
+  negative zero, and that `perlpack` had no `U`.
+- [x] **Two applications, and the packages under them** — `brokerwire`
+  `topiclog` for `apps/broker`, `audiodsp` `audiotest` for `apps/mixer`.
+  22 cases against ffmpeg's own filters, and the two application gates.
+
 ### Next
 
 Each line has an implementation to be checked against on this machine.
 
-- **Other languages' formats** — `rubymarshal` (`ruby`), `perlpack` (`perl`),
-  `pytokenize` (`tokenize`)
+- **What is left** — `pytokenize` (`tokenize`)

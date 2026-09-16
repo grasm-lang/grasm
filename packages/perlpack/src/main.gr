@@ -1,0 +1,992 @@
+// Perl's `pack` and `unpack`, for byte strings.
+//
+// A binary protocol, a file header or a network packet in a Perl program is
+// almost always a `pack` template: `"n/a* C N"`, `"A8 x2 v"`, `"(Z*)*"`.
+// Porting such a program, talking to one, or reading the files it wrote
+// means reproducing what the template does, and the letters have details
+// the documentation states once, briefly:
+//
+// - `a` pads with NULs, `A` with spaces and strips spaces and NULs when
+//   unpacking, `Z` always leaves room for a terminating NUL;
+// - `b`/`B` and `h`/`H` take their count in bits and nybbles, and use only
+//   the low bits of each character they are given;
+// - numbers wrap to the width of their letter, a string is numified the way
+//   Perl numifies — `"12abc"` is 12, `"1.9"` is 1 — and a float outside a
+//   64-bit integer saturates as Perl's casts do;
+// - `<` and `>` force byte order, `!` switches to native sizes (a `long` is
+//   eight bytes here), and `n!` and friends make the network-order letters
+//   signed;
+// - `w` is a BER compressed integer, `x`, `X` and `@` move within the
+//   string, `(...)` groups repeat, and `N/a*` writes or reads a length
+//   before what it measures.
+//
+// Floats unpack to Perl's text for them, `%.15g`. Letters that work in
+// characters rather than bytes (`U`, `W`), that deal in pointers (`p`, `P`)
+// or long doubles (`D`), and `u` (uuencode) are refused by name.
+//
+// Checked against `perl` 5.34's `pack` and `unpack`.
+
+import bigint
+import luaformat
+
+type PerlPackError =
+    | PackUnsupported(letter: str)
+    | PackBadTemplate(at: i64, why: str)
+    | PackOutside(what: str)
+    | PackNegativeBer
+
+type PackItem = {
+    letter: str,
+    count: i64,
+    star: bool,
+    has_count: bool,
+    little: bool,
+    big: bool,
+    bang: bool,
+    group: [PackItem],
+    slash: bool,
+}
+
+fn item(letter: str) -> PackItem {
+    return PackItem{ letter: letter, count: 1, star: false, has_count: false,
+        little: false, big: false, bang: false, group: [], slash: false }
+}
+
+fn is_digit(c: str) -> bool {
+    return c >= "0" and c <= "9" and c.len() == 1
+}
+
+/// The items of a template, with groups nested and `/` marked on the
+/// length item.
+pub fn parse_template(template: str) -> [PackItem] ! PerlPackError {
+    let chars = template.chars()
+    let parsed = try parse_items(chars, 0, false)
+    return parsed.0
+}
+
+fn parse_items(chars: [str], start: i64, in_group: bool) -> ([PackItem], i64) ! PerlPackError {
+    var items: [PackItem] = []
+    var i = start
+    while i < chars.len() {
+        let c = chars[i]
+        if c == " " or c == "\t" or c == "\n" or c == "\r" or c == "\u{c}" {
+            i = i + 1
+            continue
+        }
+        if c == "#" {
+            while i < chars.len() and chars[i] != "\n" {
+                i = i + 1
+            }
+            continue
+        }
+        if c == ")" {
+            if not in_group {
+                fail(PackBadTemplate(i, "unmatched )"))
+            }
+            return (items, i + 1)
+        }
+        if c == "/" {
+            if items.len() == 0 {
+                fail(PackBadTemplate(i, "/ must follow a numeric type"))
+            }
+            items[items.len() - 1].slash = true
+            i = i + 1
+            continue
+        }
+        var it = item(c)
+        i = i + 1
+        if c == "(" {
+            let inner = try parse_items(chars, i, true)
+            it.group = inner.0
+            i = inner.1
+        } else if not "aAZbBhHcCsSlLqQjJiInNvVfdFwxX@U".contains(c) {
+            fail(PackUnsupported(c))
+        }
+        while i < chars.len() and (chars[i] == "<" or chars[i] == ">" or chars[i] == "!") {
+            if chars[i] == "<" {
+                it.little = true
+            } else if chars[i] == ">" {
+                it.big = true
+            } else {
+                it.bang = true
+            }
+            i = i + 1
+        }
+        if i < chars.len() and chars[i] == "*" {
+            it.star = true
+            it.has_count = true
+            i = i + 1
+        } else if i < chars.len() and (is_digit(chars[i]) or chars[i] == "[") {
+            let bracket = chars[i] == "["
+            if bracket {
+                i = i + 1
+            }
+            var n = 0
+            while i < chars.len() and is_digit(chars[i]) {
+                n = n * 10 + (chars[i].parse_int() ?? 0)
+                i = i + 1
+            }
+            if bracket {
+                if i >= chars.len() or chars[i] != "]" {
+                    fail(PackBadTemplate(i, "only a number may be in brackets"))
+                }
+                i = i + 1
+            }
+            it.count = n
+            it.has_count = true
+        }
+        items.push(it)
+    }
+    if in_group {
+        fail(PackBadTemplate(i, "unmatched ("))
+    }
+    return (items, i)
+}
+
+/// Byte width and signedness of a numeric letter under its modifiers.
+fn numeric_shape(it: PackItem) -> (i64, bool) {
+    let l = it.letter
+    if l == "c" {
+        return (1, true)
+    }
+    if l == "C" {
+        return (1, false)
+    }
+    if l == "s" or l == "S" {
+        return (2, l == "s")
+    }
+    if l == "l" or l == "L" {
+        return (if it.bang { 8 } else { 4 }, l == "l")
+    }
+    if l == "q" or l == "Q" or l == "j" or l == "J" {
+        return (8, l == "q" or l == "j")
+    }
+    if l == "i" or l == "I" {
+        return (4, l == "i")
+    }
+    if l == "n" or l == "v" {
+        return (2, it.bang)
+    }
+    if l == "N" or l == "V" {
+        return (4, it.bang)
+    }
+    return (0, false)
+}
+
+fn is_numeric(l: str) -> bool {
+    return "cCsSlLqQjJiInNvVfdFwU".contains(l)
+}
+
+/// One code point as UTF-8, which is what `pack "U"` writes.
+//
+// `U` is the one letter whose width depends on its value, and its two
+// directions are not symmetrical in Perl either: packing encodes a character,
+// while unpacking a string that was never upgraded reads one *byte* per
+// character — so `unpack "U*"` over the bytes of "café" answers 99 97 102 195
+// 169, not 99 97 102 233. This follows Perl rather than tidiness.
+fn utf8_of(code: i64) -> [i64] {
+    if code < 0 {
+        return []
+    }
+    if code < 128 {
+        return [code]
+    }
+    if code < 2048 {
+        return [192 + code.ushr(6), 128 + code.bit_and(63)]
+    }
+    if code < 65536 {
+        return [224 + code.ushr(12), 128 + code.ushr(6).bit_and(63),
+            128 + code.bit_and(63)]
+    }
+    return [240 + code.ushr(18), 128 + code.ushr(12).bit_and(63),
+        128 + code.ushr(6).bit_and(63), 128 + code.bit_and(63)]
+}
+
+fn big_endian(it: PackItem) -> bool {
+    return it.big or it.letter == "n" or it.letter == "N"
+}
+
+// ---------------------------------------------------------------------------
+// Numification
+
+fn is_space_code(c: i64) -> bool {
+    return c == 32 or (c >= 9 and c <= 13)
+}
+
+/// The numeric prefix of a Perl string: its text, and whether it is a plain
+/// integer.
+fn numeric_prefix(text: str) -> (str, bool, str) {
+    let codes = text.codes()
+    var i = 0
+    while i < codes.len() and is_space_code(codes[i]) {
+        i = i + 1
+    }
+    let start = i
+    if i < codes.len() and (codes[i] == 43 or codes[i] == 45) {
+        i = i + 1
+    }
+    let word = text.substr(i, text.len()).to_lower()
+    if word.starts_with("inf") or word.starts_with("nan") {
+        let sign = if i > start and codes[start] == 45 { "-" } else { "" }
+        return (sign + word.substr(0, 3), false, "special")
+    }
+    let digits_start = i
+    while i < codes.len() and codes[i] >= 48 and codes[i] <= 57 {
+        i = i + 1
+    }
+    var integer = i > digits_start
+    if i < codes.len() and codes[i] == 46 {
+        var j = i + 1
+        while j < codes.len() and codes[j] >= 48 and codes[j] <= 57 {
+            j = j + 1
+        }
+        if j > i + 1 or i > digits_start {
+            integer = false
+            i = j
+        }
+    }
+    if i > digits_start and i < codes.len() and (codes[i] == 101 or codes[i] == 69) {
+        var j = i + 1
+        if j < codes.len() and (codes[j] == 43 or codes[j] == 45) {
+            j = j + 1
+        }
+        let exp_start = j
+        while j < codes.len() and codes[j] >= 48 and codes[j] <= 57 {
+            j = j + 1
+        }
+        if j > exp_start {
+            integer = false
+            i = j
+        }
+    }
+    if i == digits_start {
+        return ("0", true, "none")
+    }
+    var body = text.substr(start, i - start)
+    if body.starts_with("+") {
+        body = body.substr(1, body.len())
+    }
+    return (body, integer, "number")
+}
+
+let TWO64 = bigint.pow(bigint.from_i64(2), 64)
+
+fn as_float(text: str) -> f64 {
+    var t = text
+    if t.starts_with("-.") {
+        t = "-0" + t.substr(1, t.len())
+    } else if t.starts_with(".") {
+        t = "0" + t
+    }
+    t = t.replace(".e", ".0e").replace(".E", ".0E")
+    if t.ends_with(".") {
+        t = t + "0"
+    }
+    return t.parse_float() ?? 0.0
+}
+
+/// A Perl value as the 64 bits `SvIV` or `SvUV` gives, as an unsigned
+/// number below 2^64.
+fn integer_bits(value: str, unsigned: bool) -> BigInt {
+    let found = numeric_prefix(value)
+    if found.2 == "special" {
+        let s = found.0
+        if s.ends_with("nan") {
+            return bigint.zero()
+        }
+        let top = bigint.sub(TWO64, bigint.from_i64(1))
+        if s.starts_with("-") {
+            // cast_iv of -inf is IV_MIN; cast_uv of it is IV_MIN too.
+            return bigint.pow(bigint.from_i64(2), 63)
+        }
+        return if unsigned { top } else { bigint.sub(bigint.pow(bigint.from_i64(2),
+            63), bigint.from_i64(1)) }
+    }
+    if found.1 {
+        let n = bigint.parse(found.0) ?? bigint.zero()
+        let low = bigint.negate(bigint.pow(bigint.from_i64(2), 63))
+        if bigint.compare(n, TWO64) < 0 and bigint.compare(n, low) >= 0 {
+            return wrap64(n)
+        }
+    }
+    return cast_bits(as_float(found.0), unsigned)
+}
+
+fn wrap64(n: BigInt) -> BigInt {
+    return if bigint.sign(n) < 0 { bigint.add(n, TWO64) } else { n }
+}
+
+/// `cast_iv` or `cast_uv` of a double, as 64 unsigned bits.
+fn cast_bits(x: f64, unsigned: bool) -> BigInt {
+    if x != x {
+        return bigint.zero()
+    }
+    let iv_max_p1 = 9223372036854775808.0
+    let uv_max_p1 = 18446744073709551616.0
+    if x < 0.0 {
+        if x < 0.0 - iv_max_p1 {
+            return bigint.pow(bigint.from_i64(2), 63)
+        }
+        return wrap64(bigint.from_i64(x.as_i64()))
+    }
+    if not unsigned and x < iv_max_p1 {
+        return bigint.from_i64(x.as_i64())
+    }
+    if x < uv_max_p1 {
+        let whole = luaformat.c_g(x.floor(), 25)
+        return bigint.parse(whole) ?? bigint.zero()
+    }
+    return bigint.sub(TWO64, bigint.from_i64(1))
+}
+
+// ---------------------------------------------------------------------------
+// pack
+
+type Packer = {
+    out: [i64],
+    group_start: i64,
+    args: [str],
+    next: i64,
+}
+
+fn take(inout p: Packer) -> str {
+    if p.next >= p.args.len() {
+        return ""
+    }
+    let v = p.args[p.next]
+    p.next = p.next + 1
+    return v
+}
+
+fn push_bytes(inout p: Packer, data: bytes) {
+    var i = 0
+    while i < data.len() {
+        p.out.push(data.at(i))
+        i = i + 1
+    }
+}
+
+fn push_integer(inout p: Packer, bits: BigInt, width: i64, big: bool) {
+    var parts: [i64] = []
+    var v = bits
+    let base = bigint.from_i64(256)
+    var i = 0
+    while i < width {
+        let qr = bigint.divmod(v, base) ?? (bigint.zero(), bigint.zero())
+        parts.push(bigint.to_i64(qr.1) ?? 0)
+        v = qr.0
+        i = i + 1
+    }
+    if big {
+        i = width - 1
+        while i >= 0 {
+            p.out.push(parts[i])
+            i = i - 1
+        }
+    } else {
+        for b in parts {
+            p.out.push(b)
+        }
+    }
+}
+
+fn push_float(inout p: Packer, x: f64, single: bool, big: bool) {
+    var bits = x.to_bits()
+    var width = 8
+    if single {
+        width = 4
+        bits = single_bits(x)
+    }
+    var parts: [i64] = []
+    var i = 0
+    while i < width {
+        parts.push(bits.ushr(8 * i).bit_and(255))
+        i = i + 1
+    }
+    if big {
+        i = width - 1
+        while i >= 0 {
+            p.out.push(parts[i])
+            i = i - 1
+        }
+    } else {
+        for b in parts {
+            p.out.push(b)
+        }
+    }
+}
+
+/// The IEEE single-precision bits nearest a double, rounding half to even.
+fn single_bits(x: f64) -> i64 {
+    let bits = x.to_bits()
+    let sign = if bits < 0 { 2147483648 } else { 0 }
+    let raw = bits.ushr(52).bit_and(2047)
+    let fraction = bits.bit_and(4503599627370495)
+    if raw == 2047 {
+        return sign + (if fraction == 0 { 2139095040 } else { 2143289344 })
+    }
+    if raw == 0 and fraction == 0 {
+        return sign
+    }
+    // m × 2^e with m below 2^53.
+    let m = if raw == 0 { fraction } else { fraction + 4503599627370496 }
+    let e = if raw == 0 { -1074 } else { raw - 1075 }
+    var length = 0
+    var probe = m
+    while probe > 0 {
+        probe = probe / 2
+        length = length + 1
+    }
+    let top = length + e
+    let lsb = (if top > -125 { top } else { -125 }) - 24
+    var kept = m
+    if lsb > e {
+        let shift = lsb - e
+        if shift > 62 {
+            kept = 0
+        } else {
+            var divisor = 1
+            var k = 0
+            while k < shift {
+                divisor = divisor * 2
+                k = k + 1
+            }
+            kept = m / divisor
+            let rest = m % divisor
+            if rest * 2 > divisor or (rest * 2 == divisor and kept % 2 == 1) {
+                kept = kept + 1
+            }
+        }
+    } else {
+        var k = e
+        while k > lsb {
+            kept = kept * 2
+            k = k - 1
+        }
+    }
+    var exponent = lsb
+    if kept == 16777216 {
+        kept = 8388608
+        exponent = exponent + 1
+    }
+    if kept == 0 {
+        return sign
+    }
+    while kept < 8388608 and exponent > -149 {
+        kept = kept * 2
+        exponent = exponent - 1
+    }
+    if kept < 8388608 {
+        return sign + kept
+    }
+    let biased = exponent + 23 + 127
+    if biased >= 255 {
+        return sign + 2139095040
+    }
+    return sign + biased * 8388608 + (kept - 8388608)
+}
+
+fn ber(value: BigInt) -> [i64] {
+    var groups: [i64] = []
+    var v = value
+    let base = bigint.from_i64(128)
+    while true {
+        let qr = bigint.divmod(v, base) ?? (bigint.zero(), bigint.zero())
+        groups.push(bigint.to_i64(qr.1) ?? 0)
+        v = qr.0
+        if bigint.is_zero(v) {
+            break
+        }
+    }
+    var out: [i64] = []
+    var i = groups.len() - 1
+    while i >= 0 {
+        out.push(if i > 0 { groups[i] + 128 } else { groups[i] })
+        i = i - 1
+    }
+    return out
+}
+
+fn pack_string(inout p: Packer, it: PackItem, value: bytes) {
+    let l = it.letter
+    var n = if it.has_count { it.count } else { 1 }
+    if it.star {
+        n = value.len() + (if l == "Z" { 1 } else { 0 })
+    }
+    var i = 0
+    while i < n {
+        if l == "Z" and i == n - 1 {
+            p.out.push(0)
+        } else if i < value.len() {
+            p.out.push(value.at(i))
+        } else {
+            p.out.push(if l == "A" { 32 } else { 0 })
+        }
+        i = i + 1
+    }
+}
+
+fn pack_bits(inout p: Packer, it: PackItem, value: bytes) {
+    let l = it.letter
+    let per = if l == "b" or l == "B" { 8 } else { 2 }
+    var n = if it.star { value.len() } else if it.has_count { it.count } else { 1 }
+    if n > value.len() and it.star {
+        n = value.len()
+    }
+    var acc = 0
+    var filled = 0
+    var i = 0
+    while i < n {
+        let c = if i < value.len() { value.at(i) } else { 0 }
+        var unit = 0
+        if per == 8 {
+            unit = c.bit_and(1)
+            if l == "b" {
+                acc = acc + unit * pow2(filled)
+            } else {
+                acc = acc + unit * pow2(7 - filled)
+            }
+            filled = filled + 1
+        } else {
+            unit = if (c >= 65 and c <= 90) or (c >= 97 and c <= 122) {
+                (c.bit_and(15) + 9).bit_and(15) } else { c.bit_and(15) }
+            if l == "h" {
+                acc = acc + unit * pow2(4 * filled)
+            } else {
+                acc = acc + unit * pow2(4 * (1 - filled))
+            }
+            filled = filled + 1
+        }
+        if filled == per {
+            p.out.push(acc)
+            acc = 0
+            filled = 0
+        }
+        i = i + 1
+    }
+    if filled > 0 {
+        p.out.push(acc)
+    }
+}
+
+fn pow2(n: i64) -> i64 {
+    var v = 1
+    var i = 0
+    while i < n {
+        v = v * 2
+        i = i + 1
+    }
+    return v
+}
+
+fn pack_one(inout p: Packer, it: PackItem) -> () ! PerlPackError {
+    let value = take(p)
+    try pack_value(p, it, value)
+}
+
+fn pack_value(inout p: Packer, it: PackItem, value: str) -> () ! PerlPackError {
+    let l = it.letter
+    let big = big_endian(it)
+    if l == "f" or l == "d" or l == "F" {
+        let x = as_float(numeric_prefix(value).0)
+        push_float(p, x, l == "f", big)
+        return ()
+    }
+    if l == "U" {
+        let found = numeric_prefix(value)
+        let code = if found.1 { found.0.parse_int() ?? 0 } else {
+            as_float(found.0).as_i64() }
+        for b in utf8_of(code) {
+            p.out.push(b)
+        }
+        return ()
+    }
+    if l == "w" {
+        let found = numeric_prefix(value)
+        let n = if found.1 { bigint.parse(found.0) ?? bigint.zero() } else {
+            cast_bits(as_float(found.0), true) }
+        if bigint.sign(n) < 0 {
+            fail(PackNegativeBer)
+        }
+        for b in ber(n) {
+            p.out.push(b)
+        }
+        return ()
+    }
+    let shape = numeric_shape(it)
+    push_integer(p, integer_bits(value, not shape.1), shape.0, big)
+}
+
+/// `n/A` and its relatives: a count written from the length of the value that
+/// follows it, which is how Perl reads a length-prefixed string in one
+/// template rather than two calls.
+fn pack_counted(inout p: Packer, count_item: PackItem,
+    target: PackItem) -> () ! PerlPackError {
+    let value = take(p).to_bytes()
+    var length = value.len()
+    if target.letter == "Z" and (target.star or not target.has_count) {
+        length = length + 1
+    }
+    if target.has_count and not target.star {
+        length = if target.count < length { target.count } else { length }
+    }
+    try pack_value(p, count_item, "{length}")
+    var body = target
+    body.star = not target.has_count or target.star
+    body.has_count = true
+    body.count = length
+    if target.letter == "Z" {
+        body.star = false
+    }
+    pack_string(p, body, value)
+}
+
+/// `x`, `X` and `@`: the three that move the cursor rather than write a
+/// value. `@` is an absolute position from the start of the current group,
+/// which is why it can shorten what has already been written.
+fn pack_position(inout p: Packer, it: PackItem) -> () ! PerlPackError {
+    let l = it.letter
+    let n = if it.star { 0 } else if it.has_count { it.count } else { 1 }
+    if l == "x" {
+        if it.bang {
+            while n > 0 and p.out.len() % n != 0 {
+                p.out.push(0)
+            }
+        } else {
+            var k = 0
+            while k < n {
+                p.out.push(0)
+                k = k + 1
+            }
+        }
+        return ()
+    }
+    if l == "X" {
+        let back = if it.bang { (if n > 0 { p.out.len() % n } else { 0 }) } else { n }
+        if back > p.out.len() {
+            fail(PackOutside("'X' outside of string in pack"))
+        }
+        p.out = p.out.slice(0, p.out.len() - back)
+        return ()
+    }
+    let target = p.group_start + (if it.has_count and not it.star { it.count } else {
+        0 })
+    if target < p.out.len() {
+        p.out = p.out.slice(0, target)
+    }
+    while p.out.len() < target {
+        p.out.push(0)
+    }
+}
+
+fn pack_items(inout p: Packer, items: [PackItem]) -> () ! PerlPackError {
+    var index = 0
+    while index < items.len() {
+        let it = items[index]
+        let l = it.letter
+        if it.slash and index + 1 < items.len() {
+            try pack_counted(p, it, items[index + 1])
+            index = index + 2
+            continue
+        }
+        if l == "(" {
+            let repeat = if it.star { -1 } else if it.has_count { it.count } else { 1 }
+            var r = 0
+            while (repeat < 0 and p.next < p.args.len()) or (repeat >= 0 and r < repeat) {
+                let saved = p.group_start
+                p.group_start = p.out.len()
+                try pack_items(p, it.group)
+                p.group_start = saved
+                r = r + 1
+            }
+        } else if l == "a" or l == "A" or l == "Z" {
+            pack_string(p, it, take(p).to_bytes())
+        } else if l == "b" or l == "B" or l == "h" or l == "H" {
+            pack_bits(p, it, take(p).to_bytes())
+        } else if l == "x" or l == "X" or l == "@" {
+            try pack_position(p, it)
+        } else {
+            let times = if it.star { p.args.len() - p.next } else if it.has_count {
+                it.count } else { 1 }
+            var k = 0
+            while k < times {
+                try pack_one(p, it)
+                k = k + 1
+            }
+        }
+        index = index + 1
+    }
+}
+
+/// `pack(template, values...)`, the values given as Perl would stringify
+/// them.
+pub fn pack(template: str, values: [str]) -> bytes ! PerlPackError {
+    let items = try parse_template(template)
+    var p = Packer{ out: [], group_start: 0, args: values, next: 0 }
+    try pack_items(p, items)
+    return bytes_of(p.out)
+}
+
+// ---------------------------------------------------------------------------
+// unpack
+
+type Unpacker = {
+    data: bytes,
+    at: i64,
+    group_start: i64,
+    out: [str],
+}
+
+fn unpack_integer(data: bytes, at: i64, width: i64, signed: bool, big: bool) -> str {
+    var value = bigint.zero()
+    let base = bigint.from_i64(256)
+    var i = 0
+    while i < width {
+        let b = if big { data.at(at + i) } else { data.at(at + width - 1 - i) }
+        value = bigint.add(bigint.mul(value, base), bigint.from_i64(b))
+        i = i + 1
+    }
+    let half = bigint.pow(bigint.from_i64(2), 8 * width - 1)
+    if signed and bigint.compare(value, half) >= 0 {
+        value = bigint.sub(value, bigint.mul(half, bigint.from_i64(2)))
+    }
+    return bigint.to_str(value)
+}
+
+/// A double as Perl prints it: `%.15g`, `Inf`, `-Inf`, `NaN`.
+pub fn perl_number_text(x: f64) -> str {
+    if x != x {
+        return "NaN"
+    }
+    if x - x != 0.0 {
+        return if x > 0.0 { "Inf" } else { "-Inf" }
+    }
+    return luaformat.c_g(x, 15)
+}
+
+fn single_to_double(bits: i64) -> f64 {
+    let negative = bits.ushr(31).bit_and(1) == 1
+    let raw = bits.ushr(23).bit_and(255)
+    let fraction = bits.bit_and(8388607)
+    var magnitude = 0.0
+    if raw == 255 {
+        magnitude = if fraction == 0 { (9218868437227405312).from_bits() } else {
+            (9221120237041090560).from_bits() }
+    } else if raw == 0 {
+        magnitude = fraction.as_f64() * pow2f(-149)
+    } else {
+        magnitude = (fraction + 8388608).as_f64() * pow2f(raw - 150)
+    }
+    return if negative { -1.0 * magnitude } else { magnitude }
+}
+
+fn pow2f(n: i64) -> f64 {
+    var v = 1.0
+    var i = 0
+    if n >= 0 {
+        while i < n {
+            v = v * 2.0
+            i = i + 1
+        }
+    } else {
+        while i < 0 - n {
+            v = v * 0.5
+            i = i + 1
+        }
+    }
+    return v
+}
+
+fn is_perl_space(b: i64) -> bool {
+    return b == 0 or b == 32 or (b >= 9 and b <= 13)
+}
+
+fn unpack_string(inout u: Unpacker, it: PackItem, count: i64, star: bool) {
+    let l = it.letter
+    let left = u.data.len() - u.at
+    var n = if star { left } else { count }
+    if n > left {
+        n = left
+    }
+    var chunk = u.data.slice(u.at, u.at + n)
+    if l == "Z" {
+        var end = 0
+        while end < chunk.len() and chunk.at(end) != 0 {
+            end = end + 1
+        }
+        if star and end < left {
+            n = end + 1
+        }
+        chunk = chunk.slice(0, end)
+    } else if l == "A" {
+        var end = chunk.len()
+        while end > 0 and is_perl_space(chunk.at(end - 1)) {
+            end = end - 1
+        }
+        chunk = chunk.slice(0, end)
+    }
+    u.out.push(chunk.to_str())
+    u.at = u.at + n
+}
+
+fn unpack_bits(inout u: Unpacker, it: PackItem, count: i64, star: bool) {
+    let l = it.letter
+    let per = if l == "b" or l == "B" { 8 } else { 2 }
+    let left = (u.data.len() - u.at) * per
+    var n = if star { left } else { count }
+    if n > left {
+        n = left
+    }
+    var text = ""
+    var i = 0
+    while i < n {
+        let b = u.data.at(u.at + i / per)
+        if per == 8 {
+            let bit = if l == "b" { b.ushr(i % 8).bit_and(1) } else {
+                b.ushr(7 - i % 8).bit_and(1) }
+            text = text + "{bit}"
+        } else {
+            let nybble = if l == "h" { b.ushr(4 * (i % 2)).bit_and(15) } else {
+                b.ushr(4 * (1 - i % 2)).bit_and(15) }
+            text = text + "0123456789abcdef".substr(nybble, 1)
+        }
+        i = i + 1
+    }
+    u.out.push(text)
+    u.at = u.at + (n + per - 1) / per
+}
+
+/// One numeric value at the cursor, or `None` when the data runs out.
+fn unpack_number(inout u: Unpacker, it: PackItem) -> Option[str] {
+    let l = it.letter
+    let big = big_endian(it)
+    if l == "U" {
+        if u.at >= u.data.len() {
+            return None
+        }
+        let b = u.data.at(u.at)
+        u.at = u.at + 1
+        return Some("{b}")
+    }
+    if l == "w" {
+        var value = bigint.zero()
+        var i = u.at
+        while i < u.data.len() {
+            let b = u.data.at(i)
+            value = bigint.add(bigint.mul(value, bigint.from_i64(128)),
+                bigint.from_i64(b % 128))
+            i = i + 1
+            if b < 128 {
+                u.at = i
+                return Some(bigint.to_str(value))
+            }
+        }
+        return None
+    }
+    let width = if l == "f" { 4 } else if l == "d" or l == "F" { 8 } else {
+        numeric_shape(it).0 }
+    if u.at + width > u.data.len() {
+        return None
+    }
+    var text = ""
+    if l == "f" or l == "d" or l == "F" {
+        var bits = 0
+        var i = 0
+        while i < width {
+            let b = if big { u.data.at(u.at + i) } else { u.data.at(u.at + width - 1 - i) }
+            bits = bits.shl(8).bit_or(b)
+            i = i + 1
+        }
+        let x = if l == "f" { single_to_double(bits) } else { bits.from_bits() }
+        text = perl_number_text(x)
+    } else {
+        text = unpack_integer(u.data, u.at, width, numeric_shape(it).1, big)
+    }
+    u.at = u.at + width
+    return Some(text)
+}
+
+fn unpack_items(inout u: Unpacker, items: [PackItem]) -> () ! PerlPackError {
+    var index = 0
+    var carried = -1
+    while index < items.len() {
+        let it = items[index]
+        let l = it.letter
+        var count = if it.has_count { it.count } else { 1 }
+        var star = it.star
+        if carried >= 0 {
+            count = carried
+            star = false
+            carried = -1
+        }
+        if it.slash {
+            match unpack_number(u, it) {
+                Some(text) -> carried = text.parse_int() ?? 0
+                None -> fail(PackOutside("'/' must follow a numeric type in unpack"))
+            }
+            index = index + 1
+            continue
+        }
+        if l == "(" {
+            var r = 0
+            while (star and u.at < u.data.len()) or (not star and r < count) {
+                let saved = u.group_start
+                u.group_start = u.at
+                try unpack_items(u, it.group)
+                u.group_start = saved
+                r = r + 1
+            }
+        } else if l == "a" or l == "A" or l == "Z" {
+            unpack_string(u, it, count, star)
+        } else if l == "b" or l == "B" or l == "h" or l == "H" {
+            unpack_bits(u, it, count, star)
+        } else if l == "x" or l == "X" or l == "@" {
+            try unpack_move(u, it, count, star)
+        } else {
+            var k = 0
+            while star or k < count {
+                match unpack_number(u, it) {
+                    Some(text) -> u.out.push(text)
+                    None -> break
+                }
+                k = k + 1
+            }
+        }
+        index = index + 1
+    }
+}
+
+fn unpack_move(inout u: Unpacker, it: PackItem, count: i64, star: bool) -> () ! PerlPackError {
+    let l = it.letter
+    if l == "x" {
+        let n = if star { u.data.len() - u.at } else if it.bang {
+            (if count > 0 { (count - u.at % count) % count } else { 0 }) } else { count }
+        if u.at + n > u.data.len() {
+            fail(PackOutside("'x' outside of string in unpack"))
+        }
+        u.at = u.at + n
+        return ()
+    }
+    if l == "X" {
+        let n = if star { 0 } else if it.bang {
+            (if count > 0 { u.at % count } else { 0 }) } else { count }
+        if n > u.at {
+            fail(PackOutside("'X' outside of string in unpack"))
+        }
+        u.at = u.at - n
+        return ()
+    }
+    let target = u.group_start + (if star { 0 } else { count })
+    if target > u.data.len() {
+        fail(PackOutside("'@' outside of string in unpack"))
+    }
+    u.at = target
+}
+
+/// `unpack(template, data)`, each value as Perl would print it.
+pub fn unpack(template: str, data: bytes) -> [str] ! PerlPackError {
+    let items = try parse_template(template)
+    var u = Unpacker{ data: data, at: 0, group_start: 0, out: [] }
+    try unpack_items(u, items)
+    return u.out
+}

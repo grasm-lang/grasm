@@ -1,0 +1,28 @@
+[package]
+name = "langs_demo"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.jsnumber]
+path = "../jsnumber"
+version = "^1.0.0"
+
+[dependencies.tcllist]
+path = "../tcllist"
+version = "^1.0.0"
+
+[dependencies.luaformat]
+path = "../luaformat"
+version = "^1.0.0"
+
+[dependencies.rubymarshal]
+path = "../rubymarshal"
+version = "^1.0.0"
+
+[dependencies.perlpack]
+path = "../perlpack"
+version = "^1.0.0"
+
+[dependencies.bigint]
+path = "../bigint"
+version = "^1.0.0"

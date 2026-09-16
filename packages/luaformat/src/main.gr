@@ -1,0 +1,584 @@
+// Lua's text for its values: string literals, `%q`, `tostring` and
+// `tonumber`.
+//
+// Lua is embedded in more programs than it is run on its own — Neovim,
+// Redis, nginx through OpenResty, Roblox, a long list of games, Wireshark,
+// HAProxy — and those programs pass data to and from Lua as text: a
+// configuration written as a Lua table, a value serialised with
+// `string.format("%q", v)` to be `load`ed back, a number printed by
+// `tostring`. Producing that text outside Lua, or reading it, means Lua's
+// exact rules, which are Lua 5.5's here:
+//
+// - **String literals** in quotes take `\n`-style escapes, `\ddd` in
+//   decimal up to 255, `\xhh` with exactly two digits, `\u{h...}` up to
+//   2^31 written as extended UTF-8 of up to six bytes, `\z` to skip the
+//   white space after it, and a backslash before a line break for a line
+//   break. Long brackets `[==[ ... ]==]` take nothing, drop a line break
+//   straight after the opening, and write every line break as `\n`.
+// - **`%q`** escapes only `"`, `\` and newline with a backslash and control
+//   characters as decimal — three digits when a digit follows — and writes
+//   floats in hexadecimal so they read back exactly: `0x1.999999999999ap-4`,
+//   with `1e9999` for infinity and `(0/0)` for NaN.
+// - **`tostring`** writes a float with `%.15g`, or `%.17g` when fifteen
+//   digits do not read back, and adds `.0` when the result looks like an
+//   integer.
+// - **`tonumber`** reads an integer when it can — hex wraps around, decimal
+//   that overflows becomes a float instead — then a float, decimal or hex,
+//   and never `inf` or `nan`.
+//
+// Checked against `lua` 5.5: `load` of generated literals, `string.format`
+// and `tostring` of doubles across the range, and `tonumber` of numerals
+// built to hit every rule.
+
+import floatmath
+import shortestfloat
+
+type LuaFormatError =
+    | LuaUnfinishedString
+    | LuaInvalidEscape(at: i64, why: str)
+    | LuaNotALiteral
+
+/// A number as Lua holds it: an integer or a float.
+type LuaNumber = {
+    is_integer: bool,
+    integer: i64,
+    float: f64,
+}
+
+let MIN_INTEGER = -9223372036854775807 - 1
+
+fn is_digit(c: i64) -> bool {
+    return c >= 48 and c <= 57
+}
+
+fn is_hex(c: i64) -> bool {
+    return is_digit(c) or (c >= 97 and c <= 102) or (c >= 65 and c <= 70)
+}
+
+fn hex_value(c: i64) -> i64 {
+    return if c <= 57 { c - 48 } else if c >= 97 { c - 87 } else { c - 55 }
+}
+
+fn is_space(c: i64) -> bool {
+    return c == 32 or (c >= 9 and c <= 13)
+}
+
+/// `string.format("%q", s)` for a string's bytes.
+pub fn quote_string(data: bytes) -> bytes {
+    var out: [i64] = [34]
+    var i = 0
+    while i < data.len() {
+        let c = data.at(i)
+        if c == 34 or c == 92 or c == 10 {
+            out.push(92)
+            out.push(c)
+        } else if c < 32 or c == 127 {
+            let next_digit = i + 1 < data.len() and is_digit(data.at(i + 1))
+            let text = if next_digit { "{c}".pad_start(3, "0") } else { "{c}" }
+            out.push(92)
+            for d in text.to_bytes().to_list() {
+                out.push(d)
+            }
+        } else {
+            out.push(c)
+        }
+        i = i + 1
+    }
+    out.push(34)
+    return bytes_of(out)
+}
+
+/// `string.format("%q", n)` for an integer; the smallest one has no decimal
+/// literal, so it is written in hex.
+pub fn quote_integer(n: i64) -> str {
+    if n == MIN_INTEGER {
+        return "0x8000000000000000"
+    }
+    return "{n}"
+}
+
+fn hex_digit(v: i64) -> str {
+    return "0123456789abcdef".substr(v, 1)
+}
+
+/// C's `%a` for a double as this C library writes it: normalised to a
+/// leading 1 even below the smallest normal, trailing zeros dropped.
+pub fn hex_float(x: f64) -> str {
+    let bits = x.to_bits()
+    let sign = if bits < 0 { "-" } else { "" }
+    let raw = bits.ushr(52).bit_and(2047)
+    var fraction = bits.bit_and(4503599627370495)
+    if raw == 0 and fraction == 0 {
+        return sign + "0x0p+0"
+    }
+    var exponent = raw - 1023
+    if raw == 0 {
+        exponent = -1022
+        while fraction < 4503599627370496 {
+            fraction = fraction * 2
+            exponent = exponent - 1
+        }
+        fraction = fraction - 4503599627370496
+    }
+    var digits = ""
+    var shift = 48
+    while shift >= 0 {
+        digits = digits + hex_digit(fraction.ushr(shift).bit_and(15))
+        shift = shift - 4
+    }
+    while digits.ends_with("0") {
+        digits = digits.substr(0, digits.len() - 1)
+    }
+    let point = if digits.len() > 0 { "." + digits } else { "" }
+    let esign = if exponent < 0 { "-" } else { "+" }
+    let magnitude = if exponent < 0 { 0 - exponent } else { exponent }
+    return sign + "0x1" + point + "p" + esign + "{magnitude}"
+}
+
+/// `string.format("%q", x)` for a float.
+pub fn quote_float(x: f64) -> str {
+    if x != x {
+        return "(0/0)"
+    }
+    if x - x != 0.0 {
+        return if x > 0.0 { "1e9999" } else { "-1e9999" }
+    }
+    return hex_float(x)
+}
+
+/// C's `%.<precision>g`, correctly rounded.
+pub fn c_g(x: f64, precision: i64) -> str {
+    if x != x {
+        // This C library prints a NaN as `nan` whatever its sign bit.
+        return "nan"
+    }
+    if x - x != 0.0 {
+        return if x > 0.0 { "inf" } else { "-inf" }
+    }
+    let p = shortestfloat.significant(x, precision)
+    let sign = if p.negative { "-" } else { "" }
+    if x == 0.0 {
+        return sign + "0"
+    }
+    let exponent = p.point - 1
+    let digits = p.digits
+    if exponent < -4 or exponent >= precision {
+        var mantissa = digits.substr(0, 1) + "." + digits.substr(1, digits.len())
+        while mantissa.ends_with("0") {
+            mantissa = mantissa.substr(0, mantissa.len() - 1)
+        }
+        if mantissa.ends_with(".") {
+            mantissa = mantissa.substr(0, mantissa.len() - 1)
+        }
+        let esign = if exponent < 0 { "-" } else { "+" }
+        let magnitude = if exponent < 0 { 0 - exponent } else { exponent }
+        return sign + mantissa + "e" + esign + "{magnitude}".pad_start(2, "0")
+    }
+    var whole = "0"
+    var fraction = ""
+    if p.point <= 0 {
+        fraction = "0".repeat(0 - p.point) + digits
+    } else {
+        whole = digits.substr(0, p.point)
+        fraction = digits.substr(p.point, digits.len())
+    }
+    while fraction.ends_with("0") {
+        fraction = fraction.substr(0, fraction.len() - 1)
+    }
+    return sign + whole + (if fraction.len() > 0 { "." + fraction } else { "" })
+}
+
+/// `tostring` of a float.
+pub fn tostring_float(x: f64) -> str {
+    var text = c_g(x, 15)
+    let back = text.parse_float() ?? 0.0
+    if x == x and back.to_bits() != x.to_bits() {
+        text = c_g(x, 17)
+    }
+    var plain = true
+    for c in text.codes() {
+        if c != 45 and not is_digit(c) {
+            plain = false
+        }
+    }
+    return if plain { text + ".0" } else { text }
+}
+
+fn push_utf8(inout out: [i64], value: i64) {
+    if value < 128 {
+        out.push(value)
+        return
+    }
+    // Lua's own encoder: up to six bytes, for values up to 2^31 - 1.
+    var tail: [i64] = []
+    var v = value
+    var first_max = 63
+    while v > first_max {
+        tail.push(128 + v % 64)
+        v = v / 64
+        first_max = first_max / 2
+    }
+    let lead = (255 - (first_max * 2 + 1)) % 256 + v
+    out.push(lead)
+    var i = tail.len() - 1
+    while i >= 0 {
+        out.push(tail[i])
+        i = i - 1
+    }
+}
+
+/// Past a line break at `at`: `\r\n` and `\n\r` count as one.
+fn skip_newline(data: bytes, at: i64) -> i64 {
+    let c = data.at(at)
+    if at + 1 < data.len() and (data.at(at + 1) == 10 or data.at(at + 1) == 13) and
+    data.at(at + 1) != c {
+        return at + 2
+    }
+    return at + 1
+}
+
+fn escape(data: bytes, at: i64, inout out: [i64]) -> i64 ! LuaFormatError {
+    if at >= data.len() {
+        fail(LuaUnfinishedString)
+    }
+    let c = data.at(at)
+    let simple = [(97, 7), (98, 8), (102, 12), (110, 10), (114, 13), (116, 9),
+        (118, 11), (92, 92), (34, 34), (39, 39)]
+    for pair in simple {
+        if c == pair.0 {
+            out.push(pair.1)
+            return at + 1
+        }
+    }
+    if c == 10 or c == 13 {
+        out.push(10)
+        return skip_newline(data, at)
+    }
+    if c == 120 {
+        if at + 2 >= data.len() or not is_hex(data.at(at + 1)) or not is_hex(data.at(at + 2)) {
+            fail(LuaInvalidEscape(at, "hexadecimal digit expected"))
+        }
+        out.push(hex_value(data.at(at + 1)) * 16 + hex_value(data.at(at + 2)))
+        return at + 3
+    }
+    if c == 122 {
+        var i = at + 1
+        while i < data.len() and is_space(data.at(i)) {
+            i = i + 1
+        }
+        return i
+    }
+    if c == 117 {
+        return try utf8_escape(data, at, out)
+    }
+    if not is_digit(c) {
+        fail(LuaInvalidEscape(at, "invalid escape sequence"))
+    }
+    var value = 0
+    var i = at
+    while i < data.len() and i < at + 3 and is_digit(data.at(i)) {
+        value = value * 10 + data.at(i) - 48
+        i = i + 1
+    }
+    if value > 255 {
+        fail(LuaInvalidEscape(at, "decimal escape too large"))
+    }
+    out.push(value)
+    return i
+}
+
+fn utf8_escape(data: bytes, at: i64, inout out: [i64]) -> i64 ! LuaFormatError {
+    if at + 1 >= data.len() or data.at(at + 1) != 123 {
+        fail(LuaInvalidEscape(at, "missing '\{' in \\u\{xxxx\}"))
+    }
+    var i = at + 2
+    var value = 0
+    var digits = 0
+    while i < data.len() and is_hex(data.at(i)) {
+        value = value * 16 + hex_value(data.at(i))
+        if value > 2147483647 {
+            fail(LuaInvalidEscape(at, "UTF-8 value too large"))
+        }
+        digits = digits + 1
+        i = i + 1
+    }
+    if digits == 0 {
+        fail(LuaInvalidEscape(at, "hexadecimal digit expected"))
+    }
+    if i >= data.len() or data.at(i) != 125 {
+        fail(LuaInvalidEscape(at, "missing '\}' in \\u\{xxxx\}"))
+    }
+    push_utf8(out, value)
+    return i + 1
+}
+
+/// The level of a long bracket opening at `at` — the number of `=` — or -1.
+fn long_level(data: bytes, at: i64) -> i64 {
+    if at >= data.len() or data.at(at) != 91 {
+        return -1
+    }
+    var i = at + 1
+    while i < data.len() and data.at(i) == 61 {
+        i = i + 1
+    }
+    return if i < data.len() and data.at(i) == 91 { i - at - 1 } else { -1 }
+}
+
+fn read_long(data: bytes, level: i64) -> bytes ! LuaFormatError {
+    var i = level + 2
+    if i < data.len() and (data.at(i) == 10 or data.at(i) == 13) {
+        i = skip_newline(data, i)
+    }
+    var out: [i64] = []
+    while i < data.len() {
+        let c = data.at(i)
+        if c == 93 {
+            var j = i + 1
+            while j < data.len() and data.at(j) == 61 {
+                j = j + 1
+            }
+            if j - i - 1 == level and j < data.len() and data.at(j) == 93 {
+                if j + 1 != data.len() {
+                    fail(LuaNotALiteral)
+                }
+                return bytes_of(out)
+            }
+            out.push(c)
+            i = i + 1
+        } else if c == 10 or c == 13 {
+            out.push(10)
+            i = skip_newline(data, i)
+        } else {
+            out.push(c)
+            i = i + 1
+        }
+    }
+    fail(LuaUnfinishedString)
+}
+
+/// The bytes a whole string literal stands for: quoted with `"` or `'`, or
+/// in long brackets.
+pub fn read_string(literal: bytes) -> bytes ! LuaFormatError {
+    if literal.len() == 0 {
+        fail(LuaNotALiteral)
+    }
+    let level = long_level(literal, 0)
+    if level >= 0 {
+        return try read_long(literal, level)
+    }
+    let quote = literal.at(0)
+    if quote != 34 and quote != 39 {
+        fail(LuaNotALiteral)
+    }
+    var out: [i64] = []
+    var i = 1
+    while true {
+        if i >= literal.len() {
+            fail(LuaUnfinishedString)
+        }
+        let c = literal.at(i)
+        if c == quote {
+            if i + 1 != literal.len() {
+                fail(LuaNotALiteral)
+            }
+            return bytes_of(out)
+        }
+        if c == 10 or c == 13 {
+            fail(LuaUnfinishedString)
+        }
+        if c == 92 {
+            i = try escape(literal, i + 1, out)
+        } else {
+            out.push(c)
+            i = i + 1
+        }
+    }
+    fail(LuaUnfinishedString)
+}
+
+fn integer_of(codes: [i64]) -> Option[i64] {
+    var i = 0
+    while i < codes.len() and is_space(codes[i]) {
+        i = i + 1
+    }
+    var negative = false
+    if i < codes.len() and (codes[i] == 45 or codes[i] == 43) {
+        negative = codes[i] == 45
+        i = i + 1
+    }
+    var high = 0
+    var low = 0
+    var empty = true
+    let hex = i + 1 < codes.len() and codes[i] == 48 and
+    (codes[i + 1] == 120 or codes[i + 1] == 88)
+    if hex {
+        i = i + 2
+        while i < codes.len() and is_hex(codes[i]) {
+            // Wraps around, as unsigned arithmetic does: keep two 32-bit halves.
+            let l = low * 16 + hex_value(codes[i])
+            high = (high * 16 + l / 4294967296) % 4294967296
+            low = l % 4294967296
+            empty = false
+            i = i + 1
+        }
+    } else {
+        var value = 0
+        var smallest = false
+        while i < codes.len() and is_digit(codes[i]) {
+            let d = codes[i] - 48
+            let limit = if negative { 8 } else { 7 }
+            if smallest or value > 922337203685477580 or
+            (value == 922337203685477580 and d > limit) {
+                return None
+            }
+            if value == 922337203685477580 and d == 8 {
+                // 2^63 itself, which only fits negated.
+                smallest = true
+            } else {
+                value = value * 10 + d
+            }
+            empty = false
+            i = i + 1
+        }
+        high = value / 4294967296
+        low = value % 4294967296
+        if smallest {
+            high = 2147483648
+            low = 0
+        }
+    }
+    while i < codes.len() and is_space(codes[i]) {
+        i = i + 1
+    }
+    if empty or i != codes.len() {
+        return None
+    }
+    let unsigned_high = high
+    var magnitude = if unsigned_high >= 2147483648 {
+        (unsigned_high - 4294967296) * 4294967296 + low } else {
+        unsigned_high * 4294967296 + low }
+    if negative {
+        magnitude = if magnitude == MIN_INTEGER { MIN_INTEGER } else {
+            0 - magnitude }
+    }
+    return Some(magnitude)
+}
+
+/// The end of a `strtod` numeral at `at`, and its text in a form this reads.
+fn strtod_end(codes: [i64], at: i64) -> (i64, bool) {
+    var i = at
+    let hex = i + 1 < codes.len() and codes[i] == 48 and
+    (codes[i + 1] == 120 or codes[i + 1] == 88)
+    let digit = if hex { is_hex } else { is_digit }
+    var j = if hex { i + 2 } else { i }
+    var count = 0
+    while j < codes.len() and digit(codes[j]) {
+        j = j + 1
+        count = count + 1
+    }
+    if j < codes.len() and codes[j] == 46 {
+        var k = j + 1
+        var fraction = 0
+        while k < codes.len() and digit(codes[k]) {
+            k = k + 1
+            fraction = fraction + 1
+        }
+        if count + fraction > 0 {
+            j = k
+            count = count + fraction
+        }
+    }
+    if count == 0 {
+        // Only the `0` of a `0x` with no digits is a number.
+        return if hex { (i + 1, false) } else { (i, false) }
+    }
+    let marker = if hex { 112 } else { 101 }
+    if j < codes.len() and (codes[j] == marker or codes[j] == marker - 32) {
+        var k = j + 1
+        if k < codes.len() and (codes[k] == 43 or codes[k] == 45) {
+            k = k + 1
+        }
+        let start = k
+        while k < codes.len() and is_digit(codes[k]) {
+            k = k + 1
+        }
+        if k > start {
+            j = k
+        }
+    }
+    return (j, hex)
+}
+
+fn text_of(codes: [i64], from: i64, to: i64) -> str {
+    var out = ""
+    var i = from
+    while i < to {
+        out = out + codes[i].to_char()
+        i = i + 1
+    }
+    return out
+}
+
+fn float_of(codes: [i64]) -> Option[f64] {
+    for c in codes {
+        if c == 110 or c == 78 {
+            return None
+        }
+    }
+    var i = 0
+    while i < codes.len() and is_space(codes[i]) {
+        i = i + 1
+    }
+    var negative = false
+    if i < codes.len() and (codes[i] == 45 or codes[i] == 43) {
+        negative = codes[i] == 45
+        i = i + 1
+    }
+    let found = strtod_end(codes, i)
+    if found.0 == i {
+        return None
+    }
+    var end = found.0
+    let text = text_of(codes, i, end)
+    while end < codes.len() and is_space(codes[end]) {
+        end = end + 1
+    }
+    if end != codes.len() {
+        return None
+    }
+    var value = 0.0
+    if found.1 {
+        value = floatmath.from_hex(text) ?? 0.0
+    } else {
+        var t = text
+        if t.starts_with(".") {
+            t = "0" + t
+        }
+        t = t.replace(".e", ".0e").replace(".E", ".0E")
+        if t.ends_with(".") {
+            t = t + "0"
+        }
+        value = t.parse_float() ?? 0.0
+    }
+    return Some(if negative { 0.0 - value } else { value })
+}
+
+/// `tonumber(text)`: an integer if the text is one that fits, else a float.
+pub fn tonumber(text: str) -> Option[LuaNumber] {
+    let codes = text.codes()
+    match integer_of(codes) {
+        Some(n) -> return Some(LuaNumber{ is_integer: true, integer: n,
+            float: 0.0 })
+        None -> {}
+    }
+    match float_of(codes) {
+        Some(x) -> return Some(LuaNumber{ is_integer: false, integer: 0,
+            float: x })
+        None -> return None
+    }
+}
+
+/// `tostring` of a Lua number.
+pub fn tostring(n: LuaNumber) -> str {
+    return if n.is_integer { "{n.integer}" } else { tostring_float(n.float) }
+}

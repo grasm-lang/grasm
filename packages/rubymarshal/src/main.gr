@@ -1,0 +1,722 @@
+// Ruby's `Marshal` format, version 4.8.
+//
+// Rails caches, Sidekiq and Resque job arguments before they switched to
+// JSON, `Rack::Session::Cookie` sessions, gem specifications inside `.gem`
+// files, and years of objects in Memcached and Redis are `Marshal.dump`
+// output. Reading them from outside Ruby means reading a format documented
+// only by `marshal.c`:
+//
+// - integers are packed in one to five bytes, small ones in one; anything
+//   outside ±2^30 is a bignum of 16-bit digits;
+// - floats are text, the shortest that reads back, laid out Ruby's way —
+//   `1e2`, `123456.789`, `1e-5`, `inf`;
+// - a string's encoding is an instance variable wrapped around it — `E`
+//   true for UTF-8, false for US-ASCII, or `encoding` with a name — and a
+//   string without one is binary;
+// - every symbol after its first appearance is a back-reference by number,
+//   and so is every object seen before, so a shared string is read back as
+//   one string;
+// - objects, structs, regexps, classes and modules name their class, and a
+//   user-defined `_dump` or `marshal_dump` carries its own payload.
+//
+// Nothing is instantiated: an object is its class name and its instance
+// variables, which is what makes reading untrusted `Marshal` data here safe
+// where `Marshal.load` in Ruby is not. A reference to an object still being
+// read — which only a cyclic structure produces — is refused.
+//
+// `dump` writes what `Marshal.dump` writes, byte for byte, for any value
+// `load` returned, back-references included.
+//
+// Checked against Ruby 2.6's `Marshal.dump` and `Marshal.load`.
+
+import bigint
+import shortestfloat
+
+type RubyValue =
+    | RubyNil
+    | RubyBool(value: bool)
+    | RubyInteger(value: BigInt)
+    | RubyFloat(value: f64)
+    /// `encoding` is `""` for binary, else a name such as `UTF-8`.
+    | RubyString(data: bytes, encoding: str)
+    | RubySymbol(name: str)
+    | RubyArray(items: [ref RubyValue])
+    | RubyHash(keys: [ref RubyValue], values: [ref RubyValue], default: [ref RubyValue])
+    | RubyObject(class_name: str, names: [str], values: [ref RubyValue])
+    | RubyStruct(class_name: str, names: [str], values: [ref RubyValue])
+    | RubyRegexp(source: bytes, options: i64, encoding: str)
+    | RubyClass(name: str)
+    | RubyModule(name: str)
+    | RubyUserDefined(class_name: str, data: bytes, encoding: str)
+    | RubyUserMarshal(class_name: str, value: ref RubyValue)
+    | RubySubclass(class_name: str, value: ref RubyValue)
+
+type RubyMarshalError =
+    | RubyTruncated(at: i64)
+    | RubyBadVersion(major: i64, minor: i64)
+    | RubyUnknownType(at: i64, code: i64)
+    | RubyBadLink(at: i64)
+    | RubyRefused(at: i64, what: str)
+
+type RubyReader = {
+    data: bytes,
+    at: i64,
+    symbols: [str],
+    objects: [ref RubyValue],
+    complete: [bool],
+}
+
+fn byte(inout r: RubyReader) -> i64 ! RubyMarshalError {
+    if r.at >= r.data.len() {
+        fail(RubyTruncated(r.at))
+    }
+    let b = r.data.at(r.at)
+    r.at = r.at + 1
+    return b
+}
+
+/// `r_long`: the packed integer.
+fn long(inout r: RubyReader) -> i64 ! RubyMarshalError {
+    let c = try byte(r)
+    if c == 0 {
+        return 0
+    }
+    let signed = if c >= 128 { c - 256 } else { c }
+    if signed > 4 {
+        return signed - 5
+    }
+    if signed < -4 {
+        return signed + 5
+    }
+    var value = 0
+    var i = 0
+    if signed > 0 {
+        while i < signed {
+            value = value + (try byte(r)) * pow256(i)
+            i = i + 1
+        }
+        return value
+    }
+    let count = 0 - signed
+    value = -1
+    while i < count {
+        let b = try byte(r)
+        value = value - (255 - b) * pow256(i)
+        i = i + 1
+    }
+    return value
+}
+
+fn pow256(n: i64) -> i64 {
+    var v = 1
+    var i = 0
+    while i < n {
+        v = v * 256
+        i = i + 1
+    }
+    return v
+}
+
+fn chunk(inout r: RubyReader) -> bytes ! RubyMarshalError {
+    let n = try long(r)
+    if n < 0 or r.at + n > r.data.len() {
+        fail(RubyTruncated(r.at))
+    }
+    let out = r.data.slice(r.at, r.at + n)
+    r.at = r.at + n
+    return out
+}
+
+fn register(inout r: RubyReader) -> i64 {
+    r.objects.push(ref(RubyNil))
+    r.complete.push(false)
+    return r.objects.len() - 1
+}
+
+fn settle(inout r: RubyReader, slot: i64, value: ref RubyValue) -> ref RubyValue {
+    r.objects[slot] = value
+    r.complete[slot] = true
+    return value
+}
+
+fn symbol(inout r: RubyReader) -> str ! RubyMarshalError {
+    let start = r.at
+    let code = try byte(r)
+    if code == 59 {
+        let index = try long(r)
+        if index < 0 or index >= r.symbols.len() {
+            fail(RubyBadLink(start))
+        }
+        return r.symbols[index]
+    }
+    if code == 58 {
+        let name = (try chunk(r)).to_str()
+        r.symbols.push(name)
+        return name
+    }
+    if code == 73 {
+        // A symbol with an encoding: the name, then its instance variables.
+        if (try byte(r)) != 58 {
+            fail(RubyUnknownType(start, code))
+        }
+        let name = (try chunk(r)).to_str()
+        r.symbols.push(name)
+        let count = try long(r)
+        var i = 0
+        while i < count {
+            let _key = try symbol(r)
+            let _value = try read(r)
+            i = i + 1
+        }
+        return name
+    }
+    fail(RubyUnknownType(start, code))
+}
+
+/// The encoding named by a string's instance variables.
+fn encoding_of(names: [str], values: [ref RubyValue]) -> str {
+    var i = 0
+    while i < names.len() {
+        if names[i] == "E" {
+            match values[i] {
+                RubyBool(b) -> return if b { "UTF-8" } else { "US-ASCII" }
+                _ -> {}
+            }
+        }
+        if names[i] == "encoding" {
+            match values[i] {
+                RubyString(d, _e) -> return d.to_str()
+                _ -> {}
+            }
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn ivars(inout r: RubyReader) -> ([str], [ref RubyValue]) ! RubyMarshalError {
+    let count = try long(r)
+    var names: [str] = []
+    var values: [ref RubyValue] = []
+    var i = 0
+    while i < count {
+        names.push(try symbol(r))
+        values.push(try read(r))
+        i = i + 1
+    }
+    return (names, values)
+}
+
+fn with_ivars(inout r: RubyReader, start: i64) -> ref RubyValue ! RubyMarshalError {
+    let inner = try read(r)
+    let found = try ivars(r)
+    let encoding = encoding_of(found.0, found.1)
+    match inner {
+        RubyString(d, _e) -> {
+            let slot = index_of(r, inner)
+            let value = ref(RubyString(d, encoding))
+            if slot >= 0 {
+                r.objects[slot] = value
+            }
+            return value
+        }
+        RubyRegexp(s, o, _e) -> {
+            let slot = index_of(r, inner)
+            let value = ref(RubyRegexp(s, o, encoding))
+            if slot >= 0 {
+                r.objects[slot] = value
+            }
+            return value
+        }
+        RubyUserDefined(c, d, _e) -> {
+            let slot = index_of(r, inner)
+            let value = ref(RubyUserDefined(c, d, encoding))
+            if slot >= 0 {
+                r.objects[slot] = value
+            }
+            return value
+        }
+        _ -> fail(RubyRefused(start, "instance variables on this kind of value"))
+    }
+}
+
+fn index_of(r: RubyReader, value: ref RubyValue) -> i64 {
+    var i = r.objects.len() - 1
+    while i >= 0 {
+        if r.objects[i] == value {
+            return i
+        }
+        i = i - 1
+    }
+    return -1
+}
+
+fn read_bignum(inout r: RubyReader) -> ref RubyValue ! RubyMarshalError {
+    let slot = register(r)
+    let sign = try byte(r)
+    let words = try long(r)
+    if words < 0 or r.at + 2 * words > r.data.len() {
+        fail(RubyTruncated(r.at))
+    }
+    var value = bigint.zero()
+    var i = 2 * words - 1
+    while i >= 0 {
+        value = bigint.add(bigint.mul(value, bigint.from_i64(256)),
+            bigint.from_i64(r.data.at(r.at + i)))
+        i = i - 1
+    }
+    r.at = r.at + 2 * words
+    if sign == 45 {
+        value = bigint.negate(value)
+    }
+    return settle(r, slot, ref(RubyInteger(value)))
+}
+
+fn read_float(inout r: RubyReader) -> ref RubyValue ! RubyMarshalError {
+    let slot = register(r)
+    let text = (try chunk(r)).to_str()
+    // Old dumps put the mantissa's bits after a NUL; the text is enough.
+    let cut = text.index_of("\u{0}") ?? text.len()
+    let t = text.substr(0, cut)
+    let x = if t == "nan" { (9221120237041090560).from_bits() } else if t == "inf" {
+        (9218868437227405312).from_bits() } else if t == "-inf" {
+        (-4503599627370496).from_bits() } else {
+        t.parse_float() ?? 0.0 }
+    return settle(r, slot, ref(RubyFloat(x)))
+}
+
+fn read_collection(inout r: RubyReader, code: i64) -> ref RubyValue ! RubyMarshalError {
+    let slot = register(r)
+    let count = try long(r)
+    if code == 91 {
+        var items: [ref RubyValue] = []
+        var i = 0
+        while i < count {
+            items.push(try read(r))
+            i = i + 1
+        }
+        return settle(r, slot, ref(RubyArray(items)))
+    }
+    var keys: [ref RubyValue] = []
+    var values: [ref RubyValue] = []
+    var i = 0
+    while i < count {
+        keys.push(try read(r))
+        values.push(try read(r))
+        i = i + 1
+    }
+    var default: [ref RubyValue] = []
+    if code == 125 {
+        default.push(try read(r))
+    }
+    return settle(r, slot, ref(RubyHash(keys, values, default)))
+}
+
+fn read_named(inout r: RubyReader, code: i64) -> ref RubyValue ! RubyMarshalError {
+    let slot = register(r)
+    let class_name = try symbol(r)
+    if code == 111 {
+        let found = try ivars(r)
+        return settle(r, slot, ref(RubyObject(class_name, found.0, found.1)))
+    }
+    if code == 83 {
+        let found = try ivars(r)
+        return settle(r, slot, ref(RubyStruct(class_name, found.0, found.1)))
+    }
+    if code == 85 {
+        return settle(r, slot, ref(RubyUserMarshal(class_name, try read(r))))
+    }
+    // `u`: registered only after its payload, as `r_object` does.
+    r.objects.pop()
+    r.complete.pop()
+    let data = try chunk(r)
+    let value = ref(RubyUserDefined(class_name, data, ""))
+    r.objects.push(value)
+    r.complete.push(true)
+    return value
+}
+
+fn read(inout r: RubyReader) -> ref RubyValue ! RubyMarshalError {
+    let start = r.at
+    let code = try byte(r)
+    if code == 48 {
+        return ref(RubyNil)
+    }
+    if code == 84 or code == 70 {
+        return ref(RubyBool(code == 84))
+    }
+    if code == 105 {
+        return ref(RubyInteger(bigint.from_i64(try long(r))))
+    }
+    if code == 58 or code == 59 {
+        r.at = start
+        return ref(RubySymbol(try symbol(r)))
+    }
+    if code == 64 {
+        let index = try long(r)
+        if index < 0 or index >= r.objects.len() {
+            fail(RubyBadLink(start))
+        }
+        if not r.complete[index] {
+            fail(RubyRefused(start, "a link to an object still being read"))
+        }
+        return r.objects[index]
+    }
+    if code == 73 {
+        return try with_ivars(r, start)
+    }
+    if code == 108 {
+        return try read_bignum(r)
+    }
+    if code == 102 {
+        return try read_float(r)
+    }
+    if code == 34 {
+        let slot = register(r)
+        return settle(r, slot, ref(RubyString(try chunk(r), "")))
+    }
+    if code == 91 or code == 123 or code == 125 {
+        return try read_collection(r, code)
+    }
+    if code == 111 or code == 83 or code == 85 or code == 117 {
+        return try read_named(r, code)
+    }
+    return try read_other(r, code, start)
+}
+
+fn read_other(inout r: RubyReader, code: i64, start: i64) -> ref RubyValue ! RubyMarshalError {
+    if code == 47 {
+        let slot = register(r)
+        let source = try chunk(r)
+        let options = try byte(r)
+        return settle(r, slot, ref(RubyRegexp(source, options, "")))
+    }
+    if code == 99 or code == 109 {
+        let slot = register(r)
+        let name = (try chunk(r)).to_str()
+        return settle(r, slot, if code == 99 { ref(RubyClass(name)) } else {
+            ref(RubyModule(name)) })
+    }
+    if code == 67 {
+        let class_name = try symbol(r)
+        let inner = try read(r)
+        let value = ref(RubySubclass(class_name, inner))
+        let slot = index_of(r, inner)
+        if slot >= 0 {
+            r.objects[slot] = value
+        }
+        return value
+    }
+    fail(RubyUnknownType(start, code))
+}
+
+/// The value in a `Marshal.dump` string.
+pub fn load(data: bytes) -> ref RubyValue ! RubyMarshalError {
+    if data.len() < 2 {
+        fail(RubyTruncated(0))
+    }
+    if data.at(0) != 4 or data.at(1) > 8 {
+        fail(RubyBadVersion(data.at(0), data.at(1)))
+    }
+    var r = RubyReader{ data: data, at: 2, symbols: [], objects: [],
+        complete: [] }
+    return try read(r)
+}
+
+// ---------------------------------------------------------------------------
+// Writing
+
+type RubyWriter = {
+    out: [i64],
+    symbols: [str],
+    objects: [ref RubyValue],
+}
+
+fn put_long(inout w: RubyWriter, n: i64) {
+    if n == 0 {
+        w.out.push(0)
+        return
+    }
+    if n > 0 and n < 123 {
+        w.out.push(n + 5)
+        return
+    }
+    if n < 0 and n > -124 {
+        w.out.push((n - 5 + 256) % 256)
+        return
+    }
+    var bytes_needed: [i64] = []
+    var v = n
+    var i = 0
+    while i < 8 {
+        bytes_needed.push(((v % 256) + 256) % 256)
+        v = if v >= 0 { v / 256 } else { (v - 255) / 256 }
+        i = i + 1
+        if (n >= 0 and v == 0) or (n < 0 and v == -1) {
+            break
+        }
+    }
+    w.out.push(if n >= 0 { bytes_needed.len() } else { 256 - bytes_needed.len() })
+    for b in bytes_needed {
+        w.out.push(b)
+    }
+}
+
+fn put_bytes(inout w: RubyWriter, data: bytes) {
+    put_long(w, data.len())
+    var i = 0
+    while i < data.len() {
+        w.out.push(data.at(i))
+        i = i + 1
+    }
+}
+
+fn put_symbol(inout w: RubyWriter, name: str) {
+    var i = 0
+    while i < w.symbols.len() {
+        if w.symbols[i] == name {
+            w.out.push(59)
+            put_long(w, i)
+            return
+        }
+        i = i + 1
+    }
+    w.symbols.push(name)
+    var ascii = true
+    for c in name.codes() {
+        if c >= 128 {
+            ascii = false
+        }
+    }
+    if ascii {
+        w.out.push(58)
+        put_bytes(w, name.to_bytes())
+        return
+    }
+    w.out.push(73)
+    w.out.push(58)
+    put_bytes(w, name.to_bytes())
+    put_long(w, 1)
+    put_symbol(w, "E")
+    w.out.push(84)
+}
+
+/// Ruby's float text: the shortest digits, laid out as `w_float` lays them.
+pub fn float_text(x: f64) -> str {
+    if x != x {
+        return "nan"
+    }
+    if x - x != 0.0 {
+        return if x > 0.0 { "inf" } else { "-inf" }
+    }
+    if x == 0.0 {
+        return if x.to_bits() < 0 { "-0" } else { "0" }
+    }
+    let p = shortestfloat.parts(x)
+    let sign = if p.negative { "-" } else { "" }
+    let digits = p.digits
+    let decpt = p.point
+    let count = digits.len()
+    if decpt < -3 or decpt > count {
+        let rest = if count > 1 { "." + digits.substr(1, count) } else { "" }
+        return sign + digits.substr(0, 1) + rest + "e{decpt - 1}"
+    }
+    if decpt > 0 {
+        let rest = if count > decpt { "." + digits.substr(decpt, count) } else { "" }
+        return sign + digits.substr(0, decpt) + rest
+    }
+    return sign + "0." + "0".repeat(0 - decpt) + digits
+}
+
+fn encoding_ivars(inout w: RubyWriter, encoding: str) {
+    if encoding == "" {
+        return
+    }
+    put_long(w, 1)
+    if encoding == "UTF-8" or encoding == "US-ASCII" {
+        put_symbol(w, "E")
+        w.out.push(if encoding == "UTF-8" { 84 } else { 70 })
+        return
+    }
+    put_symbol(w, "encoding")
+    w.out.push(34)
+    put_bytes(w, encoding.to_bytes())
+}
+
+fn put_integer(inout w: RubyWriter, n: BigInt) {
+    match bigint.to_i64(n) {
+        Some(v) -> {
+            if v >= -1073741824 and v < 1073741824 {
+                w.out.push(105)
+                put_long(w, v)
+                return
+            }
+        }
+        None -> {}
+    }
+    w.out.push(108)
+    w.out.push(if bigint.sign(n) < 0 { 45 } else { 43 })
+    var magnitude = if bigint.sign(n) < 0 { bigint.negate(n) } else { n }
+    var digits: [i64] = []
+    let base = bigint.from_i64(256)
+    while not bigint.is_zero(magnitude) {
+        let qr = bigint.divmod(magnitude, base) ?? (bigint.zero(), bigint.zero())
+        digits.push(bigint.to_i64(qr.1) ?? 0)
+        magnitude = qr.0
+    }
+    if digits.len() % 2 == 1 {
+        digits.push(0)
+    }
+    put_long(w, digits.len() / 2)
+    for d in digits {
+        w.out.push(d)
+    }
+}
+
+/// Whether the value was written before; if so a link is written instead.
+fn linked(inout w: RubyWriter, value: ref RubyValue) -> bool {
+    var i = 0
+    while i < w.objects.len() {
+        if w.objects[i] == value {
+            w.out.push(64)
+            put_long(w, i)
+            return true
+        }
+        i = i + 1
+    }
+    w.objects.push(value)
+    return false
+}
+
+fn put_pairs(inout w: RubyWriter, names: [str], values: [ref RubyValue]) {
+    put_long(w, names.len())
+    var i = 0
+    while i < names.len() {
+        put_symbol(w, names[i])
+        write(w, values[i])
+        i = i + 1
+    }
+}
+
+fn write(inout w: RubyWriter, value: ref RubyValue) {
+    match value {
+        RubyNil -> w.out.push(48)
+        RubyBool(b) -> w.out.push(if b { 84 } else { 70 })
+        RubySymbol(name) -> put_symbol(w, name)
+        RubyInteger(n) -> {
+            let small = match bigint.to_i64(n) {
+                Some(v) -> v >= -1073741824 and v < 1073741824
+                None -> false
+            }
+            if small or not linked(w, value) {
+                put_integer(w, n)
+            }
+        }
+        RubyFloat(x) -> {
+            // Every float takes a number, and none is ever linked to.
+            w.objects.push(ref(RubyNil))
+            w.out.push(102)
+            put_bytes(w, float_text(x).to_bytes())
+        }
+        _ -> {
+            if not linked(w, value) {
+                write_object(w, value)
+            }
+        }
+    }
+}
+
+fn write_object(inout w: RubyWriter, value: ref RubyValue) {
+    match value {
+        RubyString(d, e) -> {
+            if e != "" {
+                w.out.push(73)
+            }
+            w.out.push(34)
+            put_bytes(w, d)
+            encoding_ivars(w, e)
+        }
+        RubyArray(items) -> {
+            w.out.push(91)
+            put_long(w, items.len())
+            for item in items {
+                write(w, item)
+            }
+        }
+        RubyHash(keys, values, default) -> {
+            w.out.push(if default.len() > 0 { 125 } else { 123 })
+            put_long(w, keys.len())
+            var i = 0
+            while i < keys.len() {
+                write(w, keys[i])
+                write(w, values[i])
+                i = i + 1
+            }
+            if default.len() > 0 {
+                write(w, default[0])
+            }
+        }
+        RubyObject(c, names, values) -> {
+            w.out.push(111)
+            put_symbol(w, c)
+            put_pairs(w, names, values)
+        }
+        RubyStruct(c, names, values) -> {
+            w.out.push(83)
+            put_symbol(w, c)
+            put_pairs(w, names, values)
+        }
+        _ -> write_rest(w, value)
+    }
+}
+
+fn write_rest(inout w: RubyWriter, value: ref RubyValue) {
+    match value {
+        RubyRegexp(s, o, e) -> {
+            if e != "" {
+                w.out.push(73)
+            }
+            w.out.push(47)
+            put_bytes(w, s)
+            w.out.push(o)
+            encoding_ivars(w, e)
+        }
+        RubyClass(name) -> {
+            w.out.push(99)
+            put_bytes(w, name.to_bytes())
+        }
+        RubyModule(name) -> {
+            w.out.push(109)
+            put_bytes(w, name.to_bytes())
+        }
+        RubyUserDefined(c, d, e) -> {
+            if e != "" {
+                w.out.push(73)
+            }
+            w.out.push(117)
+            put_symbol(w, c)
+            put_bytes(w, d)
+            encoding_ivars(w, e)
+        }
+        RubyUserMarshal(c, inner) -> {
+            w.out.push(85)
+            put_symbol(w, c)
+            write(w, inner)
+        }
+        RubySubclass(c, inner) -> {
+            w.out.push(67)
+            put_symbol(w, c)
+            // The wrapped value shares the subclass's number, so it is
+            // written without taking one of its own.
+            write_object(w, inner)
+        }
+        _ -> {}
+    }
+}
+
+/// `Marshal.dump` of a value.
+pub fn dump(value: ref RubyValue) -> bytes {
+    var w = RubyWriter{ out: [4, 8], symbols: [], objects: [] }
+    write(w, value)
+    return bytes_of(w.out)
+}

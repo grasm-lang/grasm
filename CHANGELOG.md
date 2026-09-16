@@ -9,6 +9,17 @@ migration note here; anything `experimental` may change in any release. See
 
 ### Added
 
+- **How five other languages write things down.** `jsnumber` is JavaScript's
+  number-to-string and back — shortest round-trip, `toFixed`, `toExponential`,
+  `toPrecision`, `Number` and `parseFloat`, which disagree with each other on
+  purpose. `tcllist` is Tcl's list format, where quoting is decided per element
+  and splitting is not `split " "`. `luaformat` is what `%q` writes and `load`
+  reads back, including the padded numeric escape a digit forces and the
+  hexadecimal floats Lua prefers. `rubymarshal` reads and writes Ruby's
+  `Marshal`, object and symbol back-references included. `perlpack` is `pack`
+  and `unpack`: every letter, `/` counts, groups, `@` positions and BER
+  integers. 75,569 cases against node, tclsh, lua, ruby and perl themselves;
+  `langdiff` is a gate.
 - **A multi-track audio editor, and the arithmetic under it.** `audiodsp` is
   gain, fades, equal-power panning, RBJ cookbook filters, echo, two
   resamplers and metering, all in f64; `audiodiff` checks 22 cases against
@@ -268,6 +279,13 @@ migration note here; anything `experimental` may change in any release. See
   are gates.
 
 ### Fixed
+
+- **`jsnumber` lost the sign of negative zero.** `Number("-0")` and
+  `parseFloat("-0")` applied the sign by subtracting from zero, and IEEE-754
+  says `0.0 - 0.0` is *positive* zero — so `-0` parsed to `0`, and with it
+  went `Object.is(-0, 0)` being false and `1 / -0` being `-Infinity`. It
+  multiplies by -1 now. (The text is the same either way: the specification's
+  `ToString` and `toFixed` both test `x < 0`, which -0 is not.)
 
 - **`par_map` refused the cores to the work that wanted them most.** The
   runtime decided by counting elements — fewer than 256 meant one core,

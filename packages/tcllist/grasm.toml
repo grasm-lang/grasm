@@ -1,0 +1,6 @@
+[package]
+name = "tcllist"
+version = "1.0.0"
+
+# Strings to lists and back. Opens nothing.
+capabilities = []

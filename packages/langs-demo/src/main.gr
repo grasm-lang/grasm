@@ -1,0 +1,245 @@
+// How five other languages write things down, without those languages.
+//
+// Each of these is a format one runtime treats as obvious and every other
+// runtime gets subtly wrong: JavaScript's number-to-string, Tcl's lists, the
+// literals Lua's `%q` writes and `load` reads back, Ruby's `Marshal`, and
+// Perl's `pack`. The claims below are the ones where a careful reading of the
+// documentation still leaves you wrong, which is why `scripts/lang_diff.sh`
+// asks node, tclsh, lua, ruby and perl themselves.
+import jsnumber
+import tcllist
+import luaformat
+import rubymarshal
+import perlpack
+import bigint
+
+fn say(inout f: i64, name: str, held: bool) / {io} {
+    if held {
+        print("  ok    {name}")
+    } else {
+        print("  FAIL  {name}")
+        f = f + 1
+    }
+}
+
+fn hex(raw: bytes) -> str {
+    let digits = "0123456789abcdef"
+    var out = ""
+    var i = 0
+    while i < raw.len() {
+        out = out + digits.substr(raw.at(i) / 16, 1) +
+        digits.substr(raw.at(i) % 16, 1)
+        i = i + 1
+    }
+    return out
+}
+
+// ------------------------------------------------------------------ jsnumber
+
+fn check_jsnumber(inout f: i64) / {io} {
+    print("-- jsnumber: the shortest string that reads back as the same double")
+    // The famous one. `0.1 + 0.2` is not `0.3`, and JavaScript prints the
+    // difference rather than hiding it behind a fixed precision.
+    say(f, "0.1 + 0.2 prints as 0.30000000000000004",
+        jsnumber.to_string(0.1 + 0.2) == "0.30000000000000004")
+    // Shortest round-trip: 0.1 is not 0.1000000000000000055511151231257827,
+    // though that is what the double actually is.
+    say(f, "and 0.1 prints as 0.1", jsnumber.to_string(0.1) == "0.1")
+    // The exponent threshold is 1e21, not 1e20, and is a property of the
+    // *value* rather than of how it was written.
+    say(f, "1e20 prints in full and 1e21 does not",
+        jsnumber.to_string(1e20) == "100000000000000000000" and
+        jsnumber.to_string(1e21) == "1e+21")
+    say(f, "and small numbers turn at 1e-7",
+        jsnumber.to_string(0.000001) == "0.000001" and
+        jsnumber.to_string(0.0000001) == "1e-7")
+    // `toFixed` is not rounding as arithmetic teaches it: it rounds the
+    // *double*, and 1.005 is a hair below the decimal 1.005.
+    say(f, "1.005.toFixed(2) is 1.00, not 1.01",
+        (jsnumber.to_fixed(1.005, 2) ?? "?") == "1.00")
+    say(f, "and 4.35.toFixed(1) is 4.3", (jsnumber.to_fixed(4.35, 1) ?? "?") ==
+        "4.3")
+    // Negative zero survives parsing — `Object.is(-0, 0)` is false and
+    // `1 / -0` is -Infinity — and then disappears on the way out: the
+    // specification's `ToString` and `toFixed` both test `x < 0`, which -0 is
+    // not. So the sign is in the value and never in the text.
+    let minus_zero = jsnumber.number("-0")
+    say(f, "-0 parses to a negative zero", minus_zero == 0.0 and
+        minus_zero.to_bits() != 0)
+    say(f, "and then prints without its sign, both ways",
+        jsnumber.to_string(minus_zero) == "0" and
+        (jsnumber.to_fixed(minus_zero, 1) ?? "?") == "0.0")
+    // `Number` and `parseFloat` are different functions: one takes the whole
+    // string or nothing, the other takes a prefix; one knows 0x, the other
+    // does not.
+    say(f, "Number(\"0x10\") is 16 and parseFloat(\"0x10\") is 0",
+        jsnumber.number("0x10") == 16.0 and jsnumber.parse_float("0x10") == 0.0)
+    say(f, "Number(\"12abc\") is NaN and parseFloat(\"12abc\") is 12",
+        jsnumber.number("12abc") != jsnumber.number("12abc") and
+        jsnumber.parse_float("12abc") == 12.0)
+    say(f, "and the empty string is 0 to one and NaN to the other",
+        jsnumber.number("") == 0.0 and
+        jsnumber.parse_float("") != jsnumber.parse_float(""))
+}
+
+// ------------------------------------------------------------------- tcllist
+
+fn check_tcllist(inout f: i64) / {io} {
+    print("-- tcllist: everything is a string, including a list")
+    // Quoting is decided per element and only when needed, which is what
+    // makes a Tcl list readable by a person as well as by Tcl.
+    say(f, "a plain element is not quoted", tcllist.merge(["a", "b"]) == "a b")
+    say(f, "a space makes braces", tcllist.merge(["a b"]) == "\{a b\}")
+    say(f, "an empty element is a pair of braces",
+        tcllist.merge(["", "x"]) == "\{\} x")
+    // A backslash-escape is used where braces cannot balance.
+    say(f, "an unbalanced brace escapes instead", tcllist.merge(["a\{b"]) ==
+        "a\\\{b")
+    // Splitting is the inverse, and it is not `split " "`: braces group,
+    // runs of whitespace are one separator, and backslashes survive.
+    say(f, "splitting collapses runs of whitespace",
+        (tcllist.split("  a   b  ") ?? []) == ["a", "b"])
+    say(f, "braces group, and come off exactly once",
+        (tcllist.split("\{a b\} c") ?? []) == ["a b", "c"])
+    say(f, "and nesting is kept for the next split to undo",
+        (tcllist.split("\{a \{b c\} d\}") ?? []) == ["a \{b c\} d"])
+    // What Tcl refuses is as much a part of the format as what it accepts.
+    say(f, "an unmatched brace is refused", match tcllist.split("\{a") {
+        Ok(_x) -> false
+        Err(_e) -> true
+    })
+    // A round trip is the property that matters: any list of strings survives
+    // being written and read.
+    let awkward = ["a b", "\{", "\}", "", "back\\slash", "new\nline"]
+    say(f, "and any list survives the round trip",
+        (tcllist.split(tcllist.merge(awkward)) ?? []) == awkward)
+}
+
+// ----------------------------------------------------------------- luaformat
+
+fn check_luaformat(inout f: i64) / {io} {
+    print("-- luaformat: a literal Lua will read back as the same value")
+    // `%q` escapes a newline as a backslash and a *real* newline, which is
+    // legal in a Lua long string and surprises everyone who expects \n.
+    say(f, "a newline is escaped as backslash-newline",
+        luaformat.quote_string("a\nb".to_bytes()).to_str() == "\"a\\\nb\"")
+    say(f, "a zero byte is escaped by number",
+        luaformat.quote_string(bytes_of([97, 0, 98])).to_str() == "\"a\\0b\"")
+    // And by a *padded* number when a digit follows, or the digit would be
+    // read as part of the escape.
+    say(f, "and by a padded one when a digit follows",
+        luaformat.quote_string(bytes_of([0, 55])).to_str() == "\"\\0007\"")
+    // Floats are written as hexadecimal, which is the only notation that
+    // round-trips exactly in every Lua build.
+    say(f, "a float is quoted in hexadecimal",
+        luaformat.quote_float(0.1) == "0x1.999999999999ap-4")
+    // `tostring` is the other direction: %.14g, so 0.1 prints as 0.1.
+    say(f, "but tostring gives it to fourteen digits",
+        luaformat.tostring_float(0.1) == "0.1")
+    say(f, "and an integral float keeps its point",
+        luaformat.tostring_float(10.0) == "10.0")
+    // `tonumber` knows hexadecimal floats, which almost nothing else does.
+    say(f, "tonumber reads a hexadecimal float", match
+        luaformat.tonumber("0xA.8p1") {
+            Some(n) -> not n.is_integer and n.float == 21.0
+            None -> false
+    })
+    say(f, "and tells an integer from a float", match luaformat.tonumber("3") {
+        Some(n) -> n.is_integer and n.integer == 3
+        None -> false
+    })
+    say(f, "and refuses what Lua refuses",
+        luaformat.tonumber("1_0") == None and luaformat.tonumber("") == None)
+    // Reading back what was written is the whole point.
+    let raw = bytes_of([0, 1, 34, 92, 10, 13, 9, 255, 65])
+    say(f, "and a quoted string reads back byte for byte",
+        hex(luaformat.read_string(luaformat.quote_string(raw)) ??
+            bytes_of([])) == hex(raw))
+}
+
+// --------------------------------------------------------------- rubymarshal
+
+fn check_rubymarshal(inout f: i64) / {io} {
+    print("-- rubymarshal: Ruby's own object graph, on disk")
+    // Small integers are packed into the length byte itself, which is why a
+    // dump of 7 is four bytes and a dump of 1000 is six.
+    say(f, "a small integer is one byte after the header",
+        hex(rubymarshal.dump(ref(RubyInteger(bigint.from_i64(7))))) == "0408690c")
+    say(f, "and zero has no bytes at all",
+        hex(rubymarshal.dump(ref(RubyInteger(bigint.zero())))) == "04086900")
+    // A string carries its encoding as an instance variable, which is why
+    // "a" and "a".force_encoding("BINARY") are different dumps.
+    say(f, "a UTF-8 string carries an encoding flag",
+        hex(rubymarshal.dump(ref(RubyString("a".to_bytes(), "UTF-8")))) ==
+        "040849220661063a064554")
+    // Repeated objects are written once and referred to afterwards. That is
+    // not an optimization: it is what makes a cycle representable at all.
+    let shared = ref(RubyString("same".to_bytes(), "UTF-8"))
+    let twice = rubymarshal.dump(ref(RubyArray([shared, shared])))
+    say(f, "the second copy of a string is a back-reference",
+        hex(twice) == "04085b0749220973616d65063a0645544006")
+    // A symbol is interned the same way, in its own table.
+    let sym = ref(RubySymbol("s"))
+    say(f, "and so is the second use of a symbol",
+        hex(rubymarshal.dump(ref(RubyArray([sym, sym])))) == "04085b073a06733b00")
+    // Round trip: what is loaded dumps to the same bytes.
+    say(f, "and loading then dumping gives the bytes back",
+        hex(rubymarshal.dump(rubymarshal.load(twice) ?? ref(RubyNil))) ==
+        hex(twice))
+    say(f, "a float carries enough digits to be itself again", match
+        rubymarshal.load(rubymarshal.dump(ref(RubyFloat(0.1)))) ?? ref(RubyNil) {
+            RubyFloat(x) -> x == 0.1
+            _other -> false
+    })
+}
+
+// ------------------------------------------------------------------ perlpack
+
+fn check_perlpack(inout f: i64) / {io} {
+    print("-- perlpack: the template language under every binary Perl reads")
+    // The three string letters differ only in how they pad, and that is the
+    // whole difference between a fixed field and a C string.
+    say(f, "A pads with spaces, a with zeroes, Z with a terminator",
+        hex(perlpack.pack("A5", ["ab"]) ?? bytes_of([])) == "6162202020" and
+        hex(perlpack.pack("a5", ["ab"]) ?? bytes_of([])) == "6162000000" and
+        hex(perlpack.pack("Z5", ["ab"]) ?? bytes_of([])) == "6162000000")
+    // And they differ again on the way back: A strips, a does not.
+    say(f, "and A strips the padding back off while a keeps it",
+        (perlpack.unpack("A5", "ab   ".to_bytes()) ?? []) == ["ab"] and
+        (perlpack.unpack("a5", "ab   ".to_bytes()) ?? []) == ["ab   "])
+    // Endianness is in the letter, not in the machine.
+    say(f, "n and v are the two orders of the same two bytes",
+        hex(perlpack.pack("n", ["258"]) ?? bytes_of([])) == "0102" and
+        hex(perlpack.pack("v", ["258"]) ?? bytes_of([])) == "0201")
+    // BER: a length that is as long as it needs to be.
+    say(f, "w writes a base-128 number, seven bits at a time",
+        hex(perlpack.pack("w", ["16384"]) ?? bytes_of([])) == "818000")
+    // A count that comes from the data, which is how Perl reads a
+    // length-prefixed string in one template.
+    say(f, "C/A takes its length from the byte in front of it",
+        (perlpack.unpack("C/A", "\u{3}abcdef".to_bytes()) ?? []) == ["abc"])
+    // `U` packs a character and unpacks a byte, which is not symmetrical and
+    // is what Perl does.
+    say(f, "U writes a code point as UTF-8",
+        hex(perlpack.pack("U", ["233"]) ?? bytes_of([])) == "c3a9")
+    say(f, "and reads one byte at a time back out",
+        (perlpack.unpack("U*", bytes_of([195, 169])) ?? []) == ["195", "169"])
+    // `@` is an absolute position, not a skip.
+    say(f, "@ moves to an offset rather than past one",
+        hex(perlpack.pack("C @4 C", ["1", "2"]) ?? bytes_of([])) ==
+        "0100000002")
+}
+
+fn main() / {io} {
+    var f = 0
+    check_jsnumber(f)
+    check_tcllist(f)
+    check_luaformat(f)
+    check_rubymarshal(f)
+    check_perlpack(f)
+    if f == 0 {
+        print("langs: every claim held")
+    } else {
+        print("langs: {f} claims failed")
+    }
+}
