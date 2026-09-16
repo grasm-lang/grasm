@@ -1042,7 +1042,11 @@ fn main() / {io, net} {
     } else if mode == "stats" {
         stats(number_flag("port", 9099))
     } else if mode == "selftest" {
-        selftest(flag("dir", "broker-selftest"))
+        // Under the system's temporary directory rather than the working
+        // one: a self-test that leaves a directory behind wherever it was
+        // run turns up later as an untracked file in somebody's checkout.
+        let scratch = env("TMPDIR") ?? "/tmp"
+        selftest(flag("dir", scratch + "/broker-selftest"))
     } else {
         print("broker serve   --dir D --port P [--peer host:port --topics a,b] [--ticks N]")
         print("broker bench   --port P [--connections N] [--messages M] [--size S] [--depth D] [--durable]")
