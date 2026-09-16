@@ -9,6 +9,19 @@ migration note here; anything `experimental` may change in any release. See
 
 ### Added
 
+- **A multi-track audio editor, and the arithmetic under it.** `audiodsp` is
+  gain, fades, equal-power panning, RBJ cookbook filters, echo, two
+  resamplers and metering, all in f64; `audiodiff` checks 22 cases against
+  ffmpeg's own `volume`, `biquad`, `lowpass`, `equalizer`, `afade` and
+  `aecho`, worst disagreement 1.2e-07 of full scale. `apps/mixer` is the
+  editor: tracks of clips with their own trim, reverse, gain and fades, a
+  filter and an echo per track, undo and redo, a waveform drawn on a decibel
+  scale through `tuibox`, keys through `termios`, and a render handed to
+  `afplay`, `aplay` or `ffplay`. There is no live stream and no window, and
+  `apps/mixer/src/main.gr` says why in its first paragraph. `mixertest` is a
+  gate: three engines agree on the self-test *and* on the frame the editor
+  draws, a project renders byte for byte identically twice, ffprobe accepts
+  the file, and one file through one track matches ffmpeg's own pan exactly.
 - **A message broker, and what it took to make one.** `apps/broker` serves
   topics over a length-framed binary protocol, keeps an append-only log per
   topic in segments with a CRC per record, delivers to subscribers as records
@@ -255,6 +268,17 @@ migration note here; anything `experimental` may change in any release. See
   are gates.
 
 ### Fixed
+
+- **`par_map` refused the cores to the work that wanted them most.** The
+  runtime decided by counting elements — fewer than 256 meant one core,
+  whatever was in them — so a thousand-element `x * x` was threaded and an
+  eight-clip audio mixdown, each clip forty milliseconds of filtering, was
+  not. It now computes the first element on the calling thread, times it, and
+  splits the rest when what remains is worth more than the spawns. A
+  compute-bound eight-element `par_map` went from 2.09 s to 0.90 s. The answer
+  is unchanged — the function is effect-free and each worker writes its own
+  indices — and `spec/conformance/T-PAR-MAP-SMALL.gr` is the case that keeps
+  it that way.
 
 - **The compiled backend refused an `inout` argument that was not a plain
   variable**, through a module-qualified call and through a method receiver —

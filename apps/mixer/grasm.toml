@@ -1,0 +1,25 @@
+[package]
+name = "mixer"
+version = "0.1.0"
+entry = "src/main.gr"
+
+# Reads and writes audio files, puts the terminal into raw mode, and hands a
+# rendered file to the system player. The `unsafe` is `termios` and the one
+# call that starts the player; both are named in the source.
+capabilities = ["io", "unsafe"]
+
+[dependencies.audiodsp]
+path = "../../packages/audiodsp"
+version = "^1.0.0"
+
+[dependencies.wav]
+path = "../../packages/wav"
+version = "^1.0.0"
+
+[dependencies.termios]
+path = "../../packages/termios"
+version = "^1.0.0"
+
+[dependencies.tuibox]
+path = "../../packages/tuibox"
+version = "^1.0.0"

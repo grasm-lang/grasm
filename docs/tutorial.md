@@ -397,6 +397,20 @@ and `grasm build -o` produce a bundled *interpreter*, and there a `par_map` is
 a `map`. The answer is identical — that is the whole point of requiring purity
 — but the throughput is not, so measure with `grasm build --native`.
 
+A short list is not automatically a sequential one. The runtime computes the
+first element on the calling thread, times it, and splits the rest when what
+remains is worth more than the spawns — so six elements of real work get the
+cores, and a thousand cheap ones are not split for the sake of it. Being wrong
+costs one element's time and never changes the answer.
+
+What threads cannot help with is worth knowing before reaching for them: if
+the body mostly *moves* memory rather than computing — copying a buffer,
+building a list — eight workers share one memory bus and gain nothing, and if
+the body reads a large structure shared with the other workers, the reference
+counts on it are atomic and the contention can cost more than the work.
+`docs/apps-phases.md` has both measured, from an audio mixdown where the
+difference was 1.2 s against 6.3 s.
+
 A panicking task aborts the whole scope; tasks spawned after it do not run.
 A `return` inside a task body returns from the function the `parallel` block
 is in, and the rest of the scope — the tasks not yet run, and the statements

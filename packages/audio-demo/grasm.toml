@@ -22,3 +22,7 @@ version = "^1.0.0"
 [dependencies.loudness]
 path = "../loudness"
 version = "^1.0.0"
+
+[dependencies.audiodsp]
+path = "../audiodsp"
+version = "^1.0.0"

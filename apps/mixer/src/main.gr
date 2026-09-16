@@ -1,0 +1,1215 @@
+// A multi-track audio editor that runs in a terminal.
+//
+// Tracks hold clips, clips point into loaded audio, and every clip carries its
+// own gain, fades and trim. A track adds a filter, a pan, a mute and a solo.
+// The mixdown is arithmetic over those, and the result is a WAV file — or the
+// system player, handed that file.
+//
+// **Why a terminal rather than a window.** The language reaches C through
+// `extern fn`, and an `extern fn` takes scalars and pointers and returns a
+// scalar. That is enough for `tcgetattr`, which is how `packages/termios`
+// puts this terminal into raw mode, and it is not enough for CoreAudio or a
+// window surface: those need structs by value, callbacks and a run loop that
+// calls *back* into the program. So there is no live output stream here, and
+// saying otherwise would be the kind of claim this repository exists to
+// avoid. What there is instead is an editor that renders offline and plays
+// through `afplay`, `aplay` or `ffplay` — which is the same thing a mastering
+// session does, only with the boundary in a different place.
+//
+// **Where the cores are.** `par_map` is the only multicore this language has,
+// and it requires a function that is effect-free and captures no `ref` — so
+// every clip is rendered as a *self-contained job*: the job struct carries its
+// own samples and its own parameters, the function that renders it reads
+// nothing else, and the compiler checks that rather than a convention doing
+// it. A twelve-clip project renders twelve clips at once; the summing that
+// follows is sequential because addition into one buffer is not.
+//
+//   mixer                      the editor, on a demo project
+//   mixer open FILE...         the editor, with these files loaded
+//   mixer render OUT.wav       the demo project, rendered
+//   mixer render OUT.wav FILE... the files as one track each, rendered
+//   mixer play                 render the demo and hand it to the player
+//   mixer selftest             every claim this file makes, checked
+import audiodsp
+import termios
+import tuibox
+import wav
+
+/// Starting a process is the one thing here the language has no builtin for,
+/// and `system` is how a program has done it since V7. It is named at the top
+/// of the file rather than buried, because it is also the only reason this
+/// program needs `unsafe`.
+extern fn system(cmd: str) -> i64
+
+/// Bytes to the terminal as they are, because a frame must not end in a
+/// newline: on the last row of the screen that scrolls everything up by one
+/// and the next frame is drawn one line out for the rest of the session.
+extern fn write(fd: i64, buf: bytes, n: i64) -> i64
+
+let FILTER_NONE = 0
+let FILTER_LOWPASS = 1
+let FILTER_HIGHPASS = 2
+let FILTER_PEAKING = 3
+
+/// A piece of a source on a track: where it sits, what of it is used, and
+/// what is done to it on the way past.
+type Clip = {
+    source: i64,
+    /// Where it starts on the timeline, in samples.
+    at: i64,
+    /// The window taken from the source.
+    from: i64,
+    length: i64,
+    gain_db: f64,
+    fade_in: i64,
+    fade_out: i64,
+    curve: i64,
+    reversed: bool,
+}
+
+type Track = {
+    name: str,
+    clips: [Clip],
+    gain_db: f64,
+    /// -1 hard left, 0 centre, 1 hard right.
+    pan: f64,
+    mute: bool,
+    solo: bool,
+    filter: i64,
+    cutoff: f64,
+    q: f64,
+    filter_db: f64,
+    echo_ms: f64,
+    echo_decay: f64,
+}
+
+/// One clip, packed so that rendering it needs nothing else — which is what
+/// lets `par_map` have it.
+type Job = {
+    samples: [f64],
+    from: i64,
+    length: i64,
+    gain_db: f64,
+    fade_in: i64,
+    fade_out: i64,
+    curve: i64,
+    reversed: bool,
+    at: i64,
+}
+
+type Project = {
+    rate: i64,
+    sources: [[f64]],
+    source_names: [str],
+    tracks: [Track],
+}
+
+/// What an undo step holds. The sources are not in it: loading a file is not
+/// an edit, and copying a minute of audio to remember a fader move is how an
+/// editor comes to need a gigabyte to hold ten undos.
+type Step = {
+    tracks: [Track],
+    what: str,
+}
+
+type Editor = {
+    project: Project,
+    cursor: i64,
+    track_at: i64,
+    clip_at: i64,
+    /// Samples per column of the timeline.
+    zoom: i64,
+    /// The sample the leftmost column shows, so a long project scrolls.
+    view: i64,
+    width: i64,
+    height: i64,
+    /// The frame on the screen now, which is what the next one is compared
+    /// against — a full repaint of a screen flickers and, over a slow link,
+    /// cannot keep up.
+    shown: TuiBuffer,
+    history: [Step],
+    future: [Step],
+    message: str,
+    running: bool,
+    last_render: str,
+}
+
+fn empty_track(name: str) -> Track {
+    return Track{ name: name, clips: [], gain_db: 0.0, pan: 0.0, mute: false,
+        solo: false, filter: FILTER_NONE, cutoff: 1000.0, q: 0.7071,
+        filter_db: 0.0, echo_ms: 0.0, echo_decay: 0.0 }
+}
+
+// --- rendering --------------------------------------------------------------
+
+/// One clip's samples, with its trim, reverse, gain and fades applied.
+//
+// Effect-free and capturing nothing: every input is in the job. That is not
+// style — `par_map` will not take a function that reads a `ref` or prints, and
+// the compiler is what says so.
+fn render_job(j: Job) -> [f64] {
+    // Trim, reverse, gain and both fades in one pass.
+    //
+    // Written as four `audiodsp` calls this reads better and allocates four
+    // buffers of the clip's length instead of one. That turned out to matter
+    // more than anything else here: with four allocations per clip the
+    // mixdown was bound by the allocator, and threads spent their time
+    // contending for it rather than filtering. Fused, the same work is
+    // arithmetic over one buffer, and the cores show up.
+    var start = j.from
+    if start < 0 {
+        start = 0
+    }
+    var end = start + j.length
+    if end > j.samples.len() {
+        end = j.samples.len()
+    }
+    let count = if end > start { end - start } else { 0 }
+    let level = audiodsp.db_to_gain(j.gain_db)
+    let out_at = count - j.fade_out
+    // The buffer is made once at its final length rather than grown: a list
+    // that doubles reallocates a dozen times for a second of audio, and on
+    // several threads at once that is the allocator, not the filter.
+    var out = audiodsp.silence(count)
+    var i = 0
+    while i < count {
+        let from_at = if j.reversed { start + count - 1 - i } else { start + i }
+        var v = j.samples[from_at] * level
+        if j.fade_in > 0 and i < j.fade_in {
+            v = v * audiodsp.curve(j.curve, i.as_f64() / j.fade_in.as_f64())
+        }
+        if j.fade_out > 0 and i >= out_at {
+            let t = (i - out_at).as_f64() / j.fade_out.as_f64()
+            v = v * audiodsp.curve(j.curve, 1.0 - t)
+        }
+        out[i] = v
+        i = i + 1
+    }
+    return out
+}
+
+fn jobs_of(p: Project, t: Track) -> [Job] {
+    var out: [Job] = []
+    for c in t.clips {
+        if c.source >= 0 and c.source < p.sources.len() {
+            // The window is taken here rather than in the worker: a job that
+            // owns its samples reads nothing shared, and what a worker shares
+            // it pays for in atomics on every touch.
+            out.push(Job{ samples: audiodsp.cut(p.sources[c.source], c.from,
+                c.length), from: 0, length: c.length, gain_db: c.gain_db,
+                fade_in: c.fade_in, fade_out: c.fade_out, curve: c.curve,
+                reversed: c.reversed, at: c.at })
+        }
+    }
+    return out
+}
+
+/// One track's clips, rendered and laid out on the timeline.
+fn render_track(p: Project, t: Track) -> [f64] {
+    let jobs = jobs_of(p, t)
+    let rendered = jobs.par_map(|j| render_job(j))
+    // Long enough for the last clip to end in, then summed in place.
+    var total = 0
+    var i = 0
+    while i < rendered.len() {
+        let end = jobs[i].at + rendered[i].len()
+        if end > total {
+            total = end
+        }
+        i = i + 1
+    }
+    var out = audiodsp.silence(total)
+    i = 0
+    while i < rendered.len() {
+        audiodsp.mix_into(out, rendered[i], jobs[i].at, 1.0)
+        i = i + 1
+    }
+    if t.gain_db != 0.0 {
+        out = audiodsp.gain(out, t.gain_db)
+    }
+    if t.filter == FILTER_LOWPASS {
+        match audiodsp.lowpass(p.rate, t.cutoff, t.q) {
+            Ok(f) -> out = audiodsp.filter(out, f)
+            Err(_e) -> {}
+        }
+    } else if t.filter == FILTER_HIGHPASS {
+        match audiodsp.highpass(p.rate, t.cutoff, t.q) {
+            Ok(f) -> out = audiodsp.filter(out, f)
+            Err(_e) -> {}
+        }
+    } else if t.filter == FILTER_PEAKING {
+        match audiodsp.peaking(p.rate, t.cutoff, t.q, t.filter_db) {
+            Ok(f) -> out = audiodsp.filter(out, f)
+            Err(_e) -> {}
+        }
+    }
+    if t.echo_ms > 0.0 {
+        match audiodsp.echo(out, p.rate, 1.0, 1.0, [t.echo_ms],
+            [t.echo_decay]) {
+            Ok(v) -> out = v
+            Err(_e) -> {}
+        }
+    }
+    return out
+}
+
+fn any_solo(p: Project) -> bool {
+    for t in p.tracks {
+        if t.solo {
+            return true
+        }
+    }
+    return false
+}
+
+/// The whole project as a stereo pair.
+//
+// The cores are taken at the track, which is where a mixer's work actually
+// divides. Per *clip* was tried first and is slower than one core: rendering a
+// clip is a pass over a buffer, so eight of them at once are bound by memory
+// rather than by arithmetic, and the threads end up queueing for the same
+// bandwidth. A track carries its filter and its echo as well — arithmetic per
+// sample, not just movement — and that is work worth spreading.
+pub fn mixdown(p: Project) -> ([f64], [f64]) {
+    let solo = any_solo(p)
+    var heard: [Track] = []
+    for t in p.tracks {
+        if not (t.mute or (solo and not t.solo)) {
+            heard.push(t)
+        }
+    }
+    let rendered = heard.map(|t| render_track(p, t))
+    var left: [f64] = []
+    var right: [f64] = []
+    var i = 0
+    while i < rendered.len() {
+        let pair = audiodsp.pan(rendered[i], heard[i].pan)
+        left = audiodsp.add(left, pair.0)
+        right = audiodsp.add(right, pair.1)
+        i = i + 1
+    }
+    return (left, right)
+}
+
+fn write_wav(path: str, rate: i64, left: [f64], right: [f64]) -> bool / {io} {
+    let flat = match audiodsp.interleave([audiodsp.clamp(left),
+        audiodsp.clamp(right)], 16) {
+        Ok(v) -> v
+        Err(_e) -> return false
+    }
+    let a = wav.audio(2, rate, 16, flat)
+    let raw = match wav.encode(a) {
+        Ok(v) -> v
+        Err(_e) -> return false
+    }
+    match write_bytes(path, raw) {
+        Ok(_x) -> return true
+        Err(_e) -> return false
+    }
+}
+
+// --- loading ----------------------------------------------------------------
+
+fn base_name(path: str) -> str {
+    var cut = 0
+    var i = 0
+    while i < path.len() {
+        if path.substr(i, 1) == "/" {
+            cut = i + 1
+        }
+        i = i + 1
+    }
+    return path.substr(cut, path.len() - cut)
+}
+
+/// A file as one mono buffer, at whatever rate it holds.
+fn load_source(path: str) -> Option[(i64, [f64])] / {io} {
+    let raw = match read_bytes(path) {
+        Ok(d) -> d
+        Err(_e) -> return None
+    }
+    let a = match wav.decode(raw) {
+        Ok(v) -> v
+        Err(_e) -> return None
+    }
+    let channels = match audiodsp.deinterleave(a.sample, a.channels, a.bits) {
+        Ok(v) -> v
+        Err(_e) -> return None
+    }
+    if channels.len() == 0 {
+        return None
+    }
+    var mono = channels[0]
+    var c = 1
+    while c < channels.len() {
+        mono = audiodsp.add(mono, channels[c])
+        c = c + 1
+    }
+    if channels.len() > 1 {
+        mono = audiodsp.scale(mono, 1.0 / channels.len().as_f64())
+    }
+    return Some((a.sample_rate, mono))
+}
+
+/// A project with one track per file, each clip at the start of the timeline.
+//
+// A file at another rate is resampled on the way in rather than played at the
+// wrong speed: an editor that mixes 48 kHz material into a 44.1 kHz session
+// without saying so is the bug, not the feature.
+fn project_of(paths: [str], rate: i64) -> Project / {io} {
+    var p = Project{ rate: rate, sources: [], source_names: [], tracks: [] }
+    for path in paths {
+        match load_source(path) {
+            None -> print("mixer: cannot read {path}")
+            Some(found) -> {
+                var samples = found.1
+                if found.0 != rate {
+                    match audiodsp.resample_sinc(samples, found.0, rate, 16) {
+                        Ok(v) -> samples = v
+                        Err(_e) -> {}
+                    }
+                }
+                p.sources.push(samples)
+                p.source_names.push(base_name(path))
+                var t = empty_track(base_name(path))
+                t.clips.push(Clip{ source: p.sources.len() - 1, at: 0,
+                    from: 0, length: samples.len(), gain_db: 0.0, fade_in: 0,
+                    fade_out: 0, curve: audiodsp.FADE_LINEAR,
+                    reversed: false })
+                p.tracks.push(t)
+            }
+        }
+    }
+    return p
+}
+
+/// A project made of generated material, so the editor has something to open
+/// with no files to hand.
+fn demo_project(rate: i64) -> Project {
+    var p = Project{ rate: rate, sources: [], source_names: [], tracks: [] }
+    let second = rate
+    p.sources.push(audiodsp.tone(110.0, second * 2, rate, 0.5))
+    p.source_names.push("bass 110 Hz")
+    p.sources.push(audiodsp.tone(440.0, second, rate, 0.4))
+    p.source_names.push("tone 440 Hz")
+    p.sources.push(audiodsp.tone(1320.0, second / 2, rate, 0.25))
+    p.source_names.push("bell 1320 Hz")
+
+    var bass = empty_track("bass")
+    bass.clips.push(Clip{ source: 0, at: 0, from: 0, length: second * 2,
+        gain_db: -3.0, fade_in: second / 10, fade_out: second / 4,
+        curve: audiodsp.FADE_QUARTER_SINE, reversed: false })
+    bass.filter = FILTER_LOWPASS
+    bass.cutoff = 400.0
+    p.tracks.push(bass)
+
+    var lead = empty_track("lead")
+    lead.pan = -0.4
+    var n = 0
+    while n < 3 {
+        lead.clips.push(Clip{ source: 1, at: second / 2 + n * second / 2,
+            from: 0, length: second / 3, gain_db: -6.0,
+            fade_in: second / 40, fade_out: second / 20,
+            curve: audiodsp.FADE_LINEAR, reversed: n == 2 })
+        n = n + 1
+    }
+    p.tracks.push(lead)
+
+    var bell = empty_track("bell")
+    bell.pan = 0.5
+    bell.echo_ms = 180.0
+    bell.echo_decay = 0.35
+    bell.clips.push(Clip{ source: 2, at: second, from: 0, length: second / 2,
+        gain_db: -9.0, fade_in: 0, fade_out: second / 8,
+        curve: audiodsp.FADE_HALF_SINE, reversed: false })
+    p.tracks.push(bell)
+    return p
+}
+
+// --- the terminal -----------------------------------------------------------
+
+fn emit(text: str) / {io, unsafe} {
+    let raw = text.to_bytes()
+    var sent = 0
+    while sent < raw.len() {
+        let n = unsafe { write(1, raw.slice(sent, raw.len()),
+            raw.len() - sent) }
+        if n <= 0 {
+            return
+        }
+        sent = sent + n
+    }
+}
+
+/// A block for a level, on a decibel scale rather than a linear one.
+//
+// Linear height is what a naive meter draws and it is useless: a -20 dB
+// passage is a tenth of full scale, so everything but the loudest moment sits
+// in the bottom block and the display looks empty. -60 dB to 0 across eight
+// blocks is roughly what a console meter shows.
+fn bar(level: f64) -> str {
+    let steps = " ▁▂▃▄▅▆▇█"
+    if level <= 0.0 {
+        return " "
+    }
+    let db = audiodsp.gain_to_db(level)
+    var which = ((db + 60.0) / 60.0 * 8.0).round().as_i64()
+    if which < 1 {
+        which = 1
+    }
+    if which > 8 {
+        which = 8
+    }
+    return steps.chars()[which]
+}
+
+/// One track drawn as a row of blocks, each column the loudest sample in the
+/// span of time it covers.
+//
+// The whole track is rendered to draw it, which is the honest cost of a view
+// that shows what will be heard rather than what was loaded: a fader move
+// changes the picture because it changes the audio.
+fn track_row(p: Project, t: Track, columns: i64, zoom: i64,
+    from: i64) -> str {
+    let mono = render_track(p, t)
+    var out = ""
+    var c = 0
+    while c < columns {
+        let start = from + c * zoom
+        var top = 0.0
+        var i = start
+        let end = start + zoom
+        while i < end and i < mono.len() {
+            let v = mono[i].abs()
+            if v > top {
+                top = v
+            }
+            i = i + 1
+        }
+        out = out + (if start >= mono.len() { " " } else { bar(top) })
+        c = c + 1
+    }
+    return out
+}
+
+fn seconds(rate: i64, samples: i64) -> str {
+    let whole = samples / rate
+    let hundredths = (samples % rate) * 100 / rate
+    return "{whole}.{hundredths.to_str().pad_start(2, "0")}s"
+}
+
+fn filter_name(t: Track) -> str {
+    if t.filter == FILTER_LOWPASS {
+        return "lp{t.cutoff.round().as_i64()}"
+    } else if t.filter == FILTER_HIGHPASS {
+        return "hp{t.cutoff.round().as_i64()}"
+    } else if t.filter == FILTER_PEAKING {
+        return "eq{t.cutoff.round().as_i64()}"
+    }
+    return "-"
+}
+
+let LABEL = 34
+
+/// The screen as it should look, into a buffer — nothing is sent from here,
+/// so what the editor draws can be tested without a terminal.
+fn frame(e: Editor, width: i64, height: i64) -> TuiBuffer {
+    var b = match tuibox.new_buffer(width, height) {
+        Ok(v) -> v
+        Err(_e) -> return match tuibox.new_buffer(1, 1) {
+            Ok(v) -> v
+            Err(_x) -> TuiBuffer{ width: 0, height: 0, cell: [] }
+        }
+    }
+    let columns = if width > LABEL + 2 { width - LABEL - 2 } else { 1 }
+    let rate = e.project.rate
+    let head = "mixer  {e.project.tracks.len()} tracks  {rate} Hz  " +
+    "cursor {seconds(rate, e.cursor)}  {seconds(rate, e.zoom)}/column"
+    let _h = tuibox.write(b, 0, 0, head, "1")
+    // The ruler, a mark every eight columns, so a glance gives a position.
+    var ruler = ""
+    var c = 0
+    while c < columns {
+        ruler = ruler + (if c % 8 == 0 { "+" } else { "·" })
+        c = c + 1
+    }
+    let _r = tuibox.write(b, LABEL + 1, 1, ruler, "2")
+    var row = 2
+    var i = 0
+    while i < e.project.tracks.len() and row < height - 4 {
+        let t = e.project.tracks[i]
+        let mark = if i == e.track_at { ">" } else { " " }
+        let state = (if t.mute { "M" } else { "·" }) +
+        (if t.solo { "S" } else { "·" })
+        let name = tuibox.pad_columns(t.name, 10)
+        let level = t.gain_db.round().as_i64().to_str().pad_start(3, " ")
+        let side = (t.pan * 10.0).round().as_i64().to_str().pad_start(3, " ")
+        let shaped = tuibox.pad_columns(filter_name(t), 8)
+        let label = "{mark}{name} {state} {level}dB {side} {shaped}"
+        let _l = tuibox.write(b, 0, row, tuibox.pad_columns(label, LABEL),
+            if i == e.track_at { "1" } else { "" })
+        let _w = tuibox.write(b, LABEL + 1, row,
+            track_row(e.project, t, columns, e.zoom, e.view), "")
+        row = row + 1
+        i = i + 1
+    }
+    // The playhead, under the tracks it points into.
+    let mark_at = (e.cursor - e.view) / e.zoom
+    if mark_at >= 0 and mark_at < columns {
+        let _p = tuibox.write(b, LABEL + 1 + mark_at, row, "^", "1")
+    }
+    let keys = "space play  w write  , . move  j k track  + - gain  " +
+    "[ ] pan  m mute  s solo"
+    let more = "f filter  F cutoff  e echo  n normalise  < > zoom  " +
+    "u undo  r redo  q quit"
+    let _k1 = tuibox.write(b, 0, height - 3, keys, "2")
+    let _k2 = tuibox.write(b, 0, height - 2, more, "2")
+    let _m = tuibox.write(b, 0, height - 1, e.message, "")
+    return b
+}
+
+/// A frame as plain lines, which is how the drawing is checked without a
+/// terminal to draw on — and how `mixer screen` shows what the editor looks
+/// like inside a pipe.
+fn frame_lines(e: Editor, width: i64, height: i64) -> [str] {
+    let b = frame(e, width, height)
+    var out: [str] = []
+    var y = 0
+    while y < b.height {
+        var line = ""
+        var x = 0
+        while x < b.width {
+            line = line + tuibox.cell_at(b, x, y).text
+            x = x + 1
+        }
+        out.push(line.trim_end())
+        y = y + 1
+    }
+    return out
+}
+
+fn draw(inout e: Editor) / {io, unsafe} {
+    let now = frame(e, e.width, e.height)
+    emit(tuibox.diff(e.shown, now))
+    e.shown = now
+}
+
+// --- edits ------------------------------------------------------------------
+
+fn remember(inout e: Editor, what: str) {
+    e.history.push(Step{ tracks: e.project.tracks, what: what })
+    e.future = []
+    if e.history.len() > 64 {
+        e.history.remove(0)
+    }
+}
+
+fn undo(inout e: Editor) {
+    match e.history.pop() {
+        None -> e.message = "nothing to undo"
+        Some(step) -> {
+            e.future.push(Step{ tracks: e.project.tracks, what: step.what })
+            e.project.tracks = step.tracks
+            e.message = "undid {step.what}"
+        }
+    }
+}
+
+fn redo(inout e: Editor) {
+    match e.future.pop() {
+        None -> e.message = "nothing to redo"
+        Some(step) -> {
+            e.history.push(Step{ tracks: e.project.tracks, what: step.what })
+            e.project.tracks = step.tracks
+            e.message = "redid {step.what}"
+        }
+    }
+}
+
+fn selected(e: Editor) -> i64 {
+    if e.track_at < 0 or e.track_at >= e.project.tracks.len() {
+        return -1
+    }
+    return e.track_at
+}
+
+fn render_to(e: Editor, path: str) -> bool / {io} {
+    let pair = mixdown(e.project)
+    return write_wav(path, e.project.rate, pair.0, pair.1)
+}
+
+/// Hands the file to whichever player this machine has.
+//
+// `afplay` on macOS, `aplay` on Linux, `ffplay` where ffmpeg is installed —
+// tried in that order, in the background, so the editor keeps its keyboard.
+fn play(path: str) -> bool / {io, unsafe} {
+    let tries = ["afplay '{path}' >/dev/null 2>&1 &",
+        "aplay -q '{path}' >/dev/null 2>&1 &",
+        "ffplay -nodisp -autoexit -loglevel quiet '{path}' >/dev/null 2>&1 &"]
+    for one in tries {
+        let probe = one.split(" ")[0]
+        let found = unsafe { system("command -v {probe} >/dev/null 2>&1") }
+        if found == 0 {
+            let _code = unsafe { system(one) }
+            return true
+        }
+    }
+    return false
+}
+
+/// The keys that change a track, which is most of them.
+fn key_edit(inout e: Editor, key: i64) -> bool / {io} {
+    let which = selected(e)
+    if which < 0 {
+        return false
+    }
+    if key == 43 or key == 61 {
+        // + and =, because one of them needs shift
+        if which >= 0 {
+            remember(e, "gain")
+            e.project.tracks[which].gain_db =
+            e.project.tracks[which].gain_db + 1.0
+            e.message = "{e.project.tracks[which].name} gain up"
+        }
+    } else if key == 45 {
+        // -
+        if which >= 0 {
+            remember(e, "gain")
+            e.project.tracks[which].gain_db =
+            e.project.tracks[which].gain_db - 1.0
+            e.message = "{e.project.tracks[which].name} gain down"
+        }
+    } else if key == 91 {
+        // [
+        if which >= 0 {
+            remember(e, "pan")
+            var v = e.project.tracks[which].pan - 0.1
+            if v < -1.0 {
+                v = -1.0
+            }
+            e.project.tracks[which].pan = v
+            e.message = "pan left"
+        }
+    } else if key == 93 {
+        // ]
+        if which >= 0 {
+            remember(e, "pan")
+            var v = e.project.tracks[which].pan + 0.1
+            if v > 1.0 {
+                v = 1.0
+            }
+            e.project.tracks[which].pan = v
+            e.message = "pan right"
+        }
+    } else if key == 109 {
+        // m
+        if which >= 0 {
+            remember(e, "mute")
+            e.project.tracks[which].mute = not e.project.tracks[which].mute
+            e.message = "mute toggled"
+        }
+    } else if key == 115 {
+        // s
+        if which >= 0 {
+            remember(e, "solo")
+            e.project.tracks[which].solo = not e.project.tracks[which].solo
+            e.message = "solo toggled"
+        }
+    } else {
+        return key_effect(e, key)
+    }
+    return true
+}
+
+/// The keys that change how a track sounds rather than where it sits.
+fn key_effect(inout e: Editor, key: i64) -> bool / {io} {
+    let which = selected(e)
+    if which < 0 {
+        return false
+    }
+    if key == 102 {
+        // f
+        if which >= 0 {
+            remember(e, "filter")
+            e.project.tracks[which].filter =
+            (e.project.tracks[which].filter + 1) % 4
+            e.message = "filter {filter_name(e.project.tracks[which])}"
+        }
+    } else if key == 70 {
+        // F
+        if which >= 0 {
+            remember(e, "cutoff")
+            var hz = e.project.tracks[which].cutoff * 1.5
+            if hz > e.project.rate.as_f64() / 2.5 {
+                hz = 100.0
+            }
+            e.project.tracks[which].cutoff = hz
+            e.message = "cutoff {hz.round().as_i64()} Hz"
+        }
+    } else if key == 101 {
+        // e
+        if which >= 0 {
+            remember(e, "echo")
+            if e.project.tracks[which].echo_ms > 0.0 {
+                e.project.tracks[which].echo_ms = 0.0
+                e.project.tracks[which].echo_decay = 0.0
+                e.message = "echo off"
+            } else {
+                e.project.tracks[which].echo_ms = 220.0
+                e.project.tracks[which].echo_decay = 0.4
+                e.message = "echo on"
+            }
+        }
+    } else if key == 110 {
+        // n
+        if which >= 0 {
+            remember(e, "normalise")
+            let mono = render_track(e.project, e.project.tracks[which])
+            let top = audiodsp.peak_db(mono)
+            e.project.tracks[which].gain_db =
+            e.project.tracks[which].gain_db - top - 1.0
+            e.message = "normalised to -1 dBFS"
+        }
+    } else {
+        return false
+    }
+    return true
+}
+
+fn key_press(inout e: Editor, key: i64) / {io, unsafe} {
+    let step = e.zoom * 8
+    if key_edit(e, key) {
+        return
+    }
+    if key == 113 {
+        // q
+        e.running = false
+    } else if key == 44 {
+        // ,
+        e.cursor = if e.cursor > step { e.cursor - step } else { 0 }
+    } else if key == 46 {
+        // .
+        e.cursor = e.cursor + step
+    } else if key == 106 {
+        // j
+        if e.track_at + 1 < e.project.tracks.len() {
+            e.track_at = e.track_at + 1
+        }
+    } else if key == 107 {
+        // k
+        if e.track_at > 0 {
+            e.track_at = e.track_at - 1
+        }
+    } else if key == 117 {
+        // u
+        undo(e)
+    } else if key == 114 {
+        // r
+        redo(e)
+    } else if key == 60 {
+        // <
+        if e.zoom > 64 {
+            e.zoom = e.zoom / 2
+        }
+    } else if key == 62 {
+        // >
+        e.zoom = e.zoom * 2
+    } else if key == 119 {
+        // w
+        if render_to(e, "mixdown.wav") {
+            e.message = "wrote mixdown.wav"
+        } else {
+            e.message = "could not write mixdown.wav"
+        }
+    } else if key == 32 {
+        // space
+        let path = e.last_render
+        if render_to(e, path) {
+            if play(path) {
+                e.message = "playing {path}"
+            } else {
+                e.message = "rendered {path}; no player found"
+            }
+        } else {
+            e.message = "could not render"
+        }
+    }
+}
+
+/// The terminal's size, asked of the kernel through `ioctl`.
+//
+// `TIOCGWINSZ` fills a four-`u16` struct, and an `extern fn` can pass the
+// buffer it fills — the same trick `termios` uses for `tcgetattr`. Falling
+// back to 80x24 rather than failing: a size that is wrong is a layout
+// complaint, a program that will not start is worse.
+extern fn ioctl(fd: i64, request: i64, buf: bytes) -> i64
+
+let TIOCGWINSZ = 1074295912
+
+fn screen_size() -> (i64, i64) / {io, unsafe} {
+    let box = bytes_of([0, 0, 0, 0, 0, 0, 0, 0])
+    let code = unsafe { ioctl(1, TIOCGWINSZ, box) }
+    if code != 0 {
+        return (80, 24)
+    }
+    let rows = box.at(0) + box.at(1) * 256
+    let columns = box.at(2) + box.at(3) * 256
+    if rows < 8 or columns < 40 {
+        return (80, 24)
+    }
+    return (columns, rows)
+}
+
+fn edit(p: Project) / {io, unsafe} {
+    if not termios.is_terminal(0) {
+        print("mixer: not a terminal — try `mixer render out.wav`")
+        return
+    }
+    let size = screen_size()
+    var e = Editor{ project: p, cursor: 0, track_at: 0, clip_at: 0,
+        zoom: p.rate / 16, view: 0, width: size.0, height: size.1,
+        shown: match tuibox.new_buffer(size.0, size.1) {
+            Ok(v) -> v
+            Err(_e) -> TuiBuffer{ width: 0, height: 0, cell: [] }
+        },
+        history: [], future: [],
+        message: "space plays, w writes mixdown.wav, q quits", running: true,
+        last_render: "mixer-preview.wav" }
+    let saved = match termios.current(0) {
+        Ok(t) -> t
+        Err(_e) -> {
+            print("mixer: this terminal refused raw mode")
+            return
+        }
+    }
+    match termios.apply(0, termios.raw_of(saved)) {
+        Ok(_x) -> {}
+        Err(_e) -> {
+            print("mixer: cannot enter raw mode")
+            return
+        }
+    }
+    emit(tuibox.enter_alternate_screen() + tuibox.hide_cursor())
+    while e.running {
+        draw(e)
+        match termios.read_key(0) {
+            None -> e.running = false
+            Some(key) -> key_press(e, key)
+        }
+    }
+    emit(tuibox.show_cursor() + tuibox.leave_alternate_screen())
+    match termios.apply(0, saved) {
+        Ok(_x) -> {}
+        Err(_e) -> {}
+    }
+    print("mixer: done")
+}
+
+// --- self-test --------------------------------------------------------------
+
+fn near(a: f64, b: f64, tolerance: f64) -> bool {
+    return (a - b).abs() <= tolerance
+}
+
+fn say(inout failures: i64, claim: str, held: bool) / {io} {
+    if held {
+        print("  ok    {claim}")
+    } else {
+        print("  FAIL  {claim}")
+        failures = failures + 1
+    }
+}
+
+fn selftest_placement(inout f: i64) / {io} {
+    let rate = 8000
+    var p = Project{ rate: rate, sources: [], source_names: [], tracks: [] }
+    p.sources.push(audiodsp.tone(100.0, 800, rate, 0.5))
+    p.sources.push(audiodsp.tone(200.0, 800, rate, 0.5))
+    p.source_names = ["a", "b"]
+
+    var one = empty_track("one")
+    one.clips.push(Clip{ source: 0, at: 0, from: 0, length: 400,
+        gain_db: 0.0, fade_in: 0, fade_out: 0, curve: audiodsp.FADE_LINEAR,
+        reversed: false })
+    p.tracks.push(one)
+
+    let first = mixdown(p)
+    say(f, "a clip lands at its own length",
+        first.0.len() == 400 and first.1.len() == 400)
+    say(f, "a centred track is equal in both ears",
+        near(audiodsp.peak(first.0), audiodsp.peak(first.1), 0.000001))
+    // Equal power, so the centre is -3 dB in each ear rather than unity.
+    say(f, "and centre is 3 dB down in each, not unity",
+        near(audiodsp.peak_db(first.0), audiodsp.peak_db([0.5]) - 3.0103, 0.01))
+
+    // A clip placed later leaves silence in front of it.
+    p.tracks[0].clips.push(Clip{ source: 1, at: 1000, from: 0, length: 200,
+        gain_db: 0.0, fade_in: 0, fade_out: 0, curve: audiodsp.FADE_LINEAR,
+        reversed: false })
+    let spread = mixdown(p)
+    say(f, "a clip at 1000 makes the mix 1200 long", spread.0.len() == 1200)
+    say(f, "the gap between clips is silent",
+        near(audiodsp.peak(audiodsp.cut(spread.0, 500, 400)), 0.0, 0.000001))
+
+    // Gain is the arithmetic it claims to be.
+    p.tracks[0].gain_db = -6.0206
+    let quieter = mixdown(p)
+    say(f, "-6.02 dB halves the peak",
+        near(audiodsp.peak(quieter.0), audiodsp.peak(spread.0) / 2.0, 0.0005))
+    p.tracks[0].gain_db = 0.0
+
+    // Pan is equal power: hard left puts nothing in the right.
+    p.tracks[0].pan = -1.0
+    let left = mixdown(p)
+    say(f, "hard left leaves the right ear empty",
+        near(audiodsp.peak(left.1), 0.0, 0.000001))
+    say(f, "and the left ear at full scale of the source",
+        near(audiodsp.peak(left.0), audiodsp.peak(p.sources[0]), 0.0005))
+    p.tracks[0].pan = 0.0
+    selftest_voices(f, p)
+}
+
+/// Mute, solo, reverse — the claims about which sound reaches the mix.
+fn selftest_voices(inout f: i64, project: Project) / {io} {
+    var p = project
+    let rate = p.rate
+    // Mute and solo.
+    var second = empty_track("two")
+    second.clips.push(Clip{ source: 1, at: 0, from: 0, length: 400,
+        gain_db: 0.0, fade_in: 0, fade_out: 0, curve: audiodsp.FADE_LINEAR,
+        reversed: false })
+    p.tracks.push(second)
+    p.tracks[0].mute = true
+    let muted = mixdown(p)
+    p.tracks[0].mute = false
+    p.tracks[1].solo = true
+    let soloed = mixdown(p)
+    say(f, "muting one track is the same as soloing the other",
+        muted.0.len() == soloed.0.len() and
+        near(audiodsp.peak(muted.0), audiodsp.peak(soloed.0), 0.000001))
+    p.tracks[1].solo = false
+
+    // A reversed clip is the same samples backwards. Compared against a
+    // project holding nothing else, because a claim about one clip checked
+    // against a mix of several is a claim about the sum.
+    var plain = Project{ rate: rate, sources: p.sources,
+        source_names: p.source_names, tracks: [empty_track("plain")] }
+    plain.tracks[0].clips.push(Clip{ source: 0, at: 0, from: 0, length: 400,
+        gain_db: 0.0, fade_in: 0, fade_out: 0, curve: audiodsp.FADE_LINEAR,
+        reversed: false })
+    var rev = plain
+    rev.tracks[0].clips[0].reversed = true
+    let forwards = mixdown(plain)
+    let backwards = mixdown(rev)
+    var mirrored = forwards.0.len() == backwards.0.len()
+    var m = 0
+    while m < forwards.0.len() and mirrored {
+        if not near(backwards.0[m], forwards.0[399 - m], 0.000001) {
+            mirrored = false
+        }
+        m = m + 1
+    }
+    say(f, "a reversed clip is the same samples, end to end", mirrored)
+    selftest_machinery(f, p)
+}
+
+/// The claims about the machinery rather than the audio: that the
+/// parallel path answers exactly as one core would, and that undo is undo.
+fn selftest_machinery(inout f: i64, project: Project) / {io} {
+    var p = project
+    // The parallel path and the sequential one must agree exactly, because
+    // that is the whole claim `par_map` makes.
+    var jobs: [Job] = []
+    for c in p.tracks[0].clips {
+        jobs.push(Job{ samples: p.sources[c.source], from: c.from,
+            length: c.length, gain_db: -2.0, fade_in: 20, fade_out: 30,
+            curve: audiodsp.FADE_QUARTER_SINE, reversed: false, at: c.at })
+    }
+    let parallel_out = jobs.par_map(|j| render_job(j))
+    var serial_out: [[f64]] = []
+    for j in jobs {
+        serial_out.push(render_job(j))
+    }
+    var same = parallel_out.len() == serial_out.len()
+    var k = 0
+    while k < parallel_out.len() and same {
+        if parallel_out[k].len() != serial_out[k].len() {
+            same = false
+        } else {
+            var n = 0
+            while n < parallel_out[k].len() {
+                if parallel_out[k][n] != serial_out[k][n] {
+                    same = false
+                }
+                n = n + 1
+            }
+        }
+        k = k + 1
+    }
+    say(f, "par_map renders every clip exactly as one core would", same)
+
+    // Undo restores what was there, and redo puts the edit back.
+    var e = Editor{ project: p, cursor: 0, track_at: 0, clip_at: 0,
+        zoom: 100, view: 0, width: 80, height: 24,
+        shown: match tuibox.new_buffer(80, 24) {
+            Ok(v) -> v
+            Err(_e) -> TuiBuffer{ width: 0, height: 0, cell: [] }
+        },
+        history: [], future: [], message: "", running: true,
+        last_render: "x.wav" }
+    let before = e.project.tracks[0].gain_db
+    remember(e, "gain")
+    e.project.tracks[0].gain_db = before + 5.0
+    undo(e)
+    say(f, "undo puts the fader back", e.project.tracks[0].gain_db == before)
+    redo(e)
+    say(f, "redo moves it again",
+        e.project.tracks[0].gain_db == before + 5.0)
+
+    // A file written and read back is the same audio.
+    let demo = demo_project(8000)
+    let pair = mixdown(demo)
+    say(f, "the demo project renders something audible",
+        audiodsp.peak(pair.0) > 0.01 and pair.0.len() > 8000)
+    say(f, "and nothing in it clips",
+        audiodsp.clipped(audiodsp.clamp(pair.0)) <= audiodsp.clipped(pair.0))
+}
+
+fn selftest() / {io} {
+    var f = 0
+    selftest_placement(f)
+    if f == 0 {
+        print("mixer selftest: every claim held")
+    } else {
+        print("mixer selftest: {f} failed")
+    }
+}
+
+/// `mixer render`: the demo, or one track per file named.
+fn do_render(all: [str], rate: i64) / {io} {
+
+    if all.len() < 2 {
+        print("mixer render OUT.wav [FILE...]")
+        return
+    }
+    var files: [str] = []
+    var i = 2
+    while i < all.len() {
+        files.push(all[i])
+        i = i + 1
+    }
+    let p = if files.len() == 0 { demo_project(rate) } else {
+        project_of(files, rate) }
+    let pair = mixdown(p)
+    if write_wav(all[1], p.rate, pair.0, pair.1) {
+        let ms = pair.0.len() * 1000 / p.rate
+        print("mixer: wrote {all[1]} — {p.tracks.len()} tracks, {ms} ms, " +
+            "peak {audiodsp.peak_db(pair.0).round().as_i64()} dBFS")
+    } else {
+        print("mixer: cannot write {all[1]}")
+    }
+}
+
+/// `mixer bench`: a synthetic project of `tracks` x `clips`, timed.
+fn do_bench(all: [str], rate: i64) / {io} {
+
+    let tracks = if all.len() > 1 { all[1].parse_int() ?? 4 } else { 4 }
+    let per = if all.len() > 2 { all[2].parse_int() ?? 16 } else { 16 }
+    let length = rate * 4
+    var p = Project{ rate: rate, sources: [], source_names: [],
+        tracks: [] }
+    p.sources.push(audiodsp.tone(220.0, length, rate, 0.4))
+    p.source_names.push("tone")
+    var t = 0
+    while t < tracks {
+        var one = empty_track("t{t}")
+        one.filter = FILTER_LOWPASS
+        one.cutoff = 800.0 + t.as_f64() * 50.0
+        var c = 0
+        while c < per {
+            one.clips.push(Clip{ source: 0, at: c * length / per,
+                from: 0, length: length / 2, gain_db: -12.0,
+                fade_in: 500, fade_out: 500,
+                curve: audiodsp.FADE_QUARTER_SINE, reversed: c % 2 == 1 })
+            c = c + 1
+        }
+        p.tracks.push(one)
+        t = t + 1
+    }
+    let started = monotonic_millis()
+    let pair = mixdown(p)
+    let took = monotonic_millis() - started
+    let seconds_out = pair.0.len().as_f64() / rate.as_f64()
+    let ratio = seconds_out * 1000.0 / (if took == 0 { 1 } else {
+        took }).as_f64()
+    print("mixer bench: {tracks} tracks x {per} clips — " +
+        "{seconds_out.round().as_i64()} s of audio in {took} ms, " +
+        "{ratio.round().as_i64()}x real time")
+}
+
+/// `mixer screen`: one frame, drawn without a terminal to draw on.
+fn do_screen(all: [str], rate: i64) / {io} {
+
+    var files: [str] = []
+    var i = 1
+    while i < all.len() {
+        files.push(all[i])
+        i = i + 1
+    }
+    let p = if files.len() == 0 { demo_project(rate) } else {
+        project_of(files, rate) }
+    var e = Editor{ project: p, cursor: 0, track_at: 0, clip_at: 0,
+        zoom: rate / 16, view: 0, width: 96, height: 16,
+        shown: match tuibox.new_buffer(96, 16) {
+            Ok(v) -> v
+            Err(_e) -> TuiBuffer{ width: 0, height: 0, cell: [] }
+        },
+        history: [], future: [],
+        message: "drawn without a terminal", running: false,
+        last_render: "mixer-preview.wav" }
+    for line in frame_lines(e, 96, 16) {
+        print(line)
+    }
+}
+
+fn main() / {io, unsafe} {
+    let all = args()
+    let mode = if all.len() > 0 { all[0] } else { "" }
+    let rate = 44100
+    if mode == "render" {
+        do_render(all, rate)
+    } else if mode == "bench" {
+        do_bench(all, rate)
+    } else if mode == "screen" {
+        do_screen(all, rate)
+    } else if mode == "play" {
+        let p = demo_project(rate)
+        let pair = mixdown(p)
+        let path = "mixer-preview.wav"
+        if write_wav(path, p.rate, pair.0, pair.1) and play(path) {
+            print("mixer: playing {path}")
+        } else {
+            print("mixer: rendered {path}; no player found")
+        }
+    } else if mode == "selftest" {
+        selftest()
+    } else if mode == "open" {
+        var files: [str] = []
+        var i = 1
+        while i < all.len() {
+            files.push(all[i])
+            i = i + 1
+        }
+        edit(project_of(files, rate))
+    } else if mode == "" {
+        edit(demo_project(rate))
+    } else {
+        print("mixer                        the editor, on a demo project")
+        print("mixer open FILE...           the editor, with these loaded")
+        print("mixer render OUT.wav [FILE...]  render without the editor")
+        print("mixer play                   render the demo and play it")
+        print("mixer bench [tracks] [clips] time a mixdown")
+        print("mixer screen [FILE...]       print one frame, no terminal")
+        print("mixer selftest               check every claim in this file")
+    }
+}

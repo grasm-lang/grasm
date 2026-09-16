@@ -418,7 +418,90 @@ until the kernel takes its bytes.
 
 ---
 
-# What the four phases found, together
+# Phase 5 — arithmetic, and the cores
+
+**The question.** Phase 4 asked whether the language can be the thing on the
+other end of a socket. This one asks whether it can do *work*: floating-point
+arithmetic over large buffers, checked against implementations that already
+exist, and spread across cores by the one construct that offers them.
+
+## `apps/mixer`, `packages/audiodsp`
+
+A multi-track audio editor in a terminal. Tracks hold clips; a clip carries
+its own trim, reverse, gain and fades; a track adds a filter, an echo, a pan,
+a mute and a solo. `audiodsp` is the arithmetic — RBJ cookbook biquads, fades,
+echo, resampling, metering — and `wav` was already here. The editor draws with
+`tuibox`, takes keys through `termios`, renders to a file and hands it to
+`afplay`, `aplay` or `ffplay`.
+
+**What it cannot be, stated first.** There is no live audio stream and no
+window. An `extern fn` passes scalars and pointers and returns a scalar, which
+is enough for `tcgetattr` and `ioctl` and is not enough for CoreAudio: that
+needs structs by value, a callback the system calls on its own thread, and a
+run loop. So this renders offline and plays through a player, and the boundary
+is named rather than blurred.
+
+**What it found.**
+
+1. **`par_map` refused to use cores for the work that most wanted them.** The
+   threshold was a count — 256 elements — so a thousand-element `x * x` ran on
+   eight cores and an eight-clip mixdown, each clip forty milliseconds of
+   filtering, ran on one. The runtime's own comment said the count was the
+   wrong question and then asked it anyway. It now computes the first element
+   on the calling thread, times it, and splits the rest when what remains is
+   worth more than the spawns. A compute-bound eight-element `par_map` went
+   from 2.09 s to 0.90 s; the answer is unchanged, because the function is
+   effect-free and each worker writes its own indices.
+
+2. **Two per-byte loops, again, and this time in the arithmetic.** `audiodsp`
+   was written compositionally — cut, then reverse, then gain, then two fades
+   — which allocates four buffers per clip. Fusing them into one pass changed
+   the mixdown from allocator-bound to arithmetic-bound. The same lesson as
+   the broker's framing, in a different package, which is what makes it worth
+   writing down twice.
+
+3. **Threads are not free when the data is shared.** Parallelising per *track*
+   — the obvious granularity, and what a DAW does — was catastrophic: 6.3 s of
+   wall time and 40 s of CPU against 1.2 s on one core, because every worker
+   touched a project structure whose reference counts are atomic. Parallelising
+   per *clip*, with each job owning its samples, costs nothing and gains
+   little: rendering a clip is a pass over a buffer, so eight at once are bound
+   by memory bandwidth rather than arithmetic. The honest summary is that this
+   mixdown is memory-bound and `par_map` is for the compute-bound; the fix in
+   (1) is what makes that a measurement rather than a refusal.
+
+4. **ffmpeg's fade curves are not what their names suggest.** `log` is
+   `1 + log10(t)/5`, which is already at 0.8 a tenth of the way in, and `par`
+   is `1 - sqrt(1-t)`. Both were read off ffmpeg's output rather than guessed,
+   after guessing produced a curve that was wrong for the first fifth of every
+   fade.
+
+5. **A comparison can measure the wrong thing.** Left alone, ffmpeg keeps the
+   input's sample format through a filter, so a 16-bit file is filtered in
+   16-bit and every case disagreed by exactly one 16-bit step — the same number
+   everywhere, which is a measurement of the file format. Asked for float, one
+   case still disagreed: a low-pass at 80 Hz with Q 2, whose poles sit close to
+   the unit circle, where 32-bit float loses significance. In double, the two
+   agree to 2e-7. The disagreement was ffmpeg's precision, and it is why
+   `audiodsp` keeps every buffer in f64 rather than following the file's width.
+
+**What the gates check.** `audiodiff` runs 22 cases against ffmpeg's own
+`volume`, `biquad`, `lowpass`, `highpass`, `bandpass`, `equalizer`, `afade`
+and `aecho` — worst disagreement 1.2e-07 of full scale, about 140 dB down.
+`mixertest` checks that three engines agree on the self-test *and on the frame
+the editor draws*, that a project renders byte for byte identically twice,
+that ffprobe accepts the file, and that one file through one track matches
+ffmpeg's own equal-power pan — which it does exactly, with a worst sample
+difference of zero.
+
+**What it does not show.** No live playback, no window, no plugin format, no
+recording. The mixdown is offline and single-process. And the editor has been
+driven by a keyboard by one person; `mixer screen` is what makes its drawing
+testable, not a substitute for use.
+
+---
+
+# What the five phases found, together
 
 | phase | application | libraries | defects |
 |---|---|---|---|
@@ -427,17 +510,19 @@ until the kernel takes its bytes.
 | 2, composition | `apigateway` | 16 | 3 — F82, F83, F84 |
 | 3, use | `grlint` | 5 | 1 in the tool, 4 in this session's code |
 | 4, infrastructure | `broker` | 2 (its own) | 2 — a backend refusal and a self-test that held only once |
+| 5, arithmetic | `mixer` | 4 | 1 in the runtime — `par_map` refusing the cores |
 
-**Nine defects and one clean result.** The clean one is `logpipe`, and it is
+**Ten defects and one clean result.** The clean one is `logpipe`, and it is
 recorded as plainly as the others: this axis, with these libraries, at this
 scale, produced no disagreement.
 
-The pattern across all five: **an application finds what the shape of a real
+The pattern across all six: **an application finds what the shape of a real
 program reaches, and nothing else.** `linkstore` found library misuse.
 `apigateway` found three language defects, every one needing a program with
 sixteen dependencies to exist at all. `grlint` found four places where correct
 code did not say so. `broker` found a hole in the compiled backend that only
 a program keeping its state in one struct and handing pieces of it to a
-package would meet. None of the nine was reachable by any of the 2,177
-generated programs, and none of them is the kind a generator could be extended
+package would meet. `mixer` found a parallelism policy that was exactly
+backwards for the work that asks for parallelism most loudly. None of the ten
+was reachable by any of the 2,177 generated programs, and none of them is the kind a generator could be extended
 to reach — they are consequences of *size* and *combination*, not of shape.

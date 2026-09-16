@@ -1,0 +1,186 @@
+// One `audiodsp` operation over a WAV file, so ffmpeg can be asked for the
+// same one.
+//
+// Everything reads a 16-bit file and writes a 32-bit one. The width goes up
+// rather than down on purpose: reducing depth is where an encoder decides
+// whether to dither, and two programs that dither differently disagree by a
+// sample everywhere for reasons that have nothing to do with the filter under
+// test. Widening has no such decision, so what is left in the difference is
+// the arithmetic.
+//
+//   audiotest gain     IN OUT <db>
+//   audiotest biquad   IN OUT <b0> <b1> <b2> <a1> <a2>
+//   audiotest lowpass  IN OUT <hz> <q>
+//   audiotest highpass IN OUT <hz> <q>
+//   audiotest bandpass IN OUT <hz> <q>
+//   audiotest peaking  IN OUT <hz> <q> <db>
+//   audiotest fade     IN OUT in|out <curve> <samples>
+//   audiotest echo     IN OUT <in_gain> <out_gain> <ms,ms> <decay,decay>
+//   audiotest resample IN OUT <rate> linear|sinc
+//   audiotest stats    IN
+import audiodsp
+import wav
+
+fn number(text: str) -> f64 {
+    return text.parse_float() ?? 0.0
+}
+
+fn numbers(text: str) -> [f64] {
+    var out: [f64] = []
+    for piece in text.split(",") {
+        out.push(number(piece))
+    }
+    return out
+}
+
+fn curve_of(name: str) -> i64 {
+    let names = [("qsin", audiodsp.FADE_QUARTER_SINE),
+        ("hsin", audiodsp.FADE_HALF_SINE),
+        ("log", audiodsp.FADE_LOGARITHMIC),
+        ("exp", audiodsp.FADE_EXPONENTIAL),
+        ("squ", audiodsp.FADE_SQUARE_ROOT),
+        ("qua", audiodsp.FADE_QUADRATIC),
+        ("cub", audiodsp.FADE_CUBIC),
+        ("par", audiodsp.FADE_PARABOLA)]
+    for pair in names {
+        if pair.0 == name {
+            return pair.1
+        }
+    }
+    return audiodsp.FADE_LINEAR
+}
+
+fn load(path: str) -> (i64, i64, [[f64]]) / {io} {
+    let raw = match read_bytes(path) {
+        Ok(d) -> d
+        Err(_e) -> {
+            print("cannot read {path}")
+            return (0, 0, [])
+        }
+    }
+    let a = match wav.decode(raw) {
+        Ok(v) -> v
+        Err(_e) -> {
+            print("cannot decode {path}")
+            return (0, 0, [])
+        }
+    }
+    let channels = match audiodsp.deinterleave(a.sample, a.channels, a.bits) {
+        Ok(v) -> v
+        Err(_e) -> []
+    }
+    return (a.sample_rate, a.channels, channels)
+}
+
+fn save(path: str, rate: i64, channels: [[f64]]) / {io} {
+    let flat = match audiodsp.interleave(channels, 32) {
+        Ok(v) -> v
+        Err(_e) -> []
+    }
+    let a = wav.audio(channels.len(), rate, 32, flat)
+    match wav.encode(a) {
+        Ok(raw) -> {
+            match write_bytes(path, raw) {
+                Ok(_x) -> {}
+                Err(_e) -> print("cannot write {path}")
+            }
+        }
+        Err(_e) -> print("cannot encode")
+    }
+}
+
+fn each(channels: [[f64]], what: str, args: [str],
+    rate: i64) -> [[f64]] / {io} {
+    var out: [[f64]] = []
+    for ch in channels {
+        if what == "gain" {
+            out.push(audiodsp.gain(ch, number(args[0])))
+        } else if what == "biquad" {
+            out.push(audiodsp.filter(ch, audiodsp.biquad(number(args[0]),
+                number(args[1]), number(args[2]), number(args[3]),
+                number(args[4]))))
+        } else if what == "lowpass" {
+            match audiodsp.lowpass(rate, number(args[0]), number(args[1])) {
+                Ok(f) -> out.push(audiodsp.filter(ch, f))
+                Err(_e) -> print("bad filter")
+            }
+        } else if what == "highpass" {
+            match audiodsp.highpass(rate, number(args[0]), number(args[1])) {
+                Ok(f) -> out.push(audiodsp.filter(ch, f))
+                Err(_e) -> print("bad filter")
+            }
+        } else if what == "bandpass" {
+            match audiodsp.bandpass(rate, number(args[0]), number(args[1])) {
+                Ok(f) -> out.push(audiodsp.filter(ch, f))
+                Err(_e) -> print("bad filter")
+            }
+        } else if what == "peaking" {
+            match audiodsp.peaking(rate, number(args[0]), number(args[1]),
+                number(args[2])) {
+                Ok(f) -> out.push(audiodsp.filter(ch, f))
+                Err(_e) -> print("bad filter")
+            }
+        } else if what == "fade" {
+            let count = args[2].parse_int() ?? 0
+            if args[0] == "in" {
+                out.push(audiodsp.fade_in(ch, count, curve_of(args[1])))
+            } else {
+                out.push(audiodsp.fade_out(ch, count, curve_of(args[1])))
+            }
+        } else if what == "echo" {
+            match audiodsp.echo(ch, rate, number(args[0]), number(args[1]),
+                numbers(args[2]), numbers(args[3])) {
+                Ok(v) -> out.push(v)
+                Err(_e) -> print("bad echo")
+            }
+        } else if what == "resample" {
+            let to = args[0].parse_int() ?? rate
+            if args[1] == "sinc" {
+                match audiodsp.resample_sinc(ch, rate, to, 16) {
+                    Ok(v) -> out.push(v)
+                    Err(_e) -> print("bad resample")
+                }
+            } else {
+                match audiodsp.resample_linear(ch, rate, to) {
+                    Ok(v) -> out.push(v)
+                    Err(_e) -> print("bad resample")
+                }
+            }
+        }
+    }
+    return out
+}
+
+fn main() / {io} {
+    let all = args()
+    if all.len() < 2 {
+        print("audiotest <op> IN [OUT] [args...]")
+        return
+    }
+    let what = all[0]
+    let source = load(all[1])
+    let rate = source.0
+    let channels = source.2
+    if channels.len() == 0 {
+        return
+    }
+    if what == "stats" {
+        for ch in channels {
+            print("peak {audiodsp.peak_db(ch)} rms {audiodsp.rms_db(ch)} " +
+                "clipped {audiodsp.clipped(ch)} samples {ch.len()}")
+        }
+        return
+    }
+    var rest: [str] = []
+    var i = 3
+    while i < all.len() {
+        rest.push(all[i])
+        i = i + 1
+    }
+    let done = each(channels, what, rest, rate)
+    var out_rate = rate
+    if what == "resample" {
+        out_rate = rest[0].parse_int() ?? rate
+    }
+    save(all[2], out_rate, done)
+}

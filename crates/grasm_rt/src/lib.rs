@@ -1819,15 +1819,43 @@ fn grasm_panic_msg_str(msg: &str) -> ! {
 
 // --- data parallelism ---
 
-/// Below this length, threading costs more than it saves.
+/// A list this long is split without asking any further questions.
 ///
-/// Deliberately low. The runtime cannot see how expensive one element is —
-/// a 400-element `par_map` whose elements each take 100µs is very much worth
-/// splitting, and a count-based threshold of a few thousand silently refuses
-/// to. Spawning costs tens of microseconds, so over-splitting a cheap list
-/// wastes almost nothing, while under-splitting an expensive one costs the
-/// whole speedup. The user asked for parallelism by writing `par_map`.
+/// Spawning costs tens of microseconds, so over-splitting a cheap list wastes
+/// almost nothing, while under-splitting an expensive one costs the whole
+/// speedup. The user asked for parallelism by writing `par_map`.
 const PAR_MIN_ELEMS: usize = 256;
+
+/// And a list shorter than that is split when the work in it is worth a
+/// thread, which is measured rather than guessed at.
+///
+/// A count is the wrong question. The thing that decides whether threading
+/// pays is the work *per element*, and a count-based threshold cannot see it:
+/// an eight-clip audio mixdown, where one element is forty milliseconds of
+/// filtering, ran on one core while a thousand-element `x * x` ran on eight.
+/// That was backwards, and it was found by writing the mixdown.
+///
+/// So the first element is computed on the calling thread and timed — work
+/// that had to happen anyway — and the rest is split only if what remains is
+/// worth more than the spawns. Being wrong costs one element's time; the
+/// answer never changes, because the function is effect-free and each worker
+/// writes its own indices.
+const PAR_MIN_WORK: std::time::Duration = std::time::Duration::from_micros(500);
+
+/// How many workers to give `n` elements, one of which took `one` to compute.
+fn workers_for(n: usize, one: std::time::Duration) -> usize {
+    if IN_PARALLEL.with(|f| f.get()) || n < 2 {
+        return 1;
+    }
+    let worth_it = n >= PAR_MIN_ELEMS || one.saturating_mul(n as u32) >= PAR_MIN_WORK;
+    if !worth_it {
+        return 1;
+    }
+    std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(1)
+        .min(n)
+}
 
 thread_local! {
     /// Set while a parallel region is running. A `par_map` reached from inside
@@ -1936,65 +1964,68 @@ unsafe fn par_words(
 ) -> Vec<i64> {
     let n = words.len();
     let mut out: Vec<i64> = vec![0; n];
+    if n == 0 {
+        return out;
+    }
 
-    let workers = if IN_PARALLEL.with(|f| f.get()) || n < PAR_MIN_ELEMS {
-        1
-    } else {
-        std::thread::available_parallelism()
-            .map(|p| p.get())
-            .unwrap_or(1)
-            .min(n)
-    };
+    // The first element, on this thread, timed: what it costs is what decides
+    // whether the rest is worth spreading.
+    let began = std::time::Instant::now();
+    out[0] = code(env_owned.as_ptr(), words[0]);
+    let workers = workers_for(n, began.elapsed());
 
     if workers <= 1 {
-        for (o, &x) in out.iter_mut().zip(words.iter()) {
+        for (o, &x) in out.iter_mut().zip(words.iter()).skip(1) {
             *o = code(env_owned.as_ptr(), x);
         }
         return out;
     }
-    // Hand out many small pieces from a shared queue rather than giving each
-    // worker one big slice. Elements are not equally expensive — a mandelbrot
-    // row in the middle of the set costs far more than one at the edge — and
-    // splitting statically means every worker waits for whichever got the
-    // expensive half. Dynamic hand-out keeps them all busy until the work is
-    // actually gone.
-    let chunk = n.div_ceil(workers * 16).max(1);
-    let input: &[i64] = words;
-    let pieces: std::sync::Mutex<Vec<(usize, &mut [i64])>> =
-        std::sync::Mutex::new(out.chunks_mut(chunk).enumerate().collect());
-    std::thread::scope(|scope| {
-        let queue = &pieces;
-        let env_ref = env_owned;
-        let drain = move || {
-            IN_PARALLEL.with(|f| f.set(true));
-            loop {
-                let Some((ci, slot)) = queue.lock().expect("no panics inside").pop() else {
-                    return;
-                };
-                let src = &input[ci * chunk..ci * chunk + slot.len()];
-                for (o, &x) in slot.iter_mut().zip(src.iter()) {
-                    *o = code(env_ref.as_ptr(), x);
+    // Everything but the element already computed, handed out in pieces from
+    // a shared queue rather than one big slice each. Elements are not equally
+    // expensive — a mandelbrot row in the middle of the set costs far more
+    // than one at the edge — and splitting statically means every worker waits
+    // for whichever got the expensive half. Dynamic hand-out keeps them all
+    // busy until the work is actually gone.
+    {
+        let input: &[i64] = &words[1..];
+        let rest = &mut out[1..];
+        let chunk = input.len().div_ceil(workers * 16).max(1);
+        let pieces: std::sync::Mutex<Vec<(usize, &mut [i64])>> =
+            std::sync::Mutex::new(rest.chunks_mut(chunk).enumerate().collect());
+        std::thread::scope(|scope| {
+            let queue = &pieces;
+            let env_ref = env_owned;
+            let drain = move || {
+                IN_PARALLEL.with(|f| f.set(true));
+                loop {
+                    let Some((ci, slot)) = queue.lock().expect("no panics inside").pop() else {
+                        return;
+                    };
+                    let src = &input[ci * chunk..ci * chunk + slot.len()];
+                    for (o, &x) in slot.iter_mut().zip(src.iter()) {
+                        *o = code(env_ref.as_ptr(), x);
+                    }
                 }
+            };
+            for _ in 0..workers {
+                // A worker that cannot be created is not an error: the queue is
+                // hand-out, so whatever it would have taken is still there for
+                // someone else. The calling thread drains the remainder below,
+                // which is why this result can be dropped and why the answer is
+                // complete even if every spawn fails.
+                let _ = std::thread::Builder::new()
+                    .stack_size(WORKER_STACK)
+                    .spawn_scoped(scope, move || {
+                        drain();
+                        // This thread is done, so what it allocated and handed
+                        // back stops being its business and starts being
+                        // everyone's.
+                        hand_back_live();
+                    });
             }
-        };
-        for _ in 0..workers {
-            // A worker that cannot be created is not an error: the queue is
-            // hand-out, so whatever it would have taken is still there for
-            // someone else. The calling thread drains the remainder below,
-            // which is why this result can be dropped and why the answer is
-            // complete even if every spawn fails.
-            let _ = std::thread::Builder::new()
-                .stack_size(WORKER_STACK)
-                .spawn_scoped(scope, move || {
-                    drain();
-                    // This thread is done, so what it allocated and handed
-                    // back stops being its business and starts being
-                    // everyone's.
-                    hand_back_live();
-                });
-        }
-        drain();
-    });
+            drain();
+        });
+    }
     out
 }
 
@@ -2184,23 +2215,25 @@ pub unsafe extern "C" fn grasm_par_filter_scalar(
 
     let n = words.len();
     let mut keep: Vec<u8> = vec![0; n];
-    let workers = if IN_PARALLEL.with(|f| f.get()) || n < PAR_MIN_ELEMS {
-        1
-    } else {
-        std::thread::available_parallelism()
-            .map(|p| p.get())
-            .unwrap_or(1)
-            .min(n)
-    };
+    // The first element decides the rest, the same way `par_map` does it: what
+    // one costs is the only thing that says whether threading the others pays.
+    let mut workers = 1;
+    if n > 0 {
+        let began = std::time::Instant::now();
+        keep[0] = u8::from(code(env_owned.as_ptr(), words[0]) != 0);
+        workers = workers_for(n, began.elapsed());
+    }
 
     if workers <= 1 {
-        for (k, &x) in keep.iter_mut().zip(words.iter()) {
+        for (k, &x) in keep.iter_mut().zip(words.iter()).skip(1) {
             *k = u8::from(code(env_owned.as_ptr(), x) != 0);
         }
     } else {
-        let chunk = n.div_ceil(workers * 16).max(1);
+        let input: &[i64] = &words[1..];
+        let rest = &mut keep[1..];
+        let chunk = input.len().div_ceil(workers * 16).max(1);
         let pieces: std::sync::Mutex<Vec<(usize, &mut [u8])>> =
-            std::sync::Mutex::new(keep.chunks_mut(chunk).enumerate().collect());
+            std::sync::Mutex::new(rest.chunks_mut(chunk).enumerate().collect());
         std::thread::scope(|scope| {
             let queue = &pieces;
             let env_ref = &env_owned;
@@ -2210,7 +2243,7 @@ pub unsafe extern "C" fn grasm_par_filter_scalar(
                     let Some((ci, slot)) = queue.lock().expect("no panics inside").pop() else {
                         return;
                     };
-                    let src = &words[ci * chunk..ci * chunk + slot.len()];
+                    let src = &input[ci * chunk..ci * chunk + slot.len()];
                     for (k, &x) in slot.iter_mut().zip(src.iter()) {
                         *k = u8::from(code(env_ref.as_ptr(), x) != 0);
                     }

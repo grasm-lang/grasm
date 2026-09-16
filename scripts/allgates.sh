@@ -46,6 +46,8 @@ run_gate leakcheck     scripts/leakcheck.sh
 run_gate agreetest     scripts/agreetest.sh
 run_gate nativegaps    scripts/nativegaps.sh
 run_gate brokertest    scripts/broker_test.sh
+run_gate audiodiff     scripts/audio_diff.sh
+run_gate mixertest     scripts/mixer_test.sh
 run_gate replaytest    scripts/replaytest.sh
 run_gate wasmtest      scripts/wasmtest.sh
 run_gate gatecheck     scripts/gatecheck.sh
