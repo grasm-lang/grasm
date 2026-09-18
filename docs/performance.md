@@ -335,6 +335,27 @@ to match on the payload. Inlining it would mean the generated code depending on
 where Rust puts an enum's fields, which is not a promise Rust makes — so the
 route to it is an explicit layout, not a peephole.
 
+**Releasing a value asked the thread where its pool was before finding out
+whether it needed one.** `dec` opened with `LOCAL.with(...)`, and only inside
+that did it look at the refcount. But most releases free nothing: a borrow
+taken for the length of a call, an element a loop bound and dropped, a value
+somebody else still holds. Each of those is one atomic decrement and nothing
+more — no pool, no work list, no thread state — and every one of them was
+paying for a call through `_tlv_get_addr` first. A profile of a loop over a
+list of strings put that call at **twenty-eight percent**.
+
+The decrement happens first now, and `LOCAL` is reached only when the count
+actually reaches zero. Iterating a list of strings went from 6.46 ns an element
+to **4.61**, a list of structs with a field read from 7.82 to **5.87**, and on
+the benchmarks **wordfreq 1.21x and tree 1.12x** — the largest single change of
+the session.
+
+It is worth noticing why this one was found late. The cost was never in a
+function that looked expensive; it was in the *order* of two cheap things, and
+it only became visible after profiling a four-line loop rather than a
+benchmark. The benchmarks are averages over programs that do many things at
+once; a microbenchmark of one operation says which one.
+
 ## Where the remaining gap actually is
 
 Timed head to head by processor time, and split by compiling cut-down versions

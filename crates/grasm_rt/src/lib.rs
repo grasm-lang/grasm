@@ -1883,13 +1883,42 @@ unsafe fn dec(v: *mut RtVal) {
     // about a fifth of the program. Dropping a tree of ten thousand nodes made
     // ten thousand of those calls, one per node, for a pointer that cannot
     // change: the traversal never leaves the thread it started on.
-    LOCAL.with(|local| dec_in(local, v))
+    //
+    // But most releases free nothing at all. A borrow taken for the length of
+    // a call, an element a loop bound and dropped, a value somebody else still
+    // holds — each of those is one atomic decrement and nothing more, and it
+    // needs no pool and no thread state. Reaching for `LOCAL` before finding
+    // that out cost a call through `_tlv_get_addr` on every one of them, which
+    // was twenty-eight percent of a loop over a list of strings.
+    if v.is_null() {
+        return;
+    }
+    let rc = &(*v).rc;
+    if !is_counted(rc.load(Relaxed)) {
+        return;
+    }
+    // Release on the way down, Acquire before freeing: the `Arc` discipline,
+    // for the same reason it has it.
+    if rc.fetch_sub(1, Release) - 1 > 0 {
+        return;
+    }
+    std::sync::atomic::fence(Acquire);
+    // It has reached zero, so the box is going back to the pool and whatever
+    // it held has to be followed. *Now* the thread's state is worth fetching.
+    LOCAL.with(|local| dec_walk(local, v, true))
 }
 
 /// The walk itself, with the thread's state already in hand.
 ///
 /// # Safety: as `dec`.
-unsafe fn dec_in(local: &Local, v: *mut RtVal) {
+/// The walk, told whether the first value has already reached zero.
+///
+/// `dec` does that decrement itself, so that the common release — the one that
+/// frees nothing — never reaches the thread's state at all.
+///
+/// # Safety: as `dec`. When `first_is_zero`, `v`'s count has already reached
+/// zero and the acquire fence has already been taken.
+unsafe fn dec_walk(local: &Local, v: *mut RtVal, first_is_zero: bool) {
     // The children still to release. Almost always a handful — a struct has
     // two or three fields, a list a few elements — so they go in the frame,
     // and only a genuinely large value reaches the heap.
@@ -1908,67 +1937,78 @@ unsafe fn dec_in(local: &Local, v: *mut RtVal) {
     let mut n: usize = 0;
     let mut spill: Vec<*mut RtVal> = Vec::new();
     let mut cur = v;
+    let mut known_zero = first_is_zero;
     loop {
         if !cur.is_null() {
             let rc = &(*cur).rc;
-            if is_counted(rc.load(Relaxed)) {
-                // Release on the way down, Acquire before freeing: everything
-                // every other holder wrote through this value has to be
-                // visible to the thread that takes it apart. Again the `Arc`
-                // discipline, and for the same reason.
+            // Release on the way down, Acquire before freeing: everything
+            // every other holder wrote through this value has to be visible to
+            // the thread that takes it apart. Again the `Arc` discipline, and
+            // for the same reason.
+            let hit_zero = if known_zero {
+                true
+            } else if is_counted(rc.load(Relaxed)) {
                 let left = rc.fetch_sub(1, Release) - 1;
                 if left <= 0 {
                     std::sync::atomic::fence(Acquire);
-                    // The children are read out *before* the payload is
-                    // dropped; the box itself goes back to the pool.
-                    match &(*cur).payload {
-                        RtPayload::List(items) | RtPayload::Tuple(items) => {
-                            for c in items.iter() {
-                                push_pending(&mut inline, &mut n, &mut spill, *c);
-                            }
-                        }
-                        RtPayload::Map(entries) => {
-                            for c in entries.values() {
-                                push_pending(&mut inline, &mut n, &mut spill, *c);
-                            }
-                        }
-                        RtPayload::Struct { fields, .. } => {
-                            for c in fields.iter() {
-                                push_pending(&mut inline, &mut n, &mut spill, *c);
-                            }
-                        }
-                        RtPayload::Fn { env, .. } => {
-                            if !env.is_null() {
-                                push_pending(&mut inline, &mut n, &mut spill, *env);
-                            }
-                        }
-                        RtPayload::Variant { fields, .. } => {
-                            for c in fields.iter() {
-                                push_pending(&mut inline, &mut n, &mut spill, *c);
-                            }
-                        }
-                        // A handler owns one environment per operation, and an
-                        // environment owns whichever of its words are
-                        // references. Without these two arms a handler that
-                        // escaped its frame would leak everything it captured —
-                        // which is the whole reason it is allowed to escape.
-                        RtPayload::Handler { ops, .. } => {
-                            for env in ops.iter().map(|(_, _, e)| *e).filter(|e| !e.is_null()) {
-                                push_pending(&mut inline, &mut n, &mut spill, env);
-                            }
-                        }
-                        RtPayload::Env { words, boxed } => {
-                            for (w, is_boxed) in words.iter().zip(boxed.iter()) {
-                                if *is_boxed && *w != 0 {
-                                    push_pending(&mut inline, &mut n, &mut spill, *w as *mut RtVal);
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                    local.live.set(local.live.get() - 1);
-                    give_box_in(local, cur);
+                    true
+                } else {
+                    false
                 }
+            } else {
+                false
+            };
+            known_zero = false;
+            if hit_zero {
+                // The children are read out *before* the payload is
+                // dropped; the box itself goes back to the pool.
+                match &(*cur).payload {
+                    RtPayload::List(items) | RtPayload::Tuple(items) => {
+                        for c in items.iter() {
+                            push_pending(&mut inline, &mut n, &mut spill, *c);
+                        }
+                    }
+                    RtPayload::Map(entries) => {
+                        for c in entries.values() {
+                            push_pending(&mut inline, &mut n, &mut spill, *c);
+                        }
+                    }
+                    RtPayload::Struct { fields, .. } => {
+                        for c in fields.iter() {
+                            push_pending(&mut inline, &mut n, &mut spill, *c);
+                        }
+                    }
+                    RtPayload::Fn { env, .. } => {
+                        if !env.is_null() {
+                            push_pending(&mut inline, &mut n, &mut spill, *env);
+                        }
+                    }
+                    RtPayload::Variant { fields, .. } => {
+                        for c in fields.iter() {
+                            push_pending(&mut inline, &mut n, &mut spill, *c);
+                        }
+                    }
+                    // A handler owns one environment per operation, and an
+                    // environment owns whichever of its words are
+                    // references. Without these two arms a handler that
+                    // escaped its frame would leak everything it captured —
+                    // which is the whole reason it is allowed to escape.
+                    RtPayload::Handler { ops, .. } => {
+                        for env in ops.iter().map(|(_, _, e)| *e).filter(|e| !e.is_null()) {
+                            push_pending(&mut inline, &mut n, &mut spill, env);
+                        }
+                    }
+                    RtPayload::Env { words, boxed } => {
+                        for (w, is_boxed) in words.iter().zip(boxed.iter()) {
+                            if *is_boxed && *w != 0 {
+                                push_pending(&mut inline, &mut n, &mut spill, *w as *mut RtVal);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                local.live.set(local.live.get() - 1);
+                give_box_in(local, cur);
             }
         }
         // The frame first, then whatever spilled: the order releases are done
