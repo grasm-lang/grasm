@@ -675,9 +675,7 @@ pub fn example_group_program(program: &Program, examples: &[&Example]) -> Progra
         .flat_map(|f| {
             f.imports
                 .iter()
-                .map(move |(alias, target)| {
-                    ((f.name.clone(), alias.clone()), target.clone())
-                })
+                .map(move |(alias, target)| ((f.name.clone(), alias.clone()), target.clone()))
         })
         .collect();
     crate::loader::load_with_resolved_imports(
@@ -735,7 +733,10 @@ mod tests {
 
     #[test]
     fn a_skipped_block_does_not_swallow_the_next_one() {
-        assert_eq!(fenced_blocks("```text\na : b\n```\n\n```\nx\n```"), vec!["x"]);
+        assert_eq!(
+            fenced_blocks("```text\na : b\n```\n\n```\nx\n```"),
+            vec!["x"]
+        );
     }
 
     #[test]

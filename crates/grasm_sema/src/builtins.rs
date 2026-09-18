@@ -88,52 +88,204 @@ const PURE: &[&str] = &[];
 
 pub const BUILTINS: &[Builtin] = &[
     // --- the terminal ---
-    Builtin { name: "print", row: IO_ROW, journal: Journal::Repeated },
-    Builtin { name: "eprint", row: IO_ROW, journal: Journal::Repeated },
-    Builtin { name: "input", row: IO_ROW, journal: Journal::Recorded },
+    Builtin {
+        name: "print",
+        row: IO_ROW,
+        journal: Journal::Repeated,
+    },
+    Builtin {
+        name: "eprint",
+        row: IO_ROW,
+        journal: Journal::Repeated,
+    },
+    Builtin {
+        name: "input",
+        row: IO_ROW,
+        journal: Journal::Recorded,
+    },
     // --- the filesystem ---
-    Builtin { name: "read_file", row: IO_ROW, journal: Journal::Recorded },
-    Builtin { name: "write_file", row: IO_ROW, journal: Journal::Recorded },
-    Builtin { name: "read_bytes", row: IO_ROW, journal: Journal::Recorded },
-    Builtin { name: "read_bytes_at", row: IO_ROW, journal: Journal::Recorded },
-    Builtin { name: "append_bytes", row: IO_ROW, journal: Journal::Recorded },
-    Builtin { name: "file_size", row: IO_ROW, journal: Journal::Recorded },
-    Builtin { name: "sync_file", row: IO_ROW, journal: Journal::Recorded },
-    Builtin { name: "rename_file", row: IO_ROW, journal: Journal::Recorded },
-    Builtin { name: "write_bytes", row: IO_ROW, journal: Journal::Recorded },
-    Builtin { name: "file_exists", row: IO_ROW, journal: Journal::Recorded },
-    Builtin { name: "remove_file", row: IO_ROW, journal: Journal::Recorded },
-    Builtin { name: "make_dir", row: IO_ROW, journal: Journal::Recorded },
-    Builtin { name: "list_dir", row: IO_ROW, journal: Journal::Recorded },
+    Builtin {
+        name: "read_file",
+        row: IO_ROW,
+        journal: Journal::Recorded,
+    },
+    Builtin {
+        name: "write_file",
+        row: IO_ROW,
+        journal: Journal::Recorded,
+    },
+    Builtin {
+        name: "read_bytes",
+        row: IO_ROW,
+        journal: Journal::Recorded,
+    },
+    Builtin {
+        name: "read_bytes_at",
+        row: IO_ROW,
+        journal: Journal::Recorded,
+    },
+    Builtin {
+        name: "append_bytes",
+        row: IO_ROW,
+        journal: Journal::Recorded,
+    },
+    Builtin {
+        name: "file_size",
+        row: IO_ROW,
+        journal: Journal::Recorded,
+    },
+    Builtin {
+        name: "sync_file",
+        row: IO_ROW,
+        journal: Journal::Recorded,
+    },
+    Builtin {
+        name: "rename_file",
+        row: IO_ROW,
+        journal: Journal::Recorded,
+    },
+    Builtin {
+        name: "write_bytes",
+        row: IO_ROW,
+        journal: Journal::Recorded,
+    },
+    Builtin {
+        name: "file_exists",
+        row: IO_ROW,
+        journal: Journal::Recorded,
+    },
+    Builtin {
+        name: "remove_file",
+        row: IO_ROW,
+        journal: Journal::Recorded,
+    },
+    Builtin {
+        name: "make_dir",
+        row: IO_ROW,
+        journal: Journal::Recorded,
+    },
+    Builtin {
+        name: "list_dir",
+        row: IO_ROW,
+        journal: Journal::Recorded,
+    },
     // --- the process's own surroundings ---
-    Builtin { name: "args", row: IO_ROW, journal: Journal::Recorded },
-    Builtin { name: "env", row: IO_ROW, journal: Journal::Recorded },
-    Builtin { name: "now_millis", row: IO_ROW, journal: Journal::Recorded },
-    Builtin { name: "monotonic_millis", row: IO_ROW, journal: Journal::Recorded },
-    Builtin { name: "sleep_millis", row: IO_ROW, journal: Journal::Recorded },
+    Builtin {
+        name: "args",
+        row: IO_ROW,
+        journal: Journal::Recorded,
+    },
+    Builtin {
+        name: "env",
+        row: IO_ROW,
+        journal: Journal::Recorded,
+    },
+    Builtin {
+        name: "now_millis",
+        row: IO_ROW,
+        journal: Journal::Recorded,
+    },
+    Builtin {
+        name: "monotonic_millis",
+        row: IO_ROW,
+        journal: Journal::Recorded,
+    },
+    Builtin {
+        name: "sleep_millis",
+        row: IO_ROW,
+        journal: Journal::Recorded,
+    },
     // Reading entropy is reaching outside the program, and two calls do not
     // agree — which is the same reason `now_millis` is charged. A pure function
     // that answered differently each time would break every promise the effect
     // row makes.
-    Builtin { name: "random_bytes", row: IO_ROW, journal: Journal::Recorded },
+    Builtin {
+        name: "random_bytes",
+        row: IO_ROW,
+        journal: Journal::Recorded,
+    },
     // --- the network ---
-    Builtin { name: "tcp_listen", row: NET_ROW, journal: Journal::Recorded },
-    Builtin { name: "tcp_connect", row: NET_ROW, journal: Journal::Recorded },
-    Builtin { name: "tcp_accept", row: NET_ROW, journal: Journal::Recorded },
-    Builtin { name: "tcp_read", row: NET_ROW, journal: Journal::Recorded },
-    Builtin { name: "tcp_read_bytes", row: NET_ROW, journal: Journal::Recorded },
-    Builtin { name: "tcp_write", row: NET_ROW, journal: Journal::Recorded },
-    Builtin { name: "tcp_write_bytes", row: NET_ROW, journal: Journal::Recorded },
-    Builtin { name: "net_close", row: NET_ROW, journal: Journal::Recorded },
-    Builtin { name: "net_wait", row: NET_ROW, journal: Journal::Recorded },
-    Builtin { name: "net_port", row: NET_ROW, journal: Journal::Recorded },
-    Builtin { name: "udp_bind", row: NET_ROW, journal: Journal::Recorded },
-    Builtin { name: "udp_send", row: NET_ROW, journal: Journal::Recorded },
-    Builtin { name: "udp_recv", row: NET_ROW, journal: Journal::Recorded },
-    Builtin { name: "udp_recv_from", row: NET_ROW, journal: Journal::Recorded },
+    Builtin {
+        name: "tcp_listen",
+        row: NET_ROW,
+        journal: Journal::Recorded,
+    },
+    Builtin {
+        name: "tcp_connect",
+        row: NET_ROW,
+        journal: Journal::Recorded,
+    },
+    Builtin {
+        name: "tcp_accept",
+        row: NET_ROW,
+        journal: Journal::Recorded,
+    },
+    Builtin {
+        name: "tcp_read",
+        row: NET_ROW,
+        journal: Journal::Recorded,
+    },
+    Builtin {
+        name: "tcp_read_bytes",
+        row: NET_ROW,
+        journal: Journal::Recorded,
+    },
+    Builtin {
+        name: "tcp_write",
+        row: NET_ROW,
+        journal: Journal::Recorded,
+    },
+    Builtin {
+        name: "tcp_write_bytes",
+        row: NET_ROW,
+        journal: Journal::Recorded,
+    },
+    Builtin {
+        name: "net_close",
+        row: NET_ROW,
+        journal: Journal::Recorded,
+    },
+    Builtin {
+        name: "net_wait",
+        row: NET_ROW,
+        journal: Journal::Recorded,
+    },
+    Builtin {
+        name: "net_port",
+        row: NET_ROW,
+        journal: Journal::Recorded,
+    },
+    Builtin {
+        name: "udp_bind",
+        row: NET_ROW,
+        journal: Journal::Recorded,
+    },
+    Builtin {
+        name: "udp_send",
+        row: NET_ROW,
+        journal: Journal::Recorded,
+    },
+    Builtin {
+        name: "udp_recv",
+        row: NET_ROW,
+        journal: Journal::Recorded,
+    },
+    Builtin {
+        name: "udp_recv_from",
+        row: NET_ROW,
+        journal: Journal::Recorded,
+    },
     // --- other programs ---
-    Builtin { name: "proc_run", row: PROC_ROW, journal: Journal::Recorded },
-    Builtin { name: "proc_pipeline", row: PROC_ROW, journal: Journal::Recorded },
+    Builtin {
+        name: "proc_run",
+        row: PROC_ROW,
+        journal: Journal::Recorded,
+    },
+    Builtin {
+        name: "proc_pipeline",
+        row: PROC_ROW,
+        journal: Journal::Recorded,
+    },
     // --- reaching nothing ---
     //
     // `bytes_of` converts a list. The other three end the program: they observe
@@ -142,11 +294,31 @@ pub const BUILTINS: &[Builtin] = &[
     // deliberate exemption and it is the reason this row is written out rather
     // than left implied — a builtin with no row should be a decision, not an
     // omission, which is exactly the distinction F35 turned on.
-    Builtin { name: "bytes_of", row: PURE, journal: Journal::Untouched },
-    Builtin { name: "exit", row: PURE, journal: Journal::Untouched },
-    Builtin { name: "panic", row: PURE, journal: Journal::Untouched },
-    Builtin { name: "assert", row: PURE, journal: Journal::Untouched },
-    Builtin { name: "assert_eq", row: PURE, journal: Journal::Untouched },
+    Builtin {
+        name: "bytes_of",
+        row: PURE,
+        journal: Journal::Untouched,
+    },
+    Builtin {
+        name: "exit",
+        row: PURE,
+        journal: Journal::Untouched,
+    },
+    Builtin {
+        name: "panic",
+        row: PURE,
+        journal: Journal::Untouched,
+    },
+    Builtin {
+        name: "assert",
+        row: PURE,
+        journal: Journal::Untouched,
+    },
+    Builtin {
+        name: "assert_eq",
+        row: PURE,
+        journal: Journal::Untouched,
+    },
 ];
 
 /// The row calling `name` performs, or empty if it is not a builtin.

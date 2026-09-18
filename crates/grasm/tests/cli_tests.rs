@@ -18,10 +18,8 @@ struct Work(PathBuf);
 impl Work {
     fn new(tag: &str) -> Work {
         let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "grasm_cli_test_{}_{n}_{tag}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("grasm_cli_test_{}_{n}_{tag}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         Work(dir)
     }
@@ -52,7 +50,8 @@ fn app_entry(app: &Path) -> String {
     app.join("src/main.gr").to_string_lossy().into_owned()
 }
 
-const OVER_CEILING: &str = "[package]\nname = \"quietlib\"\nversion = \"0.1.0\"\ncapabilities = []\n";
+const OVER_CEILING: &str =
+    "[package]\nname = \"quietlib\"\nversion = \"0.1.0\"\ncapabilities = []\n";
 const AT_CEILING: &str =
     "[package]\nname = \"quietlib\"\nversion = \"0.1.0\"\ncapabilities = [\"io\"]\n";
 const LIB_SRC: &str = "pub fn greet() -> i64 {\n    print(\"side effect\")\n    5\n}\n";
@@ -173,7 +172,11 @@ fn a_dependencys_private_module_is_not_replaceable_by_the_consumer() {
         "import sub.helper\n\npub fn f() -> i64 {\n    helper.g()\n}\n",
     )
     .unwrap();
-    std::fs::write(lib.join("src/sub/helper.gr"), "pub fn g() -> i64 {\n    7\n}\n").unwrap();
+    std::fs::write(
+        lib.join("src/sub/helper.gr"),
+        "pub fn g() -> i64 {\n    7\n}\n",
+    )
+    .unwrap();
     std::fs::write(
         app.join("grasm.toml"),
         "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies.liba]\npath = \"../liba\"\n",
@@ -396,7 +399,11 @@ fn a_doc_example_behaves_the_same_from_the_library_and_from_a_consumer() {
 fn a_closure_crossing_a_module_boundary_agrees_between_engines() {
     let w = Work::new("closmod");
     std::fs::create_dir_all(&w.0).unwrap();
-    std::fs::write(w.0.join("helper.gr"), "pub fn value() -> str {\n    \"from helper\"\n}\n").unwrap();
+    std::fs::write(
+        w.0.join("helper.gr"),
+        "pub fn value() -> str {\n    \"from helper\"\n}\n",
+    )
+    .unwrap();
     std::fs::write(
         w.0.join("engine.gr"),
         "pub fn apply(f: fn() -> str) -> str {\n    f()\n}\n",
@@ -414,7 +421,13 @@ fn a_closure_crossing_a_module_boundary_agrees_between_engines() {
     assert!(text.contains("from helper"), "wrong output:\n{text}");
 
     let bin = w.0.join("out");
-    run(&["build", entry.to_str().unwrap(), "--native", "-o", bin.to_str().unwrap()]);
+    run(&[
+        "build",
+        entry.to_str().unwrap(),
+        "--native",
+        "-o",
+        bin.to_str().unwrap(),
+    ]);
     let out = Command::new(&bin).output().expect("runs");
     assert_eq!(
         String::from_utf8_lossy(&out.stdout).trim(),
@@ -488,12 +501,20 @@ fn api_classifies_changes_by_what_actually_changed() {
     assert_eq!(code, 0, "should print a surface:\n{surface}");
     assert!(surface.contains("lib\torigin"), "surface:\n{surface}");
     // A private function is not surface.
-    assert!(!surface.contains("helper"), "private item leaked:\n{surface}");
+    assert!(
+        !surface.contains("helper"),
+        "private item leaked:\n{surface}"
+    );
     let saved = w.0.join("v1.api");
     std::fs::write(&saved, &surface).unwrap();
 
     // Unchanged.
-    let (code, text) = run(&["api", main.to_str().unwrap(), "--against", saved.to_str().unwrap()]);
+    let (code, text) = run(&[
+        "api",
+        main.to_str().unwrap(),
+        "--against",
+        saved.to_str().unwrap(),
+    ]);
     assert_eq!(code, 0);
     assert!(text.contains("PATCH"), "{text}");
 
@@ -506,7 +527,12 @@ fn api_classifies_changes_by_what_actually_changed() {
          fn helper() -> i64 {\n    1\n}\n",
     )
     .unwrap();
-    let (code, text) = run(&["api", main.to_str().unwrap(), "--against", saved.to_str().unwrap()]);
+    let (code, text) = run(&[
+        "api",
+        main.to_str().unwrap(),
+        "--against",
+        saved.to_str().unwrap(),
+    ]);
     assert_eq!(code, 0, "additive must not fail:\n{text}");
     assert!(text.contains("MINOR") && text.contains("ADDED"), "{text}");
 
@@ -518,7 +544,12 @@ fn api_classifies_changes_by_what_actually_changed() {
          fn helper() -> i64 {\n    1\n}\n",
     )
     .unwrap();
-    let (code, text) = run(&["api", main.to_str().unwrap(), "--against", saved.to_str().unwrap()]);
+    let (code, text) = run(&[
+        "api",
+        main.to_str().unwrap(),
+        "--against",
+        saved.to_str().unwrap(),
+    ]);
     assert_eq!(code, 1, "breaking must fail the check:\n{text}");
     assert!(text.contains("MAJOR") && text.contains("CHANGED"), "{text}");
 }
@@ -591,7 +622,10 @@ fn a_doc_example_counts_toward_the_capability_ceiling() {
     );
     let entry = app_entry(&app);
     let (code, out) = run(&["check", entry.as_str()]);
-    assert_eq!(code, 1, "a printing doc example is over the ceiling:\n{out}");
+    assert_eq!(
+        code, 1,
+        "a printing doc example is over the ceiling:\n{out}"
+    );
     assert!(out.contains("performs `io`"), "{out}");
 
     // And the form that does not perform anything is accepted.
@@ -765,7 +799,10 @@ fn an_unknown_flag_is_refused() {
         "-o",
         out_path.to_str().unwrap(),
     ]);
-    assert_eq!(code, 1, "a typo in --native must not build a bundle:\n{out}");
+    assert_eq!(
+        code, 1,
+        "a typo in --native must not build a bundle:\n{out}"
+    );
     assert!(out.contains("has no option `--natives`"), "{out}");
 
     // And a value-taking option with no value is a lost operand.
@@ -788,7 +825,14 @@ fn a_discarded_failure_in_main_is_reported() {
     let native = w.0.join("m_native");
     let bundle = w.0.join("m_bundle");
     assert_eq!(
-        run(&["build", f.to_str().unwrap(), "--native", "-o", native.to_str().unwrap()]).0,
+        run(&[
+            "build",
+            f.to_str().unwrap(),
+            "--native",
+            "-o",
+            native.to_str().unwrap()
+        ])
+        .0,
         0
     );
     assert_eq!(
@@ -862,7 +906,10 @@ fn a_failed_import_names_the_paths_that_were_tried() {
         !out.contains("app/src/liba"),
         "the consumer's tree is not where this import is looked for:\n{out}"
     );
-    assert!(!out.contains(".."), "paths are collapsed, not chained:\n{out}");
+    assert!(
+        !out.contains(".."),
+        "paths are collapsed, not chained:\n{out}"
+    );
 
     // A module two packages down names both real candidates, in order.
     std::fs::write(
@@ -1153,7 +1200,10 @@ fn a_graph_past_the_depth_limit_says_the_limit() {
     let (code, out) = run(&["check", &app_entry(&app)]);
     assert_eq!(code, 1, "{out}");
     assert!(out.contains("more than 64 deep from the entry"), "{out}");
-    assert!(!out.contains("/p10/p11/p12"), "concatenated path in:\n{out}");
+    assert!(
+        !out.contains("/p10/p11/p12"),
+        "concatenated path in:\n{out}"
+    );
     assert!(out.lines().count() < 12, "{out}");
 }
 
@@ -1229,7 +1279,9 @@ fn deps_blames_the_file_the_error_is_in() {
         "both rows name the failing file:\n{text}"
     );
     assert!(
-        text.contains("cannot analyze package `app`: `../dep/src/main.gr` (reached through a dependency)"),
+        text.contains(
+            "cannot analyze package `app`: `../dep/src/main.gr` (reached through a dependency)"
+        ),
         "{text}"
     );
     assert!(
@@ -1252,8 +1304,11 @@ fn a_bundles_trace_names_the_entry_file() {
     let w = Work::new("bundletrace");
     let dir = w.0.join("src");
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("helper.gr"), "pub fn crash(n: i64) -> i64 {\n    n / 0\n}\n")
-        .unwrap();
+    std::fs::write(
+        dir.join("helper.gr"),
+        "pub fn crash(n: i64) -> i64 {\n    n / 0\n}\n",
+    )
+    .unwrap();
     let entry = dir.join("app.gr");
     std::fs::write(
         &entry,
@@ -1348,13 +1403,13 @@ n * 2\n}\n",
         "import lib\n\nfn main() {\n    print(\"{lib.go(3)}\")\n}\n",
     );
     let entry = app_entry(&app);
-    for args in [
-        vec!["check", entry.as_str()],
-        vec!["run", entry.as_str()],
-    ] {
+    for args in [vec!["check", entry.as_str()], vec!["run", entry.as_str()]] {
         let (code, out) = run(&args);
         assert_eq!(code, 1, "{args:?}: {out}");
-        assert!(out.contains("is reserved by the language"), "{args:?}: {out}");
+        assert!(
+            out.contains("is reserved by the language"),
+            "{args:?}: {out}"
+        );
         assert!(!out.contains("lib wrote to your stdout"), "{args:?}: {out}");
     }
     let out = Command::new(GRASM)
@@ -1364,8 +1419,8 @@ n * 2\n}\n",
         .output()
         .expect("runs");
     assert_eq!(out.status.code(), Some(1));
-    let text = String::from_utf8_lossy(&out.stdout).into_owned()
-        + &String::from_utf8_lossy(&out.stderr);
+    let text =
+        String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
     assert!(text.contains("CANNOT ANALYZE"), "{text}");
     assert!(!text.contains("performs []"), "{text}");
 }
@@ -1392,7 +1447,10 @@ fn a_build_that_cannot_write_its_output_says_so_plainly() {
         assert_eq!(code, 1, "{args:?}: {out}");
         assert!(out.contains("cannot write"), "{args:?}: {out}");
         assert!(out.contains("is not a directory"), "{args:?}: {out}");
-        assert!(!out.contains("grasm_native_"), "internal path leaked:\n{out}");
+        assert!(
+            !out.contains("grasm_native_"),
+            "internal path leaked:\n{out}"
+        );
         assert!(!out.contains("out.o"), "internal path leaked:\n{out}");
     }
     // And a build that does work is unaffected.
@@ -1444,8 +1502,8 @@ unsafe {\n        getpid() + x\n    }\n}\n\nfn main() {\n    print(\"{lib.call_a
         .output()
         .expect("runs");
     assert_eq!(out.status.code(), Some(1));
-    let text = String::from_utf8_lossy(&out.stdout).into_owned()
-        + &String::from_utf8_lossy(&out.stderr);
+    let text =
+        String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
     assert!(!text.contains("lib              performs []"), "{text}");
     assert!(!app.join("grasm.lock").exists(), "{text}");
 }
@@ -1474,8 +1532,8 @@ fn a_flag_before_the_directory_does_not_swallow_it() {
         .current_dir(&pkg)
         .output()
         .expect("runs");
-    let text = String::from_utf8_lossy(&out.stdout).into_owned()
-        + &String::from_utf8_lossy(&out.stderr);
+    let text =
+        String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(1), "{text}");
     assert!(!text.contains("up to date"), "{text}");
     assert!(text.contains("nowhere"), "{text}");
@@ -1521,7 +1579,10 @@ fn a_flag_before_the_file_does_not_take_its_place() {
     ] {
         let (code, out) = run(&args);
         assert_eq!(code, 1, "{args:?}: {out}");
-        assert!(out.contains("--cases must be at least 1"), "{args:?}: {out}");
+        assert!(
+            out.contains("--cases must be at least 1"),
+            "{args:?}: {out}"
+        );
     }
 
     let md = w.0.join("out.md");
@@ -1725,8 +1786,8 @@ pub fn add(a: i64, b: i64) -> i64 {\n    a + b\n}\n",
         .current_dir(&app)
         .output()
         .expect("runs");
-    let text = String::from_utf8_lossy(&out.stdout).into_owned()
-        + &String::from_utf8_lossy(&out.stderr);
+    let text =
+        String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(0), "{text}");
     assert!(text.contains("app              performs []"), "{text}");
 }
@@ -1772,11 +1833,7 @@ fn a_native_build_leaves_no_scratch_directory() {
             return 0;
         };
         rd.flatten()
-            .filter(|e| {
-                e.file_name()
-                    .to_string_lossy()
-                    .starts_with("grasm_native_")
-            })
+            .filter(|e| e.file_name().to_string_lossy().starts_with("grasm_native_"))
             .count()
     };
     let before = leaked();

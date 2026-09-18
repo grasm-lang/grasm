@@ -74,7 +74,11 @@ pub enum Wire {
     Tuple(Vec<Wire>),
     /// `Ok`/`Err`/`Some`/`None`/`IoError` — every fallible builtin answers with
     /// one of these.
-    Variant { ty: String, name: String, fields: Vec<Wire> },
+    Variant {
+        ty: String,
+        name: String,
+        fields: Vec<Wire>,
+    },
 }
 
 impl Wire {
@@ -210,16 +214,32 @@ impl Wire {
 
     /// `Ok(v)` / `Err(v)` / `Some(v)` / `None`, built the way every engine does.
     pub fn ok(v: Wire) -> Wire {
-        Wire::Variant { ty: "!".into(), name: "Ok".into(), fields: vec![v] }
+        Wire::Variant {
+            ty: "!".into(),
+            name: "Ok".into(),
+            fields: vec![v],
+        }
     }
     pub fn err(v: Wire) -> Wire {
-        Wire::Variant { ty: "!".into(), name: "Err".into(), fields: vec![v] }
+        Wire::Variant {
+            ty: "!".into(),
+            name: "Err".into(),
+            fields: vec![v],
+        }
     }
     pub fn some(v: Wire) -> Wire {
-        Wire::Variant { ty: "Option".into(), name: "Some".into(), fields: vec![v] }
+        Wire::Variant {
+            ty: "Option".into(),
+            name: "Some".into(),
+            fields: vec![v],
+        }
     }
     pub fn none() -> Wire {
-        Wire::Variant { ty: "Option".into(), name: "None".into(), fields: vec![] }
+        Wire::Variant {
+            ty: "Option".into(),
+            name: "None".into(),
+            fields: vec![],
+        }
     }
     /// The one error type every `io` builtin fails with.
     pub fn io_error(kind: &str, message: &str) -> Wire {
@@ -304,7 +324,10 @@ fn bracketed(items: &[Wire], budget: usize, open: char, close: char) -> String {
 enum Mode {
     Off,
     Recording(std::fs::File),
-    Replaying { records: Vec<(String, Wire)>, at: usize },
+    Replaying {
+        records: Vec<(String, Wire)>,
+        at: usize,
+    },
 }
 
 thread_local! {
@@ -565,7 +588,10 @@ mod tests {
         let back = super::read(path.as_os_str()).expect("reads");
         assert_eq!(back.len(), 2);
         assert_eq!(back[0].0, "now_millis");
-        assert_eq!(back[1].1.render(usize::MAX), "Err(IoFailed(\"disk quota exceeded\"))");
+        assert_eq!(
+            back[1].1.render(usize::MAX),
+            "Err(IoFailed(\"disk quota exceeded\"))"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -574,7 +600,10 @@ mod tests {
     fn a_truncated_value_is_refused() {
         let raw = Wire::Str("abcdef".into()).encode();
         for cut in 1..raw.len() {
-            assert!(Wire::decode(&raw[..cut]).is_err(), "accepted a {cut}-byte prefix");
+            assert!(
+                Wire::decode(&raw[..cut]).is_err(),
+                "accepted a {cut}-byte prefix"
+            );
         }
     }
 }

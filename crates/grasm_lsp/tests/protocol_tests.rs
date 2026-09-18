@@ -71,13 +71,13 @@ fn request(id: i64, method: &str, params: Json) -> String {
 
 fn position_params(uri: &str, line: i64, ch: i64) -> Json {
     Json::obj(vec![
-        (
-            "textDocument",
-            Json::obj(vec![("uri", Json::str(uri))]),
-        ),
+        ("textDocument", Json::obj(vec![("uri", Json::str(uri))])),
         (
             "position",
-            Json::obj(vec![("line", Json::int(line)), ("character", Json::int(ch))]),
+            Json::obj(vec![
+                ("line", Json::int(line)),
+                ("character", Json::int(ch)),
+            ]),
         ),
     ])
 }
@@ -118,7 +118,12 @@ fn errors_are_published_with_ranges_and_help() {
     };
     assert_eq!(diags.len(), 1);
     let d = &diags[0];
-    assert!(d.get("message").unwrap().as_str().unwrap().contains("type mismatch"));
+    assert!(d
+        .get("message")
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .contains("type mismatch"));
     assert_eq!(d.get("severity").unwrap().as_i64(), Some(1));
     assert_eq!(d.get("source").unwrap().as_str(), Some("grasm"));
     // Line 1 (0-based), pointing at the string literal.
@@ -169,7 +174,10 @@ fn edits_refresh_diagnostics() {
         panic!()
     };
     assert_eq!(first.len(), 1);
-    assert_eq!(out[1].path("params.diagnostics").unwrap(), &Json::Arr(vec![]));
+    assert_eq!(
+        out[1].path("params.diagnostics").unwrap(),
+        &Json::Arr(vec![])
+    );
 }
 
 #[test]
@@ -177,10 +185,18 @@ fn hover_shows_function_signature() {
     // Line 4 is `pub fn area(s: Shape) -> f64 {`, "area" starts at column 7.
     let out = run(&[
         &open_doc("file:///e.gr", SAMPLE),
-        &request(2, "textDocument/hover", position_params("file:///e.gr", 4, 8)),
+        &request(
+            2,
+            "textDocument/hover",
+            position_params("file:///e.gr", 4, 8),
+        ),
     ]);
     let hover = out.iter().find(|m| m.get("id").is_some()).unwrap();
-    let text = hover.path("result.contents.value").unwrap().as_str().unwrap();
+    let text = hover
+        .path("result.contents.value")
+        .unwrap()
+        .as_str()
+        .unwrap();
     assert!(text.contains("pub fn area(s: Shape) -> f64"), "got: {text}");
 }
 
@@ -189,14 +205,30 @@ fn hover_shows_variant_and_builtin() {
     let out = run(&[
         &open_doc("file:///f.gr", SAMPLE),
         // "Circle" inside the match arm (line 6).
-        &request(2, "textDocument/hover", position_params("file:///f.gr", 6, 10)),
+        &request(
+            2,
+            "textDocument/hover",
+            position_params("file:///f.gr", 6, 10),
+        ),
         // "print" on line 12.
-        &request(3, "textDocument/hover", position_params("file:///f.gr", 12, 6)),
+        &request(
+            3,
+            "textDocument/hover",
+            position_params("file:///f.gr", 12, 6),
+        ),
     ]);
     let replies: Vec<&Json> = out.iter().filter(|m| m.get("id").is_some()).collect();
-    let variant = replies[0].path("result.contents.value").unwrap().as_str().unwrap();
+    let variant = replies[0]
+        .path("result.contents.value")
+        .unwrap()
+        .as_str()
+        .unwrap();
     assert!(variant.contains("Shape.Circle(r: f64)"), "got: {variant}");
-    let builtin = replies[1].path("result.contents.value").unwrap().as_str().unwrap();
+    let builtin = replies[1]
+        .path("result.contents.value")
+        .unwrap()
+        .as_str()
+        .unwrap();
     assert!(builtin.contains("io effect"), "got: {builtin}");
 }
 
@@ -216,7 +248,10 @@ fn goto_definition_finds_the_declaration() {
         reply.path("result.uri").unwrap().as_str(),
         Some("file:///g.gr")
     );
-    assert_eq!(reply.path("result.range.start.line").unwrap().as_i64(), Some(4));
+    assert_eq!(
+        reply.path("result.range.start.line").unwrap().as_i64(),
+        Some(4)
+    );
 }
 
 #[test]
@@ -238,7 +273,10 @@ fn completion_offers_locals_keywords_and_builtins() {
         .filter_map(|i| i.get("label").and_then(|l| l.as_str()))
         .collect();
     for expected in ["area", "Shape", "Circle", "match", "print", "fail"] {
-        assert!(labels.contains(&expected), "missing `{expected}` in {labels:?}");
+        assert!(
+            labels.contains(&expected),
+            "missing `{expected}` in {labels:?}"
+        );
     }
 }
 
@@ -306,11 +344,22 @@ fn hover_includes_the_doc_comment() {
     let out = run(&[
         &open_doc("file:///d.gr", src),
         // "add" on line 2 (0-based), column 3.
-        &request(2, "textDocument/hover", position_params("file:///d.gr", 2, 4)),
+        &request(
+            2,
+            "textDocument/hover",
+            position_params("file:///d.gr", 2, 4),
+        ),
     ]);
     let hover = out.iter().find(|m| m.get("id").is_some()).unwrap();
-    let text = hover.path("result.contents.value").unwrap().as_str().unwrap();
-    assert!(text.contains("fn add(a: i64, b: i64) -> i64"), "got: {text}");
+    let text = hover
+        .path("result.contents.value")
+        .unwrap()
+        .as_str()
+        .unwrap();
+    assert!(
+        text.contains("fn add(a: i64, b: i64) -> i64"),
+        "got: {text}"
+    );
     assert!(text.contains("Adds two integers."), "got: {text}");
     assert!(text.contains("Wraps on overflow."), "got: {text}");
 }
@@ -320,10 +369,18 @@ fn hover_without_a_doc_comment_shows_only_the_signature() {
     let src = "fn add(a: i64, b: i64) -> i64 {\n    a + b\n}\n";
     let out = run(&[
         &open_doc("file:///nd.gr", src),
-        &request(2, "textDocument/hover", position_params("file:///nd.gr", 0, 4)),
+        &request(
+            2,
+            "textDocument/hover",
+            position_params("file:///nd.gr", 0, 4),
+        ),
     ]);
     let hover = out.iter().find(|m| m.get("id").is_some()).unwrap();
-    let text = hover.path("result.contents.value").unwrap().as_str().unwrap();
+    let text = hover
+        .path("result.contents.value")
+        .unwrap()
+        .as_str()
+        .unwrap();
     assert!(text.contains("fn add"), "got: {text}");
     assert!(!text.contains("---"), "no separator without a doc: {text}");
 }
@@ -354,7 +411,8 @@ fn a_file_with_imports_resolves_them() {
     assert_eq!(diags, &Json::Arr(vec![]), "imports should resolve");
 
     // And a genuine error in the same file is still reported.
-    let broken = "import util\n\nfn main() {\n    let s: str = util.scale(3)\n    print(\"{s}\")\n}\n";
+    let broken =
+        "import util\n\nfn main() {\n    let s: str = util.scale(3)\n    print(\"{s}\")\n}\n";
     std::fs::write(&main_path, broken).unwrap();
     let out = run(&[&open_doc(&uri, broken)]);
     let Json::Arr(diags) = out[0].path("params.diagnostics").unwrap() else {

@@ -54,38 +54,38 @@ pub enum TokenKind {
     RBracket,
     Comma,
     Dot,
-    DotDot,     // ..
-    DotDotEq,   // ..=
+    DotDot,   // ..
+    DotDotEq, // ..=
     Colon,
     ColonColon,
-    Arrow,      // ->
-    FatArrow,   // =>
-    Pipe,       // |
-    PipeGt,     // |>
+    Arrow,    // ->
+    FatArrow, // =>
+    Pipe,     // |
+    PipeGt,   // |>
     /// `&&` and `||`, which Grasm spells `and` and `or` ([G-BOOL-OPS]).
     ///
     /// Lexed as tokens of their own rather than rejected as characters, so the
     /// error can be raised where the operator's *precedence* is known — the
     /// parser then consumes it as the operator it obviously is and keeps going,
     /// reporting one mistake instead of desyncing and reporting two.
-    AmpAmp,     // &&
-    PipePipe,   // ||
+    AmpAmp, // &&
+    PipePipe, // ||
     Plus,
     Minus,
     Star,
     Slash,
     Percent,
-    Caret,      // ^ (power)
-    Eq,         // =
+    Caret, // ^ (power)
+    Eq,    // =
     EqEq,
-    NotEq,      // !=
+    NotEq, // !=
     Lt,
     LtEq,
     Gt,
     GtEq,
-    Bang,       // !  (error union in types)
-    Question,   // ?
-    QuestionDot,     // ?.
+    Bang,             // !  (error union in types)
+    Question,         // ?
+    QuestionDot,      // ?.
     QuestionQuestion, // ??
     PlusEq,
     MinusEq,
@@ -108,7 +108,10 @@ pub enum StrPart {
     /// Raw source of an interpolated expression: `"hi {name}"`.
     /// Parsed into an expression by the parser. `offset` is the byte offset of
     /// `src` within the file, so sub-expression spans stay accurate.
-    Interp { src: String, offset: u32 },
+    Interp {
+        src: String,
+        offset: u32,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]

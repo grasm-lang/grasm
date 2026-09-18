@@ -70,7 +70,13 @@ fn ast_forms() -> BTreeMap<String, Vec<String>> {
 /// The Core table's row count, per section heading in `spec/core.md`.
 fn declared_core_counts(doc: &str) -> BTreeMap<String, usize> {
     let mut out = BTreeMap::new();
-    for section in ["Expressions", "Statements", "Declarations", "Types", "Patterns"] {
+    for section in [
+        "Expressions",
+        "Statements",
+        "Declarations",
+        "Types",
+        "Patterns",
+    ] {
         let needle = format!("### {section} (");
         if let Some(i) = doc.find(&needle) {
             let rest = &doc[i + needle.len()..];
@@ -305,9 +311,7 @@ grown past the point where the gap is worth recording rather than closing."
 
     let unique: BTreeSet<&str> = ["placeholder"].into_iter().collect();
     let _ = unique;
-    println!(
-        "kernel budgets — interpreter {interp_lines}/5000 lines, spec ~{pages}/50 pages"
-    );
+    println!("kernel budgets — interpreter {interp_lines}/5000 lines, spec ~{pages}/50 pages");
 }
 
 /// The route to 30 must be as long as the distance to 30.
@@ -382,8 +386,8 @@ the same number — that is exactly the drift this test exists for"
     );
 
     // And in the README, which is what a reader meets first.
-    let readme = std::fs::read_to_string(repo_root().join("README.md"))
-        .expect("README.md should exist");
+    let readme =
+        std::fs::read_to_string(repo_root().join("README.md")).expect("README.md should exist");
     assert!(
         readme.contains(&format!("{core} constructs against a budget of 30")),
         "README.md disagrees with spec/core.md about the Core count ({core})"

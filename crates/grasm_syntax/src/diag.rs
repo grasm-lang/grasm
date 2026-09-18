@@ -54,7 +54,11 @@ impl Diagnostic {
         // window around the span rather than the line.
         let (line_text, caret_col) = window(full, (lc.col - 1) as usize, width);
         let caret_pad = " ".repeat(caret_col);
-        let carets = "^".repeat(width.min(line_text.chars().count().saturating_sub(caret_col)).max(1));
+        let carets = "^".repeat(
+            width
+                .min(line_text.chars().count().saturating_sub(caret_col))
+                .max(1),
+        );
         let mut out = format!(
             "{file}:{}:{}: {sev}: {}\n    {line_text}\n    {caret_pad}{carets}",
             lc.line, lc.col, self.message

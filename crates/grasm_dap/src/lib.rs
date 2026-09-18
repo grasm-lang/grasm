@@ -15,8 +15,8 @@ use grasm_interp::{DebugHook, Interp};
 use grasm_sema::loader::Program;
 use grasm_syntax::span::{LineIndex, Span};
 use json::Json;
-use std::collections::BTreeSet;
 use std::cell::RefCell;
+use std::collections::BTreeSet;
 use std::io::{BufRead, Write};
 use std::rc::Rc;
 
@@ -336,7 +336,10 @@ fn serve_while_stopped<I: BufRead, O: Write, W: Write>(
         match command.as_str() {
             "continue" => {
                 session.resume = Resume::Continue;
-                session.respond(&msg, Json::obj(vec![("allThreadsContinued", Json::Bool(true))]));
+                session.respond(
+                    &msg,
+                    Json::obj(vec![("allThreadsContinued", Json::Bool(true))]),
+                );
                 return;
             }
             "next" => {
@@ -493,7 +496,9 @@ fn variables<I: BufRead, O: Write, W: Write>(
     for scope in interp.debug_scopes().iter().rev() {
         for (name, value) in scope {
             seen.entry(name.clone()).or_insert_with(|| render(value));
-            types.entry(name.clone()).or_insert_with(|| type_name(value));
+            types
+                .entry(name.clone())
+                .or_insert_with(|| type_name(value));
         }
     }
     let vars: Vec<Json> = seen
@@ -533,7 +538,10 @@ fn set_breakpoints<I: BufRead, O: Write>(session: &mut Session<I, O>, request: &
             .iter()
             .any(|(p, _, _)| p == &path || file_name(p) == file_name(&path));
         if known && line > 0 {
-            session.breakpoints.lines.insert((path.clone(), line as u32));
+            session
+                .breakpoints
+                .lines
+                .insert((path.clone(), line as u32));
         }
         verified.push(Json::obj(vec![
             ("verified", Json::Bool(known && line > 0)),
@@ -649,10 +657,7 @@ pub fn serve<I: BufRead + 'static, O: Write + 'static>(
                     .path("arguments.program")
                     .and_then(Json::as_str)
                     .unwrap_or("");
-                stop_on_entry = matches!(
-                    msg.path("arguments.stopOnEntry"),
-                    Some(Json::Bool(true))
-                );
+                stop_on_entry = matches!(msg.path("arguments.stopOnEntry"), Some(Json::Bool(true)));
                 // `"journal": "path"` in launch.json steps through a *recorded*
                 // run rather than a fresh one. This is the pair the two halves
                 // were built for: the failure happens in the compiled build on
@@ -682,10 +687,7 @@ pub fn serve<I: BufRead + 'static, O: Write + 'static>(
                     Ok(p) => {
                         program = Some(p);
                         launch_request = Some(msg.clone());
-                        write_message(
-                            &mut output,
-                            &ok_response(seq, &msg, Json::obj(vec![])),
-                        );
+                        write_message(&mut output, &ok_response(seq, &msg, Json::obj(vec![])));
                     }
                     Err(e) => {
                         write_message(&mut output, &err_response(seq, &msg, &e));
@@ -779,12 +781,15 @@ pub fn serve<I: BufRead + 'static, O: Write + 'static>(
         pending: Vec::new(),
     };
 
-    let files: Vec<(String, &grasm_syntax::ast::Module, std::collections::HashMap<String, String>)> =
-        program
-            .files
-            .iter()
-            .map(|f| (f.name.clone(), &f.module, f.imports.clone()))
-            .collect();
+    let files: Vec<(
+        String,
+        &grasm_syntax::ast::Module,
+        std::collections::HashMap<String, String>,
+    )> = program
+        .files
+        .iter()
+        .map(|f| (f.name.clone(), &f.module, f.imports.clone()))
+        .collect();
     let mut interp = Interp::new_program(&files, &mut sink);
     interp.attach_debugger(Box::new(Suspender {
         session: shared.clone(),
@@ -798,27 +803,27 @@ pub fn serve<I: BufRead + 'static, O: Write + 'static>(
     drop(sink);
 
     {
-    let mut session = shared.borrow_mut();
-    if !trace.is_empty() {
-        let mut text = String::from("stack trace (innermost first):\n");
-        for frame in &trace {
-            let (path, line, col) = session.sources.locate(frame.at);
-            text.push_str(&format!("  {} at {path}:{line}:{col}\n", frame.function));
+        let mut session = shared.borrow_mut();
+        if !trace.is_empty() {
+            let mut text = String::from("stack trace (innermost first):\n");
+            for frame in &trace {
+                let (path, line, col) = session.sources.locate(frame.at);
+                text.push_str(&format!("  {} at {path}:{line}:{col}\n", frame.function));
+            }
+            session.event(
+                "output",
+                Json::obj(vec![
+                    ("category", Json::str("stderr")),
+                    ("output", Json::str(text)),
+                ]),
+            );
         }
-        session.event(
-            "output",
-            Json::obj(vec![
-                ("category", Json::str("stderr")),
-                ("output", Json::str(text)),
-            ]),
-        );
-    }
 
-    session.event(
-        "exited",
-        Json::obj(vec![("exitCode", Json::int(i64::from(code)))]),
-    );
-    session.event("terminated", Json::obj(vec![]));
+        session.event(
+            "exited",
+            Json::obj(vec![("exitCode", Json::int(i64::from(code)))]),
+        );
+        session.event("terminated", Json::obj(vec![]));
     }
     // Every other handle is gone by now, so the writer comes back out.
     let session = Rc::try_unwrap(shared)

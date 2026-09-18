@@ -41,7 +41,7 @@ fn garbage_inputs_do_not_crash() {
         "with with with",
         "🎉🎉🎉 fn é() {}",
         "fn main() { 999999999999999999999999999 }",
-        "x" ,
+        "x",
         "// only a comment",
         "/* unclosed block comment",
         "fn main() {\n    let x = 1 +\n",

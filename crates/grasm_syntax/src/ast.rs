@@ -323,9 +323,15 @@ pub enum Stmt {
     },
     /// `parallel { spawn { .. } spawn { .. } }` — a structured concurrency
     /// scope. Every task spawned inside completes before the scope exits.
-    Parallel { body: Block, span: Span },
+    Parallel {
+        body: Block,
+        span: Span,
+    },
     /// `spawn { ... }` — schedule a task in the enclosing `parallel` scope.
-    Spawn { body: Block, span: Span },
+    Spawn {
+        body: Block,
+        span: Span,
+    },
     /// `with Clock handled_by ClockHandler{ now: || 0 } { ... }`
     With {
         effect: Path,

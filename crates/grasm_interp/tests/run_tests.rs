@@ -27,7 +27,10 @@ fn run_expect(src: &str, expected_out: &str) {
 
 #[test]
 fn hello_world() {
-    run_expect("fn main() {\n    print(\"hello, world\")\n}\n", "hello, world\n");
+    run_expect(
+        "fn main() {\n    print(\"hello, world\")\n}\n",
+        "hello, world\n",
+    );
 }
 
 #[test]
@@ -489,14 +492,10 @@ fn fs_roundtrip_with_args() {
 }
 "#;
     let mut out = Vec::new();
-    let (code, diags) =
-        grasm_interp::run_src_with_args(src, &[path_str], &mut out);
+    let (code, diags) = grasm_interp::run_src_with_args(src, &[path_str], &mut out);
     assert!(diags.is_empty(), "{diags:#?}");
     assert_eq!(code, 0, "output: {}", String::from_utf8_lossy(&out));
-    assert_eq!(
-        String::from_utf8(out).unwrap(),
-        "2 lines\ntrue false\n"
-    );
+    assert_eq!(String::from_utf8(out).unwrap(), "2 lines\ntrue false\n");
 }
 
 #[test]
@@ -880,9 +879,8 @@ fn env_reads_the_process_environment() {
 
 #[test]
 fn exit_stops_the_program_with_a_status() {
-    let (code, out) = run(
-        "fn main() {\n    print(\"before\")\n    exit(3)\n    print(\"after\")\n}\n",
-    );
+    let (code, out) =
+        run("fn main() {\n    print(\"before\")\n    exit(3)\n    print(\"after\")\n}\n");
     assert_eq!(code, 3);
     assert_eq!(out, "before\n");
 }

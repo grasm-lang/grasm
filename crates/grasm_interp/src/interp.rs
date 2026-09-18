@@ -315,9 +315,7 @@ fn assign_into(root: &mut Value, segs: &[Seg], v: Value) -> Result<(), Flow> {
                     match items.get_mut(*i) {
                         Some(iv) => slot = iv,
                         None => {
-                            return Err(Flow::Panic(format!(
-                                "index {i} out of bounds (len {len})"
-                            )))
+                            return Err(Flow::Panic(format!("index {i} out of bounds (len {len})")))
                         }
                     }
                 }
@@ -367,9 +365,7 @@ fn mutate_in_place(
             // *last* element for `remove(-1)` and said nothing, while the
             // compiled backend panicked — two engines, two answers.
             if i < 0 || i >= n {
-                return Err(Flow::Panic(format!(
-                    "remove {i} out of bounds (len {n})"
-                )));
+                return Err(Flow::Panic(format!("remove {i} out of bounds (len {n})")));
             }
             items.remove(i as usize)
         }
@@ -471,18 +467,23 @@ fn mentioned_names(e: &Expr, out: &mut std::collections::HashSet<String>) {
             }
         }
         Expr::Block(b) | Expr::Unsafe(b) | Expr::Region(b) => mentioned_names_block(b, out),
-        Expr::If { cond, then_block, else_branch, .. } => {
+        Expr::If {
+            cond,
+            then_block,
+            else_branch,
+            ..
+        } => {
             mentioned_names(cond, out);
             mentioned_names_block(then_block, out);
             match else_branch.as_deref() {
                 Some(grasm_syntax::ast::ElseBranch::Else(b)) => mentioned_names_block(b, out),
-                Some(grasm_syntax::ast::ElseBranch::ElseIf(inner)) => {
-                    mentioned_names(inner, out)
-                }
+                Some(grasm_syntax::ast::ElseBranch::ElseIf(inner)) => mentioned_names(inner, out),
                 None => {}
             }
         }
-        Expr::Match { scrutinee, arms, .. } => {
+        Expr::Match {
+            scrutinee, arms, ..
+        } => {
             mentioned_names(scrutinee, out);
             for a in arms {
                 mentioned_names(&a.body, out);
@@ -544,9 +545,7 @@ fn mentions_ident(e: &Expr, name: &str) -> bool {
         }),
         Expr::Unary { expr, .. } | Expr::Try { expr, .. } => mentions_ident(expr, name),
         Expr::Field { recv, .. } => mentions_ident(recv, name),
-        Expr::Binary { lhs, rhs, .. } => {
-            mentions_ident(lhs, name) || mentions_ident(rhs, name)
-        }
+        Expr::Binary { lhs, rhs, .. } => mentions_ident(lhs, name) || mentions_ident(rhs, name),
         Expr::Index { recv, index, .. } => {
             mentions_ident(recv, name) || mentions_ident(index, name)
         }
@@ -857,13 +856,7 @@ impl<'a, W: Write> Interp<'a, W> {
         journal::recorded("udp_send", out)
     }
 
-    fn udp_send_now(
-        &mut self,
-        handle: &Value,
-        host: &str,
-        port: &Value,
-        data: &Value,
-    ) -> Value {
+    fn udp_send_now(&mut self, handle: &Value, host: &str, port: &Value, data: &Value) -> Value {
         let fail = |m: String| Value::Err(Rc::new(io_error("IoFailed", m)));
         let (Value::Int(h), Value::Int(port)) = (handle, port) else {
             return fail("handle and port must be integers".to_string());
@@ -1127,10 +1120,7 @@ impl<'a, W: Write> Interp<'a, W> {
         self.float_sums = spans;
     }
 
-    fn build(
-        files: &'a [(String, &'a Module, HashMap<String, String>)],
-        out: &'a mut W,
-    ) -> Self {
+    fn build(files: &'a [(String, &'a Module, HashMap<String, String>)], out: &'a mut W) -> Self {
         let mut imports_map = HashMap::new();
         for (name, _, imps) in files {
             imports_map.insert(name.clone(), imps.clone());
@@ -1151,8 +1141,7 @@ impl<'a, W: Write> Interp<'a, W> {
         for decl in &module.decls {
             match decl {
                 Decl::Fn(f) => {
-                    self.fns
-                        .insert(format!("{mod_name}::{}", f.name.name), f);
+                    self.fns.insert(format!("{mod_name}::{}", f.name.name), f);
                 }
                 Decl::Const(c) => {
                     self.consts
@@ -1319,7 +1308,6 @@ impl<'a, W: Write> Interp<'a, W> {
         self.current_module = module.to_string();
     }
 
-
     /// Whether this function's return type is fallible, following aliases.
     fn returns_fallible(&self, f: &FnDecl) -> bool {
         let mut te = match &f.ret {
@@ -1435,7 +1423,9 @@ impl<'a, W: Write> Interp<'a, W> {
             // implementation-defined ([E-RECURSION-DEPTH]), so naming this
             // one's number here advertised a limit no program should depend on
             // and made the same failure read as two different failures.
-            return Err(Flow::Panic("stack overflow: recursion too deep".to_string()));
+            return Err(Flow::Panic(
+                "stack overflow: recursion too deep".to_string(),
+            ));
         }
         self.depth += 1;
         self.call_stack
@@ -1513,15 +1503,12 @@ impl<'a, W: Write> Interp<'a, W> {
                     // engine names its own bound; a second overflow site with
                     // its own wording made `[1].map(|x| f(x))` recursion
                     // report differently under `grasm run` than compiled.
-                    return Err(Flow::Panic(
-                        "stack overflow: recursion too deep".into(),
-                    ));
+                    return Err(Flow::Panic("stack overflow: recursion too deep".into()));
                 }
                 self.depth += 1;
                 // Names in the body mean what they meant where it was written.
                 let saved_module = std::mem::replace(&mut self.current_module, (*module).clone());
-                let mut scope: HashMap<String, Value> =
-                    env.iter().cloned().collect();
+                let mut scope: HashMap<String, Value> = env.iter().cloned().collect();
                 for (p, v) in params.iter().zip(args) {
                     scope.insert(p.name.clone(), v);
                 }
@@ -1591,7 +1578,11 @@ impl<'a, W: Write> Interp<'a, W> {
         for (i, stmt) in b.stmts.iter().enumerate() {
             match self.eval_stmt(stmt) {
                 Ok(v) => {
-                    last = if i + 1 == b.stmts.len() { v } else { Value::Unit };
+                    last = if i + 1 == b.stmts.len() {
+                        v
+                    } else {
+                        Value::Unit
+                    };
                 }
                 Err(flow) => {
                     self.scopes.pop();
@@ -1641,7 +1632,9 @@ impl<'a, W: Write> Interp<'a, W> {
 
     fn eval_stmt_inner(&mut self, s: &Stmt) -> EResult {
         match s {
-            Stmt::LetTuple { names, init, span, .. } => {
+            Stmt::LetTuple {
+                names, init, span, ..
+            } => {
                 let v = self.eval_expr(init)?;
                 let Value::Tuple(items) = &v else {
                     return Err(Flow::Panic("destructuring a non-tuple".into()));
@@ -1662,9 +1655,7 @@ impl<'a, W: Write> Interp<'a, W> {
                 }
                 Ok(Value::Unit)
             }
-            Stmt::Let {
-                name, ty, init, ..
-            } => {
+            Stmt::Let { name, ty, init, .. } => {
                 let mut v = self.eval_expr(init)?;
                 // An annotation of `f64` makes an integer literal a float, so
                 // the value matches the type the checker assigned it.
@@ -1673,10 +1664,7 @@ impl<'a, W: Write> Interp<'a, W> {
                         v = Value::Float(*i as f64);
                     }
                 }
-                self.scopes
-                    .last_mut()
-                    .unwrap()
-                    .insert(name.name.clone(), v);
+                self.scopes.last_mut().unwrap().insert(name.name.clone(), v);
                 Ok(Value::Unit)
             }
             Stmt::Assign {
@@ -1772,18 +1760,16 @@ impl<'a, W: Write> Interp<'a, W> {
                 }
                 Ok(Value::Unit)
             }
-            Stmt::Spawn { body, span } => {
-                match self.task_scopes.last_mut() {
-                    Some(scope) => {
-                        scope.push(body.clone());
-                        Ok(Value::Unit)
-                    }
-                    None => Err(Flow::Panic(format!(
-                        "`spawn` outside a `parallel` block (at offset {})",
-                        span.start
-                    ))),
+            Stmt::Spawn { body, span } => match self.task_scopes.last_mut() {
+                Some(scope) => {
+                    scope.push(body.clone());
+                    Ok(Value::Unit)
                 }
-            }
+                None => Err(Flow::Panic(format!(
+                    "`spawn` outside a `parallel` block (at offset {})",
+                    span.start
+                ))),
+            },
             Stmt::With {
                 effect,
                 handler,
@@ -1797,8 +1783,7 @@ impl<'a, W: Write> Interp<'a, W> {
                         effect.dotted()
                     )));
                 };
-                let ops: HashMap<String, Value> =
-                    fields.iter().cloned().collect();
+                let ops: HashMap<String, Value> = fields.iter().cloned().collect();
                 self.handlers.push((effect.dotted(), ops));
                 let r = self.eval_block(body);
                 self.handlers.pop();
@@ -1858,13 +1843,8 @@ impl<'a, W: Write> Interp<'a, W> {
                     Value::Range(a, b, true) => (a..=b).map(Value::Int).collect(),
                     Value::Range(a, b, false) => (a..b).map(Value::Int).collect(),
                     Value::List(items) => items.iter().cloned().collect(),
-                    Value::Str(s) => s
-                        .chars()
-                        .map(|c| Value::str(c.to_string()))
-                        .collect(),
-                    other => {
-                        return Err(Flow::Panic(format!("cannot iterate over `{other}`")))
-                    }
+                    Value::Str(s) => s.chars().map(|c| Value::str(c.to_string())).collect(),
+                    other => return Err(Flow::Panic(format!("cannot iterate over `{other}`"))),
                 };
                 for item in items {
                     self.scopes.push(HashMap::new());
@@ -1897,10 +1877,8 @@ impl<'a, W: Write> Interp<'a, W> {
         let wbs = std::mem::take(&mut self.pending_writebacks);
         for (i, v) in wbs {
             if let Some(e) = arg_exprs.get(i) {
-                let is_place = matches!(
-                    e,
-                    Expr::Ident(_) | Expr::Field { .. } | Expr::Index { .. }
-                );
+                let is_place =
+                    matches!(e, Expr::Ident(_) | Expr::Field { .. } | Expr::Index { .. });
                 if !is_place {
                     continue;
                 }
@@ -1938,7 +1916,12 @@ impl<'a, W: Write> Interp<'a, W> {
         let Expr::Ident(id) = root else {
             return self.eval_expr(target);
         };
-        let Some(mut cur) = self.scopes.iter().rev().find_map(|sc| sc.get(&id.name)).cloned()
+        let Some(mut cur) = self
+            .scopes
+            .iter()
+            .rev()
+            .find_map(|sc| sc.get(&id.name))
+            .cloned()
         else {
             return self.eval_expr(target);
         };
@@ -1972,16 +1955,17 @@ impl<'a, W: Write> Interp<'a, W> {
                     .map(|(_, v)| v.clone())
                     .ok_or_else(|| Flow::Panic(format!("no field `{f}`")))?,
                 (Value::Tuple(items), Seg::Field(f)) => {
-                    let i: usize = f.parse().map_err(|_| Flow::Panic(format!("no field `{f}`")))?;
+                    let i: usize = f
+                        .parse()
+                        .map_err(|_| Flow::Panic(format!("no field `{f}`")))?;
                     items
                         .get(i)
                         .cloned()
                         .ok_or_else(|| Flow::Panic(format!("no component `{i}`")))?
                 }
-                (Value::List(items), Seg::Index(i)) => items
-                    .get(*i)
-                    .cloned()
-                    .ok_or_else(|| Flow::Panic(format!("index {i} out of bounds (len {})", items.len())))?,
+                (Value::List(items), Seg::Index(i)) => items.get(*i).cloned().ok_or_else(|| {
+                    Flow::Panic(format!("index {i} out of bounds (len {})", items.len()))
+                })?,
                 _ => return self.eval_expr(target),
             };
         }
@@ -2025,9 +2009,7 @@ impl<'a, W: Write> Interp<'a, W> {
                     let idx = match self.eval_expr(e)? {
                         Value::Int(i) => i,
                         other => {
-                            return Err(Flow::Panic(format!(
-                                "index must be an int, got `{other}`"
-                            )))
+                            return Err(Flow::Panic(format!("index must be an int, got `{other}`")))
                         }
                     };
                     if idx < 0 {
@@ -2151,11 +2133,7 @@ impl<'a, W: Write> Interp<'a, W> {
                         let fields = Rc::make_mut(fields);
                         match fields.iter_mut().find(|(k, _)| k == fname) {
                             Some((_, fv)) => slot = fv,
-                            None => {
-                                return Err(Flow::Panic(format!(
-                                    "no field `{fname}`"
-                                )))
-                            }
+                            None => return Err(Flow::Panic(format!("no field `{fname}`"))),
                         }
                     }
                     other => {
@@ -2177,11 +2155,7 @@ impl<'a, W: Write> Interp<'a, W> {
                             }
                         }
                     }
-                    other => {
-                        return Err(Flow::Panic(format!(
-                            "cannot index into `{other}`"
-                        )))
-                    }
+                    other => return Err(Flow::Panic(format!("cannot index into `{other}`"))),
                 },
             }
         }
@@ -2350,7 +2324,10 @@ impl<'a, W: Write> Interp<'a, W> {
             }
             Expr::Call { callee, args, .. } => self.eval_call(callee, args),
             Expr::MethodCall {
-                recv, name, args, span,
+                recv,
+                name,
+                args,
+                span,
             } => self.eval_method_call(recv, name, args, *span),
             Expr::Field { recv, name, .. } => self.eval_field(recv, name),
             Expr::Index { recv, index, .. } => {
@@ -2443,7 +2420,9 @@ impl<'a, W: Write> Interp<'a, W> {
                         },
                         None => Ok(Value::Unit),
                     },
-                    other => Err(Flow::Panic(format!("if condition must be bool, got `{other}`"))),
+                    other => Err(Flow::Panic(format!(
+                        "if condition must be bool, got `{other}`"
+                    ))),
                 }
             }
             Expr::Match {
@@ -2499,7 +2478,9 @@ impl<'a, W: Write> Interp<'a, W> {
                     }
                 }
                 let cb = match &**body {
-                    Expr::Block(b) | Expr::Unsafe(b) | Expr::Region(b) => ClosureBody::Block(b.clone()),
+                    Expr::Block(b) | Expr::Unsafe(b) | Expr::Region(b) => {
+                        ClosureBody::Block(b.clone())
+                    }
                     other => ClosureBody::Expr(other.clone()),
                 };
                 Ok(Value::Closure {
@@ -2576,13 +2557,8 @@ impl<'a, W: Write> Interp<'a, W> {
         Err(Flow::Panic(format!("unknown name `{}`", id.name)))
     }
 
-
     /// Calls a declared C function.
-    fn call_extern(
-        &mut self,
-        e: &grasm_syntax::ast::ExternDecl,
-        args: &[Expr],
-    ) -> EResult {
+    fn call_extern(&mut self, e: &grasm_syntax::ast::ExternDecl, args: &[Expr]) -> EResult {
         let mut vals = Vec::with_capacity(args.len());
         for a in args {
             vals.push(self.eval_expr(a)?);
@@ -2722,9 +2698,7 @@ uses to mark the end of a string"
                         return if a.eq_value(&b) {
                             Ok(Value::Unit)
                         } else {
-                            Err(Flow::Panic(format!(
-                                "assertion failed: `{a}` != `{b}`"
-                            )))
+                            Err(Flow::Panic(format!("assertion failed: `{a}` != `{b}`")))
                         };
                     }
                     "panic" => {
@@ -2774,10 +2748,14 @@ uses to mark the end of a string"
                         }
                         let done = |v: Value| journal::recorded("proc_pipeline", v);
                         let Value::List(items) = stages else {
-                            return Ok(done(fail("proc_pipeline takes a list of stages".to_string())));
+                            return Ok(done(fail(
+                                "proc_pipeline takes a list of stages".to_string(),
+                            )));
                         };
                         if items.is_empty() {
-                            return Ok(done(fail("a pipeline needs at least one stage".to_string())));
+                            return Ok(done(fail(
+                                "a pipeline needs at least one stage".to_string(),
+                            )));
                         }
                         let mut plan: Vec<(String, Vec<String>)> = Vec::new();
                         for it in items.iter() {
@@ -2903,10 +2881,9 @@ uses to mark the end of a string"
                             },
                         ));
                     }
-                    "tcp_listen" | "tcp_connect" | "tcp_accept" | "tcp_read"
-                    | "tcp_read_bytes" | "tcp_write" | "tcp_write_bytes"
-                    | "net_close" | "net_port" | "udp_bind" | "udp_recv"
-                    | "udp_recv_from" => {
+                    "tcp_listen" | "tcp_connect" | "tcp_accept" | "tcp_read" | "tcp_read_bytes"
+                    | "tcp_write" | "tcp_write_bytes" | "net_close" | "net_port" | "udp_bind"
+                    | "udp_recv" | "udp_recv_from" => {
                         let h = self.eval_expr(&args[0])?;
                         let extra = if id.name == "tcp_write" || id.name == "tcp_connect" {
                             Some(self.eval_expr(&args[1])?.to_string())
@@ -2928,13 +2905,16 @@ uses to mark the end of a string"
                         if let Some(v) = journal::gated("read_file") {
                             return Ok(v);
                         }
-                        return Ok(journal::recorded("read_file", match std::fs::read_to_string(&p) {
-                            Ok(s) => Value::Ok(Rc::new(Value::str(s))),
-                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                                Value::Err(Rc::new(io_error("NotFound", p)))
-                            }
-                            Err(e) => Value::Err(Rc::new(io_error("IoFailed", e.to_string()))),
-                        }));
+                        return Ok(journal::recorded(
+                            "read_file",
+                            match std::fs::read_to_string(&p) {
+                                Ok(s) => Value::Ok(Rc::new(Value::str(s))),
+                                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                                    Value::Err(Rc::new(io_error("NotFound", p)))
+                                }
+                                Err(e) => Value::Err(Rc::new(io_error("IoFailed", e.to_string()))),
+                            },
+                        ));
                     }
                     "write_file" => {
                         let p = self.eval_expr(&args[0])?.to_string();
@@ -2942,10 +2922,13 @@ uses to mark the end of a string"
                         if let Some(v) = journal::gated("write_file") {
                             return Ok(v);
                         }
-                        return Ok(journal::recorded("write_file", match std::fs::write(&p, content) {
-                            Ok(()) => Value::Ok(Rc::new(Value::Unit)),
-                            Err(e) => Value::Err(Rc::new(io_error("IoFailed", e.to_string()))),
-                        }));
+                        return Ok(journal::recorded(
+                            "write_file",
+                            match std::fs::write(&p, content) {
+                                Ok(()) => Value::Ok(Rc::new(Value::Unit)),
+                                Err(e) => Value::Err(Rc::new(io_error("IoFailed", e.to_string()))),
+                            },
+                        ));
                     }
                     // Creates the whole path, and succeeds if it is already
                     // there — so a program can make its own working directory
@@ -2959,7 +2942,9 @@ uses to mark the end of a string"
                         let mut out = Vec::with_capacity(items.len());
                         for it in items.iter() {
                             let Value::Int(n) = it else {
-                                return Err(Flow::Panic("bytes_of expects a list of integers".into()));
+                                return Err(Flow::Panic(
+                                    "bytes_of expects a list of integers".into(),
+                                ));
                             };
                             if !(0..=255).contains(n) {
                                 return Err(Flow::Panic(format!(
@@ -2980,16 +2965,24 @@ uses to mark the end of a string"
                             return Ok(v);
                         }
                         if n < 0 {
-                            return Ok(journal::recorded("random_bytes", Value::Err(Rc::new(io_error(
-                                "IoFailed",
-                                format!("random_bytes needs a count of 0 or more, got {n}"),
-                            )))));
+                            return Ok(journal::recorded(
+                                "random_bytes",
+                                Value::Err(Rc::new(io_error(
+                                    "IoFailed",
+                                    format!("random_bytes needs a count of 0 or more, got {n}"),
+                                ))),
+                            ));
                         }
                         if n > 1_048_576 {
-                            return Ok(journal::recorded("random_bytes", Value::Err(Rc::new(io_error(
-                                "IoFailed",
-                                format!("random_bytes is capped at 1048576 bytes, asked for {n}"),
-                            )))));
+                            return Ok(journal::recorded(
+                                "random_bytes",
+                                Value::Err(Rc::new(io_error(
+                                    "IoFailed",
+                                    format!(
+                                        "random_bytes is capped at 1048576 bytes, asked for {n}"
+                                    ),
+                                ))),
+                            ));
                         }
                         let mut buf = vec![0u8; n as usize];
                         if n == 0 {
@@ -2998,32 +2991,38 @@ uses to mark the end of a string"
                                 Value::Ok(Rc::new(Value::Bytes(Rc::new(buf)))),
                             ));
                         }
-                        return Ok(journal::recorded("random_bytes", match std::fs::File::open("/dev/urandom") {
-                            Err(e) => Value::Err(Rc::new(io_error(
-                                "IoFailed",
-                                format!("cannot open /dev/urandom: {e}"),
-                            ))),
-                            Ok(mut f) => match f.read_exact(&mut buf) {
-                                Ok(()) => Value::Ok(Rc::new(Value::Bytes(Rc::new(buf)))),
+                        return Ok(journal::recorded(
+                            "random_bytes",
+                            match std::fs::File::open("/dev/urandom") {
                                 Err(e) => Value::Err(Rc::new(io_error(
                                     "IoFailed",
-                                    format!("short read: {e}"),
+                                    format!("cannot open /dev/urandom: {e}"),
                                 ))),
+                                Ok(mut f) => match f.read_exact(&mut buf) {
+                                    Ok(()) => Value::Ok(Rc::new(Value::Bytes(Rc::new(buf)))),
+                                    Err(e) => Value::Err(Rc::new(io_error(
+                                        "IoFailed",
+                                        format!("short read: {e}"),
+                                    ))),
+                                },
                             },
-                        }));
+                        ));
                     }
                     "read_bytes" => {
                         let p = self.eval_expr(&args[0])?.to_string();
                         if let Some(v) = journal::gated("read_bytes") {
                             return Ok(v);
                         }
-                        return Ok(journal::recorded("read_bytes", match std::fs::read(&p) {
-                            Ok(b) => Value::Ok(Rc::new(Value::Bytes(Rc::new(b)))),
-                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                                Value::Err(Rc::new(io_error("NotFound", p)))
-                            }
-                            Err(e) => Value::Err(Rc::new(io_error("IoFailed", e.to_string()))),
-                        }));
+                        return Ok(journal::recorded(
+                            "read_bytes",
+                            match std::fs::read(&p) {
+                                Ok(b) => Value::Ok(Rc::new(Value::Bytes(Rc::new(b)))),
+                                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                                    Value::Err(Rc::new(io_error("NotFound", p)))
+                                }
+                                Err(e) => Value::Err(Rc::new(io_error("IoFailed", e.to_string()))),
+                            },
+                        ));
                     }
                     // A range of a file, and the four calls a crash-safe
                     // store needs. Every other file call here is whole-file,
@@ -3031,28 +3030,38 @@ uses to mark the end of a string"
                     "read_bytes_at" => {
                         let p = self.eval_expr(&args[0])?.to_string();
                         let Value::Int(off) = self.eval_expr(&args[1])? else {
-                            return Err(Flow::Panic("read_bytes_at expects an integer offset".into()));
+                            return Err(Flow::Panic(
+                                "read_bytes_at expects an integer offset".into(),
+                            ));
                         };
                         let Value::Int(count) = self.eval_expr(&args[2])? else {
-                            return Err(Flow::Panic("read_bytes_at expects an integer count".into()));
+                            return Err(Flow::Panic(
+                                "read_bytes_at expects an integer count".into(),
+                            ));
                         };
                         if let Some(v) = journal::gated("read_bytes_at") {
                             return Ok(v);
                         }
-                        return Ok(journal::recorded("read_bytes_at", read_range(&p, off, count)));
+                        return Ok(journal::recorded(
+                            "read_bytes_at",
+                            read_range(&p, off, count),
+                        ));
                     }
                     "file_size" => {
                         let p = self.eval_expr(&args[0])?.to_string();
                         if let Some(v) = journal::gated("file_size") {
                             return Ok(v);
                         }
-                        return Ok(journal::recorded("file_size", match std::fs::metadata(&p) {
-                            Ok(m) => Value::Ok(Rc::new(Value::Int(m.len() as i64))),
-                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                                Value::Err(Rc::new(io_error("NotFound", p)))
-                            }
-                            Err(e) => Value::Err(Rc::new(io_error("IoFailed", e.to_string()))),
-                        }));
+                        return Ok(journal::recorded(
+                            "file_size",
+                            match std::fs::metadata(&p) {
+                                Ok(m) => Value::Ok(Rc::new(Value::Int(m.len() as i64))),
+                                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                                    Value::Err(Rc::new(io_error("NotFound", p)))
+                                }
+                                Err(e) => Value::Err(Rc::new(io_error("IoFailed", e.to_string()))),
+                            },
+                        ));
                     }
                     "append_bytes" => {
                         let p = self.eval_expr(&args[0])?.to_string();
@@ -3069,10 +3078,13 @@ uses to mark the end of a string"
                             .append(true)
                             .open(&p)
                             .and_then(|mut f| f.write_all(&b));
-                        return Ok(journal::recorded("append_bytes", match done {
-                            Ok(()) => Value::Ok(Rc::new(Value::Unit)),
-                            Err(e) => Value::Err(Rc::new(io_error("IoFailed", e.to_string()))),
-                        }));
+                        return Ok(journal::recorded(
+                            "append_bytes",
+                            match done {
+                                Ok(()) => Value::Ok(Rc::new(Value::Unit)),
+                                Err(e) => Value::Err(Rc::new(io_error("IoFailed", e.to_string()))),
+                            },
+                        ));
                     }
                     "sync_file" => {
                         let p = self.eval_expr(&args[0])?.to_string();
@@ -3083,13 +3095,16 @@ uses to mark the end of a string"
                             .append(true)
                             .open(&p)
                             .and_then(|f| f.sync_all());
-                        return Ok(journal::recorded("sync_file", match done {
-                            Ok(()) => Value::Ok(Rc::new(Value::Unit)),
-                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                                Value::Err(Rc::new(io_error("NotFound", p)))
-                            }
-                            Err(e) => Value::Err(Rc::new(io_error("IoFailed", e.to_string()))),
-                        }));
+                        return Ok(journal::recorded(
+                            "sync_file",
+                            match done {
+                                Ok(()) => Value::Ok(Rc::new(Value::Unit)),
+                                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                                    Value::Err(Rc::new(io_error("NotFound", p)))
+                                }
+                                Err(e) => Value::Err(Rc::new(io_error("IoFailed", e.to_string()))),
+                            },
+                        ));
                     }
                     "rename_file" => {
                         let from = self.eval_expr(&args[0])?.to_string();
@@ -3097,13 +3112,16 @@ uses to mark the end of a string"
                         if let Some(v) = journal::gated("rename_file") {
                             return Ok(v);
                         }
-                        return Ok(journal::recorded("rename_file", match std::fs::rename(&from, &to) {
-                            Ok(()) => Value::Ok(Rc::new(Value::Unit)),
-                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                                Value::Err(Rc::new(io_error("NotFound", from)))
-                            }
-                            Err(e) => Value::Err(Rc::new(io_error("IoFailed", e.to_string()))),
-                        }));
+                        return Ok(journal::recorded(
+                            "rename_file",
+                            match std::fs::rename(&from, &to) {
+                                Ok(()) => Value::Ok(Rc::new(Value::Unit)),
+                                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                                    Value::Err(Rc::new(io_error("NotFound", from)))
+                                }
+                                Err(e) => Value::Err(Rc::new(io_error("IoFailed", e.to_string()))),
+                            },
+                        ));
                     }
                     "write_bytes" => {
                         let p = self.eval_expr(&args[0])?.to_string();
@@ -3114,33 +3132,42 @@ uses to mark the end of a string"
                         if let Some(v) = journal::gated("write_bytes") {
                             return Ok(v);
                         }
-                        return Ok(journal::recorded("write_bytes", match std::fs::write(&p, b.as_slice()) {
-                            Ok(()) => Value::Ok(Rc::new(Value::Unit)),
-                            Err(e) => Value::Err(Rc::new(io_error("IoFailed", e.to_string()))),
-                        }));
+                        return Ok(journal::recorded(
+                            "write_bytes",
+                            match std::fs::write(&p, b.as_slice()) {
+                                Ok(()) => Value::Ok(Rc::new(Value::Unit)),
+                                Err(e) => Value::Err(Rc::new(io_error("IoFailed", e.to_string()))),
+                            },
+                        ));
                     }
                     "make_dir" => {
                         let p = self.eval_expr(&args[0])?.to_string();
                         if let Some(v) = journal::gated("make_dir") {
                             return Ok(v);
                         }
-                        return Ok(journal::recorded("make_dir", match std::fs::create_dir_all(&p) {
-                            Ok(()) => Value::Ok(Rc::new(Value::Unit)),
-                            Err(e) => Value::Err(Rc::new(io_error("IoFailed", e.to_string()))),
-                        }));
+                        return Ok(journal::recorded(
+                            "make_dir",
+                            match std::fs::create_dir_all(&p) {
+                                Ok(()) => Value::Ok(Rc::new(Value::Unit)),
+                                Err(e) => Value::Err(Rc::new(io_error("IoFailed", e.to_string()))),
+                            },
+                        ));
                     }
                     "remove_file" => {
                         let p = self.eval_expr(&args[0])?.to_string();
                         if let Some(v) = journal::gated("remove_file") {
                             return Ok(v);
                         }
-                        return Ok(journal::recorded("remove_file", match std::fs::remove_file(&p) {
-                            Ok(()) => Value::Ok(Rc::new(Value::Unit)),
-                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                                Value::Err(Rc::new(io_error("NotFound", p)))
-                            }
-                            Err(e) => Value::Err(Rc::new(io_error("IoFailed", e.to_string()))),
-                        }));
+                        return Ok(journal::recorded(
+                            "remove_file",
+                            match std::fs::remove_file(&p) {
+                                Ok(()) => Value::Ok(Rc::new(Value::Unit)),
+                                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                                    Value::Err(Rc::new(io_error("NotFound", p)))
+                                }
+                                Err(e) => Value::Err(Rc::new(io_error("IoFailed", e.to_string()))),
+                            },
+                        ));
                     }
                     // Sorted, because a directory's order is the filesystem's
                     // and differs between machines and between runs — and
@@ -3152,15 +3179,18 @@ uses to mark the end of a string"
                         if let Some(v) = journal::gated("list_dir") {
                             return Ok(v);
                         }
-                        return Ok(journal::recorded("list_dir", match list_dir_sorted(&p) {
-                            Ok(names) => Value::Ok(Rc::new(Value::List(Rc::new(
-                                names.into_iter().map(Value::str).collect(),
-                            )))),
-                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                                Value::Err(Rc::new(io_error("NotFound", p)))
-                            }
-                            Err(e) => Value::Err(Rc::new(io_error("IoFailed", e.to_string()))),
-                        }));
+                        return Ok(journal::recorded(
+                            "list_dir",
+                            match list_dir_sorted(&p) {
+                                Ok(names) => Value::Ok(Rc::new(Value::List(Rc::new(
+                                    names.into_iter().map(Value::str).collect(),
+                                )))),
+                                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                                    Value::Err(Rc::new(io_error("NotFound", p)))
+                                }
+                                Err(e) => Value::Err(Rc::new(io_error("IoFailed", e.to_string()))),
+                            },
+                        ));
                     }
                     "file_exists" => {
                         let p = self.eval_expr(&args[0])?.to_string();
@@ -3176,8 +3206,11 @@ uses to mark the end of a string"
                         if let Some(v) = journal::gated("args") {
                             return Ok(v);
                         }
-                        let vs: Vec<Value> =
-                            self.program_args.iter().map(|a| Value::str(a.clone())).collect();
+                        let vs: Vec<Value> = self
+                            .program_args
+                            .iter()
+                            .map(|a| Value::str(a.clone()))
+                            .collect();
                         return Ok(journal::recorded("args", Value::List(Rc::new(vs))));
                     }
                     "Ok" | "Err" => {
@@ -3207,7 +3240,11 @@ uses to mark the end of a string"
                             std::f64::consts::E
                         }));
                     }
-                    "ref" if !self.fns.contains_key(&format!("{}::ref", self.current_module)) => {
+                    "ref"
+                        if !self
+                            .fns
+                            .contains_key(&format!("{}::ref", self.current_module)) =>
+                    {
                         let v = self.eval_expr(&args[0])?;
                         let r = match self.slab_free.pop() {
                             Some(i) => {
@@ -3300,17 +3337,23 @@ uses to mark the end of a string"
                         if let Some(v) = journal::gated("now_millis") {
                             return Ok(v);
                         }
-                        return Ok(journal::recorded("now_millis", Value::Int(host_now_millis())));
+                        return Ok(journal::recorded(
+                            "now_millis",
+                            Value::Int(host_now_millis()),
+                        ));
                     }
                     "env" => {
                         let name = self.eval_expr(&args[0])?.to_string();
                         if let Some(v) = journal::gated("env") {
                             return Ok(v);
                         }
-                        return Ok(journal::recorded("env", match std::env::var(&name) {
-                            Ok(v) => Value::some(Value::str(v)),
-                            Err(_) => Value::none(),
-                        }));
+                        return Ok(journal::recorded(
+                            "env",
+                            match std::env::var(&name) {
+                                Ok(v) => Value::some(Value::str(v)),
+                                Err(_) => Value::none(),
+                            },
+                        ));
                     }
                     "exit" => {
                         let code = match self.eval_expr(&args[0])? {
@@ -3348,10 +3391,8 @@ uses to mark the end of a string"
                             return Ok(journal::recorded("input", Value::str(next)));
                         }
                         let mut line = String::new();
-                        let _ = std::io::BufRead::read_line(
-                            &mut std::io::stdin().lock(),
-                            &mut line,
-                        );
+                        let _ =
+                            std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut line);
                         while line.ends_with('\n') || line.ends_with('\r') {
                             line.pop();
                         }
@@ -3851,11 +3892,7 @@ uses to mark the end of a string"
                     _ => return None,
                 }
             }
-            None => self
-                .scopes
-                .iter_mut()
-                .rev()
-                .find_map(|s| s.get_mut(root))?,
+            None => self.scopes.iter_mut().rev().find_map(|s| s.get_mut(root))?,
         };
         for seg in path {
             cur = match (cur, seg) {
@@ -4092,9 +4129,7 @@ uses to mark the end of a string"
                                 None => *f,
                             });
                         }
-                        other => {
-                            return Err(Flow::Panic(format!("cannot sum `{other}`")))
-                        }
+                        other => return Err(Flow::Panic(format!("cannot sum `{other}`"))),
                     }
                 }
                 // An empty list has no element to read the type off, so the
@@ -4218,8 +4253,11 @@ uses to mark the end of a string"
                         let len = items.len() as i64;
                         let s = s.clamp(0, len) as usize;
                         let e = e.clamp(0, len) as usize;
-                        let v: Vec<Value> =
-                            if s <= e { items[s..e].to_vec() } else { Vec::new() };
+                        let v: Vec<Value> = if s <= e {
+                            items[s..e].to_vec()
+                        } else {
+                            Vec::new()
+                        };
                         Value::List(Rc::new(v))
                     }
                     _ => return Err(Flow::Panic("slice bounds must be ints".into())),
@@ -4260,9 +4298,7 @@ uses to mark the end of a string"
             (Value::Str(s), "chars") => Value::List(Rc::new(
                 s.chars().map(|c| Value::str(c.to_string())).collect(),
             )),
-            (Value::Str(s), "lines") => Value::List(Rc::new(
-                s.lines().map(Value::str).collect(),
-            )),
+            (Value::Str(s), "lines") => Value::List(Rc::new(s.lines().map(Value::str).collect())),
             (Value::Str(s), "is_empty") => Value::Bool(s.is_empty()),
             (Value::Str(s), "pad_start" | "pad_end") => {
                 let at_start = name.name == "pad_start";
@@ -4311,14 +4347,16 @@ uses to mark the end of a string"
                     Value::Int(k) if k >= 0 => {
                         match (k as usize).checked_mul(s.len()) {
                             Some(bytes) if bytes <= MAX_ALLOC => Value::str(s.repeat(k as usize)),
-                            _ => {
-                                return Err(Flow::Panic(format!(
-                                    "repeat would need more memory than a string can hold ({k} copies)"
-                                )))
-                            }
+                            _ => return Err(Flow::Panic(format!(
+                                "repeat would need more memory than a string can hold ({k} copies)"
+                            ))),
                         }
                     }
-                    _ => return Err(Flow::Panic("repeat count must be a non-negative int".into())),
+                    _ => {
+                        return Err(Flow::Panic(
+                            "repeat count must be a non-negative int".into(),
+                        ))
+                    }
                 }
             }
             (Value::Str(s), "replace") => {
@@ -4393,9 +4431,7 @@ uses to mark the end of a string"
                 };
                 let n = s.char_len() as i64;
                 if i < 0 || i >= n {
-                    return Err(Flow::Panic(format!(
-                        "code_at {i} out of bounds (len {n})"
-                    )));
+                    return Err(Flow::Panic(format!("code_at {i} out of bounds (len {n})")));
                 }
                 // Constant time whatever the text: ASCII indexes directly,
                 // and anything else builds a character index once. Walking
@@ -4404,17 +4440,15 @@ uses to mark the end of a string"
                 // [L-LIB-CODES] recommends the method for.
                 Value::Int(s.char_at(i as usize).expect("in bounds") as i64)
             }
-            (Value::Str(s), "words") => Value::List(Rc::new(
-                s.split_whitespace().map(Value::str).collect(),
-            )),
+            (Value::Str(s), "words") => {
+                Value::List(Rc::new(s.split_whitespace().map(Value::str).collect()))
+            }
             (Value::Str(s), "codes") => {
                 Value::List(Rc::new(s.chars().map(|c| Value::Int(c as i64)).collect()))
             }
             (Value::Int(i), "to_char") => match u32::try_from(*i).ok().and_then(char::from_u32) {
                 Some(c) => Value::str(c.to_string()),
-                None => {
-                    return Err(Flow::Panic(format!("{i} is not a Unicode code point")))
-                }
+                None => return Err(Flow::Panic(format!("{i} is not a Unicode code point"))),
             },
             (Value::Float(f), "is_nan") => Value::Bool(f.is_nan()),
             (Value::Float(f), "is_finite") => Value::Bool(f.is_finite()),
@@ -4492,9 +4526,7 @@ uses to mark the end of a string"
             // carries text, and a malformed byte should not end a program that
             // is inspecting one.
             (Value::Bytes(b), "to_str") => Value::str(String::from_utf8_lossy(b).into_owned()),
-            (Value::Str(s), "to_bytes") => {
-                Value::Bytes(Rc::new(s.to_string().into_bytes()))
-            }
+            (Value::Str(s), "to_bytes") => Value::Bytes(Rc::new(s.to_string().into_bytes())),
             (Value::Int(i), "as_f64") => Value::Float(*i as f64),
             // Base ten is not the only base a systems program needs.
             (Value::Int(i), "to_base") => {
@@ -4636,9 +4668,9 @@ uses to mark the end of a string"
             }
             (Value::Map(entries), "len") => Value::Int(entries.len() as i64),
             (Value::Map(entries), "is_empty") => Value::Bool(entries.is_empty()),
-            (Value::Map(entries), "keys") => Value::List(Rc::new(
-                entries.keys().map(|k| k.to_value()).collect(),
-            )),
+            (Value::Map(entries), "keys") => {
+                Value::List(Rc::new(entries.keys().map(|k| k.to_value()).collect()))
+            }
             (Value::Map(entries), "values") => {
                 Value::List(Rc::new(entries.values().cloned().collect()))
             }
@@ -4648,12 +4680,8 @@ uses to mark the end of a string"
                     .map(|(k, v)| Value::Tuple(Rc::new(vec![k.to_value(), v.clone()])))
                     .collect(),
             )),
-            (Value::Variant { variant, .. }, "is_some") => {
-                Value::Bool(variant.as_str() == "Some")
-            }
-            (Value::Variant { variant, .. }, "is_none") => {
-                Value::Bool(variant.as_str() == "None")
-            }
+            (Value::Variant { variant, .. }, "is_some") => Value::Bool(variant.as_str() == "Some"),
+            (Value::Variant { variant, .. }, "is_none") => Value::Bool(variant.as_str() == "None"),
             (
                 Value::Variant {
                     variant, fields, ..
@@ -4764,9 +4792,7 @@ uses to mark the end of a string"
             }),
             // Tuples compare component by component, which is what makes a
             // multi-key sort key work with `<` too.
-            (Value::Tuple(_), Value::Tuple(_))
-                if matches!(op, Lt | LtEq | Gt | GtEq) =>
-            {
+            (Value::Tuple(_), Value::Tuple(_)) if matches!(op, Lt | LtEq | Gt | GtEq) => {
                 let ord = compare_values(&l, &r);
                 Ok(Value::Bool(match op {
                     Lt => ord.is_lt(),
@@ -4781,9 +4807,7 @@ uses to mark the end of a string"
                 out.extend(b.iter().cloned());
                 Ok(Value::List(Rc::new(out)))
             }
-            _ => Err(Flow::Panic(format!(
-                "invalid operands `{l}` and `{r}`"
-            ))),
+            _ => Err(Flow::Panic(format!("invalid operands `{l}` and `{r}`"))),
         }
     }
 
@@ -4791,12 +4815,7 @@ uses to mark the end of a string"
     // Pattern matching
     // ------------------------------------------------------------------
 
-    fn match_pattern(
-        &self,
-        pat: &Pattern,
-        v: &Value,
-        bindings: &mut Vec<(String, Value)>,
-    ) -> bool {
+    fn match_pattern(&self, pat: &Pattern, v: &Value, bindings: &mut Vec<(String, Value)>) -> bool {
         match pat {
             // Any alternative matching is enough. None of them bind, so there
             // is nothing to reconcile between the branches.
@@ -4865,11 +4884,11 @@ uses to mark the end of a string"
 /// True for the surface types that mean `f64`.
 fn is_float_type(t: &TypeExpr) -> bool {
     matches!(t, TypeExpr::Name { path, args, .. }
-        if args.is_empty()
-            && matches!(
-                path.segments.last().map(|s| s.name.as_str()),
-                Some("f64") | Some("f32") | Some("float")
-            ))
+    if args.is_empty()
+        && matches!(
+            path.segments.last().map(|s| s.name.as_str()),
+            Some("f64") | Some("f32") | Some("float")
+        ))
 }
 
 /// A directory's entries, by name, sorted.

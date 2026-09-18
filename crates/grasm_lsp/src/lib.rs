@@ -126,10 +126,7 @@ impl Server {
                         ("documentSymbolProvider", Json::Bool(true)),
                         (
                             "completionProvider",
-                            Json::obj(vec![(
-                                "triggerCharacters",
-                                Json::Arr(vec![Json::str(".")]),
-                            )]),
+                            Json::obj(vec![("triggerCharacters", Json::Arr(vec![Json::str(".")]))]),
                         ),
                     ]),
                 ),
@@ -351,19 +348,13 @@ impl Server {
             Decl::Type(t) if t.name.name == word => Some(t.name.span),
             Decl::Effect(e) if e.name.name == word => Some(e.name.span),
             Decl::Type(t) => match &t.body {
-                TypeBody::Sum(vs) => vs
-                    .iter()
-                    .find(|v| v.name.name == word)
-                    .map(|v| v.name.span),
+                TypeBody::Sum(vs) => vs.iter().find(|v| v.name.name == word).map(|v| v.name.span),
                 _ => None,
             },
             _ => None,
         });
         match target {
-            Some(span) => Json::obj(vec![
-                ("uri", Json::str(uri)),
-                ("range", doc.range_of(span)),
-            ]),
+            Some(span) => Json::obj(vec![("uri", Json::str(uri)), ("range", doc.range_of(span))]),
             None => Json::Null,
         }
     }
@@ -412,10 +403,7 @@ impl Server {
     }
 
     fn symbols(&self, req: &Json) -> Json {
-        let Some(uri) = req
-            .path("params.textDocument.uri")
-            .and_then(|u| u.as_str())
-        else {
+        let Some(uri) = req.path("params.textDocument.uri").and_then(|u| u.as_str()) else {
             return Json::Null;
         };
         let Some(doc) = self.docs.get(uri) else {
@@ -621,9 +609,33 @@ fn word_at(text: &str, off: u32) -> Option<String> {
 }
 
 const KEYWORDS: &[&str] = &[
-    "fn", "pub", "let", "var", "own", "inout", "type", "effect", "with", "handled_by", "match",
-    "if", "else", "for", "while", "in", "return", "try", "true", "false", "break", "continue",
-    "and", "or", "not", "import", "test",
+    "fn",
+    "pub",
+    "let",
+    "var",
+    "own",
+    "inout",
+    "type",
+    "effect",
+    "with",
+    "handled_by",
+    "match",
+    "if",
+    "else",
+    "for",
+    "while",
+    "in",
+    "return",
+    "try",
+    "true",
+    "false",
+    "break",
+    "continue",
+    "and",
+    "or",
+    "not",
+    "import",
+    "test",
 ];
 
 const BUILTINS: &[(&str, &str)] = &[
@@ -634,7 +646,10 @@ const BUILTINS: &[(&str, &str)] = &[
     ("fail", "fail(err) — raise the error branch of `T ! E`"),
     ("map", "map() — a new empty Map[K, V]"),
     ("args", "args() -> [str] — program arguments (io effect)"),
-    ("input", "input() -> str — read a line from stdin (io effect)"),
+    (
+        "input",
+        "input() -> str — read a line from stdin (io effect)",
+    ),
     (
         "read_file",
         "read_file(path: str) -> str ! IoError (io effect)",
@@ -643,17 +658,11 @@ const BUILTINS: &[(&str, &str)] = &[
         "write_file",
         "write_file(path: str, content: str) -> () ! IoError (io effect)",
     ),
-    (
-        "file_exists",
-        "file_exists(path: str) -> bool (io effect)",
-    ),
+    ("file_exists", "file_exists(path: str) -> bool (io effect)"),
 ];
 
 fn builtin_doc(name: &str) -> Option<&'static str> {
-    BUILTINS
-        .iter()
-        .find(|(n, _)| *n == name)
-        .map(|(_, d)| *d)
+    BUILTINS.iter().find(|(n, _)| *n == name).map(|(_, d)| *d)
 }
 
 // ---------------------------------------------------------------------------

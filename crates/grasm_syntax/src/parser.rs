@@ -143,9 +143,7 @@ fn parse_expr_src_at(src: &str, offset: u32, depth: u32) -> (Option<Expr>, Vec<D
                 leftover,
                 "unexpected extra input inside `{...}` — an interpolation holds one expression",
             )
-            .with_help(
-                "close the interpolation before this, or join the parts with an operator",
-            ),
+            .with_help("close the interpolation before this, or join the parts with an operator"),
         );
     }
     (expr, p.diags)
@@ -285,9 +283,7 @@ impl Parser {
             // The outermost mode is the file's own and is never popped: a
             // stray closer would otherwise leave the parser with no mode at
             // all.
-            TokenKind::RParen | TokenKind::RBracket | TokenKind::RBrace
-                if self.modes.len() > 1 =>
-            {
+            TokenKind::RParen | TokenKind::RBracket | TokenKind::RBrace if self.modes.len() > 1 => {
                 self.modes.pop();
             }
             _ => {}
@@ -361,7 +357,10 @@ impl Parser {
     /// an ordinary program (ProjectGold 06).
     fn wrapped_operator_ahead(&self) -> Option<&'static str> {
         // Shared with the expression-position diagnostic below.
-        if !matches!(self.toks.get(self.i).map(|t| &t.kind), Some(TokenKind::Newline)) {
+        if !matches!(
+            self.toks.get(self.i).map(|t| &t.kind),
+            Some(TokenKind::Newline)
+        ) {
             return None;
         }
         let mut j = self.i;
@@ -446,8 +445,7 @@ impl Parser {
                 // `bench` is an ordinary identifier, and breaking on it would
                 // hand the same token back to parse_decl and spin forever.
                 TokenKind::Ident(n)
-                    if n == "bench"
-                        && matches!(&self.toks[self.i + 1].kind, TokenKind::Str(_)) =>
+                    if n == "bench" && matches!(&self.toks[self.i + 1].kind, TokenKind::Str(_)) =>
                 {
                     break
                 }
@@ -695,7 +693,9 @@ impl Parser {
 
     /// `-> Ret ! Err / {effects}` — every piece optional.
     #[allow(clippy::type_complexity)]
-    fn parse_fn_tail(&mut self) -> PResult<(Option<TypeExpr>, Option<TypeExpr>, Option<Vec<Path>>)> {
+    fn parse_fn_tail(
+        &mut self,
+    ) -> PResult<(Option<TypeExpr>, Option<TypeExpr>, Option<Vec<Path>>)> {
         let mut ret = None;
         let mut err = None;
         let mut effects = None;
@@ -1342,8 +1342,9 @@ impl Parser {
                     let span = expr.span().merge(value.span());
                     if !is_place_expr(&expr) {
                         self.diags.push(
-                            Diagnostic::error(expr.span(), "invalid assignment target")
-                                .with_help("only variables, fields, and index expressions can be assigned to"),
+                            Diagnostic::error(expr.span(), "invalid assignment target").with_help(
+                                "only variables, fields, and index expressions can be assigned to",
+                            ),
                         );
                     }
                     Ok(Stmt::Assign {
@@ -1560,7 +1561,9 @@ impl Parser {
             let rhs = self.parse_additive()?;
             let span = lhs.span().merge(rhs.span());
             lhs = match rhs {
-                Expr::Call { callee, mut args, .. } => {
+                Expr::Call {
+                    callee, mut args, ..
+                } => {
                     args.insert(0, lhs);
                     Expr::Call { callee, args, span }
                 }
@@ -1585,8 +1588,11 @@ impl Parser {
                 },
                 other => {
                     self.diags.push(
-                        Diagnostic::error(other.span(), "right side of `|>` must be a function or call")
-                            .with_help("write `value |> f` or `value |> f(more, args)`"),
+                        Diagnostic::error(
+                            other.span(),
+                            "right side of `|>` must be a function or call",
+                        )
+                        .with_help("write `value |> f` or `value |> f(more, args)`"),
                     );
                     other
                 }
@@ -1826,8 +1832,7 @@ impl Parser {
                     match part {
                         StrPart::Text(t) => pieces.push(StrPiece::Text(t)),
                         StrPart::Interp { src, offset } => {
-                            let (expr, mut diags) =
-                                parse_expr_src_at(&src, offset, self.depth + 1);
+                            let (expr, mut diags) = parse_expr_src_at(&src, offset, self.depth + 1);
                             self.diags.append(&mut diags);
                             match expr {
                                 Some(e) => pieces.push(StrPiece::Expr(e)),
@@ -1855,18 +1860,13 @@ impl Parser {
             // asking, so `for x in region { … }` read the loop's own brace as
             // a region body and `let region = [1, 2]` stopped being a usable
             // name ([L-CONTEXTUAL]).
-            TokenKind::Ident(n)
-                if n == "region" && !self.no_struct_lit && self.block_follows() =>
-            {
+            TokenKind::Ident(n) if n == "region" && !self.no_struct_lit && self.block_follows() => {
                 self.bump();
                 Ok(Expr::Region(self.parse_block()?))
             }
             TokenKind::Ident(name) => {
                 self.bump();
-                let ident = Ident {
-                    name,
-                    span: start,
-                };
+                let ident = Ident { name, span: start };
                 // Struct literal: `Name{ ... }` — only when allowed here.
                 if !self.no_struct_lit && self.at(&TokenKind::LBrace) {
                     return self.parse_struct_lit_or_ident(ident);
@@ -2142,9 +2142,7 @@ impl Parser {
                 // ([G-MAP-BLOCK-AMBIG]); here the arm's own braces win,
                 // because "do nothing" is what somebody writing it meant. A
                 // non-empty `{k: v}` is still a map.
-                TokenKind::LBrace if empty_brace => {
-                    Expr::Block(self.parse_block()?)
-                }
+                TokenKind::LBrace if empty_brace => Expr::Block(self.parse_block()?),
                 TokenKind::KwBreak | TokenKind::KwContinue | TokenKind::KwReturn => {
                     let stmt = self.parse_stmt()?;
                     let span = crate::parser::stmt_span_of(&stmt);
@@ -2443,10 +2441,7 @@ pub(crate) fn stmt_span_of(s: &Stmt) -> Span {
 }
 
 fn is_place_expr(e: &Expr) -> bool {
-    matches!(
-        e,
-        Expr::Ident(_) | Expr::Field { .. } | Expr::Index { .. }
-    )
+    matches!(e, Expr::Ident(_) | Expr::Field { .. } | Expr::Index { .. })
 }
 
 /// The spelling of a binary operator token, for diagnostics.

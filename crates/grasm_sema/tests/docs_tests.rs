@@ -22,8 +22,7 @@ impl Fixture {
     }
 
     fn program(&self) -> grasm_sema::loader::Program {
-        let program =
-            grasm_sema::loader::load_from_disk(&self.dir.join("main.gr")).expect("loads");
+        let program = grasm_sema::loader::load_from_disk(&self.dir.join("main.gr")).expect("loads");
         assert!(
             program.diagnostics.is_empty(),
             "fixture failed to parse: {:#?}",
@@ -148,7 +147,10 @@ fn the_entry_module_documents_its_own_private_items() {
     // A program's `main` file has no consumers, so `pub` there means nothing.
     let fx = Fixture::new(
         "entry",
-        &[("main", "/// Helper.\nfn helper() -> i64 {\n    1\n}\n\nfn main() {\n}\n")],
+        &[(
+            "main",
+            "/// Helper.\nfn helper() -> i64 {\n    1\n}\n\nfn main() {\n}\n",
+        )],
     );
     let modules = docs::collect(&fx.program());
     assert!(modules[0].items.iter().any(|i| i.name == "helper"));
@@ -158,12 +160,18 @@ fn the_entry_module_documents_its_own_private_items() {
 fn markdown_contains_the_signature_and_the_prose() {
     let fx = Fixture::new(
         "md",
-        &[("main", "/// Adds.\nfn add(a: i64, b: i64) -> i64 {\n    a + b\n}\n\nfn main() {\n}\n")],
+        &[(
+            "main",
+            "/// Adds.\nfn add(a: i64, b: i64) -> i64 {\n    a + b\n}\n\nfn main() {\n}\n",
+        )],
     );
     let text = docs::render_markdown("demo", &docs::collect(&fx.program()));
     assert!(text.starts_with("# demo\n"), "got: {text}");
     assert!(text.contains("### `fn` add"), "got: {text}");
-    assert!(text.contains("fn add(a: i64, b: i64) -> i64"), "got: {text}");
+    assert!(
+        text.contains("fn add(a: i64, b: i64) -> i64"),
+        "got: {text}"
+    );
     assert!(text.contains("Adds."), "got: {text}");
 }
 
@@ -230,10 +238,7 @@ fn an_example_program_keeps_module_structure() {
         "the owning module's own names must resolve in an example: {diags:#?}"
     );
     assert!(
-        ex_program
-            .files
-            .iter()
-            .any(|f| f.src.contains("fn square")),
+        ex_program.files.iter().any(|f| f.src.contains("fn square")),
         "the documented module's items must be in the example program"
     );
 }
@@ -296,14 +301,20 @@ fn a_dependency_doc_example_resolves_inside_the_dependency() {
         root.join("dep/src/main.gr"),
         "import util\n\n/// ```\n/// assert(twice(3) == 6)\n/// ```\npub fn twice(n: i64) -> i64 {\n    util.scale(n)\n}\n",
     );
-    write(root.join("dep/src/util.gr"), "pub fn scale(n: i64) -> i64 {\n    n * 2\n}\n");
+    write(
+        root.join("dep/src/util.gr"),
+        "pub fn scale(n: i64) -> i64 {\n    n * 2\n}\n",
+    );
     write(
         root.join("app/grasm.toml"),
         "[package]\nname = \"app\"\nversion = \"0.1.0\"\nentry = \"src/main.gr\"\ncapabilities = [\"io\"]\n\n[dependencies.dep]\npath = \"../dep\"\nversion = \"^0.1.0\"\n",
     );
     // Same module name, different answer. Without the fix the example picks
     // this one and computes 3000.
-    write(root.join("app/src/util.gr"), "pub fn scale(n: i64) -> i64 {\n    n * 1000\n}\n");
+    write(
+        root.join("app/src/util.gr"),
+        "pub fn scale(n: i64) -> i64 {\n    n * 1000\n}\n",
+    );
     write(
         root.join("app/src/main.gr"),
         "import dep\n\nfn main() {\n    print(\"{dep.twice(3)}\")\n}\n",
@@ -318,7 +329,10 @@ fn a_dependency_doc_example_resolves_inside_the_dependency() {
         .expect("the dependency's example is collected");
     let ex = docs::example_program(&program, example);
     assert!(ex.diagnostics.is_empty(), "{:#?}", ex.diagnostics);
-    assert_eq!(ex.files[0].imports.get("util").map(String::as_str), Some("dep.util"));
+    assert_eq!(
+        ex.files[0].imports.get("util").map(String::as_str),
+        Some("dep.util")
+    );
 
     let _ = std::fs::remove_dir_all(&root);
 }

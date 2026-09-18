@@ -153,13 +153,7 @@ fn breakpoints(seq: i64, fixture: &Fixture, lines: &[i64]) -> String {
 #[test]
 fn initialize_advertises_only_what_is_implemented() {
     let fx = Fixture::new("init", COUNTER);
-    let out = run(
-        &fx,
-        &[
-            init(1),
-            request(2, "disconnect", Json::obj(vec![])),
-        ],
-    );
+    let out = run(&fx, &[init(1), request(2, "disconnect", Json::obj(vec![]))]);
     let reply = responses(&out, "initialize")[0];
     assert_eq!(
         reply.path("body.supportsConfigurationDoneRequest"),
@@ -257,8 +251,14 @@ fn variables_show_the_locals_in_scope() {
         .iter()
         .map(|v| {
             (
-                v.get("name").and_then(Json::as_str).unwrap_or("").to_string(),
-                v.get("value").and_then(Json::as_str).unwrap_or("").to_string(),
+                v.get("name")
+                    .and_then(Json::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                v.get("value")
+                    .and_then(Json::as_str)
+                    .unwrap_or("")
+                    .to_string(),
             )
         })
         .collect();

@@ -54,7 +54,13 @@ pub fn load_with(
     entry_display_path: &str,
     provider: &dyn Fn(&str) -> Option<String>,
 ) -> Program {
-    load_with_paths_in(entry_name, entry_display_path, provider, &|_| Vec::new(), &HashSet::new())
+    load_with_paths_in(
+        entry_name,
+        entry_display_path,
+        provider,
+        &|_| Vec::new(),
+        &HashSet::new(),
+    )
 }
 
 /// `load_with`, plus a way to say where a missing module was looked for.
@@ -69,7 +75,13 @@ pub fn load_with_paths(
     provider: &dyn Fn(&str) -> Option<String>,
     tried: &dyn Fn(&str) -> Vec<String>,
 ) -> Program {
-    load_with_paths_in(entry_name, entry_display_path, provider, tried, &HashSet::new())
+    load_with_paths_in(
+        entry_name,
+        entry_display_path,
+        provider,
+        tried,
+        &HashSet::new(),
+    )
 }
 
 /// `load_with_paths`, told which module names are *dependencies*.
@@ -264,11 +276,7 @@ pub fn load_with_resolved_imports(
                 queue.push((full, disp, imp.span, written.clone()));
             }
         }
-        let alias = name
-            .rsplit('.')
-            .next()
-            .unwrap_or(&name)
-            .to_string();
+        let alias = name.rsplit('.').next().unwrap_or(&name).to_string();
         let len = src.len() as u32;
         files.push(LoadedFile {
             name,
@@ -581,7 +589,12 @@ pub fn load_from_disk_in(
             .iter()
             .filter(|(p, _)| importer == p.as_str() || importer.starts_with(&format!("{p}.")))
             .max_by_key(|(p, _)| p.len())
-            .map(|(_, d)| package_entry(d).parent().map(|s| s.to_path_buf()).unwrap_or_else(|| d.clone()))
+            .map(|(_, d)| {
+                package_entry(d)
+                    .parent()
+                    .map(|s| s.to_path_buf())
+                    .unwrap_or_else(|| d.clone())
+            })
             .unwrap_or_else(|| entry_dir_for_canon.clone());
         if pkg_dir
             .join(format!("{}.gr", written.replace('.', "/")))
@@ -597,15 +610,13 @@ pub fn load_from_disk_in(
         // second one prefixed its own private modules with a sibling
         // package's name, which resolved nowhere.
         let subs = package_dependencies(&pkg_dir);
-        let dir = subs
-            .get(root)
-            .or_else(|| {
-                dependency_names(&pkg_dir)
-                    .iter()
-                    .any(|d| d == root)
-                    .then(|| resolved_for_canon.get(root))
-                    .flatten()
-            })?;
+        let dir = subs.get(root).or_else(|| {
+            dependency_names(&pkg_dir)
+                .iter()
+                .any(|d| d == root)
+                .then(|| resolved_for_canon.get(root))
+                .flatten()
+        })?;
         let key = real_dir(dir);
         let want = canon.get(&key)?;
         Some(match written.split_once('.') {
@@ -769,7 +780,15 @@ fn collect_packages(
 ) -> bool {
     let mut expanded = std::collections::HashSet::new();
     let mut truncated = false;
-    collect_packages_in(prefix, dir, resolved, out, depth, &mut expanded, &mut truncated);
+    collect_packages_in(
+        prefix,
+        dir,
+        resolved,
+        out,
+        depth,
+        &mut expanded,
+        &mut truncated,
+    );
     truncated
 }
 
@@ -922,7 +941,9 @@ so this import was not resolved as a dependency name"
     let Some(src_dir) = entry.parent().map(|p| p.to_path_buf()) else {
         return;
     };
-    out.push(tidy(&src_dir.join(format!("{}.gr", rest.replace('.', "/")))));
+    out.push(tidy(
+        &src_dir.join(format!("{}.gr", rest.replace('.', "/"))),
+    ));
     let head = rest.split('.').next().unwrap_or(rest);
     let tail = rest.split_once('.').map(|(_, t)| t).unwrap_or("");
     match package_dependencies(&src_dir).get(head) {
@@ -981,7 +1002,11 @@ fn dependency_names(dir: &std::path::Path) -> Vec<String> {
     for raw in text.lines() {
         let line = raw.split('#').next().unwrap_or("").trim();
         if let Some(rest) = line.strip_prefix('[') {
-            if let Some(name) = rest.trim_end_matches(']').trim().strip_prefix("dependencies.") {
+            if let Some(name) = rest
+                .trim_end_matches(']')
+                .trim()
+                .strip_prefix("dependencies.")
+            {
                 out.push(name.trim().to_string());
             }
         }

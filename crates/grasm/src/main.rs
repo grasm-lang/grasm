@@ -35,8 +35,6 @@ use grasm_sema::loader::{self, Program};
 
 const BUNDLE_MAGIC: &[u8; 8] = b"GRASMBDL";
 
-
-
 /// The stack the whole tool runs on.
 ///
 /// Every pass after the parser — checking, formatting, the interpreter's own
@@ -118,10 +116,7 @@ fn run() -> ExitCode {
         // The flags each command takes, and which of them take a value.
         let (flags, valued): (&[&str], &[&str]) = match cmd {
             "run" => (&[], &[]),
-            "test" => (
-                &["--coverage"],
-                &["--seed", "--cases", "--filter"],
-            ),
+            "test" => (&["--coverage"], &["--seed", "--cases", "--filter"]),
             "bench" => (&[], &["--filter"]),
             "check" => (&[], &[]),
             "build" => (
@@ -414,15 +409,17 @@ fn run() -> ExitCode {
             // `grasm build x.gr -o x.gr` reported success and left a 10 MB
             // executable where the program used to be.
             if same_dir(std::path::Path::new(&out_path), std::path::Path::new(path)) {
+                eprintln!("error: `{out_path}` is the source file — the build would overwrite it");
                 eprintln!(
-                    "error: `{out_path}` is the source file — the build would overwrite it"
+                    "  help: name the output something else, or drop `-o` to use the file's stem"
                 );
-                eprintln!("  help: name the output something else, or drop `-o` to use the file's stem");
                 return ExitCode::FAILURE;
             }
             let want_source = args.iter().any(|a| a == "--source");
             if out_path.ends_with(".gr") && !want_source {
-                eprintln!("error: `{out_path}` ends in `.gr`, and a build writes an executable there");
+                eprintln!(
+                    "error: `{out_path}` ends in `.gr`, and a build writes an executable there"
+                );
                 eprintln!("  help: name the output without the `.gr` suffix");
                 return ExitCode::FAILURE;
             }
@@ -446,9 +443,9 @@ fn run() -> ExitCode {
             // there too, with a clearer message.
             if !program.files.iter().any(|f| {
                 f.name == "main"
-                    && f.module.decls.iter().any(|d| {
-                        matches!(d, grasm_syntax::ast::Decl::Fn(fd) if fd.name.name == "main")
-                    })
+                    && f.module.decls.iter().any(
+                        |d| matches!(d, grasm_syntax::ast::Decl::Fn(fd) if fd.name.name == "main"),
+                    )
             }) {
                 eprintln!("error: no `main` function");
                 return ExitCode::FAILURE;
@@ -523,9 +520,7 @@ fn run() -> ExitCode {
                         ExitCode::FAILURE
                     }
                     Ok(size) => {
-                        println!(
-                            "built `{out_path}` natively ({size} bytes, Cranelift)",
-                        );
+                        println!("built `{out_path}` natively ({size} bytes, Cranelift)",);
                         ExitCode::SUCCESS
                     }
                     Err(e) => {
@@ -538,9 +533,10 @@ fn run() -> ExitCode {
             // other two build modes say so. The bundle used to ship a 9.7 MB
             // executable, report success, and fail on startup.
             if !program.files.first().is_some_and(|f| {
-                f.module.decls.iter().any(|d| {
-                    matches!(d, grasm_syntax::ast::Decl::Fn(fd) if fd.name.name == "main")
-                })
+                f.module
+                    .decls
+                    .iter()
+                    .any(|d| matches!(d, grasm_syntax::ast::Decl::Fn(fd) if fd.name.name == "main"))
             }) {
                 eprintln!("error: no `main` function");
                 eprintln!("  help: a bundled build needs an entry point, the same as a native one");
@@ -548,7 +544,10 @@ fn run() -> ExitCode {
             }
             match write_bundle(&program, &out_path) {
                 Ok(size) => {
-                    println!("built `{out_path}` ({size} bytes, {} module(s))", program.files.len());
+                    println!(
+                        "built `{out_path}` ({size} bytes, {} module(s))",
+                        program.files.len()
+                    );
                     ExitCode::SUCCESS
                 }
                 Err(e) => {
@@ -590,10 +589,7 @@ fn run() -> ExitCode {
                     // release. A truncated file, a wrong path that happens to
                     // exist, or binary junk all landed there and exited 0 —
                     // the one exit code a release gate reads.
-                    let entries = old
-                        .lines()
-                        .filter(|l| l.split('\t').count() == 3)
-                        .count();
+                    let entries = old.lines().filter(|l| l.split('\t').count() == 3).count();
                     if entries == 0 && !surface.trim().is_empty() {
                         eprintln!(
                             "error: `{saved}` has no API entries — a baseline that says nothing would report every export as added"
@@ -812,7 +808,11 @@ fn run() -> ExitCode {
             // `--full` is opt-in rather than the default because the common
             // reason to open a recording is to find which call went wrong, and
             // one `read_bytes` of a large file would bury the other twenty.
-            let budget = if args.iter().any(|a| a == "--full") { usize::MAX } else { 48 };
+            let budget = if args.iter().any(|a| a == "--full") {
+                usize::MAX
+            } else {
+                48
+            };
             let records = match grasm_journal::read(std::ffi::OsStr::new(path.as_str())) {
                 Ok(r) => r,
                 Err(e) => {
@@ -913,24 +913,34 @@ fn run() -> ExitCode {
             eprintln!("  bench <file.gr>              run bench blocks, report time per op");
             eprintln!("      --filter TEXT            only benchmarks whose name contains TEXT");
             eprintln!("  check <file.gr>              parse + typecheck");
-            eprintln!("  build <file.gr> [-o out]     self-contained executable
+            eprintln!(
+                "  build <file.gr> [-o out]     self-contained executable
       --source                 one .gr holding the whole program, for an
-                               embedder with no filesystem");
+                               embedder with no filesystem"
+            );
             eprintln!("      --native                 compile to machine code (Cranelift)");
             eprintln!("      --target <triple>        emit a cross-target object file");
-            eprintln!("      --no-incremental         one object, no cache (best for a single build)");
+            eprintln!(
+                "      --no-incremental         one object, no cache (best for a single build)"
+            );
             eprintln!("  doc <file.gr> [-o out.md]    API documentation from `///` comments");
             eprintln!("  api <file.gr> [--against F]  public surface, and what changed in it");
             eprintln!("  fmt <file.gr> [--check]      canonical layout: 4-space indent and one spacing for every token");
             eprintln!("  lint <file.gr> [--json]      unused, shadowed and over-long — the rules a line cannot answer");
             eprintln!("  lsp                          language server (stdio)");
-            eprintln!("  dap                          debug adapter (stdio) — breakpoints, stepping");
+            eprintln!(
+                "  dap                          debug adapter (stdio) — breakpoints, stepping"
+            );
             eprintln!("  deps [dir]                   resolve dependencies, check capabilities, write grasm.lock");
-            eprintln!("      --locked                 fail if anything changed since grasm.lock (CI)");
+            eprintln!(
+                "      --locked                 fail if anything changed since grasm.lock (CI)"
+            );
             eprintln!("  publish [dir]                copy a package into a registry (versions are immutable)");
             eprintln!("      --registry <dir>         registry root (else GRASM_REGISTRY, else .grasm/registry)");
             eprintln!("  add <name> <version> [dir]   add a registry dependency to grasm.toml");
-            eprintln!("  journal <file> [--full]      what a recorded run read from outside itself");
+            eprintln!(
+                "  journal <file> [--full]      what a recorded run read from outside itself"
+            );
             eprintln!("  tokens <file.gr>             dump lexer output (debug)");
             eprintln!("  version                      print version");
             if asked {
@@ -1190,7 +1200,6 @@ build against a dependency whose reach is unknown",
     }
 }
 
-
 /// A package's public surface, one item per line, sorted.
 ///
 /// Sorted because a diff should report what *changed*, not where a
@@ -1245,17 +1254,13 @@ fn api_surface(program: &Program) -> String {
     use grasm_syntax::ast::Decl;
     let const_types = grasm_sema::check::check_program(program).const_types;
     // Aliases are program-wide: types share one namespace ([T-MODULE-NS]).
-    let mut aliases: std::collections::BTreeMap<String, String> =
-        std::collections::BTreeMap::new();
+    let mut aliases: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
     for file in &program.files {
         for decl in &file.module.decls {
             if let Decl::Type(t) = decl {
                 if let grasm_syntax::ast::TypeBody::Alias(target) = &t.body {
                     if t.generics.is_empty() {
-                        aliases.insert(
-                            t.name.name.clone(),
-                            grasm_sema::docs::type_text(target),
-                        );
+                        aliases.insert(t.name.name.clone(), grasm_sema::docs::type_text(target));
                     }
                 }
             }
@@ -1278,14 +1283,10 @@ fn api_surface(program: &Program) -> String {
             // breaking change while dropping `pub` from a real export read as
             // no change at all — backwards in both directions.
             let (name, sig) = match decl {
-                Decl::Fn(f) if f.is_pub => (
-                    f.name.name.clone(),
-                    grasm_sema::docs::fn_signature(f),
-                ),
-                Decl::Extern(e) if e.is_pub => (
-                    e.name.name.clone(),
-                    grasm_sema::docs::extern_signature(e),
-                ),
+                Decl::Fn(f) if f.is_pub => (f.name.name.clone(), grasm_sema::docs::fn_signature(f)),
+                Decl::Extern(e) if e.is_pub => {
+                    (e.name.name.clone(), grasm_sema::docs::extern_signature(e))
+                }
                 Decl::Const(c) if c.is_pub => {
                     // The inferred type, not just the name: `pub let W = 42`
                     // becoming `= "x"` is a breaking change and the source
@@ -1299,14 +1300,8 @@ fn api_surface(program: &Program) -> String {
                 }
                 // Types and effects share one namespace across the program
                 // ([T-MODULE-NS]), so every one of them is surface.
-                Decl::Type(t) => (
-                    t.name.name.clone(),
-                    grasm_sema::docs::type_signature(t),
-                ),
-                Decl::Effect(e) => (
-                    e.name.name.clone(),
-                    grasm_sema::docs::effect_signature(e),
-                ),
+                Decl::Type(t) => (t.name.name.clone(), grasm_sema::docs::type_signature(t)),
+                Decl::Effect(e) => (e.name.name.clone(), grasm_sema::docs::effect_signature(e)),
                 _ => continue,
             };
             // An alias declaration keeps its own text — `type Text = str`
@@ -1384,7 +1379,10 @@ fn report_api_change(old: &str, new: &str) -> ExitCode {
         );
         ExitCode::FAILURE
     } else if !added.is_empty() {
-        println!("compatible: {} added — this is a MINOR release", added.len());
+        println!(
+            "compatible: {} added — this is a MINOR release",
+            added.len()
+        );
         ExitCode::SUCCESS
     } else {
         println!("no change to the public surface — this is a PATCH release");
@@ -1608,7 +1606,10 @@ fn run_bundle(bundle: &Bundle, program_args: &[String]) -> ExitCode {
         .iter()
         .map(|(m, a, t)| ((m.clone(), a.clone()), t.clone()))
         .collect();
-    let entry_display = bundle.entry.clone().unwrap_or_else(|| "main.gr".to_string());
+    let entry_display = bundle
+        .entry
+        .clone()
+        .unwrap_or_else(|| "main.gr".to_string());
     let program = loader::load_with_resolved_imports(
         "main",
         &entry_display,
@@ -1628,7 +1629,8 @@ fn run_bundle(bundle: &Bundle, program_args: &[String]) -> ExitCode {
         return ExitCode::FAILURE;
     }
     let mut stdout = std::io::stdout();
-    let (code, trace, _fault) = grasm_interp::run_program_traced(&program, program_args, &mut stdout);
+    let (code, trace, _fault) =
+        grasm_interp::run_program_traced(&program, program_args, &mut stdout);
     let _ = stdout.flush();
     print_trace(&program, &trace);
     ExitCode::from((code & 0xff) as u8)
@@ -1688,8 +1690,8 @@ fn find_runtime() -> Result<PathBuf, String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let dir = exe.parent().ok_or("cannot locate the grasm binary")?;
     let candidates = [
-        dir.join("libgrasm_rt.a"),               // release archive, cargo target
-        dir.join("../lib/grasm/libgrasm_rt.a"),  // bin/ + lib/ install layout
+        dir.join("libgrasm_rt.a"),              // release archive, cargo target
+        dir.join("../lib/grasm/libgrasm_rt.a"), // bin/ + lib/ install layout
         dir.join("lib/libgrasm_rt.a"),
         dir.join("../lib/libgrasm_rt.a"),
     ];
@@ -1751,7 +1753,11 @@ fn world_signature(program: &Program) -> String {
         .files
         .iter()
         .map(|f| {
-            let mut s = format!("{}\n{}", f.name, grasm_sema::docs::module_signature(&f.module));
+            let mut s = format!(
+                "{}\n{}",
+                f.name,
+                grasm_sema::docs::module_signature(&f.module)
+            );
             // Constant *values*, which the signature deliberately omits — a
             // constant changing value is not an API break, so `grasm api` is
             // right to ignore it, and a cache key is wrong to.
@@ -1933,7 +1939,9 @@ fn build_native_incremental(
                     Some(rest) => rest.split('"').next()?.trim_start_matches('_').to_string(),
                     None => {
                         let rest = l.split("undefined reference to").nth(1)?;
-                        rest.trim().trim_matches(|c| c == '`' || c == '\'').to_string()
+                        rest.trim()
+                            .trim_matches(|c| c == '`' || c == '\'')
+                            .to_string()
                     }
                 };
                 // Not an internal symbol: `g_…` is a compiled function,
@@ -1996,7 +2004,9 @@ fn build_native_incremental(
             .arg(out_path)
             .output();
     }
-    let size = std::fs::metadata(out_path).map_err(|e| e.to_string())?.len();
+    let size = std::fs::metadata(out_path)
+        .map_err(|e| e.to_string())?
+        .len();
     Ok(size)
 }
 
@@ -2145,10 +2155,7 @@ to its ceiling,\n        so its dependents get no guarantee at all"
             "  help: a capability must be `io`, `async`, `net`, `unsafe`, or an effect \
 the program declares"
         );
-        return Err(format!(
-            "{} capability name(s) do not exist",
-            unknown.len()
-        ));
+        return Err(format!("{} capability name(s) do not exist", unknown.len()));
     }
 
     if !violations.is_empty() {

@@ -253,9 +253,37 @@ fn is_ident_cont(b: u8) -> bool {
 /// Keywords that may be followed by a parenthesis they do not *call*.
 /// `print(x)` is a call and closes up; `if (a)` is a keyword and does not.
 const KEYWORDS: &[&str] = &[
-    "fn", "pub", "let", "var", "own", "inout", "type", "interface", "impl", "effect", "with",
-    "handled_by", "match", "if", "else", "for", "while", "unsafe", "ref", "in", "return", "try",
-    "true", "false", "break", "continue", "and", "or", "not", "import", "test",
+    "fn",
+    "pub",
+    "let",
+    "var",
+    "own",
+    "inout",
+    "type",
+    "interface",
+    "impl",
+    "effect",
+    "with",
+    "handled_by",
+    "match",
+    "if",
+    "else",
+    "for",
+    "while",
+    "unsafe",
+    "ref",
+    "in",
+    "return",
+    "try",
+    "true",
+    "false",
+    "break",
+    "continue",
+    "and",
+    "or",
+    "not",
+    "import",
+    "test",
 ];
 
 fn is_keyword(s: &str) -> bool {
@@ -277,7 +305,11 @@ fn split_pieces(line: &str) -> Option<Vec<Piece<'_>>> {
         }
         // Comment: the rest of the line, verbatim.
         if c == b'/' && i + 1 < b.len() && b[i + 1] == b'/' {
-            out.push(Piece { kind: Kind::Opaque, text: &line[i..], at: i });
+            out.push(Piece {
+                kind: Kind::Opaque,
+                text: &line[i..],
+                at: i,
+            });
             return Some(out);
         }
         // Block comment. Only one that closes on this line is handled here;
@@ -307,7 +339,11 @@ fn split_pieces(line: &str) -> Option<Vec<Piece<'_>>> {
             if depth != 0 {
                 return None;
             }
-            out.push(Piece { kind: Kind::Opaque, text: &line[i..j], at: i });
+            out.push(Piece {
+                kind: Kind::Opaque,
+                text: &line[i..j],
+                at: i,
+            });
             i = j;
             continue;
         }
@@ -316,11 +352,19 @@ fn split_pieces(line: &str) -> Option<Vec<Piece<'_>>> {
             match line[i + 3..].find("\"\"\"") {
                 Some(end) => {
                     let stop = i + 3 + end + 3;
-                    out.push(Piece { kind: Kind::Opaque, text: &line[i..stop], at: i });
+                    out.push(Piece {
+                        kind: Kind::Opaque,
+                        text: &line[i..stop],
+                        at: i,
+                    });
                     i = stop;
                 }
                 None => {
-                    out.push(Piece { kind: Kind::Opaque, text: &line[i..], at: i });
+                    out.push(Piece {
+                        kind: Kind::Opaque,
+                        text: &line[i..],
+                        at: i,
+                    });
                     return Some(out);
                 }
             }
@@ -328,7 +372,11 @@ fn split_pieces(line: &str) -> Option<Vec<Piece<'_>>> {
         }
         if c == b'"' {
             let stop = scan_string(b, i)?;
-            out.push(Piece { kind: Kind::Opaque, text: &line[i..stop], at: i });
+            out.push(Piece {
+                kind: Kind::Opaque,
+                text: &line[i..stop],
+                at: i,
+            });
             i = stop;
             continue;
         }
@@ -337,7 +385,11 @@ fn split_pieces(line: &str) -> Option<Vec<Piece<'_>>> {
             while i < b.len() && is_ident_cont(b[i]) {
                 i += 1;
             }
-            out.push(Piece { kind: Kind::Word, text: &line[start..i], at: start });
+            out.push(Piece {
+                kind: Kind::Word,
+                text: &line[start..i],
+                at: start,
+            });
             continue;
         }
         if c.is_ascii_digit() {
@@ -363,16 +415,28 @@ fn split_pieces(line: &str) -> Option<Vec<Piece<'_>>> {
                 }
                 break;
             }
-            out.push(Piece { kind: Kind::Word, text: &line[start..i], at: start });
+            out.push(Piece {
+                kind: Kind::Word,
+                text: &line[start..i],
+                at: start,
+            });
             continue;
         }
         if let Some(op) = OPS.iter().find(|o| line[i..].starts_with(**o)) {
-            out.push(Piece { kind: Kind::Op, text: &line[i..i + op.len()], at: i });
+            out.push(Piece {
+                kind: Kind::Op,
+                text: &line[i..i + op.len()],
+                at: i,
+            });
             i += op.len();
             continue;
         }
         if c.is_ascii_punctuation() {
-            out.push(Piece { kind: Kind::Op, text: &line[i..i + 1], at: i });
+            out.push(Piece {
+                kind: Kind::Op,
+                text: &line[i..i + 1],
+                at: i,
+            });
             i += 1;
             continue;
         }
@@ -510,9 +574,9 @@ fn respace(line: &str) -> String {
         let unary = p.kind == Kind::Op
             && (p.text == "-" || p.text == "+")
             && !prev_ends_value
-            && ps.get(k + 1).is_some_and(|q| {
-                q.kind == Kind::Word || (q.kind == Kind::Op && q.text == "(")
-            });
+            && ps
+                .get(k + 1)
+                .is_some_and(|q| q.kind == Kind::Word || (q.kind == Kind::Op && q.text == "("));
         // A closure's parameter list opens with a `|` that cannot follow a
         // value — `|n| n * 2`, `map(|a, b| …)`, `let f = |x| x`. A `|` that
         // *does* follow a value separates alternatives instead, as in the
@@ -631,8 +695,7 @@ fn brace_kind(
         }
         return match prev {
             Some(p)
-                if p.kind == Kind::Word
-                    && p.text.starts_with(|c: char| c.is_ascii_uppercase()) =>
+                if p.kind == Kind::Word && p.text.starts_with(|c: char| c.is_ascii_uppercase()) =>
             {
                 Brace::Struct
             }
@@ -654,12 +717,7 @@ fn brace_kind(
     Brace::Block
 }
 
-fn needs_space(
-    prev: &Piece,
-    next: &Piece,
-    braces: &[Brace],
-    this_brace: Option<Brace>,
-) -> bool {
+fn needs_space(prev: &Piece, next: &Piece, braces: &[Brace], this_brace: Option<Brace>) -> bool {
     let (p, n) = (prev.text, next.text);
     let p_op = prev.kind == Kind::Op;
     let n_op = next.kind == Kind::Op;
@@ -678,13 +736,24 @@ fn needs_space(
     // punctuation lists below — otherwise the struct-update spread in
     // `Stats{ ..s, n: 1 }` loses its space to the rule that keeps `0..n` tight.
     if p_op && p == "{" {
-        return matches!(braces.last(), Some(Brace::Struct) | Some(Brace::Block) | None);
+        return matches!(
+            braces.last(),
+            Some(Brace::Struct) | Some(Brace::Block) | None
+        );
     }
     if n_op && n == "}" {
-        return matches!(braces.last(), Some(Brace::Struct) | Some(Brace::Block) | None);
+        return matches!(
+            braces.last(),
+            Some(Brace::Struct) | Some(Brace::Block) | None
+        );
     }
     // Never a space before these.
-    if n_op && matches!(n, "," | ";" | ")" | "]" | "?" | ":" | "." | ".." | "..=" | "?." | "::") {
+    if n_op
+        && matches!(
+            n,
+            "," | ";" | ")" | "]" | "?" | ":" | "." | ".." | "..=" | "?." | "::"
+        )
+    {
         return false;
     }
     // Never a space after these.
@@ -814,7 +883,11 @@ mod interp_regression {
     fn interpolation_braces_do_not_affect_depth() {
         // Regression: `"{n}"` used to eat one indent level.
         let src = "fn f(n: i64) -> str {\n    match n {\n        0 -> \"{n}\"\n        _ -> \"x\"\n    }\n}\n";
-        assert_eq!(format_src(src), src, "already-canonical file must be unchanged");
+        assert_eq!(
+            format_src(src),
+            src,
+            "already-canonical file must be unchanged"
+        );
     }
 
     #[test]

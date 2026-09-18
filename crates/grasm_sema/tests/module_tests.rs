@@ -32,7 +32,10 @@ fn err(files: &[(&str, &str)], needle: &str) {
 #[test]
 fn cross_module_calls() {
     ok(&[
-        ("main", "import utils\n\nfn main() {\n    print(\"{utils.double(21)}\")\n}\n"),
+        (
+            "main",
+            "import utils\n\nfn main() {\n    print(\"{utils.double(21)}\")\n}\n",
+        ),
         ("utils", "pub fn double(x: i64) -> i64 {\n    x * 2\n}\n"),
     ]);
 }
@@ -41,7 +44,10 @@ fn cross_module_calls() {
 fn privacy_enforced() {
     err(
         &[
-            ("main", "import utils\n\nfn main() {\n    print(\"{utils.secret()}\")\n}\n"),
+            (
+                "main",
+                "import utils\n\nfn main() {\n    print(\"{utils.secret()}\")\n}\n",
+            ),
             ("utils", "fn secret() -> i64 {\n    1\n}\n"),
         ],
         "is private",
@@ -71,7 +77,10 @@ fn missing_fn_in_module() {
 fn type_errors_cross_module() {
     err(
         &[
-            ("main", "import utils\n\nfn main() {\n    let x: str = utils.double(2)\n}\n"),
+            (
+                "main",
+                "import utils\n\nfn main() {\n    let x: str = utils.double(2)\n}\n",
+            ),
             ("utils", "pub fn double(x: i64) -> i64 {\n    x * 2\n}\n"),
         ],
         "type mismatch",
@@ -81,7 +90,10 @@ fn type_errors_cross_module() {
 #[test]
 fn same_fn_name_in_two_modules_ok() {
     ok(&[
-        ("main", "import a\nimport b\n\nfn main() {\n    print(\"{a.get() + b.get()}\")\n}\n"),
+        (
+            "main",
+            "import a\nimport b\n\nfn main() {\n    print(\"{a.get() + b.get()}\")\n}\n",
+        ),
         ("a", "pub fn get() -> i64 {\n    1\n}\n"),
         ("b", "pub fn get() -> i64 {\n    2\n}\n"),
     ]);
@@ -90,7 +102,10 @@ fn same_fn_name_in_two_modules_ok() {
 #[test]
 fn dotted_imports_use_last_segment_alias() {
     ok(&[
-        ("main", "import lib.math\n\nfn main() {\n    print(\"{math.sq(3)}\")\n}\n"),
+        (
+            "main",
+            "import lib.math\n\nfn main() {\n    print(\"{math.sq(3)}\")\n}\n",
+        ),
         ("lib.math", "pub fn sq(x: i64) -> i64 {\n    x * x\n}\n"),
     ]);
 }
@@ -114,9 +129,18 @@ fn effects_flow_across_modules() {
 #[test]
 fn diamond_imports_load_once() {
     ok(&[
-        ("main", "import a\nimport b\n\nfn main() {\n    print(\"{a.fa() + b.fb()}\")\n}\n"),
-        ("a", "import shared\n\npub fn fa() -> i64 {\n    shared.base()\n}\n"),
-        ("b", "import shared\n\npub fn fb() -> i64 {\n    shared.base() * 2\n}\n"),
+        (
+            "main",
+            "import a\nimport b\n\nfn main() {\n    print(\"{a.fa() + b.fb()}\")\n}\n",
+        ),
+        (
+            "a",
+            "import shared\n\npub fn fa() -> i64 {\n    shared.base()\n}\n",
+        ),
+        (
+            "b",
+            "import shared\n\npub fn fb() -> i64 {\n    shared.base() * 2\n}\n",
+        ),
         ("shared", "pub fn base() -> i64 {\n    10\n}\n"),
     ]);
 }
@@ -125,7 +149,10 @@ fn diamond_imports_load_once() {
 fn duplicate_type_across_modules_rejected() {
     err(
         &[
-            ("main", "import other\ntype Thing = { x: i64 }\n\nfn main() {\n}\n"),
+            (
+                "main",
+                "import other\ntype Thing = { x: i64 }\n\nfn main() {\n}\n",
+            ),
             ("other", "type Thing = { y: i64 }\n"),
         ],
         "duplicate type name",
@@ -247,7 +274,10 @@ fn a_closure_resolves_names_where_it_was_written() {
             "engine",
             "pub fn apply(f: fn() -> str) -> str {\n    f()\n}\n",
         ),
-        ("helper", "pub fn value() -> str {\n    \"from helper\"\n}\n"),
+        (
+            "helper",
+            "pub fn value() -> str {\n    \"from helper\"\n}\n",
+        ),
     ]);
 }
 
@@ -333,7 +363,10 @@ fn a_private_constant_is_not() {
                 "main",
                 "import lib\n\nfn main() {\n    print(\"{lib.HIDDEN}\")\n}\n",
             ),
-            ("lib", "let HIDDEN = 7\npub fn w() -> i64 {\n    HIDDEN\n}\n"),
+            (
+                "lib",
+                "let HIDDEN = 7\npub fn w() -> i64 {\n    HIDDEN\n}\n",
+            ),
         ],
         "is private",
     );
@@ -362,7 +395,10 @@ fn a_diagnostic_in_a_dependency_names_a_real_file() {
         root.join("liba/src/main.gr"),
         "import helper\n\npub fn go() -> str {\n    helper.bad()\n}\n",
     );
-    write(root.join("liba/src/helper.gr"), "pub fn bad() -> str {\n    42\n}\n");
+    write(
+        root.join("liba/src/helper.gr"),
+        "pub fn bad() -> str {\n    42\n}\n",
+    );
     write(
         root.join("app/grasm.toml"),
         "[package]\nname = \"app\"\nversion = \"0.1.0\"\nentry = \"src/main.gr\"\ncapabilities = [\"io\"]\n\n[dependencies.liba]\npath = \"../liba\"\nversion = \"^0.1.0\"\n",
@@ -395,13 +431,19 @@ fn a_key_generic_is_checked_at_a_qualified_call_site() {
     let tally = "pub fn tally[T](xs: [T]) -> i64 {\n    var m: Map[T, i64] = {}\n    for x in xs {\n        m.set(x, 1)\n    }\n    m.len()\n}\n";
     err(
         &[
-            ("main", "import mk\n\nfn main() {\n    print(\"{mk.tally([1.5, 2.5])}\")\n}\n"),
+            (
+                "main",
+                "import mk\n\nfn main() {\n    print(\"{mk.tally([1.5, 2.5])}\")\n}\n",
+            ),
             ("mk", tally),
         ],
         "map keys must be",
     );
     ok(&[
-        ("main", "import mk\n\nfn main() {\n    let n = mk.tally([\"a\"])\n    print(\"{n}\")\n}\n"),
+        (
+            "main",
+            "import mk\n\nfn main() {\n    let n = mk.tally([\"a\"])\n    print(\"{n}\")\n}\n",
+        ),
         ("mk", tally),
     ]);
 }

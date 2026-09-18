@@ -115,6 +115,30 @@ the four fast-ish rows allocate nothing at all — their gap is entirely code
 generation. Those are two different problems and neither is fixed by making
 allocation cheaper at the margin.
 
+**Hoisting `i * n` out of the inner loop is worth nothing on this machine.**
+`c[i * n + j] += aik * b[k * n + j]` inside `for j in 0..n` recomputes two
+products per element, and Cranelift has no pass that moves them out. A
+loop-invariant pass was written — canonical spellings of `+`/`-`/`*` over names
+and literals, a conservative writes analysis that gives up on any body
+containing a call, a closure or a thread, and the computation emitted in the
+block before the loop, which is sound without a guard because none of those
+three operators can trap. It hoisted exactly what it should: `(i * n)` out of
+two loops and `(k * n)` out of one. Measured against the same compiler with the
+pass switched off: matmul 1.011x, sieve 1.012x, parwords 1.028x, sort 0.970x,
+tree 0.997x — a wash.
+
+The reason is in the disassembly. AArch64 has `madd`, and Cranelift's lowering
+pattern-matches `iadd(imul(a, b), c)` into one instruction, so `i * n + j`
+costs a single `madd` whether or not the multiply was moved. Hoisting replaces
+one instruction with one instruction. The pass was removed.
+
+What the inner loop is actually carrying is the *bounds checks*: of eighteen
+instructions, four are two `cmp`/`b.hs` pairs and three more are register
+shuffles setting up their operands. Removing those needs the loop compiled
+twice — once with the checks and once without, chosen by a single test in the
+preheader that the whole range fits — which is the next thing to try, and worth
+about forty percent of the loop rather than nothing.
+
 ## What the other implementations do, and which of it applies here
 
 Read against Rust's `hashbrown`, Zig's `std.hash_map`, Swift's SIL optimizer,

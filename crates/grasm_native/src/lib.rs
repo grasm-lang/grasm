@@ -4885,6 +4885,17 @@ impl FnCx<'_, '_> {
         let mut scope: HashMap<String, (Value, Value, VType)> = HashMap::new();
         let candidates: Vec<String> = indexed_only_lists(body);
         for name in candidates {
+            // A list an enclosing loop already pinned stays pinned to that
+            // loop. Its buffer and its length cannot have moved — a name that
+            // is assigned or pushed to anywhere in the body is not a candidate
+            // in the first place — so pinning it again would call into the
+            // runtime once for every entry of every inner loop and hold the
+            // answer in a fresh stack slot, which is what pushed `matmul`'s
+            // lengths out of registers and made the innermost loop reload one
+            // from the stack on every element.
+            if self.pinned_list(&name).is_some() {
+                continue;
+            }
             let Some((var, VType::List(elem))) = self.lookup(&name) else {
                 continue;
             };
@@ -5575,8 +5586,7 @@ impl FnCx<'_, '_> {
                 // being joined: appended in place when nothing else holds it,
                 // which is what makes building text in a loop linear instead
                 // of copying everything written so far on every iteration.
-                if matches!(op, AssignOp::Assign)
-                    && self.try_self_append(target, value)?.is_some()
+                if matches!(op, AssignOp::Assign) && self.try_self_append(target, value)?.is_some()
                 {
                     return Ok(StmtOut::Value(None));
                 }

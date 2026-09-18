@@ -13,11 +13,8 @@ struct Fixture {
 
 impl Fixture {
     fn new(name: &str, src: &str) -> Fixture {
-        let dir = std::env::temp_dir().join(format!(
-            "grasm_testing_{}_{}",
-            name,
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("grasm_testing_{}_{}", name, std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let entry = dir.join("main.gr");
@@ -215,10 +212,12 @@ fn coverage_is_off_by_default() {
         "test \"t\" {\n    assert(true)\n}\n\nfn main() {\n}\n",
         &TestOptions::default(),
     );
-    let fx = Fixture::new("nocov2", "test \"t\" {\n    assert(true)\n}\n\nfn main() {\n}\n");
+    let fx = Fixture::new(
+        "nocov2",
+        "test \"t\" {\n    assert(true)\n}\n\nfn main() {\n}\n",
+    );
     let mut out = Vec::new();
-    let summary =
-        grasm_interp::test_program_with(&fx.program(), &TestOptions::default(), &mut out);
+    let summary = grasm_interp::test_program_with(&fx.program(), &TestOptions::default(), &mut out);
     assert!(summary.coverage.is_none());
 }
 
@@ -317,8 +316,14 @@ fn generated_values_cover_the_declared_types() {
     assert!(saw_zero, "generator never produced 0");
     assert!(saw_negative, "generator never produced a negative int");
     assert!(saw_nonempty_str, "generator never produced a non-empty str");
-    assert!(saw_nonempty_list, "generator never produced a non-empty list");
-    assert!(saw_both_bools.0 && saw_both_bools.1, "bools were not varied");
+    assert!(
+        saw_nonempty_list,
+        "generator never produced a non-empty list"
+    );
+    assert!(
+        saw_both_bools.0 && saw_both_bools.1,
+        "bools were not varied"
+    );
     assert!(saw_none && saw_some, "Option was not varied");
 }
 
@@ -461,7 +466,10 @@ fn a_run_tries_every_boundary_value() {
             }
         }
         for w in &want {
-            assert!(seen.contains(w), "seed {seed} never generated {w}: {seen:?}");
+            assert!(
+                seen.contains(w),
+                "seed {seed} never generated {w}: {seen:?}"
+            );
         }
     }
 }
@@ -528,7 +536,11 @@ j = j + 1\n        }\n        i = i + 1\n    }\n}\n\nfn main() {\n}\n",
     };
     match interp.run_property(&pair.params, &pair.body, &TestOptions::default()) {
         PropertyOutcome::Failed { inputs, .. } => {
-            assert_eq!(format!("{}", inputs[0].1), "(0, 0)", "not shrunk: {inputs:?}");
+            assert_eq!(
+                format!("{}", inputs[0].1),
+                "(0, 0)",
+                "not shrunk: {inputs:?}"
+            );
         }
         PropertyOutcome::Passed(_) => panic!("this property cannot hold"),
     }
@@ -538,7 +550,11 @@ j = j + 1\n        }\n        i = i + 1\n    }\n}\n\nfn main() {\n}\n",
     };
     match interp.run_property(&list.params, &list.body, &TestOptions::default()) {
         PropertyOutcome::Failed { inputs, .. } => {
-            assert_eq!(format!("{}", inputs[0].1), "[0, 0]", "not shrunk: {inputs:?}");
+            assert_eq!(
+                format!("{}", inputs[0].1),
+                "[0, 0]",
+                "not shrunk: {inputs:?}"
+            );
         }
         PropertyOutcome::Passed(_) => panic!("this property cannot hold"),
     }
@@ -570,10 +586,7 @@ fn parameters_that_must_agree_shrink_together() {
     };
     match interp.run_property(&t.params, &t.body, &TestOptions::default()) {
         PropertyOutcome::Failed { inputs, .. } => {
-            let shown: Vec<String> = inputs
-                .iter()
-                .map(|(n, v)| format!("{n} = {v}"))
-                .collect();
+            let shown: Vec<String> = inputs.iter().map(|(n, v)| format!("{n} = {v}")).collect();
             assert_eq!(shown, vec!["a = 0", "b = 0"], "not shrunk: {shown:?}");
         }
         PropertyOutcome::Passed(_) => panic!("this property cannot hold"),

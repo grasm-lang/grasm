@@ -11,9 +11,9 @@
 //! and no libffi: the enumeration below is the whole of what can be called,
 //! and anything outside it is reported rather than guessed at.
 
+use std::ffi::c_void;
 #[cfg(not(target_arch = "wasm32"))]
 use std::ffi::{c_char, CString};
-use std::ffi::c_void;
 
 #[cfg(not(target_arch = "wasm32"))]
 unsafe extern "C" {

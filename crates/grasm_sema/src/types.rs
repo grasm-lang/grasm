@@ -36,7 +36,10 @@ pub enum Type {
     /// `Map[K, V]` — keys restricted to i64/str/bool.
     Map(Box<Type>, Box<Type>),
     /// Struct or sum type instance, e.g. `Option[i64]`.
-    Named { id: TypeDefId, args: Vec<Type> },
+    Named {
+        id: TypeDefId,
+        args: Vec<Type>,
+    },
     /// Closure / function value.
     /// A function value's type, **including its effect row**.
     ///
@@ -213,10 +216,7 @@ impl Unifier {
         match t {
             Type::Tuple(items) => Type::Tuple(items.iter().map(|i| self.resolve(i)).collect()),
             Type::List(inner) => Type::List(Box::new(self.resolve(&inner))),
-            Type::Map(k, v) => Type::Map(
-                Box::new(self.resolve(&k)),
-                Box::new(self.resolve(&v)),
-            ),
+            Type::Map(k, v) => Type::Map(Box::new(self.resolve(&k)), Box::new(self.resolve(&v))),
             Type::Named { id, args } => Type::Named {
                 id,
                 args: args.iter().map(|a| self.resolve(a)).collect(),
@@ -282,9 +282,7 @@ impl Unifier {
                 xs.len() == ys.len() && xs.iter().zip(ys).all(|(x, y)| self.unify(x, y))
             }
             (Type::List(x), Type::List(y)) => self.unify(x, y),
-            (Type::Map(k1, v1), Type::Map(k2, v2)) => {
-                self.unify(k1, k2) && self.unify(v1, v2)
-            }
+            (Type::Map(k1, v1), Type::Map(k2, v2)) => self.unify(k1, k2) && self.unify(v1, v2),
             (Type::Named { id: i1, args: a1 }, Type::Named { id: i2, args: a2 }) => {
                 i1 == i2 && a1.len() == a2.len() && a1.iter().zip(a2).all(|(x, y)| self.unify(x, y))
             }
@@ -326,10 +324,7 @@ impl Default for Unifier {
 /// Substitute `Generic(i)` with `args[i]` — instantiating a generic definition.
 pub fn substitute_generics(ty: &Type, args: &[Type]) -> Type {
     match ty {
-        Type::Generic(i) => args
-            .get(*i as usize)
-            .cloned()
-            .unwrap_or(Type::Error),
+        Type::Generic(i) => args.get(*i as usize).cloned().unwrap_or(Type::Error),
         Type::Tuple(items) => {
             Type::Tuple(items.iter().map(|t| substitute_generics(t, args)).collect())
         }
@@ -344,7 +339,10 @@ pub fn substitute_generics(ty: &Type, args: &[Type]) -> Type {
         },
         Type::Ref(inner) => Type::Ref(Box::new(substitute_generics(inner, args))),
         Type::Fn { params, ret, row } => Type::Fn {
-            params: params.iter().map(|t| substitute_generics(t, args)).collect(),
+            params: params
+                .iter()
+                .map(|t| substitute_generics(t, args))
+                .collect(),
             ret: Box::new(substitute_generics(ret, args)),
             row: row.clone(),
         },
@@ -352,9 +350,7 @@ pub fn substitute_generics(ty: &Type, args: &[Type]) -> Type {
             Box::new(substitute_generics(ok, args)),
             Box::new(substitute_generics(err, args)),
         ),
-        Type::Union(ms) => {
-            Type::Union(ms.iter().map(|t| substitute_generics(t, args)).collect())
-        }
+        Type::Union(ms) => Type::Union(ms.iter().map(|t| substitute_generics(t, args)).collect()),
         other => other.clone(),
     }
 }

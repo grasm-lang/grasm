@@ -1,8 +1,8 @@
 //! grasm_interp — the definitional tree-walking interpreter.
 
-pub mod journal;
 pub mod ffi;
 pub mod interp;
+pub mod journal;
 pub mod testing;
 pub mod value;
 
@@ -13,10 +13,7 @@ use grasm_syntax::ast::Module;
 use std::io::Write;
 
 /// Check + run `main`. Returns (exit_code, diagnostics).
-pub fn run_src<W: Write + Send>(
-    src: &str,
-    out: &mut W,
-) -> (i32, Vec<grasm_syntax::Diagnostic>) {
+pub fn run_src<W: Write + Send>(src: &str, out: &mut W) -> (i32, Vec<grasm_syntax::Diagnostic>) {
     run_src_with_args(src, &[], out)
 }
 
@@ -44,7 +41,6 @@ fn run_src_here(
     report_fault(&interp.fault);
     (code, vec![])
 }
-
 
 /// Runs `f` on a thread with a large stack, so the depth guard is what stops
 /// deep recursion rather than the host's stack running out.
@@ -130,12 +126,11 @@ pub fn run_src_capturing_fault_with_stdin<W: Write + Send>(
             if !analysis.diagnostics.is_empty() {
                 return (1, None, analysis.diagnostics);
             }
-            let files: Vec<(String, &Module, std::collections::HashMap<String, String>)> =
-                program
-                    .files
-                    .iter()
-                    .map(|f| (f.name.clone(), &f.module, f.imports.clone()))
-                    .collect();
+            let files: Vec<(String, &Module, std::collections::HashMap<String, String>)> = program
+                .files
+                .iter()
+                .map(|f| (f.name.clone(), &f.module, f.imports.clone()))
+                .collect();
             let mut interp = Interp::new_program(&files, out);
             interp.set_float_literals(analysis.float_literals);
             interp.set_ok_wrapped(analysis.ok_wrapped);
@@ -790,10 +785,7 @@ fn bench_program_here(
 }
 
 /// Check + run all `test` blocks. Returns (passed, failed, diagnostics).
-pub fn test_src(
-    src: &str,
-    out: &mut impl Write,
-) -> (u32, u32, Vec<grasm_syntax::Diagnostic>) {
+pub fn test_src(src: &str, out: &mut impl Write) -> (u32, u32, Vec<grasm_syntax::Diagnostic>) {
     let (module, diags) = grasm_sema::analyze(src);
     if !diags.is_empty() {
         return (0, 0, diags);

@@ -134,12 +134,7 @@ pub unsafe extern "C" fn grasm_run_with_journal(
     run_with(ptr, len, std::ptr::null(), 0)
 }
 
-unsafe fn run_with(
-    ptr: *const u8,
-    len: usize,
-    stdin_ptr: *const u8,
-    stdin_len: usize,
-) -> *mut u8 {
+unsafe fn run_with(ptr: *const u8, len: usize, stdin_ptr: *const u8, stdin_len: usize) -> *mut u8 {
     let src = std::slice::from_raw_parts(ptr, len);
     // Invalid UTF-8 is replaced rather than refused, for the same reason
     // `tcp_read` replaces it ([L-LIB-NET]): the caller is a browser and a
@@ -228,7 +223,11 @@ mod tests {
                 std::str::from_utf8(std::slice::from_raw_parts(ptr.add(err_off + 4), err_len))
                     .unwrap()
                     .to_string();
-            assert_eq!(total, err_off + 4 + err_len, "the length field must be true");
+            assert_eq!(
+                total,
+                err_off + 4 + err_len,
+                "the length field must be true"
+            );
             grasm_free(ptr, total);
             (code, out, err)
         }
@@ -248,9 +247,8 @@ mod tests {
 let line = input()\n        if line == \"\" {\n            going = false\n        \
 } else {\n            print(\"got {line}\")\n        }\n    }\n}\n";
         let stdin = "one\ntwo\nthree\n";
-        let ptr = unsafe {
-            grasm_run_with_stdin(src.as_ptr(), src.len(), stdin.as_ptr(), stdin.len())
-        };
+        let ptr =
+            unsafe { grasm_run_with_stdin(src.as_ptr(), src.len(), stdin.as_ptr(), stdin.len()) };
         let (code, out, err) = unframe(ptr);
         assert_eq!(code, 0, "{err}");
         assert_eq!(out, "got one\ngot two\ngot three\n");
@@ -316,4 +314,3 @@ let line = input()\n        if line == \"\" {\n            going = false\n      
         assert!(!err.is_empty());
     }
 }
-

@@ -28,7 +28,11 @@ pub fn to_wire(v: &Value) -> Wire {
         Value::Tuple(items) => Wire::Tuple(many(items)),
         Value::Ok(inner) => Wire::ok(to_wire(inner)),
         Value::Err(inner) => Wire::err(to_wire(inner)),
-        Value::Variant { type_name, variant, fields } => Wire::Variant {
+        Value::Variant {
+            type_name,
+            variant,
+            fields,
+        } => Wire::Variant {
             ty: type_name.as_str().to_string(),
             name: variant.as_str().to_string(),
             fields: many(fields),

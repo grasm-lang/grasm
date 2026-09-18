@@ -167,15 +167,14 @@ pub fn check_effects(module: &Module) -> Vec<Diagnostic> {
 /// a typo or a fiction, and either way the manifest is claiming something the
 /// code cannot mean.
 pub fn effect_vocabulary(program: &crate::loader::Program) -> BTreeSet<String> {
-    let mut names: BTreeSet<String> =
-        [
-            IO.to_string(),
-            ASYNC.to_string(),
-            NET.to_string(),
-            PROC.to_string(),
-            UNSAFE.to_string(),
-        ]
-        .into();
+    let mut names: BTreeSet<String> = [
+        IO.to_string(),
+        ASYNC.to_string(),
+        NET.to_string(),
+        PROC.to_string(),
+        UNSAFE.to_string(),
+    ]
+    .into();
     for file in &program.files {
         for decl in &file.module.decls {
             if let Decl::Effect(e) = decl {
@@ -303,10 +302,8 @@ pub fn effects_of_program(program: &crate::loader::Program) -> BTreeSet<String> 
                     ctx.effect_names.insert(e.name.name.clone());
                     for op in &e.ops {
                         if let Some(ret) = &op.ret {
-                            ctx.pending_op_rets.push((
-                                format!("{}::{}", e.name.name, op.name.name),
-                                ret.clone(),
-                            ));
+                            ctx.pending_op_rets
+                                .push((format!("{}::{}", e.name.name, op.name.name), ret.clone()));
                         }
                     }
                 }
@@ -335,7 +332,11 @@ pub fn effects_of_program(program: &crate::loader::Program) -> BTreeSet<String> 
     let (value_rows, callee_rows) = crate::check::value_tables(program);
     ctx.value_rows = value_rows;
     ctx.callee_rows = callee_rows;
-    ctx.rows = ctx.fns.keys().map(|k| (k.clone(), BTreeSet::new())).collect();
+    ctx.rows = ctx
+        .fns
+        .keys()
+        .map(|k| (k.clone(), BTreeSet::new()))
+        .collect();
     loop {
         let mut changed = false;
         let keys: Vec<String> = ctx.fns.keys().cloned().collect();
@@ -527,10 +528,8 @@ fn build_ctx_in<'a>(files: &'a [ModuleView<'a>], packages: &BTreeSet<String>) ->
                     ctx.effect_names.insert(e.name.name.clone());
                     for op in &e.ops {
                         if let Some(ret) = &op.ret {
-                            ctx.pending_op_rets.push((
-                                format!("{}::{}", e.name.name, op.name.name),
-                                ret.clone(),
-                            ));
+                            ctx.pending_op_rets
+                                .push((format!("{}::{}", e.name.name, op.name.name), ret.clone()));
                         }
                     }
                 }
@@ -554,7 +553,11 @@ fn build_ctx_in<'a>(files: &'a [ModuleView<'a>], packages: &BTreeSet<String>) ->
             &mut ctx.elem_rows,
         );
     }
-    ctx.rows = ctx.fns.keys().map(|k| (k.clone(), BTreeSet::new())).collect();
+    ctx.rows = ctx
+        .fns
+        .keys()
+        .map(|k| (k.clone(), BTreeSet::new()))
+        .collect();
     ctx
 }
 
@@ -597,7 +600,11 @@ fn compute_handler_rows(ctx: &Ctx) -> HashMap<(String, String), BTreeSet<String>
     let keys: Vec<String> = ctx.fns.keys().cloned().collect();
     for key in keys {
         let f = ctx.fns[&key];
-        let current = key.rsplit_once("::").map(|(m, _)| m).unwrap_or("main").to_string();
+        let current = key
+            .rsplit_once("::")
+            .map(|(m, _)| m)
+            .unwrap_or("main")
+            .to_string();
         let mut lits: Vec<&Expr> = Vec::new();
         collect_handler_lits_block(&f.body, &mut lits);
         for lit in lits {
@@ -799,7 +806,11 @@ fn compute_closure_rows(ctx: &Ctx) -> HashMap<u32, BTreeSet<String>> {
     let keys: Vec<String> = ctx.fns.keys().cloned().collect();
     for key in keys {
         let f = ctx.fns[&key];
-        let current = key.rsplit_once("::").map(|(m, _)| m).unwrap_or("main").to_string();
+        let current = key
+            .rsplit_once("::")
+            .map(|(m, _)| m)
+            .unwrap_or("main")
+            .to_string();
         let mut lits: Vec<&Expr> = Vec::new();
         collect_closure_lits_inner(&f.body, &mut lits);
         for lit in lits {
@@ -1077,12 +1088,15 @@ once inside `main`",
                 .collect::<Vec<_>>()
                 .join(", ");
             diags.push(
-                Diagnostic::error(main.name.span, format!("`main` has unhandled effect(s) {list}"))
-                    .with_help(
-                        "wrap the calls in `with <Effect> handled_by <handler> { ... }` — and \
+                Diagnostic::error(
+                    main.name.span,
+                    format!("`main` has unhandled effect(s) {list}"),
+                )
+                .with_help(
+                    "wrap the calls in `with <Effect> handled_by <handler> { ... }` — and \
 if the effect comes from a *handler's own body*, the `with` goes around where that handler \
 is installed, not around the calls to it ([E-HANDLER-OWN-ROW])",
-                    ),
+                ),
             );
         }
     }
@@ -1101,8 +1115,10 @@ is installed, not around the calls to it ([E-HANDLER-OWN-ROW])",
                 let mut fnb = FnBindings::default();
                 collect_fn_bindings(body, &ctx, &f.name, &mut fnb);
                 walk_block(body, &f.name, &mut active, &ctx, &fnb, &mut row);
-                let leftover: Vec<&String> =
-                    row.iter().filter(|e| *e != IO && *e != ASYNC && *e != UNSAFE && *e != NET && *e != PROC).collect();
+                let leftover: Vec<&String> = row
+                    .iter()
+                    .filter(|e| *e != IO && *e != ASYNC && *e != UNSAFE && *e != NET && *e != PROC)
+                    .collect();
                 if !leftover.is_empty() {
                     let list = leftover
                         .iter()
@@ -1271,7 +1287,12 @@ fn check_declared_rows_block(
 ) {
     for stmt in &b.stmts {
         match stmt {
-            Stmt::Let { name, ty: Some(t), init, .. } => {
+            Stmt::Let {
+                name,
+                ty: Some(t),
+                init,
+                ..
+            } => {
                 if let Some(allowed) = declared_row_within(t, &ctx.type_aliases, &ctx.type_rows) {
                     declared.insert(name.name.clone(), allowed.clone());
                     report_row_over(init, current, ctx, fnb, &allowed, diags);
@@ -1463,7 +1484,12 @@ fn collect_calls_expr<'e>(e: &'e Expr, out: &mut Vec<(String, &'e [Expr], Span)>
             }
         }
         // And the method-call spelling of the same thing.
-        Expr::MethodCall { recv, name, args, span } => {
+        Expr::MethodCall {
+            recv,
+            name,
+            args,
+            span,
+        } => {
             if let Expr::Ident(alias) = &**recv {
                 out.push((
                     format!("{}.{}", alias.name, name.name),
@@ -1519,7 +1545,9 @@ fn collect_calls_expr<'e>(e: &'e Expr, out: &mut Vec<(String, &'e [Expr], Span)>
             }
         }
         Expr::Block(b) | Expr::Unsafe(b) | Expr::Region(b) => collect_calls_block(b, out),
-        Expr::Match { scrutinee, arms, .. } => {
+        Expr::Match {
+            scrutinee, arms, ..
+        } => {
             collect_calls_expr(scrutinee, out);
             for a in arms {
                 collect_calls_expr(&a.body, out);
@@ -1537,7 +1565,6 @@ fn check_par_map_block(
     fnb: &FnBindings,
     diags: &mut Vec<Diagnostic>,
 ) {
-
     let mut calls = Vec::new();
     collect_par_maps_block(b, &mut calls);
     for (func, span) in calls {
@@ -1679,7 +1706,6 @@ fn collect_par_maps_expr<'e>(e: &'e Expr, out: &mut Vec<(&'e Expr, Span)>) {
     }
 }
 
-
 /// The names a body binds, and where each comes into scope.
 ///
 /// All that is left of a much larger structure. This pass used to track *where
@@ -1738,11 +1764,7 @@ const MAX_ALIAS_DEPTH: usize = 32;
 /// Returns a clone rather than a borrow because an alias body lives in
 /// another declaration; the types involved are small and this runs once per
 /// binding.
-fn resolve_alias(
-    te: &TypeExpr,
-    aliases: &HashMap<String, TypeExpr>,
-    depth: usize,
-) -> TypeExpr {
+fn resolve_alias(te: &TypeExpr, aliases: &HashMap<String, TypeExpr>, depth: usize) -> TypeExpr {
     if depth > MAX_ALIAS_DEPTH {
         return te.clone();
     }
@@ -1782,9 +1804,7 @@ fn declared_row_within_at(
         return None;
     }
     match &resolve_alias(te, aliases, 0) {
-        TypeExpr::Fn { effects, .. } => {
-            Some(effects.iter().map(|p| p.dotted()).collect())
-        }
+        TypeExpr::Fn { effects, .. } => Some(effects.iter().map(|p| p.dotted()).collect()),
         TypeExpr::List(inner, _) | TypeExpr::Ref(inner, _) => {
             declared_row_within_at(inner, aliases, type_rows, depth + 1)
         }
@@ -1812,7 +1832,10 @@ fn declared_row_within_at(
                 }
             }
             for a in args {
-                found = union_rows(found, declared_row_within_at(a, aliases, type_rows, depth + 1));
+                found = union_rows(
+                    found,
+                    declared_row_within_at(a, aliases, type_rows, depth + 1),
+                );
             }
             found
         }
@@ -1916,7 +1939,11 @@ fn carried_row(
                 carried_row(v, current, ctx, fnb, depth + 1, out);
             }
         }
-        Expr::If { then_block, else_branch, .. } => {
+        Expr::If {
+            then_block,
+            else_branch,
+            ..
+        } => {
             if let Some(Stmt::Expr(t)) = then_block.stmts.last() {
                 carried_row(t, current, ctx, fnb, depth + 1, out);
             }
@@ -1972,7 +1999,9 @@ fn seed_closure_params(e: &Expr, fnb: &mut FnBindings<'_>) {
 /// Every direct subexpression of `e`.
 fn walk_exprs_shallow(e: &Expr, f: &mut impl FnMut(&Expr)) {
     match e {
-        Expr::Closure { body, .. } | Expr::Unary { expr: body, .. } | Expr::Try { expr: body, .. } => f(body),
+        Expr::Closure { body, .. }
+        | Expr::Unary { expr: body, .. }
+        | Expr::Try { expr: body, .. } => f(body),
         Expr::Binary { lhs, rhs, .. } => {
             f(lhs);
             f(rhs);
@@ -2069,8 +2098,10 @@ fn harvest_rows_at(
             effects,
             ..
         } => {
-            let row: BTreeSet<String> =
-                effects.iter().map(|p| p.segments.last().unwrap().name.clone()).collect();
+            let row: BTreeSet<String> = effects
+                .iter()
+                .map(|p| p.segments.last().unwrap().name.clone())
+                .collect();
             if !row.is_empty() {
                 match field {
                     Some(name) => field_rows.entry(name.to_string()).or_default().extend(row),
@@ -2108,10 +2139,7 @@ fn harvest_rows_at(
 ///
 /// Types share one namespace across the program ([T-MODULE-NS]), so one map
 /// over every module is the right shape.
-fn collect_type_aliases(
-    m: &grasm_syntax::ast::Module,
-    out: &mut HashMap<String, TypeExpr>,
-) {
+fn collect_type_aliases(m: &grasm_syntax::ast::Module, out: &mut HashMap<String, TypeExpr>) {
     use grasm_syntax::ast::TypeBody;
     for d in &m.decls {
         if let Decl::Type(td) = d {
@@ -2156,9 +2184,10 @@ fn collect_type_rows(
             };
             let parts: Vec<&TypeExpr> = match &td.body {
                 TypeBody::Struct(fields) => fields.iter().map(|f| &f.ty).collect(),
-                TypeBody::Sum(variants) => {
-                    variants.iter().flat_map(|v| v.fields.iter().map(|f| &f.ty)).collect()
-                }
+                TypeBody::Sum(variants) => variants
+                    .iter()
+                    .flat_map(|v| v.fields.iter().map(|f| &f.ty))
+                    .collect(),
                 TypeBody::Alias(t) => vec![t],
             };
             let e_own = own.entry(td.name.name.clone()).or_default();
@@ -2296,13 +2325,27 @@ fn harvest_module(
             Decl::Type(td) => match &td.body {
                 TypeBody::Struct(fields) => {
                     for f in fields {
-                        harvest_rows_at(&f.ty, Some(&f.name.name), aliases, field_rows, elem_rows, 0);
+                        harvest_rows_at(
+                            &f.ty,
+                            Some(&f.name.name),
+                            aliases,
+                            field_rows,
+                            elem_rows,
+                            0,
+                        );
                     }
                 }
                 TypeBody::Sum(variants) => {
                     for v in variants {
                         for f in &v.fields {
-                            harvest_rows_at(&f.ty, Some(&f.name.name), aliases, field_rows, elem_rows, 0);
+                            harvest_rows_at(
+                                &f.ty,
+                                Some(&f.name.name),
+                                aliases,
+                                field_rows,
+                                elem_rows,
+                                0,
+                            );
                         }
                     }
                 }
@@ -2533,9 +2576,7 @@ fn walk_expr(
                 // proof failed, over one parameter's spelling
                 // ([T-FN-VALUE-ROW]).
                 let shadowed = fnb.shadowed(&id.name, id.span.start);
-                if let (false, Some(qual)) =
-                    (shadowed, ctx.resolve_call(current, &id.name))
-                {
+                if let (false, Some(qual)) = (shadowed, ctx.resolve_call(current, &id.name)) {
                     contribute(&qual, active, ctx, out);
                 } else if let Some(row) = ctx.value_row_of(callee) {
                     // The checker typed the callee, so the row is on its type
@@ -2591,9 +2632,10 @@ fn walk_expr(
                     if !active.contains(&ename) {
                         out.insert(ename);
                     }
-                } else if let (false, Some(qual)) =
-                    (shadowed, ctx.resolve_qualified(current, &tid.name, &name.name))
-                {
+                } else if let (false, Some(qual)) = (
+                    shadowed,
+                    ctx.resolve_qualified(current, &tid.name, &name.name),
+                ) {
                     // Cross-module call `utils.helper(...)`.
                     contribute(&qual, active, ctx, out);
                     resolved_qualified = true;
@@ -2690,7 +2732,9 @@ fn walk_expr(
                 }
             }
         }
-        Expr::Match { scrutinee, arms, .. } => {
+        Expr::Match {
+            scrutinee, arms, ..
+        } => {
             walk_expr(scrutinee, current, active, ctx, fnb, out);
             for arm in arms {
                 if let Some(g) = &arm.guard {
@@ -2753,7 +2797,10 @@ pub fn effect_sites(program: &crate::loader::Program) -> HashMap<String, String>
                 let off = span.start.saturating_sub(file.base) as usize;
                 let upto = &file.src[..off.min(file.src.len())];
                 let line = upto.matches('\n').count() + 1;
-                let col = upto.rsplit('\n').next().map_or(1, |l| l.chars().count() + 1);
+                let col = upto
+                    .rsplit('\n')
+                    .next()
+                    .map_or(1, |l| l.chars().count() + 1);
                 format!("{}:{line}:{col}", file.path)
             });
         };
@@ -2824,7 +2871,10 @@ fn site_expr(
             }
         }
         Expr::MethodCall {
-            recv, name, args, span,
+            recv,
+            name,
+            args,
+            span,
         } => {
             if let Expr::Ident(tid) = &**recv {
                 if effects.contains(&tid.name) {
@@ -2866,9 +2916,7 @@ fn site_expr(
             }
         }
         Expr::Closure { body, .. } => site_expr(body, externs, effects, out),
-        Expr::Unary { expr, .. } | Expr::Try { expr, .. } => {
-            site_expr(expr, externs, effects, out)
-        }
+        Expr::Unary { expr, .. } | Expr::Try { expr, .. } => site_expr(expr, externs, effects, out),
         Expr::Field { recv, .. } => site_expr(recv, externs, effects, out),
         Expr::Binary { lhs, rhs, .. } => {
             site_expr(lhs, externs, effects, out);

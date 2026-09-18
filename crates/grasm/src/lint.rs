@@ -65,7 +65,12 @@ fn line_col(src: &str, at: u32) -> (u32, u32) {
 
 impl<'a> Linter<'a> {
     pub fn new(src: &'a str, only: Option<String>) -> Self {
-        Linter { src, scopes: Vec::new(), findings: Vec::new(), only }
+        Linter {
+            src,
+            scopes: Vec::new(),
+            findings: Vec::new(),
+            only,
+        }
     }
 
     fn report(&mut self, span: Span, rule: &'static str, message: String) {
@@ -73,7 +78,12 @@ impl<'a> Linter<'a> {
             return;
         }
         let (line, col) = line_col(self.src, span.start);
-        self.findings.push(Finding { line, col, rule, message });
+        self.findings.push(Finding {
+            line,
+            col,
+            rule,
+            message,
+        });
     }
 
     fn declare(&mut self, name: &Ident, what: &'static str) {
@@ -193,7 +203,10 @@ impl<'a> Linter<'a> {
             self.report(
                 f.span,
                 "long-function",
-                format!("`{}` is {n} statements; the limit is {LONG_FN}", f.name.name),
+                format!(
+                    "`{}` is {n} statements; the limit is {LONG_FN}",
+                    f.name.name
+                ),
             );
         }
         self.push_scope();
@@ -233,17 +246,29 @@ impl<'a> Linter<'a> {
 
     fn stmt(&mut self, s: &Stmt) {
         match s {
-            Stmt::Let { mutable, name, init, .. } => {
+            Stmt::Let {
+                mutable,
+                name,
+                init,
+                ..
+            } => {
                 self.expr(init);
                 self.declare(name, if *mutable { "var" } else { "let" });
             }
-            Stmt::LetTuple { mutable, names, init, .. } => {
+            Stmt::LetTuple {
+                mutable,
+                names,
+                init,
+                ..
+            } => {
                 self.expr(init);
                 for n in names {
                     self.declare(n, if *mutable { "var" } else { "let" });
                 }
             }
-            Stmt::Assign { target, op, value, .. } => {
+            Stmt::Assign {
+                target, op, value, ..
+            } => {
                 self.expr(value);
                 // `x = v` writes; `x += v` reads first. Either way a *field* or
                 // *index* target reads the thing it reaches into.
@@ -263,7 +288,9 @@ impl<'a> Linter<'a> {
                 self.expr(cond);
                 self.block(body);
             }
-            Stmt::For { var, iter, body, .. } => {
+            Stmt::For {
+                var, iter, body, ..
+            } => {
                 self.expr(iter);
                 self.push_scope();
                 self.declare(var, "let");
@@ -300,7 +327,9 @@ impl<'a> Linter<'a> {
                     self.expr(v);
                 }
             }
-            Expr::StructLit { name, base, fields, .. } => {
+            Expr::StructLit {
+                name, base, fields, ..
+            } => {
                 // A constructor names its type, and a type can come from an
                 // import — so this counts as a use of the first segment.
                 if let Some(first) = name.segments.first() {
@@ -339,7 +368,12 @@ impl<'a> Linter<'a> {
                 self.expr(start);
                 self.expr(end);
             }
-            Expr::If { cond, then_block, else_branch, .. } => {
+            Expr::If {
+                cond,
+                then_block,
+                else_branch,
+                ..
+            } => {
                 self.expr(cond);
                 self.block(then_block);
                 match else_branch.as_deref() {
@@ -348,7 +382,9 @@ impl<'a> Linter<'a> {
                     None => {}
                 }
             }
-            Expr::Match { scrutinee, arms, .. } => {
+            Expr::Match {
+                scrutinee, arms, ..
+            } => {
                 self.expr(scrutinee);
                 for a in arms {
                     self.push_scope();
@@ -431,7 +467,11 @@ fn count_stmt(s: &Stmt) -> usize {
 fn count_expr(e: &Expr) -> usize {
     match e {
         Expr::Block(b) | Expr::Region(b) | Expr::Unsafe(b) => count_stmts(b),
-        Expr::If { then_block, else_branch, .. } => {
+        Expr::If {
+            then_block,
+            else_branch,
+            ..
+        } => {
             count_stmts(then_block)
                 + match else_branch.as_deref() {
                     Some(ElseBranch::Else(b)) => count_stmts(b),
@@ -447,9 +487,21 @@ fn count_expr(e: &Expr) -> usize {
 
 /// Every rule this reports, with the reason it needs the tree.
 pub const RULES: &[(&str, &str)] = &[
-    ("unused-binding", "a `let` or `var` that is never read — needs scope"),
-    ("unused-parameter", "a parameter that is never read — needs scope"),
+    (
+        "unused-binding",
+        "a `let` or `var` that is never read — needs scope",
+    ),
+    (
+        "unused-parameter",
+        "a parameter that is never read — needs scope",
+    ),
     ("unused-import", "an import nothing in the file names"),
-    ("shadowing", "a name that hides one already in scope — needs scope"),
-    ("long-function", "more statements than the limit — a line is not a statement"),
+    (
+        "shadowing",
+        "a name that hides one already in scope — needs scope",
+    ),
+    (
+        "long-function",
+        "more statements than the limit — a line is not a statement",
+    ),
 ];

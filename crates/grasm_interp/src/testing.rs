@@ -141,15 +141,13 @@ pub fn generate(rng: &mut Rng, te: &TypeExpr, size: u32, boundary: Option<usize>
                 .collect();
             list_of(items)
         }
-        TypeExpr::Tuple(items, _) => {
-            Value::Tuple(Rc::new(
-                items
-                    .iter()
-                    .enumerate()
-                    .map(|(i, t)| generate(rng, t, size, boundary.map(|b| b + i)))
-                    .collect(),
-            ))
-        }
+        TypeExpr::Tuple(items, _) => Value::Tuple(Rc::new(
+            items
+                .iter()
+                .enumerate()
+                .map(|(i, t)| generate(rng, t, size, boundary.map(|b| b + i)))
+                .collect(),
+        )),
         TypeExpr::Union(items, _) => match items.first() {
             Some(t) => generate(rng, t, size, boundary),
             None => Value::Unit,
@@ -182,8 +180,7 @@ pub fn generate(rng: &mut Rng, te: &TypeExpr, size: u32, boundary: Option<usize>
                         // never a NaN. Subnormals and the extremes are here
                         // for the same reason.
                         Value::Float(
-                            INTERESTING_FLOATS
-                                [rng.below(INTERESTING_FLOATS.len() as u64) as usize],
+                            INTERESTING_FLOATS[rng.below(INTERESTING_FLOATS.len() as u64) as usize],
                         )
                     } else {
                         let scale = f64::from(size).max(1.0);
@@ -209,7 +206,9 @@ pub fn generate(rng: &mut Rng, te: &TypeExpr, size: u32, boundary: Option<usize>
                     }
                     let n = rng.below(u64::from(size).min(24) + 1) as usize;
                     let s: String = (0..n)
-                        .map(|_| INTERESTING_CHARS[rng.below(INTERESTING_CHARS.len() as u64) as usize])
+                        .map(|_| {
+                            INTERESTING_CHARS[rng.below(INTERESTING_CHARS.len() as u64) as usize]
+                        })
                         .collect();
                     Value::str(s)
                 }
@@ -276,8 +275,12 @@ fn shrink(v: &Value) -> Vec<Value> {
             let chars: Vec<char> = s.chars().collect();
             let mut out = vec![Value::str(String::new())];
             if chars.len() > 1 {
-                out.push(Value::str(chars[..chars.len() / 2].iter().collect::<String>()));
-                out.push(Value::str(chars[chars.len() / 2..].iter().collect::<String>()));
+                out.push(Value::str(
+                    chars[..chars.len() / 2].iter().collect::<String>(),
+                ));
+                out.push(Value::str(
+                    chars[chars.len() / 2..].iter().collect::<String>(),
+                ));
             }
             // Drop one character at a time, so the survivor is minimal.
             for i in 0..chars.len() {
@@ -569,10 +572,7 @@ impl<W: Write> Interp<'_, W> {
     /// inside a test body puts its own lines in that same buffer, so the
     /// mapping slid by one: the example's own status was lost and the *next*
     /// example was reported with it. A failing example printed `ok`.
-    pub fn run_unit_test_result(
-        &mut self,
-        t: &grasm_syntax::ast::TestDecl,
-    ) -> Result<(), String> {
+    pub fn run_unit_test_result(&mut self, t: &grasm_syntax::ast::TestDecl) -> Result<(), String> {
         match self.try_case(&[], &t.body) {
             None => Ok(()),
             Some(message) => Err(message),
@@ -763,7 +763,10 @@ fn block_lines(
 ) {
     use grasm_syntax::ast::Stmt;
     for stmt in &block.stmts {
-        out.insert((file.to_string(), index.line_col(stmt_start(stmt).saturating_sub(base)).line));
+        out.insert((
+            file.to_string(),
+            index.line_col(stmt_start(stmt).saturating_sub(base)).line,
+        ));
         // Nested blocks contribute their own lines; a statement only counts as
         // covered when control actually reached it.
         match stmt {
@@ -819,7 +822,9 @@ fn expr_lines(
                 None => {}
             }
         }
-        Expr::Match { scrutinee, arms, .. } => {
+        Expr::Match {
+            scrutinee, arms, ..
+        } => {
             expr_lines(file, scrutinee, base, index, out);
             for arm in arms {
                 if let Some(g) = &arm.guard {
@@ -830,7 +835,9 @@ fn expr_lines(
         }
         Expr::Block(b) => block_lines(file, b, base, index, out),
         Expr::Closure { body, .. } => expr_lines(file, body, base, index, out),
-        Expr::Try { expr, .. } | Expr::Unary { expr, .. } => expr_lines(file, expr, base, index, out),
+        Expr::Try { expr, .. } | Expr::Unary { expr, .. } => {
+            expr_lines(file, expr, base, index, out)
+        }
         Expr::Binary { lhs, rhs, .. } => {
             expr_lines(file, lhs, base, index, out);
             expr_lines(file, rhs, base, index, out);
@@ -895,16 +902,24 @@ mod tests {
 
     #[test]
     fn the_rng_is_deterministic_and_seed_dependent() {
-        let a: Vec<u64> = (0..5).scan(Rng::new(7), |r, _| Some(r.next_u64())).collect();
-        let b: Vec<u64> = (0..5).scan(Rng::new(7), |r, _| Some(r.next_u64())).collect();
-        let c: Vec<u64> = (0..5).scan(Rng::new(8), |r, _| Some(r.next_u64())).collect();
+        let a: Vec<u64> = (0..5)
+            .scan(Rng::new(7), |r, _| Some(r.next_u64()))
+            .collect();
+        let b: Vec<u64> = (0..5)
+            .scan(Rng::new(7), |r, _| Some(r.next_u64()))
+            .collect();
+        let c: Vec<u64> = (0..5)
+            .scan(Rng::new(8), |r, _| Some(r.next_u64()))
+            .collect();
         assert_eq!(a, b, "the same seed must replay exactly");
         assert_ne!(a, c, "different seeds must diverge");
     }
 
     #[test]
     fn a_zero_seed_still_varies() {
-        let vals: Vec<u64> = (0..8).scan(Rng::new(0), |r, _| Some(r.next_u64())).collect();
+        let vals: Vec<u64> = (0..8)
+            .scan(Rng::new(0), |r, _| Some(r.next_u64()))
+            .collect();
         assert!(
             vals.windows(2).any(|w| w[0] != w[1]),
             "seed 0 produced a constant stream: {vals:?}"
@@ -957,7 +972,10 @@ mod tests {
         assert!(has(&shrink(&Value::str("abc")), &Value::str("")));
         assert!(shrink(&Value::str("")).is_empty());
         assert!(shrink(&list_of(vec![])).is_empty());
-        assert!(has(&shrink(&list_of(vec![Value::Int(1)])), &list_of(vec![])));
+        assert!(has(
+            &shrink(&list_of(vec![Value::Int(1)])),
+            &list_of(vec![])
+        ));
     }
 
     #[test]

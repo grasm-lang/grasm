@@ -15,11 +15,16 @@ use grasm_syntax::token::{StrPart, TokenKind};
 use std::path::{Path, PathBuf};
 
 fn gr_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
     for e in rd.flatten() {
         let p = e.path();
         if p.is_dir() {
-            if !matches!(p.file_name().and_then(|s| s.to_str()), Some("target" | ".git")) {
+            if !matches!(
+                p.file_name().and_then(|s| s.to_str()),
+                Some("target" | ".git")
+            ) {
                 gr_files(&p, out);
             }
         } else if p.extension().and_then(|s| s.to_str()) == Some("gr") {
@@ -52,15 +57,24 @@ fn kinds(src: &str) -> Vec<TokenKind> {
 
 #[test]
 fn formatting_never_changes_the_token_stream() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .unwrap();
     let mut files = Vec::new();
     gr_files(&root, &mut files);
-    assert!(files.len() > 200, "expected the whole corpus, found {}", files.len());
+    assert!(
+        files.len() > 200,
+        "expected the whole corpus, found {}",
+        files.len()
+    );
 
     let mut changed = 0usize;
     let mut bad: Vec<String> = Vec::new();
     for f in &files {
-        let Ok(src) = std::fs::read_to_string(f) else { continue };
+        let Ok(src) = std::fs::read_to_string(f) else {
+            continue;
+        };
         let once = format_src(&src);
         let before = kinds(&src);
         let after = kinds(&once);
@@ -71,7 +85,12 @@ fn formatting_never_changes_the_token_stream() {
                 .position(|(a, b)| a != b)
                 .unwrap_or(before.len().min(after.len()));
             let ctx = |v: &Vec<TokenKind>| {
-                v.iter().skip(at.saturating_sub(3)).take(7).map(|k| format!("{k:?}")).collect::<Vec<_>>().join(" ")
+                v.iter()
+                    .skip(at.saturating_sub(3))
+                    .take(7)
+                    .map(|k| format!("{k:?}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
             };
             bad.push(format!(
                 "{}\n     was: {}\n     now: {}",
@@ -85,9 +104,17 @@ fn formatting_never_changes_the_token_stream() {
         }
         let twice = format_src(&once);
         if twice != once {
-            bad.push(format!("{}: not idempotent", f.strip_prefix(&root).unwrap_or(f).display()));
+            bad.push(format!(
+                "{}: not idempotent",
+                f.strip_prefix(&root).unwrap_or(f).display()
+            ));
         }
     }
     eprintln!("fmt: {} files, {} would change", files.len(), changed);
-    assert!(bad.is_empty(), "{} files broken by fmt:\n  {}", bad.len(), bad.join("\n  "));
+    assert!(
+        bad.is_empty(),
+        "{} files broken by fmt:\n  {}",
+        bad.len(),
+        bad.join("\n  ")
+    );
 }

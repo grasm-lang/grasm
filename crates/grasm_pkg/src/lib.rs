@@ -227,12 +227,13 @@ outside that set is executed but recorded nowhere"
             let req = match table.get("version") {
                 None => None,
                 Some(v) => {
-                    let text = v
-                        .as_str()
-                        .ok_or_else(|| format!("dependency `{dep_name}`: `version` must be a string"))?;
-                    Some(VersionReq::parse(text).map_err(|e| {
-                        format!("dependency `{dep_name}`: {e}")
-                    })?)
+                    let text = v.as_str().ok_or_else(|| {
+                        format!("dependency `{dep_name}`: `version` must be a string")
+                    })?;
+                    Some(
+                        VersionReq::parse(text)
+                            .map_err(|e| format!("dependency `{dep_name}`: {e}"))?,
+                    )
                 }
             };
             if path.is_none() && req.is_none() {
@@ -284,7 +285,10 @@ table — put it under `[package]`"
             if name.is_empty() || name == "package" || name == "dependencies" {
                 continue;
             }
-            if name.strip_prefix("dependencies.").is_some_and(|d| !d.is_empty()) {
+            if name
+                .strip_prefix("dependencies.")
+                .is_some_and(|d| !d.is_empty())
+            {
                 continue;
             }
             return Err(format!(
@@ -330,8 +334,7 @@ and not a keyword"
         // Named here, not in the parser: `line 1: expected `key = value``
         // said which line of *something*, and a graph has one manifest per
         // package. Which file is the first thing a reader needs.
-        Manifest::parse(&text, dir)
-            .map_err(|e| format!("{}: {e}", grasm_sema::loader::tidy(&path)))
+        Manifest::parse(&text, dir).map_err(|e| format!("{}: {e}", grasm_sema::loader::tidy(&path)))
     }
 
     pub fn entry_path(&self) -> PathBuf {
@@ -344,11 +347,43 @@ fn is_identifier(name: &str) -> bool {
     // The keyword list the grammar reserves. A package named for one of them
     // parses as that keyword in the consumer's `import` line.
     const KEYWORDS: &[&str] = &[
-        "and", "as", "bench", "break", "const", "continue", "effect", "else", "extern", "fail",
-        "false", "fn", "for", "handled_by", "if", "import", "in", "inout", "let", "match", "not",
+        "and",
+        "as",
+        "bench",
+        "break",
+        "const",
+        "continue",
+        "effect",
+        "else",
+        "extern",
+        "fail",
+        "false",
+        "fn",
+        "for",
+        "handled_by",
+        "if",
+        "import",
+        "in",
+        "inout",
+        "let",
+        "match",
+        "not",
         "or",
-        "own", "parallel", "pub", "ref", "region", "return", "spawn", "test", "true", "try",
-        "type", "unsafe", "var", "while", "with",
+        "own",
+        "parallel",
+        "pub",
+        "ref",
+        "region",
+        "return",
+        "spawn",
+        "test",
+        "true",
+        "try",
+        "type",
+        "unsafe",
+        "var",
+        "while",
+        "with",
     ];
     let mut chars = name.chars();
     let Some(first) = chars.next() else {
@@ -493,7 +528,9 @@ pub fn publish(pkg_dir: &Path, registry: &Registry) -> Result<Published, String>
     // like their problem.
     let performed = effects_of_package(&manifest)?;
     if let Some(v) = check_capabilities(&manifest, &performed) {
-        return Err(format!("{v}\n  refusing to publish a package that exceeds its own ceiling"));
+        return Err(format!(
+            "{v}\n  refusing to publish a package that exceeds its own ceiling"
+        ));
     }
 
     // A `path` dependency names a directory beside the package, and only the
@@ -527,8 +564,7 @@ no consumer can resolve\n  give `{}` a `version` and publish it first",
         ));
     }
 
-    std::fs::create_dir_all(&dest)
-        .map_err(|e| format!("cannot create {}: {e}", dest.display()))?;
+    std::fs::create_dir_all(&dest).map_err(|e| format!("cannot create {}: {e}", dest.display()))?;
     let mut files = 0;
     copy_into(&pkg_dir.join(MANIFEST_NAME), &dest.join(MANIFEST_NAME))?;
     files += 1;
@@ -586,7 +622,8 @@ and not a keyword"
 
 fn copy_into(from: &Path, to: &Path) -> Result<(), String> {
     if let Some(parent) = to.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
     }
     std::fs::copy(from, to)
         .map(|_| ())
@@ -895,9 +932,10 @@ impl Selection {
                     .registry
                     .as_ref()
                     .ok_or_else(|| missing_registry(&dep.name, &[]))?;
-                let v = self.versions.get(&dep.name).ok_or_else(|| {
-                    format!("internal: no version selected for `{}`", dep.name)
-                })?;
+                let v = self
+                    .versions
+                    .get(&dep.name)
+                    .ok_or_else(|| format!("internal: no version selected for `{}`", dep.name))?;
                 Ok(reg.dir(&dep.name, v))
             }
         }
@@ -1196,9 +1234,8 @@ pub fn effects_of_package(manifest: &Manifest) -> Result<BTreeSet<String>, Strin
     // consumer cannot fix, and if the consumer already declared `io` for its
     // own reasons, nothing was reported at all.
     for extra in package_modules(manifest, &entry) {
-        let p = grasm_sema::loader::load_from_disk_with(&extra, &resolved).map_err(|e| {
-            format!("package `{}`: {}", manifest.name, e)
-        })?;
+        let p = grasm_sema::loader::load_from_disk_with(&extra, &resolved)
+            .map_err(|e| format!("package `{}`: {}", manifest.name, e))?;
         // A file that does not parse cannot be read for what it performs, and
         // affirming the package anyway is the wrong answer in the one
         // direction that matters: `grasm deps` reported `performs []` and
@@ -1321,9 +1358,7 @@ pub fn package_checksum(manifest: &Manifest) -> Result<String, String> {
         let rel = f.strip_prefix(&manifest.dir).unwrap_or(f);
         buf.extend(rel.to_string_lossy().as_bytes());
         buf.push(0);
-        buf.extend(
-            std::fs::read(f).map_err(|e| format!("cannot read {}: {e}", f.display()))?,
-        );
+        buf.extend(std::fs::read(f).map_err(|e| format!("cannot read {}: {e}", f.display()))?);
         buf.push(0);
     }
     Ok(hash::sha256_hex(&buf))
@@ -1397,10 +1432,7 @@ pub fn build_lock(resolution: &Resolution) -> Result<Vec<LockEntry>, String> {
             name: m.name.clone(),
             version: m.version.clone(),
             checksum: package_checksum(m)?,
-            capabilities: m
-                .capabilities
-                .as_ref()
-                .map(|c| c.iter().cloned().collect()),
+            capabilities: m.capabilities.as_ref().map(|c| c.iter().cloned().collect()),
         });
     }
     Ok(entries)
@@ -1431,7 +1463,11 @@ pub fn render_lock(entries: &[LockEntry]) -> String {
 pub enum LockChange {
     /// A package's sources changed since the lockfile was written. This is the
     /// case a lockfile exists to catch: a dependency that is not what it was.
-    Changed { name: String, was: String, now: String },
+    Changed {
+        name: String,
+        was: String,
+        now: String,
+    },
     /// A package resolved to a different *version* than the lockfile records.
     ///
     /// Reported separately from a content change because it can happen without
@@ -1439,7 +1475,11 @@ pub enum LockChange {
     /// match and only the version moved. Comparing checksums alone let that
     /// through `--locked`, and the lockfile then went on recording a version
     /// that was no longer in the build — a factually wrong record passing CI.
-    VersionChanged { name: String, was: String, now: String },
+    VersionChanged {
+        name: String,
+        was: String,
+        now: String,
+    },
     /// A package the lockfile does not mention.
     Added(String),
     /// A package the lockfile mentions that is no longer in the graph.
@@ -1488,7 +1528,10 @@ impl std::fmt::Display for LockChange {
                 )
             }
             LockChange::Unreadable => {
-                write!(f, "the existing lockfile is unreadable and will be rewritten")
+                write!(
+                    f,
+                    "the existing lockfile is unreadable and will be rewritten"
+                )
             }
         }
     }

@@ -46,7 +46,10 @@ fn parse_case(path: &Path) -> Case {
     let source = std::fs::read_to_string(path).expect("readable conformance file");
     // A leading byte order mark is ignored, the same as the compiler ignores
     // one ([L-ENCODING]) — and one of these files begins with one on purpose.
-    let source = source.strip_prefix('\u{feff}').unwrap_or(&source).to_string();
+    let source = source
+        .strip_prefix('\u{feff}')
+        .unwrap_or(&source)
+        .to_string();
     let name = path.file_name().unwrap().to_string_lossy().to_string();
 
     let mut tag = None;
@@ -99,7 +102,10 @@ fn all_cases() -> Vec<Case> {
         .filter(|p| p.extension().is_some_and(|e| e == "gr"))
         .collect();
     paths.sort();
-    assert!(!paths.is_empty(), "no conformance programs found in {dir:?}");
+    assert!(
+        !paths.is_empty(),
+        "no conformance programs found in {dir:?}"
+    );
     paths.iter().map(|p| parse_case(p)).collect()
 }
 
@@ -188,7 +194,11 @@ fn run_test_suite(source: &str) -> (u32, u32, String, Vec<String>) {
 /// analyses one string, imports never resolve, and the specification cannot
 /// say anything about its own module system.
 fn run_case(case: &Case) -> (i32, String, Vec<String>) {
-    if !case.source.lines().any(|l| l.trim_start().starts_with("import ")) {
+    if !case
+        .source
+        .lines()
+        .any(|l| l.trim_start().starts_with("import "))
+    {
         return run_program(&case.source);
     }
     let program = match grasm_sema::loader::load_from_disk(&case.path) {
@@ -302,10 +312,7 @@ fn every_conformance_program_behaves_as_specified() {
                     ));
                 }
                 if code == 0 {
-                    failures.push(format!(
-                        "{}: expected a non-zero exit, got 0",
-                        case.name
-                    ));
+                    failures.push(format!("{}: expected a non-zero exit, got 0", case.name));
                 }
             }
             Expect::Error(needles) => {
@@ -438,12 +445,7 @@ fn tutorial_programs() -> Vec<(usize, String)> {
             }
             (None, true) => {
                 let info = line[width..].trim();
-                current = Some((
-                    i + 2,
-                    width,
-                    Vec::new(),
-                    info.is_empty() || info == "grasm",
-                ));
+                current = Some((i + 2, width, Vec::new(), info.is_empty() || info == "grasm"));
             }
             (Some((_, _, lines, _)), _) => lines.push(line.to_string()),
             (None, false) => {}
@@ -485,7 +487,9 @@ fn every_tutorial_program_compiles_and_runs() {
                     "docs/tutorial.md:{line}: does not compile: {diags:?}\n{src}"
                 ));
             } else if failed > 0 {
-                failures.push(format!("docs/tutorial.md:{line}: {failed} test(s) failed\n{src}"));
+                failures.push(format!(
+                    "docs/tutorial.md:{line}: {failed} test(s) failed\n{src}"
+                ));
             }
             continue;
         }
@@ -567,7 +571,10 @@ fn every_clause_has_a_stability_level() {
     let levels = stability_levels();
     let known = ["stable", "provisional", "experimental"];
 
-    let missing: Vec<&String> = declared.iter().filter(|t| !levels.contains_key(*t)).collect();
+    let missing: Vec<&String> = declared
+        .iter()
+        .filter(|t| !levels.contains_key(*t))
+        .collect();
     assert!(
         missing.is_empty(),
         "{} clause(s) have no stability level — add them to spec/stability.md:\n  {}",
@@ -633,7 +640,9 @@ fn the_language_pack_is_current_and_complete() {
     let root = spec_dir().parent().unwrap().to_path_buf();
     let read = |name: &str| match std::fs::read_to_string(root.join("dist").join(name)) {
         Ok(p) => p,
-        Err(e) => panic!("dist/{name} is missing ({e}) — regenerate it with scripts/language_pack.sh"),
+        Err(e) => {
+            panic!("dist/{name} is missing ({e}) — regenerate it with scripts/language_pack.sh")
+        }
     };
     let pack = read("grasm-language-pack.md");
     // The conformance programs are four files now, split by the area a clause
@@ -728,8 +737,7 @@ fn every_clause_is_filed_under_the_heading_that_matches_its_level() {
     // scanning headings and a tool parsing labels get different answers about
     // what the project has promised.
     let text = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../spec/stability.md"),
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../spec/stability.md"),
     )
     .expect("spec/stability.md is readable");
 

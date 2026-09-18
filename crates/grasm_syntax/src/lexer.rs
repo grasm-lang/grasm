@@ -69,12 +69,18 @@ impl<'a> Lexer<'a> {
             // instead means the chain reads down the left margin, which is
             // where every other language that solved this ended up.
             if matches!(tok.kind, TokenKind::Dot | TokenKind::QuestionDot)
-                && matches!(out.last().map(|t: &Token| &t.kind), Some(TokenKind::Newline))
+                && matches!(
+                    out.last().map(|t: &Token| &t.kind),
+                    Some(TokenKind::Newline)
+                )
             {
                 out.pop();
                 out.push(tok);
             } else if tok.kind == TokenKind::Newline
-                && matches!(out.last().map(|t: &Token| &t.kind), Some(TokenKind::Newline))
+                && matches!(
+                    out.last().map(|t: &Token| &t.kind),
+                    Some(TokenKind::Newline)
+                )
             {
                 // Collapse consecutive newlines into one.
                 if let Some(last) = out.last_mut() {
@@ -229,8 +235,8 @@ impl<'a> Lexer<'a> {
             self.bump();
         }
         let text = &self.src[start..self.pos];
-        let kind = TokenKind::keyword_from(text)
-            .unwrap_or_else(|| TokenKind::Ident(text.to_string()));
+        let kind =
+            TokenKind::keyword_from(text).unwrap_or_else(|| TokenKind::Ident(text.to_string()));
         self.tok(kind, start)
     }
 
@@ -305,7 +311,10 @@ impl<'a> Lexer<'a> {
         if (self.peek() == b'e' || self.peek() == b'E')
             && (self.peek2().is_ascii_digit()
                 || ((self.peek2() == b'+' || self.peek2() == b'-')
-                    && self.bytes.get(self.pos + 2).is_some_and(|b| b.is_ascii_digit())))
+                    && self
+                        .bytes
+                        .get(self.pos + 2)
+                        .is_some_and(|b| b.is_ascii_digit())))
         {
             is_float = true;
             self.bump();
@@ -317,11 +326,17 @@ impl<'a> Lexer<'a> {
             }
         }
 
-        let text: String = self.src[start..self.pos].chars().filter(|&c| c != '_').collect();
+        let text: String = self.src[start..self.pos]
+            .chars()
+            .filter(|&c| c != '_')
+            .collect();
         if is_float {
             match text.parse::<f64>() {
                 Ok(v) => self.tok(TokenKind::Float(v), start),
-                Err(_) => self.tok(TokenKind::Error(format!("invalid float literal `{text}`")), start),
+                Err(_) => self.tok(
+                    TokenKind::Error(format!("invalid float literal `{text}`")),
+                    start,
+                ),
             }
         } else {
             match text.parse::<i64>() {
@@ -379,7 +394,10 @@ impl<'a> Lexer<'a> {
         let mut cur = String::new();
         loop {
             if self.pos >= self.bytes.len() || self.peek() == b'\n' {
-                return self.tok(TokenKind::Error("unterminated string literal".into()), start);
+                return self.tok(
+                    TokenKind::Error("unterminated string literal".into()),
+                    start,
+                );
             }
             match self.peek() {
                 b'"' => {
@@ -441,7 +459,9 @@ impl<'a> Lexer<'a> {
                                 && digits.len() <= 6
                                 && digits.chars().all(|c| c.is_ascii_hexdigit());
                             let ch = if ok {
-                                u32::from_str_radix(&digits, 16).ok().and_then(char::from_u32)
+                                u32::from_str_radix(&digits, 16)
+                                    .ok()
+                                    .and_then(char::from_u32)
                             } else {
                                 None
                             };
@@ -471,7 +491,7 @@ impl<'a> Lexer<'a> {
                                     (esc as char).escape_debug()
                                 )),
                                 start,
-                            )
+                            );
                         }
                     }
                 }
@@ -727,16 +747,19 @@ impl<'a> Lexer<'a> {
                 // which ([L-ENCODING]).
                 {
                     let ch = text.chars().next().unwrap_or('\u{fffd}');
-                    if ch.is_control() || ch.is_whitespace() || matches!(ch, '\u{feff}' | '\u{200b}'..='\u{200f}' | '\u{2060}') {
+                    if ch.is_control()
+                        || ch.is_whitespace()
+                        || matches!(ch, '\u{feff}' | '\u{200b}'..='\u{200f}' | '\u{2060}')
+                    {
                         let named = match ch {
-                            '\u{feff}' => " (a byte order mark — legal only at the very start of a file)".to_string(),
+                            '\u{feff}' => {
+                                " (a byte order mark — legal only at the very start of a file)"
+                                    .to_string()
+                            }
                             '\u{200b}' => " (a zero-width space)".to_string(),
                             _ => String::new(),
                         };
-                        Error(format!(
-                            "unexpected character U+{:04X}{named}",
-                            ch as u32
-                        ))
+                        Error(format!("unexpected character U+{:04X}{named}", ch as u32))
                     } else {
                         Error(format!("unexpected character `{text}`"))
                     }
@@ -844,9 +867,15 @@ mod tests {
             vec![
                 Str(vec![
                     StrPart::Text("hi ".into()),
-                    StrPart::Interp { src: "name".into(), offset: 5 },
+                    StrPart::Interp {
+                        src: "name".into(),
+                        offset: 5
+                    },
                     StrPart::Text(", you are ".into()),
-                    StrPart::Interp { src: "age + 1".into(), offset: 21 },
+                    StrPart::Interp {
+                        src: "age + 1".into(),
+                        offset: 21
+                    },
                 ]),
                 Eof
             ]
@@ -877,30 +906,56 @@ mod tests {
         assert_eq!(
             kinds("-> => == != <= >= |> ?? ?. .. ..= :: += -= *= /="),
             vec![
-                Arrow, FatArrow, EqEq, NotEq, LtEq, GtEq, PipeGt, QuestionQuestion,
-                QuestionDot, DotDot, DotDotEq, ColonColon, PlusEq, MinusEq, StarEq,
-                SlashEq, Eof
+                Arrow,
+                FatArrow,
+                EqEq,
+                NotEq,
+                LtEq,
+                GtEq,
+                PipeGt,
+                QuestionQuestion,
+                QuestionDot,
+                DotDot,
+                DotDotEq,
+                ColonColon,
+                PlusEq,
+                MinusEq,
+                StarEq,
+                SlashEq,
+                Eof
             ]
         );
         assert_eq!(
             kinds("+-*/%^=<>!?|.,:"),
             vec![
-                Plus, Minus, Star, Slash, Percent, Caret, Eq, Lt, Gt, Bang, Question,
-                Pipe, Dot, Comma, Colon, Eof
+                Plus, Minus, Star, Slash, Percent, Caret, Eq, Lt, Gt, Bang, Question, Pipe, Dot,
+                Comma, Colon, Eof
             ]
         );
     }
 
     #[test]
     fn newlines_collapse() {
-        assert_eq!(kinds("a\n\n\nb"), vec![Ident("a".into()), Newline, Ident("b".into()), Eof]);
-        assert_eq!(kinds("a\r\nb"), vec![Ident("a".into()), Newline, Ident("b".into()), Eof]);
+        assert_eq!(
+            kinds("a\n\n\nb"),
+            vec![Ident("a".into()), Newline, Ident("b".into()), Eof]
+        );
+        assert_eq!(
+            kinds("a\r\nb"),
+            vec![Ident("a".into()), Newline, Ident("b".into()), Eof]
+        );
     }
 
     #[test]
     fn comments() {
-        assert_eq!(kinds("a // comment\nb"), vec![Ident("a".into()), Newline, Ident("b".into()), Eof]);
-        assert_eq!(kinds("a /* x /* nested */ y */ b"), vec![Ident("a".into()), Ident("b".into()), Eof]);
+        assert_eq!(
+            kinds("a // comment\nb"),
+            vec![Ident("a".into()), Newline, Ident("b".into()), Eof]
+        );
+        assert_eq!(
+            kinds("a /* x /* nested */ y */ b"),
+            vec![Ident("a".into()), Ident("b".into()), Eof]
+        );
         assert_eq!(kinds("// only comment"), vec![Eof]);
     }
 

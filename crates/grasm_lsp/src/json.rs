@@ -303,11 +303,10 @@ mod tests {
         let src = r#"{"a":1,"b":[true,null,"x\ny"],"c":{"d":-2.5}}"#;
         let v = parse(src).unwrap();
         assert_eq!(v.path("c.d").unwrap().as_i64(), Some(-2));
-        assert_eq!(v.path("b").unwrap(), &Json::Arr(vec![
-            Json::Bool(true),
-            Json::Null,
-            Json::Str("x\ny".into())
-        ]));
+        assert_eq!(
+            v.path("b").unwrap(),
+            &Json::Arr(vec![Json::Bool(true), Json::Null, Json::Str("x\ny".into())])
+        );
         // Re-parsing our own output must give the same value.
         assert_eq!(parse(&v.to_text()).unwrap(), v);
     }

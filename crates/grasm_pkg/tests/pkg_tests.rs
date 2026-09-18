@@ -21,10 +21,8 @@ impl Workspace {
         // it. That failed roughly one run in fifty, which is the worst
         // frequency for a gate to fail at. A counter cannot collide.
         let n = WORKSPACE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "grasm_pkg_test_{}_{n}_{tag}",
-            std::process::id(),
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("grasm_pkg_test_{}_{n}_{tag}", std::process::id(),));
         std::fs::create_dir_all(&dir).unwrap();
         Workspace(dir)
     }
@@ -50,7 +48,8 @@ impl Drop for Workspace {
 }
 
 const PURE_SRC: &str = "pub fn double(n: i64) -> i64 {\n    n * 2\n}\n\nfn main() {\n}\n";
-const IO_SRC: &str = "pub fn shout(s: str) {\n    print(s)\n}\n\nfn main() {\n    shout(\"hi\")\n}\n";
+const IO_SRC: &str =
+    "pub fn shout(s: str) {\n    print(s)\n}\n\nfn main() {\n    shout(\"hi\")\n}\n";
 
 fn manifest(name: &str, caps: Option<&str>, deps: &[(&str, &str)]) -> String {
     let mut m = format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\n");
@@ -94,8 +93,14 @@ fn malformed_manifests_are_rejected_with_reasons() {
     let cases = [
         ("[package]\nversion = \"1.0.0\"\n", "missing `name`"),
         ("[package]\nname = \"x\"\n", "missing `version`"),
-        ("[package]\nname = \"x\"\nversion = \"1.0\"\n", "MAJOR.MINOR.PATCH"),
-        ("[package]\nname = \"x\"\nversion = \"a.b.c\"\n", "MAJOR.MINOR.PATCH"),
+        (
+            "[package]\nname = \"x\"\nversion = \"1.0\"\n",
+            "MAJOR.MINOR.PATCH",
+        ),
+        (
+            "[package]\nname = \"x\"\nversion = \"a.b.c\"\n",
+            "MAJOR.MINOR.PATCH",
+        ),
         ("name = \"x\"\n", "[package]"),
         (
             "[package]\nname = \"x\"\nversion = \"1.0.0\"\ncapabilities = \"io\"\n",
@@ -104,7 +109,10 @@ fn malformed_manifests_are_rejected_with_reasons() {
     ];
     for (text, needle) in cases {
         let e = Manifest::parse(text, Path::new("/tmp")).expect_err("should reject");
-        assert!(e.contains(needle), "for {text:?} expected {needle:?}, got {e:?}");
+        assert!(
+            e.contains(needle),
+            "for {text:?} expected {needle:?}, got {e:?}"
+        );
     }
 }
 
@@ -128,7 +136,10 @@ fn a_dependency_with_only_a_version_comes_from_the_registry() {
     )
     .expect("registry dependency");
     assert_eq!(m.dependencies[0].path, None);
-    assert_eq!(m.dependencies[0].req, Some(VersionReq::parse("^1.2.0").unwrap()));
+    assert_eq!(
+        m.dependencies[0].req,
+        Some(VersionReq::parse("^1.2.0").unwrap())
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -172,7 +183,11 @@ fn a_diamond_loads_each_package_once() {
     );
     let root = ws.package(
         "top",
-        &manifest("top", Some(""), &[("left", "../left"), ("right", "../right")]),
+        &manifest(
+            "top",
+            Some(""),
+            &[("left", "../left"), ("right", "../right")],
+        ),
         PURE_SRC,
     );
 
@@ -190,7 +205,10 @@ fn cycles_are_reported_not_hung_on() {
 
     let e = grasm_pkg::resolve(&ws.path().join("a")).expect_err("cycle must be caught");
     assert!(e.contains("dependency cycle"), "got: {e}");
-    assert!(e.contains("a") && e.contains("b"), "cycle should name the path: {e}");
+    assert!(
+        e.contains("a") && e.contains("b"),
+        "cycle should name the path: {e}"
+    );
 }
 
 #[test]
@@ -380,8 +398,8 @@ fn entry_file_must_exist() {
 fn performed(source: &str) -> BTreeSet<String> {
     let ws = Workspace::new("effects");
     let dir = ws.package("probe", &manifest("probe", Some(""), &[]), source);
-    let program = grasm_sema::loader::load_from_disk(&dir.join("src/main.gr"))
-        .expect("probe source loads");
+    let program =
+        grasm_sema::loader::load_from_disk(&dir.join("src/main.gr")).expect("probe source loads");
     assert!(
         program.diagnostics.is_empty(),
         "probe source does not parse: {:#?}\n{source}",
@@ -457,10 +475,7 @@ fn file_and_network_reads_are_reported_as_io() {
         "fn main() {\n    print(\"{file_exists(\"/etc/passwd\")}\")\n}\n",
         "fn main() {\n    print(\"{env(\"HOME\") ?? \"\"}\")\n}\n",
     ] {
-        assert!(
-            performed(src).contains("io"),
-            "must be io: {src}"
-        );
+        assert!(performed(src).contains("io"), "must be io: {src}");
     }
 }
 
@@ -638,8 +653,8 @@ fn a_consumer_can_actually_call_into_its_dependency() {
         "import mathlib\n\nfn main() {\n    print(\"{mathlib.total([1, 2, 3, 4])}\")\n}\n",
     );
 
-    let program = grasm_sema::loader::load_from_disk(&app.join("src/main.gr"))
-        .expect("the entry file loads");
+    let program =
+        grasm_sema::loader::load_from_disk(&app.join("src/main.gr")).expect("the entry file loads");
     assert!(
         program.diagnostics.is_empty(),
         "a dependency named in grasm.toml must be importable: {:#?}",
@@ -963,7 +978,8 @@ impl Workspace {
     fn publish(&self, name: &str, version: &str, deps: &[(&str, &str)]) {
         let dir = self.0.join("registry").join(name).join(version);
         std::fs::create_dir_all(dir.join("src")).unwrap();
-        let mut m = format!("[package]\nname = \"{name}\"\nversion = \"{version}\"\ncapabilities = []\n");
+        let mut m =
+            format!("[package]\nname = \"{name}\"\nversion = \"{version}\"\ncapabilities = []\n");
         for (dep, req) in deps {
             m.push_str(&format!("\n[dependencies.{dep}]\nversion = \"{req}\"\n"));
         }
@@ -1040,16 +1056,24 @@ fn the_result_does_not_depend_on_the_order_the_graph_is_walked() {
     ws.publish("a", "1.0.0", &[("text", "^1.4.0")]);
     ws.publish("b", "1.0.0", &[("text", "^1.0.0")]);
 
-    let one = ws.package("one", &{
-        let mut m = app_requiring(&[("a", "^1.0.0"), ("b", "^1.0.0")]);
-        m = m.replace("name = \"app\"", "name = \"one\"");
-        m
-    }, PURE_SRC);
-    let two = ws.package("two", &{
-        let mut m = app_requiring(&[("b", "^1.0.0"), ("a", "^1.0.0")]);
-        m = m.replace("name = \"app\"", "name = \"two\"");
-        m
-    }, PURE_SRC);
+    let one = ws.package(
+        "one",
+        &{
+            let mut m = app_requiring(&[("a", "^1.0.0"), ("b", "^1.0.0")]);
+            m = m.replace("name = \"app\"", "name = \"one\"");
+            m
+        },
+        PURE_SRC,
+    );
+    let two = ws.package(
+        "two",
+        &{
+            let mut m = app_requiring(&[("b", "^1.0.0"), ("a", "^1.0.0")]);
+            m = m.replace("name = \"app\"", "name = \"two\"");
+            m
+        },
+        PURE_SRC,
+    );
 
     let r1 = grasm_pkg::resolve_in(&one, Some(&ws.registry())).unwrap();
     let r2 = grasm_pkg::resolve_in(&two, Some(&ws.registry())).unwrap();
@@ -1204,7 +1228,6 @@ fn the_lockfile_records_the_versions_selection_chose() {
     assert!(!text.checksum.is_empty());
 }
 
-
 /// An effect handled inside the package is not a capability.
 ///
 /// A capability is what a package needs from *outside* itself. `Cfg` is
@@ -1229,7 +1252,10 @@ fn an_effect_handled_inside_the_package_is_not_a_capability() {
     let m = Manifest::load(&dir).unwrap();
     let performed = grasm_pkg::effects_of_package(&m).unwrap();
     assert!(!performed.contains("Cfg"), "got: {performed:?}");
-    assert!(performed.contains("io"), "the print still counts: {performed:?}");
+    assert!(
+        performed.contains("io"),
+        "the print still counts: {performed:?}"
+    );
     assert!(grasm_pkg::check_capabilities(&m, &performed).is_none());
 }
 
@@ -1512,7 +1538,10 @@ fn an_unknown_manifest_table_is_refused() {
     ] {
         std::fs::write(dir.join("grasm.toml"), text).unwrap();
         let err = Manifest::load(&dir).expect_err("an unknown table cannot load");
-        assert!(err.contains("is not a table this manifest has"), "{text:?}: {err}");
+        assert!(
+            err.contains("is not a table this manifest has"),
+            "{text:?}: {err}"
+        );
     }
     // The tables it does have still load, dependencies included.
     std::fs::write(
@@ -1587,14 +1616,24 @@ fn the_boolean_literals_are_not_package_names() {
 fn one_walk_answers_for_the_checksum_publish_and_the_ceiling() {
     let ws = Workspace::new("one_walk");
     let dir = ws.package("ow", &manifest("ow", Some(""), &[]), PURE_SRC);
-    for rel in ["src/target/m.gr", "src/.hidden/h.gr", "src/HELPER.GR", "tools/gen.gr"] {
+    for rel in [
+        "src/target/m.gr",
+        "src/.hidden/h.gr",
+        "src/HELPER.GR",
+        "tools/gen.gr",
+    ] {
         let p = dir.join(rel);
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
         std::fs::write(&p, "pub fn v() -> i64 {\n    1\n}\n").unwrap();
     }
     let m = Manifest::load(&dir).unwrap();
     let before = grasm_pkg::package_checksum(&m).unwrap();
-    for rel in ["src/target/m.gr", "src/.hidden/h.gr", "src/HELPER.GR", "tools/gen.gr"] {
+    for rel in [
+        "src/target/m.gr",
+        "src/.hidden/h.gr",
+        "src/HELPER.GR",
+        "tools/gen.gr",
+    ] {
         std::fs::write(dir.join(rel), "pub fn v() -> i64 {\n    2\n}\n").unwrap();
         let after = grasm_pkg::package_checksum(&m).unwrap();
         assert_ne!(before, after, "{rel} is not in the checksum");
@@ -1602,9 +1641,16 @@ fn one_walk_answers_for_the_checksum_publish_and_the_ceiling() {
     }
     // And `source_files` is what all three consult.
     let found = grasm_pkg::source_files(&dir).unwrap();
-    for rel in ["src/target/m.gr", "src/.hidden/h.gr", "src/HELPER.GR", "tools/gen.gr"] {
+    for rel in [
+        "src/target/m.gr",
+        "src/.hidden/h.gr",
+        "src/HELPER.GR",
+        "tools/gen.gr",
+    ] {
         assert!(
-            found.iter().any(|p| p.ends_with(rel.rsplit('/').next().unwrap())),
+            found
+                .iter()
+                .any(|p| p.ends_with(rel.rsplit('/').next().unwrap())),
             "{rel} missing from {found:?}"
         );
     }
@@ -1670,7 +1716,10 @@ fn add_refuses_a_name_a_manifest_cannot_hold() {
     ] {
         let err = grasm_pkg::add_dependency(&dir, name, &req)
             .expect_err("an unusable name cannot be added");
-        assert!(err.contains("not a usable dependency name"), "{name:?}: {err}");
+        assert!(
+            err.contains("not a usable dependency name"),
+            "{name:?}: {err}"
+        );
     }
     assert_eq!(
         std::fs::read_to_string(dir.join("grasm.toml")).unwrap(),
@@ -1691,7 +1740,12 @@ fn add_refuses_a_name_a_manifest_cannot_hold() {
 /// enumerations of one file set is one too many.
 #[test]
 fn the_ceiling_sees_every_source_in_the_package() {
-    for at in ["tests/helper.gr", "helper.gr", "src/deep/helper.gr", "src/HELPER.GR"] {
+    for at in [
+        "tests/helper.gr",
+        "helper.gr",
+        "src/deep/helper.gr",
+        "src/HELPER.GR",
+    ] {
         let ws = Workspace::new("scan_all");
         let dir = ws.package("probe", &manifest("probe", Some(""), &[]), PURE_SRC);
         let file = dir.join(at);
@@ -1703,7 +1757,10 @@ fn the_ceiling_sees_every_source_in_the_package() {
             effects.contains("io"),
             "`io` performed in {at} escaped the scan: {effects:?}"
         );
-        assert!(grasm_pkg::check_capabilities(&m, &effects).is_some(), "{at}");
+        assert!(
+            grasm_pkg::check_capabilities(&m, &effects).is_some(),
+            "{at}"
+        );
     }
 }
 
@@ -1716,7 +1773,11 @@ fn the_ceiling_sees_every_source_in_the_package() {
 #[test]
 fn entry_uses_the_same_rule_as_the_source_scan() {
     let ws = Workspace::new("entry_case");
-    for (entry, ok) in [("src/Main.GR", true), ("src/main.gr", true), ("src/lib.txt", false)] {
+    for (entry, ok) in [
+        ("src/Main.GR", true),
+        ("src/main.gr", true),
+        ("src/lib.txt", false),
+    ] {
         let dir = ws.package(
             "probe",
             &format!("[package]\nname = \"probe\"\nversion = \"0.1.0\"\nentry = \"{entry}\"\n"),
@@ -1758,8 +1819,8 @@ lib_run()\n}\n\nfn lib_run() {\n    \
 logging.work(LogHandler{ write: |s| print(s) }, \"x\")\n}\n",
     );
 
-    let program = grasm_sema::loader::load_from_disk(&app.join("src/main.gr"))
-        .expect("the entry file loads");
+    let program =
+        grasm_sema::loader::load_from_disk(&app.join("src/main.gr")).expect("the entry file loads");
     let diags = grasm_sema::check::check_program(&program).diagnostics;
     assert!(diags.is_empty(), "{diags:#?}");
 
@@ -1770,7 +1831,10 @@ logging.work(LogHandler{ write: |s| print(s) }, \"x\")\n}\n",
     // The library still permits nothing of its own.
     let m = Manifest::load(&ws.path().join("logging")).expect("manifest loads");
     let effects = grasm_pkg::effects_of_package(&m).expect("effects are inferred");
-    assert!(grasm_pkg::check_capabilities(&m, &effects).is_none(), "{effects:?}");
+    assert!(
+        grasm_pkg::check_capabilities(&m, &effects).is_none(),
+        "{effects:?}"
+    );
 }
 
 /// A C function called in method position counts against the ceiling.
@@ -1823,7 +1887,10 @@ fn main() {\n}\n",
     // The library permits exactly `Mk` and performs exactly `Mk` — no `io`.
     let m = Manifest::load(&dir).expect("manifest loads");
     let effects = grasm_pkg::effects_of_package(&m).expect("effects are inferred");
-    assert!(grasm_pkg::check_capabilities(&m, &effects).is_none(), "{effects:?}");
+    assert!(
+        grasm_pkg::check_capabilities(&m, &effects).is_none(),
+        "{effects:?}"
+    );
 
     // And a consumer cannot hand it a printing function through the result:
     // the handler literal is refused where it is written.

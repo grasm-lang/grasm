@@ -28,7 +28,10 @@ fn hello_world() {
 fn arithmetic_and_inference() {
     check_ok("fn f() {\n    let x = 1 + 2 * 3\n    let y = 2.5 * 4.0\n    let z: f64 = 2\n    let s = \"a\" + \"b\"\n}\n");
     check_err("fn f() {\n    let x = 1 + \"a\"\n}\n", "type mismatch");
-    check_err("fn f() {\n    let x = true + false\n}\n", "cannot apply `+`");
+    check_err(
+        "fn f() {\n    let x = true + false\n}\n",
+        "cannot apply `+`",
+    );
 }
 
 #[test]
@@ -44,10 +47,7 @@ fn unknown_names() {
 
 #[test]
 fn immutability_enforced() {
-    check_err(
-        "fn f() {\n    let x = 1\n    x = 2\n}\n",
-        "it is immutable",
-    );
+    check_err("fn f() {\n    let x = 1\n    x = 2\n}\n", "it is immutable");
     check_ok("fn f() {\n    var x = 1\n    x = 2\n    x += 3\n}\n");
 }
 
@@ -71,7 +71,9 @@ fn inout_param_is_mutable() {
 
 #[test]
 fn function_calls_and_returns() {
-    check_ok("fn add(a: i64, b: i64) -> i64 {\n    a + b\n}\n\nfn main() {\n    let x = add(1, 2)\n}\n");
+    check_ok(
+        "fn add(a: i64, b: i64) -> i64 {\n    a + b\n}\n\nfn main() {\n    let x = add(1, 2)\n}\n",
+    );
     check_err(
         "fn add(a: i64, b: i64) -> i64 {\n    a + b\n}\n\nfn main() {\n    let x = add(1)\n}\n",
         "expects 2 argument(s)",
@@ -80,15 +82,14 @@ fn function_calls_and_returns() {
         "fn add(a: i64, b: i64) -> i64 {\n    a + b\n}\n\nfn main() {\n    let x = add(1, \"two\")\n}\n",
         "type mismatch",
     );
-    check_err(
-        "fn bad() -> i64 {\n    \"nope\"\n}\n",
-        "must return `i64`",
-    );
+    check_err("fn bad() -> i64 {\n    \"nope\"\n}\n", "must return `i64`");
 }
 
 #[test]
 fn explicit_return() {
-    check_ok("fn f(x: i64) -> i64 {\n    if x > 0 {\n        return x\n    }\n    return 0 - x\n}\n");
+    check_ok(
+        "fn f(x: i64) -> i64 {\n    if x > 0 {\n        return x\n    }\n    return 0 - x\n}\n",
+    );
     check_err("fn f() -> i64 {\n    return \"s\"\n}\n", "type mismatch");
 }
 
@@ -148,7 +149,9 @@ fn wildcard_covers_match() {
 
 #[test]
 fn bool_match_exhaustive() {
-    check_ok("fn f(b: bool) -> i64 {\n    match b {\n        true -> 1\n        false -> 0\n    }\n}\n");
+    check_ok(
+        "fn f(b: bool) -> i64 {\n    match b {\n        true -> 1\n        false -> 0\n    }\n}\n",
+    );
     check_err(
         "fn f(b: bool) -> i64 {\n    match b {\n        true -> 1\n    }\n}\n",
         "missing `false`",
@@ -165,7 +168,9 @@ fn guards_do_not_count_for_exhaustiveness() {
 
 #[test]
 fn option_prelude() {
-    check_ok("fn f() {\n    let x = Some(3)\n    let y = x ?? 0\n    let n: Option[str] = None\n}\n");
+    check_ok(
+        "fn f() {\n    let x = Some(3)\n    let y = x ?? 0\n    let n: Option[str] = None\n}\n",
+    );
     check_ok("fn f(o: Option[i64]) -> i64 {\n    match o {\n        Some(v) -> v\n        None -> 0\n    }\n}\n");
     check_err(
         "fn f(o: Option[i64]) -> i64 {\n    match o {\n        Some(v) -> v\n    }\n}\n",
@@ -228,10 +233,7 @@ fn generics_basic() {
 #[test]
 fn list_methods() {
     check_ok("fn f() {\n    let xs = [1, 2, 3]\n    let n = xs.len()\n    let d = xs.map(|x| x * 2)\n    let e = xs.filter(|x| x > 1)\n    let s = xs.sum()\n    let names = [\"a\", \"b\"].join(\", \")\n}\n");
-    check_err(
-        "fn f() {\n    let s = [true].sum()\n}\n",
-        "cannot sum",
-    );
+    check_err("fn f() {\n    let s = [true].sum()\n}\n", "cannot sum");
     check_err(
         "fn f() {\n    let xs = [1]\n    let y = xs.frobnicate()\n}\n",
         "no method `frobnicate`",
@@ -256,7 +258,10 @@ fn closures_and_pipelines() {
 #[test]
 fn loops_and_ranges() {
     check_ok("fn main() {\n    var total = 0\n    for i in 0..10 {\n        total += i\n    }\n    for x in [1.5, 2.5] {\n        print(\"{x}\")\n    }\n    while total > 0 {\n        total -= 1\n    }\n}\n");
-    check_err("fn main() {\n    for i in 3.5 {\n    }\n}\n", "cannot iterate");
+    check_err(
+        "fn main() {\n    for i in 3.5 {\n    }\n}\n",
+        "cannot iterate",
+    );
     check_err("fn main() {\n    break\n}\n", "outside of a loop");
 }
 
@@ -264,7 +269,10 @@ fn loops_and_ranges() {
 fn if_as_expression() {
     check_ok("fn f(x: i64) -> str {\n    if x > 0 { \"pos\" } else { \"neg\" }\n}\n");
     check_ok("fn f(x: i64) -> i64 {\n    let y = if x > 0 { 1 } else { 0 - 1 }\n    y\n}\n");
-    check_err("fn f(x: i64) {\n    if x { print(\"hm\") }\n}\n", "type mismatch");
+    check_err(
+        "fn f(x: i64) {\n    if x { print(\"hm\") }\n}\n",
+        "type mismatch",
+    );
 }
 
 #[test]
@@ -275,7 +283,10 @@ fn tests_can_use_try() {
 #[test]
 fn duplicate_names_diagnosed() {
     check_err("fn f() {\n}\n\nfn f() {\n}\n", "duplicate function name");
-    check_err("type A = { x: i64 }\ntype A = { y: i64 }\n", "duplicate type name");
+    check_err(
+        "type A = { x: i64 }\ntype A = { y: i64 }\n",
+        "duplicate type name",
+    );
 }
 
 #[test]
@@ -375,10 +386,7 @@ fn unknown_effect_in_with() {
 
 #[test]
 fn unknown_effect_in_declared_row() {
-    check_err(
-        "fn f() / {Bogus} {\n}\n",
-        "unknown effect `Bogus`",
-    );
+    check_err("fn f() / {Bogus} {\n}\n", "unknown effect `Bogus`");
 }
 
 #[test]
@@ -471,7 +479,9 @@ fn reassignment_revives_moved_var() {
 #[test]
 fn inout_arg_must_be_mutable_place() {
     let bump = "fn bump(inout x: i64) {\n    x += 1\n}\n";
-    check_ok(&format!("{bump}\nfn main() {{\n    var n = 0\n    bump(n)\n    print(\"{{n}}\")\n}}\n"));
+    check_ok(&format!(
+        "{bump}\nfn main() {{\n    var n = 0\n    bump(n)\n    print(\"{{n}}\")\n}}\n"
+    ));
     check_err(
         &format!("{bump}\nfn main() {{\n    let n = 0\n    bump(n)\n}}\n"),
         "it is immutable",
@@ -667,10 +677,7 @@ fn is_empty_works_on_every_container() {
 #[test]
 fn property_parameters_are_bound_in_the_body() {
     check_ok("test \"p\" (n: i64, s: str) {\n    assert(n == n)\n    assert(s.len() >= 0)\n}\n");
-    check_err(
-        "test \"p\" (n: i64) {\n    assert(m == 0)\n}\n",
-        "unknown",
-    );
+    check_err("test \"p\" (n: i64) {\n    assert(m == 0)\n}\n", "unknown");
 }
 
 #[test]
@@ -694,10 +701,7 @@ fn a_property_parameter_cannot_be_inout_or_own() {
 fn property_parameters_are_immutable() {
     // The runner owns the value; reassigning it would silently discard the
     // input the failure will be reported with.
-    check_err(
-        "test \"p\" (n: i64) {\n    n = 1\n}\n",
-        "immutable",
-    );
+    check_err("test \"p\" (n: i64) {\n    n = 1\n}\n", "immutable");
 }
 
 #[test]
@@ -1425,9 +1429,7 @@ fn an_undetermined_map_is_refused() {
     check_ok(
         "fn main() {\n    var m: Map[str, i64] = map()\n    m.set(\"a\", 1)\n    print(\"{m.len()}\")\n}\n",
     );
-    check_ok(
-        "fn main() {\n    var m = map()\n    m.set(\"a\", 1)\n    print(\"{m.len()}\")\n}\n",
-    );
+    check_ok("fn main() {\n    var m = map()\n    m.set(\"a\", 1)\n    print(\"{m.len()}\")\n}\n");
 }
 
 /// The "must return" template belongs to the tail expression and to no other.
@@ -1719,7 +1721,9 @@ fn a_with_discharges_a_named_function_value() {
 fn a_callbacks_parameter_row_is_checked_the_other_way() {
     let base = "fn shout(n: i64) -> i64 / {io} {\n    print(\"x\")\n    n\n}\nfn call(f: fn(i64) -> i64) -> i64 {\n    f(1)\n}\n";
     check_err(
-        &format!("{base}fn main() {{\n    let fs = [shout]\n    print(\"{{fs.par_map(call)}}\")\n}}\n"),
+        &format!(
+            "{base}fn main() {{\n    let fs = [shout]\n    print(\"{{fs.par_map(call)}}\")\n}}\n"
+        ),
         "performs nothing, but this one performs `io`",
     );
     check_err(
@@ -1773,13 +1777,11 @@ print(\"{{ys}}\")\n}}\n"
         "inside a parallel operation",
     );
     // A `ref` created inside the function is one per element.
-    check_ok(
-        &format!(
-            "{base}fn main() {{\n    let ys = [1, 2].par_map(|x| {{\n        \
+    check_ok(&format!(
+        "{base}fn main() {{\n    let ys = [1, 2].par_map(|x| {{\n        \
 let mine = ref(Acc{{ n: x, seen: [] }})\n        mine.n = mine.n * 2\n        \
 mine.n\n    }})\n    print(\"{{ys}}\")\n}}\n"
-        ),
-    );
+    ));
     // Reading a captured one was allowed, on the reasoning that a read shares
     // nothing. It shares the *reference count*: a read through a reference
     // takes one on what it finds, and it is not atomic. This assertion was
@@ -1797,7 +1799,10 @@ let ys = [1, 2].par_map(|x| x + acc.n)\n    print(\"{{ys}}\")\n}}\n"
     // *is* the shared thing.
     for (elem, build) in [
         ("[ref Acc]", "var rs: [ref Acc] = []\n    rs.push(acc)"),
-        ("[Holder]", "var rs: [Holder] = []\n    rs.push(Holder{ r: acc })"),
+        (
+            "[Holder]",
+            "var rs: [Holder] = []\n    rs.push(Holder{ r: acc })",
+        ),
     ] {
         let _ = elem;
         for op in ["par_map(|r| 1)", "par_filter(|r| true)"] {
@@ -1812,13 +1817,11 @@ let ys = rs.{op}\n    print(\"{{ys.len()}}\")\n}}\n"
         }
     }
     // `map` is sequential, so the write is exactly what [T-REF-CAPTURE] allows.
-    check_ok(
-        &format!(
-            "{base}fn main() {{\n    let acc = ref(Acc{{ n: 0, seen: [] }})\n    \
+    check_ok(&format!(
+        "{base}fn main() {{\n    let acc = ref(Acc{{ n: 0, seen: [] }})\n    \
 let ys = [1, 2].map(|x| {{\n        acc.n = acc.n + x\n        x\n    }})\n    \
 print(\"{{ys}} {{acc.n}}\")\n}}\n"
-        ),
-    );
+    ));
 }
 
 /// The builtin capability names cannot be declared as effects
@@ -1888,8 +1891,10 @@ if x == 0 {\n        fail(Bad)\n    } else {\n        Ok(x)\n    }\n}\n";
     }
     // A directly fallible tail still propagates: that is what the slot is for.
     check_ok(&format!("{base}fn main() {{\n    risky(0)\n}}\n"));
-    check_ok(&format!("{base}fn main() {{\n    let r = [1, 2].map(risky)\n    \
-match r[0] {{\n        Ok(v) -> print(\"{{v}}\")\n        Err(e) -> print(\"bad\")\n    }}\n}}\n"));
+    check_ok(&format!(
+        "{base}fn main() {{\n    let r = [1, 2].map(risky)\n    \
+match r[0] {{\n        Ok(v) -> print(\"{{v}}\")\n        Err(e) -> print(\"bad\")\n    }}\n}}\n"
+    ));
 }
 
 /// A field read waits for a receiver whose type is not settled yet.
@@ -1909,12 +1914,12 @@ fn a_field_read_waits_for_a_deferred_closures_result() {
         "{base}fn main() {{\n    let f = |x| S{{ c: x }}\n    let s = f(2)\n    \
 print(\"{{s.c}}\")\n}}\n"
     ));
-    check_ok(
-        "fn main() {\n    let f = |x| (x, x + 1)\n    print(\"{f(2).0} {f(2).1}\")\n}\n",
-    );
+    check_ok("fn main() {\n    let f = |x| (x, x + 1)\n    print(\"{f(2).0} {f(2).1}\")\n}\n");
     // A field the type does not have is still refused, and named by its type.
     check_err(
-        &format!("{base}fn main() {{\n    let f = |x| S{{ c: x }}\n    print(\"{{f(2).nope}}\")\n}}\n"),
+        &format!(
+            "{base}fn main() {{\n    let f = |x| S{{ c: x }}\n    print(\"{{f(2).nope}}\")\n}}\n"
+        ),
         "`S` has no field `nope`",
     );
     check_err(
@@ -2046,7 +2051,15 @@ fn main() {\n    print(\"{quiet(dbl, 5)}\")\n}\n",
 /// instead, and the reader had written a function nothing calls.
 #[test]
 fn a_builtin_function_name_cannot_be_redeclared() {
-    for name in ["print", "panic", "env", "file_exists", "fail", "exit", "read_file"] {
+    for name in [
+        "print",
+        "panic",
+        "env",
+        "file_exists",
+        "fail",
+        "exit",
+        "read_file",
+    ] {
         check_err(
             &format!("fn {name}(x: str) -> i64 {{\n    99\n}}\n\nfn main() {{\n}}\n"),
             "is built in",
@@ -2239,7 +2252,10 @@ fn c() / {} {\n    print(\"c\")\n}\n\nfn main() {\n    a()\n    b()\n    c()\n}\
     let spans: Vec<u32> = diags.iter().map(|d| d.span.start).collect();
     let mut sorted = spans.clone();
     sorted.sort();
-    assert_eq!(spans, sorted, "diagnostics are not in source order: {spans:?}");
+    assert_eq!(
+        spans, sorted,
+        "diagnostics are not in source order: {spans:?}"
+    );
     assert!(spans.len() >= 3, "expected one per function: {spans:?}");
 }
 
@@ -2399,8 +2415,10 @@ let fs: [fn(i64) -> i64] = [|x| x + 1]\n    let g = fs[0]\n    print(\"{g(1)}\")
         "not in its declared row",
     );
     check_err(
-        &format!("{head}fn quiet(fs: [fn(i64) -> i64 / {{io}}]) -> i64 / {{}} {{\n    \
-let g = fs[0]\n    g(1)\n}}\n\nfn main() {{\n    print(\"{{quiet([shout])}}\")\n}}\n"),
+        &format!(
+            "{head}fn quiet(fs: [fn(i64) -> i64 / {{io}}]) -> i64 / {{}} {{\n    \
+let g = fs[0]\n    g(1)\n}}\n\nfn main() {{\n    print(\"{{quiet([shout])}}\")\n}}\n"
+        ),
         "not in its declared row",
     );
 }
@@ -2562,7 +2580,11 @@ fn main() {{\n    print(\"{{f(true, true) ?? 0 - 1}}\")\n}}\n"
 fn a_let_copy_of_a_parameter_keeps_that_parameters_row() {
     let tail = "fn shout(m: str) {\n    print(m)\n}\n\nfn dbl(n: i64) -> i64 {\n    n * 2\n}\n\n\
 fn main() {\n    print(\"{run(shout, dbl, [1, 2, 3])}\")\n}\n";
-    for body in ["let f = step\n    xs.map(f)", "xs.map(step)", "let f = step\n    xs.par_map(f)"] {
+    for body in [
+        "let f = step\n    xs.map(f)",
+        "xs.map(step)",
+        "let f = step\n    xs.par_map(f)",
+    ] {
         check_ok(&format!(
             "fn run(log: fn(str) / {{io}}, step: fn(i64) -> i64, xs: [i64]) -> [i64] / {{}} {{\n    \
 {body}\n}}\n\n{tail}"
@@ -2701,14 +2723,22 @@ fn the_immutability_help_names_a_fix_that_parses() {
         "fn f(n: i64) -> i64 {\n    n = 5\n    n\n}\n\nfn main() {\n    print(\"{f(1)}\")\n}\n",
     );
     let help = diags[0].help.clone().expect("the write has help");
-    assert!(help.contains("inout n") && help.contains("var n = n"), "{help}");
+    assert!(
+        help.contains("inout n") && help.contains("var n = n"),
+        "{help}"
+    );
     // Following it compiles.
-    check_ok("fn f(inout n: i64) {\n    n = 5\n}\n\nfn main() {\n    var x = 1\n    \
-f(x)\n    print(\"{x}\")\n}\n");
+    check_ok(
+        "fn f(inout n: i64) {\n    n = 5\n}\n\nfn main() {\n    var x = 1\n    \
+f(x)\n    print(\"{x}\")\n}\n",
+    );
     // A local still gets the `var` advice, which is right for a local.
     let (_, diags) = analyze("fn main() {\n    let a = 1\n    a = 2\n    print(\"{a}\")\n}\n");
     assert!(
-        diags[0].help.as_deref().is_some_and(|h| h.contains("var a")),
+        diags[0]
+            .help
+            .as_deref()
+            .is_some_and(|h| h.contains("var a")),
         "{:?}",
         diags[0].help
     );
@@ -2816,7 +2846,10 @@ print(\"{quiet()}\")\n    }\n}\n\nfn noisy(x: i64) -> i64 {\n    print(\"{x}\")\
         ("fn(i64) -> i64 / {io}", "let f = Mk.get()\n    f(4)"),
         ("fn(i64) -> i64 / {io}", "Mk.get()(4)"),
         ("[fn(i64) -> i64 / {io}]", "let fs = Mk.get()\n    fs[0](4)"),
-        ("Option[fn(i64) -> i64 / {io}]", "let f = Mk.get() ?? noisy\n    f(4)"),
+        (
+            "Option[fn(i64) -> i64 / {io}]",
+            "let f = Mk.get() ?? noisy\n    f(4)",
+        ),
     ] {
         check_err(
             &format!(
@@ -2827,7 +2860,10 @@ fn quiet() -> i64 / {{Mk}} {{\n    {body}\n}}\n{handler}"
         );
     }
     // The parallel proof sees it too, through a name and written at the call.
-    for body in ["let f = Mk.get()\n    [1, 2].par_map(f)", "[1, 2].par_map(Mk.get())"] {
+    for body in [
+        "let f = Mk.get()\n    [1, 2].par_map(f)",
+        "[1, 2].par_map(Mk.get())",
+    ] {
         check_err(
             &format!(
                 "effect Mk {{\n    fn get() -> fn(i64) -> i64 / {{io}}\n}}\n\n\
@@ -3066,9 +3102,7 @@ type W = { inner: Option[ref Acc] }\n\n";
         "let ls = [[acc]]\n    print(\"{ls.par_map(|l| 1)}\")",
     ] {
         check_err(
-            &format!(
-                "{decls}fn main() {{\n    let acc = ref(Acc{{ n: 1 }})\n    {build}\n}}\n"
-            ),
+            &format!("{decls}fn main() {{\n    let acc = ref(Acc{{ n: 1 }})\n    {build}\n}}\n"),
             "reaches a `ref`",
         );
     }
@@ -3090,7 +3124,10 @@ type W = { inner: Option[ref Acc] }\n\n";
 fn a_name_bound_closure_carries_its_ref_into_a_parallel_operation() {
     let base = "type Acc = { n: i64 }\n\n";
     for (bind, op) in [
-        ("let f = |x| {\n        acc.n = acc.n + x\n        x\n    }", "par_map(f)"),
+        (
+            "let f = |x| {\n        acc.n = acc.n + x\n        x\n    }",
+            "par_map(f)",
+        ),
         ("let f = |x| x + acc.n", "par_map(f)"),
         ("let f = |x| acc.n > x", "par_filter(f)"),
     ] {
@@ -3296,7 +3333,9 @@ fn a_deeply_nested_tuple_literal_is_near_linear() {
             for _ in 0..1000 {
                 e = format!("({e}, 2)");
             }
-            check_ok(&format!("fn main() {{\n    let t = {e}\n    print(\"ok\")\n}}\n"));
+            check_ok(&format!(
+                "fn main() {{\n    let t = {e}\n    print(\"ok\")\n}}\n"
+            ));
         })
         .expect("spawns")
         .join()
@@ -3369,9 +3408,8 @@ fn range_methods_are_the_ones_the_help_names() {
 /// typed. Third instance of that mistake; the first two are guarded beside it.
 #[test]
 fn the_range_help_does_not_propose_an_unwriteable_signature() {
-    let (_, diags) = grasm_sema::analyze(
-        "fn main() {\n    let r = 0..3\n    print(\"{r.count()}\")\n}\n",
-    );
+    let (_, diags) =
+        grasm_sema::analyze("fn main() {\n    let r = 0..3\n    print(\"{r.count()}\")\n}\n");
     let d = diags
         .iter()
         .find(|d| d.message.contains("count"))
@@ -3449,9 +3487,9 @@ print(\"yes\")\n    }}\n}}\n"
         );
         let (_, diags) = grasm_sema::analyze(&src);
         assert!(
-            diags
-                .iter()
-                .any(|d| d.message.contains(&format!("`{wrote}` is written `{meant}`"))),
+            diags.iter().any(|d| d
+                .message
+                .contains(&format!("`{wrote}` is written `{meant}`"))),
             "`{wrote}` should name `{meant}`; got:\n{diags:#?}"
         );
         // And exactly one error: reported where the precedence is known, the
@@ -3653,10 +3691,42 @@ compiling and the error says nothing about a name being reserved:\n  {}",
 #[test]
 fn builtins_do_not_take_names_a_program_would_want() {
     const WANTED: &[&str] = &[
-        "run", "send", "open", "close", "read", "write", "start", "stop", "wait", "execute",
-        "step", "next", "get", "set", "add", "push", "pop", "find", "parse", "format", "log",
-        "init", "update", "check", "process", "handle", "make", "build", "run_pipeline",
-        "pipeline", "emit", "apply", "reduce", "walk", "visit", "render",
+        "run",
+        "send",
+        "open",
+        "close",
+        "read",
+        "write",
+        "start",
+        "stop",
+        "wait",
+        "execute",
+        "step",
+        "next",
+        "get",
+        "set",
+        "add",
+        "push",
+        "pop",
+        "find",
+        "parse",
+        "format",
+        "log",
+        "init",
+        "update",
+        "check",
+        "process",
+        "handle",
+        "make",
+        "build",
+        "run_pipeline",
+        "pipeline",
+        "emit",
+        "apply",
+        "reduce",
+        "walk",
+        "visit",
+        "render",
     ];
     let taken: Vec<&str> = WANTED
         .iter()
@@ -3686,8 +3756,14 @@ own functions, and reserving one is permanent: {taken:?}"
 #[test]
 fn builtin_names_agree_with_the_table() {
     use std::collections::BTreeSet;
-    let listed: BTreeSet<&str> = grasm_sema::check::BUILTIN_FREE_FNS.iter().copied().collect();
-    let tabled: BTreeSet<&str> = grasm_sema::builtins::BUILTINS.iter().map(|b| b.name).collect();
+    let listed: BTreeSet<&str> = grasm_sema::check::BUILTIN_FREE_FNS
+        .iter()
+        .copied()
+        .collect();
+    let tabled: BTreeSet<&str> = grasm_sema::builtins::BUILTINS
+        .iter()
+        .map(|b| b.name)
+        .collect();
 
     let missing_row: Vec<&&str> = listed.difference(&tabled).collect();
     assert!(
@@ -3708,8 +3784,8 @@ fn every_builtin_that_reaches_the_world_is_charged() {
     // either a mistake or a decision — and a decision belongs in the table's
     // comment rather than in nobody's head.
     let suspicious = [
-        "read", "write", "file", "dir", "tcp", "udp", "net", "proc", "env",
-        "now", "input", "print", "args",
+        "read", "write", "file", "dir", "tcp", "udp", "net", "proc", "env", "now", "input",
+        "print", "args",
     ];
     for b in grasm_sema::builtins::BUILTINS {
         if b.row.is_empty() && suspicious.iter().any(|s| b.name.contains(s)) {
@@ -3897,11 +3973,26 @@ fn a_rule_that_fires_anywhere_fires_everywhere() {
         ("unknown name", "nosuchname(1)", "unknown name", true),
         ("unknown method", "(1).nomethod()", "no method", true),
         ("type mismatch", "let z: i64 = \"s\"", "mismatch", true),
-        ("unhandled fallible", "risky()", "failure is discarded", true),
+        (
+            "unhandled fallible",
+            "risky()",
+            "failure is discarded",
+            true,
+        ),
         // Legal as a statement — it is only a defect when the binding is
         // captured — so that position is not asked of it.
-        ("capture write", "cell.push(1)", "captured from outside", false),
-        ("undeclared effect", "print(\"x\")", "not in its declared row", false),
+        (
+            "capture write",
+            "cell.push(1)",
+            "captured from outside",
+            false,
+        ),
+        (
+            "undeclared effect",
+            "print(\"x\")",
+            "not in its declared row",
+            false,
+        ),
     ];
 
     const PRE: &str = "type E = { m: str }\nfn risky() -> i64 ! E {\n    Ok(1)\n}\n";

@@ -244,7 +244,11 @@ fn looks_like(candidate: &str, written: &str) -> bool {
     if a.len().abs_diff(b.len()) > 1 {
         return false;
     }
-    let (long, short) = if a.len() >= b.len() { (&a, &b) } else { (&b, &a) };
+    let (long, short) = if a.len() >= b.len() {
+        (&a, &b)
+    } else {
+        (&b, &a)
+    };
     let mut skipped = false;
     let mut i = 0;
     for &c in long.iter() {
@@ -365,8 +369,7 @@ fn check_modules_in(
     c.fn_rows = rows;
     c.closure_rows = closure_rows;
     for f in files {
-        c.module_imports
-            .insert(f.name.clone(), f.imports.clone());
+        c.module_imports.insert(f.name.clone(), f.imports.clone());
     }
     for f in files {
         c.current_module = f.name.clone();
@@ -550,7 +553,16 @@ fn check_modules_in(
             .consts
             .iter()
             .filter(|(_, (_, is_pub))| *is_pub)
-            .map(|(k, (t, _))| (k.clone(), TypeDisplay { ty: t, defs: &c.defs }.to_string()))
+            .map(|(k, (t, _))| {
+                (
+                    k.clone(),
+                    TypeDisplay {
+                        ty: t,
+                        defs: &c.defs,
+                    }
+                    .to_string(),
+                )
+            })
             .collect(),
         float_literals: c.float_literals,
         value_rows: c.value_rows.clone(),
@@ -1003,12 +1015,12 @@ impl Checker {
         match self.type_module.get(&name.name).cloned() {
             Some(there) if there != here => {
                 self.error_help(
-                name.span,
-                format!(
-                    "duplicate type name `{}` — `{there}` declares one too",
-                    name.name
-                ),
-                "types share one namespace across the whole program ([T-MODULE-NS]), \
+                    name.span,
+                    format!(
+                        "duplicate type name `{}` — `{there}` declares one too",
+                        name.name
+                    ),
+                    "types share one namespace across the whole program ([T-MODULE-NS]), \
 so two packages cannot each declare a type of the same name — rename one, or, \
 if you own neither, ask whichever is yours to prefix its types",
                 );
@@ -1099,7 +1111,8 @@ already reachable from every module — drop the `pub`",
         }
         self.pending_aliases
             .push((self.current_module.clone(), alias_decls));
-        self.pending_type_bodies.push((self.current_module.clone(), ids));
+        self.pending_type_bodies
+            .push((self.current_module.clone(), ids));
     }
 
     /// Fills in the *bodies* of the types registered by `collect_types`.
@@ -1254,7 +1267,10 @@ already reachable from every module — drop the `pub`",
                         for f in fields {
                             let ty = self.resolve_type(&f.ty, &generics);
                             if fs.iter().any(|(n, _)| n == &f.name.name) {
-                                self.error(f.name.span, format!("duplicate field `{}`", f.name.name));
+                                self.error(
+                                    f.name.span,
+                                    format!("duplicate field `{}`", f.name.name),
+                                );
                                 continue;
                             }
                             fs.push((f.name.name.clone(), ty));
@@ -1309,9 +1325,7 @@ already reachable from every module — drop the `pub`",
                 // dependency must not be able to write it away.
                 if matches!(
                     e.name.name.as_str(),
-                    crate::effects::IO
-                        | crate::effects::ASYNC
-                        | crate::effects::UNSAFE
+                    crate::effects::IO | crate::effects::ASYNC | crate::effects::UNSAFE
                 ) {
                     self.error_help(
                         e.name.span,
@@ -1337,9 +1351,7 @@ not effects a program declares or handles — there is no `with io handled_by` \
                 // here. The name set is filled in the pass that collected the
                 // declaration, which is the pass this has to agree with.
                 for clash in [e.name.name.clone(), format!("{}Handler", e.name.name)] {
-                    if self.defs.by_name.contains_key(&clash)
-                        || self.alias_names.contains(&clash)
-                    {
+                    if self.defs.by_name.contains_key(&clash) || self.alias_names.contains(&clash) {
                         let what = if clash == e.name.name {
                             format!("effect `{clash}` collides with a type of that name")
                         } else {
@@ -1379,8 +1391,11 @@ land in a copy the caller never sees — return the new value from the operation
                             );
                         }
                     }
-                    let params: Vec<Type> =
-                        op.params.iter().map(|p| self.resolve_type(&p.ty, &[])).collect();
+                    let params: Vec<Type> = op
+                        .params
+                        .iter()
+                        .map(|p| self.resolve_type(&p.ty, &[]))
+                        .collect();
                     let mut ret = op
                         .ret
                         .as_ref()
@@ -1630,11 +1645,7 @@ different name, or call it as a method if you meant to extend a type (UFCS)",
     /// Whether a written type reaches `name`, or any other alias that is also
     /// stuck, so a mutually recursive pair is reported as such rather than as
     /// two unknown names.
-    fn names_itself(
-        te: &TypeExpr,
-        name: &str,
-        stuck: &std::collections::HashSet<String>,
-    ) -> bool {
+    fn names_itself(te: &TypeExpr, name: &str, stuck: &std::collections::HashSet<String>) -> bool {
         match te {
             TypeExpr::Name { path, args, .. } => {
                 let here = path
@@ -1661,11 +1672,17 @@ different name, or call it as a method if you meant to extend a type (UFCS)",
 
     fn resolve_type(&mut self, te: &TypeExpr, generics: &[String]) -> Type {
         match te {
-            TypeExpr::Ref(inner, _) => {
-                Type::Ref(Box::new(self.resolve_type(inner, generics)))
-            }
-            TypeExpr::Fn { params, ret, effects, .. } => {
-                let ps = params.iter().map(|p| self.resolve_type(p, generics)).collect();
+            TypeExpr::Ref(inner, _) => Type::Ref(Box::new(self.resolve_type(inner, generics))),
+            TypeExpr::Fn {
+                params,
+                ret,
+                effects,
+                ..
+            } => {
+                let ps = params
+                    .iter()
+                    .map(|p| self.resolve_type(p, generics))
+                    .collect();
                 // The row is part of the type, not decoration on the syntax.
                 // A bare `fn(i64) -> i64` is the *empty* row, which is what
                 // makes it reject a function that prints ([T-FN-TYPE-ROW]).
@@ -1728,7 +1745,8 @@ different name, or call it as a method if you meant to extend a type (UFCS)",
                         .map(|a| self.resolve_type(a, generics))
                         .collect();
                     if resolved_args.len() != 2 {
-                        return self.error(*span, "`Map` takes exactly 2 type arguments: Map[K, V]");
+                        return self
+                            .error(*span, "`Map` takes exactly 2 type arguments: Map[K, V]");
                     }
                     self.require_map_key(&resolved_args[0], *span);
                     return Type::Map(
@@ -1889,9 +1907,7 @@ different name, or call it as a method if you meant to extend a type (UFCS)",
                 };
                 t || f
             }
-            Expr::Match { arms, .. } => {
-                arms.iter().any(|a| self.branch_calls_fallible(&a.body))
-            }
+            Expr::Match { arms, .. } => arms.iter().any(|a| self.branch_calls_fallible(&a.body)),
             _ => false,
         }
     }
@@ -1914,19 +1930,14 @@ different name, or call it as a method if you meant to extend a type (UFCS)",
             Type::Fallible(..) => true,
             Type::List(e) | Type::Ref(e) => self.holds_fallible_at(&e, depth + 1),
             Type::Map(_, v) => self.holds_fallible_at(&v, depth + 1),
-            Type::Tuple(parts) => parts
-                .iter()
-                .any(|p| self.holds_fallible_at(p, depth + 1)),
+            Type::Tuple(parts) => parts.iter().any(|p| self.holds_fallible_at(p, depth + 1)),
             // `Some(save())`, `Report{ written: save() }`, `W(save())` — one
             // constructor was enough to launder a failure past the rule, and
             // the recursion stopped at the type-argument boundary so even a
             // list of them slipped through. A named type's arguments and its
             // own fields carry values like any other container.
             Type::Named { id, args } => {
-                if args
-                    .iter()
-                    .any(|a| self.holds_fallible_at(a, depth + 1))
-                {
+                if args.iter().any(|a| self.holds_fallible_at(a, depth + 1)) {
                     return true;
                 }
                 let fields: Vec<Type> = match &self.defs.get(id).kind {
@@ -1938,9 +1949,7 @@ different name, or call it as a method if you meant to extend a type (UFCS)",
                         .flat_map(|v| v.fields.iter().map(|(_, t)| t.clone()))
                         .collect(),
                 };
-                fields
-                    .iter()
-                    .any(|f| self.holds_fallible_at(f, depth + 1))
+                fields.iter().any(|f| self.holds_fallible_at(f, depth + 1))
             }
             _ => false,
         }
@@ -2021,13 +2030,12 @@ different name, or call it as a method if you meant to extend a type (UFCS)",
             f.body.stmts.last(),
             Some(Stmt::Expr(
                 Expr::Int(..) | Expr::Float(..) | Expr::List(..) | Expr::Tuple(..) | Expr::Map(..)
-            ))
-        // An `if` or a `match` none of whose branches builds the whole
-        // `T ! E` produces the ok half, so the ok half is what reaches them.
-        // Without this `fn f(n: i64) -> f64 ! E { if c { 4.5 } else { 6 } }`
-        // was refused for branches "of different types" while the same body
-        // with a plain `-> f64` compiled — [T-INT-TO-FLOAT-CARRIED] names an
-        // `if`'s branches and a `match`'s arms explicitly.
+            )) // An `if` or a `match` none of whose branches builds the whole
+               // `T ! E` produces the ok half, so the ok half is what reaches them.
+               // Without this `fn f(n: i64) -> f64 ! E { if c { 4.5 } else { 6 } }`
+               // was refused for branches "of different types" while the same body
+               // with a plain `-> f64` compiled — [T-INT-TO-FLOAT-CARRIED] names an
+               // `if`'s branches and a `match`'s arms explicitly.
         ) || matches!(
             f.body.stmts.last(),
             Some(Stmt::Expr(e)) if yields_ok_half(e) && !self.branch_calls_fallible(e)
@@ -2143,30 +2151,28 @@ is a failure nothing reports",
         // `T ! E`, which is what `Ok(v)` and `Err(e)` build ([T-OK-ERR]).
         // Only the first was accepted, so the constructors worked everywhere
         // except the position a function's own result is written in.
-        let whole = self.fn_err.clone().map(|e| {
-            Type::Fallible(Box::new(ret.clone()), Box::new(e))
-        });
-        let fits_whole = whole
-            .as_ref()
-            .is_some_and(|w| self.uni.unify(&body_ty, w));
+        let whole = self
+            .fn_err
+            .clone()
+            .map(|e| Type::Fallible(Box::new(ret.clone()), Box::new(e)));
+        let fits_whole = whole.as_ref().is_some_and(|w| self.uni.unify(&body_ty, w));
         // The row check has to run here too: a function body's value is
         // compared with `unify`, not `check_expr`, so returning a named
         // function was the one coercion nothing looked at.
         if !ends_with_return {
             self.check_row_fits(&body_ty, &ret, f.body.span);
         }
-        if ret != Type::Unit && !ends_with_return && !fits_whole && !self.uni.unify(&body_ty, &ret) {
-            let span = f
-                .body
-                .stmts
-                .last()
-                .map(stmt_span)
-                .unwrap_or(f.body.span);
+        if ret != Type::Unit && !ends_with_return && !fits_whole && !self.uni.unify(&body_ty, &ret)
+        {
+            let span = f.body.stmts.last().map(stmt_span).unwrap_or(f.body.span);
             let want = self.show(&ret);
             let got = self.show(&body_ty);
             self.error_help(
                 span,
-                format!("function `{}` must return `{want}` but its body produces `{got}`", f.name.name),
+                format!(
+                    "function `{}` must return `{want}` but its body produces `{got}`",
+                    f.name.name
+                ),
                 "the last expression of the body is the return value",
             );
         }
@@ -2190,7 +2196,11 @@ is a failure nothing reports",
     fn is_int_literal(e: &Expr) -> bool {
         match e {
             Expr::Int(..) => true,
-            Expr::Unary { op: UnaryOp::Neg, expr, .. } => matches!(**expr, Expr::Int(..)),
+            Expr::Unary {
+                op: UnaryOp::Neg,
+                expr,
+                ..
+            } => matches!(**expr, Expr::Int(..)),
             _ => false,
         }
     }
@@ -2207,7 +2217,11 @@ is a failure nothing reports",
     fn defers_to_its_context(e: &Expr) -> bool {
         match e {
             Expr::Int(..) => true,
-            Expr::Unary { op: UnaryOp::Neg, expr, .. } => Self::defers_to_its_context(expr),
+            Expr::Unary {
+                op: UnaryOp::Neg,
+                expr,
+                ..
+            } => Self::defers_to_its_context(expr),
             Expr::List(items, _) | Expr::Tuple(items, _) => {
                 !items.is_empty() && items.iter().all(Self::defers_to_its_context)
             }
@@ -2591,8 +2605,7 @@ closing brace — yield a number from the region and return that",
                             || matches!(e, Expr::If { .. } | Expr::Match { .. });
                         match (wrapped, self.fn_err.clone()) {
                             (true, Some(err)) => {
-                                let whole =
-                                    Type::Fallible(Box::new(ret.clone()), Box::new(err));
+                                let whole = Type::Fallible(Box::new(ret.clone()), Box::new(err));
                                 self.check_expr(e, &whole);
                             }
                             _ => self.check_expr(e, &ret),
@@ -2827,7 +2840,9 @@ closing brace — yield a number from the region and return that",
                             id.name
                         ),
                     )
-                    .with_help("move a copy instead, or restructure so the move happens outside the loop"),
+                    .with_help(
+                        "move a copy instead, or restructure so the move happens outside the loop",
+                    ),
                 );
             } else {
                 b.moved = true;
@@ -2895,9 +2910,7 @@ closing brace — yield a number from the region and return that",
                     || self.carries(&ret, want_fn, seen)
             }
             Type::List(e) => self.carries(&e, want_fn, seen),
-            Type::Map(k, v) => {
-                self.carries(&k, want_fn, seen) || self.carries(&v, want_fn, seen)
-            }
+            Type::Map(k, v) => self.carries(&k, want_fn, seen) || self.carries(&v, want_fn, seen),
             Type::Tuple(items) => items.iter().any(|i| self.carries(i, want_fn, seen)),
             Type::Fallible(a, b) => {
                 self.carries(&a, want_fn, seen) || self.carries(&b, want_fn, seen)
@@ -2968,12 +2981,7 @@ closing brace — yield a number from the region and return that",
         // accepted, and calling it back out ran libc from a function
         // declaring nothing.
         if self.extern_names.contains(&key) {
-            return Some(
-                ["io", "unsafe"]
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect(),
-            );
+            return Some(["io", "unsafe"].iter().map(|s| s.to_string()).collect());
         }
         self.fn_rows.get(&key).cloned()
     }
@@ -3021,8 +3029,16 @@ closing brace — yield a number from the region and return that",
                 return;
             }
             (
-                Type::Fn { ret: ar, params: ap, .. },
-                Type::Fn { ret: br, params: bp, .. },
+                Type::Fn {
+                    ret: ar,
+                    params: ap,
+                    ..
+                },
+                Type::Fn {
+                    ret: br,
+                    params: bp,
+                    ..
+                },
             ) => {
                 // A function's result may itself be a function.
                 self.check_row_fits(ar, br, span);
@@ -3040,7 +3056,14 @@ closing brace — yield a number from the region and return that",
             }
             _ => {}
         }
-        let (Type::Fn { row: Some(have), .. }, Type::Fn { row: Some(allowed), .. }) = (&g, &w)
+        let (
+            Type::Fn {
+                row: Some(have), ..
+            },
+            Type::Fn {
+                row: Some(allowed), ..
+            },
+        ) = (&g, &w)
         else {
             return;
         };
@@ -3140,10 +3163,7 @@ that does not change",
         let Some(&floor) = self.region_floors.last() else {
             return;
         };
-        let declared_at = self
-            .scopes
-            .iter()
-            .rposition(|sc| sc.contains_key(&id.name));
+        let declared_at = self.scopes.iter().rposition(|sc| sc.contains_key(&id.name));
         if declared_at.is_some_and(|d| d < floor) {
             self.error_help(
                 id.span,
@@ -3205,11 +3225,7 @@ declaration into the region, or compute a number and yield that",
             root = recv;
         }
         let Expr::Ident(id) = root else { return };
-        let Some(declared_at) = self
-            .scopes
-            .iter()
-            .rposition(|sc| sc.contains_key(&id.name))
-        else {
+        let Some(declared_at) = self.scopes.iter().rposition(|sc| sc.contains_key(&id.name)) else {
             return;
         };
         let row = self.row_carried_by(value_ty);
@@ -3239,8 +3255,7 @@ afterwards has nowhere to send the effect — call it here, or return what it co
     /// does.
     fn reject_handler_escape_through_call(&mut self, args: &[Expr], info: &FnInfo, span: Span) {
         // Which effects this call could carry out, and where they came from.
-        let mut carried: std::collections::BTreeSet<String> =
-            std::collections::BTreeSet::new();
+        let mut carried: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         for (a, p) in args.iter().zip(&info.params) {
             carried.extend(self.row_carried_by(p));
             // A closure literal's row is known from the effect pass, and a
@@ -3258,10 +3273,7 @@ afterwards has nowhere to send the effect — call it here, or return what it co
                 continue;
             }
             let Some(id) = place_root(a) else { continue };
-            let Some(declared_at) = self
-                .scopes
-                .iter()
-                .rposition(|sc| sc.contains_key(&id.name))
+            let Some(declared_at) = self.scopes.iter().rposition(|sc| sc.contains_key(&id.name))
             else {
                 continue;
             };
@@ -3319,9 +3331,7 @@ afterwards has nowhere to send the effect — call it here, or return what it co
                 return Some(self.uni.resolve(whole));
             }
             // An integer literal adopts the ok half's float.
-            if ok == Type::F64
-                && matches!(self.uni.shallow_resolve(half), Type::I64)
-            {
+            if ok == Type::F64 && matches!(self.uni.shallow_resolve(half), Type::I64) {
                 if let Some(e) = half_at.and_then(Self::int_literal_tail) {
                     self.float_literals.insert(e.span().start);
                     return Some(self.uni.resolve(whole));
@@ -3391,9 +3401,7 @@ afterwards has nowhere to send the effect — call it here, or return what it co
                     stack.push(self.uni.resolve(&k));
                     stack.push(self.uni.resolve(&v));
                 }
-                Type::Tuple(items) => {
-                    stack.extend(items.iter().map(|i| self.uni.resolve(i)))
-                }
+                Type::Tuple(items) => stack.extend(items.iter().map(|i| self.uni.resolve(i))),
                 Type::Fallible(a, b) => {
                     stack.push(self.uni.resolve(&a));
                     stack.push(self.uni.resolve(&b));
@@ -3413,9 +3421,7 @@ afterwards has nowhere to send the effect — call it here, or return what it co
                         }
                         TypeDefKind::Sum { variants } => {
                             for v in variants {
-                                stack.extend(
-                                    v.fields.iter().map(|(_, t)| self.uni.resolve(t)),
-                                );
+                                stack.extend(v.fields.iter().map(|(_, t)| self.uni.resolve(t)));
                             }
                         }
                     }
@@ -3425,7 +3431,6 @@ afterwards has nowhere to send the effect — call it here, or return what it co
         }
         out
     }
-
 
     /// What to demand of one branch of an `if` whose whole value is `want`.
     ///
@@ -3475,7 +3480,9 @@ afterwards has nowhere to send the effect — call it here, or return what it co
         }
         match b.stmts.last() {
             None => {}
-            Some(Stmt::Expr(_)) | Some(Stmt::Return(..)) | Some(Stmt::Break(_))
+            Some(Stmt::Expr(_))
+            | Some(Stmt::Return(..))
+            | Some(Stmt::Break(_))
             | Some(Stmt::Continue(_)) => return,
             Some(_) => {}
         }
@@ -3587,7 +3594,15 @@ write back to — copy it into a local first, as in `var {} = {}`",
             self.float_literals.insert(e.span().start);
             return;
         }
-        if let (Expr::Unary { op: UnaryOp::Neg, expr, .. }, Type::F64) = (e, &want) {
+        if let (
+            Expr::Unary {
+                op: UnaryOp::Neg,
+                expr,
+                ..
+            },
+            Type::F64,
+        ) = (e, &want)
+        {
             if matches!(**expr, Expr::Int(..)) {
                 self.float_literals.insert(expr.span().start);
                 return;
@@ -3612,7 +3627,8 @@ write back to — copy it into a local first, as in `var {} = {}`",
                 // `([], "x")` and `if c { [] } else { … }` all checked and ran
                 // and could not be built ([T-EMPTY-LIT]).
                 if items.is_empty() {
-                    self.empty_lits.push((span.start, span.end - span.start, elem));
+                    self.empty_lits
+                        .push((span.start, span.end - span.start, elem));
                 }
                 return;
             }
@@ -3644,9 +3660,13 @@ write back to — copy it into a local first, as in `var {} = {}`",
             (Expr::Call { callee, args, .. }, _) if args.len() == 1 => {
                 if let Expr::Ident(id) = &**callee {
                     let inner = match (id.name.as_str(), &want) {
-                        ("Some", Type::Named { id: nid, args: targs })
-                            if self.defs.get(*nid).name == "Option" && targs.len() == 1 =>
-                        {
+                        (
+                            "Some",
+                            Type::Named {
+                                id: nid,
+                                args: targs,
+                            },
+                        ) if self.defs.get(*nid).name == "Option" && targs.len() == 1 => {
                             Some(targs[0].clone())
                         }
                         ("Ok", Type::Fallible(ok, _)) => Some((**ok).clone()),
@@ -3727,7 +3747,9 @@ write back to — copy it into a local first, as in `var {} = {}`",
                     let _ = first;
                     self.error_help(
                         e.span(),
-                        format!("this closure performs {list}, which the expected type does not allow"),
+                        format!(
+                            "this closure performs {list}, which the expected type does not allow"
+                        ),
                         "widen the type's effect row, or move the effect out of the closure",
                     );
                 }
@@ -3774,16 +3796,16 @@ write back to — copy it into a local first, as in `var {} = {}`",
             let got_r = self.uni.shallow_resolve(got);
             let g = self.show(got);
             let w = self.show(want);
-            if matches!(got_r, Type::Fallible(..)) && !matches!(self.uni.shallow_resolve(want), Type::Fallible(..)) {
+            if matches!(got_r, Type::Fallible(..))
+                && !matches!(self.uni.shallow_resolve(want), Type::Fallible(..))
+            {
                 self.error_help(
                     span,
                     format!("this expression can fail (`{g}`) but `{w}` is required"),
                     "use `try` to propagate the error or `match` to handle it",
                 );
-            } else if let (
-                Type::Fn { ret: got_ret, .. },
-                Type::Fn { ret: want_ret, .. },
-            ) = (&got_r, &self.uni.shallow_resolve(want))
+            } else if let (Type::Fn { ret: got_ret, .. }, Type::Fn { ret: want_ret, .. }) =
+                (&got_r, &self.uni.shallow_resolve(want))
             {
                 // A fallible function passed where a plain one is wanted. The
                 // types alone do not say what to do about it, and the answer
@@ -4040,7 +4062,8 @@ allocates could outlive it — move the work out of the region, or yield a numbe
                     self.check_expr(item, &elem);
                 }
                 if items.is_empty() {
-                    self.empty_lits.push((span.start, span.end - span.start, elem.clone()));
+                    self.empty_lits
+                        .push((span.start, span.end - span.start, elem.clone()));
                 }
                 Type::List(Box::new(elem))
             }
@@ -4210,9 +4233,9 @@ allocates could outlive it — move the work out of the region, or yield a numbe
                                 },
                                 ElseBranch::ElseIf(inner) => Some(inner),
                             };
-                            if let Some(t) = self.merge_fallible_branches_at(
-                                &then_ty, &else_ty, then_at, else_at,
-                            ) {
+                            if let Some(t) = self
+                                .merge_fallible_branches_at(&then_ty, &else_ty, then_at, else_at)
+                            {
                                 return t;
                             }
                             // An integer literal branch adopts the other's
@@ -4365,7 +4388,10 @@ only a number or a `bool` can come out — compute what you need and yield that"
                 }
                 return self.error_help(
                     id.span,
-                    format!("`{}` is ambiguous — it names a variant of multiple types", id.name),
+                    format!(
+                        "`{}` is ambiguous — it names a variant of multiple types",
+                        id.name
+                    ),
                     "qualify it as `TypeName.Variant`",
                 );
             }
@@ -4478,7 +4504,8 @@ only a number or a `bool` can come out — compute what you need and yield that"
         // it, exactly as it may for an empty literal — and resolved at the end
         // with the same machinery.
         if generics > 0 {
-            self.generic_ctors.push((span.start, span.end - span.start, built.clone()));
+            self.generic_ctors
+                .push((span.start, span.end - span.start, built.clone()));
         }
         built
     }
@@ -4496,10 +4523,7 @@ only a number or a `bool` can come out — compute what you need and yield that"
         };
         let def = self.defs.get(def_id);
         let generics = def.generics.len();
-        let TypeDefKind::Struct {
-            fields: def_fields,
-        } = def.kind.clone()
-        else {
+        let TypeDefKind::Struct { fields: def_fields } = def.kind.clone() else {
             return self.error_help(
                 name.span,
                 format!("`{tname}` is not a struct"),
@@ -4547,7 +4571,10 @@ only a number or a `bool` can come out — compute what you need and yield that"
                 .map(|s| format!("`{s}`"))
                 .collect::<Vec<_>>()
                 .join(", ");
-            self.error(span, format!("missing field(s) {list} in `{tname}` literal"));
+            self.error(
+                span,
+                format!("missing field(s) {list} in `{tname}` literal"),
+            );
         }
         Type::Named {
             id: def_id,
@@ -4632,8 +4659,8 @@ only a number or a `bool` can come out — compute what you need and yield that"
                     // `str`, so reaching the network needed no pointer type —
                     // which would have been a far larger change to the language
                     // than the network itself ([L-LIB-NET]).
-                    "tcp_listen" | "tcp_accept" | "tcp_read" | "tcp_read_bytes"
-                    | "net_port" | "udp_bind" | "udp_recv" => {
+                    "tcp_listen" | "tcp_accept" | "tcp_read" | "tcp_read_bytes" | "net_port"
+                    | "udp_bind" | "udp_recv" => {
                         let (want, gives) = match id.name.as_str() {
                             "tcp_listen" => (Type::I64, Type::I64),
                             "udp_bind" => (Type::I64, Type::I64),
@@ -4644,10 +4671,8 @@ only a number or a `bool` can come out — compute what you need and yield that"
                             _ => (Type::I64, Type::Str),
                         };
                         if args.len() != 1 {
-                            return self.error(
-                                span,
-                                format!("{} takes exactly 1 argument", id.name),
-                            );
+                            return self
+                                .error(span, format!("{} takes exactly 1 argument", id.name));
                         }
                         self.check_expr(&args[0], &want);
                         let io_err = Type::Named {
@@ -4674,8 +4699,7 @@ only a number or a `bool` can come out — compute what you need and yield that"
                             id: self.defs.io_error_id,
                             args: vec![],
                         };
-                        let triple =
-                            Type::Tuple(vec![Type::Bytes, Type::Str, Type::I64]);
+                        let triple = Type::Tuple(vec![Type::Bytes, Type::Str, Type::I64]);
                         return Type::Fallible(Box::new(triple), Box::new(io_err));
                     }
                     // Running another program. The result is a tuple rather
@@ -4685,10 +4709,8 @@ only a number or a `bool` can come out — compute what you need and yield that"
                     // ([L-LIB-PROC]).
                     "proc_run" => {
                         if args.len() != 2 {
-                            return self.error(
-                                span,
-                                "proc_run takes 2 arguments (program, arguments)",
-                            );
+                            return self
+                                .error(span, "proc_run takes 2 arguments (program, arguments)");
                         }
                         self.check_expr(&args[0], &Type::Str);
                         self.check_expr(&args[1], &Type::List(Box::new(Type::Str)));
@@ -4707,10 +4729,7 @@ only a number or a `bool` can come out — compute what you need and yield that"
                             return self
                                 .error(span, "proc_pipeline takes 2 arguments (stages, input)");
                         }
-                        let stage = Type::Tuple(vec![
-                            Type::Str,
-                            Type::List(Box::new(Type::Str)),
-                        ]);
+                        let stage = Type::Tuple(vec![Type::Str, Type::List(Box::new(Type::Str))]);
                         self.check_expr(&args[0], &Type::List(Box::new(stage)));
                         self.check_expr(&args[1], &Type::Str);
                         let io_err = Type::Named {
@@ -4726,10 +4745,8 @@ only a number or a `bool` can come out — compute what you need and yield that"
                     // needed no new type either ([L-LIB-NET]).
                     "net_wait" => {
                         if args.len() != 2 {
-                            return self.error(
-                                span,
-                                "net_wait takes 2 arguments (handles, timeout_ms)",
-                            );
+                            return self
+                                .error(span, "net_wait takes 2 arguments (handles, timeout_ms)");
                         }
                         let handles = Type::List(Box::new(Type::I64));
                         self.check_expr(&args[0], &handles);
@@ -4766,8 +4783,7 @@ only a number or a `bool` can come out — compute what you need and yield that"
                     // be a server and could not be a client.
                     "tcp_connect" => {
                         if args.len() != 2 {
-                            return self
-                                .error(span, "tcp_connect takes 2 arguments (host, port)");
+                            return self.error(span, "tcp_connect takes 2 arguments (host, port)");
                         }
                         self.check_expr(&args[0], &Type::Str);
                         self.check_expr(&args[1], &Type::I64);
@@ -4778,7 +4794,11 @@ only a number or a `bool` can come out — compute what you need and yield that"
                         return Type::Fallible(Box::new(Type::I64), Box::new(io_err));
                     }
                     "tcp_write" | "tcp_write_bytes" => {
-                        let what = if id.name == "tcp_write" { "text" } else { "bytes" };
+                        let what = if id.name == "tcp_write" {
+                            "text"
+                        } else {
+                            "bytes"
+                        };
                         if args.len() != 2 {
                             return self.error(
                                 span,
@@ -4818,7 +4838,8 @@ only a number or a `bool` can come out — compute what you need and yield that"
                     }
                     "write_file" => {
                         if args.len() != 2 {
-                            return self.error(span, "write_file takes 2 arguments (path, content)");
+                            return self
+                                .error(span, "write_file takes 2 arguments (path, content)");
                         }
                         self.check_expr(&args[0], &Type::Str);
                         self.check_expr(&args[1], &Type::Str);
@@ -4902,8 +4923,7 @@ only a number or a `bool` can come out — compute what you need and yield that"
                     }
                     "file_size" => {
                         if args.len() != 1 {
-                            return self
-                                .error(span, "file_size takes exactly 1 argument (path)");
+                            return self.error(span, "file_size takes exactly 1 argument (path)");
                         }
                         self.check_expr(&args[0], &Type::Str);
                         let io_err = Type::Named {
@@ -4927,8 +4947,7 @@ only a number or a `bool` can come out — compute what you need and yield that"
                     }
                     "sync_file" => {
                         if args.len() != 1 {
-                            return self
-                                .error(span, "sync_file takes exactly 1 argument (path)");
+                            return self.error(span, "sync_file takes exactly 1 argument (path)");
                         }
                         self.check_expr(&args[0], &Type::Str);
                         let io_err = Type::Named {
@@ -4939,8 +4958,7 @@ only a number or a `bool` can come out — compute what you need and yield that"
                     }
                     "rename_file" => {
                         if args.len() != 2 {
-                            return self
-                                .error(span, "rename_file takes 2 arguments (from, to)");
+                            return self.error(span, "rename_file takes 2 arguments (from, to)");
                         }
                         self.check_expr(&args[0], &Type::Str);
                         self.check_expr(&args[1], &Type::Str);
@@ -4952,8 +4970,7 @@ only a number or a `bool` can come out — compute what you need and yield that"
                     }
                     "write_bytes" => {
                         if args.len() != 2 {
-                            return self
-                                .error(span, "write_bytes takes 2 arguments (path, bytes)");
+                            return self.error(span, "write_bytes takes 2 arguments (path, bytes)");
                         }
                         self.check_expr(&args[0], &Type::Str);
                         self.check_expr(&args[1], &Type::Bytes);
@@ -4965,8 +4982,10 @@ only a number or a `bool` can come out — compute what you need and yield that"
                     }
                     "make_dir" | "remove_file" => {
                         if args.len() != 1 {
-                            return self
-                                .error(span, format!("{} takes exactly 1 argument (path)", id.name));
+                            return self.error(
+                                span,
+                                format!("{} takes exactly 1 argument (path)", id.name),
+                            );
                         }
                         self.check_expr(&args[0], &Type::Str);
                         let io_err = Type::Named {
@@ -4997,7 +5016,10 @@ only a number or a `bool` can come out — compute what you need and yield that"
                     }
                     "map" => {
                         if !args.is_empty() {
-                            return self.error(span, "map() takes no arguments — add entries with .set(k, v)");
+                            return self.error(
+                                span,
+                                "map() takes no arguments — add entries with .set(k, v)",
+                            );
                         }
                         let k = self.uni.fresh();
                         let v = self.uni.fresh();
@@ -5007,7 +5029,8 @@ only a number or a `bool` can come out — compute what you need and yield that"
                         // answered anyway and the backend refused. Registering
                         // it here is what holds both engines to one answer.
                         let t = Type::Map(Box::new(k), Box::new(v));
-                        self.empty_lits.push((span.start, span.end - span.start, t.clone()));
+                        self.empty_lits
+                            .push((span.start, span.end - span.start, t.clone()));
                         return t;
                     }
                     // The two constants the math methods are useless
@@ -5018,10 +5041,7 @@ only a number or a `bool` can come out — compute what you need and yield that"
                     // break working programs.
                     "pi" | "e" if self.lookup_fn(&id.name).is_none() => {
                         if !args.is_empty() {
-                            return self.error(
-                                span,
-                                format!("{} takes no arguments", id.name),
-                            );
+                            return self.error(span, format!("{} takes no arguments", id.name));
                         }
                         return Type::F64;
                     }
@@ -5084,21 +5104,24 @@ only a number or a `bool` can come out — compute what you need and yield that"
                     }
                     "sleep_millis" => {
                         if args.len() != 1 {
-                            return self.error(span, "sleep_millis takes 1 argument (milliseconds)");
+                            return self
+                                .error(span, "sleep_millis takes 1 argument (milliseconds)");
                         }
                         self.check_expr(&args[0], &Type::I64);
                         return Type::Unit;
                     }
                     "env" => {
                         if args.len() != 1 {
-                            return self.error(span, "env takes exactly 1 argument (the variable name)");
+                            return self
+                                .error(span, "env takes exactly 1 argument (the variable name)");
                         }
                         self.check_expr(&args[0], &Type::Str);
                         return self.defs.option_some(Type::Str);
                     }
                     "exit" => {
                         if args.len() != 1 {
-                            return self.error(span, "exit takes exactly 1 argument (the status code)");
+                            return self
+                                .error(span, "exit takes exactly 1 argument (the status code)");
                         }
                         self.check_expr(&args[0], &Type::I64);
                         return self.uni.fresh(); // diverges
@@ -5115,10 +5138,8 @@ only a number or a `bool` can come out — compute what you need and yield that"
                     // a trampoline function whose whole body was `v`.
                     "Ok" | "Err" => {
                         if args.len() != 1 {
-                            return self.error(
-                                span,
-                                format!("`{}` takes exactly 1 argument", id.name),
-                            );
+                            return self
+                                .error(span, format!("`{}` takes exactly 1 argument", id.name));
                         }
                         let inner = self.infer_expr(&args[0]);
                         let other = self.uni.fresh();
@@ -5130,7 +5151,8 @@ only a number or a `bool` can come out — compute what you need and yield that"
                     }
                     "fail" => {
                         if args.len() != 1 {
-                            return self.error(span, "fail takes exactly 1 argument (the error value)");
+                            return self
+                                .error(span, "fail takes exactly 1 argument (the error value)");
                         }
                         // `fail` leaves the region carrying a value, the same
                         // as `return` — and its payload is usually built right
@@ -5153,7 +5175,9 @@ fail outside it",
                                     let d = self.show(&declared);
                                     self.error_help(
                                         span,
-                                        format!("`fail` raises `{e}` but this function declares `{d}`"),
+                                        format!(
+                                            "`fail` raises `{e}` but this function declares `{d}`"
+                                        ),
                                         "add the error type to the function's `!` clause",
                                     );
                                 }
@@ -5266,13 +5290,7 @@ fail outside it",
     /// `region { lib.cfg_user() }` was accepted — the handler is written
     /// outside the region and may keep what it is given, which is exactly how
     /// a value allocated inside gets out.
-    fn check_region_call_in(
-        &mut self,
-        owner: &str,
-        name: &str,
-        args: &[Expr],
-        span: Span,
-    ) {
+    fn check_region_call_in(&mut self, owner: &str, name: &str, args: &[Expr], span: Span) {
         if self.region_depth == 0 {
             return;
         }
@@ -5415,9 +5433,10 @@ fail outside it",
                     // eliminate — after the snapshot had already emptied the
                     // component.
                     if let Some((_, segs)) = place_path(a) {
-                        if segs.iter().any(|s| matches!(s, PlaceSeg::Field(f)
-                            if f.chars().all(|c| c.is_ascii_digit())))
-                        {
+                        if segs.iter().any(|s| {
+                            matches!(s, PlaceSeg::Field(f)
+                            if f.chars().all(|c| c.is_ascii_digit()))
+                        }) {
                             self.error_help(
                                 a.span(),
                                 "cannot pass a tuple component as `inout`".to_string(),
@@ -5528,10 +5547,7 @@ parts have names worth writing",
         }
         let ret = substitute_generics(&info.ret, &fresh);
         match &info.err {
-            Some(err) => Type::Fallible(
-                Box::new(ret),
-                Box::new(substitute_generics(err, &fresh)),
-            ),
+            Some(err) => Type::Fallible(Box::new(ret), Box::new(substitute_generics(err, &fresh))),
             None => ret,
         }
     }
@@ -5599,7 +5615,10 @@ parts have names worth writing",
                         }
                         return self.error_help(
                             name.span,
-                            format!("constant `{}` in module `{target_mod}` is private", name.name),
+                            format!(
+                                "constant `{}` in module `{target_mod}` is private",
+                                name.name
+                            ),
                             "mark it `pub let` to allow cross-module use",
                         );
                     }
@@ -5622,10 +5641,9 @@ parts have names worth writing",
                     match self.fns.get(&qual).cloned() {
                         Some(info) if info.is_pub => {
                             let ret = match &info.err {
-                                Some(e) => Type::Fallible(
-                                    Box::new(info.ret.clone()),
-                                    Box::new(e.clone()),
-                                ),
+                                Some(e) => {
+                                    Type::Fallible(Box::new(info.ret.clone()), Box::new(e.clone()))
+                                }
                                 None => info.ret.clone(),
                             };
                             // A generic's type parameters are instantiated
@@ -5674,10 +5692,7 @@ parts have names worth writing",
                         None => {
                             return self.error(
                                 name.span,
-                                format!(
-                                    "module `{target_mod}` has no function `{}`",
-                                    name.name
-                                ),
+                                format!("module `{target_mod}` has no function `{}`", name.name),
                             );
                         }
                     }
@@ -5794,21 +5809,12 @@ parts have names worth writing",
                     defs: &self.defs,
                 }
                 .to_string();
-                self.error(
-                    name.span,
-                    format!("`{shown}` has no field `{}`", name.name),
-                )
+                self.error(name.span, format!("`{shown}` has no field `{}`", name.name))
             }
         }
     }
 
-    fn infer_method_call(
-        &mut self,
-        recv: &Expr,
-        name: &Ident,
-        args: &[Expr],
-        span: Span,
-    ) -> Type {
+    fn infer_method_call(&mut self, recv: &Expr, name: &Ident, args: &[Expr], span: Span) -> Type {
         // Cross-module qualified call `utils.helper(...)`.
         if let Expr::Ident(tid) = recv {
             if self.lookup(&tid.name).is_none() {
@@ -5824,9 +5830,7 @@ parts have names worth writing",
                             // Belt and braces for [T-UNSAFE-FFI]: a C
                             // function reached through a qualifier is still a
                             // C function.
-                            if self.unsafe_depth == 0
-                                && self.extern_names.contains(&qual)
-                            {
+                            if self.unsafe_depth == 0 && self.extern_names.contains(&qual) {
                                 self.error_help(
                                     name.span,
                                     format!(
@@ -5867,10 +5871,7 @@ declare the `unsafe` capability, which is what makes it visible to everyone who 
                             }
                             return self.error(
                                 name.span,
-                                format!(
-                                    "module `{target_mod}` has no function `{}`",
-                                    name.name
-                                ),
+                                format!("module `{target_mod}` has no function `{}`", name.name),
                             );
                         }
                     }
@@ -6060,8 +6061,14 @@ Perform the effect after the closing brace, or yield a number and do the work ou
         if BUILTIN_FREE_FNS.contains(&name.name.as_str()) {
             return self.error_help(
                 name.span,
-                format!("`{}` is a built-in function, not a method on `{shown}`", name.name),
-                format!("write `x |> {}` to pass a value to it, or `{}(x)`", name.name, name.name),
+                format!(
+                    "`{}` is a built-in function, not a method on `{shown}`",
+                    name.name
+                ),
+                format!(
+                    "write `x |> {}` to pass a value to it, or `{}(x)`",
+                    name.name, name.name
+                ),
             );
         }
         // A range has no name in the type grammar — `fn f(r: range)` is
@@ -6097,7 +6104,10 @@ Perform the effect after the closing brace, or yield a number and do the work ou
         self.error_help(
             name.span,
             format!("no method `{}` on `{shown}`", name.name),
-            format!("a free function `fn {}({shown}, ...)` would also work here (UFCS)", name.name),
+            format!(
+                "a free function `fn {}({shown}, ...)` would also work here (UFCS)",
+                name.name
+            ),
         )
     }
 
@@ -6150,7 +6160,10 @@ Perform the effect after the closing brace, or yield a number and do the work ou
                 let TypeDefKind::Struct { fields } = &self.defs.get(id).kind else {
                     return None;
                 };
-                fields.iter().find(|(n, _)| n == field).map(|(_, t)| t.clone())
+                fields
+                    .iter()
+                    .find(|(n, _)| n == field)
+                    .map(|(_, t)| t.clone())
             }
             // A tuple's components are fields spelled with numbers. Reading
             // one as a value already worked; calling one did not, so a
@@ -6158,7 +6171,10 @@ Perform the effect after the closing brace, or yield a number and do the work ou
             // name first — the same defect [T-FIELD-CALL] records for struct
             // fields, and the help offered was `fn 0(...)`, which is not a
             // name anyone can write.
-            Type::Tuple(items) => field.parse::<usize>().ok().and_then(|i| items.get(i).cloned()),
+            Type::Tuple(items) => field
+                .parse::<usize>()
+                .ok()
+                .and_then(|i| items.get(i).cloned()),
             // Reading a field through a reference works, so calling one does
             // too ([T-REF-READ]).
             //
@@ -6197,7 +6213,11 @@ Perform the effect after the closing brace, or yield a number and do the work ou
             if args.len() != want {
                 c.error(
                     span,
-                    format!("`{}` takes {want} argument(s), got {}", name.name, args.len()),
+                    format!(
+                        "`{}` takes {want} argument(s), got {}",
+                        name.name,
+                        args.len()
+                    ),
                 );
                 return false;
             }
@@ -6390,7 +6410,10 @@ Perform the effect after the closing brace, or yield a number and do the work ou
                         }
                         if !self.uni.unify(&elem, &Type::Str) {
                             let shown = self.show(&elem);
-                            self.error(span, format!("`join` needs `[str]`, found list of `{shown}`"));
+                            self.error(
+                                span,
+                                format!("`join` needs `[str]`, found list of `{shown}`"),
+                            );
                         }
                         Type::Str
                     }
@@ -6799,7 +6822,8 @@ Perform the effect after the closing brace, or yield a number and do the work ou
                 // `extern fn` instead cost a capability ([T-EXTERN-VALUE]),
                 // which put a trigonometry helper over the ceiling of any
                 // package declaring `capabilities = []`.
-                "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "sinh" | "cosh" | "tanh" | "exp" | "ln" | "log2" | "log10" | "cbrt" | "to_radians" | "to_degrees" => {
+                "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "sinh" | "cosh" | "tanh"
+                | "exp" | "ln" | "log2" | "log10" | "cbrt" | "to_radians" | "to_degrees" => {
                     check_arity(self, 0);
                     Type::F64
                 }
@@ -6950,9 +6974,9 @@ Perform the effect after the closing brace, or yield a number and do the work ou
             return false;
         };
         for depth in (0..self.deferred_closures.len()).rev() {
-            let hit = self.deferred_closures[depth].iter().position(|d| {
-                matches!(self.uni.shallow_resolve(&d.ret), Type::Var(w) if w == v)
-            });
+            let hit = self.deferred_closures[depth]
+                .iter()
+                .position(|d| matches!(self.uni.shallow_resolve(&d.ret), Type::Var(w) if w == v));
             if let Some(i) = hit {
                 let d = self.deferred_closures[depth].remove(i);
                 self.check_deferred_closure(d);
@@ -7039,7 +7063,9 @@ element",
                 continue;
             };
             for i in indices {
-                let Some(t) = fresh.get(i).cloned() else { continue };
+                let Some(t) = fresh.get(i).cloned() else {
+                    continue;
+                };
                 if matches!(self.uni.resolve(&t), Type::Generic(_)) {
                     continue;
                 }
@@ -7120,7 +7146,10 @@ same slot would race — pass a type that holds no `ref`, or use `map` inside th
             // Written inside a generic function's own body: remember which
             // parameter it was, so the call sites can be held to it.
             if let Some(owner) = self.key_generic_owner.clone() {
-                self.key_generics.entry(owner).or_default().insert(i as usize);
+                self.key_generics
+                    .entry(owner)
+                    .or_default()
+                    .insert(i as usize);
             }
         }
         if !matches!(
@@ -7151,7 +7180,8 @@ same slot would race — pass a type that holds no `ref`, or use `map` inside th
         // shape [T-PAR-MAP-PURE] listed as still reaching past the rule.
         if let Expr::Ident(id) = arg {
             if let Some(at) = self.let_closure_span.get(&id.name).copied() {
-                self.pending_par_name_checks.push((at, id.name.clone(), id.span));
+                self.pending_par_name_checks
+                    .push((at, id.name.clone(), id.span));
             }
         }
         let outer = self.parallel_fn_floor.replace(self.scopes.len());
@@ -7183,7 +7213,10 @@ same slot would race — pass a type that holds no `ref`, or use `map` inside th
         // for `fn go[T](xs: [T], f: fn(T) -> i64) { xs.par_map(f) }`.
         if let Type::Generic(i) = self.uni.resolve(elem) {
             if let Some(owner) = self.key_generic_owner.clone() {
-                self.par_generics.entry(owner).or_default().insert(i as usize);
+                self.par_generics
+                    .entry(owner)
+                    .or_default()
+                    .insert(i as usize);
             }
             return;
         }
@@ -7224,10 +7257,7 @@ for work over shared state, or build the references inside the function, one per
         // all: the obvious `|e| log.push(e)` was rejected, and so was the
         // reference that answers it, which is what made `inout` on an effect
         // operation look like the remaining option ([E-EFFECT-NO-INOUT]).
-        let declared_at = self
-            .scopes
-            .iter()
-            .rposition(|sc| sc.contains_key(&id.name));
+        let declared_at = self.scopes.iter().rposition(|sc| sc.contains_key(&id.name));
         if let Some(b) = self.lookup(&id.name) {
             if matches!(self.uni.resolve(&b.ty), Type::Ref(_)) {
                 // …except inside a parallel operation's function, where the
@@ -7379,9 +7409,11 @@ bind the component to a `var`, or use a struct when the parts have names worth w
         let lhs_ty = self.infer_expr(lhs);
         let literal_span = match lhs {
             Expr::Int(..) => Some(lhs.span().start),
-            Expr::Unary { op: UnaryOp::Neg, expr, .. } if matches!(**expr, Expr::Int(..)) => {
-                Some(expr.span().start)
-            }
+            Expr::Unary {
+                op: UnaryOp::Neg,
+                expr,
+                ..
+            } if matches!(**expr, Expr::Int(..)) => Some(expr.span().start),
             _ => None,
         };
         if let Some(at) = literal_span {
@@ -7406,9 +7438,11 @@ bind the component to a `var`, or use a struct when the parts have names worth w
         // ([E-NUM-PROMOTE]: "on either side").
         let literal_span = match lhs {
             Expr::Int(..) => Some(lhs.span().start),
-            Expr::Unary { op: UnaryOp::Neg, expr, .. } if matches!(**expr, Expr::Int(..)) => {
-                Some(expr.span().start)
-            }
+            Expr::Unary {
+                op: UnaryOp::Neg,
+                expr,
+                ..
+            } if matches!(**expr, Expr::Int(..)) => Some(expr.span().start),
             _ => None,
         };
         if let Some(at) = literal_span {
@@ -7444,7 +7478,10 @@ bind the component to a `var`, or use a struct when the parts have names worth w
                     self.uni.unify(&t, &Type::I64);
                 } else if !self.is_ordered(&r) {
                     let shown = self.show(&t);
-                    self.error(span, format!("cannot compare `{shown}` values with `<`/`>`"));
+                    self.error(
+                        span,
+                        format!("cannot compare `{shown}` values with `<`/`>`"),
+                    );
                 }
                 Type::Bool
             }
@@ -7549,7 +7586,9 @@ bind the component to a `var`, or use a struct when the parts have names worth w
                             let fe = self.show(&fn_err);
                             self.error_help(
                                 span,
-                                format!("`try` propagates `{e}` but this function only declares `{fe}`"),
+                                format!(
+                                    "`try` propagates `{e}` but this function only declares `{fe}`"
+                                ),
                                 "add the error type to the function's `!` clause",
                             );
                         }
@@ -7695,11 +7734,9 @@ bind the component to a `var`, or use a struct when the parts have names worth w
                         Some(t) => {
                             // The arm that gave the bare half is the one
                             // wrapped; the other already built the whole.
-                            if !matches!(
-                                self.uni.shallow_resolve(&arm_ty),
-                                Type::Fallible(..)
-                            ) {
-                                self.ok_wrapped.insert((arm.body.span().start, arm.body.span().end));
+                            if !matches!(self.uni.shallow_resolve(&arm_ty), Type::Fallible(..)) {
+                                self.ok_wrapped
+                                    .insert((arm.body.span().start, arm.body.span().end));
                             }
                             let _ = self.uni.unify(&result, &t);
                         }
@@ -7772,7 +7809,10 @@ bind the component to a `var`, or use a struct when the parts have names worth w
         // Exhaustiveness.
         if !has_irrefutable {
             let missing = self.missing_for(&scrut_ty, &covered);
-            let missing: Vec<String> = missing.into_iter().filter(|m| !covered.contains(m)).collect();
+            let missing: Vec<String> = missing
+                .into_iter()
+                .filter(|m| !covered.contains(m))
+                .collect();
             if !missing.is_empty() {
                 let list = missing
                     .iter()
@@ -7823,26 +7863,30 @@ bind the component to a `var`, or use a struct when the parts have names worth w
             Type::Tuple(members)
                 if !members.is_empty()
                     && members.len() <= 8
-                    && members
-                        .iter()
-                        .all(|m| self.uni.resolve(m) == Type::Bool) =>
+                    && members.iter().all(|m| self.uni.resolve(m) == Type::Bool) =>
             {
                 let n = members.len();
                 let mut missing = Vec::new();
                 for bits in 0..(1u32 << n) {
                     let combo: Vec<&str> = (0..n)
-                        .map(|i| if bits & (1 << i) != 0 { "true" } else { "false" })
+                        .map(|i| {
+                            if bits & (1 << i) != 0 {
+                                "true"
+                            } else {
+                                "false"
+                            }
+                        })
                         .collect();
                     let is_covered = covered.iter().any(|tag| {
                         tag.strip_prefix('(')
                             .and_then(|t| t.strip_suffix(')'))
                             .map(|inner| {
-                                let parts: Vec<&str> =
-                                    inner.split(", ").collect();
+                                let parts: Vec<&str> = inner.split(", ").collect();
                                 parts.len() == n
-                                    && parts.iter().zip(&combo).all(
-                                        |(p, want)| *p == "_" || p == want,
-                                    )
+                                    && parts
+                                        .iter()
+                                        .zip(&combo)
+                                        .all(|(p, want)| *p == "_" || p == want)
                             })
                             .unwrap_or(false)
                     });
@@ -7855,7 +7899,10 @@ bind the component to a `var`, or use a struct when the parts have names worth w
             Type::Error => vec![],
             _ => vec!["_".into()], // ints, strings, … need a catch-all
         };
-        missing.into_iter().filter(|m| !covered.contains(m)).collect()
+        missing
+            .into_iter()
+            .filter(|m| !covered.contains(m))
+            .collect()
     }
 
     /// Is every value of this variant matched by some arm?
@@ -8037,7 +8084,10 @@ bind the component to a `var`, or use a struct when the parts have names worth w
                     }
                 }
                 let TypeDefKind::Sum { variants } = self.defs.get(def_id).kind.clone() else {
-                    self.error(*span, "struct values are matched with bindings, not variants");
+                    self.error(
+                        *span,
+                        "struct values are matched with bindings, not variants",
+                    );
                     return Some(vname.clone());
                 };
                 match variants.iter().find(|v| &v.name == vname) {
@@ -8121,7 +8171,8 @@ bind the component to a `var`, or use a struct when the parts have names worth w
         };
         let param_tys: Vec<Type> = match expected {
             Some(Type::Fn {
-                params: want_params, ..
+                params: want_params,
+                ..
             }) if want_params.len() == params.len() => want_params.clone(),
             _ => params.iter().map(|_| self.uni.fresh()).collect(),
         };
@@ -8129,9 +8180,11 @@ bind the component to a `var`, or use a struct when the parts have names worth w
         // type is: the backend identifies a closure by where its *body* starts,
         // and one with parameters begins earlier than that.
         self.closure_params.push((span.start, param_tys.clone()));
-        self.closure_params.push((body.span().start, param_tys.clone()));
+        self.closure_params
+            .push((body.span().start, param_tys.clone()));
         if let Some(Type::Fn {
-            params: want_params, ..
+            params: want_params,
+            ..
         }) = expected
         {
             if want_params.len() != params.len() {
@@ -8337,7 +8390,11 @@ fn yields_ok_half(e: &Expr) -> bool {
         match e {
             Expr::Call { callee, .. } => !matches!(&**callee, Expr::Ident(id)
                 if id.name == "Ok" || id.name == "Err"),
-            Expr::If { then_block, else_branch, .. } => {
+            Expr::If {
+                then_block,
+                else_branch,
+                ..
+            } => {
                 let t = block_tail(then_block).map(ok).unwrap_or(true);
                 let f = match else_branch.as_deref() {
                     Some(ElseBranch::Else(b)) => block_tail(b).map(ok).unwrap_or(true),
@@ -8390,7 +8447,11 @@ fn yields_some_whole(e: &Expr) -> bool {
     match e {
         Expr::Call { callee, .. } => matches!(&**callee, Expr::Ident(id)
             if id.name == "Ok" || id.name == "Err" || id.name == "fail"),
-        Expr::If { then_block, else_branch, .. } => {
+        Expr::If {
+            then_block,
+            else_branch,
+            ..
+        } => {
             tail(then_block).is_some_and(yields_some_whole)
                 || match else_branch.as_deref() {
                     Some(ElseBranch::Else(b)) => tail(b).is_some_and(yields_some_whole),
@@ -8415,7 +8476,11 @@ fn yields_whole(e: &Expr) -> bool {
         match e {
             Expr::Call { callee, .. } => matches!(&**callee, Expr::Ident(id)
                 if id.name == "Ok" || id.name == "Err" || id.name == "fail"),
-            Expr::If { then_block, else_branch, .. } => {
+            Expr::If {
+                then_block,
+                else_branch,
+                ..
+            } => {
                 let t = block_tail(then_block).map(whole).unwrap_or(false);
                 let f = match else_branch.as_deref() {
                     Some(ElseBranch::Else(b)) => block_tail(b).map(whole).unwrap_or(false),
@@ -8442,8 +8507,16 @@ fn collect_hof_closures(e: &Expr, out: &mut std::collections::HashSet<u32>) {
     if let Expr::MethodCall { name, args, .. } = e {
         if matches!(
             name.name.as_str(),
-            "map" | "par_map" | "filter" | "par_filter" | "fold" | "any" | "all"
-                | "find" | "sort_by" | "each"
+            "map"
+                | "par_map"
+                | "filter"
+                | "par_filter"
+                | "fold"
+                | "any"
+                | "all"
+                | "find"
+                | "sort_by"
+                | "each"
         ) {
             for a in args {
                 if let Expr::Closure { span, .. } = a {
@@ -8549,7 +8622,12 @@ fn walk_exprs(e: &Expr, f: &mut dyn FnMut(&Expr)) {
                 walk_stmt_exprs(st, f);
             }
         }
-        Expr::If { cond, then_block, else_branch, .. } => {
+        Expr::If {
+            cond,
+            then_block,
+            else_branch,
+            ..
+        } => {
             walk_exprs(cond, f);
             for st in &then_block.stmts {
                 walk_stmt_exprs(st, f);
@@ -8564,7 +8642,9 @@ fn walk_exprs(e: &Expr, f: &mut dyn FnMut(&Expr)) {
                 None => {}
             }
         }
-        Expr::Match { scrutinee, arms, .. } => {
+        Expr::Match {
+            scrutinee, arms, ..
+        } => {
             walk_exprs(scrutinee, f);
             for a in arms {
                 walk_exprs(&a.body, f);
@@ -8605,8 +8685,7 @@ enum PlaceSeg {
 /// `release`, `alive` — are handled elsewhere in `infer_call` and are listed
 /// because a call still reaches them first.
 fn is_builtin_fn_name(name: &str) -> bool {
-    BUILTIN_FREE_FNS.contains(&name)
-        || matches!(name, "fail" | "map" | "ref" | "release" | "alive")
+    BUILTIN_FREE_FNS.contains(&name) || matches!(name, "fail" | "map" | "ref" | "release" | "alive")
 }
 
 /// Names `resolve_type` answers for before it consults any declaration.
@@ -8693,7 +8772,6 @@ fn tag_with_payload(name: &str, subs: &[Option<String>]) -> String {
     }
     format!("{name}{PAYLOAD_SEP}?")
 }
-
 
 fn stmt_span(s: &Stmt) -> Span {
     match s {

@@ -167,9 +167,7 @@ fn parse_value(text: &str) -> Result<Value, String> {
         return Ok(Value::Bool(false));
     }
     if let Some(rest) = text.strip_prefix('"') {
-        let body = rest
-            .strip_suffix('"')
-            .ok_or("unterminated string value")?;
+        let body = rest.strip_suffix('"').ok_or("unterminated string value")?;
         return Ok(Value::Str(unescape(body)));
     }
     if let Some(rest) = text.strip_prefix('[') {
@@ -284,7 +282,12 @@ path = "../utils"
 
     #[test]
     fn reports_malformed_input_with_line_numbers() {
-        for bad in ["[unclosed\n", "novalue\n", "[t]\nk = \"open\n", "[t]\nk = ?\n"] {
+        for bad in [
+            "[unclosed\n",
+            "novalue\n",
+            "[t]\nk = \"open\n",
+            "[t]\nk = ?\n",
+        ] {
             let e = parse(bad).expect_err("should fail");
             assert!(e.starts_with("line "), "expected a located error, got: {e}");
         }

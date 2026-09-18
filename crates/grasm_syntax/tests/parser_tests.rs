@@ -75,10 +75,7 @@ fn let_var_and_assign() {
     let m = parse_ok(src);
     let f = first_fn(&m);
     assert_eq!(f.body.stmts.len(), 5);
-    assert!(matches!(
-        f.body.stmts[0],
-        Stmt::Let { mutable: false, .. }
-    ));
+    assert!(matches!(f.body.stmts[0], Stmt::Let { mutable: false, .. }));
     assert!(matches!(
         &f.body.stmts[1],
         Stmt::Let {
@@ -403,7 +400,13 @@ fn ranges_and_for() {
     let Stmt::For { iter, .. } = &f.body.stmts[1] else {
         panic!()
     };
-    assert!(matches!(iter, Expr::Range { inclusive: true, .. }));
+    assert!(matches!(
+        iter,
+        Expr::Range {
+            inclusive: true,
+            ..
+        }
+    ));
 }
 
 #[test]
@@ -537,7 +540,8 @@ test "area of rect" {
 fn recovery_from_unbalanced_parens_resets_newline_mode() {
     // Error inside `(` — recovery must not leave newline-skipping mode on,
     // otherwise `good`'s newline-terminated statements would misparse.
-    let src = "fn broken() {\n    let x = g(1, +\n}\n\nfn good() {\n    let a = 1\n    let b = 2\n}\n";
+    let src =
+        "fn broken() {\n    let x = g(1, +\n}\n\nfn good() {\n    let a = 1\n    let b = 2\n}\n";
     let out = grasm_syntax::parse(src);
     assert!(!out.diagnostics.is_empty());
     let good = out.module.decls.iter().find_map(|d| match d {
