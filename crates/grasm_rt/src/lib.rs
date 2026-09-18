@@ -4690,6 +4690,39 @@ fn rt_stack_check() {
     });
 }
 
+/// This thread's stack floor, for a caller that compares against it itself.
+///
+/// A function that can recurse used to call `grasm_stack_check` on entry, and
+/// that function reached `LOCAL` — which on macOS is a second call, through
+/// `_tlv_get_addr`. Two calls, on every recursive call in the language.
+/// Measured on `fib(30)`, which makes about 2.7 million of them: the pair cost
+/// 5.0 ms of a 7.5 ms program, against 0.67 ms for the same test written
+/// inline against a floor already in a register.
+///
+/// So the floor is fetched once, where the recursion is entered, and passed
+/// down as a hidden first argument; the check itself becomes a compare and a
+/// branch that the compiler emits in place. This is the call that fetches it.
+///
+/// # Safety: `sp` is an address in the current thread's stack.
+#[no_mangle]
+pub extern "C" fn grasm_stack_floor(sp: i64) -> i64 {
+    LOCAL.with(|local| {
+        let floor = local.stack_floor.get();
+        if floor == 0 {
+            let set = (sp as usize).saturating_sub(STACK_BUDGET);
+            local.stack_floor.set(set);
+            return set as i64;
+        }
+        floor as i64
+    })
+}
+
+/// What a compiled function calls when its own check fails.
+#[no_mangle]
+pub extern "C" fn grasm_panic_stack() -> ! {
+    rt_panic("stack overflow: recursion too deep")
+}
+
 /// Panics if the stack has run down past this thread's floor.
 ///
 /// Called on entry to every function that can recurse. [E-RECURSION-DEPTH]

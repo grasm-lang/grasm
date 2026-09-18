@@ -194,14 +194,25 @@ of that is the two calls. An older note in this file said the guard cost 7%;
 that measurement short-circuited the *body* of the check and left both calls in
 place, which is why it saw so little.
 
-The fix is to stop asking the operating system where this thread's state is on
-every call and carry it instead: a hidden context parameter on every compiled
-function, fetched once at each thread's entry point and passed down, with the
-floor read from it and compared inline. That is what Go does with its `g`
-register and Julia with `ptls`, and it also removes the `_tlv_get_addr` that is
-fifteen to nineteen percent of `wordfreq` and `tree`. Not yet done — it changes
-the calling convention of every Grasm function, including the ones the runtime
-calls back into.
+So the floor is now carried rather than looked up: a function that can reach
+itself takes it as a hidden first argument, fetched once where the recursion is
+entered, and the check is a compare and a branch the compiler emits in place.
+
+**And it was worth a sixth of what the table above predicted.** fib 1.06x,
+tree 1.03x, everything else unchanged — not the 1.8x the 7.52-to-3.20 row
+suggests. Two reasons, both visible in the disassembly. Removing the call is
+not free: the floor has to survive the recursive calls, which costs a third
+callee-saved register to save and restore and a `mov` before each call, so
+`fib` went from 27 instructions to 35 even as two calls disappeared. And a
+perfectly predicted direct call to a tiny leaf function is largely hidden by an
+out-of-order core, which a standalone microbenchmark written around
+`#[inline(never)]` does not model.
+
+The lesson is about the method rather than the change: a microbenchmark of a
+mechanism in isolation bounds the cost of that mechanism, not the win from
+removing it, because removing it changes everything around it. The change is
+kept — it is faster, and it is the plumbing a full context parameter would
+need — but the four milliseconds were not there to collect.
 
 ## What the other implementations do, and which of it applies here
 

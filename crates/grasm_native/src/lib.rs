@@ -246,6 +246,12 @@ struct FnSig {
     modes: Vec<ParamMode>,
     ret: VType,
     id: FuncId,
+    /// Takes this thread's stack floor as a hidden first argument.
+    ///
+    /// Set for exactly the functions that can reach themselves, which are the
+    /// ones that check the stack on entry. Both the declaration and every call
+    /// site read it from here, so the two cannot disagree.
+    takes_floor: bool,
 }
 
 pub fn compile_object(
@@ -707,6 +713,8 @@ impl<'m> Codegen<'m> {
             ("grasm_val_cmp", vec![i64t, i64t], Some(i64t)),
             ("grasm_assert_eq", vec![i64t, i64t], None),
             ("grasm_stack_check", vec![i64t], None),
+            ("grasm_stack_floor", vec![i64t], Some(i64t)),
+            ("grasm_panic_stack", vec![], None),
             ("grasm_str_from_i64", vec![i64t], Some(i64t)),
             ("grasm_str_from_f64", vec![f64t], Some(i64t)),
             ("grasm_str_from_bool", vec![i8t], Some(i64t)),
@@ -1122,11 +1130,14 @@ impl<'m> Codegen<'m> {
             self.current_module = name.clone();
             self.resolve_type_bodies(m)?;
         }
+        // Before the signatures, not after: whether a function can reach
+        // itself decides whether it carries the hidden stack-floor argument,
+        // and that is part of its ABI.
+        self.recursive = recursive_functions(views);
         for (name, m, _) in views {
             self.current_module = name.clone();
             self.declare_fns(m)?;
         }
-        self.recursive = recursive_functions(views);
         if !self.fns.contains_key("main::main") {
             // Not a backend limitation: a program without `main` has no
             // entry point in any engine ([E-ENTRY]). The CLI checks for it
@@ -1572,7 +1583,13 @@ arguments nor the type this is bound to",
         let (params, modes, ret) = signature?;
 
         let ptr_ty = self.module.target_config().pointer_type();
+        // An instantiation recurses exactly when the generic it came from
+        // does, and the recursion analysis names the generic.
+        let takes_floor = self.recursive.contains(&format!("{module}::{name}"));
         let mut sig = self.module.make_signature();
+        if takes_floor {
+            sig.params.push(AbiParam::new(types::I64));
+        }
         for (p, m) in params.iter().zip(&modes) {
             sig.params.push(AbiParam::new(if *m == ParamMode::Inout {
                 ptr_ty
@@ -1604,6 +1621,7 @@ arguments nor the type this is bound to",
                 modes,
                 ret,
                 id,
+                takes_floor,
             },
         );
         self.pending_generics.push(PendingGeneric {
@@ -1686,6 +1704,8 @@ arguments nor the type this is bound to",
                             params: param_ts,
                             modes: e.params.iter().map(|p| p.mode).collect(),
                             ret: ret_t,
+                            // A C function never takes it.
+                            takes_floor: false,
                         },
                     );
                 }
@@ -1726,7 +1746,12 @@ arguments nor the type this is bound to",
                         ret = VType::Fallible(Box::new(ret), Box::new(e));
                     }
                     let ptr_ty = self.module.target_config().pointer_type();
+                    let key = format!("{}::{}", self.current_module, f.name.name);
+                    let takes_floor = self.recursive.contains(&key);
                     let mut sig = self.module.make_signature();
+                    if takes_floor {
+                        sig.params.push(AbiParam::new(types::I64));
+                    }
                     for (p, m) in params.iter().zip(&modes) {
                         sig.params.push(AbiParam::new(if *m == ParamMode::Inout {
                             ptr_ty
@@ -1750,7 +1775,6 @@ arguments nor the type this is bound to",
                             span: f.span,
                             what: format!("(module error: {e})"),
                         })?;
-                    let key = format!("{}::{}", self.current_module, f.name.name);
                     self.fns.insert(
                         key,
                         FnSig {
@@ -1759,6 +1783,7 @@ arguments nor the type this is bound to",
                             modes,
                             ret,
                             id,
+                            takes_floor,
                         },
                     );
                 }
@@ -1805,7 +1830,24 @@ arguments nor the type this is bound to",
         let g_main = self.fns["main::main"].id;
         let main_fallible = matches!(self.fns["main::main"].ret, VType::Fallible(_, _));
         let fref = self.module.declare_func_in_func(g_main, b.func);
-        let inst = b.ins().call(fref, &[]);
+        // `main` can call itself, and then it takes a floor like any other
+        // recursive function.
+        let mut main_args: Vec<Value> = Vec::new();
+        if self.fns["main::main"].takes_floor {
+            let ptr_ty = self.module.target_config().pointer_type();
+            let slot = b.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
+                cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                8,
+                3,
+            ));
+            let here = b.ins().stack_addr(ptr_ty, slot, 0);
+            let f = self
+                .module
+                .declare_func_in_func(self.runtime["grasm_stack_floor"], b.func);
+            let call = b.ins().call(f, &[here]);
+            main_args.push(b.inst_results(call)[0]);
+        }
+        let inst = b.ins().call(fref, &main_args);
         if main_fallible {
             let res = b.inst_results(inst)[0];
             let ok_blk = b.create_block();
@@ -1869,9 +1911,13 @@ arguments nor the type this is bound to",
         let sig_modes = self.fns[&key].modes.clone();
         let sig_ret = self.fns[&key].ret.clone();
         let func_id = self.fns[&key].id;
+        let takes_floor = self.fns[&key].takes_floor;
         let ptr_ty = self.module.target_config().pointer_type();
 
         let mut ctx = self.module.make_context();
+        if takes_floor {
+            ctx.func.signature.params.push(AbiParam::new(types::I64));
+        }
         for (p, m) in sig_params.iter().zip(&sig_modes) {
             ctx.func
                 .signature
@@ -1911,6 +1957,7 @@ arguments nor the type this is bound to",
             index_vals: HashMap::new(),
             wrote_through_ref: false,
             task_scopes: Vec::new(),
+            floor: None,
         };
 
         let entry = fcx.b.create_block();
@@ -1923,7 +1970,16 @@ arguments nor the type this is bound to",
         // crash, or corrupt the process". Only recursive functions pay for
         // it, and the address of a scratch slot stands in for the stack
         // pointer.
-        if fcx.cg.recursive.contains(&key) {
+        //
+        // The floor arrives as a hidden first argument rather than being
+        // looked up here, so the test is a compare and a branch. It used to be
+        // a call to `grasm_stack_check`, which then reached a thread-local —
+        // on macOS a second call. On `fib(30)`, 2.7 million calls deep, the
+        // pair cost 5.0 ms of a 7.5 ms program and the inline test costs 0.67.
+        if takes_floor {
+            // The address of a scratch slot stands in for the stack pointer.
+            // `get_frame_pointer` would say the same thing without the slot,
+            // but Cranelift's verifier rejects it here.
             let slot = fcx
                 .b
                 .create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
@@ -1932,10 +1988,26 @@ arguments nor the type this is bound to",
                     3,
                 ));
             let here = fcx.b.ins().stack_addr(ptr_ty, slot, 0);
-            fcx.call_rt("grasm_stack_check", &[here]);
+            let floor = fcx.b.block_params(entry)[0];
+            // Defined in the entry block, so it dominates every call this
+            // function makes and can be handed straight on.
+            fcx.floor = Some(floor);
+            let over = fcx.b.create_block();
+            let ok = fcx.b.create_block();
+            let bad = fcx.b.ins().icmp(IntCC::UnsignedLessThan, here, floor);
+            fcx.b.ins().brif(bad, over, &[], ok, &[]);
+            fcx.filled = true;
+            fcx.goto_block(over);
+            fcx.call_rt("grasm_panic_stack", &[]);
+            fcx.trap_here();
+            fcx.filled = true;
+            fcx.goto_block(ok);
         }
         fcx.push_scope();
-        let entry_params: Vec<Value> = fcx.b.block_params(entry).to_vec();
+        // The hidden floor, when there is one, sits before the declared
+        // parameters.
+        let shift = usize::from(takes_floor);
+        let entry_params: Vec<Value> = fcx.b.block_params(entry)[shift..].to_vec();
         for (i, p) in f.params.iter().enumerate() {
             let vt = sig_params[i].clone();
             if sig_modes[i] == ParamMode::Inout {
@@ -2414,6 +2486,22 @@ operation's",
         // correctly.
         let mut call_args: Vec<Value> = Vec::with_capacity(params.len() - 1);
         let mut c_temps: Vec<(Value, bool)> = Vec::new();
+        // A wrapper is reached through the closure ABI, which has no room for
+        // the hidden stack floor — so it asks for one and hands it on. That
+        // happens once, where the recursion is entered.
+        if sig_info.takes_floor {
+            let slot = b.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
+                cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                8,
+                3,
+            ));
+            let here = b.ins().stack_addr(ptr_ty, slot, 0);
+            let f = self
+                .module
+                .declare_func_in_func(self.runtime["grasm_stack_floor"], b.func);
+            let call = b.ins().call(f, &[here]);
+            call_args.push(b.inst_results(call)[0]);
+        }
         for (i, p) in params[1..].iter().enumerate() {
             match sig_info.params.get(i) {
                 Some(VType::Str) if sig_info.is_extern => {
@@ -2509,6 +2597,7 @@ operation's",
             index_vals: HashMap::new(),
             wrote_through_ref: false,
             task_scopes: Vec::new(),
+            floor: None,
         };
         let entry = fcx.b.create_block();
         fcx.b.append_block_params_for_function_params(entry);
@@ -2606,6 +2695,7 @@ operation's",
             index_vals: HashMap::new(),
             wrote_through_ref: false,
             task_scopes: Vec::new(),
+            floor: None,
         };
         let entry = fcx.b.create_block();
         fcx.b.append_block_params_for_function_params(entry);
@@ -2746,6 +2836,7 @@ operation's",
             index_vals: HashMap::new(),
             wrote_through_ref: false,
             task_scopes: Vec::new(),
+            floor: None,
         };
         let entry = fcx.b.create_block();
         fcx.b.append_block_params_for_function_params(entry);
@@ -3085,6 +3176,10 @@ struct FnCx<'a, 'm> {
     /// lexically known, and [T-TASK-CAPTURE] guarantees they only touch
     /// bindings that outlive the block.
     task_scopes: Vec<(Variable, usize)>,
+    /// This function's copy of the thread's stack floor, when it was handed
+    /// one. A function that was not needs to ask the runtime before it can
+    /// call one that was.
+    floor: Option<Value>,
 }
 
 /// What a block knows that a closure inside it needs.
@@ -5028,6 +5123,27 @@ impl FnCx<'_, '_> {
     }
 
     /// Inline bounds check, then a raw load or the address to store to.
+    /// The stack floor to hand to a function that takes one.
+    ///
+    /// Already in hand for a function that recurses — it was passed in. Any
+    /// other function asks the runtime, which happens once per entry into a
+    /// recursion rather than once per level of it.
+    fn floor_arg(&mut self) -> Value {
+        if let Some(v) = self.floor {
+            return v;
+        }
+        let ptr_ty = self.cg.module.target_config().pointer_type();
+        let slot = self
+            .b
+            .create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
+                cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                8,
+                3,
+            ));
+        let here = self.b.ins().stack_addr(ptr_ty, slot, 0);
+        self.call_rt("grasm_stack_floor", &[here]).unwrap()
+    }
+
     fn pinned_address(&mut self, data: Value, len: Value, idx: Value, stride: i64) -> Value {
         let ok = self.b.create_block();
         let oob = self.b.create_block();
@@ -8303,11 +8419,12 @@ this case",
                         qual = made?;
                     }
                     if let Some(sig) = self.cg.fns.get(&qual) {
-                        let (fid, params, modes, ret) = (
+                        let (fid, params, modes, ret, callee_floor) = (
                             sig.id,
                             sig.params.clone(),
                             sig.modes.clone(),
                             sig.ret.clone(),
+                            sig.takes_floor,
                         );
                         // `inout` marshals the same way here as in a
                         // same-module call: the caller's variable goes through
@@ -8383,6 +8500,12 @@ this case",
                                 v = self.b.ins().fcvt_from_sint(types::F64, v);
                             }
                             vals.push(v);
+                        }
+                        // The hidden stack floor goes ahead of the declared
+                        // arguments; see `floor_arg`.
+                        if callee_floor {
+                            let f = self.floor_arg();
+                            vals.insert(0, f);
                         }
                         let fref = self.cg.module.declare_func_in_func(fid, self.b.func);
                         let inst = self.b.ins().call(fref, &vals);
@@ -9307,12 +9430,13 @@ this case",
                         .cloned(),
                 };
                 if let Some(sig) = resolved {
-                    let (fid, params, modes, ret, is_extern) = (
+                    let (fid, params, modes, ret, is_extern, callee_floor) = (
                         sig.id,
                         sig.params.clone(),
                         sig.modes.clone(),
                         sig.ret.clone(),
                         sig.is_extern,
+                        sig.takes_floor,
                     );
                     let ptr_ty = self.cg.module.target_config().pointer_type();
                     let mut vals: Vec<Value> = Vec::with_capacity(args.len() + 1);
@@ -9451,6 +9575,10 @@ this case",
                             continue;
                         }
                         vals.push(v);
+                    }
+                    if callee_floor {
+                        let f = self.floor_arg();
+                        vals.insert(0, f);
                     }
                     let fref = self.cg.module.declare_func_in_func(fid, self.b.func);
                     let inst = self.b.ins().call(fref, &vals);
@@ -10682,12 +10810,13 @@ type parameters",
             }
             return nope(id.span, format!("the function `{}` here", id.name));
         };
-        let (fid, params, modes, ret, is_extern) = (
+        let (fid, params, modes, ret, is_extern, callee_floor) = (
             sig.id,
             sig.params.clone(),
             sig.modes.clone(),
             sig.ret.clone(),
             sig.is_extern,
+            sig.takes_floor,
         );
         let ptr_ty = self.cg.module.target_config().pointer_type();
         let mut vals = Vec::with_capacity(args.len());
@@ -10811,6 +10940,10 @@ type parameters",
         }
         // The call is happening: ownership passes, so no release here.
         self.pop_scope_no_decs();
+        if callee_floor {
+            let f = self.floor_arg();
+            vals.insert(0, f);
+        }
         let fref = self.cg.module.declare_func_in_func(fid, self.b.func);
         let inst = self.b.ins().call(fref, &vals);
         let results: Vec<Value> = self.b.inst_results(inst).to_vec();
