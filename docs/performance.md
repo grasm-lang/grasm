@@ -139,6 +139,70 @@ twice — once with the checks and once without, chosen by a single test in the
 preheader that the whole range fits — which is the next thing to try, and worth
 about forty percent of the loop rather than nothing.
 
+**The map's hash was most of the gap to Zig, and it was a choice.** Timed
+head to head by processor time, `wordfreq` takes Grasm 31.4 ms, Rust 25.2 and
+Zig 8.5 — and the three programs are the same program. Rust's `HashMap`
+defaults to SipHash-1-3, a keyed MAC at about half a byte per cycle; Zig's
+defaults to Wyhash. Grasm was inheriting Rust's default and therefore Rust's
+bill.
+
+A map now hashes with a multiply-fold — wyhash's mixing step, a full 64x64 to
+128 product with its halves xored together — seeded once per process from the
+operating system through the same entropy `std` uses. Short inline strings also
+compare as whole fifteen-byte arrays rather than through `memcmp`, which is
+sound because `StrData::of` starts from zeroes, so the bytes past the text are
+zero in both. Together: **wordfreq 1.12x, parwords 1.08x**, and SipHash went
+from 108 samples of the profile to 26.
+
+**What this gives up, stated plainly.** SipHash is proved against an attacker
+who can watch a table's behaviour and search for colliding keys against the
+live seed. The replacement is not. It keeps the defence that matters in
+practice — the seed is secret and per-process, so collisions cannot be computed
+ahead of time — and it is the same trade Zig's standard library makes. A
+program holding a map keyed by hostile input, which cares about the adaptive
+attack, should not rely on the default. Nothing here can make a program answer
+*wrongly*: a hash picks a bucket and `Eq` decides what is in it. A bad hash is
+slow, not incorrect — which is why the guard is four distribution tests in
+`grasm_rt`, checked to fail when the mixer is weakened.
+
+**Hand-rolled small copies are slower than `memmove`.** With SipHash gone,
+`_platform_memmove` was 22.5% of `wordfreq` — copying seven-byte words. The
+obvious fix, two overlapping fixed-width moves instead of a call, made it
+*worse*: wordfreq 1.15x slower and parwords 1.23x slower. Apple's `memmove` is
+well tuned and the branches on the length mispredict. Reverted.
+
+**The stack check is most of `fib`, and it is two calls, not one.** Every
+function that can reach itself calls `grasm_stack_check` on entry
+([E-RECURSION-DEPTH] requires a panic and exit 101 rather than a SIGSEGV), and
+that function then reads `LOCAL` — which on macOS is a second call, through
+`_tlv_get_addr`. `fib(30)` makes about 2.7 million calls and pays for both
+every time.
+
+Measured in a standalone Rust program rather than by weakening the compiler's
+own check, on the same `fib(30)`:
+
+| stack check | fib(30) |
+| --- | --- |
+| a call that reads a thread-local — what is emitted today | 7.52 ms |
+| a call, with the floor already in hand | 4.96 ms |
+| an inline compare against a floor in a register | 3.20 ms |
+| no check at all | 2.53 ms |
+
+So the check costs 5.0 ms as built and 0.67 ms inlined. Grasm's `fib` is
+9.65 ms against Rust's 3.98 by processor time — a gap of 5.67 — and about 4.3
+of that is the two calls. An older note in this file said the guard cost 7%;
+that measurement short-circuited the *body* of the check and left both calls in
+place, which is why it saw so little.
+
+The fix is to stop asking the operating system where this thread's state is on
+every call and carry it instead: a hidden context parameter on every compiled
+function, fetched once at each thread's entry point and passed down, with the
+floor read from it and compared inline. That is what Go does with its `g`
+register and Julia with `ptls`, and it also removes the `_tlv_get_addr` that is
+fifteen to nineteen percent of `wordfreq` and `tree`. Not yet done — it changes
+the calling convention of every Grasm function, including the ones the runtime
+calls back into.
+
 ## What the other implementations do, and which of it applies here
 
 Read against Rust's `hashbrown`, Zig's `std.hash_map`, Swift's SIL optimizer,

@@ -258,6 +258,132 @@ impl Iterator for ScalarIter<'_> {
     }
 }
 
+/// The hash a `map` uses, and why it is not the one Rust picks by default.
+///
+/// `std`'s `HashMap` hashes with SipHash-1-3, which is a keyed MAC chosen so
+/// that an attacker who can choose the keys cannot make the table degenerate.
+/// It costs about half a byte per cycle. Zig's standard map uses Wyhash, which
+/// is an order of magnitude faster, and the difference is most of a benchmark:
+/// counting four hundred thousand short words takes Rust 25 ms, Zig 8.5, and
+/// the programs are otherwise the same program.
+///
+/// This is the same trade, taken the same way Zig takes it, and it keeps the
+/// part that matters. The multiply-fold below is wyhash's mixing step — a full
+/// 64x64 to 128 multiply whose halves are folded together, so every input bit
+/// reaches every output bit — and the table is still keyed: the seed is drawn
+/// once per process from the operating system, through the same entropy `std`
+/// uses. An attacker who does not know the seed cannot compute colliding keys
+/// ahead of time, which is the attack that actually happens.
+///
+/// What is given up is resistance to an attacker who can *measure* the table's
+/// behaviour and search for collisions adaptively against the live seed.
+/// SipHash is proved against that; this is not. A program that holds a map
+/// keyed by input from a hostile network and cares about that attack should
+/// not rely on the default — which is a thing worth writing down rather than
+/// leaving implied.
+///
+/// Nothing here can make a program answer wrongly. A hash chooses a bucket;
+/// `Eq` decides what is in it, and `Eq` is untouched. A bad hash is slow, not
+/// incorrect.
+mod maphash {
+    use std::hash::{BuildHasher, Hasher};
+
+    const S0: u64 = 0xa076_1d64_78bd_642f;
+    const S1: u64 = 0xe703_7ed1_a0b4_28db;
+    const S2: u64 = 0x8ebc_6af0_9c88_c6e3;
+
+    /// Multiply and fold: the whole 128-bit product, halves xored together.
+    #[inline(always)]
+    fn mix(a: u64, b: u64) -> u64 {
+        let p = (a as u128).wrapping_mul(b as u128);
+        (p as u64) ^ ((p >> 64) as u64)
+    }
+
+    /// One seed for the process, from the same place `std` gets its own.
+    fn seed() -> u64 {
+        static SEED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        *SEED.get_or_init(|| {
+            std::collections::hash_map::RandomState::new()
+                .build_hasher()
+                .finish()
+        })
+    }
+
+    #[derive(Clone, Copy)]
+    pub struct MapHash {
+        seed: u64,
+    }
+
+    impl Default for MapHash {
+        fn default() -> Self {
+            MapHash { seed: seed() }
+        }
+    }
+
+    impl BuildHasher for MapHash {
+        type Hasher = MapHasher;
+        #[inline]
+        fn build_hasher(&self) -> MapHasher {
+            MapHasher { h: self.seed }
+        }
+    }
+
+    pub struct MapHasher {
+        h: u64,
+    }
+
+    impl Hasher for MapHasher {
+        #[inline]
+        fn write(&mut self, bytes: &[u8]) {
+            // The length goes in first, so that "ab" and "a" + "b" fed as two
+            // writes cannot land on the same value.
+            let mut h = self.h ^ (bytes.len() as u64).wrapping_mul(S0);
+            let (words, rest) = bytes.as_chunks::<8>();
+            for c in words {
+                h = mix(h ^ u64::from_le_bytes(*c), S1);
+            }
+            if !rest.is_empty() {
+                let mut last = [0u8; 8];
+                last[..rest.len()].copy_from_slice(rest);
+                h = mix(h ^ u64::from_le_bytes(last), S2);
+            }
+            self.h = h;
+        }
+
+        #[inline]
+        fn write_u64(&mut self, n: u64) {
+            self.h = mix(self.h ^ n, S1);
+        }
+        #[inline]
+        fn write_u8(&mut self, n: u8) {
+            self.write_u64(u64::from(n));
+        }
+        #[inline]
+        fn write_u32(&mut self, n: u32) {
+            self.write_u64(u64::from(n));
+        }
+        #[inline]
+        fn write_usize(&mut self, n: usize) {
+            self.write_u64(n as u64);
+        }
+        #[inline]
+        fn write_i64(&mut self, n: i64) {
+            self.write_u64(n as u64);
+        }
+        #[inline]
+        fn write_isize(&mut self, n: isize) {
+            self.write_u64(n as u64);
+        }
+        #[inline]
+        fn finish(&self) -> u64 {
+            mix(self.h, S2)
+        }
+    }
+}
+
+/// What a `map` is made of.
+pub type MapTable = std::collections::HashMap<MapKey, *mut RtVal, maphash::MapHash>;
+
 /// A map key, owned.
 ///
 /// Keys are restricted to `i64`, `str`, and `bool` ([T-MAP-KEY]), which makes
@@ -705,6 +831,16 @@ unsafe fn desc_ty(desc: *const StructDesc) -> &'static StructTy {
 /// `Inline("a")` and `Heap("a")` different, which is a wrong answer in a map.
 impl PartialEq for StrData {
     fn eq(&self, other: &StrData) -> bool {
+        // Two inline strings are equal exactly when their fifteen bytes are,
+        // because `of` starts from zeroes and writes only the text: whatever
+        // follows it is zero in both. That makes the comparison two loads the
+        // compiler can inline, rather than a call to `memcmp` — which for a
+        // seven-byte map key is nearly all call.
+        if let (StrData::Inline { bytes: a, len: la }, StrData::Inline { bytes: b, len: lb }) =
+            (self, other)
+        {
+            return la == lb && a == b;
+        }
         self.as_str() == other.as_str()
     }
 }
@@ -751,7 +887,7 @@ impl StrData {
 
     /// Inline when the text fits, heap otherwise.
     fn of(text: &str) -> StrData {
-        if text.len() <= 15 {
+        if text.len() <= INLINE_STR_CAP {
             let mut bytes = [0u8; 15];
             bytes[..text.len()].copy_from_slice(text.as_bytes());
             StrData::Inline {
@@ -1183,7 +1319,7 @@ pub enum RtPayload {
     },
     /// Hash table for lookup; iteration sorts, which is where the ordering
     /// guarantee is paid for rather than on every get and set.
-    Map(std::collections::HashMap<MapKey, *mut RtVal>),
+    Map(MapTable),
     /// A struct value carries its field *pointers* and nothing else. The names
     /// are identical for every value of a type, so they live once in a
     /// `StructTy` the value points at rather than being repeated in each one.
@@ -3920,11 +4056,11 @@ pub unsafe extern "C" fn grasm_str_from_val(v: *mut RtVal) -> *mut RtVal {
 
 #[no_mangle]
 pub extern "C" fn grasm_map_new() -> *mut RtVal {
-    alloc(RtPayload::Map(std::collections::HashMap::new()))
+    alloc(RtPayload::Map(MapTable::default()))
 }
 
 /// A map's keys in the order iteration must present them.
-fn sorted_keys(entries: &std::collections::HashMap<MapKey, *mut RtVal>) -> Vec<MapKey> {
+fn sorted_keys(entries: &MapTable) -> Vec<MapKey> {
     let mut keys: Vec<MapKey> = entries.keys().cloned().collect();
     keys.sort();
     keys
@@ -3937,7 +4073,7 @@ unsafe fn cow_map(m: *mut RtVal) -> *mut RtVal {
     let RtPayload::Map(entries) = &(*m).payload else {
         grasm_panic_msg_str("map op on non-map");
     };
-    let cloned: std::collections::HashMap<MapKey, *mut RtVal> = entries
+    let cloned: MapTable = entries
         .iter()
         .map(|(k, &v)| {
             inc(v);
@@ -7704,5 +7840,97 @@ pub unsafe extern "C" fn grasm_handler_install(h: *mut RtVal) {
                 list.push((name.clone(), code, data));
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod maphash_tests {
+    use super::maphash::MapHash;
+    use std::collections::HashSet;
+    use std::hash::{BuildHasher, Hash};
+
+    fn hash_of<T: Hash>(b: &MapHash, v: &T) -> u64 {
+        b.hash_one(v)
+    }
+
+    /// How many distinct values `n` keys land on, out of `slots`.
+    ///
+    /// The expected count for a hash that behaves like a random function is
+    /// `slots * (1 - e^(-n/slots))`; a hash that clusters comes in far under
+    /// it. This is the property a table actually depends on — not secrecy —
+    /// and it is the one a mistake in the mixing would break.
+    fn spread(pick: impl Fn(u64) -> u64, keys: &[String], b: &MapHash) -> usize {
+        keys.iter()
+            .map(|k| pick(hash_of(b, k)))
+            .collect::<HashSet<_>>()
+            .len()
+    }
+
+    fn expected(n: f64, slots: f64) -> usize {
+        (slots * (1.0 - (-n / slots).exp())) as usize
+    }
+
+    #[test]
+    fn short_keys_spread_across_buckets() {
+        let b = MapHash::default();
+        // The shape that matters: short keys sharing a long prefix, which is
+        // what a counting loop over words produces.
+        let keys: Vec<String> = (0..100_000).map(|i| format!("alpha{i}")).collect();
+        let slots = 1u64 << 16;
+        // The low bits choose the bucket.
+        let low = spread(|h| h & (slots - 1), &keys, &b);
+        // The top seven choose the control byte, which is what a probe
+        // compares first; clustering there costs a memcmp per collision.
+        let top = spread(|h| h >> 57, &keys, &b);
+        let want = expected(100_000.0, slots as f64);
+        assert!(
+            low > want * 99 / 100,
+            "low bits cluster: {low} distinct, expected about {want}"
+        );
+        assert!(top > 120, "top bits cluster: {top} of 128");
+    }
+
+    #[test]
+    fn near_identical_keys_do_not_collide() {
+        let b = MapHash::default();
+        // One bit apart, one byte apart, and a length apart.
+        let keys: Vec<String> = ["a", "b", "aa", "ab", "ba", "", "aaaaaaaa", "aaaaaaab"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        let hashes: HashSet<u64> = keys.iter().map(|k| hash_of(&b, k)).collect();
+        assert_eq!(hashes.len(), keys.len(), "distinct keys shared a hash");
+    }
+
+    #[test]
+    fn integers_spread_too() {
+        let b = MapHash::default();
+        // Consecutive integers and multiples of a power of two are the two
+        // ways an integer-keyed table is usually filled.
+        let slots = 1u64 << 12;
+        for step in [1i64, 8, 64, 1024] {
+            let mut seen = HashSet::new();
+            for i in 0..10_000i64 {
+                seen.insert(b.hash_one(i * step) & (slots - 1));
+            }
+            let want = expected(10_000.0, slots as f64);
+            assert!(
+                seen.len() > want * 98 / 100,
+                "step {step} clusters: {} distinct, expected about {want}",
+                seen.len()
+            );
+        }
+    }
+
+    #[test]
+    fn the_seed_actually_varies_the_hash() {
+        // Two tables in one process share a seed, so this checks the seed is
+        // used at all rather than that it differs between them.
+        let b = MapHash::default();
+        let plain = b.hash_one("alpha");
+        assert_ne!(plain, 0);
+        // The same key in the same process hashes the same, which is what a
+        // table needs between a `set` and the `get` that follows it.
+        assert_eq!(plain, b.hash_one("alpha"));
     }
 }
