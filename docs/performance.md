@@ -313,6 +313,28 @@ Two details that were measured rather than assumed. The inline array is
 `wordfreq` was three percent slower until that was fixed. And sixteen slots were
 worse than four for the same reason.
 
+**A loop over a list asked how long it was on every iteration.** `for x in xs`
+lowered to an index loop whose header called `grasm_list_len`, so walking a
+thousand elements made a thousand calls to be told the same number. The length
+cannot change: the loop iterates a temp it owns, which user code has no name
+for, and every list mutator goes through `cow_list`, which copies rather than
+writes anything whose refcount is not exactly 1 — so `for x in xs { xs.push(y) }`
+grows `xs` and leaves what the loop is walking alone, which is checked against
+the interpreter.
+
+Asked once, in the block before the loop: iterating a scalar list went from
+3.29 ns an element to **2.34**, a list of strings 6.81 to 6.46, and a list of
+structs with a field read 8.78 to 7.82. **tree 1.04x, parwords 1.06x.**
+
+**What a walk still pays.** `for k in n.kids` in `tree` makes five runtime
+calls per child — `grasm_list_get`, `grasm_val_inc`, the recursive call,
+`grasm_val_dec`, and two more for the field reads that reach `n.value` and
+`n.kids`. A struct field read is a call: measured at **1.95 ns** against 0.70 ns
+for a plain local, because the field is a pointer to a box and the accessor has
+to match on the payload. Inlining it would mean the generated code depending on
+where Rust puts an enum's fields, which is not a promise Rust makes — so the
+route to it is an explicit layout, not a peephole.
+
 ## Where the remaining gap actually is
 
 Timed head to head by processor time, and split by compiling cut-down versions

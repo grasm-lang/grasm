@@ -6535,6 +6535,20 @@ this case",
         let zero = self.b.ins().iconst(types::I64, 0);
         self.b.def_var(ivar, zero);
 
+        // How many there are, asked once.
+        //
+        // This was a call to `grasm_list_len` in the loop header, so a loop
+        // over a thousand elements made a thousand calls to be told the same
+        // number. It cannot change: the loop iterates a temp it owns, which
+        // user code has no name for, and every list mutator goes through
+        // `cow_list`, which copies rather than writes anything whose refcount
+        // is not exactly 1 — so `for x in xs { xs.push(y) }` grows `xs` and
+        // leaves what the loop is walking alone.
+        let lv = self.b.use_var(list_var);
+        let len_v = self.call_rt("grasm_list_len", &[lv]).unwrap();
+        let len_var = self.new_var(&VType::I64);
+        self.b.def_var(len_var, len_v);
+
         let header = self.b.create_block();
         let body_blk = self.b.create_block();
         let step = self.b.create_block();
@@ -6542,8 +6556,7 @@ this case",
         self.b.ins().jump(header, &[]);
         self.filled = true;
         self.goto_block(header);
-        let lv = self.b.use_var(list_var);
-        let len = self.call_rt("grasm_list_len", &[lv]).unwrap();
+        let len = self.b.use_var(len_var);
         let iv = self.b.use_var(ivar);
         let c = self.b.ins().icmp(IntCC::SignedLessThan, iv, len);
         self.b.ins().brif(c, body_blk, &[], exit, &[]);
