@@ -1910,7 +1910,9 @@ fn build_native_incremental(
     } else if cfg!(target_os = "linux") {
         link.arg("-Wl,--gc-sections");
         // Linux strips fully at link time; macOS needs the tool, below.
-        link.arg("-Wl,-s");
+        if !std::env::var("GRASM_KEEP_SYMBOLS").is_ok_and(|v| v != "0") {
+            link.arg("-Wl,-s");
+        }
     }
     // Captured rather than inherited: the linker's own text names a temporary
     // object file, an internal symbol and an architecture, and four lines of
@@ -1982,7 +1984,13 @@ fn build_native_incremental(
     // used, and a failure is ignored because a larger binary is a worse binary
     // and not a broken one. 437 KB -> 332 KB on a hello-world, against [G5]'s
     // 300 KB budget.
-    if cfg!(target_os = "macos") {
+    // `GRASM_KEEP_SYMBOLS=1` leaves the table in place. A profiler has nothing
+    // else to go on: `sample` on a stripped binary reports every frame as
+    // `???`, so "where does this program spend its time" cannot be answered
+    // about the thing that actually ships. The default is still to strip,
+    // because the table is a quarter of the binary and no program reads it.
+    let keep = std::env::var("GRASM_KEEP_SYMBOLS").is_ok_and(|v| v != "0");
+    if cfg!(target_os = "macos") && !keep {
         let _ = std::process::Command::new("strip")
             .arg("-no_uuid")
             .arg(out_path)

@@ -1596,6 +1596,21 @@ unsafe fn inc(v: *mut RtVal) {
 /// says a program past the bound panics rather than crashing. The depth a
 /// structure can reach is not the depth the code that frees it should need.
 unsafe fn dec(v: *mut RtVal) {
+    // The thread's state is resolved once for the whole traversal rather than
+    // once per value freed.
+    //
+    // On macOS a `thread_local!` access is a call into `_tlv_get_addr`, and a
+    // profile of the tree benchmark put that call at the top by six times —
+    // about a fifth of the program. Dropping a tree of ten thousand nodes made
+    // ten thousand of those calls, one per node, for a pointer that cannot
+    // change: the traversal never leaves the thread it started on.
+    LOCAL.with(|local| dec_in(local, v))
+}
+
+/// The walk itself, with the thread's state already in hand.
+///
+/// # Safety: as `dec`.
+unsafe fn dec_in(local: &Local, v: *mut RtVal) {
     let mut pending: Vec<*mut RtVal> = Vec::new();
     let mut cur = v;
     loop {
@@ -1648,10 +1663,8 @@ unsafe fn dec(v: *mut RtVal) {
                         }
                         _ => {}
                     }
-                    LOCAL.with(|local| {
-                        local.live.set(local.live.get() - 1);
-                        give_box_in(local, cur);
-                    });
+                    local.live.set(local.live.get() - 1);
+                    give_box_in(local, cur);
                 }
             }
         }
