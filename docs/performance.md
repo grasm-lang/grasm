@@ -59,6 +59,41 @@ indexing is pinned and inlined before a loop with an inline bounds check
 fewer elements never touches the heap; a map key of fifteen characters or fewer
 allocates nothing; freed boxes go back to a per-thread pool.
 
+## Measured and rejected, 2026-09-18
+
+**Non-atomic reference counts while a program is single-threaded: worth zero.**
+In isolation an atomic retain/release pair costs 10.1 ns on this machine
+against 0.33 ns for an ordinary one — thirty-one times, most of it the
+release/acquire ordering rather than the read-modify-write. That is a real
+measurement and it is irrelevant: threading here comes only from `par_map` and
+`par_filter`, so the counts *can* be plain integers until one of them runs, and
+making them so changed nothing. Forcing every count back to atomic in the same
+build changed nothing either — `tree` 45 ms both ways, `wordfreq` 39 ms both
+ways. The atomic costs ten nanoseconds when a loop does nothing else and
+disappears into the work around it when the program is doing anything at all.
+Reverted; the branch and the `as_ptr` write were complexity for no gain.
+
+**A per-thread scratch buffer for the free walk: worth zero.** `dec` allocated
+its worklist per call and grew it from nothing. Keeping one per thread for its
+capacity measured nothing on `tree`, which frees six hundred thousand values.
+
+**What the allocation counter says.** `GRASM_ALLOC_STATS=1` reports every
+allocation a program made. The benchmark set splits cleanly in two:
+
+| program | allocations | what that is |
+|---|---:|---|
+| `tree` | 1,180,960 | exactly two per node — the struct box and its list of children |
+| `wordfreq` | 800,003 | exactly two per iteration — the interpolated number and the joined string |
+| `sieve` | 1 | |
+| `sort` | 1 | |
+| `matmul` | 3 | |
+| `fib` | 0 | |
+
+So the two slow rows are slow because of *how many* values they allocate, and
+the four fast-ish rows allocate nothing at all — their gap is entirely code
+generation. Those are two different problems and neither is fixed by making
+allocation cheaper at the margin.
+
 ## What is left, and what each would take
 
 **A bump arena for regions.** The feature exists and currently costs what it

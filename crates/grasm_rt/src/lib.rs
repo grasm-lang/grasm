@@ -356,6 +356,14 @@ pub enum ScalarData {
 }
 
 impl ScalarData {
+    /// Room for `n` more elements, taken now rather than in a dozen doublings.
+    fn reserve(&mut self, n: usize) {
+        match self {
+            ScalarData::Words(v) => v.reserve(n),
+            ScalarData::Bytes(v) => v.reserve(n),
+        }
+    }
+
     fn new(kind: ScalarKind) -> ScalarData {
         match kind {
             ScalarKind::Bool => ScalarData::Bytes(Vec::new()),
@@ -994,6 +1002,21 @@ impl From<Vec<*mut RtVal>> for ListData {
 }
 
 impl ListData {
+    /// Room for `n` elements. Below the inline threshold this is already true
+    /// and does nothing; above it, the heap vector is made at its final size.
+    fn reserve(&mut self, n: usize) {
+        if n <= 4 {
+            return;
+        }
+        if let ListData::Inline { vals, len } = self {
+            let mut heap: Vec<*mut RtVal> = Vec::with_capacity(n);
+            heap.extend_from_slice(&vals[..*len as usize]);
+            *self = ListData::Heap(heap);
+        } else if let ListData::Heap(v) = self {
+            v.reserve(n.saturating_sub(v.len()));
+        }
+    }
+
     fn new() -> ListData {
         ListData::Inline {
             vals: [std::ptr::null_mut(); 4],
@@ -1241,6 +1264,11 @@ struct Local {
     region_depth: Cell<usize>,
     /// The address this thread's stack may not go past.
     stack_floor: Cell<usize>,
+    /// Every allocation this thread has made, whether or not it is still
+    /// live. Reported by `GRASM_ALLOC_STATS`, which is how a question like
+    /// "how many boxes does one iteration of this loop cost" gets an answer
+    /// rather than an estimate off a profile.
+    allocated: Cell<u64>,
 }
 
 thread_local! {
@@ -1254,6 +1282,7 @@ thread_local! {
             regions: std::cell::RefCell::new(Vec::new()),
             region_depth: Cell::new(0),
             stack_floor: Cell::new(0),
+            allocated: Cell::new(0),
         }
     };
 }
@@ -1304,6 +1333,7 @@ unsafe fn give_box_in(local: &Local, p: *mut RtVal) {
 fn alloc(payload: RtPayload) -> *mut RtVal {
     LOCAL.with(|local| {
         local.live.set(local.live.get() + 1);
+        local.allocated.set(local.allocated.get() + 1);
         // Inside a region the value is arena-owned: no reference counting, and
         // the whole set is freed at the closing brace ([T-REGION]).
         let in_region = local.region_depth.get() > 0;
@@ -1338,8 +1368,12 @@ fn alloc(payload: RtPayload) -> *mut RtVal {
 /// finishes, once, and the exit check adds the two.
 static ESCAPED: AtomicI64 = AtomicI64::new(0);
 
+/// What worker threads allocated, for the same report.
+static ESCAPED_ALLOCS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Called by a worker as it ends: its balance becomes everyone's.
 fn hand_back_live() {
+    ESCAPED_ALLOCS.fetch_add(LOCAL.with(|l| l.allocated.replace(0)), Relaxed);
     let n = LOCAL.with(|l| l.live.replace(0));
     if n != 0 {
         ESCAPED.fetch_add(n, Relaxed);
@@ -1384,6 +1418,10 @@ pub extern "C" fn grasm_live_allocations() -> i64 {
 /// nothing else here uses.
 #[no_mangle]
 pub extern "C" fn grasm_check_leaks() {
+    if std::env::var_os("GRASM_ALLOC_STATS").is_some() {
+        let made = LOCAL.with(|l| l.allocated.get()) + ESCAPED_ALLOCS.load(Relaxed);
+        eprintln!("allocations: {made}");
+    }
     if std::env::var_os("GRASM_LEAK_CHECK").is_none() {
         return;
     }
@@ -1452,6 +1490,7 @@ const ARENA: i64 = i64::MAX - 1;
 fn is_counted(rc: i64) -> bool {
     rc != IMMORTAL && rc != ARENA
 }
+
 
 // A `Cell<usize>` depth counter was tried beside this, so that an allocation
 // could ask "am I inside a region" with a load rather than a `RefCell` borrow.
@@ -2116,6 +2155,123 @@ pub unsafe extern "C" fn grasm_par_map_mixed(
 /// # Safety
 /// `list` is a live list; the out-params are writable.
 #[no_mangle]
+/// Opens a scalar list for appending: the buffer, how much is in it, and how
+/// much room it has.
+///
+/// `map` and `filter` fill a list the compiler made a moment earlier, one
+/// element per iteration, and each of those elements used to cross the runtime
+/// boundary — a call, a copy-on-write check and a match on the payload, for a
+/// store. With the buffer and the capacity in hand the loop writes straight
+/// into it and calls back only when the room runs out.
+///
+/// The list must be one the caller owns: this hands out a raw pointer into its
+/// storage, and anything that reallocates it while the pointer is live is a
+/// use-after-free. The compiler only does this for a list it created itself
+/// and that nothing else can name.
+///
+/// # Safety: `list` is a live list this runtime allocated; the out-params are
+/// writable.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_list_append_begin(
+    list: *mut RtVal,
+    kind: i64,
+    out_data: *mut i64,
+    out_len: *mut i64,
+    out_cap: *mut i64,
+) -> *mut RtVal {
+    let want = ScalarKind::from_i64(kind);
+    let target = cow_list(list);
+    if let RtPayload::List(items) = &(*target).payload {
+        let mut data = ScalarData::new(want);
+        for &it in items {
+            data.push(scalar_unbox_val(want, it));
+            dec(it);
+        }
+        (*target).payload = RtPayload::ListScalar { kind: want, data };
+    }
+    match &mut (*target).payload {
+        RtPayload::ListScalar {
+            data: ScalarData::Words(v),
+            ..
+        } => {
+            *out_data = v.as_mut_ptr() as i64;
+            *out_len = v.len() as i64;
+            *out_cap = v.capacity() as i64;
+        }
+        RtPayload::ListScalar {
+            data: ScalarData::Bytes(v),
+            ..
+        } => {
+            *out_data = v.as_mut_ptr() as i64;
+            *out_len = v.len() as i64;
+            *out_cap = v.capacity() as i64;
+        }
+        _ => {
+            *out_data = 0;
+            *out_len = 0;
+            *out_cap = 0;
+        }
+    }
+    target
+}
+
+/// Makes room for at least one more element and republishes the buffer.
+///
+/// # Safety: as `grasm_list_append_begin`; `len` is how many elements the
+/// caller has actually written.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_list_append_grow(
+    list: *mut RtVal,
+    len: i64,
+    out_data: *mut i64,
+    out_cap: *mut i64,
+) {
+    match &mut (*list).payload {
+        RtPayload::ListScalar {
+            data: ScalarData::Words(v),
+            ..
+        } => {
+            v.set_len(len as usize);
+            v.reserve(1);
+            *out_data = v.as_mut_ptr() as i64;
+            *out_cap = v.capacity() as i64;
+        }
+        RtPayload::ListScalar {
+            data: ScalarData::Bytes(v),
+            ..
+        } => {
+            v.set_len(len as usize);
+            v.reserve(1);
+            *out_data = v.as_mut_ptr() as i64;
+            *out_cap = v.capacity() as i64;
+        }
+        _ => {
+            *out_data = 0;
+            *out_cap = 0;
+        }
+    }
+}
+
+/// Closes an append: the list's length becomes what the caller wrote.
+///
+/// # Safety: `len` elements have actually been written through the pointer
+/// `grasm_list_append_begin` handed out, and none of them is uninitialised.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_list_append_end(list: *mut RtVal, len: i64) {
+    match &mut (*list).payload {
+        RtPayload::ListScalar {
+            data: ScalarData::Words(v),
+            ..
+        } => v.set_len(len as usize),
+        RtPayload::ListScalar {
+            data: ScalarData::Bytes(v),
+            ..
+        } => v.set_len(len as usize),
+        _ => {}
+    }
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn grasm_list_pin(
     list: *mut RtVal,
     kind: i64,
@@ -2406,6 +2562,37 @@ unsafe fn items_of<'a>(v: *mut RtVal) -> Items<'a> {
 }
 
 /// A new empty scalar list of the given kind (0 = i64, 1 = f64, 2 = bool).
+#[no_mangle]
+/// An empty scalar list with room for `n` elements already taken.
+///
+/// `xs.map(f)` produces exactly as many elements as it was given, and a range
+/// knows its own length, so the list it builds never has to be grown. Without
+/// this a two-million element sieve grew its flag list twenty-one times,
+/// copying every byte written so far each time — a third of the program's
+/// running time was in the push path rather than in the sieve.
+///
+/// A negative or absurd count reserves nothing rather than failing: the
+/// capacity is a hint, and the pushes that follow are correct either way.
+#[no_mangle]
+pub extern "C" fn grasm_list_new_scalar_cap(kind: i64, n: i64) -> *mut RtVal {
+    let k = ScalarKind::from_i64(kind);
+    let mut data = ScalarData::new(k);
+    if n > 0 && n <= (1 << 34) {
+        data.reserve(n as usize);
+    }
+    alloc(RtPayload::ListScalar { kind: k, data })
+}
+
+/// The same for a list of boxed values.
+#[no_mangle]
+pub extern "C" fn grasm_list_new_cap(n: i64) -> *mut RtVal {
+    let mut data = ListData::new();
+    if n > 0 && n <= (1 << 34) {
+        data.reserve(n as usize);
+    }
+    alloc(RtPayload::List(data))
+}
+
 #[no_mangle]
 pub extern "C" fn grasm_list_new_scalar(kind: i64) -> *mut RtVal {
     let k = ScalarKind::from_i64(kind);
@@ -5726,6 +5913,7 @@ unsafe fn grasm_proc_pipeline_now(
         if i == 0 && !stdin_text.is_empty() {
             // Written on a thread: a large input and a chatty child deadlock
             // if the parent writes everything before it reads anything.
+
             if let Some(mut sink) = child.stdin.take() {
                 let text = stdin_text.clone();
                 std::thread::spawn(move || {
@@ -6932,18 +7120,38 @@ pub unsafe extern "C" fn grasm_range_to_list(r: *mut RtVal) -> *mut RtVal {
     };
     let (start, end, inclusive) = (*start, *end, *inclusive);
     let last = if inclusive { end } else { end - 1 };
-    let out = grasm_list_new_scalar(ScalarKind::I64.to_i64());
-    let mut i = start;
-    while i <= last {
-        grasm_list_push_scalar(out, i, ScalarKind::I64.to_i64());
-        // `i64::MAX` as the last element would wrap the counter back to
-        // `i64::MIN` and iterate forever, so the end is recognised as the end.
-        if i == last {
-            break;
+    // Filled directly rather than pushed one at a time.
+    //
+    // This used to call `grasm_list_push_scalar` per element, so a two-million
+    // element range crossed the runtime boundary two million times and paid a
+    // copy-on-write check and a payload match on each — better than a third of
+    // the sieve benchmark's running time was here rather than in the sieve.
+    // The length is known before the first element, so the vector is made once
+    // at its final size and written straight into.
+    let mut words: Vec<i64> = Vec::new();
+    if start <= last {
+        // Widened so a range spanning the whole of `i64` does not overflow the
+        // count itself, and clamped: a range longer than memory is a bad
+        // program, and pushing until the allocator gives up is a worse answer
+        // than a big allocation that fails honestly.
+        let count = (last as i128 - start as i128 + 1) as u128;
+        words.reserve(count.min(u32::MAX as u128 * 4) as usize);
+        let mut i = start;
+        loop {
+            words.push(i);
+            // `i64::MAX` as the last element would wrap the counter back to
+            // `i64::MIN` and iterate forever, so the end is recognised as the
+            // end.
+            if i == last {
+                break;
+            }
+            i += 1;
         }
-        i += 1;
     }
-    out
+    alloc(RtPayload::ListScalar {
+        kind: ScalarKind::I64,
+        data: ScalarData::Words(words),
+    })
 }
 
 /// How many elements it has, without building them.

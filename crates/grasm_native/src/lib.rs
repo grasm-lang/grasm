@@ -883,6 +883,15 @@ impl<'m> Codegen<'m> {
             ("grasm_map_is_empty", vec![i64t], Some(i8t)),
             ("grasm_list_min_max", vec![i64t, i8t], Some(i64t)),
             ("grasm_list_new_scalar", vec![i64t], Some(i64t)),
+            ("grasm_list_new_scalar_cap", vec![i64t, i64t], Some(i64t)),
+            (
+                "grasm_list_append_begin",
+                vec![i64t, i64t, i64t, i64t, i64t],
+                Some(i64t),
+            ),
+            ("grasm_list_append_grow", vec![i64t, i64t, i64t, i64t], None),
+            ("grasm_list_append_end", vec![i64t, i64t], None),
+            ("grasm_list_new_cap", vec![i64t], Some(i64t)),
             ("grasm_range_new", vec![i64t, i64t, i8t], Some(i64t)),
             ("grasm_env_new", vec![i64t], Some(i64t)),
             ("grasm_env_set", vec![i64t, i64t, i64t, i8t], None),
@@ -1819,6 +1828,7 @@ arguments nor the type this is bound to",
             handler_held: Vec::new(),
             closure_hints: Vec::new(),
             pinned: Vec::new(),
+            appends: Vec::new(),
             tail_hint: None,
             probe_types: Vec::new(),
             probing_args: false,
@@ -2414,6 +2424,7 @@ operation's",
             handler_held: Vec::new(),
             closure_hints: Vec::new(),
             pinned: Vec::new(),
+            appends: Vec::new(),
             tail_hint: None,
             probe_types: Vec::new(),
             probing_args: false,
@@ -2510,6 +2521,7 @@ operation's",
             handler_held: Vec::new(),
             closure_hints: Vec::new(),
             pinned: Vec::new(),
+            appends: Vec::new(),
             tail_hint: None,
             probe_types: Vec::new(),
             probing_args: false,
@@ -2645,6 +2657,7 @@ operation's",
             handler_held: Vec::new(),
             closure_hints: Vec::new(),
             pinned: Vec::new(),
+            appends: Vec::new(),
             tail_hint: None,
             probe_types: Vec::new(),
             probing_args: false,
@@ -2963,6 +2976,9 @@ struct FnCx<'a, 'm> {
     /// length, element type). While pinned, `xs[i]` is a load rather than a
     /// call.
     pinned: Vec<HashMap<String, (Value, Value, VType)>>,
+    /// Lists this loop is appending to with the buffer held open: the name,
+    /// where the elements go, how many there are, and how many fit.
+    appends: Vec<HashMap<String, PinnedAppend>>,
     /// What the value of a block in tail position should be. Only consulted
     /// for the shapes that cannot type themselves — an empty collection
     /// literal — so a stale hint cannot change a program's meaning.
@@ -4092,6 +4108,209 @@ fn merge_fallible_halves(a: VType, b: VType) -> VType {
     }
 }
 
+
+/// Lists a loop body only *appends* to, and the shapes that disqualify one.
+///
+/// `xs.push(v)` is the single use that keeps a list eligible here, exactly as
+/// `xs[i]` is for `indexed_only_lists`. Naming `xs` any other way — passing
+/// it, assigning it, reading its length — could alias or resize it while the
+/// loop holds a pointer into its storage, so it is disqualified.
+fn pushed_only_lists(block: &grasm_syntax::ast::Block) -> Vec<String> {
+    let mut pushed: Vec<String> = Vec::new();
+    let mut bad: Vec<String> = Vec::new();
+    scan_pushes_block(block, &mut pushed, &mut bad);
+    pushed.sort();
+    pushed.dedup();
+    pushed.retain(|n| !bad.contains(n));
+    pushed
+}
+
+/// Whether a loop body can leave without reaching its own end.
+///
+/// The pinned length lives in a register until the loop is over, so a body
+/// that can `break`, `return` or `fail` out would leave the list not knowing
+/// about the elements written since — they would be in the buffer and
+/// invisible. A panic is not in this list: it ends the process ([E-PANIC-EXIT]),
+/// so nothing can observe the length again.
+fn body_leaves_early(block: &grasm_syntax::ast::Block) -> bool {
+    let mut found = false;
+    leaves_early_block(block, &mut found);
+    found
+}
+
+fn leaves_early_block(b: &grasm_syntax::ast::Block, found: &mut bool) {
+    for stmt in &b.stmts {
+        match stmt {
+            Stmt::Break(_) | Stmt::Return(_, _) => *found = true,
+            Stmt::Expr(e) => leaves_early_expr(e, found),
+            Stmt::Let { init, .. } => leaves_early_expr(init, found),
+            Stmt::Assign { value, .. } => leaves_early_expr(value, found),
+            Stmt::While { cond, body, .. } => {
+                leaves_early_expr(cond, found);
+                // A `break` inside a nested loop belongs to that loop.
+                let mut inner = false;
+                leaves_early_block(body, &mut inner);
+                let _ = inner;
+            }
+            Stmt::For { body, iter, .. } => {
+                leaves_early_expr(iter, found);
+                let mut inner = false;
+                leaves_early_block(body, &mut inner);
+                let _ = inner;
+            }
+            _ => {}
+        }
+    }
+}
+
+fn leaves_early_expr(e: &Expr, found: &mut bool) {
+    match e {
+        Expr::Try { .. } => *found = true,
+        Expr::If { cond, then_block, else_branch, .. } => {
+            leaves_early_expr(cond, found);
+            leaves_early_block(then_block, found);
+            match else_branch.as_deref() {
+                Some(ElseBranch::Else(b)) => leaves_early_block(b, found),
+                Some(ElseBranch::ElseIf(e)) => leaves_early_expr(e, found),
+                None => {}
+            }
+        }
+        Expr::Match { scrutinee, arms, .. } => {
+            leaves_early_expr(scrutinee, found);
+            for arm in arms {
+                leaves_early_expr(&arm.body, found);
+            }
+        }
+        Expr::Block(b) => leaves_early_block(b, found),
+        Expr::Call { callee, args, .. } => {
+            // `fail(...)` returns from the enclosing function.
+            if let Expr::Ident(id) = &**callee {
+                if id.name == "fail" {
+                    *found = true;
+                }
+            }
+            leaves_early_expr(callee, found);
+            for a in args {
+                leaves_early_expr(a, found);
+            }
+        }
+        Expr::MethodCall { recv, args, .. } => {
+            leaves_early_expr(recv, found);
+            for a in args {
+                leaves_early_expr(a, found);
+            }
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            leaves_early_expr(lhs, found);
+            leaves_early_expr(rhs, found);
+        }
+        Expr::Unary { expr, .. } => leaves_early_expr(expr, found),
+        _ => {}
+    }
+}
+
+fn scan_pushes_block(b: &grasm_syntax::ast::Block, pushed: &mut Vec<String>, bad: &mut Vec<String>) {
+    for stmt in &b.stmts {
+        match stmt {
+            Stmt::Expr(e) => scan_pushes_expr(e, pushed, bad),
+            Stmt::Let { init, .. } => scan_pushes_expr(init, pushed, bad),
+            Stmt::Assign { target, value, .. } => {
+                scan_pushes_expr(target, pushed, bad);
+                scan_pushes_expr(value, pushed, bad);
+            }
+            Stmt::While { cond, body, .. } => {
+                scan_pushes_expr(cond, pushed, bad);
+                scan_pushes_block(body, pushed, bad);
+            }
+            Stmt::For { iter, body, .. } => {
+                scan_pushes_expr(iter, pushed, bad);
+                scan_pushes_block(body, pushed, bad);
+            }
+            Stmt::Return(Some(v), _) => scan_pushes_expr(v, pushed, bad),
+            _ => {}
+        }
+    }
+}
+
+fn scan_pushes_expr(e: &Expr, pushed: &mut Vec<String>, bad: &mut Vec<String>) {
+    match e {
+        Expr::MethodCall { recv, name, args, .. } if name.name == "push" => {
+            match &**recv {
+                Expr::Ident(id) => pushed.push(id.name.clone()),
+                other => scan_pushes_expr(other, pushed, bad),
+            }
+            for a in args {
+                scan_pushes_expr(a, pushed, bad);
+            }
+        }
+        Expr::Ident(id) => bad.push(id.name.clone()),
+        Expr::Index { recv, index, .. } => {
+            scan_pushes_expr(recv, pushed, bad);
+            scan_pushes_expr(index, pushed, bad);
+        }
+        Expr::Unary { expr, .. } | Expr::Try { expr, .. } => scan_pushes_expr(expr, pushed, bad),
+        Expr::Binary { lhs, rhs, .. } => {
+            scan_pushes_expr(lhs, pushed, bad);
+            scan_pushes_expr(rhs, pushed, bad);
+        }
+        Expr::Call { callee, args, .. } => {
+            scan_pushes_expr(callee, pushed, bad);
+            for a in args {
+                scan_pushes_expr(a, pushed, bad);
+            }
+        }
+        Expr::MethodCall { recv, args, .. } => {
+            scan_pushes_expr(recv, pushed, bad);
+            for a in args {
+                scan_pushes_expr(a, pushed, bad);
+            }
+        }
+        Expr::Field { recv, .. } => scan_pushes_expr(recv, pushed, bad),
+        Expr::List(items, _) | Expr::Tuple(items, _) => {
+            for i in items {
+                scan_pushes_expr(i, pushed, bad);
+            }
+        }
+        Expr::Str(pieces, _) => {
+            for p in pieces {
+                if let StrPiece::Expr(inner) = p {
+                    scan_pushes_expr(inner, pushed, bad);
+                }
+            }
+        }
+        Expr::If { cond, then_block, else_branch, .. } => {
+            scan_pushes_expr(cond, pushed, bad);
+            scan_pushes_block(then_block, pushed, bad);
+            match else_branch.as_deref() {
+                Some(ElseBranch::Else(b)) => scan_pushes_block(b, pushed, bad),
+                Some(ElseBranch::ElseIf(e)) => scan_pushes_expr(e, pushed, bad),
+                None => {}
+            }
+        }
+        Expr::Match { scrutinee, arms, .. } => {
+            scan_pushes_expr(scrutinee, pushed, bad);
+            for arm in arms {
+                scan_pushes_expr(&arm.body, pushed, bad);
+            }
+        }
+        Expr::Block(b) => scan_pushes_block(b, pushed, bad),
+        Expr::Closure { body, .. } => scan_pushes_expr(body, pushed, bad),
+        _ => {}
+    }
+}
+
+/// A list a loop is filling, with its storage pinned for the duration.
+#[derive(Clone, Copy)]
+struct PinnedAppend {
+    list_var: Variable,
+    data_var: Variable,
+    len_var: Variable,
+    cap_var: Variable,
+    data_out: Value,
+    cap_out: Value,
+    stride: i64,
+}
+
 fn indexed_only_lists(block: &grasm_syntax::ast::Block) -> Vec<String> {
     let mut indexed: Vec<String> = Vec::new();
     let mut disqualified: Vec<String> = Vec::new();
@@ -4589,7 +4808,89 @@ impl FnCx<'_, '_> {
             scope.insert(name, (data, len, (*elem).clone()));
         }
         self.pinned.push(scope);
+
+        // Lists the body only appends to get their storage held open for the
+        // whole loop, so `xs.push(v)` is a store rather than a call into the
+        // runtime with a copy-on-write check on the way.
+        //
+        // Only when the body cannot leave early: the length lives in a
+        // register until the loop is over, and a `break` past that point would
+        // leave the elements written but uncounted.
+        let mut appending: HashMap<String, PinnedAppend> = HashMap::new();
+        if !body_leaves_early(body) {
+            for name in pushed_only_lists(body) {
+                let Some((var, VType::List(elem))) = self.lookup(&name) else {
+                    continue;
+                };
+                let Some(kind) = scalar_kind_i64(&elem) else {
+                    continue;
+                };
+                let ptr_ty = self.cg.module.target_config().pointer_type();
+                let slot = self.b.create_sized_stack_slot(
+                    cranelift_codegen::ir::StackSlotData::new(
+                        cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                        24,
+                        3,
+                    ),
+                );
+                let data_out = self.b.ins().stack_addr(ptr_ty, slot, 0);
+                let len_out = self.b.ins().stack_addr(ptr_ty, slot, 8);
+                let cap_out = self.b.ins().stack_addr(ptr_ty, slot, 16);
+                let kc = self.b.ins().iconst(types::I64, kind);
+                let cur = self.b.use_var(var);
+                let held = self
+                    .call_rt(
+                        "grasm_list_append_begin",
+                        &[cur, kc, data_out, len_out, cap_out],
+                    )
+                    .unwrap();
+                self.b.def_var(var, held);
+                let flags = cranelift_codegen::ir::MemFlags::trusted();
+                let d = self.b.ins().load(types::I64, flags, data_out, 0);
+                let l = self.b.ins().load(types::I64, flags, len_out, 0);
+                let c = self.b.ins().load(types::I64, flags, cap_out, 0);
+                let data_var = self.new_var(&VType::I64);
+                let len_var = self.new_var(&VType::I64);
+                let cap_var = self.new_var(&VType::I64);
+                self.b.def_var(data_var, d);
+                self.b.def_var(len_var, l);
+                self.b.def_var(cap_var, c);
+                let stride = if kind == scalar_kind_i64(&VType::Bool).unwrap_or(-1) {
+                    1
+                } else {
+                    8
+                };
+                appending.insert(
+                    name,
+                    PinnedAppend {
+                        list_var: var,
+                        data_var,
+                        len_var,
+                        cap_var,
+                        data_out,
+                        cap_out,
+                        stride,
+                    },
+                );
+            }
+        }
+        self.appends.push(appending);
         Ok(())
+    }
+
+    /// Hands every pinned list its length back, and forgets the pins.
+    ///
+    /// Emitted where the loop has finished — until this runs the elements are
+    /// in the buffer and the list does not know how many there are.
+    fn close_loop_appends(&mut self) {
+        let Some(open) = self.appends.pop() else {
+            return;
+        };
+        for state in open.values() {
+            let held = self.b.use_var(state.list_var);
+            let written = self.b.use_var(state.len_var);
+            self.call_rt("grasm_list_append_end", &[held, written]);
+        }
     }
 
     /// Inline bounds check, then a raw load or the address to store to.
@@ -4633,6 +4934,22 @@ impl FnCx<'_, '_> {
         }
     }
 
+    /// The same, with room for `n` elements taken up front.
+    //
+    // `xs.map(f)` produces exactly as many elements as it consumed, and the
+    // count is in hand before the loop starts — so the list it fills never
+    // has to be grown. A two-million element list grew twenty-one times
+    // without this, copying everything written so far each time.
+    fn new_list_of_cap(&mut self, elem_t: &VType, n: Value) -> Value {
+        match scalar_kind_i64(elem_t) {
+            Some(k) => {
+                let kc = self.b.ins().iconst(types::I64, k);
+                self.call_rt("grasm_list_new_scalar_cap", &[kc, n]).unwrap()
+            }
+            None => self.call_rt("grasm_list_new_cap", &[n]).unwrap(),
+        }
+    }
+
     /// One element out of a list: the typed inline read when the element type
     /// is scalar, the boxed read + unbox otherwise.
     fn list_get_elem(&mut self, list: Value, idx: Value, elem_t: &VType) -> CResult<(Value, VType)> {
@@ -4650,6 +4967,79 @@ impl FnCx<'_, '_> {
 
     /// Appends `v` (a native value of type `vt`) to `list`, choosing the
     /// inline or the boxed path. Consumes `v`'s reference either way.
+    /// The append state for a name, if some enclosing loop is filling it.
+    fn append_state(&self, name: &str) -> Option<PinnedAppend> {
+        for scope in self.appends.iter().rev() {
+            if let Some(state) = scope.get(name) {
+                return Some(*state);
+            }
+        }
+        None
+    }
+
+    /// One element appended to a list whose buffer this loop is holding.
+    //
+    // The list was made here, nothing else can name it, and its capacity was
+    // taken before the loop — so the common iteration is a bounds compare and
+    // a store, and the runtime is called only when the room runs out. Pushing
+    // through `grasm_list_push_scalar` instead cost a call, a copy-on-write
+    // check and a match on the payload for every element, which was a third of
+    // the sieve benchmark.
+    fn append_pinned(
+        &mut self,
+        list_v: Value,
+        data_var: Variable,
+        len_var: Variable,
+        cap_var: Variable,
+        data_out: Value,
+        cap_out: Value,
+        bits: Value,
+        stride: i64,
+    ) {
+        let room = self.b.create_block();
+        let grow = self.b.create_block();
+        let store = self.b.create_block();
+        let len = self.b.use_var(len_var);
+        let cap = self.b.use_var(cap_var);
+        let full = self.b.ins().icmp(IntCC::SignedGreaterThanOrEqual, len, cap);
+        self.b.ins().brif(full, grow, &[], room, &[]);
+        self.filled = true;
+
+        self.goto_block(grow);
+        let len_now = self.b.use_var(len_var);
+        self.call_rt(
+            "grasm_list_append_grow",
+            &[list_v, len_now, data_out, cap_out],
+        );
+        let flags = cranelift_codegen::ir::MemFlags::trusted();
+        let fresh_data = self.b.ins().load(types::I64, flags, data_out, 0);
+        let fresh_cap = self.b.ins().load(types::I64, flags, cap_out, 0);
+        self.b.def_var(data_var, fresh_data);
+        self.b.def_var(cap_var, fresh_cap);
+        self.b.ins().jump(store, &[]);
+        self.filled = true;
+
+        self.goto_block(room);
+        self.b.ins().jump(store, &[]);
+        self.filled = true;
+
+        self.goto_block(store);
+        let data = self.b.use_var(data_var);
+        let at = self.b.use_var(len_var);
+        let off = self.b.ins().imul_imm(at, stride);
+        let addr = self.b.ins().iadd(data, off);
+        let mf = cranelift_codegen::ir::MemFlags::trusted();
+        if stride == 1 {
+            let byte = self.b.ins().ireduce(types::I8, bits);
+            self.b.ins().store(mf, byte, addr, 0);
+        } else {
+            self.b.ins().store(mf, bits, addr, 0);
+        }
+        let one = self.b.ins().iconst(types::I64, 1);
+        let next = self.b.ins().iadd(at, one);
+        self.b.def_var(len_var, next);
+    }
+
     fn list_push_elem(&mut self, list: Value, v: Value, vt: &VType) -> Value {
         if let Some(k) = scalar_kind_i64(vt) {
             let bits = self.scalar_bits_of(v, vt);
@@ -5435,6 +5825,7 @@ impl FnCx<'_, '_> {
                 let (c, ct) = self.eval_expr_val(cond)?;
                 if ct != VType::Bool {
                     self.pinned.pop();
+                    self.appends.pop();
                     return nope(cond.span(), "non-bool while condition");
                 }
                 self.b.ins().brif(c, body_blk, &[], exit, &[]);
@@ -5459,6 +5850,7 @@ impl FnCx<'_, '_> {
                     self.filled = true;
                 }
                 self.goto_block(exit);
+                self.close_loop_appends();
                 Ok(StmtOut::Value(None))
             }
             Stmt::For {
@@ -5850,6 +6242,7 @@ this case",
             self.b.ins().jump(header, &[]);
             self.filled = true;
             self.goto_block(exit);
+            self.close_loop_appends();
             return Ok(StmtOut::Value(None));
         }
 
@@ -7445,6 +7838,23 @@ this case",
             } else {
                 avt
             };
+            // A list this loop is filling with its storage held open: the
+            // element is a store rather than a call.
+            if let Some(state) = self.append_state(&id.name) {
+                let bits = self.scalar_bits_of(av, &avt);
+                let held = self.b.use_var(state.list_var);
+                self.append_pinned(
+                    held,
+                    state.data_var,
+                    state.len_var,
+                    state.cap_var,
+                    state.data_out,
+                    state.cap_out,
+                    bits,
+                    state.stride,
+                );
+                return Ok(None);
+            }
             let cur = self.b.use_var(var);
             let newp = self.list_push_elem(cur, av, &avt);
             self.b.def_var(var, newp);
@@ -14049,11 +14459,64 @@ binding, as in `let f: fn(i64) -> i64 = |x| x + 1`, or make it a top-level `fn`)
         } else {
             Some(elem_t.clone())
         };
-        let out0 = match out_hint {
-            Some(t) => self.new_list_of(&t),
-            None => self.call_rt("grasm_list_new", &[]).unwrap(),
+        // `map` keeps the length it was given and `filter` can only shrink,
+        // so the input's length is the right capacity for both.
+        let sized = {
+            let lv = self.b.use_var(list_var);
+            self.call_rt("grasm_list_len", &[lv]).unwrap()
+        };
+        let out0 = match &out_hint {
+            Some(t) => self.new_list_of_cap(t, sized),
+            None => self.call_rt("grasm_list_new_cap", &[sized]).unwrap(),
         };
         self.b.def_var(out_var, out0);
+
+        // Whether this loop can hold the output's buffer open and store into
+        // it directly. Only for a scalar element type, and only when the body
+        // cannot leave the loop early — a `fail` that returns out of the
+        // enclosing function would abandon the length, which loses elements.
+        let pinned_kind = out_hint
+            .as_ref()
+            .and_then(scalar_kind_i64)
+            .filter(|_| !redirect_fail && !body_can_fail(body));
+        let ptr_ty = self.cg.module.target_config().pointer_type();
+        let append = pinned_kind.map(|k| {
+            let slot = self.b.create_sized_stack_slot(
+                cranelift_codegen::ir::StackSlotData::new(
+                    cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                    24,
+                    3,
+                ),
+            );
+            let data_out = self.b.ins().stack_addr(ptr_ty, slot, 0);
+            let len_out = self.b.ins().stack_addr(ptr_ty, slot, 8);
+            let cap_out = self.b.ins().stack_addr(ptr_ty, slot, 16);
+            let kc = self.b.ins().iconst(types::I64, k);
+            let cur = self.b.use_var(out_var);
+            let held = self
+                .call_rt(
+                    "grasm_list_append_begin",
+                    &[cur, kc, data_out, len_out, cap_out],
+                )
+                .unwrap();
+            self.b.def_var(out_var, held);
+            let flags = cranelift_codegen::ir::MemFlags::trusted();
+            let d = self.b.ins().load(types::I64, flags, data_out, 0);
+            let l = self.b.ins().load(types::I64, flags, len_out, 0);
+            let c = self.b.ins().load(types::I64, flags, cap_out, 0);
+            let data_var = self.new_var(&VType::I64);
+            let len_var = self.new_var(&VType::I64);
+            let cap_var = self.new_var(&VType::I64);
+            self.b.def_var(data_var, d);
+            self.b.def_var(len_var, l);
+            self.b.def_var(cap_var, c);
+            let stride = if k == scalar_kind_i64(&VType::Bool).unwrap_or(-1) {
+                1
+            } else {
+                8
+            };
+            (data_var, len_var, cap_var, data_out, cap_out, stride)
+        });
         let ivar = self.new_var(&VType::I64);
         let zero = self.b.ins().iconst(types::I64, 0);
         self.b.def_var(ivar, zero);
@@ -14113,9 +14576,18 @@ binding, as in `let f: fn(i64) -> i64 = |x| x + 1`, or make it a top-level `fn`)
         }
         let out_elem_t = if is_map { bvt.clone() } else { elem_t.clone() };
         if is_map {
-            let cur = self.b.use_var(out_var);
-            let np = self.list_push_elem(cur, bv, &bvt);
-            self.b.def_var(out_var, np);
+            match append {
+                Some((dv, lv, cv, d_out, c_out, stride)) => {
+                    let bits = self.scalar_bits_of(bv, &bvt);
+                    let held = self.b.use_var(out_var);
+                    self.append_pinned(held, dv, lv, cv, d_out, c_out, bits, stride);
+                }
+                None => {
+                    let cur = self.b.use_var(out_var);
+                    let np = self.list_push_elem(cur, bv, &bvt);
+                    self.b.def_var(out_var, np);
+                }
+            }
             self.pop_scope_with_decs();
             self.b.ins().jump(step, &[]);
             self.filled = true;
@@ -14143,9 +14615,18 @@ binding, as in `let f: fn(i64) -> i64 = |x| x + 1`, or make it a top-level `fn`)
             if evt.boxed() {
                 self.call_rt("grasm_val_inc", &[e2]);
             }
-            let cur = self.b.use_var(out_var);
-            let np = self.list_push_elem(cur, e2, &evt);
-            self.b.def_var(out_var, np);
+            match append {
+                Some((dv, lv, cv, d_out, c_out, stride)) => {
+                    let bits = self.scalar_bits_of(e2, &evt);
+                    let held = self.b.use_var(out_var);
+                    self.append_pinned(held, dv, lv, cv, d_out, c_out, bits, stride);
+                }
+                None => {
+                    let cur = self.b.use_var(out_var);
+                    let np = self.list_push_elem(cur, e2, &evt);
+                    self.b.def_var(out_var, np);
+                }
+            }
             self.b.ins().jump(skip, &[]);
             self.filled = true;
             self.goto_block(skip);
@@ -14167,6 +14648,13 @@ binding, as in `let f: fn(i64) -> i64 = |x| x + 1`, or make it a top-level `fn`)
         // the expression and belongs to whoever asked for it, so it is not
         // released — only the input is.
         self.pop_scope_no_decs();
+        // The length the loop wrote becomes the list's length. Until this
+        // call the elements are in the buffer and the list does not know it.
+        if let Some((_, len_var, _, _, _, _)) = append {
+            let held = self.b.use_var(out_var);
+            let written = self.b.use_var(len_var);
+            self.call_rt("grasm_list_append_end", &[held, written]);
+        }
         let lv3 = self.b.use_var(list_var);
         self.call_rt("grasm_val_dec", &[lv3]);
         let out = self.b.use_var(out_var);
