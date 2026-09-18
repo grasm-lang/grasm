@@ -3,6 +3,9 @@
 //! alpha beta gamma
 //! 6
 //! 0
+//! [0, 1, 10, 11]
+//! [0, 1, 2, 3, 4]
+//! 5 [0, 1, 2]
 fn main() {
     // The loop variable is the element itself, not an index.
     let words = ["alpha", "beta", "gamma"]
@@ -25,4 +28,36 @@ fn main() {
         count = count + 1
     }
     print("{count}")
+
+    // A list filled from a *nested* loop.
+    //
+    // The compiled backend holds a list's buffer open for the loop that fills
+    // it, so a push is a store rather than a call. Two loops filling the same
+    // list each held their own length, and the outer one closed last with the
+    // length it took before the inner loop ran — so this came out empty.
+    var pairs: [i64] = []
+    for i in 0..2 {
+        for j in 0..2 {
+            pairs.push(i * 10 + j)
+        }
+    }
+    print("{pairs}")
+
+    // A loop whose *condition* reads the list it fills.
+    //
+    // The same optimisation keeps the length in a register until the loop
+    // ends. `k.len()` in the condition then read the length the list had
+    // before the first push, every time, and the loop never finished.
+    var k: [i64] = []
+    while k.len() < 5 {
+        k.push(k.len())
+    }
+    print("{k}")
+
+    // And a list read *after* the loop that filled it knows how long it is.
+    var made: [i64] = []
+    for i in 0..3 {
+        made.push(i)
+    }
+    print("{made.len() + 2} {made}")
 }

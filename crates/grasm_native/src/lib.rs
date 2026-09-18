@@ -680,6 +680,13 @@ impl<'m> Codegen<'m> {
             ("grasm_str_lit", vec![ptr, i64t], Some(i64t)),
             ("grasm_str_lit_immortal", vec![ptr, i64t], Some(i64t)),
             ("grasm_str_concat", vec![i64t, i64t], Some(i64t)),
+            ("grasm_str_build", vec![], Some(i64t)),
+            ("grasm_str_build_text", vec![i64t, i64t, i64t], None),
+            ("grasm_str_build_i64", vec![i64t, i64t], None),
+            ("grasm_str_build_f64", vec![i64t, i64t], None),
+            ("grasm_str_build_bool", vec![i64t, i64t], None),
+            ("grasm_str_build_str", vec![i64t, i64t], None),
+            ("grasm_str_build_end", vec![i64t], Some(i64t)),
             ("grasm_str_append", vec![i64t, i64t], Some(i64t)),
             ("grasm_list_concat", vec![i64t, i64t], Some(i64t)),
             ("grasm_list_sort_by", vec![i64t, i64t], Some(i64t)),
@@ -921,9 +928,21 @@ impl<'m> Codegen<'m> {
             if let Some(r) = ret {
                 sig.returns.push(AbiParam::new(*r));
             }
+            // `Hidden` rather than `Import`: the runtime is a static archive
+            // linked into this same program, never a shared library, so every
+            // call to it can be a PC-relative branch.
+            //
+            // `cranelift-module` decides that per call site from the linkage —
+            // `colocated = decl.linkage.is_final()` — and `Import` is not
+            // final, so each call became a load of the symbol's address
+            // followed by an indirect branch. `call_rt` had already set
+            // `colocated` by hand, and the measurement in its comment is why;
+            // but five call sites reach the runtime without going through it,
+            // and those were still paying. Saying what is true about the
+            // linkage fixes all of them, and any written later.
             let id = self
                 .module
-                .declare_function(name, Linkage::Import, &sig)
+                .declare_function(name, Linkage::Hidden, &sig)
                 .map_err(|e| e.to_string())?;
             self.runtime.insert(name, id);
         }
@@ -4777,6 +4796,21 @@ impl FnCx<'_, '_> {
     }
 
     fn pin_loop_lists(&mut self, body: &grasm_syntax::ast::Block) -> CResult<()> {
+        self.pin_loop_lists_with(body, &[])
+    }
+
+    /// The same, told about expressions in the loop's *header* — a `while`
+    /// condition, or what a `for` iterates.
+    ///
+    /// A list whose length the header reads cannot have that length held in a
+    /// register: `while k.len() < 64 { k.push(0) }` would read the length the
+    /// list had before the loop, every time, and never finish. The header is
+    /// part of the loop and has to be scanned with the body.
+    fn pin_loop_lists_with(
+        &mut self,
+        body: &grasm_syntax::ast::Block,
+        header: &[&Expr],
+    ) -> CResult<()> {
         let mut scope: HashMap<String, (Value, Value, VType)> = HashMap::new();
         let candidates: Vec<String> = indexed_only_lists(body);
         for name in candidates {
@@ -4817,8 +4851,26 @@ impl FnCx<'_, '_> {
         // register until the loop is over, and a `break` past that point would
         // leave the elements written but uncounted.
         let mut appending: HashMap<String, PinnedAppend> = HashMap::new();
+        // Anything the header names is off limits, whatever it does with it.
+        let mut header_names: Vec<String> = Vec::new();
+        let mut header_bad: Vec<String> = Vec::new();
+        for e in header {
+            scan_pushes_expr(e, &mut header_names, &mut header_bad);
+        }
         if !body_leaves_early(body) {
             for name in pushed_only_lists(body) {
+                if header_names.contains(&name) || header_bad.contains(&name) {
+                    continue;
+                }
+                // A list an enclosing loop is already filling stays with that
+                // loop. Pinning it again here would give the inner loop its
+                // own length, and the outer one would then close with the
+                // length it captured before the inner loop ran — writing the
+                // list back to what it was. A nested `for` pushing into an
+                // outer list came out empty.
+                if self.append_state(&name).is_some() {
+                    continue;
+                }
                 let Some((var, VType::List(elem))) = self.lookup(&name) else {
                     continue;
                 };
@@ -5439,6 +5491,16 @@ impl FnCx<'_, '_> {
                 ..
             } => {
                 self.index_vals.clear();
+                // `acc = acc + …` on a string is one string growing, not two
+                // being joined: appended in place when nothing else holds it,
+                // which is what makes building text in a loop linear instead
+                // of copying everything written so far on every iteration.
+                if matches!(op, AssignOp::Assign) {
+                    if let Some(out) = self.try_self_append(target, value)? {
+                        let _ = out;
+                        return Ok(StmtOut::Value(None));
+                    }
+                }
                 // Field/index places (any depth, plain or compound).
                 if matches!(target, Expr::Field { .. } | Expr::Index { .. }) {
                     let (root, path) = self.place_path(target)?;
@@ -5815,7 +5877,7 @@ impl FnCx<'_, '_> {
                 // Lists the body only indexes get a raw pointer for the whole
                 // loop, turning each access from a call into a load.
                 self.pin_loop_consts(body)?;
-                self.pin_loop_lists(body)?;
+                self.pin_loop_lists_with(body, &[cond])?;
                 let header = self.b.create_block();
                 let body_blk = self.b.create_block();
                 let exit = self.b.create_block();
@@ -6185,7 +6247,7 @@ this case",
             self.b.def_var(end_var, e);
             // Same as the while loop: lists the body only indexes are pinned
             // for its whole extent so each access is a load, not a call.
-            self.pin_loop_lists(body)?;
+            self.pin_loop_lists_with(body, &[start, end])?;
 
             let header = self.b.create_block();
             let body_blk = self.b.create_block();
@@ -6925,6 +6987,15 @@ this case",
                 if matches!(op, BinaryOp::And | BinaryOp::Or) {
                     return self.short_circuit(*op, lhs, rhs);
                 }
+                // `a + "{n}"` and its longer relatives are one string being
+                // written, not two being joined: built into a single buffer,
+                // the whole tree costs one value instead of one per piece.
+                if *op == BinaryOp::Add && self.is_fusible_concat(e) {
+                    let at = self.call_rt("grasm_str_build", &[]).unwrap();
+                    self.emit_concat_into(at, e)?;
+                    let v = self.call_rt("grasm_str_build_end", &[at]).unwrap();
+                    return Ok(Some((v, VType::Str)));
+                }
                 if *op == BinaryOp::Coalesce {
                     return self.eval_coalesce(lhs, rhs, *span).map(Some);
                 }
@@ -7079,8 +7150,12 @@ this case",
         self.probe_type(first)
     }
 
-    /// Interpolated string as a value: fold pieces with concat.
-    fn build_string(&mut self, pieces: &[StrPiece]) -> CResult<(Value, VType)> {
+    /// The older shape: each piece becomes a value and they are appended.
+    ///
+    /// Kept because it is cheaper than opening a buffer when there is only one
+    /// piece to put in it — `"{n}"` and `"a{n}b"` are one allocation either
+    /// way, and this way there is no builder to open and close.
+    fn fold_string(&mut self, pieces: &[StrPiece]) -> CResult<(Value, VType)> {
         let mut acc: Option<Value> = None;
         for piece in pieces {
             let part: Value = match piece {
@@ -7092,17 +7167,12 @@ this case",
                         VType::F64 => self.call_rt("grasm_str_from_f64", &[v]).unwrap(),
                         VType::Bool => self.call_rt("grasm_str_from_bool", &[v]).unwrap(),
                         VType::Str => v,
-                        ref vt if vt.boxed() => {
+                        VType::Unit => self.str_literal("()"),
+                        ref other if other.boxed() => {
                             let sv = self.call_rt("grasm_str_from_val", &[v]).unwrap();
                             self.call_rt("grasm_val_dec", &[v]);
                             sv
                         }
-                        // A unit carries nothing, so there is nothing to
-                        // read: the text is a constant. It reached here
-                        // unboxed — the boxed arm above runs first, which is
-                        // why the same expression under an annotation always
-                        // compiled and only the inferred one was refused.
-                        VType::Unit => self.str_literal("()"),
                         _ => unreachable!(),
                     }
                 }
@@ -7110,10 +7180,6 @@ this case",
             acc = Some(match acc {
                 None => part,
                 Some(prev) => {
-                    // `prev` is this loop's own intermediate and nothing else
-                    // holds it, so it is handed over rather than copied:
-                    // `"{a}{b}{c}"` builds one string instead of one per
-                    // piece.
                     let joined = self.call_rt("grasm_str_append", &[prev, part]).unwrap();
                     self.call_rt("grasm_val_dec", &[part]);
                     joined
@@ -7124,6 +7190,198 @@ this case",
             Some(v) => v,
             None => self.str_literal(""),
         };
+        Ok((v, VType::Str))
+    }
+
+    /// `a = a + rest` where `a` is a string: appends rather than rebuilding.
+    ///
+    /// Answers `Some(())` when it handled the assignment.
+    fn try_self_append(&mut self, target: &Expr, value: &Expr) -> CResult<Option<()>> {
+        let Expr::Ident(dest) = target else {
+            return Ok(None);
+        };
+        let Expr::Binary { op: BinaryOp::Add, lhs, rhs, .. } = value else {
+            return Ok(None);
+        };
+        let Expr::Ident(from) = &**lhs else {
+            return Ok(None);
+        };
+        if from.name != dest.name {
+            return Ok(None);
+        }
+        let Some((var, VType::Str)) = self.lookup(&dest.name) else {
+            return Ok(None);
+        };
+        if !matches!(self.probe_type(rhs), Ok(VType::Str)) {
+            return Ok(None);
+        }
+        let (part, _) = self.eval_expr_val(rhs)?;
+        let cur = self.b.use_var(var);
+        // `grasm_str_append` takes the left side over and gives back a string
+        // that may be the same box: with one holder it writes into the buffer
+        // it already has.
+        let joined = self.call_rt("grasm_str_append", &[cur, part]).unwrap();
+        self.call_rt("grasm_val_dec", &[part]);
+        self.b.def_var(var, joined);
+        Ok(Some(()))
+    }
+
+    /// The pieces of an interpolation, appended to a buffer already open.
+    fn emit_pieces(&mut self, at: Value, pieces: &[StrPiece]) -> CResult<()> {
+        for piece in pieces {
+            match piece {
+                StrPiece::Text(t) => {
+                    if t.is_empty() {
+                        continue;
+                    }
+                    let (ptr, len) = self.str_ptr_len(t);
+                    self.call_rt("grasm_str_build_text", &[at, ptr, len]);
+                }
+                StrPiece::Expr(inner) => {
+                    let (v, vt) = self.eval_expr_val(inner)?;
+                    match vt {
+                        VType::I64 => {
+                            self.call_rt("grasm_str_build_i64", &[at, v]);
+                        }
+                        VType::F64 => {
+                            let bits = self.b.ins().bitcast(
+                                types::I64,
+                                cranelift_codegen::ir::MemFlags::new(),
+                                v,
+                            );
+                            self.call_rt("grasm_str_build_f64", &[at, bits]);
+                        }
+                        VType::Bool => {
+                            let w = self.b.ins().uextend(types::I64, v);
+                            self.call_rt("grasm_str_build_bool", &[at, w]);
+                        }
+                        VType::Str => {
+                            self.call_rt("grasm_str_build_str", &[at, v]);
+                            self.call_rt("grasm_val_dec", &[v]);
+                        }
+                        // A unit carries nothing, so there is nothing to read.
+                        VType::Unit => {
+                            let (ptr, len) = self.str_ptr_len("()");
+                            self.call_rt("grasm_str_build_text", &[at, ptr, len]);
+                        }
+                        ref other if other.boxed() => {
+                            let sv = self.call_rt("grasm_str_from_val", &[v]).unwrap();
+                            self.call_rt("grasm_val_dec", &[v]);
+                            self.call_rt("grasm_str_build_str", &[at, sv]);
+                            self.call_rt("grasm_val_dec", &[sv]);
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether this `+` tree is worth building in one buffer.
+    ///
+    /// Two plain strings joined are already one allocation, so nothing is
+    /// gained there. What this looks for is a tree with an *interpolation* in
+    /// it, or more than one join — the shapes where each piece currently
+    /// becomes a value of its own on the way to the answer.
+    fn is_fusible_concat(&mut self, e: &Expr) -> bool {
+        if !matches!(self.probe_type(e), Ok(VType::Str)) {
+            return false;
+        }
+        // What the builder saves is allocations. A join whose left side is
+        // not a temporary has to copy, so it costs one; each interpolated
+        // piece costs one more. `words[i] + "{n}"` is therefore two values on
+        // the old path and one on this one.
+        //
+        // `acc = acc + "{i}"` is excluded by the leftmost test: that is one
+        // string growing, and appending into the buffer it already has beats
+        // building a new one however few allocations the new one takes.
+        if Self::leftmost_is_name(e) {
+            return false;
+        }
+        Self::allocating_leaves(e) >= 1
+    }
+
+    /// Whether the left end of a `+` tree is a plain name.
+    fn leftmost_is_name(e: &Expr) -> bool {
+        match e {
+            Expr::Binary { op: BinaryOp::Add, lhs, .. } => Self::leftmost_is_name(lhs),
+            Expr::Ident(_) => true,
+            _ => false,
+        }
+    }
+
+    /// How many values this tree would allocate if each piece were built on
+    /// its own.
+    fn allocating_leaves(e: &Expr) -> i64 {
+        match e {
+            Expr::Binary { op: BinaryOp::Add, lhs, rhs, .. } => {
+                Self::allocating_leaves(lhs) + Self::allocating_leaves(rhs)
+            }
+            Expr::Str(pieces, _) => pieces
+                .iter()
+                .filter(|p| matches!(p, StrPiece::Expr(_)))
+                .count() as i64,
+            _ => 0,
+        }
+    }
+
+    /// Appends whatever this expression contributes to a string under
+    /// construction, flattening joins and interpolations into the same buffer.
+    fn emit_concat_into(&mut self, at: Value, e: &Expr) -> CResult<()> {
+        match e {
+            Expr::Binary { op: BinaryOp::Add, lhs, rhs, .. }
+                if matches!(self.probe_type(e), Ok(VType::Str)) =>
+            {
+                self.emit_concat_into(at, lhs)?;
+                self.emit_concat_into(at, rhs)
+            }
+            Expr::Str(pieces, _) => self.emit_pieces(at, pieces),
+            other => {
+                let (v, vt) = self.eval_expr_val(other)?;
+                if vt != VType::Str {
+                    return nope(other.span(), "joining a non-string with `+`");
+                }
+                self.call_rt("grasm_str_build_str", &[at, v]);
+                self.call_rt("grasm_val_dec", &[v]);
+                Ok(())
+            }
+        }
+    }
+
+    /// Interpolated string as a value, built once.
+    //
+    // Folding the pieces with concat made a value per piece: `"a{n}b"`
+    // formatted the number into a box of its own and then copied it into an
+    // accumulator, which is an allocation and a copy for text the program
+    // asked to write once. The pieces go straight into one buffer now, and
+    // only the finished string becomes a value. The buffer is the thread's and
+    // is kept for its capacity, so a loop building a million strings allocates
+    // one of them.
+    fn build_string(&mut self, pieces: &[StrPiece]) -> CResult<(Value, VType)> {
+        // One piece that is already a string is that string: there is nothing
+        // to join, and going through the builder would copy it for nothing.
+        if let [StrPiece::Expr(inner)] = pieces {
+            if matches!(self.probe_type(inner), Ok(VType::Str)) {
+                return self.eval_expr_val(inner);
+            }
+        }
+        if pieces.is_empty() {
+            return Ok((self.str_literal(""), VType::Str));
+        }
+        // One interpolated piece already costs one value in the old scheme,
+        // and the builder cannot beat one: it would add its own calls to save
+        // an allocation that was not there. Folding wins below two.
+        let interpolated = pieces
+            .iter()
+            .filter(|p| matches!(p, StrPiece::Expr(_)))
+            .count();
+        if interpolated < 2 {
+            return self.fold_string(pieces);
+        }
+        let at = self.call_rt("grasm_str_build", &[]).unwrap();
+        self.emit_pieces(at, pieces)?;
+        let v = self.call_rt("grasm_str_build_end", &[at]).unwrap();
         Ok((v, VType::Str))
     }
 

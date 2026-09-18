@@ -94,6 +94,57 @@ the four fast-ish rows allocate nothing at all — their gap is entirely code
 generation. Those are two different problems and neither is fixed by making
 allocation cheaper at the margin.
 
+## What the other implementations do, and which of it applies here
+
+Read against Rust's `hashbrown`, Zig's `std.hash_map`, Swift's SIL optimizer,
+Lean 4's *Counting Immutable Beans*, Koka's Perceus, Nim's ARC, Go's escape
+analysis and Cranelift's own documentation. Four of those findings changed
+what is worth doing here, and two of them changed it by saying **no**.
+
+**The map is already the good one.** `wordfreq` is the worst row and the
+obvious suspect was the hash table, but this runtime's maps are Rust's
+`HashMap`, which is `hashbrown` — the SwissTable design: one control byte per
+slot holding seven bits of the hash, sixteen slots matched at a time, a
+triangular probe, 87.5% load. Independent measurement puts that at 6.1x a
+chaining map on string keys. There is nothing to take; we have it.
+
+What we do *not* have is a fast hash: the default hasher is SipHash-1-3, which
+SMHasher3 measures at 0.61 bytes/cycle against rapidhash's 8.82, and foldhash's
+own suite puts a word-count workload — ten thousand inserts, ninety per cent
+duplicates, which is exactly `wordfreq` — at 35.36 ns/op under SipHash against
+14.77 under a folded-multiply hash. Our profile says hashing is 16% of
+`wordfreq`, so the ceiling here is about 12%, not 2.4x. **It is a trade, not a
+free win**: SipHash is keyed and flooding-resistant, and a language whose maps
+hold parsed input should not give that up quietly. PolymurHash is the option
+that keeps a proof — almost-universal, 21 cycles for 49 bytes — and is what to
+reach for if this is done at all.
+
+**Reference counting is not the problem it is in those languages.** Lean
+measures 52% for making its counts non-atomic and Koka 5–59%; both were
+tempting until the same experiment here measured zero, twice (above). The
+reason is density: their RC operations are everywhere and ours are sparse.
+The advice that follows from their papers — biased reference counting — is
+therefore the wrong move, and this file records that so it is not tried again.
+
+**What does apply is that every count is a call.** The backend emits
+`call grasm_val_inc` at 189 sites, and Cranelift cannot inline it: its mid-end
+optimises pure instructions and keeps calls in a side-effect skeleton, and it
+has no inliner at all. Nothing in the runtime is an `ir::Function`, so even a
+future Cranelift inliner would not reach it. Emitting the fast path as IR —
+load the count, compare against the two sentinels, add, store, and branch to
+the runtime only when it reaches zero — is the one large win available without
+building anything new.
+
+**Everything else needs an intermediate representation we do not have.**
+Borrow inference (Lean's fixpoint: borrowed by default, owned when consumed),
+drop-guided reuse (the ICFP'22 correction to Lean's algorithm, which otherwise
+grows peak memory without bound), stack promotion (Go's signed-indirection
+flow graph plus an `outlives` test, with Swift's trick of giving a promoted
+object an immortal count so the existing operations become no-ops) — all of
+them run over a mid-level IR. This backend lowers the typed AST straight to
+Cranelift, so there is nowhere to put them. That is the real prerequisite for
+closing the `tree` row, and it is a project rather than a patch.
+
 ## What is left, and what each would take
 
 **A bump arena for regions.** The feature exists and currently costs what it

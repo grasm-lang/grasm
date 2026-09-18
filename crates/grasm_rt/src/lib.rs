@@ -487,6 +487,9 @@ impl ScalarData {
 /// computed once and kept. It also answers whether the text is ASCII — that is
 /// exactly "as many characters as bytes" — which is what makes `code_at(i)` an
 /// index rather than a walk.
+/// How many bytes a string keeps in its own box before it needs the heap.
+pub const INLINE_STR_CAP: usize = 15;
+
 #[derive(Debug)]
 pub struct RtStr {
     s: StrData,
@@ -715,7 +718,7 @@ impl Ord for StrData {
 /// representation and never links the runtime.
 #[derive(Debug, Clone)]
 pub enum StrData {
-    Inline { bytes: [u8; 15], len: u8 },
+    Inline { bytes: [u8; INLINE_STR_CAP], len: u8 },
     Heap(String),
 }
 
@@ -1264,6 +1267,8 @@ struct Local {
     region_depth: Cell<usize>,
     /// The address this thread's stack may not go past.
     stack_floor: Cell<usize>,
+    /// Buffers for building interpolated strings, kept for their capacity.
+    builders: std::cell::RefCell<Vec<Box<String>>>,
     /// Every allocation this thread has made, whether or not it is still
     /// live. Reported by `GRASM_ALLOC_STATS`, which is how a question like
     /// "how many boxes does one iteration of this loop cost" gets an answer
@@ -1283,6 +1288,7 @@ thread_local! {
             region_depth: Cell::new(0),
             stack_floor: Cell::new(0),
             allocated: Cell::new(0),
+            builders: std::cell::RefCell::new(Vec::new()),
         }
     };
 }
@@ -1755,6 +1761,133 @@ pub unsafe extern "C" fn grasm_str_lit_immortal(ptr: *const u8, len: u64) -> *mu
 pub unsafe extern "C" fn grasm_str_lit(ptr: *const u8, len: u64) -> *mut RtVal {
     let bytes = std::slice::from_raw_parts(ptr, len as usize);
     alloc(RtPayload::Str(RtStr::of(&String::from_utf8_lossy(bytes))))
+}
+
+#[no_mangle]
+/// A place to build a string in, taken from this thread and given back.
+///
+/// Every piece of `"a{b}c"` used to become a value of its own: the number was
+/// formatted into a fresh box and then copied into the accumulator, which is
+/// two allocations and a copy for something the program asked to write once.
+/// `wordfreq` allocates exactly two values per iteration for
+/// `words[i % 8] + "{i % 97}"`, and one of them is that intermediate.
+///
+/// Buffers are stacked rather than single, because a piece can itself
+/// interpolate — `"{ "{inner}" }"` is legal — and they are kept for their
+/// capacity, so a loop that builds a million strings allocates the buffer
+/// once.
+///
+/// # Safety: the handle is one this thread was given by `grasm_str_build` and
+/// has not yet ended.
+#[no_mangle]
+pub extern "C" fn grasm_str_build() -> i64 {
+    LOCAL.with(|local| {
+        let mut held = local.builders.borrow_mut();
+        // The box is recycled, not made: `Box::new` here would be a fresh
+        // allocation for every string built, which is the allocation this was
+        // written to remove.
+        let mut buf = held.pop().unwrap_or_else(|| Box::new(String::new()));
+        buf.clear();
+        Box::into_raw(buf) as i64
+    })
+}
+
+/// # Safety: `at` is a live builder handle; `ptr`/`len` are a UTF-8 slice.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_str_build_text(at: i64, ptr: i64, len: i64) {
+    let buf = &mut *(at as *mut String);
+    let bytes = std::slice::from_raw_parts(ptr as *const u8, len as usize);
+    buf.push_str(std::str::from_utf8_unchecked(bytes));
+}
+
+/// # Safety: `at` is a live builder handle.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_str_build_i64(at: i64, v: i64) {
+    let buf = &mut *(at as *mut String);
+    // Digits written by hand rather than through `core::fmt`: the formatting
+    // machinery is a trait object, a width calculation and a padding pass for
+    // something that is a divide and a table lookup.
+    let mut digits = [0u8; 20];
+    let mut at_end = digits.len();
+    let negative = v < 0;
+    // Taken as unsigned so the most negative integer, which has no positive
+    // counterpart, does not wrap when its sign is removed.
+    let mut n = v.unsigned_abs();
+    loop {
+        at_end -= 1;
+        digits[at_end] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    if negative {
+        at_end -= 1;
+        digits[at_end] = b'-';
+    }
+    buf.push_str(std::str::from_utf8_unchecked(&digits[at_end..]));
+}
+
+/// # Safety: `at` is a live builder handle.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_str_build_f64(at: i64, bits: i64) {
+    let buf = &mut *(at as *mut String);
+    buf.push_str(&float_text(f64::from_bits(bits as u64)));
+}
+
+/// # Safety: `at` is a live builder handle.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_str_build_bool(at: i64, v: i64) {
+    let buf = &mut *(at as *mut String);
+    buf.push_str(if v != 0 { "true" } else { "false" });
+}
+
+/// # Safety: `at` is a live builder handle; `v` is a live string value.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_str_build_str(at: i64, v: *mut RtVal) {
+    let RtPayload::Str(s) = &(*v).payload else {
+        grasm_panic_msg_str("interpolating a non-string as a string");
+    };
+    let text: &str = s;
+    let (p, n) = (text.as_ptr(), text.len());
+    let buf = &mut *(at as *mut String);
+    buf.push_str(std::str::from_utf8_unchecked(std::slice::from_raw_parts(p, n)));
+}
+
+/// The finished string, and the buffer back to the thread.
+///
+/// # Safety: `at` is a live builder handle, not used again after this.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_str_build_end(at: i64) -> *mut RtVal {
+    let mut buf = Box::from_raw(at as *mut String);
+    // A short result is copied into the value's own inline storage and the
+    // buffer comes back for the next one. A long result is *moved*: copying it
+    // would be a second pass over text that was just written, which is what
+    // made `acc = acc + "{i}"` — a loop that grows one string — twice as slow
+    // as the concatenation it replaced. The buffer is given up in that case
+    // and the next build makes a fresh one.
+    if buf.len() > INLINE_STR_CAP {
+        let owned = std::mem::take(&mut *buf);
+        let out = alloc(RtPayload::Str(RtStr::new(owned)));
+        LOCAL.with(|local| {
+            let mut held = local.builders.borrow_mut();
+            if held.len() < 8 {
+                held.push(buf);
+            }
+        });
+        return out;
+    }
+    let out = alloc(RtPayload::Str(RtStr::of(&buf)));
+    buf.clear();
+    LOCAL.with(|local| {
+        let mut held = local.builders.borrow_mut();
+        // A handful is enough to cover any nesting a program actually has;
+        // past that the buffer is dropped rather than hoarded.
+        if held.len() < 8 {
+            held.push(buf);
+        }
+    });
+    out
 }
 
 #[no_mangle]
