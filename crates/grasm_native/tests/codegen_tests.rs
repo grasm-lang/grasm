@@ -8,7 +8,11 @@ fn compile(src: &str) -> Result<Vec<u8>, String> {
     let program = grasm_sema::loader::load_with("main", "test.gr", &provider);
     assert!(program.diagnostics.is_empty());
     let analysis = grasm_sema::check::check_program(&program);
-    assert!(analysis.diagnostics.is_empty(), "{:#?}", analysis.diagnostics);
+    assert!(
+        analysis.diagnostics.is_empty(),
+        "{:#?}",
+        analysis.diagnostics
+    );
     let tmp = std::env::temp_dir().join(format!(
         "grasm_cg_test_{}_{:p}.o",
         std::process::id(),
@@ -57,7 +61,9 @@ fn unsupported_features_reported_cleanly() {
     let program = grasm_sema::loader::load_with("main", "test.gr", &provider);
     let diags = grasm_sema::check::check_program(&program).diagnostics;
     assert!(
-        diags.iter().any(|d| d.message.contains("not determined by anything")),
+        diags
+            .iter()
+            .any(|d| d.message.contains("not determined by anything")),
         "got: {diags:#?}"
     );
 }
@@ -72,10 +78,8 @@ fn n2_strings_and_lists_compile() {
 
 #[test]
 fn n2_list_of_strings_compiles() {
-    compile(
-        "fn main() {\n    var ws = [\"a\", \"b\"]\n    ws.push(\"c\")\n    print(ws)\n}\n",
-    )
-    .expect("should compile");
+    compile("fn main() {\n    var ws = [\"a\", \"b\"]\n    ws.push(\"c\")\n    print(ws)\n}\n")
+        .expect("should compile");
 }
 
 #[test]
@@ -178,11 +182,8 @@ fn emits_objects_for_all_supported_targets() {
         "s390x-unknown-linux-gnu",
         "x86_64-apple-darwin",
     ] {
-        let tmp = std::env::temp_dir().join(format!(
-            "grasm_xtarget_{}_{}.o",
-            std::process::id(),
-            target
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("grasm_xtarget_{}_{}.o", std::process::id(), target));
         let r = grasm_native::compile_object_for(&program, &tmp, Some(target));
         assert!(r.is_ok(), "target {target} failed: {:?}", r.err());
         let bytes = std::fs::read(&tmp).unwrap();
@@ -284,10 +285,8 @@ fn a_generic_calling_a_generic_compiles() {
 fn an_unused_generic_needs_no_instantiation() {
     // A generic that is never called has no concrete types, so there is
     // nothing to emit — and that must not be an error.
-    compile(
-        "fn unused[T](x: T) -> T {\n    x\n}\n\nfn main() {\n    print(\"fine\")\n}\n",
-    )
-    .expect("an uncalled generic should not need a symbol");
+    compile("fn unused[T](x: T) -> T {\n    x\n}\n\nfn main() {\n    print(\"fine\")\n}\n")
+        .expect("an uncalled generic should not need a symbol");
 }
 
 #[test]
@@ -354,10 +353,8 @@ fn a_closure_argument_declared_after_it_still_types() {
     // The call names `i`, which is declared *after* the closure. The closure
     // is lowered first, so its parameter type has to come from the binding's
     // initializer rather than the binding itself.
-    compile(
-        "fn main() {\n    let f = |x| x + 1\n    var i = 0\n    print(\"{f(i)}\")\n}\n",
-    )
-    .expect("a later binding should still give the parameter its type");
+    compile("fn main() {\n    let f = |x| x + 1\n    var i = 0\n    print(\"{f(i)}\")\n}\n")
+        .expect("a later binding should still give the parameter its type");
 }
 
 #[test]

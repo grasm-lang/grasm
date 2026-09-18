@@ -120,9 +120,12 @@ impl VType {
             VType::List(t) | VType::Ref(t) | VType::Option(t) => t.depth(),
             VType::Fallible(a, b) | VType::Map(a, b) => a.depth().max(b.depth()),
             VType::Tuple(ts) => ts.iter().map(|t| t.depth()).max().unwrap_or(0),
-            VType::Fn(ps, r) => {
-                ps.iter().map(|t| t.depth()).max().unwrap_or(0).max(r.depth())
-            }
+            VType::Fn(ps, r) => ps
+                .iter()
+                .map(|t| t.depth())
+                .max()
+                .unwrap_or(0)
+                .max(r.depth()),
             _ => 0,
         }
     }
@@ -231,7 +234,6 @@ impl VType {
                 | VType::Any
         )
     }
-
 }
 
 #[derive(Clone)]
@@ -286,7 +288,6 @@ fn compile_object_scoped(
     target: Option<&str>,
     only_module: Option<&str>,
 ) -> Result<(), String> {
-
     let mut flags = settings::builder();
     flags.set("is_pic", "true").map_err(|e| e.to_string())?;
     flags.set("opt_level", "speed").map_err(|e| e.to_string())?;
@@ -321,7 +322,11 @@ fn compile_object_scoped(
     cg.resolved_types = analysis.resolved_types.into_iter().collect();
     cg.only_module = only_module.map(str::to_string);
     cg.declare_runtime()?;
-    let views: Vec<(String, &AstModule, std::collections::HashMap<String, String>)> = program
+    let views: Vec<(
+        String,
+        &AstModule,
+        std::collections::HashMap<String, String>,
+    )> = program
         .files
         .iter()
         .map(|f| (f.name.clone(), &f.module, f.imports.clone()))
@@ -331,9 +336,8 @@ fn compile_object_scoped(
     // fired in, and an absolute path from the machine that built the
     // compiler, with no `error:` line of grasm's own. Caught here so it
     // arrives as a diagnostic that says what happened and what still works.
-    let compiled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        cg.compile_program(&views)
-    }));
+    let compiled =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cg.compile_program(&views)));
     let compiled = match compiled {
         Ok(r) => r,
         Err(_) => {
@@ -730,8 +734,16 @@ impl<'m> Codegen<'m> {
             ("grasm_struct_get_at", vec![i64t, i64t], Some(i64t)),
             ("grasm_struct_scalar_at", vec![i64t, i64t], Some(i64t)),
             ("grasm_struct_borrow_at", vec![i64t, i64t], Some(i64t)),
-            ("grasm_struct_set_field", vec![i64t, ptr, i64t, i64t], Some(i64t)),
-            ("grasm_struct_set_field_at", vec![i64t, i64t, i64t], Some(i64t)),
+            (
+                "grasm_struct_set_field",
+                vec![i64t, ptr, i64t, i64t],
+                Some(i64t),
+            ),
+            (
+                "grasm_struct_set_field_at",
+                vec![i64t, i64t, i64t],
+                Some(i64t),
+            ),
             ("grasm_variant_new", vec![ptr, i64t, ptr, i64t], Some(i64t)),
             ("grasm_variant_push", vec![i64t, i64t], None),
             ("grasm_variant_is", vec![i64t, ptr, i64t], Some(i8t)),
@@ -816,7 +828,11 @@ impl<'m> Codegen<'m> {
             ("grasm_fn_new", vec![i64t, i64t, ptr, i64t], Some(i64t)),
             ("grasm_fn_code", vec![i64t], Some(i64t)),
             ("grasm_fn_env", vec![i64t], Some(i64t)),
-            ("grasm_handler_lookup", vec![ptr, i64t, ptr, i64t], Some(ptr)),
+            (
+                "grasm_handler_lookup",
+                vec![ptr, i64t, ptr, i64t],
+                Some(ptr),
+            ),
             ("grasm_handler_env", vec![ptr, i64t, ptr, i64t], Some(ptr)),
             ("grasm_args", vec![], Some(i64t)),
             ("grasm_input", vec![], Some(i64t)),
@@ -834,7 +850,11 @@ impl<'m> Codegen<'m> {
             ("grasm_net_close", vec![i64t], None),
             ("grasm_net_wait", vec![i64t, i64t], Some(i64t)),
             ("grasm_net_port", vec![i64t], Some(i64t)),
-            ("grasm_map_add_i64", vec![i64t, i64t, i64t, i64t], Some(i64t)),
+            (
+                "grasm_map_add_i64",
+                vec![i64t, i64t, i64t, i64t],
+                Some(i64t),
+            ),
             ("grasm_proc_run", vec![i64t, i64t], Some(i64t)),
             ("grasm_proc_pipeline", vec![i64t, i64t], Some(i64t)),
             // The C boundary ([T-EXTERN-POINTER]).
@@ -912,13 +932,33 @@ impl<'m> Codegen<'m> {
             ("grasm_range_inclusive", vec![i64t], Some(i8t)),
             ("grasm_list_push_scalar", vec![i64t, i64t, i64t], Some(i64t)),
             ("grasm_list_get_scalar", vec![i64t, i64t, i64t], Some(i64t)),
-            ("grasm_list_set_scalar", vec![i64t, i64t, i64t, i64t], Some(i64t)),
+            (
+                "grasm_list_set_scalar",
+                vec![i64t, i64t, i64t, i64t],
+                Some(i64t),
+            ),
             ("grasm_list_pin", vec![i64t, i64t, ptr, ptr], Some(i64t)),
             ("grasm_panic_index", vec![i64t, i64t], None),
-            ("grasm_par_map_scalar", vec![i64t, ptr, ptr, i64t, i64t], Some(i64t)),
-            ("grasm_par_map_mixed", vec![i64t, ptr, ptr, i64t, i64t, i64t], Some(i64t)),
-            ("grasm_par_filter_scalar", vec![i64t, ptr, ptr, i64t], Some(i64t)),
-            ("grasm_par_filter_boxed", vec![i64t, ptr, ptr, i64t], Some(i64t)),
+            (
+                "grasm_par_map_scalar",
+                vec![i64t, ptr, ptr, i64t, i64t],
+                Some(i64t),
+            ),
+            (
+                "grasm_par_map_mixed",
+                vec![i64t, ptr, ptr, i64t, i64t, i64t],
+                Some(i64t),
+            ),
+            (
+                "grasm_par_filter_scalar",
+                vec![i64t, ptr, ptr, i64t],
+                Some(i64t),
+            ),
+            (
+                "grasm_par_filter_boxed",
+                vec![i64t, ptr, ptr, i64t],
+                Some(i64t),
+            ),
         ];
         for (name, params, ret) in decls {
             let mut sig = self.module.make_signature();
@@ -1054,7 +1094,11 @@ impl<'m> Codegen<'m> {
     /// namespace (as in the checker); functions are per-module symbols.
     fn compile_program(
         &mut self,
-        views: &[(String, &AstModule, std::collections::HashMap<String, String>)],
+        views: &[(
+            String,
+            &AstModule,
+            std::collections::HashMap<String, String>,
+        )],
     ) -> CResult<()> {
         for (name, m, imports) in views {
             self.module_imports.insert(name.clone(), imports.clone());
@@ -1287,17 +1331,12 @@ impl<'m> Codegen<'m> {
                             for f in &v.fields {
                                 fts.push(self.vtype_of(&f.ty)?);
                             }
-                            self.variant_index.insert(
-                                v.name.name.clone(),
-                                (t.name.name.clone(), v.fields.len()),
-                            );
+                            self.variant_index
+                                .insert(v.name.name.clone(), (t.name.name.clone(), v.fields.len()));
                             self.variant_by_module
                                 .entry(self.current_module.clone())
                                 .or_default()
-                                .insert(
-                                    v.name.name.clone(),
-                                    (t.name.name.clone(), v.fields.len()),
-                                );
+                                .insert(v.name.name.clone(), (t.name.name.clone(), v.fields.len()));
                             vs.push((v.name.name.clone(), fts));
                         }
                         self.sums.insert(t.name.name.clone(), vs);
@@ -1450,14 +1489,20 @@ arguments nor the type this is bound to",
                 }
                 TypeBody::Alias(te) => {
                     let t = self.vtype_of(te)?;
-                    self.aliases.insert(key.clone(), grasm_syntax::ast::TypeExpr::Name {
-                        path: grasm_syntax::ast::Path {
-                            segments: vec![Ident { name: t.show(), span }],
+                    self.aliases.insert(
+                        key.clone(),
+                        grasm_syntax::ast::TypeExpr::Name {
+                            path: grasm_syntax::ast::Path {
+                                segments: vec![Ident {
+                                    name: t.show(),
+                                    span,
+                                }],
+                                span,
+                            },
+                            args: Vec::new(),
                             span,
                         },
-                        args: Vec::new(),
-                        span,
-                    });
+                    );
                 }
             }
             Ok(())
@@ -1647,8 +1692,10 @@ arguments nor the type this is bound to",
                 // Constants are inlined at each use, so there is no symbol to
                 // declare — see `const_inits`.
                 Decl::Const(c) => {
-                    self.consts
-                        .insert(format!("{}::{}", self.current_module, c.name.name), c.clone());
+                    self.consts.insert(
+                        format!("{}::{}", self.current_module, c.name.name),
+                        c.clone(),
+                    );
                 }
                 Decl::Fn(f) => {
                     if !f.generics.is_empty() {
@@ -1715,7 +1762,11 @@ arguments nor the type this is bound to",
                         },
                     );
                 }
-                Decl::Test(_) | Decl::Bench(_) | Decl::Import(_) | Decl::Type(_) | Decl::Effect(_) => {}
+                Decl::Test(_)
+                | Decl::Bench(_)
+                | Decl::Import(_)
+                | Decl::Type(_)
+                | Decl::Effect(_) => {}
             }
         }
         Ok(())
@@ -1768,7 +1819,8 @@ arguments nor the type this is bound to",
             let rep_id = self.runtime["grasm_report_main_err"];
             let rep_ref = self.module.declare_func_in_func(rep_id, b.func);
             b.ins().call(rep_ref, &[res]);
-            b.ins().trap(cranelift_codegen::ir::TrapCode::unwrap_user(1));
+            b.ins()
+                .trap(cranelift_codegen::ir::TrapCode::unwrap_user(1));
             b.switch_to_block(ok_blk);
             // The `Ok(())` a fallible `main` returns is an allocation like any
             // other, and nothing released it — so every program whose entry
@@ -1821,9 +1873,14 @@ arguments nor the type this is bound to",
 
         let mut ctx = self.module.make_context();
         for (p, m) in sig_params.iter().zip(&sig_modes) {
-            ctx.func.signature.params.push(AbiParam::new(
-                if *m == ParamMode::Inout { ptr_ty } else { p.cl() },
-            ));
+            ctx.func
+                .signature
+                .params
+                .push(AbiParam::new(if *m == ParamMode::Inout {
+                    ptr_ty
+                } else {
+                    p.cl()
+                }));
         }
         if sig_ret != VType::Unit {
             ctx.func.signature.returns.push(AbiParam::new(sig_ret.cl()));
@@ -1867,13 +1924,13 @@ arguments nor the type this is bound to",
         // it, and the address of a scratch slot stands in for the stack
         // pointer.
         if fcx.cg.recursive.contains(&key) {
-            let slot = fcx.b.create_sized_stack_slot(
-                cranelift_codegen::ir::StackSlotData::new(
+            let slot = fcx
+                .b
+                .create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
                     cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
                     8,
                     3,
-                ),
-            );
+                ));
             let here = fcx.b.ins().stack_addr(ptr_ty, slot, 0);
             fcx.call_rt("grasm_stack_check", &[here]);
         }
@@ -2074,8 +2131,7 @@ arguments nor the type this is bound to",
     ) -> CResult<Vec<(String, HandlerOpCode, Vec<String>)>> {
         let mut site = Vec::new();
         for (fname, fexpr) in fields {
-            let Some((_, param_ts, ret_t)) =
-                ops.iter().find(|(o, _, _)| *o == fname.name).cloned()
+            let Some((_, param_ts, ret_t)) = ops.iter().find(|(o, _, _)| *o == fname.name).cloned()
             else {
                 return nope(fname.span, format!("the operation `{}`", fname.name));
             };
@@ -2111,11 +2167,7 @@ operation's",
                         // the second crashed the program it produced. The
                         // wrapper is built where every other one is, when the
                         // handler is installed.
-                        site.push((
-                            fname.name.clone(),
-                            HandlerOpCode::Named(key),
-                            Vec::new(),
-                        ));
+                        site.push((fname.name.clone(), HandlerOpCode::Named(key), Vec::new()));
                         continue;
                     }
                 }
@@ -2255,7 +2307,10 @@ operation's",
     /// Lifts a handler literal written in a value position, keyed by its own
     /// span rather than by a `with`.
     fn lift_handler_literal(&mut self, lit: &Expr) -> CResult<()> {
-        let Expr::StructLit { name, fields, span, .. } = lit else {
+        let Expr::StructLit {
+            name, fields, span, ..
+        } = lit
+        else {
             return Ok(());
         };
         if self.handler_sites.contains_key(&span.start) {
@@ -2318,7 +2373,10 @@ operation's",
         if sig_info.ret != VType::Unit {
             sig.returns.push(AbiParam::new(sig_info.ret.cl()));
         }
-        let sym = format!("gv_{}", key_for_sym.replace([':', '.', '[', ']', ',', '#'], "_"));
+        let sym = format!(
+            "gv_{}",
+            key_for_sym.replace([':', '.', '[', ']', ',', '#'], "_")
+        );
         let id = self
             .module
             .declare_function(&sym, Linkage::Local, &sig)
@@ -2340,8 +2398,9 @@ operation's",
         // A handler operation's is a stack address, and releasing one of those
         // is a decrement through a live frame.
         if owns_env {
-            let dec_ref =
-                self.module.declare_func_in_func(self.runtime["grasm_val_dec"], b.func);
+            let dec_ref = self
+                .module
+                .declare_func_in_func(self.runtime["grasm_val_dec"], b.func);
             b.ins().call(dec_ref, &[env]);
         } else {
             let _ = env;
@@ -2556,13 +2615,13 @@ operation's",
         // that guards named functions never sees it.
         if body_can_call(&c.body) {
             let ptr_ty = fcx.cg.module.target_config().pointer_type();
-            let slot = fcx.b.create_sized_stack_slot(
-                cranelift_codegen::ir::StackSlotData::new(
+            let slot = fcx
+                .b
+                .create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
                     cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
                     8,
                     3,
-                ),
-            );
+                ));
             let here = fcx.b.ins().stack_addr(ptr_ty, slot, 0);
             fcx.call_rt("grasm_stack_check", &[here]);
         }
@@ -2646,7 +2705,11 @@ operation's",
     }
 
     fn compile_handler(&mut self, mut h: PendingHandler) -> CResult<()> {
-        h.captures = self.handler_captures.get(&h.id).cloned().unwrap_or_default();
+        h.captures = self
+            .handler_captures
+            .get(&h.id)
+            .cloned()
+            .unwrap_or_default();
         let mut ctx = self.module.make_context();
         let ptr_ty = self.module.target_config().pointer_type();
         // The environment is always the first parameter, even when empty, so
@@ -2692,13 +2755,13 @@ operation's",
         // that guards named functions never sees it.
         if body_can_call(&h.body) {
             let ptr_ty = fcx.cg.module.target_config().pointer_type();
-            let slot = fcx.b.create_sized_stack_slot(
-                cranelift_codegen::ir::StackSlotData::new(
+            let slot = fcx
+                .b
+                .create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
                     cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
                     8,
                     3,
-                ),
-            );
+                ));
             let here = fcx.b.ins().stack_addr(ptr_ty, slot, 0);
             fcx.call_rt("grasm_stack_check", &[here]);
         }
@@ -2830,11 +2893,7 @@ operation's",
     /// a pointer and a length per field. The pointers are relocations, so the
     /// text itself is the same interned bytes every other mention of that name
     /// uses.
-    fn struct_desc(
-        &mut self,
-        name: &str,
-        fields: &[String],
-    ) -> cranelift_module::DataId {
+    fn struct_desc(&mut self, name: &str, fields: &[String]) -> cranelift_module::DataId {
         let key = format!("{name}\u{0}{}", fields.join("\u{0}"));
         if let Some(id) = self.struct_descs.get(&key) {
             return *id;
@@ -3078,7 +3137,11 @@ fn const_node(module: &str, name: &str) -> String {
 /// through that parameter is opaque here and can close a cycle this cannot
 /// see.
 fn recursive_functions(
-    views: &[(String, &AstModule, std::collections::HashMap<String, String>)],
+    views: &[(
+        String,
+        &AstModule,
+        std::collections::HashMap<String, String>,
+    )],
 ) -> std::collections::HashSet<String> {
     let mut calls: HashMap<String, Vec<String>> = HashMap::new();
     let mut out: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -3146,7 +3209,10 @@ fn recursive_functions(
             collect_idents_block(&f.body, &mut idents);
             let called: std::collections::HashSet<&str> =
                 named.iter().map(|(n, _)| n.as_str()).collect();
-            if idents.iter().any(|i| !called.contains(i.as_str()) && fn_names.contains(i)) {
+            if idents
+                .iter()
+                .any(|i| !called.contains(i.as_str()) && fn_names.contains(i))
+            {
                 out.insert(key.clone());
             }
             let mut callees: Vec<String> = named
@@ -3190,10 +3256,7 @@ fn recursive_functions(
 
 /// Every `f(args...)` in a block where `f` is a plain name, innermost first.
 /// Every struct literal a statement contains, as (type path, fields).
-fn collect_struct_lits_stmt<'e>(
-    s: &'e Stmt,
-    out: &mut Vec<(&'e Path, &'e Vec<(Ident, Expr)>)>,
-) {
+fn collect_struct_lits_stmt<'e>(s: &'e Stmt, out: &mut Vec<(&'e Path, &'e Vec<(Ident, Expr)>)>) {
     match s {
         Stmt::Let { init, .. } => collect_struct_lits(init, out),
         Stmt::Assign { value, .. } => collect_struct_lits(value, out),
@@ -3211,12 +3274,11 @@ fn collect_struct_lits_stmt<'e>(
     }
 }
 
-fn collect_struct_lits<'e>(
-    e: &'e Expr,
-    out: &mut Vec<(&'e Path, &'e Vec<(Ident, Expr)>)>,
-) {
+fn collect_struct_lits<'e>(e: &'e Expr, out: &mut Vec<(&'e Path, &'e Vec<(Ident, Expr)>)>) {
     match e {
-        Expr::StructLit { name, fields, base, .. } => {
+        Expr::StructLit {
+            name, fields, base, ..
+        } => {
             out.push((name, fields));
             if let Some(b) = base {
                 collect_struct_lits(b, out);
@@ -3304,16 +3366,14 @@ fn collect_named_calls_expr(e: &Expr, out: &mut Vec<(String, Vec<Expr>)>) {
             collect_named_calls_expr(cond, out);
             collect_named_calls_block(then_block, out);
             match else_branch.as_deref() {
-                Some(grasm_syntax::ast::ElseBranch::Else(b)) => {
-                    collect_named_calls_block(b, out)
-                }
-                Some(grasm_syntax::ast::ElseBranch::ElseIf(e)) => {
-                    collect_named_calls_expr(e, out)
-                }
+                Some(grasm_syntax::ast::ElseBranch::Else(b)) => collect_named_calls_block(b, out),
+                Some(grasm_syntax::ast::ElseBranch::ElseIf(e)) => collect_named_calls_expr(e, out),
                 None => {}
             }
         }
-        Expr::Match { scrutinee, arms, .. } => {
+        Expr::Match {
+            scrutinee, arms, ..
+        } => {
             collect_named_calls_expr(scrutinee, out);
             for a in arms {
                 collect_named_calls_expr(&a.body, out);
@@ -3441,7 +3501,13 @@ fn collect_calls_expr(e: &Expr, bound: &[String], out: &mut HashMap<String, Vec<
     // are: one element of `xs`. Recording `xs[0]` as a stand-in argument is
     // enough — the hint is only ever *probed*, never evaluated, so an index
     // that might be out of range costs nothing.
-    if let Expr::MethodCall { recv, name, args, span } = e {
+    if let Expr::MethodCall {
+        recv,
+        name,
+        args,
+        span,
+    } = e
+    {
         let per_element = matches!(
             name.name.as_str(),
             "map" | "par_map" | "filter" | "par_filter" | "any" | "all" | "find" | "sort_by"
@@ -3536,13 +3602,13 @@ fn collect_calls_expr(e: &Expr, bound: &[String], out: &mut HashMap<String, Vec<
                         collect_calls_stmt(st, bound, out);
                     }
                 }
-                Some(grasm_syntax::ast::ElseBranch::ElseIf(e)) => {
-                    collect_calls_expr(e, bound, out)
-                }
+                Some(grasm_syntax::ast::ElseBranch::ElseIf(e)) => collect_calls_expr(e, bound, out),
                 None => {}
             }
         }
-        Expr::Match { scrutinee, arms, .. } => {
+        Expr::Match {
+            scrutinee, arms, ..
+        } => {
             collect_calls_expr(scrutinee, bound, out);
             for a in arms {
                 collect_calls_expr(&a.body, bound, out);
@@ -3892,9 +3958,7 @@ fn carrier_payload(callee: &Expr, ty: &TypeExpr) -> Option<TypeExpr> {
     };
     match (id.name.as_str(), ty) {
         ("Some", TypeExpr::Name { path, args, .. })
-            if path.segments.len() == 1
-                && path.segments[0].name == "Option"
-                && args.len() == 1 =>
+            if path.segments.len() == 1 && path.segments[0].name == "Option" && args.len() == 1 =>
         {
             Some(args[0].clone())
         }
@@ -4106,10 +4170,9 @@ fn merge_fallible_halves(a: VType, b: VType) -> VType {
         }
     };
     match (&a, &b) {
-        (VType::Fallible(a_ok, a_err), VType::Fallible(b_ok, b_err)) => VType::Fallible(
-            Box::new(pick(a_ok, b_ok)),
-            Box::new(pick(a_err, b_err)),
-        ),
+        (VType::Fallible(a_ok, a_err), VType::Fallible(b_ok, b_err)) => {
+            VType::Fallible(Box::new(pick(a_ok, b_ok)), Box::new(pick(a_err, b_err)))
+        }
         // One side gives the whole `T ! E` and the other only the ok half —
         // `if n == 1 { 10 } else { Ok(n * 3) }` in a fallible function
         // ([T-OK-ERR-RETURN]). The whole type is the wider of the two, and
@@ -4126,7 +4189,6 @@ fn merge_fallible_halves(a: VType, b: VType) -> VType {
         _ => a,
     }
 }
-
 
 /// Lists a loop body only *appends* to, and the shapes that disqualify one.
 ///
@@ -4185,7 +4247,12 @@ fn leaves_early_block(b: &grasm_syntax::ast::Block, found: &mut bool) {
 fn leaves_early_expr(e: &Expr, found: &mut bool) {
     match e {
         Expr::Try { .. } => *found = true,
-        Expr::If { cond, then_block, else_branch, .. } => {
+        Expr::If {
+            cond,
+            then_block,
+            else_branch,
+            ..
+        } => {
             leaves_early_expr(cond, found);
             leaves_early_block(then_block, found);
             match else_branch.as_deref() {
@@ -4194,7 +4261,9 @@ fn leaves_early_expr(e: &Expr, found: &mut bool) {
                 None => {}
             }
         }
-        Expr::Match { scrutinee, arms, .. } => {
+        Expr::Match {
+            scrutinee, arms, ..
+        } => {
             leaves_early_expr(scrutinee, found);
             for arm in arms {
                 leaves_early_expr(&arm.body, found);
@@ -4228,7 +4297,11 @@ fn leaves_early_expr(e: &Expr, found: &mut bool) {
     }
 }
 
-fn scan_pushes_block(b: &grasm_syntax::ast::Block, pushed: &mut Vec<String>, bad: &mut Vec<String>) {
+fn scan_pushes_block(
+    b: &grasm_syntax::ast::Block,
+    pushed: &mut Vec<String>,
+    bad: &mut Vec<String>,
+) {
     for stmt in &b.stmts {
         match stmt {
             Stmt::Expr(e) => scan_pushes_expr(e, pushed, bad),
@@ -4253,7 +4326,9 @@ fn scan_pushes_block(b: &grasm_syntax::ast::Block, pushed: &mut Vec<String>, bad
 
 fn scan_pushes_expr(e: &Expr, pushed: &mut Vec<String>, bad: &mut Vec<String>) {
     match e {
-        Expr::MethodCall { recv, name, args, .. } if name.name == "push" => {
+        Expr::MethodCall {
+            recv, name, args, ..
+        } if name.name == "push" => {
             match &**recv {
                 Expr::Ident(id) => pushed.push(id.name.clone()),
                 other => scan_pushes_expr(other, pushed, bad),
@@ -4297,7 +4372,12 @@ fn scan_pushes_expr(e: &Expr, pushed: &mut Vec<String>, bad: &mut Vec<String>) {
                 }
             }
         }
-        Expr::If { cond, then_block, else_branch, .. } => {
+        Expr::If {
+            cond,
+            then_block,
+            else_branch,
+            ..
+        } => {
             scan_pushes_expr(cond, pushed, bad);
             scan_pushes_block(then_block, pushed, bad);
             match else_branch.as_deref() {
@@ -4306,7 +4386,9 @@ fn scan_pushes_expr(e: &Expr, pushed: &mut Vec<String>, bad: &mut Vec<String>) {
                 None => {}
             }
         }
-        Expr::Match { scrutinee, arms, .. } => {
+        Expr::Match {
+            scrutinee, arms, ..
+        } => {
             scan_pushes_expr(scrutinee, pushed, bad);
             for arm in arms {
                 scan_pushes_expr(&arm.body, pushed, bad);
@@ -4340,11 +4422,7 @@ fn indexed_only_lists(block: &grasm_syntax::ast::Block) -> Vec<String> {
     indexed
 }
 
-fn scan_uses_block(
-    b: &grasm_syntax::ast::Block,
-    indexed: &mut Vec<String>,
-    bad: &mut Vec<String>,
-) {
+fn scan_uses_block(b: &grasm_syntax::ast::Block, indexed: &mut Vec<String>, bad: &mut Vec<String>) {
     for stmt in &b.stmts {
         match stmt {
             Stmt::Let { init, .. } => scan_uses_expr(init, indexed, bad),
@@ -4617,11 +4695,8 @@ impl FnCx<'_, '_> {
             }
         }
         self.handler_arg_held = held;
-        let all: Vec<(Variable, VType)> = self
-            .vars
-            .iter()
-            .flat_map(|s| s.values().cloned())
-            .collect();
+        let all: Vec<(Variable, VType)> =
+            self.vars.iter().flat_map(|s| s.values().cloned()).collect();
         let inout_vars: Vec<Variable> = self.inout_slots.iter().map(|(_, v, _)| *v).collect();
         for (var, vt) in all {
             if inout_vars.contains(&var) {
@@ -4795,10 +4870,6 @@ impl FnCx<'_, '_> {
         Ok(())
     }
 
-    fn pin_loop_lists(&mut self, body: &grasm_syntax::ast::Block) -> CResult<()> {
-        self.pin_loop_lists_with(body, &[])
-    }
-
     /// The same, told about expressions in the loop's *header* — a `while`
     /// condition, or what a `for` iterates.
     ///
@@ -4821,13 +4892,13 @@ impl FnCx<'_, '_> {
                 continue;
             };
             let ptr_ty = self.cg.module.target_config().pointer_type();
-            let slot = self.b.create_sized_stack_slot(
-                cranelift_codegen::ir::StackSlotData::new(
+            let slot = self
+                .b
+                .create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
                     cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
                     16,
                     3,
-                ),
-            );
+                ));
             let data_out = self.b.ins().stack_addr(ptr_ty, slot, 0);
             let len_out = self.b.ins().stack_addr(ptr_ty, slot, 8);
             let cur = self.b.use_var(var);
@@ -4878,13 +4949,13 @@ impl FnCx<'_, '_> {
                     continue;
                 };
                 let ptr_ty = self.cg.module.target_config().pointer_type();
-                let slot = self.b.create_sized_stack_slot(
-                    cranelift_codegen::ir::StackSlotData::new(
-                        cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
-                        24,
-                        3,
-                    ),
-                );
+                let slot =
+                    self.b
+                        .create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
+                            cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                            24,
+                            3,
+                        ));
                 let data_out = self.b.ins().stack_addr(ptr_ty, slot, 0);
                 let len_out = self.b.ins().stack_addr(ptr_ty, slot, 8);
                 let cap_out = self.b.ins().stack_addr(ptr_ty, slot, 16);
@@ -4950,7 +5021,10 @@ impl FnCx<'_, '_> {
         let ok = self.b.create_block();
         let oob = self.b.create_block();
         // Unsigned compare catches negative indices in the same test.
-        let bad = self.b.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, idx, len);
+        let bad = self
+            .b
+            .ins()
+            .icmp(IntCC::UnsignedGreaterThanOrEqual, idx, len);
         self.b.ins().brif(bad, oob, &[], ok, &[]);
         self.filled = true;
 
@@ -5004,7 +5078,12 @@ impl FnCx<'_, '_> {
 
     /// One element out of a list: the typed inline read when the element type
     /// is scalar, the boxed read + unbox otherwise.
-    fn list_get_elem(&mut self, list: Value, idx: Value, elem_t: &VType) -> CResult<(Value, VType)> {
+    fn list_get_elem(
+        &mut self,
+        list: Value,
+        idx: Value,
+        elem_t: &VType,
+    ) -> CResult<(Value, VType)> {
         if let Some(k) = scalar_kind_i64(elem_t) {
             let kc = self.b.ins().iconst(types::I64, k);
             let bits = self
@@ -5037,17 +5116,17 @@ impl FnCx<'_, '_> {
     // through `grasm_list_push_scalar` instead cost a call, a copy-on-write
     // check and a match on the payload for every element, which was a third of
     // the sieve benchmark.
-    fn append_pinned(
-        &mut self,
-        list_v: Value,
-        data_var: Variable,
-        len_var: Variable,
-        cap_var: Variable,
-        data_out: Value,
-        cap_out: Value,
-        bits: Value,
-        stride: i64,
-    ) {
+    fn append_pinned(&mut self, pin: &PinnedAppend, bits: Value) {
+        let PinnedAppend {
+            list_var,
+            data_var,
+            len_var,
+            cap_var,
+            data_out,
+            cap_out,
+            stride,
+        } = *pin;
+        let list_v = self.b.use_var(list_var);
         let room = self.b.create_block();
         let grow = self.b.create_block();
         let store = self.b.create_block();
@@ -5267,9 +5346,7 @@ impl FnCx<'_, '_> {
                     return Ok(None);
                 };
                 let iv = self.b.ins().iconst(types::I64, i);
-                let v = self
-                    .call_rt("grasm_struct_borrow_at", &[base, iv])
-                    .unwrap();
+                let v = self.call_rt("grasm_struct_borrow_at", &[base, iv]).unwrap();
                 Ok(Some((v, inner)))
             }
             _ => Ok(None),
@@ -5294,7 +5371,9 @@ impl FnCx<'_, '_> {
         let make_blk = self.b.create_block();
         let done_blk = self.b.create_block();
         self.b.append_block_param(done_blk, types::I64);
-        self.b.ins().brif(cached, done_blk, &[cached], make_blk, &[]);
+        self.b
+            .ins()
+            .brif(cached, done_blk, &[cached], make_blk, &[]);
 
         self.goto_block(make_blk);
         let (p, l) = self.str_ptr_len(text);
@@ -5396,7 +5475,10 @@ impl FnCx<'_, '_> {
                     return nope(*span, "destructuring a non-tuple");
                 };
                 if part_ts.len() != names.len() {
-                    return nope(*span, "a tuple destructured into a different number of names");
+                    return nope(
+                        *span,
+                        "a tuple destructured into a different number of names",
+                    );
                 }
                 for (i, (n, pt)) in names.iter().zip(&part_ts).enumerate() {
                     let idx = self.b.ins().iconst(types::I64, i as i64);
@@ -5408,9 +5490,7 @@ impl FnCx<'_, '_> {
                 self.dec_if_boxed(tv, &VType::Tuple(part_ts));
                 Ok(StmtOut::Value(None))
             }
-            Stmt::Let {
-                name, ty, init, ..
-            } => {
+            Stmt::Let { name, ty, init, .. } => {
                 // A handler bound to a name is consumed by the pass that lifts
                 // its operations into functions, not by this one. There is no
                 // runtime value to produce: `EHandler` is a type the effect
@@ -5495,11 +5575,10 @@ impl FnCx<'_, '_> {
                 // being joined: appended in place when nothing else holds it,
                 // which is what makes building text in a loop linear instead
                 // of copying everything written so far on every iteration.
-                if matches!(op, AssignOp::Assign) {
-                    if let Some(out) = self.try_self_append(target, value)? {
-                        let _ = out;
-                        return Ok(StmtOut::Value(None));
-                    }
+                if matches!(op, AssignOp::Assign)
+                    && self.try_self_append(target, value)?.is_some()
+                {
+                    return Ok(StmtOut::Value(None));
                 }
                 // Field/index places (any depth, plain or compound).
                 if matches!(target, Expr::Field { .. } | Expr::Index { .. }) {
@@ -5634,15 +5713,8 @@ impl FnCx<'_, '_> {
                             AssignOp::Div => BinaryOp::Div,
                             AssignOp::Assign => unreachable!(),
                         };
-                        self.binop_values(
-                            bop,
-                            old,
-                            elem_t.clone(),
-                            val,
-                            val_t,
-                            target.span(),
-                        )?
-                        .0
+                        self.binop_values(bop, old, elem_t.clone(), val, val_t, target.span())?
+                            .0
                     };
                     let boxed = self.box_value(final_v, &elem_t);
                     let cur = self.b.use_var(var);
@@ -5673,9 +5745,7 @@ impl FnCx<'_, '_> {
                                 rhs,
                                 ..
                             },
-                        ) if matches!(&**lhs, Expr::Ident(l) if l.name == id.name) => {
-                            Some(&**rhs)
-                        }
+                        ) if matches!(&**lhs, Expr::Ident(l) if l.name == id.name) => Some(&**rhs),
                         _ => None,
                     };
                     if let Some(piece) = rhs {
@@ -5684,8 +5754,7 @@ impl FnCx<'_, '_> {
                             return nope(piece.span(), "adding a non-string to a string");
                         }
                         let old = self.b.use_var(var);
-                        let joined =
-                            self.call_rt("grasm_str_append", &[old, rv]).unwrap();
+                        let joined = self.call_rt("grasm_str_append", &[old, rv]).unwrap();
                         self.call_rt("grasm_val_dec", &[rv]);
                         self.b.def_var(var, joined);
                         return Ok(StmtOut::Value(None));
@@ -5828,7 +5897,7 @@ impl FnCx<'_, '_> {
                         // balanced by the +1 the Ident eval added.)
                         self.emit_scope_decs_all();
                         self.b.ins().return_(&[val]);
-                self.filled = true;
+                        self.filled = true;
                     }
                     None => {
                         if let VType::Fallible(ok_t, _) = self.ret.clone() {
@@ -5893,7 +5962,8 @@ impl FnCx<'_, '_> {
                 self.b.ins().brif(c, body_blk, &[], exit, &[]);
                 self.filled = true;
                 self.goto_block(body_blk);
-                self.loops.push((header, exit, self.vars.len(), self.handlers_installed));
+                self.loops
+                    .push((header, exit, self.vars.len(), self.handlers_installed));
                 let inner = self.eval_block_inner(body);
                 self.loops.pop();
                 self.pinned.pop();
@@ -6056,13 +6126,13 @@ this case",
                     // `fail` inside the block does return while it is
                     // installed, and until F59 nothing popped it, so the next
                     // operation read this slot in a frame that had gone.
-                    let slot = self.b.create_sized_stack_slot(
-                        cranelift_codegen::ir::StackSlotData::new(
-                            cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
-                            (captures.len().max(1) * 8) as u32,
-                            3,
-                        ),
-                    );
+                    let slot =
+                        self.b
+                            .create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
+                                cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                                (captures.len().max(1) * 8) as u32,
+                                3,
+                            ));
                     for (i, (cname, cvt)) in captures.iter().enumerate() {
                         let Some((var, _)) = self
                             .lookup(&Self::snapshot_name(lit_span, cname))
@@ -6270,7 +6340,8 @@ this case",
             self.goto_block(body_blk);
             self.push_scope();
             self.bind(&loop_var.name, ivar, VType::I64);
-            self.loops.push((step, exit, self.vars.len(), self.handlers_installed));
+            self.loops
+                .push((step, exit, self.vars.len(), self.handlers_installed));
             let inner = self.eval_block_inner(body);
             self.loops.pop();
             self.pinned.pop();
@@ -6363,7 +6434,8 @@ this case",
         // iteration binds a fresh one. Recording it after meant
         // `emit_decs_above` skipped that scope, and every `continue` in a loop
         // over boxed elements leaked the element it skipped.
-        self.loops.push((step, exit, self.vars.len(), self.handlers_installed));
+        self.loops
+            .push((step, exit, self.vars.len(), self.handlers_installed));
         self.push_scope();
         self.bind(&loop_var.name, evar, elem_vt.clone());
         let (_, mut terminated) = self.eval_block_inner(body)?;
@@ -6522,7 +6594,12 @@ this case",
                 format!("a `{eff}Handler` that is not a handler literal or a name bound to one"),
             );
         };
-        let Expr::StructLit { fields, span: lit_span, .. } = &lit else {
+        let Expr::StructLit {
+            fields,
+            span: lit_span,
+            ..
+        } = &lit
+        else {
             return nope(e.span(), format!("a `{eff}Handler` value"));
         };
         self.cg.lift_handler_literal(&lit)?;
@@ -6608,7 +6685,8 @@ this case",
             if let Expr::Ident(id) = &**callee {
                 if self.lookup(&id.name).is_none()
                     && self.cg.sums.get(key).is_some_and(|vs| {
-                        vs.iter().any(|(n, ts)| n == &id.name && ts.len() == args.len())
+                        vs.iter()
+                            .any(|(n, ts)| n == &id.name && ts.len() == args.len())
                     })
                 {
                     let key = key.clone();
@@ -6716,9 +6794,7 @@ this case",
             }
         }
         if let (Expr::Tuple(items, _), Some(VType::Tuple(ts))) = (e, expected) {
-            if !items.is_empty()
-                && items.len() == ts.len()
-                && items.iter().any(needs_element_hint)
+            if !items.is_empty() && items.len() == ts.len() && items.iter().any(needs_element_hint)
             {
                 let ts = ts.clone();
                 let mut list = self.call_rt("grasm_list_new", &[]).unwrap();
@@ -6787,10 +6863,9 @@ this case",
             // A literal the checker placed in an `f64` position *is* a float
             // ([T-INT-TO-FLOAT]), everywhere and not only where this backend
             // remembered to convert it.
-            Expr::Int(v, sp) if self.cg.float_literals.contains(&sp.start) => Ok(Some((
-                self.b.ins().f64const(*v as f64),
-                VType::F64,
-            ))),
+            Expr::Int(v, sp) if self.cg.float_literals.contains(&sp.start) => {
+                Ok(Some((self.b.ins().f64const(*v as f64), VType::F64)))
+            }
             Expr::Int(v, _) => Ok(Some((self.b.ins().iconst(types::I64, *v), VType::I64))),
             Expr::Map(entries, mspan) => {
                 let mut m = self.call_rt("grasm_map_new", &[]).unwrap();
@@ -6835,7 +6910,9 @@ this case",
                 }
                 Ok(Some((v, vt)))
             }
-            Expr::Ident(id) if self.lookup(&id.name).is_none() && self.const_of(&id.name).is_some() => {
+            Expr::Ident(id)
+                if self.lookup(&id.name).is_none() && self.const_of(&id.name).is_some() =>
+            {
                 // A module-level constant. The initializer is effect-free, so
                 // compiling it here is the whole of what the name means — no
                 // global, and the same rule the interpreter follows.
@@ -6969,7 +7046,10 @@ this case",
                 Ok(Some((v, vt)))
             }
             Expr::MethodCall {
-                recv, name, args, span,
+                recv,
+                name,
+                args,
+                span,
             } => self.eval_method(recv, name, args, *span),
             Expr::Unary { op, expr, span } => {
                 let (v, vt) = self.eval_expr_val(expr)?;
@@ -7096,7 +7176,9 @@ this case",
                 .map(Some),
             Expr::Field { recv, name, span } => self.eval_field(recv, name, *span),
             Expr::Match {
-                scrutinee, arms, span,
+                scrutinee,
+                arms,
+                span,
             } => self.eval_match(scrutinee, arms, *span),
             Expr::Try { expr, span } => self.eval_try(expr, *span).map(Some),
             Expr::Range {
@@ -7200,7 +7282,13 @@ this case",
         let Expr::Ident(dest) = target else {
             return Ok(None);
         };
-        let Expr::Binary { op: BinaryOp::Add, lhs, rhs, .. } = value else {
+        let Expr::Binary {
+            op: BinaryOp::Add,
+            lhs,
+            rhs,
+            ..
+        } = value
+        else {
             return Ok(None);
         };
         let Expr::Ident(from) = &**lhs else {
@@ -7305,7 +7393,11 @@ this case",
     /// Whether the left end of a `+` tree is a plain name.
     fn leftmost_is_name(e: &Expr) -> bool {
         match e {
-            Expr::Binary { op: BinaryOp::Add, lhs, .. } => Self::leftmost_is_name(lhs),
+            Expr::Binary {
+                op: BinaryOp::Add,
+                lhs,
+                ..
+            } => Self::leftmost_is_name(lhs),
             Expr::Ident(_) => true,
             _ => false,
         }
@@ -7315,9 +7407,12 @@ this case",
     /// its own.
     fn allocating_leaves(e: &Expr) -> i64 {
         match e {
-            Expr::Binary { op: BinaryOp::Add, lhs, rhs, .. } => {
-                Self::allocating_leaves(lhs) + Self::allocating_leaves(rhs)
-            }
+            Expr::Binary {
+                op: BinaryOp::Add,
+                lhs,
+                rhs,
+                ..
+            } => Self::allocating_leaves(lhs) + Self::allocating_leaves(rhs),
             Expr::Str(pieces, _) => pieces
                 .iter()
                 .filter(|p| matches!(p, StrPiece::Expr(_)))
@@ -7330,9 +7425,12 @@ this case",
     /// construction, flattening joins and interpolations into the same buffer.
     fn emit_concat_into(&mut self, at: Value, e: &Expr) -> CResult<()> {
         match e {
-            Expr::Binary { op: BinaryOp::Add, lhs, rhs, .. }
-                if matches!(self.probe_type(e), Ok(VType::Str)) =>
-            {
+            Expr::Binary {
+                op: BinaryOp::Add,
+                lhs,
+                rhs,
+                ..
+            } if matches!(self.probe_type(e), Ok(VType::Str)) => {
                 self.emit_concat_into(at, lhs)?;
                 self.emit_concat_into(at, rhs)
             }
@@ -7484,15 +7582,38 @@ this case",
                 (Expr::Int(x, ..), Expr::Int(y, ..)) => x == y,
                 (Expr::Str(..), Expr::Str(..)) => format!("{a:?}") == format!("{b:?}"),
                 (
-                    Expr::Index { recv: r1, index: i1, .. },
-                    Expr::Index { recv: r2, index: i2, .. },
+                    Expr::Index {
+                        recv: r1,
+                        index: i1,
+                        ..
+                    },
+                    Expr::Index {
+                        recv: r2,
+                        index: i2,
+                        ..
+                    },
                 ) => same(r1, r2) && same(i1, i2),
-                (Expr::Field { recv: r1, name: n1, .. }, Expr::Field { recv: r2, name: n2, .. }) => {
-                    n1.name == n2.name && same(r1, r2)
-                }
                 (
-                    Expr::Binary { op: o1, lhs: l1, rhs: h1, .. },
-                    Expr::Binary { op: o2, lhs: l2, rhs: h2, .. },
+                    Expr::Field {
+                        recv: r1, name: n1, ..
+                    },
+                    Expr::Field {
+                        recv: r2, name: n2, ..
+                    },
+                ) => n1.name == n2.name && same(r1, r2),
+                (
+                    Expr::Binary {
+                        op: o1,
+                        lhs: l1,
+                        rhs: h1,
+                        ..
+                    },
+                    Expr::Binary {
+                        op: o2,
+                        lhs: l2,
+                        rhs: h2,
+                        ..
+                    },
                 ) => o1 == o2 && same(l1, l2) && same(h1, h2),
                 _ => false,
             }
@@ -7502,20 +7623,35 @@ this case",
             return None;
         }
         // `<something> + N`, with N a literal.
-        let Expr::Binary { op: BinaryOp::Add, lhs, rhs, .. } = value else {
+        let Expr::Binary {
+            op: BinaryOp::Add,
+            lhs,
+            rhs,
+            ..
+        } = value
+        else {
             return None;
         };
         let Expr::Int(delta, ..) = &**rhs else {
             return None;
         };
         // The left side is `m.get(k) ?? D`.
-        let Expr::Binary { op: BinaryOp::Coalesce, lhs: got, rhs: dflt, .. } = &**lhs else {
+        let Expr::Binary {
+            op: BinaryOp::Coalesce,
+            lhs: got,
+            rhs: dflt,
+            ..
+        } = &**lhs
+        else {
             return None;
         };
         let Expr::Int(default, ..) = &**dflt else {
             return None;
         };
-        let Expr::MethodCall { recv, name, args, .. } = &**got else {
+        let Expr::MethodCall {
+            recv, name, args, ..
+        } = &**got
+        else {
             return None;
         };
         if name.name != "get" || args.len() != 1 {
@@ -7530,13 +7666,7 @@ this case",
         Some((*delta, *default))
     }
 
-    fn fused_range_build(
-        &self,
-        range: &Expr,
-        which: &str,
-        f: &Expr,
-        span: Span,
-    ) -> Option<Expr> {
+    fn fused_range_build(&self, range: &Expr, which: &str, f: &Expr, span: Span) -> Option<Expr> {
         let Expr::Closure { params, body, .. } = f else {
             return None;
         };
@@ -7562,7 +7692,10 @@ this case",
         let elem_ty = grasm_syntax::ast::TypeExpr::List(
             Box::new(grasm_syntax::ast::TypeExpr::Name {
                 path: grasm_syntax::ast::Path {
-                    segments: vec![Ident { name: elem_name.to_string(), span }],
+                    segments: vec![Ident {
+                        name: elem_name.to_string(),
+                        span,
+                    }],
                     span,
                 },
                 args: Vec::new(),
@@ -7570,13 +7703,19 @@ this case",
             }),
             span,
         );
-        let acc = Ident { name: "__fused_acc".to_string(), span };
+        let acc = Ident {
+            name: "__fused_acc".to_string(),
+            span,
+        };
         let item = params[0].clone();
 
         // `acc.push(<body>)` for map; `if <body> { acc.push(item) }` for filter.
         let push_mapped = Stmt::Expr(Expr::MethodCall {
             recv: Box::new(Expr::Ident(acc.clone())),
-            name: Ident { name: "push".to_string(), span },
+            name: Ident {
+                name: "push".to_string(),
+                span,
+            },
             args: vec![if which == "map" {
                 (**body).clone()
             } else {
@@ -7589,7 +7728,10 @@ this case",
         } else {
             Stmt::Expr(Expr::If {
                 cond: Box::new((**body).clone()),
-                then_block: grasm_syntax::ast::Block { stmts: vec![push_mapped], span },
+                then_block: grasm_syntax::ast::Block {
+                    stmts: vec![push_mapped],
+                    span,
+                },
                 else_branch: None,
                 span,
             })
@@ -7607,7 +7749,10 @@ this case",
                 Stmt::For {
                     var: item,
                     iter: range.clone(),
-                    body: grasm_syntax::ast::Block { stmts: vec![body_stmt], span },
+                    body: grasm_syntax::ast::Block {
+                        stmts: vec![body_stmt],
+                        span,
+                    },
                     span,
                 },
                 Stmt::Expr(Expr::Ident(acc)),
@@ -7710,7 +7855,10 @@ this case",
             return self.eval_expr(&call);
         }
         // Mutating map/list methods on a variable receiver.
-        if matches!(name.name.as_str(), "set" | "delete" | "pop" | "sort" | "sort_by" | "remove") {
+        if matches!(
+            name.name.as_str(),
+            "set" | "delete" | "pop" | "sort" | "sort_by" | "remove"
+        ) {
             if let Expr::Ident(id) = recv {
                 if let Some((var, vt)) = self.lookup(&id.name) {
                     match (&vt, name.name.as_str()) {
@@ -7752,8 +7900,16 @@ this case",
                                 }
                             }
                             let (kt, vt2) = (k_t.clone(), v_t.clone());
-                            let want_k: Option<VType> = if **k_t == VType::Any { None } else { Some((**k_t).clone()) };
-                            let want_v: Option<VType> = if **v_t == VType::Any { None } else { Some((**v_t).clone()) };
+                            let want_k: Option<VType> = if **k_t == VType::Any {
+                                None
+                            } else {
+                                Some((**k_t).clone())
+                            };
+                            let want_v: Option<VType> = if **v_t == VType::Any {
+                                None
+                            } else {
+                                Some((**v_t).clone())
+                            };
                             // The key is held while the value is evaluated,
                             // so a value that diverges — `m.set(k, try f())` —
                             // releases the key instead of stranding it. That
@@ -7771,7 +7927,11 @@ this case",
                             // Refine the map's element types once known.
                             let refined = VType::Map(
                                 if *kt == VType::Any { Box::new(kvt) } else { kt },
-                                if *vt2 == VType::Any { Box::new(vvt) } else { vt2 },
+                                if *vt2 == VType::Any {
+                                    Box::new(vvt)
+                                } else {
+                                    vt2
+                                },
                             );
                             self.rebind(&id.name, var, refined);
                             self.b.def_var(var, np);
@@ -7790,9 +7950,7 @@ this case",
                             let ptr_ty = self.cg.module.target_config().pointer_type();
                             let addr = self.b.ins().stack_addr(ptr_ty, slot, 0);
                             let cur = self.b.use_var(var);
-                            let np = self
-                                .call_rt("grasm_map_delete", &[cur, kb, addr])
-                                .unwrap();
+                            let np = self.call_rt("grasm_map_delete", &[cur, kb, addr]).unwrap();
                             self.b.def_var(var, np);
                             self.call_rt("grasm_val_dec", &[kb]);
                             let found = self.b.ins().stack_load(types::I8, slot, 0);
@@ -7854,12 +8012,10 @@ this case",
                                     Expr::Closure { params, body, .. } if params.len() == 1 => {
                                         (params[0].clone(), (**body).clone())
                                     }
-                                    other => {
-                                        return nope(
-                                            other.span(),
-                                            "sort_by with something other than a one-argument function",
-                                        )
-                                    }
+                                    other => return nope(
+                                        other.span(),
+                                        "sort_by with something other than a one-argument function",
+                                    ),
                                 },
                             };
                             let cur = self.b.use_var(var);
@@ -7893,10 +8049,16 @@ this case",
             let inner_t = self.place_type(&root_t, &path, span)?;
             match (&inner_t, name.name.as_str()) {
                 (VType::Map(k_t, v_t), "set") => {
-                    let want_k: Option<VType> =
-                        if **k_t == VType::Any { None } else { Some((**k_t).clone()) };
-                    let want_v: Option<VType> =
-                        if **v_t == VType::Any { None } else { Some((**v_t).clone()) };
+                    let want_k: Option<VType> = if **k_t == VType::Any {
+                        None
+                    } else {
+                        Some((**k_t).clone())
+                    };
+                    let want_v: Option<VType> = if **v_t == VType::Any {
+                        None
+                    } else {
+                        Some((**v_t).clone())
+                    };
                     // The key is held while the value is evaluated, so a
                     // value that diverges — `m.set(k, try f())` — releases the
                     // key instead of stranding it. That is the shape a parser
@@ -7920,13 +8082,13 @@ this case",
                 (VType::Map(_, _), "delete") => {
                     let (kv, kvt) = self.eval_expr_val(&args[0])?;
                     let kb = self.box_value(kv, &kvt);
-                    let slot = self.b.create_sized_stack_slot(
-                        cranelift_codegen::ir::StackSlotData::new(
-                            cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
-                            8,
-                            3,
-                        ),
-                    );
+                    let slot =
+                        self.b
+                            .create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
+                                cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                                8,
+                                3,
+                            ));
                     let ptr_ty = self.cg.module.target_config().pointer_type();
                     let addr = self.b.ins().stack_addr(ptr_ty, slot, 0);
                     let cur = self.b.use_var(var);
@@ -7990,13 +8152,13 @@ this case",
                 (VType::List(e), "pop") => {
                     let et = e.clone();
                     let ptr_ty = self.cg.module.target_config().pointer_type();
-                    let slot = self.b.create_sized_stack_slot(
-                        cranelift_codegen::ir::StackSlotData::new(
-                            cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
-                            8,
-                            3,
-                        ),
-                    );
+                    let slot =
+                        self.b
+                            .create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
+                                cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                                8,
+                                3,
+                            ));
                     let addr = self.b.ins().stack_addr(ptr_ty, slot, 0);
                     let cur = self.b.use_var(var);
                     let listv = self.read_place_boxed(cur, &path, &root_t, true)?;
@@ -8012,13 +8174,13 @@ this case",
                     let et = (**e).clone();
                     let (idx, _) = self.eval_expr_val(&args[0])?;
                     let ptr_ty = self.cg.module.target_config().pointer_type();
-                    let slot = self.b.create_sized_stack_slot(
-                        cranelift_codegen::ir::StackSlotData::new(
-                            cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
-                            8,
-                            3,
-                        ),
-                    );
+                    let slot =
+                        self.b
+                            .create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
+                                cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                                8,
+                                3,
+                            ));
                     let addr = self.b.ins().stack_addr(ptr_ty, slot, 0);
                     let cur = self.b.use_var(var);
                     let listv = self.read_place_boxed(cur, &path, &root_t, true)?;
@@ -8100,17 +8262,7 @@ this case",
             // element is a store rather than a call.
             if let Some(state) = self.append_state(&id.name) {
                 let bits = self.scalar_bits_of(av, &avt);
-                let held = self.b.use_var(state.list_var);
-                self.append_pinned(
-                    held,
-                    state.data_var,
-                    state.len_var,
-                    state.cap_var,
-                    state.data_out,
-                    state.cap_out,
-                    bits,
-                    state.stride,
-                );
+                self.append_pinned(&state, bits);
                 return Ok(None);
             }
             let cur = self.b.use_var(var);
@@ -8131,17 +8283,12 @@ this case",
                     let mut qual = format!("{target_mod}::{}", name.name);
                     // A generic in another module instantiates the same way,
                     // just under that module's namespace.
-                    if !self.cg.fns.contains_key(&qual)
-                        && self.cg.generic_fns.contains_key(&qual)
-                    {
+                    if !self.cg.fns.contains_key(&qual) && self.cg.generic_fns.contains_key(&qual) {
                         let arg_types = self.generic_arg_types(&qual, args)?;
                         self.cg.ret_hint = self.annotation_at(span);
-                        let made = self.cg.instantiate_generic(
-                            &target_mod,
-                            &name.name,
-                            &arg_types,
-                            span,
-                        );
+                        let made =
+                            self.cg
+                                .instantiate_generic(&target_mod, &name.name, &arg_types, span);
                         self.cg.ret_hint = None;
                         qual = made?;
                     }
@@ -8159,8 +8306,11 @@ this case",
                         // thread mutable state stop at the file edge.
                         let ptr_ty = self.cg.module.target_config().pointer_type();
                         let mut vals = Vec::with_capacity(args.len());
-                        let mut inout_args: Vec<(cranelift_codegen::ir::StackSlot, Variable, VType)> =
-                            Vec::new();
+                        let mut inout_args: Vec<(
+                            cranelift_codegen::ir::StackSlot,
+                            Variable,
+                            VType,
+                        )> = Vec::new();
                         // And an `inout` argument that names a *place* rather
                         // than a binding — `store.append(s.logs[i], x)`, which
                         // is what a program keeping several of a package's
@@ -8448,10 +8598,9 @@ this case",
             (VType::List(_), "rev") => vt.clone(),
             (VType::Map(k, _), "keys") => VType::List(k.clone()),
             (VType::Map(_, v), "values") => VType::List(v.clone()),
-            (VType::Map(k, v), "entries") => VType::List(Box::new(VType::Tuple(vec![
-                (**k).clone(),
-                (**v).clone(),
-            ]))),
+            (VType::Map(k, v), "entries") => {
+                VType::List(Box::new(VType::Tuple(vec![(**k).clone(), (**v).clone()])))
+            }
             (VType::Str, "chars" | "lines" | "words") => VType::List(Box::new(VType::Str)),
             (VType::Str, "codes") => VType::List(Box::new(VType::I64)),
             (VType::Str, "trim" | "trim_start" | "trim_end" | "to_upper" | "to_lower") => {
@@ -8752,7 +8901,9 @@ this case",
             (VType::List(e), "par_map") => {
                 let elem_t = (**e).clone();
                 if let Some((param, body)) = self.desugar_fn_arg(&args[0], true) {
-                    return self.emit_par_map(rv, &elem_t, &param, &body, span).map(Some);
+                    return self
+                        .emit_par_map(rv, &elem_t, &param, &body, span)
+                        .map(Some);
                 }
                 let Expr::Closure {
                     params: cparams,
@@ -8775,7 +8926,10 @@ this case",
                 let (ap, ep, fbody) = match &args[1] {
                     Expr::Closure { params, body, span } => {
                         if params.len() != 2 {
-                            return nope(*span, "a fold function that does not take two parameters");
+                            return nope(
+                                *span,
+                                "a fold function that does not take two parameters",
+                            );
                         }
                         (params[0].clone(), params[1].clone(), (**body).clone())
                     }
@@ -8791,8 +8945,14 @@ this case",
                             return nope(other.span(), "fold with a non-literal function");
                         }
                         let sp = id.span;
-                        let a = Ident { name: "__fold_acc".into(), span: sp };
-                        let b = Ident { name: "__fold_elem".into(), span: sp };
+                        let a = Ident {
+                            name: "__fold_acc".into(),
+                            span: sp,
+                        };
+                        let b = Ident {
+                            name: "__fold_elem".into(),
+                            span: sp,
+                        };
                         let call = Expr::Call {
                             callee: Box::new(Expr::Ident(id.clone())),
                             args: vec![Expr::Ident(a.clone()), Expr::Ident(b.clone())],
@@ -8900,9 +9060,7 @@ this case",
                 self.call_rt("grasm_val_dec", &[bb]);
                 (v, VType::I64)
             }
-            (VType::I64, "as_f64") => {
-                (self.b.ins().fcvt_from_sint(types::F64, rv), VType::F64)
-            }
+            (VType::I64, "as_f64") => (self.b.ins().fcvt_from_sint(types::F64, rv), VType::F64),
             (VType::I64, "to_str") => (
                 self.call_rt("grasm_str_from_i64", &[rv]).unwrap(),
                 VType::Str,
@@ -8959,9 +9117,7 @@ this case",
             (VType::Bytes, "slice") => {
                 let from = arg_scalar!(0, VType::I64);
                 let end = arg_scalar!(1, VType::I64);
-                let v = self
-                    .call_rt("grasm_bytes_slice", &[rv, from, end])
-                    .unwrap();
+                let v = self.call_rt("grasm_bytes_slice", &[rv, from, end]).unwrap();
                 self.call_rt("grasm_val_dec", &[rv]);
                 (v, VType::Bytes)
             }
@@ -9023,19 +9179,20 @@ this case",
             // with SIGILL, no message, while the interpreter saturated. Rust's
             // `as` does the same thing this does: NaN to 0, the infinities to
             // the ends.
-            (VType::F64, "as_i64") => (
-                self.b.ins().fcvt_to_sint_sat(types::I64, rv),
-                VType::I64,
-            ),
+            (VType::F64, "as_i64") => (self.b.ins().fcvt_to_sint_sat(types::I64, rv), VType::I64),
             // A reinterpretation, not a conversion: the same sixty-four bits
             // read as the other type. `bitcast` is exactly that and costs
             // nothing at run time.
             (VType::F64, "to_bits") => (
-                self.b.ins().bitcast(types::I64, cranelift_codegen::ir::MemFlags::new(), rv),
+                self.b
+                    .ins()
+                    .bitcast(types::I64, cranelift_codegen::ir::MemFlags::new(), rv),
                 VType::I64,
             ),
             (VType::I64, "from_bits") => (
-                self.b.ins().bitcast(types::F64, cranelift_codegen::ir::MemFlags::new(), rv),
+                self.b
+                    .ins()
+                    .bitcast(types::F64, cranelift_codegen::ir::MemFlags::new(), rv),
                 VType::F64,
             ),
             (VType::F64, "to_str") => (
@@ -9054,7 +9211,11 @@ this case",
             }
             // The math library. Every one is `f64 -> f64` with no allocation
             // and no effect, so it lowers to a direct runtime call.
-            (VType::F64, "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "sinh" | "cosh" | "tanh" | "exp" | "ln" | "log2" | "log10" | "cbrt" | "to_radians" | "to_degrees") => {
+            (
+                VType::F64,
+                "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "sinh" | "cosh" | "tanh" | "exp"
+                | "ln" | "log2" | "log10" | "cbrt" | "to_radians" | "to_degrees",
+            ) => {
                 let f = match m {
                     "sin" => "grasm_f64_sin",
                     "cos" => "grasm_f64_cos",
@@ -9118,12 +9279,10 @@ this case",
                         all.extend(args.iter().cloned());
                         let arg_types = self.generic_arg_types(&generic_key, &all)?;
                         let module = self.cg.current_module.clone();
-                        Some(self.cg.instantiate_generic(
-                            &module,
-                            &name.name,
-                            &arg_types,
-                            span,
-                        )?)
+                        Some(
+                            self.cg
+                                .instantiate_generic(&module, &name.name, &arg_types, span)?,
+                        )
                     } else {
                         None
                     }
@@ -9449,7 +9608,11 @@ checker did",
         // boxed values either way: `Some(()) == None` was refused as a
         // "mixed-type operation" for two values of the same type.
         if lt != rt && lt.boxed() && rt.boxed() && (any_inside(&lt) || any_inside(&rt)) {
-            let unified = if any_inside(&lt) { rt.clone() } else { lt.clone() };
+            let unified = if any_inside(&lt) {
+                rt.clone()
+            } else {
+                lt.clone()
+            };
             lt = unified.clone();
             rt = unified;
         }
@@ -9756,9 +9919,7 @@ checker did",
                     // or just the ok half ([T-OK-ERR-RETURN]).
                     // `if b { Err(e) } else { 3 }` jumped a bare integer into
                     // a merge holding a pointer: SIGSEGV, empty stderr.
-                    if matches!(want, VType::Fallible(..))
-                        && !matches!(vt, VType::Fallible(..))
-                    {
+                    if matches!(want, VType::Fallible(..)) && !matches!(vt, VType::Fallible(..)) {
                         let boxed = self.box_value(v, vt);
                         v = self.call_rt("grasm_ok_new", &[boxed]).unwrap();
                     } else if *want == VType::F64 && *vt == VType::I64 {
@@ -9799,9 +9960,7 @@ checker did",
                     // or just the ok half ([T-OK-ERR-RETURN]).
                     // `if b { Err(e) } else { 3 }` jumped a bare integer into
                     // a merge holding a pointer: SIGSEGV, empty stderr.
-                    if matches!(want, VType::Fallible(..))
-                        && !matches!(vt, VType::Fallible(..))
-                    {
+                    if matches!(want, VType::Fallible(..)) && !matches!(vt, VType::Fallible(..)) {
                         let boxed = self.box_value(v, vt);
                         v = self.call_rt("grasm_ok_new", &[boxed]).unwrap();
                     } else if *want == VType::F64 && *vt == VType::I64 {
@@ -9981,7 +10140,12 @@ checker did",
                 return Ok(Some((self.b.ins().f64const(c), VType::F64)));
             }
             // Tier 2.
-            "ref" if !self.cg.fns.contains_key(&format!("{}::ref", self.cg.current_module)) => {
+            "ref"
+                if !self
+                    .cg
+                    .fns
+                    .contains_key(&format!("{}::ref", self.cg.current_module)) =>
+            {
                 let (v, vt) = self.eval_expr_val(&args[0])?;
                 let boxed = self.box_value(v, &vt);
                 let r = self.call_rt("grasm_ref_new", &[boxed]).unwrap();
@@ -10055,8 +10219,8 @@ checker did",
                     ),
                 )));
             }
-            "tcp_listen" | "tcp_accept" | "tcp_read" | "tcp_read_bytes"
-            | "net_port" | "udp_bind" | "udp_recv" => {
+            "tcp_listen" | "tcp_accept" | "tcp_read" | "tcp_read_bytes" | "net_port"
+            | "udp_bind" | "udp_recv" => {
                 let (hv, ht) = self.eval_expr_val(&args[0])?;
                 let boxed = self.box_value(hv, &ht);
                 let (sym, ok_t) = match id.name.as_str() {
@@ -10089,10 +10253,7 @@ checker did",
                 self.call_rt("grasm_val_dec", &[boxed_port]);
                 return Ok(Some((
                     v,
-                    VType::Fallible(
-                        Box::new(VType::I64),
-                        Box::new(VType::Sum("IoError".into())),
-                    ),
+                    VType::Fallible(Box::new(VType::I64), Box::new(VType::Sum("IoError".into()))),
                 )));
             }
             "proc_pipeline" => {
@@ -10185,7 +10346,10 @@ checker did",
                 self.call_rt("grasm_val_dec", &[dv]);
                 return Ok(Some((
                     v,
-                    VType::Fallible(Box::new(VType::Unit), Box::new(VType::Sum("IoError".into()))),
+                    VType::Fallible(
+                        Box::new(VType::Unit),
+                        Box::new(VType::Sum("IoError".into())),
+                    ),
                 )));
             }
             "net_close" => {
@@ -10199,7 +10363,10 @@ checker did",
                 let (pv, _) = self.eval_expr_val(&args[0])?;
                 let v = self.call_rt("grasm_read_file", &[pv]).unwrap();
                 self.call_rt("grasm_val_dec", &[pv]);
-                return Ok(Some((v, VType::Fallible(Box::new(VType::Str), Box::new(VType::Sum("IoError".into()))))));
+                return Ok(Some((
+                    v,
+                    VType::Fallible(Box::new(VType::Str), Box::new(VType::Sum("IoError".into()))),
+                )));
             }
             "write_file" => {
                 let (pv, _) = self.eval_expr_val(&args[0])?;
@@ -10207,7 +10374,13 @@ checker did",
                 let v = self.call_rt("grasm_write_file", &[pv, cv]).unwrap();
                 self.call_rt("grasm_val_dec", &[pv]);
                 self.call_rt("grasm_val_dec", &[cv]);
-                return Ok(Some((v, VType::Fallible(Box::new(VType::Unit), Box::new(VType::Sum("IoError".into()))))));
+                return Ok(Some((
+                    v,
+                    VType::Fallible(
+                        Box::new(VType::Unit),
+                        Box::new(VType::Sum("IoError".into())),
+                    ),
+                )));
             }
             // [L-LIB-FS]. Both answer with the sorted listing / unit the
             // runtime produces, so the two engines cannot disagree on order.
@@ -10224,7 +10397,10 @@ checker did",
                 self.call_rt("grasm_val_dec", &[boxed]);
                 return Ok(Some((
                     v,
-                    VType::Fallible(Box::new(VType::Bytes), Box::new(VType::Sum("IoError".into()))),
+                    VType::Fallible(
+                        Box::new(VType::Bytes),
+                        Box::new(VType::Sum("IoError".into())),
+                    ),
                 )));
             }
             "read_bytes" => {
@@ -10233,7 +10409,10 @@ checker did",
                 self.call_rt("grasm_val_dec", &[pv]);
                 return Ok(Some((
                     v,
-                    VType::Fallible(Box::new(VType::Bytes), Box::new(VType::Sum("IoError".into()))),
+                    VType::Fallible(
+                        Box::new(VType::Bytes),
+                        Box::new(VType::Sum("IoError".into())),
+                    ),
                 )));
             }
             // A range of a file, and the four calls a crash-safe store needs.
@@ -10250,7 +10429,10 @@ checker did",
                 self.call_rt("grasm_val_dec", &[bc]);
                 return Ok(Some((
                     v,
-                    VType::Fallible(Box::new(VType::Bytes), Box::new(VType::Sum("IoError".into()))),
+                    VType::Fallible(
+                        Box::new(VType::Bytes),
+                        Box::new(VType::Sum("IoError".into())),
+                    ),
                 )));
             }
             "file_size" => {
@@ -10268,7 +10450,10 @@ checker did",
                 self.call_rt("grasm_val_dec", &[pv]);
                 return Ok(Some((
                     v,
-                    VType::Fallible(Box::new(VType::Unit), Box::new(VType::Sum("IoError".into()))),
+                    VType::Fallible(
+                        Box::new(VType::Unit),
+                        Box::new(VType::Sum("IoError".into())),
+                    ),
                 )));
             }
             "rename_file" => {
@@ -10279,7 +10464,10 @@ checker did",
                 self.call_rt("grasm_val_dec", &[bv]);
                 return Ok(Some((
                     v,
-                    VType::Fallible(Box::new(VType::Unit), Box::new(VType::Sum("IoError".into()))),
+                    VType::Fallible(
+                        Box::new(VType::Unit),
+                        Box::new(VType::Sum("IoError".into())),
+                    ),
                 )));
             }
             "append_bytes" => {
@@ -10290,7 +10478,10 @@ checker did",
                 self.call_rt("grasm_val_dec", &[bv]);
                 return Ok(Some((
                     v,
-                    VType::Fallible(Box::new(VType::Unit), Box::new(VType::Sum("IoError".into()))),
+                    VType::Fallible(
+                        Box::new(VType::Unit),
+                        Box::new(VType::Sum("IoError".into())),
+                    ),
                 )));
             }
             "write_bytes" => {
@@ -10301,17 +10492,27 @@ checker did",
                 self.call_rt("grasm_val_dec", &[bv]);
                 return Ok(Some((
                     v,
-                    VType::Fallible(Box::new(VType::Unit), Box::new(VType::Sum("IoError".into()))),
+                    VType::Fallible(
+                        Box::new(VType::Unit),
+                        Box::new(VType::Sum("IoError".into())),
+                    ),
                 )));
             }
             "make_dir" | "remove_file" => {
                 let (pv, _) = self.eval_expr_val(&args[0])?;
-                let sym = if id.name == "make_dir" { "grasm_make_dir" } else { "grasm_remove_file" };
+                let sym = if id.name == "make_dir" {
+                    "grasm_make_dir"
+                } else {
+                    "grasm_remove_file"
+                };
                 let v = self.call_rt(sym, &[pv]).unwrap();
                 self.call_rt("grasm_val_dec", &[pv]);
                 return Ok(Some((
                     v,
-                    VType::Fallible(Box::new(VType::Unit), Box::new(VType::Sum("IoError".into()))),
+                    VType::Fallible(
+                        Box::new(VType::Unit),
+                        Box::new(VType::Sum("IoError".into())),
+                    ),
                 )));
             }
             "list_dir" => {
@@ -10336,9 +10537,15 @@ checker did",
                 let (v, vt) = self.eval_expr_val(&args[0])?;
                 let boxed = self.box_value(v, &vt);
                 let (f, ty) = if id.name == "Ok" {
-                    ("grasm_ok_new", VType::Fallible(Box::new(vt), Box::new(VType::Any)))
+                    (
+                        "grasm_ok_new",
+                        VType::Fallible(Box::new(vt), Box::new(VType::Any)),
+                    )
                 } else {
-                    ("grasm_err_new", VType::Fallible(Box::new(VType::Any), Box::new(vt)))
+                    (
+                        "grasm_err_new",
+                        VType::Fallible(Box::new(VType::Any), Box::new(vt)),
+                    )
                 };
                 let out = self.call_rt(f, &[boxed]).unwrap();
                 return Ok(Some((out, ty)));
@@ -10426,7 +10633,9 @@ checker did",
                 self.cg.ret_hint = self
                     .annotation_at(call_span)
                     .or_else(|| self.annotation_at(id.span));
-                let key = self.cg.instantiate_generic(&module, &id.name, &arg_types, id.span);
+                let key = self
+                    .cg
+                    .instantiate_generic(&module, &id.name, &arg_types, id.span);
                 self.cg.ret_hint = None;
                 Some(key?)
             } else {
@@ -10520,13 +10729,13 @@ type parameters",
                     // said `unbox: not an i64`. `grasm run` printed the answer,
                     // so this was a disagreement, not a refusal.
                     let (raw, _) = self.unbox(held, want)?;
-                    let slot = self.b.create_sized_stack_slot(
-                        cranelift_codegen::ir::StackSlotData::new(
-                            cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
-                            8,
-                            3,
-                        ),
-                    );
+                    let slot =
+                        self.b
+                            .create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
+                                cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                                8,
+                                3,
+                            ));
                     self.b.ins().stack_store(raw, slot, 0);
                     let addr = self.b.ins().stack_addr(ptr_ty, slot, 0);
                     vals.push(addr);
@@ -10539,13 +10748,13 @@ type parameters",
                 let Some((var, vt)) = self.lookup(&id.name) else {
                     return nope(id.span, "an unknown `inout` argument");
                 };
-                let slot = self.b.create_sized_stack_slot(
-                    cranelift_codegen::ir::StackSlotData::new(
-                        cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
-                        8,
-                        3,
-                    ),
-                );
+                let slot =
+                    self.b
+                        .create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
+                            cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                            8,
+                            3,
+                        ));
                 let cur = self.b.use_var(var);
                 self.b.ins().stack_store(cur, slot, 0);
                 let addr = self.b.ins().stack_addr(ptr_ty, slot, 0);
@@ -10787,7 +10996,12 @@ type parameters",
         nope(span, format!("the field `{fname}`"))
     }
 
-    fn variant_field_types(&mut self, parent: &str, vname: &str, span: Span) -> CResult<Vec<VType>> {
+    fn variant_field_types(
+        &mut self,
+        parent: &str,
+        vname: &str,
+        span: Span,
+    ) -> CResult<Vec<VType>> {
         if parent == "Option" {
             return Ok(if vname == "Some" {
                 vec![VType::Any]
@@ -10810,7 +11024,9 @@ type parameters",
     fn make_variant(&mut self, parent: &str, vname: &str, fields: &[Value]) -> CResult<Value> {
         let (tp, tl) = self.str_ptr_len(parent);
         let (vp, vl) = self.str_ptr_len(vname);
-        let v = self.call_rt("grasm_variant_new", &[tp, tl, vp, vl]).unwrap();
+        let v = self
+            .call_rt("grasm_variant_new", &[tp, tl, vp, vl])
+            .unwrap();
         for f in fields {
             self.call_rt("grasm_variant_push", &[v, *f]);
         }
@@ -11049,7 +11265,12 @@ fields, not the type this is bound to, not an enclosing generic",
                 fv = self.b.ins().fcvt_from_sint(types::F64, fv);
             }
             let boxed = self.box_value(fv, &ft);
-            if ft.boxed() || matches!(ft, VType::I64 | VType::F64 | VType::Bool | VType::Unit | VType::Ref(_)) {
+            if ft.boxed()
+                || matches!(
+                    ft,
+                    VType::I64 | VType::F64 | VType::Bool | VType::Unit | VType::Ref(_)
+                )
+            {
                 let hv = self.new_var(&VType::Str);
                 self.b.def_var(hv, boxed);
                 self.bind(&format!(" fld{}_{}", span.start, fi), hv, VType::Str);
@@ -11070,23 +11291,20 @@ fields, not the type this is bound to, not an enclosing generic",
                 .get(&sname)
                 .map(|fs| fs.iter().map(|(n, _)| n.clone()).collect())
                 .unwrap_or_default();
-            built.sort_by_key(|(n, _)| {
-                order.iter().position(|d| d == n).unwrap_or(usize::MAX)
-            });
-            let names: Vec<String> =
-                built.iter().map(|(n, _)| n.clone()).collect();
+            built.sort_by_key(|(n, _)| order.iter().position(|d| d == n).unwrap_or(usize::MAX));
+            let names: Vec<String> = built.iter().map(|(n, _)| n.clone()).collect();
             // The field values go into a stack slot and the whole value is
             // built by one call. A slot of nothing is not a slot, so an empty
             // struct still gets a word; the callee reads none of it.
             let ptr_ty = self.cg.module.target_config().pointer_type();
             let words = built.len().max(1);
-            let slot = self.b.create_sized_stack_slot(
-                cranelift_codegen::ir::StackSlotData::new(
+            let slot = self
+                .b
+                .create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
                     cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
                     (words * 8) as u32,
                     3,
-                ),
-            );
+                ));
             for (i, (_, boxed)) in built.iter().enumerate() {
                 self.b.ins().stack_store(*boxed, slot, (i * 8) as i32);
             }
@@ -11188,9 +11406,7 @@ fields, not the type this is bound to, not an enclosing generic",
         // `.value` reads what a reference points at, when that has no fields of
         // its own ([T-REF-VALUE]). The slab read above already produced it, so
         // there is nothing further to do.
-        if through_ref
-            && name.name == "value"
-            && !matches!(rt, VType::Struct(_) | VType::Tuple(_))
+        if through_ref && name.name == "value" && !matches!(rt, VType::Struct(_) | VType::Tuple(_))
         {
             return Ok(Some((rv, rt)));
         }
@@ -11282,7 +11498,7 @@ fields, not the type this is bound to, not an enclosing generic",
         self.emit_scope_decs_all();
         if matches!(self.ret, VType::Fallible(_, _)) {
             self.b.ins().return_(&[wrapped]);
-                self.filled = true;
+            self.filled = true;
         } else {
             // Checker prevents this; guard anyway.
             self.call_rt("grasm_report_main_err", &[wrapped]);
@@ -11335,12 +11551,11 @@ fields, not the type this is bound to, not an enclosing generic",
     /// default only in the `none` block — so an eagerly evaluated default would
     /// change what `m.get(k) ?? panic("missing")` does. The runtime answers with
     /// a null pointer instead of an `Option`, and the branch is on that.
-    fn fused_map_get_or(
-        &mut self,
-        lhs: &Expr,
-        rhs: &Expr,
-    ) -> CResult<Option<(Value, VType)>> {
-        let Expr::MethodCall { recv, name, args, .. } = lhs else {
+    fn fused_map_get_or(&mut self, lhs: &Expr, rhs: &Expr) -> CResult<Option<(Value, VType)>> {
+        let Expr::MethodCall {
+            recv, name, args, ..
+        } = lhs
+        else {
             return Ok(None);
         };
         if name.name != "get" || args.len() != 1 {
@@ -11381,9 +11596,7 @@ fields, not the type this is bound to, not an enclosing generic",
         let (mv, _) = self.eval_expr_val(recv)?;
         let (kv, kt) = self.eval_expr_val(&args[0])?;
         let boxed_k = self.box_value(kv, &kt);
-        let found = self
-            .call_rt("grasm_map_get_ptr", &[mv, boxed_k])
-            .unwrap();
+        let found = self.call_rt("grasm_map_get_ptr", &[mv, boxed_k]).unwrap();
         self.call_rt("grasm_val_dec", &[mv]);
         self.call_rt("grasm_val_dec", &[boxed_k]);
 
@@ -11592,11 +11805,7 @@ fields, not the type this is bound to, not an enclosing generic",
     /// parameter is not known until the *other* arguments have fixed the type
     /// parameters. So probe what can be probed, solve the type parameters from
     /// those, and read the remaining arguments off the signature.
-    fn generic_arg_types(
-        &mut self,
-        generic_key: &str,
-        args: &[Expr],
-    ) -> CResult<Vec<VType>> {
+    fn generic_arg_types(&mut self, generic_key: &str, args: &[Expr]) -> CResult<Vec<VType>> {
         let mut probed: Vec<Option<VType>> = Vec::with_capacity(args.len());
         let mut first_err: Option<Unsupported> = None;
         for a in args {
@@ -11750,7 +11959,12 @@ fields, not the type this is bound to, not an enclosing generic",
         // is not, and the two cannot be told apart from the span alone. So the
         // synthesiser records what it reused, and this skips those.
         let sp = e.span();
-        if !self.cg.synthesised_spans.borrow().contains(&(sp.start, sp.end)) {
+        if !self
+            .cg
+            .synthesised_spans
+            .borrow()
+            .contains(&(sp.start, sp.end))
+        {
             if let Some(text) = self.cg.resolved_types.get(&(sp.start, sp.end)).cloned() {
                 if let Some(te) = grasm_syntax::parse_type_src(&text) {
                     if let Ok(t) = self.cg.vtype_of(&te) {
@@ -11777,10 +11991,9 @@ fields, not the type this is bound to, not an enclosing generic",
             Expr::Str(..) => VType::Str,
             Expr::List(items, span) => VType::List(Box::new(self.list_elem_type(items, *span)?)),
             Expr::Map(entries, _) => match entries.first() {
-                Some((k, v)) => VType::Map(
-                    Box::new(self.probe_type(k)?),
-                    Box::new(self.probe_type(v)?),
-                ),
+                Some((k, v)) => {
+                    VType::Map(Box::new(self.probe_type(k)?), Box::new(self.probe_type(v)?))
+                }
                 None => VType::Map(Box::new(VType::Any), Box::new(VType::Any)),
             },
             // A block's type is its tail expression's, and the tail may name
@@ -11894,7 +12107,9 @@ fields, not the type this is bound to, not an enclosing generic",
                     lt
                 }
             },
-            Expr::Ident(id) if self.lookup(&id.name).is_none() && self.const_of(&id.name).is_some() => {
+            Expr::Ident(id)
+                if self.lookup(&id.name).is_none() && self.const_of(&id.name).is_some() =>
+            {
                 let init = self.const_of(&id.name).expect("just checked");
                 self.probe_type(&init)?
             }
@@ -11944,9 +12159,7 @@ fields, not the type this is bound to, not an enclosing generic",
                 // to be worked out rather than read: a list element, say.
                 if let Expr::Ident(id) = &**callee {
                     if self.lookup(&id.name).is_none() {
-                        if let Some(key) =
-                            self.generic_variant_key(&id.name, args, id.span)?
-                        {
+                        if let Some(key) = self.generic_variant_key(&id.name, args, id.span)? {
                             return Ok(VType::Sum(key));
                         }
                     }
@@ -12031,11 +12244,7 @@ fields, not the type this is bound to, not an enclosing generic",
                                 Box::new(VType::Sum("IoError".into())),
                             )),
                             "proc_run" | "proc_pipeline" => Some(VType::Fallible(
-                                Box::new(VType::Tuple(vec![
-                                    VType::I64,
-                                    VType::Str,
-                                    VType::Str,
-                                ])),
+                                Box::new(VType::Tuple(vec![VType::I64, VType::Str, VType::Str])),
                                 Box::new(VType::Sum("IoError".into())),
                             )),
                             "udp_recv" => Some(VType::Fallible(
@@ -12043,11 +12252,7 @@ fields, not the type this is bound to, not an enclosing generic",
                                 Box::new(VType::Sum("IoError".into())),
                             )),
                             "udp_recv_from" => Some(VType::Fallible(
-                                Box::new(VType::Tuple(vec![
-                                    VType::Bytes,
-                                    VType::Str,
-                                    VType::I64,
-                                ])),
+                                Box::new(VType::Tuple(vec![VType::Bytes, VType::Str, VType::I64])),
                                 Box::new(VType::Sum("IoError".into())),
                             )),
                             "net_wait" => Some(VType::Fallible(
@@ -12139,9 +12344,9 @@ fields, not the type this is bound to, not an enclosing generic",
                     if self.cg.generic_fns.contains_key(&generic_key) {
                         let arg_types = self.generic_arg_types(&generic_key, args)?;
                         let module = self.cg.current_module.clone();
-                        let key =
-                            self.cg
-                                .instantiate_generic(&module, &id.name, &arg_types, id.span)?;
+                        let key = self
+                            .cg
+                            .instantiate_generic(&module, &id.name, &arg_types, id.span)?;
                         return Ok(self.cg.fns[&key].ret.clone());
                     }
                     if let Some((parent, _)) = self.cg.variant_owner(&id.name) {
@@ -12168,10 +12373,7 @@ fields, not the type this is bound to, not an enclosing generic",
                         return Ok(self
                             .empty_vtype(e.span())
                             .filter(|t| matches!(t, VType::Map(_, _)))
-                            .unwrap_or(VType::Map(
-                                Box::new(VType::Any),
-                                Box::new(VType::Any),
-                            )));
+                            .unwrap_or(VType::Map(Box::new(VType::Any), Box::new(VType::Any))));
                     }
                     // `Ok(v)` and `Err(e)` each name one half. Without these
                     // a closure returning them probed as `_ ! _`, so a caller
@@ -12194,17 +12396,11 @@ fields, not the type this is bound to, not an enclosing generic",
                     }
                     if id.name == "Ok" && args.len() == 1 {
                         let inner = self.probe_type(&args[0])?;
-                        return Ok(VType::Fallible(
-                            Box::new(inner),
-                            Box::new(VType::Any),
-                        ));
+                        return Ok(VType::Fallible(Box::new(inner), Box::new(VType::Any)));
                     }
                     if id.name == "Err" && args.len() == 1 {
                         let inner = self.probe_type(&args[0])?;
-                        return Ok(VType::Fallible(
-                            Box::new(VType::Any),
-                            Box::new(inner),
-                        ));
+                        return Ok(VType::Fallible(Box::new(VType::Any), Box::new(inner)));
                     }
                 }
                 let what = match &**callee {
@@ -12295,15 +12491,15 @@ fields, not the type this is bound to, not an enclosing generic",
                         // -- which [T-REF-CAPTURE] is about -- was refused,
                         // while the same read outside a closure compiled
                         // (F67).
-                        other if name.name == "value"
-                            && !matches!(other, VType::Tuple(_)) =>
-                        {
-                            other
-                        }
+                        other if name.name == "value" && !matches!(other, VType::Tuple(_)) => other,
                         other => {
                             return nope(
                                 *span,
-                                format!("reading `.{}` through a `ref {}`", name.name, other.show()),
+                                format!(
+                                    "reading `.{}` through a `ref {}`",
+                                    name.name,
+                                    other.show()
+                                ),
                             )
                         }
                     },
@@ -12312,11 +12508,7 @@ fields, not the type this is bound to, not an enclosing generic",
                         _ => {
                             return nope(
                                 *span,
-                                format!(
-                                    "`.{}` on a {}-part tuple",
-                                    name.name,
-                                    parts.len()
-                                ),
+                                format!("`.{}` on a {}-part tuple", name.name, parts.len()),
                             )
                         }
                     },
@@ -12327,10 +12519,7 @@ fields, not the type this is bound to, not an enclosing generic",
                                 return Ok(self.sum_vtype(&tid.name));
                             }
                         }
-                        return nope(
-                            *span,
-                            format!("`.{}` on `{}`", name.name, other.show()),
-                        );
+                        return nope(*span, format!("`.{}` on `{}`", name.name, other.show()));
                     }
                 }
             }
@@ -12425,7 +12614,10 @@ fields, not the type this is bound to, not an enclosing generic",
                     None => {
                         return nope(
                             name.span,
-                            format!("`{}` is not an operation of effect `{}`", name.name, tid.name),
+                            format!(
+                                "`{}` is not an operation of effect `{}`",
+                                name.name, tid.name
+                            ),
                         )
                     }
                 }
@@ -12444,19 +12636,23 @@ fields, not the type this is bound to, not an enclosing generic",
             // declared in another module, and matching on the alias alone
             // caught that too and refused it — a program that had compiled
             // since modules existed.
-            Expr::MethodCall { recv, name, args, span }
-                if matches!(&**recv, Expr::Ident(tid)
-                    if self.lookup(&tid.name).is_none()
-                        && self
-                            .cg
-                            .module_imports
-                            .get(&self.cg.current_module)
-                            .and_then(|m| m.get(&tid.name))
-                            .is_some_and(|target| {
-                                let qual = format!("{target}::{}", name.name);
-                                self.cg.fns.contains_key(&qual)
-                                    || self.cg.generic_fns.contains_key(&qual)
-                            })) =>
+            Expr::MethodCall {
+                recv,
+                name,
+                args,
+                span,
+            } if matches!(&**recv, Expr::Ident(tid)
+            if self.lookup(&tid.name).is_none()
+                && self
+                    .cg
+                    .module_imports
+                    .get(&self.cg.current_module)
+                    .and_then(|m| m.get(&tid.name))
+                    .is_some_and(|target| {
+                        let qual = format!("{target}::{}", name.name);
+                        self.cg.fns.contains_key(&qual)
+                            || self.cg.generic_fns.contains_key(&qual)
+                    })) =>
             {
                 let Expr::Ident(tid) = &**recv else {
                     unreachable!("just matched")
@@ -12477,7 +12673,9 @@ fields, not the type this is bound to, not an enclosing generic",
                     // instantiated here the way the lowering instantiates it,
                     // and the instance's return type is the answer.
                     let arg_types = self.generic_arg_types(&qual, args)?;
-                    let key = self.cg.instantiate_generic(&target, &name.name, &arg_types, *span)?;
+                    let key = self
+                        .cg
+                        .instantiate_generic(&target, &name.name, &arg_types, *span)?;
                     self.cg.fns[&key].ret.clone()
                 } else {
                     unreachable!("the guard checked that this name is a function")
@@ -12510,16 +12708,17 @@ fields, not the type this is bound to, not an enclosing generic",
                     other => other,
                 }
             }
-            Expr::MethodCall { recv, name, args, .. } => match name.name.as_str() {
+            Expr::MethodCall {
+                recv, name, args, ..
+            } => match name.name.as_str() {
                 "len" | "byte_len" => VType::I64,
                 "is_nan" | "is_finite" => VType::Bool,
-                "is_some" | "is_none" | "is_empty" | "contains" | "starts_with"
-                | "ends_with" | "has" | "delete" | "any" | "all" => VType::Bool,
+                "is_some" | "is_none" | "is_empty" | "contains" | "starts_with" | "ends_with"
+                | "has" | "delete" | "any" | "all" => VType::Bool,
                 "to_base" => VType::Str,
-                "to_str" | "join" | "trim" | "trim_start" | "trim_end"
-                | "to_upper" | "to_lower" | "replace"
-                | "substr" | "repeat" | "pad_start" | "pad_end" | "to_char"
-                | "to_fixed" => VType::Str,
+                "to_str" | "join" | "trim" | "trim_start" | "trim_end" | "to_upper"
+                | "to_lower" | "replace" | "substr" | "repeat" | "pad_start" | "pad_end"
+                | "to_char" | "to_fixed" => VType::Str,
                 "code_at" | "cmp" => VType::I64,
                 "codes" => VType::List(Box::new(VType::I64)),
                 "as_f64" => VType::F64,
@@ -12532,16 +12731,17 @@ fields, not the type this is bound to, not an enclosing generic",
                 // fell through to a representation that then unboxed an f64
                 // as if it were a pointer.
                 "sqrt" | "floor" | "ceil" | "round" => VType::F64,
-                "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "sinh" | "cosh" | "tanh" | "exp" | "ln" | "log2" | "log10" | "cbrt" | "to_radians" | "to_degrees" => VType::F64,
+                "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "sinh" | "cosh" | "tanh"
+                | "exp" | "ln" | "log2" | "log10" | "cbrt" | "to_radians" | "to_degrees" => {
+                    VType::F64
+                }
                 "atan2" | "hypot" | "log" => VType::F64,
                 "abs" => self.probe_type(recv)?,
                 // Bit manipulation always answers `i64` ([L-LIB-BITS]).
                 // Without this the probe could not type `(v.ushr(8)).bit_and(0xFF)`
                 // — a chain that every little-endian field in a binary format
                 // is built from.
-                "bit_and" | "bit_or" | "bit_xor" | "bit_not" | "shl" | "shr" | "ushr" => {
-                    VType::I64
-                }
+                "bit_and" | "bit_or" | "bit_xor" | "bit_not" | "shl" | "shr" | "ushr" => VType::I64,
                 // Bytes ([L-LIB-BYTES]).
                 "to_bytes" => VType::Bytes,
                 "at" => VType::I64,
@@ -12549,11 +12749,27 @@ fields, not the type this is bound to, not an enclosing generic",
                 "chars" | "lines" | "split" | "words" | "keys" => VType::List(Box::new(VType::Str)),
                 "entries" => match self.probe_type(recv)? {
                     VType::Map(k, v) => VType::List(Box::new(VType::Tuple(vec![*k, *v]))),
-                    _ => return nope(e.span(), format!("`.{}()` on a receiver whose type is not known here", name.name)),
+                    _ => {
+                        return nope(
+                            e.span(),
+                            format!(
+                                "`.{}()` on a receiver whose type is not known here",
+                                name.name
+                            ),
+                        )
+                    }
                 },
                 "values" => match self.probe_type(recv)? {
                     VType::Map(_, v) => VType::List(v),
-                    _ => return nope(e.span(), format!("`.{}()` on a receiver whose type is not known here", name.name)),
+                    _ => {
+                        return nope(
+                            e.span(),
+                            format!(
+                                "`.{}()` on a receiver whose type is not known here",
+                                name.name
+                            ),
+                        )
+                    }
                 },
                 "parse_int" => VType::Option(Box::new(VType::I64)),
                 // Its sibling had an arm and it did not, so `"ff"` parsed in
@@ -12570,20 +12786,44 @@ fields, not the type this is bound to, not an enclosing generic",
                     // answered by the default, which has to be the same type.
                     _ => match args.first() {
                         Some(d) => self.probe_type(d)?,
-                        None => return nope(e.span(), format!("`.{}()` on a receiver whose type is not known here", name.name)),
+                        None => {
+                            return nope(
+                                e.span(),
+                                format!(
+                                    "`.{}()` on a receiver whose type is not known here",
+                                    name.name
+                                ),
+                            )
+                        }
                     },
                 },
                 // A fold is worth what it accumulates, and the seed is what
                 // says so -- the closure's result has to match it.
                 "fold" => match args.first() {
                     Some(seed) => self.probe_type(seed)?,
-                    None => return nope(e.span(), format!("`.{}()` on a receiver whose type is not known here", name.name)),
+                    None => {
+                        return nope(
+                            e.span(),
+                            format!(
+                                "`.{}()` on a receiver whose type is not known here",
+                                name.name
+                            ),
+                        )
+                    }
                 },
                 "index_of" => VType::Option(Box::new(VType::I64)),
                 "to_list" => match self.probe_type(recv)? {
                     VType::Bytes | VType::Range => VType::List(Box::new(VType::I64)),
                     VType::List(t) => VType::List(t),
-                    _ => return nope(e.span(), format!("`.{}()` on a receiver whose type is not known here", name.name)),
+                    _ => {
+                        return nope(
+                            e.span(),
+                            format!(
+                                "`.{}()` on a receiver whose type is not known here",
+                                name.name
+                            ),
+                        )
+                    }
                 },
                 // Element-wise: the result follows the receiver's elements.
                 "sum" => match self.probe_type(recv)? {
@@ -12591,7 +12831,15 @@ fields, not the type this is bound to, not an enclosing generic",
                     // [L-LIB-RANGE-OPS]: a range answers the list surface by
                     // building the list of its elements, which are `i64`.
                     VType::Range => VType::I64,
-                    _ => return nope(e.span(), format!("`.{}()` on a receiver whose type is not known here", name.name)),
+                    _ => {
+                        return nope(
+                            e.span(),
+                            format!(
+                                "`.{}()` on a receiver whose type is not known here",
+                                name.name
+                            ),
+                        )
+                    }
                 },
                 // `min`/`max` are two methods sharing a name: the reduction
                 // over a list yields an Option, the two-argument numeric form
@@ -12599,14 +12847,28 @@ fields, not the type this is bound to, not an enclosing generic",
                 "min" | "max" => match self.probe_type(recv)? {
                     VType::List(elem) => VType::Option(elem),
                     n @ (VType::I64 | VType::F64) => n,
-                    _ => return nope(e.span(), format!("`.{}()` on a receiver whose type is not known here", name.name)),
-                },
-                "first" | "last" | "pop" => {
-                    match self.probe_type(recv)? {
-                        VType::List(elem) => VType::Option(elem),
-                        _ => return nope(e.span(), format!("`.{}()` on a receiver whose type is not known here", name.name)),
+                    _ => {
+                        return nope(
+                            e.span(),
+                            format!(
+                                "`.{}()` on a receiver whose type is not known here",
+                                name.name
+                            ),
+                        )
                     }
-                }
+                },
+                "first" | "last" | "pop" => match self.probe_type(recv)? {
+                    VType::List(elem) => VType::Option(elem),
+                    _ => {
+                        return nope(
+                            e.span(),
+                            format!(
+                                "`.{}()` on a receiver whose type is not known here",
+                                name.name
+                            ),
+                        )
+                    }
+                },
                 "rev" | "slice" | "filter" | "par_filter" => {
                     match self.probe_type(recv)? {
                         // A range's `filter` answers a *list*, not a range.
@@ -12627,24 +12889,64 @@ fields, not the type this is bound to, not an enclosing generic",
                 "sort" | "sort_by" | "push" | "set" => VType::Unit,
                 "remove" => match self.probe_type(recv)? {
                     VType::List(elem) => *elem,
-                    _ => return nope(e.span(), format!("`.{}()` on a receiver whose type is not known here", name.name)),
+                    _ => {
+                        return nope(
+                            e.span(),
+                            format!(
+                                "`.{}()` on a receiver whose type is not known here",
+                                name.name
+                            ),
+                        )
+                    }
                 },
                 "enumerate" => match self.probe_type(recv)? {
                     VType::List(elem) => {
                         VType::List(Box::new(VType::Tuple(vec![VType::I64, *elem])))
                     }
-                    _ => return nope(e.span(), format!("`.{}()` on a receiver whose type is not known here", name.name)),
+                    _ => {
+                        return nope(
+                            e.span(),
+                            format!(
+                                "`.{}()` on a receiver whose type is not known here",
+                                name.name
+                            ),
+                        )
+                    }
                 },
                 "zip" => match (self.probe_type(recv)?, args.first()) {
                     (VType::List(a), Some(other)) => match self.probe_type(other)? {
                         VType::List(b) => VType::List(Box::new(VType::Tuple(vec![*a, *b]))),
-                        _ => return nope(e.span(), format!("`.{}()` on a receiver whose type is not known here", name.name)),
+                        _ => {
+                            return nope(
+                                e.span(),
+                                format!(
+                                    "`.{}()` on a receiver whose type is not known here",
+                                    name.name
+                                ),
+                            )
+                        }
                     },
-                    _ => return nope(e.span(), format!("`.{}()` on a receiver whose type is not known here", name.name)),
+                    _ => {
+                        return nope(
+                            e.span(),
+                            format!(
+                                "`.{}()` on a receiver whose type is not known here",
+                                name.name
+                            ),
+                        )
+                    }
                 },
                 "find" => match self.probe_type(recv)? {
                     VType::List(elem) => VType::Option(elem),
-                    _ => return nope(e.span(), format!("`.{}()` on a receiver whose type is not known here", name.name)),
+                    _ => {
+                        return nope(
+                            e.span(),
+                            format!(
+                                "`.{}()` on a receiver whose type is not known here",
+                                name.name
+                            ),
+                        )
+                    }
                 },
                 // `map`/`par_map` change the element type, which needs the
                 // function's result — only knowable when it is a closure whose
@@ -12674,7 +12976,15 @@ fields, not the type this is bound to, not an enclosing generic",
                                 _ => self.probe_type(body)?,
                             }
                         }
-                        _ => return nope(e.span(), format!("`.{}()` on a receiver whose type is not known here", name.name)),
+                        _ => {
+                            return nope(
+                                e.span(),
+                                format!(
+                                    "`.{}()` on a receiver whose type is not known here",
+                                    name.name
+                                ),
+                            )
+                        }
                     };
                     VType::List(Box::new(inner))
                 }
@@ -12683,7 +12993,15 @@ fields, not the type this is bound to, not an enclosing generic",
                     match rt {
                         VType::List(elem) => VType::Option(elem),
                         VType::Map(_, v) => VType::Option(v),
-                        _ => return nope(e.span(), format!("`.{}()` on a receiver whose type is not known here", name.name)),
+                        _ => {
+                            return nope(
+                                e.span(),
+                                format!(
+                                    "`.{}()` on a receiver whose type is not known here",
+                                    name.name
+                                ),
+                            )
+                        }
                     }
                 }
                 _ => {
@@ -12695,15 +13013,12 @@ fields, not the type this is bound to, not an enclosing generic",
                             .and_then(|m| m.get(&tid.name))
                             .cloned()
                         {
-                            if let Some(sig) =
-                                self.cg.fns.get(&format!("{target}::{}", name.name))
+                            if let Some(sig) = self.cg.fns.get(&format!("{target}::{}", name.name))
                             {
                                 return Ok(sig.ret.clone());
                             }
                             // `shapes.Circle(..)` — a variant through the alias.
-                            if let Some((parent, _)) =
-                                self.cg.variant_owner(&name.name)
-                            {
+                            if let Some((parent, _)) = self.cg.variant_owner(&name.name) {
                                 return Ok(self.sum_vtype(&parent));
                             }
                         }
@@ -12714,10 +13029,22 @@ fields, not the type this is bound to, not an enclosing generic",
                         if self.cg.sums.contains_key(&tid.name) {
                             self.sum_vtype(&tid.name)
                         } else {
-                            return nope(e.span(), format!("`.{}()` on a receiver whose type is not known here", name.name));
+                            return nope(
+                                e.span(),
+                                format!(
+                                    "`.{}()` on a receiver whose type is not known here",
+                                    name.name
+                                ),
+                            );
                         }
                     } else {
-                        return nope(e.span(), format!("`.{}()` on a receiver whose type is not known here", name.name));
+                        return nope(
+                            e.span(),
+                            format!(
+                                "`.{}()` on a receiver whose type is not known here",
+                                name.name
+                            ),
+                        );
                     }
                 }
             },
@@ -12914,9 +13241,9 @@ fields, not the type this is bound to, not an enclosing generic",
             // literal takes its element type from — `match n { 0 -> [] ... }`
             // has nothing else to go on.
             let bv = match &out_t {
-                Some(t) if needs_type_hint(&arm.body) => {
-                    self.eval_expr_expecting(&arm.body, Some(&t.clone())).map(Some)?
-                }
+                Some(t) if needs_type_hint(&arm.body) => self
+                    .eval_expr_expecting(&arm.body, Some(&t.clone()))
+                    .map(Some)?,
                 _ => self.eval_expr(&arm.body)?,
             };
             // An arm body may itself terminate (`-> break`, `-> return x`).
@@ -12927,8 +13254,7 @@ fields, not the type this is bound to, not an enclosing generic",
                         // An arm of a fallible function may give the whole
                         // `T ! E` or just the ok half ([T-OK-ERR-RETURN]),
                         // exactly as an `if` branch may.
-                        if matches!(want, VType::Fallible(..))
-                            && !matches!(vt, VType::Fallible(..))
+                        if matches!(want, VType::Fallible(..)) && !matches!(vt, VType::Fallible(..))
                         {
                             let boxed = self.box_value(v, &vt);
                             v = self.call_rt("grasm_ok_new", &[boxed]).unwrap();
@@ -13288,12 +13614,7 @@ fields, not the type this is bound to, not an enclosing generic",
                 (VType::List(e), PlaceSeg::Index(ix)) => {
                     let et = (**e).clone();
                     let (iv, _) = self.index_value(ix)?;
-                    cur = self.take_or_get(
-                        "grasm_list_take",
-                        "grasm_list_get",
-                        &[cur, iv],
-                        take,
-                    );
+                    cur = self.take_or_get("grasm_list_take", "grasm_list_get", &[cur, iv], take);
                     cur_t = et;
                 }
                 _ => return nope(Span::new(0, 1), "this place's shape"),
@@ -13408,24 +13729,24 @@ fields, not the type this is bound to, not an enclosing generic",
             },
             Some((seg, rest)) => {
                 // Descend: read the child, recurse, then write it back.
-                let (child, child_t, writeback): (Value, VType, PlaceSeg<'_>) =
-                    match (root_t, seg) {
-                        (VType::Struct(sname), PlaceSeg::Field(f)) => {
-                            let sname = sname.clone();
-                            let ft = self.struct_field_type(&sname, f, Span::new(0, 1))?;
-                            let (fp, fl) = self.str_ptr_len(f);
-                            let c = self.call_rt("grasm_struct_get", &[root, fp, fl]).unwrap();
-                            (c, ft, PlaceSeg::Field(f))
-                        }
-                        (VType::List(e), PlaceSeg::Index(ix)) => {
-                            let et = (**e).clone();
-                            let (iv, _) = self.index_value(ix)?;
-                            let c = self.call_rt("grasm_list_get", &[root, iv]).unwrap();
-                            let _ = iv;
-                            (c, et, PlaceSeg::Index(ix))
-                        }
-                        _ => return nope(span, place_shape(root_t, seg)),
-                    };
+                let (child, child_t, writeback): (Value, VType, PlaceSeg<'_>) = match (root_t, seg)
+                {
+                    (VType::Struct(sname), PlaceSeg::Field(f)) => {
+                        let sname = sname.clone();
+                        let ft = self.struct_field_type(&sname, f, Span::new(0, 1))?;
+                        let (fp, fl) = self.str_ptr_len(f);
+                        let c = self.call_rt("grasm_struct_get", &[root, fp, fl]).unwrap();
+                        (c, ft, PlaceSeg::Field(f))
+                    }
+                    (VType::List(e), PlaceSeg::Index(ix)) => {
+                        let et = (**e).clone();
+                        let (iv, _) = self.index_value(ix)?;
+                        let c = self.call_rt("grasm_list_get", &[root, iv]).unwrap();
+                        let _ = iv;
+                        (c, et, PlaceSeg::Index(ix))
+                    }
+                    _ => return nope(span, place_shape(root_t, seg)),
+                };
                 // A reference child is written *through*: the write lands in
                 // the slab, so every other holder of it sees the change and
                 // nothing above needs updating — not this parent, and not any
@@ -13487,19 +13808,13 @@ fields, not the type this is bound to, not an enclosing generic",
                         Ok(match self.struct_field_index(&sn, f) {
                             Some(i) => {
                                 let iv = self.b.ins().iconst(types::I64, i);
-                                self.call_rt(
-                                    "grasm_struct_set_field_at",
-                                    &[root, iv, new_child],
-                                )
-                                .unwrap()
+                                self.call_rt("grasm_struct_set_field_at", &[root, iv, new_child])
+                                    .unwrap()
                             }
                             None => {
                                 let (fp, fl) = self.str_ptr_len(f);
-                                self.call_rt(
-                                    "grasm_struct_set_field",
-                                    &[root, fp, fl, new_child],
-                                )
-                                .unwrap()
+                                self.call_rt("grasm_struct_set_field", &[root, fp, fl, new_child])
+                                    .unwrap()
                             }
                         })
                     }
@@ -13648,7 +13963,11 @@ fields, not the type this is bound to, not an enclosing generic",
         if ret != VType::Unit {
             sig.returns.push(AbiParam::new(ret.cl()));
         }
-        let sym = format!("gc_{}_{}", self.cg.current_module.replace('.', "_"), span.start);
+        let sym = format!(
+            "gc_{}_{}",
+            self.cg.current_module.replace('.', "_"),
+            span.start
+        );
         let id = self
             .cg
             .module
@@ -13711,7 +14030,13 @@ fields, not the type this is bound to, not an enclosing generic",
         // tells the reader to write: `let f: fn(i64) -> i64 = |x| x + 1`.
         // Without this the advice named a form the backend then refused.
         for stmt in &blk.stmts {
-            let Stmt::Let { name, ty: Some(ty), init, .. } = stmt else {
+            let Stmt::Let {
+                name,
+                ty: Some(ty),
+                init,
+                ..
+            } = stmt
+            else {
                 continue;
             };
             if !matches!(init, Expr::Closure { params, .. } if !params.is_empty()) {
@@ -13719,10 +14044,7 @@ fields, not the type this is bound to, not an enclosing generic",
             }
             if let Ok(VType::Fn(ps, ret)) = self.cg.vtype_of(ty) {
                 hints.declared.entry(name.name.clone()).or_insert(ps);
-                hints
-                    .declared_ret
-                    .entry(name.name.clone())
-                    .or_insert(*ret);
+                hints.declared_ret.entry(name.name.clone()).or_insert(*ret);
             }
         }
         // A struct field's declared type says what a closure put in it takes:
@@ -13734,7 +14056,11 @@ fields, not the type this is bound to, not an enclosing generic",
             let mut lits: Vec<(&Path, &Vec<(Ident, Expr)>)> = Vec::new();
             collect_struct_lits_stmt(stmt, &mut lits);
             for (name, fields) in lits {
-                let sname = name.segments.last().map(|s| s.name.clone()).unwrap_or_default();
+                let sname = name
+                    .segments
+                    .last()
+                    .map(|s| s.name.clone())
+                    .unwrap_or_default();
                 for (fname, value) in fields {
                     let Expr::Ident(id) = value else { continue };
                     if !bound.contains(&id.name) {
@@ -13799,8 +14125,7 @@ fields, not the type this is bound to, not an enclosing generic",
                 let mut out = Vec::with_capacity(ts.len());
                 let mut all = true;
                 for t in &ts {
-                    match grasm_syntax::parse_type_src(t)
-                        .and_then(|te| self.cg.vtype_of(&te).ok())
+                    match grasm_syntax::parse_type_src(t).and_then(|te| self.cg.vtype_of(&te).ok())
                     {
                         Some(vt) => out.push(vt),
                         None => {
@@ -13914,7 +14239,10 @@ own parameters cannot be annotated)",
                 .iter()
                 .rev()
                 .flat_map(|scope| {
-                    scope.declared_ty.iter().map(|(n, t)| (n.clone(), t.clone()))
+                    scope
+                        .declared_ty
+                        .iter()
+                        .map(|(n, t)| (n.clone(), t.clone()))
                 })
                 .collect();
             for (n, t) in declared {
@@ -14125,8 +14453,7 @@ binding, as in `let f: fn(i64) -> i64 = |x| x + 1`, or make it a top-level `fn`)
         let all_scalar = scalar_kind_i64(elem_t).is_some()
             && scalar_kind_i64(&out_t).is_some()
             && captures.iter().all(|(_, t)| scalar_kind_i64(t).is_some());
-        if !(ok(elem_t) && ok(&out_t) && captures.iter().all(|(_, t)| ok(t)))
-            || body_can_fail(body)
+        if !(ok(elem_t) && ok(&out_t) && captures.iter().all(|(_, t)| ok(t))) || body_can_fail(body)
         {
             // Not parallelizable with this representation; the sequential
             // lowering produces the same list.
@@ -14167,11 +14494,13 @@ binding, as in `let f: fn(i64) -> i64 = |x| x + 1`, or make it a top-level `fn`)
         // The captured scalars go into a stack array the runtime copies per
         // worker — no shared mutable state at all.
         let slot_bytes = (captures.len().max(1) * 8) as u32;
-        let slot = self.b.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
-            cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
-            slot_bytes,
-            3,
-        ));
+        let slot = self
+            .b
+            .create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
+                cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                slot_bytes,
+                3,
+            ));
         for (i, (name, vt)) in captures.iter().enumerate() {
             let (var, _) = self.lookup(name).expect("capture resolved above");
             let v = self.b.use_var(var);
@@ -14195,10 +14524,7 @@ binding, as in `let f: fn(i64) -> i64 = |x| x + 1`, or make it a top-level `fn`)
         } else {
             // Both representations are the compiler's to state: they follow
             // the static type, and a boxed list of integers exists.
-            let in_boxed = self
-                .b
-                .ins()
-                .iconst(types::I64, i64::from(elem_t.boxed()));
+            let in_boxed = self.b.ins().iconst(types::I64, i64::from(elem_t.boxed()));
             let out_kind = self
                 .b
                 .ins()
@@ -14270,11 +14596,13 @@ binding, as in `let f: fn(i64) -> i64 = |x| x + 1`, or make it a top-level `fn`)
         });
 
         let slot_bytes = (captures.len().max(1) * 8) as u32;
-        let slot = self.b.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
-            cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
-            slot_bytes,
-            3,
-        ));
+        let slot = self
+            .b
+            .create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
+                cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                slot_bytes,
+                3,
+            ));
         for (i, (name, vt)) in captures.iter().enumerate() {
             let (var, _) = self.lookup(name).expect("capture resolved above");
             let v = self.b.use_var(var);
@@ -14604,7 +14932,8 @@ binding, as in `let f: fn(i64) -> i64 = |x| x + 1`, or make it a top-level `fn`)
             // ordinary path releases it with `pop_scope_with_decs`, and a fail
             // path that skipped it leaked whatever they held — invisible with
             // an `i64` element and one allocation with a `str`.
-            self.fail_redirect.push((blk, slot, self.vars.len().saturating_sub(1)));
+            self.fail_redirect
+                .push((blk, slot, self.vars.len().saturating_sub(1)));
             Some((blk, slot))
         } else {
             None
@@ -14739,13 +15068,13 @@ binding, as in `let f: fn(i64) -> i64 = |x| x + 1`, or make it a top-level `fn`)
             .filter(|_| !redirect_fail && !body_can_fail(body));
         let ptr_ty = self.cg.module.target_config().pointer_type();
         let append = pinned_kind.map(|k| {
-            let slot = self.b.create_sized_stack_slot(
-                cranelift_codegen::ir::StackSlotData::new(
+            let slot = self
+                .b
+                .create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
                     cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
                     24,
                     3,
-                ),
-            );
+                ));
             let data_out = self.b.ins().stack_addr(ptr_ty, slot, 0);
             let len_out = self.b.ins().stack_addr(ptr_ty, slot, 8);
             let cap_out = self.b.ins().stack_addr(ptr_ty, slot, 16);
@@ -14773,7 +15102,15 @@ binding, as in `let f: fn(i64) -> i64 = |x| x + 1`, or make it a top-level `fn`)
             } else {
                 8
             };
-            (data_var, len_var, cap_var, data_out, cap_out, stride)
+            PinnedAppend {
+                list_var: out_var,
+                data_var,
+                len_var,
+                cap_var,
+                data_out,
+                cap_out,
+                stride,
+            }
         });
         let ivar = self.new_var(&VType::I64);
         let zero = self.b.ins().iconst(types::I64, 0);
@@ -14823,7 +15160,8 @@ binding, as in `let f: fn(i64) -> i64 = |x| x + 1`, or make it a top-level `fn`)
             // ordinary path releases it with `pop_scope_with_decs`, and a fail
             // path that skipped it leaked whatever they held — invisible with
             // an `i64` element and one allocation with a `str`.
-            self.fail_redirect.push((blk, slot, self.vars.len().saturating_sub(1)));
+            self.fail_redirect
+                .push((blk, slot, self.vars.len().saturating_sub(1)));
             Some((blk, slot))
         } else {
             None
@@ -14834,11 +15172,11 @@ binding, as in `let f: fn(i64) -> i64 = |x| x + 1`, or make it a top-level `fn`)
         }
         let out_elem_t = if is_map { bvt.clone() } else { elem_t.clone() };
         if is_map {
-            match append {
-                Some((dv, lv, cv, d_out, c_out, stride)) => {
+            match &append {
+                Some(pin) => {
                     let bits = self.scalar_bits_of(bv, &bvt);
-                    let held = self.b.use_var(out_var);
-                    self.append_pinned(held, dv, lv, cv, d_out, c_out, bits, stride);
+                    let pin = *pin;
+                    self.append_pinned(&pin, bits);
                 }
                 None => {
                     let cur = self.b.use_var(out_var);
@@ -14873,11 +15211,11 @@ binding, as in `let f: fn(i64) -> i64 = |x| x + 1`, or make it a top-level `fn`)
             if evt.boxed() {
                 self.call_rt("grasm_val_inc", &[e2]);
             }
-            match append {
-                Some((dv, lv, cv, d_out, c_out, stride)) => {
+            match &append {
+                Some(pin) => {
                     let bits = self.scalar_bits_of(e2, &evt);
-                    let held = self.b.use_var(out_var);
-                    self.append_pinned(held, dv, lv, cv, d_out, c_out, bits, stride);
+                    let pin = *pin;
+                    self.append_pinned(&pin, bits);
                 }
                 None => {
                     let cur = self.b.use_var(out_var);
@@ -14908,9 +15246,9 @@ binding, as in `let f: fn(i64) -> i64 = |x| x + 1`, or make it a top-level `fn`)
         self.pop_scope_no_decs();
         // The length the loop wrote becomes the list's length. Until this
         // call the elements are in the buffer and the list does not know it.
-        if let Some((_, len_var, _, _, _, _)) = append {
+        if let Some(pin) = append {
             let held = self.b.use_var(out_var);
-            let written = self.b.use_var(len_var);
+            let written = self.b.use_var(pin.len_var);
             self.call_rt("grasm_list_append_end", &[held, written]);
         }
         let lv3 = self.b.use_var(list_var);
@@ -15223,8 +15561,10 @@ binding, as in `let f: fn(i64) -> i64 = |x| x + 1`, or make it a top-level `fn`)
                     let boxed = self.call_rt("grasm_list_get", &[sv, idx]).unwrap();
                     match pat_i {
                         Pattern::Bind(fid)
-                            if !matches!(self.cg.variant_owner(&fid.name).as_ref(), Some((_, 0)))
-                                && fid.name != "None" =>
+                            if !matches!(
+                                self.cg.variant_owner(&fid.name).as_ref(),
+                                Some((_, 0))
+                            ) && fid.name != "None" =>
                         {
                             let (v, vt) = self.unbox(boxed, t_i)?;
                             let var = self.new_var(&vt);

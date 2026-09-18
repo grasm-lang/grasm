@@ -463,17 +463,34 @@ impl ScalarData {
 
     /// Sorts in place. Bools have no ordering in `cmp_vals`, so sorting them
     /// is a no-op in both engines — replicated here rather than "fixed".
+    /// Sorted in place.
+    //
+    // Unstable, and a plain `sort_unstable` where the words *are* the order.
+    // Every comparison here is a total one: two words that compare equal are
+    // the same word — `total_cmp` distinguishes -0.0 from 0.0 and orders NaNs
+    // by their bits — so no program can tell which of two equal elements came
+    // first, and stability costs a scratch buffer of half the list plus a
+    // closure call per comparison. For integers there is not even a
+    // comparison to make: the machine's own order is the answer.
     fn sort(&mut self, kind: ScalarKind) {
         if let ScalarData::Words(v) = self {
-            v.sort_by(|&a, &b| scalar_cmp(kind, a, b));
+            match kind {
+                ScalarKind::I64 | ScalarKind::Ref => v.sort_unstable(),
+                ScalarKind::F64 => v.sort_unstable_by(|&a, &b| {
+                    f64::from_bits(a as u64).total_cmp(&f64::from_bits(b as u64))
+                }),
+                // Every bool compares equal to every other, so there is
+                // nothing to do — and they are bytes, not words, anyway.
+                ScalarKind::Bool => {}
+            }
         }
     }
 
     fn from_words(kind: ScalarKind, words: Vec<i64>) -> ScalarData {
         match kind {
-            ScalarKind::Bool => ScalarData::Bytes(
-                words.into_iter().map(|b| u8::from(b != 0)).collect(),
-            ),
+            ScalarKind::Bool => {
+                ScalarData::Bytes(words.into_iter().map(|b| u8::from(b != 0)).collect())
+            }
             _ => ScalarData::Words(words),
         }
     }
@@ -569,10 +586,7 @@ impl StructFields {
         if n <= 4 {
             let mut vals = [std::ptr::null_mut(); 4];
             std::ptr::copy_nonoverlapping(argv, vals.as_mut_ptr(), n);
-            StructFields::Inline {
-                vals,
-                len: n as u8,
-            }
+            StructFields::Inline { vals, len: n as u8 }
         } else {
             StructFields::Heap(std::slice::from_raw_parts(argv, n).to_vec())
         }
@@ -664,12 +678,10 @@ unsafe fn desc_ty(desc: *const StructDesc) -> &'static StructTy {
         fields,
     }));
     let addr = fresh as *const StructTy as usize;
-    match (*desc).cache.compare_exchange(
-        0,
-        addr,
-        Ordering::Release,
-        Ordering::Acquire,
-    ) {
+    match (*desc)
+        .cache
+        .compare_exchange(0, addr, Ordering::Release, Ordering::Acquire)
+    {
         Ok(_) => fresh,
         Err(won) => &*(won as *const StructTy),
     }
@@ -718,7 +730,10 @@ impl Ord for StrData {
 /// representation and never links the runtime.
 #[derive(Debug, Clone)]
 pub enum StrData {
-    Inline { bytes: [u8; INLINE_STR_CAP], len: u8 },
+    Inline {
+        bytes: [u8; INLINE_STR_CAP],
+        len: u8,
+    },
     Heap(String),
 }
 
@@ -739,7 +754,10 @@ impl StrData {
         if text.len() <= 15 {
             let mut bytes = [0u8; 15];
             bytes[..text.len()].copy_from_slice(text.as_bytes());
-            StrData::Inline { bytes, len: text.len() as u8 }
+            StrData::Inline {
+                bytes,
+                len: text.len() as u8,
+            }
         } else {
             StrData::Heap(text.to_string())
         }
@@ -759,7 +777,11 @@ impl RtStr {
         // allocation has already happened here, but every later read avoids a
         // pointer hop. The constructors that matter for speed —
         // `concat` and `of_i64` — never build a `String` at all.
-        let data = if s.len() <= 15 { StrData::of(&s) } else { StrData::Heap(s) };
+        let data = if s.len() <= 15 {
+            StrData::of(&s)
+        } else {
+            StrData::Heap(s)
+        };
         RtStr {
             s: data,
             index: std::sync::OnceLock::new(),
@@ -848,7 +870,10 @@ impl RtStr {
             let mut bytes = [0u8; 15];
             bytes[..a.len()].copy_from_slice(a.as_bytes());
             bytes[a.len()..total].copy_from_slice(b.as_bytes());
-            StrData::Inline { bytes, len: total as u8 }
+            StrData::Inline {
+                bytes,
+                len: total as u8,
+            }
         } else {
             let mut out = String::with_capacity(total);
             out.push_str(a);
@@ -864,7 +889,12 @@ impl RtStr {
     /// The character index, built on first use. Only reached for non-ASCII.
     fn index(&self) -> &CharIndex {
         self.index.get_or_init(|| {
-            let offsets: Vec<u32> = self.s.as_str().char_indices().map(|(o, _)| o as u32).collect();
+            let offsets: Vec<u32> = self
+                .s
+                .as_str()
+                .char_indices()
+                .map(|(o, _)| o as u32)
+                .collect();
             Box::new(CharIndex {
                 count: offsets.len() as u32,
                 offsets,
@@ -1102,7 +1132,10 @@ pub enum RtPayload {
     /// changes when the environment outlives the frame that built it. `boxed`
     /// says which of those words are references, and is what lets releasing the
     /// environment release them.
-    Env { words: Vec<i64>, boxed: Vec<bool> },
+    Env {
+        words: Vec<i64>,
+        boxed: Vec<bool>,
+    },
     /// An effect handler as a value: its effect, and each operation's code and
     /// environment.
     ///
@@ -1118,7 +1151,11 @@ pub enum RtPayload {
     /// and a flag, and the interpreter's `Value::Range` is the same three
     /// fields — so a range that crosses between engines is the same value on
     /// both, and prints as `0..2000000` rather than as two million integers.
-    Range { start: i64, end: i64, inclusive: bool },
+    Range {
+        start: i64,
+        end: i64,
+        inclusive: bool,
+    },
     /// A contiguous run of bytes ([L-LIB-BYTES]). `Vec<u8>`, not a list of
     /// boxed integers: the promise the type makes is that every element is a
     /// byte, and the representation should carry that promise.
@@ -1140,7 +1177,10 @@ pub enum RtPayload {
     /// Scalar elements stored inline — no per-element heap cell, no refcount
     /// traffic, no pointer chase. This is why `c[i] = c[i] + x` in a hot loop
     /// is a load and a store instead of an allocation.
-    ListScalar { kind: ScalarKind, data: ScalarData },
+    ListScalar {
+        kind: ScalarKind,
+        data: ScalarData,
+    },
     /// Hash table for lookup; iteration sorts, which is where the ordering
     /// guarantee is paid for rather than on every get and set.
     Map(std::collections::HashMap<MapKey, *mut RtVal>),
@@ -1268,6 +1308,11 @@ struct Local {
     /// The address this thread's stack may not go past.
     stack_floor: Cell<usize>,
     /// Buffers for building interpolated strings, kept for their capacity.
+    //
+    // Boxed on purpose, whatever clippy thinks: `grasm_str_build` hands the
+    // generated code the address of one of these as its handle, so the
+    // `String` has to stay where it is while the vector behind it grows.
+    #[allow(clippy::vec_box)]
     builders: std::cell::RefCell<Vec<Box<String>>>,
     /// Every allocation this thread has made, whether or not it is still
     /// live. Reported by `GRASM_ALLOC_STATS`, which is how a question like
@@ -1363,7 +1408,6 @@ fn alloc(payload: RtPayload) -> *mut RtVal {
         p
     })
 }
-
 
 /// What worker threads allocated and did not free themselves.
 ///
@@ -1497,7 +1541,6 @@ fn is_counted(rc: i64) -> bool {
     rc != IMMORTAL && rc != ARENA
 }
 
-
 // A `Cell<usize>` depth counter was tried beside this, so that an allocation
 // could ask "am I inside a region" with a load rather than a `RefCell` borrow.
 // It measured **zero** on a benchmark that allocates 800,000 times, and was
@@ -1538,18 +1581,36 @@ pub unsafe extern "C" fn grasm_region_pop() {
         let mut outside: Vec<*mut RtVal> = Vec::new();
         match &(*p).payload {
             RtPayload::List(items) | RtPayload::Tuple(items) => {
-                outside.extend(items.iter().copied().filter(|c| (**c).rc.load(Relaxed) != ARENA));
+                outside.extend(
+                    items
+                        .iter()
+                        .copied()
+                        .filter(|c| (**c).rc.load(Relaxed) != ARENA),
+                );
             }
             RtPayload::Map(entries) => {
-                outside.extend(entries.values().copied().filter(|c| (**c).rc.load(Relaxed) != ARENA));
+                outside.extend(
+                    entries
+                        .values()
+                        .copied()
+                        .filter(|c| (**c).rc.load(Relaxed) != ARENA),
+                );
             }
             RtPayload::Struct { fields, .. } => {
                 outside.extend(
-                    fields.iter().copied().filter(|c| (**c).rc.load(Relaxed) != ARENA),
+                    fields
+                        .iter()
+                        .copied()
+                        .filter(|c| (**c).rc.load(Relaxed) != ARENA),
                 );
             }
             RtPayload::Variant { fields, .. } => {
-                outside.extend(fields.iter().copied().filter(|c| (**c).rc.load(Relaxed) != ARENA));
+                outside.extend(
+                    fields
+                        .iter()
+                        .copied()
+                        .filter(|c| (**c).rc.load(Relaxed) != ARENA),
+                );
             }
             RtPayload::Handler { ops, .. } => {
                 outside.extend(
@@ -1763,7 +1824,6 @@ pub unsafe extern "C" fn grasm_str_lit(ptr: *const u8, len: u64) -> *mut RtVal {
     alloc(RtPayload::Str(RtStr::of(&String::from_utf8_lossy(bytes))))
 }
 
-#[no_mangle]
 /// A place to build a string in, taken from this thread and given back.
 ///
 /// Every piece of `"a{b}c"` used to become a value of its own: the number was
@@ -1851,7 +1911,9 @@ pub unsafe extern "C" fn grasm_str_build_str(at: i64, v: *mut RtVal) {
     let text: &str = s;
     let (p, n) = (text.as_ptr(), text.len());
     let buf = &mut *(at as *mut String);
-    buf.push_str(std::str::from_utf8_unchecked(std::slice::from_raw_parts(p, n)));
+    buf.push_str(std::str::from_utf8_unchecked(std::slice::from_raw_parts(
+        p, n,
+    )));
 }
 
 /// The finished string, and the buffer back to the thread.
@@ -1953,7 +2015,11 @@ pub unsafe extern "C" fn grasm_str_from_f64(v: f64) -> *mut RtVal {
 
 #[no_mangle]
 pub unsafe extern "C" fn grasm_str_from_bool(v: i8) -> *mut RtVal {
-    alloc(RtPayload::Str(RtStr::of(if v != 0 { "true" } else { "false" })))
+    alloc(RtPayload::Str(RtStr::of(if v != 0 {
+        "true"
+    } else {
+        "false"
+    })))
 }
 
 #[no_mangle]
@@ -2287,7 +2353,6 @@ pub unsafe extern "C" fn grasm_par_map_mixed(
 ///
 /// # Safety
 /// `list` is a live list; the out-params are writable.
-#[no_mangle]
 /// Opens a scalar list for appending: the buffer, how much is in it, and how
 /// much room it has.
 ///
@@ -2684,18 +2749,19 @@ enum Items<'a> {
 /// # Safety: live runtime pointer.
 unsafe fn items_of<'a>(v: *mut RtVal) -> Items<'a> {
     match &(*v).payload {
-        RtPayload::List(items) => {
-            Items::Boxed(std::mem::transmute::<&[*mut RtVal], &'a [*mut RtVal]>(items))
-        }
-        RtPayload::ListScalar { kind, data } => {
-            Items::Scalar(*kind, std::mem::transmute::<&ScalarData, &'a ScalarData>(data))
-        }
+        RtPayload::List(items) => Items::Boxed(std::mem::transmute::<
+            &[*mut RtVal],
+            &'a [*mut RtVal],
+        >(items)),
+        RtPayload::ListScalar { kind, data } => Items::Scalar(
+            *kind,
+            std::mem::transmute::<&ScalarData, &'a ScalarData>(data),
+        ),
         _ => grasm_panic_msg_str("expected a list"),
     }
 }
 
 /// A new empty scalar list of the given kind (0 = i64, 1 = f64, 2 = bool).
-#[no_mangle]
 /// An empty scalar list with room for `n` elements already taken.
 ///
 /// `xs.map(f)` produces exactly as many elements as it was given, and a range
@@ -2709,8 +2775,11 @@ unsafe fn items_of<'a>(v: *mut RtVal) -> Items<'a> {
 #[no_mangle]
 pub extern "C" fn grasm_list_new_scalar_cap(kind: i64, n: i64) -> *mut RtVal {
     let k = ScalarKind::from_i64(kind);
+    if n <= 0 {
+        return empty_list_of(Some(k));
+    }
     let mut data = ScalarData::new(k);
-    if n > 0 && n <= (1 << 34) {
+    if n <= (1 << 34) {
         data.reserve(n as usize);
     }
     alloc(RtPayload::ListScalar { kind: k, data })
@@ -2719,8 +2788,11 @@ pub extern "C" fn grasm_list_new_scalar_cap(kind: i64, n: i64) -> *mut RtVal {
 /// The same for a list of boxed values.
 #[no_mangle]
 pub extern "C" fn grasm_list_new_cap(n: i64) -> *mut RtVal {
+    if n <= 0 {
+        return empty_list_of(None);
+    }
     let mut data = ListData::new();
-    if n > 0 && n <= (1 << 34) {
+    if n <= (1 << 34) {
         data.reserve(n as usize);
     }
     alloc(RtPayload::List(data))
@@ -2728,11 +2800,7 @@ pub extern "C" fn grasm_list_new_cap(n: i64) -> *mut RtVal {
 
 #[no_mangle]
 pub extern "C" fn grasm_list_new_scalar(kind: i64) -> *mut RtVal {
-    let k = ScalarKind::from_i64(kind);
-    alloc(RtPayload::ListScalar {
-        kind: k,
-        data: ScalarData::new(k),
-    })
+    empty_list_of(Some(ScalarKind::from_i64(kind)))
 }
 
 /// Appends inline bits. On a boxed list (one a runtime builtin produced),
@@ -2852,9 +2920,54 @@ pub unsafe extern "C" fn grasm_fn_env(v: *mut RtVal) -> *mut RtVal {
 
 // --- lists ---
 
+/// The empty list, shared by everything that asks for one.
+///
+/// Two thirds of the nodes in a tree are leaves, and a leaf's list of children
+/// is empty — so a third of everything `tree` allocates is a box holding
+/// nothing, made and freed a moment later. There is no reason for a second
+/// one to exist: a list is only ever changed through `cow_list`, which copies
+/// anything it does not uniquely own, and this is owned by nobody.
+///
+/// `IMMORTAL`, so `inc` and `dec` skip it and the first push copies it. Built
+/// with `Box::into_raw` rather than through `alloc`, for the same reason the
+/// string literals are: `alloc` counts a live value and this one is never
+/// freed, so it would be reported as a leak at exit.
+fn empty_list_of(kind: Option<ScalarKind>) -> *mut RtVal {
+    // One per shape: a list of boxed values, and one per scalar width, because
+    // the first push writes into whichever storage is already there.
+    static BOXED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    static SCALARS: std::sync::OnceLock<[usize; 5]> = std::sync::OnceLock::new();
+    match kind {
+        None => *BOXED.get_or_init(|| {
+            Box::into_raw(Box::new(RtVal {
+                rc: AtomicI64::new(IMMORTAL),
+                payload: RtPayload::List(ListData::new()),
+            })) as usize
+        }) as *mut RtVal,
+        Some(k) => {
+            let table = SCALARS.get_or_init(|| {
+                let mut out = [0usize; 5];
+                for (i, slot) in out.iter_mut().enumerate() {
+                    let of = ScalarKind::from_i64(i as i64);
+                    *slot = Box::into_raw(Box::new(RtVal {
+                        rc: AtomicI64::new(IMMORTAL),
+                        payload: RtPayload::ListScalar {
+                            kind: of,
+                            data: ScalarData::new(of),
+                        },
+                    })) as usize;
+                }
+                out
+            });
+            let at = k.to_i64().clamp(0, 4) as usize;
+            table[at] as *mut RtVal
+        }
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn grasm_list_new() -> *mut RtVal {
-    alloc(RtPayload::List(ListData::new()))
+    empty_list_of(None)
 }
 
 /// Push honoring copy-on-write: returns the (possibly new) list pointer.
@@ -3038,7 +3151,11 @@ unsafe fn display(v: *mut RtVal) -> String {
             format!("{effect}Handler{{{}}}", fields.join(", "))
         }
         RtPayload::Env { .. } => "<environment>".to_string(),
-        RtPayload::Range { start, end, inclusive } => {
+        RtPayload::Range {
+            start,
+            end,
+            inclusive,
+        } => {
             if *inclusive {
                 format!("{start}..={end}")
             } else {
@@ -3261,11 +3378,7 @@ pub unsafe extern "C" fn grasm_struct_get_at(s: *mut RtVal, i: i64) -> *mut RtVa
 
 /// # Safety: as above; returns +1.
 #[no_mangle]
-pub unsafe extern "C" fn grasm_struct_get(
-    s: *mut RtVal,
-    name: *const u8,
-    len: u64,
-) -> *mut RtVal {
+pub unsafe extern "C" fn grasm_struct_get(s: *mut RtVal, name: *const u8, len: u64) -> *mut RtVal {
     let RtPayload::Struct { ty, fields } = &(*s).payload else {
         grasm_panic_msg_str("field access on non-struct");
     };
@@ -3298,11 +3411,7 @@ pub unsafe extern "C" fn grasm_struct_get(
 ///
 /// # Safety: `s` is a struct this runtime allocated.
 #[no_mangle]
-pub unsafe extern "C" fn grasm_struct_take(
-    s: *mut RtVal,
-    name: *const u8,
-    len: u64,
-) -> *mut RtVal {
+pub unsafe extern "C" fn grasm_struct_take(s: *mut RtVal, name: *const u8, len: u64) -> *mut RtVal {
     if (*s).rc.load(Relaxed) != 1 {
         return std::ptr::null_mut();
     }
@@ -3539,7 +3648,11 @@ pub unsafe extern "C" fn grasm_report_main_err(v: *mut RtVal) {
     // stderr, for the same reason a panic goes there ([E-MAIN-ERR]).
     let _ = std::io::stdout().flush();
     let mut out = std::io::stderr().lock();
-    let _ = writeln!(out, "error: unhandled error from main: {}", display(fields[0]));
+    let _ = writeln!(
+        out,
+        "error: unhandled error from main: {}",
+        display(fields[0])
+    );
     let _ = out.flush();
     std::process::exit(1);
 }
@@ -3564,14 +3677,26 @@ pub unsafe extern "C" fn grasm_val_eq(a: *mut RtVal, b: *mut RtVal) -> i8 {
 }
 
 /// One level of structural equality; children are pushed for the caller.
-unsafe fn val_eq_step(a: *mut RtVal, b: *mut RtVal, work: &mut Vec<(*mut RtVal, *mut RtVal)>) -> bool {
+unsafe fn val_eq_step(
+    a: *mut RtVal,
+    b: *mut RtVal,
+    work: &mut Vec<(*mut RtVal, *mut RtVal)>,
+) -> bool {
     match (&(*a).payload, &(*b).payload) {
         // By the bounds. `0..3 == 0..3` is true and `0..3 == 0..=3` is false,
         // which is what the interpreter answers — and comparing the elements
         // instead would have made `0..0` equal to `5..5`.
         (
-            RtPayload::Range { start: s1, end: e1, inclusive: i1 },
-            RtPayload::Range { start: s2, end: e2, inclusive: i2 },
+            RtPayload::Range {
+                start: s1,
+                end: e1,
+                inclusive: i1,
+            },
+            RtPayload::Range {
+                start: s2,
+                end: e2,
+                inclusive: i2,
+            },
         ) => s1 == s2 && e1 == e2 && i1 == i2,
         (RtPayload::Map(x), RtPayload::Map(y)) => {
             if x.len() != y.len() {
@@ -3585,10 +3710,7 @@ unsafe fn val_eq_step(a: *mut RtVal, b: *mut RtVal, work: &mut Vec<(*mut RtVal, 
             }
             true
         }
-        (
-            RtPayload::Struct { ty: t1, fields: f1 },
-            RtPayload::Struct { ty: t2, fields: f2 },
-        ) => {
+        (RtPayload::Struct { ty: t1, fields: f1 }, RtPayload::Struct { ty: t2, fields: f2 }) => {
             // The type name decides; the field names follow from it, so two
             // values of one type have the same names in the same order by
             // construction and only the values need comparing.
@@ -3601,8 +3723,16 @@ unsafe fn val_eq_step(a: *mut RtVal, b: *mut RtVal, work: &mut Vec<(*mut RtVal, 
             true
         }
         (
-            RtPayload::Variant { type_name: t1, name: n1, fields: f1 },
-            RtPayload::Variant { type_name: t2, name: n2, fields: f2 },
+            RtPayload::Variant {
+                type_name: t1,
+                name: n1,
+                fields: f1,
+            },
+            RtPayload::Variant {
+                type_name: t2,
+                name: n2,
+                fields: f2,
+            },
         ) => {
             if t1 != t2 || n1 != n2 || f1.len() != f2.len() {
                 return false;
@@ -3612,8 +3742,7 @@ unsafe fn val_eq_step(a: *mut RtVal, b: *mut RtVal, work: &mut Vec<(*mut RtVal, 
             }
             true
         }
-        (RtPayload::List(x), RtPayload::List(y))
-        | (RtPayload::Tuple(x), RtPayload::Tuple(y)) => {
+        (RtPayload::List(x), RtPayload::List(y)) | (RtPayload::Tuple(x), RtPayload::Tuple(y)) => {
             if x.len() != y.len() {
                 return false;
             }
@@ -3650,11 +3779,14 @@ unsafe fn val_eq(a: *mut RtVal, b: *mut RtVal) -> bool {
         // that was not equal to itself, which also broke deduplicating a list
         // of them ([E-EQ-STRUCTURAL]).
         (
-            RtPayload::Fn { code: c1, env: e1, .. },
-            RtPayload::Fn { code: c2, env: e2, .. },
+            RtPayload::Fn {
+                code: c1, env: e1, ..
+            },
+            RtPayload::Fn {
+                code: c2, env: e2, ..
+            },
         ) => c1 == c2 && (e1 == e2 || (!e1.is_null() && !e2.is_null() && val_eq(*e1, *e2))),
-        (RtPayload::Tuple(x), RtPayload::Tuple(y))
-        | (RtPayload::List(x), RtPayload::List(y)) => {
+        (RtPayload::Tuple(x), RtPayload::Tuple(y)) | (RtPayload::List(x), RtPayload::List(y)) => {
             x.len() == y.len() && x.iter().zip(y).all(|(&i, &j)| val_eq(i, j))
         }
         (
@@ -3676,9 +3808,7 @@ unsafe fn val_eq(a: *mut RtVal, b: *mut RtVal) -> bool {
                     .all(|(bits, &boxed)| match (*kind, &(*boxed).payload) {
                         (ScalarKind::I64, RtPayload::I64(x)) => bits == *x,
                         (ScalarKind::Ref, RtPayload::Ref(x)) => bits == *x,
-                        (ScalarKind::F64, RtPayload::F64(x)) => {
-                            f64::from_bits(bits as u64) == *x
-                        }
+                        (ScalarKind::F64, RtPayload::F64(x)) => f64::from_bits(bits as u64) == *x,
                         (ScalarKind::Bool, RtPayload::Bool(x)) => (bits != 0) == *x,
                         _ => false,
                     })
@@ -3688,17 +3818,22 @@ unsafe fn val_eq(a: *mut RtVal, b: *mut RtVal) -> bool {
                 && x.iter()
                     .all(|(k, &v)| y.get(k).is_some_and(|&w| val_eq(v, w)))
         }
-        (
-            RtPayload::Struct { ty: t1, fields: f1 },
-            RtPayload::Struct { ty: t2, fields: f2 },
-        ) => {
+        (RtPayload::Struct { ty: t1, fields: f1 }, RtPayload::Struct { ty: t2, fields: f2 }) => {
             t1.name == t2.name
                 && f1.len() == f2.len()
                 && f1.iter().zip(f2.iter()).all(|(v1, v2)| val_eq(*v1, *v2))
         }
         (
-            RtPayload::Variant { type_name: t1, name: n1, fields: f1 },
-            RtPayload::Variant { type_name: t2, name: n2, fields: f2 },
+            RtPayload::Variant {
+                type_name: t1,
+                name: n1,
+                fields: f1,
+            },
+            RtPayload::Variant {
+                type_name: t2,
+                name: n2,
+                fields: f2,
+            },
         ) => {
             t1 == t2
                 && n1 == n2
@@ -3767,7 +3902,6 @@ fn sorted_keys(entries: &std::collections::HashMap<MapKey, *mut RtVal>) -> Vec<M
     keys
 }
 
-
 unsafe fn cow_map(m: *mut RtVal) -> *mut RtVal {
     if (*m).rc.load(Relaxed) == 1 {
         return m;
@@ -3829,11 +3963,7 @@ pub unsafe extern "C" fn grasm_map_add_i64(
 
 /// # Safety: key/value ownership transfers; returns the (possibly new) map.
 #[no_mangle]
-pub unsafe extern "C" fn grasm_map_set(
-    m: *mut RtVal,
-    k: *mut RtVal,
-    v: *mut RtVal,
-) -> *mut RtVal {
+pub unsafe extern "C" fn grasm_map_set(m: *mut RtVal, k: *mut RtVal, v: *mut RtVal) -> *mut RtVal {
     let target = cow_map(m);
     let RtPayload::Map(entries) = &mut (*target).payload else {
         unreachable!()
@@ -4326,7 +4456,6 @@ pub extern "C" fn grasm_ref_alive(r: i64) -> i8 {
     i8::from(idx < s.slots.len() && s.gens[idx] == gen && s.slots[idx].is_some())
 }
 
-
 /// How much stack a program may use below its entry frame.
 ///
 /// Under the 8 MiB a main thread usually gets, this leaves room for the panic
@@ -4460,7 +4589,6 @@ fn bump_last_digit(s: &str) -> String {
     String::from_utf8(digits).expect("digits stay ascii")
 }
 
-
 /// The Unicode code point of character `i`, counting characters not bytes.
 ///
 /// # Safety: live pointer.
@@ -4576,7 +4704,9 @@ pub unsafe extern "C" fn grasm_str_replace(
     from: *mut RtVal,
     to: *mut RtVal,
 ) -> *mut RtVal {
-    alloc(RtPayload::Str(RtStr::new(as_str(s).replace(as_str(from), as_str(to)))))
+    alloc(RtPayload::Str(RtStr::new(
+        as_str(s).replace(as_str(from), as_str(to)),
+    )))
 }
 
 /// # Safety: live pointer.
@@ -4810,7 +4940,11 @@ pub unsafe extern "C" fn grasm_list_sort(v: *mut RtVal) -> *mut RtVal {
 ///
 /// # Safety: live pointers.
 #[no_mangle]
-pub unsafe extern "C" fn grasm_list_remove(v: *mut RtVal, i: i64, out: *mut *mut RtVal) -> *mut RtVal {
+pub unsafe extern "C" fn grasm_list_remove(
+    v: *mut RtVal,
+    i: i64,
+    out: *mut *mut RtVal,
+) -> *mut RtVal {
     let n = grasm_list_len(v);
     if i < 0 || i >= n {
         rt_panic(&format!("remove {i} out of bounds (len {n})"));
@@ -4841,7 +4975,12 @@ pub unsafe extern "C" fn grasm_list_remove(v: *mut RtVal, i: i64, out: *mut *mut
 pub unsafe extern "C" fn grasm_list_enumerate(v: *mut RtVal) -> *mut RtVal {
     let n = grasm_list_len(v);
     let items: Vec<*mut RtVal> = (0..n)
-        .map(|i| alloc(RtPayload::Tuple(ListData::pair(grasm_box_i64(i), grasm_list_get(v, i)))))
+        .map(|i| {
+            alloc(RtPayload::Tuple(ListData::pair(
+                grasm_box_i64(i),
+                grasm_list_get(v, i),
+            )))
+        })
         .collect();
     alloc(RtPayload::List(items.into()))
 }
@@ -4854,7 +4993,12 @@ pub unsafe extern "C" fn grasm_list_enumerate(v: *mut RtVal) -> *mut RtVal {
 pub unsafe extern "C" fn grasm_list_zip(a: *mut RtVal, b: *mut RtVal) -> *mut RtVal {
     let n = grasm_list_len(a).min(grasm_list_len(b));
     let items: Vec<*mut RtVal> = (0..n)
-        .map(|i| alloc(RtPayload::Tuple(ListData::pair(grasm_list_get(a, i), grasm_list_get(b, i)))))
+        .map(|i| {
+            alloc(RtPayload::Tuple(ListData::pair(
+                grasm_list_get(a, i),
+                grasm_list_get(b, i),
+            )))
+        })
         .collect();
     alloc(RtPayload::List(items.into()))
 }
@@ -4948,7 +5092,10 @@ pub unsafe extern "C" fn grasm_list_concat(a: *mut RtVal, b: *mut RtVal) -> *mut
             for i in 0..db.len() {
                 out.push(db.get(i));
             }
-            alloc(RtPayload::ListScalar { kind: ka, data: out })
+            alloc(RtPayload::ListScalar {
+                kind: ka,
+                data: out,
+            })
         }
         (ia, ib) => {
             let mut out: Vec<*mut RtVal> = Vec::new();
@@ -4983,9 +5130,7 @@ pub unsafe extern "C" fn grasm_list_contains(v: *mut RtVal, needle: *mut RtVal) 
             (ScalarKind::F64, RtPayload::F64(x)) => {
                 data.iter().any(|b| f64::from_bits(b as u64) == *x)
             }
-            (ScalarKind::Bool, RtPayload::Bool(x)) => {
-                data.iter().any(|b| (b != 0) == *x)
-            }
+            (ScalarKind::Bool, RtPayload::Bool(x)) => data.iter().any(|b| (b != 0) == *x),
             _ => false,
         },
     };
@@ -5722,7 +5867,10 @@ unsafe fn grasm_tcp_accept_now(handle: *mut RtVal) -> *mut RtVal {
         _ => return err_of(io_err("IoFailed", "handle must be an integer".to_string())),
     };
     let accepted = socket_with(h, |s| match s {
-        Socket::Listener(l) => l.accept().map(|(stream, _)| stream).map_err(|e| e.to_string()),
+        Socket::Listener(l) => l
+            .accept()
+            .map(|(stream, _)| stream)
+            .map_err(|e| e.to_string()),
         Socket::Stream(_) => Err(format!("socket {h} is a connection, not a listener")),
         Socket::Datagram(_) => Err(format!("socket {h} is a datagram socket, not a listener")),
     });
@@ -5826,9 +5974,7 @@ unsafe fn grasm_random_bytes_now(count: *mut RtVal) -> *mut RtVal {
     match std::fs::File::open("/dev/urandom") {
         Err(e) => err_of(io_err("IoFailed", format!("cannot open /dev/urandom: {e}"))),
         Ok(mut f) => match f.read_exact(&mut buf) {
-            Ok(()) => {
-                ok_of(alloc(RtPayload::Bytes(std::sync::Arc::new(buf))))
-            }
+            Ok(()) => ok_of(alloc(RtPayload::Bytes(std::sync::Arc::new(buf)))),
             Err(e) => err_of(io_err("IoFailed", format!("short read: {e}"))),
         },
     }
@@ -5881,24 +6027,23 @@ unsafe fn grasm_tcp_read_bytes_now(handle: *mut RtVal) -> *mut RtVal {
 ///
 /// # Safety: called from compiled Grasm with boxed values.
 #[no_mangle]
-pub unsafe extern "C" fn grasm_tcp_write_bytes(
-    handle: *mut RtVal,
-    data: *mut RtVal,
-) -> *mut RtVal {
-    journaled("tcp_write_bytes", || grasm_tcp_write_bytes_now(handle, data))
+pub unsafe extern "C" fn grasm_tcp_write_bytes(handle: *mut RtVal, data: *mut RtVal) -> *mut RtVal {
+    journaled("tcp_write_bytes", || {
+        grasm_tcp_write_bytes_now(handle, data)
+    })
 }
 
-unsafe fn grasm_tcp_write_bytes_now(
-    handle: *mut RtVal,
-    data: *mut RtVal,
-) -> *mut RtVal {
+unsafe fn grasm_tcp_write_bytes_now(handle: *mut RtVal, data: *mut RtVal) -> *mut RtVal {
     use std::io::Write;
     let h = match &(*handle).payload {
         RtPayload::I64(n) => *n,
         _ => return err_of(io_err("IoFailed", "handle must be an integer".to_string())),
     };
     let RtPayload::Bytes(payload) = &(*data).payload else {
-        return err_of(io_err("IoFailed", "tcp_write_bytes needs bytes".to_string()));
+        return err_of(io_err(
+            "IoFailed",
+            "tcp_write_bytes needs bytes".to_string(),
+        ));
     };
     let payload = payload.clone();
     let wrote = socket_with(h, |s| match s {
@@ -5971,25 +6116,25 @@ unsafe fn grasm_tcp_write_now(handle: *mut RtVal, data: *mut RtVal) -> *mut RtVa
 ///
 /// # Safety: called from compiled Grasm with boxed values.
 #[no_mangle]
-pub unsafe extern "C" fn grasm_proc_pipeline(
-    stages: *mut RtVal,
-    input: *mut RtVal,
-) -> *mut RtVal {
+pub unsafe extern "C" fn grasm_proc_pipeline(stages: *mut RtVal, input: *mut RtVal) -> *mut RtVal {
     journaled("proc_pipeline", || grasm_proc_pipeline_now(stages, input))
 }
 
-unsafe fn grasm_proc_pipeline_now(
-    stages: *mut RtVal,
-    input: *mut RtVal,
-) -> *mut RtVal {
+unsafe fn grasm_proc_pipeline_now(stages: *mut RtVal, input: *mut RtVal) -> *mut RtVal {
     use std::io::Write;
     use std::process::{Command, Stdio};
 
     let RtPayload::List(items) = &(*stages).payload else {
-        return err_of(io_err("IoFailed", "proc_pipeline takes a list of stages".to_string()));
+        return err_of(io_err(
+            "IoFailed",
+            "proc_pipeline takes a list of stages".to_string(),
+        ));
     };
     if items.is_empty() {
-        return err_of(io_err("IoFailed", "a pipeline needs at least one stage".to_string()));
+        return err_of(io_err(
+            "IoFailed",
+            "a pipeline needs at least one stage".to_string(),
+        ));
     }
     let mut plan: Vec<(String, Vec<String>)> = Vec::with_capacity(items.len());
     for &it in items.iter() {
@@ -6078,8 +6223,12 @@ unsafe fn grasm_proc_pipeline_now(
     let code = out.status.code().map_or(-1, i64::from);
     let fields = vec![
         alloc(RtPayload::I64(code)),
-        alloc(RtPayload::Str(RtStr::of(&String::from_utf8_lossy(&out.stdout)))),
-        alloc(RtPayload::Str(RtStr::of(&String::from_utf8_lossy(&out.stderr)))),
+        alloc(RtPayload::Str(RtStr::of(&String::from_utf8_lossy(
+            &out.stdout,
+        )))),
+        alloc(RtPayload::Str(RtStr::of(&String::from_utf8_lossy(
+            &out.stderr,
+        )))),
     ];
     ok_of(alloc(RtPayload::Tuple(fields.into())))
 }
@@ -6171,7 +6320,12 @@ unsafe fn grasm_proc_run_now(cmd: *mut RtVal, args: *mut RtVal) -> *mut RtVal {
     let program = as_str(cmd).to_string();
     let argv: Vec<String> = match &(*args).payload {
         RtPayload::List(items) => items.iter().map(|&p| as_str(p).to_string()).collect(),
-        _ => return err_of(io_err("IoFailed", "run takes a list of arguments".to_string())),
+        _ => {
+            return err_of(io_err(
+                "IoFailed",
+                "run takes a list of arguments".to_string(),
+            ))
+        }
     };
     match std::process::Command::new(&program).args(&argv).output() {
         Ok(out) => {
@@ -6577,7 +6731,9 @@ pub unsafe extern "C" fn grasm_read_bytes_at(
     offset: *mut RtVal,
     count: *mut RtVal,
 ) -> *mut RtVal {
-    journaled("read_bytes_at", || grasm_read_bytes_at_now(path, offset, count))
+    journaled("read_bytes_at", || {
+        grasm_read_bytes_at_now(path, offset, count)
+    })
 }
 
 unsafe fn grasm_read_bytes_at_now(
@@ -6910,12 +7066,8 @@ pub unsafe extern "C" fn grasm_env(name: *mut RtVal) -> *mut RtVal {
 
 unsafe fn grasm_env_now(name: *mut RtVal) -> *mut RtVal {
     match std::env::var(as_str(name)) {
-        Ok(v) => {
-            some_of(alloc(RtPayload::Str(RtStr::new(v))))
-        }
-        Err(_) => {
-            none_val()
-        }
+        Ok(v) => some_of(alloc(RtPayload::Str(RtStr::new(v)))),
+        Err(_) => none_val(),
     }
 }
 
@@ -7063,7 +7215,6 @@ pub unsafe extern "C" fn grasm_list_min_max(v: *mut RtVal, want_max: i8) -> *mut
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // The journal, in the runtime's own values
 //
@@ -7108,7 +7259,11 @@ unsafe fn wire_of(v: *mut RtVal) -> replay::Wire {
             let n = grasm_list_len(v);
             replay::Wire::List((0..n).map(|i| wire_of(grasm_list_get(v, i))).collect())
         }
-        RtPayload::Variant { type_name, name, fields } => replay::Wire::Variant {
+        RtPayload::Variant {
+            type_name,
+            name,
+            fields,
+        } => replay::Wire::Variant {
             ty: (*type_name).to_string(),
             name: (*name).to_string(),
             fields: fields.iter().map(|&p| wire_of(p)).collect(),
@@ -7172,10 +7327,16 @@ mod small_string_tests {
     #[test]
     fn inline_and_heap_agree() {
         let cases = [
-            "", "a", "abc", "0123456789abcde",        // 15 — the last inline size
-            "0123456789abcdef",                        // 16 — first heap
+            "",
+            "a",
+            "abc",
+            "0123456789abcde",  // 15 — the last inline size
+            "0123456789abcdef", // 16 — first heap
             "a much longer string than fifteen bytes",
-            "héllo", "🙂", "αβγ", "naïve café",       // non-ASCII, both sides of 15
+            "héllo",
+            "🙂",
+            "αβγ",
+            "naïve café", // non-ASCII, both sides of 15
         ];
         for c in cases {
             let s = RtStr::new(c.to_string());
@@ -7194,10 +7355,19 @@ mod small_string_tests {
     fn of_i64_agrees_with_to_string() {
         let mut cases: Vec<i64> = (-3000..3000).collect();
         cases.extend([
-            i64::MIN, i64::MIN + 1, i64::MAX, i64::MAX - 1,
-            -99_999_999_999_999, 99_999_999_999_999,     // last inline magnitudes
-            -100_000_000_000_000, 100_000_000_000_000,   // first heap magnitudes
-            10, -10, 100, -100, 1_000_000_000,
+            i64::MIN,
+            i64::MIN + 1,
+            i64::MAX,
+            i64::MAX - 1,
+            -99_999_999_999_999,
+            99_999_999_999_999, // last inline magnitudes
+            -100_000_000_000_000,
+            100_000_000_000_000, // first heap magnitudes
+            10,
+            -10,
+            100,
+            -100,
+            1_000_000_000,
         ]);
         for v in cases {
             assert_eq!(&*RtStr::of_i64(v), v.to_string().as_str(), "of_i64({v})");
@@ -7208,7 +7378,15 @@ mod small_string_tests {
     /// across the boundary where the result stops fitting inline.
     #[test]
     fn concat_agrees_across_the_inline_boundary() {
-        let parts = ["", "a", "abcdefg", "0123456789abcde", "0123456789abcdef", "é", "🙂"];
+        let parts = [
+            "",
+            "a",
+            "abcdefg",
+            "0123456789abcde",
+            "0123456789abcdef",
+            "é",
+            "🙂",
+        ];
         for a in parts {
             for b in parts {
                 let joined = RtStr::concat(a, b);
@@ -7248,7 +7426,12 @@ pub extern "C" fn grasm_range_new(start: i64, end: i64, inclusive: i8) -> *mut R
 /// # Safety: live runtime pointer.
 #[no_mangle]
 pub unsafe extern "C" fn grasm_range_to_list(r: *mut RtVal) -> *mut RtVal {
-    let RtPayload::Range { start, end, inclusive } = &(*r).payload else {
+    let RtPayload::Range {
+        start,
+        end,
+        inclusive,
+    } = &(*r).payload
+    else {
         panic!("range_to_list: not a range");
     };
     let (start, end, inclusive) = (*start, *end, *inclusive);
@@ -7292,7 +7475,12 @@ pub unsafe extern "C" fn grasm_range_to_list(r: *mut RtVal) -> *mut RtVal {
 /// # Safety: live runtime pointer.
 #[no_mangle]
 pub unsafe extern "C" fn grasm_range_len(r: *mut RtVal) -> i64 {
-    let RtPayload::Range { start, end, inclusive } = &(*r).payload else {
+    let RtPayload::Range {
+        start,
+        end,
+        inclusive,
+    } = &(*r).payload
+    else {
         panic!("range_len: not a range");
     };
     let span = if *inclusive {

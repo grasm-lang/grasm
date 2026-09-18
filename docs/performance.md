@@ -53,6 +53,27 @@ find it, and the sweep then frees values one at a time exactly as the refcount
 would have. Measured on `tree`: 50.7 ms against 45.6, and the same 5.2 MB peak,
 because refcounting already freed each round.
 
+**Stability nobody can observe costs half the list and a call per compare.**
+`xs.sort()` on a scalar list ran Rust's *stable* sort through a closure that
+re-branched on the element kind for every comparison; a stable sort also takes
+a scratch buffer of half the input. But every comparator here is a *total*
+order on the stored word — integers compare as words, floats by `total_cmp`,
+which separates -0.0 from 0.0 and orders NaNs by their bits — so two elements
+that compare equal are the same 64 bits, and no program can tell which of them
+came first. Switching to `sort_unstable` (pdqsort, no scratch, and for
+integers no comparator at all) was worth **1.90x on `sort`**: 19 ms to 10,
+against Rust's 11. The first benchmark row where Grasm is not behind.
+Done, 2026-09-18.
+
+**An empty list is one list.** `[]` allocated a fresh box every time, and the
+programs that build a tree or a table of lists allocate a lot of them. There
+is now one immortal empty boxed list and a five-entry table of immortal empty
+scalar lists, handed out by `grasm_list_new` and friends. Safe without a
+special case anywhere else because every list mutator already goes through
+`cow_list`, which copies anything whose refcount is not exactly 1 — and an
+immortal refcount never is. Worth 393,660 fewer allocations on `tree`
+(1,180,960 to 787,300) and 1.05x. Done, 2026-09-18.
+
 **Things that were already fast** and do not need looking at again: scalar list
 indexing is pinned and inlined before a loop with an inline bounds check
 (`pin_loop_lists`); `bool` lists are one byte an element; a list of four or
