@@ -265,6 +265,66 @@ them run over a mid-level IR. This backend lowers the typed AST straight to
 Cranelift, so there is nowhere to put them. That is the real prerequisite for
 closing the `tree` row, and it is a project rather than a patch.
 
+## Ceilings, measured before building — 2026-09-18
+
+Three times in one session an idea that looked worth twenty to forty percent by
+counting instructions turned out to be worth nothing. So each of these was
+*bounded first*, in the real compiler on the real benchmarks, before any of it
+was written. Five were abandoned on the strength of one measurement each.
+
+| idea | how it was bounded | ceiling | verdict |
+| --- | --- | --- | --- |
+| eliminate bounds checks | compiled the corpus with the check removed outright | matmul 1.00x, sieve 1.13x, sort 1.03x | not built |
+| carry the thread state instead of looking it up | timed a `thread_local!` access against a `&Local`, times the measured access count | ~1.06x on the allocating rows | not built |
+| unboxed scalar map values | timed `counts.set(k, counts.get(k) + 1)` against a bare `counts.has(k)` | 1.00x | not built |
+| strength-reduce `%` by a constant | timed 20 million `i % 8` against 20 million `i + 1` | 0.31 ns per division, ~1.01x | not built |
+| hoist loop-invariant arithmetic | built it, then A/B'd against itself with the pass off | 1.01x | built and removed |
+
+The reason is the same in every row: a modern out-of-order core hides
+independent, perfectly-predicted work. A bounds check is a compare and a branch
+that never mispredicts; a `sdiv` whose result nothing waits on retires behind
+other work; a direct call to a tiny leaf function overlaps with its caller.
+Counting instructions in a disassembly measures none of that. **The only
+number worth acting on is a measured one, and the cheapest way to get it is
+usually to break the thing rather than to build its replacement.**
+
+## Where the remaining gap actually is
+
+Timed head to head by processor time, and split by compiling cut-down versions
+of the same program:
+
+**`wordfreq`, 28 ms against Zig's 8.5.** Building the key costs 15 ms and the
+map costs 10.5. Inside the key: making *one* string box costs **26 ns** — the
+same whether it is built by one call to `grasm_str_concat` or four calls
+through the string builder, which is how it is known that the calls are not the
+cost. The box is: a pool pop, sixty-four bytes written, two thread-local
+reaches, a `memmove` for six bytes, and drop glue on the way out. Zig's
+equivalent writes into a stack buffer and allocates nothing. Removing the box
+for a string that is only ever *borrowed* — built, used as a map key, dropped —
+is worth the whole 10.4 ms, and it is escape analysis, which is a real
+subsystem rather than a peephole.
+
+**`tree`, 37.9 ms against Rust's 8.8.** Rust's `Vec<Node>` stores its nodes
+inline and contiguous: 196,820 allocations for the whole run against our
+787,300 scattered sixty-four-byte boxes. Not refcounting — layout. Closing it
+means structs stored inline inside lists, which needs a notion of a borrowed
+element, because `for k in n.kids` must not box one to look at it.
+
+**`matmul`, 8.6 ms against Rust's 3.9.** Rust's inner loop is vectorised —
+`umull.2d` over `q` registers, visible in its disassembly. Cranelift has no
+auto-vectoriser. The bounds checks, which looked like the answer, are worth
+nothing.
+
+**`fib`, 8.9 ms against Rust's 4.0.** No allocation, no checks left to remove:
+this is instruction selection and register allocation. Cranelift emits
+`mov x6, x19; sub x1, x6, #1` where one instruction would do, and spills a
+register it did not need to.
+
+**`sieve`, 10.3 ms against Rust's 5.9.** Bounds checks are 1.13x of it; the
+rest is not yet accounted for.
+
+None of these five is a peephole. Four are subsystems.
+
 ## What is left, and what each would take
 
 **A bump arena for regions.** The feature exists and currently costs what it
