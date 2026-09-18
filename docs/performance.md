@@ -288,6 +288,31 @@ Counting instructions in a disassembly measures none of that. **The only
 number worth acting on is a measured one, and the cheapest way to get it is
 usually to break the thing rather than to build its replacement.**
 
+**Releasing a value with children called `malloc`.** `dec_in` walks a value's
+children with a work list, and that list was a `Vec` built fresh per call.
+`Vec::new()` does not allocate, but the first push does — so releasing *any*
+value that had children cost a `malloc` and a matching `free`. In a loop that
+makes and drops a two-field struct, `RawVec` growth and the allocator were
+three quarters of the profile.
+
+The work list now lives in the stack frame — four slots, which is what
+`StructFields::Inline` and `ListData::Inline` already hold — and spills to the
+heap only for a value big enough to need it, at which point it moves everything
+across and stays there, so a deep walk does not pay to refill the frame at
+every step.
+
+Making and dropping a small value: **49 ns to 28.9**, a list of one boxed
+element **40.4 to 22.8**. On the benchmark suite: nothing, within noise on every
+row. The suite has no program shaped like "make a small record, read it, drop
+it", which is the shape most code in the package corpus is made of — so this is
+recorded as a win on a shape rather than a win on a number.
+
+Two details that were measured rather than assumed. The inline array is
+`MaybeUninit`: zeroing it cost more than it saved, because the frame is built on
+*every* release including the overwhelming majority that push nothing, and
+`wordfreq` was three percent slower until that was fixed. And sixteen slots were
+worse than four for the same reason.
+
 ## Where the remaining gap actually is
 
 Timed head to head by processor time, and split by compiling cut-down versions
