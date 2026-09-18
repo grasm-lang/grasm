@@ -52,7 +52,14 @@ echo "baseline:  $BASE"
 echo "candidate: $CAND"
 echo
 
-# Milliseconds for one run, as an integer — *processor* time, not wall time.
+# Microsecond-resolution milliseconds for one run — *processor* time, not
+# wall time.
+#
+# To three decimal places, because `getrusage` reports microseconds and a
+# whole-millisecond figure cannot see a ten-percent change in a thirty-
+# millisecond program: a real win measured that way came out looking like a
+# two-millisecond loss until the same programs were run at twenty times the
+# size.
 #
 # Wall time on a loaded machine is mostly a measurement of the other programs:
 # two identical builds came out 1.68x apart that way. Processor time is what
@@ -72,48 +79,53 @@ cpu = ((after.ru_utime - before.ru_utime) +
        (after.ru_stime - before.ru_stime)) * 1000
 text = done.stdout.decode().strip().replace("\n", " ")[:60]
 if done.returncode != 0:
-    print("-1 " + done.stderr.decode()[-80:].replace("\n", " "))
+    print("-1.0 " + done.stderr.decode()[-80:].replace("\n", " "))
 else:
-    print("%d %s" % (cpu, text))
+    print("%.3f %s" % (cpu, text))
 INNER
 }
 
-printf '%-10s %8s %8s %8s   %s\n' program baseline candidate change answer
+# The smaller of two decimal times, ignoring a failed run (-1).
+lower() {
+    awk -v a="$1" -v b="$2" 'BEGIN { print (a >= 0 && a < b) ? a : b }'
+}
+
+printf '%-10s %9s %9s %8s   %s\n' program baseline candidate change answer
 for p in $PROGRAMS; do
     src=benchmarks/grasm/$p.gr
     [ -f "$src" ] || continue
     if ! "$BASE" build "$src" --native -o "$WORK/a_$p" >"$WORK/a_$p.log" 2>&1; then
-        printf '%-10s %8s %8s %8s   %s\n' "$p" "-" "-" "-" "baseline build failed"
+        printf '%-10s %9s %9s %8s   %s\n' "$p" "-" "-" "-" "baseline build failed"
         continue
     fi
     if ! "$CAND" build "$src" --native -o "$WORK/b_$p" >"$WORK/b_$p.log" 2>&1; then
-        printf '%-10s %8s %8s %8s   %s\n' "$p" "-" "-" "-" "candidate build failed"
+        printf '%-10s %9s %9s %8s   %s\n' "$p" "-" "-" "-" "candidate build failed"
         continue
     fi
-    best_a=999999
-    best_b=999999
+    best_a=999999.0
+    best_b=999999.0
     answer_a=""
     answer_b=""
     n=0
     while [ "$n" -lt "$REPS" ]; do
         set -- $(time_ms "$WORK/a_$p")
         ms=$1; shift; out="$*"
-        [ "$ms" -ge 0 ] && [ "$ms" -lt "$best_a" ] && best_a=$ms
+        best_a=$(lower "$ms" "$best_a")
         answer_a=$out
         set -- $(time_ms "$WORK/b_$p")
         ms=$1; shift; out="$*"
-        [ "$ms" -ge 0 ] && [ "$ms" -lt "$best_b" ] && best_b=$ms
+        best_b=$(lower "$ms" "$best_b")
         answer_b=$out
         n=$((n + 1))
     done
     # A faster wrong answer is not a result. The two builds must agree.
     if [ "$answer_a" != "$answer_b" ]; then
-        printf '%-10s %8s %8s %8s   %s\n' "$p" "$best_a" "$best_b" "DIFFER" \
+        printf '%-10s %9s %9s %8s   %s\n' "$p" "$best_a" "$best_b" "DIFFER" \
             "$answer_a | $answer_b"
         continue
     fi
     change=$(python3 -c "
 a, b = $best_a, $best_b
 print('same' if b == a else ('%.2fx faster' % (a / b) if b < a else '%.2fx SLOWER' % (b / a)))")
-    printf '%-10s %8s %8s %8s   %s\n' "$p" "$best_a" "$best_b" "" "$change"
+    printf '%-10s %9s %9s %8s   %s\n' "$p" "$best_a" "$best_b" "" "$change"
 done

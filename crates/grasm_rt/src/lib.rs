@@ -1382,31 +1382,38 @@ unsafe fn give_box_in(local: &Local, p: *mut RtVal) {
 }
 
 fn alloc(payload: RtPayload) -> *mut RtVal {
-    LOCAL.with(|local| {
-        local.live.set(local.live.get() + 1);
-        local.allocated.set(local.allocated.get() + 1);
-        // Inside a region the value is arena-owned: no reference counting, and
-        // the whole set is freed at the closing brace ([T-REGION]).
-        let in_region = local.region_depth.get() > 0;
-        let p = take_box_in(local);
-        // Safety: `take_box_in` returns storage for exactly one `RtVal`,
-        // uninitialised.
-        unsafe {
-            std::ptr::write(
-                p,
-                RtVal {
-                    rc: AtomicI64::new(if in_region { ARENA } else { 1 }),
-                    payload,
-                },
-            );
+    LOCAL.with(|local| alloc_in(local, payload))
+}
+
+/// Allocation with the thread's state already in hand.
+///
+/// A caller that is going to reach `LOCAL` anyway should reach it once and
+/// call this: on macOS every `thread_local!` access is a call through
+/// `_tlv_get_addr`, which a profile of `wordfreq` put at fifteen percent.
+fn alloc_in(local: &Local, payload: RtPayload) -> *mut RtVal {
+    local.live.set(local.live.get() + 1);
+    local.allocated.set(local.allocated.get() + 1);
+    // Inside a region the value is arena-owned: no reference counting, and
+    // the whole set is freed at the closing brace ([T-REGION]).
+    let in_region = local.region_depth.get() > 0;
+    let p = take_box_in(local);
+    // Safety: `take_box_in` returns storage for exactly one `RtVal`,
+    // uninitialised.
+    unsafe {
+        std::ptr::write(
+            p,
+            RtVal {
+                rc: AtomicI64::new(if in_region { ARENA } else { 1 }),
+                payload,
+            },
+        );
+    }
+    if in_region {
+        if let Some(top) = local.regions.borrow_mut().last_mut() {
+            top.push(p);
         }
-        if in_region {
-            if let Some(top) = local.regions.borrow_mut().last_mut() {
-                top.push(p);
-            }
-        }
-        p
-    })
+    }
+    p
 }
 
 /// What worker threads allocated and did not free themselves.
@@ -1646,27 +1653,49 @@ pub unsafe extern "C" fn grasm_region_pop() {
 const SMALL_MIN: i64 = -128;
 const SMALL_MAX: i64 = 1024;
 
-thread_local! {
-    static INTERNED: Vec<*mut RtVal> = {
-        let mut table = Vec::with_capacity((SMALL_MAX - SMALL_MIN + 3) as usize);
+/// Where the interned boxes live: one block, for the whole process.
+///
+/// This was a thread-local vector of pointers, which cost two memory touches
+/// and — on macOS, where a thread-local is reached through a call to
+/// `_tlv_get_addr` — a call, every time a small integer was boxed. That is one
+/// of the hottest things the language does: a loop counter, an index, a length
+/// and a count are all small integers. `_tlv_get_addr` was fifteen percent of
+/// `wordfreq`'s profile, and most of it arrived here.
+///
+/// Nothing about the table needed to be per-thread. Every box in it is
+/// `IMMORTAL`, so `inc` and `dec` skip it, `cow_*` copies rather than writes
+/// it, and no thread can ever change what another reads. Sharing one block
+/// across the process is sound for exactly that reason, and it reduces the
+/// lookup to an add and a multiply: the boxes are contiguous, so the address
+/// of the box for `n` can be computed rather than read out of a table.
+fn interned_base() -> usize {
+    static BASE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *BASE.get_or_init(|| {
+        let mut table: Vec<RtVal> = Vec::with_capacity((SMALL_MAX - SMALL_MIN + 3) as usize);
         for v in [false, true] {
-            table.push(Box::into_raw(Box::new(RtVal {
+            table.push(RtVal {
                 rc: AtomicI64::new(IMMORTAL),
                 payload: RtPayload::Bool(v),
-            })));
+            });
         }
         for n in SMALL_MIN..=SMALL_MAX {
-            table.push(Box::into_raw(Box::new(RtVal {
+            table.push(RtVal {
                 rc: AtomicI64::new(IMMORTAL),
                 payload: RtPayload::I64(n),
-            })));
+            });
         }
-        table
-    };
+        // Leaked on purpose, and not through `alloc`: these are never freed,
+        // so counting them would report a leak at exit.
+        Box::leak(table.into_boxed_slice()).as_mut_ptr() as usize
+    })
+}
+
+fn interned_at(index: usize) -> *mut RtVal {
+    (interned_base() + index * std::mem::size_of::<RtVal>()) as *mut RtVal
 }
 
 fn interned_bool(v: bool) -> *mut RtVal {
-    INTERNED.with(|t| t[usize::from(v)])
+    interned_at(usize::from(v))
 }
 
 /// The shared box for `n`, or null when `n` is outside the interned range.
@@ -1674,7 +1703,7 @@ fn interned_int(n: i64) -> *mut RtVal {
     if !(SMALL_MIN..=SMALL_MAX).contains(&n) {
         return std::ptr::null_mut();
     }
-    INTERNED.with(|t| t[(n - SMALL_MIN) as usize + 2])
+    interned_at((n - SMALL_MIN) as usize + 2)
 }
 
 /// # Safety
@@ -1922,34 +1951,33 @@ pub unsafe extern "C" fn grasm_str_build_str(at: i64, v: *mut RtVal) {
 #[no_mangle]
 pub unsafe extern "C" fn grasm_str_build_end(at: i64) -> *mut RtVal {
     let mut buf = Box::from_raw(at as *mut String);
-    // A short result is copied into the value's own inline storage and the
-    // buffer comes back for the next one. A long result is *moved*: copying it
-    // would be a second pass over text that was just written, which is what
-    // made `acc = acc + "{i}"` — a loop that grows one string — twice as slow
-    // as the concatenation it replaced. The buffer is given up in that case
-    // and the next build makes a fresh one.
-    if buf.len() > INLINE_STR_CAP {
-        let owned = std::mem::take(&mut *buf);
-        let out = alloc(RtPayload::Str(RtStr::new(owned)));
-        LOCAL.with(|local| {
-            let mut held = local.builders.borrow_mut();
-            if held.len() < 8 {
-                held.push(buf);
-            }
-        });
-        return out;
-    }
-    let out = alloc(RtPayload::Str(RtStr::of(&buf)));
-    buf.clear();
+    // One reach for the thread's state, not two: the value is allocated and
+    // the buffer given back under the same `LOCAL.with`, because on macOS each
+    // of those is a call through `_tlv_get_addr`.
     LOCAL.with(|local| {
+        let long = buf.len() > INLINE_STR_CAP;
+        let out = if long {
+            // A long result is *moved*: copying it would be a second pass over
+            // text that was just written, which is what made `acc = acc +
+            // "{i}"` — a loop that grows one string — twice as slow as the
+            // concatenation it replaced. The buffer is given up in that case
+            // and the next build makes a fresh one.
+            alloc_in(local, RtPayload::Str(RtStr::new(std::mem::take(&mut *buf))))
+        } else {
+            // A short result is copied into the value's own inline storage and
+            // the buffer comes back for the next one.
+            let v = alloc_in(local, RtPayload::Str(RtStr::of(&buf)));
+            buf.clear();
+            v
+        };
         let mut held = local.builders.borrow_mut();
         // A handful is enough to cover any nesting a program actually has;
         // past that the buffer is dropped rather than hoarded.
         if held.len() < 8 {
             held.push(buf);
         }
-    });
-    out
+        out
+    })
 }
 
 #[no_mangle]
@@ -3947,11 +3975,37 @@ pub unsafe extern "C" fn grasm_map_add_i64(
     let slot = with_key(k, |kk| entries.get_mut(kk).map(std::ptr::from_mut));
     match slot {
         Some(slot) => {
-            let old = match &(**slot).payload {
+            let cur = *slot;
+            let old = match &(*cur).payload {
                 RtPayload::I64(n) => *n,
                 _ => rt_panic("map_add on a map whose values are not integers"),
             };
-            dec(std::mem::replace(&mut *slot, grasm_box_i64(old + delta)));
+            // The counter is written where it already is when this map is the
+            // only thing holding it. A counting loop otherwise allocated a box
+            // for every increment and freed the one before it -- four hundred
+            // thousand of each in `wordfreq` -- to store a number one larger.
+            //
+            // A refcount of exactly 1 is what makes it safe: nobody else can
+            // be reading this box, and it rules out the interned small
+            // integers on its own, since those are immortal and never 1.
+            // Written through the variant rather than by assigning a new
+            // payload: assigning drops the old one, and dropping an
+            // `RtPayload` is a match over every variant it could have been.
+            //
+            // A count that is still small has an interned box waiting for it,
+            // which costs no allocation either — so that case is asked about
+            // first and never pays for the refcount load.
+            let new = old + delta;
+            let shared = interned_int(new);
+            if !shared.is_null() {
+                dec(std::mem::replace(&mut *slot, shared));
+            } else if (*cur).rc.load(Relaxed) == 1 {
+                if let RtPayload::I64(n) = &mut (*cur).payload {
+                    *n = new;
+                }
+            } else {
+                dec(std::mem::replace(&mut *slot, grasm_box_i64(new)));
+            }
         }
         None => {
             entries.insert(MapKey::of(k), grasm_box_i64(default + delta));
