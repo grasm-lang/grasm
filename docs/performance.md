@@ -464,6 +464,39 @@ difference is the whole gap, and nothing smaller than changing it will close
 it: not the pushes, not the field reads, not the thread-local, each of which is
 worth a few percent.
 
+**Lending a parameter instead of giving it: measured at 7.8x, written, and
+reverted.** Passing a collection to a function costs 8.52 ns where passing an
+integer costs 1.26 — measured on a loop calling a function that does nothing
+with it. The caller adds a reference because reading a boxed name yields one,
+and the callee releases it on the way out; neither is needed when the callee
+only *looks* at the value, because the caller's own binding holds it open for
+the length of the call.
+
+Built as an inferred borrow: a `let` parameter qualifies when every mention of
+its name is the receiver of an index or a field read, the flag lives on the
+signature so the declaration and every call site read the same answer, and the
+callee's release paths skip it. It worked — passing a collection fell to
+1.26 ns, the same as an integer, a call that also indexes it 9.66 to 2.81, and
+`tree` 1.08x.
+
+**It also broke four programs in the package corpus, and it is reverted.** The
+differential gate caught them; forcing the analysis off restores 59 of 59. The
+hole is not yet found: the compiler reports *no* borrowed parameters in the
+failing programs, which cannot both be true, so either the analysis fires
+somewhere the trace does not cover or one of the call-site edits is not as
+conditional as it reads. The measurement stands and the design is sound; the
+implementation is not, and a wrong answer here frees a value the caller is
+still holding.
+
+Two things worth keeping from the attempt. The first version released a borrow
+it never took on the `return` path — `emit_scope_decs_all`, a third release
+path beyond the two obvious ones — and **`leakcheck` passed all 497 programs
+with that bug present**, because a premature free is not a leak. Only running
+the program caught it. And the conformance case for [T-PARAM-LET] now exercises
+every shape the analysis has to decide — returned, stored, relayed, read,
+handed a temporary — which is what a second attempt should be developed
+against.
+
 ## Where the remaining gap actually is
 
 Timed head to head by processor time, and split by compiling cut-down versions

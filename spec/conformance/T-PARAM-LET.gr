@@ -1,11 +1,66 @@
 //! tag: T-PARAM-LET
 //! expect: output
 //! 2 2
+//! 20 42 5
+//! [0, 10, 20, 30, 40] [[0, 10, 20, 30, 40]] [0, 10, 20, 30, 40]
+//! 100 8
+//! [0, 10, 20, 30, 40] 42
+type P = { v: i64, tag: str }
+
 fn size(xs: [i64]) -> i64 {
     xs.len()
 }
+
+// A parameter the callee only reads is *lent*: the caller adds no reference
+// and the callee releases none. Which of these qualify is decided by
+// `param_is_borrowed` in the native backend, and getting it wrong frees a
+// value the caller is still holding — so every shape is exercised here.
+fn peek(xs: [i64], i: i64) -> i64 {
+    return xs[i]
+}
+fn field(p: P) -> i64 {
+    return p.v
+}
+// Returns it, so the reference has to be real.
+fn give_back(xs: [i64]) -> [i64] {
+    return xs
+}
+// Stores it somewhere that outlives the call.
+fn stash(xs: [i64]) -> [[i64]] {
+    var out: [[i64]] = []
+    out.push(xs)
+    return out
+}
+// Hands it to something else, which takes it.
+fn relay(xs: [i64]) -> [i64] {
+    return give_back(xs)
+}
+// Reads it while calling something that does not take it.
+fn sum2(xs: [i64], n: i64) -> i64 {
+    var s = 0
+    for i in 0..n {
+        s = s + peek(xs, i)
+    }
+    return s
+}
+// A temporary handed to a lent parameter still has to be released by someone.
+fn make() -> [i64] {
+    return [7, 8, 9]
+}
+
 fn main() {
     let xs = [1, 2]
     // A plain parameter does not consume the caller's binding.
     print("{size(xs)} {size(xs)}")
+
+    var ys: [i64] = []
+    for i in 0..5 {
+        ys.push(i * 10)
+    }
+    let p = P{ v: 42, tag: "t" }
+    print("{peek(ys, 2)} {field(p)} {size(ys)}")
+    print("{give_back(ys)} {stash(ys)} {relay(ys)}")
+    print("{sum2(ys, 5)} {peek(make(), 1)}")
+    // Everything the caller lent is still its own afterwards.
+    print("{ys} {p.v}")
 }
