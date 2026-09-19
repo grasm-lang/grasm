@@ -7606,14 +7606,22 @@ this case",
         if pieces.is_empty() {
             return Ok((self.str_literal(""), VType::Str));
         }
-        // One interpolated piece already costs one value in the old scheme,
-        // and the builder cannot beat one: it would add its own calls to save
-        // an allocation that was not there. Folding wins below two.
+        // What decides this is how many *pieces* there are, not how many of
+        // them are interpolated.
+        //
+        // `"{x}"` is one piece: folding turns it into one value and the builder
+        // could only add calls around the same allocation. But `"n{x}"` is two,
+        // and folding allocates twice — once for the number, once to join it to
+        // the text, because the text is a literal and a literal is immortal, so
+        // the append cannot write into it. The builder allocates once. That
+        // shape is what a program writes every time it makes a key or a label,
+        // and it was the single most expensive operation in the language:
+        // 47 ns to produce three characters.
         let interpolated = pieces
             .iter()
             .filter(|p| matches!(p, StrPiece::Expr(_)))
             .count();
-        if interpolated < 2 {
+        if interpolated == 0 || pieces.len() < 2 {
             return self.fold_string(pieces);
         }
         let at = self.call_rt("grasm_str_build", &[]).unwrap();

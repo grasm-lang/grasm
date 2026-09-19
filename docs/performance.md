@@ -356,6 +356,43 @@ it only became visible after profiling a four-line loop rather than a
 benchmark. The benchmarks are averages over programs that do many things at
 once; a microbenchmark of one operation says which one.
 
+**`"n{x}"` allocated twice to produce three characters.** The string builder
+was used only when two or more *pieces were interpolated*, on the reasoning
+that one interpolated value already costs one allocation and the builder could
+only add calls around it. That is right for `"{x}"`, which is a single piece.
+It is wrong for `"n{x}"`, which is two: folding makes a value for the number
+and then joins it to the text, and the text is a literal, and a literal is
+immortal — so the append cannot write into it and has to allocate again. Two
+allocations, 47 ns, for three characters. The test is now on the number of
+pieces rather than the number of interpolations.
+
+String interpolation **47.3 ns to 27.3**, a map lookup by an interpolated key
+**69.1 to 50.0**. Nothing on the benchmark suite, because the one benchmark
+that interpolates does it as a single piece.
+
+**A table of what each operation costs**, measured by putting one of them in a
+loop and subtracting the empty loop — which is how the release-path find above
+was made, after five iterations of profiling whole benchmarks missed it:
+
+| operation | ns |
+| --- | --- |
+| index a scalar list | 0.31 |
+| read a list's length | 1.00 |
+| read a struct field | 2.02 |
+| read a string's length | 2.89 |
+| index a list of strings | 6.30 |
+| interpolate `"n{x}"` | 27.3 |
+| concatenate two strings | 29.3 |
+| make a two-field struct | 32.8 |
+| make a two-element tuple | 47.7 |
+| look a key up in a map | 50.0 |
+
+The outliers are the thing to read it for. A tuple costs more than a struct with
+the same contents, because a tuple literal is built as a list and then sealed —
+four runtime calls where the struct takes one. And a field read costs a call at
+all, because a field is a pointer to a box and the accessor matches on the
+payload to unwrap it.
+
 ## Where the remaining gap actually is
 
 Timed head to head by processor time, and split by compiling cut-down versions
