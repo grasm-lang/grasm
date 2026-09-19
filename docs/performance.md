@@ -279,9 +279,17 @@ was written. Five were abandoned on the strength of one measurement each.
 | unboxed scalar map values | timed `counts.set(k, counts.get(k) + 1)` against a bare `counts.has(k)` | 1.00x | not built |
 | strength-reduce `%` by a constant | timed 20 million `i % 8` against 20 million `i + 1` | 0.31 ns per division, ~1.01x | not built |
 | hoist loop-invariant arithmetic | built it, then A/B'd against itself with the pass off | 1.01x | built and removed |
+| defeat Cranelift's constant rematerialization | timed the same loop with a literal bound against a register-held one | 0.998x | not built |
+| drop the inclusive-range overflow guard | timed `0..=N` against `0..N+1` | the guarded form is *faster* | not built |
+| reserve a counted loop's push capacity up front | added the hint, A/B'd it | 0.99x-1.01x | built and removed |
 
 The reason is the same in every row: a modern out-of-order core hides
-independent, perfectly-predicted work. A bounds check is a compare and a branch
+independent, perfectly-predicted work — *while there are spare issue slots*.
+That qualification matters and took a while to find. In a six-instruction loop
+the two that rebuild a constant are free, measured. In the twenty-instruction
+loop that fills a list they are not, because the loop is issue-bound. Neither
+"instructions are free" nor "instructions cost" is the rule; the rule is
+whether the loop has slack, and only measurement says. A bounds check is a compare and a branch
 that never mispredicts; a `sdiv` whose result nothing waits on retires behind
 other work; a direct call to a tiny leaf function overlaps with its caller.
 Counting instructions in a disassembly measures none of that. **The only
@@ -417,6 +425,14 @@ common of the two. Nothing on the benchmark suite.
 
 `#[cold]` earns its place: without it, LLVM still splits the function but lays
 the branch out evenly — 1.11x on the iteration instead of 1.17x.
+
+**A program costs 1.67 ms before it runs.** Process startup — dyld, the
+runtime's first thread-local touches, the interned-integer block — is that much
+on this machine, and it is included in every absolute number here. Splitting a
+benchmark into phases by timing cut-down versions *must* subtract it, and the
+first split of `sieve` did not: it read as build 5.39, scan 4.04, strike 3.95,
+which put the cost in the wrong place. Corrected: **build 3.56, scan 2.42,
+strike 5.74**. The strike loop is the expensive part, not building the flags.
 
 ## Where the remaining gap actually is
 
