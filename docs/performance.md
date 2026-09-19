@@ -282,6 +282,8 @@ was written. Five were abandoned on the strength of one measurement each.
 | defeat Cranelift's constant rematerialization | timed the same loop with a literal bound against a register-held one | 0.998x | not built |
 | drop the inclusive-range overflow guard | timed `0..=N` against `0..N+1` | the guarded form is *faster* | not built |
 | reserve a counted loop's push capacity up front | added the hint, A/B'd it | 0.99x-1.01x | built and removed |
+| tune Cranelift's own settings | swept alias analysis, opt_level, frame pointers, unwind info, regalloc | all within noise; `single_pass` regalloc is 3-4x *worse* | nothing to change |
+| pin a loop's appends to a list of boxed values | timed a pinned scalar push against an unpinned boxed one | 3.08 ns against 2.01 — worth 0.6 ms of `tree`'s 27.6 | not built |
 
 The reason is the same in every row: a modern out-of-order core hides
 independent, perfectly-predicted work — *while there are spare issue slots*.
@@ -433,6 +435,34 @@ benchmark into phases by timing cut-down versions *must* subtract it, and the
 first split of `sieve` did not: it read as build 5.39, scan 4.04, strike 3.95,
 which put the cost in the wrong place. Corrected: **build 3.56, scan 2.42,
 strike 5.74**. The strike loop is the expensive part, not building the flags.
+
+## What `tree` is made of, measured
+
+Split by timing cut-down programs, with the 1.67 ms of process startup
+subtracted:
+
+| phase | ms | share |
+| --- | --- | --- |
+| build the trees and free them | 27.55 | 70% |
+| walk them | 11.83 | 30% |
+
+And inside the build, by profiling: the generated `build` is 52%, `dec_walk`
+34%, the drop glue 8%.
+
+The unit cost that explains it: **making and freeing one struct box is 24.8 ns**
+— measured on a loop that does nothing else, with the field value small enough
+to be an interned integer, so exactly one box. Of that, `_tlv_get_addr` is 17%:
+the allocation reaches the thread's state and so does the free. A pinned scalar
+push is 2.01 ns by comparison, and the boxed push that `kids.push(child)` does
+costs 3.08 — so pinning appends to boxed lists, which looked like the obvious
+next move, is worth about 0.6 ms of 27.6.
+
+`tree` makes 1.33 boxes per node — one for the node, one for each interior
+node's list of children. Rust's equivalent makes 0.33 allocations per node,
+because `Vec<Node>` stores the nodes *inside* it. At 24.8 ns a box that
+difference is the whole gap, and nothing smaller than changing it will close
+it: not the pushes, not the field reads, not the thread-local, each of which is
+worth a few percent.
 
 ## Where the remaining gap actually is
 
