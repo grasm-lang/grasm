@@ -387,11 +387,21 @@ was made, after five iterations of profiling whole benchmarks missed it:
 | make a two-element tuple | 47.7 |
 | look a key up in a map | 50.0 |
 
-The outliers are the thing to read it for. A tuple costs more than a struct with
-the same contents, because a tuple literal is built as a list and then sealed —
-four runtime calls where the struct takes one. And a field read costs a call at
-all, because a field is a pointer to a box and the accessor matches on the
-payload to unwrap it.
+The outliers are the thing to read it for. A tuple cost more than a struct with
+the same contents, because a tuple literal was built as a list and then sealed —
+`list_new`, a push per element, and `tuple_seal`, four runtime calls where a
+struct takes one. Two and three go straight to the runtime now
+(`grasm_tuple2`/`grasm_tuple3`), which is where tuple literals stop being
+common: **67.6 ns to 53.4 for a pair, 1.27x**.
+
+Not for a literal whose elements can *fail* part-way through, though. The
+general path holds the half-built tuple in a scope so a `fail` in a later
+element releases the earlier ones, and that is worth four calls; where no
+element can fail there is nothing to release.
+
+And a field read costs a call at all, because a field is a pointer to a box and
+the accessor matches on the payload to unwrap it. `.1` on a *tuple* costs four —
+`list_get`, an inc, an unbox and a dec — which is the next outlier in the table.
 
 ## Where the remaining gap actually is
 

@@ -1219,6 +1219,16 @@ impl ListData {
         }
     }
 
+    /// Three or four elements, in the box, for the same reason as `pair`.
+    fn small(vals: &[*mut RtVal]) -> ListData {
+        let mut out = [std::ptr::null_mut(); 4];
+        out[..vals.len()].copy_from_slice(vals);
+        ListData::Inline {
+            vals: out,
+            len: vals.len() as u8,
+        }
+    }
+
     fn pop(&mut self) -> Option<*mut RtVal> {
         match self {
             ListData::Inline { vals, len } => {
@@ -2271,6 +2281,27 @@ pub unsafe extern "C" fn grasm_str_append(a: *mut RtVal, b: *mut RtVal) -> *mut 
     let out = alloc(RtPayload::Str(RtStr::concat(sa, bt)));
     dec(a);
     out
+}
+
+/// A tuple of two, in one call and one allocation.
+///
+/// A tuple literal used to be built as a list and then sealed: `list_new`, a
+/// push per element, and `tuple_seal` — four calls into the runtime for a
+/// pair, which measured more than making a two-field struct with the same
+/// contents. Both arguments' references transfer.
+///
+/// # Safety: live runtime pointers, whose ownership passes here.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_tuple2(a: *mut RtVal, b: *mut RtVal) -> *mut RtVal {
+    alloc(RtPayload::Tuple(ListData::pair(a, b)))
+}
+
+/// The same for three, which is where tuple literals stop being common.
+///
+/// # Safety: as `grasm_tuple2`.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_tuple3(a: *mut RtVal, b: *mut RtVal, c: *mut RtVal) -> *mut RtVal {
+    alloc(RtPayload::Tuple(ListData::small(&[a, b, c])))
 }
 
 #[no_mangle]

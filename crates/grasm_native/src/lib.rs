@@ -726,6 +726,8 @@ impl<'m> Codegen<'m> {
             ("grasm_str_cmp", vec![i64t, i64t], Some(i64t)),
             ("grasm_list_new", vec![], Some(i64t)),
             ("grasm_tuple_seal", vec![i64t], Some(i64t)),
+            ("grasm_tuple2", vec![i64t, i64t], Some(i64t)),
+            ("grasm_tuple3", vec![i64t, i64t, i64t], Some(i64t)),
             ("grasm_list_push", vec![i64t, i64t], Some(i64t)),
             ("grasm_list_len", vec![i64t], Some(i64t)),
             ("grasm_list_get", vec![i64t, i64t], Some(i64t)),
@@ -5144,6 +5146,24 @@ impl FnCx<'_, '_> {
         self.call_rt("grasm_stack_floor", &[here]).unwrap()
     }
 
+    /// A tuple from values that are already boxed and already owned.
+    ///
+    /// Two and three go straight to the runtime; anything longer is built as a
+    /// list and sealed, which is what every tuple used to do.
+    fn make_tuple(&mut self, boxed: &[Value]) -> Value {
+        match boxed.len() {
+            2 => self.call_rt("grasm_tuple2", boxed).unwrap(),
+            3 => self.call_rt("grasm_tuple3", boxed).unwrap(),
+            _ => {
+                let mut list = self.call_rt("grasm_list_new", &[]).unwrap();
+                for b in boxed {
+                    list = self.call_rt("grasm_list_push", &[list, *b]).unwrap();
+                }
+                self.call_rt("grasm_tuple_seal", &[list]).unwrap()
+            }
+        }
+    }
+
     fn pinned_address(&mut self, data: Value, len: Value, idx: Value, stride: i64) -> Value {
         let ok = self.b.create_block();
         let oob = self.b.create_block();
@@ -6936,15 +6956,14 @@ this case",
             if !items.is_empty() && items.len() == ts.len() && items.iter().any(needs_element_hint)
             {
                 let ts = ts.clone();
-                let mut list = self.call_rt("grasm_list_new", &[]).unwrap();
+                let mut boxed = Vec::with_capacity(items.len());
                 let mut got = Vec::with_capacity(items.len());
                 for (item, want) in items.iter().zip(&ts) {
                     let (v, vt) = self.eval_expr_expecting(item, Some(want))?;
-                    let bx = self.box_value(v, &vt);
-                    list = self.call_rt("grasm_list_push", &[list, bx]).unwrap();
+                    boxed.push(self.box_value(v, &vt));
                     got.push(vt);
                 }
-                let sealed = self.call_rt("grasm_tuple_seal", &[list]).unwrap();
+                let sealed = self.make_tuple(&boxed);
                 return Ok(Some((sealed, VType::Tuple(got))));
             }
         }
@@ -7282,6 +7301,22 @@ this case",
                 if items.is_empty() {
                     let nothing = self.zero_of(&VType::Unit);
                     return Ok(Some((nothing, VType::Unit)));
+                }
+                // Two or three elements that cannot fail part-way through are
+                // made in one call. The general path below holds the half-built
+                // tuple in a scope so that a `fail` in a later element releases
+                // the earlier ones; where no element can fail there is nothing
+                // to release and four runtime calls become one.
+                if items.len() <= 3 && !items.iter().any(body_can_fail) {
+                    let mut boxed = Vec::with_capacity(items.len());
+                    let mut ts = Vec::with_capacity(items.len());
+                    for item in items {
+                        let (v, vt) = self.eval_expr_val(item)?;
+                        boxed.push(self.box_value(v, &vt));
+                        ts.push(vt);
+                    }
+                    let made = self.make_tuple(&boxed);
+                    return Ok(Some((made, VType::Tuple(ts))));
                 }
                 let mut list = self.call_rt("grasm_list_new", &[]).unwrap();
                 // As for a list literal (F65).
