@@ -1915,6 +1915,20 @@ unsafe fn dec(v: *mut RtVal) {
     std::sync::atomic::fence(Acquire);
     // It has reached zero, so the box is going back to the pool and whatever
     // it held has to be followed. *Now* the thread's state is worth fetching.
+    dec_reached_zero(v)
+}
+
+/// The rest of a release, once the count has reached zero.
+///
+/// Its own function, and marked cold, so that the common release — decrement
+/// and return — can be a leaf: reaching `LOCAL` needs the link register saved,
+/// and with this inline `grasm_val_dec` built a forty-eight byte frame and
+/// saved four registers before finding out it had nothing to do.
+///
+/// # Safety: `v`'s count has reached zero and the acquire fence has been taken.
+#[cold]
+#[inline(never)]
+unsafe fn dec_reached_zero(v: *mut RtVal) {
     LOCAL.with(|local| dec_walk(local, v, true))
 }
 

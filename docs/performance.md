@@ -403,6 +403,21 @@ And a field read costs a call at all, because a field is a pointer to a box and
 the accessor matches on the payload to unwrap it. `.1` on a *tuple* costs four —
 `list_get`, an inc, an unbox and a dec — which is the next outlier in the table.
 
+**Releasing built a stack frame before finding out it had nothing to do.**
+With the zero case inline, `grasm_val_dec` opened with a forty-eight byte frame
+and four saved registers — because reaching `LOCAL` needs the link register —
+even though the common path decrements and returns. Moved into a `#[cold]`
+`#[inline(never)]` function, the frame is two instructions and LLVM shrink-wraps
+the rest onto the branch that actually frees.
+
+**1.17x iterating a list of structs, 1.10x a list of strings, 1.04x a map
+lookup; 2% slower making a struct**, which is the cost of one extra call on the
+path that does free. Kept because releasing without freeing is much the more
+common of the two. Nothing on the benchmark suite.
+
+`#[cold]` earns its place: without it, LLVM still splits the function but lays
+the branch out evenly — 1.11x on the iteration instead of 1.17x.
+
 ## Where the remaining gap actually is
 
 Timed head to head by processor time, and split by compiling cut-down versions
