@@ -10,26 +10,32 @@ it. This is the other half: why the numbers are what they are.
 
 ## The standing gap
 
-Against Rust on the same programs, with the 2 ms harness floor subtracted from
-both sides, Grasm's compiled backend is roughly:
+Measured 2026-09-20 on an idle machine by `scripts/bench.sh` — wall clock,
+best of three, checksums verified against the interpreter first.
 
-| program | ratio | what it is |
-|---|---:|---|
-| `sort` | 1.9x | comparison-heavy work over a large list |
-| `parmap` | 2.1x | multi-core throughput over integers |
-| `sieve` | 2.6x | list indexing in a tight loop |
-| `matmul` | 2.7x | nested indexing over a flat list |
-| `fib` | 2.7x | function call overhead |
-| `parwords` | 3.3x | multi-core throughput over text |
-| `tree` | ~4.9x* | allocating small linked structures and walking them |
+| program | rust | zig | grasm | ratio | what it is |
+|---|---:|---:|---:|---:|---|
+| `sort` | 15ms | – | **15ms** | **1.0x** | comparison-heavy work over a large list |
+| `wordfreq` | 33ms | 12ms | **32ms** | **0.97x** | counting words through a map |
+| `fib` | 6ms | 7ms | 8ms | 1.3x | function call overhead |
+| `sieve` | 9ms | 9ms | 11ms | 1.2x | list indexing in a tight loop |
+| `matmul` | 6ms | 7ms | 12ms | 2.0x | nested indexing over a flat list |
+| `parmap` | 60ms | – | 128ms | 2.1x | multi-core throughput over integers |
+| `parwords` | 13ms | – | 30ms | 2.3x | multi-core throughput over text |
+| `tree` | 13ms | – | 40ms | 3.1x | allocating small linked structures and walking them |
 
-\* `tree`'s cell is an estimate: the table in `benchmarks/README.md` records
-5.9x and predates the thread-local work below, which took 1.19x off it on a
-machine that was not idle. That row is due a re-measure.
+`G2` — the geometric mean of rust/native — is **0.62x** against a target of
+0.95x. `sort` ties Rust and beats C (48ms) and Go (64ms); `wordfreq` beats
+Rust and C and loses to Go and Zig. The small rows carry about 3ms of process
+start on both sides, so their ratios understate the gap in compute: with that
+floor subtracted G2 is 0.54x.
 
-`sort` beats C and Go outright. The three worst rows are the three that
-allocate, which is the shape of the whole problem: **arithmetic and indexing
-are close, allocation is not.**
+The shape of what is left has not changed: **arithmetic and indexing are
+close, allocation is not.** `tree` allocates 39,365 boxes a round where Rust
+allocates 9,841 vectors, because every `Node` is its own box where Rust stores
+it inline in its parent's — see the profile below. `matmul` needs the inner
+loop vectorised, which Cranelift will not do. The `par*` rows were measured
+after this table and are now better than it says.
 
 ## What has been measured
 
@@ -159,6 +165,27 @@ terminated, and Cranelift refused the function. A block opened inside an
 expression that control left now gets its terminator at the end of the
 function, which costs a reachable program nothing: a filled block already has
 one. Done, 2026-09-20.
+
+**A constant power-of-two divisor is shifts, not a divide.** `acc = (acc *
+1103515245 + 12345) % 2147483648` — the standard LCG, and the inner loop of
+both `parmap` and `sort` — compiled to `sdiv` plus `msub`, with a
+divide-by-zero branch testing a constant that cannot be zero, on the
+dependency chain of a loop that runs 160 million times. Bounded first by
+masking the same arithmetic by hand in the source, which is exact for a
+non-negative accumulator: `parmap` **911 ms of processor time to 269**, a
+ceiling of 3.4x. The compiler cannot assume non-negative, so it emits the
+truncating sequence — bias by `2^k - 1` when the dividend is negative, then
+shift or mask — which is four instructions more than the hand-written mask and
+still no divide. Worth **1.70x on `parmap`** and 1.06x on `sort`. Done,
+2026-09-20.
+
+Restricted to powers of two, and the restriction is measured rather than
+cautious. Dropping *just* the zero check for any constant divisor — a branch
+on a value that cannot be zero, two instructions gone — made `tree` 1.05x
+**slower**, twice over. Removing a block changes what the register allocator
+does with the ones around it, and a divide the core can hide behind is not
+worth paying for that. So a divisor that is not a power of two keeps the
+general path, guard and all.
 
 **Things that were already fast** and do not need looking at again: scalar list
 indexing is pinned and inlined before a loop with an inline bounds check

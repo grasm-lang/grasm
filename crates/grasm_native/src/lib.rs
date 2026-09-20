@@ -10745,6 +10745,11 @@ checker did",
             // other overflow ([E-ARITH-INT]). Three extra instructions on an
             // operation already tens of cycles deep.
             (VType::I64, Div) => {
+                if let Some(d) = self.const_i64(rv) {
+                    if let Some(q) = self.div_by_const(lv, d) {
+                        return Ok((q, VType::I64));
+                    }
+                }
                 self.guard_zero(rv, "grasm_panic_div_zero");
                 let minus_one = self.b.ins().iconst(types::I64, -1);
                 let is_neg1 = self.b.ins().icmp(IntCC::Equal, rv, minus_one);
@@ -10757,6 +10762,11 @@ checker did",
             // `x % -1` is 0 for every x, and `x % 1` is 0 too, so the same
             // substitution gives the right answer with no fixup.
             (VType::I64, Rem) => {
+                if let Some(d) = self.const_i64(rv) {
+                    if let Some(r) = self.rem_by_const(lv, d) {
+                        return Ok((r, VType::I64));
+                    }
+                }
                 self.guard_zero(rv, "grasm_panic_rem_zero");
                 let minus_one = self.b.ins().iconst(types::I64, -1);
                 let is_neg1 = self.b.ins().icmp(IntCC::Equal, rv, minus_one);
@@ -10836,6 +10846,93 @@ checker did",
             _ => return nope(span, format!("`{}` on `{}`", opname, lt.show())),
         };
         Ok(out)
+    }
+
+    /// The constant behind a value, if it is one.
+    ///
+    /// Asked of the *Cranelift* value rather than the syntax, so a divisor
+    /// that arrived as a module constant or was folded from an expression
+    /// counts too.
+    fn const_i64(&self, v: Value) -> Option<i64> {
+        use cranelift_codegen::ir::{instructions::InstructionData, Opcode, ValueDef};
+        let ValueDef::Result(inst, _) = self.b.func.dfg.value_def(v) else {
+            return None;
+        };
+        match self.b.func.dfg.insts[inst] {
+            InstructionData::UnaryImm {
+                opcode: Opcode::Iconst,
+                imm,
+            } => Some(imm.bits()),
+            _ => None,
+        }
+    }
+
+    /// `x + (2^k - 1)` when `x` is negative and `x` otherwise, which is the
+    /// bias that makes an arithmetic shift truncate toward zero the way `/`
+    /// is defined to ([E-ARITH-INT]).
+    fn pow2_bias(&mut self, x: Value, k: i64) -> Value {
+        let sign = self.b.ins().sshr_imm(x, 63);
+        let bias = self.b.ins().ushr_imm(sign, 64 - k);
+        self.b.ins().iadd(x, bias)
+    }
+
+    /// `x / d` for a constant `d`, or `None` to fall through to the
+    /// general path.
+    ///
+    /// Two things are wrong with the general path when the divisor is
+    /// known. The divide-by-zero branch is a test on a value that cannot be
+    /// zero, and Cranelift keeps it: `% 2147483648` compiled to a `mov` of
+    /// the constant and a `cbnz` against it, every iteration. And a power of
+    /// two does not need a divide at all — `sdiv` is tens of cycles and sits
+    /// on the dependency chain of exactly the loops that use it. Measured by
+    /// masking the same arithmetic by hand in the source: `parmap` 911 ms of
+    /// processor time to 269.
+    fn div_by_const(&mut self, x: Value, d: i64) -> Option<Value> {
+        match d {
+            0 => None,
+            1 => Some(x),
+            // Wraps for `i64::MIN`, like every other overflow.
+            -1 => Some(self.b.ins().ineg(x)),
+            _ => {
+                let mag = d.unsigned_abs();
+                if mag.is_power_of_two() && mag.trailing_zeros() < 63 {
+                    let k = i64::from(mag.trailing_zeros());
+                    let biased = self.pow2_bias(x, k);
+                    let q = self.b.ins().sshr_imm(biased, k);
+                    Some(if d < 0 { self.b.ins().ineg(q) } else { q })
+                } else {
+                    // Not a power of two: the general path, guard and all.
+                    // Dropping just the guard — a branch on a value that
+                    // cannot be zero — made `tree` 1.05x *slower*, twice
+                    // over. Removing a block changes what the register
+                    // allocator does with the ones around it, and the divide
+                    // that remains is tens of cycles it can hide behind.
+                    None
+                }
+            }
+        }
+    }
+
+    /// `x % d` for a constant `d`. The remainder takes the sign of the
+    /// dividend, so the divisor's own sign does not matter.
+    fn rem_by_const(&mut self, x: Value, d: i64) -> Option<Value> {
+        match d {
+            0 => None,
+            1 | -1 => Some(self.b.ins().iconst(types::I64, 0)),
+            _ => {
+                let mag = d.unsigned_abs();
+                if mag.is_power_of_two() && mag.trailing_zeros() < 63 {
+                    let k = i64::from(mag.trailing_zeros());
+                    let biased = self.pow2_bias(x, k);
+                    let mask = !(mag as i64 - 1);
+                    let whole = self.b.ins().band_imm(biased, mask);
+                    Some(self.b.ins().isub(x, whole))
+                } else {
+                    // As in `div_by_const`: measured, and not worth it.
+                    None
+                }
+            }
+        }
     }
 
     fn guard_zero(&mut self, divisor: Value, panic_fn: &'static str) {
