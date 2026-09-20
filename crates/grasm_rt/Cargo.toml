@@ -10,3 +10,10 @@ crate-type = ["staticlib", "rlib"]
 [dependencies]
 # The journal format, shared with the interpreter and the browser build.
 grasm_journal = { path = "../grasm_journal" }
+
+[features]
+# Never reuse a freed box, and trap on touching one. Off by default because it
+# leaks every value by design; `scripts/usecheck.sh` builds with it to catch a
+# use-after-free, which `leakcheck.sh` cannot see — a premature free is not a
+# leak, and one slipped past all 497 programs.
+poison = []

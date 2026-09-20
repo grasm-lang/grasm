@@ -1492,6 +1492,34 @@ thread_local! {
     };
 }
 
+/// What a freed box's refcount is set to under the `poison` feature.
+///
+/// Chosen so it cannot be mistaken for a count, for `IMMORTAL`, for `ARENA`,
+/// or for a pool link — the free list stores the next box's address there, and
+/// no address is negative.
+#[cfg(feature = "poison")]
+const POISON: i64 = i64::MIN + 0x5EAD;
+
+/// Refuses to go on if `v` has already been released.
+///
+/// A premature free is not a leak, so `leakcheck` cannot see one: it counts
+/// what is still live at exit, and a value freed too early is *less* live, not
+/// more. One went undetected through all 497 programs. Under `poison` a freed
+/// box is never handed out again and its count is set to something no live
+/// value can hold, so the next thing to touch it says so instead of reading
+/// whatever moved in.
+#[cfg(feature = "poison")]
+#[inline]
+unsafe fn assert_alive(v: *mut RtVal, what: &str) {
+    if !v.is_null() && (*v).rc.load(Relaxed) == POISON {
+        rt_panic(&format!("use after free: {what} on a value already released"));
+    }
+}
+
+#[cfg(not(feature = "poison"))]
+#[inline(always)]
+unsafe fn assert_alive(_v: *mut RtVal, _what: &str) {}
+
 /// Sixty-four bytes to put an `RtVal` in, recycled if one is going spare.
 ///
 /// Takes the thread's state rather than resolving it: on macOS that
@@ -1523,6 +1551,23 @@ fn take_box_in(local: &Local) -> *mut RtVal {
 /// nothing points at it any more.
 unsafe fn give_box_in(local: &Local, p: *mut RtVal) {
     std::ptr::drop_in_place(&mut (*p).payload);
+    #[cfg(feature = "poison")]
+    {
+        // Kept out of circulation on purpose: a box never handed out again is
+        // one whose later use is still there to be caught.
+        //
+        // The payload is overwritten as well, with `Unit` — a real variant,
+        // not a pattern, because an invalid discriminant would be undefined
+        // rather than detectable. Anything that later reads this box as the
+        // list or the string it used to be finds a unit instead and says so,
+        // which is how a stale *read* is caught; the count below is how a
+        // stale `inc` or `dec` is.
+        let _ = local;
+        std::ptr::write(&mut (*p).payload, RtPayload::Unit);
+        (*p).rc.store(POISON, Relaxed);
+        return;
+    }
+    #[allow(unreachable_code)]
     {
         let pool = &local.pool;
         if pool.n.get() >= POOL_CAP {
@@ -1863,6 +1908,7 @@ fn interned_int(n: i64) -> *mut RtVal {
 /// # Safety
 /// `v` must be a live pointer produced by this runtime.
 unsafe fn inc(v: *mut RtVal) {
+    assert_alive(v, "inc");
     if !v.is_null() {
         let rc = &(*v).rc;
         // Relaxed: taking a reference to a value only requires that the count
@@ -1903,6 +1949,7 @@ unsafe fn dec(v: *mut RtVal) {
     if v.is_null() {
         return;
     }
+    assert_alive(v, "dec");
     let rc = &(*v).rc;
     if !is_counted(rc.load(Relaxed)) {
         return;
@@ -8116,5 +8163,43 @@ mod maphash_tests {
         // The same key in the same process hashes the same, which is what a
         // table needs between a `set` and the `get` that follows it.
         assert_eq!(plain, b.hash_one("alpha"));
+    }
+}
+
+#[cfg(all(test, feature = "poison"))]
+mod poison_tests {
+    use super::*;
+
+    /// The detector has to actually detect. Without this the feature could be
+    /// silently inert and a gate built on it would report success forever.
+    ///
+    /// The poisoning itself is what is checked rather than the panic: a
+    /// `rt_panic` ends the process rather than unwinding, which is right for a
+    /// running program and untestable from here.
+    #[test]
+    fn a_released_value_is_marked() {
+        unsafe {
+            let v = alloc(RtPayload::I64(7));
+            assert_ne!((*v).rc.load(Relaxed), POISON, "fresh value already marked");
+            // One owner, so this releases it.
+            dec(v);
+            assert_eq!(
+                (*v).rc.load(Relaxed),
+                POISON,
+                "a released box was not marked, so a later use would go unseen"
+            );
+        }
+    }
+
+    #[test]
+    fn a_live_value_is_not_marked() {
+        unsafe {
+            let v = alloc(RtPayload::I64(9));
+            inc(v);
+            dec(v);
+            assert_ne!((*v).rc.load(Relaxed), POISON, "still held, but marked freed");
+            assert!(matches!((*v).payload, RtPayload::I64(9)));
+            dec(v);
+        }
     }
 }

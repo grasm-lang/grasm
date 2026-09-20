@@ -43,6 +43,7 @@ run_gate() {
 
 run_gate difftest      scripts/difftest.sh
 run_gate leakcheck     scripts/leakcheck.sh
+run_gate usecheck      scripts/usecheck.sh
 run_gate agreetest     scripts/agreetest.sh
 run_gate nativegaps    scripts/nativegaps.sh
 run_gate brokertest    scripts/broker_test.sh

@@ -5,7 +5,38 @@ Every defect that is known and not fixed, with its severity from
 to paste. S1 and S2 block a release; S3 and S4 do not, and this file is what
 makes shipping them honest rather than quiet.
 
-**Open S1: none. Open S2: none. Open S3: none. Open S4: none.**
+**Open S1: two. Open S2: none. Open S3: none. Open S4: none.**
+
+## S1 — a value is released twice, in two programs
+
+`packages/aes-demo` and `apps/broker` release a value that has already been
+released. Natively they segfault or abort; under the interpreter both are
+correct. Found by `scripts/usecheck.sh`, which builds the runtime with
+`--features grasm_rt/poison` — a freed box is marked and never handed out
+again, so the next thing to touch it says so:
+
+    $ cargo build --release --workspace --features grasm_rt/poison
+    $ ./target/release/grasm build packages/aes-demo/src/main.gr --native -o /tmp/a
+    $ /tmp/a
+      ok    the S-box starts 63 7c 77 7b
+      ok    and ends 41 99 2d 0f b0 54 bb 16
+    panic: use after free: dec on a value already released
+
+Both are layout-sensitive, which is why every gate has been passing them. The
+binary has to sit **directly in `/tmp`**: one directory deeper, or under
+`$TMPDIR` — sixty characters of `/var/folders/...` on macOS — and the same
+program runs clean. `difftest.sh` builds into a working directory under
+`$TMPDIR`, so it has never seen either one; `leakcheck.sh` cannot see them at
+all, because a premature free is not a leak. It counts what is still live at
+exit, and a value freed too early is *less* live, not more.
+
+Why the depth matters is not understood and is worth understanding: it is the
+difference between a gate that finds this class and one that does not. What is
+measured is that it does, and `usecheck.sh` therefore builds at the shallowest
+path available.
+
+The release bar in `docs/release-scope.md` says S1 blocks a version. These two
+do.
 
 F92 was open here and is fixed: a loop body is a block in statement position,
 so its last expression is handed to nobody, and neither `while` nor `for`
