@@ -5,7 +5,25 @@ Every defect that is known and not fixed, with its severity from
 to paste. S1 and S2 block a release; S3 and S4 do not, and this file is what
 makes shipping them honest rather than quiet.
 
-**Open S1: none. Open S2: none. Open S3: none. Open S4: none.**
+**Open S1: none. Open S2: none. Open S3: none. Open S4: one.**
+
+## S4 — `grasm_sema`'s deep-chain tests overflow the stack in a debug build
+
+`cargo test -p grasm_sema --test check_tests` aborts with `has overflowed its
+stack` on `a_chain_of_field_reads_is_linear`, which checks a thousand-deep
+`n.next.next...` projection. It is flaky rather than constant: the same test
+binary passed earlier the same day and failed later, and `RUST_MIN_STACK=32M`
+made it pass once and then moved the abort to a different, unnamed thread at
+64M. Release builds are unaffected, so every gate in `scripts/allgates.sh`
+passes; only the debug unit-test run sees it.
+
+The checker recurses once per projection and a debug frame is large, so a
+thousand of them sit near the limit and whether they fit depends on what else
+the process has done. Not a wrong answer — an abort — and not reachable from a
+compiled program, which is why it is S4. The fix is for the checker to walk a
+projection chain iteratively, or for the test to run its body on a thread with
+a stack it asks for; shrinking the chain would delete the thing the test is
+for.
 
 Closed on 2026-09-20, and the entry it replaces was wrong twice before it was
 right. Two programs — `packages/aes-demo` and `apps/broker` — released a value

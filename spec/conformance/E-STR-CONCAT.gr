@@ -1,6 +1,50 @@
 //! tag: E-STR-CONCAT
 //! expect: output
 //! hello, world
+//! abab
+//! xyxy
+//! pp1q
+//! nn-2-true-1.5
+//! 01234
+//! [0:0][1:2][2:4][3:6][4:8]
+// A string built by appending to itself is the same string however the
+// backend chooses to build it. `s = s + rest` and `s += rest` are compiled
+// as an append rather than a rebuild — in place when nothing else holds the
+// string, and an interpolation's pieces go onto the buffer one at a time
+// rather than being built into a string of their own first. So each of the
+// shapes where the left and right sides can be the *same* value has to come
+// out the way a rebuild would.
 fn main() {
     print("hello, " + "world")
+
+    // The right side is the left side: two references to one string, so
+    // nothing can write into it in place.
+    var s = "ab"
+    s = s + s
+    print(s)
+    // The same, reached through an interpolation.
+    var t = "xy"
+    t = t + "{t}"
+    print(t)
+    // And read twice in one interpolation, once for its text and once for a
+    // length that is taken before any of it is appended.
+    var u = "p"
+    u = u + "{u}{u.len()}q"
+    print(u)
+    // Every piece kind in one, through `+=`.
+    var v = "n"
+    v += "{v}-{1 + 1}-{true}-{1.5}"
+    print(v)
+
+    // The loop shapes, which are why any of this exists.
+    var w = ""
+    for i in 0..5 {
+        w = w + "{i}"
+    }
+    print(w)
+    var z = ""
+    for i in 0..5 {
+        z += "[{i}:{i * 2}]"
+    }
+    print(z)
 }

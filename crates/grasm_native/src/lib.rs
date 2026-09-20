@@ -708,6 +708,10 @@ impl<'m> Codegen<'m> {
             ("grasm_str_build_str", vec![i64t, i64t], None),
             ("grasm_str_build_end", vec![i64t], Some(i64t)),
             ("grasm_str_append", vec![i64t, i64t], Some(i64t)),
+            ("grasm_str_append_text", vec![i64t, i64t, i64t], Some(i64t)),
+            ("grasm_str_append_i64", vec![i64t, i64t], Some(i64t)),
+            ("grasm_str_append_f64", vec![i64t, i64t], Some(i64t)),
+            ("grasm_str_append_bool", vec![i64t, i64t], Some(i64t)),
             ("grasm_list_concat", vec![i64t, i64t], Some(i64t)),
             ("grasm_list_sort_by", vec![i64t, i64t], Some(i64t)),
             ("grasm_list_remove", vec![i64t, i64t, ptr], Some(i64t)),
@@ -6481,6 +6485,17 @@ impl FnCx<'_, '_> {
                         _ => None,
                     };
                     if let Some(piece) = rhs {
+                        // As in `try_self_append`: an interpolation's pieces
+                        // go onto the buffer one at a time, so the string it
+                        // would have built is never a value.
+                        if let Expr::Str(pieces, _) = piece {
+                            let mut cur = self.b.use_var(var);
+                            for p in pieces {
+                                cur = self.append_piece(cur, p)?;
+                            }
+                            self.b.def_var(var, cur);
+                            return Ok(StmtOut::Value(None));
+                        }
                         let (rv, rt) = self.eval_expr_val(piece)?;
                         if rt != VType::Str {
                             return nope(piece.span(), "adding a non-string to a string");
@@ -8063,6 +8078,18 @@ this case",
         if !matches!(self.probe_type(rhs), Ok(VType::Str)) {
             return Ok(None);
         }
+        // An interpolation appends its pieces straight onto the buffer. The
+        // string it would otherwise build is a value nobody keeps: `acc = acc
+        // + "{i % 7}"` boxed a one-character string four million times in the
+        // `parwords` benchmark, and that box cost more than the appending.
+        if let Expr::Str(pieces, _) = &**rhs {
+            let mut cur = self.b.use_var(var);
+            for piece in pieces {
+                cur = self.append_piece(cur, piece)?;
+            }
+            self.b.def_var(var, cur);
+            return Ok(Some(()));
+        }
         let (part, _) = self.eval_expr_val(rhs)?;
         let cur = self.b.use_var(var);
         // `grasm_str_append` takes the left side over and gives back a string
@@ -8072,6 +8099,58 @@ this case",
         self.call_rt("grasm_val_dec", &[part]);
         self.b.def_var(var, joined);
         Ok(Some(()))
+    }
+
+    /// One piece of an interpolation appended to a string the caller owns.
+    ///
+    /// Takes `cur`'s reference and answers the string to hold instead — the
+    /// same box when it was the only holder, a fresh one otherwise. Nothing
+    /// here allocates a value for the piece itself.
+    fn append_piece(&mut self, cur: Value, piece: &StrPiece) -> CResult<Value> {
+        Ok(match piece {
+            StrPiece::Text(t) => {
+                if t.is_empty() {
+                    return Ok(cur);
+                }
+                let (ptr, len) = self.str_ptr_len(t);
+                self.call_rt("grasm_str_append_text", &[cur, ptr, len]).unwrap()
+            }
+            StrPiece::Expr(inner) => {
+                let (v, vt) = self.eval_expr_val(inner)?;
+                match vt {
+                    VType::I64 => self.call_rt("grasm_str_append_i64", &[cur, v]).unwrap(),
+                    VType::F64 => {
+                        let bits = self.b.ins().bitcast(
+                            types::I64,
+                            cranelift_codegen::ir::MemFlags::new(),
+                            v,
+                        );
+                        self.call_rt("grasm_str_append_f64", &[cur, bits]).unwrap()
+                    }
+                    VType::Bool => {
+                        let w = self.b.ins().uextend(types::I64, v);
+                        self.call_rt("grasm_str_append_bool", &[cur, w]).unwrap()
+                    }
+                    VType::Str => {
+                        let out = self.call_rt("grasm_str_append", &[cur, v]).unwrap();
+                        self.call_rt("grasm_val_dec", &[v]);
+                        out
+                    }
+                    VType::Unit => {
+                        let (ptr, len) = self.str_ptr_len("()");
+                        self.call_rt("grasm_str_append_text", &[cur, ptr, len]).unwrap()
+                    }
+                    ref other if other.boxed() => {
+                        let sv = self.call_rt("grasm_str_from_val", &[v]).unwrap();
+                        self.call_rt("grasm_val_dec", &[v]);
+                        let out = self.call_rt("grasm_str_append", &[cur, sv]).unwrap();
+                        self.call_rt("grasm_val_dec", &[sv]);
+                        out
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        })
     }
 
     /// The pieces of an interpolation, appended to a buffer already open.

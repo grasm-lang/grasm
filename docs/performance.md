@@ -187,6 +187,24 @@ does with the ones around it, and a divide the core can hide behind is not
 worth paying for that. So a divisor that is not a power of two keeps the
 general path, guard and all.
 
+**An interpolation appended to a string never becomes a string.** `acc = acc
++ "{i % 7}"` is how a program builds text here, and it built a one-character
+string in its own box four million times in `parwords`. Decomposed by
+substitution: the benchmark is 120 ms of processor time, 15 of which is
+everything except that loop; replacing the interpolation with a literal saves
+63 ms and dropping the append saves 23. **The box for the piece cost more than
+the appending did.** `grasm_str_append_i64`, `_f64`, `_bool` and `_text` take
+the left side over and write the piece's bytes straight into its buffer, so
+`acc = acc + "{x}"` and `acc += "{x}"` allocate nothing at all when `acc` is
+the only holder of its string. Worth **2.05x on `parwords`** — 112 ms of
+processor time to 55, which is wall-clock parity with Rust. Done, 2026-09-20.
+
+The aliasing is what makes this need care rather than only a new entry point:
+the right-hand side can *be* the left-hand side. `s = s + s`, `s = s + "{s}"`
+and `s = s + "{s}{s.len()}q"` all have to answer what a rebuild would, and
+they do because a second reference makes the count two and the in-place path
+needs exactly one. E-STR-CONCAT pins all three.
+
 **Things that were already fast** and do not need looking at again: scalar list
 indexing is pinned and inlined before a loop with an inline bounds check
 (`pin_loop_lists`); `bool` lists are one byte an element; a list of four or
@@ -399,6 +417,34 @@ any ceiling probe has produced this session apart from the fill, it compounds
 with a second level, and unlike the others it applies to every program with
 small functions rather than to one benchmark. It is also the only remaining
 item on this list that is squarely ours rather than Cranelift's.
+
+### `matmul`, taken apart — 2026-09-20
+
+Four probes, and the one that measured was not the one that looked obvious.
+
+**Vectorising is worth 1.21x, not 2x.** Rust's inner loop uses `umull.2d`; the
+easy assumption is that SIMD is the whole gap. Measured by building the *Rust*
+program with LLVM's vectorisers off (`-C llvm-args=--vectorize-loops=false
+--vectorize-slp=false`): 4.83 ms against 3.99 vectorised. So an auto-vectoriser
+— by a long way the most work of anything on this list — would close a fifth of
+a gap that is 1.9x wide. Not built.
+
+**Index strength reduction: 1.00x.** `c[i * n + j] += aik * b[k * n + j]`
+recomputes two `madd`s per element where an induction variable would increment
+by one. Written that way by hand in the source: 8.78 ms to 8.90, *slower*.
+The increments cost what the multiplies did, and two more loop-carried
+variables cost a little more than that.
+
+**Bounds checks: 1.01x**, measured the same day as `sieve`'s 1.11x by
+compiling with the check stripped out.
+
+**Unrolling is worth 1.37x**, and it is the only one that measured. Unrolled
+by four in the source: 8.75 ms to 6.37. Cranelift does not unroll and neither
+do we; a loop that is four instructions of bookkeeping and thirteen of work
+pays a quarter of itself for the bookkeeping, and unrolling also puts more
+memory operations in flight, which is what this loop is actually short of —
+removing one indexed *load* from the body saved 25% where removing four ALU
+instructions saved nothing.
 
 ## What the other implementations do, and which of it applies here
 

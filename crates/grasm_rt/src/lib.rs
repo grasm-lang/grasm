@@ -861,6 +861,29 @@ impl Ord for StrData {
     }
 }
 
+/// `v` in decimal, written backwards into `buf`, answering where it starts.
+///
+/// A free function because two callers want the digits without a `String`
+/// between them: `RtStr::of_i64`, which makes a value, and
+/// `grasm_str_append_i64`, which does not.
+fn i64_digits(v: i64, buf: &mut [u8; 20]) -> usize {
+    let mut n = v.unsigned_abs();
+    let mut i = buf.len();
+    loop {
+        i -= 1;
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    if v < 0 {
+        i -= 1;
+        buf[i] = b'-';
+    }
+    i
+}
+
 /// Public only because `RtPayload` is, and a map key holds one. Nothing
 /// outside this crate has any use for it: the interpreter has its own value
 /// representation and never links the runtime.
@@ -944,20 +967,7 @@ impl RtStr {
     /// so this path skips the allocation that spelling would need.
     pub fn of_i64(v: i64) -> RtStr {
         let mut buf = [0u8; 20];
-        let mut n = v.unsigned_abs();
-        let mut i = buf.len();
-        loop {
-            i -= 1;
-            buf[i] = b'0' + (n % 10) as u8;
-            n /= 10;
-            if n == 0 {
-                break;
-            }
-        }
-        if v < 0 {
-            i -= 1;
-            buf[i] = b'-';
-        }
+        let i = i64_digits(v, &mut buf);
         // ASCII digits, so this is valid UTF-8.
         RtStr::of(unsafe { std::str::from_utf8_unchecked(&buf[i..]) })
     }
@@ -2348,6 +2358,71 @@ pub unsafe extern "C" fn grasm_str_append(a: *mut RtVal, b: *mut RtVal) -> *mut 
     let out = alloc(RtPayload::Str(RtStr::concat(sa, bt)));
     dec(a);
     out
+}
+
+/// `a + <text>` where `a` will not be used again, with no box for the text.
+///
+/// The same ownership contract as `grasm_str_append`: `a`'s reference
+/// transfers here, and with one holder the text is written into the buffer it
+/// already has. What this adds is that the right-hand side never becomes a
+/// value: `acc = acc + "{i % 7}"` built a one-character string in its own box
+/// four million times in the `parwords` benchmark, which cost more than the
+/// appending did.
+///
+/// # Safety: `a` is a live string whose reference transfers; `ptr`/`len` are
+/// a live UTF-8 slice that outlives the call.
+unsafe fn str_append_text(a: *mut RtVal, ptr: *const u8, len: usize) -> *mut RtVal {
+    let RtPayload::Str(_) = &(*a).payload else {
+        grasm_panic_msg_str("concat on non-strings");
+    };
+    if (*a).rc.load(Relaxed) == 1 {
+        let RtPayload::Str(sa) = &mut (*a).payload else {
+            unreachable!()
+        };
+        sa.push_str(std::str::from_utf8_unchecked(std::slice::from_raw_parts(
+            ptr, len,
+        )));
+        return a;
+    }
+    let RtPayload::Str(sa) = &(*a).payload else {
+        unreachable!()
+    };
+    let t = std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr, len));
+    let out = alloc(RtPayload::Str(RtStr::concat(sa, t)));
+    dec(a);
+    out
+}
+
+/// # Safety: as `str_append_text`.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_str_append_text(
+    a: *mut RtVal,
+    ptr: *const u8,
+    len: i64,
+) -> *mut RtVal {
+    str_append_text(a, ptr, len as usize)
+}
+
+/// # Safety: `a` is a live string whose reference transfers.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_str_append_i64(a: *mut RtVal, v: i64) -> *mut RtVal {
+    let mut buf = [0u8; 20];
+    let n = i64_digits(v, &mut buf);
+    str_append_text(a, buf[n..].as_ptr(), buf.len() - n)
+}
+
+/// # Safety: `a` is a live string whose reference transfers.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_str_append_f64(a: *mut RtVal, bits: i64) -> *mut RtVal {
+    let text = float_text(f64::from_bits(bits as u64));
+    str_append_text(a, text.as_ptr(), text.len())
+}
+
+/// # Safety: `a` is a live string whose reference transfers.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_str_append_bool(a: *mut RtVal, v: i64) -> *mut RtVal {
+    let text = if v != 0 { "true" } else { "false" };
+    str_append_text(a, text.as_ptr(), text.len())
 }
 
 /// A tuple of two, in one call and one allocation.
