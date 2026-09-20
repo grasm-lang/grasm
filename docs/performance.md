@@ -10,39 +10,46 @@ it. This is the other half: why the numbers are what they are.
 
 ## The standing gap
 
-Measured 2026-09-20 on an idle machine by `scripts/bench.sh` — wall clock,
+Measured 2026-09-21 on an idle machine by `scripts/bench.sh` — wall clock,
 best of three, checksums verified against the interpreter first.
 
-| program | c | rust | go | zig | grasm | vs rust | what it is |
-|---|---:|---:|---:|---:|---:|---:|---|
-| `sort` | 37ms | 12ms | 50ms | – | **11ms** | **0.9x** | comparison-heavy work over a large list |
-| `wordfreq` | 32ms | 26ms | 18ms | 9ms | **25ms** | **1.0x** | counting words through a map |
-| `fib` | 5ms | 5ms | 6ms | 6ms | 6ms | 1.2x | function call overhead |
-| `sieve` | 7ms | 7ms | 8ms | 7ms | 8ms | 1.1x | list indexing in a tight loop |
-| `parmap` | 55ms | 54ms | 91ms | – | 65ms | 1.2x | multi-core throughput over integers |
-| `parwords` | 8ms | 11ms | 10ms | – | 16ms | 1.5x | multi-core throughput over text |
-| `matmul` | 5ms | 6ms | 8ms | 6ms | 11ms | 1.8x | nested indexing over a flat list |
-| `tree` | 21ms | 10ms | 24ms | – | 32ms | 3.2x | allocating small linked structures and walking them |
+| program | c | rust | go | nim | zig | grasm | vs rust |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `sort` | 37ms | 11ms | 49ms | – | – | **10ms** | **0.9x** |
+| `fib` | 5ms | 6ms | 6ms | 6ms | 6ms | **5ms** | **0.8x** |
+| `wordfreq` | 31ms | 26ms | 17ms | 22ms | 10ms | **25ms** | **1.0x** |
+| `sieve` | 7ms | 7ms | 8ms | 9ms | 7ms | 8ms | 1.1x |
+| `parmap` | 55ms | 52ms | 89ms | – | – | 63ms | 1.2x |
+| `parwords` | 8ms | 11ms | 10ms | – | – | 16ms | 1.5x |
+| `matmul` | 5ms | 5ms | 8ms | 9ms | 6ms | 10ms | 2.0x |
+| `tree` | 21ms | 10ms | 22ms | – | – | 28ms | 2.8x |
 
-`G2` — the geometric mean of rust/native — is **0.73x** against a target of
-0.95x, up from 0.62x the same morning. With the 2 ms harness floor subtracted
-from both sides it is 0.68x.
+`G2` — the geometric mean of rust/native — is **0.77x** against a target of
+0.95x, up from 0.62x at the start of the day. With the 2 ms harness floor
+subtracted from both sides it is 0.73x.
 
-**`sort` and `wordfreq` beat Rust.** `sort` also beats C by three times and Go
-by four; `wordfreq` beats C and loses to Go and Zig. `fib` and `sieve` are
-within a millisecond. What is left is four rows and three causes:
+**Three rows are at or ahead of Rust.** `sort` at 10ms beats Rust, C by more
+than three times and Go by five. `fib` at 5ms beats Rust, Go, Nim and Zig, and
+ties C. `wordfreq` beats Rust and C. `sieve` is one millisecond behind Rust
+and level with Zig.
 
-* `tree` allocates 39,365 boxes a round where Rust allocates 9,841 vectors,
-  because every `Node` is its own box where Rust stores it inline in its
-  parent's. Inline aggregate storage is the only lever on it, worth about
-  1.4x by the profile below, and would still leave it twice Rust.
-* `matmul` wants its inner loop vectorised, which Cranelift will not do — and
-  which the probe below values at only 1.21x anyway.
-* `parwords` builds a list of character codes per string to iterate it, and
-  `parmap`'s remaining gap is scalar code quality.
+What is left is four rows, and each has a measurement rather than a theory
+behind it:
 
-**Arithmetic, indexing, sorting and text are at or near parity. Allocation is
-not.**
+* `tree` — 2.8x. Five probes, four of which measured nothing; the table is
+  below. The representation change the profile pointed at is a third *slower*
+  in the only form that can be built today.
+* `matmul` — 2.0x. All of it is instruction quality inside one loop, with no
+  runtime call anywhere in the profile. A vectoriser is worth 1.21x, measured
+  by building the *Rust* program with LLVM's vectorisers off.
+* `parwords` — 1.5x. Three quarters of it is one loop appending a digit at a
+  time, and every append is a call into the runtime. Lists already avoid this
+  shape with `grasm_list_append_begin`; strings have no equivalent yet.
+* `parmap` — 1.2x, and the row cannot resolve a change smaller than about 15%
+  (see the note on `par*` measurement below).
+
+**Arithmetic, calls, sorting and text are at or near parity. Allocation is
+not, and neither is vectorised arithmetic.**
 
 ## What has been measured
 
