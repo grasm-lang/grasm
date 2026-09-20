@@ -282,6 +282,49 @@ more register-to-register moves shuttling values across block boundaries.
 That is the shape of the remaining gap on the loop benchmarks: not the
 runtime, and not the checks.
 
+### More ceilings, same day
+
+**Marking the panic blocks cold: 1.00x.** `set_cold_block` on the
+out-of-bounds, divide-by-zero and stack-guard blocks does what it says — the
+sieve's inner loop went from thirteen instructions to ten, three of the five
+register-to-register moves gone — and changed no benchmark by more than noise,
+and no binary's size by a single byte. Reverted. Three instructions in ten,
+removed, measuring nothing is the clearest statement yet of what an
+out-of-order core does with work that never mispredicts.
+
+**Lending the loop element: 1.03x on `tree`, nothing elsewhere.** `for k in
+n.kids` reads each element with a `+1` and releases it at the end of the
+iteration, which is the same reference-count pair `param_is_borrowed` removes
+one level up — and the list holds every element alive for the length of the
+loop, so the same argument applies. Built as far as a forced-on probe
+(`grasm_list_get_ref`, the element bound as a borrowed var) and measured
+before the analysis that would make it safe: `tree` 1.03x, everything else
+1.00x. Reverted. It agrees with the older finding that making the counts
+non-atomic is worth nothing: the reference counting is not where the time is.
+
+**Where `tree`'s time actually is, profiled.** `sample` on 400 rounds, with
+symbols kept (`GRASM_KEEP_SYMBOLS=1`): `dec_walk` 25%, the rest of the release
+path (`drop_glue`, `grasm_val_dec`) 11%, reading fields and elements
+(`grasm_list_get`, `grasm_struct_get_at`, `grasm_list_len`) 13%, allocating
+(`alloc_in`, `grasm_struct_make`, `grasm_list_new`, push) 15%, `_tlv_get_addr`
+5%, `cow_list` 5%, and the compiled program's own `build` and `total` 15%.
+Freeing and allocating are 40% of the benchmark, and they are 40% because of
+how many boxes there are: 39,365 a round against Rust's 9,841 `Vec`s, because
+every `Node` is its own box where Rust stores it inline in its parent's
+vector. Removing the struct box — inline aggregate storage in a list — is the
+only lever on that 40%, it is worth about 1.4x by this decomposition, and it
+would still leave `tree` more than twice Rust's time.
+
+**What an inliner would be worth: 1.24x per level on `fib`.** Cranelift has no
+inliner and neither do we, so `fib(30)`'s 1.6 million calls each pay argument
+setup, a stack-guard check and a return. Bounded without writing one, by
+expanding one level of the recursion by hand in the source: 11.15 ms to 8.97
+on the same loaded machine, measured alternately. That is the largest number
+any ceiling probe has produced this session apart from the fill, it compounds
+with a second level, and unlike the others it applies to every program with
+small functions rather than to one benchmark. It is also the only remaining
+item on this list that is squarely ours rather than Cranelift's.
+
 ## What the other implementations do, and which of it applies here
 
 Read against Rust's `hashbrown`, Zig's `std.hash_map`, Swift's SIL optimizer,
