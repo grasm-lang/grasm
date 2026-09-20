@@ -272,6 +272,18 @@ way: marking `push_str` and `str_append_text` `#[inline]` made the serial
 proxy *slower*, and so did writing the short append through `set_len` and raw
 pointer stores rather than a `push` loop.
 
+**The release walk remembers only what died.** Taking a value apart pushed
+every child onto a pending list and decided what to do with it when it came
+back off. Two thirds of `tree`'s nodes hold nothing but an interned integer
+and the shared empty list, and neither of those is ever freed — so the list
+was mostly things that were going to be looked at and dropped. The reference
+is released where the child is *read* instead, and only a child that reached
+zero is remembered. Every value on the pending list is now known to be dead,
+which also takes a branch out of the loop. Worth **1.12x on `tree`**
+(30.4 ms of processor time to 27.2) and nothing measurable elsewhere, which
+is what it should be: no other benchmark tears down a graph. Done,
+2026-09-20.
+
 **Things that were already fast** and do not need looking at again: scalar list
 indexing is pinned and inlined before a loop with an inline bounds check
 (`pin_loop_lists`); `bool` lists are one byte an element; a list of four or

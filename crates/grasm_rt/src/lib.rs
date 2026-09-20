@@ -2028,7 +2028,7 @@ unsafe fn dec(v: *mut RtVal) {
 #[cold]
 #[inline(never)]
 unsafe fn dec_reached_zero(v: *mut RtVal) {
-    LOCAL.with(|local| dec_walk(local, v, true))
+    LOCAL.with(|local| dec_walk(local, v))
 }
 
 /// The walk itself, with the thread's state already in hand.
@@ -2041,99 +2041,91 @@ unsafe fn dec_reached_zero(v: *mut RtVal) {
 ///
 /// # Safety: as `dec`. When `first_is_zero`, `v`'s count has already reached
 /// zero and the acquire fence has already been taken.
-unsafe fn dec_walk(local: &Local, v: *mut RtVal, first_is_zero: bool) {
-    // The children still to release. Almost always a handful — a struct has
-    // two or three fields, a list a few elements — so they go in the frame,
-    // and only a genuinely large value reaches the heap.
+unsafe fn dec_walk(local: &Local, v: *mut RtVal) {
+    // The children still to take apart. Almost always a handful — a struct
+    // has two or three fields, a list a few elements — so they go in the
+    // frame, and only a genuinely large value reaches the heap.
     //
     // It was a `Vec` for every call. `Vec::new()` does not allocate, but the
     // first push does, so releasing *any* value that had children cost a
     // `malloc` and a `free`: in a loop that makes and drops a two-field struct
     // they were three quarters of the profile, and the whole make-and-drop
     // cost forty-nine nanoseconds.
-    // Uninitialised, because most releases push nothing at all: a value whose
-    // refcount has not reached zero, or one with no children, would otherwise
-    // pay to zero the whole array. Only the slots below `n` are ever read, and
-    // each was written before `n` passed it.
+    // Uninitialised, because most releases push nothing at all: a value with
+    // no children would otherwise pay to zero the whole array. Only the slots
+    // below `n` are ever read, and each was written before `n` passed it.
     let mut inline: [std::mem::MaybeUninit<*mut RtVal>; PENDING_INLINE] =
         [const { std::mem::MaybeUninit::uninit() }; PENDING_INLINE];
     let mut n: usize = 0;
     let mut spill: Vec<*mut RtVal> = Vec::new();
     let mut cur = v;
-    let mut known_zero = first_is_zero;
     loop {
-        if !cur.is_null() {
-            let rc = &(*cur).rc;
-            // Release on the way down, Acquire before freeing: everything
-            // every other holder wrote through this value has to be visible to
-            // the thread that takes it apart. Again the `Arc` discipline, and
-            // for the same reason.
-            let hit_zero = if known_zero {
-                true
-            } else if is_counted(rc.load(Relaxed)) {
-                let left = rc.fetch_sub(1, Release) - 1;
-                if left <= 0 {
-                    std::sync::atomic::fence(Acquire);
-                    true
-                } else {
-                    false
+        // `cur` has reached zero. Its children are read out *before* the
+        // payload is dropped, and each is released here — only the ones that
+        // reach zero themselves are worth remembering, which is what keeps
+        // the list short. Two thirds of `tree`'s nodes hold nothing but an
+        // interned integer and the immortal empty list, and neither of those
+        // is ever pushed now.
+        match &(*cur).payload {
+            RtPayload::List(items) | RtPayload::Tuple(items) => {
+                for c in items.iter() {
+                    if release_to_zero(*c) {
+                        push_pending(&mut inline, &mut n, &mut spill, *c);
+                    }
                 }
-            } else {
-                false
-            };
-            known_zero = false;
-            if hit_zero {
-                // The children are read out *before* the payload is
-                // dropped; the box itself goes back to the pool.
-                match &(*cur).payload {
-                    RtPayload::List(items) | RtPayload::Tuple(items) => {
-                        for c in items.iter() {
-                            push_pending(&mut inline, &mut n, &mut spill, *c);
-                        }
-                    }
-                    RtPayload::Map(entries) => {
-                        for c in entries.values() {
-                            push_pending(&mut inline, &mut n, &mut spill, *c);
-                        }
-                    }
-                    RtPayload::Struct { fields, .. } => {
-                        for c in fields.iter() {
-                            push_pending(&mut inline, &mut n, &mut spill, *c);
-                        }
-                    }
-                    RtPayload::Fn { env, .. } => {
-                        if !env.is_null() {
-                            push_pending(&mut inline, &mut n, &mut spill, *env);
-                        }
-                    }
-                    RtPayload::Variant { fields, .. } => {
-                        for c in fields.iter() {
-                            push_pending(&mut inline, &mut n, &mut spill, *c);
-                        }
-                    }
-                    // A handler owns one environment per operation, and an
-                    // environment owns whichever of its words are
-                    // references. Without these two arms a handler that
-                    // escaped its frame would leak everything it captured —
-                    // which is the whole reason it is allowed to escape.
-                    RtPayload::Handler { ops, .. } => {
-                        for env in ops.iter().map(|(_, _, e)| *e).filter(|e| !e.is_null()) {
-                            push_pending(&mut inline, &mut n, &mut spill, env);
-                        }
-                    }
-                    RtPayload::Env { words, boxed } => {
-                        for (w, is_boxed) in words.iter().zip(boxed.iter()) {
-                            if *is_boxed && *w != 0 {
-                                push_pending(&mut inline, &mut n, &mut spill, *w as *mut RtVal);
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-                local.live.set(local.live.get() - 1);
-                give_box_in(local, cur);
             }
+            RtPayload::Map(entries) => {
+                for c in entries.values() {
+                    if release_to_zero(*c) {
+                        push_pending(&mut inline, &mut n, &mut spill, *c);
+                    }
+                }
+            }
+            RtPayload::Struct { fields, .. } => {
+                for c in fields.iter() {
+                    if release_to_zero(*c) {
+                        push_pending(&mut inline, &mut n, &mut spill, *c);
+                    }
+                }
+            }
+            RtPayload::Fn { env, .. } => {
+                if release_to_zero(*env) {
+                    push_pending(&mut inline, &mut n, &mut spill, *env);
+                }
+            }
+            RtPayload::Variant { fields, .. } => {
+                for c in fields.iter() {
+                    if release_to_zero(*c) {
+                        push_pending(&mut inline, &mut n, &mut spill, *c);
+                    }
+                }
+            }
+            // A handler owns one environment per operation, and an
+            // environment owns whichever of its words are references.
+            // Without these two arms a handler that escaped its frame would
+            // leak everything it captured — which is the whole reason it is
+            // allowed to escape.
+            RtPayload::Handler { ops, .. } => {
+                for env in ops.iter().map(|(_, _, e)| *e) {
+                    if release_to_zero(env) {
+                        push_pending(&mut inline, &mut n, &mut spill, env);
+                    }
+                }
+            }
+            RtPayload::Env { words, boxed } => {
+                for (w, is_boxed) in words.iter().zip(boxed.iter()) {
+                    if *is_boxed && *w != 0 {
+                        let c = *w as *mut RtVal;
+                        if release_to_zero(c) {
+                            push_pending(&mut inline, &mut n, &mut spill, c);
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
+        local.live.set(local.live.get() - 1);
+        give_box_in(local, cur);
         // The frame first, then whatever spilled: the order releases are done
         // in is not observable, only that each happens once.
         match spill.pop().or_else(|| {
@@ -2147,6 +2139,32 @@ unsafe fn dec_walk(local: &Local, v: *mut RtVal, first_is_zero: bool) {
             None => return,
         }
     }
+}
+
+/// Drops one reference, answering whether that was the last.
+///
+/// `false` for a null pointer and for anything immortal or arena-owned, which
+/// is what makes an interned integer or the shared empty list cost a load and
+/// a branch rather than a place on the pending list.
+///
+/// # Safety: a live runtime pointer, or null.
+#[inline]
+unsafe fn release_to_zero(p: *mut RtVal) -> bool {
+    if p.is_null() {
+        return false;
+    }
+    let rc = &(*p).rc;
+    // Release on the way down, Acquire before freeing: everything every other
+    // holder wrote through this value has to be visible to the thread that
+    // takes it apart. The `Arc` discipline, and for the same reason.
+    if !is_counted(rc.load(Relaxed)) {
+        return false;
+    }
+    if rc.fetch_sub(1, Release) - 1 > 0 {
+        return false;
+    }
+    std::sync::atomic::fence(Acquire);
+    true
 }
 
 /// One more child to release, in the frame while there is room.
