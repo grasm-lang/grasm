@@ -4632,6 +4632,11 @@ fn indexed_only_lists(block: &grasm_syntax::ast::Block) -> Vec<String> {
 /// every caller of a middling function bigger for nothing.
 const INLINE_BUDGET: i32 = 48;
 
+/// How many copies of a counted loop's body to emit per iteration, and how
+/// large a body is worth copying that many times.
+const UNROLL_BY: i64 = 4;
+const UNROLL_BUDGET: i32 = 32;
+
 /// What a spliced body produced: a value, or nothing because control left.
 type InlineOut = Option<(Value, VType)>;
 
@@ -4672,7 +4677,8 @@ fn inline_candidate(f: &FnDecl) -> Option<Vec<Stmt>> {
         return None;
     }
     let mut budget = INLINE_BUDGET;
-    if !stmts.iter().all(|st| inline_stmt_ok(st, &mut budget)) {
+    let mut calls = 0;
+    if !stmts.iter().all(|st| inline_stmt_ok(st, &mut budget, &mut calls)) {
         return None;
     }
     Some(stmts)
@@ -4828,24 +4834,24 @@ fn inline_bound_expr(e: &Expr, out: &mut Vec<String>) {
     }
 }
 
-fn inline_stmt_ok(st: &Stmt, budget: &mut i32) -> bool {
+fn inline_stmt_ok(st: &Stmt, budget: &mut i32, calls: &mut u32) -> bool {
     *budget -= 1;
     if *budget < 0 {
         return false;
     }
     match st {
-        Stmt::Let { init, .. } => inline_expr_ok(init, budget),
-        Stmt::LetTuple { init, .. } => inline_expr_ok(init, budget),
+        Stmt::Let { init, .. } => inline_expr_ok(init, budget, calls),
+        Stmt::LetTuple { init, .. } => inline_expr_ok(init, budget, calls),
         Stmt::Assign { target, value, .. } => {
-            inline_expr_ok(target, budget) && inline_expr_ok(value, budget)
+            inline_expr_ok(target, budget, calls) && inline_expr_ok(value, budget, calls)
         }
-        Stmt::Expr(e) => inline_expr_ok(e, budget),
+        Stmt::Expr(e) => inline_expr_ok(e, budget, calls),
         Stmt::Break(_) | Stmt::Continue(_) => true,
         Stmt::While { cond, body, .. } => {
-            inline_expr_ok(cond, budget) && body.stmts.iter().all(|s| inline_stmt_ok(s, budget))
+            inline_expr_ok(cond, budget, calls) && body.stmts.iter().all(|s| inline_stmt_ok(s, budget, calls))
         }
         Stmt::For { iter, body, .. } => {
-            inline_expr_ok(iter, budget) && body.stmts.iter().all(|s| inline_stmt_ok(s, budget))
+            inline_expr_ok(iter, budget, calls) && body.stmts.iter().all(|s| inline_stmt_ok(s, budget, calls))
         }
         // A `return` anywhere but the tail leaves the caller, not the splice.
         // A thread, a handler or a `spawn` is frame-shaped and is not moved.
@@ -4853,7 +4859,7 @@ fn inline_stmt_ok(st: &Stmt, budget: &mut i32) -> bool {
     }
 }
 
-fn inline_expr_ok(e: &Expr, budget: &mut i32) -> bool {
+fn inline_expr_ok(e: &Expr, budget: &mut i32, calls: &mut u32) -> bool {
     *budget -= 1;
     if *budget < 0 {
         return false;
@@ -4861,55 +4867,55 @@ fn inline_expr_ok(e: &Expr, budget: &mut i32) -> bool {
     match e {
         Expr::Int(..) | Expr::Float(..) | Expr::Bool(..) | Expr::Ident(_) => true,
         Expr::Str(pieces, _) => pieces.iter().all(|p| match p {
-            grasm_syntax::ast::StrPiece::Expr(x) => inline_expr_ok(x, budget),
+            grasm_syntax::ast::StrPiece::Expr(x) => inline_expr_ok(x, budget, calls),
             _ => true,
         }),
         Expr::List(items, _) | Expr::Tuple(items, _) => {
-            items.iter().all(|i| inline_expr_ok(i, budget))
+            items.iter().all(|i| inline_expr_ok(i, budget, calls))
         }
         Expr::Map(pairs, _) => pairs
             .iter()
-            .all(|(k, v)| inline_expr_ok(k, budget) && inline_expr_ok(v, budget)),
+            .all(|(k, v)| inline_expr_ok(k, budget, calls) && inline_expr_ok(v, budget, calls)),
         Expr::StructLit { fields, base, .. } => {
             base.as_deref()
-                .is_none_or(|b| inline_expr_ok(b, budget))
-                && fields.iter().all(|(_, v)| inline_expr_ok(v, budget))
+                .is_none_or(|b| inline_expr_ok(b, budget, calls))
+                && fields.iter().all(|(_, v)| inline_expr_ok(v, budget, calls))
         }
         Expr::Index { recv, index, .. } => {
-            inline_expr_ok(recv, budget) && inline_expr_ok(index, budget)
+            inline_expr_ok(recv, budget, calls) && inline_expr_ok(index, budget, calls)
         }
-        Expr::Field { recv, .. } => inline_expr_ok(recv, budget),
-        Expr::Unary { expr, .. } => inline_expr_ok(expr, budget),
+        Expr::Field { recv, .. } => inline_expr_ok(recv, budget, calls),
+        Expr::Unary { expr, .. } => inline_expr_ok(expr, budget, calls),
         Expr::Binary { lhs, rhs, .. } => {
-            inline_expr_ok(lhs, budget) && inline_expr_ok(rhs, budget)
+            inline_expr_ok(lhs, budget, calls) && inline_expr_ok(rhs, budget, calls)
         }
         Expr::Range { start, end, .. } => {
-            inline_expr_ok(start, budget) && inline_expr_ok(end, budget)
+            inline_expr_ok(start, budget, calls) && inline_expr_ok(end, budget, calls)
         }
-        Expr::Block(b) => b.stmts.iter().all(|s| inline_stmt_ok(s, budget)),
+        Expr::Block(b) => b.stmts.iter().all(|s| inline_stmt_ok(s, budget, calls)),
         Expr::If {
             cond,
             then_block,
             else_branch,
             ..
         } => {
-            inline_expr_ok(cond, budget)
-                && then_block.stmts.iter().all(|s| inline_stmt_ok(s, budget))
+            inline_expr_ok(cond, budget, calls)
+                && then_block.stmts.iter().all(|s| inline_stmt_ok(s, budget, calls))
                 && match else_branch.as_deref() {
                     None => true,
                     Some(grasm_syntax::ast::ElseBranch::Else(b)) => {
-                        b.stmts.iter().all(|s| inline_stmt_ok(s, budget))
+                        b.stmts.iter().all(|s| inline_stmt_ok(s, budget, calls))
                     }
-                    Some(grasm_syntax::ast::ElseBranch::ElseIf(x)) => inline_expr_ok(x, budget),
+                    Some(grasm_syntax::ast::ElseBranch::ElseIf(x)) => inline_expr_ok(x, budget, calls),
                 }
         }
         Expr::Match {
             scrutinee, arms, ..
         } => {
-            inline_expr_ok(scrutinee, budget)
+            inline_expr_ok(scrutinee, budget, calls)
                 && arms.iter().all(|a| {
-                    a.guard.as_ref().is_none_or(|g| inline_expr_ok(g, budget))
-                        && inline_expr_ok(&a.body, budget)
+                    a.guard.as_ref().is_none_or(|g| inline_expr_ok(g, budget, calls))
+                        && inline_expr_ok(&a.body, budget, calls)
                 })
         }
         // `fail` returns from whatever function it is written in, which after
@@ -4918,10 +4924,12 @@ fn inline_expr_ok(e: &Expr, budget: &mut i32) -> bool {
             if matches!(&**callee, Expr::Ident(id) if id.name == "fail") {
                 return false;
             }
-            inline_expr_ok(callee, budget) && args.iter().all(|a| inline_expr_ok(a, budget))
+            *calls += 1;
+            inline_expr_ok(callee, budget, calls) && args.iter().all(|a| inline_expr_ok(a, budget, calls))
         }
         Expr::MethodCall { recv, args, .. } => {
-            inline_expr_ok(recv, budget) && args.iter().all(|a| inline_expr_ok(a, budget))
+            *calls += 1;
+            inline_expr_ok(recv, budget, calls) && args.iter().all(|a| inline_expr_ok(a, budget, calls))
         }
         // A closure captures the frame it was written in, a `try` and a
         // `region` are frame-shaped, and anything added later is unknown.
@@ -7070,8 +7078,110 @@ this case",
             let body_blk = self.b.create_block();
             let step = self.b.create_block();
             let exit = self.b.create_block();
-            self.b.ins().jump(header, &[]);
-            self.filled = true;
+            // Four iterations at a time while four are left, then the
+            // ordinary loop for what remains.
+            //
+            // Cranelift does not unroll, and this loop is where that shows:
+            // `matmul`'s inner statement is thirteen instructions of work
+            // behind four of bookkeeping, and unrolling it by four in the
+            // source was worth 1.37x. It is not only the bookkeeping — the
+            // same probe showed the loop is short of memory operations in
+            // flight rather than issue slots, and four copies give the core
+            // four independent addresses to work on.
+            //
+            // `break` and `continue` need no special handling: `break` goes
+            // to the exit as it always did, and `continue` goes to the
+            // remainder loop's step, which increments and carries on there —
+            // the same iterations in the same order, just no longer unrolled.
+            // No calls, and the rule is a measurement. `tree`'s inner loop
+            // is `kids.push(build(...))` three times over: the call dwarfs
+            // the loop's own bookkeeping, so unrolling buys nothing there and
+            // the four copies of the body cost 1.05x in instruction cache.
+            // Where the bookkeeping is a real share of the work — a loop of
+            // arithmetic and indexing — it is worth it.
+            let mut budget = UNROLL_BUDGET;
+            let mut calls = 0;
+            let unrolled = body
+                .stmts
+                .iter()
+                .all(|st| inline_stmt_ok(st, &mut budget, &mut calls))
+                && calls == 0;
+            if unrolled {
+                let uhead = self.b.create_block();
+                let ubody = self.b.create_block();
+                // `i + 4 <= end` decides whether four more fit, and it is
+                // written as `i <= end - 4` so that nothing overflows: `end`
+                // is at most `i64::MAX`, so `end - 4` is exact whenever it
+                // does not underflow, and that is what the first test asks.
+                let ev0 = self.b.use_var(end_var);
+                let room = self.b.ins().icmp_imm(
+                    IntCC::SignedGreaterThanOrEqual,
+                    ev0,
+                    i64::MIN + UNROLL_BY,
+                );
+                let lim = self.b.ins().iadd_imm(ev0, -UNROLL_BY);
+                let limvar = self.new_var(&VType::I64);
+                self.b.def_var(limvar, lim);
+                self.b.ins().brif(room, uhead, &[], header, &[]);
+                self.filled = true;
+
+                self.goto_block(uhead);
+                let iv0 = self.b.use_var(ivar);
+                let lv0 = self.b.use_var(limvar);
+                let fits = self
+                    .b
+                    .ins()
+                    .icmp(IntCC::SignedLessThanOrEqual, iv0, lv0);
+                self.b.ins().brif(fits, ubody, &[], header, &[]);
+                self.filled = true;
+
+                self.goto_block(ubody);
+                // Each copy's index is `base + k` rather than one more than
+                // the copy before it. Chaining the increments left the four
+                // addresses dependent on each other and measured 1.03x on
+                // `matmul` where the same unrolling written out by hand in
+                // the source measured 1.37x: what the loop is short of is
+                // memory operations in flight, and a dependent address
+                // cannot issue early. Writing it back into the loop variable
+                // is what keeps `continue` right, since the remainder loop's
+                // step increments from wherever the body left it.
+                let base = self.b.use_var(ivar);
+                self.push_scope();
+                self.bind(&loop_var.name, ivar, VType::I64);
+                self.loops
+                    .push((step, exit, self.vars.len(), self.handlers_installed));
+                let mut term = false;
+                let mut failed: Option<Unsupported> = None;
+                for k in 0..UNROLL_BY {
+                    if term || failed.is_some() {
+                        break;
+                    }
+                    let cur = self.b.ins().iadd_imm(base, k);
+                    self.b.def_var(ivar, cur);
+                    match self.eval_block_inner(body) {
+                        Ok((tail, t)) => {
+                            self.dec_block_tail(tail);
+                            term = t || self.is_filled();
+                        }
+                        Err(e) => failed = Some(e),
+                    }
+                }
+                self.loops.pop();
+                self.pop_scope_no_decs();
+                if let Some(e) = failed {
+                    self.pinned.pop();
+                    return Err(e);
+                }
+                if !term {
+                    let nx = self.b.ins().iadd_imm(base, UNROLL_BY);
+                    self.b.def_var(ivar, nx);
+                    self.b.ins().jump(uhead, &[]);
+                    self.filled = true;
+                }
+            } else {
+                self.b.ins().jump(header, &[]);
+                self.filled = true;
+            }
             self.goto_block(header);
             let iv = self.b.use_var(ivar);
             let ev = self.b.use_var(end_var);

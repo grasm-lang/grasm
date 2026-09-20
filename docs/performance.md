@@ -205,6 +205,44 @@ and `s = s + "{s}{s.len()}q"` all have to answer what a rebuild would, and
 they do because a second reference makes the count two and the in-place path
 needs exactly one. E-STR-CONCAT pins all three.
 
+**A counted loop runs four iterations at a time.** Cranelift does not unroll,
+so `for j in 0..n` pays its compare, increment and branch once per element —
+four instructions of bookkeeping behind thirteen of work in `matmul`'s inner
+loop. The loop now runs four copies of its body while four iterations are
+left, then the ordinary loop for the remainder. Worth **1.21x on `sieve`**,
+1.04x on `sort`, 1.03x on `matmul` and nothing elsewhere.
+
+Two details decided by measurement rather than by argument:
+
+*The copies use `base + k`, not one more than the copy before,* so the four
+addresses do not depend on each other. Writing each index back into the loop
+variable is what keeps `continue` right: it jumps to the remainder loop's
+step, which increments from wherever the body left off, so the same iterations
+run in the same order and simply stop being unrolled. `break` needs nothing;
+it goes to the exit it always did.
+
+*`matmul` did not reproduce its probe, and that is not explained.* Unrolled by
+four in the source it measured 1.37x; unrolled by the compiler it measures
+1.03x, with chained increments and with independent ones alike. The compiled
+version differs from the hand-written one in emitting a remainder loop as
+well, which doubles the code in a three-deep nest, and in keeping the
+loop-invariant `end >= i64::MIN + 4` test as a materialised boolean the outer
+loop re-branches on. Either could account for it; neither has been measured
+apart. The win recorded here is `sieve`'s.
+
+*Bodies that contain a call are not unrolled.* `tree`'s inner loop is
+`kids.push(build(...))` three times over: the call dwarfs the loop's own
+bookkeeping, so there is nothing to win, and four copies of the body cost
+1.05x in instruction cache. With the rule in place `tree` is 1.02x faster
+instead. Done, 2026-09-20.
+
+Deciding whether four more iterations fit is written `i <= end - 4`, guarded
+by `end >= i64::MIN + 4`, rather than `i + 4 <= end`: the second form wraps
+when `i` is within four of `i64::MAX` and would unroll four iterations where
+two remain. E-LOOP-RANGE walks every trip count from zero to twice the group,
+both range forms, both ends of the number line, and `break` and `continue` at
+every position within a group.
+
 **Things that were already fast** and do not need looking at again: scalar list
 indexing is pinned and inlined before a loop with an inline bounds check
 (`pin_loop_lists`); `bool` lists are one byte an element; a list of four or
@@ -438,8 +476,9 @@ variables cost a little more than that.
 **Bounds checks: 1.01x**, measured the same day as `sieve`'s 1.11x by
 compiling with the check stripped out.
 
-**Unrolling is worth 1.37x**, and it is the only one that measured. Unrolled
-by four in the source: 8.75 ms to 6.37. Cranelift does not unroll and neither
+**Unrolling is worth 1.37x in the source**, and it was the only one that
+measured — though the compiler doing it reached only 1.03x on this benchmark;
+see below. Unrolled by four in the source: 8.75 ms to 6.37. Cranelift does not unroll and neither
 do we; a loop that is four instructions of bookkeeping and thirteen of work
 pays a quarter of itself for the bookkeeping, and unrolling also puts more
 memory operations in flight, which is what this loop is actually short of —

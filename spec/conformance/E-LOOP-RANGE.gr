@@ -3,6 +3,35 @@
 //! 0123
 //! 01234
 //! empty
+//! 0 [] [0]
+//! 1 [0] [01]
+//! 2 [01] [012]
+//! 3 [012] [0123]
+//! 4 [0123] [01234]
+//! 5 [01234] [012345]
+//! 6 [012345] [0123456]
+//! 7 [0123456] [01234567]
+//! 8 [01234567] [012345678]
+//! 9 [012345678] [0123456789]
+//! 3 4
+//! -5 0
+//! 0 B
+//! 1 B
+//! 2 1B
+//! 3 12B
+//! 4 12B
+//! 5 124B
+//! 6 1245B
+//! 7 1245B
+//! 8 12457B
+//! 9 124578B
+//! 10 124578B
+//! 11 1245780B
+//! 12 12457801
+// A counted loop is compiled four iterations at a time while four are left,
+// then one at a time for the remainder — so every trip count around that
+// four, both range forms, and both ways out of the body have to answer what
+// a loop compiled one iteration at a time would.
 fn main() {
     var a = ""
     for i in 0..4 {
@@ -20,5 +49,59 @@ fn main() {
     }
     if n == 0 {
         print("empty")
+    }
+
+    // Every trip count from none to twice the group.
+    for m in 0..10 {
+        var s = ""
+        for i in 0..m {
+            s += "{i}"
+        }
+        var t = ""
+        for i in 0..=m {
+            t += "{i}"
+        }
+        print("{m} [{s}] [{t}]")
+    }
+
+    // The ends of the number line, where deciding whether four more fit
+    // would overflow if it were written as `i + 4 <= end`.
+    let lo = 0 - 9223372036854775807 - 1
+    var low = 0
+    for _i in lo..lo + 3 {
+        low += 1
+    }
+    var high = 0
+    for _i in 9223372036854775804..=9223372036854775807 {
+        high += 1
+    }
+    print("{low} {high}")
+
+    // Negative bounds, and a backwards range, which runs not at all.
+    var sum = 0
+    for i in -5..5 {
+        sum = sum + i
+    }
+    var never = 0
+    for _i in 5..0 {
+        never += 1
+    }
+    print("{sum} {never}")
+
+    // `break` leaves, and `continue` skips the rest of its own iteration —
+    // including the copies of the body that would have followed it.
+    for m in 0..13 {
+        var hit = ""
+        for i in 0..12 {
+            if i == m {
+                hit += "B"
+                break
+            }
+            if i % 3 == 0 {
+                continue
+            }
+            hit += "{i % 10}"
+        }
+        print("{m} {hit}")
     }
 }
