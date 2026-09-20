@@ -1732,7 +1732,43 @@ fn module_cache_key(program: &Program, index: usize, world_sig: &str) -> String 
     buf.extend(f.src.as_bytes());
     buf.push(0);
     buf.extend(world_sig.as_bytes());
+    buf.push(0);
+    buf.extend(compiler_fingerprint().as_bytes());
     grasm_pkg::hash::sha256_hex(&buf)
+}
+
+/// What compiled the object, so that a different compiler cannot reuse it.
+///
+/// The key was the module's source and the program's signature surface, and
+/// said nothing about the thing doing the compiling. So changing code
+/// generation and rebuilding left every cached object valid, and the next
+/// build linked yesterday's code into today's binary. During a run of
+/// optimisation work that produced two programs that segfaulted, stayed
+/// broken across `git checkout`, and cleared up the moment the cache was
+/// deleted — which cost three sittings to understand, because every
+/// explanation tried was about the program rather than about what had
+/// compiled it.
+///
+/// The version alone is not enough: it does not move between one build of an
+/// unreleased compiler and the next. The executable's size and modification
+/// time do, they cost one `stat`, and they change for a user who upgrades as
+/// surely as for a developer who rebuilds. If the path cannot be read the key
+/// falls back to a constant, which is no worse than before.
+fn compiler_fingerprint() -> String {
+    let mut out = String::from(env!("CARGO_PKG_VERSION"));
+    if let Ok(exe) = std::env::current_exe() {
+        if let Ok(m) = std::fs::metadata(&exe) {
+            out.push(' ');
+            out.push_str(&m.len().to_string());
+            if let Ok(t) = m.modified() {
+                if let Ok(d) = t.duration_since(std::time::UNIX_EPOCH) {
+                    out.push(' ');
+                    out.push_str(&d.as_nanos().to_string());
+                }
+            }
+        }
+    }
+    out
 }
 
 /// The program's whole signature surface, in a stable order.

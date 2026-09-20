@@ -5,94 +5,44 @@ Every defect that is known and not fixed, with its severity from
 to paste. S1 and S2 block a release; S3 and S4 do not, and this file is what
 makes shipping them honest rather than quiet.
 
-**Open S1: two. Open S2: none. Open S3: none. Open S4: none.**
+**Open S1: none. Open S2: none. Open S3: none. Open S4: none.**
 
-## S1 — a value is released twice, in two programs
+Closed on 2026-09-20, and the entry it replaces was wrong twice before it was
+right. Two programs — `packages/aes-demo` and `apps/broker` — released a value
+twice and segfaulted natively while running correctly under the interpreter.
+Neither was a code-generation defect. Both were **objects compiled by an
+earlier build of the compiler and reused by a later one**.
 
-`packages/aes-demo` and `apps/broker` release a value that has already been
-released. Natively they segfault or abort; under the interpreter both are
-correct. Found by `scripts/usecheck.sh`, which builds the runtime with
-`--features grasm_rt/poison` — a freed box is marked and never handed out
-again, so the next thing to touch it says so:
+`build_native_incremental` caches one object per module in `.grasm-cache`
+beside the output, and recompiles a module only when its key is missing. The
+key was the module's name, its source, and the program's whole signature
+surface — and nothing about the compiler doing the compiling. So a session
+spent changing code generation and rebuilding left every cached object valid,
+and each new binary linked yesterday's code.
 
-    $ cargo build --release --workspace --features grasm_rt/poison
-    $ ./target/release/grasm build packages/aes-demo/src/main.gr --native -o /tmp/a
-    $ /tmp/a
-      ok    the S-box starts 63 7c 77 7b
-      ok    and ends 41 99 2d 0f b0 54 bb 16
-    panic: use after free: dec on a value already released
+Everything that made it look like a program bug follows from that:
 
-Both are layout-sensitive, which is why every gate has been passing them. The
-binary has to sit **directly in `/tmp`**: one directory deeper, or under
-`$TMPDIR` — sixty characters of `/var/folders/...` on macOS — and the same
-program runs clean. `difftest.sh` builds into a working directory under
-`$TMPDIR`, so it has never seen either one; `leakcheck.sh` cannot see them at
-all, because a premature free is not a leak. It counts what is still live at
-exit, and a value freed too early is *less* live, not more.
+* *The output path mattered.* The cache lives beside the output, so `-o /tmp/a`
+  and `-o /tmp/sub/a` are different caches with different staleness.
+* *Padding the source fixed it.* It changes the key, so the module recompiles.
+* *The same function emitted two releases in one program and three in another.*
+  One of those was read from a stale object.
+* *`difftest` never saw it.* It builds into a fresh directory per run, so its
+  cache is always cold — which is also why the gate was right and the bug was
+  real at the same time.
+* *Instrumenting the backend printed nothing.* Nothing was being compiled.
 
-### What is established, and one explanation already withdrawn
+The fix is `compiler_fingerprint()` in the cache key: the version, and the
+executable's size and modification time, which cost one `stat` and change for
+a user who upgrades as surely as for a developer who rebuilds. With it, a
+compiler rebuild invalidates the cache; without it, a released upgrade would
+silently mix old objects into new binaries. With a cold cache both programs run
+clean, `usecheck` reports no use-after-free, and the previously failing
+difftest slice is 71 of 71.
 
-The defect is in code generation, and it is deterministic. The same function
-compiles differently depending on what else is in the program:
-
-    pub fn encrypt_block(round_keys: [i64], block: bytes) -> bytes {
-        encrypt_with(Cipher{ round_keys: round_keys, table: sbox() }, block)
-    }
-
-The `Cipher` is handed to `encrypt_with`, which owns and releases it, so the
-caller must not. Built as part of a program that only calls `encrypt_block`,
-the caller emits **two** releases — one per parameter — which is right. Built
-as part of the full demo it emits **three**: the struct as well, and that third
-one frees what the callee already freed. Both counts are stable across repeated
-builds to the same output path.
-
-Why it crashes only sometimes is separate and is understood: the output path is
-written into the binary, so `-o /tmp/a` and `-o /tmp/aaa` differ by the length
-of that string and everything after it shifts. That changes the layout the
-program runs with, which decides whether the freed box is reused before it is
-read. It is not the bug; it is the weather.
-
-**An explanation recorded here earlier was wrong and is withdrawn.** It said
-the analysis tables — `field_calls`, `resolved_types`, `float_literals` and the
-rest — collide because they are keyed by byte offset with no module. They are
-keyed by offset, but the loader already shifts each file into a disjoint range
-of one virtual span space (`parse_with_offset`, `base += len + 1`), so two
-modules cannot share a key. The evidence for the claim was that padding
-`packages/aes/src/main.gr` with forty lines of comment makes the program run
-clean — which is true, and which only shows that changing the code changes the
-layout, exactly as changing the output path does. That is the same mistake as
-reading a benchmark without a control.
-
-Also checked and ruled out: the compiler is deterministic. Two builds of this
-program to the same path are byte-identical; three builds to *different* paths
-differ in exactly one byte, which is the path.
-
-Narrowed further, and blocked on a tool:
-
-* The callee *does* release the `Cipher` it is handed — `encrypt_with` releases
-  five values on the way out, its two parameters among them. So three releases
-  in the caller is the wrong count, not two.
-* The two functions are adjacent in the binary in both builds, so the counts
-  are read from the right range. They are stable across repeated builds to the
-  same output path.
-* Deleting the `opening` section of the demo *and* the two helpers it uses
-  (`opens`, `flip`) drops the count from three to two. Deleting either helper
-  on its own does not, and neither does adding those shapes to the small
-  program. So the trigger is not one construct; something about the program as
-  a whole moves a decision in the caller.
-
-**What stops this going further is that the compiler cannot currently be
-instrumented for the programs that show the bug.** An `eprintln!` in
-`call_rt` — which every emitted `grasm_val_dec` passes through — fires for a
-single-file program and for a two-file one, and does not fire at all for a
-build of a package with a `grasm.toml`, even though that build demonstrably
-reads its source, recompiles, and emits those calls. No artifact cache and no
-subprocess explains it. Until that is understood, the backend is opaque exactly
-where it needs to be read, and that is the next thing to fix — before the
-double release, not after it.
-
-The release bar in `docs/release-scope.md` says S1 blocks a version. These two
-do.
+`scripts/usecheck.sh` and the `poison` feature stay. They are what turned an
+intermittent segfault into a named, repeatable `use after free`, and the gate
+`leakcheck` cannot replace.
 
 F92 was open here and is fixed: a loop body is a block in statement position,
 so its last expression is handed to nobody, and neither `while` nor `for`
