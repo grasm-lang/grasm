@@ -571,6 +571,29 @@ That is the reason the representation change has not been started: every
 prediction made from a profile decomposition this session has been wrong by
 between six and twenty times, and this one has no measurement behind it.
 
+### `tree` has been probed five ways, 2026-09-21
+
+One of the five landed. The rest are here so the next reader does not spend
+the day rediscovering them.
+
+| probe | measured |
+|---|---:|
+| the release walk remembers only what died | **1.12x — landed** |
+| lending the loop element (`for k in n.kids`) | 1.03x |
+| moving a local into a struct field instead of copying it | 1.009x |
+| `% 1000` replaced by a power of two, so no `sdiv` at all | 0.995x |
+| a flat rewrite with no per-node box at all | 0.74x |
+
+The last three are the interesting ones. Removing a constant division from the
+hot path of every node measured nothing, which agrees with the older finding
+that a divide nothing waits on retires behind other work. Moving rather than
+copying a field removes two calls and two atomic read-modify-writes per node
+and measured nine parts in a thousand. And the representation change that the
+profile decomposition valued at 1.4x is, in the only form that can be built
+today, a third *slower*.
+
+`tree` is 2.7x Rust and none of the obvious explanations survives measurement.
+
 ## What the other implementations do, and which of it applies here
 
 Read against Rust's `hashbrown`, Zig's `std.hash_map`, Swift's SIL optimizer,
