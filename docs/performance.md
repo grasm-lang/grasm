@@ -13,29 +13,36 @@ it. This is the other half: why the numbers are what they are.
 Measured 2026-09-20 on an idle machine by `scripts/bench.sh` — wall clock,
 best of three, checksums verified against the interpreter first.
 
-| program | rust | zig | grasm | ratio | what it is |
-|---|---:|---:|---:|---:|---|
-| `sort` | 15ms | – | **15ms** | **1.0x** | comparison-heavy work over a large list |
-| `wordfreq` | 33ms | 12ms | **32ms** | **0.97x** | counting words through a map |
-| `fib` | 6ms | 7ms | 8ms | 1.3x | function call overhead |
-| `sieve` | 9ms | 9ms | 11ms | 1.2x | list indexing in a tight loop |
-| `matmul` | 6ms | 7ms | 12ms | 2.0x | nested indexing over a flat list |
-| `parmap` | 60ms | – | 128ms | 2.1x | multi-core throughput over integers |
-| `parwords` | 13ms | – | 30ms | 2.3x | multi-core throughput over text |
-| `tree` | 13ms | – | 40ms | 3.1x | allocating small linked structures and walking them |
+| program | c | rust | go | zig | grasm | vs rust | what it is |
+|---|---:|---:|---:|---:|---:|---:|---|
+| `sort` | 37ms | 12ms | 50ms | – | **11ms** | **0.9x** | comparison-heavy work over a large list |
+| `wordfreq` | 32ms | 26ms | 18ms | 9ms | **25ms** | **1.0x** | counting words through a map |
+| `fib` | 5ms | 5ms | 6ms | 6ms | 6ms | 1.2x | function call overhead |
+| `sieve` | 7ms | 7ms | 8ms | 7ms | 8ms | 1.1x | list indexing in a tight loop |
+| `parmap` | 55ms | 54ms | 91ms | – | 65ms | 1.2x | multi-core throughput over integers |
+| `parwords` | 8ms | 11ms | 10ms | – | 16ms | 1.5x | multi-core throughput over text |
+| `matmul` | 5ms | 6ms | 8ms | 6ms | 11ms | 1.8x | nested indexing over a flat list |
+| `tree` | 21ms | 10ms | 24ms | – | 32ms | 3.2x | allocating small linked structures and walking them |
 
-`G2` — the geometric mean of rust/native — is **0.62x** against a target of
-0.95x. `sort` ties Rust and beats C (48ms) and Go (64ms); `wordfreq` beats
-Rust and C and loses to Go and Zig. The small rows carry about 3ms of process
-start on both sides, so their ratios understate the gap in compute: with that
-floor subtracted G2 is 0.54x.
+`G2` — the geometric mean of rust/native — is **0.73x** against a target of
+0.95x, up from 0.62x the same morning. With the 2 ms harness floor subtracted
+from both sides it is 0.68x.
 
-The shape of what is left has not changed: **arithmetic and indexing are
-close, allocation is not.** `tree` allocates 39,365 boxes a round where Rust
-allocates 9,841 vectors, because every `Node` is its own box where Rust stores
-it inline in its parent's — see the profile below. `matmul` needs the inner
-loop vectorised, which Cranelift will not do. The `par*` rows were measured
-after this table and are now better than it says.
+**`sort` and `wordfreq` beat Rust.** `sort` also beats C by three times and Go
+by four; `wordfreq` beats C and loses to Go and Zig. `fib` and `sieve` are
+within a millisecond. What is left is four rows and three causes:
+
+* `tree` allocates 39,365 boxes a round where Rust allocates 9,841 vectors,
+  because every `Node` is its own box where Rust stores it inline in its
+  parent's. Inline aggregate storage is the only lever on it, worth about
+  1.4x by the profile below, and would still leave it twice Rust.
+* `matmul` wants its inner loop vectorised, which Cranelift will not do — and
+  which the probe below values at only 1.21x anyway.
+* `parwords` builds a list of character codes per string to iterate it, and
+  `parmap`'s remaining gap is scalar code quality.
+
+**Arithmetic, indexing, sorting and text are at or near parity. Allocation is
+not.**
 
 ## What has been measured
 
