@@ -3153,6 +3153,38 @@ pub extern "C" fn grasm_list_new_scalar_cap(kind: i64, n: i64) -> *mut RtVal {
     alloc(RtPayload::ListScalar { kind: k, data })
 }
 
+/// A scalar list of `n` copies of one value.
+///
+/// `(0..=limit).map(|_i| true)` is how a program asks for a buffer here —
+/// there is no `vec![x; n]` to write instead — and building it by pushing
+/// two million times cost 4.0 ms of the sieve benchmark's 10.2, against the
+/// 0.2 ms a fill of the same bytes takes. The elements are all the same
+/// value, so the loop was never the point: `vec![v; n]` fills a byte list
+/// with `memset` and a word list with a straight-line store loop.
+#[no_mangle]
+pub extern "C" fn grasm_list_fill_scalar(kind: i64, n: i64, bits: i64) -> *mut RtVal {
+    let k = ScalarKind::from_i64(kind);
+    if n <= 0 {
+        return empty_list_of(Some(k));
+    }
+    let n = n as usize;
+    let width = match k {
+        ScalarKind::Bool => 1,
+        _ => 8,
+    };
+    match n.checked_mul(width) {
+        Some(bytes) if bytes <= MAX_ALLOC => {}
+        _ => rt_panic(&format!(
+            "a list of {n} elements would need more memory than one can hold"
+        )),
+    }
+    let data = match k {
+        ScalarKind::Bool => ScalarData::Bytes(vec![u8::from(bits != 0); n]),
+        _ => ScalarData::Words(vec![bits; n]),
+    };
+    alloc(RtPayload::ListScalar { kind: k, data })
+}
+
 /// The same for a list of boxed values.
 #[no_mangle]
 pub extern "C" fn grasm_list_new_cap(n: i64) -> *mut RtVal {

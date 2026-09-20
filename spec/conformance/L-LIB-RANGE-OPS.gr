@@ -16,6 +16,10 @@
 //! w 0..4 6
 //! 4 [0, 10]
 //! 4 [2, 3]
+//! 0 [7] 0
+//! bound 1
+//! bound 4
+//! [true, true, true] [9, 9, 9] [0, 2, 4, 6]
 // A range answers the list combinators, producing a list of the same elements
 // `for i in a..b` walks.
 //
@@ -77,4 +81,21 @@ fn main() {
     print("{rs[1].len()} {rs[0].map(|v| v * 10)}")
     let f = || 2..6
     print("{f().len()} {window(4).filter(|v| v > 1)}")
+
+    // Mapping a range to one constant is a fill rather than a loop, and the
+    // shapes around that have to keep answering the same way: an empty or
+    // backwards range is still a list, and each bound is computed exactly
+    // once no matter which lowering runs.
+    print("{(5..2).map(|_i| 0).len()} {(3..=3).map(|_i| 7)} {(0..0).map(|_i| 1.5).len()}")
+    let filled = (bound(1)..bound(4)).map(|_i| true)
+    // Not a literal, so still a loop: a binding, and a body that reads the
+    // element.
+    var k = 9
+    print("{filled} {(0..3).map(|_i| k)} {(0..4).map(|i| i * 2)}")
+}
+
+// Announces itself, so a bound evaluated twice is visible in the output.
+fn bound(x: i64) -> i64 / {io} {
+    print("bound {x}")
+    return x
 }

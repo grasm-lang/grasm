@@ -100,6 +100,18 @@ no longer released it. Two programs leaked, one of them 170,202 allocations.
 The wrapper is where the two conventions meet and is now where the release
 happens; the hidden stack-floor argument had already needed exactly this.
 
+**Every element the same value is a fill, not a loop.** `(0..=limit).map(|_i|
+true)` is how a program asks this language for a buffer — there is no
+`vec![x; n]` to write instead — and it was lowered to a `for` loop pushing two
+million times. That cost **4.03 ms of the sieve benchmark's 10.25**, measured
+by timing the allocation on its own; the same bytes take 0.2 ms to fill, which
+is what `vec![v; n]` compiles to: a `memset` for a byte list and a store loop
+for a word list. `grasm_list_fill_scalar` does it in one call. Only a *literal*
+body qualifies — a call or an index runs once per element and can see how many
+times that was — and the bounds are type-checked before anything is emitted, so
+falling back to the loop cannot compute `(f()..g())` twice. Worth **1.42x on
+`sieve`**, 10.48 ms to 7.40 against Rust's 5.8. Done, 2026-09-20.
+
 **Things that were already fast** and do not need looking at again: scalar list
 indexing is pinned and inlined before a loop with an inline bounds check
 (`pin_loop_lists`); `bool` lists are one byte an element; a list of four or
@@ -239,6 +251,36 @@ mechanism in isolation bounds the cost of that mechanism, not the win from
 removing it, because removing it changes everything around it. The change is
 kept — it is faster, and it is the plumbing a full context parameter would
 need — but the four milliseconds were not there to collect.
+
+### Ceilings measured, 2026-09-20
+
+**Lending *every* boxed parameter: 1.01x, which is nothing.** The analysis that
+decides which parameters are lent is deliberately narrow — index and field
+reads only — and the obvious next step was to widen it to the zero-argument
+reads (`xs.len()`, `s.trim()`) that `borrowed_read` already compiles without
+touching a refcount. Bounded first by forcing *every* boxed non-`inout`
+parameter to be lent, which is unsound but compiles and runs: `fib` 1.01x,
+`sieve` 1.01x, `matmul` 1.01x slower, `tree` 1.01x, `sort` 1.01x, `wordfreq`
+1.01x slower. The narrow analysis had already taken what there was to take.
+One build instead of a day.
+
+**Removing every bounds check: 1.11x on `sieve`, nothing anywhere else.**
+Measured the same way, by compiling with the check stripped out of
+`pinned_address`: `sieve` 10.41 ms to 9.34, `sort` 1.03x, and `matmul`,
+`tree`, `fib` and `wordfreq` all 1.00x. Even a perfect bounds-check
+elimination leaves `sieve` at 9.34 against Rust's 5.8, so it is not what the
+gap is made of. This is the third measurement to say the same thing about
+checks an out-of-order core can predict.
+
+What the stripped build *did* show is where the rest goes. Without the check
+the inner loop is eight instructions where the ideal is four, and the four
+extra are all Cranelift's: two rematerialising the loop bound
+(`mov`/`movk` of the same constant, every iteration), one materialising zero
+into a register instead of using `wzr`, and one unconditional branch because
+the body is laid out after the exit. With the check *in*, regalloc adds five
+more register-to-register moves shuttling values across block boundaries.
+That is the shape of the remaining gap on the loop benchmarks: not the
+runtime, and not the checks.
 
 ## What the other implementations do, and which of it applies here
 

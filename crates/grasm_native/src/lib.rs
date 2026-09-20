@@ -926,6 +926,7 @@ impl<'m> Codegen<'m> {
             ("grasm_list_min_max", vec![i64t, i8t], Some(i64t)),
             ("grasm_list_new_scalar", vec![i64t], Some(i64t)),
             ("grasm_list_new_scalar_cap", vec![i64t, i64t], Some(i64t)),
+            ("grasm_list_fill_scalar", vec![i64t, i64t, i64t], Some(i64t)),
             (
                 "grasm_list_append_begin",
                 vec![i64t, i64t, i64t, i64t, i64t],
@@ -8185,6 +8186,70 @@ this case",
         }))
     }
 
+    /// `(a..b).map(|_| <literal>)` as one filled allocation.
+    ///
+    /// `None` means "not that shape", and the caller falls through to the
+    /// fused push loop. The body has to be a literal rather than merely
+    /// independent of the parameter: a call or an index runs once per
+    /// element and can see how many times that was, so replacing the loop
+    /// with a fill would change what the program does.
+    fn range_fill(
+        &mut self,
+        recv: &Expr,
+        f: &Expr,
+        span: Span,
+    ) -> CResult<Option<(Value, VType)>> {
+        let Expr::Range {
+            start,
+            end,
+            inclusive,
+            ..
+        } = recv
+        else {
+            return Ok(None);
+        };
+        let Expr::Closure { params, body, .. } = f else {
+            return Ok(None);
+        };
+        if params.len() != 1 {
+            return Ok(None);
+        }
+        let elem_t = match &**body {
+            Expr::Int(..) => VType::I64,
+            Expr::Float(..) => VType::F64,
+            Expr::Bool(..) => VType::Bool,
+            _ => return Ok(None),
+        };
+        let Some(kind) = scalar_kind_i64(&elem_t) else {
+            return Ok(None);
+        };
+        // Asked before anything is emitted. Bailing out *after* evaluating a
+        // bound would leave the code that computed it behind and let the
+        // fused path compute it a second time, so `(f()..g()).map(|_| 1)`
+        // would call each of them twice.
+        if self.probe_type(start)? != VType::I64 || self.probe_type(end)? != VType::I64 {
+            return Ok(None);
+        }
+        let (s, _) = self.eval_expr_expecting(start, Some(&VType::I64))?;
+        let (e, _) = self.eval_expr_expecting(end, Some(&VType::I64))?;
+        // `a..b` has `b - a` elements and `a..=b` one more. A backwards
+        // range is empty, which the runtime reads off a count of zero or
+        // less rather than being told separately.
+        let mut n = self.b.ins().isub(e, s);
+        if *inclusive {
+            n = self.b.ins().iadd_imm(n, 1);
+        }
+        // A literal of the type the match above read off it.
+        let (v, _) = self.eval_expr_expecting(body, Some(&elem_t))?;
+        let bits = self.value_to_bits(v, &elem_t);
+        let kc = self.b.ins().iconst(types::I64, kind);
+        let list = self
+            .call_rt("grasm_list_fill_scalar", &[kc, n, bits])
+            .unwrap();
+        let _ = span;
+        Ok(Some((list, VType::List(Box::new(elem_t)))))
+    }
+
     fn eval_method(
         &mut self,
         recv: &Expr,
@@ -8265,6 +8330,18 @@ this case",
             // input: on `(0..=2_000_000).map(|_| true)` — how a sieve makes its
             // flags — the intermediate cost more than the sieve that followed
             // it, 20 ms against 5 ms of reading and 3 ms of writing.
+            // Every element the same value is not a loop, it is a fill.
+            // `(0..=limit).map(|_i| true)` is how a program asks for a
+            // buffer — the language has no `vec![x; n]` to write instead —
+            // and pushing two million times cost 4.0 ms of the sieve
+            // benchmark's 10.2 against the 0.2 ms the same bytes take to
+            // fill. Only a literal body qualifies: anything else could
+            // observe how many times it ran.
+            if name.name == "map" {
+                if let Some(out) = self.range_fill(recv, &args[0], span)? {
+                    return Ok(Some(out));
+                }
+            }
             if name.name == "map" || name.name == "filter" {
                 if let Some(fused) = self.fused_range_build(recv, &name.name, &args[0], span) {
                     return self.eval_expr(&fused);
