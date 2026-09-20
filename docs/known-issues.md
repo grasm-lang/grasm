@@ -30,45 +30,46 @@ program runs clean. `difftest.sh` builds into a working directory under
 all, because a premature free is not a leak. It counts what is still live at
 exit, and a value freed too early is *less* live, not more.
 
-### The cause: the analysis tables are keyed by byte offset and nothing else
+### What is established, and one explanation already withdrawn
 
-`grasm_sema`'s `Analysis` hands the backend a dozen lookup tables keyed by a
-source span — `field_calls`, `map_get_value_kind`, `value_rows`, `callee_rows`,
-`resolved_types` by a `(start, end)` pair, and `float_literals`,
-`fallible_closures`, `empty_types`, `closure_param_types`,
-`generic_ctor_types` by a start offset alone. Every one of them covers the
-*whole program* and none of them records which module a span came from.
-
-Spans are per-file offsets. So a construct at bytes 5085..5153 of one module
-and an unrelated construct at the same bytes of another are the same key, and
-the backend reads one module's answer while compiling the other's code.
-
-That is what miscompiles `encrypt_block`:
+The defect is in code generation, and it is deterministic. The same function
+compiles differently depending on what else is in the program:
 
     pub fn encrypt_block(round_keys: [i64], block: bytes) -> bytes {
         encrypt_with(Cipher{ round_keys: round_keys, table: sbox() }, block)
     }
 
-The freshly built `Cipher` is handed to `encrypt_with`, which owns and releases
-it — so the caller must not. In a build of this package alone the generated
-code releases twice, once for each parameter, which is right. In the full demo
-it releases three times: the struct as well. The call sits at bytes 5085..5153
-of `packages/aes/src/main.gr`, and both `packages/bytes/src/main.gr` and
-`packages/aes-demo/src/main.gr` have their own content at those same offsets.
+The `Cipher` is handed to `encrypt_with`, which owns and releases it, so the
+caller must not. Built as part of a program that only calls `encrypt_block`,
+the caller emits **two** releases — one per parameter — which is right. Built
+as part of the full demo it emits **three**: the struct as well, and that third
+one frees what the callee already freed. Both counts are stable across repeated
+builds to the same output path.
 
-Demonstrated rather than argued: putting forty lines of comment at the top of
-`packages/aes/src/main.gr` — which changes nothing but its offsets — drops the
-generated release count back to two and the program runs clean. Padding the
-*demo* instead does not, because `bytes` still collides.
+Why it crashes only sometimes is separate and is understood: the output path is
+written into the binary, so `-o /tmp/a` and `-o /tmp/aaa` differ by the length
+of that string and everything after it shifts. That changes the layout the
+program runs with, which decides whether the freed box is reused before it is
+read. It is not the bug; it is the weather.
 
-This also explains the directory-depth sensitivity above, which is not
-sensitivity to depth at all. It is sensitivity to *which modules are compiled
-together*, and the paths that appeared to matter were changing that.
+**An explanation recorded here earlier was wrong and is withdrawn.** It said
+the analysis tables — `field_calls`, `resolved_types`, `float_literals` and the
+rest — collide because they are keyed by byte offset with no module. They are
+keyed by offset, but the loader already shifts each file into a disjoint range
+of one virtual span space (`parse_with_offset`, `base += len + 1`), so two
+modules cannot share a key. The evidence for the claim was that padding
+`packages/aes/src/main.gr` with forty lines of comment makes the program run
+clean — which is true, and which only shows that changing the code changes the
+layout, exactly as changing the output path does. That is the same mistake as
+reading a benchmark without a control.
 
-The fix is to key every one of those tables by module as well as span. It
-touches the checker's published analysis and every read of it in the backend,
-which is why it is written down here rather than attempted in the same sitting
-as the diagnosis.
+Also checked and ruled out: the compiler is deterministic. Two builds of this
+program to the same path are byte-identical; three builds to *different* paths
+differ in exactly one byte, which is the path.
+
+So what is known is the codegen difference above, and that is where to look
+next: what about compiling the rest of the demo makes the caller release an
+argument whose ownership it has already handed over.
 
 The release bar in `docs/release-scope.md` says S1 blocks a version. These two
 do.
