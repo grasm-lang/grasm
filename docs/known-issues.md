@@ -67,9 +67,29 @@ Also checked and ruled out: the compiler is deterministic. Two builds of this
 program to the same path are byte-identical; three builds to *different* paths
 differ in exactly one byte, which is the path.
 
-So what is known is the codegen difference above, and that is where to look
-next: what about compiling the rest of the demo makes the caller release an
-argument whose ownership it has already handed over.
+Narrowed further, and blocked on a tool:
+
+* The callee *does* release the `Cipher` it is handed — `encrypt_with` releases
+  five values on the way out, its two parameters among them. So three releases
+  in the caller is the wrong count, not two.
+* The two functions are adjacent in the binary in both builds, so the counts
+  are read from the right range. They are stable across repeated builds to the
+  same output path.
+* Deleting the `opening` section of the demo *and* the two helpers it uses
+  (`opens`, `flip`) drops the count from three to two. Deleting either helper
+  on its own does not, and neither does adding those shapes to the small
+  program. So the trigger is not one construct; something about the program as
+  a whole moves a decision in the caller.
+
+**What stops this going further is that the compiler cannot currently be
+instrumented for the programs that show the bug.** An `eprintln!` in
+`call_rt` — which every emitted `grasm_val_dec` passes through — fires for a
+single-file program and for a two-file one, and does not fire at all for a
+build of a package with a `grasm.toml`, even though that build demonstrably
+reads its source, recompiles, and emits those calls. No artifact cache and no
+subprocess explains it. Until that is understood, the backend is opaque exactly
+where it needs to be read, and that is the next thing to fix — before the
+double release, not after it.
 
 The release bar in `docs/release-scope.md` says S1 blocks a version. These two
 do.
