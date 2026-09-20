@@ -250,6 +250,28 @@ two remain. E-LOOP-RANGE walks every trip count from zero to twice the group,
 both range forms, both ends of the number line, and `break` and `continue` at
 every position within a group.
 
+**A one-byte append does not go through `memcpy`.** `String::push_str` copies
+through `memcpy` however short the piece is, and appending one digit at a time
+— which is what building text in a loop does — spends more in the call than in
+the byte. A piece of four bytes or fewer is written directly, and `i64_digits`
+answers a single digit without its loop or its two divisions. Worth **1.037x**
+on the string-building workload, reproduced on two independent runs.
+
+Measuring it is the part worth recording. On `parwords` itself the same
+comparison gave 1.12x faster, 1.05x faster, 1.00x, 1.02x faster and 1.11x
+*slower* — the same two binaries, interleaved, best of nine to eleven
+processor-time runs each. A `par*` row contends for cores with whatever else
+is on the machine, and contention inflates total processor time, so the metric
+that survives load on the single-threaded rows does not survive it here. The
+number above comes from a *serial proxy*: the same program with `par_map`
+replaced by `map`. Nothing smaller than about 15% can be measured on a `par*`
+row at all. Done, 2026-09-20.
+
+Two things that looked like they should help and did not, measured the same
+way: marking `push_str` and `str_append_text` `#[inline]` made the serial
+proxy *slower*, and so did writing the short append through `set_len` and raw
+pointer stores rather than a `push` loop.
+
 **Things that were already fast** and do not need looking at again: scalar list
 indexing is pinned and inlined before a loop with an inline bounds check
 (`pin_loop_lists`); `bool` lists are one byte an element; a list of four or

@@ -867,6 +867,13 @@ impl Ord for StrData {
 /// between them: `RtStr::of_i64`, which makes a value, and
 /// `grasm_str_append_i64`, which does not.
 fn i64_digits(v: i64, buf: &mut [u8; 20]) -> usize {
+    // One digit is the common case wherever this is hot — a loop appending
+    // `"{i % 7}"` never reaches a second — and it needs neither the loop nor
+    // its two divisions.
+    if (0..10).contains(&v) {
+        buf[19] = b'0' + v as u8;
+        return 19;
+    }
     let mut n = v.unsigned_abs();
     let mut i = buf.len();
     loop {
@@ -991,7 +998,13 @@ impl RtStr {
             StrData::Inline { bytes, len } => {
                 let at = *len as usize;
                 if at + t.len() <= 15 {
-                    bytes[at..at + t.len()].copy_from_slice(t.as_bytes());
+                    // Byte at a time rather than `copy_from_slice`, which is
+                    // a call to `memcpy` whatever the length. See the `Heap`
+                    // arm below: text is built a digit or a character at a
+                    // time here, and the call costs more than the byte.
+                    for (i, c) in t.as_bytes().iter().enumerate() {
+                        bytes[at + i] = *c;
+                    }
                     *len = (at + t.len()) as u8;
                     return;
                 }
@@ -1003,7 +1016,30 @@ impl RtStr {
                 out
             }
             StrData::Heap(h) => {
-                h.push_str(t);
+                let b = t.as_bytes();
+                // `String::push_str` copies through `memcpy` however short
+                // the piece is, and a call that moves one byte costs far more
+                // than the byte: in `parwords`, which appends one digit four
+                // million times, `memmove` and its stub were the largest
+                // single item in the profile. A short piece is written
+                // directly instead.
+                //
+                // Safety: `t` is a `&str`, so appending all of its bytes to
+                // valid UTF-8 leaves valid UTF-8.
+                if b.len() <= 4 {
+                    let v = unsafe { h.as_mut_vec() };
+                    v.reserve(b.len());
+                    let n = v.len();
+                    unsafe {
+                        let p = v.as_mut_ptr().add(n);
+                        for (i, c) in b.iter().enumerate() {
+                            *p.add(i) = *c;
+                        }
+                        v.set_len(n + b.len());
+                    }
+                } else {
+                    h.push_str(t);
+                }
                 return;
             }
         };
