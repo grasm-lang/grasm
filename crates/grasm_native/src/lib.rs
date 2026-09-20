@@ -2025,14 +2025,11 @@ arguments nor the type this is bound to",
             // The address of a scratch slot stands in for the stack pointer.
             // `get_frame_pointer` would say the same thing without the slot,
             // but Cranelift's verifier rejects it here.
-            let slot = fcx
-                .b
-                .create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
-                    cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
-                    8,
-                    3,
-                ));
-            let here = fcx.b.ins().stack_addr(ptr_ty, slot, 0);
+            // The current stack pointer, read directly. It used to be the address
+            // of a one-word stack slot, which is what a slot costs: a `sub sp`
+            // in the prologue and an `add sp` in the epilogue of every
+            // function that can reach itself.
+                        let here = fcx.b.ins().get_stack_pointer(ptr_ty);
             let floor = fcx.b.block_params(entry)[0];
             // Defined in the entry block, so it dominates every call this
             // function makes and can be handed straight on.
@@ -2549,12 +2546,7 @@ operation's",
         // the hidden stack floor — so it asks for one and hands it on. That
         // happens once, where the recursion is entered.
         if sig_info.takes_floor {
-            let slot = b.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
-                cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
-                8,
-                3,
-            ));
-            let here = b.ins().stack_addr(ptr_ty, slot, 0);
+            let here = b.ins().get_stack_pointer(ptr_ty);
             let f = self
                 .module
                 .declare_func_in_func(self.runtime["grasm_stack_floor"], b.func);
@@ -5733,14 +5725,9 @@ impl FnCx<'_, '_> {
             return v;
         }
         let ptr_ty = self.cg.module.target_config().pointer_type();
-        let slot = self
-            .b
-            .create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
-                cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
-                8,
-                3,
-            ));
-        let here = self.b.ins().stack_addr(ptr_ty, slot, 0);
+        // Read directly rather than through the address of a scratch slot,
+        // which costs a `sub sp` and an `add sp` in every frame that has one.
+        let here = self.b.ins().get_stack_pointer(ptr_ty);
         self.call_rt("grasm_stack_floor", &[here]).unwrap()
     }
 

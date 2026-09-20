@@ -284,6 +284,20 @@ which also takes a branch out of the loop. Worth **1.12x on `tree`**
 is what it should be: no other benchmark tears down a graph. Done,
 2026-09-20.
 
+**The stack guard reads the stack pointer instead of a scratch slot's
+address.** A function that can reach itself compares its current stack
+position against a floor ([E-RECURSION-DEPTH]). It got that position by
+allocating a one-word stack slot and taking its address — and a slot costs a
+`sub sp` in the prologue and an `add sp` in the epilogue of *every* frame that
+has one. Cranelift's `get_stack_pointer` answers the same question with no
+slot at all.
+
+Two instructions of fifty, and worth **1.19x on `fib`** (5.61 ms of processor
+time to 4.71). That is the opposite of everything else on this page, where
+removing four instructions from a thirteen-instruction loop measured nothing:
+these two sit in the prologue and epilogue, and every load and store in the
+frame waits on the stack pointer they move. Done, 2026-09-21.
+
 **Things that were already fast** and do not need looking at again: scalar list
 indexing is pinned and inlined before a loop with an inline bounds check
 (`pin_loop_lists`); `bool` lists are one byte an element; a list of four or
