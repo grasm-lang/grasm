@@ -30,10 +30,45 @@ program runs clean. `difftest.sh` builds into a working directory under
 all, because a premature free is not a leak. It counts what is still live at
 exit, and a value freed too early is *less* live, not more.
 
-Why the depth matters is not understood and is worth understanding: it is the
-difference between a gate that finds this class and one that does not. What is
-measured is that it does, and `usecheck.sh` therefore builds at the shallowest
-path available.
+### The cause: the analysis tables are keyed by byte offset and nothing else
+
+`grasm_sema`'s `Analysis` hands the backend a dozen lookup tables keyed by a
+source span — `field_calls`, `map_get_value_kind`, `value_rows`, `callee_rows`,
+`resolved_types` by a `(start, end)` pair, and `float_literals`,
+`fallible_closures`, `empty_types`, `closure_param_types`,
+`generic_ctor_types` by a start offset alone. Every one of them covers the
+*whole program* and none of them records which module a span came from.
+
+Spans are per-file offsets. So a construct at bytes 5085..5153 of one module
+and an unrelated construct at the same bytes of another are the same key, and
+the backend reads one module's answer while compiling the other's code.
+
+That is what miscompiles `encrypt_block`:
+
+    pub fn encrypt_block(round_keys: [i64], block: bytes) -> bytes {
+        encrypt_with(Cipher{ round_keys: round_keys, table: sbox() }, block)
+    }
+
+The freshly built `Cipher` is handed to `encrypt_with`, which owns and releases
+it — so the caller must not. In a build of this package alone the generated
+code releases twice, once for each parameter, which is right. In the full demo
+it releases three times: the struct as well. The call sits at bytes 5085..5153
+of `packages/aes/src/main.gr`, and both `packages/bytes/src/main.gr` and
+`packages/aes-demo/src/main.gr` have their own content at those same offsets.
+
+Demonstrated rather than argued: putting forty lines of comment at the top of
+`packages/aes/src/main.gr` — which changes nothing but its offsets — drops the
+generated release count back to two and the program runs clean. Padding the
+*demo* instead does not, because `bytes` still collides.
+
+This also explains the directory-depth sensitivity above, which is not
+sensitivity to depth at all. It is sensitivity to *which modules are compiled
+together*, and the paths that appeared to matter were changing that.
+
+The fix is to key every one of those tables by module as well as span. It
+touches the checker's published analysis and every read of it in the backend,
+which is why it is written down here rather than attempted in the same sitting
+as the diagnosis.
 
 The release bar in `docs/release-scope.md` says S1 blocks a version. These two
 do.

@@ -1512,6 +1512,10 @@ const POISON: i64 = i64::MIN + 0x5EAD;
 #[inline]
 unsafe fn assert_alive(v: *mut RtVal, what: &str) {
     if !v.is_null() && (*v).rc.load(Relaxed) == POISON {
+        // To find *which* code released it twice, swap this for
+        // `std::process::abort()` and build with `GRASM_KEEP_SYMBOLS=1`: macOS
+        // writes a symbolicated report and the generated frames are named in
+        // it. A Rust backtrace stops at the runtime boundary and says nothing.
         rt_panic(&format!("use after free: {what} on a value already released"));
     }
 }
