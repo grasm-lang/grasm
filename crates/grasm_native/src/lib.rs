@@ -484,6 +484,10 @@ struct Codegen<'m> {
     /// thing as a generic machine-code symbol, so each *instantiation* becomes
     /// its own concrete function.
     generic_fns: HashMap<String, FnDecl>,
+    /// Bodies small enough and plain enough to splice into their callers.
+    /// See `inline_candidate`; only these are kept, so an ordinary function's
+    /// AST is not cloned for nothing.
+    inlinable: HashMap<String, (FnDecl, Vec<String>)>,
     /// Generic *type* declarations, kept whole until a use site fixes their
     /// parameters — the same treatment generic functions get, for the same
     /// reason: `type Pair[A, B]` describes a family, and a machine
@@ -647,6 +651,7 @@ impl<'m> Codegen<'m> {
             module_imports: HashMap::new(),
             only_module: None,
             generic_fns: HashMap::new(),
+            inlinable: HashMap::new(),
             generic_types: HashMap::new(),
             type_args: HashMap::new(),
             generic_variant_owner: HashMap::new(),
@@ -1757,6 +1762,7 @@ arguments nor the type this is bound to",
                     }
                     let ptr_ty = self.module.target_config().pointer_type();
                     let key = format!("{}::{}", self.current_module, f.name.name);
+                    let key_for_inline = key.clone();
                     let takes_floor = self.recursive.contains(&key);
                     let mut sig = self.module.make_signature();
                     if takes_floor {
@@ -1807,6 +1813,16 @@ arguments nor the type this is bound to",
                             borrowed,
                         },
                     );
+                    if let Some(spliced) = inline_candidate(f) {
+                        let mut names: Vec<String> =
+                            f.params.iter().map(|p| p.name.name.clone()).collect();
+                        for st in &spliced {
+                            inline_bound_stmt(st, &mut names);
+                        }
+                        let mut small = f.clone();
+                        small.body.stmts = spliced;
+                        self.inlinable.insert(key_for_inline, (small, names));
+                    }
                 }
                 Decl::Test(_)
                 | Decl::Bench(_)
@@ -1981,6 +1997,8 @@ arguments nor the type this is bound to",
             task_scopes: Vec::new(),
             floor: None,
             borrowed_vars: std::collections::HashSet::new(),
+            inline_depth: 0,
+            inline_seq: 0,
         };
 
         let entry = fcx.b.create_block();
@@ -2072,6 +2090,16 @@ arguments nor the type this is bound to",
         // Verifier errors") and covered a quarter of every well-typed program
         // containing a `return`.
         let terminated = terminated || fcx.is_filled();
+        // Control left, but through a block opened *inside* an expression —
+        // `print("{boom()}")` where `boom`'s body was spliced in and ends in
+        // a `panic`. The rest of the interpolation is written into a block
+        // nothing reaches, and an unreachable block still needs a terminator
+        // or Cranelift refuses the function. No reachable program loses
+        // anything by this: a block that is filled already has one.
+        if terminated && !fcx.is_filled() {
+            fcx.trap_here();
+            fcx.filled = true;
+        }
         if !terminated {
             match (&sig_ret, last) {
                 (VType::Unit, last) => {
@@ -2641,6 +2669,8 @@ operation's",
             task_scopes: Vec::new(),
             floor: None,
             borrowed_vars: std::collections::HashSet::new(),
+            inline_depth: 0,
+            inline_seq: 0,
         };
         let entry = fcx.b.create_block();
         fcx.b.append_block_params_for_function_params(entry);
@@ -2740,6 +2770,8 @@ operation's",
             task_scopes: Vec::new(),
             floor: None,
             borrowed_vars: std::collections::HashSet::new(),
+            inline_depth: 0,
+            inline_seq: 0,
         };
         let entry = fcx.b.create_block();
         fcx.b.append_block_params_for_function_params(entry);
@@ -2882,6 +2914,8 @@ operation's",
             task_scopes: Vec::new(),
             floor: None,
             borrowed_vars: std::collections::HashSet::new(),
+            inline_depth: 0,
+            inline_seq: 0,
         };
         let entry = fcx.b.create_block();
         fcx.b.append_block_params_for_function_params(entry);
@@ -3224,6 +3258,10 @@ struct FnCx<'a, 'm> {
     /// Parameters the caller lent rather than gave: they are not released on
     /// the way out, because no reference changed hands. See `param_is_borrowed`.
     borrowed_vars: std::collections::HashSet<u32>,
+    /// How many function bodies are currently spliced around this point, and
+    /// a counter for the hidden names a splice binds its arguments to.
+    inline_depth: u32,
+    inline_seq: u32,
     /// This function's copy of the thread's stack floor, when it was handed
     /// one. A function that was not needs to ask the runtime before it can
     /// call one that was.
@@ -4582,6 +4620,311 @@ fn indexed_only_lists(block: &grasm_syntax::ast::Block) -> Vec<String> {
 /// callee holding a reference nobody lent it, so a bare mention disqualifies
 /// it. So does rebinding the name, since later mentions would then be a
 /// different value.
+/// How much of a body is worth copying into a call site.
+///
+/// Counted in AST nodes rather than instructions, because the point is to
+/// bound how much the *compiler* duplicates: a splice that is cheap here can
+/// still be large after lowering, and a budget that is generous here makes
+/// every caller of a middling function bigger for nothing.
+const INLINE_BUDGET: i32 = 48;
+
+/// What a spliced body produced: a value, or nothing because control left.
+type InlineOut = Option<(Value, VType)>;
+
+/// How deep a splice may nest. One level is what a recursive function needs
+/// to halve its calls. Two was measured and is *slower* — `fib` went from
+/// 6.70 ms to 8.86 — because a body that contains two calls to itself grows
+/// four times over at the second level, and what that costs in register
+/// pressure and instruction cache is more than the calls it removes.
+const INLINE_DEPTH: u32 = 1;
+
+/// The body to splice, if this function may be spliced at all.
+///
+/// Cranelift has no inliner, so every call a compiled program makes is a real
+/// call: arguments into their registers, a stack-guard check if the function
+/// can reach itself, and a return. Expanding one level of `fib`'s recursion
+/// by hand in the source was worth 1.24x, which is what this is for.
+///
+/// Deny by default. The returned statements are the body with a trailing
+/// `return e` rewritten to `e`, because a block's last expression is its
+/// value and a `return` from a spliced body would leave the *caller*.
+fn inline_candidate(f: &FnDecl) -> Option<Vec<Stmt>> {
+    if !f.generics.is_empty() || f.effects.is_some() || f.err.is_some() || f.ret.is_none() {
+        return None;
+    }
+    if f.params.iter().any(|p| p.mode == ParamMode::Inout) {
+        return None;
+    }
+    let mut stmts = f.body.stmts.clone();
+    if let Some(Stmt::Return(Some(e), _)) = stmts.last() {
+        let e = e.clone();
+        let n = stmts.len() - 1;
+        stmts[n] = Stmt::Expr(e);
+    }
+    // The last statement has to *be* the value: a body ending in a `let` or a
+    // loop returns unit, and splicing it where a value is wanted would put
+    // the wrong thing in the caller's hands.
+    if !matches!(stmts.last(), Some(Stmt::Expr(_))) {
+        return None;
+    }
+    let mut budget = INLINE_BUDGET;
+    if !stmts.iter().all(|st| inline_stmt_ok(st, &mut budget)) {
+        return None;
+    }
+    Some(stmts)
+}
+
+/// Every name a spliced body binds, so a call site can tell whether any of
+/// them would collide with something the caller already has. Mirrors
+/// `inline_stmt_ok`: only the constructs that scan accepts can appear.
+fn inline_bound_stmt(st: &Stmt, out: &mut Vec<String>) {
+    match st {
+        Stmt::Let { name, init, .. } => {
+            out.push(name.name.clone());
+            inline_bound_expr(init, out);
+        }
+        Stmt::LetTuple { names, init, .. } => {
+            out.extend(names.iter().map(|n| n.name.clone()));
+            inline_bound_expr(init, out);
+        }
+        Stmt::Assign { target, value, .. } => {
+            inline_bound_expr(target, out);
+            inline_bound_expr(value, out);
+        }
+        Stmt::Expr(e) => inline_bound_expr(e, out),
+        Stmt::While { cond, body, .. } => {
+            inline_bound_expr(cond, out);
+            for s in &body.stmts {
+                inline_bound_stmt(s, out);
+            }
+        }
+        Stmt::For {
+            var, iter, body, ..
+        } => {
+            out.push(var.name.clone());
+            inline_bound_expr(iter, out);
+            for s in &body.stmts {
+                inline_bound_stmt(s, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn inline_bound_pattern(p: &grasm_syntax::ast::Pattern, out: &mut Vec<String>) {
+    match p {
+        grasm_syntax::ast::Pattern::Bind(id) => out.push(id.name.clone()),
+        grasm_syntax::ast::Pattern::Variant { fields, .. } => {
+            for f in fields {
+                inline_bound_pattern(f, out);
+            }
+        }
+        grasm_syntax::ast::Pattern::Tuple(ps, _) => {
+            for f in ps {
+                inline_bound_pattern(f, out);
+            }
+        }
+        // `A | B` may not bind names.
+        _ => {}
+    }
+}
+
+fn inline_bound_expr(e: &Expr, out: &mut Vec<String>) {
+    match e {
+        Expr::Str(pieces, _) => {
+            for p in pieces {
+                if let grasm_syntax::ast::StrPiece::Expr(x) = p {
+                    inline_bound_expr(x, out);
+                }
+            }
+        }
+        Expr::List(items, _) | Expr::Tuple(items, _) => {
+            for i in items {
+                inline_bound_expr(i, out);
+            }
+        }
+        Expr::Map(pairs, _) => {
+            for (k, v) in pairs {
+                inline_bound_expr(k, out);
+                inline_bound_expr(v, out);
+            }
+        }
+        Expr::StructLit { fields, base, .. } => {
+            if let Some(b) = base {
+                inline_bound_expr(b, out);
+            }
+            for (_, v) in fields {
+                inline_bound_expr(v, out);
+            }
+        }
+        Expr::Index { recv, index, .. } => {
+            inline_bound_expr(recv, out);
+            inline_bound_expr(index, out);
+        }
+        Expr::Field { recv, .. } => inline_bound_expr(recv, out),
+        Expr::Unary { expr, .. } => inline_bound_expr(expr, out),
+        Expr::Binary { lhs, rhs, .. } => {
+            inline_bound_expr(lhs, out);
+            inline_bound_expr(rhs, out);
+        }
+        Expr::Range { start, end, .. } => {
+            inline_bound_expr(start, out);
+            inline_bound_expr(end, out);
+        }
+        Expr::Block(b) => {
+            for s in &b.stmts {
+                inline_bound_stmt(s, out);
+            }
+        }
+        Expr::If {
+            cond,
+            then_block,
+            else_branch,
+            ..
+        } => {
+            inline_bound_expr(cond, out);
+            for s in &then_block.stmts {
+                inline_bound_stmt(s, out);
+            }
+            match else_branch.as_deref() {
+                None => {}
+                Some(grasm_syntax::ast::ElseBranch::Else(b)) => {
+                    for s in &b.stmts {
+                        inline_bound_stmt(s, out);
+                    }
+                }
+                Some(grasm_syntax::ast::ElseBranch::ElseIf(x)) => inline_bound_expr(x, out),
+            }
+        }
+        Expr::Match {
+            scrutinee, arms, ..
+        } => {
+            inline_bound_expr(scrutinee, out);
+            for a in arms {
+                inline_bound_pattern(&a.pattern, out);
+                if let Some(g) = &a.guard {
+                    inline_bound_expr(g, out);
+                }
+                inline_bound_expr(&a.body, out);
+            }
+        }
+        Expr::Call { callee, args, .. } => {
+            inline_bound_expr(callee, out);
+            for a in args {
+                inline_bound_expr(a, out);
+            }
+        }
+        Expr::MethodCall { recv, args, .. } => {
+            inline_bound_expr(recv, out);
+            for a in args {
+                inline_bound_expr(a, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn inline_stmt_ok(st: &Stmt, budget: &mut i32) -> bool {
+    *budget -= 1;
+    if *budget < 0 {
+        return false;
+    }
+    match st {
+        Stmt::Let { init, .. } => inline_expr_ok(init, budget),
+        Stmt::LetTuple { init, .. } => inline_expr_ok(init, budget),
+        Stmt::Assign { target, value, .. } => {
+            inline_expr_ok(target, budget) && inline_expr_ok(value, budget)
+        }
+        Stmt::Expr(e) => inline_expr_ok(e, budget),
+        Stmt::Break(_) | Stmt::Continue(_) => true,
+        Stmt::While { cond, body, .. } => {
+            inline_expr_ok(cond, budget) && body.stmts.iter().all(|s| inline_stmt_ok(s, budget))
+        }
+        Stmt::For { iter, body, .. } => {
+            inline_expr_ok(iter, budget) && body.stmts.iter().all(|s| inline_stmt_ok(s, budget))
+        }
+        // A `return` anywhere but the tail leaves the caller, not the splice.
+        // A thread, a handler or a `spawn` is frame-shaped and is not moved.
+        _ => false,
+    }
+}
+
+fn inline_expr_ok(e: &Expr, budget: &mut i32) -> bool {
+    *budget -= 1;
+    if *budget < 0 {
+        return false;
+    }
+    match e {
+        Expr::Int(..) | Expr::Float(..) | Expr::Bool(..) | Expr::Ident(_) => true,
+        Expr::Str(pieces, _) => pieces.iter().all(|p| match p {
+            grasm_syntax::ast::StrPiece::Expr(x) => inline_expr_ok(x, budget),
+            _ => true,
+        }),
+        Expr::List(items, _) | Expr::Tuple(items, _) => {
+            items.iter().all(|i| inline_expr_ok(i, budget))
+        }
+        Expr::Map(pairs, _) => pairs
+            .iter()
+            .all(|(k, v)| inline_expr_ok(k, budget) && inline_expr_ok(v, budget)),
+        Expr::StructLit { fields, base, .. } => {
+            base.as_deref()
+                .is_none_or(|b| inline_expr_ok(b, budget))
+                && fields.iter().all(|(_, v)| inline_expr_ok(v, budget))
+        }
+        Expr::Index { recv, index, .. } => {
+            inline_expr_ok(recv, budget) && inline_expr_ok(index, budget)
+        }
+        Expr::Field { recv, .. } => inline_expr_ok(recv, budget),
+        Expr::Unary { expr, .. } => inline_expr_ok(expr, budget),
+        Expr::Binary { lhs, rhs, .. } => {
+            inline_expr_ok(lhs, budget) && inline_expr_ok(rhs, budget)
+        }
+        Expr::Range { start, end, .. } => {
+            inline_expr_ok(start, budget) && inline_expr_ok(end, budget)
+        }
+        Expr::Block(b) => b.stmts.iter().all(|s| inline_stmt_ok(s, budget)),
+        Expr::If {
+            cond,
+            then_block,
+            else_branch,
+            ..
+        } => {
+            inline_expr_ok(cond, budget)
+                && then_block.stmts.iter().all(|s| inline_stmt_ok(s, budget))
+                && match else_branch.as_deref() {
+                    None => true,
+                    Some(grasm_syntax::ast::ElseBranch::Else(b)) => {
+                        b.stmts.iter().all(|s| inline_stmt_ok(s, budget))
+                    }
+                    Some(grasm_syntax::ast::ElseBranch::ElseIf(x)) => inline_expr_ok(x, budget),
+                }
+        }
+        Expr::Match {
+            scrutinee, arms, ..
+        } => {
+            inline_expr_ok(scrutinee, budget)
+                && arms.iter().all(|a| {
+                    a.guard.as_ref().is_none_or(|g| inline_expr_ok(g, budget))
+                        && inline_expr_ok(&a.body, budget)
+                })
+        }
+        // `fail` returns from whatever function it is written in, which after
+        // a splice is the caller. Everything else is an ordinary call.
+        Expr::Call { callee, args, .. } => {
+            if matches!(&**callee, Expr::Ident(id) if id.name == "fail") {
+                return false;
+            }
+            inline_expr_ok(callee, budget) && args.iter().all(|a| inline_expr_ok(a, budget))
+        }
+        Expr::MethodCall { recv, args, .. } => {
+            inline_expr_ok(recv, budget) && args.iter().all(|a| inline_expr_ok(a, budget))
+        }
+        // A closure captures the frame it was written in, a `try` and a
+        // `region` are frame-shaped, and anything added later is unknown.
+        _ => false,
+    }
+}
+
 fn param_is_borrowed(name: &str, body: &grasm_syntax::ast::Block) -> bool {
     let mut ok = true;
     scan_borrow_block(name, body, &mut ok);
@@ -8250,6 +8593,137 @@ this case",
         Ok(Some((list, VType::List(Box::new(elem_t)))))
     }
 
+    /// Splices a small function's body in place of the call to it.
+    ///
+    /// `Ok(None)` means "not spliced" and the caller emits an ordinary call;
+    /// `Ok(Some(out))` means the body was compiled here and `out` is its
+    /// value, which may itself be `None` if the body left by some other path.
+    ///
+    /// The arguments are bound twice: once to a hidden name in the caller's
+    /// scope, and once from there to the parameter's own name. One binding
+    /// would be wrong whenever a parameter shadows something a later argument
+    /// reads — `f(x, x)` where the first parameter is itself called `x` would
+    /// pass the new binding as the second argument.
+    fn try_inline(&mut self, name: &str, args: &[Expr]) -> CResult<Option<InlineOut>> {
+        if self.inline_depth >= INLINE_DEPTH {
+            return Ok(None);
+        }
+        // A local of the same name is a value being called, not this
+        // function.
+        if self.lookup(name).is_some() {
+            return Ok(None);
+        }
+        let key = format!("{}::{}", self.cg.current_module, name);
+        let Some((decl, bound)) = self.cg.inlinable.get(&key).cloned() else {
+            return Ok(None);
+        };
+        // A spliced body keeps its own names, and several of this backend's
+        // optimisations are keyed by name rather than by binding: a list
+        // being filled in a loop is pinned under the name it is written as,
+        // and a `push` to any `out` in that loop goes to the pinned buffer.
+        // `tnet_encode`'s `var out` spliced into a loop whose own `out` was
+        // pinned wrote the callee's bytes into the caller's list — right
+        // output for a list, wrong for a dictionary, and no other check saw
+        // it. Ordinary shadowing is fine, because the scope table is keyed by
+        // binding; it is the two name-keyed caches that have to agree, so a
+        // body is called rather than spliced when one of its names is pinned
+        // or is a loop's append target here.
+        if bound
+            .iter()
+            .any(|n| self.pinned_list(n).is_some() || self.append_state(n).is_some())
+        {
+            return Ok(None);
+        }
+        if decl.params.len() != args.len() {
+            return Ok(None);
+        }
+        // Exactly the declared types, because the call path converts an
+        // integer argument to a float parameter on the way in and a `let`
+        // spliced here does not.
+        for (p, a) in decl.params.iter().zip(args) {
+            let want = self.cg.vtype_of(&p.ty)?;
+            let Ok(got) = self.probe_type(a) else {
+                return Ok(None);
+            };
+            if got != want {
+                return Ok(None);
+            }
+        }
+        let span = decl.span;
+        self.inline_seq += 1;
+        let seq = self.inline_seq;
+        let mut stmts: Vec<Stmt> = Vec::with_capacity(decl.params.len() * 2 + decl.body.stmts.len());
+        for (i, a) in args.iter().enumerate() {
+            stmts.push(Stmt::Let {
+                mutable: false,
+                name: Ident {
+                    name: format!(" in{seq}_{i}"),
+                    span,
+                },
+                ty: None,
+                init: a.clone(),
+                span,
+            });
+        }
+        for (i, p) in decl.params.iter().enumerate() {
+            stmts.push(Stmt::Let {
+                mutable: false,
+                name: p.name.clone(),
+                ty: Some(p.ty.clone()),
+                init: Expr::Ident(Ident {
+                    name: format!(" in{seq}_{i}"),
+                    span,
+                }),
+                span,
+            });
+        }
+        stmts.extend(decl.body.stmts.iter().cloned());
+        let block = Expr::Block(grasm_syntax::ast::Block { stmts, span });
+        // The call site is told the *declared* return type, not whatever the
+        // body's tail happened to infer. `fn overlap(..) -> Option[Span]`
+        // ending in `None` infers `Option[Any]`, and a `match` on that reads
+        // the payload as `Any` and refuses the field access the same call
+        // through a symbol compiles. The declared type is what every other
+        // caller of this function is given.
+        let declared = match &decl.ret {
+            Some(t) => self.cg.vtype_of(t)?,
+            None => return Ok(None),
+        };
+        self.inline_depth += 1;
+        let out = self.eval_expr_expecting_opt(&block, Some(&declared));
+        self.inline_depth -= 1;
+        let Some((v, vt)) = out? else {
+            // The body left rather than produced a value — `fn boom() -> i64
+            // { panic("mid") }`. A *call* to it returns to a live block and
+            // the caller carries on; a splice puts the trap in the caller's
+            // own block, so control has to be told it left, the way every
+            // other diverging expression here does. Without it the caller
+            // wrote the rest of its work into a block that was already
+            // finished, and Cranelift's verifier refused the function.
+            if self.is_filled() && !self.dead {
+                self.enter_dead_block();
+            }
+            return Ok(Some(None));
+        };
+        if vt == declared {
+            return Ok(Some(Some((v, vt))));
+        }
+        // An integer body under a float signature converts on the way out,
+        // exactly as it does when the call is a real one.
+        if declared == VType::F64 && vt == VType::I64 {
+            let f = self.b.ins().fcvt_from_sint(types::F64, v);
+            return Ok(Some(Some((f, VType::F64))));
+        }
+        // Same machine type, more precise name: a variant, an option or a
+        // list whose element type the body could not see. Anything else is a
+        // shape this does not understand, and reporting the body's own type
+        // is what it did before — so keep it rather than guess.
+        if vt.cl() == declared.cl() && vt.boxed() == declared.boxed() {
+            return Ok(Some(Some((v, declared))));
+        }
+        Ok(Some(Some((v, vt))))
+    }
+
     fn eval_method(
         &mut self,
         recv: &Expr,
@@ -11182,6 +11656,12 @@ checker did",
             let boxed = self.box_value(av, &avt);
             let v = self.make_variant("Option", "Some", &[boxed])?;
             return Ok(Some((v, VType::Option(Box::new(avt)))));
+        }
+        // A small function spliced in rather than called. Nothing else
+        // knows how to do this: Cranelift has no inliner, so a call that
+        // survives to the backend is a real call.
+        if let Some(out) = self.try_inline(&id.name, args)? {
+            return Ok(out);
         }
         // A generic function has no symbol until a call site fixes its type
         // parameters, so probe the arguments and instantiate on demand.

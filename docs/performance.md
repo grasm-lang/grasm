@@ -112,6 +112,54 @@ times that was — and the bounds are type-checked before anything is emitted, s
 falling back to the loop cannot compute `(f()..g())` twice. Worth **1.42x on
 `sieve`**, 10.48 ms to 7.40 against Rust's 5.8. Done, 2026-09-20.
 
+**A small function is spliced into its caller.** Cranelift has no inliner, so
+every call a compiled program makes is a real call: arguments into registers,
+a stack-guard check if the function can reach itself, a return. Bounding it
+first by expanding one level of `fib`'s recursion by hand in the source said
+1.24x; doing it in the compiler, where the splice is an ordinary block and the
+backend's own constant folding sees through it, is worth **1.66x on `fib`**
+(11.50 ms to 6.91) and nothing measurable on the benchmarks that do not make
+many calls.
+
+The body is spliced as a block: two `let`s per argument — one to a hidden name
+in the caller's scope, one from there to the parameter's own name, so
+`f(x, x)` with a parameter also called `x` cannot read the binding it just
+made — then the callee's statements, with a trailing `return e` rewritten to
+`e`. Everything after that is the backend compiling an ordinary block, which
+is what makes this cheap to get right: scopes, releases and types are already
+its job.
+
+Deny by default. No generics, no effects, no `! E`, no `inout`, a declared
+return type, a tail that is an expression, and a body of at most 48 AST nodes
+containing no `return` other than that tail, no closure, no `with`, no
+`parallel`, no `spawn`, no `region`, no `try` and no `fail` — every one of
+those either leaves the caller or is shaped by the frame it was written in.
+The call site is told the *declared* return type rather than the body's:
+`fn overlap(..) -> Option[Span]` ending in `None` infers `Option[Any]`, and a
+`match` on that reads the payload as `Any`.
+
+Two levels of splicing is *slower* — `fib` 6.70 ms to 8.86 — because a body
+with two calls to itself grows fourfold at the second level, and the register
+pressure costs more than the calls it removes. One level.
+
+The defect worth recording: a spliced body keeps its own names, and two of
+this backend's optimisations are keyed by name rather than by binding — a list
+filled in a loop is pinned under the name it is written as. `tnet_encode`'s
+`var out`, spliced into a loop whose own `out` was pinned, wrote the callee's
+bytes into the caller's list. It produced the right answer for a list and the
+wrong one for a dictionary, which is why it took a differential run over 497
+programs to see. Ordinary shadowing is fine; a body whose names are pinned or
+are a loop's append target at the call site is called instead.
+
+The other one: a body that *leaves* rather than produces a value — `fn boom()
+-> i64 { panic("mid") }` — puts the trap in the caller's own block when it is
+spliced, where a call to it would have returned to a live one. The rest of
+`print("{boom()}")` was then written into a block nothing reaches and nothing
+terminated, and Cranelift refused the function. A block opened inside an
+expression that control left now gets its terminator at the end of the
+function, which costs a reachable program nothing: a filled block already has
+one. Done, 2026-09-20.
+
 **Things that were already fast** and do not need looking at again: scalar list
 indexing is pinned and inlined before a loop with an inline bounds check
 (`pin_loop_lists`); `bool` lists are one byte an element; a list of four or

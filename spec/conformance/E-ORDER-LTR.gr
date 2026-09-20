@@ -12,6 +12,10 @@
 //! arg
 //! [[1, 9]]
 //! 6 [[5], []] [0]
+//! once
+//! 8
+//! 8 4
+//! [7, 7, 7] [1, 2, 3]
 // Subexpressions evaluate left to right — including an assignment's target.
 //
 // The walk that writes a value is what evaluates the target's index, so doing
@@ -52,6 +56,42 @@ fn main() {
     var k = [[5], [6]]
     let taken = k[q.remove(0)].remove(0)
     print("{taken} {k} {q}")
+
+    // A call is a call however the backend chooses to compile it. A small
+    // function may be spliced into its caller instead of called, and the
+    // three things that can go wrong if it is are all visible from here.
+    //
+    // The argument is evaluated once, where it is written, not once per
+    // mention of the parameter in the body.
+    print("{twice(note("once", 4))}")
+    // A parameter may share a name with something the caller has bound, and
+    // the caller's binding is untouched by the call.
+    let n = 4
+    print("{twice(n)} {n}")
+    // And a callee's own local may share a name with a list the caller is
+    // filling in a loop, which is the shape that reaches furthest into a
+    // backend: `out` here is two different lists.
+    var out: [i64] = []
+    for v in [1, 2, 3] {
+        out.push(v)
+        let _ = filled()
+    }
+    print("{filled()} {out}")
+}
+
+// `n` is also a name `main` binds; `v + v` mentions the parameter twice.
+fn twice(n: i64) -> i64 {
+    let v = n
+    return v + v
+}
+
+// `out` is also a name `main` binds, and fills in a loop.
+fn filled() -> [i64] {
+    var out: [i64] = []
+    out.push(7)
+    out.push(7)
+    out.push(7)
+    return out
 }
 
 fn step(inout n: i64) -> i64 {
