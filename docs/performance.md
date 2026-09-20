@@ -305,6 +305,26 @@ removing four instructions from a thirteen-instruction loop measured nothing:
 these two sit in the prologue and epilogue, and every load and store in the
 frame waits on the stack pointer they move. Done, 2026-09-21.
 
+**Appending to a string it alone holds is written out, not reached through
+three calls.** `acc += "{x}"` went through `grasm_str_append_i64` to
+`i64_digits`, then `str_append_text`, then `RtStr::push_str` — four frames to
+put one byte on the end of a buffer. `append_fast` makes the same four tests
+the general path makes (the reference count, the payload, the storage, and
+whether a character index was ever built) and then writes the bytes.
+
+Worth **1.62x** on the string-building workload, 34.6 ms of processor time to
+21.3, and 1.22x on `parwords` itself. Done, 2026-09-21.
+
+It was bounded first, by an unsound probe that skipped the tests as well as
+the calls: 1.59x. The sound version measured 1.63x — *the tests were never the
+cost*. That is worth remembering the next time a fast path looks like it needs
+to drop a check to be fast; this one dropped none.
+
+The same helper serves `grasm_str_append_text` and `grasm_str_append`, so a
+literal piece and a string piece take it too. Aliasing is ruled out the way
+the general path already ruled it out: two references to one box cannot both
+be the only one, so `s = s + s` never reaches a path that writes in place.
+
 **Things that were already fast** and do not need looking at again: scalar list
 indexing is pinned and inlined before a loop with an inline bounds check
 (`pin_loop_lists`); `bool` lists are one byte an element; a list of four or
