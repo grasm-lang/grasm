@@ -74,6 +74,32 @@ special case anywhere else because every list mutator already goes through
 immortal refcount never is. Worth 393,660 fewer allocations on `tree`
 (1,180,960 to 787,300) and 1.05x. Done, 2026-09-18.
 
+**A parameter the callee only reads needs no reference count.** Passing a
+collection to a function cost a retain at the call and a release at the
+callee's exit — an atomic pair, 10.1 ns, on a call that may do nothing but
+read one element. A parameter is *lent* instead of given when every mention of
+it in the callee's body is the receiver of an index or a field read
+(`param_is_borrowed`); anything else — returning it, storing it, handing it
+on, calling a method on it, capturing it in a closure, rebinding it — keeps the
+owning convention. Deny by default, so an unrecognised shape is owned.
+Measured on the mechanism: passing a collection **9.78 ns to 1.28**, the same
+as passing an `i64`; a call that also indexes it 9.66 to 2.84. On the
+benchmarks it is worth 1.07x on `tree` and 1.03x on `parwords`, and nothing on
+the ones that do not pass collections around. Done, 2026-09-20.
+
+Two defects on the way, both of which say something about the change. The
+first: a borrowed parameter must be skipped on *every* release path, and the
+`return` path is a separate one — with it missed, a program released a
+reference it never took, and `leakcheck` passed all 497 programs, because a
+premature free is not a leak. That is what `usecheck.sh` was built for. The
+second: a convention is a contract between two sides, so every place a
+function can be *reached* has to know about it. A function used as a value is
+reached through a wrapper, since the closure ABI has one shape for every
+function — and the wrapper forwarded the caller's reference to a callee that
+no longer released it. Two programs leaked, one of them 170,202 allocations.
+The wrapper is where the two conventions meet and is now where the release
+happens; the hidden stack-floor argument had already needed exactly this.
+
 **Things that were already fast** and do not need looking at again: scalar list
 indexing is pinned and inlined before a loop with an inline bounds check
 (`pin_loop_lists`); `bool` lists are one byte an element; a list of four or

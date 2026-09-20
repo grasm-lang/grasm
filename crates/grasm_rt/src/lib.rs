@@ -1516,7 +1516,9 @@ unsafe fn assert_alive(v: *mut RtVal, what: &str) {
         // `std::process::abort()` and build with `GRASM_KEEP_SYMBOLS=1`: macOS
         // writes a symbolicated report and the generated frames are named in
         // it. A Rust backtrace stops at the runtime boundary and says nothing.
-        rt_panic(&format!("use after free: {what} on a value already released"));
+        rt_panic(&format!(
+            "use after free: {what} on a value already released"
+        ));
     }
 }
 
@@ -8201,7 +8203,11 @@ mod poison_tests {
             let v = alloc(RtPayload::I64(9));
             inc(v);
             dec(v);
-            assert_ne!((*v).rc.load(Relaxed), POISON, "still held, but marked freed");
+            assert_ne!(
+                (*v).rc.load(Relaxed),
+                POISON,
+                "still held, but marked freed"
+            );
             assert!(matches!((*v).payload, RtPayload::I64(9)));
             dec(v);
         }

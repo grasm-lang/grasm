@@ -4,6 +4,7 @@
 //! 20 42 5
 //! [0, 10, 20, 30, 40] [[0, 10, 20, 30, 40]] [0, 10, 20, 30, 40]
 //! 100 8
+//! 50 [0, 10, 20, 30, 40]
 //! [0, 10, 20, 30, 40] 42
 type P = { v: i64, tag: str }
 
@@ -48,6 +49,14 @@ fn make() -> [i64] {
     return [7, 8, 9]
 }
 
+// Reached through a *function value* the parameter is still lent, but the
+// closure ABI has one shape for every function, so no call site can know it.
+// The wrapper that bridges the two conventions releases what the callee did
+// not, or every such call leaks its argument.
+fn last_of(xs: [i64], n: i64) -> i64 {
+    return xs[n - 1]
+}
+
 fn main() {
     let xs = [1, 2]
     // A plain parameter does not consume the caller's binding.
@@ -61,6 +70,13 @@ fn main() {
     print("{peek(ys, 2)} {field(p)} {size(ys)}")
     print("{give_back(ys)} {stash(ys)} {relay(ys)}")
     print("{sum2(ys, 5)} {peek(make(), 1)}")
+    let fns = [peek, last_of]
+    var through = 0
+    for f in fns {
+        through = through + f(ys, 3)
+    }
+    print("{through} {ys}")
+
     // Everything the caller lent is still its own afterwards.
     print("{ys} {p.v}")
 }

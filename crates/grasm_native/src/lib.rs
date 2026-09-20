@@ -246,6 +246,11 @@ struct FnSig {
     modes: Vec<ParamMode>,
     ret: VType,
     id: FuncId,
+    /// Per parameter: the callee only reads it, so no reference changes hands.
+    ///
+    /// Both the declaration and every call site read it from here, so the two
+    /// cannot disagree about who owns what. See `param_is_borrowed`.
+    borrowed: Vec<bool>,
     /// Takes this thread's stack floor as a hidden first argument.
     ///
     /// Set for exactly the functions that can reach themselves, which are the
@@ -1618,6 +1623,7 @@ arguments nor the type this is bound to",
         self.fns.insert(
             key.clone(),
             FnSig {
+                borrowed: vec![false; params.len()],
                 is_extern: false,
                 params,
                 modes,
@@ -1703,6 +1709,7 @@ arguments nor the type this is bound to",
                         FnSig {
                             id,
                             is_extern: true,
+                            borrowed: vec![false; param_ts.len()],
                             params: param_ts,
                             modes: e.params.iter().map(|p| p.mode).collect(),
                             ret: ret_t,
@@ -1777,6 +1784,16 @@ arguments nor the type this is bound to",
                             span: f.span,
                             what: format!("(module error: {e})"),
                         })?;
+                    let borrowed: Vec<bool> = params
+                        .iter()
+                        .zip(&modes)
+                        .zip(&f.params)
+                        .map(|((t, m), p)| {
+                            t.boxed()
+                                && *m != ParamMode::Inout
+                                && param_is_borrowed(&p.name.name, &f.body)
+                        })
+                        .collect();
                     self.fns.insert(
                         key,
                         FnSig {
@@ -1786,6 +1803,7 @@ arguments nor the type this is bound to",
                             ret,
                             id,
                             takes_floor,
+                            borrowed,
                         },
                     );
                 }
@@ -1914,6 +1932,7 @@ arguments nor the type this is bound to",
         let sig_ret = self.fns[&key].ret.clone();
         let func_id = self.fns[&key].id;
         let takes_floor = self.fns[&key].takes_floor;
+        let sig_borrowed = self.fns[&key].borrowed.clone();
         let ptr_ty = self.module.target_config().pointer_type();
 
         let mut ctx = self.module.make_context();
@@ -1960,6 +1979,7 @@ arguments nor the type this is bound to",
             wrote_through_ref: false,
             task_scopes: Vec::new(),
             floor: None,
+            borrowed_vars: std::collections::HashSet::new(),
         };
 
         let entry = fcx.b.create_block();
@@ -2027,6 +2047,10 @@ arguments nor the type this is bound to",
             } else {
                 let var = fcx.new_var(&vt);
                 fcx.b.def_var(var, entry_params[i]);
+                if sig_borrowed.get(i).copied().unwrap_or(false) {
+                    // Lent, not given: nothing to release on the way out.
+                    fcx.borrowed_vars.insert(var.as_u32());
+                }
                 fcx.bind(&p.name.name, var, vt);
             }
         }
@@ -2529,6 +2553,21 @@ operation's",
         }
         let inst = b.ins().call(target, &call_args);
         let results: Vec<Value> = b.inst_results(inst).to_vec();
+        // A parameter the target only *reads* is lent, not given: the target
+        // releases nothing. Every direct call site knows that and either
+        // passes a binding it already holds or releases the temporary
+        // afterwards — but a call through a function value cannot know it,
+        // because the closure ABI has one shape for every function. So the
+        // wrapper, which is where the two conventions meet, does it: it was
+        // handed a reference and the target did not consume it.
+        for (i, p) in params[1..].iter().enumerate() {
+            if sig_info.borrowed.get(i).copied().unwrap_or(false) {
+                let f = self
+                    .module
+                    .declare_func_in_func(self.runtime["grasm_val_dec"], b.func);
+                b.ins().call(f, &[*p]);
+            }
+        }
         // The wrapper owns the arguments it was handed, and C released
         // nothing: free the string copies and release the boxes.
         for (v, is_copy) in c_temps {
@@ -2600,6 +2639,7 @@ operation's",
             wrote_through_ref: false,
             task_scopes: Vec::new(),
             floor: None,
+            borrowed_vars: std::collections::HashSet::new(),
         };
         let entry = fcx.b.create_block();
         fcx.b.append_block_params_for_function_params(entry);
@@ -2698,6 +2738,7 @@ operation's",
             wrote_through_ref: false,
             task_scopes: Vec::new(),
             floor: None,
+            borrowed_vars: std::collections::HashSet::new(),
         };
         let entry = fcx.b.create_block();
         fcx.b.append_block_params_for_function_params(entry);
@@ -2839,6 +2880,7 @@ operation's",
             wrote_through_ref: false,
             task_scopes: Vec::new(),
             floor: None,
+            borrowed_vars: std::collections::HashSet::new(),
         };
         let entry = fcx.b.create_block();
         fcx.b.append_block_params_for_function_params(entry);
@@ -3178,6 +3220,9 @@ struct FnCx<'a, 'm> {
     /// lexically known, and [T-TASK-CAPTURE] guarantees they only touch
     /// bindings that outlive the block.
     task_scopes: Vec<(Variable, usize)>,
+    /// Parameters the caller lent rather than gave: they are not released on
+    /// the way out, because no reference changed hands. See `param_is_borrowed`.
+    borrowed_vars: std::collections::HashSet<u32>,
     /// This function's copy of the thread's stack floor, when it was handed
     /// one. A function that was not needs to ask the runtime before it can
     /// call one that was.
@@ -4519,6 +4564,185 @@ fn indexed_only_lists(block: &grasm_syntax::ast::Block) -> Vec<String> {
     indexed
 }
 
+/// Whether a boxed parameter is only ever *read*, so that the caller need not
+/// lend it a reference and the callee need not release one.
+///
+/// Passing a collection to a function costs 8.52 ns against 1.26 for passing
+/// an integer, measured on a loop that calls a function doing nothing with it:
+/// the caller adds a reference because reading a boxed name yields one, and
+/// the callee releases it on the way out. Neither is needed when the callee
+/// only looks at the value — the caller's own binding already holds it open
+/// for the length of the call.
+///
+/// Deny by default. The parameter qualifies only when every mention of its
+/// name is the receiver of an index or a field read — `xs[i]`, `n.value` —
+/// which cannot make the value outlive the call. A bare mention could be
+/// returned, stored, captured or handed on, and any of those would leave the
+/// callee holding a reference nobody lent it, so a bare mention disqualifies
+/// it. So does rebinding the name, since later mentions would then be a
+/// different value.
+fn param_is_borrowed(name: &str, body: &grasm_syntax::ast::Block) -> bool {
+    let mut ok = true;
+    scan_borrow_block(name, body, &mut ok);
+    ok
+}
+
+fn scan_borrow_block(name: &str, b: &grasm_syntax::ast::Block, ok: &mut bool) {
+    for stmt in &b.stmts {
+        if !*ok {
+            return;
+        }
+        match stmt {
+            Stmt::Let { name: n, init, .. } => {
+                if n.name == name {
+                    *ok = false;
+                }
+                scan_borrow_expr(name, init, ok);
+            }
+            Stmt::LetTuple { names, init, .. } => {
+                if names.iter().any(|n| n.name == name) {
+                    *ok = false;
+                }
+                scan_borrow_expr(name, init, ok);
+            }
+            Stmt::Assign { target, value, .. } => {
+                scan_borrow_expr(name, target, ok);
+                scan_borrow_expr(name, value, ok);
+            }
+            Stmt::Expr(e) | Stmt::Return(Some(e), _) => scan_borrow_expr(name, e, ok),
+            Stmt::Return(None, _) | Stmt::Break(_) | Stmt::Continue(_) => {}
+            Stmt::While { cond, body, .. } => {
+                scan_borrow_expr(name, cond, ok);
+                scan_borrow_block(name, body, ok);
+            }
+            Stmt::For {
+                var, iter, body, ..
+            } => {
+                if var.name == name {
+                    *ok = false;
+                }
+                scan_borrow_expr(name, iter, ok);
+                scan_borrow_block(name, body, ok);
+            }
+            // A thread or a handler could outlive the call; not read.
+            Stmt::Parallel { .. } | Stmt::Spawn { .. } | Stmt::With { .. } => *ok = false,
+        }
+    }
+}
+
+fn scan_borrow_expr(name: &str, e: &Expr, ok: &mut bool) {
+    if !*ok {
+        return;
+    }
+    match e {
+        // The two approved shapes: the value is read through, not taken.
+        Expr::Index { recv, index, .. } if is_named(recv, name) => {
+            scan_borrow_expr(name, index, ok)
+        }
+        Expr::Field { recv, .. } if is_named(recv, name) => {}
+        // A bare mention could go anywhere.
+        Expr::Ident(id) if id.name == name => *ok = false,
+        Expr::Int(..) | Expr::Float(..) | Expr::Bool(..) | Expr::Ident(_) => {}
+        Expr::Str(pieces, _) => {
+            for p in pieces {
+                if let grasm_syntax::ast::StrPiece::Expr(x) = p {
+                    scan_borrow_expr(name, x, ok);
+                }
+            }
+        }
+        Expr::List(items, _) | Expr::Tuple(items, _) => {
+            for i in items {
+                scan_borrow_expr(name, i, ok);
+            }
+        }
+        Expr::Map(pairs, _) => {
+            for (k, v) in pairs {
+                scan_borrow_expr(name, k, ok);
+                scan_borrow_expr(name, v, ok);
+            }
+        }
+        Expr::StructLit { fields, base, .. } => {
+            if let Some(b) = base {
+                scan_borrow_expr(name, b, ok);
+            }
+            for (_, v) in fields {
+                scan_borrow_expr(name, v, ok);
+            }
+        }
+        Expr::Index { recv, index, .. } => {
+            scan_borrow_expr(name, recv, ok);
+            scan_borrow_expr(name, index, ok);
+        }
+        Expr::Field { recv, .. } => scan_borrow_expr(name, recv, ok),
+        Expr::Unary { expr, .. } => scan_borrow_expr(name, expr, ok),
+        Expr::Binary { lhs, rhs, .. } => {
+            scan_borrow_expr(name, lhs, ok);
+            scan_borrow_expr(name, rhs, ok);
+        }
+        Expr::Range { start, end, .. } => {
+            scan_borrow_expr(name, start, ok);
+            scan_borrow_expr(name, end, ok);
+        }
+        Expr::Block(b) => scan_borrow_block(name, b, ok),
+        Expr::If {
+            cond,
+            then_block,
+            else_branch,
+            ..
+        } => {
+            scan_borrow_expr(name, cond, ok);
+            scan_borrow_block(name, then_block, ok);
+            match else_branch.as_deref() {
+                None => {}
+                Some(grasm_syntax::ast::ElseBranch::Else(b)) => scan_borrow_block(name, b, ok),
+                Some(grasm_syntax::ast::ElseBranch::ElseIf(x)) => scan_borrow_expr(name, x, ok),
+            }
+        }
+        Expr::Match {
+            scrutinee, arms, ..
+        } => {
+            scan_borrow_expr(name, scrutinee, ok);
+            for arm in arms {
+                if let Some(g) = &arm.guard {
+                    scan_borrow_expr(name, g, ok);
+                }
+                scan_borrow_expr(name, &arm.body, ok);
+            }
+        }
+        // A call is fine as long as the parameter is not what is handed to
+        // it: the callee would take ownership of anything it is passed, and a
+        // bare mention below refuses. The call itself keeps nothing.
+        Expr::Call { callee, args, .. } => {
+            scan_borrow_expr(name, callee, ok);
+            for a in args {
+                scan_borrow_expr(name, a, ok);
+            }
+        }
+        // A method *on* the parameter is refused rather than allow-listed:
+        // some read and some take, and the difference is not visible here.
+        Expr::MethodCall { recv, args, .. } => {
+            if is_named(recv, name) {
+                *ok = false;
+                return;
+            }
+            scan_borrow_expr(name, recv, ok);
+            for a in args {
+                scan_borrow_expr(name, a, ok);
+            }
+        }
+        Expr::Region(b) | Expr::Unsafe(b) => scan_borrow_block(name, b, ok),
+        // A closure could hold the value after the call returns.
+        Expr::Closure { .. } => *ok = false,
+        // Anything not named above — a `try`, and whatever is added later —
+        // is refused, because a wrong answer here frees a live value.
+        _ => *ok = false,
+    }
+}
+
+fn is_named(e: &Expr, name: &str) -> bool {
+    matches!(e, Expr::Ident(id) if id.name == name)
+}
+
 fn scan_uses_block(b: &grasm_syntax::ast::Block, indexed: &mut Vec<String>, bad: &mut Vec<String>) {
     for stmt in &b.stmts {
         match stmt {
@@ -4674,7 +4898,7 @@ impl FnCx<'_, '_> {
     fn pop_scope_with_decs(&mut self) {
         let scope = self.vars.pop().unwrap();
         for (_, (var, vt)) in scope {
-            if vt.boxed() {
+            if vt.boxed() && !self.borrowed_vars.contains(&var.as_u32()) {
                 let v = self.b.use_var(var);
                 self.call_rt("grasm_val_dec", &[v]);
             }
@@ -4710,7 +4934,7 @@ impl FnCx<'_, '_> {
             .flat_map(|sc| sc.values().cloned())
             .collect();
         for (var, vt) in live {
-            if vt.boxed() {
+            if vt.boxed() && !self.borrowed_vars.contains(&var.as_u32()) {
                 let v = self.b.use_var(var);
                 self.call_rt("grasm_val_dec", &[v]);
             }
@@ -4797,6 +5021,13 @@ impl FnCx<'_, '_> {
         let inout_vars: Vec<Variable> = self.inout_slots.iter().map(|(_, v, _)| *v).collect();
         for (var, vt) in all {
             if inout_vars.contains(&var) {
+                continue;
+            }
+            // A parameter the caller lent rather than gave: no reference of
+            // this function's own, so nothing to release. Leaving by `return`
+            // comes through here, which is how the first version of this
+            // released a borrow it never took and freed the caller's list.
+            if self.borrowed_vars.contains(&var.as_u32()) {
                 continue;
             }
             if vt.boxed() {
@@ -4992,6 +5223,17 @@ impl FnCx<'_, '_> {
             // from the stack on every element.
             if self.pinned_list(&name).is_some() {
                 continue;
+            }
+            // A parameter the caller lent is not ours to copy. Pinning goes
+            // through `cow_list`, which replaces a list it does not uniquely
+            // own and consumes the reference it was given — and a lent
+            // parameter was given none, so the caller's value is released out
+            // from under it. `peek(xs, i)` has no loop and was fine; `depth`,
+            // whose `while` indexes its parameter, freed the caller's list.
+            if let Some((var, _)) = self.lookup(&name) {
+                if self.borrowed_vars.contains(&var.as_u32()) {
+                    continue;
+                }
             }
             let Some((var, VType::List(elem))) = self.lookup(&name) else {
                 continue;
@@ -8475,12 +8717,13 @@ this case",
                         qual = made?;
                     }
                     if let Some(sig) = self.cg.fns.get(&qual) {
-                        let (fid, params, modes, ret, callee_floor) = (
+                        let (fid, params, modes, ret, callee_floor, callee_borrowed) = (
                             sig.id,
                             sig.params.clone(),
                             sig.modes.clone(),
                             sig.ret.clone(),
                             sig.takes_floor,
+                            sig.borrowed.clone(),
                         );
                         // `inout` marshals the same way here as in a
                         // same-module call: the caller's variable goes through
@@ -8559,6 +8802,22 @@ this case",
                         }
                         // The hidden stack floor goes ahead of the declared
                         // arguments; see `floor_arg`.
+                        // A parameter the callee only reads releases nothing
+                        // on the other side, so the caller does it here. This
+                        // path does not take the shortcut the plain-call path
+                        // does; it only has to stay correct.
+                        let lent: Vec<Value> = callee_borrowed
+                            .iter()
+                            .enumerate()
+                            .filter(|(k, b)| {
+                                **b
+                                    && params.get(*k).map(|t| t.boxed()).unwrap_or(false)
+                                    // An `inout` slot is a stack address, not
+                                    // a box; releasing one corrupts the frame.
+                                    && modes.get(*k).copied() != Some(ParamMode::Inout)
+                            })
+                            .filter_map(|(k, _)| vals.get(k).copied())
+                            .collect();
                         if callee_floor {
                             let f = self.floor_arg();
                             vals.insert(0, f);
@@ -8566,6 +8825,9 @@ this case",
                         let fref = self.cg.module.declare_func_in_func(fid, self.b.func);
                         let inst = self.b.ins().call(fref, &vals);
                         let results: Vec<Value> = self.b.inst_results(inst).to_vec();
+                        for v in lent {
+                            self.call_rt("grasm_val_dec", &[v]);
+                        }
                         for (slot, var, vt) in inout_args {
                             let updated = self.b.ins().stack_load(vt.cl(), slot, 0);
                             self.b.def_var(var, updated);
@@ -9486,13 +9748,14 @@ this case",
                         .cloned(),
                 };
                 if let Some(sig) = resolved {
-                    let (fid, params, modes, ret, is_extern, callee_floor) = (
+                    let (fid, params, modes, ret, is_extern, callee_floor, callee_borrowed) = (
                         sig.id,
                         sig.params.clone(),
                         sig.modes.clone(),
                         sig.ret.clone(),
                         sig.is_extern,
                         sig.takes_floor,
+                        sig.borrowed.clone(),
                     );
                     let ptr_ty = self.cg.module.target_config().pointer_type();
                     let mut vals: Vec<Value> = Vec::with_capacity(args.len() + 1);
@@ -9577,6 +9840,17 @@ this case",
                     }
                     let mut arg_slots: Vec<(cranelift_codegen::ir::StackSlot, Variable, VType)> =
                         Vec::new();
+                    // Temporaries passed to a parameter the callee only reads.
+                    let mut lent_temps: Vec<Value> = Vec::new();
+                    // The receiver was evaluated owned above. If the callee
+                    // only reads it, nothing on the other side releases it.
+                    if callee_borrowed.first().copied().unwrap_or(false)
+                        && params.first().map(|t| t.boxed()).unwrap_or(false)
+                        && modes.first().copied() != Some(ParamMode::Inout)
+                        && !is_extern
+                    {
+                        lent_temps.push(rv);
+                    }
                     for (i, (a, want)) in args.iter().zip(params.iter().skip(1)).enumerate() {
                         if modes.get(i + 1).copied() == Some(ParamMode::Inout) {
                             let Expr::Ident(aid) = a else {
@@ -9617,6 +9891,18 @@ this case",
                             arg_slots.push((slot, avar, avt));
                             continue;
                         }
+                        // Lent rather than given; see `param_is_borrowed`.
+                        // The receiver is parameter zero on this path.
+                        if callee_borrowed.get(i + 1).copied().unwrap_or(false) {
+                            if let Expr::Ident(n) = a {
+                                if let Some((var, vt)) = self.lookup(&n.name) {
+                                    if vt.boxed() && &vt == want {
+                                        vals.push(self.b.use_var(var));
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
                         let (mut v, vt) = self.eval_expr_expecting(a, Some(want))?;
                         if *want == VType::F64 && vt == VType::I64 {
                             v = self.b.ins().fcvt_from_sint(types::F64, v);
@@ -9630,6 +9916,9 @@ this case",
                             vals.push(p);
                             continue;
                         }
+                        if vt.boxed() && callee_borrowed.get(i + 1).copied().unwrap_or(false) {
+                            lent_temps.push(v);
+                        }
                         vals.push(v);
                     }
                     if callee_floor {
@@ -9639,6 +9928,9 @@ this case",
                     let fref = self.cg.module.declare_func_in_func(fid, self.b.func);
                     let inst = self.b.ins().call(fref, &vals);
                     let results: Vec<Value> = self.b.inst_results(inst).to_vec();
+                    for v in lent_temps {
+                        self.call_rt("grasm_val_dec", &[v]);
+                    }
                     if let Some((slot, rvar, rvt)) = recv_slot {
                         let updated = self.b.ins().stack_load(rvt.cl(), slot, 0);
                         self.b.def_var(rvar, updated);
@@ -10866,13 +11158,14 @@ type parameters",
             }
             return nope(id.span, format!("the function `{}` here", id.name));
         };
-        let (fid, params, modes, ret, is_extern, callee_floor) = (
+        let (fid, params, modes, ret, is_extern, callee_floor, callee_borrowed) = (
             sig.id,
             sig.params.clone(),
             sig.modes.clone(),
             sig.ret.clone(),
             sig.is_extern,
             sig.takes_floor,
+            sig.borrowed.clone(),
         );
         let ptr_ty = self.cg.module.target_config().pointer_type();
         let mut vals = Vec::with_capacity(args.len());
@@ -10890,6 +11183,8 @@ type parameters",
         // (arg index, boxed value, its type, the C pointer) for a C call's
         // pointer arguments, cleaned up after the call returns.
         let mut c_args: Vec<(usize, Value, VType, Value)> = Vec::new();
+        // Temporaries passed to a parameter the callee only reads.
+        let mut lent_temps: Vec<Value> = Vec::new();
         // (arg index, slot, root variable, root type, path) for an `inout`
         // argument that is a *place* rather than a plain variable.
         let mut inout_places: Vec<(
@@ -10957,6 +11252,21 @@ type parameters",
                 inout_args.push((i, slot, var, vt));
                 continue;
             }
+            // A parameter the callee only reads needs no reference of its
+            // own: the caller's binding holds the value open for the length
+            // of the call. A plain name is passed as it stands; anything else
+            // is a temporary that somebody must still release, so it is
+            // evaluated owned and released after the call returns.
+            if callee_borrowed.get(i).copied().unwrap_or(false) {
+                if let Expr::Ident(n) = a {
+                    if let Some((var, vt)) = self.lookup(&n.name) {
+                        if vt.boxed() && &vt == want {
+                            vals.push(self.b.use_var(var));
+                            continue;
+                        }
+                    }
+                }
+            }
             let (mut v, vt) = self.eval_expr_expecting(a, Some(want))?;
             if *want == VType::F64 && vt == VType::I64 {
                 v = self.b.ins().fcvt_from_sint(types::F64, v);
@@ -10991,6 +11301,9 @@ type parameters",
                 self.b.def_var(hold, v);
                 self.bind(&format!(" arg{i}"), hold, vt.clone());
                 v = self.b.use_var(hold);
+                if callee_borrowed.get(i).copied().unwrap_or(false) {
+                    lent_temps.push(v);
+                }
             }
             vals.push(v);
         }
@@ -11003,6 +11316,11 @@ type parameters",
         let fref = self.cg.module.declare_func_in_func(fid, self.b.func);
         let inst = self.b.ins().call(fref, &vals);
         let results: Vec<Value> = self.b.inst_results(inst).to_vec();
+        // Temporaries handed to a parameter the callee only reads: nobody on
+        // the other side released them.
+        for v in lent_temps {
+            self.call_rt("grasm_val_dec", &[v]);
+        }
         for (_, slot, var, vt) in inout_args {
             let updated = self.b.ins().stack_load(vt.cl(), slot, 0);
             self.b.def_var(var, updated);
