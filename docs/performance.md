@@ -526,6 +526,37 @@ memory operations in flight, which is what this loop is actually short of —
 removing one indexed *load* from the body saved 25% where removing four ALU
 instructions saved nothing.
 
+### Three more ceilings, 2026-09-21
+
+**Unrolling `sieve`'s inner loop: 1.00x.** `while j <= limit { flags[j] = false;
+j += i }` has an invariant step, so it can be unrolled by four with three
+extra index additions and a remainder loop. Written that way in the source:
+6.66 ms against 6.70. That loop scatters byte writes across two megabytes and
+waits on memory, not on issue slots, which is why removing a quarter of its
+bookkeeping changes nothing.
+
+**`matmul` has nothing left to find by profiling.** 250 of 452 samples are in
+the compiled function itself with no runtime call anywhere — the whole 1.8x is
+instruction quality. That agrees with the four probes already on file and
+means the row needs a vectoriser, which the Rust-with-vectorisers-off
+measurement values at 1.21x.
+
+**A `tree` with no boxes at all is *slower*.** The profile decomposition says
+allocation and release are about a third of `tree` and that inline aggregate
+storage — every `Node` stored in its parent's list rather than in a box of its
+own — would take three quarters of that, worth roughly 1.4x. A flat rewrite
+bounds it: the same program, same answer, nodes held in parallel scalar lists
+with an explicit stack and not one per-node box, runs **1.35x slower** (36.1 ms
+against 26.6). It is not a clean bound, because the explicit stack is work the
+recursive version does not do and `push_at` is a call the recursion is not
+making. But it is the only probe available, it does not support the
+decomposition's 1.4x, and an older note in this file claiming a flat rewrite
+reached 18.7 ms does not reproduce on today's compiler.
+
+That is the reason the representation change has not been started: every
+prediction made from a profile decomposition this session has been wrong by
+between six and twenty times, and this one has no measurement behind it.
+
 ## What the other implementations do, and which of it applies here
 
 Read against Rust's `hashbrown`, Zig's `std.hash_map`, Swift's SIL optimizer,
