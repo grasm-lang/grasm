@@ -3399,6 +3399,18 @@ pub unsafe extern "C" fn grasm_list_push_scalar(
     bits: i64,
     kind: i64,
 ) -> *mut RtVal {
+    // As in `grasm_list_push`: the uniquely held word list, written out
+    // rather than reached through `cow_list` and `ScalarData::push`.
+    if (*list).rc.load(Relaxed) == 1 {
+        if let RtPayload::ListScalar {
+            data: ScalarData::Words(v),
+            ..
+        } = &mut (*list).payload
+        {
+            v.push(bits);
+            return list;
+        }
+    }
     let target = cow_list(list);
     match &mut (*target).payload {
         RtPayload::ListScalar { data, .. } => data.push(bits),
@@ -3562,6 +3574,24 @@ pub extern "C" fn grasm_list_new() -> *mut RtVal {
 /// live runtime pointers.
 #[no_mangle]
 pub unsafe extern "C" fn grasm_list_push(list: *mut RtVal, elem: *mut RtVal) -> *mut RtVal {
+    // The list this call alone holds, with room where it already is. Written
+    // out rather than reached through `cow_list` and `ListData::push`, for
+    // the reason `append_fast` is written out: the tests are not the cost,
+    // the frames are. `cow_list` is a large function because of its clone
+    // path and does not inline, so every push paid a call to ask a question
+    // whose answer is two instructions.
+    if (*list).rc.load(Relaxed) == 1 {
+        if let RtPayload::List(ListData::Inline { vals, len }) = &mut (*list).payload {
+            if (*len as usize) < 4 {
+                vals[*len as usize] = elem;
+                *len += 1;
+                return list;
+            }
+        } else if let RtPayload::List(ListData::Heap(h)) = &mut (*list).payload {
+            h.push(elem);
+            return list;
+        }
+    }
     let target = cow_list(list);
     match &mut (*target).payload {
         RtPayload::List(items) => items.push(elem), // ownership transfers

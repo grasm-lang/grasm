@@ -325,6 +325,23 @@ literal piece and a string piece take it too. Aliasing is ruled out the way
 the general path already ruled it out: two references to one box cannot both
 be the only one, so `s = s + s` never reaches a path that writes in place.
 
+**Pushing onto a list it alone holds is written out too.** Every push called
+`cow_list` to ask whether this was the only holder — a question whose answer
+is two instructions, in a function large enough not to inline because of its
+clone path. The same treatment as `append_fast`, applied to
+`grasm_list_push` and `grasm_list_push_scalar`. Worth 1.03x on `tree` and
+nothing elsewhere, and the reason it is small is that the loops which push
+hardest already hold their buffer open through `grasm_list_append_begin`;
+only the paths that cannot be pinned — a recursive `build` — were paying.
+Done, 2026-09-21.
+
+Asked rustc to inline the three small helpers the profile shows as frames of
+their own — `inc`, `interned_int`, `interned_at` — and `tree` measured 1.02x,
+slightly *worse* than the push change alone. That is the second time an
+`#[inline]` request has measured negative where writing the path out measured
+positive. The difference is not the inlining: writing it out lets the specific
+case skip work the general function still has to be able to do.
+
 **Things that were already fast** and do not need looking at again: scalar list
 indexing is pinned and inlined before a loop with an inline bounds check
 (`pin_loop_lists`); `bool` lists are one byte an element; a list of four or
