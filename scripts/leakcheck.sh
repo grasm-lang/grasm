@@ -68,6 +68,7 @@ cd "$(dirname "$0")/.."
 # keeps its own assertions on and the runtime checks integer overflow.
 GRASM=${GRASM:-./target/release/grasm}
 . "$(dirname "$0")/lib/fresh.sh"
+. "$(dirname "$0")/lib/native.sh"
 fresh_or_stop "./target/release/grasm"
 WORK="${TMPDIR:-/tmp}/grasm_leak_$$"
 mkdir -p "$WORK"
@@ -89,9 +90,10 @@ programs=$(corpus_programs)
 for src in $programs; do
     grep -qE '^\s*(pub )?fn main\(' "$src" || continue
     grep -q '^//! expect: error$' "$src" && continue
-    name=$(echo "$src" | tr '/.' '__')
-    bin="$WORK/$name"
-    if ! build_log=$("$GRASM" build "$src" --native -o "$bin" 2>&1); then
+    # One reused file for every program in the corpus, so macOS admits a new
+    # executable once instead of ~500 times (see lib/native.sh).
+    bin="$WORK/p"
+    if ! build_log=$(grasm_build_native "$src" "$bin"); then
         # Counted and passed over in silence, so a program that stopped
         # compiling moved from "leak-free" to "not compiled" and the gate
         # still said PASS — about a program it had not run (F76).

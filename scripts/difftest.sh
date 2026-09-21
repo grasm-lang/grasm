@@ -12,6 +12,7 @@ cd "$(dirname "$0")/.."
 GRASM=${GRASM:-./target/release/grasm}
 . "$(dirname "$0")/lib/fresh.sh"
 . "$(dirname "$0")/lib/trace.sh"
+. "$(dirname "$0")/lib/native.sh"
 fresh_or_stop "./target/release/grasm"
 WORK="${TMPDIR:-/tmp}/grasm_difftest_$$"
 mkdir -p "$WORK"
@@ -42,10 +43,11 @@ for src in $programs; do
     if grep -q '^//! expect: error$' "$src"; then
         continue
     fi
-    name=$(echo "$src" | tr '/.' '__')
-    bin="$WORK/$name"
+    # One reused file for the whole corpus, so macOS admits a new executable
+    # once instead of once per program (see lib/native.sh).
+    bin="$WORK/p"
 
-    build_log=$("$GRASM" build "$src" --native -o "$bin" 2>&1)
+    build_log=$(grasm_build_native "$src" "$bin")
     if [ ! -x "$bin" ]; then
         reason=$(echo "$build_log" | grep -o "does not yet support [^—]*" | head -1)
         [ -z "$reason" ] && reason=$(echo "$build_log" | head -1)
