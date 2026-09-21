@@ -699,6 +699,34 @@ ours. Written out by hand in Grasm source it measures 1.059x, which would
 leave `fib` about 4% behind Rust rather than 10%. It is a real AST transform
 for six per cent of one benchmark, and it is recorded rather than built.
 
+### `wordfreq`'s `memmove`, chased twice and not caught — 2026-09-21
+
+`_platform_memmove` is the largest single item in `wordfreq`'s profile at 38
+samples — ahead of the map bump at 22 and four times the hash at 9 — and the
+words it copies are five to seven bytes. Two ways of removing it, both
+measured, both *slower*:
+
+**A short-piece fast append in the builder, 0.987x.** `grasm_str_build_text`,
+`_str`, `_i64`, `_bool` and `_f64` all append through `String::push_str`,
+which calls `memcpy` at any length. Writing a byte loop for pieces of sixteen
+bytes or fewer — the shape that was worth 1.62x in `append_fast` — measured
+`wordfreq` 1.03x slower and `parwords` 1.04x slower. The difference from
+`append_fast` is that there the win came from collapsing three frames; here
+there is one frame either way, and a byte loop is not faster than `memcpy` at
+five bytes.
+
+**Raising `RtStr::push_str`'s threshold from four bytes to sixteen, 0.97x.**
+The four was chosen when the case in hand was a single digit, which looked
+like a number fitted to one example. It is not: on the serial proxy the
+sixteen-byte version measured 0.981x and 0.967x on two runs. The `parwords`
+row said 1.07x *faster* in the same session, which is what that row does —
+below fifteen per cent it cannot be read.
+
+So the `memmove` is somewhere else: the map key, or the copy into inline
+storage when a builder finishes. Recorded rather than pursued, because the
+profile has now pointed at this twice and been wrong both times about what
+removing it would be worth.
+
 ## What the other implementations do, and which of it applies here
 
 Read against Rust's `hashbrown`, Zig's `std.hash_map`, Swift's SIL optimizer,
