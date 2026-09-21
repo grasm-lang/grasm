@@ -2,8 +2,39 @@
 
 use grasm_sema::analyze;
 
+/// The stack the compiler gives its own front end (`COMPILER_STACK` in
+/// `crates/grasm/src/main.rs`), which these tests have to match.
+///
+/// `analyze` recurses once per level of nesting, and the depth a program may
+/// reach is decided by the checker's own "code is nested too deeply" limit —
+/// not by whichever stack the caller happened to have. `grasm` establishes
+/// that by running on a thread of its own; a test calling `analyze` directly
+/// gets cargo's thread instead, and in a *debug* build the thousand-deep
+/// projection chain in `a_chain_of_field_reads_is_linear` overflowed it and
+/// aborted the whole test binary. Release passed, so every gate passed, and
+/// only `cargo test` without `--release` ever saw it.
+const COMPILER_STACK: usize = 256 * 1024 * 1024;
+
+/// Runs `f` with the stack the compiler would have given it.
+fn with_compiler_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    let spawned = std::thread::Builder::new()
+        .stack_size(COMPILER_STACK)
+        .spawn(f);
+    match spawned {
+        Ok(h) => match h.join() {
+            Ok(v) => v,
+            Err(panic) => std::panic::resume_unwind(panic),
+        },
+        // A thread that cannot be spawned leaves nothing to fall back to but
+        // this one, and the caller would rather see the real failure than a
+        // message about threads.
+        Err(e) => panic!("could not spawn a checker thread: {e}"),
+    }
+}
+
 fn check_ok(src: &str) {
-    let (_, diags) = analyze(src);
+    let owned = src.to_string();
+    let diags = with_compiler_stack(move || analyze(&owned).1);
     assert!(
         diags.is_empty(),
         "expected no diagnostics for:\n{src}\ngot:\n{diags:#?}"
@@ -12,7 +43,8 @@ fn check_ok(src: &str) {
 
 /// Asserts at least one diagnostic contains `needle`.
 fn check_err(src: &str, needle: &str) {
-    let (_, diags) = analyze(src);
+    let owned = src.to_string();
+    let diags = with_compiler_stack(move || analyze(&owned).1);
     assert!(
         diags.iter().any(|d| d.message.contains(needle)),
         "expected a diagnostic containing `{needle}` for:\n{src}\ngot:\n{diags:#?}"
