@@ -5,7 +5,35 @@ Every defect that is known and not fixed, with its severity from
 to paste. S1 and S2 block a release; S3 and S4 do not, and this file is what
 makes shipping them honest rather than quiet.
 
-**Open S1: none. Open S2: none. Open S3: none. Open S4: one.**
+**Open S1: none. Open S2: none. Open S3: two. Open S4: one.**
+
+## S3 — `fuzz_exits` disagrees on four programs in eighty-five
+
+`python3 scripts/fuzz_exits.py` reports `disagreed: 4`. The generator is
+deterministic, so the same four come back every run. The shape is a `try` of a
+fallible *generic* inside a tuple, in a function that also carries an effect
+row:
+
+```
+fn risky_of[T](v: T) -> T ! Bad { fail(Bad) }
+fn leaves(kept: [i64]) -> i64 ! Bad / {Src} {
+    let made = (kept, if true { try risky_of([2]) } else { [2] })
+    let _n = made.0.len()
+    0
+}
+```
+
+Not caused by anything in this session: the same four disagree on `bcf035d`,
+the commit this session started from, rebuilt and re-run. It is S3 rather than
+S2 because what differs is the exit path of a program the checker already
+allows, not a wrong answer from a program that runs.
+
+## S3 — `gitsigndiff` differs on eight cases in a hundred and five
+
+`scripts/gitsign_diff.sh` reports `agreeing: 97   differing: 8`, and several
+of the differing cases produce the *same* wrong hash, which points at one
+cause rather than eight. Also present on `bcf035d`, so it predates this
+session.
 
 ## S4 — `grasm_sema`'s deep-chain tests overflow the stack in a debug build
 

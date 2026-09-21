@@ -58,12 +58,16 @@ for src in $(corpus_programs); do
     "$GRASM" build "$src" --native -o "$bin" >/dev/null 2>&1 || continue
     err=$("$bin" 2>&1 >/dev/null)
     code=$?
-    if echo "$err" | grep -q "use after free"; then
+    # `grep -c … >/dev/null` rather than `grep -q`: under `pipefail` a `-q`
+    # that matches exits early, the writer takes SIGPIPE, and the pipeline
+    # reports failure for a pattern that was found. `gatecheck.sh` watches for
+    # exactly this.
+    if echo "$err" | grep -c "use after free" >/dev/null; then
         caught=$((caught + 1))
         CAUGHT+=("$src")
         echo "USE AFTER FREE: $src"
         echo "$err" | grep "use after free" | head -1
-    elif [ "$code" -eq 134 ] || echo "$err" | grep -qi "memory allocation of"; then
+    elif [ "$code" -eq 134 ] || echo "$err" | grep -ci "memory allocation of" >/dev/null; then
         exhausted=$((exhausted + 1))
     else
         clean=$((clean + 1))

@@ -9236,6 +9236,21 @@ this case",
                 return Ok(None);
             }
         }
+        // A handler is shaped by the frame it was written in: the backend
+        // finds a handler literal by *where it appears*, and a spliced body
+        // moves it. `fn pass(h: SHandler) -> SHandler { h }` used as a
+        // `with`'s handler stopped compiling — the `with` looked for the
+        // literal and found the hidden name the splice had bound it to.
+        let handler_shaped = matches!(
+            self.cg.vtype_of(decl.ret.as_ref().expect("candidate has a return type"))?,
+            VType::Handler(_)
+        ) || decl
+            .params
+            .iter()
+            .any(|p| matches!(self.cg.vtype_of(&p.ty), Ok(VType::Handler(_))));
+        if handler_shaped {
+            return Ok(None);
+        }
         let span = decl.span;
         self.inline_seq += 1;
         let seq = self.inline_seq;
