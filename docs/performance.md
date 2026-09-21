@@ -20,13 +20,20 @@ best of three, microseconds, checksums verified against the interpreter first.
 | `sieve` | 7.02 | 7.09 | 7.91 | 9.45 | 7.71 | 7.72 | 1.09x |
 | `fib` | 5.05 | 5.29 | 6.35 | 6.17 | 5.61 | 5.95 | 1.12x |
 | `parwords` | 9.27 | 10.62 | 9.91 | – | – | 11.99 | 1.13x |
-| `parmap` | 53.07 | 51.72 | 87.78 | – | – | 63.16 | 1.22x |
+| `parmap` | 53.07 | 51.72 | 87.78 | – | – | 63.16* | 1.22x* |
 | `matmul` | 5.25 | 5.34 | 8.57 | 9.34 | 5.98 | 9.52 | 1.78x |
 | `tree` | 21.23 | 9.93 | 22.75 | – | – | 27.74 | 2.79x |
 
+\* `parmap`'s cell predates the power-of-two remainder change below, which is
+worth 1.13x on that row and has not been re-measured here. The number is left
+as it was taken rather than divided: a table entry that was computed instead
+of measured is how a wrong claim gets into a document. `bench.sh` has refused
+twice since, at load 6.8 on eight cores.
+
 `G2` — the geometric mean of rust/native — is **0.778x** against a target of
 0.95x, and it was 0.62x at the start of the previous day. Run to run it moves
-by about 0.02, so read it as 0.78 give or take.
+by about 0.02, so read it as 0.78 give or take — and the `parmap` cell makes
+that a slight understatement until the next idle run.
 
 **Two rows beat Rust**, and they do it in every run: `sort` — also three and a
 half times over C and four and a half over Go — and `wordfreq`, which also
