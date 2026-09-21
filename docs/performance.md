@@ -11,42 +11,47 @@ it. This is the other half: why the numbers are what they are.
 ## The standing gap
 
 Measured 2026-09-21 on an idle machine by `scripts/bench.sh` — wall clock,
-best of three, checksums verified against the interpreter first.
+best of three, checksums verified against the interpreter first. In
+microseconds: the harness rounded to whole milliseconds until this run, and
+half these rows finish in five to ten of them, so a cell could move a fifth
+and print the same number.
 
 | program | c | rust | go | nim | zig | grasm | vs rust |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| `sort` | 37ms | 11ms | 49ms | – | – | **10ms** | **0.9x** |
-| `fib` | 5ms | 6ms | 6ms | 6ms | 6ms | **5ms** | **0.8x** |
-| `wordfreq` | 31ms | 26ms | 17ms | 22ms | 10ms | **25ms** | **1.0x** |
-| `sieve` | 7ms | 7ms | 8ms | 9ms | 7ms | 8ms | 1.1x |
-| `parmap` | 55ms | 52ms | 89ms | – | – | 63ms | 1.2x |
-| `parwords` | 8ms | 11ms | 10ms | – | – | 16ms | 1.5x |
-| `matmul` | 5ms | 5ms | 8ms | 9ms | 6ms | 10ms | 2.0x |
-| `tree` | 21ms | 10ms | 22ms | – | – | 28ms | 2.8x |
+| `sort` | 37.09 | 11.72 | 48.85 | – | – | **10.21** | **0.87x** |
+| `wordfreq` | 30.85 | 26.42 | 17.86 | 22.17 | 9.69 | **24.69** | **0.93x** |
+| `parwords` | 8.37 | 12.79 | 10.48 | – | – | 13.54 | 1.06x |
+| `fib` | 5.06 | 5.36 | 6.17 | 6.03 | 5.50 | 5.89 | 1.10x |
+| `sieve` | 7.09 | 7.10 | 7.68 | 9.06 | 7.26 | 8.13 | 1.15x |
+| `parmap` | 50.11 | 51.90 | 91.52 | – | – | 63.31 | 1.22x |
+| `matmul` | 5.35 | 5.45 | 8.15 | 9.74 | 5.91 | 9.62 | 1.76x |
+| `tree` | 21.13 | 9.73 | 20.73 | – | – | 27.16 | 2.79x |
 
-`G2` — the geometric mean of rust/native — is **0.77x** against a target of
-0.95x, up from 0.62x at the start of the day. With the 2 ms harness floor
-subtracted from both sides it is 0.73x.
+`G2` — the geometric mean of rust/native — is **0.791x** against a target of
+0.95x, up from 0.62x at the start of the previous day. With the 2.49 ms
+process floor subtracted from both sides it is 0.732x.
 
-**Three rows are at or ahead of Rust.** `sort` at 10ms beats Rust, C by more
-than three times and Go by five. `fib` at 5ms beats Rust, Go, Nim and Zig, and
-ties C. `wordfreq` beats Rust and C. `sieve` is one millisecond behind Rust
-and level with Zig.
+**Two rows beat Rust.** `sort` by 13%, and by three and a half times over C
+and nearly five over Go. `wordfreq` by 7%, and over C. `parwords` is 6%
+behind Rust, `fib` 10% behind, `sieve` 15% behind and level with Zig.
 
-What is left is four rows, and each has a measurement rather than a theory
-behind it:
+A claim made from the previous table is withdrawn here: at whole-millisecond
+resolution `fib` printed 5ms against Rust's 6 and was reported as beating
+Rust, Zig, Go and Nim. It beats Go and Nim. Against Rust and Zig it is behind,
+by 10% and 7%, and the earlier reading was the rounding. That is what the
+instrument change was for.
 
-* `tree` — 2.8x. Five probes, four of which measured nothing; the table is
-  below. The representation change the profile pointed at is a third *slower*
-  in the only form that can be built today.
-* `matmul` — 2.0x. All of it is instruction quality inside one loop, with no
-  runtime call anywhere in the profile. A vectoriser is worth 1.21x, measured
-  by building the *Rust* program with LLVM's vectorisers off.
-* `parwords` — 1.5x. Three quarters of it is one loop appending a digit at a
-  time, and every append is a call into the runtime. Lists already avoid this
-  shape with `grasm_list_append_begin`; strings have no equivalent yet.
-* `parmap` — 1.2x, and the row cannot resolve a change smaller than about 15%
-  (see the note on `par*` measurement below).
+What is left, each with a measurement behind it rather than a theory:
+
+* `tree` — 2.79x. Probed five ways; four measured nothing and the fifth, a
+  representation with no per-node box at all, is a third *slower*.
+* `matmul` — 1.76x. All instruction quality inside one loop, no runtime call
+  anywhere in the profile. A vectoriser is worth 1.21x, measured by building
+  the *Rust* program with LLVM's vectorisers off.
+* `parmap` — 1.22x, on a row that cannot resolve a change smaller than about
+  15%.
+* `sieve`, `fib`, `parwords` — within 15% of Rust, and none of them has an
+  identified cause left.
 
 **Arithmetic, calls, sorting and text are at or near parity. Allocation is
 not, and neither is vectorised arithmetic.**

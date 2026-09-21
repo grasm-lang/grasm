@@ -76,7 +76,14 @@ fi
 # it does not look like noise — it compresses every ratio toward 1 and makes a
 # slow implementation look close to a fast one. The C sieve takes about 5 ms
 # and was reported at 30.
-time_ms() {
+# Microseconds, not milliseconds.
+#
+# Whole milliseconds were the instrument's own limit and it had become the
+# binding one: `fib` and `matmul` finish in five to ten of them, so a cell
+# could move ten or twenty per cent and print the same number, and G2 moved
+# by more than a day's work did. Rounding is done once, at the end, where the
+# figure is printed.
+time_us() {
     python3 - "$WORK" "$@" <<'TIMER'
 import subprocess, sys, time
 
@@ -85,14 +92,14 @@ with open(work + "/out", "wb") as out, open(work + "/err", "wb") as err:
     started = time.perf_counter()
     done = subprocess.run(cmd, stdout=out, stderr=err)
     elapsed = (time.perf_counter() - started) * 1000
-print(int(round(elapsed)))
+print(int(round(elapsed * 1000)))
 sys.exit(0 if done.returncode == 0 else 1)
 TIMER
 }
 
 # What the timer costs when there is nothing to time.
 #
-# This is the check that was missing when `time_ms` was measuring a Python
+# This is the check that was missing when the timer was measuring a Python
 # interpreter's startup and adding it to every cell (ProjectGold F27). Two
 # gates already watched the *inputs* to a measurement — is the answer right,
 # is the machine quiet — and neither could see a timer that was wrong, because
@@ -100,11 +107,12 @@ TIMER
 #
 # `true` does nothing, so the whole of this figure is fork, exec and wait. A
 # few milliseconds is the floor of any wall-clock measurement of a process and
-# is honest; anything more means the harness is timing itself again.
+# is honest; anything more means the harness is timing itself again. In
+# microseconds, so the limit is ten thousand.
 timer_floor() {
     local t best=""
     for _ in 1 2 3; do
-        t=$(time_ms /usr/bin/true) || return 1
+        t=$(time_us /usr/bin/true) || return 1
         if [ -z "$best" ] || [ "$t" -lt "$best" ]; then best=$t; fi
     done
     echo "$best"
@@ -115,8 +123,8 @@ if [ -z "$FLOOR" ]; then
     echo "refusing to benchmark: the timer could not measure /usr/bin/true"
     exit 1
 fi
-if [ "$FLOOR" -gt 10 ]; then
-    echo "refusing to benchmark: timing /usr/bin/true takes ${FLOOR}ms"
+if [ "$FLOOR" -gt 10000 ]; then
+    echo "refusing to benchmark: timing /usr/bin/true takes $((FLOOR / 1000))ms"
     echo
     echo "A program that does nothing cannot take that long. The harness is"
     echo "measuring itself, and every number it prints would carry the same"
@@ -126,10 +134,10 @@ if [ "$FLOOR" -gt 10 ]; then
 fi
 
 # Best of REPS, the least noisy summary of a short run.
-best_ms() {
+best_us() {
     local best="" t i=0
     while [ $i -lt "$REPS" ]; do
-        t=$(time_ms "$@") || return 1
+        t=$(time_us "$@") || return 1
         if [ -z "$best" ] || [ "$t" -lt "$best" ]; then best=$t; fi
         i=$((i + 1))
     done
@@ -186,7 +194,7 @@ for p in $PROGRAMS; do
             continue
         fi
         # shellcheck disable=SC2086
-        ms=$(best_ms $cmd) && echo "$ms" >"$WORK/r_${lang}_$p"
+        us=$(best_us $cmd) && echo "$us" >"$WORK/r_${lang}_$p"
     done
     echo "  $p done"
 done
@@ -210,7 +218,7 @@ for p in $PROGRAMS; do
             if [ "$v" = "WRONG" ]; then
                 printf '%14s' "WRONG"
             else
-                printf '%13s ' "${v}ms"
+                printf '%13s ' "$(awk -v v="$v" 'BEGIN { printf "%.2fms", v / 1000 }')"
             fi
         fi
     done
@@ -260,7 +268,8 @@ if plain:
     print()
     print(
         f"G2  geomean of rust/native over {len(plain)} program(s):"
-        f"  {geo(plain):.2f}x   (floor {floor}ms subtracted: {geo(subbed):.2f}x)"
+        f"  {geo(plain):.3f}x   (floor {floor / 1000:.2f}ms subtracted:"
+        f" {geo(subbed):.3f}x)"
     )
     print("    target is >= 0.95x; higher is better, 1.00x is parity with Rust")
 if missing:
