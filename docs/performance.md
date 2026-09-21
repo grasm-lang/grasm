@@ -739,6 +739,54 @@ copies buy no bookkeeping back and cost register pressure. Turning it off for
 No rule change made. Picking the cases apart on four benchmarks would be
 fitting the rule to them.
 
+### What one box actually costs, re-measured — 2026-09-21
+
+The 24.8 ns for making and freeing one struct box is now **19.91 ns**, measured
+the same way: 5,000,000 iterations of a two-field struct whose fields are
+interned integers, against an identical loop without the struct, best of nine.
+The number moved, so anything reasoned from the old one is worth re-checking.
+
+Profiling that loop names where it goes, and it is not where the comment in
+`alloc_in` says:
+
+| leaf | samples | share of non-dyld |
+| --- | --- | --- |
+| `_tlv_get_addr` | 441 | ~28% |
+| `_platform_memmove` + its stub | 295 | ~19% |
+| everything in the program's own text | ~874 | rest |
+
+**`_tlv_get_addr` is 28%, not the 15% on record.** Two thread-local lookups
+per iteration -- one to allocate, one to release -- at roughly 2.75 ns each.
+That is ~5.5 ns of the 19.91, and it is the largest single item in the cost of
+every allocation this runtime makes.
+
+**The memmove is a red herring, twice over.** `grasm_struct_make` builds an
+`RtPayload` and passes it by value into `alloc` and again into `alloc_in`, a
+56-byte enum moved twice before it lands in the box. Two fixes were tried:
+writing the fields through `addr_of_mut!` instead of `ptr::write`ing a whole
+`RtVal`, and `#[inline]` on both allocator functions. Neither moved the
+microbenchmark (19.91 -> 19.67 -> 19.69 ns), the memmove leaf stayed at 210
+samples, and on the real rows both together measured *worse*:
+
+| | base | changed | |
+| --- | --- | --- | --- |
+| `tree` | 28.03 ms | 28.45 ms | 0.985x |
+| `wordfreq` | 25.52 ms | 25.48 ms | 1.001x |
+| `sort` | 10.39 ms | 10.42 ms | 0.997x |
+
+Both reverted. A leaf high in a sample histogram is not the same as a leaf on
+the critical path, which is the lesson worth keeping.
+
+**What is left is the thread-local.** The runtime already has the shape for it:
+`alloc_in` takes `&Local` so a caller that is reaching `LOCAL` anyway reaches
+it once, and the backend already caches one per-function value this way for
+`grasm_stack_floor`. Extending that to the hot entries -- fetch the thread's
+state once per compiled function and pass it to `grasm_struct_make` and
+`grasm_val_dec` -- is worth up to 28% of allocation, which is most of `tree`.
+Before building it: a cached pointer is sound only if a compiled function
+cannot resume on a different thread than it started on, and whether an effect
+handler can do that has to be established first, not assumed.
+
 ### Three more ceilings, 2026-09-21
 
 **Unrolling `sieve`'s inner loop: 1.00x.** `while j <= limit { flags[j] = false;
