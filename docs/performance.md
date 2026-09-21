@@ -11,50 +11,49 @@ it. This is the other half: why the numbers are what they are.
 ## The standing gap
 
 Measured 2026-09-21 on an idle machine by `scripts/bench.sh` — wall clock,
-best of three, checksums verified against the interpreter first. In
-microseconds: the harness rounded to whole milliseconds until this run, and
-half these rows finish in five to ten of them, so a cell could move a fifth
-and print the same number.
+best of three, microseconds, checksums verified against the interpreter first.
 
 | program | c | rust | go | nim | zig | grasm | vs rust |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| `sort` | 37.09 | 11.72 | 48.85 | – | – | **10.21** | **0.87x** |
-| `wordfreq` | 30.85 | 26.42 | 17.86 | 22.17 | 9.69 | **24.69** | **0.93x** |
-| `parwords` | 8.37 | 12.79 | 10.48 | – | – | 13.54 | 1.06x |
-| `fib` | 5.06 | 5.36 | 6.17 | 6.03 | 5.50 | 5.89 | 1.10x |
-| `sieve` | 7.09 | 7.10 | 7.68 | 9.06 | 7.26 | 8.13 | 1.15x |
-| `parmap` | 50.11 | 51.90 | 91.52 | – | – | 63.31 | 1.22x |
-| `matmul` | 5.35 | 5.45 | 8.15 | 9.74 | 5.91 | 9.62 | 1.76x |
-| `tree` | 21.13 | 9.73 | 20.73 | – | – | 27.16 | 2.79x |
+| `sort` | 36.77 | 11.28 | 48.81 | – | – | **10.73** | **0.95x** |
+| `wordfreq` | 31.21 | 26.50 | 17.39 | 22.51 | 9.64 | **24.57** | **0.93x** |
+| `sieve` | 7.02 | 7.09 | 7.91 | 9.45 | 7.71 | 7.72 | 1.09x |
+| `fib` | 5.05 | 5.29 | 6.35 | 6.17 | 5.61 | 5.95 | 1.12x |
+| `parwords` | 9.27 | 10.62 | 9.91 | – | – | 11.99 | 1.13x |
+| `parmap` | 53.07 | 51.72 | 87.78 | – | – | 63.16 | 1.22x |
+| `matmul` | 5.25 | 5.34 | 8.57 | 9.34 | 5.98 | 9.52 | 1.78x |
+| `tree` | 21.23 | 9.93 | 22.75 | – | – | 27.74 | 2.79x |
 
-`G2` — the geometric mean of rust/native — is **0.791x** against a target of
-0.95x, up from 0.62x at the start of the previous day. With the 2.49 ms
-process floor subtracted from both sides it is 0.732x.
+`G2` — the geometric mean of rust/native — is **0.778x** against a target of
+0.95x, and it was 0.62x at the start of the previous day. Run to run it moves
+by about 0.02, so read it as 0.78 give or take.
 
-**Two rows beat Rust.** `sort` by 13%, and by three and a half times over C
-and nearly five over Go. `wordfreq` by 7%, and over C. `parwords` is 6%
-behind Rust, `fib` 10% behind, `sieve` 15% behind and level with Zig.
+**Two rows beat Rust**, and they do it in every run: `sort` — also three and a
+half times over C and four and a half over Go — and `wordfreq`, which also
+beats C. `sieve` and `fib` are within 12%, `sieve` now level with Zig.
 
-A claim made from the previous table is withdrawn here: at whole-millisecond
-resolution `fib` printed 5ms against Rust's 6 and was reported as beating
-Rust, Zig, Go and Nim. It beats Go and Nim. Against Rust and Zig it is behind,
-by 10% and 7%, and the earlier reading was the rounding. That is what the
-instrument change was for.
+**The `par*` rows cannot be read to better than about 15%, for any language.**
+`parwords`' Rust column was 12.79ms in the previous run and 10.62 here with
+nothing changed in Rust; ours went 13.54 to 11.99 on a real 1.45x in its
+dominant loop. Contention inflates every column, not only Grasm's. A change
+that matters on those rows has to be measured on a serial proxy — the same
+program with `par_map` replaced by `map`.
 
-What is left, each with a measurement behind it rather than a theory:
+What is left, with the ceiling measured for each:
 
-* `tree` — 2.79x. Probed five ways; four measured nothing and the fifth, a
+* `tree` — 2.79x. Five probes; four measured nothing and the fifth, a
   representation with no per-node box at all, is a third *slower*.
-* `matmul` — 1.76x. All instruction quality inside one loop, no runtime call
-  anywhere in the profile. A vectoriser is worth 1.21x, measured by building
+* `matmul` — 1.78x. All instruction quality inside one loop, no runtime call
+  anywhere in its profile. A vectoriser is worth 1.21x, measured by building
   the *Rust* program with LLVM's vectorisers off.
-* `parmap` — 1.22x, on a row that cannot resolve a change smaller than about
-  15%.
-* `sieve`, `fib`, `parwords` — within 15% of Rust, and none of them has an
-  identified cause left.
+* `fib` — 1.12x. The accumulator loop LLVM builds from `f(a) + f(b)` is worth
+  1.06x, hand-written in Grasm source.
+* `sieve` — 1.09x. Removing every bounds check is worth 1.03x.
+* `parmap`, `parwords` — below what those rows can resolve.
 
-**Arithmetic, calls, sorting and text are at or near parity. Allocation is
-not, and neither is vectorised arithmetic.**
+**No single remaining lever wins a row.** The cheap work is done; what is left
+is a vectoriser or a value-representation change, and the representation
+change has a measurement arguing against it.
 
 ## What has been measured
 
