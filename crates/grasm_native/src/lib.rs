@@ -3843,6 +3843,150 @@ fn body_can_call(e: &Expr) -> bool {
 /// built natively printed a raw address as the middle element and exited 0.
 /// The sequential lowering propagates the failure correctly, and `par_map` is
 /// free to run sequentially, so a body like this takes that path.
+/// Whether evaluating this element can leave before the container exists.
+///
+/// `return`, `break`, `continue`, `try` and `fail` all abandon the elements
+/// already built, and a path that builds them in registers has nowhere to
+/// release them from. `body_can_fail` asked about `fail` alone, so
+/// `(kept, if true { return 1 } else { [2] })` leaked the first element —
+/// four of `fuzz_exits`' programs, one allocation each.
+///
+/// Over-approximates on purpose: a `break` belonging to a loop *inside* the
+/// element cannot escape it, but counting it only costs the slower path that
+/// holds each element in a scope.
+fn elem_can_leave(e: &Expr) -> bool {
+    let mut found = false;
+    scan_leave_expr(e, &mut found);
+    found
+}
+
+fn scan_leave_block(b: &grasm_syntax::ast::Block, found: &mut bool) {
+    for st in &b.stmts {
+        if *found {
+            return;
+        }
+        match st {
+            Stmt::Return(..) | Stmt::Break(_) | Stmt::Continue(_) => *found = true,
+            Stmt::Let { init, .. } | Stmt::LetTuple { init, .. } => {
+                scan_leave_expr(init, found)
+            }
+            Stmt::Assign { target, value, .. } => {
+                scan_leave_expr(target, found);
+                scan_leave_expr(value, found);
+            }
+            Stmt::Expr(e) => scan_leave_expr(e, found),
+            Stmt::While { cond, body, .. } => {
+                scan_leave_expr(cond, found);
+                scan_leave_block(body, found);
+            }
+            Stmt::For { iter, body, .. } => {
+                scan_leave_expr(iter, found);
+                scan_leave_block(body, found);
+            }
+            Stmt::Parallel { body, .. } | Stmt::Spawn { body, .. } => {
+                scan_leave_block(body, found)
+            }
+            Stmt::With { handler, body, .. } => {
+                scan_leave_expr(handler, found);
+                scan_leave_block(body, found);
+            }
+        }
+    }
+}
+
+fn scan_leave_expr(e: &Expr, found: &mut bool) {
+    if *found {
+        return;
+    }
+    match e {
+        Expr::Try { .. } => *found = true,
+        Expr::Call { callee, args, .. } => {
+            if matches!(&**callee, Expr::Ident(id) if id.name == "fail") {
+                *found = true;
+                return;
+            }
+            scan_leave_expr(callee, found);
+            for a in args {
+                scan_leave_expr(a, found);
+            }
+        }
+        Expr::MethodCall { recv, args, .. } => {
+            scan_leave_expr(recv, found);
+            for a in args {
+                scan_leave_expr(a, found);
+            }
+        }
+        Expr::Block(b) | Expr::Unsafe(b) | Expr::Region(b) => scan_leave_block(b, found),
+        Expr::If {
+            cond,
+            then_block,
+            else_branch,
+            ..
+        } => {
+            scan_leave_expr(cond, found);
+            scan_leave_block(then_block, found);
+            match else_branch.as_deref() {
+                None => {}
+                Some(grasm_syntax::ast::ElseBranch::Else(b)) => scan_leave_block(b, found),
+                Some(grasm_syntax::ast::ElseBranch::ElseIf(x)) => scan_leave_expr(x, found),
+            }
+        }
+        Expr::Match {
+            scrutinee, arms, ..
+        } => {
+            scan_leave_expr(scrutinee, found);
+            for a in arms {
+                if let Some(g) = &a.guard {
+                    scan_leave_expr(g, found);
+                }
+                scan_leave_expr(&a.body, found);
+            }
+        }
+        Expr::List(items, _) | Expr::Tuple(items, _) => {
+            for i in items {
+                scan_leave_expr(i, found);
+            }
+        }
+        Expr::Map(pairs, _) => {
+            for (k, v) in pairs {
+                scan_leave_expr(k, found);
+                scan_leave_expr(v, found);
+            }
+        }
+        Expr::StructLit { fields, base, .. } => {
+            if let Some(b) = base {
+                scan_leave_expr(b, found);
+            }
+            for (_, v) in fields {
+                scan_leave_expr(v, found);
+            }
+        }
+        Expr::Index { recv, index, .. } => {
+            scan_leave_expr(recv, found);
+            scan_leave_expr(index, found);
+        }
+        Expr::Field { recv, .. } => scan_leave_expr(recv, found),
+        Expr::Unary { expr, .. } => scan_leave_expr(expr, found),
+        Expr::Binary { lhs, rhs, .. } => {
+            scan_leave_expr(lhs, found);
+            scan_leave_expr(rhs, found);
+        }
+        Expr::Range { start, end, .. } => {
+            scan_leave_expr(start, found);
+            scan_leave_expr(end, found);
+        }
+        Expr::Str(pieces, _) => {
+            for p in pieces {
+                if let grasm_syntax::ast::StrPiece::Expr(x) = p {
+                    scan_leave_expr(x, found);
+                }
+            }
+        }
+        // A closure's body runs when it is called, not here.
+        _ => {}
+    }
+}
+
 fn body_can_fail(e: &Expr) -> bool {
     let mut names = Vec::new();
     collect_idents(e, &mut names);
@@ -8049,7 +8193,12 @@ this case",
             }
         }
         if let (Expr::Tuple(items, _), Some(VType::Tuple(ts))) = (e, expected) {
-            if !items.is_empty() && items.len() == ts.len() && items.iter().any(needs_element_hint)
+            if !items.is_empty()
+                && items.len() == ts.len()
+                && items.iter().any(needs_element_hint)
+                // As below: an element that leaves abandons the ones already
+                // built, and this path holds them in registers.
+                && !items.iter().any(elem_can_leave)
             {
                 let ts = ts.clone();
                 let mut boxed = Vec::with_capacity(items.len());
@@ -8403,7 +8552,7 @@ this case",
                 // tuple in a scope so that a `fail` in a later element releases
                 // the earlier ones; where no element can fail there is nothing
                 // to release and four runtime calls become one.
-                if items.len() <= 3 && !items.iter().any(body_can_fail) {
+                if items.len() <= 3 && !items.iter().any(elem_can_leave) {
                     let mut boxed = Vec::with_capacity(items.len());
                     let mut ts = Vec::with_capacity(items.len());
                     for item in items {

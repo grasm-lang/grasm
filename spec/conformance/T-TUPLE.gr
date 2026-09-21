@@ -1,9 +1,64 @@
 //! tag: T-TUPLE
 //! expect: output
 //! 1 is one
+//! 1
+//! 0
+//! 3 [7]
+//! -1 ok
+// An element that *leaves* before the tuple exists abandons the elements
+// already built — and there is nowhere to release them from unless the
+// half-built tuple is held somewhere the scope can find. Every spelling of
+// leaving is here: `return`, `break`, `continue` and `try`. None of them
+// changes what the program prints, which is why this is a leak rather than a
+// wrong answer, and why only `GRASM_LEAK_CHECK=1` can see it.
+type Bad = | Bad
+
+fn risky() -> i64 ! Bad {
+    fail(Bad)
+}
+
+fn by_return(kept: [i64]) -> i64 {
+    let made = (kept, if true { return 1 } else { [2] })
+    let _n = made.0.len()
+    0
+}
+
+fn by_break(kept: [i64]) -> i64 {
+    var n = 0
+    for _i in 0..3 {
+        let made = (kept, if true { break } else { [2] })
+        let _n = made.0.len()
+        n = n + 1
+    }
+    n
+}
+
+fn by_continue(kept: [i64]) -> i64 {
+    var n = 0
+    for _i in 0..3 {
+        let made = (kept, if true { continue } else { [2] })
+        let _n = made.0.len()
+        n = n + 1
+    }
+    n
+}
+
+fn by_try(kept: [i64]) -> i64 ! Bad {
+    let made = (kept, try risky())
+    return made.0.len()
+}
+
 fn main() {
     let pair = (1, "one")
     match pair {
         (n, name) -> print("{n} is {name}")
     }
+
+    let xs = [1, 2]
+    print("{by_return(xs)}")
+    print("{by_break(xs) + by_continue(xs)}")
+    // The tuple that does *not* leave still holds what it was given.
+    let held = (3, [7])
+    print("{held.0} {held.1}")
+    print("{by_try(xs) ?? 0 - 1} ok")
 }

@@ -5,28 +5,16 @@ Every defect that is known and not fixed, with its severity from
 to paste. S1 and S2 block a release; S3 and S4 do not, and this file is what
 makes shipping them honest rather than quiet.
 
-**Open S1: none. Open S2: none. Open S3: two. Open S4: one.**
+**Open S1: none. Open S2: none. Open S3: one. Open S4: one.**
 
-## S3 — `fuzz_exits` disagrees on four programs in eighty-five
-
-`python3 scripts/fuzz_exits.py` reports `disagreed: 4`. The generator is
-deterministic, so the same four come back every run. The shape is a `try` of a
-fallible *generic* inside a tuple, in a function that also carries an effect
-row:
-
-```
-fn risky_of[T](v: T) -> T ! Bad { fail(Bad) }
-fn leaves(kept: [i64]) -> i64 ! Bad / {Src} {
-    let made = (kept, if true { try risky_of([2]) } else { [2] })
-    let _n = made.0.len()
-    0
-}
-```
-
-Not caused by anything in this session: the same four disagree on `bcf035d`,
-the commit this session started from, rebuilt and re-run. It is S3 rather than
-S2 because what differs is the exit path of a program the checker already
-allows, not a wrong answer from a program that runs.
+Closed on 2026-09-21: `fuzz_exits` disagreed on four programs in eighty-five,
+and each was the same leak. A tuple literal of two or three elements is built
+in one call, and the guard on that path asked `body_can_fail` — whether an
+element could `fail`. An element can also leave by `return`, `break`,
+`continue` or `try`, and when it did, the elements already built were
+abandoned with nowhere to release them from. `elem_can_leave` asks the whole
+question now, and T-TUPLE carries all four spellings; it exits 7 under
+`GRASM_LEAK_CHECK=1` on the compiler before the fix.
 
 ## S3 — `gitsigndiff` differs on eight cases in a hundred and five
 
