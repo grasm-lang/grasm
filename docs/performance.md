@@ -643,6 +643,34 @@ today, a third *slower*.
 
 `tree` is 2.7x Rust and none of the obvious explanations survives measurement.
 
+### Every remaining row now has a measured ceiling, 2026-09-21
+
+Re-measured at the end, on the current compiler, because most of these
+numbers were taken before the day's changes shrank the totals they were a
+share of.
+
+| row | vs rust | the lever | its ceiling |
+|---|---:|---|---:|
+| `parwords` | 1.06x | — | no cause identified |
+| `fib` | 1.10x | the accumulator loop LLVM builds from `f(a) + f(b)` | 1.06x |
+| `sieve` | 1.15x | removing every bounds check | 1.03x |
+| `parmap` | 1.22x | — | not measurable below 15% on that row |
+| `matmul` | 1.76x | auto-vectorisation | 1.21x |
+| `tree` | 2.79x | inline aggregate storage | 0.74x — *slower* |
+
+Bounds checks were worth 1.11x on `sieve` when that was measured; they are
+worth 1.03x now, because the constant-map-to-fill change took four
+milliseconds out of the total they were a share of. That is the general shape
+of this table: each lever got smaller as the program around it got faster.
+
+The accumulator transform is the only one left with a real mechanism and no
+implementation. `fib(n-1) + fib(n-2)` has its second call in tail position
+modulo the addition, so it can become a loop with an accumulator — which is
+what Rust's disassembly shows LLVM doing, and why its frame count is half
+ours. Written out by hand in Grasm source it measures 1.059x, which would
+leave `fib` about 4% behind Rust rather than 10%. It is a real AST transform
+for six per cent of one benchmark, and it is recorded rather than built.
+
 ## What the other implementations do, and which of it applies here
 
 Read against Rust's `hashbrown`, Zig's `std.hash_map`, Swift's SIL optimizer,
