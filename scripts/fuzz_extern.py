@@ -56,6 +56,8 @@ def _lib(name):
 
 
 leaked = _lib("leaks").leaked
+# One binary, rebuilt in place, instead of one file per program (see the module).
+build_native = _lib("inplace").build
 
 _spec = _ilu.spec_from_file_location(
     "grasm_fresh", os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib", "fresh.py")
@@ -220,7 +222,8 @@ def main():
                 print(f"POINTER WRONG {name}: C answered {wrong} (c/grasm)\n{src}")
                 continue
             exe = os.path.join(work, "p.bin")
-            rc2, _, err2 = run([GRASM, "build", path, "--native", "-o", exe])
+            bp = build_native(GRASM, path, exe, "--native")
+            rc2, _, err2 = bp.returncode, bp.stdout, bp.stderr
             if rc2 != 0:
                 # A refusal is honest; a wrong answer is not.
                 declined.append(name)

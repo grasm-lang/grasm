@@ -45,6 +45,8 @@ def _lib(name):
 
 
 leaked = _lib("leaks").leaked
+# One binary, rebuilt in place, instead of one file per program (see the module).
+build_native = _lib("inplace").build
 _lib("fresh").fresh_or_stop(GRASM)
 
 
@@ -213,7 +215,8 @@ def main():
                     refused.append(label)
                     continue
                 checked += 1
-                rc2, o2, err2 = run([GRASM, "build", path, "--native", "-o", exe])
+                bp = build_native(GRASM, path, exe, "--native")
+                rc2, o2, err2 = bp.returncode, bp.stdout, bp.stderr
                 if rc2 != 0:
                     first = (o2 + err2).strip().splitlines()
                     declined.append(f"{label}: {first[0] if first else '(silent)'}")

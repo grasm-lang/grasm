@@ -53,6 +53,8 @@ def _lib(name):
 
 
 leaked = _lib("leaks").leaked
+# One binary, rebuilt in place, instead of one file per program (see the module).
+build_native = _lib("inplace").build
 _lib("fresh").fresh_or_stop(GRASM)
 
 
@@ -341,7 +343,8 @@ def main():
                     continue
 
                 exe = os.path.join(work, "out")
-                rc2, o2, e2 = run([GRASM, "build", src, "--native", "-o", exe])
+                bp = build_native(GRASM, src, exe, "--native")
+                rc2, o2, e2 = bp.returncode, bp.stdout, bp.stderr
                 if rc2 != 0:
                     refused.append(label + " / native")
                     print(f"NATIVE REFUSED {label}\n{e2 or o2}")
@@ -530,7 +533,8 @@ def main():
                 ([], "bundle"),
             ):
                 exe = os.path.join(work, "out-" + label)
-                rc2, o2, e2 = run([GRASM, "build", src] + flags + ["-o", exe])
+                bp = build_native(GRASM, src, exe, *flags)
+                rc2, o2, e2 = bp.returncode, bp.stdout, bp.stderr
                 if rc2 != 0:
                     holes.append(f"variant/{a_ty}/{b_ty}/{label}")
                     print(f"VARIANT will not build {label} ({a_ty} vs {b_ty}):\n{e2 or o2}")

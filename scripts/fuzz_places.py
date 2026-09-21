@@ -51,6 +51,8 @@ def _lib(name):
 
 
 leaked = _lib("leaks").leaked
+# One binary, rebuilt in place, instead of one file per program (see the module).
+build_native = _lib("inplace").build
 
 _spec = _ilu.spec_from_file_location(
     "grasm_fresh",
@@ -228,7 +230,8 @@ def main():
                     print(f"REJECTED {label}: {(out + err).strip()}\n{src}")
                     continue
                 want = out
-                rc2, _, err2 = run([GRASM, "build", path, "--native", "-o", exe])
+                bp = build_native(GRASM, path, exe, "--native")
+                rc2, _, err2 = bp.returncode, bp.stdout, bp.stderr
                 if rc2 != 0:
                     declined.append(label)
                     continue
@@ -257,7 +260,8 @@ def main():
                     print(f"REJECTED {label}: {(out + err).strip()}\n{src}")
                     continue
                 want = out
-                rc2, _, err2 = run([GRASM, "build", path, "--native", "-o", exe])
+                bp = build_native(GRASM, path, exe, "--native")
+                rc2, _, err2 = bp.returncode, bp.stdout, bp.stderr
                 if rc2 != 0:
                     declined.append(label)
                     continue
