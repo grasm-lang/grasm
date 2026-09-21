@@ -814,14 +814,36 @@ allocation itself, take-box through payload-write through give-back, is ~9.9 ns.
 `acc += n.v + n.w`: 19.41 ns against 21.39. That is one runtime call and its
 body, ~7 cycles, which also prices what a runtime call costs here.
 
-| part of one box | ns |
-| --- | --- |
-| allocation | ~9.9 |
-| one scalar field read | 1.98 |
-| the rest -- argument array, two more calls, release, loop | ~7.5 |
+Inside the allocation, by the same method -- build without the part, time it:
+
+| part of one box | ns | |
+| --- | --- | --- |
+| allocation | ~9.9 | of which drop glue 1.59, counters 0.67 |
+| one scalar field read | 1.98 | |
+| the rest -- argument array, two more calls, release, loop | ~7.5 | |
+
+The drop glue is the one with something to do about it. `give_box_in` calls
+`drop_in_place` on the whole `RtPayload`, and for much the commonest payload --
+a struct whose parts are a `&'static StructTy` and four raw pointers in a fixed
+array -- there is nothing to drop at all: the pointees are released by
+`dec_walk`, not by this. Removing the call entirely is worth 1.59 ns (19.41 to
+17.82); saying so with a match, which still costs the discriminant test,
+recovers 0.48 of it. **`tree` 1.010x, `wordfreq` and `sort` unchanged.** A
+`needs_drop` assertion holds the reasoning, so a payload that later owns
+something fails the build rather than leaking.
+
+The counters are 0.67 ns and stay: `allocated` exists for the leak report, and
+1.7% is not worth changing what a gate prints.
+
+**Interleave the A and B runs.** Measured back to back, this change read as
+`tree` 1.036x and `wordfreq` 0.982x; alternating the two binaries and taking
+25 of each put them at 1.010x and 1.001x. Sequential runs drift about 2% here,
+which is larger than most of what is being measured.
 
 So the target is the ~9.9 ns of allocation, and the reach of any fix is limited
-by what else a box costs: even a free allocation leaves 9.44 ns standing.
+by what else a box costs: even a free allocation leaves 9.44 ns standing. For
+`tree`, which makes 1.33 boxes a node against Rust's 0.33, a cheaper box is not
+the answer -- a fourth as many boxes is.
 
 ### Three more ceilings, 2026-09-21
 
