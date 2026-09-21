@@ -661,13 +661,37 @@ is the representation, all of it, and no amount of backend work reaches it:
 the 1.21x vectoriser and the 1.37x unroller above would move a number that is
 already at parity with the best another compiler manages on these bytes.
 
-What it costs to fix is now sized too. Packed scalar storage would take the
-kernel toward the 2.31 ms column and the setup with it, since most of that
-2.54 ms is allocating 120,000 boxed values. That is `matmul` at parity, and it
-is the only thing that gets there.
+**Withdrawn the same day.** The premise was wrong: `matmul`'s lists are not
+boxed. A one-shot probe in `grasm_list_get_scalar` never fired, and a profile
+of a 600-iteration build put every sample inside a 288-byte range of the
+program's own text with no runtime call in it at all. Disassembled, the inner
+loop is `ldr x6, [x24, x0, lsl #3]` against a packed `ListScalar`, already
+unrolled by four. Rust with boxed elements landing within 2% of it is a
+coincidence of two different costs, not a match.
+
+What the disassembly does show is the per-element instruction count:
+
+    madd x0, x14, x4, x15     index i*n+j
+    cmp  x0, x27 / b.hs       bounds check
+    ldr  x6, [x24, x0, lsl #3]
+    madd x0, x28, x5, x15     index again, other array
+    cmp  x0, x1  / b.hs       bounds check
+    ldr  x7, [x3, x0, lsl #3]
+    madd x6, x2, x6, x7
+    str  x6, [x3, x0, lsl #3]
+    mov  x5, #0xc8            n, rematerialised per element
+
+Eleven instructions where Rust's scalar loop is four or five, because LLVM
+hoists the check and strength-reduces the index to a pointer walk. The working
+set is three 320KB arrays, so this is cache-resident and issue-bound, and
+instruction count is the thing.
+
+That sits badly against the 1.01x measured for bounds checks and 1.00x for
+strength reduction above, which together should have removed eight of those
+eleven. One of those numbers deserves re-measuring rather than trusting.
 
 `sieve` shares the layout and does not share the problem: its elements are
-booleans, which are interned, so it pays the eight bytes of pointer but never
+booleans, which are interned, so it pays eight bytes of pointer but never
 allocates, and it already runs at 1.08x.
 
 ### Three more ceilings, 2026-09-21
