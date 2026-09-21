@@ -727,6 +727,26 @@ storage when a builder finishes. Recorded rather than pursued, because the
 profile has now pointed at this twice and been wrong both times about what
 removing it would be worth.
 
+### Two more hypotheses closed, 2026-09-21
+
+**The reference count's memory ordering costs nothing: 1.02x *slower*.** An
+older note here says non-atomic counts would be worth zero, and reasons it
+from a microbenchmark: an atomic retain/release pair costs 10.1 ns against
+0.33 for an ordinary one, "most of it the release/acquire ordering". That
+reasoning is now checked by building it. Dropping the `Release` on the
+decrement and the `Acquire` fence before the free — keeping atomicity, losing
+only the ordering — measured `tree` 1.02x slower, `sort` 1.02x slower,
+`sieve` 1.02x slower and `wordfreq` 1.03x faster. Noise in both directions,
+and no win hiding behind the ordering.
+
+**Process start is not where the small rows lose.** Every row carries the cost
+of starting a process, and at five to eight milliseconds that is a third of
+some of them. Measured with a program that prints one word: C 2.19 ms, Rust
+2.34, **Grasm 2.21**, and `/usr/bin/true` 1.77. Grasm starts *faster* than
+Rust and level with C, so there is nothing to win — and it means the
+compute gaps are slightly wider than the raw ratios say, which is why the
+floor-subtracted G2 (0.72x) is the more honest of the two figures.
+
 ## What the other implementations do, and which of it applies here
 
 Read against Rust's `hashbrown`, Zig's `std.hash_map`, Swift's SIL optimizer,
