@@ -942,6 +942,19 @@ impl<'m> Codegen<'m> {
                 Some(i64t),
             ),
             ("grasm_list_append_grow", vec![i64t, i64t, i64t, i64t], None),
+            (
+                "grasm_str_pin_begin",
+                vec![i64t, i64t, i64t, i64t],
+                Some(i64t),
+            ),
+            (
+                "grasm_str_pin_grow",
+                vec![i64t, i64t, i64t, i64t, i64t],
+                None,
+            ),
+            ("grasm_str_pin_end", vec![i64t, i64t], None),
+            ("grasm_str_pin_i64", vec![i64t, i64t, i64t], Some(i64t)),
+            ("grasm_str_pin_text", vec![i64t, i64t, i64t, i64t], Some(i64t)),
             ("grasm_list_append_end", vec![i64t, i64t], None),
             ("grasm_list_new_cap", vec![i64t], Some(i64t)),
             ("grasm_range_new", vec![i64t, i64t, i8t], Some(i64t)),
@@ -1993,6 +2006,7 @@ arguments nor the type this is bound to",
             closure_hints: Vec::new(),
             pinned: Vec::new(),
             appends: Vec::new(),
+            str_appends: Vec::new(),
             tail_hint: None,
             probe_types: Vec::new(),
             probing_args: false,
@@ -2657,6 +2671,7 @@ operation's",
             closure_hints: Vec::new(),
             pinned: Vec::new(),
             appends: Vec::new(),
+            str_appends: Vec::new(),
             tail_hint: None,
             probe_types: Vec::new(),
             probing_args: false,
@@ -2758,6 +2773,7 @@ operation's",
             closure_hints: Vec::new(),
             pinned: Vec::new(),
             appends: Vec::new(),
+            str_appends: Vec::new(),
             tail_hint: None,
             probe_types: Vec::new(),
             probing_args: false,
@@ -2902,6 +2918,7 @@ operation's",
             closure_hints: Vec::new(),
             pinned: Vec::new(),
             appends: Vec::new(),
+            str_appends: Vec::new(),
             tail_hint: None,
             probe_types: Vec::new(),
             probing_args: false,
@@ -3223,6 +3240,7 @@ struct FnCx<'a, 'm> {
     /// Lists this loop is appending to with the buffer held open: the name,
     /// where the elements go, how many there are, and how many fit.
     appends: Vec<HashMap<String, PinnedAppend>>,
+    str_appends: Vec<HashMap<String, PinnedStr>>,
     /// What the value of a block in tail position should be. Only consulted
     /// for the shapes that cannot type themselves — an empty collection
     /// literal — so a stale hint cannot change a program's meaning.
@@ -4373,6 +4391,142 @@ fn merge_fallible_halves(a: VType, b: VType) -> VType {
 /// `xs[i]` is for `indexed_only_lists`. Naming `xs` any other way — passing
 /// it, assigning it, reading its length — could alias or resize it while the
 /// loop holds a pointer into its storage, so it is disqualified.
+/// Strings a loop body does nothing to but append to themselves.
+///
+/// `acc = acc + rest` and `acc += rest` are the two shapes. Every other
+/// mention of the name — reading it, passing it, taking its length —
+/// disqualifies it, because while the buffer is open the string's own length
+/// is stale and anything that reads it would see the text it had before the
+/// loop. That is the same rule the list machinery follows.
+fn str_appended_only(block: &grasm_syntax::ast::Block) -> Vec<String> {
+    let mut appended: Vec<String> = Vec::new();
+    let mut other: Vec<String> = Vec::new();
+    scan_str_appends_block(block, &mut appended, &mut other);
+    appended.sort();
+    appended.dedup();
+    appended.retain(|n| !other.contains(n));
+    appended
+}
+
+/// The right-hand side of every self-append to `name` in a block.
+///
+/// The open site needs these because a pinned string's *every* append has to
+/// go through the buffer: one that fell back to the older path would write
+/// into the value while the buffer's length said otherwise, and the length
+/// written back at the end of the loop would discard it. That is a defect
+/// this had before the check existed — a `bool` piece, which the inline
+/// writer does not take, made the whole loop produce nothing.
+fn str_append_rhs<'a>(b: &'a grasm_syntax::ast::Block, name: &str, out: &mut Vec<&'a Expr>) {
+    for st in &b.stmts {
+        match st {
+            Stmt::Assign {
+                op,
+                target: Expr::Ident(id),
+                value,
+                ..
+            } if id.name == name => match (op, value) {
+                (AssignOp::Add, v) => out.push(v),
+                (
+                    AssignOp::Assign,
+                    Expr::Binary {
+                        op: BinaryOp::Add,
+                        lhs,
+                        rhs,
+                        ..
+                    },
+                ) if matches!(&**lhs, Expr::Ident(l) if l.name == name) => out.push(rhs),
+                _ => {}
+            },
+            Stmt::While { body, .. } | Stmt::For { body, .. } => {
+                str_append_rhs(body, name, out)
+            }
+            _ => {}
+        }
+    }
+}
+
+fn scan_str_appends_block(
+    b: &grasm_syntax::ast::Block,
+    appended: &mut Vec<String>,
+    other: &mut Vec<String>,
+) {
+    for st in &b.stmts {
+        match st {
+            Stmt::Assign {
+                op,
+                target: Expr::Ident(id),
+                value,
+                ..
+            } => {
+                let rest = match (op, value) {
+                    (AssignOp::Add, v) => Some(v),
+                    (
+                        AssignOp::Assign,
+                        Expr::Binary {
+                            op: BinaryOp::Add,
+                            lhs,
+                            rhs,
+                            ..
+                        },
+                    ) if matches!(&**lhs, Expr::Ident(l) if l.name == id.name) => Some(&**rhs),
+                    _ => None,
+                };
+                match rest {
+                    Some(r) => {
+                        appended.push(id.name.clone());
+                        // The right-hand side reading the same name is an
+                        // alias, not an append.
+                        collect_idents(r, other);
+                    }
+                    None => {
+                        other.push(id.name.clone());
+                        collect_idents(value, other);
+                    }
+                }
+            }
+            // A nested loop or branch may append to the same name, and that
+            // is still an append; anything else it does is not.
+            Stmt::While { cond, body, .. } => {
+                collect_idents(cond, other);
+                scan_str_appends_block(body, appended, other);
+            }
+            Stmt::For { iter, body, .. } => {
+                collect_idents(iter, other);
+                scan_str_appends_block(body, appended, other);
+            }
+            other_stmt => collect_idents_stmt_into(other_stmt, other),
+        }
+    }
+}
+
+/// One statement's mentions, for the scanner above. `collect_idents_block`
+/// walks blocks; this is its per-statement half, which that function keeps
+/// private inside its own loop.
+fn collect_idents_stmt_into(st: &Stmt, out: &mut Vec<String>) {
+    let one = grasm_syntax::ast::Block {
+        stmts: vec![st.clone()],
+        span: st_span(st),
+    };
+    collect_idents_block(&one, out);
+}
+
+fn st_span(st: &Stmt) -> Span {
+    match st {
+        Stmt::Let { span, .. }
+        | Stmt::LetTuple { span, .. }
+        | Stmt::Assign { span, .. }
+        | Stmt::While { span, .. }
+        | Stmt::For { span, .. }
+        | Stmt::Parallel { span, .. }
+        | Stmt::Spawn { span, .. }
+        | Stmt::With { span, .. }
+        | Stmt::Break(span)
+        | Stmt::Continue(span)
+        | Stmt::Return(_, span) => *span,
+        Stmt::Expr(e) => e.span(),
+    }
+}
+
 fn pushed_only_lists(block: &grasm_syntax::ast::Block) -> Vec<String> {
     let mut pushed: Vec<String> = Vec::new();
     let mut bad: Vec<String> = Vec::new();
@@ -4575,6 +4729,20 @@ fn scan_pushes_expr(e: &Expr, pushed: &mut Vec<String>, bad: &mut Vec<String>) {
         Expr::Closure { body, .. } => scan_pushes_expr(body, pushed, bad),
         _ => {}
     }
+}
+
+/// A string a loop only appends to, with its buffer held open.
+///
+/// The same shape as `PinnedAppend` and for the same reason: appending is
+/// then a bounds compare and a store instead of a call into the runtime.
+#[derive(Clone, Copy)]
+struct PinnedStr {
+    str_var: Variable,
+    data_var: Variable,
+    len_var: Variable,
+    cap_var: Variable,
+    data_out: Value,
+    cap_out: Value,
 }
 
 /// A list a loop is filling, with its storage pinned for the duration.
@@ -5696,7 +5864,221 @@ impl FnCx<'_, '_> {
             }
         }
         self.appends.push(appending);
+
+        // Strings the body only appends to themselves get the same treatment:
+        // the buffer, its length and its capacity are taken once and held in
+        // registers, so `acc += "{x}"` is a bounds compare and a store.
+        let mut str_open: HashMap<String, PinnedStr> = HashMap::new();
+        if !body_leaves_early(body) {
+            for name in str_appended_only(body) {
+                if header_names.contains(&name) || header_bad.contains(&name) {
+                    continue;
+                }
+                if self.str_append_state(&name).is_some() {
+                    continue;
+                }
+                let Some((var, VType::Str)) = self.lookup(&name) else {
+                    continue;
+                };
+                // Every append has to be one the buffer takes, or none of
+                // them can be: see `str_append_rhs`.
+                let mut rhs: Vec<&Expr> = Vec::new();
+                str_append_rhs(body, &name, &mut rhs);
+                let mut all_inline = !rhs.is_empty();
+                for r in rhs {
+                    match r {
+                        Expr::Str(pieces, _) if self.pieces_write_inline(pieces) => {}
+                        _ => {
+                            all_inline = false;
+                            break;
+                        }
+                    }
+                }
+                if !all_inline {
+                    continue;
+                }
+                let ptr_ty = self.cg.module.target_config().pointer_type();
+                let slot =
+                    self.b
+                        .create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
+                            cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                            24,
+                            3,
+                        ));
+                let data_out = self.b.ins().stack_addr(ptr_ty, slot, 0);
+                let len_out = self.b.ins().stack_addr(ptr_ty, slot, 8);
+                let cap_out = self.b.ins().stack_addr(ptr_ty, slot, 16);
+                let cur = self.b.use_var(var);
+                let held = self
+                    .call_rt("grasm_str_pin_begin", &[cur, data_out, len_out, cap_out])
+                    .unwrap();
+                self.b.def_var(var, held);
+                let flags = cranelift_codegen::ir::MemFlags::trusted();
+                let d = self.b.ins().load(types::I64, flags, data_out, 0);
+                let l = self.b.ins().load(types::I64, flags, len_out, 0);
+                let c = self.b.ins().load(types::I64, flags, cap_out, 0);
+                let data_var = self.new_var(&VType::I64);
+                let len_var = self.new_var(&VType::I64);
+                let cap_var = self.new_var(&VType::I64);
+                self.b.def_var(data_var, d);
+                self.b.def_var(len_var, l);
+                self.b.def_var(cap_var, c);
+                str_open.insert(
+                    name,
+                    PinnedStr {
+                        str_var: var,
+                        data_var,
+                        len_var,
+                        cap_var,
+                        data_out,
+                        cap_out,
+                    },
+                );
+            }
+        }
+        self.str_appends.push(str_open);
         Ok(())
+    }
+
+    /// The open buffer for a string, if some enclosing loop is filling it.
+    fn str_append_state(&self, name: &str) -> Option<PinnedStr> {
+        for scope in self.str_appends.iter().rev() {
+            if let Some(state) = scope.get(name) {
+                return Some(*state);
+            }
+        }
+        None
+    }
+
+    /// Makes room for `need` more bytes in a pinned buffer.
+    fn str_pin_reserve(&mut self, pin: &PinnedStr, need: i64) {
+        let grow = self.b.create_block();
+        let room = self.b.create_block();
+        let cont = self.b.create_block();
+        let len = self.b.use_var(pin.len_var);
+        let cap = self.b.use_var(pin.cap_var);
+        let want = self.b.ins().iadd_imm(len, need);
+        let full = self.b.ins().icmp(IntCC::SignedGreaterThan, want, cap);
+        self.b.ins().brif(full, grow, &[], room, &[]);
+        self.filled = true;
+
+        self.goto_block(grow);
+        let sv = self.b.use_var(pin.str_var);
+        let len_now = self.b.use_var(pin.len_var);
+        let n = self.b.ins().iconst(types::I64, need);
+        self.call_rt(
+            "grasm_str_pin_grow",
+            &[sv, len_now, n, pin.data_out, pin.cap_out],
+        );
+        let flags = cranelift_codegen::ir::MemFlags::trusted();
+        let fresh_data = self.b.ins().load(types::I64, flags, pin.data_out, 0);
+        let fresh_cap = self.b.ins().load(types::I64, flags, pin.cap_out, 0);
+        self.b.def_var(pin.data_var, fresh_data);
+        self.b.def_var(pin.cap_var, fresh_cap);
+        self.b.ins().jump(cont, &[]);
+        self.filled = true;
+
+        self.goto_block(room);
+        self.b.ins().jump(cont, &[]);
+        self.filled = true;
+        self.goto_block(cont);
+    }
+
+    /// Whether every piece is one this writes into a buffer directly.
+    ///
+    /// Asked before any of them is written, because the decision cannot be
+    /// taken back halfway: text always, an `i64` always, anything else not
+    /// yet.
+    fn pieces_write_inline(&mut self, pieces: &[StrPiece]) -> bool {
+        for p in pieces {
+            if let StrPiece::Expr(e) = p {
+                if !matches!(self.probe_type(e), Ok(VType::I64)) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// One interpolation piece written into a pinned buffer.
+    ///
+    /// `false` when the piece is a shape this does not write inline, and the
+    /// caller must not have started: the decision is made for every piece
+    /// before any of them is emitted.
+    fn str_pin_piece(&mut self, pin: &PinnedStr, piece: &StrPiece) -> CResult<bool> {
+        match piece {
+            StrPiece::Text(t) => {
+                if t.is_empty() {
+                    return Ok(true);
+                }
+                let bytes = t.as_bytes();
+                self.str_pin_reserve(pin, bytes.len() as i64);
+                let data = self.b.use_var(pin.data_var);
+                let at = self.b.use_var(pin.len_var);
+                let base = self.b.ins().iadd(data, at);
+                let mf = cranelift_codegen::ir::MemFlags::trusted();
+                if bytes.len() <= 8 {
+                    for (i, c) in bytes.iter().enumerate() {
+                        let b = self.b.ins().iconst(types::I8, i64::from(*c));
+                        self.b.ins().store(mf, b, base, i as i32);
+                    }
+                } else {
+                    let (ptr, len) = self.str_ptr_len(t);
+                    self.call_rt("grasm_str_pin_text", &[data, at, ptr, len]);
+                }
+                let next = self.b.ins().iadd_imm(at, bytes.len() as i64);
+                self.b.def_var(pin.len_var, next);
+                Ok(true)
+            }
+            StrPiece::Expr(inner) => {
+                let want = VType::I64;
+                if !matches!(self.probe_type(inner), Ok(VType::I64)) {
+                    return Ok(false);
+                }
+                let (v, vt) = self.eval_expr_expecting(inner, Some(&want))?;
+                if vt != VType::I64 {
+                    return Ok(false);
+                }
+                // Twenty bytes covers every `i64`, so the room is made once
+                // whatever the value turns out to be.
+                self.str_pin_reserve(pin, 20);
+                let data = self.b.use_var(pin.data_var);
+                let at = self.b.use_var(pin.len_var);
+                // One digit is the common case in a loop building text, and
+                // it is a store rather than a call.
+                let small = self.b.create_block();
+                let big = self.b.create_block();
+                let cont = self.b.create_block();
+                let lo = self.b.ins().icmp_imm(IntCC::SignedLessThan, v, 10);
+                let hi = self.b.ins().icmp_imm(IntCC::SignedGreaterThanOrEqual, v, 0);
+                let one = self.b.ins().band(lo, hi);
+                self.b.ins().brif(one, small, &[], big, &[]);
+                self.filled = true;
+
+                self.goto_block(small);
+                let base = self.b.ins().iadd(data, at);
+                let digit = self.b.ins().iadd_imm(v, i64::from(b'0'));
+                let byte = self.b.ins().ireduce(types::I8, digit);
+                let mf = cranelift_codegen::ir::MemFlags::trusted();
+                self.b.ins().store(mf, byte, base, 0);
+                let n1 = self.b.ins().iadd_imm(at, 1);
+                self.b.def_var(pin.len_var, n1);
+                self.b.ins().jump(cont, &[]);
+                self.filled = true;
+
+                self.goto_block(big);
+                let wrote = self
+                    .call_rt("grasm_str_pin_i64", &[data, at, v])
+                    .unwrap();
+                let nn = self.b.ins().iadd(at, wrote);
+                self.b.def_var(pin.len_var, nn);
+                self.b.ins().jump(cont, &[]);
+                self.filled = true;
+
+                self.goto_block(cont);
+                Ok(true)
+            }
+        }
     }
 
     /// Hands every pinned list its length back, and forgets the pins.
@@ -5704,6 +6086,13 @@ impl FnCx<'_, '_> {
     /// Emitted where the loop has finished — until this runs the elements are
     /// in the buffer and the list does not know how many there are.
     fn close_loop_appends(&mut self) {
+        if let Some(open) = self.str_appends.pop() {
+            for state in open.values() {
+                let held = self.b.use_var(state.str_var);
+                let written = self.b.use_var(state.len_var);
+                self.call_rt("grasm_str_pin_end", &[held, written]);
+            }
+        }
         let Some(open) = self.appends.pop() else {
             return;
         };
@@ -6484,6 +6873,14 @@ impl FnCx<'_, '_> {
                         // go onto the buffer one at a time, so the string it
                         // would have built is never a value.
                         if let Expr::Str(pieces, _) = piece {
+                            if let Some(pin) = self.str_append_state(&id.name) {
+                                if self.pieces_write_inline(pieces) {
+                                    for p in pieces {
+                                        self.str_pin_piece(&pin, p)?;
+                                    }
+                                    return Ok(StmtOut::Value(None));
+                                }
+                            }
                             let mut cur = self.b.use_var(var);
                             for p in pieces {
                                 cur = self.append_piece(cur, p)?;
@@ -6699,6 +7096,7 @@ impl FnCx<'_, '_> {
                 if ct != VType::Bool {
                     self.pinned.pop();
                     self.appends.pop();
+                    self.str_appends.pop();
                     return nope(cond.span(), "non-bool while condition");
                 }
                 self.b.ins().brif(c, body_blk, &[], exit, &[]);
@@ -8174,6 +8572,19 @@ this case",
         };
         if !matches!(self.probe_type(rhs), Ok(VType::Str)) {
             return Ok(None);
+        }
+        // A string this loop is filling has its buffer open, so the pieces
+        // are written straight into it: a bounds compare and a store, with no
+        // call at all for a literal or a single digit.
+        if let Some(pin) = self.str_append_state(&dest.name) {
+            if let Expr::Str(pieces, _) = &**rhs {
+                if self.pieces_write_inline(pieces) {
+                    for p in pieces {
+                        self.str_pin_piece(&pin, p)?;
+                    }
+                    return Ok(Some(()));
+                }
+            }
         }
         // An interpolation appends its pieces straight onto the buffer. The
         // string it would otherwise build is a value nobody keeps: `acc = acc

@@ -2537,6 +2537,137 @@ pub unsafe extern "C" fn grasm_str_append_bool(a: *mut RtVal, v: i64) -> *mut Rt
     str_append_text(a, text.as_ptr(), text.len())
 }
 
+/// Opens a string for appending, handing the caller its buffer.
+///
+/// The same bargain `grasm_list_append_begin` strikes for lists: the string
+/// is made uniquely owned and spilled to the heap, its character index is
+/// dropped, and the caller gets the pointer, the length and the capacity so
+/// that appending is a bounds compare and a store rather than a call. The
+/// length in the value itself is left where it was and is written back by
+/// `grasm_str_pin_end`, so nothing may read the string until then — which is
+/// the same rule the list machinery already follows, and the reason only a
+/// name the loop *only appends to* is ever pinned.
+///
+/// Measured worth: a free append is 1.81x on the string-building workload,
+/// and this is how much of that is reachable.
+///
+/// # Safety: `a` is a live string whose reference transfers here; the three
+/// out-pointers are writable.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_str_pin_begin(
+    a: *mut RtVal,
+    out_data: *mut i64,
+    out_len: *mut i64,
+    out_cap: *mut i64,
+) -> *mut RtVal {
+    let target = if (*a).rc.load(Relaxed) == 1 {
+        a
+    } else {
+        let RtPayload::Str(sa) = &(*a).payload else {
+            grasm_panic_msg_str("append to a non-string");
+        };
+        let fresh = alloc(RtPayload::Str(RtStr::of(sa)));
+        dec(a);
+        fresh
+    };
+    let RtPayload::Str(rs) = &mut (*target).payload else {
+        grasm_panic_msg_str("append to a non-string");
+    };
+    rs.index = std::sync::OnceLock::new();
+    // Always a heap buffer while pinned: the inline one has no spare room to
+    // hand out, and spilling once here is cheaper than deciding per append.
+    if let StrData::Inline { bytes, len } = &rs.s {
+        let mut out = String::with_capacity(64);
+        out.push_str(std::str::from_utf8_unchecked(&bytes[..*len as usize]));
+        rs.s = StrData::Heap(out);
+    }
+    let StrData::Heap(h) = &mut rs.s else {
+        unreachable!()
+    };
+    let v = h.as_mut_vec();
+    *out_data = v.as_mut_ptr() as i64;
+    *out_len = v.len() as i64;
+    *out_cap = v.capacity() as i64;
+    target
+}
+
+/// More room, with `len` bytes of it already written by the caller.
+///
+/// # Safety: `a` is a string opened by `grasm_str_pin_begin`, `len` counts
+/// bytes the caller has written into the buffer it was given, and the two
+/// out-pointers are writable.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_str_pin_grow(
+    a: *mut RtVal,
+    len: i64,
+    want: i64,
+    out_data: *mut i64,
+    out_cap: *mut i64,
+) {
+    let RtPayload::Str(rs) = &mut (*a).payload else {
+        grasm_panic_msg_str("append to a non-string");
+    };
+    let StrData::Heap(h) = &mut rs.s else {
+        grasm_panic_msg_str("append to a string that was not opened");
+    };
+    let v = h.as_mut_vec();
+    v.set_len(len as usize);
+    v.reserve(want.max(1) as usize);
+    *out_data = v.as_mut_ptr() as i64;
+    *out_cap = v.capacity() as i64;
+}
+
+/// Closes a string opened for appending, writing back what was written.
+///
+/// # Safety: as `grasm_str_pin_grow`. The bytes the caller wrote must be
+/// valid UTF-8, which they are: every piece appended is a whole `&str`.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_str_pin_end(a: *mut RtVal, len: i64) {
+    let RtPayload::Str(rs) = &mut (*a).payload else {
+        grasm_panic_msg_str("append to a non-string");
+    };
+    rs.index = std::sync::OnceLock::new();
+    if let StrData::Heap(h) = &mut rs.s {
+        h.as_mut_vec().set_len(len as usize);
+    }
+}
+
+/// The decimal digits of `v`, written at `at` in a buffer the caller owns,
+/// answering how many bytes were written.
+///
+/// A leaf: no reference count, no payload, no capacity. The caller has
+/// already made room for twenty bytes.
+///
+/// # Safety: `data + at` through `data + at + 20` is writable.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_str_pin_i64(data: i64, at: i64, v: i64) -> i64 {
+    let p = (data as *mut u8).add(at as usize);
+    let mut buf = [0u8; 20];
+    let i = i64_digits(v, &mut buf);
+    let n = buf.len() - i;
+    for k in 0..n {
+        *p.add(k) = buf[i + k];
+    }
+    n as i64
+}
+
+/// `len` bytes copied to `at` in a buffer the caller owns, answering `len`.
+///
+/// A leaf, like `grasm_str_pin_i64`: the caller has already made room.
+///
+/// # Safety: `data + at` through `data + at + len` is writable, and `ptr`
+/// through `ptr + len` is readable.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_str_pin_text(
+    data: i64,
+    at: i64,
+    ptr: *const u8,
+    len: i64,
+) -> i64 {
+    std::ptr::copy_nonoverlapping(ptr, (data as *mut u8).add(at as usize), len as usize);
+    len
+}
+
 /// A tuple of two, in one call and one allocation.
 ///
 /// A tuple literal used to be built as a list and then sealed: `list_new`, a

@@ -7,6 +7,12 @@
 //! nn-2-true-1.5
 //! 01234
 //! [0:0][1:2][2:4][3:6][4:8]
+//! 1390 545082
+//! x0:-1234:-2468:-3702:-4936:
+//! 012345 21
+//! 0123
+//! 00 01 02 10 11 12 20 21 22 
+//! false-false-true-
 // A string built by appending to itself is the same string however the
 // backend chooses to build it. `s = s + rest` and `s += rest` are compiled
 // as an append rather than a rebuild — in place when nothing else holds the
@@ -47,4 +53,62 @@ fn main() {
         z += "[{i}:{i * 2}]"
     }
     print(z)
+
+    // A string a loop only appends to has its buffer held open, and the
+    // length in the value itself is not written back until the loop ends —
+    // so every shape that could read a stale one has to keep it off that
+    // path, and every shape that takes it has to come out the same.
+    //
+    // Past the inline buffer and past a growth of the heap one.
+    var g = ""
+    for i in 0..300 {
+        g += "[{i}]"
+    }
+    var gh = 0
+    for c in g.codes() {
+        gh = (gh * 31 + c) % 1000003
+    }
+    print("{g.len()} {gh}")
+
+    // Negative and multi-digit, which the one-digit store does not take.
+    var m = "x"
+    for i in 0..5 {
+        m = m + "{0 - i * 1234}:"
+    }
+    print(m)
+
+    // Read inside the loop: the length it sees must be the length it has.
+    var r = ""
+    var seen = 0
+    for i in 0..6 {
+        r += "{i}"
+        seen = seen + r.len()
+    }
+    print("{r} {seen}")
+
+    // Left early, so what was written before the `break` still counts.
+    var e = ""
+    for i in 0..10 {
+        if i == 4 {
+            break
+        }
+        e += "{i}"
+    }
+    print(e)
+
+    // A nested loop appending to the same string.
+    var n = ""
+    for i in 0..3 {
+        for j in 0..3 {
+            n += "{i}{j} "
+        }
+    }
+    print(n)
+
+    // A piece that is not an integer, so the whole loop keeps the older path.
+    var b2 = ""
+    for i in 0..3 {
+        b2 += "{i > 1}-"
+    }
+    print(b2)
 }

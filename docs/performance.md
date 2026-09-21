@@ -347,6 +347,35 @@ slightly *worse* than the push change alone. That is the second time an
 positive. The difference is not the inlining: writing it out lets the specific
 case skip work the general function still has to be able to do.
 
+**A string a loop only appends to has its buffer held open.** `acc += "{x}"`
+was a call into the runtime per character, and after the fast-path work above
+that call was a single flat frame at 42% of the string-building workload. The
+same bargain lists have had since `grasm_list_append_begin`: the buffer, its
+length and its capacity are taken once per loop and held in registers, so an
+append is a capacity compare and a store — one store for a one-digit integer,
+constant stores for a short literal — with a leaf call only for a longer
+number or a longer piece of text.
+
+Bounded first, by building a runtime whose append does nothing at all:
+**1.81x**. Built, it is **1.41x** — 21.8 ms of processor time to 15.5 — and
+1.45x on `parwords`. Done, 2026-09-21.
+
+The rule that makes it safe is the one lists already follow: while the buffer
+is open the string's own length is stale, so only a name the loop does
+nothing to but append to itself is ever pinned, and a body that can `break`,
+`return` or `fail` is not pinned at all.
+
+That rule has a second half which the first version missed. A pinned string's
+*every* append has to go through the buffer: one that fell back to the older
+path would write into the value while the length said otherwise, and the
+length written back at the end of the loop would discard it. `acc += "{i > 1}-"`
+has a `bool` piece, which the inline writer does not take — and that loop
+printed nothing where the interpreter printed `false-false-true-`. So the
+decision belongs at the open site rather than per statement:
+`str_append_rhs` collects the right-hand side of every self-append to a
+candidate, and the string is pinned only if all of them are shapes the buffer
+takes.
+
 **Things that were already fast** and do not need looking at again: scalar list
 indexing is pinned and inlined before a loop with an inline bounds check
 (`pin_loop_lists`); `bool` lists are one byte an element; a list of four or
