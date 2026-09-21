@@ -1291,6 +1291,33 @@ Storing it inline is therefore permitted by the semantics already; that `[Node]`
 holds boxes is an implementation choice in `ListData`. That is the change worth
 costing, and it is the only one that reaches this row.
 
+**And it is worth 2.245x, measured.** The same benchmark in Rust, written two
+ways -- `Vec<Node>` as it ships, and `Vec<Box<Node>>`, which allocates 787,300
+times exactly as Grasm does -- interleaved, 15 runs each, both printing
+294954900:
+
+| `tree` | min | median |
+| --- | --- | --- |
+| Rust, `Vec<Node>` | 10.00 ms | 10.46 ms |
+| Rust, `Vec<Box<Node>>` | 22.46 ms | 23.08 ms |
+| Grasm | 27.5 ms | |
+
+Unlike the boxed-`matmul` probe further up, this model is exact: the allocation
+counts match to the unit. So of `tree`'s 2.87x, **2.245x is the representation**
+and Grasm's own overhead over Rust doing the identical work is **1.22x** --
+reference counting every one of those boxes and still within a quarter of a
+`Box::new` per node. Inline storage would put this row near 1.2x, which is the
+largest single move available anywhere in this document.
+
+**The prerequisite is a borrowed list read.** Inline storage only pays if
+`for k in n.kids` can hand the body a pointer into the list rather than copy an
+element out of it; otherwise the allocations move from the build to the walk.
+`grasm_struct_borrow_at` already does exactly this for a field -- "sound only
+while the struct holding it is alive, which the caller establishes" -- and
+there is no list equivalent: every element read is a `grasm_list_get` that
+returns a +1 reference. That function, and the analysis that says when a loop
+variable is only read, is the first piece and is worth having on its own.
+
 ## Where the remaining gap actually is
 
 Timed head to head by processor time, and split by compiling cut-down versions
