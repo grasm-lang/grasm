@@ -151,6 +151,16 @@ pub fn canonical(diff: str) -> str {
             }
             started = true
         }
+        // `\ No newline at end of file` is a note about the line above it,
+        // not a line of the patch, and git's patch-id passes straight over
+        // it. Falling through to the state machine did worse than hash it:
+        // after a hunk is consumed the next line must begin `diff `, so a
+        // marker there ended the walk and every diff touching a file without
+        // a trailing newline hashed as its own first hunk. Four of this
+        // repository's own commits hashed identically because of it.
+        if line.starts_with("\\") {
+            continue
+        }
         if before == 0 - 1 {
             if line.starts_with("index ") {
                 // Blob hashes are about the file's history, not the change —

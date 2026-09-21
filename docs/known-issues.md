@@ -5,7 +5,7 @@ Every defect that is known and not fixed, with its severity from
 to paste. S1 and S2 block a release; S3 and S4 do not, and this file is what
 makes shipping them honest rather than quiet.
 
-**Open S1: none. Open S2: none. Open S3: one. Open S4: one.**
+**Open S1: none. Open S2: none. Open S3: none. Open S4: one.**
 
 Closed on 2026-09-21: `fuzz_exits` disagreed on four programs in eighty-five,
 and each was the same leak. A tuple literal of two or three elements is built
@@ -16,12 +16,16 @@ abandoned with nowhere to release them from. `elem_can_leave` asks the whole
 question now, and T-TUPLE carries all four spellings; it exits 7 under
 `GRASM_LEAK_CHECK=1` on the compiler before the fix.
 
-## S3 — `gitsigndiff` differs on eight cases in a hundred and five
-
-`scripts/gitsign_diff.sh` reports `agreeing: 97   differing: 8`, and several
-of the differing cases produce the *same* wrong hash, which points at one
-cause rather than eight. Also present on `bcf035d`, so it predates this
-session.
+Closed on 2026-09-21: `gitsigndiff` differed on eight cases in a hundred and
+five, and four of them produced the *same* wrong hash — which is not what
+eight independent errors look like. `\ No newline at end of file` is a note
+about the line above it, not a line of the patch, and git's `patch-id` passes
+over it. `packages/patchid` fell through to its state machine, where after a
+hunk's lines are consumed the next line must begin `diff ` — so a marker there
+ended the walk, and every diff touching a file without a trailing newline
+hashed as its own first hunk. The failing commits shared a first file, hence
+one hash for four inputs. The marker is skipped now, and the gate reports
+105/105.
 
 ## S4 — `grasm_sema`'s deep-chain tests overflow the stack in a debug build
 
