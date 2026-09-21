@@ -777,15 +777,27 @@ samples, and on the real rows both together measured *worse*:
 Both reverted. A leaf high in a sample histogram is not the same as a leaf on
 the critical path, which is the lesson worth keeping.
 
-**What is left is the thread-local.** The runtime already has the shape for it:
-`alloc_in` takes `&Local` so a caller that is reaching `LOCAL` anyway reaches
-it once, and the backend already caches one per-function value this way for
-`grasm_stack_floor`. Extending that to the hot entries -- fetch the thread's
-state once per compiled function and pass it to `grasm_struct_make` and
-`grasm_val_dec` -- is worth up to 28% of allocation, which is most of `tree`.
-Before building it: a cached pointer is sound only if a compiled function
-cannot resume on a different thread than it started on, and whether an effect
-handler can do that has to be established first, not assumed.
+**The thread-local is not on the critical path either — built and reverted.**
+The soundness question settled cleanly: there is no continuation capture and no
+stack switching in this runtime, threads only ever run a closure to completion,
+so a frame belongs to one thread and may hold its state pointer. So it was
+built: `grasm_local_ptr`, a `grasm_struct_make_in` taking the pointer, and a
+`local` on `FnCx` fetched in a block that dominates the body.
+
+In the box loop that removes one of the two lookups per iteration, and should
+have been worth ~14%. It was worth **1%** (19.91 ns to 19.72). Every real row
+got worse, `fib` worst at 7.22 ms against 5.50, which is the per-call lookup
+this crude version adds to functions that allocate nothing.
+
+So a leaf worth 28% of samples is worth 1% of the clock. That is the same
+mistake as the memmove above, made twice in one session on the same evidence:
+**`sample`'s leaf histogram attributes cost to cheap leaf calls that the
+out-of-order core is already hiding.** The way to price something here is to
+remove it and time the result, never to read its share off a profile.
+
+Which leaves the cost of a box unattributed at ~19.7 ns, with the two largest
+apparent contributors both disproved. Attributing it needs hardware counters,
+not sampling.
 
 ### Three more ceilings, 2026-09-21
 
