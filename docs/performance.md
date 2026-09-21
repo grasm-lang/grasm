@@ -636,6 +636,40 @@ memory operations in flight, which is what this loop is actually short of —
 removing one indexed *load* from the body saved 25% where removing four ALU
 instructions saved nothing.
 
+### `matmul` is not a codegen gap at all — 2026-09-21
+
+Everything above probes the *code* `matmul` runs. None of it probed the data.
+A Grasm list is `Vec<*mut RtVal>`: eight bytes of pointer per element, each
+pointing at a separately allocated 64-byte value. Rust's is `Vec<i64>`.
+
+So give Rust our layout and see what rustc can do with it. Same program, same
+algorithm, elements changed to a 64-byte `#[repr(C)]` struct holding an atomic
+refcount and the value, one allocation each, reached through a pointer in a
+`Vec`. Kernel only, timed inside the process with `Instant`, best of five, and
+both print `47998000`:
+
+| `matmul` kernel | |
+| --- | --- |
+| Rust, `Vec<i64>` | 2.31 ms |
+| Rust, 64-byte boxed elements | 6.61 ms |
+| Grasm (9.29 ms whole program less a 2.54 ms setup-only build) | **6.75 ms** |
+
+**Grasm's kernel is within 2% of what rustc produces from the same layout.**
+Not close to it — level with it, with rustc free to use every optimisation it
+has, including the unrolling and vectorisation we lack. The 1.87x on this row
+is the representation, all of it, and no amount of backend work reaches it:
+the 1.21x vectoriser and the 1.37x unroller above would move a number that is
+already at parity with the best another compiler manages on these bytes.
+
+What it costs to fix is now sized too. Packed scalar storage would take the
+kernel toward the 2.31 ms column and the setup with it, since most of that
+2.54 ms is allocating 120,000 boxed values. That is `matmul` at parity, and it
+is the only thing that gets there.
+
+`sieve` shares the layout and does not share the problem: its elements are
+booleans, which are interned, so it pays the eight bytes of pointer but never
+allocates, and it already runs at 1.08x.
+
 ### Three more ceilings, 2026-09-21
 
 **Unrolling `sieve`'s inner loop: 1.00x.** `while j <= limit { flags[j] = false;
