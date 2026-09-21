@@ -34,6 +34,9 @@ def _lib(name):
 
 
 leaked = _lib("leaks").leaked
+# One binary, rebuilt in place, instead of one file per program (see the module).
+build_native = _lib("inplace").build
+
 
 _spec = _ilu.spec_from_file_location(
     "grasm_fresh",
@@ -116,7 +119,7 @@ def run(args):
     return p.stdout + p.stderr, p.returncode
 
 def main():
-    count = int(sys.argv[1]) if len(sys.argv) > 1 else 200
+    count = int(sys.argv[1]) if len(sys.argv) > 1 else 500
     base = int(sys.argv[2]) if len(sys.argv) > 2 else 0
     d = tempfile.mkdtemp(prefix="merge_fuzz_")
     src, out = os.path.join(d, "p.gr"), os.path.join(d, "p")
@@ -127,12 +130,19 @@ def main():
     declined = 0
     for s in range(base, base + count):
         open(src, "w").write(gen(s))
-        _, rc = run([G, "check", src])
+        # No `check` run ahead of the build: the build typechecks this same
+        # program on its way to code, so one that succeeded has already said it
+        # was well-typed, and checking first spent a third of the run proving
+        # it twice. The check moves to the build-failure path, which is where
+        # an invalid program and a compiler that failed on a valid one have to
+        # be told apart — and telling them apart is what it was always for.
+        bp = build_native(G, src, out, "--native")
+        why, rc = bp.stdout + bp.stderr, bp.returncode
         if rc != 0:
-            rejected += 1
-            continue
-        why, rc = run([G, "build", src, "--native", "-o", out])
-        if rc != 0:
+            _, crc = run([G, "check", src])
+            if crc != 0:
+                rejected += 1
+                continue
             first = why.strip().splitlines()[0] if why.strip() else "(silent)"
             reason = first.split(": ", 1)[-1]
             # "codegen bug" is the backend failing its own verifier, which is a
@@ -159,7 +169,6 @@ def main():
             mism += 1
             print(f"LEAKS seed={s}: {held}")
             continue
-        os.path.exists(out) and os.remove(out)
         checked += 1
         if (a, ra) != (b, rb):
             mism += 1

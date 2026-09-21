@@ -48,6 +48,9 @@ def _lib(name):
 
 
 leaked = _lib("leaks").leaked
+# One binary, rebuilt in place, instead of one file per program (see the module).
+build_native = _lib("inplace").build
+
 
 _spec = _ilu.spec_from_file_location(
     "grasm_fresh",
@@ -358,20 +361,27 @@ def check_one(src, work):
     with open(path, "w") as f:
         f.write(src)
 
-    rc, out, err = run([GRASM, "check", path])
-    if rc != 0:
-        return ("rejected", err.strip())
-
+    # `check` is not run up front. Both builds below typecheck this very same
+    # program on their way to code, so a build that succeeded has already said
+    # it was well-typed, and a check spawn ahead of them spent a seventh of the
+    # run re-deriving it. It runs where the answer is actually in doubt: a
+    # build that failed, which has to say whether the generator emitted an
+    # invalid program or the compiler failed on a valid one.
     ir, io, ie = run([GRASM, "run", path])
 
     bundle = os.path.join(work, "p.bundle")
-    rc, _, err = run([GRASM, "build", path, "-o", bundle])
+    bp = build_native(GRASM, path, bundle)
+    rc, err = bp.returncode, bp.stderr
     if rc != 0:
+        crc, _, cerr = run([GRASM, "check", path])
+        if crc != 0:
+            return ("rejected", cerr.strip())
         return ("bundle build failed", err.strip())
     br, bo, be = run([bundle])
 
     native = os.path.join(work, "p.native")
-    rc, _, err = run([GRASM, "build", path, "--native", "-o", native])
+    bp = build_native(GRASM, path, native, "--native")
+    rc, err = bp.returncode, bp.stderr
     if rc != 0:
         if "does not yet support" in err:
             # Counted, not swallowed. An unlabelled `None` here is
@@ -397,7 +407,7 @@ def check_one(src, work):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--count", type=int, default=200)
+    ap.add_argument("--count", type=int, default=500)
     ap.add_argument("--seed", type=int, default=None)
     ap.add_argument("--keep", action="store_true")
     args = ap.parse_args()

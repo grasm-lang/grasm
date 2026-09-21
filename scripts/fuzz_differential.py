@@ -46,6 +46,8 @@ def _lib(name):
 
 
 leaked = _lib("leaks").leaked
+# One binary, rebuilt in place, instead of one file per program (see the module).
+build_native = _lib("inplace").build
 
 _spec = _ilu.spec_from_file_location(
     "grasm_fresh", os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib", "fresh.py")
@@ -552,14 +554,27 @@ def run(cmd, **kw):
 
 
 def check(src_path, bin_path):
-    """(ok, detail). Compares stdout and exit code, as difftest does."""
-    build = run([GRASM, "build", src_path, "--native", "-o", bin_path])
+    """"ok", "reject" (a generator bug) or "fail" (a compiler one), and detail.
+
+    A program this generator emits must typecheck, and one that does not is a
+    generator bug worth hearing about immediately. Establishing that does not
+    need its own `grasm check` run: `build --native` typechecks the very same
+    program on its way to code, so a build that succeeded has already said the
+    program was well-typed. A separate check spawn spent a third of this
+    fuzzer's compile time re-deriving what the build was about to prove, so it
+    runs only when the build failed — the one case where the answer is in
+    doubt, and the only case that has to tell the two kinds of bug apart.
+    """
+    build = build_native(GRASM, src_path, bin_path, "--native")
     if not os.path.exists(bin_path):
-        return False, "native build failed:\n" + (build.stdout + build.stderr)[:600]
+        checked = run([GRASM, "check", src_path])
+        if checked.returncode != 0:
+            return "reject", checked.stdout + checked.stderr
+        return "fail", "native build failed:\n" + (build.stdout + build.stderr)[:600]
     interp = run([GRASM, "run", src_path])
     native = run([bin_path])
     if interp.stdout != native.stdout or interp.returncode != native.returncode:
-        return False, (
+        return "fail", (
             f"exit {interp.returncode} (interp) vs {native.returncode} (native)\n"
             f"--- interpreter ---\n{interp.stdout}"
             f"--- native ---\n{native.stdout}"
@@ -569,13 +584,13 @@ def check(src_path, bin_path):
     # (F57).
     held = leaked(bin_path) if native.returncode == 0 else None
     if held:
-        return False, f"native leaks: {held}"
-    return True, ""
+        return "fail", f"native leaks: {held}"
+    return "ok", ""
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--count", type=int, default=200)
+    ap.add_argument("--count", type=int, default=500)
     ap.add_argument("--seed", type=int, default=None)
     ap.add_argument("--keep", action="store_true", help="keep failing programs")
     args = ap.parse_args()
@@ -597,15 +612,10 @@ def main():
         with open(path, "w") as f:
             f.write(src)
 
-        # A program this generator emits must typecheck. If it does not, the
-        # generator is wrong, and that is worth hearing about immediately.
-        checked = run([GRASM, "check", path])
-        if checked.returncode != 0:
-            rejected.append((seed, checked.stdout + checked.stderr))
-            continue
-
-        ok, detail = check(path, os.path.join(work, f"p{seed}.bin"))
-        if not ok:
+        status, detail = check(path, os.path.join(work, "p.bin"))
+        if status == "reject":
+            rejected.append((seed, detail))
+        elif status == "fail":
             failures.append((seed, src, detail))
         if (i + 1) % 25 == 0:
             print(f"  {i + 1}/{args.count}  mismatches={len(failures)}")
