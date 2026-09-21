@@ -745,6 +745,7 @@ impl<'m> Codegen<'m> {
             ("grasm_list_push", vec![i64t, i64t], Some(i64t)),
             ("grasm_list_len", vec![i64t], Some(i64t)),
             ("grasm_list_get", vec![i64t, i64t], Some(i64t)),
+            ("grasm_list_borrow_at", vec![i64t, i64t], Some(i64t)),
             ("grasm_box_i64", vec![i64t], Some(i64t)),
             ("grasm_box_unit", vec![], Some(i64t)),
             ("grasm_box_ref", vec![i64t], Some(i64t)),
@@ -5241,161 +5242,206 @@ fn inline_expr_ok(e: &Expr, budget: &mut i32, calls: &mut u32) -> bool {
     }
 }
 
-fn param_is_borrowed(name: &str, body: &grasm_syntax::ast::Block) -> bool {
-    let mut ok = true;
-    scan_borrow_block(name, body, &mut ok);
-    ok
+/// The verdict, and what a call site is allowed to do with the name.
+struct BorrowScan<'a> {
+    ok: bool,
+    /// When present, a bare mention is allowed where it is an argument to a
+    /// parameter the callee only reads — which is information the caller has
+    /// in `FnSig::borrowed` and this scan cannot work out for itself. `None`
+    /// keeps the stricter rule, which is what parameter inference uses: a
+    /// parameter is inferred before any body is compiled, so it has no
+    /// signatures to consult.
+    lent: Option<&'a dyn Fn(&str, usize) -> bool>,
 }
 
-fn scan_borrow_block(name: &str, b: &grasm_syntax::ast::Block, ok: &mut bool) {
+fn param_is_borrowed(name: &str, body: &grasm_syntax::ast::Block) -> bool {
+    let mut st = BorrowScan { ok: true, lent: None };
+    scan_borrow_block(name, body, &mut st);
+    st.ok
+}
+
+/// The same rule for a `for` loop's element, which the list holds open for the
+/// whole body, plus the one shape a loop needs and a parameter cannot have:
+/// handing the element to a function that only reads it.
+fn loop_elem_is_borrowed(
+    name: &str,
+    body: &grasm_syntax::ast::Block,
+    lent: &dyn Fn(&str, usize) -> bool,
+) -> bool {
+    let mut st = BorrowScan {
+        ok: true,
+        lent: Some(lent),
+    };
+    scan_borrow_block(name, body, &mut st);
+    st.ok
+}
+
+fn scan_borrow_block(name: &str, b: &grasm_syntax::ast::Block, st: &mut BorrowScan) {
     for stmt in &b.stmts {
-        if !*ok {
+        if !st.ok {
             return;
         }
         match stmt {
             Stmt::Let { name: n, init, .. } => {
                 if n.name == name {
-                    *ok = false;
+                    st.ok = false;
                 }
-                scan_borrow_expr(name, init, ok);
+                scan_borrow_expr(name, init, st);
             }
             Stmt::LetTuple { names, init, .. } => {
                 if names.iter().any(|n| n.name == name) {
-                    *ok = false;
+                    st.ok = false;
                 }
-                scan_borrow_expr(name, init, ok);
+                scan_borrow_expr(name, init, st);
             }
             Stmt::Assign { target, value, .. } => {
-                scan_borrow_expr(name, target, ok);
-                scan_borrow_expr(name, value, ok);
+                scan_borrow_expr(name, target, st);
+                scan_borrow_expr(name, value, st);
             }
-            Stmt::Expr(e) | Stmt::Return(Some(e), _) => scan_borrow_expr(name, e, ok),
+            Stmt::Expr(e) | Stmt::Return(Some(e), _) => scan_borrow_expr(name, e, st),
             Stmt::Return(None, _) | Stmt::Break(_) | Stmt::Continue(_) => {}
             Stmt::While { cond, body, .. } => {
-                scan_borrow_expr(name, cond, ok);
-                scan_borrow_block(name, body, ok);
+                scan_borrow_expr(name, cond, st);
+                scan_borrow_block(name, body, st);
             }
             Stmt::For {
                 var, iter, body, ..
             } => {
                 if var.name == name {
-                    *ok = false;
+                    st.ok = false;
                 }
-                scan_borrow_expr(name, iter, ok);
-                scan_borrow_block(name, body, ok);
+                scan_borrow_expr(name, iter, st);
+                scan_borrow_block(name, body, st);
             }
             // A thread or a handler could outlive the call; not read.
-            Stmt::Parallel { .. } | Stmt::Spawn { .. } | Stmt::With { .. } => *ok = false,
+            Stmt::Parallel { .. } | Stmt::Spawn { .. } | Stmt::With { .. } => st.ok = false,
         }
     }
 }
 
-fn scan_borrow_expr(name: &str, e: &Expr, ok: &mut bool) {
-    if !*ok {
+fn scan_borrow_expr(name: &str, e: &Expr, st: &mut BorrowScan) {
+    if !st.ok {
         return;
     }
     match e {
         // The two approved shapes: the value is read through, not taken.
         Expr::Index { recv, index, .. } if is_named(recv, name) => {
-            scan_borrow_expr(name, index, ok)
+            scan_borrow_expr(name, index, st)
         }
         Expr::Field { recv, .. } if is_named(recv, name) => {}
         // A bare mention could go anywhere.
-        Expr::Ident(id) if id.name == name => *ok = false,
+        Expr::Ident(id) if id.name == name => st.ok = false,
         Expr::Int(..) | Expr::Float(..) | Expr::Bool(..) | Expr::Ident(_) => {}
         Expr::Str(pieces, _) => {
             for p in pieces {
                 if let grasm_syntax::ast::StrPiece::Expr(x) = p {
-                    scan_borrow_expr(name, x, ok);
+                    scan_borrow_expr(name, x, st);
                 }
             }
         }
         Expr::List(items, _) | Expr::Tuple(items, _) => {
             for i in items {
-                scan_borrow_expr(name, i, ok);
+                scan_borrow_expr(name, i, st);
             }
         }
         Expr::Map(pairs, _) => {
             for (k, v) in pairs {
-                scan_borrow_expr(name, k, ok);
-                scan_borrow_expr(name, v, ok);
+                scan_borrow_expr(name, k, st);
+                scan_borrow_expr(name, v, st);
             }
         }
         Expr::StructLit { fields, base, .. } => {
             if let Some(b) = base {
-                scan_borrow_expr(name, b, ok);
+                scan_borrow_expr(name, b, st);
             }
             for (_, v) in fields {
-                scan_borrow_expr(name, v, ok);
+                scan_borrow_expr(name, v, st);
             }
         }
         Expr::Index { recv, index, .. } => {
-            scan_borrow_expr(name, recv, ok);
-            scan_borrow_expr(name, index, ok);
+            scan_borrow_expr(name, recv, st);
+            scan_borrow_expr(name, index, st);
         }
-        Expr::Field { recv, .. } => scan_borrow_expr(name, recv, ok),
-        Expr::Unary { expr, .. } => scan_borrow_expr(name, expr, ok),
+        Expr::Field { recv, .. } => scan_borrow_expr(name, recv, st),
+        Expr::Unary { expr, .. } => scan_borrow_expr(name, expr, st),
         Expr::Binary { lhs, rhs, .. } => {
-            scan_borrow_expr(name, lhs, ok);
-            scan_borrow_expr(name, rhs, ok);
+            scan_borrow_expr(name, lhs, st);
+            scan_borrow_expr(name, rhs, st);
         }
         Expr::Range { start, end, .. } => {
-            scan_borrow_expr(name, start, ok);
-            scan_borrow_expr(name, end, ok);
+            scan_borrow_expr(name, start, st);
+            scan_borrow_expr(name, end, st);
         }
-        Expr::Block(b) => scan_borrow_block(name, b, ok),
+        Expr::Block(b) => scan_borrow_block(name, b, st),
         Expr::If {
             cond,
             then_block,
             else_branch,
             ..
         } => {
-            scan_borrow_expr(name, cond, ok);
-            scan_borrow_block(name, then_block, ok);
+            scan_borrow_expr(name, cond, st);
+            scan_borrow_block(name, then_block, st);
             match else_branch.as_deref() {
                 None => {}
-                Some(grasm_syntax::ast::ElseBranch::Else(b)) => scan_borrow_block(name, b, ok),
-                Some(grasm_syntax::ast::ElseBranch::ElseIf(x)) => scan_borrow_expr(name, x, ok),
+                Some(grasm_syntax::ast::ElseBranch::Else(b)) => scan_borrow_block(name, b, st),
+                Some(grasm_syntax::ast::ElseBranch::ElseIf(x)) => scan_borrow_expr(name, x, st),
             }
         }
         Expr::Match {
             scrutinee, arms, ..
         } => {
-            scan_borrow_expr(name, scrutinee, ok);
+            scan_borrow_expr(name, scrutinee, st);
             for arm in arms {
                 if let Some(g) = &arm.guard {
-                    scan_borrow_expr(name, g, ok);
+                    scan_borrow_expr(name, g, st);
                 }
-                scan_borrow_expr(name, &arm.body, ok);
+                scan_borrow_expr(name, &arm.body, st);
             }
         }
-        // A call is fine as long as the parameter is not what is handed to
-        // it: the callee would take ownership of anything it is passed, and a
-        // bare mention below refuses. The call itself keeps nothing.
+        // A call takes ownership of what it is handed, so a bare mention falls
+        // through to the refusal below — unless the callee is known to only
+        // read that parameter, which is exactly what `borrowed` records. The
+        // call itself keeps nothing either way.
         Expr::Call { callee, args, .. } => {
-            scan_borrow_expr(name, callee, ok);
-            for a in args {
-                scan_borrow_expr(name, a, ok);
+            scan_borrow_expr(name, callee, st);
+            let lent = st.lent;
+            let callee_name = match &**callee {
+                Expr::Ident(id) => Some(id.name.clone()),
+                _ => None,
+            };
+            for (i, a) in args.iter().enumerate() {
+                if is_named(a, name) {
+                    let reads_only = match (lent, &callee_name) {
+                        (Some(f), Some(n)) => f(n, i),
+                        _ => false,
+                    };
+                    if !reads_only {
+                        st.ok = false;
+                        return;
+                    }
+                    continue;
+                }
+                scan_borrow_expr(name, a, st);
             }
         }
         // A method *on* the parameter is refused rather than allow-listed:
         // some read and some take, and the difference is not visible here.
         Expr::MethodCall { recv, args, .. } => {
             if is_named(recv, name) {
-                *ok = false;
+                st.ok = false;
                 return;
             }
-            scan_borrow_expr(name, recv, ok);
+            scan_borrow_expr(name, recv, st);
             for a in args {
-                scan_borrow_expr(name, a, ok);
+                scan_borrow_expr(name, a, st);
             }
         }
-        Expr::Region(b) | Expr::Unsafe(b) => scan_borrow_block(name, b, ok),
+        Expr::Region(b) | Expr::Unsafe(b) => scan_borrow_block(name, b, st),
         // A closure could hold the value after the call returns.
-        Expr::Closure { .. } => *ok = false,
+        Expr::Closure { .. } => st.ok = false,
         // Anything not named above — a `try`, and whatever is added later —
         // is refused, because a wrong answer here frees a live value.
-        _ => *ok = false,
+        _ => st.ok = false,
     }
 }
 
@@ -7834,9 +7880,29 @@ this case",
         self.goto_block(body_blk);
         let lv2 = self.b.use_var(list_var);
         let iv2 = self.b.use_var(ivar);
-        let (elem_val, elem_vt) = self.list_get_elem(lv2, iv2, &elem_t)?;
+        // The element is lent rather than given when the body only reads it:
+        // the list holds it open for the whole loop, so the +1 and the -1 it
+        // pays per element buy nothing. Worth 1.05x on `tree`, whose body
+        // hands each child to a function that only reads it.
+        let lent = |callee: &str, i: usize| -> bool {
+            self.lookup_fn(callee)
+                .map(|sg| sg.borrowed.get(i).copied().unwrap_or(false))
+                .unwrap_or(false)
+        };
+        let borrow_elem = elem_t.boxed() && loop_elem_is_borrowed(&loop_var.name, body, &lent);
+        let (elem_val, elem_vt) = if borrow_elem {
+            let v = self.call_rt("grasm_list_borrow_at", &[lv2, iv2]).unwrap();
+            (v, (*elem_t).clone())
+        } else {
+            self.list_get_elem(lv2, iv2, &elem_t)?
+        };
         let evar = self.new_var(&elem_vt);
         self.b.def_var(evar, elem_val);
+        if borrow_elem {
+            // Nothing was taken, so nothing is released: the same mechanism a
+            // lent parameter uses.
+            self.borrowed_vars.insert(evar.as_u32());
+        }
         // The depth is recorded *before* the loop variable's scope, so
         // `continue` releases it: the element was read with a +1 and the next
         // iteration binds a fresh one. Recording it after meant

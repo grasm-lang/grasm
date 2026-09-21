@@ -3793,6 +3793,33 @@ pub unsafe extern "C" fn grasm_list_len(v: *mut RtVal) -> i64 {
 /// Returns element (+1 rc for the caller); panics on OOB like the interpreter.
 /// # Safety
 /// live runtime pointers.
+/// One element, **borrowed** — no reference count is touched.
+///
+/// The list-shaped counterpart of `grasm_struct_borrow_at`, and sound on the
+/// same terms: the caller establishes that the list outlives the use. A `for`
+/// loop does, because it walks a temp it owns for the whole body, and every
+/// list mutator goes through `cow_list`, which copies rather than writes
+/// anything held more than once — so nothing can shorten an element's life
+/// mid-walk. The element cannot be written through either: a loop variable is
+/// immutable, so `k.f = v` is refused by the checker before it reaches here.
+///
+/// # Safety: live runtime pointer, and a list the caller keeps alive.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_list_borrow_at(v: *mut RtVal, i: i64) -> *mut RtVal {
+    match &(*v).payload {
+        RtPayload::List(items) | RtPayload::Tuple(items) => {
+            if i < 0 || i as usize >= items.len() {
+                rt_panic(&format!("index {i} out of bounds (len {})", items.len()));
+            }
+            items[i as usize]
+        }
+        // Only the boxed representation has an element to lend. A scalar list
+        // would have to box one to hand it over, which is the allocation this
+        // exists to avoid, so the backend does not ask.
+        _ => grasm_panic_msg_str("borrowed index on a list of scalars"),
+    }
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn grasm_list_get(v: *mut RtVal, i: i64) -> *mut RtVal {
     match &(*v).payload {

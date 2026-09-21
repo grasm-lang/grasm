@@ -1339,6 +1339,29 @@ That extension is the shared prerequisite: it is what makes the borrowed loop
 read pay, and it is what inline storage needs so that `for k in n.kids` hands
 out a pointer rather than moving the allocation from the build to the walk.
 
+**Built. `tree` 1.052x min, 1.055x median**, `wordfreq` and `sort` unchanged,
+every answer the same. `grasm_list_borrow_at` lends an element without touching
+its count, the loop variable goes into `borrowed_vars` so the scope releases
+nothing, and `loop_elem_is_borrowed` decides when that is allowed. The rule is
+`param_is_borrowed` plus the one shape a loop has and a parameter cannot: a
+bare mention that is an argument to a parameter the callee only reads, which
+`FnSig::borrowed` already records. Parameter inference keeps the stricter rule,
+because it runs before any body is compiled and has no signatures to consult.
+
+Two things were checked rather than assumed, because borrowing changes who owns
+the element and a wrong answer here frees a live value:
+
+- **The element cannot be written through.** `k.v = k.v + 100` in a loop body
+  is refused by the checker -- a loop variable is immutable. That matters
+  because a borrowed element has a count of one and would be mutated in place,
+  where a taken one has two and `cow_struct` copies. The observable difference
+  cannot arise because the program cannot be written.
+- **The same question for lent parameters, which landed earlier.** Also
+  refused: "a parameter cannot be `var`". No latent bug there either.
+
+The list cannot be shortened underneath the walk: the loop iterates a temp it
+owns, so every mutator sees a count above one and `cow_list` copies.
+
 ## Where the remaining gap actually is
 
 Timed head to head by processor time, and split by compiling cut-down versions
