@@ -1258,6 +1258,39 @@ every shape the analysis has to decide — returned, stored, relayed, read,
 handed a temporary — which is what a second attempt should be developed
 against.
 
+## `tree`'s allocations, counted exactly — 2026-09-22
+
+`GRASM_ALLOC_STATS=1` on the benchmark reports **787,300 allocations**. The
+tree is depth 9, branch 3, built 20 times: 29,524 nodes each, 9,841 of them
+interior, so 590,480 nodes and 196,820 interior nodes in the run. The count is
+exactly their sum:
+
+    787,300 = 590,480 nodes + 196,820 kids-lists
+
+So it is one box per node, one box per interior node's list of children, and
+**nothing at all for a leaf's empty `[]`** — the empty list is already free,
+which is worth knowing because two thirds of the nodes are leaves.
+
+Rust's `Vec<Node>` stores nodes inside the vector, so it allocates once per
+interior node and never per node: **196,820**. Grasm makes exactly **four
+times** as many, and at ~19 ns a box that is ~15 ms of a 27.5 ms run.
+
+It is also a working-set difference. `RtVal` is 64 bytes (`RtPayload` 56,
+`StructFields` and `ListData` 40 each, measured), so the live tree is ~50 MB
+against Rust's ~19 MB of 32-byte nodes stored inline.
+
+**Shrinking the box does not work.** Getting `RtVal` to 32 bytes would need
+every payload variant under 24, and `ListScalar` alone is 32 (a `kind` plus a
+`Vec`). Dropping inline struct capacity from four fields to two reaches 48, a
+quarter off, while pushing every three- and four-field struct onto the heap.
+
+**Reducing the count is not a language change.** `[T-PARAM-OWN]` moves a value
+and `[E-VALUE-SEMANTICS]` says reading a place copies, so a node pushed into
+its parent's list is owned by that list and nothing may observe its identity.
+Storing it inline is therefore permitted by the semantics already; that `[Node]`
+holds boxes is an implementation choice in `ListData`. That is the change worth
+costing, and it is the only one that reaches this row.
+
 ## Where the remaining gap actually is
 
 Timed head to head by processor time, and split by compiling cut-down versions
