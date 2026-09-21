@@ -6799,6 +6799,15 @@ impl FnCx<'_, '_> {
                     }
                     _ => self.eval_expr_expecting(init, expected.as_ref())?,
                 };
+                // The initializer left — `let v = if c { fail(e) } else {
+                // fail(e) }`, where both arms leave and the `if` is worth
+                // nothing. `eval_expr_expecting` answers with a placeholder
+                // so that every caller has *a* value, and binding and
+                // releasing that placeholder wrote instructions into a block
+                // control had already left. There is nothing to bind here.
+                if self.is_filled() || self.dead {
+                    return Ok(StmtOut::Terminated);
+                }
                 if let Some(te) = ty {
                     let want = self.cg.vtype_of(te)?;
                     if want == VType::F64 && vt == VType::I64 {
@@ -11900,6 +11909,17 @@ checker did",
         if then_term && else_term && merge_ty.is_none() {
             self.trap_here();
             self.filled = true;
+            // And control has left, so whatever the caller writes next must
+            // not be written *here*. Answering `None` was enough for
+            // `return if c { fail(e) } else { fail(e) }`, where the return
+            // statement stops on its own — but `let v = if c { fail(e) }
+            // else { fail(e) }` carries on to bind and release a value, and
+            // put those instructions after the trap. The verifier called
+            // that "a terminator instruction was encountered before the end
+            // of block3" and the backend reported it against itself as a
+            // codegen bug. One `if` reaches this from many statements, so the
+            // dead block belongs here rather than at each of them.
+            self.enter_dead_block();
             return Ok(None);
         }
         if let Some(vt) = merge_ty {

@@ -4,11 +4,15 @@
 //! N 7
 //! 15 -1
 //! 25
+//! -1 -1
+//! -1 -1
+//! 11 22
 //! 0 -> err z
 //! 1 -> 100
 //! 2 -> 50
 // A branch that leaves — `fail`, `panic`, `return` — has no value, so the
-// `if` is worth whatever the *other* branch produced.
+// `if` is worth whatever the *other* branch produced, and when *both* leave
+// it is worth nothing at all.
 //
 // Taking the type from the then branch alone meant `if c { fail(e) } else
 // { v }` in tail position had no merge value at all: the compiled function
@@ -49,6 +53,39 @@ fn chain(y: i64) -> i64 ! E {
     }
 }
 
+/// Both branches leave, so the `if` produces nothing and there is nothing to
+/// bind. The statement has to stop there: binding a placeholder wrote
+/// instructions into a block control had already left, and the backend
+/// reported its own verifier error as a codegen bug.
+fn both_bound(y: i64) -> i64 ! E {
+    let v: i64 ! E = if y == 0 {
+        fail(E{ c: "a" })
+    } else {
+        fail(E{ c: "b" })
+    }
+    v
+}
+
+/// The same shape where the `if` is returned rather than bound, which is
+/// where this was first found and fixed.
+fn both_returned(y: i64) -> i64 ! E {
+    return if y == 0 {
+        fail(E{ c: "a" })
+    } else {
+        fail(E{ c: "b" })
+    }
+}
+
+/// And where both branches `return` outright.
+fn both_left(y: i64) -> i64 {
+    let v = if y == 0 {
+        return 11
+    } else {
+        return 22
+    }
+    v
+}
+
 fn main() {
     print("{fi(4) ?? 0 - 1} {fs(2) ?? "?"} {ff(4) ?? 0.0} {fb(2) ?? false}")
     match fv(7) {
@@ -63,6 +100,10 @@ fn main() {
     // `??` groups to the right, so the layered unwrap — an `Option` of a
     // fallible value — says so with brackets.
     print("{(m.get("a") ?? fi(1)) ?? 0 - 1}")
+    // Both branches leaving, bound and returned and left outright.
+    print("{both_bound(0) ?? 0 - 1} {both_bound(3) ?? 0 - 1}")
+    print("{both_returned(0) ?? 0 - 1} {both_returned(3) ?? 0 - 1}")
+    print("{both_left(0)} {both_left(3)}")
     // And the whole shape end to end.
     for n in [0, 1, 2] {
         match fi(n) {
