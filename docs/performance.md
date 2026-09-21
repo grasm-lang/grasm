@@ -1315,8 +1315,29 @@ element out of it; otherwise the allocations move from the build to the walk.
 `grasm_struct_borrow_at` already does exactly this for a field -- "sound only
 while the struct holding it is alive, which the caller establishes" -- and
 there is no list equivalent: every element read is a `grasm_list_get` that
-returns a +1 reference. That function, and the analysis that says when a loop
-variable is only read, is the first piece and is worth having on its own.
+returns a +1 reference.
+
+**Built as a probe and priced: 1.029x min, 1.050x median on `tree`**, neutral
+on `wordfreq` and `sort`. A `grasm_list_borrow_at` that returns the element
+without a reference, with the loop variable marked in `borrowed_vars` so the
+scope does not release it -- the mechanism lent parameters already use. It
+neither leaks (exit 0 under `GRASM_LEAK_CHECK`) nor changes the allocation
+count (787,300 either way), so what it saves is purely the +1/-1 per element.
+The loop is entitled to it: the loop walks a temp it owns and every mutator
+goes through `cow_list`, so nothing can shorten the element's life mid-walk.
+
+**But the sound analysis refuses the shape that gains.** `param_is_borrowed`
+treats a bare mention as disqualifying -- "a bare mention could go anywhere" --
+and `tree`'s loop body is `sum = sum + total(k)`, where `k` is a bare mention
+passed as an argument. Applying the existing rule unchanged would borrow
+nothing here. Realising the 1.05x needs one extension: a bare mention is
+allowed when it is an argument to a parameter already inferred lent, which is
+information the backend has in `sig_borrowed` but `param_is_borrowed`, a free
+function over a name and a block, cannot see.
+
+That extension is the shared prerequisite: it is what makes the borrowed loop
+read pay, and it is what inline storage needs so that `for k in n.kids` hands
+out a pointer rather than moving the allocation from the build to the walk.
 
 ## Where the remaining gap actually is
 
