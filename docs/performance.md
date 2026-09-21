@@ -716,6 +716,29 @@ instruction count does not capture.
 booleans, which are interned, so it pays eight bytes of pointer but never
 allocates, and it already runs at 1.08x.
 
+### The unroller is a trade, measured four ways — 2026-09-21
+
+`matmul` is unrolled by four and Rust's scalar loop is not unrolled at all and
+is faster, so the unroller was gated behind an environment variable read at
+codegen time and every row measured both ways. Same answers throughout, best
+of eleven:
+
+| | unrolled | not | |
+| --- | --- | --- | --- |
+| `sieve` | 7.57 ms | 8.75 ms | unrolling helps 13.4% |
+| `sort` | 10.33 ms | 10.69 ms | helps 3.3% |
+| `matmul` | 9.83 ms | 9.75 ms | hurts 0.8% |
+| `fib` | 5.72 ms | 5.55 ms | hurts 3.0% |
+
+Net positive and worth keeping, but it is not free on every shape: the two rows
+it costs are the two whose bodies are already dense with work, where four
+copies buy no bookkeeping back and cost register pressure. Turning it off for
+`matmul` recovers 0.8%, which is noise; for `fib`, 3.0%, which is not, though
+`fib` is 1.03x of Rust and the whole row is nearly parity already.
+
+No rule change made. Picking the cases apart on four benchmarks would be
+fitting the rule to them.
+
 ### Three more ceilings, 2026-09-21
 
 **Unrolling `sieve`'s inner loop: 1.00x.** `while j <= limit { flags[j] = false;
