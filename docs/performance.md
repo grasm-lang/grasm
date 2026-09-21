@@ -795,9 +795,33 @@ mistake as the memmove above, made twice in one session on the same evidence:
 out-of-order core is already hiding.** The way to price something here is to
 remove it and time the result, never to read its share off a profile.
 
-Which leaves the cost of a box unattributed at ~19.7 ns, with the two largest
-apparent contributors both disproved. Attributing it needs hardware counters,
-not sampling.
+**Attributed by removal instead — 2026-09-22.** Three differentials, each one
+building the program without some part of the work and timing the result.
+
+*Refcounting and freeing are not it.* The same loop written inside a `region`,
+where nothing is reference counted and the whole set is freed in one sweep at
+the closing brace, costs **19.91 ns/box against 19.34** for the ordinary
+reference-counted version. Tier 1 buys nothing here, which says the cost is in
+making the box rather than in owning or releasing it.
+
+*Allocation is about half.* With `grasm_struct_make` changed to build one
+struct once and hand it back with a reference each time -- so the argument
+array, the call, the field read and the release all still happen, and only the
+allocation does not -- the loop falls from 19.41 ns to **9.44 ns**. So the
+allocation itself, take-box through payload-write through give-back, is ~9.9 ns.
+
+*A scalar field read is 1.98 ns.* Differencing `acc += n.v` against
+`acc += n.v + n.w`: 19.41 ns against 21.39. That is one runtime call and its
+body, ~7 cycles, which also prices what a runtime call costs here.
+
+| part of one box | ns |
+| --- | --- |
+| allocation | ~9.9 |
+| one scalar field read | 1.98 |
+| the rest -- argument array, two more calls, release, loop | ~7.5 |
+
+So the target is the ~9.9 ns of allocation, and the reach of any fix is limited
+by what else a box costs: even a free allocation leaves 9.44 ns standing.
 
 ### Three more ceilings, 2026-09-21
 
