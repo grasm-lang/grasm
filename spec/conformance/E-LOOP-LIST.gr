@@ -6,6 +6,27 @@
 //! [0, 1, 10, 11]
 //! [0, 1, 2, 3, 4]
 //! 5 [0, 1, 2]
+//! 60 3
+//! 1 2 3
+//! 120 3
+//! 1 2 3
+//! 20 2
+type Cell = { v: i64 }
+
+/// Every mention of `c` is a field read, so the loop may lend its element.
+fn peek(c: Cell) -> i64 {
+    c.v * 10
+}
+
+/// Mentions `c` bare, so it is not inferred read-only and the loop has to hand
+/// over a reference rather than a loan. ([T-MOVE-LOOP] refuses `own` here
+/// outright -- a moved element would be gone by the next iteration -- so this
+/// is the shape that actually distinguishes the two paths.)
+fn stash(c: Cell) -> i64 {
+    let held = [c]
+    held[0].v * 20
+}
+
 fn main() {
     // The loop variable is the element itself, not an index.
     let words = ["alpha", "beta", "gamma"]
@@ -60,4 +81,40 @@ fn main() {
         made.push(i)
     }
     print("{made.len() + 2} {made}")
+
+    // A loop over boxed elements lends each one rather than taking a
+    // reference to it: the list holds the element open for the whole body, so
+    // the +1 and the -1 buy nothing. What must not change is the answer, or
+    // the list, or who owns what.
+    let cells = [Cell{ v: 1 }, Cell{ v: 2 }, Cell{ v: 3 }]
+    var sum = 0
+    for c in cells {
+        sum = sum + peek(c)
+    }
+    // The list is untouched by having been walked.
+    print("{sum} {cells.len()}")
+    print("{cells[0].v} {cells[1].v} {cells[2].v}")
+
+    // The same loop where the callee keeps what it is given. Lending here
+    // would hand out something the list still holds, so the loop gives a
+    // reference instead — and the list still comes out whole.
+    var kept = 0
+    for c in cells {
+        kept = kept + stash(c)
+    }
+    print("{kept} {cells.len()}")
+    print("{cells[0].v} {cells[1].v} {cells[2].v}")
+
+    // Leaving the body early releases nothing that was only lent.
+    var seen = 0
+    for c in cells {
+        if c.v == 3 {
+            break
+        }
+        if c.v == 1 {
+            continue
+        }
+        seen = seen + peek(c)
+    }
+    print("{seen} {cells.len() - 1}")
 }
