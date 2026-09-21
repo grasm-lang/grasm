@@ -15,52 +15,37 @@ best of three, microseconds, checksums verified against the interpreter first.
 
 | program | c | rust | go | nim | zig | grasm | vs rust |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| `sort` | 36.77 | 11.28 | 48.81 | – | – | **10.73** | **0.95x** |
-| `wordfreq` | 31.21 | 26.50 | 17.39 | 22.51 | 9.64 | **24.57** | **0.93x** |
-| `sieve` | 7.02 | 7.09 | 7.91 | 9.45 | 7.71 | 7.72 | 1.09x |
-| `fib` | 5.05 | 5.29 | 6.35 | 6.17 | 5.61 | 5.95 | 1.12x |
-| `parwords` | 9.27 | 10.62 | 9.91 | – | – | 11.99 | 1.13x |
-| `parmap` | 53.07 | 51.72 | 87.78 | – | – | 63.16* | 1.22x* |
-| `matmul` | 5.25 | 5.34 | 8.57 | 9.34 | 5.98 | 9.52 | 1.78x |
-| `tree` | 21.23 | 9.93 | 22.75 | – | – | 27.74 | 2.79x |
+| `sort` | 36.79 | 11.66 | 49.64 | – | – | **10.30** | **0.88x** |
+| `wordfreq` | 30.66 | 26.40 | 16.98 | 22.08 | 9.52 | **24.84** | **0.94x** |
+| `parwords` | 8.31 | 11.50 | 9.98 | – | – | 11.20 | 0.97x |
+| `fib` | 4.86 | 5.44 | 6.17 | 5.69 | 5.42 | 5.60 | 1.03x |
+| `parmap` | 50.04 | 53.05 | 89.42 | – | – | 56.20 | 1.06x |
+| `sieve` | 7.24 | 7.00 | 7.66 | 9.46 | 7.33 | 7.54 | 1.08x |
+| `matmul` | 5.07 | 5.24 | 8.26 | 10.28 | 5.84 | 9.80 | 1.87x |
+| `tree` | 20.89 | 9.73 | 20.66 | – | – | 27.95 | 2.87x |
 
-\* `parmap`'s cell predates the power-of-two remainder change below, which is
-worth 1.13x on that row and has not been re-measured here. The number is left
-as it was taken rather than divided: a table entry that was computed instead
-of measured is how a wrong claim gets into a document. `bench.sh` has refused
-twice since, at load 6.8 on eight cores.
+`G2` — the geometric mean of rust/native — is **0.816x** against a target of
+0.95x, and it was 0.62x at the start of the previous day. With the 2.64 ms
+process floor subtracted from both sides it is 0.755x.
 
-`G2` — the geometric mean of rust/native — is **0.778x** against a target of
-0.95x, and it was 0.62x at the start of the previous day. Run to run it moves
-by about 0.02, so read it as 0.78 give or take — and the `parmap` cell makes
-that a slight understatement until the next idle run.
+**Two rows beat Rust and one is level.** `sort` by 12%, and by three and a
+half times over C and nearly five over Go. `wordfreq` by 6%, and over C. Both
+are single-threaded, so those margins can be read. `parwords` comes out 3%
+ahead, which is *inside* what a `par*` row can resolve — call it parity, not a
+win. `parmap` is 6% behind on the same terms, so also parity; it was 1.22x
+behind before the power-of-two remainder change.
 
-**Two rows beat Rust**, and they do it in every run: `sort` — also three and a
-half times over C and four and a half over Go — and `wordfreq`, which also
-beats C. `sieve` and `fib` are within 12%, `sieve` now level with Zig.
+`fib` and `sieve` are within 8% of Rust and within 4% of Zig. What is left is
+two rows:
 
-**The `par*` rows cannot be read to better than about 15%, for any language.**
-`parwords`' Rust column was 12.79ms in the previous run and 10.62 here with
-nothing changed in Rust; ours went 13.54 to 11.99 on a real 1.45x in its
-dominant loop. Contention inflates every column, not only Grasm's. A change
-that matters on those rows has to be measured on a serial proxy — the same
-program with `par_map` replaced by `map`.
-
-What is left, with the ceiling measured for each:
-
-* `tree` — 2.79x. Five probes; four measured nothing and the fifth, a
+* `tree` — 2.87x. Probed five ways; four measured nothing and the fifth, a
   representation with no per-node box at all, is a third *slower*.
-* `matmul` — 1.78x. All instruction quality inside one loop, no runtime call
-  anywhere in its profile. A vectoriser is worth 1.21x, measured by building
-  the *Rust* program with LLVM's vectorisers off.
-* `fib` — 1.12x. The accumulator loop LLVM builds from `f(a) + f(b)` is worth
-  1.06x, hand-written in Grasm source.
-* `sieve` — 1.09x. Removing every bounds check is worth 1.03x.
-* `parmap`, `parwords` — below what those rows can resolve.
+* `matmul` — 1.87x. All instruction quality inside one loop, with no runtime
+  call anywhere in its profile. A vectoriser is worth 1.21x, measured by
+  building the *Rust* program with LLVM's vectorisers off.
 
-**No single remaining lever wins a row.** The cheap work is done; what is left
-is a vectoriser or a value-representation change, and the representation
-change has a measurement arguing against it.
+**Arithmetic, calls, sorting, text and multi-core throughput are at or near
+parity. Allocation is not, and neither is vectorised arithmetic.**
 
 ## What has been measured
 
