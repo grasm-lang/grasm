@@ -375,6 +375,33 @@ decision belongs at the open site rather than per statement:
 candidate, and the string is pinned only if all of them are shapes the buffer
 takes.
 
+**A power-of-two remainder is two masks on separate branches, not a bias in a
+row.** `parmap`'s kernel is 160 million iterations of an LCG — `acc = (acc * A
++ C) % 2^31` — which is a dependency chain, so what decides it is *latency*,
+not instruction count. Counted against Rust's disassembly: ours was `madd` →
+`sshr` → `ushr` → `iadd` → `band` → `isub`, eight cycles; LLVM's is `madd` →
+`negs` → `and` → `csneg`, six. Measured 2.50 ns and 1.89 ns an iteration at
+3.2 GHz — 8.0 and 6.0 cycles, the one time all session a cycle count and a
+measurement agreed exactly, and they agree because a serial chain is
+predictable where issue-bound throughput is not.
+
+The shape is the difference: biasing then masking is four operations in a row,
+where `x >= 0 ? (x & m) : -((-x) & m)` puts the two masks on separate
+branches. Emitting that form takes the chain from eight cycles to **seven**,
+worth **1.13x on `parmap`**, confirmed on the benchmark and on a serial proxy.
+The missing seventh cycle is a `csneg` — Cranelift has no rule fusing
+`select(c, ineg(a), b)`, so it emits `neg` and `csel` where LLVM emits one
+instruction. Done, 2026-09-21.
+
+`i64::MIN` needs no special case: negating it wraps back to itself, and its
+low bits are zero for every power of two, so both halves answer zero — which
+is what `i64::MIN % 2^k` is.
+
+Nothing else moves, and that was checked rather than assumed. `parwords`
+printed 1.29x *slower* in the same run — the `par*` noise — and its serial
+proxy says 1.004x. `sieve` printed 1.13x faster and re-measures at 1.00x.
+Neither program contains a power-of-two remainder.
+
 **Things that were already fast** and do not need looking at again: scalar list
 indexing is pinned and inlined before a loop with an inline bounds check
 (`pin_loop_lists`); `bool` lists are one byte an element; a list of four or

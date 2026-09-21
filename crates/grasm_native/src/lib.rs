@@ -11673,11 +11673,25 @@ checker did",
             _ => {
                 let mag = d.unsigned_abs();
                 if mag.is_power_of_two() && mag.trailing_zeros() < 63 {
-                    let k = i64::from(mag.trailing_zeros());
-                    let biased = self.pow2_bias(x, k);
-                    let mask = !(mag as i64 - 1);
-                    let whole = self.b.ins().band_imm(biased, mask);
-                    Some(self.b.ins().isub(x, whole))
+                    // `x >= 0 ? (x & m) : -((-x) & m)`, which is what LLVM
+                    // emits and is two cycles shorter through the dependency
+                    // chain than biasing and masking: the two masks sit on
+                    // separate branches where the bias is four operations in
+                    // a row. On the LCG that `parmap` and `sort` are built
+                    // from, the whole iteration is eight cycles against
+                    // Rust's six, and this is the difference.
+                    //
+                    // `i64::MIN` needs no special case. Negating it wraps
+                    // back to itself, and its low bits are zero for every
+                    // power of two, so both halves answer zero — which is
+                    // what `i64::MIN % 2^k` is.
+                    let mask = mag as i64 - 1;
+                    let pos = self.b.ins().band_imm(x, mask);
+                    let flipped = self.b.ins().ineg(x);
+                    let low = self.b.ins().band_imm(flipped, mask);
+                    let neg = self.b.ins().ineg(low);
+                    let is_neg = self.b.ins().icmp_imm(IntCC::SignedLessThan, x, 0);
+                    Some(self.b.ins().select(is_neg, neg, pos))
                 } else {
                     // As in `div_by_const`: measured, and not worth it.
                     None
