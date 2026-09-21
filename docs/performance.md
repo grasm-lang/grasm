@@ -686,9 +686,31 @@ hoists the check and strength-reduces the index to a pointer walk. The working
 set is three 320KB arrays, so this is cache-resident and issue-bound, and
 instruction count is the thing.
 
-That sits badly against the 1.01x measured for bounds checks and 1.00x for
-strength reduction above, which together should have removed eight of those
-eleven. One of those numbers deserves re-measuring rather than trusting.
+That sat badly against the 1.01x measured for bounds checks and 1.00x for
+strength reduction above, so both were re-measured.
+
+**Bounds checks are worth 1.081x whole-program on `matmul`, not 1.01x.**
+Measured by gating the check in `pinned_address` on an environment variable
+read at codegen time, so the generated program pays nothing for the test:
+9.88 ms to 9.14 ms, same answer, and 1.029x on `sieve`. On the kernel alone
+(less the 2.54 ms setup) that is 7.34 ms to 6.60 ms, 1.11x. The old number was
+wrong.
+
+**Recomputing the index is free, and that part of the old number stands.**
+Rust's scalar kernel with `n` behind a `black_box`, so the index must be
+recomputed rather than walked: 2751 us against 2797 us for the ordinary scalar
+build. Independent multiplies cost nothing on an out-of-order core.
+
+**And instruction count is not the bottleneck.** Removing the checks takes the
+body from thirteen instructions per element to nine -- 1.44x fewer -- and buys
+1.11x. Against Rust's scalar kernel (2797 us, seven instructions per element
+including its loop overhead, unrolled not at all) Grasm's checkless kernel is
+still 2.36x slower at 6.60 ms. Neither the checks, nor the index arithmetic,
+nor the raw instruction count accounts for that, so what does is still open.
+Grasm's IPC across the loop works out near 3.1 against Rust's 5.7, which is
+where to look next -- the body carries two conditional branches per element and
+splits into a trap block for each, and branch throughput is a candidate the
+instruction count does not capture.
 
 `sieve` shares the layout and does not share the problem: its elements are
 booleans, which are interned, so it pays eight bytes of pointer but never
