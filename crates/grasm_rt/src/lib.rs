@@ -1153,8 +1153,28 @@ impl RtStr {
     }
 
     /// Every character one byte, so an index is an index.
+    ///
+    /// The answer is in the index once there is one: it carries offsets for
+    /// text that needs them and none for text that does not, so an empty
+    /// table *is* the flat case. Asking `is_ascii` instead reads the whole
+    /// string, and `substr(i, 1)` asks once per character — 20,000 characters
+    /// took 53.8 ms and 40,000 took 196.7, which is the same quadratic shape
+    /// `char_len` had.
     pub fn is_flat(&self) -> bool {
-        self.s.as_str().is_ascii()
+        if let Some(ix) = self.index.get() {
+            return ix.offsets.is_empty();
+        }
+        let text = self.s.as_str();
+        if text.len() < LEN_CACHE_MIN {
+            return text.is_ascii();
+        }
+        // Past the threshold the answer is worth keeping, and `char_len` is
+        // what builds it either way.
+        self.char_len();
+        match self.index.get() {
+            Some(ix) => ix.offsets.is_empty(),
+            None => text.is_ascii(),
+        }
     }
 }
 

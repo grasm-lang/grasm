@@ -1642,9 +1642,26 @@ discipline. [E-STR-CHARS] pins the case that would catch a miss: text that is
 ASCII until an `\u{03b1}` is appended to it, where a remembered one-byte-per-
 character count would be wrong from that moment on.
 
-`s.substr(i, 1)` per character and `s = "x" + s` are still quadratic, and both
-are inherent rather than accidental: one walks to a character index, the other
-copies to put a character in front.
+**`s.substr(i, 1)` had the same defect, one function over.** Calling it
+inherent above was wrong, and inferred from what UTF-8 makes hard rather than
+from the code. `byte_at` returns the index directly for flat text, so this
+should be constant — but `is_flat` was `self.s.as_str().is_ascii()`, reading
+the whole string on every call. The index answers it without a scan: offsets
+for text that needs them, none for text that does not, so an empty table *is*
+the flat case.
+
+| `s.substr(i, 1)` per character | before | after |
+| --- | --- | --- |
+| 20,000 | 53.8 ms | 3.4 ms |
+| 40,000 | 196.7 ms | 3.6 ms |
+| scaling | 3.7x | **1.1x** |
+
+**55x at 40,000.** `char_at` is on the same path and gains the same way.
+Matched builds put `wordfreq`, `sort`, `tree` and short-string `len` inside
+noise with identical answers.
+
+`s = "x" + s` remains quadratic and that one really is inherent: putting a
+character in front of text means moving the text.
 
 ## Where the remaining gap actually is
 
