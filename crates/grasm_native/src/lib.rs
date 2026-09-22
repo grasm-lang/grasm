@@ -787,6 +787,12 @@ impl<'m> Codegen<'m> {
             ("grasm_map_delete", vec![i64t, i64t, ptr], Some(i64t)),
             ("grasm_map_len", vec![i64t], Some(i64t)),
             ("grasm_map_get_ptr", vec![i64t, i64t], Some(i64t)),
+            ("grasm_map_get_ptr_bytes", vec![i64t, ptr, i64t], Some(i64t)),
+            ("grasm_map_add_i64_bytes", vec![i64t, ptr, i64t, i64t, i64t], Some(i64t)),
+            ("grasm_map_set_bytes", vec![i64t, ptr, i64t, i64t], Some(i64t)),
+            ("grasm_str_build_ptr", vec![i64t], Some(ptr)),
+            ("grasm_str_build_len", vec![i64t], Some(i64t)),
+            ("grasm_str_build_discard", vec![i64t], None),
             ("grasm_map_keys", vec![i64t], Some(i64t)),
             ("grasm_map_values", vec![i64t], Some(i64t)),
             ("grasm_map_entries", vec![i64t], Some(i64t)),
@@ -2015,6 +2021,8 @@ arguments nor the type this is bound to",
             wrote_through_ref: false,
             task_scopes: Vec::new(),
             floor: None,
+            built_keys: Vec::new(),
+            pending_key: None,
             borrowed_vars: std::collections::HashSet::new(),
             inline_depth: 0,
             inline_seq: 0,
@@ -2680,6 +2688,8 @@ operation's",
             wrote_through_ref: false,
             task_scopes: Vec::new(),
             floor: None,
+            built_keys: Vec::new(),
+            pending_key: None,
             borrowed_vars: std::collections::HashSet::new(),
             inline_depth: 0,
             inline_seq: 0,
@@ -2782,6 +2792,8 @@ operation's",
             wrote_through_ref: false,
             task_scopes: Vec::new(),
             floor: None,
+            built_keys: Vec::new(),
+            pending_key: None,
             borrowed_vars: std::collections::HashSet::new(),
             inline_depth: 0,
             inline_seq: 0,
@@ -2927,6 +2939,8 @@ operation's",
             wrote_through_ref: false,
             task_scopes: Vec::new(),
             floor: None,
+            built_keys: Vec::new(),
+            pending_key: None,
             borrowed_vars: std::collections::HashSet::new(),
             inline_depth: 0,
             inline_seq: 0,
@@ -3281,6 +3295,11 @@ struct FnCx<'a, 'm> {
     /// one. A function that was not needs to ask the runtime before it can
     /// call one that was.
     floor: Option<Value>,
+    /// Per block: the `let` names whose value exists only to be a map key,
+    /// and the builder each one's text was written into.
+    built_keys: Vec<(Vec<String>, HashMap<String, Value>)>,
+    /// The boxed key of a counter bump, between evaluating it and using it.
+    pending_key: Option<Value>,
 }
 
 /// What a block knows that a closure inside it needs.
@@ -5252,10 +5271,20 @@ struct BorrowScan<'a> {
     /// parameter is inferred before any body is compiled, so it has no
     /// signatures to consult.
     lent: Option<&'a dyn Fn(&str, usize) -> bool>,
+    /// Stricter, and for a different question: the name's value may exist
+    /// *only* to be a map key. Reading through it — `w.len()`, `w[0]` — is
+    /// then disqualifying rather than allowed, because there would be no
+    /// string to read; what is allowed instead is the key argument of `get`
+    /// and `set`.
+    key_only: bool,
 }
 
 fn param_is_borrowed(name: &str, body: &grasm_syntax::ast::Block) -> bool {
-    let mut st = BorrowScan { ok: true, lent: None };
+    let mut st = BorrowScan {
+        ok: true,
+        lent: None,
+        key_only: false,
+    };
     scan_borrow_block(name, body, &mut st);
     st.ok
 }
@@ -5271,13 +5300,30 @@ fn loop_elem_is_borrowed(
     let mut st = BorrowScan {
         ok: true,
         lent: Some(lent),
+        key_only: false,
     };
     scan_borrow_block(name, body, &mut st);
     st.ok
 }
 
+/// Whether every mention of `name` in `stmts` is the key argument of a map
+/// `get` or `set`, so the value exists only to be looked up by.
+fn only_map_key_uses(name: &str, stmts: &[Stmt]) -> bool {
+    let mut st = BorrowScan {
+        ok: true,
+        lent: None,
+        key_only: true,
+    };
+    scan_borrow_stmts(name, stmts, &mut st);
+    st.ok
+}
+
 fn scan_borrow_block(name: &str, b: &grasm_syntax::ast::Block, st: &mut BorrowScan) {
-    for stmt in &b.stmts {
+    scan_borrow_stmts(name, &b.stmts, st);
+}
+
+fn scan_borrow_stmts(name: &str, stmts: &[Stmt], st: &mut BorrowScan) {
+    for stmt in stmts {
         if !st.ok {
             return;
         }
@@ -5326,9 +5372,17 @@ fn scan_borrow_expr(name: &str, e: &Expr, st: &mut BorrowScan) {
     match e {
         // The two approved shapes: the value is read through, not taken.
         Expr::Index { recv, index, .. } if is_named(recv, name) => {
+            if st.key_only {
+                st.ok = false;
+                return;
+            }
             scan_borrow_expr(name, index, st)
         }
-        Expr::Field { recv, .. } if is_named(recv, name) => {}
+        Expr::Field { recv, .. } if is_named(recv, name) => {
+            if st.key_only {
+                st.ok = false;
+            }
+        }
         // A bare mention could go anywhere.
         Expr::Ident(id) if id.name == name => st.ok = false,
         Expr::Int(..) | Expr::Float(..) | Expr::Bool(..) | Expr::Ident(_) => {}
@@ -5426,6 +5480,19 @@ fn scan_borrow_expr(name: &str, e: &Expr, st: &mut BorrowScan) {
         }
         // A method *on* the parameter is refused rather than allow-listed:
         // some read and some take, and the difference is not visible here.
+        Expr::MethodCall {
+            recv, name: m, args, ..
+        } if st.key_only
+            && matches!(m.name.as_str(), "get" | "set")
+            && args.first().is_some_and(|a| is_named(a, name)) =>
+        {
+            // The key argument is the use this is looking for; everything
+            // else about the call is scanned as usual.
+            scan_borrow_expr(name, recv, st);
+            for a in &args[1..] {
+                scan_borrow_expr(name, a, st);
+            }
+        }
         Expr::MethodCall { recv, args, .. } => {
             if is_named(recv, name) {
                 st.ok = false;
@@ -6736,6 +6803,8 @@ impl FnCx<'_, '_> {
         blk: &grasm_syntax::ast::Block,
     ) -> CResult<(Option<(Value, VType)>, bool)> {
         self.push_scope();
+        let keyed = self.built_key_lets(blk);
+        self.built_keys.push((keyed, HashMap::new()));
         let mut hints = collect_block_hints(blk);
         self.declared_fn_arg_types(blk, &mut hints);
         self.closure_hints.push(hints);
@@ -6763,6 +6832,16 @@ impl FnCx<'_, '_> {
                     last = v;
                 }
                 StmtOut::Terminated => terminated = true,
+            }
+        }
+        // The builders go back to the thread when the block closes. A block
+        // that terminated is not eligible for one in the first place, so there
+        // is nothing to give back on that path.
+        if let Some((_, held)) = self.built_keys.pop() {
+            if !terminated && !self.is_filled() {
+                for at in held.into_values() {
+                    self.call_rt("grasm_str_build_discard", &[at]);
+                }
             }
         }
         if terminated {
@@ -6802,6 +6881,24 @@ impl FnCx<'_, '_> {
                 Ok(StmtOut::Value(None))
             }
             Stmt::Let { name, ty, init, .. } => {
+                // A name that exists only to be a map key never becomes a
+                // string: the text stays in the builder and the table is
+                // probed from its bytes.
+                if self
+                    .built_keys
+                    .last()
+                    .is_some_and(|(eligible, _)| eligible.iter().any(|n| *n == name.name))
+                {
+                    let at = self.call_rt("grasm_str_build", &[]).unwrap();
+                    match init {
+                        Expr::Str(pieces, _) => self.emit_pieces(at, pieces)?,
+                        other => self.emit_concat_into(at, other)?,
+                    }
+                    if let Some((_, held)) = self.built_keys.last_mut() {
+                        held.insert(name.name.clone(), at);
+                    }
+                    return Ok(StmtOut::Value(None));
+                }
                 // A handler bound to a name is consumed by the pass that lifts
                 // its operations into functions, not by this one. There is no
                 // runtime value to produce: `EHandler` is a type the effect
@@ -8943,6 +9040,54 @@ this case",
     /// gained there. What this looks for is a tree with an *interpolation* in
     /// it, or more than one join — the shapes where each piece currently
     /// becomes a value of its own on the way to the answer.
+    /// The `let` names in this block whose value exists only to be a map key.
+    ///
+    /// `counts.set(w, (counts.get(w) ?? 0) + 1)` builds `w`, looks it up,
+    /// finds it already in the table and drops it — 399,224 times out of
+    /// 400,000 in `wordfreq`, at 12.67 ns each. The table never needed the
+    /// value: it probes from borrowed text and builds a key only on insert.
+    /// So the text stays in the builder and no string is ever made.
+    ///
+    /// Only for a block that runs to its end: the builder is given back when
+    /// the block closes, and a `break` past that point would strand it.
+    fn built_key_lets(&mut self, blk: &grasm_syntax::ast::Block) -> Vec<String> {
+        if body_leaves_early(blk) {
+            return Vec::new();
+        }
+        let mut out: Vec<String> = Vec::new();
+        for (i, st) in blk.stmts.iter().enumerate() {
+            let Stmt::Let { name, init, .. } = st else {
+                continue;
+            };
+            let builds = matches!(init, Expr::Str(..)) || self.is_fusible_concat(init);
+            if !builds || !matches!(self.probe_type(init), Ok(VType::Str)) {
+                continue;
+            }
+            if only_map_key_uses(&name.name, &blk.stmts[i + 1..]) {
+                out.push(name.name.clone());
+            }
+        }
+        out
+    }
+
+    /// The builder holding this expression's text, if it is such a name.
+    fn built_key(&self, e: &Expr) -> Option<Value> {
+        let Expr::Ident(id) = e else {
+            return None;
+        };
+        self.built_keys
+            .iter()
+            .rev()
+            .find_map(|(_, held)| held.get(&id.name).copied())
+    }
+
+    /// The builder's bytes, as the pair the byte-keyed map entries take.
+    fn built_key_bytes(&mut self, at: Value) -> (Value, Value) {
+        let ptr = self.call_rt("grasm_str_build_ptr", &[at]).unwrap();
+        let len = self.call_rt("grasm_str_build_len", &[at]).unwrap();
+        (ptr, len)
+    }
+
     fn is_fusible_concat(&mut self, e: &Expr) -> bool {
         if !matches!(self.probe_type(e), Ok(VType::Str)) {
             return false;
@@ -9678,15 +9823,37 @@ this case",
                                         Some((**k_t).clone())
                                     };
                                     let kt2 = k_t.clone();
-                                    let (kv, kvt) =
-                                        self.eval_expr_expecting(&args[0], want_k.as_ref())?;
-                                    let kb = self.box_value(kv, &kvt);
+                                    let keyed = self.built_key(&args[0]);
+                                    let kvt = match keyed {
+                                        // The key never became a string: its
+                                        // text is still in the builder.
+                                        Some(_) => VType::Str,
+                                        None => {
+                                            let (kv, kvt) = self
+                                                .eval_expr_expecting(&args[0], want_k.as_ref())?;
+                                            let kb = self.box_value(kv, &kvt);
+                                            self.pending_key = Some(kb);
+                                            kvt
+                                        }
+                                    };
                                     let d = self.b.ins().iconst(types::I64, delta);
                                     let z = self.b.ins().iconst(types::I64, default);
                                     let cur = self.b.use_var(var);
-                                    let np = self
-                                        .call_rt("grasm_map_add_i64", &[cur, kb, d, z])
-                                        .unwrap();
+                                    let np = match keyed {
+                                        Some(at) => {
+                                            let (kp, kl) = self.built_key_bytes(at);
+                                            self.call_rt(
+                                                "grasm_map_add_i64_bytes",
+                                                &[cur, kp, kl, d, z],
+                                            )
+                                            .unwrap()
+                                        }
+                                        None => {
+                                            let kb = self.pending_key.take().expect("key");
+                                            self.call_rt("grasm_map_add_i64", &[cur, kb, d, z])
+                                                .unwrap()
+                                        }
+                                    };
                                     let refined = VType::Map(
                                         if *kt2 == VType::Any {
                                             Box::new(kvt)
@@ -9716,15 +9883,32 @@ this case",
                             // releases the key instead of stranding it. That
                             // is a parser's inner loop: read a key, then fail
                             // reading its value.
+                            let keyed = self.built_key(&args[0]);
                             self.push_scope();
-                            let (kv, kvt) = self.eval_expr_expecting(&args[0], want_k.as_ref())?;
-                            let kb = self.box_value(kv, &kvt);
-                            let kb = self.hold_operand((kb, VType::Any)).0;
+                            let (kb, kvt) = match keyed {
+                                Some(_) => (None, VType::Str),
+                                None => {
+                                    let (kv, kvt) =
+                                        self.eval_expr_expecting(&args[0], want_k.as_ref())?;
+                                    let kb = self.box_value(kv, &kvt);
+                                    (Some(self.hold_operand((kb, VType::Any)).0), kvt)
+                                }
+                            };
                             let (vv, vvt) = self.eval_expr_expecting(&args[1], want_v.as_ref())?;
                             self.pop_scope_no_decs();
                             let vb = self.box_value(vv, &vvt);
                             let cur = self.b.use_var(var);
-                            let np = self.call_rt("grasm_map_set", &[cur, kb, vb]).unwrap();
+                            let np = match (keyed, kb) {
+                                (Some(at), _) => {
+                                    let (kp, kl) = self.built_key_bytes(at);
+                                    self.call_rt("grasm_map_set_bytes", &[cur, kp, kl, vb])
+                                        .unwrap()
+                                }
+                                (None, Some(kb)) => {
+                                    self.call_rt("grasm_map_set", &[cur, kb, vb]).unwrap()
+                                }
+                                (None, None) => unreachable!(),
+                            };
                             // Refine the map's element types once known.
                             let refined = VType::Map(
                                 if *kt == VType::Any { Box::new(kvt) } else { kt },
@@ -9864,16 +10048,33 @@ this case",
                     // value that diverges — `m.set(k, try f())` — releases the
                     // key instead of stranding it. That is the shape a parser
                     // has: read a key, then fail reading its value.
+                    let keyed = self.built_key(&args[0]);
                     self.push_scope();
-                    let (kv, kvt) = self.eval_expr_expecting(&args[0], want_k.as_ref())?;
-                    let kb = self.box_value(kv, &kvt);
-                    let kb = self.hold_operand((kb, VType::Any)).0;
+                    let kb = match keyed {
+                        Some(_) => None,
+                        None => {
+                            let (kv, kvt) =
+                                self.eval_expr_expecting(&args[0], want_k.as_ref())?;
+                            let kb = self.box_value(kv, &kvt);
+                            Some(self.hold_operand((kb, VType::Any)).0)
+                        }
+                    };
                     let (vv, vvt) = self.eval_expr_expecting(&args[1], want_v.as_ref())?;
                     self.pop_scope_no_decs();
                     let vb = self.box_value(vv, &vvt);
                     let cur = self.b.use_var(var);
                     let mapv = self.read_place_boxed(cur, &path, &root_t, true)?;
-                    let newmap = self.call_rt("grasm_map_set", &[mapv, kb, vb]).unwrap();
+                    let newmap = match (keyed, kb) {
+                        (Some(at), _) => {
+                            let (kp, kl) = self.built_key_bytes(at);
+                            self.call_rt("grasm_map_set_bytes", &[mapv, kp, kl, vb])
+                                .unwrap()
+                        }
+                        (None, Some(kb)) => {
+                            self.call_rt("grasm_map_set", &[mapv, kb, vb]).unwrap()
+                        }
+                        (None, None) => unreachable!(),
+                    };
                     let cur2 = self.b.use_var(var);
                     self.begin_write();
                     let updated = self.write_place(span, cur2, &path, &root_t, newmap)?;
@@ -13616,11 +13817,24 @@ fields, not the type this is bound to, not an enclosing generic",
         };
 
         let (mv, _) = self.eval_expr_val(recv)?;
-        let (kv, kt) = self.eval_expr_val(&args[0])?;
-        let boxed_k = self.box_value(kv, &kt);
-        let found = self.call_rt("grasm_map_get_ptr", &[mv, boxed_k]).unwrap();
-        self.call_rt("grasm_val_dec", &[mv]);
-        self.call_rt("grasm_val_dec", &[boxed_k]);
+        let found = match self.built_key(&args[0]) {
+            Some(at) => {
+                let (kp, kl) = self.built_key_bytes(at);
+                let f = self
+                    .call_rt("grasm_map_get_ptr_bytes", &[mv, kp, kl])
+                    .unwrap();
+                self.call_rt("grasm_val_dec", &[mv]);
+                f
+            }
+            None => {
+                let (kv, kt) = self.eval_expr_val(&args[0])?;
+                let boxed_k = self.box_value(kv, &kt);
+                let f = self.call_rt("grasm_map_get_ptr", &[mv, boxed_k]).unwrap();
+                self.call_rt("grasm_val_dec", &[mv]);
+                self.call_rt("grasm_val_dec", &[boxed_k]);
+                f
+            }
+        };
 
         let present = self.b.create_block();
         let absent = self.b.create_block();

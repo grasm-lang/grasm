@@ -1450,6 +1450,34 @@ that could be probed by the builder's bytes -- hashing from the buffer and
 materialising a key only on insert -- would allocate 776 times instead of
 400,000. The buffer already exists and is already kept for its capacity.
 
+**Built. `wordfreq` 25.35 ms to 19.17 ms, 1.322x**, with allocations going from
+400,003 to **3**, `sort` and `tree` unchanged and every answer the same.
+
+The route there is worth recording, because two thirds of the work was aimed at
+dead code. `m.set(k, v)` has three lowerings and the first two patched were
+both unreachable for this program: the counting idiom is already fused into one
+`grasm_map_add_i64` that hashes once, which is why neither `map_set` site ever
+saw it. The only waste left in that fused call was the key *string*, so what
+was actually needed was `grasm_map_add_i64_bytes` and a rule that keeps the
+text where it was written.
+
+The rule: a `let` whose value is a string build and whose **every** mention is
+the key argument of `get` or `set` never becomes a string. The text goes into a
+builder, the table is probed from its bytes, and the builder returns to the
+thread when the block closes. Three conditions hold it up:
+
+- Only for a block that runs to its end -- `body_leaves_early` -- because a
+  `break` past the close would strand the builder.
+- Reading *through* the name disqualifies it, where the loan analysis allows
+  exactly that: a loan still has a value behind it and this has none, so
+  `w.len()` has nothing to read.
+- The scan denies by default, so an expression nobody thought about refuses
+  rather than quietly qualifying.
+
+Against Rust's 26.39 ms this row now runs 0.73x. Against Zig's 9.69 it is
+1.98x, and what remains is the 16.4 ns of formatting and copying per
+iteration, which no allocation trick reaches.
+
 (The single-interpolation form `"{i % 97}"` does not go through
 `grasm_str_build_end` -- under the same probe its allocation count *rose*, so
 its own path is elsewhere and this measurement says nothing about it.)

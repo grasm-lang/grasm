@@ -5,6 +5,11 @@
 //! a=1
 //! b=2
 //! true 1
+//! 3 3 1 3
+//! [ax1, bx2, cx3]
+//! 2 1
+//! 22 2
+//! 1 1 2
 fn main() {
     var m = map()
     m.set("b", 2)
@@ -23,4 +28,47 @@ fn main() {
 
     let gone = m.delete("b")
     print("{gone} {m.len()}")
+
+    // A key built on the spot and used only to look up by. The text never has
+    // to become a string of its own: it can be hashed where it was written and
+    // a key made only when one is genuinely new. What must hold is that the
+    // table ends up with exactly the keys the program wrote, whatever route
+    // they took to get there.
+    let tags = ["a", "b", "c"]
+    var counts = map()
+    for r in 0..3 {
+        for i in 0..3 {
+            let k = tags[i] + "x{i + 1}"
+            counts.set(k, (counts.get(k) ?? 0) + 1)
+        }
+    }
+    print("{counts.len()} {counts.get("bx2") ?? 0} {counts.get("zz") ?? 1} {counts.values().sum() / 3}")
+    print("{counts.keys()}")
+
+    // A key longer than a value holds inline, so the table has to own a copy
+    // rather than borrow the buffer it was hashed from.
+    var wide = map()
+    for i in 0..2 {
+        let long = "a-key-far-longer-than-fifteen-bytes-{i}"
+        wide.set(long, i + 1)
+    }
+    print("{wide.len()} {wide.get("a-key-far-longer-than-fifteen-bytes-0") ?? 0}")
+
+    // The same name read as a string as well as used as a key: it is an
+    // ordinary string and behaves like one.
+    var mixed = map()
+    let both = "kk" + "{2}"
+    mixed.set(both, 22)
+    print("{mixed.get(both) ?? 0} {both.len() - 1}")
+
+    // Leaving the block early, which the built form is not eligible for.
+    var early = map()
+    for i in 0..3 {
+        let e = "e{i}"
+        early.set(e, i)
+        if i == 0 {
+            continue
+        }
+    }
+    print("{early.len() - 2} {early.get("e1") ?? 9} {early.get("e2") ?? 9 - 1}")
 }
