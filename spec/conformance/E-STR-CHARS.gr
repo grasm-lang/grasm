@@ -1,8 +1,41 @@
 //! tag: E-STR-CHARS
 //! expect: output
 //! 3 3
+//! 300
+//! 302
+//! 303 304
+//! 304 305
+//! yzα w
+//! 300 600
+//! 301 601 q
 fn main() {
     // Characters, not bytes: each of these is multi-byte in UTF-8.
     let s = "héllo"
     print("{"abc".len()} {s.substr(0, 3).len()}")
+
+    // `len` counts characters, and for text long enough to be worth it the
+    // count is remembered rather than rescanned — `while i < s.len()` asked
+    // for it once per character and read the whole string each time, which is
+    // quadratic. What must hold is that the remembered count never outlives
+    // the text it described.
+    var a = ""
+    for _i in 0..300 { a += "x" }
+    print("{a.len()}")
+    a += "yz"
+    print("{a.len()}")
+
+    // ASCII until it is not. A count remembered while the text was one byte
+    // per character would be wrong the moment it stops being.
+    a += "\u{03b1}"
+    print("{a.len()} {a.byte_len()}")
+    a += "w"
+    print("{a.len()} {a.byte_len()}")
+    print("{a.substr(300, 3)} {a.substr(a.len() - 1, 1)}")
+
+    // Multi-byte from the start, grown past the same threshold.
+    var b = ""
+    for _i in 0..300 { b += "\u{00e9}" }
+    print("{b.len()} {b.byte_len()}")
+    b += "q"
+    print("{b.len()} {b.byte_len()} {b.substr(300, 1)}")
 }

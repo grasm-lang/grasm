@@ -1613,20 +1613,38 @@ over the whole text on every call — vectorised, but still linear — so
 source files write `while i < x.len()`**, which is the opposite of the list
 trap above, though the ones checked are over lists and bytes rather than text.
 
-**Caching the count is the wrong fix, and the runtime already says so.**
-`RtStr` is the largest `RtPayload` variant, so its size is charged to every
-boxed value — every integer, every bool. A cached length and an index were
-removed for exactly that reason, and the comment explaining it is still there:
-36 of `RtStr`'s 64 bytes were an index most strings never build. Buying O(1)
-`len` for long text by making every small value larger is the trade that was
-already made, in the other direction, deliberately.
+**A cached count as a new field would be the wrong fix, and the runtime says
+so.** `RtStr` is the largest `RtPayload` variant, so its size is charged to
+every boxed value — every integer, every bool. A cached length and an index
+were removed for exactly that reason, and the comment explaining it is still
+there: 36 of `RtStr`'s 64 bytes were an index most strings never build.
 
-So this is written down rather than fixed. No program in the corpus is
-measurably slower for it -- the two slowest are an interpreter and a durable
-log -- and the fix that looks obvious would cost the working set of everything
-else. What would be worth measuring, if a victim ever turns up, is folding the
-flag into the `OnceLock` the index already occupies, so an ASCII string pays
-one small allocation on its first `len` instead of a scan on every one.
+**Fixed without paying that, by using the `OnceLock` the index already
+occupies.** It is empty for ASCII text, which never needs offsets, so the count
+goes there and costs no bytes at all. `byte_at` and `char_at` both return
+before reading `offsets`, so an index carrying a count and an empty vector is
+never misread. Below 256 bytes nothing changes: the scan is what the original
+comment measured as cheaper than reaching the cache, and short text keeps it.
+
+| `while i < s.len()` | before | after |
+| --- | --- | --- |
+| 20,000 | 19.8 ms | 2.4 ms |
+| 40,000 | 67.4 ms | 2.9 ms |
+| scaling | 3.4x, quadratic | **1.2x, linear** |
+
+**23x at 40,000**, and matched builds show nothing paying for it: short-string
+`len` over two million calls, a non-ASCII loop, `wordfreq`, `sort` and `tree`
+are all inside noise with identical answers.
+
+The hazard is a count outliving the text it described, and the index already
+had it — three mutation sites reset the `OnceLock`, so the count inherits that
+discipline. [E-STR-CHARS] pins the case that would catch a miss: text that is
+ASCII until an `\u{03b1}` is appended to it, where a remembered one-byte-per-
+character count would be wrong from that moment on.
+
+`s.substr(i, 1)` per character and `s = "x" + s` are still quadratic, and both
+are inherent rather than accidental: one walks to a character index, the other
+copies to put a character in front.
 
 ## Where the remaining gap actually is
 

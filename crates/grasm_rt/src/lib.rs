@@ -931,6 +931,12 @@ impl StrData {
 }
 
 /// Character offsets for text that is not ASCII.
+/// Below this, `char_len` scans rather than remembering: the scan is
+/// vectorised, and for short text it beats reaching through the cache. The
+/// cost it avoids is quadratic, so the threshold only has to be low enough
+/// that a loop over long text stops paying it.
+const LEN_CACHE_MIN: usize = 256;
+
 #[derive(Debug)]
 struct CharIndex {
     count: u32,
@@ -1112,9 +1118,36 @@ impl RtStr {
         // ASCII is the overwhelmingly common case and needs nothing built:
         // one byte per character, so the count *is* the length. `is_ascii` is
         // a vectorised scan in `std`, far cheaper than counting characters and
-        // cheaper than the cache lookup it replaces.
-        if self.s.as_str().is_ascii() {
-            return self.s.as_str().len();
+        // cheaper than the cache lookup it replaces — for short text, which is
+        // what that comparison was made on and what this keeps.
+        //
+        // Long text is the other case. The scan is linear, so
+        // `while i < s.len()` asks for the length once per character and reads
+        // the whole string each time: 20,000 characters took 19.8 ms and
+        // 40,000 took 67.4, which is quadratic. Past the threshold the count
+        // is remembered in the index this already has, and every later call is
+        // a pointer away.
+        //
+        // ASCII stores a count with no offsets: the byte offset *is* the
+        // index, so `byte_at` and `char_at` return before reading them, and
+        // building the vector would cost four bytes a character for a table
+        // nothing consults.
+        let text = self.s.as_str();
+        if text.len() < LEN_CACHE_MIN {
+            if text.is_ascii() {
+                return text.len();
+            }
+            return self.index().count as usize;
+        }
+        if let Some(ix) = self.index.get() {
+            return ix.count as usize;
+        }
+        if text.is_ascii() {
+            let _ = self.index.set(Box::new(CharIndex {
+                count: text.len() as u32,
+                offsets: Vec::new(),
+            }));
+            return text.len();
         }
         self.index().count as usize
     }
