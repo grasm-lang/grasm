@@ -1663,6 +1663,39 @@ noise with identical answers.
 `s = "x" + s` remains quadratic and that one really is inherent: putting a
 character in front of text means moving the text.
 
+### What the two string fixes are worth on real programs
+
+The byte-keyed map above helped 0 of 186 demos, so these were held to the same
+question. Every demo whose runtime is far enough above the process floor to
+resolve — 108 of them — was timed with the old binary and the new one
+**interleaved**, run for run:
+
+| | before | after | |
+| --- | --- | --- | --- |
+| `sql-demo` | 10.1 ms | 4.2 ms | 2.41x |
+| `legacytext-demo` | 85.9 ms | 41.3 ms | 2.08x |
+| `fonts-demo` | 17.9 ms | 8.6 ms | 2.08x |
+| `geo2-demo` | 5.6 ms | 4.2 ms | 1.34x |
+| `content-demo`, `encodings-demo`, `japan-demo` | | | 1.27x |
+| `sevenbit-demo` | 83.6 ms | 66.9 ms | 1.25x |
+
+All with identical output. Text handling is where the corpus actually spends
+itself, and this is the first change this session to show that breadth.
+
+**Two measurement traps caught on the way, both mine.** Diffing two corpus
+sweeps taken at different times under load produced eight "movers" of 2.2-3x;
+interleaved, three of the five checked had not moved at all (`http-demo` 0.96x,
+`config2-demo` 0.97x, `compression2-demo` 1.00x). Two sweeps are not a
+comparison, however many programs they cover. And seven reps on a 3 ms program
+reported `cache-demo` at 0.60x and `audio-demo` at 0.73x; at twenty-one reps
+they are 0.97x and **1.00x**. When min and median disagree, the answer is that
+there are not enough runs yet.
+
+**The case that cannot pay for itself costs about 5%.** A fresh 5,000-character
+string asked its length exactly once — so the remembered count is never read
+again — runs 0.97x min, 0.95x median, 0.99x mean over thirty-one runs. That is
+the price of the 23x and the 55x, and it is worth it.
+
 ## Where the remaining gap actually is
 
 Timed head to head by processor time, and split by compiling cut-down versions
