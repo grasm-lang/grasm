@@ -10,42 +10,51 @@ it. This is the other half: why the numbers are what they are.
 
 ## The standing gap
 
-Measured 2026-09-21 on an idle machine by `scripts/bench.sh` — wall clock,
-best of three, microseconds, checksums verified against the interpreter first.
+Measured 2026-09-22 by `scripts/bench.sh` — wall clock, best of three,
+checksums verified against the interpreter first.
 
 | program | c | rust | go | nim | zig | grasm | vs rust |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| `sort` | 36.79 | 11.66 | 49.64 | – | – | **10.30** | **0.88x** |
-| `wordfreq` | 30.66 | 26.40 | 16.98 | 22.08 | 9.52 | **24.84** | **0.94x** |
-| `parwords` | 8.31 | 11.50 | 9.98 | – | – | 11.20 | 0.97x |
-| `fib` | 4.86 | 5.44 | 6.17 | 5.69 | 5.42 | 5.60 | 1.03x |
-| `parmap` | 50.04 | 53.05 | 89.42 | – | – | 56.20 | 1.06x |
-| `sieve` | 7.24 | 7.00 | 7.66 | 9.46 | 7.33 | 7.54 | 1.08x |
-| `matmul` | 5.07 | 5.24 | 8.26 | 10.28 | 5.84 | 9.80 | 1.87x |
-| `tree` | 20.89 | 9.73 | 20.66 | – | – | 27.95 | 2.87x |
+| `wordfreq` | 30.70 | 25.44 | 17.72 | 21.89 | 9.46 | **18.61** | **0.73x** |
+| `sort` | 36.58 | 11.65 | 50.27 | – | – | **10.20** | **0.88x** |
+| `fib` | 5.32 | 5.66 | 6.04 | 5.60 | 5.59 | **5.35** | **0.95x** |
+| `parwords` | 7.87 | 11.38 | 10.37 | – | – | 11.27 | 0.99x |
+| `sieve` | 7.10 | 7.04 | 8.05 | 9.08 | 7.39 | 7.60 | 1.08x |
+| `parmap` | 61.05 | 51.60 | 90.20 | – | – | 69.90 | 1.35x † |
+| `matmul` | 5.24 | 5.16 | 8.21 | 9.31 | 5.59 | 9.60 | 1.86x |
+| `tree` | 20.62 | 9.86 | 21.00 | – | – | 25.49 | 2.59x |
 
-`G2` — the geometric mean of rust/native — is **0.816x** against a target of
-0.95x, and it was 0.62x at the start of the previous day. With the 2.64 ms
-process floor subtracted from both sides it is 0.755x.
+† **`parmap` is contaminated.** The machine's load average reached 6.66 by the
+end of this run, and a `par*` row is the most load-sensitive thing here: the
+same binary measured 55.48 ms an hour earlier. Read it as ~1.07x, and read
+`G2` as about 0.86 rather than the 0.836 printed below.
 
-**Two rows beat Rust and one is level.** `sort` by 12%, and by three and a
-half times over C and nearly five over Go. `wordfreq` by 6%, and over C. Both
-are single-threaded, so those margins can be read. `parwords` comes out 3%
-ahead, which is *inside* what a `par*` row can resolve — call it parity, not a
-win. `parmap` is 6% behind on the same terms, so also parity; it was 1.22x
-behind before the power-of-two remainder change.
+`G2` — the geometric mean of rust/native — printed **0.836x** against a target
+of 0.95x, from 0.816x the previous day and 0.62x the day before that. With the
+2.28 ms process floor subtracted from both sides, 0.794x.
 
-`fib` and `sieve` are within 8% of Rust and within 4% of Zig. What is left is
-two rows:
+**Four rows now beat Rust.** `wordfreq` by 37% and over C by 65%, after the
+byte-keyed map took 400,000 allocations down to 3. `sort` by 14%, and by three
+and a half times over C. `fib` by 6% — and by 4% over Zig, which is the first
+row here to beat Zig outright. `parwords` is 1% ahead, which is inside what a
+`par*` row resolves, so parity rather than a win.
 
-* `tree` — 2.87x. Probed five ways; four measured nothing and the fifth, a
-  representation with no per-node box at all, is a third *slower*.
-* `matmul` — 1.87x. All instruction quality inside one loop, with no runtime
-  call anywhere in its profile. A vectoriser is worth 1.21x, measured by
-  building the *Rust* program with LLVM's vectorisers off.
+`sieve` is within 8% of Rust and 3% of Zig. What is left is two rows:
+
+* `tree` — 2.59x, and **2.245x of that is the representation**: the same
+  program in Rust with `Vec<Box<Node>>`, which allocates 787,300 times exactly
+  as this does, runs 22.46 ms against 10.00 for `Vec<Node>`. Grasm's own
+  overhead over Rust doing the identical work is 1.22x. Storing nodes inline
+  is the only thing that reaches this row.
+* `matmul` — 1.86x. All instruction quality inside one loop, with no runtime
+  call anywhere in its profile. Bounds checks are worth 1.081x and a vectoriser
+  1.21x; the remaining 2.36x against Rust's *scalar* kernel is not explained by
+  checks, index arithmetic, instruction count or unrolling, and naming it needs
+  hardware counters.
 
 **Arithmetic, calls, sorting, text and multi-core throughput are at or near
-parity. Allocation is not, and neither is vectorised arithmetic.**
+parity, and text is now ahead of Rust and of C. Allocation is not, and neither
+is vectorised arithmetic.**
 
 ## What has been measured
 
