@@ -18,6 +18,7 @@
 //! xyxy
 //! 0a1b2c
 //! q-0-q-1-
+//! xya zwb
 // A string built by appending to itself is the same string however the
 // backend chooses to build it. `s = s + rest` and `s += rest` are compiled
 // as an append rather than a rebuild — in place when nothing else holds the
@@ -155,4 +156,16 @@ fn main() {
         f3 = f3 + q + "-{i}-"
     }
     print(f3)
+
+    // Binding a name a second time in the same block releases what the first
+    // binding owned. The scope releases only what it holds when it closes, so
+    // without that the first value is simply lost — and it takes an append to
+    // bite, because a bare literal is immortal and has no reference to lose.
+    // This exited 7 under `GRASM_LEAK_CHECK=1` with one allocation live.
+    var sh = "xy"
+    sh = sh + "a"
+    let first = sh
+    var sh = "zw"
+    sh = sh + "b"
+    print("{first} {sh}")
 }

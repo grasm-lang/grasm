@@ -5863,6 +5863,32 @@ impl FnCx<'_, '_> {
     }
 
     fn bind(&mut self, name: &str, var: Variable, vt: VType) {
+        // A second `var x` in the same block replaces this entry, and the
+        // scope releases only what it holds when it closes -- so without this
+        // the first binding's value is never released. It takes an append to
+        // bite, which is why it went unseen: a bare string literal is
+        // immortal and has no reference to lose, and `var t = "xy"` twice over
+        // is clean. `var t = "xy"; t = t + "a"; var t = "zw"` is not.
+        //
+        // Only for a genuinely different variable: `rebind` refines a type on
+        // the same one and must not release it. And only from a live block,
+        // since a call emitted after a terminator is a verifier error.
+        let prev = self
+            .vars
+            .last()
+            .and_then(|scope| scope.get(name))
+            .map(|(v, t)| (*v, t.clone()));
+        if let Some((old, old_t)) = prev {
+            if old.as_u32() != var.as_u32()
+                && old_t.boxed()
+                && !self.borrowed_vars.contains(&old.as_u32())
+                && !self.is_filled()
+                && !self.dead
+            {
+                let v = self.b.use_var(old);
+                self.call_rt("grasm_val_dec", &[v]);
+            }
+        }
         self.vars
             .last_mut()
             .unwrap()
