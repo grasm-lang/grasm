@@ -1529,6 +1529,46 @@ Written the other way round -- a single interpolation, `"{words[i % 8]}{i % 97}"
 interpolation already lower to one thing and there is no source-level win
 hiding here.
 
+## A chained append was quadratic — 2026-09-22
+
+Found by asking the corpus instead of the benchmarks. Every one of the 186 demo
+packages was built and run, and the slowest by a wide margin was `zlib-demo` at
+**5.17 s**, with `_platform_memmove` holding ~85% of its samples.
+
+The cause is general and nothing to do with zlib. The self-append fusion
+matched `s = s + a` and not `s = s + a + b`, because the second parses as
+`((s + a) + b)` and the match looked for the name directly on the left. What it
+did not match fell through to building a whole new string each time round:
+
+| | n=50,000 | n=100,000 |
+| --- | --- | --- |
+| `out = out + a` | 2.5 ms | 3.1 ms |
+| `out = out + a + b` | 244.9 ms | 711.8 ms |
+| `out = out + a + b`, after | 3.0 ms | 4.1 ms |
+
+Linear against quadratic — **174x at n=100,000** — and `bytes.encode_hex`
+writes exactly that shape, which is why hex-encoding 200 KB to compare two
+buffers dominated the whole program.
+
+    zlib-demo   5171 ms -> 65.2 ms   79x
+
+Nothing else moved: `scheme-demo`, `x509-demo`, `statistics-demo`,
+`encodings-demo` and `certs-demo` are all within 1%.
+
+**Appending in place changes the name as it goes**, which is a hazard the
+single-piece form does not have. `s = s + "-" + s` compiled to `ab-ab-` for
+`ab-ab`, because the second piece read the name after the first had already
+written to it. A chain of more than one piece that mentions the target now
+falls back to the ordinary path; one piece stays safe, since it is read before
+the append. No gate caught that -- difftest passed the broken build, because
+nothing in 497 programs writes it and no generator makes it -- so it is pinned
+in [E-STR-CONCAT] along with the chain, a three-piece mix, and a chain whose
+head is a different name.
+
+Two hypotheses died before any of this was built: hoisting `zlib`'s per-call
+lookup tables to module constants changed nothing at all, and an `inout` list
+push turned out not to copy (2.9 ms against 2.7 for 200,000 pushes).
+
 ## Where the remaining gap actually is
 
 Timed head to head by processor time, and split by compiling cut-down versions

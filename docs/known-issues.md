@@ -5,7 +5,44 @@ Every defect that is known and not fixed, with its severity from
 to paste. S1 and S2 block a release; S3 and S4 do not, and this file is what
 makes shipping them honest rather than quiet.
 
-**Open S1: none. Open S2: none. Open S3: none. Open S4: none.**
+**Open S1: none. Open S2: none. Open S3: 1. Open S4: none.**
+
+## S3 — a second `var` of the same name leaks the first value
+
+Redeclaring a name in the same block replaces the scope's entry, and the
+scope releases only what it holds at the end — so the value the first binding
+owned is never released.
+
+```
+fn main() {
+    var t = "xy"
+    t = t + "a"
+    print(t)
+    var t = "zw"
+    t = t + "b"
+    print(t)
+}
+```
+
+Exits 7 under `GRASM_LEAK_CHECK=1` with one allocation still live. Both
+engines print the right thing, which is why nothing else sees it.
+
+Shadowing on its own does *not* leak: `var t = "xy"` followed by
+`var t = "zw"` with no append is clean, because a short string literal is
+immortal and never had a reference to lose. It takes an append first to make
+the binding own a counted value.
+
+`FnCx::bind` inserts into the innermost scope map and drops whatever entry was
+there. `pop_scope_with_decs` then releases each name's *current* variable, so
+the shadowed one is simply lost. The fix is a release at the point of
+replacement, guarded on the variable actually differing — `rebind`, which
+refines a type on the same variable, must not release — and on the block being
+live.
+
+Found on 2026-09-22 while writing an [E-STR-CONCAT] case that reused a name
+the file already had. Present on the compiler before that day's changes too,
+so it is not a regression from them.
+
 
 Closed on 2026-09-21: `fuzz_exits` disagreed on four programs in eighty-five,
 and each was the same leak. A tuple literal of two or three elements is built

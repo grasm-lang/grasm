@@ -4562,6 +4562,31 @@ fn merge_fallible_halves(a: VType, b: VType) -> VType {
 /// disqualifies it, because while the buffer is open the string's own length
 /// is stale and anything that reads it would see the text it had before the
 /// loop. That is the same rule the list machinery follows.
+/// A left-nested `a + b + c` as its leftmost operand and the pieces after it.
+///
+/// `s = s + a` was recognised as an append and `s = s + a + b` was not, because
+/// the second parses as `((s + a) + b)` and the match looked for the name
+/// directly on the left. The unrecognised form fell back to building a whole
+/// new string per iteration, which is quadratic: `encode_hex` in the `bytes`
+/// package writes exactly that shape, and hex-encoding 200,000 bytes took
+/// 697 ms where the single-piece form takes 3.
+fn concat_chain(e: &Expr) -> (&Expr, Vec<&Expr>) {
+    let mut pieces: Vec<&Expr> = Vec::new();
+    let mut cur = e;
+    while let Expr::Binary {
+        op: BinaryOp::Add,
+        lhs,
+        rhs,
+        ..
+    } = cur
+    {
+        pieces.push(rhs);
+        cur = lhs;
+    }
+    pieces.reverse();
+    (cur, pieces)
+}
+
 fn str_appended_only(block: &grasm_syntax::ast::Block) -> Vec<String> {
     let mut appended: Vec<String> = Vec::new();
     let mut other: Vec<String> = Vec::new();
@@ -4590,15 +4615,18 @@ fn str_append_rhs<'a>(b: &'a grasm_syntax::ast::Block, name: &str, out: &mut Vec
                 ..
             } if id.name == name => match (op, value) {
                 (AssignOp::Add, v) => out.push(v),
-                (
-                    AssignOp::Assign,
-                    Expr::Binary {
-                        op: BinaryOp::Add,
-                        lhs,
-                        rhs,
-                        ..
-                    },
-                ) if matches!(&**lhs, Expr::Ident(l) if l.name == name) => out.push(rhs),
+                (AssignOp::Assign, v @ Expr::Binary { op: BinaryOp::Add, .. }) => {
+                    let (head, pieces) = concat_chain(v);
+                    let reads_target = pieces.len() > 1
+                        && pieces.iter().any(|p| {
+                            let mut names = Vec::new();
+                            collect_idents(p, &mut names);
+                            names.iter().any(|n| *n == name)
+                        });
+                    if !reads_target && matches!(head, Expr::Ident(l) if l.name == name) {
+                        out.extend(pieces);
+                    }
+                }
                 _ => {}
             },
             Stmt::While { body, .. } | Stmt::For { body, .. } => {
@@ -4622,25 +4650,32 @@ fn scan_str_appends_block(
                 value,
                 ..
             } => {
-                let rest = match (op, value) {
-                    (AssignOp::Add, v) => Some(v),
-                    (
-                        AssignOp::Assign,
-                        Expr::Binary {
-                            op: BinaryOp::Add,
-                            lhs,
-                            rhs,
-                            ..
-                        },
-                    ) if matches!(&**lhs, Expr::Ident(l) if l.name == id.name) => Some(&**rhs),
+                let rest: Option<Vec<&Expr>> = match (op, value) {
+                    (AssignOp::Add, v) => Some(vec![v]),
+                    (AssignOp::Assign, v @ Expr::Binary { op: BinaryOp::Add, .. }) => {
+                        let (head, pieces) = concat_chain(v);
+                        let reads_target = pieces.len() > 1
+                            && pieces.iter().any(|p| {
+                                let mut names = Vec::new();
+                                collect_idents(p, &mut names);
+                                names.iter().any(|n| *n == id.name)
+                            });
+                        if !reads_target && matches!(head, Expr::Ident(l) if l.name == id.name) {
+                            Some(pieces)
+                        } else {
+                            None
+                        }
+                    }
                     _ => None,
                 };
                 match rest {
-                    Some(r) => {
+                    Some(rs) => {
                         appended.push(id.name.clone());
                         // The right-hand side reading the same name is an
                         // alias, not an append.
-                        collect_idents(r, other);
+                        for r in rs {
+                            collect_idents(r, other);
+                        }
                     }
                     None => {
                         other.push(id.name.clone());
@@ -7151,38 +7186,62 @@ impl FnCx<'_, '_> {
                 // copied, so the accumulator grows in place instead of being
                 // copied whole every step.
                 if vt == VType::Str {
-                    let rhs = match (op, value) {
-                        (AssignOp::Add, v) => Some(v),
-                        (
-                            AssignOp::Assign,
-                            Expr::Binary {
-                                op: BinaryOp::Add,
-                                lhs,
-                                rhs,
-                                ..
-                            },
-                        ) if matches!(&**lhs, Expr::Ident(l) if l.name == id.name) => Some(&**rhs),
+                    // `s = s + a + b` is the same append as `s = s + a`, twice
+                    // over: it parses as `((s + a) + b)`, so the name is at the
+                    // end of the left spine rather than directly on the left.
+                    // Reading only the direct form left the chained one
+                    // building a whole new string each time round, which is
+                    // quadratic.
+                    let rhs: Option<Vec<&Expr>> = match (op, value) {
+                        (AssignOp::Add, v) => Some(vec![v]),
+                        (AssignOp::Assign, v @ Expr::Binary { op: BinaryOp::Add, .. }) => {
+                            let (head, pieces) = concat_chain(v);
+                            // Appending in place changes the name as it goes,
+                            // so a later piece that reads it would see what
+                            // earlier pieces already wrote: `s = s + "-" + s`
+                            // gave `ab-ab-` for `ab-ab`. One piece is safe --
+                            // it is read before the append -- and a chain that
+                            // mentions the name again is left to the ordinary
+                            // path, which builds the whole value first.
+                            let reads_target = pieces.len() > 1
+                                && pieces.iter().any(|p| {
+                                    let mut names = Vec::new();
+                                    collect_idents(p, &mut names);
+                                    names.iter().any(|n| *n == id.name)
+                                });
+                            if !reads_target
+                                && matches!(head, Expr::Ident(l) if l.name == id.name)
+                            {
+                                Some(pieces)
+                            } else {
+                                None
+                            }
+                        }
                         _ => None,
                     };
-                    if let Some(piece) = rhs {
+                    if let Some(parts) = rhs {
+                        for piece in parts {
                         // As in `try_self_append`: an interpolation's pieces
                         // go onto the buffer one at a time, so the string it
                         // would have built is never a value.
                         if let Expr::Str(pieces, _) = piece {
+                            let mut done = false;
                             if let Some(pin) = self.str_append_state(&id.name) {
                                 if self.pieces_write_inline(pieces) {
                                     for p in pieces {
                                         self.str_pin_piece(&pin, p)?;
                                     }
-                                    return Ok(StmtOut::Value(None));
+                                    done = true;
                                 }
                             }
-                            let mut cur = self.b.use_var(var);
-                            for p in pieces {
-                                cur = self.append_piece(cur, p)?;
+                            if !done {
+                                let mut cur = self.b.use_var(var);
+                                for p in pieces {
+                                    cur = self.append_piece(cur, p)?;
+                                }
+                                self.b.def_var(var, cur);
                             }
-                            self.b.def_var(var, cur);
-                            return Ok(StmtOut::Value(None));
+                            continue;
                         }
                         let (rv, rt) = self.eval_expr_val(piece)?;
                         if rt != VType::Str {
@@ -7192,6 +7251,7 @@ impl FnCx<'_, '_> {
                         let joined = self.call_rt("grasm_str_append", &[old, rv]).unwrap();
                         self.call_rt("grasm_val_dec", &[rv]);
                         self.b.def_var(var, joined);
+                        }
                         return Ok(StmtOut::Value(None));
                     }
                 }

@@ -13,6 +13,11 @@
 //! 0123
 //! 00 01 02 10 11 12 20 21 22 
 //! false-false-true-
+//! a0b0a1b1a2b2
+//! ab-ab
+//! xyxy
+//! 0a1b2c
+//! q-0-q-1-
 // A string built by appending to itself is the same string however the
 // backend chooses to build it. `s = s + rest` and `s += rest` are compiled
 // as an append rather than a rebuild — in place when nothing else holds the
@@ -111,4 +116,43 @@ fn main() {
         b2 += "{i > 1}-"
     }
     print(b2)
+
+    // A chain of appends is the same append, twice over. `c = c + x + y`
+    // parses as `((c + x) + y)`, so the name sits at the end of the left
+    // spine rather than directly on the left; reading only the direct form
+    // left this rebuilding the whole string each time round, which is
+    // quadratic — 200,000 bytes of hex took 697 ms where one piece takes 3.
+    var c = ""
+    for i in 0..3 {
+        c = c + "a{i}" + "b{i}"
+    }
+    print(c)
+
+    // Appending in place changes the name as it goes, so a chain that reads
+    // the name again cannot take that path: the later piece would see what
+    // the earlier one already wrote. This gave `ab-ab-` for `ab-ab`.
+    var d = "ab"
+    d = d + "-" + d
+    print(d)
+
+    // One piece is safe either way, because it is read before the append.
+    var twice = "xy"
+    twice = twice + twice
+    print(twice)
+
+    // A chain of three, mixing an interpolation with a plain string.
+    var e3 = ""
+    let tail = ["a", "b", "c"]
+    for i in 0..3 {
+        e3 = e3 + "{i}" + tail[i]
+    }
+    print(e3)
+
+    // A chain whose head is a *different* name is not an append at all.
+    var f3 = ""
+    let q = "q"
+    for i in 0..2 {
+        f3 = f3 + q + "-{i}-"
+    }
+    print(f3)
 }
