@@ -1750,11 +1750,26 @@ free. Contained to the runtime; the sweep still has to drop each payload, so
 the win is the bookkeeping rather than the drops. Would make regions the
 answer to allocation-heavy code that the language already claims they are.
 
-**Escape analysis.** `tree` builds a `Node` per call and drops it a few
-instructions later. A value that provably does not escape its function could
-live on the stack with no box and no refcount. This is the one that closes the
-worst row, and it is a compiler project rather than a patch: it needs an
-alias analysis the front end does not have.
+**Storing struct values inline in a list.** `tree` allocates 787,300 times
+where Rust allocates 196,820 — one box per node plus one per interior node's
+list of children, against `Vec<Node>` holding its nodes inside it. The ceiling
+is measured, not guessed: the same program in Rust with `Vec<Box<Node>>`
+allocates identically and runs 22.46 ms against 10.00, so **2.245x of that row
+is the representation** and the 1.22x on top is ours. Nothing smaller reaches
+it; a cheaper box does not, because even a free allocation leaves 9.44 ns of
+the 19.41 standing.
+
+`[T-PARAM-OWN]` moves and `[E-VALUE-SEMANTICS]` copies on read, so a node
+pushed into its parent's list is owned by it and its identity is unobservable
+— the semantics already permit this, and only `ListData` stands in the way.
+What it needs first is a borrowed element read, so `for k in n.kids` hands out
+a pointer rather than moving the allocation from the build to the walk; that
+part is built and landed.
+
+**Escape analysis**, the other half of the same problem: a `Node` that
+provably does not escape its function could live on the stack with no box at
+all. A compiler project rather than a patch — it needs an alias analysis the
+front end does not have.
 
 **Inlined reference counts.** The backend emits a call for every retain and
 release, at more than a hundred sites. Inlining the atomic would remove a call each
@@ -1765,11 +1780,24 @@ sequentially consistent. The runtime's counts are `Relaxed` on the way up and
 *slower* on ARM and would be a threading defect if the ordering were wrong.
 Measure before writing.
 
-**A faster hash.** Both this runtime and the Rust comparison use SipHash, so
-the map rows are a fair fight. Swapping in a non-cryptographic hash would win
-several per cent and give up hash-flooding resistance, which is a real
-property for a language whose maps hold parsed input. Not a free win; it is a
-trade, and it should be argued rather than slipped in.
+**A faster hash — already taken, and this entry was wrong.** It read "both
+this runtime and the Rust comparison use SipHash". They do not: `mod maphash`
+is a wyhash-style mixing step, seeded per process, and has been for some time.
+There is no per-cent left there to trade hash-flooding resistance for, and
+`wordfreq` turned out not to be map-bound anyway — 400,000 `get`s and `set`s
+cost 780 allocations, while the *keys* cost 400,000 until they stopped.
+
+**`matmul`'s unexplained 2.36x.** Against Rust's *scalar* kernel, after bounds
+checks (1.081x) and with the vectoriser (1.21x) set aside, what remains is not
+explained by instruction count, index arithmetic, branch density or unrolling
+— each measured and ruled out. Naming it needs hardware counters, and this
+machine has Command Line Tools without Instruments, so `xctrace` is absent.
+
+**Two quadratic traps, left in on purpose.** `xs = xs + [i]` copies the whole
+list each step, and appears in **0 corpus source files** — they all use `push`.
+`s = "x" + s` is quadratic and inherent, since putting a character in front of
+text means moving the text. Both are written up above; neither is worth a
+change nothing exercises.
 
 **The optimiser itself.** Cranelift does not unroll, does not vectorise, and
 picks instructions less well than LLVM. Part of every ratio above is that, and
