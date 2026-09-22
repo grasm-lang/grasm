@@ -1478,6 +1478,30 @@ Against Rust's 26.39 ms this row now runs 0.73x. Against Zig's 9.69 it is
 1.98x, and what remains is the 16.4 ns of formatting and copying per
 iteration, which no allocation trick reaches.
 
+**How far it reaches, counted: 2 of 83.** Of the corpus programs that use a
+map, the rule fires on exactly two -- `wordfreq` and the conformance test
+written for it. Both are files this work touched, so as it stands the change
+earns its keep on the benchmark it was built for and nowhere else yet. That is
+worth saying plainly rather than leaving to be discovered.
+
+The corpus does contain the idiom, just not in a shape that reaches it:
+
+    seen.set("{pixels[i]},{pixels[i + 1]},{pixels[i + 2]}", true)
+    db.by_port.get("{port}/{protocol}")
+    c.entries.get(context + "\u{4}" + key)
+
+These write the key straight into the argument rather than binding it, which
+needs no analysis at all -- the text is built, probed and given back inside one
+expression, so nothing can hold it afterwards. That was built this session and
+**measured at 0 of 83 as well**: the `match m.get(k)` form goes through the
+plain `grasm_map_get`, which was then wired too and still fired nowhere,
+because most of the files carrying these lines are library modules with no
+`main` and the rest sit behind receivers the patched arms do not cover. Reverted
+rather than landed, since nothing measures it.
+
+So the honest position on this row: 1.322x is real and gated, and its
+generality is not yet demonstrated.
+
 (The single-interpolation form `"{i % 97}"` does not go through
 `grasm_str_build_end` -- under the same probe its allocation count *rose*, so
 its own path is elsewhere and this measurement says nothing about it.)
