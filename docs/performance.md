@@ -1569,6 +1569,32 @@ Two hypotheses died before any of this was built: hoisting `zlib`'s per-call
 lookup tables to module constants changed nothing at all, and an `inout` list
 push turned out not to copy (2.9 ms against 2.7 for 200,000 pushes).
 
+**The list has the same trap, and nothing in the corpus steps in it.**
+`xs = xs + [i]` allocates twice an iteration — the one-element literal and a
+fresh concatenation — so each step copies everything written so far:
+
+| n | | of n=10,000 | linear would be |
+| --- | --- | --- | --- |
+| 10,000 | 25.6 ms | 1.0x | 1x |
+| 20,000 | 95.9 ms | 3.7x | 2x |
+| 40,000 | 195.9 ms | 7.6x | 4x |
+| 80,000 | 628.5 ms | 24.5x | 8x |
+
+Per element that is 5.1 us against 0.13 for `xs.push(i)`, which is linear
+(2.6 ms at 20,000 against 2.9 at 40,000). `m.set(k, v)` is fine too.
+
+It is **not** fixed, and the reason is the measurement rather than the
+difficulty: `x = x + [...]` appears in **0 of the corpus's source files**,
+which all use `push`. The string version earned its fix by being what
+`bytes.encode_hex` actually writes. This one would be a change nothing here
+exercises, and the session already has one of those. It is written down so that
+a program which does hit it is not a mystery.
+
+A runtime-only fix would not reach it either: the backend reads the left
+operand with a reference and releases it after the call, so the concatenation
+never sees a uniquely-held list to append into. It needs the same self-append
+shape the string form uses.
+
 ## Where the remaining gap actually is
 
 Timed head to head by processor time, and split by compiling cut-down versions
