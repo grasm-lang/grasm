@@ -1362,6 +1362,48 @@ the element and a wrong answer here frees a live value:
 The list cannot be shortened underneath the walk: the loop iterates a temp it
 owns, so every mutator sees a count above one and `cow_list` copies.
 
+## `wordfreq` taken apart, and it is not the hash — 2026-09-22
+
+Against Zig rather than Rust, `wordfreq` is the worst row here: 9.69 ms to
+24.81, where C is 31.07 and Rust 26.39. The standing note elsewhere in this
+document blames the map hash and says a faster one would be worth "several per
+cent". Both halves of that are wrong. **This runtime already uses a wyhash-style
+mixing step**, not SipHash -- see `mod maphash` -- so there is no trade left to
+make there, and the map is not where the time goes anyway.
+
+Split three ways, interleaved, min of 15:
+
+| | min | |
+| --- | --- | --- |
+| whole program | 24.61 ms | 400,003 allocations |
+| the string half alone | 17.84 ms | 400,001 allocations |
+| the map half alone, keys built once | 12.98 ms | 780 allocations |
+
+The map does 400,000 `get`s and `set`s for 780 allocations, which is close to
+free. The string half is one allocation per iteration -- the concatenation and
+the interpolation are already fused into a single string, so that work is done.
+
+Per iteration, measured against a bare loop of the same shape:
+
+| | ns/iter | allocations |
+| --- | --- | --- |
+| `ns[i % 8]` on a list of integers | ~0.0 | none |
+| `words[i % 8]` on a list of strings, plus `len()` | 8.9 | none |
+| `"{i % 97}"` | 16.4 | one |
+| `words[i % 8] + "{i % 97}"` | 37.0 | one |
+
+**A scalar list index is free and a boxed one is 8.9 ns.** The scalar list is
+pinned -- the loop holds its buffer open and the index compiles to a load --
+while the boxed list pays `grasm_list_get` with its +1, a call for the read,
+and `grasm_val_dec` on the way out, none of which the scalar path has. Nothing
+is allocated either way, so all of it is call and reference-count traffic.
+
+That is the next thing to build: pinning a boxed list the body only reads, so
+the element arrives as a load and a loan rather than a call and a reference.
+`grasm_list_borrow_at` and `loop_elem_is_borrowed` are already in place for the
+loop case; this is the same rule at an index. Worth ~1.8 ms of `wordfreq`'s
+24.6 on the reference counting alone, and more if the call goes too.
+
 ## Where the remaining gap actually is
 
 Timed head to head by processor time, and split by compiling cut-down versions
