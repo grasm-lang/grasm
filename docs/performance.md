@@ -1435,6 +1435,25 @@ worth about 2% of `wordfreq` -- real, but small next to the 16.4 ns the
 formatting and its allocation cost. The string half is dominated by making the
 string, not by reading the word that goes into it.
 
+**And the allocation inside that is 12.67 ns, measured by removing it.** With
+`grasm_str_build_end` changed to fill the buffer, hand it back, and return one
+shared immortal string instead of allocating -- so the whole build runs and
+only the box does not -- `wf_str` falls from 17.51 ms to 12.44 ms, **1.407x**,
+with allocations going from 400,001 to 2. On `wordfreq` that is ~5.1 ms of
+24.9, about **20%**, and it is the largest measured item on the row this
+project is furthest behind Zig on.
+
+What would collect it: `wordfreq` writes `counts.set(w, (counts.get(w) ?? 0) + 1)`
+over 776 distinct keys and 400,000 iterations, so **399,224 of those 400,000
+key strings are allocated only to be found already present and dropped**. A map
+that could be probed by the builder's bytes -- hashing from the buffer and
+materialising a key only on insert -- would allocate 776 times instead of
+400,000. The buffer already exists and is already kept for its capacity.
+
+(The single-interpolation form `"{i % 97}"` does not go through
+`grasm_str_build_end` -- under the same probe its allocation count *rose*, so
+its own path is elsewhere and this measurement says nothing about it.)
+
 Written the other way round -- a single interpolation, `"{words[i % 8]}{i % 97}"`
 -- costs the same 37.1 ns against 37.2, so the concatenation and the
 interpolation already lower to one thing and there is no source-level win
