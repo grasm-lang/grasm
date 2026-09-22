@@ -1487,11 +1487,25 @@ Against Rust's 26.39 ms this row now runs 0.73x. Against Zig's 9.69 it is
 1.98x, and what remains is the 16.4 ns of formatting and copying per
 iteration, which no allocation trick reaches.
 
-**How far it reaches, counted: 2 of 83.** Of the corpus programs that use a
-map, the rule fires on exactly two -- `wordfreq` and the conformance test
-written for it. Both are files this work touched, so as it stands the change
-earns its keep on the benchmark it was built for and nowhere else yet. That is
-worth saying plainly rather than leaving to be discovered.
+**How far it reaches, counted properly: 0 of 186.** The first count of this
+was wrong, and wrong in the flattering direction for the measurement rather
+than the change: it built corpus files standalone, and 47 of the 83 it looked
+at are library modules with no `main`, so they never reached code generation at
+all. Every one of the 186 demo packages *does* build, and pulls its libraries
+in with it. The rule fires on none of them. It fires on `wordfreq` and on the
+conformance test written for it, both files this work touched.
+
+Nor is the narrower reading the problem. A key written straight into the
+argument -- `db.by_port.get("{port}/{protocol}")`, which `netdb` really does
+write -- needs no analysis at all, and building that form and counting it the
+same way gives **1 of 186**.
+
+So this earns its keep on the benchmark it was built for and on one demo. It
+stays, because the idiom it removes is the counting loop -- which is what
+`wordfreq` is in the set to represent -- and because 400,000 allocations down
+to 3 is not a trick that stops working on other programs shaped like it. But
+the corpus says plainly that the shape is rare here, and that belongs in the
+record next to the 1.322x.
 
 The corpus does contain the idiom, just not in a shape that reaches it:
 
@@ -1499,17 +1513,12 @@ The corpus does contain the idiom, just not in a shape that reaches it:
     db.by_port.get("{port}/{protocol}")
     c.entries.get(context + "\u{4}" + key)
 
-These write the key straight into the argument rather than binding it, which
-needs no analysis at all -- the text is built, probed and given back inside one
-expression, so nothing can hold it afterwards. That was built this session and
-**measured at 0 of 83 as well**: the `match m.get(k)` form goes through the
-plain `grasm_map_get`, which was then wired too and still fired nowhere,
-because most of the files carrying these lines are library modules with no
-`main` and the rest sit behind receivers the patched arms do not cover. Reverted
-rather than landed, since nothing measures it.
+That form was built this session, extended to the plain `grasm_map_get` that
+`match m.get(k)` goes through, and reverted: one demo in 186 is not enough to
+measure a change by, and code that nothing measures should not land.
 
 So the honest position on this row: 1.322x is real and gated, and its
-generality is not yet demonstrated.
+generality is measured rather than assumed -- and measured small.
 
 (The single-interpolation form `"{i % 97}"` does not go through
 `grasm_str_build_end` -- under the same probe its allocation count *rose*, so
