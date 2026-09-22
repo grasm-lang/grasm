@@ -1691,6 +1691,14 @@ reported `cache-demo` at 0.60x and `audio-demo` at 0.73x; at twenty-one reps
 they are 0.97x and **1.00x**. When min and median disagree, the answer is that
 there are not enough runs yet.
 
+**Two more callers of the same scan.** `index_of` turned its byte result into
+a character index by counting the prefix, and flat text is indexed by byte, so
+that walk was unnecessary — 358 uses across 144 corpus files. `pad` counted
+characters where `char_len` now remembers them. Neither is a complexity fix,
+since `find` is linear either way; they are constants: 1.03-1.04x min and
+1.07-1.12x median on `index_of` over long text, and **1.00x on short mixed
+text**, so nothing pays for the extra question.
+
 **The case that cannot pay for itself costs about 5%.** A fresh 5,000-character
 string asked its length exactly once — so the remembered count is never read
 again — runs 0.97x min, 0.95x median, 0.99x mean over thirty-one runs. That is

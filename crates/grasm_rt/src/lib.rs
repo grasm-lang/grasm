@@ -5782,7 +5782,18 @@ pub unsafe extern "C" fn grasm_str_index_of(s: *mut RtVal, needle: *mut RtVal) -
     let text = as_str(s);
     match text.find(as_str(needle)) {
         Some(byte_idx) => {
-            let char_idx = text[..byte_idx].chars().count() as i64;
+            // Flat text is indexed by byte, so the prefix needs no counting.
+            // `is_flat` reads the index rather than the string, so asking is
+            // cheaper than the walk it replaces.
+            let flat = match &(*s).payload {
+                RtPayload::Str(gs) => gs.is_flat(),
+                _ => false,
+            };
+            let char_idx = if flat {
+                byte_idx as i64
+            } else {
+                text[..byte_idx].chars().count() as i64
+            };
             some_of(alloc(RtPayload::I64(char_idx)))
         }
         None => none_val(),
@@ -8156,7 +8167,12 @@ pub unsafe extern "C" fn grasm_str_pad(
     if fill.is_empty() {
         grasm_panic_msg_str("pad fill must not be empty");
     }
-    let len = text.chars().count();
+    // The same count `len` reports, and remembered for text long enough to
+    // make remembering worthwhile.
+    let len = match &(*s).payload {
+        RtPayload::Str(gs) => gs.char_len(),
+        _ => text.chars().count(),
+    };
     // A width past what a string can hold is a panic with a sentence, not the
     // allocator's own failure message and SIGABRT — as `repeat` already is.
     if width > MAX_ALLOC as i64 {
