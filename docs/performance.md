@@ -1398,11 +1398,27 @@ while the boxed list pays `grasm_list_get` with its +1, a call for the read,
 and `grasm_val_dec` on the way out, none of which the scalar path has. Nothing
 is allocated either way, so all of it is call and reference-count traffic.
 
-That is the next thing to build: pinning a boxed list the body only reads, so
-the element arrives as a load and a loan rather than a call and a reference.
-`grasm_list_borrow_at` and `loop_elem_is_borrowed` are already in place for the
-loop case; this is the same rule at an index. Worth ~1.8 ms of `wordfreq`'s
-24.6 on the reference counting alone, and more if the call goes too.
+That is the next thing to build, and the shape matters. The measurement above
+used `let w = words[i % 8]`, but `wordfreq` writes
+`words[i % 8] + "{i % 97}"`: the index is a **temporary inside an expression**,
+not a `let` initializer. A borrow attached to a `let` would not fire on this
+row at all -- something worth noticing before building it rather than after.
+
+What fires here is an index in *operand* position whose consumer provably keeps
+nothing. `grasm_str_concat` reads both operands and returns a new string, as do
+`grasm_str_eq` and the comparisons, and each is followed by a `grasm_val_dec`
+of an operand that was incremented only to be released a moment later. So the
+rule is narrower than pinning and does not need the list to be only-indexed
+across a whole block: evaluate `xs[i]` borrowed where `xs` is a plain local and
+the operand is consumed on the spot.
+
+Worth ~1.8 ms of `wordfreq`'s 24.6 on the reference counting, and more if the
+`grasm_list_get` call goes with it. `grasm_list_borrow_at` already exists.
+
+Written the other way round -- a single interpolation, `"{words[i % 8]}{i % 97}"`
+-- costs the same 37.1 ns against 37.2, so the concatenation and the
+interpolation already lower to one thing and there is no source-level win
+hiding here.
 
 ## Where the remaining gap actually is
 
