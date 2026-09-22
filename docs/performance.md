@@ -1595,6 +1595,39 @@ operand with a reference and releases it after the call, so the concatenation
 never sees a uniquely-held list to append into. It needs the same self-append
 shape the string form uses.
 
+### Three more scaling traps, and why the obvious fix is wrong
+
+Scaling is one measurement that survives a busy machine: a 4x ratio for a
+doubled input does not become a 2x one under load. Doubling 20,000 to 40,000:
+
+| | 20,000 | 40,000 | |
+| --- | --- | --- | --- |
+| `while i < xs.len()` on a list | 2.5 ms | 3.0 ms | 1.2x — fine |
+| `while i < s.len()` on a string | 19.8 ms | 67.4 ms | **3.4x** |
+| `s.substr(i, 1)` per character | 53.8 ms | 196.7 ms | **3.7x** |
+| `s = "x" + s` | 6.6 ms | 21.9 ms | **3.3x** |
+
+A list's `len` is O(1); a string's is not. `RtStr::char_len` runs `is_ascii`
+over the whole text on every call — vectorised, but still linear — so
+`while i < s.len()` scans the string once per character. **432 of the corpus's
+source files write `while i < x.len()`**, which is the opposite of the list
+trap above, though the ones checked are over lists and bytes rather than text.
+
+**Caching the count is the wrong fix, and the runtime already says so.**
+`RtStr` is the largest `RtPayload` variant, so its size is charged to every
+boxed value — every integer, every bool. A cached length and an index were
+removed for exactly that reason, and the comment explaining it is still there:
+36 of `RtStr`'s 64 bytes were an index most strings never build. Buying O(1)
+`len` for long text by making every small value larger is the trade that was
+already made, in the other direction, deliberately.
+
+So this is written down rather than fixed. No program in the corpus is
+measurably slower for it -- the two slowest are an interpreter and a durable
+log -- and the fix that looks obvious would cost the working set of everything
+else. What would be worth measuring, if a victim ever turns up, is folding the
+flag into the `OnceLock` the index already occupies, so an ASCII string pays
+one small allocation on its first `len` instead of a scan on every one.
+
 ## Where the remaining gap actually is
 
 Timed head to head by processor time, and split by compiling cut-down versions
