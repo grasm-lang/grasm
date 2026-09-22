@@ -4658,7 +4658,7 @@ fn scan_str_appends_block(
                             && pieces.iter().any(|p| {
                                 let mut names = Vec::new();
                                 collect_idents(p, &mut names);
-                                names.iter().any(|n| *n == id.name)
+                                names.contains(&id.name)
                             });
                         if !reads_target && matches!(head, Expr::Ident(l) if l.name == id.name) {
                             Some(pieces)
@@ -5296,6 +5296,10 @@ fn inline_expr_ok(e: &Expr, budget: &mut i32, calls: &mut u32) -> bool {
     }
 }
 
+/// Whether a callee only reads the parameter at that position — the question
+/// a bare mention has to answer before it can be allowed.
+type LentAt<'a> = &'a dyn Fn(&str, usize) -> bool;
+
 /// The verdict, and what a call site is allowed to do with the name.
 struct BorrowScan<'a> {
     ok: bool,
@@ -5305,7 +5309,7 @@ struct BorrowScan<'a> {
     /// keeps the stricter rule, which is what parameter inference uses: a
     /// parameter is inferred before any body is compiled, so it has no
     /// signatures to consult.
-    lent: Option<&'a dyn Fn(&str, usize) -> bool>,
+    lent: Option<LentAt<'a>>,
     /// Stricter, and for a different question: the name's value may exist
     /// *only* to be a map key. Reading through it — `w.len()`, `w[0]` — is
     /// then disqualifying rather than allowed, because there would be no
@@ -5330,7 +5334,7 @@ fn param_is_borrowed(name: &str, body: &grasm_syntax::ast::Block) -> bool {
 fn loop_elem_is_borrowed(
     name: &str,
     body: &grasm_syntax::ast::Block,
-    lent: &dyn Fn(&str, usize) -> bool,
+    lent: LentAt,
 ) -> bool {
     let mut st = BorrowScan {
         ok: true,
@@ -6948,7 +6952,7 @@ impl FnCx<'_, '_> {
                 if self
                     .built_keys
                     .last()
-                    .is_some_and(|(eligible, _)| eligible.iter().any(|n| *n == name.name))
+                    .is_some_and(|(eligible, _)| eligible.contains(&name.name))
                 {
                     let at = self.call_rt("grasm_str_build", &[]).unwrap();
                     match init {
@@ -7233,7 +7237,7 @@ impl FnCx<'_, '_> {
                                 && pieces.iter().any(|p| {
                                     let mut names = Vec::new();
                                     collect_idents(p, &mut names);
-                                    names.iter().any(|n| *n == id.name)
+                                    names.contains(&id.name)
                                 });
                             if !reads_target
                                 && matches!(head, Expr::Ident(l) if l.name == id.name)
