@@ -1412,8 +1412,28 @@ rule is narrower than pinning and does not need the list to be only-indexed
 across a whole block: evaluate `xs[i]` borrowed where `xs` is a plain local and
 the operand is consumed on the spot.
 
-Worth ~1.8 ms of `wordfreq`'s 24.6 on the reference counting, and more if the
-`grasm_list_get` call goes with it. `grasm_list_borrow_at` already exists.
+**Built and reverted: it helps the benchmark and hurts its own microbenchmark.**
+`borrowed_index_operand` in `emit_concat_into`, lending the element to
+`grasm_str_build_str` and skipping the release. Matched builds, interleaved,
+15 runs each, same answers and the same 400,001 allocations throughout:
+
+| | before | after | |
+| --- | --- | --- | --- |
+| `wordfreq` | 24.94 ms | 24.39 ms | 1.023x |
+| `wf_str`, the same concatenation with `len()` instead of a map | 17.72 ms | 19.68 ms | **0.901x** |
+| `sort`, `tree` | | | unchanged |
+
+The two disagree about the identical change to the identical expression, which
+means something is going on that the reasoning above does not cover. The
+likeliest candidate is a second bounds check: `index_value` normalises the
+index and `grasm_list_borrow_at` checks it again, where `list_get_elem` checked
+once. That is a guess, and 10% against a 2.3% gain is not a trade to make on a
+guess, so it is reverted.
+
+What the pair does establish is that the reference counting on this operand is
+worth about 2% of `wordfreq` -- real, but small next to the 16.4 ns the
+formatting and its allocation cost. The string half is dominated by making the
+string, not by reading the word that goes into it.
 
 Written the other way round -- a single interpolation, `"{words[i % 8]}{i % 97}"`
 -- costs the same 37.1 ns against 37.2, so the concatenation and the
