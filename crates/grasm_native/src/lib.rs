@@ -2024,6 +2024,8 @@ arguments nor the type this is bound to",
             built_keys: Vec::new(),
             pending_key: None,
             borrowed_vars: std::collections::HashSet::new(),
+            movable: std::collections::HashSet::new(),
+            moved: std::collections::HashSet::new(),
             inline_depth: 0,
             inline_seq: 0,
         };
@@ -2691,6 +2693,8 @@ operation's",
             built_keys: Vec::new(),
             pending_key: None,
             borrowed_vars: std::collections::HashSet::new(),
+            movable: std::collections::HashSet::new(),
+            moved: std::collections::HashSet::new(),
             inline_depth: 0,
             inline_seq: 0,
         };
@@ -2795,6 +2799,8 @@ operation's",
             built_keys: Vec::new(),
             pending_key: None,
             borrowed_vars: std::collections::HashSet::new(),
+            movable: std::collections::HashSet::new(),
+            moved: std::collections::HashSet::new(),
             inline_depth: 0,
             inline_seq: 0,
         };
@@ -2942,6 +2948,8 @@ operation's",
             built_keys: Vec::new(),
             pending_key: None,
             borrowed_vars: std::collections::HashSet::new(),
+            movable: std::collections::HashSet::new(),
+            moved: std::collections::HashSet::new(),
             inline_depth: 0,
             inline_seq: 0,
         };
@@ -3287,6 +3295,11 @@ struct FnCx<'a, 'm> {
     /// Parameters the caller lent rather than gave: they are not released on
     /// the way out, because no reference changed hands. See `param_is_borrowed`.
     borrowed_vars: std::collections::HashSet<u32>,
+    /// Locals whose next read is their last, and which that read may take
+    /// rather than copy; and those it did take, which their scope therefore
+    /// does not release. See `tail_moves`.
+    movable: std::collections::HashSet<u32>,
+    moved: std::collections::HashSet<u32>,
     /// How many function bodies are currently spliced around this point, and
     /// a counter for the hidden names a splice binds its arguments to.
     inline_depth: u32,
@@ -3874,6 +3887,35 @@ fn body_can_call(e: &Expr) -> bool {
 /// Over-approximates on purpose: a `break` belonging to a loop *inside* the
 /// element cannot escape it, but counting it only costs the slower path that
 /// holds each element in a scope.
+/// Names read where the read runs exactly once whenever the expression does:
+/// not under a branch, a loop, a closure, a short-circuit, or a method (whose
+/// receiver may be read in place or more than once). A superset of the others
+/// is `collect_idents`; a name found by both, once each, is read once.
+fn straight_idents(e: &Expr, out: &mut Vec<String>) {
+    match e {
+        Expr::Ident(id) => out.push(id.name.clone()),
+        Expr::Call { callee, args, .. } => {
+            if !matches!(**callee, Expr::Ident(_)) {
+                return;
+            }
+            for a in args {
+                straight_idents(a, out);
+            }
+        }
+        Expr::StructLit { base: None, fields, .. } => {
+            for (_, v) in fields {
+                straight_idents(v, out);
+            }
+        }
+        Expr::List(items, _) | Expr::Tuple(items, _) => {
+            for i in items {
+                straight_idents(i, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn elem_can_leave(e: &Expr) -> bool {
     let mut found = false;
     scan_leave_expr(e, &mut found);
@@ -5714,6 +5756,9 @@ impl FnCx<'_, '_> {
     fn pop_scope_with_decs(&mut self) {
         let scope = self.vars.pop().unwrap();
         for (_, (var, vt)) in scope {
+            if self.moved.remove(&var.as_u32()) {
+                continue;
+            }
             if vt.boxed() && !self.borrowed_vars.contains(&var.as_u32()) {
                 let v = self.b.use_var(var);
                 self.call_rt("grasm_val_dec", &[v]);
@@ -6888,6 +6933,40 @@ impl FnCx<'_, '_> {
         }
     }
 
+    /// Lets a block's tail *take* the locals it reads last.
+    ///
+    /// `Node{ value: v, kids: kids }` at the end of `build` retained `kids` for
+    /// the struct and then released it as the block closed -- two calls for
+    /// every node, handing the same reference from one owner to the next. A
+    /// local of this block that the tail mentions exactly once, somewhere that
+    /// read runs exactly once and on every path, is read by taking it.
+    ///
+    /// Not when the tail can leave: a `?` after the read would release the
+    /// block's locals on its way out, the taken one included, while the value
+    /// that took it is released as well.
+    fn tail_moves(&mut self, e: &Expr) {
+        if elem_can_leave(e) {
+            return;
+        }
+        let mut all = Vec::new();
+        collect_idents(e, &mut all);
+        let mut straight = Vec::new();
+        straight_idents(e, &mut straight);
+        let Some(scope) = self.vars.last() else {
+            return;
+        };
+        for (name, (var, vt)) in scope {
+            if !vt.boxed() || self.borrowed_vars.contains(&var.as_u32()) {
+                continue;
+            }
+            let n = all.iter().filter(|m| *m == name).count();
+            let k = straight.iter().filter(|m| *m == name).count();
+            if n == 1 && k == 1 {
+                self.movable.insert(var.as_u32());
+            }
+        }
+    }
+
     fn eval_block_inner(
         &mut self,
         blk: &grasm_syntax::ast::Block,
@@ -6912,8 +6991,14 @@ impl FnCx<'_, '_> {
             let is_last = i + 1 == blk.stmts.len();
             if is_last {
                 self.tail_hint = tail_hint.clone();
+                if let Stmt::Expr(e) = stmt {
+                    self.tail_moves(e);
+                }
             }
-            let out = self.eval_stmt(stmt, is_last)?;
+            let out = self.eval_stmt(stmt, is_last);
+            // Whatever the tail did not read stays the scope's to release.
+            self.movable.clear();
+            let out = out?;
             self.tail_hint = None;
             match out {
                 StmtOut::Value(v) => {
@@ -8645,7 +8730,11 @@ this case",
             Expr::Ident(id) => match self.lookup(&id.name) {
                 Some((var, vt)) => {
                     let v = self.b.use_var(var);
-                    if vt.boxed() {
+                    if self.movable.remove(&var.as_u32()) {
+                        // Its last read: the reference the local held is the
+                        // one handed out, and its scope will not release it.
+                        self.moved.insert(var.as_u32());
+                    } else if vt.boxed() {
                         self.call_rt("grasm_val_inc", &[v]);
                     }
                     Ok(Some((v, vt)))

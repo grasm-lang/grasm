@@ -4,7 +4,40 @@
 //! 1 99
 //! hi! hi hi
 //! hixxx hi
+//! [1, 2] [1, 2, 9]
+//! 1
+//! [5] [5, 7] 1
+//! [3, 4] [3, 4]
+//! [8] [0]
 type Box = { n: i64 }
+type Bag = { items: [i64] }
+type Two = { a: [i64], b: [i64] }
+
+// A block's tail takes the locals it reads last instead of copying them. Each
+// of these has to come out the same as if it copied.
+fn grown() -> [i64] {
+    var v = [1]
+    v.push(2)
+    v
+}
+
+fn bagged(keep: [i64]) -> Bag {
+    var mine = keep
+    let alias = mine
+    print("{alias.len()}")
+    Bag{ items: mine }
+}
+
+fn both() -> Two {
+    let v = [3, 4]
+    Two{ a: v, b: v }
+}
+
+fn pick(c: bool) -> [i64] {
+    let v = [8]
+    if c { v } else { [0] }
+}
+
 fn main() {
     var a = [1, 2]
     var b = a
@@ -37,4 +70,19 @@ fn main() {
         g = g + "x"
     }
     print("{g} {"hi"}")
+
+    let g1 = grown()
+    var g2 = grown()
+    g2.push(9)
+    print("{g1} {g2}")
+
+    let orig = [5]
+    var bag = bagged(orig)
+    bag.items.push(7)
+    print("{orig} {bag.items} {orig.len()}")
+
+    var two = both()
+    print("{two.a} {two.b}")
+
+    print("{pick(true)} {pick(false)}")
 }
