@@ -1784,12 +1784,33 @@ checksum:
 The middle row is what the easy design buys: 21.88 to 19.77, a tenth of the
 gap. The walk's pointer-chasing was never the cost; the allocation per node is.
 
-What reaches the first row is **constructing each node where it will live** —
-`build` handed the address of the parent's next slot and writing its fields
-there, so no box ever exists. That is destination-passing (return-value
-placement) across a call, on top of inline storage rather than instead of it.
-It is the real project, and the easy half should not be built first on the
-expectation that it pays.
+**And neither representation change is the lever — withdrawn the same hour.**
+A fourth model keeps Grasm's shape exactly — every node its own object, reached
+through an indirection, the way a box is — but allocates by bumping an index in
+one arena and releases the whole tree at once:
+
+| `tree` storage | min | |
+| --- | --- | --- |
+| `Vec<Node>`, built in place | 9.92 ms | 1.00x |
+| **separate objects behind an indirection, bump-allocated, freed wholesale** | **9.41 ms** | **0.95x** |
+| boxed, then moved into `Vec<Node>` | 19.59 ms | 1.97x |
+| `Vec<Box<Node>>`, a `malloc` and a `free` per node | 22.07 ms | 2.22x |
+
+Separate objects and the pointer-chasing between them cost *nothing* once
+allocation is a bump and release is wholesale — that row is faster than
+inline. So `tree`'s entire 2.2x is **the price of allocating and releasing each
+object**, and the paragraph that stood here recommending destination-passing
+was aimed at the wrong thing: placing values inline was never needed.
+
+Grasm's box is 19.4 ns made and freed, and the removal measurements above say
+where it goes — about 9.9 on the allocation side (pool, a 64-byte write, two
+counters, drop glue) and about 7.5 on calls: `grasm_struct_make`, the release
+through `grasm_val_dec` and `dec_walk`, each an out-of-line trip. The bump
+arena's equivalent is an add. That makes the lever general rather than
+`tree`-shaped — every allocation-heavy program pays the same 19.4 ns — and it
+is the entry below on inlining reference counts, together with an inline
+allocation fast path, that reaches it. A bump arena for data that dies
+together (regions, or region inference) is the other route.
 
 **Escape analysis**, the other half of the same problem: a `Node` that
 provably does not escape its function could live on the stack with no box at
