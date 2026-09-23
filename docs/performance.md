@@ -1766,6 +1766,31 @@ What it needs first is a borrowed element read, so `for k in n.kids` hands out
 a pointer rather than moving the allocation from the build to the walk; that
 part is built and landed.
 
+**But storing values inline is worth only ~10% on its own — measured before
+building it.** The easy design is available: keep each list element as a real
+`RtVal` in the list's buffer with `ARENA` for a count, so every existing reader
+still gets a valid `*mut RtVal`. The catch is how `tree` fills its lists —
+`kids.push(build(...))`, where `build` returns a fresh value. Pushing would copy
+that value into the buffer and free its box, so **every node is still
+allocated once**. Modelled in Rust, interleaved, 31 runs, all printing the same
+checksum:
+
+| `tree` storage | min | |
+| --- | --- | --- |
+| `Vec<Node>`, each node built in place | 10.06 ms | 1.00x |
+| each node built in a `Box`, then moved into a `Vec<Node>` | 19.77 ms | 1.97x |
+| `Vec<Box<Node>>` | 21.88 ms | 2.18x |
+
+The middle row is what the easy design buys: 21.88 to 19.77, a tenth of the
+gap. The walk's pointer-chasing was never the cost; the allocation per node is.
+
+What reaches the first row is **constructing each node where it will live** —
+`build` handed the address of the parent's next slot and writing its fields
+there, so no box ever exists. That is destination-passing (return-value
+placement) across a call, on top of inline storage rather than instead of it.
+It is the real project, and the easy half should not be built first on the
+expectation that it pays.
+
 **Escape analysis**, the other half of the same problem: a `Node` that
 provably does not escape its function could live on the stack with no box at
 all. A compiler project rather than a patch — it needs an alias analysis the
