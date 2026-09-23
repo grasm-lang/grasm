@@ -1809,8 +1809,24 @@ through `grasm_val_dec` and `dec_walk`, each an out-of-line trip. The bump
 arena's equivalent is an add. That makes the lever general rather than
 `tree`-shaped — every allocation-heavy program pays the same 19.4 ns — and it
 is the entry below on inlining reference counts, together with an inline
-allocation fast path, that reaches it. A bump arena for data that dies
-together (regions, or region inference) is the other route.
+allocation fast path, that reaches it.
+
+**Regions are not the other route, measured.** `tree` with each iteration's
+work written inside a `region { }` — a probe, not a change to the benchmark,
+whose Rust counterpart uses no arena — runs **0.98x** of the ordinary program:
+26.27 ms against 25.85. A region already skips every reference count and frees
+its values in one sweep, and gains nothing. Its sweep did have waste: a `Vec`
+allocated per value to gather children to release, which an interned integer
+triggered despite being `IMMORTAL`, and a thread-local lookup per value.
+Removing both measured **1.01x**, noise, and was reverted.
+
+So neither refcounting nor freeing is where a box's 19.4 ns goes, and a bump
+arena would inherit the same cost: every box is made by an out-of-line call to
+`grasm_struct_make`, filled through a 64-byte write, pushed by another call,
+and released by a third. Rust's arena row is fast because constructing a node
+there is a store in the caller. What would close this row is emitting the
+allocation and release fast paths into generated code, so that making a node
+is not a call at all.
 
 **Escape analysis**, the other half of the same problem: a `Node` that
 provably does not escape its function could live on the stack with no box at
