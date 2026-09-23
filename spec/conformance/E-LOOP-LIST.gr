@@ -11,6 +11,9 @@
 //! 120 3
 //! 1 2 3
 //! 20 2
+//! 14
+//! 6 0
+//! 201 101 102
 type Cell = { v: i64 }
 
 /// Every mention of `c` is a field read, so the loop may lend its element.
@@ -25,6 +28,27 @@ fn peek(c: Cell) -> i64 {
 fn stash(c: Cell) -> i64 {
     let held = [c]
     held[0].v * 20
+}
+
+/// A walk over a field: `for k in n.kids` reads the list off the node in
+/// place, and the recursive call is spliced with `k` lent to it.
+type Tree = { v: i64, kids: [Tree] }
+
+fn sum_tree(n: Tree) -> i64 {
+    var s = n.v
+    for k in n.kids {
+        s = s + sum_tree(k)
+    }
+    s
+}
+
+type Holder = { items: [Cell] }
+
+/// Lent parameters bound straight to the caller's locals, where the names
+/// cross: `pair(b, a)` must not let the first binding change what the second
+/// argument reads.
+fn pair(a: Cell, b: Cell) -> i64 {
+    a.v * 100 + b.v
 }
 
 fn main() {
@@ -117,4 +141,23 @@ fn main() {
         seen = seen + peek(c)
     }
     print("{seen} {cells.len() - 1}")
+
+    // Walked through a field, recursively.
+    let leaf = Tree{ v: 3, kids: [] }
+    let t = Tree{ v: 1, kids: [Tree{ v: 2, kids: [leaf, leaf] }, Tree{ v: 5, kids: [] }] }
+    print("{sum_tree(t)}")
+
+    // A body that replaces the struct it is walking cannot be lent the list:
+    // the old list has to survive until the loop is done with it.
+    var h = Holder{ items: [Cell{ v: 1 }, Cell{ v: 2 }, Cell{ v: 3 }] }
+    var got = 0
+    for c in h.items {
+        h = Holder{ items: [] }
+        got = got + c.v
+    }
+    print("{got} {h.items.len()}")
+
+    let a = Cell{ v: 1 }
+    let b = Cell{ v: 2 }
+    print("{pair(b, a)} {pair(a, a)} {pair(a, b)}")
 }

@@ -4038,6 +4038,10 @@ fn collect_idents(e: &Expr, out: &mut Vec<String>) {
             collect_idents(recv, out);
             collect_idents(index, out);
         }
+        Expr::Range { start, end, .. } => {
+            collect_idents(start, out);
+            collect_idents(end, out);
+        }
         Expr::List(items, _) | Expr::Tuple(items, _) => {
             for i in items {
                 collect_idents(i, out);
@@ -4100,7 +4104,7 @@ fn collect_idents(e: &Expr, out: &mut Vec<String>) {
 fn collect_idents_block(b: &grasm_syntax::ast::Block, out: &mut Vec<String>) {
     for stmt in &b.stmts {
         match stmt {
-            Stmt::Let { init, .. } => collect_idents(init, out),
+            Stmt::Let { init, .. } | Stmt::LetTuple { init, .. } => collect_idents(init, out),
             Stmt::Assign { target, value, .. } => {
                 collect_idents(target, out);
                 collect_idents(value, out);
@@ -6796,6 +6800,27 @@ impl FnCx<'_, '_> {
         }
     }
 
+    /// The last step of a borrowed field path, whatever its type: `n.kids`
+    /// read in place off a struct local, as `borrow_struct_path` reads the
+    /// struct-typed steps before it. The caller keeps the root alive.
+    fn borrow_struct_field(&mut self, e: &Expr) -> CResult<Option<(Value, VType)>> {
+        let Expr::Field { recv, name, span } = e else {
+            return Ok(None);
+        };
+        let Some((base, sname)) = self.borrow_struct_path(recv)? else {
+            return Ok(None);
+        };
+        let Ok(ft) = self.struct_field_type(&sname, &name.name, *span) else {
+            return Ok(None);
+        };
+        let Some(i) = self.struct_field_index(&sname, &name.name) else {
+            return Ok(None);
+        };
+        let iv = self.b.ins().iconst(types::I64, i);
+        let v = self.call_rt("grasm_struct_borrow_at", &[base, iv]).unwrap();
+        Ok(Some((v, ft)))
+    }
+
     /// A string literal, made once and cached in a slot of its own.
     ///
     /// The value is `IMMORTAL`, so the caller does not have to know it is
@@ -8015,7 +8040,37 @@ this case",
         // temporary, so returning out of a `for` leaked the list being
         // iterated, which is the shape any search function has.
         self.push_scope();
-        let (mut list_v, mut list_t) = self.eval_expr_val(iter)?;
+        // `for k in n.kids` over a struct local the body never mentions reads
+        // the list in place. Fetching it owned was an increment before the
+        // loop and a release after it, per call of every recursive walk over
+        // a tree -- and the local already keeps the list alive for exactly as
+        // long as the loop runs, since nothing in the body can reach it to
+        // replace it.
+        let lent_iter = match iter {
+            Expr::Field { .. } => {
+                let mut root = iter;
+                while let Expr::Field { recv, .. } = root {
+                    root = recv;
+                }
+                let mut names = Vec::new();
+                collect_idents_block(body, &mut names);
+                match root {
+                    Expr::Ident(id) if !names.contains(&id.name) => {
+                        match self.borrow_struct_field(iter)? {
+                            Some((v, t @ VType::List(_))) => Some((v, t)),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        let lent_list = lent_iter.is_some();
+        let (mut list_v, mut list_t) = match lent_iter {
+            Some(got) => got,
+            None => self.eval_expr_val(iter)?,
+        };
         // A range *held as a value* — `let r = 0..n` then `for i in r`. The
         // literal `for i in 0..n` never gets here; it is compiled above into a
         // counted loop, which is why it costs nothing and still does. Walking
@@ -8032,6 +8087,9 @@ this case",
         };
         let list_var = self.new_var(&list_t);
         self.b.def_var(list_var, list_v);
+        if lent_list {
+            self.borrowed_vars.insert(list_var.as_u32());
+        }
         self.bind(" for", list_var, list_t.clone());
         let ivar = self.new_var(&VType::I64);
         let zero = self.b.ins().iconst(types::I64, 0);
@@ -9713,8 +9771,53 @@ this case",
         let span = decl.span;
         self.inline_seq += 1;
         let seq = self.inline_seq;
+        // A local handed to a parameter the callee only lends is bound to it
+        // directly, borrowed, as the called function binds it. Through the two
+        // `let`s below it was retained twice and released twice per splice --
+        // four calls around every recursive `total(k)` for nothing, since the
+        // caller's local holds the value for the whole body.
+        //
+        // Only when no *other* argument mentions the parameter's name: binding
+        // it early would otherwise change what that argument reads, which is
+        // the `f(x, x)` hazard the two-step binding exists for.
+        let lent: Vec<bool> = self
+            .lookup_fn(name)
+            .map(|sg| sg.borrowed.clone())
+            .unwrap_or_default();
+        self.push_scope();
+        let mut direct = vec![false; args.len()];
+        for (i, (p, a)) in decl.params.iter().zip(args).enumerate() {
+            let Expr::Ident(id) = a else { continue };
+            if !lent.get(i).copied().unwrap_or(false) {
+                continue;
+            }
+            let mut others = Vec::new();
+            for (j, b) in args.iter().enumerate() {
+                if j != i {
+                    collect_idents(b, &mut others);
+                }
+            }
+            if others.contains(&p.name.name) {
+                continue;
+            }
+            let Some((var, vt)) = self.lookup(&id.name) else {
+                continue;
+            };
+            if !vt.boxed() {
+                continue;
+            }
+            let v = self.b.use_var(var);
+            let pv = self.new_var(&vt);
+            self.b.def_var(pv, v);
+            self.borrowed_vars.insert(pv.as_u32());
+            self.bind(&p.name.name, pv, vt);
+            direct[i] = true;
+        }
         let mut stmts: Vec<Stmt> = Vec::with_capacity(decl.params.len() * 2 + decl.body.stmts.len());
         for (i, a) in args.iter().enumerate() {
+            if direct[i] {
+                continue;
+            }
             stmts.push(Stmt::Let {
                 mutable: false,
                 name: Ident {
@@ -9727,6 +9830,9 @@ this case",
             });
         }
         for (i, p) in decl.params.iter().enumerate() {
+            if direct[i] {
+                continue;
+            }
             stmts.push(Stmt::Let {
                 mutable: false,
                 name: p.name.clone(),
@@ -9747,12 +9853,24 @@ this case",
         // through a symbol compiles. The declared type is what every other
         // caller of this function is given.
         let declared = match &decl.ret {
-            Some(t) => self.cg.vtype_of(t)?,
-            None => return Ok(None),
+            Some(t) => self.cg.vtype_of(t),
+            None => {
+                self.pop_scope_no_decs();
+                return Ok(None);
+            }
+        };
+        let declared = match declared {
+            Ok(t) => t,
+            Err(e) => {
+                self.pop_scope_no_decs();
+                return Err(e);
+            }
         };
         self.inline_depth += 1;
         let out = self.eval_expr_expecting_opt(&block, Some(&declared));
         self.inline_depth -= 1;
+        // Only borrowed bindings live here, so there is nothing to release.
+        self.pop_scope_no_decs();
         let Some((v, vt)) = out? else {
             // The body left rather than produced a value — `fn boom() -> i64
             // { panic("mid") }`. A *call* to it returns to a live block and
