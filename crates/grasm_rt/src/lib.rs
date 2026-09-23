@@ -3792,6 +3792,17 @@ pub unsafe extern "C" fn grasm_list_push(list: *mut RtVal, elem: *mut RtVal) -> 
             h.push(elem);
             return list;
         }
+    } else if let RtPayload::List(ListData::Inline { len: 0, .. }) = &(*list).payload {
+        // The first push onto `[]`, which is the shared immortal empty list
+        // or an empty one somebody else also holds: either way the result is
+        // a fresh one-element list, and nothing of the old one is copied.
+        // Through `cow_list` this was a clone of nothing plus a grow -- a
+        // fifth of the pushes in `tree`, where every inner node starts a
+        // `var kids: [Node] = []`.
+        let mut vals = [std::ptr::null_mut(); 4];
+        vals[0] = elem;
+        dec(list);
+        return alloc(RtPayload::List(ListData::Inline { vals, len: 1 }));
     }
     let target = cow_list(list);
     match &mut (*target).payload {
