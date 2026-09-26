@@ -4,6 +4,17 @@ E = "&amp;"
 
 
 from site_highlight import code  # noqa: E402,F401
+import os  # noqa: E402
+
+import site_markdown  # noqa: E402
+
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def markdown_file(rel):
+    """A document from the repository, rendered as this page's body."""
+    with open(os.path.join(_ROOT, rel)) as f:
+        return site_markdown.render(f.read())
 
 
 PAGES = {}
@@ -319,6 +330,32 @@ PAGES["playground.html"] = (
 <p class="lede">Grasm compiles to <code>wasm32</code>, so the language runs in a
 browser with no server behind it.</p>
 
+<p>The engine below is the reference interpreter — the same one
+<code>grasm run</code> uses — built for <code>wasm32</code> and held to the other
+engines by <code>scripts/wasmtest.sh</code>. Your program never leaves this tab.
+The examples are the files in <code>examples/</code>, read when this page was
+generated.</p>
+
+<section class="pg" id="playground" aria-label="Playground">
+  <div class="pg-bar">
+    <label class="pg-pick">Example
+      <select id="pg-example" disabled></select>
+    </label>
+    <span class="pg-engine" id="pg-engine">loading the engine…</span>
+    <button class="btn" id="pg-run" type="button" disabled>Run</button>
+  </div>
+  <textarea id="pg-src" class="pg-src" spellcheck="false" autocapitalize="off"
+    autocomplete="off" aria-label="Program source"></textarea>
+  <div class="pg-out-head">
+    <span>Output</span>
+    <span class="pg-status" id="pg-status" role="status"></span>
+  </div>
+  <pre class="pg-out" id="pg-out" aria-live="polite">Loading…</pre>
+</section>
+<noscript><div class="note">The playground needs JavaScript and WebAssembly.
+The instructions below run the same engine locally.</div></noscript>
+<script type="module" src="playground.js"></script>
+
 <h2>Running it locally</h2>
 <p>The wasm build and a host page live in the repository. Serve the directory
 and open it:</p>"""
@@ -342,10 +379,9 @@ are skipped for a reason the host cannot supply, and each names it: a
 filesystem, a socket, a process, threads, or a stack deep enough for the
 recursion limit the specification promises.</p>
 
-<div class="note"><b>This page is not itself a playground yet.</b> The wasm
-build works and the host page works; wiring an editor into this site is on the
-<a href="roadmap.html">roadmap</a>. Saying otherwise would be the kind of claim
-this project does not make.</div>
+<p>In this page the missing facilities refuse the same way: a program that
+opens a file or a socket gets the ordinary error back, and <code>par_map</code>
+runs on one core with the same answer.</p>
 """,
 )
 
@@ -765,56 +801,26 @@ specification.</a></p>
 # ---------------------------------------------------------------- library
 
 PAGES["library.html"] = (
-    "The standard library: 81 methods and the free functions.",
+    "The standard library, rendered from spec/library.md.",
     """
 <p class="eyebrow">Reference</p>
 <h1>Library reference</h1>
-<p class="lede">Small on purpose. «methods» methods, each with a law checked
-against arithmetic rather than against another engine.</p>
+<p class="lede">The standard library, clause by clause. This page is
+<code>spec/library.md</code>, rendered when the site was written — not a summary
+of it.</p>
+"""
+    + markdown_file("spec/library.md"),
+)
 
-<h2>Lists</h2>
-<p><code>len is_empty first last get push pop remove sort sort_by rev slice
-concat map filter fold sum min max any all find enumerate zip join to_list
-par_map par_filter</code></p>
-
-<h2>Strings</h2>
-<p><code>len byte_len is_empty chars codes code_at to_char substr split lines
-words contains starts_with ends_with index_of replace trim trim_start trim_end
-to_upper to_lower repeat pad_start pad_end parse_int parse_int_base parse_float
-to_bytes</code></p>
-
-<h2>Maps</h2>
-<p><code>get set has delete len is_empty keys values entries</code></p>
-
-<h2>Bytes</h2>
-<p><code>len is_empty at slice concat to_list to_str</code></p>
-
-<h2>Options</h2>
-<p><code>is_some is_none expect unwrap_or</code>, and <code>??</code>.</p>
-
-<h2>Numbers</h2>
-<p><code>abs min max cmp as_f64 as_i64 to_str to_base to_fixed round floor ceil
-sqrt cbrt exp ln log log2 log10 sin cos tan asin acos atan atan2 sinh cosh tanh
-hypot to_radians to_degrees is_nan is_finite bit_and bit_or bit_xor bit_not shl
-shr ushr</code></p>
-
-<h2>Ranges</h2>
-<p><code>to_list map filter sum len</code>. A range is a value of type
-<code>range</code>: it holds three numbers, not its elements, so
-<code>0..2_000_000</code> costs the same as <code>0..2</code>.</p>
-
-<h2>The world</h2>
-<p><code>print eprint read_file write_file read_bytes write_bytes list_dir
-make_dir random_bytes tcp_listen tcp_accept tcp_connect udp_bind net_wait
-proc_run proc_pipeline</code> — each carrying the effect it performs, so a
-function that uses one says so in its type.</p>
-
-<div class="note"><b>Every method has a law.</b> Not a recorded expected output —
-a relation checked against arithmetic, because a bundle <em>is</em> the
-interpreter and a wrong answer they share is invisible to any comparison
-between them. A method added to the specification without a law fails the
-gate by name.</div>
-""",
+PAGES["tutorial.html"] = (
+    "Grasm in an hour: the guided tutorial, rendered from docs/tutorial.md.",
+    """
+<p class="eyebrow">Learn</p>
+<h1>Grasm in an hour</h1>
+<p class="lede">The whole language in one sitting. This page is
+<code>docs/tutorial.md</code>, rendered when the site was written.</p>
+"""
+    + markdown_file("docs/tutorial.md"),
 )
 
 # ---------------------------------------------------------------- packages
@@ -1089,9 +1095,11 @@ PAGES["roadmap.html"] = (
 defect loop rather than instead of it.</p>
 
 <h2>1. This site</h2>
-<p>In progress — you are reading it. What remains: an in-page playground wired
-to the wasm build, and the tutorial and library reference rendered from
-<code>docs/</code> rather than summarised here.</p>
+<p>In progress — you are reading it. The <a href="playground.html">playground</a>
+now runs programs in the page, on the same wasm module the gates hold to the
+other engines, and the <a href="tutorial.html">tutorial</a> and
+<a href="library.html">library reference</a> are the documents themselves,
+rendered when the site is written rather than summarised here.</p>
 
 <h2>2. Speed</h2>
 <p>0.45× native Rust today against a 0.95× target, computed by

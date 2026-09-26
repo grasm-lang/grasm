@@ -28,6 +28,7 @@
 <a href="install.html">Install</a>
 <a href="playground.html" aria-current="page">Playground</a>
 <h2>Learn</h2>
+<a href="tutorial.html">Tutorial</a>
 <a href="tour.html">Tour</a>
 <a href="effects.html">Effects</a>
 <a href="tiers.html">Ownership</a>
@@ -54,6 +55,32 @@
 <p class="lede">Grasm compiles to <code>wasm32</code>, so the language runs in a
 browser with no server behind it.</p>
 
+<p>The engine below is the reference interpreter — the same one
+<code>grasm run</code> uses — built for <code>wasm32</code> and held to the other
+engines by <code>scripts/wasmtest.sh</code>. Your program never leaves this tab.
+The examples are the files in <code>examples/</code>, read when this page was
+generated.</p>
+
+<section class="pg" id="playground" aria-label="Playground">
+  <div class="pg-bar">
+    <label class="pg-pick">Example
+      <select id="pg-example" disabled></select>
+    </label>
+    <span class="pg-engine" id="pg-engine">loading the engine…</span>
+    <button class="btn" id="pg-run" type="button" disabled>Run</button>
+  </div>
+  <textarea id="pg-src" class="pg-src" spellcheck="false" autocapitalize="off"
+    autocomplete="off" aria-label="Program source"></textarea>
+  <div class="pg-out-head">
+    <span>Output</span>
+    <span class="pg-status" id="pg-status" role="status"></span>
+  </div>
+  <pre class="pg-out" id="pg-out" aria-live="polite">Loading…</pre>
+</section>
+<noscript><div class="note">The playground needs JavaScript and WebAssembly.
+The instructions below run the same engine locally.</div></noscript>
+<script type="module" src="playground.js"></script>
+
 <h2>Running it locally</h2>
 <p>The wasm build and a host page live in the repository. Serve the directory
 and open it:</p><pre><code>cargo build <span class="op">-</span><span class="op">-</span>release <span class="op">-</span><span class="op">-</span>target wasm32<span class="op">-</span>unknown<span class="op">-</span>unknown <span class="op">-</span>p grasm_wasm
@@ -71,10 +98,9 @@ are skipped for a reason the host cannot supply, and each names it: a
 filesystem, a socket, a process, threads, or a stack deep enough for the
 recursion limit the specification promises.</p>
 
-<div class="note"><b>This page is not itself a playground yet.</b> The wasm
-build works and the host page works; wiring an editor into this site is on the
-<a href="roadmap.html">roadmap</a>. Saying otherwise would be the kind of claim
-this project does not make.</div>
+<p>In this page the missing facilities refuse the same way: a program that
+opens a file or a socket gets the ordinary error back, and <code>par_map</code>
+runs on one core with the same answer.</p>
 
 <footer>
 Grasm — four engines, one answer. Every figure on this site is computed,

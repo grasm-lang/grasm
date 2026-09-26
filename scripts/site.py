@@ -30,6 +30,7 @@ NAV = [
     ("start.html", "Getting started", "Start", "Getting started"),
     ("install.html", "Install", "Start", "Install"),
     ("playground.html", "Playground", "Start", "Playground"),
+    ("tutorial.html", "Grasm in an hour", "Learn", "Tutorial"),
     ("tour.html", "A tour of the language", "Learn", "Tour"),
     ("effects.html", "Effects and capabilities", "Learn", "Effects"),
     ("tiers.html", "Ownership tiers", "Learn", "Ownership"),
@@ -234,6 +235,51 @@ def write(pages, check):
     return stale, unknown
 
 
+# The playground's examples, in the order its menu lists them. Read from
+# `examples/` rather than written into the page, so a program shown there is
+# the file the gates run -- not a copy that can stop compiling unnoticed.
+PLAYGROUND_EXAMPLES = [
+    ("hello", "Hello"),
+    ("errors", "Errors as values"),
+    ("effects", "Effects and handlers"),
+    ("generics", "Generics"),
+    ("function_values", "Function values"),
+    ("combinators", "Combinators"),
+    ("ranges", "Ranges"),
+    ("ownership", "Ownership"),
+]
+
+# The browser engine. `scripts/wasmtest.sh` holds this exact module to the
+# other engines, so the site serves that file and never a build of its own.
+WASM_SRC = os.path.join(ROOT, "ProjectGold", "web", "grasm.wasm")
+
+
+def playground_assets():
+    """What `playground.js` loads, as (name, bytes)."""
+    examples = []
+    for name, title in PLAYGROUND_EXAMPLES:
+        with open(os.path.join(ROOT, "examples", name + ".gr")) as f:
+            examples.append({"id": name, "title": title, "src": f.read()})
+    text = json.dumps(examples, indent=1, ensure_ascii=False) + "\n"
+    with open(WASM_SRC, "rb") as f:
+        wasm = f.read()
+    return [("playground.json", text.encode()), ("grasm.wasm", wasm)]
+
+
+def write_assets(check):
+    stale = []
+    for name, data in playground_assets():
+        path = os.path.join(OUT, name)
+        if check:
+            have = open(path, "rb").read() if os.path.exists(path) else b""
+            if have != data:
+                stale.append(name)
+        else:
+            with open(path, "wb") as f:
+                f.write(data)
+    return stale
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--check", action="store_true")
@@ -264,6 +310,7 @@ def main():
         site_lottie.main()
 
     stale, unknown = write(PAGES, args.check)
+    stale += write_assets(args.check)
     if unknown:
         print("the site names a figure nothing computes:", " ".join(sorted(unknown)))
         sys.exit(1)

@@ -1,0 +1,447 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Grasm in an hour</title>
+<meta name="description" content="Grasm in an hour: the guided tutorial, rendered from docs/tutorial.md.">
+<link rel="stylesheet" href="style.css">
+<script src="vendor/motion.js" defer></script>
+<script src="vendor/lottie.js" defer></script>
+<script type="module" src="app.js"></script>
+</head><body data-page="tutorial">
+<header class="topbar">
+  <a class="brand" href="index.html"><svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3 4 7.5v9L12 21l8-4.5v-9L12 3Z"/><path d="M12 12 4 7.5M12 12l8-4.5M12 12v9"/></svg><span>grasm</span></a>
+  <span class="ver">v1.0.0</span>
+  <nav>
+    <a href="start.html">Docs</a>
+    <a href="syntax.html">Syntax</a>
+    <a href="security.html">Security</a>
+    <a href="packages.html">Packages</a>
+    <a href="status.html">Status</a>
+  </nav>
+</header>
+<div class="frame">
+<nav class="rail">
+<a class="mark" href="index.html"><b>grasm</b><span>a systems language</span></a>
+<h2>Start</h2>
+<a href="start.html">Getting started</a>
+<a href="install.html">Install</a>
+<a href="playground.html">Playground</a>
+<h2>Learn</h2>
+<a href="tutorial.html" aria-current="page">Tutorial</a>
+<a href="tour.html">Tour</a>
+<a href="effects.html">Effects</a>
+<a href="tiers.html">Ownership</a>
+<a href="errors.html">Errors</a>
+<a href="concurrency.html">Concurrency</a>
+<a href="security.html">Security</a>
+<h2>Reference</h2>
+<a href="syntax.html">Syntax</a>
+<a href="language.html">Language</a>
+<a href="library.html">Library</a>
+<a href="packages.html">Packages</a>
+<a href="spec.html">Specification</a>
+<a href="architecture.html">Architecture</a>
+<h2>More</h2>
+<a href="examples.html">Examples</a>
+<a href="about.html">About</a>
+<a href="status.html">Status</a>
+<a href="roadmap.html">Roadmap</a>
+</nav>
+<main>
+
+<p class="eyebrow">Learn</p>
+<h1>Grasm in an hour</h1>
+<p class="lede">The whole language in one sitting. This page is
+<code>docs/tutorial.md</code>, rendered when the site was written.</p>
+<p>A guided tour, in the order the pieces build on each other. Every program here runs — <code>grasm run &lt;file&gt;</code> — and the code blocks are the same ones the conformance suite and <code>examples/</code> exercise, so nothing drifts out of date silently.</p>
+<p>If you want the exact rules rather than the tour, read <code>spec/</code>. This document explains; the spec decides.</p>
+<hr>
+<h2 id="1-a-first-program">1. A first program</h2>
+<pre><code><span class="kw">fn</span> <span class="fn">main</span><span class="op">(</span><span class="op">)</span> <span class="op">{</span>
+    <span class="fn">print</span><span class="op">(</span><span class="st">"hello, world"</span><span class="op">)</span>
+<span class="op">}</span></code></pre>
+<p><code>grasm run hello.gr</code> typechecks and executes. <code>grasm build hello.gr --native</code> produces a standalone binary through Cranelift.</p>
+<p>There are no semicolons, no imports needed for <code>print</code>, and no type annotations required where they can be inferred:</p>
+<pre><code><span class="kw">fn</span> <span class="fn">main</span><span class="op">(</span><span class="op">)</span> <span class="op">{</span>
+    <span class="kw">let</span> name <span class="op">=</span> <span class="st">"world"</span>
+    <span class="kw">let</span> count <span class="op">=</span> <span class="nu">3</span>
+    <span class="kw">for</span> i <span class="kw">in</span> <span class="nu">1</span><span class="op">..=</span>count <span class="op">{</span>
+        <span class="fn">print</span><span class="op">(</span><span class="st">"hello, {name} ({i})"</span><span class="op">)</span>
+    <span class="op">}</span>
+<span class="op">}</span></code></pre>
+<p><code>{...}</code> inside a string interpolates any expression. <code>1..=3</code> includes 3; <code>1..3</code> excludes it.</p>
+<h2 id="2-bindings">2. Bindings</h2>
+<p><code>let</code> is immutable, <code>var</code> is not. That is the whole rule.</p>
+<pre><code><span class="kw">fn</span> <span class="fn">main</span><span class="op">(</span><span class="op">)</span> <span class="op">{</span>
+    <span class="kw">let</span> x <span class="op">=</span> <span class="nu">1</span>
+    <span class="kw">var</span> total <span class="op">=</span> <span class="nu">0</span>
+    total <span class="op">+=</span> x        <span class="cm">// fine</span>
+    <span class="cm">// x = 2         // error: cannot assign to `x` — it is immutable</span>
+    <span class="fn">print</span><span class="op">(</span><span class="st">"{total}"</span><span class="op">)</span>
+<span class="op">}</span></code></pre>
+<p>Values have <strong>value semantics</strong>: assigning or passing never creates an alias, so mutating one binding can never be observed through another.</p>
+<pre><code><span class="kw">fn</span> <span class="fn">main</span><span class="op">(</span><span class="op">)</span> <span class="op">{</span>
+    <span class="kw">var</span> a <span class="op">=</span> <span class="op">[</span><span class="nu">1</span><span class="op">,</span> <span class="nu">2</span><span class="op">,</span> <span class="nu">3</span><span class="op">]</span>
+    <span class="kw">var</span> b <span class="op">=</span> a
+    b<span class="op">.</span><span class="fn">push</span><span class="op">(</span><span class="nu">4</span><span class="op">)</span>
+    <span class="fn">print</span><span class="op">(</span><span class="st">"{a.len()} {b.len()}"</span><span class="op">)</span>   <span class="cm">// 3 4</span>
+<span class="op">}</span></code></pre>
+<p>Copies are lazy — a copy costs a reference-count bump and only becomes a real copy on mutation of a shared value — but that is an optimization you cannot observe.</p>
+<p>A <code>let</code> at module level is a <strong>constant</strong> — one value for the whole program:</p>
+<pre><code><span class="kw">let</span> <span class="ty">TABLE_WIDTH</span> <span class="op">=</span> <span class="nu">77</span>
+<span class="kw">let</span> <span class="ty">TITLE</span> <span class="op">=</span> <span class="st">"Sales report"</span>
+
+<span class="kw">fn</span> <span class="fn">main</span><span class="op">(</span><span class="op">)</span> <span class="op">{</span>
+    <span class="fn">print</span><span class="op">(</span><span class="st">"{TITLE}, {TABLE_WIDTH} wide"</span><span class="op">)</span>
+<span class="op">}</span></code></pre>
+<p>A constant's value cannot perform effects. It is evaluated wherever its name is used, so an effect in it would happen once per mention; a value that has to be computed once, with effects, is a function.</p>
+<h2 id="3-types">3. Types</h2>
+<p>Scalars are <code>i64</code>, <code>f64</code>, <code>bool</code>, <code>str</code>. Collections are <code>[T]</code> and <code>Map[K, V]</code>. Annotate when you want to; infer when you do not.</p>
+<pre><code><span class="kw">type</span> <span class="ty">Point</span> <span class="op">=</span> <span class="op">{</span> x<span class="op">:</span> <span class="ty">f64</span><span class="op">,</span> y<span class="op">:</span> <span class="ty">f64</span> <span class="op">}</span>
+
+<span class="kw">type</span> <span class="ty">Shape</span> <span class="op">=</span>
+    <span class="op">|</span> <span class="ty">Circle</span><span class="op">(</span>r<span class="op">:</span> <span class="ty">f64</span><span class="op">)</span>
+    <span class="op">|</span> <span class="ty">Rect</span><span class="op">(</span>w<span class="op">:</span> <span class="ty">f64</span><span class="op">,</span> h<span class="op">:</span> <span class="ty">f64</span><span class="op">)</span>
+
+<span class="kw">fn</span> <span class="fn">area</span><span class="op">(</span>s<span class="op">:</span> <span class="ty">Shape</span><span class="op">)</span> <span class="op">-&gt;</span> <span class="ty">f64</span> <span class="op">{</span>
+    <span class="kw">match</span> s <span class="op">{</span>
+        <span class="ty">Circle</span><span class="op">(</span>r<span class="op">)</span> <span class="op">-&gt;</span> <span class="nu">3.14159</span> <span class="op">*</span> r <span class="op">*</span> r
+        <span class="ty">Rect</span><span class="op">(</span>w<span class="op">,</span> h<span class="op">)</span> <span class="op">-&gt;</span> w <span class="op">*</span> h
+    <span class="op">}</span>
+<span class="op">}</span>
+
+<span class="kw">fn</span> <span class="fn">main</span><span class="op">(</span><span class="op">)</span> <span class="op">{</span>
+    <span class="fn">print</span><span class="op">(</span><span class="st">"{area(Circle(2.0))}"</span><span class="op">)</span>
+<span class="op">}</span></code></pre>
+<p><code>match</code> must be exhaustive. Adding a variant to <code>Shape</code> turns every incomplete match into a compile error rather than a surprise at runtime.</p>
+<p>A tuple can be split into names, in a <code>let</code> or in a loop header:</p>
+<pre><code><span class="kw">fn</span> <span class="fn">main</span><span class="op">(</span><span class="op">)</span> <span class="op">{</span>
+    <span class="kw">let</span> <span class="op">(</span>a<span class="op">,</span> b<span class="op">)</span> <span class="op">=</span> <span class="op">(</span><span class="nu">1</span><span class="op">,</span> <span class="st">"two"</span><span class="op">)</span>
+    <span class="fn">print</span><span class="op">(</span><span class="st">"{a} {b}"</span><span class="op">)</span>
+
+    <span class="kw">for</span> <span class="op">(</span>i<span class="op">,</span> w<span class="op">)</span> <span class="kw">in</span> <span class="op">[</span><span class="st">"x"</span><span class="op">,</span> <span class="st">"y"</span><span class="op">]</span><span class="op">.</span><span class="fn">enumerate</span><span class="op">(</span><span class="op">)</span> <span class="op">{</span>
+        <span class="fn">print</span><span class="op">(</span><span class="st">"{i}{w}"</span><span class="op">)</span>
+    <span class="op">}</span>
+<span class="op">}</span></code></pre>
+<p>Those are the only destructuring forms — there is no <code>if let</code>, and patterns elsewhere appear only in <code>match</code>. They matter most with maps, where <code>entries()</code> hands back pairs, and with <code>enumerate()</code> and <code>zip()</code>.</p>
+<p>Write a map with <code>{key: value}</code>, or build one up from <code>{}</code>. Maps iterate in sorted key order, so printing one is deterministic — and what it prints is what you would type to write it back:</p>
+<pre><code><span class="kw">fn</span> <span class="fn">main</span><span class="op">(</span><span class="op">)</span> <span class="op">{</span>
+    <span class="kw">let</span> ripeness <span class="op">=</span> <span class="op">{</span><span class="st">"pear"</span><span class="op">:</span> <span class="nu">2</span><span class="op">,</span> <span class="st">"fig"</span><span class="op">:</span> <span class="nu">1</span><span class="op">}</span>
+    <span class="fn">print</span><span class="op">(</span><span class="st">"{ripeness}"</span><span class="op">)</span>          <span class="cm">// {fig: 1, pear: 2} — sorted, every run</span>
+
+    <span class="kw">var</span> counts<span class="op">:</span> <span class="ty">Map</span><span class="op">[</span><span class="ty">str</span><span class="op">,</span> <span class="ty">i64</span><span class="op">]</span> <span class="op">=</span> <span class="op">{</span><span class="op">}</span>
+    counts<span class="op">.</span><span class="fn">set</span><span class="op">(</span><span class="st">"pear"</span><span class="op">,</span> <span class="nu">2</span><span class="op">)</span>
+    <span class="fn">print</span><span class="op">(</span><span class="st">"{counts}"</span><span class="op">)</span>
+<span class="op">}</span></code></pre>
+<p><code>{}</code> is the empty map. Braces holding <em>statements</em> are a block, and an empty block has no use as an expression, so <code>()</code> is how you write unit. The braces of <code>if</code>, <code>for</code>, <code>while</code>, <code>match</code> and function bodies are always blocks.</p>
+<p>Lists join with <code>+</code>, and sort by a key you extract — which is how a list of structs gets sorted at all, since a struct has no order of its own:</p>
+<pre><code><span class="kw">type</span> <span class="ty">Run</span> <span class="op">=</span> <span class="op">{</span> name<span class="op">:</span> <span class="ty">str</span><span class="op">,</span> ms<span class="op">:</span> <span class="ty">i64</span> <span class="op">}</span>
+
+<span class="kw">fn</span> <span class="fn">main</span><span class="op">(</span><span class="op">)</span> <span class="op">{</span>
+    <span class="kw">var</span> runs <span class="op">=</span> <span class="op">[</span><span class="ty">Run</span><span class="op">{</span> name<span class="op">:</span> <span class="st">"b"</span><span class="op">,</span> ms<span class="op">:</span> <span class="nu">30</span> <span class="op">}</span><span class="op">,</span> <span class="ty">Run</span><span class="op">{</span> name<span class="op">:</span> <span class="st">"a"</span><span class="op">,</span> ms<span class="op">:</span> <span class="nu">10</span> <span class="op">}</span><span class="op">]</span>
+    runs<span class="op">.</span><span class="fn">sort_by</span><span class="op">(</span><span class="op">|</span>r<span class="op">|</span> r<span class="op">.</span>ms<span class="op">)</span>
+    <span class="kw">for</span> r <span class="kw">in</span> runs <span class="op">{</span>
+        <span class="fn">print</span><span class="op">(</span><span class="st">"{r.name} {r.ms}"</span><span class="op">)</span>
+    <span class="op">}</span>
+
+    <span class="kw">let</span> all <span class="op">=</span> <span class="op">[</span><span class="nu">1</span><span class="op">,</span> <span class="nu">2</span><span class="op">]</span> <span class="op">+</span> <span class="op">[</span><span class="nu">3</span><span class="op">]</span>
+    <span class="fn">print</span><span class="op">(</span><span class="st">"{all}"</span><span class="op">)</span>
+<span class="op">}</span></code></pre>
+<p>Text is characters, not bytes, and <code>code_at</code> / <code>codes</code> / <code>to_char</code> move between a character and its Unicode code point — which is what lets you compute on text rather than only cut and compare it:</p>
+<pre><code><span class="kw">fn</span> <span class="fn">hash</span><span class="op">(</span>s<span class="op">:</span> <span class="ty">str</span><span class="op">)</span> <span class="op">-&gt;</span> <span class="ty">i64</span> <span class="op">{</span>
+    <span class="kw">var</span> h <span class="op">=</span> <span class="nu">0</span>
+    <span class="kw">for</span> c <span class="kw">in</span> s<span class="op">.</span><span class="fn">codes</span><span class="op">(</span><span class="op">)</span> <span class="op">{</span>
+        h <span class="op">=</span> <span class="op">(</span>h <span class="op">*</span> <span class="nu">31</span> <span class="op">+</span> c<span class="op">)</span> <span class="op">%</span> <span class="nu">1000007</span>
+    <span class="op">}</span>
+    h
+<span class="op">}</span>
+
+<span class="kw">fn</span> <span class="fn">main</span><span class="op">(</span><span class="op">)</span> <span class="op">{</span>
+    <span class="fn">print</span><span class="op">(</span><span class="st">"{hash("grasm")} {104.to_char()}"</span><span class="op">)</span>
+<span class="op">}</span></code></pre>
+<h2 id="4-errors-are-values">4. Errors are values</h2>
+<p>There are no exceptions. A function that can fail says so in its type with <code>! E</code>, raises with <code>fail</code>, and callers propagate with <code>try</code>.</p>
+<pre><code><span class="kw">fn</span> <span class="fn">divide</span><span class="op">(</span>a<span class="op">:</span> <span class="ty">i64</span><span class="op">,</span> b<span class="op">:</span> <span class="ty">i64</span><span class="op">)</span> <span class="op">-&gt;</span> <span class="ty">i64</span> <span class="op">!</span> <span class="ty">str</span> <span class="op">{</span>
+    <span class="kw">if</span> b <span class="op">==</span> <span class="nu">0</span> <span class="op">{</span>
+        <span class="fn">fail</span><span class="op">(</span><span class="st">"division by zero"</span><span class="op">)</span>
+    <span class="op">}</span>
+    a <span class="op">/</span> b
+<span class="op">}</span>
+
+<span class="kw">fn</span> <span class="fn">compute</span><span class="op">(</span><span class="op">)</span> <span class="op">-&gt;</span> <span class="ty">i64</span> <span class="op">!</span> <span class="ty">str</span> <span class="op">{</span>
+    <span class="kw">let</span> half <span class="op">=</span> <span class="kw">try</span> <span class="fn">divide</span><span class="op">(</span><span class="nu">10</span><span class="op">,</span> <span class="nu">2</span><span class="op">)</span>
+    <span class="kw">try</span> <span class="fn">divide</span><span class="op">(</span>half<span class="op">,</span> <span class="nu">0</span><span class="op">)</span>
+<span class="op">}</span>
+
+<span class="kw">fn</span> <span class="fn">main</span><span class="op">(</span><span class="op">)</span> <span class="op">{</span>
+    <span class="kw">match</span> <span class="fn">compute</span><span class="op">(</span><span class="op">)</span> <span class="op">{</span>
+        <span class="ty">Ok</span><span class="op">(</span>v<span class="op">)</span> <span class="op">-&gt;</span> <span class="fn">print</span><span class="op">(</span><span class="st">"got {v}"</span><span class="op">)</span>
+        <span class="ty">Err</span><span class="op">(</span>e<span class="op">)</span> <span class="op">-&gt;</span> <span class="fn">print</span><span class="op">(</span><span class="st">"failed: {e}"</span><span class="op">)</span>
+    <span class="op">}</span>
+<span class="op">}</span></code></pre>
+<p>You cannot forget to handle one: using a fallible value without <code>try</code> or a <code>match</code> is a compile error. An error that reaches <code>main</code> exits 1 with a message rather than exiting 0 as though nothing happened.</p>
+<p>A <strong>panic</strong> is different: it means a bug (index out of bounds, divide by zero, a failed <code>assert</code>), prints <code>panic: &lt;message&gt;</code>, and exits 101. Panics are not for recoverable conditions.</p>
+<p><code>Option</code> covers absence:</p>
+<pre><code><span class="kw">fn</span> <span class="fn">main</span><span class="op">(</span><span class="op">)</span> <span class="op">{</span>
+    <span class="kw">let</span> xs <span class="op">=</span> <span class="op">[</span><span class="nu">3</span><span class="op">,</span> <span class="nu">1</span><span class="op">,</span> <span class="nu">4</span><span class="op">]</span>
+    <span class="fn">print</span><span class="op">(</span><span class="st">"{xs.min() ?? 0}"</span><span class="op">)</span>           <span class="cm">// 1</span>
+    <span class="fn">print</span><span class="op">(</span><span class="st">"{xs.find(|x| x &gt; 99) ?? -1}"</span><span class="op">)</span>  <span class="cm">// -1</span>
+<span class="op">}</span></code></pre>
+<p><code>??</code> evaluates its right side only when the left is <code>None</code>.</p>
+<h2 id="5-effects">5. Effects</h2>
+<p>A function's type says what it <em>does</em>, not just what it returns. Built-in effects are <code>io</code> and <code>async</code>; you can declare your own.</p>
+<pre><code><span class="kw">effect</span> <span class="ty">Clock</span> <span class="op">{</span>
+    <span class="kw">fn</span> <span class="fn">now</span><span class="op">(</span><span class="op">)</span> <span class="op">-&gt;</span> <span class="ty">i64</span>
+<span class="op">}</span>
+
+<span class="kw">fn</span> <span class="fn">stamp</span><span class="op">(</span><span class="op">)</span> <span class="op">-&gt;</span> <span class="ty">str</span> <span class="op">/</span> <span class="op">{</span><span class="ty">Clock</span><span class="op">}</span> <span class="op">{</span>
+    <span class="st">"at {Clock.now()}"</span>
+<span class="op">}</span>
+
+<span class="kw">fn</span> <span class="fn">main</span><span class="op">(</span><span class="op">)</span> <span class="op">{</span>
+    <span class="kw">with</span> <span class="ty">Clock</span> <span class="kw">handled_by</span> <span class="ty">ClockHandler</span><span class="op">{</span> now<span class="op">:</span> <span class="op">|</span><span class="op">|</span> <span class="nu">1700000000</span> <span class="op">}</span> <span class="op">{</span>
+        <span class="fn">print</span><span class="op">(</span><span class="fn">stamp</span><span class="op">(</span><span class="op">)</span><span class="op">)</span>
+    <span class="op">}</span>
+<span class="op">}</span></code></pre>
+<p>An effect that reaches <code>main</code> without a handler is a <em>compile</em> error. This is what makes tests hermetic by construction: a function that touches the clock or the network cannot pretend otherwise, and a test supplies a handler instead of a mocking framework.</p>
+<p>The same property is what the package manager enforces at the dependency boundary — see §8.</p>
+<h2 id="6-ownership-without-a-borrow-checker">6. Ownership without a borrow checker</h2>
+<p>Three parameter modes, and the default is the one you want:</p>
+<ul><li>plain — the callee gets a value; the caller keeps theirs.</li><li><code>inout</code> — the callee mutates the caller's binding in place. The caller passes a mutable place, and the same place cannot be passed as <code>inout</code> twice in one call.</li><li><code>own</code> — the caller gives the value up. Using it afterwards is a compile error, <strong>for types that are not copied</strong>. <code>i64</code>, <code>f64</code>, <code>bool</code>, and <code>()</code> are copied ([T-COPY]), so <code>own</code> on one of those transfers nothing and the caller keeps using its binding. <code>str</code>, lists, maps, and structs do move. Write the demonstration with one of those, or it will appear to disprove the rule it is demonstrating:</li></ul>
+<pre><code><span class="kw">fn</span> <span class="fn">consume</span><span class="op">(</span><span class="kw">own</span> xs<span class="op">:</span> <span class="op">[</span><span class="ty">i64</span><span class="op">]</span><span class="op">)</span> <span class="op">-&gt;</span> <span class="ty">i64</span> <span class="op">{</span>
+    xs<span class="op">.</span><span class="fn">len</span><span class="op">(</span><span class="op">)</span>
+<span class="op">}</span>
+
+<span class="kw">fn</span> <span class="fn">main</span><span class="op">(</span><span class="op">)</span> <span class="op">{</span>
+    <span class="kw">let</span> xs <span class="op">=</span> <span class="op">[</span><span class="nu">1</span><span class="op">,</span> <span class="nu">2</span><span class="op">,</span> <span class="nu">3</span><span class="op">,</span> <span class="nu">4</span><span class="op">,</span> <span class="nu">5</span><span class="op">]</span>
+    <span class="fn">print</span><span class="op">(</span><span class="st">"{consume(xs)}"</span><span class="op">)</span>
+    <span class="cm">// print("{xs.len()}")   // error: use of moved value `xs`</span>
+<span class="op">}</span></code></pre>
+<pre><code><span class="kw">fn</span> <span class="fn">bump</span><span class="op">(</span><span class="kw">inout</span> n<span class="op">:</span> <span class="ty">i64</span><span class="op">)</span> <span class="op">{</span>
+    n <span class="op">+=</span> <span class="nu">1</span>
+<span class="op">}</span>
+
+<span class="kw">fn</span> <span class="fn">main</span><span class="op">(</span><span class="op">)</span> <span class="op">{</span>
+    <span class="kw">var</span> count <span class="op">=</span> <span class="nu">0</span>
+    <span class="fn">bump</span><span class="op">(</span>count<span class="op">)</span>
+    <span class="fn">print</span><span class="op">(</span><span class="st">"{count}"</span><span class="op">)</span>     <span class="cm">// 1</span>
+<span class="op">}</span></code></pre>
+<p>The mode lives on the parameter, so the call site stays plain. No lifetimes, no borrow annotations on types, no <code>&amp;</code>/<code>&amp;mut</code> sprinkled through the code.</p>
+<h2 id="6a-functions-as-parameters">6a. Functions as parameters</h2>
+<p><code>fn(A, B) -&gt; R</code> is a type, so a program can declare its own higher-order function rather than being limited to the built-in ones:</p>
+<pre><code><span class="kw">fn</span> <span class="fn">apply</span><span class="op">(</span>f<span class="op">:</span> <span class="kw">fn</span><span class="op">(</span><span class="ty">i64</span><span class="op">)</span> <span class="op">-&gt;</span> <span class="ty">i64</span><span class="op">,</span> x<span class="op">:</span> <span class="ty">i64</span><span class="op">)</span> <span class="op">-&gt;</span> <span class="ty">i64</span> <span class="op">{</span>
+    <span class="fn">f</span><span class="op">(</span>x<span class="op">)</span>
+<span class="op">}</span>
+
+<span class="kw">fn</span> <span class="fn">double</span><span class="op">(</span>n<span class="op">:</span> <span class="ty">i64</span><span class="op">)</span> <span class="op">-&gt;</span> <span class="ty">i64</span> <span class="op">{</span>
+    n <span class="op">*</span> <span class="nu">2</span>
+<span class="op">}</span>
+
+<span class="kw">fn</span> <span class="fn">main</span><span class="op">(</span><span class="op">)</span> <span class="op">{</span>
+    <span class="fn">print</span><span class="op">(</span><span class="st">"{apply(double, 5)}"</span><span class="op">)</span>
+    <span class="fn">print</span><span class="op">(</span><span class="st">"{apply(|n| n + 1, 5)}"</span><span class="op">)</span>
+<span class="op">}</span></code></pre>
+<p>A closure passed to such a parameter takes its parameter types from it, so it needs no annotation.</p>
+<p>A closure captures the <strong>values</strong> it uses at the moment it is created, not the bindings ([E-CLOSURE-CAPTURE]). Changing a captured variable afterwards is not visible inside, and assigning to one inside changes only the closure's copy:</p>
+<pre><code><span class="kw">fn</span> <span class="fn">main</span><span class="op">(</span><span class="op">)</span> <span class="op">{</span>
+    <span class="kw">var</span> n <span class="op">=</span> <span class="nu">1</span>
+    <span class="kw">let</span> plus_n <span class="op">=</span> <span class="op">|</span>x<span class="op">|</span> x <span class="op">+</span> n
+    n <span class="op">=</span> <span class="nu">100</span>
+    <span class="fn">print</span><span class="op">(</span><span class="st">"{plus_n(0)}"</span><span class="op">)</span>     <span class="cm">// 1, not 100</span>
+<span class="op">}</span></code></pre>
+<p>That has one consequence worth knowing before you design around it: <strong>an effect handler cannot hold mutable state</strong>, because a handler's operations are closures. A <code>Store</code> whose <code>write</code> updates a captured list updates a copy, and the next <code>read</code> will not see it. Handlers supply values and accept output; state that changes belongs in the caller. <code>examples/ledger/</code> is that lesson written down after getting it wrong.</p>
+<p>Note that <code>spawn { … }</code> does <em>not</em> work this way — a task body shares the enclosing scope ([E-SPAWN-SHARED]). Two block-shaped constructs, two rules.</p>
+<p>The type carries an effect row, and <strong>no row means the empty row</strong>. So <code>fn(i64) -&gt; i64</code> accepts only functions that perform nothing, and passing one that prints is an error where you pass it — not a surprise inside. Write <code>fn(i64) -&gt; i64 / {io}</code> when the caller should be allowed to hand over something effectful. This is the one place a row is written rather than inferred, because a type has no body to infer from.</p>
+<h2 id="7-structured-concurrency">7. Structured concurrency</h2>
+<p><code>parallel</code> opens a scope; <code>spawn</code> adds a task to it. The scope does not exit until every task inside it has finished.</p>
+<pre><code><span class="kw">fn</span> <span class="fn">main</span><span class="op">(</span><span class="op">)</span> <span class="op">{</span>
+    <span class="kw">var</span> log<span class="op">:</span> <span class="op">[</span><span class="ty">str</span><span class="op">]</span> <span class="op">=</span> <span class="op">[</span><span class="op">]</span>
+    parallel <span class="op">{</span>
+        spawn <span class="op">{</span>
+            log<span class="op">.</span><span class="fn">push</span><span class="op">(</span><span class="st">"first"</span><span class="op">)</span>
+        <span class="op">}</span>
+        spawn <span class="op">{</span>
+            log<span class="op">.</span><span class="fn">push</span><span class="op">(</span><span class="st">"second"</span><span class="op">)</span>
+        <span class="op">}</span>
+    <span class="op">}</span>
+    <span class="fn">print</span><span class="op">(</span>log<span class="op">.</span><span class="fn">join</span><span class="op">(</span><span class="st">" "</span><span class="op">)</span><span class="op">)</span>     <span class="cm">// first second</span>
+<span class="op">}</span></code></pre>
+<p>Tasks run in spawn order, deterministically: the same program always produces the same output. That determinism is deliberate and is <em>not</em> multi-core speedup — <code>parallel</code> buys you structure and reproducibility, not throughput, because its tasks share the enclosing scope and running them at once would race.</p>
+<p>Throughput has its own form, and the effect system is what makes it safe:</p>
+<pre><code><span class="kw">fn</span> <span class="fn">main</span><span class="op">(</span><span class="op">)</span> <span class="op">{</span>
+    <span class="kw">let</span> xs <span class="op">=</span> <span class="op">[</span><span class="nu">1</span><span class="op">,</span> <span class="nu">2</span><span class="op">,</span> <span class="nu">3</span><span class="op">,</span> <span class="nu">4</span><span class="op">,</span> <span class="nu">5</span><span class="op">]</span>
+    <span class="fn">print</span><span class="op">(</span><span class="st">"{xs.par_map(|x| x * x)}"</span><span class="op">)</span>
+<span class="op">}</span></code></pre>
+<p><code>par_map</code> and <code>par_filter</code> spread the work across cores. The function must be effect-free and <strong>the compiler proves it</strong> — put a <code>print</code> inside and the build fails — so there are no <code>Send</code>/<code>Sync</code> bounds to satisfy and no race detector to run. Results come back in input order whatever the core count is, so the answer never depends on the machine.</p>
+<p>Which is also why only the compiled backend actually uses them: <code>grasm run</code> and <code>grasm build -o</code> produce a bundled <em>interpreter</em>, and there a <code>par_map</code> is a <code>map</code>. The answer is identical — that is the whole point of requiring purity — but the throughput is not, so measure with <code>grasm build --native</code>.</p>
+<p>A short list is not automatically a sequential one. The runtime computes the first element on the calling thread, times it, and splits the rest when what remains is worth more than the spawns — so six elements of real work get the cores, and a thousand cheap ones are not split for the sake of it. Being wrong costs one element's time and never changes the answer.</p>
+<p>What threads cannot help with is worth knowing before reaching for them: if the body mostly <em>moves</em> memory rather than computing — copying a buffer, building a list — eight workers share one memory bus and gain nothing, and if the body reads a large structure shared with the other workers, the reference counts on it are atomic and the contention can cost more than the work. <code>docs/apps-phases.md</code> has both measured, from an audio mixdown where the difference was 1.2 s against 6.3 s.</p>
+<p>A panicking task aborts the whole scope; tasks spawned after it do not run. A <code>return</code> inside a task body returns from the function the <code>parallel</code> block is in, and the rest of the scope — the tasks not yet run, and the statements after the block — is abandoned. That is a way out, not a way to end one task.</p>
+<p>The two forms divide the work between them, and it is worth knowing which you want before you reach for one. <strong><code>for x in xs { spawn { … x … } }</code> is not writable</strong>: a task's body reads the enclosing scope as it stands when the tasks run, so a loop variable is gone by then, and the compiler says so. The number of tasks a <code>parallel</code> block starts is fixed where it is written.</p>
+<p>So: a <em>runtime-sized</em> amount of work over data is <code>par_map</code>/<code>par_filter</code>, which is also the form that gets real cores and that the compiler proves safe. <code>parallel</code>/<code>spawn</code> is for a fixed set of distinct activities that share results through the enclosing scope.</p>
+<h2 id="8-modules-and-packages">8. Modules and packages</h2>
+<pre><code><span class="kw">import</span> lib<span class="op">.</span>math
+
+<span class="kw">fn</span> <span class="fn">main</span><span class="op">(</span><span class="op">)</span> <span class="op">{</span>
+    <span class="fn">print</span><span class="op">(</span><span class="st">"{math.square(4)}"</span><span class="op">)</span>
+<span class="op">}</span></code></pre>
+<p><code>pub</code> controls what crosses a module boundary. <code>import helper</code> finds <code>helper.gr</code> beside the importing file; <code>import lib.math</code> finds <code>lib/math.gr</code>. No manifest is needed for either — a manifest is what turns a directory into a <em>package</em>, which is what dependencies and capabilities are about.</p>
+<p>A package is a directory laid out like this:</p>
+<pre><code>mathlib<span class="op">/</span>
+  grasm<span class="op">.</span>toml          the manifest
+  src<span class="op">/</span>
+    main<span class="op">.</span>gr           the entry file — what `<span class="kw">import</span> mathlib` resolves to</code></pre>
+<p><code>src/main.gr</code> is the default; <code>entry = "src/lib.gr"</code> in <code>[package]</code> changes it. It has to name a file <em>inside</em> the package: the lockfile's checksum, the capability ceiling and <code>grasm publish</code> all cover the package's own directory, so an <code>entry</code> reaching out of it with <code>..</code> — or an absolute path — is refused rather than silently leaving all three describing a tree the program does not use. It has to end in <code>.gr</code> for the same reason: those three collect the package's Grasm sources, and an entry named anything else was executed but recorded nowhere — <code>--locked</code> reported "up to date" after it changed, and <code>grasm publish</code> shipped a package that could not build into a slot that cannot be republished. Everything a package exports lives behind that one file, so a dependency's other modules are reached as <code>import mathlib.helpers</code>.</p>
+<p>"The package's sources" is <strong>one</strong> answer to all three questions, which it was not: the checksum skipped <code>target/</code> and every dot-directory, both of which are legal import path segments; the <code>.gr</code> extension was matched case-sensitively, so <code>HELPER.GR</code> — what <code>import helper</code> resolves to on a case-insensitive filesystem — was invisible to the checksum, to <code>publish</code> and to the ceiling alike; and <code>publish</code> walked from the entry's directory while the checksum walked from the package's, so one released version had two checksums. A directory symlink is followed once: a package holding two self-links took <code>deps</code> and <code>publish</code> from "34 copies into an immutable slot" to "never returns".</p>
+<p>A package with a <code>path</code> dependency cannot be published at all. Only the package's own directory travels, so the release named a dependency that resolved outside the version directory — every consumer failed on a version that cannot be republished.</p>
+<pre><code>[package]
+name = "mathlib"
+version = "0.1.0"
+capabilities = []          # this package performs no effects
+
+[dependencies.utils]
+path = "../utils"
+version = "^1.0.0"         # optional: 1.x, and no other line</code></pre>
+<p><code>version</code> accepts a compatible range with <code>^</code> (a bare <code>1.0.0</code> means the same) or one exact version with <code>=</code>. Before 1.0 the minor number carries the weight of a major, so <code>^0.2.0</code> stops below <code>0.3.0</code>.</p>
+<p>Drop the <code>path</code> and the package comes from a registry — a directory of <code>&lt;name&gt;/&lt;version&gt;/</code> packages, pointed at by <code>GRASM_REGISTRY</code> or found as the nearest <code>.grasm/registry</code>. Which version you get is the <em>lowest</em> one that satisfies everybody, so adding a dependency never quietly upgrades something else you were already using.</p>
+<p><code>capabilities</code> is a <strong>ceiling</strong>, and it is checked against what the code actually does. <strong>Omitting the key means unrestricted</strong>, not empty — a package with no <code>capabilities</code> line is not held to anything, and <code>grasm deps</code> reports it as <code>(unrestricted)</code>. Write <code>capabilities = []</code> to mean "performs nothing"; leaving it out means "do not check me". A key <code>[package]</code> does not recognise is refused rather than ignored, because that difference is exactly what a typo would spend: <code>capabilitys = []</code> used to leave the package unrestricted, and the only trace was a column in <code>grasm deps</code>. Because effects are inferred from source, a dependency that quietly starts reading the filesystem exceeds its declared ceiling and fails to build <strong>in every consumer</strong> — a compile error, not a runtime surprise, and not something a reviewer has to happen to notice.</p>
+<p>A capability is what a package needs from <strong>outside</strong> itself, so what counts is what <em>escapes</em>: the effects <code>main</code> performs, the effects left in a <code>pub</code> function's row for a consumer to handle, and the effects its <code>test</code> and <code>bench</code> bodies and its <strong>doc examples</strong> perform. That last group surprises people — a test is not part of the interface, and an example is documentation — but <code>grasm test</code> runs the tests <em>and the doc examples</em> of every imported module, so a dependency's test body and its <code>///</code> fenced blocks really do execute in your process. The consequence is worth knowing: a <code>capabilities = []</code> package cannot <code>print</code> from a test or from a doc example, which rules out the usual <code>/// print("{f(2)}")</code> — write the example as <code>assert(f(2) == 4)</code> instead, which performs nothing and checks more. Every module in the package counts, not only the ones its entry file imports — a consumer reaches <code>pub fn f</code> with <code>import dep.module</code> whether or not the dependency's own entry mentions that module, so a <code>capabilities = []</code> package could otherwise keep a filesystem reader in an unimported sibling file and be reported as performing nothing. A <em>dependency's</em> <code>pub</code> rows do not count toward the consumer, whose ceiling is what it needs, not what everything it depends on offers; what the consumer actually calls is already in the row of whatever calls it. An effect you declare, perform and handle inside your own package needs nothing from anyone and is not a capability — but the handler answers for what it really does, so a <code>Log</code> handler that calls <code>print</code> puts <code>io</code> in the ceiling whoever asked for it.</p>
+<p><code>grasm deps</code> resolves the graph, checks every package against its ceiling, and writes <code>grasm.lock</code> with a SHA-256 over each package's manifest and sources. The manifest is in the digest because the <code>capabilities</code> line is what a consumer is relying on: three releases with identical code and different ceilings hashed the same without it.</p>
+<h2 id="9-testing">9. Testing</h2>
+<p>One declaration form covers three kinds of test.</p>
+<pre><code><span class="kw">fn</span> <span class="fn">reverse</span><span class="op">(</span>xs<span class="op">:</span> <span class="op">[</span><span class="ty">i64</span><span class="op">]</span><span class="op">)</span> <span class="op">-&gt;</span> <span class="op">[</span><span class="ty">i64</span><span class="op">]</span> <span class="op">{</span>
+    <span class="kw">var</span> out<span class="op">:</span> <span class="op">[</span><span class="ty">i64</span><span class="op">]</span> <span class="op">=</span> <span class="op">[</span><span class="op">]</span>
+    <span class="kw">var</span> i <span class="op">=</span> xs<span class="op">.</span><span class="fn">len</span><span class="op">(</span><span class="op">)</span> <span class="op">-</span> <span class="nu">1</span>
+    <span class="kw">while</span> i <span class="op">&gt;=</span> <span class="nu">0</span> <span class="op">{</span>
+        out<span class="op">.</span><span class="fn">push</span><span class="op">(</span>xs<span class="op">[</span>i<span class="op">]</span><span class="op">)</span>
+        i <span class="op">=</span> i <span class="op">-</span> <span class="nu">1</span>
+    <span class="op">}</span>
+    out
+<span class="op">}</span>
+
+<span class="kw">test</span> <span class="st">"reverse of a known list"</span> <span class="op">{</span>
+    <span class="fn">assert</span><span class="op">(</span><span class="fn">reverse</span><span class="op">(</span><span class="op">[</span><span class="nu">1</span><span class="op">,</span> <span class="nu">2</span><span class="op">,</span> <span class="nu">3</span><span class="op">]</span><span class="op">)</span> <span class="op">==</span> <span class="op">[</span><span class="nu">3</span><span class="op">,</span> <span class="nu">2</span><span class="op">,</span> <span class="nu">1</span><span class="op">]</span><span class="op">)</span>
+<span class="op">}</span>
+
+<span class="kw">test</span> <span class="st">"reversing twice is the identity"</span> <span class="op">(</span>xs<span class="op">:</span> <span class="op">[</span><span class="ty">i64</span><span class="op">]</span><span class="op">)</span> <span class="op">{</span>
+    <span class="fn">assert</span><span class="op">(</span><span class="fn">reverse</span><span class="op">(</span><span class="fn">reverse</span><span class="op">(</span>xs<span class="op">)</span><span class="op">)</span> <span class="op">==</span> xs<span class="op">)</span>
+<span class="op">}</span></code></pre>
+<p><code>grasm test file.gr</code> runs the tests of every module the program imports, not just that file's, and names each one by its module. <code>grasm bench</code> does the same for benchmarks. A library whose tests are failing should not look like a library whose tests passed.</p>
+<p>Parameters make it a <strong>property</strong> test: the runner generates the inputs. Pointing one at <code>str</code> is fuzzing — the generator emits tabs, newlines, quotes, backslashes, and multi-byte characters.</p>
+<p>A failure reports a <em>shrunk</em> counterexample — the smallest input that still fails — plus the seed that found it:</p>
+<pre><code>test "doubling is monotonic" ... FAILED on case 1 of 100
+  assertion failed
+  counterexample: n = 0
+  replay: --seed 24301 --cases 100</code></pre>
+<p><code>0</code> is the simplest witness the shrinker could reach: <code>0 * 2</code> is <code>0</code>, which is not greater. The property is false for <code>0</code>, for every negative number, and for <code>4611686018427387904</code> and up, where <code>n * 2</code> wraps — the shrinker reports the simplest one it can, not the first one it found.</p>
+<p>That seed is the <em>default</em>, and it does not change between runs: <code>grasm test</code> twice runs the same hundred cases twice, so a suite that passes today passes tomorrow. Running it again is not how you widen coverage — <code>--seed</code> is. What the fixed run does guarantee is the boundary values: the first ten cases walk them in order, so <code>0</code>, <code>±1</code>, <code>±2</code>, <code>10</code>, <code>100</code>, the <code>i64</code> extremes, NaN, both infinities, both zeros, both <code>bool</code>s and the empty string are tried every time rather than merely often. The rest of the run is the widening random mix.</p>
+<p><code>grasm test --coverage</code> reports which statement lines the suite reached — counting the lines that doc examples reach, since those are tests too. It did not, so a function reached <em>only</em> by its own documented example was reported uncovered while the suite had just run it — and then it did, but only for the entry file: a group of examples runs in a synthesized program where the owner's source is inlined, so the lines an <em>imported</em> module's examples reached were being read against the wrong file. <code>bench "name" { ... }</code> bodies are warmed up, then sampled, and <code>grasm bench</code> reports time per operation, in whatever unit keeps the figure readable.</p>
+<h2 id="10-documentation-that-cannot-rot">10. Documentation that cannot rot</h2>
+<p><code>///</code> comments document the declaration that follows. <code>grasm doc</code> renders them as Markdown with signatures taken from the AST, so a documented effect row or error type cannot drift from the real one.</p>
+<pre><code>/// Adds two integers.
+///
+/// Addition wraps on overflow.
+///
+/// ```
+/// assert(add(2, 3) == 5)
+/// ```
+fn add(a: i64, b: i64) -&gt; i64 {
+    a + b
+}
+````
+
+The fenced block is **executable**. `grasm test` runs it as a test, compiled
+in the module that owns it: that module's own items are in scope unqualified,
+and everything else it imports is available the way the module has it. So an
+example writes `square(4)` — the way the module's own code does — and the same
+example passes whether the library is tested on its own or through a consumer.
+Documentation that stops being true fails the suite instead of quietly
+misleading the next reader.
+
+Lines beginning `# ` inside a block are hidden setup: they run, but they are
+not part of what a reader sees.
+
+## 10a. Calling C
+
+`extern fn` declares a C function. There is no body and no binding layer: a
+compiled build resolves the symbol at link time, and `grasm run` finds it in
+its own process.
+</code></pre>
+<p>extern fn sqrt(x: f64) -&gt; f64 extern fn getpid() -&gt; i64</p>
+<p>fn main() { let r = unsafe { sqrt(16.0) } print("{r}") }</p>
+<pre><code><span class="ty">Parameters</span> <span class="kw">and</span> results are `<span class="ty">i64</span>` <span class="kw">and</span> `<span class="ty">f64</span>`<span class="op">.</span> `<span class="ty">bool</span>` is deliberately <span class="kw">not</span>
+allowed<span class="op">:</span> <span class="ty">C</span>'s is one byte <span class="kw">and</span> <span class="ty">Grasm</span>'s is a register<span class="op">,</span> <span class="kw">and</span> that kind of mismatch
+surfaces as garbage far from where it was caused<span class="op">.</span>
+
+<span class="op">*</span><span class="op">*</span><span class="ty">It</span> has to be inside `<span class="kw">unsafe</span>`<span class="op">,</span> <span class="kw">and</span> it counts as both `<span class="kw">unsafe</span>` <span class="kw">and</span> `io`<span class="op">.</span><span class="op">*</span><span class="op">*</span>
+<span class="ty">Calling</span> <span class="ty">C</span> is <span class="ty">Tier</span> <span class="nu">3</span> — outside everything the safe tiers guarantee — so the
+source says so at the use<span class="op">,</span> <span class="kw">and</span> the package says so <span class="kw">in</span> its manifest<span class="op">:</span></code></pre>
+<p>capabilities = ["io", "unsafe"]</p>
+<pre><code><span class="ty">Naming</span> a <span class="ty">C</span> function without calling it needs `<span class="kw">unsafe</span>` as well<span class="op">:</span> holding the
+function <span class="op">*</span>is<span class="op">*</span> the ability to call it<span class="op">.</span> <span class="ty">What</span> a <span class="ty">C</span> function does cannot be known<span class="op">,</span>
+so the safe assumption is the only one available — an `extern` use counts
+against the ceiling<span class="op">,</span> <span class="kw">and</span> a function that makes one cannot be handed to
+`par_map`<span class="op">.</span> <span class="ty">A</span> consumer can see `<span class="kw">unsafe</span>` <span class="kw">in</span> your manifest<span class="op">,</span> transitively<span class="op">,</span> <span class="kw">and</span>
+refuse to depend on you<span class="op">:</span> your <span class="ty">JSON</span> parser cannot quietly contain one<span class="op">.</span>
+
+## 10b<span class="op">.</span> <span class="ty">Knowing</span> what you broke
+
+`grasm api` prints a package's public surface — every `<span class="kw">pub</span>` item<span class="op">,</span> sorted<span class="op">,</span> one
+line each<span class="op">.</span> <span class="ty">Save</span> it<span class="op">,</span> <span class="kw">and</span> a later `<span class="op">-</span><span class="op">-</span>against` says what changed<span class="op">:</span>
+
+```text
+$ grasm api src<span class="op">/</span>main<span class="op">.</span>gr <span class="op">&gt;</span> v1<span class="op">.</span>api
+$ grasm api src<span class="op">/</span>main<span class="op">.</span>gr <span class="op">-</span><span class="op">-</span>against v1<span class="op">.</span>api
+<span class="ty">CHANGED</span>  lib<span class="op">::</span><span class="ty">Point</span>
+    was  <span class="kw">type</span> <span class="ty">Point</span> <span class="op">=</span> <span class="op">{</span> x<span class="op">:</span> <span class="ty">i64</span><span class="op">,</span> y<span class="op">:</span> <span class="ty">i64</span> <span class="op">}</span>
+    now  <span class="kw">type</span> <span class="ty">Point</span> <span class="op">=</span> <span class="op">{</span> x<span class="op">:</span> <span class="ty">f64</span><span class="op">,</span> y<span class="op">:</span> <span class="ty">i64</span> <span class="op">}</span>
+
+breaking<span class="op">:</span> <span class="nu">0</span> removed<span class="op">,</span> <span class="nu">1</span> changed<span class="op">,</span> <span class="nu">0</span> added — this is a <span class="ty">MAJOR</span> release</code></pre>
+<p>It exits 1 on a breaking change, so a build can refuse one that the version number does not admit to.</p>
+<p>A version number is supposed to answer "will this break me". One a human typed cannot answer it — it records what somebody <em>believed</em>. This one is read off the code.</p>
+<p>The limit is worth stating: this compares <strong>shape</strong>, not behaviour. A function that keeps its signature and starts returning something else is a <code>PATCH</code> here and a disaster for you. Deciding that automatically is undecidable, and a tool that claimed to would be worse than one that says where it stops.</p>
+<h2 id="10c-making-a-failure-happen-twice">10c. Making a failure happen twice</h2>
+<p>A program is a function of its code and everything it read from outside itself. The code is in the binary; the rest can be written down:</p>
+<pre><code>$ GRASM_RECORD=j ./server          # the run that went wrong
+$ GRASM_REPLAY=j grasm run src/main.gr</code></pre>
+<p>The second run does not read the clock, the disk, the network or the environment. It takes every answer from <code>j</code> — so it behaves the same on your laptop as it did on the machine that failed, as many times as you need, under a debugger.</p>
+<p>It also does not <em>write</em>. Replaying a <code>write_file</code> to reproduce a bug would damage a disk. <code>print</code> is the deliberate exception: a replay whose output you cannot see is not worth running.</p>
+<p><code>grasm journal</code> shows what was recorded:</p>
+<pre><code>$ grasm journal j
+j — 5 record(s), 264 bytes
+
+  1  now_millis  1787564958324
+  2  env         Some("/home/dev")
+  3  read_file   Ok("port = 8080\n")
+  4  tcp_listen  Err(IoFailed("Permission denied (os error 13)"))
+  5  now_millis  1787564958324
+
+  5 call(s) across 4 builtin(s): env 1, now_millis 2, read_file 1, tcp_listen 1</code></pre>
+<p><strong>Why this is cheap here and expensive elsewhere.</strong> Knowing which calls are non-deterministic is normally the hard part of building a record-and-replay tool. In Grasm it was already written down: a function that reaches outside the program declares an effect (§5), and one that does not <em>cannot</em>. The journal is "every call with a row, in order, and what it answered".</p>
+<p><strong>Divergence is refused, not guessed.</strong> If the program takes a different path from the recorded one, the run stops and says which call disagreed:</p>
+<pre><code>grasm: at call 3 the recording says `read_file` and this run asked for
+`env` — the program has taken a different path from the one recorded, so
+this is not a replay of it</code></pre>
+<p>Handing back the next record anyway would produce something that looks like a replay and is not, and a tool whose whole promise is <em>this is what happened</em> must not be able to lie about it.</p>
+<p>A recording is portable between engines, which is the case that matters: the failure happens in the compiled build and the debugger is in <code>grasm run</code>. It even replays in a browser tab — see replay.md.</p>
+<h2 id="11-where-native-stops">11. Where <code>--native</code> stops</h2>
+<p><code>grasm run</code> and <code>grasm build --native</code> are two implementations of one language, and <code>scripts/difftest.sh</code> holds them to identical output — and identical exit codes — on every program in the repository.</p>
+<p>For most of this project's life the compiled backend was the <em>smaller</em> of the two, and this section was a list of shapes that ran under <code>grasm run</code> and could not be built. That list was seventeen entries long. It is one, and it is not a defect being worked off:</p>
+<div class="scroll"><table><thead><tr><th>shape</th><th>why</th></tr></thead><tbody><tr><td>polymorphic recursion</td><td><code>fn f[T](x: T) -&gt; i64 { f([x]) }</code> needs one compiled copy per type and the types never stop growing. No amount of work removes this; it is what monomorphization is, and it is refused by name at build time</td></tr></tbody></table></div>
+<p>Everything else the interpreter accepts, the compiled backend compiles. <code>scripts/nativegaps.sh</code> holds that claim to 55 cases, running each under both engines and comparing output, exit code and leaks. Six of the fourteen generators in <code>scripts/</code> report how many of the programs they invented the backend turned away, and all six report <code>declined: 0</code> — and in all six a decline is a <em>failure</em> rather than a report. Every shape they generate is one the backend compiles, so a refusal is coverage lost rather than an honest no: it is either a new gap, which belongs in the table above, or a defect. Twice now a generator has counted one and exited 0, and both times the programs stopped running while the summary said nothing was wrong.</p>
+<p>That is a statement about what has been checked, not a proof. A shape nobody has written is a shape nobody has tried. What has changed is the direction the gate points: it used to record what the backend could not do, and now it mostly records what it can.</p>
+<p>A refusal, when one appears, is by name and at build time rather than a wrong answer. That is the promise, and it has been broken: a <code>fold</code> whose accumulator was fallible was named in this table as refused and was quietly miscompiled instead (F43). Both halves of that shape are in the gate list now — the one that works and the one that must not.</p>
+<p>One row left this table by being answered rather than implemented. A constructor that leaves a type parameter undetermined — <code>Good(1)</code> for <code>Res[T, E]</code> — was refused here and accepted by the other two engines, which made it look like a backend limitation. [T-GENERIC-TYPE] says it is the language's rule, so the <em>checker</em> enforces it now and all three engines agree. A shape on a list of backend gaps is worth asking about twice: whether the backend should accept it, or whether the others should not.</p>
+<h2 id="where-to-go-next">Where to go next</h2>
+<ul><li><code>spec/</code> — the normative rules, each tagged and backed by a program in <code>spec/conformance/</code> that the test suite runs.</li><li><code>examples/</code> — runnable programs, including <code>stdlib_tour.gr</code> and <code>testing_tour.gr</code>.</li><li><code>projects/</code> — twelve larger programs, beginner through advanced.</li><li><code>docs/replay.md</code> — recording a run and replaying it, in full.</li><li><code>docs/wasm.md</code> — running a Grasm program in a browser tab.</li><li><code>MASTERPLAN.md</code> — where the language is going and why.</li></ul>
+<footer>
+Grasm — four engines, one answer. Every figure on this site is computed,
+not typed.
+<a href="status.html">Status</a> ·
+<a href="spec.html">Specification</a> ·
+<a href="roadmap.html">Roadmap</a>
+</footer>
+</main>
+</div>
+</body></html>

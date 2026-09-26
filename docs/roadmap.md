@@ -49,10 +49,20 @@ longer matches the run, a figure nothing computes, and no recorded run at all.
 All four fail the `--check`. A fifth — a gate that stops printing the count the
 site reads — fails the recorder rather than writing a stale number.
 
-What it still needs: an in-page playground wired to the wasm build (the build
-works, and `ProjectGold/web/` hosts it, but this site does not embed it yet),
-and the tutorial and library reference rendered from `docs/` rather than
-summarised.
+The playground runs in the page (2026-09-26). `site/grasm.wasm` is the module
+`ProjectGold/web/` serves and `scripts/wasmtest.sh` holds to the other engines
+-- `scripts/site.py --check` fails if the two differ -- and its examples are
+the files in `examples/`, read when the site is written, so a program it shows
+is one the gates run. Checked in a browser: all eight examples print what
+`grasm run` prints, byte for byte; a type error, a panic and an edited program
+come back as they do on the command line; and no page scrolls sideways at a
+phone's 390 px, which three of them did before.
+
+The tutorial and the library reference are rendered from `docs/tutorial.md`
+and `spec/library.md` (2026-09-27) by `scripts/site_markdown.py`, which knows
+the constructs those two documents use and refuses any other rather than
+guessing at it. The library page had been a hand-kept list of 81 method names;
+it is now the specification's own tables and clauses, anchored by clause tag.
 
 The original list, for the record: a landing page that says what the language is and why it exists;
 getting started and install; a tutorial; a language reference; a library

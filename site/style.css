@@ -352,6 +352,9 @@ footer a { color: var(--ink-2); }
 
 .hero { padding: 14px 0 8px; }
 .split { display: grid; grid-template-columns: 1fr; gap: 26px; align-items: start; }
+/* A grid item's minimum is its content's, so one long code line widened the
+   column past the screen; the code panel scrolls inside itself instead. */
+.split > * { min-width: 0; }
 @media (min-width: 1080px) { .split { grid-template-columns: 1fr 1fr; gap: 40px; } }
 
 /* The terminal keeps the dark ground code has, so it reads as the machine
@@ -466,11 +469,108 @@ footer a { color: var(--ink-2); }
 .reveal.in { opacity: 1; transform: none; transition: opacity .5s ease, transform .5s cubic-bezier(.2, .8, .25, 1); }
 
 @media (max-width: 940px) {
-  .frame { flex-direction: column; }
+  /* Stretched, not sized to content: as a column with `flex-start`, `main`
+     took the width of its widest code line and the page scrolled sideways
+     on a phone. */
+  .frame { flex-direction: column; align-items: stretch; }
   .rail { width: auto; flex: none; height: auto; position: static; border-right: 0; border-bottom: 1px solid var(--rule); padding: 16px 22px; }
   main { padding: 30px 22px 70px; }
   .topbar nav { display: none; }
   .topbar { padding: 0 20px; }
   .verdict-row { grid-template-columns: 1fr; gap: 5px; }
   .fig { border-right: 0; border-bottom: 1px solid var(--rule); }
+}
+
+/* -------------------------------------------------------------- playground */
+
+/* One dark instrument: the editor and its output are the same panel, split by
+   a rule, because they are one program's before and after. */
+.pg {
+  margin: 26px 0 30px;
+  border-radius: 10px;
+  overflow: hidden;
+  background: var(--code-bg);
+  border: 1px solid #1f2a25;
+}
+.pg-bar {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
+  padding: 10px 12px 10px 16px;
+  background: #121a16;
+  border-bottom: 1px solid #1f2a25;
+}
+.pg-pick {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+  color: var(--t-cm);
+}
+.pg-pick select {
+  font: 14px var(--sans);
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--code-fg);
+  background: var(--code-bg);
+  border: 1px solid #2c3a33;
+  border-radius: 6px;
+  padding: 5px 8px;
+}
+.pg-engine {
+  flex: 1;
+  font: 12px var(--mono);
+  color: var(--t-cm);
+  font-variant-numeric: tabular-nums;
+}
+.pg .btn { padding: 7px 18px; }
+.pg-src {
+  display: block;
+  width: 100%;
+  min-height: 300px;
+  resize: vertical;
+  margin: 0;
+  padding: 16px 20px;
+  border: 0;
+  background: var(--code-bg);
+  color: var(--code-fg);
+  font: 13.2px/1.65 var(--mono);
+  tab-size: 4;
+  white-space: pre;
+  overflow: auto;
+}
+.pg-src:focus-visible, .pg-pick select:focus-visible {
+  outline: 2px solid var(--t-kw);
+  outline-offset: -2px;
+}
+.pg-out-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 20px;
+  border-top: 1px solid #1f2a25;
+  background: #121a16;
+  font-size: 12px;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+  color: var(--t-cm);
+}
+.pg-status { font: 12px var(--mono); letter-spacing: 0; text-transform: none; font-variant-numeric: tabular-nums; }
+.pg-status.ok { color: var(--t-kw); }
+.pg-status.bad { color: #e08a74; }
+.pg-status.busy { color: var(--t-fn); }
+.pg-out {
+  margin: 0;
+  border-radius: 0;
+  min-height: 90px;
+  max-height: 360px;
+  overflow: auto;
+  white-space: pre-wrap;
+}
+@media (max-width: 640px) {
+  .pg-bar { padding: 10px 12px; }
+  .pg-src, .pg-out { padding-left: 14px; padding-right: 14px; }
 }
