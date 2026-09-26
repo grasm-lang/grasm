@@ -83,7 +83,7 @@ floor-subtracted, against a 0.95× target. `scripts/bench.sh` computes it from
 the numbers it prints rather than from anything typed by hand.
 
 Known costs, in the order they are worth attacking: `tree`'s box-per-node;
-binary size 328 KB against a 300 KB target; the reference count on every boxed
+binary size 350 KB against a 300 KB target; the reference count on every boxed
 value, which is atomic because a `parallel` body may hold one.
 
 Quality is the loop. It does not stop.

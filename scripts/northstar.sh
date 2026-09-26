@@ -92,6 +92,18 @@ if [ "${rc:-1}" -ne 0 ]; then
 fi
 locs=$(( lines * 1000 / work_ms ))
 printf '%-4s %-34s %-22s %s\n' "G3" "frontend throughput" ">= 500,000 LOC/s" "$(printf "%'d" $locs) LOC/s   ($lines lines in ${work_ms}ms)"
+
+# The other half of G3: an edit, in an editor, until its diagnostic. `grasm
+# lsp` re-checks the whole program on every change, so this is timed on the
+# largest program in the repository and the largest that imports. Load-
+# sensitive like everything else here; the median is the figure, and a p95
+# taken on a busy machine says more about the machine.
+if lsp=$(python3 scripts/lsp_latency.py "$GRASM" 2>&1 | tail -1); then
+    printf '%-4s %-34s %-22s %s\n' "G3" "edit-to-diagnostic (lsp)" "<= 50 ms" "${lsp#worst file: }"
+else
+    echo "error: could not time the language server: $lsp"
+    exit 1
+fi
 printf '%-4s %-34s %-22s %s\n' "" "incremental edit-to-diagnostic" "<= 50 ms" "not built (no query engine)"
 
 # ---------------------------------------------------------------- G5: size

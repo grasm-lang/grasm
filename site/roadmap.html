@@ -65,7 +65,7 @@ rendered when the site is written rather than summarised here.</p>
 <h2>2. Speed</h2>
 <p>0.45× native Rust today against a 0.95× target, computed by
 <code>scripts/bench.sh</code> from the numbers it prints. The costs worth
-attacking, in order: a box per node in tree-shaped data, binary size (328 KB
+attacking, in order: a box per node in tree-shaped data, binary size (350 KB
 against a 300 KB target), and the atomic reference count every boxed value
 carries because a <code>parallel</code> body may hold one.</p>
 
