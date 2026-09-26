@@ -56,6 +56,33 @@ row here to beat Zig outright. `parwords` is 1% ahead, which is inside what a
 parity, and text is now ahead of Rust and of C. Allocation is not, and neither
 is vectorised arithmetic.**
 
+### Since that table, 2026-09-23 to 26
+
+Interleaved A/B against the previous commit each time, not a new `bench.sh`
+table — the machine sat between load 6 and 160 for these three days, and the
+table above stands until a quiet one replaces it.
+
+| change | row | before | after | |
+| --- | --- | --- | --- | --- |
+| walk a field without counts (`62244d3`) | `tree` | 26.44 | 25.20 | 1.045x |
+| tail takes its last-read locals (`2c82398`) | `tree` | 25.01 | 24.34 | 1.03x |
+| first push onto `[]` skips copy-on-write (`5ce58a6`) | `tree` | 24.26 | 23.58 | 1.03x |
+| rotate a simple `while` (`520f481`) | `sieve` | 7.56 | 6.46 | 1.17x |
+
+**`sieve` is ahead of Rust and Zig, narrowly.** Forty-one interleaved runs at
+load 17: Grasm 6.95 ms, Rust 7.10, Zig 7.45. A 2% lead on a loaded machine is
+not a result to lean on; it is the first time the row has been ahead at all.
+
+**`tree` is 1.12x faster and still about 2.3x behind.** `total` now makes no
+reference-count call — `for k in n.kids` reads the list in place when the body
+never mentions `n`, and the one-level splice of `total(k)` binds `k` borrowed —
+and `build` makes none either, since `kids: kids` takes the local rather than
+copying it. What is left is the representation, as above: a box per node.
+
+**Rotating `for i in a..b` as well: noise on every row, dropped.** The loops
+where the extra jump would show are the unrolled ones, and those only reach the
+header for the remainder.
+
 ## What has been measured
 
 **A thread-local is a call on macOS.** `sample` on `tree` put `_tlv_get_addr`
@@ -1867,7 +1894,8 @@ no amount of runtime work touches it.
 
 ## What will not be claimed
 
-That Grasm matches Rust. It does not, on any row here except `sort`, and the
-rows where it is closest are the ones doing the least allocation. The numbers
+That Grasm matches Rust. `G2` is below its 0.95x target; the rows that are
+ahead — text, sorting, recursion, and now `sieve` narrowly — are the ones doing
+the least allocation, and `tree` and `matmul` are not close. The numbers
 are in `benchmarks/README.md` with the method beside them; anybody can rerun
 them on an idle machine.
