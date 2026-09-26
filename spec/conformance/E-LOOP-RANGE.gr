@@ -28,10 +28,25 @@
 //! 10 124578B
 //! 11 1245780B
 //! 12 12457801
+//! 1,2,4,5,7,8,10,11,
+//! 3
+//! 7
+//! 4 6
 // A counted loop is compiled four iterations at a time while four are left,
 // then one at a time for the remainder — so every trip count around that
 // four, both range forms, and both ways out of the body have to answer what
 // a loop compiled one iteration at a time would.
+// A `while` whose condition is tested again at the bottom of the body rather
+// than by jumping back to the top. `continue` has to reach that test and not
+// skip it, and a body that always leaves never reaches it at all.
+fn first_over(xs: [i64], limit: i64) -> i64 {
+    var i = 0
+    while i < xs.len() {
+        return xs[i] + limit
+    }
+    0 - 1
+}
+
 fn main() {
     var a = ""
     for i in 0..4 {
@@ -104,4 +119,32 @@ fn main() {
         }
         print("{m} {hit}")
     }
+
+    var w = 0
+    var line = ""
+    while w < 11 {
+        w += 1
+        if w % 3 == 0 {
+            continue
+        }
+        line += "{w},"
+    }
+    print(line)
+    print("{first_over([1, 2], 2)}")
+    let ys = [4, 9, 7, 0, 5]
+    var k = 0
+    while ys[k] != 0 and k < ys.len() {
+        if ys[k] == 7 {
+            break
+        }
+        k += 1
+    }
+    print("{ys[k]}")
+    var n = 0
+    var m = 0
+    while n < 4 {
+        n += 1
+        m = m + if n % 2 == 0 { 2 } else { 1 }
+    }
+    print("{n} {m}")
 }

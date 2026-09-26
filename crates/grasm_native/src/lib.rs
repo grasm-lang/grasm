@@ -5264,6 +5264,24 @@ fn inline_stmt_ok(st: &Stmt, budget: &mut i32, calls: &mut u32) -> bool {
     }
 }
 
+/// A `while` condition cheap and pure enough to emit twice: names, literals,
+/// arithmetic and comparisons, an index into a named list, and a named list's
+/// length. Nothing that allocates, so a second copy is only code.
+fn rotatable_cond(e: &Expr) -> bool {
+    match e {
+        Expr::Int(..) | Expr::Float(..) | Expr::Bool(..) | Expr::Ident(_) => true,
+        Expr::Unary { expr, .. } => rotatable_cond(expr),
+        Expr::Binary { lhs, rhs, .. } => rotatable_cond(lhs) && rotatable_cond(rhs),
+        Expr::Index { recv, index, .. } => {
+            matches!(**recv, Expr::Ident(_)) && rotatable_cond(index)
+        }
+        Expr::MethodCall { recv, name, args, .. } => {
+            name.name == "len" && args.is_empty() && matches!(**recv, Expr::Ident(_))
+        }
+        _ => false,
+    }
+}
+
 fn inline_expr_ok(e: &Expr, budget: &mut i32, calls: &mut u32) -> bool {
     *budget -= 1;
     if *budget < 0 {
@@ -7585,6 +7603,18 @@ impl FnCx<'_, '_> {
                 let header = self.b.create_block();
                 let body_blk = self.b.create_block();
                 let exit = self.b.create_block();
+                // A condition of a few loads and compares is tested again at
+                // the bottom of the body rather than by jumping back to the
+                // top, so each iteration is one conditional branch instead of
+                // a conditional and an unconditional one. Cranelift does not
+                // rotate loops itself: `sieve`'s inner `while j <= limit` was
+                // a test, the store, and a jump back to the test.
+                let rotate = rotatable_cond(cond);
+                let latch = if rotate {
+                    self.b.create_block()
+                } else {
+                    header
+                };
                 self.b.ins().jump(header, &[]);
                 self.filled = true;
                 self.goto_block(header);
@@ -7599,7 +7629,7 @@ impl FnCx<'_, '_> {
                 self.filled = true;
                 self.goto_block(body_blk);
                 self.loops
-                    .push((header, exit, self.vars.len(), self.handlers_installed));
+                    .push((latch, exit, self.vars.len(), self.handlers_installed));
                 let inner = self.eval_block_inner(body);
                 self.loops.pop();
                 self.pinned.pop();
@@ -7614,7 +7644,16 @@ impl FnCx<'_, '_> {
                 self.dec_block_tail(tail);
                 terminated |= self.is_filled();
                 if !terminated {
-                    self.b.ins().jump(header, &[]);
+                    self.b.ins().jump(latch, &[]);
+                    self.filled = true;
+                }
+                if rotate {
+                    // Reached by falling out of the body and by `continue`.
+                    // A body that always leaves leaves the latch unreached,
+                    // which is still a well-formed block.
+                    self.goto_block(latch);
+                    let (c2, _) = self.eval_expr_val(cond)?;
+                    self.b.ins().brif(c2, body_blk, &[], exit, &[]);
                     self.filled = true;
                 }
                 self.goto_block(exit);
