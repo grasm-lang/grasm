@@ -79,6 +79,15 @@ never mentions `n`, and the one-level splice of `total(k)` binds `k` borrowed â€
 and `build` makes none either, since `kids: kids` takes the local rather than
 copying it. What is left is the representation, as above: a box per node.
 
+**`[]` from a cached slot instead of a call: 0.96x, reverted.** Every leaf in
+`tree` calls `grasm_list_new` for its empty `kids`, which only returns the
+runtime's immortal empty list, so reading that pointer from a per-module slot
+looked like a free call per leaf. Forty-one interleaved runs against the
+commit before it, load 5: 24.00 ms against 25.13 min, 24.57 against 25.60
+median. The slot costs a load through the global's address and a branch on a
+split block, and the call it replaced was a few instructions that stayed hot.
+A call that returns a constant is not the cost it looks like.
+
 **Rotating `for i in a..b` as well: noise on every row, dropped.** The loops
 where the extra jump would show are the unrolled ones, and those only reach the
 header for the remainder.
