@@ -2036,6 +2036,8 @@ arguments nor the type this is bound to",
             borrowed_vars: std::collections::HashSet::new(),
             movable: std::collections::HashSet::new(),
             moved: std::collections::HashSet::new(),
+            unchecked_idx: std::collections::HashSet::new(),
+            version_guard_value: None,
             inline_depth: 0,
             inline_seq: 0,
         };
@@ -2705,6 +2707,8 @@ operation's",
             borrowed_vars: std::collections::HashSet::new(),
             movable: std::collections::HashSet::new(),
             moved: std::collections::HashSet::new(),
+            unchecked_idx: std::collections::HashSet::new(),
+            version_guard_value: None,
             inline_depth: 0,
             inline_seq: 0,
         };
@@ -2811,6 +2815,8 @@ operation's",
             borrowed_vars: std::collections::HashSet::new(),
             movable: std::collections::HashSet::new(),
             moved: std::collections::HashSet::new(),
+            unchecked_idx: std::collections::HashSet::new(),
+            version_guard_value: None,
             inline_depth: 0,
             inline_seq: 0,
         };
@@ -2960,6 +2966,8 @@ operation's",
             borrowed_vars: std::collections::HashSet::new(),
             movable: std::collections::HashSet::new(),
             moved: std::collections::HashSet::new(),
+            unchecked_idx: std::collections::HashSet::new(),
+            version_guard_value: None,
             inline_depth: 0,
             inline_seq: 0,
         };
@@ -3310,6 +3318,10 @@ struct FnCx<'a, 'm> {
     /// does not release. See `tail_moves`.
     movable: std::collections::HashSet<u32>,
     moved: std::collections::HashSet<u32>,
+    /// Index spans a versioned loop proved in bounds, for its unchecked copy.
+    unchecked_idx: std::collections::HashSet<(u32, u32)>,
+    /// The guard `version_guard` computed, taken by the loop it decides.
+    version_guard_value: Option<Value>,
     /// How many function bodies are currently spliced around this point, and
     /// a counter for the hidden names a splice binds its arguments to.
     inline_depth: u32,
@@ -5292,6 +5304,125 @@ fn rotatable_cond(e: &Expr) -> bool {
     }
 }
 
+/// Walks a loop body for `version_guard`: records the names the body assigns
+/// or binds, and each list index as (list, base, index span), where the index
+/// is `i` (no base) or `base + i` / `i + base`. `false` for anything it does
+/// not understand, which keeps the loop checked.
+fn affine_block(
+    b: &grasm_syntax::ast::Block,
+    i: &str,
+    assigned: &mut Vec<String>,
+    acc: &mut Vec<(String, Option<Expr>, (u32, u32))>,
+) -> bool {
+    b.stmts.iter().all(|st| match st {
+        Stmt::Let { name, init, .. } => {
+            assigned.push(name.name.clone());
+            affine_expr(init, i, assigned, acc)
+        }
+        Stmt::Assign { target, value, .. } => {
+            let target_ok = match target {
+                Expr::Ident(id) => {
+                    assigned.push(id.name.clone());
+                    true
+                }
+                Expr::Index { recv, index, .. } => match &**recv {
+                    Expr::Ident(id) => {
+                        assigned.push(id.name.clone());
+                        affine_index(&id.name, index, i, acc) && affine_expr(index, i, assigned, acc)
+                    }
+                    _ => false,
+                },
+                _ => false,
+            };
+            target_ok && affine_expr(value, i, assigned, acc)
+        }
+        Stmt::Expr(e) => affine_expr(e, i, assigned, acc),
+        _ => false,
+    })
+}
+
+fn affine_index(
+    list: &str,
+    index: &Expr,
+    i: &str,
+    acc: &mut Vec<(String, Option<Expr>, (u32, u32))>,
+) -> bool {
+    let sp = index.span();
+    let is_i = |e: &Expr| matches!(e, Expr::Ident(id) if id.name == i);
+    let base = match index {
+        e if is_i(e) => None,
+        Expr::Binary {
+            op: BinaryOp::Add,
+            lhs,
+            rhs,
+            ..
+        } if is_i(rhs) && pure_arith(lhs) => Some((**lhs).clone()),
+        Expr::Binary {
+            op: BinaryOp::Add,
+            lhs,
+            rhs,
+            ..
+        } if is_i(lhs) && pure_arith(rhs) => Some((**rhs).clone()),
+        _ => return false,
+    };
+    acc.push((list.to_string(), base, (sp.start, sp.end)));
+    true
+}
+
+/// Literals, names and `+ - *` of them: what a versioned index's base may be.
+fn pure_arith(e: &Expr) -> bool {
+    match e {
+        Expr::Int(..) | Expr::Ident(_) => true,
+        Expr::Binary {
+            op: BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul,
+            lhs,
+            rhs,
+            ..
+        } => pure_arith(lhs) && pure_arith(rhs),
+        _ => false,
+    }
+}
+
+fn affine_expr(
+    e: &Expr,
+    i: &str,
+    assigned: &mut Vec<String>,
+    acc: &mut Vec<(String, Option<Expr>, (u32, u32))>,
+) -> bool {
+    match e {
+        Expr::Int(..) | Expr::Float(..) | Expr::Bool(..) | Expr::Ident(_) => true,
+        Expr::Unary { expr, .. } => affine_expr(expr, i, assigned, acc),
+        Expr::Binary { lhs, rhs, .. } => {
+            affine_expr(lhs, i, assigned, acc) && affine_expr(rhs, i, assigned, acc)
+        }
+        Expr::Index { recv, index, .. } => match &**recv {
+            Expr::Ident(id) => {
+                affine_index(&id.name, index, i, acc) && affine_expr(index, i, assigned, acc)
+            }
+            _ => false,
+        },
+        Expr::If {
+            cond,
+            then_block,
+            else_branch,
+            ..
+        } => {
+            affine_expr(cond, i, assigned, acc)
+                && affine_block(then_block, i, assigned, acc)
+                && match else_branch.as_deref() {
+                    None => true,
+                    Some(grasm_syntax::ast::ElseBranch::Else(b)) => {
+                        affine_block(b, i, assigned, acc)
+                    }
+                    Some(grasm_syntax::ast::ElseBranch::ElseIf(e)) => {
+                        affine_expr(e, i, assigned, acc)
+                    }
+                }
+        }
+        _ => false,
+    }
+}
+
 fn inline_expr_ok(e: &Expr, budget: &mut i32, calls: &mut u32) -> bool {
     *budget -= 1;
     if *budget < 0 {
@@ -6537,6 +6668,25 @@ impl FnCx<'_, '_> {
         }
     }
 
+    /// `pinned_address`, unless a versioned loop has already proved this
+    /// index in bounds for every iteration -- the guard in `version_guard`
+    /// is what keeps the check's promise there.
+    fn pinned_address_at(
+        &mut self,
+        data: Value,
+        len: Value,
+        idx: Value,
+        stride: i64,
+        at: Span,
+    ) -> Value {
+        if self.unchecked_idx.contains(&(at.start, at.end)) {
+            let w = self.b.ins().iconst(types::I64, stride);
+            let off = self.b.ins().imul(idx, w);
+            return self.b.ins().iadd(data, off);
+        }
+        self.pinned_address(data, len, idx, stride)
+    }
+
     fn pinned_address(&mut self, data: Value, len: Value, idx: Value, stride: i64) -> Value {
         let ok = self.b.create_block();
         let oob = self.b.create_block();
@@ -7243,7 +7393,13 @@ impl FnCx<'_, '_> {
                                     val = self.b.ins().fcvt_from_sint(types::F64, val);
                                 }
                                 let (iv, _) = self.index_value(ix)?;
-                                let addr = self.pinned_address(data, len, iv, stride_of(&elem_t));
+                                let addr = self.pinned_address_at(
+                                    data,
+                                    len,
+                                    iv,
+                                    stride_of(&elem_t),
+                                    ix.span(),
+                                );
                                 let flags = cranelift_codegen::ir::MemFlags::trusted();
                                 let final_v = if *op == AssignOp::Assign {
                                     val
@@ -7976,6 +8132,274 @@ this case",
         }
     }
 
+    /// A counted loop over `ivar` up to `end_var`: four iterations at a time
+    /// while four are left when the body allows it, then one at a time. Leaves
+    /// the builder in the loop's exit block. Emitted twice when the loop is
+    /// versioned, which is why the pinned lists are the caller's to release.
+    fn emit_range_loop(
+        &mut self,
+        ivar: Variable,
+        end_var: Variable,
+        loop_var: &Ident,
+        body: &grasm_syntax::ast::Block,
+        inclusive: bool,
+    ) -> CResult<()> {
+        let header = self.b.create_block();
+        let body_blk = self.b.create_block();
+        let step = self.b.create_block();
+        let exit = self.b.create_block();
+        // Four iterations at a time while four are left, then the
+        // ordinary loop for what remains.
+        //
+        // Cranelift does not unroll, and this loop is where that shows:
+        // `matmul`'s inner statement is thirteen instructions of work
+        // behind four of bookkeeping, and unrolling it by four in the
+        // source was worth 1.37x. It is not only the bookkeeping — the
+        // same probe showed the loop is short of memory operations in
+        // flight rather than issue slots, and four copies give the core
+        // four independent addresses to work on.
+        //
+        // `break` and `continue` need no special handling: `break` goes
+        // to the exit as it always did, and `continue` goes to the
+        // remainder loop's step, which increments and carries on there —
+        // the same iterations in the same order, just no longer unrolled.
+        // No calls, and the rule is a measurement. `tree`'s inner loop
+        // is `kids.push(build(...))` three times over: the call dwarfs
+        // the loop's own bookkeeping, so unrolling buys nothing there and
+        // the four copies of the body cost 1.05x in instruction cache.
+        // Where the bookkeeping is a real share of the work — a loop of
+        // arithmetic and indexing — it is worth it.
+        let mut budget = UNROLL_BUDGET;
+        let mut calls = 0;
+        let unrolled = body
+            .stmts
+            .iter()
+            .all(|st| inline_stmt_ok(st, &mut budget, &mut calls))
+            && calls == 0;
+        if unrolled {
+            let uhead = self.b.create_block();
+            let ubody = self.b.create_block();
+            // `i + 4 <= end` decides whether four more fit, and it is
+            // written as `i <= end - 4` so that nothing overflows: `end`
+            // is at most `i64::MAX`, so `end - 4` is exact whenever it
+            // does not underflow, and that is what the first test asks.
+            let ev0 = self.b.use_var(end_var);
+            let room = self.b.ins().icmp_imm(
+                IntCC::SignedGreaterThanOrEqual,
+                ev0,
+                i64::MIN + UNROLL_BY,
+            );
+            let lim = self.b.ins().iadd_imm(ev0, -UNROLL_BY);
+            let limvar = self.new_var(&VType::I64);
+            self.b.def_var(limvar, lim);
+            self.b.ins().brif(room, uhead, &[], header, &[]);
+            self.filled = true;
+
+            self.goto_block(uhead);
+            let iv0 = self.b.use_var(ivar);
+            let lv0 = self.b.use_var(limvar);
+            let fits = self
+                .b
+                .ins()
+                .icmp(IntCC::SignedLessThanOrEqual, iv0, lv0);
+            self.b.ins().brif(fits, ubody, &[], header, &[]);
+            self.filled = true;
+
+            self.goto_block(ubody);
+            // Each copy's index is `base + k` rather than one more than
+            // the copy before it. Chaining the increments left the four
+            // addresses dependent on each other and measured 1.03x on
+            // `matmul` where the same unrolling written out by hand in
+            // the source measured 1.37x: what the loop is short of is
+            // memory operations in flight, and a dependent address
+            // cannot issue early. Writing it back into the loop variable
+            // is what keeps `continue` right, since the remainder loop's
+            // step increments from wherever the body left it.
+            let base = self.b.use_var(ivar);
+            self.push_scope();
+            self.bind(&loop_var.name, ivar, VType::I64);
+            self.loops
+                .push((step, exit, self.vars.len(), self.handlers_installed));
+            let mut term = false;
+            let mut failed: Option<Unsupported> = None;
+            for k in 0..UNROLL_BY {
+                if term || failed.is_some() {
+                    break;
+                }
+                let cur = self.b.ins().iadd_imm(base, k);
+                self.b.def_var(ivar, cur);
+                match self.eval_block_inner(body) {
+                    Ok((tail, t)) => {
+                        self.dec_block_tail(tail);
+                        term = t || self.is_filled();
+                    }
+                    Err(e) => failed = Some(e),
+                }
+            }
+            self.loops.pop();
+            self.pop_scope_no_decs();
+            if let Some(e) = failed {
+                return Err(e);
+            }
+            if !term {
+                let nx = self.b.ins().iadd_imm(base, UNROLL_BY);
+                self.b.def_var(ivar, nx);
+                self.b.ins().jump(uhead, &[]);
+                self.filled = true;
+            }
+        } else {
+            self.b.ins().jump(header, &[]);
+            self.filled = true;
+        }
+        self.goto_block(header);
+        let iv = self.b.use_var(ivar);
+        let ev = self.b.use_var(end_var);
+        let cc = if inclusive {
+            IntCC::SignedLessThanOrEqual
+        } else {
+            IntCC::SignedLessThan
+        };
+        let c = self.b.ins().icmp(cc, iv, ev);
+        self.b.ins().brif(c, body_blk, &[], exit, &[]);
+        self.filled = true;
+
+        self.goto_block(body_blk);
+        self.push_scope();
+        self.bind(&loop_var.name, ivar, VType::I64);
+        self.loops
+            .push((step, exit, self.vars.len(), self.handlers_installed));
+        let inner = self.eval_block_inner(body);
+        self.loops.pop();
+        let (tail, mut terminated) = inner?;
+        // Statement position, as for `while` above (F92).
+        self.dec_block_tail(tail);
+        terminated |= self.is_filled();
+        self.pop_scope_no_decs(); // loop var is scalar
+        if !terminated {
+            self.b.ins().jump(step, &[]);
+            self.filled = true;
+        }
+        self.goto_block(step);
+        let iv2 = self.b.use_var(ivar);
+        // An inclusive range stops *before* incrementing past its end.
+        // Incrementing first and re-testing `i <= end` spins forever when
+        // the end is `i64::MAX`: the add wraps to `i64::MIN`, which is
+        // still `<= end`. The exclusive form cannot reach that, because
+        // its last value is one below the end.
+        if inclusive {
+            let ev2 = self.b.use_var(end_var);
+            let done = self.b.ins().icmp(IntCC::Equal, iv2, ev2);
+            let bump = self.b.create_block();
+            self.b.ins().brif(done, exit, &[], bump, &[]);
+            self.filled = true;
+            self.goto_block(bump);
+        }
+        let one = self.b.ins().iconst(types::I64, 1);
+        let next = self.b.ins().iadd(iv2, one);
+        self.b.def_var(ivar, next);
+        self.b.ins().jump(header, &[]);
+        self.filled = true;
+        self.goto_block(exit);
+        Ok(())
+    }
+
+    /// Whether a counted loop can run without a bounds check per element:
+    /// if so, the index spans that may skip it, with the guard that decides
+    /// at run time left in `version_guard_value`.
+    ///
+    /// Every read or write of a pinned list in the body has to index it by
+    /// `i` or `base + i`, where `base` is literals, arithmetic and names the
+    /// body never assigns or rebinds. Then every index the loop will use lies
+    /// between `base + start` and `base + end - 1`, and checking those two
+    /// against the list's length -- which a pinned list cannot change during
+    /// the loop -- checks them all. A body with any other shape of access, a
+    /// nested loop or a call is not versioned.
+    ///
+    /// `GRASM_NO_VERSION=1`, read here at compile time, turns it off, so the
+    /// same program can be built both ways and timed against itself.
+    fn version_guard(
+        &mut self,
+        loop_var: &Ident,
+        body: &grasm_syntax::ast::Block,
+        ivar: Variable,
+        end_var: Variable,
+        inclusive: bool,
+    ) -> CResult<Option<Vec<(u32, u32)>>> {
+        if std::env::var("GRASM_NO_VERSION").is_ok_and(|v| v == "1") {
+            return Ok(None);
+        }
+        let mut assigned: Vec<String> = Vec::new();
+        let mut accesses: Vec<(String, Option<Expr>, (u32, u32))> = Vec::new();
+        if !affine_block(body, &loop_var.name, &mut assigned, &mut accesses) || accesses.is_empty() {
+            return Ok(None);
+        }
+        let mut lens: Vec<Value> = Vec::with_capacity(accesses.len());
+        for (name, base, _) in &accesses {
+            match self.pinned_list(name) {
+                Some((_, len, _)) => lens.push(len),
+                None => return Ok(None),
+            }
+            if let Some(b) = base {
+                let mut names = Vec::new();
+                collect_idents(b, &mut names);
+                if names.iter().any(|n| n == &loop_var.name || assigned.contains(n)) {
+                    return Ok(None);
+                }
+                // A name in the base must be a plain integer local: a pinned
+                // list or anything else reads differently here than it would.
+                for n in &names {
+                    if !matches!(self.lookup(n), Some((_, VType::I64))) {
+                        return Ok(None);
+                    }
+                }
+            }
+        }
+        // Every value entering the arithmetic below is kept within 2^61 of
+        // zero, so no sum here can overflow: a range or a base outside that
+        // simply takes the checked loop.
+        let lim = 1i64 << 61;
+        let s0 = self.b.use_var(ivar);
+        let e0 = self.b.use_var(end_var);
+        let small = |me: &mut Self, v: Value| -> Value {
+            let shifted = me.b.ins().iadd_imm(v, lim);
+            me.b.ins().icmp_imm(IntCC::UnsignedLessThan, shifted, 2 * lim)
+        };
+        let s_ok = small(self, s0);
+        let e_ok = small(self, e0);
+        let mut ok = self.b.ins().band(s_ok, e_ok);
+        // The last index the loop reaches.
+        let last = if inclusive { e0 } else { self.b.ins().iadd_imm(e0, -1) };
+        for ((_, base, _), len) in accesses.iter().zip(&lens) {
+            let (lo, hi) = match base {
+                Some(b) => {
+                    let (bv, bt) = self.eval_expr_val(b)?;
+                    if bt != VType::I64 {
+                        return Ok(None);
+                    }
+                    let b_ok = small(self, bv);
+                    ok = self.b.ins().band(ok, b_ok);
+                    (self.b.ins().iadd(bv, s0), self.b.ins().iadd(bv, last))
+                }
+                None => (s0, last),
+            };
+            let lo_ok = self.b.ins().icmp_imm(IntCC::SignedGreaterThanOrEqual, lo, 0);
+            let hi_ok = self.b.ins().icmp(IntCC::SignedLessThan, hi, *len);
+            ok = self.b.ins().band(ok, lo_ok);
+            ok = self.b.ins().band(ok, hi_ok);
+        }
+        // A loop that runs no iterations indexes nothing, so either copy is
+        // right; the unchecked one is taken for it like any other.
+        let cc = if inclusive {
+            IntCC::SignedGreaterThan
+        } else {
+            IntCC::SignedGreaterThanOrEqual
+        };
+        let empty = self.b.ins().icmp(cc, s0, e0);
+        let guard = self.b.ins().bor(ok, empty);
+        self.version_guard_value = Some(guard);
+        Ok(Some(accesses.into_iter().map(|(_, _, sp)| sp).collect()))
+    }
+
     fn eval_for(
         &mut self,
         loop_var: &Ident,
@@ -8004,164 +8428,42 @@ this case",
             // for its whole extent so each access is a load, not a call.
             self.pin_loop_lists_with(body, &[start, end])?;
 
-            let header = self.b.create_block();
-            let body_blk = self.b.create_block();
-            let step = self.b.create_block();
-            let exit = self.b.create_block();
-            // Four iterations at a time while four are left, then the
-            // ordinary loop for what remains.
-            //
-            // Cranelift does not unroll, and this loop is where that shows:
-            // `matmul`'s inner statement is thirteen instructions of work
-            // behind four of bookkeeping, and unrolling it by four in the
-            // source was worth 1.37x. It is not only the bookkeeping — the
-            // same probe showed the loop is short of memory operations in
-            // flight rather than issue slots, and four copies give the core
-            // four independent addresses to work on.
-            //
-            // `break` and `continue` need no special handling: `break` goes
-            // to the exit as it always did, and `continue` goes to the
-            // remainder loop's step, which increments and carries on there —
-            // the same iterations in the same order, just no longer unrolled.
-            // No calls, and the rule is a measurement. `tree`'s inner loop
-            // is `kids.push(build(...))` three times over: the call dwarfs
-            // the loop's own bookkeeping, so unrolling buys nothing there and
-            // the four copies of the body cost 1.05x in instruction cache.
-            // Where the bookkeeping is a real share of the work — a loop of
-            // arithmetic and indexing — it is worth it.
-            let mut budget = UNROLL_BUDGET;
-            let mut calls = 0;
-            let unrolled = body
-                .stmts
-                .iter()
-                .all(|st| inline_stmt_ok(st, &mut budget, &mut calls))
-                && calls == 0;
-            if unrolled {
-                let uhead = self.b.create_block();
-                let ubody = self.b.create_block();
-                // `i + 4 <= end` decides whether four more fit, and it is
-                // written as `i <= end - 4` so that nothing overflows: `end`
-                // is at most `i64::MAX`, so `end - 4` is exact whenever it
-                // does not underflow, and that is what the first test asks.
-                let ev0 = self.b.use_var(end_var);
-                let room = self.b.ins().icmp_imm(
-                    IntCC::SignedGreaterThanOrEqual,
-                    ev0,
-                    i64::MIN + UNROLL_BY,
-                );
-                let lim = self.b.ins().iadd_imm(ev0, -UNROLL_BY);
-                let limvar = self.new_var(&VType::I64);
-                self.b.def_var(limvar, lim);
-                self.b.ins().brif(room, uhead, &[], header, &[]);
-                self.filled = true;
-
-                self.goto_block(uhead);
-                let iv0 = self.b.use_var(ivar);
-                let lv0 = self.b.use_var(limvar);
-                let fits = self
-                    .b
-                    .ins()
-                    .icmp(IntCC::SignedLessThanOrEqual, iv0, lv0);
-                self.b.ins().brif(fits, ubody, &[], header, &[]);
-                self.filled = true;
-
-                self.goto_block(ubody);
-                // Each copy's index is `base + k` rather than one more than
-                // the copy before it. Chaining the increments left the four
-                // addresses dependent on each other and measured 1.03x on
-                // `matmul` where the same unrolling written out by hand in
-                // the source measured 1.37x: what the loop is short of is
-                // memory operations in flight, and a dependent address
-                // cannot issue early. Writing it back into the loop variable
-                // is what keeps `continue` right, since the remainder loop's
-                // step increments from wherever the body left it.
-                let base = self.b.use_var(ivar);
-                self.push_scope();
-                self.bind(&loop_var.name, ivar, VType::I64);
-                self.loops
-                    .push((step, exit, self.vars.len(), self.handlers_installed));
-                let mut term = false;
-                let mut failed: Option<Unsupported> = None;
-                for k in 0..UNROLL_BY {
-                    if term || failed.is_some() {
-                        break;
-                    }
-                    let cur = self.b.ins().iadd_imm(base, k);
-                    self.b.def_var(ivar, cur);
-                    match self.eval_block_inner(body) {
-                        Ok((tail, t)) => {
-                            self.dec_block_tail(tail);
-                            term = t || self.is_filled();
-                        }
-                        Err(e) => failed = Some(e),
-                    }
-                }
-                self.loops.pop();
-                self.pop_scope_no_decs();
-                if let Some(e) = failed {
-                    self.pinned.pop();
-                    return Err(e);
-                }
-                if !term {
-                    let nx = self.b.ins().iadd_imm(base, UNROLL_BY);
-                    self.b.def_var(ivar, nx);
-                    self.b.ins().jump(uhead, &[]);
+            // Versioned when every index into a pinned list is the loop
+            // variable plus something the body cannot change: the bounds of
+            // the whole range are checked once, before the loop, and a copy
+            // of it runs with no check per element. Otherwise -- or when that
+            // check fails, so a panic still lands on the element that caused
+            // it -- this is the loop it always was.
+            let out = match self.version_guard(loop_var, body, ivar, end_var, *inclusive) {
+                Ok(Some(spans)) => {
+                    let fast = self.b.create_block();
+                    let slow = self.b.create_block();
+                    let join = self.b.create_block();
+                    let guard = self.version_guard_value.take().expect("guard computed");
+                    self.b.ins().brif(guard, fast, &[], slow, &[]);
                     self.filled = true;
+                    self.goto_block(fast);
+                    self.unchecked_idx.extend(spans.iter().copied());
+                    let r = self.emit_range_loop(ivar, end_var, loop_var, body, *inclusive);
+                    for sp in &spans {
+                        self.unchecked_idx.remove(sp);
+                    }
+                    r.and_then(|()| {
+                        self.b.ins().jump(join, &[]);
+                        self.filled = true;
+                        self.goto_block(slow);
+                        self.emit_range_loop(ivar, end_var, loop_var, body, *inclusive)?;
+                        self.b.ins().jump(join, &[]);
+                        self.filled = true;
+                        self.goto_block(join);
+                        Ok(())
+                    })
                 }
-            } else {
-                self.b.ins().jump(header, &[]);
-                self.filled = true;
-            }
-            self.goto_block(header);
-            let iv = self.b.use_var(ivar);
-            let ev = self.b.use_var(end_var);
-            let cc = if *inclusive {
-                IntCC::SignedLessThanOrEqual
-            } else {
-                IntCC::SignedLessThan
+                Ok(None) => self.emit_range_loop(ivar, end_var, loop_var, body, *inclusive),
+                Err(e) => Err(e),
             };
-            let c = self.b.ins().icmp(cc, iv, ev);
-            self.b.ins().brif(c, body_blk, &[], exit, &[]);
-            self.filled = true;
-
-            self.goto_block(body_blk);
-            self.push_scope();
-            self.bind(&loop_var.name, ivar, VType::I64);
-            self.loops
-                .push((step, exit, self.vars.len(), self.handlers_installed));
-            let inner = self.eval_block_inner(body);
-            self.loops.pop();
             self.pinned.pop();
-            let (tail, mut terminated) = inner?;
-            // Statement position, as for `while` above (F92).
-            self.dec_block_tail(tail);
-            terminated |= self.is_filled();
-            self.pop_scope_no_decs(); // loop var is scalar
-            if !terminated {
-                self.b.ins().jump(step, &[]);
-                self.filled = true;
-            }
-            self.goto_block(step);
-            let iv2 = self.b.use_var(ivar);
-            // An inclusive range stops *before* incrementing past its end.
-            // Incrementing first and re-testing `i <= end` spins forever when
-            // the end is `i64::MAX`: the add wraps to `i64::MIN`, which is
-            // still `<= end`. The exclusive form cannot reach that, because
-            // its last value is one below the end.
-            if *inclusive {
-                let ev2 = self.b.use_var(end_var);
-                let done = self.b.ins().icmp(IntCC::Equal, iv2, ev2);
-                let bump = self.b.create_block();
-                self.b.ins().brif(done, exit, &[], bump, &[]);
-                self.filled = true;
-                self.goto_block(bump);
-            }
-            let one = self.b.ins().iconst(types::I64, 1);
-            let next = self.b.ins().iadd(iv2, one);
-            self.b.def_var(ivar, next);
-            self.b.ins().jump(header, &[]);
-            self.filled = true;
-            self.goto_block(exit);
+            out?;
             self.close_loop_appends();
             return Ok(StmtOut::Value(None));
         }
@@ -8869,7 +9171,7 @@ this case",
                         if it != VType::I64 {
                             return nope(index.span(), "non-integer index");
                         }
-                        let addr = self.pinned_address(data, len, iv, stride_of(&pt));
+                        let addr = self.pinned_address_at(data, len, iv, stride_of(&pt), index.span());
                         let flags = cranelift_codegen::ir::MemFlags::trusted();
                         let v = self.b.ins().load(pt.cl(), flags, addr, 0);
                         return Ok(Some((v, pt)));
