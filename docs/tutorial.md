@@ -181,6 +181,61 @@ fn main() {
 }
 ```
 
+## 3a. Interfaces
+
+A generic function works on any type — which means that inside it, a `T` can
+do almost nothing, because nothing is known about it. An `interface` names
+what a type must provide, and a bound says a type parameter provides it:
+
+```
+interface Show {
+    fn show(self) -> str
+}
+
+type Point = { x: i64, y: i64 }
+
+impl Show for Point {
+    fn show(self) -> str {
+        "({self.x}, {self.y})"
+    }
+}
+
+impl Show for i64 {
+    fn show(self) -> str {
+        "#{self}"
+    }
+}
+
+fn all_shown[T: Show](xs: [T]) -> str {
+    var out = ""
+    for x in xs {
+        out += x.show() + " "
+    }
+    out
+}
+
+fn main() {
+    print(all_shown([Point{ x: 1, y: 2 }, Point{ x: 3, y: 4 }]))
+    print(all_shown([7, 8]))
+}
+```
+
+`self` is the value the method is called on, and `Self` in an interface means
+"the implementing type". The method is chosen by the receiver's type, so
+`Point` and `i64` can each have a `show`.
+
+The bound is checked where the function is written, not where it is used:
+`x.show()` in a function declared `[T]` rather than `[T: Show]` is an error
+even if every caller happens to pass something showable. And a call with a
+type that has no `impl` is refused at that call, by name — "`Dog` does not
+implement `Show`" — rather than somewhere inside the generic function.
+
+Two limits for now, both refused with a message: an `impl` is for a declared
+non-generic type or for `i64`, `f64`, `bool` or `str`; and an interface method
+performs no effects, so an `impl` method cannot print. The second is what lets
+a generic function's own effect row stay honest without knowing which `impl`
+it will reach.
+
 ## 4. Errors are values
 
 There are no exceptions. A function that can fail says so in its type with

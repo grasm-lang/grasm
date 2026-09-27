@@ -1061,6 +1061,22 @@ once inside `main`",
                     .map(|m| format!("`{m}`"))
                     .collect::<Vec<_>>()
                     .join(", ");
+                // An `impl` method, lowered to `method@Type`: said in the
+                // words the source used ([T-INTERFACE-PURE]).
+                if let Some((method, ty)) = f.name.name.split_once('@') {
+                    diags.push(
+                        Diagnostic::error(
+                            f.name.span,
+                            format!(
+                                "`{method}` for `{ty}` performs {list}, and an interface method performs nothing"
+                            ),
+                        )
+                        .with_help(
+                            "move the effect to the caller, or handle it inside the method ([T-INTERFACE-PURE])",
+                        ),
+                    );
+                    continue;
+                }
                 diags.push(
                     Diagnostic::error(
                         f.name.span,

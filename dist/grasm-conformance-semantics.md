@@ -48,6 +48,12 @@ fn main() {
 //! -9223372036854775808
 //! 0
 //! 7 0 -7
+//! -17: -8,-1 -4,-1 0,-17 -17,0 8,-1 4,-1 0,-17 17,0
+//! -8: -4,0 -2,0 0,-8 -8,0 4,0 2,0 0,-8 8,0
+//! -1: 0,-1 0,-1 0,-1 -1,0 0,-1 0,-1 0,-1 1,0
+//! 0: 0,0 0,0 0,0 0,0 0,0 0,0 0,0 0,0
+//! 7: 3,1 1,3 0,7 7,0 -3,1 -1,3 0,7 -7,0
+//! 4611686018427387904: 2305843009213693952,0 1152921504606846976,0 4503599627370496,0 4611686018427387904,0 -2305843009213693952,0 -1152921504606846976,0 -4503599627370496,0 -4611686018427387904,0
 fn main() {
     print("{2 + 3 * 4}")
     // Wrapping on overflow, two's complement.
@@ -64,6 +70,18 @@ fn main() {
     print("{min % -1}")
 
     print("{-7 / -1} {-7 % -1} {7 / -1}")
+
+    // A *constant* divisor that is a power of two is compiled as shifts
+    // rather than as a divide, and the truncation has to come out the same:
+    // `/` rounds toward zero and `%` takes the sign of the dividend, so a
+    // negative dividend needs a bias the shift does not supply by itself.
+    // Both signs of divisor, because `x % -d` is `x % d` and `x / -d` is not.
+    for x in [-17, -8, -1, 0, 7, 4611686018427387904] {
+        let a = "{x / 2},{x % 2} {x / 4},{x % 4} {x / 1024},{x % 1024}"
+        let b = "{x / 1},{x % 1} {x / -2},{x % -2} {x / -4},{x % -4}"
+        let c = "{x / -1024},{x % -1024} {x / -1},{x % -1}"
+        print("{x}: {a} {b} {c}")
+    }
 }
 ```
 
@@ -585,11 +603,15 @@ fn main() {
 //! N 7
 //! 15 -1
 //! 25
+//! -1 -1
+//! -1 -1
+//! 11 22
 //! 0 -> err z
 //! 1 -> 100
 //! 2 -> 50
 // A branch that leaves — `fail`, `panic`, `return` — has no value, so the
-// `if` is worth whatever the *other* branch produced.
+// `if` is worth whatever the *other* branch produced, and when *both* leave
+// it is worth nothing at all.
 //
 // Taking the type from the then branch alone meant `if c { fail(e) } else
 // { v }` in tail position had no merge value at all: the compiled function
@@ -630,6 +652,39 @@ fn chain(y: i64) -> i64 ! E {
     }
 }
 
+/// Both branches leave, so the `if` produces nothing and there is nothing to
+/// bind. The statement has to stop there: binding a placeholder wrote
+/// instructions into a block control had already left, and the backend
+/// reported its own verifier error as a codegen bug.
+fn both_bound(y: i64) -> i64 ! E {
+    let v: i64 ! E = if y == 0 {
+        fail(E{ c: "a" })
+    } else {
+        fail(E{ c: "b" })
+    }
+    v
+}
+
+/// The same shape where the `if` is returned rather than bound, which is
+/// where this was first found and fixed.
+fn both_returned(y: i64) -> i64 ! E {
+    return if y == 0 {
+        fail(E{ c: "a" })
+    } else {
+        fail(E{ c: "b" })
+    }
+}
+
+/// And where both branches `return` outright.
+fn both_left(y: i64) -> i64 {
+    let v = if y == 0 {
+        return 11
+    } else {
+        return 22
+    }
+    v
+}
+
 fn main() {
     print("{fi(4) ?? 0 - 1} {fs(2) ?? "?"} {ff(4) ?? 0.0} {fb(2) ?? false}")
     match fv(7) {
@@ -644,6 +699,10 @@ fn main() {
     // `??` groups to the right, so the layered unwrap — an `Option` of a
     // fallible value — says so with brackets.
     print("{(m.get("a") ?? fi(1)) ?? 0 - 1}")
+    // Both branches leaving, bound and returned and left outright.
+    print("{both_bound(0) ?? 0 - 1} {both_bound(3) ?? 0 - 1}")
+    print("{both_returned(0) ?? 0 - 1} {both_returned(3) ?? 0 - 1}")
+    print("{both_left(0)} {both_left(3)}")
     // And the whole shape end to end.
     for n in [0, 1, 2] {
         match fi(n) {
@@ -940,6 +999,54 @@ fn main() {
 //! alpha beta gamma
 //! 6
 //! 0
+//! [0, 1, 10, 11]
+//! [0, 1, 2, 3, 4]
+//! 5 [0, 1, 2]
+//! 60 3
+//! 1 2 3
+//! 120 3
+//! 1 2 3
+//! 20 2
+//! 14
+//! 6 0
+//! 201 101 102
+type Cell = { v: i64 }
+
+/// Every mention of `c` is a field read, so the loop may lend its element.
+fn peek(c: Cell) -> i64 {
+    c.v * 10
+}
+
+/// Mentions `c` bare, so it is not inferred read-only and the loop has to hand
+/// over a reference rather than a loan. ([T-MOVE-LOOP] refuses `own` here
+/// outright -- a moved element would be gone by the next iteration -- so this
+/// is the shape that actually distinguishes the two paths.)
+fn stash(c: Cell) -> i64 {
+    let held = [c]
+    held[0].v * 20
+}
+
+/// A walk over a field: `for k in n.kids` reads the list off the node in
+/// place, and the recursive call is spliced with `k` lent to it.
+type Tree = { v: i64, kids: [Tree] }
+
+fn sum_tree(n: Tree) -> i64 {
+    var s = n.v
+    for k in n.kids {
+        s = s + sum_tree(k)
+    }
+    s
+}
+
+type Holder = { items: [Cell] }
+
+/// Lent parameters bound straight to the caller's locals, where the names
+/// cross: `pair(b, a)` must not let the first binding change what the second
+/// argument reads.
+fn pair(a: Cell, b: Cell) -> i64 {
+    a.v * 100 + b.v
+}
+
 fn main() {
     // The loop variable is the element itself, not an index.
     let words = ["alpha", "beta", "gamma"]
@@ -962,6 +1069,93 @@ fn main() {
         count = count + 1
     }
     print("{count}")
+
+    // A list filled from a *nested* loop.
+    //
+    // The compiled backend holds a list's buffer open for the loop that fills
+    // it, so a push is a store rather than a call. Two loops filling the same
+    // list each held their own length, and the outer one closed last with the
+    // length it took before the inner loop ran — so this came out empty.
+    var pairs: [i64] = []
+    for i in 0..2 {
+        for j in 0..2 {
+            pairs.push(i * 10 + j)
+        }
+    }
+    print("{pairs}")
+
+    // A loop whose *condition* reads the list it fills.
+    //
+    // The same optimisation keeps the length in a register until the loop
+    // ends. `k.len()` in the condition then read the length the list had
+    // before the first push, every time, and the loop never finished.
+    var k: [i64] = []
+    while k.len() < 5 {
+        k.push(k.len())
+    }
+    print("{k}")
+
+    // And a list read *after* the loop that filled it knows how long it is.
+    var made: [i64] = []
+    for i in 0..3 {
+        made.push(i)
+    }
+    print("{made.len() + 2} {made}")
+
+    // A loop over boxed elements lends each one rather than taking a
+    // reference to it: the list holds the element open for the whole body, so
+    // the +1 and the -1 buy nothing. What must not change is the answer, or
+    // the list, or who owns what.
+    let cells = [Cell{ v: 1 }, Cell{ v: 2 }, Cell{ v: 3 }]
+    var sum = 0
+    for c in cells {
+        sum = sum + peek(c)
+    }
+    // The list is untouched by having been walked.
+    print("{sum} {cells.len()}")
+    print("{cells[0].v} {cells[1].v} {cells[2].v}")
+
+    // The same loop where the callee keeps what it is given. Lending here
+    // would hand out something the list still holds, so the loop gives a
+    // reference instead — and the list still comes out whole.
+    var kept = 0
+    for c in cells {
+        kept = kept + stash(c)
+    }
+    print("{kept} {cells.len()}")
+    print("{cells[0].v} {cells[1].v} {cells[2].v}")
+
+    // Leaving the body early releases nothing that was only lent.
+    var seen = 0
+    for c in cells {
+        if c.v == 3 {
+            break
+        }
+        if c.v == 1 {
+            continue
+        }
+        seen = seen + peek(c)
+    }
+    print("{seen} {cells.len() - 1}")
+
+    // Walked through a field, recursively.
+    let leaf = Tree{ v: 3, kids: [] }
+    let t = Tree{ v: 1, kids: [Tree{ v: 2, kids: [leaf, leaf] }, Tree{ v: 5, kids: [] }] }
+    print("{sum_tree(t)}")
+
+    // A body that replaces the struct it is walking cannot be lent the list:
+    // the old list has to survive until the loop is done with it.
+    var h = Holder{ items: [Cell{ v: 1 }, Cell{ v: 2 }, Cell{ v: 3 }] }
+    var got = 0
+    for c in h.items {
+        h = Holder{ items: [] }
+        got = got + c.v
+    }
+    print("{got} {h.items.len()}")
+
+    let a = Cell{ v: 1 }
+    let b = Cell{ v: 2 }
+    print("{pair(b, a)} {pair(a, a)} {pair(a, b)}")
 }
 ```
 
@@ -1021,6 +1215,50 @@ fn main() {
 //! 0123
 //! 01234
 //! empty
+//! 0 [] [0]
+//! 1 [0] [01]
+//! 2 [01] [012]
+//! 3 [012] [0123]
+//! 4 [0123] [01234]
+//! 5 [01234] [012345]
+//! 6 [012345] [0123456]
+//! 7 [0123456] [01234567]
+//! 8 [01234567] [012345678]
+//! 9 [012345678] [0123456789]
+//! 3 4
+//! -5 0
+//! 0 B
+//! 1 B
+//! 2 1B
+//! 3 12B
+//! 4 12B
+//! 5 124B
+//! 6 1245B
+//! 7 1245B
+//! 8 12457B
+//! 9 124578B
+//! 10 124578B
+//! 11 1245780B
+//! 12 12457801
+//! 1,2,4,5,7,8,10,11,
+//! 3
+//! 7
+//! 4 6
+// A counted loop is compiled four iterations at a time while four are left,
+// then one at a time for the remainder — so every trip count around that
+// four, both range forms, and both ways out of the body have to answer what
+// a loop compiled one iteration at a time would.
+// A `while` whose condition is tested again at the bottom of the body rather
+// than by jumping back to the top. `continue` has to reach that test and not
+// skip it, and a body that always leaves never reaches it at all.
+fn first_over(xs: [i64], limit: i64) -> i64 {
+    var i = 0
+    while i < xs.len() {
+        return xs[i] + limit
+    }
+    0 - 1
+}
+
 fn main() {
     var a = ""
     for i in 0..4 {
@@ -1039,6 +1277,88 @@ fn main() {
     if n == 0 {
         print("empty")
     }
+
+    // Every trip count from none to twice the group.
+    for m in 0..10 {
+        var s = ""
+        for i in 0..m {
+            s += "{i}"
+        }
+        var t = ""
+        for i in 0..=m {
+            t += "{i}"
+        }
+        print("{m} [{s}] [{t}]")
+    }
+
+    // The ends of the number line, where deciding whether four more fit
+    // would overflow if it were written as `i + 4 <= end`.
+    let lo = 0 - 9223372036854775807 - 1
+    var low = 0
+    for _i in lo..lo + 3 {
+        low += 1
+    }
+    var high = 0
+    for _i in 9223372036854775804..=9223372036854775807 {
+        high += 1
+    }
+    print("{low} {high}")
+
+    // Negative bounds, and a backwards range, which runs not at all.
+    var sum = 0
+    for i in -5..5 {
+        sum = sum + i
+    }
+    var never = 0
+    for _i in 5..0 {
+        never += 1
+    }
+    print("{sum} {never}")
+
+    // `break` leaves, and `continue` skips the rest of its own iteration —
+    // including the copies of the body that would have followed it.
+    for m in 0..13 {
+        var hit = ""
+        for i in 0..12 {
+            if i == m {
+                hit += "B"
+                break
+            }
+            if i % 3 == 0 {
+                continue
+            }
+            hit += "{i % 10}"
+        }
+        print("{m} {hit}")
+    }
+
+    var w = 0
+    var line = ""
+    while w < 11 {
+        w += 1
+        if w % 3 == 0 {
+            continue
+        }
+        line += "{w},"
+    }
+    print(line)
+    print("{first_over([1, 2], 2)}")
+    let ys = [4, 9, 7, 0, 5]
+    var k = 0
+    while ys[k] != 0 and k < ys.len() {
+        if ys[k] == 7 {
+            break
+        }
+        k += 1
+    }
+    print("{ys[k]}")
+    var n = 0
+    var m = 0
+    while n < 4 {
+        n += 1
+        m = m + if n % 2 == 0 { 2 } else { 1 }
+    }
+    print("{n} {m}")
 }
 ```
 
@@ -1299,6 +1619,10 @@ fn main() {
 //! arg
 //! [[1, 9]]
 //! 6 [[5], []] [0]
+//! once
+//! 8
+//! 8 4
+//! [7, 7, 7] [1, 2, 3]
 // Subexpressions evaluate left to right — including an assignment's target.
 //
 // The walk that writes a value is what evaluates the target's index, so doing
@@ -1339,6 +1663,42 @@ fn main() {
     var k = [[5], [6]]
     let taken = k[q.remove(0)].remove(0)
     print("{taken} {k} {q}")
+
+    // A call is a call however the backend chooses to compile it. A small
+    // function may be spliced into its caller instead of called, and the
+    // three things that can go wrong if it is are all visible from here.
+    //
+    // The argument is evaluated once, where it is written, not once per
+    // mention of the parameter in the body.
+    print("{twice(note("once", 4))}")
+    // A parameter may share a name with something the caller has bound, and
+    // the caller's binding is untouched by the call.
+    let n = 4
+    print("{twice(n)} {n}")
+    // And a callee's own local may share a name with a list the caller is
+    // filling in a loop, which is the shape that reaches furthest into a
+    // backend: `out` here is two different lists.
+    var out: [i64] = []
+    for v in [1, 2, 3] {
+        out.push(v)
+        let _ = filled()
+    }
+    print("{filled()} {out}")
+}
+
+// `n` is also a name `main` binds; `v + v` mentions the parameter twice.
+fn twice(n: i64) -> i64 {
+    let v = n
+    return v + v
+}
+
+// `out` is also a name `main` binds, and fills in a loop.
+fn filled() -> [i64] {
+    var out: [i64] = []
+    out.push(7)
+    out.push(7)
+    out.push(7)
+    return out
 }
 
 fn step(inout n: i64) -> i64 {
@@ -1900,10 +2260,43 @@ fn main() {
 //! tag: E-STR-CHARS
 //! expect: output
 //! 3 3
+//! 300
+//! 302
+//! 303 304
+//! 304 305
+//! yzα w
+//! 300 600
+//! 301 601 q
 fn main() {
     // Characters, not bytes: each of these is multi-byte in UTF-8.
     let s = "héllo"
     print("{"abc".len()} {s.substr(0, 3).len()}")
+
+    // `len` counts characters, and for text long enough to be worth it the
+    // count is remembered rather than rescanned — `while i < s.len()` asked
+    // for it once per character and read the whole string each time, which is
+    // quadratic. What must hold is that the remembered count never outlives
+    // the text it described.
+    var a = ""
+    for _i in 0..300 { a += "x" }
+    print("{a.len()}")
+    a += "yz"
+    print("{a.len()}")
+
+    // ASCII until it is not. A count remembered while the text was one byte
+    // per character would be wrong the moment it stops being.
+    a += "\u{03b1}"
+    print("{a.len()} {a.byte_len()}")
+    a += "w"
+    print("{a.len()} {a.byte_len()}")
+    print("{a.substr(300, 3)} {a.substr(a.len() - 1, 1)}")
+
+    // Multi-byte from the start, grown past the same threshold.
+    var b = ""
+    for _i in 0..300 { b += "\u{00e9}" }
+    print("{b.len()} {b.byte_len()}")
+    b += "q"
+    print("{b.len()} {b.byte_len()} {b.substr(300, 1)}")
 }
 ```
 
@@ -1924,8 +2317,173 @@ fn main() {
 //! tag: E-STR-CONCAT
 //! expect: output
 //! hello, world
+//! abab
+//! xyxy
+//! pp1q
+//! nn-2-true-1.5
+//! 01234
+//! [0:0][1:2][2:4][3:6][4:8]
+//! 1390 545082
+//! x0:-1234:-2468:-3702:-4936:
+//! 012345 21
+//! 0123
+//! 00 01 02 10 11 12 20 21 22 
+//! false-false-true-
+//! a0b0a1b1a2b2
+//! ab-ab
+//! xyxy
+//! 0a1b2c
+//! q-0-q-1-
+//! xya zwb
+// A string built by appending to itself is the same string however the
+// backend chooses to build it. `s = s + rest` and `s += rest` are compiled
+// as an append rather than a rebuild — in place when nothing else holds the
+// string, and an interpolation's pieces go onto the buffer one at a time
+// rather than being built into a string of their own first. So each of the
+// shapes where the left and right sides can be the *same* value has to come
+// out the way a rebuild would.
 fn main() {
     print("hello, " + "world")
+
+    // The right side is the left side: two references to one string, so
+    // nothing can write into it in place.
+    var s = "ab"
+    s = s + s
+    print(s)
+    // The same, reached through an interpolation.
+    var t = "xy"
+    t = t + "{t}"
+    print(t)
+    // And read twice in one interpolation, once for its text and once for a
+    // length that is taken before any of it is appended.
+    var u = "p"
+    u = u + "{u}{u.len()}q"
+    print(u)
+    // Every piece kind in one, through `+=`.
+    var v = "n"
+    v += "{v}-{1 + 1}-{true}-{1.5}"
+    print(v)
+
+    // The loop shapes, which are why any of this exists.
+    var w = ""
+    for i in 0..5 {
+        w = w + "{i}"
+    }
+    print(w)
+    var z = ""
+    for i in 0..5 {
+        z += "[{i}:{i * 2}]"
+    }
+    print(z)
+
+    // A string a loop only appends to has its buffer held open, and the
+    // length in the value itself is not written back until the loop ends —
+    // so every shape that could read a stale one has to keep it off that
+    // path, and every shape that takes it has to come out the same.
+    //
+    // Past the inline buffer and past a growth of the heap one.
+    var g = ""
+    for i in 0..300 {
+        g += "[{i}]"
+    }
+    var gh = 0
+    for c in g.codes() {
+        gh = (gh * 31 + c) % 1000003
+    }
+    print("{g.len()} {gh}")
+
+    // Negative and multi-digit, which the one-digit store does not take.
+    var m = "x"
+    for i in 0..5 {
+        m = m + "{0 - i * 1234}:"
+    }
+    print(m)
+
+    // Read inside the loop: the length it sees must be the length it has.
+    var r = ""
+    var seen = 0
+    for i in 0..6 {
+        r += "{i}"
+        seen = seen + r.len()
+    }
+    print("{r} {seen}")
+
+    // Left early, so what was written before the `break` still counts.
+    var e = ""
+    for i in 0..10 {
+        if i == 4 {
+            break
+        }
+        e += "{i}"
+    }
+    print(e)
+
+    // A nested loop appending to the same string.
+    var n = ""
+    for i in 0..3 {
+        for j in 0..3 {
+            n += "{i}{j} "
+        }
+    }
+    print(n)
+
+    // A piece that is not an integer, so the whole loop keeps the older path.
+    var b2 = ""
+    for i in 0..3 {
+        b2 += "{i > 1}-"
+    }
+    print(b2)
+
+    // A chain of appends is the same append, twice over. `c = c + x + y`
+    // parses as `((c + x) + y)`, so the name sits at the end of the left
+    // spine rather than directly on the left; reading only the direct form
+    // left this rebuilding the whole string each time round, which is
+    // quadratic — 200,000 bytes of hex took 697 ms where one piece takes 3.
+    var c = ""
+    for i in 0..3 {
+        c = c + "a{i}" + "b{i}"
+    }
+    print(c)
+
+    // Appending in place changes the name as it goes, so a chain that reads
+    // the name again cannot take that path: the later piece would see what
+    // the earlier one already wrote. This gave `ab-ab-` for `ab-ab`.
+    var d = "ab"
+    d = d + "-" + d
+    print(d)
+
+    // One piece is safe either way, because it is read before the append.
+    var twice = "xy"
+    twice = twice + twice
+    print(twice)
+
+    // A chain of three, mixing an interpolation with a plain string.
+    var e3 = ""
+    let tail = ["a", "b", "c"]
+    for i in 0..3 {
+        e3 = e3 + "{i}" + tail[i]
+    }
+    print(e3)
+
+    // A chain whose head is a *different* name is not an append at all.
+    var f3 = ""
+    let q = "q"
+    for i in 0..2 {
+        f3 = f3 + q + "-{i}-"
+    }
+    print(f3)
+
+    // Binding a name a second time in the same block releases what the first
+    // binding owned. The scope releases only what it holds when it closes, so
+    // without that the first value is simply lost — and it takes an append to
+    // bite, because a bare literal is immortal and has no reference to lose.
+    // This exited 7 under `GRASM_LEAK_CHECK=1` with one allocation live.
+    var sh = "xy"
+    sh = sh + "a"
+    let first = sh
+    var sh = "zw"
+    sh = sh + "b"
+    print("{first} {sh}")
 }
 ```
 
@@ -2040,7 +2598,40 @@ fn main() {
 //! 1 99
 //! hi! hi hi
 //! hixxx hi
+//! [1, 2] [1, 2, 9]
+//! 1
+//! [5] [5, 7] 1
+//! [3, 4] [3, 4]
+//! [8] [0]
 type Box = { n: i64 }
+type Bag = { items: [i64] }
+type Two = { a: [i64], b: [i64] }
+
+// A block's tail takes the locals it reads last instead of copying them. Each
+// of these has to come out the same as if it copied.
+fn grown() -> [i64] {
+    var v = [1]
+    v.push(2)
+    v
+}
+
+fn bagged(keep: [i64]) -> Bag {
+    var mine = keep
+    let alias = mine
+    print("{alias.len()}")
+    Bag{ items: mine }
+}
+
+fn both() -> Two {
+    let v = [3, 4]
+    Two{ a: v, b: v }
+}
+
+fn pick(c: bool) -> [i64] {
+    let v = [8]
+    if c { v } else { [0] }
+}
+
 fn main() {
     var a = [1, 2]
     var b = a
@@ -2073,5 +2664,20 @@ fn main() {
         g = g + "x"
     }
     print("{g} {"hi"}")
+
+    let g1 = grown()
+    var g2 = grown()
+    g2.push(9)
+    print("{g1} {g2}")
+
+    let orig = [5]
+    var bag = bagged(orig)
+    bag.items.push(7)
+    print("{orig} {bag.items} {orig.len()}")
+
+    var two = both()
+    print("{two.a} {two.b}")
+
+    print("{pick(true)} {pick(false)}")
 }
 ```

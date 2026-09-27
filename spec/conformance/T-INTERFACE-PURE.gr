@@ -1,0 +1,22 @@
+//! tag: T-INTERFACE-PURE
+//! expect: error
+//! performs `io`
+// An interface method declares no effects, so a bounded call cannot perform
+// any. An `impl` method that prints would let a generic body with an empty row
+// print through it.
+interface Show {
+    fn show(self) -> str
+}
+
+type Point = { x: i64 }
+
+impl Show for Point {
+    fn show(self) -> str {
+        print("side effect")
+        "p"
+    }
+}
+
+fn main() {
+    print(Point{ x: 1 }.show())
+}

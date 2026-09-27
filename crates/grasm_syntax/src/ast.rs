@@ -56,6 +56,8 @@ pub fn decl_span(d: &Decl) -> Span {
         Decl::Test(t) => t.span,
         Decl::Bench(b) => b.span,
         Decl::Import(i) => i.span,
+        Decl::Interface(i) => i.span,
+        Decl::Impl(i) => i.span,
     }
 }
 
@@ -71,6 +73,45 @@ pub enum Decl {
     Test(TestDecl),
     Bench(BenchDecl),
     Import(ImportDecl),
+    /// `interface Show { fn show(self) -> str }` ([T-INTERFACE]).
+    Interface(InterfaceDecl),
+    /// `impl Show for Point { ... }` -- the header only. Its methods are
+    /// ordinary `Decl::Fn`s beside it, named `method@Type` (see `ImplDecl`).
+    Impl(ImplDecl),
+}
+
+/// An interface: a name and the signatures a type provides to satisfy it.
+/// `self` in a signature is a parameter of type `Self`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InterfaceDecl {
+    pub is_pub: bool,
+    pub name: Ident,
+    pub methods: Vec<FnSig>,
+    pub span: Span,
+}
+
+/// An `impl` header.
+///
+/// Its methods are lowered by the parser into plain functions named
+/// `method@Type` -- a name no source can spell, so they cannot collide with a
+/// user function or with each other -- whose first parameter is `self` of the
+/// implementing type. Every engine registers them as it registers any other
+/// function; only method-call resolution needs to know they exist, and it
+/// finds them through the checker's impl table.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImplDecl {
+    pub iface: Path,
+    pub ty: TypeExpr,
+    /// The implementing type's name as written: `Point`, `i64`.
+    pub type_name: String,
+    /// Each method's source name and the name of the function it became.
+    pub methods: Vec<(Ident, String)>,
+    pub span: Span,
+}
+
+/// The name an `impl` method is lowered to.
+pub fn impl_fn_name(method: &str, type_name: &str) -> String {
+    format!("{method}@{type_name}")
 }
 
 /// A C function this program calls. It has no body: the symbol is resolved
@@ -101,6 +142,9 @@ pub struct FnDecl {
     pub is_pub: bool,
     pub name: Ident,
     pub generics: Vec<Ident>,
+    /// The interfaces each generic parameter is bounded by, in the same
+    /// order as `generics`: `[T: Show + Ord, U]` is `[[Show, Ord], []]`.
+    pub bounds: Vec<Vec<Path>>,
     pub params: Vec<Param>,
     pub ret: Option<TypeExpr>,
     /// `! E` — error type of the `T ! E` union.
@@ -549,5 +593,36 @@ impl Pattern {
             Pattern::Variant { span, .. } => *span,
             Pattern::Tuple(_, s) | Pattern::Or(_, s) => *s,
         }
+    }
+}
+
+/// `t` with every `Self` replaced by `with` -- the implementing type, inside
+/// an `impl` ([T-INTERFACE]).
+pub fn replace_self(t: &TypeExpr, with: &TypeExpr) -> TypeExpr {
+    match t {
+        TypeExpr::Name { path, args, span } => {
+            if args.is_empty() && path.segments.len() == 1 && path.segments[0].name == "Self" {
+                return with.clone();
+            }
+            TypeExpr::Name {
+                path: path.clone(),
+                args: args.iter().map(|a| replace_self(a, with)).collect(),
+                span: *span,
+            }
+        }
+        TypeExpr::List(inner, sp) => TypeExpr::List(Box::new(replace_self(inner, with)), *sp),
+        TypeExpr::Ref(inner, sp) => TypeExpr::Ref(Box::new(replace_self(inner, with)), *sp),
+        TypeExpr::Fallible(a, b, sp) => TypeExpr::Fallible(
+            Box::new(replace_self(a, with)),
+            Box::new(replace_self(b, with)),
+            *sp,
+        ),
+        TypeExpr::Tuple(items, sp) => {
+            TypeExpr::Tuple(items.iter().map(|a| replace_self(a, with)).collect(), *sp)
+        }
+        TypeExpr::Union(items, sp) => {
+            TypeExpr::Union(items.iter().map(|a| replace_self(a, with)).collect(), *sp)
+        }
+        other => other.clone(),
     }
 }

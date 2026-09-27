@@ -1,0 +1,20 @@
+//! tag: T-INTERFACE-IMPL
+//! expect: error
+//! does not provide `cmp`
+// An `impl` provides every method its interface declares.
+interface Ord {
+    fn cmp(self, other: Self) -> i64
+    fn eq(self, other: Self) -> bool
+}
+
+type Point = { x: i64 }
+
+impl Ord for Point {
+    fn eq(self, other: Self) -> bool {
+        self.x == other.x
+    }
+}
+
+fn main() {
+    print("never")
+}

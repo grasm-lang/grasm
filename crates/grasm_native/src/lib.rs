@@ -326,6 +326,8 @@ fn compile_object_scoped(
     cg.float_literals = analysis.float_literals;
     cg.map_get_value_kind = analysis.map_get_value_kind;
     cg.field_calls = analysis.field_calls;
+    cg.iface_calls = analysis.iface_calls;
+    cg.impl_fns = analysis.impl_fns;
     cg.fallible_closures = analysis.fallible_closures;
     cg.empty_types = analysis.empty_types;
     cg.closure_param_types = analysis.closure_param_types;
@@ -563,6 +565,10 @@ struct Codegen<'m> {
     /// Method calls the checker resolved to a struct field holding a function.
     /// See the UFCS branch of the method-call lowering.
     field_calls: grasm_sema::check::SpanSet,
+    /// Method calls resolved through an `impl`, and the impl table
+    /// ([T-INTERFACE]). See the UFCS branch of the method-call lowering.
+    iface_calls: grasm_sema::check::SpanSet,
+    impl_fns: std::collections::HashMap<(String, String), String>,
     /// Closure literals whose own type is fallible, by start offset.
     fallible_closures: std::collections::HashSet<u32>,
     /// Start offset of each empty literal → the type the checker settled on.
@@ -667,6 +673,8 @@ impl<'m> Codegen<'m> {
             float_literals: std::collections::HashSet::new(),
             map_get_value_kind: std::collections::HashMap::new(),
             field_calls: Default::default(),
+            iface_calls: Default::default(),
+            impl_fns: Default::default(),
             fallible_closures: std::collections::HashSet::new(),
             empty_types: std::collections::HashMap::new(),
             closure_param_types: std::collections::HashMap::new(),
@@ -1852,7 +1860,9 @@ arguments nor the type this is bound to",
                 | Decl::Bench(_)
                 | Decl::Import(_)
                 | Decl::Type(_)
-                | Decl::Effect(_) => {}
+                | Decl::Effect(_)
+                | Decl::Interface(_)
+                | Decl::Impl(_) => {}
             }
         }
         Ok(())
@@ -10985,7 +10995,16 @@ this case",
         args: &[Expr],
         span: Span,
     ) -> CResult<Option<(Value, VType)>> {
-        let m = name.name.as_str();
+        // A method an `impl` provides wins over a builtin of the same name
+        // ([T-INTERFACE]), so such a call skips every builtin arm below and
+        // lands in the UFCS branch, which takes its function from the impl
+        // table by the receiver's type.
+        let iface_call = self.cg.iface_calls.contains(&(span.start, span.end));
+        let m = if iface_call {
+            "\u{0}interface"
+        } else {
+            name.name.as_str()
+        };
         // Helper closures can't borrow self; inline the arg evaluation.
         macro_rules! arg_boxed {
             ($i:expr) => {{
@@ -11634,7 +11653,31 @@ this case",
                 // arm and was refused while `describe([1, 2])` compiled. The
                 // receiver is the first argument ([L-UFCS]), which is exactly
                 // what the type parameters are read from.
-                let ufcs_generic = if self.lookup_fn(&name.name).is_none()
+                // By the receiver's type: after monomorphization a generic
+                // body's `x.show()` has one concrete type here.
+                let iface_fn: Option<String> = if iface_call {
+                    let tname = match &rt {
+                        VType::I64 => "i64".to_string(),
+                        VType::F64 => "f64".to_string(),
+                        VType::Bool => "bool".to_string(),
+                        VType::Str => "str".to_string(),
+                        VType::Struct(n) | VType::Sum(n) => n.clone(),
+                        other => other.show(),
+                    };
+                    match self.cg.impl_fns.get(&(tname.clone(), name.name.clone())) {
+                        Some(q) => Some(q.clone()),
+                        None => {
+                            return nope(
+                                span,
+                                format!("`{}` on `{tname}` through an interface", name.name),
+                            )
+                        }
+                    }
+                } else {
+                    None
+                };
+                let ufcs_generic = if !iface_call
+                    && self.lookup_fn(&name.name).is_none()
                     && !self.cg.field_calls.contains(&(span.start, span.end))
                 {
                     let generic_key = format!("{}::{}", self.cg.current_module, name.name);
@@ -11654,9 +11697,10 @@ this case",
                 } else {
                     None
                 };
-                let resolved: Option<FnSig> = match &ufcs_generic {
-                    Some(k) => self.cg.fns.get(k).cloned(),
-                    None => self
+                let resolved: Option<FnSig> = match (&iface_fn, &ufcs_generic) {
+                    (Some(q), _) => self.cg.fns.get(q).cloned(),
+                    (None, Some(k)) => self.cg.fns.get(k).cloned(),
+                    (None, None) => self
                         .lookup_fn(&name.name)
                         .filter(|_| !self.cg.field_calls.contains(&(span.start, span.end)))
                         .cloned(),

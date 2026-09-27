@@ -1,0 +1,100 @@
+//! tag: T-INTERFACE
+//! expect: output
+//! (1, 2)
+//! red
+//! <(3, 4)> <blue>
+//! 7!
+//! 3 2
+//! (5, 6) is the larger
+//! len 5
+//! <(2, 2)> <9!>
+// Interfaces: a method set, provided per type by an `impl`, and resolved by the
+// receiver's type — so `Point` and `Color` each have a `show`.
+interface Show {
+    fn show(self) -> str
+}
+
+interface Ord {
+    fn cmp(self, other: Self) -> i64
+}
+
+type Point = { x: i64, y: i64 }
+
+type Color = | Red | Blue
+
+impl Show for Point {
+    fn show(self) -> str {
+        "({self.x}, {self.y})"
+    }
+}
+
+impl Ord for Point {
+    fn cmp(self, other: Self) -> i64 {
+        (self.x + self.y) - (other.x + other.y)
+    }
+}
+
+impl Show for Color {
+    fn show(self) -> str {
+        match self {
+            Red -> "red"
+            Blue -> "blue"
+        }
+    }
+}
+
+// A primitive may have an `impl` too.
+impl Show for i64 {
+    fn show(self) -> str {
+        "{self}!"
+    }
+}
+
+impl Ord for i64 {
+    fn cmp(self, other: Self) -> i64 {
+        self - other
+    }
+}
+
+// A method from an `impl` is found before a builtin of the same name.
+interface Sized {
+    fn len(self) -> i64
+}
+
+impl Sized for str {
+    fn len(self) -> i64 {
+        5
+    }
+}
+
+fn describe[T: Show](x: T) -> str {
+    "<" + x.show() + ">"
+}
+
+fn largest[T: Ord](xs: [T]) -> T {
+    var best = xs[0]
+    for x in xs {
+        if x.cmp(best) > 0 {
+            best = x
+        }
+    }
+    best
+}
+
+// A bounded parameter passed on to another bounded function.
+fn larger_shown[T: Show + Ord](a: T, b: T) -> str {
+    if a.cmp(b) >= 0 { describe(a) } else { describe(b) }
+}
+
+fn main() {
+    let p = Point{ x: 1, y: 2 }
+    print(p.show())
+    print(Red.show())
+    print("{describe(Point{ x: 3, y: 4 })} {describe(Blue)}")
+    print(7.show())
+    print("{largest([1, 3, 2])} {largest([2, 1])}")
+    let big = largest([Point{ x: 1, y: 1 }, Point{ x: 5, y: 6 }, Point{ x: 0, y: 2 }])
+    print("{big.show()} is the larger")
+    print("len {"hi".len()}")
+    print("{larger_shown(Point{ x: 1, y: 1 }, Point{ x: 2, y: 0 + 2 })} {larger_shown(4, 9)}")
+}

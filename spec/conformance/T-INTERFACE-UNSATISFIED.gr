@@ -1,0 +1,17 @@
+//! tag: T-INTERFACE-UNSATISFIED
+//! expect: error
+//! `Point` does not implement `Show`
+// A bounded parameter needs an `impl` of every bound at each call.
+interface Show {
+    fn show(self) -> str
+}
+
+type Point = { x: i64 }
+
+fn describe[T: Show](x: T) -> str {
+    x.show()
+}
+
+fn main() {
+    print(describe(Point{ x: 1 }))
+}

@@ -69,6 +69,31 @@ fn same[T](v: T) -> T {
     v
 }
 
+// [T-INTERFACE]: two types with a method of one name, and a bounded function.
+interface Weigh {
+    fn weight(self) -> i64
+}
+
+impl Weigh for Pt {
+    fn weight(self) -> i64 {
+        self.x * 10 + self.y
+    }
+}
+
+impl Weigh for i64 {
+    fn weight(self) -> i64 {
+        self * 3
+    }
+}
+
+fn total_weight[T: Weigh](xs: [T]) -> i64 {
+    var t = 0
+    for x in xs {
+        t += x.weight()
+    }
+    t
+}
+
 fn fails() -> i64 ! Bad {
     fail(Bad)
 }
@@ -299,6 +324,7 @@ CLAUSES = {
     "T-REF-VALUE": "ref write is visible",
     "T-REF-GENERATIONAL": "a released slot is dead",
     "T-GENERIC-FN": "generic keeps the type",
+    "T-INTERFACE": "a bounded call is the direct call",
     "T-FALLIBLE": "a fallible ok is the value",
     "L-LIB-RANGE-OPS": "a range holds its bounds",
     "L-LIB-BITS": "bit and or xor",
@@ -475,6 +501,10 @@ LAWS = {
  "a closure sees the value at creation": 'var n = 1\n    let f = || n\n    n = 9\n    say(f() == 1)',
  "a handler is found by name": 'with Src handled_by SrcHandler{ get: || 3 } {\n        say(reads() == 3)\n    }',
  "generic keeps the type":     'say(same([1, 2]) == [1, 2] and same(Pt{ x: 1, y: 2 }) == Pt{ x: 1, y: 2 })',
+ # Through a bound, each receiver reaches its own type's method: the generic
+ # total must equal the sum written out by hand, for both types, and the two
+ # `weight`s must not be confused -- 12 as a point is 12, as an i64 is 36.
+ "a bounded call is the direct call": 'let ps = [Pt{ x: 1, y: 2 }, Pt{ x: 3, y: 4 }]\n    let ns = [5, 7]\n    say(total_weight(ps) == 12 + 34 and total_weight(ns) == 15 + 21 and Pt{ x: 1, y: 2 }.weight() != 12.weight())',
  "a fallible ok is the value": 'say((works() ?? 0) == 4 and (fails() ?? 7) == 7)',
  "unit has one value":         'let a = ()\n    let b = ()\n    say(a == b)',
  "float arithmetic":          'say(0.1 + 0.2 != 0.3 and (0.5 + 0.25) == 0.75)',

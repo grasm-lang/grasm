@@ -121,6 +121,10 @@ pub struct Interp<'a, W: Write> {
     /// Method calls the checker resolved to a struct field. See
     /// `set_field_calls`.
     field_calls: grasm_sema::check::SpanSet,
+    /// Method calls that resolve through an `impl`, and the impl table, from
+    /// `Analysis` ([T-INTERFACE]). See `set_interfaces`.
+    iface_calls: grasm_sema::check::SpanSet,
+    impl_fns: HashMap<(String, String), String>,
     /// Listeners and connections opened by the `net` builtins, by handle.
     sockets: Vec<Option<NetSocket>>,
     /// Closure literals whose own type is fallible, by start offset.
@@ -692,6 +696,8 @@ impl<'a, W: Write> Interp<'a, W> {
         me.float_literals = a.float_literals;
         me.ok_wrapped = a.ok_wrapped;
         me.field_calls = a.field_calls;
+        me.iface_calls = a.iface_calls;
+        me.impl_fns = a.impl_fns;
         me.float_sums = a.float_sums;
         me.fallible_closures = a.fallible_closures;
         me
@@ -1110,6 +1116,19 @@ impl<'a, W: Write> Interp<'a, W> {
         self.field_calls = spans;
     }
 
+    /// The method calls the checker resolved through an `impl`, and which
+    /// function each `(type, method)` is ([T-INTERFACE]). Such a call is found
+    /// by the receiver's runtime type -- two types may each have a `show`, and
+    /// inside a generic body which one is meant is only known here.
+    pub fn set_interfaces(
+        &mut self,
+        spans: grasm_sema::check::SpanSet,
+        fns: HashMap<(String, String), String>,
+    ) {
+        self.iface_calls = spans;
+        self.impl_fns = fns;
+    }
+
     /// The closure literals the checker typed as fallible, from `Analysis`.
     pub fn set_fallible_closures(&mut self, spans: std::collections::HashSet<u32>) {
         self.fallible_closures = spans;
@@ -1230,6 +1249,8 @@ impl<'a, W: Write> Interp<'a, W> {
             float_literals: std::collections::HashSet::new(),
             ok_wrapped: std::collections::HashSet::new(),
             field_calls: Default::default(),
+            iface_calls: Default::default(),
+            impl_fns: HashMap::new(),
             sockets: Vec::new(),
             fallible_closures: std::collections::HashSet::new(),
             float_sums: std::collections::HashSet::new(),
@@ -3618,6 +3639,31 @@ uses to mark the end of a string"
                     fields: Rc::new(vs),
                 });
             }
+        }
+        if self.iface_calls.contains(&(span.start, span.end)) {
+            let recv_v = self.eval_expr(recv)?;
+            let tname = match &recv_v {
+                Value::Int(_) => "i64".to_string(),
+                Value::Float(_) => "f64".to_string(),
+                Value::Bool(_) => "bool".to_string(),
+                Value::Str(_) => "str".to_string(),
+                Value::Struct { name, .. } => name.to_string(),
+                Value::Variant { type_name, .. } => type_name.to_string(),
+                _ => String::new(),
+            };
+            let Some(qual) = self.impl_fns.get(&(tname.clone(), name.name.clone())).cloned() else {
+                return Err(Flow::Panic(format!("no `impl` provides `{}` for `{tname}`", name.name)));
+            };
+            let Some(f) = self.fns.get(&qual).copied() else {
+                return Err(Flow::Panic(format!("`{qual}` is not a function")));
+            };
+            let module = qual.rsplit_once("::").map(|(m, _)| m.to_string()).unwrap_or_default();
+            let mut vs = Vec::with_capacity(args.len() + 1);
+            vs.push(recv_v);
+            for a in args {
+                vs.push(self.eval_expr(a)?);
+            }
+            return self.call_decl(f, &module, vs);
         }
         if name.name == "sort_by" {
             // Resolve the receiver's place once. Reading it with `eval_expr`

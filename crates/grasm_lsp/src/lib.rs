@@ -421,6 +421,12 @@ impl Server {
                 Decl::Test(t) => (format!("test {:?}", t.name), 12, t.span),
                 Decl::Bench(b) => (format!("bench {:?}", b.name), 12, b.span),
                 Decl::Import(i) => (format!("import {}", i.path.dotted()), 2, i.span),
+                Decl::Interface(i) => (i.name.name.clone(), 11, i.span), // Interface
+                Decl::Impl(i) => (
+                    format!("impl {} for {}", i.iface.dotted(), i.type_name),
+                    5, // Class
+                    i.span,
+                ),
             };
             out.push(Json::obj(vec![
                 ("name", Json::str(name)),

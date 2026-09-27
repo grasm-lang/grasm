@@ -137,6 +137,14 @@ pub struct Analysis {
     /// function, rather than to a method or a UFCS free function. The engines
     /// resolve by name and would otherwise disagree with the types.
     pub field_calls: SpanSet,
+    /// Method-call spans that resolve through an `impl` ([T-INTERFACE]). The
+    /// engines look the method up by the receiver's type in `impl_fns`
+    /// rather than by name, since two types may each have one.
+    pub iface_calls: SpanSet,
+    /// `(type, method)` -> the qualified function an `impl` lowered it to,
+    /// `module::method@Type`. A type is named as its `impl` wrote it:
+    /// `Point`, `i64`, `f64`, `bool`, `str`.
+    pub impl_fns: HashMap<(String, String), String>,
     /// Start offsets of closure literals whose own type is fallible.
     ///
     /// `fail(e)` raises the error branch of the enclosing *fallible* function,
@@ -395,7 +403,15 @@ fn check_modules_in(
     c.resolve_type_bodies(&modules);
     for f in files {
         c.current_module = f.name.clone();
+        c.collect_interfaces(f.module);
+    }
+    for f in files {
+        c.current_module = f.name.clone();
         c.collect_fns(f.module);
+    }
+    for f in files {
+        c.current_module = f.name.clone();
+        c.collect_impls(f.module);
     }
     // After the functions: a constant's value may call one, or name one as a
     // value. Collecting constants first meant `let DOUBLE = two() * 2` said
@@ -568,6 +584,12 @@ fn check_modules_in(
         value_rows: c.value_rows.clone(),
         callee_rows: c.callee_rows.clone(),
         field_calls: c.field_calls.clone(),
+        iface_calls: c.iface_calls.clone(),
+        impl_fns: c
+            .impls
+            .iter()
+            .map(|(k, (f, _))| (k.clone(), f.clone()))
+            .collect(),
         ok_wrapped: c.ok_wrapped,
         map_get_value_kind,
         fallible_closures: c
@@ -612,10 +634,17 @@ enum BindKind {
     Generated,
 }
 
+/// A bounded call's promise, settled once inference has: the variable a
+/// bounded parameter was instantiated with, its interfaces, the call, and the
+/// calling function's own bounds and parameter names at the time.
+type BoundObligation = (Type, Vec<String>, Span, Vec<Vec<String>>, Vec<String>);
+
 #[derive(Clone)]
 struct FnInfo {
     is_pub: bool,
     generics: usize,
+    /// Each generic parameter's interfaces ([T-INTERFACE-BOUND]).
+    bounds: Vec<Vec<String>>,
     params: Vec<Type>,
     modes: Vec<ParamMode>,
     ret: Type,
@@ -715,6 +744,19 @@ struct Checker {
     /// whole span.
     callee_rows: SpanMap<std::collections::BTreeSet<String>>,
     field_calls: SpanSet,
+    /// Interfaces by name. They share the program-wide type namespace.
+    interfaces: HashMap<String, grasm_syntax::ast::InterfaceDecl>,
+    /// `(type, method)` -> (qualified lowered function, interface).
+    impls: HashMap<(String, String), (String, String)>,
+    /// `(interface, type)` for every `impl`.
+    impl_of: std::collections::HashSet<(String, String)>,
+    iface_calls: SpanSet,
+    /// Bounds of the function being checked, beside `current_generics`.
+    current_bounds: Vec<Vec<String>>,
+    /// A bounded call's promise to check once inference has settled: the
+    /// variable a bounded parameter was instantiated with, its interfaces,
+    /// the call, and the calling function's own bounds at the time.
+    bound_obligations: Vec<BoundObligation>,
     /// Inferred type per expression, keyed by whole span. See `infer_expr`.
     expr_types: SpanMap<Type>,
     /// Every expression's inferred type, keyed by its span.
@@ -920,6 +962,12 @@ impl Checker {
             value_rows: SpanMap::default(),
             callee_rows: SpanMap::default(),
             field_calls: SpanSet::default(),
+            interfaces: HashMap::new(),
+            impls: HashMap::new(),
+            impl_of: std::collections::HashSet::new(),
+            iface_calls: SpanSet::default(),
+            current_bounds: Vec::new(),
+            bound_obligations: Vec::new(),
             expr_types: SpanMap::default(),
             resolved_types: SpanMap::default(),
             empty_lits: Vec::new(),
@@ -1551,6 +1599,7 @@ nothing says who owns it, how long it lives, or how long it is"
                 FnInfo {
                     is_pub: e.is_pub,
                     generics: 0,
+                    bounds: Vec::new(),
                     params,
                     modes: e.params.iter().map(|p| p.mode).collect(),
                     ret,
@@ -1578,6 +1627,270 @@ nothing says who owns it, how long it lives, or how long it is"
     /// lives, or how long it is — so that stays refused ([T-EXTERN-POINTER]).
     fn is_c_param_type(t: &Type) -> bool {
         matches!(t, Type::I64 | Type::F64 | Type::Str | Type::Bytes)
+    }
+
+    /// The name an `impl` is keyed by for a type, if the type can have one:
+    /// `i64`, `f64`, `bool`, `str`, or a declared non-generic type.
+    fn impl_key(&self, t: &Type) -> Option<String> {
+        match t {
+            Type::I64 => Some("i64".to_string()),
+            Type::F64 => Some("f64".to_string()),
+            Type::Bool => Some("bool".to_string()),
+            Type::Str => Some("str".to_string()),
+            Type::Named { id, args } if args.is_empty() => Some(self.defs.get(*id).name.clone()),
+            _ => None,
+        }
+    }
+
+    fn collect_interfaces(&mut self, module: &Module) {
+        for decl in &module.decls {
+            if let Decl::Interface(i) = decl {
+                if self.interfaces.contains_key(&i.name.name)
+                    || self.defs.by_name.contains_key(&i.name.name)
+                {
+                    self.error(i.name.span, format!("duplicate name `{}`", i.name.name));
+                    continue;
+                }
+                let mut seen = std::collections::HashSet::new();
+                for m in &i.methods {
+                    if !seen.insert(m.name.name.clone()) {
+                        self.error(
+                            m.name.span,
+                            format!("interface `{}` declares `{}` twice", i.name.name, m.name.name),
+                        );
+                    }
+                    let first_is_self = m.params.first().is_some_and(|p| p.name.name == "self");
+                    if !first_is_self {
+                        self.error(
+                            m.name.span,
+                            format!(
+                                "`{}` needs `self` as its first parameter: an interface method is called on a value",
+                                m.name.name
+                            ),
+                        );
+                    }
+                }
+                self.interfaces.insert(i.name.name.clone(), i.clone());
+            }
+        }
+    }
+
+    /// Records each `impl` and holds it to its interface ([T-INTERFACE-IMPL]).
+    fn collect_impls(&mut self, module: &Module) {
+        for decl in &module.decls {
+            let Decl::Impl(im) = decl else { continue };
+            let iname = im.iface.segments.last().map(|s| s.name.clone()).unwrap_or_default();
+            let Some(iface) = self.interfaces.get(&iname).cloned() else {
+                self.error(im.iface.span, format!("unknown interface `{iname}`"));
+                continue;
+            };
+            let tname = im.type_name.clone();
+            let known = matches!(tname.as_str(), "i64" | "f64" | "bool" | "str")
+                || self
+                    .defs
+                    .by_name
+                    .get(&tname)
+                    .is_some_and(|id| self.defs.get(*id).generics.is_empty());
+            if !known {
+                self.error(
+                    im.ty.span(),
+                    format!(
+                        "an `impl` is for a declared, non-generic type or for `i64`, `f64`, `bool` or `str`, not `{tname}`"
+                    ),
+                );
+                continue;
+            }
+            if !self.impl_of.insert((iname.clone(), tname.clone())) {
+                self.error(
+                    im.span,
+                    format!("`{tname}` already implements `{iname}`; a type has one `impl` of each interface"),
+                );
+                continue;
+            }
+            let provided: HashMap<String, String> = im
+                .methods
+                .iter()
+                .map(|(n, lowered)| (n.name.clone(), lowered.clone()))
+                .collect();
+            for (n, _) in &im.methods {
+                if !iface.methods.iter().any(|m| m.name.name == n.name) {
+                    self.error(
+                        n.span,
+                        format!("`{}` is not a method of interface `{iname}`", n.name),
+                    );
+                }
+            }
+            for m in &iface.methods {
+                let Some(lowered) = provided.get(&m.name.name) else {
+                    self.error(
+                        im.span,
+                        format!(
+                            "`impl {iname} for {tname}` does not provide `{}`",
+                            m.name.name
+                        ),
+                    );
+                    continue;
+                };
+                let key = format!("{}::{lowered}", self.current_module);
+                let Some(info) = self.fns.get(&key).cloned() else { continue };
+                // The interface's signature with `Self` read as this type.
+                let want_params: Vec<Type> = m
+                    .params
+                    .iter()
+                    .map(|p| {
+                        let te = grasm_syntax::ast::replace_self(&p.ty, &im.ty);
+                        self.resolve_type(&te, &[])
+                    })
+                    .collect();
+                let want_ret = m
+                    .ret
+                    .as_ref()
+                    .map(|t| {
+                        let te = grasm_syntax::ast::replace_self(t, &im.ty);
+                        self.resolve_type(&te, &[])
+                    })
+                    .unwrap_or(Type::Unit);
+                let want_err = m.err.as_ref().map(|t| {
+                    let te = grasm_syntax::ast::replace_self(t, &im.ty);
+                    self.resolve_type(&te, &[])
+                });
+                if info.generics > 0
+                    || info.params != want_params
+                    || info.ret != want_ret
+                    || info.err != want_err
+                    || info.modes.iter().any(|m| *m != ParamMode::Let)
+                {
+                    self.error(
+                        im.span,
+                        format!(
+                            "`{}` in `impl {iname} for {tname}` does not match the interface's signature",
+                            m.name.name
+                        ),
+                    );
+                    continue;
+                }
+                let slot = (tname.clone(), m.name.name.clone());
+                if let Some((_, other)) = self.impls.get(&slot) {
+                    let other = other.clone();
+                    self.error(
+                        im.span,
+                        format!(
+                            "`{tname}` would have two methods `{}`, from `{other}` and `{iname}`",
+                            m.name.name
+                        ),
+                    );
+                    continue;
+                }
+                self.impls.insert(slot, (key, iname.clone()));
+            }
+        }
+    }
+
+    /// `x.m(args)` where `m` comes from an interface: an `impl` for `x`'s type,
+    /// or a bound on `x`'s type parameter. `None` when neither applies, and
+    /// the call is resolved as it always was.
+    fn interface_method(
+        &mut self,
+        recv_res: &Type,
+        recv: &Expr,
+        name: &Ident,
+        args: &[Expr],
+        span: Span,
+    ) -> Option<Type> {
+        if let Type::Generic(i) = recv_res {
+            let i = *i as usize;
+            let gname = self.current_generics.get(i).cloned().unwrap_or_else(|| "T".to_string());
+            let bounds = self.current_bounds.get(i).cloned().unwrap_or_default();
+            let found = bounds.iter().find_map(|b| {
+                self.interfaces
+                    .get(b)
+                    .and_then(|iface| iface.methods.iter().find(|m| m.name.name == name.name))
+                    .cloned()
+            });
+            let Some(sig) = found else {
+                // A free function taking any type still applies to a `T`
+                // (UFCS), as it did before interfaces existed.
+                if self.lookup_fn(&name.name).is_some() {
+                    return None;
+                }
+                return Some(self.error_help(
+                    name.span,
+                    format!("`{gname}` has no method `{}`", name.name),
+                    format!(
+                        "inside a generic body a `{gname}` offers only its bounds' methods — bound it with an interface declaring `{}`, as in `[{gname}: Show]`",
+                        name.name
+                    ),
+                ));
+            };
+            // `Self` is this type parameter.
+            let mut names = vec![String::new(); i + 1];
+            names[i] = "Self".to_string();
+            let params: Vec<Type> =
+                sig.params.iter().skip(1).map(|p| self.resolve_type(&p.ty, &names)).collect();
+            let ret = sig.ret.as_ref().map(|t| self.resolve_type(t, &names)).unwrap_or(Type::Unit);
+            if args.len() != params.len() {
+                return Some(self.error(
+                    span,
+                    format!("`{}` takes {} argument(s), got {}", name.name, params.len(), args.len()),
+                ));
+            }
+            for (a, p) in args.iter().zip(&params) {
+                self.check_expr(a, p);
+            }
+            self.iface_calls.insert((span.start, span.end));
+            return Some(ret);
+        }
+        let key = self.impl_key(recv_res)?;
+        let (qual, _) = self.impls.get(&(key, name.name.clone()))?.clone();
+        let (owner, fname) = qual.rsplit_once("::").map(|(a, b)| (a.to_string(), b.to_string()))?;
+        let info = self.fns.get(&qual).cloned()?;
+        let mut full_args: Vec<Expr> = Vec::with_capacity(args.len() + 1);
+        full_args.push(recv.clone());
+        full_args.extend(args.iter().cloned());
+        self.iface_calls.insert((span.start, span.end));
+        Some(self.check_fn_call_in(&owner, &fname, &info, &full_args, span))
+    }
+
+    /// Settles the bounded calls made in the body just checked
+    /// ([T-INTERFACE-UNSATISFIED]).
+    fn flush_bound_obligations(&mut self) {
+        let obligations = std::mem::take(&mut self.bound_obligations);
+        for (v, ifaces, span, caller_bounds, caller_names) in obligations {
+            let t = self.uni.resolve(&v);
+            match &t {
+                Type::Var(_) | Type::Error => {}
+                Type::Generic(j) => {
+                    let have = caller_bounds.get(*j as usize).cloned().unwrap_or_default();
+                    for i in &ifaces {
+                        if !have.contains(i) {
+                            let shown = caller_names
+                                .get(*j as usize)
+                                .cloned()
+                                .unwrap_or_else(|| self.show(&t));
+                            self.error_help(
+                                span,
+                                format!("`{shown}` is not bounded by `{i}`"),
+                                format!("add the bound where it is declared: `[{shown}: {i}]`"),
+                            );
+                        }
+                    }
+                }
+                _ => {
+                    let key = self.impl_key(&t);
+                    for i in &ifaces {
+                        let ok = key.as_ref().is_some_and(|k| self.impl_of.contains(&(i.clone(), k.clone())));
+                        if !ok {
+                            let shown = self.show(&t);
+                            self.error_help(
+                                span,
+                                format!("`{shown}` does not implement `{i}`"),
+                                format!("write `impl {i} for {shown} {{ ... }}`"),
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fn collect_fns(&mut self, module: &Module) {
@@ -1626,11 +1939,29 @@ different name, or call it as a method if you meant to extend a type (UFCS)",
                     (Type::Fallible(ok, e), None) => (*ok, Some(*e)),
                     _ => (ret, err),
                 };
+                let mut bounds = Vec::new();
+                for (g, bs) in f.generics.iter().zip(&f.bounds) {
+                    let mut names = Vec::new();
+                    for b in bs {
+                        let iname = b.segments.last().map(|s| s.name.clone()).unwrap_or_default();
+                        if !self.interfaces.contains_key(&iname) {
+                            self.error(
+                                b.span,
+                                format!("unknown interface `{iname}` bounding `{}`", g.name),
+                            );
+                            continue;
+                        }
+                        names.push(iname);
+                    }
+                    bounds.push(names);
+                }
+                bounds.resize(generics.len(), Vec::new());
                 self.fns.insert(
                     key,
                     FnInfo {
                         is_pub: f.is_pub,
                         generics: generics.len(),
+                        bounds,
                         params,
                         modes: f.params.iter().map(|p| p.mode).collect(),
                         ret,
@@ -1989,6 +2320,7 @@ different name, or call it as a method if you meant to extend a type (UFCS)",
         self.hof_closures.clear();
         collect_hof_closures_block(&f.body, &mut self.hof_closures);
         self.current_generics = f.generics.iter().map(|g| g.name.clone()).collect();
+        self.current_bounds = info.bounds.clone();
         self.key_generic_owner = if f.generics.is_empty() {
             None
         } else {
@@ -2178,7 +2510,9 @@ is a failure nothing reports",
         }
         self.scopes.pop();
         self.current_generics.clear();
+        self.current_bounds.clear();
         self.key_generic_owner = None;
+        self.flush_bound_obligations();
     }
 
     // ------------------------------------------------------------------
@@ -5350,6 +5684,17 @@ fail outside it",
     ) -> Type {
         self.check_region_call_in(owner, name, args, span);
         let fresh: Vec<Type> = (0..info.generics).map(|_| self.uni.fresh()).collect();
+        for (v, b) in fresh.iter().zip(&info.bounds) {
+            if !b.is_empty() {
+                self.bound_obligations.push((
+                    v.clone(),
+                    b.clone(),
+                    span,
+                    self.current_bounds.clone(),
+                    self.current_generics.clone(),
+                ));
+            }
+        }
         if args.len() != info.params.len() {
             return self.error(
                 span,
@@ -5973,6 +6318,11 @@ Perform the effect after the closing brace, or yield a number and do the work ou
         // naming the inference variable it was about to resolve.
         self.force_deferred(&recv_ty);
         let recv_res = self.uni.resolve(&recv_ty);
+        // A method an `impl` provides is found before a builtin of the same
+        // name ([T-INTERFACE]).
+        if let Some(result) = self.interface_method(&recv_res, recv, name, args, span) {
+            return result;
+        }
         if let Some(result) = self.builtin_method(&recv_res, recv, name, args, span) {
             return result;
         }

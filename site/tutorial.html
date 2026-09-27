@@ -160,6 +160,41 @@
 <span class="kw">fn</span> <span class="fn">main</span><span class="op">(</span><span class="op">)</span> <span class="op">{</span>
     <span class="fn">print</span><span class="op">(</span><span class="st">"{hash("grasm")} {104.to_char()}"</span><span class="op">)</span>
 <span class="op">}</span></code></pre>
+<h2 id="3a-interfaces">3a. Interfaces</h2>
+<p>A generic function works on any type — which means that inside it, a <code>T</code> can do almost nothing, because nothing is known about it. An <code>interface</code> names what a type must provide, and a bound says a type parameter provides it:</p>
+<pre><code><span class="kw">interface</span> <span class="ty">Show</span> <span class="op">{</span>
+    <span class="kw">fn</span> <span class="fn">show</span><span class="op">(</span>self<span class="op">)</span> <span class="op">-&gt;</span> <span class="ty">str</span>
+<span class="op">}</span>
+
+<span class="kw">type</span> <span class="ty">Point</span> <span class="op">=</span> <span class="op">{</span> x<span class="op">:</span> <span class="ty">i64</span><span class="op">,</span> y<span class="op">:</span> <span class="ty">i64</span> <span class="op">}</span>
+
+<span class="kw">impl</span> <span class="ty">Show</span> <span class="kw">for</span> <span class="ty">Point</span> <span class="op">{</span>
+    <span class="kw">fn</span> <span class="fn">show</span><span class="op">(</span>self<span class="op">)</span> <span class="op">-&gt;</span> <span class="ty">str</span> <span class="op">{</span>
+        <span class="st">"({self.x}, {self.y})"</span>
+    <span class="op">}</span>
+<span class="op">}</span>
+
+<span class="kw">impl</span> <span class="ty">Show</span> <span class="kw">for</span> <span class="ty">i64</span> <span class="op">{</span>
+    <span class="kw">fn</span> <span class="fn">show</span><span class="op">(</span>self<span class="op">)</span> <span class="op">-&gt;</span> <span class="ty">str</span> <span class="op">{</span>
+        <span class="st">"#{self}"</span>
+    <span class="op">}</span>
+<span class="op">}</span>
+
+<span class="kw">fn</span> all_shown<span class="op">[</span><span class="ty">T</span><span class="op">:</span> <span class="ty">Show</span><span class="op">]</span><span class="op">(</span>xs<span class="op">:</span> <span class="op">[</span><span class="ty">T</span><span class="op">]</span><span class="op">)</span> <span class="op">-&gt;</span> <span class="ty">str</span> <span class="op">{</span>
+    <span class="kw">var</span> out <span class="op">=</span> <span class="st">""</span>
+    <span class="kw">for</span> x <span class="kw">in</span> xs <span class="op">{</span>
+        out <span class="op">+=</span> x<span class="op">.</span><span class="fn">show</span><span class="op">(</span><span class="op">)</span> <span class="op">+</span> <span class="st">" "</span>
+    <span class="op">}</span>
+    out
+<span class="op">}</span>
+
+<span class="kw">fn</span> <span class="fn">main</span><span class="op">(</span><span class="op">)</span> <span class="op">{</span>
+    <span class="fn">print</span><span class="op">(</span><span class="fn">all_shown</span><span class="op">(</span><span class="op">[</span><span class="ty">Point</span><span class="op">{</span> x<span class="op">:</span> <span class="nu">1</span><span class="op">,</span> y<span class="op">:</span> <span class="nu">2</span> <span class="op">}</span><span class="op">,</span> <span class="ty">Point</span><span class="op">{</span> x<span class="op">:</span> <span class="nu">3</span><span class="op">,</span> y<span class="op">:</span> <span class="nu">4</span> <span class="op">}</span><span class="op">]</span><span class="op">)</span><span class="op">)</span>
+    <span class="fn">print</span><span class="op">(</span><span class="fn">all_shown</span><span class="op">(</span><span class="op">[</span><span class="nu">7</span><span class="op">,</span> <span class="nu">8</span><span class="op">]</span><span class="op">)</span><span class="op">)</span>
+<span class="op">}</span></code></pre>
+<p><code>self</code> is the value the method is called on, and <code>Self</code> in an interface means "the implementing type". The method is chosen by the receiver's type, so <code>Point</code> and <code>i64</code> can each have a <code>show</code>.</p>
+<p>The bound is checked where the function is written, not where it is used: <code>x.show()</code> in a function declared <code>[T]</code> rather than <code>[T: Show]</code> is an error even if every caller happens to pass something showable. And a call with a type that has no <code>impl</code> is refused at that call, by name — "<code>Dog</code> does not implement <code>Show</code>" — rather than somewhere inside the generic function.</p>
+<p>Two limits for now, both refused with a message: an <code>impl</code> is for a declared non-generic type or for <code>i64</code>, <code>f64</code>, <code>bool</code> or <code>str</code>; and an interface method performs no effects, so an <code>impl</code> method cannot print. The second is what lets a generic function's own effect row stay honest without knowing which <code>impl</code> it will reach.</p>
 <h2 id="4-errors-are-values">4. Errors are values</h2>
 <p>There are no exceptions. A function that can fail says so in its type with <code>! E</code>, raises with <code>fail</code>, and callers propagate with <code>try</code>.</p>
 <pre><code><span class="kw">fn</span> <span class="fn">divide</span><span class="op">(</span>a<span class="op">:</span> <span class="ty">i64</span><span class="op">,</span> b<span class="op">:</span> <span class="ty">i64</span><span class="op">)</span> <span class="op">-&gt;</span> <span class="ty">i64</span> <span class="op">!</span> <span class="ty">str</span> <span class="op">{</span>

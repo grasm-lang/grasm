@@ -239,6 +239,11 @@ pub fn type_signature(t: &TypeDecl) -> String {
     s
 }
 
+pub fn interface_signature(i: &grasm_syntax::ast::InterfaceDecl) -> String {
+    let ms: Vec<String> = i.methods.iter().map(fn_sig_text).collect();
+    format!("interface {} {{ {} }}", i.name.name, ms.join("; "))
+}
+
 pub fn effect_signature(e: &EffectDecl) -> String {
     let ops: Vec<String> = e.ops.iter().map(fn_sig_text).collect();
     format!("effect {} {{ {} }}", e.name.name, ops.join("; "))
@@ -354,6 +359,17 @@ pub fn module_signature(module: &Module) -> String {
             Decl::Import(i) => {
                 out.push_str("import ");
                 out.push_str(&i.path.dotted());
+                out.push('\n');
+            }
+            // An interface and an impl are both part of what another module
+            // can rely on: one is a contract, the other decides which types
+            // meet it. The impl's methods are `Decl::Fn`s of their own.
+            Decl::Interface(i) => {
+                out.push_str(&interface_signature(i));
+                out.push('\n');
+            }
+            Decl::Impl(i) => {
+                out.push_str(&format!("impl {} for {}", i.iface.dotted(), i.type_name));
                 out.push('\n');
             }
             // Tests and benchmarks are not part of any other module's view.
@@ -476,6 +492,8 @@ fn decl_name(d: &Decl) -> String {
         Decl::Test(t) => t.name.clone(),
         Decl::Bench(b) => b.name.clone(),
         Decl::Import(i) => i.path.dotted(),
+        Decl::Interface(i) => i.name.name.clone(),
+        Decl::Impl(i) => format!("{} for {}", i.iface.dotted(), i.type_name),
     }
 }
 

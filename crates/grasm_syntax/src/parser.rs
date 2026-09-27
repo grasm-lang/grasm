@@ -195,6 +195,9 @@ struct Parser {
     /// Whether the map reading of `{...}` has read a `key :` and so cannot be
     /// anything else.
     map_committed: bool,
+    /// Functions an `impl` was lowered to, waiting to follow its header into
+    /// the module ([T-INTERFACE]).
+    lowered: Vec<Decl>,
 }
 
 /// What to write instead, for an operator this language does not have.
@@ -225,6 +228,7 @@ impl Parser {
             depth: 0,
             not_a_map: std::collections::HashSet::new(),
             map_committed: false,
+            lowered: Vec::new(),
         }
     }
 
@@ -515,7 +519,10 @@ impl Parser {
             }
             let before = self.i;
             match self.parse_decl() {
-                Ok(d) => module.decls.push(d),
+                Ok(d) => {
+                    module.decls.push(d);
+                    module.decls.append(&mut self.lowered);
+                }
                 Err(()) => {
                     self.sync_decl();
                     // Recovery must consume something. If it did not, the same
@@ -546,10 +553,12 @@ impl Parser {
             TokenKind::KwEffect => Ok(Decl::Effect(self.parse_effect_decl()?)),
             TokenKind::KwTest => Ok(Decl::Test(self.parse_test_decl()?)),
             TokenKind::KwImport => Ok(Decl::Import(self.parse_import()?)),
+            TokenKind::KwInterface => Ok(Decl::Interface(self.parse_interface(is_pub)?)),
+            TokenKind::KwImpl => Ok(Decl::Impl(self.parse_impl()?)),
             _ => {
                 let found = self.cur().describe();
                 self.error_here(format!(
-                    "expected a declaration (`fn`, `let`, `type`, `effect`, `test`, `bench`, `import`) but found {found}"
+                    "expected a declaration (`fn`, `let`, `type`, `effect`, `interface`, `impl`, `test`, `bench`, `import`) but found {found}"
                 ));
                 Err(())
             }
@@ -600,11 +609,17 @@ impl Parser {
     }
 
     fn parse_fn(&mut self, is_pub: bool) -> PResult<FnDecl> {
+        self.parse_fn_with_self(is_pub, None)
+    }
+
+    /// A function, or -- given the type `self` stands for -- a method of an
+    /// `impl`, whose first parameter may be the bare word `self`.
+    fn parse_fn_with_self(&mut self, is_pub: bool, self_ty: Option<&TypeExpr>) -> PResult<FnDecl> {
         let start = self.cur_span();
         self.expect(&TokenKind::KwFn)?;
         let name = self.ident()?;
-        let generics = self.parse_generics()?;
-        let params = self.parse_params()?;
+        let (generics, bounds) = self.parse_generics()?;
+        let params = self.parse_params_self(self_ty)?;
         let (ret, err, effects) = self.parse_fn_tail()?;
         let body = self.parse_block()?;
         let span = start.merge(body.span);
@@ -612,6 +627,7 @@ impl Parser {
             is_pub,
             name,
             generics,
+            bounds,
             params,
             ret,
             err,
@@ -621,24 +637,177 @@ impl Parser {
         })
     }
 
-    fn parse_generics(&mut self) -> PResult<Vec<Ident>> {
+    /// `[T, U]`, each optionally bounded: `[T: Show + Ord, U]`
+    /// ([T-INTERFACE-BOUND]). The bounds come back aligned with the names.
+    fn parse_generics(&mut self) -> PResult<(Vec<Ident>, Vec<Vec<Path>>)> {
         let mut generics = Vec::new();
+        let mut bounds = Vec::new();
         if self.eat(&TokenKind::LBracket) {
             loop {
                 if self.at(&TokenKind::RBracket) {
                     break;
                 }
                 generics.push(self.ident()?);
+                let mut these = Vec::new();
+                if self.eat(&TokenKind::Colon) {
+                    loop {
+                        these.push(self.parse_path()?);
+                        if !self.eat(&TokenKind::Plus) {
+                            break;
+                        }
+                    }
+                }
+                bounds.push(these);
                 if !self.eat(&TokenKind::Comma) {
                     break;
                 }
             }
             self.expect(&TokenKind::RBracket)?;
         }
-        Ok(generics)
+        Ok((generics, bounds))
+    }
+
+    /// `interface Show { fn show(self) -> str }`. A signature's `self` is a
+    /// parameter of type `Self`.
+    fn parse_interface(&mut self, is_pub: bool) -> PResult<InterfaceDecl> {
+        let start = self.cur_span();
+        self.expect(&TokenKind::KwInterface)?;
+        let name = self.ident()?;
+        self.expect(&TokenKind::LBrace)?;
+        let self_ty = TypeExpr::Name {
+            path: Path {
+                segments: vec![Ident {
+                    name: "Self".to_string(),
+                    span: name.span,
+                }],
+                span: name.span,
+            },
+            args: Vec::new(),
+            span: name.span,
+        };
+        let mut methods = Vec::new();
+        loop {
+            self.skip_newlines();
+            if self.at(&TokenKind::RBrace) {
+                break;
+            }
+            let m_start = self.cur_span();
+            self.expect(&TokenKind::KwFn)?;
+            let m_name = self.ident()?;
+            let params = self.parse_params_self(Some(&self_ty))?;
+            let (ret, err, fx) = self.parse_fn_tail()?;
+            if fx.is_some() {
+                self.error_here(
+                    "an interface method declares no effects ([T-INTERFACE-PURE])",
+                );
+                return Err(());
+            }
+            let span = m_start.merge(self.toks[self.i - 1].span);
+            methods.push(FnSig {
+                name: m_name,
+                params,
+                ret,
+                err,
+                span,
+            });
+        }
+        let rb = self.expect(&TokenKind::RBrace)?;
+        Ok(InterfaceDecl {
+            is_pub,
+            name,
+            methods,
+            span: start.merge(rb.span),
+        })
+    }
+
+    /// `impl Show for Point { fn show(self) -> str { ... } }`.
+    ///
+    /// Each method is lowered here into an ordinary function named
+    /// `method@Type` with `self` as its first parameter and every `Self`
+    /// in its signature replaced by the implementing type, and queued in
+    /// `lowered` to follow the header into the module. So every engine sees
+    /// plain functions and needs to know nothing about `impl` except where a
+    /// method call resolves to one.
+    fn parse_impl(&mut self) -> PResult<ImplDecl> {
+        let start = self.cur_span();
+        self.expect(&TokenKind::KwImpl)?;
+        let iface = self.parse_path()?;
+        match self.cur() {
+            TokenKind::KwFor => {
+                self.bump();
+            }
+            _ => {
+                let found = self.cur().describe();
+                self.error_here(format!(
+                    "expected `for` after the interface name, as in `impl Show for Point`, but found {found}"
+                ));
+                return Err(());
+            }
+        }
+        let ty = self.parse_type()?;
+        let type_name = match &ty {
+            TypeExpr::Name { path, args, .. } if args.is_empty() && path.segments.len() == 1 => {
+                path.segments[0].name.clone()
+            }
+            other => {
+                self.diags.push(Diagnostic::error(
+                    other.span(),
+                    "an `impl` is for a declared, non-generic type or for `i64`, `f64`, `bool` or `str` ([T-INTERFACE])",
+                ));
+                return Err(());
+            }
+        };
+        self.expect(&TokenKind::LBrace)?;
+        let mut methods = Vec::new();
+        loop {
+            self.skip_newlines();
+            if self.at(&TokenKind::RBrace) {
+                break;
+            }
+            let mut f = self.parse_fn_with_self(false, Some(&ty))?;
+            for p in &mut f.params {
+                p.ty = replace_self(&p.ty, &ty);
+            }
+            f.ret = f.ret.as_ref().map(|t| replace_self(t, &ty));
+            f.err = f.err.as_ref().map(|t| replace_self(t, &ty));
+            // An interface method performs nothing, so its `impl` may not
+            // either ([T-INTERFACE-PURE]). Declaring the empty row lets the
+            // ordinary row check say so, at the line that performs.
+            if f.effects.is_some() {
+                self.diags.push(Diagnostic::error(
+                    f.name.span,
+                    "an `impl` method declares no effects: its interface's methods perform none ([T-INTERFACE-PURE])",
+                ));
+            }
+            f.effects = Some(Vec::new());
+            let lowered = impl_fn_name(&f.name.name, &type_name);
+            methods.push((f.name.clone(), lowered.clone()));
+            f.name = Ident {
+                name: lowered,
+                span: f.name.span,
+            };
+            // Visible wherever the type is: an impl method is reached through
+            // a value of its type, not by importing its name.
+            f.is_pub = true;
+            self.lowered.push(Decl::Fn(f));
+        }
+        let rb = self.expect(&TokenKind::RBrace)?;
+        Ok(ImplDecl {
+            iface,
+            ty,
+            type_name,
+            methods,
+            span: start.merge(rb.span),
+        })
     }
 
     fn parse_params(&mut self) -> PResult<Vec<Param>> {
+        self.parse_params_self(None)
+    }
+
+    /// A parameter list. With `self_ty`, the first parameter may be the bare
+    /// word `self`, which stands for a parameter of that type.
+    fn parse_params_self(&mut self, self_ty: Option<&TypeExpr>) -> PResult<Vec<Param>> {
         self.expect(&TokenKind::LParen)?;
         let mut params = Vec::new();
         loop {
@@ -646,6 +815,31 @@ impl Parser {
                 break;
             }
             let start = self.cur_span();
+            if matches!(self.cur(), TokenKind::Ident(n) if n == "self")
+                && !matches!(self.toks.get(self.i + 1).map(|t| &t.kind), Some(TokenKind::Colon))
+            {
+                let Some(st) = self_ty else {
+                    self.error_here(
+                        "`self` is a parameter of an interface or `impl` method only ([T-INTERFACE])",
+                    );
+                    return Err(());
+                };
+                if !params.is_empty() {
+                    self.error_here("`self` must be the first parameter");
+                    return Err(());
+                }
+                let name = self.ident()?;
+                params.push(Param {
+                    mode: ParamMode::Let,
+                    name,
+                    ty: st.clone(),
+                    span: start,
+                });
+                if !self.eat(&TokenKind::Comma) {
+                    break;
+                }
+                continue;
+            }
             let mode = if self.eat(&TokenKind::KwInout) {
                 ParamMode::Inout
             } else if self.eat(&TokenKind::KwOwn) {
@@ -742,7 +936,11 @@ impl Parser {
         let start = self.cur_span();
         self.expect(&TokenKind::KwType)?;
         let name = self.ident()?;
-        let generics = self.parse_generics()?;
+        let (generics, bounds) = self.parse_generics()?;
+        if bounds.iter().any(|b| !b.is_empty()) {
+            self.error_here("a type's parameters take no bounds; bound the functions that use it");
+            return Err(());
+        }
         self.expect(&TokenKind::Eq)?;
         self.skip_newlines();
         let (body, end_span) = if self.at(&TokenKind::LBrace) {

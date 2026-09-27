@@ -183,6 +183,57 @@ requirement is the language's rather than either engine's. The check waits for i
 finish, so a parameter a *later* line fixes is determined: `let a = Good(1)`
 followed by a use that needs `Res[i64, str]` is accepted.
 
+### Interfaces
+
+**[T-INTERFACE]** An `interface` names a set of methods a type can provide, and
+an `impl` provides them for one type:
+
+```grasm
+interface Show {
+    fn show(self) -> str
+}
+
+type Point = { x: i64, y: i64 }
+
+impl Show for Point {
+    fn show(self) -> str {
+        "({self.x}, {self.y})"
+    }
+}
+
+fn describe[T: Show](x: T) -> str {
+    "<" + x.show() + ">"
+}
+```
+
+`self` is the receiver, of the implementing type; in an interface, and in an
+`impl`, `Self` names that type. A method of an `impl` is called as a method,
+`p.show()`, and resolves by the receiver's type — so two types may each have a
+`show` without either name taking the other's place. A method from an `impl`
+is found before a builtin method of the same name. An `impl` may be written
+for a declared, non-generic struct or sum type, or for `i64`, `f64`, `bool` or
+`str`. A type has at most one `impl` of each interface in a program.
+
+**[T-INTERFACE-BOUND]** A type parameter may be bounded, `[T: Show]` or
+`[T: Show + Ord]`. Inside the body, a value of type `T` offers exactly the
+methods of its bounds — checked where the function is written, once, not at
+each use ([T-GENERIC-INST]). Calling a method no bound provides is an error at
+the definition, whatever types it is later called with.
+
+**[T-INTERFACE-UNSATISFIED]** A call to a bounded function must give each
+bounded parameter a type with an `impl` of every bound, or a type parameter of
+its own caller that carries those bounds. Otherwise the call is an error that
+names the type and the missing interface.
+
+**[T-INTERFACE-IMPL]** An `impl` must provide every method of its interface,
+each with the interface's signature under `Self` = the implementing type, and
+nothing else.
+
+**[T-INTERFACE-PURE]** An interface method declares no effects, so a bounded
+call performs none. An `impl` method may therefore perform none either: one
+that does is an error at the `impl`. (A row on interface methods is future
+work; this keeps a generic body's own row honest in the meantime.)
+
 ## 5. Errors as values
 
 **[T-FALLIBLE]** `T ! E` is the type of a computation yielding `T` or failing

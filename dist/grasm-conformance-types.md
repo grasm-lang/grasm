@@ -1,6 +1,6 @@
 # Grasm — conformance programs: types
 
-The type and effect system — what a program means before it runs. 97 executable program(s), one per normative clause of
+The type and effect system — what a program means before it runs. 102 executable program(s), one per normative clause of
 `grasm-language-pack.md`. Each header states the tag it demonstrates and the
 exact expected behaviour, and every one is run by `cargo test -p grasm_spec`, so
 a program here cannot describe behaviour the implementation does not have.
@@ -1745,6 +1745,207 @@ fn main() {
 }
 ```
 
+## `T-INTERFACE-BOUND.gr`
+
+```grasm
+//! tag: T-INTERFACE-BOUND
+//! expect: error
+//! `T` has no method `show`
+// Inside a generic body a `T` offers only what its bounds promise. With no
+// bound there is nothing to call, and the error is at the definition — not
+// deferred to some call that happens to pass a type with a `show`.
+interface Show {
+    fn show(self) -> str
+}
+
+fn describe[T](x: T) -> str {
+    x.show()
+}
+
+fn main() {
+    print("never")
+}
+```
+
+## `T-INTERFACE-IMPL.gr`
+
+```grasm
+//! tag: T-INTERFACE-IMPL
+//! expect: error
+//! does not provide `cmp`
+// An `impl` provides every method its interface declares.
+interface Ord {
+    fn cmp(self, other: Self) -> i64
+    fn eq(self, other: Self) -> bool
+}
+
+type Point = { x: i64 }
+
+impl Ord for Point {
+    fn eq(self, other: Self) -> bool {
+        self.x == other.x
+    }
+}
+
+fn main() {
+    print("never")
+}
+```
+
+## `T-INTERFACE-PURE.gr`
+
+```grasm
+//! tag: T-INTERFACE-PURE
+//! expect: error
+//! performs `io`
+// An interface method declares no effects, so a bounded call cannot perform
+// any. An `impl` method that prints would let a generic body with an empty row
+// print through it.
+interface Show {
+    fn show(self) -> str
+}
+
+type Point = { x: i64 }
+
+impl Show for Point {
+    fn show(self) -> str {
+        print("side effect")
+        "p"
+    }
+}
+
+fn main() {
+    print(Point{ x: 1 }.show())
+}
+```
+
+## `T-INTERFACE-UNSATISFIED.gr`
+
+```grasm
+//! tag: T-INTERFACE-UNSATISFIED
+//! expect: error
+//! `Point` does not implement `Show`
+// A bounded parameter needs an `impl` of every bound at each call.
+interface Show {
+    fn show(self) -> str
+}
+
+type Point = { x: i64 }
+
+fn describe[T: Show](x: T) -> str {
+    x.show()
+}
+
+fn main() {
+    print(describe(Point{ x: 1 }))
+}
+```
+
+## `T-INTERFACE.gr`
+
+```grasm
+//! tag: T-INTERFACE
+//! expect: output
+//! (1, 2)
+//! red
+//! <(3, 4)> <blue>
+//! 7!
+//! 3 2
+//! (5, 6) is the larger
+//! len 5
+//! <(2, 2)> <9!>
+// Interfaces: a method set, provided per type by an `impl`, and resolved by the
+// receiver's type — so `Point` and `Color` each have a `show`.
+interface Show {
+    fn show(self) -> str
+}
+
+interface Ord {
+    fn cmp(self, other: Self) -> i64
+}
+
+type Point = { x: i64, y: i64 }
+
+type Color = | Red | Blue
+
+impl Show for Point {
+    fn show(self) -> str {
+        "({self.x}, {self.y})"
+    }
+}
+
+impl Ord for Point {
+    fn cmp(self, other: Self) -> i64 {
+        (self.x + self.y) - (other.x + other.y)
+    }
+}
+
+impl Show for Color {
+    fn show(self) -> str {
+        match self {
+            Red -> "red"
+            Blue -> "blue"
+        }
+    }
+}
+
+// A primitive may have an `impl` too.
+impl Show for i64 {
+    fn show(self) -> str {
+        "{self}!"
+    }
+}
+
+impl Ord for i64 {
+    fn cmp(self, other: Self) -> i64 {
+        self - other
+    }
+}
+
+// A method from an `impl` is found before a builtin of the same name.
+interface Sized {
+    fn len(self) -> i64
+}
+
+impl Sized for str {
+    fn len(self) -> i64 {
+        5
+    }
+}
+
+fn describe[T: Show](x: T) -> str {
+    "<" + x.show() + ">"
+}
+
+fn largest[T: Ord](xs: [T]) -> T {
+    var best = xs[0]
+    for x in xs {
+        if x.cmp(best) > 0 {
+            best = x
+        }
+    }
+    best
+}
+
+// A bounded parameter passed on to another bounded function.
+fn larger_shown[T: Show + Ord](a: T, b: T) -> str {
+    if a.cmp(b) >= 0 { describe(a) } else { describe(b) }
+}
+
+fn main() {
+    let p = Point{ x: 1, y: 2 }
+    print(p.show())
+    print(Red.show())
+    print("{describe(Point{ x: 3, y: 4 })} {describe(Blue)}")
+    print(7.show())
+    print("{largest([1, 3, 2])} {largest([2, 1])}")
+    let big = largest([Point{ x: 1, y: 1 }, Point{ x: 5, y: 6 }, Point{ x: 0, y: 2 }])
+    print("{big.show()} is the larger")
+    print("len {"hi".len()}")
+    print("{larger_shown(Point{ x: 1, y: 1 }, Point{ x: 2, y: 0 + 2 })} {larger_shown(4, 9)}")
+}
+```
+
 ## `T-LET-IMMUTABLE.gr`
 
 ```grasm
@@ -2383,13 +2584,84 @@ fn main() {
 //! tag: T-PARAM-LET
 //! expect: output
 //! 2 2
+//! 20 42 5
+//! [0, 10, 20, 30, 40] [[0, 10, 20, 30, 40]] [0, 10, 20, 30, 40]
+//! 100 8
+//! 50 [0, 10, 20, 30, 40]
+//! [0, 10, 20, 30, 40] 42
+type P = { v: i64, tag: str }
+
 fn size(xs: [i64]) -> i64 {
     xs.len()
 }
+
+// A parameter the callee only reads is *lent*: the caller adds no reference
+// and the callee releases none. Which of these qualify is decided by
+// `param_is_borrowed` in the native backend, and getting it wrong frees a
+// value the caller is still holding — so every shape is exercised here.
+fn peek(xs: [i64], i: i64) -> i64 {
+    return xs[i]
+}
+fn field(p: P) -> i64 {
+    return p.v
+}
+// Returns it, so the reference has to be real.
+fn give_back(xs: [i64]) -> [i64] {
+    return xs
+}
+// Stores it somewhere that outlives the call.
+fn stash(xs: [i64]) -> [[i64]] {
+    var out: [[i64]] = []
+    out.push(xs)
+    return out
+}
+// Hands it to something else, which takes it.
+fn relay(xs: [i64]) -> [i64] {
+    return give_back(xs)
+}
+// Reads it while calling something that does not take it.
+fn sum2(xs: [i64], n: i64) -> i64 {
+    var s = 0
+    for i in 0..n {
+        s = s + peek(xs, i)
+    }
+    return s
+}
+// A temporary handed to a lent parameter still has to be released by someone.
+fn make() -> [i64] {
+    return [7, 8, 9]
+}
+
+// Reached through a *function value* the parameter is still lent, but the
+// closure ABI has one shape for every function, so no call site can know it.
+// The wrapper that bridges the two conventions releases what the callee did
+// not, or every such call leaks its argument.
+fn last_of(xs: [i64], n: i64) -> i64 {
+    return xs[n - 1]
+}
+
 fn main() {
     let xs = [1, 2]
     // A plain parameter does not consume the caller's binding.
     print("{size(xs)} {size(xs)}")
+
+    var ys: [i64] = []
+    for i in 0..5 {
+        ys.push(i * 10)
+    }
+    let p = P{ v: 42, tag: "t" }
+    print("{peek(ys, 2)} {field(p)} {size(ys)}")
+    print("{give_back(ys)} {stash(ys)} {relay(ys)}")
+    print("{sum2(ys, 5)} {peek(make(), 1)}")
+    let fns = [peek, last_of]
+    var through = 0
+    for f in fns {
+        through = through + f(ys, 3)
+    }
+    print("{through} {ys}")
+
+    // Everything the caller lent is still its own afterwards.
+    print("{ys} {p.v}")
 }
 ```
 
@@ -3185,11 +3457,66 @@ fn main() {
 //! tag: T-TUPLE
 //! expect: output
 //! 1 is one
+//! 1
+//! 0
+//! 3 [7]
+//! -1 ok
+// An element that *leaves* before the tuple exists abandons the elements
+// already built — and there is nowhere to release them from unless the
+// half-built tuple is held somewhere the scope can find. Every spelling of
+// leaving is here: `return`, `break`, `continue` and `try`. None of them
+// changes what the program prints, which is why this is a leak rather than a
+// wrong answer, and why only `GRASM_LEAK_CHECK=1` can see it.
+type Bad = | Bad
+
+fn risky() -> i64 ! Bad {
+    fail(Bad)
+}
+
+fn by_return(kept: [i64]) -> i64 {
+    let made = (kept, if true { return 1 } else { [2] })
+    let _n = made.0.len()
+    0
+}
+
+fn by_break(kept: [i64]) -> i64 {
+    var n = 0
+    for _i in 0..3 {
+        let made = (kept, if true { break } else { [2] })
+        let _n = made.0.len()
+        n = n + 1
+    }
+    n
+}
+
+fn by_continue(kept: [i64]) -> i64 {
+    var n = 0
+    for _i in 0..3 {
+        let made = (kept, if true { continue } else { [2] })
+        let _n = made.0.len()
+        n = n + 1
+    }
+    n
+}
+
+fn by_try(kept: [i64]) -> i64 ! Bad {
+    let made = (kept, try risky())
+    return made.0.len()
+}
+
 fn main() {
     let pair = (1, "one")
     match pair {
         (n, name) -> print("{n} is {name}")
     }
+
+    let xs = [1, 2]
+    print("{by_return(xs)}")
+    print("{by_break(xs) + by_continue(xs)}")
+    // The tuple that does *not* leave still holds what it was given.
+    let held = (3, [7])
+    print("{held.0} {held.1}")
+    print("{by_try(xs) ?? 0 - 1} ok")
 }
 ```
 

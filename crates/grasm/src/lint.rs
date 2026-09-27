@@ -193,7 +193,12 @@ impl<'a> Linter<'a> {
                 self.pop_scope();
             }
             Decl::Const(c) => self.expr(&c.init),
-            Decl::Import(_) | Decl::Type(_) | Decl::Effect(_) | Decl::Extern(_) => {}
+            Decl::Import(_)
+            | Decl::Type(_)
+            | Decl::Effect(_)
+            | Decl::Extern(_)
+            | Decl::Interface(_)
+            | Decl::Impl(_) => {}
         }
     }
 

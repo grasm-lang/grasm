@@ -1,0 +1,17 @@
+//! tag: T-INTERFACE-BOUND
+//! expect: error
+//! `T` has no method `show`
+// Inside a generic body a `T` offers only what its bounds promise. With no
+// bound there is nothing to call, and the error is at the definition — not
+// deferred to some call that happens to pass a type with a `show`.
+interface Show {
+    fn show(self) -> str
+}
+
+fn describe[T](x: T) -> str {
+    x.show()
+}
+
+fn main() {
+    print("never")
+}
