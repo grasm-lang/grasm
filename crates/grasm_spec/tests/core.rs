@@ -221,6 +221,8 @@ fn every_ast_form_is_classified() {
         ("Const", "at module level"),
         ("Test", "test \"name\""),
         ("Bench", "bench \"name\""),
+        ("Interface", "interface I {"),
+        ("Impl", "impl I for T {"),
         ("Name", "named type, applied"),
         ("Fallible", "T ! E"),
         ("Ref", "ref T"),

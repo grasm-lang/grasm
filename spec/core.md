@@ -148,13 +148,15 @@ String **interpolation** — `"a{e}b"` — is Full within form 1: it rewrites to
 | `parallel { … }` | `{ … }` with each `spawn` body run in order — [E-NOT-PARALLEL] already says tasks are not multicore, so the rewrite is exact |
 | `spawn { B }` | the block `B`, deferred to the end of the enclosing `parallel` |
 
-### Declarations (3)
+### Declarations (5)
 
 | Form | Rewrite into Core |
 |---|---|
 | `let NAME = e` at module level | `fn NAME() -> T { e }` plus a use-site rewrite of `NAME` to `NAME()`; sound because [E-CONST] already fixes one value for the whole program |
 | `test "name" { B }` | `fn §test_name() { B }`, collected by the runner rather than by the language |
 | `bench "name" { B }` | `fn §bench_name() { B }`, likewise |
+| `interface I { … }` | nothing: a constraint the checker reads, erased before any engine runs ([T-INTERFACE]) |
+| `impl I for T { fn m(self, …) … }` | `fn m@T(self: T, …) …`, and each `x.m(…)` the checker resolved through it becomes `m@T(x, …)` by `x`'s type |
 
 ### Types (1)
 
@@ -196,13 +198,6 @@ entry is the reason to say so: it takes two forms out and puts one in.
    `set_at` and calling indexing sugar for them: nobody would write those
    methods, and inventing surface so a count comes out right is the thing this
    document exists to prevent.
-
-`try` used to be the seventh entry here and is now in the Full table, because
-the rewrite turned out to exist and to be exact:
-`try e` is `match e { Ok(v) -> v  Err(er) -> return Err(er) }`. That was checked
-by writing a program both ways and running it, on the ok branch and the failing
-one, rather than by reasoning about it — which is how the other six will have to
-be settled too.
 
 Four of those six are real design work, not bookkeeping. The count is 36 and the
 route to 30 is written down; claiming 30 today would be false.

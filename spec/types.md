@@ -62,13 +62,6 @@ it names, so it has nowhere to stop — unlike a struct or a sum, which
 [T-RECURSIVE] does allow to refer to themselves, because a value of one is
 built out of *other* values.
 
-`type A = [A]` was accepted at the declaration and then walked recursively by
-every pass that reads a written type: the process aborted with a Rust stack
-overflow, exit 134 and no diagnostic at all — and a dependency carrying the
-line took its consumer's toolchain down with it, after `grasm deps` had
-printed a partial success line. [G-NEST-LIMIT]: exceeding a cap is a
-diagnostic, never a crash.
-
 **[T-RECURSIVE]** A type may refer to itself, directly or through a
 collection: `type Json = | JArr(items: [Json]) | JObj(fields: Map[str, Json])`
 is the shape a parser needs and is legal. Recursion through a field of the
@@ -185,54 +178,39 @@ followed by a use that needs `Res[i64, str]` is accepted.
 
 ### Interfaces
 
-**[T-INTERFACE]** An `interface` names a set of methods a type can provide, and
-an `impl` provides them for one type:
+**[T-INTERFACE]** An `interface` names methods a type can provide; an `impl`
+provides them for one type:
 
 ```grasm
 interface Show {
     fn show(self) -> str
 }
-
-type Point = { x: i64, y: i64 }
-
 impl Show for Point {
-    fn show(self) -> str {
-        "({self.x}, {self.y})"
-    }
+    fn show(self) -> str { "({self.x}, {self.y})" }
 }
-
-fn describe[T: Show](x: T) -> str {
-    "<" + x.show() + ">"
-}
+fn describe[T: Show](x: T) -> str { "<" + x.show() + ">" }
 ```
 
-`self` is the receiver, of the implementing type; in an interface, and in an
-`impl`, `Self` names that type. A method of an `impl` is called as a method,
-`p.show()`, and resolves by the receiver's type — so two types may each have a
-`show` without either name taking the other's place. A method from an `impl`
-is found before a builtin method of the same name. An `impl` may be written
-for a declared, non-generic struct or sum type, or for `i64`, `f64`, `bool` or
-`str`. A type has at most one `impl` of each interface in a program.
+`self` is the receiver; `Self` names the implementing type. An `impl` method
+is called as a method and resolves by the receiver's type, before any builtin
+method of that name. An `impl` is for a declared non-generic type or for
+`i64`, `f64`, `bool` or `str`, and a type has at most one `impl` of each
+interface.
 
-**[T-INTERFACE-BOUND]** A type parameter may be bounded, `[T: Show]` or
-`[T: Show + Ord]`. Inside the body, a value of type `T` offers exactly the
-methods of its bounds — checked where the function is written, once, not at
-each use ([T-GENERIC-INST]). Calling a method no bound provides is an error at
-the definition, whatever types it is later called with.
+**[T-INTERFACE-BOUND]** In `[T: Show + Ord]`, a `T` offers exactly its bounds'
+methods, checked once at the definition: a method no bound provides is an
+error there, whatever the callers pass.
 
-**[T-INTERFACE-UNSATISFIED]** A call to a bounded function must give each
-bounded parameter a type with an `impl` of every bound, or a type parameter of
-its own caller that carries those bounds. Otherwise the call is an error that
-names the type and the missing interface.
+**[T-INTERFACE-UNSATISFIED]** Each call must give a bounded parameter a type
+with an `impl` of every bound, or a type parameter of the caller carrying
+those bounds; otherwise it is an error naming the type and the interface.
 
-**[T-INTERFACE-IMPL]** An `impl` must provide every method of its interface,
-each with the interface's signature under `Self` = the implementing type, and
+**[T-INTERFACE-IMPL]** An `impl` provides every method of its interface, each
+with the interface's signature under `Self` = the implementing type, and
 nothing else.
 
-**[T-INTERFACE-PURE]** An interface method declares no effects, so a bounded
-call performs none. An `impl` method may therefore perform none either: one
-that does is an error at the `impl`. (A row on interface methods is future
-work; this keeps a generic body's own row honest in the meantime.)
+**[T-INTERFACE-PURE]** An interface method declares no effects, so an `impl`
+method may perform none; one that does is an error at the `impl`.
 
 ## 5. Errors as values
 
@@ -324,12 +302,6 @@ scrutinee types require a `_` arm.
 
 **[T-MATCH-NESTED]** A pattern's *payload* counts too. `Wrap(A)` matches only
 the `Wrap`s carrying `A`, so it does not on its own cover `Wrap`.
-
-This used to not be checked at all: a payload pattern was recorded as covering
-its whole variant, so `match o { Wrap(A) -> … Plain -> … }` compiled and
-panicked on `Wrap(B)`. The same held for an integer payload, an `Option`
-payload and an `Ok`/`Err` payload. That is precisely the runtime surprise the
-clause above exists to prevent.
 
 **[T-MATCH-NESTED-COVER]** Payload patterns that *between them* cover the
 payload type do cover the variant: `Wrap(A)` and `Wrap(B)` cover `Wrap` exactly
@@ -448,15 +420,6 @@ the runtime at `main` and in tests.
 effects. They are capabilities the runtime discharges, not effects a program
 handles — there is no `with io handled_by`, the same point [T-UNSAFE-FFI]
 makes for `unsafe`.
-
-`unsafe` is a keyword, so it never parsed. The other two are not, so
-`effect io { … }` did — and the `with io handled_by …` it then made available
-discharged the *builtin* `io` for everything in the block. A function
-declaring `/ {}` printed, `par_map` ran a printing function on several cores
-past [T-PAR-MAP-PURE], and a dependency declaring `capabilities = []` read and
-wrote files while `grasm deps` certified it as performing nothing. A
-capability ceiling one declaration away from meaningless is not a ceiling; a
-package may not write away the word that constrains it.
 
 **[T-EFFECT-DISCHARGE]** `with E handled_by h { … }` discharges `E` inside the
 block. Any user effect still outstanding at `main` or in a test is an error.
@@ -640,14 +603,7 @@ error at the call site. This is the only place a row can be checked rather than
 inferred — a written type has no body to infer from — and without it a function
 value would be a way to carry an effect past a declared row.
 
-A closure literal is checked the same way a named function is. It was not:
-only the shape was compared when a closure met a written function type, so
-`Box{ f: shout }` was refused and `Box{ f: |n| shout(n) }` was accepted — the
-same function, one closure apart. Every consequence followed from that one
-gap: a `/ {}` function printed, `[T-PAR-MAP-PURE]`'s compile-time proof
-passed, a C function reached libc from a declared-empty row, a closure
-carrying a handled effect left its `with` block inside a list, and a package
-declaring `capabilities = []` exported one.
+A closure literal is checked the same way a named function is.
 
 "The same way" is about the *body* too: a named function's is checked against
 its declared return, and a closure's was merely inferred. So the expected type
@@ -787,15 +743,7 @@ The write a closure is otherwise allowed to make ([T-REF-CAPTURE]) is the one
 that has to be refused here. A `ref` created *inside* the function is one per
 element and is left alone, as is reading a captured one.
 
-*And it may not reach a `ref` from outside at all.* Reading one was allowed on
-the reasoning that a read shares nothing; it shares the reference **count**,
-which a read through a reference takes and which is not atomic. The day the
-native backend stopped refusing writes through a reference, a program made only
-of reads — `[1, 2].par_map(|x| x + acc.n)` — died with SIGTRAP, panicked inside
-the runtime with `field access on non-struct`, or printed a different wrong
-answer on each run at exit 0. The clause below had named the shape and said it
-was "not a race today"; it became one exactly as predicted, and the fix is the
-one the prediction implies.
+*And it may not reach a `ref` from outside at all.*
 
 So an **element type that reaches a reference** is refused at the operation —
 `[ref T]`, or a struct holding one anywhere inside — because every element is

@@ -1244,6 +1244,7 @@ fn main() {
 //! 3
 //! 7
 //! 4 6
+//! 325 325 15 325
 // A counted loop is compiled four iterations at a time while four are left,
 // then one at a time for the remainder — so every trip count around that
 // four, both range forms, and both ways out of the body have to answer what
@@ -1359,6 +1360,38 @@ fn main() {
         m = m + if n % 2 == 0 { 2 } else { 1 }
     }
     print("{n} {m}")
+
+    // Loops a compiled build may run without a bounds check per element,
+    // once it has checked the whole range up front. The answers are the
+    // ones any loop gives: including a range that runs no iterations at all,
+    // one written backwards, a base below zero and the last element reached
+    // by an inclusive range.
+    let n = 5
+    var grid = (0..n * n).map(|v| v)
+    var sum = 0
+    for r in 0..n {
+        for c in 0..n {
+            grid[r * n + c] += 1
+            sum += grid[r * n + c]
+        }
+    }
+    var still = sum
+    for c in 3..3 {
+        still += grid[c + 100]
+    }
+    for c in 5..2 {
+        still += grid[c + 100]
+    }
+    let back = 0 - 2
+    var neg = 0
+    for c in 2..7 {
+        neg += grid[back + c]
+    }
+    var incl = 0
+    for c in 0..=24 {
+        incl += grid[c]
+    }
+    print("{sum} {still} {neg} {incl}")
 }
 ```
 

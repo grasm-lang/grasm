@@ -189,10 +189,6 @@ either side and for arithmetic and comparison alike: `3 * f`, `f * 3`,
 `3 < f` and `f > 3` all work. A non-literal `i64` does not convert on its own
 ([T-INT-TO-FLOAT]) — `n > f` is an error that says to write `n.as_f64()`.
 
-The rule used to be stated as "mixing promotes", which was not what the
-implementation did, and comparisons had a further asymmetry nothing recorded:
-`5.0 == 5` was accepted and `5 == 5.0` was not.
-
 **[E-STR-CONCAT]** `+` on two `str` values concatenates them.
 
 **[E-STR-COMPARE]** `< <= > >=` on `str` compare lexicographically by code
@@ -258,12 +254,6 @@ produce something.
 
 **[E-IF-VALUE]** `if` is an expression when both branches yield the same type;
 otherwise it is a statement of type `()`, and using its value is an error.
-
-The second half was missing. A mismatched `if` became `()` wherever it stood,
-and `()` was accepted as an initializer without checking — so
-`let a: () = if c { 1 } else { 2.5 }` typechecked and left `a` holding an
-`i64` at run time: it printed as `1`, compared unequal to `()`, and could be
-passed to a `fn f(u: ())`. `()` has one value.
 
 A branch that must deliver a value has to *end in an expression*. The expected
 type is pushed into a tail expression and there is nothing to push it into
