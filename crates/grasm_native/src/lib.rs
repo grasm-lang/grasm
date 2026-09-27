@@ -796,8 +796,16 @@ impl<'m> Codegen<'m> {
             ("grasm_map_len", vec![i64t], Some(i64t)),
             ("grasm_map_get_ptr", vec![i64t, i64t], Some(i64t)),
             ("grasm_map_get_ptr_bytes", vec![i64t, ptr, i64t], Some(i64t)),
-            ("grasm_map_add_i64_bytes", vec![i64t, ptr, i64t, i64t, i64t], Some(i64t)),
-            ("grasm_map_set_bytes", vec![i64t, ptr, i64t, i64t], Some(i64t)),
+            (
+                "grasm_map_add_i64_bytes",
+                vec![i64t, ptr, i64t, i64t, i64t],
+                Some(i64t),
+            ),
+            (
+                "grasm_map_set_bytes",
+                vec![i64t, ptr, i64t, i64t],
+                Some(i64t),
+            ),
             ("grasm_str_build_ptr", vec![i64t], Some(ptr)),
             ("grasm_str_build_len", vec![i64t], Some(i64t)),
             ("grasm_str_build_discard", vec![i64t], None),
@@ -969,7 +977,11 @@ impl<'m> Codegen<'m> {
             ),
             ("grasm_str_pin_end", vec![i64t, i64t], None),
             ("grasm_str_pin_i64", vec![i64t, i64t, i64t], Some(i64t)),
-            ("grasm_str_pin_text", vec![i64t, i64t, i64t, i64t], Some(i64t)),
+            (
+                "grasm_str_pin_text",
+                vec![i64t, i64t, i64t, i64t],
+                Some(i64t),
+            ),
             ("grasm_list_append_end", vec![i64t, i64t], None),
             ("grasm_list_new_cap", vec![i64t], Some(i64t)),
             ("grasm_range_new", vec![i64t, i64t, i8t], Some(i64t)),
@@ -2038,6 +2050,8 @@ arguments nor the type this is bound to",
             moved: std::collections::HashSet::new(),
             unchecked_idx: std::collections::HashSet::new(),
             version_guard_value: None,
+            vectorize_next: false,
+            vector_splats: HashMap::new(),
             inline_depth: 0,
             inline_seq: 0,
         };
@@ -2066,7 +2080,7 @@ arguments nor the type this is bound to",
             // of a one-word stack slot, which is what a slot costs: a `sub sp`
             // in the prologue and an `add sp` in the epilogue of every
             // function that can reach itself.
-                        let here = fcx.b.ins().get_stack_pointer(ptr_ty);
+            let here = fcx.b.ins().get_stack_pointer(ptr_ty);
             let floor = fcx.b.block_params(entry)[0];
             // Defined in the entry block, so it dominates every call this
             // function makes and can be handed straight on.
@@ -2709,6 +2723,8 @@ operation's",
             moved: std::collections::HashSet::new(),
             unchecked_idx: std::collections::HashSet::new(),
             version_guard_value: None,
+            vectorize_next: false,
+            vector_splats: HashMap::new(),
             inline_depth: 0,
             inline_seq: 0,
         };
@@ -2817,6 +2833,8 @@ operation's",
             moved: std::collections::HashSet::new(),
             unchecked_idx: std::collections::HashSet::new(),
             version_guard_value: None,
+            vectorize_next: false,
+            vector_splats: HashMap::new(),
             inline_depth: 0,
             inline_seq: 0,
         };
@@ -2968,6 +2986,8 @@ operation's",
             moved: std::collections::HashSet::new(),
             unchecked_idx: std::collections::HashSet::new(),
             version_guard_value: None,
+            vectorize_next: false,
+            vector_splats: HashMap::new(),
             inline_depth: 0,
             inline_seq: 0,
         };
@@ -3322,6 +3342,11 @@ struct FnCx<'a, 'm> {
     unchecked_idx: std::collections::HashSet<(u32, u32)>,
     /// The guard `version_guard` computed, taken by the loop it decides.
     version_guard_value: Option<Value>,
+    /// Set for the one loop about to be emitted as a versioned fast copy,
+    /// which may run two `f64` lanes at a time. See `emit_vector_prefix`.
+    vectorize_next: bool,
+    /// Broadcast invariants of the vector loop being emitted, by span.
+    vector_splats: HashMap<(u32, u32), Value>,
     /// How many function bodies are currently spliced around this point, and
     /// a counter for the hidden names a splice binds its arguments to.
     inline_depth: u32,
@@ -3924,7 +3949,9 @@ fn straight_idents(e: &Expr, out: &mut Vec<String>) {
                 straight_idents(a, out);
             }
         }
-        Expr::StructLit { base: None, fields, .. } => {
+        Expr::StructLit {
+            base: None, fields, ..
+        } => {
             for (_, v) in fields {
                 straight_idents(v, out);
             }
@@ -3951,9 +3978,7 @@ fn scan_leave_block(b: &grasm_syntax::ast::Block, found: &mut bool) {
         }
         match st {
             Stmt::Return(..) | Stmt::Break(_) | Stmt::Continue(_) => *found = true,
-            Stmt::Let { init, .. } | Stmt::LetTuple { init, .. } => {
-                scan_leave_expr(init, found)
-            }
+            Stmt::Let { init, .. } | Stmt::LetTuple { init, .. } => scan_leave_expr(init, found),
             Stmt::Assign { target, value, .. } => {
                 scan_leave_expr(target, found);
                 scan_leave_expr(value, found);
@@ -3967,9 +3992,7 @@ fn scan_leave_block(b: &grasm_syntax::ast::Block, found: &mut bool) {
                 scan_leave_expr(iter, found);
                 scan_leave_block(body, found);
             }
-            Stmt::Parallel { body, .. } | Stmt::Spawn { body, .. } => {
-                scan_leave_block(body, found)
-            }
+            Stmt::Parallel { body, .. } | Stmt::Spawn { body, .. } => scan_leave_block(body, found),
             Stmt::With { handler, body, .. } => {
                 scan_leave_expr(handler, found);
                 scan_leave_block(body, found);
@@ -4683,7 +4706,12 @@ fn str_append_rhs<'a>(b: &'a grasm_syntax::ast::Block, name: &str, out: &mut Vec
                 ..
             } if id.name == name => match (op, value) {
                 (AssignOp::Add, v) => out.push(v),
-                (AssignOp::Assign, v @ Expr::Binary { op: BinaryOp::Add, .. }) => {
+                (
+                    AssignOp::Assign,
+                    v @ Expr::Binary {
+                        op: BinaryOp::Add, ..
+                    },
+                ) => {
                     let (head, pieces) = concat_chain(v);
                     let reads_target = pieces.len() > 1
                         && pieces.iter().any(|p| {
@@ -4697,9 +4725,7 @@ fn str_append_rhs<'a>(b: &'a grasm_syntax::ast::Block, name: &str, out: &mut Vec
                 }
                 _ => {}
             },
-            Stmt::While { body, .. } | Stmt::For { body, .. } => {
-                str_append_rhs(body, name, out)
-            }
+            Stmt::While { body, .. } | Stmt::For { body, .. } => str_append_rhs(body, name, out),
             _ => {}
         }
     }
@@ -4720,7 +4746,12 @@ fn scan_str_appends_block(
             } => {
                 let rest: Option<Vec<&Expr>> = match (op, value) {
                     (AssignOp::Add, v) => Some(vec![v]),
-                    (AssignOp::Assign, v @ Expr::Binary { op: BinaryOp::Add, .. }) => {
+                    (
+                        AssignOp::Assign,
+                        v @ Expr::Binary {
+                            op: BinaryOp::Add, ..
+                        },
+                    ) => {
                         let (head, pieces) = concat_chain(v);
                         let reads_target = pieces.len() > 1
                             && pieces.iter().any(|p| {
@@ -5105,7 +5136,10 @@ fn inline_candidate(f: &FnDecl) -> Option<Vec<Stmt>> {
     }
     let mut budget = INLINE_BUDGET;
     let mut calls = 0;
-    if !stmts.iter().all(|st| inline_stmt_ok(st, &mut budget, &mut calls)) {
+    if !stmts
+        .iter()
+        .all(|st| inline_stmt_ok(st, &mut budget, &mut calls))
+    {
         return None;
     }
     Some(stmts)
@@ -5275,10 +5309,12 @@ fn inline_stmt_ok(st: &Stmt, budget: &mut i32, calls: &mut u32) -> bool {
         Stmt::Expr(e) => inline_expr_ok(e, budget, calls),
         Stmt::Break(_) | Stmt::Continue(_) => true,
         Stmt::While { cond, body, .. } => {
-            inline_expr_ok(cond, budget, calls) && body.stmts.iter().all(|s| inline_stmt_ok(s, budget, calls))
+            inline_expr_ok(cond, budget, calls)
+                && body.stmts.iter().all(|s| inline_stmt_ok(s, budget, calls))
         }
         Stmt::For { iter, body, .. } => {
-            inline_expr_ok(iter, budget, calls) && body.stmts.iter().all(|s| inline_stmt_ok(s, budget, calls))
+            inline_expr_ok(iter, budget, calls)
+                && body.stmts.iter().all(|s| inline_stmt_ok(s, budget, calls))
         }
         // A `return` anywhere but the tail leaves the caller, not the splice.
         // A thread, a handler or a `spawn` is frame-shaped and is not moved.
@@ -5297,9 +5333,9 @@ fn rotatable_cond(e: &Expr) -> bool {
         Expr::Index { recv, index, .. } => {
             matches!(**recv, Expr::Ident(_)) && rotatable_cond(index)
         }
-        Expr::MethodCall { recv, name, args, .. } => {
-            name.name == "len" && args.is_empty() && matches!(**recv, Expr::Ident(_))
-        }
+        Expr::MethodCall {
+            recv, name, args, ..
+        } => name.name == "len" && args.is_empty() && matches!(**recv, Expr::Ident(_)),
         _ => false,
     }
 }
@@ -5308,6 +5344,45 @@ fn rotatable_cond(e: &Expr) -> bool {
 /// or binds, and each list index as (list, base, index span), where the index
 /// is `i` (no base) or `base + i` / `i + base`. `false` for anything it does
 /// not understand, which keeps the loop checked.
+/// `i` or `base + i` / `i + base` with a pure-arithmetic base, as a key two
+/// accesses share exactly when they index the same element in every
+/// iteration. Spans are left out; only the shape and the names count.
+fn affine_key(index: &Expr, i: &str) -> Option<String> {
+    fn text(e: &Expr) -> Option<String> {
+        Some(match e {
+            Expr::Int(n, _) => n.to_string(),
+            Expr::Ident(id) => id.name.clone(),
+            Expr::Binary { op, lhs, rhs, .. } => {
+                let o = match op {
+                    BinaryOp::Add => "+",
+                    BinaryOp::Sub => "-",
+                    BinaryOp::Mul => "*",
+                    _ => return None,
+                };
+                format!("({} {o} {})", text(lhs)?, text(rhs)?)
+            }
+            _ => return None,
+        })
+    }
+    let is_i = |e: &Expr| matches!(e, Expr::Ident(id) if id.name == i);
+    match index {
+        e if is_i(e) => Some(String::new()),
+        Expr::Binary {
+            op: BinaryOp::Add,
+            lhs,
+            rhs,
+            ..
+        } if is_i(rhs) && pure_arith(lhs) => text(lhs),
+        Expr::Binary {
+            op: BinaryOp::Add,
+            lhs,
+            rhs,
+            ..
+        } if is_i(lhs) && pure_arith(rhs) => text(rhs),
+        _ => None,
+    }
+}
+
 fn affine_block(
     b: &grasm_syntax::ast::Block,
     i: &str,
@@ -5328,7 +5403,8 @@ fn affine_block(
                 Expr::Index { recv, index, .. } => match &**recv {
                     Expr::Ident(id) => {
                         assigned.push(id.name.clone());
-                        affine_index(&id.name, index, i, acc) && affine_expr(index, i, assigned, acc)
+                        affine_index(&id.name, index, i, acc)
+                            && affine_expr(index, i, assigned, acc)
                     }
                     _ => false,
                 },
@@ -5464,13 +5540,18 @@ fn inline_expr_ok(e: &Expr, budget: &mut i32, calls: &mut u32) -> bool {
             ..
         } => {
             inline_expr_ok(cond, budget, calls)
-                && then_block.stmts.iter().all(|s| inline_stmt_ok(s, budget, calls))
+                && then_block
+                    .stmts
+                    .iter()
+                    .all(|s| inline_stmt_ok(s, budget, calls))
                 && match else_branch.as_deref() {
                     None => true,
                     Some(grasm_syntax::ast::ElseBranch::Else(b)) => {
                         b.stmts.iter().all(|s| inline_stmt_ok(s, budget, calls))
                     }
-                    Some(grasm_syntax::ast::ElseBranch::ElseIf(x)) => inline_expr_ok(x, budget, calls),
+                    Some(grasm_syntax::ast::ElseBranch::ElseIf(x)) => {
+                        inline_expr_ok(x, budget, calls)
+                    }
                 }
         }
         Expr::Match {
@@ -5478,7 +5559,9 @@ fn inline_expr_ok(e: &Expr, budget: &mut i32, calls: &mut u32) -> bool {
         } => {
             inline_expr_ok(scrutinee, budget, calls)
                 && arms.iter().all(|a| {
-                    a.guard.as_ref().is_none_or(|g| inline_expr_ok(g, budget, calls))
+                    a.guard
+                        .as_ref()
+                        .is_none_or(|g| inline_expr_ok(g, budget, calls))
                         && inline_expr_ok(&a.body, budget, calls)
                 })
         }
@@ -5489,11 +5572,13 @@ fn inline_expr_ok(e: &Expr, budget: &mut i32, calls: &mut u32) -> bool {
                 return false;
             }
             *calls += 1;
-            inline_expr_ok(callee, budget, calls) && args.iter().all(|a| inline_expr_ok(a, budget, calls))
+            inline_expr_ok(callee, budget, calls)
+                && args.iter().all(|a| inline_expr_ok(a, budget, calls))
         }
         Expr::MethodCall { recv, args, .. } => {
             *calls += 1;
-            inline_expr_ok(recv, budget, calls) && args.iter().all(|a| inline_expr_ok(a, budget, calls))
+            inline_expr_ok(recv, budget, calls)
+                && args.iter().all(|a| inline_expr_ok(a, budget, calls))
         }
         // A closure captures the frame it was written in, a `try` and a
         // `region` are frame-shaped, and anything added later is unknown.
@@ -5536,11 +5621,7 @@ fn param_is_borrowed(name: &str, body: &grasm_syntax::ast::Block) -> bool {
 /// The same rule for a `for` loop's element, which the list holds open for the
 /// whole body, plus the one shape a loop needs and a parameter cannot have:
 /// handing the element to a function that only reads it.
-fn loop_elem_is_borrowed(
-    name: &str,
-    body: &grasm_syntax::ast::Block,
-    lent: LentAt,
-) -> bool {
+fn loop_elem_is_borrowed(name: &str, body: &grasm_syntax::ast::Block, lent: LentAt) -> bool {
     let mut st = BorrowScan {
         ok: true,
         lent: Some(lent),
@@ -5725,7 +5806,10 @@ fn scan_borrow_expr(name: &str, e: &Expr, st: &mut BorrowScan) {
         // A method *on* the parameter is refused rather than allow-listed:
         // some read and some take, and the difference is not visible here.
         Expr::MethodCall {
-            recv, name: m, args, ..
+            recv,
+            name: m,
+            args,
+            ..
         } if st.key_only
             && matches!(m.name.as_str(), "get" | "set")
             && args.first().is_some_and(|a| is_named(a, name)) =>
@@ -6597,9 +6681,7 @@ impl FnCx<'_, '_> {
                 self.filled = true;
 
                 self.goto_block(big);
-                let wrote = self
-                    .call_rt("grasm_str_pin_i64", &[data, at, v])
-                    .unwrap();
+                let wrote = self.call_rt("grasm_str_pin_i64", &[data, at, v]).unwrap();
                 let nn = self.b.ins().iadd(at, wrote);
                 self.b.def_var(pin.len_var, nn);
                 self.b.ins().jump(cont, &[]);
@@ -7518,7 +7600,12 @@ impl FnCx<'_, '_> {
                     // quadratic.
                     let rhs: Option<Vec<&Expr>> = match (op, value) {
                         (AssignOp::Add, v) => Some(vec![v]),
-                        (AssignOp::Assign, v @ Expr::Binary { op: BinaryOp::Add, .. }) => {
+                        (
+                            AssignOp::Assign,
+                            v @ Expr::Binary {
+                                op: BinaryOp::Add, ..
+                            },
+                        ) => {
                             let (head, pieces) = concat_chain(v);
                             // Appending in place changes the name as it goes,
                             // so a later piece that reads it would see what
@@ -7533,8 +7620,7 @@ impl FnCx<'_, '_> {
                                     collect_idents(p, &mut names);
                                     names.contains(&id.name)
                                 });
-                            if !reads_target
-                                && matches!(head, Expr::Ident(l) if l.name == id.name)
+                            if !reads_target && matches!(head, Expr::Ident(l) if l.name == id.name)
                             {
                                 Some(pieces)
                             } else {
@@ -7545,36 +7631,36 @@ impl FnCx<'_, '_> {
                     };
                     if let Some(parts) = rhs {
                         for piece in parts {
-                        // As in `try_self_append`: an interpolation's pieces
-                        // go onto the buffer one at a time, so the string it
-                        // would have built is never a value.
-                        if let Expr::Str(pieces, _) = piece {
-                            let mut done = false;
-                            if let Some(pin) = self.str_append_state(&id.name) {
-                                if self.pieces_write_inline(pieces) {
-                                    for p in pieces {
-                                        self.str_pin_piece(&pin, p)?;
+                            // As in `try_self_append`: an interpolation's pieces
+                            // go onto the buffer one at a time, so the string it
+                            // would have built is never a value.
+                            if let Expr::Str(pieces, _) = piece {
+                                let mut done = false;
+                                if let Some(pin) = self.str_append_state(&id.name) {
+                                    if self.pieces_write_inline(pieces) {
+                                        for p in pieces {
+                                            self.str_pin_piece(&pin, p)?;
+                                        }
+                                        done = true;
                                     }
-                                    done = true;
                                 }
-                            }
-                            if !done {
-                                let mut cur = self.b.use_var(var);
-                                for p in pieces {
-                                    cur = self.append_piece(cur, p)?;
+                                if !done {
+                                    let mut cur = self.b.use_var(var);
+                                    for p in pieces {
+                                        cur = self.append_piece(cur, p)?;
+                                    }
+                                    self.b.def_var(var, cur);
                                 }
-                                self.b.def_var(var, cur);
+                                continue;
                             }
-                            continue;
-                        }
-                        let (rv, rt) = self.eval_expr_val(piece)?;
-                        if rt != VType::Str {
-                            return nope(piece.span(), "adding a non-string to a string");
-                        }
-                        let old = self.b.use_var(var);
-                        let joined = self.call_rt("grasm_str_append", &[old, rv]).unwrap();
-                        self.call_rt("grasm_val_dec", &[rv]);
-                        self.b.def_var(var, joined);
+                            let (rv, rt) = self.eval_expr_val(piece)?;
+                            if rt != VType::Str {
+                                return nope(piece.span(), "adding a non-string to a string");
+                            }
+                            let old = self.b.use_var(var);
+                            let joined = self.call_rt("grasm_str_append", &[old, rv]).unwrap();
+                            self.call_rt("grasm_val_dec", &[rv]);
+                            self.b.def_var(var, joined);
                         }
                         return Ok(StmtOut::Value(None));
                     }
@@ -8136,6 +8222,260 @@ this case",
     /// while four are left when the body allows it, then one at a time. Leaves
     /// the builder in the loop's exit block. Emitted twice when the loop is
     /// versioned, which is why the pinned lists are the caller's to release.
+    /// Whether a versioned loop's body can also run two elements at a time:
+    /// every statement `A[base + i] op= E`, where `A` is a pinned `f64` list
+    /// and `E` is built from `f64` names the body does not assign, float
+    /// literals, reads `B[base' + i]` of pinned `f64` lists, `+ - * /` and
+    /// negation. And no element one iteration writes is one another reads:
+    /// each list the body writes is only ever indexed by one base, so
+    /// iteration `i` touches index `base + i` of it and nothing else.
+    ///
+    /// `f64` only. Every integer here is an `i64`, and NEON has no 64-bit
+    /// multiply: a two-lane integer loop measured about 1.1x at best against
+    /// 3.7x for two lanes of `f64` (scratch pricing, 2026-09-27).
+    fn vector_plan_ok(&self, body: &grasm_syntax::ast::Block, i: &str) -> bool {
+        let mut written: HashMap<String, String> = HashMap::new();
+        let mut read: Vec<(String, String)> = Vec::new();
+        for st in &body.stmts {
+            let Stmt::Assign { target, value, .. } = st else {
+                return false;
+            };
+            let Expr::Index { recv, index, .. } = target else {
+                return false;
+            };
+            let Expr::Ident(list) = &**recv else {
+                return false;
+            };
+            if !matches!(self.pinned_list(&list.name), Some((_, _, VType::F64))) {
+                return false;
+            }
+            let Some(key) = affine_key(index, i) else {
+                return false;
+            };
+            if let Some(prev) = written.insert(list.name.clone(), key.clone()) {
+                if prev != key {
+                    return false;
+                }
+            }
+            if !self.vector_expr_ok(value, i, &mut read) {
+                return false;
+            }
+        }
+        // A list written at one base and read at another would carry a value
+        // from one iteration into the next.
+        read.iter()
+            .all(|(name, key)| written.get(name).is_none_or(|w| w == key))
+    }
+
+    fn vector_expr_ok(&self, e: &Expr, i: &str, read: &mut Vec<(String, String)>) -> bool {
+        match e {
+            Expr::Float(..) => true,
+            Expr::Ident(id) => {
+                id.name != i && matches!(self.lookup(&id.name), Some((_, VType::F64)))
+            }
+            Expr::Unary {
+                op: grasm_syntax::ast::UnaryOp::Neg,
+                expr,
+                ..
+            } => self.vector_expr_ok(expr, i, read),
+            Expr::Binary {
+                op: BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div,
+                lhs,
+                rhs,
+                ..
+            } => self.vector_expr_ok(lhs, i, read) && self.vector_expr_ok(rhs, i, read),
+            Expr::Index { recv, index, .. } => {
+                let Expr::Ident(list) = &**recv else {
+                    return false;
+                };
+                if !matches!(self.pinned_list(&list.name), Some((_, _, VType::F64))) {
+                    return false;
+                }
+                match affine_key(index, i) {
+                    Some(k) => {
+                        read.push((list.name.clone(), k));
+                        true
+                    }
+                    None => false,
+                }
+            }
+            _ => false,
+        }
+    }
+
+    /// `base + i` of a pinned list, as an address, with `iv` the loop's
+    /// current index. Only for an index `version_guard` already proved.
+    fn lane_address(&mut self, list: &str, index: &Expr, i: &str, iv: Value) -> CResult<Value> {
+        let (data, _, _) = self.pinned_list(list).expect("vector_plan_ok checked");
+        let at = match index {
+            Expr::Ident(id) if id.name == i => iv,
+            Expr::Binary { lhs, rhs, .. } => {
+                let base = if matches!(&**rhs, Expr::Ident(id) if id.name == i) {
+                    lhs
+                } else {
+                    rhs
+                };
+                let (bv, _) = self.eval_expr_val(base)?;
+                self.b.ins().iadd(bv, iv)
+            }
+            _ => unreachable!("affine_key accepted it"),
+        };
+        let off = self.b.ins().imul_imm(at, 8);
+        Ok(self.b.ins().iadd(data, off))
+    }
+
+    /// Broadcasts every loop-invariant leaf of `e` -- a float literal, an `f64`
+    /// name -- once, before the loop, so the body does not rebuild a constant
+    /// on every trip. Cranelift does not hoist them itself.
+    fn hoist_splats(&mut self, e: &Expr) {
+        match e {
+            Expr::Float(f, sp) => {
+                let s = self.b.ins().f64const(*f);
+                let v = self.b.ins().splat(types::F64X2, s);
+                self.vector_splats.insert((sp.start, sp.end), v);
+            }
+            Expr::Ident(id) => {
+                let (var, _) = self.lookup(&id.name).expect("vector_expr_ok checked");
+                let s = self.b.use_var(var);
+                let v = self.b.ins().splat(types::F64X2, s);
+                self.vector_splats.insert((id.span.start, id.span.end), v);
+            }
+            Expr::Unary { expr, .. } => self.hoist_splats(expr),
+            Expr::Binary { lhs, rhs, .. } => {
+                self.hoist_splats(lhs);
+                self.hoist_splats(rhs);
+            }
+            _ => {}
+        }
+    }
+
+    fn vector_expr(&mut self, e: &Expr, i: &str, iv: Value) -> CResult<Value> {
+        let flags = cranelift_codegen::ir::MemFlags::trusted();
+        Ok(match e {
+            Expr::Float(..) | Expr::Ident(_) => {
+                let sp = e.span();
+                *self
+                    .vector_splats
+                    .get(&(sp.start, sp.end))
+                    .expect("hoisted by emit_vector_prefix")
+            }
+            Expr::Unary { expr, .. } => {
+                let v = self.vector_expr(expr, i, iv)?;
+                self.b.ins().fneg(v)
+            }
+            Expr::Binary { op, lhs, rhs, .. } => {
+                let a = self.vector_expr(lhs, i, iv)?;
+                let b = self.vector_expr(rhs, i, iv)?;
+                match op {
+                    BinaryOp::Add => self.b.ins().fadd(a, b),
+                    BinaryOp::Sub => self.b.ins().fsub(a, b),
+                    BinaryOp::Mul => self.b.ins().fmul(a, b),
+                    _ => self.b.ins().fdiv(a, b),
+                }
+            }
+            Expr::Index { recv, index, .. } => {
+                let Expr::Ident(list) = &**recv else {
+                    unreachable!()
+                };
+                let addr = self.lane_address(&list.name, index, i, iv)?;
+                self.b.ins().load(types::F64X2, flags, addr, 0)
+            }
+            _ => unreachable!("vector_expr_ok accepted it"),
+        })
+    }
+
+    /// Two elements at a time while two are left, then on into the scalar
+    /// loop for whatever remains. The same answers, bit for bit: each lane is
+    /// the IEEE operation the scalar loop performs, with no fused
+    /// multiply-add, in the same order.
+    fn emit_vector_prefix(
+        &mut self,
+        ivar: Variable,
+        end_var: Variable,
+        loop_var: &Ident,
+        body: &grasm_syntax::ast::Block,
+        inclusive: bool,
+    ) -> CResult<()> {
+        if !self.vector_plan_ok(body, &loop_var.name) {
+            return Ok(());
+        }
+        let i = loop_var.name.as_str();
+        self.vector_splats.clear();
+        for st in &body.stmts {
+            if let Stmt::Assign { value, .. } = st {
+                self.hoist_splats(value);
+            }
+        }
+        let vhead = self.b.create_block();
+        let vbody = self.b.create_block();
+        let vdone = self.b.create_block();
+        self.b.ins().jump(vhead, &[]);
+        self.filled = true;
+
+        self.goto_block(vhead);
+        let iv = self.b.use_var(ivar);
+        let ev = self.b.use_var(end_var);
+        // Four more fit when `i + 3` is still inside the range: two vectors
+        // a trip, as the scalar loop takes four, so the core has as many
+        // independent operations in flight. The guard kept every bound
+        // within 2^61, so `i + 3` cannot overflow.
+        let next = self.b.ins().iadd_imm(iv, 3);
+        let cc = if inclusive {
+            IntCC::SignedLessThanOrEqual
+        } else {
+            IntCC::SignedLessThan
+        };
+        let room = self.b.ins().icmp(cc, next, ev);
+        self.b.ins().brif(room, vbody, &[], vdone, &[]);
+        self.filled = true;
+
+        self.goto_block(vbody);
+        let iv0 = self.b.use_var(ivar);
+        let flags = cranelift_codegen::ir::MemFlags::trusted();
+        for lane in [0i64, 2] {
+            let iv = if lane == 0 {
+                iv0
+            } else {
+                self.b.ins().iadd_imm(iv0, lane)
+            };
+            for st in &body.stmts {
+                let Stmt::Assign {
+                    target, op, value, ..
+                } = st
+                else {
+                    unreachable!()
+                };
+                let Expr::Index { recv, index, .. } = target else {
+                    unreachable!()
+                };
+                let Expr::Ident(list) = &**recv else {
+                    unreachable!()
+                };
+                let v = self.vector_expr(value, i, iv)?;
+                let addr = self.lane_address(&list.name, index, i, iv)?;
+                let out = if *op == AssignOp::Assign {
+                    v
+                } else {
+                    let old = self.b.ins().load(types::F64X2, flags, addr, 0);
+                    match op {
+                        AssignOp::Add => self.b.ins().fadd(old, v),
+                        AssignOp::Sub => self.b.ins().fsub(old, v),
+                        AssignOp::Mul => self.b.ins().fmul(old, v),
+                        _ => self.b.ins().fdiv(old, v),
+                    }
+                };
+                self.b.ins().store(flags, out, addr, 0);
+            }
+        }
+        let nx = self.b.ins().iadd_imm(iv0, 4);
+        self.b.def_var(ivar, nx);
+        self.b.ins().jump(vhead, &[]);
+        self.filled = true;
+
+        self.goto_block(vdone);
+        Ok(())
+    }
+
     fn emit_range_loop(
         &mut self,
         ivar: Variable,
@@ -8144,6 +8484,10 @@ this case",
         body: &grasm_syntax::ast::Block,
         inclusive: bool,
     ) -> CResult<()> {
+        // The fast copy of a versioned loop may also run two lanes at a time.
+        if std::mem::take(&mut self.vectorize_next) {
+            self.emit_vector_prefix(ivar, end_var, loop_var, body, inclusive)?;
+        }
         let header = self.b.create_block();
         let body_blk = self.b.create_block();
         let step = self.b.create_block();
@@ -8184,11 +8528,10 @@ this case",
             // is at most `i64::MAX`, so `end - 4` is exact whenever it
             // does not underflow, and that is what the first test asks.
             let ev0 = self.b.use_var(end_var);
-            let room = self.b.ins().icmp_imm(
-                IntCC::SignedGreaterThanOrEqual,
-                ev0,
-                i64::MIN + UNROLL_BY,
-            );
+            let room =
+                self.b
+                    .ins()
+                    .icmp_imm(IntCC::SignedGreaterThanOrEqual, ev0, i64::MIN + UNROLL_BY);
             let lim = self.b.ins().iadd_imm(ev0, -UNROLL_BY);
             let limvar = self.new_var(&VType::I64);
             self.b.def_var(limvar, lim);
@@ -8198,10 +8541,7 @@ this case",
             self.goto_block(uhead);
             let iv0 = self.b.use_var(ivar);
             let lv0 = self.b.use_var(limvar);
-            let fits = self
-                .b
-                .ins()
-                .icmp(IntCC::SignedLessThanOrEqual, iv0, lv0);
+            let fits = self.b.ins().icmp(IntCC::SignedLessThanOrEqual, iv0, lv0);
             self.b.ins().brif(fits, ubody, &[], header, &[]);
             self.filled = true;
 
@@ -8330,7 +8670,8 @@ this case",
         }
         let mut assigned: Vec<String> = Vec::new();
         let mut accesses: Vec<(String, Option<Expr>, (u32, u32))> = Vec::new();
-        if !affine_block(body, &loop_var.name, &mut assigned, &mut accesses) || accesses.is_empty() {
+        if !affine_block(body, &loop_var.name, &mut assigned, &mut accesses) || accesses.is_empty()
+        {
             return Ok(None);
         }
         let mut lens: Vec<Value> = Vec::with_capacity(accesses.len());
@@ -8342,7 +8683,10 @@ this case",
             if let Some(b) = base {
                 let mut names = Vec::new();
                 collect_idents(b, &mut names);
-                if names.iter().any(|n| n == &loop_var.name || assigned.contains(n)) {
+                if names
+                    .iter()
+                    .any(|n| n == &loop_var.name || assigned.contains(n))
+                {
                     return Ok(None);
                 }
                 // A name in the base must be a plain integer local: a pinned
@@ -8362,13 +8706,18 @@ this case",
         let e0 = self.b.use_var(end_var);
         let small = |me: &mut Self, v: Value| -> Value {
             let shifted = me.b.ins().iadd_imm(v, lim);
-            me.b.ins().icmp_imm(IntCC::UnsignedLessThan, shifted, 2 * lim)
+            me.b.ins()
+                .icmp_imm(IntCC::UnsignedLessThan, shifted, 2 * lim)
         };
         let s_ok = small(self, s0);
         let e_ok = small(self, e0);
         let mut ok = self.b.ins().band(s_ok, e_ok);
         // The last index the loop reaches.
-        let last = if inclusive { e0 } else { self.b.ins().iadd_imm(e0, -1) };
+        let last = if inclusive {
+            e0
+        } else {
+            self.b.ins().iadd_imm(e0, -1)
+        };
         for ((_, base, _), len) in accesses.iter().zip(&lens) {
             let (lo, hi) = match base {
                 Some(b) => {
@@ -8382,7 +8731,10 @@ this case",
                 }
                 None => (s0, last),
             };
-            let lo_ok = self.b.ins().icmp_imm(IntCC::SignedGreaterThanOrEqual, lo, 0);
+            let lo_ok = self
+                .b
+                .ins()
+                .icmp_imm(IntCC::SignedGreaterThanOrEqual, lo, 0);
             let hi_ok = self.b.ins().icmp(IntCC::SignedLessThan, hi, *len);
             ok = self.b.ins().band(ok, lo_ok);
             ok = self.b.ins().band(ok, hi_ok);
@@ -8444,7 +8796,9 @@ this case",
                     self.filled = true;
                     self.goto_block(fast);
                     self.unchecked_idx.extend(spans.iter().copied());
+                    self.vectorize_next = !std::env::var("GRASM_NO_VECTOR").is_ok_and(|v| v == "1");
                     let r = self.emit_range_loop(ivar, end_var, loop_var, body, *inclusive);
+                    self.vectorize_next = false;
                     for sp in &spans {
                         self.unchecked_idx.remove(sp);
                     }
@@ -9171,7 +9525,8 @@ this case",
                         if it != VType::I64 {
                             return nope(index.span(), "non-integer index");
                         }
-                        let addr = self.pinned_address_at(data, len, iv, stride_of(&pt), index.span());
+                        let addr =
+                            self.pinned_address_at(data, len, iv, stride_of(&pt), index.span());
                         let flags = cranelift_codegen::ir::MemFlags::trusted();
                         let v = self.b.ins().load(pt.cl(), flags, addr, 0);
                         return Ok(Some((v, pt)));
@@ -9530,7 +9885,8 @@ this case",
                     return Ok(cur);
                 }
                 let (ptr, len) = self.str_ptr_len(t);
-                self.call_rt("grasm_str_append_text", &[cur, ptr, len]).unwrap()
+                self.call_rt("grasm_str_append_text", &[cur, ptr, len])
+                    .unwrap()
             }
             StrPiece::Expr(inner) => {
                 let (v, vt) = self.eval_expr_val(inner)?;
@@ -9555,7 +9911,8 @@ this case",
                     }
                     VType::Unit => {
                         let (ptr, len) = self.str_ptr_len("()");
-                        self.call_rt("grasm_str_append_text", &[cur, ptr, len]).unwrap()
+                        self.call_rt("grasm_str_append_text", &[cur, ptr, len])
+                            .unwrap()
                     }
                     ref other if other.boxed() => {
                         let sv = self.call_rt("grasm_str_from_val", &[v]).unwrap();
@@ -10080,12 +10437,7 @@ this case",
     /// independent of the parameter: a call or an index runs once per
     /// element and can see how many times that was, so replacing the loop
     /// with a fill would change what the program does.
-    fn range_fill(
-        &mut self,
-        recv: &Expr,
-        f: &Expr,
-        span: Span,
-    ) -> CResult<Option<(Value, VType)>> {
+    fn range_fill(&mut self, recv: &Expr, f: &Expr, span: Span) -> CResult<Option<(Value, VType)>> {
         let Expr::Range {
             start,
             end,
@@ -10199,7 +10551,8 @@ this case",
         // `with`'s handler stopped compiling — the `with` looked for the
         // literal and found the hidden name the splice had bound it to.
         let handler_shaped = matches!(
-            self.cg.vtype_of(decl.ret.as_ref().expect("candidate has a return type"))?,
+            self.cg
+                .vtype_of(decl.ret.as_ref().expect("candidate has a return type"))?,
             VType::Handler(_)
         ) || decl
             .params
@@ -10253,7 +10606,8 @@ this case",
             self.bind(&p.name.name, pv, vt);
             direct[i] = true;
         }
-        let mut stmts: Vec<Stmt> = Vec::with_capacity(decl.params.len() * 2 + decl.body.stmts.len());
+        let mut stmts: Vec<Stmt> =
+            Vec::with_capacity(decl.params.len() * 2 + decl.body.stmts.len());
         for (i, a) in args.iter().enumerate() {
             if direct[i] {
                 continue;
@@ -10701,8 +11055,7 @@ this case",
                     let kb = match keyed {
                         Some(_) => None,
                         None => {
-                            let (kv, kvt) =
-                                self.eval_expr_expecting(&args[0], want_k.as_ref())?;
+                            let (kv, kvt) = self.eval_expr_expecting(&args[0], want_k.as_ref())?;
                             let kb = self.box_value(kv, &kvt);
                             Some(self.hold_operand((kb, VType::Any)).0)
                         }
@@ -10718,9 +11071,7 @@ this case",
                             self.call_rt("grasm_map_set_bytes", &[mapv, kp, kl, vb])
                                 .unwrap()
                         }
-                        (None, Some(kb)) => {
-                            self.call_rt("grasm_map_set", &[mapv, kb, vb]).unwrap()
-                        }
+                        (None, Some(kb)) => self.call_rt("grasm_map_set", &[mapv, kb, vb]).unwrap(),
                         (None, None) => unreachable!(),
                     };
                     let cur2 = self.b.use_var(var);
