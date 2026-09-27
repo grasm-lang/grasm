@@ -1828,24 +1828,39 @@ fn a_native_build_leaves_no_scratch_directory() {
     std::fs::write(&entry, "fn main() {\n    print(\"x\")\n}\n").unwrap();
     let p = entry.to_str().unwrap();
 
+    // A temp directory of this test's own. Counting in the shared one also
+    // counted the scratch directories of other tests' builds running in
+    // parallel, so the test failed whenever one was in flight at the moment
+    // it looked -- twice in a row on 2026-09-28 -- without any leak.
+    let tmp = w.0.join("tmp");
+    std::fs::create_dir_all(&tmp).unwrap();
     let leaked = || -> usize {
-        let Ok(rd) = std::fs::read_dir(std::env::temp_dir()) else {
-            return 0;
-        };
-        rd.flatten()
-            .filter(|e| e.file_name().to_string_lossy().starts_with("grasm_native_"))
-            .count()
+        std::fs::read_dir(&tmp)
+            .map(|rd| {
+                rd.flatten()
+                    .filter(|e| e.file_name().to_string_lossy().starts_with("grasm_native_"))
+                    .count()
+            })
+            .unwrap_or(0)
+    };
+    let build = |out: &str| -> i32 {
+        Command::new(GRASM)
+            .args(["build", p, "--native", "-o", out])
+            .env("TMPDIR", &tmp)
+            .output()
+            .expect("runs")
+            .status
+            .code()
+            .unwrap_or(-1)
     };
     let before = leaked();
 
     let good = w.0.join("out");
     for _ in 0..3 {
-        let (code, out) = run(&["build", p, "--native", "-o", good.to_str().unwrap()]);
-        assert_eq!(code, 0, "{out}");
+        assert_eq!(build(good.to_str().unwrap()), 0);
     }
     // And on the failure path, where a dozen `?` return early.
-    let (code, _) = run(&["build", p, "--native", "-o", "/nonexistent/dir/x"]);
-    assert_eq!(code, 1);
+    assert_eq!(build("/nonexistent/dir/x"), 1);
 
     assert_eq!(
         leaked(),
