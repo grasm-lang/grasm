@@ -12,7 +12,7 @@ the part where they can.
 ## What a program looks like
 
 ```grasm
-fn main() / {io, task} {
+fn main() / {io, async} {
     let ch = channel()
     concurrent {
         go {
@@ -46,8 +46,9 @@ fn main() / {io, task} {
   value over; `ch.recv()` is `Some(v)`, or `None` once the channel is closed and
   drained; `ch.close()` says no more will be sent. `channel(n)` buffers `n`
   values; `channel()` is a rendezvous — a send waits for its receiver.
-- The operations perform the effect `task`, so a function that can block says
-  so in its row, and one declared `/ {}` cannot. Every rule that rests on rows
+- The operations perform `async` -- the effect `parallel` and `spawn` already
+  perform ([T-EFFECT]) -- so a function that can block says so in its row, and
+  one declared `/ {}` cannot. Every rule that rests on rows
   — `par_map`'s purity, a package's capability ceiling — keeps working.
 
 ## What it means
@@ -89,8 +90,13 @@ stack-depth check each function makes reads a per-thread floor; switching
 fibers switches that floor with the stack.
 
 **Interpreter.** Tasks are fibers on the interpreter's own thread, one running
-at a time. The interpreter's values are `Rc`, which is not thread-safe — and
-does not need to be, because nothing leaves the thread. This is why the design
+at a time, and **each task is its own interpreter instance** sharing only the
+channels: its scopes, handlers and call depth are its own, so nothing a
+suspended task holds is touched by another, and no `&mut` interpreter is ever
+live on two stacks at once. A task's output goes to a buffer the scheduler
+drains into the program's output after each resume, which keeps the order
+every other engine prints in. The interpreter's values are `Rc`, which is not
+thread-safe — and does not need to be, because nothing leaves the thread. This is why the design
 uses fibers rather than one OS thread per task passing a baton: that would have
 moved `Rc` values between threads and relied on a promise the type system
 cannot check.
@@ -107,7 +113,7 @@ observe, since tasks share nothing mutable, and is a later step.
 
 1. `grasm_fiber`: stacks and the context switch, with unit tests that switch
    thousands of fibers and check every register survives.
-2. Syntax and checking: `concurrent`, `go`, `channel`, the `task` effect, the
+2. Syntax and checking: `concurrent`, `go`, `channel`, the `async` effect, the
    no-outer-writes rule. Spec clauses, terse — the specification is at its page
    budget, so history moves out first.
 3. Interpreter: scheduler, channels, deadlock report. Conformance programs.
