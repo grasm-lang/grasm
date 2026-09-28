@@ -241,6 +241,11 @@
     <span class="fn">print</span><span class="op">(</span><span class="st">"{isqrt(17)} {isqrt(1000000)}"</span><span class="op">)</span>
 <span class="op">}</span></code></pre>
 <p><code>requires</code> is checked before the body runs; <code>ensures |r|</code> is checked on the result, however the body leaves. A broken one panics and quotes itself — <code>requires</code>n &gt;= 0<code>failed in</code>isqrt<code>` — so a wrong answer stops at the function that produced it instead of three calls later. A contract is a plain</code>bool` that performs nothing: it states a fact, it does not do work.</p>
+<p><code>grasm test --contracts</code> turns the contracts into tests. For each function with an <code>ensures</code> it generates inputs, sets aside the ones <code>requires</code> turns away, and reports any input whose result breaks the promise, shrunk to a small one:</p>
+<pre><code>test "contracts of isqrt" ... ok (100 cases, 48 outside `requires`)
+test "contracts of sloppy" ... FAILED on case 79 of 300
+  ensures `|r| r * r &lt;= n and (r + 1) * (r + 1) &gt; n` failed in `sloppy`
+  counterexample: n = 289</code></pre>
 <h2 id="5-effects">5. Effects</h2>
 <p>A function's type says what it <em>does</em>, not just what it returns. Built-in effects are <code>io</code> and <code>async</code>; you can declare your own.</p>
 <pre><code><span class="kw">effect</span> <span class="ty">Clock</span> <span class="op">{</span>

@@ -1993,3 +1993,35 @@ fn an_incremental_rebuild_sees_a_changed_constant() {
         "a rebuild that changed nothing did not reuse its objects"
     );
 }
+
+/// `grasm test --contracts` fuzzes each function's `ensures` with inputs its
+/// `requires` accepts, and reports a counterexample when one is broken
+/// ([T-CONTRACT-ENSURES]; MASTERPLAN §9.5's third level).
+///
+/// The wrong function is wrong only for some inputs -- perfect squares above
+/// 100 -- so the run has to find one rather than trip over it. The generic one
+/// cannot be fuzzed, and says so instead of being skipped in silence. Without
+/// the flag none of this runs.
+#[test]
+fn contracts_are_fuzzed_on_request() {
+    let w = Work::new("contracts");
+    let src = w.0.join("c.gr");
+    std::fs::write(
+        &src,
+        "fn isqrt(n: i64) -> i64\n    requires n >= 0 and n < 1000000\n    ensures |r| r * r <= n and (r + 1) * (r + 1) > n\n{\n    var r = 0\n    while (r + 1) * (r + 1) <= n {\n        r += 1\n    }\n    r\n}\n\nfn sloppy(n: i64) -> i64\n    requires n >= 0 and n < 10000\n    ensures |r| r * r <= n and (r + 1) * (r + 1) > n\n{\n    var r = 0\n    while (r + 1) * (r + 1) < n or ((r + 1) * (r + 1) == n and n <= 100) {\n        r += 1\n    }\n    r\n}\n\nfn first[T](xs: [T]) -> T\n    requires xs.len() > 0\n    ensures |f| f == xs[0]\n{\n    xs[0]\n}\n\nfn main() {\n    print(\"{isqrt(10)}\")\n}\n",
+    )
+    .unwrap();
+    let p = src.to_str().unwrap();
+
+    let (code, out) = run(&["test", p, "--contracts", "--cases", "300"]);
+    assert_eq!(code, 1, "{out}");
+    assert!(out.contains("test \"contracts of isqrt\" ... ok (300 cases"), "{out}");
+    assert!(out.contains("test \"contracts of sloppy\" ... FAILED"), "{out}");
+    assert!(out.contains("ensures `|r| r * r <= n and (r + 1) * (r + 1) > n` failed in `sloppy`"), "{out}");
+    assert!(out.contains("counterexample: n = "), "{out}");
+    assert!(out.contains("contracts of first\" ... not fuzzed"), "{out}");
+
+    let (code, out) = run(&["test", p]);
+    assert_eq!(code, 0, "{out}");
+    assert!(!out.contains("contracts of"), "{out}");
+}

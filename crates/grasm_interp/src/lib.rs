@@ -362,6 +362,97 @@ fn test_program_here(
         }
     }
 
+    // `--contracts`: each function whose postcondition can be tested becomes
+    // a property of its own parameters -- generate inputs, discard the ones
+    // its `requires` turns away, and fail on any its `ensures` rejects.
+    // MASTERPLAN §9.5's third enforcement level: the contract is the oracle.
+    if opts.contracts {
+        for file in &program.files {
+            let names: std::collections::HashSet<&str> = file
+                .module
+                .decls
+                .iter()
+                .filter_map(|d| match d {
+                    Decl::Fn(f) => Some(f.name.name.as_str()),
+                    _ => None,
+                })
+                .collect();
+            for decl in &file.module.decls {
+                let Decl::Fn(f) = decl else { continue };
+                let fname = f.name.name.as_str();
+                let has_body = names.contains(format!("{fname}@body").as_str());
+                let ensures = format!("{fname}@ensures");
+                if !has_body || !names.iter().any(|n| n.starts_with(&ensures)) {
+                    continue;
+                }
+                let label = if multi {
+                    format!("contracts of {}::{fname}", file.name)
+                } else {
+                    format!("contracts of {fname}")
+                };
+                if !opts.filter.is_empty() && !label.contains(&opts.filter) {
+                    continue;
+                }
+                let refuse = if !f.generics.is_empty() {
+                    Some("it is generic, and there is no one type to generate".to_string())
+                } else {
+                    f.params
+                        .iter()
+                        .find(|p| !generatable(&p.ty))
+                        .map(|p| format!("`{}` has a type the generator cannot produce", p.name.name))
+                };
+                if let Some(why) = refuse {
+                    interp.report(&format!("test \"{label}\" ... not fuzzed: {why}"));
+                    continue;
+                }
+                let call = grasm_syntax::ast::Expr::Call {
+                    callee: Box::new(grasm_syntax::ast::Expr::Ident(f.name.clone())),
+                    args: f
+                        .params
+                        .iter()
+                        .map(|p| grasm_syntax::ast::Expr::Ident(p.name.clone()))
+                        .collect(),
+                    span: f.span,
+                };
+                let body = grasm_syntax::ast::Block {
+                    stmts: vec![grasm_syntax::ast::Stmt::Expr(call)],
+                    span: f.span,
+                };
+                interp.set_current_module(&file.name);
+                interp.contract_mode = true;
+                interp.contract_discards = 0;
+                let outcome = interp.run_property(&f.params, &body, opts);
+                let turned_away = interp.contract_discards;
+                interp.contract_mode = false;
+                match outcome {
+                    testing::PropertyOutcome::Passed(cases) if turned_away >= cases => {
+                        interp.report(&format!(
+                            "test \"{label}\" ... inconclusive: none of {cases} generated inputs met `requires`"
+                        ));
+                        passed += 1;
+                    }
+                    testing::PropertyOutcome::Passed(cases) => {
+                        interp.report(&format!(
+                            "test \"{label}\" ... ok ({cases} cases, {turned_away} outside `requires`)"
+                        ));
+                        passed += 1;
+                    }
+                    testing::PropertyOutcome::Failed { inputs, message, case } => {
+                        interp.report(&format!(
+                            "test \"{label}\" ... FAILED on case {case} of {}\n  {}\n  counterexample: {}\n  replay: --contracts --seed {} --cases {}",
+                            opts.cases,
+                            message,
+                            testing::render_inputs(&inputs),
+                            opts.seed,
+                            opts.cases,
+                        ));
+                        failed += 1;
+                    }
+                }
+            }
+        }
+    }
+
     let unit_hits = interp.take_coverage();
 
     // Examples in `///` comments are tests. Documentation that stops being
@@ -805,4 +896,18 @@ pub fn test_src(src: &str, out: &mut impl Write) -> (u32, u32, Vec<grasm_syntax:
     let mut interp = Interp::new(&module, out);
     let (p, f) = interp.run_tests(&module);
     (p, f, vec![])
+}
+
+/// Whether `grasm test --contracts` can invent a value of this type: the
+/// scalars, and lists and tuples of them.
+fn generatable(t: &grasm_syntax::ast::TypeExpr) -> bool {
+    use grasm_syntax::ast::TypeExpr;
+    match t {
+        TypeExpr::Name { path, args, .. } => {
+            args.is_empty() && matches!(path.dotted().as_str(), "i64" | "f64" | "bool" | "str")
+        }
+        TypeExpr::List(inner, _) => generatable(inner),
+        TypeExpr::Tuple(items, _) => !items.is_empty() && items.iter().all(generatable),
+        _ => false,
+    }
 }

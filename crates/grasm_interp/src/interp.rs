@@ -125,6 +125,10 @@ pub struct Interp<'a, W: Write> {
     /// `Analysis` ([T-INTERFACE]). See `set_interfaces`.
     iface_calls: grasm_sema::check::SpanSet,
     impl_fns: HashMap<(String, String), String>,
+    /// Set while `grasm test --contracts` runs a function's contracts, and
+    /// how many generated inputs its `requires` turned away. See `try_case`.
+    pub(crate) contract_mode: bool,
+    pub(crate) contract_discards: u32,
     /// Listeners and connections opened by the `net` builtins, by handle.
     sockets: Vec<Option<NetSocket>>,
     /// Closure literals whose own type is fallible, by start offset.
@@ -1251,6 +1255,8 @@ impl<'a, W: Write> Interp<'a, W> {
             field_calls: Default::default(),
             iface_calls: Default::default(),
             impl_fns: HashMap::new(),
+            contract_mode: false,
+            contract_discards: 0,
             sockets: Vec::new(),
             fallible_closures: std::collections::HashSet::new(),
             float_sums: std::collections::HashSet::new(),

@@ -310,6 +310,17 @@ result, however the body leaves. A broken one panics and quotes itself —
 that produced it instead of three calls later. A contract is a plain `bool`
 that performs nothing: it states a fact, it does not do work.
 
+`grasm test --contracts` turns the contracts into tests. For each function with
+an `ensures` it generates inputs, sets aside the ones `requires` turns away, and
+reports any input whose result breaks the promise, shrunk to a small one:
+
+```text
+test "contracts of isqrt" ... ok (100 cases, 48 outside `requires`)
+test "contracts of sloppy" ... FAILED on case 79 of 300
+  ensures `|r| r * r <= n and (r + 1) * (r + 1) > n` failed in `sloppy`
+  counterexample: n = 289
+```
+
 ## 5. Effects
 
 A function's type says what it *does*, not just what it returns. Built-in

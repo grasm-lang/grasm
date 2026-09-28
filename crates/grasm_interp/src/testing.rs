@@ -479,6 +479,8 @@ pub struct TestOptions {
     pub coverage: bool,
     /// Substring filter over declaration names; empty runs everything.
     pub filter: String,
+    /// Also fuzz every function's contracts ([T-CONTRACT-ENSURES]).
+    pub contracts: bool,
 }
 
 impl Default for TestOptions {
@@ -488,6 +490,7 @@ impl Default for TestOptions {
             cases: 100,
             coverage: false,
             filter: String::new(),
+            contracts: false,
         }
     }
 }
@@ -630,6 +633,15 @@ impl<W: Write> Interp<'_, W> {
         self.scopes.pop();
         match result {
             Ok(_) | Err(Flow::Return(_)) => None,
+            // Fuzzing a function's contracts: an input its `requires` turns
+            // away is outside the function's domain, not a failure, and a
+            // fallible function answering with its own error has kept its
+            // promise -- `ensures` speaks only of the ok value.
+            Err(Flow::Panic(m)) if self.contract_mode && m.starts_with("requires `") => {
+                self.contract_discards += 1;
+                None
+            }
+            Err(Flow::Err(_)) if self.contract_mode => None,
             Err(Flow::Panic(m)) => Some(m),
             Err(Flow::Err(e)) => Some(format!("error: {e}")),
             Err(Flow::Exit(c)) => Some(format!("exit({c}) inside a test")),

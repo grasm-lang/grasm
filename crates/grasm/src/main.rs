@@ -116,7 +116,7 @@ fn run() -> ExitCode {
         // The flags each command takes, and which of them take a value.
         let (flags, valued): (&[&str], &[&str]) = match cmd {
             "run" => (&[], &[]),
-            "test" => (&["--coverage"], &["--seed", "--cases", "--filter"]),
+            "test" => (&["--coverage", "--contracts"], &["--seed", "--cases", "--filter"]),
             "bench" => (&[], &["--filter"]),
             "check" => (&[], &[]),
             "build" => (
@@ -228,7 +228,7 @@ fn run() -> ExitCode {
             // `grasm test --cases 5 f.gr` is the ordinary spelling and
             // printed the usage line, which reads as "that file is wrong".
             let Some(path) = first_operand(&args[1..], &["--seed", "--cases", "--filter"]) else {
-                eprintln!("usage: grasm test <file.gr> [--coverage] [--seed N] [--cases N] [--filter TEXT]");
+                eprintln!("usage: grasm test <file.gr> [--coverage] [--contracts] [--seed N] [--cases N] [--filter TEXT]");
                 return ExitCode::FAILURE;
             };
             let opts = match parse_test_opts(&args[1..]) {
@@ -907,6 +907,7 @@ fn run() -> ExitCode {
             eprintln!("  run <file.gr> [-- args...]   check + execute main (follows imports)");
             eprintln!("  test <file.gr>               run test blocks (unit and property)");
             eprintln!("      --coverage               report which lines the tests reached");
+            eprintln!("      --contracts              fuzz each function's `ensures` with inputs its `requires` accepts");
             eprintln!("      --seed N                 seed for property generation");
             eprintln!("      --cases N                property cases per test (default 100)");
             eprintln!("      --filter TEXT            only tests whose name contains TEXT");
@@ -985,6 +986,7 @@ fn flag_value(args: &[String], flag: &str) -> Option<String> {
 fn parse_test_opts(args: &[String]) -> Result<grasm_interp::testing::TestOptions, String> {
     let mut opts = grasm_interp::testing::TestOptions {
         coverage: args.iter().any(|a| a == "--coverage"),
+        contracts: args.iter().any(|a| a == "--contracts"),
         filter: flag_value(args, "--filter").unwrap_or_default(),
         ..Default::default()
     };
