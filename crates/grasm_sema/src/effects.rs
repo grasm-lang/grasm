@@ -1063,6 +1063,35 @@ once inside `main`",
                     .join(", ");
                 // An `impl` method, lowered to `method@Type`: said in the
                 // words the source used ([T-INTERFACE-PURE]).
+                // A contract, lowered to `f@requiresN` / `f@ensuresN` with the
+                // empty row ([T-CONTRACT-PURE]).
+                if let Some((owner, kind)) = f.name.name.split_once('@') {
+                    if kind.starts_with("requires") || kind.starts_with("ensures") {
+                        diags.push(
+                            Diagnostic::error(
+                                f.name.span,
+                                format!(
+                                    "a contract performs no effects, and this one on `{owner}` performs {list}"
+                                ),
+                            )
+                            .with_help("a contract states a fact; compute anything effectful before the call"),
+                        );
+                        continue;
+                    }
+                    // A function with contracts keeps its row on its body.
+                    if kind == "body" {
+                        diags.push(
+                            Diagnostic::error(
+                                f.name.span,
+                                format!(
+                                    "function `{owner}` performs effect(s) {list} not in its declared row"
+                                ),
+                            )
+                            .with_help("add them to the `/ { ... }` clause or handle them inside"),
+                        );
+                        continue;
+                    }
+                }
                 if let Some((method, ty)) = f.name.name.split_once('@') {
                     diags.push(
                         Diagnostic::error(

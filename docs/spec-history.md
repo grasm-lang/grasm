@@ -79,3 +79,20 @@ the rewrite turned out to exist and to be exact:
 by writing a program both ways and running it, on the ok branch and the failing
 one, rather than by reasoning about it — which is how the other six will have to
 be settled too.
+
+## spec/types.md
+
+Each of those
+used to report a type error about a program this clause calls well typed, and
+the last was the sharpest: `fn f() -> f64 { 3 }` was refused while
+`fn f() -> f64 { return 3 }` was accepted and printed `3.0`. In a `match` the
+first arm decided for all of them, so `let x: f64 = match n { 1 -> 2  _ -> 3.5 }`
+complained that the *second* arm produced `f64`, with help that said to "use a
+literal, which does adopt the other side" — which is what was written.
+
+## spec/semantics.md
+
+It did not produce NaN,
+so a property over `f64` never saw the one value `[L-LIB-SORT-NAN]` and
+`[E-EQ-STRUCTURAL]`'s NaN paragraph exist for — six thousand cases across two
+seeds found everything else and never that.

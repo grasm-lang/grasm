@@ -1,0 +1,18 @@
+//! tag: T-CONTRACT-PURE
+//! expect: error
+//! a contract performs no effects
+// A contract states a fact; it may not change anything while stating it.
+fn noisy(n: i64) -> i64
+    requires check(n)
+{
+    n
+}
+
+fn check(n: i64) -> bool / {io} {
+    print("checking")
+    n > 0
+}
+
+fn main() {
+    print("{noisy(1)}")
+}

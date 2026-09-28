@@ -19,6 +19,7 @@ pub struct ParseOutput {
 pub fn parse(src: &str) -> ParseOutput {
     let (tokens, docs) = crate::lexer::lex_with_docs(src);
     let mut p = Parser::new(tokens);
+    p.src = src.to_string();
     let mut module = p.parse_module();
     attach_docs(&mut module, src, 0, &docs);
     ParseOutput {
@@ -87,6 +88,8 @@ pub fn parse_with_offset(src: &str, offset: u32) -> ParseOutput {
         }
     }
     let mut p = Parser::new(tokens);
+    p.src = src.to_string();
+    p.src_offset = offset;
     let mut module = p.parse_module();
     attach_docs(&mut module, src, offset, &docs);
     ParseOutput {
@@ -198,6 +201,10 @@ struct Parser {
     /// Functions an `impl` was lowered to, waiting to follow its header into
     /// the module ([T-INTERFACE]).
     lowered: Vec<Decl>,
+    /// The text being parsed and the offset its spans start at, so a
+    /// contract's panic can quote the clause as written ([T-CONTRACT-REQUIRES]).
+    src: String,
+    src_offset: u32,
 }
 
 /// What to write instead, for an operator this language does not have.
@@ -229,6 +236,8 @@ impl Parser {
             not_a_map: std::collections::HashSet::new(),
             map_committed: false,
             lowered: Vec::new(),
+            src: String::new(),
+            src_offset: 0,
         }
     }
 
@@ -621,9 +630,20 @@ impl Parser {
         let (generics, bounds) = self.parse_generics()?;
         let params = self.parse_params_self(self_ty)?;
         let (ret, err, effects) = self.parse_fn_tail()?;
+        let contracts = self.parse_contracts()?;
+        if !contracts.is_empty() {
+            if self_ty.is_some() {
+                self.diags.push(Diagnostic::error(
+                    contracts[0].span,
+                    "an `impl` method cannot carry contracts yet; state them on a function it calls",
+                ));
+                return Err(());
+            }
+            self.skip_newlines();
+        }
         let body = self.parse_block()?;
         let span = start.merge(body.span);
-        Ok(FnDecl {
+        let f = FnDecl {
             is_pub,
             name,
             generics,
@@ -634,7 +654,192 @@ impl Parser {
             effects,
             body,
             span,
-        })
+        };
+        if contracts.is_empty() {
+            return Ok(f);
+        }
+        self.lower_contracts(f, contracts)
+    }
+
+    /// `requires c` and `ensures |r| c` clauses between a signature and its
+    /// body ([T-CONTRACT-REQUIRES], [T-CONTRACT-ENSURES]), with each clause's
+    /// source text for the panic that reports it.
+    fn parse_contracts(&mut self) -> PResult<Vec<Contract>> {
+        let mut out = Vec::new();
+        loop {
+            let save = self.i;
+            self.skip_newlines();
+            let is = |t: &TokenKind, w: &str| matches!(t, TokenKind::Ident(n) if n == w);
+            if is(self.cur(), "requires") {
+                let start = self.cur_span();
+                self.bump();
+                let prev = std::mem::replace(&mut self.no_struct_lit, true);
+                let cond = self.parse_expr();
+                self.no_struct_lit = prev;
+                let cond = cond?;
+                let text = self.quote(cond.span());
+                out.push(Contract { binder: None, cond, text, span: start });
+            } else if is(self.cur(), "ensures") {
+                let start = self.cur_span();
+                self.bump();
+                let open = self.cur_span();
+                self.expect(&TokenKind::Pipe)?;
+                let binder = self.ident()?;
+                self.expect(&TokenKind::Pipe)?;
+                let prev = std::mem::replace(&mut self.no_struct_lit, true);
+                let cond = self.parse_expr();
+                self.no_struct_lit = prev;
+                let cond = cond?;
+                let text = self.quote(open.merge(cond.span()));
+                out.push(Contract { binder: Some(binder), cond, text, span: start });
+            } else {
+                self.i = save;
+                return Ok(out);
+            }
+        }
+    }
+
+    /// The source a span covers, or a neutral word when this parser was not
+    /// given the text.
+    fn quote(&self, sp: Span) -> String {
+        let a = sp.start.saturating_sub(self.src_offset) as usize;
+        let b = sp.end.saturating_sub(self.src_offset) as usize;
+        self.src
+            .get(a..b)
+            .map(|t| t.split_whitespace().collect::<Vec<_>>().join(" "))
+            .unwrap_or_else(|| "contract".to_string())
+    }
+
+    /// A function with contracts, lowered so that every engine checks them
+    /// without knowing contracts exist.
+    ///
+    /// The body becomes `f@body`; each clause becomes `f@requiresN` or
+    /// `f@ensuresN`, a function of the parameters (and the result) returning
+    /// `bool` with the empty row, which is how [T-CONTRACT-PURE] is enforced
+    /// -- the ordinary row check reports a clause that performs anything. And
+    /// `f` itself is a wrapper: check each precondition, call the body, check
+    /// each postcondition on its result, return it. The body may leave by any
+    /// `return` it likes and the postcondition still sees the value, and a
+    /// fallible body's failure passes through `try` unchecked.
+    fn lower_contracts(&mut self, f: FnDecl, contracts: Vec<Contract>) -> PResult<FnDecl> {
+        if let Some(p) = f.params.iter().find(|p| p.mode != ParamMode::Let) {
+            self.diags.push(Diagnostic::error(
+                p.span,
+                "a function with contracts takes its parameters by value for now; `inout` and `own` are not supported",
+            ));
+            return Err(());
+        }
+        let sp = f.span;
+        let name = f.name.name.clone();
+        // Every synthetic node gets a span of its own: the checker records a
+        // type per span, and nodes sharing one overwrote each other's --
+        // `xs` and the result read as one expression of two types. A
+        // zero-width span at a distinct offset inside the declaration cannot
+        // coincide with any real expression, which always covers some text.
+        let next = std::cell::Cell::new(sp.start);
+        let fresh = || {
+            let at = next.get().min(sp.end.saturating_sub(1));
+            next.set(next.get() + 1);
+            Span::new(at, at)
+        };
+        let ident = |n: &str| Ident { name: n.to_string(), span: fresh() };
+        let var = |n: &str| Expr::Ident(Ident { name: n.to_string(), span: fresh() });
+        let call = |callee: &str, args: Vec<Expr>| Expr::Call {
+            callee: Box::new(var(callee)),
+            args,
+            span: fresh(),
+        };
+        let param_args: Vec<Expr> = f.params.iter().map(|p| var(&p.name.name)).collect();
+        let ok_ty = f.ret.clone().unwrap_or(TypeExpr::Tuple(Vec::new(), fresh()));
+        let bool_ty = TypeExpr::Name {
+            path: Path { segments: vec![ident("bool")], span: fresh() },
+            args: Vec::new(),
+            span: fresh(),
+        };
+        let check = |helper: &str, args: Vec<Expr>, msg: String| -> Stmt {
+            Stmt::Expr(Expr::If {
+                cond: Box::new(Expr::Unary {
+                    op: UnaryOp::Not,
+                    expr: Box::new(call(helper, args)),
+                    span: fresh(),
+                }),
+                then_block: Block {
+                    stmts: vec![Stmt::Expr(call(
+                        "panic",
+                        vec![Expr::Str(vec![StrPiece::Text(msg)], fresh())],
+                    ))],
+                    span: fresh(),
+                },
+                else_branch: None,
+                span: fresh(),
+            })
+        };
+        let mut stmts = Vec::new();
+        let mut post = Vec::new();
+        let (mut nr, mut ne) = (0, 0);
+        for c in contracts {
+            let mut params = f.params.clone();
+            let (helper, msg) = match &c.binder {
+                None => {
+                    nr += 1;
+                    (format!("{name}@requires{nr}"), format!("requires `{}` failed in `{name}`", c.text))
+                }
+                Some(b) => {
+                    ne += 1;
+                    params.push(Param {
+                        mode: ParamMode::Let,
+                        name: b.clone(),
+                        ty: ok_ty.clone(),
+                        span: b.span,
+                    });
+                    (format!("{name}@ensures{ne}"), format!("ensures `{}` failed in `{name}`", c.text))
+                }
+            };
+            self.lowered.push(Decl::Fn(FnDecl {
+                is_pub: false,
+                name: Ident { name: helper.clone(), span: c.span },
+                generics: f.generics.clone(),
+                bounds: f.bounds.clone(),
+                params,
+                ret: Some(bool_ty.clone()),
+                err: None,
+                effects: Some(Vec::new()),
+                body: Block { stmts: vec![Stmt::Expr(c.cond)], span: c.span },
+                span: c.span,
+            }));
+            match c.binder {
+                None => stmts.push(check(&helper, param_args.clone(), msg)),
+                Some(_) => {
+                    let mut args = param_args.clone();
+                    args.push(var("\u{a7}result"));
+                    post.push(check(&helper, args, msg));
+                }
+            }
+        }
+        let body_name = format!("{name}@body");
+        let mut run = call(&body_name, param_args.clone());
+        if f.err.is_some() {
+            run = Expr::Try { expr: Box::new(run), span: fresh() };
+        }
+        stmts.push(Stmt::Let {
+            mutable: false,
+            name: ident("\u{a7}result"),
+            ty: None,
+            init: run,
+            span: fresh(),
+        });
+        stmts.extend(post);
+        stmts.push(Stmt::Expr(var("\u{a7}result")));
+        let wrapper = FnDecl {
+            body: Block { stmts, span: f.body.span },
+            ..f.clone()
+        };
+        self.lowered.push(Decl::Fn(FnDecl {
+            is_pub: false,
+            name: Ident { name: body_name, span: f.name.span },
+            ..f
+        }));
+        Ok(wrapper)
     }
 
     /// `[T, U]`, each optionally bounded: `[T: Show + Ord, U]`
@@ -2666,4 +2871,14 @@ fn binary_operator_name(kind: &TokenKind) -> Option<&'static str> {
         // one is at least as likely to be a negation as a continuation.
         _ => None,
     }
+}
+
+/// One `requires` or `ensures` clause, before lowering.
+struct Contract {
+    /// The result's name in `ensures |r| ...`; `None` for `requires`.
+    binder: Option<Ident>,
+    cond: Expr,
+    /// The clause as written, for the panic message.
+    text: String,
+    span: Span,
 }

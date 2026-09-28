@@ -468,10 +468,7 @@ guarantee it provides is entirely static.
 It passes only if every case holds; the first failing case ends the run.
 
 The `f64` generator produces NaN, both infinities, both zeros, the subnormal
-boundary and the extremes, as well as ordinary values. It did not produce NaN,
-so a property over `f64` never saw the one value `[L-LIB-SORT-NAN]` and
-`[E-EQ-STRUCTURAL]`'s NaN paragraph exist for — six thousand cases across two
-seeds found everything else and never that.
+boundary and the extremes, as well as ordinary values.
 
 **[E-TEST-SHRINK]** A failing property is reported with a *shrunk*
 counterexample: the runner repeatedly substitutes smaller inputs and keeps any

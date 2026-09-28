@@ -1245,6 +1245,9 @@ fn main() {
 //! 7
 //! 4 6
 //! 325 325 15 325
+//! [-0.061111111111111116, -0.016666666666666663, 0.016666666666666663, 0.0444444444444444, 0.06904761904761902, 0.09166666666666667, 0.11296296296296293]
+//! [1.6912037037037035, 1.8958333333333333, 2.1508333333333334, 2.4259259259259265, 2.7085884353741494, 2.992708333333333, 3.274948559670783]
+//! [1.0, 1.75, 2.875, 4.5625, 7.09375, 10.890625, 16.5859375]
 // A counted loop is compiled four iterations at a time while four are left,
 // then one at a time for the remainder — so every trip count around that
 // four, both range forms, and both ways out of the body have to answer what
@@ -1392,6 +1395,28 @@ fn main() {
         incl += grid[c]
     }
     print("{sum} {still} {neg} {incl}")
+
+    // `f64` loops a compiled build may run two elements at a time. Every lane
+    // is the scalar operation, unfused and in the same order, so the digits
+    // are the ones any engine prints: odd lengths leave a remainder, and a
+    // loop where each element reads the one before it must not be split.
+    let fl = 7
+    var fx = (0..fl).map(|v| v.as_f64() * 0.1 + 0.3)
+    var fy = (0..fl).map(|v| 1.0 / (v.as_f64() + 3.0))
+    for v in 0..fl {
+        fy[v] = 2.5 * fx[v] + fy[v]
+    }
+    for v in 0..fl {
+        fx[v] -= fy[v] / 3.0
+        fy[v] *= 0.0 - fx[v] + 1.5
+    }
+    var chain = (0..fl).map(|_v| 1.0)
+    for v in 0..fl - 1 {
+        chain[v + 1] = chain[v] * 1.5 + 0.25
+    }
+    print("{fx}")
+    print("{fy}")
+    print("{chain}")
 }
 ```
 

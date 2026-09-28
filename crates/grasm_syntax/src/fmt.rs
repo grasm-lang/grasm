@@ -80,7 +80,13 @@ pub fn format_src(src: &str) -> String {
             // back out with it. Inheriting from the line *above* instead
             // indented the doc comment of every function that followed a sum
             // type — 384 of them across 191 packages.
-            let continues = |text: &str| text.starts_with('|') || text.starts_with('.');
+            // A contract clause continues the signature above it, between the
+            // `-> T` and the body's brace ([T-CONTRACT-REQUIRES]).
+            let continues = |text: &str| {
+                text.starts_with('|')
+                    || text.starts_with('.')
+                    || contract_clause(text)
+            };
             let pipe_extra = if trimmed.starts_with("//") {
                 let next = lines[index + 1..]
                     .iter()
@@ -644,7 +650,12 @@ fn respace(line: &str) -> String {
             }
         }
         prev_ends_value = match p.kind {
-            Kind::Word => !matches!(p.text, "return" | "in" | "and" | "or" | "not" | "else"),
+            // `requires` and `ensures` open a contract clause, so what follows
+            // starts a value: `ensures |r| …` opens closure parameters.
+            Kind::Word => !matches!(
+                p.text,
+                "return" | "in" | "and" | "or" | "not" | "else" | "requires" | "ensures"
+            ),
             Kind::Opaque => !p.text.starts_with("//") && !p.text.starts_with("/*"),
             Kind::Op => matches!(p.text, ")" | "]" | "}" | "?"),
         };
@@ -906,4 +917,17 @@ mod variant_indent_regression {
         let src = "type Shape =\n    | Circle(r: f64)\n    | Rect(w: f64, h: f64)\n\nfn f() {\n}\n";
         assert_eq!(format_src(src), src);
     }
+}
+
+/// A line that is a contract clause rather than a statement about a variable
+/// that happens to be called `requires` or `ensures`: the word is followed by
+/// something other than an assignment.
+fn contract_clause(text: &str) -> bool {
+    ["requires ", "ensures "].iter().any(|kw| {
+        text.strip_prefix(kw).is_some_and(|rest| {
+            let rest = rest.trim_start();
+            !(rest.starts_with('=') && !rest.starts_with("=="))
+                && !["+=", "-=", "*=", "/="].iter().any(|op| rest.starts_with(op))
+        })
+    })
 }

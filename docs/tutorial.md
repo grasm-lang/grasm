@@ -282,6 +282,34 @@ fn main() {
 
 `??` evaluates its right side only when the left is `None`.
 
+## 4a. Contracts
+
+A function can state what it expects and what it promises, and every call
+checks both:
+
+```
+fn isqrt(n: i64) -> i64
+    requires n >= 0
+    ensures |r| r * r <= n and (r + 1) * (r + 1) > n
+{
+    var r = 0
+    while (r + 1) * (r + 1) <= n {
+        r += 1
+    }
+    r
+}
+
+fn main() {
+    print("{isqrt(17)} {isqrt(1000000)}")
+}
+```
+
+`requires` is checked before the body runs; `ensures |r|` is checked on the
+result, however the body leaves. A broken one panics and quotes itself —
+`requires `n >= 0` failed in `isqrt`` — so a wrong answer stops at the function
+that produced it instead of three calls later. A contract is a plain `bool`
+that performs nothing: it states a fact, it does not do work.
+
 ## 5. Effects
 
 A function's type says what it *does*, not just what it returns. Built-in

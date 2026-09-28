@@ -1,0 +1,19 @@
+//! tag: T-CONTRACT-REQUIRES
+//! expect: panic
+//! requires `n >= 0` failed in `isqrt`
+// A precondition is checked on entry, before the body can run on input it was
+// never written for.
+fn isqrt(n: i64) -> i64
+    requires n >= 0
+{
+    var r = 0
+    while (r + 1) * (r + 1) <= n {
+        r += 1
+    }
+    r
+}
+
+fn main() {
+    print("{isqrt(17)}")
+    print("{isqrt(0 - 4)}")
+}

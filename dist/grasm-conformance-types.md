@@ -1,6 +1,6 @@
 # Grasm — conformance programs: types
 
-The type and effect system — what a program means before it runs. 102 executable program(s), one per normative clause of
+The type and effect system — what a program means before it runs. 105 executable program(s), one per normative clause of
 `grasm-language-pack.md`. Each header states the tag it demonstrates and the
 exact expected behaviour, and every one is run by `cargo test -p grasm_spec`, so
 a program here cannot describe behaviour the implementation does not have.
@@ -183,6 +183,87 @@ pub fn scaled() -> i64 {
 
 fn main() {
     print("{WIDTH} {scaled()}")
+}
+```
+
+## `T-CONTRACT-ENSURES.gr`
+
+```grasm
+//! tag: T-CONTRACT-ENSURES
+//! expect: panic
+//! ensures `|r| r * r <= n and (r + 1) * (r + 1) > n` failed in `bad_sqrt`
+// A postcondition sees the result whichever way the body leaves -- here by an
+// early `return` -- so a wrong answer is stopped at the function that made it.
+fn good_sqrt(n: i64) -> i64
+    requires n >= 0
+    ensures |r| r * r <= n and (r + 1) * (r + 1) > n
+{
+    var r = 0
+    while (r + 1) * (r + 1) <= n {
+        r += 1
+    }
+    r
+}
+
+fn bad_sqrt(n: i64) -> i64
+    ensures |r| r * r <= n and (r + 1) * (r + 1) > n
+{
+    if n > 10 {
+        return n / 2
+    }
+    good_sqrt(n)
+}
+
+fn main() {
+    print("{good_sqrt(26)} {bad_sqrt(9)}")
+    print("{bad_sqrt(50)}")
+}
+```
+
+## `T-CONTRACT-PURE.gr`
+
+```grasm
+//! tag: T-CONTRACT-PURE
+//! expect: error
+//! a contract performs no effects
+// A contract states a fact; it may not change anything while stating it.
+fn noisy(n: i64) -> i64
+    requires check(n)
+{
+    n
+}
+
+fn check(n: i64) -> bool / {io} {
+    print("checking")
+    n > 0
+}
+
+fn main() {
+    print("{noisy(1)}")
+}
+```
+
+## `T-CONTRACT-REQUIRES.gr`
+
+```grasm
+//! tag: T-CONTRACT-REQUIRES
+//! expect: panic
+//! requires `n >= 0` failed in `isqrt`
+// A precondition is checked on entry, before the body can run on input it was
+// never written for.
+fn isqrt(n: i64) -> i64
+    requires n >= 0
+{
+    var r = 0
+    while (r + 1) * (r + 1) <= n {
+        r += 1
+    }
+    r
+}
+
+fn main() {
+    print("{isqrt(17)}")
+    print("{isqrt(0 - 4)}")
 }
 ```
 

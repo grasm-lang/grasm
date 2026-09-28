@@ -17,7 +17,7 @@ criterion 5 forbids. Saying so was cheaper than defending the listing.
 the five-part test in `docs/stability.md`. The audit is reproducible and 26
 clauses did not pass it; the commit that promoted these says why each failed.
 
-Today: 167 stable, 26 provisional, 51 experimental, of 244.
+Today: 167 stable, 26 provisional, 54 experimental, of 247.
 
 ## Stable
 
@@ -265,6 +265,9 @@ May change or be removed in any release. New surface starts here.
 - `L-LIB-UDP` — experimental
 - `T-ALIAS-NOT-RECURSIVE` — experimental
 - `T-CAPABILITY` — experimental
+- `T-CONTRACT-ENSURES` — experimental
+- `T-CONTRACT-PURE` — experimental
+- `T-CONTRACT-REQUIRES` — experimental
 - `T-EFFECT-BUILTIN` — experimental
 - `T-EFFECT-OP-RESULT` — experimental
 - `T-EFFECT-RESERVED` — experimental

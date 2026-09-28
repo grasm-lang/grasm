@@ -1,0 +1,29 @@
+//! tag: T-CONTRACT-ENSURES
+//! expect: panic
+//! ensures `|r| r * r <= n and (r + 1) * (r + 1) > n` failed in `bad_sqrt`
+// A postcondition sees the result whichever way the body leaves -- here by an
+// early `return` -- so a wrong answer is stopped at the function that made it.
+fn good_sqrt(n: i64) -> i64
+    requires n >= 0
+    ensures |r| r * r <= n and (r + 1) * (r + 1) > n
+{
+    var r = 0
+    while (r + 1) * (r + 1) <= n {
+        r += 1
+    }
+    r
+}
+
+fn bad_sqrt(n: i64) -> i64
+    ensures |r| r * r <= n and (r + 1) * (r + 1) > n
+{
+    if n > 10 {
+        return n / 2
+    }
+    good_sqrt(n)
+}
+
+fn main() {
+    print("{good_sqrt(26)} {bad_sqrt(9)}")
+    print("{bad_sqrt(50)}")
+}

@@ -562,13 +562,7 @@ different types".
 
 An expected type also reaches a literal *through the shape that carries it*: a
 list, tuple or map literal, `Some`, `Ok`, `Err`, an `if`'s branches, a
-`match`'s arms, and the expression a function body ends with. Each of those
-used to report a type error about a program this clause calls well typed, and
-the last was the sharpest: `fn f() -> f64 { 3 }` was refused while
-`fn f() -> f64 { return 3 }` was accepted and printed `3.0`. In a `match` the
-first arm decided for all of them, so `let x: f64 = match n { 1 -> 2  _ -> 3.5 }`
-complained that the *second* arm produced `f64`, with help that said to "use a
-literal, which does adopt the other side" — which is what was written.
+`match`'s arms, and the expression a function body ends with.
 
 **[T-EMPTY-LIT]** An empty collection literal takes its element type from the
 surrounding annotation, struct field, parameter, or return type — or, failing
@@ -650,6 +644,18 @@ nothing else.
 
 **[T-INTERFACE-PURE]** An interface method declares no effects, so an `impl`
 method may perform none; one that does is an error at the `impl`.
+
+### Contracts
+
+**[T-CONTRACT-REQUIRES]** `requires c`, between a function's signature and its
+body, is checked on every call before the body runs; if `c` is false the call
+panics, quoting `c` and naming the function. A function may have several.
+
+**[T-CONTRACT-ENSURES]** `ensures |r| c` is checked on the value the body
+produces, however it leaves; if `c` is false the call panics the same way. A
+fallible function's `ensures` sees the ok value, and a failure is not checked.
+
+**[T-CONTRACT-PURE]** A contract is a `bool` that performs no effects.
 
 ## 5. Errors as values
 
@@ -2110,10 +2116,7 @@ guarantee it provides is entirely static.
 It passes only if every case holds; the first failing case ends the run.
 
 The `f64` generator produces NaN, both infinities, both zeros, the subnormal
-boundary and the extremes, as well as ordinary values. It did not produce NaN,
-so a property over `f64` never saw the one value `[L-LIB-SORT-NAN]` and
-`[E-EQ-STRUCTURAL]`'s NaN paragraph exist for — six thousand cases across two
-seeds found everything else and never that.
+boundary and the extremes, as well as ordinary values.
 
 **[E-TEST-SHRINK]** A failing property is reported with a *shrunk*
 counterexample: the runner repeatedly substitutes smaller inputs and keeps any
@@ -3269,6 +3272,34 @@ fn main() {
 ```
 
 `??` evaluates its right side only when the left is `None`.
+
+## 4a. Contracts
+
+A function can state what it expects and what it promises, and every call
+checks both:
+
+```
+fn isqrt(n: i64) -> i64
+    requires n >= 0
+    ensures |r| r * r <= n and (r + 1) * (r + 1) > n
+{
+    var r = 0
+    while (r + 1) * (r + 1) <= n {
+        r += 1
+    }
+    r
+}
+
+fn main() {
+    print("{isqrt(17)} {isqrt(1000000)}")
+}
+```
+
+`requires` is checked before the body runs; `ensures |r|` is checked on the
+result, however the body leaves. A broken one panics and quotes itself —
+`requires `n >= 0` failed in `isqrt`` — so a wrong answer stops at the function
+that produced it instead of three calls later. A contract is a plain `bool`
+that performs nothing: it states a fact, it does not do work.
 
 ## 5. Effects
 

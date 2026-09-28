@@ -224,6 +224,23 @@
     <span class="fn">print</span><span class="op">(</span><span class="st">"{xs.find(|x| x &gt; 99) ?? -1}"</span><span class="op">)</span>  <span class="cm">// -1</span>
 <span class="op">}</span></code></pre>
 <p><code>??</code> evaluates its right side only when the left is <code>None</code>.</p>
+<h2 id="4a-contracts">4a. Contracts</h2>
+<p>A function can state what it expects and what it promises, and every call checks both:</p>
+<pre><code><span class="kw">fn</span> <span class="fn">isqrt</span><span class="op">(</span>n<span class="op">:</span> <span class="ty">i64</span><span class="op">)</span> <span class="op">-&gt;</span> <span class="ty">i64</span>
+    requires n <span class="op">&gt;=</span> <span class="nu">0</span>
+    ensures <span class="op">|</span>r<span class="op">|</span> r <span class="op">*</span> r <span class="op">&lt;=</span> n <span class="kw">and</span> <span class="op">(</span>r <span class="op">+</span> <span class="nu">1</span><span class="op">)</span> <span class="op">*</span> <span class="op">(</span>r <span class="op">+</span> <span class="nu">1</span><span class="op">)</span> <span class="op">&gt;</span> n
+<span class="op">{</span>
+    <span class="kw">var</span> r <span class="op">=</span> <span class="nu">0</span>
+    <span class="kw">while</span> <span class="op">(</span>r <span class="op">+</span> <span class="nu">1</span><span class="op">)</span> <span class="op">*</span> <span class="op">(</span>r <span class="op">+</span> <span class="nu">1</span><span class="op">)</span> <span class="op">&lt;=</span> n <span class="op">{</span>
+        r <span class="op">+=</span> <span class="nu">1</span>
+    <span class="op">}</span>
+    r
+<span class="op">}</span>
+
+<span class="kw">fn</span> <span class="fn">main</span><span class="op">(</span><span class="op">)</span> <span class="op">{</span>
+    <span class="fn">print</span><span class="op">(</span><span class="st">"{isqrt(17)} {isqrt(1000000)}"</span><span class="op">)</span>
+<span class="op">}</span></code></pre>
+<p><code>requires</code> is checked before the body runs; <code>ensures |r|</code> is checked on the result, however the body leaves. A broken one panics and quotes itself — <code>requires</code>n &gt;= 0<code>failed in</code>isqrt<code>` — so a wrong answer stops at the function that produced it instead of three calls later. A contract is a plain</code>bool` that performs nothing: it states a fact, it does not do work.</p>
 <h2 id="5-effects">5. Effects</h2>
 <p>A function's type says what it <em>does</em>, not just what it returns. Built-in effects are <code>io</code> and <code>async</code>; you can declare your own.</p>
 <pre><code><span class="kw">effect</span> <span class="ty">Clock</span> <span class="op">{</span>
