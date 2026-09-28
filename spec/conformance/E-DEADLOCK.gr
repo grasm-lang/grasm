@@ -1,0 +1,22 @@
+//! tag: E-DEADLOCK
+//! expect: panic
+//! first
+//! deadlock
+// Each task waits to hear from the other before it says anything, so neither
+// ever does. That is reported, not left to hang.
+fn main() / {io, async} {
+    let a = chan_new()
+    let b = chan_new()
+    concurrent {
+        go {
+            print("first")
+            let x = chan_recv(a) ?? 0
+            chan_send(b, x)
+        }
+        go {
+            let y = chan_recv(b) ?? 0
+            chan_send(a, y)
+        }
+    }
+    print("never")
+}

@@ -3,6 +3,7 @@
 pub mod ffi;
 pub mod interp;
 pub mod journal;
+pub mod tasks;
 pub mod testing;
 pub mod value;
 
@@ -329,10 +330,47 @@ fn test_program_here(
             continue;
         }
         if t.params.is_empty() {
-            if interp.run_unit_test(t) {
-                passed += 1;
-            } else {
-                failed += 1;
+            let before = interp.concurrent_blocks_run();
+            interp.set_schedule(opts.schedule_seed);
+            let mut outcome = interp.run_unit_test_result(t);
+            interp.set_schedule(None);
+            // `--schedules N`: a test that started tasks is run again under N
+            // other orders. Each is named by a seed derived from `--seed`, and
+            // the failing one is printed, so it can be run again exactly.
+            let mut tried = 0;
+            if outcome.is_ok()
+                && opts.schedule_seed.is_none()
+                && interp.concurrent_blocks_run() > before
+            {
+                for k in 0..opts.schedules {
+                    let s = testing::schedule_seed(opts.seed, k);
+                    interp.set_schedule(Some(s));
+                    let r = interp.run_unit_test_result(t);
+                    interp.set_schedule(None);
+                    tried += 1;
+                    if let Err(m) = r {
+                        outcome = Err(format!(
+                            "{m}\n  under schedule {} of {}\n  replay: --schedule-seed {s}",
+                            k + 1,
+                            opts.schedules
+                        ));
+                        break;
+                    }
+                }
+            }
+            match outcome {
+                Ok(()) if tried > 0 => {
+                    interp.report(&format!("test \"{}\" ... ok ({tried} schedules)", t.name));
+                    passed += 1;
+                }
+                Ok(()) => {
+                    interp.report(&format!("test \"{}\" ... ok", t.name));
+                    passed += 1;
+                }
+                Err(m) => {
+                    interp.report(&format!("test \"{}\" ... FAILED: {m}", t.name));
+                    failed += 1;
+                }
             }
             continue;
         }

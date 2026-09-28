@@ -98,6 +98,8 @@ pub struct TypeDefs {
     pub by_name: HashMap<String, TypeDefId>,
     pub option_id: TypeDefId,
     pub io_error_id: TypeDefId,
+    /// The prelude's `Chan[T]`, which `chan_new()` makes (docs/concurrency.md).
+    pub chan_id: TypeDefId,
 }
 
 /// The prelude's `IoError`, once, so that every engine reads the same list.
@@ -118,6 +120,7 @@ impl TypeDefs {
             by_name: HashMap::new(),
             option_id: 0,
             io_error_id: 0,
+            chan_id: 0,
         };
         // Prelude: type Option[T] = | Some(v: T) | None
         td.option_id = td.insert(TypeDef {
@@ -149,6 +152,13 @@ impl TypeDefs {
                     })
                     .collect(),
             },
+        });
+        // Prelude: an opaque `Chan[T]`. It has no fields a program can read;
+        // `chan_send`, `chan_recv` and `chan_close` are the only way in.
+        td.chan_id = td.insert(TypeDef {
+            name: "Chan".into(),
+            generics: vec!["T".into()],
+            kind: TypeDefKind::Struct { fields: vec![] },
         });
         td
     }

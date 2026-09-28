@@ -13,18 +13,18 @@ the part where they can.
 
 ```grasm
 fn main() / {io, async} {
-    let ch = channel()
+    let ch = chan_new()
     concurrent {
         go {
             for i in 0..3 {
-                ch.send(i * i)
+                chan_send(ch, i * i)
             }
-            ch.close()
+            chan_close(ch)
         }
         go {
             var total = 0
             while true {
-                match ch.recv() {
+                match chan_recv(ch) {
                     Some(v) -> total += v
                     None -> break
                 }
@@ -42,22 +42,31 @@ fn main() / {io, async} {
   a closure does; it may not assign to a binding outside itself. Tasks share
   nothing mutable: they communicate by channel, which is what makes them free
   of data races by construction.
-- `channel()` makes a `Chan[T]`, `T` inferred from use. `ch.send(v)` hands a
-  value over; `ch.recv()` is `Some(v)`, or `None` once the channel is closed and
-  drained; `ch.close()` says no more will be sent. `channel(n)` buffers `n`
-  values; `channel()` is a rendezvous — a send waits for its receiver.
-- The operations perform `async` -- the effect `parallel` and `spawn` already
-  perform ([T-EFFECT]) -- so a function that can block says so in its row, and
-  one declared `/ {}` cannot. Every rule that rests on rows
-  — `par_map`'s purity, a package's capability ceiling — keeps working.
+- `chan_new()` makes a `Chan[T]`, `T` inferred from use. `chan_send(ch, v)`
+  hands a value over; `chan_recv(ch)` is `Some(v)`, or `None` once the channel
+  is closed and drained; `chan_close(ch)` says no more will be sent.
+  `chan_new(n)` buffers `n` values; `chan_new()` is a rendezvous — a send waits
+  for its receiver.
+- The operations are built-in functions, named like `tcp_read` and its
+  family, rather than methods. Effects are inferred before types are known, so
+  a method `send` could not be told from a user's own `send` on some other type
+  -- and `close`, `send` and `recv` are already the names of user functions
+  across the corpus. So did `channel`: the first version of this design
+  named the constructor that, and the `wav` and `raytrace` packages stopped
+  compiling. Every one of the four is prefixed now. A prefixed built-in is in the one table that says what
+  each built-in performs, so its row is right everywhere at once.
+- They perform `async` -- the effect `parallel` and `spawn` already perform
+  ([T-EFFECT]) -- so a function that can block says so in its row, and one
+  declared `/ {}` cannot. Every rule that rests on rows — `par_map`'s purity, a
+  package's capability ceiling — keeps working.
 
 ## What it means
 
 **Tasks switch only at a channel operation.** Between two operations a task
 runs alone, so everything it does in between is atomic with respect to the
 others. That is cooperative scheduling, and it is what makes the rest of this
-tractable: the only choices the scheduler ever makes are at `send`, `recv` and
-`close`, and the end of a task.
+tractable: the only choices the scheduler ever makes are at `chan_send`,
+`chan_recv` and `chan_close`, and the end of a task.
 
 **The default schedule is fixed.** Tasks start in the order their `go`s run; a
 task that blocks gives way to the next runnable one, first in first out. So a
@@ -84,8 +93,7 @@ callee-saved registers and the stack pointer, load another's. Both engines use
 it, so they cannot disagree about scheduling.
 
 **Native.** A `go` body is lifted into a function the way a closure is, and
-`grasm_task_go` hands it to the runtime scheduler with its captured
-environment. A channel operation is a runtime call that may switch fibers. The
+the block hands the list of them to the runtime scheduler (`grasm_conc_run`). A channel operation is a runtime call that may switch fibers. The
 stack-depth check each function makes reads a per-thread floor; switching
 fibers switches that floor with the stack.
 
@@ -111,15 +119,25 @@ observe, since tasks share nothing mutable, and is a later step.
 
 ## Stages
 
-1. `grasm_fiber`: stacks and the context switch, with unit tests that switch
-   thousands of fibers and check every register survives.
-2. Syntax and checking: `concurrent`, `go`, `channel`, the `async` effect, the
-   no-outer-writes rule. Spec clauses, terse — the specification is at its page
-   budget, so history moves out first.
-3. Interpreter: scheduler, channels, deadlock report. Conformance programs.
-4. Native: lifted task bodies, runtime scheduler and channels, stack floors.
-   Both engines held to the same output.
-5. `grasm test --schedules N`.
+1. *Done.* `grasm_fiber`: stacks and the context switch, with unit tests that
+   switch thousands of fibers and check every register survives.
+2. *Done.* Syntax and checking: `concurrent`, `go`, `channel`, the `async`
+   effect, the no-outer-writes rule, and no `ref` from outside a task.
+   [E-CONCURRENT], [E-CHANNEL], [E-SCHEDULE], [E-DEADLOCK].
+3. *Done.* Interpreter: scheduler, channels, deadlock report, conformance
+   programs and two laws.
+4. *Done.* Native: a `go` body is a closure of no arguments; the block keeps
+   its tasks in a list bound in its own scope, so a block left early releases
+   them with everything else, and `grasm_conc_run` runs them on fibers.
+   Channels are a table in the runtime, a root like the `ref` slab. Each task
+   gets a stack of the same budget as `main`'s thread, and the depth check's
+   floor is switched with it -- in both engines, which had called every task's
+   first call too deep. Both engines are held to the same output by difftest.
+5. *Done.* `grasm test --schedules N`: a unit test that started tasks runs
+   again under `N` orders, each round visiting the tasks in an order drawn
+   from a seed (SplitMix64, so a seed names the same orders everywhere). A
+   failure prints the seed; `--schedule-seed S` runs that one order again. A
+   test that started no tasks is not rerun -- there is nothing to vary.
 6. Measurement: tasks per second and memory per task, against the MASTERPLAN
    figure of 1M lightweight tasks on a node.
 

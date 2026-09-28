@@ -31,7 +31,25 @@ pub enum Flow {
     Exit(i32),
 }
 
-type EResult = Result<Value, Flow>;
+pub(crate) type EResult = Result<Value, Flow>;
+
+/// `Some(v)`, as the prelude's `Option` builds it.
+pub(crate) fn some(v: Value) -> Value {
+    Value::Variant {
+        type_name: Rc::new("Option".to_string()),
+        variant: Rc::new("Some".to_string()),
+        fields: Rc::new(vec![v]),
+    }
+}
+
+/// `None`.
+pub(crate) fn none() -> Value {
+    Value::Variant {
+        type_name: Rc::new("Option".to_string()),
+        variant: Rc::new("None".to_string()),
+        fields: Rc::new(vec![]),
+    }
+}
 
 /// Called before every statement, so a debugger can stop, inspect, and step.
 ///
@@ -210,6 +228,15 @@ pub struct Interp<'a, W: Write> {
     /// Bodies are cloned: spawns are rare and this keeps the evaluator free of
     /// AST lifetimes (closures own their bodies, so borrows can't be uniform).
     task_scopes: Vec<Vec<Block>>,
+    /// Every channel the program has made, shared with its tasks'
+    /// interpreters (crate::tasks).
+    pub(crate) chans: Rc<std::cell::RefCell<crate::tasks::Chans>>,
+    /// Whether this interpreter is a task of a `concurrent` block, running on
+    /// a fiber -- the only place a channel operation may wait.
+    pub(crate) in_task: bool,
+    /// The `go` bodies of each open `concurrent` block, with the scope each
+    /// captured, by value, when its `go` ran.
+    go_queue: Vec<Vec<crate::tasks::Task>>,
 }
 
 const MAX_DEPTH: u32 = 100_000;
@@ -228,13 +255,13 @@ const MAX_DEPTH: u32 = 100_000;
 // 10,000 frames [E-RECURSION-DEPTH] guarantees stopped short under
 // `cargo test` — a red suite that said nothing about the language.
 #[cfg(debug_assertions)]
-const STACK_BUDGET: usize = 1792 * 1024 * 1024;
+pub(crate) const STACK_BUDGET: usize = 1792 * 1024 * 1024;
 #[cfg(not(debug_assertions))]
-const STACK_BUDGET: usize = 448 * 1024 * 1024;
+pub(crate) const STACK_BUDGET: usize = 448 * 1024 * 1024;
 
 thread_local! {
     /// The lowest stack address this thread may use, set on the first check.
-    static STACK_FLOOR: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static STACK_FLOOR: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Whether the stack has run down past this thread's floor.
@@ -1284,6 +1311,63 @@ impl<'a, W: Write> Interp<'a, W> {
             pending_writebacks: Vec::new(),
             program_args: Vec::new(),
             task_scopes: Vec::new(),
+            chans: Rc::new(std::cell::RefCell::new(crate::tasks::Chans::default())),
+            in_task: false,
+            go_queue: Vec::new(),
+        }
+    }
+
+    /// A fresh interpreter for one task of a `concurrent` block: the same
+    /// program, tables and handlers, its own scopes and call state, the shared
+    /// channel table, and `out` for its output. It borrows nothing from this
+    /// one, so the two can be suspended and resumed independently.
+    pub(crate) fn fork_for_task(
+        &self,
+        out: &'a mut crate::tasks::TaskOut,
+    ) -> Interp<'a, crate::tasks::TaskOut> {
+        Interp {
+            stdin_lines: None,
+            fns: self.fns.clone(),
+            current_module: self.current_module.clone(),
+            consts: self.consts.clone(),
+            const_cache: self.const_cache.clone(),
+            float_literals: self.float_literals.clone(),
+            ok_wrapped: self.ok_wrapped.clone(),
+            field_calls: self.field_calls.clone(),
+            iface_calls: self.iface_calls.clone(),
+            impl_fns: self.impl_fns.clone(),
+            contract_mode: false,
+            contract_discards: 0,
+            sockets: Vec::new(),
+            fallible_closures: self.fallible_closures.clone(),
+            float_sums: self.float_sums.clone(),
+            slab: Vec::new(),
+            slab_free: Vec::new(),
+            aliases: self.aliases.clone(),
+            externs: self.externs.clone(),
+            fallible_ops: self.fallible_ops.clone(),
+            imports: self.imports.clone(),
+            sums: self.sums.clone(),
+            variants: self.variants.clone(),
+            variants_owned: self.variants_owned.clone(),
+            struct_fields: self.struct_fields.clone(),
+            coverage: None,
+            scopes: Vec::new(),
+            effect_names: self.effect_names.clone(),
+            handlers: self.handlers.clone(),
+            out,
+            fault: None,
+            depth: 0,
+            call_stack: Vec::new(),
+            cur_span: self.cur_span,
+            panic_trace: None,
+            debug: None,
+            pending_writebacks: Vec::new(),
+            program_args: self.program_args.clone(),
+            task_scopes: Vec::new(),
+            chans: self.chans.clone(),
+            in_task: true,
+            go_queue: Vec::new(),
         }
     }
 
@@ -1773,7 +1857,11 @@ impl<'a, W: Write> Interp<'a, W> {
                 }
                 Ok(Value::Unit)
             }
-            Stmt::Parallel { body, .. } => {
+            Stmt::Parallel {
+                body,
+                concurrent: false,
+                ..
+            } => {
                 // Collect spawned tasks, then run them to completion in spawn
                 // order before the scope exits (structured concurrency).
                 self.task_scopes.push(Vec::new());
@@ -1787,7 +1875,38 @@ impl<'a, W: Write> Interp<'a, W> {
                 }
                 Ok(Value::Unit)
             }
-            Stmt::Spawn { body, span } => match self.task_scopes.last_mut() {
+            // `concurrent`: its own statements run here, each `go` queues a
+            // task with the scope it sees, and the tasks then run to their end
+            // before the block does (crate::tasks).
+            Stmt::Parallel {
+                body,
+                concurrent: true,
+                ..
+            } => {
+                self.go_queue.push(Vec::new());
+                let collect = self.eval_block(body);
+                let tasks = self.go_queue.pop().unwrap_or_default();
+                collect?;
+                self.run_tasks(tasks)
+            }
+            Stmt::Spawn {
+                body,
+                concurrent: true,
+                span,
+            } => {
+                let seen = self.scopes.clone();
+                match self.go_queue.last_mut() {
+                    Some(q) => {
+                        q.push((body.clone(), seen));
+                        Ok(Value::Unit)
+                    }
+                    None => Err(Flow::Panic(format!(
+                        "`go` outside a `concurrent` block (at offset {})",
+                        span.start
+                    ))),
+                }
+            }
+            Stmt::Spawn { body, span, .. } => match self.task_scopes.last_mut() {
                 Some(scope) => {
                     scope.push(body.clone());
                     Ok(Value::Unit)
@@ -3250,6 +3369,29 @@ uses to mark the end of a string"
                     }
                     "map" => {
                         return Ok(Value::Map(Rc::new(std::collections::BTreeMap::new())));
+                    }
+                    "chan_new" => {
+                        let cap = match args.first() {
+                            Some(a) => match self.eval_expr(a)? {
+                                Value::Int(n) => n,
+                                _ => 0,
+                            },
+                            None => 0,
+                        };
+                        return Ok(self.chans.borrow_mut().make(cap));
+                    }
+                    "chan_send" => {
+                        let ch = self.eval_expr(&args[0])?;
+                        let v = self.eval_expr(&args[1])?;
+                        return self.chan_send(&ch, v);
+                    }
+                    "chan_recv" => {
+                        let ch = self.eval_expr(&args[0])?;
+                        return self.chan_recv(&ch);
+                    }
+                    "chan_close" => {
+                        let ch = self.eval_expr(&args[0])?;
+                        return self.chan_close(&ch);
                     }
                     // Guarded on the user's own namespace, the way the
                     // checker guards them: `e` is a common enough identifier

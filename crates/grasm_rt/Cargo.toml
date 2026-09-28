@@ -10,6 +10,8 @@ crate-type = ["staticlib", "rlib"]
 [dependencies]
 # The journal format, shared with the interpreter and the browser build.
 grasm_journal = { path = "../grasm_journal" }
+# Stacks and the context switch concurrent tasks run on.
+grasm_fiber = { path = "../grasm_fiber" }
 
 [features]
 # Never reuse a freed box, and trap on touching one. Off by default because it

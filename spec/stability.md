@@ -17,7 +17,7 @@ criterion 5 forbids. Saying so was cheaper than defending the listing.
 the five-part test in `docs/stability.md`. The audit is reproducible and 26
 clauses did not pass it; the commit that promoted these says why each failed.
 
-Today: 167 stable, 26 provisional, 56 experimental, of 249.
+Today: 167 stable, 26 provisional, 60 experimental, of 253.
 
 ## Stable
 
@@ -234,6 +234,9 @@ for "no problem found" to mean anything.
 May change or be removed in any release. New surface starts here.
 
 - `E-BENCH-WARMUP` — experimental
+- `E-CHANNEL` — experimental
+- `E-CONCURRENT` — experimental
+- `E-DEADLOCK` — experimental
 - `E-IF-FALLIBLE-MERGE` — experimental
 - `E-NOT-PARALLEL` — experimental
 - `E-PAR-FAIL` — experimental
@@ -241,6 +244,7 @@ May change or be removed in any release. New surface starts here.
 - `E-PAR-MAP-ORDER` — experimental
 - `E-PAR-VALUES` — experimental
 - `E-PARALLEL-JOIN` — experimental
+- `E-SCHEDULE` — experimental
 - `E-SPAWN-ORDER` — experimental
 - `E-SPAWN-SHARED` — experimental
 - `E-TASK-PANIC` — experimental

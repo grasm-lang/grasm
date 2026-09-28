@@ -1020,6 +1020,12 @@ impl<'m> Codegen<'m> {
                 Some(i64t),
             ),
             ("grasm_par_tasks_next", vec![], None),
+            // Concurrent tasks and channels (grasm_rt::tasks).
+            ("grasm_chan_new", vec![i64t], Some(i64t)),
+            ("grasm_chan_send", vec![i64t, i64t], None),
+            ("grasm_chan_recv", vec![i64t], Some(i64t)),
+            ("grasm_chan_close", vec![i64t], None),
+            ("grasm_conc_run", vec![i64t], None),
             (
                 "grasm_par_filter_scalar",
                 vec![i64t, ptr, ptr, i64t],
@@ -1119,6 +1125,12 @@ impl<'m> Codegen<'m> {
                     }
                     if n == "Option" && args.len() == 1 {
                         return Ok(VType::Option(Box::new(self.vtype_of(&args[0])?)));
+                    }
+                    // A channel is its number in the runtime's table, as it is
+                    // in the interpreter's; what it carries is known where a
+                    // value comes out of it, from the checker.
+                    if n == "Chan" && args.len() == 1 {
+                        return Ok(VType::I64);
                     }
                     if n == "Map" && args.len() == 2 {
                         return Ok(VType::Map(
@@ -2048,6 +2060,7 @@ arguments nor the type this is bound to",
             index_vals: HashMap::new(),
             wrote_through_ref: false,
             task_scopes: Vec::new(),
+            go_scopes: Vec::new(),
             floor: None,
             built_keys: Vec::new(),
             pending_key: None,
@@ -2721,6 +2734,7 @@ operation's",
             index_vals: HashMap::new(),
             wrote_through_ref: false,
             task_scopes: Vec::new(),
+            go_scopes: Vec::new(),
             floor: None,
             built_keys: Vec::new(),
             pending_key: None,
@@ -2831,6 +2845,7 @@ operation's",
             index_vals: HashMap::new(),
             wrote_through_ref: false,
             task_scopes: Vec::new(),
+            go_scopes: Vec::new(),
             floor: None,
             built_keys: Vec::new(),
             pending_key: None,
@@ -2984,6 +2999,7 @@ operation's",
             index_vals: HashMap::new(),
             wrote_through_ref: false,
             task_scopes: Vec::new(),
+            go_scopes: Vec::new(),
             floor: None,
             built_keys: Vec::new(),
             pending_key: None,
@@ -3336,6 +3352,10 @@ struct FnCx<'a, 'm> {
     /// lexically known, and [T-TASK-CAPTURE] guarantees they only touch
     /// bindings that outlive the block.
     task_scopes: Vec<(Variable, usize)>,
+    /// The task list of each open `concurrent` block, innermost last: a `go`
+    /// pushes its closure onto it. A function or closure body starts with
+    /// none, so a `go` that is not lexically inside a block is refused.
+    go_scopes: Vec<Variable>,
     /// Parameters the caller lent rather than gave: they are not released on
     /// the way out, because no reference changed hands. See `param_is_borrowed`.
     borrowed_vars: std::collections::HashSet<u32>,
@@ -7924,7 +7944,81 @@ impl FnCx<'_, '_> {
                 body,
                 span,
             } => self.eval_for(loop_var, iter, body, *span),
-            Stmt::Parallel { body, span } => {
+            // Concurrent tasks run on fibers under the runtime's scheduler
+            // (grasm_rt::tasks). The block's own statements run here; each
+            // `go` hands the runtime a task; the tasks run when the block
+            // ends. Left early, the block's tasks never run -- the runtime
+            // drops what a block left behind -- as in the interpreter.
+            Stmt::Parallel {
+                body,
+                concurrent: true,
+                ..
+            } => {
+                let fn_t = VType::Fn(vec![], Box::new(VType::Unit));
+                let list_t = VType::List(Box::new(fn_t.clone()));
+                let list_var = self.new_var(&list_t);
+                let empty = self.new_list_of(&fn_t);
+                self.b.def_var(list_var, empty);
+                // Bound in a scope of its own under a name the source cannot
+                // spell, so however the block is left the ordinary releases
+                // free the list and the tasks in it -- as `parallel` does.
+                let name = format!(" concurrent{}", self.var_count);
+                self.push_scope();
+                self.bind(&name, list_var, list_t);
+                self.go_scopes.push(list_var);
+                let walked = self.eval_block_inner(body);
+                self.go_scopes.pop();
+                let (tail, _) = walked?;
+                if self.is_filled() || self.dead {
+                    self.pop_scope_no_decs();
+                    return Ok(StmtOut::Terminated);
+                }
+                self.dec_block_tail(tail);
+                let tasks = self.b.use_var(list_var);
+                self.call_rt("grasm_conc_run", &[tasks]);
+                self.pop_scope_with_decs();
+                Ok(StmtOut::Value(None))
+            }
+            // A task is a closure of no arguments over its body: it sees its
+            // surroundings by value, which is what [E-CONCURRENT] says.
+            Stmt::Spawn {
+                body,
+                span,
+                concurrent: true,
+            } => {
+                // A task's result goes nowhere, so a trailing value is bound
+                // to `_` -- released as the task ends -- rather than handed
+                // back to a scheduler that would have to know how to drop it.
+                let mut task = body.clone();
+                if let Some(Stmt::Expr(e)) = task.stmts.last() {
+                    if self.probe_type(e).map_or(true, |t| t != VType::Unit) {
+                        let e = e.clone();
+                        let at = Span::new(task.span.end, task.span.end);
+                        task.stmts.pop();
+                        task.stmts.push(Stmt::Let {
+                            mutable: false,
+                            name: Ident {
+                                name: "_".to_string(),
+                                span: at,
+                            },
+                            ty: None,
+                            init: e,
+                            span: at,
+                        });
+                    }
+                }
+                let Some(&list_var) = self.go_scopes.last() else {
+                    // The checker rejects this; a backstop, not a path.
+                    return nope(*span, "`go` outside a `concurrent` block");
+                };
+                let task = Expr::Block(task);
+                let (f, ft) = self.make_closure_value(&[], &task, None, *span)?;
+                let cur = self.b.use_var(list_var);
+                let next = self.list_push_elem(cur, f, &ft);
+                self.b.def_var(list_var, next);
+                Ok(StmtOut::Value(None))
+            }
+            Stmt::Parallel { body, span, .. } => {
                 if self.cg.parallel_ok.contains(&span.start) {
                     self.emit_parallel_threads(body, *span)?;
                 } else {
@@ -7940,7 +8034,7 @@ impl FnCx<'_, '_> {
                 }
                 Ok(StmtOut::Value(None))
             }
-            Stmt::Spawn { body: _, span } => {
+            Stmt::Spawn { body: _, span, .. } => {
                 // Records that this site fired. The body itself is lowered by
                 // the enclosing `parallel`, after the block finishes.
                 let Some((list_var, next_index)) = self.task_scopes.last_mut() else {
@@ -13408,6 +13502,41 @@ checker did",
                 let v = self.call_rt("grasm_monotonic_millis", &[]).unwrap();
                 return Ok(Some((v, VType::I64)));
             }
+            // Channels (grasm_rt::tasks). A value sent is handed over, count
+            // and all; one received comes back inside an `Option`.
+            "chan_new" => {
+                let cap = match args.first() {
+                    Some(a) => self.eval_expr_val(a)?.0,
+                    None => self.b.ins().iconst(types::I64, 0),
+                };
+                let v = self.call_rt("grasm_chan_new", &[cap]).unwrap();
+                return Ok(Some((v, VType::I64)));
+            }
+            "chan_send" => {
+                let (ch, _) = self.eval_expr_val(&args[0])?;
+                let (v, t) = self.eval_expr_val(&args[1])?;
+                let boxed = self.box_value(v, &t);
+                self.call_rt("grasm_chan_send", &[ch, boxed]);
+                return Ok(Some((self.b.ins().iconst(types::I64, 0), VType::Unit)));
+            }
+            "chan_close" => {
+                let (ch, _) = self.eval_expr_val(&args[0])?;
+                self.call_rt("grasm_chan_close", &[ch]);
+                return Ok(Some((self.b.ins().iconst(types::I64, 0), VType::Unit)));
+            }
+            "chan_recv" => {
+                let t = match self.cg.resolved_types.get(&(call_span.start, call_span.end)) {
+                    Some(text) => grasm_syntax::parse_type_src(text)
+                        .and_then(|te| self.cg.vtype_of(&te).ok()),
+                    None => None,
+                };
+                let Some(t @ VType::Option(_)) = t else {
+                    return nope(call_span, "a `chan_recv` whose type the checker did not settle");
+                };
+                let (ch, _) = self.eval_expr_val(&args[0])?;
+                let v = self.call_rt("grasm_chan_recv", &[ch]).unwrap();
+                return Ok(Some((v, t)));
+            }
             "sleep_millis" => {
                 let (mv, mt) = self.eval_expr_val(&args[0])?;
                 let boxed = self.box_value(mv, &mt);
@@ -15505,6 +15634,8 @@ fields, not the type this is bound to, not an enclosing generic",
                             "pi" | "e" => Some(VType::F64),
                             "now_millis" | "monotonic_millis" => Some(VType::I64),
                             "sleep_millis" => Some(VType::Unit),
+                            "chan_new" => Some(VType::I64),
+                            "chan_send" | "chan_close" => Some(VType::Unit),
                             "input" => Some(VType::Str),
                             "file_exists" => Some(VType::Bool),
                             "args" => Some(VType::List(Box::new(VType::Str))),

@@ -116,7 +116,10 @@ fn run() -> ExitCode {
         // The flags each command takes, and which of them take a value.
         let (flags, valued): (&[&str], &[&str]) = match cmd {
             "run" => (&[], &[]),
-            "test" => (&["--coverage", "--contracts"], &["--seed", "--cases", "--filter"]),
+            "test" => (
+                &["--coverage", "--contracts"],
+                &["--seed", "--cases", "--filter", "--schedules", "--schedule-seed"],
+            ),
             "bench" => (&[], &["--filter"]),
             "check" => (&[], &[]),
             "build" => (
@@ -227,8 +230,11 @@ fn run() -> ExitCode {
             // The operand is wherever it is written, not at position 1:
             // `grasm test --cases 5 f.gr` is the ordinary spelling and
             // printed the usage line, which reads as "that file is wrong".
-            let Some(path) = first_operand(&args[1..], &["--seed", "--cases", "--filter"]) else {
-                eprintln!("usage: grasm test <file.gr> [--coverage] [--contracts] [--seed N] [--cases N] [--filter TEXT]");
+            let Some(path) = first_operand(
+                &args[1..],
+                &["--seed", "--cases", "--filter", "--schedules", "--schedule-seed"],
+            ) else {
+                eprintln!("usage: grasm test <file.gr> [--coverage] [--contracts] [--seed N] [--cases N] [--filter TEXT] [--schedules N] [--schedule-seed S]");
                 return ExitCode::FAILURE;
             };
             let opts = match parse_test_opts(&args[1..]) {
@@ -911,6 +917,8 @@ fn run() -> ExitCode {
             eprintln!("      --seed N                 seed for property generation");
             eprintln!("      --cases N                property cases per test (default 100)");
             eprintln!("      --filter TEXT            only tests whose name contains TEXT");
+            eprintln!("      --schedules N            rerun each test that starts tasks under N other schedules");
+            eprintln!("      --schedule-seed S        run under the one schedule a failure named");
             eprintln!("  bench <file.gr>              run bench blocks, report time per op");
             eprintln!("      --filter TEXT            only benchmarks whose name contains TEXT");
             eprintln!("  check <file.gr>              parse + typecheck");
@@ -1003,6 +1011,17 @@ fn parse_test_opts(args: &[String]) -> Result<grasm_interp::testing::TestOptions
             return Err("--cases must be at least 1".to_string());
         }
         opts.cases = n;
+    }
+    if let Some(v) = flag_value(args, "--schedules") {
+        opts.schedules = v
+            .parse()
+            .map_err(|_| format!("--schedules expects a number, got `{v}`"))?;
+    }
+    if let Some(v) = flag_value(args, "--schedule-seed") {
+        opts.schedule_seed = Some(
+            v.parse()
+                .map_err(|_| format!("--schedule-seed expects a number, got `{v}`"))?,
+        );
     }
     Ok(opts)
 }

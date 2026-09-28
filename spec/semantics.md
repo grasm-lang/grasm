@@ -67,11 +67,6 @@ allocated one per iteration — and built once it is a slot any mention can
 `release`, leaving every other mention holding a stale reference. This follows from the clause above and was worth saying
 out loud, since it silently destroys the one thing a reference is for.
 
-However it got one. The rule looked for a literal `ref(...)` in the
-initializer, so `let ROOT = mk()` where `mk` returns one was accepted — and so
-was a struct or a list holding one. It is the constant's *type* that decides
-now, so every carrier is covered.
-
 **[E-CLOSURE-CAPTURE]** A closure captures the values it uses **at the moment
 it is created**, not the bindings. Changing a captured variable afterwards is
 not visible inside, and a closure may not write to one at all — that is a
@@ -411,6 +406,26 @@ it do not run.
 build uses several cores only where that cannot be observed: every task is
 `v = e` with `e` pure, each `v` its own and read by no other task. Otherwise
 they run in order; multi-core work over *data* is `par_map`.
+
+**[E-CONCURRENT]** `concurrent { … }` does not exit until every task a `go
+{ … }` in it started has ended; `go` anywhere else is an error. A task sees its
+surroundings by value, as a closure does, and may not write a binding outside
+it or reach a `ref` from outside: tasks share nothing mutable.
+
+**[E-CHANNEL]** `chan_new(n)` makes a `Chan[T]` holding up to `n` values;
+`chan_new()` holds none, so `chan_send` waits until its value is received.
+`chan_recv(ch)` is `Some(v)`, in the order sent, or `None` once `chan_close(ch)`
+has run and the channel is drained. Sending on or closing a closed channel
+panics.
+
+**[E-SCHEDULE]** A task runs alone until it ends or a channel operation has to
+wait; then the next task, in the order the `go`s ran, takes over. So output is
+the same on every run. A channel operation outside every task that has to wait
+panics, since there is nothing to wait for. `grasm test --schedules N` reruns a
+test under `N` other orders, each named by a seed `--schedule-seed` replays.
+
+**[E-DEADLOCK]** When every task is waiting and none can go on, the program
+panics.
 
 **[E-PAR-FILTER-ORDER]** `xs.par_filter(f)` tests elements concurrently and
 keeps the survivors in **input order**. The predicate parallelises; the

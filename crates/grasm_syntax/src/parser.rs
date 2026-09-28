@@ -1582,16 +1582,17 @@ impl Parser {
         // concurrency scope only when a block follows, so existing code using
         // those words as ordinary names keeps compiling.
         if let TokenKind::Ident(name) = self.cur() {
-            let is_parallel = name == "parallel";
-            let is_spawn = name == "spawn";
+            let concurrent = name == "concurrent" || name == "go";
+            let is_parallel = name == "parallel" || name == "concurrent";
+            let is_spawn = name == "spawn" || name == "go";
             if (is_parallel || is_spawn) && self.block_follows() {
                 self.bump();
                 let body = self.parse_block()?;
                 let span = start.merge(body.span);
                 return Ok(if is_parallel {
-                    Stmt::Parallel { body, span }
+                    Stmt::Parallel { body, span, concurrent }
                 } else {
-                    Stmt::Spawn { body, span }
+                    Stmt::Spawn { body, span, concurrent }
                 });
             }
         }

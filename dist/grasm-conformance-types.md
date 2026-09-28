@@ -369,6 +369,13 @@ fn concurrent() / {async} {
         }
     }
 }
+// The channel operations wait on other tasks, which is `async` too: a
+// function that can block says so in its row.
+fn channel_ops(ch: Chan[i64]) / {async} {
+    chan_send(ch, 1)
+    let _v = chan_recv(ch)
+    chan_close(ch)
+}
 
 // **Every** builtin that reaches outside the program is charged `io`, and the
 // list of them is the thing that has to stay complete.

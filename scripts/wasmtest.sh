@@ -130,6 +130,11 @@ for src in $programs; do
     # file calls a store needed: three demos read and wrote real files and were
     # counted as disagreements. Anything added to `[L-LIB-BYTES]`'s file table
     # belongs here on the same day.
+    #
+    # A `concurrent` block's tasks are fibers, and wasm32-unknown-unknown has
+    # no way to switch stacks. The pattern is the block, not the word, so
+    # T-EFFECT-BUILTIN's `fn concurrent()` still runs; it holds no colon,
+    # because the reason starts at the first one.
     for need in par_map:threads par_filter:threads spawn:threads \
                 tcp_listen:sockets tcp_accept:sockets tcp_connect:sockets \
                 udp_bind:sockets net_wait:sockets \
@@ -141,7 +146,8 @@ for src in $programs; do
                 file_exists:filesystem \
                 random_bytes:filesystem \
                 list_dir:filesystem make_dir:filesystem \
-                proc_run:processes proc_pipeline:processes; do
+                proc_run:processes proc_pipeline:processes \
+                'concurrent[^a-z_(]*{:stack-switching'; do
         # Code, not prose. The name was matched anywhere in the file, so
         # `T-EXTERN-VALUE.gr` -- which mentions `par_map` in a comment
         # explaining why a purity proof matters -- was skipped as needing

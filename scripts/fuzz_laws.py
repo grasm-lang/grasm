@@ -325,6 +325,8 @@ CLAUSES = {
     "E-ORDER-LTR": "arguments run left to right",
     "E-SPAWN-ORDER": "spawn runs in order",
     "E-PARALLEL-JOIN": "parallel joins before after",
+    "E-CONCURRENT": "concurrent joins before after",
+    "E-SCHEDULE": "a task runs until it waits",
     "E-POW": "power is repeated product",
     "E-ARITH-INT": "division truncates toward zero",
     "E-STR-CONCAT": "substr composes",
@@ -506,6 +508,8 @@ LAWS = {
  "arguments run left to right": 'let seen = ref("")\n    let _v = two(note(seen, "a"), note(seen, "b"))\n    let order = seen.value\n    release(seen)\n    say(order == "ab")',
  "spawn runs in order":        'var log = ""\n    parallel {\n        spawn {\n            log += "a"\n        }\n        spawn {\n            log += "b"\n        }\n    }\n    say(log == "ab")',
  "parallel joins before after": 'var log = ""\n    parallel {\n        spawn {\n            log += "a"\n        }\n    }\n    log += "z"\n    say(log == "az")',
+ "concurrent joins before after": 'let ch = chan_new(1)\n    concurrent {\n        go {\n            chan_send(ch, "a")\n        }\n    }\n    let log = (chan_recv(ch) ?? "?") + "z"\n    say(log == "az")',
+ "a task runs until it waits": 'let ch = chan_new(3)\n    concurrent {\n        go {\n            chan_send(ch, 1)\n            chan_send(ch, 2)\n        }\n        go {\n            chan_send(ch, 3)\n        }\n    }\n    let a = chan_recv(ch) ?? 0\n    let b = chan_recv(ch) ?? 0\n    let c = chan_recv(ch) ?? 0\n    say(a == 1 and b == 2 and c == 3)',
  "power is repeated product":  'say((2 ^ 10) == 1024)',
  "negative power is a fraction": 'say((2.0 ^ (0.0 - 1.0)) == 0.5)',
  "division truncates toward zero": 'say((7 / 2) == 3 and ((0 - 7) / 2) == 0 - 3)',
@@ -718,7 +722,8 @@ def main():
             # without it does not run at all -- the fault F58 found, which is
             # why "not run" is a failure here rather than a count.
             needs_async = any(
-                w in law for w in ("par_map", "par_filter", "parallel", "spawn")
+                w in law
+                for w in ("par_map", "par_filter", "parallel", "spawn", "concurrent", "chan_")
             )
             row = "{io, async, Src}" if needs_async else "{io, Src}"
             src = PRELUDE + "fn main() / " + row + " {\n    " + law + "\n}\n"

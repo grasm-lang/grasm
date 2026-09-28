@@ -31,6 +31,9 @@ use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 /// interpolation, same formatting, same flushing — so duplicating six
 /// functions to change a destination would be six places for them to drift
 /// apart ([L-LIB-EPRINT]).
+// Concurrent tasks and channels (docs/concurrency.md).
+mod tasks;
+
 mod sink {
     use std::cell::Cell;
     thread_local! {
@@ -1819,6 +1822,8 @@ pub extern "C" fn grasm_check_leaks() {
             unsafe { dec(p) };
         }
     }
+    // What channels still hold is reachable the same way.
+    tasks::release_channels();
     // Allocations a worker thread made and handed back live in `ESCAPED`: the
     // counter is per-thread so that the hot path stays a plain load and store,
     // and a thread folds its balance in when it ends. A value built on a

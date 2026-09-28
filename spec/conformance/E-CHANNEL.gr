@@ -1,0 +1,14 @@
+//! tag: E-CHANNEL
+//! expect: panic
+//! Some(1) Some(2) None None
+//! send on a closed channel
+// A buffered channel needs no receiver to be waiting: two values fit. They
+// come out in the order they went in, then `None` for as long as anyone asks.
+fn main() / {io, async} {
+    let ch = chan_new(2)
+    chan_send(ch, 1)
+    chan_send(ch, 2)
+    chan_close(ch)
+    print("{chan_recv(ch)} {chan_recv(ch)} {chan_recv(ch)} {chan_recv(ch)}")
+    chan_send(ch, 3)
+}

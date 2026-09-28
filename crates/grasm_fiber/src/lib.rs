@@ -61,12 +61,27 @@ impl Fiber {
     /// # Panics
     /// When the target does not support fibers, or the stack cannot be mapped.
     pub fn new(stack_size: usize, body: impl FnOnce() + 'static) -> Fiber {
+        // Safety: `'static` needs no promise.
+        unsafe { Fiber::new_scoped(stack_size, body) }
+    }
+
+    /// [`Fiber::new`] for a body that borrows something shorter-lived.
+    ///
+    /// # Safety
+    /// The caller runs the fiber to its end, or drops it, before anything the
+    /// body borrows goes away. An interpreter's tasks borrow the program they
+    /// run, and a `concurrent` block does not end until its tasks have -- or
+    /// until one panics, in which case the rest are dropped unrun.
+    pub unsafe fn new_scoped<'a>(stack_size: usize, body: impl FnOnce() + 'a) -> Fiber {
+        let body: Box<dyn FnOnce() + 'a> = Box::new(body);
+        // Safety: the caller's promise above is what makes the lifetime moot.
+        let body: Box<dyn FnOnce() + 'static> = std::mem::transmute(body);
         assert!(supported(), "fibers are not supported on this target");
         let stack = Stack::new(stack_size);
         let mut inner = Box::new(Inner {
             own: Context { sp: 0 },
             back: Context { sp: 0 },
-            body: Some(Box::new(body)),
+            body: Some(body),
             finished: false,
             panic: None,
             stack,
@@ -96,6 +111,12 @@ impl Fiber {
             std::panic::resume_unwind(p);
         }
         self.inner.finished
+    }
+
+    /// The lowest address of this fiber's usable stack. A runtime that
+    /// checks its own depth sets its floor from this while the fiber runs.
+    pub fn stack_bottom(&self) -> usize {
+        self.inner.stack.bottom()
     }
 
     pub fn is_finished(&self) -> bool {
@@ -192,6 +213,14 @@ impl Stack {
     #[cfg(not(unix))]
     fn new(_size: usize) -> Stack {
         unreachable!("fibers are not supported on this target")
+    }
+
+    /// The lowest address the fiber may use; the guard page lies below it.
+    fn bottom(&self) -> usize {
+        #[cfg(unix)]
+        return self.base as usize + PAGE;
+        #[cfg(not(unix))]
+        return self.base as usize;
     }
 
     /// The top of the stack, 16-byte aligned, which every ABI here requires.

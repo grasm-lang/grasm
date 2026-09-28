@@ -119,3 +119,38 @@ sends people somewhere worse.
 ## spec/library.md
 
 it used to offer UFCS for `print`, which is the call it had just refused.
+
+## spec/types.md
+
+`let g =
+fs[0]` fell through to the pool of every function value in the function, so an
+unrelated closure elsewhere charged its effect to a call through `g` — while
+the same program written `for g in fs` was accepted, which is the pair this
+clause exists to close, back in the other direction. Where nothing is known
+about the part, the fallback is this function's own signature and nothing
+wider: reaching for every nameless row in the *program* meant an **unused**
+`type Loud = fn(i64) -> i64 / {io}` — in this file or in a dependency — refused
+a `/ {}` function whose own tuple component declares no effects.
+
+## spec/types.md
+
+"The same way" is about the *body* too: a named function's is checked against
+its declared return, and a closure's was merely inferred. So the expected type
+never reached the literals in its tail — `|x| 3` against `fn(i64) -> f64` was
+refused while `fn named(x: i64) -> f64 { 3 }`, the same body one closure apart,
+was accepted, and so was `|x| { return 3 }`. That is the asymmetry
+[T-INT-TO-FLOAT-CARRIED] records as fixed for named functions, still present
+one shape in.
+
+## spec/types.md
+
+the expected type reached
+only the *immediate* expression, so the same computation was accepted written
+with `match` on the outside and refused written with `if`, one keyword apart.
+
+## spec/semantics.md
+
+However it got one. The rule looked for a literal `ref(...)` in the
+initializer, so `let ROOT = mk()` where `mk` returns one was accepted — and so
+was a struct or a list holding one. It is the constant's *type* that decides
+now, so every carrier is covered.

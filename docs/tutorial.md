@@ -321,6 +321,17 @@ test "contracts of sloppy" ... FAILED on case 79 of 300
   counterexample: n = 289
 ```
 
+`grasm test --schedules N` does the same for tasks. A test that starts tasks
+in a `concurrent` block runs again under `N` other orders in which they could
+have taken turns; a result that depends on the order fails, with the seed that
+reproduces it:
+
+```text
+test "tasks arrive in go order" ... FAILED: assertion failed: `[21]` != `[12]`
+  under schedule 2 of 20
+  replay: --schedule-seed 13899076551742739803
+```
+
 ## 5. Effects
 
 A function's type says what it *does*, not just what it returns. Built-in
@@ -907,7 +918,7 @@ defect being worked off:
 | polymorphic recursion | `fn f[T](x: T) -> i64 { f([x]) }` needs one compiled copy per type and the types never stop growing. No amount of work removes this; it is what monomorphization is, and it is refused by name at build time |
 
 Everything else the interpreter accepts, the compiled backend compiles.
-`scripts/nativegaps.sh` holds that claim to 55 cases, running each under both
+`scripts/nativegaps.sh` holds that claim to 56 cases, running each under both
 engines and comparing output, exit code and leaks. Six of the fourteen generators in
 `scripts/` report how many of the programs they invented the backend turned
 away, and all six report `declined: 0` — and in all six a decline is a

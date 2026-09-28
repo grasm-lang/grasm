@@ -85,8 +85,33 @@ const IO_ROW: &[&str] = &[IO];
 const NET_ROW: &[&str] = &[NET];
 const PROC_ROW: &[&str] = &[PROC];
 const PURE: &[&str] = &[];
+const ASYNC_ROW: &[&str] = &[ASYNC];
 
 pub const BUILTINS: &[Builtin] = &[
+    // --- channels between the tasks of a `concurrent` block
+    // (docs/concurrency.md). Making one reaches nothing; the operations may
+    // wait on another task, which is what `async` says. Nothing outside the
+    // program is involved, so a replay changes nothing.
+    Builtin {
+        name: "chan_new",
+        row: PURE,
+        journal: Journal::Untouched,
+    },
+    Builtin {
+        name: "chan_send",
+        row: ASYNC_ROW,
+        journal: Journal::Untouched,
+    },
+    Builtin {
+        name: "chan_recv",
+        row: ASYNC_ROW,
+        journal: Journal::Untouched,
+    },
+    Builtin {
+        name: "chan_close",
+        row: ASYNC_ROW,
+        journal: Journal::Untouched,
+    },
     // --- the terminal ---
     Builtin {
         name: "print",

@@ -425,8 +425,9 @@ value or `fail`s, exactly as a fallible function's body does.
 row `/ {io, E}` is an upper bound: performing an effect outside it is an error.
 
 **[T-EFFECT-BUILTIN]** `io` is performed by `print` and the filesystem
-builtins. `async` is performed by `parallel`/`spawn`. Both are discharged by
-the runtime at `main` and in tests.
+builtins. `async` is performed by `parallel`/`spawn`, `concurrent`/`go` and
+`chan_send`, `chan_recv`, `chan_close`. Both are discharged by the runtime at
+`main` and in tests.
 
 **[T-EFFECT-RESERVED]** `io`, `async` and `unsafe` may not be declared as
 effects. They are capabilities the runtime discharges, not effects a program
@@ -524,16 +525,6 @@ the fallback anyway, so an unrelated `log: fn(str) / {io}` in the same
 signature charged `io` to a call through a pure `step` — while `xs.map(step)`
 written directly was accepted. The same program one `let` apart, again.
 
-`let g =
-fs[0]` fell through to the pool of every function value in the function, so an
-unrelated closure elsewhere charged its effect to a call through `g` — while
-the same program written `for g in fs` was accepted, which is the pair this
-clause exists to close, back in the other direction. Where nothing is known
-about the part, the fallback is this function's own signature and nothing
-wider: reaching for every nameless row in the *program* meant an **unused**
-`type Loud = fn(i64) -> i64 / {io}` — in this file or in a dependency — refused
-a `/ {}` function whose own tuple component declares no effects.
-
 A `type` name counts as the type it stands for, here as everywhere
 ([T-TYPE-ALIAS]). This is inferred from written syntax rather than from
 resolved types, and a row behind a name was not there: `f: Cb` for
@@ -617,14 +608,6 @@ value would be a way to carry an effect past a declared row.
 
 A closure literal is checked the same way a named function is.
 
-"The same way" is about the *body* too: a named function's is checked against
-its declared return, and a closure's was merely inferred. So the expected type
-never reached the literals in its tail — `|x| 3` against `fn(i64) -> f64` was
-refused while `fn named(x: i64) -> f64 { 3 }`, the same body one closure apart,
-was accepted, and so was `|x| { return 3 }`. That is the asymmetry
-[T-INT-TO-FLOAT-CARRIED] records as fixed for named functions, still present
-one shape in.
-
 **[T-OK-ERR]** `Ok(v)` and `Err(e)` build a `T ! E` directly. They are the
 constructors matching what `match` already destructures, and without them a
 plain value could not be *put into* a fallible slot at all: `fail` is legal
@@ -649,9 +632,7 @@ stderr.
 
 Nesting does not change the position. A branch whose own body branches is at
 the fallible position too, so `if a { if b { 1 } else { Ok(2) } } else { Ok(3) }`
-merges to `i64 ! E` exactly as the flat form does; the expected type reached
-only the *immediate* expression, so the same computation was accepted written
-with `match` on the outside and refused written with `if`, one keyword apart.
+merges to `i64 ! E` exactly as the flat form does.
 
 This is a rule about the *position*, not about how it was reached: an
 annotation naming `T ! E` — a `let`, a struct field, a parameter — accepts the

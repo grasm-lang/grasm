@@ -1,0 +1,30 @@
+//! tag: E-SCHEDULE
+//! expect: output
+//! ping 0
+//! pong 0
+//! ping 1
+//! pong 10
+//! ping 2
+//! pong 20
+// Two rendezvous channels force strict alternation, and the fixed order fixes
+// which of the two prints first: the task whose `go` ran first.
+fn main() / {io, async} {
+    let ping = chan_new()
+    let pong = chan_new()
+    concurrent {
+        go {
+            for i in 0..3 {
+                print("ping {i}")
+                chan_send(ping, i)
+                let _back = chan_recv(pong)
+            }
+        }
+        go {
+            for _i in 0..3 {
+                let n = chan_recv(ping) ?? 0
+                print("pong {n * 10}")
+                chan_send(pong, n)
+            }
+        }
+    }
+}

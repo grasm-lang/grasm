@@ -284,6 +284,10 @@ fn looks_like(candidate: &str, written: &str) -> bool {
 /// syntax against the receiver type's methods and then against functions a
 /// *program* declares, and `print` is a method of nothing.
 pub const BUILTIN_FREE_FNS: &[&str] = &[
+    "chan_new",
+    "chan_send",
+    "chan_recv",
+    "chan_close",
     "print",
     "eprint",
     "tcp_listen",
@@ -930,6 +934,11 @@ struct Checker {
     err_open: bool,
     /// Nesting depth of `parallel` scopes — `spawn` requires one.
     parallel_depth: u32,
+    /// Nesting of `concurrent` blocks, and the scope depth at which the
+    /// innermost `go` body began: a binding below it belongs to another task
+    /// and may not be written from this one (docs/concurrency.md).
+    concurrent_depth: u32,
+    go_floor: Option<usize>,
     /// Scope depth where the innermost enclosing `parallel` block began.
     parallel_floor: Option<usize>,
     /// While checking a task body: (parallel floor, depth where this task body
@@ -1037,6 +1046,8 @@ impl Checker {
             fn_err: None,
             err_open: false,
             parallel_depth: 0,
+            concurrent_depth: 0,
+            go_floor: None,
             parallel_floor: None,
             task_capture: None,
             loop_depth: 0,
@@ -3016,6 +3027,9 @@ is a failure nothing reports",
     fn check_deferred_closure(&mut self, d: DeferredClosure) {
         self.scopes.push(HashMap::new());
         self.closure_floors.push(self.scopes.len() - 1);
+        // A `go` must be lexically inside its block, not inside something
+        // that could run after the block has ended.
+        let saved_conc = std::mem::replace(&mut self.concurrent_depth, 0);
         let saved_touch = std::mem::replace(&mut self.closure_touches_outside_ref, false);
         for (p, t) in d.params.iter().zip(&d.param_tys) {
             self.bind(p, t.clone(), false);
@@ -3045,6 +3059,7 @@ is a failure nothing reports",
         }
         self.deferred_closures.pop();
         self.settle_deferred_fields();
+        self.concurrent_depth = saved_conc;
         self.closure_floors.pop();
         self.scopes.pop();
         if self.closure_touches_outside_ref {
@@ -3176,6 +3191,15 @@ is a failure nothing reports",
                     self.consume(value);
                 }
                 self.check_assign_target(target);
+                {
+                    let mut root = target;
+                    while let Expr::Field { recv, .. } | Expr::Index { recv, .. } = root {
+                        root = recv;
+                    }
+                    if let Expr::Ident(id) = root {
+                        self.reject_task_write(id);
+                    }
+                }
                 let target_ty = self.infer_expr(target);
                 self.reject_handler_escape(target, &target_ty);
                 if *op == AssignOp::Assign {
@@ -3300,7 +3324,50 @@ closing brace — yield a number from the region and return that",
                 self.loop_depth -= 1;
                 Type::Unit
             }
-            Stmt::Parallel { body, span } => {
+            Stmt::Parallel {
+                body,
+                concurrent: true,
+                ..
+            } => {
+                // Its own statements run in the task that reaches it; each
+                // `go` inside starts another, and the block ends when they all
+                // have.
+                self.concurrent_depth += 1;
+                self.check_block_discarded(body);
+                self.concurrent_depth -= 1;
+                Type::Unit
+            }
+            Stmt::Spawn {
+                body,
+                span,
+                concurrent: true,
+            } => {
+                if self.concurrent_depth == 0 {
+                    self.error_help(
+                        *span,
+                        "`go` outside a `concurrent` block",
+                        "wrap it in `concurrent { ... }`, which does not end until every task it started has",
+                    );
+                }
+                // A task sees its surroundings by value, as a closure does --
+                // so the closure rules apply: it cannot capture a linear value,
+                // move a binding from outside, or write one.
+                let saved_loop = self.loop_depth;
+                let saved_go = self.go_floor;
+                self.loop_depth = 0;
+                self.go_floor = Some(self.scopes.len());
+                self.closure_floors.push(self.scopes.len());
+                // A `go` must be lexically inside its block, not inside something
+                // that could run after the block has ended.
+                let saved_conc = std::mem::replace(&mut self.concurrent_depth, 0);
+                self.check_block_discarded(body);
+                self.concurrent_depth = saved_conc;
+                self.closure_floors.pop();
+                self.go_floor = saved_go;
+                self.loop_depth = saved_loop;
+                Type::Unit
+            }
+            Stmt::Parallel { body, span, .. } => {
                 self.parallel_depth += 1;
                 let saved_floor = self.parallel_floor;
                 // Bindings from here down live only for the collection pass;
@@ -3314,7 +3381,7 @@ closing brace — yield a number from the region and return that",
                 }
                 Type::Unit
             }
-            Stmt::Spawn { body, span } => {
+            Stmt::Spawn { body, span, .. } => {
                 if self.parallel_depth == 0 {
                     self.error_help(
                         *span,
@@ -3822,6 +3889,21 @@ that does not change",
     /// by assignment or by a mutating method — is precisely how something
     /// would get out. `outer.push(made_here)` is the case that a rule about
     /// assignment alone would miss.
+    /// A task of a `concurrent` block writing a binding from outside itself.
+    /// Tasks share nothing mutable -- that is what makes them free of races
+    /// by construction -- so a value goes from one to another over a channel.
+    fn reject_task_write(&mut self, id: &Ident) {
+        let Some(floor) = self.go_floor else { return };
+        let at = self.scopes.iter().rposition(|sc| sc.contains_key(&id.name));
+        if at.is_some_and(|i| i < floor) {
+            self.error_help(
+                id.span,
+                format!("a task cannot write `{}`, which belongs outside it", id.name),
+                "tasks share nothing mutable -- send the value on a channel and let the owner write it",
+            );
+        }
+    }
+
     fn reject_region_escape(&mut self, id: &Ident, verb: &str) {
         let Some(&floor) = self.region_floors.last() else {
             return;
@@ -4631,6 +4713,24 @@ write back to — copy it into a local first, as in `var {} = {}`",
             });
             if outside && self.carries_ref(&t) {
                 self.closure_touches_outside_ref = true;
+            }
+        }
+        // A task reaching a `ref` from outside it: two tasks holding the same
+        // cell is shared mutable state, which is what tasks give up in
+        // exchange for being free of races.
+        if let (Some(floor), Expr::Ident(id)) = (self.go_floor, e) {
+            let declared_at = self.scopes.iter().rposition(|sc| sc.contains_key(&id.name));
+            if declared_at.is_some_and(|at| at < floor) && self.carries_ref(&t) {
+                self.error_help(
+                    id.span,
+                    format!(
+                        "a task cannot use `{}` -- it reaches a `ref` from outside, which \
+tasks would share",
+                        id.name
+                    ),
+                    "tasks share nothing mutable -- send the value on a channel instead",
+                );
+                return Type::Error;
             }
         }
         if let (Some(floor), Expr::Ident(id)) = (self.parallel_fn_floor, e) {
@@ -5731,6 +5831,42 @@ only a number or a `bool` can come out — compute what you need and yield that"
                             Box::new(io_err),
                         );
                     }
+                    // Channels between the tasks of a `concurrent` block
+                    // (docs/concurrency.md).
+                    "chan_new" => {
+                        if args.len() > 1 {
+                            return self.error(
+                                span,
+                                "`chan_new` takes at most 1 argument (how many values it buffers)",
+                            );
+                        }
+                        if let Some(n) = args.first() {
+                            self.check_expr(n, &Type::I64);
+                        }
+                        let t = self.uni.fresh();
+                        return Type::Named { id: self.defs.chan_id, args: vec![t] };
+                    }
+                    "chan_send" | "chan_recv" | "chan_close" => {
+                        let name = id.name.as_str();
+                        let want = if name == "chan_send" { 2 } else { 1 };
+                        if args.len() != want {
+                            return self.error(
+                                span,
+                                format!("{name} takes {want} argument(s), got {}", args.len()),
+                            );
+                        }
+                        let t = self.uni.fresh();
+                        let chan = Type::Named { id: self.defs.chan_id, args: vec![t.clone()] };
+                        self.check_expr(&args[0], &chan);
+                        return match name {
+                            "chan_send" => {
+                                self.check_expr(&args[1], &t);
+                                Type::Unit
+                            }
+                            "chan_recv" => Type::Named { id: self.defs.option_id, args: vec![t] },
+                            _ => Type::Unit,
+                        };
+                    }
                     "args" => {
                         if !args.is_empty() {
                             return self.error(span, "args takes no arguments");
@@ -6707,6 +6843,20 @@ Perform the effect after the closing brace, or yield a number and do the work ou
             }
             if let Expr::Ident(id) = root {
                 self.reject_region_escape(id, "mutate");
+            }
+        }
+        if self.go_floor.is_some()
+            && matches!(
+                name.name.as_str(),
+                "push" | "pop" | "set" | "delete" | "sort" | "sort_by" | "remove"
+            )
+        {
+            let mut root = recv;
+            while let Expr::Field { recv, .. } | Expr::Index { recv, .. } = root {
+                root = recv;
+            }
+            if let Expr::Ident(id) = root {
+                self.reject_task_write(id);
             }
         }
         let recv_ty = self.infer_expr(recv);
@@ -8033,6 +8183,11 @@ value per element and combine the results afterwards",
                 return;
             }
         }
+        // A task's own floor: `reject_task_write` says so, and this advice --
+        // hold it behind a `ref` -- is what a task may not do.
+        if self.go_floor == Some(floor) {
+            return;
+        }
         if let Some(at) = declared_at {
             if at < floor {
                 self.error_help(
@@ -8983,6 +9138,9 @@ bind the component to a `var`, or use a struct when the parts have names worth w
         }
         self.scopes.push(HashMap::new());
         self.closure_floors.push(self.scopes.len() - 1);
+        // A `go` must be lexically inside its block, not inside something
+        // that could run after the block has ended.
+        let saved_conc = std::mem::replace(&mut self.concurrent_depth, 0);
         // Per closure: an inner one reaching a `ref` says nothing about the
         // one around it.
         let saved_touch = std::mem::replace(&mut self.closure_touches_outside_ref, false);
@@ -9086,6 +9244,7 @@ bind the component to a `var`, or use a struct when the parts have names worth w
             self.check_deferred_closure(next);
         }
         self.deferred_closures.pop();
+        self.concurrent_depth = saved_conc;
         self.closure_floors.pop();
         self.scopes.pop();
         if self.closure_touches_outside_ref {

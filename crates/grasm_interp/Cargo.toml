@@ -13,3 +13,6 @@ grasm_sema = { path = "../grasm_sema" }
 # another. It must not reach for `grasm_rt`: that runtime is written for a
 # 64-bit host, and this crate is also the browser build.
 grasm_journal = { path = "../grasm_journal" }
+# Fibers for the tasks of a `concurrent` block (crate::tasks). No
+# dependencies of its own, and on wasm32 it compiles to nothing callable.
+grasm_fiber = { path = "../grasm_fiber" }

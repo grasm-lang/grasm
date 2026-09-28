@@ -864,8 +864,9 @@ value or `fail`s, exactly as a fallible function's body does.
 row `/ {io, E}` is an upper bound: performing an effect outside it is an error.
 
 **[T-EFFECT-BUILTIN]** `io` is performed by `print` and the filesystem
-builtins. `async` is performed by `parallel`/`spawn`. Both are discharged by
-the runtime at `main` and in tests.
+builtins. `async` is performed by `parallel`/`spawn`, `concurrent`/`go` and
+`chan_send`, `chan_recv`, `chan_close`. Both are discharged by the runtime at
+`main` and in tests.
 
 **[T-EFFECT-RESERVED]** `io`, `async` and `unsafe` may not be declared as
 effects. They are capabilities the runtime discharges, not effects a program
@@ -963,16 +964,6 @@ the fallback anyway, so an unrelated `log: fn(str) / {io}` in the same
 signature charged `io` to a call through a pure `step` — while `xs.map(step)`
 written directly was accepted. The same program one `let` apart, again.
 
-`let g =
-fs[0]` fell through to the pool of every function value in the function, so an
-unrelated closure elsewhere charged its effect to a call through `g` — while
-the same program written `for g in fs` was accepted, which is the pair this
-clause exists to close, back in the other direction. Where nothing is known
-about the part, the fallback is this function's own signature and nothing
-wider: reaching for every nameless row in the *program* meant an **unused**
-`type Loud = fn(i64) -> i64 / {io}` — in this file or in a dependency — refused
-a `/ {}` function whose own tuple component declares no effects.
-
 A `type` name counts as the type it stands for, here as everywhere
 ([T-TYPE-ALIAS]). This is inferred from written syntax rather than from
 resolved types, and a row behind a name was not there: `f: Cb` for
@@ -1056,14 +1047,6 @@ value would be a way to carry an effect past a declared row.
 
 A closure literal is checked the same way a named function is.
 
-"The same way" is about the *body* too: a named function's is checked against
-its declared return, and a closure's was merely inferred. So the expected type
-never reached the literals in its tail — `|x| 3` against `fn(i64) -> f64` was
-refused while `fn named(x: i64) -> f64 { 3 }`, the same body one closure apart,
-was accepted, and so was `|x| { return 3 }`. That is the asymmetry
-[T-INT-TO-FLOAT-CARRIED] records as fixed for named functions, still present
-one shape in.
-
 **[T-OK-ERR]** `Ok(v)` and `Err(e)` build a `T ! E` directly. They are the
 constructors matching what `match` already destructures, and without them a
 plain value could not be *put into* a fallible slot at all: `fail` is legal
@@ -1088,9 +1071,7 @@ stderr.
 
 Nesting does not change the position. A branch whose own body branches is at
 the fallible position too, so `if a { if b { 1 } else { Ok(2) } } else { Ok(3) }`
-merges to `i64 ! E` exactly as the flat form does; the expected type reached
-only the *immediate* expression, so the same computation was accepted written
-with `match` on the outside and refused written with `if`, one keyword apart.
+merges to `i64 ! E` exactly as the flat form does.
 
 This is a rule about the *position*, not about how it was reached: an
 annotation naming `T ! E` — a `let`, a struct field, a parameter — accepts the
@@ -1717,11 +1698,6 @@ allocated one per iteration — and built once it is a slot any mention can
 `release`, leaving every other mention holding a stale reference. This follows from the clause above and was worth saying
 out loud, since it silently destroys the one thing a reference is for.
 
-However it got one. The rule looked for a literal `ref(...)` in the
-initializer, so `let ROOT = mk()` where `mk` returns one was accepted — and so
-was a struct or a list holding one. It is the constant's *type* that decides
-now, so every carrier is covered.
-
 **[E-CLOSURE-CAPTURE]** A closure captures the values it uses **at the moment
 it is created**, not the bindings. Changing a captured variable afterwards is
 not visible inside, and a closure may not write to one at all — that is a
@@ -2061,6 +2037,26 @@ it do not run.
 build uses several cores only where that cannot be observed: every task is
 `v = e` with `e` pure, each `v` its own and read by no other task. Otherwise
 they run in order; multi-core work over *data* is `par_map`.
+
+**[E-CONCURRENT]** `concurrent { … }` does not exit until every task a `go
+{ … }` in it started has ended; `go` anywhere else is an error. A task sees its
+surroundings by value, as a closure does, and may not write a binding outside
+it or reach a `ref` from outside: tasks share nothing mutable.
+
+**[E-CHANNEL]** `chan_new(n)` makes a `Chan[T]` holding up to `n` values;
+`chan_new()` holds none, so `chan_send` waits until its value is received.
+`chan_recv(ch)` is `Some(v)`, in the order sent, or `None` once `chan_close(ch)`
+has run and the channel is drained. Sending on or closing a closed channel
+panics.
+
+**[E-SCHEDULE]** A task runs alone until it ends or a channel operation has to
+wait; then the next task, in the order the `go`s ran, takes over. So output is
+the same on every run. A channel operation outside every task that has to wait
+panics, since there is nothing to wait for. `grasm test --schedules N` reruns a
+test under `N` other orders, each named by a seed `--schedule-seed` replays.
+
+**[E-DEADLOCK]** When every task is waiting and none can go on, the program
+panics.
 
 **[E-PAR-FILTER-ORDER]** `xs.par_filter(f)` tests elements concurrently and
 keeps the survivors in **input order**. The predicate parallelises; the
@@ -3313,6 +3309,17 @@ test "contracts of sloppy" ... FAILED on case 79 of 300
   counterexample: n = 289
 ```
 
+`grasm test --schedules N` does the same for tasks. A test that starts tasks
+in a `concurrent` block runs again under `N` other orders in which they could
+have taken turns; a result that depends on the order fails, with the seed that
+reproduces it:
+
+```text
+test "tasks arrive in go order" ... FAILED: assertion failed: `[21]` != `[12]`
+  under schedule 2 of 20
+  replay: --schedule-seed 13899076551742739803
+```
+
 ## 5. Effects
 
 A function's type says what it *does*, not just what it returns. Built-in
@@ -3899,7 +3906,7 @@ defect being worked off:
 | polymorphic recursion | `fn f[T](x: T) -> i64 { f([x]) }` needs one compiled copy per type and the types never stop growing. No amount of work removes this; it is what monomorphization is, and it is refused by name at build time |
 
 Everything else the interpreter accepts, the compiled backend compiles.
-`scripts/nativegaps.sh` holds that claim to 55 cases, running each under both
+`scripts/nativegaps.sh` holds that claim to 56 cases, running each under both
 engines and comparing output, exit code and leaks. Six of the fourteen generators in
 `scripts/` report how many of the programs they invented the backend turned
 away, and all six report `declined: 0` — and in all six a decline is a

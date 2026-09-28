@@ -234,6 +234,7 @@ version = "1.0.0"
 name = "grasm_interp"
 version = "1.0.0"
 dependencies = [
+ "grasm_fiber",
  "grasm_journal",
  "grasm_sema",
  "grasm_syntax",
@@ -278,6 +279,7 @@ dependencies = [
 name = "grasm_rt"
 version = "1.0.0"
 dependencies = [
+ "grasm_fiber",
  "grasm_journal",
 ]
 

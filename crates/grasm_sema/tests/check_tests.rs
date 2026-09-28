@@ -3866,9 +3866,12 @@ fn every_effectful_builtin_is_named_in_conformance() {
 /// classification is not optional, so the test makes it not optional.
 #[test]
 fn every_effectful_builtin_says_what_a_replay_owes_it() {
-    use grasm_sema::builtins::{Journal, BUILTINS};
+    use grasm_sema::builtins::{Journal, ASYNC, BUILTINS};
     for b in BUILTINS {
-        if b.row.is_empty() {
+        // `async` alone does not reach the world: a channel operation talks
+        // to another task of the same program, under a schedule that is fixed,
+        // so a replay does it again and gets the same answer.
+        if b.row.iter().all(|e| *e == ASYNC) {
             assert_eq!(
                 b.journal,
                 Journal::Untouched,

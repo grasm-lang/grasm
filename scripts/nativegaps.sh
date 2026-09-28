@@ -395,6 +395,20 @@ fn main() {
     print("{boom()}")
 }'
 
+# Was a gap until stage 4 of docs/concurrency.md: tasks are fibers under the
+# runtime's scheduler, channels a table in the runtime.
+expect_compiled "channels and concurrent tasks" 'fn main() / {io, async} {
+    let ch = chan_new()
+    concurrent {
+        go {
+            chan_send(ch, "hi")
+        }
+        go {
+            print(chan_recv(ch) ?? "none")
+        }
+    }
+}'
+
 expect_refused "polymorphic recursion" 'fn f[T](x: T, n: i64) -> i64 {
     if n <= 0 {
         0

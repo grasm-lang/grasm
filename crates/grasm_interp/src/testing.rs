@@ -472,6 +472,15 @@ const BENCH_MAX_ITERS: u64 = 20_000_000;
 // Runner
 // ---------------------------------------------------------------------------
 
+/// The seed of the `k`th schedule `--schedules` tries: a function of `--seed`,
+/// so two runs with the same flags try the same orders.
+pub fn schedule_seed(seed: u64, k: u32) -> u64 {
+    let mut z = seed ^ (u64::from(k) + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
+}
+
 /// Options for one `grasm test` invocation.
 pub struct TestOptions {
     pub seed: u64,
@@ -481,6 +490,11 @@ pub struct TestOptions {
     pub filter: String,
     /// Also fuzz every function's contracts ([T-CONTRACT-ENSURES]).
     pub contracts: bool,
+    /// Rerun each unit test that starts tasks under this many other
+    /// schedules (docs/concurrency.md, stage 5).
+    pub schedules: u32,
+    /// Run under the one schedule this seed names, as a failure reports it.
+    pub schedule_seed: Option<u64>,
 }
 
 impl Default for TestOptions {
@@ -491,6 +505,8 @@ impl Default for TestOptions {
             coverage: false,
             filter: String::new(),
             contracts: false,
+            schedules: 0,
+            schedule_seed: None,
         }
     }
 }
@@ -555,6 +571,17 @@ impl<W: Write> Interp<'_, W> {
     }
 
     /// Runs one unit test (no parameters). Returns whether it passed.
+    /// Chooses the order tasks are visited in: `None` is the fixed default,
+    /// `Some(seed)` an order drawn from the seed.
+    pub fn set_schedule(&mut self, seed: Option<u64>) {
+        self.chans.borrow_mut().schedule = seed;
+    }
+
+    /// How many `concurrent` blocks have run tasks so far.
+    pub fn concurrent_blocks_run(&self) -> u64 {
+        self.chans.borrow().blocks_run
+    }
+
     pub fn run_unit_test(&mut self, t: &grasm_syntax::ast::TestDecl) -> bool {
         match self.run_unit_test_result(t) {
             Ok(()) => {

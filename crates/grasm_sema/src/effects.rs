@@ -28,11 +28,10 @@ pub const NET: &str = "net";
 /// would make every capability claim in the language weaker than it reads.
 pub use crate::builtins::PROC;
 
-/// Which builtins perform what is **not written here**. It is in
-/// `crate::builtins`, once, with the names — because it used to be written in
-/// both places and the two disagreed for as long as `bytes` had existed
-/// (ProjectGold F35). A list that can drift from another list will.
-use crate::builtins::performs;
+// Which builtins perform what is **not written here**: `builtins::row_of` reads it from
+// `crate::builtins`, once, with the names — because it used to be written in
+// both places and the two disagreed for as long as `bytes` had existed
+// (ProjectGold F35). A list that can drift from another list will.
 
 struct Ctx<'a> {
     /// qualified name (`mod::fn`) → decl
@@ -2598,14 +2597,13 @@ fn walk_expr(
         }
         Expr::Call { callee, args, .. } => {
             if let Expr::Ident(id) = &**callee {
-                if performs(&id.name, IO) && !active.iter().any(|a| a == IO) {
-                    out.insert(IO.to_string());
-                }
-                if performs(&id.name, NET) && !active.iter().any(|a| a == NET) {
-                    out.insert(NET.to_string());
-                }
-                if performs(&id.name, PROC) && !active.iter().any(|a| a == PROC) {
-                    out.insert(PROC.to_string());
+                // Every effect in the builtin's row. This named `io`, `net`
+                // and `proc` one by one, so a row the table gave `async` was
+                // dropped here -- a second place that knew about effects.
+                for effect in crate::builtins::row_of(&id.name) {
+                    if !active.iter().any(|a| a == effect) {
+                        out.insert((*effect).to_string());
+                    }
                 }
                 // A C function's effects are unknowable, so it performs `io`.
                 if ctx.externs.contains(&format!("{current}::{}", id.name))

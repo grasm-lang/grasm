@@ -1,6 +1,6 @@
 # Grasm — conformance programs: semantics
 
-Evaluation — what a program does when it runs. 66 executable program(s), one per normative clause of
+Evaluation — what a program does when it runs. 70 executable program(s), one per normative clause of
 `grasm-language-pack.md`. Each header states the tag it demonstrates and the
 exact expected behaviour, and every one is run by `cargo test -p grasm_spec`, so
 a program here cannot describe behaviour the implementation does not have.
@@ -154,6 +154,25 @@ fn main() {
 }
 ```
 
+## `E-CHANNEL.gr`
+
+```grasm
+//! tag: E-CHANNEL
+//! expect: panic
+//! Some(1) Some(2) None None
+//! send on a closed channel
+// A buffered channel needs no receiver to be waiting: two values fit. They
+// come out in the order they went in, then `None` for as long as anyone asks.
+fn main() / {io, async} {
+    let ch = chan_new(2)
+    chan_send(ch, 1)
+    chan_send(ch, 2)
+    chan_close(ch)
+    print("{chan_recv(ch)} {chan_recv(ch)} {chan_recv(ch)} {chan_recv(ch)}")
+    chan_send(ch, 3)
+}
+```
+
 ## `E-CLOSURE-CAPTURE.gr`
 
 ```grasm
@@ -262,6 +281,40 @@ fn main() {
 }
 ```
 
+## `E-CONCURRENT.gr`
+
+```grasm
+//! tag: E-CONCURRENT
+//! expect: output
+//! squares 14
+//! after the block
+// The block waits for both tasks, so the line after it prints last. Each task
+// sees `n` by value; what comes back comes back on a channel.
+fn main() / {io, async} {
+    let n = 4
+    let ch = chan_new()
+    concurrent {
+        go {
+            for i in 0..n {
+                chan_send(ch, i * i)
+            }
+            chan_close(ch)
+        }
+        go {
+            var total = 0
+            while true {
+                match chan_recv(ch) {
+                    Some(v) -> total += v
+                    None -> break
+                }
+            }
+            print("squares {total}")
+        }
+    }
+    print("after the block")
+}
+```
+
 ## `E-CONST-REF.gr`
 
 ```grasm
@@ -350,6 +403,33 @@ fn main() {
     var ys = xs
     ys.push(4)
     print("{xs.len()} {ys.len()}")
+}
+```
+
+## `E-DEADLOCK.gr`
+
+```grasm
+//! tag: E-DEADLOCK
+//! expect: panic
+//! first
+//! deadlock
+// Each task waits to hear from the other before it says anything, so neither
+// ever does. That is reported, not left to hang.
+fn main() / {io, async} {
+    let a = chan_new()
+    let b = chan_new()
+    concurrent {
+        go {
+            print("first")
+            let x = chan_recv(a) ?? 0
+            chan_send(b, x)
+        }
+        go {
+            let y = chan_recv(b) ?? 0
+            chan_send(a, y)
+        }
+    }
+    print("never")
 }
 ```
 
@@ -2236,6 +2316,41 @@ fn main() {
         xs.push(8000)
     }
     print("{xs.par_map(|x| descend(x)).sum()}")
+}
+```
+
+## `E-SCHEDULE.gr`
+
+```grasm
+//! tag: E-SCHEDULE
+//! expect: output
+//! ping 0
+//! pong 0
+//! ping 1
+//! pong 10
+//! ping 2
+//! pong 20
+// Two rendezvous channels force strict alternation, and the fixed order fixes
+// which of the two prints first: the task whose `go` ran first.
+fn main() / {io, async} {
+    let ping = chan_new()
+    let pong = chan_new()
+    concurrent {
+        go {
+            for i in 0..3 {
+                print("ping {i}")
+                chan_send(ping, i)
+                let _back = chan_recv(pong)
+            }
+        }
+        go {
+            for _i in 0..3 {
+                let n = chan_recv(ping) ?? 0
+                print("pong {n * 10}")
+                chan_send(pong, n)
+            }
+        }
+    }
 }
 ```
 

@@ -1,0 +1,29 @@
+//! tag: E-CONCURRENT
+//! expect: output
+//! squares 14
+//! after the block
+// The block waits for both tasks, so the line after it prints last. Each task
+// sees `n` by value; what comes back comes back on a channel.
+fn main() / {io, async} {
+    let n = 4
+    let ch = chan_new()
+    concurrent {
+        go {
+            for i in 0..n {
+                chan_send(ch, i * i)
+            }
+            chan_close(ch)
+        }
+        go {
+            var total = 0
+            while true {
+                match chan_recv(ch) {
+                    Some(v) -> total += v
+                    None -> break
+                }
+            }
+            print("squares {total}")
+        }
+    }
+    print("after the block")
+}

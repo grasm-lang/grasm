@@ -373,11 +373,17 @@ pub enum Stmt {
     Parallel {
         body: Block,
         span: Span,
+        /// `concurrent { ... }`: tasks run interleaved on fibers and may talk
+        /// over channels (docs/concurrency.md), where `parallel` runs them
+        /// after the block, in order ([E-SPAWN-ORDER]).
+        concurrent: bool,
     },
     /// `spawn { ... }` — schedule a task in the enclosing `parallel` scope.
     Spawn {
         body: Block,
         span: Span,
+        /// `go { ... }`, a task of a `concurrent` block.
+        concurrent: bool,
     },
     /// `with Clock handled_by ClockHandler{ now: || 0 } { ... }`
     With {
