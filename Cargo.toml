@@ -10,6 +10,7 @@ members = [
     "crates/grasm_spec",
     "crates/grasm_pkg",
     "crates/grasm_journal",
+    "crates/grasm_fiber",
     "crates/grasm_rt",
     "crates/grasm_wasm",
     "crates/grasm",

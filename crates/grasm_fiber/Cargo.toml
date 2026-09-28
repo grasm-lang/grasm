@@ -1,0 +1,11 @@
+[package]
+name = "grasm_fiber"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Stackful fibers for concurrent tasks (docs/concurrency.md): stacks and a
+# context switch, shared by the native runtime and the interpreter so the two
+# cannot disagree about scheduling. No dependencies, like `grasm_rt`, which
+# will link it.
+[dependencies]

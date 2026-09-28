@@ -227,6 +227,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "grasm_fiber"
+version = "1.0.0"
+
+[[package]]
 name = "grasm_interp"
 version = "1.0.0"
 dependencies = [
