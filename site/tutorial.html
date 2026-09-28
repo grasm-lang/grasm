@@ -310,6 +310,31 @@ test "contracts of sloppy" ... FAILED on case 79 of 300
 <p>That has one consequence worth knowing before you design around it: <strong>an effect handler cannot hold mutable state</strong>, because a handler's operations are closures. A <code>Store</code> whose <code>write</code> updates a captured list updates a copy, and the next <code>read</code> will not see it. Handlers supply values and accept output; state that changes belongs in the caller. <code>examples/ledger/</code> is that lesson written down after getting it wrong.</p>
 <p>Note that <code>spawn { … }</code> does <em>not</em> work this way — a task body shares the enclosing scope ([E-SPAWN-SHARED]). Two block-shaped constructs, two rules.</p>
 <p>The type carries an effect row, and <strong>no row means the empty row</strong>. So <code>fn(i64) -&gt; i64</code> accepts only functions that perform nothing, and passing one that prints is an error where you pass it — not a surprise inside. Write <code>fn(i64) -&gt; i64 / {io}</code> when the caller should be allowed to hand over something effectful. This is the one place a row is written rather than inferred, because a type has no body to infer from.</p>
+<h2 id="6b-values-that-must-be-used-exactly-once">6b. Values that must be used exactly once</h2>
+<p>Some values stand for something that must be finished: a transaction to commit or roll back, a file to close, a lock to release. A <code>linear type</code> makes forgetting a compile error instead of a production incident:</p>
+<pre><code>linear <span class="kw">type</span> <span class="ty">Tx</span> <span class="op">=</span> <span class="op">{</span> id<span class="op">:</span> <span class="ty">i64</span> <span class="op">}</span>
+
+<span class="kw">fn</span> <span class="fn">open</span><span class="op">(</span>id<span class="op">:</span> <span class="ty">i64</span><span class="op">)</span> <span class="op">-&gt;</span> <span class="ty">Tx</span> <span class="op">{</span>
+    <span class="ty">Tx</span><span class="op">{</span> id<span class="op">:</span> id <span class="op">}</span>
+<span class="op">}</span>
+
+<span class="kw">fn</span> <span class="fn">commit</span><span class="op">(</span><span class="kw">own</span> t<span class="op">:</span> <span class="ty">Tx</span><span class="op">)</span> <span class="op">-&gt;</span> <span class="ty">str</span> <span class="op">{</span>
+    <span class="st">"committed {t.id}"</span>
+<span class="op">}</span>
+
+<span class="kw">fn</span> <span class="fn">rollback</span><span class="op">(</span><span class="kw">own</span> t<span class="op">:</span> <span class="ty">Tx</span><span class="op">)</span> <span class="op">-&gt;</span> <span class="ty">str</span> <span class="op">{</span>
+    <span class="st">"rolled back {t.id}"</span>
+<span class="op">}</span>
+
+<span class="kw">fn</span> <span class="fn">main</span><span class="op">(</span><span class="op">)</span> <span class="op">{</span>
+    <span class="kw">let</span> t <span class="op">=</span> <span class="fn">open</span><span class="op">(</span><span class="nu">1</span><span class="op">)</span>
+    <span class="kw">if</span> t<span class="op">.</span>id <span class="op">&gt;</span> <span class="nu">0</span> <span class="op">{</span>
+        <span class="fn">print</span><span class="op">(</span><span class="fn">commit</span><span class="op">(</span>t<span class="op">)</span><span class="op">)</span>
+    <span class="op">}</span> <span class="kw">else</span> <span class="op">{</span>
+        <span class="fn">print</span><span class="op">(</span><span class="fn">rollback</span><span class="op">(</span>t<span class="op">)</span><span class="op">)</span>
+    <span class="op">}</span>
+<span class="op">}</span></code></pre>
+<p>Each <code>Tx</code> must be handed on exactly once on every path: to an <code>own</code> parameter, returned, or moved into another binding. Reading <code>t.id</code> or lending <code>t</code> to an ordinary parameter does not count. Delete the <code>else</code> branch and the program no longer compiles — <code>t</code> would be consumed on one path and not the other — and calling <code>commit(t)</code> twice is a use of a moved value. <code>commit</code> and <code>rollback</code> may simply let their <code>own</code> parameter end, because they are in the module that declares <code>Tx</code>; that is how a linear value is finished.</p>
 <h2 id="7-structured-concurrency">7. Structured concurrency</h2>
 <p><code>parallel</code> opens a scope; <code>spawn</code> adds a task to it. The scope does not exit until every task inside it has finished.</p>
 <pre><code><span class="kw">fn</span> <span class="fn">main</span><span class="op">(</span><span class="op">)</span> <span class="op">{</span>

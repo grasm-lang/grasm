@@ -445,6 +445,45 @@ that prints is an error where you pass it — not a surprise inside. Write
 something effectful. This is the one place a row is written rather than
 inferred, because a type has no body to infer from.
 
+## 6b. Values that must be used exactly once
+
+Some values stand for something that must be finished: a transaction to commit
+or roll back, a file to close, a lock to release. A `linear type` makes
+forgetting a compile error instead of a production incident:
+
+```
+linear type Tx = { id: i64 }
+
+fn open(id: i64) -> Tx {
+    Tx{ id: id }
+}
+
+fn commit(own t: Tx) -> str {
+    "committed {t.id}"
+}
+
+fn rollback(own t: Tx) -> str {
+    "rolled back {t.id}"
+}
+
+fn main() {
+    let t = open(1)
+    if t.id > 0 {
+        print(commit(t))
+    } else {
+        print(rollback(t))
+    }
+}
+```
+
+Each `Tx` must be handed on exactly once on every path: to an `own`
+parameter, returned, or moved into another binding. Reading `t.id` or lending
+`t` to an ordinary parameter does not count. Delete the `else` branch and the
+program no longer compiles — `t` would be consumed on one path and not the
+other — and calling `commit(t)` twice is a use of a moved value. `commit` and
+`rollback` may simply let their `own` parameter end, because they are in the
+module that declares `Tx`; that is how a linear value is finished.
+
 ## 7. Structured concurrency
 
 `parallel` opens a scope; `spawn` adds a task to it. The scope does not exit

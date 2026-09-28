@@ -69,6 +69,21 @@ fn same[T](v: T) -> T {
     v
 }
 
+// [T-LINEAR]: a value that must be handed on exactly once.
+linear type Tok = { n: i64 }
+
+fn mint(n: i64) -> Tok {
+    Tok{ n: n }
+}
+
+fn pass(own t: Tok) -> Tok {
+    t
+}
+
+fn spend(own t: Tok) -> i64 {
+    t.n
+}
+
 // [T-INTERFACE]: two types with a method of one name, and a bounded function.
 interface Weigh {
     fn weight(self) -> i64
@@ -325,6 +340,7 @@ CLAUSES = {
     "T-REF-GENERATIONAL": "a released slot is dead",
     "T-GENERIC-FN": "generic keeps the type",
     "T-INTERFACE": "a bounded call is the direct call",
+    "T-LINEAR": "a linear value arrives intact",
     "T-FALLIBLE": "a fallible ok is the value",
     "L-LIB-RANGE-OPS": "a range holds its bounds",
     "L-LIB-BITS": "bit and or xor",
@@ -504,6 +520,9 @@ LAWS = {
  # Through a bound, each receiver reaches its own type's method: the generic
  # total must equal the sum written out by hand, for both types, and the two
  # `weight`s must not be confused -- 12 as a point is 12, as an i64 is 36.
+ # Moved through three owners, the value that arrives is the one minted; and
+ # each branch of an `if` spends its own, so the two answers differ.
+ "a linear value arrives intact": 'let t = mint(7)\n    let u = pass(t)\n    let v = pass(u)\n    let a = spend(v)\n    let b = if a > 5 { spend(mint(40)) } else { spend(mint(1)) }\n    say(a == 7 and b == 40)',
  "a bounded call is the direct call": 'let ps = [Pt{ x: 1, y: 2 }, Pt{ x: 3, y: 4 }]\n    let ns = [5, 7]\n    say(total_weight(ps) == 12 + 34 and total_weight(ns) == 15 + 21 and Pt{ x: 1, y: 2 }.weight() != 12.weight())',
  "a fallible ok is the value": 'say((works() ?? 0) == 4 and (fails() ?? 7) == 7)',
  "unit has one value":         'let a = ()\n    let b = ()\n    say(a == b)',

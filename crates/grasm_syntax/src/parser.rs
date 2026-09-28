@@ -551,6 +551,8 @@ impl Parser {
         if self.at_bench_decl() {
             return Ok(Decl::Bench(self.parse_bench_decl()?));
         }
+        let linear_type = matches!(self.cur(), TokenKind::Ident(n) if n == "linear")
+            && matches!(self.toks.get(self.i + 1).map(|t| &t.kind), Some(TokenKind::KwType));
         match self.cur() {
             TokenKind::KwFn => Ok(Decl::Fn(self.parse_fn(is_pub)?)),
             // `extern fn abs(n: i64) -> i64` — a C function.
@@ -559,6 +561,13 @@ impl Parser {
             // constant became a zero-argument function.
             TokenKind::KwLet => Ok(Decl::Const(self.parse_const(is_pub)?)),
             TokenKind::KwType => Ok(Decl::Type(self.parse_type_decl(is_pub)?)),
+            // `linear type T = ...`: `linear` is a word only here.
+            TokenKind::Ident(_) if linear_type => {
+                self.bump();
+                let mut t = self.parse_type_decl(is_pub)?;
+                t.is_linear = true;
+                Ok(Decl::Type(t))
+            }
             TokenKind::KwEffect => Ok(Decl::Effect(self.parse_effect_decl()?)),
             TokenKind::KwTest => Ok(Decl::Test(self.parse_test_decl()?)),
             TokenKind::KwImport => Ok(Decl::Import(self.parse_import()?)),
@@ -1201,6 +1210,7 @@ impl Parser {
         };
         Ok(TypeDecl {
             is_pub,
+            is_linear: false,
             name,
             generics,
             body,

@@ -1,10 +1,32 @@
 //! tag: T-PARAM-OWN
 //! expect: output
 //! 3
+//! 2 5
+//! 3 4
 fn consume(own s: str) -> i64 {
     s.len()
 }
+// A value moved on one branch and on the other is moved exactly once, in
+// value position as in a statement; and a branch that returns has left, so
+// what it moved on its way out is still here on the path that did not take it.
+fn either(own s: str, short: bool) -> i64 {
+    if short {
+        consume(s) - 1
+    } else {
+        consume(s) + 2
+    }
+}
+
+fn early(own s: str, n: i64) -> i64 {
+    if n > 5 {
+        return consume(s)
+    }
+    consume(s) + 1
+}
+
 fn main() {
     let name = "ada"
     print("{consume(name)}")
+    print("{either("abc", true)} {either("abc", false)}")
+    print("{early("abc", 9)} {early("abc", 1)}")
 }

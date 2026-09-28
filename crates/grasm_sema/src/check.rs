@@ -381,6 +381,10 @@ fn check_modules_in(
     }
     for f in files {
         c.current_module = f.name.clone();
+        c.collect_linear(f.module);
+    }
+    for f in files {
+        c.current_module = f.name.clone();
         c.collect_types(f.module);
     }
     // Before the bodies are resolved: `effect E` declares the type `EHandler`,
@@ -401,6 +405,10 @@ fn check_modules_in(
     // registered by then ([T-MODULE-NS], F68).
     c.resolve_type_aliases(&modules);
     c.resolve_type_bodies(&modules);
+    for f in files {
+        c.current_module = f.name.clone();
+        c.check_linear_fields(f.module);
+    }
     for f in files {
         c.current_module = f.name.clone();
         c.collect_interfaces(f.module);
@@ -618,6 +626,13 @@ struct Binding {
     kind: BindKind,
     /// Ownership was transferred with `own` — further use is an error.
     moved: bool,
+    /// Whether this binding owns its value, so that a linear one must be
+    /// consumed before it ends ([T-LINEAR]): a local does, an `own`
+    /// parameter does (unless the module declaring its type is the one
+    /// ending it), a lent parameter does not.
+    owned: bool,
+    /// Where it was bound, for the report when a linear value is not consumed.
+    at: Span,
     /// Loop nesting depth at declaration (for move-in-loop detection).
     decl_loop_depth: u32,
 }
@@ -637,6 +652,9 @@ enum BindKind {
 /// A bounded call's promise, settled once inference has: the variable a
 /// bounded parameter was instantiated with, its interfaces, the call, and the
 /// calling function's own bounds and parameter names at the time.
+/// Which bindings are moved, scope by scope: what a branch leaves behind.
+type MoveSnapshot = Vec<Vec<(String, bool)>>;
+
 type BoundObligation = (Type, Vec<String>, Span, Vec<Vec<String>>, Vec<String>);
 
 #[derive(Clone)]
@@ -751,6 +769,11 @@ struct Checker {
     /// `(interface, type)` for every `impl`.
     impl_of: std::collections::HashSet<(String, String)>,
     iface_calls: SpanSet,
+    /// Linear types by name, with the module that declares each ([T-LINEAR]).
+    linear_types: HashMap<String, String>,
+    /// Index of the current function's parameter scope, so a `return` can
+    /// find every binding it leaves behind.
+    fn_scope_base: usize,
     /// Bounds of the function being checked, beside `current_generics`.
     current_bounds: Vec<Vec<String>>,
     /// A bounded call's promise to check once inference has settled: the
@@ -966,6 +989,8 @@ impl Checker {
             impls: HashMap::new(),
             impl_of: std::collections::HashSet::new(),
             iface_calls: SpanSet::default(),
+            linear_types: HashMap::new(),
+            fn_scope_base: 0,
             current_bounds: Vec::new(),
             bound_obligations: Vec::new(),
             expr_types: SpanMap::default(),
@@ -1075,6 +1100,46 @@ if you own neither, ask whichever is yours to prefix its types",
             }
             _ => {
                 self.error(name.span, format!("duplicate type name `{}`", name.name));
+            }
+        }
+    }
+
+    /// Registers `linear type` declarations ([T-LINEAR]). A linear type is a
+    /// non-generic struct: its fields are what the declaring module reads
+    /// when it ends one, and a type parameter would let a linear value hide
+    /// inside something that is not.
+    fn collect_linear(&mut self, module: &Module) {
+        for decl in &module.decls {
+            let Decl::Type(t) = decl else { continue };
+            if !t.is_linear {
+                continue;
+            }
+            if !t.generics.is_empty() || !matches!(t.body, grasm_syntax::ast::TypeBody::Struct(_)) {
+                self.error(t.name.span, "a `linear type` is a struct with no type parameters");
+                continue;
+            }
+            self.linear_types.insert(t.name.name.clone(), self.current_module.clone());
+        }
+    }
+
+    /// A field of a non-linear struct cannot hold a linear value: the struct
+    /// could be copied, and with it the value ([T-LINEAR-CONTAIN]).
+    fn check_linear_fields(&mut self, module: &Module) {
+        for decl in &module.decls {
+            let Decl::Type(t) = decl else { continue };
+            if t.is_linear {
+                continue;
+            }
+            let grasm_syntax::ast::TypeBody::Struct(fields) = &t.body else { continue };
+            for fd in fields {
+                let ty = self.resolve_type(&fd.ty, &t.generics.iter().map(|g| g.name.clone()).collect::<Vec<_>>());
+                if self.is_linear(&ty) || self.holds_linear(&ty) {
+                    self.error_help(
+                        fd.span,
+                        format!("field `{}` of `{}` would hold a linear value", fd.name.name, t.name.name),
+                        "only a `linear type` may hold one, so the whole is consumed once too ([T-LINEAR-CONTAIN])",
+                    );
+                }
             }
         }
     }
@@ -1893,6 +1958,146 @@ nothing says who owns it, how long it lives, or how long it is"
         }
     }
 
+    /// The module declaring `t`, when `t` is a linear type.
+    fn linear_module_of(&self, t: &Type) -> Option<String> {
+        match self.uni.resolve(t) {
+            Type::Named { id, .. } => self.linear_types.get(&self.defs.get(id).name).cloned(),
+            _ => None,
+        }
+    }
+
+    fn is_linear(&self, t: &Type) -> bool {
+        self.linear_module_of(t).is_some()
+    }
+
+    /// Whether `t` keeps a linear value somewhere it could be copied or lost:
+    /// in a list, map, tuple, `ref`, or a generic type's argument. A linear
+    /// struct holding another linear value directly is fine, and so is a
+    /// fallible result or a function's signature.
+    fn holds_linear(&self, t: &Type) -> bool {
+        fn inside(me: &Checker, t: &Type) -> bool {
+            me.is_linear(t) || me.holds_linear(t)
+        }
+        match self.uni.resolve(t) {
+            Type::List(x) | Type::Ref(x) => inside(self, &x),
+            Type::Map(k, v) => inside(self, &k) || inside(self, &v),
+            Type::Tuple(items) => items.iter().any(|x| inside(self, x)),
+            Type::Named { args, .. } => args.iter().any(|x| inside(self, x)),
+            Type::Fallible(ok, _) => self.holds_linear(&ok),
+            _ => false,
+        }
+    }
+
+    /// `e` in a position that takes its value -- `let`, `return`, a block's
+    /// tail, the right of `=`, a struct literal's field -- consumes it when it
+    /// names a linear binding ([T-LINEAR]).
+    fn consume(&mut self, e: &Expr) {
+        let Expr::Ident(id) = e else { return };
+        let Some(b) = self.lookup(&id.name) else { return };
+        if b.moved || !self.is_linear(&b.ty) {
+            return;
+        }
+        if !b.owned && b.kind == BindKind::Param {
+            self.error_help(
+                id.span,
+                format!("cannot give away `{}`: it is lent to this function, not owned by it", id.name),
+                "take the parameter as `own` to be able to consume it ([T-LINEAR])",
+            );
+            return;
+        }
+        self.mark_moved(id);
+    }
+
+    /// Every linear value still owed in scopes `from..`, each reported once.
+    fn report_unconsumed(&mut self, from: usize, when: &str) {
+        let mut owed: Vec<(String, Span, Type)> = Vec::new();
+        for sc in self.scopes.iter().skip(from) {
+            for (name, b) in sc {
+                // An `own` parameter of a linear type declared in this very
+                // module is how that module ends one -- `close`, `commit` --
+                // so it owes nothing. Everywhere else it is owed like a local.
+                let ends_own_type = b.kind == BindKind::Param
+                    && self.linear_module_of(&b.ty).is_some_and(|m| m == self.current_module);
+                if b.owned && !b.moved && !ends_own_type && self.is_linear(&b.ty) {
+                    owed.push((name.clone(), b.at, b.ty.clone()));
+                }
+            }
+        }
+        owed.sort_by_key(|(_, at, _)| at.start);
+        for (name, at, ty) in owed {
+            let shown = self.show(&ty);
+            self.error_help(
+                at,
+                format!("linear value `{name}` is never consumed{when}"),
+                format!(
+                    "a `{shown}` must be handed on exactly once -- pass it to the function that finishes it, return it, or move it into another binding ([T-LINEAR])"
+                ),
+            );
+            if let Some(b) = self.lookup_mut(&name) {
+                b.moved = true;
+            }
+        }
+    }
+
+    /// Branches that reach the code after them must agree on which linear
+    /// values they consumed; a branch that leaves by `return`, `break`,
+    /// `continue` or a panic does not reach it and does not vote.
+    /// After branches: what the code after them sees. Only the branches that
+    /// reach it count -- one that leaves by `return`, `break`, `continue` or
+    /// a panic has already gone, and a value it moved on its way out is still
+    /// here on every path that did not take it. Counting those made
+    /// `if n > 5 { return eat(t) }` followed by `eat(t)` a "use of moved
+    /// value" ([T-USE-AFTER-MOVE]).
+    fn merge_branches(&mut self, branches: Vec<(MoveSnapshot, bool)>, at: Span) {
+        let reaching: Vec<MoveSnapshot> = branches
+            .iter()
+            .filter(|(_, leaves)| !leaves)
+            .map(|(s, _)| s.clone())
+            .collect();
+        let pick = if reaching.is_empty() {
+            branches.iter().map(|(s, _)| s.clone()).collect()
+        } else {
+            reaching
+        };
+        self.restore_moved(&pick[0]);
+        self.merge_moved(&pick[1..]);
+        self.merge_linear(&branches, at);
+    }
+
+    fn merge_linear(&mut self, branches: &[(MoveSnapshot, bool)], at: Span) {
+        let Some((first, _)) = branches.first() else { return };
+        for (si, scope) in first.iter().enumerate() {
+            for (name, _) in scope {
+                let linear = self.scopes.get(si).and_then(|sc| sc.get(name)).is_some_and(|b| {
+                    b.owned && self.is_linear(&b.ty)
+                });
+                if !linear {
+                    continue;
+                }
+                let votes: Vec<bool> = branches
+                    .iter()
+                    .filter(|(_, leaves)| !leaves)
+                    .filter_map(|(snap, _)| {
+                        snap.get(si)
+                            .and_then(|sc| sc.iter().find(|(n, _)| n == name))
+                            .map(|(_, m)| *m)
+                    })
+                    .collect();
+                let Some(&first_vote) = votes.first() else { continue };
+                if votes.iter().any(|v| *v != first_vote) {
+                    self.error_help(
+                        at,
+                        format!("linear value `{name}` is consumed on one path here and not on another"),
+                        "every way through must consume it, or none may ([T-LINEAR])",
+                    );
+                }
+                if let Some(b) = self.scopes.get_mut(si).and_then(|sc| sc.get_mut(name)) {
+                    b.moved = first_vote;
+                }
+            }
+        }
+    }
+
     fn collect_fns(&mut self, module: &Module) {
         for decl in &module.decls {
             if let Decl::Fn(f) = decl {
@@ -2180,6 +2385,8 @@ different name, or call it as a method if you meant to extend a type (UFCS)",
                                 mutable: false,
                                 kind: BindKind::Generated,
                                 moved: false,
+                                owned: false,
+                                at: p.span,
                                 decl_loop_depth: 0,
                             },
                         );
@@ -2342,11 +2549,14 @@ different name, or call it as a method if you meant to extend a type (UFCS)",
                     mutable: p.mode == ParamMode::Inout,
                     kind: BindKind::Param,
                     moved: false,
+                    owned: p.mode == ParamMode::Own,
+                    at: p.name.span,
                     decl_loop_depth: 0,
                 },
             );
         }
         self.scopes.push(scope);
+        self.fn_scope_base = self.scopes.len() - 1;
         let ret = info.ret.clone();
         // The tail expression is the return value, so it is checked against
         // the declared return type rather than inferred and compared after.
@@ -2507,6 +2717,10 @@ is a failure nothing reports",
                 ),
                 "the last expression of the body is the return value",
             );
+        }
+        if !ends_with_return && !block_leaves(&f.body) {
+            let base = self.scopes.len() - 1;
+            self.report_unconsumed(base, "");
         }
         self.scopes.pop();
         self.current_generics.clear();
@@ -2690,6 +2904,15 @@ is a failure nothing reports",
         }
         self.deferred_closures.pop();
         self.settle_deferred_fields();
+        // A block's last expression is its value, so a linear name there is
+        // handed on rather than dropped ([T-LINEAR]).
+        if let Some(Stmt::Expr(e)) = b.stmts.last() {
+            self.consume(e);
+        }
+        if !block_leaves(b) {
+            let top = self.scopes.len() - 1;
+            self.report_unconsumed(top, "");
+        }
         self.scopes.pop();
         ty
     }
@@ -2844,20 +3067,34 @@ is a failure nothing reports",
                     self.let_closure_span.remove(&name.name);
                 }
                 self.closure_touches_outside_ref = saw_ref;
+                self.consume(init);
                 self.bind(name, bound_ty, *mutable);
                 Type::Unit
             }
             Stmt::Assign {
                 target, op, value, ..
             } => {
-                // Re-initializing a moved variable revives it.
+                // Re-initializing a moved variable revives it -- unless what
+                // it holds is linear and still owed ([T-LINEAR]): the write
+                // would drop it unconsumed.
                 if *op == AssignOp::Assign {
                     if let Expr::Ident(id) = target {
                         let name = id.name.clone();
+                        let owed = self
+                            .lookup(&name)
+                            .is_some_and(|b| b.owned && !b.moved && self.is_linear(&b.ty));
+                        if owed {
+                            self.error_help(
+                                id.span,
+                                format!("assigning to `{name}` drops a linear value that was never consumed"),
+                                "consume the value it holds first -- pass it to the function that finishes it",
+                            );
+                        }
                         if let Some(b) = self.lookup_mut(&name) {
                             b.moved = false;
                         }
                     }
+                    self.consume(value);
                 }
                 self.check_assign_target(target);
                 let target_ty = self.infer_expr(target);
@@ -2952,6 +3189,14 @@ closing brace — yield a number from the region and return that",
                         }
                     }
                 }
+                if let Some(v) = value.as_ref() {
+                    self.consume(v);
+                }
+                let base = match self.closure_floors.last() {
+                    Some(f) if *f + 1 > self.fn_scope_base => *f + 1,
+                    _ => self.fn_scope_base,
+                };
+                self.report_unconsumed(base, " before this `return`");
                 // Divergent: control leaves before any value is produced, so
                 // this fits wherever it is written — the same rule `fail` has
                 // ([T-FAIL]). Without it `0 -> return false` typed the arm as
@@ -3085,6 +3330,8 @@ closing brace — yield a number from the region and return that",
                 mutable,
                 kind: BindKind::Local,
                 moved: false,
+                owned: true,
+                at: name.span,
                 decl_loop_depth,
             },
         );
@@ -4044,17 +4291,34 @@ write back to — copy it into a local first, as in `var {} = {}`",
                 ..
             } => {
                 self.check_expr(cond, &Type::Bool);
+                // Only one branch runs, so each starts from the moves made
+                // before the `if` -- the statement form did this and this,
+                // the form in value position, did not: `if ok { commit(t) }
+                // else { rollback(t) }` as a function's result was a "use of
+                // moved value" for a `t` moved exactly once either way.
+                let before = self.moved_snapshot();
                 let want_then = self.branch_want(then_block.stmts.last(), &want);
                 let t = self.check_block_with(then_block, Some(&want_then));
                 self.require_branch_value(then_block, &t, &want);
-                match &**eb {
+                let after_then = self.moved_snapshot();
+                self.restore_moved(&before);
+                let else_leaves = match &**eb {
                     ElseBranch::Else(b) => {
                         let want_else = self.branch_want(b.stmts.last(), &want);
                         let t = self.check_block_with(b, Some(&want_else));
                         self.require_branch_value(b, &t, &want);
+                        block_leaves(b)
                     }
-                    ElseBranch::ElseIf(inner) => self.check_expr(inner, &want),
-                }
+                    ElseBranch::ElseIf(inner) => {
+                        self.check_expr(inner, &want);
+                        false
+                    }
+                };
+                let after_else = self.moved_snapshot();
+                self.merge_branches(
+                    vec![(after_then, block_leaves(then_block)), (after_else, else_leaves)],
+                    e.span(),
+                );
                 return;
             }
             _ => {}
@@ -4258,6 +4522,14 @@ write back to — copy it into a local first, as in `var {} = {}`",
         // visit on purpose: a span visited twice was visited the second time
         // with more known, so the later answer is the settled one.
         self.resolved_types.insert(key, t.clone());
+        if !self.linear_types.is_empty() && self.holds_linear(&t) {
+            let shown = self.show(&t);
+            self.error_help(
+                e.span(),
+                format!("`{shown}` would hold a linear value"),
+                "a list, map, tuple, `ref`, `Option` or other generic cannot promise to consume what it holds exactly once -- keep the linear value in its own binding ([T-LINEAR-CONTAIN])",
+            );
+        }
         self.record_value_row(e, &t);
         // A `ref` from outside, mentioned inside a parallel operation's
         // function. Writing through one was already refused; *reading* is no
@@ -4434,7 +4706,13 @@ allocates could outlive it — move the work out of the region, or yield a numbe
                 base,
                 fields,
                 span,
-            } => self.infer_struct_lit(name, base.as_deref(), fields, *span),
+            } => {
+                let t = self.infer_struct_lit(name, base.as_deref(), fields, *span);
+                for (_, v) in fields {
+                    self.consume(v);
+                }
+                t
+            }
             Expr::Call { callee, args, span } => self.infer_call(callee, args, *span),
             Expr::MethodCall {
                 recv,
@@ -4539,7 +4817,14 @@ allocates could outlive it — move the work out of the region, or yield a numbe
                             }
                         };
                         let after_else = self.moved_snapshot();
-                        self.merge_moved(&[after_then, after_else]);
+                        let else_leaves = matches!(&**eb, ElseBranch::Else(b) if block_leaves(b));
+                        self.merge_branches(
+                            vec![
+                                (after_then, block_leaves(then_block)),
+                                (after_else, else_leaves),
+                            ],
+                            e_span,
+                        );
                         if self.uni.unify(&then_ty, &else_ty) {
                             then_ty
                         } else if disc {
@@ -4605,6 +4890,15 @@ allocates could outlive it — move the work out of the region, or yield a numbe
                         }
                     }
                     None => {
+                        // Either the branch ran or it did not; the code after
+                        // sees whichever of the two reaches it.
+                        self.merge_branches(
+                            vec![
+                                (after_then.clone(), block_leaves(then_block)),
+                                (before.clone(), false),
+                            ],
+                            e_span,
+                        );
                         // A one-armed `if` throws its branch's value away —
                         // there is no other branch for it to agree with — so
                         // a failure in that tail is a discarded failure.
@@ -4697,6 +4991,19 @@ only a number or a `bool` can come out — compute what you need and yield that"
     fn infer_ident(&mut self, id: &Ident) -> Type {
         if let Some(b) = self.lookup(&id.name) {
             self.reject_dead_capture(id);
+            let captured = self.closure_floors.last().is_some_and(|floor| {
+                self.scopes
+                    .iter()
+                    .rposition(|sc| sc.contains_key(&id.name))
+                    .is_some_and(|at| at < *floor)
+            });
+            if captured && self.is_linear(&b.ty) {
+                return self.error_help(
+                    id.span,
+                    format!("a closure cannot capture the linear value `{}`", id.name),
+                    "a closure may run any number of times, so it cannot promise to consume it once ([T-LINEAR-CONTAIN]); pass it as an argument instead",
+                );
+            }
             if b.moved {
                 return self.error_help(
                     id.span,
@@ -5764,6 +6071,16 @@ fail outside it",
             match mode {
                 ParamMode::Own => {
                     if let Expr::Ident(id) = a {
+                        let lent_linear = self
+                            .lookup(&id.name)
+                            .is_some_and(|b| !b.owned && b.kind == BindKind::Param && self.is_linear(&b.ty));
+                        if lent_linear {
+                            self.error_help(
+                                id.span,
+                                format!("cannot give away `{}`: it is lent to this function, not owned by it", id.name),
+                                "take the parameter as `own` to be able to consume it ([T-LINEAR])",
+                            );
+                        }
                         if !self.is_copy_type(p) && self.lookup(&id.name).is_some() {
                             self.mark_moved(id);
                             own_roots.push(id.name.clone());
@@ -8155,7 +8472,11 @@ bind the component to a `var`, or use a struct when the parts have names worth w
             self.check_expr(body, &result);
         }
         self.restore_moved(&before);
-        self.merge_moved(&arm_states);
+        let voters = arm_states
+            .into_iter()
+            .zip(arms.iter().map(|a| expr_leaves(&a.body)))
+            .collect();
+        self.merge_branches(voters, span);
         // Exhaustiveness.
         if !has_irrefutable {
             let missing = self.missing_for(&scrut_ty, &covered);
@@ -9137,5 +9458,25 @@ fn stmt_span(s: &Stmt) -> Span {
         | Stmt::Parallel { span, .. }
         | Stmt::Spawn { span, .. } => *span,
         Stmt::Expr(e) => e.span(),
+    }
+}
+
+/// Whether a block always leaves before its end: its last statement returns,
+/// breaks, continues, or calls something that does not come back.
+fn block_leaves(b: &Block) -> bool {
+    match b.stmts.last() {
+        Some(Stmt::Return(..)) | Some(Stmt::Break(_)) | Some(Stmt::Continue(_)) => true,
+        Some(Stmt::Expr(e)) => expr_leaves(e),
+        _ => false,
+    }
+}
+
+fn expr_leaves(e: &Expr) -> bool {
+    match e {
+        Expr::Block(b) => block_leaves(b),
+        Expr::Call { callee, .. } => {
+            matches!(&**callee, Expr::Ident(id) if matches!(id.name.as_str(), "panic" | "exit" | "fail"))
+        }
+        _ => false,
     }
 }

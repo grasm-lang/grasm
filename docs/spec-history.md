@@ -96,3 +96,26 @@ It did not produce NaN,
 so a property over `f64` never saw the one value `[L-LIB-SORT-NAN]` and
 `[E-EQ-STRUCTURAL]`'s NaN paragraph exist for — six thousand cases across two
 seeds found everything else and never that.
+
+## spec/types.md
+
+The clause used to say that anything without an
+annotation is rejected, which was not true of `grasm run` and was true of
+`grasm build --native` — so the
+one thing it said, it said about a case where the engines differed, and a
+reader consulting it about a program `check` had just accepted would have been
+told the opposite. Both now accept it: the checker resolves an empty literal
+against the whole body, and it hands the answer to the backend, which has
+nothing to read the type off otherwise.
+
+## spec/types.md
+
+Without it the obvious spelling
+was refused and so was the reference that answers it, leaving `inout` on an
+effect operation as the apparent last option — which typechecked and silently
+discarded the write ([E-EFFECT-NO-INOUT]). A feature with no working spelling
+sends people somewhere worse.
+
+## spec/library.md
+
+it used to offer UFCS for `print`, which is the call it had just refused.

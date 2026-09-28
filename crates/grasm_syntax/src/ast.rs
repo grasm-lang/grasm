@@ -176,6 +176,9 @@ pub struct Param {
 #[derive(Debug, Clone, PartialEq)]
 pub struct TypeDecl {
     pub is_pub: bool,
+    /// `linear type T = { ... }` -- every value must be consumed exactly once
+    /// ([T-LINEAR]).
+    pub is_linear: bool,
     pub name: Ident,
     pub generics: Vec<Ident>,
     pub body: TypeBody,

@@ -1,0 +1,59 @@
+//! tag: T-LINEAR
+//! expect: output
+//! 13 1
+//! committed 1
+//! rolled back 2
+//! committed 3
+//! rolled back 4
+// A transaction that must end exactly once: committed or rolled back, on
+// every path, and never twice. Lending it to `write` consumes nothing;
+// `commit` and `rollback` take it by `own` in the module that declares
+// `Tx`, which is what lets them end it.
+linear type Tx = { id: i64, log: [str] }
+
+fn open(id: i64) -> Tx {
+    Tx{ id: id, log: [] }
+}
+
+fn write(t: Tx, what: str) -> i64 {
+    t.id * 10 + what.len()
+}
+
+// This module declares `Tx`, so an `own` parameter here may end one.
+fn commit(own t: Tx) -> str {
+    "committed {t.id}"
+}
+
+fn rollback(own t: Tx) -> str {
+    "rolled back {t.id}"
+}
+
+fn fresh(id: i64) -> Tx {
+    let t = open(id)
+    t
+}
+
+fn settle(own t: Tx, ok: bool) -> str {
+    if ok {
+        commit(t)
+    } else {
+        rollback(t)
+    }
+}
+
+fn early(own t: Tx, n: i64) -> str {
+    if n > 5 {
+        return commit(t)
+    }
+    rollback(t)
+}
+
+fn main() {
+    let t = open(1)
+    print("{write(t, "abc")} {t.id}")
+    print(commit(t))
+    let u = fresh(2)
+    print(settle(u, false))
+    print(early(fresh(3), 9))
+    print(early(fresh(4), 1))
+}

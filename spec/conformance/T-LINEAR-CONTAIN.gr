@@ -1,0 +1,21 @@
+//! tag: T-LINEAR-CONTAIN
+//! expect: error
+//! would hold a linear value
+// A list could keep a copy of the transaction after it was committed, and
+// commit it again. Nothing that can copy what it holds may hold one.
+linear type Tx = { id: i64 }
+
+fn open(id: i64) -> Tx {
+    Tx{ id: id }
+}
+
+fn commit(own t: Tx) -> str {
+    "c{t.id}"
+}
+
+fn main() {
+    let t = open(1)
+    let pending = [t]
+    print(commit(t))
+    print("{pending.len()}")
+}

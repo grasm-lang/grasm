@@ -139,14 +139,7 @@ just approved. A method that pins the element type counts as determining it,
 which is why `[].sum()` is an `i64`.
 
 A literal whose type nothing determines *is* rejected, by the checker, so both
-engines agree about it. The clause used to say that anything without an
-annotation is rejected, which was not true of `grasm run` and was true of
-`grasm build --native` — so the
-one thing it said, it said about a case where the engines differed, and a
-reader consulting it about a program `check` had just accepted would have been
-told the opposite. Both now accept it: the checker resolves an empty literal
-against the whole body, and it hands the answer to the backend, which has
-nothing to read the type off otherwise.
+engines agree about it.
 
 ## 4. Generics
 
@@ -217,6 +210,19 @@ produces, however it leaves; if `c` is false the call panics the same way. A
 fallible function's `ensures` sees the ok value, and a failure is not checked.
 
 **[T-CONTRACT-PURE]** A contract is a `bool` that performs no effects.
+
+### Linear types
+
+**[T-LINEAR]** `linear type T = { … }` is a struct each of whose values must be
+consumed exactly once on every path that does not panic: by `let b = v`,
+`return v`, a block's value, `b = v`, a linear struct's field, or an `own`
+argument. Reading a field or lending it consumes nothing. An owned value
+reaching its scope's end, a `return`, or a branch merge unconsumed on some
+path is an error; so is giving away one that was lent. An `own` parameter of
+`T` in the module declaring `T` may end unconsumed: that is how one closes.
+
+**[T-LINEAR-CONTAIN]** No list, map, tuple, `ref`, generic type, non-linear
+struct or closure may hold a linear value.
 
 ## 5. Errors as values
 
@@ -1002,11 +1008,7 @@ captures *values*, so the write would land in a copy nobody can see — a
 reference copies as a slot rather than as a value, so a write through one is
 visible to everyone holding it and the reason does not apply.
 
-This is what lets an effect handler accumulate. Without it the obvious spelling
-was refused and so was the reference that answers it, leaving `inout` on an
-effect operation as the apparent last option — which typechecked and silently
-discarded the write ([E-EFFECT-NO-INOUT]). A feature with no working spelling
-sends people somewhere worse.
+This is what lets an effect handler accumulate.
 
 **[T-REF-STALE]** Reading through a released reference **panics**, always. The
 slot may already hold something else — a released slot is reused by the next

@@ -578,14 +578,7 @@ just approved. A method that pins the element type counts as determining it,
 which is why `[].sum()` is an `i64`.
 
 A literal whose type nothing determines *is* rejected, by the checker, so both
-engines agree about it. The clause used to say that anything without an
-annotation is rejected, which was not true of `grasm run` and was true of
-`grasm build --native` — so the
-one thing it said, it said about a case where the engines differed, and a
-reader consulting it about a program `check` had just accepted would have been
-told the opposite. Both now accept it: the checker resolves an empty literal
-against the whole body, and it hands the answer to the backend, which has
-nothing to read the type off otherwise.
+engines agree about it.
 
 ## 4. Generics
 
@@ -656,6 +649,19 @@ produces, however it leaves; if `c` is false the call panics the same way. A
 fallible function's `ensures` sees the ok value, and a failure is not checked.
 
 **[T-CONTRACT-PURE]** A contract is a `bool` that performs no effects.
+
+### Linear types
+
+**[T-LINEAR]** `linear type T = { … }` is a struct each of whose values must be
+consumed exactly once on every path that does not panic: by `let b = v`,
+`return v`, a block's value, `b = v`, a linear struct's field, or an `own`
+argument. Reading a field or lending it consumes nothing. An owned value
+reaching its scope's end, a `return`, or a branch merge unconsumed on some
+path is an error; so is giving away one that was lent. An `own` parameter of
+`T` in the module declaring `T` may end unconsumed: that is how one closes.
+
+**[T-LINEAR-CONTAIN]** No list, map, tuple, `ref`, generic type, non-linear
+struct or closure may hold a linear value.
 
 ## 5. Errors as values
 
@@ -1441,11 +1447,7 @@ captures *values*, so the write would land in a copy nobody can see — a
 reference copies as a slot rather than as a value, so a write through one is
 visible to everyone holding it and the reason does not apply.
 
-This is what lets an effect handler accumulate. Without it the obvious spelling
-was refused and so was the reference that answers it, leaving `inout` on an
-effect operation as the apparent last option — which typechecked and silently
-discarded the write ([E-EFFECT-NO-INOUT]). A feature with no working spelling
-sends people somewhere worse.
+This is what lets an effect handler accumulate.
 
 **[T-REF-STALE]** Reading through a released reference **panics**, always. The
 slot may already hold something else — a released slot is reused by the next
@@ -2295,8 +2297,7 @@ The language's *own* free functions — `print`, `read_file`, `write_file`,
 `assert_eq` — are not reached this way. They are not methods of any type, and a
 second spelling for each of them buys nothing: `x |> print` already applies a
 free function to a value ([G-PIPE]), and it is charged the same row a call is.
-`"hi".print()` is refused, and the refusal says so and points at the pipeline —
-it used to offer UFCS for `print`, which is the call it had just refused.
+`"hi".print()` is refused, and the refusal says so and points at the pipeline.
 
 ## 2. `i64` and `f64`
 
@@ -3301,6 +3302,17 @@ result, however the body leaves. A broken one panics and quotes itself —
 that produced it instead of three calls later. A contract is a plain `bool`
 that performs nothing: it states a fact, it does not do work.
 
+`grasm test --contracts` turns the contracts into tests. For each function with
+an `ensures` it generates inputs, sets aside the ones `requires` turns away, and
+reports any input whose result breaks the promise, shrunk to a small one:
+
+```text
+test "contracts of isqrt" ... ok (100 cases, 48 outside `requires`)
+test "contracts of sloppy" ... FAILED on case 79 of 300
+  ensures `|r| r * r <= n and (r + 1) * (r + 1) > n` failed in `sloppy`
+  counterexample: n = 289
+```
+
 ## 5. Effects
 
 A function's type says what it *does*, not just what it returns. Built-in
@@ -3371,6 +3383,45 @@ fn main() {
 
 The mode lives on the parameter, so the call site stays plain. No lifetimes,
 no borrow annotations on types, no `&`/`&mut` sprinkled through the code.
+
+## 6b. Values that must be used exactly once
+
+Some values stand for something that must be finished: a transaction to commit
+or roll back, a file to close, a lock to release. A `linear type` makes
+forgetting a compile error instead of a production incident:
+
+```
+linear type Tx = { id: i64 }
+
+fn open(id: i64) -> Tx {
+    Tx{ id: id }
+}
+
+fn commit(own t: Tx) -> str {
+    "committed {t.id}"
+}
+
+fn rollback(own t: Tx) -> str {
+    "rolled back {t.id}"
+}
+
+fn main() {
+    let t = open(1)
+    if t.id > 0 {
+        print(commit(t))
+    } else {
+        print(rollback(t))
+    }
+}
+```
+
+Each `Tx` must be handed on exactly once on every path: to an `own`
+parameter, returned, or moved into another binding. Reading `t.id` or lending
+`t` to an ordinary parameter does not count. Delete the `else` branch and the
+program no longer compiles — `t` would be consumed on one path and not the
+other — and calling `commit(t)` twice is a use of a moved value. `commit` and
+`rollback` may simply let their `own` parameter end, because they are in the
+module that declares `Tx`; that is how a linear value is finished.
 
 ## 6a. Functions as parameters
 

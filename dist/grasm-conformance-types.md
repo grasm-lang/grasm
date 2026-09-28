@@ -1,6 +1,6 @@
 # Grasm — conformance programs: types
 
-The type and effect system — what a program means before it runs. 105 executable program(s), one per normative clause of
+The type and effect system — what a program means before it runs. 107 executable program(s), one per normative clause of
 `grasm-language-pack.md`. Each header states the tag it demonstrates and the
 exact expected behaviour, and every one is run by `cargo test -p grasm_spec`, so
 a program here cannot describe behaviour the implementation does not have.
@@ -2039,6 +2039,96 @@ fn main() {
 }
 ```
 
+## `T-LINEAR-CONTAIN.gr`
+
+```grasm
+//! tag: T-LINEAR-CONTAIN
+//! expect: error
+//! would hold a linear value
+// A list could keep a copy of the transaction after it was committed, and
+// commit it again. Nothing that can copy what it holds may hold one.
+linear type Tx = { id: i64 }
+
+fn open(id: i64) -> Tx {
+    Tx{ id: id }
+}
+
+fn commit(own t: Tx) -> str {
+    "c{t.id}"
+}
+
+fn main() {
+    let t = open(1)
+    let pending = [t]
+    print(commit(t))
+    print("{pending.len()}")
+}
+```
+
+## `T-LINEAR.gr`
+
+```grasm
+//! tag: T-LINEAR
+//! expect: output
+//! 13 1
+//! committed 1
+//! rolled back 2
+//! committed 3
+//! rolled back 4
+// A transaction that must end exactly once: committed or rolled back, on
+// every path, and never twice. Lending it to `write` consumes nothing;
+// `commit` and `rollback` take it by `own` in the module that declares
+// `Tx`, which is what lets them end it.
+linear type Tx = { id: i64, log: [str] }
+
+fn open(id: i64) -> Tx {
+    Tx{ id: id, log: [] }
+}
+
+fn write(t: Tx, what: str) -> i64 {
+    t.id * 10 + what.len()
+}
+
+// This module declares `Tx`, so an `own` parameter here may end one.
+fn commit(own t: Tx) -> str {
+    "committed {t.id}"
+}
+
+fn rollback(own t: Tx) -> str {
+    "rolled back {t.id}"
+}
+
+fn fresh(id: i64) -> Tx {
+    let t = open(id)
+    t
+}
+
+fn settle(own t: Tx, ok: bool) -> str {
+    if ok {
+        commit(t)
+    } else {
+        rollback(t)
+    }
+}
+
+fn early(own t: Tx, n: i64) -> str {
+    if n > 5 {
+        return commit(t)
+    }
+    rollback(t)
+}
+
+fn main() {
+    let t = open(1)
+    print("{write(t, "abc")} {t.id}")
+    print(commit(t))
+    let u = fresh(2)
+    print(settle(u, false))
+    print(early(fresh(3), 9))
+    print(early(fresh(4), 1))
+}
+```
+
 ## `T-LIST.gr`
 
 ```grasm
@@ -2752,12 +2842,34 @@ fn main() {
 //! tag: T-PARAM-OWN
 //! expect: output
 //! 3
+//! 2 5
+//! 3 4
 fn consume(own s: str) -> i64 {
     s.len()
 }
+// A value moved on one branch and on the other is moved exactly once, in
+// value position as in a statement; and a branch that returns has left, so
+// what it moved on its way out is still here on the path that did not take it.
+fn either(own s: str, short: bool) -> i64 {
+    if short {
+        consume(s) - 1
+    } else {
+        consume(s) + 2
+    }
+}
+
+fn early(own s: str, n: i64) -> i64 {
+    if n > 5 {
+        return consume(s)
+    }
+    consume(s) + 1
+}
+
 fn main() {
     let name = "ada"
     print("{consume(name)}")
+    print("{either("abc", true)} {either("abc", false)}")
+    print("{early("abc", 9)} {early("abc", 1)}")
 }
 ```
 

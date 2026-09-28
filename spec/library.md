@@ -116,8 +116,7 @@ The language's *own* free functions — `print`, `read_file`, `write_file`,
 `assert_eq` — are not reached this way. They are not methods of any type, and a
 second spelling for each of them buys nothing: `x |> print` already applies a
 free function to a value ([G-PIPE]), and it is charged the same row a call is.
-`"hi".print()` is refused, and the refusal says so and points at the pipeline —
-it used to offer UFCS for `print`, which is the call it had just refused.
+`"hi".print()` is refused, and the refusal says so and points at the pipeline.
 
 ## 2. `i64` and `f64`
 
