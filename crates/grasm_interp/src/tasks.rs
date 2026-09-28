@@ -132,6 +132,14 @@ const TASK_STACK: usize = STACK_BUDGET + TASK_MARGIN;
 const DEADLOCK: &str =
     "deadlock: every task is waiting on a channel, and nothing left can send or receive";
 
+/// A task that has not had its first turn holds only its body; its fiber, and
+/// the stack under it, are made when it does. A task that ends without
+/// waiting then gives its stack back before the next one starts.
+enum Run<'b> {
+    Pending(Option<Box<dyn FnOnce() + 'b>>),
+    Running(grasm_fiber::Fiber, usize),
+}
+
 impl<'a, W: Write> Interp<'a, W> {
     fn wait(&self) -> Result<(), Flow> {
         match if self.in_task { Wait::Yield } else { Wait::Deadlock } {
@@ -238,7 +246,7 @@ impl<'a, W: Write> Interp<'a, W> {
         self.chans.borrow_mut().blocks_run += 1;
         let shared = Rc::new(RefCell::new(Vec::new()));
         type Ending = Rc<RefCell<Option<Result<(), Flow>>>>;
-        let mut live: Vec<(grasm_fiber::Fiber, Ending, *mut TaskOut, usize)> = Vec::new();
+        let mut live: Vec<(Run<'_>, Ending, *mut TaskOut)> = Vec::new();
         for (body, scopes) in tasks {
             let out = Box::into_raw(Box::new(TaskOut(shared.clone())));
             // Safety: the box lives until after this task's interpreter is
@@ -248,35 +256,47 @@ impl<'a, W: Write> Interp<'a, W> {
             task.scopes = scopes;
             let ending: Ending = Rc::new(RefCell::new(None));
             let end2 = ending.clone();
-            // Safety: every fiber made here is run to its end or dropped
-            // before this function returns, and everything it borrows -- the
-            // program, through `task` -- outlives this function.
-            let fiber = unsafe {
-                grasm_fiber::Fiber::new_scoped(TASK_STACK, move || {
-                    let r = task.eval_block(&body).map(|_| ());
-                    let r = match r {
-                        Err(Flow::Return(_)) => Ok(()),
-                        other => other,
-                    };
-                    *end2.borrow_mut() = Some(r);
-                    drop(task);
-                })
-            };
-            let floor = fiber.stack_bottom() + TASK_MARGIN;
-            live.push((fiber, ending, out, floor));
+            // What the task runs, once it has a fiber to run on.
+            let body: Box<dyn FnOnce() + '_> = Box::new(move || {
+                let r = task.eval_block(&body).map(|_| ());
+                let r = match r {
+                    Err(Flow::Return(_)) => Ok(()),
+                    other => other,
+                };
+                *end2.borrow_mut() = Some(r);
+                drop(task);
+            });
+            live.push((Run::Pending(Some(body)), ending, out));
         }
         let result = loop {
             let before = self.chans.borrow().progress;
             let mut finished_any = false;
             let mut failed: Option<Flow> = None;
             let order = self.chans.borrow_mut().round_order(live.len());
-            let mut done = vec![false; live.len()];
+            // Each round takes the tasks out and puts back the ones still
+            // waiting, in the order they ran. Removing finished ones from the
+            // middle of the list cost a shift of everything after each, which
+            // is quadratic in the number of tasks.
+            let mut slots: Vec<Option<_>> = live.drain(..).map(Some).collect();
             for i in order {
+                let mut entry = slots[i].take().expect("each index once");
                 // The depth check measures the stack it runs on, and that is
                 // now this task's -- not the thread's, whose floor lies far
                 // below it and would call every task's first call too deep.
-                let outer = STACK_FLOOR.with(|f| f.replace(live[i].3));
-                let ended = live[i].0.resume();
+                if let Run::Pending(body) = &mut entry.0 {
+                    let body = body.take().expect("started once");
+                    // Safety: every fiber made here is run to its end or
+                    // dropped before this function returns, and everything it
+                    // borrows -- the program, through the task -- outlives it.
+                    let fiber = unsafe { grasm_fiber::Fiber::new_scoped(TASK_STACK, body) };
+                    let floor = fiber.stack_bottom() + TASK_MARGIN;
+                    entry.0 = Run::Running(fiber, floor);
+                }
+                let Run::Running(fiber, floor) = &mut entry.0 else {
+                    unreachable!("started above")
+                };
+                let outer = STACK_FLOOR.with(|f| f.replace(*floor));
+                let ended = fiber.resume();
                 STACK_FLOOR.with(|f| f.set(outer));
                 // Output in the order it was written, as every engine prints.
                 let bytes = std::mem::take(&mut *shared.borrow_mut());
@@ -284,22 +304,21 @@ impl<'a, W: Write> Interp<'a, W> {
                     let _ = self.out.write_all(&bytes);
                 }
                 if ended {
-                    done[i] = true;
                     finished_any = true;
-                    if let Some(Err(e)) = live[i].1.borrow_mut().take() {
+                    let ended_with = entry.1.borrow_mut().take();
+                    // Safety: the task's interpreter was dropped at the end of
+                    // its fiber, so nothing refers to this box any more.
+                    unsafe { drop(Box::from_raw(entry.2)) };
+                    if let Some(Err(e)) = ended_with {
                         failed = Some(e);
                         break;
                     }
+                } else {
+                    live.push(entry);
                 }
             }
-            for i in (0..live.len()).rev() {
-                if done[i] {
-                    let (_, _, out, _) = live.remove(i);
-                    // Safety: the task's interpreter was dropped at the end of
-                    // its fiber, so nothing refers to this box any more.
-                    unsafe { drop(Box::from_raw(out)) };
-                }
-            }
+            // Tasks a failure cut the round short before: abandoned below.
+            live.extend(slots.into_iter().flatten());
             if let Some(e) = failed {
                 break Err(e);
             }
@@ -312,8 +331,8 @@ impl<'a, W: Write> Interp<'a, W> {
         };
         // A task still suspended here is abandoned with the block: its fiber
         // and stack go, and so does its output box.
-        for (fiber, _, out, _) in live.drain(..) {
-            drop(fiber);
+        for (run, _, out) in live.drain(..) {
+            drop(run);
             // Safety: the fiber that could reach it is gone.
             unsafe { drop(Box::from_raw(out)) };
         }

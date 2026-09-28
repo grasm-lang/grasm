@@ -185,11 +185,37 @@ mod sys {
     pub const MAP_ANON: i32 = 0x20;
 }
 
+/// Stacks a finished fiber gave back, for the next fiber of the same size.
+/// A program that starts a hundred thousand short tasks maps one stack, not a
+/// hundred thousand: a task that ends without waiting leaves its stack here for
+/// the next one. Bounded, so a burst of waiting tasks does not pin its peak.
+const POOL_MAX: usize = 64;
+
+/// A pooled stack keeps the pages its fiber touched, so only stacks small
+/// enough that holding them is cheap are pooled. The interpreter's, sized for
+/// its deep recursion budget, are unmapped as they finish.
+const POOL_STACK_MAX: usize = 8 * 1024 * 1024 + 64 * 1024;
+
+thread_local! {
+    static POOL: std::cell::RefCell<Vec<Stack>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 impl Stack {
     #[cfg(unix)]
     fn new(size: usize) -> Stack {
         let usable = size.div_ceil(PAGE).max(1) * PAGE;
         let len = usable + PAGE;
+        let reused = POOL
+            .try_with(|p| {
+                let mut p = p.borrow_mut();
+                let at = p.iter().rposition(|s| s.len == len)?;
+                Some(p.swap_remove(at))
+            })
+            .ok()
+            .flatten();
+        if let Some(stack) = reused {
+            return stack;
+        }
         // Safety: an anonymous private mapping; the result is checked.
         unsafe {
             let base = sys::mmap(
@@ -231,6 +257,25 @@ impl Stack {
 
 impl Drop for Stack {
     fn drop(&mut self) {
+        if self.base.is_null() {
+            return;
+        }
+        // Kept for the next fiber if there is room. The pool itself is being
+        // torn down when the thread ends, and then the stack is unmapped.
+        let (base, len) = (self.base, self.len);
+        let kept = POOL
+            .try_with(|p| match p.try_borrow_mut() {
+                Ok(mut p) if p.len() < POOL_MAX && len <= POOL_STACK_MAX => {
+                    p.push(Stack { base, len });
+                    true
+                }
+                _ => false,
+            })
+            .unwrap_or(false);
+        if kept {
+            self.base = std::ptr::null_mut();
+            return;
+        }
         #[cfg(unix)]
         // Safety: exactly the mapping `new` made.
         unsafe {

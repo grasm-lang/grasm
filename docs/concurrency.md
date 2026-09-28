@@ -138,8 +138,31 @@ observe, since tasks share nothing mutable, and is a later step.
    from a seed (SplitMix64, so a seed names the same orders everywhere). A
    failure prints the seed; `--schedule-seed S` runs that one order again. A
    test that started no tasks is not rerun -- there is nothing to vary.
-6. Measurement: tasks per second and memory per task, against the MASTERPLAN
-   figure of 1M lightweight tasks on a node.
+6. *Done.* Measurement, native build, Apple M-series, 2026-09-29, at a load
+   average of 20-30 (so wall times are pessimistic; CPU times are the
+   steadier figure):
+
+   | tasks | shape | wall | CPU (user + sys) | peak RSS |
+   |---|---|---|---|---|
+   | 1 000 000 | each sends on a buffered channel and ends | 0.95 s | 0.53 s | 289 MB |
+   | 100 000 | the same | 0.09 s | 0.05 s | 33 MB |
+   | 100 000 | all waiting at once on a rendezvous | 6.4 s | 2.7 s | 334 MB |
+   | 1 000 000 | all waiting at once on a rendezvous | 69 s | 24.5 s | 397 MB |
+
+   So the MASTERPLAN figure holds in both senses: a million short tasks in
+   under a second, and a million alive at once on one node. The second is
+   bounded by the kernel, not the scheduler -- 22 of its 24.5 CPU seconds are
+   `sys`, mapping and first-touching a stack per waiting task. RSS undercounts
+   there (macOS compresses idle pages); one touched page per waiting task,
+   16 KB on Apple silicon, is the honest floor of a stackful design.
+
+   The first measurement found two defects, both fixed before these numbers:
+   the scheduler removed finished tasks from the middle of a list, which is
+   quadratic -- 100 000 short tasks took 46 s -- and made every task's fiber up
+   front, so each held a stack from the start. Now it is a run queue, a
+   fiber is made on a task's first turn, and `grasm_fiber` keeps up to 64
+   finished stacks for the next fiber. The interpreter had the same quadratic
+   list and now rebuilds it once a round.
 
 ## Not in this design
 

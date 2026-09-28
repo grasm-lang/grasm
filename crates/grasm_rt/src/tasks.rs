@@ -213,33 +213,38 @@ pub unsafe extern "C" fn grasm_conc_run(tasks: *mut RtVal) {
     if tasks.is_empty() {
         return;
     }
-    let mut live: Vec<(grasm_fiber::Fiber, usize)> = tasks
-        .into_iter()
-        .map(|f| {
-            // Safety: see `run_task`; the value lives until the task ends.
-            let fiber = grasm_fiber::Fiber::new(TASK_STACK, move || unsafe { run_task(f) });
-            let floor = fiber.stack_bottom() + TASK_MARGIN;
-            (fiber, floor)
-        })
-        .collect();
+    // A run queue: a task that has to wait goes to the back, so every task
+    // gets a turn in the order its `go` ran, and taking a finished one out
+    // costs nothing. (Removing from the middle of a list cost a shift of
+    // everything after it, and a hundred thousand tasks took 46 seconds.)
+    // A task's fiber is made when it first runs, so a task that ends without
+    // waiting hands its stack to the next one rather than every task holding
+    // one from the start.
+    let mut queue: VecDeque<(*mut RtVal, Option<(grasm_fiber::Fiber, usize)>)> =
+        tasks.into_iter().map(|f| (f, None)).collect();
     loop {
         let before = chans().progress;
         let mut finished_any = false;
-        let mut i = 0;
-        while i < live.len() {
+        for _ in 0..queue.len() {
+            let (f, mut fiber) = queue.pop_front().expect("counted");
+            let (fiber_ref, floor) = fiber.get_or_insert_with(|| {
+                // Safety: see `run_task`; the value lives until the task ends.
+                let fb = grasm_fiber::Fiber::new(TASK_STACK, move || unsafe { run_task(f) });
+                let floor = fb.stack_bottom() + TASK_MARGIN;
+                (fb, floor)
+            });
             // The stack check reads one floor per thread, and the stack it
             // guards is now this task's.
-            let outer = LOCAL.with(|l| l.stack_floor.replace(live[i].1));
-            let done = live[i].0.resume();
+            let outer = LOCAL.with(|l| l.stack_floor.replace(*floor));
+            let done = fiber_ref.resume();
             LOCAL.with(|l| l.stack_floor.set(outer));
             if done {
-                live.remove(i);
                 finished_any = true;
             } else {
-                i += 1;
+                queue.push_back((f, fiber));
             }
         }
-        if live.is_empty() {
+        if queue.is_empty() {
             return;
         }
         if !finished_any && chans().progress == before {
