@@ -1,6 +1,7 @@
 //! tag: E-NOT-PARALLEL
 //! expect: output
 //! sequential
+//! 832040 832041 1028458
 fn main() {
     // Tasks run one at a time, so a task always observes the previous
     // task's completed writes — never a partial interleaving.
@@ -14,4 +15,21 @@ fn main() {
         }
     }
     print(log)
+
+    // Independent: each task writes its own `var` from a pure call and reads
+    // no other task's. A compiled build may run these on separate cores; the
+    // answer is the one running them in order gives.
+    var a = 0
+    var b = 0
+    var c = 0
+    parallel {
+        spawn { a = fib(30) }
+        spawn { b = fib(30) + 1 }
+        spawn { c = fib(29) * 2 }
+    }
+    print("{a} {b} {c}")
+}
+
+fn fib(n: i64) -> i64 {
+    if n < 2 { n } else { fib(n - 1) + fib(n - 2) }
 }

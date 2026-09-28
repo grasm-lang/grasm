@@ -145,7 +145,7 @@ String **interpolation** — `"a{e}b"` — is Full within form 1: it rewrites to
 |---|---|
 | `let (a, b) = e` | `let § = e` then `let a = §.0` and `let b = §.1` |
 | `for x in xs { B }` | `let § = iter(xs)` then `while has_next(§) { let x = next(§); B }` |
-| `parallel { … }` | `{ … }` with each `spawn` body run in order — [E-NOT-PARALLEL] already says tasks are not multicore, so the rewrite is exact |
+| `parallel { … }` | `{ … }` with each `spawn` body run in order — [E-NOT-PARALLEL] says tasks behave as if run in order, so the rewrite is exact |
 | `spawn { B }` | the block `B`, deferred to the end of the enclosing `parallel` |
 
 ### Declarations (6)

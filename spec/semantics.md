@@ -407,10 +407,10 @@ share results. This is the opposite of how a closure body behaves — see
 **[E-TASK-PANIC]** A panicking task aborts the whole scope; tasks spawned after
 it do not run.
 
-**[E-NOT-PARALLEL]** `parallel`/`spawn` tasks are *not* executed on multiple
-cores. That scope provides structure and determinism, not speedup — tasks share
-the enclosing scope, and running them concurrently would race. Multi-core
-execution of *data* is provided by `par_map` instead.
+**[E-NOT-PARALLEL]** Tasks behave as if run one at a time, in order. A compiled
+build uses several cores only where that cannot be observed: every task is
+`v = e` with `e` pure, each `v` its own and read by no other task. Otherwise
+they run in order; multi-core work over *data* is `par_map`.
 
 **[E-PAR-FILTER-ORDER]** `xs.par_filter(f)` tests elements concurrently and
 keeps the survivors in **input order**. The predicate parallelises; the

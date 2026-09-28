@@ -2868,6 +2868,22 @@ thread_local! {
     /// Set while a parallel region is running. A `par_map` reached from inside
     /// another one runs sequentially rather than spawning threads per level.
     static IN_PARALLEL: Cell<bool> = const { Cell::new(false) };
+    /// Set by the backend just before the `par_map` it builds from a
+    /// `parallel` block of independent tasks, and taken by that call. See
+    /// `grasm_par_tasks_next`.
+    static TASKS_NEXT: Cell<bool> = const { Cell::new(false) };
+}
+
+/// The next parallel map on this thread runs a `parallel` block's tasks.
+///
+/// A `par_map` over data times its first element on the calling thread and
+/// spreads the rest only if that looks worth it -- right for many cheap
+/// elements, wrong for a handful of tasks each of which is the expensive part:
+/// four tasks ran as one alone and then three together. Tasks each get a
+/// worker at once instead.
+#[no_mangle]
+pub extern "C" fn grasm_par_tasks_next() {
+    TASKS_NEXT.with(|t| t.set(true));
 }
 
 /// Applies `code` to every element of a scalar list, in parallel.
@@ -2972,6 +2988,21 @@ unsafe fn par_words(
     let n = words.len();
     let mut out: Vec<i64> = vec![0; n];
     if n == 0 {
+        return out;
+    }
+    if TASKS_NEXT.with(|t| t.replace(false)) && n >= 2 && !IN_PARALLEL.with(|f| f.get()) {
+        // One scoped thread per task, each writing its own slot, so the
+        // result is the one any order would give -- the checker proved the
+        // tasks independent and effect-free.
+        std::thread::scope(|scope| {
+            for (o, &x) in out.iter_mut().zip(words.iter()) {
+                let env_ref = env_owned;
+                scope.spawn(move || {
+                    IN_PARALLEL.with(|f| f.set(true));
+                    *o = code(env_ref.as_ptr(), x);
+                });
+            }
+        });
         return out;
     }
 

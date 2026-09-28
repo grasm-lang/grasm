@@ -329,6 +329,7 @@ fn compile_object_scoped(
     cg.iface_calls = analysis.iface_calls;
     cg.impl_fns = analysis.impl_fns;
     cg.fallible_closures = analysis.fallible_closures;
+    cg.parallel_ok = analysis.parallel_ok;
     cg.empty_types = analysis.empty_types;
     cg.closure_param_types = analysis.closure_param_types;
     cg.generic_ctor_types = analysis.generic_ctor_types;
@@ -565,6 +566,9 @@ struct Codegen<'m> {
     /// Method calls the checker resolved to a struct field holding a function.
     /// See the UFCS branch of the method-call lowering.
     field_calls: grasm_sema::check::SpanSet,
+    /// `parallel` blocks the checker proved independent, by span start. Their
+    /// tasks run on several cores; see `emit_parallel_threads`.
+    parallel_ok: std::collections::HashSet<u32>,
     /// Method calls resolved through an `impl`, and the impl table
     /// ([T-INTERFACE]). See the UFCS branch of the method-call lowering.
     iface_calls: grasm_sema::check::SpanSet,
@@ -675,6 +679,7 @@ impl<'m> Codegen<'m> {
             field_calls: Default::default(),
             iface_calls: Default::default(),
             impl_fns: Default::default(),
+            parallel_ok: Default::default(),
             fallible_closures: std::collections::HashSet::new(),
             empty_types: std::collections::HashMap::new(),
             closure_param_types: std::collections::HashMap::new(),
@@ -1014,6 +1019,7 @@ impl<'m> Codegen<'m> {
                 vec![i64t, ptr, ptr, i64t, i64t, i64t],
                 Some(i64t),
             ),
+            ("grasm_par_tasks_next", vec![], None),
             (
                 "grasm_par_filter_scalar",
                 vec![i64t, ptr, ptr, i64t],
@@ -7918,8 +7924,12 @@ impl FnCx<'_, '_> {
                 body,
                 span,
             } => self.eval_for(loop_var, iter, body, *span),
-            Stmt::Parallel { body, .. } => {
-                self.emit_parallel(body)?;
+            Stmt::Parallel { body, span } => {
+                if self.cg.parallel_ok.contains(&span.start) {
+                    self.emit_parallel_threads(body, *span)?;
+                } else {
+                    self.emit_parallel(body)?;
+                }
                 // The collection pass may have left -- `parallel { return 5 }`
                 // -- and saying so is what stops the next statement being
                 // written into a block already closed. F63 put this guard on
@@ -17904,6 +17914,104 @@ binding, as in `let f: fn(i64) -> i64 = |x| x + 1`, or make it a top-level `fn`)
     /// Since the bodies are lexically known, the runtime list holds site
     /// indices and the dispatch is a switch — no closures, no environment
     /// capture, and no allocation per task beyond an interned index.
+    /// A `parallel` block of independent tasks, run on several cores.
+    ///
+    /// The checker proved every task has the form `v = e` with `e` pure and
+    /// the `v`s distinct and unread by the other tasks ([E-SPAWN-ORDER] under
+    /// the as-if rule; `Analysis::parallel_ok`). So the block is the same
+    /// computation as
+    ///
+    /// ```text
+    /// let §par = [0, 1, ..].par_map(|§k| if §k == 0 { e0 } else if ...)
+    /// v0 = §par[0]
+    /// ...
+    /// ```
+    ///
+    /// and is compiled as exactly that: `par_map` already runs a lifted body
+    /// on worker threads and returns the results in order. The interpreter
+    /// runs the tasks one by one, which gives the same values.
+    fn emit_parallel_threads(
+        &mut self,
+        body: &grasm_syntax::ast::Block,
+        span: Span,
+    ) -> CResult<()> {
+        // Synthetic nodes need spans of their own that no real expression
+        // has: zero-width ones inside the block.
+        let next = std::cell::Cell::new(span.start);
+        let fresh = || {
+            let at = next.get().min(span.end.saturating_sub(1));
+            next.set(next.get() + 1);
+            Span::new(at, at)
+        };
+        let mut tasks: Vec<(Ident, Expr)> = Vec::new();
+        for st in &body.stmts {
+            let Stmt::Spawn { body: task, .. } = st else {
+                return self.emit_parallel(body);
+            };
+            let [Stmt::Assign { target: Expr::Ident(v), value, .. }] = task.stmts.as_slice() else {
+                return self.emit_parallel(body);
+            };
+            tasks.push((v.clone(), value.clone()));
+        }
+        let k = Ident { name: "\u{a7}k".to_string(), span: fresh() };
+        // `if §k == 0 { e0 } else if §k == 1 { e1 } ... else { eN }`
+        let mut chain = tasks.last().expect("two or more tasks").1.clone();
+        for (i, (_, e)) in tasks.iter().enumerate().rev().skip(1) {
+            let one = |e: Expr| grasm_syntax::ast::Block { stmts: vec![Stmt::Expr(e)], span: fresh() };
+            chain = Expr::If {
+                cond: Box::new(Expr::Binary {
+                    op: BinaryOp::Eq,
+                    lhs: Box::new(Expr::Ident(k.clone())),
+                    rhs: Box::new(Expr::Int(i as i64, fresh())),
+                    span: fresh(),
+                }),
+                then_block: one(e.clone()),
+                else_branch: Some(Box::new(grasm_syntax::ast::ElseBranch::Else(one(chain)))),
+                span: fresh(),
+            };
+        }
+        let indices = Expr::List(
+            (0..tasks.len()).map(|i| Expr::Int(i as i64, fresh())).collect(),
+            fresh(),
+        );
+        let run = Expr::MethodCall {
+            recv: Box::new(indices),
+            name: Ident { name: "par_map".to_string(), span: fresh() },
+            args: vec![Expr::Closure {
+                params: vec![k.clone()],
+                body: Box::new(chain),
+                span: fresh(),
+            }],
+            span: fresh(),
+        };
+        let par = Ident { name: "\u{a7}par".to_string(), span: fresh() };
+        let mut stmts = vec![Stmt::Let {
+            mutable: false,
+            name: par.clone(),
+            ty: None,
+            init: run,
+            span: fresh(),
+        }];
+        for (i, (v, _)) in tasks.iter().enumerate() {
+            stmts.push(Stmt::Assign {
+                target: Expr::Ident(v.clone()),
+                op: AssignOp::Assign,
+                value: Expr::Index {
+                    recv: Box::new(Expr::Ident(par.clone())),
+                    index: Box::new(Expr::Int(i as i64, fresh())),
+                    span: fresh(),
+                },
+                span: fresh(),
+            });
+        }
+        let block = grasm_syntax::ast::Block { stmts, span: fresh() };
+        // The `par_map` below is the first parallel map this block runs.
+        self.call_rt("grasm_par_tasks_next", &[]);
+        let (tail, _) = self.eval_block_inner(&block)?;
+        self.dec_block_tail(tail);
+        Ok(())
+    }
+
     fn emit_parallel(&mut self, body: &grasm_syntax::ast::Block) -> CResult<()> {
         let sites = collect_spawn_sites(body);
 

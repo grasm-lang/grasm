@@ -2057,10 +2057,10 @@ share results. This is the opposite of how a closure body behaves — see
 **[E-TASK-PANIC]** A panicking task aborts the whole scope; tasks spawned after
 it do not run.
 
-**[E-NOT-PARALLEL]** `parallel`/`spawn` tasks are *not* executed on multiple
-cores. That scope provides structure and determinism, not speedup — tasks share
-the enclosing scope, and running them concurrently would race. Multi-core
-execution of *data* is provided by `par_map` instead.
+**[E-NOT-PARALLEL]** Tasks behave as if run one at a time, in order. A compiled
+build uses several cores only where that cannot be observed: every task is
+`v = e` with `e` pure, each `v` its own and read by no other task. Otherwise
+they run in order; multi-core work over *data* is `par_map`.
 
 **[E-PAR-FILTER-ORDER]** `xs.par_filter(f)` tests elements concurrently and
 keeps the survivors in **input order**. The predicate parallelises; the
@@ -3384,45 +3384,6 @@ fn main() {
 The mode lives on the parameter, so the call site stays plain. No lifetimes,
 no borrow annotations on types, no `&`/`&mut` sprinkled through the code.
 
-## 6b. Values that must be used exactly once
-
-Some values stand for something that must be finished: a transaction to commit
-or roll back, a file to close, a lock to release. A `linear type` makes
-forgetting a compile error instead of a production incident:
-
-```
-linear type Tx = { id: i64 }
-
-fn open(id: i64) -> Tx {
-    Tx{ id: id }
-}
-
-fn commit(own t: Tx) -> str {
-    "committed {t.id}"
-}
-
-fn rollback(own t: Tx) -> str {
-    "rolled back {t.id}"
-}
-
-fn main() {
-    let t = open(1)
-    if t.id > 0 {
-        print(commit(t))
-    } else {
-        print(rollback(t))
-    }
-}
-```
-
-Each `Tx` must be handed on exactly once on every path: to an `own`
-parameter, returned, or moved into another binding. Reading `t.id` or lending
-`t` to an ordinary parameter does not count. Delete the `else` branch and the
-program no longer compiles — `t` would be consumed on one path and not the
-other — and calling `commit(t)` twice is a use of a moved value. `commit` and
-`rollback` may simply let their `own` parameter end, because they are in the
-module that declares `Tx`; that is how a linear value is finished.
-
 ## 6a. Functions as parameters
 
 `fn(A, B) -> R` is a type, so a program can declare its own higher-order
@@ -3475,6 +3436,45 @@ that prints is an error where you pass it — not a surprise inside. Write
 `fn(i64) -> i64 / {io}` when the caller should be allowed to hand over
 something effectful. This is the one place a row is written rather than
 inferred, because a type has no body to infer from.
+
+## 6b. Values that must be used exactly once
+
+Some values stand for something that must be finished: a transaction to commit
+or roll back, a file to close, a lock to release. A `linear type` makes
+forgetting a compile error instead of a production incident:
+
+```
+linear type Tx = { id: i64 }
+
+fn open(id: i64) -> Tx {
+    Tx{ id: id }
+}
+
+fn commit(own t: Tx) -> str {
+    "committed {t.id}"
+}
+
+fn rollback(own t: Tx) -> str {
+    "rolled back {t.id}"
+}
+
+fn main() {
+    let t = open(1)
+    if t.id > 0 {
+        print(commit(t))
+    } else {
+        print(rollback(t))
+    }
+}
+```
+
+Each `Tx` must be handed on exactly once on every path: to an `own`
+parameter, returned, or moved into another binding. Reading `t.id` or lending
+`t` to an ordinary parameter does not count. Delete the `else` branch and the
+program no longer compiles — `t` would be consumed on one path and not the
+other — and calling `commit(t)` twice is a use of a moved value. `commit` and
+`rollback` may simply let their `own` parameter end, because they are in the
+module that declares `Tx`; that is how a linear value is finished.
 
 ## 7. Structured concurrency
 

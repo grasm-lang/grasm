@@ -188,6 +188,11 @@ pub struct Analysis {
     /// Same reason as `float_literals`: the interpreter reads the type off the
     /// elements, and an empty `[f64]` has none to read.
     pub float_sums: std::collections::HashSet<u32>,
+    /// `parallel` blocks whose tasks are proved independent, by the block's
+    /// span start ([E-SPAWN-ORDER] under the as-if rule). A compiled build
+    /// may run their tasks on several cores: no order of running them could
+    /// be told apart from the written one. See `parallel_independent`.
+    pub parallel_ok: std::collections::HashSet<u32>,
 }
 
 pub fn check(module: &Module) -> Analysis {
@@ -610,6 +615,7 @@ fn check_modules_in(
         generic_ctor_types,
         empty_types,
         float_sums: c.float_sums,
+        parallel_ok: c.parallel_ok.clone(),
         defs: c.defs,
         diagnostics,
     }
@@ -684,6 +690,8 @@ struct Checker {
     /// before checking. A function's row is part of its type, so this has to
     /// be known before anything is typed.
     fn_rows: HashMap<String, std::collections::BTreeSet<String>>,
+    /// See `Analysis::parallel_ok`.
+    parallel_ok: std::collections::HashSet<u32>,
     /// Each closure literal's row, keyed by span. See `rows_and_closures`.
     closure_rows: HashMap<u32, std::collections::BTreeSet<String>>,
     /// See `Analysis::ok_wrapped`.
@@ -965,6 +973,7 @@ impl Checker {
             aliases: HashMap::new(),
             fns: HashMap::new(),
             fn_rows: HashMap::new(),
+            parallel_ok: std::collections::HashSet::new(),
             closure_rows: HashMap::new(),
             ok_wrapped: std::collections::HashSet::new(),
             map_get_pending: Vec::new(),
@@ -2098,6 +2107,76 @@ nothing says who owns it, how long it lives, or how long it is"
         }
     }
 
+    /// Whether a `parallel` block's tasks are independent, so running them on
+    /// several cores is indistinguishable from running them in order.
+    ///
+    /// The shape proved: the block holds nothing but two or more
+    /// `spawn { v = e }`, each `v` a different outer `var`, all of one type;
+    /// each `e` built from literals, names, arithmetic and calls to functions
+    /// whose effect row is empty; and no `e` names another task's `v`. Then
+    /// each task reads only values no task writes and writes a place no other
+    /// task touches, and performs nothing -- so the only observable result,
+    /// the final values of the `v`s, is the same in any order.
+    fn parallel_independent(&self, body: &Block) -> bool {
+        if body.stmts.len() < 2 {
+            return false;
+        }
+        let mut targets: Vec<String> = Vec::new();
+        let mut exprs: Vec<&Expr> = Vec::new();
+        let mut ty: Option<Type> = None;
+        for st in &body.stmts {
+            let Stmt::Spawn { body: task, .. } = st else { return false };
+            let [Stmt::Assign { target: Expr::Ident(v), op: AssignOp::Assign, value, .. }] =
+                task.stmts.as_slice()
+            else {
+                return false;
+            };
+            let Some(b) = self.lookup(&v.name) else { return false };
+            let t = self.uni.resolve(&b.ty);
+            match &ty {
+                None => ty = Some(t),
+                Some(prev) if *prev == t => {}
+                Some(_) => return false,
+            }
+            if targets.contains(&v.name) {
+                return false;
+            }
+            targets.push(v.name.clone());
+            exprs.push(value);
+        }
+        exprs.iter().enumerate().all(|(i, e)| {
+            self.pure_task_expr(e)
+                && {
+                    let mut names = Vec::new();
+                    crate::check::idents_in(e, &mut names);
+                    targets
+                        .iter()
+                        .enumerate()
+                        .all(|(j, t)| j == i || !names.contains(t))
+                }
+        })
+    }
+
+    /// Literals, names, arithmetic and calls to functions with an empty row.
+    fn pure_task_expr(&self, e: &Expr) -> bool {
+        match e {
+            Expr::Int(..) | Expr::Float(..) | Expr::Bool(..) | Expr::Ident(_) => true,
+            Expr::Unary { expr, .. } => self.pure_task_expr(expr),
+            Expr::Binary { lhs, rhs, .. } => self.pure_task_expr(lhs) && self.pure_task_expr(rhs),
+            Expr::Call { callee, args, .. } => {
+                let Expr::Ident(f) = &**callee else { return false };
+                if self.lookup(&f.name).is_some() {
+                    return false;
+                }
+                let key = format!("{}::{}", self.current_module, f.name);
+                self.fns.contains_key(&key)
+                    && self.fn_rows.get(&key).is_some_and(|r| r.is_empty())
+                    && args.iter().all(|a| self.pure_task_expr(a))
+            }
+            _ => false,
+        }
+    }
+
     fn collect_fns(&mut self, module: &Module) {
         for decl in &module.decls {
             if let Decl::Fn(f) = decl {
@@ -3221,7 +3300,7 @@ closing brace — yield a number from the region and return that",
                 self.loop_depth -= 1;
                 Type::Unit
             }
-            Stmt::Parallel { body, .. } => {
+            Stmt::Parallel { body, span } => {
                 self.parallel_depth += 1;
                 let saved_floor = self.parallel_floor;
                 // Bindings from here down live only for the collection pass;
@@ -3230,6 +3309,9 @@ closing brace — yield a number from the region and return that",
                 self.check_block_discarded(body);
                 self.parallel_floor = saved_floor;
                 self.parallel_depth -= 1;
+                if self.parallel_independent(body) {
+                    self.parallel_ok.insert(span.start);
+                }
                 Type::Unit
             }
             Stmt::Spawn { body, span } => {
@@ -9478,5 +9560,24 @@ fn expr_leaves(e: &Expr) -> bool {
             matches!(&**callee, Expr::Ident(id) if matches!(id.name.as_str(), "panic" | "exit" | "fail"))
         }
         _ => false,
+    }
+}
+
+/// Every name an expression mentions.
+pub(crate) fn idents_in(e: &Expr, out: &mut Vec<String>) {
+    match e {
+        Expr::Ident(id) => out.push(id.name.clone()),
+        Expr::Unary { expr, .. } => idents_in(expr, out),
+        Expr::Binary { lhs, rhs, .. } => {
+            idents_in(lhs, out);
+            idents_in(rhs, out);
+        }
+        Expr::Call { callee, args, .. } => {
+            idents_in(callee, out);
+            for a in args {
+                idents_in(a, out);
+            }
+        }
+        _ => {}
     }
 }
