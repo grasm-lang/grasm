@@ -41,7 +41,7 @@ four missed with numbers attached, and three that cannot be measured from inside
 this repository at all — two of those need someone else to use the language.
 
 `spec/core.md` does the same for the kernel-language commitment:
-36 constructs against a budget of 30, with the six that would close the gap
+37 constructs against a budget of 30, with the seven that would close the gap
 named.
 
 ### Something built with it

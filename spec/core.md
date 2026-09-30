@@ -45,11 +45,11 @@ Two consequences worth stating, because both were tempting and both are wrong:
 
 ## Where the split falls today
 
-**Core: 36 forms. Full: 20 forms.**
+**Core: 37 forms. Full: 20 forms.**
 
-Thirty-six is not thirty. §19.2 says "≤ ~30", and this is over it. The gap is
+Thirty-seven is not thirty. §19.2 says "≤ ~30", and this is over it. The gap is
 recorded rather than closed by re-counting: §"What would have to move" below
-names the six forms that would take Core to 30 and what each would cost. A
+names the seven forms that would take Core to 30 and what each would cost. A
 number that is met by redefining what counts is not a number.
 
 The literal forms — `1`, `1.0`, `true`, `"s"` — are counted as **one** construct
@@ -77,7 +77,7 @@ That is the only collapse taken, and it is stated so the count can be audited.
 | 13 | `region { … }` | tiered ownership: a scope with an allocation discipline |
 | 14 | `unsafe { … }` | the capability gate; nothing else can express it |
 
-### Statements (8)
+### Statements (9)
 
 | # | Form | Why |
 |---|---|---|
@@ -89,35 +89,36 @@ That is the only collapse taken, and it is stated so the count can be audited.
 | 20 | `break` | loop exit |
 | 21 | `continue` | loop restart |
 | 22 | `with E handled_by h { … }` | effect handler installation |
+| 23 | `concurrent { … go { … } … }` | tasks that take turns; no sequential form has a turn to give ([E-SCHEDULE]) |
 
 ### Declarations (5)
 
 | # | Form | Why |
 |---|---|---|
-| 23 | `fn f(…) -> T / {…} { … }` | function definition |
-| 24 | `type T = …` | ADT and alias definition |
-| 25 | `effect E { … }` | effect declaration |
-| 26 | `extern fn f(…)` | the C boundary; no Grasm form denotes it |
-| 27 | `import m` | module reference |
+| 24 | `fn f(…) -> T / {…} { … }` | function definition |
+| 25 | `type T = …` | ADT and alias definition |
+| 26 | `effect E { … }` | effect declaration |
+| 27 | `extern fn f(…)` | the C boundary; no Grasm form denotes it |
+| 28 | `import m` | module reference |
 
 ### Types (6)
 
 | # | Form | Why |
 |---|---|---|
-| 28 | `T`, `T[A]` | named type, applied |
-| 29 | `fn(A) -> B / {E}` | function type, carrying its row |
-| 30 | `T ! E` | error union |
-| 31 | `ref T` | generational reference |
-| 32 | `(A, B)` | product type |
-| 33 | `(A or B)` written with a bar | error-union member set |
+| 29 | `T`, `T[A]` | named type, applied |
+| 30 | `fn(A) -> B / {E}` | function type, carrying its row |
+| 31 | `T ! E` | error union |
+| 32 | `ref T` | generational reference |
+| 33 | `(A, B)` | product type |
+| 34 | `(A or B)` written with a bar | error-union member set |
 
 ### Patterns (3)
 
 | # | Form | Why |
 |---|---|---|
-| 34 | `_` | ignore |
-| 35 | `x` | bind |
-| 36 | `V(a, b)` | ADT elimination |
+| 35 | `_` | ignore |
+| 36 | `x` | bind |
+| 37 | `V(a, b)` | ADT elimination |
 
 ## Full — and the rewrite for each
 
@@ -176,7 +177,7 @@ String **interpolation** — `"a{e}b"` — is Full within form 1: it rewrites to
 
 ## What would have to move, to reach 30
 
-Six forms, in the order they are least defensible as Core. The number in
+Seven forms, in the order they are least defensible as Core. The number in
 parentheses is the **net** saving — what a change removes minus what it adds
 back — because that is the only figure the arithmetic below can use. The first
 entry is the reason to say so: it takes two forms out and puts one in.
@@ -200,8 +201,12 @@ entry is the reason to say so: it takes two forms out and puts one in.
    `set_at` and calling indexing sugar for them: nobody would write those
    methods, and inventing surface so a count comes out right is the thing this
    document exists to prevent.
+7. **`concurrent` and `go`** (net 1). Removable if a task switch were an
+   effect a scheduler handles, as MASTERPLAN §8.6 wants channels built on
+   effects: `concurrent` would be a `with` over it. Today a handler cannot
+   hold a suspended computation, so this needs continuations in Core first.
 
-Four of those six are real design work, not bookkeeping. The count is 36 and the
+Five of those seven are real design work, not bookkeeping. The count is 37 and the
 route to 30 is written down; claiming 30 today would be false.
 
 ## What the gate checks
@@ -219,7 +224,7 @@ The budgets, measured rather than asserted:
 
 | Budget | §19.2 target | Today |
 |---|---|---|
-| Core constructs | ≤ 30 | **36** |
+| Core constructs | ≤ 30 | **37** |
 | Reference interpreter | ≤ 5,000 lines | **9046** |
 | Specification | ≤ 50 pages | **~70 pages** |
 
