@@ -187,9 +187,20 @@ In the interpreter a task is its own interpreter, and a `ref` names a slot in
 one slab, so the slab is handed from interpreter to interpreter as they take
 turns (`slab_hold` in `crate::tasks`) rather than each having its own.
 
+## Select
+
+`chan_select(chs)` is the index of the first channel in `chs` that a
+`chan_recv` would not wait on -- one holding a value, or closed -- and waits
+until there is one. It answers with an index rather than a value because
+nothing runs between it and the `chan_recv` that follows, so the answer is
+still true then, and an integer is all either runtime has to build. The
+channels share an element type, being a list; channels of different types
+are selected over by sending a sum type on each. Earlier channels win ties,
+so the choice is as fixed as the schedule.
+
 ## Not in this design
 
-`select` over several channels, timeouts,
+Sending on whichever of several channels is ready, timeouts,
 and I/O that parks a fiber instead of blocking the thread — `net_wait` already
 covers concurrent sockets on one thread, and bringing it under the scheduler is
 its own step.

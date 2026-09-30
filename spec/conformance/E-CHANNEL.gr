@@ -1,6 +1,8 @@
 //! tag: E-CHANNEL
 //! expect: panic
 //! Some(1) Some(2) None None
+//! select 1
+//! select 0
 //! send on a closed channel
 // A buffered channel needs no receiver to be waiting: two values fit. They
 // come out in the order they went in, then `None` for as long as anyone asks.
@@ -10,5 +12,13 @@ fn main() / {io, async} {
     chan_send(ch, 2)
     chan_close(ch)
     print("{chan_recv(ch)} {chan_recv(ch)} {chan_recv(ch)} {chan_recv(ch)}")
+    // `chan_select` names the first channel a `chan_recv` would not wait on:
+    // one holding a value, or one closed.
+    let a = chan_new(1)
+    let b = chan_new(1)
+    chan_send(b, 9)
+    print("select {chan_select([a, b])}")
+    chan_close(a)
+    print("select {chan_select([a, b])}")
     chan_send(ch, 3)
 }

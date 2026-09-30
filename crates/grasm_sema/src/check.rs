@@ -287,6 +287,7 @@ pub const BUILTIN_FREE_FNS: &[&str] = &[
     "chan_new",
     "chan_send",
     "chan_recv",
+    "chan_select",
     "chan_close",
     "print",
     "eprint",
@@ -5881,6 +5882,17 @@ only a number or a `bool` can come out — compute what you need and yield that"
                         }
                         let t = self.uni.fresh();
                         return Type::Named { id: self.defs.chan_id, args: vec![t] };
+                    }
+                    // The first of several channels a `chan_recv` would not
+                    // wait on ([E-CHANNEL]).
+                    "chan_select" => {
+                        if args.len() != 1 {
+                            return self.error(span, "`chan_select` takes 1 argument, a list of channels");
+                        }
+                        let t = self.uni.fresh();
+                        let want = Type::List(Box::new(Type::Named { id: self.defs.chan_id, args: vec![t] }));
+                        self.check_expr(&args[0], &want);
+                        return Type::I64;
                     }
                     "chan_send" | "chan_recv" | "chan_close" => {
                         let name = id.name.as_str();

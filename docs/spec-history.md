@@ -172,3 +172,10 @@ requires, and §11 no longer lists it. This paragraph said otherwise for a day
 after it stopped being true, which is the failure mode a documented gap has:
 the table is checked against the compiler on every run, and prose beside it is
 not.
+
+## spec/semantics.md ([E-MATCH-BUILTIN-ARMS])
+
+Those two used to be the same answer, so a value match whose arms it did not
+understand compiled to no value at all and the enclosing function returned
+whatever was in the register. A wrong answer with nothing reported is the worst
+outcome available, and strictly worse than the refusal that replaced it.

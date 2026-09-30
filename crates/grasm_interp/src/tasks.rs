@@ -238,6 +238,34 @@ impl<'a, W: Write> Interp<'a, W> {
         }
     }
 
+    /// `chan_select(chs)`: the index of the first channel in `chs` that a
+    /// `chan_recv` would not wait on -- one holding a value, or closed --
+    /// waiting until there is one. Nothing runs between this and the
+    /// `chan_recv` that follows it, so the answer is still true then.
+    pub(crate) fn chan_select(&mut self, chs: &Value) -> EResult {
+        let ids: Vec<usize> = match chs {
+            Value::List(items) => items.iter().map(chan_id).collect::<Result<_, _>>()?,
+            _ => return Err(Flow::Panic("not a list of channels".into())),
+        };
+        if ids.is_empty() {
+            return Err(Flow::Panic("`chan_select` of no channels would wait forever".into()));
+        }
+        loop {
+            {
+                let guard = self.chans.borrow();
+                for (i, id) in ids.iter().enumerate() {
+                    let Some(c) = guard.chans.get(*id) else {
+                        return Err(Flow::Panic("not a channel".into()));
+                    };
+                    if !c.buf.is_empty() || c.closed {
+                        return Ok(Value::Int(i as i64));
+                    }
+                }
+            }
+            self.wait()?;
+        }
+    }
+
     /// `chan_close(ch)`.
     pub(crate) fn chan_close(&mut self, ch: &Value) -> EResult {
         let id = chan_id(ch)?;

@@ -17,6 +17,7 @@ fn concurrent() / {async} {
 fn channel_ops(ch: Chan[i64]) / {async} {
     chan_send(ch, 1)
     let _v = chan_recv(ch)
+    let _i = chan_select([ch])
     chan_close(ch)
 }
 

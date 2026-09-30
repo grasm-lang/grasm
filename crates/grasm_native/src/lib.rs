@@ -1025,6 +1025,7 @@ impl<'m> Codegen<'m> {
             ("grasm_chan_send", vec![i64t, i64t], None),
             ("grasm_chan_recv", vec![i64t], Some(i64t)),
             ("grasm_chan_close", vec![i64t], None),
+            ("grasm_chan_select", vec![i64t], Some(i64t)),
             ("grasm_conc_run", vec![i64t], None),
             (
                 "grasm_par_filter_scalar",
@@ -13519,6 +13520,12 @@ checker did",
                 self.call_rt("grasm_chan_send", &[ch, boxed]);
                 return Ok(Some((self.b.ins().iconst(types::I64, 0), VType::Unit)));
             }
+            "chan_select" => {
+                let (chs, _) = self.eval_expr_val(&args[0])?;
+                let v = self.call_rt("grasm_chan_select", &[chs]).unwrap();
+                self.call_rt("grasm_val_dec", &[chs]);
+                return Ok(Some((v, VType::I64)));
+            }
             "chan_close" => {
                 let (ch, _) = self.eval_expr_val(&args[0])?;
                 self.call_rt("grasm_chan_close", &[ch]);
@@ -15634,7 +15641,7 @@ fields, not the type this is bound to, not an enclosing generic",
                             "pi" | "e" => Some(VType::F64),
                             "now_millis" | "monotonic_millis" => Some(VType::I64),
                             "sleep_millis" => Some(VType::Unit),
-                            "chan_new" => Some(VType::I64),
+                            "chan_new" | "chan_select" => Some(VType::I64),
                             "chan_send" | "chan_close" => Some(VType::Unit),
                             "input" => Some(VType::Str),
                             "file_exists" => Some(VType::Bool),

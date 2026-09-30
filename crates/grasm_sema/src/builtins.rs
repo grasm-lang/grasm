@@ -108,6 +108,11 @@ pub const BUILTINS: &[Builtin] = &[
         journal: Journal::Untouched,
     },
     Builtin {
+        name: "chan_select",
+        row: ASYNC_ROW,
+        journal: Journal::Untouched,
+    },
+    Builtin {
         name: "chan_close",
         row: ASYNC_ROW,
         journal: Journal::Untouched,

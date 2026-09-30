@@ -144,6 +144,31 @@ pub extern "C" fn grasm_chan_recv(ch: i64) -> *mut RtVal {
     }
 }
 
+/// `chan_select(chs)`: the index of the first channel a `chan_recv` would not
+/// wait on, waiting until there is one. Borrows the list.
+///
+/// # Safety: `chs` is a live list of channels.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_chan_select(chs: *mut RtVal) -> i64 {
+    let ids = crate::scalar_words(chs, "chan_select");
+    if ids.is_empty() {
+        rt_panic("`chan_select` of no channels would wait forever");
+    }
+    loop {
+        {
+            let guard = chans();
+            for (i, &id) in ids.iter().enumerate() {
+                let at = index(id, &guard);
+                let c = &guard.chans[at];
+                if !c.buf.is_empty() || c.closed {
+                    return i as i64;
+                }
+            }
+        }
+        wait();
+    }
+}
+
 /// `chan_close(ch)`.
 #[no_mangle]
 pub extern "C" fn grasm_chan_close(ch: i64) {

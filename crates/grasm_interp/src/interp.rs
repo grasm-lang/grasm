@@ -3393,6 +3393,10 @@ uses to mark the end of a string"
                         let ch = self.eval_expr(&args[0])?;
                         return self.chan_close(&ch);
                     }
+                    "chan_select" => {
+                        let chs = self.eval_expr(&args[0])?;
+                        return self.chan_select(&chs);
+                    }
                     // Guarded on the user's own namespace, the way the
                     // checker guards them: `e` is a common enough identifier
                     // that a builtin taking it outright would break working
