@@ -9,6 +9,12 @@ several cores where no program could tell ([E-NOT-PARALLEL]). That is
 parallelism, not concurrency — tasks there cannot talk to each other. This is
 the part where they can.
 
+Measured 2026-10-01, native, four `spawn`s each running the same 150M-step
+pure loop, against the same four calls in sequence, runs interleaved: 3.09x
+and 3.29x wall in the two quietest rounds (load 8-9), 2.70x-3.79x over all
+five, against an ideal of 4x; CPU time rises about 10%, the cost of the
+threads. The load never fell below 8, so the figure is fair but not clean.
+
 ## What a program looks like
 
 ```grasm
