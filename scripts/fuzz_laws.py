@@ -53,6 +53,22 @@ _lib("fresh").fresh_or_stop(GRASM)
 
 PRELUDE = """type Bad = | Bad
 
+actor Cell {
+    var v: i64 = 0
+
+    fn set(inout self, x: i64) {
+        self.v = x
+    }
+
+    fn add(inout self, x: i64) {
+        self.v += x
+    }
+
+    fn get(self) -> i64 {
+        self.v
+    }
+}
+
 effect Src {
     fn get() -> i64
 }
@@ -327,6 +343,7 @@ CLAUSES = {
     "E-PARALLEL-JOIN": "parallel joins before after",
     "E-CONCURRENT": "concurrent joins before after",
     "E-SCHEDULE": "a task runs until it waits",
+    "E-ACTOR": "an actor's copies share its state",
     "E-POW": "power is repeated product",
     "E-ARITH-INT": "division truncates toward zero",
     "E-STR-CONCAT": "substr composes",
@@ -510,6 +527,8 @@ LAWS = {
  "parallel joins before after": 'var log = ""\n    parallel {\n        spawn {\n            log += "a"\n        }\n    }\n    log += "z"\n    say(log == "az")',
  "concurrent joins before after": 'let ch = chan_new(1)\n    concurrent {\n        go {\n            chan_send(ch, "a")\n        }\n    }\n    let log = (chan_recv(ch) ?? "?") + "z"\n    say(log == "az")',
  "a task runs until it waits": 'let ch = chan_new(3)\n    concurrent {\n        go {\n            chan_send(ch, 1)\n            chan_send(ch, 2)\n        }\n        go {\n            chan_send(ch, 3)\n        }\n    }\n    let a = chan_recv(ch) ?? 0\n    let b = chan_recv(ch) ?? 0\n    let c = chan_recv(ch) ?? 0\n    say(a == 1 and b == 2 and c == 3)',
+ "an actor's copies share its state": 'let a = Cell()\n    let b = a\n    b.set(7)\n    say(a.get() == 7)',
+ "tasks share an actor": 'let c = Cell()\n    concurrent {\n        for k in 1..5 {\n            go {\n                c.add(k)\n            }\n        }\n    }\n    say(c.get() == 10)',
  "power is repeated product":  'say((2 ^ 10) == 1024)',
  "negative power is a fraction": 'say((2.0 ^ (0.0 - 1.0)) == 0.5)',
  "division truncates toward zero": 'say((7 / 2) == 3 and ((0 - 7) / 2) == 0 - 3)',

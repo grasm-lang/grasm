@@ -161,9 +161,9 @@ pub struct Interp<'a, W: Write> {
     /// the generation that slot is on. A reference matches only while the
     /// generation it was taken at is still current, so a released slot can be
     /// reused immediately and every reference into its previous life is caught.
-    slab: Vec<(Option<Value>, u32)>,
+    pub(crate) slab: Vec<(Option<Value>, u32)>,
     /// Slots free for reuse.
-    slab_free: Vec<u32>,
+    pub(crate) slab_free: Vec<u32>,
     /// `type Res = i64 ! E` — needed to tell whether a function that returns
     /// an alias is fallible, which decides whether its value is wrapped.
     aliases: HashMap<String, TypeExpr>,

@@ -1025,6 +1025,36 @@ once inside `main`",
         }
     }
 
+    // An actor's method runs to its end before another task can run
+    // ([E-ACTOR]): that is what makes the actor exclusive without a lock, and
+    // it holds only while the method cannot wait. So it may not perform
+    // `async` -- not wait on a channel, not start tasks.
+    for f in files {
+        for d in &f.module.decls {
+            let Decl::Impl(im) = d else { continue };
+            if im.iface.segments.last().map(|s| s.name.as_str()) != Some("\u{a7}actor") {
+                continue;
+            }
+            for (m, lowered) in &im.methods {
+                let key = format!("{}::{lowered}", f.name);
+                if ctx.rows.get(&key).is_some_and(|r| r.contains(ASYNC)) {
+                    diags.push(
+                        Diagnostic::error(
+                            m.span,
+                            format!(
+                                "`{}` of actor `{}` performs `async`, and an actor's method runs to its end before any other task does",
+                                m.name, im.type_name
+                            ),
+                        )
+                        .with_help(
+                            "waiting inside a method would let another task call the actor halfway through -- do the channel work in the caller ([E-ACTOR])",
+                        ),
+                    );
+                }
+            }
+        }
+    }
+
     // Declared rows are upper bounds.
     for (key, f) in &ctx.fns {
         if let Some(declared) = &f.effects {

@@ -915,11 +915,6 @@ n.value += 1
 print("{n.value}")        // 1
 ```
 
-Without it `ref(0)` typechecked, produced a `ref i64`, and **no expression in
-the language could observe it** — a value that could be constructed and never
-used. The workaround was a one-field wrapper struct, which is the same thing
-with a name on it.
-
 It is *not* offered when the referent is a struct or a tuple. A struct already
 has field names, and `.value` would either shadow a real one or change meaning
 the day somebody added one; a tuple's components are `.0` and `.1`. So the rule
@@ -955,15 +950,6 @@ through: `r.field = v`, `r.items.push(x)`, `r.n += 1`. The binding's own
 mutability is not the question — writing through a reference does not modify
 the reference — so `let r = ref(...)` is the ordinary form and `var` is not
 required.
-
-Without this a `ref` graph was **write-once**: closing a cycle needs one write
-after both nodes exist, and that write typechecked and then panicked. The
-compiled backend refused the shape for a while and no longer does — it writes
-into the slab rather than rebuilding the referent, which is what a cycle
-requires, and §11 no longer lists it. This paragraph said otherwise for a day
-after it stopped being true, which is the failure mode a documented gap has:
-the table is checked against the compiler on every run, and prose beside it is
-not.
 
 Anywhere on the path, not only at the root. A node held in a list or in a
 struct field is the ordinary Tier 2 arena — `[T-REF-GENERATIONAL]` names

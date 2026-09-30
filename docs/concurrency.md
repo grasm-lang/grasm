@@ -164,9 +164,32 @@ observe, since tasks share nothing mutable, and is a later step.
    finished stacks for the next fiber. The interpreter had the same quadratic
    list and now rebuilds it once a round.
 
+## Actors
+
+MASTERPLAN §8.6: "`actor Counter { var n = 0; fn inc(inout self) }` —
+exclusive by construction". Done as [E-ACTOR], lowered in the parser the way an
+`impl` is: a state struct behind a `ref`, a handle holding it, a constructor,
+and the methods as `impl` methods of an interface no program can name, so a
+call resolves by the handle's type in both engines unchanged.
+
+Exclusive by construction here means a method cannot wait: it may not perform
+`async`, and tasks switch only where something waits, so a method runs to its
+end before another task runs and no lock is needed. When tasks run on several
+threads, a handle will need one; the language does not change.
+
+Two departures from the MASTERPLAN sketch. A field declares its type
+(`var n: i64 = 0`), as a struct's does. And a method call is not charged
+`async` -- "messages are effects" -- because effects are inferred before types,
+so `c.inc()` cannot be told from any other `inc` there; the property the
+effect would have protected, exclusivity, holds without it.
+
+In the interpreter a task is its own interpreter, and a `ref` names a slot in
+one slab, so the slab is handed from interpreter to interpreter as they take
+turns (`slab_hold` in `crate::tasks`) rather than each having its own.
+
 ## Not in this design
 
-Actors (planned on top of channels), `select` over several channels, timeouts,
+`select` over several channels, timeouts,
 and I/O that parks a fiber instead of blocking the thread — `net_wait` already
 covers concurrent sockets on one thread, and bringing it under the scheduler is
 its own step.

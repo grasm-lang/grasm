@@ -154,3 +154,21 @@ However it got one. The rule looked for a literal `ref(...)` in the
 initializer, so `let ROOT = mk()` where `mk` returns one was accepted — and so
 was a struct or a list holding one. It is the constant's *type* that decides
 now, so every carrier is covered.
+
+## spec/types.md ([T-REF-VALUE])
+
+Without it `ref(0)` typechecked, produced a `ref i64`, and **no expression in
+the language could observe it** — a value that could be constructed and never
+used. The workaround was a one-field wrapper struct, which is the same thing
+with a name on it.
+
+## spec/types.md ([T-REF-WRITE])
+
+Without this a `ref` graph was **write-once**: closing a cycle needs one write
+after both nodes exist, and that write typechecked and then panicked. The
+compiled backend refused the shape for a while and no longer does — it writes
+into the slab rather than rebuilding the referent, which is what a cycle
+requires, and §11 no longer lists it. This paragraph said otherwise for a day
+after it stopped being true, which is the failure mode a documented gap has:
+the table is checked against the compiler on every run, and prose beside it is
+not.

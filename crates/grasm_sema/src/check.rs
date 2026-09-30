@@ -939,6 +939,10 @@ struct Checker {
     /// and may not be written from this one (docs/concurrency.md).
     concurrent_depth: u32,
     go_floor: Option<usize>,
+    /// The handle types of the program's actors ([E-ACTOR]). A task may use
+    /// one from outside, though it reaches a `ref`: the state behind it is
+    /// reached only through methods that run one at a time.
+    actor_types: std::collections::HashSet<String>,
     /// Scope depth where the innermost enclosing `parallel` block began.
     parallel_floor: Option<usize>,
     /// While checking a task body: (parallel floor, depth where this task body
@@ -1048,6 +1052,7 @@ impl Checker {
             parallel_depth: 0,
             concurrent_depth: 0,
             go_floor: None,
+            actor_types: Default::default(),
             parallel_floor: None,
             task_capture: None,
             loop_depth: 0,
@@ -1765,6 +1770,22 @@ nothing says who owns it, how long it lives, or how long it is"
         for decl in &module.decls {
             let Decl::Impl(im) = decl else { continue };
             let iname = im.iface.segments.last().map(|s| s.name.clone()).unwrap_or_default();
+            // An actor's methods ([E-ACTOR]): the parser lowered them as an
+            // `impl` of an interface no program can name, so there is no
+            // signature to hold them to -- only the calls to resolve.
+            if iname == "\u{a7}actor" {
+                self.actor_types.insert(im.type_name.clone());
+                for (n, lowered) in &im.methods {
+                    let key = format!("{}::{lowered}", self.current_module);
+                    let slot = (im.type_name.clone(), n.name.clone());
+                    if self.impls.contains_key(&slot) {
+                        self.error(n.span, format!("actor `{}` has two methods `{}`", im.type_name, n.name));
+                        continue;
+                    }
+                    self.impls.insert(slot, (key, iname.clone()));
+                }
+                continue;
+            }
             let Some(iface) = self.interfaces.get(&iname).cloned() else {
                 self.error(im.iface.span, format!("unknown interface `{iname}`"));
                 continue;
@@ -3632,21 +3653,30 @@ closing brace — yield a number from the region and return that",
     /// `Holder { s: ref Sink }` into the region names no `ref` at all, and the
     /// callee reads the field and writes through it ([T-REGION-REF]).
     fn carries(&self, t: &Type, want_fn: bool, seen: &mut Vec<usize>) -> bool {
+        self.carries_in(t, want_fn, false, seen)
+    }
+
+    /// `carries`, where `actors_ok` stops at an actor's handle: a task may
+    /// share one ([E-ACTOR]), though a parallel operation may not.
+    fn carries_in(&self, t: &Type, want_fn: bool, actors_ok: bool, seen: &mut Vec<usize>) -> bool {
         match self.uni.resolve(t) {
-            Type::Ref(inner) => !want_fn || self.carries(&inner, want_fn, seen),
+            Type::Ref(inner) => !want_fn || self.carries_in(&inner, want_fn, actors_ok, seen),
             Type::Fn { params, ret, .. } => {
                 want_fn
-                    || params.iter().any(|p| self.carries(p, want_fn, seen))
-                    || self.carries(&ret, want_fn, seen)
+                    || params.iter().any(|p| self.carries_in(p, want_fn, actors_ok, seen))
+                    || self.carries_in(&ret, want_fn, actors_ok, seen)
             }
-            Type::List(e) => self.carries(&e, want_fn, seen),
-            Type::Map(k, v) => self.carries(&k, want_fn, seen) || self.carries(&v, want_fn, seen),
-            Type::Tuple(items) => items.iter().any(|i| self.carries(i, want_fn, seen)),
+            Type::List(e) => self.carries_in(&e, want_fn, actors_ok, seen),
+            Type::Map(k, v) => self.carries_in(&k, want_fn, actors_ok, seen) || self.carries_in(&v, want_fn, actors_ok, seen),
+            Type::Tuple(items) => items.iter().any(|i| self.carries_in(i, want_fn, actors_ok, seen)),
             Type::Fallible(a, b) => {
-                self.carries(&a, want_fn, seen) || self.carries(&b, want_fn, seen)
+                self.carries_in(&a, want_fn, actors_ok, seen) || self.carries_in(&b, want_fn, actors_ok, seen)
             }
             Type::Named { id, args } => {
-                if args.iter().any(|a| self.carries(a, want_fn, seen)) {
+                if actors_ok && self.actor_types.contains(&self.defs.get(id).name) {
+                    return false;
+                }
+                if args.iter().any(|a| self.carries_in(a, want_fn, actors_ok, seen)) {
                     return true;
                 }
                 // A recursive type is reached twice; the second visit answers
@@ -3664,12 +3694,18 @@ closing brace — yield a number from the region and return that",
                         .flat_map(|v| v.fields.iter().map(|(_, t)| t.clone()))
                         .collect(),
                 };
-                let found = inner.iter().any(|t| self.carries(t, want_fn, seen));
+                let found = inner.iter().any(|t| self.carries_in(t, want_fn, actors_ok, seen));
                 seen.pop();
                 found
             }
             _ => false,
         }
+    }
+
+    /// Whether a task handing on or reaching a `t` would share a `ref` cell
+    /// with another task. An actor's handle does not count ([E-ACTOR]).
+    fn task_shares_ref(&self, t: &Type) -> bool {
+        self.carries_in(t, false, true, &mut Vec::new())
     }
 
     fn carries_ref(&self, t: &Type) -> bool {
@@ -4720,7 +4756,7 @@ write back to — copy it into a local first, as in `var {} = {}`",
         // exchange for being free of races.
         if let (Some(floor), Expr::Ident(id)) = (self.go_floor, e) {
             let declared_at = self.scopes.iter().rposition(|sc| sc.contains_key(&id.name));
-            if declared_at.is_some_and(|at| at < floor) && self.carries_ref(&t) {
+            if declared_at.is_some_and(|at| at < floor) && self.task_shares_ref(&t) {
                 self.error_help(
                     id.span,
                     format!(
@@ -5861,6 +5897,18 @@ only a number or a `bool` can come out — compute what you need and yield that"
                         return match name {
                             "chan_send" => {
                                 self.check_expr(&args[1], &t);
+                                // A `ref` handed to another task is a cell
+                                // both hold: shared mutable state, which is
+                                // what tasks give up ([E-CONCURRENT]). An
+                                // actor is the sanctioned way to share one.
+                                let sent = self.uni.resolve(&t);
+                                if self.task_shares_ref(&sent) {
+                                    self.error_help(
+                                        args[1].span(),
+                                        "a channel cannot carry a `ref`: the task receiving it would share the cell with the one sending it",
+                                        "send the value itself, or wrap the shared state in an `actor` ([E-ACTOR])",
+                                    );
+                                }
                                 Type::Unit
                             }
                             "chan_recv" => Type::Named { id: self.defs.option_id, args: vec![t] },

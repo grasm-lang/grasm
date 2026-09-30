@@ -45,7 +45,7 @@ Two consequences worth stating, because both were tempting and both are wrong:
 
 ## Where the split falls today
 
-**Core: 36 forms. Full: 19 forms.**
+**Core: 36 forms. Full: 20 forms.**
 
 Thirty-six is not thirty. §19.2 says "≤ ~30", and this is over it. The gap is
 recorded rather than closed by re-counting: §"What would have to move" below
@@ -148,7 +148,7 @@ String **interpolation** — `"a{e}b"` — is Full within form 1: it rewrites to
 | `parallel { … }` | `{ … }` with each `spawn` body run in order — [E-NOT-PARALLEL] says tasks behave as if run in order, so the rewrite is exact |
 | `spawn { B }` | the block `B`, deferred to the end of the enclosing `parallel` |
 
-### Declarations (6)
+### Declarations (7)
 
 | Form | Rewrite into Core |
 |---|---|
@@ -157,6 +157,7 @@ String **interpolation** — `"a{e}b"` — is Full within form 1: it rewrites to
 | `bench "name" { B }` | `fn §bench_name() { B }`, likewise |
 | `interface I { … }` | nothing: a constraint the checker reads, erased before any engine runs ([T-INTERFACE]) |
 | `impl I for T { fn m(self, …) … }` | `fn m@T(self: T, …) …`, and each `x.m(…)` the checker resolved through it becomes `m@T(x, …)` by `x`'s type |
+| `actor A(ps) { var f: T = e … fn m(self, …) … }` | `type A@state = { f: T … }`, `type A = { §state: ref A@state }`, `fn A(ps) -> A` building one, and each method as an `impl` method `m@A` with `self.f` read as `self.§state.f` ([E-ACTOR]) |
 | `requires` and `ensures` clauses on `fn f` | `f@body` holds the body, each clause is a `bool` function, and `f` checks them around a call to `f@body` ([T-CONTRACT-REQUIRES]) |
 
 ### Types (1)

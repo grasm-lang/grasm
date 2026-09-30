@@ -1,6 +1,6 @@
 # Grasm — conformance programs: semantics
 
-Evaluation — what a program does when it runs. 70 executable program(s), one per normative clause of
+Evaluation — what a program does when it runs. 71 executable program(s), one per normative clause of
 `grasm-language-pack.md`. Each header states the tag it demonstrates and the
 exact expected behaviour, and every one is run by `cargo test -p grasm_spec`, so
 a program here cannot describe behaviour the implementation does not have.
@@ -12,6 +12,60 @@ see it settled by a program.
 The programs are split by area because together they no longer fit in one
 context, and a reader with a rule in dispute needs one area rather than four.
 The other parts are `grasm-conformance-grammar`, `grasm-conformance-types`, `grasm-conformance-semantics`, `grasm-conformance-library`.
+
+## `E-ACTOR.gr`
+
+```grasm
+//! tag: E-ACTOR
+//! expect: output
+//! 3 deposits, balance 160
+//! refused 500
+//! 3 deposits, balance 160
+// An account several tasks deposit into. Its state is reached only through
+// its methods, and a method cannot wait, so each runs to its end before any
+// other task runs: no deposit is lost between reading and writing the
+// balance.
+actor Account(opening: i64) {
+    var balance: i64 = opening
+    var deposits: i64 = 0
+
+    fn deposit(inout self, amount: i64) {
+        self.balance += amount
+        self.deposits += 1
+    }
+
+    fn withdraw(inout self, amount: i64) -> bool {
+        if amount > self.balance {
+            false
+        } else {
+            self.balance -= amount
+            true
+        }
+    }
+
+    fn summary(self) -> str {
+        "{self.deposits} deposits, balance {self.balance}"
+    }
+}
+
+fn main() / {io, async} {
+    let acct = Account(100)
+    concurrent {
+        for amount in [10, 20, 30] {
+            go {
+                acct.deposit(amount)
+            }
+        }
+    }
+    print(acct.summary())
+    // A copy of the handle is the same account.
+    let same = acct
+    if not same.withdraw(500) {
+        print("refused 500")
+    }
+    print(acct.summary())
+}
+```
 
 ## `E-ARGS.gr`
 

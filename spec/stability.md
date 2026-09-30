@@ -17,7 +17,7 @@ criterion 5 forbids. Saying so was cheaper than defending the listing.
 the five-part test in `docs/stability.md`. The audit is reproducible and 26
 clauses did not pass it; the commit that promoted these says why each failed.
 
-Today: 167 stable, 26 provisional, 60 experimental, of 253.
+Today: 167 stable, 26 provisional, 61 experimental, of 254.
 
 ## Stable
 
@@ -233,6 +233,7 @@ for "no problem found" to mean anything.
 
 May change or be removed in any release. New surface starts here.
 
+- `E-ACTOR` — experimental
 - `E-BENCH-WARMUP` — experimental
 - `E-CHANNEL` — experimental
 - `E-CONCURRENT` — experimental

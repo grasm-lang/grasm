@@ -42,7 +42,16 @@ pub struct Chans {
     /// How many `concurrent` blocks have run tasks, so the test runner can
     /// tell a test that has a schedule to vary from one that has none.
     pub(crate) blocks_run: u64,
+    /// Tier 2's slab, while it is in transit between interpreters. A `ref`
+    /// (an actor's state is one) names a slot in *the* slab, so there can be
+    /// only one; each task's interpreter holds it while it runs and puts it
+    /// here when it gives way, and the scheduler does the same around each
+    /// resume. Only one interpreter runs at a time, so it is never needed in
+    /// two places at once.
+    pub(crate) slab_hold: Option<Slab>,
 }
+
+pub(crate) type Slab = (Vec<(Option<Value>, u32)>, Vec<u32>);
 
 /// SplitMix64: a fixed, portable generator, so a seed names the same orders
 /// on every machine.
@@ -141,10 +150,26 @@ enum Run<'b> {
 }
 
 impl<'a, W: Write> Interp<'a, W> {
-    fn wait(&self) -> Result<(), Flow> {
+    /// Puts this interpreter's slab where the next one to run will take it.
+    pub(crate) fn park_slab(&mut self) {
+        let slab = (std::mem::take(&mut self.slab), std::mem::take(&mut self.slab_free));
+        self.chans.borrow_mut().slab_hold = Some(slab);
+    }
+
+    /// Takes the slab the last interpreter to run left.
+    pub(crate) fn take_slab(&mut self) {
+        if let Some((slab, free)) = self.chans.borrow_mut().slab_hold.take() {
+            self.slab = slab;
+            self.slab_free = free;
+        }
+    }
+
+    fn wait(&mut self) -> Result<(), Flow> {
         match if self.in_task { Wait::Yield } else { Wait::Deadlock } {
             Wait::Yield => {
+                self.park_slab();
                 grasm_fiber::suspend();
+                self.take_slab();
                 Ok(())
             }
             Wait::Deadlock => Err(Flow::Panic(format!(
@@ -258,7 +283,9 @@ impl<'a, W: Write> Interp<'a, W> {
             let end2 = ending.clone();
             // What the task runs, once it has a fiber to run on.
             let body: Box<dyn FnOnce() + '_> = Box::new(move || {
+                task.take_slab();
                 let r = task.eval_block(&body).map(|_| ());
+                task.park_slab();
                 let r = match r {
                     Err(Flow::Return(_)) => Ok(()),
                     other => other,
@@ -296,7 +323,9 @@ impl<'a, W: Write> Interp<'a, W> {
                     unreachable!("started above")
                 };
                 let outer = STACK_FLOOR.with(|f| f.replace(*floor));
+                self.park_slab();
                 let ended = fiber.resume();
+                self.take_slab();
                 STACK_FLOOR.with(|f| f.set(outer));
                 // Output in the order it was written, as every engine prints.
                 let bytes = std::mem::take(&mut *shared.borrow_mut());

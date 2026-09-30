@@ -534,6 +534,7 @@ fn respace(line: &str) -> String {
                     | "effect"
                     | "interface"
                     | "impl"
+                    | "actor"
                     | "test"
                     | "for"
                     | "while"

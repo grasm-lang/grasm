@@ -427,6 +427,14 @@ test under `N` other orders, each named by a seed `--schedule-seed` replays.
 **[E-DEADLOCK]** When every task is waiting and none can go on, the program
 panics.
 
+**[E-ACTOR]** `actor A(ps) { var f: T = e … fn m(inout self, …) { … } }`
+declares state tasks may share. `A(args)` makes one; every copy of the handle
+reaches the same state, which only its methods reach, as `self.f`. A task may
+use a handle from outside, and a channel may carry one; neither may share any
+other `ref`. A method may not perform `async`, so it runs to its end before
+another task runs: an actor is exclusive without a lock. A parallel operation
+may not reach a handle.
+
 **[E-PAR-FILTER-ORDER]** `xs.par_filter(f)` tests elements concurrently and
 keeps the survivors in **input order**. The predicate parallelises; the
 compaction that follows does not, so the result does not depend on how many

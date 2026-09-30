@@ -116,7 +116,7 @@ pub fn parse_type_src(src: &str) -> Option<TypeExpr> {
 
 /// Parse a single expression (used by the REPL and interpolation).
 pub fn parse_expr_src(src: &str, offset: u32) -> (Option<Expr>, Vec<Diagnostic>) {
-    parse_expr_src_at(src, offset, 0)
+    parse_expr_src_at(src, offset, 0, None)
 }
 
 /// The same, starting from a depth already spent.
@@ -125,13 +125,60 @@ pub fn parse_expr_src(src: &str, offset: u32) -> (Option<Expr>, Vec<Diagnostic>)
 /// zero — so nesting `"{ … }"` inside itself was the one shape the cap could
 /// not see, and 60 000 levels aborted the process with a stack overflow while
 /// 40 000 were accepted with no error at all ([G-NEST-LIMIT]).
-fn parse_expr_src_at(src: &str, offset: u32, depth: u32) -> (Option<Expr>, Vec<Diagnostic>) {
+/// Rewrites `self . f`, for each state field `f`, as `self . §state . f` in
+/// `toks[from..to]`: an actor method's `self` is the handle, and its state is
+/// behind the handle's one field ([E-ACTOR]). The tokens put in take the span
+/// of the `.` they follow, so the expression `self.§state` has a span no
+/// expression written in the source has.
+fn state_reads(toks: &mut Vec<Token>, from: usize, to: usize, fields: &[String]) {
+    let mut j = from;
+    let mut to = to.min(toks.len());
+    while j + 2 < to {
+        let is_self = matches!(&toks[j].kind, TokenKind::Ident(n) if n == "self");
+        let dot = matches!(toks[j + 1].kind, TokenKind::Dot);
+        let field = matches!(&toks[j + 2].kind, TokenKind::Ident(n) if fields.contains(n));
+        if is_self && dot && field {
+            let sp = toks[j + 1].span;
+            toks.insert(
+                j + 2,
+                Token {
+                    kind: TokenKind::Ident("\u{a7}state".to_string()),
+                    span: sp,
+                },
+            );
+            toks.insert(
+                j + 3,
+                Token {
+                    kind: TokenKind::Dot,
+                    span: sp,
+                },
+            );
+            j += 4;
+            to += 2;
+            continue;
+        }
+        j += 1;
+    }
+}
+
+fn parse_expr_src_at(
+    src: &str,
+    offset: u32,
+    depth: u32,
+    actor_fields: Option<&[String]>,
+) -> (Option<Expr>, Vec<Diagnostic>) {
     let mut tokens = lex(src);
     for t in &mut tokens {
         t.span = Span::new(t.span.start + offset, t.span.end + offset);
     }
+    // Inside an actor's method `"{self.n}"` reads the state, as `self.n` does
+    // outside the quotes.
+    if let Some(fields) = actor_fields {
+        state_reads(&mut tokens, 0, usize::MAX, fields);
+    }
     let mut p = Parser::new(tokens);
     p.depth = depth;
+    p.actor_fields = actor_fields.map(<[String]>::to_vec);
     p.skip_newlines();
     let expr = p.parse_expr().ok();
     // Everything between the braces has to be one expression. Parsing a
@@ -184,6 +231,9 @@ struct Parser {
     diags: Vec<Diagnostic>,
     /// When true, `Ident {` is NOT a struct literal (condition positions).
     no_struct_lit: bool,
+    /// The state fields of the actor whose method is being parsed, so an
+    /// interpolation inside it reads `self.f` as the state too ([E-ACTOR]).
+    actor_fields: Option<Vec<String>>,
     depth: u32,
     /// Token positions already found not to start a map literal.
     ///
@@ -232,6 +282,7 @@ impl Parser {
             modes: vec![NlMode::Keep],
             diags: Vec::new(),
             no_struct_lit: false,
+            actor_fields: None,
             depth: 0,
             not_a_map: std::collections::HashSet::new(),
             map_committed: false,
@@ -553,6 +604,12 @@ impl Parser {
         }
         let linear_type = matches!(self.cur(), TokenKind::Ident(n) if n == "linear")
             && matches!(self.toks.get(self.i + 1).map(|t| &t.kind), Some(TokenKind::KwType));
+        // `actor Counter { ... }`: `actor` is a word only here.
+        let actor = matches!(self.cur(), TokenKind::Ident(n) if n == "actor")
+            && matches!(self.toks.get(self.i + 1).map(|t| &t.kind), Some(TokenKind::Ident(_)));
+        if actor {
+            return Ok(Decl::Type(self.parse_actor(is_pub)?));
+        }
         match self.cur() {
             TokenKind::KwFn => Ok(Decl::Fn(self.parse_fn(is_pub)?)),
             // `extern fn abs(n: i64) -> i64` — a C function.
@@ -1015,6 +1072,229 @@ impl Parser {
         })
     }
 
+    /// `actor Name(params) { var f: T = e ... fn m(inout self, ...) { ... } }`
+    /// ([E-ACTOR]). Lowered here, as an `impl` is:
+    ///
+    /// - `type Name@state = { f: T, ... }`, the state;
+    /// - `type Name = { §state: ref Name@state }`, the handle -- what the
+    ///   program holds and tasks may share; the field cannot be spelt, so the
+    ///   state is reached only through the methods;
+    /// - `fn Name(params) -> Name`, which makes one;
+    /// - each method as `m@Name(self: Name, ...)`, with `self.f` read as
+    ///   `self.§state.f`, and an `impl` of the unspellable interface `§actor`
+    ///   that lets the checker resolve `a.m(...)` to it.
+    fn parse_actor(&mut self, is_pub: bool) -> PResult<TypeDecl> {
+        let start = self.cur_span();
+        self.bump(); // `actor`
+        let name = self.ident()?;
+        let params = if self.at(&TokenKind::LParen) {
+            self.parse_params()?
+        } else {
+            Vec::new()
+        };
+        self.expect(&TokenKind::LBrace)?;
+        let at = |n: &Ident| TypeExpr::Name {
+            path: Path {
+                segments: vec![n.clone()],
+                span: n.span,
+            },
+            args: Vec::new(),
+            span: n.span,
+        };
+        let handle_ty = at(&name);
+        let state = Ident {
+            name: format!("{}@state", name.name),
+            span: name.span,
+        };
+        let mut fields: Vec<(FieldDef, Expr)> = Vec::new();
+        let mut methods: Vec<(Ident, String)> = Vec::new();
+        loop {
+            self.skip_newlines();
+            if self.at(&TokenKind::RBrace) {
+                break;
+            }
+            if self.at(&TokenKind::KwVar) {
+                let vstart = self.cur_span();
+                self.bump();
+                if !methods.is_empty() {
+                    self.diags.push(Diagnostic::error(
+                        vstart,
+                        "an actor's state is declared before its methods ([E-ACTOR])",
+                    ));
+                    return Err(());
+                }
+                let fname = self.ident()?;
+                self.expect(&TokenKind::Colon)?;
+                let ty = self.parse_type()?;
+                self.expect(&TokenKind::Eq)?;
+                let init = self.parse_expr()?;
+                let span = vstart.merge(init.span());
+                fields.push((
+                    FieldDef {
+                        name: fname,
+                        ty,
+                        span,
+                    },
+                    init,
+                ));
+                continue;
+            }
+            if self.at(&TokenKind::KwFn) {
+                let names: Vec<String> = fields.iter().map(|(f, _)| f.name.name.clone()).collect();
+                self.actor_state_reads(&names);
+                self.actor_fields = Some(names);
+                let parsed = self.parse_fn_with_self(true, Some(&handle_ty));
+                self.actor_fields = None;
+                let mut f = parsed?;
+                if f.params.first().map(|p| p.name.name.as_str()) != Some("self") {
+                    self.diags.push(Diagnostic::error(
+                        f.name.span,
+                        "an actor method takes `self` or `inout self` first ([E-ACTOR])",
+                    ));
+                    return Err(());
+                }
+                // The handle is shared, not moved; `inout` says the method
+                // changes the state it reaches, which is behind the handle.
+                f.params[0].mode = ParamMode::Let;
+                for p in &mut f.params {
+                    p.ty = replace_self(&p.ty, &handle_ty);
+                }
+                f.ret = f.ret.as_ref().map(|t| replace_self(t, &handle_ty));
+                f.err = f.err.as_ref().map(|t| replace_self(t, &handle_ty));
+                let lowered = impl_fn_name(&f.name.name, &name.name);
+                methods.push((f.name.clone(), lowered.clone()));
+                f.name = Ident {
+                    name: lowered,
+                    span: f.name.span,
+                };
+                f.is_pub = true;
+                self.lowered.push(Decl::Fn(f));
+                continue;
+            }
+            let found = self.cur().describe();
+            self.error_here(format!(
+                "expected `var` or `fn` in an actor ([E-ACTOR]), but found {found}"
+            ));
+            return Err(());
+        }
+        let rb = self.expect(&TokenKind::RBrace)?;
+        let span = start.merge(rb.span);
+        // Synthetic nodes need spans no real node has: zero-width ones at the
+        // start of the declaration, one each -- it is at least `actor X {}`.
+        let fresh = |k: usize| {
+            let at = span.start + k as u32;
+            Span::new(at, at)
+        };
+        let path_of = |n: &Ident, sp: Span| Path {
+            segments: vec![Ident {
+                name: n.name.clone(),
+                span: sp,
+            }],
+            span: sp,
+        };
+        let state_lit = Expr::StructLit {
+            name: path_of(&state, fresh(0)),
+            base: None,
+            fields: fields.iter().map(|(f, e)| (f.name.clone(), e.clone())).collect(),
+            span: fresh(1),
+        };
+        let cell = Expr::Call {
+            callee: Box::new(Expr::Ident(Ident {
+                name: "ref".to_string(),
+                span: fresh(2),
+            })),
+            args: vec![state_lit],
+            span: fresh(3),
+        };
+        let slot = Ident {
+            name: "\u{a7}state".to_string(),
+            span: fresh(4),
+        };
+        let handle = Expr::StructLit {
+            name: path_of(&name, fresh(5)),
+            base: None,
+            fields: vec![(slot.clone(), cell)],
+            span: fresh(6),
+        };
+        self.lowered.push(Decl::Type(TypeDecl {
+            is_pub,
+            is_linear: false,
+            name: state.clone(),
+            generics: Vec::new(),
+            body: TypeBody::Struct(fields.iter().map(|(f, _)| f.clone()).collect()),
+            span,
+        }));
+        self.lowered.push(Decl::Fn(FnDecl {
+            is_pub,
+            name: name.clone(),
+            generics: Vec::new(),
+            bounds: Vec::new(),
+            params,
+            ret: Some(handle_ty.clone()),
+            err: None,
+            effects: None,
+            body: Block {
+                stmts: vec![Stmt::Expr(handle)],
+                span: fresh(7),
+            },
+            span,
+        }));
+        self.lowered.push(Decl::Impl(ImplDecl {
+            iface: Path {
+                segments: vec![Ident {
+                    name: "\u{a7}actor".to_string(),
+                    span: name.span,
+                }],
+                span: name.span,
+            },
+            ty: handle_ty,
+            type_name: name.name.clone(),
+            methods,
+            span,
+        }));
+        Ok(TypeDecl {
+            is_pub,
+            is_linear: false,
+            name,
+            generics: Vec::new(),
+            body: TypeBody::Struct(vec![FieldDef {
+                name: slot,
+                ty: TypeExpr::Ref(Box::new(at(&state)), state.span),
+                span,
+            }]),
+            span,
+        })
+    }
+
+    /// Rewrites `self.f`, for each state field `f`, as `self.§state.f` in the
+    /// tokens of the method about to be parsed: the method's `self` is the
+    /// handle, and its state is behind the handle's one field. The tokens put
+    /// in take the span of the `.` they follow, so the expression `self.§state`
+    /// has a span no expression written in the source has.
+    fn actor_state_reads(&mut self, fields: &[String]) {
+        // From here to the end of the method's body: the first `{` opens it.
+        let mut depth = 0i32;
+        let mut seen_body = false;
+        let mut end = self.toks.len();
+        for (j, t) in self.toks.iter().enumerate().skip(self.i) {
+            match t.kind {
+                TokenKind::LBrace => {
+                    depth += 1;
+                    seen_body = true;
+                }
+                TokenKind::RBrace => {
+                    depth -= 1;
+                    if seen_body && depth == 0 {
+                        end = j;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        state_reads(&mut self.toks, self.i, end, fields);
+    }
+
     fn parse_params(&mut self) -> PResult<Vec<Param>> {
         self.parse_params_self(None)
     }
@@ -1029,6 +1309,13 @@ impl Parser {
                 break;
             }
             let start = self.cur_span();
+            // `inout self`: an actor method that changes its actor's state.
+            let inout_self = self_ty.is_some()
+                && matches!(self.cur(), TokenKind::KwInout)
+                && matches!(self.toks.get(self.i + 1).map(|t| &t.kind), Some(TokenKind::Ident(n)) if n == "self");
+            if inout_self {
+                self.bump();
+            }
             if matches!(self.cur(), TokenKind::Ident(n) if n == "self")
                 && !matches!(self.toks.get(self.i + 1).map(|t| &t.kind), Some(TokenKind::Colon))
             {
@@ -1044,7 +1331,7 @@ impl Parser {
                 }
                 let name = self.ident()?;
                 params.push(Param {
-                    mode: ParamMode::Let,
+                    mode: if inout_self { ParamMode::Inout } else { ParamMode::Let },
                     name,
                     ty: st.clone(),
                     span: start,
@@ -2246,7 +2533,12 @@ impl Parser {
                     match part {
                         StrPart::Text(t) => pieces.push(StrPiece::Text(t)),
                         StrPart::Interp { src, offset } => {
-                            let (expr, mut diags) = parse_expr_src_at(&src, offset, self.depth + 1);
+                            let (expr, mut diags) = parse_expr_src_at(
+                                &src,
+                                offset,
+                                self.depth + 1,
+                                self.actor_fields.as_deref(),
+                            );
                             self.diags.append(&mut diags);
                             match expr {
                                 Some(e) => pieces.push(StrPiece::Expr(e)),
