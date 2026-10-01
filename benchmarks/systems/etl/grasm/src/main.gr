@@ -37,6 +37,18 @@ let BATCH = 1000
 let MODULUS = 1000000007
 let CHUNK = 1048576
 
+// The members each object is read for, as the key bytes `json.next_member`
+// compares in place: made once, so no key is ever made into a string.
+type Keys = { address: [bytes], user: [bytes], order: [bytes], customer: [bytes] }
+
+fn keys_of(names: [str]) -> [bytes] {
+    var out: [bytes] = []
+    for n in names {
+        out.push(n.to_bytes())
+    }
+    out
+}
+
 // --- decoding: the text straight into typed values -------------------------
 //
 // Each line is read with the `json` package's cursor rather than parsed into a
@@ -53,7 +65,7 @@ fn missing(r: JsonReader, key: str) -> JsonError {
     JsonError{ why: "missing `{key}`", at: r.i }
 }
 
-fn decode_address(inout r: JsonReader) -> Address ! JsonError {
+fn decode_address(inout r: JsonReader, keys: Keys) -> Address ! JsonError {
     var city = ""
     var zip = ""
     var has_city = false
@@ -61,18 +73,18 @@ fn decode_address(inout r: JsonReader) -> Address ! JsonError {
     try json.open_object(r)
     var going = true
     while going {
-        match try json.next_key(r) {
-            None -> going = false
-            Some(k) -> {
-                if k == "city" and not has_city {
-                    city = try json.read_str(r)
-                    has_city = true
-                } else if k == "zip" and not has_zip {
-                    zip = try json.read_str(r)
-                    has_zip = true
-                } else {
-                    try json.skip(r)
-                }
+        let k = try json.next_member(r, keys.address)
+        if k < 0 {
+            going = false
+        } else {
+            if k == 0 and not has_city {
+                city = try json.read_str(r)
+                has_city = true
+            } else if k == 1 and not has_zip {
+                zip = try json.read_str(r)
+                has_zip = true
+            } else {
+                try json.skip(r)
             }
         }
     }
@@ -85,7 +97,7 @@ fn decode_address(inout r: JsonReader) -> Address ! JsonError {
     Address{ city: city, zip: zip }
 }
 
-fn decode_user(inout r: JsonReader) -> User ! JsonError {
+fn decode_user(inout r: JsonReader, keys: Keys) -> User ! JsonError {
     var name = ""
     var email = ""
     var tags: [str] = []
@@ -97,27 +109,27 @@ fn decode_user(inout r: JsonReader) -> User ! JsonError {
     try json.open_object(r)
     var going = true
     while going {
-        match try json.next_key(r) {
-            None -> going = false
-            Some(k) -> {
-                if k == "name" and not has_name {
-                    name = try json.read_str(r)
-                    has_name = true
-                } else if k == "email" and not has_email {
-                    email = try json.read_str(r)
-                    has_email = true
-                } else if k == "tags" and not has_tags {
-                    try json.open_list(r)
-                    while try json.next_item(r) {
-                        tags.push(try json.read_str(r))
-                    }
-                    has_tags = true
-                } else if k == "address" and not has_address {
-                    address = try decode_address(r)
-                    has_address = true
-                } else {
-                    try json.skip(r)
+        let k = try json.next_member(r, keys.user)
+        if k < 0 {
+            going = false
+        } else {
+            if k == 0 and not has_name {
+                name = try json.read_str(r)
+                has_name = true
+            } else if k == 1 and not has_email {
+                email = try json.read_str(r)
+                has_email = true
+            } else if k == 2 and not has_tags {
+                try json.open_list(r)
+                while try json.next_item(r) {
+                    tags.push(try json.read_str(r))
                 }
+                has_tags = true
+            } else if k == 3 and not has_address {
+                address = try decode_address(r, keys)
+                has_address = true
+            } else {
+                try json.skip(r)
             }
         }
     }
@@ -136,7 +148,7 @@ fn decode_user(inout r: JsonReader) -> User ! JsonError {
     User{ name: name, email: email, tags: tags, address: address }
 }
 
-fn decode_order(inout r: JsonReader) -> Order ! JsonError {
+fn decode_order(inout r: JsonReader, keys: Keys) -> Order ! JsonError {
     var sku = ""
     var qty = 0
     var price = 0
@@ -146,21 +158,21 @@ fn decode_order(inout r: JsonReader) -> Order ! JsonError {
     try json.open_object(r)
     var going = true
     while going {
-        match try json.next_key(r) {
-            None -> going = false
-            Some(k) -> {
-                if k == "sku" and not has_sku {
-                    sku = try json.read_str(r)
-                    has_sku = true
-                } else if k == "qty" and not has_qty {
-                    qty = try json.read_int(r)
-                    has_qty = true
-                } else if k == "price" and not has_price {
-                    price = try json.read_int(r)
-                    has_price = true
-                } else {
-                    try json.skip(r)
-                }
+        let k = try json.next_member(r, keys.order)
+        if k < 0 {
+            going = false
+        } else {
+            if k == 0 and not has_sku {
+                sku = try json.read_str(r)
+                has_sku = true
+            } else if k == 1 and not has_qty {
+                qty = try json.read_int(r)
+                has_qty = true
+            } else if k == 2 and not has_price {
+                price = try json.read_int(r)
+                has_price = true
+            } else {
+                try json.skip(r)
             }
         }
     }
@@ -176,7 +188,7 @@ fn decode_order(inout r: JsonReader) -> Order ! JsonError {
     Order{ sku: sku, qty: qty, price: price }
 }
 
-fn decode_customer(inout r: JsonReader) -> Customer ! JsonError {
+fn decode_customer(inout r: JsonReader, keys: Keys) -> Customer ! JsonError {
     var id = 0
     var user = User{ name: "", email: "", tags: [], address: Address{ city: "", zip: "" } }
     var orders: [Order] = []
@@ -188,27 +200,27 @@ fn decode_customer(inout r: JsonReader) -> Customer ! JsonError {
     try json.open_object(r)
     var going = true
     while going {
-        match try json.next_key(r) {
-            None -> going = false
-            Some(k) -> {
-                if k == "id" and not has_id {
-                    id = try json.read_int(r)
-                    has_id = true
-                } else if k == "user" and not has_user {
-                    user = try decode_user(r)
-                    has_user = true
-                } else if k == "orders" and not has_orders {
-                    try json.open_list(r)
-                    while try json.next_item(r) {
-                        orders.push(try decode_order(r))
-                    }
-                    has_orders = true
-                } else if k == "note" and not has_note {
-                    note = try json.read_str(r)
-                    has_note = true
-                } else {
-                    try json.skip(r)
+        let k = try json.next_member(r, keys.customer)
+        if k < 0 {
+            going = false
+        } else {
+            if k == 0 and not has_id {
+                id = try json.read_int(r)
+                has_id = true
+            } else if k == 1 and not has_user {
+                user = try decode_user(r, keys)
+                has_user = true
+            } else if k == 2 and not has_orders {
+                try json.open_list(r)
+                while try json.next_item(r) {
+                    orders.push(try decode_order(r, keys))
                 }
+                has_orders = true
+            } else if k == 3 and not has_note {
+                note = try json.read_str(r)
+                has_note = true
+            } else {
+                try json.skip(r)
             }
         }
     }
@@ -228,9 +240,9 @@ fn decode_customer(inout r: JsonReader) -> Customer ! JsonError {
 }
 
 /// One line, which must be one record and nothing after it.
-fn decode(line: str) -> Customer ! JsonError {
-    var r = json.reader(line)
-    let c = try decode_customer(r)
+fn decode(line: bytes, keys: Keys) -> Customer ! JsonError {
+    var r = json.reader_of(line)
+    let c = try decode_customer(r, keys)
     try json.finish(r)
     c
 }
@@ -302,6 +314,12 @@ fn main() {
         }
     }
 
+    let keys = Keys{
+        address: keys_of(["city", "zip"]),
+        user: keys_of(["name", "email", "tags", "address"]),
+        order: keys_of(["sku", "qty", "price"]),
+        customer: keys_of(["id", "user", "orders", "note"]),
+    }
     var db = Db{ cities: map(), rows: 0, total_cents: 0, checksum: 0 }
     var batch: [Row] = []
     var rejected = 0
@@ -324,12 +342,23 @@ fn main() {
             }
             end = b.len() - 1
         }
-        let text = b.slice(0, end + 1).to_str()
-        for line in text.lines() {
-            if line.is_empty() {
+        // Lines are cut straight out of the bytes: the reader works on bytes,
+        // and text is decoded only where a string value is read. Through a
+        // `str`, every line was checked as UTF-8 and copied twice. As
+        // `lines()` does, a line's trailing `\r` is not part of it.
+        var start = 0
+        while start <= end {
+            let stop = b.index_of(10, start) ?? (end + 1)
+            var cut = stop
+            if cut > start and b.at(cut - 1) == 13 {
+                cut = cut - 1
+            }
+            let line_start = start
+            start = stop + 1
+            if cut == line_start {
                 continue
             }
-            match decode(line) {
+            match decode(b.slice(line_start, cut), keys) {
                 Ok(c) -> {
                     if validate(c) {
                         batch.push(transform(c))

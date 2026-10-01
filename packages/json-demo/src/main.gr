@@ -108,6 +108,32 @@ fn skipped(label: str, src: str) {
     }
 }
 
+// Members matched by their key bytes, never made into strings.
+fn member_order(src: str, keys: [bytes]) -> [i64] ! JsonError {
+    var r = json.reader(src)
+    var seen: [i64] = []
+    try json.open_object(r)
+    var going = true
+    while going {
+        let k = try json.next_member(r, keys)
+        if k < 0 {
+            going = false
+        } else {
+            seen.push(k)
+            try json.skip(r)
+        }
+    }
+    try json.finish(r)
+    seen
+}
+
+fn members(label: str, src: str) {
+    match member_order(src, ["a".to_bytes(), "bb".to_bytes()]) {
+        Ok(seen) -> print("  {label} -> {seen}")
+        Err(e) -> print("  {label} -> refused -- {e.why} at {e.at}")
+    }
+}
+
 fn main() {
     print("-- parsing")
     parsed("null", "null")
@@ -243,4 +269,10 @@ fn main() {
     skipped("an unclosed object", "\{\"a\": 1")
     skipped("a bad number", "[1.2.3]")
     skipped("two values", "1 2")
+
+    print("-- members by key bytes")
+    members("known and unknown", "\{\"bb\": 1, \"zz\": [2], \"a\": null}")
+    members("an escaped key", "\{\"\\u0061\": 1}")
+    members("empty", "\{}")
+    members("a missing colon", "\{\"a\" 1}")
 }

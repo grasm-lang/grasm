@@ -872,6 +872,71 @@ fn member(inout p: JsonReader, keep: bool) -> Option[str] ! JsonError {
     Some(k)
 }
 
+/// Whether the bytes of `k` are at `at` in `b`.
+fn bytes_at_are(b: bytes, at: i64, k: bytes) -> bool {
+    for i in 0..k.len() {
+        if b.at(at + i) != k.at(i) {
+            return false
+        }
+    }
+    true
+}
+
+/// The next member's key as its position in `keys` -- each one the key's
+/// UTF-8 bytes, made once by the caller -- with the cursor left at the value:
+/// `keys.len()` for a key that is not among them, and -1 once the object has
+/// ended, with the cursor past its `\}`.
+///
+/// `next_key` without the key: a decoder that knows the members it wants
+/// compares bytes where the key already is, instead of making a string for
+/// every member of every object to compare it with `==`.
+pub fn next_member(inout p: JsonReader, keys: [bytes]) -> i64 ! JsonError {
+    skip_ws(p)
+    let first = before(p) == 123
+    if peek(p) == 125 {
+        p.i = p.i + 1
+        return -1
+    }
+    if not first {
+        if peek(p) != 44 {
+            fail(JsonError{ why: "expected `,` or `\}` but found {shown(peek(p))}", at: p.i })
+        }
+        p.i = p.i + 1
+        skip_ws(p)
+    }
+    if peek(p) != 34 {
+        fail(JsonError{ why: "expected `\"` but found {shown(peek(p))}", at: p.i })
+    }
+    var which = keys.len()
+    let start = p.i + 1
+    let end = plain_end(p.b, start)
+    if end < p.b.len() and p.b.at(end) == 34 {
+        let n = end - start
+        for ki in 0..keys.len() {
+            if keys[ki].len() == n and bytes_at_are(p.b, start, keys[ki]) {
+                which = ki
+                break
+            }
+        }
+        p.i = end + 1
+    } else {
+        // A key with an escape in it is decoded and compared as text.
+        let text = (try scan_string(p, true)).to_bytes()
+        for ki in 0..keys.len() {
+            if keys[ki].len() == text.len() and bytes_at_are(text, 0, keys[ki]) {
+                which = ki
+                break
+            }
+        }
+    }
+    skip_ws(p)
+    if peek(p) != 58 {
+        fail(JsonError{ why: "expected `:` but found {shown(peek(p))}", at: p.i })
+    }
+    p.i = p.i + 1
+    which
+}
+
 /// The key of the object's next member, with the cursor left at its value --
 /// which the caller reads next, or `skip`s. `None` once the object has ended,
 /// with the cursor past its `\}`.
