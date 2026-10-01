@@ -4107,6 +4107,9 @@ pub unsafe extern "C" fn grasm_list_len(v: *mut RtVal) -> i64 {
     match &(*v).payload {
         RtPayload::List(items) | RtPayload::Tuple(items) => items.len() as i64,
         RtPayload::ListScalar { data, .. } => data.len() as i64,
+        // A list of value structs reaches here from every path that asks a
+        // list its length without knowing its element type was made a value.
+        RtPayload::ListVals { ty, words } => (words.len() / ty.kinds.len().max(1)) as i64,
         _ => grasm_panic_msg_str("len on non-list"),
     }
 }
@@ -7360,6 +7363,51 @@ unsafe fn grasm_tcp_listen_now(port: *mut RtVal) -> *mut RtVal {
     }
 }
 
+/// Listens on `host:port`, answering with a handle.
+///
+/// `tcp_listen` binds the loopback address only, which is the right default
+/// for a program being tried out — it opens nothing to the network — and the
+/// wrong one for a server other machines must reach. This is the same listen
+/// with the address named: `"0.0.0.0"` for every interface, or one address
+/// for one of them.
+///
+/// # Safety: called from compiled Grasm with boxed values.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_tcp_listen_on(host: *mut RtVal, port: *mut RtVal) -> *mut RtVal {
+    journaled("tcp_listen_on", || grasm_tcp_listen_on_now(host, port))
+}
+
+unsafe fn grasm_tcp_listen_on_now(host: *mut RtVal, port: *mut RtVal) -> *mut RtVal {
+    let host = match &(*host).payload {
+        RtPayload::Str(s) => s.to_string(),
+        _ => return err_of(io_err("IoFailed", "host must be text".to_string())),
+    };
+    let port = match &(*port).payload {
+        RtPayload::I64(n) => *n,
+        _ => return err_of(io_err("IoFailed", "port must be an integer".to_string())),
+    };
+    if !(0..=65535).contains(&port) {
+        return err_of(io_err("IoFailed", format!("port {port} is out of range")));
+    }
+    match std::net::TcpListener::bind((host.as_str(), port as u16)) {
+        Ok(l) => ok_of(alloc(RtPayload::I64(socket_put(Socket::Listener(l))))),
+        Err(e) => err_of(io_err("IoFailed", e.to_string())),
+    }
+}
+
+/// Turns Nagle's algorithm off on a new connection.
+///
+/// Nagle holds a small write back until the previous one is acknowledged, and
+/// the peer delays that acknowledgement hoping to piggyback it on a reply — so
+/// a request/response exchange stalls for tens of milliseconds every round.
+/// Programs here write whole messages, so the coalescing buys nothing, and Go
+/// turns it off by default for the same reason. A failure to turn it off
+/// leaves a working, slower socket, which is no reason to fail the connection.
+fn without_nagle(stream: std::net::TcpStream) -> std::net::TcpStream {
+    let _ = stream.set_nodelay(true);
+    stream
+}
+
 /// Opens a connection to `host:port`, answering with a handle for it.
 ///
 /// The other half of [L-LIB-NET]. Without it a Grasm program could be a server
@@ -7391,7 +7439,9 @@ unsafe fn grasm_tcp_connect_now(host: *mut RtVal, port: *mut RtVal) -> *mut RtVa
         return err_of(io_err("IoFailed", format!("port {port} is out of range")));
     }
     match std::net::TcpStream::connect((host.as_str(), port as u16)) {
-        Ok(stream) => ok_of(alloc(RtPayload::I64(socket_put(Socket::Stream(stream))))),
+        Ok(stream) => ok_of(alloc(RtPayload::I64(socket_put(Socket::Stream(
+            without_nagle(stream),
+        ))))),
         Err(e) => err_of(io_err("IoFailed", e.to_string())),
     }
 }
@@ -7412,7 +7462,7 @@ unsafe fn grasm_tcp_accept_now(handle: *mut RtVal) -> *mut RtVal {
     let accepted = socket_with(h, |s| match s {
         Socket::Listener(l) => l
             .accept()
-            .map(|(stream, _)| stream)
+            .map(|(stream, _)| without_nagle(stream))
             .map_err(|e| e.to_string()),
         Socket::Stream(_) => Err(format!("socket {h} is a connection, not a listener")),
         Socket::Datagram(_) => Err(format!("socket {h} is a datagram socket, not a listener")),
@@ -8060,6 +8110,47 @@ unsafe fn grasm_udp_recv_from_now(handle: *mut RtVal) -> *mut RtVal {
     }
 }
 
+/// The address and port at the other end of a connection.
+///
+/// A server that logs, rate-limits or answers differently by origin needs it,
+/// and only a connected stream has one: a listener has no peer, and a datagram
+/// socket has a different one for every message, which is what
+/// `udp_recv_from` reports. The pair is a tuple for the same reason that one's
+/// triple is.
+///
+/// # Safety: called from compiled Grasm with a boxed value.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_tcp_peer(handle: *mut RtVal) -> *mut RtVal {
+    journaled("tcp_peer", || grasm_tcp_peer_now(handle))
+}
+
+unsafe fn grasm_tcp_peer_now(handle: *mut RtVal) -> *mut RtVal {
+    let h = match &(*handle).payload {
+        RtPayload::I64(n) => *n,
+        _ => return err_of(io_err("IoFailed", "handle must be an integer".to_string())),
+    };
+    let got = socket_with(h, |s| match s {
+        Socket::Stream(st) => st
+            .peer_addr()
+            .map(|a| (a.ip().to_string(), i64::from(a.port())))
+            .map_err(|e| e.to_string()),
+        Socket::Listener(_) => Err(format!("socket {h} is a listener, not a connection")),
+        Socket::Datagram(_) => Err(format!(
+            "socket {h} is a datagram socket — use udp_recv_from, which names each sender"
+        )),
+    });
+    match got {
+        Ok((host, port)) => {
+            let fields = vec![
+                alloc(RtPayload::Str(RtStr::of(&host))),
+                alloc(RtPayload::I64(port)),
+            ];
+            ok_of(alloc(RtPayload::Tuple(fields.into())))
+        }
+        Err(e) => err_of(io_err("IoFailed", e)),
+    }
+}
+
 /// Closes a listener or a connection. Closing one twice is not an error, for
 /// the same reason releasing a `ref` twice is not: cleanup order is not
 /// something a caller should have to track.
@@ -8135,10 +8226,13 @@ pub unsafe extern "C" fn grasm_file_exists(path: *mut RtVal) -> i8 {
 // ---------------------------------------------------------------------------
 // bytes ([L-LIB-BYTES])
 
-unsafe fn as_bytes(v: *mut RtVal) -> std::sync::Arc<Vec<u8>> {
+/// The bytes a box holds, borrowed for as long as the caller keeps the box.
+/// It used to hand back a clone of the `Arc` -- two atomic operations on
+/// every `b.len()` and every `b.at(i)`, which is per byte in a parser.
+unsafe fn as_bytes<'a>(v: *mut RtVal) -> &'a [u8] {
     match &(*v).payload {
-        RtPayload::Bytes(b) => b.clone(),
-        _ => std::sync::Arc::new(Vec::new()),
+        RtPayload::Bytes(b) => b.as_slice(),
+        _ => &[],
     }
 }
 
@@ -8210,8 +8304,8 @@ pub unsafe extern "C" fn grasm_bytes_slice(v: *mut RtVal, from: i64, end: i64) -
 /// # Safety: boxed values.
 #[no_mangle]
 pub unsafe extern "C" fn grasm_bytes_concat(a: *mut RtVal, b: *mut RtVal) -> *mut RtVal {
-    let mut out = as_bytes(a).as_ref().clone();
-    out.extend_from_slice(&as_bytes(b));
+    let mut out = as_bytes(a).to_vec();
+    out.extend_from_slice(as_bytes(b));
     alloc(RtPayload::Bytes(std::sync::Arc::new(out)))
 }
 
@@ -8230,7 +8324,7 @@ pub unsafe extern "C" fn grasm_bytes_to_list(v: *mut RtVal) -> *mut RtVal {
 /// # Safety: boxed values.
 #[no_mangle]
 pub unsafe extern "C" fn grasm_bytes_to_str(v: *mut RtVal) -> *mut RtVal {
-    let text = String::from_utf8_lossy(&as_bytes(v)).into_owned();
+    let text = String::from_utf8_lossy(as_bytes(v)).into_owned();
     alloc(RtPayload::Str(RtStr::new(text)))
 }
 
@@ -8357,7 +8451,7 @@ unsafe fn grasm_append_bytes_now(path: *mut RtVal, data: *mut RtVal) -> *mut RtV
         .create(true)
         .append(true)
         .open(&p)
-        .and_then(|mut f| f.write_all(as_bytes(data).as_slice()));
+        .and_then(|mut f| f.write_all(as_bytes(data)));
     match done {
         Ok(()) => ok_of(alloc(RtPayload::Unit)),
         Err(e) => err_of(io_err("IoFailed", e.to_string())),
@@ -8419,7 +8513,7 @@ pub unsafe extern "C" fn grasm_write_bytes(path: *mut RtVal, data: *mut RtVal) -
 
 unsafe fn grasm_write_bytes_now(path: *mut RtVal, data: *mut RtVal) -> *mut RtVal {
     let p = as_str(path).to_string();
-    match std::fs::write(&p, as_bytes(data).as_slice()) {
+    match std::fs::write(&p, as_bytes(data)) {
         // `Unit`, not `I64(0)`. The two are indistinguishable to a compiled
         // build — the static type is `()` and the backend prints it from the
         // type rather than the value — but they are not indistinguishable once
@@ -8564,15 +8658,41 @@ pub extern "C" fn grasm_now_millis() -> i64 {
 /// only thing a duration can be built on.
 #[no_mangle]
 pub extern "C" fn grasm_monotonic_millis() -> i64 {
-    use std::sync::OnceLock;
-    static START: OnceLock<std::time::Instant> = OnceLock::new();
     if let Some(replay::Wire::Int(v)) = replay::gate("monotonic_millis") {
         return v;
     }
-    let start = START.get_or_init(std::time::Instant::now);
-    let now = start.elapsed().as_millis() as i64;
+    let now = monotonic_start().elapsed().as_millis() as i64;
     if replay::recording() {
         replay::put("monotonic_millis", &replay::Wire::Int(now));
+    }
+    now
+}
+
+/// The moment both monotonic clocks count from, captured on first use, so that
+/// `monotonic_millis` and `monotonic_nanos` agree on how much time has passed
+/// and differ only in how finely they say it.
+fn monotonic_start() -> std::time::Instant {
+    use std::sync::OnceLock;
+    static START: OnceLock<std::time::Instant> = OnceLock::new();
+    *START.get_or_init(std::time::Instant::now)
+}
+
+/// Nanoseconds since the same unnamed moment `monotonic_millis` counts from.
+///
+/// A request served in forty microseconds is zero milliseconds, and a program
+/// timing its own hot path cannot average zeros. The nanosecond is what the
+/// operating system's clock reports anyway; whether the last digits mean
+/// anything is the hardware's business, and the reading still only increases.
+#[no_mangle]
+pub extern "C" fn grasm_monotonic_nanos() -> i64 {
+    if let Some(replay::Wire::Int(v)) = replay::gate("monotonic_nanos") {
+        return v;
+    }
+    // An `i64` of nanoseconds lasts about 292 years, so the conversion only
+    // saturates for a process that has outlived everyone who started it.
+    let now = i64::try_from(monotonic_start().elapsed().as_nanos()).unwrap_or(i64::MAX);
+    if replay::recording() {
+        replay::put("monotonic_nanos", &replay::Wire::Int(now));
     }
     now
 }

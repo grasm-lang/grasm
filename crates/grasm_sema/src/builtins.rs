@@ -221,6 +221,11 @@ pub const BUILTINS: &[Builtin] = &[
         journal: Journal::Recorded,
     },
     Builtin {
+        name: "monotonic_nanos",
+        row: IO_ROW,
+        journal: Journal::Recorded,
+    },
+    Builtin {
         name: "sleep_millis",
         row: IO_ROW,
         journal: Journal::Recorded,
@@ -237,6 +242,11 @@ pub const BUILTINS: &[Builtin] = &[
     // --- the network ---
     Builtin {
         name: "tcp_listen",
+        row: NET_ROW,
+        journal: Journal::Recorded,
+    },
+    Builtin {
+        name: "tcp_listen_on",
         row: NET_ROW,
         journal: Journal::Recorded,
     },
@@ -282,6 +292,11 @@ pub const BUILTINS: &[Builtin] = &[
     },
     Builtin {
         name: "net_port",
+        row: NET_ROW,
+        journal: Journal::Recorded,
+    },
+    Builtin {
+        name: "tcp_peer",
         row: NET_ROW,
         journal: Journal::Recorded,
     },

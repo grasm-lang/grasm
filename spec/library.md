@@ -24,6 +24,7 @@ came to be documented as returning `Option[str]` when it is fallible.
 | `map()` | `() -> Map[K, V]` | a new empty map |
 | `now_millis()` | `() -> i64` | milliseconds since the epoch; `io` |
 | `monotonic_millis()` | `() -> i64` | since an unnamed moment; only increases |
+| `monotonic_nanos()` | `() -> i64` | the same clock in nanoseconds (scaled from milliseconds on wasm); `io` |
 | `sleep_millis(n)` | `(i64) -> ()` | waits; a replay does not; both `io` |
 | `random_bytes(n)` | `(i64) -> bytes ! IoError` | `n` bytes from the operating system; `io` |
 | `env(name)` | `(str) -> Option[str]` | environment variable; `io` |
@@ -35,7 +36,7 @@ came to be documented as returning `Option[str]` when it is fallible.
 **[L-LIB-CLOCK]** `now_millis` is the *wall* clock and **moves backwards** — a
 correction, a leap second, a resumed machine — so a duration measured with it
 goes negative and a timeout fires wrong by that much. `monotonic_millis` only
-increases. `sleep_millis` waits; a replay does not.
+increases, and so does `monotonic_nanos`. `sleep_millis` waits; a replay does not.
 
 **[L-LIB-EXIT]** `exit(code)` ends the program with the **low eight bits** of
 `code`, as an operating system reports it and as C's `exit` does: `exit(-1)` is
@@ -454,11 +455,12 @@ count in [`core.md`](core.md) does not move.
 
 ## Network — the `net` capability
 
-**[L-LIB-NET]** Eight builtins reach the network, and each performs `net`:
+**[L-LIB-NET]** These builtins reach the network, and each performs `net`:
 
 | | type | |
 |---|---|---|
 | `tcp_listen(port)` | `(i64) -> i64 ! IoError` | listens on `127.0.0.1:port`; `0` asks the system to choose |
+| `tcp_listen_on(host, port)` | `(str, i64) -> i64 ! IoError` | listens on `host:port` — `"0.0.0.0"` for every interface |
 | `tcp_connect(host, port)` | `(str, i64) -> i64 ! IoError` | dials `host:port`; a name is resolved |
 | `tcp_accept(h)` | `(i64) -> i64 ! IoError` | waits for a connection, answering with a handle for it |
 | `tcp_read(h)` | `(i64) -> str ! IoError` | what has arrived, as text |
@@ -468,6 +470,7 @@ count in [`core.md`](core.md) does not move.
 | `net_close(h)` | `(i64) -> ()` | closes a listener or a connection |
 | `net_wait(hs, ms)` | `([i64], i64) -> [i64] ! IoError` | the handles that can be read without waiting |
 | `net_port(h)` | `(i64) -> i64 ! IoError` | the local port a handle is bound to |
+| `tcp_peer(h)` | `(i64) -> (str, i64) ! IoError` | the address and port at the other end of a connection ([L-LIB-NET-PEER]) |
 
 `tcp_connect` is the half that makes a program a *client*. Without it a Grasm
 program could listen and accept and never dial — no fetching a URL, no calling
@@ -526,9 +529,8 @@ which is how a caller learns the conversation ended; reporting it as not-ready
 would leave a dead connection in the wait set forever, and the loop would never
 notice it should be dropped.
 
-Readiness needed no new type: the wait set is an ordinary `[i64]` and the
-timeout an ordinary `i64`, which is the same reason the rest of this surface
-looks the way it does.
+**[L-LIB-NET-PEER]** `tcp_peer(h)` is the far end of an accepted or dialed stream;
+any other handle is an `IoFailed`. Those streams have Nagle off (`TCP_NODELAY`).
 
 **[L-LIB-UDP]** Four more reach the network as **datagrams**, each performing
 `net`:

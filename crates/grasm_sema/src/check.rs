@@ -292,6 +292,7 @@ pub const BUILTIN_FREE_FNS: &[&str] = &[
     "print",
     "eprint",
     "tcp_listen",
+    "tcp_listen_on",
     "tcp_connect",
     "tcp_accept",
     "tcp_read",
@@ -301,6 +302,7 @@ pub const BUILTIN_FREE_FNS: &[&str] = &[
     "net_close",
     "net_wait",
     "net_port",
+    "tcp_peer",
     "udp_bind",
     "udp_send",
     "udp_recv",
@@ -325,6 +327,7 @@ pub const BUILTIN_FREE_FNS: &[&str] = &[
     "args",
     "now_millis",
     "monotonic_millis",
+    "monotonic_nanos",
     "sleep_millis",
     "random_bytes",
     "env",
@@ -5639,6 +5642,38 @@ only a number or a `bool` can come out — compute what you need and yield that"
                         };
                         return Type::Fallible(Box::new(Type::I64), Box::new(io_err));
                     }
+                    // Who is at the other end of a connection: the address and
+                    // port as two values with obvious positions, a tuple for
+                    // the same reason `udp_recv_from` returns one.
+                    "tcp_peer" => {
+                        if args.len() != 1 {
+                            return self.error(span, "tcp_peer takes exactly 1 argument");
+                        }
+                        self.check_expr(&args[0], &Type::I64);
+                        let io_err = Type::Named {
+                            id: self.defs.io_error_id,
+                            args: vec![],
+                        };
+                        let pair = Type::Tuple(vec![Type::Str, Type::I64]);
+                        return Type::Fallible(Box::new(pair), Box::new(io_err));
+                    }
+                    // `tcp_listen` with the address named, for a server that
+                    // other machines must reach; `tcp_listen` itself stays on
+                    // the loopback address so that trying a program out does
+                    // not open a port to the network.
+                    "tcp_listen_on" => {
+                        if args.len() != 2 {
+                            return self
+                                .error(span, "tcp_listen_on takes 2 arguments (host, port)");
+                        }
+                        self.check_expr(&args[0], &Type::Str);
+                        self.check_expr(&args[1], &Type::I64);
+                        let io_err = Type::Named {
+                            id: self.defs.io_error_id,
+                            args: vec![],
+                        };
+                        return Type::Fallible(Box::new(Type::I64), Box::new(io_err));
+                    }
                     // The other half of [L-LIB-NET]: without it a program could
                     // be a server and could not be a client.
                     "tcp_connect" => {
@@ -6015,7 +6050,11 @@ only a number or a `bool` can come out — compute what you need and yield that"
                     // correction went. `monotonic_millis` has no relation to
                     // any calendar and only ever increases, which is what a
                     // duration needs.
-                    "now_millis" | "monotonic_millis" => {
+                    //
+                    // `monotonic_nanos` is the same clock read more finely:
+                    // a request that takes forty microseconds is zero
+                    // milliseconds, and a benchmark cannot average zeros.
+                    "now_millis" | "monotonic_millis" | "monotonic_nanos" => {
                         if !args.is_empty() {
                             return self.error(span, format!("{} takes no arguments", id.name));
                         }
@@ -9535,6 +9574,17 @@ fn walk_stmt_exprs(s: &Stmt, f: &mut dyn FnMut(&Expr)) {
         }
         _ => {}
     }
+}
+
+/// Whether `e` names the variable `name` anywhere inside it.
+pub fn expr_mentions(e: &Expr, name: &str) -> bool {
+    let mut found = false;
+    walk_exprs(e, &mut |x| {
+        if let Expr::Ident(id) = x {
+            found |= id.name == name;
+        }
+    });
+    found
 }
 
 fn walk_exprs(e: &Expr, f: &mut dyn FnMut(&Expr)) {

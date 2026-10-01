@@ -1050,6 +1050,8 @@ fn main() {
 //! expect: output
 //! 3 [1, 2]
 //! 2 [2, 2, 9] a! 3.0 true
+//! [1, 3, 3] [1, 3, 3, 4]
+//! [9, 2] [1, 2] [[7], [2]] [[1], [2]]
 fn bump(inout n: i64) {
     n += 1
 }
@@ -1082,6 +1084,17 @@ fn addall(inout xs: [i64]) {
     xs.push(9)
 }
 
+// A later argument may read the variable an `inout` place lives in. The
+// compiled engine moved the place out first -- leaving a hole until the
+// write-back -- and `h.xs[1]` then panicked "index on non-list" where
+// `grasm run` read the list it was given.
+type Holder = { xs: [i64] }
+type Grid = { rows: [[i64]] }
+
+fn put(inout xs: [i64], i: i64, v: i64) {
+    xs[i] = v
+}
+
 fn main() {
     var n = 2
     bump(n)
@@ -1097,6 +1110,23 @@ fn main() {
     flip(o.b)
     addall(o.xs)
     print("{o.i.v} {o.xs} {o.s} {o.f} {o.b}")
+
+    var h = Holder{ xs: [1, 2, 3] }
+    put(h.xs, 1, h.xs[1] + 1)
+    let before = "{h.xs}"
+    h.xs.push(h.xs.len() + 1)
+    print("{before} {h.xs}")
+
+    // A write through a field changes only this holder: a copy taken before
+    // keeps what it had, whether the write moves the list out of an unshared
+    // holder and back or copies it out of a shared one.
+    var a = Holder{ xs: [1, 2] }
+    let kept = a
+    a.xs[0] = 9
+    var g = Grid{ rows: [[1], [2]] }
+    let gkept = g
+    g.rows[0][0] = 7
+    print("{a.xs} {kept.xs} {g.rows} {gkept.rows}")
 }
 ```
 
@@ -2858,6 +2888,14 @@ fn main() {
 //! [5] [5, 7] 1
 //! [3, 4] [3, 4]
 //! [8] [0]
+//! 9.0 7 true | 1.0 3 true
+//! 10.5 14 false | 9.0 7 true
+//! 9.0 7 true | 9.0 100 true
+//! 0.0 1 true
+//! 1.0 1 false
+//! 20.0 3 true
+//! 3.0 3 false
+//! 8 3.0 3 false 3.0 3 false
 type Box = { n: i64 }
 type Bag = { items: [i64] }
 type Two = { a: [i64], b: [i64] }
@@ -2885,6 +2923,61 @@ fn both() -> Two {
 fn pick(c: bool) -> [i64] {
     let v = [8]
     if c { v } else { [0] }
+}
+
+// A struct of scalars may be compiled as its fields, each in a register,
+// rather than as one block of memory. A copy of it is then a snapshot that
+// later writes to the original must not reach, in every direction.
+type Pt = { x: f64, n: i64, ok: bool }
+
+fn bump(p: Pt) -> Pt {
+    var q = p
+    q.x += 1.5
+    q.n *= 2
+    q.ok = not q.ok
+    q
+}
+
+fn show(p: Pt) -> str {
+    "{p.x} {p.n} {p.ok}"
+}
+
+fn snapshots() {
+    var a = Pt{ x: 1.0, n: 3, ok: true }
+    let snap = a
+    a.x = 9.0
+    a.n += 4
+    print("{show(a)} | {show(snap)}")
+    var b = bump(a)
+    print("{show(b)} | {show(a)}")
+    b = a
+    a.n = 100
+    print("{show(b)} | {show(a)}")
+    var ps: [Pt] = []
+    for i in 0..4 {
+        var p = Pt{ x: i.as_f64(), n: i, ok: i % 2 == 0 }
+        if p.ok {
+            p.x = p.x * 10.0
+        } else {
+            p.n -= 1
+        }
+        ps.push(p)
+        p.n = 999
+    }
+    for i in 0..ps.len() {
+        var e = ps[i]
+        e.n += 1
+        ps[i] = e
+        e.n = -5
+    }
+    var total = 0
+    for p in ps {
+        total += p.n
+        print(show(p))
+    }
+    var c = ps[0]
+    c = ps[3]
+    print("{total} {show(c)} {show(ps[3])}")
 }
 
 fn main() {
@@ -2934,5 +3027,7 @@ fn main() {
     print("{two.a} {two.b}")
 
     print("{pick(true)} {pick(false)}")
+
+    snapshots()
 }
 ```

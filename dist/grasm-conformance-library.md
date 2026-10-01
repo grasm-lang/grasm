@@ -1,6 +1,6 @@
 # Grasm — conformance programs: library
 
-The standard library. 56 executable program(s), one per normative clause of
+The standard library. 57 executable program(s), one per normative clause of
 `grasm-language-pack.md`. Each header states the tag it demonstrates and the
 exact expected behaviour, and every one is run by `cargo test -p grasm_spec`, so
 a program here cannot describe behaviour the implementation does not have.
@@ -1064,6 +1064,85 @@ fn main() {
     print("{(3.0).hypot(4.0).to_fixed(2)} {(27.0).cbrt().to_fixed(2)} {(81.0).log(3.0).to_fixed(4)} {(0.5).acos().to_fixed(6)}")
     print("{(180.0).to_radians().to_fixed(6)} {pi().to_degrees().to_fixed(2)} {(1.0).sinh().to_fixed(4)} {(1.0).tanh().to_fixed(4)}")
     print("{shadowed()}")
+}
+```
+
+## `L-LIB-NET-PEER.gr`
+
+```grasm
+//! tag: L-LIB-NET-PEER
+//! expect: output
+//! listening on a named address
+//! the accepted side sees the peer at 127.0.0.1: true
+//! the peer's port is a real port: true
+//! the client side sees the listener's own port: true
+//! a listener has no peer, and that is an Err
+//! a handle that names nothing has no peer either
+//! monotonic_nanos never went backwards: true
+// Who is at the other end of a connection, a listen on a named address, and a
+// clock fine enough to time one request.
+//
+// The port is chosen by the system and the client's port is ephemeral, so the
+// transcript prints what is true of them rather than the numbers themselves.
+fn main() / {io, net} {
+    match tcp_listen_on("127.0.0.1", 0) {
+        Err(e) -> print("could not listen")
+        Ok(listener) -> {
+            print("listening on a named address")
+            let port = net_port(listener) ?? 0
+            match tcp_connect("127.0.0.1", port) {
+                Err(e) -> print("could not dial the listener")
+                Ok(client) -> {
+                    match tcp_accept(listener) {
+                        Err(e) -> print("could not accept")
+                        Ok(conn) -> {
+                            // The accepted side's peer is the client: the
+                            // loopback address and the ephemeral port the
+                            // system gave the dial.
+                            match tcp_peer(conn) {
+                                Err(e) -> print("the accepted side has no peer, which it must")
+                                Ok(peer) -> {
+                                    let (host, their_port) = peer
+                                    print("the accepted side sees the peer at 127.0.0.1: {host == "127.0.0.1"}")
+                                    print("the peer's port is a real port: {their_port > 0 and their_port <= 65535}")
+                                }
+                            }
+                            // And the client's peer is the listener, on the
+                            // port that was read back from it.
+                            match tcp_peer(client) {
+                                Err(e) -> print("the client side has no peer, which it must")
+                                Ok(peer) -> {
+                                    let (_, their_port) = peer
+                                    print("the client side sees the listener's own port: {their_port == port}")
+                                }
+                            }
+                            net_close(conn)
+                        }
+                    }
+                    net_close(client)
+                }
+            }
+
+            // A listener is not connected to anything, so there is no answer
+            // to give — an ordinary failure, not a made-up address.
+            match tcp_peer(listener) {
+                Ok(_) -> print("a listener reported a peer, which it must not")
+                Err(e) -> print("a listener has no peer, and that is an Err")
+            }
+            net_close(listener)
+            match tcp_peer(4242) {
+                Ok(_) -> print("a handle that names nothing reported a peer, which it must not")
+                Err(e) -> print("a handle that names nothing has no peer either")
+            }
+        }
+    }
+
+    // The same only-increasing clock as `monotonic_millis`, read in
+    // nanoseconds. Equal readings are allowed — a coarse clock may not tick
+    // between two calls — and a smaller one never is.
+    let first = monotonic_nanos()
+    let second = monotonic_nanos()
+    print("monotonic_nanos never went backwards: {second >= first}")
 }
 ```
 

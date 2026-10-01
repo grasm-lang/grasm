@@ -921,7 +921,9 @@ impl<'m> Codegen<'m> {
             // The `net` capability. Handles and payloads are ordinary boxed
             // values, so these look like any other runtime call.
             ("grasm_tcp_listen", vec![i64t], Some(i64t)),
+            ("grasm_tcp_listen_on", vec![i64t, i64t], Some(i64t)),
             ("grasm_tcp_connect", vec![i64t, i64t], Some(i64t)),
+            ("grasm_tcp_peer", vec![i64t], Some(i64t)),
             ("grasm_tcp_accept", vec![i64t], Some(i64t)),
             ("grasm_tcp_read", vec![i64t], Some(i64t)),
             ("grasm_tcp_read_bytes", vec![i64t], Some(i64t)),
@@ -969,6 +971,7 @@ impl<'m> Codegen<'m> {
             ("grasm_set_args", vec![i64t, ptr], None),
             ("grasm_now_millis", vec![], Some(i64t)),
             ("grasm_monotonic_millis", vec![], Some(i64t)),
+            ("grasm_monotonic_nanos", vec![], Some(i64t)),
             ("grasm_sleep_millis", vec![i64t], Some(i64t)),
             ("grasm_check_leaks", vec![], None),
             ("grasm_struct_take", vec![ptr, ptr, i64t], Some(ptr)),
@@ -1904,6 +1907,12 @@ arguments nor the type this is bound to",
                                     && param_is_borrowed(&p.name.name, &f.body))
                         })
                         .collect();
+                    // Not spliced when a value struct crosses the call: the
+                    // splice ends the body's scope -- releasing its locals --
+                    // before the caller copies the result out, so `let p =
+                    // P{...}; return p` freed the fields it was returning.
+                    let values_cross = matches!(ret, VType::Val(_))
+                        || params.iter().any(|t| matches!(t, VType::Val(_)));
                     self.fns.insert(
                         key,
                         FnSig {
@@ -1916,7 +1925,7 @@ arguments nor the type this is bound to",
                             borrowed,
                         },
                     );
-                    if let Some(spliced) = inline_candidate(f) {
+                    if let Some(spliced) = inline_candidate(f).filter(|_| !values_cross) {
                         let mut names: Vec<String> =
                             f.params.iter().map(|p| p.name.name.clone()).collect();
                         for st in &spliced {
@@ -2117,6 +2126,7 @@ arguments nor the type this is bound to",
             probe_types: Vec::new(),
             probing_args: false,
             index_vals: HashMap::new(),
+            split_vals: HashMap::new(),
             wrote_through_ref: false,
             task_scopes: Vec::new(),
             go_scopes: Vec::new(),
@@ -2801,6 +2811,7 @@ operation's",
             probe_types: Vec::new(),
             probing_args: false,
             index_vals: HashMap::new(),
+            split_vals: HashMap::new(),
             wrote_through_ref: false,
             task_scopes: Vec::new(),
             go_scopes: Vec::new(),
@@ -2916,6 +2927,7 @@ operation's",
             probe_types: Vec::new(),
             probing_args: false,
             index_vals: HashMap::new(),
+            split_vals: HashMap::new(),
             wrote_through_ref: false,
             task_scopes: Vec::new(),
             go_scopes: Vec::new(),
@@ -3074,6 +3086,7 @@ operation's",
             probe_types: Vec::new(),
             probing_args: false,
             index_vals: HashMap::new(),
+            split_vals: HashMap::new(),
             wrote_through_ref: false,
             task_scopes: Vec::new(),
             go_scopes: Vec::new(),
@@ -3433,6 +3446,10 @@ struct FnCx<'a, 'm> {
     /// that writes the value is what evaluates the indices — so doing it
     /// after left the order reversed. Keyed by span, cleared per statement.
     index_vals: HashMap<u32, (Value, VType)>,
+    /// Value-struct locals held field by field in variables rather than in a
+    /// stack slot, keyed by the binding's variable: one variable per field.
+    /// See `split_val_ok`.
+    split_vals: HashMap<u32, Vec<Variable>>,
     /// Set when a write reached the slab through a `ref`, so no enclosing
     /// container needs updating. See `begin_write`.
     wrote_through_ref: bool,
@@ -5214,14 +5231,17 @@ struct PinnedAppend {
     stride: i64,
 }
 
-fn indexed_only_lists(block: &grasm_syntax::ast::Block) -> Vec<String> {
+/// The lists a block only indexes, and of those, the ones it writes an
+/// element of.
+fn indexed_only_lists(block: &grasm_syntax::ast::Block) -> (Vec<String>, Vec<String>) {
     let mut indexed: Vec<String> = Vec::new();
     let mut disqualified: Vec<String> = Vec::new();
-    scan_uses_block(block, &mut indexed, &mut disqualified);
+    let mut written: Vec<String> = Vec::new();
+    scan_uses_block(block, &mut indexed, &mut disqualified, &mut written);
     indexed.sort();
     indexed.dedup();
     indexed.retain(|n| !disqualified.contains(n));
-    indexed
+    (indexed, written)
 }
 
 /// Whether a boxed parameter is only ever *read*, so that the caller need not
@@ -6003,117 +6023,134 @@ fn is_named(e: &Expr, name: &str) -> bool {
     matches!(e, Expr::Ident(id) if id.name == name)
 }
 
-fn scan_uses_block(b: &grasm_syntax::ast::Block, indexed: &mut Vec<String>, bad: &mut Vec<String>) {
+fn scan_uses_block(
+    b: &grasm_syntax::ast::Block,
+    indexed: &mut Vec<String>,
+    bad: &mut Vec<String>,
+    written: &mut Vec<String>,
+) {
     for stmt in &b.stmts {
         match stmt {
-            Stmt::Let { init, .. } => scan_uses_expr(init, indexed, bad),
+            Stmt::Let { init, .. } => scan_uses_expr(init, indexed, bad, written),
             Stmt::Assign { target, value, .. } => {
+                // A write through an element -- `xs[i] = v`, `xs[i].f = v` --
+                // is what a pinned list of values has to be unshared for.
+                if let Some(root) = place_root(target) {
+                    if !matches!(target, Expr::Ident(_)) {
+                        written.push(root.to_string());
+                    }
+                }
                 // `xs[i] = v` keeps xs eligible; `xs = other` does not.
                 match target {
                     Expr::Index { recv, index, .. } => {
                         if let Expr::Ident(id) = &**recv {
                             indexed.push(id.name.clone());
                         } else {
-                            scan_uses_expr(recv, indexed, bad);
+                            scan_uses_expr(recv, indexed, bad, written);
                         }
-                        scan_uses_expr(index, indexed, bad);
+                        scan_uses_expr(index, indexed, bad, written);
                     }
-                    other => scan_uses_expr(other, indexed, bad),
+                    other => scan_uses_expr(other, indexed, bad, written),
                 }
                 if let Expr::Ident(id) = target {
                     bad.push(id.name.clone());
                 }
-                scan_uses_expr(value, indexed, bad);
+                scan_uses_expr(value, indexed, bad, written);
             }
-            Stmt::Return(Some(e), _) | Stmt::Expr(e) => scan_uses_expr(e, indexed, bad),
+            Stmt::Return(Some(e), _) | Stmt::Expr(e) => scan_uses_expr(e, indexed, bad, written),
             Stmt::While { cond, body, .. } => {
-                scan_uses_expr(cond, indexed, bad);
-                scan_uses_block(body, indexed, bad);
+                scan_uses_expr(cond, indexed, bad, written);
+                scan_uses_block(body, indexed, bad, written);
             }
             Stmt::For { iter, body, .. } => {
-                scan_uses_expr(iter, indexed, bad);
-                scan_uses_block(body, indexed, bad);
+                scan_uses_expr(iter, indexed, bad, written);
+                scan_uses_block(body, indexed, bad, written);
             }
             Stmt::Parallel { body, .. } | Stmt::Spawn { body, .. } => {
-                scan_uses_block(body, indexed, bad)
+                scan_uses_block(body, indexed, bad, written)
             }
             Stmt::With { handler, body, .. } => {
-                scan_uses_expr(handler, indexed, bad);
-                scan_uses_block(body, indexed, bad);
+                scan_uses_expr(handler, indexed, bad, written);
+                scan_uses_block(body, indexed, bad, written);
             }
             _ => {}
         }
     }
 }
 
-fn scan_uses_expr(e: &Expr, indexed: &mut Vec<String>, bad: &mut Vec<String>) {
+fn scan_uses_expr(
+    e: &Expr,
+    indexed: &mut Vec<String>,
+    bad: &mut Vec<String>,
+    written: &mut Vec<String>,
+) {
     match e {
         // The one shape that keeps a list eligible.
         Expr::Index { recv, index, .. } => {
             if let Expr::Ident(id) = &**recv {
                 indexed.push(id.name.clone());
             } else {
-                scan_uses_expr(recv, indexed, bad);
+                scan_uses_expr(recv, indexed, bad, written);
             }
-            scan_uses_expr(index, indexed, bad);
+            scan_uses_expr(index, indexed, bad, written);
         }
         // Everything below is a use that could alias, resize, or retain.
         Expr::Ident(id) => bad.push(id.name.clone()),
-        Expr::Unary { expr, .. } | Expr::Try { expr, .. } => scan_uses_expr(expr, indexed, bad),
+        Expr::Unary { expr, .. } | Expr::Try { expr, .. } => scan_uses_expr(expr, indexed, bad, written),
         Expr::Binary { lhs, rhs, .. } => {
-            scan_uses_expr(lhs, indexed, bad);
-            scan_uses_expr(rhs, indexed, bad);
+            scan_uses_expr(lhs, indexed, bad, written);
+            scan_uses_expr(rhs, indexed, bad, written);
         }
         Expr::Call { callee, args, .. } => {
-            scan_uses_expr(callee, indexed, bad);
+            scan_uses_expr(callee, indexed, bad, written);
             for a in args {
-                scan_uses_expr(a, indexed, bad);
+                scan_uses_expr(a, indexed, bad, written);
             }
         }
         Expr::MethodCall { recv, args, .. } => {
-            scan_uses_expr(recv, indexed, bad);
+            scan_uses_expr(recv, indexed, bad, written);
             for a in args {
-                scan_uses_expr(a, indexed, bad);
+                scan_uses_expr(a, indexed, bad, written);
             }
         }
-        Expr::Field { recv, .. } => scan_uses_expr(recv, indexed, bad),
+        Expr::Field { recv, .. } => scan_uses_expr(recv, indexed, bad, written),
         Expr::List(items, _) | Expr::Tuple(items, _) => {
             for i in items {
-                scan_uses_expr(i, indexed, bad);
+                scan_uses_expr(i, indexed, bad, written);
             }
         }
         Expr::Str(pieces, _) => {
             for p in pieces {
                 if let StrPiece::Expr(inner) = p {
-                    scan_uses_expr(inner, indexed, bad);
+                    scan_uses_expr(inner, indexed, bad, written);
                 }
             }
         }
-        Expr::Closure { body, .. } => scan_uses_expr(body, indexed, bad),
-        Expr::Block(b) | Expr::Unsafe(b) | Expr::Region(b) => scan_uses_block(b, indexed, bad),
+        Expr::Closure { body, .. } => scan_uses_expr(body, indexed, bad, written),
+        Expr::Block(b) | Expr::Unsafe(b) | Expr::Region(b) => scan_uses_block(b, indexed, bad, written),
         Expr::If {
             cond,
             then_block,
             else_branch,
             ..
         } => {
-            scan_uses_expr(cond, indexed, bad);
-            scan_uses_block(then_block, indexed, bad);
+            scan_uses_expr(cond, indexed, bad, written);
+            scan_uses_block(then_block, indexed, bad, written);
             match else_branch.as_deref() {
-                Some(ElseBranch::Else(b)) => scan_uses_block(b, indexed, bad),
-                Some(ElseBranch::ElseIf(inner)) => scan_uses_expr(inner, indexed, bad),
+                Some(ElseBranch::Else(b)) => scan_uses_block(b, indexed, bad, written),
+                Some(ElseBranch::ElseIf(inner)) => scan_uses_expr(inner, indexed, bad, written),
                 None => {}
             }
         }
         Expr::Match {
             scrutinee, arms, ..
         } => {
-            scan_uses_expr(scrutinee, indexed, bad);
+            scan_uses_expr(scrutinee, indexed, bad, written);
             for arm in arms {
                 if let Some(g) = &arm.guard {
-                    scan_uses_expr(g, indexed, bad);
+                    scan_uses_expr(g, indexed, bad, written);
                 }
-                scan_uses_expr(&arm.body, indexed, bad);
+                scan_uses_expr(&arm.body, indexed, bad, written);
             }
         }
         _ => {}
@@ -6137,6 +6174,36 @@ fn scalar_kind_i64(vt: &VType) -> Option<i64> {
 }
 
 /// One step of a place path (`p.field`, `xs[i]`).
+/// Whether evaluating `e` only reads: names, literals, fields, indexes and
+/// operators -- nothing that could call code and replace a variable while a
+/// field of it is lent out.
+fn pure_read(e: &Expr) -> bool {
+    match e {
+        Expr::Int(..) | Expr::Float(..) | Expr::Bool(..) | Expr::Ident(_) => true,
+        Expr::Field { recv, .. } => pure_read(recv),
+        Expr::Index { recv, index, .. } => pure_read(recv) && pure_read(index),
+        Expr::Binary { lhs, rhs, .. } => pure_read(lhs) && pure_read(rhs),
+        Expr::Unary { expr, .. } => pure_read(expr),
+        _ => false,
+    }
+}
+
+/// The variable a field path starts from: `p` for `p.b.c`.
+fn place_root(e: &Expr) -> Option<&str> {
+    match e {
+        Expr::Ident(id) => Some(&id.name),
+        Expr::Field { recv, .. } => place_root(recv),
+        _ => None,
+    }
+}
+
+/// Whether any of `args` reads the variable `name` -- an argument evaluated
+/// after an `inout` place is taken from that variable would find the hole.
+fn later_reads(args: &[Expr], name: &str) -> bool {
+    args.iter()
+        .any(|a| grasm_sema::check::expr_mentions(a, name))
+}
+
 #[derive(Clone, Copy)]
 enum PlaceSeg<'e> {
     Field(&'e str),
@@ -6526,7 +6593,7 @@ impl FnCx<'_, '_> {
         header: &[&Expr],
     ) -> CResult<()> {
         let mut scope: HashMap<String, (Value, Value, VType)> = HashMap::new();
-        let candidates: Vec<String> = indexed_only_lists(body);
+        let (candidates, written) = indexed_only_lists(body);
         for name in candidates {
             // A list an enclosing loop already pinned stays pinned to that
             // loop. Its buffer and its length cannot have moved — a name that
@@ -6568,13 +6635,26 @@ impl FnCx<'_, '_> {
                 let data_out = self.b.ins().stack_addr(ptr_ty, slot, 0);
                 let len_out = self.b.ins().stack_addr(ptr_ty, slot, 8);
                 let cur = self.b.use_var(var);
-                let mine = self
-                    .call_rt("grasm_vals_pin", &[cur, data_out, len_out])
-                    .unwrap();
-                self.b.def_var(var, mine);
-                let flags = cranelift_codegen::ir::MemFlags::trusted();
-                let data = self.b.ins().load(types::I64, flags, data_out, 0);
-                let len = self.b.ins().load(types::I64, flags, len_out, 0);
+                // A loop that only reads the list needs its words, not a list
+                // of its own: unsharing a list a caller also holds copied all
+                // of it on loop entry -- a five-million-node graph, every
+                // time a breadth-first search began.
+                let (data, len) = if written.contains(&name) {
+                    let mine = self
+                        .call_rt("grasm_vals_pin", &[cur, data_out, len_out])
+                        .unwrap();
+                    self.b.def_var(var, mine);
+                    let flags = cranelift_codegen::ir::MemFlags::trusted();
+                    (
+                        self.b.ins().load(types::I64, flags, data_out, 0),
+                        self.b.ins().load(types::I64, flags, len_out, 0),
+                    )
+                } else {
+                    (
+                        self.call_rt("grasm_vals_data", &[cur]).unwrap(),
+                        self.call_rt("grasm_vals_len", &[cur]).unwrap(),
+                    )
+                };
                 scope.insert(name, (data, len, (*elem).clone()));
                 continue;
             }
@@ -7315,6 +7395,75 @@ impl FnCx<'_, '_> {
             .unwrap_or_default()
     }
 
+    /// Whether a local of value struct `s` is held field by field in
+    /// variables. Cranelift does not promote stack slots to registers, and its
+    /// load forwarding gives up at the next store to any slot, so a value
+    /// updated field by field in a loop -- `var e = es[i]; e.x += e.vx * dt;
+    /// ...; es[i] = e` -- reloaded every field from memory after every write.
+    /// In variables, the fields are registers.
+    ///
+    /// Only for a struct whose fields are all scalars: there is nothing to
+    /// count or release, so a copy of the value is just its fields. And it is
+    /// sound because a value struct is never written through its address: a
+    /// value type cannot be an `inout` parameter, has no methods, and is not
+    /// captured (`values::eligible`), so the only writes are the assignments
+    /// `assign_val` sees. Every other use of the whole value reads a snapshot
+    /// stored to a fresh slot (`split_materialize`).
+    fn split_val_ok(&self, s: &str) -> bool {
+        if std::env::var_os("GRASM_NO_SPLIT").is_some() {
+            return false;
+        }
+        let fs = self.val_fields(s);
+        !fs.is_empty() && fs.iter().all(|t| matches!(t, VType::I64 | VType::F64 | VType::Bool))
+    }
+
+    /// The fields of the value at `v` in fresh variables.
+    fn split_from(&mut self, v: Value, s: &str) -> Vec<Variable> {
+        self.fresh_vals.remove(&v);
+        let decl = self.val_fields(s);
+        let mut out = Vec::with_capacity(decl.len());
+        for (i, ft) in decl.iter().enumerate() {
+            let w = self.load_val_scalar(v, i, ft);
+            let fv = self.new_var(ft);
+            self.b.def_var(fv, w);
+            out.push(fv);
+        }
+        out
+    }
+
+    /// A split local as a value: its fields stored to a fresh slot, which the
+    /// reader owns.
+    fn split_materialize(&mut self, var: Variable, s: &str) -> Value {
+        let fs = self.split_vals[&var.as_u32()].clone();
+        let at = self.val_slot(s);
+        for (i, ft) in self.val_fields(s).iter().enumerate() {
+            let w = self.b.use_var(fs[i]);
+            self.store_val_scalar(w, at, i, ft);
+        }
+        self.fresh_vals.insert(at);
+        at
+    }
+
+    /// Scalar field `i` of the value at `at`. An `f64` is loaded as a float:
+    /// read as a word and moved across, every field operation in an update
+    /// loop paid a register-file crossing each way.
+    fn load_val_scalar(&mut self, at: Value, i: usize, ft: &VType) -> Value {
+        let flags = cranelift_codegen::ir::MemFlags::trusted();
+        if *ft == VType::F64 {
+            return self.b.ins().load(types::F64, flags, at, (8 * i) as i32);
+        }
+        let w = self.b.ins().load(types::I64, flags, at, (8 * i) as i32);
+        self.scalar_of_bits(w, ft)
+    }
+
+    /// Stores scalar field `i` of the value at `at`, the inverse of
+    /// `load_val_scalar`.
+    fn store_val_scalar(&mut self, v: Value, at: Value, i: usize, ft: &VType) {
+        let flags = cranelift_codegen::ir::MemFlags::trusted();
+        let w = if *ft == VType::F64 { v } else { self.scalar_bits_of(v, ft) };
+        self.b.ins().store(flags, w, at, (8 * i) as i32);
+    }
+
     /// Releases the boxed fields of the value at `at`.
     fn drop_val(&mut self, at: Value, s: &str) {
         let flags = cranelift_codegen::ir::MemFlags::trusted();
@@ -7411,11 +7560,33 @@ impl FnCx<'_, '_> {
                     return nope(span, "a compound assignment to a whole value struct");
                 }
                 let (nv, _) = self.eval_expr_val(value)?;
-                // Taken before the old value goes: `p = f(p)` reads it.
-                let owned = self.own_val(nv, &s);
-                let old = self.b.use_var(var);
-                self.drop_val(old, &s);
-                self.b.def_var(var, owned);
+                if let Some(fs) = self.split_vals.get(&var.as_u32()).cloned() {
+                    self.fresh_vals.remove(&nv);
+                    let decl = self.val_fields(&s);
+                    for (i, ft) in decl.iter().enumerate() {
+                        let w = self.load_val_scalar(nv, i, ft);
+                        self.b.def_var(fs[i], w);
+                    }
+                    return Ok(Some(StmtOut::Value(None)));
+                }
+                // The new value is written into the variable's own slot. It
+                // used to *adopt* a temporary's slot instead -- and a call's
+                // result slot belongs to the call site, so in `acc = dbl(acc)`
+                // in a loop the next call wrote its result over `acc` and the
+                // release of the old value freed the new one's fields.
+                //
+                // Counts are taken on a copied value before the old one is
+                // released, so `p = p` and `p = q` sharing fields keep them.
+                if !self.fresh_vals.remove(&nv) {
+                    self.inc_val_fields(nv, &s);
+                }
+                let at = self.b.use_var(var);
+                self.drop_val(at, &s);
+                let flags = cranelift_codegen::ir::MemFlags::trusted();
+                for i in 0..self.val_fields(&s).len() {
+                    let w = self.b.ins().load(types::I64, flags, nv, (8 * i) as i32);
+                    self.b.ins().store(flags, w, at, (8 * i) as i32);
+                }
                 Ok(Some(StmtOut::Value(None)))
             }
             Expr::Field { recv, name, .. } => {
@@ -7430,6 +7601,30 @@ impl FnCx<'_, '_> {
                     return nope(span, format!("the field `{}` of `{s}`", name.name));
                 };
                 let ft = decl[i].1.clone();
+                if let Some(fs) = self.split_vals.get(&var.as_u32()).cloned() {
+                    let (mut nv, mut nt) = self.eval_expr_expecting(value, Some(&ft))?;
+                    if ft == VType::F64 && nt == VType::I64 {
+                        nv = self.b.ins().fcvt_from_sint(types::F64, nv);
+                        nt = VType::F64;
+                    }
+                    if op != AssignOp::Assign {
+                        let old = self.b.use_var(fs[i]);
+                        let bop = match op {
+                            AssignOp::Add => BinaryOp::Add,
+                            AssignOp::Sub => BinaryOp::Sub,
+                            AssignOp::Mul => BinaryOp::Mul,
+                            AssignOp::Div => BinaryOp::Div,
+                            AssignOp::Assign => unreachable!(),
+                        };
+                        let (r, rt) = self.binop_values(bop, old, ft.clone(), nv, nt, span)?;
+                        nv = r;
+                        if ft == VType::F64 && rt == VType::I64 {
+                            nv = self.b.ins().fcvt_from_sint(types::F64, nv);
+                        }
+                    }
+                    self.b.def_var(fs[i], nv);
+                    return Ok(Some(StmtOut::Value(None)));
+                }
                 let at = self.b.use_var(var);
                 let (mut nv, mut nt) = self.eval_expr_expecting(value, Some(&ft))?;
                 if ft == VType::F64 && nt == VType::I64 {
@@ -7440,8 +7635,7 @@ impl FnCx<'_, '_> {
                     if ft.boxed() {
                         return nope(span, "a compound assignment to a boxed field of a value");
                     }
-                    let w = self.b.ins().load(types::I64, flags, at, (8 * i) as i32);
-                    let old = self.scalar_of_bits(w, &ft);
+                    let old = self.load_val_scalar(at, i, &ft);
                     let bop = match op {
                         AssignOp::Add => BinaryOp::Add,
                         AssignOp::Sub => BinaryOp::Sub,
@@ -7461,8 +7655,7 @@ impl FnCx<'_, '_> {
                     self.b.ins().store(flags, nv, at, (8 * i) as i32);
                     self.call_rt("grasm_val_dec", &[old]);
                 } else {
-                    let bits = self.scalar_bits_of(nv, &ft);
-                    self.b.ins().store(flags, bits, at, (8 * i) as i32);
+                    self.store_val_scalar(nv, at, i, &ft);
                 }
                 Ok(Some(StmtOut::Value(None)))
             }
@@ -7478,6 +7671,29 @@ impl FnCx<'_, '_> {
                 };
                 if op != AssignOp::Assign {
                     return nope(span, "a compound assignment to a whole value struct");
+                }
+                // A split local's fields are stored straight into the element,
+                // with no slot between.
+                if let Expr::Ident(vid) = value {
+                    if let Some((vvar, _)) = self.lookup(&vid.name) {
+                        if let Some(fs) = self.split_vals.get(&vvar.as_u32()).cloned() {
+                            let (iv, _) = self.index_value(index)?;
+                            let at = if let Some((data, len, pt)) = self.pinned_list(&root.name) {
+                                let stride = self.val_stride(&pt);
+                                self.pinned_address(data, len, iv, stride)
+                            } else {
+                                let cur = self.b.use_var(var);
+                                let mine = self.call_rt("grasm_vals_unshare", &[cur]).unwrap();
+                                self.b.def_var(var, mine);
+                                self.call_rt("grasm_vals_at", &[mine, iv]).unwrap()
+                            };
+                            for (i, ft) in self.val_fields(&s).iter().enumerate() {
+                                let w = self.b.use_var(fs[i]);
+                                self.store_val_scalar(w, at, i, ft);
+                            }
+                            return Ok(Some(StmtOut::Value(None)));
+                        }
+                    }
                 }
                 let (nv, _) = self.eval_expr_val(value)?;
                 // A temporary's words move in. A place's are copied, and its
@@ -8036,6 +8252,15 @@ impl FnCx<'_, '_> {
                 // moves in, a place is copied.
                 if let VType::Val(s) = &vt {
                     let s = s.clone();
+                    if self.split_val_ok(&s) {
+                        let fields = self.split_from(v, &s);
+                        let var = self.new_var(&vt);
+                        let zero = self.b.ins().iconst(types::I64, 0);
+                        self.b.def_var(var, zero);
+                        self.split_vals.insert(var.as_u32(), fields);
+                        self.bind(&name.name, var, vt);
+                        return Ok(StmtOut::Value(None));
+                    }
                     v = self.own_val(v, &s);
                 }
                 let var = self.new_var(&vt);
@@ -8209,6 +8434,48 @@ impl FnCx<'_, '_> {
                         self.binop_values(bop, old, elem_t.clone(), val, val_t, target.span())?
                             .0
                     };
+                    // `p.i = p.i + 1` -- a scalar field of a struct nobody else
+                    // holds -- is a store of its bits into the box. Through the
+                    // runtime it was a box for the number, a call, and an unbox
+                    // on the other side, on every byte a parser reads. Shared,
+                    // the call copies first, as it always did.
+                    if let (VType::Struct(sn), [PlaceSeg::Field(f)]) = (&root_t, path.as_slice()) {
+                        let sn = sn.clone();
+                        if let (Some(i), true) =
+                            (self.struct_field_index(&sn, f), scalar_kind_i64(&elem_t).is_some())
+                        {
+                            let inline = self.cg.structs.get(&sn).is_some_and(|fs| fs.len() <= 4);
+                            if inline {
+                                let cur = self.b.use_var(var);
+                                let flags = cranelift_codegen::ir::MemFlags::trusted();
+                                let rc = self.b.ins().load(types::I64, flags, cur, 0);
+                                let uniq = self.b.ins().icmp_imm(IntCC::Equal, rc, 1);
+                                let fast = self.b.create_block();
+                                let slow = self.b.create_block();
+                                let join = self.b.create_block();
+                                self.b.ins().brif(uniq, fast, &[], slow, &[]);
+                                self.goto_block(fast);
+                                let bits = self.scalar_bits_of(final_v, &elem_t);
+                                self.b.ins().store(
+                                    flags,
+                                    bits,
+                                    cur,
+                                    (LAYOUT_STRUCT_INLINE_VALS + 8 * i) as i32,
+                                );
+                                self.b.ins().jump(join, &[]);
+                                self.goto_block(slow);
+                                let boxed = self.box_value(final_v, &elem_t);
+                                let iv = self.b.ins().iconst(types::I64, i);
+                                let updated = self
+                                    .call_rt("grasm_struct_set_field_at", &[cur, iv, boxed])
+                                    .unwrap();
+                                self.b.def_var(var, updated);
+                                self.b.ins().jump(join, &[]);
+                                self.goto_block(join);
+                                return Ok(StmtOut::Value(None));
+                            }
+                        }
+                    }
                     let boxed = self.box_value(final_v, &elem_t);
                     let cur = self.b.use_var(var);
                     self.begin_write();
@@ -10183,6 +10450,10 @@ this case",
                 self.eval_expr(&init)
             }
             Expr::Ident(id) => match self.lookup(&id.name) {
+                Some((var, VType::Val(s))) if self.split_vals.contains_key(&var.as_u32()) => {
+                    let at = self.split_materialize(var, &s);
+                    Ok(Some((at, VType::Val(s))))
+                }
                 Some((var, vt)) => {
                     let v = self.b.use_var(var);
                     if self.movable.remove(&var.as_u32()) {
@@ -10322,8 +10593,18 @@ this case",
                 if it != VType::I64 {
                     return nope(index.span(), "non-integer index");
                 }
-                let (v, vt) = self.list_get_elem(rv, iv, &elem_t)?;
+                let (mut v, vt) = self.list_get_elem(rv, iv, &elem_t)?;
                 if owned {
+                    // An element of a value list is a place *in* the list, so
+                    // out of a temporary it is copied out before the list goes:
+                    // `table()[0].year` read the freed list's words.
+                    if let VType::Val(s) = &vt {
+                        let s = s.clone();
+                        let dst = self.val_slot(&s);
+                        self.move_or_copy_val(v, dst, &s);
+                        self.fresh_vals.insert(dst);
+                        v = dst;
+                    }
                     self.call_rt("grasm_val_dec", &[rv]);
                 }
                 Ok(Some((v, vt)))
@@ -12093,6 +12374,8 @@ this case",
                             Vec<PlaceSeg<'_>>,
                             VType,
                         )> = Vec::new();
+                        // Value temporaries lent to the callee, released after.
+                        let mut mod_val_temps: Vec<(Value, VType)> = Vec::new();
                         for (i, (a, want)) in args.iter().zip(&params).enumerate() {
                             if modes.get(i).copied() == Some(ParamMode::Inout) {
                                 let Expr::Ident(aid) = a else {
@@ -12104,7 +12387,8 @@ this case",
                                     // Taken rather than copied, so the callee
                                     // mutates what it was handed instead of a
                                     // copy of it.
-                                    let held = self.read_place_boxed(cur, &path, &root_t, true)?;
+                                    let take = !later_reads(&args[i + 1..], &root_id.name);
+                                    let held = self.read_place_boxed(cur, &path, &root_t, take)?;
                                     let (raw, _) = self.unbox(held, want)?;
                                     let slot = self.b.create_sized_stack_slot(
                                         cranelift_codegen::ir::StackSlotData::new(
@@ -12140,6 +12424,9 @@ this case",
                             if *want == VType::F64 && vt == VType::I64 {
                                 v = self.b.ins().fcvt_from_sint(types::F64, v);
                             }
+                            if matches!(vt, VType::Val(_)) && self.fresh_vals.contains(&v) {
+                                mod_val_temps.push((v, vt.clone()));
+                            }
                             vals.push(v);
                         }
                         // The hidden stack floor goes ahead of the declared
@@ -12164,11 +12451,28 @@ this case",
                             let f = self.floor_arg();
                             vals.insert(0, f);
                         }
+                        // A value-struct result comes back through a slot of
+                        // the caller's, as on the same-module path. Without
+                        // it, every call into a package that returns one
+                        // panicked the compiler reading a result that was not
+                        // there.
+                        let ret_slot = match &ret {
+                            VType::Val(s) => {
+                                let s = s.clone();
+                                let at = self.val_slot(&s);
+                                vals.push(at);
+                                Some(at)
+                            }
+                            _ => None,
+                        };
                         let fref = self.cg.module.declare_func_in_func(fid, self.b.func);
                         let inst = self.b.ins().call(fref, &vals);
                         let results: Vec<Value> = self.b.inst_results(inst).to_vec();
                         for v in lent {
                             self.call_rt("grasm_val_dec", &[v]);
+                        }
+                        for (v, t) in mod_val_temps {
+                            self.dec_if_boxed(v, &t);
                         }
                         for (slot, var, vt) in inout_args {
                             let updated = self.b.ins().stack_load(vt.cl(), slot, 0);
@@ -12182,6 +12486,10 @@ this case",
                             self.begin_write();
                             let new_root = self.write_place(span, cur, &path, &root_t, updated)?;
                             self.b.def_var(var, new_root);
+                        }
+                        if let Some(at) = ret_slot {
+                            self.fresh_vals.insert(at);
+                            return Ok(Some((at, ret)));
                         }
                         return Ok(if ret == VType::Unit {
                             None
@@ -12332,25 +12640,67 @@ this case",
     /// `xs.len()` and friends on a plain local, without touching its
     /// refcount. `None` means "not one of these", and the caller falls
     /// through to the owning path.
+    /// The type of a field path off a local -- `p.b`, `s.user.name` -- when
+    /// every step is a field of a struct, or of a value struct.
+    fn field_path_type(&mut self, e: &Expr) -> Option<VType> {
+        match e {
+            Expr::Ident(id) => self.lookup(&id.name).map(|(_, t)| t),
+            Expr::Field { recv, name, span } => match self.field_path_type(recv)? {
+                VType::Struct(sn) | VType::Val(sn) => {
+                    self.struct_field_type(&sn, &name.name, *span).ok()
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     fn borrowed_read(
         &mut self,
         recv: &Expr,
         name: &Ident,
         args: &[Expr],
     ) -> CResult<Option<(Value, VType)>> {
-        if !args.is_empty() {
+        // `b.at(i)` takes one argument; everything else here takes none.
+        let indexed = name.name == "at" && args.len() == 1;
+        if !args.is_empty() && !indexed {
             return Ok(None);
         }
-        let Expr::Ident(id) = recv else {
-            return Ok(None);
+        // The receiver is a local, or a field path off one (`p.b`, the field
+        // a parser reads on every byte), lent rather than counted. The root
+        // keeps it alive for the call -- unless an argument could replace the
+        // root first, which only an argument naming it can do.
+        let root = match recv {
+            Expr::Ident(id) => &id.name,
+            Expr::Field { .. } => match place_root(recv) {
+                Some(r) => r,
+                None => return Ok(None),
+            },
+            _ => return Ok(None),
         };
-        let Some((var, vt)) = self.lookup(&id.name) else {
+        if args
+            .iter()
+            .any(|a| !pure_read(a) && grasm_sema::check::expr_mentions(a, root))
+        {
             return Ok(None);
+        }
+        let vt = match recv {
+            Expr::Ident(id) => match self.lookup(&id.name) {
+                Some((_, vt)) => vt,
+                None => return Ok(None),
+            },
+            _ => match self.field_path_type(recv) {
+                Some(t) => t,
+                None => return Ok(None),
+            },
         };
         if !vt.boxed() {
             return Ok(None);
         }
         let f = match (&vt, name.name.as_str()) {
+            (VType::Bytes, "at") if indexed => "grasm_bytes_at",
+            (VType::Bytes, "len") => "grasm_bytes_len",
+            (VType::Bytes, "is_empty") => "grasm_bytes_len",
             (VType::List(e), "len") if matches!(**e, VType::Val(_)) => "grasm_vals_len",
             (VType::List(_), "len") => "grasm_list_len",
             (VType::List(_), "is_empty") => "grasm_list_is_empty",
@@ -12375,8 +12725,34 @@ this case",
             (VType::Str, "to_lower") => "grasm_str_lower",
             _ => return Ok(None),
         };
-        let borrowed = self.b.use_var(var);
-        let v = self.call_rt(f, &[borrowed]).unwrap();
+        if indexed && f != "grasm_bytes_at" {
+            return Ok(None);
+        }
+        let borrowed = match recv {
+            Expr::Ident(id) => {
+                let Some((var, _)) = self.lookup(&id.name) else {
+                    return Ok(None);
+                };
+                self.b.use_var(var)
+            }
+            _ => match self.borrow_struct_field(recv)? {
+                Some((w, ft)) if ft == vt => w,
+                _ => return Ok(None),
+            },
+        };
+        let v = if indexed {
+            let (iv, it) = self.eval_expr_val(&args[0])?;
+            if it != VType::I64 {
+                return nope(args[0].span(), "non-integer index");
+            }
+            self.call_rt(f, &[borrowed, iv]).unwrap()
+        } else {
+            self.call_rt(f, &[borrowed]).unwrap()
+        };
+        if (&vt, name.name.as_str()) == (&VType::Bytes, "is_empty") {
+            let zero = self.b.ins().iconst(types::I64, 0);
+            return Ok(Some((self.b.ins().icmp(IntCC::Equal, v, zero), VType::Bool)));
+        }
         // This match must name every method the table above accepts. It used to
         // end in `(VType::Str, _) => VType::Str`, and that catch-all is a trap:
         // `byte_len` was added to the table above, returned an `i64`, and was
@@ -12386,6 +12762,7 @@ this case",
         // silent miscompile into a fall-through to the owning path, which is
         // slower and correct.
         let out_t = match (&vt, name.name.as_str()) {
+            (VType::Bytes, "at") => VType::I64,
             (_, "len") => VType::I64,
             (VType::Str, "byte_len") => VType::I64,
             (_, "is_empty") => VType::Bool,
@@ -13188,8 +13565,13 @@ this case",
                             self.dec_if_boxed(rv, &rt);
                             let cur = self.b.use_var(var);
                             // Taken rather than copied, so the callee's
-                            // mutation does not copy what it was handed.
-                            let held = self.read_place_boxed(cur, &path, &root_t, true)?;
+                            // mutation does not copy what it was handed --
+                            // unless an argument still to be evaluated reads
+                            // the same variable and would find the hole.
+                            let take = !args.iter().any(|x| {
+                                grasm_sema::check::expr_mentions(x, &root_id.name)
+                            });
+                            let held = self.read_place_boxed(cur, &path, &root_t, take)?;
                             let (raw, _) = self.unbox(held, &want)?;
                             let slot = self.b.create_sized_stack_slot(
                                 cranelift_codegen::ir::StackSlotData::new(
@@ -13236,7 +13618,8 @@ this case",
                                     return nope(root_id.span, "an unknown `inout` argument");
                                 };
                                 let cur = self.b.use_var(var);
-                                let held = self.read_place_boxed(cur, &path, &root_t, true)?;
+                                let take = !later_reads(&args[i + 1..], &root_id.name);
+                                let held = self.read_place_boxed(cur, &path, &root_t, take)?;
                                 let (raw, _) = self.unbox(held, want)?;
                                 let slot = self.b.create_sized_stack_slot(
                                     cranelift_codegen::ir::StackSlotData::new(
@@ -14164,6 +14547,10 @@ checker did",
                 let v = self.call_rt("grasm_monotonic_millis", &[]).unwrap();
                 return Ok(Some((v, VType::I64)));
             }
+            "monotonic_nanos" => {
+                let v = self.call_rt("grasm_monotonic_nanos", &[]).unwrap();
+                return Ok(Some((v, VType::I64)));
+            }
             // Channels (grasm_rt::tasks). A value sent is handed over, count
             // and all; one received comes back inside an `Option`.
             "chan_new" => {
@@ -14245,6 +14632,22 @@ checker did",
                     ),
                 )));
             }
+            // The other end of a connection: a pair rather than one value,
+            // so it stands apart from the arm below for the same reason
+            // `udp_recv_from` does.
+            "tcp_peer" => {
+                let (hv, ht) = self.eval_expr_val(&args[0])?;
+                let boxed = self.box_value(hv, &ht);
+                let v = self.call_rt("grasm_tcp_peer", &[boxed]).unwrap();
+                self.call_rt("grasm_val_dec", &[boxed]);
+                return Ok(Some((
+                    v,
+                    VType::Fallible(
+                        Box::new(VType::Tuple(vec![VType::Str, VType::I64])),
+                        Box::new(VType::Sum("IoError".into())),
+                    ),
+                )));
+            }
             "tcp_listen" | "tcp_accept" | "tcp_read" | "tcp_read_bytes" | "net_port"
             | "udp_bind" | "udp_recv" => {
                 let (hv, ht) = self.eval_expr_val(&args[0])?;
@@ -14267,14 +14670,19 @@ checker did",
             }
             // Two boxed arguments, a host and a port, and an `i64` handle
             // back — the same shape as `tcp_write` rather than `tcp_listen`.
-            "tcp_connect" => {
+            // `tcp_listen_on` is that shape too: `tcp_listen` with the
+            // address named rather than fixed at loopback.
+            "tcp_connect" | "tcp_listen_on" => {
                 let (hostv, hostt) = self.eval_expr_val(&args[0])?;
                 let boxed_host = self.box_value(hostv, &hostt);
                 let (portv, portt) = self.eval_expr_val(&args[1])?;
                 let boxed_port = self.box_value(portv, &portt);
-                let v = self
-                    .call_rt("grasm_tcp_connect", &[boxed_host, boxed_port])
-                    .unwrap();
+                let sym = if id.name == "tcp_connect" {
+                    "grasm_tcp_connect"
+                } else {
+                    "grasm_tcp_listen_on"
+                };
+                let v = self.call_rt(sym, &[boxed_host, boxed_port]).unwrap();
                 self.call_rt("grasm_val_dec", &[boxed_host]);
                 self.call_rt("grasm_val_dec", &[boxed_port]);
                 return Ok(Some((
@@ -14756,8 +15164,14 @@ type parameters",
                     let cur = self.b.use_var(var);
                     // Taken rather than copied: the write-back below puts it
                     // straight back, and a copy would make every `inout`
-                    // through a place O(n) in the thing it points at.
-                    let held = self.read_place_boxed(cur, &path, &root_t, true)?;
+                    // through a place O(n) in the thing it points at. Not when
+                    // a later argument reads the same variable, though: taking
+                    // leaves a hole until the write-back, and `put(s.xs, 1,
+                    // s.xs[1] + 1)` read the hole and panicked "index on
+                    // non-list" where `grasm run` printed the list. Copied
+                    // there, as the interpreter's left-to-right reading does.
+                    let take = !later_reads(&args[i + 1..], &root_id.name);
+                    let held = self.read_place_boxed(cur, &path, &root_t, take)?;
                     // A place holds a *boxed* value; an `inout` parameter is a
                     // pointer to a slot holding what the callee's type is —
                     // a raw integer for `inout n: i64`. Stored boxed, the
@@ -15451,6 +15865,17 @@ fields, not the type this is bound to, not an enclosing generic",
                 other => self.probe_type(other).ok(),
             };
             if let Some(VType::Val(s)) = rt {
+                if let Expr::Ident(id) = recv {
+                    if let Some((var, _)) = self.lookup(&id.name) {
+                        if let Some(fs) = self.split_vals.get(&var.as_u32()).cloned() {
+                            let decl = self.cg.structs.get(&s).cloned().unwrap_or_default();
+                            let Some(i) = decl.iter().position(|(n, _)| *n == name.name) else {
+                                return nope(span, format!("the field `{}` of `{s}`", name.name));
+                            };
+                            return Ok(Some((self.b.use_var(fs[i]), decl[i].1.clone())));
+                        }
+                    }
+                }
                 let (p, _) = self.eval_expr_val(recv)?;
                 let decl = self.cg.structs.get(&s).cloned().unwrap_or_default();
                 let Some(i) = decl.iter().position(|(n, _)| *n == name.name) else {
@@ -15458,12 +15883,12 @@ fields, not the type this is bound to, not an enclosing generic",
                 };
                 let ft = decl[i].1.clone();
                 let flags = cranelift_codegen::ir::MemFlags::trusted();
-                let w = self.b.ins().load(types::I64, flags, p, (8 * i) as i32);
                 let v = if ft.boxed() {
+                    let w = self.b.ins().load(types::I64, flags, p, (8 * i) as i32);
                     self.call_rt("grasm_val_inc", &[w]);
                     w
                 } else {
-                    self.scalar_of_bits(w, &ft)
+                    self.load_val_scalar(p, i, &ft)
                 };
                 let pt = VType::Val(s);
                 self.dec_if_boxed(p, &pt);
@@ -16375,7 +16800,9 @@ fields, not the type this is bound to, not an enclosing generic",
                     if self.lookup(&id.name).is_none() && self.lookup_fn(&id.name).is_none() {
                         let t = match id.name.as_str() {
                             "pi" | "e" => Some(VType::F64),
-                            "now_millis" | "monotonic_millis" => Some(VType::I64),
+                            "now_millis" | "monotonic_millis" | "monotonic_nanos" => {
+                                Some(VType::I64)
+                            }
                             "sleep_millis" => Some(VType::Unit),
                             "chan_new" | "chan_select" => Some(VType::I64),
                             "chan_send" | "chan_close" => Some(VType::Unit),
@@ -16383,8 +16810,8 @@ fields, not the type this is bound to, not an enclosing generic",
                             "file_exists" => Some(VType::Bool),
                             "args" => Some(VType::List(Box::new(VType::Str))),
                             "env" => Some(VType::Option(Box::new(VType::Str))),
-                            "tcp_listen" | "tcp_connect" | "tcp_accept" | "net_port"
-                            | "udp_bind" | "udp_send" => Some(VType::Fallible(
+                            "tcp_listen" | "tcp_listen_on" | "tcp_connect" | "tcp_accept"
+                            | "net_port" | "udp_bind" | "udp_send" => Some(VType::Fallible(
                                 Box::new(VType::I64),
                                 Box::new(VType::Sum("IoError".into())),
                             )),
@@ -16402,6 +16829,10 @@ fields, not the type this is bound to, not an enclosing generic",
                             )),
                             "udp_recv" => Some(VType::Fallible(
                                 Box::new(VType::Bytes),
+                                Box::new(VType::Sum("IoError".into())),
+                            )),
+                            "tcp_peer" => Some(VType::Fallible(
+                                Box::new(VType::Tuple(vec![VType::Str, VType::I64])),
                                 Box::new(VType::Sum("IoError".into())),
                             )),
                             "udp_recv_from" => Some(VType::Fallible(
@@ -16591,6 +17022,10 @@ fields, not the type this is bound to, not an enclosing generic",
                     Some(eff) if self.cg.effects.contains_key(eff) => {
                         VType::Handler(eff.to_string())
                     }
+                    // A value struct's literal is a value: probed as a box, a
+                    // list literal of them was built as a list of boxes and
+                    // then read as a list of values ("len on non-list").
+                    _ if self.cg.value_types.contains(&n) => VType::Val(n),
                     _ => match self.generic_struct_key(&n, fields, e.span())? {
                         Some(k) => VType::Struct(k),
                         None => VType::Struct(n),
@@ -17787,6 +18222,36 @@ fields, not the type this is bound to, not an enclosing generic",
 
     /// Writes `boxed_val` at the place, rebuilding containers copy-on-write.
     /// Returns the (possibly new) root value.
+    /// Whether `write_place` may move a child of type `t` out of its parent
+    /// while it writes `rest` into it: no index on `rest` is still to be
+    /// evaluated (it could read the parent and find the hole), and no
+    /// reference is reached (a write through one returns without the
+    /// write-back that would fill the hole).
+    fn can_take_for_write(&mut self, t: &VType, rest: &[PlaceSeg<'_>]) -> bool {
+        let mut t = t.clone();
+        for seg in rest {
+            t = match (&t, seg) {
+                (VType::Struct(sn), PlaceSeg::Field(f)) => {
+                    match self.struct_field_type(sn, f, Span::new(0, 1)) {
+                        Ok(ft) => ft,
+                        Err(_) => return false,
+                    }
+                }
+                (VType::List(e), PlaceSeg::Index(ix)) => {
+                    if !self.index_vals.contains_key(&ix.span().start) {
+                        return false;
+                    }
+                    (**e).clone()
+                }
+                _ => return false,
+            };
+            if matches!(t, VType::Ref(_)) {
+                return false;
+            }
+        }
+        !matches!(t, VType::Ref(_))
+    }
+
     fn write_place(
         &mut self,
         span: Span,
@@ -17884,18 +18349,38 @@ fields, not the type this is bound to, not an enclosing generic",
                 // Descend: read the child, recurse, then write it back.
                 let (child, child_t, writeback): (Value, VType, PlaceSeg<'_>) = match (root_t, seg)
                 {
+                    // The child is *taken* when the parent is unshared: moved
+                    // out, so the write below finds it unshared too and changes
+                    // it in place, and the write-back puts it home. Read with a
+                    // count instead, `s.xs[i] = v` found the list shared and
+                    // copied all of it on every write -- 5.25 s for 20,000
+                    // writes into a million-element field. Taking leaves a hole
+                    // until the write-back, so it is done only when nothing can
+                    // look at the hole first: every index below was evaluated
+                    // before the walk began, and no reference below can end the
+                    // walk early without a write-back.
                     (VType::Struct(sname), PlaceSeg::Field(f)) => {
                         let sname = sname.clone();
                         let ft = self.struct_field_type(&sname, f, Span::new(0, 1))?;
+                        let take = self.can_take_for_write(&ft, rest);
                         let (fp, fl) = self.str_ptr_len(f);
-                        let c = self.call_rt("grasm_struct_get", &[root, fp, fl]).unwrap();
+                        let c = self.take_or_get(
+                            "grasm_struct_take",
+                            "grasm_struct_get",
+                            &[root, fp, fl],
+                            take,
+                        );
                         (c, ft, PlaceSeg::Field(f))
                     }
                     (VType::List(e), PlaceSeg::Index(ix)) => {
                         let et = (**e).clone();
                         let (iv, _) = self.index_value(ix)?;
-                        let c = self.call_rt("grasm_list_get", &[root, iv]).unwrap();
-                        let _ = iv;
+                        let c = if et.boxed() {
+                            let take = self.can_take_for_write(&et, rest);
+                            self.take_or_get("grasm_list_take", "grasm_list_get", &[root, iv], take)
+                        } else {
+                            self.call_rt("grasm_list_get", &[root, iv]).unwrap()
+                        };
                         (c, et, PlaceSeg::Index(ix))
                     }
                     _ => return nope(span, place_shape(root_t, seg)),

@@ -650,10 +650,15 @@ fn host_now_millis() -> i64 {
 /// measured from it.
 #[cfg(not(target_arch = "wasm32"))]
 fn host_monotonic_millis() -> i64 {
+    monotonic_start().elapsed().as_millis() as i64
+}
+
+/// The moment both monotonic clocks count from, captured on first use.
+#[cfg(not(target_arch = "wasm32"))]
+fn monotonic_start() -> std::time::Instant {
     use std::sync::OnceLock;
     static START: OnceLock<std::time::Instant> = OnceLock::new();
-    let start = START.get_or_init(std::time::Instant::now);
-    start.elapsed().as_millis() as i64
+    *START.get_or_init(std::time::Instant::now)
 }
 
 /// wasm32 has no monotonic clock of its own either, so the embedder supplies
@@ -670,6 +675,28 @@ fn host_monotonic_millis() -> i64 {
         fn grasm_monotonic_millis() -> f64;
     }
     unsafe { grasm_monotonic_millis() as i64 }
+}
+
+/// Nanoseconds since the same unnamed moment `host_monotonic_millis` counts
+/// from, for durations too short for a millisecond to resolve.
+///
+/// It shares that function's starting point, so the two clocks agree on how
+/// much time has passed and differ only in how finely they say it.
+#[cfg(not(target_arch = "wasm32"))]
+fn host_monotonic_nanos() -> i64 {
+    // An `i64` of nanoseconds lasts about 292 years, so the conversion only
+    // saturates for a process that has outlived everyone who started it.
+    i64::try_from(monotonic_start().elapsed().as_nanos()).unwrap_or(i64::MAX)
+}
+
+/// wasm32 has only the embedder's millisecond clock, and asking the embedder
+/// for a second import would make every host supply one for the sake of a
+/// precision `performance.now()` does not reliably have anyway. The nanosecond
+/// reading is the millisecond one scaled, which is coarse but still only ever
+/// increases — the property a duration needs.
+#[cfg(target_arch = "wasm32")]
+fn host_monotonic_nanos() -> i64 {
+    host_monotonic_millis().saturating_mul(1_000_000)
 }
 
 /// Waits, where the host has a way to wait.
@@ -967,6 +994,29 @@ impl<'a, W: Write> Interp<'a, W> {
             };
         }
 
+        // `tcp_listen` binds the loopback address only, which is the safe
+        // default for a program being tried out and the wrong one for a server
+        // that other machines must reach. This is the same listen with the
+        // address named by the caller — "0.0.0.0" for every interface. Like
+        // `tcp_connect` the host comes first, so it is settled before the
+        // handle is read.
+        if which == "tcp_listen_on" {
+            let host = handle.to_string();
+            let Some(port) = text.as_ref().and_then(|t| t.parse::<i64>().ok()) else {
+                return fail("port must be an integer".to_string());
+            };
+            if !(0..=65535).contains(&port) {
+                return fail(format!("port {port} is out of range"));
+            }
+            return match std::net::TcpListener::bind((host.as_str(), port as u16)) {
+                Ok(l) => {
+                    self.sockets.push(Some(NetSocket::Listener(l)));
+                    Value::Ok(Rc::new(Value::Int((self.sockets.len() - 1) as i64)))
+                }
+                Err(e) => fail(e.to_string()),
+            };
+        }
+
         // `tcp_connect` takes a host in the first position rather than a
         // handle, which is why it is settled here beside `tcp_listen` and
         // before the handle is read.
@@ -980,6 +1030,8 @@ impl<'a, W: Write> Interp<'a, W> {
             }
             return match std::net::TcpStream::connect((host.as_str(), port as u16)) {
                 Ok(stream) => {
+                    // Nagle off, as for an accepted stream below.
+                    let _ = stream.set_nodelay(true);
                     self.sockets.push(Some(NetSocket::Stream(stream)));
                     Value::Ok(Rc::new(Value::Int((self.sockets.len() - 1) as i64)))
                 }
@@ -1018,6 +1070,15 @@ impl<'a, W: Write> Interp<'a, W> {
         match (which, socket) {
             ("tcp_accept", NetSocket::Listener(l)) => match l.accept() {
                 Ok((stream, _)) => {
+                    // Nagle's algorithm holds a small write back until the
+                    // previous one is acknowledged, and the peer delays that
+                    // acknowledgement hoping to piggyback it on a reply — so a
+                    // request/response exchange stalls for tens of milliseconds
+                    // on every round. Programs here write whole messages, so
+                    // the coalescing buys nothing; Go turns it off by default
+                    // for the same reason. A failure to turn it off leaves a
+                    // working, slower socket, which is no reason to fail.
+                    let _ = stream.set_nodelay(true);
                     self.sockets.push(Some(NetSocket::Stream(stream)));
                     Value::Ok(Rc::new(Value::Int((self.sockets.len() - 1) as i64)))
                 }
@@ -1114,6 +1175,21 @@ impl<'a, W: Write> Interp<'a, W> {
                     Err(e) => fail(e.to_string()),
                 }
             }
+            // Who is at the other end of a connection. A server that logs,
+            // rate-limits or answers differently by origin needs it, and only
+            // a connected stream has one: a listener has no peer, and a
+            // datagram socket has a different one for every message, which is
+            // what `udp_recv_from` reports.
+            ("tcp_peer", NetSocket::Stream(st)) => match st.peer_addr() {
+                Ok(a) => Value::Ok(Rc::new(Value::Tuple(Rc::new(vec![
+                    Value::str(a.ip().to_string()),
+                    Value::Int(i64::from(a.port())),
+                ])))),
+                Err(e) => fail(e.to_string()),
+            },
+            ("tcp_peer", NetSocket::Datagram(_)) => fail(format!(
+                "socket {h} is a datagram socket — use udp_recv_from, which names each sender"
+            )),
             ("udp_recv" | "udp_recv_from", _) => {
                 fail(format!("socket {h} is not a datagram socket"))
             }
@@ -3027,11 +3103,14 @@ uses to mark the end of a string"
                             },
                         ));
                     }
-                    "tcp_listen" | "tcp_connect" | "tcp_accept" | "tcp_read" | "tcp_read_bytes"
-                    | "tcp_write" | "tcp_write_bytes" | "net_close" | "net_port" | "udp_bind"
-                    | "udp_recv" | "udp_recv_from" => {
+                    "tcp_listen" | "tcp_listen_on" | "tcp_connect" | "tcp_accept" | "tcp_read"
+                    | "tcp_read_bytes" | "tcp_write" | "tcp_write_bytes" | "net_close"
+                    | "net_port" | "tcp_peer" | "udp_bind" | "udp_recv" | "udp_recv_from" => {
                         let h = self.eval_expr(&args[0])?;
-                        let extra = if id.name == "tcp_write" || id.name == "tcp_connect" {
+                        let extra = if matches!(
+                            id.name.as_str(),
+                            "tcp_write" | "tcp_connect" | "tcp_listen_on"
+                        ) {
                             Some(self.eval_expr(&args[1])?.to_string())
                         } else {
                             None
@@ -3489,6 +3568,15 @@ uses to mark the end of a string"
                         return Ok(journal::recorded(
                             "monotonic_millis",
                             Value::Int(host_monotonic_millis()),
+                        ));
+                    }
+                    "monotonic_nanos" => {
+                        if let Some(v) = journal::gated("monotonic_nanos") {
+                            return Ok(v);
+                        }
+                        return Ok(journal::recorded(
+                            "monotonic_nanos",
+                            Value::Int(host_monotonic_nanos()),
                         ));
                     }
                     "sleep_millis" => {

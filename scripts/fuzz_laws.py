@@ -649,7 +649,7 @@ def uncovered_clauses():
             kind[tag] = exp
     # A clause a law cannot speak for, and why.
     world = {
-        "L-LIB-FS", "L-LIB-IO", "L-LIB-NET", "L-LIB-PROC", "L-LIB-UDP",
+        "L-LIB-FS", "L-LIB-IO", "L-LIB-NET", "L-LIB-NET-PEER", "L-LIB-PROC", "L-LIB-UDP",
         "L-LIB-RANDOM", "L-LIB-EPRINT", "L-BUNDLE-SOURCE", "E-ARGS", "E-ENTRY",
         "E-PRINT-ATOMIC", "E-BENCH-WARMUP", "G-BENCH-CONTEXTUAL",
     }

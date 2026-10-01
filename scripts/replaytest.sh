@@ -34,9 +34,11 @@ prog() {
     env)            echo 'match env("HOME") { Some(v) -> print("y") None -> print("n") }' ;;
     now_millis)     echo 'print(now_millis().to_str())' ;;
     monotonic_millis) echo 'print(monotonic_millis().to_str())' ;;
+    monotonic_nanos) echo 'print(monotonic_nanos().to_str())' ;;
     sleep_millis)   echo 'sleep_millis(0)' ;;
     random_bytes)   echo 'match random_bytes(1) { Ok(b) -> print("y") Err(e) -> print("n") }' ;;
     tcp_listen)     echo 'match tcp_listen(0) { Ok(h) -> print("y") Err(e) -> print("n") }' ;;
+    tcp_listen_on)  echo 'match tcp_listen_on("127.0.0.1", 0) { Ok(h) -> print("y") Err(e) -> print("n") }' ;;
     tcp_connect)    echo 'match tcp_connect("127.0.0.1", 9) { Ok(h) -> print("y") Err(e) -> print("n") }' ;;
     tcp_accept)     echo 'match tcp_accept(0) { Ok(h) -> print("y") Err(e) -> print("n") }' ;;
     tcp_read)       echo 'match tcp_read(0) { Ok(s) -> print("y") Err(e) -> print("n") }' ;;
@@ -46,6 +48,7 @@ prog() {
     net_close)      echo 'net_close(0)' ;;
     net_wait)       echo 'match net_wait([0], 1) { Ok(r) -> print("y") Err(e) -> print("n") }' ;;
     net_port)       echo 'match net_port(0) { Ok(p) -> print("y") Err(e) -> print("n") }' ;;
+    tcp_peer)       echo 'match tcp_peer(0) { Ok(p) -> print("y") Err(e) -> print("n") }' ;;
     udp_bind)       echo 'match udp_bind(0) { Ok(h) -> print("y") Err(e) -> print("n") }' ;;
     udp_send)       echo 'match udp_send(0, "127.0.0.1", 9, bytes_of([1])) { Ok(n) -> print("y") Err(e) -> print("n") }' ;;
     udp_recv)       echo 'match udp_recv(0) { Ok(m) -> print("y") Err(e) -> print("n") }' ;;

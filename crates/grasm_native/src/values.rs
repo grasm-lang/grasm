@@ -16,6 +16,15 @@ use grasm_syntax::ast::{
 
 /// The struct types of `modules` that can be values, given the checker's
 /// resolved type of every expression (by span).
+/// Methods that read their receiver and change nothing in it.
+const READ_ONLY_METHODS: &[&str] = &[
+    "len", "is_empty", "byte_len", "contains", "starts_with", "ends_with", "at",
+    "get", "first", "last", "slice", "index_of", "split", "chars", "codes",
+    "lines", "words", "trim", "trim_start", "trim_end", "to_upper", "to_lower",
+    "to_str", "to_bytes", "keys", "values", "entries", "contains_key",
+    "parse_int", "parse_float", "substr", "join", "sum", "min", "max",
+];
+
 pub fn eligible(
     modules: &[&Module],
     types: &HashMap<(u32, u32), String>,
@@ -245,8 +254,16 @@ impl Walk<'_> {
                 let allowed = on_list && matches!(name.name.as_str(), "push" | "len");
                 // A method on a field of a value (`bag.items.push(7)`) may
                 // change that field in place, which is a write into the
-                // value's slot -- a later stage.
-                if matches!(&**recv, Expr::Field { .. }) {
+                // value's slot -- a later stage. One that only reads a field
+                // holding no value type (`node.url.len()`) changes nothing,
+                // and refusing it kept the dirty-heap benchmark's `Node`
+                // boxed over a length.
+                let reads_plain_field = READ_ONLY_METHODS.contains(&name.name.as_str())
+                    && self
+                        .types
+                        .get(&(recv.span().start, recv.span().end))
+                        .is_some_and(|t| self.mentioned(t).is_empty());
+                if matches!(&**recv, Expr::Field { .. }) && !reads_plain_field {
                     self.disqualify_chain(recv);
                 }
                 self.expr(recv, allowed);

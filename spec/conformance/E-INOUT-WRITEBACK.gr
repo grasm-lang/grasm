@@ -2,6 +2,8 @@
 //! expect: output
 //! 3 [1, 2]
 //! 2 [2, 2, 9] a! 3.0 true
+//! [1, 3, 3] [1, 3, 3, 4]
+//! [9, 2] [1, 2] [[7], [2]] [[1], [2]]
 fn bump(inout n: i64) {
     n += 1
 }
@@ -34,6 +36,17 @@ fn addall(inout xs: [i64]) {
     xs.push(9)
 }
 
+// A later argument may read the variable an `inout` place lives in. The
+// compiled engine moved the place out first -- leaving a hole until the
+// write-back -- and `h.xs[1]` then panicked "index on non-list" where
+// `grasm run` read the list it was given.
+type Holder = { xs: [i64] }
+type Grid = { rows: [[i64]] }
+
+fn put(inout xs: [i64], i: i64, v: i64) {
+    xs[i] = v
+}
+
 fn main() {
     var n = 2
     bump(n)
@@ -49,4 +62,21 @@ fn main() {
     flip(o.b)
     addall(o.xs)
     print("{o.i.v} {o.xs} {o.s} {o.f} {o.b}")
+
+    var h = Holder{ xs: [1, 2, 3] }
+    put(h.xs, 1, h.xs[1] + 1)
+    let before = "{h.xs}"
+    h.xs.push(h.xs.len() + 1)
+    print("{before} {h.xs}")
+
+    // A write through a field changes only this holder: a copy taken before
+    // keeps what it had, whether the write moves the list out of an unshared
+    // holder and back or copies it out of a shared one.
+    var a = Holder{ xs: [1, 2] }
+    let kept = a
+    a.xs[0] = 9
+    var g = Grid{ rows: [[1], [2]] }
+    let gkept = g
+    g.rows[0][0] = 7
+    print("{a.xs} {kept.xs} {g.rows} {gkept.rows}")
 }

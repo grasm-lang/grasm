@@ -9,6 +9,14 @@
 //! [5] [5, 7] 1
 //! [3, 4] [3, 4]
 //! [8] [0]
+//! 9.0 7 true | 1.0 3 true
+//! 10.5 14 false | 9.0 7 true
+//! 9.0 7 true | 9.0 100 true
+//! 0.0 1 true
+//! 1.0 1 false
+//! 20.0 3 true
+//! 3.0 3 false
+//! 8 3.0 3 false 3.0 3 false
 type Box = { n: i64 }
 type Bag = { items: [i64] }
 type Two = { a: [i64], b: [i64] }
@@ -36,6 +44,61 @@ fn both() -> Two {
 fn pick(c: bool) -> [i64] {
     let v = [8]
     if c { v } else { [0] }
+}
+
+// A struct of scalars may be compiled as its fields, each in a register,
+// rather than as one block of memory. A copy of it is then a snapshot that
+// later writes to the original must not reach, in every direction.
+type Pt = { x: f64, n: i64, ok: bool }
+
+fn bump(p: Pt) -> Pt {
+    var q = p
+    q.x += 1.5
+    q.n *= 2
+    q.ok = not q.ok
+    q
+}
+
+fn show(p: Pt) -> str {
+    "{p.x} {p.n} {p.ok}"
+}
+
+fn snapshots() {
+    var a = Pt{ x: 1.0, n: 3, ok: true }
+    let snap = a
+    a.x = 9.0
+    a.n += 4
+    print("{show(a)} | {show(snap)}")
+    var b = bump(a)
+    print("{show(b)} | {show(a)}")
+    b = a
+    a.n = 100
+    print("{show(b)} | {show(a)}")
+    var ps: [Pt] = []
+    for i in 0..4 {
+        var p = Pt{ x: i.as_f64(), n: i, ok: i % 2 == 0 }
+        if p.ok {
+            p.x = p.x * 10.0
+        } else {
+            p.n -= 1
+        }
+        ps.push(p)
+        p.n = 999
+    }
+    for i in 0..ps.len() {
+        var e = ps[i]
+        e.n += 1
+        ps[i] = e
+        e.n = -5
+    }
+    var total = 0
+    for p in ps {
+        total += p.n
+        print(show(p))
+    }
+    var c = ps[0]
+    c = ps[3]
+    print("{total} {show(c)} {show(ps[3])}")
 }
 
 fn main() {
@@ -85,4 +148,6 @@ fn main() {
     print("{two.a} {two.b}")
 
     print("{pick(true)} {pick(false)}")
+
+    snapshots()
 }
