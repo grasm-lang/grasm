@@ -1020,6 +1020,7 @@ impl<'m> Codegen<'m> {
                 Some(i64t),
             ),
             ("grasm_par_tasks_next", vec![], None),
+            ("grasm_layout_check", vec![i64t], None),
             // Concurrent tasks and channels (grasm_rt::tasks).
             ("grasm_chan_new", vec![i64t], Some(i64t)),
             ("grasm_chan_send", vec![i64t, i64t], None),
@@ -1926,6 +1927,22 @@ arguments nor the type this is bound to",
         let user_argc = b.ins().isub(argc, one);
         let eight = b.ins().iconst(types::I64, 8);
         let argv_shift = b.ins().iadd(params[1], eight);
+        // The offsets inlined reads use, checked against the runtime's own
+        // before anything else runs (`grasm_layout_check`).
+        let packed = i64::from_le_bytes([
+            LAYOUT_PAYLOAD_TAG as u8,
+            LAYOUT_TAG_LIST as u8,
+            LAYOUT_LIST_DATA_TAG as u8,
+            LAYOUT_LIST_INLINE_LEN as u8,
+            LAYOUT_LIST_INLINE_VALS as u8,
+            LAYOUT_STRUCT_INLINE_VALS as u8,
+            LAYOUT_INLINE as u8,
+            LAYOUT_TAG_STRUCT as u8,
+        ]);
+        let check = self.runtime["grasm_layout_check"];
+        let check_ref = self.module.declare_func_in_func(check, b.func);
+        let pv = b.ins().iconst(types::I64, packed);
+        b.ins().call(check_ref, &[pv]);
         let set_args = self.runtime["grasm_set_args"];
         let sa_ref = self.module.declare_func_in_func(set_args, b.func);
         b.ins().call(sa_ref, &[user_argc, argv_shift]);
@@ -4290,6 +4307,19 @@ fn field_kind(t: &VType) -> u8 {
         _ => 0,
     }
 }
+
+/// `grasm_rt::layout::STRUCT_INLINE_VALS`: where a struct of four fields or
+/// fewer keeps them, inside its box. The runtime checks the backend's copy of
+/// these numbers when a program starts (`grasm_layout_check`).
+const LAYOUT_STRUCT_INLINE_VALS: i64 = 32;
+/// The rest of `grasm_rt::layout` the backend reads.
+const LAYOUT_PAYLOAD_TAG: i64 = 8;
+const LAYOUT_TAG_LIST: i64 = 10;
+const LAYOUT_LIST_DATA_TAG: i64 = 16;
+const LAYOUT_LIST_INLINE_LEN: i64 = 17;
+const LAYOUT_LIST_INLINE_VALS: i64 = 24;
+const LAYOUT_INLINE: i64 = 0;
+const LAYOUT_TAG_STRUCT: i64 = 14;
 
 fn collect_spawn_sites(block: &grasm_syntax::ast::Block) -> Vec<&grasm_syntax::ast::Block> {
     let mut out = Vec::new();
@@ -7144,6 +7174,83 @@ impl FnCx<'_, '_> {
         }
     }
 
+    /// Field `i` of a struct value, read straight out of the box: a scalar's
+    /// bits or a boxed field's pointer, borrowed. Only for a type of four
+    /// fields or fewer, which the runtime always stores inline -- at
+    /// `STRUCT_INLINE_VALS` in `grasm_rt::layout`, checked at startup by
+    /// `grasm_layout_check`. `None` for a wider type, which takes the call.
+    fn inline_field_word(&mut self, s: Value, sname: &str, i: i64) -> Option<Value> {
+        let n = self.cg.structs.get(sname)?.len();
+        if n > 4 || i < 0 || i as usize >= n {
+            return None;
+        }
+        let flags = cranelift_codegen::ir::MemFlags::trusted();
+        Some(self.b.ins().load(
+            types::I64,
+            flags,
+            s,
+            (LAYOUT_STRUCT_INLINE_VALS + 8 * i) as i32,
+        ))
+    }
+
+    /// Whether `lv` is a list stored inline in its box: its payload tag says
+    /// `List` and its storage tag says `Inline` (`grasm_rt::layout`). The two
+    /// bytes are checked rather than assumed, so a list held any other way
+    /// takes the runtime call it always did.
+    fn list_is_inline(&mut self, lv: Value) -> Value {
+        let flags = cranelift_codegen::ir::MemFlags::trusted();
+        let ptag = self.b.ins().uload8(types::I32, flags, lv, LAYOUT_PAYLOAD_TAG as i32);
+        let ltag = self.b.ins().uload8(types::I32, flags, lv, LAYOUT_LIST_DATA_TAG as i32);
+        let is_list = self.b.ins().icmp_imm(IntCC::Equal, ptag, LAYOUT_TAG_LIST);
+        let is_inline = self.b.ins().icmp_imm(IntCC::Equal, ltag, LAYOUT_INLINE);
+        self.b.ins().band(is_list, is_inline)
+    }
+
+    /// `xs.len()` for a list of boxed values: a byte load when the list is
+    /// inline, the runtime call otherwise.
+    fn list_len_fast(&mut self, lv: Value, elem_t: &VType) -> Value {
+        if !elem_t.boxed() {
+            return self.call_rt("grasm_list_len", &[lv]).unwrap();
+        }
+        let inline = self.list_is_inline(lv);
+        let fast = self.b.create_block();
+        let slow = self.b.create_block();
+        let join = self.b.create_block();
+        self.b.append_block_param(join, types::I64);
+        self.b.ins().brif(inline, fast, &[], slow, &[]);
+        self.goto_block(fast);
+        let flags = cranelift_codegen::ir::MemFlags::trusted();
+        let n = self.b.ins().uload8(types::I64, flags, lv, LAYOUT_LIST_INLINE_LEN as i32);
+        self.b.ins().jump(join, &[n]);
+        self.goto_block(slow);
+        let m = self.call_rt("grasm_list_len", &[lv]).unwrap();
+        self.b.ins().jump(join, &[m]);
+        self.goto_block(join);
+        self.b.block_params(join)[0]
+    }
+
+    /// Element `i` of a list of boxed values, borrowed, where the caller has
+    /// already established `0 <= i < len`: a load when the list is inline.
+    fn list_borrow_fast(&mut self, lv: Value, iv: Value) -> Value {
+        let inline = self.list_is_inline(lv);
+        let fast = self.b.create_block();
+        let slow = self.b.create_block();
+        let join = self.b.create_block();
+        self.b.append_block_param(join, types::I64);
+        self.b.ins().brif(inline, fast, &[], slow, &[]);
+        self.goto_block(fast);
+        let off = self.b.ins().ishl_imm(iv, 3);
+        let at = self.b.ins().iadd(lv, off);
+        let flags = cranelift_codegen::ir::MemFlags::trusted();
+        let e = self.b.ins().load(types::I64, flags, at, LAYOUT_LIST_INLINE_VALS as i32);
+        self.b.ins().jump(join, &[e]);
+        self.goto_block(slow);
+        let c = self.call_rt("grasm_list_borrow_at", &[lv, iv]).unwrap();
+        self.b.ins().jump(join, &[c]);
+        self.goto_block(join);
+        self.b.block_params(join)[0]
+    }
+
     /// A pure field path rooted at a plain local, borrowed at every step.
     ///
     /// `o.i.v` fetched `i` and incremented it, read `v`, then released `i` —
@@ -7176,8 +7283,13 @@ impl FnCx<'_, '_> {
                 let Some(i) = self.struct_field_index(&sname, &name.name) else {
                     return Ok(None);
                 };
-                let iv = self.b.ins().iconst(types::I64, i);
-                let v = self.call_rt("grasm_struct_borrow_at", &[base, iv]).unwrap();
+                let v = match self.inline_field_word(base, &sname, i) {
+                    Some(w) => w,
+                    None => {
+                        let iv = self.b.ins().iconst(types::I64, i);
+                        self.call_rt("grasm_struct_borrow_at", &[base, iv]).unwrap()
+                    }
+                };
                 Ok(Some((v, inner)))
             }
             _ => Ok(None),
@@ -7204,8 +7316,13 @@ impl FnCx<'_, '_> {
         let Some(i) = self.struct_field_index(&sname, &name.name) else {
             return Ok(None);
         };
-        let iv = self.b.ins().iconst(types::I64, i);
-        let v = self.call_rt("grasm_struct_borrow_at", &[base, iv]).unwrap();
+        let v = match self.inline_field_word(base, &sname, i) {
+            Some(w) => w,
+            None => {
+                let iv = self.b.ins().iconst(types::I64, i);
+                self.call_rt("grasm_struct_borrow_at", &[base, iv]).unwrap()
+            }
+        };
         Ok(Some((v, ft)))
     }
 
@@ -9075,7 +9192,7 @@ this case",
         // is not exactly 1 — so `for x in xs { xs.push(y) }` grows `xs` and
         // leaves what the loop is walking alone.
         let lv = self.b.use_var(list_var);
-        let len_v = self.call_rt("grasm_list_len", &[lv]).unwrap();
+        let len_v = self.list_len_fast(lv, &elem_t);
         let len_var = self.new_var(&VType::I64);
         self.b.def_var(len_var, len_v);
         let header = self.b.create_block();
@@ -9105,7 +9222,7 @@ this case",
         };
         let borrow_elem = elem_t.boxed() && loop_elem_is_borrowed(&loop_var.name, body, &lent);
         let (elem_val, elem_vt) = if borrow_elem {
-            let v = self.call_rt("grasm_list_borrow_at", &[lv2, iv2]).unwrap();
+            let v = self.list_borrow_fast(lv2, iv2);
             (v, (*elem_t).clone())
         } else {
             self.list_get_elem(lv2, iv2, &elem_t)?
@@ -14954,8 +15071,13 @@ fields, not the type this is bound to, not an enclosing generic",
             self.struct_field_index(&sname, &name.name),
             scalar_kind_i64(&ft).is_some(),
         ) {
-            let iv = self.b.ins().iconst(types::I64, i);
-            let bits = self.call_rt("grasm_struct_scalar_at", &[rv, iv]).unwrap();
+            let bits = match self.inline_field_word(rv, &sname, i) {
+                Some(w) => w,
+                None => {
+                    let iv = self.b.ins().iconst(types::I64, i);
+                    self.call_rt("grasm_struct_scalar_at", &[rv, iv]).unwrap()
+                }
+            };
             if owned {
                 self.call_rt("grasm_val_dec", &[rv]);
             }

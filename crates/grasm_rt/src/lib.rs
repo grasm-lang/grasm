@@ -666,8 +666,9 @@ pub struct RtStr {
 /// four fields or fewer, and for those a value is now *one* allocation instead
 /// of two — building a tree of two-field nodes was allocating the box, this
 /// vector, the child list and its storage.
+#[repr(u8)]
 pub enum StructFields {
-    Inline { vals: [*mut RtVal; 4], len: u8 },
+    Inline { len: u8, vals: [*mut RtVal; 4] },
     Heap(Vec<*mut RtVal>),
 }
 
@@ -1295,8 +1296,9 @@ impl std::fmt::Display for RtStr {
 /// Four for the same reason `StructFields` uses four — it is the largest run
 /// that leaves `RtVal` at 64 bytes, which the assertion below holds the file
 /// to. Beyond four the elements move to the heap once and stay there.
+#[repr(u8)]
 pub enum ListData {
-    Inline { vals: [*mut RtVal; 4], len: u8 },
+    Inline { len: u8, vals: [*mut RtVal; 4] },
     Heap(Vec<*mut RtVal>),
 }
 
@@ -1429,6 +1431,7 @@ impl ListData {
     }
 }
 
+#[repr(u8)]
 pub enum RtPayload {
     I64(i64),
     /// The unit value. No payload, but it renders as `()` and a container can
@@ -1520,7 +1523,10 @@ pub enum RtPayload {
     Variant {
         type_name: &'static str,
         name: &'static str,
-        fields: Vec<*mut RtVal>,
+        /// A boxed slice rather than a `Vec`: a variant's fields are fixed
+        /// once built, and the capacity word a `Vec` carries is what pushed
+        /// this payload past the 48 bytes every variant has to fit in.
+        fields: Box<[*mut RtVal]>,
     },
     /// A function value: code address plus the environment it captured.
     ///
@@ -1535,6 +1541,7 @@ pub enum RtPayload {
     },
 }
 
+#[repr(C)]
 pub struct RtVal {
     /// Atomic, so that a value may be held by more than one thread.
     ///
@@ -1552,7 +1559,6 @@ pub struct RtVal {
     pub rc: AtomicI64,
     pub payload: RtPayload,
 }
-
 /// Sixty-four bytes, and every inline-storage decision in this file is sized
 /// against that: fifteen bytes of text in `StrData`, four fields in
 /// `StructFields`. Those numbers were chosen by measuring the size of this
@@ -1561,6 +1567,53 @@ pub struct RtVal {
 /// have widened every boxed integer in the program and nothing would have said
 /// so. Now the build says so.
 const _: () = assert!(std::mem::size_of::<RtVal>() == 64);
+
+/// Where things are inside a box, for compiled code that reads them directly
+/// rather than calling in: a struct's field, a list's length and elements.
+/// `RtVal` is `repr(C)` and the enums below it `repr(u8)`, so these are fixed
+/// by the definitions -- each variant's fields sit after its one-byte tag, at
+/// the next multiple of eight. The backend holds the same numbers, and
+/// `grasm_layout_check` stops a program whose runtime disagrees with them.
+pub mod layout {
+    /// The payload's variant tag.
+    pub const PAYLOAD_TAG: usize = 8;
+    pub const TAG_LIST: u8 = 10;
+    pub const TAG_STRUCT: u8 = 14;
+    /// `List(ListData)`: its tag, the inline length, the inline elements.
+    pub const LIST_DATA_TAG: usize = 16;
+    pub const LIST_INLINE_LEN: usize = 17;
+    pub const LIST_INLINE_VALS: usize = 24;
+    /// `Struct { ty, fields }`: the fields' tag, inline length and values.
+    pub const STRUCT_FIELDS_TAG: usize = 24;
+    pub const STRUCT_INLINE_LEN: usize = 25;
+    pub const STRUCT_INLINE_VALS: usize = 32;
+    /// The tag of the `Inline` variant of `ListData` and `StructFields`.
+    pub const INLINE: u8 = 0;
+}
+
+/// Called first thing by a compiled `main` with the backend's copy of
+/// `layout`, packed one number per byte. Compiled code reads struct fields
+/// and list elements at those offsets without calling in; if this runtime
+/// was built with a different layout, those reads would be wrong silently.
+/// So a mismatch stops the program here, saying so, before any is made.
+#[no_mangle]
+pub extern "C" fn grasm_layout_check(packed: i64) {
+    let ours = i64::from_le_bytes([
+        layout::PAYLOAD_TAG as u8,
+        layout::TAG_LIST,
+        layout::LIST_DATA_TAG as u8,
+        layout::LIST_INLINE_LEN as u8,
+        layout::LIST_INLINE_VALS as u8,
+        layout::STRUCT_INLINE_VALS as u8,
+        layout::INLINE,
+        layout::TAG_STRUCT,
+    ]);
+    if packed != ours {
+        rt_panic(
+            "this program was compiled for a different runtime layout -- rebuild it with the grasm that matches this runtime",
+        );
+    }
+}
 
 /// Boxes that have been freed and are waiting to be used again.
 ///
@@ -4644,7 +4697,7 @@ pub unsafe extern "C" fn grasm_variant_new(
     alloc(RtPayload::Variant {
         type_name: borrowed_str(tp, tl),
         name: borrowed_str(vp, vl),
-        fields: Vec::new(),
+        fields: Box::new([]),
     })
 }
 
@@ -4654,7 +4707,12 @@ pub unsafe extern "C" fn grasm_variant_push(v: *mut RtVal, val: *mut RtVal) {
     let RtPayload::Variant { fields, .. } = &mut (*v).payload else {
         grasm_panic_msg_str("variant_push on non-variant");
     };
-    fields.push(val);
+    // A variant is built field by field and then never grows, so its fields
+    // are a boxed slice; extending one rebuilds it, a handful of times per
+    // value at most.
+    let mut grown = std::mem::take(fields).into_vec();
+    grown.push(val);
+    *fields = grown.into_boxed_slice();
 }
 
 /// # Safety: live pointers.
@@ -4685,7 +4743,7 @@ pub unsafe extern "C" fn grasm_ok_new(val: *mut RtVal) -> *mut RtVal {
     alloc(RtPayload::Variant {
         type_name: "!",
         name: "Ok",
-        fields: vec![val],
+        fields: vec![val].into_boxed_slice(),
     })
 }
 
@@ -4695,7 +4753,7 @@ pub unsafe extern "C" fn grasm_err_new(val: *mut RtVal) -> *mut RtVal {
     alloc(RtPayload::Variant {
         type_name: "!",
         name: "Err",
-        fields: vec![val],
+        fields: vec![val].into_boxed_slice(),
     })
 }
 
@@ -4940,7 +4998,7 @@ pub unsafe extern "C" fn grasm_list_get_opt(v: *mut RtVal, i: i64) -> *mut RtVal
                 alloc(RtPayload::Variant {
                     type_name: "Option",
                     name: "None",
-                    fields: vec![],
+                    fields: vec![].into_boxed_slice(),
                 })
             } else {
                 let e = items[i as usize];
@@ -4948,7 +5006,7 @@ pub unsafe extern "C" fn grasm_list_get_opt(v: *mut RtVal, i: i64) -> *mut RtVal
                 alloc(RtPayload::Variant {
                     type_name: "Option",
                     name: "Some",
-                    fields: vec![e],
+                    fields: vec![e].into_boxed_slice(),
                 })
             }
         }
@@ -5279,13 +5337,13 @@ pub unsafe extern "C" fn grasm_map_get(m: *mut RtVal, k: *mut RtVal) -> *mut RtV
         return alloc(RtPayload::Variant {
             type_name: "Option",
             name: "Some",
-            fields: vec![ev],
+            fields: vec![ev].into_boxed_slice(),
         });
     }
     alloc(RtPayload::Variant {
         type_name: "Option",
         name: "None",
-        fields: vec![],
+        fields: vec![].into_boxed_slice(),
     })
 }
 
@@ -6032,7 +6090,7 @@ fn none_val() -> *mut RtVal {
     alloc(RtPayload::Variant {
         type_name: "Option",
         name: "None",
-        fields: vec![],
+        fields: vec![].into_boxed_slice(),
     })
 }
 
@@ -6040,7 +6098,7 @@ fn some_of(v: *mut RtVal) -> *mut RtVal {
     alloc(RtPayload::Variant {
         type_name: "Option",
         name: "Some",
-        fields: vec![v],
+        fields: vec![v].into_boxed_slice(),
     })
 }
 
@@ -6823,7 +6881,7 @@ fn io_err(variant: &'static str, payload: String) -> *mut RtVal {
     alloc(RtPayload::Variant {
         type_name: "IoError",
         name: variant,
-        fields: vec![inner],
+        fields: vec![inner].into_boxed_slice(),
     })
 }
 
@@ -6831,7 +6889,7 @@ fn err_of(v: *mut RtVal) -> *mut RtVal {
     alloc(RtPayload::Variant {
         type_name: "!",
         name: "Err",
-        fields: vec![v],
+        fields: vec![v].into_boxed_slice(),
     })
 }
 
@@ -6839,7 +6897,7 @@ fn ok_of(v: *mut RtVal) -> *mut RtVal {
     alloc(RtPayload::Variant {
         type_name: "!",
         name: "Ok",
-        fields: vec![v],
+        fields: vec![v].into_boxed_slice(),
     })
 }
 
@@ -8589,7 +8647,7 @@ fn val_of(w: &replay::Wire) -> *mut RtVal {
         replay::Wire::Variant { ty, name, fields } => alloc(RtPayload::Variant {
             type_name: interned(ty),
             name: interned(name),
-            fields: many(fields),
+            fields: many(fields).into_boxed_slice(),
         }),
     }
 }
@@ -9078,6 +9136,47 @@ mod poison_tests {
             );
             assert!(matches!((*v).payload, RtPayload::I64(9)));
             dec(v);
+        }
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    /// The offsets in `layout`, measured on real values: a reordering of a
+    /// variant or a field moves these, and this is where it would show.
+    #[test]
+    fn layout_matches_the_definitions() {
+        unsafe {
+            let a = grasm_box_i64(1_000_000_007);
+            let b = grasm_box_i64(2_000_000_011);
+            let ty: &'static StructTy = Box::leak(Box::new(StructTy {
+                name: "P",
+                fields: vec!["a", "b"],
+                kinds: vec![0, 0],
+            }));
+            let s = alloc(RtPayload::Struct {
+                ty,
+                fields: StructFields::from_values(vec![a, b]),
+            });
+            let sb = s as *const u8;
+            assert_eq!(*sb.add(layout::PAYLOAD_TAG), layout::TAG_STRUCT);
+            assert_eq!(*sb.add(layout::STRUCT_FIELDS_TAG), layout::INLINE);
+            assert_eq!(*sb.add(layout::STRUCT_INLINE_LEN), 2);
+            assert_eq!(*(sb.add(layout::STRUCT_INLINE_VALS) as *const *mut RtVal), a);
+            assert_eq!(*(sb.add(layout::STRUCT_INLINE_VALS + 8) as *const *mut RtVal), b);
+            let l = alloc(RtPayload::List(ListData::Inline {
+                len: 2,
+                vals: [b, a, std::ptr::null_mut(), std::ptr::null_mut()],
+            }));
+            let lb = l as *const u8;
+            assert_eq!(*lb.add(layout::PAYLOAD_TAG), layout::TAG_LIST);
+            assert_eq!(*lb.add(layout::LIST_DATA_TAG), layout::INLINE);
+            assert_eq!(*lb.add(layout::LIST_INLINE_LEN), 2);
+            assert_eq!(*(lb.add(layout::LIST_INLINE_VALS) as *const *mut RtVal), b);
+            assert_eq!((*s).rc.load(Relaxed), 1);
+            assert_eq!(*(sb as *const i64), 1, "the count is the first word");
         }
     }
 }
