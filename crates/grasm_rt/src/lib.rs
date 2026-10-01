@@ -7374,6 +7374,29 @@ thread_local! {
     /// is an `i64` at the boundary and the caller never sees an address.
     static SOCKETS: std::cell::RefCell<Vec<Option<Socket>>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// The table's empty slots, lowest first. A new socket takes the lowest,
+    /// as it did when the table was searched from the start -- handle numbers
+    /// are visible to programs -- without the search, which was a scan of
+    /// every connection on every accept.
+    static FREE_SOCKETS: std::cell::RefCell<std::collections::BinaryHeap<std::cmp::Reverse<usize>>> =
+        const { std::cell::RefCell::new(std::collections::BinaryHeap::new()) };
+    /// One read buffer per thread, reused. A read answers with exactly the
+    /// bytes that arrived; a fresh 64 KiB buffer per read, truncated but
+    /// keeping its capacity, held 64 KiB for every chunk a server kept.
+    static READ_BUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Reads once through the thread's read buffer, answering with the bytes read
+/// in a buffer of exactly their size.
+fn read_sized<T>(read: impl FnOnce(&mut [u8]) -> std::io::Result<(usize, T)>) -> std::io::Result<(Vec<u8>, T)> {
+    READ_BUF.with(|b| {
+        let mut b = b.borrow_mut();
+        if b.len() < 65536 {
+            b.resize(65536, 0);
+        }
+        let (n, extra) = read(&mut b[..])?;
+        Ok((b[..n].to_vec(), extra))
+    })
 }
 
 enum Socket {
@@ -7391,7 +7414,7 @@ fn socket_put(s: Socket) -> i64 {
         let mut table = table.borrow_mut();
         // A freed slot is reused, so a long-running server does not grow the
         // table once per connection.
-        if let Some(i) = table.iter().position(Option::is_none) {
+        if let Some(std::cmp::Reverse(i)) = FREE_SOCKETS.with(|f| f.borrow_mut().pop()) {
             table[i] = Some(s);
             return i as i64;
         }
@@ -7750,10 +7773,8 @@ unsafe fn grasm_tcp_read_now(handle: *mut RtVal) -> *mut RtVal {
     };
     let read = socket_with(h, |s| match s {
         Socket::Stream(stream) => {
-            let mut buf = vec![0u8; 65536];
-            match stream.read(&mut buf) {
-                Ok(n) => {
-                    buf.truncate(n);
+            match read_sized(|b| stream.read(b).map(|n| (n, ()))) {
+                Ok((buf, ())) => {
                     // Lossy, because a socket carries bytes and a Grasm `str`
                     // is text: a client that sends invalid UTF-8 gets its bytes
                     // replaced rather than crashing the server.
@@ -7853,12 +7874,8 @@ unsafe fn grasm_tcp_read_bytes_now(handle: *mut RtVal) -> *mut RtVal {
     };
     let read = socket_with(h, |s| match s {
         Socket::Stream(stream) => {
-            let mut buf = vec![0u8; 65536];
-            match stream.read(&mut buf) {
-                Ok(n) => {
-                    buf.truncate(n);
-                    Ok(buf)
-                }
+            match read_sized(|b| stream.read(b).map(|n| (n, ()))) {
+                Ok((buf, ())) => Ok(buf),
                 Err(e) => Err(e.to_string()),
             }
         }
@@ -8305,12 +8322,8 @@ unsafe fn grasm_udp_recv_now(handle: *mut RtVal) -> *mut RtVal {
     };
     let got = socket_with(h, |s| match s {
         Socket::Datagram(d) => {
-            let mut buf = vec![0u8; 65536];
-            match d.recv_from(&mut buf) {
-                Ok((n, _)) => {
-                    buf.truncate(n);
-                    Ok(buf)
-                }
+            match read_sized(|b| d.recv_from(b)) {
+                Ok((buf, _)) => Ok(buf),
                 Err(e) => Err(e.to_string()),
             }
         }
@@ -8343,12 +8356,8 @@ unsafe fn grasm_udp_recv_from_now(handle: *mut RtVal) -> *mut RtVal {
     };
     let got = socket_with(h, |s| match s {
         Socket::Datagram(d) => {
-            let mut buf = vec![0u8; 65536];
-            match d.recv_from(&mut buf) {
-                Ok((n, from)) => {
-                    buf.truncate(n);
-                    Ok((buf, from.ip().to_string(), i64::from(from.port())))
-                }
+            match read_sized(|b| d.recv_from(b)) {
+                Ok((buf, from)) => Ok((buf, from.ip().to_string(), i64::from(from.port()))),
                 Err(e) => Err(e.to_string()),
             }
         }
@@ -8429,7 +8438,9 @@ pub unsafe extern "C" fn grasm_net_close(handle: *mut RtVal) {
         SOCKETS.with(|table| {
             let mut table = table.borrow_mut();
             if let Some(slot) = table.get_mut(h as usize) {
-                *slot = None;
+                if slot.take().is_some() {
+                    FREE_SOCKETS.with(|f| f.borrow_mut().push(std::cmp::Reverse(h as usize)));
+                }
             }
         });
     }

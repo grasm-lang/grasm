@@ -70,8 +70,9 @@ functions that take a boxed value.
 3. Codegen for values in functions: literals, field reads, parameters, returns,
    copies and drops.
 4. Codegen for lists of values: `[]`, `push`, `len`, index, `for`.
-5. On by default once difftest, leakcheck and usecheck agree with it on the
-   whole corpus; the switch kept to build either way.
+5. *Done, 2026-10-01.* On by default: difftest, leakcheck and usecheck agree
+   with it on the whole corpus (507 programs each). `GRASM_VALUES=0` keeps
+   every struct boxed, and the gates run that build too.
 
 Then widen eligibility one generic operation at a time, each by boxing a value
 at the boundary where it meets the runtime.

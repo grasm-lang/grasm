@@ -343,8 +343,9 @@ fn compile_object_scoped(
     cg.closure_param_types = analysis.closure_param_types;
     cg.generic_ctor_types = analysis.generic_ctor_types;
     cg.resolved_types = analysis.resolved_types.into_iter().collect();
-    // Value structs (docs/values.md), stage 1: report which types qualify.
-    if std::env::var("GRASM_VALUES").is_ok_and(|v| v == "1") {
+    // Value structs (docs/values.md): on unless `GRASM_VALUES=0`, which keeps
+    // every struct boxed -- the switch stays so either build can be had.
+    if !std::env::var("GRASM_VALUES").is_ok_and(|v| v == "0") {
         let modules: Vec<&AstModule> = program.files.iter().map(|f| &f.module).collect();
         let ok = values::eligible(&modules, &cg.resolved_types);
         if std::env::var("GRASM_VALUES_REPORT").is_ok() {
@@ -531,8 +532,8 @@ struct Codegen<'m> {
     /// This is the checker's answer; the probe consults it first and falls
     /// back to its own reasoning, so there is never a window with neither.
     resolved_types: HashMap<(u32, u32), String>,
-    /// Struct types compiled as values (docs/values.md); empty unless
-    /// `GRASM_VALUES=1` while that work is experimental.
+    /// Struct types compiled as values (docs/values.md); empty under
+    /// `GRASM_VALUES=0`.
     value_types: std::collections::HashSet<String>,
     /// Spans that a *synthesised* expression reuses.
     ///
