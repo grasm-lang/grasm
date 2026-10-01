@@ -22,6 +22,15 @@ type. The scanner state, the character cursor and the sub-parsers stay private:
 nothing outside needs to know that a recursive descent parser is what is behind
 the door, and a module that exports its internals cannot change them.
 
+## Reading without a tree
+
+`reader`, `open_object`, `next_key`, `open_list`, `next_item`, `read_str`,
+`read_int`, `read_num`, `read_bool`, `read_null`, `peek_kind`, `skip` and
+`finish` read a document one value at a time from a cursor, so a program can
+decode straight into its own types instead of building a `ref Json` tree and
+walking it. They use the same scanners as `parse` and refuse what it refuses.
+`json-demo` shows them, malformed input included.
+
 ## capabilities = []
 
 A parser reads text and answers with a value. It opens no files, dials nothing

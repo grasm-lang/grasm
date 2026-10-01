@@ -86,16 +86,60 @@ fn hex4(p: JsonReader, at: i64) -> i64 ! JsonError {
 }
 
 fn parse_string(inout p: JsonReader) -> str ! JsonError {
-    let _ok = try expect(p, 34)
+    scan_string(p, true)
+}
+
+/// Where the run of plain string text starting at `from` ends: at a quote, a
+/// backslash, a control character or the end.
+fn plain_end(b: bytes, from: i64) -> i64 {
+    let n = b.len()
+    var i = from
+    while i < n {
+        let c = b.at(i)
+        if c == 34 or c == 92 or c < 32 {
+            return i
+        }
+        i = i + 1
+    }
+    i
+}
+
+/// The string at the cursor, read past and checked. With `keep` false nothing
+/// is cut out or decoded and the answer is empty: `skip` passes over a string
+/// it will throw away, and checking it is the whole of the work, so it is the
+/// same loop -- a string `parse` refuses is one `skip` refuses.
+fn scan_string(inout p: JsonReader, keep: bool) -> str ! JsonError {
+    // The checks are written out rather than made through `expect`: in
+    // compiled code every call that can fail allocates its answer, and this is
+    // the call a document makes most.
+    if peek(p) != 34 {
+        fail(JsonError{ why: "expected `\"` but found {shown(peek(p))}", at: p.i })
+    }
+    p.i = p.i + 1
+    // The usual string has no escape, and is one run cut out whole.
+    let end = plain_end(p.b, p.i)
+    if end < p.b.len() and p.b.at(end) == 34 {
+        let start = p.i
+        p.i = end + 1
+        if keep {
+            return p.b.slice(start, end).to_str()
+        }
+        return ""
+    }
     // Runs of plain text are cut out whole; only an escape is decoded.
     var pieces: [str] = []
     var run = p.i
+    p.i = end
     while true {
         if p.i >= p.b.len() {
             fail(JsonError{ why: "unterminated string", at: p.i })
         }
         let c = p.b.at(p.i)
         if c == 34 {
+            if not keep {
+                p.i = p.i + 1
+                return ""
+            }
             let tail = p.b.slice(run, p.i).to_str()
             p.i = p.i + 1
             // The usual string has no escape, and is the one cut.
@@ -109,23 +153,31 @@ fn parse_string(inout p: JsonReader) -> str ! JsonError {
             fail(JsonError{ why: "unescaped control character in a string", at: p.i })
         }
         if c != 92 {
-            p.i = p.i + 1
+            p.i = plain_end(p.b, p.i + 1)
             continue
         }
-        pieces.push(p.b.slice(run, p.i).to_str())
+        if keep {
+            pieces.push(p.b.slice(run, p.i).to_str())
+        }
         p.i = p.i + 1
         if p.i >= p.b.len() {
             fail(JsonError{ why: "unterminated escape", at: p.i })
         }
         let e = p.b.at(p.i)
-        if e == 110 { pieces.push("\n") }
-        else if e == 116 { pieces.push("\t") }
-        else if e == 114 { pieces.push("\r") }
-        else if e == 98 { pieces.push(8.to_char()) }
-        else if e == 102 { pieces.push(12.to_char()) }
-        else if e == 34 { pieces.push("\"") }
-        else if e == 92 { pieces.push("\\") }
-        else if e == 47 { pieces.push("/") }
+        if e == 110 or e == 116 or e == 114 or e == 98 or e == 102 or e == 34 or e == 92 or
+        e == 47 {
+            if keep {
+                pieces.push(
+                    if e == 110 { "\n" }
+                    else if e == 116 { "\t" }
+                    else if e == 114 { "\r" }
+                    else if e == 98 { 8.to_char() }
+                    else if e == 102 { 12.to_char() }
+                    else if e == 34 { "\"" }
+                    else if e == 92 { "\\" }
+                    else { "/" })
+            }
+        }
         else if e == 117 {
             var code = try hex4(p, p.i + 1)
             p.i = p.i + 4
@@ -152,7 +204,9 @@ fn parse_string(inout p: JsonReader) -> str ! JsonError {
             } else if code >= 56320 and code <= 57343 {
                 code = 65533
             }
-            pieces.push(code.to_char())
+            if keep {
+                pieces.push(code.to_char())
+            }
         }
         else { fail(JsonError{ why: "unknown escape `\\{e.to_char()}`", at: p.i }) }
         p.i = p.i + 1
@@ -705,4 +759,279 @@ pub fn with_item(v: ref Json, item: ref Json) -> ref Json {
     }
     items.push(item)
     ref(JList(items))
+}
+
+// --- reading without a tree -----------------------------------------------
+//
+// `parse` builds the whole document before the program looks at any of it,
+// and a program that wants its own types then walks that tree to build them:
+// every value is allocated twice and the first copy is thrown away. Reading a
+// 50 MB file of records that way spent most of its time making nodes nobody
+// kept. These read one value at a time from a cursor instead, so a program
+// decodes straight into its own structs and the tree is never made.
+//
+// The cursor is a `JsonReader`, the same one `parse` uses, and every function
+// here takes it `inout` and leaves it just past what it read. Each one checks
+// what it reads by the same rules `parse` does -- they are the same scanners --
+// so a document a program walks to the end with these is a document `parse`
+// would have accepted, and one it would have refused fails here with the same
+// `JsonError`. What the cursor cannot check is what the program never reads:
+// call `skip` on a value it does not want, and `finish` at the end, or the rest
+// of the text goes unexamined.
+//
+// An object is read as `open_object` and then `next_key` until it answers
+// `None`; a list as `open_list` and then `next_item` until it answers false.
+// After each key or item the program reads exactly one value. Neither keeps
+// any state beyond the position: whether a comma is owed is told by the byte
+// before the cursor, which is the bracket only when nothing has been read yet.
+// A key read without its value read after it is therefore an error at the next
+// call, not a silent misreading.
+
+/// A cursor at the start of `src`.
+pub fn reader(src: str) -> JsonReader {
+    JsonReader{ b: src.to_bytes(), i: 0 }
+}
+
+/// A cursor at the start of UTF-8 bytes. Text inside strings is converted as
+/// `to_str` converts it.
+pub fn reader_of(b: bytes) -> JsonReader {
+    JsonReader{ b: b, i: 0 }
+}
+
+/// The last byte before the cursor that is not whitespace, or -1 at the start.
+fn before(p: JsonReader) -> i64 {
+    var j = p.i - 1
+    while j >= 0 {
+        let c = p.b.at(j)
+        if c == 32 or c == 10 or c == 9 or c == 13 {
+            j = j - 1
+        } else {
+            return c
+        }
+    }
+    -1
+}
+
+/// What the next value is, as `kind` names it: `null`, `bool`, `number`,
+/// `string`, `list` or `object`. Nothing is read past but whitespace. It looks
+/// at one byte, so `nul` answers `null` and fails when it is read.
+pub fn peek_kind(inout p: JsonReader) -> str ! JsonError {
+    skip_ws(p)
+    let c = peek(p)
+    if c == 123 { "object" }
+    else if c == 91 { "list" }
+    else if c == 34 { "string" }
+    else if c == 116 or c == 102 { "bool" }
+    else if c == 110 { "null" }
+    else if c == 45 or is_digit(c) { "number" }
+    else if c < 0 { fail(JsonError{ why: "unexpected end of input", at: p.i }) }
+    else { fail(JsonError{ why: "expected a value but found {shown(c)}", at: p.i }) }
+}
+
+/// Reads past the `\{` that opens an object.
+pub fn open_object(inout p: JsonReader) -> () ! JsonError {
+    skip_ws(p)
+    if peek(p) != 123 {
+        fail(JsonError{ why: "expected `\{` but found {shown(peek(p))}", at: p.i })
+    }
+    p.i = p.i + 1
+}
+
+/// Reads past the `[` that opens a list.
+pub fn open_list(inout p: JsonReader) -> () ! JsonError {
+    skip_ws(p)
+    if peek(p) != 91 {
+        fail(JsonError{ why: "expected `[` but found {shown(peek(p))}", at: p.i })
+    }
+    p.i = p.i + 1
+}
+
+/// The next member's key, read through its `:`, or past the `\}` and `None`
+/// at the object's end. `next_key` with `keep` false: the key is checked and
+/// not cut out, for `skip`.
+fn member(inout p: JsonReader, keep: bool) -> Option[str] ! JsonError {
+    skip_ws(p)
+    let first = before(p) == 123
+    if peek(p) == 125 {
+        p.i = p.i + 1
+        return None
+    }
+    if not first {
+        if peek(p) != 44 {
+            fail(JsonError{ why: "expected `,` or `\}` but found {shown(peek(p))}", at: p.i })
+        }
+        p.i = p.i + 1
+        skip_ws(p)
+    }
+    let k = try scan_string(p, keep)
+    skip_ws(p)
+    if peek(p) != 58 {
+        fail(JsonError{ why: "expected `:` but found {shown(peek(p))}", at: p.i })
+    }
+    p.i = p.i + 1
+    Some(k)
+}
+
+/// The key of the object's next member, with the cursor left at its value --
+/// which the caller reads next, or `skip`s. `None` once the object has ended,
+/// with the cursor past its `\}`.
+///
+/// A key can appear twice. This reads members in the order the text has them
+/// and answers every one; a program that wants `get`'s answer -- the first --
+/// skips a key it has already seen.
+pub fn next_key(inout p: JsonReader) -> Option[str] ! JsonError {
+    member(p, true)
+}
+
+/// Whether the list has another element, with the cursor left at it. False
+/// once the list has ended, with the cursor past its `]`.
+pub fn next_item(inout p: JsonReader) -> bool ! JsonError {
+    skip_ws(p)
+    let first = before(p) == 91
+    if peek(p) == 93 {
+        p.i = p.i + 1
+        return false
+    }
+    if not first {
+        if peek(p) != 44 {
+            fail(JsonError{ why: "expected `,` or `]` but found {shown(peek(p))}", at: p.i })
+        }
+        p.i = p.i + 1
+    }
+    true
+}
+
+pub fn read_str(inout p: JsonReader) -> str ! JsonError {
+    skip_ws(p)
+    if peek(p) != 34 {
+        fail(JsonError{ why: "expected a string but found {shown(peek(p))}", at: p.i })
+    }
+    scan_string(p, true)
+}
+
+pub fn read_num(inout p: JsonReader) -> f64 ! JsonError {
+    skip_ws(p)
+    let c = peek(p)
+    if c != 45 and not is_digit(c) {
+        fail(JsonError{ why: "expected a number but found {shown(c)}", at: p.i })
+    }
+    parse_number(p)
+}
+
+/// A number written as a whole number, as an `i64`, read exactly.
+///
+/// `as_int` has to answer from an `f64`, and so refuses anything past 2^53;
+/// this reads the digits themselves, so every `i64` is reachable and nothing
+/// is rounded on the way. A number written with a fraction or an exponent is
+/// refused -- `1.0` and `1e3` included, though they name whole values -- as is
+/// one outside the `i64` range: the alternative is a quantity that silently
+/// became a different one.
+pub fn read_int(inout p: JsonReader) -> i64 ! JsonError {
+    skip_ws(p)
+    let start = p.i
+    let neg = peek(p) == 45
+    if neg {
+        p.i = p.i + 1
+    }
+    // Accumulated below zero, because the most negative `i64` has no positive
+    // partner to build it from.
+    var v = 0
+    var digits = 0
+    while p.i < p.b.len() {
+        let c = p.b.at(p.i)
+        if not is_digit(c) {
+            break
+        }
+        let d = c - 48
+        if v < -922337203685477580 or (v == -922337203685477580 and d > 8) {
+            fail(JsonError{ why: "integer out of range", at: start })
+        }
+        v = v * 10 - d
+        digits = digits + 1
+        p.i = p.i + 1
+    }
+    if digits == 0 {
+        fail(JsonError{ why: "expected an integer but found {shown(peek(p))}", at: p.i })
+    }
+    let c = peek(p)
+    if c == 46 or c == 101 or c == 69 {
+        fail(JsonError{ why: "expected an integer but found a fraction or exponent", at: start })
+    }
+    if neg {
+        return v
+    }
+    if v == -9223372036854775807 - 1 {
+        fail(JsonError{ why: "integer out of range", at: start })
+    }
+    -v
+}
+
+pub fn read_bool(inout p: JsonReader) -> bool ! JsonError {
+    skip_ws(p)
+    let c = peek(p)
+    if c == 116 {
+        let _e = try expect_word(p, "true")
+        return true
+    }
+    if c == 102 {
+        let _e = try expect_word(p, "false")
+        return false
+    }
+    fail(JsonError{ why: "expected `true` or `false` but found {shown(c)}", at: p.i })
+}
+
+/// Whether the next value is `null`, reading past it if it is. Anything else is
+/// left for the caller to read, which is how an optional field is read.
+pub fn read_null(inout p: JsonReader) -> bool ! JsonError {
+    skip_ws(p)
+    if peek(p) != 110 {
+        return false
+    }
+    let _e = try expect_word(p, "null")
+    true
+}
+
+/// Reads past one value of any kind, checking it as `parse` would and building
+/// nothing: a member the program does not know is still part of the document,
+/// and a document with a broken one in it is a broken document.
+pub fn skip(inout p: JsonReader) -> () ! JsonError {
+    skip_ws(p)
+    let c = peek(p)
+    if c < 0 {
+        fail(JsonError{ why: "unexpected end of input", at: p.i })
+    }
+    if c == 123 {
+        p.i = p.i + 1
+        var going = true
+        while going {
+            match try member(p, false) {
+                Some(_k) -> try skip(p)
+                None -> going = false
+            }
+        }
+    } else if c == 91 {
+        p.i = p.i + 1
+        while try next_item(p) {
+            try skip(p)
+        }
+    } else if c == 34 {
+        let _s = try scan_string(p, false)
+    } else if c == 116 {
+        let _e = try expect_word(p, "true")
+    } else if c == 102 {
+        let _e = try expect_word(p, "false")
+    } else if c == 110 {
+        let _e = try expect_word(p, "null")
+    } else {
+        let _n = try parse_number(p)
+    }
+}
+
+/// Fails unless only whitespace is left: the check `parse` makes after its one
+/// value, for a program that has read its own.
+pub fn finish(inout p: JsonReader) -> () ! JsonError {
+    skip_ws(p)
+    if p.i < p.b.len() {
+        fail(JsonError{ why: "trailing input after the value", at: p.i })
+    }
 }

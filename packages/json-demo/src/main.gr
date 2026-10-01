@@ -20,6 +20,94 @@ fn reach(label: str, doc: ref Json, p: str) {
     }
 }
 
+// A type of the program's own, read straight out of the text with the pull
+// API: no tree is built, members may come in any order, one it does not know
+// is skipped (and still checked), a repeated key keeps its first value as
+// `get` would, and one that never came is an error of the program's own.
+type Pin = { name: str, at: [i64], note: Option[str] }
+
+fn read_pin(src: str) -> Pin ! JsonError {
+    var r = json.reader(src)
+    var name: Option[str] = None
+    var at: Option[[i64]] = None
+    var note: Option[str] = None
+    var seen_note = false
+    try json.open_object(r)
+    var going = true
+    while going {
+        match try json.next_key(r) {
+            None -> going = false
+            Some(k) -> {
+                if k == "name" and name.is_none() {
+                    name = Some(try json.read_str(r))
+                } else if k == "at" and at.is_none() {
+                    var xs: [i64] = []
+                    try json.open_list(r)
+                    while try json.next_item(r) {
+                        xs.push(try json.read_int(r))
+                    }
+                    at = Some(xs)
+                } else if k == "note" and not seen_note {
+                    seen_note = true
+                    if not try json.read_null(r) {
+                        note = Some(try json.read_str(r))
+                    }
+                } else {
+                    try json.skip(r)
+                }
+            }
+        }
+    }
+    try json.finish(r)
+    match name {
+        None -> fail(JsonError{ why: "missing `name`", at: r.i })
+        Some(n) -> match at {
+            None -> fail(JsonError{ why: "missing `at`", at: r.i })
+            Some(xs) -> Pin{ name: n, at: xs, note: note }
+        }
+    }
+}
+
+fn pin(label: str, src: str) {
+    match read_pin(src) {
+        Ok(p) -> print("{label}: {p.name} at {p.at} note {p.note ?? "(none)"}")
+        Err(e) -> print("{label}: refused -- {e.why} at {e.at}")
+    }
+}
+
+fn int_read(label: str, src: str) {
+    var r = json.reader(src)
+    match json.read_int(r) {
+        Ok(n) -> print("  {label}: {n}")
+        Err(e) -> print("  {label}: refused -- {e.why} at {e.at}")
+    }
+}
+
+fn kinds(src: str) -> str ! JsonError {
+    var r = json.reader(src)
+    var out: [str] = []
+    try json.open_list(r)
+    while try json.next_item(r) {
+        out.push(try json.peek_kind(r))
+        try json.skip(r)
+    }
+    try json.finish(r)
+    out.join(" ")
+}
+
+fn skip_all(src: str) -> () ! JsonError {
+    var r = json.reader(src)
+    try json.skip(r)
+    try json.finish(r)
+}
+
+fn skipped(label: str, src: str) {
+    match skip_all(src) {
+        Ok(_u) -> print("  {label}: fine")
+        Err(e) -> print("  {label}: refused -- {e.why} at {e.at}")
+    }
+}
+
 fn main() {
     print("-- parsing")
     parsed("null", "null")
@@ -114,5 +202,45 @@ fn main() {
     print("  a part of it -> {alive(inner)}")
     json.free(doc)
     print("  freed twice -> fine")
-}
 
+    print("-- reading without a tree")
+    pin("in order", "\{\"name\": \"dock\", \"at\": [3, -4], \"note\": \"by the \\u00e9cluse\"}")
+    pin("any order", "\{\"at\": [], \"note\": null, \"name\": \"caf\u{e9}\"}")
+    pin("unknown members", "\{\"x\": \{\"y\": [1.5, true, null, \"\\u00e9\"]}, \"name\": \"a\", \"at\": [1]}")
+    pin("a repeated key", "\{\"name\": \"first\", \"at\": [1], \"name\": \"second\"}")
+    pin("a repeated key, broken the second time", "\{\"name\": \"first\", \"at\": [1], \"name\": tru}")
+    pin("missing", "\{\"name\": \"a\"}")
+    pin("wrong type", "\{\"name\": 7, \"at\": [1]}")
+    pin("a fraction where a whole number goes", "\{\"name\": \"a\", \"at\": [1.5]}")
+    pin("not an object", "[1]")
+    pin("trailing comma", "\{\"name\": \"a\", \"at\": [1],}")
+    pin("trailing comma in a list", "\{\"name\": \"a\", \"at\": [1,]}")
+    pin("missing comma", "\{\"name\": \"a\" \"at\": [1]}")
+    pin("missing colon", "\{\"name\" \"a\"}")
+    pin("broken unknown member", "\{\"name\": \"a\", \"at\": [1], \"x\": [1, \"\\q\"]}")
+    pin("truncated", "\{\"name\": \"a\", \"at\": [1")
+    pin("trailing input", "\{\"name\": \"a\", \"at\": [1]} x")
+    pin("nothing", "")
+    let every_kind = kinds("[null, true, 1, -2.5, \"s\", [], \{}]") ?? "(refused)"
+    print("  kinds -> {every_kind}")
+    print("  kinds of garbage -> {kinds("[1, @]") ?? "(refused)"}")
+
+    print("-- whole numbers, read exactly")
+    int_read("9007199254740993", "9007199254740993")
+    int_read("i64 max", "9223372036854775807")
+    int_read("i64 min", "-9223372036854775808")
+    int_read("one past i64 max", "9223372036854775808")
+    int_read("twenty digits", "99999999999999999999")
+    int_read("1.0", "1.0")
+    int_read("1e3", "1e3")
+    int_read("a lone minus", "-")
+    int_read("a string", "\"1\"")
+
+    print("-- skipping")
+    skipped("a nested document", " \{\"a\": [1, \{\"b\": \"\\ud83d\\ude00\"}], \"c\": false} ")
+    skipped("a bad escape", "[\"\\x\"]")
+    skipped("a raw control character", "\"a" + 1.to_char() + "b\"")
+    skipped("an unclosed object", "\{\"a\": 1")
+    skipped("a bad number", "[1.2.3]")
+    skipped("two values", "1 2")
+}
