@@ -1,6 +1,6 @@
 // HTTP/1.1 reverse proxy subset: the Grasm entry of benchmarks/systems/proxy.
 //
-//   proxy [listen_port] [upstream_port]        (defaults 9301, 9300)
+//   proxy [listen_port] [upstream_port] [workers]   (defaults 9301, 9300, 8)
 //
 // For each client connection: read requests (keep-alive, Content-Length bodies,
 // possibly 0), find the head, insert `X-Forwarded-For: <client ip>` or append
@@ -10,11 +10,19 @@
 //
 // ## Shape
 //
-// One thread, one `net_wait` readiness loop over the listener and every live
-// socket. That is the only shape that scales in Grasm today: `spawn` does not
-// carry `net`, and a `go` task inside `concurrent` that blocks in `tcp_accept`
-// or `tcp_read` blocks every other task (they are cooperatively scheduled and
-// only yield at channel operations), so a task per connection serialises.
+// `net_workers` threads, each running its own `net_wait` readiness loop over
+// the one shared listener and the connections it accepted. A worker shares
+// nothing with the others but the listener — its state is its own, built
+// inside it — so a client and its upstream connection stay on the thread that
+// accepted them.
+//
+// Every idle worker waits on the listener, so a new client wakes several of
+// them. They all call `tcp_accept`, one gets the connection, and for the rest
+// the accept answers an error rather than waiting: an accept right after
+// `net_wait` reported the listener ready does not wait ([L-LIB-NET-WORKERS]).
+// Each worker takes one client per wake-up rather than draining the queue, so
+// a burst of clients spreads over the workers instead of landing on whichever
+// woke first.
 //
 // Per-connection state lives in parallel lists indexed by the handle number,
 // which the runtime keeps small by reusing freed slots.
@@ -343,11 +351,9 @@ fn on_upstream(inout st: State, u: i64) / {net} {
     dispatch(st, c)
 }
 
-fn main() {
-    let a = args()
-    let port = (a.get(0) ?? "9301").parse_int() ?? 9301
-    let up_port = (a.get(1) ?? "9300").parse_int() ?? 9300
-    let listener = try tcp_listen(port)
+/// One worker: a readiness loop over the shared listener and the clients
+/// this worker accepted. Answers only if waiting fails.
+fn serve(listener: i64, up_port: i64) -> i64 / {net} {
     var st = State{
         kind: [],
         peer: [],
@@ -361,20 +367,16 @@ fn main() {
         cl_name: "content-length".codes(),
         xff_name: "x-forwarded-for".codes(),
     }
-    print("proxy listening on 127.0.0.1:{port}, upstream 127.0.0.1:{up_port}")
     while true {
-        let ready = try net_wait(st.watch, -1)
+        let ready = match net_wait(st.watch, -1) {
+            Err(_failed) -> return 1
+            Ok(r) -> r
+        }
         for h in ready {
             if h == listener {
-                // Drain the accept queue rather than taking one connection
-                // per pass: `tcp_accept` blocks, so ask (with a zero
-                // timeout) before each further accept.
+                // One per wake-up; a worker that lost the race to another
+                // gets an error from `tcp_accept` and `accept_one` returns.
                 accept_one(st, listener, up_port)
-                var more = 0
-                while more < 64 and not (net_wait([listener], 0) ?? []).is_empty() {
-                    accept_one(st, listener, up_port)
-                    more += 1
-                }
             } else if h < st.kind.len() {
                 if st.kind[h] == 1 {
                     on_client(st, h)
@@ -384,4 +386,16 @@ fn main() {
             }
         }
     }
+    0
+}
+
+fn main() {
+    let a = args()
+    let port = (a.get(0) ?? "9301").parse_int() ?? 9301
+    let up_port = (a.get(1) ?? "9300").parse_int() ?? 9300
+    let workers = (a.get(2) ?? "8").parse_int() ?? 8
+    let listener = try tcp_listen(port)
+    print("proxy listening on 127.0.0.1:{port}, upstream 127.0.0.1:{up_port}, {workers} workers")
+    let done = net_workers(workers, |w| serve(listener, up_port))
+    print("workers stopped: {done}")
 }

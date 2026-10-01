@@ -11,7 +11,7 @@ without copying the body.
 |---|---|
 | `upstream/` | Go `net/http` keep-alive server, shared by every run. Returns a fixed body (`-size`, default 4096). Echoes the `X-Forwarded-For` it received (`X-Echo-Xff`), how many such headers it got (`X-Echo-Xff-Count`) and the request body length (`X-Echo-Len`). |
 | `loadgen/` | Go raw-socket client: `-c` keep-alive connections (256), `-n` requests (200,000). Checks every response for status 200, body length, `X-Forwarded-For` exactly as expected and exactly once, and the request body length. Reports requests/s, p50/p99/p999 latency, and the proxy's peak RSS from `ps -o rss=` every 100 ms. |
-| `grasm/proxy.gr` | One thread running a `net_wait` readiness loop. |
+| `grasm/proxy.gr` | `net_workers` threads (8 by default), each running a `net_wait` readiness loop over the shared listener and its own clients. |
 | `rust/` | tokio (1.53.1) with one task per client. |
 | `go/` | Raw `net.Conn` with one goroutine per client. It does not use `httputil.ReverseProxy`. |
 
@@ -37,9 +37,11 @@ CONNS=64 REQS=20000 PROXIES="grasm go" ./run.sh
 
 `build.sh` (which both scripts call) builds everything into `$BUILD_DIR`. The default is `$TMPDIR/proxybench-build`. It compiles the Grasm proxy with `$GRASM`, which defaults to `target/release/grasm` at the repository root. Rust builds offline into `$CARGO_TARGET_DIR`. The scripts use ports `$PORT_BASE` and `$PORT_BASE+1` (default 23300 and 23301).
 
-**Parallelism is not equal.** Rust (tokio multi-thread) and Go use every core. The Grasm proxy runs on one thread because nothing else in Grasm scales for sockets:
-- `spawn` does not carry `net`.
-- A `go` task in `concurrent` can call socket builtins, but a task blocked in `tcp_accept` or `tcp_read` blocks every other task. Tasks are cooperatively scheduled and yield only at channel operations.
+**Parallelism.** Rust (tokio multi-thread) and Go use every core. The Grasm proxy runs `net_workers(n, f)` ([L-LIB-NET-WORKERS]): `n` OS threads, each running the readiness loop. The third argument sets `n` (`proxy 9301 9300 4`); the default is 8.
+- All workers wait on the one listener. A new client wakes several of them, and they all call `tcp_accept`. One gets the connection. For the others, `tcp_accept` returns an error instead of waiting, because an accept right after `net_wait` reported the listener ready never waits. Each worker accepts one client per wake-up, so a burst of clients is spread across workers.
+- A client and its upstream connection stay on the worker that accepted the client. Workers share nothing else: the checker allows the worker function only the `net` effect, and no `ref` or actor handle from outside.
+- Handles are process-wide. The runtime's socket table is one locked table, and no lock is held during blocking I/O.
+- `spawn` still does not carry `net`. A `go` task blocked in `tcp_accept` or `tcp_read` still blocks every other task. `net_workers` is the only way to put sockets on several threads.
 
 ## Where each proxy copies
 
@@ -67,7 +69,7 @@ Fixed since the benchmark was written:
 
 Still open:
 
-7. **Blocking writes.** `net_wait` reports readability only, and `tcp_write_bytes` blocks until everything is written. One slow reader stalls the whole loop.
+7. **Blocking writes.** `net_wait` reports readability only, and `tcp_write_bytes` blocks until everything is written. One slow reader stalls every client on the same worker.
 8. **`bytes` API gaps:**
    - No view or sub-range type.
    - No `index_of`.
@@ -78,4 +80,4 @@ Still open:
 10. **Wait-set cost grows with the set.**
     - `net_wait` rebuilds a `poll(2)` set on every call: O(n) per call, with no kqueue or epoll.
     - The handle table finds a free slot with a linear scan.
-11. **No parallelism for sockets.** `spawn` does not carry `net`, and a `go` task blocked on a socket blocks every other task (see "Parallelism is not equal" above).
+11. **Fixed: no parallelism for sockets.** `net_workers(n, f)` runs `f` on `n` threads that share the socket table (see "Parallelism" above). A worker cannot hand a connection to another worker, so a busy worker's clients cannot move to an idle one.

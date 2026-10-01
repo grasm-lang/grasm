@@ -35,7 +35,7 @@ fn bfs(root: ref Node) -> (i64, i64) {
     while head < queue.len() {
         let v = queue[head]
         head += 1
-        bytes += v.url.len()
+        bytes += v.url.byte_len()
         for w in v.edges {
             if not w.seen {
                 w.seen = true
