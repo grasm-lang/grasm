@@ -3160,8 +3160,15 @@ operation's",
     /// a pointer and a length per field. The pointers are relocations, so the
     /// text itself is the same interned bytes every other mention of that name
     /// uses.
-    fn struct_desc(&mut self, name: &str, fields: &[String]) -> cranelift_module::DataId {
-        let key = format!("{name}\u{0}{}", fields.join("\u{0}"));
+    fn struct_desc(
+        &mut self,
+        name: &str,
+        fields: &[String],
+        kinds: &[u8],
+    ) -> cranelift_module::DataId {
+        // The kinds are part of the key: `Pair[i64, str]` and `Pair[str, i64]`
+        // share a name and field names and store their fields differently.
+        let key = format!("{name}\u{0}{}\u{0}{kinds:?}", fields.join("\u{0}"));
         if let Some(id) = self.struct_descs.get(&key) {
             return *id;
         }
@@ -3169,15 +3176,19 @@ operation's",
         let field_ids: Vec<cranelift_module::DataId> =
             fields.iter().map(|f| self.intern_string(f)).collect();
 
-        let size = 32 + fields.len() * 16;
+        // A (pointer, length, kind) triple per field: see `StructDesc` in the
+        // runtime, which reads this layout.
+        let size = 32 + fields.len() * 24;
         let mut bytes = vec![0u8; size];
         // Little-endian: the backend targets the host, and every target it can
         // reach is little-endian.
         bytes[16..24].copy_from_slice(&(name.len() as u64).to_le_bytes());
         bytes[24..32].copy_from_slice(&(fields.len() as u64).to_le_bytes());
         for (i, f) in fields.iter().enumerate() {
-            let at = 32 + i * 16 + 8;
+            let at = 32 + i * 24 + 8;
             bytes[at..at + 8].copy_from_slice(&(f.len() as u64).to_le_bytes());
+            let kind = u64::from(kinds.get(i).copied().unwrap_or(0));
+            bytes[at + 8..at + 16].copy_from_slice(&kind.to_le_bytes());
         }
 
         // Writable: the runtime stores the built `StructTy` into word 0.
@@ -3192,7 +3203,7 @@ operation's",
         d.write_data_addr(8, gv, 0);
         for (i, fid) in field_ids.iter().enumerate() {
             let gv = self.module.declare_data_in_data(*fid, &mut d);
-            d.write_data_addr((32 + i * 16) as u32, gv, 0);
+            d.write_data_addr((32 + i * 24) as u32, gv, 0);
         }
         self.module.define_data(id, &d).expect("data define");
         self.struct_descs.insert(key, id);
@@ -4250,6 +4261,19 @@ fn collect_idents_block(b: &grasm_syntax::ast::Block, out: &mut Vec<String>) {
 /// once, however many times it runs — so the index assigned here is the index
 /// the emitted code records. A nested `parallel` owns its own sites, so the
 /// walk stops there.
+/// How a struct stores a field of this type: `0` for a box, otherwise the
+/// runtime's `FK_*` kind of a scalar kept as its bits.
+fn field_kind(t: &VType) -> u8 {
+    match t {
+        VType::I64 => 1,
+        VType::F64 => 2,
+        VType::Bool => 3,
+        VType::Ref(_) => 4,
+        VType::Unit => 5,
+        _ => 0,
+    }
+}
+
 fn collect_spawn_sites(block: &grasm_syntax::ast::Block) -> Vec<&grasm_syntax::ast::Block> {
     let mut out = Vec::new();
     walk_spawns(block, &mut out);
@@ -7145,6 +7169,10 @@ impl FnCx<'_, '_> {
         let Ok(ft) = self.struct_field_type(&sname, &name.name, *span) else {
             return Ok(None);
         };
+        // A scalar field is bits, with no box to lend.
+        if !ft.boxed() {
+            return Ok(None);
+        }
         let Some(i) = self.struct_field_index(&sname, &name.name) else {
             return Ok(None);
         };
@@ -14666,6 +14694,15 @@ fields, not the type this is bound to, not an enclosing generic",
             if ft == VType::F64 && fvt == VType::I64 {
                 fv = self.b.ins().fcvt_from_sint(types::F64, fv);
             }
+            // Without a base the value is built by `grasm_struct_make`, which
+            // stores a scalar field as its bits: nothing to box, and nothing
+            // to release if a later field leaves. With one, the field goes in
+            // through `grasm_struct_set_field`, which takes a box.
+            if base.is_none() && field_kind(&ft) != 0 {
+                let bits = self.scalar_bits_of(fv, &ft);
+                built.push((fname.name.clone(), bits));
+                continue;
+            }
             let boxed = self.box_value(fv, &ft);
             if ft.boxed()
                 || matches!(
@@ -14723,7 +14760,17 @@ fields, not the type this is bound to, not an enclosing generic",
                 .get(&sname)
                 .map(|(base, _)| base.clone())
                 .unwrap_or_else(|| sname.clone());
-            let did = self.cg.struct_desc(&display_name, &names);
+            let kinds: Vec<u8> = names
+                .iter()
+                .map(|n| {
+                    self.cg
+                        .structs
+                        .get(&sname)
+                        .and_then(|fs| fs.iter().find(|(f, _)| f == n))
+                        .map_or(0, |(_, t)| field_kind(t))
+                })
+                .collect();
+            let did = self.cg.struct_desc(&display_name, &names, &kinds);
             let gv = self.cg.module.declare_data_in_func(did, self.b.func);
             let dp = self.b.ins().global_value(ptr_ty, gv);
             sv = self.call_rt("grasm_struct_make", &[dp, argv]).unwrap();

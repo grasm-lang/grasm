@@ -747,6 +747,75 @@ pub struct StructTy {
     /// Declaration order. A field is read by index because of this: the
     /// backend sorts every literal into this order before storing anything.
     pub fields: Vec<&'static str>,
+    /// What each field holds, in the same order: a box (`FK_BOXED`), or the
+    /// raw bits of a scalar stored in the field's word itself. A struct used
+    /// to box every field, so `Point{ x: 1.5, y: 2.5 }` was three allocations
+    /// and reading `p.x` followed a second pointer; a scalar is now just bits.
+    pub kinds: Vec<u8>,
+}
+
+/// A struct field's kind, as the backend records it in the descriptor.
+pub const FK_BOXED: u8 = 0;
+pub const FK_I64: u8 = 1;
+pub const FK_F64: u8 = 2;
+pub const FK_BOOL: u8 = 3;
+pub const FK_REF: u8 = 4;
+pub const FK_UNIT: u8 = 5;
+
+impl StructTy {
+    /// Whether field `i` holds a box rather than a scalar's bits.
+    #[inline]
+    fn boxed(&self, i: usize) -> bool {
+        self.kinds.get(i).copied().unwrap_or(FK_BOXED) == FK_BOXED
+    }
+}
+
+/// A box holding a scalar field's bits, for a caller that wants a value.
+unsafe fn box_field_bits(kind: u8, bits: i64) -> *mut RtVal {
+    match kind {
+        FK_F64 => grasm_box_f64(f64::from_bits(bits as u64)),
+        FK_BOOL => grasm_box_bool(i8::from(bits != 0)),
+        FK_REF => grasm_box_ref(bits),
+        FK_UNIT => grasm_box_unit(),
+        _ => grasm_box_i64(bits),
+    }
+}
+
+/// A scalar's bits, out of the box it arrived in.
+unsafe fn unbox_field_bits(v: *mut RtVal) -> i64 {
+    match &(*v).payload {
+        RtPayload::I64(x) => *x,
+        RtPayload::Bool(b) => i64::from(*b),
+        RtPayload::F64(f) => f.to_bits() as i64,
+        RtPayload::Ref(r) => *r,
+        RtPayload::Unit => 0,
+        _ => grasm_panic_msg_str("a boxed value stored into a scalar field"),
+    }
+}
+
+/// Two scalar fields of one kind, compared as the values they are: an `f64`
+/// as a float, so `NaN` is unequal to itself as it is anywhere else.
+fn field_bits_eq(kind: u8, a: i64, b: i64) -> bool {
+    if kind == FK_F64 {
+        f64::from_bits(a as u64) == f64::from_bits(b as u64)
+    } else {
+        a == b
+    }
+}
+
+/// Copies a struct's fields for a new owner: a box gains a count, a scalar's
+/// bits are just bits.
+unsafe fn copy_fields(ty: &StructTy, fields: &StructFields) -> Vec<*mut RtVal> {
+    fields
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            if ty.boxed(i) {
+                inc(*v);
+            }
+            *v
+        })
+        .collect()
 }
 
 /// The compiler's description of a struct type, one per type, sitting in the
@@ -764,8 +833,8 @@ pub struct StructTy {
 ///  +8  name_ptr   -> the type's name          (relocation)
 /// +16  name_len
 /// +24  nfields
-/// +32  field 0: ptr (relocation), len
-/// +48  field 1: ...
+/// +32  field 0: ptr (relocation), len, kind (`FK_*`)
+/// +56  field 1: ...
 /// ```
 #[repr(C)]
 pub struct StructDesc {
@@ -773,7 +842,7 @@ pub struct StructDesc {
     name_ptr: *const u8,
     name_len: u64,
     nfields: u64,
-    // `nfields` (ptr, len) pairs follow.
+    // `nfields` (ptr, len, kind) triples follow.
 }
 
 /// The `StructTy` a descriptor stands for, built on first use.
@@ -793,18 +862,21 @@ unsafe fn desc_ty(desc: *const StructDesc) -> &'static StructTy {
         return &*(cached as *const StructTy);
     }
     let n = (*desc).nfields as usize;
-    let pairs = (desc as *const u8).add(32) as *const u64;
+    let triples = (desc as *const u8).add(32) as *const u64;
     let mut fields = Vec::with_capacity(n);
+    let mut kinds = Vec::with_capacity(n);
     for i in 0..n {
-        let p = *pairs.add(i * 2) as *const u8;
-        let l = *pairs.add(i * 2 + 1);
+        let p = *triples.add(i * 3) as *const u8;
+        let l = *triples.add(i * 3 + 1);
         fields.push(borrowed_str(p, l));
+        kinds.push(*triples.add(i * 3 + 2) as u8);
     }
     // Leaked on purpose: one per struct type, and it has to outlive every
     // value that points at it.
     let fresh: &'static StructTy = Box::leak(Box::new(StructTy {
         name: borrowed_str((*desc).name_ptr, (*desc).name_len),
         fields,
+        kinds,
     }));
     let addr = fresh as *const StructTy as usize;
     match (*desc)
@@ -1929,12 +2001,13 @@ pub unsafe extern "C" fn grasm_region_pop() {
                         .filter(|c| (**c).rc.load(Relaxed) != ARENA),
                 );
             }
-            RtPayload::Struct { fields, .. } => {
+            RtPayload::Struct { ty, fields } => {
                 outside.extend(
                     fields
                         .iter()
-                        .copied()
-                        .filter(|c| (**c).rc.load(Relaxed) != ARENA),
+                        .enumerate()
+                        .filter(|(i, c)| ty.boxed(*i) && (***c).rc.load(Relaxed) != ARENA)
+                        .map(|(_, c)| *c),
                 );
             }
             RtPayload::Variant { fields, .. } => {
@@ -1973,6 +2046,7 @@ pub unsafe extern "C" fn grasm_region_pop() {
         });
     }
 }
+
 
 /// Small integers worth interning. Covers loop counters, indices, flags, and
 /// the small constants that dominate real programs.
@@ -2156,9 +2230,9 @@ unsafe fn dec_walk(local: &Local, v: *mut RtVal) {
                     }
                 }
             }
-            RtPayload::Struct { fields, .. } => {
-                for c in fields.iter() {
-                    if release_to_zero(*c) {
+            RtPayload::Struct { ty, fields } => {
+                for (i, c) in fields.iter().enumerate() {
+                    if ty.boxed(i) && release_to_zero(*c) {
                         push_pending(&mut inline, &mut n, &mut spill, *c);
                     }
                 }
@@ -4083,7 +4157,16 @@ unsafe fn display(v: *mut RtVal) -> String {
                 .enumerate()
                 .map(|(i, fv)| {
                     let k = names.get(i).copied().unwrap_or("?");
-                    format!("{k}: {}", display(*fv))
+                    if ty.boxed(i) {
+                        format!("{k}: {}", display(*fv))
+                    } else {
+                        // Rendered through a box so a scalar field prints
+                        // exactly as the same value does anywhere else.
+                        let b = box_field_bits(ty.kinds[i], *fv as i64);
+                        let text = display(b);
+                        dec(b);
+                        format!("{k}: {text}")
+                    }
                 })
                 .collect();
             format!("{name}{{{}}}", parts.join(", "))
@@ -4194,9 +4277,14 @@ pub unsafe extern "C" fn grasm_struct_make(
 /// and the caller keeps the struct alive for as long as it uses the result.
 #[no_mangle]
 pub unsafe extern "C" fn grasm_struct_borrow_at(s: *mut RtVal, i: i64) -> *mut RtVal {
-    let RtPayload::Struct { fields, .. } = &(*s).payload else {
+    let RtPayload::Struct { ty, fields } = &(*s).payload else {
         grasm_panic_msg_str("field access on non-struct");
     };
+    if !ty.boxed(i as usize) {
+        // A scalar field has no box to lend; the backend reads those with
+        // `grasm_struct_scalar_at`.
+        grasm_panic_msg_str("a borrowed read of a scalar field");
+    }
     match fields.get(i as usize) {
         Some(v) => *v,
         None => grasm_panic_msg_str("no such field"),
@@ -4222,9 +4310,15 @@ pub unsafe extern "C" fn grasm_struct_borrow_at(s: *mut RtVal, i: i64) -> *mut R
 /// and the field's static type is a scalar.
 #[no_mangle]
 pub unsafe extern "C" fn grasm_struct_scalar_at(s: *mut RtVal, i: i64) -> i64 {
-    let RtPayload::Struct { fields, .. } = &(*s).payload else {
+    let RtPayload::Struct { ty, fields } = &(*s).payload else {
         grasm_panic_msg_str("field access on non-struct");
     };
+    if !ty.boxed(i as usize) {
+        return match fields.get(i as usize) {
+            Some(v) => *v as i64,
+            None => grasm_panic_msg_str("no such field"),
+        };
+    }
     match fields.get(i as usize) {
         Some(v) => match &(**v).payload {
             RtPayload::I64(x) => *x,
@@ -4254,10 +4348,11 @@ pub unsafe extern "C" fn grasm_struct_scalar_at(s: *mut RtVal, i: i64) -> i64 {
 /// # Safety: `i` is a field index the compiler resolved for this struct type.
 #[no_mangle]
 pub unsafe extern "C" fn grasm_struct_get_at(s: *mut RtVal, i: i64) -> *mut RtVal {
-    let RtPayload::Struct { fields, .. } = &(*s).payload else {
+    let RtPayload::Struct { ty, fields } = &(*s).payload else {
         grasm_panic_msg_str("field access on non-struct");
     };
     match fields.get(i as usize) {
+        Some(v) if !ty.boxed(i as usize) => box_field_bits(ty.kinds[i as usize], *v as i64),
         Some(v) => {
             inc(*v);
             *v
@@ -4282,6 +4377,9 @@ pub unsafe extern "C" fn grasm_struct_get(s: *mut RtVal, name: *const u8, len: u
     let idx = ty.fields.iter().position(|n| *n == key);
     if let Some(i) = idx {
         if let Some(v) = fields.get(i) {
+            if !ty.boxed(i) {
+                return box_field_bits(ty.kinds[i], *v as i64);
+            }
             inc(*v);
             return *v;
         }
@@ -4318,6 +4416,10 @@ pub unsafe extern "C" fn grasm_struct_take(s: *mut RtVal, name: *const u8, len: 
     let idx = ty.fields.iter().position(|n| *n == key);
     let hole = interned_bool(false);
     if let Some(i) = idx {
+        // A scalar's bits are not a value to take; the caller copies instead.
+        if !ty.boxed(i) {
+            return std::ptr::null_mut();
+        }
         if let Some(v) = fields.get_mut(i) {
             return std::mem::replace(v, hole);
         }
@@ -4367,13 +4469,7 @@ pub unsafe extern "C" fn grasm_struct_set_field_at(
         let RtPayload::Struct { ty: sty, fields } = &(*s).payload else {
             grasm_panic_msg_str("set_field on non-struct");
         };
-        let cloned: Vec<*mut RtVal> = fields
-            .iter()
-            .map(|v| {
-                inc(*v);
-                *v
-            })
-            .collect();
+        let cloned = copy_fields(sty, fields);
         let nv = alloc(RtPayload::Struct {
             ty: sty,
             fields: StructFields::from_values(cloned),
@@ -4381,9 +4477,18 @@ pub unsafe extern "C" fn grasm_struct_set_field_at(
         dec(s);
         nv
     };
-    let RtPayload::Struct { fields, .. } = &mut (*target).payload else {
+    let RtPayload::Struct { ty, fields } = &mut (*target).payload else {
         unreachable!()
     };
+    if !ty.boxed(i as usize) {
+        let bits = unbox_field_bits(val);
+        dec(val);
+        match fields.get_mut(i as usize) {
+            Some(slot) => *slot = bits as *mut RtVal,
+            None => grasm_panic_msg_str("no such field"),
+        }
+        return target;
+    }
     match fields.get_mut(i as usize) {
         Some(slot) => {
             // The value is already in this slot, so the store is a no-op —
@@ -4421,13 +4526,7 @@ pub unsafe extern "C" fn grasm_struct_set_field(
         };
         // Copying a struct copies its field *pointers*; the names live once in
         // the type and cost nothing to carry.
-        let cloned: Vec<*mut RtVal> = fields
-            .iter()
-            .map(|v| {
-                inc(*v);
-                *v
-            })
-            .collect();
+        let cloned = copy_fields(sty, fields);
         let nv = alloc(RtPayload::Struct {
             ty: sty,
             fields: StructFields::from_values(cloned),
@@ -4441,6 +4540,14 @@ pub unsafe extern "C" fn grasm_struct_set_field(
     let key = borrowed_str(name, len);
     let idx = ty.fields.iter().position(|n| *n == key);
     if let Some(i) = idx {
+        if !ty.boxed(i) {
+            let bits = unbox_field_bits(val);
+            dec(val);
+            if let Some(v) = fields.get_mut(i) {
+                *v = bits as *mut RtVal;
+                return target;
+            }
+        }
         if let Some(v) = fields.get_mut(i) {
             // As in `grasm_struct_set_field_at`: the caller's reference is
             // the surplus one when the value is already here (F79).
@@ -4609,8 +4716,12 @@ unsafe fn val_eq_step(
             if t1.name != t2.name || f1.len() != f2.len() {
                 return false;
             }
-            for (v1, v2) in f1.iter().zip(f2.iter()) {
-                work.push((*v1, *v2));
+            for (i, (v1, v2)) in f1.iter().zip(f2.iter()).enumerate() {
+                if t1.boxed(i) {
+                    work.push((*v1, *v2));
+                } else if !field_bits_eq(t1.kinds[i], *v1 as i64, *v2 as i64) {
+                    return false;
+                }
             }
             true
         }
@@ -4713,7 +4824,13 @@ unsafe fn val_eq(a: *mut RtVal, b: *mut RtVal) -> bool {
         (RtPayload::Struct { ty: t1, fields: f1 }, RtPayload::Struct { ty: t2, fields: f2 }) => {
             t1.name == t2.name
                 && f1.len() == f2.len()
-                && f1.iter().zip(f2.iter()).all(|(v1, v2)| val_eq(*v1, *v2))
+                && f1.iter().zip(f2.iter()).enumerate().all(|(i, (v1, v2))| {
+                    if t1.boxed(i) {
+                        val_eq(*v1, *v2)
+                    } else {
+                        field_bits_eq(t1.kinds[i], *v1 as i64, *v2 as i64)
+                    }
+                })
         }
         (
             RtPayload::Variant {
@@ -5440,13 +5557,7 @@ pub unsafe extern "C" fn grasm_ref_make_unique(r: i64) -> *mut RtVal {
     // the same slot, so every holder of the *reference* sees what follows.
     let fresh = match &(*p).payload {
         RtPayload::Struct { ty, fields } => {
-            let cloned: Vec<*mut RtVal> = fields
-                .iter()
-                .map(|v| {
-                    inc(*v);
-                    *v
-                })
-                .collect();
+            let cloned = copy_fields(ty, fields);
             alloc(RtPayload::Struct {
                 ty,
                 fields: StructFields::from_values(cloned),
