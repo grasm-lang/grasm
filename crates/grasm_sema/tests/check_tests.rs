@@ -826,6 +826,42 @@ fn a_list_may_hold_functions_of_the_same_shape() {
     );
 }
 
+// net_workers ([L-LIB-NET-WORKERS]): a parallel operation whose function may
+// perform `net`, and nothing else.
+
+#[test]
+fn net_workers_allows_net_and_answers_a_list() {
+    check_ok("fn probe(i: i64) -> bool / {net} {\n    (tcp_listen(0) ?? -1) >= 0\n}\nfn main() / {io, net} {\n    let a: [bool] = net_workers(2, probe)\n    let b: [i64] = net_workers(2, |i| i + 1)\n    print(\"{a} {b}\")\n}\n");
+}
+
+#[test]
+fn net_workers_refuses_every_effect_but_net() {
+    check_err(
+        "fn loud(i: i64) -> i64 / {io} {\n    print(\"hi\")\n    i\n}\nfn main() / {io, net} {\n    let a = net_workers(2, loud)\n}\n",
+        "may perform only `net`",
+    );
+    check_err(
+        "fn main() / {io, net} {\n    let a = net_workers(2, |i| {\n        print(\"x\")\n        i\n    })\n}\n",
+        "may perform only `net`",
+    );
+}
+
+#[test]
+fn net_workers_refuses_a_ref_from_outside() {
+    check_err(
+        "type Acc = { n: i64 }\nfn main() / {io, net} {\n    let acc = ref(Acc{ n: 0 })\n    let a = net_workers(2, |i| acc.n + i)\n}\n",
+        "reaches a `ref` from outside",
+    );
+}
+
+#[test]
+fn net_workers_performs_net() {
+    check_err(
+        "fn main() / {io} {\n    let a = net_workers(2, |i| i)\n}\n",
+        "performs effect(s) `net`",
+    );
+}
+
 // ---------------------------------------------------------------------------
 // par_map
 // ---------------------------------------------------------------------------

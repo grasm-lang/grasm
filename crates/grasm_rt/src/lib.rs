@@ -400,7 +400,7 @@ pub enum MapKey {
     /// `MapKey::of` used to call `to_string()` on every key on every `set`,
     /// including one already in the table — four hundred thousand allocations
     /// for eight distinct one-byte keys.
-    Str(StrData),
+    Str(KeyStr),
 }
 
 thread_local! {
@@ -437,14 +437,14 @@ unsafe fn with_key<R>(v: *mut RtVal, f: impl FnOnce(&MapKey) -> R) -> R {
         // Short text needs no buffer at all: the inline form *is* the key.
         // Long text still borrows the scratch buffer, so a probe with a long
         // key does not allocate either.
-        RtPayload::Str(s) if s.len() <= 15 => f(&MapKey::Str(StrData::of(s))),
+        RtPayload::Str(s) if s.len() <= KEY_INLINE_CAP => f(&MapKey::Str(KeyStr::of(s))),
         RtPayload::Str(s) => PROBE.with(|cell| {
             let mut buf = cell.borrow_mut();
             buf.clear();
             buf.push_str(s);
-            let key = MapKey::Str(StrData::Heap(std::mem::take(&mut buf)));
+            let key = MapKey::Str(KeyStr::Heap(std::mem::take(&mut buf)));
             let out = f(&key);
-            let MapKey::Str(StrData::Heap(returned)) = key else {
+            let MapKey::Str(KeyStr::Heap(returned)) = key else {
                 unreachable!()
             };
             *buf = returned;
@@ -463,7 +463,7 @@ impl MapKey {
         match &(*v).payload {
             RtPayload::Bool(b) => MapKey::Bool(*b),
             RtPayload::I64(n) => MapKey::I64(*n),
-            RtPayload::Str(s) => MapKey::Str(StrData::of(s)),
+            RtPayload::Str(s) => MapKey::Str(KeyStr::of(s)),
             _ => rt_panic(&format!("invalid map key `{}`", display(v))),
         }
     }
@@ -477,9 +477,27 @@ impl MapKey {
     }
 }
 
+/// `repr(u8)` so compiled code can find the buffer: the tag is the first
+/// byte, the `Vec` at `layout::SCALAR_VEC`, and the `Vec`'s own address,
+/// length and capacity at the offsets `vec_layout` measures (`Vec` does not
+/// promise an order, so it is measured rather than assumed, and the compiler
+/// checks its own measurement against this one at startup).
+#[repr(u8)]
 pub enum ScalarData {
     Words(Vec<i64>),
     Bytes(Vec<u8>),
+}
+
+/// Where a `Vec` keeps its address, length and capacity, in bytes from its
+/// start: found by making one whose three words all differ and looking.
+pub fn vec_layout() -> (usize, usize, usize) {
+    let mut v: Vec<i64> = Vec::with_capacity(7);
+    v.extend_from_slice(&[1, 2, 3]);
+    let words: [usize; 3] = unsafe { std::mem::transmute_copy(&v) };
+    let find = |x: usize| words.iter().position(|&w| w == x).expect("a Vec word") * 8;
+    let out = (find(v.as_ptr() as usize), find(v.len()), find(v.capacity()));
+    drop(v);
+    out
 }
 
 impl ScalarData {
@@ -632,7 +650,11 @@ impl ScalarData {
 /// exactly "as many characters as bytes" — which is what makes `code_at(i)` an
 /// index rather than a walk.
 /// How many bytes a string keeps in its own box before it needs the heap.
-pub const INLINE_STR_CAP: usize = 15;
+///
+/// 38 is all the room the 64-byte box has (the size assert on `RtVal` holds
+/// it there): a URL, a map key, a word, a short line all fit, and each one
+/// was a heap allocation of its own -- and 48 more bytes of memory -- at 15.
+pub const INLINE_STR_CAP: usize = 38;
 
 #[derive(Debug)]
 pub struct RtStr {
@@ -656,7 +678,7 @@ pub struct RtStr {
     /// ASCII text needs no index at all: there the byte offset is the index
     /// and the character count is the byte count, which `char_len` answers
     /// without touching this.
-    index: std::sync::OnceLock<Box<CharIndex>>,
+    index: IndexCell,
 }
 
 /// A struct's field values: inline when there are few, on the heap when not.
@@ -907,8 +929,8 @@ unsafe fn desc_ty(desc: *const StructDesc) -> &'static StructTy {
 /// Compared, ordered and hashed **by content**, so the inline and heap forms
 /// of the same text are the same key. Deriving these instead would make
 /// `Inline("a")` and `Heap("a")` different, which is a wrong answer in a map.
-impl PartialEq for StrData {
-    fn eq(&self, other: &StrData) -> bool {
+impl<const N: usize> PartialEq for StrData<N> {
+    fn eq(&self, other: &StrData<N>) -> bool {
         // Two inline strings are equal exactly when their fifteen bytes are,
         // because `of` starts from zeroes and writes only the text: whatever
         // follows it is zero in both. That makes the comparison two loads the
@@ -922,19 +944,19 @@ impl PartialEq for StrData {
         self.as_str() == other.as_str()
     }
 }
-impl Eq for StrData {}
-impl std::hash::Hash for StrData {
+impl<const N: usize> Eq for StrData<N> {}
+impl<const N: usize> std::hash::Hash for StrData<N> {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.as_str().hash(state);
     }
 }
-impl PartialOrd for StrData {
-    fn partial_cmp(&self, other: &StrData) -> Option<std::cmp::Ordering> {
+impl<const N: usize> PartialOrd for StrData<N> {
+    fn partial_cmp(&self, other: &StrData<N>) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
-impl Ord for StrData {
-    fn cmp(&self, other: &StrData) -> std::cmp::Ordering {
+impl<const N: usize> Ord for StrData<N> {
+    fn cmp(&self, other: &StrData<N>) -> std::cmp::Ordering {
         self.as_str().cmp(other.as_str())
     }
 }
@@ -972,16 +994,23 @@ fn i64_digits(v: i64, buf: &mut [u8; 20]) -> usize {
 /// Public only because `RtPayload` is, and a map key holds one. Nothing
 /// outside this crate has any use for it: the interpreter has its own value
 /// representation and never links the runtime.
+///
+/// `N` is how many bytes are held inline: a string value's full
+/// `INLINE_STR_CAP`, or a map key's `KEY_INLINE_CAP` -- a key is stored in
+/// every entry of its table, so it is kept to the 24 bytes a `String` takes.
 #[derive(Debug, Clone)]
-pub enum StrData {
-    Inline {
-        bytes: [u8; INLINE_STR_CAP],
-        len: u8,
-    },
+pub enum StrData<const N: usize = INLINE_STR_CAP> {
+    Inline { bytes: [u8; N], len: u8 },
     Heap(String),
 }
 
-impl StrData {
+/// How many bytes a map key keeps inline (see `StrData`).
+pub const KEY_INLINE_CAP: usize = 15;
+
+/// A map key's text.
+pub type KeyStr = StrData<KEY_INLINE_CAP>;
+
+impl<const N: usize> StrData<N> {
     fn as_str(&self) -> &str {
         match self {
             // Valid UTF-8 by construction: every constructor either copies
@@ -994,9 +1023,9 @@ impl StrData {
     }
 
     /// Inline when the text fits, heap otherwise.
-    fn of(text: &str) -> StrData {
-        if text.len() <= INLINE_STR_CAP {
-            let mut bytes = [0u8; 15];
+    fn of(text: &str) -> StrData<N> {
+        if text.len() <= N {
+            let mut bytes = [0u8; N];
             bytes[..text.len()].copy_from_slice(text.as_bytes());
             StrData::Inline {
                 bytes,
@@ -1016,6 +1045,60 @@ impl StrData {
 const LEN_CACHE_MIN: usize = 256;
 
 #[derive(Debug)]
+/// A string's character index, built at most once and then shared: what a
+/// `OnceLock<Box<CharIndex>>` is, in one word instead of two. A `OnceLock`
+/// keeps its `Once` beside the value, and those eight bytes are what kept a
+/// string's inline storage at 30 bytes rather than 38.
+pub struct IndexCell(std::sync::atomic::AtomicPtr<CharIndex>);
+
+impl IndexCell {
+    const fn new() -> IndexCell {
+        IndexCell(std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()))
+    }
+
+    fn get(&self) -> Option<&CharIndex> {
+        let p = self.0.load(std::sync::atomic::Ordering::Acquire);
+        // Safety: a non-null pointer was published by `set`, and lives until
+        // this cell is dropped.
+        unsafe { p.as_ref() }
+    }
+
+    /// Stores `v` unless another thread got there first, in which case `v`
+    /// is handed back.
+    fn set(&self, v: Box<CharIndex>) -> Result<(), Box<CharIndex>> {
+        let raw = Box::into_raw(v);
+        match self.0.compare_exchange(
+            std::ptr::null_mut(),
+            raw,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        ) {
+            Ok(_) => Ok(()),
+            // Safety: `raw` was never published.
+            Err(_) => Err(unsafe { Box::from_raw(raw) }),
+        }
+    }
+
+    fn get_or_init(&self, f: impl FnOnce() -> Box<CharIndex>) -> &CharIndex {
+        if let Some(ix) = self.get() {
+            return ix;
+        }
+        let _ = self.set(f());
+        self.get().expect("set above")
+    }
+}
+
+impl Drop for IndexCell {
+    fn drop(&mut self) {
+        let p = *self.0.get_mut();
+        if !p.is_null() {
+            // Safety: published by `set`, owned by this cell.
+            unsafe { drop(Box::from_raw(p)) };
+        }
+    }
+}
+
+#[derive(Debug)]
 struct CharIndex {
     count: u32,
     offsets: Vec<u32>,
@@ -1027,14 +1110,14 @@ impl RtStr {
         // allocation has already happened here, but every later read avoids a
         // pointer hop. The constructors that matter for speed —
         // `concat` and `of_i64` — never build a `String` at all.
-        let data = if s.len() <= 15 {
+        let data = if s.len() <= INLINE_STR_CAP {
             StrData::of(&s)
         } else {
             StrData::Heap(s)
         };
         RtStr {
             s: data,
-            index: std::sync::OnceLock::new(),
+            index: IndexCell::new(),
         }
     }
 
@@ -1046,7 +1129,7 @@ impl RtStr {
     pub fn of(text: &str) -> RtStr {
         RtStr {
             s: StrData::of(text),
-            index: std::sync::OnceLock::new(),
+            index: IndexCell::new(),
         }
     }
 
@@ -1077,11 +1160,11 @@ impl RtStr {
     ///
     /// The character index is thrown away: it described the old text.
     fn push_str(&mut self, t: &str) {
-        self.index = std::sync::OnceLock::new();
+        self.index = IndexCell::new();
         let spill = match &mut self.s {
             StrData::Inline { bytes, len } => {
                 let at = *len as usize;
-                if at + t.len() <= 15 {
+                if at + t.len() <= INLINE_STR_CAP {
                     // Byte at a time rather than `copy_from_slice`, which is
                     // a call to `memcpy` whatever the length. See the `Heap`
                     // arm below: text is built a digit or a character at a
@@ -1132,8 +1215,8 @@ impl RtStr {
 
     pub fn concat(a: &str, b: &str) -> RtStr {
         let total = a.len() + b.len();
-        let data = if total <= 15 {
-            let mut bytes = [0u8; 15];
+        let data = if total <= INLINE_STR_CAP {
+            let mut bytes = [0u8; INLINE_STR_CAP];
             bytes[..a.len()].copy_from_slice(a.as_bytes());
             bytes[a.len()..total].copy_from_slice(b.as_bytes());
             StrData::Inline {
@@ -1148,7 +1231,7 @@ impl RtStr {
         };
         RtStr {
             s: data,
-            index: std::sync::OnceLock::new(),
+            index: IndexCell::new(),
         }
     }
 
@@ -1752,8 +1835,38 @@ pub mod layout {
     pub const TAG_BYTES: u8 = 9;
     pub const BYTES_PTR: usize = 16;
     pub const BYTES_LEN: usize = 24;
+    /// `ListScalar { kind, data }`: its tag, the `ScalarData` tag, and where
+    /// that holds its `Vec`.
+    pub const TAG_LIST_SCALAR: u8 = 12;
+    pub const SCALAR_DATA_TAG: usize = 16;
+    pub const SCALAR_VEC: usize = 24;
     /// `ListVals`, last in `RtPayload` so no earlier tag moved.
     pub const TAG_LIST_VALS: u8 = 17;
+    /// `ListVals { ty, words }`: where its `Vec` of words is.
+    pub const VALS_VEC: usize = 24;
+}
+
+/// The third part of the layout check, for scalar lists: the compiled
+/// program's measurement of a `Vec` against this runtime's, with the list
+/// offsets, packed one per byte.
+#[no_mangle]
+pub extern "C" fn grasm_layout_check_lists(packed: i64) {
+    let (p, l, c) = vec_layout();
+    let ours = i64::from_le_bytes([
+        layout::TAG_LIST_SCALAR,
+        layout::SCALAR_DATA_TAG as u8,
+        layout::SCALAR_VEC as u8,
+        p as u8,
+        l as u8,
+        c as u8,
+        layout::TAG_LIST_VALS,
+        layout::VALS_VEC as u8,
+    ]);
+    if packed != ours {
+        rt_panic(
+            "this program was compiled for a different runtime layout -- rebuild it with the grasm that matches this runtime",
+        );
+    }
 }
 
 /// The second half of `grasm_layout_check`, for `bytes`: its tag and the
@@ -2812,7 +2925,12 @@ pub unsafe extern "C" fn grasm_str_build_end(at: i64) -> *mut RtVal {
             // "{i}"` — a loop that grows one string — twice as slow as the
             // concatenation it replaced. The buffer is given up in that case
             // and the next build makes a fresh one.
-            alloc_in(local, RtPayload::Str(RtStr::new(std::mem::take(&mut *buf))))
+            let text = std::mem::take(&mut *buf);
+            // The next build starts with room for one like this: from empty
+            // it doubled its way up -- three or four reallocations for a URL --
+            // and the string kept the doubled capacity.
+            *buf = String::with_capacity(text.len() + 16);
+            alloc_in(local, RtPayload::Str(RtStr::new(text)))
         } else {
             // A short result is copied into the value's own inline storage and
             // the buffer comes back for the next one.
@@ -3040,7 +3158,7 @@ pub unsafe extern "C" fn grasm_str_pin_begin(
     let RtPayload::Str(rs) = &mut (*target).payload else {
         grasm_panic_msg_str("append to a non-string");
     };
-    rs.index = std::sync::OnceLock::new();
+    rs.index = IndexCell::new();
     // Always a heap buffer while pinned: the inline one has no spare room to
     // hand out, and spilling once here is cheaper than deciding per append.
     if let StrData::Inline { bytes, len } = &rs.s {
@@ -3093,7 +3211,7 @@ pub unsafe extern "C" fn grasm_str_pin_end(a: *mut RtVal, len: i64) {
     let RtPayload::Str(rs) = &mut (*a).payload else {
         grasm_panic_msg_str("append to a non-string");
     };
-    rs.index = std::sync::OnceLock::new();
+    rs.index = IndexCell::new();
     if let StrData::Heap(h) = &mut rs.s {
         h.as_mut_vec().set_len(len as usize);
     }
@@ -3506,6 +3624,109 @@ pub unsafe extern "C" fn grasm_par_map_mixed(
         Vec::new()
     };
     let out = par_words(&owned, code, &env_owned);
+    if out_kind < 0 {
+        let mut built = ListData::new();
+        for w in out {
+            built.push(w as *mut RtVal);
+        }
+        return alloc(RtPayload::List(built));
+    }
+    let kind = ScalarKind::from_i64(out_kind);
+    alloc(RtPayload::ListScalar {
+        kind,
+        data: ScalarData::from_words(kind, out),
+    })
+}
+
+/// The most workers one `net_workers` call may start. Each is a thread, so a
+/// count from a miscomputed argument should be a refusal rather than ten
+/// thousand threads; 256 is past the core count of any machine this runs on
+/// ([L-LIB-NET-WORKERS]). The interpreter has the same number.
+const NET_WORKERS_MAX: i64 = 256;
+
+/// `[0, 1, …, n - 1]`, the worker indices of `net_workers(n, f)`: empty for
+/// `n <= 0`, and a panic past [`NET_WORKERS_MAX`].
+///
+/// A list rather than a count because the backend's sequential lowering —
+/// the fallback for a function it cannot lift onto a thread — is a `map`, and
+/// a map wants something to map over.
+#[no_mangle]
+pub extern "C" fn grasm_net_workers_indices(n: i64) -> *mut RtVal {
+    if n > NET_WORKERS_MAX {
+        rt_panic(&format!(
+            "net_workers: at most {NET_WORKERS_MAX} workers, asked for {n}"
+        ));
+    }
+    let mut data = ScalarData::new(ScalarKind::I64);
+    for i in 0..n.max(0) {
+        data.push(i);
+    }
+    alloc(RtPayload::ListScalar {
+        kind: ScalarKind::I64,
+        data,
+    })
+}
+
+/// Runs `code` once per worker index, **each on a thread of its own**, and
+/// answers the results in index order ([L-LIB-NET-WORKERS]).
+///
+/// This is not `par_map`'s machine, though it calls the same lifted body: a
+/// `par_map` spreads data over as many cores as pay for themselves, and is
+/// free to run it all on one. A worker is usually a server loop that never
+/// returns, so two of them sharing a thread is one of them never starting.
+/// One thread each, joined before this returns.
+///
+/// The checker allowed the function `net` and nothing else, and refused any
+/// `ref` or actor handle from outside, so what the workers share is the socket
+/// table — which is behind a lock for this reason — and nothing the program
+/// can observe the order of.
+///
+/// A recorded or replayed run is the exception. The journal is a single
+/// sequence and each thread would open its own, so there the workers run one
+/// after another on this thread, in index order — the schedule the interpreter
+/// always uses, and one the clause allows.
+///
+/// # Safety: `list` is a live scalar list; `code` and `env` are as for
+/// `grasm_par_map_scalar`.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_net_workers(
+    list: *mut RtVal,
+    code: extern "C" fn(*const i64, i64) -> i64,
+    env: *const i64,
+    env_len: i64,
+    out_kind: i64,
+) -> *mut RtVal {
+    let words = scalar_words(list, "net_workers");
+    let env_owned: Vec<i64> = if env_len > 0 {
+        std::slice::from_raw_parts(env, env_len as usize).to_vec()
+    } else {
+        Vec::new()
+    };
+    let mut out: Vec<i64> = vec![0; words.len()];
+    if replay::active() || words.len() < 2 {
+        for (o, &x) in out.iter_mut().zip(words.iter()) {
+            *o = code(env_owned.as_ptr(), x);
+        }
+    } else {
+        std::thread::scope(|scope| {
+            let env_ref: &[i64] = &env_owned;
+            for (o, &x) in out.iter_mut().zip(words.iter()) {
+                let spawned = std::thread::Builder::new()
+                    .name(format!("net-worker-{x}"))
+                    .stack_size(WORKER_STACK)
+                    .spawn_scoped(scope, move || {
+                        *o = code(env_ref.as_ptr(), x);
+                        hand_back_live();
+                    });
+                // Unlike a `par_map`, there is nothing to fall back to: the
+                // workers already started may never return, so running this
+                // one later on the calling thread could mean never.
+                if let Err(e) = spawned {
+                    rt_panic(&format!("net_workers: cannot start worker {x}: {e}"));
+                }
+            }
+        });
+    }
     if out_kind < 0 {
         let mut built = ListData::new();
         for w in out {
@@ -4012,6 +4233,23 @@ pub extern "C" fn grasm_list_new_cap(n: i64) -> *mut RtVal {
         data.reserve(n as usize);
     }
     alloc(RtPayload::List(data))
+}
+
+/// A scalar list from `n` words in the program's read-only data: a list
+/// literal of constants, made in one call rather than one push per element.
+///
+/// # Safety: `words` points at `n` readable words.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_list_from_words(kind: i64, words: *const i64, n: i64) -> *mut RtVal {
+    let k = ScalarKind::from_i64(kind);
+    if n <= 0 {
+        return empty_list_of(Some(k));
+    }
+    let src = std::slice::from_raw_parts(words, n as usize);
+    alloc(RtPayload::ListScalar {
+        kind: k,
+        data: ScalarData::from_words(k, src.to_vec()),
+    })
 }
 
 #[no_mangle]
@@ -4833,6 +5071,56 @@ pub unsafe extern "C" fn grasm_vals_push(l: *mut RtVal, src: *const i64) -> *mut
     target
 }
 
+/// Room for `n` more elements in a list about to be pushed to `n` times: the
+/// list itself (or, when shared, a copy nothing else holds) with its storage
+/// grown once. The compiler calls it before a counted loop that pushes on
+/// every trip -- what `Vec::with_capacity` is to a Rust program, without the
+/// program having to say so. A list of boxes is left as it is.
+///
+/// # Safety: `l` is a live list the caller owns a count on, which passes to
+/// the result.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_list_reserve(l: *mut RtVal, n: i64) -> *mut RtVal {
+    if n <= 0 {
+        return l;
+    }
+    // Bounded: a loop that would push more than this is better left to grow.
+    let n = (n as usize).min(1 << 24);
+    match &(*l).payload {
+        RtPayload::ListVals { ty, words } => {
+            let w = ty.kinds.len().max(1);
+            if (*l).rc.load(Relaxed) == 1 {
+                if let RtPayload::ListVals { words, .. } = &mut (*l).payload {
+                    words.reserve(n * w);
+                }
+                return l;
+            }
+            // The copy holds its own counts on every boxed field.
+            for el in words.chunks_exact(w) {
+                for (f, c) in el.iter().enumerate() {
+                    if ty.boxed(f) {
+                        inc(*c as *mut RtVal);
+                    }
+                }
+            }
+            let mut grown = Vec::with_capacity(words.len() + n * w);
+            grown.extend_from_slice(words);
+            let ty = *ty;
+            let copy = alloc(RtPayload::ListVals { ty, words: grown });
+            dec(l);
+            copy
+        }
+        RtPayload::ListScalar { .. } => {
+            let target = cow_list(l);
+            if let RtPayload::ListScalar { data, .. } = &mut (*target).payload {
+                data.reserve(n);
+            }
+            target
+        }
+        _ => l,
+    }
+}
+
 /// The list itself when nothing else holds it, otherwise a copy that nothing
 /// else does: what a write into one element needs first.
 ///
@@ -5204,6 +5492,53 @@ pub unsafe extern "C" fn grasm_try_take(res: *mut RtVal) -> *mut RtVal {
     }
     dec(res);
     payload
+}
+
+/// A result taken apart for the split-result calling convention: the payload
+/// word is written to `out` and the tag returned, 0 for `Ok` and 1 for `Err`.
+/// An `Ok` holding a scalar (`kind` 0-4, as `ScalarKind`, 4 for unit) gives
+/// its bits; anything else gives its box, owned. The result is released.
+///
+/// # Safety: `res` is a live result the caller owns a count on; `out` is
+/// writable.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_result_split(res: *mut RtVal, out: *mut i64, kind: i64) -> i8 {
+    let RtPayload::Variant { name, fields, .. } = &mut (*res).payload else {
+        grasm_panic_msg_str("a result that is not one");
+    };
+    let is_ok = *name == "Ok";
+    let payload = fields[0];
+    if (*res).rc.load(Relaxed) == 1 {
+        *fields = VFields::default();
+    } else {
+        inc(payload);
+    }
+    dec(res);
+    if is_ok && kind >= 0 {
+        *out = if kind == 4 { 0 } else { unbox_field_bits(payload) };
+        dec(payload);
+    } else {
+        *out = payload as i64;
+    }
+    i8::from(!is_ok)
+}
+
+/// The inverse of `grasm_result_split`: a boxed result from a tag and a
+/// payload word, for a caller that keeps the result as a value.
+///
+/// # Safety: `word` is a box the caller owns, unless the tag is 0 and `kind`
+/// names a scalar.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_result_box(tag: i64, word: i64, kind: i64) -> *mut RtVal {
+    if tag != 0 {
+        return grasm_err_new(word as *mut RtVal);
+    }
+    let payload = match kind {
+        k if k < 0 => word as *mut RtVal,
+        4 => grasm_box_i64(0),
+        k => scalar_box(ScalarKind::from_i64(k), word),
+    };
+    grasm_ok_new(payload)
 }
 
 /// `try` on a result whose `Ok` holds a scalar: its bits written to `out`,
@@ -5623,7 +5958,7 @@ pub unsafe extern "C" fn grasm_map_add_i64_bytes(
             let text =
                 std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr, len as usize));
             entries.insert(
-                MapKey::Str(StrData::of(text)),
+                MapKey::Str(KeyStr::of(text)),
                 grasm_box_i64(default + delta),
             );
         }
@@ -5668,7 +6003,7 @@ pub unsafe extern "C" fn grasm_map_set(m: *mut RtVal, k: *mut RtVal, v: *mut RtV
 unsafe fn with_key_bytes<R>(ptr: *const u8, len: i64, f: impl FnOnce(&MapKey) -> R) -> R {
     let text =
         std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr, len as usize));
-    f(&MapKey::Str(StrData::of(text)))
+    f(&MapKey::Str(KeyStr::of(text)))
 }
 
 /// `m.get(k)` where the key is bytes: the value with a reference, or null.
@@ -5713,7 +6048,7 @@ pub unsafe extern "C" fn grasm_map_set_bytes(
         None => {
             let text =
                 std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr, len as usize));
-            entries.insert(MapKey::Str(StrData::of(text)), v);
+            entries.insert(MapKey::Str(KeyStr::of(text)), v);
         }
     }
     target
@@ -7369,21 +7704,61 @@ fn ok_of(v: *mut RtVal) -> *mut RtVal {
 // network access can never touch the network" — which could not be shown at all
 // while there was no network to gate.
 
+/// Open listeners and connections, by handle, and the empty slots among them.
+///
+/// One table for the whole process, because `net_workers` runs a program's
+/// function on several threads and every one of them must mean the same thing
+/// by a handle: a listener the main thread opened is accepted on by every
+/// worker ([L-LIB-NET-WORKERS]). It was thread-local, which made a handle
+/// opened on one thread name nothing on another.
+///
+/// The lock is held only to find or change an entry, never across a call that
+/// can block. An operation clones the `Arc` it needs and lets go; the standard
+/// library does socket I/O through `&self`, so nothing more is needed to read
+/// on one thread while another writes. `net_close` removes the entry at once —
+/// the handle names nothing from then on — and the descriptor is closed when
+/// the last clone goes, so an `accept` or a `poll` already under way finishes
+/// on the socket it started with rather than on whatever reused its number.
+struct SocketTable {
+    slots: Vec<Option<std::sync::Arc<Socket>>>,
+    /// The empty slots, lowest first. A new socket takes the lowest, as it did
+    /// when the table was searched from the start -- handle numbers are
+    /// visible to programs -- without the search, which was a scan of every
+    /// connection on every accept.
+    free: std::collections::BinaryHeap<std::cmp::Reverse<usize>>,
+}
+
+/// Read-write: every socket operation looks its handle up, and only opening
+/// and closing change the table. Behind a plain mutex, a proxy's eight
+/// workers spent as long waiting for the lock as in `poll`.
+static SOCKETS: std::sync::RwLock<SocketTable> = std::sync::RwLock::new(SocketTable {
+    slots: Vec::new(),
+    free: std::collections::BinaryHeap::new(),
+});
+
+/// The table, locked for a change. A panic while holding it ends the process
+/// ([E-PANIC-EXIT]) before anything could observe a half-made change, so a
+/// poisoned lock holds a table that is still whole.
+fn sockets() -> std::sync::RwLockWriteGuard<'static, SocketTable> {
+    SOCKETS.write().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The table, locked for a lookup.
+fn sockets_read() -> std::sync::RwLockReadGuard<'static, SocketTable> {
+    SOCKETS.read().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 thread_local! {
-    /// Open listeners and connections, by handle. A handle is an index, so it
-    /// is an `i64` at the boundary and the caller never sees an address.
-    static SOCKETS: std::cell::RefCell<Vec<Option<Socket>>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-    /// The table's empty slots, lowest first. A new socket takes the lowest,
-    /// as it did when the table was searched from the start -- handle numbers
-    /// are visible to programs -- without the search, which was a scan of
-    /// every connection on every accept.
-    static FREE_SOCKETS: std::cell::RefCell<std::collections::BinaryHeap<std::cmp::Reverse<usize>>> =
-        const { std::cell::RefCell::new(std::collections::BinaryHeap::new()) };
     /// One read buffer per thread, reused. A read answers with exactly the
     /// bytes that arrived; a fresh 64 KiB buffer per read, truncated but
     /// keeping its capacity, held 64 KiB for every chunk a server kept.
     static READ_BUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Listeners this thread's last `net_wait` reported ready. A `tcp_accept`
+    /// on one of them does not wait: several workers woken for the same
+    /// connection all try, one gets it, and the rest must go back to their own
+    /// connections rather than sit in `accept` until the next client arrives
+    /// ([L-LIB-NET-WORKERS]).
+    static ACCEPT_READY: std::cell::RefCell<Vec<i64>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// Reads once through the thread's read buffer, answering with the bytes read
@@ -7410,32 +7785,71 @@ enum Socket {
 }
 
 fn socket_put(s: Socket) -> i64 {
-    SOCKETS.with(|table| {
-        let mut table = table.borrow_mut();
-        // A freed slot is reused, so a long-running server does not grow the
-        // table once per connection.
-        if let Some(std::cmp::Reverse(i)) = FREE_SOCKETS.with(|f| f.borrow_mut().pop()) {
-            table[i] = Some(s);
-            return i as i64;
-        }
-        table.push(Some(s));
-        (table.len() - 1) as i64
-    })
+    let s = std::sync::Arc::new(s);
+    let mut table = sockets();
+    // A freed slot is reused, so a long-running server does not grow the
+    // table once per connection.
+    if let Some(std::cmp::Reverse(i)) = table.free.pop() {
+        table.slots[i] = Some(s);
+        return i as i64;
+    }
+    table.slots.push(Some(s));
+    (table.slots.len() - 1) as i64
 }
 
-/// Runs `f` against the socket a handle names.
+/// The socket a handle names, held so it stays open however long the caller
+/// needs it.
+fn socket_get(h: i64) -> Option<std::sync::Arc<Socket>> {
+    let table = sockets_read();
+    usize::try_from(h)
+        .ok()
+        .and_then(|i| table.slots.get(i))
+        .and_then(Option::clone)
+}
+
+/// Runs `f` against the socket a handle names, without holding the table.
 ///
 /// A handle that names nothing is an ordinary failure, not a panic: it is what
 /// a program gets for using a connection after closing it, and a wrong answer
 /// is worse than an error.
-fn socket_with<T>(h: i64, f: impl FnOnce(&mut Socket) -> Result<T, String>) -> Result<T, String> {
-    SOCKETS.with(|table| {
-        let mut table = table.borrow_mut();
-        match table.get_mut(h as usize).and_then(Option::as_mut) {
-            Some(s) => f(s),
-            None => Err(format!("socket {h} is not open")),
+fn socket_with<T>(h: i64, f: impl FnOnce(&Socket) -> Result<T, String>) -> Result<T, String> {
+    match socket_get(h) {
+        Some(s) => f(&s),
+        None => Err(format!("socket {h} is not open")),
+    }
+}
+
+/// Every listener is non-blocking underneath, and `tcp_accept` waits with
+/// `poll(2)` when it is asked to wait. Toggling the mode per call instead would
+/// race: one worker switching it back to blocking while another is about to
+/// make its single attempt leaves the second stuck in `accept`.
+fn listener_put(l: std::net::TcpListener) -> std::io::Result<i64> {
+    l.set_nonblocking(true)?;
+    Ok(socket_put(Socket::Listener(l)))
+}
+
+/// One connection from a listener; when `ready`, without waiting for one.
+fn accept_from(l: &std::net::TcpListener, ready: bool) -> Result<std::net::TcpStream, String> {
+    use std::os::fd::AsRawFd;
+    loop {
+        match l.accept() {
+            // Accepted from a non-blocking listener, a stream inherits the
+            // mode on the BSDs, macOS included; every read and write here
+            // expects to block.
+            Ok((stream, _)) => {
+                stream.set_nonblocking(false).map_err(|e| e.to_string())?;
+                return Ok(without_nagle(stream));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if ready {
+                    return Err("no connection is waiting".to_string());
+                }
+                wait_readable(&[l.as_raw_fd()], -1)?;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e.to_string()),
         }
-    })
+    }
 }
 
 /// `poll(2)`, declared here rather than taken from a crate.
@@ -7514,6 +7928,292 @@ fn wait_readable(_fds: &[i32], _timeout_ms: i32) -> Result<Vec<bool>, String> {
     Err("net_wait needs poll(2), which this platform does not provide".to_string())
 }
 
+/// `kqueue(2)`, for `net_wait` on the systems that have it.
+#[cfg(target_os = "macos")]
+mod sys_kqueue {
+    pub const EVFILT_READ: i16 = -1;
+    pub const EV_ADD: u16 = 0x0001;
+    pub const EV_DELETE: u16 = 0x0002;
+    pub const EV_RECEIPT: u16 = 0x0040;
+    pub const EV_ERROR: u16 = 0x4000;
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct KEvent {
+        pub ident: usize,
+        pub filter: i16,
+        pub flags: u16,
+        pub fflags: u32,
+        pub data: isize,
+        pub udata: *mut std::ffi::c_void,
+    }
+
+    impl KEvent {
+        pub fn new(fd: i32, flags: u16) -> KEvent {
+            KEvent {
+                ident: fd as usize,
+                filter: EVFILT_READ,
+                flags,
+                fflags: 0,
+                data: 0,
+                udata: std::ptr::null_mut(),
+            }
+        }
+    }
+
+    #[repr(C)]
+    pub struct TimeSpec {
+        pub tv_sec: i64,
+        pub tv_nsec: i64,
+    }
+
+    extern "C" {
+        pub fn kqueue() -> i32;
+        pub fn kevent(
+            kq: i32,
+            changelist: *const KEvent,
+            nchanges: i32,
+            eventlist: *mut KEvent,
+            nevents: i32,
+            timeout: *const TimeSpec,
+        ) -> i32;
+        pub fn close(fd: i32) -> i32;
+    }
+}
+
+/// One thread's kqueue and the sockets registered with it.
+///
+/// `poll(2)` hands the kernel the whole set on every call, and the kernel
+/// walks every descriptor twice — to arm it and to disarm it — however few are
+/// ready. A server waits on the same set call after call, so registering it
+/// once and asking only for what is ready makes a wait cost what is ready
+/// rather than what is open. The set a program passes stays the whole truth:
+/// each call compares it with what is registered and changes only the
+/// difference.
+///
+/// Entries are kept by socket, not by descriptor number. A `Weak` keeps the
+/// socket's allocation (never its descriptor) alive, so an entry's address
+/// cannot come back as a different socket. A socket whose last `Arc` has gone
+/// has closed its descriptor, and closing removes it from every kqueue, so a
+/// dead entry is simply forgotten — its number may already belong to a new
+/// socket, which is registered afresh.
+#[cfg(target_os = "macos")]
+struct KqWaiter {
+    kq: i32,
+    /// The handles registered, in the order the program passed them.
+    handles: Vec<i64>,
+    registered: Vec<(i32, std::sync::Weak<Socket>)>,
+    events: Vec<sys_kqueue::KEvent>,
+    /// The registered set's index for each descriptor number, `u32::MAX`
+    /// for none.
+    position: Vec<u32>,
+    /// Which registered entries are listeners.
+    listener: Vec<bool>,
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for KqWaiter {
+    fn drop(&mut self) {
+        if self.kq >= 0 {
+            unsafe { sys_kqueue::close(self.kq) };
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+thread_local! {
+    static KQ_WAITER: std::cell::RefCell<Option<KqWaiter>> = const { std::cell::RefCell::new(None) };
+}
+
+/// What a wait answers: which handles are ready, and which are listeners.
+type Waited = Result<(Vec<bool>, Vec<bool>), String>;
+
+/// `net_wait` through the thread's kqueue: which of `wanted` are ready, and
+/// which of them are listeners. `None` asks for `poll` instead.
+///
+/// A wait on the set already registered takes the table lock once to check
+/// that every handle still names the socket registered for it, and holds
+/// none of them through the wait. It does not need to: a socket closed
+/// mid-wait leaves the kqueue as its descriptor closes, and a socket that
+/// takes over the number is not registered, so it cannot be reported.
+#[cfg(target_os = "macos")]
+fn kq_wait(wanted: &[i64], timeout_ms: i32) -> Option<Waited> {
+    use sys_kqueue::*;
+    KQ_WAITER.with(|w| {
+        let mut w = w.borrow_mut();
+        if w.is_none() {
+            let kq = unsafe { kqueue() };
+            if kq < 0 {
+                return None;
+            }
+            *w = Some(KqWaiter {
+                kq,
+                handles: Vec::new(),
+                registered: Vec::new(),
+                listener: Vec::new(),
+                events: Vec::new(),
+                position: Vec::new(),
+            });
+        }
+        let w = w.as_mut().unwrap();
+        let same = w.handles.as_slice() == wanted && {
+            let table = sockets_read();
+            w.registered.iter().zip(wanted).all(|((_, rs), &h)| {
+                matches!(usize::try_from(h).ok().and_then(|i| table.slots.get(i)),
+                    Some(Some(s)) if std::ptr::eq(rs.as_ptr(), std::sync::Arc::as_ptr(s)))
+            })
+        };
+        if !same {
+            let held = match socket_set(wanted) {
+                Ok(held) => held,
+                Err(e) => return Some(Err(e)),
+            };
+            let fds = socket_fds(&held);
+            // Where each descriptor sits in the set, by number. A handle twice
+            // in one set is legal and rare; one registration cannot answer
+            // for both positions, so `poll` does. The registrations are left
+            // as they are, and still match `registered`.
+            let top = fds.iter().copied().max().unwrap_or(0).max(0) as usize;
+            let mut position = vec![u32::MAX; top + 1];
+            for (i, &fd) in fds.iter().enumerate() {
+                if fd < 0 || position[fd as usize] != u32::MAX {
+                    return None;
+                }
+                position[fd as usize] = i as u32;
+            }
+            let mut changes: Vec<KEvent> = Vec::new();
+            for (rfd, rs) in &w.registered {
+                let kept = held.iter().any(|s| std::ptr::eq(rs.as_ptr(), std::sync::Arc::as_ptr(s)));
+                if kept {
+                    continue;
+                }
+                // Still open somewhere else: take it out. Gone: closing it
+                // already did.
+                if let Some(_open) = rs.upgrade() {
+                    changes.push(KEvent::new(*rfd, EV_DELETE | EV_RECEIPT));
+                }
+            }
+            for (s, &fd) in held.iter().zip(&fds) {
+                let known = w
+                    .registered
+                    .iter()
+                    .any(|(rfd, rs)| *rfd == fd && std::ptr::eq(rs.as_ptr(), std::sync::Arc::as_ptr(s)));
+                if !known {
+                    changes.push(KEvent::new(fd, EV_ADD | EV_RECEIPT));
+                }
+            }
+            if !changes.is_empty() {
+                let mut receipts = changes.clone();
+                let n = unsafe {
+                    kevent(
+                        w.kq,
+                        changes.as_ptr(),
+                        changes.len() as i32,
+                        receipts.as_mut_ptr(),
+                        receipts.len() as i32,
+                        std::ptr::null(),
+                    )
+                };
+                if n < 0 {
+                    return Some(Err(std::io::Error::last_os_error().to_string()));
+                }
+                // A delete that finds nothing is fine; an add that fails is not.
+                for r in &receipts[..n as usize] {
+                    let added = changes.iter().any(|c| c.ident == r.ident && c.flags & EV_ADD != 0);
+                    if r.flags & EV_ERROR != 0 && r.data != 0 && added {
+                        // What is registered is no longer known; start over.
+                        unsafe { close(w.kq) };
+                        w.kq = unsafe { kqueue() };
+                        w.handles.clear();
+                        w.registered.clear();
+                        return Some(Err(std::io::Error::from_raw_os_error(r.data as i32).to_string()));
+                    }
+                }
+            }
+            w.registered = held.iter().zip(&fds).map(|(s, &fd)| (fd, std::sync::Arc::downgrade(s))).collect();
+            w.listener = held.iter().map(|s| matches!(&**s, Socket::Listener(_))).collect();
+            w.handles = wanted.to_vec();
+            w.position = position;
+        }
+        let cap = wanted.len().max(1);
+        w.events.clear();
+        w.events.resize(cap, KEvent::new(-1, 0));
+        let ts;
+        let tp = if timeout_ms < 0 {
+            std::ptr::null()
+        } else {
+            ts = TimeSpec {
+                tv_sec: i64::from(timeout_ms / 1000),
+                tv_nsec: i64::from(timeout_ms % 1000) * 1_000_000,
+            };
+            &ts as *const TimeSpec
+        };
+        loop {
+            let n = unsafe { kevent(w.kq, std::ptr::null(), 0, w.events.as_mut_ptr(), cap as i32, tp) };
+            if n >= 0 {
+                let mut ready = vec![false; wanted.len()];
+                for e in &w.events[..n as usize] {
+                    if let Some(&i) = w.position.get(e.ident) {
+                        if i != u32::MAX {
+                            ready[i as usize] = true;
+                        }
+                    }
+                }
+                return Some(Ok((ready, w.listener.clone())));
+            }
+            let e = std::io::Error::last_os_error();
+            // As in `wait_readable`: a signal is not a failure.
+            if e.kind() != std::io::ErrorKind::Interrupted {
+                return Some(Err(e.to_string()));
+            }
+        }
+    })
+}
+
+/// The sockets `wanted` names, each held, under one lock: every worker waits
+/// on every connection it owns, and the lock word is the one cache line they
+/// all share.
+fn socket_set(wanted: &[i64]) -> Result<Vec<std::sync::Arc<Socket>>, String> {
+    let table = sockets_read();
+    wanted
+        .iter()
+        .map(|&h| {
+            usize::try_from(h)
+                .ok()
+                .and_then(|i| table.slots.get(i))
+                .and_then(Option::clone)
+                .ok_or_else(|| format!("socket {h} is not open"))
+        })
+        .collect()
+}
+
+#[cfg(unix)]
+fn socket_fds(held: &[std::sync::Arc<Socket>]) -> Vec<i32> {
+    use std::os::fd::AsRawFd;
+    held.iter()
+        .map(|s| match &**s {
+            Socket::Listener(l) => l.as_raw_fd(),
+            Socket::Stream(st) => st.as_raw_fd(),
+            Socket::Datagram(d) => d.as_raw_fd(),
+        })
+        .collect()
+}
+
+#[cfg(not(unix))]
+fn socket_fds(held: &[std::sync::Arc<Socket>]) -> Vec<i32> {
+    vec![-1; held.len()]
+}
+
+/// `net_wait` through `poll`: which of `wanted` are ready, and which of them
+/// are listeners. Each socket is held, not just looked up, for the whole wait:
+/// a worker closing one of these mid-`poll` must not let the descriptor number
+/// be reused under it.
+fn poll_wait(wanted: &[i64], timeout_ms: i32) -> Waited {
+    let held = socket_set(wanted)?;
+    let ready = wait_readable(&socket_fds(&held), timeout_ms)?;
+    Ok((ready, held.iter().map(|s| matches!(&**s, Socket::Listener(_))).collect()))
+}
+
 /// The local port a handle is bound to.
 ///
 /// `tcp_listen(0)` asks the system to choose a free port, which is the only way
@@ -7562,8 +8262,6 @@ pub unsafe extern "C" fn grasm_net_wait(handles: *mut RtVal, timeout: *mut RtVal
 }
 
 unsafe fn grasm_net_wait_now(handles: *mut RtVal, timeout: *mut RtVal) -> *mut RtVal {
-    use std::os::fd::AsRawFd;
-
     let timeout_ms = match &(*timeout).payload {
         RtPayload::I64(n) => *n,
         _ => return err_of(io_err("IoFailed", "timeout must be an integer".to_string())),
@@ -7584,27 +8282,23 @@ unsafe fn grasm_net_wait_now(handles: *mut RtVal, timeout: *mut RtVal) -> *mut R
         }));
     }
 
-    let fds = SOCKETS.with(|table| {
-        let table = table.borrow();
-        wanted
-            .iter()
-            .map(|&h| match table.get(h as usize).and_then(Option::as_ref) {
-                Some(Socket::Listener(l)) => Ok(l.as_raw_fd()),
-                Some(Socket::Stream(st)) => Ok(st.as_raw_fd()),
-                Some(Socket::Datagram(d)) => Ok(d.as_raw_fd()),
-                None => Err(format!("socket {h} is not open")),
-            })
-            .collect::<Result<Vec<i32>, String>>()
-    });
-    let fds = match fds {
-        Ok(fds) => fds,
-        Err(e) => return err_of(io_err("IoFailed", e)),
-    };
-
-    let ready = match wait_readable(&fds, timeout_ms) {
+    #[cfg(target_os = "macos")]
+    let waited = kq_wait(&wanted, timeout_ms);
+    #[cfg(not(target_os = "macos"))]
+    let waited = None;
+    let (ready, listener) = match waited.unwrap_or_else(|| poll_wait(&wanted, timeout_ms)) {
         Ok(r) => r,
         Err(e) => return err_of(io_err("IoFailed", e)),
     };
+    ACCEPT_READY.with(|a| {
+        let mut a = a.borrow_mut();
+        a.clear();
+        for (i, &h) in wanted.iter().enumerate() {
+            if ready[i] && listener[i] {
+                a.push(h);
+            }
+        }
+    });
 
     // The answer keeps the order it was asked in, so a program that walks the
     // result serves its connections in a fixed order rather than whichever one
@@ -7638,7 +8332,10 @@ unsafe fn grasm_tcp_listen_now(port: *mut RtVal) -> *mut RtVal {
         return err_of(io_err("IoFailed", format!("port {port} is out of range")));
     }
     match std::net::TcpListener::bind(("127.0.0.1", port as u16)) {
-        Ok(l) => ok_of(alloc(RtPayload::I64(socket_put(Socket::Listener(l))))),
+        Ok(l) => match listener_put(l) {
+            Ok(h) => ok_of(alloc(RtPayload::I64(h))),
+            Err(e) => err_of(io_err("IoFailed", e.to_string())),
+        },
         Err(e) => err_of(io_err("IoFailed", e.to_string())),
     }
 }
@@ -7670,7 +8367,10 @@ unsafe fn grasm_tcp_listen_on_now(host: *mut RtVal, port: *mut RtVal) -> *mut Rt
         return err_of(io_err("IoFailed", format!("port {port} is out of range")));
     }
     match std::net::TcpListener::bind((host.as_str(), port as u16)) {
-        Ok(l) => ok_of(alloc(RtPayload::I64(socket_put(Socket::Listener(l))))),
+        Ok(l) => match listener_put(l) {
+            Ok(h) => ok_of(alloc(RtPayload::I64(h))),
+            Err(e) => err_of(io_err("IoFailed", e.to_string())),
+        },
         Err(e) => err_of(io_err("IoFailed", e.to_string())),
     }
 }
@@ -7739,11 +8439,13 @@ unsafe fn grasm_tcp_accept_now(handle: *mut RtVal) -> *mut RtVal {
         RtPayload::I64(n) => *n,
         _ => return err_of(io_err("IoFailed", "handle must be an integer".to_string())),
     };
+    let ready = ACCEPT_READY.with(|a| {
+        let mut a = a.borrow_mut();
+        let at = a.iter().position(|&r| r == h);
+        at.map(|i| a.swap_remove(i)).is_some()
+    });
     let accepted = socket_with(h, |s| match s {
-        Socket::Listener(l) => l
-            .accept()
-            .map(|(stream, _)| without_nagle(stream))
-            .map_err(|e| e.to_string()),
+        Socket::Listener(l) => accept_from(l, ready),
         Socket::Stream(_) => Err(format!("socket {h} is a connection, not a listener")),
         Socket::Datagram(_) => Err(format!("socket {h} is a datagram socket, not a listener")),
     });
@@ -7773,7 +8475,7 @@ unsafe fn grasm_tcp_read_now(handle: *mut RtVal) -> *mut RtVal {
     };
     let read = socket_with(h, |s| match s {
         Socket::Stream(stream) => {
-            match read_sized(|b| stream.read(b).map(|n| (n, ()))) {
+            match read_sized(|b| (&mut &*stream).read(b).map(|n| (n, ()))) {
                 Ok((buf, ())) => {
                     // Lossy, because a socket carries bytes and a Grasm `str`
                     // is text: a client that sends invalid UTF-8 gets its bytes
@@ -7874,7 +8576,7 @@ unsafe fn grasm_tcp_read_bytes_now(handle: *mut RtVal) -> *mut RtVal {
     };
     let read = socket_with(h, |s| match s {
         Socket::Stream(stream) => {
-            match read_sized(|b| stream.read(b).map(|n| (n, ()))) {
+            match read_sized(|b| (&mut &*stream).read(b).map(|n| (n, ()))) {
                 Ok((buf, ())) => Ok(buf),
                 Err(e) => Err(e.to_string()),
             }
@@ -7914,9 +8616,9 @@ unsafe fn grasm_tcp_write_bytes_now(handle: *mut RtVal, data: *mut RtVal) -> *mu
     };
     let payload = payload.owner.clone();
     let wrote = socket_with(h, |s| match s {
-        Socket::Stream(stream) => stream
+        Socket::Stream(stream) => (&mut &*stream)
             .write_all(&payload)
-            .and_then(|()| stream.flush())
+            .and_then(|()| (&mut &*stream).flush())
             .map_err(|e| e.to_string()),
         Socket::Listener(_) => Err(format!("socket {h} is a listener, not a connection")),
         Socket::Datagram(_) => Err(format!(
@@ -7950,9 +8652,9 @@ unsafe fn grasm_tcp_write_now(handle: *mut RtVal, data: *mut RtVal) -> *mut RtVa
     };
     let text = as_str(data).to_string();
     let wrote = socket_with(h, |s| match s {
-        Socket::Stream(stream) => stream
+        Socket::Stream(stream) => (&mut &*stream)
             .write_all(text.as_bytes())
-            .and_then(|()| stream.flush())
+            .and_then(|()| (&mut &*stream).flush())
             .map_err(|e| e.to_string()),
         Socket::Listener(_) => Err(format!("socket {h} is a listener, not a connection")),
         Socket::Datagram(_) => Err(format!(
@@ -8435,14 +9137,20 @@ pub unsafe extern "C" fn grasm_net_close(handle: *mut RtVal) {
     }
     if let RtPayload::I64(h) = &(*handle).payload {
         let h = *h;
-        SOCKETS.with(|table| {
-            let mut table = table.borrow_mut();
-            if let Some(slot) = table.get_mut(h as usize) {
-                if slot.take().is_some() {
-                    FREE_SOCKETS.with(|f| f.borrow_mut().push(std::cmp::Reverse(h as usize)));
-                }
+        // Taken out under the lock and dropped after it: the descriptor
+        // closes here unless an operation on another thread still holds it.
+        let gone = {
+            let mut table = sockets();
+            let taken = usize::try_from(h)
+                .ok()
+                .and_then(|i| table.slots.get_mut(i))
+                .and_then(Option::take);
+            if taken.is_some() {
+                table.free.push(std::cmp::Reverse(h as usize));
             }
-        });
+            taken
+        };
+        drop(gone);
     }
 }
 
@@ -8567,6 +9275,35 @@ pub unsafe extern "C" fn grasm_bytes_slice(v: *mut RtVal, from: i64, end: i64) -
     alloc(RtPayload::Bytes(RtBytes::new(
         b[from as usize..end as usize].to_vec(),
     )))
+}
+
+/// `b.index_of(byte, from)`: the first position at or after `from` holding
+/// `byte`, as an `Option`. The search is the C library's `memchr`, which reads
+/// a word or a vector at a time.
+///
+/// # Safety: `v` is a live `bytes` value.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_bytes_index_of(v: *mut RtVal, byte: i64, from: i64) -> *mut RtVal {
+    extern "C" {
+        fn memchr(s: *const u8, c: i32, n: usize) -> *const u8;
+    }
+    let b = as_bytes(v);
+    if from < 0 || from as usize > b.len() {
+        rt_panic(&format!(
+            "index_of from {from} out of bounds (len {})",
+            b.len()
+        ));
+    }
+    if !(0..=255).contains(&byte) {
+        return none_val();
+    }
+    let rest = &b[from as usize..];
+    let at = memchr(rest.as_ptr(), byte as i32, rest.len());
+    if at.is_null() {
+        none_val()
+    } else {
+        some_of(grasm_box_i64(from + at.offset_from(rest.as_ptr()) as i64))
+    }
 }
 
 /// # Safety: boxed values.
@@ -9788,6 +10525,29 @@ mod layout_tests {
             assert_eq!(*lb.add(layout::LIST_DATA_TAG), layout::INLINE);
             assert_eq!(*lb.add(layout::LIST_INLINE_LEN), 2);
             assert_eq!(*(lb.add(layout::LIST_INLINE_VALS) as *const *mut RtVal), b);
+            let ls = alloc(RtPayload::ListScalar {
+                kind: ScalarKind::I64,
+                data: ScalarData::Words(vec![5, 6]),
+            });
+            let lsb = ls as *const u8;
+            assert_eq!(*lsb.add(layout::PAYLOAD_TAG), layout::TAG_LIST_SCALAR);
+            assert_eq!(*lsb.add(layout::SCALAR_DATA_TAG), 0, "Words is tag 0");
+            let (vp, vl, _) = vec_layout();
+            let vec_at = lsb.add(layout::SCALAR_VEC);
+            assert_eq!(*(vec_at.add(vl) as *const usize), 2);
+            assert_eq!(*(*(vec_at.add(vp) as *const *const i64)).add(1), 6);
+            let ty: &'static StructTy = Box::leak(Box::new(StructTy {
+                name: "V",
+                fields: vec!["a"],
+                kinds: vec![0],
+                empty: std::sync::OnceLock::new(),
+            }));
+            let lv = alloc(RtPayload::ListVals { ty, words: vec![4, 5] });
+            let lvb = lv as *const u8;
+            assert_eq!(*lvb.add(layout::PAYLOAD_TAG), layout::TAG_LIST_VALS);
+            let (vp2, vl2, _) = vec_layout();
+            assert_eq!(*(lvb.add(24 + vl2) as *const usize), 2, "ListVals keeps its Vec at 24");
+            assert_eq!(*(*(lvb.add(24 + vp2) as *const *const i64)).add(1), 5);
             let by = alloc(RtPayload::Bytes(RtBytes::new(vec![7, 8, 9])));
             let bb = by as *const u8;
             assert_eq!(*bb.add(layout::PAYLOAD_TAG), layout::TAG_BYTES);

@@ -1,10 +1,30 @@
 //! tag: E-COW
 //! expect: output
 //! 3 4
+//! 2 143 0 0 69 1 100 101 169
+// A list grown in a loop, and grown again by a loop inside that one: what a
+// writer appending each block's bytes does. The compiled engine once made room
+// for the inner loop's elements by moving the list while the outer loop still
+// held it open, and the bytes went to the old storage.
+fn blocks(n: i64, size: i64) -> [i64] {
+    var out: [i64] = [n]
+    var b = 0
+    while b < n {
+        out.push(b)
+        for i in 0..size {
+            out.push(b * 100 + i)
+        }
+        b = b + 1
+    }
+    out
+}
+
 fn main() {
     // Copy-on-write is never observable: the copy is independent.
     var xs = [1, 2, 3]
     var ys = xs
     ys.push(4)
     print("{xs.len()} {ys.len()}")
+    let bs = blocks(2, 70)
+    print("{bs[0]} {bs.len()} {bs[1]} {bs[2]} {bs[71]} {bs[72]} {bs[73]} {bs[74]} {bs[bs.len() - 1]}")
 }

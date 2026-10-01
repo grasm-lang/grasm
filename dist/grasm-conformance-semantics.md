@@ -461,12 +461,32 @@ fn main() {
 //! tag: E-COW
 //! expect: output
 //! 3 4
+//! 2 143 0 0 69 1 100 101 169
+// A list grown in a loop, and grown again by a loop inside that one: what a
+// writer appending each block's bytes does. The compiled engine once made room
+// for the inner loop's elements by moving the list while the outer loop still
+// held it open, and the bytes went to the old storage.
+fn blocks(n: i64, size: i64) -> [i64] {
+    var out: [i64] = [n]
+    var b = 0
+    while b < n {
+        out.push(b)
+        for i in 0..size {
+            out.push(b * 100 + i)
+        }
+        b = b + 1
+    }
+    out
+}
+
 fn main() {
     // Copy-on-write is never observable: the copy is independent.
     var xs = [1, 2, 3]
     var ys = xs
     ys.push(4)
     print("{xs.len()} {ys.len()}")
+    let bs = blocks(2, 70)
+    print("{bs[0]} {bs.len()} {bs[1]} {bs[2]} {bs[71]} {bs[72]} {bs[73]} {bs[74]} {bs[bs.len() - 1]}")
 }
 ```
 
@@ -2896,6 +2916,7 @@ fn main() {
 //! 20.0 3 true
 //! 3.0 3 false
 //! 8 3.0 3 false 3.0 3 false
+//! [2] [1] [3] [3, 3] []
 type Box = { n: i64 }
 type Bag = { items: [i64] }
 type Two = { a: [i64], b: [i64] }
@@ -2980,6 +3001,25 @@ fn snapshots() {
     print("{total} {show(c)} {show(ps[3])}")
 }
 
+// A struct chosen by an `if` or a `match` and returned: each branch's value
+// is the one handed back, held once -- not copied and left behind.
+type Halves = { left: [i64], right: [i64] }
+
+fn halves(xs: [i64], flip: bool) -> Halves {
+    if flip {
+        Halves{ left: [xs[1]], right: [xs[0]] }
+    } else {
+        Halves{ left: [xs[0]], right: [xs[1]] }
+    }
+}
+
+fn pick_halves(n: i64) -> Halves {
+    match n {
+        0 -> return Halves{ left: [], right: [] }
+        _ -> return Halves{ left: [n], right: [n, n] }
+    }
+}
+
 fn main() {
     var a = [1, 2]
     var b = a
@@ -3029,5 +3069,8 @@ fn main() {
     print("{pick(true)} {pick(false)}")
 
     snapshots()
+    let h = halves([1, 2], true)
+    let k = pick_halves(3)
+    print("{h.left} {h.right} {k.left} {k.right} {pick_halves(0).left}")
 }
 ```

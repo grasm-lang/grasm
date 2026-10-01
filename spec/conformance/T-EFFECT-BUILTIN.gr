@@ -85,6 +85,7 @@ fn every_net_builtin(host: str, port: i64) / {net} {
     match net_wait([], 0) { Ok(v) -> {} Err(e) -> {} }
     match net_port(port) { Ok(v) -> {} Err(e) -> {} }
     match tcp_peer(port) { Ok(v) -> {} Err(e) -> {} }
+    let workers = net_workers(port, |i| i)
     match udp_bind(port) { Ok(v) -> {} Err(e) -> {} }
     match udp_send(port, host, port, bytes_of([])) { Ok(v) -> {} Err(e) -> {} }
     match udp_recv(port) { Ok(v) -> {} Err(e) -> {} }

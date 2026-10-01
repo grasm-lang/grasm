@@ -17,7 +17,7 @@ criterion 5 forbids. Saying so was cheaper than defending the listing.
 the five-part test in `docs/stability.md`. The audit is reproducible and 26
 clauses did not pass it; the commit that promoted these says why each failed.
 
-Today: 167 stable, 26 provisional, 62 experimental, of 255.
+Today: 167 stable, 26 provisional, 63 experimental, of 256.
 
 ## Stable
 
@@ -264,6 +264,7 @@ May change or be removed in any release. New surface starts here.
 - `L-LIB-FS` — experimental
 - `L-LIB-NET` — experimental
 - `L-LIB-NET-PEER` — experimental
+- `L-LIB-NET-WORKERS` — experimental
 - `L-LIB-PROC` — experimental
 - `L-LIB-RANDOM` — experimental
 - `L-LIB-RANGE-OPS` — experimental

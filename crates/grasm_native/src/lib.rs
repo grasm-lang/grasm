@@ -266,6 +266,29 @@ struct FnSig {
     /// ones that check the stack on entry. Both the declaration and every call
     /// site read it from here, so the two cannot disagree.
     takes_floor: bool,
+    /// A fallible function returning by the split-result convention: its
+    /// result's payload word through a hidden last pointer, its tag (0 `Ok`,
+    /// 1 `Err`) as the return value -- no boxed result built per call. See
+    /// `split_result_on`.
+    split_ret: bool,
+}
+
+/// Whether plain fallible functions use the split-result convention (on
+/// unless `GRASM_SPLIT_RESULT=0`). A
+/// boxed `Ok(v)` per call was the whole cost of a call that can fail -- 25 ns
+/// against 1 for one that cannot. Every other way of reaching a function
+/// (a function value, a handler) keeps the boxed result.
+fn split_result_on() -> bool {
+    !std::env::var("GRASM_SPLIT_RESULT").is_ok_and(|v| v == "0")
+}
+
+/// How a split result's `Ok` payload word is to be read: a scalar kind
+/// (0 i64, 1 f64, 2 bool, 3 ref, 4 unit) or -1 for a box.
+fn result_kind(ok_t: &VType) -> i64 {
+    match ok_t {
+        VType::Unit => 4,
+        other => scalar_kind_i64(other).unwrap_or(-1),
+    }
 }
 
 pub fn compile_object(
@@ -452,6 +475,8 @@ struct Codegen<'m> {
     struct_descs: HashMap<String, cranelift_module::DataId>,
     /// One cache slot per distinct string literal — see `str_lit_slot`.
     str_lit_slots: HashMap<String, cranelift_module::DataId>,
+    /// See `f64_data`.
+    f64_slots: HashMap<u64, cranelift_module::DataId>,
     /// struct name → ordered fields (name, type)
     structs: HashMap<String, Vec<(String, VType)>>,
     /// `type Name = str` — the aliased type expression, resolved on demand.
@@ -665,6 +690,7 @@ impl<'m> Codegen<'m> {
             strings: HashMap::new(),
             struct_descs: HashMap::new(),
             str_lit_slots: HashMap::new(),
+            f64_slots: HashMap::new(),
             structs: HashMap::new(),
             aliases: HashMap::new(),
             sums: HashMap::new(),
@@ -781,6 +807,7 @@ impl<'m> Codegen<'m> {
             ("grasm_list_push", vec![i64t, i64t], Some(i64t)),
             ("grasm_list_len", vec![i64t], Some(i64t)),
             ("grasm_vals_new", vec![ptr], Some(i64t)),
+            ("grasm_list_reserve", vec![i64t, i64t], Some(i64t)),
             ("grasm_vals_push", vec![i64t, ptr], Some(i64t)),
             ("grasm_vals_len", vec![i64t], Some(i64t)),
             ("grasm_vals_at", vec![i64t, i64t], Some(ptr)),
@@ -815,6 +842,8 @@ impl<'m> Codegen<'m> {
             ("grasm_variant_new", vec![ptr, i64t, ptr, i64t], Some(i64t)),
             ("grasm_variant_push", vec![i64t, i64t], None),
             ("grasm_try_take", vec![i64t], Some(i64t)),
+            ("grasm_result_split", vec![i64t, ptr, i64t], Some(types::I8)),
+            ("grasm_result_box", vec![i64t, i64t, i64t], Some(i64t)),
             ("grasm_try_take_bits", vec![i64t, ptr], Some(types::I8)),
             ("grasm_variant_new1", vec![ptr, i64t, ptr, i64t, i64t], Some(i64t)),
             ("grasm_variant_new2", vec![ptr, i64t, ptr, i64t, i64t, i64t], Some(i64t)),
@@ -962,6 +991,7 @@ impl<'m> Codegen<'m> {
             ("grasm_bytes_at", vec![i64t, i64t], Some(i64t)),
             ("grasm_bytes_slice", vec![i64t, i64t, i64t], Some(i64t)),
             ("grasm_bytes_slice_to_str", vec![i64t, i64t, i64t], Some(i64t)),
+            ("grasm_bytes_index_of", vec![i64t, i64t, i64t], Some(i64t)),
             ("grasm_bytes_concat", vec![i64t, i64t], Some(i64t)),
             ("grasm_bytes_to_list", vec![i64t], Some(i64t)),
             ("grasm_bytes_to_str", vec![i64t], Some(i64t)),
@@ -1001,6 +1031,7 @@ impl<'m> Codegen<'m> {
             ("grasm_list_min_max", vec![i64t, i8t], Some(i64t)),
             ("grasm_list_new_scalar", vec![i64t], Some(i64t)),
             ("grasm_list_new_scalar_cap", vec![i64t, i64t], Some(i64t)),
+            ("grasm_list_from_words", vec![i64t, ptr, i64t], Some(i64t)),
             ("grasm_list_fill_scalar", vec![i64t, i64t, i64t], Some(i64t)),
             (
                 "grasm_list_append_begin",
@@ -1058,8 +1089,15 @@ impl<'m> Codegen<'m> {
                 Some(i64t),
             ),
             ("grasm_par_tasks_next", vec![], None),
+            ("grasm_net_workers_indices", vec![i64t], Some(i64t)),
+            (
+                "grasm_net_workers",
+                vec![i64t, ptr, ptr, i64t, i64t],
+                Some(i64t),
+            ),
             ("grasm_layout_check", vec![i64t], None),
             ("grasm_layout_check_bytes", vec![i64t], None),
+            ("grasm_layout_check_lists", vec![i64t], None),
             // Concurrent tasks and channels (grasm_rt::tasks).
             ("grasm_chan_new", vec![i64t], Some(i64t)),
             ("grasm_chan_send", vec![i64t, i64t], None),
@@ -1742,6 +1780,7 @@ arguments nor the type this is bound to",
                 ret,
                 id,
                 takes_floor,
+                split_ret: false,
             },
         );
         self.pending_generics.push(PendingGeneric {
@@ -1827,6 +1866,7 @@ arguments nor the type this is bound to",
                             ret: ret_t,
                             // A C function never takes it.
                             takes_floor: false,
+                            split_ret: false,
                         },
                     );
                 }
@@ -1883,8 +1923,14 @@ arguments nor the type this is bound to",
                     }
                     // A value struct comes back through the caller's slot,
                     // whose address is the last parameter.
+                    let split_ret = split_result_on()
+                        && matches!(ret, VType::Fallible(..))
+                        && f.name.name != "main";
                     if matches!(ret, VType::Val(_)) {
                         sig.params.push(AbiParam::new(ptr_ty));
+                    } else if split_ret {
+                        sig.params.push(AbiParam::new(ptr_ty));
+                        sig.returns.push(AbiParam::new(types::I8));
                     } else if ret != VType::Unit {
                         sig.returns.push(AbiParam::new(ret.cl()));
                     }
@@ -1930,6 +1976,7 @@ arguments nor the type this is bound to",
                             id,
                             takes_floor,
                             borrowed,
+                            split_ret,
                         },
                     );
                     if let Some(spliced) = inline_candidate(f).filter(|_| !values_cross) {
@@ -2012,6 +2059,21 @@ arguments nor the type this is bound to",
         let check_b_ref = self.module.declare_func_in_func(check_b, b.func);
         let pbv = b.ins().iconst(types::I64, packed_bytes);
         b.ins().call(check_b_ref, &[pbv]);
+        let (vp, vl, vc) = vec_layout();
+        let packed_lists = i64::from_le_bytes([
+            LAYOUT_TAG_LIST_SCALAR as u8,
+            LAYOUT_SCALAR_DATA_TAG as u8,
+            LAYOUT_SCALAR_VEC as u8,
+            vp as u8,
+            vl as u8,
+            vc as u8,
+            LAYOUT_TAG_LIST_VALS as u8,
+            LAYOUT_VALS_VEC as u8,
+        ]);
+        let check_l = self.runtime["grasm_layout_check_lists"];
+        let check_l_ref = self.module.declare_func_in_func(check_l, b.func);
+        let plv = b.ins().iconst(types::I64, packed_lists);
+        b.ins().call(check_l_ref, &[plv]);
         let set_args = self.runtime["grasm_set_args"];
         let sa_ref = self.module.declare_func_in_func(set_args, b.func);
         b.ins().call(sa_ref, &[user_argc, argv_shift]);
@@ -2101,6 +2163,7 @@ arguments nor the type this is bound to",
         let func_id = self.fns[&key].id;
         let takes_floor = self.fns[&key].takes_floor;
         let sig_borrowed = self.fns[&key].borrowed.clone();
+        let split_ret = self.fns[&key].split_ret;
         let ptr_ty = self.module.target_config().pointer_type();
 
         let mut ctx = self.module.make_context();
@@ -2119,6 +2182,9 @@ arguments nor the type this is bound to",
         }
         if matches!(sig_ret, VType::Val(_)) {
             ctx.func.signature.params.push(AbiParam::new(ptr_ty));
+        } else if split_ret {
+            ctx.func.signature.params.push(AbiParam::new(ptr_ty));
+            ctx.func.signature.returns.push(AbiParam::new(types::I8));
         } else if sig_ret != VType::Unit {
             ctx.func.signature.returns.push(AbiParam::new(sig_ret.cl()));
         }
@@ -2148,6 +2214,9 @@ arguments nor the type this is bound to",
             probing_args: false,
             index_vals: HashMap::new(),
             split_vals: HashMap::new(),
+            split_out: None,
+            split_want: None,
+            split_got: None,
             wrote_through_ref: false,
             task_scopes: Vec::new(),
             go_scopes: Vec::new(),
@@ -2160,7 +2229,13 @@ arguments nor the type this is bound to",
             unchecked_idx: std::collections::HashSet::new(),
             version_guard_value: None,
             version_rows: Vec::new(),
+            version_val_rows: Vec::new(),
             row_base: HashMap::new(),
+            row_ptr: HashMap::new(),
+            ptr_rows_next: Vec::new(),
+            ptr_row_origin: Vec::new(),
+            hoisted_floats: HashMap::new(),
+            fn_mutated: std::collections::HashSet::new(),
             sret: None,
             fresh_vals: std::collections::HashSet::new(),
             vectorize_next: false,
@@ -2217,6 +2292,28 @@ arguments nor the type this is bound to",
         if matches!(sig_ret, VType::Val(_)) {
             fcx.sret = entry_params.last().copied();
         }
+        if split_ret {
+            fcx.split_out = entry_params.last().copied();
+        }
+        // Built-in methods that only read, unless the program declares a
+        // function of the same name -- a method call can reach one (UFCS),
+        // and it may take its receiver `inout`.
+        let user_names: std::collections::HashSet<String> = fcx
+            .cg
+            .fns
+            .keys()
+            .filter_map(|k| k.rsplit("::").next().map(str::to_string))
+            .collect();
+        let reads_only = |m: &str| {
+            !user_names.contains(m)
+                && matches!(
+                    m,
+                    "len" | "is_empty" | "byte_len" | "contains" | "contains_key" | "get"
+                        | "at" | "first" | "last" | "slice" | "index_of" | "keys" | "values"
+                        | "entries" | "starts_with" | "ends_with" | "to_str" | "to_bytes"
+                )
+        };
+        fcx.fn_mutated = grasm_sema::check::possibly_mutated(&f.body, &reads_only);
         for (i, p) in f.params.iter().enumerate() {
             let vt = sig_params[i].clone();
             if sig_modes[i] == ParamMode::Inout {
@@ -2308,6 +2405,16 @@ arguments nor the type this is bound to",
                     // through to the shared return below.
                     let already_fallible =
                         matches!(want, VType::Fallible(..)) && matches!(vt, VType::Fallible(..));
+                    if let (false, Some(_), VType::Fallible(ok_t, _)) =
+                        (already_fallible, fcx.split_out, want.clone())
+                    {
+                        let mut inner = v;
+                        if *ok_t == VType::F64 && vt == VType::I64 {
+                            inner = fcx.b.ins().fcvt_from_sint(types::F64, inner);
+                        }
+                        fcx.emit_scope_decs_all();
+                        fcx.ret_ok_raw(inner, &ok_t);
+                    } else {
                     if !already_fallible {
                         if let VType::Fallible(ok_t, _) = want.clone() {
                             let mut inner = v;
@@ -2321,7 +2428,12 @@ arguments nor the type this is bound to",
                         }
                     }
                     fcx.emit_scope_decs_all();
-                    fcx.b.ins().return_(&[v]);
+                    if matches!(want, VType::Fallible(..)) {
+                        fcx.ret_result(v);
+                    } else {
+                        fcx.b.ins().return_(&[v]);
+                    }
+                    }
                 }
                 (VType::Fallible(_, _), None) => {
                     // Unit-valued fallible function: Ok(()).
@@ -2329,7 +2441,7 @@ arguments nor the type this is bound to",
                     let boxed = fcx.call_rt("grasm_box_i64", &[z]).unwrap();
                     let v = fcx.call_rt("grasm_ok_new", &[boxed]).unwrap();
                     fcx.emit_scope_decs_all();
-                    fcx.b.ins().return_(&[v]);
+                    fcx.ret_result(v);
                 }
                 (want, None) => {
                     // A body that leaves — `panic(m)`, `exit(n)` — produces no
@@ -2754,8 +2866,31 @@ operation's",
                 _ => call_args.push(*p),
             }
         }
+        // A split-result target is put back together here: a function value
+        // and a handler operation hand back the boxed result.
+        let split_slot = if sig_info.split_ret {
+            let slot = b.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
+                cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                8,
+                3,
+            ));
+            call_args.push(b.ins().stack_addr(ptr_ty, slot, 0));
+            Some(slot)
+        } else {
+            None
+        };
         let inst = b.ins().call(target, &call_args);
-        let results: Vec<Value> = b.inst_results(inst).to_vec();
+        let mut results: Vec<Value> = b.inst_results(inst).to_vec();
+        if let (Some(slot), VType::Fallible(ok_t, _)) = (split_slot, &sig_info.ret) {
+            let tag = b.ins().uextend(types::I64, results[0]);
+            let word = b.ins().stack_load(types::I64, slot, 0);
+            let k = b.ins().iconst(types::I64, result_kind(ok_t));
+            let f = self
+                .module
+                .declare_func_in_func(self.runtime["grasm_result_box"], b.func);
+            let call = b.ins().call(f, &[tag, word, k]);
+            results = b.inst_results(call).to_vec();
+        }
         // A parameter the target only *reads* is lent, not given: the target
         // releases nothing. Every direct call site knows that and either
         // passes a binding it already holds or releases the temporary
@@ -2841,6 +2976,9 @@ operation's",
             probing_args: false,
             index_vals: HashMap::new(),
             split_vals: HashMap::new(),
+            split_out: None,
+            split_want: None,
+            split_got: None,
             wrote_through_ref: false,
             task_scopes: Vec::new(),
             go_scopes: Vec::new(),
@@ -2853,7 +2991,13 @@ operation's",
             unchecked_idx: std::collections::HashSet::new(),
             version_guard_value: None,
             version_rows: Vec::new(),
+            version_val_rows: Vec::new(),
             row_base: HashMap::new(),
+            row_ptr: HashMap::new(),
+            ptr_rows_next: Vec::new(),
+            ptr_row_origin: Vec::new(),
+            hoisted_floats: HashMap::new(),
+            fn_mutated: std::collections::HashSet::new(),
             sret: None,
             fresh_vals: std::collections::HashSet::new(),
             vectorize_next: false,
@@ -2957,6 +3101,9 @@ operation's",
             probing_args: false,
             index_vals: HashMap::new(),
             split_vals: HashMap::new(),
+            split_out: None,
+            split_want: None,
+            split_got: None,
             wrote_through_ref: false,
             task_scopes: Vec::new(),
             go_scopes: Vec::new(),
@@ -2969,7 +3116,13 @@ operation's",
             unchecked_idx: std::collections::HashSet::new(),
             version_guard_value: None,
             version_rows: Vec::new(),
+            version_val_rows: Vec::new(),
             row_base: HashMap::new(),
+            row_ptr: HashMap::new(),
+            ptr_rows_next: Vec::new(),
+            ptr_row_origin: Vec::new(),
+            hoisted_floats: HashMap::new(),
+            fn_mutated: std::collections::HashSet::new(),
             sret: None,
             fresh_vals: std::collections::HashSet::new(),
             vectorize_next: false,
@@ -3116,6 +3269,9 @@ operation's",
             probing_args: false,
             index_vals: HashMap::new(),
             split_vals: HashMap::new(),
+            split_out: None,
+            split_want: None,
+            split_got: None,
             wrote_through_ref: false,
             task_scopes: Vec::new(),
             go_scopes: Vec::new(),
@@ -3128,7 +3284,13 @@ operation's",
             unchecked_idx: std::collections::HashSet::new(),
             version_guard_value: None,
             version_rows: Vec::new(),
+            version_val_rows: Vec::new(),
             row_base: HashMap::new(),
+            row_ptr: HashMap::new(),
+            ptr_rows_next: Vec::new(),
+            ptr_row_origin: Vec::new(),
+            hoisted_floats: HashMap::new(),
+            fn_mutated: std::collections::HashSet::new(),
             sret: None,
             fresh_vals: std::collections::HashSet::new(),
             vectorize_next: false,
@@ -3354,6 +3516,39 @@ operation's",
         id
     }
 
+    /// Read-only words for a constant list literal (see `const_words`).
+    fn words_data(&mut self, words: &[i64]) -> cranelift_module::DataId {
+        let id = self
+            .module
+            .declare_anonymous_data(false, false)
+            .expect("data");
+        let mut d = DataDescription::new();
+        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        d.define(bytes.into_boxed_slice());
+        d.set_align(8);
+        self.module.define_data(id, &d).expect("data define");
+        id
+    }
+
+    /// Eight read-only bytes holding `bits`, for a constant that must be read
+    /// from memory once rather than rebuilt at every use (see
+    /// `hoisted_floats`).
+    fn f64_data(&mut self, bits: u64) -> cranelift_module::DataId {
+        if let Some(id) = self.f64_slots.get(&bits) {
+            return *id;
+        }
+        let id = self
+            .module
+            .declare_anonymous_data(false, false)
+            .expect("data");
+        let mut d = DataDescription::new();
+        d.define(bits.to_le_bytes().to_vec().into_boxed_slice());
+        d.set_align(8);
+        self.module.define_data(id, &d).expect("data define");
+        self.f64_slots.insert(bits, id);
+        id
+    }
+
     fn intern_string(&mut self, s: &str) -> cranelift_module::DataId {
         if let Some(id) = self.strings.get(s) {
             return *id;
@@ -3479,6 +3674,13 @@ struct FnCx<'a, 'm> {
     /// stack slot, keyed by the binding's variable: one variable per field.
     /// See `split_val_ok`.
     split_vals: HashMap<u32, Vec<Variable>>,
+    /// Where a split-result function writes its payload word (see
+    /// `FnSig::split_ret`); `None` for every other body.
+    split_out: Option<Value>,
+    /// The call `try` is about to make, by span: that call hands back its
+    /// tag and payload slot (`split_got`) instead of a boxed result.
+    split_want: Option<(u32, u32)>,
+    split_got: Option<(Value, cranelift_codegen::ir::StackSlot)>,
     /// Set when a write reached the slab through a `ref`, so no enclosing
     /// container needs updating. See `begin_write`.
     wrote_through_ref: bool,
@@ -3510,11 +3712,25 @@ struct FnCx<'a, 'm> {
     /// list's data plus its base times the stride, computed once before the
     /// loop.
     version_rows: Vec<((u32, u32), Value)>,
+    /// The value-list rows among them, with their element size: stepped as
+    /// pointers (`row_ptr`) rather than recomputed from the index.
+    version_val_rows: Vec<((u32, u32), Value, i64)>,
     /// While a versioned loop's check-free copy is emitted: for an index
     /// `base + i`, the row address and the loop variable's name, so the access
     /// is `row + i * stride` -- one indexed load -- rather than the base
     /// multiplied out again on every element.
     row_base: HashMap<(u32, u32), (Value, String)>,
+    /// A value list's element address in a versioned loop, as a pointer that
+    /// steps by the element's size each iteration: `es[i].x` is then one load
+    /// at a fixed offset, not a multiply and two adds. Set up by
+    /// `emit_range_loop` from `ptr_rows_next`.
+    row_ptr: HashMap<(u32, u32), Variable>,
+    ptr_rows_next: Vec<((u32, u32), Value, i64)>,
+    ptr_row_origin: Vec<(Value, i64)>,
+    /// Float literals of a versioned loop's fast copy, made once before it.
+    hoisted_floats: HashMap<u64, Value>,
+    /// Every name the function body might change (`possibly_mutated`).
+    fn_mutated: std::collections::HashSet<String>,
     /// Where a function returning a value struct writes it: the caller's slot.
     sret: Option<Value>,
     /// Value structs that are temporaries -- a literal or a call's result not
@@ -4429,6 +4645,28 @@ const LAYOUT_INLINE: i64 = 0;
 const LAYOUT_TAG_STRUCT: i64 = 14;
 /// `Bytes(RtBytes)`: its tag, and its buffer's address and length.
 const LAYOUT_TAG_BYTES: i64 = 9;
+/// `ListScalar { kind, data: ScalarData }`: its tag, where its element kind
+/// byte is, the `ScalarData` tag and where that keeps its `Vec`.
+const LAYOUT_TAG_LIST_SCALAR: i64 = 12;
+const LAYOUT_SCALAR_KIND: i64 = 9;
+const LAYOUT_SCALAR_DATA_TAG: i64 = 16;
+const LAYOUT_SCALAR_VEC: i64 = 24;
+/// `ListVals { ty, words }`: its tag, and where its `Vec` of words is.
+const LAYOUT_TAG_LIST_VALS: i64 = 17;
+const LAYOUT_VALS_VEC: i64 = 24;
+
+/// Where a `Vec` keeps its address, length and capacity, measured the way
+/// the runtime measures it (`grasm_rt::vec_layout`): the compiler and the
+/// runtime are built by one compiler, and the startup check holds them to it.
+fn vec_layout() -> (i64, i64, i64) {
+    let mut v: Vec<i64> = Vec::with_capacity(7);
+    v.extend_from_slice(&[1, 2, 3]);
+    let words: [usize; 3] = unsafe { std::mem::transmute_copy(&v) };
+    let find = |x: usize| words.iter().position(|&w| w == x).expect("a Vec word") as i64 * 8;
+    let out = (find(v.as_ptr() as usize), find(v.len()), find(v.capacity()));
+    drop(v);
+    out
+}
 const LAYOUT_BYTES_PTR: i64 = 16;
 const LAYOUT_BYTES_LEN: i64 = 24;
 
@@ -5620,6 +5858,14 @@ fn affine_block(
                     }
                     _ => false,
                 },
+                // `e.x = v` on a local: it rebinds nothing a list index reads.
+                Expr::Field { recv, .. } => match &**recv {
+                    Expr::Ident(id) => {
+                        assigned.push(id.name.clone());
+                        true
+                    }
+                    _ => false,
+                },
                 _ => false,
             };
             target_ok && affine_expr(value, i, assigned, acc)
@@ -5689,6 +5935,8 @@ fn affine_expr(
             }
             _ => false,
         },
+        // A field of a local, or of an element read the ways above.
+        Expr::Field { recv, .. } => affine_expr(recv, i, assigned, acc),
         Expr::If {
             cond,
             then_block,
@@ -6219,6 +6467,79 @@ fn pure_read(e: &Expr) -> bool {
         Expr::Unary { expr, .. } => pure_read(expr),
         _ => false,
     }
+}
+
+/// The multiplier and shift that divide by `d` (|d| >= 2, not a power of
+/// two) with a multiply-high: Hacker's Delight, figure 10-1, for 64 bits.
+fn signed_magic(d: i64) -> (i64, u32) {
+    let two63: u64 = 1 << 63;
+    let ad = d.unsigned_abs();
+    let t = two63 + ((d as u64) >> 63);
+    let anc = t - 1 - t % ad;
+    let mut p: u32 = 63;
+    let mut q1 = two63 / anc;
+    let mut r1 = two63 - q1 * anc;
+    let mut q2 = two63 / ad;
+    let mut r2 = two63 - q2 * ad;
+    loop {
+        p += 1;
+        q1 = q1.wrapping_mul(2);
+        r1 = r1.wrapping_mul(2);
+        if r1 >= anc {
+            q1 = q1.wrapping_add(1);
+            r1 = r1.wrapping_sub(anc);
+        }
+        q2 = q2.wrapping_mul(2);
+        r2 = r2.wrapping_mul(2);
+        if r2 >= ad {
+            q2 = q2.wrapping_add(1);
+            r2 = r2.wrapping_sub(ad);
+        }
+        let delta = ad - r2;
+        if !(q1 < delta || (q1 == delta && r1 == 0)) {
+            break;
+        }
+    }
+    let m = q2.wrapping_add(1) as i64;
+    (if d < 0 { m.wrapping_neg() } else { m }, p - 64)
+}
+
+/// A list literal's elements as the words a scalar list stores, when every
+/// one is a constant: an integer, a float, a bool, or a negated number.
+fn const_words(items: &[Expr], elem_t: &VType) -> Option<Vec<i64>> {
+    fn one(e: &Expr, t: &VType) -> Option<i64> {
+        match (e, t) {
+            (Expr::Int(n, _), VType::I64) => Some(*n),
+            (Expr::Int(n, _), VType::F64) => Some((*n as f64).to_bits() as i64),
+            (Expr::Float(f, _), VType::F64) => Some(f.to_bits() as i64),
+            (Expr::Bool(b, _), VType::Bool) => Some(i64::from(*b)),
+            (
+                Expr::Unary {
+                    op: UnaryOp::Neg,
+                    expr,
+                    ..
+                },
+                VType::I64,
+            ) => match &**expr {
+                Expr::Int(n, _) => Some(n.wrapping_neg()),
+                _ => None,
+            },
+            (
+                Expr::Unary {
+                    op: UnaryOp::Neg,
+                    expr,
+                    ..
+                },
+                VType::F64,
+            ) => match &**expr {
+                Expr::Int(n, _) => Some((-(*n as f64)).to_bits() as i64),
+                Expr::Float(f, _) => Some((-f).to_bits() as i64),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+    items.iter().map(|e| one(e, elem_t)).collect()
 }
 
 /// The variable a field path starts from: `p` for `p.b.c`.
@@ -7020,6 +7341,67 @@ impl FnCx<'_, '_> {
     ///
     /// Emitted where the loop has finished — until this runs the elements are
     /// in the buffer and the list does not know how many there are.
+    /// Before a counted loop whose body pushes onto a local list on every
+    /// trip -- `for _ in 0..deg { edges.push(x) }` -- the list's storage is
+    /// grown once for all of them, as `Vec::with_capacity` would be: grown
+    /// a push at a time it was reallocated and copied several times over.
+    /// Only a push at the top of the body counts, and only in a body that
+    /// cannot leave early, so the room reserved is room that gets used.
+    fn reserve_for_pushes(&mut self, body: &grasm_syntax::ast::Block, start: Value, end: Value) {
+        if grasm_sema::check::block_can_exit(body) {
+            return;
+        }
+        let mut counts: Vec<(String, i64)> = Vec::new();
+        for st in &body.stmts {
+            if let Stmt::Expr(Expr::MethodCall {
+                recv, name, args, ..
+            }) = st
+            {
+                if let (Expr::Ident(id), "push", 1) = (&**recv, name.name.as_str(), args.len()) {
+                    match counts.iter_mut().find(|(n, _)| *n == id.name) {
+                        Some(c) => c.1 += 1,
+                        None => counts.push((id.name.clone(), 1)),
+                    }
+                }
+            }
+        }
+        for (name, per_trip) in counts {
+            let Some((var, VType::List(elem))) = self.lookup(&name) else {
+                continue;
+            };
+            // A lent binding's list is not this function's to replace. Nor
+            // is one an enclosing loop holds open -- pinned, or with its
+            // buffer kept in registers for appending: growing it here moved
+            // the buffer out from under that loop, and `zlib`'s writer, which
+            // appends a block's bytes in a `for` inside a `while`, wrote them
+            // to the old one.
+            if self.borrowed_vars.contains(&var.as_u32())
+                || self.pinned_list(&name).is_some()
+                || self.append_state(&name).is_some()
+            {
+                continue;
+            }
+            if !(matches!(*elem, VType::Val(_)) || scalar_kind_i64(&elem).is_some()) {
+                continue;
+            }
+            let trips = self.b.ins().isub(end, start);
+            let n = self.b.ins().imul_imm(trips, per_trip);
+            // Only for a long run of pushes: a short one grows no more than
+            // once or twice, and a call before every three-trip loop cost
+            // `tree` more than its growth did.
+            let big = self.b.ins().icmp_imm(IntCC::SignedGreaterThan, n, 16);
+            let go = self.b.create_block();
+            let done = self.b.create_block();
+            self.b.ins().brif(big, go, &[], done, &[]);
+            self.goto_block(go);
+            let cur = self.b.use_var(var);
+            let grown = self.call_rt("grasm_list_reserve", &[cur, n]).unwrap();
+            self.b.def_var(var, grown);
+            self.b.ins().jump(done, &[]);
+            self.goto_block(done);
+        }
+    }
+
     fn close_loop_appends(&mut self) {
         if let Some(open) = self.str_appends.pop() {
             for state in open.values() {
@@ -7096,6 +7478,9 @@ impl FnCx<'_, '_> {
     /// `row + i * stride`. The index's base is literals, arithmetic and names
     /// the loop never assigns, so skipping its evaluation skips nothing.
     fn row_address(&mut self, at: Span, stride: i64) -> Option<Value> {
+        if let Some(&pv) = self.row_ptr.get(&(at.start, at.end)) {
+            return Some(self.b.use_var(pv));
+        }
         let (row, lv) = self.row_base.get(&(at.start, at.end)).cloned()?;
         let (var, _) = self.lookup(&lv)?;
         let iv = self.b.use_var(var);
@@ -7172,6 +7557,11 @@ impl FnCx<'_, '_> {
 
     /// One element out of a list: the typed inline read when the element type
     /// is scalar, the boxed read + unbox otherwise.
+    ///
+    /// (A scalar element is read inline when the list is a `ListScalar` of
+    /// the expected kind and the index is inside it -- see
+    /// `scalar_list_ok`; anything else takes the runtime call, which also
+    /// owns the out-of-range message.)
     fn list_get_elem(
         &mut self,
         list: Value,
@@ -7184,10 +7574,7 @@ impl FnCx<'_, '_> {
             return Ok((at, elem_t.clone()));
         }
         if let Some(k) = scalar_kind_i64(elem_t) {
-            let kc = self.b.ins().iconst(types::I64, k);
-            let bits = self
-                .call_rt("grasm_list_get_scalar", &[list, idx, kc])
-                .unwrap();
+            let bits = self.scalar_list_get(list, idx, k);
             let v = self.scalar_of_bits(bits, elem_t);
             return Ok((v, elem_t.clone()));
         }
@@ -7276,14 +7663,11 @@ impl FnCx<'_, '_> {
             // fields: a temporary hands them over, anything else is copied.
             let s = s.clone();
             let owned = self.own_val(v, &s);
-            return self.call_rt("grasm_vals_push", &[list, owned]).unwrap();
+            return self.vals_push_fast(list, owned, &s);
         }
         if let Some(k) = scalar_kind_i64(vt) {
             let bits = self.scalar_bits_of(v, vt);
-            let kc = self.b.ins().iconst(types::I64, k);
-            return self
-                .call_rt("grasm_list_push_scalar", &[list, bits, kc])
-                .unwrap();
+            return self.scalar_list_push(list, bits, k);
         }
         let bx = self.box_value(v, vt);
         self.call_rt("grasm_list_push", &[list, bx]).unwrap()
@@ -7428,6 +7812,101 @@ impl FnCx<'_, '_> {
             .unwrap_or_default()
     }
 
+    /// For a call to a split-result function: the slot its payload word lands
+    /// in, its address passed as the last argument.
+    fn split_call_slot(
+        &mut self,
+        split: bool,
+        vals: &mut Vec<Value>,
+    ) -> Option<cranelift_codegen::ir::StackSlot> {
+        if !split {
+            return None;
+        }
+        let slot = self
+            .b
+            .create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
+                cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                8,
+                3,
+            ));
+        let ptr_ty = self.cg.module.target_config().pointer_type();
+        vals.push(self.b.ins().stack_addr(ptr_ty, slot, 0));
+        Some(slot)
+    }
+
+    /// A split-result call's tag and payload, put back together as the boxed
+    /// result every other path expects. `try` asks for the parts instead
+    /// (`split_pending`), and then nothing is boxed.
+    fn split_call_result(
+        &mut self,
+        slot: Option<cranelift_codegen::ir::StackSlot>,
+        results: Vec<Value>,
+        ret: &VType,
+        span: Span,
+    ) -> Vec<Value> {
+        let Some(slot) = slot else {
+            return results;
+        };
+        if self.split_want == Some((span.start, span.end)) {
+            self.split_want = None;
+            self.split_got = Some((results[0], slot));
+            // A stand-in: `try` reads the parts and never this.
+            return vec![self.b.ins().iconst(types::I64, 0)];
+        }
+        let VType::Fallible(ok_t, _) = ret else {
+            unreachable!("only a fallible function returns a split result")
+        };
+        let tag = self.b.ins().uextend(types::I64, results[0]);
+        let word = self.b.ins().stack_load(types::I64, slot, 0);
+        let k = self.b.ins().iconst(types::I64, result_kind(ok_t));
+        vec![self.call_rt("grasm_result_box", &[tag, word, k]).unwrap()]
+    }
+
+    /// `Ok(v)` from a split-result function, with nothing boxed: the payload
+    /// word written and tag 0 returned. `v` is the ok value as computed --
+    /// a scalar or an owned box.
+    fn ret_ok_raw(&mut self, v: Value, ok_t: &VType) {
+        let out = self.split_out.expect("a split-result function");
+        let flags = cranelift_codegen::ir::MemFlags::trusted();
+        let word = match result_kind(ok_t) {
+            4 => self.b.ins().iconst(types::I64, 0),
+            k if k >= 0 => self.scalar_bits_of(v, ok_t),
+            _ => v,
+        };
+        self.b.ins().store(flags, word, out, 0);
+        let tag = self.b.ins().iconst(types::I8, 0);
+        self.b.ins().return_(&[tag]);
+    }
+
+    /// `Err(e)` from a split-result function: the error's box written and
+    /// tag 1 returned.
+    fn ret_err_raw(&mut self, e: Value) {
+        let out = self.split_out.expect("a split-result function");
+        let flags = cranelift_codegen::ir::MemFlags::trusted();
+        self.b.ins().store(flags, e, out, 0);
+        let tag = self.b.ins().iconst(types::I8, 1);
+        self.b.ins().return_(&[tag]);
+    }
+
+    /// Returns a result from the function being compiled: as the boxed value
+    /// itself, or -- by the split-result convention -- taken apart into the
+    /// caller's payload slot and a tag. The scope releases are the caller's.
+    fn ret_result(&mut self, v: Value) {
+        match self.split_out {
+            Some(out) => {
+                let VType::Fallible(ok_t, _) = self.ret.clone() else {
+                    unreachable!("a split result belongs to a fallible function")
+                };
+                let k = self.b.ins().iconst(types::I64, result_kind(&ok_t));
+                let tag = self.call_rt("grasm_result_split", &[v, out, k]).unwrap();
+                self.b.ins().return_(&[tag]);
+            }
+            None => {
+                self.b.ins().return_(&[v]);
+            }
+        }
+    }
+
     /// Whether a local of value struct `s` is held field by field in
     /// variables. Cranelift does not promote stack slots to registers, and its
     /// load forwarding gives up at the next store to any slot, so a value
@@ -7534,9 +8013,26 @@ impl FnCx<'_, '_> {
     /// are evaluated as written and stored as declared; a boxed field's
     /// reference belongs to the value.
     fn eval_val_lit(&mut self, s: &str, fields: &[(Ident, Expr)], span: Span) -> CResult<(Value, VType)> {
-        let decl = self.cg.structs.get(s).cloned().unwrap_or_default();
+        let words = self.val_lit_words(s, fields, span)?;
         let at = self.val_slot(s);
         let flags = cranelift_codegen::ir::MemFlags::trusted();
+        for (i, w) in words {
+            self.b.ins().store(flags, w, at, (8 * i) as i32);
+        }
+        self.fresh_vals.insert(at);
+        Ok((at, VType::Val(s.to_string())))
+    }
+
+    /// A value-struct literal's field words, each owned, by field index: what
+    /// `eval_val_lit` stores to a slot, and what a `push` of a literal stores
+    /// straight into the list.
+    fn val_lit_words(
+        &mut self,
+        s: &str,
+        fields: &[(Ident, Expr)],
+        span: Span,
+    ) -> CResult<Vec<(usize, Value)>> {
+        let decl = self.cg.structs.get(s).cloned().unwrap_or_default();
         // Held where an early exit's releases find them until stored.
         self.push_scope();
         let mut words: Vec<(usize, Value)> = Vec::new();
@@ -7563,12 +8059,8 @@ impl FnCx<'_, '_> {
             };
             words.push((i, w));
         }
-        for (i, w) in words {
-            self.b.ins().store(flags, w, at, (8 * i) as i32);
-        }
         self.pop_scope_no_decs();
-        self.fresh_vals.insert(at);
-        Ok((at, VType::Val(s.to_string())))
+        Ok(words)
     }
 
     /// An assignment whose target is a value struct variable, or one of its
@@ -7711,7 +8203,10 @@ impl FnCx<'_, '_> {
                     if let Some((vvar, _)) = self.lookup(&vid.name) {
                         if let Some(fs) = self.split_vals.get(&vvar.as_u32()).cloned() {
                             let (iv, _) = self.index_value(index)?;
-                            let at = if let Some((data, len, pt)) = self.pinned_list(&root.name) {
+                            let row = self.row_address(index.span(), self.val_stride(&VType::Val(s.clone())));
+                            let at = if let Some(r) = row {
+                                r
+                            } else if let Some((data, len, pt)) = self.pinned_list(&root.name) {
                                 let stride = self.val_stride(&pt);
                                 self.pinned_address(data, len, iv, stride)
                             } else {
@@ -7738,7 +8233,10 @@ impl FnCx<'_, '_> {
                 }
                 let owned = nv;
                 let (iv, _) = self.index_value(index)?;
-                let at = if let Some((data, len, pt)) = self.pinned_list(&root.name) {
+                let row = self.row_address(index.span(), self.val_stride(&VType::Val(s.clone())));
+                let at = if let Some(r) = row {
+                    r
+                } else if let Some((data, len, pt)) = self.pinned_list(&root.name) {
                     let stride = self.val_stride(&pt);
                     self.pinned_address(data, len, iv, stride)
                 } else {
@@ -7913,11 +8411,215 @@ impl FnCx<'_, '_> {
         self.b.ins().band(is_list, is_inline)
     }
 
+    /// Whether `lv` is a `ListScalar` of kind `k` (0 i64, 1 f64, 2 bool, 3
+    /// ref) held in the `ScalarData` variant that kind uses: words, or bytes
+    /// for a bool. Every inline scalar-list operation asks this first.
+    fn scalar_list_ok(&mut self, lv: Value, k: i64) -> Value {
+        let flags = cranelift_codegen::ir::MemFlags::trusted();
+        let ptag = self.b.ins().uload8(types::I32, flags, lv, LAYOUT_PAYLOAD_TAG as i32);
+        let kind = self.b.ins().uload8(types::I32, flags, lv, LAYOUT_SCALAR_KIND as i32);
+        let dtag = self.b.ins().uload8(types::I32, flags, lv, LAYOUT_SCALAR_DATA_TAG as i32);
+        let a = self.b.ins().icmp_imm(IntCC::Equal, ptag, LAYOUT_TAG_LIST_SCALAR);
+        let b = self.b.ins().icmp_imm(IntCC::Equal, kind, k);
+        let c = self.b.ins().icmp_imm(IntCC::Equal, dtag, i64::from(k == 2));
+        let ab = self.b.ins().band(a, b);
+        self.b.ins().band(ab, c)
+    }
+
+    /// The buffer address, length and capacity of a scalar list's `Vec`.
+    fn scalar_vec_words(&mut self, lv: Value) -> (Value, Value, Value) {
+        let flags = cranelift_codegen::ir::MemFlags::trusted();
+        let (vp, vl, vc) = vec_layout();
+        let base = LAYOUT_SCALAR_VEC;
+        (
+            self.b.ins().load(types::I64, flags, lv, (base + vp) as i32),
+            self.b.ins().load(types::I64, flags, lv, (base + vl) as i32),
+            self.b.ins().load(types::I64, flags, lv, (base + vc) as i32),
+        )
+    }
+
+    /// `xs.push(v)` on a list of values: the words stored at the end and the
+    /// length bumped, when nothing else holds the list and its buffer has room
+    /// -- the runtime call (which copies the list, or grows it) otherwise.
+    /// `owned` is the element's words, already owned by the caller.
+    fn vals_push_fast(&mut self, lv: Value, owned: Value, s: &str) -> Value {
+        let w = self.val_fields(s).len() as i64;
+        let flags = cranelift_codegen::ir::MemFlags::trusted();
+        let ptag = self.b.ins().uload8(types::I32, flags, lv, LAYOUT_PAYLOAD_TAG as i32);
+        let is_vals = self.b.ins().icmp_imm(IntCC::Equal, ptag, LAYOUT_TAG_LIST_VALS);
+        let check = self.b.create_block();
+        let fast = self.b.create_block();
+        let slow = self.b.create_block();
+        let join = self.b.create_block();
+        self.b.append_block_param(join, types::I64);
+        self.b.ins().brif(is_vals, check, &[], slow, &[]);
+        self.goto_block(check);
+        let (vp, vl, vc) = vec_layout();
+        let base = LAYOUT_VALS_VEC;
+        let rc = self.b.ins().load(types::I64, flags, lv, 0);
+        let unique = self.b.ins().icmp_imm(IntCC::Equal, rc, 1);
+        let ptr = self.b.ins().load(types::I64, flags, lv, (base + vp) as i32);
+        let n = self.b.ins().load(types::I64, flags, lv, (base + vl) as i32);
+        let cap = self.b.ins().load(types::I64, flags, lv, (base + vc) as i32);
+        let need = self.b.ins().iadd_imm(n, w);
+        let room = self.b.ins().icmp(IntCC::UnsignedLessThanOrEqual, need, cap);
+        let go = self.b.ins().band(unique, room);
+        self.b.ins().brif(go, fast, &[], slow, &[]);
+        self.goto_block(fast);
+        let off = self.b.ins().ishl_imm(n, 3);
+        let at = self.b.ins().iadd(ptr, off);
+        for i in 0..w {
+            let word = self.b.ins().load(types::I64, flags, owned, (8 * i) as i32);
+            self.b.ins().store(flags, word, at, (8 * i) as i32);
+        }
+        self.b.ins().store(flags, need, lv, (base + vl) as i32);
+        self.b.ins().jump(join, &[lv]);
+        self.goto_block(slow);
+        let r = self.call_rt("grasm_vals_push", &[lv, owned]).unwrap();
+        self.b.ins().jump(join, &[r]);
+        self.goto_block(join);
+        self.b.block_params(join)[0]
+    }
+
+    /// `vals_push_fast` for words that are in registers rather than a slot:
+    /// stored at the list's end when it has room, and through a slot and the
+    /// runtime call when it does not.
+    fn vals_push_words(&mut self, lv: Value, words: &[(usize, Value)], s: &str) -> Value {
+        let w = self.val_fields(s).len() as i64;
+        let flags = cranelift_codegen::ir::MemFlags::trusted();
+        let ptag = self.b.ins().uload8(types::I32, flags, lv, LAYOUT_PAYLOAD_TAG as i32);
+        let is_vals = self.b.ins().icmp_imm(IntCC::Equal, ptag, LAYOUT_TAG_LIST_VALS);
+        let check = self.b.create_block();
+        let fast = self.b.create_block();
+        let slow = self.b.create_block();
+        let join = self.b.create_block();
+        self.b.append_block_param(join, types::I64);
+        self.b.ins().brif(is_vals, check, &[], slow, &[]);
+        self.goto_block(check);
+        let (vp, vl, vc) = vec_layout();
+        let base = LAYOUT_VALS_VEC;
+        let rc = self.b.ins().load(types::I64, flags, lv, 0);
+        let unique = self.b.ins().icmp_imm(IntCC::Equal, rc, 1);
+        let ptr = self.b.ins().load(types::I64, flags, lv, (base + vp) as i32);
+        let n = self.b.ins().load(types::I64, flags, lv, (base + vl) as i32);
+        let cap = self.b.ins().load(types::I64, flags, lv, (base + vc) as i32);
+        let need = self.b.ins().iadd_imm(n, w);
+        let room = self.b.ins().icmp(IntCC::UnsignedLessThanOrEqual, need, cap);
+        let go = self.b.ins().band(unique, room);
+        self.b.ins().brif(go, fast, &[], slow, &[]);
+        self.goto_block(fast);
+        let off = self.b.ins().ishl_imm(n, 3);
+        let at = self.b.ins().iadd(ptr, off);
+        for (i, word) in words {
+            self.b.ins().store(flags, *word, at, (8 * i) as i32);
+        }
+        self.b.ins().store(flags, need, lv, (base + vl) as i32);
+        self.b.ins().jump(join, &[lv]);
+        self.goto_block(slow);
+        let slot = self.val_slot(s);
+        for (i, word) in words {
+            self.b.ins().store(flags, *word, slot, (8 * i) as i32);
+        }
+        let r = self.call_rt("grasm_vals_push", &[lv, slot]).unwrap();
+        self.b.ins().jump(join, &[r]);
+        self.goto_block(join);
+        self.b.block_params(join)[0]
+    }
+
+    /// `xs[i]` on a scalar list, as bits: a load when the list is in the
+    /// expected shape and `i` is inside it, the runtime call otherwise.
+    fn scalar_list_get(&mut self, lv: Value, iv: Value, k: i64) -> Value {
+        let ok = self.scalar_list_ok(lv, k);
+        let check = self.b.create_block();
+        let fast = self.b.create_block();
+        let slow = self.b.create_block();
+        let join = self.b.create_block();
+        self.b.append_block_param(join, types::I64);
+        self.b.ins().brif(ok, check, &[], slow, &[]);
+        self.goto_block(check);
+        let (ptr, n, _) = self.scalar_vec_words(lv);
+        let inside = self.b.ins().icmp(IntCC::UnsignedLessThan, iv, n);
+        self.b.ins().brif(inside, fast, &[], slow, &[]);
+        self.goto_block(fast);
+        let flags = cranelift_codegen::ir::MemFlags::trusted();
+        let v = if k == 2 {
+            let at = self.b.ins().iadd(ptr, iv);
+            self.b.ins().uload8(types::I64, flags, at, 0)
+        } else {
+            let off = self.b.ins().ishl_imm(iv, 3);
+            let at = self.b.ins().iadd(ptr, off);
+            self.b.ins().load(types::I64, flags, at, 0)
+        };
+        self.b.ins().jump(join, &[v]);
+        self.goto_block(slow);
+        let kc = self.b.ins().iconst(types::I64, k);
+        let r = self.call_rt("grasm_list_get_scalar", &[lv, iv, kc]).unwrap();
+        self.b.ins().jump(join, &[r]);
+        self.goto_block(join);
+        self.b.block_params(join)[0]
+    }
+
+    /// `xs.push(v)` on a scalar list, `v` as bits: a store and a length bump
+    /// when nothing else holds the list and its buffer has room, the runtime
+    /// call (which copies, or grows) otherwise. Answers the list.
+    fn scalar_list_push(&mut self, lv: Value, bits: Value, k: i64) -> Value {
+        let ok = self.scalar_list_ok(lv, k);
+        let check = self.b.create_block();
+        let fast = self.b.create_block();
+        let slow = self.b.create_block();
+        let join = self.b.create_block();
+        self.b.append_block_param(join, types::I64);
+        self.b.ins().brif(ok, check, &[], slow, &[]);
+        self.goto_block(check);
+        let flags = cranelift_codegen::ir::MemFlags::trusted();
+        let rc = self.b.ins().load(types::I64, flags, lv, 0);
+        let unique = self.b.ins().icmp_imm(IntCC::Equal, rc, 1);
+        let (ptr, n, cap) = self.scalar_vec_words(lv);
+        let room = self.b.ins().icmp(IntCC::UnsignedLessThan, n, cap);
+        let go = self.b.ins().band(unique, room);
+        self.b.ins().brif(go, fast, &[], slow, &[]);
+        self.goto_block(fast);
+        if k == 2 {
+            let at = self.b.ins().iadd(ptr, n);
+            self.b.ins().istore8(flags, bits, at, 0);
+        } else {
+            let off = self.b.ins().ishl_imm(n, 3);
+            let at = self.b.ins().iadd(ptr, off);
+            self.b.ins().store(flags, bits, at, 0);
+        }
+        let n1 = self.b.ins().iadd_imm(n, 1);
+        let (_, vl, _) = vec_layout();
+        self.b.ins().store(flags, n1, lv, (LAYOUT_SCALAR_VEC + vl) as i32);
+        self.b.ins().jump(join, &[lv]);
+        self.goto_block(slow);
+        let kc = self.b.ins().iconst(types::I64, k);
+        let r = self.call_rt("grasm_list_push_scalar", &[lv, bits, kc]).unwrap();
+        self.b.ins().jump(join, &[r]);
+        self.goto_block(join);
+        self.b.block_params(join)[0]
+    }
+
     /// `xs.len()` for a list of boxed values: a byte load when the list is
     /// inline, the runtime call otherwise.
     fn list_len_fast(&mut self, lv: Value, elem_t: &VType) -> Value {
         if matches!(elem_t, VType::Val(_)) {
             return self.call_rt("grasm_vals_len", &[lv]).unwrap();
+        }
+        if let Some(k) = scalar_kind_i64(elem_t) {
+            let ok = self.scalar_list_ok(lv, k);
+            let fast = self.b.create_block();
+            let slow = self.b.create_block();
+            let join = self.b.create_block();
+            self.b.append_block_param(join, types::I64);
+            self.b.ins().brif(ok, fast, &[], slow, &[]);
+            self.goto_block(fast);
+            let (_, n, _) = self.scalar_vec_words(lv);
+            self.b.ins().jump(join, &[n]);
+            self.goto_block(slow);
+            let m = self.call_rt("grasm_list_len", &[lv]).unwrap();
+            self.b.ins().jump(join, &[m]);
+            self.goto_block(join);
+            return self.b.block_params(join)[0];
         }
         if !elem_t.boxed() {
             return self.call_rt("grasm_list_len", &[lv]).unwrap();
@@ -8242,7 +8944,13 @@ impl FnCx<'_, '_> {
                 self.dec_if_boxed(tv, &VType::Tuple(part_ts));
                 Ok(StmtOut::Value(None))
             }
-            Stmt::Let { name, ty, init, .. } => {
+            Stmt::Let {
+                name,
+                ty,
+                init,
+                mutable,
+                ..
+            } => {
                 // A name that exists only to be a map key never becomes a
                 // string: the text stays in the builder and the table is
                 // probed from its bytes.
@@ -8341,6 +9049,26 @@ impl FnCx<'_, '_> {
                 // moves in, a place is copied.
                 if let VType::Val(s) = &vt {
                     let s = s.clone();
+                    // `let node = nodes[v]` with `nodes` never changed in this
+                    // function: the element itself, lent -- no copy, and no
+                    // count taken on its fields. Copied, a graph walk spent
+                    // most of its time taking and dropping two counts per
+                    // node on boxes it had not otherwise touched.
+                    if !*mutable && !self.split_val_ok(&s) {
+                        if let Expr::Index { recv, .. } = init {
+                            if let Expr::Ident(list) = &**recv {
+                                if !self.fn_mutated.contains(&list.name)
+                                    && !self.fresh_vals.contains(&v)
+                                {
+                                    let var = self.new_var(&vt);
+                                    self.b.def_var(var, v);
+                                    self.borrowed_vars.insert(var.as_u32());
+                                    self.bind(&name.name, var, vt);
+                                    return Ok(StmtOut::Value(None));
+                                }
+                            }
+                        }
+                    }
                     if self.split_val_ok(&s) {
                         let fields = self.split_from(v, &s);
                         let var = self.new_var(&vt);
@@ -8775,6 +9503,12 @@ impl FnCx<'_, '_> {
                                 if *ok_t == VType::F64 && vt == VType::I64 {
                                     inner = self.b.ins().fcvt_from_sint(types::F64, inner);
                                 }
+                                if self.split_out.is_some() {
+                                    self.emit_scope_decs_all();
+                                    self.ret_ok_raw(inner, &ok_t);
+                                    self.filled = true;
+                                    return Ok(StmtOut::Terminated);
+                                }
                                 let boxed = self.box_value(inner, &ok_t);
                                 val = self.call_rt("grasm_ok_new", &[boxed]).unwrap();
                             }
@@ -8798,7 +9532,11 @@ impl FnCx<'_, '_> {
                         // (Locals holding the same box are fine: their dec is
                         // balanced by the +1 the Ident eval added.)
                         self.emit_scope_decs_all();
-                        self.b.ins().return_(&[val]);
+                        if matches!(self.ret, VType::Fallible(..)) {
+                            self.ret_result(val);
+                        } else {
+                            self.b.ins().return_(&[val]);
+                        }
                         self.filled = true;
                     }
                     None => {
@@ -8812,7 +9550,7 @@ impl FnCx<'_, '_> {
                             };
                             let wrapped = self.call_rt("grasm_ok_new", &[inner]).unwrap();
                             self.emit_scope_decs_all();
-                            self.b.ins().return_(&[wrapped]);
+                            self.ret_result(wrapped);
                         } else {
                             self.emit_scope_decs_all();
                             self.b.ins().return_(&[]);
@@ -9563,6 +10301,25 @@ this case",
         if std::mem::take(&mut self.vectorize_next) {
             self.emit_vector_prefix(ivar, end_var, loop_var, body, inclusive)?;
         }
+        // Stepping element pointers, from wherever the index now starts.
+        let mut ptr_steps: Vec<(Variable, i64)> = Vec::new();
+        for (sp, row, stride) in std::mem::take(&mut self.ptr_rows_next) {
+            let pv = match ptr_steps.iter().zip(&self.ptr_row_origin).find(|(_, (r, st))| *r == row && *st == stride) {
+                Some(((pv, _), _)) => *pv,
+                None => {
+                    let pv = self.new_var(&VType::I64);
+                    let iv = self.b.use_var(ivar);
+                    let off = self.b.ins().imul_imm(iv, stride);
+                    let at = self.b.ins().iadd(row, off);
+                    self.b.def_var(pv, at);
+                    ptr_steps.push((pv, stride));
+                    self.ptr_row_origin.push((row, stride));
+                    pv
+                }
+            };
+            self.row_ptr.insert(sp, pv);
+        }
+        self.ptr_row_origin.clear();
         let header = self.b.create_block();
         let body_blk = self.b.create_block();
         let step = self.b.create_block();
@@ -9590,10 +10347,13 @@ this case",
         // arithmetic and indexing — it is worth it.
         let mut budget = UNROLL_BUDGET;
         let mut calls = 0;
-        let unrolled = body
-            .stmts
-            .iter()
-            .all(|st| inline_stmt_ok(st, &mut budget, &mut calls))
+        // Not with stepped element pointers: each unrolled copy computes its
+        // own index, and the pointers step once per trip round the plain loop.
+        let unrolled = ptr_steps.is_empty()
+            && body
+                .stmts
+                .iter()
+                .all(|st| inline_stmt_ok(st, &mut budget, &mut calls))
             && calls == 0;
         if unrolled {
             let uhead = self.b.create_block();
@@ -9712,6 +10472,11 @@ this case",
         let one = self.b.ins().iconst(types::I64, 1);
         let next = self.b.ins().iadd(iv2, one);
         self.b.def_var(ivar, next);
+        for (pv, stride) in &ptr_steps {
+            let p = self.b.use_var(*pv);
+            let p2 = self.b.ins().iadd_imm(p, *stride);
+            self.b.def_var(*pv, p2);
+        }
         self.b.ins().jump(header, &[]);
         self.filled = true;
         self.goto_block(exit);
@@ -9752,9 +10517,6 @@ this case",
         let mut lens: Vec<Value> = Vec::with_capacity(accesses.len());
         for (name, base, _) in &accesses {
             match self.pinned_list(name) {
-                // A list of values is not versioned: its accesses are places,
-                // not the loads and stores the check-free copy rewrites.
-                Some((_, _, VType::Val(_))) => return Ok(None),
                 Some((_, len, _)) => lens.push(len),
                 None => return Ok(None),
             }
@@ -9797,9 +10559,10 @@ this case",
             self.b.ins().iadd_imm(e0, -1)
         };
         self.version_rows.clear();
+        self.version_val_rows.clear();
         for ((name, base, sp), len) in accesses.iter().zip(&lens) {
             let (data, _, pt) = self.pinned_list(name).expect("pinned above");
-            let stride = stride_of(&pt);
+            let stride = self.val_stride(&pt);
             let (lo, hi) = match base {
                 Some(b) => {
                     let (bv, bt) = self.eval_expr_val(b)?;
@@ -9814,7 +10577,11 @@ this case",
                     (self.b.ins().iadd(bv, s0), self.b.ins().iadd(bv, last))
                 }
                 None => {
-                    self.version_rows.push((*sp, data));
+                    if matches!(pt, VType::Val(_)) {
+                        self.version_val_rows.push((*sp, data, stride));
+                    } else {
+                        self.version_rows.push((*sp, data));
+                    }
                     (s0, last)
                 }
             };
@@ -9865,6 +10632,7 @@ this case",
             self.b.def_var(end_var, e);
             // Same as the while loop: lists the body only indexes are pinned
             // for its whole extent so each access is a load, not a call.
+            self.reserve_for_pushes(body, s, e);
             self.pin_loop_lists_with(body, &[start, end])?;
 
             // Versioned when every index into a pinned list is the loop
@@ -9887,13 +10655,37 @@ this case",
                     for (sp, row) in &rows {
                         self.row_base.insert(*sp, (*row, loop_var.name.clone()));
                     }
+                    self.ptr_rows_next = std::mem::take(&mut self.version_val_rows);
+                    // The fast copy's float constants, made once here and held
+                    // in registers: built where used, each was three
+                    // instructions per use per element.
+                    let saved_floats = std::mem::take(&mut self.hoisted_floats);
+                    if !std::env::var("GRASM_NO_HOIST_FLOATS").is_ok_and(|v| v == "1") {
+                        for f in grasm_sema::check::block_float_literals(body) {
+                            let k = f.to_bits();
+                            if let std::collections::hash_map::Entry::Vacant(e) = self.hoisted_floats.entry(k) {
+                                // Loaded, not built: Cranelift rebuilds a
+                                // constant at each use however early it is
+                                // made, and a load it leaves where it is.
+                                let id = self.cg.f64_data(k);
+                                let gv = self.cg.module.declare_data_in_func(id, self.b.func);
+                                let ptr_ty = self.cg.module.target_config().pointer_type();
+                                let addr = self.b.ins().global_value(ptr_ty, gv);
+                                let flags = cranelift_codegen::ir::MemFlags::trusted();
+                                let c = self.b.ins().load(types::F64, flags, addr, 0);
+                                e.insert(c);
+                            }
+                        }
+                    }
                     self.vectorize_next = !std::env::var("GRASM_NO_VECTOR").is_ok_and(|v| v == "1");
                     let r = self.emit_range_loop(ivar, end_var, loop_var, body, *inclusive);
                     self.vectorize_next = false;
                     for sp in &spans {
                         self.unchecked_idx.remove(sp);
                         self.row_base.remove(sp);
+                        self.row_ptr.remove(sp);
                     }
+                    self.hoisted_floats = saved_floats;
                     r.and_then(|()| {
                         self.b.ins().jump(join, &[]);
                         self.filled = true;
@@ -9999,6 +10791,15 @@ this case",
             }
             _ => None,
         };
+        // A scalar list's shape and buffer, found once: the list cannot change
+        // while the loop walks it (see the length above), so each element is
+        // a load -- unless the list is held some other way, which the per-
+        // element branch on `ok` sends to the runtime call as before.
+        let scalar_view = scalar_kind_i64(&elem_t).map(|k| {
+            let ok = self.scalar_list_ok(lv, k);
+            let (ptr, _, _) = self.scalar_vec_words(lv);
+            (ok, ptr, k)
+        });
         let header = self.b.create_block();
         let body_blk = self.b.create_block();
         let step = self.b.create_block();
@@ -10032,6 +10833,30 @@ this case",
         } else if borrow_elem {
             let v = self.list_borrow_fast(lv2, iv2);
             (v, (*elem_t).clone())
+        } else if let Some((ok, ptr, k)) = scalar_view {
+            let fast = self.b.create_block();
+            let slow = self.b.create_block();
+            let join = self.b.create_block();
+            self.b.append_block_param(join, types::I64);
+            self.b.ins().brif(ok, fast, &[], slow, &[]);
+            self.goto_block(fast);
+            let flags = cranelift_codegen::ir::MemFlags::trusted();
+            let bits = if k == 2 {
+                let at = self.b.ins().iadd(ptr, iv2);
+                self.b.ins().uload8(types::I64, flags, at, 0)
+            } else {
+                let off = self.b.ins().ishl_imm(iv2, 3);
+                let at = self.b.ins().iadd(ptr, off);
+                self.b.ins().load(types::I64, flags, at, 0)
+            };
+            self.b.ins().jump(join, &[bits]);
+            self.goto_block(slow);
+            let kc = self.b.ins().iconst(types::I64, k);
+            let r = self.call_rt("grasm_list_get_scalar", &[lv2, iv2, kc]).unwrap();
+            self.b.ins().jump(join, &[r]);
+            self.goto_block(join);
+            let bits = self.b.block_params(join)[0];
+            (self.scalar_of_bits(bits, &elem_t), (*elem_t).clone())
         } else {
             self.list_get_elem(lv2, iv2, &elem_t)?
         };
@@ -10510,7 +11335,12 @@ this case",
                 self.pop_scope_no_decs();
                 Ok(Some((m, VType::Map(Box::new(kt), Box::new(vt)))))
             }
-            Expr::Float(v, _) => Ok(Some((self.b.ins().f64const(*v), VType::F64))),
+            Expr::Float(v, _) => {
+                if let Some(&h) = self.hoisted_floats.get(&v.to_bits()) {
+                    return Ok(Some((h, VType::F64)));
+                }
+                Ok(Some((self.b.ins().f64const(*v), VType::F64)))
+            }
             Expr::Bool(v, _) => Ok(Some((
                 self.b.ins().iconst(types::I8, i64::from(*v)),
                 VType::Bool,
@@ -10593,6 +11423,25 @@ this case",
             Expr::Str(pieces, _) => Ok(Some(self.build_string(pieces)?)),
             Expr::List(items, span) => {
                 let elem_t = self.list_elem_type(items, *span)?;
+                // A literal of constants is data: its words are laid out at
+                // compile time and the list made from them in one call. A
+                // thousand-entry table built a push at a time was a thousand
+                // pushes of code at every use -- enough to make `unicodenorm`
+                // too large for the code generator once a push was inline.
+                if let Some(k) = scalar_kind_i64(&elem_t) {
+                    if items.len() >= 2 {
+                        if let Some(words) = const_words(items, &elem_t) {
+                            let id = self.cg.words_data(&words);
+                            let gv = self.cg.module.declare_data_in_func(id, self.b.func);
+                            let ptr_ty = self.cg.module.target_config().pointer_type();
+                            let at = self.b.ins().global_value(ptr_ty, gv);
+                            let kc = self.b.ins().iconst(types::I64, k);
+                            let n = self.b.ins().iconst(types::I64, words.len() as i64);
+                            let list = self.call_rt("grasm_list_from_words", &[kc, at, n]).unwrap();
+                            return Ok(Some((list, VType::List(Box::new(elem_t)))));
+                        }
+                    }
+                }
                 let mut list = self.new_list_of(&elem_t);
                 // The half-built list, under a name the source cannot spell,
                 // so that an element which *leaves* -- `[1, if c { return 1 }
@@ -10618,7 +11467,16 @@ this case",
                     } else {
                         vt
                     };
-                    list = self.list_push_elem(list, v, &vt);
+                    // A call, not the inline push: a literal is written once and
+                    // its elements are code, so their size is what matters.
+                    list = match scalar_kind_i64(&vt) {
+                        Some(k) => {
+                            let bits = self.scalar_bits_of(v, &vt);
+                            let kc = self.b.ins().iconst(types::I64, k);
+                            self.call_rt("grasm_list_push_scalar", &[list, bits, kc]).unwrap()
+                        }
+                        None => self.list_push_elem(list, v, &vt),
+                    };
                     self.b.def_var(held, list);
                 }
                 self.pop_scope_no_decs();
@@ -10631,7 +11489,12 @@ this case",
                 // per element for a value the load does not use.
                 if let Expr::Ident(id) = &**recv {
                     if let Some((data, len, pt @ VType::Val(_))) = self.pinned_list(&id.name) {
-                        // An element of a pinned value list: a place in it.
+                        // An element of a pinned value list: a place in it --
+                        // the versioned loop's row, when it has checked them.
+                        let stride = self.val_stride(&pt);
+                        if let Some(addr) = self.row_address(index.span(), stride) {
+                            return Ok(Some((addr, pt)));
+                        }
                         let (iv, it) = self.eval_expr_val(index)?;
                         if it != VType::I64 {
                             return nope(index.span(), "non-integer index");
@@ -12387,6 +13250,26 @@ this case",
             } else {
                 Some((*elem_t).clone())
             };
+            // `xs.push(P{...})` on a list of values: the fields go straight
+            // into the list's storage when it has room, with no slot between
+            // -- a struct built in a slot and then copied in was most of
+            // what filling a list of them cost.
+            if let (VType::Val(sn), Expr::StructLit { name: lit, base: None, fields, span: lsp }) =
+                (&*elem_t, &args[0])
+            {
+                if lit.segments.len() == 1
+                    && lit.segments[0].name == *sn
+                    && self.append_state(&id.name).is_none()
+                    && fields.len() == self.val_fields(sn).len()
+                {
+                    let sn = sn.clone();
+                    let words = self.val_lit_words(&sn, fields, *lsp)?;
+                    let cur = self.b.use_var(var);
+                    let newp = self.vals_push_words(cur, &words, &sn);
+                    self.b.def_var(var, newp);
+                    return Ok(None);
+                }
+            }
             let (mut av, avt) = self.eval_expr_expecting(&args[0], want.as_ref())?;
             let avt = if *elem_t == VType::F64 && avt == VType::I64 {
                 av = self.b.ins().fcvt_from_sint(types::F64, av);
@@ -12429,6 +13312,7 @@ this case",
                         qual = made?;
                     }
                     if let Some(sig) = self.cg.fns.get(&qual) {
+                        let split_ret_call = sig.split_ret;
                         let (fid, params, modes, ret, callee_floor, callee_borrowed) = (
                             sig.id,
                             sig.params.clone(),
@@ -12555,8 +13439,10 @@ this case",
                             _ => None,
                         };
                         let fref = self.cg.module.declare_func_in_func(fid, self.b.func);
+                        let split_slot = self.split_call_slot(split_ret_call, &mut vals);
                         let inst = self.b.ins().call(fref, &vals);
                         let results: Vec<Value> = self.b.inst_results(inst).to_vec();
+                        let results = self.split_call_result(split_slot, results, &ret, span);
                         for v in lent {
                             self.call_rt("grasm_val_dec", &[v]);
                         }
@@ -12874,6 +13760,9 @@ this case",
             self.bytes_at_fast(borrowed, iv)
         } else if f == "grasm_bytes_len" {
             self.bytes_len_fast(borrowed)
+        } else if let (VType::List(e), "grasm_list_len") = (&vt, f) {
+            let e = (**e).clone();
+            self.list_len_fast(borrowed, &e)
         } else {
             self.call_rt(f, &[borrowed]).unwrap()
         };
@@ -13436,6 +14325,15 @@ this case",
                 self.call_rt("grasm_val_dec", &[other]);
                 (out, VType::Bytes)
             }
+            (VType::Bytes, "index_of") => {
+                let byte = arg_scalar!(0, VType::I64);
+                let from = arg_scalar!(1, VType::I64);
+                let v = self
+                    .call_rt("grasm_bytes_index_of", &[rv, byte, from])
+                    .unwrap();
+                self.call_rt("grasm_val_dec", &[rv]);
+                (v, VType::Option(Box::new(VType::I64)))
+            }
             (VType::Bytes, "to_list") => {
                 let v = self.call_rt("grasm_bytes_to_list", &[rv]).unwrap();
                 self.call_rt("grasm_val_dec", &[rv]);
@@ -13507,16 +14405,18 @@ this case",
                 self.call_rt("grasm_str_from_f64", &[rv]).unwrap(),
                 VType::Str,
             ),
-            (VType::F64, "abs" | "sqrt" | "floor" | "ceil" | "round") => {
-                let f = match m {
-                    "abs" => "grasm_f64_abs",
-                    "sqrt" => "grasm_f64_sqrt",
-                    "floor" => "grasm_f64_floor",
-                    "ceil" => "grasm_f64_ceil",
-                    _ => "grasm_f64_round",
-                };
-                (self.call_rt(f, &[rv]).unwrap(), VType::F64)
-            }
+            // One instruction each, with the same IEEE answer the runtime's
+            // Rust gives -- a call apiece was most of a checksum loop.
+            // `round` stays a call: Rust rounds halves away from zero, and
+            // the instruction (`nearest`) rounds them to even.
+            (VType::F64, "abs") => (self.b.ins().fabs(rv), VType::F64),
+            (VType::F64, "sqrt") => (self.b.ins().sqrt(rv), VType::F64),
+            (VType::F64, "floor") => (self.b.ins().floor(rv), VType::F64),
+            (VType::F64, "ceil") => (self.b.ins().ceil(rv), VType::F64),
+            (VType::F64, "round") => (
+                self.call_rt("grasm_f64_round", &[rv]).unwrap(),
+                VType::F64,
+            ),
             // The math library. Every one is `f64 -> f64` with no allocation
             // and no effect, so it lowers to a direct runtime call.
             (
@@ -13630,6 +14530,7 @@ this case",
                         .cloned(),
                 };
                 if let Some(sig) = resolved {
+                    let split_ret_call = sig.split_ret;
                     let (fid, params, modes, ret, is_extern, callee_floor, callee_borrowed) = (
                         sig.id,
                         sig.params.clone(),
@@ -13814,8 +14715,10 @@ this case",
                         vals.insert(0, f);
                     }
                     let fref = self.cg.module.declare_func_in_func(fid, self.b.func);
+                    let split_slot = self.split_call_slot(split_ret_call, &mut vals);
                     let inst = self.b.ins().call(fref, &vals);
                     let results: Vec<Value> = self.b.inst_results(inst).to_vec();
+                    let results = self.split_call_result(split_slot, results, &ret, span);
                     for v in lent_temps {
                         self.call_rt("grasm_val_dec", &[v]);
                     }
@@ -14238,13 +15141,11 @@ checker did",
                     let q = self.b.ins().sshr_imm(biased, k);
                     Some(if d < 0 { self.b.ins().ineg(q) } else { q })
                 } else {
-                    // Not a power of two: the general path, guard and all.
-                    // Dropping just the guard — a branch on a value that
-                    // cannot be zero — made `tree` 1.05x *slower*, twice
-                    // over. Removing a block changes what the register
-                    // allocator does with the ones around it, and the divide
-                    // that remains is tens of cycles it can hide behind.
-                    None
+                    // Any other constant: a multiply by its reciprocal, as
+                    // LLVM does. (Dropping only the zero guard and keeping
+                    // the divide made `tree` 1.05x slower; this removes the
+                    // divide itself, which was the cost.)
+                    Some(self.div_by_magic(x, d))
                 }
             }
         }
@@ -14279,11 +15180,33 @@ checker did",
                     let is_neg = self.b.ins().icmp_imm(IntCC::SignedLessThan, x, 0);
                     Some(self.b.ins().select(is_neg, neg, pos))
                 } else {
-                    // As in `div_by_const`: measured, and not worth it.
-                    None
+                    let q = self.div_by_magic(x, d);
+                    let qd = self.b.ins().imul_imm(q, d);
+                    Some(self.b.ins().isub(x, qd))
                 }
             }
         }
+    }
+
+    /// `x / d`, truncated, for a constant `d` that is not 0, 1, -1 or a power
+    /// of two: the high half of `x` times a magic multiplier, shifted, and
+    /// corrected by one for a negative quotient (Hacker's Delight 10-1). The
+    /// divide it replaces is tens of cycles on the critical path of every
+    /// hash, LCG and digit loop.
+    fn div_by_magic(&mut self, x: Value, d: i64) -> Value {
+        let (m, s) = signed_magic(d);
+        let mv = self.b.ins().iconst(types::I64, m);
+        let mut q = self.b.ins().smulhi(x, mv);
+        if d > 0 && m < 0 {
+            q = self.b.ins().iadd(q, x);
+        } else if d < 0 && m > 0 {
+            q = self.b.ins().isub(q, x);
+        }
+        if s > 0 {
+            q = self.b.ins().sshr_imm(q, i64::from(s));
+        }
+        let sign = self.b.ins().ushr_imm(q, 63);
+        self.b.ins().iadd(q, sign)
     }
 
     fn guard_zero(&mut self, divisor: Value, panic_fn: &'static str) {
@@ -14871,6 +15794,31 @@ checker did",
                     ),
                 )));
             }
+            // `f(0)`, …, `f(n - 1)` on a thread each. The index list comes
+            // from the runtime, which also refuses a count past its cap, and
+            // `f` is lowered exactly as `par_map`'s function is — a closure
+            // written here, or a name rewritten into one.
+            "net_workers" if args.len() == 2 => {
+                let (n, _) = self.eval_expr_val(&args[0])?;
+                let list = self.call_rt("grasm_net_workers_indices", &[n]).unwrap();
+                let (param, body) = match self.desugar_fn_arg(&args[1], true) {
+                    Some(pb) => pb,
+                    None => match &args[1] {
+                        Expr::Closure { params, body, .. } if params.len() == 1 => {
+                            (params[0].clone(), (**body).clone())
+                        }
+                        other => {
+                            return nope(
+                                other.span(),
+                                "net_workers with a function that is neither a closure written in place nor a named function",
+                            )
+                        }
+                    },
+                };
+                return self
+                    .emit_par_map_on(list, &VType::I64, &param, &body, call_span, true)
+                    .map(Some);
+            }
             // Readiness. The handles arrive as an ordinary `[i64]`, which the
             // backend represents as an *unboxed scalar* list, and the runtime
             // hands one back in the same shape — so the answer can be indexed
@@ -15151,6 +16099,16 @@ checker did",
                 if !evt.boxed() {
                     return nope(args[0].span(), "failing with unboxed values");
                 }
+                if self.fail_redirect.is_empty()
+                    && self.split_out.is_some()
+                    && matches!(self.ret, VType::Fallible(_, _))
+                {
+                    self.emit_scope_decs_all();
+                    self.ret_err_raw(ev);
+                    self.filled = true;
+                    self.enter_dead_block();
+                    return Ok(None);
+                }
                 let wrapped = self.call_rt("grasm_err_new", &[ev]).unwrap();
                 // Inside a closure that was inlined into a loop, this `fail` is
                 // the *closure's* — it produces an `Err` element and the loop
@@ -15166,7 +16124,7 @@ checker did",
                 }
                 self.emit_scope_decs_all();
                 if matches!(self.ret, VType::Fallible(_, _)) {
-                    self.b.ins().return_(&[wrapped]);
+                    self.ret_result(wrapped);
                 } else {
                     // `fn main() { fail(e) }` — `main` may propagate without
                     // declaring `! E`, and its signature then returns nothing.
@@ -15259,6 +16217,7 @@ type parameters",
             }
             return nope(id.span, format!("the function `{}` here", id.name));
         };
+        let split_ret_call = sig.split_ret;
         let (fid, params, modes, ret, is_extern, callee_floor, callee_borrowed) = (
             sig.id,
             sig.params.clone(),
@@ -15435,8 +16394,10 @@ type parameters",
             _ => None,
         };
         let fref = self.cg.module.declare_func_in_func(fid, self.b.func);
+        let split_slot = self.split_call_slot(split_ret_call, &mut vals);
         let inst = self.b.ins().call(fref, &vals);
         let results: Vec<Value> = self.b.inst_results(inst).to_vec();
+        let results = self.split_call_result(split_slot, results, &ret, call_span);
         // Temporaries handed to a parameter the callee only reads: nobody on
         // the other side released them.
         for v in lent_temps {
@@ -16199,10 +17160,48 @@ fields, not the type this is bound to, not an enclosing generic",
     }
 
     fn eval_try(&mut self, inner: &Expr, span: Span) -> CResult<(Value, VType)> {
-        let (fv, ft) = self.eval_expr_val(inner)?;
+        if matches!(inner, Expr::Call { .. } | Expr::MethodCall { .. }) {
+            let sp = inner.span();
+            self.split_want = Some((sp.start, sp.end));
+        }
+        self.split_got = None;
+        let evaluated = self.eval_expr_val(inner);
+        self.split_want = None;
+        let (fv, ft) = evaluated?;
         let VType::Fallible(ok_t, _) = ft else {
             return nope(span, "try on non-fallible values");
         };
+        // The call was a split-result one and handed over its parts: branch on
+        // the tag, and nothing is boxed or unboxed on either side.
+        if let Some((tag, slot)) = self.split_got.take() {
+            let ok_blk = self.b.create_block();
+            let err_blk = self.b.create_block();
+            self.b.ins().brif(tag, err_blk, &[], ok_blk, &[]);
+            self.filled = true;
+            self.goto_block(err_blk);
+            let epay = self.b.ins().stack_load(types::I64, slot, 0);
+            if self.split_out.is_some() && matches!(self.ret, VType::Fallible(_, _)) {
+                self.emit_scope_decs_all();
+                self.ret_err_raw(epay);
+            } else {
+                let wrapped = self.call_rt("grasm_err_new", &[epay]).unwrap();
+                self.emit_scope_decs_all();
+                if matches!(self.ret, VType::Fallible(_, _)) {
+                    self.ret_result(wrapped);
+                } else {
+                    self.call_rt("grasm_report_main_err", &[wrapped]);
+                    self.trap_here();
+                }
+            }
+            self.filled = true;
+            self.goto_block(ok_blk);
+            let word = self.b.ins().stack_load(types::I64, slot, 0);
+            return Ok(match result_kind(&ok_t) {
+                4 => (self.b.ins().iconst(types::I8, 0), VType::Unit),
+                k if k >= 0 => (self.scalar_of_bits(word, &ok_t), (*ok_t).clone()),
+                _ => (word, (*ok_t).clone()),
+            });
+        }
         let ok_blk = self.b.create_block();
         let err_blk = self.b.create_block();
         // The `Ok` side is taken in the same call that tests it: a scalar's
@@ -16233,7 +17232,7 @@ fields, not the type this is bound to, not an enclosing generic",
         let wrapped = self.call_rt("grasm_err_new", &[epay]).unwrap();
         self.emit_scope_decs_all();
         if matches!(self.ret, VType::Fallible(_, _)) {
-            self.b.ins().return_(&[wrapped]);
+            self.ret_result(wrapped);
             self.filled = true;
         } else {
             // Checker prevents this; guard anyway.
@@ -19255,6 +20254,23 @@ binding, as in `let f: fn(i64) -> i64 = |x| x + 1`, or make it a top-level `fn`)
         body: &Expr,
         span: Span,
     ) -> CResult<(Value, VType)> {
+        self.emit_par_map_on(list, elem_t, param, body, span, false)
+    }
+
+    /// `emit_par_map`, or with `workers` the body of `net_workers(n, f)` over
+    /// its index list: the same lifted function, handed to a runtime entry
+    /// that gives every index a thread of its own ([L-LIB-NET-WORKERS]). The
+    /// sequential fallback is the same for both, and for `net_workers` it is
+    /// the interpreter's schedule.
+    fn emit_par_map_on(
+        &mut self,
+        list: Value,
+        elem_t: &VType,
+        param: &Ident,
+        body: &Expr,
+        span: Span,
+        workers: bool,
+    ) -> CResult<(Value, VType)> {
         let captures = self.closure_captures(std::slice::from_ref(param), body);
         let out_t = {
             self.push_scope();
@@ -19337,7 +20353,17 @@ binding, as in `let f: fn(i64) -> i64 = |x| x + 1`, or make it a top-level `fn`)
         let fref = self.cg.module.declare_func_in_func(id, self.b.func);
         let code = self.b.ins().func_addr(ptr_ty, fref);
         let env_len = self.b.ins().iconst(types::I64, captures.len() as i64);
-        let out = if all_scalar {
+        let out = if workers {
+            let out_kind = self
+                .b
+                .ins()
+                .iconst(types::I64, scalar_kind_i64(&out_t).unwrap_or(-1));
+            self.call_rt(
+                "grasm_net_workers",
+                &[list, code, env_ptr, env_len, out_kind],
+            )
+            .unwrap()
+        } else if all_scalar {
             let out_kind = self
                 .b
                 .ins()

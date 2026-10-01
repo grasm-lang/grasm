@@ -301,6 +301,7 @@ pub const BUILTIN_FREE_FNS: &[&str] = &[
     "tcp_write_bytes",
     "net_close",
     "net_wait",
+    "net_workers",
     "net_port",
     "tcp_peer",
     "udp_bind",
@@ -5620,6 +5621,26 @@ only a number or a `bool` can come out — compute what you need and yield that"
                         };
                         return Type::Fallible(Box::new(handles), Box::new(io_err));
                     }
+                    // `f(0)`, …, `f(n - 1)`, each on a thread of its own
+                    // ([L-LIB-NET-WORKERS]). Checked as a parallel operation's
+                    // function, because it is one: every worker runs at once,
+                    // so a `ref` or an actor handle from outside would be
+                    // shared between them. The row is the one difference —
+                    // `net` is allowed, and `effects.rs` refuses anything else.
+                    "net_workers" => {
+                        if args.len() != 2 {
+                            return self.error(span, "net_workers takes 2 arguments (n, f)");
+                        }
+                        self.check_expr(&args[0], &Type::I64);
+                        let out = self.uni.fresh();
+                        let f = Type::Fn {
+                            params: vec![Type::I64],
+                            ret: Box::new(out.clone()),
+                            row: None,
+                        };
+                        self.check_parallel_fn(&args[1], &f);
+                        return Type::List(Box::new(out));
+                    }
                     // A datagram is a whole message sent to an address named at
                     // send time, so unlike `tcp_write` it cannot take just a
                     // handle and a payload. The payload is `bytes` rather than
@@ -7700,6 +7721,16 @@ Perform the effect after the closing brace, or yield a number and do the work ou
                     }
                     Type::Bytes
                 }
+                // The first position at or after `from` holding `byte`: where
+                // the next line or field ends, found without walking the
+                // buffer a byte at a time in the program.
+                "index_of" => {
+                    if check_arity(self, 2) {
+                        self.check_expr(&args[0], &Type::I64);
+                        self.check_expr(&args[1], &Type::I64);
+                    }
+                    self.defs.option_some(Type::I64)
+                }
                 "to_list" => {
                     check_arity(self, 0);
                     Type::List(Box::new(Type::I64))
@@ -9574,6 +9605,136 @@ fn walk_stmt_exprs(s: &Stmt, f: &mut dyn FnMut(&Expr)) {
         }
         _ => {}
     }
+}
+
+/// Every name a block might change: assigned through (`x = v`, `x.f = v`,
+/// `x[i] = v`), rebound by a `let`, the receiver of any method call, or a
+/// bare argument (which could be `inout`). Deliberately generous: a name not
+/// in it is certainly left alone for the whole block.
+pub fn possibly_mutated(
+    b: &Block,
+    reads_only: &dyn Fn(&str) -> bool,
+) -> std::collections::HashSet<String> {
+    fn root(e: &Expr) -> Option<&str> {
+        match e {
+            Expr::Ident(id) => Some(&id.name),
+            Expr::Field { recv, .. } | Expr::Index { recv, .. } => root(recv),
+            _ => None,
+        }
+    }
+    fn block(
+        b: &Block,
+        out: &mut std::collections::HashSet<String>,
+        ro: &dyn Fn(&str) -> bool,
+    ) {
+        for st in &b.stmts {
+            match st {
+                Stmt::Assign { target, .. } => {
+                    if let Some(r) = root(target) {
+                        out.insert(r.to_string());
+                    }
+                }
+                Stmt::Let { name, .. } => {
+                    out.insert(name.name.clone());
+                }
+                Stmt::LetTuple { names, .. } => {
+                    for n in names {
+                        out.insert(n.name.clone());
+                    }
+                }
+                Stmt::While { body, .. }
+                | Stmt::For { body, .. }
+                | Stmt::Parallel { body, .. }
+                | Stmt::Spawn { body, .. }
+                | Stmt::With { body, .. } => block(body, out, ro),
+                _ => {}
+            }
+            walk_stmt_exprs(st, &mut |e| expr(e, out, ro));
+        }
+    }
+    fn expr(e: &Expr, out: &mut std::collections::HashSet<String>, ro: &dyn Fn(&str) -> bool) {
+        match e {
+            // A method the caller vouches reads only (`xs.len()`) changes
+            // nothing; any other may.
+            Expr::MethodCall { recv, name, .. } => {
+                if !ro(&name.name) {
+                    if let Some(r) = root(recv) {
+                        out.insert(r.to_string());
+                    }
+                }
+            }
+            Expr::Call { args, .. } => {
+                for a in args {
+                    if let Some(r) = root(a) {
+                        out.insert(r.to_string());
+                    }
+                }
+            }
+            Expr::Block(b) | Expr::Unsafe(b) | Expr::Region(b) => block(b, out, ro),
+            Expr::If {
+                then_block,
+                else_branch,
+                ..
+            } => {
+                block(then_block, out, ro);
+                if let Some(ElseBranch::Else(b)) = else_branch.as_deref() {
+                    block(b, out, ro);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = std::collections::HashSet::new();
+    block(b, &mut out, reads_only);
+    out
+}
+
+/// Whether a block can leave before its end: a `break` or `return` anywhere
+/// in it, nested blocks included.
+pub fn block_can_exit(b: &Block) -> bool {
+    fn block(b: &Block) -> bool {
+        b.stmts.iter().any(|st| match st {
+            Stmt::Break(_) | Stmt::Return(..) => true,
+            Stmt::While { body, .. }
+            | Stmt::For { body, .. }
+            | Stmt::Parallel { body, .. }
+            | Stmt::Spawn { body, .. }
+            | Stmt::With { body, .. } => block(body) || stmt_exprs_exit(st),
+            _ => stmt_exprs_exit(st),
+        })
+    }
+    fn stmt_exprs_exit(st: &Stmt) -> bool {
+        let mut found = false;
+        walk_stmt_exprs(st, &mut |e| match e {
+            Expr::Block(b) | Expr::Unsafe(b) | Expr::Region(b) => found |= block(b),
+            Expr::If {
+                then_block,
+                else_branch,
+                ..
+            } => {
+                found |= block(then_block);
+                if let Some(ElseBranch::Else(b)) = else_branch.as_deref() {
+                    found |= block(b);
+                }
+            }
+            _ => {}
+        });
+        found
+    }
+    block(b)
+}
+
+/// Every float literal written anywhere in a block.
+pub fn block_float_literals(b: &Block) -> Vec<f64> {
+    let mut out = Vec::new();
+    for st in &b.stmts {
+        walk_stmt_exprs(st, &mut |x| {
+            if let Expr::Float(v, _) = x {
+                out.push(*v);
+            }
+        });
+    }
+    out
 }
 
 /// Whether `e` names the variable `name` anywhere inside it.

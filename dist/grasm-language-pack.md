@@ -2639,19 +2639,12 @@ count in [`core.md`](core.md) does not move.
 | `net_wait(hs, ms)` | `([i64], i64) -> [i64] ! IoError` | the handles that can be read without waiting |
 | `net_port(h)` | `(i64) -> i64 ! IoError` | the local port a handle is bound to |
 | `tcp_peer(h)` | `(i64) -> (str, i64) ! IoError` | the address and port at the other end of a connection ([L-LIB-NET-PEER]) |
+| `net_workers(n, f)` | `(i64, fn(i64) -> T) -> [T]` | `f(0)`, …, `f(n - 1)`, a thread each ([L-LIB-NET-WORKERS]) |
 
-`tcp_connect` is the half that makes a program a *client*. Without it a Grasm
-program could listen and accept and never dial — no fetching a URL, no calling
-an API, no talking to a database — which is a gap invisible until somebody tries
-to write an ordinary program. Resolution failure and connection failure are the
-same `IoFailed` to a caller, because both mean "there is nothing to talk to",
-and the message carries the difference.
-
-A handle is an integer and a payload is text, so reaching the network needed no
-pointer type and no byte buffer. That is the reason the surface looks like this:
-adding either to the language would have been a far larger change than adding
-the network, and `extern fn` could already call `socket()` and `listen()` —
-what it could not do was pass a `sockaddr` or a buffer.
+`tcp_connect` resolves names; failing to resolve and failing to connect are the
+same `IoFailed`, since both mean "there is nothing to talk to", and the message
+carries the difference. A handle is an integer and a payload is text, so the
+network needed no pointer type and no byte buffer in the language.
 
 `tcp_read` performs **one** read rather than looping to end-of-stream, because
 an HTTP client holds the connection open after its request and reading to the
@@ -2659,29 +2652,18 @@ end would wait forever. A caller that needs more reads again. Bytes that are not
 valid UTF-8 are replaced rather than refused: a socket carries bytes, a `str`
 carries text, and a client's mistake should not end a server.
 
-That replacement is right for a protocol made of text and wrong for one that is
-not. `multipart/form-data` carries a JPEG, and turning every invalid sequence
-into U+FFFD corrupts the file in a way nothing downstream can detect — the
-upload arrives, the length looks plausible, and the image is broken.
-`tcp_read_bytes` and `tcp_write_bytes` are the same two calls without the
-conversion. They needed no new type: `bytes` already existed ([L-LIB-BYTES]),
-and the socket simply had no way to speak it.
+That is wrong for a protocol not made of text: a JPEG in `multipart/form-data`
+would arrive plausibly sized and broken. `tcp_read_bytes` and `tcp_write_bytes`
+are the same calls without the conversion ([L-LIB-BYTES]). Both pairs stay: an
+HTTP header is text and its body may not be.
 
-Both pairs stay, rather than one replacing the other, because an HTTP header is
-text and a body may not be: a server reads the request as bytes and decodes the
-part it knows is text, and a program serving only text should not have to.
-
-`net_port` is what makes `tcp_listen(0)` usable. Asking the system to choose a
-free port is the only way to write a program that runs on a machine where
-something else already holds the port it wanted — and with no way to read the
-choice back, a program could bind a port it was then unable to name, dial, or
-print.
+`net_port` is what makes `tcp_listen(0)` usable. Letting the system choose a
+free port is how a program runs where the one it wanted is taken, and without
+reading the choice back it could not name, dial, or print the port it bound.
 
 `net_wait` is what lets one thread hold many conversations. Every other call
-here blocks: without it a server serves one client at a time, and serving two
-would need a thread per connection — which a Grasm program cannot spawn, because
-`spawn` does not carry `net`. So the language had a network a program could not
-usefully *serve* on, and the missing piece was readiness, not threads.
+here blocks, and `spawn` does not carry `net`, so without it a server serves one
+client at a time; several such loops at once are [L-LIB-NET-WORKERS].
 
 It answers with the subset of `hs` that will not block, **in the order they were
 asked in** rather than whichever order the kernel reports, so a program that
@@ -2699,6 +2681,17 @@ notice it should be dropped.
 
 **[L-LIB-NET-PEER]** `tcp_peer(h)` is the far end of an accepted or dialed stream;
 any other handle is an `IoFailed`. Those streams have Nagle off (`TCP_NODELAY`).
+
+**[L-LIB-NET-WORKERS]** `net_workers(n, f)` runs `f(0)`, …, `f(n - 1)`, which
+may run concurrently, and answers their results in index order. A compiled build
+gives each a thread, joined before the call returns; `grasm run`, and any
+recorded or replayed run, calls them one after another in index order. `f` may
+perform `net` and nothing else, and may not reach a `ref` or an actor handle
+from outside ([T-PAR-MAP-PURE]): workers share the socket table and nothing more,
+so the only concurrency is the network's, which no program controls anyway.
+`n <= 0` answers `[]`; `n > 256` panics, as does a panicking worker. A
+`tcp_accept` on a listener this thread's last `net_wait` reported ready does not
+wait: if another worker took the connection, it is an `IoFailed`.
 
 **[L-LIB-UDP]** Four more reach the network as **datagrams**, each performing
 `net`:
@@ -2957,6 +2950,7 @@ cannot emit an object file.
 | `b.is_empty()` | `(bytes) -> bool` | |
 | `b.at(i)` | `(bytes, i64) -> i64` | one byte, `0..255`; out of range panics |
 | `b.slice(from, end)` | `(bytes, i64, i64) -> bytes` | `end` exclusive, as `list.slice`; out of range panics rather than clamping |
+| `b.index_of(byte, from)` | `(bytes, i64, i64) -> Option[i64]` | first position `>= from` holding `byte`; `None` when absent or `byte` is outside `0..255`; `from` outside `0..=len` panics |
 | `b.concat(other)` | `(bytes, bytes) -> bytes` | |
 | `b.to_list()` | `(bytes) -> [i64]` | |
 | `read_bytes(path)` | `(str) -> bytes ! IoError` | the whole file |

@@ -17,6 +17,11 @@
 //! an unresolvable name is an Err too
 //! as text, 0xff 0xfe became: [239, 191, 189, 239, 191, 189, 65, 66, 0, 67]
 //! as bytes, they survived: [255, 254, 65, 66, 0, 67]
+//! unread data: the connection
+//! a new connection on the freed handle: nothing ready
+//! once it sends: the connection
+//! left out of the set: nothing ready
+//! put back: the connection
 // The `net` capability: handles are integers, payloads are text.
 //
 // Port 0 asks the system to choose, so this program can run anywhere without
@@ -160,6 +165,7 @@ fn binary_round_trip() / {net, io} {
     let payload = [255, 254, 65, 66, 0, 67]
     print("as text, 0xff 0xfe became: {echo_as(payload, true)}")
     print("as bytes, they survived: {echo_as(payload, false)}")
+    changing_set()
 }
 
 /// Sends `payload` to a listener on this machine and reads it back, as text
@@ -194,6 +200,44 @@ fn echo_as(payload: [i64], as_text: bool) -> [i64] / {net} {
             }
             net_close(srv)
             seen
+        }
+    }
+}
+
+/// Writes, reporting only a failure.
+fn send(h: i64, text: str) / {io, net} {
+    match tcp_write(h, text) {
+        Ok(_) -> {}
+        Err(e) -> print("could not write")
+    }
+}
+
+/// A wait set that changes from one wait to the next, as a server's does: a
+/// connection closed while it still had something to read, its handle taken
+/// by a new connection that has said nothing yet, and a ready connection left
+/// out of the set and then put back. Each answer must be about the set asked
+/// for now, never about one asked for earlier.
+fn changing_set() / {io, net} {
+    match tcp_listen(0) {
+        Err(e) -> print("could not listen")
+        Ok(srv) -> {
+            let port = net_port(srv) ?? 0
+            let a = tcp_connect("127.0.0.1", port) ?? -1
+            let a_in = tcp_accept(srv) ?? -1
+            send(a, "x")
+            report("unread data", net_wait([srv, a_in], 1000) ?? [], srv, a_in)
+            net_close(a_in)
+            net_close(a)
+            let b = tcp_connect("127.0.0.1", port) ?? -1
+            let b_in = tcp_accept(srv) ?? -1
+            report("a new connection on the freed handle", net_wait([srv, b_in], 0) ?? [], srv, b_in)
+            send(b, "y")
+            report("once it sends", net_wait([srv, b_in], 1000) ?? [], srv, b_in)
+            report("left out of the set", net_wait([srv], 0) ?? [], srv, b_in)
+            report("put back", net_wait([srv, b_in], 1000) ?? [], srv, b_in)
+            net_close(b_in)
+            net_close(b)
+            net_close(srv)
         }
     }
 }

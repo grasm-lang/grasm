@@ -11,6 +11,7 @@
 //! last byte and last slice: 0 0x00
 //! slice means the same on bytes as on a list: true true true true
 //! and refuses the end a list would clamp: true
+//! index_of: Some(1) Some(3) None None None
 //! index 7 out of bounds (len 7)
 // `bytes` is the type `str` deliberately is not ([L-LIB-BYTES]).
 //
@@ -64,6 +65,13 @@ fn main() / {io} {
     // is usually being parsed, where a short read is a truncated message.
     print("and refuses the end a list would clamp: " +
         "{code.to_list().slice(0, 99).len() == 7}")
+
+    // A search from `from` on, which is how a line splitter walks a buffer
+    // without slicing it. From the very end there is nothing left to find,
+    // and a value no byte can hold is simply absent.
+    let text = "a,b,c".to_bytes()
+    print("index_of: {text.index_of(44, 0)} {text.index_of(44, 2)} " +
+        "{text.index_of(44, 4)} {text.index_of(44, text.len())} {text.index_of(300, 0)}")
 
     print("{code.at(code.len())}")
 }

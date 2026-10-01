@@ -58,6 +58,12 @@ pub enum Journal {
     /// The call is the program *speaking* to the person watching it. Replaying
     /// it means doing it again for real — a replay whose output you cannot see
     /// is not worth running.
+    ///
+    /// `net_workers` is the other kind: a call that only runs the program's
+    /// own code, whose every reach into the world is a call of its own with a
+    /// record of its own. Replaying it means running that code again, against
+    /// those records — which is why a journaled run keeps its workers on one
+    /// thread, in index order ([L-LIB-NET-WORKERS]).
     Repeated,
 }
 
@@ -299,6 +305,13 @@ pub const BUILTINS: &[Builtin] = &[
         name: "tcp_peer",
         row: NET_ROW,
         journal: Journal::Recorded,
+    },
+    // Runs the program's own function on several threads. `f` may perform
+    // `net` and nothing else, so the call performs exactly that.
+    Builtin {
+        name: "net_workers",
+        row: NET_ROW,
+        journal: Journal::Repeated,
     },
     Builtin {
         name: "udp_bind",

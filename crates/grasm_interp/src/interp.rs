@@ -98,6 +98,38 @@ fn int_in_base(v: i64, base: i64) -> String {
     String::from_utf8_lossy(&buf[i..]).into_owned()
 }
 
+/// The most workers one `net_workers` call may start. A thread each, so a
+/// count from a miscomputed argument should be a refusal rather than ten
+/// thousand threads ([L-LIB-NET-WORKERS]). The runtime has the same number.
+const NET_WORKERS_MAX: i64 = 256;
+
+/// Accepts one connection; when `ready`, without waiting for one.
+///
+/// "No connection is waiting" is the same `IoFailed` text in both engines.
+/// A stream accepted from a non-blocking listener inherits that mode on the
+/// BSDs, macOS included, and every other operation here expects to block.
+fn accept_once(
+    l: &std::net::TcpListener,
+    ready: bool,
+) -> std::io::Result<(std::net::TcpStream, std::net::SocketAddr)> {
+    if !ready {
+        return l.accept();
+    }
+    l.set_nonblocking(true)?;
+    let got = l.accept();
+    let _ = l.set_nonblocking(false);
+    match got {
+        Ok((stream, addr)) => {
+            stream.set_nonblocking(false)?;
+            Ok((stream, addr))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Err(std::io::Error::other(
+            "no connection is waiting",
+        )),
+        Err(e) => Err(e),
+    }
+}
+
 enum NetSocket {
     Listener(std::net::TcpListener),
     Stream(std::net::TcpStream),
@@ -149,6 +181,13 @@ pub struct Interp<'a, W: Write> {
     pub(crate) contract_discards: u32,
     /// Listeners and connections opened by the `net` builtins, by handle.
     sockets: Vec<Option<NetSocket>>,
+    /// Listeners the last `net_wait` reported ready. A `tcp_accept` on one of
+    /// them does not wait: under `net_workers` another worker may have taken
+    /// the connection in between, and waiting for the next one would stall
+    /// everything else that worker serves ([L-LIB-NET-WORKERS]). One thread
+    /// here, so nobody does — but the rule is the language's, not the
+    /// runtime's, and both engines keep it.
+    accept_ready: Vec<i64>,
     /// Closure literals whose own type is fallible, by start offset.
     ///
     /// `fail(e)` raises the error branch of the enclosing fallible function,
@@ -899,6 +938,19 @@ impl<'a, W: Write> Interp<'a, W> {
                     .filter(|(_, p)| p.revents & (POLLIN | POLLHUP | POLLNVAL) != 0)
                     .map(|(&h, _)| Value::Int(h))
                     .collect();
+                self.accept_ready = ready
+                    .iter()
+                    .filter_map(|v| match v {
+                        Value::Int(h) => Some(*h),
+                        _ => None,
+                    })
+                    .filter(|&h| {
+                        matches!(
+                            self.sockets.get(h as usize).and_then(Option::as_ref),
+                            Some(NetSocket::Listener(_))
+                        )
+                    })
+                    .collect();
                 return Value::Ok(Rc::new(Value::List(Rc::new(ready))));
             }
         }
@@ -1064,11 +1116,17 @@ impl<'a, W: Write> Interp<'a, W> {
             }
             return Value::Unit;
         }
+        // After a `net_wait` said this listener was ready, a single attempt
+        // that does not wait; otherwise the ordinary blocking accept.
+        let ready = which == "tcp_accept" && {
+            let at = self.accept_ready.iter().position(|&r| r == h);
+            at.map(|i| self.accept_ready.swap_remove(i)).is_some()
+        };
         let Some(socket) = self.sockets.get_mut(h as usize).and_then(Option::as_mut) else {
             return fail(format!("socket {h} is not open"));
         };
         match (which, socket) {
-            ("tcp_accept", NetSocket::Listener(l)) => match l.accept() {
+            ("tcp_accept", NetSocket::Listener(l)) => match accept_once(l, ready) {
                 Ok((stream, _)) => {
                     // Nagle's algorithm holds a small write back until the
                     // previous one is acknowledged, and the peer delays that
@@ -1361,6 +1419,7 @@ impl<'a, W: Write> Interp<'a, W> {
             contract_mode: false,
             contract_discards: 0,
             sockets: Vec::new(),
+            accept_ready: Vec::new(),
             fallible_closures: std::collections::HashSet::new(),
             float_sums: std::collections::HashSet::new(),
             slab: Vec::new(),
@@ -1415,6 +1474,7 @@ impl<'a, W: Write> Interp<'a, W> {
             contract_mode: false,
             contract_discards: 0,
             sockets: Vec::new(),
+            accept_ready: Vec::new(),
             fallible_closures: self.fallible_closures.clone(),
             float_sums: self.float_sums.clone(),
             slab: Vec::new(),
@@ -2940,6 +3000,28 @@ uses to mark the end of a string"
                         let handles = self.eval_expr(&args[0])?;
                         let timeout = self.eval_expr(&args[1])?;
                         return Ok(self.net_wait(&handles, &timeout));
+                    }
+                    // The workers one after another, in index order, on this
+                    // thread. That is one of the schedules a compiled build
+                    // may pick, and the only one with nothing to synchronise:
+                    // the socket table here is this engine's own
+                    // ([L-LIB-NET-WORKERS]).
+                    "net_workers" => {
+                        let n = match self.eval_expr(&args[0])? {
+                            Value::Int(n) => n,
+                            _ => 0,
+                        };
+                        let f = self.eval_expr(&args[1])?;
+                        if n > NET_WORKERS_MAX {
+                            return Err(Flow::Panic(format!(
+                                "net_workers: at most {NET_WORKERS_MAX} workers, asked for {n}"
+                            )));
+                        }
+                        let mut out = Vec::with_capacity(n.max(0) as usize);
+                        for i in 0..n.max(0) {
+                            out.push(self.call_value(f.clone(), vec![Value::Int(i)], "net_workers")?);
+                        }
+                        return Ok(Value::List(Rc::new(out)));
                     }
                     // Four arguments, because a datagram names its destination
                     // at send time rather than at connect time, and its payload
@@ -4804,6 +4886,26 @@ uses to mark the end of a string"
                 let mut out = b.as_ref().clone();
                 out.extend_from_slice(&other);
                 Value::Bytes(Rc::new(out))
+            }
+            // `from` past the end panics, as `slice` does; a byte outside
+            // 0..255 is simply never found.
+            (Value::Bytes(b), "index_of") => {
+                let Value::Int(byte) = self.eval_expr(&args[0])? else {
+                    return Err(Flow::Panic("index_of expects an integer".into()));
+                };
+                let Value::Int(from) = self.eval_expr(&args[1])? else {
+                    return Err(Flow::Panic("index_of expects an integer".into()));
+                };
+                if from < 0 || from as usize > b.len() {
+                    return Err(Flow::Panic(format!(
+                        "index_of from {from} out of bounds (len {})",
+                        b.len()
+                    )));
+                }
+                match b[from as usize..].iter().position(|&x| i64::from(x) == byte) {
+                    Some(i) => Value::some(Value::Int(from + i as i64)),
+                    None => Value::none(),
+                }
             }
             (Value::Bytes(b), "to_list") => {
                 Value::List(Rc::new(b.iter().map(|x| Value::Int(*x as i64)).collect()))

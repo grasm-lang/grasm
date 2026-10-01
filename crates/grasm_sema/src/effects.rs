@@ -1641,11 +1641,31 @@ fn check_par_map_block(
 ) {
     let mut calls = Vec::new();
     collect_par_maps_block(b, &mut calls);
-    for (func, span) in calls {
+    for (func, span, allowed) in calls {
         let mut row = BTreeSet::new();
         let mut active = Vec::new();
         par_fn_row(func, current, ctx, fnb, &mut active, &mut row);
+        row.retain(|e| !allowed.contains(&e.as_str()));
         if row.is_empty() {
+            continue;
+        }
+        if !allowed.is_empty() {
+            let list = row
+                .iter()
+                .map(|e| format!("`{e}`"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            diags.push(
+                Diagnostic::error(
+                    span,
+                    format!("`net_workers` runs a function that may perform only `net`, but the one given performs {list}"),
+                )
+                .with_help(
+                    "the workers run at once on separate threads, so anything but the \
+network would interleave differently between runs — return what the worker found and \
+act on it after `net_workers` answers",
+                ),
+            );
             continue;
         }
         let list = row
@@ -1666,7 +1686,12 @@ interleave differently between runs — use `map` for effectful work",
     }
 }
 
-fn collect_par_maps_block<'e>(b: &'e Block, out: &mut Vec<(&'e Expr, Span)>) {
+/// A parallel operation's function, where it was handed over, and the effects
+/// it may perform anyway: none for `par_map` and `par_filter`, `net` for
+/// `net_workers` ([L-LIB-NET-WORKERS]).
+type ParCall<'e> = (&'e Expr, Span, &'static [&'static str]);
+
+fn collect_par_maps_block<'e>(b: &'e Block, out: &mut Vec<ParCall<'e>>) {
     for s in &b.stmts {
         match s {
             Stmt::Let { init, .. } => collect_par_maps_expr(init, out),
@@ -1695,14 +1720,24 @@ fn collect_par_maps_block<'e>(b: &'e Block, out: &mut Vec<(&'e Expr, Span)>) {
     }
 }
 
-fn collect_par_maps_expr<'e>(e: &'e Expr, out: &mut Vec<(&'e Expr, Span)>) {
+fn collect_par_maps_expr<'e>(e: &'e Expr, out: &mut Vec<ParCall<'e>>) {
     if let Expr::MethodCall {
         name, args, span, ..
     } = e
     {
         if name.name == "par_map" || name.name == "par_filter" {
             if let Some(f) = args.first() {
-                out.push((f, *span));
+                out.push((f, *span, &[]));
+            }
+        }
+    }
+    // The network is outside the program's control already, so it is the one
+    // thing workers may do concurrently without making the output depend on
+    // the schedule.
+    if let Expr::Call { callee, args, span } = e {
+        if matches!(&**callee, Expr::Ident(id) if id.name == "net_workers") {
+            if let Some(f) = args.get(1) {
+                out.push((f, *span, &[crate::builtins::NET]));
             }
         }
     }

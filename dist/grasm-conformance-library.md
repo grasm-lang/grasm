@@ -1,6 +1,6 @@
 # Grasm — conformance programs: library
 
-The standard library. 57 executable program(s), one per normative clause of
+The standard library. 58 executable program(s), one per normative clause of
 `grasm-language-pack.md`. Each header states the tag it demonstrates and the
 exact expected behaviour, and every one is run by `cargo test -p grasm_spec`, so
 a program here cannot describe behaviour the implementation does not have.
@@ -532,6 +532,7 @@ fn hex(v: i64) -> str {
 //! last byte and last slice: 0 0x00
 //! slice means the same on bytes as on a list: true true true true
 //! and refuses the end a list would clamp: true
+//! index_of: Some(1) Some(3) None None None
 //! index 7 out of bounds (len 7)
 // `bytes` is the type `str` deliberately is not ([L-LIB-BYTES]).
 //
@@ -585,6 +586,13 @@ fn main() / {io} {
     // is usually being parsed, where a short read is a truncated message.
     print("and refuses the end a list would clamp: " +
         "{code.to_list().slice(0, 99).len() == 7}")
+
+    // A search from `from` on, which is how a line splitter walks a buffer
+    // without slicing it. From the very end there is nothing left to find,
+    // and a value no byte can hold is simply absent.
+    let text = "a,b,c".to_bytes()
+    print("index_of: {text.index_of(44, 0)} {text.index_of(44, 2)} " +
+        "{text.index_of(44, 4)} {text.index_of(44, text.len())} {text.index_of(300, 0)}")
 
     print("{code.at(code.len())}")
 }
@@ -1146,6 +1154,107 @@ fn main() / {io, net} {
 }
 ```
 
+## `L-LIB-NET-WORKERS.gr`
+
+```grasm
+//! tag: L-LIB-NET-WORKERS
+//! expect: output
+//! results in index order: [0, 10, 20, 30]
+//! no workers: 0 results
+//! fewer than none: 0 results
+//! every worker talked to itself: [true, true, true]
+//! a worker's listener is open on the main thread too: true
+//! the main thread's listener is open in every worker: [true, true]
+//! one waiting connection, accepted once: 1
+// `net_workers(n, f)` runs `f(0)`, ..., `f(n - 1)` — on a thread each in a
+// compiled build, one after another in index order under `grasm run` — and
+// answers their results in index order. Every line here is the same under
+// both schedules, which is the property the clause promises.
+
+/// Opens a listener of its own, dials it, and passes a message through:
+/// everything a worker can do with sockets nobody else has.
+fn talk_to_self(i: i64) -> bool / {net} {
+    match tcp_listen_on("127.0.0.1", 0) {
+        Err(_) -> false
+        Ok(l) -> {
+            let port = net_port(l) ?? 0
+            var ok = false
+            match tcp_connect("127.0.0.1", port) {
+                Err(_) -> {}
+                Ok(client) -> {
+                    match tcp_accept(l) {
+                        Err(_) -> {}
+                        Ok(conn) -> {
+                            let sent = tcp_write(client, "worker {i}") ?? ()
+                            ok = (tcp_read(conn) ?? "") == "worker {i}"
+                            net_close(conn)
+                        }
+                    }
+                    net_close(client)
+                }
+            }
+            net_close(l)
+            ok
+        }
+    }
+}
+
+/// A listener left open for the main thread to look at.
+fn open_one(i: i64) -> i64 / {net} {
+    tcp_listen_on("127.0.0.1", 0) ?? -1
+}
+
+/// 1 if this worker took the waiting connection, 0 if it found none or another
+/// worker took it first. A `tcp_accept` after `net_wait` reported the listener
+/// ready does not wait, so the worker that lost the race answers rather than
+/// waiting for a client that will never come.
+fn take(listener: i64) -> i64 / {net} {
+    let ready = net_wait([listener], 200) ?? []
+    if ready.is_empty() {
+        return 0
+    }
+    match tcp_accept(listener) {
+        Err(_) -> 0
+        Ok(c) -> {
+            net_close(c)
+            1
+        }
+    }
+}
+
+fn main() / {io, net} {
+    let step = 10
+    print("results in index order: {net_workers(4, |i| i * step)}")
+    print("no workers: {net_workers(0, |i| i).len()} results")
+    print("fewer than none: {net_workers(-3, |i| i).len()} results")
+    print("every worker talked to itself: {net_workers(3, talk_to_self)}")
+
+    // One table for the whole program: a handle means the same socket on
+    // every thread.
+    let opened = net_workers(1, open_one)
+    let h = opened[0]
+    print("a worker's listener is open on the main thread too: {(net_port(h) ?? 0) > 0}")
+    net_close(h)
+
+    match tcp_listen_on("127.0.0.1", 0) {
+        Err(_) -> print("could not listen")
+        Ok(listener) -> {
+            let port = net_port(listener) ?? 0
+            print("the main thread's listener is open in every worker: {net_workers(2, |i| (net_port(listener) ?? -1) == port)}")
+            match tcp_connect("127.0.0.1", port) {
+                Err(_) -> print("could not dial")
+                Ok(client) -> {
+                    let took = net_workers(2, |i| take(listener))
+                    print("one waiting connection, accepted once: {took[0] + took[1]}")
+                    net_close(client)
+                }
+            }
+            net_close(listener)
+        }
+    }
+}
+```
+
 ## `L-LIB-NET.gr`
 
 ```grasm
@@ -1168,6 +1277,11 @@ fn main() / {io, net} {
 //! an unresolvable name is an Err too
 //! as text, 0xff 0xfe became: [239, 191, 189, 239, 191, 189, 65, 66, 0, 67]
 //! as bytes, they survived: [255, 254, 65, 66, 0, 67]
+//! unread data: the connection
+//! a new connection on the freed handle: nothing ready
+//! once it sends: the connection
+//! left out of the set: nothing ready
+//! put back: the connection
 // The `net` capability: handles are integers, payloads are text.
 //
 // Port 0 asks the system to choose, so this program can run anywhere without
@@ -1311,6 +1425,7 @@ fn binary_round_trip() / {net, io} {
     let payload = [255, 254, 65, 66, 0, 67]
     print("as text, 0xff 0xfe became: {echo_as(payload, true)}")
     print("as bytes, they survived: {echo_as(payload, false)}")
+    changing_set()
 }
 
 /// Sends `payload` to a listener on this machine and reads it back, as text
@@ -1345,6 +1460,44 @@ fn echo_as(payload: [i64], as_text: bool) -> [i64] / {net} {
             }
             net_close(srv)
             seen
+        }
+    }
+}
+
+/// Writes, reporting only a failure.
+fn send(h: i64, text: str) / {io, net} {
+    match tcp_write(h, text) {
+        Ok(_) -> {}
+        Err(e) -> print("could not write")
+    }
+}
+
+/// A wait set that changes from one wait to the next, as a server's does: a
+/// connection closed while it still had something to read, its handle taken
+/// by a new connection that has said nothing yet, and a ready connection left
+/// out of the set and then put back. Each answer must be about the set asked
+/// for now, never about one asked for earlier.
+fn changing_set() / {io, net} {
+    match tcp_listen(0) {
+        Err(e) -> print("could not listen")
+        Ok(srv) -> {
+            let port = net_port(srv) ?? 0
+            let a = tcp_connect("127.0.0.1", port) ?? -1
+            let a_in = tcp_accept(srv) ?? -1
+            send(a, "x")
+            report("unread data", net_wait([srv, a_in], 1000) ?? [], srv, a_in)
+            net_close(a_in)
+            net_close(a)
+            let b = tcp_connect("127.0.0.1", port) ?? -1
+            let b_in = tcp_accept(srv) ?? -1
+            report("a new connection on the freed handle", net_wait([srv, b_in], 0) ?? [], srv, b_in)
+            send(b, "y")
+            report("once it sends", net_wait([srv, b_in], 1000) ?? [], srv, b_in)
+            report("left out of the set", net_wait([srv], 0) ?? [], srv, b_in)
+            report("put back", net_wait([srv, b_in], 1000) ?? [], srv, b_in)
+            net_close(b_in)
+            net_close(b)
+            net_close(srv)
         }
     }
 }

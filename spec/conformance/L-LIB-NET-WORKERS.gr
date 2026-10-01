@@ -1,0 +1,96 @@
+//! tag: L-LIB-NET-WORKERS
+//! expect: output
+//! results in index order: [0, 10, 20, 30]
+//! no workers: 0 results
+//! fewer than none: 0 results
+//! every worker talked to itself: [true, true, true]
+//! a worker's listener is open on the main thread too: true
+//! the main thread's listener is open in every worker: [true, true]
+//! one waiting connection, accepted once: 1
+// `net_workers(n, f)` runs `f(0)`, ..., `f(n - 1)` — on a thread each in a
+// compiled build, one after another in index order under `grasm run` — and
+// answers their results in index order. Every line here is the same under
+// both schedules, which is the property the clause promises.
+
+/// Opens a listener of its own, dials it, and passes a message through:
+/// everything a worker can do with sockets nobody else has.
+fn talk_to_self(i: i64) -> bool / {net} {
+    match tcp_listen_on("127.0.0.1", 0) {
+        Err(_) -> false
+        Ok(l) -> {
+            let port = net_port(l) ?? 0
+            var ok = false
+            match tcp_connect("127.0.0.1", port) {
+                Err(_) -> {}
+                Ok(client) -> {
+                    match tcp_accept(l) {
+                        Err(_) -> {}
+                        Ok(conn) -> {
+                            let sent = tcp_write(client, "worker {i}") ?? ()
+                            ok = (tcp_read(conn) ?? "") == "worker {i}"
+                            net_close(conn)
+                        }
+                    }
+                    net_close(client)
+                }
+            }
+            net_close(l)
+            ok
+        }
+    }
+}
+
+/// A listener left open for the main thread to look at.
+fn open_one(i: i64) -> i64 / {net} {
+    tcp_listen_on("127.0.0.1", 0) ?? -1
+}
+
+/// 1 if this worker took the waiting connection, 0 if it found none or another
+/// worker took it first. A `tcp_accept` after `net_wait` reported the listener
+/// ready does not wait, so the worker that lost the race answers rather than
+/// waiting for a client that will never come.
+fn take(listener: i64) -> i64 / {net} {
+    let ready = net_wait([listener], 200) ?? []
+    if ready.is_empty() {
+        return 0
+    }
+    match tcp_accept(listener) {
+        Err(_) -> 0
+        Ok(c) -> {
+            net_close(c)
+            1
+        }
+    }
+}
+
+fn main() / {io, net} {
+    let step = 10
+    print("results in index order: {net_workers(4, |i| i * step)}")
+    print("no workers: {net_workers(0, |i| i).len()} results")
+    print("fewer than none: {net_workers(-3, |i| i).len()} results")
+    print("every worker talked to itself: {net_workers(3, talk_to_self)}")
+
+    // One table for the whole program: a handle means the same socket on
+    // every thread.
+    let opened = net_workers(1, open_one)
+    let h = opened[0]
+    print("a worker's listener is open on the main thread too: {(net_port(h) ?? 0) > 0}")
+    net_close(h)
+
+    match tcp_listen_on("127.0.0.1", 0) {
+        Err(_) -> print("could not listen")
+        Ok(listener) -> {
+            let port = net_port(listener) ?? 0
+            print("the main thread's listener is open in every worker: {net_workers(2, |i| (net_port(listener) ?? -1) == port)}")
+            match tcp_connect("127.0.0.1", port) {
+                Err(_) -> print("could not dial")
+                Ok(client) -> {
+                    let took = net_workers(2, |i| take(listener))
+                    print("one waiting connection, accepted once: {took[0] + took[1]}")
+                    net_close(client)
+                }
+            }
+            net_close(listener)
+        }
+    }
+}
