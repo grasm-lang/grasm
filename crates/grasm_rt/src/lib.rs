@@ -1435,6 +1435,152 @@ impl ListData {
     }
 }
 
+/// The payload of a `bytes` value: the buffer, shared, and its address and
+/// length beside it at fixed offsets (`layout::BYTES_PTR`, `layout::BYTES_LEN`)
+/// so compiled code reads `b.len()` and `b.at(i)` without calling in. The
+/// buffer is never written once built -- every operation on `bytes` makes a
+/// new one -- so the address stays good for as long as `owner` lives.
+#[repr(C)]
+pub struct RtBytes {
+    ptr: *const u8,
+    len: usize,
+    owner: std::sync::Arc<Vec<u8>>,
+}
+
+// The raw address is into the `Arc`'s buffer, which is immutable and shared
+// the same way the `Arc` itself is.
+unsafe impl Send for RtBytes {}
+unsafe impl Sync for RtBytes {}
+
+impl RtBytes {
+    fn new(v: Vec<u8>) -> RtBytes {
+        let owner = std::sync::Arc::new(v);
+        RtBytes {
+            ptr: owner.as_ptr(),
+            len: owner.len(),
+            owner,
+        }
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        self.owner.as_slice()
+    }
+}
+
+impl std::ops::Deref for RtBytes {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+/// A variant's fields, in the 16 bytes a boxed slice took.
+///
+/// One field -- `Some(x)`, `Ok(v)`, `Err(e)`, by far the commonest variants --
+/// is held in the pointer word itself, so building one allocates nothing past
+/// its box; as a boxed slice it was a `malloc` and a `free` per `Ok`, which was
+/// most of what a fallible call cost. None or two or more are as before: no
+/// pointer, or a boxed slice.
+pub struct VFields {
+    ptr: *mut *mut RtVal,
+    len: usize,
+}
+
+impl VFields {
+    fn one(v: *mut RtVal) -> VFields {
+        VFields {
+            ptr: v as *mut *mut RtVal,
+            len: 1,
+        }
+    }
+
+    fn new(v: Vec<*mut RtVal>) -> VFields {
+        match v.len() {
+            0 => VFields::default(),
+            1 => VFields::one(v[0]),
+            n => VFields {
+                ptr: Box::into_raw(v.into_boxed_slice()) as *mut *mut RtVal,
+                len: n,
+            },
+        }
+    }
+
+    fn as_slice(&self) -> &[*mut RtVal] {
+        match self.len {
+            0 => &[],
+            // The word holding the one field, read as a slice of one.
+            1 => unsafe {
+                std::slice::from_raw_parts(
+                    &self.ptr as *const *mut *mut RtVal as *const *mut RtVal,
+                    1,
+                )
+            },
+            n => unsafe { std::slice::from_raw_parts(self.ptr, n) },
+        }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [*mut RtVal] {
+        match self.len {
+            0 => &mut [],
+            1 => unsafe {
+                std::slice::from_raw_parts_mut(
+                    &mut self.ptr as *mut *mut *mut RtVal as *mut *mut RtVal,
+                    1,
+                )
+            },
+            n => unsafe { std::slice::from_raw_parts_mut(self.ptr, n) },
+        }
+    }
+
+    fn into_vec(self) -> Vec<*mut RtVal> {
+        self.as_slice().to_vec()
+    }
+}
+
+impl Default for VFields {
+    fn default() -> VFields {
+        VFields {
+            ptr: std::ptr::null_mut(),
+            len: 0,
+        }
+    }
+}
+
+impl Drop for VFields {
+    fn drop(&mut self) {
+        // The fields are counted references released by whoever drops the
+        // variant; only the slice holding two or more is this struct's own.
+        if self.len >= 2 {
+            unsafe {
+                drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(
+                    self.ptr, self.len,
+                )));
+            }
+        }
+    }
+}
+
+impl std::ops::Deref for VFields {
+    type Target = [*mut RtVal];
+    fn deref(&self) -> &[*mut RtVal] {
+        self.as_slice()
+    }
+}
+
+impl std::ops::DerefMut for VFields {
+    fn deref_mut(&mut self) -> &mut [*mut RtVal] {
+        self.as_mut_slice()
+    }
+}
+
+impl<'a> IntoIterator for &'a VFields {
+    type Item = &'a *mut RtVal;
+    type IntoIter = std::slice::Iter<'a, *mut RtVal>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.as_slice().iter()
+    }
+}
+
 #[repr(u8)]
 pub enum RtPayload {
     I64(i64),
@@ -1490,7 +1636,7 @@ pub enum RtPayload {
     /// and a `bytes` value is exactly the kind of thing a parallel worker
     /// would be handed. The count is only touched when a `bytes` value is
     /// copied, which is rare enough that nothing measurable rides on it.
-    Bytes(std::sync::Arc<Vec<u8>>),
+    Bytes(RtBytes),
     List(ListData),
     /// Same shape as a list, rendered with parentheses.
     ///
@@ -1527,10 +1673,10 @@ pub enum RtPayload {
     Variant {
         type_name: &'static str,
         name: &'static str,
-        /// A boxed slice rather than a `Vec`: a variant's fields are fixed
-        /// once built, and the capacity word a `Vec` carries is what pushed
-        /// this payload past the 48 bytes every variant has to fit in.
-        fields: Box<[*mut RtVal]>,
+        /// Fixed once built, so no capacity word -- that is what pushed this
+        /// payload past the 48 bytes every variant has to fit in -- and one
+        /// field needs no allocation at all (`VFields`).
+        fields: VFields,
     },
     /// A function value: code address plus the environment it captured.
     ///
@@ -1602,8 +1748,33 @@ pub mod layout {
     pub const STRUCT_INLINE_VALS: usize = 32;
     /// The tag of the `Inline` variant of `ListData` and `StructFields`.
     pub const INLINE: u8 = 0;
+    /// `Bytes(RtBytes)`: its buffer's address and length.
+    pub const TAG_BYTES: u8 = 9;
+    pub const BYTES_PTR: usize = 16;
+    pub const BYTES_LEN: usize = 24;
     /// `ListVals`, last in `RtPayload` so no earlier tag moved.
     pub const TAG_LIST_VALS: u8 = 17;
+}
+
+/// The second half of `grasm_layout_check`, for `bytes`: its tag and the
+/// offsets of its address and length, packed one per byte.
+#[no_mangle]
+pub extern "C" fn grasm_layout_check_bytes(packed: i64) {
+    let ours = i64::from_le_bytes([
+        layout::TAG_BYTES,
+        layout::BYTES_PTR as u8,
+        layout::BYTES_LEN as u8,
+        0,
+        0,
+        0,
+        0,
+        0,
+    ]);
+    if packed != ours {
+        rt_panic(
+            "this program was compiled for a different runtime layout -- rebuild it with the grasm that matches this runtime",
+        );
+    }
 }
 
 /// Called first thing by a compiled `main` with the backend's copy of
@@ -4895,7 +5066,45 @@ pub unsafe extern "C" fn grasm_variant_new(
     alloc(RtPayload::Variant {
         type_name: borrowed_str(tp, tl),
         name: borrowed_str(vp, vl),
-        fields: Box::new([]),
+        fields: VFields::default(),
+    })
+}
+
+/// A variant of one field, built whole: `Some(x)`. Built field by field it was
+/// an allocation for the empty slice's replacement on every push.
+///
+/// # Safety: as `grasm_variant_new`; `a` ownership transfers.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_variant_new1(
+    tp: *const u8,
+    tl: u64,
+    vp: *const u8,
+    vl: u64,
+    a: *mut RtVal,
+) -> *mut RtVal {
+    alloc(RtPayload::Variant {
+        type_name: borrowed_str(tp, tl),
+        name: borrowed_str(vp, vl),
+        fields: VFields::one(a),
+    })
+}
+
+/// A variant of two fields, built whole.
+///
+/// # Safety: as `grasm_variant_new`; `a` and `b` ownership transfers.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_variant_new2(
+    tp: *const u8,
+    tl: u64,
+    vp: *const u8,
+    vl: u64,
+    a: *mut RtVal,
+    b: *mut RtVal,
+) -> *mut RtVal {
+    alloc(RtPayload::Variant {
+        type_name: borrowed_str(tp, tl),
+        name: borrowed_str(vp, vl),
+        fields: VFields::new(vec![a, b]),
     })
 }
 
@@ -4910,14 +5119,19 @@ pub unsafe extern "C" fn grasm_variant_push(v: *mut RtVal, val: *mut RtVal) {
     // value at most.
     let mut grown = std::mem::take(fields).into_vec();
     grown.push(val);
-    *fields = grown.into_boxed_slice();
+    *fields = VFields::new(grown);
 }
 
 /// # Safety: live pointers.
 #[no_mangle]
 pub unsafe extern "C" fn grasm_variant_is(v: *mut RtVal, p: *const u8, l: u64) -> i8 {
     match &(*v).payload {
-        RtPayload::Variant { name, .. } => i8::from(*name == borrowed_str(p, l)),
+        // The name a compiled program asks about is usually the very bytes
+        // it built the variant with, so the address answers before the text
+        // has to be compared.
+        RtPayload::Variant { name, .. } => {
+            i8::from((name.as_ptr() == p && name.len() as u64 == l) || *name == borrowed_str(p, l))
+        }
         _ => 0,
     }
 }
@@ -4941,7 +5155,7 @@ pub unsafe extern "C" fn grasm_ok_new(val: *mut RtVal) -> *mut RtVal {
     alloc(RtPayload::Variant {
         type_name: "!",
         name: "Ok",
-        fields: vec![val].into_boxed_slice(),
+        fields: VFields::one(val),
     })
 }
 
@@ -4951,7 +5165,7 @@ pub unsafe extern "C" fn grasm_err_new(val: *mut RtVal) -> *mut RtVal {
     alloc(RtPayload::Variant {
         type_name: "!",
         name: "Err",
-        fields: vec![val].into_boxed_slice(),
+        fields: VFields::one(val),
     })
 }
 
@@ -4962,6 +5176,49 @@ pub unsafe extern "C" fn grasm_is_ok(v: *mut RtVal) -> i8 {
         RtPayload::Variant { name, .. } => i8::from(*name == "Ok"),
         _ => 0,
     }
+}
+
+/// `try` on a result: the `Ok` payload, owned by the caller, with the result
+/// itself released -- or null for an `Err`, with the result untouched for the
+/// error path to use. One call where `try` was four (test, read the field,
+/// release the result, and the field's own count), and when nothing else
+/// holds the result the payload is moved out rather than counted.
+///
+/// # Safety: `res` is a live result the caller owns a count on, which passes
+/// to this call when the answer is not null.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_try_take(res: *mut RtVal) -> *mut RtVal {
+    let RtPayload::Variant { name, fields, .. } = &mut (*res).payload else {
+        grasm_panic_msg_str("try on a value that is not a result");
+    };
+    if *name != "Ok" {
+        return std::ptr::null_mut();
+    }
+    let payload = fields[0];
+    if (*res).rc.load(Relaxed) == 1 {
+        // The result's last holder: its field leaves with the caller, so the
+        // box is freed with an empty field list rather than releasing it.
+        *fields = VFields::default();
+    } else {
+        inc(payload);
+    }
+    dec(res);
+    payload
+}
+
+/// `try` on a result whose `Ok` holds a scalar: its bits written to `out`,
+/// and 1; or 0 for an `Err`, with the result untouched.
+///
+/// # Safety: as `grasm_try_take`; `out` is writable.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_try_take_bits(res: *mut RtVal, out: *mut i64) -> i8 {
+    let payload = grasm_try_take(res);
+    if payload.is_null() {
+        return 0;
+    }
+    *out = unbox_field_bits(payload);
+    dec(payload);
+    1
 }
 
 /// # Safety: live pointer; prints the interpreter-identical line, exits 1.
@@ -5101,7 +5358,7 @@ unsafe fn val_eq(a: *mut RtVal, b: *mut RtVal) -> bool {
         // this arm made `b == b` false for every `bytes` value, in both
         // engines at once ([E-EQ-STRUCTURAL]) -- so the two agreed, and the
         // agreement gates could not see it.
-        (RtPayload::Bytes(x), RtPayload::Bytes(y)) => x == y,
+        (RtPayload::Bytes(x), RtPayload::Bytes(y)) => x.as_slice() == y.as_slice(),
         // Two function values are the same function when they run the same
         // code over the same captures. Falling through to "not equal" made
         // `dbl == dbl` false and `assert_eq(dbl, dbl)` fail — the one type
@@ -5196,7 +5453,7 @@ pub unsafe extern "C" fn grasm_list_get_opt(v: *mut RtVal, i: i64) -> *mut RtVal
                 alloc(RtPayload::Variant {
                     type_name: "Option",
                     name: "None",
-                    fields: vec![].into_boxed_slice(),
+                    fields: VFields::default(),
                 })
             } else {
                 let e = items[i as usize];
@@ -5204,7 +5461,7 @@ pub unsafe extern "C" fn grasm_list_get_opt(v: *mut RtVal, i: i64) -> *mut RtVal
                 alloc(RtPayload::Variant {
                     type_name: "Option",
                     name: "Some",
-                    fields: vec![e].into_boxed_slice(),
+                    fields: VFields::one(e),
                 })
             }
         }
@@ -5535,13 +5792,13 @@ pub unsafe extern "C" fn grasm_map_get(m: *mut RtVal, k: *mut RtVal) -> *mut RtV
         return alloc(RtPayload::Variant {
             type_name: "Option",
             name: "Some",
-            fields: vec![ev].into_boxed_slice(),
+            fields: VFields::one(ev),
         });
     }
     alloc(RtPayload::Variant {
         type_name: "Option",
         name: "None",
-        fields: vec![].into_boxed_slice(),
+        fields: VFields::default(),
     })
 }
 
@@ -6288,7 +6545,7 @@ fn none_val() -> *mut RtVal {
     alloc(RtPayload::Variant {
         type_name: "Option",
         name: "None",
-        fields: vec![].into_boxed_slice(),
+        fields: VFields::default(),
     })
 }
 
@@ -6296,7 +6553,7 @@ fn some_of(v: *mut RtVal) -> *mut RtVal {
     alloc(RtPayload::Variant {
         type_name: "Option",
         name: "Some",
-        fields: vec![v].into_boxed_slice(),
+        fields: VFields::one(v),
     })
 }
 
@@ -7079,7 +7336,7 @@ fn io_err(variant: &'static str, payload: String) -> *mut RtVal {
     alloc(RtPayload::Variant {
         type_name: "IoError",
         name: variant,
-        fields: vec![inner].into_boxed_slice(),
+        fields: VFields::one(inner),
     })
 }
 
@@ -7087,7 +7344,7 @@ fn err_of(v: *mut RtVal) -> *mut RtVal {
     alloc(RtPayload::Variant {
         type_name: "!",
         name: "Err",
-        fields: vec![v].into_boxed_slice(),
+        fields: VFields::one(v),
     })
 }
 
@@ -7095,7 +7352,7 @@ fn ok_of(v: *mut RtVal) -> *mut RtVal {
     alloc(RtPayload::Variant {
         type_name: "!",
         name: "Ok",
-        fields: vec![v].into_boxed_slice(),
+        fields: VFields::one(v),
     })
 }
 
@@ -7562,12 +7819,12 @@ unsafe fn grasm_random_bytes_now(count: *mut RtVal) -> *mut RtVal {
     // obtain again: two runs disagree by construction.
     let mut buf = vec![0u8; n as usize];
     if n == 0 {
-        return ok_of(alloc(RtPayload::Bytes(std::sync::Arc::new(buf))));
+        return ok_of(alloc(RtPayload::Bytes(RtBytes::new(buf))));
     }
     match std::fs::File::open("/dev/urandom") {
         Err(e) => err_of(io_err("IoFailed", format!("cannot open /dev/urandom: {e}"))),
         Ok(mut f) => match f.read_exact(&mut buf) {
-            Ok(()) => ok_of(alloc(RtPayload::Bytes(std::sync::Arc::new(buf)))),
+            Ok(()) => ok_of(alloc(RtPayload::Bytes(RtBytes::new(buf)))),
             Err(e) => err_of(io_err("IoFailed", format!("short read: {e}"))),
         },
     }
@@ -7611,7 +7868,7 @@ unsafe fn grasm_tcp_read_bytes_now(handle: *mut RtVal) -> *mut RtVal {
         )),
     });
     match read {
-        Ok(b) => ok_of(alloc(RtPayload::Bytes(std::sync::Arc::new(b)))),
+        Ok(b) => ok_of(alloc(RtPayload::Bytes(RtBytes::new(b)))),
         Err(e) => err_of(io_err("IoFailed", e)),
     }
 }
@@ -7638,7 +7895,7 @@ unsafe fn grasm_tcp_write_bytes_now(handle: *mut RtVal, data: *mut RtVal) -> *mu
             "tcp_write_bytes needs bytes".to_string(),
         ));
     };
-    let payload = payload.clone();
+    let payload = payload.owner.clone();
     let wrote = socket_with(h, |s| match s {
         Socket::Stream(stream) => stream
             .write_all(&payload)
@@ -7881,7 +8138,7 @@ pub unsafe extern "C" fn grasm_str_c_free(p: *mut std::ffi::c_char) {
 #[no_mangle]
 pub unsafe extern "C" fn grasm_bytes_ptr(v: *mut RtVal) -> *mut u8 {
     match &(*v).payload {
-        RtPayload::Bytes(b) => b.as_ptr() as *mut u8,
+        RtPayload::Bytes(b) => b.as_slice().as_ptr() as *mut u8,
         _ => rt_panic("bytes_ptr on a value that is not bytes"),
     }
 }
@@ -8009,7 +8266,7 @@ unsafe fn grasm_udp_send_now(
     }
     let host = as_str(host).to_string();
     let payload = match &(*data).payload {
-        RtPayload::Bytes(b) => b.clone(),
+        RtPayload::Bytes(b) => b.owner.clone(),
         _ => return err_of(io_err("IoFailed", "udp_send takes bytes".to_string())),
     };
     let sent = socket_with(h, |s| match s {
@@ -8060,7 +8317,7 @@ unsafe fn grasm_udp_recv_now(handle: *mut RtVal) -> *mut RtVal {
         _ => Err(format!("socket {h} is not a datagram socket")),
     });
     match got {
-        Ok(b) => ok_of(alloc(RtPayload::Bytes(std::sync::Arc::new(b)))),
+        Ok(b) => ok_of(alloc(RtPayload::Bytes(RtBytes::new(b)))),
         Err(e) => err_of(io_err("IoFailed", e)),
     }
 }
@@ -8100,7 +8357,7 @@ unsafe fn grasm_udp_recv_from_now(handle: *mut RtVal) -> *mut RtVal {
     match got {
         Ok((b, host, port)) => {
             let fields = vec![
-                alloc(RtPayload::Bytes(std::sync::Arc::new(b))),
+                alloc(RtPayload::Bytes(RtBytes::new(b))),
                 alloc(RtPayload::Str(RtStr::of(&host))),
                 alloc(RtPayload::I64(port)),
             ];
@@ -8267,7 +8524,7 @@ pub unsafe extern "C" fn grasm_bytes_of(list: *mut RtVal) -> *mut RtVal {
         }
         out.push(n as u8);
     }
-    alloc(RtPayload::Bytes(std::sync::Arc::new(out)))
+    alloc(RtPayload::Bytes(RtBytes::new(out)))
 }
 
 /// # Safety: boxed values.
@@ -8296,7 +8553,7 @@ pub unsafe extern "C" fn grasm_bytes_slice(v: *mut RtVal, from: i64, end: i64) -
             b.len()
         ));
     }
-    alloc(RtPayload::Bytes(std::sync::Arc::new(
+    alloc(RtPayload::Bytes(RtBytes::new(
         b[from as usize..end as usize].to_vec(),
     )))
 }
@@ -8306,7 +8563,7 @@ pub unsafe extern "C" fn grasm_bytes_slice(v: *mut RtVal, from: i64, end: i64) -
 pub unsafe extern "C" fn grasm_bytes_concat(a: *mut RtVal, b: *mut RtVal) -> *mut RtVal {
     let mut out = as_bytes(a).to_vec();
     out.extend_from_slice(as_bytes(b));
-    alloc(RtPayload::Bytes(std::sync::Arc::new(out)))
+    alloc(RtPayload::Bytes(RtBytes::new(out)))
 }
 
 /// # Safety: boxed values.
@@ -8324,7 +8581,35 @@ pub unsafe extern "C" fn grasm_bytes_to_list(v: *mut RtVal) -> *mut RtVal {
 /// # Safety: boxed values.
 #[no_mangle]
 pub unsafe extern "C" fn grasm_bytes_to_str(v: *mut RtVal) -> *mut RtVal {
-    let text = String::from_utf8_lossy(as_bytes(v)).into_owned();
+    let text = text_of_bytes(as_bytes(v));
+    alloc(RtPayload::Str(RtStr::new(text)))
+}
+
+/// Bytes as text, invalid sequences replaced. Valid UTF-8 -- nearly all of it
+/// -- is checked by `from_utf8`, which is several times faster than walking
+/// the chunks the lossy conversion does, and only invalid input pays for that.
+fn text_of_bytes(b: &[u8]) -> String {
+    match std::str::from_utf8(b) {
+        Ok(t) => t.to_owned(),
+        Err(_) => String::from_utf8_lossy(b).into_owned(),
+    }
+}
+
+/// `b.slice(from, end).to_str()` in one step: the text is decoded straight
+/// out of the range, without the intermediate `bytes` and its copy. A parser
+/// cutting tokens out of its input does this once per token.
+///
+/// # Safety: boxed values.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_bytes_slice_to_str(v: *mut RtVal, from: i64, end: i64) -> *mut RtVal {
+    let b = as_bytes(v);
+    if from < 0 || end < from || end as usize > b.len() {
+        rt_panic(&format!(
+            "slice {from}..{end} out of bounds (len {})",
+            b.len()
+        ));
+    }
+    let text = text_of_bytes(&b[from as usize..end as usize]);
     alloc(RtPayload::Str(RtStr::new(text)))
 }
 
@@ -8332,7 +8617,7 @@ pub unsafe extern "C" fn grasm_bytes_to_str(v: *mut RtVal) -> *mut RtVal {
 #[no_mangle]
 pub unsafe extern "C" fn grasm_str_to_bytes(v: *mut RtVal) -> *mut RtVal {
     let bytes = as_str(v).to_string().into_bytes();
-    alloc(RtPayload::Bytes(std::sync::Arc::new(bytes)))
+    alloc(RtPayload::Bytes(RtBytes::new(bytes)))
 }
 
 /// # Safety: boxed values.
@@ -8344,7 +8629,7 @@ pub unsafe extern "C" fn grasm_read_bytes(path: *mut RtVal) -> *mut RtVal {
 unsafe fn grasm_read_bytes_now(path: *mut RtVal) -> *mut RtVal {
     let p = as_str(path).to_string();
     match std::fs::read(&p) {
-        Ok(b) => ok_of(alloc(RtPayload::Bytes(std::sync::Arc::new(b)))),
+        Ok(b) => ok_of(alloc(RtPayload::Bytes(RtBytes::new(b)))),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => err_of(io_err("NotFound", p)),
         Err(e) => err_of(io_err("IoFailed", e.to_string())),
     }
@@ -8409,7 +8694,7 @@ unsafe fn grasm_read_bytes_at_now(
                 }
             }
             buf.truncate(filled);
-            ok_of(alloc(RtPayload::Bytes(std::sync::Arc::new(buf))))
+            ok_of(alloc(RtPayload::Bytes(RtBytes::new(buf))))
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => err_of(io_err("NotFound", p)),
         Err(e) => err_of(io_err("IoFailed", e.to_string())),
@@ -8920,7 +9205,7 @@ unsafe fn wire_of(v: *mut RtVal) -> replay::Wire {
         RtPayload::F64(n) => replay::Wire::Float(*n),
         RtPayload::Bool(b) => replay::Wire::Bool(*b),
         RtPayload::Str(s) => replay::Wire::Str((**s).to_string()),
-        RtPayload::Bytes(b) => replay::Wire::Bytes(b.as_ref().clone()),
+        RtPayload::Bytes(b) => replay::Wire::Bytes(b.as_slice().to_vec()),
         RtPayload::List(d) => replay::Wire::List(items(d)),
         RtPayload::Tuple(d) => replay::Wire::Tuple(items(d)),
         RtPayload::ListScalar { .. } => {
@@ -8957,13 +9242,13 @@ fn val_of(w: &replay::Wire) -> *mut RtVal {
         replay::Wire::Float(n) => alloc(RtPayload::F64(*n)),
         replay::Wire::Bool(b) => alloc(RtPayload::Bool(*b)),
         replay::Wire::Str(s) => alloc(RtPayload::Str(RtStr::of(s))),
-        replay::Wire::Bytes(b) => alloc(RtPayload::Bytes(std::sync::Arc::new(b.clone()))),
+        replay::Wire::Bytes(b) => alloc(RtPayload::Bytes(RtBytes::new(b.clone()))),
         replay::Wire::List(v) => alloc(RtPayload::List(many(v).into())),
         replay::Wire::Tuple(v) => alloc(RtPayload::Tuple(many(v).into())),
         replay::Wire::Variant { ty, name, fields } => alloc(RtPayload::Variant {
             type_name: interned(ty),
             name: interned(name),
-            fields: many(fields).into_boxed_slice(),
+            fields: VFields::new(many(fields)),
         }),
     }
 }
@@ -9492,6 +9777,11 @@ mod layout_tests {
             assert_eq!(*lb.add(layout::LIST_DATA_TAG), layout::INLINE);
             assert_eq!(*lb.add(layout::LIST_INLINE_LEN), 2);
             assert_eq!(*(lb.add(layout::LIST_INLINE_VALS) as *const *mut RtVal), b);
+            let by = alloc(RtPayload::Bytes(RtBytes::new(vec![7, 8, 9])));
+            let bb = by as *const u8;
+            assert_eq!(*bb.add(layout::PAYLOAD_TAG), layout::TAG_BYTES);
+            assert_eq!(*(bb.add(layout::BYTES_LEN) as *const usize), 3);
+            assert_eq!(*(*(bb.add(layout::BYTES_PTR) as *const *const u8)).add(2), 9);
             assert_eq!((*s).rc.load(Relaxed), 1);
             assert_eq!(*(sb as *const i64), 1, "the count is the first word");
         }

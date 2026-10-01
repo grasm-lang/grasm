@@ -17,6 +17,7 @@
 //! 20.0 3 true
 //! 3.0 3 false
 //! 8 3.0 3 false 3.0 3 false
+//! [2] [1] [3] [3, 3] []
 type Box = { n: i64 }
 type Bag = { items: [i64] }
 type Two = { a: [i64], b: [i64] }
@@ -101,6 +102,25 @@ fn snapshots() {
     print("{total} {show(c)} {show(ps[3])}")
 }
 
+// A struct chosen by an `if` or a `match` and returned: each branch's value
+// is the one handed back, held once -- not copied and left behind.
+type Halves = { left: [i64], right: [i64] }
+
+fn halves(xs: [i64], flip: bool) -> Halves {
+    if flip {
+        Halves{ left: [xs[1]], right: [xs[0]] }
+    } else {
+        Halves{ left: [xs[0]], right: [xs[1]] }
+    }
+}
+
+fn pick_halves(n: i64) -> Halves {
+    match n {
+        0 -> return Halves{ left: [], right: [] }
+        _ -> return Halves{ left: [n], right: [n, n] }
+    }
+}
+
 fn main() {
     var a = [1, 2]
     var b = a
@@ -150,4 +170,7 @@ fn main() {
     print("{pick(true)} {pick(false)}")
 
     snapshots()
+    let h = halves([1, 2], true)
+    let k = pick_halves(3)
+    print("{h.left} {h.right} {k.left} {k.right} {pick_halves(0).left}")
 }

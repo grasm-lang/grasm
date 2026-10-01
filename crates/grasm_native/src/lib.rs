@@ -813,6 +813,10 @@ impl<'m> Codegen<'m> {
             ),
             ("grasm_variant_new", vec![ptr, i64t, ptr, i64t], Some(i64t)),
             ("grasm_variant_push", vec![i64t, i64t], None),
+            ("grasm_try_take", vec![i64t], Some(i64t)),
+            ("grasm_try_take_bits", vec![i64t, ptr], Some(types::I8)),
+            ("grasm_variant_new1", vec![ptr, i64t, ptr, i64t, i64t], Some(i64t)),
+            ("grasm_variant_new2", vec![ptr, i64t, ptr, i64t, i64t, i64t], Some(i64t)),
             ("grasm_variant_is", vec![i64t, ptr, i64t], Some(i8t)),
             ("grasm_variant_field", vec![i64t, i64t], Some(i64t)),
             ("grasm_ok_new", vec![i64t], Some(i64t)),
@@ -956,6 +960,7 @@ impl<'m> Codegen<'m> {
             ("grasm_bytes_len", vec![i64t], Some(i64t)),
             ("grasm_bytes_at", vec![i64t, i64t], Some(i64t)),
             ("grasm_bytes_slice", vec![i64t, i64t, i64t], Some(i64t)),
+            ("grasm_bytes_slice_to_str", vec![i64t, i64t, i64t], Some(i64t)),
             ("grasm_bytes_concat", vec![i64t, i64t], Some(i64t)),
             ("grasm_bytes_to_list", vec![i64t], Some(i64t)),
             ("grasm_bytes_to_str", vec![i64t], Some(i64t)),
@@ -1053,6 +1058,7 @@ impl<'m> Codegen<'m> {
             ),
             ("grasm_par_tasks_next", vec![], None),
             ("grasm_layout_check", vec![i64t], None),
+            ("grasm_layout_check_bytes", vec![i64t], None),
             // Concurrent tasks and channels (grasm_rt::tasks).
             ("grasm_chan_new", vec![i64t], Some(i64t)),
             ("grasm_chan_send", vec![i64t, i64t], None),
@@ -1991,6 +1997,20 @@ arguments nor the type this is bound to",
         let check_ref = self.module.declare_func_in_func(check, b.func);
         let pv = b.ins().iconst(types::I64, packed);
         b.ins().call(check_ref, &[pv]);
+        let packed_bytes = i64::from_le_bytes([
+            LAYOUT_TAG_BYTES as u8,
+            LAYOUT_BYTES_PTR as u8,
+            LAYOUT_BYTES_LEN as u8,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ]);
+        let check_b = self.runtime["grasm_layout_check_bytes"];
+        let check_b_ref = self.module.declare_func_in_func(check_b, b.func);
+        let pbv = b.ins().iconst(types::I64, packed_bytes);
+        b.ins().call(check_b_ref, &[pbv]);
         let set_args = self.runtime["grasm_set_args"];
         let sa_ref = self.module.declare_func_in_func(set_args, b.func);
         b.ins().call(sa_ref, &[user_argc, argv_shift]);
@@ -2318,8 +2338,16 @@ arguments nor the type this is bound to",
                     // `fn unreachable() -> T { panic(…) }` is ordinary code and
                     // §11 lists no row for it, so refusing it made the gap
                     // table wrong either way.
-                    let z = fcx.zero_of(want);
-                    fcx.b.ins().return_(&[z]);
+                    // A value struct comes back through the caller's slot,
+                    // so the signature returns nothing -- and a zero handed
+                    // back failed the verifier for every such function whose
+                    // `match` returned from every arm.
+                    if matches!(want, VType::Val(_)) {
+                        fcx.b.ins().return_(&[]);
+                    } else {
+                        let z = fcx.zero_of(want);
+                        fcx.b.ins().return_(&[z]);
+                    }
                 }
             }
         }
@@ -4398,6 +4426,10 @@ const LAYOUT_LIST_INLINE_LEN: i64 = 17;
 const LAYOUT_LIST_INLINE_VALS: i64 = 24;
 const LAYOUT_INLINE: i64 = 0;
 const LAYOUT_TAG_STRUCT: i64 = 14;
+/// `Bytes(RtBytes)`: its tag, and its buffer's address and length.
+const LAYOUT_TAG_BYTES: i64 = 9;
+const LAYOUT_BYTES_PTR: i64 = 16;
+const LAYOUT_BYTES_LEN: i64 = 24;
 
 fn collect_spawn_sites(block: &grasm_syntax::ast::Block) -> Vec<&grasm_syntax::ast::Block> {
     let mut out = Vec::new();
@@ -7809,6 +7841,62 @@ impl FnCx<'_, '_> {
             s,
             (LAYOUT_STRUCT_INLINE_VALS + 8 * i) as i32,
         ))
+    }
+
+    /// `b.len()` of a `bytes` box: a load from beside the buffer when the box
+    /// holds bytes, the runtime call otherwise.
+    fn bytes_len_fast(&mut self, bv: Value) -> Value {
+        // Read-only: a `bytes` box's tag, address, length and buffer never change
+        // while it lives, which is what lets a loop's loads be hoisted out of it.
+        let flags = cranelift_codegen::ir::MemFlags::trusted().with_readonly();
+        let tag = self.b.ins().uload8(types::I32, flags, bv, LAYOUT_PAYLOAD_TAG as i32);
+        let is_bytes = self.b.ins().icmp_imm(IntCC::Equal, tag, LAYOUT_TAG_BYTES);
+        let fast = self.b.create_block();
+        let slow = self.b.create_block();
+        let join = self.b.create_block();
+        self.b.append_block_param(join, types::I64);
+        self.b.ins().brif(is_bytes, fast, &[], slow, &[]);
+        self.goto_block(fast);
+        let n = self.b.ins().load(types::I64, flags, bv, LAYOUT_BYTES_LEN as i32);
+        self.b.ins().jump(join, &[n]);
+        self.goto_block(slow);
+        let m = self.call_rt("grasm_bytes_len", &[bv]).unwrap();
+        self.b.ins().jump(join, &[m]);
+        self.goto_block(join);
+        self.b.block_params(join)[0]
+    }
+
+    /// `b.at(i)`: one byte load when the box holds bytes and `i` is inside
+    /// them. Anything else -- including an index out of range, which panics
+    /// -- takes the runtime call, so the message is the one it always was.
+    /// It was a call per byte, which is most of what a parser does.
+    fn bytes_at_fast(&mut self, bv: Value, iv: Value) -> Value {
+        // Read-only: a `bytes` box's tag, address, length and buffer never change
+        // while it lives, which is what lets a loop's loads be hoisted out of it.
+        let flags = cranelift_codegen::ir::MemFlags::trusted().with_readonly();
+        let tag = self.b.ins().uload8(types::I32, flags, bv, LAYOUT_PAYLOAD_TAG as i32);
+        let is_bytes = self.b.ins().icmp_imm(IntCC::Equal, tag, LAYOUT_TAG_BYTES);
+        let check = self.b.create_block();
+        let fast = self.b.create_block();
+        let slow = self.b.create_block();
+        let join = self.b.create_block();
+        self.b.append_block_param(join, types::I64);
+        self.b.ins().brif(is_bytes, check, &[], slow, &[]);
+        self.goto_block(check);
+        let n = self.b.ins().load(types::I64, flags, bv, LAYOUT_BYTES_LEN as i32);
+        // Unsigned, so a negative index is out of range too.
+        let inside = self.b.ins().icmp(IntCC::UnsignedLessThan, iv, n);
+        self.b.ins().brif(inside, fast, &[], slow, &[]);
+        self.goto_block(fast);
+        let base = self.b.ins().load(types::I64, flags, bv, LAYOUT_BYTES_PTR as i32);
+        let addr = self.b.ins().iadd(base, iv);
+        let byte = self.b.ins().uload8(types::I64, flags, addr, 0);
+        self.b.ins().jump(join, &[byte]);
+        self.goto_block(slow);
+        let v = self.call_rt("grasm_bytes_at", &[bv, iv]).unwrap();
+        self.b.ins().jump(join, &[v]);
+        self.goto_block(join);
+        self.b.block_params(join)[0]
     }
 
     /// Whether `lv` is a list stored inline in its box: its payload tag says
@@ -12572,6 +12660,9 @@ this case",
         // Only methods that take the receiver, read it, and keep nothing are
         // eligible — the general path below hands `rv` to things that consume
         // it, and borrowing there would free it early.
+        if let Some(out) = self.fused_slice_to_str(recv, name, args)? {
+            return Ok(Some(out));
+        }
         if let Some(out) = self.borrowed_read(recv, name, args)? {
             return Ok(Some(out));
         }
@@ -12653,6 +12744,40 @@ this case",
             },
             _ => None,
         }
+    }
+
+/// `b.slice(from, end).to_str()` as one runtime call; see
+    /// `grasm_bytes_slice_to_str`. The receiver, then `from`, then `end` are
+    /// evaluated in that order, as the unfused calls would.
+    fn fused_slice_to_str(
+        &mut self,
+        recv: &Expr,
+        name: &Ident,
+        args: &[Expr],
+    ) -> CResult<Option<(Value, VType)>> {
+        if name.name != "to_str" || !args.is_empty() {
+            return Ok(None);
+        }
+        let Expr::MethodCall { recv: inner, name: m, args: sargs, .. } = recv else {
+            return Ok(None);
+        };
+        if m.name != "slice" || sargs.len() != 2 {
+            return Ok(None);
+        }
+        if !matches!(self.probe_type(inner), Ok(VType::Bytes)) {
+            return Ok(None);
+        }
+        let (bv, _) = self.eval_expr_val(inner)?;
+        let (from, ft) = self.eval_expr_val(&sargs[0])?;
+        let (end, et) = self.eval_expr_val(&sargs[1])?;
+        if ft != VType::I64 || et != VType::I64 {
+            return nope(recv.span(), "a non-integer slice bound");
+        }
+        let v = self
+            .call_rt("grasm_bytes_slice_to_str", &[bv, from, end])
+            .unwrap();
+        self.call_rt("grasm_val_dec", &[bv]);
+        Ok(Some((v, VType::Str)))
     }
 
     fn borrowed_read(
@@ -12745,7 +12870,9 @@ this case",
             if it != VType::I64 {
                 return nope(args[0].span(), "non-integer index");
             }
-            self.call_rt(f, &[borrowed, iv]).unwrap()
+            self.bytes_at_fast(borrowed, iv)
+        } else if f == "grasm_bytes_len" {
+            self.bytes_len_fast(borrowed)
         } else {
             self.call_rt(f, &[borrowed]).unwrap()
         };
@@ -13272,7 +13399,7 @@ this case",
             // is invisible in the output and which `scripts/leakcheck.sh`
             // caught on the first run.
             (VType::Bytes, "len") => {
-                let n = self.call_rt("grasm_bytes_len", &[rv]).unwrap();
+                let n = self.bytes_len_fast(rv);
                 self.call_rt("grasm_val_dec", &[rv]);
                 (n, VType::I64)
             }
@@ -13289,7 +13416,7 @@ this case",
             }
             (VType::Bytes, "at") => {
                 let i = arg_scalar!(0, VType::I64);
-                let v = self.call_rt("grasm_bytes_at", &[rv, i]).unwrap();
+                let v = self.bytes_at_fast(rv, i);
                 self.call_rt("grasm_val_dec", &[rv]);
                 (v, VType::I64)
             }
@@ -14281,6 +14408,11 @@ checker did",
                         v = self.call_rt("grasm_ok_new", &[boxed]).unwrap();
                     } else if *want == VType::F64 && *vt == VType::I64 {
                         v = self.b.ins().fcvt_from_sint(types::F64, v);
+                    } else if let VType::Val(sn) = want {
+                        // A value leaves its branch owned, so the merged one
+                        // is a temporary like any other (see the merge).
+                        let sn = sn.clone();
+                        v = self.own_val(v, &sn);
                     }
                     self.b.ins().jump(merge, &[v]);
                 }
@@ -14322,6 +14454,11 @@ checker did",
                         v = self.call_rt("grasm_ok_new", &[boxed]).unwrap();
                     } else if *want == VType::F64 && *vt == VType::I64 {
                         v = self.b.ins().fcvt_from_sint(types::F64, v);
+                    } else if let VType::Val(sn) = want {
+                        // A value leaves its branch owned, so the merged one
+                        // is a temporary like any other (see the merge).
+                        let sn = sn.clone();
+                        v = self.own_val(v, &sn);
                     }
                     self.b.ins().jump(merge, &[v]);
                 }
@@ -14355,6 +14492,15 @@ checker did",
         // backend reported against itself as "codegen bug in `f`". The merge
         // is unreachable, so the trap is never executed; it is there to
         // terminate the block honestly.
+        // Each branch handed over an owned value; the one that arrives is a
+        // temporary. Not marked, a value-struct `if` returned from a function
+        // was copied (with its counts) and the branch's own never released:
+        // four buffers leaked per `noise.split`.
+        if let Some(VType::Val(_)) = &merge_ty {
+            if let Some(&p) = self.b.block_params(merge).first() {
+                self.fresh_vals.insert(p);
+            }
+        }
         if then_term && else_term && merge_ty.is_none() {
             self.trap_here();
             self.filled = true;
@@ -15523,6 +15669,15 @@ type parameters",
     fn make_variant(&mut self, parent: &str, vname: &str, fields: &[Value]) -> CResult<Value> {
         let (tp, tl) = self.str_ptr_len(parent);
         let (vp, vl) = self.str_ptr_len(vname);
+        match fields {
+            [a] => return Ok(self.call_rt("grasm_variant_new1", &[tp, tl, vp, vl, *a]).unwrap()),
+            [a, b] => {
+                return Ok(self
+                    .call_rt("grasm_variant_new2", &[tp, tl, vp, vl, *a, *b])
+                    .unwrap())
+            }
+            _ => {}
+        }
         let v = self
             .call_rt("grasm_variant_new", &[tp, tl, vp, vl])
             .unwrap();
@@ -16049,8 +16204,25 @@ fields, not the type this is bound to, not an enclosing generic",
         };
         let ok_blk = self.b.create_block();
         let err_blk = self.b.create_block();
-        let c = self.call_rt("grasm_is_ok", &[fv]).unwrap();
-        self.b.ins().brif(c, ok_blk, &[], err_blk, &[]);
+        // The `Ok` side is taken in the same call that tests it: a scalar's
+        // bits through a slot, anything else as its (owned) box.
+        let scalar = matches!(*ok_t, VType::I64 | VType::F64 | VType::Bool | VType::Ref(_) | VType::Unit);
+        let ptr_ty = self.cg.module.target_config().pointer_type();
+        let (taken, bits_slot) = if scalar {
+            let slot = self.b.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
+                cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                8,
+                3,
+            ));
+            let addr = self.b.ins().stack_addr(ptr_ty, slot, 0);
+            let ok = self.call_rt("grasm_try_take_bits", &[fv, addr]).unwrap();
+            self.b.ins().brif(ok, ok_blk, &[], err_blk, &[]);
+            (None, Some(slot))
+        } else {
+            let p = self.call_rt("grasm_try_take", &[fv]).unwrap();
+            self.b.ins().brif(p, ok_blk, &[], err_blk, &[]);
+            (Some(p), None)
+        };
         self.filled = true;
 
         self.goto_block(err_blk);
@@ -16070,9 +16242,16 @@ fields, not the type this is bound to, not an enclosing generic",
         }
 
         self.goto_block(ok_blk);
-        let zero2 = self.b.ins().iconst(types::I64, 0);
-        let payload = self.call_rt("grasm_variant_field", &[fv, zero2]).unwrap();
-        self.call_rt("grasm_val_dec", &[fv]);
+        if let Some(slot) = bits_slot {
+            if *ok_t == VType::Unit {
+                let dummy = self.b.ins().iconst(types::I8, 0);
+                return Ok((dummy, VType::Unit));
+            }
+            let bits = self.b.ins().stack_load(types::I64, slot, 0);
+            let v = self.scalar_of_bits(bits, &ok_t);
+            return Ok((v, (*ok_t).clone()));
+        }
+        let payload = taken.expect("a boxed `Ok` was taken");
         if *ok_t == VType::Unit {
             // `try write_file(..)` — nothing to unwrap.
             self.call_rt("grasm_val_dec", &[payload]);
@@ -17848,6 +18027,11 @@ fields, not the type this is bound to, not an enclosing generic",
                             v = self.call_rt("grasm_ok_new", &[boxed]).unwrap();
                         } else if *want == VType::F64 && vt == VType::I64 {
                             v = self.b.ins().fcvt_from_sint(types::F64, v);
+                        } else if let VType::Val(sn) = want {
+                            // Owned before the arm's bindings are released,
+                            // as an `if` branch's is.
+                            let sn = sn.clone();
+                            v = self.own_val(v, &sn);
                         }
                         self.pop_scope_with_decs();
                         self.b.ins().jump(merge, &[v]);
@@ -17895,6 +18079,9 @@ fields, not the type this is bound to, not an enclosing generic",
         if let Some(t) = out_t {
             let out = self.b.block_params(merge)[0];
             let _ = span;
+            if matches!(t, VType::Val(_)) {
+                self.fresh_vals.insert(out);
+            }
             Ok(Some((out, t)))
         } else {
             Ok(None)
