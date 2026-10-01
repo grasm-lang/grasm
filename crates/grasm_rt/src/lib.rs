@@ -346,9 +346,7 @@ mod maphash {
                 h = mix(h ^ u64::from_le_bytes(*c), S1);
             }
             if !rest.is_empty() {
-                let mut last = [0u8; 8];
-                last[..rest.len()].copy_from_slice(rest);
-                h = mix(h ^ u64::from_le_bytes(last), S2);
+                h = mix(h ^ super::load_tail(rest), S2);
             }
             self.h = h;
         }
@@ -2446,7 +2444,7 @@ pub unsafe extern "C" fn grasm_str_build_i64(at: i64, v: i64) {
         at_end -= 1;
         digits[at_end] = b'-';
     }
-    buf.push_str(std::str::from_utf8_unchecked(&digits[at_end..]));
+    push_short(buf, std::str::from_utf8_unchecked(&digits[at_end..]));
 }
 
 /// # Safety: `at` is a live builder handle.
@@ -2470,11 +2468,83 @@ pub unsafe extern "C" fn grasm_str_build_str(at: i64, v: *mut RtVal) {
         grasm_panic_msg_str("interpolating a non-string as a string");
     };
     let text: &str = s;
-    let (p, n) = (text.as_ptr(), text.len());
-    let buf = &mut *(at as *mut String);
-    buf.push_str(std::str::from_utf8_unchecked(std::slice::from_raw_parts(
-        p, n,
-    )));
+    push_short(&mut *(at as *mut String), text);
+}
+
+/// `buf.push_str(text)`, without a call into the C library for short text.
+///
+/// A copy of a length only known at run time is a call to `memmove`, and for
+/// the five or six bytes of a word that call was most of the work: a quarter
+/// of `wordfreq` sat in `_platform_memmove`. Up to sixteen bytes are moved
+/// with two overlapping fixed-size loads and stores instead.
+#[inline]
+fn push_short(buf: &mut String, text: &str) {
+    let n = text.len();
+    if n == 0 || n > 16 {
+        buf.push_str(text);
+        return;
+    }
+    buf.reserve(n);
+    // Safety: `reserve` made room for `n` more bytes past `len`; the bytes
+    // come from a `str`, so the result is still UTF-8.
+    unsafe {
+        let v = buf.as_mut_vec();
+        let at = v.len();
+        copy_short(text.as_ptr(), v.as_mut_ptr().add(at), n);
+        v.set_len(at + n);
+    }
+}
+
+/// Copies `n` bytes, `1 <= n <= 16`, with two overlapping moves of a fixed
+/// width -- reading and writing only inside `[0, n)` of each side.
+///
+/// # Safety: `src` readable and `dst` writable for `n` bytes; no overlap.
+#[inline(always)]
+unsafe fn copy_short(src: *const u8, dst: *mut u8, n: usize) {
+    use std::ptr::{read_unaligned as rd, write_unaligned as wr};
+    if n >= 8 {
+        let a = rd(src as *const u64);
+        let b = rd(src.add(n - 8) as *const u64);
+        wr(dst as *mut u64, a);
+        wr(dst.add(n - 8) as *mut u64, b);
+    } else if n >= 4 {
+        let a = rd(src as *const u32);
+        let b = rd(src.add(n - 4) as *const u32);
+        wr(dst as *mut u32, a);
+        wr(dst.add(n - 4) as *mut u32, b);
+    } else if n >= 2 {
+        let a = rd(src as *const u16);
+        let b = rd(src.add(n - 2) as *const u16);
+        wr(dst as *mut u16, a);
+        wr(dst.add(n - 2) as *mut u16, b);
+    } else {
+        *dst = *src;
+    }
+}
+
+/// The last 1-7 bytes of a key as one little-endian word, the value
+/// `u64::from_le_bytes` gives them zero-padded -- with two overlapping
+/// loads rather than a copy into a scratch buffer, which was a call to
+/// `memmove` on every hash of a short key.
+#[inline(always)]
+fn load_tail(rest: &[u8]) -> u64 {
+    let n = rest.len();
+    debug_assert!((1..8).contains(&n));
+    let p = rest.as_ptr();
+    // Safety: every read is inside `rest`.
+    unsafe {
+        use std::ptr::read_unaligned as rd;
+        if n >= 4 {
+            let lo = u64::from(u32::from_le(rd(p as *const u32)));
+            let hi = u64::from(u32::from_le(rd(p.add(n - 4) as *const u32)));
+            lo | (hi << (8 * (n - 4)))
+        } else {
+            let a = u64::from(*p);
+            let b = u64::from(*p.add(n / 2));
+            let c = u64::from(*p.add(n - 1));
+            a | (b << (8 * (n / 2))) | (c << (8 * (n - 1)))
+        }
+    }
 }
 
 /// The finished string, and the buffer back to the thread.

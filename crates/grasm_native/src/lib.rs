@@ -2070,6 +2070,8 @@ arguments nor the type this is bound to",
             moved: std::collections::HashSet::new(),
             unchecked_idx: std::collections::HashSet::new(),
             version_guard_value: None,
+            version_rows: Vec::new(),
+            row_base: HashMap::new(),
             vectorize_next: false,
             vector_splats: HashMap::new(),
             inline_depth: 0,
@@ -2744,6 +2746,8 @@ operation's",
             moved: std::collections::HashSet::new(),
             unchecked_idx: std::collections::HashSet::new(),
             version_guard_value: None,
+            version_rows: Vec::new(),
+            row_base: HashMap::new(),
             vectorize_next: false,
             vector_splats: HashMap::new(),
             inline_depth: 0,
@@ -2855,6 +2859,8 @@ operation's",
             moved: std::collections::HashSet::new(),
             unchecked_idx: std::collections::HashSet::new(),
             version_guard_value: None,
+            version_rows: Vec::new(),
+            row_base: HashMap::new(),
             vectorize_next: false,
             vector_splats: HashMap::new(),
             inline_depth: 0,
@@ -3009,6 +3015,8 @@ operation's",
             moved: std::collections::HashSet::new(),
             unchecked_idx: std::collections::HashSet::new(),
             version_guard_value: None,
+            version_rows: Vec::new(),
+            row_base: HashMap::new(),
             vectorize_next: false,
             vector_splats: HashMap::new(),
             inline_depth: 0,
@@ -3380,6 +3388,15 @@ struct FnCx<'a, 'm> {
     unchecked_idx: std::collections::HashSet<(u32, u32)>,
     /// The guard `version_guard` computed, taken by the loop it decides.
     version_guard_value: Option<Value>,
+    /// The row address of each versioned access, from `version_guard`: the
+    /// list's data plus its base times the stride, computed once before the
+    /// loop.
+    version_rows: Vec<((u32, u32), Value)>,
+    /// While a versioned loop's check-free copy is emitted: for an index
+    /// `base + i`, the row address and the loop variable's name, so the access
+    /// is `row + i * stride` -- one indexed load -- rather than the base
+    /// multiplied out again on every element.
+    row_base: HashMap<(u32, u32), (Value, String)>,
     /// Set for the one loop about to be emitted as a versioned fast copy,
     /// which may run two `f64` lanes at a time. See `emit_vector_prefix`.
     vectorize_next: bool,
@@ -6820,6 +6837,17 @@ impl FnCx<'_, '_> {
         self.pinned_address(data, len, idx, stride)
     }
 
+    /// A versioned access's address from its precomputed row, if it has one:
+    /// `row + i * stride`. The index's base is literals, arithmetic and names
+    /// the loop never assigns, so skipping its evaluation skips nothing.
+    fn row_address(&mut self, at: Span, stride: i64) -> Option<Value> {
+        let (row, lv) = self.row_base.get(&(at.start, at.end)).cloned()?;
+        let (var, _) = self.lookup(&lv)?;
+        let iv = self.b.use_var(var);
+        let off = self.b.ins().imul_imm(iv, stride);
+        Some(self.b.ins().iadd(row, off))
+    }
+
     fn pinned_address(&mut self, data: Value, len: Value, idx: Value, stride: i64) -> Value {
         let ok = self.b.create_block();
         let oob = self.b.create_block();
@@ -7529,14 +7557,19 @@ impl FnCx<'_, '_> {
                                 if elem_t == VType::F64 && val_t == VType::I64 {
                                     val = self.b.ins().fcvt_from_sint(types::F64, val);
                                 }
-                                let (iv, _) = self.index_value(ix)?;
-                                let addr = self.pinned_address_at(
-                                    data,
-                                    len,
-                                    iv,
-                                    stride_of(&elem_t),
-                                    ix.span(),
-                                );
+                                let addr = match self.row_address(ix.span(), stride_of(&elem_t)) {
+                                    Some(a) => a,
+                                    None => {
+                                        let (iv, _) = self.index_value(ix)?;
+                                        self.pinned_address_at(
+                                            data,
+                                            len,
+                                            iv,
+                                            stride_of(&elem_t),
+                                            ix.span(),
+                                        )
+                                    }
+                                };
                                 let flags = cranelift_codegen::ir::MemFlags::trusted();
                                 let final_v = if *op == AssignOp::Assign {
                                     val
@@ -8851,7 +8884,10 @@ this case",
         } else {
             self.b.ins().iadd_imm(e0, -1)
         };
-        for ((_, base, _), len) in accesses.iter().zip(&lens) {
+        self.version_rows.clear();
+        for ((name, base, sp), len) in accesses.iter().zip(&lens) {
+            let (data, _, pt) = self.pinned_list(name).expect("pinned above");
+            let stride = stride_of(&pt);
             let (lo, hi) = match base {
                 Some(b) => {
                     let (bv, bt) = self.eval_expr_val(b)?;
@@ -8860,9 +8896,15 @@ this case",
                     }
                     let b_ok = small(self, bv);
                     ok = self.b.ins().band(ok, b_ok);
+                    let off = self.b.ins().imul_imm(bv, stride);
+                    let row = self.b.ins().iadd(data, off);
+                    self.version_rows.push((*sp, row));
                     (self.b.ins().iadd(bv, s0), self.b.ins().iadd(bv, last))
                 }
-                None => (s0, last),
+                None => {
+                    self.version_rows.push((*sp, data));
+                    (s0, last)
+                }
             };
             let lo_ok = self
                 .b
@@ -8929,11 +8971,16 @@ this case",
                     self.filled = true;
                     self.goto_block(fast);
                     self.unchecked_idx.extend(spans.iter().copied());
+                    let rows = std::mem::take(&mut self.version_rows);
+                    for (sp, row) in &rows {
+                        self.row_base.insert(*sp, (*row, loop_var.name.clone()));
+                    }
                     self.vectorize_next = !std::env::var("GRASM_NO_VECTOR").is_ok_and(|v| v == "1");
                     let r = self.emit_range_loop(ivar, end_var, loop_var, body, *inclusive);
                     self.vectorize_next = false;
                     for sp in &spans {
                         self.unchecked_idx.remove(sp);
+                        self.row_base.remove(sp);
                     }
                     r.and_then(|()| {
                         self.b.ins().jump(join, &[]);
@@ -9031,7 +9078,6 @@ this case",
         let len_v = self.call_rt("grasm_list_len", &[lv]).unwrap();
         let len_var = self.new_var(&VType::I64);
         self.b.def_var(len_var, len_v);
-
         let header = self.b.create_block();
         let body_blk = self.b.create_block();
         let step = self.b.create_block();
@@ -9654,6 +9700,11 @@ this case",
                 // per element for a value the load does not use.
                 if let Expr::Ident(id) = &**recv {
                     if let Some((data, len, pt)) = self.pinned_list(&id.name) {
+                        let flags = cranelift_codegen::ir::MemFlags::trusted();
+                        if let Some(addr) = self.row_address(index.span(), stride_of(&pt)) {
+                            let v = self.b.ins().load(pt.cl(), flags, addr, 0);
+                            return Ok(Some((v, pt)));
+                        }
                         let (iv, it) = self.eval_expr_val(index)?;
                         if it != VType::I64 {
                             return nope(index.span(), "non-integer index");
