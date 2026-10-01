@@ -751,6 +751,9 @@ pub struct StructTy {
     /// to box every field, so `Point{ x: 1.5, y: 2.5 }` was three allocations
     /// and reading `p.x` followed a second pointer; a scalar is now just bits.
     pub kinds: Vec<u8>,
+    /// The empty value list of this type (docs/values.md), made once and
+    /// shared: `[]` allocates nothing, and the first push copies on write.
+    pub empty: std::sync::OnceLock<usize>,
 }
 
 /// A struct field's kind, as the backend records it in the descriptor.
@@ -876,6 +879,7 @@ unsafe fn desc_ty(desc: *const StructDesc) -> &'static StructTy {
         name: borrowed_str((*desc).name_ptr, (*desc).name_len),
         fields,
         kinds,
+        empty: std::sync::OnceLock::new(),
     }));
     let addr = fresh as *const StructTy as usize;
     match (*desc)
@@ -1539,6 +1543,15 @@ pub enum RtPayload {
         env: *mut RtVal,
         name: Option<String>,
     },
+    /// A list of value structs (docs/values.md): each element's field words
+    /// back to back, `ty.fields.len()` words apiece -- a scalar's bits or a
+    /// boxed field's pointer, exactly as a struct box would hold them, but
+    /// with no box per element. Only types the backend proved never reach
+    /// anything generic are stored this way.
+    ListVals {
+        ty: &'static StructTy,
+        words: Vec<i64>,
+    },
 }
 
 #[repr(C)]
@@ -1589,6 +1602,8 @@ pub mod layout {
     pub const STRUCT_INLINE_VALS: usize = 32;
     /// The tag of the `Inline` variant of `ListData` and `StructFields`.
     pub const INLINE: u8 = 0;
+    /// `ListVals`, last in `RtPayload` so no earlier tag moved.
+    pub const TAG_LIST_VALS: u8 = 17;
 }
 
 /// Called first thing by a compiled `main` with the backend's copy of
@@ -2285,6 +2300,15 @@ unsafe fn dec_walk(local: &Local, v: *mut RtVal) {
                 for (i, c) in fields.iter().enumerate() {
                     if ty.boxed(i) && release_to_zero(*c) {
                         push_pending(&mut inline, &mut n, &mut spill, *c);
+                    }
+                }
+            }
+            RtPayload::ListVals { ty, words } => {
+                let w = ty.kinds.len().max(1);
+                for (k, c) in words.iter().enumerate() {
+                    let c = *c as *mut RtVal;
+                    if ty.boxed(k % w) && release_to_zero(c) {
+                        push_pending(&mut inline, &mut n, &mut spill, c);
                     }
                 }
             }
@@ -4226,6 +4250,33 @@ pub unsafe extern "C" fn grasm_out_val(v: *mut RtVal) {
 unsafe fn display(v: *mut RtVal) -> String {
     rt_stack_check();
     match &(*v).payload {
+        // Rendered as the list of structs it stands for, field by field,
+        // each the way that field would print inside a struct box.
+        RtPayload::ListVals { ty, words } => {
+            let w = ty.kinds.len().max(1);
+            let parts: Vec<String> = words
+                .chunks(w)
+                .map(|el| {
+                    let fs: Vec<String> = el
+                        .iter()
+                        .enumerate()
+                        .map(|(i, x)| {
+                            let k = ty.fields.get(i).copied().unwrap_or("?");
+                            if ty.boxed(i) {
+                                format!("{k}: {}", display(*x as *mut RtVal))
+                            } else {
+                                let b = box_field_bits(ty.kinds[i], *x);
+                                let t = display(b);
+                                dec(b);
+                                format!("{k}: {t}")
+                            }
+                        })
+                        .collect();
+                    format!("{}{{{}}}", ty.name, fs.join(", "))
+                })
+                .collect();
+            format!("[{}]", parts.join(", "))
+        }
         RtPayload::Unit => "()".to_string(),
         // The bounds, not the elements. `0..2000000` is what the range *is*,
         // and printing two million integers instead would be a different value.
@@ -4553,6 +4604,150 @@ pub unsafe extern "C" fn grasm_struct_take(s: *mut RtVal, name: *const u8, len: 
 /// The same for a list element.
 ///
 /// # Safety: `l` is a list this runtime allocated.
+/// An empty list of value structs of the type `desc` describes.
+///
+/// # Safety: `desc` is a descriptor the backend emitted.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_vals_new(desc: *const StructDesc) -> *mut RtVal {
+    let ty = desc_ty(desc);
+    // Shared and never freed, like an interned value: a leaf of a tree holds
+    // an empty list, and a million of them should cost nothing.
+    *ty.empty.get_or_init(|| {
+        let v: &'static mut RtVal = Box::leak(Box::new(RtVal {
+            rc: AtomicI64::new(IMMORTAL),
+            payload: RtPayload::ListVals {
+                ty,
+                words: Vec::new(),
+            },
+        }));
+        v as *mut RtVal as usize
+    }) as *mut RtVal
+}
+
+/// Appends one value: its field words, copied from `src`. The value's boxed
+/// fields are handed over with it -- the caller gives up its counts. Returns
+/// the list, which is a copy when the one given was shared.
+///
+/// # Safety: `l` is a live value list; `src` points at one element's words.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_vals_push(l: *mut RtVal, src: *const i64) -> *mut RtVal {
+    let target = if (*l).rc.load(Relaxed) == 1 {
+        l
+    } else {
+        let RtPayload::ListVals { ty, words } = &(*l).payload else {
+            grasm_panic_msg_str("push to a value list that is not one");
+        };
+        let w = ty.kinds.len().max(1);
+        for (k, c) in words.iter().enumerate() {
+            if ty.boxed(k % w) {
+                inc(*c as *mut RtVal);
+            }
+        }
+        // Room for a few elements up front: a list copied on write is
+        // usually about to grow, and growing from nothing reallocates often.
+        let mut grown = Vec::with_capacity((words.len() + w).max(4 * w));
+        grown.extend_from_slice(words);
+        let copy = alloc(RtPayload::ListVals { ty, words: grown });
+        dec(l);
+        copy
+    };
+    let RtPayload::ListVals { ty, words } = &mut (*target).payload else {
+        unreachable!()
+    };
+    let w = ty.kinds.len();
+    words.extend_from_slice(std::slice::from_raw_parts(src, w));
+    target
+}
+
+/// The list itself when nothing else holds it, otherwise a copy that nothing
+/// else does: what a write into one element needs first.
+///
+/// # Safety: `l` is a live value list the caller owns a count on, which
+/// passes to the result.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_vals_unshare(l: *mut RtVal) -> *mut RtVal {
+    if (*l).rc.load(Relaxed) == 1 {
+        return l;
+    }
+    let RtPayload::ListVals { ty, words } = &(*l).payload else {
+        grasm_panic_msg_str("write into a value list that is not one");
+    };
+    let w = ty.kinds.len().max(1);
+    for (k, c) in words.iter().enumerate() {
+        if ty.boxed(k % w) {
+            inc(*c as *mut RtVal);
+        }
+    }
+    let copy = alloc(RtPayload::ListVals {
+        ty,
+        words: words.clone(),
+    });
+    dec(l);
+    copy
+}
+
+/// Holds a value list open for a loop that only indexes it: unshared once,
+/// so element writes land in place, with its words and length written out
+/// for the loop to keep. Returns the (possibly new) list.
+///
+/// # Safety: `l` is a live value list the caller owns a count on, which
+/// passes to the result; `data_out` and `len_out` are writable.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_vals_pin(
+    l: *mut RtVal,
+    data_out: *mut *mut i64,
+    len_out: *mut i64,
+) -> *mut RtVal {
+    let mine = grasm_vals_unshare(l);
+    let RtPayload::ListVals { ty, words } = &mut (*mine).payload else {
+        grasm_panic_msg_str("pin of a value list that is not one");
+    };
+    *data_out = words.as_mut_ptr();
+    *len_out = (words.len() / ty.kinds.len().max(1)) as i64;
+    mine
+}
+
+/// The address of a value list's words, for a loop over a list that cannot
+/// change while it runs.
+///
+/// # Safety: `l` is a live value list, unchanged while the address is used.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_vals_data(l: *mut RtVal) -> *mut i64 {
+    let RtPayload::ListVals { words, .. } = &mut (*l).payload else {
+        grasm_panic_msg_str("words of a value list that is not one");
+    };
+    words.as_mut_ptr()
+}
+
+/// How many values a value list holds.
+///
+/// # Safety: `l` is a live value list.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_vals_len(l: *mut RtVal) -> i64 {
+    let RtPayload::ListVals { ty, words } = &(*l).payload else {
+        grasm_panic_msg_str("length of a value list that is not one");
+    };
+    (words.len() / ty.kinds.len().max(1)) as i64
+}
+
+/// The address of element `i`'s words, borrowed: valid while the list is
+/// alive and not pushed to. Panics on an index out of range, as every list
+/// index does.
+///
+/// # Safety: `l` is a live value list.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_vals_at(l: *mut RtVal, i: i64) -> *mut i64 {
+    let RtPayload::ListVals { ty, words } = &mut (*l).payload else {
+        grasm_panic_msg_str("index into a value list that is not one");
+    };
+    let w = ty.kinds.len().max(1);
+    let n = (words.len() / w) as i64;
+    if i < 0 || i >= n {
+        grasm_panic_index(i, n);
+    }
+    words.as_mut_ptr().add(i as usize * w)
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn grasm_list_take(l: *mut RtVal, i: i64) -> *mut RtVal {
     if (*l).rc.load(Relaxed) != 1 {
@@ -8630,6 +8825,7 @@ unsafe fn wire_of(v: *mut RtVal) -> replay::Wire {
         RtPayload::Map(_) => replay::Wire::of_unsupported("map"),
         RtPayload::Struct { .. } => replay::Wire::of_unsupported("struct"),
         RtPayload::Fn { .. } => replay::Wire::of_unsupported("function"),
+        RtPayload::ListVals { .. } => replay::Wire::of_unsupported("value list"),
     }
 }
 
@@ -9155,6 +9351,7 @@ mod layout_tests {
                 name: "P",
                 fields: vec!["a", "b"],
                 kinds: vec![0, 0],
+                empty: std::sync::OnceLock::new(),
             }));
             let s = alloc(RtPayload::Struct {
                 ty,
@@ -9177,6 +9374,53 @@ mod layout_tests {
             assert_eq!(*(lb.add(layout::LIST_INLINE_VALS) as *const *mut RtVal), b);
             assert_eq!((*s).rc.load(Relaxed), 1);
             assert_eq!(*(sb as *const i64), 1, "the count is the first word");
+        }
+    }
+}
+
+#[cfg(test)]
+mod value_list_tests {
+    use super::*;
+
+    fn live() -> i64 {
+        LOCAL.with(|l| l.live.get())
+    }
+
+    /// Values in, words out, every count given back: push, length, element
+    /// address, a shared copy that has to be copied on write, and the release
+    /// walk freeing each element's boxed field.
+    #[test]
+    fn value_list_owns_its_boxed_fields() {
+        unsafe {
+            let ty: &'static StructTy = Box::leak(Box::new(StructTy {
+                name: "N",
+                fields: vec!["v", "s"],
+                kinds: vec![FK_I64, FK_BOXED],
+                empty: std::sync::OnceLock::new(),
+            }));
+            let before = live();
+            let mut l = alloc(RtPayload::ListVals { ty, words: Vec::new() });
+            for k in 0..5i64 {
+                let s = alloc(RtPayload::Str(RtStr::of(&format!("s{k}"))));
+                let el = [k * 10, s as i64];
+                l = grasm_vals_push(l, el.as_ptr());
+            }
+            assert_eq!(grasm_vals_len(l), 5);
+            let third = grasm_vals_at(l, 3);
+            assert_eq!(*third, 30);
+            assert_eq!(display(*third.add(1) as *mut RtVal), "s3");
+            // A second holder: the next push copies, and both lists hold
+            // their own counts on the shared strings.
+            inc(l);
+            let s = alloc(RtPayload::Str(RtStr::of("late")));
+            let el = [99, s as i64];
+            let l2 = grasm_vals_push(l, el.as_ptr());
+            assert_ne!(l, l2);
+            assert_eq!(grasm_vals_len(l), 5);
+            assert_eq!(grasm_vals_len(l2), 6);
+            dec(l);
+            dec(l2);
+            assert_eq!(live(), before, "every element's boxed field was released");
         }
     }
 }

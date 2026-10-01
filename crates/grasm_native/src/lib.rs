@@ -10,6 +10,8 @@
 //! dec their boxed locals; early `return` skips sibling decs (bounded leak,
 //! hardened later). Unsupported constructs produce file:line diagnostics.
 
+mod values;
+
 use std::collections::HashMap;
 
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
@@ -92,6 +94,11 @@ enum VType {
     /// and needs no refcount of its own; the slab owns what it points at.
     Ref(Box<VType>),
     Struct(String),
+    /// A value struct (docs/values.md): its field words in memory -- a stack
+    /// slot, a parameter's pointer, or an element of a value list -- and the
+    /// address of those words is what travels. Not a box: no count of its
+    /// own; it owns its boxed fields.
+    Val(String),
     Sum(String),
     Option(Box<VType>),
     /// `T ! E` — boxed Ok/Err variant wrapper. Both halves are carried:
@@ -146,6 +153,7 @@ impl VType {
             VType::Option(e) => format!("o{}", e.mangle()),
             VType::Fallible(o, e) => format!("f{}_{}", o.mangle(), e.mangle()),
             VType::Struct(n) | VType::Sum(n) => format!("n{n}"),
+            VType::Val(n) => format!("v{n}"),
             VType::Map(k, v) => format!("m{}_{}", k.mangle(), v.mangle()),
             VType::Fn(ps, r) => format!(
                 "fn{}_{}",
@@ -177,7 +185,7 @@ impl VType {
             VType::List(e) => format!("[{}]", e.show()),
             VType::Option(e) => format!("{}?", e.show()),
             VType::Fallible(o, e) => format!("{} ! {}", o.show(), e.show()),
-            VType::Struct(n) | VType::Sum(n) => n.clone(),
+            VType::Struct(n) | VType::Sum(n) | VType::Val(n) => n.clone(),
             VType::Map(k, v) => format!("[{}: {}]", k.show(), v.show()),
             VType::Fn(ps, r) => format!(
                 "fn({}) -> {}",
@@ -206,6 +214,7 @@ impl VType {
             | VType::Range
             | VType::List(_)
             | VType::Struct(_)
+            | VType::Val(_)
             | VType::Sum(_)
             | VType::Option(_)
             | VType::Fallible(_, _)
@@ -334,6 +343,15 @@ fn compile_object_scoped(
     cg.closure_param_types = analysis.closure_param_types;
     cg.generic_ctor_types = analysis.generic_ctor_types;
     cg.resolved_types = analysis.resolved_types.into_iter().collect();
+    // Value structs (docs/values.md), stage 1: report which types qualify.
+    if std::env::var("GRASM_VALUES").is_ok_and(|v| v == "1") {
+        let modules: Vec<&AstModule> = program.files.iter().map(|f| &f.module).collect();
+        let ok = values::eligible(&modules, &cg.resolved_types);
+        if std::env::var("GRASM_VALUES_REPORT").is_ok() {
+            eprintln!("value structs: {}", ok.iter().cloned().collect::<Vec<_>>().join(", "));
+        }
+        cg.value_types = ok.into_iter().collect();
+    }
     cg.only_module = only_module.map(str::to_string);
     cg.declare_runtime()?;
     let views: Vec<(
@@ -513,6 +531,9 @@ struct Codegen<'m> {
     /// This is the checker's answer; the probe consults it first and falls
     /// back to its own reasoning, so there is never a window with neither.
     resolved_types: HashMap<(u32, u32), String>,
+    /// Struct types compiled as values (docs/values.md); empty unless
+    /// `GRASM_VALUES=1` while that work is experimental.
+    value_types: std::collections::HashSet<String>,
     /// Spans that a *synthesised* expression reuses.
     ///
     /// `xs.par_map(square)` is lowered as `xs.par_map(|__par_arg|
@@ -666,6 +687,7 @@ impl<'m> Codegen<'m> {
             type_args: HashMap::new(),
             generic_variant_owner: HashMap::new(),
             resolved_types: HashMap::new(),
+            value_types: std::collections::HashSet::new(),
             synthesised_spans: std::cell::RefCell::new(std::collections::HashSet::new()),
             probe_hits: std::cell::Cell::new(0),
             probe_misses: std::cell::Cell::new(0),
@@ -757,6 +779,13 @@ impl<'m> Codegen<'m> {
             ("grasm_tuple3", vec![i64t, i64t, i64t], Some(i64t)),
             ("grasm_list_push", vec![i64t, i64t], Some(i64t)),
             ("grasm_list_len", vec![i64t], Some(i64t)),
+            ("grasm_vals_new", vec![ptr], Some(i64t)),
+            ("grasm_vals_push", vec![i64t, ptr], Some(i64t)),
+            ("grasm_vals_len", vec![i64t], Some(i64t)),
+            ("grasm_vals_at", vec![i64t, i64t], Some(ptr)),
+            ("grasm_vals_data", vec![i64t], Some(ptr)),
+            ("grasm_vals_unshare", vec![i64t], Some(i64t)),
+            ("grasm_vals_pin", vec![i64t, ptr, ptr], Some(i64t)),
             ("grasm_list_get", vec![i64t, i64t], Some(i64t)),
             ("grasm_list_borrow_at", vec![i64t, i64t], Some(i64t)),
             ("grasm_box_i64", vec![i64t], Some(i64t)),
@@ -1102,6 +1131,9 @@ impl<'m> Codegen<'m> {
                         // downstream has to know aliases exist.
                         if let Some(target) = self.aliases.get(n).cloned() {
                             return self.vtype_of(&target);
+                        }
+                        if self.value_types.contains(n) {
+                            return Ok(VType::Val(n.to_string()));
                         }
                         if self.structs.contains_key(n) {
                             return Ok(VType::Struct(n.to_string()));
@@ -1839,7 +1871,11 @@ arguments nor the type this is bound to",
                             p.cl()
                         }));
                     }
-                    if ret != VType::Unit {
+                    // A value struct comes back through the caller's slot,
+                    // whose address is the last parameter.
+                    if matches!(ret, VType::Val(_)) {
+                        sig.params.push(AbiParam::new(ptr_ty));
+                    } else if ret != VType::Unit {
                         sig.returns.push(AbiParam::new(ret.cl()));
                     }
                     let sym = format!(
@@ -1860,9 +1896,12 @@ arguments nor the type this is bound to",
                         .zip(&modes)
                         .zip(&f.params)
                         .map(|((t, m), p)| {
-                            t.boxed()
-                                && *m != ParamMode::Inout
-                                && param_is_borrowed(&p.name.name, &f.body)
+                            // A value is always lent: the callee reads its
+                            // words through the caller's pointer.
+                            matches!(t, VType::Val(_))
+                                || (t.boxed()
+                                    && *m != ParamMode::Inout
+                                    && param_is_borrowed(&p.name.name, &f.body))
                         })
                         .collect();
                     self.fns.insert(
@@ -2048,7 +2087,9 @@ arguments nor the type this is bound to",
                     p.cl()
                 }));
         }
-        if sig_ret != VType::Unit {
+        if matches!(sig_ret, VType::Val(_)) {
+            ctx.func.signature.params.push(AbiParam::new(ptr_ty));
+        } else if sig_ret != VType::Unit {
             ctx.func.signature.returns.push(AbiParam::new(sig_ret.cl()));
         }
 
@@ -2089,6 +2130,8 @@ arguments nor the type this is bound to",
             version_guard_value: None,
             version_rows: Vec::new(),
             row_base: HashMap::new(),
+            sret: None,
+            fresh_vals: std::collections::HashSet::new(),
             vectorize_next: false,
             vector_splats: HashMap::new(),
             inline_depth: 0,
@@ -2140,6 +2183,9 @@ arguments nor the type this is bound to",
         // parameters.
         let shift = usize::from(takes_floor);
         let entry_params: Vec<Value> = fcx.b.block_params(entry)[shift..].to_vec();
+        if matches!(sig_ret, VType::Val(_)) {
+            fcx.sret = entry_params.last().copied();
+        }
         for (i, p) in f.params.iter().enumerate() {
             let vt = sig_params[i].clone();
             if sig_modes[i] == ParamMode::Inout {
@@ -2221,6 +2267,9 @@ arguments nor the type this is bound to",
                     }
                     fcx.emit_scope_decs_all();
                     fcx.b.ins().return_(&[]);
+                }
+                (VType::Val(_), Some((v, _))) => {
+                    fcx.emit_val_return(v);
                 }
                 (want, Some((mut v, vt))) => {
                     // A body that already produced a `T ! E` is the result;
@@ -2765,6 +2814,8 @@ operation's",
             version_guard_value: None,
             version_rows: Vec::new(),
             row_base: HashMap::new(),
+            sret: None,
+            fresh_vals: std::collections::HashSet::new(),
             vectorize_next: false,
             vector_splats: HashMap::new(),
             inline_depth: 0,
@@ -2878,6 +2929,8 @@ operation's",
             version_guard_value: None,
             version_rows: Vec::new(),
             row_base: HashMap::new(),
+            sret: None,
+            fresh_vals: std::collections::HashSet::new(),
             vectorize_next: false,
             vector_splats: HashMap::new(),
             inline_depth: 0,
@@ -3034,6 +3087,8 @@ operation's",
             version_guard_value: None,
             version_rows: Vec::new(),
             row_base: HashMap::new(),
+            sret: None,
+            fresh_vals: std::collections::HashSet::new(),
             vectorize_next: false,
             vector_splats: HashMap::new(),
             inline_depth: 0,
@@ -3414,6 +3469,12 @@ struct FnCx<'a, 'm> {
     /// is `row + i * stride` -- one indexed load -- rather than the base
     /// multiplied out again on every element.
     row_base: HashMap<(u32, u32), (Value, String)>,
+    /// Where a function returning a value struct writes it: the caller's slot.
+    sret: Option<Value>,
+    /// Value structs that are temporaries -- a literal or a call's result not
+    /// yet bound to anything -- and so owned by whoever consumes them: bound
+    /// by `let` they move, passed or discarded they are dropped after.
+    fresh_vals: std::collections::HashSet<Value>,
     /// Set for the one loop about to be emitted as a versioned fast copy,
     /// which may run two `f64` lanes at a time. See `emit_vector_prefix`.
     vectorize_next: bool,
@@ -6100,6 +6161,13 @@ impl FnCx<'_, '_> {
             if self.moved.remove(&var.as_u32()) {
                 continue;
             }
+            if let VType::Val(s) = &vt {
+                if !self.borrowed_vars.contains(&var.as_u32()) {
+                    let v = self.b.use_var(var);
+                    self.drop_val(v, s);
+                }
+                continue;
+            }
             if vt.boxed() && !self.borrowed_vars.contains(&var.as_u32()) {
                 let v = self.b.use_var(var);
                 self.call_rt("grasm_val_dec", &[v]);
@@ -6136,6 +6204,13 @@ impl FnCx<'_, '_> {
             .flat_map(|sc| sc.values().cloned())
             .collect();
         for (var, vt) in live {
+            if let VType::Val(s) = &vt {
+                if !self.borrowed_vars.contains(&var.as_u32()) {
+                    let v = self.b.use_var(var);
+                    self.drop_val(v, s);
+                }
+                continue;
+            }
             if vt.boxed() && !self.borrowed_vars.contains(&var.as_u32()) {
                 let v = self.b.use_var(var);
                 self.call_rt("grasm_val_dec", &[v]);
@@ -6158,6 +6233,13 @@ impl FnCx<'_, '_> {
         let inout_vars: Vec<Variable> = self.inout_slots.iter().map(|(_, v, _)| *v).collect();
         for (var, vt) in deeper {
             if inout_vars.contains(&var) {
+                continue;
+            }
+            if let VType::Val(s) = &vt {
+                if !self.borrowed_vars.contains(&var.as_u32()) {
+                    let v = self.b.use_var(var);
+                    self.drop_val(v, s);
+                }
                 continue;
             }
             if vt.boxed() {
@@ -6230,6 +6312,11 @@ impl FnCx<'_, '_> {
             // comes through here, which is how the first version of this
             // released a borrow it never took and freed the caller's list.
             if self.borrowed_vars.contains(&var.as_u32()) {
+                continue;
+            }
+            if let VType::Val(s) = &vt {
+                let v = self.b.use_var(var);
+                self.drop_val(v, s);
                 continue;
             }
             if vt.boxed() {
@@ -6466,6 +6553,31 @@ impl FnCx<'_, '_> {
             let Some((var, VType::List(elem))) = self.lookup(&name) else {
                 continue;
             };
+            // A list of values the loop only indexes: unshared once and its
+            // words held for the loop, so `xs[i]` is an address and
+            // `xs[i] = v` a store, as for a list of scalars.
+            if matches!(*elem, VType::Val(_)) {
+                let ptr_ty = self.cg.module.target_config().pointer_type();
+                let slot = self
+                    .b
+                    .create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
+                        cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                        16,
+                        3,
+                    ));
+                let data_out = self.b.ins().stack_addr(ptr_ty, slot, 0);
+                let len_out = self.b.ins().stack_addr(ptr_ty, slot, 8);
+                let cur = self.b.use_var(var);
+                let mine = self
+                    .call_rt("grasm_vals_pin", &[cur, data_out, len_out])
+                    .unwrap();
+                self.b.def_var(var, mine);
+                let flags = cranelift_codegen::ir::MemFlags::trusted();
+                let data = self.b.ins().load(types::I64, flags, data_out, 0);
+                let len = self.b.ins().load(types::I64, flags, len_out, 0);
+                scope.insert(name, (data, len, (*elem).clone()));
+                continue;
+            }
             let Some(kind) = scalar_kind_i64(&elem) else {
                 continue;
             };
@@ -6912,6 +7024,10 @@ impl FnCx<'_, '_> {
     /// A new empty list whose elements have type `elem_t` — inline scalar
     /// storage when the type allows it, boxed cells otherwise.
     fn new_list_of(&mut self, elem_t: &VType) -> Value {
+        if let VType::Val(s) = elem_t {
+            let d = self.val_desc(&s.clone());
+            return self.call_rt("grasm_vals_new", &[d]).unwrap();
+        }
         match scalar_kind_i64(elem_t) {
             Some(k) => {
                 let kc = self.b.ins().iconst(types::I64, k);
@@ -6928,6 +7044,10 @@ impl FnCx<'_, '_> {
     // has to be grown. A two-million element list grew twenty-one times
     // without this, copying everything written so far each time.
     fn new_list_of_cap(&mut self, elem_t: &VType, n: Value) -> Value {
+        if matches!(elem_t, VType::Val(_)) {
+            let _ = n;
+            return self.new_list_of(elem_t);
+        }
         match scalar_kind_i64(elem_t) {
             Some(k) => {
                 let kc = self.b.ins().iconst(types::I64, k);
@@ -6945,6 +7065,11 @@ impl FnCx<'_, '_> {
         idx: Value,
         elem_t: &VType,
     ) -> CResult<(Value, VType)> {
+        // An element of a value list is a place inside the list, borrowed.
+        if matches!(elem_t, VType::Val(_)) {
+            let at = self.call_rt("grasm_vals_at", &[list, idx]).unwrap();
+            return Ok((at, elem_t.clone()));
+        }
         if let Some(k) = scalar_kind_i64(elem_t) {
             let kc = self.b.ins().iconst(types::I64, k);
             let bits = self
@@ -7033,6 +7158,13 @@ impl FnCx<'_, '_> {
     }
 
     fn list_push_elem(&mut self, list: Value, v: Value, vt: &VType) -> Value {
+        if let VType::Val(s) = vt {
+            // The list takes the value's words and the counts of its boxed
+            // fields: a temporary hands them over, anything else is copied.
+            let s = s.clone();
+            let owned = self.own_val(v, &s);
+            return self.call_rt("grasm_vals_push", &[list, owned]).unwrap();
+        }
         if let Some(k) = scalar_kind_i64(vt) {
             let bits = self.scalar_bits_of(v, vt);
             let kc = self.b.ins().iconst(types::I64, k);
@@ -7165,7 +7297,277 @@ impl FnCx<'_, '_> {
     fn dec_if_boxed(&mut self, v: Value, vt: &VType) {
         if vt.boxed() {
             self.call_rt("grasm_val_dec", &[v]);
+        } else if let VType::Val(s) = vt {
+            // A temporary value nobody took: its boxed fields go with it.
+            if self.fresh_vals.remove(&v) {
+                let s = s.clone();
+                self.drop_val(v, &s);
+            }
         }
+    }
+
+    /// The fields of value struct `s`, in declared order.
+    fn val_fields(&self, s: &str) -> Vec<VType> {
+        self.cg
+            .structs
+            .get(s)
+            .map(|fs| fs.iter().map(|(_, t)| t.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    /// Releases the boxed fields of the value at `at`.
+    fn drop_val(&mut self, at: Value, s: &str) {
+        let flags = cranelift_codegen::ir::MemFlags::trusted();
+        for (i, ft) in self.val_fields(s).iter().enumerate() {
+            if ft.boxed() {
+                let w = self.b.ins().load(types::I64, flags, at, (8 * i) as i32);
+                self.call_rt("grasm_val_dec", &[w]);
+            }
+        }
+    }
+
+    /// Takes a count on each boxed field of the value at `at`.
+    fn inc_val_fields(&mut self, at: Value, s: &str) {
+        let flags = cranelift_codegen::ir::MemFlags::trusted();
+        for (i, ft) in self.val_fields(s).iter().enumerate() {
+            if ft.boxed() {
+                let w = self.b.ins().load(types::I64, flags, at, (8 * i) as i32);
+                self.call_rt("grasm_val_inc", &[w]);
+            }
+        }
+    }
+
+    /// The descriptor of value struct `s`: its name, fields and their kinds.
+    fn val_desc(&mut self, s: &str) -> Value {
+        let fs = self.cg.structs.get(s).cloned().unwrap_or_default();
+        let names: Vec<String> = fs.iter().map(|(n, _)| n.clone()).collect();
+        let kinds: Vec<u8> = fs.iter().map(|(_, t)| field_kind(t)).collect();
+        let did = self.cg.struct_desc(s, &names, &kinds);
+        let gv = self.cg.module.declare_data_in_func(did, self.b.func);
+        let ptr_ty = self.cg.module.target_config().pointer_type();
+        self.b.ins().global_value(ptr_ty, gv)
+    }
+
+    /// `S{ f: e, ... }` for a value struct: its words in a fresh slot. Fields
+    /// are evaluated as written and stored as declared; a boxed field's
+    /// reference belongs to the value.
+    fn eval_val_lit(&mut self, s: &str, fields: &[(Ident, Expr)], span: Span) -> CResult<(Value, VType)> {
+        let decl = self.cg.structs.get(s).cloned().unwrap_or_default();
+        let at = self.val_slot(s);
+        let flags = cranelift_codegen::ir::MemFlags::trusted();
+        // Held where an early exit's releases find them until stored.
+        self.push_scope();
+        let mut words: Vec<(usize, Value)> = Vec::new();
+        for (fi, (fname, fexpr)) in fields.iter().enumerate() {
+            let Some(i) = decl.iter().position(|(n, _)| *n == fname.name) else {
+                self.pop_scope_no_decs();
+                return nope(span, format!("the field `{}` of `{s}`", fname.name));
+            };
+            let ft = decl[i].1.clone();
+            let (mut v, vt) = self.eval_expr_expecting(fexpr, Some(&ft))?;
+            if ft == VType::F64 && vt == VType::I64 {
+                v = self.b.ins().fcvt_from_sint(types::F64, v);
+            }
+            let w = if ft.boxed() {
+                let hv = self.new_var(&VType::Str);
+                self.b.def_var(hv, v);
+                self.bind(&format!(" vfld{}_{}", span.start, fi), hv, VType::Str);
+                v
+            } else if field_kind(&ft) != 0 {
+                self.scalar_bits_of(v, &ft)
+            } else {
+                self.pop_scope_no_decs();
+                return nope(span, "a value struct holding another value struct");
+            };
+            words.push((i, w));
+        }
+        for (i, w) in words {
+            self.b.ins().store(flags, w, at, (8 * i) as i32);
+        }
+        self.pop_scope_no_decs();
+        self.fresh_vals.insert(at);
+        Ok((at, VType::Val(s.to_string())))
+    }
+
+    /// An assignment whose target is a value struct variable, or one of its
+    /// fields. `None` when the target is anything else.
+    fn assign_val(
+        &mut self,
+        target: &Expr,
+        op: AssignOp,
+        value: &Expr,
+        span: Span,
+    ) -> CResult<Option<StmtOut>> {
+        if self.cg.value_types.is_empty() {
+            return Ok(None);
+        }
+        let flags = cranelift_codegen::ir::MemFlags::trusted();
+        match target {
+            Expr::Ident(id) => {
+                let Some((var, VType::Val(s))) = self.lookup(&id.name) else {
+                    return Ok(None);
+                };
+                if op != AssignOp::Assign {
+                    return nope(span, "a compound assignment to a whole value struct");
+                }
+                let (nv, _) = self.eval_expr_val(value)?;
+                // Taken before the old value goes: `p = f(p)` reads it.
+                let owned = self.own_val(nv, &s);
+                let old = self.b.use_var(var);
+                self.drop_val(old, &s);
+                self.b.def_var(var, owned);
+                Ok(Some(StmtOut::Value(None)))
+            }
+            Expr::Field { recv, name, .. } => {
+                let Expr::Ident(root) = &**recv else {
+                    return Ok(None);
+                };
+                let Some((var, VType::Val(s))) = self.lookup(&root.name) else {
+                    return Ok(None);
+                };
+                let decl = self.cg.structs.get(&s).cloned().unwrap_or_default();
+                let Some(i) = decl.iter().position(|(n, _)| *n == name.name) else {
+                    return nope(span, format!("the field `{}` of `{s}`", name.name));
+                };
+                let ft = decl[i].1.clone();
+                let at = self.b.use_var(var);
+                let (mut nv, mut nt) = self.eval_expr_expecting(value, Some(&ft))?;
+                if ft == VType::F64 && nt == VType::I64 {
+                    nv = self.b.ins().fcvt_from_sint(types::F64, nv);
+                    nt = VType::F64;
+                }
+                if op != AssignOp::Assign {
+                    if ft.boxed() {
+                        return nope(span, "a compound assignment to a boxed field of a value");
+                    }
+                    let w = self.b.ins().load(types::I64, flags, at, (8 * i) as i32);
+                    let old = self.scalar_of_bits(w, &ft);
+                    let bop = match op {
+                        AssignOp::Add => BinaryOp::Add,
+                        AssignOp::Sub => BinaryOp::Sub,
+                        AssignOp::Mul => BinaryOp::Mul,
+                        AssignOp::Div => BinaryOp::Div,
+                        AssignOp::Assign => unreachable!(),
+                    };
+                    let (r, rt) = self.binop_values(bop, old, ft.clone(), nv, nt, span)?;
+                    nv = r;
+                    nt = rt;
+                    if ft == VType::F64 && nt == VType::I64 {
+                        nv = self.b.ins().fcvt_from_sint(types::F64, nv);
+                    }
+                }
+                if ft.boxed() {
+                    let old = self.b.ins().load(types::I64, flags, at, (8 * i) as i32);
+                    self.b.ins().store(flags, nv, at, (8 * i) as i32);
+                    self.call_rt("grasm_val_dec", &[old]);
+                } else {
+                    let bits = self.scalar_bits_of(nv, &ft);
+                    self.b.ins().store(flags, bits, at, (8 * i) as i32);
+                }
+                Ok(Some(StmtOut::Value(None)))
+            }
+            Expr::Index { recv, index, .. } => {
+                let Expr::Ident(root) = &**recv else {
+                    return Ok(None);
+                };
+                let Some((var, VType::List(elem))) = self.lookup(&root.name) else {
+                    return Ok(None);
+                };
+                let VType::Val(s) = *elem else {
+                    return Ok(None);
+                };
+                if op != AssignOp::Assign {
+                    return nope(span, "a compound assignment to a whole value struct");
+                }
+                let (nv, _) = self.eval_expr_val(value)?;
+                // A temporary's words move in. A place's are copied, and its
+                // boxed fields gain their counts *before* the element's old
+                // fields are released -- `xs[i] = xs[i]` reads what it frees.
+                let moving = self.fresh_vals.remove(&nv);
+                if !moving {
+                    self.inc_val_fields(nv, &s);
+                }
+                let owned = nv;
+                let (iv, _) = self.index_value(index)?;
+                let at = if let Some((data, len, pt)) = self.pinned_list(&root.name) {
+                    let stride = self.val_stride(&pt);
+                    self.pinned_address(data, len, iv, stride)
+                } else {
+                    let cur = self.b.use_var(var);
+                    let mine = self.call_rt("grasm_vals_unshare", &[cur]).unwrap();
+                    self.b.def_var(var, mine);
+                    self.call_rt("grasm_vals_at", &[mine, iv]).unwrap()
+                };
+                self.drop_val(at, &s);
+                let n = self.val_fields(&s).len();
+                for i in 0..n {
+                    let w = self.b.ins().load(types::I64, flags, owned, (8 * i) as i32);
+                    self.b.ins().store(flags, w, at, (8 * i) as i32);
+                }
+                Ok(Some(StmtOut::Value(None)))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// The bytes one element of a value list takes.
+    fn val_stride(&self, t: &VType) -> i64 {
+        match t {
+            VType::Val(s) => (self.val_fields(s).len() * 8) as i64,
+            other => stride_of(other),
+        }
+    }
+
+    /// A fresh stack slot for one value of `s`.
+    fn val_slot(&mut self, s: &str) -> Value {
+        let n = self.val_fields(s).len().max(1);
+        let slot = self
+            .b
+            .create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
+                cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                (n * 8) as u32,
+                3,
+            ));
+        let ptr_ty = self.cg.module.target_config().pointer_type();
+        self.b.ins().stack_addr(ptr_ty, slot, 0)
+    }
+
+    /// Copies the words of the value at `src` to `dst`. A temporary moves --
+    /// its fields' counts go with it; anything else is copied and each boxed
+    /// field gains a count, since both places now hold it.
+    fn move_or_copy_val(&mut self, src: Value, dst: Value, s: &str) {
+        let flags = cranelift_codegen::ir::MemFlags::trusted();
+        let n = self.val_fields(s).len();
+        for i in 0..n {
+            let w = self.b.ins().load(types::I64, flags, src, (8 * i) as i32);
+            self.b.ins().store(flags, w, dst, (8 * i) as i32);
+        }
+        if !self.fresh_vals.remove(&src) {
+            self.inc_val_fields(dst, s);
+        }
+    }
+
+    /// A value owned by the caller: `v` itself if it is a temporary, else a
+    /// copy in a slot of its own.
+    fn own_val(&mut self, v: Value, s: &str) -> Value {
+        if self.fresh_vals.remove(&v) {
+            return v;
+        }
+        let dst = self.val_slot(s);
+        self.move_or_copy_val(v, dst, s);
+        dst
+    }
+
+    /// `return v` from a function whose result is a value struct.
+    fn emit_val_return(&mut self, v: Value) {
+        let VType::Val(s) = self.ret.clone() else {
+            unreachable!("only for value-struct results")
+        };
+        let dst = self.sret.expect("a value-returning function has its slot");
+        self.move_or_copy_val(v, dst, &s);
+        self.emit_scope_decs_all();
+        self.b.ins().return_(&[]);
+        self.filled = true;
     }
 
     fn inc_if_boxed(&mut self, v: Value, vt: &VType) {
@@ -7209,6 +7611,9 @@ impl FnCx<'_, '_> {
     /// `xs.len()` for a list of boxed values: a byte load when the list is
     /// inline, the runtime call otherwise.
     fn list_len_fast(&mut self, lv: Value, elem_t: &VType) -> Value {
+        if matches!(elem_t, VType::Val(_)) {
+            return self.call_rt("grasm_vals_len", &[lv]).unwrap();
+        }
         if !elem_t.boxed() {
             return self.call_rt("grasm_list_len", &[lv]).unwrap();
         }
@@ -7303,6 +7708,23 @@ impl FnCx<'_, '_> {
         let Expr::Field { recv, name, span } = e else {
             return Ok(None);
         };
+        // A boxed field of a value-struct variable, lent: its word, uncounted.
+        if let Expr::Ident(root) = &**recv {
+            if let Some((var, VType::Val(s))) = self.lookup(&root.name) {
+                let decl = self.cg.structs.get(&s).cloned().unwrap_or_default();
+                let Some(i) = decl.iter().position(|(n, _)| *n == name.name) else {
+                    return Ok(None);
+                };
+                let ft = decl[i].1.clone();
+                if !ft.boxed() {
+                    return Ok(None);
+                }
+                let at = self.b.use_var(var);
+                let flags = cranelift_codegen::ir::MemFlags::trusted();
+                let w = self.b.ins().load(types::I64, flags, at, (8 * i) as i32);
+                return Ok(Some((w, ft)));
+            }
+        }
         let Some((base, sname)) = self.borrow_struct_path(recv)? else {
             return Ok(None);
         };
@@ -7610,6 +8032,12 @@ impl FnCx<'_, '_> {
                     }
                     vt = want;
                 }
+                // A value bound by `let` is the binding's own: a temporary
+                // moves in, a place is copied.
+                if let VType::Val(s) = &vt {
+                    let s = s.clone();
+                    v = self.own_val(v, &s);
+                }
                 let var = self.new_var(&vt);
                 self.b.def_var(var, v);
                 self.bind(&name.name, var, vt);
@@ -7623,6 +8051,9 @@ impl FnCx<'_, '_> {
                 ..
             } => {
                 self.index_vals.clear();
+                if let Some(done) = self.assign_val(target, *op, value, *span)? {
+                    return Ok(done);
+                }
                 // `acc = acc + …` on a string is one string growing, not two
                 // being joined: appended in place when nothing else holds it,
                 // which is what makes building text in a loop linear instead
@@ -7963,6 +8394,11 @@ impl FnCx<'_, '_> {
                         // bug in `f`", naming nothing.
                         let got = self.eval_expr_expecting_opt(e, Some(&expect))?;
                         if self.is_filled() || self.dead {
+                            return Ok(StmtOut::Terminated);
+                        }
+                        if let (VType::Val(_), Some((v, _))) = (&self.ret, &got) {
+                            let v = *v;
+                            self.emit_val_return(v);
                             return Ok(StmtOut::Terminated);
                         }
                         // Still unit when the operand simply has no value.
@@ -8960,6 +9396,9 @@ this case",
         let mut lens: Vec<Value> = Vec::with_capacity(accesses.len());
         for (name, base, _) in &accesses {
             match self.pinned_list(name) {
+                // A list of values is not versioned: its accesses are places,
+                // not the loads and stores the check-free copy rewrites.
+                Some((_, _, VType::Val(_))) => return Ok(None),
                 Some((_, len, _)) => lens.push(len),
                 None => return Ok(None),
             }
@@ -9195,6 +9634,15 @@ this case",
         let len_v = self.list_len_fast(lv, &elem_t);
         let len_var = self.new_var(&VType::I64);
         self.b.def_var(len_var, len_v);
+        // A lent value list cannot change while the loop runs, so its words
+        // are found once and each element is an address computed from them.
+        let val_data = match (&*elem_t, lent_list) {
+            (VType::Val(s), true) => {
+                let w = self.val_fields(&s.clone()).len() as i64;
+                Some((self.call_rt("grasm_vals_data", &[lv]).unwrap(), w * 8))
+            }
+            _ => None,
+        };
         let header = self.b.create_block();
         let body_blk = self.b.create_block();
         let step = self.b.create_block();
@@ -9221,7 +9669,11 @@ this case",
                 .unwrap_or(false)
         };
         let borrow_elem = elem_t.boxed() && loop_elem_is_borrowed(&loop_var.name, body, &lent);
-        let (elem_val, elem_vt) = if borrow_elem {
+        let val_elem = matches!(*elem_t, VType::Val(_));
+        let (elem_val, elem_vt) = if let Some((base, stride)) = val_data {
+            let off = self.b.ins().imul_imm(iv2, stride);
+            (self.b.ins().iadd(base, off), (*elem_t).clone())
+        } else if borrow_elem {
             let v = self.list_borrow_fast(lv2, iv2);
             (v, (*elem_t).clone())
         } else {
@@ -9229,7 +9681,9 @@ this case",
         };
         let evar = self.new_var(&elem_vt);
         self.b.def_var(evar, elem_val);
-        if borrow_elem {
+        // A value list's element is a place inside the list: the loop
+        // variable lends it, and nothing is released when the iteration ends.
+        if borrow_elem || val_elem {
             // Nothing was taken, so nothing is released: the same mechanism a
             // lent parameter uses.
             self.borrowed_vars.insert(evar.as_u32());
@@ -9816,6 +10270,16 @@ this case",
                 // evaluating the receiver here would be an inc/dec round trip
                 // per element for a value the load does not use.
                 if let Expr::Ident(id) = &**recv {
+                    if let Some((data, len, pt @ VType::Val(_))) = self.pinned_list(&id.name) {
+                        // An element of a pinned value list: a place in it.
+                        let (iv, it) = self.eval_expr_val(index)?;
+                        if it != VType::I64 {
+                            return nope(index.span(), "non-integer index");
+                        }
+                        let stride = self.val_stride(&pt);
+                        let addr = self.pinned_address(data, len, iv, stride);
+                        return Ok(Some((addr, pt)));
+                    }
                     if let Some((data, len, pt)) = self.pinned_list(&id.name) {
                         let flags = cranelift_codegen::ir::MemFlags::trusted();
                         if let Some(addr) = self.row_address(index.span(), stride_of(&pt)) {
@@ -11887,6 +12351,7 @@ this case",
             return Ok(None);
         }
         let f = match (&vt, name.name.as_str()) {
+            (VType::List(e), "len") if matches!(**e, VType::Val(_)) => "grasm_vals_len",
             (VType::List(_), "len") => "grasm_list_len",
             (VType::List(_), "is_empty") => "grasm_list_is_empty",
             (VType::Map(_, _), "len") => "grasm_map_len",
@@ -14265,6 +14730,7 @@ type parameters",
         // pointer arguments, cleaned up after the call returns.
         let mut c_args: Vec<(usize, Value, VType, Value)> = Vec::new();
         // Temporaries passed to a parameter the callee only reads.
+        let mut val_temps: Vec<(Value, VType)> = Vec::new();
         let mut lent_temps: Vec<Value> = Vec::new();
         // (arg index, slot, root variable, root type, path) for an `inout`
         // argument that is a *place* rather than a plain variable.
@@ -14386,6 +14852,9 @@ type parameters",
                     lent_temps.push(v);
                 }
             }
+            if matches!(vt, VType::Val(_)) && self.fresh_vals.contains(&v) {
+                val_temps.push((v, vt.clone()));
+            }
             vals.push(v);
         }
         // The call is happening: ownership passes, so no release here.
@@ -14394,6 +14863,16 @@ type parameters",
             let f = self.floor_arg();
             vals.insert(0, f);
         }
+        // A value-struct result is written into a slot of the caller's.
+        let ret_slot = match &ret {
+            VType::Val(s) => {
+                let s = s.clone();
+                let at = self.val_slot(&s);
+                vals.push(at);
+                Some(at)
+            }
+            _ => None,
+        };
         let fref = self.cg.module.declare_func_in_func(fid, self.b.func);
         let inst = self.b.ins().call(fref, &vals);
         let results: Vec<Value> = self.b.inst_results(inst).to_vec();
@@ -14401,6 +14880,10 @@ type parameters",
         // the other side released them.
         for v in lent_temps {
             self.call_rt("grasm_val_dec", &[v]);
+        }
+        // Value temporaries are lent the same way, and end here.
+        for (v, t) in val_temps {
+            self.dec_if_boxed(v, &t);
         }
         for (_, slot, var, vt) in inout_args {
             let updated = self.b.ins().stack_load(vt.cl(), slot, 0);
@@ -14425,6 +14908,10 @@ type parameters",
                 self.call_rt("grasm_str_c_free", &[p]);
             }
             self.call_rt("grasm_val_dec", &[boxed]);
+        }
+        if let Some(at) = ret_slot {
+            self.fresh_vals.insert(at);
+            return Ok(Some((at, ret)));
         }
         if ret == VType::Unit {
             Ok(None)
@@ -14825,6 +15312,9 @@ fields, not the type this is bound to, not an enclosing generic",
             Some(k) => k,
             None => sname,
         };
+        if base.is_none() && self.cg.value_types.contains(&sname) {
+            return self.eval_val_lit(&sname, fields, span);
+        }
         // `Point{ ..p, x: 1 }` — start from a copy of `p` and overwrite. The
         // base is evaluated first, as it is written ([E-ORDER-LTR]).
         let sv = match base {
@@ -14954,6 +15444,32 @@ fields, not the type this is bound to, not an enclosing generic",
         name: &Ident,
         span: Span,
     ) -> CResult<Option<(Value, VType)>> {
+        // A field of a value struct is a load from its words.
+        if !self.cg.value_types.is_empty() {
+            let rt = match recv {
+                Expr::Ident(id) => self.lookup(&id.name).map(|(_, t)| t),
+                other => self.probe_type(other).ok(),
+            };
+            if let Some(VType::Val(s)) = rt {
+                let (p, _) = self.eval_expr_val(recv)?;
+                let decl = self.cg.structs.get(&s).cloned().unwrap_or_default();
+                let Some(i) = decl.iter().position(|(n, _)| *n == name.name) else {
+                    return nope(span, format!("the field `{}` of `{s}`", name.name));
+                };
+                let ft = decl[i].1.clone();
+                let flags = cranelift_codegen::ir::MemFlags::trusted();
+                let w = self.b.ins().load(types::I64, flags, p, (8 * i) as i32);
+                let v = if ft.boxed() {
+                    self.call_rt("grasm_val_inc", &[w]);
+                    w
+                } else {
+                    self.scalar_of_bits(w, &ft)
+                };
+                let pt = VType::Val(s);
+                self.dec_if_boxed(p, &pt);
+                return Ok(Some((v, ft)));
+            }
+        }
         // `Type.Variant` nullary through the field path.
         if let Expr::Ident(tid) = recv {
             if self.lookup(&tid.name).is_none()
