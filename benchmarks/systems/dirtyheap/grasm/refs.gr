@@ -1,0 +1,66 @@
+// Dirty heap, reference variant: every node is a Tier-2 `ref Node` and its
+// out-edges are references to other nodes, so the graph is shared and cyclic
+// the way a crawler's URL map is. Reclamation of `ref`s is manual
+// ([T-REF-GENERATIONAL]), so the drop is releasing every node and then letting
+// go of the list that held the roots.
+type Node = { url: str, edges: [ref Node], seen: bool }
+
+fn lcg(x: i64) -> i64 {
+    (x * 1103515245 + 12345) % 2147483648
+}
+
+fn build(n: i64) -> [ref Node] {
+    var nodes: [ref Node] = []
+    for i in 0..n {
+        nodes.push(ref(Node{ url: "https://site{i % 1000}.example/page/{i}", edges: [], seen: false }))
+    }
+    var s = 42
+    for i in 0..n {
+        s = lcg(s)
+        let deg = 1 + s % 9
+        let node = nodes[i]
+        for e in 0..deg {
+            s = lcg(s)
+            node.edges.push(nodes[s % n])
+        }
+    }
+    nodes
+}
+
+fn bfs(root: ref Node) -> (i64, i64) {
+    var queue: [ref Node] = [root]
+    root.seen = true
+    var head = 0
+    var bytes = 0
+    while head < queue.len() {
+        let v = queue[head]
+        head += 1
+        bytes += v.url.len()
+        for w in v.edges {
+            if not w.seen {
+                w.seen = true
+                queue.push(w)
+            }
+        }
+    }
+    (queue.len(), bytes)
+}
+
+fn main() {
+    let t_start = monotonic_millis()
+    let a = args()
+    let n = if a.len() > 0 { a[0].parse_int() ?? 5000000 } else { 5000000 }
+    var graph = build(n)
+    let t_built = monotonic_millis()
+    let r = bfs(graph[0])
+    print("checksum nodes={n} reachable={r.0} url_bytes={r.1}")
+    let t0 = monotonic_millis()
+    for node in graph {
+        release(node)
+    }
+    graph = []
+    let t1 = monotonic_millis()
+    print("build_ms {t_built - t_start}")
+    print("drop_ms {t1 - t0}")
+    print("total_ms {monotonic_millis() - t_start}")
+}

@@ -1,0 +1,387 @@
+// HTTP/1.1 reverse proxy subset: the Grasm entry of benchmarks/systems/proxy.
+//
+//   proxy [listen_port] [upstream_port]        (defaults 9301, 9300)
+//
+// For each client connection: read requests (keep-alive, Content-Length bodies,
+// possibly 0), find the head, insert `X-Forwarded-For: <client ip>` or append
+// `, <client ip>` to the one the client sent, forward to a keep-alive upstream
+// connection owned by that client, and relay the response bytes back unchanged,
+// parsing the response head only to learn its Content-Length.
+//
+// ## Shape
+//
+// One thread, one `net_wait` readiness loop over the listener and every live
+// socket. That is the only shape that scales in Grasm today: `spawn` does not
+// carry `net`, and a `go` task inside `concurrent` that blocks in `tcp_accept`
+// or `tcp_read` blocks every other task (they are cooperatively scheduled and
+// only yield at channel operations), so a task per connection serialises.
+//
+// Per-connection state lives in parallel lists indexed by the handle number,
+// which the runtime keeps small by reusing freed slots.
+//
+// ## Copies
+//
+// * The response path does not copy: each chunk `tcp_read_bytes` returns is
+//   handed to `tcp_write_bytes` as the same `bytes` value. Only a response
+//   head split across reads is joined (`concat`) to be scanned.
+// * The parsers (`head_end`, `scan_head`, `name_is`, `number_at`) take the
+//   buffer as a plain (lent) parameter and read it with `at`; nothing is copied
+//   to parse.
+// * The request path copies the request once into the forwarded form: `bytes`
+//   has no view type and no way to write a sub-range or several buffers in one
+//   call, so building "head, X-Forwarded-For, rest" costs two `slice` copies and
+//   two `concat` copies (the body included). Three separate writes would avoid
+//   the joins but cost two extra syscalls (accepted and dialed streams have
+//   TCP_NODELAY on, so they would not stall on Nagle).
+// * A request split across reads is joined with `concat`, and leftover bytes
+//   after a request (pipelining) are kept with `slice`.
+
+/// Everything the loop knows, indexed by socket handle.
+type State = {
+    /// 0 free, 1 client, 2 upstream.
+    kind: [i64],
+    /// The other half of the pair.
+    peer: [i64],
+    /// Client: request bytes not yet forwarded. Upstream: a response head
+    /// that has not been completely read yet.
+    pend: [bytes],
+    /// Client: 1 while a request is at the upstream.
+    busy: [i64],
+    /// Upstream: body bytes still to relay, or -1 while reading the head.
+    remain: [i64],
+    /// The wait set: the listener first, then every live socket.
+    watch: [i64],
+    /// Client: the header line inserted when the request has no
+    /// X-Forwarded-For, `X-Forwarded-For: <client ip>\r\n`.
+    xff_new: [bytes],
+    /// Client: what is appended to an X-Forwarded-For it sent, `, <client ip>`.
+    xff_add: [bytes],
+    empty: bytes,
+    cl_name: [i64],
+    xff_name: [i64],
+}
+
+fn lower(c: i64) -> i64 {
+    if c >= 65 and c <= 90 {
+        c + 32
+    } else {
+        c
+    }
+}
+
+/// Index of the CR that starts the first "\r\n\r\n", or -1 when the head is
+/// not complete yet.
+fn head_end(b: bytes) -> i64 {
+    let n = b.len()
+    var i = 0
+    while i + 3 < n {
+        if b.at(i) == 13 {
+            if b.at(i + 1) == 10 and b.at(i + 2) == 13 and b.at(i + 3) == 10 {
+                return i
+            }
+        }
+        i += 1
+    }
+    -1
+}
+
+/// Whether the header line starting at `ls` (its CR at `le`) is named `name`
+/// (lower-case codes), case-insensitively.
+fn name_is(b: bytes, ls: i64, le: i64, name: [i64]) -> bool {
+    let n = name.len()
+    if le - ls <= n {
+        return false
+    }
+    if b.at(ls + n) != 58 {
+        return false
+    }
+    var k = 0
+    while k < n {
+        if lower(b.at(ls + k)) != name[k] {
+            return false
+        }
+        k += 1
+    }
+    true
+}
+
+/// The decimal number in `b[from..to]` after optional spaces/tabs, or -1.
+fn number_at(b: bytes, from: i64, to: i64) -> i64 {
+    var i = from
+    while i < to and (b.at(i) == 32 or b.at(i) == 9) {
+        i += 1
+    }
+    var v = 0
+    var any = false
+    while i < to {
+        let c = b.at(i)
+        if c < 48 or c > 57 {
+            break
+        }
+        v = v * 10 + (c - 48)
+        any = true
+        i += 1
+    }
+    if any {
+        v
+    } else {
+        -1
+    }
+}
+
+/// What the proxy needs from a head.
+type Head = {
+    /// Index of the CR of the blank line, or -1 when incomplete.
+    end: i64,
+    /// Content-Length, 0 when absent, -1 when unreadable.
+    length: i64,
+    /// Index of the CR ending an X-Forwarded-For line, or -1 when none.
+    xff_end: i64,
+}
+
+fn scan_head(b: bytes, cl_name: [i64], xff_name: [i64]) -> Head {
+    let hend = head_end(b)
+    if hend < 0 {
+        return Head{ end: -1, length: 0, xff_end: -1 }
+    }
+    var cl = 0
+    var xff_end = -1
+    var ls = 0
+    while b.at(ls) != 13 {
+        ls += 1
+    }
+    ls += 2
+    while ls < hend + 2 {
+        var le = ls
+        while b.at(le) != 13 {
+            le += 1
+        }
+        if name_is(b, ls, le, cl_name) {
+            cl = number_at(b, ls + cl_name.len() + 1, le)
+        } else if name_is(b, ls, le, xff_name) {
+            xff_end = le
+        }
+        ls = le + 2
+    }
+    Head{ end: hend, length: cl, xff_end: xff_end }
+}
+
+/// The request as it goes upstream: one copy of `b[0..total]` with the
+/// client address spliced in.
+fn forward(b: bytes, h: Head, total: i64, xff_new: bytes, xff_add: bytes) -> bytes {
+    if h.xff_end >= 0 {
+        b.slice(0, h.xff_end).concat(xff_add).concat(b.slice(h.xff_end, total))
+    } else {
+        b.slice(0, h.end + 2).concat(xff_new).concat(b.slice(h.end + 2, total))
+    }
+}
+
+fn ensure(inout st: State, h: i64) {
+    while st.kind.len() <= h {
+        st.kind.push(0)
+        st.peer.push(-1)
+        st.pend.push(st.empty)
+        st.busy.push(0)
+        st.remain.push(-1)
+        st.xff_new.push(st.empty)
+        st.xff_add.push(st.empty)
+    }
+}
+
+fn close_pair(inout st: State, c: i64) / {net} {
+    let u = st.peer[c]
+    for h in [c, u] {
+        if h >= 0 and h < st.kind.len() and st.kind[h] != 0 {
+            net_close(h)
+            st.kind[h] = 0
+            st.pend[h] = st.empty
+            st.xff_new[h] = st.empty
+            st.xff_add[h] = st.empty
+        }
+    }
+    var kept: [i64] = []
+    for h in st.watch {
+        if h != c and h != u {
+            kept.push(h)
+        }
+    }
+    st.watch = kept
+}
+
+fn accept_one(inout st: State, listener: i64, up_port: i64) / {net} {
+    let c = tcp_accept(listener) ?? -1
+    if c < 0 {
+        return
+    }
+    // The client IP, as the Rust and Go proxies take it from the peer
+    // address. The port is not used.
+    match tcp_peer(c) {
+        Err(_gone) -> net_close(c)
+        Ok(peer) -> {
+            let (ip, _port) = peer
+            match tcp_connect("127.0.0.1", up_port) {
+                Err(_refused) -> net_close(c)
+                Ok(u) -> {
+                    ensure(st, if c > u { c } else { u })
+                    st.kind[c] = 1
+                    st.peer[c] = u
+                    st.busy[c] = 0
+                    st.pend[c] = st.empty
+                    st.xff_new[c] = "X-Forwarded-For: {ip}\r\n".to_bytes()
+                    st.xff_add[c] = ", {ip}".to_bytes()
+                    st.kind[u] = 2
+                    st.peer[u] = c
+                    st.remain[u] = -1
+                    st.pend[u] = st.empty
+                    st.watch.push(c)
+                    st.watch.push(u)
+                }
+            }
+        }
+    }
+}
+
+/// Forward the client's next complete request, if it has one and none is
+/// outstanding.
+fn dispatch(inout st: State, c: i64) / {net} {
+    if st.busy[c] != 0 or st.pend[c].is_empty() {
+        return
+    }
+    let b = st.pend[c]
+    let h = scan_head(b, st.cl_name, st.xff_name)
+    if h.end < 0 {
+        if b.len() > 65536 {
+            close_pair(st, c)
+        }
+        return
+    }
+    if h.length < 0 {
+        close_pair(st, c)
+        return
+    }
+    let total = h.end + 4 + h.length
+    if b.len() < total {
+        return
+    }
+    let out = forward(b, h, total, st.xff_new[c], st.xff_add[c])
+    match tcp_write_bytes(st.peer[c], out) {
+        Err(_gone) -> {
+            close_pair(st, c)
+            return
+        }
+        Ok(_sent) -> {}
+    }
+    st.busy[c] = 1
+    if total == b.len() {
+        st.pend[c] = st.empty
+    } else {
+        st.pend[c] = b.slice(total, b.len())
+    }
+}
+
+fn on_client(inout st: State, c: i64) / {net} {
+    let chunk = tcp_read_bytes(c) ?? st.empty
+    if chunk.is_empty() {
+        close_pair(st, c)
+        return
+    }
+    if st.pend[c].is_empty() {
+        st.pend[c] = chunk
+    } else {
+        st.pend[c] = st.pend[c].concat(chunk)
+    }
+    dispatch(st, c)
+}
+
+fn on_upstream(inout st: State, u: i64) / {net} {
+    let c = st.peer[u]
+    let chunk = tcp_read_bytes(u) ?? st.empty
+    if chunk.is_empty() {
+        close_pair(st, c)
+        return
+    }
+    // Relay first, unchanged and uncopied.
+    match tcp_write_bytes(c, chunk) {
+        Err(_gone) -> {
+            close_pair(st, c)
+            return
+        }
+        Ok(_sent) -> {}
+    }
+    var left = 0
+    if st.remain[u] < 0 {
+        let hb = if st.pend[u].is_empty() {
+            chunk
+        } else {
+            st.pend[u].concat(chunk)
+        }
+        let h = scan_head(hb, st.cl_name, st.xff_name)
+        if h.end < 0 {
+            st.pend[u] = hb
+            return
+        }
+        st.pend[u] = st.empty
+        if h.length < 0 {
+            close_pair(st, c)
+            return
+        }
+        left = h.length - (hb.len() - (h.end + 4))
+    } else {
+        left = st.remain[u] - chunk.len()
+    }
+    if left > 0 {
+        st.remain[u] = left
+        return
+    }
+    if left < 0 {
+        // More bytes than the response declared: the stream is out of step.
+        close_pair(st, c)
+        return
+    }
+    st.remain[u] = -1
+    st.busy[c] = 0
+    dispatch(st, c)
+}
+
+fn main() {
+    let a = args()
+    let port = (a.get(0) ?? "9301").parse_int() ?? 9301
+    let up_port = (a.get(1) ?? "9300").parse_int() ?? 9300
+    let listener = try tcp_listen(port)
+    var st = State{
+        kind: [],
+        peer: [],
+        pend: [],
+        busy: [],
+        remain: [],
+        watch: [listener],
+        xff_new: [],
+        xff_add: [],
+        empty: "".to_bytes(),
+        cl_name: "content-length".codes(),
+        xff_name: "x-forwarded-for".codes(),
+    }
+    print("proxy listening on 127.0.0.1:{port}, upstream 127.0.0.1:{up_port}")
+    while true {
+        let ready = try net_wait(st.watch, -1)
+        for h in ready {
+            if h == listener {
+                // Drain the accept queue rather than taking one connection
+                // per pass: `tcp_accept` blocks, so ask (with a zero
+                // timeout) before each further accept.
+                accept_one(st, listener, up_port)
+                var more = 0
+                while more < 64 and not (net_wait([listener], 0) ?? []).is_empty() {
+                    accept_one(st, listener, up_port)
+                    more += 1
+                }
+            } else if h < st.kind.len() {
+                if st.kind[h] == 1 {
+                    on_client(st, h)
+                } else if st.kind[h] == 2 {
+                    on_upstream(st, h)
+                }
+            }
+        }
+    }
+}

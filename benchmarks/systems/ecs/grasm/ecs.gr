@@ -1,0 +1,82 @@
+// ECS update loop, array-of-structs: a list of `Entity` values updated in place.
+//
+// Usage: ecs [N] [S]   (defaults N=1000000, S=100)
+// Initial values come from an integer LCG so every language starts from the
+// same bits; each step does pos += vel * dt and reflects off [-1000, 1000].
+
+type Entity = { x: f64, y: f64, z: f64, vx: f64, vy: f64, vz: f64 }
+
+fn next(s: i64) -> i64 {
+    (s * 1103515245 + 12345) % 2147483648
+}
+
+fn arg_or(xs: [str], i: i64, default: i64) -> i64 {
+    match xs.get(i) {
+        Some(s) -> s.parse_int() ?? default
+        None -> default
+    }
+}
+
+fn main() {
+    let a = args()
+    let n = arg_or(a, 0, 1000000)
+    let steps = arg_or(a, 1, 100)
+    let dt = 0.01
+
+    var s = 42
+    var es: [Entity] = []
+    for _i in 0..n {
+        s = next(s)
+        let x = (s % 2000001 - 1000000).as_f64() / 1000.0
+        s = next(s)
+        let y = (s % 2000001 - 1000000).as_f64() / 1000.0
+        s = next(s)
+        let z = (s % 2000001 - 1000000).as_f64() / 1000.0
+        s = next(s)
+        let vx = (s % 2001 - 1000).as_f64() / 10.0
+        s = next(s)
+        let vy = (s % 2001 - 1000).as_f64() / 10.0
+        s = next(s)
+        let vz = (s % 2001 - 1000).as_f64() / 10.0
+        es.push(Entity{ x: x, y: y, z: z, vx: vx, vy: vy, vz: vz })
+    }
+
+    for _step in 0..steps {
+        for i in 0..n {
+            var e = es[i]
+            e.x += e.vx * dt
+            e.y += e.vy * dt
+            e.z += e.vz * dt
+            if e.x > 1000.0 {
+                e.x = 2000.0 - e.x
+                e.vx = -e.vx
+            } else if e.x < -1000.0 {
+                e.x = -2000.0 - e.x
+                e.vx = -e.vx
+            }
+            if e.y > 1000.0 {
+                e.y = 2000.0 - e.y
+                e.vy = -e.vy
+            } else if e.y < -1000.0 {
+                e.y = -2000.0 - e.y
+                e.vy = -e.vy
+            }
+            if e.z > 1000.0 {
+                e.z = 2000.0 - e.z
+                e.vz = -e.vz
+            } else if e.z < -1000.0 {
+                e.z = -2000.0 - e.z
+                e.vz = -e.vz
+            }
+            es[i] = e
+        }
+    }
+
+    var sum = 0.0
+    var isum = 0
+    for e in es {
+        sum += e.x + e.y + e.z
+        isum += (e.x * 1000.0).floor().as_i64() + (e.y * 1000.0).floor().as_i64() + (e.z * 1000.0).floor().as_i64()
+    }
+    print("checksum {sum.to_fixed(6)} {isum}")
+}

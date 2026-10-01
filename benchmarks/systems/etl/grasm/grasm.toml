@@ -1,0 +1,8 @@
+[package]
+name = "etl"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.json]
+path = "../../../../packages/json"
+version = "^1.0.0"

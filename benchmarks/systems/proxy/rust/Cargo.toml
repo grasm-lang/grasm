@@ -1,0 +1,14 @@
+[package]
+name = "proxybench-rust"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "=1.53.1", features = ["rt-multi-thread", "net", "io-util", "macros"] }
+
+[profile.release]
+opt-level = 3
+codegen-units = 1
+lto = true
+
+[workspace]

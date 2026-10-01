@@ -1,0 +1,84 @@
+// ECS update loop, struct-of-arrays: six [f64] lists, one per component.
+//
+// Usage: ecs_soa [N] [S]   (defaults N=1000000, S=100)
+// Same algorithm, initial values and output as ecs.gr.
+
+fn next(s: i64) -> i64 {
+    (s * 1103515245 + 12345) % 2147483648
+}
+
+fn arg_or(xs: [str], i: i64, default: i64) -> i64 {
+    match xs.get(i) {
+        Some(s) -> s.parse_int() ?? default
+        None -> default
+    }
+}
+
+fn main() {
+    let a = args()
+    let n = arg_or(a, 0, 1000000)
+    let steps = arg_or(a, 1, 100)
+    let dt = 0.01
+
+    var s = 42
+    var xs: [f64] = []
+    var ys: [f64] = []
+    var zs: [f64] = []
+    var vxs: [f64] = []
+    var vys: [f64] = []
+    var vzs: [f64] = []
+    for _i in 0..n {
+        s = next(s)
+        xs.push((s % 2000001 - 1000000).as_f64() / 1000.0)
+        s = next(s)
+        ys.push((s % 2000001 - 1000000).as_f64() / 1000.0)
+        s = next(s)
+        zs.push((s % 2000001 - 1000000).as_f64() / 1000.0)
+        s = next(s)
+        vxs.push((s % 2001 - 1000).as_f64() / 10.0)
+        s = next(s)
+        vys.push((s % 2001 - 1000).as_f64() / 10.0)
+        s = next(s)
+        vzs.push((s % 2001 - 1000).as_f64() / 10.0)
+    }
+
+    for _step in 0..steps {
+        for i in 0..n {
+            var x = xs[i] + vxs[i] * dt
+            if x > 1000.0 {
+                x = 2000.0 - x
+                vxs[i] = -vxs[i]
+            } else if x < -1000.0 {
+                x = -2000.0 - x
+                vxs[i] = -vxs[i]
+            }
+            xs[i] = x
+            var y = ys[i] + vys[i] * dt
+            if y > 1000.0 {
+                y = 2000.0 - y
+                vys[i] = -vys[i]
+            } else if y < -1000.0 {
+                y = -2000.0 - y
+                vys[i] = -vys[i]
+            }
+            ys[i] = y
+            var z = zs[i] + vzs[i] * dt
+            if z > 1000.0 {
+                z = 2000.0 - z
+                vzs[i] = -vzs[i]
+            } else if z < -1000.0 {
+                z = -2000.0 - z
+                vzs[i] = -vzs[i]
+            }
+            zs[i] = z
+        }
+    }
+
+    var sum = 0.0
+    var isum = 0
+    for i in 0..n {
+        sum += xs[i] + ys[i] + zs[i]
+        isum += (xs[i] * 1000.0).floor().as_i64() + (ys[i] * 1000.0).floor().as_i64() + (zs[i] * 1000.0).floor().as_i64()
+    }
+    print("checksum {sum.to_fixed(6)} {isum}")
+}

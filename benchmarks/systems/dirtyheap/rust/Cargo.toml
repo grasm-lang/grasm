@@ -1,0 +1,17 @@
+[package]
+name = "dirtyheap"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "dirtyheap"
+path = "src/main.rs"
+
+[[bin]]
+name = "dirtyheap_rc"
+path = "src/bin/rc.rs"
+
+[profile.release]
+opt-level = 3
+
+[workspace]

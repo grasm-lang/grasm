@@ -1,0 +1,164 @@
+// Chat broadcast server: many TCP connections, grouped into channels, every
+// line a client sends delivered to every other client in its channel.
+//
+// Protocol (identical in the Grasm, Rust and Go servers):
+//   client -> server   "J <channel>\n"   once, first; the server answers "OK\n"
+//   client -> server   any other line    broadcast verbatim to the channel's
+//                                         other members
+// The server never looks inside a broadcast line.
+//
+// ## One thread, one `net_wait` loop
+//
+// `net_wait` is poll(2): one thread holds every connection, and only reads a
+// socket that already has data. This is the design that works. The other
+// shape — a `go` task per connection inside `concurrent` — compiles, but
+// task switches happen only at channel operations, and `tcp_accept`/
+// `tcp_read` block the whole thread, so one idle client would stall every
+// other task. See ../README.md.
+//
+// Per read, everything up to the last complete newline is broadcast as one
+// write per peer (the Rust and Go servers do the same), and the tail of a
+// partial line waits in that connection's buffer.
+//
+// Usage: server [port]      (default 9000; prints "listening <port>")
+
+fn last_newline(buf: bytes) -> i64 {
+    var i = buf.len() - 1
+    while i >= 0 {
+        if buf.at(i) == 10 {
+            return i
+        }
+        i = i - 1
+    }
+    return 0 - 1
+}
+
+fn first_newline(buf: bytes) -> i64 {
+    var i = 0
+    while i < buf.len() {
+        if buf.at(i) == 10 {
+            return i
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+fn without(xs: [i64], gone: i64) -> [i64] {
+    var kept: [i64] = []
+    for x in xs {
+        if x != gone {
+            kept.push(x)
+        }
+    }
+    return kept
+}
+
+fn main() {
+    let given = args()
+    var port = 9000
+    if given.len() > 0 {
+        port = given[0].parse_int() ?? 9000
+    }
+    let listener = match tcp_listen(port) {
+        Ok(h) -> h
+        Err(why) -> {
+            print("cannot listen on {port}: {why}")
+            exit(1)
+            0
+        }
+    }
+    print("listening {net_port(listener) ?? port}")
+
+    let empty = bytes_of([])
+    // Indexed by handle: handles are small reused integers.
+    var room: [i64] = []
+    var pending: [bytes] = []
+    // Indexed by channel.
+    var members: [[i64]] = []
+    var watching: [i64] = [listener]
+
+    while true {
+        let ready = net_wait(watching, 0 - 1) ?? []
+        for h in ready {
+            if h == listener {
+                // Drain the accept queue without going back through the full
+                // wait set for every connection.
+                var more = true
+                while more {
+                    match tcp_accept(listener) {
+                        Ok(c) -> {
+                            while room.len() <= c {
+                                room.push(0 - 1)
+                                pending.push(empty)
+                            }
+                            room[c] = 0 - 1
+                            pending[c] = empty
+                            watching.push(c)
+                        }
+                        Err(_e) -> {
+                            more = false
+                        }
+                    }
+                    if more {
+                        more = (net_wait([listener], 0) ?? []).len() > 0
+                    }
+                }
+                continue
+            }
+
+            let data = tcp_read_bytes(h) ?? empty
+            if data.len() == 0 {
+                // Hung up (or reset): forget it.
+                let c = room[h]
+                if c >= 0 {
+                    members[c] = without(members[c], h)
+                }
+                room[h] = 0 - 1
+                pending[h] = empty
+                watching = without(watching, h)
+                net_close(h)
+                continue
+            }
+
+            var buf = data
+            if pending[h].len() > 0 {
+                buf = pending[h].concat(data)
+            }
+            let last = last_newline(buf)
+            if last < 0 {
+                pending[h] = buf
+                continue
+            }
+            pending[h] = buf.slice(last + 1, buf.len())
+            var lines = buf.slice(0, last + 1)
+
+            if room[h] < 0 {
+                // The first line is the join.
+                let nl = first_newline(lines)
+                let words = lines.slice(0, nl).to_str().words()
+                var c = 0
+                if words.len() >= 2 {
+                    c = words[1].parse_int() ?? 0
+                }
+                while members.len() <= c {
+                    members.push([])
+                }
+                members[c].push(h)
+                room[h] = c
+                tcp_write(h, "OK\n") ?? ()
+                lines = lines.slice(nl + 1, lines.len())
+                if lines.len() == 0 {
+                    continue
+                }
+            }
+
+            let c = room[h]
+            for m in members[c] {
+                if m != h {
+                    tcp_write_bytes(m, lines) ?? ()
+                }
+            }
+        }
+    }
+}

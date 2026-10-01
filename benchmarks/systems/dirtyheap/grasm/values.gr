@@ -1,0 +1,66 @@
+// Dirty heap, value variant: the graph is an ordinary list of node structs,
+// edges are integer indices, and every node and string is reference-counted.
+// The drop is the list being reassigned — every node, URL and edge list freed
+// at once.
+type Node = { url: str, edges: [i64] }
+
+fn lcg(x: i64) -> i64 {
+    (x * 1103515245 + 12345) % 2147483648
+}
+
+fn build(n: i64) -> [Node] {
+    var nodes: [Node] = []
+    var s = 42
+    for i in 0..n {
+        s = lcg(s)
+        let deg = 1 + s % 9
+        var edges: [i64] = []
+        for e in 0..deg {
+            s = lcg(s)
+            edges.push(s % n)
+        }
+        nodes.push(Node{ url: "https://site{i % 1000}.example/page/{i}", edges: edges })
+    }
+    nodes
+}
+
+fn bfs(nodes: [Node]) -> (i64, i64) {
+    let n = nodes.len()
+    var seen: [bool] = []
+    for i in 0..n {
+        seen.push(false)
+    }
+    var queue: [i64] = [0]
+    seen[0] = true
+    var head = 0
+    var bytes = 0
+    while head < queue.len() {
+        let v = queue[head]
+        head += 1
+        let node = nodes[v]
+        bytes += node.url.len()
+        for w in node.edges {
+            if not seen[w] {
+                seen[w] = true
+                queue.push(w)
+            }
+        }
+    }
+    (queue.len(), bytes)
+}
+
+fn main() {
+    let t_start = monotonic_millis()
+    let a = args()
+    let n = if a.len() > 0 { a[0].parse_int() ?? 5000000 } else { 5000000 }
+    var graph = build(n)
+    let t_built = monotonic_millis()
+    let r = bfs(graph)
+    print("checksum nodes={n} reachable={r.0} url_bytes={r.1}")
+    let t0 = monotonic_millis()
+    graph = []
+    let t1 = monotonic_millis()
+    print("build_ms {t_built - t_start}")
+    print("drop_ms {t1 - t0}")
+    print("total_ms {monotonic_millis() - t_start}")
+}

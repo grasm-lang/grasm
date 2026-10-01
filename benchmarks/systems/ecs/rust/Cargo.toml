@@ -1,0 +1,12 @@
+[package]
+name = "systems_ecs"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+
+[profile.release]
+opt-level = 3
+
+# Standalone: not part of the repository workspace.
+[workspace]
