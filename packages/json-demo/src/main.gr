@@ -89,4 +89,30 @@ fn main() {
     print("  equal to itself -> {json.equal(built, built)}")
     print("  equal to a rebuild -> {json.equal(built, json.parse(json.render(built)) ?? json.null())}")
     print("  equal to something else -> {json.equal(built, json.number(1.0))}")
+
+    print("-- text outside the first 65,536 characters")
+    parsed("a surrogate pair", "\"\\ud83d\\ude00!\"")
+    parsed("a lone high half", "\"a\\ud83db\"")
+    parsed("a lone low half", "\"\\ude00\"")
+    parsed("a raw multi-byte character", "\"caf\u{e9} \u{1f600}\"")
+    parsed("a truncated pair", "\"\\ud83d\\ude")
+    print("  control characters round trip -> {json.render(json.text("bell " + 7.to_char() + " end"))}")
+    let back = json.parse(json.render(json.text("tab\tnul-ish " + 1.to_char()))) ?? json.null()
+    print("  and read back -> {json.as_str(back) ?? "(refused)"}")
+    parsed("a raw control character", "\"a" + 1.to_char() + "b\"")
+
+    print("-- numbers past 2^53")
+    let big = json.parse("9007199254740993") ?? json.null()
+    print("  as_int(9007199254740993) -> {json.as_int(big) ?? -1}")
+    print("  as_int(9007199254740991) -> {json.as_int(json.parse("9007199254740991") ?? json.null()) ?? -1}")
+
+    print("-- giving a document back")
+    let doc = json.parse("\{\"a\": [1, \{\"b\": 2}], \"c\": \"d\"}") ?? json.null()
+    let inner = json.path(doc, "a.1") ?? json.null()
+    json.free(doc)
+    print("  the document -> {alive(doc)}")
+    print("  a part of it -> {alive(inner)}")
+    json.free(doc)
+    print("  freed twice -> fine")
 }
+

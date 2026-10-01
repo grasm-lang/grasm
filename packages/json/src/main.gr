@@ -22,229 +22,373 @@ type Json =
 
 type JsonError = { why: str, at: i64 }
 
-type JsonReader = { cs: [str], i: i64 }
+// The reader works on the UTF-8 bytes, not on `chars()`: a list of one-letter
+// strings is an allocation per character before parsing starts, and that made
+// a 50 MB document take five seconds. Every byte the grammar cares about is
+// ASCII, and UTF-8 never uses an ASCII byte inside a longer character, so the
+// text between two of them is cut out whole and is still valid text.
+//
+// `JsonError.at` is a byte offset into the source.
+type JsonReader = { b: bytes, i: i64 }
 
-fn peek(p: JsonReader) -> str {
-    if p.i < p.cs.len() { p.cs[p.i] } else { "" }
+/// The byte at the cursor, or -1 at the end.
+fn peek(p: JsonReader) -> i64 {
+    if p.i < p.b.len() { p.b.at(p.i) } else { -1 }
+}
+
+fn shown(c: i64) -> str {
+    if c < 0 { "end of input" } else if c < 32 or c > 126 { "byte {c}" } else { "`{c.to_char()}`" }
 }
 
 fn skip_ws(inout p: JsonReader) {
-    var going = true
-    while going {
-        let c = peek(p)
-        if c == " " or c == "\n" or c == "\t" or c == "\r" {
+    while p.i < p.b.len() {
+        let c = p.b.at(p.i)
+        if c == 32 or c == 10 or c == 9 or c == 13 {
             p.i = p.i + 1
         } else {
-            going = false
+            break
         }
     }
 }
 
-fn expect(inout p: JsonReader, c: str) -> bool ! JsonError {
+fn expect(inout p: JsonReader, c: i64) -> bool ! JsonError {
     if peek(p) != c {
-        fail(JsonError{ why: "expected `{c}` but found `{peek(p)}`", at: p.i })
+        fail(JsonError{ why: "expected `{c.to_char()}` but found {shown(peek(p))}", at: p.i })
     }
     p.i = p.i + 1
     true
 }
 
+/// The literal `word` at the cursor -- `true`, `false` or `null`.
+fn expect_word(inout p: JsonReader, word: str) -> bool ! JsonError {
+    for c in word.codes() {
+        let _e = try expect(p, c)
+    }
+    true
+}
+
+/// Four hex digits after `\u`, starting at `at`.
+fn hex4(p: JsonReader, at: i64) -> i64 ! JsonError {
+    if at + 4 > p.b.len() {
+        fail(JsonError{ why: "truncated \\u escape", at: at })
+    }
+    var code = 0
+    for k in 0..4 {
+        let h = p.b.at(at + k)
+        var v = 0
+        if h >= 48 and h <= 57 { v = h - 48 }
+        else if h >= 97 and h <= 102 { v = h - 87 }
+        else if h >= 65 and h <= 70 { v = h - 55 }
+        else { fail(JsonError{ why: "bad hex digit in \\u escape", at: at + k }) }
+        code = code * 16 + v
+    }
+    code
+}
+
 fn parse_string(inout p: JsonReader) -> str ! JsonError {
-    let _ok = try expect(p, "\"")
-    var out = ""
-    var going = true
-    while going {
-        if p.i >= p.cs.len() {
+    let _ok = try expect(p, 34)
+    // Runs of plain text are cut out whole; only an escape is decoded.
+    var pieces: [str] = []
+    var run = p.i
+    while true {
+        if p.i >= p.b.len() {
             fail(JsonError{ why: "unterminated string", at: p.i })
         }
-        let c = p.cs[p.i]
-        if c == "\"" {
+        let c = p.b.at(p.i)
+        if c == 34 {
+            let tail = p.b.slice(run, p.i).to_str()
             p.i = p.i + 1
-            going = false
-        } else if c == "\\" {
-            p.i = p.i + 1
-            if p.i >= p.cs.len() {
-                fail(JsonError{ why: "unterminated escape", at: p.i })
+            // The usual string has no escape, and is the one cut.
+            if pieces.is_empty() {
+                return tail
             }
-            let e = p.cs[p.i]
-            if e == "n" { out = out + "\n" }
-            else if e == "t" { out = out + "\t" }
-            else if e == "r" { out = out + "\r" }
-            else if e == "\"" { out = out + "\"" }
-            else if e == "\\" { out = out + "\\" }
-            else if e == "/" { out = out + "/" }
-            else if e == "u" {
-                // \uXXXX. Only the BMP, and only as a code point — enough to
-                // prove the four hex digits are read and converted.
-                var code = 0
-                for k in 1..5 {
-                    if p.i + k >= p.cs.len() {
-                        fail(JsonError{ why: "truncated \\u escape", at: p.i })
-                    }
-                    let h = p.cs[p.i + k].code_at(0)
-                    var v = 0
-                    if h >= 48 and h <= 57 { v = h - 48 }
-                    else if h >= 97 and h <= 102 { v = h - 87 }
-                    else if h >= 65 and h <= 70 { v = h - 55 }
-                    else { fail(JsonError{ why: "bad hex digit in \\u escape", at: p.i + k }) }
-                    code = code * 16 + v
-                }
-                out = out + code.to_char()
-                p.i = p.i + 4
-            }
-            else { fail(JsonError{ why: "unknown escape `\\{e}`", at: p.i }) }
-            p.i = p.i + 1
-        } else {
-            out = out + c
-            p.i = p.i + 1
+            pieces.push(tail)
+            break
         }
+        if c < 32 {
+            fail(JsonError{ why: "unescaped control character in a string", at: p.i })
+        }
+        if c != 92 {
+            p.i = p.i + 1
+            continue
+        }
+        pieces.push(p.b.slice(run, p.i).to_str())
+        p.i = p.i + 1
+        if p.i >= p.b.len() {
+            fail(JsonError{ why: "unterminated escape", at: p.i })
+        }
+        let e = p.b.at(p.i)
+        if e == 110 { pieces.push("\n") }
+        else if e == 116 { pieces.push("\t") }
+        else if e == 114 { pieces.push("\r") }
+        else if e == 98 { pieces.push(8.to_char()) }
+        else if e == 102 { pieces.push(12.to_char()) }
+        else if e == 34 { pieces.push("\"") }
+        else if e == 92 { pieces.push("\\") }
+        else if e == 47 { pieces.push("/") }
+        else if e == 117 {
+            var code = try hex4(p, p.i + 1)
+            p.i = p.i + 4
+            // A character outside the first 65,536 is written as two escapes,
+            // a high surrogate then a low one, and is one character: an emoji
+            // is `😀`. Read one at a time, the first half is not a
+            // character at all and converting it panicked. A half with no
+            // partner is replaced by U+FFFD, as a decoder of UTF-16 does,
+            // rather than refusing a document over one bad character.
+            if code >= 55296 and code <= 56319 {
+                let pair = p.i + 2 < p.b.len() and p.b.at(p.i + 1) == 92 and
+                p.b.at(p.i + 2) == 117
+                let lo = if pair {
+                    try hex4(p, p.i + 3)
+                } else {
+                    -1
+                }
+                if lo >= 56320 and lo <= 57343 {
+                    code = 65536 + (code - 55296) * 1024 + (lo - 56320)
+                    p.i = p.i + 6
+                } else {
+                    code = 65533
+                }
+            } else if code >= 56320 and code <= 57343 {
+                code = 65533
+            }
+            pieces.push(code.to_char())
+        }
+        else { fail(JsonError{ why: "unknown escape `\\{e.to_char()}`", at: p.i }) }
+        p.i = p.i + 1
+        run = p.i
     }
-    out
+    pieces.join("")
+}
+
+fn is_digit(c: i64) -> bool {
+    c >= 48 and c <= 57
 }
 
 fn parse_number(inout p: JsonReader) -> f64 ! JsonError {
     let start = p.i
-    if peek(p) == "-" {
+    if peek(p) == 45 {
         p.i = p.i + 1
     }
     var digits = 0
-    var going = true
-    while going {
-        let c = peek(p)
-        let code = if c == "" { 0 } else { c.code_at(0) }
-        if (code >= 48 and code <= 57) or c == "." or c == "e" or c == "E" {
-            if code >= 48 and code <= 57 {
-                digits = digits + 1
-            }
+    while p.i < p.b.len() {
+        let c = p.b.at(p.i)
+        if is_digit(c) {
+            digits = digits + 1
             p.i = p.i + 1
-        } else if (c == "+" or c == "-") and p.i > start {
-            let prev = p.cs[p.i - 1]
-            if prev == "e" or prev == "E" {
+        } else if c == 46 or c == 101 or c == 69 {
+            p.i = p.i + 1
+        } else if (c == 43 or c == 45) and p.i > start {
+            let prev = p.b.at(p.i - 1)
+            if prev == 101 or prev == 69 {
                 p.i = p.i + 1
             } else {
-                going = false
+                break
             }
         } else {
-            going = false
+            break
         }
     }
     if digits == 0 {
         fail(JsonError{ why: "expected a number", at: start })
     }
-    var text = ""
-    for k in start..p.i {
-        text = text + p.cs[k]
-    }
+    let text = p.b.slice(start, p.i).to_str()
     match text.parse_float() {
         Some(v) -> v
         None -> fail(JsonError{ why: "`{text}` is not a number", at: start })
     }
 }
 
+/// Gives back what a parse that failed part-way had already built.
+fn free_all(vs: [ref Json]) {
+    for v in vs {
+        free(v)
+    }
+}
+
 fn parse_value(inout p: JsonReader) -> ref Json ! JsonError {
     skip_ws(p)
     let c = peek(p)
-    if c == "" {
+    if c < 0 {
         fail(JsonError{ why: "unexpected end of input", at: p.i })
     }
-    if c == "\{" {
+    // A failure part-way through a list or an object releases the members
+    // already read: they are references ([T-REF-GENERATIONAL]), and nothing
+    // reaches them once the parse has failed, so nobody else could.
+    if c == 123 {
         p.i = p.i + 1
         var keys: [str] = []
         var values: [ref Json] = []
         skip_ws(p)
-        if peek(p) == "\}" {
+        if peek(p) == 125 {
             p.i = p.i + 1
             return ref(JObj(keys, values))
         }
         var going = true
         while going {
             skip_ws(p)
-            let k = try parse_string(p)
+            let k = match parse_string(p) {
+                Ok(s) -> s
+                Err(e) -> {
+                    free_all(values)
+                    fail(e)
+                }
+            }
             skip_ws(p)
-            let _c = try expect(p, ":")
-            let v = try parse_value(p)
+            if peek(p) != 58 {
+                free_all(values)
+                fail(JsonError{ why: "expected `:` but found {shown(peek(p))}", at: p.i })
+            }
+            p.i = p.i + 1
+            let v = match parse_value(p) {
+                Ok(v) -> v
+                Err(e) -> {
+                    free_all(values)
+                    fail(e)
+                }
+            }
             keys.push(k)
             values.push(v)
             skip_ws(p)
-            if peek(p) == "," {
+            if peek(p) == 44 {
                 p.i = p.i + 1
             } else {
                 going = false
             }
         }
         skip_ws(p)
-        let _e = try expect(p, "\}")
+        if peek(p) != 125 {
+            free_all(values)
+            fail(JsonError{ why: "expected `\}` but found {shown(peek(p))}", at: p.i })
+        }
+        p.i = p.i + 1
         return ref(JObj(keys, values))
     }
-    if c == "[" {
+    if c == 91 {
         p.i = p.i + 1
         var items: [ref Json] = []
         skip_ws(p)
-        if peek(p) == "]" {
+        if peek(p) == 93 {
             p.i = p.i + 1
             return ref(JList(items))
         }
         var going = true
         while going {
-            let v = try parse_value(p)
+            let v = match parse_value(p) {
+                Ok(v) -> v
+                Err(e) -> {
+                    free_all(items)
+                    fail(e)
+                }
+            }
             items.push(v)
             skip_ws(p)
-            if peek(p) == "," {
+            if peek(p) == 44 {
                 p.i = p.i + 1
             } else {
                 going = false
             }
         }
         skip_ws(p)
-        let _e = try expect(p, "]")
+        if peek(p) != 93 {
+            free_all(items)
+            fail(JsonError{ why: "expected `]` but found {shown(peek(p))}", at: p.i })
+        }
+        p.i = p.i + 1
         return ref(JList(items))
     }
-    if c == "\"" {
+    if c == 34 {
         let s = try parse_string(p)
         return ref(JStr(s))
     }
-    if c == "t" {
-        for ch in "true".chars() {
-            let _e = try expect(p, ch)
-        }
+    if c == 116 {
+        let _e = try expect_word(p, "true")
         return ref(JBool(true))
     }
-    if c == "f" {
-        for ch in "false".chars() {
-            let _e = try expect(p, ch)
-        }
+    if c == 102 {
+        let _e = try expect_word(p, "false")
         return ref(JBool(false))
     }
-    if c == "n" {
-        for ch in "null".chars() {
-            let _e = try expect(p, ch)
-        }
+    if c == 110 {
+        let _e = try expect_word(p, "null")
         return ref(JNull)
     }
     let n = try parse_number(p)
     ref(JNum(n))
 }
 
+/// A document, from its text.
+///
+/// A parsed document is references, and references are given back by the
+/// program rather than collected ([T-REF-GENERATIONAL]): call `free` on the
+/// document when done with it, or every parse holds its memory until the
+/// program exits. A parse that fails gives back whatever it had built.
 pub fn parse(src: str) -> ref Json ! JsonError {
-    var p = JsonReader{ cs: src.chars(), i: 0 }
+    var p = JsonReader{ b: src.to_bytes(), i: 0 }
     let v = try parse_value(p)
     skip_ws(p)
-    if p.i < p.cs.len() {
+    if p.i < p.b.len() {
+        free(v)
         fail(JsonError{ why: "trailing input after the value", at: p.i })
     }
     v
 }
 
-pub fn escape(s: str) -> str {
-    var out = ""
-    for c in s.chars() {
-        if c == "\"" { out = out + "\\\"" }
-        else if c == "\\" { out = out + "\\\\" }
-        else if c == "\n" { out = out + "\\n" }
-        else if c == "\t" { out = out + "\\t" }
-        else if c == "\r" { out = out + "\\r" }
-        else { out = out + c }
+/// Gives back a document and everything in it. Reading it afterwards panics
+/// ([T-REF-STALE]) rather than reading freed memory -- so free a document only
+/// once nothing still uses it, including a document built from parts of it
+/// with `with_key` or `with_item`, which shares those parts.
+pub fn free(v: ref Json) {
+    if not alive(v) {
+        return
     }
-    out
+    match v {
+        JList(items) -> free_all(items)
+        JObj(keys, values) -> free_all(values)
+        _ -> {}
+    }
+    release(v)
+}
+
+fn hex_digit(d: i64) -> str {
+    if d < 10 { (48 + d).to_char() } else { (87 + d).to_char() }
+}
+
+/// The text of `s` as a JSON string body. Control characters are escaped too:
+/// a raw one is not allowed inside a JSON string, so writing one out produced
+/// a document no parser -- this one included -- would read back.
+pub fn escape(s: str) -> str {
+    let b = s.to_bytes()
+    var plain = true
+    for i in 0..b.len() {
+        let c = b.at(i)
+        if c < 32 or c == 34 or c == 92 {
+            plain = false
+            break
+        }
+    }
+    if plain {
+        return s
+    }
+    var pieces: [str] = []
+    var run = 0
+    for i in 0..b.len() {
+        let c = b.at(i)
+        if c < 32 or c == 34 or c == 92 {
+            pieces.push(b.slice(run, i).to_str())
+            run = i + 1
+            if c == 34 { pieces.push("\\\"") }
+            else if c == 92 { pieces.push("\\\\") }
+            else if c == 10 { pieces.push("\\n") }
+            else if c == 9 { pieces.push("\\t") }
+            else if c == 13 { pieces.push("\\r") }
+            else {
+                pieces.push("\\u00" + hex_digit(c / 16) + hex_digit(c % 16))
+            }
+        }
+    }
+    pieces.push(b.slice(run, b.len()).to_str())
+    pieces.join("")
 }
 
 /// A number that is a whole value prints without its `.0`, which is what makes
@@ -432,10 +576,15 @@ pub fn as_num(v: ref Json) -> Option[f64] {
 /// A number that is a whole value, as an `i64`. `1.5` is `None` rather than
 /// `1`: JSON has one number type and silently truncating is how a quantity
 /// becomes a different quantity.
+///
+/// Numbers are held as `f64`, as JavaScript holds them, so a whole number of
+/// 2^53 or more may not be the one the document wrote: `9007199254740993`
+/// reads as `...992`. Past 2^53 - 1, the largest JavaScript calls safe, the
+/// answer is `None` too, for the same reason.
 pub fn as_int(v: ref Json) -> Option[i64] {
     match v {
         JNum(n) -> {
-            if n != n.as_i64().as_f64() {
+            if n != n.as_i64().as_f64() or n.abs() > 9007199254740991.0 {
                 return None
             }
             Some(n.as_i64())
