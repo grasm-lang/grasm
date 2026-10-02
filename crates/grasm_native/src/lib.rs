@@ -374,19 +374,19 @@ fn compile_object_scoped(
         if std::env::var("GRASM_VALUES_REPORT").is_ok() {
             eprintln!("value structs: {}", ok.iter().cloned().collect::<Vec<_>>().join(", "));
         }
-        cg.value_types = ok.into_iter().collect();
-        // Inline fields, named one at a time while the codegen for them is
-        // being measured: `GRASM_INLINE=Node.kids,Node.url`. The analysis
-        // that chooses them is the next stage (docs/values.md).
-        if let Ok(list) = std::env::var("GRASM_INLINE") {
-            for item in list.split(',').filter(|x| !x.is_empty()) {
-                if let Some((t, f)) = item.split_once('.') {
-                    if cg.value_types.contains(t) {
-                        cg.inline_fields.insert((t.to_string(), f.to_string()));
-                    }
-                }
+        // Which of their fields are held inline rather than in a box of
+        // their own. `GRASM_NO_INLINE=1` keeps every field a pointer, so the
+        // same program can be built both ways and timed against itself.
+        if !std::env::var("GRASM_NO_INLINE").is_ok_and(|v| v == "1") {
+            let fields = values::inline_fields(&modules, &cg.resolved_types, &ok);
+            if std::env::var("GRASM_INLINE_REPORT").is_ok() {
+                let shown: Vec<String> =
+                    fields.iter().map(|(t, f)| format!("{t}.{f}")).collect();
+                eprintln!("inline fields: {}", shown.join(", "));
             }
+            cg.inline_fields = fields.into_iter().collect();
         }
+        cg.value_types = ok.into_iter().collect();
     }
     cg.only_module = only_module.map(str::to_string);
     cg.declare_runtime()?;
