@@ -3460,9 +3460,10 @@ operation's",
         let field_ids: Vec<cranelift_module::DataId> =
             fields.iter().map(|f| self.intern_string(f)).collect();
 
-        // A (pointer, length, kind) triple per field: see `StructDesc` in the
-        // runtime, which reads this layout.
-        let size = 32 + fields.len() * 24;
+        // A (pointer, length, kind) triple per field, then one auxiliary word
+        // per field (an inline list of values' element descriptor, else 0):
+        // see `StructDesc` in the runtime, which reads this layout.
+        let size = 32 + fields.len() * 32;
         let mut bytes = vec![0u8; size];
         // Little-endian: the backend targets the host, and every target it can
         // reach is little-endian.
