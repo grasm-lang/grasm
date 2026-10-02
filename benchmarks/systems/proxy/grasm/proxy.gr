@@ -1,6 +1,6 @@
 // HTTP/1.1 reverse proxy subset: the Grasm entry of benchmarks/systems/proxy.
 //
-//   proxy [listen_port] [upstream_port] [workers]   (defaults 9301, 9300, 8)
+//   proxy [listen_port] [upstream_port] [workers]   (defaults 9301, 9300, 32)
 //
 // For each client connection: read requests (keep-alive, Content-Length bodies,
 // possibly 0), find the head, insert `X-Forwarded-For: <client ip>` or append
@@ -393,7 +393,7 @@ fn main() {
     let a = args()
     let port = (a.get(0) ?? "9301").parse_int() ?? 9301
     let up_port = (a.get(1) ?? "9300").parse_int() ?? 9300
-    let workers = (a.get(2) ?? "8").parse_int() ?? 8
+    let workers = (a.get(2) ?? "32").parse_int() ?? 32
     let listener = try tcp_listen(port)
     print("proxy listening on 127.0.0.1:{port}, upstream 127.0.0.1:{up_port}, {workers} workers")
     let done = net_workers(workers, |w| serve(listener, up_port))

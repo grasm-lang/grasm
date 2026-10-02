@@ -11,7 +11,7 @@ without copying the body.
 |---|---|
 | `upstream/` | Go `net/http` keep-alive server, shared by every run. Returns a fixed body (`-size`, default 4096). Echoes the `X-Forwarded-For` it received (`X-Echo-Xff`), how many such headers it got (`X-Echo-Xff-Count`) and the request body length (`X-Echo-Len`). |
 | `loadgen/` | Go raw-socket client: `-c` keep-alive connections (256), `-n` requests (200,000). Checks every response for status 200, body length, `X-Forwarded-For` exactly as expected and exactly once, and the request body length. Reports requests/s, p50/p99/p999 latency, and the proxy's peak RSS from `ps -o rss=` every 100 ms. |
-| `grasm/proxy.gr` | `net_workers` threads (8 by default), each running a `net_wait` readiness loop over the shared listener and its own clients. |
+| `grasm/proxy.gr` | `net_workers` threads (32 by default), each running a `net_wait` readiness loop over the shared listener and its own clients. |
 | `rust/` | tokio (1.53.1) with one task per client. |
 | `go/` | Raw `net.Conn` with one goroutine per client. It does not use `httputil.ReverseProxy`. |
 
@@ -37,7 +37,9 @@ CONNS=64 REQS=20000 PROXIES="grasm go" ./run.sh
 
 `build.sh` (which both scripts call) builds everything into `$BUILD_DIR`. The default is `$TMPDIR/proxybench-build`. It compiles the Grasm proxy with `$GRASM`, which defaults to `target/release/grasm` at the repository root. Rust builds offline into `$CARGO_TARGET_DIR`. The scripts use ports `$PORT_BASE` and `$PORT_BASE+1` (default 23300 and 23301).
 
-**Parallelism.** Rust (tokio multi-thread) and Go use every core. The Grasm proxy runs `net_workers(n, f)` ([L-LIB-NET-WORKERS]): `n` OS threads, each running the readiness loop. The third argument sets `n` (`proxy 9301 9300 4`); the default is 8.
+**Parallelism.** Rust (tokio multi-thread) and Go use every core. The Grasm proxy runs `net_workers(n, f)` ([L-LIB-NET-WORKERS]): `n` OS threads, each running the readiness loop. The third argument sets `n` (`proxy 9301 9300 4`); the default is 32.
+- Why 32 on an 8-core machine: a client stays on the worker that accepted it, so when the OS pauses a worker, every client it holds waits. Tokio moves runnable tasks to idle threads; Grasm workers share nothing but the listener and cannot. With the load generator and the upstream also on the machine, 8 workers of 32 clients each put p99 at 22–32 ms against Rust's 11–14 ms at the same requests/s; 32 workers of about 8 clients each put it at 14–18 ms, with requests/s unchanged (51–60k for all three, load 3–11, 2026-10-02). The remaining tail gap is this, not the per-request work.
+- On macOS `net_wait` keeps one kqueue per thread with the wait set registered, and changes only what differs between calls, so a wait costs what is ready rather than what is open. With `poll` it cost 1.4x Rust's CPU per request in system time alone.
 - All workers wait on the one listener. A new client wakes several of them, and they all call `tcp_accept`. One gets the connection. For the others, `tcp_accept` returns an error instead of waiting, because an accept right after `net_wait` reported the listener ready never waits. Each worker accepts one client per wake-up, so a burst of clients is spread across workers.
 - A client and its upstream connection stay on the worker that accepted the client. Workers share nothing else: the checker allows the worker function only the `net` effect, and no `ref` or actor handle from outside.
 - Handles are process-wide. The runtime's socket table is one locked table, and no lock is held during blocking I/O.
