@@ -130,3 +130,18 @@ field a box, exactly as today.
    difftest, leakcheck and usecheck agreeing across the corpus, and
    `GRASM_INLINE_LISTS=0` gated too.
 4. Strings: the same for `str` fields, which is what `dirtyheap` needs.
+
+**Decided 2026-10-02: build it, lists and strings, for `dirtyheap`.** Scope of
+the first version, chosen so that what is allowed is a property of the
+program and not of one benchmark:
+
+- Kinds: an inline `[i64]`/`[f64]` field, an inline list of value structs,
+  and an inline `str` field -- three words each (address, length, capacity).
+- A field is inline when every use of it in the program is a `for` over it,
+  `len`/`byte_len`, an index read, interpolation into a string, `==` with a
+  string, or the struct literal that fills it. The literal *absorbs* any list
+  or string: it takes the buffer when it holds the only reference and copies
+  otherwise. Every other use keeps the field a box, as today.
+- Copying a value with an inline field copies the buffer (value semantics);
+  dropping it frees the buffer and whatever its elements own.
+- The interpreter is unchanged: it is the reference these are diffed against.
