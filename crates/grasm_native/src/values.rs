@@ -427,3 +427,254 @@ fn type_text(te: &TypeExpr) -> String {
         other => format!("{other:?}"),
     }
 }
+
+/// Which fields of value-eligible structs may be stored inline: a `str` or a
+/// list of scalars that the program only ever reads (docs/values.md).
+///
+/// Measured before it was written: a *list of values* stored inline costs
+/// more than it saves, because a node's release becomes a runtime call where
+/// it was one decrement (`tree` 20.6 -> 27.4 ms), while a string and a list
+/// of scalars pay for themselves (`dirtyheap` 3067 -> 1788 ms). So those two
+/// are the candidates and a list of values is not.
+///
+/// Conservative in the same way as `eligible`: a use this file does not
+/// recognise keeps the field a box.
+pub fn inline_fields(
+    modules: &[&Module],
+    types: &HashMap<(u32, u32), String>,
+    value_types: &BTreeSet<String>,
+) -> BTreeSet<(String, String)> {
+    let mut candidates: BTreeSet<(String, String)> = BTreeSet::new();
+    for m in modules {
+        for d in &m.decls {
+            let Decl::Type(t) = d else { continue };
+            if !value_types.contains(&t.name.name) {
+                continue;
+            }
+            let TypeBody::Struct(fields) = &t.body else {
+                continue;
+            };
+            for f in fields {
+                if inlinable_type(&type_text(&f.ty)) {
+                    candidates.insert((t.name.name.clone(), f.name.name.clone()));
+                }
+            }
+        }
+    }
+    if candidates.is_empty() {
+        return candidates;
+    }
+    let mut w = Fields {
+        candidates: candidates.clone(),
+        types,
+        bad: HashSet::new(),
+    };
+    for m in modules {
+        for d in &m.decls {
+            if let Decl::Fn(f) = d {
+                w.block(&f.body);
+            }
+        }
+    }
+    candidates.retain(|c| !w.bad.contains(c));
+    candidates
+}
+
+/// A field type that can be held inline: text, or a list of scalars.
+fn inlinable_type(text: &str) -> bool {
+    matches!(text, "str" | "[i64]" | "[f64]" | "[bool]")
+}
+
+struct Fields<'a> {
+    candidates: BTreeSet<(String, String)>,
+    types: &'a HashMap<(u32, u32), String>,
+    bad: HashSet<(String, String)>,
+}
+
+impl Fields<'_> {
+    /// The `(type, field)` this expression reads, when it is a field access
+    /// of a candidate.
+    fn named(&self, e: &Expr) -> Option<(String, String)> {
+        let Expr::Field { recv, name, .. } = e else {
+            return None;
+        };
+        let t = self.types.get(&(recv.span().start, recv.span().end))?;
+        let pair = (t.clone(), name.name.clone());
+        self.candidates.contains(&pair).then_some(pair)
+    }
+
+    /// Whether `e` is a candidate field whose declared type is text.
+    fn is_str_field(&self, e: &Expr) -> bool {
+        self.named(e)
+            .is_some_and(|_| self.types.get(&(e.span().start, e.span().end)).is_some_and(|t| t == "str"))
+    }
+
+    fn ban(&mut self, e: &Expr) {
+        if let Some(p) = self.named(e) {
+            self.bad.insert(p);
+        }
+    }
+
+    /// An expression in a position that does not allow an inline field: any
+    /// candidate it reads directly stops being one.
+    fn expr(&mut self, e: &Expr) {
+        self.ban(e);
+        match e {
+            Expr::Int(..) | Expr::Float(..) | Expr::Bool(..) | Expr::Ident(_) => {}
+            Expr::Str(pieces, _) => {
+                for p in pieces {
+                    if let StrPiece::Expr(x) = p {
+                        // Text written into a string is read, not kept.
+                        if self.is_str_field(x) {
+                            self.inner(x);
+                        } else {
+                            self.expr(x);
+                        }
+                    }
+                }
+            }
+            Expr::List(items, _) | Expr::Tuple(items, _) => {
+                for x in items {
+                    self.expr(x);
+                }
+            }
+            Expr::Map(entries, _) => {
+                for (k, v) in entries {
+                    self.expr(k);
+                    self.expr(v);
+                }
+            }
+            Expr::StructLit { base, fields, .. } => {
+                if let Some(b) = base {
+                    self.expr(b);
+                }
+                for (_, v) in fields {
+                    self.expr(v);
+                }
+            }
+            Expr::Call { callee, args, .. } => {
+                self.expr(callee);
+                for a in args {
+                    self.expr(a);
+                }
+            }
+            Expr::MethodCall {
+                recv, name, args, ..
+            } => {
+                // `x.f.len()`, `x.f.byte_len()`, `x.f.is_empty()` are answered
+                // from the field's own words.
+                let counted = args.is_empty()
+                    && matches!(name.name.as_str(), "len" | "byte_len" | "is_empty")
+                    && self.named(recv).is_some();
+                if counted {
+                    self.inner(recv);
+                } else {
+                    self.expr(recv);
+                }
+                for a in args {
+                    self.expr(a);
+                }
+            }
+            Expr::Field { recv, .. } => self.expr(recv),
+            Expr::Index { recv, index, .. } => {
+                // `x.f[i]` reads one element where it is.
+                if self.named(recv).is_some() {
+                    self.inner(recv);
+                } else {
+                    self.expr(recv);
+                }
+                self.expr(index);
+            }
+            Expr::Unary { expr, .. } => self.expr(expr),
+            Expr::Binary { op, lhs, rhs, .. } => {
+                // Comparing text reads it.
+                let cmp = matches!(op, grasm_syntax::ast::BinaryOp::Eq | grasm_syntax::ast::BinaryOp::NotEq);
+                for side in [lhs, rhs] {
+                    if cmp && self.is_str_field(side) {
+                        self.inner(side);
+                    } else {
+                        self.expr(side);
+                    }
+                }
+            }
+            Expr::Range { start, end, .. } => {
+                self.expr(start);
+                self.expr(end);
+            }
+            Expr::If {
+                cond,
+                then_block,
+                else_branch,
+                ..
+            } => {
+                self.expr(cond);
+                self.block(then_block);
+                match else_branch.as_deref() {
+                    Some(ElseBranch::Else(b)) => self.block(b),
+                    Some(ElseBranch::ElseIf(x)) => self.expr(x),
+                    None => {}
+                }
+            }
+            Expr::Match {
+                scrutinee, arms, ..
+            } => {
+                self.expr(scrutinee);
+                for a in arms {
+                    if let Some(g) = &a.guard {
+                        self.expr(g);
+                    }
+                    self.expr(&a.body);
+                }
+            }
+            Expr::Block(b) | Expr::Region(b) | Expr::Unsafe(b) => self.block(b),
+            Expr::Try { expr, .. } => self.expr(expr),
+            Expr::Closure { body, .. } => self.expr(body),
+        }
+    }
+
+    /// The receiver of an allowed read: `x` in `x.f.len()`. The field itself
+    /// is not banned, but whatever the value came from still is walked.
+    fn inner(&mut self, e: &Expr) {
+        if let Expr::Field { recv, .. } = e {
+            self.expr(recv);
+        }
+    }
+
+    fn block(&mut self, b: &Block) {
+        for s in &b.stmts {
+            match s {
+                Stmt::Let { init, .. } | Stmt::LetTuple { init, .. } => self.expr(init),
+                Stmt::Assign { target, value, .. } => {
+                    // Writing a field, or through one, keeps it a box: only
+                    // the literal that builds the value fills an inline field.
+                    self.expr(target);
+                    if let Expr::Index { recv, .. } = target {
+                        self.ban(recv);
+                    }
+                    self.expr(value);
+                }
+                Stmt::Expr(e) | Stmt::Return(Some(e), _) => self.expr(e),
+                Stmt::Return(None, _) => {}
+                Stmt::While { cond, body, .. } => {
+                    self.expr(cond);
+                    self.block(body);
+                }
+                Stmt::For { iter, body, .. } => {
+                    // `for x in v.f` walks the field's own buffer.
+                    if self.named(iter).is_some() {
+                        self.inner(iter);
+                    } else {
+                        self.expr(iter);
+                    }
+                    self.block(body);
+                }
+                Stmt::Spawn { body, .. } | Stmt::Parallel { body, .. } => self.block(body),
+                Stmt::With { handler, body, .. } => {
+                    self.expr(handler);
+                    self.block(body);
+                }
+                Stmt::Break(_) | Stmt::Continue(_) => {}
+            }
+        }
+    }
+}

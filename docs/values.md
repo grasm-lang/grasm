@@ -145,3 +145,27 @@ program and not of one benchmark:
 - Copying a value with an inline field copies the buffer (value semantics);
   dropping it frees the buffer and whatever its elements own.
 - The interpreter is unchanged: it is the reference these are diffed against.
+
+### Measured, and what shipped (2026-10-02)
+
+Built behind a switch and measured before the analysis was written:
+
+| program | boxed fields | inline fields |
+|---|---|---|
+| `dirtyheap`, 5,000,000 nodes | 3067 ms, 1128 MB | **1788 ms, 753 MB** |
+| `dirtyheap`, 2,000,000 nodes, interleaved | 1137-1230 ms | **713-716 ms** |
+| `tree` (`kids: [Node]` inline) | 20.6 ms | 27.4 ms |
+
+So a string and a list of scalars pay for themselves, and a list of *values*
+does not: a node's release becomes a runtime call where it was one inlined
+decrement, which costs more than the list box it removes. The analysis
+therefore offers a field inline when it is a `str` or a list of scalars and
+every use of it is a read -- `len`, `byte_len`, `is_empty`, a `for`, an index,
+interpolation, a comparison -- with the struct literal the only thing that
+fills it. `GRASM_NO_INLINE=1` keeps every field a pointer; `GRASM_INLINE_REPORT=1`
+prints what was chosen.
+
+`dirtyheap` now uses **less memory than Rust's arena** (753 MB against 789)
+and is 1.67x its time, from 2.6x. The remaining gap is the build: the URL is
+made as a string value and then copied into the field, where Rust formats it
+straight into place.

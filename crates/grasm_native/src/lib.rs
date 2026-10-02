@@ -374,6 +374,18 @@ fn compile_object_scoped(
         if std::env::var("GRASM_VALUES_REPORT").is_ok() {
             eprintln!("value structs: {}", ok.iter().cloned().collect::<Vec<_>>().join(", "));
         }
+        // Which of their fields are held inline rather than in a box of
+        // their own. `GRASM_NO_INLINE=1` keeps every field a pointer, so the
+        // same program can be built both ways and timed against itself.
+        if !std::env::var("GRASM_NO_INLINE").is_ok_and(|v| v == "1") {
+            let fields = values::inline_fields(&modules, &cg.resolved_types, &ok);
+            if std::env::var("GRASM_INLINE_REPORT").is_ok() {
+                let shown: Vec<String> =
+                    fields.iter().map(|(t, f)| format!("{t}.{f}")).collect();
+                eprintln!("inline fields: {}", shown.join(", "));
+            }
+            cg.inline_fields = fields.into_iter().collect();
+        }
         cg.value_types = ok.into_iter().collect();
     }
     cg.only_module = only_module.map(str::to_string);
@@ -560,6 +572,10 @@ struct Codegen<'m> {
     /// Struct types compiled as values (docs/values.md); empty under
     /// `GRASM_VALUES=0`.
     value_types: std::collections::HashSet<String>,
+    /// `(type, field)` pairs whose list or string field is stored inline --
+    /// the `Vec`'s three words among the struct's own -- rather than as a
+    /// pointer to a box of its own (docs/values.md).
+    inline_fields: std::collections::HashSet<(String, String)>,
     /// Spans that a *synthesised* expression reuses.
     ///
     /// `xs.par_map(square)` is lowered as `xs.par_map(|__par_arg|
@@ -715,6 +731,7 @@ impl<'m> Codegen<'m> {
             generic_variant_owner: HashMap::new(),
             resolved_types: HashMap::new(),
             value_types: std::collections::HashSet::new(),
+            inline_fields: std::collections::HashSet::new(),
             synthesised_spans: std::cell::RefCell::new(std::collections::HashSet::new()),
             probe_hits: std::cell::Cell::new(0),
             probe_misses: std::cell::Cell::new(0),
@@ -791,6 +808,11 @@ impl<'m> Codegen<'m> {
             ("grasm_stack_check", vec![i64t], None),
             ("grasm_stack_floor", vec![i64t], Some(i64t)),
             ("grasm_panic_stack", vec![], None),
+            ("grasm_val_release", vec![i64t, i64t], None),
+            ("grasm_val_dup", vec![i64t, i64t], None),
+            ("grasm_inline_absorb_list", vec![i64t, i64t], None),
+            ("grasm_inline_absorb_str", vec![i64t, i64t], None),
+            ("grasm_inline_str_box", vec![i64t, i64t], Some(i64t)),
             ("grasm_str_from_i64", vec![i64t], Some(i64t)),
             ("grasm_str_from_f64", vec![f64t], Some(i64t)),
             ("grasm_str_from_bool", vec![i8t], Some(i64t)),
@@ -3444,25 +3466,35 @@ operation's",
     /// a pointer and a length per field. The pointers are relocations, so the
     /// text itself is the same interned bytes every other mention of that name
     /// uses.
-    fn struct_desc(
+    /// The key a descriptor is remembered by. The kinds are part of it:
+    /// `Pair[i64, str]` and `Pair[str, i64]` share a name and field names and
+    /// store their fields differently.
+    fn desc_key(name: &str, fields: &[String], kinds: &[u8]) -> String {
+        format!("{name}\u{0}{}\u{0}{kinds:?}", fields.join("\u{0}"))
+    }
+
+    /// The descriptor `id` stands for, written out. `elem_ids` holds, for
+    /// each inline list of values, the descriptor of its element type.
+    ///
+    /// The id is reserved and remembered by the caller *before* this is
+    /// called, because a type may hold an inline list of itself and this
+    /// writes a relocation to that same descriptor.
+    fn define_struct_desc(
         &mut self,
+        id: cranelift_module::DataId,
         name: &str,
         fields: &[String],
         kinds: &[u8],
-    ) -> cranelift_module::DataId {
-        // The kinds are part of the key: `Pair[i64, str]` and `Pair[str, i64]`
-        // share a name and field names and store their fields differently.
-        let key = format!("{name}\u{0}{}\u{0}{kinds:?}", fields.join("\u{0}"));
-        if let Some(id) = self.struct_descs.get(&key) {
-            return *id;
-        }
+        elem_ids: &[Option<cranelift_module::DataId>],
+    ) {
         let name_id = self.intern_string(name);
         let field_ids: Vec<cranelift_module::DataId> =
             fields.iter().map(|f| self.intern_string(f)).collect();
 
-        // A (pointer, length, kind) triple per field: see `StructDesc` in the
-        // runtime, which reads this layout.
-        let size = 32 + fields.len() * 24;
+        // A (pointer, length, kind) triple per field, then one auxiliary word
+        // per field (an inline list of values' element descriptor, else 0):
+        // see `StructDesc` in the runtime, which reads this layout.
+        let size = 32 + fields.len() * 32;
         let mut bytes = vec![0u8; size];
         // Little-endian: the backend targets the host, and every target it can
         // reach is little-endian.
@@ -3475,11 +3507,6 @@ operation's",
             bytes[at + 8..at + 16].copy_from_slice(&kind.to_le_bytes());
         }
 
-        // Writable: the runtime stores the built `StructTy` into word 0.
-        let id = self
-            .module
-            .declare_anonymous_data(true, false)
-            .expect("data");
         let mut d = DataDescription::new();
         d.define(bytes.into_boxed_slice());
         d.set_align(8);
@@ -3489,8 +3516,39 @@ operation's",
             let gv = self.module.declare_data_in_data(*fid, &mut d);
             d.write_data_addr((32 + i * 24) as u32, gv, 0);
         }
+        // The auxiliary word of an inline list of values points at its
+        // element type's descriptor. A type may hold a list of itself, so
+        // this is written as a relocation to data that may still be being
+        // defined -- which is why the runtime reads a descriptor here and
+        // builds the `StructTy` from it on first use, not now.
+        let aux_at = 32 + fields.len() * 24;
+        for (i, sub) in elem_ids.iter().enumerate() {
+            let Some(sub) = sub else { continue };
+            let gv = self.module.declare_data_in_data(*sub, &mut d);
+            d.write_data_addr((aux_at + i * 8) as u32, gv, 0);
+        }
         self.module.define_data(id, &d).expect("data define");
+    }
+
+    /// The descriptor for a type whose fields are all one word: every struct
+    /// that is not compiled as a value with an inline field.
+    fn struct_desc_plain(
+        &mut self,
+        name: &str,
+        fields: &[String],
+        kinds: &[u8],
+    ) -> cranelift_module::DataId {
+        let key = Self::desc_key(name, fields, kinds);
+        if let Some(id) = self.struct_descs.get(&key) {
+            return *id;
+        }
+        let id = self
+            .module
+            .declare_anonymous_data(true, false)
+            .expect("data");
         self.struct_descs.insert(key, id);
+        let none: Vec<Option<cranelift_module::DataId>> = vec![None; fields.len()];
+        self.define_struct_desc(id, name, fields, kinds, &none);
         id
     }
 
@@ -4620,6 +4678,23 @@ fn collect_idents_block(b: &grasm_syntax::ast::Block, out: &mut Vec<String>) {
 /// walk stops there.
 /// How a struct stores a field of this type: `0` for a box, otherwise the
 /// runtime's `FK_*` kind of a scalar kept as its bits.
+/// An inline list of scalars, an inline list of values, and an inline
+/// string: a field of one of these kinds is the three words of a `Vec`
+/// rather than a pointer to a box. Mirrors `grasm_rt`'s `FK_*`, as the
+/// layout constants below mirror its offsets.
+const FK_INLIST: u8 = 6;
+const FK_INVALS: u8 = 7;
+const FK_INSTR: u8 = 8;
+
+/// Words a field of this kind takes (`grasm_rt::kind_width`).
+fn kind_width(k: u8) -> usize {
+    if matches!(k, FK_INLIST | FK_INVALS | FK_INSTR) {
+        3
+    } else {
+        1
+    }
+}
+
 fn field_kind(t: &VType) -> u8 {
     match t {
         VType::I64 => 1,
@@ -7813,6 +7888,171 @@ impl FnCx<'_, '_> {
             .unwrap_or_default()
     }
 
+    /// What each field of `s` holds, as the runtime's `FK_*` kind. A field
+    /// the analysis made inline is three words rather than one, so this is
+    /// what decides the type's shape -- `val_offs` and `val_words` follow
+    /// from it, and the descriptor the runtime reads carries the same kinds.
+    fn val_kinds(&self, s: &str) -> Vec<u8> {
+        self.cg
+            .structs
+            .get(s)
+            .map(|fs| {
+                fs.iter()
+                    .map(|(n, t)| self.inline_kind(s, n, t).unwrap_or_else(|| field_kind(t)))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The inline kind of field `n` of `s`, when it is one: a list of
+    /// scalars, a list of values, or a string stored among the struct's own
+    /// words rather than behind a pointer.
+    fn inline_kind(&self, s: &str, n: &str, t: &VType) -> Option<u8> {
+        if !self.cg.inline_fields.contains(&(s.to_string(), n.to_string())) {
+            return None;
+        }
+        match t {
+            VType::Str => Some(FK_INSTR),
+            VType::List(e) if matches!(**e, VType::Val(_)) => Some(FK_INVALS),
+            VType::List(e) if scalar_kind_i64(e).is_some() => Some(FK_INLIST),
+            _ => None,
+        }
+    }
+
+    /// Whether any field of `s` is inline, which is what makes copying and
+    /// releasing a value of it more than its words and its boxes.
+    fn val_has_inline(&self, s: &str) -> bool {
+        self.val_kinds(s).into_iter().any(|k| kind_width(k) > 1)
+    }
+
+    /// Field `i` of `s` when it is inline: its kind and the byte offset of
+    /// its three words.
+    fn inline_field_of(&self, s: &str, i: usize) -> Option<(u8, i32)> {
+        let k = *self.val_kinds(s).get(i)?;
+        (kind_width(k) > 1).then(|| (k, self.val_off(s, i)))
+    }
+
+    /// `x.f` where `f` is an inline field: the kind, the field's declared
+    /// type, and the field's buffer address and length -- read from the
+    /// value, which holds them where a pointer to a box used to be.
+    ///
+    /// The length is the buffer's: elements for a list of scalars, bytes for
+    /// a string, and *words* for a list of values, which `inline_len` turns
+    /// into a count.
+    fn inline_field_parts(&mut self, e: &Expr) -> CResult<Option<(u8, VType, Value, Value)>> {
+        if self.cg.inline_fields.is_empty() {
+            return Ok(None);
+        }
+        let Expr::Field { recv, name, .. } = e else {
+            return Ok(None);
+        };
+        let rt = match &**recv {
+            Expr::Ident(id) => self.lookup(&id.name).map(|(_, t)| t),
+            other => self.probe_type(other).ok(),
+        };
+        let Some(VType::Val(s)) = rt else {
+            return Ok(None);
+        };
+        let decl = self.cg.structs.get(&s).cloned().unwrap_or_default();
+        let Some(i) = decl.iter().position(|(n, _)| *n == name.name) else {
+            return Ok(None);
+        };
+        let Some((kind, off)) = self.inline_field_of(&s, i) else {
+            return Ok(None);
+        };
+        let ft = decl[i].1.clone();
+        let (p, _) = self.eval_expr_val(recv)?;
+        let flags = cranelift_codegen::ir::MemFlags::trusted();
+        let (vp, vl, _) = vec_layout();
+        let ptr = self.b.ins().load(types::I64, flags, p, off + vp as i32);
+        let len = self.b.ins().load(types::I64, flags, p, off + vl as i32);
+        Ok(Some((kind, ft, ptr, len)))
+    }
+
+    /// How many elements an inline field's buffer holds, from its length in
+    /// elements, bytes or words.
+    fn inline_len(&mut self, kind: u8, ft: &VType, len: Value) -> Value {
+        if kind != FK_INVALS {
+            return len;
+        }
+        let VType::List(e) = ft else { return len };
+        let VType::Val(en) = &**e else { return len };
+        let w = self.val_words(&en.clone()).max(1) as i64;
+        if w == 1 {
+            len
+        } else if w & (w - 1) == 0 {
+            self.b.ins().ushr_imm(len, i64::from(w.trailing_zeros()))
+        } else {
+            self.div_by_magic(len, w)
+        }
+    }
+
+    /// The bytes one element of an inline list field takes.
+    fn inline_stride(&mut self, kind: u8, ft: &VType) -> i64 {
+        if kind != FK_INVALS {
+            return 8;
+        }
+        match ft {
+            VType::List(e) => match &**e {
+                VType::Val(en) => (self.val_words(&en.clone()) * 8) as i64,
+                _ => 8,
+            },
+            _ => 8,
+        }
+    }
+
+    /// `x.f.len()`, `x.f.byte_len()` and `x.f.is_empty()` on an inline
+    /// field: a load, with no list or string to build first.
+    fn inline_field_method(
+        &mut self,
+        recv: &Expr,
+        name: &Ident,
+        args: &[Expr],
+    ) -> CResult<Option<(Value, VType)>> {
+        if !args.is_empty() || !matches!(name.name.as_str(), "len" | "byte_len" | "is_empty") {
+            return Ok(None);
+        }
+        let Some((kind, ft, _ptr, len)) = self.inline_field_parts(recv)? else {
+            return Ok(None);
+        };
+        if name.name == "byte_len" && kind != FK_INSTR {
+            return Ok(None);
+        }
+        let n = if name.name == "byte_len" {
+            len
+        } else {
+            self.inline_len(kind, &ft, len)
+        };
+        if name.name == "is_empty" {
+            let zero = self.b.ins().iconst(types::I64, 0);
+            return Ok(Some((self.b.ins().icmp(IntCC::Equal, n, zero), VType::Bool)));
+        }
+        Ok(Some((n, VType::I64)))
+    }
+
+    /// Where each field of `s` starts, in words.
+    fn val_offs(&self, s: &str) -> Vec<usize> {
+        let mut at = 0;
+        self.val_kinds(s)
+            .into_iter()
+            .map(|k| {
+                let was = at;
+                at += kind_width(k);
+                was
+            })
+            .collect()
+    }
+
+    /// Words one value of `s` takes, in a slot and per list element.
+    fn val_words(&self, s: &str) -> usize {
+        self.val_kinds(s).into_iter().map(kind_width).sum()
+    }
+
+    /// The byte offset of field `i` of `s` among a value's words.
+    fn val_off(&self, s: &str, i: usize) -> i32 {
+        (8 * self.val_offs(s)[i]) as i32
+    }
+
     /// For a call to a split-result function: the slot its payload word lands
     /// in, its address passed as the last argument.
     fn split_call_slot(
@@ -7934,9 +8174,10 @@ impl FnCx<'_, '_> {
     fn split_from(&mut self, v: Value, s: &str) -> Vec<Variable> {
         self.fresh_vals.remove(&v);
         let decl = self.val_fields(s);
+        let offs = self.val_offs(s);
         let mut out = Vec::with_capacity(decl.len());
         for (i, ft) in decl.iter().enumerate() {
-            let w = self.load_val_scalar(v, i, ft);
+            let w = self.load_val_scalar(v, (8 * offs[i]) as i32, ft);
             let fv = self.new_var(ft);
             self.b.def_var(fv, w);
             out.push(fv);
@@ -7949,9 +8190,10 @@ impl FnCx<'_, '_> {
     fn split_materialize(&mut self, var: Variable, s: &str) -> Value {
         let fs = self.split_vals[&var.as_u32()].clone();
         let at = self.val_slot(s);
+        let offs = self.val_offs(s);
         for (i, ft) in self.val_fields(s).iter().enumerate() {
             let w = self.b.use_var(fs[i]);
-            self.store_val_scalar(w, at, i, ft);
+            self.store_val_scalar(w, at, (8 * offs[i]) as i32, ft);
         }
         self.fresh_vals.insert(at);
         at
@@ -7960,29 +8202,38 @@ impl FnCx<'_, '_> {
     /// Scalar field `i` of the value at `at`. An `f64` is loaded as a float:
     /// read as a word and moved across, every field operation in an update
     /// loop paid a register-file crossing each way.
-    fn load_val_scalar(&mut self, at: Value, i: usize, ft: &VType) -> Value {
+    fn load_val_scalar(&mut self, at: Value, off: i32, ft: &VType) -> Value {
         let flags = cranelift_codegen::ir::MemFlags::trusted();
         if *ft == VType::F64 {
-            return self.b.ins().load(types::F64, flags, at, (8 * i) as i32);
+            return self.b.ins().load(types::F64, flags, at, off);
         }
-        let w = self.b.ins().load(types::I64, flags, at, (8 * i) as i32);
+        let w = self.b.ins().load(types::I64, flags, at, off);
         self.scalar_of_bits(w, ft)
     }
 
     /// Stores scalar field `i` of the value at `at`, the inverse of
     /// `load_val_scalar`.
-    fn store_val_scalar(&mut self, v: Value, at: Value, i: usize, ft: &VType) {
+    fn store_val_scalar(&mut self, v: Value, at: Value, off: i32, ft: &VType) {
         let flags = cranelift_codegen::ir::MemFlags::trusted();
         let w = if *ft == VType::F64 { v } else { self.scalar_bits_of(v, ft) };
-        self.b.ins().store(flags, w, at, (8 * i) as i32);
+        self.b.ins().store(flags, w, at, off);
     }
 
     /// Releases the boxed fields of the value at `at`.
     fn drop_val(&mut self, at: Value, s: &str) {
+        // A type with an inline field owns buffers as well as boxes, and
+        // what an inline list of values holds is only known from the
+        // descriptor, so the runtime does the walk.
+        if self.val_has_inline(s) {
+            let d = self.val_desc(s);
+            self.call_rt("grasm_val_release", &[d, at]);
+            return;
+        }
         let flags = cranelift_codegen::ir::MemFlags::trusted();
+        let offs = self.val_offs(s);
         for (i, ft) in self.val_fields(s).iter().enumerate() {
             if ft.boxed() {
-                let w = self.b.ins().load(types::I64, flags, at, (8 * i) as i32);
+                let w = self.b.ins().load(types::I64, flags, at, (8 * offs[i]) as i32);
                 self.call_rt("grasm_val_dec", &[w]);
             }
         }
@@ -7990,10 +8241,18 @@ impl FnCx<'_, '_> {
 
     /// Takes a count on each boxed field of the value at `at`.
     fn inc_val_fields(&mut self, at: Value, s: &str) {
+        // As `drop_val`: a copy of a value with an inline field copies the
+        // buffer, which only the runtime can do from the descriptor.
+        if self.val_has_inline(s) {
+            let d = self.val_desc(s);
+            self.call_rt("grasm_val_dup", &[d, at]);
+            return;
+        }
         let flags = cranelift_codegen::ir::MemFlags::trusted();
+        let offs = self.val_offs(s);
         for (i, ft) in self.val_fields(s).iter().enumerate() {
             if ft.boxed() {
-                let w = self.b.ins().load(types::I64, flags, at, (8 * i) as i32);
+                let w = self.b.ins().load(types::I64, flags, at, (8 * offs[i]) as i32);
                 self.call_rt("grasm_val_inc", &[w]);
             }
         }
@@ -8001,24 +8260,110 @@ impl FnCx<'_, '_> {
 
     /// The descriptor of value struct `s`: its name, fields and their kinds.
     fn val_desc(&mut self, s: &str) -> Value {
-        let fs = self.cg.structs.get(s).cloned().unwrap_or_default();
-        let names: Vec<String> = fs.iter().map(|(n, _)| n.clone()).collect();
-        let kinds: Vec<u8> = fs.iter().map(|(_, t)| field_kind(t)).collect();
-        let did = self.cg.struct_desc(s, &names, &kinds);
+        let did = self.val_desc_id(s);
         let gv = self.cg.module.declare_data_in_func(did, self.b.func);
         let ptr_ty = self.cg.module.target_config().pointer_type();
         self.b.ins().global_value(ptr_ty, gv)
+    }
+
+    /// The descriptor of value struct `s`, with its inline kinds and, for
+    /// each inline list of values, its element type's descriptor.
+    ///
+    /// The id is reserved and remembered before the element types are asked
+    /// for, so a type holding an inline list of itself describes itself once
+    /// rather than for ever.
+    fn val_desc_id(&mut self, s: &str) -> cranelift_module::DataId {
+        let fs = self.cg.structs.get(s).cloned().unwrap_or_default();
+        let names: Vec<String> = fs.iter().map(|(n, _)| n.clone()).collect();
+        let kinds: Vec<u8> = self.val_kinds(s);
+        let key = Codegen::desc_key(s, &names, &kinds);
+        if let Some(id) = self.cg.struct_descs.get(&key) {
+            return *id;
+        }
+        let id = self
+            .cg
+            .module
+            .declare_anonymous_data(true, false)
+            .expect("data");
+        self.cg.struct_descs.insert(key, id);
+        let elem_ids: Vec<Option<cranelift_module::DataId>> = fs
+            .iter()
+            .zip(&kinds)
+            .map(|((_, t), &k)| match (k, t) {
+                (FK_INVALS, VType::List(e)) => match &**e {
+                    VType::Val(en) => Some(self.val_desc_id(&en.clone())),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        self.cg
+            .define_struct_desc(id, s, &names, &kinds, &elem_ids);
+        id
     }
 
     /// `S{ f: e, ... }` for a value struct: its words in a fresh slot. Fields
     /// are evaluated as written and stored as declared; a boxed field's
     /// reference belongs to the value.
     fn eval_val_lit(&mut self, s: &str, fields: &[(Ident, Expr)], span: Span) -> CResult<(Value, VType)> {
+        if self.val_has_inline(s) {
+            return self.eval_val_lit_inline(s, fields, span);
+        }
         let words = self.val_lit_words(s, fields, span)?;
         let at = self.val_slot(s);
         let flags = cranelift_codegen::ir::MemFlags::trusted();
+        let offs = self.val_offs(s);
         for (i, w) in words {
-            self.b.ins().store(flags, w, at, (8 * i) as i32);
+            self.b.ins().store(flags, w, at, (8 * offs[i]) as i32);
+        }
+        self.fresh_vals.insert(at);
+        Ok((at, VType::Val(s.to_string())))
+    }
+
+    /// `S{ ... }` where some field is inline: each ordinary field is a word
+    /// stored as usual, and each inline field *absorbs* what it was given --
+    /// the list or string's buffer when nothing else holds it, a copy when
+    /// something does.
+    fn eval_val_lit_inline(
+        &mut self,
+        s: &str,
+        fields: &[(Ident, Expr)],
+        span: Span,
+    ) -> CResult<(Value, VType)> {
+        let decl = self.cg.structs.get(s).cloned().unwrap_or_default();
+        let at = self.val_slot(s);
+        let flags = cranelift_codegen::ir::MemFlags::trusted();
+        for (fname, fexpr) in fields {
+            let Some(i) = decl.iter().position(|(n, _)| *n == fname.name) else {
+                return nope(span, format!("the field `{}` of `{s}`", fname.name));
+            };
+            let ft = decl[i].1.clone();
+            let off = self.val_off(s, i);
+            let (mut v, vt) = self.eval_expr_expecting(fexpr, Some(&ft))?;
+            match self.inline_field_of(s, i) {
+                Some((kind, _)) => {
+                    let dst = self.b.ins().iadd_imm(at, i64::from(off));
+                    let f = if kind == FK_INSTR {
+                        "grasm_inline_absorb_str"
+                    } else {
+                        "grasm_inline_absorb_list"
+                    };
+                    self.call_rt(f, &[v, dst]);
+                }
+                None => {
+                    if ft == VType::F64 && vt == VType::I64 {
+                        v = self.b.ins().fcvt_from_sint(types::F64, v);
+                    }
+                    let w = if ft.boxed() {
+                        v
+                    } else if field_kind(&ft) != 0 {
+                        self.scalar_bits_of(v, &ft)
+                    } else {
+                        return nope(span, "a value struct holding another value struct");
+                    };
+                    self.b.ins().store(flags, w, at, off);
+                }
+            }
         }
         self.fresh_vals.insert(at);
         Ok((at, VType::Val(s.to_string())))
@@ -8089,8 +8434,9 @@ impl FnCx<'_, '_> {
                 if let Some(fs) = self.split_vals.get(&var.as_u32()).cloned() {
                     self.fresh_vals.remove(&nv);
                     let decl = self.val_fields(&s);
+                    let offs = self.val_offs(&s);
                     for (i, ft) in decl.iter().enumerate() {
-                        let w = self.load_val_scalar(nv, i, ft);
+                        let w = self.load_val_scalar(nv, (8 * offs[i]) as i32, ft);
                         self.b.def_var(fs[i], w);
                     }
                     return Ok(Some(StmtOut::Value(None)));
@@ -8109,7 +8455,7 @@ impl FnCx<'_, '_> {
                 let at = self.b.use_var(var);
                 self.drop_val(at, &s);
                 let flags = cranelift_codegen::ir::MemFlags::trusted();
-                for i in 0..self.val_fields(&s).len() {
+                for i in 0..self.val_words(&s) {
                     let w = self.b.ins().load(types::I64, flags, nv, (8 * i) as i32);
                     self.b.ins().store(flags, w, at, (8 * i) as i32);
                 }
@@ -8127,6 +8473,13 @@ impl FnCx<'_, '_> {
                     return nope(span, format!("the field `{}` of `{s}`", name.name));
                 };
                 let ft = decl[i].1.clone();
+                // Only the literal that builds a value fills an inline field,
+                // which is what the analysis that chooses them requires. A
+                // write here would put a pointer over the first of its three
+                // words, so it is refused rather than miscompiled.
+                if self.inline_field_of(&s, i).is_some() {
+                    return nope(span, format!("a write to the inline field `{s}.{}`", name.name));
+                }
                 if let Some(fs) = self.split_vals.get(&var.as_u32()).cloned() {
                     let (mut nv, mut nt) = self.eval_expr_expecting(value, Some(&ft))?;
                     if ft == VType::F64 && nt == VType::I64 {
@@ -8161,7 +8514,7 @@ impl FnCx<'_, '_> {
                     if ft.boxed() {
                         return nope(span, "a compound assignment to a boxed field of a value");
                     }
-                    let old = self.load_val_scalar(at, i, &ft);
+                    let old = self.load_val_scalar(at, self.val_off(&s, i), &ft);
                     let bop = match op {
                         AssignOp::Add => BinaryOp::Add,
                         AssignOp::Sub => BinaryOp::Sub,
@@ -8177,11 +8530,12 @@ impl FnCx<'_, '_> {
                     }
                 }
                 if ft.boxed() {
-                    let old = self.b.ins().load(types::I64, flags, at, (8 * i) as i32);
-                    self.b.ins().store(flags, nv, at, (8 * i) as i32);
+                    let off = self.val_off(&s, i);
+                    let old = self.b.ins().load(types::I64, flags, at, off);
+                    self.b.ins().store(flags, nv, at, off);
                     self.call_rt("grasm_val_dec", &[old]);
                 } else {
-                    self.store_val_scalar(nv, at, i, &ft);
+                    self.store_val_scalar(nv, at, self.val_off(&s, i), &ft);
                 }
                 Ok(Some(StmtOut::Value(None)))
             }
@@ -8216,9 +8570,10 @@ impl FnCx<'_, '_> {
                                 self.b.def_var(var, mine);
                                 self.call_rt("grasm_vals_at", &[mine, iv]).unwrap()
                             };
+                            let offs = self.val_offs(&s);
                             for (i, ft) in self.val_fields(&s).iter().enumerate() {
                                 let w = self.b.use_var(fs[i]);
-                                self.store_val_scalar(w, at, i, ft);
+                                self.store_val_scalar(w, at, (8 * offs[i]) as i32, ft);
                             }
                             return Ok(Some(StmtOut::Value(None)));
                         }
@@ -8247,7 +8602,7 @@ impl FnCx<'_, '_> {
                     self.call_rt("grasm_vals_at", &[mine, iv]).unwrap()
                 };
                 self.drop_val(at, &s);
-                let n = self.val_fields(&s).len();
+                let n = self.val_words(&s);
                 for i in 0..n {
                     let w = self.b.ins().load(types::I64, flags, owned, (8 * i) as i32);
                     self.b.ins().store(flags, w, at, (8 * i) as i32);
@@ -8261,14 +8616,14 @@ impl FnCx<'_, '_> {
     /// The bytes one element of a value list takes.
     fn val_stride(&self, t: &VType) -> i64 {
         match t {
-            VType::Val(s) => (self.val_fields(s).len() * 8) as i64,
+            VType::Val(s) => (self.val_words(s) * 8) as i64,
             other => stride_of(other),
         }
     }
 
     /// A fresh stack slot for one value of `s`.
     fn val_slot(&mut self, s: &str) -> Value {
-        let n = self.val_fields(s).len().max(1);
+        let n = self.val_words(s).max(1);
         let slot = self
             .b
             .create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
@@ -8285,7 +8640,7 @@ impl FnCx<'_, '_> {
     /// field gains a count, since both places now hold it.
     fn move_or_copy_val(&mut self, src: Value, dst: Value, s: &str) {
         let flags = cranelift_codegen::ir::MemFlags::trusted();
-        let n = self.val_fields(s).len();
+        let n = self.val_words(s);
         for i in 0..n {
             let w = self.b.ins().load(types::I64, flags, src, (8 * i) as i32);
             self.b.ins().store(flags, w, dst, (8 * i) as i32);
@@ -8469,7 +8824,7 @@ impl FnCx<'_, '_> {
     /// -- the runtime call (which copies the list, or grows it) otherwise.
     /// `owned` is the element's words, already owned by the caller.
     fn vals_push_fast(&mut self, lv: Value, owned: Value, s: &str) -> Value {
-        let w = self.val_fields(s).len() as i64;
+        let w = self.val_words(s) as i64;
         let flags = cranelift_codegen::ir::MemFlags::trusted();
         let ptag = self.b.ins().uload8(types::I32, flags, lv, LAYOUT_PAYLOAD_TAG as i32);
         let is_vals = self.b.ins().icmp_imm(IntCC::Equal, ptag, LAYOUT_TAG_LIST_VALS);
@@ -8511,7 +8866,8 @@ impl FnCx<'_, '_> {
     /// stored at the list's end when it has room, and through a slot and the
     /// runtime call when it does not.
     fn vals_push_words(&mut self, lv: Value, words: &[(usize, Value)], s: &str) -> Value {
-        let w = self.val_fields(s).len() as i64;
+        let w = self.val_words(s) as i64;
+        let offs = self.val_offs(s);
         let flags = cranelift_codegen::ir::MemFlags::trusted();
         // Into the slot first, before any branch. The slow path needs them
         // there anyway, and a store is what makes Cranelift compute the words
@@ -8521,7 +8877,7 @@ impl FnCx<'_, '_> {
         // time after the paths meet -- 42 instructions an entity in `ecs`.
         let slot = self.val_slot(s);
         for (i, word) in words {
-            self.b.ins().store(flags, *word, slot, (8 * i) as i32);
+            self.b.ins().store(flags, *word, slot, (8 * offs[*i]) as i32);
         }
         let ptag = self.b.ins().uload8(types::I32, flags, lv, LAYOUT_PAYLOAD_TAG as i32);
         let is_vals = self.b.ins().icmp_imm(IntCC::Equal, ptag, LAYOUT_TAG_LIST_VALS);
@@ -8547,7 +8903,7 @@ impl FnCx<'_, '_> {
         let off = self.b.ins().ishl_imm(n, 3);
         let at = self.b.ins().iadd(ptr, off);
         for (i, word) in words {
-            self.b.ins().store(flags, *word, at, (8 * i) as i32);
+            self.b.ins().store(flags, *word, at, (8 * offs[*i]) as i32);
         }
         self.b.ins().store(flags, need, lv, (base + vl) as i32);
         self.b.ins().jump(join, &[lv]);
@@ -8640,7 +8996,7 @@ impl FnCx<'_, '_> {
         let (_, vl, _) = vec_layout();
         let flags = cranelift_codegen::ir::MemFlags::trusted();
         let words = self.b.ins().load(types::I64, flags, lv, (LAYOUT_VALS_VEC + vl) as i32);
-        let w = self.val_fields(sname).len().max(1) as i64;
+        let w = self.val_words(sname).max(1) as i64;
         if w == 1 {
             words
         } else if w & (w - 1) == 0 {
@@ -8783,12 +9139,17 @@ impl FnCx<'_, '_> {
                     return Ok(None);
                 };
                 let ft = decl[i].1.clone();
-                if !ft.boxed() {
+                // An inline field has no pointer to lend: its first word is
+                // the buffer's address, and a caller handed that as a boxed
+                // value would read a list header off the elements. The reads
+                // an inline field does allow are answered before this.
+                if !ft.boxed() || self.inline_field_of(&s, i).is_some() {
                     return Ok(None);
                 }
                 let at = self.b.use_var(var);
                 let flags = cranelift_codegen::ir::MemFlags::trusted();
-                let w = self.b.ins().load(types::I64, flags, at, (8 * i) as i32);
+                let off = self.val_off(&s, i);
+                let w = self.b.ins().load(types::I64, flags, at, off);
                 return Ok(Some((w, ft)));
             }
         }
@@ -10766,6 +11127,72 @@ this case",
             return Ok(StmtOut::Value(None));
         }
 
+        // `for x in v.f` over an inline field: its buffer is the list, so
+        // the loop reads the elements where they already are. Nothing in the
+        // body can replace the value the field belongs to -- a value struct
+        // is only ever written through `assign_val`, and a loop variable is
+        // not a place -- so the address and the count are read once.
+        if let Some((kind, ft, ptr, raw_len)) = self.inline_field_parts(iter)? {
+            let n = self.inline_len(kind, &ft, raw_len);
+            let stride = self.inline_stride(kind, &ft);
+            let elem_t = match &ft {
+                VType::List(e) => (**e).clone(),
+                _ => return nope(iter.span(), "a for over this inline field"),
+            };
+            self.push_scope();
+            let ivar = self.new_var(&VType::I64);
+            let zero = self.b.ins().iconst(types::I64, 0);
+            self.b.def_var(ivar, zero);
+            let header = self.b.create_block();
+            let body_blk = self.b.create_block();
+            let step = self.b.create_block();
+            let exit = self.b.create_block();
+            self.b.ins().jump(header, &[]);
+            self.filled = true;
+            self.goto_block(header);
+            let iv = self.b.use_var(ivar);
+            let go = self.b.ins().icmp(IntCC::SignedLessThan, iv, n);
+            self.b.ins().brif(go, body_blk, &[], exit, &[]);
+            self.filled = true;
+            self.goto_block(body_blk);
+            let iv2 = self.b.use_var(ivar);
+            let off = self.b.ins().imul_imm(iv2, stride);
+            let at = self.b.ins().iadd(ptr, off);
+            let (ev, evt) = if kind == FK_INVALS {
+                (at, elem_t.clone())
+            } else {
+                let flags = cranelift_codegen::ir::MemFlags::trusted();
+                let bits = self.b.ins().load(types::I64, flags, at, 0);
+                (self.scalar_of_bits(bits, &elem_t), elem_t.clone())
+            };
+            let evar = self.new_var(&evt);
+            self.b.def_var(evar, ev);
+            self.push_scope();
+            self.bind(&loop_var.name, evar, evt);
+            self.loops
+                .push((step, exit, self.vars.len(), self.handlers_installed));
+            let inner = self.eval_block_inner(body);
+            self.loops.pop();
+            let (tail, mut terminated) = inner?;
+            self.dec_block_tail(tail);
+            terminated |= self.is_filled();
+            self.pop_scope_no_decs();
+            if !terminated {
+                self.b.ins().jump(step, &[]);
+                self.filled = true;
+            }
+            self.goto_block(step);
+            let iv3 = self.b.use_var(ivar);
+            let next = self.b.ins().iadd_imm(iv3, 1);
+            self.b.def_var(ivar, next);
+            self.b.ins().jump(header, &[]);
+            self.filled = true;
+            self.goto_block(exit);
+            self.pop_scope_no_decs();
+            self.close_loop_appends();
+            return Ok(StmtOut::Value(None));
+        }
+
         // List iteration: index-based over an owned temp.
         //
         // The temp lives in a scope of its own, so every way out of the loop
@@ -10848,7 +11275,7 @@ this case",
         // address computed from them.
         let val_data = match &*elem_t {
             VType::Val(s) => {
-                let w = self.val_fields(&s.clone()).len() as i64;
+                let w = self.val_words(&s.clone()) as i64;
                 Some((self.vals_data_inline(lv), w * 8))
             }
             _ => None,
@@ -11545,6 +11972,40 @@ this case",
                 Ok(Some((list, list_t)))
             }
             Expr::Index { recv, index, span } => {
+                // `v.f[i]` on an inline field: the element is read where it
+                // is, with the same bounds check a list index has.
+                if let Some((kind, ft, ptr, raw_len)) = self.inline_field_parts(recv)? {
+                    let n = self.inline_len(kind, &ft, raw_len);
+                    let stride = self.inline_stride(kind, &ft);
+                    let elem_t = match &ft {
+                        VType::List(e) => (**e).clone(),
+                        _ => return nope(*span, "an index into this inline field"),
+                    };
+                    let (iv, it) = self.eval_expr_val(index)?;
+                    if it != VType::I64 {
+                        return nope(index.span(), "non-integer index");
+                    }
+                    let inside = self.b.ins().icmp(IntCC::UnsignedLessThan, iv, n);
+                    let ok_blk = self.b.create_block();
+                    let bad = self.b.create_block();
+                    self.b.ins().brif(inside, ok_blk, &[], bad, &[]);
+                    self.filled = true;
+                    self.goto_block(bad);
+                    self.b.set_cold_block(bad);
+                    self.call_rt("grasm_panic_index", &[iv, n]);
+                    self.trap_here();
+                    self.filled = true;
+                    self.goto_block(ok_blk);
+                    let off = self.b.ins().imul_imm(iv, stride);
+                    let at = self.b.ins().iadd(ptr, off);
+                    if kind == FK_INVALS {
+                        return Ok(Some((at, elem_t)));
+                    }
+                    let flags = cranelift_codegen::ir::MemFlags::trusted();
+                    let bits = self.b.ins().load(types::I64, flags, at, 0);
+                    let v = self.scalar_of_bits(bits, &elem_t);
+                    return Ok(Some((v, elem_t)));
+                }
                 // A pinned list is read without ever producing the list value:
                 // `pin` already took the borrow for the whole loop, so
                 // evaluating the receiver here would be an inc/dec round trip
@@ -12764,6 +13225,11 @@ this case",
         args: &[Expr],
         span: Span,
     ) -> CResult<Option<(Value, VType)>> {
+        // An inline field answers its own length: there is no list or string
+        // value to make first.
+        if let Some(got) = self.inline_field_method(recv, name, args)? {
+            return Ok(Some(got));
+        }
         // A combinator on a range: `(0..n).map(f)`. The backend has no range
         // *value* (§11), and it does not need one — a range is the bounds of a
         // loop, and the loop that builds a list from those bounds is a shape
@@ -13323,6 +13789,9 @@ this case",
                     && lit.segments[0].name == *sn
                     && self.append_state(&id.name).is_none()
                     && fields.len() == self.val_fields(sn).len()
+                    // A word per field: an inline field is three, and is
+                    // built in a slot and pushed from there instead.
+                    && !self.val_has_inline(sn)
                 {
                     let sn = sn.clone();
                     let words = self.val_lit_words(&sn, fields, *lsp)?;
@@ -17077,7 +17546,7 @@ fields, not the type this is bound to, not an enclosing generic",
                         .map_or(0, |(_, t)| field_kind(t))
                 })
                 .collect();
-            let did = self.cg.struct_desc(&display_name, &names, &kinds);
+            let did = self.cg.struct_desc_plain(&display_name, &names, &kinds);
             let gv = self.cg.module.declare_data_in_func(did, self.b.func);
             let dp = self.b.ins().global_value(ptr_ty, gv);
             sv = self.call_rt("grasm_struct_make", &[dp, argv]).unwrap();
@@ -17118,12 +17587,32 @@ fields, not the type this is bound to, not an enclosing generic",
                 };
                 let ft = decl[i].1.clone();
                 let flags = cranelift_codegen::ir::MemFlags::trusted();
+                if let Some((kind, _)) = self.inline_field_of(&s, i) {
+                    let flags = cranelift_codegen::ir::MemFlags::trusted();
+                    let (vp, vl, _) = vec_layout();
+                    let off = self.val_off(&s, i);
+                    let ptr = self.b.ins().load(types::I64, flags, p, off + vp as i32);
+                    let len = self.b.ins().load(types::I64, flags, p, off + vl as i32);
+                    if kind != FK_INSTR {
+                        return nope(
+                            span,
+                            format!("an inline list field (`{}.{}`) used as a list", s, name.name),
+                        );
+                    }
+                    // A string value made from the bytes, for a use that
+                    // wants one: interpolation, a comparison, a call.
+                    let v = self.call_rt("grasm_inline_str_box", &[ptr, len]).unwrap();
+                    let pt = VType::Val(s);
+                    self.dec_if_boxed(p, &pt);
+                    return Ok(Some((v, ft)));
+                }
+                let off = self.val_off(&s, i);
                 let v = if ft.boxed() {
-                    let w = self.b.ins().load(types::I64, flags, p, (8 * i) as i32);
+                    let w = self.b.ins().load(types::I64, flags, p, off);
                     self.call_rt("grasm_val_inc", &[w]);
                     w
                 } else {
-                    self.load_val_scalar(p, i, &ft)
+                    self.load_val_scalar(p, off, &ft)
                 };
                 let pt = VType::Val(s);
                 self.dec_if_boxed(p, &pt);

@@ -776,6 +776,19 @@ pub struct StructTy {
     /// The empty value list of this type (docs/values.md), made once and
     /// shared: `[]` allocates nothing, and the first push copies on write.
     pub empty: std::sync::OnceLock<usize>,
+    /// Where each field starts, in words. A field is one word, except an
+    /// inline list or string, which is three (`kind_width`).
+    pub offs: Vec<usize>,
+    /// Words one value of this type takes: in a stack slot, and per element
+    /// of a value list.
+    pub width: usize,
+    /// For an `FK_INVALS` field, its elements' descriptor; 0 otherwise. A
+    /// descriptor rather than a `StructTy`, because a type may hold a list of
+    /// itself, whose `StructTy` is not built while this one is being built.
+    pub elems: Vec<usize>,
+    /// Whether any field is inline, which is what makes copying a value more
+    /// than copying its words and counting its boxes up.
+    pub has_inline: bool,
 }
 
 /// A struct field's kind, as the backend records it in the descriptor.
@@ -785,8 +798,80 @@ pub const FK_F64: u8 = 2;
 pub const FK_BOOL: u8 = 3;
 pub const FK_REF: u8 = 4;
 pub const FK_UNIT: u8 = 5;
+/// An inline list of eight-byte scalars (`[i64]`, `[f64]`): the `Vec<i64>`'s
+/// address, length and capacity, in `vec_layout` order, among the struct's
+/// own words rather than in a list box of its own (docs/values.md).
+pub const FK_INLIST: u8 = 6;
+/// An inline list of value structs: a `Vec<i64>` of their words.
+pub const FK_INVALS: u8 = 7;
+/// An inline string: a `Vec<u8>` of its UTF-8.
+pub const FK_INSTR: u8 = 8;
+
+/// Words a field of this kind takes.
+pub fn kind_width(k: u8) -> usize {
+    if matches!(k, FK_INLIST | FK_INVALS | FK_INSTR) {
+        3
+    } else {
+        1
+    }
+}
+
+/// The three words of an inline field, as the `Vec` they hold.
+///
+/// # Safety: `w` holds a `Vec<T>`'s parts, written by `inline_parts`, and the
+/// caller does not let the result free them twice.
+unsafe fn inline_vec<T>(w: &[i64]) -> Vec<T> {
+    let (vp, vl, vc) = vec_layout_words();
+    let (p, l, c) = (w[vp] as usize, w[vl] as usize, w[vc] as usize);
+    if c == 0 {
+        return Vec::new();
+    }
+    Vec::from_raw_parts(p as *mut T, l, c)
+}
+
+/// A `Vec`'s parts written as an inline field's three words. The `Vec` is
+/// given up: those words own its buffer from here on.
+fn inline_parts<T>(v: Vec<T>, w: &mut [i64]) {
+    let (vp, vl, vc) = vec_layout_words();
+    let mut v = std::mem::ManuallyDrop::new(v);
+    w[vp] = v.as_mut_ptr() as i64;
+    w[vl] = v.len() as i64;
+    w[vc] = v.capacity() as i64;
+}
+
+/// `vec_layout` as word indices rather than byte offsets.
+fn vec_layout_words() -> (usize, usize, usize) {
+    static AT: std::sync::OnceLock<(usize, usize, usize)> = std::sync::OnceLock::new();
+    *AT.get_or_init(|| {
+        let (p, l, c) = vec_layout();
+        (p / 8, l / 8, c / 8)
+    })
+}
 
 impl StructTy {
+    /// A type with its layout derived from its field kinds: where each field
+    /// starts and how many words a value takes. `elems` is empty, so this is
+    /// for types with no inline list of values.
+    pub fn of(name: &'static str, fields: Vec<&'static str>, kinds: Vec<u8>) -> StructTy {
+        let mut offs = Vec::with_capacity(kinds.len());
+        let mut width = 0;
+        for &k in &kinds {
+            offs.push(width);
+            width += kind_width(k);
+        }
+        let has_inline = kinds.iter().any(|&k| kind_width(k) > 1);
+        StructTy {
+            name,
+            elems: vec![0; fields.len()],
+            fields,
+            kinds,
+            empty: std::sync::OnceLock::new(),
+            offs,
+            width,
+            has_inline,
+        }
+    }
+
     /// Whether field `i` holds a box rather than a scalar's bits.
     #[inline]
     fn boxed(&self, i: usize) -> bool {
@@ -802,7 +887,17 @@ impl StructTy {
     /// times to learn that none of them held a box.
     #[inline]
     fn for_each_box(&self, words: &[i64], mut f: impl FnMut(*mut RtVal)) {
-        let w = self.kinds.len().max(1);
+        let w = self.width.max(1);
+        if self.has_inline {
+            for el in words.chunks_exact(w) {
+                for (i, &k) in self.kinds.iter().enumerate() {
+                    if k == FK_BOXED {
+                        f(el[self.offs[i]] as *mut RtVal);
+                    }
+                }
+            }
+            return;
+        }
         if !(0..w).any(|i| self.boxed(i)) {
             return;
         }
@@ -817,6 +912,208 @@ impl StructTy {
             }
         }
     }
+
+    /// The element type of field `i`, which is an inline list of values.
+    fn elem_ty(&self, i: usize) -> &'static StructTy {
+        // Safety: the backend writes a descriptor for every `FK_INVALS` field.
+        unsafe { desc_ty(self.elems[i] as *const StructDesc) }
+    }
+
+    /// Makes `words` -- values of this type copied bit for bit from ones that
+    /// still own what they hold -- own their own: every box counted up, every
+    /// inline buffer copied.
+    ///
+    /// # Safety: `words` are whole values of this type.
+    unsafe fn dup_words(&self, words: &mut [i64]) {
+        if !self.has_inline {
+            self.for_each_box(words, |c| inc(c));
+            return;
+        }
+        let w = self.width.max(1);
+        for el in words.chunks_exact_mut(w) {
+            for (i, &k) in self.kinds.iter().enumerate() {
+                let at = self.offs[i];
+                match k {
+                    FK_BOXED => inc(el[at] as *mut RtVal),
+                    FK_INLIST => {
+                        let v = std::mem::ManuallyDrop::new(inline_vec::<i64>(&el[at..at + 3]));
+                        inline_parts((*v).clone(), &mut el[at..at + 3]);
+                    }
+                    FK_INSTR => {
+                        let v = std::mem::ManuallyDrop::new(inline_vec::<u8>(&el[at..at + 3]));
+                        inline_parts((*v).clone(), &mut el[at..at + 3]);
+                    }
+                    FK_INVALS => {
+                        let v = std::mem::ManuallyDrop::new(inline_vec::<i64>(&el[at..at + 3]));
+                        let mut copy = (*v).clone();
+                        self.elem_ty(i).dup_words(&mut copy);
+                        inline_parts(copy, &mut el[at..at + 3]);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// Releases what `words` -- whole values of this type -- own: every box
+    /// whose count reaches zero handed to `boxes`, every inline buffer freed,
+    /// and every inline list of values pushed onto `vecs` for the caller to
+    /// release in turn, so a deep tree comes apart without recursion.
+    ///
+    /// # Safety: `words` are whole values of this type, not used as owners
+    /// again afterwards.
+    unsafe fn release_words(
+        &self,
+        words: &[i64],
+        boxes: &mut impl FnMut(*mut RtVal),
+        vecs: &mut Vec<(&'static StructTy, Vec<i64>)>,
+    ) {
+        if !self.has_inline {
+            self.for_each_box(words, |c| {
+                if release_to_zero(c) {
+                    boxes(c);
+                }
+            });
+            return;
+        }
+        let w = self.width.max(1);
+        for el in words.chunks_exact(w) {
+            for (i, &k) in self.kinds.iter().enumerate() {
+                let at = self.offs[i];
+                match k {
+                    FK_BOXED => {
+                        let c = el[at] as *mut RtVal;
+                        if release_to_zero(c) {
+                            boxes(c);
+                        }
+                    }
+                    FK_INLIST => drop(inline_vec::<i64>(&el[at..at + 3])),
+                    FK_INSTR => drop(inline_vec::<u8>(&el[at..at + 3])),
+                    FK_INVALS => vecs.push((self.elem_ty(i), inline_vec::<i64>(&el[at..at + 3]))),
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+thread_local! {
+    /// The worklist `release_words` fills with inline lists of values, kept
+    /// between releases. Releasing a tree node used to make and free one of
+    /// these per node, which cost more than the box the inline list replaced.
+    static RELEASE_WORK: std::cell::RefCell<Vec<(&'static StructTy, Vec<i64>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Runs `f` with the thread's release worklist, empty, and keeps its
+/// capacity afterwards. A release that happens *inside* another one gets a
+/// list of its own rather than disturbing the outer one.
+fn with_release_work<R>(f: impl FnOnce(&mut Vec<(&'static StructTy, Vec<i64>)>) -> R) -> R {
+    let mut held = RELEASE_WORK.with(|w| std::mem::take(&mut *w.borrow_mut()));
+    let out = f(&mut held);
+    held.clear();
+    RELEASE_WORK.with(|w| {
+        let mut slot = w.borrow_mut();
+        if slot.capacity() < held.capacity() {
+            *slot = held;
+        }
+    });
+    out
+}
+
+/// Releases everything the one value at `p` owns, leaving its words behind as
+/// garbage: what compiled code does for a value with an inline field going
+/// out of scope.
+///
+/// # Safety: `desc` describes the type; `p` points at one owning value.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_val_release(desc: *const StructDesc, p: *const i64) {
+    let ty = desc_ty(desc);
+    let words = std::slice::from_raw_parts(p, ty.width.max(1));
+    LOCAL.with(|local| {
+        with_release_work(|vecs| {
+            let mut free = |c: *mut RtVal| dec_walk(local, c);
+            ty.release_words(words, &mut free, vecs);
+            while let Some((t, v)) = vecs.pop() {
+                t.release_words(&v, &mut free, vecs);
+            }
+        });
+    });
+}
+
+/// Makes the value at `p`, a bit-for-bit copy of one that still owns what it
+/// holds, own its own (`StructTy::dup_words`).
+///
+/// # Safety: `desc` describes the type; `p` points at one value.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_val_dup(desc: *const StructDesc, p: *mut i64) {
+    let ty = desc_ty(desc);
+    let words = std::slice::from_raw_parts_mut(p, ty.width.max(1));
+    ty.dup_words(words);
+}
+
+/// A list handed to a struct literal for an inline list field, as that
+/// field's three words at `out`: its buffer taken when nothing else holds the
+/// list, copied otherwise. The caller's count on the list is spent here.
+///
+/// # Safety: `l` is a live list matching the field; `out` is three writable
+/// words.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_inline_absorb_list(l: *mut RtVal, out: *mut i64) {
+    let out = std::slice::from_raw_parts_mut(out, 3);
+    let unique = (*l).rc.load(Relaxed) == 1;
+    match &mut (*l).payload {
+        RtPayload::ListVals { ty, words } => {
+            let v = if unique {
+                std::mem::take(words)
+            } else {
+                let mut c = words.clone();
+                ty.dup_words(&mut c);
+                c
+            };
+            inline_parts(v, out);
+        }
+        RtPayload::ListScalar { data, .. } => {
+            let v: Vec<i64> = if unique {
+                match data {
+                    ScalarData::Words(w) => std::mem::take(w),
+                    other => (0..other.len()).map(|i| other.get(i)).collect(),
+                }
+            } else {
+                (0..data.len()).map(|i| data.get(i)).collect()
+            };
+            inline_parts(v, out);
+        }
+        // The shared empty list of boxes, which `[]` is before its element
+        // type is known.
+        RtPayload::List(items) if items.is_empty() => inline_parts(Vec::<i64>::new(), out),
+        _ => grasm_panic_msg_str("an inline list field given something that is not a list"),
+    }
+    dec(l);
+}
+
+/// A string handed to a struct literal for an inline string field, as that
+/// field's three words at `out`: its bytes copied, since a short string's
+/// live inside its box. The caller's count on the string is spent here.
+///
+/// # Safety: `s` is a live string; `out` is three writable words.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_inline_absorb_str(s: *mut RtVal, out: *mut i64) {
+    let out = std::slice::from_raw_parts_mut(out, 3);
+    let RtPayload::Str(text) = &(*s).payload else {
+        grasm_panic_msg_str("an inline string field given something that is not a string");
+    };
+    inline_parts(text.as_bytes().to_vec(), out);
+    dec(s);
+}
+
+/// An inline string field as a string value, for a use that needs one.
+///
+/// # Safety: `ptr`/`len` are an inline string field's bytes.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_inline_str_box(ptr: *const u8, len: i64) -> *mut RtVal {
+    let text = std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr, len as usize));
+    alloc(RtPayload::Str(RtStr::of(text)))
 }
 
 /// A box holding a scalar field's bits, for a caller that wants a value.
@@ -884,6 +1181,8 @@ unsafe fn copy_fields(ty: &StructTy, fields: &StructFields) -> Vec<*mut RtVal> {
 /// +24  nfields
 /// +32  field 0: ptr (relocation), len, kind (`FK_*`)
 /// +56  field 1: ...
+///      then one word per field: an inline list of values' element
+///      descriptor (relocation), or 0
 /// ```
 #[repr(C)]
 pub struct StructDesc {
@@ -920,6 +1219,17 @@ unsafe fn desc_ty(desc: *const StructDesc) -> &'static StructTy {
         fields.push(borrowed_str(p, l));
         kinds.push(*triples.add(i * 3 + 2) as u8);
     }
+    // One auxiliary word per field after the triples: for an inline list of
+    // values, its element type's descriptor; 0 for every other kind.
+    let aux = triples.add(n * 3);
+    let elems: Vec<usize> = (0..n).map(|i| *aux.add(i) as usize).collect();
+    let mut offs = Vec::with_capacity(n);
+    let mut width = 0;
+    for &k in &kinds {
+        offs.push(width);
+        width += kind_width(k);
+    }
+    let has_inline = kinds.iter().any(|&k| kind_width(k) > 1);
     // Leaked on purpose: one per struct type, and it has to outlive every
     // value that points at it.
     let fresh: &'static StructTy = Box::leak(Box::new(StructTy {
@@ -927,6 +1237,10 @@ unsafe fn desc_ty(desc: *const StructDesc) -> &'static StructTy {
         fields,
         kinds,
         empty: std::sync::OnceLock::new(),
+        offs,
+        width,
+        elems,
+        has_inline,
     }));
     let addr = fresh as *const StructTy as usize;
     match (*desc)
@@ -2613,9 +2927,15 @@ unsafe fn dec_walk(local: &Local, v: *mut RtVal) {
                 }
             }
             RtPayload::ListVals { ty, words } => {
-                ty.for_each_box(words, |c| {
-                    if release_to_zero(c) {
-                        push_pending(&mut inline, &mut n, &mut spill, c);
+                // Inline lists of values that the elements hold come apart
+                // here too, through a list of their own rather than by
+                // recursion: a tree is as deep as its data says.
+                with_release_work(|vecs| {
+                    let mut found =
+                        |c: *mut RtVal| push_pending(&mut inline, &mut n, &mut spill, c);
+                    ty.release_words(words, &mut found, vecs);
+                    while let Some((t, v)) = vecs.pop() {
+                        t.release_words(&v, &mut found, vecs);
                     }
                 });
             }
@@ -4541,7 +4861,7 @@ pub unsafe extern "C" fn grasm_list_len(v: *mut RtVal) -> i64 {
         RtPayload::ListScalar { data, .. } => data.len() as i64,
         // A list of value structs reaches here from every path that asks a
         // list its length without knowing its element type was made a value.
-        RtPayload::ListVals { ty, words } => (words.len() / ty.kinds.len().max(1)) as i64,
+        RtPayload::ListVals { ty, words } => (words.len() / ty.width.max(1)) as i64,
         _ => grasm_panic_msg_str("len on non-list"),
     }
 }
@@ -4688,22 +5008,45 @@ unsafe fn display(v: *mut RtVal) -> String {
         // Rendered as the list of structs it stands for, field by field,
         // each the way that field would print inside a struct box.
         RtPayload::ListVals { ty, words } => {
-            let w = ty.kinds.len().max(1);
+            let w = ty.width.max(1);
             let parts: Vec<String> = words
                 .chunks(w)
                 .map(|el| {
-                    let fs: Vec<String> = el
+                    let fs: Vec<String> = ty
+                        .kinds
                         .iter()
                         .enumerate()
-                        .map(|(i, x)| {
+                        .map(|(i, &kind)| {
                             let k = ty.fields.get(i).copied().unwrap_or("?");
-                            if ty.boxed(i) {
-                                format!("{k}: {}", display(*x as *mut RtVal))
-                            } else {
-                                let b = box_field_bits(ty.kinds[i], *x);
-                                let t = display(b);
-                                dec(b);
-                                format!("{k}: {t}")
+                            let at = ty.offs[i];
+                            let x = &el[at];
+                            match kind {
+                                FK_BOXED => format!("{k}: {}", display(*x as *mut RtVal)),
+                                FK_INSTR => {
+                                    let v = std::mem::ManuallyDrop::new(
+                                        inline_vec::<u8>(&el[at..at + 3]),
+                                    );
+                                    format!("{k}: {}", String::from_utf8_lossy(&v))
+                                }
+                                FK_INLIST => {
+                                    let v = std::mem::ManuallyDrop::new(
+                                        inline_vec::<i64>(&el[at..at + 3]),
+                                    );
+                                    format!("{k}: {:?}", &v[..])
+                                }
+                                FK_INVALS => {
+                                    let v = std::mem::ManuallyDrop::new(
+                                        inline_vec::<i64>(&el[at..at + 3]),
+                                    );
+                                    let et = ty.elem_ty(i);
+                                    format!("{k}: [{} values]", v.len() / et.width.max(1))
+                                }
+                                _ => {
+                                    let b = box_field_bits(kind, *x);
+                                    let t = display(b);
+                                    dec(b);
+                                    format!("{k}: {t}")
+                                }
                             }
                         })
                         .collect();
@@ -5072,12 +5415,12 @@ pub unsafe extern "C" fn grasm_vals_push(l: *mut RtVal, src: *const i64) -> *mut
         let RtPayload::ListVals { ty, words } = &(*l).payload else {
             grasm_panic_msg_str("push to a value list that is not one");
         };
-        ty.for_each_box(words, |c| inc(c));
-        let w = ty.kinds.len().max(1);
+        let w = ty.width.max(1);
         // Room for a few elements up front: a list copied on write is
         // usually about to grow, and growing from nothing reallocates often.
         let mut grown = Vec::with_capacity((words.len() + w).max(4 * w));
         grown.extend_from_slice(words);
+        ty.dup_words(&mut grown);
         let copy = alloc(RtPayload::ListVals { ty, words: grown });
         dec(l);
         copy
@@ -5085,7 +5428,7 @@ pub unsafe extern "C" fn grasm_vals_push(l: *mut RtVal, src: *const i64) -> *mut
     let RtPayload::ListVals { ty, words } = &mut (*target).payload else {
         unreachable!()
     };
-    let w = ty.kinds.len();
+    let w = ty.width;
     words.extend_from_slice(std::slice::from_raw_parts(src, w));
     target
 }
@@ -5107,23 +5450,18 @@ pub unsafe extern "C" fn grasm_list_reserve(l: *mut RtVal, n: i64) -> *mut RtVal
     let n = (n as usize).min(1 << 24);
     match &(*l).payload {
         RtPayload::ListVals { ty, words } => {
-            let w = ty.kinds.len().max(1);
+            let w = ty.width.max(1);
             if (*l).rc.load(Relaxed) == 1 {
                 if let RtPayload::ListVals { words, .. } = &mut (*l).payload {
                     words.reserve(n * w);
                 }
                 return l;
             }
-            // The copy holds its own counts on every boxed field.
-            for el in words.chunks_exact(w) {
-                for (f, c) in el.iter().enumerate() {
-                    if ty.boxed(f) {
-                        inc(*c as *mut RtVal);
-                    }
-                }
-            }
+            // The copy owns what its elements hold: boxes counted up, inline
+            // buffers copied.
             let mut grown = Vec::with_capacity(words.len() + n * w);
             grown.extend_from_slice(words);
+            ty.dup_words(&mut grown);
             let ty = *ty;
             let copy = alloc(RtPayload::ListVals { ty, words: grown });
             dec(l);
@@ -5153,11 +5491,9 @@ pub unsafe extern "C" fn grasm_vals_unshare(l: *mut RtVal) -> *mut RtVal {
     let RtPayload::ListVals { ty, words } = &(*l).payload else {
         grasm_panic_msg_str("write into a value list that is not one");
     };
-    ty.for_each_box(words, |c| inc(c));
-    let copy = alloc(RtPayload::ListVals {
-        ty,
-        words: words.clone(),
-    });
+    let mut copied = words.clone();
+    ty.dup_words(&mut copied);
+    let copy = alloc(RtPayload::ListVals { ty, words: copied });
     dec(l);
     copy
 }
@@ -5179,7 +5515,7 @@ pub unsafe extern "C" fn grasm_vals_pin(
         grasm_panic_msg_str("pin of a value list that is not one");
     };
     *data_out = words.as_mut_ptr();
-    *len_out = (words.len() / ty.kinds.len().max(1)) as i64;
+    *len_out = (words.len() / ty.width.max(1)) as i64;
     mine
 }
 
@@ -5203,7 +5539,7 @@ pub unsafe extern "C" fn grasm_vals_len(l: *mut RtVal) -> i64 {
     let RtPayload::ListVals { ty, words } = &(*l).payload else {
         grasm_panic_msg_str("length of a value list that is not one");
     };
-    (words.len() / ty.kinds.len().max(1)) as i64
+    (words.len() / ty.width.max(1)) as i64
 }
 
 /// The address of element `i`'s words, borrowed: valid while the list is
@@ -5216,7 +5552,7 @@ pub unsafe extern "C" fn grasm_vals_at(l: *mut RtVal, i: i64) -> *mut i64 {
     let RtPayload::ListVals { ty, words } = &mut (*l).payload else {
         grasm_panic_msg_str("index into a value list that is not one");
     };
-    let w = ty.kinds.len().max(1);
+    let w = ty.width.max(1);
     let n = (words.len() / w) as i64;
     if i < 0 || i >= n {
         grasm_panic_index(i, n);
@@ -10514,12 +10850,7 @@ mod layout_tests {
         unsafe {
             let a = grasm_box_i64(1_000_000_007);
             let b = grasm_box_i64(2_000_000_011);
-            let ty: &'static StructTy = Box::leak(Box::new(StructTy {
-                name: "P",
-                fields: vec!["a", "b"],
-                kinds: vec![0, 0],
-                empty: std::sync::OnceLock::new(),
-            }));
+            let ty: &'static StructTy = Box::leak(Box::new(StructTy::of("P", vec!["a", "b"], vec![0, 0])));
             let s = alloc(RtPayload::Struct {
                 ty,
                 fields: StructFields::from_values(vec![a, b]),
@@ -10550,12 +10881,7 @@ mod layout_tests {
             let vec_at = lsb.add(layout::SCALAR_VEC);
             assert_eq!(*(vec_at.add(vl) as *const usize), 2);
             assert_eq!(*(*(vec_at.add(vp) as *const *const i64)).add(1), 6);
-            let ty: &'static StructTy = Box::leak(Box::new(StructTy {
-                name: "V",
-                fields: vec!["a"],
-                kinds: vec![0],
-                empty: std::sync::OnceLock::new(),
-            }));
+            let ty: &'static StructTy = Box::leak(Box::new(StructTy::of("V", vec!["a"], vec![0])));
             let lv = alloc(RtPayload::ListVals { ty, words: vec![4, 5] });
             let lvb = lv as *const u8;
             assert_eq!(*lvb.add(layout::PAYLOAD_TAG), layout::TAG_LIST_VALS);
@@ -10587,12 +10913,7 @@ mod value_list_tests {
     #[test]
     fn value_list_owns_its_boxed_fields() {
         unsafe {
-            let ty: &'static StructTy = Box::leak(Box::new(StructTy {
-                name: "N",
-                fields: vec!["v", "s"],
-                kinds: vec![FK_I64, FK_BOXED],
-                empty: std::sync::OnceLock::new(),
-            }));
+            let ty: &'static StructTy = Box::leak(Box::new(StructTy::of("N", vec!["v", "s"], vec![FK_I64, FK_BOXED])));
             let before = live();
             let mut l = alloc(RtPayload::ListVals { ty, words: Vec::new() });
             for k in 0..5i64 {
