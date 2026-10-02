@@ -76,3 +76,48 @@ functions that take a boxed value.
 
 Then widen eligibility one generic operation at a time, each by boxing a value
 at the boundary where it meets the runtime.
+
+## Next: list fields stored inline (planned 2026-10-02)
+
+A value struct's list field (`kids: [Node]`) is one word today: a pointer to a
+list box whose payload holds the `Vec`. The box is what `tree` still pays for
+per internal node -- the first push copies the shared empty list into a new
+box, and the release walk takes one more step per list -- and, with the URL's
+box, what `dirtyheap`'s BFS misses on.
+
+**Ceiling, estimated from the profile before building:** in `tree`, the
+first-push slow path (`grasm_vals_push`, `grasm_vals_new`, `alloc_in`,
+`desc_ty`) and the release walk's extra step per list are about a quarter of
+the samples; the buffer's `malloc`/`free` stays either way. So roughly
+16.6 -> 12.5 ms against Rust's 9.0: a gain, not parity. `dirtyheap` needs the
+URL inline as well -- Rust measured with only one of the two inline gained
+nothing, because the two misses overlap -- so list fields alone do not move it.
+Stage 1 measures this ceiling for real before the rest is built.
+
+**Representation.** An inline list field takes three words, the `Vec`'s
+address, length and capacity (in `vec_layout()` order), so a field is no longer
+one word: each field gets a *width*, and the offset of field `i` is the sum of
+the widths before it. `StructTy.kinds` gains a kind, `FK_LIST_VALS` (and later
+one per scalar list kind), whose width is 3; boxed structs never use it, so the
+table they share is unchanged for them.
+
+**Where it is allowed.** As with value structs, by whole-program analysis: a
+list field is inline only if every use of it is a `for` over it, `len`, an
+index read, a push through the struct's own variable, or a move into it in a
+struct literal from a local list that is used only the same ways. Anything
+else -- passing `n.kids` to a function, a list method, printing -- keeps the
+field a box, exactly as today.
+
+**Stages, each measured and gated:**
+
+1. Prototype on `tree` alone, behind `GRASM_INLINE_LISTS=1`: inline `kids`,
+   local `kids` unboxed until the literal moves it in, `for` and drop over the
+   inline words. Measure. Stop here if the gain is under 15%.
+2. Field widths throughout codegen (`val_fields`, slots, offsets, copies,
+   drops, pushes, versioned loops) and the runtime (`for_each_box`,
+   `dec_walk`, `vals_push`/`unshare`/`reserve`, display); layout check for the
+   new kind.
+3. The eligibility analysis, reporting before it acts; then on by default with
+   difftest, leakcheck and usecheck agreeing across the corpus, and
+   `GRASM_INLINE_LISTS=0` gated too.
+4. Strings: the same for `str` fields, which is what `dirtyheap` needs.
