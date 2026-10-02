@@ -997,6 +997,30 @@ impl StructTy {
     }
 }
 
+thread_local! {
+    /// The worklist `release_words` fills with inline lists of values, kept
+    /// between releases. Releasing a tree node used to make and free one of
+    /// these per node, which cost more than the box the inline list replaced.
+    static RELEASE_WORK: std::cell::RefCell<Vec<(&'static StructTy, Vec<i64>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Runs `f` with the thread's release worklist, empty, and keeps its
+/// capacity afterwards. A release that happens *inside* another one gets a
+/// list of its own rather than disturbing the outer one.
+fn with_release_work<R>(f: impl FnOnce(&mut Vec<(&'static StructTy, Vec<i64>)>) -> R) -> R {
+    let mut held = RELEASE_WORK.with(|w| std::mem::take(&mut *w.borrow_mut()));
+    let out = f(&mut held);
+    held.clear();
+    RELEASE_WORK.with(|w| {
+        let mut slot = w.borrow_mut();
+        if slot.capacity() < held.capacity() {
+            *slot = held;
+        }
+    });
+    out
+}
+
 /// Releases everything the one value at `p` owns, leaving its words behind as
 /// garbage: what compiled code does for a value with an inline field going
 /// out of scope.
@@ -1006,12 +1030,15 @@ impl StructTy {
 pub unsafe extern "C" fn grasm_val_release(desc: *const StructDesc, p: *const i64) {
     let ty = desc_ty(desc);
     let words = std::slice::from_raw_parts(p, ty.width.max(1));
-    let mut vecs: Vec<(&'static StructTy, Vec<i64>)> = Vec::new();
-    let mut free = |c: *mut RtVal| LOCAL.with(|local| dec_walk(local, c));
-    ty.release_words(words, &mut free, &mut vecs);
-    while let Some((t, v)) = vecs.pop() {
-        t.release_words(&v, &mut free, &mut vecs);
-    }
+    LOCAL.with(|local| {
+        with_release_work(|vecs| {
+            let mut free = |c: *mut RtVal| dec_walk(local, c);
+            ty.release_words(words, &mut free, vecs);
+            while let Some((t, v)) = vecs.pop() {
+                t.release_words(&v, &mut free, vecs);
+            }
+        });
+    });
 }
 
 /// Makes the value at `p`, a bit-for-bit copy of one that still owns what it
@@ -2903,12 +2930,14 @@ unsafe fn dec_walk(local: &Local, v: *mut RtVal) {
                 // Inline lists of values that the elements hold come apart
                 // here too, through a list of their own rather than by
                 // recursion: a tree is as deep as its data says.
-                let mut vecs: Vec<(&'static StructTy, Vec<i64>)> = Vec::new();
-                let mut found = |c: *mut RtVal| push_pending(&mut inline, &mut n, &mut spill, c);
-                ty.release_words(words, &mut found, &mut vecs);
-                while let Some((t, v)) = vecs.pop() {
-                    t.release_words(&v, &mut found, &mut vecs);
-                }
+                with_release_work(|vecs| {
+                    let mut found =
+                        |c: *mut RtVal| push_pending(&mut inline, &mut n, &mut spill, c);
+                    ty.release_words(words, &mut found, vecs);
+                    while let Some((t, v)) = vecs.pop() {
+                        t.release_words(&v, &mut found, vecs);
+                    }
+                });
             }
             RtPayload::Fn { env, .. } => {
                 if release_to_zero(*env) {
