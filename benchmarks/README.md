@@ -87,31 +87,28 @@ All seven implementations in one table. Nim and Zig implement the four programs
 where the comparison is about the language rather than about which concurrency
 primitive each one reaches for.
 
-| program  |   C |  Rust |  Go | Nim | Zig | grasm-native | grasm-interp | Python |
-|----------|----:|------:|----:|----:|----:|-------------:|-------------:|-------:|
-| fib      |   5 |     5 |   6 |   6 |   6 |           11 |         1741 |    131 |
-| sieve    |   7 |     7 |   8 |   9 |   7 |           16 |         2930 |    357 |
-| matmul   |   5 |     5 |   8 |   9 |   6 |           10 |         6317 |    879 |
-| wordfreq |  31 |    26 |  17 |  22 |   9 |       **38** |          489 |    130 |
-| tree     |  21 |    10 |  21 |   — |   — |       **42** |         1572 |    333 |
-| sort     |  37 |    11 |  49 |   — |   — |       **19** |          382 |    215 |
-| parmap   |  54 |    49 |  87 |   — |   — |          104 |       54,583 |  3,539 |
-| parwords |   8 |    10 |  10 |   — |   — |       **23** |         2005 |    213 |
+| program  |     C |  Rust |    Go |  Nim |  Zig | grasm-native | grasm-interp |  Python |
+|----------|------:|------:|------:|-----:|-----:|-------------:|-------------:|--------:|
+| fib      |  5.13 |  5.84 |  6.08 | 5.74 | 6.30 |     **5.76** |         1743 |     133 |
+| sieve    |  6.73 |  6.75 |  7.64 | 9.12 | 7.11 |     **6.53** |         3024 |     372 |
+| matmul   |  5.17 |  4.87 |  8.04 | 9.36 | 5.73 |         5.30 |         6093 |     963 |
+| wordfreq | 30.92 | 26.23 | 17.32 | 22.2 | 9.59 |    **15.71** |          501 |     133 |
+| tree     | 20.76 |  9.82 | 20.73 |    — |    — |        19.22 |         1555 |     355 |
+| sort     | 38.30 | 12.23 | 50.84 |    — |    — |    **10.90** |          389 |     249 |
+| parmap   | 51.64 | 53.69 | 107.7 |    — |    — |        66.41 |       55,887 |   3,610 |
+| parwords |  8.89 | 11.76 |  9.27 |    — |    — |    **11.61** |         2092 |     273 |
 
 `scripts/bench.sh` prints the geometric mean of Rust over Grasm at the bottom
-of the run, which is goal G2 in `docs/northstar.md`: **0.46x**, and **0.39x**
-with the floor subtracted. Parity is 1.00x. Nothing here is at or above it.
+of the run, which is goal G2 in `docs/northstar.md`: **0.965x**, and **0.955x**
+with the floor subtracted, against a target of 0.95x. Parity is 1.00x. Five of
+the eight are at or above it — `wordfreq` 1.67x, `sort` 1.12x, `sieve` 1.03x,
+`fib` 1.01x (also ahead of Zig) and `parwords` 1.01x — and `matmul` at 0.92x
+is ahead of Zig and Go. `tree` at 0.51x is what the geomean still carries.
 
-> **These numbers are old, and wrong by more than a factor of two.** The table
-> above and the 0.46x with it predate a great deal of work. The standing table
-> lives in `docs/performance.md`. The last figure from a quiet machine is
-> **0.836x** (2026-09-22); a run on 2026-10-02 printed **0.973x**, which clears
-> the 0.95x target, with `wordfreq` 1.41x, `matmul` 1.23x (ahead of Zig *and*
-> C), `sort` 1.13x and `sieve` at parity — but that run was at load 3.5, where
-> `bench.sh` refuses and had to be overridden, so it is recorded and not
-> published. The rule three paragraphs up applies to this page as much as to
-> anything. Re-run `./scripts/bench.sh` on a quiet machine and replace the
-> table wholesale rather than patching cells.
+> **Measured 2026-10-02 on an idle machine** (load 2.09; `bench.sh` refuses
+> above a third of the cores being busy, and did not have to be overridden).
+> What moved it from 0.46x: value structs, inline list and string fields, and
+> a scan that reads its buffer without a bounds check per byte.
 
 Best of 5. **The harness floor is 2 ms** — what timing `/usr/bin/true` costs,
 which is fork, exec and wait rather than anything a program did. The top three

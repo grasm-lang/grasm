@@ -78,12 +78,11 @@ accept, and because a site with a build step is a site that stops building.
 
 ## 2. Speed and quality
 
-**Status: the target is cleared, pending a clean run.** G2 printed **0.973×**
-against Rust on 2026-10-02, against a 0.95× target, with four of eight programs
-ahead — but at load 3.5, so it is not published. The last figure from a quiet
-machine is 0.836× (2026-09-22). `scripts/bench.sh` computes it from the numbers
-it prints rather than from anything typed by hand, and refuses to run above a
-third of the cores being busy.
+**Status: met.** G2 is **0.965×** against Rust, **0.955×** floor-subtracted,
+against a 0.95× target — measured on 2026-10-02 at load 2.09, so `bench.sh`
+ran without being overridden. Five of eight programs are at or above parity.
+`scripts/bench.sh` computes it from the numbers it prints rather than from
+anything typed by hand, and refuses to run above a third of the cores busy.
 
 Known costs, in the order they are worth attacking: `tree` at 0.50× of Rust,
 which is a list of values held as a box per node — storing those inline was
