@@ -5,14 +5,15 @@ performance + 2 efficiency cores), load 7–24 and varying between benchmarks.
 One run is not a distribution: treat differences under ~10% as noise, and
 `chat` as noisier than that. Compiler at the inline-fields merge.
 
-Grasm does **not** beat Rust across this suite. It wins on memory everywhere,
-leads `proxy` throughput and beats Go on every row but one; it loses `etl`,
-`dirtyheap` and `ecs` on time, and `chat` throughput to Rust.
+Grasm does **not** beat Rust across this suite. It wins on memory everywhere
+-- by 8x on `chat` and 5x on `proxy` -- and its `dirtyheap` drop is faster
+than Rust's arena. It loses `etl`, `dirtyheap`, `ecs` and `chat` on time, and
+the `proxy` tail to both Rust and Go.
 
 | benchmark | metric | Grasm | Rust | Go |
 |---|---|---|---|---|
-| chat | deliveries/s | 528,259 | **574,738** | 268,185 |
-| chat | peak RSS MB | **8.6** | 53.8 | 200.2 |
+| chat | deliveries/s (median of 3) | 590,078 | **693,534** | 131,735 |
+| chat | peak RSS MB | **8.4** | 69.4 | 264.0 |
 | ecs (1M × 100) | wall ms | 277 | **238** | 313 |
 | ecs | RSS MB | 47.3 | **47.2** | 50.1 |
 | dirtyheap (5M) | wall ms | 1,860 | **1,240** | 2,720 |
@@ -20,18 +21,28 @@ leads `proxy` throughput and beats Go on every row but one; it loses `etl`,
 | dirtyheap | RSS MB | **718** | 789 | 914 |
 | etl (1 GiB) | wall ms | 10,260 | **2,854** | 10,429 |
 | etl | RSS MB | 5.7 | **4.0** | 10.6 |
-| proxy (256 conns) | req/s | **36,406** | 35,893 | 35,354 |
-| proxy | p99 ms | 28.6 | **25.8** | 31.8 |
-| proxy | RSS MB | **7.2** | 8.3 | 30.8 |
+| proxy (256 conns) | req/s (median of 3) | 42,045 | 40,159 | **47,563** |
+| proxy | p99 ms (median of 3) | 29.1 | 27.0 | **18.5** |
+| proxy | RSS MB | **7.2** | 8.3 | 37.1 |
 
 Changes since the morning run: `dirtyheap` 3067 → 1860 ms and 1128 → 718 MB,
 from holding a value struct's string and scalar-list fields inline instead of
 in a box of its own (docs/values.md). Its drop is now faster than Rust's
 arena, and it uses less memory than Rust.
 
-`chat` is the row that moves most between runs: in the morning Rust delivered
-only 9,985,193 of 9,990,000 messages at 194,689/s, and here it delivered all
-of them at 574,738/s. Grasm delivered all of them in both.
+`chat` and `proxy` were re-run three times each on a quieter machine, and
+both tables above now show the median; the other rows are single runs. That
+changed two conclusions a single run had given:
+
+- **chat**: Rust is ahead by about 1.18x, consistently (590k against 694k),
+  not level. The morning run where Grasm appeared to win was one where Rust
+  failed to deliver 4,807 of its messages. Grasm delivered all of them every
+  time, in 8.4 MB against Rust's 69 MB.
+- **proxy**: Go leads the tail (p99 18.5 ms against Grasm's 29.1 and Rust's
+  27.0), where a single run had put Grasm ahead of Go. Throughput swings from
+  29k to 48k for the same binary, because the load generator, the upstream and
+  the proxy all compete for the same eight cores: this row cannot separate the
+  three at better than about 20%.
 
 What is behind each loss, measured rather than guessed:
 
