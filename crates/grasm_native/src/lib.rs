@@ -11961,6 +11961,40 @@ this case",
                 Ok(Some((list, list_t)))
             }
             Expr::Index { recv, index, span } => {
+                // `v.f[i]` on an inline field: the element is read where it
+                // is, with the same bounds check a list index has.
+                if let Some((kind, ft, ptr, raw_len)) = self.inline_field_parts(recv)? {
+                    let n = self.inline_len(kind, &ft, raw_len);
+                    let stride = self.inline_stride(kind, &ft);
+                    let elem_t = match &ft {
+                        VType::List(e) => (**e).clone(),
+                        _ => return nope(*span, "an index into this inline field"),
+                    };
+                    let (iv, it) = self.eval_expr_val(index)?;
+                    if it != VType::I64 {
+                        return nope(index.span(), "non-integer index");
+                    }
+                    let inside = self.b.ins().icmp(IntCC::UnsignedLessThan, iv, n);
+                    let ok_blk = self.b.create_block();
+                    let bad = self.b.create_block();
+                    self.b.ins().brif(inside, ok_blk, &[], bad, &[]);
+                    self.filled = true;
+                    self.goto_block(bad);
+                    self.b.set_cold_block(bad);
+                    self.call_rt("grasm_panic_index", &[iv, n]);
+                    self.trap_here();
+                    self.filled = true;
+                    self.goto_block(ok_blk);
+                    let off = self.b.ins().imul_imm(iv, stride);
+                    let at = self.b.ins().iadd(ptr, off);
+                    if kind == FK_INVALS {
+                        return Ok(Some((at, elem_t)));
+                    }
+                    let flags = cranelift_codegen::ir::MemFlags::trusted();
+                    let bits = self.b.ins().load(types::I64, flags, at, 0);
+                    let v = self.scalar_of_bits(bits, &elem_t);
+                    return Ok(Some((v, elem_t)));
+                }
                 // A pinned list is read without ever producing the list value:
                 // `pin` already took the borrow for the whole loop, so
                 // evaluating the receiver here would be an inc/dec round trip
