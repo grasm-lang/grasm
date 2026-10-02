@@ -1,38 +1,48 @@
-# Systems suite — results, 2026-10-02
+# Systems suite — results, 2026-10-02 (afternoon)
 
-One run of each `run.sh` at full size, back to back, on an 8-core Apple
-machine (6 performance + 2 efficiency cores) at load 3–5. One run is not a
-distribution: treat differences under ~10% as noise. Compiler at e7524a4.
+One run of each `run.sh` at full size on an 8-core Apple machine (6
+performance + 2 efficiency cores), load 7–24 and varying between benchmarks.
+One run is not a distribution: treat differences under ~10% as noise, and
+`chat` as noisier than that. Compiler at the inline-fields merge.
 
-Grasm does **not** beat Rust across this suite. It wins `chat`, is within 10%
-on `ecs` and `proxy` throughput, and loses `etl`, `dirtyheap` and the proxy's
-tail latency.
+Grasm does **not** beat Rust across this suite. It wins on memory everywhere,
+leads `proxy` throughput and beats Go on every row but one; it loses `etl`,
+`dirtyheap` and `ecs` on time, and `chat` throughput to Rust.
 
-| benchmark | metric | Grasm | Rust | Go | Grasm / Rust |
-|---|---|---|---|---|---|
-| chat | deliveries/s | **614,162** (exact) | 194,689 (not exact) | 196,645 (not exact) | 3.15x better |
-| chat | peak RSS MB | **7.8** | 60.6 | 292.9 | 7.8x better |
-| ecs (1M × 100) | wall ms | 234 (aos), 230 (soa) | **214** | 265 | 1.09x worse |
-| ecs | RSS MB | 47.3 | 47.2 | 50.1 | parity |
-| etl (1 GiB) | wall ms | 9,231 | **2,560** | 9,536 | 3.6x worse |
-| etl | RSS MB | 5.5 | **4.3** | 10.2 | 1.3x worse |
-| dirtyheap (5M) | wall ms | 2,770 (values) | **1,070** (arena), 2,290 (Rc) | 1,590 | 2.6x worse (1.2x vs Rc) |
-| dirtyheap | drop ms | 497 | **206** (arena) | 25 (GC, concurrent) | 2.4x worse |
-| dirtyheap | RSS MB | 1,081 | **789** | 942 | 1.4x worse |
-| proxy (256 conns) | req/s | 56,242 | **61,783** | 52,616 | 0.91x |
-| proxy | p99 ms | 10.97 | **8.36** | 15.82 | 1.31x worse |
-| proxy | p999 ms | 17.87 | **12.34** | 102.18 | 1.45x worse |
+| benchmark | metric | Grasm | Rust | Go |
+|---|---|---|---|---|
+| chat | deliveries/s | 528,259 | **574,738** | 268,185 |
+| chat | peak RSS MB | **8.6** | 53.8 | 200.2 |
+| ecs (1M × 100) | wall ms | 277 | **238** | 313 |
+| ecs | RSS MB | 47.3 | **47.2** | 50.1 |
+| dirtyheap (5M) | wall ms | 1,860 | **1,240** | 2,720 |
+| dirtyheap | drop ms | **266** | 326 | 83 (GC, concurrent) |
+| dirtyheap | RSS MB | **718** | 789 | 914 |
+| etl (1 GiB) | wall ms | 10,260 | **2,854** | 10,429 |
+| etl | RSS MB | 5.7 | **4.0** | 10.6 |
+| proxy (256 conns) | req/s | **36,406** | 35,893 | 35,354 |
+| proxy | p99 ms | 28.6 | **25.8** | 31.8 |
+| proxy | RSS MB | **7.2** | 8.3 | 30.8 |
+
+Changes since the morning run: `dirtyheap` 3067 → 1860 ms and 1128 → 718 MB,
+from holding a value struct's string and scalar-list fields inline instead of
+in a box of its own (docs/values.md). Its drop is now faster than Rust's
+arena, and it uses less memory than Rust.
+
+`chat` is the row that moves most between runs: in the morning Rust delivered
+only 9,985,193 of 9,990,000 messages at 194,689/s, and here it delivered all
+of them at 574,738/s. Grasm delivered all of them in both.
 
 What is behind each loss, measured rather than guessed:
 
 - **etl**: Grasm makes a value per string field and validates its UTF-8 per
-  slice; Rust's serde decoder borrows from the line. Almost half of Grasm's time
-  is its own generated code, a fifth the runtime, the rest allocation and
-  copying.
-- **dirtyheap**: each node's URL and edge list is a box of its own, so the
-  BFS takes two cache misses per node that Rust's arena (URL length and edge
-  pointer inline in the node) does not. Rust written with Grasm's
-  representation is within 1.2x.
+  slice; Rust's serde decoder borrows from the line. Almost half of Grasm's
+  time is its own generated code, a fifth the runtime, the rest allocation and
+  copying. Borrowed string and bytes views are the next lever.
+- **dirtyheap**: what is left is the build, where the URL is made as a string
+  value and then copied into the field; Rust formats it into place.
+- **ecs**: the update loop is at parity; the setup loop is behind on
+  instructions retired.
 - **proxy tail**: a connection stays on the worker that accepted it, so a
   paused worker stalls its clients; tokio moves runnable tasks to idle
   threads. See `proxy/README.md`.
