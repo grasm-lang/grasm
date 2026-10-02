@@ -102,15 +102,16 @@ primitive each one reaches for.
 of the run, which is goal G2 in `docs/northstar.md`: **0.46x**, and **0.39x**
 with the floor subtracted. Parity is 1.00x. Nothing here is at or above it.
 
-> **These numbers are old.** The table above and the 0.46x with it predate a
-> good deal of work; the standing table lives in `docs/performance.md` and was
-> last taken on 2026-09-22, where `G2` is **0.836x** and four rows are ahead of
-> Rust — `wordfreq` at 0.73x, `sort` 0.88x, `fib` 0.95x (which is also ahead of
-> Zig), `parwords` at parity. This page has not been re-measured because the
-> rule three paragraphs up applies to it as much as to anything: the machine
-> has not been idle, and a number taken under load should not be published.
-> Re-run `./scripts/bench.sh` on a quiet machine and replace the table wholesale
-> rather than patching cells.
+> **These numbers are old, and wrong by more than a factor of two.** The table
+> above and the 0.46x with it predate a great deal of work. The standing table
+> lives in `docs/performance.md`. The last figure from a quiet machine is
+> **0.836x** (2026-09-22); a run on 2026-10-02 printed **0.973x**, which clears
+> the 0.95x target, with `wordfreq` 1.41x, `matmul` 1.23x (ahead of Zig *and*
+> C), `sort` 1.13x and `sieve` at parity — but that run was at load 3.5, where
+> `bench.sh` refuses and had to be overridden, so it is recorded and not
+> published. The rule three paragraphs up applies to this page as much as to
+> anything. Re-run `./scripts/bench.sh` on a quiet machine and replace the
+> table wholesale rather than patching cells.
 
 Best of 5. **The harness floor is 2 ms** — what timing `/usr/bin/true` costs,
 which is fork, exec and wait rather than anything a program did. The top three

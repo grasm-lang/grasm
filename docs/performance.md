@@ -10,6 +10,17 @@ it. This is the other half: why the numbers are what they are.
 
 ## The standing gap
 
+> **2026-10-02, recorded not published.** `bench.sh` printed `G2` **0.973x**
+> (0.972x floor-subtracted), clearing the 0.95x target, with four of eight
+> programs ahead of Rust: `wordfreq` 1.41x, `matmul` 1.23x — which is also
+> ahead of Zig's 6.00 ms and C's 8.91 — `sort` 1.13x, and `sieve` at parity.
+> `tree` at 0.50x is the one program still far behind. The machine was at load
+> 3.5, so `bench.sh` refused and was overridden with `BENCH_IGNORE_LOAD=1`:
+> these are not publishable numbers and the table below has not been replaced
+> from them. What changed since 0.836x: value structs, inline list and string
+> fields, and a scan that reads its buffer without a check per byte.
+
+
 Measured 2026-09-22 by `scripts/bench.sh` — wall clock, best of three,
 checksums verified against the interpreter first.
 

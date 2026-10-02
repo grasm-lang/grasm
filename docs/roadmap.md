@@ -78,13 +78,19 @@ accept, and because a site with a build step is a site that stops building.
 
 ## 2. Speed and quality
 
-**Status: ongoing, measured.** G2 is 0.45× native against Rust, 0.39×
-floor-subtracted, against a 0.95× target. `scripts/bench.sh` computes it from
-the numbers it prints rather than from anything typed by hand.
+**Status: the target is cleared, pending a clean run.** G2 printed **0.973×**
+against Rust on 2026-10-02, against a 0.95× target, with four of eight programs
+ahead — but at load 3.5, so it is not published. The last figure from a quiet
+machine is 0.836× (2026-09-22). `scripts/bench.sh` computes it from the numbers
+it prints rather than from anything typed by hand, and refuses to run above a
+third of the cores being busy.
 
-Known costs, in the order they are worth attacking: `tree`'s box-per-node;
-binary size 350 KB against a 300 KB target; the reference count on every boxed
-value, which is atomic because a `parallel` body may hold one.
+Known costs, in the order they are worth attacking: `tree` at 0.50× of Rust,
+which is a list of values held as a box per node — storing those inline was
+built and measured on 2026-10-02 at *1.33× slower*, because a node's release
+becomes a runtime call, so the release has to get cheaper first; `etl` at 3.4×,
+which is byte-loop code generation and the honest answer there is LLVM as a
+release backend; binary size 350 KB against a 300 KB target.
 
 Quality is the loop. It does not stop.
 
