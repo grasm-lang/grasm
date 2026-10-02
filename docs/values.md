@@ -94,6 +94,15 @@ URL inline as well -- Rust measured with only one of the two inline gained
 nothing, because the two misses overlap -- so list fields alone do not move it.
 Stage 1 measures this ceiling for real before the rest is built.
 
+**Measured, 2026-10-02, before building:** a Rust model of `tree` written both
+ways with everything else equal -- kids behind a pooled, refcounted box with a
+shared immortal empty list (Grasm's shape), and kids as an inline `Vec` with
+the same capacity policy -- ran 14.5 ms and 13.7 ms: the box is worth about
+6%, not the quarter the profile suggested. That is under the 15% bar stage 1
+sets, so stage 1 stops here for `tree`. For `dirtyheap`, Rust with both the
+URL and the edges boxed ran 1.44x its arena form, so inline lists *and* strings
+could buy at most about that; the decision to build it is open.
+
 **Representation.** An inline list field takes three words, the `Vec`'s
 address, length and capacity (in `vec_layout()` order), so a field is no longer
 one word: each field gets a *width*, and the offset of field `i` is the sum of
