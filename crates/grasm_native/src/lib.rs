@@ -4621,6 +4621,23 @@ fn collect_idents_block(b: &grasm_syntax::ast::Block, out: &mut Vec<String>) {
 /// walk stops there.
 /// How a struct stores a field of this type: `0` for a box, otherwise the
 /// runtime's `FK_*` kind of a scalar kept as its bits.
+/// An inline list of scalars, an inline list of values, and an inline
+/// string: a field of one of these kinds is the three words of a `Vec`
+/// rather than a pointer to a box. Mirrors `grasm_rt`'s `FK_*`, as the
+/// layout constants below mirror its offsets.
+const FK_INLIST: u8 = 6;
+const FK_INVALS: u8 = 7;
+const FK_INSTR: u8 = 8;
+
+/// Words a field of this kind takes (`grasm_rt::kind_width`).
+fn kind_width(k: u8) -> usize {
+    if matches!(k, FK_INLIST | FK_INVALS | FK_INSTR) {
+        3
+    } else {
+        1
+    }
+}
+
 fn field_kind(t: &VType) -> u8 {
     match t {
         VType::I64 => 1,
@@ -7814,6 +7831,41 @@ impl FnCx<'_, '_> {
             .unwrap_or_default()
     }
 
+    /// What each field of `s` holds, as the runtime's `FK_*` kind. A field
+    /// the analysis made inline is three words rather than one, so this is
+    /// what decides the type's shape -- `val_offs` and `val_words` follow
+    /// from it, and the descriptor the runtime reads carries the same kinds.
+    fn val_kinds(&self, s: &str) -> Vec<u8> {
+        self.cg
+            .structs
+            .get(s)
+            .map(|fs| fs.iter().map(|(_, t)| field_kind(t)).collect())
+            .unwrap_or_default()
+    }
+
+    /// Where each field of `s` starts, in words.
+    fn val_offs(&self, s: &str) -> Vec<usize> {
+        let mut at = 0;
+        self.val_kinds(s)
+            .into_iter()
+            .map(|k| {
+                let was = at;
+                at += kind_width(k);
+                was
+            })
+            .collect()
+    }
+
+    /// Words one value of `s` takes, in a slot and per list element.
+    fn val_words(&self, s: &str) -> usize {
+        self.val_kinds(s).into_iter().map(kind_width).sum()
+    }
+
+    /// The byte offset of field `i` of `s` among a value's words.
+    fn val_off(&self, s: &str, i: usize) -> i32 {
+        (8 * self.val_offs(s)[i]) as i32
+    }
+
     /// For a call to a split-result function: the slot its payload word lands
     /// in, its address passed as the last argument.
     fn split_call_slot(
@@ -7935,9 +7987,10 @@ impl FnCx<'_, '_> {
     fn split_from(&mut self, v: Value, s: &str) -> Vec<Variable> {
         self.fresh_vals.remove(&v);
         let decl = self.val_fields(s);
+        let offs = self.val_offs(s);
         let mut out = Vec::with_capacity(decl.len());
         for (i, ft) in decl.iter().enumerate() {
-            let w = self.load_val_scalar(v, i, ft);
+            let w = self.load_val_scalar(v, (8 * offs[i]) as i32, ft);
             let fv = self.new_var(ft);
             self.b.def_var(fv, w);
             out.push(fv);
@@ -7950,9 +8003,10 @@ impl FnCx<'_, '_> {
     fn split_materialize(&mut self, var: Variable, s: &str) -> Value {
         let fs = self.split_vals[&var.as_u32()].clone();
         let at = self.val_slot(s);
+        let offs = self.val_offs(s);
         for (i, ft) in self.val_fields(s).iter().enumerate() {
             let w = self.b.use_var(fs[i]);
-            self.store_val_scalar(w, at, i, ft);
+            self.store_val_scalar(w, at, (8 * offs[i]) as i32, ft);
         }
         self.fresh_vals.insert(at);
         at
@@ -7961,29 +8015,30 @@ impl FnCx<'_, '_> {
     /// Scalar field `i` of the value at `at`. An `f64` is loaded as a float:
     /// read as a word and moved across, every field operation in an update
     /// loop paid a register-file crossing each way.
-    fn load_val_scalar(&mut self, at: Value, i: usize, ft: &VType) -> Value {
+    fn load_val_scalar(&mut self, at: Value, off: i32, ft: &VType) -> Value {
         let flags = cranelift_codegen::ir::MemFlags::trusted();
         if *ft == VType::F64 {
-            return self.b.ins().load(types::F64, flags, at, (8 * i) as i32);
+            return self.b.ins().load(types::F64, flags, at, off);
         }
-        let w = self.b.ins().load(types::I64, flags, at, (8 * i) as i32);
+        let w = self.b.ins().load(types::I64, flags, at, off);
         self.scalar_of_bits(w, ft)
     }
 
     /// Stores scalar field `i` of the value at `at`, the inverse of
     /// `load_val_scalar`.
-    fn store_val_scalar(&mut self, v: Value, at: Value, i: usize, ft: &VType) {
+    fn store_val_scalar(&mut self, v: Value, at: Value, off: i32, ft: &VType) {
         let flags = cranelift_codegen::ir::MemFlags::trusted();
         let w = if *ft == VType::F64 { v } else { self.scalar_bits_of(v, ft) };
-        self.b.ins().store(flags, w, at, (8 * i) as i32);
+        self.b.ins().store(flags, w, at, off);
     }
 
     /// Releases the boxed fields of the value at `at`.
     fn drop_val(&mut self, at: Value, s: &str) {
         let flags = cranelift_codegen::ir::MemFlags::trusted();
+        let offs = self.val_offs(s);
         for (i, ft) in self.val_fields(s).iter().enumerate() {
             if ft.boxed() {
-                let w = self.b.ins().load(types::I64, flags, at, (8 * i) as i32);
+                let w = self.b.ins().load(types::I64, flags, at, (8 * offs[i]) as i32);
                 self.call_rt("grasm_val_dec", &[w]);
             }
         }
@@ -7992,9 +8047,10 @@ impl FnCx<'_, '_> {
     /// Takes a count on each boxed field of the value at `at`.
     fn inc_val_fields(&mut self, at: Value, s: &str) {
         let flags = cranelift_codegen::ir::MemFlags::trusted();
+        let offs = self.val_offs(s);
         for (i, ft) in self.val_fields(s).iter().enumerate() {
             if ft.boxed() {
-                let w = self.b.ins().load(types::I64, flags, at, (8 * i) as i32);
+                let w = self.b.ins().load(types::I64, flags, at, (8 * offs[i]) as i32);
                 self.call_rt("grasm_val_inc", &[w]);
             }
         }
@@ -8018,8 +8074,9 @@ impl FnCx<'_, '_> {
         let words = self.val_lit_words(s, fields, span)?;
         let at = self.val_slot(s);
         let flags = cranelift_codegen::ir::MemFlags::trusted();
+        let offs = self.val_offs(s);
         for (i, w) in words {
-            self.b.ins().store(flags, w, at, (8 * i) as i32);
+            self.b.ins().store(flags, w, at, (8 * offs[i]) as i32);
         }
         self.fresh_vals.insert(at);
         Ok((at, VType::Val(s.to_string())))
@@ -8090,8 +8147,9 @@ impl FnCx<'_, '_> {
                 if let Some(fs) = self.split_vals.get(&var.as_u32()).cloned() {
                     self.fresh_vals.remove(&nv);
                     let decl = self.val_fields(&s);
+                    let offs = self.val_offs(&s);
                     for (i, ft) in decl.iter().enumerate() {
-                        let w = self.load_val_scalar(nv, i, ft);
+                        let w = self.load_val_scalar(nv, (8 * offs[i]) as i32, ft);
                         self.b.def_var(fs[i], w);
                     }
                     return Ok(Some(StmtOut::Value(None)));
@@ -8110,7 +8168,7 @@ impl FnCx<'_, '_> {
                 let at = self.b.use_var(var);
                 self.drop_val(at, &s);
                 let flags = cranelift_codegen::ir::MemFlags::trusted();
-                for i in 0..self.val_fields(&s).len() {
+                for i in 0..self.val_words(&s) {
                     let w = self.b.ins().load(types::I64, flags, nv, (8 * i) as i32);
                     self.b.ins().store(flags, w, at, (8 * i) as i32);
                 }
@@ -8162,7 +8220,7 @@ impl FnCx<'_, '_> {
                     if ft.boxed() {
                         return nope(span, "a compound assignment to a boxed field of a value");
                     }
-                    let old = self.load_val_scalar(at, i, &ft);
+                    let old = self.load_val_scalar(at, self.val_off(&s, i), &ft);
                     let bop = match op {
                         AssignOp::Add => BinaryOp::Add,
                         AssignOp::Sub => BinaryOp::Sub,
@@ -8178,11 +8236,12 @@ impl FnCx<'_, '_> {
                     }
                 }
                 if ft.boxed() {
-                    let old = self.b.ins().load(types::I64, flags, at, (8 * i) as i32);
-                    self.b.ins().store(flags, nv, at, (8 * i) as i32);
+                    let off = self.val_off(&s, i);
+                    let old = self.b.ins().load(types::I64, flags, at, off);
+                    self.b.ins().store(flags, nv, at, off);
                     self.call_rt("grasm_val_dec", &[old]);
                 } else {
-                    self.store_val_scalar(nv, at, i, &ft);
+                    self.store_val_scalar(nv, at, self.val_off(&s, i), &ft);
                 }
                 Ok(Some(StmtOut::Value(None)))
             }
@@ -8217,9 +8276,10 @@ impl FnCx<'_, '_> {
                                 self.b.def_var(var, mine);
                                 self.call_rt("grasm_vals_at", &[mine, iv]).unwrap()
                             };
+                            let offs = self.val_offs(&s);
                             for (i, ft) in self.val_fields(&s).iter().enumerate() {
                                 let w = self.b.use_var(fs[i]);
-                                self.store_val_scalar(w, at, i, ft);
+                                self.store_val_scalar(w, at, (8 * offs[i]) as i32, ft);
                             }
                             return Ok(Some(StmtOut::Value(None)));
                         }
@@ -8248,7 +8308,7 @@ impl FnCx<'_, '_> {
                     self.call_rt("grasm_vals_at", &[mine, iv]).unwrap()
                 };
                 self.drop_val(at, &s);
-                let n = self.val_fields(&s).len();
+                let n = self.val_words(&s);
                 for i in 0..n {
                     let w = self.b.ins().load(types::I64, flags, owned, (8 * i) as i32);
                     self.b.ins().store(flags, w, at, (8 * i) as i32);
@@ -8262,14 +8322,14 @@ impl FnCx<'_, '_> {
     /// The bytes one element of a value list takes.
     fn val_stride(&self, t: &VType) -> i64 {
         match t {
-            VType::Val(s) => (self.val_fields(s).len() * 8) as i64,
+            VType::Val(s) => (self.val_words(s) * 8) as i64,
             other => stride_of(other),
         }
     }
 
     /// A fresh stack slot for one value of `s`.
     fn val_slot(&mut self, s: &str) -> Value {
-        let n = self.val_fields(s).len().max(1);
+        let n = self.val_words(s).max(1);
         let slot = self
             .b
             .create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
@@ -8286,7 +8346,7 @@ impl FnCx<'_, '_> {
     /// field gains a count, since both places now hold it.
     fn move_or_copy_val(&mut self, src: Value, dst: Value, s: &str) {
         let flags = cranelift_codegen::ir::MemFlags::trusted();
-        let n = self.val_fields(s).len();
+        let n = self.val_words(s);
         for i in 0..n {
             let w = self.b.ins().load(types::I64, flags, src, (8 * i) as i32);
             self.b.ins().store(flags, w, dst, (8 * i) as i32);
@@ -8470,7 +8530,7 @@ impl FnCx<'_, '_> {
     /// -- the runtime call (which copies the list, or grows it) otherwise.
     /// `owned` is the element's words, already owned by the caller.
     fn vals_push_fast(&mut self, lv: Value, owned: Value, s: &str) -> Value {
-        let w = self.val_fields(s).len() as i64;
+        let w = self.val_words(s) as i64;
         let flags = cranelift_codegen::ir::MemFlags::trusted();
         let ptag = self.b.ins().uload8(types::I32, flags, lv, LAYOUT_PAYLOAD_TAG as i32);
         let is_vals = self.b.ins().icmp_imm(IntCC::Equal, ptag, LAYOUT_TAG_LIST_VALS);
@@ -8512,7 +8572,8 @@ impl FnCx<'_, '_> {
     /// stored at the list's end when it has room, and through a slot and the
     /// runtime call when it does not.
     fn vals_push_words(&mut self, lv: Value, words: &[(usize, Value)], s: &str) -> Value {
-        let w = self.val_fields(s).len() as i64;
+        let w = self.val_words(s) as i64;
+        let offs = self.val_offs(s);
         let flags = cranelift_codegen::ir::MemFlags::trusted();
         // Into the slot first, before any branch. The slow path needs them
         // there anyway, and a store is what makes Cranelift compute the words
@@ -8522,7 +8583,7 @@ impl FnCx<'_, '_> {
         // time after the paths meet -- 42 instructions an entity in `ecs`.
         let slot = self.val_slot(s);
         for (i, word) in words {
-            self.b.ins().store(flags, *word, slot, (8 * i) as i32);
+            self.b.ins().store(flags, *word, slot, (8 * offs[*i]) as i32);
         }
         let ptag = self.b.ins().uload8(types::I32, flags, lv, LAYOUT_PAYLOAD_TAG as i32);
         let is_vals = self.b.ins().icmp_imm(IntCC::Equal, ptag, LAYOUT_TAG_LIST_VALS);
@@ -8548,7 +8609,7 @@ impl FnCx<'_, '_> {
         let off = self.b.ins().ishl_imm(n, 3);
         let at = self.b.ins().iadd(ptr, off);
         for (i, word) in words {
-            self.b.ins().store(flags, *word, at, (8 * i) as i32);
+            self.b.ins().store(flags, *word, at, (8 * offs[*i]) as i32);
         }
         self.b.ins().store(flags, need, lv, (base + vl) as i32);
         self.b.ins().jump(join, &[lv]);
@@ -8641,7 +8702,7 @@ impl FnCx<'_, '_> {
         let (_, vl, _) = vec_layout();
         let flags = cranelift_codegen::ir::MemFlags::trusted();
         let words = self.b.ins().load(types::I64, flags, lv, (LAYOUT_VALS_VEC + vl) as i32);
-        let w = self.val_fields(sname).len().max(1) as i64;
+        let w = self.val_words(sname).max(1) as i64;
         if w == 1 {
             words
         } else if w & (w - 1) == 0 {
@@ -8789,7 +8850,8 @@ impl FnCx<'_, '_> {
                 }
                 let at = self.b.use_var(var);
                 let flags = cranelift_codegen::ir::MemFlags::trusted();
-                let w = self.b.ins().load(types::I64, flags, at, (8 * i) as i32);
+                let off = self.val_off(&s, i);
+                let w = self.b.ins().load(types::I64, flags, at, off);
                 return Ok(Some((w, ft)));
             }
         }
@@ -10849,7 +10911,7 @@ this case",
         // address computed from them.
         let val_data = match &*elem_t {
             VType::Val(s) => {
-                let w = self.val_fields(&s.clone()).len() as i64;
+                let w = self.val_words(&s.clone()) as i64;
                 Some((self.vals_data_inline(lv), w * 8))
             }
             _ => None,
@@ -17119,12 +17181,13 @@ fields, not the type this is bound to, not an enclosing generic",
                 };
                 let ft = decl[i].1.clone();
                 let flags = cranelift_codegen::ir::MemFlags::trusted();
+                let off = self.val_off(&s, i);
                 let v = if ft.boxed() {
-                    let w = self.b.ins().load(types::I64, flags, p, (8 * i) as i32);
+                    let w = self.b.ins().load(types::I64, flags, p, off);
                     self.call_rt("grasm_val_inc", &[w]);
                     w
                 } else {
-                    self.load_val_scalar(p, i, &ft)
+                    self.load_val_scalar(p, off, &ft)
                 };
                 let pt = VType::Val(s);
                 self.dec_if_boxed(p, &pt);
