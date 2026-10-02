@@ -8473,6 +8473,13 @@ impl FnCx<'_, '_> {
                     return nope(span, format!("the field `{}` of `{s}`", name.name));
                 };
                 let ft = decl[i].1.clone();
+                // Only the literal that builds a value fills an inline field,
+                // which is what the analysis that chooses them requires. A
+                // write here would put a pointer over the first of its three
+                // words, so it is refused rather than miscompiled.
+                if self.inline_field_of(&s, i).is_some() {
+                    return nope(span, format!("a write to the inline field `{s}.{}`", name.name));
+                }
                 if let Some(fs) = self.split_vals.get(&var.as_u32()).cloned() {
                     let (mut nv, mut nt) = self.eval_expr_expecting(value, Some(&ft))?;
                     if ft == VType::F64 && nt == VType::I64 {
@@ -9132,7 +9139,11 @@ impl FnCx<'_, '_> {
                     return Ok(None);
                 };
                 let ft = decl[i].1.clone();
-                if !ft.boxed() {
+                // An inline field has no pointer to lend: its first word is
+                // the buffer's address, and a caller handed that as a boxed
+                // value would read a list header off the elements. The reads
+                // an inline field does allow are answered before this.
+                if !ft.boxed() || self.inline_field_of(&s, i).is_some() {
                     return Ok(None);
                 }
                 let at = self.b.use_var(var);
