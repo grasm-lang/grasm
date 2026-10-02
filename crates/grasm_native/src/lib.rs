@@ -2250,6 +2250,7 @@ arguments nor the type this is bound to",
             movable: std::collections::HashSet::new(),
             moved: std::collections::HashSet::new(),
             unchecked_idx: std::collections::HashSet::new(),
+            in_bce_copy: false,
             version_guard_value: None,
             version_rows: Vec::new(),
             version_val_rows: Vec::new(),
@@ -3012,6 +3013,7 @@ operation's",
             movable: std::collections::HashSet::new(),
             moved: std::collections::HashSet::new(),
             unchecked_idx: std::collections::HashSet::new(),
+            in_bce_copy: false,
             version_guard_value: None,
             version_rows: Vec::new(),
             version_val_rows: Vec::new(),
@@ -3137,6 +3139,7 @@ operation's",
             movable: std::collections::HashSet::new(),
             moved: std::collections::HashSet::new(),
             unchecked_idx: std::collections::HashSet::new(),
+            in_bce_copy: false,
             version_guard_value: None,
             version_rows: Vec::new(),
             version_val_rows: Vec::new(),
@@ -3305,6 +3308,7 @@ operation's",
             movable: std::collections::HashSet::new(),
             moved: std::collections::HashSet::new(),
             unchecked_idx: std::collections::HashSet::new(),
+            in_bce_copy: false,
             version_guard_value: None,
             version_rows: Vec::new(),
             version_val_rows: Vec::new(),
@@ -3765,6 +3769,10 @@ struct FnCx<'a, 'm> {
     moved: std::collections::HashSet<u32>,
     /// Index spans a versioned loop proved in bounds, for its unchecked copy.
     unchecked_idx: std::collections::HashSet<(u32, u32)>,
+    /// Inside a copy of a loop made for `while_bce_plan`. A loop nested in
+    /// one is not versioned again: two copies of two copies is four, and the
+    /// doubling would compound with the nesting depth.
+    in_bce_copy: bool,
     /// The guard `version_guard` computed, taken by the loop it decides.
     version_guard_value: Option<Value>,
     /// The row address of each versioned access, from `version_guard`: the
@@ -5846,6 +5854,262 @@ fn inline_stmt_ok(st: &Stmt, budget: &mut i32, calls: &mut u32) -> bool {
         // A thread, a handler or a `spawn` is frame-shaped and is not moved.
         _ => false,
     }
+}
+
+/// Whether `name` is assigned anywhere in `b`.
+fn assigns_name(b: &grasm_syntax::ast::Block, name: &str) -> bool {
+    fn expr_assigns(e: &Expr, name: &str) -> bool {
+        match e {
+            Expr::If {
+                then_block,
+                else_branch,
+                ..
+            } => {
+                assigns_name(then_block, name)
+                    || match else_branch.as_deref() {
+                        Some(ElseBranch::Else(x)) => assigns_name(x, name),
+                        Some(ElseBranch::ElseIf(x)) => expr_assigns(x, name),
+                        None => false,
+                    }
+            }
+            Expr::Block(x) | Expr::Region(x) | Expr::Unsafe(x) => assigns_name(x, name),
+            Expr::Match { arms, .. } => arms.iter().any(|a| expr_assigns(&a.body, name)),
+            _ => false,
+        }
+    }
+    b.stmts.iter().any(|st| match st {
+        Stmt::Assign { target, .. } => matches!(target, Expr::Ident(id) if id.name == name),
+        Stmt::While { body, .. }
+        | Stmt::For { body, .. }
+        | Stmt::With { body, .. }
+        | Stmt::Spawn { body, .. }
+        | Stmt::Parallel { body, .. } => assigns_name(body, name),
+        Stmt::Expr(e) | Stmt::Return(Some(e), _) => expr_assigns(e, name),
+        Stmt::Let { init, .. } | Stmt::LetTuple { init, .. } => expr_assigns(init, name),
+        _ => false,
+    })
+}
+
+/// Every `buf.at(i)` in `b` whose index is exactly `i`, as (buffer, span of
+/// the index). Anything else keeps its check.
+fn at_uses(b: &grasm_syntax::ast::Block, i: &str, out: &mut Vec<(String, Span)>) {
+    for st in &b.stmts {
+        match st {
+            Stmt::Let { init, .. } | Stmt::LetTuple { init, .. } => at_in_expr(init, i, out),
+            Stmt::Assign { target, value, .. } => {
+                at_in_expr(target, i, out);
+                at_in_expr(value, i, out);
+            }
+            Stmt::Expr(e) | Stmt::Return(Some(e), _) => at_in_expr(e, i, out),
+            Stmt::While { cond, body, .. } => {
+                at_in_expr(cond, i, out);
+                at_uses(body, i, out);
+            }
+            Stmt::For { iter, body, .. } => {
+                at_in_expr(iter, i, out);
+                at_uses(body, i, out);
+            }
+            Stmt::With { handler, body, .. } => {
+                at_in_expr(handler, i, out);
+                at_uses(body, i, out);
+            }
+            Stmt::Spawn { body, .. } | Stmt::Parallel { body, .. } => at_uses(body, i, out),
+            _ => {}
+        }
+    }
+}
+
+fn at_in_expr(e: &Expr, i: &str, out: &mut Vec<(String, Span)>) {
+    match e {
+        Expr::MethodCall {
+            recv, name, args, ..
+        } => {
+            if name.name == "at" && args.len() == 1 {
+                if let (Expr::Ident(buf), Expr::Ident(ix)) = (&**recv, &args[0]) {
+                    if ix.name == i {
+                        out.push((buf.name.clone(), args[0].span()));
+                    }
+                }
+            }
+            at_in_expr(recv, i, out);
+            for a in args {
+                at_in_expr(a, i, out);
+            }
+        }
+        Expr::Call { callee, args, .. } => {
+            at_in_expr(callee, i, out);
+            for a in args {
+                at_in_expr(a, i, out);
+            }
+        }
+        Expr::Str(pieces, _) => {
+            for p in pieces {
+                if let StrPiece::Expr(x) = p {
+                    at_in_expr(x, i, out);
+                }
+            }
+        }
+        Expr::List(xs, _) | Expr::Tuple(xs, _) => {
+            for x in xs {
+                at_in_expr(x, i, out);
+            }
+        }
+        Expr::Map(pairs, _) => {
+            for (k, v) in pairs {
+                at_in_expr(k, i, out);
+                at_in_expr(v, i, out);
+            }
+        }
+        Expr::StructLit { base, fields, .. } => {
+            if let Some(x) = base {
+                at_in_expr(x, i, out);
+            }
+            for (_, v) in fields {
+                at_in_expr(v, i, out);
+            }
+        }
+        Expr::Index { recv, index, .. } => {
+            at_in_expr(recv, i, out);
+            at_in_expr(index, i, out);
+        }
+        Expr::Field { recv, .. } => at_in_expr(recv, i, out),
+        Expr::Unary { expr, .. } | Expr::Try { expr, .. } => at_in_expr(expr, i, out),
+        Expr::Binary { lhs, rhs, .. } => {
+            at_in_expr(lhs, i, out);
+            at_in_expr(rhs, i, out);
+        }
+        Expr::Range { start, end, .. } => {
+            at_in_expr(start, i, out);
+            at_in_expr(end, i, out);
+        }
+        Expr::If {
+            cond,
+            then_block,
+            else_branch,
+            ..
+        } => {
+            at_in_expr(cond, i, out);
+            at_uses(then_block, i, out);
+            match else_branch.as_deref() {
+                Some(ElseBranch::Else(x)) => at_uses(x, i, out),
+                Some(ElseBranch::ElseIf(x)) => at_in_expr(x, i, out),
+                None => {}
+            }
+        }
+        Expr::Match {
+            scrutinee, arms, ..
+        } => {
+            at_in_expr(scrutinee, i, out);
+            for a in arms {
+                if let Some(g) = &a.guard {
+                    at_in_expr(g, i, out);
+                }
+                at_in_expr(&a.body, i, out);
+            }
+        }
+        Expr::Block(x) | Expr::Region(x) | Expr::Unsafe(x) => at_uses(x, i, out),
+        Expr::Closure { body, .. } => at_in_expr(body, i, out),
+        _ => {}
+    }
+}
+
+/// A `while i < n` loop whose body advances `i` by a fixed positive step and
+/// reads buffers at `i`: the index, the bound, and the accesses that a guard
+/// checked once can make unchecked.
+struct BcePlan {
+    index: String,
+    bound: String,
+    bufs: Vec<String>,
+    spans: Vec<Span>,
+}
+
+fn while_bce_plan(cond: &Expr, body: &grasm_syntax::ast::Block) -> Option<BcePlan> {
+    let Expr::Binary {
+        op: BinaryOp::Lt,
+        lhs,
+        rhs,
+        ..
+    } = cond
+    else {
+        return None;
+    };
+    let (Expr::Ident(i), Expr::Ident(n)) = (&**lhs, &**rhs) else {
+        return None;
+    };
+    if n.name == i.name || assigns_name(body, &n.name) {
+        return None;
+    }
+    // Exactly one `i = i + k`, k positive, at the top level and nowhere else:
+    // that is what makes "every value `i` takes lies in `[start, n)`" true.
+    let mut step = None;
+    let mut writes = 0;
+    for st in &body.stmts {
+        let Stmt::Assign { target, op, value, .. } = st else {
+            continue;
+        };
+        let Expr::Ident(t) = target else { continue };
+        if t.name != i.name {
+            continue;
+        }
+        writes += 1;
+        let k = match (op, value) {
+            (AssignOp::Add, Expr::Int(k, _)) => *k,
+            (
+                AssignOp::Assign,
+                Expr::Binary {
+                    op: BinaryOp::Add,
+                    lhs: a,
+                    rhs: bx,
+                    ..
+                },
+            ) => match (&**a, &**bx) {
+                (Expr::Ident(x), Expr::Int(k, _)) if x.name == i.name => *k,
+                _ => return None,
+            },
+            _ => return None,
+        };
+        if k <= 0 {
+            return None;
+        }
+        step = Some(k);
+    }
+    step?;
+    if writes != 1 {
+        return None;
+    }
+    // A write to `i` anywhere but that one statement -- in a branch, a nested
+    // loop -- and the step is not what the guard assumed.
+    let nested = body.stmts.iter().any(|st| {
+        !matches!(st, Stmt::Assign { target: Expr::Ident(t), .. } if t.name == i.name)
+            && assigns_name(
+                &grasm_syntax::ast::Block {
+                    stmts: vec![st.clone()],
+                    span: body.span,
+                },
+                &i.name,
+            )
+    });
+    if nested {
+        return None;
+    }
+    let mut spans = Vec::new();
+    at_uses(body, &i.name, &mut spans);
+    if spans.is_empty() {
+        return None;
+    }
+    let mut bufs: Vec<String> = spans.iter().map(|(b, _)| b.clone()).collect();
+    bufs.sort();
+    bufs.dedup();
+    // A buffer the body replaces is not the one the guard measured.
+    if bufs.iter().any(|b| assigns_name(body, b)) {
+        return None;
+    }
+    Some(BcePlan {
+        index: i.name.clone(),
+        bound: n.name.clone(),
+        bufs,
+        spans: spans.into_iter().map(|(_, s)| s).collect(),
+    })
 }
 
 /// A `while` condition cheap and pure enough to emit twice: names, literals,
@@ -8769,8 +9033,17 @@ impl FnCx<'_, '_> {
     ///
     /// The length and address are pure loads, so in a loop the check is one
     /// compare against a value computed before it.
-    fn bytes_at_fast(&mut self, bv: Value, iv: Value) -> Value {
+    fn bytes_at_fast(&mut self, bv: Value, iv: Value, at: Option<Span>) -> Value {
         let flags = cranelift_codegen::ir::MemFlags::trusted().with_readonly();
+        // A scan whose guard proved the index inside the buffer reads it
+        // straight. Worth more than the compare it drops: the check's cold
+        // path is a call, and a call in the loop pushes everything the loop
+        // carries into callee-saved registers.
+        if at.is_some_and(|sp| self.unchecked_idx.contains(&(sp.start, sp.end))) {
+            let base = self.b.ins().load(types::I64, flags, bv, LAYOUT_BYTES_PTR as i32);
+            let addr = self.b.ins().iadd(base, iv);
+            return self.b.ins().uload8(types::I64, flags, addr, 0);
+        }
         let n = self.bytes_len_with(bv, true);
         let fast = self.b.create_block();
         let slow = self.b.create_block();
@@ -10018,70 +10291,53 @@ impl FnCx<'_, '_> {
                 Ok(StmtOut::Terminated)
             }
             Stmt::While { cond, body, .. } => {
-                // Pinning emits code, so it has to happen while the current
-                // block is still open — before the jump that closes it.
-                // Lists the body only indexes get a raw pointer for the whole
-                // loop, turning each access from a call into a load.
-                self.pin_loop_consts(body)?;
-                self.pin_loop_lists_with(body, &[cond])?;
-                let header = self.b.create_block();
-                let body_blk = self.b.create_block();
-                let exit = self.b.create_block();
-                // A condition of a few loads and compares is tested again at
-                // the bottom of the body rather than by jumping back to the
-                // top, so each iteration is one conditional branch instead of
-                // a conditional and an unconditional one. Cranelift does not
-                // rotate loops itself: `sieve`'s inner `while j <= limit` was
-                // a test, the store, and a jump back to the test.
-                let rotate = rotatable_cond(cond);
-                let latch = if rotate {
-                    self.b.create_block()
+                // A scan whose index is proved inside its buffer runs without
+                // a check per byte. The check is not the whole cost: its cold
+                // path is a *call*, and a call in the loop forces everything
+                // the loop carries into callee-saved registers, so the body
+                // also pays a register move per value per iteration and the
+                // function saves six registers on entry. The guard is checked
+                // once, here, and a second copy of the loop keeps the checks
+                // for when it fails -- so a panic still lands on the access
+                // that caused it.
+                let plan = if self.in_bce_copy
+                    || std::env::var("GRASM_NO_BCE").is_ok_and(|v| v == "1")
+                {
+                    None
                 } else {
-                    header
+                    while_bce_plan(cond, body)
                 };
-                self.b.ins().jump(header, &[]);
+                let guarded = match plan {
+                    Some(p) => self.bce_guard(&p)?,
+                    None => None,
+                };
+                let Some((spans, guard)) = guarded else {
+                    return self.emit_while_loop(cond, body).map(|()| StmtOut::Value(None));
+                };
+                let fast = self.b.create_block();
+                let slow = self.b.create_block();
+                let join = self.b.create_block();
+                self.b.ins().brif(guard, fast, &[], slow, &[]);
                 self.filled = true;
-                self.goto_block(header);
-                let (c, ct) = self.eval_expr_val(cond)?;
-                if ct != VType::Bool {
-                    self.pinned.pop();
-                    self.appends.pop();
-                    self.str_appends.pop();
-                    return nope(cond.span(), "non-bool while condition");
+                self.goto_block(fast);
+                self.unchecked_idx
+                    .extend(spans.iter().map(|sp| (sp.start, sp.end)));
+                self.in_bce_copy = true;
+                let r = self.emit_while_loop(cond, body);
+                for sp in &spans {
+                    self.unchecked_idx.remove(&(sp.start, sp.end));
                 }
-                self.b.ins().brif(c, body_blk, &[], exit, &[]);
+                if r.is_ok() {
+                    self.b.ins().jump(join, &[]);
+                    self.filled = true;
+                    self.goto_block(slow);
+                }
+                let r2 = r.and_then(|()| self.emit_while_loop(cond, body));
+                self.in_bce_copy = false;
+                r2?;
+                self.b.ins().jump(join, &[]);
                 self.filled = true;
-                self.goto_block(body_blk);
-                self.loops
-                    .push((latch, exit, self.vars.len(), self.handlers_installed));
-                let inner = self.eval_block_inner(body);
-                self.loops.pop();
-                self.pinned.pop();
-                let (tail, mut terminated) = inner?;
-                // A loop body is a block in *statement* position, so its last
-                // expression is not a value anybody receives — and the block
-                // walker only decs a discarded expression when it is not the
-                // last one, because in expression position the last one is the
-                // block's result. Dropped here it was never released: a
-                // `while { xs.pop() }` leaked what it popped, every iteration
-                // (F92).
-                self.dec_block_tail(tail);
-                terminated |= self.is_filled();
-                if !terminated {
-                    self.b.ins().jump(latch, &[]);
-                    self.filled = true;
-                }
-                if rotate {
-                    // Reached by falling out of the body and by `continue`.
-                    // A body that always leaves leaves the latch unreached,
-                    // which is still a well-formed block.
-                    self.goto_block(latch);
-                    let (c2, _) = self.eval_expr_val(cond)?;
-                    self.b.ins().brif(c2, body_blk, &[], exit, &[]);
-                    self.filled = true;
-                }
-                self.goto_block(exit);
-                self.close_loop_appends();
+                self.goto_block(join);
                 Ok(StmtOut::Value(None))
             }
             Stmt::For {
@@ -10919,6 +11175,125 @@ this case",
         self.goto_block(exit);
         Ok(())
     }
+
+    /// The run-time guard that makes a scan's accesses safe without a check
+    /// apiece: the index starts at or above zero, and the bound is within
+    /// every buffer the body reads at that index. Both are loop-invariant,
+    /// so this is answered once.
+    ///
+    /// `None` when the loop is not in a shape the guard can be built for --
+    /// the names have to be live scalars and buffers here, which they are
+    /// not if the analysis matched something this function cannot address.
+    fn bce_guard(&mut self, plan: &BcePlan) -> CResult<Option<(Vec<Span>, Value)>> {
+        let Some((ivar, VType::I64)) = self.lookup(&plan.index) else {
+            return Ok(None);
+        };
+        let Some((nvar, VType::I64)) = self.lookup(&plan.bound) else {
+            return Ok(None);
+        };
+        let mut bufs = Vec::with_capacity(plan.bufs.len());
+        for name in &plan.bufs {
+            match self.lookup(name) {
+                Some((v, VType::Bytes)) => bufs.push(v),
+                _ => return Ok(None),
+            }
+        }
+        let i0 = self.b.use_var(ivar);
+        let zero = self.b.ins().iconst(types::I64, 0);
+        let mut ok = self
+            .b
+            .ins()
+            .icmp(IntCC::SignedGreaterThanOrEqual, i0, zero);
+        let n0 = self.b.use_var(nvar);
+        for bv in bufs {
+            let bval = self.b.use_var(bv);
+            // A box that does not hold bytes measures zero here, so the
+            // guard fails and the checked copy runs -- which is also what
+            // makes the unchecked load safe without a tag test of its own.
+            let len = self.bytes_len_fast(bval);
+            let within = self
+                .b
+                .ins()
+                .icmp(IntCC::SignedLessThanOrEqual, n0, len);
+            ok = self.b.ins().band(ok, within);
+        }
+        Ok(Some((plan.spans.clone(), ok)))
+    }
+
+    /// A `while` loop, emitted. Separate from the statement arm because a
+    /// loop whose bounds checks can be skipped is emitted twice, once each
+    /// way, behind the guard that decides.
+    fn emit_while_loop(
+        &mut self,
+        cond: &Expr,
+        body: &grasm_syntax::ast::Block,
+    ) -> CResult<()> {
+        // Pinning emits code, so it has to happen while the current
+        // block is still open — before the jump that closes it.
+        // Lists the body only indexes get a raw pointer for the whole
+        // loop, turning each access from a call into a load.
+        self.pin_loop_consts(body)?;
+        self.pin_loop_lists_with(body, &[cond])?;
+        let header = self.b.create_block();
+        let body_blk = self.b.create_block();
+        let exit = self.b.create_block();
+        // A condition of a few loads and compares is tested again at
+        // the bottom of the body rather than by jumping back to the
+        // top, so each iteration is one conditional branch instead of
+        // a conditional and an unconditional one. Cranelift does not
+        // rotate loops itself: `sieve`'s inner `while j <= limit` was
+        // a test, the store, and a jump back to the test.
+        let rotate = rotatable_cond(cond);
+        let latch = if rotate {
+            self.b.create_block()
+        } else {
+            header
+        };
+        self.b.ins().jump(header, &[]);
+        self.filled = true;
+        self.goto_block(header);
+        let (c, ct) = self.eval_expr_val(cond)?;
+        if ct != VType::Bool {
+            self.pinned.pop();
+            self.appends.pop();
+            self.str_appends.pop();
+            return nope(cond.span(), "non-bool while condition");
+        }
+        self.b.ins().brif(c, body_blk, &[], exit, &[]);
+        self.filled = true;
+        self.goto_block(body_blk);
+        self.loops
+            .push((latch, exit, self.vars.len(), self.handlers_installed));
+        let inner = self.eval_block_inner(body);
+        self.loops.pop();
+        self.pinned.pop();
+        let (tail, mut terminated) = inner?;
+        // A loop body is a block in *statement* position, so its last
+        // expression is not a value anybody receives — and the block
+        // walker only decs a discarded expression when it is not the
+        // last one, because in expression position the last one is the
+        // block's result. Dropped here it was never released: a
+        // `while { xs.pop() }` leaked what it popped, every iteration
+        // (F92).
+        self.dec_block_tail(tail);
+        terminated |= self.is_filled();
+        if !terminated {
+            self.b.ins().jump(latch, &[]);
+            self.filled = true;
+        }
+        if rotate {
+            // Reached by falling out of the body and by `continue`.
+            // A body that always leaves leaves the latch unreached,
+            // which is still a well-formed block.
+            self.goto_block(latch);
+            let (c2, _) = self.eval_expr_val(cond)?;
+            self.b.ins().brif(c2, body_blk, &[], exit, &[]);
+            self.filled = true;
+        }
+        self.goto_block(exit);
+        self.close_loop_appends();
+        Ok(())
+}
 
     /// Whether a counted loop can run without a bounds check per element:
     /// if so, the index spans that may skip it, with the guard that decides
@@ -14304,7 +14679,7 @@ this case",
             if it != VType::I64 {
                 return nope(args[0].span(), "non-integer index");
             }
-            self.bytes_at_fast(borrowed, iv)
+            self.bytes_at_fast(borrowed, iv, Some(args[0].span()))
         } else if f == "grasm_bytes_len" {
             self.bytes_len_fast(borrowed)
         } else if let (VType::List(e), "grasm_list_len" | "grasm_vals_len") = (&vt, f) {
@@ -14853,7 +15228,7 @@ this case",
             }
             (VType::Bytes, "at") => {
                 let i = arg_scalar!(0, VType::I64);
-                let v = self.bytes_at_fast(rv, i);
+                let v = self.bytes_at_fast(rv, i, Some(args[0].span()));
                 self.call_rt("grasm_val_dec", &[rv]);
                 (v, VType::I64)
             }
