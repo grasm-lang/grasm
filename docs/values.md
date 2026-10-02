@@ -169,3 +169,16 @@ prints what was chosen.
 and is 1.67x its time, from 2.6x. The remaining gap is the build: the URL is
 made as a string value and then copied into the field, where Rust formats it
 straight into place.
+
+### After it landed (2026-10-02)
+
+Two more measurements on `dirtyheap`'s build, which is what is left of its
+gap (2.1x Rust's, where its BFS and drop are now at or ahead of parity):
+
+- Building an interpolated string **into** the field, so no string value is
+  made, copied out of and freed, is worth about 4% of the whole program.
+- The `%` in its LCG costs nothing worth chasing: a variant using
+  `bit_and(2147483647)`, which is the one instruction a compiler that could
+  prove the value non-negative would emit, is **no faster**. So the interval
+  analysis that would let Grasm emit it on its own was not written; the build
+  is bound by allocation and memory, not by that arithmetic.

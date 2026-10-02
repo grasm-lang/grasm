@@ -1107,6 +1107,30 @@ pub unsafe extern "C" fn grasm_inline_absorb_str(s: *mut RtVal, out: *mut i64) {
     dec(s);
 }
 
+/// Closes a builder straight into an inline string field's three words at
+/// `out`, with no string value in between.
+///
+/// `grasm_str_build_end` makes a box, which the field then copies out of and
+/// frees -- an allocation and a pass over the text per value built. The
+/// builder's own buffer becomes the field's, so neither happens.
+///
+/// # Safety: `at` is a live builder from `grasm_str_build`, used no further;
+/// `out` is three writable words.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_str_build_end_inline(at: i64, out: *mut i64) {
+    let mut buf = Box::from_raw(at as *mut String);
+    let text = std::mem::take(&mut *buf);
+    // The next build starts with room for one like this, as `build_end` does.
+    *buf = String::with_capacity(text.len() + 16);
+    LOCAL.with(|local| {
+        let mut held = local.builders.borrow_mut();
+        if held.len() < 8 {
+            held.push(buf);
+        }
+    });
+    inline_parts(text.into_bytes(), std::slice::from_raw_parts_mut(out, 3));
+}
+
 /// An inline string field as a string value, for a use that needs one.
 ///
 /// # Safety: `ptr`/`len` are an inline string field's bytes.

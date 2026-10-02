@@ -813,6 +813,7 @@ impl<'m> Codegen<'m> {
             ("grasm_inline_absorb_list", vec![i64t, i64t], None),
             ("grasm_inline_absorb_str", vec![i64t, i64t], None),
             ("grasm_inline_str_box", vec![i64t, i64t], Some(i64t)),
+            ("grasm_str_build_end_inline", vec![i64t, i64t], None),
             ("grasm_str_from_i64", vec![i64t], Some(i64t)),
             ("grasm_str_from_f64", vec![f64t], Some(i64t)),
             ("grasm_str_from_bool", vec![i8t], Some(i64t)),
@@ -8339,6 +8340,21 @@ impl FnCx<'_, '_> {
             };
             let ft = decl[i].1.clone();
             let off = self.val_off(s, i);
+            // An interpolation filling an inline string field is written
+            // into the field: the builder's buffer becomes the field's, so
+            // there is no string value made, copied out of and freed.
+            if let (Some((FK_INSTR, _)), Expr::Str(pieces, _)) = (self.inline_field_of(s, i), fexpr)
+            {
+                if pieces.iter().filter(|p| matches!(p, StrPiece::Expr(_))).count() > 0
+                    && pieces.len() >= 2
+                {
+                    let dst = self.b.ins().iadd_imm(at, i64::from(off));
+                    let open = self.call_rt("grasm_str_build", &[]).unwrap();
+                    self.emit_pieces(open, pieces)?;
+                    self.call_rt("grasm_str_build_end_inline", &[open, dst]);
+                    continue;
+                }
+            }
             let (mut v, vt) = self.eval_expr_expecting(fexpr, Some(&ft))?;
             match self.inline_field_of(s, i) {
                 Some((kind, _)) => {
