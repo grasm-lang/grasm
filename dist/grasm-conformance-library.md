@@ -533,6 +533,7 @@ fn hex(v: i64) -> str {
 //! slice means the same on bytes as on a list: true true true true
 //! and refuses the end a list would clamp: true
 //! index_of: Some(1) Some(3) None None None
+//! a temporary's length: 337 0.337
 //! index 7 out of bounds (len 7)
 // `bytes` is the type `str` deliberately is not ([L-LIB-BYTES]).
 //
@@ -594,11 +595,24 @@ fn main() / {io} {
     print("index_of: {text.index_of(44, 0)} {text.index_of(44, 2)} " +
         "{text.index_of(44, 4)} {text.index_of(44, text.len())} {text.index_of(300, 0)}")
 
+    // The length of a value released straight after it is read: the read has
+    // to happen before the release, wherever the answer is used.
+    print("a temporary's length: {made(337).len()} {made(337).len().as_f64() / 1000.0}")
+
     print("{code.at(code.len())}")
 }
 
 fn same_slice(b: bytes, from: i64, to: i64) -> bool {
     return b.slice(from, to).to_list() == b.to_list().slice(from, to)
+}
+
+/// A fresh buffer of `n` bytes, so its caller holds the only reference.
+fn made(n: i64) -> bytes {
+    var xs: [i64] = []
+    for i in 0..n {
+        xs.push(i % 200)
+    }
+    bytes_of(xs)
 }
 ```
 

@@ -792,6 +792,31 @@ impl StructTy {
     fn boxed(&self, i: usize) -> bool {
         self.kinds.get(i).copied().unwrap_or(FK_BOXED) == FK_BOXED
     }
+
+    /// Calls `f` with every box among `words`, the words of a value list of
+    /// this type.
+    ///
+    /// A type with no boxed field is answered without looking at the words,
+    /// and the field is counted rather than found with `k % width`: freeing a
+    /// list of three million six-float entities divided eighteen million
+    /// times to learn that none of them held a box.
+    #[inline]
+    fn for_each_box(&self, words: &[i64], mut f: impl FnMut(*mut RtVal)) {
+        let w = self.kinds.len().max(1);
+        if !(0..w).any(|i| self.boxed(i)) {
+            return;
+        }
+        let mut k = 0;
+        for c in words {
+            if self.boxed(k) {
+                f(*c as *mut RtVal);
+            }
+            k += 1;
+            if k == w {
+                k = 0;
+            }
+        }
+    }
 }
 
 /// A box holding a scalar field's bits, for a caller that wants a value.
@@ -2588,13 +2613,11 @@ unsafe fn dec_walk(local: &Local, v: *mut RtVal) {
                 }
             }
             RtPayload::ListVals { ty, words } => {
-                let w = ty.kinds.len().max(1);
-                for (k, c) in words.iter().enumerate() {
-                    let c = *c as *mut RtVal;
-                    if ty.boxed(k % w) && release_to_zero(c) {
+                ty.for_each_box(words, |c| {
+                    if release_to_zero(c) {
                         push_pending(&mut inline, &mut n, &mut spill, c);
                     }
-                }
+                });
             }
             RtPayload::Fn { env, .. } => {
                 if release_to_zero(*env) {
@@ -5049,12 +5072,8 @@ pub unsafe extern "C" fn grasm_vals_push(l: *mut RtVal, src: *const i64) -> *mut
         let RtPayload::ListVals { ty, words } = &(*l).payload else {
             grasm_panic_msg_str("push to a value list that is not one");
         };
+        ty.for_each_box(words, |c| inc(c));
         let w = ty.kinds.len().max(1);
-        for (k, c) in words.iter().enumerate() {
-            if ty.boxed(k % w) {
-                inc(*c as *mut RtVal);
-            }
-        }
         // Room for a few elements up front: a list copied on write is
         // usually about to grow, and growing from nothing reallocates often.
         let mut grown = Vec::with_capacity((words.len() + w).max(4 * w));
@@ -5134,12 +5153,7 @@ pub unsafe extern "C" fn grasm_vals_unshare(l: *mut RtVal) -> *mut RtVal {
     let RtPayload::ListVals { ty, words } = &(*l).payload else {
         grasm_panic_msg_str("write into a value list that is not one");
     };
-    let w = ty.kinds.len().max(1);
-    for (k, c) in words.iter().enumerate() {
-        if ty.boxed(k % w) {
-            inc(*c as *mut RtVal);
-        }
-    }
+    ty.for_each_box(words, |c| inc(c));
     let copy = alloc(RtPayload::ListVals {
         ty,
         words: words.clone(),

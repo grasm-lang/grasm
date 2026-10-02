@@ -7004,10 +7004,11 @@ impl FnCx<'_, '_> {
                         self.b.ins().load(types::I64, flags, len_out, 0),
                     )
                 } else {
-                    (
-                        self.call_rt("grasm_vals_data", &[cur]).unwrap(),
-                        self.call_rt("grasm_vals_len", &[cur]).unwrap(),
-                    )
+                    let sn = match &*elem {
+                        VType::Val(sn) => sn.clone(),
+                        _ => unreachable!(),
+                    };
+                    (self.vals_data_inline(cur), self.vals_len_inline(cur, &sn))
                 };
                 scope.insert(name, (data, len, (*elem).clone()));
                 continue;
@@ -8342,56 +8343,80 @@ impl FnCx<'_, '_> {
         ))
     }
 
-    /// `b.len()` of a `bytes` box: a load from beside the buffer when the box
-    /// holds bytes, the runtime call otherwise.
-    fn bytes_len_fast(&mut self, bv: Value) -> Value {
-        // Read-only: a `bytes` box's tag, address, length and buffer never change
-        // while it lives, which is what lets a loop's loads be hoisted out of it.
+    /// The payload tag of a `bytes` box, as a plain read-only `load`.
+    ///
+    /// Not `uload8`: Cranelift treats only `load` with `readonly` and `notrap`
+    /// as pure, so a `uload8` stayed in every loop iteration and was never
+    /// shared between two reads of the same buffer. Reading the tag early is
+    /// safe wherever it is moved to, because every box is wider than its tag.
+    fn bytes_tag(&mut self, bv: Value) -> Value {
         let flags = cranelift_codegen::ir::MemFlags::trusted().with_readonly();
-        let tag = self.b.ins().uload8(types::I32, flags, bv, LAYOUT_PAYLOAD_TAG as i32);
-        let is_bytes = self.b.ins().icmp_imm(IntCC::Equal, tag, LAYOUT_TAG_BYTES);
-        let fast = self.b.create_block();
-        let slow = self.b.create_block();
-        let join = self.b.create_block();
-        self.b.append_block_param(join, types::I64);
-        self.b.ins().brif(is_bytes, fast, &[], slow, &[]);
-        self.goto_block(fast);
-        let n = self.b.ins().load(types::I64, flags, bv, LAYOUT_BYTES_LEN as i32);
-        self.b.ins().jump(join, &[n]);
-        self.goto_block(slow);
-        let m = self.call_rt("grasm_bytes_len", &[bv]).unwrap();
-        self.b.ins().jump(join, &[m]);
-        self.goto_block(join);
-        self.b.block_params(join)[0]
+        let tag = self.b.ins().load(types::I8, flags, bv, LAYOUT_PAYLOAD_TAG as i32);
+        self.b.ins().uextend(types::I32, tag)
     }
 
-    /// `b.at(i)`: one byte load when the box holds bytes and `i` is inside
-    /// them. Anything else -- including an index out of range, which panics
-    /// -- takes the runtime call, so the message is the one it always was.
-    /// It was a call per byte, which is most of what a parser does.
-    fn bytes_at_fast(&mut self, bv: Value, iv: Value) -> Value {
-        // Read-only: a `bytes` box's tag, address, length and buffer never change
-        // while it lives, which is what lets a loop's loads be hoisted out of it.
-        let flags = cranelift_codegen::ir::MemFlags::trusted().with_readonly();
-        let tag = self.b.ins().uload8(types::I32, flags, bv, LAYOUT_PAYLOAD_TAG as i32);
+    /// `b.len()` of a `bytes` box: the length stored beside the buffer when
+    /// the box holds bytes, and 0 otherwise -- which is what the runtime
+    /// answers for a box that does not, so no call is needed for it.
+    ///
+    /// Ordinary loads, not pure ones: Cranelift places a pure operation at its
+    /// first use, and `f().len()` releases the temporary right after this, so
+    /// a pure length read could be placed past the release and read freed
+    /// memory (`gorilla`'s rate came out 0.0).
+    fn bytes_len_fast(&mut self, bv: Value) -> Value {
+        self.bytes_len_with(bv, false)
+    }
+
+    /// The length as `bytes_len_fast` computes it, from pure loads when
+    /// `pure` -- for a caller whose next instruction consumes it in a branch,
+    /// which fixes where it is computed, and whose loop can then compute it
+    /// once, before the loop.
+    fn bytes_len_with(&mut self, bv: Value, pure: bool) -> Value {
+        let flags = if pure {
+            cranelift_codegen::ir::MemFlags::trusted().with_readonly()
+        } else {
+            cranelift_codegen::ir::MemFlags::trusted()
+        };
+        let tag = if pure {
+            self.bytes_tag(bv)
+        } else {
+            self.b.ins().uload8(types::I32, flags, bv, LAYOUT_PAYLOAD_TAG as i32)
+        };
         let is_bytes = self.b.ins().icmp_imm(IntCC::Equal, tag, LAYOUT_TAG_BYTES);
-        let check = self.b.create_block();
+        // Read whatever the box holds there; every box is wider than this,
+        // and the answer is used only when the tag says bytes.
+        let n = self.b.ins().load(types::I64, flags, bv, LAYOUT_BYTES_LEN as i32);
+        let zero = self.b.ins().iconst(types::I64, 0);
+        self.b.ins().select(is_bytes, n, zero)
+    }
+
+    /// `b.at(i)`: one byte load when `i` is inside the buffer. Anything else
+    /// -- an index out of range, which panics, or a box that does not hold
+    /// bytes, whose length reads as 0 -- takes the runtime call, so the
+    /// message is the one it always was. It was a call per byte, which is
+    /// most of what a parser does.
+    ///
+    /// The length and address are pure loads, so in a loop the check is one
+    /// compare against a value computed before it.
+    fn bytes_at_fast(&mut self, bv: Value, iv: Value) -> Value {
+        let flags = cranelift_codegen::ir::MemFlags::trusted().with_readonly();
+        let n = self.bytes_len_with(bv, true);
         let fast = self.b.create_block();
         let slow = self.b.create_block();
         let join = self.b.create_block();
         self.b.append_block_param(join, types::I64);
-        self.b.ins().brif(is_bytes, check, &[], slow, &[]);
-        self.goto_block(check);
-        let n = self.b.ins().load(types::I64, flags, bv, LAYOUT_BYTES_LEN as i32);
         // Unsigned, so a negative index is out of range too.
         let inside = self.b.ins().icmp(IntCC::UnsignedLessThan, iv, n);
         self.b.ins().brif(inside, fast, &[], slow, &[]);
         self.goto_block(fast);
         let base = self.b.ins().load(types::I64, flags, bv, LAYOUT_BYTES_PTR as i32);
         let addr = self.b.ins().iadd(base, iv);
+        // `uload8`, not a pure load: the address is only good once the check
+        // above has passed, and a pure load could be moved ahead of it.
         let byte = self.b.ins().uload8(types::I64, flags, addr, 0);
         self.b.ins().jump(join, &[byte]);
         self.goto_block(slow);
+        self.b.set_cold_block(slow);
         let v = self.call_rt("grasm_bytes_at", &[bv, iv]).unwrap();
         self.b.ins().jump(join, &[v]);
         self.goto_block(join);
@@ -8416,14 +8441,15 @@ impl FnCx<'_, '_> {
     /// for a bool. Every inline scalar-list operation asks this first.
     fn scalar_list_ok(&mut self, lv: Value, k: i64) -> Value {
         let flags = cranelift_codegen::ir::MemFlags::trusted();
-        let ptag = self.b.ins().uload8(types::I32, flags, lv, LAYOUT_PAYLOAD_TAG as i32);
-        let kind = self.b.ins().uload8(types::I32, flags, lv, LAYOUT_SCALAR_KIND as i32);
+        // The payload tag and the element kind are neighbours, so both are
+        // checked with one 16-bit load (little-endian: the tag is the low
+        // byte). Every push and every length asks this.
+        const _: () = assert!(LAYOUT_SCALAR_KIND == LAYOUT_PAYLOAD_TAG + 1);
+        let tag_kind = self.b.ins().uload16(types::I32, flags, lv, LAYOUT_PAYLOAD_TAG as i32);
         let dtag = self.b.ins().uload8(types::I32, flags, lv, LAYOUT_SCALAR_DATA_TAG as i32);
-        let a = self.b.ins().icmp_imm(IntCC::Equal, ptag, LAYOUT_TAG_LIST_SCALAR);
-        let b = self.b.ins().icmp_imm(IntCC::Equal, kind, k);
+        let a = self.b.ins().icmp_imm(IntCC::Equal, tag_kind, LAYOUT_TAG_LIST_SCALAR | (k << 8));
         let c = self.b.ins().icmp_imm(IntCC::Equal, dtag, i64::from(k == 2));
-        let ab = self.b.ins().band(a, b);
-        self.b.ins().band(ab, c)
+        self.b.ins().band(a, c)
     }
 
     /// The buffer address, length and capacity of a scalar list's `Vec`.
@@ -8487,6 +8513,16 @@ impl FnCx<'_, '_> {
     fn vals_push_words(&mut self, lv: Value, words: &[(usize, Value)], s: &str) -> Value {
         let w = self.val_fields(s).len() as i64;
         let flags = cranelift_codegen::ir::MemFlags::trusted();
+        // Into the slot first, before any branch. The slow path needs them
+        // there anyway, and a store is what makes Cranelift compute the words
+        // here: left to it, pure arithmetic is placed in the first block that
+        // uses it, and when that is the fast path, whatever the loop carries
+        // on to (`s` in `s = next(s)` six times over) is computed a second
+        // time after the paths meet -- 42 instructions an entity in `ecs`.
+        let slot = self.val_slot(s);
+        for (i, word) in words {
+            self.b.ins().store(flags, *word, slot, (8 * i) as i32);
+        }
         let ptag = self.b.ins().uload8(types::I32, flags, lv, LAYOUT_PAYLOAD_TAG as i32);
         let is_vals = self.b.ins().icmp_imm(IntCC::Equal, ptag, LAYOUT_TAG_LIST_VALS);
         let check = self.b.create_block();
@@ -8516,10 +8552,6 @@ impl FnCx<'_, '_> {
         self.b.ins().store(flags, need, lv, (base + vl) as i32);
         self.b.ins().jump(join, &[lv]);
         self.goto_block(slow);
-        let slot = self.val_slot(s);
-        for (i, word) in words {
-            self.b.ins().store(flags, *word, slot, (8 * i) as i32);
-        }
         let r = self.call_rt("grasm_vals_push", &[lv, slot]).unwrap();
         self.b.ins().jump(join, &[r]);
         self.goto_block(join);
@@ -8599,11 +8631,39 @@ impl FnCx<'_, '_> {
         self.b.block_params(join)[0]
     }
 
+    /// How many values a value list of struct `sname` holds: its word
+    /// count, read from the `Vec` in its box, over the words per value -- a
+    /// constant here. What `grasm_vals_len` answers, without the call; a
+    /// value list is always held as one (`grasm_vals_len` panics otherwise),
+    /// and `grasm_layout_check_lists` holds the offsets to the runtime's.
+    fn vals_len_inline(&mut self, lv: Value, sname: &str) -> Value {
+        let (_, vl, _) = vec_layout();
+        let flags = cranelift_codegen::ir::MemFlags::trusted();
+        let words = self.b.ins().load(types::I64, flags, lv, (LAYOUT_VALS_VEC + vl) as i32);
+        let w = self.val_fields(sname).len().max(1) as i64;
+        if w == 1 {
+            words
+        } else if w & (w - 1) == 0 {
+            self.b.ins().ushr_imm(words, i64::from(w.trailing_zeros()))
+        } else {
+            self.div_by_magic(words, w)
+        }
+    }
+
+    /// The address of a value list's first word: what `grasm_vals_data`
+    /// answers, without the call.
+    fn vals_data_inline(&mut self, lv: Value) -> Value {
+        let (vp, _, _) = vec_layout();
+        let flags = cranelift_codegen::ir::MemFlags::trusted();
+        self.b.ins().load(types::I64, flags, lv, (LAYOUT_VALS_VEC + vp) as i32)
+    }
+
     /// `xs.len()` for a list of boxed values: a byte load when the list is
     /// inline, the runtime call otherwise.
     fn list_len_fast(&mut self, lv: Value, elem_t: &VType) -> Value {
-        if matches!(elem_t, VType::Val(_)) {
-            return self.call_rt("grasm_vals_len", &[lv]).unwrap();
+        if let VType::Val(sn) = elem_t {
+            let sn = sn.clone();
+            return self.vals_len_inline(lv, &sn);
         }
         if let Some(k) = scalar_kind_i64(elem_t) {
             let ok = self.scalar_list_ok(lv, k);
@@ -10782,12 +10842,14 @@ this case",
         let len_v = self.list_len_fast(lv, &elem_t);
         let len_var = self.new_var(&VType::I64);
         self.b.def_var(len_var, len_v);
-        // A lent value list cannot change while the loop runs, so its words
-        // are found once and each element is an address computed from them.
-        let val_data = match (&*elem_t, lent_list) {
-            (VType::Val(s), true) => {
+        // A value list cannot change while the loop runs -- lent, or held by
+        // the loop's own reference, which every write copies around (see the
+        // length above) -- so its words are found once and each element is an
+        // address computed from them.
+        let val_data = match &*elem_t {
+            VType::Val(s) => {
                 let w = self.val_fields(&s.clone()).len() as i64;
-                Some((self.call_rt("grasm_vals_data", &[lv]).unwrap(), w * 8))
+                Some((self.vals_data_inline(lv), w * 8))
             }
             _ => None,
         };
@@ -13760,7 +13822,7 @@ this case",
             self.bytes_at_fast(borrowed, iv)
         } else if f == "grasm_bytes_len" {
             self.bytes_len_fast(borrowed)
-        } else if let (VType::List(e), "grasm_list_len") = (&vt, f) {
+        } else if let (VType::List(e), "grasm_list_len" | "grasm_vals_len") = (&vt, f) {
             let e = (**e).clone();
             self.list_len_fast(borrowed, &e)
         } else {
@@ -14809,6 +14871,47 @@ checker did",
         Ok(Some(out))
     }
 
+    /// Whether `e` is a `bool` made only of comparisons, `not`, `and` and
+    /// `or` over literals and scalar locals: nothing in it can fail, call,
+    /// allocate or have an effect.
+    fn cheap_pure_bool(&self, e: &Expr) -> bool {
+        match e {
+            Expr::Bool(..) => true,
+            Expr::Ident(id) => matches!(self.lookup(&id.name), Some((_, VType::Bool))),
+            Expr::Unary {
+                op: UnaryOp::Not,
+                expr,
+                ..
+            } => self.cheap_pure_bool(expr),
+            Expr::Binary { op, lhs, rhs, .. } => match op {
+                BinaryOp::And | BinaryOp::Or => self.cheap_pure_bool(lhs) && self.cheap_pure_bool(rhs),
+                BinaryOp::Eq
+                | BinaryOp::NotEq
+                | BinaryOp::Lt
+                | BinaryOp::LtEq
+                | BinaryOp::Gt
+                | BinaryOp::GtEq => {
+                    let lt = self.cheap_scalar(lhs);
+                    lt.is_some() && lt == self.cheap_scalar(rhs)
+                }
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
+    /// The type of a literal or a scalar local, for `cheap_pure_bool`.
+    fn cheap_scalar(&self, e: &Expr) -> Option<VType> {
+        match e {
+            Expr::Int(..) => Some(VType::I64),
+            Expr::Ident(id) => match self.lookup(&id.name) {
+                Some((_, VType::I64)) => Some(VType::I64),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     fn short_circuit(
         &mut self,
         op: BinaryOp,
@@ -14818,6 +14921,21 @@ checker did",
         let (lv, lt) = self.eval_expr_val(lhs)?;
         if lt != VType::Bool {
             return nope(lhs.span(), "non-bool logic operand");
+        }
+        // A right side that is only comparisons of scalar locals and literals
+        // cannot fail, call or allocate, so evaluating it whether or not it
+        // is needed is unobservable -- and costs less than the branch around
+        // it. `c == 34 or c == 92 or c < 32` was three branches.
+        if self.cheap_pure_bool(rhs) {
+            let (rv, rt) = self.eval_expr_val(rhs)?;
+            if rt != VType::Bool {
+                return nope(rhs.span(), "non-bool logic operand");
+            }
+            let out = match op {
+                BinaryOp::And => self.b.ins().band(lv, rv),
+                _ => self.b.ins().bor(lv, rv),
+            };
+            return Ok(Some((out, VType::Bool)));
         }
         let rhs_blk = self.b.create_block();
         let merge = self.b.create_block();
