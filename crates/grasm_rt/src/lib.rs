@@ -1931,8 +1931,28 @@ impl RtBytes {
         }
     }
 
+    /// A window on the same buffer: the bytes `from..end` of this value,
+    /// sharing its allocation instead of copying it.
+    ///
+    /// Sound because `bytes` has no mutating operation -- the buffer behind
+    /// the `Arc` is filled when it is made and never written again -- so two
+    /// windows on one buffer cannot observe each other change. The cost is
+    /// that a window keeps the whole buffer alive; see `grasm_bytes_slice`.
+    fn sub(&self, from: usize, end: usize) -> RtBytes {
+        RtBytes {
+            // In bounds, or one past the end when the window is empty, which
+            // is a pointer it is legal to form and to pass with a length of 0.
+            ptr: unsafe { self.ptr.add(from) },
+            len: end - from,
+            owner: std::sync::Arc::clone(&self.owner),
+        }
+    }
+
     fn as_slice(&self) -> &[u8] {
-        self.owner.as_slice()
+        // The window, which for a value made by `new` is the whole buffer.
+        // An empty `Vec`'s pointer is dangling but aligned and non-null,
+        // which is what `from_raw_parts` asks for at length 0.
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
     }
 }
 
@@ -9662,16 +9682,22 @@ pub unsafe extern "C" fn grasm_bytes_at(v: *mut RtVal, i: i64) -> i64 {
 /// # Safety: boxed values.
 #[no_mangle]
 pub unsafe extern "C" fn grasm_bytes_slice(v: *mut RtVal, from: i64, end: i64) -> *mut RtVal {
-    let b = as_bytes(v);
-    if from < 0 || end < from || end as usize > b.len() {
-        rt_panic(&format!(
-            "slice {from}..{end} out of bounds (len {})",
-            b.len()
-        ));
+    let RtPayload::Bytes(b) = &(*v).payload else {
+        return alloc(RtPayload::Bytes(RtBytes::new(Vec::new())));
+    };
+    let len = b.as_slice().len();
+    if from < 0 || end < from || end as usize > len {
+        rt_panic(&format!("slice {from}..{end} out of bounds (len {len})"));
     }
-    alloc(RtPayload::Bytes(RtBytes::new(
-        b[from as usize..end as usize].to_vec(),
-    )))
+    // A window, not a copy: `bytes` is immutable, so the slice can share the
+    // buffer. A parser that cuts a line out of a chunk and then a field out
+    // of the line copied both before this, which was most of what decoding a
+    // field cost.
+    //
+    // The trade is that a window holds its whole buffer alive. That is the
+    // same bargain Rust's `Bytes` makes, and the shape these buffers are used
+    // in -- a chunk read, sliced, and dropped together -- is the one it suits.
+    alloc(RtPayload::Bytes(b.sub(from as usize, end as usize)))
 }
 
 /// `b.index_of(byte, from)`: the first position at or after `from` holding
@@ -9726,17 +9752,22 @@ pub unsafe extern "C" fn grasm_bytes_to_list(v: *mut RtVal) -> *mut RtVal {
 /// # Safety: boxed values.
 #[no_mangle]
 pub unsafe extern "C" fn grasm_bytes_to_str(v: *mut RtVal) -> *mut RtVal {
-    let text = text_of_bytes(as_bytes(v));
-    alloc(RtPayload::Str(RtStr::new(text)))
+    alloc(RtPayload::Str(str_of_bytes(as_bytes(v))))
 }
 
 /// Bytes as text, invalid sequences replaced. Valid UTF-8 -- nearly all of it
 /// -- is checked by `from_utf8`, which is several times faster than walking
 /// the chunks the lossy conversion does, and only invalid input pays for that.
-fn text_of_bytes(b: &[u8]) -> String {
+///
+/// The valid case hands the borrowed text straight to `RtStr::of`, which
+/// copies it into the value's own 38 bytes when it fits. Going through a
+/// `String` first, as this did, allocated a heap buffer and freed it again on
+/// the next line -- for *every* token a parser cuts out of its input, which
+/// is the thing `RtStr::of`'s own comment warns against.
+fn str_of_bytes(b: &[u8]) -> RtStr {
     match std::str::from_utf8(b) {
-        Ok(t) => t.to_owned(),
-        Err(_) => String::from_utf8_lossy(b).into_owned(),
+        Ok(t) => RtStr::of(t),
+        Err(_) => RtStr::new(String::from_utf8_lossy(b).into_owned()),
     }
 }
 
@@ -9754,8 +9785,9 @@ pub unsafe extern "C" fn grasm_bytes_slice_to_str(v: *mut RtVal, from: i64, end:
             b.len()
         ));
     }
-    let text = text_of_bytes(&b[from as usize..end as usize]);
-    alloc(RtPayload::Str(RtStr::new(text)))
+    alloc(RtPayload::Str(str_of_bytes(
+        &b[from as usize..end as usize],
+    )))
 }
 
 /// # Safety: boxed values.
@@ -10180,7 +10212,7 @@ pub extern "C" fn grasm_exit(code: i64) {
 pub unsafe extern "C" fn grasm_str_lines(s: *mut RtVal) -> *mut RtVal {
     let items: Vec<*mut RtVal> = as_str(s)
         .lines()
-        .map(|l| alloc(RtPayload::Str(RtStr::new(l.to_string()))))
+        .map(|l| alloc(RtPayload::Str(RtStr::of(l))))
         .collect();
     alloc(RtPayload::List(items.into()))
 }
