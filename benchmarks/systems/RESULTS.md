@@ -54,6 +54,46 @@ What is behind each loss, measured rather than guessed:
   value and then copied into the field; Rust formats it into place.
 - **ecs**: the update loop is at parity; the setup loop is behind on
   instructions retired.
-- **proxy tail**: a connection stays on the worker that accepted it, so a
-  paused worker stalls its clients; tokio moves runnable tasks to idle
-  threads. See `proxy/README.md`.
+- **proxy tail**: *unexplained.* The pinning theory below was tested and is
+  wrong. See "The proxy row, re-measured".
+
+## The proxy row, re-measured (2026-10-03)
+
+The table above gives `proxy` as 42,045 rps / p99 29.1 ms against Go's 47,563
+/ 18.5. Those were medians of three *sequential* runs, and this machine drifts
+far more than that between them: the same Grasm binary, run five times in a
+row at 256 connections, gave 52,157 down to 35,893 rps and a p99 from 14.6 to
+35.5 ms. A sequential median cannot separate three proxies through that.
+
+Re-run **interleaved** -- grasm, go, rust, grasm, go, rust, ... five rounds of
+40,000 requests each, medians:
+
+| | Grasm | Rust | Go |
+|---|---|---|---|
+| req/s | 50,366 | 52,308 | **53,128** |
+| p99 ms | 16.7 | **12.8** | 14.1 |
+
+Two of the recorded conclusions do not survive it. **Throughput is parity**:
+Grasm is within 5% of both, not 12% behind Go. **Rust leads the tail**, where
+the recorded row had it behind Grasm. What stands is that Grasm's tail is
+last: 1.18x Go's and 1.30x Rust's, a real gap and a much smaller one than the
+1.57x recorded.
+
+### The pinning theory is wrong
+
+`proxy/README.md` and the row above explained that tail by connection
+affinity: a worker owns the clients it accepted, so a busy worker stalls them
+while others idle. That predicts the tail improves as workers are added, and
+it is disprovable without writing a work-stealing scheduler -- **one worker
+per connection is perfect distribution by construction**. Interleaved, 32
+workers against 256 for 256 connections:
+
+| workers | req/s (median of 5) | p99 ms (median of 5) |
+|---|---|---|
+| 32 | 37,619 | 28.7 |
+| 256 | 35,853 | 27.1 |
+
+No change. Affinity is not what costs the tail, so work stealing would have
+bought nothing, and the cause is now unknown rather than known-and-unfixed.
+`net_wait` is already kqueue on macOS and the accept herd costs 31 wasted
+wake-ups per *connection*, not per request, so neither is a candidate either.

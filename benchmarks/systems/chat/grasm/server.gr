@@ -9,7 +9,8 @@
 //
 // ## One thread, one `net_wait` loop
 //
-// `net_wait` is poll(2): one thread holds every connection, and only reads a
+// `net_wait` is kqueue(2) here, poll(2) elsewhere: one thread holds every
+// connection, and only reads a
 // socket that already has data. This is the design that works. The other
 // shape — a `go` task per connection inside `concurrent` — compiles, but
 // task switches happen only at channel operations, and `tcp_accept`/
