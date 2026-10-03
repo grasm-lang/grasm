@@ -809,6 +809,8 @@ impl<'m> Codegen<'m> {
             ("grasm_stack_floor", vec![i64t], Some(i64t)),
             ("grasm_panic_stack", vec![], None),
             ("grasm_val_release", vec![i64t, i64t], None),
+            ("grasm_inline_free_words", vec![i64t], None),
+            ("grasm_inline_free_bytes", vec![i64t], None),
             ("grasm_val_dup", vec![i64t, i64t], None),
             ("grasm_inline_absorb_list", vec![i64t, i64t], None),
             ("grasm_inline_absorb_str", vec![i64t, i64t], None),
@@ -4687,6 +4689,13 @@ fn collect_idents_block(b: &grasm_syntax::ast::Block, out: &mut Vec<String>) {
 /// walk stops there.
 /// How a struct stores a field of this type: `0` for a box, otherwise the
 /// runtime's `FK_*` kind of a scalar kept as its bits.
+/// A field held as a pointer to a box: the kind `field_kind` gives anything
+/// that is not a scalar. Named so the matches below read as patterns rather
+/// than bindings -- written bare, `FK_BOXED` is a binding that matches every
+/// kind, which is how the first version of the inline release freed nothing
+/// and decremented a buffer address instead.
+const FK_BOXED: u8 = 0;
+
 /// An inline list of scalars, an inline list of values, and an inline
 /// string: a field of one of these kinds is the three words of a `Vec`
 /// rather than a pointer to a box. Mirrors `grasm_rt`'s `FK_*`, as the
@@ -8486,12 +8495,39 @@ impl FnCx<'_, '_> {
 
     /// Releases the boxed fields of the value at `at`.
     fn drop_val(&mut self, at: Value, s: &str) {
-        // A type with an inline field owns buffers as well as boxes, and
-        // what an inline list of values holds is only known from the
-        // descriptor, so the runtime does the walk.
         if self.val_has_inline(s) {
-            let d = self.val_desc(s);
-            self.call_rt("grasm_val_release", &[d, at]);
+            let kinds = self.val_kinds(s);
+            // An inline list *of values* owns whatever its elements own, and
+            // only the descriptor says what that is, so the runtime walks it.
+            // Buffers of scalars and of text need no walk: the field's
+            // offset and its element width are known here, so each is freed
+            // where it is -- no descriptor, and none of the two reaches for
+            // the thread's state that the walk makes per value.
+            if kinds.contains(&FK_INVALS) {
+                let d = self.val_desc(s);
+                self.call_rt("grasm_val_release", &[d, at]);
+                return;
+            }
+            let offs = self.val_offs(s);
+            let flags = cranelift_codegen::ir::MemFlags::trusted();
+            for (i, &k) in kinds.iter().enumerate() {
+                let off = (8 * offs[i]) as i32;
+                match k {
+                    FK_BOXED => {
+                        let w = self.b.ins().load(types::I64, flags, at, off);
+                        self.call_rt("grasm_val_dec", &[w]);
+                    }
+                    FK_INLIST => {
+                        let fp = self.b.ins().iadd_imm(at, i64::from(off));
+                        self.call_rt("grasm_inline_free_words", &[fp]);
+                    }
+                    FK_INSTR => {
+                        let fp = self.b.ins().iadd_imm(at, i64::from(off));
+                        self.call_rt("grasm_inline_free_bytes", &[fp]);
+                    }
+                    _ => {}
+                }
+            }
             return;
         }
         let flags = cranelift_codegen::ir::MemFlags::trusted();

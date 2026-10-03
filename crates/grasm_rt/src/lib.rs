@@ -1041,6 +1041,29 @@ pub unsafe extern "C" fn grasm_val_release(desc: *const StructDesc, p: *const i6
     });
 }
 
+/// Frees one inline field's buffer, given the three words the field holds.
+///
+/// `grasm_val_release` walks a descriptor to find which fields own what, and
+/// reaches the thread's state twice on the way. A type whose inline fields
+/// are plain buffers needs none of that: the backend knows where they are
+/// and how wide their elements are, so it frees them directly. Freeing two
+/// buffers per node was the second-hottest thing in the runtime.
+///
+/// # Safety: the three words at `w` were written by `inline_parts` for a
+/// `Vec` of eight-byte elements, and are not used again.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_inline_free_words(w: *const i64) {
+    drop(inline_vec::<i64>(std::slice::from_raw_parts(w, 3)));
+}
+
+/// The same for a field holding bytes.
+///
+/// # Safety: as `grasm_inline_free_words`, for a `Vec<u8>`.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_inline_free_bytes(w: *const i64) {
+    drop(inline_vec::<u8>(std::slice::from_raw_parts(w, 3)));
+}
+
 /// Makes the value at `p`, a bit-for-bit copy of one that still owns what it
 /// holds, own its own (`StructTy::dup_words`).
 ///
