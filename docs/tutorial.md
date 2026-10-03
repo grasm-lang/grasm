@@ -230,11 +230,29 @@ even if every caller happens to pass something showable. And a call with a
 type that has no `impl` is refused at that call, by name — "`Dog` does not
 implement `Show`" — rather than somewhere inside the generic function.
 
-Two limits for now, both refused with a message: an `impl` is for a declared
-non-generic type or for `i64`, `f64`, `bool` or `str`; and an interface method
-performs no effects, so an `impl` method cannot print. The second is what lets
-a generic function's own effect row stay honest without knowing which `impl`
-it will reach.
+An interface method may declare an effect row, and then its implementations
+may perform it:
+
+```
+interface Sink {
+    fn emit(self, line: str) / {io}
+}
+
+fn send_all[T: Sink](s: T, xs: [str]) / {io} {
+    for x in xs {
+        s.emit(x)
+    }
+}
+```
+
+`send_all` has to declare `io` itself, because a call through a bound performs
+whatever the *interface* said — which is how a generic function's row stays
+honest without knowing which `impl` it will reach. An `impl` may not declare
+more than its interface does, so nothing can smuggle an effect past a
+package's capabilities. An interface method with no row performs nothing.
+
+One limit for now, refused with a message: an `impl` is for a declared
+non-generic type or for `i64`, `f64`, `bool` or `str`.
 
 ## 4. Errors are values
 

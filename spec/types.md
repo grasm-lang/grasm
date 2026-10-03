@@ -196,8 +196,13 @@ those bounds; otherwise it is an error naming the type and the interface.
 with the interface's signature under `Self` = the implementing type, and
 nothing else.
 
-**[T-INTERFACE-PURE]** An interface method declares no effects, so an `impl`
-method may perform none; one that does is an error at the `impl`.
+**[T-INTERFACE-EFFECTS]** An interface method may declare an effect row; an
+`impl` may perform that row and no more, and declaring an effect the interface
+does not is an error at the `impl`. A call through a bound performs the
+*interface's* row, charged to the caller — so `fn send[T: Sink](s: T) / {io}`
+must say `io` though it cannot know which `impl` it reaches. That keeps a
+generic row honest and a manifest's capabilities meaningful: no `impl` can
+smuggle an effect past the row its interface wrote. No row, no effects.
 
 ### Contracts
 

@@ -289,7 +289,7 @@ May change or be removed in any release. New surface starts here.
 - `T-INTERFACE` — experimental
 - `T-INTERFACE-BOUND` — experimental
 - `T-INTERFACE-IMPL` — experimental
-- `T-INTERFACE-PURE` — experimental
+- `T-INTERFACE-EFFECTS` — experimental
 - `T-INTERFACE-UNSATISFIED` — experimental
 - `T-LINEAR` — experimental
 - `T-LINEAR-CONTAIN` — experimental

@@ -967,16 +967,11 @@ impl Parser {
             let m_name = self.ident()?;
             let params = self.parse_params_self(Some(&self_ty))?;
             let (ret, err, fx) = self.parse_fn_tail()?;
-            if fx.is_some() {
-                self.error_here(
-                    "an interface method declares no effects ([T-INTERFACE-PURE])",
-                );
-                return Err(());
-            }
             let span = m_start.merge(self.toks[self.i - 1].span);
             methods.push(FnSig {
                 name: m_name,
                 params,
+                effects: fx,
                 ret,
                 err,
                 span,
@@ -1041,16 +1036,14 @@ impl Parser {
             }
             f.ret = f.ret.as_ref().map(|t| replace_self(t, &ty));
             f.err = f.err.as_ref().map(|t| replace_self(t, &ty));
-            // An interface method performs nothing, so its `impl` may not
-            // either ([T-INTERFACE-PURE]). Declaring the empty row lets the
-            // ordinary row check say so, at the line that performs.
-            if f.effects.is_some() {
-                self.diags.push(Diagnostic::error(
-                    f.name.span,
-                    "an `impl` method declares no effects: its interface's methods perform none ([T-INTERFACE-PURE])",
-                ));
+            // The row the `impl` wrote is kept, and the ordinary row check
+            // holds the body to it. That it is also within the interface's
+            // row is checked where the interface is known
+            // ([T-INTERFACE-EFFECTS]); here there is no interface to read.
+            // An `impl` that writes no row performs nothing, as before.
+            if f.effects.is_none() {
+                f.effects = Some(Vec::new());
             }
-            f.effects = Some(Vec::new());
             let lowered = impl_fn_name(&f.name.name, &type_name);
             methods.push((f.name.clone(), lowered.clone()));
             f.name = Ident {
@@ -1545,11 +1538,12 @@ impl Parser {
             self.expect(&TokenKind::KwFn)?;
             let op_name = self.ident()?;
             let params = self.parse_params()?;
-            let (ret, err, _fx) = self.parse_fn_tail()?;
+            let (ret, err, fx) = self.parse_fn_tail()?;
             let span = op_start.merge(self.toks[self.i - 1].span);
             ops.push(FnSig {
                 name: op_name,
                 params,
+                effects: fx,
                 ret,
                 err,
                 span,

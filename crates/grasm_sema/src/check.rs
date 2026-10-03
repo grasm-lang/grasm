@@ -1880,6 +1880,63 @@ nothing says who owns it, how long it lives, or how long it is"
                     );
                     continue;
                 }
+                // The row an `impl` may perform is the interface's, and no
+                // wider: a bounded call charges the caller what the
+                // *interface* declares, so a method that performed more than
+                // that would be reached through a row that does not mention
+                // it -- and a package's capabilities are checked against
+                // those rows ([T-INTERFACE-EFFECTS]).
+                let allowed: std::collections::BTreeSet<&str> = m
+                    .effects
+                    .iter()
+                    .flatten()
+                    .map(|p| p.segments[0].name.as_str())
+                    .collect();
+                let declared = module.decls.iter().find_map(|d| match d {
+                    Decl::Fn(f) if f.name.name == *lowered => f.effects.as_ref(),
+                    _ => None,
+                });
+                let extra: Vec<String> = declared
+                    .into_iter()
+                    .flatten()
+                    .map(|p| p.segments[0].name.clone())
+                    .filter(|e| {
+                        !allowed.contains(e.as_str())
+                            && !allowed.iter().any(|a| e.split('.').next() == Some(*a))
+                    })
+                    .collect();
+                if !extra.is_empty() {
+                    let list = extra
+                        .iter()
+                        .map(|e| format!("`{e}`"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let shown = if allowed.is_empty() {
+                        "performs nothing".to_string()
+                    } else {
+                        let names: Vec<String> =
+                            allowed.iter().map(|a| format!("`{a}`")).collect();
+                        format!("performs {}", names.join(", "))
+                    };
+                    // At the `impl`'s own method, which is the one to change.
+                    let at = im
+                        .methods
+                        .iter()
+                        .find(|(n, _)| n.name == m.name.name)
+                        .map_or(im.span, |(n, _)| n.span);
+                    self.error_help(
+                        at,
+                        format!(
+                            "`{}` for `{tname}` declares {list}, which `{iname}` does not",
+                            m.name.name
+                        ),
+                        format!(
+                            "`{iname}` says `{}` {shown}, and a caller is charged that row ([T-INTERFACE-EFFECTS])",
+                            m.name.name
+                        ),
+                    );
+                    continue;
+                }
                 let slot = (tname.clone(), m.name.name.clone());
                 if let Some((_, other)) = self.impls.get(&slot) {
                     let other = other.clone();
@@ -1933,6 +1990,17 @@ nothing says who owns it, how long it lives, or how long it is"
                     ),
                 ));
             };
+            // What the method may perform is the interface's to say, not the
+            // caller's to discover: the call site records the row so the
+            // effect pass charges it to whoever made the call, without
+            // knowing which `impl` will answer ([T-INTERFACE-EFFECTS]).
+            if let Some(fx) = &sig.effects {
+                if !fx.is_empty() {
+                    let row: std::collections::BTreeSet<String> =
+                        fx.iter().map(|p| p.segments[0].name.clone()).collect();
+                    self.callee_rows.insert((span.start, span.end), row);
+                }
+            }
             // `Self` is this type parameter.
             let mut names = vec![String::new(); i + 1];
             names[i] = "Self".to_string();

@@ -1091,7 +1091,7 @@ once inside `main`",
                     .collect::<Vec<_>>()
                     .join(", ");
                 // An `impl` method, lowered to `method@Type`: said in the
-                // words the source used ([T-INTERFACE-PURE]).
+                // words the source used ([T-INTERFACE-EFFECTS]).
                 // A contract, lowered to `f@requiresN` / `f@ensuresN` with the
                 // empty row ([T-CONTRACT-PURE]).
                 if let Some((owner, kind)) = f.name.name.split_once('@') {
@@ -1130,7 +1130,7 @@ once inside `main`",
                             ),
                         )
                         .with_help(
-                            "move the effect to the caller, or handle it inside the method ([T-INTERFACE-PURE])",
+                            "declare it on the interface's method, move it to the caller, or handle it inside ([T-INTERFACE-EFFECTS])",
                         ),
                     );
                     continue;

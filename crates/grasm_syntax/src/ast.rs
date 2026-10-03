@@ -223,6 +223,11 @@ pub struct FnSig {
     pub params: Vec<Param>,
     pub ret: Option<TypeExpr>,
     pub err: Option<TypeExpr>,
+    /// What an implementation of this method may perform. A bounded call
+    /// contributes it to the row of the function making the call, which is
+    /// what lets a generic function stay honest without knowing which `impl`
+    /// it will reach ([T-INTERFACE-EFFECTS]).
+    pub effects: Option<Vec<Path>>,
     pub span: Span,
 }
 

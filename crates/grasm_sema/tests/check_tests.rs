@@ -4161,3 +4161,58 @@ fn a_reference_to_a_sum_is_read_and_written_through_value() {
         "a tuple has no field `value`",
     );
 }
+
+/// An interface method's effect row bounds its implementations, and a call
+/// through a bound charges the caller that row ([T-INTERFACE-EFFECTS]).
+///
+/// Both halves are refusals, and a conformance program has one answer, so
+/// they live here. `spec/conformance/T-INTERFACE-EFFECTS-ROW.gr` shows the
+/// accepted shape.
+#[test]
+fn an_interface_effect_row_bounds_its_impls_and_charges_its_callers() {
+    // An `impl` may not declare an effect its interface does not: a bounded
+    // call contributes the *interface's* row, so the extra one would be
+    // reached through a row that never mentions it -- and a package's
+    // capabilities are checked against those rows.
+    check_err(
+        "interface Sink {\n\
+         \x20   fn emit(self, line: str) / {io}\n\
+         }\n\
+         type Net = { host: str }\n\
+         impl Sink for Net {\n\
+         \x20   fn emit(self, line: str) / {io, net} {\n\
+         \x20       print(\"{self.host} {line}\")\n\
+         \x20   }\n\
+         }\n\
+         fn main() / {io} {\n\
+         \x20   Net{ host: \"h\" }.emit(\"x\")\n\
+         }\n",
+        "declares `net`, which `Sink` does not",
+    );
+    // And a generic body whose declared row omits what its bound performs is
+    // refused where it is written, not where it is called.
+    check_err(
+        "interface Sink {\n\
+         \x20   fn emit(self, line: str) / {io}\n\
+         }\n\
+         fn send[T: Sink](s: T) / {} {\n\
+         \x20   s.emit(\"x\")\n\
+         }\n\
+         fn main() {\n\
+         }\n",
+        "performs effect(s) `io` not in its declared row",
+    );
+    // An interface that declares no row still admits no effect at all.
+    check_err(
+        "interface Show {\n\
+         \x20   fn show(self) -> str\n\
+         }\n\
+         type P = { x: i64 }\n\
+         impl Show for P {\n\
+         \x20   fn show(self) -> str / {io} { \"{self.x}\" }\n\
+         }\n\
+         fn main() {\n\
+         }\n",
+        "declares `io`, which `Show` does not",
+    );
+}

@@ -125,6 +125,25 @@ fn total_weight[T: Weigh](xs: [T]) -> i64 {
     t
 }
 
+// [T-INTERFACE-EFFECTS]: an interface method that declares a row, and a
+// bounded function that must declare the same one to call it.
+interface Note {
+    fn note(self, k: i64) -> i64 / {io}
+}
+
+impl Note for Pt {
+    // Declares the row its interface declares, and performs nothing of it:
+    // a law answers `ok` and nothing else, and what is under test here is
+    // that the row crosses the bound at all.
+    fn note(self, k: i64) -> i64 / {io} {
+        self.x * 100 + self.y * 10 + k
+    }
+}
+
+fn note_via_bound[T: Note](x: T, k: i64) -> i64 / {io} {
+    x.note(k)
+}
+
 fn fails() -> i64 ! Bad {
     fail(Bad)
 }
@@ -359,6 +378,7 @@ CLAUSES = {
     "T-REF-GENERATIONAL": "a released slot is dead",
     "T-GENERIC-FN": "generic keeps the type",
     "T-INTERFACE": "a bounded call is the direct call",
+    "T-INTERFACE-EFFECTS": "an effectful bounded call is the direct call",
     "T-LINEAR": "a linear value arrives intact",
     "T-FALLIBLE": "a fallible ok is the value",
     "L-LIB-RANGE-OPS": "a range holds its bounds",
@@ -412,6 +432,14 @@ LAWS = {
  # its own signature promises none, breaks one of the two.
  "an explicit unit return is the plain one":
                               'let a = ref(0)\n    let b = ref(0)\n    for _i in 0..LIMIT {\n        ends_plainly(a)\n        ends_explicitly(b)\n    }\n    let plain = a.value\n    let explicit = b.value\n    release(a)\n    release(b)\n    let taken = ref(0)\n    let skipped = ref(0)\n    ends_in_a_branch(taken, true)\n    ends_in_a_branch(skipped, false)\n    let early = taken.value\n    let late = skipped.value\n    release(taken)\n    release(skipped)\n    say(plain == explicit and plain == LIMIT and early == 1 and late == 10)',
+ # A method that declares an effect still dispatches like any other, and the
+ # relation is between two calls rather than a recorded answer: reached through
+ # a bound and reached directly, the same `impl` must run and give the same
+ # result. That the program compiles at all is the other half -- a bounded call
+ # performs the interface's row, so `note_via_bound` has to declare `io`, and a
+ # backend that charged the caller nothing would let the row be dropped.
+ "an effectful bounded call is the direct call":
+                              'let p = Pt{ x: 2, y: 3 }\n    let bound = note_via_bound(p, 7)\n    let direct = p.note(7)\n    say(bound == direct and bound == 237)',
  "rev twice is identity":      'let xs = [3, 1, 2]\n    say(xs.rev().rev() == xs)',
  # A law a degenerate implementation satisfies is not a law: `rev` as the
  # identity passes "rev twice is identity", and did.
