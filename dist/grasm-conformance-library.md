@@ -534,7 +534,8 @@ fn hex(v: i64) -> str {
 //! and refuses the end a list would clamp: true
 //! index_of: Some(1) Some(3) None None None
 //! a temporary's length: 337 0.337
-//! index 7 out of bounds (len 7)
+//! scanned: 13 0 3 1
+//! index 5 out of bounds (len 5)
 // `bytes` is the type `str` deliberately is not ([L-LIB-BYTES]).
 //
 // The sequence below is x86-64 `mov rax, 1`. Written through a `str` it lands
@@ -599,7 +600,32 @@ fn main() / {io} {
     // to happen before the release, wherever the answer is used.
     print("a temporary's length: {made(337).len()} {made(337).len().as_f64() / 1000.0}")
 
-    print("{code.at(code.len())}")
+    // A scan over a buffer: the index is read at every step, and the loop's
+    // own bound is what keeps it inside. Counted from several starts, and
+    // over an empty range, because a compiler may prove the bound once and
+    // read without checking -- and then these are the answers it has to keep.
+    let text2 = "a,b,c".to_bytes()
+    print("scanned: {commas(text2, 0, text2.len())} {commas(text2, 0, 0)} " +
+        "{commas(text2, 3, text2.len())} {commas(text2, 0, 3)}")
+
+    // Past the end: whatever the loop was proved to allow, this is still the
+    // read that fails, with the message every other out-of-range read gives.
+    print("{commas(text2, 0, text2.len() + 2)}")
+}
+
+/// Where the commas are, as a number built from their positions: a scan
+/// whose bound is the caller's, so it is only inside the buffer when the
+/// caller's bound is.
+fn commas(b: bytes, from: i64, upto: i64) -> i64 {
+    var i = from
+    var acc = 0
+    while i < upto {
+        if b.at(i) == 44 {
+            acc = acc * 10 + i
+        }
+        i = i + 1
+    }
+    acc
 }
 
 fn same_slice(b: bytes, from: i64, to: i64) -> bool {

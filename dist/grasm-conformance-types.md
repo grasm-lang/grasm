@@ -1860,6 +1860,64 @@ fn main() {
 }
 ```
 
+## `T-INTERFACE-EFFECTS.gr`
+
+```grasm
+//! tag: T-INTERFACE-EFFECTS
+//! expect: output
+//! log: one
+//! log: two
+//! counted 3
+// An interface method may declare an effect row, and a call through a bound
+// performs it -- charged to the function making the call, which cannot know
+// which `impl` it will reach. `send_all` must say `io` itself.
+//
+// The three refusals this rule rests on cannot be shown here, because a
+// program has one answer and this one is an answer: an `impl` declaring an
+// effect its interface does not, a generic body whose declared row omits what
+// its bound performs, and an `impl` of a method with no row performing one.
+// All three are in `crates/grasm_sema/tests/check_tests.rs`.
+interface Sink {
+    fn emit(self, line: str) / {io}
+}
+
+/// An interface method with no row still performs nothing.
+interface Tag {
+    fn tag(self) -> str
+}
+
+type Console = { name: str }
+
+impl Sink for Console {
+    fn emit(self, line: str) / {io} {
+        print("{self.name}: {line}")
+    }
+}
+
+impl Tag for Console {
+    fn tag(self) -> str {
+        self.name
+    }
+}
+
+fn send_all[T: Sink](s: T, xs: [str]) / {io} {
+    for x in xs {
+        s.emit(x)
+    }
+}
+
+/// A bound whose method performs nothing leaves this row empty.
+fn name_of[T: Tag](s: T) -> str {
+    s.tag()
+}
+
+fn main() / {io} {
+    let c = Console{ name: "log" }
+    send_all(c, ["one", "two"])
+    print("counted {name_of(c).len()}")
+}
+```
+
 ## `T-INTERFACE-IMPL.gr`
 
 ```grasm
@@ -1882,33 +1940,6 @@ impl Ord for Point {
 
 fn main() {
     print("never")
-}
-```
-
-## `T-INTERFACE-PURE.gr`
-
-```grasm
-//! tag: T-INTERFACE-PURE
-//! expect: error
-//! performs `io`
-// An interface method declares no effects, so a bounded call cannot perform
-// any. An `impl` method that prints would let a generic body with an empty row
-// print through it.
-interface Show {
-    fn show(self) -> str
-}
-
-type Point = { x: i64 }
-
-impl Show for Point {
-    fn show(self) -> str {
-        print("side effect")
-        "p"
-    }
-}
-
-fn main() {
-    print(Point{ x: 1 }.show())
 }
 ```
 

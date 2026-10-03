@@ -635,8 +635,13 @@ those bounds; otherwise it is an error naming the type and the interface.
 with the interface's signature under `Self` = the implementing type, and
 nothing else.
 
-**[T-INTERFACE-PURE]** An interface method declares no effects, so an `impl`
-method may perform none; one that does is an error at the `impl`.
+**[T-INTERFACE-EFFECTS]** An interface method may declare an effect row; an
+`impl` may perform that row and no more, and declaring an effect the interface
+does not is an error at the `impl`. A call through a bound performs the
+*interface's* row, charged to the caller — so `fn send[T: Sink](s: T) / {io}`
+must say `io` though it cannot know which `impl` it reaches. That keeps a
+generic row honest and a manifest's capabilities meaningful: no `impl` can
+smuggle an effect past the row its interface wrote. No row, no effects.
 
 ### Contracts
 
@@ -3205,11 +3210,29 @@ even if every caller happens to pass something showable. And a call with a
 type that has no `impl` is refused at that call, by name — "`Dog` does not
 implement `Show`" — rather than somewhere inside the generic function.
 
-Two limits for now, both refused with a message: an `impl` is for a declared
-non-generic type or for `i64`, `f64`, `bool` or `str`; and an interface method
-performs no effects, so an `impl` method cannot print. The second is what lets
-a generic function's own effect row stay honest without knowing which `impl`
-it will reach.
+An interface method may declare an effect row, and then its implementations
+may perform it:
+
+```
+interface Sink {
+    fn emit(self, line: str) / {io}
+}
+
+fn send_all[T: Sink](s: T, xs: [str]) / {io} {
+    for x in xs {
+        s.emit(x)
+    }
+}
+```
+
+`send_all` has to declare `io` itself, because a call through a bound performs
+whatever the *interface* said — which is how a generic function's row stays
+honest without knowing which `impl` it will reach. An `impl` may not declare
+more than its interface does, so nothing can smuggle an effect past a
+package's capabilities. An interface method with no row performs nothing.
+
+One limit for now, refused with a message: an `impl` is for a declared
+non-generic type or for `i64`, `f64`, `bool` or `str`.
 
 ## 4. Errors are values
 
