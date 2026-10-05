@@ -780,6 +780,12 @@ fn needs_space(prev: &Piece, next: &Piece, braces: &[Brace], this_brace: Option<
     if n_op && n == "(" && prev.kind == Kind::Word && matches!(p, "fn" | "ref") {
         return false;
     }
+    // `impl[T: Show] Show for [T]`: the parameters belong to the `impl` and
+    // are written as a function writes its own, so they close up against the
+    // keyword even though `impl` is one ([T-INTERFACE-GENERIC]).
+    if n_op && n == "[" && prev.kind == Kind::Word && p == "impl" {
+        return false;
+    }
     // A call or an index closes up against the thing it applies to; a keyword
     // does not, because `if (a)` is not calling `if`.
     if n_op && (n == "(" || n == "[") {

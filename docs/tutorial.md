@@ -251,8 +251,42 @@ honest without knowing which `impl` it will reach. An `impl` may not declare
 more than its interface does, so nothing can smuggle an effect past a
 package's capabilities. An interface method with no row performs nothing.
 
-One limit for now, refused with a message: an `impl` is for a declared
-non-generic type or for `i64`, `f64`, `bool` or `str`.
+An `impl` is for a *shape*, and may introduce its own bounded parameters:
+
+```
+interface Show {
+    fn show(self) -> str
+}
+
+impl Show for i64 {
+    fn show(self) -> str {
+        "{self}"
+    }
+}
+
+impl[T: Show] Show for [T] {
+    fn show(self) -> str {
+        var out = "["
+        var first = true
+        for v in self {
+            if not first { out = out + ", " }
+            out = out + v.show()
+            first = false
+        }
+        out + "]"
+    }
+}
+
+fn main() / {io} {
+    print([[1, 2], [3]].show())
+}
+```
+
+One `impl` then serves `[i64]`, `[Point]` and `[[i64]]` alike -- the last
+satisfies the bound through this very `impl`. A declared generic type is a
+shape too (`impl[A: Show] Show for Pair[A]`), and takes the parameters it was
+declared with. Each shape has one `impl` of each interface, so no two can
+overlap and there is never a question of which one runs.
 
 ## 4. Errors are values
 

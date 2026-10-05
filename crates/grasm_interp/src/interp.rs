@@ -3971,6 +3971,9 @@ uses to mark the end of a string"
                 Value::Str(_) => "str".to_string(),
                 Value::Struct { name, .. } => name.to_string(),
                 Value::Variant { type_name, .. } => type_name.to_string(),
+                // The shape a generic `impl` is keyed by, matching what the
+                // checker's `impl_key` answers ([T-INTERFACE-GENERIC]).
+                Value::List(_) => "[]".to_string(),
                 _ => String::new(),
             };
             let Some(qual) = self.impl_fns.get(&(tname.clone(), name.name.clone())).cloned() else {

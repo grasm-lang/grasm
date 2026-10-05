@@ -4216,3 +4216,57 @@ fn an_interface_effect_row_bounds_its_impls_and_charges_its_callers() {
         "declares `io`, which `Show` does not",
     );
 }
+
+/// An `impl` is for a shape, and the parameters it introduces are what the
+/// shape is written in terms of ([T-INTERFACE-GENERIC]).
+///
+/// The accepted shapes are in `spec/conformance/T-INTERFACE-GENERIC.gr`;
+/// these are the three refusals, which a conformance program cannot be.
+#[test]
+fn a_generic_impl_is_for_a_shape_and_its_own_parameters() {
+    // An element is only what its bound says it is, exactly as in a generic
+    // function: without `: Show` the `impl` cannot call `show` on an element,
+    // even though every type it will be reached with happens to have one.
+    check_err(
+        "interface Show {\n\
+         \x20   fn show(self) -> str\n\
+         }\n\
+         impl Show for i64 {\n\
+         \x20   fn show(self) -> str { \"{self}\" }\n\
+         }\n\
+         impl[T] Show for [T] {\n\
+         \x20   fn show(self) -> str { self[0].show() }\n\
+         }\n\
+         fn main() {\n\
+         }\n",
+        "has no method `show`",
+    );
+    // A declared type is given the parameters it was declared with, so an
+    // `impl` cannot quietly introduce one the type has no room for.
+    check_err(
+        "interface Show {\n\
+         \x20   fn show(self) -> str\n\
+         }\n\
+         type Pair[A] = { left: A, right: A }\n\
+         impl[A, B] Show for Pair[A] {\n\
+         \x20   fn show(self) -> str { \"x\" }\n\
+         }\n\
+         fn main() {\n\
+         }\n",
+        "takes 1 type parameter(s) and this `impl` introduces 2",
+    );
+    // And a list shape is for every element type: writing one for `[i64]`
+    // alone would be an `impl` two shapes could claim, so it is refused at
+    // the type rather than left to overlap.
+    check_err(
+        "interface Show {\n\
+         \x20   fn show(self) -> str\n\
+         }\n\
+         impl Show for [i64] {\n\
+         \x20   fn show(self) -> str { \"x\" }\n\
+         }\n\
+         fn main() {\n\
+         }\n",
+        "for every element type",
+    );
+}

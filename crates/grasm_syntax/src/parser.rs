@@ -997,6 +997,13 @@ impl Parser {
     fn parse_impl(&mut self) -> PResult<ImplDecl> {
         let start = self.cur_span();
         self.expect(&TokenKind::KwImpl)?;
+        // `impl[T: Show] Show for [T]`: the parameters belong to the `impl`
+        // and are shared by every method in it.
+        let (generics, bounds) = if self.at(&TokenKind::LBracket) {
+            self.parse_generics()?
+        } else {
+            (Vec::new(), Vec::new())
+        };
         let iface = self.parse_path()?;
         match self.cur() {
             TokenKind::KwFor => {
@@ -1011,14 +1018,36 @@ impl Parser {
             }
         }
         let ty = self.parse_type()?;
+        // The *shape* an `impl` is for. A receiver is matched against this,
+        // so `[]` serves `[i64]` and `[str]` alike and the element type is
+        // left to the method's own generic parameter ([T-INTERFACE-GENERIC]).
         let type_name = match &ty {
-            TypeExpr::Name { path, args, .. } if args.is_empty() && path.segments.len() == 1 => {
+            TypeExpr::Name { path, args, .. } if path.segments.len() == 1 => {
+                // Either a plain type, or a generic one applied to the
+                // `impl`'s parameters: `Pair[T, U]` has the shape `Pair`.
+                if let Some(bad) = args.iter().find(|a| !Self::is_impl_param(a, &generics)) {
+                    self.diags.push(Diagnostic::error(
+                        bad.span(),
+                        "a generic `impl` applies its type to its own parameters, as in `impl[T] Show for Pair[T]` ([T-INTERFACE-GENERIC])",
+                    ));
+                    return Err(());
+                }
                 path.segments[0].name.clone()
+            }
+            TypeExpr::List(elem, _) => {
+                if !Self::is_impl_param(elem, &generics) {
+                    self.diags.push(Diagnostic::error(
+                        elem.span(),
+                        "an `impl` for a list is for every element type, written `impl[T] Show for [T]` ([T-INTERFACE-GENERIC])",
+                    ));
+                    return Err(());
+                }
+                "[]".to_string()
             }
             other => {
                 self.diags.push(Diagnostic::error(
                     other.span(),
-                    "an `impl` is for a declared, non-generic type or for `i64`, `f64`, `bool` or `str` ([T-INTERFACE])",
+                    "an `impl` is for a declared type, a list, or for `i64`, `f64`, `bool` or `str` ([T-INTERFACE])",
                 ));
                 return Err(());
             }
@@ -1044,6 +1073,16 @@ impl Parser {
             if f.effects.is_none() {
                 f.effects = Some(Vec::new());
             }
+            // The `impl`'s parameters come first, so the method is an
+            // ordinary generic function and inference needs nothing new.
+            if !generics.is_empty() {
+                let mut g = generics.clone();
+                g.extend(f.generics.iter().cloned());
+                f.generics = g;
+                let mut b = bounds.clone();
+                b.extend(f.bounds.iter().cloned());
+                f.bounds = b;
+            }
             let lowered = impl_fn_name(&f.name.name, &type_name);
             methods.push((f.name.clone(), lowered.clone()));
             f.name = Ident {
@@ -1059,10 +1098,20 @@ impl Parser {
         Ok(ImplDecl {
             iface,
             ty,
+            generics,
+            bounds,
             type_name,
             methods,
             span: start.merge(rb.span),
         })
+    }
+
+    /// Is this type argument one of the `impl`'s own parameters?
+    fn is_impl_param(t: &TypeExpr, generics: &[Ident]) -> bool {
+        matches!(t, TypeExpr::Name { path, args, .. }
+            if args.is_empty()
+                && path.segments.len() == 1
+                && generics.iter().any(|g| g.name == path.segments[0].name))
     }
 
     /// `actor Name(params) { var f: T = e ... fn m(inout self, ...) { ... } }`
@@ -1241,6 +1290,8 @@ impl Parser {
                 span: name.span,
             },
             ty: handle_ty,
+            generics: Vec::new(),
+            bounds: Vec::new(),
             type_name: name.name.clone(),
             methods,
             span,

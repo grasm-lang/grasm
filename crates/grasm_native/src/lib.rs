@@ -15444,10 +15444,46 @@ this case",
                         VType::Bool => "bool".to_string(),
                         VType::Str => "str".to_string(),
                         VType::Struct(n) | VType::Sum(n) => n.clone(),
+                        // The shape a generic `impl` is keyed by, matching
+                        // the checker's `impl_key` and the interpreter
+                        // ([T-INTERFACE-GENERIC]).
+                        VType::List(_) => "[]".to_string(),
                         other => other.show(),
                     };
-                    match self.cg.impl_fns.get(&(tname.clone(), name.name.clone())) {
-                        Some(q) => Some(q.clone()),
+                    // A monomorphised generic type arrives here under its
+                    // instantiated name, `Pair[i64]`, but a generic `impl` is
+                    // keyed by the constructor it was written for. Try the
+                    // name as it stands, then its shape.
+                    let found = self
+                        .cg
+                        .impl_fns
+                        .get(&(tname.clone(), name.name.clone()))
+                        .or_else(|| {
+                            let shape = tname.split('[').next().unwrap_or(&tname).to_string();
+                            self.cg.impl_fns.get(&(shape, name.name.clone()))
+                        });
+                    match found {
+                        Some(q) => {
+                            let q = q.clone();
+                            // A generic `impl`'s method has no symbol until
+                            // the call site fixes its parameters, exactly as
+                            // a generic free function reached by [L-UFCS].
+                            if self.cg.generic_fns.contains_key(&q) {
+                                let Some((module, fname)) = q.rsplit_once("::") else {
+                                    return nope(span, format!("`{q}` is not a qualified name"));
+                                };
+                                let (module, fname) = (module.to_string(), fname.to_string());
+                                let mut all: Vec<Expr> = Vec::with_capacity(args.len() + 1);
+                                all.push(recv.clone());
+                                all.extend(args.iter().cloned());
+                                let arg_types = self.generic_arg_types(&q, &all)?;
+                                Some(self.cg.instantiate_generic(
+                                    &module, &fname, &arg_types, span,
+                                )?)
+                            } else {
+                                Some(q)
+                            }
+                        }
                         None => {
                             return nope(
                                 span,

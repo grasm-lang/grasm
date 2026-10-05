@@ -1,0 +1,65 @@
+//! tag: T-INTERFACE-GENERIC
+//! expect: output
+//! [1, 2, 3]
+//! [(1,2), (3,4)]
+//! [[1, 2], [3]]
+//! <1|2>
+// An `impl` is for a shape, and may introduce bounded parameters the shape is
+// written in terms of. One `impl` then serves every element type, and may use
+// what the bound provides -- which is what a container library needs, and
+// what could not be written before this clause.
+//
+// The refusals it rests on cannot be shown here, because a program has one
+// answer: an element used beyond its bounds, a declared type given the wrong
+// number of parameters, and a list shape written for one element type. All
+// three are in `crates/grasm_sema/tests/check_tests.rs`.
+interface Show {
+    fn show(self) -> str
+}
+
+type Point = { x: i64, y: i64 }
+
+type Pair[A] = { left: A, right: A }
+
+impl Show for i64 {
+    fn show(self) -> str {
+        "{self}"
+    }
+}
+
+impl Show for Point {
+    fn show(self) -> str {
+        "({self.x},{self.y})"
+    }
+}
+
+/// Every list of a showable element, including a list of lists: the bound is
+/// satisfied by this very `impl`.
+impl[T: Show] Show for [T] {
+    fn show(self) -> str {
+        var out = "["
+        var first = true
+        for v in self {
+            if not first {
+                out = out + ", "
+            }
+            out = out + v.show()
+            first = false
+        }
+        out + "]"
+    }
+}
+
+/// A declared generic type is a shape too.
+impl[A: Show] Show for Pair[A] {
+    fn show(self) -> str {
+        "<{self.left.show()}|{self.right.show()}>"
+    }
+}
+
+fn main() / {io} {
+    print([1, 2, 3].show())
+    print([Point{ x: 1, y: 2 }, Point{ x: 3, y: 4 }].show())
+    print([[1, 2], [3]].show())
+    print(Pair{ left: 1, right: 2 }.show())
+}

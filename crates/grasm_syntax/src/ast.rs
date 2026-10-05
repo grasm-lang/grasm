@@ -102,7 +102,16 @@ pub struct InterfaceDecl {
 pub struct ImplDecl {
     pub iface: Path,
     pub ty: TypeExpr,
-    /// The implementing type's name as written: `Point`, `i64`.
+    /// The parameters the `impl` itself introduces: `impl[T] Show for [T]`.
+    /// They become each method's own generics, so a generic `impl` needs
+    /// nothing from inference that a generic function did not already need
+    /// ([T-INTERFACE-GENERIC]).
+    pub generics: Vec<Ident>,
+    /// The interfaces each of `generics` is bounded by, in the same order.
+    pub bounds: Vec<Vec<Path>>,
+    /// The implementing type's *shape*: `Point`, `i64`, `[]` for a list of
+    /// anything, or the bare name of a generic type. A shape is what a
+    /// receiver is matched against, so one `impl` serves every element type.
     pub type_name: String,
     /// Each method's source name and the name of the function it became.
     pub methods: Vec<(Ident, String)>,

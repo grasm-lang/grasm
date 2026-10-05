@@ -17,7 +17,7 @@ criterion 5 forbids. Saying so was cheaper than defending the listing.
 the five-part test in `docs/stability.md`. The audit is reproducible and 26
 clauses did not pass it; the commit that promoted these says why each failed.
 
-Today: 167 stable, 26 provisional, 63 experimental, of 256.
+Today: 167 stable, 26 provisional, 64 experimental, of 257.
 
 ## Stable
 
@@ -290,6 +290,7 @@ May change or be removed in any release. New surface starts here.
 - `T-INTERFACE-BOUND` — experimental
 - `T-INTERFACE-IMPL` — experimental
 - `T-INTERFACE-EFFECTS` — experimental
+- `T-INTERFACE-GENERIC` — experimental
 - `T-INTERFACE-UNSATISFIED` — experimental
 - `T-LINEAR` — experimental
 - `T-LINEAR-CONTAIN` — experimental

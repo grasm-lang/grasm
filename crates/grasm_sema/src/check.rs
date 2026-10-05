@@ -1732,7 +1732,11 @@ nothing says who owns it, how long it lives, or how long it is"
             Type::F64 => Some("f64".to_string()),
             Type::Bool => Some("bool".to_string()),
             Type::Str => Some("str".to_string()),
-            Type::Named { id, args } if args.is_empty() => Some(self.defs.get(*id).name.clone()),
+            // A shape, not a type: `[i64]` and `[str]` both answer `[]`, and
+            // `Pair[i64]` answers `Pair`, so one generic `impl` serves every
+            // instantiation ([T-INTERFACE-GENERIC]).
+            Type::List(_) => Some("[]".to_string()),
+            Type::Named { id, .. } => Some(self.defs.get(*id).name.clone()),
             _ => None,
         }
     }
@@ -1796,19 +1800,33 @@ nothing says who owns it, how long it lives, or how long it is"
                 continue;
             };
             let tname = im.type_name.clone();
-            let known = matches!(tname.as_str(), "i64" | "f64" | "bool" | "str")
-                || self
-                    .defs
-                    .by_name
-                    .get(&tname)
-                    .is_some_and(|id| self.defs.get(*id).generics.is_empty());
+            // The target is a shape. A list shape carries its element type in
+            // the `impl`'s own parameter, which the parser has checked; a
+            // declared type must be given exactly as many parameters as it
+            // was declared with ([T-INTERFACE-GENERIC]).
+            let known = if tname == "[]" {
+                true
+            } else if matches!(tname.as_str(), "i64" | "f64" | "bool" | "str") {
+                im.generics.is_empty()
+            } else if let Some(id) = self.defs.by_name.get(&tname) {
+                self.defs.get(*id).generics.len() == im.generics.len()
+            } else {
+                false
+            };
             if !known {
-                self.error(
-                    im.ty.span(),
-                    format!(
-                        "an `impl` is for a declared, non-generic type or for `i64`, `f64`, `bool` or `str`, not `{tname}`"
+                let why = match self.defs.by_name.get(&tname) {
+                    Some(id) => {
+                        let want = self.defs.get(*id).generics.len();
+                        format!(
+                            "`{tname}` takes {want} type parameter(s) and this `impl` introduces {}",
+                            im.generics.len()
+                        )
+                    }
+                    None => format!(
+                        "an `impl` is for a declared type, a list, or for `i64`, `f64`, `bool` or `str`, not `{tname}`"
                     ),
-                );
+                };
+                self.error(im.ty.span(), why);
                 continue;
             }
             if !self.impl_of.insert((iname.clone(), tname.clone())) {
@@ -1844,13 +1862,17 @@ nothing says who owns it, how long it lives, or how long it is"
                 };
                 let key = format!("{}::{lowered}", self.current_module);
                 let Some(info) = self.fns.get(&key).cloned() else { continue };
+                // `Self` is the shape the `impl` is for, so the `impl`'s own
+                // parameters have to be in scope to read it.
+                let gnames: Vec<String> =
+                    im.generics.iter().map(|g| g.name.clone()).collect();
                 // The interface's signature with `Self` read as this type.
                 let want_params: Vec<Type> = m
                     .params
                     .iter()
                     .map(|p| {
                         let te = grasm_syntax::ast::replace_self(&p.ty, &im.ty);
-                        self.resolve_type(&te, &[])
+                        self.resolve_type(&te, &gnames)
                     })
                     .collect();
                 let want_ret = m
@@ -1858,14 +1880,16 @@ nothing says who owns it, how long it lives, or how long it is"
                     .as_ref()
                     .map(|t| {
                         let te = grasm_syntax::ast::replace_self(t, &im.ty);
-                        self.resolve_type(&te, &[])
+                        self.resolve_type(&te, &gnames)
                     })
                     .unwrap_or(Type::Unit);
                 let want_err = m.err.as_ref().map(|t| {
                     let te = grasm_syntax::ast::replace_self(t, &im.ty);
-                    self.resolve_type(&te, &[])
+                    self.resolve_type(&te, &gnames)
                 });
-                if info.generics > 0
+                // The method carries the `impl`'s parameters and no others:
+                // an interface method is not itself generic.
+                if info.generics != im.generics.len()
                     || info.params != want_params
                     || info.ret != want_ret
                     || info.err != want_err

@@ -144,6 +144,27 @@ fn note_via_bound[T: Note](x: T, k: i64) -> i64 / {io} {
     x.note(k)
 }
 
+// [T-INTERFACE-GENERIC]: one `impl` for the list shape, using its bound.
+interface Tally {
+    fn tally(self) -> i64
+}
+
+impl Tally for i64 {
+    fn tally(self) -> i64 {
+        self
+    }
+}
+
+impl[T: Tally] Tally for [T] {
+    fn tally(self) -> i64 {
+        var t = 0
+        for v in self {
+            t = t + v.tally()
+        }
+        t
+    }
+}
+
 fn fails() -> i64 ! Bad {
     fail(Bad)
 }
@@ -379,6 +400,7 @@ CLAUSES = {
     "T-GENERIC-FN": "generic keeps the type",
     "T-INTERFACE": "a bounded call is the direct call",
     "T-INTERFACE-EFFECTS": "an effectful bounded call is the direct call",
+    "T-INTERFACE-GENERIC": "a generic impl reaches every element type",
     "T-LINEAR": "a linear value arrives intact",
     "T-FALLIBLE": "a fallible ok is the value",
     "L-LIB-RANGE-OPS": "a range holds its bounds",
@@ -440,6 +462,14 @@ LAWS = {
  # backend that charged the caller nothing would let the row be dropped.
  "an effectful bounded call is the direct call":
                               'let p = Pt{ x: 2, y: 3 }\n    let bound = note_via_bound(p, 7)\n    let direct = p.note(7)\n    say(bound == direct and bound == 237)',
+ # One `impl` written for `[T]` has to answer for every element type it is
+ # reached with, and the relation is to the same sum computed without it: a
+ # dispatch that resolved to the wrong shape, or an element type the shape
+ # failed to serve, breaks one of the three. The nested case matters most --
+ # `[[i64]]` satisfies the bound through this very `impl`, so a shape key that
+ # did not match itself would stop there.
+ "a generic impl reaches every element type":
+                              'let flat = [1, 2, 3]\n    let nested = [[1, 2], [3], []]\n    let deep = [[[4]], [[5, 6]]]\n    say(flat.tally() == 6 and nested.tally() == 6 and deep.tally() == 15)',
  "rev twice is identity":      'let xs = [3, 1, 2]\n    say(xs.rev().rev() == xs)',
  # A law a degenerate implementation satisfies is not a law: `rev` as the
  # identity passes "rev twice is identity", and did.

@@ -98,8 +98,7 @@ list written `3.0`, and prints with a point. This is a rule about the engines
 rather than about the language, and it needed saying because neither engine had
 the information: only the checker knows which literals are floats, and each
 backend had been converting where it happened to remember to — differently, and
-in both cases incompletely. The checker now hands the set over, so the answer is
-the same one twice.
+in both cases incompletely. The checker hands the set over, so both agree.
 
 Order does not matter, and neither does position. A `fold`'s seed adopts the
 element type, so `[1.5, 2.5].fold(0, |a, b| a + b)` needs no `0.0`. A list, a
@@ -185,24 +184,24 @@ method of that name. An `impl` is for a declared non-generic type or for
 interface.
 
 **[T-INTERFACE-BOUND]** In `[T: Show + Ord]`, a `T` offers exactly its bounds'
-methods, checked once at the definition: a method no bound provides is an
-error there, whatever the callers pass.
+methods, checked once at the definition whatever the callers pass.
 
 **[T-INTERFACE-UNSATISFIED]** Each call must give a bounded parameter a type
-with an `impl` of every bound, or a type parameter of the caller carrying
-those bounds; otherwise it is an error naming the type and the interface.
+with an `impl` of every bound, or a caller's parameter carrying them.
 
-**[T-INTERFACE-IMPL]** An `impl` provides every method of its interface, each
-with the interface's signature under `Self` = the implementing type, and
-nothing else.
+**[T-INTERFACE-IMPL]** An `impl` provides every method of its interface with
+the interface's signature under `Self` = the implementing type, and no other.
+
+**[T-INTERFACE-GENERIC]** An `impl` is for a *shape* — `i64`, a declared type,
+or `[T]` — and may introduce bounded parameters it is written in terms of, so
+`impl[T: Show] Show for [T]` serves every element type and may use the bound.
+A declared type takes its declared parameters; a shape has one `impl` each.
 
 **[T-INTERFACE-EFFECTS]** An interface method may declare an effect row; an
-`impl` may perform that row and no more, and declaring an effect the interface
-does not is an error at the `impl`. A call through a bound performs the
-*interface's* row, charged to the caller — so `fn send[T: Sink](s: T) / {io}`
-must say `io` though it cannot know which `impl` it reaches. That keeps a
-generic row honest and a manifest's capabilities meaningful: no `impl` can
-smuggle an effect past the row its interface wrote. No row, no effects.
+`impl` may perform that row and no more, and declaring more is an error at the
+`impl`. A bounded call performs the *interface's* row, charged to the caller —
+so `fn send[T: Sink](s: T) / {io}` says `io` without knowing which `impl` it
+reaches. That keeps a generic row honest. No row, no effects.
 
 ### Contracts
 
