@@ -1934,10 +1934,19 @@ impl RtBytes {
     /// A window on the same buffer: the bytes `from..end` of this value,
     /// sharing its allocation instead of copying it.
     ///
-    /// Sound because `bytes` has no mutating operation -- the buffer behind
-    /// the `Arc` is filled when it is made and never written again -- so two
-    /// windows on one buffer cannot observe each other change. The cost is
-    /// that a window keeps the whole buffer alive; see `grasm_bytes_slice`.
+    /// Sound because `bytes` has no mutating operation *in Grasm* -- the
+    /// buffer is filled when it is made and no safe operation writes it
+    /// again -- so two windows on one buffer cannot observe each other
+    /// change. The cost is that a window keeps the whole buffer alive; see
+    /// `grasm_bytes_slice`.
+    ///
+    /// One exception, and it is Tier 3: a `bytes` handed to an `extern fn`
+    /// crosses as a pointer, and C may write through it -- which is how
+    /// `packages/termios` reads a `struct termios` back out of `tcgetattr`.
+    /// A window taken *before* such a call therefore observes the write,
+    /// where before this it held a copy and did not. That is a change in what
+    /// `unsafe` code sees, not in what safe code does, and passing a buffer
+    /// to C for it to fill was already aliasing a `&[u8]` the runtime holds.
     fn sub(&self, from: usize, end: usize) -> RtBytes {
         RtBytes {
             // In bounds, or one past the end when the window is empty, which
