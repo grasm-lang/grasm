@@ -95,7 +95,9 @@ Quality is the loop. It does not stop.
 
 ## 3. Packages and the libraries a first release needs
 
-**Status: the mechanism was already built; thirty-four libraries now exist.**
+**Status: the mechanism was already built; 651 packages now exist.** (This
+said thirty-four for a long time after it stopped being true. `docs/ecosystem.md`
+audits them against a request for parity with crates.io and Go.)
 
 `crates/grasm_pkg` does manifests, dependency resolution, lockfiles, path
 dependencies, a local registry, and the capability ceiling — a package

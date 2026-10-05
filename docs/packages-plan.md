@@ -239,11 +239,14 @@ already has.
 These are not scheduling decisions. Each one names a thing the language does
 not have, so that nobody spends a week discovering it.
 
-**1. TLS — and so HTTPS, gRPC, `wss://`, and OAuth2 against a real provider.**
-There is no TLS and there will not be a hand-written one. The realistic path is
-binding a reviewed C library through `extern fn`, which works and which costs
-`unsafe` in the row — meaning a package doing it declares `unsafe` and every
-consumer sees that. That is the correct outcome and it is worth the honesty.
+**1. ~~TLS~~ — done, and not the way this said it would be.** This said there
+would be no hand-written TLS and the path was a C binding. There is one:
+`tls13` is RFC 8446's key schedule and record layer, with `tlshandshake`,
+`tlsverify`, `tlsclient`, `x509`, `certchain` and `https_client` above it, all
+in Grasm and none of them declaring `unsafe`. So HTTPS, `wss://` and OAuth2
+against a real provider are unblocked. Two questions this does *not* settle,
+and which are not the same as "does it exist": whether it is fast, and whether
+it has been fuzzed against a real server.
 
 **2. A background task that outlives its block — and so an async runtime, a
 thread pool, and a connection pool holding live sockets.** `parallel` and
@@ -252,13 +255,12 @@ determinism. Nothing detaches. A connection pool can reuse a socket within one
 request; it cannot keep one warm across requests in another task, because there
 is no other task. This is a language question, not a library one.
 
-**3. A monotonic clock.** `now_millis()` is wall time. Every duration a metric,
-a trace span, a timeout or a circuit breaker measures can therefore go backwards
-when the system clock is adjusted. The fix is a primitive.
+**3. ~~A monotonic clock~~ — done.** `monotonic_millis()` is the primitive, and
+`spec/conformance/L-LIB-CLOCK.gr` plus the law "sleeping advances the monotonic
+clock" hold it to moving forward by at least what `sleep_millis` waited.
 
-**4. A sleep.** The only blocking call with a timeout is `net_wait(handles,
-ms)`, so a sleep is a wait on no handles. That works and it is a strange thing
-to have to know, so `task` will wrap it and the wrapper will say why.
+**4. ~~A sleep~~ — done.** `sleep_millis()` is a primitive now, rather than the
+wait-on-no-handles trick this described.
 
 **5. Process and machine metrics — CPU, memory, file descriptors.** They come
 from `/proc` on Linux and from `sysctl` on macOS, so one is `io` and the other
