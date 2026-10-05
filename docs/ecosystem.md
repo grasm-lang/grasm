@@ -51,7 +51,7 @@ most other things want.
 **`cxx` and `glyph-atlas`** need, respectively, C++ name mangling and a GPU,
 and should wait.
 
-## The linchpin the list does not name
+## The linchpin that turned out not to be one
 
 Its own "five linchpins" section picks `bindgen`, `sqlite`+`pool`,
 `web`+`router`, `pty`+`notify`, and `wgpu`+`winit`. The first is right. The
@@ -67,12 +67,43 @@ limitation sits under `pool`, `web`, `tower`, `grpc`, `quic`, `http3`, `kafka`,
 `nats`, `etcd`, and every database driver the list calls async — about 25 of
 the 100, counting the partial ones.
 
-It is also the hardest thing on any of these lists, because four engines have
-to agree byte-for-byte and a detached task's interleaving is not deterministic.
-The mechanism that makes it testable already exists: the runtime journals 34
-nondeterministic operations and `replaytest` holds every one of them to it.
+### Except it does not. Measured, 2026-10-05.
 
-So the order is: detached tasks, then `bindgen`, then the OS primitives — in
-that order, because the first is a language change that everything else is
-written against, and because the second turns twenty months of wrapper work
-into days.
+Everything above this line was written before trying it, and the paragraph
+before it is wrong. [E-SCHEDULE] is a *cooperative deterministic scheduler*
+already: a `go` task runs on its own fiber until a channel operation has to
+wait, then the next runs, in a fixed order. Tasks are long-lived fibers, not
+statements. So what the twenty-five packages are said to need was tested:
+
+- **A background task holding state across many requests.** Works. A `go`
+  task looping on a channel kept a socket count, served six requests from
+  three "generations" and reaped between them, deterministically, on the
+  interpreter and natively with identical output.
+- **A library providing the loop and the consumer providing the task.** Works,
+  including yielding across the function call — `go { pool_loop(work, done) }`
+  suspends inside `pool_loop` at its `chan_recv` and resumes there.
+
+One thing genuinely does not work, and it is narrower than "detached tasks":
+
+- **A function cannot return while a task it started is still running.**
+  `concurrent` does not exit until its tasks end, so a library cannot hand
+  back an opaque handle with a task running behind it. Tried, and it is a
+  clean deadlock panic naming the waiting tasks rather than a hang.
+
+That is the structured-concurrency bargain every language making this choice
+has taken — Trio's nurseries, Rust's scoped threads, Kotlin's
+`coroutineScope` — and it is a constraint on an API's *shape*, not a missing
+capability. A pool is written as a loop its consumer runs, not as a
+constructor hiding a thread. The cost is that the task is visible in the
+consumer's code; what it buys is that no task leaks and output is identical on
+every engine and every run.
+
+**So the ecosystem is not blocked on a language feature.** The 25 packages
+need writing in the loop-and-channel shape. The order is `bindgen` first,
+because it is worth twenty packages on its own, then the OS primitives, then
+the unwritten pure-Grasm ones.
+
+Detaching is still worth wanting for ergonomics, and QUIC's retransmission
+timers are the one case where a yield-at-a-wait schedule is a real
+approximation rather than a different spelling. Neither is a reason to put it
+before `bindgen`.
