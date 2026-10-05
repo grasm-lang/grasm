@@ -1,0 +1,780 @@
+// C headers into Grasm `extern fn` declarations.
+//
+// Twenty of the packages Grasm is missing are wrappers around a C library
+// that already exists and that nobody should rewrite -- SQLite, FFmpeg,
+// DuckDB, Raylib, libusb. Each is a day's work once the declarations exist
+// and a month if they are typed out by hand, so this writes them.
+//
+// ## What the FFI can carry, which is what this maps onto
+//
+// An `extern fn` takes `i64`, `f64`, `str` and `bytes` and answers `i64` or
+// `f64` ([T-EXTERN], [T-EXTERN-POINTER]). That is less than C has and more
+// than it first appears, because a pointer is an address and an address is an
+// `i64`:
+//
+// - a handle C hands back (`sqlite3*`, `FILE*`, `AVCodec*`) is an `i64` held
+//   and passed back;
+// - an out-parameter is a `bytes` the caller sizes and C fills, which is how
+//   `packages/termios` reads a `struct termios` out of `tcgetattr`;
+// - text C hands back is read with `strlen` and `memcpy` declared over an
+//   `i64` address.
+//
+// So every handle-based C API is expressible. What is not: a struct passed or
+// returned *by value*, and varargs. Those are reported rather than guessed
+// at, because a wrong FFI signature is not a compile error -- it is garbage
+// three calls later.
+//
+// ## What it expects
+//
+// Preprocessed C: run `cc -E -P` over the header first. That removes
+// `#include`, `#ifdef` and macros, which are a C preprocessor's job and not
+// this package's. What is left is declarations, which is all a binding needs.
+
+/// One parameter of a generated declaration.
+type Param = { name: str, ty: str }
+
+/// A declaration this could translate.
+type Binding = { name: str, params: [Param], ret: str }
+
+/// A declaration this could not, and why. Reported, never guessed.
+type Skipped = { name: str, why: str }
+
+/// An `enum` constant, which a header carries as the API's vocabulary.
+type Const = { name: str, value: i64 }
+
+type Generated = {
+    bindings: [Binding],
+    consts: [Const],
+    skipped: [Skipped]
+}
+
+// --- tokens ---------------------------------------------------------------
+//
+// C needs very little lexing to read a declaration: words, numbers, and the
+// handful of punctuators that end or nest one. Comments and strings are
+// skipped rather than kept, since a declaration carries neither.
+
+fn is_ident_start(c: i64) -> bool {
+    (c >= 97 and c <= 122) or (c >= 65 and c <= 90) or c == 95
+}
+
+fn is_ident(c: i64) -> bool {
+    is_ident_start(c) or (c >= 48 and c <= 57)
+}
+
+fn is_digit(c: i64) -> bool {
+    c >= 48 and c <= 57
+}
+
+fn is_space(c: i64) -> bool {
+    c == 32 or c == 9 or c == 10 or c == 13
+}
+
+/// The tokens of preprocessed C, as text: an identifier, a number, or a
+/// one-character punctuator.
+pub fn tokens(src: str) -> [str] {
+    let b = src.to_bytes()
+    let n = b.len()
+    var out: [str] = []
+    var i = 0
+    while i < n {
+        let c = b.at(i)
+        if is_space(c) {
+            i = i + 1
+        } else if c == 35 {
+            // A `#line` the preprocessor left behind: to the end of the line.
+            while i < n and b.at(i) != 10 {
+                i = i + 1
+            }
+        } else if c == 47 and i + 1 < n and b.at(i + 1) == 47 {
+            while i < n and b.at(i) != 10 {
+                i = i + 1
+            }
+        } else if c == 47 and i + 1 < n and b.at(i + 1) == 42 {
+            i = i + 2
+            while i + 1 < n and not (b.at(i) == 42 and b.at(i + 1) == 47) {
+                i = i + 1
+            }
+            i = i + 2
+        } else if c == 34 or c == 39 {
+            // A string or character literal: skipped whole, escapes included.
+            let quote = c
+            i = i + 1
+            while i < n and b.at(i) != quote {
+                if b.at(i) == 92 {
+                    i = i + 1
+                }
+                i = i + 1
+            }
+            i = i + 1
+        } else if is_ident_start(c) {
+            let start = i
+            while i < n and is_ident(b.at(i)) {
+                i = i + 1
+            }
+            out.push(b.slice(start, i).to_str())
+        } else if is_digit(c) {
+            let start = i
+            // Hex, suffixes and all: the value is parsed later.
+            while i < n and (is_ident(b.at(i)) or b.at(i) == 46) {
+                i = i + 1
+            }
+            out.push(b.slice(start, i).to_str())
+        } else {
+            out.push(b.slice(i, i + 1).to_str())
+            i = i + 1
+        }
+    }
+    out
+}
+
+// --- the type map ---------------------------------------------------------
+
+/// The C integer type names that fit an `i64`. Everything a header spells
+/// for a whole number, including the fixed-width and the platform aliases.
+fn is_int_word(w: str) -> bool {
+    w == "int" or w == "char" or w == "short" or w == "long" or
+    w == "signed" or w == "unsigned" or w == "_Bool" or w == "bool" or
+    w == "size_t" or w == "ssize_t" or w == "ptrdiff_t" or
+    w == "int8_t" or w == "int16_t" or w == "int32_t" or w == "int64_t" or
+    w == "uint8_t" or w == "uint16_t" or w == "uint32_t" or w == "uint64_t" or
+    w == "intptr_t" or w == "uintptr_t" or w == "wchar_t" or
+    w == "time_t" or w == "off_t" or w == "mode_t" or w == "pid_t" or
+    w == "uid_t" or w == "gid_t" or w == "socklen_t" or w == "clock_t" or
+    w == "sqlite3_int64" or w == "sqlite_int64"
+}
+
+fn is_float_word(w: str) -> bool {
+    w == "float" or w == "double"
+}
+
+/// Words a declaration may carry that say nothing about its layout.
+fn is_noise(w: str) -> bool {
+    w == "const" or w == "volatile" or w == "restrict" or w == "__restrict" or
+    w == "extern" or w == "static" or w == "inline" or w == "_Nullable" or
+    w == "_Nonnull" or w == "__inline" or w == "register"
+}
+
+/// A compiler attribute, which is not part of the declaration. These arrive
+/// with a parenthesised group the scanner has to drop with them, or
+/// `__attribute__` itself becomes a function named in the output -- which it
+/// did, out of `sqlite3.h`.
+fn is_attribute(w: str) -> bool {
+    w == "__attribute__" or w == "__asm" or w == "asm" or w == "__asm__" or
+    w == "__declspec" or w == "__extension__" or w == "_Noreturn"
+}
+
+/// C's own leading underscores, which a header uses to keep its parameter
+/// names out of a consumer's macro namespace and which read as noise here.
+fn trim_under(name: str) -> str {
+    let b = name.to_bytes()
+    var i = 0
+    while i < b.len() and b.at(i) == 95 {
+        i = i + 1
+    }
+    if i >= b.len() {
+        return name
+    }
+    b.slice(i, b.len()).to_str()
+}
+
+// --- parsing one declaration ----------------------------------------------
+
+/// The Grasm type for a parameter whose C words are `words` with `stars`
+/// levels of pointer. `""` means "cannot be carried", with the reason in the
+/// second answer.
+fn param_type(words: [str], stars: i64, is_const_char: bool) -> (str, str) {
+    if stars > 0 {
+        // A `const char *` is text going in, which the FFI carries as a
+        // `str`. Any other pointer is an address: `i64`, which the caller
+        // either got from C or built as a `bytes` for C to fill.
+        if is_const_char and stars == 1 {
+            return ("str", "")
+        }
+        return ("i64", "")
+    }
+    if words.is_empty() {
+        return ("", "a parameter with no type")
+    }
+    var seen_struct = false
+    for w in words {
+        if w == "struct" or w == "union" {
+            seen_struct = true
+        }
+    }
+    if seen_struct {
+        return ("", "a struct or union passed by value, which the FFI cannot carry")
+    }
+    var floats = false
+    var ints = false
+    for w in words {
+        if is_float_word(w) {
+            floats = true
+        }
+        if is_int_word(w) {
+            ints = true
+        }
+    }
+    if floats {
+        return ("f64", "")
+    }
+    if ints {
+        return ("i64", "")
+    }
+    if words.len() == 1 and words[0] == "void" {
+        return ("", "void")
+    }
+    // A typedef this header did not define in terms this understands. It is
+    // almost always a handle, and guessing is the thing to avoid, so say so.
+    ("i64", "")
+}
+
+// --- the declaration scanner ----------------------------------------------
+//
+// Preprocessed C at brace depth zero is a sequence of declarations ending in
+// `;`, plus `struct`/`union`/`enum` bodies and function definitions that have
+// a `{`. A binding wants the first kind. The scanner cuts the token stream
+// into those runs and hands each to the parser.
+
+/// Is this run a function declaration, and where are its parentheses?
+/// Answers the index of `(` and of the matching `)`, or (0 - 1, 0 - 1).
+fn call_parens(run: [str]) -> (i64, i64) {
+    var open = 0 - 1
+    var i = 0
+    while i < run.len() {
+        if run[i] == "(" {
+            open = i
+            i = run.len()
+        } else {
+            i = i + 1
+        }
+    }
+    if open < 0 {
+        return (0 - 1, 0 - 1)
+    }
+    var depth = 0
+    var j = open
+    while j < run.len() {
+        if run[j] == "(" {
+            depth = depth + 1
+        } else if run[j] == ")" {
+            depth = depth - 1
+            if depth == 0 {
+                return (open, j)
+            }
+        }
+        j = j + 1
+    }
+    (0 - 1, 0 - 1)
+}
+
+/// The parameters between `(` and `)`, split on top-level commas.
+fn split_params(run: [str], open: i64, close: i64) -> [[str]] {
+    var out: [[str]] = []
+    var cur: [str] = []
+    var depth = 0
+    var i = open + 1
+    while i < close {
+        let t = run[i]
+        if t == "(" {
+            depth = depth + 1
+            cur.push(t)
+        } else if t == ")" {
+            depth = depth - 1
+            cur.push(t)
+        } else if t == "," and depth == 0 {
+            out.push(cur)
+            cur = []
+        } else {
+            cur.push(t)
+        }
+        i = i + 1
+    }
+    if not cur.is_empty() {
+        out.push(cur)
+    }
+    out
+}
+
+/// One parameter's Grasm type and name, from its C tokens.
+fn one_param(toks: [str], at: i64) -> (str, str, str) {
+    var words: [str] = []
+    var stars = 0
+    var saw_const = false
+    var saw_char = false
+    var last_ident = ""
+    var idents = 0
+    var is_fnptr = false
+    for t in toks {
+        if t == "*" {
+            stars = stars + 1
+        } else if t == "(" or t == ")" {
+            // `void (*cb)(int)`: a function pointer, which is an address.
+            is_fnptr = true
+        } else if t == "[" or t == "]" {
+            // An array parameter is a pointer in C.
+            if stars == 0 {
+                stars = 1
+            }
+        } else if is_noise(t) {
+            if t == "const" {
+                saw_const = true
+            }
+        } else if is_ident_start(t.to_bytes().at(0)) {
+            if t == "char" {
+                saw_char = true
+            }
+            if is_int_word(t) or is_float_word(t) or t == "void" or
+            t == "struct" or t == "union" or t == "enum" {
+                words.push(t)
+            } else {
+                // A typedef name, or the parameter's own name. The last bare
+                // identifier before the end is the name; anything earlier is
+                // part of the type.
+                if not last_ident.is_empty() {
+                    words.push(last_ident)
+                }
+                last_ident = t
+                idents = idents + 1
+            }
+        }
+    }
+    if is_fnptr {
+        return ("i64", "cb{at}", "")
+    }
+    // `int n` leaves `last_ident` holding the name; `int` alone leaves it
+    // empty and the type in `words`. A lone typedef (`sqlite3 *db`) puts the
+    // type in `last_ident` when there is no name after it.
+    var name = ""
+    var ty_words = words
+    if not last_ident.is_empty() {
+        if ty_words.is_empty() and stars == 0 {
+            // Just one identifier: it is the type, unnamed.
+            ty_words = [last_ident]
+        } else {
+            name = last_ident
+        }
+    }
+    if ty_words.is_empty() and stars > 0 {
+        // `sqlite3 *db` consumed the typedef into `words` already, or the
+        // name is all there is -- either way a pointer is an address.
+        ty_words = ["void"]
+    }
+    let mapped = param_type(ty_words, stars, saw_const and saw_char)
+    // A declaration may name no parameter at all -- `sqlite3_close(sqlite3*)`
+    // -- and then the only identifier is the *type*, which must not become
+    // the name. Positional is right there, and readable.
+    var clean = trim_under(name)
+    // One identifier and no type words means that identifier *is* the type:
+    // `sqlite3_close(sqlite3*)` names no parameter, and taking `sqlite3` for
+    // the name read as though it did.
+    if clean.is_empty() or ty_words.contains(clean) or idents <= 1 and words.is_empty() {
+        clean = "a{at}"
+    }
+    // Grasm has keywords C does not; a parameter called `type` would not
+    // compile, so every name is prefixed once rather than special-cased.
+    (mapped.0, "p_{clean}", mapped.1)
+}
+
+/// The return type of a declaration whose tokens before `(` are `head`.
+/// The function's own name is the last identifier in `head`.
+fn return_of(head: [str]) -> (str, str, str) {
+    var words: [str] = []
+    var stars = 0
+    var saw_const = false
+    var saw_char = false
+    var name = ""
+    for t in head {
+        if t == "*" {
+            stars = stars + 1
+        } else if is_noise(t) {
+            if t == "const" {
+                saw_const = true
+            }
+        } else if t == "(" or t == ")" {
+            // Nothing: a parenthesised declarator carries no type.
+        } else if is_ident_start(t.to_bytes().at(0)) {
+            if t == "char" {
+                saw_char = true
+            }
+            if not name.is_empty() {
+                words.push(name)
+            }
+            name = t
+        }
+    }
+    // The last identifier is the function's name; the rest is its type.
+    if stars > 0 {
+        // A pointer return is an address. `const char *` coming *back* is
+        // not a `str`: the FFI only carries `str` inward, and a returned
+        // string is read with `strlen` and `memcpy` over the address.
+        return ("i64", name, "")
+    }
+    if words.is_empty() {
+        // `foo(void)` with no return words at all: C's implicit int.
+        return ("i64", name, "")
+    }
+    var floats = false
+    var ints = false
+    var structy = false
+    for w in words {
+        if is_float_word(w) {
+            floats = true
+        }
+        if is_int_word(w) {
+            ints = true
+        }
+        if w == "struct" or w == "union" {
+            structy = true
+        }
+    }
+    if structy {
+        return ("", name, "a struct or union returned by value, which the FFI cannot carry")
+    }
+    if floats {
+        return ("f64", name, "")
+    }
+    if ints {
+        return ("i64", name, "")
+    }
+    if words.len() == 1 and words[0] == "void" {
+        return ("void", name, "")
+    }
+    ("i64", name, "")
+}
+
+/// Reads a C integer literal: decimal, hex, or a character count. `None`
+/// when it is an expression rather than a constant.
+fn int_literal(t: str) -> i64 ! str {
+    let b = t.to_bytes()
+    if b.len() > 2 and b.at(0) == 48 and (b.at(1) == 120 or b.at(1) == 88) {
+        var v = 0
+        var i = 2
+        while i < b.len() {
+            let c = b.at(i)
+            var d = 0 - 1
+            if is_digit(c) {
+                d = c - 48
+            } else if c >= 97 and c <= 102 {
+                d = c - 87
+            } else if c >= 65 and c <= 70 {
+                d = c - 55
+            } else if c == 117 or c == 85 or c == 108 or c == 76 {
+                i = b.len()
+                d = 0 - 2
+            }
+            if d == 0 - 1 {
+                fail("not hex")
+            }
+            if d >= 0 {
+                v = v * 16 + d
+            }
+            i = i + 1
+        }
+        return v
+    }
+    var v = 0
+    var any = false
+    var i = 0
+    while i < b.len() {
+        let c = b.at(i)
+        if is_digit(c) {
+            v = v * 10 + (c - 48)
+            any = true
+            i = i + 1
+        } else if c == 117 or c == 85 or c == 108 or c == 76 {
+            i = b.len()
+        } else {
+            fail("not an integer")
+        }
+    }
+    if not any {
+        fail("empty")
+    }
+    v
+}
+
+// --- the whole header -----------------------------------------------------
+
+/// Every declaration a preprocessed header carries, as bindings, constants,
+/// and the ones that were refused with the reason why.
+pub fn read(src: str) -> Generated {
+    let ts = tokens(src)
+    var bindings: [Binding] = []
+    var consts: [Const] = []
+    var skipped: [Skipped] = []
+    var seen: [str] = []
+    var i = 0
+    let n = ts.len()
+    while i < n {
+        let t = ts[i]
+        if t == "enum" {
+            // `enum [name] { A, B = 3, ... }`: the API's vocabulary.
+            var j = i + 1
+            while j < n and ts[j] != "\{" and ts[j] != ";" {
+                j = j + 1
+            }
+            if j < n and ts[j] == "\{" {
+                var next_value = 0
+                var k = j + 1
+                while k < n and ts[k] != "}" {
+                    let name = ts[k]
+                    if is_ident_start(name.to_bytes().at(0)) {
+                        var value = next_value
+                        var m = k + 1
+                        if m < n and ts[m] == "=" {
+                            match int_literal(ts[m + 1]) {
+                                Ok(v) -> {
+                                    value = v
+                                    m = m + 2
+                                }
+                                Err(_why) -> {
+                                    // An expression: skip the constant
+                                    // rather than compute the wrong number.
+                                    skipped.push(Skipped{
+                                        name: name,
+                                        why: "an enum value that is an expression"
+                                    })
+                                    while m < n and ts[m] != "," and ts[m] != "}" {
+                                        m = m + 1
+                                    }
+                                    value = 0 - 1
+                                }
+                            }
+                        }
+                        if value != 0 - 1 {
+                            consts.push(Const{ name: name, value: value })
+                            next_value = value + 1
+                        }
+                        k = m
+                    } else {
+                        k = k + 1
+                    }
+                    if k < n and ts[k] == "," {
+                        k = k + 1
+                    }
+                }
+                i = k
+            } else {
+                i = j
+            }
+        } else if t == "\{" {
+            // A body -- a struct's, or a function definition's. Skipped
+            // whole: a binding needs the declaration, never the body.
+            var depth = 0
+            while i < n {
+                if ts[i] == "\{" {
+                    depth = depth + 1
+                } else if ts[i] == "}" {
+                    depth = depth - 1
+                    if depth == 0 {
+                        i = i + 1
+                        break
+                    }
+                }
+                i = i + 1
+            }
+        } else if t == ";" {
+            i = i + 1
+        } else {
+            // A declaration: up to the next `;` or `{` at depth zero.
+            var run: [str] = []
+            var depth = 0
+            var hit_body = false
+            while i < n {
+                let u = ts[i]
+                if is_attribute(u) {
+                    // The attribute and whatever it is applied to: skipped
+                    // together, or `__attribute__` is read as the function.
+                    i = i + 1
+                    if i < n and ts[i] == "(" {
+                        var d2 = 0
+                        while i < n {
+                            if ts[i] == "(" {
+                                d2 = d2 + 1
+                            } else if ts[i] == ")" {
+                                d2 = d2 - 1
+                                if d2 == 0 {
+                                    i = i + 1
+                                    break
+                                }
+                            }
+                            i = i + 1
+                        }
+                    }
+                } else if u == "(" or u == "[" {
+                    depth = depth + 1
+                    run.push(u)
+                    i = i + 1
+                } else if u == ")" or u == "]" {
+                    depth = depth - 1
+                    run.push(u)
+                    i = i + 1
+                } else if u == ";" and depth <= 0 {
+                    i = i + 1
+                    break
+                } else if u == "\{" and depth <= 0 {
+                    hit_body = true
+                    break
+                } else {
+                    run.push(u)
+                    i = i + 1
+                }
+            }
+            if not hit_body and not run.is_empty() {
+                let parens = call_parens(run)
+                if parens.0 >= 0 {
+                    var head: [str] = []
+                    var h = 0
+                    while h < parens.0 {
+                        head.push(run[h])
+                        h = h + 1
+                    }
+                    let ret = return_of(head)
+                    let fname = ret.1
+                    if fname.is_empty() {
+                        // A declarator this does not read, such as a
+                        // function pointer typedef.
+                    } else if seen.contains(fname) {
+                        // A header may declare the same function twice.
+                    } else if not ret.2.is_empty() {
+                        seen.push(fname)
+                        skipped.push(Skipped{ name: fname, why: ret.2 })
+                    } else {
+                        let raw = split_params(run, parens.0, parens.1)
+                        var params: [Param] = []
+                        var why = ""
+                        var at = 0
+                        for p in raw {
+                            if why.is_empty() {
+                                var is_ellipsis = false
+                                for q in p {
+                                    if q == "." {
+                                        is_ellipsis = true
+                                    }
+                                }
+                                if is_ellipsis {
+                                    why = "varargs, which the FFI cannot carry"
+                                } else {
+                                    let got = one_param(p, at)
+                                    if not got.2.is_empty() {
+                                        if got.2 != "void" {
+                                            why = got.2
+                                        }
+                                    } else {
+                                        params.push(Param{ name: got.1, ty: got.0 })
+                                    }
+                                }
+                            }
+                            at = at + 1
+                        }
+                        seen.push(fname)
+                        if why.is_empty() {
+                            bindings.push(Binding{
+                                name: fname,
+                                params: params,
+                                ret: ret.0
+                            })
+                        } else {
+                            skipped.push(Skipped{ name: fname, why: why })
+                        }
+                    }
+                }
+            }
+            if hit_body {
+                var depth2 = 0
+                while i < n {
+                    if ts[i] == "\{" {
+                        depth2 = depth2 + 1
+                    } else if ts[i] == "}" {
+                        depth2 = depth2 - 1
+                        if depth2 == 0 {
+                            i = i + 1
+                            break
+                        }
+                    }
+                    i = i + 1
+                }
+            }
+        }
+    }
+    Generated{ bindings: bindings, consts: consts, skipped: skipped }
+}
+
+/// The Grasm source for what `read` found: the `extern fn` declarations, the
+/// constants, and a comment for every declaration that was refused. The
+/// refusals are in the output on purpose -- a missing function should be
+/// findable where it was expected, with the reason beside it.
+pub fn emit(g: Generated) -> str {
+    var out = ""
+    if not g.consts.is_empty() {
+        for c in g.consts {
+            out = out + "let {c.name} = {c.value}\n"
+        }
+        out = out + "\n"
+    }
+    for b in g.bindings {
+        var ps = ""
+        var first = true
+        for p in b.params {
+            if not first {
+                ps = ps + ", "
+            }
+            ps = ps + "{p.name}: {p.ty}"
+            first = false
+        }
+        if b.ret == "void" {
+            out = out + "extern fn {b.name}({ps})\n"
+        } else {
+            out = out + "extern fn {b.name}({ps}) -> {b.ret}\n"
+        }
+    }
+    if not g.skipped.is_empty() {
+        out = out + "\n// Not generated, and why:\n"
+        for s in g.skipped {
+            out = out + "//   {s.name}: {s.why}\n"
+        }
+    }
+    out
+}
+
+/// The integer `#define`s of a *raw* header -- `SQLITE_OK`, `O_RDONLY`, the
+/// vocabulary every handle-based API answers in. `cc -E` deletes these before
+/// the declarations are readable, so they are read separately, from the file
+/// as written.
+///
+/// Only a plain integer is taken. A `#define` whose body is an expression, a
+/// cast or another macro is left alone rather than half-evaluated.
+pub fn defines(raw: str) -> [Const] {
+    var out: [Const] = []
+    for line in raw.lines() {
+        let t = line.trim()
+        if t.starts_with("#define ") {
+            // A `str` has no substring of its own; the way to take one is
+            // through its bytes, which is a window rather than a copy.
+            let tb = t.to_bytes()
+            let rest = tb.slice(8, tb.len()).to_str().trim()
+            match rest.index_of(" ") {
+                None -> {}
+                Some(sp) -> {
+                    let rb = rest.to_bytes()
+                    let name = rb.slice(0, sp).to_str()
+                    let body = rb.slice(sp + 1, rb.len()).to_str().trim()
+                    // A macro with parameters is not a constant.
+                    if not name.contains("(") and not body.is_empty() {
+                        match int_literal(body) {
+                            Ok(v) -> out.push(Const{ name: name, value: v })
+                            Err(_why) -> {}
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Preprocessed C in, Grasm source out.
+pub fn generate(src: str) -> str {
+    emit(read(src))
+}

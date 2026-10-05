@@ -124,7 +124,7 @@ fn run() -> ExitCode {
             "check" => (&[], &[]),
             "build" => (
                 &["--native", "--no-incremental", "--source"],
-                &["-o", "--target"],
+                &["-o", "--target", "--link"],
             ),
             "doc" => (&[], &["-o"]),
             "api" => (&[], &["--against"]),
@@ -370,6 +370,15 @@ fn run() -> ExitCode {
                 eprintln!("usage: grasm build <file.gr> [-o output]");
                 return ExitCode::FAILURE;
             };
+            // Collected before anything is compiled, since the link is the
+            // last thing to happen and the flag is read there.
+            let links: Vec<String> = args
+                .iter()
+                .enumerate()
+                .filter(|(_, a)| *a == "--link")
+                .filter_map(|(i, _)| args.get(i + 1).cloned())
+                .collect();
+            let _ = LINK_ARGS.set(links);
             let out_path = args
                 .iter()
                 .position(|a| a == "-o")
@@ -1836,6 +1845,35 @@ fn world_signature(program: &Program) -> String {
     sigs.join("\n")
 }
 
+/// What `--link` asked for, which the link line needs and the build does not
+/// otherwise carry.
+///
+/// An `extern fn` is resolved by the system linker ([T-EXTERN]), so a program
+/// calling SQLite or FFmpeg needs that library named here -- `-lsqlite3` --
+/// or the link fails naming every symbol. Set once from the command line and
+/// read once at the link, so there is no mutable global state.
+static LINK_ARGS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+/// Every `--link` value, in order. A bare name becomes `-lname`; anything
+/// starting with `-` or `/` is handed to the linker as written, which is how
+/// a search path (`-L/opt/homebrew/lib`) or an archive by path gets through.
+fn link_flags() -> Vec<String> {
+    LINK_ARGS
+        .get()
+        .map(|v| {
+            v.iter()
+                .map(|a| {
+                    if a.starts_with('-') || a.starts_with('/') {
+                        a.clone()
+                    } else {
+                        format!("-l{a}")
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn build_native(program: &Program, out_path: &str) -> Result<u64, String> {
     build_native_incremental(program, out_path, true)
 }
@@ -1965,6 +2003,10 @@ fn build_native_incremental(
         link.arg(o);
     }
     link.arg(&rt).arg("-o").arg(out_path);
+    // After the objects, so a library satisfies the symbols they reference.
+    for f in link_flags() {
+        link.arg(f);
+    }
     // Strip runtime code the program never calls. The archive carries the
     // whole stdlib surface; a hello-world only needs a sliver of it, and
     // without this every binary pays for all of it (1.5 MB -> ~0.5 MB).

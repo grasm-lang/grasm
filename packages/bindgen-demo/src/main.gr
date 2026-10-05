@@ -1,0 +1,40 @@
+// Reads a preprocessed C header, writes Grasm `extern fn` declarations.
+//
+//     cc -E -P /usr/include/sqlite3.h > sqlite3.i
+//     grasm run packages/bindgen-demo/src/main.gr sqlite3.i
+//
+// The package itself opens nothing; this does the reading, which is why the
+// capability split is where it is -- `bindgen` declares nothing at all.
+import bindgen
+
+fn main() / {io} {
+    let a = args()
+    match a.get(0) {
+        None -> print("usage: bindgen-demo <preprocessed-header.i>")
+        Some(path) -> {
+            // A header is read whole rather than a line at a time: `input()`
+            // answers the empty string for a blank line and for end of
+            // input alike, and a header has blank lines.
+            match read_file(path) {
+                Err(_e) -> print("cannot read `{path}`")
+                Ok(src) -> {
+                    var g = bindgen.read(src)
+                    // The raw header, when given as a second argument, is
+                    // where the `#define` constants are: `cc -E` deletes
+                    // them before the declarations become readable.
+                    match a.get(1) {
+                        None -> {}
+                        Some(raw_path) -> {
+                            match read_file(raw_path) {
+                                Err(_e) -> print("// cannot read `{raw_path}` for its #defines")
+                                Ok(raw) -> g.consts = g.consts + bindgen.defines(raw)
+                            }
+                        }
+                    }
+                    print("// {g.bindings.len()} functions, {g.consts.len()} constants, {g.skipped.len()} refused")
+                    print(bindgen.emit(g))
+                }
+            }
+        }
+    }
+}

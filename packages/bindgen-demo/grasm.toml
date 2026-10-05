@@ -1,0 +1,8 @@
+[package]
+name = "bindgen_demo"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.bindgen]
+path = "../bindgen"
+version = "^1.0.0"

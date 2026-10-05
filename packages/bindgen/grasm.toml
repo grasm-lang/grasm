@@ -1,0 +1,10 @@
+[package]
+name = "bindgen"
+version = "1.0.0"
+
+# Text in, text out. It reads a C header and writes Grasm source; it opens no
+# file and runs no preprocessor, so it reaches nothing and declares nothing.
+# The consumer does the IO, and the consumer decides whether to trust the
+# `extern fn` declarations this hands back -- which are Tier 3 wherever they
+# are called, never here.
+capabilities = []
