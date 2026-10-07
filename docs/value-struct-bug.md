@@ -1,5 +1,8 @@
 # A value struct in a local loses data, and sometimes the process
 
+> **Fixed 2026-10-07.** The cause and the one-line fix are at the end; the
+> narrowing is kept because it is how the next one of these gets found.
+
 Found 2026-10-07 by `allgates`' `gold` gate, which failed on
 `ProjectGold/30-async-chat`: the interpreter prints 21 lines, the native build
 stops after three and exits on a signal that differs between runs -- SIGSEGV,
@@ -132,3 +135,39 @@ epilogue's drop of each live value-struct local is where the accounting goes
 wrong. Both programs above belong in the corpus as conformance cases once it
 is fixed, because `difftest` has 511 programs and not one of them has this
 shape -- which is why it took a gate on a hand-written app to find it.
+
+
+## Fixed
+
+`VType::Val(_)` is not `boxed()` -- a value struct's words live in a slot
+rather than behind a pointer -- and `tail_moves` skipped everything that is
+not `boxed()`:
+
+```rust
+if !vt.boxed() || self.borrowed_vars.contains(&var.as_u32()) {
+    continue;
+}
+```
+
+So a value-struct local never entered the tail-move analysis, never reached
+`self.moved`, and `pop_scope_with_decs` released it even when it was the value
+being returned. The release landed between the store and the copy into the
+caller's slot, which is the `fn3` in the trace above.
+
+A value struct is not boxed, but **its fields are counted**, so it has to take
+part in that analysis exactly as a boxed local does:
+
+```rust
+let counted = vt.boxed() || matches!(vt, VType::Val(_));
+if !counted || self.borrowed_vars.contains(&var.as_u32()) {
+    continue;
+}
+```
+
+`pop_scope_with_decs` already knew what to do with a moved value struct; it
+was simply never told one had moved.
+
+After it: `ProjectGold/30-async-chat` is byte-identical across engines, both
+reproducers answer correctly, `difftest` is 511/511 and `leakcheck` reports no
+leaks -- the risk being that marking more locals moved would leak instead of
+double-free, and it does not.

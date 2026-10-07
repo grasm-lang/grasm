@@ -9613,7 +9613,16 @@ impl FnCx<'_, '_> {
             return;
         };
         for (name, (var, vt)) in scope {
-            if !vt.boxed() || self.borrowed_vars.contains(&var.as_u32()) {
+            // A value struct is not `boxed()` -- its words live in a slot --
+            // but its *fields* are counted, so it has to take part in this
+            // analysis exactly as a boxed local does. Left out, a local
+            // returned as the tail was released by `pop_scope_with_decs` and
+            // then copied into the caller's slot and re-incremented, which is
+            // a use-after-free: `fn step(r: Room, h) { var room = r; room =
+            // joined(room, h); room }` answered 2 where it should answer 8,
+            // and crashed on larger inputs.
+            let counted = vt.boxed() || matches!(vt, VType::Val(_));
+            if !counted || self.borrowed_vars.contains(&var.as_u32()) {
                 continue;
             }
             let n = all.iter().filter(|m| *m == name).count();
