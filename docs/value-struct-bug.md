@@ -80,6 +80,49 @@ reused, which looked like the same fault one layer down. It is not -- the
 change turned the silent wrong answer into a crash, which is a different bug
 being uncovered rather than this one being fixed, and it was reverted.
 
+## The instruction sequence, which names the fault
+
+`GRASM_DUMP_IR=1` on `step`, with `v0` the parameter, `v1` the integer and
+`v2` the caller's result slot. `fn0`/`fn4` are both `u0:14`, the increment;
+`fn2`/`fn3` are both `u0:15`, the decrement:
+
+```
+    v3 = stack_addr.i64 ss0      ; room's own slot
+    v4 = load.i64 v0
+    store v4, v3                 ; room = r, words copied
+    v5 = load.i64 v3
+    call fn0(v5)                 ; INC  -- the retain for `var room = r`   ok
+
+    v6 = stack_addr.i64 ss1      ; joined()'s result slot
+    call fn1(v3, v1, v6)         ; room = joined(room, h)
+    v7 = load.i64 v3
+    call fn2(v7)                 ; DEC  -- release the old room            ok
+    v8 = load.i64 v6
+    store v8, v3                 ; the new words move in                   ok
+
+    v9 = load.i64 v3
+    call fn3(v9)                 ; DEC  -- releases what was just stored   WRONG
+
+    v10 = load.i64 v3
+    store v10, v2                ; copy to the caller's slot
+    v11 = load.i64 v2
+    call fn4(v11)                ; INC  -- on a list already freed
+    return
+```
+
+Two increments and **three** decrements across the pair of values, and the
+third lands between the store and the return. `emit_val_return` is not the
+culprit: it copies to the result slot and only then releases the scope, which
+is the right order and is what `v10`-`v11` are.
+
+The reading that fits is that the assignment **moved** the temporary's words
+into `room` without marking the temporary moved, so the temporary is released
+afterwards -- and because `room` now holds the same pointer, releasing the
+temporary releases `room`. `move_or_copy_val` decides move-against-copy by
+`fresh_vals`, and the assignment path at the `inc_val_fields` call says counts
+are taken on a *copied* value before the old one is released. A moved one
+takes no count, so nothing may release it either.
+
 ## Where to look next
 
 `move_or_copy_val` decides move-against-copy by whether the source is in
