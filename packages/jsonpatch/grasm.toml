@@ -2,6 +2,8 @@
 name = "jsonpatch"
 version = "1.0.0"
 
+# Computation only: it opens nothing and performs nothing.
+capabilities = []
 [dependencies.json]
 path = "../json"
 version = "^1.0.0"

@@ -2,6 +2,8 @@
 name = "k8squantity"
 version = "1.0.0"
 
+# Computation only: it opens nothing and performs nothing.
+capabilities = []
 [dependencies.bigint]
 path = "../bigint"
 version = "^1.0.0"

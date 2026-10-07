@@ -2,6 +2,8 @@
 name = "semverrange"
 version = "1.0.0"
 
+# Computation only: it opens nothing and performs nothing.
+capabilities = []
 [dependencies.semver]
 path = "../semver"
 version = "^1.0.0"

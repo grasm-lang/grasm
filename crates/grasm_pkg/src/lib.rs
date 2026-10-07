@@ -523,6 +523,22 @@ pub fn publish(pkg_dir: &Path, registry: &Registry) -> Result<Published, String>
         ));
     }
 
+    // Omitting `capabilities` means *unrestricted*, not empty
+    // ([T-CAPABILITY]), which is the right default for a directory of files
+    // you are editing and the wrong one for something other people resolve
+    // against: a consumer cannot see what they are agreeing to, and nothing
+    // would be checked for them. So the key is optional everywhere except
+    // here. `capabilities = []` is the answer for a package that performs
+    // nothing, and says so.
+    if manifest.capabilities.is_none() {
+        return Err(format!(
+            "package `{}` has no `capabilities` key, so nothing about what it \
+may reach is checked for the people who depend on it\n  add `capabilities = []` \
+if it performs nothing, or list what it performs",
+            manifest.name
+        ));
+    }
+
     // A package that already exceeds its own ceiling should not enter a
     // registry at all: every consumer would fail, and the failure would look
     // like their problem.

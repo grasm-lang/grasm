@@ -2,6 +2,8 @@
 name = "knownhosts"
 version = "1.0.0"
 
+# Computation only: it opens nothing and performs nothing.
+capabilities = []
 [dependencies.hotp]
 path = "../hotp"
 version = "^1.0.0"

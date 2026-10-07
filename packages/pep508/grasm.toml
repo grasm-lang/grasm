@@ -2,6 +2,8 @@
 name = "pep508"
 version = "1.0.0"
 
+# Computation only: it opens nothing and performs nothing.
+capabilities = []
 [dependencies.pep440]
 path = "../pep440"
 version = "^1.0.0"

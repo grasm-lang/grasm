@@ -2,6 +2,8 @@
 name = "wordwrap"
 version = "1.0.0"
 
+# Computation only: it opens nothing and performs nothing.
+capabilities = []
 [dependencies.linebreak]
 path = "../linebreak"
 version = "^1.0.0"

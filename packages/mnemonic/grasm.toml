@@ -2,6 +2,8 @@
 name = "mnemonic"
 version = "1.0.0"
 
+# Computation only: it opens nothing and performs nothing.
+capabilities = []
 [dependencies.crypto_hash]
 path = "../crypto_hash"
 version = "^1.0.0"

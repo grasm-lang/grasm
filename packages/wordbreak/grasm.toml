@@ -2,6 +2,8 @@
 name = "wordbreak"
 version = "1.0.0"
 
+# Computation only: it opens nothing and performs nothing.
+capabilities = []
 [dependencies.graphemes]
 path = "../graphemes"
 version = "^1.0.0"

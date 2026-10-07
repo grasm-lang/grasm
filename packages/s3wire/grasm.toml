@@ -2,6 +2,8 @@
 name = "s3wire"
 version = "1.0.0"
 
+# Computation only: it opens nothing and performs nothing.
+capabilities = []
 [dependencies.xml]
 path = "../xml"
 version = "^1.0.0"

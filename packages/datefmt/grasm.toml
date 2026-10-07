@@ -2,6 +2,8 @@
 name = "datefmt"
 version = "1.0.0"
 
+# Computation only: it opens nothing and performs nothing.
+capabilities = []
 [dependencies.time]
 path = "../time"
 version = "^1.0.0"

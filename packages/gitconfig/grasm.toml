@@ -1,3 +1,6 @@
 [package]
 name = "gitconfig"
 version = "1.0.0"
+
+# Computation only: it opens nothing and performs nothing.
+capabilities = []

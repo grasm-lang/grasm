@@ -2,6 +2,8 @@
 name = "icalendar"
 version = "1.0.0"
 
+# Computation only: it opens nothing and performs nothing.
+capabilities = []
 [dependencies.contentline]
 path = "../contentline"
 version = "^1.0.0"
