@@ -107,3 +107,37 @@ Both are frontend numbers and neither is touched by this fix.
 
 Reproduce with `scratchpad/cs/gen.py N` and `genrs.py N`, timing
 `grasm check`, `grasm build --native` and `rustc -O` on the output.
+
+
+## The frontend, profiled (2026-10-07)
+
+G3's frontend half is still short: 365-400k LOC/s against 500k, and mildly
+superlinear -- 625,052 lines run at **286k LOC/s** where 175,052 run at 365k.
+
+A profile of `check` over 625,052 lines, by share of the 1,502 samples under
+`check_program`:
+
+| | samples | |
+|---|---:|---:|
+| `check_module` -- typing the bodies | 733 | 49% |
+| the collection passes before it | ~450 | 30% |
+| `rows_and_closures` -- the effect fixpoint | 123 | 8% |
+| everything else | ~200 | 13% |
+
+`check_modules_in` is one function holding a sequence of `for f in files`
+passes -- `collect_linear`, `collect_types`, `collect_effects`, then aliases,
+then the bodies. The profiler reports it four times because those passes
+inline separately, not because it runs four times.
+
+So the frontend is **not** the backend's story. There is no single quadratic
+line standing in front of half the time; the cost is spread across a fixpoint,
+four collection passes and the body check, and the superlinearity is worth
+about 22% over a 3.5x size increase rather than the 7.5x the backend showed.
+
+Reaching 500k LOC/s therefore means either removing the superlinearity *and*
+finding roughly a quarter more, or running the collection passes in parallel
+across modules -- which does nothing for a single large file and would be
+worth measuring on the 651-package corpus instead, where it is many modules
+rather than one.
+
+That is a project, not a fix, and it is recorded here rather than started.
