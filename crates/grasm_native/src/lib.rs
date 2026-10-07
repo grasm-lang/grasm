@@ -478,6 +478,17 @@ enum HandlerOpCode {
 struct Codegen<'m> {
     module: &'m mut ObjectModule,
     fns: HashMap<String, FnSig>,
+    /// Which of `READS_ONLY` the program declares a function for.
+    ///
+    /// A method call can reach a free function by [L-UFCS], and that function
+    /// may take its receiver `inout`, so a built-in that only reads stops
+    /// being read-only when the program declares its name. Answering that
+    /// used to mean collecting every key in `fns`, splitting each on `::` and
+    /// allocating a `String` per name -- **once per function compiled**, which
+    /// is O(n^2) in the size of the program and was 76% of a 75,000-line
+    /// build. Only these eighteen names can ever matter, so they are recorded
+    /// as functions are declared and the question is a hash lookup.
+    shadowed_builtins: std::collections::HashSet<String>,
     runtime: HashMap<&'static str, FuncId>,
     strings: HashMap<String, cranelift_module::DataId>,
     /// One type descriptor per struct shape, keyed by the type name and the
@@ -702,6 +713,7 @@ impl<'m> Codegen<'m> {
         Codegen {
             module,
             fns: HashMap::new(),
+            shadowed_builtins: std::collections::HashSet::new(),
             runtime: HashMap::new(),
             strings: HashMap::new(),
             struct_descs: HashMap::new(),
@@ -1795,6 +1807,7 @@ arguments nor the type this is bound to",
                 span,
                 what: format!("(module error: {e})"),
             })?;
+        self.note_declared(&key);
         self.fns.insert(
             key.clone(),
             FnSig {
@@ -1880,8 +1893,10 @@ arguments nor the type this is bound to",
                             span: e.span,
                             what: format!("declaring `{}`: {err}", e.name.name),
                         })?;
+                    let ekey = format!("{}::{}", self.current_module, e.name.name);
+                    self.note_declared(&ekey);
                     self.fns.insert(
-                        format!("{}::{}", self.current_module, e.name.name),
+                        ekey,
                         FnSig {
                             id,
                             is_extern: true,
@@ -1991,6 +2006,7 @@ arguments nor the type this is bound to",
                     // P{...}; return p` freed the fields it was returning.
                     let values_cross = matches!(ret, VType::Val(_))
                         || params.iter().any(|t| matches!(t, VType::Val(_)));
+                    self.note_declared(&key);
                     self.fns.insert(
                         key,
                         FnSig {
@@ -2180,6 +2196,22 @@ arguments nor the type this is bound to",
         self.compile_fn_as(f, &key)
     }
 
+    /// Built-in methods that only read their receiver.
+    const READS_ONLY: &'static [&'static str] = &[
+        "len", "is_empty", "byte_len", "contains", "contains_key", "get", "at", "first", "last",
+        "slice", "index_of", "keys", "values", "entries", "starts_with", "ends_with", "to_str",
+        "to_bytes",
+    ];
+
+    /// Called wherever a function enters `fns`, so the read-only question
+    /// stays answerable in O(1) however the program grows.
+    fn note_declared(&mut self, key: &str) {
+        let bare = key.rsplit("::").next().unwrap_or(key);
+        if Self::READS_ONLY.contains(&bare) {
+            self.shadowed_builtins.insert(bare.to_string());
+        }
+    }
+
     fn compile_fn_as(&mut self, f: &FnDecl, key: &str) -> CResult<()> {
         let key = key.to_string();
         let sig_params = self.fns[&key].params.clone();
@@ -2323,22 +2355,12 @@ arguments nor the type this is bound to",
         }
         // Built-in methods that only read, unless the program declares a
         // function of the same name -- a method call can reach one (UFCS),
-        // and it may take its receiver `inout`.
-        let user_names: std::collections::HashSet<String> = fcx
-            .cg
-            .fns
-            .keys()
-            .filter_map(|k| k.rsplit("::").next().map(str::to_string))
-            .collect();
-        let reads_only = |m: &str| {
-            !user_names.contains(m)
-                && matches!(
-                    m,
-                    "len" | "is_empty" | "byte_len" | "contains" | "contains_key" | "get"
-                        | "at" | "first" | "last" | "slice" | "index_of" | "keys" | "values"
-                        | "entries" | "starts_with" | "ends_with" | "to_str" | "to_bytes"
-                )
-        };
+        // and it may take its receiver `inout`. Recorded at declaration, so
+        // this is a lookup rather than a walk of every function in the
+        // program for every function in the program.
+        let shadowed = &fcx.cg.shadowed_builtins;
+        let reads_only =
+            |m: &str| Self::READS_ONLY.contains(&m) && !shadowed.contains(m);
         fcx.fn_mutated = grasm_sema::check::possibly_mutated(&f.body, &reads_only);
         for (i, p) in f.params.iter().enumerate() {
             let vt = sig_params[i].clone();

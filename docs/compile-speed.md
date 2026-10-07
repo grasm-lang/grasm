@@ -32,7 +32,42 @@ quarter**, and missed for an ordinary reason rather than a pathological one.
 one: 39 ms at 5,052 lines, **80 ms at 25,052** against a 50 ms target. The
 crossover is around 15k lines in one unit.
 
-## The native backend is superlinear, and that is a defect
+## Fixed, 2026-10-07
+
+One line was the whole of it. `compile_fn_as` opened with:
+
+```rust
+let user_names: HashSet<String> = fcx.cg.fns.keys()
+    .filter_map(|k| k.rsplit("::").next().map(str::to_string))
+    .collect();
+```
+
+built **once per function compiled**, walking **every function in the
+program**, splitting each qualified name and allocating a `String` for it. At
+9,000 functions that is 81 million allocations, and a profile of the 75,000-line
+build put 76% of samples inside `compile_fn_as` with 1,668 in
+`HashMap<String, _>::insert` and 1,762 in `rsplit`.
+
+Only eighteen built-in method names can ever be the answer to the question it
+was asking -- does the program declare a function that shadows a read-only
+built-in, which [L-UFCS] would then let a method call reach. Those are now
+recorded as functions are declared, and the question is a hash lookup.
+
+| | before | after | |
+|---|---:|---:|---|
+| 25,052 lines | 1,549 ms | **621 ms** | 2.5x |
+| 75,052 lines | 11,662 ms | **1,685 ms** | **6.9x** |
+| 3x the lines costs | 7.5x the time | **2.7x** | linear |
+
+Against `rustc -O` on the same shapes, Grasm is now **3.2x faster at 25k lines
+and 2.5x faster at 75k**, where before it was 1.3x faster at 25k and 2.8x
+*slower* at 75k.
+
+Gates: 100 pass. The one failure, `gold`'s `30-async-chat`, reproduces
+identically on the pre-change compiler (SIGSEGV, same three lines of output)
+and is recorded in `docs/known-issues.md`.
+
+## The defect, as it was found
 
 | | Grasm | rustc `-O` |
 |---|---:|---:|
@@ -62,11 +97,13 @@ than `rustc -O` and one that is three times slower, on the same code.
 ## What this changes
 
 Cranelift's design point is fast code generation, and the assumption here has
-been that giving up LLVM's optimiser bought compile speed. It buys it **at
-module scale and loses it at program scale**, which is exactly the regime a
-real codebase lives in. The claim "Grasm compiles faster than Rust" is true at
-25k lines and false at 75k, and should not be made until the superlinearity is
-gone.
+been that giving up LLVM's optimiser bought compile speed. It does -- 2.5x to
+3.2x `rustc -O` on these shapes -- but that was invisible behind one quadratic
+line, and nobody had looked because compile time had never been measured.
+
+What is still open is **G3 itself**: the frontend at 365-400k LOC/s against
+500k, and edit-to-diagnostic at 80 ms for a 25,000-line unit against 50 ms.
+Both are frontend numbers and neither is touched by this fix.
 
 Reproduce with `scratchpad/cs/gen.py N` and `genrs.py N`, timing
 `grasm check`, `grasm build --native` and `rustc -O` on the output.

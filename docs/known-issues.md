@@ -218,3 +218,16 @@ methods of any type, and `"hi".print()` is refused with help that names the
 spelling that works — `"hi" |> print`, which was always there and is charged
 the same row a call is. The old help offered UFCS for `print`, which is the
 call it had just refused.
+
+## `ProjectGold/30-async-chat` crashes under the native backend
+
+Found by `scripts/allgates.sh`'s `gold` gate on 2026-10-07. The interpreter
+runs it to completion (21 lines); the native build stops after three and exits
+with a varying signal -- SIGSEGV, SIGBUS, SIGTRAP, and once `panic: expected a
+list`. A signal that changes between runs on the same binary is memory
+corruption rather than a logic error.
+
+It is **not** a regression from the compile-speed fix of the same day: the
+compiler built from the commit before it fails identically, three times out of
+three. It is the only failure among 101 gates, and it is the only program in
+the corpus that combines sockets with `concurrent`, which is where to look.
