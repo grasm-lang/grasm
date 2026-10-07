@@ -436,8 +436,13 @@ territory as Rust rather than C's fully in-place `qsort`.
 ### Not benchmarked
 
 - Learning curve, as above.
-- **Incremental** rebuilds. The figures above are all from scratch; Grasm has
-  no build cache at all, which flatters it here and would not at scale.
+- ~~**Incremental** rebuilds~~ and compile speed generally: measured on
+  2026-10-07, see `docs/compile-speed.md`. The frontend runs at 365-400k LOC/s
+  against G3's 500k target, edit-to-diagnostic is 39 ms at 5k lines and 80 ms
+  at 25k against a 50 ms target, and the native backend is **superlinear** --
+  3x the lines costs 7.5x the time where rustc costs 1.7x. There *is* a
+  per-function build cache (`--no-incremental` turns it off); the sentence
+  here saying there is none was wrong.
 - Error-message quality. 32% of diagnostic sites attach a `help:` line; that
   is a coverage number, not a quality measurement.
 - Anything off macOS/arm64 for timing. Correctness *is* checked on a second
