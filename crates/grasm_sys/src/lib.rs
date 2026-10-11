@@ -26,10 +26,10 @@ pub mod absent {
     pub unsafe fn close(_fd: i32) -> i32 {
         0
     }
-    pub unsafe fn sys_read(_fd: i32, _buf: *mut u8, _n: usize) -> isize {
+    pub unsafe fn sys_read(_fd: i32, _buf: *mut core::ffi::c_void, _n: usize) -> isize {
         -1
     }
-    pub unsafe fn sys_write(_fd: i32, _buf: *const u8, _n: usize) -> isize {
+    pub unsafe fn sys_write(_fd: i32, _buf: *const core::ffi::c_void, _n: usize) -> isize {
         -1
     }
     pub unsafe fn lseek(_fd: i32, _at: i64, _whence: i32) -> i64 {
