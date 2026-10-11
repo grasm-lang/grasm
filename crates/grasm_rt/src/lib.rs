@@ -115,6 +115,261 @@ mod tls {
     }
 }
 
+/// `Mutex`, `RwLock` and `OnceLock` without `std`.
+///
+/// POSIX again, for the same reason `tls` is: these need the operating
+/// system, and this runtime already calls it directly. No poisoning -- a
+/// panic here calls `exit(101)` rather than unwinding ([E-PANIC-EXIT]), so a
+/// lock can never be left poisoned and `PoisonError` has nothing to report.
+mod sync {
+    use core::cell::UnsafeCell;
+    use core::mem::MaybeUninit;
+    use core::ops::{Deref, DerefMut};
+    use core::sync::atomic::{AtomicU8, Ordering};
+
+    // Opaque, and sized generously: macOS wants 64 bytes for a mutex and 200
+    // for an rwlock, glibc 40 and 56. Over-sizing costs bytes in a static and
+    // under-sizing corrupts the heap, so these are the larger of the two
+    // plus room.
+    #[repr(C, align(16))]
+    struct RawLock([u8; 256]);
+
+    extern "C" {
+        fn pthread_mutex_init(m: *mut u8, attr: *const u8) -> i32;
+        fn pthread_mutex_lock(m: *mut u8) -> i32;
+        fn pthread_mutex_unlock(m: *mut u8) -> i32;
+        fn pthread_rwlock_init(l: *mut u8, attr: *const u8) -> i32;
+        fn pthread_rwlock_rdlock(l: *mut u8) -> i32;
+        fn pthread_rwlock_wrlock(l: *mut u8) -> i32;
+        fn pthread_rwlock_unlock(l: *mut u8) -> i32;
+    }
+
+    /// Not started, being started, started. A lock is made once, by whoever
+    /// gets there first; everyone else spins over the handful of
+    /// instructions that takes.
+    const UNSET: u8 = 0;
+    const SETTING: u8 = 1;
+    const READY: u8 = 2;
+
+    pub struct Mutex<T> {
+        raw: UnsafeCell<MaybeUninit<RawLock>>,
+        state: AtomicU8,
+        value: UnsafeCell<T>,
+    }
+
+    unsafe impl<T: Send> Send for Mutex<T> {}
+    unsafe impl<T: Send> Sync for Mutex<T> {}
+
+    impl<T> Mutex<T> {
+        pub const fn new(value: T) -> Mutex<T> {
+            Mutex {
+                raw: UnsafeCell::new(MaybeUninit::uninit()),
+                state: AtomicU8::new(UNSET),
+                value: UnsafeCell::new(value),
+            }
+        }
+
+        fn raw(&self) -> *mut u8 {
+            let at = self.raw.get() as *mut u8;
+            loop {
+                match self.state.compare_exchange(
+                    UNSET,
+                    SETTING,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => {
+                        unsafe { pthread_mutex_init(at, core::ptr::null()) };
+                        self.state.store(READY, Ordering::Release);
+                        return at;
+                    }
+                    Err(READY) => return at,
+                    Err(_) => core::hint::spin_loop(),
+                }
+            }
+        }
+
+        pub fn lock(&self) -> Guard<'_, T> {
+            let at = self.raw();
+            unsafe { pthread_mutex_lock(at) };
+            Guard { at, value: self.value.get() }
+        }
+    }
+
+    pub struct Guard<'a, T> {
+        at: *mut u8,
+        value: *mut T,
+        }
+
+    impl<T> Deref for Guard<'_, T> {
+        type Target = T;
+        fn deref(&self) -> &T {
+            unsafe { &*self.value }
+        }
+    }
+
+    impl<T> DerefMut for Guard<'_, T> {
+        fn deref_mut(&mut self) -> &mut T {
+            unsafe { &mut *self.value }
+        }
+    }
+
+    impl<T> Drop for Guard<'_, T> {
+        fn drop(&mut self) {
+            unsafe { pthread_mutex_unlock(self.at) };
+        }
+    }
+
+    pub struct RwLock<T> {
+        raw: UnsafeCell<MaybeUninit<RawLock>>,
+        state: AtomicU8,
+        value: UnsafeCell<T>,
+    }
+
+    unsafe impl<T: Send> Send for RwLock<T> {}
+    unsafe impl<T: Send + Sync> Sync for RwLock<T> {}
+
+    impl<T> RwLock<T> {
+        pub const fn new(value: T) -> RwLock<T> {
+            RwLock {
+                raw: UnsafeCell::new(MaybeUninit::uninit()),
+                state: AtomicU8::new(UNSET),
+                value: UnsafeCell::new(value),
+            }
+        }
+
+        fn raw(&self) -> *mut u8 {
+            let at = self.raw.get() as *mut u8;
+            loop {
+                match self.state.compare_exchange(
+                    UNSET,
+                    SETTING,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => {
+                        unsafe { pthread_rwlock_init(at, core::ptr::null()) };
+                        self.state.store(READY, Ordering::Release);
+                        return at;
+                    }
+                    Err(READY) => return at,
+                    Err(_) => core::hint::spin_loop(),
+                }
+            }
+        }
+
+        pub fn read(&self) -> ReadGuard<'_, T> {
+            let at = self.raw();
+            unsafe { pthread_rwlock_rdlock(at) };
+            ReadGuard { at, value: self.value.get() }
+        }
+
+        pub fn write(&self) -> Guard<'_, T> {
+            let at = self.raw();
+            unsafe { pthread_rwlock_wrlock(at) };
+            // A write guard unlocks an rwlock, not a mutex, so it cannot be
+            // the `Guard` above: that one calls `pthread_mutex_unlock`.
+            Guard { at, value: self.value.get() }
+        }
+    }
+
+    pub struct ReadGuard<'a, T> {
+        at: *mut u8,
+        value: *mut T,
+        _held: core::marker::PhantomData<&'a T>,
+    }
+
+    impl<T> Deref for ReadGuard<'_, T> {
+        type Target = T;
+        fn deref(&self) -> &T {
+            unsafe { &*self.value }
+        }
+    }
+
+    impl<T> Drop for ReadGuard<'_, T> {
+        fn drop(&mut self) {
+            unsafe { pthread_rwlock_unlock(self.at) };
+        }
+    }
+
+    /// Written once, read for ever after. `Mutex` could carry an `Option`
+    /// instead, but every read would then take a lock, and these hold things
+    /// the runtime reads on hot paths.
+    pub struct OnceLock<T> {
+        state: AtomicU8,
+        value: UnsafeCell<MaybeUninit<T>>,
+    }
+
+    unsafe impl<T: Send> Send for OnceLock<T> {}
+    unsafe impl<T: Send + Sync> Sync for OnceLock<T> {}
+
+    impl<T> OnceLock<T> {
+        pub const fn new() -> OnceLock<T> {
+            OnceLock {
+                state: AtomicU8::new(UNSET),
+                value: UnsafeCell::new(MaybeUninit::uninit()),
+            }
+        }
+
+        pub fn get(&self) -> Option<&T> {
+            if self.state.load(Ordering::Acquire) == READY {
+                // Safety: READY is stored with Release after the write
+                // below, so the value is there and never changes again.
+                Some(unsafe { (*self.value.get()).assume_init_ref() })
+            } else {
+                None
+            }
+        }
+
+        pub fn get_or_init(&self, make: impl FnOnce() -> T) -> &T {
+            loop {
+                match self.state.compare_exchange(
+                    UNSET,
+                    SETTING,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => {
+                        let at = self.value.get();
+                        unsafe { (*at).write(make()) };
+                        self.state.store(READY, Ordering::Release);
+                        return unsafe { (*at).assume_init_ref() };
+                    }
+                    Err(READY) => {
+                        return unsafe { (*self.value.get()).assume_init_ref() }
+                    }
+                    // Another thread is running its `make`. It may take a
+                    // while, but a `OnceLock` initialiser here is short and
+                    // this only happens on the first touch.
+                    Err(_) => core::hint::spin_loop(),
+                }
+            }
+        }
+
+        pub fn set(&self, value: T) -> Result<(), T> {
+            match self.state.compare_exchange(
+                UNSET,
+                SETTING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    unsafe { (*self.value.get()).write(value) };
+                    self.state.store(READY, Ordering::Release);
+                    Ok(())
+                }
+                Err(_) => Err(value),
+            }
+        }
+    }
+
+    impl<T> Default for OnceLock<T> {
+        fn default() -> OnceLock<T> {
+            OnceLock::new()
+        }
+    }
+}
+
 /// The shape `std`'s macro accepts, over `tls::Local`. The `const { … }` form
 /// is taken and the braces dropped: the initialiser is run on first use here
 /// rather than folded at compile time, which costs one branch per thread.
@@ -423,7 +678,7 @@ mod maphash {
 
     /// One seed for the process, from the same place `std` gets its own.
     fn seed() -> u64 {
-        static SEED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        static SEED: crate::sync::OnceLock<u64> = crate::sync::OnceLock::new();
         *SEED.get_or_init(|| {
             std::collections::hash_map::RandomState::new()
                 .build_hasher()
@@ -894,7 +1149,7 @@ pub struct StructTy {
     pub kinds: Vec<u8>,
     /// The empty value list of this type (docs/values.md), made once and
     /// shared: `[]` allocates nothing, and the first push copies on write.
-    pub empty: std::sync::OnceLock<usize>,
+    pub empty: crate::sync::OnceLock<usize>,
     /// Where each field starts, in words. A field is one word, except an
     /// inline list or string, which is three (`kind_width`).
     pub offs: Vec<usize>,
@@ -960,7 +1215,7 @@ fn inline_parts<T>(v: Vec<T>, w: &mut [i64]) {
 
 /// `vec_layout` as word indices rather than byte offsets.
 fn vec_layout_words() -> (usize, usize, usize) {
-    static AT: std::sync::OnceLock<(usize, usize, usize)> = std::sync::OnceLock::new();
+    static AT: crate::sync::OnceLock<(usize, usize, usize)> = crate::sync::OnceLock::new();
     *AT.get_or_init(|| {
         let (p, l, c) = vec_layout();
         (p / 8, l / 8, c / 8)
@@ -984,7 +1239,7 @@ impl StructTy {
             elems: vec![0; fields.len()],
             fields,
             kinds,
-            empty: std::sync::OnceLock::new(),
+            empty: crate::sync::OnceLock::new(),
             offs,
             width,
             has_inline,
@@ -1402,7 +1657,7 @@ unsafe fn desc_ty(desc: *const StructDesc) -> &'static StructTy {
         name: borrowed_str((*desc).name_ptr, (*desc).name_len),
         fields,
         kinds,
-        empty: std::sync::OnceLock::new(),
+        empty: crate::sync::OnceLock::new(),
         offs,
         width,
         elems,
@@ -2953,7 +3208,7 @@ const SMALL_MAX: i64 = 1024;
 /// lookup to an add and a multiply: the boxes are contiguous, so the address
 /// of the box for `n` can be computed rather than read out of a table.
 fn interned_base() -> usize {
-    static BASE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    static BASE: crate::sync::OnceLock<usize> = crate::sync::OnceLock::new();
     *BASE.get_or_init(|| {
         let mut table: Vec<RtVal> = Vec::with_capacity((SMALL_MAX - SMALL_MIN + 3) as usize);
         for v in [false, true] {
@@ -4081,8 +4336,8 @@ unsafe fn par_words(
         let input: &[i64] = &words[1..];
         let rest = &mut out[1..];
         let chunk = input.len().div_ceil(workers * 16).max(1);
-        let pieces: std::sync::Mutex<Vec<(usize, &mut [i64])>> =
-            std::sync::Mutex::new(rest.chunks_mut(chunk).enumerate().collect());
+        let pieces: crate::sync::Mutex<Vec<(usize, &mut [i64])>> =
+            crate::sync::Mutex::new(rest.chunks_mut(chunk).enumerate().collect());
         std::thread::scope(|scope| {
             let queue = &pieces;
             let env_ref = env_owned;
@@ -4542,8 +4797,8 @@ pub unsafe extern "C" fn grasm_par_filter_scalar(
         let input: &[i64] = &words[1..];
         let rest = &mut keep[1..];
         let chunk = input.len().div_ceil(workers * 16).max(1);
-        let pieces: std::sync::Mutex<Vec<(usize, &mut [u8])>> =
-            std::sync::Mutex::new(rest.chunks_mut(chunk).enumerate().collect());
+        let pieces: crate::sync::Mutex<Vec<(usize, &mut [u8])>> =
+            crate::sync::Mutex::new(rest.chunks_mut(chunk).enumerate().collect());
         std::thread::scope(|scope| {
             let queue = &pieces;
             let env_ref = &env_owned;
@@ -4939,8 +5194,8 @@ pub unsafe extern "C" fn grasm_fn_env(v: *mut RtVal) -> *mut RtVal {
 fn empty_list_of(kind: Option<ScalarKind>) -> *mut RtVal {
     // One per shape: a list of boxed values, and one per scalar width, because
     // the first push writes into whichever storage is already there.
-    static BOXED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    static SCALARS: std::sync::OnceLock<[usize; 5]> = std::sync::OnceLock::new();
+    static BOXED: crate::sync::OnceLock<usize> = crate::sync::OnceLock::new();
+    static SCALARS: crate::sync::OnceLock<[usize; 5]> = crate::sync::OnceLock::new();
     match kind {
         None => *BOXED.get_or_init(|| {
             Box::into_raw(Box::new(RtVal {
@@ -6885,7 +7140,7 @@ struct Slab {
 /// A mutex is the right cost here: taking a reference is rare next to reading
 /// through one, and correctness across threads is the entire point of a shared
 /// heap.
-static SLAB: std::sync::Mutex<Slab> = std::sync::Mutex::new(Slab {
+static SLAB: crate::sync::Mutex<Slab> = crate::sync::Mutex::new(Slab {
     slots: Vec::new(),
     gens: Vec::new(),
     free: Vec::new(),
@@ -8276,7 +8531,7 @@ struct SocketTable {
 /// Read-write: every socket operation looks its handle up, and only opening
 /// and closing change the table. Behind a plain mutex, a proxy's eight
 /// workers spent as long waiting for the lock as in `poll`.
-static SOCKETS: std::sync::RwLock<SocketTable> = std::sync::RwLock::new(SocketTable {
+static SOCKETS: crate::sync::RwLock<SocketTable> = crate::sync::RwLock::new(SocketTable {
     slots: Vec::new(),
     free: alloc::collections::BinaryHeap::new(),
 });
@@ -8284,13 +8539,13 @@ static SOCKETS: std::sync::RwLock<SocketTable> = std::sync::RwLock::new(SocketTa
 /// The table, locked for a change. A panic while holding it ends the process
 /// ([E-PANIC-EXIT]) before anything could observe a half-made change, so a
 /// poisoned lock holds a table that is still whole.
-fn sockets() -> std::sync::RwLockWriteGuard<'static, SocketTable> {
-    SOCKETS.write().unwrap_or_else(std::sync::PoisonError::into_inner)
+fn sockets() -> crate::sync::Guard<'static, SocketTable> {
+    SOCKETS.write()
 }
 
 /// The table, locked for a lookup.
-fn sockets_read() -> std::sync::RwLockReadGuard<'static, SocketTable> {
-    SOCKETS.read().unwrap_or_else(std::sync::PoisonError::into_inner)
+fn sockets_read() -> crate::sync::ReadGuard<'static, SocketTable> {
+    SOCKETS.read()
 }
 
 thread_local! {
@@ -8547,7 +8802,7 @@ struct KqWaiter {
     kq: i32,
     /// The handles registered, in the order the program passed them.
     handles: Vec<i64>,
-    registered: Vec<(i32, std::sync::Weak<Socket>)>,
+    registered: Vec<(i32, alloc::sync::Weak<Socket>)>,
     events: Vec<sys_kqueue::KEvent>,
     /// The registered set's index for each descriptor number, `u32::MAX`
     /// for none.
@@ -10262,7 +10517,7 @@ pub extern "C" fn grasm_monotonic_millis() -> i64 {
 /// `monotonic_millis` and `monotonic_nanos` agree on how much time has passed
 /// and differ only in how finely they say it.
 fn monotonic_start() -> std::time::Instant {
-    use std::sync::OnceLock;
+    use crate::sync::OnceLock;
     static START: OnceLock<std::time::Instant> = OnceLock::new();
     *START.get_or_init(std::time::Instant::now)
 }
@@ -10484,7 +10739,7 @@ pub unsafe extern "C" fn grasm_list_min_max(v: *mut RtVal, want_max: i8) -> *mut
 /// Names outlive the values that carry them, and a journal holds few of them.
 fn interned(text: &str) -> &'static str {
     use std::collections::HashMap;
-    use std::sync::{Mutex, OnceLock};
+    use crate::sync::{Mutex, OnceLock};
     static NAMES: OnceLock<Mutex<HashMap<String, &'static str>>> = OnceLock::new();
     let mut map = NAMES
         .get_or_init(|| Mutex::new(HashMap::new()))

@@ -13,7 +13,7 @@
 //! released before the leak check counts.
 
 use std::collections::VecDeque;
-use std::sync::Mutex;
+use crate::sync::Mutex;
 
 use crate::{dec, inc, none_val, rt_panic, some_of, RtPayload, RtVal, LOCAL, STACK_BUDGET};
 
@@ -47,7 +47,7 @@ static CHANS: Mutex<Chans> = Mutex::new(Chans {
 const DEADLOCK: &str =
     "deadlock: every task is waiting on a channel, and nothing left can send or receive";
 
-fn chans() -> std::sync::MutexGuard<'static, Chans> {
+fn chans() -> crate::sync::Guard<'static, Chans> {
     CHANS.lock().unwrap_or_else(|p| p.into_inner())
 }
 
