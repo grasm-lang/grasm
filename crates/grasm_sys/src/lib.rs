@@ -20,7 +20,7 @@ extern crate alloc;
 /// journal is simply off in the browser -- which is what it already was.
 #[cfg(target_arch = "wasm32")]
 pub mod absent {
-    pub unsafe fn open(_path: *const u8, _flags: i32, _mode: u32) -> i32 {
+    pub unsafe fn sys_open(_path: *const core::ffi::c_char, _flags: i32, _mode: u32) -> i32 {
         -1
     }
     pub unsafe fn close(_fd: i32) -> i32 {
@@ -312,8 +312,10 @@ pub mod io {
 
     #[cfg(not(target_arch = "wasm32"))]
     extern "C" {
-        fn write(fd: i32, buf: *const u8, n: usize) -> isize;
-        fn read(fd: i32, buf: *mut u8, n: usize) -> isize;
+        #[link_name = "write"]
+        fn sys_write(fd: i32, buf: *const core::ffi::c_void, n: usize) -> isize;
+        #[link_name = "read"]
+        fn sys_read(fd: i32, buf: *mut core::ffi::c_void, n: usize) -> isize;
         fn strerror(code: i32) -> *const u8;
     }
 
@@ -417,7 +419,7 @@ pub mod io {
     fn write_fully(fd: i32, bytes: &[u8]) -> Result<()> {
         let mut done = 0;
         while done < bytes.len() {
-            let n = unsafe { write(fd, bytes[done..].as_ptr(), bytes.len() - done) };
+            let n = unsafe { sys_write(fd, bytes[done..].as_ptr() as *const core::ffi::c_void, bytes.len() - done) };
             if n > 0 {
                 done += n as usize;
             } else if n < 0 && errno() == EINTR {
@@ -557,7 +559,7 @@ pub mod io {
         // failure on non-ASCII input.
         let mut held: Vec<u8> = Vec::new();
         loop {
-            let n = unsafe { read(0, byte.as_mut_ptr(), 1) };
+            let n = unsafe { sys_read(0, byte.as_mut_ptr() as *mut core::ffi::c_void, 1) };
             if n == 0 {
                 break;
             }
@@ -624,8 +626,10 @@ pub mod process {
         fn execvp(file: *const u8, argv: *const *const u8) -> i32;
         fn _exit(code: i32) -> !;
         fn waitpid(pid: i32, status: *mut i32, flags: i32) -> i32;
-        fn read(fd: i32, buf: *mut u8, n: usize) -> isize;
-        fn write(fd: i32, buf: *const u8, n: usize) -> isize;
+        #[link_name = "read"]
+        fn sys_read(fd: i32, buf: *mut core::ffi::c_void, n: usize) -> isize;
+        #[link_name = "write"]
+        fn sys_write(fd: i32, buf: *const core::ffi::c_void, n: usize) -> isize;
         fn poll(fds: *mut PollFd, n: u32, timeout: i32) -> i32;
         // Variadic too, for the same reason as `open` above.
         fn fcntl(fd: i32, cmd: i32, ...) -> i32;
@@ -756,7 +760,7 @@ pub mod process {
         let mut done = 0;
         while done < bytes.len() {
             let n = unsafe {
-                write(fd, bytes[done..].as_ptr(), bytes.len() - done)
+                sys_write(fd, bytes[done..].as_ptr() as *const core::ffi::c_void, bytes.len() - done)
             };
             if n > 0 {
                 done += n as usize;
@@ -799,7 +803,7 @@ pub mod process {
                     continue;
                 }
                 let n = unsafe {
-                    read(watched.fd, chunk.as_mut_ptr(), chunk.len())
+                    sys_read(watched.fd, chunk.as_mut_ptr() as *mut core::ffi::c_void, chunk.len())
                 };
                 let into = if watched.fd == out {
                     &mut got_out
@@ -1635,14 +1639,15 @@ pub mod fs {
         // x2 and `open` read whatever was on the stack -- so a created file
         // got a garbage mode, and the second `append_bytes` to it failed with
         // "Permission denied" while the first succeeded.
-        fn open(path: *const u8, flags: i32, ...) -> i32;
+        #[link_name = "open"]
+        fn sys_open(path: *const core::ffi::c_char, flags: i32, ...) -> i32;
         fn close(fd: i32) -> i32;
         // Named apart from this module's own `read`, `write` and `rename`,
         // which would otherwise be duplicate definitions.
         #[link_name = "read"]
-        fn sys_read(fd: i32, buf: *mut u8, n: usize) -> isize;
+        fn sys_read(fd: i32, buf: *mut core::ffi::c_void, n: usize) -> isize;
         #[link_name = "write"]
-        fn sys_write(fd: i32, buf: *const u8, n: usize) -> isize;
+        fn sys_write(fd: i32, buf: *const core::ffi::c_void, n: usize) -> isize;
         fn lseek(fd: i32, at: i64, whence: i32) -> i64;
         fn fsync(fd: i32) -> i32;
         #[link_name = "rename"]
@@ -1732,7 +1737,7 @@ pub mod fs {
         pub fn with_flags(path: &str, flags: i32, mode: u32) -> Result<File> {
             let at = c_path(path);
             loop {
-                let fd = unsafe { open(at.as_ptr(), flags, mode) };
+                let fd = unsafe { sys_open(at.as_ptr() as *const core::ffi::c_char, flags, mode) };
                 if fd >= 0 {
                     return Ok(File { fd });
                 }
@@ -1748,7 +1753,7 @@ pub mod fs {
 
         pub fn read(&mut self, into: &mut [u8]) -> Result<usize> {
             loop {
-                let n = unsafe { sys_read(self.fd, into.as_mut_ptr(), into.len()) };
+                let n = unsafe { sys_read(self.fd, into.as_mut_ptr() as *mut core::ffi::c_void, into.len()) };
                 if n >= 0 {
                     return Ok(n as usize);
                 }
@@ -1793,7 +1798,7 @@ pub mod fs {
             let mut done = 0;
             while done < bytes.len() {
                 let n = unsafe {
-                    sys_write(self.fd, bytes[done..].as_ptr(), bytes.len() - done)
+                    sys_write(self.fd, bytes[done..].as_ptr() as *const core::ffi::c_void, bytes.len() - done)
                 };
                 if n > 0 {
                     done += n as usize;
@@ -2655,7 +2660,6 @@ extern crate std;
 mod tests {
     #[allow(unused_imports)]
     use alloc::{format, string::String, string::ToString, vec, vec::Vec};
-    use std::string::ToString as _;
 
     fn scratch(name: &str) -> String {
         let at = format!(
@@ -2884,6 +2888,7 @@ mod tests {
     /// this from the wrong place would move every money column in the corpus.
     #[test]
     fn rounding_takes_halves_away_from_zero() {
+        #[allow(unused_imports)]
         use crate::math::Float;
         assert_eq!(2.5f64.round(), 3.0);
         assert_eq!((-2.5f64).round(), -3.0);
@@ -2893,6 +2898,7 @@ mod tests {
 
     #[test]
     fn the_float_maths_agrees_with_known_values() {
+        #[allow(unused_imports)]
         use crate::math::Float;
         assert_eq!(4.0f64.sqrt(), 2.0);
         assert_eq!(2.0f64.powf(10.0), 1024.0);
