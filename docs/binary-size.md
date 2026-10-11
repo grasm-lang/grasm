@@ -203,3 +203,35 @@ The other sixteen are correct: `pthread_key_t` (u64/u32), `pthread_t`
 `_SC_NPROCESSORS_ONLN` (58/84), and the `Dirent` and `addrinfo` layouts.
 `EINTR`, `ENOENT`, `EEXIST`, `AF_INET`, `IPPROTO_TCP`, `TCP_NODELAY`,
 `CLOCK_REALTIME`, `POLLIN` and `SIGKILL` are the same on both.
+
+## Two defects difftest found that reading the code had not (2026-10-11)
+
+### `open` is variadic, and arm64 passes variadic arguments differently
+
+`int open(const char *, int, ...)` takes its mode as a **variadic** argument.
+arm64 Apple's ABI passes variadic arguments on the stack where a fixed
+parameter goes in a register. Declared as `fn open(path, flags, mode)`, the
+mode went into x2 and `open` read whatever happened to be on the stack.
+
+The symptom was not a crash. A created file got a garbage mode, so the *first*
+`append_bytes` to a path succeeded and the *second* failed with "Permission
+denied" -- and `file_size` then reported 5 where the interpreter said 10. Three
+of `apps/broker`'s assertions failed while thirty-two other programs passed.
+
+`fcntl` has the same shape and had the same defect, in two places. Nothing
+had failed visibly there yet: a wrong `F_SETFL` argument makes
+`set_nonblocking` quietly do something else.
+
+Both are now declared with `...`, which is what they are.
+
+### `readdir$INODE64` does not exist on arm64
+
+The suffixed symbol is an x86_64-only compatibility alias. On arm64 plain
+`readdir` already returns a 64-bit inode and no alias exists, so asking for
+one fails at **link** time -- `apps/broker`, `apps/grlint` and `apps/logpipe`
+all stopped compiling natively. The cfg was per-OS where it had to be
+per-architecture.
+
+Both found by `difftest`, neither by reading the code, and neither by
+compiling it. After them: **57 programs identical across all four engines, 0
+mismatched, 0 unsupported.**

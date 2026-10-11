@@ -627,7 +627,8 @@ pub mod process {
         fn read(fd: i32, buf: *mut u8, n: usize) -> isize;
         fn write(fd: i32, buf: *const u8, n: usize) -> isize;
         fn poll(fds: *mut PollFd, n: u32, timeout: i32) -> i32;
-        fn fcntl(fd: i32, cmd: i32, arg: i32) -> i32;
+        // Variadic too, for the same reason as `open` above.
+        fn fcntl(fd: i32, cmd: i32, ...) -> i32;
         fn kill(pid: i32, signal: i32) -> i32;
     }
 
@@ -1232,7 +1233,8 @@ pub mod net {
         fn setsockopt(fd: i32, level: i32, name: i32, value: *const u8, len: u32) -> i32;
         fn shutdown(fd: i32, how: i32) -> i32;
         fn close(fd: i32) -> i32;
-        fn fcntl(fd: i32, cmd: i32, arg: i32) -> i32;
+        // Variadic too, for the same reason as `open` above.
+        fn fcntl(fd: i32, cmd: i32, ...) -> i32;
         fn getaddrinfo(host: *const u8, service: *const u8, hint: *const AddrInfo, out: *mut *const AddrInfo) -> i32;
         fn freeaddrinfo(at: *const AddrInfo);
         fn getsockname(fd: i32, addr: *mut u8, len: *mut u32) -> i32;
@@ -1626,7 +1628,14 @@ pub mod fs {
 
     #[cfg(not(target_arch = "wasm32"))]
     extern "C" {
-        fn open(path: *const u8, flags: i32, mode: u32) -> i32;
+        // Variadic, and that is not a detail: `int open(const char *, int,
+        // ...)` takes its mode as a variadic argument, which arm64 Apple's
+        // ABI passes **on the stack** where a fixed parameter goes in a
+        // register. Declared with a fixed third parameter, the mode went to
+        // x2 and `open` read whatever was on the stack -- so a created file
+        // got a garbage mode, and the second `append_bytes` to it failed with
+        // "Permission denied" while the first succeeded.
+        fn open(path: *const u8, flags: i32, ...) -> i32;
         fn close(fd: i32) -> i32;
         // Named apart from this module's own `read`, `write` and `rename`,
         // which would otherwise be duplicate definitions.
@@ -1645,9 +1654,20 @@ pub mod fs {
         fn closedir(dir: *mut u8) -> i32;
     }
 
-    // `readdir` is `readdir$INODE64` on macOS, because the original returns
-    // a 32-bit inode and was versioned out.
-    #[cfg(all(target_os = "macos", not(target_arch = "wasm32")))]
+    // The 64-bit-inode `readdir`, which is spelled differently on the two
+    // macOS architectures and caught three apps failing to link when this
+    // was written per-OS instead of per-architecture:
+    //
+    //   - arm64: plain `readdir` already returns a 64-bit inode, and no
+    //     `$INODE64` alias exists -- asking for one does not link.
+    //   - x86_64: plain `readdir` is the old 32-bit-inode version kept for
+    //     compatibility, so the suffixed symbol is the one that matches
+    //     `Dirent` below.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    extern "C" {
+        fn readdir(dir: *mut u8) -> *const Dirent;
+    }
+    #[cfg(all(target_os = "macos", not(target_arch = "aarch64")))]
     extern "C" {
         #[link_name = "readdir$INODE64"]
         fn readdir(dir: *mut u8) -> *const Dirent;
