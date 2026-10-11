@@ -383,6 +383,280 @@ mod io {
     }
 }
 
+/// Subprocesses: `fork`, `execvp`, `waitpid`, and pipes.
+///
+/// Two hazards decide the shape of this module, and both are the kind that
+/// works in testing and fails in production.
+///
+/// **Nothing is allocated between `fork` and `exec`.** This runtime has
+/// threads -- `par_map` and the network workers -- and `fork` gives the child
+/// one thread while leaving every lock as it was. If another thread held
+/// `malloc`'s lock at the moment of the fork, the child deadlocks the first
+/// time it allocates. So every C string and pointer array is built before the
+/// fork, and the child calls only `dup2`, `close`, `execvp` and `_exit`, all
+/// of which are async-signal-safe.
+///
+/// **Two pipes are drained together, not one after the other.** Reading
+/// stdout to the end before touching stderr deadlocks as soon as the child
+/// writes more to stderr than its pipe buffer holds -- 64 KiB on Linux. The
+/// child blocks writing, the parent blocks reading, and neither moves. So
+/// both descriptors go through one `poll` loop.
+mod process {
+    use crate::io::{errno, Error, Result, EINTR};
+    use alloc::string::String;
+    use alloc::vec::Vec;
+
+    const POLLIN: i16 = 0x0001;
+
+    #[repr(C)]
+    struct PollFd {
+        fd: i32,
+        wanted: i16,
+        got: i16,
+    }
+
+    extern "C" {
+        fn pipe(into: *mut i32) -> i32;
+        fn fork() -> i32;
+        fn dup2(from: i32, to: i32) -> i32;
+        fn close(fd: i32) -> i32;
+        fn execvp(file: *const u8, argv: *const *const u8) -> i32;
+        fn _exit(code: i32) -> !;
+        fn waitpid(pid: i32, status: *mut i32, flags: i32) -> i32;
+        fn read(fd: i32, buf: *mut u8, n: usize) -> isize;
+        fn write(fd: i32, buf: *const u8, n: usize) -> isize;
+        fn poll(fds: *mut PollFd, n: u32, timeout: i32) -> i32;
+        fn fcntl(fd: i32, cmd: i32, arg: i32) -> i32;
+        fn kill(pid: i32, signal: i32) -> i32;
+    }
+
+    const F_SETFD: i32 = 2;
+    const FD_CLOEXEC: i32 = 1;
+    pub const SIGKILL: i32 = 9;
+
+    pub fn stop(pid: i32) {
+        unsafe { kill(pid, SIGKILL) };
+    }
+
+    /// The argument vector, owned, so that the child between `fork` and
+    /// `exec` only reads pointers that already exist.
+    struct Argv {
+        _owned: Vec<Vec<u8>>,
+        pointers: Vec<*const u8>,
+    }
+
+    fn argv_of(program: &str, args: &[String]) -> Argv {
+        let mut owned = Vec::with_capacity(args.len() + 1);
+        let mut one = Vec::with_capacity(program.len() + 1);
+        one.extend_from_slice(program.as_bytes());
+        one.push(0);
+        owned.push(one);
+        for arg in args {
+            let mut next = Vec::with_capacity(arg.len() + 1);
+            next.extend_from_slice(arg.as_bytes());
+            next.push(0);
+            owned.push(next);
+        }
+        let mut pointers: Vec<*const u8> =
+            owned.iter().map(|a| a.as_ptr()).collect();
+        // `execvp` reads until it sees a null, so the array must end with one.
+        pointers.push(core::ptr::null());
+        Argv { _owned: owned, pointers }
+    }
+
+    pub struct Pipe {
+        pub reader: i32,
+        pub writer: i32,
+    }
+
+    /// Both ends are marked close-on-exec, which is what makes a pipeline
+    /// terminate. A child inherits every open descriptor, so without this
+    /// the second stage would hold the first stage's writer open and the
+    /// first stage's reader would never see end of file -- a pipeline that
+    /// hangs instead of finishing. `dup2` clears the flag on the descriptor
+    /// it makes, so the child still gets its own 0, 1 and 2.
+    pub fn new_pipe() -> Result<Pipe> {
+        let mut ends = [0i32; 2];
+        if unsafe { pipe(ends.as_mut_ptr()) } < 0 {
+            return Err(Error::last_os_error());
+        }
+        for fd in ends {
+            unsafe { fcntl(fd, F_SETFD, FD_CLOEXEC) };
+        }
+        Ok(Pipe { reader: ends[0], writer: ends[1] })
+    }
+
+    pub fn shut(fd: i32) {
+        if fd >= 0 {
+            unsafe { close(fd) };
+        }
+    }
+
+    /// Forks and execs. `stdin`, `stdout` and `stderr` replace the child's
+    /// own when given. Every other descriptor is already close-on-exec, so
+    /// the child keeps nothing else.
+    pub fn start(
+        program: &str,
+        args: &[String],
+        stdin: Option<i32>,
+        stdout: Option<i32>,
+        stderr: Option<i32>,
+    ) -> Result<i32> {
+        // Before the fork, while allocating is still safe.
+        let argv = argv_of(program, args);
+        let pid = unsafe { fork() };
+        if pid < 0 {
+            return Err(Error::last_os_error());
+        }
+        if pid == 0 {
+            unsafe {
+                if let Some(fd) = stdin {
+                    dup2(fd, 0);
+                }
+                if let Some(fd) = stdout {
+                    dup2(fd, 1);
+                }
+                if let Some(fd) = stderr {
+                    dup2(fd, 2);
+                }
+                execvp(argv.pointers[0], argv.pointers.as_ptr());
+                // Only reached if `execvp` failed. 127 is what a shell
+                // reports for a command it could not run.
+                _exit(127)
+            }
+        }
+        Ok(pid)
+    }
+
+    /// The exit code, or -1 for a signal -- which is what the caller already
+    /// treats as "no status a process can exit with".
+    pub fn wait_for(pid: i32) -> Result<i64> {
+        let mut status = 0i32;
+        loop {
+            let r = unsafe { waitpid(pid, &mut status, 0) };
+            if r >= 0 {
+                break;
+            }
+            if errno() != EINTR {
+                return Err(Error::last_os_error());
+            }
+        }
+        // The low seven bits hold the signal, the next eight the exit code,
+        // which is what `WIFEXITED` and `WEXITSTATUS` read.
+        if status & 0x7f == 0 {
+            Ok(((status >> 8) & 0xff) as i64)
+        } else {
+            Ok(-1)
+        }
+    }
+
+    pub fn write_and_close(fd: i32, bytes: &[u8]) {
+        let mut done = 0;
+        while done < bytes.len() {
+            let n = unsafe {
+                write(fd, bytes[done..].as_ptr(), bytes.len() - done)
+            };
+            if n > 0 {
+                done += n as usize;
+            } else if n < 0 && errno() == EINTR {
+                continue;
+            } else {
+                // A child that exited without reading leaves nowhere to put
+                // the rest, which is not this function's problem to report.
+                break;
+            }
+        }
+        shut(fd);
+    }
+
+    /// Both descriptors in one `poll` loop, so neither pipe can fill while
+    /// the other is being read. Each is closed as it reaches end of file.
+    pub fn drain_both(mut out: i32, mut err: i32) -> (Vec<u8>, Vec<u8>) {
+        let mut got_out = Vec::new();
+        let mut got_err = Vec::new();
+        let mut chunk = [0u8; 8192];
+        while out >= 0 || err >= 0 {
+            let mut watching: Vec<PollFd> = Vec::with_capacity(2);
+            if out >= 0 {
+                watching.push(PollFd { fd: out, wanted: POLLIN, got: 0 });
+            }
+            if err >= 0 {
+                watching.push(PollFd { fd: err, wanted: POLLIN, got: 0 });
+            }
+            let r = unsafe {
+                poll(watching.as_mut_ptr(), watching.len() as u32, -1)
+            };
+            if r < 0 {
+                if errno() == EINTR {
+                    continue;
+                }
+                break;
+            }
+            for watched in &watching {
+                if watched.got == 0 {
+                    continue;
+                }
+                let n = unsafe {
+                    read(watched.fd, chunk.as_mut_ptr(), chunk.len())
+                };
+                let into = if watched.fd == out {
+                    &mut got_out
+                } else {
+                    &mut got_err
+                };
+                if n > 0 {
+                    into.extend_from_slice(&chunk[..n as usize]);
+                } else if n == 0 || errno() != EINTR {
+                    // End of file, or an error that will not clear. Either
+                    // way this descriptor is finished.
+                    shut(watched.fd);
+                    if watched.fd == out {
+                        out = -1;
+                    } else {
+                        err = -1;
+                    }
+                }
+            }
+        }
+        (got_out, got_err)
+    }
+
+    /// `Command::new(p).args(a).output()`.
+    pub fn run(program: &str, args: &[String]) -> Result<(i64, Vec<u8>, Vec<u8>)> {
+        let out = new_pipe()?;
+        let err = match new_pipe() {
+            Ok(p) => p,
+            Err(e) => {
+                shut(out.reader);
+                shut(out.writer);
+                return Err(e);
+            }
+        };
+        let pid = start(
+            program,
+            args,
+            None,
+            Some(out.writer),
+            Some(err.writer),
+        );
+        // The parent holds no writer: while it does, the reader never sees
+        // end of file even after the child exits.
+        shut(out.writer);
+        shut(err.writer);
+        let pid = match pid {
+            Ok(pid) => pid,
+            Err(e) => {
+                shut(out.reader);
+                shut(err.reader);
+                return Err(e);
+            }
+        };
+        let (got_out, got_err) = drain_both(out.reader, err.reader);
+        let code = wait_for(pid)?;
+        Ok((code, got_out, got_err))
+    }
+}
+
 /// `std::thread`, over pthreads.
 ///
 /// The piece that matters is `scope`. `par_map` spawns closures holding `&mut`
@@ -11060,7 +11334,7 @@ unsafe fn grasm_proc_pipeline_now(stages: *mut RtVal, input: *mut RtVal) -> *mut
 /// # Safety: called from compiled Grasm with a boxed value.
 #[no_mangle]
 pub unsafe extern "C" fn grasm_str_c_new(v: *mut RtVal) -> *mut core::ffi::c_char {
-    match core::ffi::CString::new(as_str(v).as_bytes()) {
+    match alloc::ffi::CString::new(as_str(v).as_bytes()) {
         Ok(c) => {
             // Counted, because nothing else counts it. `LIVE` tracks the
             // runtime's own allocations, and this one is `CString`'s -- so a
@@ -11082,7 +11356,7 @@ pub unsafe extern "C" fn grasm_str_c_new(v: *mut RtVal) -> *mut core::ffi::c_cha
 pub unsafe extern "C" fn grasm_str_c_free(p: *mut core::ffi::c_char) {
     if !p.is_null() {
         C_COPIES.fetch_sub(1, Relaxed);
-        drop(core::ffi::CString::from_raw(p));
+        drop(alloc::ffi::CString::from_raw(p));
     }
 }
 
@@ -11136,19 +11410,14 @@ unsafe fn grasm_proc_run_now(cmd: *mut RtVal, args: *mut RtVal) -> *mut RtVal {
             ))
         }
     };
-    match std::process::Command::new(&program).args(&argv).output() {
-        Ok(out) => {
-            // `None` means a signal killed it. `-1` is not a status any
-            // process can exit with, so it cannot be confused for one.
-            let code = out.status.code().map_or(-1, i64::from);
+    match crate::process::run(&program, &argv) {
+        // A signal gives -1, which is not a status any process can exit
+        // with, so it cannot be confused for one.
+        Ok((code, out, err)) => {
             let fields = vec![
                 alloc(RtPayload::I64(code)),
-                alloc(RtPayload::Str(RtStr::of(&String::from_utf8_lossy(
-                    &out.stdout,
-                )))),
-                alloc(RtPayload::Str(RtStr::of(&String::from_utf8_lossy(
-                    &out.stderr,
-                )))),
+                alloc(RtPayload::Str(RtStr::of(&String::from_utf8_lossy(&out)))),
+                alloc(RtPayload::Str(RtStr::of(&String::from_utf8_lossy(&err)))),
             ];
             ok_of(alloc(RtPayload::Tuple(fields.into())))
         }
