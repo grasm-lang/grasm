@@ -7,6 +7,20 @@
 //! pointers this runtime itself produced (and keeps alive via refcounts) plus
 //! interned UTF-8 name/data blobs the compiler embedded. Callers outside that
 //! contract are not supported.
+#![no_std]
+extern crate alloc;
+
+// What `std`'s prelude gave for free. `alloc` owns the growable types; `core`
+// owns everything that does not allocate. Nothing here needs an operating
+// system, which is the whole point: linking `std` costs 135 KB of DWARF
+// backtrace symboliser in every compiled program (docs/binary-size.md).
+use alloc::borrow::ToOwned;
+use alloc::boxed::Box;
+use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::vec;
+use alloc::vec::Vec;
+
 #![allow(clippy::missing_safety_doc)]
 
 use std::io::Write;
@@ -17,8 +31,8 @@ use std::io::Write;
 /// share the journal and cannot link this runtime, so the format lives in its
 /// own crate. Every `replay::` path in this file is unchanged.
 pub use grasm_journal as replay;
-use std::sync::atomic::AtomicI64;
-use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
+use core::sync::atomic::AtomicI64;
+use core::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 
 // ---------------------------------------------------------------------------
 // Output (print / interpolation are lowered to piecewise `out` calls)
@@ -35,7 +49,7 @@ use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 mod tasks;
 
 mod sink {
-    use std::cell::Cell;
+    use core::cell::Cell;
     thread_local! {
         pub static TO_STDERR: Cell<bool> = const { Cell::new(false) };
     }
@@ -69,7 +83,7 @@ fn emit(f: impl Fn(&mut dyn Write)) {
 /// only passes string-literal data it embedded itself).
 #[no_mangle]
 pub unsafe extern "C" fn grasm_out_text(ptr: *const u8, len: u64) {
-    let bytes = std::slice::from_raw_parts(ptr, len as usize);
+    let bytes = core::slice::from_raw_parts(ptr, len as usize);
     emit(|out| {
         let _ = out.write_all(bytes);
     });
@@ -161,7 +175,7 @@ pub extern "C" fn grasm_panic_neg_pow() {
 /// `ptr`/`len` as in `grasm_out_text`.
 #[no_mangle]
 pub unsafe extern "C" fn grasm_panic_msg(ptr: *const u8, len: u64) {
-    let bytes = std::slice::from_raw_parts(ptr, len as usize);
+    let bytes = core::slice::from_raw_parts(ptr, len as usize);
     rt_panic(&String::from_utf8_lossy(bytes));
 }
 
@@ -195,7 +209,7 @@ pub extern "C" fn grasm_f64_rem(a: f64, b: f64) -> f64 {
 // Codegen passes these as opaque pointers (`i64`-sized).
 // ---------------------------------------------------------------------------
 
-use std::cell::Cell;
+use core::cell::Cell;
 
 /// Element type of an unboxed scalar list. Fixed at creation.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -237,8 +251,8 @@ impl ScalarKind {
 /// a 2M-entry sieve is 2 MB instead of 16 MB, and that is the whole reason
 /// this is not simply `Vec<i64>`.
 enum ScalarIter<'a> {
-    Words(std::slice::Iter<'a, i64>),
-    Bytes(std::slice::Iter<'a, u8>),
+    Words(core::slice::Iter<'a, i64>),
+    Bytes(core::slice::Iter<'a, u8>),
 }
 
 impl Iterator for ScalarIter<'_> {
@@ -289,7 +303,7 @@ impl Iterator for ScalarIter<'_> {
 /// `Eq` decides what is in it, and `Eq` is untouched. A bad hash is slow, not
 /// incorrect.
 mod maphash {
-    use std::hash::{BuildHasher, Hasher};
+    use core::hash::{BuildHasher, Hasher};
 
     const S0: u64 = 0xa076_1d64_78bd_642f;
     const S1: u64 = 0xe703_7ed1_a0b4_28db;
@@ -406,7 +420,7 @@ pub enum MapKey {
 thread_local! {
     /// Buffer reused by every map probe, so looking a string key up does not
     /// allocate. Only its contents change; the capacity is handed back.
-    static PROBE: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+    static PROBE: core::cell::RefCell<String> = const { core::cell::RefCell::new(String::new()) };
 }
 
 /// Calls `f` with `v` seen as a map key, without taking ownership of it.
@@ -423,7 +437,7 @@ thread_local! {
 #[no_mangle]
 pub unsafe extern "C" fn grasm_tuple_seal(v: *mut RtVal) -> *mut RtVal {
     if let RtPayload::List(items) = &mut (*v).payload {
-        let taken = std::mem::take(items);
+        let taken = core::mem::take(items);
         (*v).payload = RtPayload::Tuple(taken);
     }
     v
@@ -442,7 +456,7 @@ unsafe fn with_key<R>(v: *mut RtVal, f: impl FnOnce(&MapKey) -> R) -> R {
             let mut buf = cell.borrow_mut();
             buf.clear();
             buf.push_str(s);
-            let key = MapKey::Str(KeyStr::Heap(std::mem::take(&mut buf)));
+            let key = MapKey::Str(KeyStr::Heap(core::mem::take(&mut buf)));
             let out = f(&key);
             let MapKey::Str(KeyStr::Heap(returned)) = key else {
                 unreachable!()
@@ -493,7 +507,7 @@ pub enum ScalarData {
 pub fn vec_layout() -> (usize, usize, usize) {
     let mut v: Vec<i64> = Vec::with_capacity(7);
     v.extend_from_slice(&[1, 2, 3]);
-    let words: [usize; 3] = unsafe { std::mem::transmute_copy(&v) };
+    let words: [usize; 3] = unsafe { core::mem::transmute_copy(&v) };
     let find = |x: usize| words.iter().position(|&w| w == x).expect("a Vec word") * 8;
     let out = (find(v.as_ptr() as usize), find(v.len()), find(v.capacity()));
     drop(v);
@@ -716,7 +730,7 @@ impl StructFields {
         }
     }
 
-    fn iter(&self) -> std::slice::Iter<'_, *mut RtVal> {
+    fn iter(&self) -> core::slice::Iter<'_, *mut RtVal> {
         self.as_slice().iter()
     }
 
@@ -734,17 +748,17 @@ impl StructFields {
     /// # Safety: `argv` points at `n` values whose ownership transfers here.
     unsafe fn from_ptrs(argv: *const *mut RtVal, n: usize) -> StructFields {
         if n <= 4 {
-            let mut vals = [std::ptr::null_mut(); 4];
-            std::ptr::copy_nonoverlapping(argv, vals.as_mut_ptr(), n);
+            let mut vals = [core::ptr::null_mut(); 4];
+            core::ptr::copy_nonoverlapping(argv, vals.as_mut_ptr(), n);
             StructFields::Inline { vals, len: n as u8 }
         } else {
-            StructFields::Heap(std::slice::from_raw_parts(argv, n).to_vec())
+            StructFields::Heap(core::slice::from_raw_parts(argv, n).to_vec())
         }
     }
 
     fn from_values(values: Vec<*mut RtVal>) -> StructFields {
         if values.len() <= 4 {
-            let mut vals = [std::ptr::null_mut(); 4];
+            let mut vals = [core::ptr::null_mut(); 4];
             vals[..values.len()].copy_from_slice(&values);
             StructFields::Inline {
                 vals,
@@ -833,7 +847,7 @@ unsafe fn inline_vec<T>(w: &[i64]) -> Vec<T> {
 /// given up: those words own its buffer from here on.
 fn inline_parts<T>(v: Vec<T>, w: &mut [i64]) {
     let (vp, vl, vc) = vec_layout_words();
-    let mut v = std::mem::ManuallyDrop::new(v);
+    let mut v = core::mem::ManuallyDrop::new(v);
     w[vp] = v.as_mut_ptr() as i64;
     w[vl] = v.len() as i64;
     w[vc] = v.capacity() as i64;
@@ -936,15 +950,15 @@ impl StructTy {
                 match k {
                     FK_BOXED => inc(el[at] as *mut RtVal),
                     FK_INLIST => {
-                        let v = std::mem::ManuallyDrop::new(inline_vec::<i64>(&el[at..at + 3]));
+                        let v = core::mem::ManuallyDrop::new(inline_vec::<i64>(&el[at..at + 3]));
                         inline_parts((*v).clone(), &mut el[at..at + 3]);
                     }
                     FK_INSTR => {
-                        let v = std::mem::ManuallyDrop::new(inline_vec::<u8>(&el[at..at + 3]));
+                        let v = core::mem::ManuallyDrop::new(inline_vec::<u8>(&el[at..at + 3]));
                         inline_parts((*v).clone(), &mut el[at..at + 3]);
                     }
                     FK_INVALS => {
-                        let v = std::mem::ManuallyDrop::new(inline_vec::<i64>(&el[at..at + 3]));
+                        let v = core::mem::ManuallyDrop::new(inline_vec::<i64>(&el[at..at + 3]));
                         let mut copy = (*v).clone();
                         self.elem_ty(i).dup_words(&mut copy);
                         inline_parts(copy, &mut el[at..at + 3]);
@@ -1001,15 +1015,15 @@ thread_local! {
     /// The worklist `release_words` fills with inline lists of values, kept
     /// between releases. Releasing a tree node used to make and free one of
     /// these per node, which cost more than the box the inline list replaced.
-    static RELEASE_WORK: std::cell::RefCell<Vec<(&'static StructTy, Vec<i64>)>> =
-        const { std::cell::RefCell::new(Vec::new()) };
+    static RELEASE_WORK: core::cell::RefCell<Vec<(&'static StructTy, Vec<i64>)>> =
+        const { core::cell::RefCell::new(Vec::new()) };
 }
 
 /// Runs `f` with the thread's release worklist, empty, and keeps its
 /// capacity afterwards. A release that happens *inside* another one gets a
 /// list of its own rather than disturbing the outer one.
 fn with_release_work<R>(f: impl FnOnce(&mut Vec<(&'static StructTy, Vec<i64>)>) -> R) -> R {
-    let mut held = RELEASE_WORK.with(|w| std::mem::take(&mut *w.borrow_mut()));
+    let mut held = RELEASE_WORK.with(|w| core::mem::take(&mut *w.borrow_mut()));
     let out = f(&mut held);
     held.clear();
     RELEASE_WORK.with(|w| {
@@ -1029,7 +1043,7 @@ fn with_release_work<R>(f: impl FnOnce(&mut Vec<(&'static StructTy, Vec<i64>)>) 
 #[no_mangle]
 pub unsafe extern "C" fn grasm_val_release(desc: *const StructDesc, p: *const i64) {
     let ty = desc_ty(desc);
-    let words = std::slice::from_raw_parts(p, ty.width.max(1));
+    let words = core::slice::from_raw_parts(p, ty.width.max(1));
     LOCAL.with(|local| {
         with_release_work(|vecs| {
             let mut free = |c: *mut RtVal| dec_walk(local, c);
@@ -1053,7 +1067,7 @@ pub unsafe extern "C" fn grasm_val_release(desc: *const StructDesc, p: *const i6
 /// `Vec` of eight-byte elements, and are not used again.
 #[no_mangle]
 pub unsafe extern "C" fn grasm_inline_free_words(w: *const i64) {
-    drop(inline_vec::<i64>(std::slice::from_raw_parts(w, 3)));
+    drop(inline_vec::<i64>(core::slice::from_raw_parts(w, 3)));
 }
 
 /// The same for a field holding bytes.
@@ -1061,7 +1075,7 @@ pub unsafe extern "C" fn grasm_inline_free_words(w: *const i64) {
 /// # Safety: as `grasm_inline_free_words`, for a `Vec<u8>`.
 #[no_mangle]
 pub unsafe extern "C" fn grasm_inline_free_bytes(w: *const i64) {
-    drop(inline_vec::<u8>(std::slice::from_raw_parts(w, 3)));
+    drop(inline_vec::<u8>(core::slice::from_raw_parts(w, 3)));
 }
 
 /// Makes the value at `p`, a bit-for-bit copy of one that still owns what it
@@ -1071,7 +1085,7 @@ pub unsafe extern "C" fn grasm_inline_free_bytes(w: *const i64) {
 #[no_mangle]
 pub unsafe extern "C" fn grasm_val_dup(desc: *const StructDesc, p: *mut i64) {
     let ty = desc_ty(desc);
-    let words = std::slice::from_raw_parts_mut(p, ty.width.max(1));
+    let words = core::slice::from_raw_parts_mut(p, ty.width.max(1));
     ty.dup_words(words);
 }
 
@@ -1083,12 +1097,12 @@ pub unsafe extern "C" fn grasm_val_dup(desc: *const StructDesc, p: *mut i64) {
 /// words.
 #[no_mangle]
 pub unsafe extern "C" fn grasm_inline_absorb_list(l: *mut RtVal, out: *mut i64) {
-    let out = std::slice::from_raw_parts_mut(out, 3);
+    let out = core::slice::from_raw_parts_mut(out, 3);
     let unique = (*l).rc.load(Relaxed) == 1;
     match &mut (*l).payload {
         RtPayload::ListVals { ty, words } => {
             let v = if unique {
-                std::mem::take(words)
+                core::mem::take(words)
             } else {
                 let mut c = words.clone();
                 ty.dup_words(&mut c);
@@ -1099,7 +1113,7 @@ pub unsafe extern "C" fn grasm_inline_absorb_list(l: *mut RtVal, out: *mut i64) 
         RtPayload::ListScalar { data, .. } => {
             let v: Vec<i64> = if unique {
                 match data {
-                    ScalarData::Words(w) => std::mem::take(w),
+                    ScalarData::Words(w) => core::mem::take(w),
                     other => (0..other.len()).map(|i| other.get(i)).collect(),
                 }
             } else {
@@ -1122,7 +1136,7 @@ pub unsafe extern "C" fn grasm_inline_absorb_list(l: *mut RtVal, out: *mut i64) 
 /// # Safety: `s` is a live string; `out` is three writable words.
 #[no_mangle]
 pub unsafe extern "C" fn grasm_inline_absorb_str(s: *mut RtVal, out: *mut i64) {
-    let out = std::slice::from_raw_parts_mut(out, 3);
+    let out = core::slice::from_raw_parts_mut(out, 3);
     let RtPayload::Str(text) = &(*s).payload else {
         grasm_panic_msg_str("an inline string field given something that is not a string");
     };
@@ -1142,7 +1156,7 @@ pub unsafe extern "C" fn grasm_inline_absorb_str(s: *mut RtVal, out: *mut i64) {
 #[no_mangle]
 pub unsafe extern "C" fn grasm_str_build_end_inline(at: i64, out: *mut i64) {
     let mut buf = Box::from_raw(at as *mut String);
-    let text = std::mem::take(&mut *buf);
+    let text = core::mem::take(&mut *buf);
     // The next build starts with room for one like this, as `build_end` does.
     *buf = String::with_capacity(text.len() + 16);
     LOCAL.with(|local| {
@@ -1151,7 +1165,7 @@ pub unsafe extern "C" fn grasm_str_build_end_inline(at: i64, out: *mut i64) {
             held.push(buf);
         }
     });
-    inline_parts(text.into_bytes(), std::slice::from_raw_parts_mut(out, 3));
+    inline_parts(text.into_bytes(), core::slice::from_raw_parts_mut(out, 3));
 }
 
 /// An inline string field as a string value, for a use that needs one.
@@ -1159,7 +1173,7 @@ pub unsafe extern "C" fn grasm_str_build_end_inline(at: i64, out: *mut i64) {
 /// # Safety: `ptr`/`len` are an inline string field's bytes.
 #[no_mangle]
 pub unsafe extern "C" fn grasm_inline_str_box(ptr: *const u8, len: i64) -> *mut RtVal {
-    let text = std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr, len as usize));
+    let text = core::str::from_utf8_unchecked(core::slice::from_raw_parts(ptr, len as usize));
     alloc(RtPayload::Str(RtStr::of(text)))
 }
 
@@ -1233,7 +1247,7 @@ unsafe fn copy_fields(ty: &StructTy, fields: &StructFields) -> Vec<*mut RtVal> {
 /// ```
 #[repr(C)]
 pub struct StructDesc {
-    cache: std::sync::atomic::AtomicUsize,
+    cache: core::sync::atomic::AtomicUsize,
     name_ptr: *const u8,
     name_len: u64,
     nfields: u64,
@@ -1251,7 +1265,7 @@ pub struct StructDesc {
 ///
 /// # Safety: `desc` is a descriptor the backend emitted.
 unsafe fn desc_ty(desc: *const StructDesc) -> &'static StructTy {
-    use std::sync::atomic::Ordering;
+    use core::sync::atomic::Ordering;
     let cached = (*desc).cache.load(Ordering::Acquire);
     if cached != 0 {
         return &*(cached as *const StructTy);
@@ -1331,18 +1345,18 @@ impl<const N: usize> PartialEq for StrData<N> {
     }
 }
 impl<const N: usize> Eq for StrData<N> {}
-impl<const N: usize> std::hash::Hash for StrData<N> {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+impl<const N: usize> core::hash::Hash for StrData<N> {
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
         self.as_str().hash(state);
     }
 }
 impl<const N: usize> PartialOrd for StrData<N> {
-    fn partial_cmp(&self, other: &StrData<N>) -> Option<std::cmp::Ordering> {
+    fn partial_cmp(&self, other: &StrData<N>) -> Option<core::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
 impl<const N: usize> Ord for StrData<N> {
-    fn cmp(&self, other: &StrData<N>) -> std::cmp::Ordering {
+    fn cmp(&self, other: &StrData<N>) -> core::cmp::Ordering {
         self.as_str().cmp(other.as_str())
     }
 }
@@ -1402,7 +1416,7 @@ impl<const N: usize> StrData<N> {
             // Valid UTF-8 by construction: every constructor either copies
             // from an existing `str` or writes ASCII digits.
             StrData::Inline { bytes, len } => unsafe {
-                std::str::from_utf8_unchecked(&bytes[..*len as usize])
+                core::str::from_utf8_unchecked(&bytes[..*len as usize])
             },
             StrData::Heap(s) => s,
         }
@@ -1435,15 +1449,15 @@ const LEN_CACHE_MIN: usize = 256;
 /// `OnceLock<Box<CharIndex>>` is, in one word instead of two. A `OnceLock`
 /// keeps its `Once` beside the value, and those eight bytes are what kept a
 /// string's inline storage at 30 bytes rather than 38.
-pub struct IndexCell(std::sync::atomic::AtomicPtr<CharIndex>);
+pub struct IndexCell(core::sync::atomic::AtomicPtr<CharIndex>);
 
 impl IndexCell {
     const fn new() -> IndexCell {
-        IndexCell(std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()))
+        IndexCell(core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()))
     }
 
     fn get(&self) -> Option<&CharIndex> {
-        let p = self.0.load(std::sync::atomic::Ordering::Acquire);
+        let p = self.0.load(core::sync::atomic::Ordering::Acquire);
         // Safety: a non-null pointer was published by `set`, and lives until
         // this cell is dropped.
         unsafe { p.as_ref() }
@@ -1454,10 +1468,10 @@ impl IndexCell {
     fn set(&self, v: Box<CharIndex>) -> Result<(), Box<CharIndex>> {
         let raw = Box::into_raw(v);
         match self.0.compare_exchange(
-            std::ptr::null_mut(),
+            core::ptr::null_mut(),
             raw,
-            std::sync::atomic::Ordering::AcqRel,
-            std::sync::atomic::Ordering::Acquire,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
         ) {
             Ok(_) => Ok(()),
             // Safety: `raw` was never published.
@@ -1529,7 +1543,7 @@ impl RtStr {
         let mut buf = [0u8; 20];
         let i = i64_digits(v, &mut buf);
         // ASCII digits, so this is valid UTF-8.
-        RtStr::of(unsafe { std::str::from_utf8_unchecked(&buf[i..]) })
+        RtStr::of(unsafe { core::str::from_utf8_unchecked(&buf[i..]) })
     }
 
     /// Two pieces joined, with no allocation at all when the result is short.
@@ -1564,7 +1578,7 @@ impl RtStr {
                 // Doubling rather than exact: this is a loop, and the next
                 // call is going to ask for more.
                 let mut out = String::with_capacity(((at + t.len()) * 2).max(32));
-                out.push_str(std::str::from_utf8(&bytes[..at]).unwrap_or(""));
+                out.push_str(core::str::from_utf8(&bytes[..at]).unwrap_or(""));
                 out.push_str(t);
                 out
             }
@@ -1645,9 +1659,9 @@ impl RtStr {
         }
         let offs = &self.index().offsets;
         match i.cmp(&offs.len()) {
-            std::cmp::Ordering::Less => Some(offs[i] as usize),
-            std::cmp::Ordering::Equal => Some(self.s.as_str().len()),
-            std::cmp::Ordering::Greater => None,
+            core::cmp::Ordering::Less => Some(offs[i] as usize),
+            core::cmp::Ordering::Equal => Some(self.s.as_str().len()),
+            core::cmp::Ordering::Greater => None,
         }
     }
 
@@ -1734,26 +1748,26 @@ impl PartialEq for RtStr {
 impl Eq for RtStr {}
 
 impl PartialOrd for RtStr {
-    fn partial_cmp(&self, other: &RtStr) -> Option<std::cmp::Ordering> {
+    fn partial_cmp(&self, other: &RtStr) -> Option<core::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
 
 impl Ord for RtStr {
-    fn cmp(&self, other: &RtStr) -> std::cmp::Ordering {
+    fn cmp(&self, other: &RtStr) -> core::cmp::Ordering {
         self.s.as_str().cmp(other.s.as_str())
     }
 }
 
-impl std::ops::Deref for RtStr {
+impl core::ops::Deref for RtStr {
     type Target = str;
     fn deref(&self) -> &str {
         self.s.as_str()
     }
 }
 
-impl std::fmt::Display for RtStr {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for RtStr {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "{}", self.s.as_str())
     }
 }
@@ -1775,7 +1789,7 @@ pub enum ListData {
     Heap(Vec<*mut RtVal>),
 }
 
-impl std::ops::Deref for ListData {
+impl core::ops::Deref for ListData {
     type Target = [*mut RtVal];
     fn deref(&self) -> &[*mut RtVal] {
         match self {
@@ -1785,7 +1799,7 @@ impl std::ops::Deref for ListData {
     }
 }
 
-impl std::ops::DerefMut for ListData {
+impl core::ops::DerefMut for ListData {
     fn deref_mut(&mut self) -> &mut [*mut RtVal] {
         match self {
             ListData::Inline { vals, len } => &mut vals[..*len as usize],
@@ -1802,7 +1816,7 @@ impl Default for ListData {
 
 impl<'a> IntoIterator for &'a ListData {
     type Item = &'a *mut RtVal;
-    type IntoIter = std::slice::Iter<'a, *mut RtVal>;
+    type IntoIter = core::slice::Iter<'a, *mut RtVal>;
     fn into_iter(self) -> Self::IntoIter {
         self.iter()
     }
@@ -1835,7 +1849,7 @@ impl ListData {
 
     fn new() -> ListData {
         ListData::Inline {
-            vals: [std::ptr::null_mut(); 4],
+            vals: [core::ptr::null_mut(); 4],
             len: 0,
         }
     }
@@ -1861,14 +1875,14 @@ impl ListData {
     /// is a pair, and `vec![a, b]` allocated for it.
     fn pair(a: *mut RtVal, b: *mut RtVal) -> ListData {
         ListData::Inline {
-            vals: [a, b, std::ptr::null_mut(), std::ptr::null_mut()],
+            vals: [a, b, core::ptr::null_mut(), core::ptr::null_mut()],
             len: 2,
         }
     }
 
     /// Three or four elements, in the box, for the same reason as `pair`.
     fn small(vals: &[*mut RtVal]) -> ListData {
-        let mut out = [std::ptr::null_mut(); 4];
+        let mut out = [core::ptr::null_mut(); 4];
         out[..vals.len()].copy_from_slice(vals);
         ListData::Inline {
             vals: out,
@@ -1913,7 +1927,7 @@ impl ListData {
 pub struct RtBytes {
     ptr: *const u8,
     len: usize,
-    owner: std::sync::Arc<Vec<u8>>,
+    owner: alloc::sync::Arc<Vec<u8>>,
 }
 
 // The raw address is into the `Arc`'s buffer, which is immutable and shared
@@ -1923,7 +1937,7 @@ unsafe impl Sync for RtBytes {}
 
 impl RtBytes {
     fn new(v: Vec<u8>) -> RtBytes {
-        let owner = std::sync::Arc::new(v);
+        let owner = alloc::sync::Arc::new(v);
         RtBytes {
             ptr: owner.as_ptr(),
             len: owner.len(),
@@ -1953,7 +1967,7 @@ impl RtBytes {
             // is a pointer it is legal to form and to pass with a length of 0.
             ptr: unsafe { self.ptr.add(from) },
             len: end - from,
-            owner: std::sync::Arc::clone(&self.owner),
+            owner: alloc::sync::Arc::clone(&self.owner),
         }
     }
 
@@ -1961,11 +1975,11 @@ impl RtBytes {
         // The window, which for a value made by `new` is the whole buffer.
         // An empty `Vec`'s pointer is dangling but aligned and non-null,
         // which is what `from_raw_parts` asks for at length 0.
-        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+        unsafe { core::slice::from_raw_parts(self.ptr, self.len) }
     }
 }
 
-impl std::ops::Deref for RtBytes {
+impl core::ops::Deref for RtBytes {
     type Target = [u8];
     fn deref(&self) -> &[u8] {
         self.as_slice()
@@ -2008,12 +2022,12 @@ impl VFields {
             0 => &[],
             // The word holding the one field, read as a slice of one.
             1 => unsafe {
-                std::slice::from_raw_parts(
+                core::slice::from_raw_parts(
                     &self.ptr as *const *mut *mut RtVal as *const *mut RtVal,
                     1,
                 )
             },
-            n => unsafe { std::slice::from_raw_parts(self.ptr, n) },
+            n => unsafe { core::slice::from_raw_parts(self.ptr, n) },
         }
     }
 
@@ -2021,12 +2035,12 @@ impl VFields {
         match self.len {
             0 => &mut [],
             1 => unsafe {
-                std::slice::from_raw_parts_mut(
+                core::slice::from_raw_parts_mut(
                     &mut self.ptr as *mut *mut *mut RtVal as *mut *mut RtVal,
                     1,
                 )
             },
-            n => unsafe { std::slice::from_raw_parts_mut(self.ptr, n) },
+            n => unsafe { core::slice::from_raw_parts_mut(self.ptr, n) },
         }
     }
 
@@ -2038,7 +2052,7 @@ impl VFields {
 impl Default for VFields {
     fn default() -> VFields {
         VFields {
-            ptr: std::ptr::null_mut(),
+            ptr: core::ptr::null_mut(),
             len: 0,
         }
     }
@@ -2050,7 +2064,7 @@ impl Drop for VFields {
         // variant; only the slice holding two or more is this struct's own.
         if self.len >= 2 {
             unsafe {
-                drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(
+                drop(Box::from_raw(core::ptr::slice_from_raw_parts_mut(
                     self.ptr, self.len,
                 )));
             }
@@ -2058,14 +2072,14 @@ impl Drop for VFields {
     }
 }
 
-impl std::ops::Deref for VFields {
+impl core::ops::Deref for VFields {
     type Target = [*mut RtVal];
     fn deref(&self) -> &[*mut RtVal] {
         self.as_slice()
     }
 }
 
-impl std::ops::DerefMut for VFields {
+impl core::ops::DerefMut for VFields {
     fn deref_mut(&mut self) -> &mut [*mut RtVal] {
         self.as_mut_slice()
     }
@@ -2073,7 +2087,7 @@ impl std::ops::DerefMut for VFields {
 
 impl<'a> IntoIterator for &'a VFields {
     type Item = &'a *mut RtVal;
-    type IntoIter = std::slice::Iter<'a, *mut RtVal>;
+    type IntoIter = core::slice::Iter<'a, *mut RtVal>;
     fn into_iter(self) -> Self::IntoIter {
         self.as_slice().iter()
     }
@@ -2223,7 +2237,7 @@ pub struct RtVal {
 /// lived only in prose — a fifth inline field or a sixteenth inline byte would
 /// have widened every boxed integer in the program and nothing would have said
 /// so. Now the build says so.
-const _: () = assert!(std::mem::size_of::<RtVal>() == 64);
+const _: () = assert!(core::mem::size_of::<RtVal>() == 64);
 
 /// Where things are inside a box, for compiled code that reads them directly
 /// rather than calling in: a struct's field, a list's length and elements.
@@ -2366,7 +2380,7 @@ impl Drop for Pool {
         let mut cur = self.head.get();
         while !cur.is_null() {
             let next = unsafe { (*cur).rc.load(Relaxed) as usize as *mut RtVal };
-            drop(unsafe { Box::from_raw(cur as *mut std::mem::MaybeUninit<RtVal>) });
+            drop(unsafe { Box::from_raw(cur as *mut core::mem::MaybeUninit<RtVal>) });
             cur = next;
         }
     }
@@ -2393,7 +2407,7 @@ struct Local {
     /// and only one of those announces itself.
     live: Cell<i64>,
     /// One list of allocations per open region, innermost last.
-    regions: std::cell::RefCell<Vec<Vec<*mut RtVal>>>,
+    regions: core::cell::RefCell<Vec<Vec<*mut RtVal>>>,
     /// How many of those are open. The hot path asks this rather than
     /// borrowing the list, because borrowing a `RefCell` to ask whether it is
     /// empty is a flag write on every allocation.
@@ -2406,7 +2420,7 @@ struct Local {
     // generated code the address of one of these as its handle, so the
     // `String` has to stay where it is while the vector behind it grows.
     #[allow(clippy::vec_box)]
-    builders: std::cell::RefCell<Vec<Box<String>>>,
+    builders: core::cell::RefCell<Vec<Box<String>>>,
     /// Every allocation this thread has made, whether or not it is still
     /// live. Reported by `GRASM_ALLOC_STATS`, which is how a question like
     /// "how many boxes does one iteration of this loop cost" gets an answer
@@ -2418,15 +2432,15 @@ thread_local! {
     static LOCAL: Local = const {
         Local {
             pool: Pool {
-                head: Cell::new(std::ptr::null_mut()),
+                head: Cell::new(core::ptr::null_mut()),
                 n: Cell::new(0),
             },
             live: Cell::new(0),
-            regions: std::cell::RefCell::new(Vec::new()),
+            regions: core::cell::RefCell::new(Vec::new()),
             region_depth: Cell::new(0),
             stack_floor: Cell::new(0),
             allocated: Cell::new(0),
-            builders: std::cell::RefCell::new(Vec::new()),
+            builders: core::cell::RefCell::new(Vec::new()),
         }
     };
 }
@@ -2474,8 +2488,8 @@ fn take_box_in(local: &Local) -> *mut RtVal {
     {
         let head = pool.head.get();
         if head.is_null() {
-            let fresh: Box<std::mem::MaybeUninit<RtVal>> =
-                Box::new(std::mem::MaybeUninit::uninit());
+            let fresh: Box<core::mem::MaybeUninit<RtVal>> =
+                Box::new(core::mem::MaybeUninit::uninit());
             Box::into_raw(fresh) as *mut RtVal
         } else {
             // Safety: a box on the chain has a dropped payload and holds its
@@ -2497,8 +2511,8 @@ fn take_box_in(local: &Local) -> *mut RtVal {
 /// If either of these ever owns anything, the skip in `give_box_in` below
 /// would leak it — so the reasoning is checked by the compiler rather than
 /// left in a comment.
-const _: () = assert!(!std::mem::needs_drop::<&'static StructTy>());
-const _: () = assert!(!std::mem::needs_drop::<[*mut RtVal; 4]>());
+const _: () = assert!(!core::mem::needs_drop::<&'static StructTy>());
+const _: () = assert!(!core::mem::needs_drop::<[*mut RtVal; 4]>());
 
 unsafe fn give_box_in(local: &Local, p: *mut RtVal) {
     // The commonest payload owns nothing: a `&'static StructTy` and four raw
@@ -2511,7 +2525,7 @@ unsafe fn give_box_in(local: &Local, p: *mut RtVal) {
             fields: StructFields::Inline { .. },
             ..
         } => {}
-        _ => std::ptr::drop_in_place(&mut (*p).payload),
+        _ => core::ptr::drop_in_place(&mut (*p).payload),
     }
     #[cfg(feature = "poison")]
     {
@@ -2525,7 +2539,7 @@ unsafe fn give_box_in(local: &Local, p: *mut RtVal) {
         // which is how a stale *read* is caught; the count below is how a
         // stale `inc` or `dec` is.
         let _ = local;
-        std::ptr::write(&mut (*p).payload, RtPayload::Unit);
+        core::ptr::write(&mut (*p).payload, RtPayload::Unit);
         (*p).rc.store(POISON, Relaxed);
         return;
     }
@@ -2533,7 +2547,7 @@ unsafe fn give_box_in(local: &Local, p: *mut RtVal) {
     {
         let pool = &local.pool;
         if pool.n.get() >= POOL_CAP {
-            drop(Box::from_raw(p as *mut std::mem::MaybeUninit<RtVal>));
+            drop(Box::from_raw(p as *mut core::mem::MaybeUninit<RtVal>));
             return;
         }
         (*p).rc.store(pool.head.get() as usize as i64, Relaxed);
@@ -2561,7 +2575,7 @@ fn alloc_in(local: &Local, payload: RtPayload) -> *mut RtVal {
     // Safety: `take_box_in` returns storage for exactly one `RtVal`,
     // uninitialised.
     unsafe {
-        std::ptr::write(
+        core::ptr::write(
             p,
             RtVal {
                 rc: AtomicI64::new(if in_region { ARENA } else { 1 }),
@@ -2587,7 +2601,7 @@ fn alloc_in(local: &Local, payload: RtPayload) -> *mut RtVal {
 static ESCAPED: AtomicI64 = AtomicI64::new(0);
 
 /// What worker threads allocated, for the same report.
-static ESCAPED_ALLOCS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static ESCAPED_ALLOCS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Called by a worker as it ends: its balance becomes everyone's.
 fn hand_back_live() {
@@ -2856,7 +2870,7 @@ fn interned_base() -> usize {
 }
 
 fn interned_at(index: usize) -> *mut RtVal {
-    (interned_base() + index * std::mem::size_of::<RtVal>()) as *mut RtVal
+    (interned_base() + index * core::mem::size_of::<RtVal>()) as *mut RtVal
 }
 
 fn interned_bool(v: bool) -> *mut RtVal {
@@ -2866,7 +2880,7 @@ fn interned_bool(v: bool) -> *mut RtVal {
 /// The shared box for `n`, or null when `n` is outside the interned range.
 fn interned_int(n: i64) -> *mut RtVal {
     if !(SMALL_MIN..=SMALL_MAX).contains(&n) {
-        return std::ptr::null_mut();
+        return core::ptr::null_mut();
     }
     interned_at((n - SMALL_MIN) as usize + 2)
 }
@@ -2925,7 +2939,7 @@ unsafe fn dec(v: *mut RtVal) {
     if rc.fetch_sub(1, Release) - 1 > 0 {
         return;
     }
-    std::sync::atomic::fence(Acquire);
+    core::sync::atomic::fence(Acquire);
     // It has reached zero, so the box is going back to the pool and whatever
     // it held has to be followed. *Now* the thread's state is worth fetching.
     dec_reached_zero(v)
@@ -2968,8 +2982,8 @@ unsafe fn dec_walk(local: &Local, v: *mut RtVal) {
     // Uninitialised, because most releases push nothing at all: a value with
     // no children would otherwise pay to zero the whole array. Only the slots
     // below `n` are ever read, and each was written before `n` passed it.
-    let mut inline: [std::mem::MaybeUninit<*mut RtVal>; PENDING_INLINE] =
-        [const { std::mem::MaybeUninit::uninit() }; PENDING_INLINE];
+    let mut inline: [core::mem::MaybeUninit<*mut RtVal>; PENDING_INLINE] =
+        [const { core::mem::MaybeUninit::uninit() }; PENDING_INLINE];
     let mut n: usize = 0;
     let mut spill: Vec<*mut RtVal> = Vec::new();
     let mut cur = v;
@@ -3090,14 +3104,14 @@ unsafe fn release_to_zero(p: *mut RtVal) -> bool {
     if rc.fetch_sub(1, Release) - 1 > 0 {
         return false;
     }
-    std::sync::atomic::fence(Acquire);
+    core::sync::atomic::fence(Acquire);
     true
 }
 
 /// One more child to release, in the frame while there is room.
 #[inline(always)]
 fn push_pending(
-    inline: &mut [std::mem::MaybeUninit<*mut RtVal>; PENDING_INLINE],
+    inline: &mut [core::mem::MaybeUninit<*mut RtVal>; PENDING_INLINE],
     n: &mut usize,
     spill: &mut Vec<*mut RtVal>,
     p: *mut RtVal,
@@ -3150,7 +3164,7 @@ pub unsafe extern "C" fn grasm_val_dec(v: *mut RtVal) {
 /// # Safety: compiler-generated calls with interned name data.
 #[no_mangle]
 pub unsafe extern "C" fn grasm_str_lit_immortal(ptr: *const u8, len: u64) -> *mut RtVal {
-    let bytes = std::slice::from_raw_parts(ptr, len as usize);
+    let bytes = core::slice::from_raw_parts(ptr, len as usize);
     Box::into_raw(Box::new(RtVal {
         rc: AtomicI64::new(IMMORTAL),
         payload: RtPayload::Str(RtStr::of(&String::from_utf8_lossy(bytes))),
@@ -3159,7 +3173,7 @@ pub unsafe extern "C" fn grasm_str_lit_immortal(ptr: *const u8, len: u64) -> *mu
 
 #[no_mangle]
 pub unsafe extern "C" fn grasm_str_lit(ptr: *const u8, len: u64) -> *mut RtVal {
-    let bytes = std::slice::from_raw_parts(ptr, len as usize);
+    let bytes = core::slice::from_raw_parts(ptr, len as usize);
     alloc(RtPayload::Str(RtStr::of(&String::from_utf8_lossy(bytes))))
 }
 
@@ -3195,8 +3209,8 @@ pub extern "C" fn grasm_str_build() -> i64 {
 #[no_mangle]
 pub unsafe extern "C" fn grasm_str_build_text(at: i64, ptr: i64, len: i64) {
     let buf = &mut *(at as *mut String);
-    let bytes = std::slice::from_raw_parts(ptr as *const u8, len as usize);
-    buf.push_str(std::str::from_utf8_unchecked(bytes));
+    let bytes = core::slice::from_raw_parts(ptr as *const u8, len as usize);
+    buf.push_str(core::str::from_utf8_unchecked(bytes));
 }
 
 /// # Safety: `at` is a live builder handle.
@@ -3224,7 +3238,7 @@ pub unsafe extern "C" fn grasm_str_build_i64(at: i64, v: i64) {
         at_end -= 1;
         digits[at_end] = b'-';
     }
-    push_short(buf, std::str::from_utf8_unchecked(&digits[at_end..]));
+    push_short(buf, core::str::from_utf8_unchecked(&digits[at_end..]));
 }
 
 /// # Safety: `at` is a live builder handle.
@@ -3281,7 +3295,7 @@ fn push_short(buf: &mut String, text: &str) {
 /// # Safety: `src` readable and `dst` writable for `n` bytes; no overlap.
 #[inline(always)]
 unsafe fn copy_short(src: *const u8, dst: *mut u8, n: usize) {
-    use std::ptr::{read_unaligned as rd, write_unaligned as wr};
+    use core::ptr::{read_unaligned as rd, write_unaligned as wr};
     if n >= 8 {
         let a = rd(src as *const u64);
         let b = rd(src.add(n - 8) as *const u64);
@@ -3313,7 +3327,7 @@ fn load_tail(rest: &[u8]) -> u64 {
     let p = rest.as_ptr();
     // Safety: every read is inside `rest`.
     unsafe {
-        use std::ptr::read_unaligned as rd;
+        use core::ptr::read_unaligned as rd;
         if n >= 4 {
             let lo = u64::from(u32::from_le(rd(p as *const u32)));
             let hi = u64::from(u32::from_le(rd(p.add(n - 4) as *const u32)));
@@ -3344,7 +3358,7 @@ pub unsafe extern "C" fn grasm_str_build_end(at: i64) -> *mut RtVal {
             // "{i}"` — a loop that grows one string — twice as slow as the
             // concatenation it replaced. The buffer is given up in that case
             // and the next build makes a fresh one.
-            let text = std::mem::take(&mut *buf);
+            let text = core::mem::take(&mut *buf);
             // The next build starts with room for one like this: from empty
             // it doubled its way up -- three or four reallocations for a URL --
             // and the string kept the doubled capacity.
@@ -3404,14 +3418,14 @@ pub unsafe extern "C" fn grasm_str_append(a: *mut RtVal, b: *mut RtVal) -> *mut 
     let (bp, bl) = (bt.as_ptr(), bt.len());
     // `a` and `b` are provably different boxes whenever the count is one, so
     // the slice stays valid across the append.
-    if append_fast(a, std::slice::from_raw_parts(bp, bl)) {
+    if append_fast(a, core::slice::from_raw_parts(bp, bl)) {
         return a;
     }
     if (*a).rc.load(Relaxed) == 1 {
         let RtPayload::Str(sa) = &mut (*a).payload else {
             unreachable!()
         };
-        let t = std::str::from_utf8_unchecked(std::slice::from_raw_parts(bp, bl));
+        let t = core::str::from_utf8_unchecked(core::slice::from_raw_parts(bp, bl));
         sa.push_str(t);
         return a;
     }
@@ -3478,7 +3492,7 @@ unsafe fn str_append_text(a: *mut RtVal, ptr: *const u8, len: usize) -> *mut RtV
         let RtPayload::Str(sa) = &mut (*a).payload else {
             unreachable!()
         };
-        sa.push_str(std::str::from_utf8_unchecked(std::slice::from_raw_parts(
+        sa.push_str(core::str::from_utf8_unchecked(core::slice::from_raw_parts(
             ptr, len,
         )));
         return a;
@@ -3486,7 +3500,7 @@ unsafe fn str_append_text(a: *mut RtVal, ptr: *const u8, len: usize) -> *mut RtV
     let RtPayload::Str(sa) = &(*a).payload else {
         unreachable!()
     };
-    let t = std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr, len));
+    let t = core::str::from_utf8_unchecked(core::slice::from_raw_parts(ptr, len));
     let out = alloc(RtPayload::Str(RtStr::concat(sa, t)));
     dec(a);
     out
@@ -3499,7 +3513,7 @@ pub unsafe extern "C" fn grasm_str_append_text(
     ptr: *const u8,
     len: i64,
 ) -> *mut RtVal {
-    if append_fast(a, std::slice::from_raw_parts(ptr, len as usize)) {
+    if append_fast(a, core::slice::from_raw_parts(ptr, len as usize)) {
         return a;
     }
     str_append_text(a, ptr, len as usize)
@@ -3582,7 +3596,7 @@ pub unsafe extern "C" fn grasm_str_pin_begin(
     // hand out, and spilling once here is cheaper than deciding per append.
     if let StrData::Inline { bytes, len } = &rs.s {
         let mut out = String::with_capacity(64);
-        out.push_str(std::str::from_utf8_unchecked(&bytes[..*len as usize]));
+        out.push_str(core::str::from_utf8_unchecked(&bytes[..*len as usize]));
         rs.s = StrData::Heap(out);
     }
     let StrData::Heap(h) = &mut rs.s else {
@@ -3668,7 +3682,7 @@ pub unsafe extern "C" fn grasm_str_pin_text(
     ptr: *const u8,
     len: i64,
 ) -> i64 {
-    std::ptr::copy_nonoverlapping(ptr, (data as *mut u8).add(at as usize), len as usize);
+    core::ptr::copy_nonoverlapping(ptr, (data as *mut u8).add(at as usize), len as usize);
     len
 }
 
@@ -3746,9 +3760,9 @@ pub unsafe extern "C" fn grasm_str_eq(a: *mut RtVal, b: *mut RtVal) -> i8 {
 pub unsafe extern "C" fn grasm_str_cmp(a: *mut RtVal, b: *mut RtVal) -> i64 {
     match (&(*a).payload, &(*b).payload) {
         (RtPayload::Str(x), RtPayload::Str(y)) => match x.cmp(y) {
-            std::cmp::Ordering::Less => -1,
-            std::cmp::Ordering::Equal => 0,
-            std::cmp::Ordering::Greater => 1,
+            core::cmp::Ordering::Less => -1,
+            core::cmp::Ordering::Equal => 0,
+            core::cmp::Ordering::Greater => 1,
         },
         _ => 0,
     }
@@ -3894,7 +3908,7 @@ pub unsafe extern "C" fn grasm_par_map_scalar(
         _ => unreachable!(),
     };
     let env_owned: Vec<i64> = if env_len > 0 {
-        std::slice::from_raw_parts(env, env_len as usize).to_vec()
+        core::slice::from_raw_parts(env, env_len as usize).to_vec()
     } else {
         Vec::new()
     };
@@ -4038,7 +4052,7 @@ pub unsafe extern "C" fn grasm_par_map_mixed(
         scalar_words(list, "par_map")
     };
     let env_owned: Vec<i64> = if env_len > 0 {
-        std::slice::from_raw_parts(env, env_len as usize).to_vec()
+        core::slice::from_raw_parts(env, env_len as usize).to_vec()
     } else {
         Vec::new()
     };
@@ -4117,7 +4131,7 @@ pub unsafe extern "C" fn grasm_net_workers(
 ) -> *mut RtVal {
     let words = scalar_words(list, "net_workers");
     let env_owned: Vec<i64> = if env_len > 0 {
-        std::slice::from_raw_parts(env, env_len as usize).to_vec()
+        core::slice::from_raw_parts(env, env_len as usize).to_vec()
     } else {
         Vec::new()
     };
@@ -4399,7 +4413,7 @@ pub unsafe extern "C" fn grasm_par_filter_scalar(
         _ => unreachable!(),
     };
     let env_owned: Vec<i64> = if env_len > 0 {
-        std::slice::from_raw_parts(env, env_len as usize).to_vec()
+        core::slice::from_raw_parts(env, env_len as usize).to_vec()
     } else {
         Vec::new()
     };
@@ -4485,7 +4499,7 @@ pub unsafe extern "C" fn grasm_par_filter_boxed(
     };
     let words: Vec<i64> = items.iter().map(|&p| p as i64).collect();
     let env_owned: Vec<i64> = if env_len > 0 {
-        std::slice::from_raw_parts(env, env_len as usize).to_vec()
+        core::slice::from_raw_parts(env, env_len as usize).to_vec()
     } else {
         Vec::new()
     };
@@ -4531,8 +4545,8 @@ unsafe fn scalar_unbox_val(kind: ScalarKind, v: *mut RtVal) -> i64 {
 /// no ordering there, so `[bool].sort()` is a no-op and `min`/`max` return
 /// the first element. The interpreter behaves the same way; changing either
 /// alone would fail the differential gate.
-fn scalar_cmp(kind: ScalarKind, a: i64, b: i64) -> std::cmp::Ordering {
-    use std::cmp::Ordering;
+fn scalar_cmp(kind: ScalarKind, a: i64, b: i64) -> core::cmp::Ordering {
+    use core::cmp::Ordering;
     match kind {
         ScalarKind::I64 | ScalarKind::Ref => a.cmp(&b),
         // A total order — see `cmp_vals`. An unboxed list of floats is the
@@ -4573,13 +4587,13 @@ enum Items<'a> {
 /// # Safety: live runtime pointer.
 unsafe fn items_of<'a>(v: *mut RtVal) -> Items<'a> {
     match &(*v).payload {
-        RtPayload::List(items) => Items::Boxed(std::mem::transmute::<
+        RtPayload::List(items) => Items::Boxed(core::mem::transmute::<
             &[*mut RtVal],
             &'a [*mut RtVal],
         >(items)),
         RtPayload::ListScalar { kind, data } => Items::Scalar(
             *kind,
-            std::mem::transmute::<&ScalarData, &'a ScalarData>(data),
+            core::mem::transmute::<&ScalarData, &'a ScalarData>(data),
         ),
         _ => grasm_panic_msg_str("expected a list"),
     }
@@ -4664,7 +4678,7 @@ pub unsafe extern "C" fn grasm_list_from_words(kind: i64, words: *const i64, n: 
     if n <= 0 {
         return empty_list_of(Some(k));
     }
-    let src = std::slice::from_raw_parts(words, n as usize);
+    let src = core::slice::from_raw_parts(words, n as usize);
     alloc(RtPayload::ListScalar {
         kind: k,
         data: ScalarData::from_words(k, src.to_vec()),
@@ -4770,7 +4784,7 @@ pub unsafe extern "C" fn grasm_fn_new(
     name_len: i64,
 ) -> *mut RtVal {
     let name = if name_len > 0 {
-        let bytes = std::slice::from_raw_parts(name_ptr, name_len as usize);
+        let bytes = core::slice::from_raw_parts(name_ptr, name_len as usize);
         Some(String::from_utf8_lossy(bytes).into_owned())
     } else {
         None
@@ -4884,7 +4898,7 @@ pub unsafe extern "C" fn grasm_list_push(list: *mut RtVal, elem: *mut RtVal) -> 
         // Through `cow_list` this was a clone of nothing plus a grow -- a
         // fifth of the pushes in `tree`, where every inner node starts a
         // `var kids: [Node] = []`.
-        let mut vals = [std::ptr::null_mut(); 4];
+        let mut vals = [core::ptr::null_mut(); 4];
         vals[0] = elem;
         dec(list);
         return alloc(RtPayload::List(ListData::Inline { vals, len: 1 }));
@@ -5099,19 +5113,19 @@ unsafe fn display(v: *mut RtVal) -> String {
                             match kind {
                                 FK_BOXED => format!("{k}: {}", display(*x as *mut RtVal)),
                                 FK_INSTR => {
-                                    let v = std::mem::ManuallyDrop::new(
+                                    let v = core::mem::ManuallyDrop::new(
                                         inline_vec::<u8>(&el[at..at + 3]),
                                     );
                                     format!("{k}: {}", String::from_utf8_lossy(&v))
                                 }
                                 FK_INLIST => {
-                                    let v = std::mem::ManuallyDrop::new(
+                                    let v = core::mem::ManuallyDrop::new(
                                         inline_vec::<i64>(&el[at..at + 3]),
                                     );
                                     format!("{k}: {:?}", &v[..])
                                 }
                                 FK_INVALS => {
-                                    let v = std::mem::ManuallyDrop::new(
+                                    let v = core::mem::ManuallyDrop::new(
                                         inline_vec::<i64>(&el[at..at + 3]),
                                     );
                                     let et = ty.elem_ty(i);
@@ -5259,8 +5273,8 @@ unsafe fn take_str(ptr: *const u8, len: u64) -> String {
 /// builds, which is a heap allocation to say a six-letter word the binary
 /// already contains.
 unsafe fn borrowed_str(ptr: *const u8, len: u64) -> &'static str {
-    let bytes = std::slice::from_raw_parts(ptr, len as usize);
-    match std::str::from_utf8(bytes) {
+    let bytes = core::slice::from_raw_parts(ptr, len as usize);
+    match core::str::from_utf8(bytes) {
         Ok(s) => s,
         Err(_) => grasm_panic_msg_str("compiler emitted a non-UTF-8 name"),
     }
@@ -5431,7 +5445,7 @@ pub unsafe extern "C" fn grasm_struct_get(s: *mut RtVal, name: *const u8, len: u
 #[no_mangle]
 pub unsafe extern "C" fn grasm_struct_take(s: *mut RtVal, name: *const u8, len: u64) -> *mut RtVal {
     if (*s).rc.load(Relaxed) != 1 {
-        return std::ptr::null_mut();
+        return core::ptr::null_mut();
     }
     let RtPayload::Struct { ty, fields } = &mut (*s).payload else {
         grasm_panic_msg_str("field access on non-struct");
@@ -5446,10 +5460,10 @@ pub unsafe extern "C" fn grasm_struct_take(s: *mut RtVal, name: *const u8, len: 
     if let Some(i) = idx {
         // A scalar's bits are not a value to take; the caller copies instead.
         if !ty.boxed(i) {
-            return std::ptr::null_mut();
+            return core::ptr::null_mut();
         }
         if let Some(v) = fields.get_mut(i) {
-            return std::mem::replace(v, hole);
+            return core::mem::replace(v, hole);
         }
     }
     grasm_panic_msg_str("no such field");
@@ -5505,7 +5519,7 @@ pub unsafe extern "C" fn grasm_vals_push(l: *mut RtVal, src: *const i64) -> *mut
         unreachable!()
     };
     let w = ty.width;
-    words.extend_from_slice(std::slice::from_raw_parts(src, w));
+    words.extend_from_slice(core::slice::from_raw_parts(src, w));
     target
 }
 
@@ -5639,19 +5653,19 @@ pub unsafe extern "C" fn grasm_vals_at(l: *mut RtVal, i: i64) -> *mut i64 {
 #[no_mangle]
 pub unsafe extern "C" fn grasm_list_take(l: *mut RtVal, i: i64) -> *mut RtVal {
     if (*l).rc.load(Relaxed) != 1 {
-        return std::ptr::null_mut();
+        return core::ptr::null_mut();
     }
     let RtPayload::List(items) = &mut (*l).payload else {
         // A scalar list holds no pointers to take.
-        return std::ptr::null_mut();
+        return core::ptr::null_mut();
     };
     let n = items.len() as i64;
     let i = if i < 0 { n + i } else { i };
     if i < 0 || i >= n {
-        return std::ptr::null_mut();
+        return core::ptr::null_mut();
     }
     let hole = interned_bool(false);
-    std::mem::replace(&mut items[i as usize], hole)
+    core::mem::replace(&mut items[i as usize], hole)
 }
 
 /// The same, by declared position rather than by name ([the reason is the same
@@ -5831,7 +5845,7 @@ pub unsafe extern "C" fn grasm_variant_push(v: *mut RtVal, val: *mut RtVal) {
     // A variant is built field by field and then never grows, so its fields
     // are a boxed slice; extending one rebuilds it, a handful of times per
     // value at most.
-    let mut grown = std::mem::take(fields).into_vec();
+    let mut grown = core::mem::take(fields).into_vec();
     grown.push(val);
     *fields = VFields::new(grown);
 }
@@ -5906,7 +5920,7 @@ pub unsafe extern "C" fn grasm_try_take(res: *mut RtVal) -> *mut RtVal {
         grasm_panic_msg_str("try on a value that is not a result");
     };
     if *name != "Ok" {
-        return std::ptr::null_mut();
+        return core::ptr::null_mut();
     }
     let payload = fields[0];
     if (*res).rc.load(Relaxed) == 1 {
@@ -6297,7 +6311,7 @@ pub unsafe extern "C" fn grasm_map_add_i64(
     let RtPayload::Map(entries) = &mut (*target).payload else {
         unreachable!()
     };
-    let slot = with_key(k, |kk| entries.get_mut(kk).map(std::ptr::from_mut));
+    let slot = with_key(k, |kk| entries.get_mut(kk).map(core::ptr::from_mut));
     match slot {
         Some(slot) => {
             let cur = *slot;
@@ -6323,13 +6337,13 @@ pub unsafe extern "C" fn grasm_map_add_i64(
             let new = old + delta;
             let shared = interned_int(new);
             if !shared.is_null() {
-                dec(std::mem::replace(&mut *slot, shared));
+                dec(core::mem::replace(&mut *slot, shared));
             } else if (*cur).rc.load(Relaxed) == 1 {
                 if let RtPayload::I64(n) = &mut (*cur).payload {
                     *n = new;
                 }
             } else {
-                dec(std::mem::replace(&mut *slot, grasm_box_i64(new)));
+                dec(core::mem::replace(&mut *slot, grasm_box_i64(new)));
             }
         }
         None => {
@@ -6360,7 +6374,7 @@ pub unsafe extern "C" fn grasm_map_add_i64_bytes(
     let RtPayload::Map(entries) = &mut (*target).payload else {
         unreachable!()
     };
-    let slot = with_key_bytes(ptr, len, |kk| entries.get_mut(kk).map(std::ptr::from_mut));
+    let slot = with_key_bytes(ptr, len, |kk| entries.get_mut(kk).map(core::ptr::from_mut));
     match slot {
         Some(slot) => {
             let cur = *slot;
@@ -6371,18 +6385,18 @@ pub unsafe extern "C" fn grasm_map_add_i64_bytes(
             let new = old + delta;
             let shared = interned_int(new);
             if !shared.is_null() {
-                dec(std::mem::replace(&mut *slot, shared));
+                dec(core::mem::replace(&mut *slot, shared));
             } else if (*cur).rc.load(Relaxed) == 1 {
                 if let RtPayload::I64(n) = &mut (*cur).payload {
                     *n = new;
                 }
             } else {
-                dec(std::mem::replace(&mut *slot, grasm_box_i64(new)));
+                dec(core::mem::replace(&mut *slot, grasm_box_i64(new)));
             }
         }
         None => {
             let text =
-                std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr, len as usize));
+                core::str::from_utf8_unchecked(core::slice::from_raw_parts(ptr, len as usize));
             entries.insert(
                 MapKey::Str(KeyStr::of(text)),
                 grasm_box_i64(default + delta),
@@ -6403,9 +6417,9 @@ pub unsafe extern "C" fn grasm_map_set(m: *mut RtVal, k: *mut RtVal, v: *mut RtV
     // only a genuinely new key has to be built and owned. That is the rare
     // case: a counting loop misses once per distinct word and hits every
     // time after.
-    match with_key(k, |kk| entries.get_mut(kk).map(std::ptr::from_mut)) {
+    match with_key(k, |kk| entries.get_mut(kk).map(core::ptr::from_mut)) {
         Some(slot) => {
-            dec(std::mem::replace(&mut *slot, v));
+            dec(core::mem::replace(&mut *slot, v));
         }
         None => {
             entries.insert(MapKey::of(k), v);
@@ -6428,7 +6442,7 @@ pub unsafe extern "C" fn grasm_map_set(m: *mut RtVal, k: *mut RtVal, v: *mut RtV
 /// # Safety: `ptr`/`len` are valid UTF-8 for the length of the call.
 unsafe fn with_key_bytes<R>(ptr: *const u8, len: i64, f: impl FnOnce(&MapKey) -> R) -> R {
     let text =
-        std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr, len as usize));
+        core::str::from_utf8_unchecked(core::slice::from_raw_parts(ptr, len as usize));
     f(&MapKey::Str(KeyStr::of(text)))
 }
 
@@ -6449,7 +6463,7 @@ pub unsafe extern "C" fn grasm_map_get_ptr_bytes(
             inc(ev);
             ev
         }
-        None => std::ptr::null_mut(),
+        None => core::ptr::null_mut(),
     }
 }
 
@@ -6467,13 +6481,13 @@ pub unsafe extern "C" fn grasm_map_set_bytes(
     let RtPayload::Map(entries) = &mut (*target).payload else {
         unreachable!()
     };
-    match with_key_bytes(ptr, len, |kk| entries.get_mut(kk).map(std::ptr::from_mut)) {
+    match with_key_bytes(ptr, len, |kk| entries.get_mut(kk).map(core::ptr::from_mut)) {
         Some(slot) => {
-            dec(std::mem::replace(&mut *slot, v));
+            dec(core::mem::replace(&mut *slot, v));
         }
         None => {
             let text =
-                std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr, len as usize));
+                core::str::from_utf8_unchecked(core::slice::from_raw_parts(ptr, len as usize));
             entries.insert(MapKey::Str(KeyStr::of(text)), v);
         }
     }
@@ -6535,7 +6549,7 @@ pub unsafe extern "C" fn grasm_map_get_ptr(m: *mut RtVal, k: *mut RtVal) -> *mut
             inc(ev);
             ev
         }
-        None => std::ptr::null_mut(),
+        None => core::ptr::null_mut(),
     }
 }
 
@@ -6680,7 +6694,7 @@ unsafe fn as_str(v: *mut RtVal) -> &'static str {
     match &(*v).payload {
         RtPayload::Str(s) => {
             // Lifetime is tied to the caller's borrow; safe for the call span.
-            std::mem::transmute::<&str, &'static str>(&**s)
+            core::mem::transmute::<&str, &'static str>(&**s)
         }
         _ => grasm_panic_msg_str("expected a string"),
     }
@@ -7007,7 +7021,7 @@ const MAX_ALLOC: usize = 1 << 33;
 /// process" — and §11 promises the compiled backend never miscompiles.
 fn rt_stack_check() {
     let here = 0u8;
-    let sp = std::ptr::addr_of!(here) as usize;
+    let sp = core::ptr::addr_of!(here) as usize;
     LOCAL.with(|local| {
         let floor = local.stack_floor.get();
         if floor == 0 {
@@ -7367,7 +7381,7 @@ fn i64_in_base(v: i64, base: i64) -> String {
         buf[i] = b'-';
     }
     // ASCII by construction.
-    unsafe { std::str::from_utf8_unchecked(&buf[i..]) }.to_string()
+    unsafe { core::str::from_utf8_unchecked(&buf[i..]) }.to_string()
 }
 
 /// Reads an integer written in a given base.
@@ -7430,8 +7444,8 @@ pub unsafe extern "C" fn grasm_list_rev(v: *mut RtVal) -> *mut RtVal {
     }
 }
 
-unsafe fn cmp_vals(a: *mut RtVal, b: *mut RtVal) -> std::cmp::Ordering {
-    use std::cmp::Ordering;
+unsafe fn cmp_vals(a: *mut RtVal, b: *mut RtVal) -> core::cmp::Ordering {
+    use core::cmp::Ordering;
     match (&(*a).payload, &(*b).payload) {
         (RtPayload::I64(x), RtPayload::I64(y)) => x.cmp(y),
         // A total order, so a sort stays a sort even with a NaN in the list
@@ -7480,9 +7494,9 @@ pub unsafe extern "C" fn grasm_assert_eq(a: *mut RtVal, b: *mut RtVal) {
 #[no_mangle]
 pub unsafe extern "C" fn grasm_val_cmp(a: *mut RtVal, b: *mut RtVal) -> i64 {
     match cmp_vals(a, b) {
-        std::cmp::Ordering::Less => -1,
-        std::cmp::Ordering::Equal => 0,
-        std::cmp::Ordering::Greater => 1,
+        core::cmp::Ordering::Less => -1,
+        core::cmp::Ordering::Equal => 0,
+        core::cmp::Ordering::Greater => 1,
     }
 }
 
@@ -7942,7 +7956,7 @@ pub extern "C" fn grasm_f64_max(a: f64, b: f64) -> f64 {
 // N5: effect handler stack + fs/args/env builtins
 // ---------------------------------------------------------------------------
 
-use std::cell::RefCell;
+use core::cell::RefCell;
 
 /// One installed effect handler: its ops as (op name, code pointer).
 /// An installed handler: the effect's name, and each operation's lifted code
@@ -8006,7 +8020,7 @@ pub unsafe extern "C" fn grasm_handler_env(
                         .map(|(_, _, env)| *env)
                 })
         })
-        .unwrap_or(std::ptr::null())
+        .unwrap_or(core::ptr::null())
 }
 
 #[no_mangle]
@@ -8146,12 +8160,12 @@ fn ok_of(v: *mut RtVal) -> *mut RtVal {
 /// the last clone goes, so an `accept` or a `poll` already under way finishes
 /// on the socket it started with rather than on whatever reused its number.
 struct SocketTable {
-    slots: Vec<Option<std::sync::Arc<Socket>>>,
+    slots: Vec<Option<alloc::sync::Arc<Socket>>>,
     /// The empty slots, lowest first. A new socket takes the lowest, as it did
     /// when the table was searched from the start -- handle numbers are
     /// visible to programs -- without the search, which was a scan of every
     /// connection on every accept.
-    free: std::collections::BinaryHeap<std::cmp::Reverse<usize>>,
+    free: alloc::collections::BinaryHeap<core::cmp::Reverse<usize>>,
 }
 
 /// Read-write: every socket operation looks its handle up, and only opening
@@ -8159,7 +8173,7 @@ struct SocketTable {
 /// workers spent as long waiting for the lock as in `poll`.
 static SOCKETS: std::sync::RwLock<SocketTable> = std::sync::RwLock::new(SocketTable {
     slots: Vec::new(),
-    free: std::collections::BinaryHeap::new(),
+    free: alloc::collections::BinaryHeap::new(),
 });
 
 /// The table, locked for a change. A panic while holding it ends the process
@@ -8178,13 +8192,13 @@ thread_local! {
     /// One read buffer per thread, reused. A read answers with exactly the
     /// bytes that arrived; a fresh 64 KiB buffer per read, truncated but
     /// keeping its capacity, held 64 KiB for every chunk a server kept.
-    static READ_BUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    static READ_BUF: core::cell::RefCell<Vec<u8>> = const { core::cell::RefCell::new(Vec::new()) };
     /// Listeners this thread's last `net_wait` reported ready. A `tcp_accept`
     /// on one of them does not wait: several workers woken for the same
     /// connection all try, one gets it, and the rest must go back to their own
     /// connections rather than sit in `accept` until the next client arrives
     /// ([L-LIB-NET-WORKERS]).
-    static ACCEPT_READY: std::cell::RefCell<Vec<i64>> = const { std::cell::RefCell::new(Vec::new()) };
+    static ACCEPT_READY: core::cell::RefCell<Vec<i64>> = const { core::cell::RefCell::new(Vec::new()) };
 }
 
 /// Reads once through the thread's read buffer, answering with the bytes read
@@ -8211,11 +8225,11 @@ enum Socket {
 }
 
 fn socket_put(s: Socket) -> i64 {
-    let s = std::sync::Arc::new(s);
+    let s = alloc::sync::Arc::new(s);
     let mut table = sockets();
     // A freed slot is reused, so a long-running server does not grow the
     // table once per connection.
-    if let Some(std::cmp::Reverse(i)) = table.free.pop() {
+    if let Some(core::cmp::Reverse(i)) = table.free.pop() {
         table.slots[i] = Some(s);
         return i as i64;
     }
@@ -8225,7 +8239,7 @@ fn socket_put(s: Socket) -> i64 {
 
 /// The socket a handle names, held so it stays open however long the caller
 /// needs it.
-fn socket_get(h: i64) -> Option<std::sync::Arc<Socket>> {
+fn socket_get(h: i64) -> Option<alloc::sync::Arc<Socket>> {
     let table = sockets_read();
     usize::try_from(h)
         .ok()
@@ -8371,7 +8385,7 @@ mod sys_kqueue {
         pub flags: u16,
         pub fflags: u32,
         pub data: isize,
-        pub udata: *mut std::ffi::c_void,
+        pub udata: *mut core::ffi::c_void,
     }
 
     impl KEvent {
@@ -8382,7 +8396,7 @@ mod sys_kqueue {
                 flags,
                 fflags: 0,
                 data: 0,
-                udata: std::ptr::null_mut(),
+                udata: core::ptr::null_mut(),
             }
         }
     }
@@ -8448,7 +8462,7 @@ impl Drop for KqWaiter {
 
 #[cfg(target_os = "macos")]
 thread_local! {
-    static KQ_WAITER: std::cell::RefCell<Option<KqWaiter>> = const { std::cell::RefCell::new(None) };
+    static KQ_WAITER: core::cell::RefCell<Option<KqWaiter>> = const { core::cell::RefCell::new(None) };
 }
 
 /// What a wait answers: which handles are ready, and which are listeners.
@@ -8486,7 +8500,7 @@ fn kq_wait(wanted: &[i64], timeout_ms: i32) -> Option<Waited> {
             let table = sockets_read();
             w.registered.iter().zip(wanted).all(|((_, rs), &h)| {
                 matches!(usize::try_from(h).ok().and_then(|i| table.slots.get(i)),
-                    Some(Some(s)) if std::ptr::eq(rs.as_ptr(), std::sync::Arc::as_ptr(s)))
+                    Some(Some(s)) if core::ptr::eq(rs.as_ptr(), alloc::sync::Arc::as_ptr(s)))
             })
         };
         if !same {
@@ -8509,7 +8523,7 @@ fn kq_wait(wanted: &[i64], timeout_ms: i32) -> Option<Waited> {
             }
             let mut changes: Vec<KEvent> = Vec::new();
             for (rfd, rs) in &w.registered {
-                let kept = held.iter().any(|s| std::ptr::eq(rs.as_ptr(), std::sync::Arc::as_ptr(s)));
+                let kept = held.iter().any(|s| core::ptr::eq(rs.as_ptr(), alloc::sync::Arc::as_ptr(s)));
                 if kept {
                     continue;
                 }
@@ -8523,7 +8537,7 @@ fn kq_wait(wanted: &[i64], timeout_ms: i32) -> Option<Waited> {
                 let known = w
                     .registered
                     .iter()
-                    .any(|(rfd, rs)| *rfd == fd && std::ptr::eq(rs.as_ptr(), std::sync::Arc::as_ptr(s)));
+                    .any(|(rfd, rs)| *rfd == fd && core::ptr::eq(rs.as_ptr(), alloc::sync::Arc::as_ptr(s)));
                 if !known {
                     changes.push(KEvent::new(fd, EV_ADD | EV_RECEIPT));
                 }
@@ -8537,7 +8551,7 @@ fn kq_wait(wanted: &[i64], timeout_ms: i32) -> Option<Waited> {
                         changes.len() as i32,
                         receipts.as_mut_ptr(),
                         receipts.len() as i32,
-                        std::ptr::null(),
+                        core::ptr::null(),
                     )
                 };
                 if n < 0 {
@@ -8556,7 +8570,7 @@ fn kq_wait(wanted: &[i64], timeout_ms: i32) -> Option<Waited> {
                     }
                 }
             }
-            w.registered = held.iter().zip(&fds).map(|(s, &fd)| (fd, std::sync::Arc::downgrade(s))).collect();
+            w.registered = held.iter().zip(&fds).map(|(s, &fd)| (fd, alloc::sync::Arc::downgrade(s))).collect();
             w.listener = held.iter().map(|s| matches!(&**s, Socket::Listener(_))).collect();
             w.handles = wanted.to_vec();
             w.position = position;
@@ -8566,7 +8580,7 @@ fn kq_wait(wanted: &[i64], timeout_ms: i32) -> Option<Waited> {
         w.events.resize(cap, KEvent::new(-1, 0));
         let ts;
         let tp = if timeout_ms < 0 {
-            std::ptr::null()
+            core::ptr::null()
         } else {
             ts = TimeSpec {
                 tv_sec: i64::from(timeout_ms / 1000),
@@ -8575,7 +8589,7 @@ fn kq_wait(wanted: &[i64], timeout_ms: i32) -> Option<Waited> {
             &ts as *const TimeSpec
         };
         loop {
-            let n = unsafe { kevent(w.kq, std::ptr::null(), 0, w.events.as_mut_ptr(), cap as i32, tp) };
+            let n = unsafe { kevent(w.kq, core::ptr::null(), 0, w.events.as_mut_ptr(), cap as i32, tp) };
             if n >= 0 {
                 let mut ready = vec![false; wanted.len()];
                 for e in &w.events[..n as usize] {
@@ -8599,7 +8613,7 @@ fn kq_wait(wanted: &[i64], timeout_ms: i32) -> Option<Waited> {
 /// The sockets `wanted` names, each held, under one lock: every worker waits
 /// on every connection it owns, and the lock word is the one cache line they
 /// all share.
-fn socket_set(wanted: &[i64]) -> Result<Vec<std::sync::Arc<Socket>>, String> {
+fn socket_set(wanted: &[i64]) -> Result<Vec<alloc::sync::Arc<Socket>>, String> {
     let table = sockets_read();
     wanted
         .iter()
@@ -8614,7 +8628,7 @@ fn socket_set(wanted: &[i64]) -> Result<Vec<std::sync::Arc<Socket>>, String> {
 }
 
 #[cfg(unix)]
-fn socket_fds(held: &[std::sync::Arc<Socket>]) -> Vec<i32> {
+fn socket_fds(held: &[alloc::sync::Arc<Socket>]) -> Vec<i32> {
     use std::os::fd::AsRawFd;
     held.iter()
         .map(|s| match &**s {
@@ -8626,7 +8640,7 @@ fn socket_fds(held: &[std::sync::Arc<Socket>]) -> Vec<i32> {
 }
 
 #[cfg(not(unix))]
-fn socket_fds(held: &[std::sync::Arc<Socket>]) -> Vec<i32> {
+fn socket_fds(held: &[alloc::sync::Arc<Socket>]) -> Vec<i32> {
     vec![-1; held.len()]
 }
 
@@ -9245,8 +9259,8 @@ unsafe fn grasm_proc_pipeline_now(stages: *mut RtVal, input: *mut RtVal) -> *mut
 ///
 /// # Safety: called from compiled Grasm with a boxed value.
 #[no_mangle]
-pub unsafe extern "C" fn grasm_str_c_new(v: *mut RtVal) -> *mut std::ffi::c_char {
-    match std::ffi::CString::new(as_str(v).as_bytes()) {
+pub unsafe extern "C" fn grasm_str_c_new(v: *mut RtVal) -> *mut core::ffi::c_char {
+    match core::ffi::CString::new(as_str(v).as_bytes()) {
         Ok(c) => {
             // Counted, because nothing else counts it. `LIVE` tracks the
             // runtime's own allocations, and this one is `CString`'s -- so a
@@ -9265,10 +9279,10 @@ pub unsafe extern "C" fn grasm_str_c_new(v: *mut RtVal) -> *mut std::ffi::c_char
 
 /// # Safety: `p` came from `grasm_str_c_new` and is freed once.
 #[no_mangle]
-pub unsafe extern "C" fn grasm_str_c_free(p: *mut std::ffi::c_char) {
+pub unsafe extern "C" fn grasm_str_c_free(p: *mut core::ffi::c_char) {
     if !p.is_null() {
         C_COPIES.fetch_sub(1, Relaxed);
-        drop(std::ffi::CString::from_raw(p));
+        drop(core::ffi::CString::from_raw(p));
     }
 }
 
@@ -9572,7 +9586,7 @@ pub unsafe extern "C" fn grasm_net_close(handle: *mut RtVal) {
                 .and_then(|i| table.slots.get_mut(i))
                 .and_then(Option::take);
             if taken.is_some() {
-                table.free.push(std::cmp::Reverse(h as usize));
+                table.free.push(core::cmp::Reverse(h as usize));
             }
             taken
         };
@@ -9774,7 +9788,7 @@ pub unsafe extern "C" fn grasm_bytes_to_str(v: *mut RtVal) -> *mut RtVal {
 /// the next line -- for *every* token a parser cuts out of its input, which
 /// is the thing `RtStr::of`'s own comment warns against.
 fn str_of_bytes(b: &[u8]) -> RtStr {
-    match std::str::from_utf8(b) {
+    match core::str::from_utf8(b) {
         Ok(t) => RtStr::of(t),
         Err(_) => RtStr::new(String::from_utf8_lossy(b).into_owned()),
     }
@@ -10306,9 +10320,9 @@ pub unsafe extern "C" fn grasm_list_min_max(v: *mut RtVal, want_max: i8) -> *mut
                     Some(cur) => {
                         let ord = cmp_vals(item, cur);
                         let take = if want_max {
-                            ord == std::cmp::Ordering::Greater
+                            ord == core::cmp::Ordering::Greater
                         } else {
-                            ord == std::cmp::Ordering::Less
+                            ord == core::cmp::Ordering::Less
                         };
                         if take {
                             item
@@ -10334,9 +10348,9 @@ pub unsafe extern "C" fn grasm_list_min_max(v: *mut RtVal, want_max: i8) -> *mut
                     Some(cur) => {
                         let ord = scalar_cmp(kind, bits, cur);
                         let take = if want_max {
-                            ord == std::cmp::Ordering::Greater
+                            ord == core::cmp::Ordering::Greater
                         } else {
-                            ord == std::cmp::Ordering::Less
+                            ord == core::cmp::Ordering::Less
                         };
                         if take {
                             bits
@@ -10781,7 +10795,7 @@ pub unsafe extern "C" fn grasm_handler_install(h: *mut RtVal) {
     HANDLERS.with(|st| st.borrow_mut().push((effect, Vec::new())));
     for (name, code, env) in ops {
         let data = if env.is_null() {
-            std::ptr::null()
+            core::ptr::null()
         } else {
             grasm_env_data(env)
         };
@@ -10797,7 +10811,7 @@ pub unsafe extern "C" fn grasm_handler_install(h: *mut RtVal) {
 mod maphash_tests {
     use super::maphash::MapHash;
     use std::collections::HashSet;
-    use std::hash::{BuildHasher, Hash};
+    use core::hash::{BuildHasher, Hash};
 
     fn hash_of<T: Hash>(b: &MapHash, v: &T) -> u64 {
         b.hash_one(v)
@@ -10951,7 +10965,7 @@ mod layout_tests {
             assert_eq!(*(sb.add(layout::STRUCT_INLINE_VALS + 8) as *const *mut RtVal), b);
             let l = alloc(RtPayload::List(ListData::Inline {
                 len: 2,
-                vals: [b, a, std::ptr::null_mut(), std::ptr::null_mut()],
+                vals: [b, a, core::ptr::null_mut(), core::ptr::null_mut()],
             }));
             let lb = l as *const u8;
             assert_eq!(*lb.add(layout::PAYLOAD_TAG), layout::TAG_LIST);
