@@ -2154,3 +2154,137 @@ macro_rules! thread_local {
 
 use crate::io::Write;
 
+
+/// Floating-point maths, from libm.
+///
+/// `core` has no `sqrt`, `powf` or `floor`: those are not language operations
+/// but calls into libm, and only `std` declares them. We link libm anyway, so
+/// this declares them directly -- and as a trait on `f64`, so that every
+/// existing `x.sqrt()` reads the same as it did under `std`.
+///
+/// `round` is libm's, which rounds halves **away from zero**, the same rule
+/// `std`'s `f64::round` uses and the one [L-LIB-ROUND] requires. A different
+/// rounding here would move every money column in the corpus.
+pub mod math {
+    extern "C" {
+        fn sqrt(x: f64) -> f64;
+        fn cbrt(x: f64) -> f64;
+        fn pow(x: f64, y: f64) -> f64;
+        fn hypot(x: f64, y: f64) -> f64;
+        fn floor(x: f64) -> f64;
+        fn ceil(x: f64) -> f64;
+        fn round(x: f64) -> f64;
+        fn exp(x: f64) -> f64;
+        fn log(x: f64) -> f64;
+        fn log2(x: f64) -> f64;
+        fn log10(x: f64) -> f64;
+        fn sin(x: f64) -> f64;
+        fn cos(x: f64) -> f64;
+        fn tan(x: f64) -> f64;
+        fn asin(x: f64) -> f64;
+        fn acos(x: f64) -> f64;
+        fn atan(x: f64) -> f64;
+        fn atan2(y: f64, x: f64) -> f64;
+        fn sinh(x: f64) -> f64;
+        fn cosh(x: f64) -> f64;
+        fn tanh(x: f64) -> f64;
+    }
+
+    /// The methods `std` puts on `f64`, with the same names and the same
+    /// meanings, so no call site changes.
+    pub trait Float {
+        fn sqrt(self) -> f64;
+        fn cbrt(self) -> f64;
+        fn powf(self, exp: f64) -> f64;
+        fn hypot(self, other: f64) -> f64;
+        fn floor(self) -> f64;
+        fn ceil(self) -> f64;
+        fn round(self) -> f64;
+        fn exp(self) -> f64;
+        fn ln(self) -> f64;
+        fn log(self, base: f64) -> f64;
+        fn log2(self) -> f64;
+        fn log10(self) -> f64;
+        fn sin(self) -> f64;
+        fn cos(self) -> f64;
+        fn tan(self) -> f64;
+        fn asin(self) -> f64;
+        fn acos(self) -> f64;
+        fn atan(self) -> f64;
+        fn atan2(self, x: f64) -> f64;
+        fn sinh(self) -> f64;
+        fn cosh(self) -> f64;
+        fn tanh(self) -> f64;
+    }
+
+    impl Float for f64 {
+        fn sqrt(self) -> f64 {
+            unsafe { sqrt(self) }
+        }
+        fn cbrt(self) -> f64 {
+            unsafe { cbrt(self) }
+        }
+        fn powf(self, exp: f64) -> f64 {
+            unsafe { pow(self, exp) }
+        }
+        fn hypot(self, other: f64) -> f64 {
+            unsafe { hypot(self, other) }
+        }
+        fn floor(self) -> f64 {
+            unsafe { floor(self) }
+        }
+        fn ceil(self) -> f64 {
+            unsafe { ceil(self) }
+        }
+        fn round(self) -> f64 {
+            unsafe { round(self) }
+        }
+        fn exp(self) -> f64 {
+            unsafe { exp(self) }
+        }
+        fn ln(self) -> f64 {
+            unsafe { log(self) }
+        }
+        /// `std`'s `log(base)` is a ratio of natural logarithms, and is
+        /// computed the same way here so the two agree bit for bit.
+        fn log(self, base: f64) -> f64 {
+            unsafe { log(self) / log(base) }
+        }
+        fn log2(self) -> f64 {
+            unsafe { log2(self) }
+        }
+        fn log10(self) -> f64 {
+            unsafe { log10(self) }
+        }
+        fn sin(self) -> f64 {
+            unsafe { sin(self) }
+        }
+        fn cos(self) -> f64 {
+            unsafe { cos(self) }
+        }
+        fn tan(self) -> f64 {
+            unsafe { tan(self) }
+        }
+        fn asin(self) -> f64 {
+            unsafe { asin(self) }
+        }
+        fn acos(self) -> f64 {
+            unsafe { acos(self) }
+        }
+        fn atan(self) -> f64 {
+            unsafe { atan(self) }
+        }
+        fn atan2(self, x: f64) -> f64 {
+            unsafe { atan2(self, x) }
+        }
+        fn sinh(self) -> f64 {
+            unsafe { sinh(self) }
+        }
+        fn cosh(self) -> f64 {
+            unsafe { cosh(self) }
+        }
+        fn tanh(self) -> f64 {
+            unsafe { tanh(self) }
+        }
+    }
+}

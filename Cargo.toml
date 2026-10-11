@@ -13,6 +13,7 @@ members = [
     "crates/grasm_fiber",
     "crates/grasm_sys",
     "crates/grasm_rt",
+    "crates/grasm_rt_abi",
     "crates/grasm_wasm",
     "crates/grasm",
 ]
@@ -24,6 +25,10 @@ license = "Apache-2.0"
 
 [profile.release]
 lto = "thin"
+# Required, not chosen: a `no_std` crate has no unwinder, and the compiler
+# refuses to build one that could unwind. The note below about this saving
+# only 1 KB was measured when `std` was still linked.
+panic = "abort"
 # `panic = "abort"` was tried here and reverted: it saved 1 KB. The 39 KB of
 # unwinding tables in a compiled program come from Rust's *precompiled* `std`,
 # which this setting cannot reach — removing them needs `-Z build-std` (nightly,

@@ -5,7 +5,9 @@ edition.workspace = true
 license.workspace = true
 
 [lib]
-crate-type = ["staticlib", "rlib"]
+# An rlib only: `grasm_rt_abi` is what becomes the archive a compiled program
+# links, because that is where the allocator and panic handler have to live.
+crate-type = ["rlib"]
 
 [dependencies]
 # The operating system layer, shared with every other crate a compiled

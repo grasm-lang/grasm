@@ -1,0 +1,16 @@
+[package]
+name = "grasm_rt_abi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# A staticlib and nothing else. This crate exists to hold the two items a
+# `no_std` program must have exactly one of -- the allocator and the panic
+# handler -- which cannot live in `grasm_rt`, because `grasm_interp` links
+# that as an rlib and `std` already supplies both.
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+grasm_rt = { path = "../grasm_rt" }
+grasm_sys = { path = "../grasm_sys" }

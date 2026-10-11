@@ -51,8 +51,26 @@
 //! arbitrary bytes — a `read_bytes` of a JPEG is exactly the case this exists
 //! to reproduce, and it is the one a text format would corrupt.
 
-use std::cell::RefCell;
-use std::io::{Read, Write};
+#![no_std]
+extern crate alloc;
+#[macro_use]
+extern crate grasm_sys;
+
+use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::vec;
+use alloc::vec::Vec;
+
+/// `eprintln!` without `std`, over `grasm_sys`'s buffered stderr.
+macro_rules! eprint_line {
+    ($($arg:tt)*) => {{
+        use grasm_sys::io::Write;
+        let mut err = grasm_sys::io::stderr().lock();
+        let _ = writeln!(err, $($arg)*);
+    }};
+}
+
+use core::cell::RefCell;
 
 const MAGIC: &[u8; 10] = b"GRASMJRNL2";
 
@@ -85,12 +103,12 @@ impl Wire {
     /// The name a hook should pass when it meets a value this cannot carry.
     /// Recording it would produce a journal that decodes into something else.
     pub fn of_unsupported(what: &str) -> ! {
-        eprintln!(
+        eprint_line!(
             "grasm: cannot record a {what} — the journal has no encoding for it, \
              and recording something else in its place would make the replay a \
              lie about what happened"
         );
-        std::process::exit(7);
+        grasm_sys::sys::exit(7);
     }
 
     pub fn encode(&self) -> Vec<u8> {
@@ -323,7 +341,7 @@ fn bracketed(items: &[Wire], budget: usize, open: char, close: char) -> String {
 
 enum Mode {
     Off,
-    Recording(std::fs::File),
+    Recording(grasm_sys::fs::File),
     Replaying {
         records: Vec<(String, Wire)>,
         at: usize,
@@ -339,24 +357,24 @@ thread_local! {
 /// Both set means recording, because a replay that also rewrote the journal it
 /// was reading would destroy the evidence it exists to preserve.
 fn open() -> Mode {
-    if let Some(path) = std::env::var_os("GRASM_RECORD") {
-        return match std::fs::File::create(&path) {
+    if let Some(path) = grasm_sys::sys::env_var("GRASM_RECORD") {
+        return match grasm_sys::fs::File::create(&path) {
             Ok(mut f) => {
                 let _ = f.write_all(MAGIC);
                 Mode::Recording(f)
             }
             Err(e) => {
-                eprintln!("grasm: cannot record to {}: {e}", path.to_string_lossy());
-                std::process::exit(7);
+                eprint_line!("grasm: cannot record to {}: {e}", path);
+                grasm_sys::sys::exit(7);
             }
         };
     }
-    if let Some(path) = std::env::var_os("GRASM_REPLAY") {
+    if let Some(path) = grasm_sys::sys::env_var("GRASM_REPLAY") {
         return match read_journal(&path) {
             Ok(records) => Mode::Replaying { records, at: 0 },
             Err(e) => {
-                eprintln!("grasm: cannot replay {}: {e}", path.to_string_lossy());
-                std::process::exit(7);
+                eprint_line!("grasm: cannot replay {}: {e}", path);
+                grasm_sys::sys::exit(7);
             }
         };
     }
@@ -387,13 +405,13 @@ pub fn framed(records: &[(String, Wire)]) -> Vec<u8> {
 
 /// Reads a journal from disk. Public so a person can be shown what a recording
 /// holds — a file of framed bytes is evidence nobody can examine.
-pub fn read(path: &std::ffi::OsStr) -> Result<Vec<(String, Wire)>, String> {
+pub fn read(path: &str) -> Result<Vec<(String, Wire)>, String> {
     read_journal(path)
 }
 
-fn read_journal(path: &std::ffi::OsStr) -> Result<Vec<(String, Wire)>, String> {
+fn read_journal(path: &str) -> Result<Vec<(String, Wire)>, String> {
     let mut raw = Vec::new();
-    std::fs::File::open(path)
+    grasm_sys::fs::File::open(path)
         .map_err(|e| e.to_string())?
         .read_to_end(&mut raw)
         .map_err(|e| e.to_string())?;
@@ -494,23 +512,23 @@ pub fn gate(name: &str) -> Option<Wire> {
             return None;
         };
         if *at >= records.len() {
-            eprintln!(
+            eprint_line!(
                 "grasm: the journal ran out at call {} (`{name}`) — the program \
                  reached outside itself more often than the recording holds, so \
                  it has diverged from the run being replayed",
                 *at + 1
             );
-            std::process::exit(7);
+            grasm_sys::sys::exit(7);
         }
         let (recorded, value) = &records[*at];
         if recorded != name {
-            eprintln!(
+            eprint_line!(
                 "grasm: at call {} the recording says `{recorded}` and this run \
                  asked for `{name}` — the program has taken a different path \
                  from the one recorded, so this is not a replay of it",
                 *at + 1
             );
-            std::process::exit(7);
+            grasm_sys::sys::exit(7);
         }
         *at += 1;
         Some(value.clone())
@@ -526,7 +544,7 @@ pub fn check_exhausted() {
         if let Mode::Replaying { records, at } = &*m.borrow() {
             if *at < records.len() {
                 let left = records.len() - *at;
-                eprintln!(
+                eprint_line!(
                     "grasm: the replay ended with {left} record(s) unread — the \
                      program stopped earlier than the run being replayed"
                 );
@@ -534,6 +552,9 @@ pub fn check_exhausted() {
         }
     });
 }
+
+#[cfg(test)]
+extern crate std;
 
 #[cfg(test)]
 mod tests {
@@ -582,9 +603,9 @@ mod tests {
         ];
         let raw = super::framed(&records);
         let dir = std::env::temp_dir().join(format!("grasm_journal_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        grasm_sys::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("j");
-        std::fs::write(&path, &raw).unwrap();
+        grasm_sys::fs::write(&path, &raw).unwrap();
         let back = super::read(path.as_os_str()).expect("reads");
         assert_eq!(back.len(), 2);
         assert_eq!(back[0].0, "now_millis");

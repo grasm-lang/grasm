@@ -828,7 +828,7 @@ fn run() -> ExitCode {
             } else {
                 48
             };
-            let records = match grasm_journal::read(std::ffi::OsStr::new(path.as_str())) {
+            let records = match grasm_journal::read(path.as_str()) {
                 Ok(r) => r,
                 Err(e) => {
                     eprintln!("grasm: cannot read {path}: {e}");
@@ -1700,7 +1700,12 @@ fn print_trace(program: &Program, trace: &[grasm_interp::Frame]) {
 // Native builds (`grasm build --native`)
 // ---------------------------------------------------------------------------
 
-/// Locates `libgrasm_rt.a`, which native builds link against.
+/// Locates `libgrasm_rt_abi.a`, which native builds link against.
+///
+/// Not `libgrasm_rt.a`: the runtime is an rlib now, and the archive is the
+/// crate that adds what a `no_std` program must have exactly one of -- the
+/// allocator and the panic handler. `libgrasm_rt.a` is still accepted, for an
+/// installation laid down by an older release.
 ///
 /// Checked in the order a real installation makes sensible, so a downloaded
 /// release, a `make install` layout, and a cargo checkout all work without
@@ -1720,8 +1725,13 @@ fn find_runtime() -> Result<PathBuf, String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let dir = exe.parent().ok_or("cannot locate the grasm binary")?;
     let candidates = [
-        dir.join("libgrasm_rt.a"),              // release archive, cargo target
-        dir.join("../lib/grasm/libgrasm_rt.a"), // bin/ + lib/ install layout
+        dir.join("libgrasm_rt_abi.a"),              // release archive, cargo target
+        dir.join("../lib/grasm/libgrasm_rt_abi.a"), // bin/ + lib/ install layout
+        dir.join("lib/libgrasm_rt_abi.a"),
+        dir.join("../lib/libgrasm_rt_abi.a"),
+        // An installation from before the runtime was split.
+        dir.join("libgrasm_rt.a"),
+        dir.join("../lib/grasm/libgrasm_rt.a"),
         dir.join("lib/libgrasm_rt.a"),
         dir.join("../lib/libgrasm_rt.a"),
     ];
@@ -1731,7 +1741,7 @@ fn find_runtime() -> Result<PathBuf, String> {
         }
     }
     Err(format!(
-        "cannot find the Grasm runtime (libgrasm_rt.a).\n\
+        "cannot find the Grasm runtime (libgrasm_rt_abi.a).\n\
          \n\
          Looked next to `{}` and in ../lib.\n\
          \n\

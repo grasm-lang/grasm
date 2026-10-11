@@ -15,3 +15,7 @@ license.workspace = true
 #
 # No dependencies, for the same reason `grasm_rt` has none.
 [dependencies]
+# The operating system, so this crate can be `no_std` too -- it links into
+# every compiled program, and one `std` crate among the three keeps `std`'s
+# 135 KB symboliser in all of them.
+grasm_sys = { path = "../grasm_sys" }

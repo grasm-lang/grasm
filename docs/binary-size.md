@@ -118,3 +118,47 @@ with 37 `std` uses between them, against `grasm_rt`'s 11,030 and 295. Most are
 which now have a `no_std` implementation in `grasm_rt` to call -- plus
 `std::panic` 5, which is the one thing with no `no_std` equivalent and needs
 reading before it is replaced.
+
+## 68.3 KB, measured (2026-10-11)
+
+All four crates a compiled program links are `no_std` -- `grasm_sys`,
+`grasm_journal`, `grasm_fiber`, `grasm_rt` -- and the archive they link
+through, `grasm_rt_abi`, supplies the allocator and the panic handler.
+
+| | |
+|---|---:|
+| hello-world, before | 351.1 KB |
+| hello-world, `no_std` | **68.3 KB** |
+| G5's target | 300 KB |
+
+`nm` on the archive: 315 `grasm_*` entry points present, **zero**
+`gimli`/`addr2line`/`rust_panic` symbols. The archive itself went from 21 MB
+to 4.7 MB. The probe predicted "under 100 KB"; the measurement is 68.3.
+
+**What this does not yet say.** One program ran correctly. Roughly 2,100 lines
+of new syscall code -- `fs`, `net`, `process`, `thread`, `io`, `tls`, `sync`
+-- have not been through the gates. Every hazard that code was written around
+is one that fails under load or on large input rather than at compile time, so
+the number above is a measurement and not yet a result.
+
+### The four things that only appeared at the end
+
+- **A `#[panic_handler]` cannot live in `grasm_rt`**, because `grasm_interp`
+  links it as an rlib and `std` already supplies one. Hence `grasm_rt_abi`: a
+  staticlib-only crate, never linked into anything with `std`, holding the two
+  items a program must have exactly one of. `grasm_rt` is an rlib now and
+  `find_runtime` looks for `libgrasm_rt_abi.a` first, still accepting the old
+  name.
+- **`panic = "abort"` is now required rather than chosen.** The note in
+  `Cargo.toml` recording that it saved only 1 KB was measured while `std` was
+  still linked; a `no_std` crate has no unwinder and the compiler refuses to
+  build one that could unwind.
+- **`core` has no floating-point maths.** `sqrt`, `powf`, `floor` and 19 more
+  are libm calls that only `std` declares. `grasm_sys::math` declares them and
+  puts them on `f64` as a trait, so no call site changed. libm's `round` is
+  halves-away-from-zero, which is what `std` did and what [L-LIB-ROUND]
+  requires -- a different rule there would move every money column in the
+  corpus.
+- **The allocator must honour over-aligned requests.** `malloc` promises 16
+  bytes; anything stricter goes through `posix_memalign`, and a `realloc` of
+  such a block copies by hand because `realloc` cannot promise the alignment.

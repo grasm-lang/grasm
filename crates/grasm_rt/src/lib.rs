@@ -14,6 +14,8 @@ extern crate alloc;
 extern crate grasm_sys;
 
 use crate::io::Write;
+// `core` has no float maths; these come from libm (grasm_sys::math).
+use grasm_sys::math::Float as _;
 
 // What `std`'s prelude gave for free. `alloc` owns the growable types; `core`
 // owns everything that does not allocate. Nothing here needs an operating
