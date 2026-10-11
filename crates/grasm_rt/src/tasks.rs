@@ -12,7 +12,7 @@
 //! and handing it back. The table is a root, like the `ref` slab, and is
 //! released before the leak check counts.
 
-use std::collections::VecDeque;
+use alloc::collections::VecDeque;
 use crate::sync::Mutex;
 
 use crate::{dec, inc, none_val, rt_panic, some_of, RtPayload, RtVal, LOCAL, STACK_BUDGET};
@@ -211,7 +211,7 @@ unsafe fn run_task(f: *mut RtVal) {
     let env = crate::grasm_fn_env(f);
     // Safety: a task is a closure the compiler lifted with no parameters and
     // no result, which takes its environment and consumes that reference.
-    let body: extern "C" fn(*mut RtVal) = std::mem::transmute(code as usize);
+    let body: extern "C" fn(*mut RtVal) = core::mem::transmute(code as usize);
     body(env);
     dec(f);
 }

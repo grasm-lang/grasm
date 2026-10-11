@@ -383,6 +383,327 @@ mod io {
     }
 }
 
+/// `std::net`, narrowed to the TCP and UDP this runtime offers.
+///
+/// Addresses are resolved with `getaddrinfo`, because the host comes from
+/// Grasm code and may be a name rather than a literal address -- which is
+/// also what `std` does underneath.
+mod net {
+    use crate::io::{errno, Error, Result, EINTR};
+    use alloc::vec::Vec;
+
+    pub const AF_INET: i32 = 2;
+    pub const SOCK_STREAM: i32 = 1;
+    pub const SOCK_DGRAM: i32 = 2;
+
+    #[cfg(target_os = "macos")]
+    pub const SOL_SOCKET: i32 = 0xffff;
+    #[cfg(not(target_os = "macos"))]
+    pub const SOL_SOCKET: i32 = 1;
+    #[cfg(target_os = "macos")]
+    pub const SO_REUSEADDR: i32 = 0x0004;
+    #[cfg(not(target_os = "macos"))]
+    pub const SO_REUSEADDR: i32 = 2;
+    pub const IPPROTO_TCP: i32 = 6;
+    #[cfg(target_os = "macos")]
+    pub const TCP_NODELAY: i32 = 0x01;
+    #[cfg(not(target_os = "macos"))]
+    pub const TCP_NODELAY: i32 = 1;
+
+    #[cfg(target_os = "macos")]
+    const O_NONBLOCK: i32 = 0x0004;
+    #[cfg(not(target_os = "macos"))]
+    const O_NONBLOCK: i32 = 0o4000;
+    const F_GETFL: i32 = 3;
+    const F_SETFL: i32 = 4;
+
+    // `addrinfo` is the trap in this module: macOS puts `canonname` before
+    // `addr` and Linux puts it after. Reading the wrong one gives a pointer
+    // to a string where a socket address is expected.
+    #[cfg(target_os = "macos")]
+    #[repr(C)]
+    struct AddrInfo {
+        flags: i32,
+        family: i32,
+        socktype: i32,
+        protocol: i32,
+        addrlen: u32,
+        canonname: *const u8,
+        addr: *const u8,
+        next: *const AddrInfo,
+    }
+    #[cfg(not(target_os = "macos"))]
+    #[repr(C)]
+    struct AddrInfo {
+        flags: i32,
+        family: i32,
+        socktype: i32,
+        protocol: i32,
+        addrlen: u32,
+        addr: *const u8,
+        canonname: *const u8,
+        next: *const AddrInfo,
+    }
+
+    extern "C" {
+        fn socket(domain: i32, kind: i32, protocol: i32) -> i32;
+        fn bind(fd: i32, addr: *const u8, len: u32) -> i32;
+        fn listen(fd: i32, backlog: i32) -> i32;
+        fn accept(fd: i32, addr: *mut u8, len: *mut u32) -> i32;
+        fn connect(fd: i32, addr: *const u8, len: u32) -> i32;
+        fn send(fd: i32, buf: *const u8, n: usize, flags: i32) -> isize;
+        fn recv(fd: i32, buf: *mut u8, n: usize, flags: i32) -> isize;
+        fn sendto(fd: i32, buf: *const u8, n: usize, flags: i32, addr: *const u8, alen: u32) -> isize;
+        fn recvfrom(fd: i32, buf: *mut u8, n: usize, flags: i32, addr: *mut u8, alen: *mut u32) -> isize;
+        fn setsockopt(fd: i32, level: i32, name: i32, value: *const u8, len: u32) -> i32;
+        fn shutdown(fd: i32, how: i32) -> i32;
+        fn close(fd: i32) -> i32;
+        fn fcntl(fd: i32, cmd: i32, arg: i32) -> i32;
+        fn getaddrinfo(host: *const u8, service: *const u8, hint: *const AddrInfo, out: *mut *const AddrInfo) -> i32;
+        fn freeaddrinfo(at: *const AddrInfo);
+    }
+
+    fn c_str(text: &str) -> Vec<u8> {
+        let mut owned = Vec::with_capacity(text.len() + 1);
+        owned.extend_from_slice(text.as_bytes());
+        owned.push(0);
+        owned
+    }
+
+    /// The resolved bytes of one socket address, copied out before
+    /// `freeaddrinfo` takes the list back.
+    pub struct Addr {
+        bytes: Vec<u8>,
+        family: i32,
+    }
+
+    pub fn resolve(host: &str, port: u16) -> Result<Addr> {
+        let (h, p) = (c_str(host), c_str(&alloc::format!("{port}")));
+        let hint = AddrInfo {
+            flags: 0,
+            family: 0,
+            socktype: SOCK_STREAM,
+            protocol: 0,
+            addrlen: 0,
+            addr: core::ptr::null(),
+            canonname: core::ptr::null(),
+            next: core::ptr::null(),
+        };
+        let mut found: *const AddrInfo = core::ptr::null();
+        let r = unsafe { getaddrinfo(h.as_ptr(), p.as_ptr(), &hint, &mut found) };
+        if r != 0 || found.is_null() {
+            // `getaddrinfo` reports through its own return value, not errno.
+            return Err(Error::from_raw_os_error(crate::io::ENOENT));
+        }
+        let addr = unsafe {
+            let len = (*found).addrlen as usize;
+            Addr {
+                bytes: core::slice::from_raw_parts((*found).addr, len).to_vec(),
+                family: (*found).family,
+            }
+        };
+        unsafe { freeaddrinfo(found) };
+        Ok(addr)
+    }
+
+    fn check(r: i32) -> Result<()> {
+        if r < 0 {
+            Err(Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn set_opt(fd: i32, level: i32, name: i32, on: bool) -> Result<()> {
+        let value: i32 = on as i32;
+        check(unsafe {
+            setsockopt(
+                fd,
+                level,
+                name,
+                &value as *const i32 as *const u8,
+                core::mem::size_of::<i32>() as u32,
+            )
+        })
+    }
+
+    pub struct Socket {
+        fd: i32,
+    }
+
+    impl Socket {
+        pub fn as_raw_fd(&self) -> i32 {
+            self.fd
+        }
+
+        /// Takes the descriptor out without closing it, for the caller that
+        /// stores raw descriptors of its own.
+        pub fn into_raw_fd(self) -> i32 {
+            let fd = self.fd;
+            core::mem::forget(self);
+            fd
+        }
+
+        pub unsafe fn from_raw_fd(fd: i32) -> Socket {
+            Socket { fd }
+        }
+
+        pub fn set_nonblocking(&self, on: bool) -> Result<()> {
+            let flags = unsafe { fcntl(self.fd, F_GETFL, 0) };
+            if flags < 0 {
+                return Err(Error::last_os_error());
+            }
+            let want = if on {
+                flags | O_NONBLOCK
+            } else {
+                flags & !O_NONBLOCK
+            };
+            check(unsafe { fcntl(self.fd, F_SETFL, want) })
+        }
+
+        pub fn set_nodelay(&self, on: bool) -> Result<()> {
+            set_opt(self.fd, IPPROTO_TCP, TCP_NODELAY, on)
+        }
+
+        pub fn read(&self, into: &mut [u8]) -> Result<usize> {
+            loop {
+                let n = unsafe { recv(self.fd, into.as_mut_ptr(), into.len(), 0) };
+                if n >= 0 {
+                    return Ok(n as usize);
+                }
+                if errno() != EINTR {
+                    return Err(Error::last_os_error());
+                }
+            }
+        }
+
+        pub fn write_all(&self, bytes: &[u8]) -> Result<()> {
+            let mut done = 0;
+            while done < bytes.len() {
+                let n = unsafe {
+                    send(self.fd, bytes[done..].as_ptr(), bytes.len() - done, 0)
+                };
+                if n > 0 {
+                    done += n as usize;
+                } else if n < 0 && errno() == EINTR {
+                    continue;
+                } else {
+                    return Err(Error::last_os_error());
+                }
+            }
+            Ok(())
+        }
+
+        pub fn shutdown_both(&self) -> Result<()> {
+            check(unsafe { shutdown(self.fd, 2) })
+        }
+
+        pub fn accept(&self) -> Result<Socket> {
+            loop {
+                let fd = unsafe {
+                    accept(self.fd, core::ptr::null_mut(), core::ptr::null_mut())
+                };
+                if fd >= 0 {
+                    return Ok(Socket { fd });
+                }
+                if errno() != EINTR {
+                    return Err(Error::last_os_error());
+                }
+            }
+        }
+
+        pub fn send_to(&self, bytes: &[u8], to: &Addr) -> Result<usize> {
+            let n = unsafe {
+                sendto(
+                    self.fd,
+                    bytes.as_ptr(),
+                    bytes.len(),
+                    0,
+                    to.bytes.as_ptr(),
+                    to.bytes.len() as u32,
+                )
+            };
+            if n < 0 {
+                Err(Error::last_os_error())
+            } else {
+                Ok(n as usize)
+            }
+        }
+
+        pub fn recv_from(&self, into: &mut [u8]) -> Result<usize> {
+            let mut from = [0u8; 128];
+            let mut flen = from.len() as u32;
+            loop {
+                let n = unsafe {
+                    recvfrom(
+                        self.fd,
+                        into.as_mut_ptr(),
+                        into.len(),
+                        0,
+                        from.as_mut_ptr(),
+                        &mut flen,
+                    )
+                };
+                if n >= 0 {
+                    return Ok(n as usize);
+                }
+                if errno() != EINTR {
+                    return Err(Error::last_os_error());
+                }
+            }
+        }
+    }
+
+    impl Drop for Socket {
+        fn drop(&mut self) {
+            unsafe { close(self.fd) };
+        }
+    }
+
+    fn open_socket(kind: i32, family: i32) -> Result<Socket> {
+        let fd = unsafe { socket(family, kind, 0) };
+        if fd < 0 {
+            Err(Error::last_os_error())
+        } else {
+            Ok(Socket { fd })
+        }
+    }
+
+    /// `SO_REUSEADDR` before `bind`, as `std` sets it: without it a listener
+    /// cannot be restarted until the kernel releases the port.
+    pub fn listen_on(host: &str, port: u16) -> Result<Socket> {
+        let addr = resolve(host, port)?;
+        let sock = open_socket(SOCK_STREAM, addr.family)?;
+        set_opt(sock.fd, SOL_SOCKET, SO_REUSEADDR, true)?;
+        check(unsafe { bind(sock.fd, addr.bytes.as_ptr(), addr.bytes.len() as u32) })?;
+        check(unsafe { listen(sock.fd, 1024) })?;
+        Ok(sock)
+    }
+
+    pub fn connect_to(host: &str, port: u16) -> Result<Socket> {
+        let addr = resolve(host, port)?;
+        let sock = open_socket(SOCK_STREAM, addr.family)?;
+        loop {
+            let r = unsafe {
+                connect(sock.fd, addr.bytes.as_ptr(), addr.bytes.len() as u32)
+            };
+            if r >= 0 {
+                return Ok(sock);
+            }
+            if errno() != EINTR {
+                return Err(Error::last_os_error());
+            }
+        }
+    }
+
+    pub fn udp_on(host: &str, port: u16) -> Result<Socket> {
+        let addr = resolve(host, port)?;
+        let sock = open_socket(SOCK_DGRAM, addr.family)?;
+        check(unsafe { bind(sock.fd, addr.bytes.as_ptr(), addr.bytes.len() as u32) })?;
+        Ok(sock)
+    }
+}
+
 /// `std::fs`, narrowed to what this runtime calls.
 ///
 /// Only the ten entry points the runtime uses, and `read_dir` gives names
@@ -415,6 +736,7 @@ mod fs {
     pub const SEEK_END: i32 = 2;
 
     const EEXIST: i32 = 17;
+    const F_OK: i32 = 0;
 
     extern "C" {
         fn open(path: *const u8, flags: i32, mode: u32) -> i32;
@@ -430,6 +752,7 @@ mod fs {
         fn sys_rename(from: *const u8, to: *const u8) -> i32;
         fn unlink(path: *const u8) -> i32;
         fn mkdir(path: *const u8, mode: u32) -> i32;
+        fn access(path: *const u8, mode: i32) -> i32;
         fn opendir(path: *const u8) -> *mut u8;
         fn closedir(dir: *mut u8) -> i32;
     }
@@ -699,6 +1022,13 @@ mod fs {
             }
         }
         Ok(())
+    }
+
+    /// `Path::exists`, which is one `access` call and does not need the
+    /// file opened.
+    pub fn exists(path: &str) -> bool {
+        let at = c_path(path);
+        unsafe { access(at.as_ptr(), F_OK) == 0 }
     }
 
     pub struct Metadata {
@@ -3734,11 +4064,11 @@ pub extern "C" fn grasm_live_allocations() -> i64 {
 /// nothing else here uses.
 #[no_mangle]
 pub extern "C" fn grasm_check_leaks() {
-    if std::env::var_os("GRASM_ALLOC_STATS").is_some() {
+    if crate::sys::env_var("GRASM_ALLOC_STATS").is_some() {
         let made = LOCAL.with(|l| l.allocated.get()) + ESCAPED_ALLOCS.load(Relaxed);
         eprintln!("allocations: {made}");
     }
-    if std::env::var_os("GRASM_LEAK_CHECK").is_none() {
+    if crate::sys::env_var("GRASM_LEAK_CHECK").is_none() {
         return;
     }
     // Everything the shared heap still holds is released first. A `ref` the
@@ -10716,7 +11046,7 @@ pub unsafe extern "C" fn grasm_file_exists(path: *mut RtVal) -> i8 {
     if let Some(replay::Wire::Bool(b)) = replay::gate("file_exists") {
         return i8::from(b);
     }
-    let there = std::path::Path::new(as_str(path)).exists();
+    let there = crate::fs::exists(as_str(path));
     if replay::recording() {
         replay::put("file_exists", &replay::Wire::Bool(there));
     }
@@ -11297,7 +11627,7 @@ pub unsafe extern "C" fn grasm_env(name: *mut RtVal) -> *mut RtVal {
 }
 
 unsafe fn grasm_env_now(name: *mut RtVal) -> *mut RtVal {
-    match std::env::var(as_str(name)) {
+    match crate::sys::env_var(as_str(name)).ok_or(()) {
         Ok(v) => some_of(alloc(RtPayload::Str(RtStr::new(v)))),
         Err(_) => none_val(),
     }
