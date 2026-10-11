@@ -10075,7 +10075,6 @@ fn listener_put(l: crate::net::Socket) -> crate::io::Result<i64> {
 
 /// One connection from a listener; when `ready`, without waiting for one.
 fn accept_from(l: &crate::net::Socket, ready: bool) -> Result<crate::net::Socket, String> {
-    use std::os::fd::AsRawFd;
     loop {
         match l.accept() {
             // Accepted from a non-blocking listener, a stream inherits the
@@ -10434,7 +10433,6 @@ fn socket_set(wanted: &[i64]) -> Result<Vec<alloc::sync::Arc<Socket>>, String> {
 
 #[cfg(unix)]
 fn socket_fds(held: &[alloc::sync::Arc<Socket>]) -> Vec<i32> {
-    use std::os::fd::AsRawFd;
     held.iter()
         .map(|s| match &**s {
             Socket::Listener(l) => l.as_raw_fd(),
@@ -10713,7 +10711,6 @@ pub unsafe extern "C" fn grasm_tcp_read(handle: *mut RtVal) -> *mut RtVal {
 }
 
 unsafe fn grasm_tcp_read_now(handle: *mut RtVal) -> *mut RtVal {
-    use std::io::Read;
     let h = match &(*handle).payload {
         RtPayload::I64(n) => *n,
         _ => return err_of(io_err("IoFailed", "handle must be an integer".to_string())),
@@ -10764,7 +10761,6 @@ pub unsafe extern "C" fn grasm_random_bytes(count: *mut RtVal) -> *mut RtVal {
 }
 
 unsafe fn grasm_random_bytes_now(count: *mut RtVal) -> *mut RtVal {
-    use std::io::Read;
     let n = match &(*count).payload {
         RtPayload::I64(v) => *v,
         _ => return err_of(io_err("IoFailed", "count must be an integer".to_string())),
@@ -10814,7 +10810,6 @@ pub unsafe extern "C" fn grasm_tcp_read_bytes(handle: *mut RtVal) -> *mut RtVal 
 }
 
 unsafe fn grasm_tcp_read_bytes_now(handle: *mut RtVal) -> *mut RtVal {
-    use std::io::Read;
     let h = match &(*handle).payload {
         RtPayload::I64(n) => *n,
         _ => return err_of(io_err("IoFailed", "handle must be an integer".to_string())),
@@ -11668,7 +11663,6 @@ unsafe fn grasm_read_bytes_at_now(
     offset: *mut RtVal,
     count: *mut RtVal,
 ) -> *mut RtVal {
-    use std::io::{Read, Seek, SeekFrom};
     let p = as_str(path).to_string();
     let (RtPayload::I64(off), RtPayload::I64(want)) = (&(*offset).payload, &(*count).payload)
     else {
@@ -11686,7 +11680,7 @@ unsafe fn grasm_read_bytes_at_now(
     }
     match crate::fs::File::open(&p) {
         Ok(mut f) => {
-            if let Err(e) = f.seek(SeekFrom::Start(off as u64)) {
+            if let Err(e) = f.seek(crate::fs::SEEK_SET, off as i64) {
                 return err_of(io_err("IoFailed", e.to_string()));
             }
             let mut buf = vec![0u8; want as usize];
@@ -11928,8 +11922,7 @@ pub extern "C" fn grasm_now_millis() -> i64 {
     if let Some(replay::Wire::Int(v)) = replay::gate("now_millis") {
         return v;
     }
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    let now = Ok::<_, ()>(crate::sys::unix_time())
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
     if replay::recording() {
@@ -12026,7 +12019,6 @@ unsafe fn grasm_env_now(name: *mut RtVal) -> *mut RtVal {
 
 #[no_mangle]
 pub extern "C" fn grasm_exit(code: i64) {
-    use std::io::Write as _;
     let _ = crate::io::stdout().flush();
     // The low eight bits, which is what an operating system reports and what
     // C's `exit` does with the same number. Clamping to 0..=255 instead made
