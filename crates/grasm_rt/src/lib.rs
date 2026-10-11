@@ -8,6 +8,7 @@
 //! interned UTF-8 name/data blobs the compiler embedded. Callers outside that
 //! contract are not supported.
 #![no_std]
+#![allow(clippy::missing_safety_doc)]
 extern crate alloc;
 
 // What `std`'s prelude gave for free. `alloc` owns the growable types; `core`
@@ -21,7 +22,111 @@ use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
 
-#![allow(clippy::missing_safety_doc)]
+/// `thread_local!` without `std`.
+///
+/// `std`'s macro is the only thing in this runtime that cannot be renamed to
+/// `core` or `alloc`, because thread-local storage needs the operating
+/// system. POSIX already provides it, and this runtime already calls POSIX
+/// directly for `poll`, `kqueue` and `mmap`, so this follows that pattern
+/// rather than taking a dependency.
+///
+/// macOS and Linux are the targets (`crates/grasm_rt` names no other), and
+/// both have pthreads.
+mod tls {
+    use alloc::boxed::Box;
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    #[cfg(target_os = "macos")]
+    pub type Key = u64;
+    #[cfg(not(target_os = "macos"))]
+    pub type Key = u32;
+
+    extern "C" {
+        fn pthread_key_create(k: *mut Key, dtor: Option<unsafe extern "C" fn(*mut u8)>) -> i32;
+        fn pthread_key_delete(k: Key) -> i32;
+        fn pthread_getspecific(k: Key) -> *mut u8;
+        fn pthread_setspecific(k: Key, v: *const u8) -> i32;
+    }
+
+    /// One value per thread, made on first use and dropped when the thread
+    /// ends -- which is what `pthread_key_create`'s destructor is for, and
+    /// what keeps this equivalent to the macro it replaces.
+    pub struct Local<T: 'static> {
+        /// The pthread key plus one, so that zero can mean "not yet made".
+        key: AtomicU64,
+        init: fn() -> T,
+    }
+
+    // Safety: the `T` never lives in this struct. It lives in thread-local
+    // storage, where exactly one thread can reach it, so `T` need not be
+    // `Sync` for the handle to be shared -- the same reasoning `std`'s own
+    // `LocalKey` uses.
+    unsafe impl<T: 'static> Sync for Local<T> {}
+
+    impl<T: 'static> Local<T> {
+        pub const fn new(init: fn() -> T) -> Local<T> {
+            Local { key: AtomicU64::new(0), init }
+        }
+
+        /// The key, made once. Two threads racing both make one; the loser
+        /// deletes its own and takes the winner's, so no key leaks and every
+        /// thread agrees which one holds the value.
+        fn key(&self) -> Key {
+            let seen = self.key.load(Ordering::Acquire);
+            if seen != 0 {
+                return (seen - 1) as Key;
+            }
+            let mut fresh: Key = 0;
+            unsafe {
+                pthread_key_create(&mut fresh, Some(drop_in_place::<T>));
+            }
+            match self.key.compare_exchange(
+                0,
+                fresh as u64 + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => fresh,
+                Err(won) => {
+                    unsafe { pthread_key_delete(fresh) };
+                    (won - 1) as Key
+                }
+            }
+        }
+
+        pub fn with<R>(&self, f: impl FnOnce(&T) -> R) -> R {
+            let k = self.key();
+            let mut at = unsafe { pthread_getspecific(k) } as *mut T;
+            if at.is_null() {
+                at = Box::into_raw(Box::new((self.init)()));
+                unsafe { pthread_setspecific(k, at as *const u8) };
+            }
+            // Safety: just made or previously made by this thread, and only
+            // this thread can reach it.
+            f(unsafe { &*at })
+        }
+    }
+
+    /// Run by pthreads when a thread that used this key ends.
+    unsafe extern "C" fn drop_in_place<T>(at: *mut u8) {
+        if !at.is_null() {
+            drop(Box::from_raw(at as *mut T));
+        }
+    }
+}
+
+/// The shape `std`'s macro accepts, over `tls::Local`. The `const { … }` form
+/// is taken and the braces dropped: the initialiser is run on first use here
+/// rather than folded at compile time, which costs one branch per thread.
+macro_rules! thread_local {
+    ($($(#[$m:meta])* $v:vis static $N:ident: $T:ty = const { $e:expr };)+) => {
+        $($(#[$m])* $v static $N: $crate::tls::Local<$T> = $crate::tls::Local::new(|| $e);)+
+    };
+    ($($(#[$m:meta])* $v:vis static $N:ident: $T:ty = $e:expr;)+) => {
+        $($(#[$m])* $v static $N: $crate::tls::Local<$T> = $crate::tls::Local::new(|| $e);)+
+    };
+}
+
 
 use std::io::Write;
 
