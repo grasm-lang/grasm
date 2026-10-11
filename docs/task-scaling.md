@@ -47,6 +47,26 @@ A per-channel **FIFO wait queue**: a blocked task joins the queue, and a send
 or receive wakes exactly one. That turns a round from O(live) into
 O(runnable) for real.
 
+### The corpus cost, counted (2026-10-11)
+
+"A corpus-wide diff" above was an estimate, and it is wrong. Counted across
+`apps`, `examples`, `packages`, `projects`, `spec/conformance` and
+`benchmarks`: **eleven programs use `concurrent` at all, and three have more
+than one `go`**. Those three are `E-SCHEDULE.gr`, `E-DEADLOCK.gr` and
+`E-CONCURRENT.gr` -- the conformance tests whose job is to pin the rule a
+queue would change.
+
+No application, package, example or benchmark anywhere has two tasks. So the
+blast radius is three tests that exist to encode the behaviour, which is
+exactly what a spec change should have to update, and nothing else.
+
+`E-SCHEDULE` is also listed **experimental** in `spec/stability.md`, so
+changing it is permitted by the project's own policy rather than a break.
+
+What stands is the spec question -- the clause says "the next task, in the
+order the `go`s ran", and a queue would make it the order they blocked -- plus
+the 16 KB a task that puts 1M at 16 GB. Neither is a corpus problem.
+
 The reason it is not done here is that it changes **which** task proceeds.
 Today the round-robin order decides; a queue would decide by arrival. Both are
 deterministic, so [E-SCHEDULE] survives either way -- but the *observable
