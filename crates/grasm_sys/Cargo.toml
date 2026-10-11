@@ -1,0 +1,9 @@
+[package]
+name = "grasm_sys"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# No dependencies, and this is the crate where that rule is absolute: it is
+# the bottom of the stack, and everything above it links whatever it links.
+[dependencies]

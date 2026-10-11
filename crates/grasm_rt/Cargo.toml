@@ -8,6 +8,9 @@ license.workspace = true
 crate-type = ["staticlib", "rlib"]
 
 [dependencies]
+# The operating system layer, shared with every other crate a compiled
+# program links. See its own doc comment for why it is a separate crate.
+grasm_sys = { path = "../grasm_sys" }
 # The journal format, shared with the interpreter and the browser build.
 grasm_journal = { path = "../grasm_journal" }
 # Stacks and the context switch concurrent tasks run on.

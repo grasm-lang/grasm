@@ -1,0 +1,2110 @@
+//! The operating system, for every crate that needs it.
+//!
+//! This exists because `grasm_rt` is not the only crate a compiled program
+//! links. `grasm_journal` and `grasm_fiber` link too, and `grasm_rt` depends
+//! on both, so neither can call back into it -- but all three need the same
+//! `fs`, `io`, `process` and `env`. Putting that layer underneath all of them
+//! is what lets every one of them be `no_std`, which is what the 135 KB of
+//! `std`'s backtrace symboliser costs if even one of them is not
+//! (docs/binary-size.md).
+#![no_std]
+#![allow(clippy::missing_safety_doc)]
+extern crate alloc;
+
+use alloc::borrow::ToOwned;
+use alloc::boxed::Box;
+use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::vec;
+use alloc::vec::Vec;
+
+/// `thread_local!` without `std`.
+///
+/// `std`'s macro is the only thing in this runtime that cannot be renamed to
+/// `core` or `alloc`, because thread-local storage needs the operating
+/// system. POSIX already provides it, and this runtime already calls POSIX
+/// directly for `poll`, `kqueue` and `mmap`, so this follows that pattern
+/// rather than taking a dependency.
+///
+/// macOS and Linux are the targets (`crates/grasm_rt` names no other), and
+/// both have pthreads.
+pub mod tls {
+    use alloc::boxed::Box;
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    #[cfg(target_os = "macos")]
+    pub type Key = u64;
+    #[cfg(not(target_os = "macos"))]
+    pub type Key = u32;
+
+    extern "C" {
+        fn pthread_key_create(k: *mut Key, dtor: Option<unsafe extern "C" fn(*mut u8)>) -> i32;
+        fn pthread_key_delete(k: Key) -> i32;
+        fn pthread_getspecific(k: Key) -> *mut u8;
+        fn pthread_setspecific(k: Key, v: *const u8) -> i32;
+    }
+
+    /// One value per thread, made on first use and dropped when the thread
+    /// ends -- which is what `pthread_key_create`'s destructor is for, and
+    /// what keeps this equivalent to the macro it replaces.
+    pub struct Local<T: 'static> {
+        /// The pthread key plus one, so that zero can mean "not yet made".
+        key: AtomicU64,
+        init: fn() -> T,
+    }
+
+    // Safety: the `T` never lives in this struct. It lives in thread-local
+    // storage, where exactly one thread can reach it, so `T` need not be
+    // `Sync` for the handle to be shared -- the same reasoning `std`'s own
+    // `LocalKey` uses.
+    unsafe impl<T: 'static> Sync for Local<T> {}
+
+    impl<T: 'static> Local<T> {
+        pub const fn new(init: fn() -> T) -> Local<T> {
+            Local { key: AtomicU64::new(0), init }
+        }
+
+        /// The key, made once. Two threads racing both make one; the loser
+        /// deletes its own and takes the winner's, so no key leaks and every
+        /// thread agrees which one holds the value.
+        fn key(&self) -> Key {
+            let seen = self.key.load(Ordering::Acquire);
+            if seen != 0 {
+                return (seen - 1) as Key;
+            }
+            let mut fresh: Key = 0;
+            unsafe {
+                pthread_key_create(&mut fresh, Some(drop_in_place::<T>));
+            }
+            match self.key.compare_exchange(
+                0,
+                fresh as u64 + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => fresh,
+                Err(won) => {
+                    unsafe { pthread_key_delete(fresh) };
+                    (won - 1) as Key
+                }
+            }
+        }
+
+        pub fn with<R>(&self, f: impl FnOnce(&T) -> R) -> R {
+            let k = self.key();
+            let mut at = unsafe { pthread_getspecific(k) } as *mut T;
+            if at.is_null() {
+                at = Box::into_raw(Box::new((self.init)()));
+                unsafe { pthread_setspecific(k, at as *const u8) };
+            }
+            // Safety: just made or previously made by this thread, and only
+            // this thread can reach it.
+            f(unsafe { &*at })
+        }
+    }
+
+    /// Run by pthreads when a thread that used this key ends.
+    unsafe extern "C" fn drop_in_place<T>(at: *mut u8) {
+        if !at.is_null() {
+            drop(Box::from_raw(at as *mut T));
+        }
+    }
+}
+
+/// `std::io`, as much of it as this runtime uses.
+///
+/// The shapes are deliberately the ones `std` has -- `stdout().lock()`, a
+/// `Write` trait, `Error::last_os_error()`, `ErrorKind` -- so that converting
+/// the runtime is a change of import and not a rewrite of every call site.
+///
+/// **Buffering is the part that matters.** `std`'s stdout is buffered and
+/// flushed when the process ends. Raw `write(2)` is neither, and Grasm's four
+/// engines have to agree byte for byte, so dropping the buffer would change
+/// how output interleaves with stderr and show up as a difftest failure
+/// rather than a compile error. So: buffered here too, and `sys::exit` flushes
+/// before it exits, which is what `std` was doing for us.
+pub mod io {
+    use crate::sync::{Guard, Mutex};
+    use alloc::string::String;
+    use alloc::vec::Vec;
+    use core::fmt;
+
+    #[cfg(target_os = "macos")]
+    extern "C" {
+        #[link_name = "__error"]
+        fn errno_at() -> *mut i32;
+    }
+    #[cfg(not(target_os = "macos"))]
+    extern "C" {
+        #[link_name = "__errno_location"]
+        fn errno_at() -> *mut i32;
+    }
+
+    extern "C" {
+        fn write(fd: i32, buf: *const u8, n: usize) -> isize;
+        fn read(fd: i32, buf: *mut u8, n: usize) -> isize;
+        fn strerror(code: i32) -> *const u8;
+        fn strlen(s: *const u8) -> usize;
+    }
+
+    pub const EINTR: i32 = 4;
+    #[cfg(target_os = "macos")]
+    pub const EAGAIN: i32 = 35;
+    #[cfg(not(target_os = "macos"))]
+    pub const EAGAIN: i32 = 11;
+    pub const ENOENT: i32 = 2;
+    #[cfg(target_os = "macos")]
+    pub const EILSEQ: i32 = 92;
+    #[cfg(not(target_os = "macos"))]
+    pub const EILSEQ: i32 = 84;
+
+    pub fn errno() -> i32 {
+        unsafe { *errno_at() }
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub enum ErrorKind {
+        NotFound,
+        Interrupted,
+        WouldBlock,
+        Other,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    pub struct Error(i32);
+
+    pub type Result<T> = core::result::Result<T, Error>;
+
+    impl Error {
+        pub fn last_os_error() -> Error {
+            Error(errno())
+        }
+
+        pub fn from_raw_os_error(code: i32) -> Error {
+            Error(code)
+        }
+
+        pub fn raw_os_error(&self) -> Option<i32> {
+            Some(self.0)
+        }
+
+        pub fn kind(&self) -> ErrorKind {
+            match self.0 {
+                ENOENT => ErrorKind::NotFound,
+                EINTR => ErrorKind::Interrupted,
+                EAGAIN => ErrorKind::WouldBlock,
+                _ => ErrorKind::Other,
+            }
+        }
+    }
+
+    impl fmt::Display for Error {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            // `strerror` gives the same text `std` prints for an errno, which
+            // keeps error messages identical across this conversion.
+            let at = unsafe { strerror(self.0) };
+            if at.is_null() {
+                return write!(f, "os error {}", self.0);
+            }
+            let len = unsafe { strlen(at) };
+            let bytes = unsafe { core::slice::from_raw_parts(at, len) };
+            match core::str::from_utf8(bytes) {
+                Ok(text) => f.write_str(text),
+                Err(_) => write!(f, "os error {}", self.0),
+            }
+        }
+    }
+
+    /// `write(2)` can return short or be interrupted, so neither is a failure
+    /// until the loop cannot make progress.
+    fn write_fully(fd: i32, bytes: &[u8]) -> Result<()> {
+        let mut done = 0;
+        while done < bytes.len() {
+            let n = unsafe { write(fd, bytes[done..].as_ptr(), bytes.len() - done) };
+            if n > 0 {
+                done += n as usize;
+            } else if n < 0 && errno() == EINTR {
+                continue;
+            } else {
+                return Err(Error::last_os_error());
+            }
+        }
+        Ok(())
+    }
+
+    pub trait Write {
+        fn write_all(&mut self, bytes: &[u8]) -> Result<()>;
+        fn flush(&mut self) -> Result<()>;
+
+        /// What `write!` and `writeln!` call.
+        fn write_fmt(&mut self, args: fmt::Arguments<'_>) -> Result<()> {
+            // `core::fmt` hands out `&str` pieces and reports only that
+            // something failed, so the errno is carried out of the adapter by
+            // hand rather than lost.
+            struct Adapt<'a, W: Write + ?Sized>(&'a mut W, Result<()>);
+            impl<W: Write + ?Sized> fmt::Write for Adapt<'_, W> {
+                fn write_str(&mut self, piece: &str) -> fmt::Result {
+                    match self.0.write_all(piece.as_bytes()) {
+                        Ok(()) => Ok(()),
+                        Err(e) => {
+                            self.1 = Err(e);
+                            Err(fmt::Error)
+                        }
+                    }
+                }
+            }
+            let mut adapt = Adapt(self, Ok(()));
+            match fmt::write(&mut adapt, args) {
+                Ok(()) => Ok(()),
+                Err(_) => adapt.1,
+            }
+        }
+    }
+
+    /// 8 KiB, which is what `std` uses for a `BufWriter`.
+    const BUF: usize = 8192;
+
+    static OUT: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+    static ERR: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+
+    pub struct Stream {
+        fd: i32,
+        held: Guard<'static, Vec<u8>>,
+    }
+
+    impl Write for Stream {
+        fn write_all(&mut self, bytes: &[u8]) -> Result<()> {
+            // A write larger than the buffer goes straight out rather than
+            // growing the buffer to hold it.
+            if self.held.len() + bytes.len() > BUF {
+                let pending = core::mem::take(&mut *self.held);
+                if !pending.is_empty() {
+                    write_fully(self.fd, &pending)?;
+                }
+                if bytes.len() >= BUF {
+                    return write_fully(self.fd, bytes);
+                }
+            }
+            self.held.extend_from_slice(bytes);
+            Ok(())
+        }
+
+        fn flush(&mut self) -> Result<()> {
+            if self.held.is_empty() {
+                return Ok(());
+            }
+            let pending = core::mem::take(&mut *self.held);
+            write_fully(self.fd, &pending)
+        }
+    }
+
+    /// Stderr is unbuffered in `std`, and is here too: a message written just
+    /// before a crash has to be out before the crash.
+    impl Drop for Stream {
+        fn drop(&mut self) {
+            if self.fd == 2 {
+                let _ = self.flush();
+            }
+        }
+    }
+
+    pub struct Handle {
+        fd: i32,
+    }
+
+    impl Handle {
+        pub fn lock(&self) -> Stream {
+            Stream {
+                fd: self.fd,
+                held: if self.fd == 1 { OUT.lock() } else { ERR.lock() },
+            }
+        }
+
+        pub fn flush(&self) -> Result<()> {
+            self.lock().flush()
+        }
+    }
+
+    pub fn stdout() -> Handle {
+        Handle { fd: 1 }
+    }
+
+    pub fn stderr() -> Handle {
+        Handle { fd: 2 }
+    }
+
+    /// Called by `sys::exit`, because nothing else will: `std` flushed stdout
+    /// when the process ended and raw file descriptors do not.
+    pub fn flush_all() {
+        let _ = stdout().flush();
+        let _ = stderr().flush();
+    }
+
+    /// One line from stdin, newline included, as `BufRead::read_line` gives
+    /// it. Unbuffered -- the runtime reads lines rarely and a buffer here
+    /// would have to be shared with anything else reading fd 0.
+    pub fn read_line(into: &mut String) -> Result<usize> {
+        let mut got = 0;
+        let mut byte = [0u8; 1];
+        // Bytes first, then one UTF-8 check. Pushing `byte as char` would
+        // read each byte as a codepoint, which turns every multi-byte
+        // character into mojibake -- and would only show up as a difftest
+        // failure on non-ASCII input.
+        let mut held: Vec<u8> = Vec::new();
+        loop {
+            let n = unsafe { read(0, byte.as_mut_ptr(), 1) };
+            if n == 0 {
+                break;
+            }
+            if n < 0 {
+                if errno() == EINTR {
+                    continue;
+                }
+                return Err(Error::last_os_error());
+            }
+            got += 1;
+            held.push(byte[0]);
+            if byte[0] == b'\n' {
+                break;
+            }
+        }
+        match core::str::from_utf8(&held) {
+            Ok(text) => {
+                into.push_str(text);
+                Ok(got)
+            }
+            // Invalid UTF-8, which `std` reports as `InvalidData`.
+            Err(_) => Err(Error::from_raw_os_error(EILSEQ)),
+        }
+    }
+}
+
+/// Subprocesses: `fork`, `execvp`, `waitpid`, and pipes.
+///
+/// Two hazards decide the shape of this module, and both are the kind that
+/// works in testing and fails in production.
+///
+/// **Nothing is allocated between `fork` and `exec`.** This runtime has
+/// threads -- `par_map` and the network workers -- and `fork` gives the child
+/// one thread while leaving every lock as it was. If another thread held
+/// `malloc`'s lock at the moment of the fork, the child deadlocks the first
+/// time it allocates. So every C string and pointer array is built before the
+/// fork, and the child calls only `dup2`, `close`, `execvp` and `_exit`, all
+/// of which are async-signal-safe.
+///
+/// **Two pipes are drained together, not one after the other.** Reading
+/// stdout to the end before touching stderr deadlocks as soon as the child
+/// writes more to stderr than its pipe buffer holds -- 64 KiB on Linux. The
+/// child blocks writing, the parent blocks reading, and neither moves. So
+/// both descriptors go through one `poll` loop.
+pub mod process {
+    use crate::io::{errno, Error, Result, EINTR};
+    use alloc::string::String;
+    use alloc::vec::Vec;
+
+    const POLLIN: i16 = 0x0001;
+
+    #[repr(C)]
+    struct PollFd {
+        fd: i32,
+        wanted: i16,
+        got: i16,
+    }
+
+    extern "C" {
+        fn pipe(into: *mut i32) -> i32;
+        fn fork() -> i32;
+        fn dup2(from: i32, to: i32) -> i32;
+        fn close(fd: i32) -> i32;
+        fn execvp(file: *const u8, argv: *const *const u8) -> i32;
+        fn _exit(code: i32) -> !;
+        fn waitpid(pid: i32, status: *mut i32, flags: i32) -> i32;
+        fn read(fd: i32, buf: *mut u8, n: usize) -> isize;
+        fn write(fd: i32, buf: *const u8, n: usize) -> isize;
+        fn poll(fds: *mut PollFd, n: u32, timeout: i32) -> i32;
+        fn fcntl(fd: i32, cmd: i32, arg: i32) -> i32;
+        fn kill(pid: i32, signal: i32) -> i32;
+    }
+
+    const F_SETFD: i32 = 2;
+    const FD_CLOEXEC: i32 = 1;
+    pub const SIGKILL: i32 = 9;
+
+    pub fn stop(pid: i32) {
+        unsafe { kill(pid, SIGKILL) };
+    }
+
+    /// The argument vector, owned, so that the child between `fork` and
+    /// `exec` only reads pointers that already exist.
+    struct Argv {
+        _owned: Vec<Vec<u8>>,
+        pointers: Vec<*const u8>,
+    }
+
+    fn argv_of(program: &str, args: &[String]) -> Argv {
+        let mut owned = Vec::with_capacity(args.len() + 1);
+        let mut one = Vec::with_capacity(program.len() + 1);
+        one.extend_from_slice(program.as_bytes());
+        one.push(0);
+        owned.push(one);
+        for arg in args {
+            let mut next = Vec::with_capacity(arg.len() + 1);
+            next.extend_from_slice(arg.as_bytes());
+            next.push(0);
+            owned.push(next);
+        }
+        let mut pointers: Vec<*const u8> =
+            owned.iter().map(|a| a.as_ptr()).collect();
+        // `execvp` reads until it sees a null, so the array must end with one.
+        pointers.push(core::ptr::null());
+        Argv { _owned: owned, pointers }
+    }
+
+    pub struct Pipe {
+        pub reader: i32,
+        pub writer: i32,
+    }
+
+    /// Both ends are marked close-on-exec, which is what makes a pipeline
+    /// terminate. A child inherits every open descriptor, so without this
+    /// the second stage would hold the first stage's writer open and the
+    /// first stage's reader would never see end of file -- a pipeline that
+    /// hangs instead of finishing. `dup2` clears the flag on the descriptor
+    /// it makes, so the child still gets its own 0, 1 and 2.
+    pub fn new_pipe() -> Result<Pipe> {
+        let mut ends = [0i32; 2];
+        if unsafe { pipe(ends.as_mut_ptr()) } < 0 {
+            return Err(Error::last_os_error());
+        }
+        for fd in ends {
+            unsafe { fcntl(fd, F_SETFD, FD_CLOEXEC) };
+        }
+        Ok(Pipe { reader: ends[0], writer: ends[1] })
+    }
+
+    pub fn shut(fd: i32) {
+        if fd >= 0 {
+            unsafe { close(fd) };
+        }
+    }
+
+    /// Forks and execs. `stdin`, `stdout` and `stderr` replace the child's
+    /// own when given. Every other descriptor is already close-on-exec, so
+    /// the child keeps nothing else.
+    pub fn start(
+        program: &str,
+        args: &[String],
+        stdin: Option<i32>,
+        stdout: Option<i32>,
+        stderr: Option<i32>,
+    ) -> Result<i32> {
+        // Before the fork, while allocating is still safe.
+        let argv = argv_of(program, args);
+        let pid = unsafe { fork() };
+        if pid < 0 {
+            return Err(Error::last_os_error());
+        }
+        if pid == 0 {
+            unsafe {
+                if let Some(fd) = stdin {
+                    dup2(fd, 0);
+                }
+                if let Some(fd) = stdout {
+                    dup2(fd, 1);
+                }
+                if let Some(fd) = stderr {
+                    dup2(fd, 2);
+                }
+                execvp(argv.pointers[0], argv.pointers.as_ptr());
+                // Only reached if `execvp` failed. 127 is what a shell
+                // reports for a command it could not run.
+                _exit(127)
+            }
+        }
+        Ok(pid)
+    }
+
+    /// The exit code, or -1 for a signal -- which is what the caller already
+    /// treats as "no status a process can exit with".
+    pub fn wait_for(pid: i32) -> Result<i64> {
+        let mut status = 0i32;
+        loop {
+            let r = unsafe { waitpid(pid, &mut status, 0) };
+            if r >= 0 {
+                break;
+            }
+            if errno() != EINTR {
+                return Err(Error::last_os_error());
+            }
+        }
+        // The low seven bits hold the signal, the next eight the exit code,
+        // which is what `WIFEXITED` and `WEXITSTATUS` read.
+        if status & 0x7f == 0 {
+            Ok(((status >> 8) & 0xff) as i64)
+        } else {
+            Ok(-1)
+        }
+    }
+
+    pub fn write_and_close(fd: i32, bytes: &[u8]) {
+        let mut done = 0;
+        while done < bytes.len() {
+            let n = unsafe {
+                write(fd, bytes[done..].as_ptr(), bytes.len() - done)
+            };
+            if n > 0 {
+                done += n as usize;
+            } else if n < 0 && errno() == EINTR {
+                continue;
+            } else {
+                // A child that exited without reading leaves nowhere to put
+                // the rest, which is not this function's problem to report.
+                break;
+            }
+        }
+        shut(fd);
+    }
+
+    /// Both descriptors in one `poll` loop, so neither pipe can fill while
+    /// the other is being read. Each is closed as it reaches end of file.
+    pub fn drain_both(mut out: i32, mut err: i32) -> (Vec<u8>, Vec<u8>) {
+        let mut got_out = Vec::new();
+        let mut got_err = Vec::new();
+        let mut chunk = [0u8; 8192];
+        while out >= 0 || err >= 0 {
+            let mut watching: Vec<PollFd> = Vec::with_capacity(2);
+            if out >= 0 {
+                watching.push(PollFd { fd: out, wanted: POLLIN, got: 0 });
+            }
+            if err >= 0 {
+                watching.push(PollFd { fd: err, wanted: POLLIN, got: 0 });
+            }
+            let r = unsafe {
+                poll(watching.as_mut_ptr(), watching.len() as u32, -1)
+            };
+            if r < 0 {
+                if errno() == EINTR {
+                    continue;
+                }
+                break;
+            }
+            for watched in &watching {
+                if watched.got == 0 {
+                    continue;
+                }
+                let n = unsafe {
+                    read(watched.fd, chunk.as_mut_ptr(), chunk.len())
+                };
+                let into = if watched.fd == out {
+                    &mut got_out
+                } else {
+                    &mut got_err
+                };
+                if n > 0 {
+                    into.extend_from_slice(&chunk[..n as usize]);
+                } else if n == 0 || errno() != EINTR {
+                    // End of file, or an error that will not clear. Either
+                    // way this descriptor is finished.
+                    shut(watched.fd);
+                    if watched.fd == out {
+                        out = -1;
+                    } else {
+                        err = -1;
+                    }
+                }
+            }
+        }
+        (got_out, got_err)
+    }
+
+    /// `Command::new(p).args(a).output()`.
+    pub fn run(program: &str, args: &[String]) -> Result<(i64, Vec<u8>, Vec<u8>)> {
+        let out = new_pipe()?;
+        let err = match new_pipe() {
+            Ok(p) => p,
+            Err(e) => {
+                shut(out.reader);
+                shut(out.writer);
+                return Err(e);
+            }
+        };
+        let pid = start(
+            program,
+            args,
+            None,
+            Some(out.writer),
+            Some(err.writer),
+        );
+        // The parent holds no writer: while it does, the reader never sees
+        // end of file even after the child exits.
+        shut(out.writer);
+        shut(err.writer);
+        let pid = match pid {
+            Ok(pid) => pid,
+            Err(e) => {
+                shut(out.reader);
+                shut(err.reader);
+                return Err(e);
+            }
+        };
+        let (got_out, got_err) = drain_both(out.reader, err.reader);
+        let code = wait_for(pid)?;
+        Ok((code, got_out, got_err))
+    }
+}
+
+/// `std::thread`, over pthreads.
+///
+/// The piece that matters is `scope`. `par_map` spawns closures holding `&mut`
+/// into slices on the caller's stack, so **every thread must be joined before
+/// `scope` returns** or those borrows outlive the frame they point into. The
+/// joining lives in a `Drop`, not at the end of the function body, so it also
+/// happens on a path out that is not the normal one.
+///
+/// A `no_std` crate cannot unwind -- `#[panic_handler]` returns `!` -- so
+/// there is no such path today. The guard does not depend on that staying
+/// true.
+pub mod thread {
+    use alloc::boxed::Box;
+    use alloc::string::String;
+    use alloc::vec::Vec;
+    use core::cell::UnsafeCell;
+    use core::marker::PhantomData;
+    use core::num::NonZeroUsize;
+    use core::time::Duration;
+
+    #[cfg(target_os = "macos")]
+    pub type Handle = *mut u8;
+    #[cfg(not(target_os = "macos"))]
+    pub type Handle = usize;
+
+    #[repr(C, align(16))]
+    struct RawAttr([u8; 128]);
+
+    #[repr(C)]
+    struct TimeSpec {
+        secs: i64,
+        nanos: i64,
+    }
+
+    extern "C" {
+        fn pthread_create(
+            out: *mut Handle,
+            attr: *const u8,
+            body: extern "C" fn(*mut u8) -> *mut u8,
+            arg: *mut u8,
+        ) -> i32;
+        fn pthread_join(handle: Handle, out: *mut *mut u8) -> i32;
+        fn pthread_detach(handle: Handle) -> i32;
+        fn pthread_attr_init(attr: *mut u8) -> i32;
+        fn pthread_attr_destroy(attr: *mut u8) -> i32;
+        fn pthread_attr_setstacksize(attr: *mut u8, size: usize) -> i32;
+        fn nanosleep(wait: *const TimeSpec, left: *mut TimeSpec) -> i32;
+        fn sysconf(name: i32) -> i64;
+    }
+
+    #[cfg(target_os = "macos")]
+    extern "C" {
+        fn pthread_setname_np(name: *const u8) -> i32;
+    }
+    #[cfg(not(target_os = "macos"))]
+    extern "C" {
+        fn pthread_self() -> Handle;
+        fn pthread_setname_np(who: Handle, name: *const u8) -> i32;
+    }
+
+    #[cfg(target_os = "macos")]
+    const SC_NPROCESSORS_ONLN: i32 = 58;
+    #[cfg(not(target_os = "macos"))]
+    const SC_NPROCESSORS_ONLN: i32 = 84;
+
+    /// What `pthread_create` is given: the closure, plus the name to set from
+    /// inside the new thread. The name is set there because macOS's
+    /// `pthread_setname_np` only names the calling thread.
+    struct Start {
+        body: Box<dyn FnOnce() + Send>,
+        name: Option<String>,
+    }
+
+    extern "C" fn run(arg: *mut u8) -> *mut u8 {
+        // Safety: `arg` is the `Box<Start>` leaked by `spawn_raw`, handed to
+        // exactly one thread, and taken back here exactly once.
+        let start = unsafe { Box::from_raw(arg as *mut Start) };
+        if let Some(name) = &start.name {
+            let mut owned = Vec::with_capacity(name.len() + 1);
+            owned.extend_from_slice(name.as_bytes());
+            owned.push(0);
+            #[cfg(target_os = "macos")]
+            unsafe {
+                pthread_setname_np(owned.as_ptr())
+            };
+            #[cfg(not(target_os = "macos"))]
+            unsafe {
+                pthread_setname_np(pthread_self(), owned.as_ptr())
+            };
+        }
+        (start.body)();
+        core::ptr::null_mut()
+    }
+
+    fn spawn_raw(
+        body: Box<dyn FnOnce() + Send>,
+        name: Option<String>,
+        stack: Option<usize>,
+    ) -> Option<Handle> {
+        let start = Box::into_raw(Box::new(Start { body, name })) as *mut u8;
+        let mut handle: Handle = unsafe { core::mem::zeroed() };
+        let made = match stack {
+            Some(size) => unsafe {
+                let mut attr = RawAttr([0; 128]);
+                let at = &mut attr as *mut RawAttr as *mut u8;
+                pthread_attr_init(at);
+                pthread_attr_setstacksize(at, size);
+                let r = pthread_create(&mut handle, at, run, start);
+                pthread_attr_destroy(at);
+                r
+            },
+            None => unsafe {
+                pthread_create(&mut handle, core::ptr::null(), run, start)
+            },
+        };
+        if made != 0 {
+            // The thread was never made, so nothing will take the box back.
+            drop(unsafe { Box::from_raw(start as *mut Start) });
+            return None;
+        }
+        Some(handle)
+    }
+
+    pub struct JoinHandle {
+        handle: Handle,
+        joined: bool,
+    }
+
+    impl JoinHandle {
+        pub fn join(mut self) -> Result<(), ()> {
+            self.joined = true;
+            let mut out = core::ptr::null_mut();
+            if unsafe { pthread_join(self.handle, &mut out) } == 0 {
+                Ok(())
+            } else {
+                Err(())
+            }
+        }
+    }
+
+    /// An unjoined thread is detached rather than leaked, so the system can
+    /// reclaim its stack when it ends.
+    impl Drop for JoinHandle {
+        fn drop(&mut self) {
+            if !self.joined {
+                unsafe { pthread_detach(self.handle) };
+            }
+        }
+    }
+
+    pub fn spawn<F: FnOnce() + Send + 'static>(body: F) -> Option<JoinHandle> {
+        spawn_raw(Box::new(body), None, None).map(|handle| JoinHandle {
+            handle,
+            joined: false,
+        })
+    }
+
+    pub fn sleep(how_long: Duration) {
+        let wait = TimeSpec {
+            secs: how_long.as_secs() as i64,
+            nanos: how_long.subsec_nanos() as i64,
+        };
+        // A signal can cut the sleep short; `left` says how much remains, so
+        // the loop finishes the wait rather than returning early.
+        let mut left = TimeSpec { secs: 0, nanos: 0 };
+        let mut at = &wait as *const TimeSpec;
+        while unsafe { nanosleep(at, &mut left) } != 0 {
+            if crate::io::errno() != crate::io::EINTR {
+                return;
+            }
+            at = &left as *const TimeSpec;
+        }
+    }
+
+    pub fn available_parallelism() -> Option<NonZeroUsize> {
+        let n = unsafe { sysconf(SC_NPROCESSORS_ONLN) };
+        if n > 0 {
+            NonZeroUsize::new(n as usize)
+        } else {
+            None
+        }
+    }
+
+    /// `PhantomData<&'scope mut &'scope ()>` makes `'scope` invariant, which
+    /// is what stops a borrow taken inside the closure from being passed out
+    /// of it. A covariant marker would let the lifetime shrink and the
+    /// guarantee with it.
+    pub struct Scope<'scope> {
+        running: UnsafeCell<Vec<Handle>>,
+        _scope: PhantomData<&'scope mut &'scope ()>,
+    }
+
+    impl<'scope> Scope<'scope> {
+        pub fn spawn<F: FnOnce() + Send + 'scope>(&'scope self, body: F) {
+            self.spawn_named(body, None, None);
+        }
+
+        fn spawn_named<F: FnOnce() + Send + 'scope>(
+            &'scope self,
+            body: F,
+            name: Option<String>,
+            stack: Option<usize>,
+        ) -> bool {
+            // Safety: the closure borrows for `'scope`, and `scope` joins
+            // every thread before `'scope` ends, so the borrow cannot outlive
+            // what it points at. Erasing the lifetime is what `pthread_create`
+            // needs and what that join pays for.
+            let erased: Box<dyn FnOnce() + Send> =
+                unsafe { core::mem::transmute(Box::new(body) as Box<dyn FnOnce() + Send + 'scope>) };
+            match spawn_raw(erased, name, stack) {
+                Some(handle) => {
+                    // Safety: `Scope` is not `Sync`, so only the thread that
+                    // made it reaches this.
+                    unsafe { (*self.running.get()).push(handle) };
+                    true
+                }
+                None => false,
+            }
+        }
+    }
+
+    /// Joins in `Drop` so it happens on every path out of `scope`, not only
+    /// the one that reaches the end of the body.
+    struct JoinAtEnd<'a, 'scope>(&'a Scope<'scope>);
+
+    impl Drop for JoinAtEnd<'_, '_> {
+        fn drop(&mut self) {
+            let running = unsafe { &mut *self.0.running.get() };
+            for handle in running.drain(..) {
+                let mut out = core::ptr::null_mut();
+                unsafe { pthread_join(handle, &mut out) };
+            }
+        }
+    }
+
+    pub fn scope<'env, R>(body: impl FnOnce(&'env Scope<'env>) -> R) -> R {
+        let held = Scope {
+            running: UnsafeCell::new(Vec::new()),
+            _scope: PhantomData,
+        };
+        // Safety: `held` outlives `join`, which outlives the call below, so
+        // the reference handed to the body is valid for as long as the body
+        // can use it -- and every thread it spawned is joined when `join` is
+        // dropped, before this function returns.
+        let borrowed: &'env Scope<'env> = unsafe { core::mem::transmute(&held) };
+        let _join = JoinAtEnd(&held);
+        body(borrowed)
+    }
+
+    pub struct Builder {
+        name: Option<String>,
+        stack: Option<usize>,
+    }
+
+    impl Builder {
+        pub fn new() -> Builder {
+            Builder { name: None, stack: None }
+        }
+
+        pub fn name(mut self, name: String) -> Builder {
+            self.name = Some(name);
+            self
+        }
+
+        pub fn stack_size(mut self, size: usize) -> Builder {
+            self.stack = Some(size);
+            self
+        }
+
+        pub fn spawn_scoped<'scope, F: FnOnce() + Send + 'scope>(
+            self,
+            scope: &'scope Scope<'scope>,
+            body: F,
+        ) -> Result<(), ()> {
+            if scope.spawn_named(body, self.name, self.stack) {
+                Ok(())
+            } else {
+                Err(())
+            }
+        }
+    }
+
+    impl Default for Builder {
+        fn default() -> Builder {
+            Builder::new()
+        }
+    }
+}
+
+/// `std::net`, narrowed to the TCP and UDP this runtime offers.
+///
+/// Addresses are resolved with `getaddrinfo`, because the host comes from
+/// Grasm code and may be a name rather than a literal address -- which is
+/// also what `std` does underneath.
+pub mod net {
+    use crate::io::{errno, Error, Result, EINTR};
+    use alloc::string::String;
+    use alloc::vec::Vec;
+
+    pub const AF_INET: i32 = 2;
+    pub const SOCK_STREAM: i32 = 1;
+    pub const SOCK_DGRAM: i32 = 2;
+
+    #[cfg(target_os = "macos")]
+    pub const SOL_SOCKET: i32 = 0xffff;
+    #[cfg(not(target_os = "macos"))]
+    pub const SOL_SOCKET: i32 = 1;
+    #[cfg(target_os = "macos")]
+    pub const SO_REUSEADDR: i32 = 0x0004;
+    #[cfg(not(target_os = "macos"))]
+    pub const SO_REUSEADDR: i32 = 2;
+    pub const IPPROTO_TCP: i32 = 6;
+    #[cfg(target_os = "macos")]
+    pub const TCP_NODELAY: i32 = 0x01;
+    #[cfg(not(target_os = "macos"))]
+    pub const TCP_NODELAY: i32 = 1;
+
+    #[cfg(target_os = "macos")]
+    const O_NONBLOCK: i32 = 0x0004;
+    #[cfg(not(target_os = "macos"))]
+    const O_NONBLOCK: i32 = 0o4000;
+    const F_GETFL: i32 = 3;
+    const F_SETFL: i32 = 4;
+
+    // `addrinfo` is the trap in this module: macOS puts `canonname` before
+    // `addr` and Linux puts it after. Reading the wrong one gives a pointer
+    // to a string where a socket address is expected.
+    #[cfg(target_os = "macos")]
+    #[repr(C)]
+    struct AddrInfo {
+        flags: i32,
+        family: i32,
+        socktype: i32,
+        protocol: i32,
+        addrlen: u32,
+        canonname: *const u8,
+        addr: *const u8,
+        next: *const AddrInfo,
+    }
+    #[cfg(not(target_os = "macos"))]
+    #[repr(C)]
+    struct AddrInfo {
+        flags: i32,
+        family: i32,
+        socktype: i32,
+        protocol: i32,
+        addrlen: u32,
+        addr: *const u8,
+        canonname: *const u8,
+        next: *const AddrInfo,
+    }
+
+    extern "C" {
+        fn socket(domain: i32, kind: i32, protocol: i32) -> i32;
+        fn bind(fd: i32, addr: *const u8, len: u32) -> i32;
+        fn listen(fd: i32, backlog: i32) -> i32;
+        fn accept(fd: i32, addr: *mut u8, len: *mut u32) -> i32;
+        fn connect(fd: i32, addr: *const u8, len: u32) -> i32;
+        fn send(fd: i32, buf: *const u8, n: usize, flags: i32) -> isize;
+        fn recv(fd: i32, buf: *mut u8, n: usize, flags: i32) -> isize;
+        fn sendto(fd: i32, buf: *const u8, n: usize, flags: i32, addr: *const u8, alen: u32) -> isize;
+        fn recvfrom(fd: i32, buf: *mut u8, n: usize, flags: i32, addr: *mut u8, alen: *mut u32) -> isize;
+        fn setsockopt(fd: i32, level: i32, name: i32, value: *const u8, len: u32) -> i32;
+        fn shutdown(fd: i32, how: i32) -> i32;
+        fn close(fd: i32) -> i32;
+        fn fcntl(fd: i32, cmd: i32, arg: i32) -> i32;
+        fn getaddrinfo(host: *const u8, service: *const u8, hint: *const AddrInfo, out: *mut *const AddrInfo) -> i32;
+        fn freeaddrinfo(at: *const AddrInfo);
+        fn getsockname(fd: i32, addr: *mut u8, len: *mut u32) -> i32;
+        fn getpeername(fd: i32, addr: *mut u8, len: *mut u32) -> i32;
+        fn inet_ntop(family: i32, addr: *const u8, out: *mut u8, len: u32) -> *const u8;
+    }
+
+    pub const AF_INET6: i32 = 30;
+
+    impl Addr {
+        /// The port, and the address as text.
+        ///
+        /// `sin_port` sits at offset 2 in network byte order for IPv4 and
+        /// IPv6 alike, and on both platforms -- macOS splits the family field
+        /// into a length and a family byte, which happens to leave the port
+        /// where Linux has it. The family itself does move, so that is read
+        /// per platform.
+        pub fn parts(&self) -> (String, u16) {
+            if self.bytes.len() < 4 {
+                return (String::new(), 0);
+            }
+            let port = u16::from_be_bytes([self.bytes[2], self.bytes[3]]);
+            #[cfg(target_os = "macos")]
+            let family = self.bytes[1] as i32;
+            #[cfg(not(target_os = "macos"))]
+            let family = u16::from_ne_bytes([self.bytes[0], self.bytes[1]]) as i32;
+            // The address itself starts after the flow info in IPv6 and
+            // straight after the port in IPv4.
+            let (at, want) = match family {
+                f if f == AF_INET6 => (8, 46),
+                _ => (4, 16),
+            };
+            if self.bytes.len() < at {
+                return (String::new(), port);
+            }
+            let mut text = [0u8; 46];
+            let shown = unsafe {
+                inet_ntop(
+                    family,
+                    self.bytes[at..].as_ptr(),
+                    text.as_mut_ptr(),
+                    want as u32,
+                )
+            };
+            if shown.is_null() {
+                return (String::new(), port);
+            }
+            let len = text.iter().position(|&b| b == 0).unwrap_or(0);
+            (
+                core::str::from_utf8(&text[..len])
+                    .unwrap_or("")
+                    .into(),
+                port,
+            )
+        }
+    }
+
+    impl Addr {
+        pub fn port(&self) -> u16 {
+            self.parts().1
+        }
+
+        pub fn ip_text(&self) -> String {
+            self.parts().0
+        }
+    }
+
+    fn name_of(fd: i32, peer: bool) -> Result<Addr> {
+        // Large enough for `sockaddr_in6`, which is the biggest this runtime
+        // can produce.
+        let mut bytes = [0u8; 128];
+        let mut len = bytes.len() as u32;
+        let r = unsafe {
+            if peer {
+                getpeername(fd, bytes.as_mut_ptr(), &mut len)
+            } else {
+                getsockname(fd, bytes.as_mut_ptr(), &mut len)
+            }
+        };
+        if r < 0 {
+            return Err(Error::last_os_error());
+        }
+        Ok(Addr {
+            bytes: bytes[..len as usize].to_vec(),
+            family: 0,
+        })
+    }
+
+    fn c_str(text: &str) -> Vec<u8> {
+        let mut owned = Vec::with_capacity(text.len() + 1);
+        owned.extend_from_slice(text.as_bytes());
+        owned.push(0);
+        owned
+    }
+
+    /// The resolved bytes of one socket address, copied out before
+    /// `freeaddrinfo` takes the list back.
+    pub struct Addr {
+        bytes: Vec<u8>,
+        family: i32,
+    }
+
+    pub fn resolve(host: &str, port: u16) -> Result<Addr> {
+        let (h, p) = (c_str(host), c_str(&alloc::format!("{port}")));
+        let hint = AddrInfo {
+            flags: 0,
+            family: 0,
+            socktype: SOCK_STREAM,
+            protocol: 0,
+            addrlen: 0,
+            addr: core::ptr::null(),
+            canonname: core::ptr::null(),
+            next: core::ptr::null(),
+        };
+        let mut found: *const AddrInfo = core::ptr::null();
+        let r = unsafe { getaddrinfo(h.as_ptr(), p.as_ptr(), &hint, &mut found) };
+        if r != 0 || found.is_null() {
+            // `getaddrinfo` reports through its own return value, not errno.
+            return Err(Error::from_raw_os_error(crate::io::ENOENT));
+        }
+        let addr = unsafe {
+            let len = (*found).addrlen as usize;
+            Addr {
+                bytes: core::slice::from_raw_parts((*found).addr, len).to_vec(),
+                family: (*found).family,
+            }
+        };
+        unsafe { freeaddrinfo(found) };
+        Ok(addr)
+    }
+
+    fn check(r: i32) -> Result<()> {
+        if r < 0 {
+            Err(Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn set_opt(fd: i32, level: i32, name: i32, on: bool) -> Result<()> {
+        let value: i32 = on as i32;
+        check(unsafe {
+            setsockopt(
+                fd,
+                level,
+                name,
+                &value as *const i32 as *const u8,
+                core::mem::size_of::<i32>() as u32,
+            )
+        })
+    }
+
+    pub struct Socket {
+        fd: i32,
+    }
+
+    impl Socket {
+        pub fn as_raw_fd(&self) -> i32 {
+            self.fd
+        }
+
+        /// Takes the descriptor out without closing it, for the caller that
+        /// stores raw descriptors of its own.
+        pub fn into_raw_fd(self) -> i32 {
+            let fd = self.fd;
+            core::mem::forget(self);
+            fd
+        }
+
+        pub unsafe fn from_raw_fd(fd: i32) -> Socket {
+            Socket { fd }
+        }
+
+        pub fn set_nonblocking(&self, on: bool) -> Result<()> {
+            let flags = unsafe { fcntl(self.fd, F_GETFL, 0) };
+            if flags < 0 {
+                return Err(Error::last_os_error());
+            }
+            let want = if on {
+                flags | O_NONBLOCK
+            } else {
+                flags & !O_NONBLOCK
+            };
+            check(unsafe { fcntl(self.fd, F_SETFL, want) })
+        }
+
+        pub fn set_nodelay(&self, on: bool) -> Result<()> {
+            set_opt(self.fd, IPPROTO_TCP, TCP_NODELAY, on)
+        }
+
+        pub fn read(&self, into: &mut [u8]) -> Result<usize> {
+            loop {
+                let n = unsafe { recv(self.fd, into.as_mut_ptr(), into.len(), 0) };
+                if n >= 0 {
+                    return Ok(n as usize);
+                }
+                if errno() != EINTR {
+                    return Err(Error::last_os_error());
+                }
+            }
+        }
+
+        pub fn write_all(&self, bytes: &[u8]) -> Result<()> {
+            let mut done = 0;
+            while done < bytes.len() {
+                let n = unsafe {
+                    send(self.fd, bytes[done..].as_ptr(), bytes.len() - done, 0)
+                };
+                if n > 0 {
+                    done += n as usize;
+                } else if n < 0 && errno() == EINTR {
+                    continue;
+                } else {
+                    return Err(Error::last_os_error());
+                }
+            }
+            Ok(())
+        }
+
+        pub fn local_addr(&self) -> Result<Addr> {
+            name_of(self.fd, false)
+        }
+
+        pub fn peer_addr(&self) -> Result<Addr> {
+            name_of(self.fd, true)
+        }
+
+        pub fn shutdown_both(&self) -> Result<()> {
+            check(unsafe { shutdown(self.fd, 2) })
+        }
+
+        pub fn accept(&self) -> Result<Socket> {
+            loop {
+                let fd = unsafe {
+                    accept(self.fd, core::ptr::null_mut(), core::ptr::null_mut())
+                };
+                if fd >= 0 {
+                    return Ok(Socket { fd });
+                }
+                if errno() != EINTR {
+                    return Err(Error::last_os_error());
+                }
+            }
+        }
+
+        pub fn send_to(&self, bytes: &[u8], to: &Addr) -> Result<usize> {
+            let n = unsafe {
+                sendto(
+                    self.fd,
+                    bytes.as_ptr(),
+                    bytes.len(),
+                    0,
+                    to.bytes.as_ptr(),
+                    to.bytes.len() as u32,
+                )
+            };
+            if n < 0 {
+                Err(Error::last_os_error())
+            } else {
+                Ok(n as usize)
+            }
+        }
+
+        /// The sender comes back with the bytes, because replying to a
+        /// datagram needs it and asking again would ask about a different
+        /// one.
+        pub fn recv_from(&self, into: &mut [u8]) -> Result<(usize, Addr)> {
+            let mut from = [0u8; 128];
+            let mut flen = from.len() as u32;
+            loop {
+                let n = unsafe {
+                    recvfrom(
+                        self.fd,
+                        into.as_mut_ptr(),
+                        into.len(),
+                        0,
+                        from.as_mut_ptr(),
+                        &mut flen,
+                    )
+                };
+                if n >= 0 {
+                    return Ok((
+                        n as usize,
+                        Addr {
+                            bytes: from[..flen as usize].to_vec(),
+                            family: 0,
+                        },
+                    ));
+                }
+                if errno() != EINTR {
+                    return Err(Error::last_os_error());
+                }
+            }
+        }
+    }
+
+    impl Drop for Socket {
+        fn drop(&mut self) {
+            unsafe { close(self.fd) };
+        }
+    }
+
+    fn open_socket(kind: i32, family: i32) -> Result<Socket> {
+        let fd = unsafe { socket(family, kind, 0) };
+        if fd < 0 {
+            Err(Error::last_os_error())
+        } else {
+            Ok(Socket { fd })
+        }
+    }
+
+    /// `SO_REUSEADDR` before `bind`, as `std` sets it: without it a listener
+    /// cannot be restarted until the kernel releases the port.
+    pub fn listen_on(host: &str, port: u16) -> Result<Socket> {
+        let addr = resolve(host, port)?;
+        let sock = open_socket(SOCK_STREAM, addr.family)?;
+        set_opt(sock.fd, SOL_SOCKET, SO_REUSEADDR, true)?;
+        check(unsafe { bind(sock.fd, addr.bytes.as_ptr(), addr.bytes.len() as u32) })?;
+        check(unsafe { listen(sock.fd, 1024) })?;
+        Ok(sock)
+    }
+
+    pub fn connect_to(host: &str, port: u16) -> Result<Socket> {
+        let addr = resolve(host, port)?;
+        let sock = open_socket(SOCK_STREAM, addr.family)?;
+        loop {
+            let r = unsafe {
+                connect(sock.fd, addr.bytes.as_ptr(), addr.bytes.len() as u32)
+            };
+            if r >= 0 {
+                return Ok(sock);
+            }
+            if errno() != EINTR {
+                return Err(Error::last_os_error());
+            }
+        }
+    }
+
+    pub fn udp_on(host: &str, port: u16) -> Result<Socket> {
+        let addr = resolve(host, port)?;
+        let sock = open_socket(SOCK_DGRAM, addr.family)?;
+        check(unsafe { bind(sock.fd, addr.bytes.as_ptr(), addr.bytes.len() as u32) })?;
+        Ok(sock)
+    }
+}
+
+/// `std::fs`, narrowed to what this runtime calls.
+///
+/// Only the ten entry points the runtime uses, and `read_dir` gives names
+/// rather than an iterator of entries because names are all the one caller
+/// wants. Narrowing on purpose: every line here is unsafe code in the crate
+/// every compiled program links.
+pub mod fs {
+    use crate::io::{errno, Error, Result, EINTR};
+    use alloc::string::String;
+    use alloc::vec::Vec;
+
+    pub const O_RDONLY: i32 = 0;
+    pub const O_WRONLY: i32 = 1;
+    pub const O_RDWR: i32 = 2;
+    #[cfg(target_os = "macos")]
+    pub const O_CREAT: i32 = 0x0200;
+    #[cfg(not(target_os = "macos"))]
+    pub const O_CREAT: i32 = 0o100;
+    #[cfg(target_os = "macos")]
+    pub const O_TRUNC: i32 = 0x0400;
+    #[cfg(not(target_os = "macos"))]
+    pub const O_TRUNC: i32 = 0o1000;
+    #[cfg(target_os = "macos")]
+    pub const O_APPEND: i32 = 0x0008;
+    #[cfg(not(target_os = "macos"))]
+    pub const O_APPEND: i32 = 0o2000;
+
+    pub const SEEK_SET: i32 = 0;
+    pub const SEEK_CUR: i32 = 1;
+    pub const SEEK_END: i32 = 2;
+
+    const EEXIST: i32 = 17;
+    const F_OK: i32 = 0;
+
+    extern "C" {
+        fn open(path: *const u8, flags: i32, mode: u32) -> i32;
+        fn close(fd: i32) -> i32;
+        // Named apart from this module's own `read`, `write` and `rename`,
+        // which would otherwise be duplicate definitions.
+        #[link_name = "read"]
+        fn sys_read(fd: i32, buf: *mut u8, n: usize) -> isize;
+        #[link_name = "write"]
+        fn sys_write(fd: i32, buf: *const u8, n: usize) -> isize;
+        fn lseek(fd: i32, at: i64, whence: i32) -> i64;
+        fn fsync(fd: i32) -> i32;
+        #[link_name = "rename"]
+        fn sys_rename(from: *const u8, to: *const u8) -> i32;
+        fn unlink(path: *const u8) -> i32;
+        fn mkdir(path: *const u8, mode: u32) -> i32;
+        fn access(path: *const u8, mode: i32) -> i32;
+        fn opendir(path: *const u8) -> *mut u8;
+        fn closedir(dir: *mut u8) -> i32;
+    }
+
+    // `readdir` is `readdir$INODE64` on macOS, because the original returns
+    // a 32-bit inode and was versioned out.
+    #[cfg(target_os = "macos")]
+    extern "C" {
+        #[link_name = "readdir$INODE64"]
+        fn readdir(dir: *mut u8) -> *const Dirent;
+    }
+    #[cfg(not(target_os = "macos"))]
+    extern "C" {
+        #[link_name = "readdir64"]
+        fn readdir(dir: *mut u8) -> *const Dirent;
+    }
+
+    // Laid out per platform so the compiler works out where `name` starts.
+    // Hardcoding that offset is how this kind of code goes wrong.
+    #[cfg(target_os = "macos")]
+    #[repr(C)]
+    struct Dirent {
+        ino: u64,
+        seekoff: u64,
+        reclen: u16,
+        namlen: u16,
+        kind: u8,
+        name: [u8; 1024],
+    }
+    #[cfg(not(target_os = "macos"))]
+    #[repr(C)]
+    struct Dirent {
+        ino: u64,
+        off: i64,
+        reclen: u16,
+        kind: u8,
+        name: [u8; 256],
+    }
+
+    /// `open` and friends want a NUL-terminated path and Rust strings are not.
+    fn c_path(path: &str) -> Vec<u8> {
+        let mut owned = Vec::with_capacity(path.len() + 1);
+        owned.extend_from_slice(path.as_bytes());
+        owned.push(0);
+        owned
+    }
+
+    fn check(r: i32) -> Result<()> {
+        if r < 0 {
+            Err(Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    pub struct File {
+        fd: i32,
+    }
+
+    impl File {
+        pub fn open(path: &str) -> Result<File> {
+            File::with_flags(path, O_RDONLY, 0)
+        }
+
+        pub fn create(path: &str) -> Result<File> {
+            File::with_flags(path, O_WRONLY | O_CREAT | O_TRUNC, 0o666)
+        }
+
+        pub fn with_flags(path: &str, flags: i32, mode: u32) -> Result<File> {
+            let at = c_path(path);
+            loop {
+                let fd = unsafe { open(at.as_ptr(), flags, mode) };
+                if fd >= 0 {
+                    return Ok(File { fd });
+                }
+                if errno() != EINTR {
+                    return Err(Error::last_os_error());
+                }
+            }
+        }
+
+        pub fn as_raw_fd(&self) -> i32 {
+            self.fd
+        }
+
+        pub fn read(&mut self, into: &mut [u8]) -> Result<usize> {
+            loop {
+                let n = unsafe { sys_read(self.fd, into.as_mut_ptr(), into.len()) };
+                if n >= 0 {
+                    return Ok(n as usize);
+                }
+                if errno() != EINTR {
+                    return Err(Error::last_os_error());
+                }
+            }
+        }
+
+        /// Reads until end of file, which is what `read_to_end` means: a
+        /// single `read` is allowed to return less than asked for, and
+        /// stopping at the first short read is the classic bug here.
+        pub fn read_to_end(&mut self, into: &mut Vec<u8>) -> Result<usize> {
+            let mut got = 0;
+            let mut chunk = [0u8; 8192];
+            loop {
+                let n = self.read(&mut chunk)?;
+                if n == 0 {
+                    return Ok(got);
+                }
+                into.extend_from_slice(&chunk[..n]);
+                got += n;
+            }
+        }
+
+        /// Fills the whole buffer or fails, which is what distinguishes this
+        /// from `read`: a short read is not the end of the data.
+        pub fn read_exact(&mut self, into: &mut [u8]) -> Result<()> {
+            let mut done = 0;
+            while done < into.len() {
+                let n = self.read(&mut into[done..])?;
+                if n == 0 {
+                    // Fewer bytes than asked for and none left to come.
+                    return Err(Error::from_raw_os_error(0));
+                }
+                done += n;
+            }
+            Ok(())
+        }
+
+        pub fn write_all(&mut self, bytes: &[u8]) -> Result<()> {
+            let mut done = 0;
+            while done < bytes.len() {
+                let n = unsafe {
+                    sys_write(self.fd, bytes[done..].as_ptr(), bytes.len() - done)
+                };
+                if n > 0 {
+                    done += n as usize;
+                } else if n < 0 && errno() == EINTR {
+                    continue;
+                } else {
+                    return Err(Error::last_os_error());
+                }
+            }
+            Ok(())
+        }
+
+        /// `sync_all`: the bytes are on the device, not merely accepted.
+        pub fn sync(&mut self) -> Result<()> {
+            check(unsafe { fsync(self.fd) })
+        }
+
+        pub fn seek(&mut self, whence: i32, at: i64) -> Result<u64> {
+            let r = unsafe { lseek(self.fd, at, whence) };
+            if r < 0 {
+                Err(Error::last_os_error())
+            } else {
+                Ok(r as u64)
+            }
+        }
+
+        pub fn len(&mut self) -> Result<u64> {
+            let here = self.seek(SEEK_CUR, 0)?;
+            let end = self.seek(SEEK_END, 0)?;
+            self.seek(SEEK_SET, here as i64)?;
+            Ok(end)
+        }
+    }
+
+    impl Drop for File {
+        fn drop(&mut self) {
+            unsafe { close(self.fd) };
+        }
+    }
+
+    #[derive(Default)]
+    pub struct OpenOptions {
+        read: bool,
+        write: bool,
+        append: bool,
+        create: bool,
+        truncate: bool,
+    }
+
+    impl OpenOptions {
+        pub fn new() -> OpenOptions {
+            OpenOptions::default()
+        }
+        pub fn read(&mut self, on: bool) -> &mut OpenOptions {
+            self.read = on;
+            self
+        }
+        pub fn write(&mut self, on: bool) -> &mut OpenOptions {
+            self.write = on;
+            self
+        }
+        pub fn append(&mut self, on: bool) -> &mut OpenOptions {
+            self.append = on;
+            self
+        }
+        pub fn create(&mut self, on: bool) -> &mut OpenOptions {
+            self.create = on;
+            self
+        }
+        pub fn truncate(&mut self, on: bool) -> &mut OpenOptions {
+            self.truncate = on;
+            self
+        }
+
+        pub fn open(&self, path: &str) -> Result<File> {
+            let mut flags = match (self.read, self.write || self.append) {
+                (true, true) => O_RDWR,
+                (false, true) => O_WRONLY,
+                _ => O_RDONLY,
+            };
+            if self.append {
+                flags |= O_APPEND;
+            }
+            if self.create {
+                flags |= O_CREAT;
+            }
+            if self.truncate {
+                flags |= O_TRUNC;
+            }
+            File::with_flags(path, flags, 0o666)
+        }
+    }
+
+    pub fn read(path: &str) -> Result<Vec<u8>> {
+        let mut file = File::open(path)?;
+        let mut held = Vec::new();
+        file.read_to_end(&mut held)?;
+        Ok(held)
+    }
+
+    pub fn read_to_string(path: &str) -> Result<String> {
+        let bytes = read(path)?;
+        match String::from_utf8(bytes) {
+            Ok(text) => Ok(text),
+            Err(_) => Err(Error::from_raw_os_error(crate::io::EILSEQ)),
+        }
+    }
+
+    pub fn write(path: &str, bytes: &[u8]) -> Result<()> {
+        File::create(path)?.write_all(bytes)
+    }
+
+    pub fn rename(from: &str, to: &str) -> Result<()> {
+        let (a, b) = (c_path(from), c_path(to));
+        check(unsafe { sys_rename(a.as_ptr(), b.as_ptr()) })
+    }
+
+    pub fn remove_file(path: &str) -> Result<()> {
+        let at = c_path(path);
+        check(unsafe { unlink(at.as_ptr()) })
+    }
+
+    /// Each component in turn, treating "it is already there" as success --
+    /// which is what makes this `_all` and not `mkdir`.
+    pub fn create_dir_all(path: &str) -> Result<()> {
+        let mut so_far = String::new();
+        if path.starts_with('/') {
+            so_far.push('/');
+        }
+        for part in path.split('/').filter(|p| !p.is_empty()) {
+            if !so_far.is_empty() && !so_far.ends_with('/') {
+                so_far.push('/');
+            }
+            so_far.push_str(part);
+            let at = c_path(&so_far);
+            let r = unsafe { mkdir(at.as_ptr(), 0o777) };
+            if r < 0 && errno() != EEXIST {
+                return Err(Error::last_os_error());
+            }
+        }
+        Ok(())
+    }
+
+    /// `Path::exists`, which is one `access` call and does not need the
+    /// file opened.
+    pub fn exists(path: &str) -> bool {
+        let at = c_path(path);
+        unsafe { access(at.as_ptr(), F_OK) == 0 }
+    }
+
+    pub struct Metadata {
+        len: u64,
+    }
+
+    impl Metadata {
+        pub fn len(&self) -> u64 {
+            self.len
+        }
+    }
+
+    /// Size by `lseek` on an opened file rather than `stat`. `struct stat`'s
+    /// layout differs between macOS and Linux in ways that are easy to get
+    /// subtly wrong, and size is all the one caller reads. The difference
+    /// this leaves: a file that cannot be opened reports its own error here
+    /// where `stat` would have succeeded.
+    pub fn metadata(path: &str) -> Result<Metadata> {
+        let mut file = File::open(path)?;
+        Ok(Metadata { len: file.len()? })
+    }
+
+    /// Names only, which is what the one caller wants. The directory handle
+    /// is closed on every path out, including the error ones.
+    pub fn read_dir(path: &str) -> Result<Vec<String>> {
+        let at = c_path(path);
+        let dir = unsafe { opendir(at.as_ptr()) };
+        if dir.is_null() {
+            return Err(Error::last_os_error());
+        }
+        let mut names = Vec::new();
+        loop {
+            let entry = unsafe { readdir(dir) };
+            if entry.is_null() {
+                break;
+            }
+            let name_at = unsafe { (*entry).name.as_ptr() };
+            let mut len = 0;
+            while unsafe { *name_at.add(len) } != 0 {
+                len += 1;
+            }
+            let bytes = unsafe { core::slice::from_raw_parts(name_at, len) };
+            // `.` and `..` are entries that `std`'s `read_dir` does not give.
+            if bytes == b"." || bytes == b".." {
+                continue;
+            }
+            names.push(String::from_utf8_lossy(bytes).into_owned());
+        }
+        unsafe { closedir(dir) };
+        Ok(names)
+    }
+}
+
+/// The operating system, called directly.
+///
+/// `core` has no `Instant`, no `exit` and no environment, because none of
+/// them can be had without asking the kernel. It does have
+/// `core::time::Duration`, so that stays.
+pub mod sys {
+    use core::time::Duration;
+
+    pub const CLOCK_REALTIME: i32 = 0;
+    #[cfg(target_os = "macos")]
+    pub const CLOCK_MONOTONIC: i32 = 6;
+    #[cfg(not(target_os = "macos"))]
+    pub const CLOCK_MONOTONIC: i32 = 1;
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    pub struct TimeSpec {
+        pub secs: i64,
+        pub nanos: i64,
+    }
+
+    extern "C" {
+        fn clock_gettime(clock: i32, at: *mut TimeSpec) -> i32;
+        fn getenv(name: *const u8) -> *const u8;
+        fn strlen(s: *const u8) -> usize;
+        #[link_name = "exit"]
+        fn libc_exit(code: i32) -> !;
+        pub fn abort() -> !;
+    }
+
+    /// `std` flushed stdout when the process ended; raw file descriptors do
+    /// not, so anything still in the buffer would be lost. Every exit in this
+    /// runtime goes through here for that reason.
+    pub fn exit(code: i32) -> ! {
+        crate::io::flush_all();
+        unsafe { libc_exit(code) }
+    }
+
+    fn now(clock: i32) -> Duration {
+        let mut at = TimeSpec::default();
+        unsafe { clock_gettime(clock, &mut at) };
+        Duration::new(at.secs as u64, at.nanos as u32)
+    }
+
+    /// Monotonic, so it cannot go backwards when the wall clock is set --
+    /// which is the whole reason to prefer it for measuring.
+    #[derive(Clone, Copy)]
+    pub struct Instant(Duration);
+
+    impl Instant {
+        pub fn now() -> Instant {
+            Instant(now(CLOCK_MONOTONIC))
+        }
+
+        pub fn elapsed(&self) -> Duration {
+            now(CLOCK_MONOTONIC).saturating_sub(self.0)
+        }
+
+        pub fn duration_since(&self, earlier: Instant) -> Duration {
+            self.0.saturating_sub(earlier.0)
+        }
+    }
+
+    /// Wall clock, for the one thing that wants it: seconds since the epoch.
+    pub fn unix_time() -> Duration {
+        now(CLOCK_REALTIME)
+    }
+
+    /// `getenv` gives a pointer into the process environment, valid until
+    /// something calls `setenv`. The runtime only reads, so copying the bytes
+    /// out keeps that from mattering.
+    pub fn env_var(name: &str) -> Option<alloc::string::String> {
+        // `getenv` wants a C string and `name` is a Rust one, so a copy with
+        // a terminator is unavoidable.
+        let mut owned = alloc::vec::Vec::with_capacity(name.len() + 1);
+        owned.extend_from_slice(name.as_bytes());
+        owned.push(0);
+        let at = unsafe { getenv(owned.as_ptr()) };
+        if at.is_null() {
+            return None;
+        }
+        let len = unsafe { strlen(at) };
+        let bytes = unsafe { core::slice::from_raw_parts(at, len) };
+        core::str::from_utf8(bytes).ok().map(alloc::borrow::ToOwned::to_owned)
+    }
+}
+
+/// `Mutex`, `RwLock` and `OnceLock` without `std`.
+///
+/// POSIX again, for the same reason `tls` is: these need the operating
+/// system, and this runtime already calls it directly. No poisoning -- a
+/// panic here calls `exit(101)` rather than unwinding ([E-PANIC-EXIT]), so a
+/// lock can never be left poisoned and `PoisonError` has nothing to report.
+pub mod sync {
+    use core::cell::UnsafeCell;
+    use core::mem::MaybeUninit;
+    use core::ops::{Deref, DerefMut};
+    use core::sync::atomic::{AtomicU8, Ordering};
+
+    // Opaque, and sized generously: macOS wants 64 bytes for a mutex and 200
+    // for an rwlock, glibc 40 and 56. Over-sizing costs bytes in a static and
+    // under-sizing corrupts the heap, so these are the larger of the two
+    // plus room.
+    #[repr(C, align(16))]
+    struct RawLock([u8; 256]);
+
+    extern "C" {
+        fn pthread_mutex_init(m: *mut u8, attr: *const u8) -> i32;
+        fn pthread_mutex_lock(m: *mut u8) -> i32;
+        fn pthread_mutex_unlock(m: *mut u8) -> i32;
+        fn pthread_rwlock_init(l: *mut u8, attr: *const u8) -> i32;
+        fn pthread_rwlock_rdlock(l: *mut u8) -> i32;
+        fn pthread_rwlock_wrlock(l: *mut u8) -> i32;
+        fn pthread_rwlock_unlock(l: *mut u8) -> i32;
+    }
+
+    /// Not started, being started, started. A lock is made once, by whoever
+    /// gets there first; everyone else spins over the handful of
+    /// instructions that takes.
+    const UNSET: u8 = 0;
+    const SETTING: u8 = 1;
+    const READY: u8 = 2;
+
+    pub struct Mutex<T> {
+        raw: UnsafeCell<MaybeUninit<RawLock>>,
+        state: AtomicU8,
+        value: UnsafeCell<T>,
+    }
+
+    unsafe impl<T: Send> Send for Mutex<T> {}
+    unsafe impl<T: Send> Sync for Mutex<T> {}
+
+    impl<T> Mutex<T> {
+        pub const fn new(value: T) -> Mutex<T> {
+            Mutex {
+                raw: UnsafeCell::new(MaybeUninit::uninit()),
+                state: AtomicU8::new(UNSET),
+                value: UnsafeCell::new(value),
+            }
+        }
+
+        fn raw(&self) -> *mut u8 {
+            let at = self.raw.get() as *mut u8;
+            loop {
+                match self.state.compare_exchange(
+                    UNSET,
+                    SETTING,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => {
+                        unsafe { pthread_mutex_init(at, core::ptr::null()) };
+                        self.state.store(READY, Ordering::Release);
+                        return at;
+                    }
+                    Err(READY) => return at,
+                    Err(_) => core::hint::spin_loop(),
+                }
+            }
+        }
+
+        pub fn lock(&self) -> Guard<'_, T> {
+            let at = self.raw();
+            unsafe { pthread_mutex_lock(at) };
+            Guard { at, value: self.value.get(), _held: core::marker::PhantomData }
+        }
+    }
+
+    pub struct Guard<'a, T> {
+        at: *mut u8,
+        value: *mut T,
+        _held: core::marker::PhantomData<&'a T>,
+    }
+
+    impl<T> Deref for Guard<'_, T> {
+        type Target = T;
+        fn deref(&self) -> &T {
+            unsafe { &*self.value }
+        }
+    }
+
+    impl<T> DerefMut for Guard<'_, T> {
+        fn deref_mut(&mut self) -> &mut T {
+            unsafe { &mut *self.value }
+        }
+    }
+
+    impl<T> Drop for Guard<'_, T> {
+        fn drop(&mut self) {
+            unsafe { pthread_mutex_unlock(self.at) };
+        }
+    }
+
+    pub struct RwLock<T> {
+        raw: UnsafeCell<MaybeUninit<RawLock>>,
+        state: AtomicU8,
+        value: UnsafeCell<T>,
+    }
+
+    unsafe impl<T: Send> Send for RwLock<T> {}
+    unsafe impl<T: Send + Sync> Sync for RwLock<T> {}
+
+    impl<T> RwLock<T> {
+        pub const fn new(value: T) -> RwLock<T> {
+            RwLock {
+                raw: UnsafeCell::new(MaybeUninit::uninit()),
+                state: AtomicU8::new(UNSET),
+                value: UnsafeCell::new(value),
+            }
+        }
+
+        fn raw(&self) -> *mut u8 {
+            let at = self.raw.get() as *mut u8;
+            loop {
+                match self.state.compare_exchange(
+                    UNSET,
+                    SETTING,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => {
+                        unsafe { pthread_rwlock_init(at, core::ptr::null()) };
+                        self.state.store(READY, Ordering::Release);
+                        return at;
+                    }
+                    Err(READY) => return at,
+                    Err(_) => core::hint::spin_loop(),
+                }
+            }
+        }
+
+        pub fn read(&self) -> ReadGuard<'_, T> {
+            let at = self.raw();
+            unsafe { pthread_rwlock_rdlock(at) };
+            ReadGuard { at, value: self.value.get(), _held: core::marker::PhantomData }
+        }
+
+        pub fn write(&self) -> Guard<'_, T> {
+            let at = self.raw();
+            unsafe { pthread_rwlock_wrlock(at) };
+            // A write guard unlocks an rwlock, not a mutex, so it cannot be
+            // the `Guard` above: that one calls `pthread_mutex_unlock`.
+            Guard { at, value: self.value.get(), _held: core::marker::PhantomData }
+        }
+    }
+
+    pub struct ReadGuard<'a, T> {
+        at: *mut u8,
+        value: *mut T,
+        _held: core::marker::PhantomData<&'a T>,
+    }
+
+    impl<T> Deref for ReadGuard<'_, T> {
+        type Target = T;
+        fn deref(&self) -> &T {
+            unsafe { &*self.value }
+        }
+    }
+
+    impl<T> Drop for ReadGuard<'_, T> {
+        fn drop(&mut self) {
+            unsafe { pthread_rwlock_unlock(self.at) };
+        }
+    }
+
+    /// Written once, read for ever after. `Mutex` could carry an `Option`
+    /// instead, but every read would then take a lock, and these hold things
+    /// the runtime reads on hot paths.
+    pub struct OnceLock<T> {
+        state: AtomicU8,
+        value: UnsafeCell<MaybeUninit<T>>,
+    }
+
+    unsafe impl<T: Send> Send for OnceLock<T> {}
+    unsafe impl<T: Send + Sync> Sync for OnceLock<T> {}
+
+    impl<T> OnceLock<T> {
+        pub const fn new() -> OnceLock<T> {
+            OnceLock {
+                state: AtomicU8::new(UNSET),
+                value: UnsafeCell::new(MaybeUninit::uninit()),
+            }
+        }
+
+        pub fn get(&self) -> Option<&T> {
+            if self.state.load(Ordering::Acquire) == READY {
+                // Safety: READY is stored with Release after the write
+                // below, so the value is there and never changes again.
+                Some(unsafe { (*self.value.get()).assume_init_ref() })
+            } else {
+                None
+            }
+        }
+
+        pub fn get_or_init(&self, make: impl FnOnce() -> T) -> &T {
+            loop {
+                match self.state.compare_exchange(
+                    UNSET,
+                    SETTING,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => {
+                        let at = self.value.get();
+                        unsafe { (*at).write(make()) };
+                        self.state.store(READY, Ordering::Release);
+                        return unsafe { (*at).assume_init_ref() };
+                    }
+                    Err(READY) => {
+                        return unsafe { (*self.value.get()).assume_init_ref() }
+                    }
+                    // Another thread is running its `make`. It may take a
+                    // while, but a `OnceLock` initialiser here is short and
+                    // this only happens on the first touch.
+                    Err(_) => core::hint::spin_loop(),
+                }
+            }
+        }
+
+        pub fn set(&self, value: T) -> Result<(), T> {
+            match self.state.compare_exchange(
+                UNSET,
+                SETTING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    unsafe { (*self.value.get()).write(value) };
+                    self.state.store(READY, Ordering::Release);
+                    Ok(())
+                }
+                Err(_) => Err(value),
+            }
+        }
+    }
+
+    impl<T> Default for OnceLock<T> {
+        fn default() -> OnceLock<T> {
+            OnceLock::new()
+        }
+    }
+}
+
+/// The shape `std`'s macro accepts, over `tls::Local`. The `const { … }` form
+/// is taken and the braces dropped: the initialiser is run on first use here
+/// rather than folded at compile time, which costs one branch per thread.
+#[macro_export]
+macro_rules! thread_local {
+    ($($(#[$m:meta])* $v:vis static $N:ident: $T:ty = const { $e:expr };)+) => {
+        $($(#[$m])* $v static $N: $crate::tls::Local<$T> = $crate::tls::Local::new(|| $e);)+
+    };
+    ($($(#[$m:meta])* $v:vis static $N:ident: $T:ty = $e:expr;)+) => {
+        $($(#[$m])* $v static $N: $crate::tls::Local<$T> = $crate::tls::Local::new(|| $e);)+
+    };
+}
+
+
+use crate::io::Write;
+
