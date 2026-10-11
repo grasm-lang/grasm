@@ -235,3 +235,32 @@ per-architecture.
 Both found by `difftest`, neither by reading the code, and neither by
 compiling it. After them: **57 programs identical across all four engines, 0
 mismatched, 0 unsupported.**
+
+## The whole conformance suite, compared (2026-10-11)
+
+All 257 programs in `spec/conformance`, interpreted against a native build:
+
+| | |
+|---|---:|
+| agree | **197** |
+| disagree | **0** |
+| negative tests, failing in both engines by design | 60 |
+| failing natively but not interpreted | **0** |
+
+The native stack trace is excluded from the comparison, because
+`docs/northstar.md` records that a `--native` build prints none at all. That
+difference accounts for seven programs -- `E-DIV-ZERO`, `E-POW-NEG`,
+`E-INDEX-BOUNDS`, `E-PANIC-TRACE`, `E-TASK-PANIC`, `E-CHANNEL`, `E-DEADLOCK`
+-- and nothing else differs in any of them once it is set aside.
+
+The 60 that the native backend declines were each re-checked rather than
+assumed: every one of them also fails under `grasm run`, so they are the
+suite's grammar, effect and handler error tests and not a native gap. Zero
+programs compile interpreted and fail natively, which is the number that
+would have hidden a regression as a capability limit -- and did, earlier
+today, when `readdir$INODE64` took three apps out and difftest called them
+"unsupported".
+
+Two defects came out of this comparison and are fixed: `RwLock::write`
+returning a mutex guard, and exec failure being indistinguishable from exit
+127. Both are in the commit log with their own regression tests.
