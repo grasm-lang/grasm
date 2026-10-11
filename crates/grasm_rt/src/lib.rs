@@ -383,6 +383,375 @@ mod io {
     }
 }
 
+/// `std::fs`, narrowed to what this runtime calls.
+///
+/// Only the ten entry points the runtime uses, and `read_dir` gives names
+/// rather than an iterator of entries because names are all the one caller
+/// wants. Narrowing on purpose: every line here is unsafe code in the crate
+/// every compiled program links.
+mod fs {
+    use crate::io::{errno, Error, Result, EINTR};
+    use alloc::string::String;
+    use alloc::vec::Vec;
+
+    pub const O_RDONLY: i32 = 0;
+    pub const O_WRONLY: i32 = 1;
+    pub const O_RDWR: i32 = 2;
+    #[cfg(target_os = "macos")]
+    pub const O_CREAT: i32 = 0x0200;
+    #[cfg(not(target_os = "macos"))]
+    pub const O_CREAT: i32 = 0o100;
+    #[cfg(target_os = "macos")]
+    pub const O_TRUNC: i32 = 0x0400;
+    #[cfg(not(target_os = "macos"))]
+    pub const O_TRUNC: i32 = 0o1000;
+    #[cfg(target_os = "macos")]
+    pub const O_APPEND: i32 = 0x0008;
+    #[cfg(not(target_os = "macos"))]
+    pub const O_APPEND: i32 = 0o2000;
+
+    pub const SEEK_SET: i32 = 0;
+    pub const SEEK_CUR: i32 = 1;
+    pub const SEEK_END: i32 = 2;
+
+    const EEXIST: i32 = 17;
+
+    extern "C" {
+        fn open(path: *const u8, flags: i32, mode: u32) -> i32;
+        fn close(fd: i32) -> i32;
+        // Named apart from this module's own `read`, `write` and `rename`,
+        // which would otherwise be duplicate definitions.
+        #[link_name = "read"]
+        fn sys_read(fd: i32, buf: *mut u8, n: usize) -> isize;
+        #[link_name = "write"]
+        fn sys_write(fd: i32, buf: *const u8, n: usize) -> isize;
+        fn lseek(fd: i32, at: i64, whence: i32) -> i64;
+        #[link_name = "rename"]
+        fn sys_rename(from: *const u8, to: *const u8) -> i32;
+        fn unlink(path: *const u8) -> i32;
+        fn mkdir(path: *const u8, mode: u32) -> i32;
+        fn opendir(path: *const u8) -> *mut u8;
+        fn closedir(dir: *mut u8) -> i32;
+    }
+
+    // `readdir` is `readdir$INODE64` on macOS, because the original returns
+    // a 32-bit inode and was versioned out.
+    #[cfg(target_os = "macos")]
+    extern "C" {
+        #[link_name = "readdir$INODE64"]
+        fn readdir(dir: *mut u8) -> *const Dirent;
+    }
+    #[cfg(not(target_os = "macos"))]
+    extern "C" {
+        #[link_name = "readdir64"]
+        fn readdir(dir: *mut u8) -> *const Dirent;
+    }
+
+    // Laid out per platform so the compiler works out where `name` starts.
+    // Hardcoding that offset is how this kind of code goes wrong.
+    #[cfg(target_os = "macos")]
+    #[repr(C)]
+    struct Dirent {
+        ino: u64,
+        seekoff: u64,
+        reclen: u16,
+        namlen: u16,
+        kind: u8,
+        name: [u8; 1024],
+    }
+    #[cfg(not(target_os = "macos"))]
+    #[repr(C)]
+    struct Dirent {
+        ino: u64,
+        off: i64,
+        reclen: u16,
+        kind: u8,
+        name: [u8; 256],
+    }
+
+    /// `open` and friends want a NUL-terminated path and Rust strings are not.
+    fn c_path(path: &str) -> Vec<u8> {
+        let mut owned = Vec::with_capacity(path.len() + 1);
+        owned.extend_from_slice(path.as_bytes());
+        owned.push(0);
+        owned
+    }
+
+    fn check(r: i32) -> Result<()> {
+        if r < 0 {
+            Err(Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    pub struct File {
+        fd: i32,
+    }
+
+    impl File {
+        pub fn open(path: &str) -> Result<File> {
+            File::with_flags(path, O_RDONLY, 0)
+        }
+
+        pub fn create(path: &str) -> Result<File> {
+            File::with_flags(path, O_WRONLY | O_CREAT | O_TRUNC, 0o666)
+        }
+
+        pub fn with_flags(path: &str, flags: i32, mode: u32) -> Result<File> {
+            let at = c_path(path);
+            loop {
+                let fd = unsafe { open(at.as_ptr(), flags, mode) };
+                if fd >= 0 {
+                    return Ok(File { fd });
+                }
+                if errno() != EINTR {
+                    return Err(Error::last_os_error());
+                }
+            }
+        }
+
+        pub fn as_raw_fd(&self) -> i32 {
+            self.fd
+        }
+
+        pub fn read(&mut self, into: &mut [u8]) -> Result<usize> {
+            loop {
+                let n = unsafe { sys_read(self.fd, into.as_mut_ptr(), into.len()) };
+                if n >= 0 {
+                    return Ok(n as usize);
+                }
+                if errno() != EINTR {
+                    return Err(Error::last_os_error());
+                }
+            }
+        }
+
+        /// Reads until end of file, which is what `read_to_end` means: a
+        /// single `read` is allowed to return less than asked for, and
+        /// stopping at the first short read is the classic bug here.
+        pub fn read_to_end(&mut self, into: &mut Vec<u8>) -> Result<usize> {
+            let mut got = 0;
+            let mut chunk = [0u8; 8192];
+            loop {
+                let n = self.read(&mut chunk)?;
+                if n == 0 {
+                    return Ok(got);
+                }
+                into.extend_from_slice(&chunk[..n]);
+                got += n;
+            }
+        }
+
+        /// Fills the whole buffer or fails, which is what distinguishes this
+        /// from `read`: a short read is not the end of the data.
+        pub fn read_exact(&mut self, into: &mut [u8]) -> Result<()> {
+            let mut done = 0;
+            while done < into.len() {
+                let n = self.read(&mut into[done..])?;
+                if n == 0 {
+                    // Fewer bytes than asked for and none left to come.
+                    return Err(Error::from_raw_os_error(0));
+                }
+                done += n;
+            }
+            Ok(())
+        }
+
+        pub fn write_all(&mut self, bytes: &[u8]) -> Result<()> {
+            let mut done = 0;
+            while done < bytes.len() {
+                let n = unsafe {
+                    sys_write(self.fd, bytes[done..].as_ptr(), bytes.len() - done)
+                };
+                if n > 0 {
+                    done += n as usize;
+                } else if n < 0 && errno() == EINTR {
+                    continue;
+                } else {
+                    return Err(Error::last_os_error());
+                }
+            }
+            Ok(())
+        }
+
+        pub fn seek(&mut self, whence: i32, at: i64) -> Result<u64> {
+            let r = unsafe { lseek(self.fd, at, whence) };
+            if r < 0 {
+                Err(Error::last_os_error())
+            } else {
+                Ok(r as u64)
+            }
+        }
+
+        pub fn len(&mut self) -> Result<u64> {
+            let here = self.seek(SEEK_CUR, 0)?;
+            let end = self.seek(SEEK_END, 0)?;
+            self.seek(SEEK_SET, here as i64)?;
+            Ok(end)
+        }
+    }
+
+    impl Drop for File {
+        fn drop(&mut self) {
+            unsafe { close(self.fd) };
+        }
+    }
+
+    #[derive(Default)]
+    pub struct OpenOptions {
+        read: bool,
+        write: bool,
+        append: bool,
+        create: bool,
+        truncate: bool,
+    }
+
+    impl OpenOptions {
+        pub fn new() -> OpenOptions {
+            OpenOptions::default()
+        }
+        pub fn read(&mut self, on: bool) -> &mut OpenOptions {
+            self.read = on;
+            self
+        }
+        pub fn write(&mut self, on: bool) -> &mut OpenOptions {
+            self.write = on;
+            self
+        }
+        pub fn append(&mut self, on: bool) -> &mut OpenOptions {
+            self.append = on;
+            self
+        }
+        pub fn create(&mut self, on: bool) -> &mut OpenOptions {
+            self.create = on;
+            self
+        }
+        pub fn truncate(&mut self, on: bool) -> &mut OpenOptions {
+            self.truncate = on;
+            self
+        }
+
+        pub fn open(&self, path: &str) -> Result<File> {
+            let mut flags = match (self.read, self.write || self.append) {
+                (true, true) => O_RDWR,
+                (false, true) => O_WRONLY,
+                _ => O_RDONLY,
+            };
+            if self.append {
+                flags |= O_APPEND;
+            }
+            if self.create {
+                flags |= O_CREAT;
+            }
+            if self.truncate {
+                flags |= O_TRUNC;
+            }
+            File::with_flags(path, flags, 0o666)
+        }
+    }
+
+    pub fn read(path: &str) -> Result<Vec<u8>> {
+        let mut file = File::open(path)?;
+        let mut held = Vec::new();
+        file.read_to_end(&mut held)?;
+        Ok(held)
+    }
+
+    pub fn read_to_string(path: &str) -> Result<String> {
+        let bytes = read(path)?;
+        match String::from_utf8(bytes) {
+            Ok(text) => Ok(text),
+            Err(_) => Err(Error::from_raw_os_error(crate::io::EILSEQ)),
+        }
+    }
+
+    pub fn write(path: &str, bytes: &[u8]) -> Result<()> {
+        File::create(path)?.write_all(bytes)
+    }
+
+    pub fn rename(from: &str, to: &str) -> Result<()> {
+        let (a, b) = (c_path(from), c_path(to));
+        check(unsafe { sys_rename(a.as_ptr(), b.as_ptr()) })
+    }
+
+    pub fn remove_file(path: &str) -> Result<()> {
+        let at = c_path(path);
+        check(unsafe { unlink(at.as_ptr()) })
+    }
+
+    /// Each component in turn, treating "it is already there" as success --
+    /// which is what makes this `_all` and not `mkdir`.
+    pub fn create_dir_all(path: &str) -> Result<()> {
+        let mut so_far = String::new();
+        if path.starts_with('/') {
+            so_far.push('/');
+        }
+        for part in path.split('/').filter(|p| !p.is_empty()) {
+            if !so_far.is_empty() && !so_far.ends_with('/') {
+                so_far.push('/');
+            }
+            so_far.push_str(part);
+            let at = c_path(&so_far);
+            let r = unsafe { mkdir(at.as_ptr(), 0o777) };
+            if r < 0 && errno() != EEXIST {
+                return Err(Error::last_os_error());
+            }
+        }
+        Ok(())
+    }
+
+    pub struct Metadata {
+        len: u64,
+    }
+
+    impl Metadata {
+        pub fn len(&self) -> u64 {
+            self.len
+        }
+    }
+
+    /// Size by `lseek` on an opened file rather than `stat`. `struct stat`'s
+    /// layout differs between macOS and Linux in ways that are easy to get
+    /// subtly wrong, and size is all the one caller reads. The difference
+    /// this leaves: a file that cannot be opened reports its own error here
+    /// where `stat` would have succeeded.
+    pub fn metadata(path: &str) -> Result<Metadata> {
+        let mut file = File::open(path)?;
+        Ok(Metadata { len: file.len()? })
+    }
+
+    /// Names only, which is what the one caller wants. The directory handle
+    /// is closed on every path out, including the error ones.
+    pub fn read_dir(path: &str) -> Result<Vec<String>> {
+        let at = c_path(path);
+        let dir = unsafe { opendir(at.as_ptr()) };
+        if dir.is_null() {
+            return Err(Error::last_os_error());
+        }
+        let mut names = Vec::new();
+        loop {
+            let entry = unsafe { readdir(dir) };
+            if entry.is_null() {
+                break;
+            }
+            let name_at = unsafe { (*entry).name.as_ptr() };
+            let mut len = 0;
+            while unsafe { *name_at.add(len) } != 0 {
+                len += 1;
+            }
+            let bytes = unsafe { core::slice::from_raw_parts(name_at, len) };
+            // `.` and `..` are entries that `std`'s `read_dir` does not give.
+            if bytes == b"." || bytes == b".." {
+                continue;
+            }
+            names.push(String::from_utf8_lossy(bytes).into_owned());
+        }
+        unsafe { closedir(dir) };
+        Ok(names)
+    }
+}
+
 /// The operating system, called directly.
 ///
 /// `core` has no `Instant`, no `exit` and no environment, because none of
@@ -3379,7 +3748,7 @@ pub extern "C" fn grasm_check_leaks() {
     // still not freed.
     {
         let taken: Vec<*mut RtVal> = {
-            let mut slab = SLAB.lock().expect("slab");
+            let mut slab = SLAB.lock();
             slab.gens.clear();
             slab.free.clear();
             slab.slots.drain(..).flatten().collect()
@@ -4699,7 +5068,7 @@ unsafe fn par_words(
             let drain = move || {
                 IN_PARALLEL.with(|f| f.set(true));
                 loop {
-                    let Some((ci, slot)) = queue.lock().expect("no panics inside").pop() else {
+                    let Some((ci, slot)) = queue.lock().pop() else {
                         return;
                     };
                     let src = &input[ci * chunk..ci * chunk + slot.len()];
@@ -5160,7 +5529,7 @@ pub unsafe extern "C" fn grasm_par_filter_scalar(
             let drain = move || {
                 IN_PARALLEL.with(|f| f.set(true));
                 loop {
-                    let Some((ci, slot)) = queue.lock().expect("no panics inside").pop() else {
+                    let Some((ci, slot)) = queue.lock().pop() else {
                         return;
                     };
                     let src = &input[ci * chunk..ci * chunk + slot.len()];
@@ -7519,7 +7888,7 @@ fn unpack_ref(r: i64) -> (u32, u32) {
 #[no_mangle]
 pub unsafe extern "C" fn grasm_ref_new(v: *mut RtVal) -> i64 {
     {
-        let mut s = SLAB.lock().expect("slab");
+        let mut s = SLAB.lock();
         match s.free.pop() {
             Some(i) => {
                 let idx = i as usize;
@@ -7550,7 +7919,7 @@ pub unsafe extern "C" fn grasm_ref_new(v: *mut RtVal) -> i64 {
 pub unsafe extern "C" fn grasm_ref_get(r: i64) -> *mut RtVal {
     let (i, gen) = unpack_ref(r);
     let found = {
-        let s = SLAB.lock().expect("slab");
+        let s = SLAB.lock();
         let idx = i as usize;
         if idx >= s.slots.len() || s.gens[idx] != gen {
             None
@@ -7574,7 +7943,7 @@ pub unsafe extern "C" fn grasm_ref_get(r: i64) -> *mut RtVal {
 pub unsafe extern "C" fn grasm_ref_set(r: i64, v: *mut RtVal) {
     let (i, gen) = unpack_ref(r);
     let old = {
-        let mut s = SLAB.lock().expect("slab");
+        let mut s = SLAB.lock();
         let idx = i as usize;
         if idx >= s.slots.len() || s.gens[idx] != gen || s.slots[idx].is_none() {
             Err(())
@@ -7611,7 +7980,7 @@ pub unsafe extern "C" fn grasm_ref_set(r: i64, v: *mut RtVal) {
 #[no_mangle]
 pub unsafe extern "C" fn grasm_ref_make_unique(r: i64) -> *mut RtVal {
     let (i, gen) = unpack_ref(r);
-    let mut s = SLAB.lock().expect("slab");
+    let mut s = SLAB.lock();
     let idx = i as usize;
     if idx >= s.slots.len() || s.gens[idx] != gen {
         drop(s);
@@ -7669,7 +8038,7 @@ pub unsafe extern "C" fn grasm_ref_make_unique(r: i64) -> *mut RtVal {
 pub extern "C" fn grasm_ref_release(r: i64) {
     let (i, gen) = unpack_ref(r);
     let taken = {
-        let mut s = SLAB.lock().expect("slab");
+        let mut s = SLAB.lock();
         let idx = i as usize;
         if idx >= s.slots.len() || s.gens[idx] != gen {
             return;
@@ -7700,7 +8069,7 @@ pub extern "C" fn grasm_ref_release(r: i64) {
 #[no_mangle]
 pub extern "C" fn grasm_ref_alive(r: i64) -> i8 {
     let (i, gen) = unpack_ref(r);
-    let s = SLAB.lock().expect("slab");
+    let s = SLAB.lock();
     let idx = i as usize;
     i8::from(idx < s.slots.len() && s.gens[idx] == gen && s.slots[idx].is_some())
 }
@@ -9699,7 +10068,7 @@ unsafe fn grasm_random_bytes_now(count: *mut RtVal) -> *mut RtVal {
     if n == 0 {
         return ok_of(alloc(RtPayload::Bytes(RtBytes::new(buf))));
     }
-    match std::fs::File::open("/dev/urandom") {
+    match crate::fs::File::open("/dev/urandom") {
         Err(e) => err_of(io_err("IoFailed", format!("cannot open /dev/urandom: {e}"))),
         Ok(mut f) => match f.read_exact(&mut buf) {
             Ok(()) => ok_of(alloc(RtPayload::Bytes(RtBytes::new(buf)))),
@@ -10316,7 +10685,7 @@ pub unsafe extern "C" fn grasm_read_file(path: *mut RtVal) -> *mut RtVal {
 
 unsafe fn grasm_read_file_now(path: *mut RtVal) -> *mut RtVal {
     let p = as_str(path).to_string();
-    match std::fs::read_to_string(&p) {
+    match crate::fs::read_to_string(&p) {
         Ok(s) => ok_of(alloc(RtPayload::Str(RtStr::new(s)))),
         Err(e) if e.kind() == crate::io::ErrorKind::NotFound => err_of(io_err("NotFound", p)),
         Err(e) => err_of(io_err("IoFailed", e.to_string())),
@@ -10331,7 +10700,7 @@ pub unsafe extern "C" fn grasm_write_file(path: *mut RtVal, content: *mut RtVal)
 unsafe fn grasm_write_file_now(path: *mut RtVal, content: *mut RtVal) -> *mut RtVal {
     let p = as_str(path).to_string();
     let c = as_str(content).to_string();
-    match std::fs::write(&p, c) {
+    match crate::fs::write(&p, c) {
         // `Unit`, not `I64(0)`. The two are indistinguishable to a compiled
         // build — the static type is `()` and the backend prints it from the
         // type rather than the value — but they are not indistinguishable once
@@ -10543,7 +10912,7 @@ pub unsafe extern "C" fn grasm_read_bytes(path: *mut RtVal) -> *mut RtVal {
 
 unsafe fn grasm_read_bytes_now(path: *mut RtVal) -> *mut RtVal {
     let p = as_str(path).to_string();
-    match std::fs::read(&p) {
+    match crate::fs::read(&p) {
         Ok(b) => ok_of(alloc(RtPayload::Bytes(RtBytes::new(b)))),
         Err(e) if e.kind() == crate::io::ErrorKind::NotFound => err_of(io_err("NotFound", p)),
         Err(e) => err_of(io_err("IoFailed", e.to_string())),
@@ -10594,7 +10963,7 @@ unsafe fn grasm_read_bytes_at_now(
             format!("read_bytes_at: offset {off} and count {want} must not be negative"),
         ));
     }
-    match std::fs::File::open(&p) {
+    match crate::fs::File::open(&p) {
         Ok(mut f) => {
             if let Err(e) = f.seek(SeekFrom::Start(off as u64)) {
                 return err_of(io_err("IoFailed", e.to_string()));
@@ -10626,7 +10995,7 @@ pub unsafe extern "C" fn grasm_file_size(path: *mut RtVal) -> *mut RtVal {
 
 unsafe fn grasm_file_size_now(path: *mut RtVal) -> *mut RtVal {
     let p = as_str(path).to_string();
-    match std::fs::metadata(&p) {
+    match crate::fs::metadata(&p) {
         Ok(m) => ok_of(alloc(RtPayload::I64(m.len() as i64))),
         Err(e) if e.kind() == crate::io::ErrorKind::NotFound => err_of(io_err("NotFound", p)),
         Err(e) => err_of(io_err("IoFailed", e.to_string())),
@@ -10647,7 +11016,7 @@ pub unsafe extern "C" fn grasm_append_bytes(path: *mut RtVal, data: *mut RtVal) 
 unsafe fn grasm_append_bytes_now(path: *mut RtVal, data: *mut RtVal) -> *mut RtVal {
     use crate::io::Write;
     let p = as_str(path).to_string();
-    let done = std::fs::OpenOptions::new()
+    let done = crate::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&p)
@@ -10671,7 +11040,7 @@ pub unsafe extern "C" fn grasm_sync_file(path: *mut RtVal) -> *mut RtVal {
 
 unsafe fn grasm_sync_file_now(path: *mut RtVal) -> *mut RtVal {
     let p = as_str(path).to_string();
-    let done = std::fs::OpenOptions::new()
+    let done = crate::fs::OpenOptions::new()
         .append(true)
         .open(&p)
         .and_then(|f| f.sync_all());
@@ -10698,7 +11067,7 @@ pub unsafe extern "C" fn grasm_rename_file(from: *mut RtVal, to: *mut RtVal) -> 
 unsafe fn grasm_rename_file_now(from: *mut RtVal, to: *mut RtVal) -> *mut RtVal {
     let a = as_str(from).to_string();
     let b = as_str(to).to_string();
-    match std::fs::rename(&a, &b) {
+    match crate::fs::rename(&a, &b) {
         Ok(()) => ok_of(alloc(RtPayload::Unit)),
         Err(e) if e.kind() == crate::io::ErrorKind::NotFound => err_of(io_err("NotFound", a)),
         Err(e) => err_of(io_err("IoFailed", e.to_string())),
@@ -10713,7 +11082,7 @@ pub unsafe extern "C" fn grasm_write_bytes(path: *mut RtVal, data: *mut RtVal) -
 
 unsafe fn grasm_write_bytes_now(path: *mut RtVal, data: *mut RtVal) -> *mut RtVal {
     let p = as_str(path).to_string();
-    match std::fs::write(&p, as_bytes(data)) {
+    match crate::fs::write(&p, as_bytes(data)) {
         // `Unit`, not `I64(0)`. The two are indistinguishable to a compiled
         // build — the static type is `()` and the backend prints it from the
         // type rather than the value — but they are not indistinguishable once
@@ -10733,7 +11102,7 @@ pub unsafe extern "C" fn grasm_make_dir(path: *mut RtVal) -> *mut RtVal {
 }
 
 unsafe fn grasm_make_dir_now(path: *mut RtVal) -> *mut RtVal {
-    match std::fs::create_dir_all(as_str(path)) {
+    match crate::fs::create_dir_all(as_str(path)) {
         // `Unit`, not `I64(0)`. The two are indistinguishable to a compiled
         // build — the static type is `()` and the backend prints it from the
         // type rather than the value — but they are not indistinguishable once
@@ -10752,7 +11121,7 @@ pub unsafe extern "C" fn grasm_remove_file(path: *mut RtVal) -> *mut RtVal {
 
 unsafe fn grasm_remove_file_now(path: *mut RtVal) -> *mut RtVal {
     let p = as_str(path).to_string();
-    match std::fs::remove_file(&p) {
+    match crate::fs::remove_file(&p) {
         // `Unit`, not `I64(0)`. The two are indistinguishable to a compiled
         // build — the static type is `()` and the backend prints it from the
         // type rather than the value — but they are not indistinguishable once
@@ -10779,7 +11148,7 @@ pub unsafe extern "C" fn grasm_list_dir(path: *mut RtVal) -> *mut RtVal {
 
 unsafe fn grasm_list_dir_now(path: *mut RtVal) -> *mut RtVal {
     let p = as_str(path).to_string();
-    match std::fs::read_dir(&p) {
+    match crate::fs::read_dir(&p) {
         Ok(entries) => {
             let mut names: Vec<String> = entries
                 .filter_map(|e| e.ok())

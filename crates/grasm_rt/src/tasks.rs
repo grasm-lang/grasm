@@ -48,7 +48,7 @@ const DEADLOCK: &str =
     "deadlock: every task is waiting on a channel, and nothing left can send or receive";
 
 fn chans() -> crate::sync::Guard<'static, Chans> {
-    CHANS.lock().unwrap_or_else(|p| p.into_inner())
+    CHANS.lock()
 }
 
 /// A channel operation that cannot go ahead: inside a task, give way and try
