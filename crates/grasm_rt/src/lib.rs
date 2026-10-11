@@ -115,6 +115,84 @@ mod tls {
     }
 }
 
+/// The operating system, called directly.
+///
+/// `core` has no `Instant`, no `exit` and no environment, because none of
+/// them can be had without asking the kernel. It does have
+/// `core::time::Duration`, so that stays.
+mod sys {
+    use core::time::Duration;
+
+    pub const CLOCK_REALTIME: i32 = 0;
+    #[cfg(target_os = "macos")]
+    pub const CLOCK_MONOTONIC: i32 = 6;
+    #[cfg(not(target_os = "macos"))]
+    pub const CLOCK_MONOTONIC: i32 = 1;
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    pub struct TimeSpec {
+        pub secs: i64,
+        pub nanos: i64,
+    }
+
+    extern "C" {
+        fn clock_gettime(clock: i32, at: *mut TimeSpec) -> i32;
+        fn getenv(name: *const u8) -> *const u8;
+        fn strlen(s: *const u8) -> usize;
+        pub fn exit(code: i32) -> !;
+        pub fn abort() -> !;
+    }
+
+    fn now(clock: i32) -> Duration {
+        let mut at = TimeSpec::default();
+        unsafe { clock_gettime(clock, &mut at) };
+        Duration::new(at.secs as u64, at.nanos as u32)
+    }
+
+    /// Monotonic, so it cannot go backwards when the wall clock is set --
+    /// which is the whole reason to prefer it for measuring.
+    #[derive(Clone, Copy)]
+    pub struct Instant(Duration);
+
+    impl Instant {
+        pub fn now() -> Instant {
+            Instant(now(CLOCK_MONOTONIC))
+        }
+
+        pub fn elapsed(&self) -> Duration {
+            now(CLOCK_MONOTONIC).saturating_sub(self.0)
+        }
+
+        pub fn duration_since(&self, earlier: Instant) -> Duration {
+            self.0.saturating_sub(earlier.0)
+        }
+    }
+
+    /// Wall clock, for the one thing that wants it: seconds since the epoch.
+    pub fn unix_time() -> Duration {
+        now(CLOCK_REALTIME)
+    }
+
+    /// `getenv` gives a pointer into the process environment, valid until
+    /// something calls `setenv`. The runtime only reads, so copying the bytes
+    /// out keeps that from mattering.
+    pub fn env_var(name: &str) -> Option<alloc::string::String> {
+        // `getenv` wants a C string and `name` is a Rust one, so a copy with
+        // a terminator is unavoidable.
+        let mut owned = alloc::vec::Vec::with_capacity(name.len() + 1);
+        owned.extend_from_slice(name.as_bytes());
+        owned.push(0);
+        let at = unsafe { getenv(owned.as_ptr()) };
+        if at.is_null() {
+            return None;
+        }
+        let len = unsafe { strlen(at) };
+        let bytes = unsafe { core::slice::from_raw_parts(at, len) };
+        core::str::from_utf8(bytes).ok().map(alloc::borrow::ToOwned::to_owned)
+    }
+}
+
 /// `Mutex`, `RwLock` and `OnceLock` without `std`.
 ///
 /// POSIX again, for the same reason `tls` is: these need the operating
@@ -508,7 +586,7 @@ fn rt_panic(msg: &str) -> ! {
     let mut out = std::io::stderr().lock();
     let _ = writeln!(out, "panic: {msg}");
     let _ = out.flush();
-    std::process::exit(101);
+    crate::sys::exit(101);
 }
 
 #[no_mangle]
@@ -2826,7 +2904,7 @@ const POISON: i64 = i64::MIN + 0x5EAD;
 unsafe fn assert_alive(v: *mut RtVal, what: &str) {
     if !v.is_null() && (*v).rc.load(Relaxed) == POISON {
         // To find *which* code released it twice, swap this for
-        // `std::process::abort()` and build with `GRASM_KEEP_SYMBOLS=1`: macOS
+        // `crate::sys::abort()` and build with `GRASM_KEEP_SYMBOLS=1`: macOS
         // writes a symbolicated report and the generated frames are named in
         // it. A Rust backtrace stops at the runtime boundary and says nothing.
         rt_panic(&format!(
@@ -3057,7 +3135,7 @@ pub extern "C" fn grasm_check_leaks() {
         );
     }
     let _ = err.flush();
-    std::process::exit(7);
+    crate::sys::exit(7);
 }
 
 /// Refcount marking a value that is shared forever and never freed.
@@ -4155,10 +4233,10 @@ const PAR_MIN_ELEMS: usize = 256;
 /// worth more than the spawns. Being wrong costs one element's time; the
 /// answer never changes, because the function is effect-free and each worker
 /// writes its own indices.
-const PAR_MIN_WORK: std::time::Duration = std::time::Duration::from_micros(500);
+const PAR_MIN_WORK: core::time::Duration = core::time::Duration::from_micros(500);
 
 /// How many workers to give `n` elements, one of which took `one` to compute.
-fn workers_for(n: usize, one: std::time::Duration) -> usize {
+fn workers_for(n: usize, one: core::time::Duration) -> usize {
     if IN_PARALLEL.with(|f| f.get()) || n < 2 {
         return 1;
     }
@@ -4316,7 +4394,7 @@ unsafe fn par_words(
 
     // The first element, on this thread, timed: what it costs is what decides
     // whether the rest is worth spreading.
-    let began = std::time::Instant::now();
+    let began = crate::sys::Instant::now();
     out[0] = code(env_owned.as_ptr(), words[0]);
     let workers = workers_for(n, began.elapsed());
 
@@ -4784,7 +4862,7 @@ pub unsafe extern "C" fn grasm_par_filter_scalar(
     // one costs is the only thing that says whether threading the others pays.
     let mut workers = 1;
     if n > 0 {
-        let began = std::time::Instant::now();
+        let began = crate::sys::Instant::now();
         keep[0] = u8::from(code(env_owned.as_ptr(), words[0]) != 0);
         workers = workers_for(n, began.elapsed());
     }
@@ -6371,7 +6449,7 @@ pub unsafe extern "C" fn grasm_report_main_err(v: *mut RtVal) {
         display(fields[0])
     );
     let _ = out.flush();
-    std::process::exit(1);
+    crate::sys::exit(1);
 }
 
 /// Structural equality across all payloads.
@@ -10516,10 +10594,10 @@ pub extern "C" fn grasm_monotonic_millis() -> i64 {
 /// The moment both monotonic clocks count from, captured on first use, so that
 /// `monotonic_millis` and `monotonic_nanos` agree on how much time has passed
 /// and differ only in how finely they say it.
-fn monotonic_start() -> std::time::Instant {
+fn monotonic_start() -> crate::sys::Instant {
     use crate::sync::OnceLock;
-    static START: OnceLock<std::time::Instant> = OnceLock::new();
-    *START.get_or_init(std::time::Instant::now)
+    static START: OnceLock<crate::sys::Instant> = OnceLock::new();
+    *START.get_or_init(crate::sys::Instant::now)
 }
 
 /// Nanoseconds since the same unnamed moment `monotonic_millis` counts from.
@@ -10557,7 +10635,7 @@ pub unsafe extern "C" fn grasm_sleep_millis(ms: *mut RtVal) -> *mut RtVal {
         return alloc(RtPayload::Unit);
     }
     if n > 0 {
-        std::thread::sleep(std::time::Duration::from_millis(n as u64));
+        std::thread::sleep(core::time::Duration::from_millis(n as u64));
     }
     if replay::recording() {
         replay::put("sleep_millis", &replay::Wire::Unit);
@@ -10587,7 +10665,7 @@ pub extern "C" fn grasm_exit(code: i64) {
     // C's `exit` does with the same number. Clamping to 0..=255 instead made
     // `exit(-1)` — the most common spelling of "fail" in a script — report
     // *success*.
-    std::process::exit((code & 0xff) as i32);
+    crate::sys::exit((code & 0xff) as i32);
 }
 
 /// # Safety: live runtime pointer.
