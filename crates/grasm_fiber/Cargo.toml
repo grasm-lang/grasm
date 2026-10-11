@@ -9,3 +9,6 @@ license.workspace = true
 # cannot disagree about scheduling. No dependencies, like `grasm_rt`, which
 # will link it.
 [dependencies]
+# Thread-local storage and the rest of the operating system, so this crate can
+# be `no_std` too -- it links into every compiled program.
+grasm_sys = { path = "../grasm_sys" }

@@ -14,7 +14,15 @@
 //! aarch64 and x86_64 only; on other targets -- wasm32, which cannot switch
 //! stacks at all -- [`supported`] is false and nothing here may be called.
 
-use std::cell::Cell;
+#![no_std]
+extern crate alloc;
+#[macro_use]
+extern crate grasm_sys;
+
+use alloc::boxed::Box;
+use alloc::vec::Vec;
+
+use core::cell::Cell;
 
 /// Whether this target can run fibers.
 pub const fn supported() -> bool {
@@ -31,7 +39,7 @@ struct Context {
 thread_local! {
     /// The fiber running on this thread, so `suspend` knows whose context
     /// to save and where to return. Null outside any fiber.
-    static CURRENT: Cell<*mut Inner> = const { Cell::new(std::ptr::null_mut()) };
+    static CURRENT: Cell<*mut Inner> = const { Cell::new(core::ptr::null_mut()) };
 }
 
 struct Inner {
@@ -42,9 +50,9 @@ struct Inner {
     /// Taken by the entry trampoline on the first resume.
     body: Option<Box<dyn FnOnce()>>,
     finished: bool,
-    /// A panic that escaped the body, carried back to the resumer rather
+    /// Was: a panic that escaped the body, carried back to the resumer.
     /// than unwound off the end of a stack it does not belong to.
-    panic: Option<Box<dyn std::any::Any + Send>>,
+
     stack: Stack,
 }
 
@@ -75,7 +83,7 @@ impl Fiber {
     pub unsafe fn new_scoped<'a>(stack_size: usize, body: impl FnOnce() + 'a) -> Fiber {
         let body: Box<dyn FnOnce() + 'a> = Box::new(body);
         // Safety: the caller's promise above is what makes the lifetime moot.
-        let body: Box<dyn FnOnce() + 'static> = std::mem::transmute(body);
+        let body: Box<dyn FnOnce() + 'static> = core::mem::transmute(body);
         assert!(supported(), "fibers are not supported on this target");
         let stack = Stack::new(stack_size);
         let mut inner = Box::new(Inner {
@@ -83,7 +91,6 @@ impl Fiber {
             back: Context { sp: 0 },
             body: Some(body),
             finished: false,
-            panic: None,
             stack,
         });
         let top = inner.stack.top();
@@ -95,10 +102,11 @@ impl Fiber {
     }
 
     /// Runs the fiber until it suspends or finishes. Returns whether it has
-    /// finished. A panic in the body is re-raised here, on the resumer's side.
+    /// finished. A panic in the body exits the process where it happens,
+    /// since nothing unwinds ([E-PANIC-EXIT]).
     ///
     /// # Panics
-    /// If the fiber has already finished, or the body panicked.
+    /// If the fiber has already finished.
     pub fn resume(&mut self) -> bool {
         assert!(!self.inner.finished, "resuming a fiber that has finished");
         let me = &mut *self.inner as *mut Inner;
@@ -107,9 +115,6 @@ impl Fiber {
         // `prepare` or by `suspend` on this fiber's own stack.
         unsafe { arch::switch(&mut (*me).back, &(*me).own) };
         CURRENT.with(|c| c.set(outer));
-        if let Some(p) = self.inner.panic.take() {
-            std::panic::resume_unwind(p);
-        }
         self.inner.finished
     }
 
@@ -149,9 +154,14 @@ extern "C" fn entry(arg: usize) -> ! {
     // Safety: `arg` is the fiber's own `Inner`, which outlives its stack.
     unsafe {
         let body = (*me).body.take().expect("a fiber starts once");
-        if let Err(p) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
-            (*me).panic = Some(p);
-        }
+        // Called directly, not through `catch_unwind`. That existed so a
+        // panic could not unwind across the context switch below -- the
+        // unwinder would walk into a stack that is not a normal call chain,
+        // which is undefined behaviour. In a `no_std` build nothing unwinds:
+        // `#[panic_handler]` prints and exits, so the hazard cannot arise and
+        // the fiber path now matches [E-PANIC-EXIT] rather than diverging
+        // from it.
+        body();
         (*me).finished = true;
         arch::switch(&mut (*me).own, &(*me).back);
     }
@@ -197,7 +207,7 @@ const POOL_MAX: usize = 64;
 const POOL_STACK_MAX: usize = 8 * 1024 * 1024 + 64 * 1024;
 
 thread_local! {
-    static POOL: std::cell::RefCell<Vec<Stack>> = const { std::cell::RefCell::new(Vec::new()) };
+    static POOL: core::cell::RefCell<Vec<Stack>> = const { core::cell::RefCell::new(Vec::new()) };
 }
 
 impl Stack {
@@ -219,7 +229,7 @@ impl Stack {
         // Safety: an anonymous private mapping; the result is checked.
         unsafe {
             let base = sys::mmap(
-                std::ptr::null_mut(),
+                core::ptr::null_mut(),
                 len,
                 sys::PROT_READ | sys::PROT_WRITE,
                 sys::MAP_PRIVATE | sys::MAP_ANON,
@@ -273,7 +283,7 @@ impl Drop for Stack {
             })
             .unwrap_or(false);
         if kept {
-            self.base = std::ptr::null_mut();
+            self.base = core::ptr::null_mut();
             return;
         }
         #[cfg(unix)]
@@ -412,11 +422,11 @@ mod arch {
 #[cfg(all(test, unix, any(target_arch = "aarch64", target_arch = "x86_64")))]
 mod tests {
     use super::*;
-    use std::rc::Rc;
+    use alloc::rc::Rc;
 
     #[test]
     fn a_fiber_runs_to_its_end() {
-        let log = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let log = Rc::new(core::cell::RefCell::new(Vec::new()));
         let l = log.clone();
         let mut f = Fiber::new(64 * 1024, move || l.borrow_mut().push(1));
         assert!(f.resume());
@@ -425,7 +435,7 @@ mod tests {
 
     #[test]
     fn suspend_and_resume_interleave() {
-        let log = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let log = Rc::new(core::cell::RefCell::new(Vec::new()));
         let mk = |tag: i64| {
             let l = log.clone();
             Fiber::new(64 * 1024, move || {
@@ -454,7 +464,7 @@ mod tests {
     /// right, which it would not if either set leaked between them.
     #[test]
     fn registers_survive_switches() {
-        let out = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let out = Rc::new(core::cell::RefCell::new(Vec::new()));
         let mut fs: Vec<Fiber> = (0..64)
             .map(|k| {
                 let o = out.clone();
@@ -502,7 +512,7 @@ mod tests {
     #[test]
     fn deep_recursion_fits_a_big_stack() {
         fn depth(n: u64) -> u64 {
-            if n == 0 { 0 } else { 1 + depth(std::hint::black_box(n - 1)) }
+            if n == 0 { 0 } else { 1 + depth(core::hint::black_box(n - 1)) }
         }
         let r = Rc::new(Cell::new(0));
         let r2 = r.clone();

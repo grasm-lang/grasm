@@ -91,22 +91,68 @@ pub mod tls {
         }
 
         pub fn with<R>(&self, f: impl FnOnce(&T) -> R) -> R {
+            match self.try_with(f) {
+                Ok(r) => r,
+                Err(_) => panic!("a thread-local was used after its thread began ending"),
+            }
+        }
+
+        /// `Err` once this thread's value has been dropped, which happens
+        /// while the thread is ending. A caller that runs then -- returning a
+        /// stack to a pool, say -- has to know the pool is gone rather than
+        /// quietly building a new one that nothing will ever free.
+        pub fn try_with<R>(&self, f: impl FnOnce(&T) -> R) -> Result<R, Gone> {
             let k = self.key();
-            let mut at = unsafe { pthread_getspecific(k) } as *mut T;
+            let mut at = unsafe { pthread_getspecific(k) } as *mut Slot<T>;
             if at.is_null() {
-                at = Box::into_raw(Box::new((self.init)()));
+                at = Box::into_raw(Box::new(Slot {
+                    alive: true,
+                    value: core::mem::ManuallyDrop::new((self.init)()),
+                }));
                 unsafe { pthread_setspecific(k, at as *const u8) };
             }
             // Safety: just made or previously made by this thread, and only
             // this thread can reach it.
-            f(unsafe { &*at })
+            let slot = unsafe { &*at };
+            if !slot.alive {
+                return Err(Gone);
+            }
+            Ok(f(&slot.value))
         }
     }
 
+    /// The value is gone because its thread is ending.
+    #[derive(Debug)]
+    pub struct Gone;
+
+    /// The value plus whether it is still there. The flag has to live beside
+    /// the value rather than in the descriptor, because the destructor below
+    /// is handed the value and not the key, so it has nowhere else to record
+    /// that it ran.
+    struct Slot<T> {
+        alive: bool,
+        value: core::mem::ManuallyDrop<T>,
+    }
+
     /// Run by pthreads when a thread that used this key ends.
+    ///
+    /// The `Slot` is deliberately **not** freed. POSIX re-runs this
+    /// destructor while the key's value stays non-null -- up to
+    /// `PTHREAD_DESTRUCTOR_ITERATIONS`, four in practice -- and the
+    /// destructor is not given the key, so it cannot clear it. Freeing the
+    /// box would therefore hand the next call a dangling pointer. Keeping it
+    /// and flipping `alive` makes the repeat calls harmless and lets
+    /// `try_with` report the value as gone. The cost is one small box per
+    /// thread that touched this key, which is bounded by the number of
+    /// threads; the value's own allocations are released here as usual.
     unsafe extern "C" fn drop_in_place<T>(at: *mut u8) {
-        if !at.is_null() {
-            drop(Box::from_raw(at as *mut T));
+        if at.is_null() {
+            return;
+        }
+        let slot = &mut *(at as *mut Slot<T>);
+        if slot.alive {
+            slot.alive = false;
+            core::mem::ManuallyDrop::drop(&mut slot.value);
         }
     }
 }
