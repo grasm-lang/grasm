@@ -679,6 +679,7 @@ mod thread {
 /// also what `std` does underneath.
 mod net {
     use crate::io::{errno, Error, Result, EINTR};
+    use alloc::string::String;
     use alloc::vec::Vec;
 
     pub const AF_INET: i32 = 2;
@@ -750,6 +751,90 @@ mod net {
         fn fcntl(fd: i32, cmd: i32, arg: i32) -> i32;
         fn getaddrinfo(host: *const u8, service: *const u8, hint: *const AddrInfo, out: *mut *const AddrInfo) -> i32;
         fn freeaddrinfo(at: *const AddrInfo);
+        fn getsockname(fd: i32, addr: *mut u8, len: *mut u32) -> i32;
+        fn getpeername(fd: i32, addr: *mut u8, len: *mut u32) -> i32;
+        fn inet_ntop(family: i32, addr: *const u8, out: *mut u8, len: u32) -> *const u8;
+    }
+
+    pub const AF_INET6: i32 = 30;
+
+    impl Addr {
+        /// The port, and the address as text.
+        ///
+        /// `sin_port` sits at offset 2 in network byte order for IPv4 and
+        /// IPv6 alike, and on both platforms -- macOS splits the family field
+        /// into a length and a family byte, which happens to leave the port
+        /// where Linux has it. The family itself does move, so that is read
+        /// per platform.
+        pub fn parts(&self) -> (String, u16) {
+            if self.bytes.len() < 4 {
+                return (String::new(), 0);
+            }
+            let port = u16::from_be_bytes([self.bytes[2], self.bytes[3]]);
+            #[cfg(target_os = "macos")]
+            let family = self.bytes[1] as i32;
+            #[cfg(not(target_os = "macos"))]
+            let family = u16::from_ne_bytes([self.bytes[0], self.bytes[1]]) as i32;
+            // The address itself starts after the flow info in IPv6 and
+            // straight after the port in IPv4.
+            let (at, want) = match family {
+                f if f == AF_INET6 => (8, 46),
+                _ => (4, 16),
+            };
+            if self.bytes.len() < at {
+                return (String::new(), port);
+            }
+            let mut text = [0u8; 46];
+            let shown = unsafe {
+                inet_ntop(
+                    family,
+                    self.bytes[at..].as_ptr(),
+                    text.as_mut_ptr(),
+                    want as u32,
+                )
+            };
+            if shown.is_null() {
+                return (String::new(), port);
+            }
+            let len = text.iter().position(|&b| b == 0).unwrap_or(0);
+            (
+                core::str::from_utf8(&text[..len])
+                    .unwrap_or("")
+                    .into(),
+                port,
+            )
+        }
+    }
+
+    impl Addr {
+        pub fn port(&self) -> u16 {
+            self.parts().1
+        }
+
+        pub fn ip_text(&self) -> String {
+            self.parts().0
+        }
+    }
+
+    fn name_of(fd: i32, peer: bool) -> Result<Addr> {
+        // Large enough for `sockaddr_in6`, which is the biggest this runtime
+        // can produce.
+        let mut bytes = [0u8; 128];
+        let mut len = bytes.len() as u32;
+        let r = unsafe {
+            if peer {
+                getpeername(fd, bytes.as_mut_ptr(), &mut len)
+            } else {
+                getsockname(fd, bytes.as_mut_ptr(), &mut len)
+            }
+        };
+        if r < 0 {
+            return Err(Error::last_os_error());
+        }
+        Ok(Addr {
+            bytes: bytes[..len as usize].to_vec(),
+            family: 0,
+        })
     }
 
     fn c_str(text: &str) -> Vec<u8> {
@@ -883,6 +968,14 @@ mod net {
             Ok(())
         }
 
+        pub fn local_addr(&self) -> Result<Addr> {
+            name_of(self.fd, false)
+        }
+
+        pub fn peer_addr(&self) -> Result<Addr> {
+            name_of(self.fd, true)
+        }
+
         pub fn shutdown_both(&self) -> Result<()> {
             check(unsafe { shutdown(self.fd, 2) })
         }
@@ -919,7 +1012,10 @@ mod net {
             }
         }
 
-        pub fn recv_from(&self, into: &mut [u8]) -> Result<usize> {
+        /// The sender comes back with the bytes, because replying to a
+        /// datagram needs it and asking again would ask about a different
+        /// one.
+        pub fn recv_from(&self, into: &mut [u8]) -> Result<(usize, Addr)> {
             let mut from = [0u8; 128];
             let mut flen = from.len() as u32;
             loop {
@@ -934,7 +1030,13 @@ mod net {
                     )
                 };
                 if n >= 0 {
-                    return Ok(n as usize);
+                    return Ok((
+                        n as usize,
+                        Addr {
+                            bytes: from[..flen as usize].to_vec(),
+                            family: 0,
+                        },
+                    ));
                 }
                 if errno() != EINTR {
                     return Err(Error::last_os_error());
@@ -9918,13 +10020,13 @@ fn read_sized<T>(read: impl FnOnce(&mut [u8]) -> crate::io::Result<(usize, T)>) 
 }
 
 enum Socket {
-    Listener(std::net::TcpListener),
-    Stream(std::net::TcpStream),
+    Listener(crate::net::Socket),
+    Stream(crate::net::Socket),
     /// A datagram socket. It sits in the same table as the stream kinds so
     /// that `net_wait`, `net_port` and `net_close` work on it unchanged — a
     /// program multiplexing a listener and a UDP socket in one loop is the
     /// ordinary case for anything that speaks two protocols.
-    Datagram(std::net::UdpSocket),
+    Datagram(crate::net::Socket),
 }
 
 fn socket_put(s: Socket) -> i64 {
@@ -9966,13 +10068,13 @@ fn socket_with<T>(h: i64, f: impl FnOnce(&Socket) -> Result<T, String>) -> Resul
 /// `poll(2)` when it is asked to wait. Toggling the mode per call instead would
 /// race: one worker switching it back to blocking while another is about to
 /// make its single attempt leaves the second stuck in `accept`.
-fn listener_put(l: std::net::TcpListener) -> crate::io::Result<i64> {
+fn listener_put(l: crate::net::Socket) -> crate::io::Result<i64> {
     l.set_nonblocking(true)?;
     Ok(socket_put(Socket::Listener(l)))
 }
 
 /// One connection from a listener; when `ready`, without waiting for one.
-fn accept_from(l: &std::net::TcpListener, ready: bool) -> Result<std::net::TcpStream, String> {
+fn accept_from(l: &crate::net::Socket, ready: bool) -> Result<crate::net::Socket, String> {
     use std::os::fd::AsRawFd;
     loop {
         match l.accept() {
@@ -10474,7 +10576,7 @@ unsafe fn grasm_tcp_listen_now(port: *mut RtVal) -> *mut RtVal {
     if !(0..=65535).contains(&port) {
         return err_of(io_err("IoFailed", format!("port {port} is out of range")));
     }
-    match std::net::TcpListener::bind(("127.0.0.1", port as u16)) {
+    match crate::net::listen_on("127.0.0.1", port as u16) {
         Ok(l) => match listener_put(l) {
             Ok(h) => ok_of(alloc(RtPayload::I64(h))),
             Err(e) => err_of(io_err("IoFailed", e.to_string())),
@@ -10509,7 +10611,7 @@ unsafe fn grasm_tcp_listen_on_now(host: *mut RtVal, port: *mut RtVal) -> *mut Rt
     if !(0..=65535).contains(&port) {
         return err_of(io_err("IoFailed", format!("port {port} is out of range")));
     }
-    match std::net::TcpListener::bind((host.as_str(), port as u16)) {
+    match crate::net::listen_on(host.as_str(), port as u16) {
         Ok(l) => match listener_put(l) {
             Ok(h) => ok_of(alloc(RtPayload::I64(h))),
             Err(e) => err_of(io_err("IoFailed", e.to_string())),
@@ -10526,7 +10628,7 @@ unsafe fn grasm_tcp_listen_on_now(host: *mut RtVal, port: *mut RtVal) -> *mut Rt
 /// Programs here write whole messages, so the coalescing buys nothing, and Go
 /// turns it off by default for the same reason. A failure to turn it off
 /// leaves a working, slower socket, which is no reason to fail the connection.
-fn without_nagle(stream: std::net::TcpStream) -> std::net::TcpStream {
+fn without_nagle(stream: crate::net::Socket) -> crate::net::Socket {
     let _ = stream.set_nodelay(true);
     stream
 }
@@ -10561,7 +10663,7 @@ unsafe fn grasm_tcp_connect_now(host: *mut RtVal, port: *mut RtVal) -> *mut RtVa
     if !(1..=65535).contains(&port) {
         return err_of(io_err("IoFailed", format!("port {port} is out of range")));
     }
-    match std::net::TcpStream::connect((host.as_str(), port as u16)) {
+    match crate::net::connect_to(host.as_str(), port as u16) {
         Ok(stream) => ok_of(alloc(RtPayload::I64(socket_put(Socket::Stream(
             without_nagle(stream),
         ))))),
@@ -11090,7 +11192,7 @@ unsafe fn grasm_udp_bind_now(port: *mut RtVal) -> *mut RtVal {
     if !(0..=65535).contains(&port) {
         return err_of(io_err("IoFailed", format!("port {port} is out of range")));
     }
-    match std::net::UdpSocket::bind(("0.0.0.0", port as u16)) {
+    match crate::net::udp_on("0.0.0.0", port as u16) {
         Ok(d) => ok_of(alloc(RtPayload::I64(socket_put(Socket::Datagram(d))))),
         Err(e) => err_of(io_err("IoFailed", e.to_string())),
     }
@@ -11243,7 +11345,7 @@ unsafe fn grasm_tcp_peer_now(handle: *mut RtVal) -> *mut RtVal {
     let got = socket_with(h, |s| match s {
         Socket::Stream(st) => st
             .peer_addr()
-            .map(|a| (a.ip().to_string(), i64::from(a.port())))
+            .map(|a| (a.ip_text(), i64::from(a.port())))
             .map_err(|e| e.to_string()),
         Socket::Listener(_) => Err(format!("socket {h} is a listener, not a connection")),
         Socket::Datagram(_) => Err(format!(
