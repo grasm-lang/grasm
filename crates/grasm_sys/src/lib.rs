@@ -1089,7 +1089,15 @@ pub mod net {
         fn inet_ntop(family: i32, addr: *const u8, out: *mut u8, len: u32) -> *const u8;
     }
 
+    // 30 on macOS, 10 on Linux. One of the few `AF_` values that differs,
+    // and getting it wrong does not fail: an IPv6 address would not match,
+    // so `parts` would read it as IPv4 -- four bytes from offset 4 instead of
+    // sixteen from offset 8, and the wrong family handed to `inet_ntop`.
+    // Wrong text for a peer's address, reported as success.
+    #[cfg(target_os = "macos")]
     pub const AF_INET6: i32 = 30;
+    #[cfg(not(target_os = "macos"))]
+    pub const AF_INET6: i32 = 10;
 
     impl Addr {
         /// The port, and the address as text.

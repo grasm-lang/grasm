@@ -176,3 +176,30 @@ the number above is a measurement and not yet a result.
 - **The allocator must honour over-aligned requests.** `malloc` promises 16
   bytes; anything stricter goes through `posix_memalign`, and a `realloc` of
   such a block copies by hand because `realloc` cannot promise the alignment.
+
+## The Linux half is compiled nowhere local (2026-10-11)
+
+Every `#[cfg(not(target_os = "macos"))]` branch in `grasm_sys` -- about 2,100
+lines of syscall code -- has never been compiled on this machine: only
+`aarch64-apple-darwin` and `x86_64-apple-darwin` are installed. The x86_64
+cross build does work (`libgrasm_rt_abi.a`, 4.8 MB, `lipo` confirms the
+architecture), so the two Apple targets are covered and CI's ubuntu runner
+will catch anything that does not *compile* on Linux.
+
+What CI will not catch is a constant with the wrong **value**, which compiles
+perfectly. So all seventeen platform-dependent pairs were read against the
+headers rather than trusted. One was wrong:
+
+**`AF_INET6` was 30 with no `cfg`** -- macOS's value, where Linux is 10. The
+failure mode is the quiet kind: an IPv6 peer's family would not match, so
+`Addr::parts` would read the address as IPv4, taking four bytes from offset 4
+instead of sixteen from offset 8 and handing `inet_ntop` the wrong family.
+`peer_addr` would return wrong text and report success.
+
+The other sixteen are correct: `pthread_key_t` (u64/u32), `pthread_t`
+(pointer/usize), `EAGAIN` (35/11), `EILSEQ` (92/84), `SOL_SOCKET`
+(0xffff/1), `SO_REUSEADDR` (4/2), `O_CREAT` (512/64), `O_TRUNC` (1024/512),
+`O_APPEND` (8/1024), `O_NONBLOCK` (4/2048), `CLOCK_MONOTONIC` (6/1),
+`_SC_NPROCESSORS_ONLN` (58/84), and the `Dirent` and `addrinfo` layouts.
+`EINTR`, `ENOENT`, `EEXIST`, `AF_INET`, `IPPROTO_TCP`, `TCP_NODELAY`,
+`CLOCK_REALTIME`, `POLLIN` and `SIGKILL` are the same on both.
