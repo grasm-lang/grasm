@@ -2644,3 +2644,313 @@ pub mod math {
         }
     }
 }
+
+// `std` is taken back for the tests, which need somewhere to put files and a
+// thread to prove a thread-local is one. Nothing below is linked into a
+// compiled program.
+#[cfg(test)]
+extern crate std;
+
+#[cfg(test)]
+mod tests {
+    #[allow(unused_imports)]
+    use alloc::{format, string::String, string::ToString, vec, vec::Vec};
+    use std::string::ToString as _;
+
+    fn scratch(name: &str) -> String {
+        let at = format!(
+            "{}/grasm_sys_test_{}_{}",
+            std::env::temp_dir().display(),
+            std::process::id(),
+            name
+        );
+        let _ = crate::fs::create_dir_all(&at);
+        at
+    }
+
+    /// The defect this exists for: `open`'s mode is a **variadic** argument,
+    /// and declaring it as a fixed parameter sent it to a register on arm64
+    /// where `open` reads the stack. The file was then created with a garbage
+    /// mode, so the *first* append worked and the *second* failed with
+    /// "Permission denied". One append would not have caught it.
+    #[test]
+    fn appending_twice_leaves_both_writes() {
+        let dir = scratch("append");
+        let path = format!("{dir}/log");
+        let _ = crate::fs::remove_file(&path);
+        crate::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .expect("first open")
+            .write_all(b"one")
+            .expect("first write");
+        crate::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .expect("second open -- a garbage mode fails here, not above")
+            .write_all(b"two")
+            .expect("second write");
+        assert_eq!(crate::fs::read(&path).unwrap(), b"onetwo");
+        assert_eq!(crate::fs::metadata(&path).unwrap().len(), 6);
+    }
+
+    #[test]
+    fn a_file_round_trips() {
+        let dir = scratch("roundtrip");
+        let path = format!("{dir}/f");
+        crate::fs::write(&path, b"hello").unwrap();
+        assert_eq!(crate::fs::read_to_string(&path).unwrap(), "hello");
+        assert!(crate::fs::exists(&path));
+        assert_eq!(crate::fs::metadata(&path).unwrap().len(), 5);
+        assert!(!crate::fs::metadata(&path).unwrap().is_empty());
+
+        let moved = format!("{dir}/g");
+        crate::fs::rename(&path, &moved).unwrap();
+        assert!(!crate::fs::exists(&path));
+        assert!(crate::fs::exists(&moved));
+        crate::fs::remove_file(&moved).unwrap();
+        assert!(!crate::fs::exists(&moved));
+    }
+
+    /// A `read` is allowed to return less than asked for, so the loops in
+    /// `read_to_end` and `read_exact` are the point. 40 KiB is several
+    /// 8 KiB chunks.
+    #[test]
+    fn a_long_read_does_not_stop_at_the_first_chunk() {
+        let dir = scratch("long");
+        let path = format!("{dir}/big");
+        let body: Vec<u8> = (0..40_960u32).map(|i| (i % 251) as u8).collect();
+        crate::fs::write(&path, &body).unwrap();
+        assert_eq!(crate::fs::read(&path).unwrap(), body);
+
+        let mut f = crate::fs::File::open(&path).unwrap();
+        let mut exact = vec![0u8; 9000];
+        f.read_exact(&mut exact).unwrap();
+        assert_eq!(exact, body[..9000]);
+    }
+
+    #[test]
+    fn seeking_reads_from_where_it_was_asked() {
+        let dir = scratch("seek");
+        let path = format!("{dir}/s");
+        crate::fs::write(&path, b"0123456789").unwrap();
+        let mut f = crate::fs::File::open(&path).unwrap();
+        f.seek(crate::fs::SEEK_SET, 4).unwrap();
+        let mut four = [0u8; 4];
+        f.read_exact(&mut four).unwrap();
+        assert_eq!(&four, b"4567");
+        // `len` has to leave the position where it found it.
+        let before = f.seek(crate::fs::SEEK_CUR, 0).unwrap();
+        assert_eq!(f.len().unwrap(), 10);
+        assert_eq!(f.seek(crate::fs::SEEK_CUR, 0).unwrap(), before);
+    }
+
+    #[test]
+    fn a_directory_lists_its_names_and_not_dot_or_dotdot() {
+        let dir = scratch("listing");
+        crate::fs::write(&format!("{dir}/a"), b"").unwrap();
+        crate::fs::write(&format!("{dir}/b"), b"").unwrap();
+        let mut names = crate::fs::read_dir(&dir).unwrap();
+        names.sort();
+        assert_eq!(names, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn create_dir_all_makes_every_component() {
+        let dir = scratch("nested");
+        let deep = format!("{dir}/x/y/z");
+        crate::fs::create_dir_all(&deep).unwrap();
+        assert!(crate::fs::exists(&deep));
+        // Twice is not an error, which is what makes it `_all`.
+        crate::fs::create_dir_all(&deep).unwrap();
+    }
+
+    #[test]
+    fn a_missing_file_says_so() {
+        let e = crate::fs::read("/nonexistent/grasm_sys/probe").unwrap_err();
+        assert_eq!(e.kind(), crate::io::ErrorKind::NotFound);
+        // `strerror`'s text, which is what `std` prints for the same errno.
+        assert!(e.to_string().to_lowercase().contains("no such file"));
+    }
+
+    /// The reasoning this checks: `sin_port` sits at offset 2 in network byte
+    /// order for IPv4 and IPv6 and on both platforms, while the family field
+    /// does move. `AF_INET6` was once 30 on both, which made an IPv6 address
+    /// parse as IPv4 and come back as wrong text with no error.
+    #[test]
+    fn a_resolved_address_reads_back() {
+        let v4 = crate::net::resolve("127.0.0.1", 8080).unwrap();
+        assert_eq!(v4.parts(), ("127.0.0.1".to_string(), 8080));
+
+        if let Ok(v6) = crate::net::resolve("::1", 9090) {
+            let (text, port) = v6.parts();
+            assert_eq!(port, 9090);
+            assert_eq!(text, "::1", "an IPv6 address read as IPv4 gives this away");
+        }
+    }
+
+    #[test]
+    fn a_listener_reports_the_port_it_was_given() {
+        let sock = crate::net::listen_on("127.0.0.1", 0).unwrap();
+        let port = sock.local_addr().unwrap().port();
+        assert_ne!(port, 0, "port 0 means the kernel chose one and we read it");
+    }
+
+    #[test]
+    fn the_environment_is_readable_and_absence_is_none() {
+        std::env::set_var("GRASM_SYS_TEST_VAR", "a value");
+        assert_eq!(
+            crate::sys::env_var("GRASM_SYS_TEST_VAR").as_deref(),
+            Some("a value")
+        );
+        assert!(crate::sys::env_var("GRASM_SYS_TEST_ABSENT_VAR").is_none());
+    }
+
+    #[test]
+    fn the_monotonic_clock_does_not_go_backwards() {
+        let start = crate::sys::Instant::now();
+        let mut last = core::time::Duration::ZERO;
+        for _ in 0..1000 {
+            let now = start.elapsed();
+            assert!(now >= last);
+            last = now;
+        }
+    }
+
+    #[test]
+    fn a_thread_local_is_one_per_thread() {
+        thread_local! {
+            static COUNT: core::cell::Cell<i64> = const { core::cell::Cell::new(0) };
+        }
+        COUNT.with(|c| c.set(7));
+        let seen_elsewhere = std::thread::spawn(|| COUNT.with(|c| c.get()))
+            .join()
+            .unwrap();
+        assert_eq!(seen_elsewhere, 0, "a second thread must not see the first's 7");
+        assert_eq!(COUNT.with(|c| c.get()), 7);
+    }
+
+    #[test]
+    fn a_mutex_serialises_and_a_oncelock_runs_once() {
+        static TOTAL: crate::sync::Mutex<i64> = crate::sync::Mutex::new(0);
+        crate::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    for _ in 0..1000 {
+                        *TOTAL.lock() += 1;
+                    }
+                });
+            }
+        });
+        assert_eq!(*TOTAL.lock(), 8000, "a lost update means the lock is not one");
+
+        static MADE: crate::sync::OnceLock<i64> = crate::sync::OnceLock::new();
+        static TIMES: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
+        crate::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    MADE.get_or_init(|| {
+                        TIMES.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+                        42
+                    });
+                });
+            }
+        });
+        assert_eq!(*MADE.get().unwrap(), 42);
+        assert_eq!(TIMES.load(core::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// `scope` has to join every thread before it returns, because the
+    /// closures hold `&mut` into the caller's frame.
+    #[test]
+    fn scope_joins_before_it_returns() {
+        let mut out = [0i64; 64];
+        crate::thread::scope(|scope| {
+            for (i, slot) in out.iter_mut().enumerate() {
+                scope.spawn(move || {
+                    *slot = i as i64 * 2;
+                });
+            }
+        });
+        for (i, got) in out.iter().enumerate() {
+            assert_eq!(*got, i as i64 * 2, "slot {i} was not written before scope returned");
+        }
+    }
+
+    /// libm's `round`, which is halves **away from zero** -- `std`'s rule and
+    /// [L-LIB-ROUND]'s. Rust's formatting rounds halves to even, so getting
+    /// this from the wrong place would move every money column in the corpus.
+    #[test]
+    fn rounding_takes_halves_away_from_zero() {
+        use crate::math::Float;
+        assert_eq!(2.5f64.round(), 3.0);
+        assert_eq!((-2.5f64).round(), -3.0);
+        assert_eq!(0.5f64.round(), 1.0);
+        assert_eq!(1.5f64.round(), 2.0);
+    }
+
+    #[test]
+    fn the_float_maths_agrees_with_known_values() {
+        use crate::math::Float;
+        assert_eq!(4.0f64.sqrt(), 2.0);
+        assert_eq!(2.0f64.powf(10.0), 1024.0);
+        assert_eq!(27.0f64.cbrt(), 3.0);
+        assert_eq!(1.0f64.ln(), 0.0);
+        assert_eq!(1000.0f64.log10(), 3.0);
+        assert_eq!(8.0f64.log2(), 3.0);
+        assert_eq!(0.0f64.sin(), 0.0);
+        assert_eq!(1.0f64.cos(), 1.0f64.cos());
+        assert_eq!((-1.5f64).floor(), -2.0);
+        assert_eq!((-1.5f64).ceil(), -1.0);
+        assert_eq!(3.0f64.hypot(4.0), 5.0);
+        // `log(base)` is a ratio of natural logs, as `std` computes it.
+        assert_eq!(8.0f64.log(2.0), 3.0);
+    }
+
+    /// Both of a child's pipes are drained together, so neither can fill and
+    /// stall the other. More than a pipe buffer on stdout is the case that
+    /// deadlocks if they are read one after the other.
+    #[test]
+    fn a_child_that_writes_more_than_a_pipe_buffer_does_not_stall() {
+        // Both streams are written, and stdout is far more than a pipe
+        // buffer (64 KiB on Linux), so reading one to the end before the
+        // other would stall here rather than fail.
+        let (code, out, err) = crate::process::run(
+            "sh",
+            &[
+                "-c".to_string(),
+                "i=0; while [ $i -lt 2000 ]; do echo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; echo bbbb >&2; i=$((i+1)); done".to_string(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(code, 0);
+        // Every line of both streams arrived, and stdout is well past a pipe
+        // buffer -- which is the property, rather than an exact byte count.
+        assert_eq!(out.iter().filter(|&&b| b == b'\n').count(), 2000);
+        assert_eq!(err.iter().filter(|&&b| b == b'\n').count(), 2000);
+        assert!(out.len() > 100_000, "stdout was only {} bytes", out.len());
+    }
+
+    #[test]
+    fn a_child_reports_its_status_and_its_stderr() {
+        let (code, out, err) = crate::process::run(
+            "sh",
+            &["-c".to_string(), "echo mine; echo theirs >&2; exit 3".to_string()],
+        )
+        .unwrap();
+        assert_eq!(code, 3);
+        assert_eq!(out, b"mine\n");
+        assert_eq!(err, b"theirs\n");
+    }
+
+    /// 127 is what a shell reports for a command it could not run, and what
+    /// `_exit` is given when `execvp` fails.
+    #[test]
+    fn a_command_that_does_not_exist_gives_127() {
+        let (code, _out, _err) =
+            crate::process::run("grasm_sys_no_such_program", &[]).unwrap();
+        assert_eq!(code, 127);
+    }
+}
