@@ -51,17 +51,43 @@ symboliser arrives through std's *default panic hook*, which any `unwrap` or
 slice index in Rust code can reach, and `-Wl,-dead_strip` cannot remove it
 because it is genuinely reachable.
 
+## Measured: `no_std` removes it, on stable
+
+Before committing to the work, the hypothesis was tested. `scratchpad/nostd`
+is a `no_std` staticlib with the shape `grasm_rt` has -- a global allocator
+over `malloc`, a reference-counted box with an `AtomicI64`, and a
+`#[panic_handler]` that writes to fd 2 and exits 101 -- linked into a C `main`
+with the same `-Wl,-dead_strip` the real build uses.
+
+    linked binary: 32.8 KB      (the real hello-world: 351.1 KB)
+
+So the 135 KB symboliser, the 39 KB of unwind tables and the rest of std's
+baggage all go, and they go **without a nightly toolchain**. The floor for a
+Rust runtime that does not link std is about 33 KB; `grasm_rt`'s own logic
+measured 16.5 KB in the current binary, so a `no_std` Grasm hello-world should
+land somewhere under 100 KB -- not merely inside G5's 300 KB but a long way
+inside it.
+
 ## What would remove it
 
-`-Z build-std` with `panic_immediate_abort`, which is what the `Cargo.toml`
-note already names. That needs a nightly toolchain and the `rust-src`
-component; this machine has `stable` and `1.98.0` and no `rust-src`, so it
-could not be tried here. On the evidence above it is worth trying: 351 KB
-minus 135 would be about **216 KB, comfortably inside G5**, and it would be a
-decision about the project's toolchain requirement rather than a code change.
+Two paths, and the measurement above picks the second.
 
-The alternative, a `no_std` runtime, is the other path the note names and is a
-far larger piece of work for the same outcome.
+`-Z build-std` with `panic_immediate_abort` needs a nightly toolchain and
+`rust-src`, and would make nightly a build requirement. It gets to about
+216 KB.
+
+**A `no_std` runtime** keeps the toolchain stable and gets further -- under
+100 KB on the probe's evidence. The cost is the work: of `grasm_rt`'s 11,030
+lines, roughly 210 uses of `std::ptr`, `slice`, `mem`, `cmp`, `cell`, `str`
+and `ops` are renames to `core`, and about 95 uses of `std::io`, `fs`, `net`,
+`thread`, `process` and `time` need direct syscalls. The runtime already does
+exactly that in `sys_poll` and `sys_kqueue`, which declare `poll`, `kqueue`
+and `mmap` as raw `extern "C"`, so the pattern is established rather than
+invented. What it also needs is a `Mutex`, and a `#[panic_handler]` in place
+of `rt_panic`'s current `std::process::exit`.
+
+That is a real project touching the code under every Grasm program, and it is
+gated by 511 differential programs, which is the right way to attempt it.
 
 ## What is not worth trying
 
