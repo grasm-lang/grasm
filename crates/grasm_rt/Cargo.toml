@@ -12,6 +12,12 @@ crate-type = ["staticlib", "rlib"]
 grasm_journal = { path = "../grasm_journal" }
 # Stacks and the context switch concurrent tasks run on.
 grasm_fiber = { path = "../grasm_fiber" }
+# The hash table `std`'s `HashMap` is itself built on. Taken as a dependency
+# only because `no_std` has no `HashMap` and this one is already in every
+# binary the compiler produces -- see docs/binary-size.md, which measures that
+# rather than assuming it. `default-features = false` because `MapHash` is the
+# hasher ([E-MAP-SEED]); none of hashbrown's own is wanted.
+hashbrown = { version = "0.15", default-features = false, features = ["default-hasher", "inline-more"] }
 
 [features]
 # Never reuse a freed box, and trap on touching one. Off by default because it

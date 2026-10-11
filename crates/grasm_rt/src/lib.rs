@@ -1911,14 +1911,15 @@ mod sync {
         pub fn lock(&self) -> Guard<'_, T> {
             let at = self.raw();
             unsafe { pthread_mutex_lock(at) };
-            Guard { at, value: self.value.get() }
+            Guard { at, value: self.value.get(), _held: core::marker::PhantomData }
         }
     }
 
     pub struct Guard<'a, T> {
         at: *mut u8,
         value: *mut T,
-        }
+        _held: core::marker::PhantomData<&'a T>,
+    }
 
     impl<T> Deref for Guard<'_, T> {
         type Target = T;
@@ -1980,7 +1981,7 @@ mod sync {
         pub fn read(&self) -> ReadGuard<'_, T> {
             let at = self.raw();
             unsafe { pthread_rwlock_rdlock(at) };
-            ReadGuard { at, value: self.value.get() }
+            ReadGuard { at, value: self.value.get(), _held: core::marker::PhantomData }
         }
 
         pub fn write(&self) -> Guard<'_, T> {
@@ -1988,7 +1989,7 @@ mod sync {
             unsafe { pthread_rwlock_wrlock(at) };
             // A write guard unlocks an rwlock, not a mutex, so it cannot be
             // the `Guard` above: that one calls `pthread_mutex_unlock`.
-            Guard { at, value: self.value.get() }
+            Guard { at, value: self.value.get(), _held: core::marker::PhantomData }
         }
     }
 
@@ -2395,13 +2396,24 @@ mod maphash {
         (p as u64) ^ ((p >> 64) as u64)
     }
 
-    /// One seed for the process, from the same place `std` gets its own.
+    /// One seed for the process, from the operating system's entropy --
+    /// which is where `std`'s `RandomState` gets its own.
+    ///
+    /// This seed is what makes map iteration order unguessable and so what
+    /// stops a caller choosing keys that all land in one bucket
+    /// ([E-MAP-SEED]). A clock or an address would compile and would weaken
+    /// that, so a failure here is a panic rather than a fallback.
     fn seed() -> u64 {
+        extern "C" {
+            fn getentropy(into: *mut u8, len: usize) -> i32;
+        }
         static SEED: crate::sync::OnceLock<u64> = crate::sync::OnceLock::new();
         *SEED.get_or_init(|| {
-            std::collections::hash_map::RandomState::new()
-                .build_hasher()
-                .finish()
+            let mut bytes = [0u8; 8];
+            if unsafe { getentropy(bytes.as_mut_ptr(), bytes.len()) } != 0 {
+                crate::rt_panic("cannot read the operating system's entropy to seed map hashing");
+            }
+            u64::from_ne_bytes(bytes)
         })
     }
 
@@ -2476,7 +2488,7 @@ mod maphash {
 }
 
 /// What a `map` is made of.
-pub type MapTable = std::collections::HashMap<MapKey, *mut RtVal, maphash::MapHash>;
+pub type MapTable = hashbrown::HashMap<MapKey, *mut RtVal, maphash::MapHash>;
 
 /// A map key, owned.
 ///
@@ -6234,7 +6246,8 @@ pub unsafe extern "C" fn grasm_net_workers(
                 // workers already started may never return, so running this
                 // one later on the calling thread could mean never.
                 if let Err(e) = spawned {
-                    rt_panic(&format!("net_workers: cannot start worker {x}: {e}"));
+                    let _ = e;
+                    rt_panic(&format!("net_workers: cannot start worker {x}"));
                 }
             }
         });
@@ -11205,7 +11218,6 @@ pub unsafe extern "C" fn grasm_proc_pipeline(stages: *mut RtVal, input: *mut RtV
 
 unsafe fn grasm_proc_pipeline_now(stages: *mut RtVal, input: *mut RtVal) -> *mut RtVal {
     use crate::io::Write;
-    use std::process::{Command, Stdio};
 
     let RtPayload::List(items) = &(*stages).payload else {
         return err_of(io_err(
@@ -11236,82 +11248,144 @@ unsafe fn grasm_proc_pipeline_now(stages: *mut RtVal, input: *mut RtVal) -> *mut
     }
     let stdin_text = as_str(input).to_string();
 
-    let mut children: Vec<std::process::Child> = Vec::with_capacity(plan.len());
-    let mut prev: Option<std::process::ChildStdout> = None;
+    // Each stage's stdout becomes the next stage's stdin. Every pipe end is
+    // close-on-exec, so no stage holds open a pipe it is not using and stalls
+    // whichever stage is waiting to see the end of it.
+    use crate::process::{new_pipe, shut, start, stop, wait_for};
+    let mut pids: Vec<i32> = Vec::with_capacity(plan.len());
+    let mut from_previous: i32 = -1;
+    let mut to_first: i32 = -1;
+    let mut last_out: i32 = -1;
+    let mut last_err: i32 = -1;
+
     for (i, (program, argv)) in plan.iter().enumerate() {
         let is_last = i + 1 == plan.len();
-        let mut cmd = Command::new(program);
-        cmd.args(argv);
-        match prev.take() {
-            Some(out) => {
-                cmd.stdin(Stdio::from(out));
+
+        let mut give_up = |message: String,
+                           pids: Vec<i32>,
+                           open: &[i32]|
+         -> *mut RtVal {
+            // Everything already started is killed and reaped, so a pipeline
+            // that fails halfway leaves nothing running.
+            for pid in pids {
+                stop(pid);
+                let _ = wait_for(pid);
             }
-            None => {
-                cmd.stdin(Stdio::piped());
+            for &fd in open {
+                shut(fd);
             }
-        }
-        cmd.stdout(Stdio::piped());
+            err_of(io_err("IoFailed", message))
+        };
+
+        let out = match new_pipe() {
+            Ok(p) => p,
+            Err(e) => {
+                return give_up(
+                    format!("{program}: {e}"),
+                    pids,
+                    &[from_previous, to_first],
+                )
+            }
+        };
         // Only the last stage's stderr is answered with. An earlier stage's
         // goes to this program's own stderr rather than being discarded: a
         // diagnostic nobody sees is worse than one in the wrong place.
-        if is_last {
-            cmd.stderr(Stdio::piped());
-        } else {
-            cmd.stderr(Stdio::inherit());
-        }
-        let mut child = match cmd.spawn() {
-            Ok(c) => c,
-            Err(e) => {
-                // Everything already started is killed and reaped, so a
-                // pipeline that fails halfway leaves nothing running.
-                for mut c in children {
-                    let _ = c.kill();
-                    let _ = c.wait();
+        let (err_reader, err_writer) = if is_last {
+            match new_pipe() {
+                Ok(p) => (p.reader, Some(p.writer)),
+                Err(e) => {
+                    return give_up(
+                        format!("{program}: {e}"),
+                        pids,
+                        &[from_previous, to_first, out.reader, out.writer],
+                    )
                 }
-                return err_of(io_err("IoFailed", format!("{program}: {e}")));
             }
+        } else {
+            (-1, None)
         };
-        if i == 0 && !stdin_text.is_empty() {
-            // Written on a thread: a large input and a chatty child deadlock
-            // if the parent writes everything before it reads anything.
 
-            if let Some(mut sink) = child.stdin.take() {
-                let text = stdin_text.clone();
-                crate::thread::spawn(move || {
-                    let _ = sink.write_all(text.as_bytes());
-                });
+        let stdin_fd = if i == 0 {
+            match new_pipe() {
+                Ok(p) => {
+                    to_first = p.writer;
+                    p.reader
+                }
+                Err(e) => {
+                    return give_up(
+                        format!("{program}: {e}"),
+                        pids,
+                        &[out.reader, out.writer, err_reader],
+                    )
+                }
             }
-        } else if i == 0 {
-            // Closed, so a filter reading to end-of-input does not wait
-            // forever for input that is never coming.
-            drop(child.stdin.take());
+        } else {
+            from_previous
+        };
+
+        let started = start(
+            program,
+            argv,
+            Some(stdin_fd),
+            Some(out.writer),
+            err_writer,
+        );
+
+        // The parent's copies go now: a reader sees no end of file while any
+        // writer is open, its own included.
+        shut(stdin_fd);
+        shut(out.writer);
+        if let Some(fd) = err_writer {
+            shut(fd);
         }
-        if !is_last {
-            prev = child.stdout.take();
+
+        match started {
+            Ok(pid) => pids.push(pid),
+            Err(e) => {
+                return give_up(
+                    format!("{program}: {e}"),
+                    pids,
+                    &[out.reader, err_reader, to_first],
+                )
+            }
         }
-        children.push(child);
+
+        from_previous = out.reader;
+        if is_last {
+            last_out = out.reader;
+            last_err = err_reader;
+        }
     }
 
-    let last = children.pop().expect("at least one stage");
-    let out = match last.wait_with_output() {
-        Ok(o) => o,
-        Err(e) => return err_of(io_err("IoFailed", e.to_string())),
-    };
-    // The earlier stages are reaped so they do not become zombies. Their exit
-    // statuses are deliberately not reported: a pipeline's status is its last
-    // stage's, which is what every shell means by it.
-    for mut c in children {
-        let _ = c.wait();
+    if stdin_text.is_empty() {
+        // Closed, so a filter reading to end-of-input does not wait forever
+        // for input that is never coming.
+        shut(to_first);
+    } else {
+        // Written on a thread: a large input and a chatty child deadlock if
+        // the parent writes everything before it reads anything.
+        let text = stdin_text.clone();
+        let sink = to_first;
+        crate::thread::spawn(move || {
+            crate::process::write_and_close(sink, text.as_bytes());
+        });
     }
-    let code = out.status.code().map_or(-1, i64::from);
+
+    let (got_out, got_err) = crate::process::drain_both(last_out, last_err);
+    // The last stage decides the status, which is what every shell means by a
+    // pipeline's status. The earlier ones are still reaped, so none is left a
+    // zombie.
+    let mut code = -1;
+    for (i, pid) in pids.iter().enumerate() {
+        let status = wait_for(*pid).unwrap_or(-1);
+        if i + 1 == pids.len() {
+            code = status;
+        }
+    }
     let fields = vec![
         alloc(RtPayload::I64(code)),
-        alloc(RtPayload::Str(RtStr::of(&String::from_utf8_lossy(
-            &out.stdout,
-        )))),
-        alloc(RtPayload::Str(RtStr::of(&String::from_utf8_lossy(
-            &out.stderr,
-        )))),
+        alloc(RtPayload::Str(RtStr::of(&String::from_utf8_lossy(&got_out)))),
+        alloc(RtPayload::Str(RtStr::of(&String::from_utf8_lossy(&got_err)))),
     ];
     ok_of(alloc(RtPayload::Tuple(fields.into())))
 }
@@ -12444,7 +12518,7 @@ pub unsafe extern "C" fn grasm_list_min_max(v: *mut RtVal, want_max: i8) -> *mut
 
 /// Names outlive the values that carry them, and a journal holds few of them.
 fn interned(text: &str) -> &'static str {
-    use std::collections::HashMap;
+    use hashbrown::HashMap;
     use crate::sync::{Mutex, OnceLock};
     static NAMES: OnceLock<Mutex<HashMap<String, &'static str>>> = OnceLock::new();
     let mut map = NAMES
@@ -12876,7 +12950,7 @@ pub unsafe extern "C" fn grasm_handler_install(h: *mut RtVal) {
 #[cfg(test)]
 mod maphash_tests {
     use super::maphash::MapHash;
-    use std::collections::HashSet;
+    use hashbrown::HashSet;
     use core::hash::{BuildHasher, Hash};
 
     fn hash_of<T: Hash>(b: &MapHash, v: &T) -> u64 {
