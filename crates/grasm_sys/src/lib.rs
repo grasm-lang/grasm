@@ -11,6 +11,61 @@
 #![allow(clippy::missing_safety_doc)]
 extern crate alloc;
 
+/// The handful of libc calls `wasm32-unknown-unknown` does not have.
+///
+/// That target has no filesystem, no environment and no process to exit, and
+/// `std` reports the same by failing every one of these. So they fail here
+/// too, rather than each caller growing a `cfg`: `grasm_journal` asks for a
+/// file when `GRASM_RECORD` is set, that ask returns an error, and the
+/// journal is simply off in the browser -- which is what it already was.
+#[cfg(target_arch = "wasm32")]
+pub mod absent {
+    pub unsafe fn open(_path: *const u8, _flags: i32, _mode: u32) -> i32 {
+        -1
+    }
+    pub unsafe fn close(_fd: i32) -> i32 {
+        0
+    }
+    pub unsafe fn sys_read(_fd: i32, _buf: *mut u8, _n: usize) -> isize {
+        -1
+    }
+    pub unsafe fn sys_write(_fd: i32, _buf: *const u8, _n: usize) -> isize {
+        -1
+    }
+    pub unsafe fn lseek(_fd: i32, _at: i64, _whence: i32) -> i64 {
+        -1
+    }
+    pub unsafe fn fsync(_fd: i32) -> i32 {
+        -1
+    }
+    pub unsafe fn sys_rename(_from: *const u8, _to: *const u8) -> i32 {
+        -1
+    }
+    pub unsafe fn unlink(_path: *const u8) -> i32 {
+        -1
+    }
+    pub unsafe fn mkdir(_path: *const u8, _mode: u32) -> i32 {
+        -1
+    }
+    pub unsafe fn access(_path: *const u8, _mode: i32) -> i32 {
+        -1
+    }
+    pub unsafe fn opendir(_path: *const u8) -> *mut u8 {
+        core::ptr::null_mut()
+    }
+    pub unsafe fn closedir(_dir: *mut u8) -> i32 {
+        0
+    }
+    pub unsafe fn getenv(_name: *const u8) -> *const u8 {
+        core::ptr::null()
+    }
+    /// A wasm module cannot end a process, so it traps instead, which is the
+    /// nearest thing the platform has.
+    pub unsafe fn libc_exit(code: i32) -> ! {
+        panic!("exit({code}) in a wasm module, which cannot end a process")
+    }
+}
+
 /// The bytes of a NUL-terminated C string, not counting the NUL.
 ///
 /// Declaring `strlen` is flagged as shadowing the one `std` itself links, and
@@ -38,14 +93,71 @@ pub unsafe fn c_bytes(at: *const u8) -> &'static [u8] {
 /// macOS and Linux are the targets (`crates/grasm_rt` names no other), and
 /// both have pthreads.
 pub mod tls {
+    #[cfg(not(target_arch = "wasm32"))]
     use alloc::boxed::Box;
+    #[cfg(not(target_arch = "wasm32"))]
     use core::sync::atomic::{AtomicU64, Ordering};
+
+    /// The value is gone because its thread is ending. On `wasm32` it never
+    /// is, because the thread that would end is the only one there is.
+    #[derive(Debug)]
+    pub struct Gone;
+
+    /// `wasm32-unknown-unknown` has no pthreads and no second thread
+    /// (scripts/wasmtest.sh: "no threads, `par_map` runs on one core"), so a
+    /// thread-local there is just a value, and asking the system for one
+    /// would be asking for `pthread_key_create` -- which is exactly how the
+    /// wasm build broke when this crate first appeared.
+    #[cfg(target_arch = "wasm32")]
+    pub struct Local<T: 'static> {
+        slot: core::cell::UnsafeCell<Option<T>>,
+        init: fn() -> T,
+    }
+
+    // Safety: `wasm32-unknown-unknown` is single-threaded, so nothing can
+    // reach this concurrently. This is the assumption the whole branch rests
+    // on, and it is the target's, not a hope about how callers behave.
+    #[cfg(target_arch = "wasm32")]
+    unsafe impl<T: 'static> Sync for Local<T> {}
+
+    #[cfg(target_arch = "wasm32")]
+    impl<T: 'static> Local<T> {
+        pub const fn new(init: fn() -> T) -> Local<T> {
+            Local {
+                slot: core::cell::UnsafeCell::new(None),
+                init,
+            }
+        }
+
+        pub fn with<R>(&self, f: impl FnOnce(&T) -> R) -> R {
+            match self.try_with(f) {
+                Ok(r) => r,
+                Err(_) => unreachable!("a wasm32 thread-local is never gone"),
+            }
+        }
+
+        pub fn try_with<R>(&self, f: impl FnOnce(&T) -> R) -> Result<R, Gone> {
+            let at = self.slot.get();
+            // Safety: made before it is borrowed, and the initialiser runs
+            // to completion before anything holds a reference -- so a
+            // re-entrant `try_with` finds a value and never writes over one
+            // that is borrowed.
+            unsafe {
+                if (*at).is_none() {
+                    let made = (self.init)();
+                    *at = Some(made);
+                }
+                Ok(f((*at).as_ref().unwrap()))
+            }
+        }
+    }
 
     #[cfg(target_os = "macos")]
     pub type Key = u64;
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(all(not(target_os = "macos"), not(target_arch = "wasm32")))]
     pub type Key = u32;
 
+    #[cfg(not(target_arch = "wasm32"))]
     extern "C" {
         fn pthread_key_create(k: *mut Key, dtor: Option<unsafe extern "C" fn(*mut u8)>) -> i32;
         fn pthread_key_delete(k: Key) -> i32;
@@ -56,6 +168,7 @@ pub mod tls {
     /// One value per thread, made on first use and dropped when the thread
     /// ends -- which is what `pthread_key_create`'s destructor is for, and
     /// what keeps this equivalent to the macro it replaces.
+    #[cfg(not(target_arch = "wasm32"))]
     pub struct Local<T: 'static> {
         /// The pthread key plus one, so that zero can mean "not yet made".
         key: AtomicU64,
@@ -66,8 +179,10 @@ pub mod tls {
     // storage, where exactly one thread can reach it, so `T` need not be
     // `Sync` for the handle to be shared -- the same reasoning `std`'s own
     // `LocalKey` uses.
+    #[cfg(not(target_arch = "wasm32"))]
     unsafe impl<T: 'static> Sync for Local<T> {}
 
+    #[cfg(not(target_arch = "wasm32"))]
     impl<T: 'static> Local<T> {
         pub const fn new(init: fn() -> T) -> Local<T> {
             Local { key: AtomicU64::new(0), init }
@@ -130,14 +245,11 @@ pub mod tls {
         }
     }
 
-    /// The value is gone because its thread is ending.
-    #[derive(Debug)]
-    pub struct Gone;
-
     /// The value plus whether it is still there. The flag has to live beside
     /// the value rather than in the descriptor, because the destructor below
     /// is handed the value and not the key, so it has nowhere else to record
     /// that it ran.
+    #[cfg(not(target_arch = "wasm32"))]
     struct Slot<T> {
         alive: bool,
         value: core::mem::ManuallyDrop<T>,
@@ -154,6 +266,7 @@ pub mod tls {
     /// `try_with` report the value as gone. The cost is one small box per
     /// thread that touched this key, which is bounded by the number of
     /// threads; the value's own allocations are released here as usual.
+    #[cfg(not(target_arch = "wasm32"))]
     unsafe extern "C" fn drop_in_place<T>(at: *mut u8) {
         if at.is_null() {
             return;
@@ -179,6 +292,7 @@ pub mod tls {
 /// rather than a compile error. So: buffered here too, and `sys::exit` flushes
 /// before it exits, which is what `std` was doing for us.
 pub mod io {
+    #[cfg(not(target_arch = "wasm32"))]
     use crate::c_bytes;
     use crate::sync::{Guard, Mutex};
     use alloc::string::String;
@@ -190,12 +304,13 @@ pub mod io {
         #[link_name = "__error"]
         fn errno_at() -> *mut i32;
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(all(not(target_os = "macos"), not(target_arch = "wasm32")))]
     extern "C" {
         #[link_name = "__errno_location"]
         fn errno_at() -> *mut i32;
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     extern "C" {
         fn write(fd: i32, buf: *const u8, n: usize) -> isize;
         fn read(fd: i32, buf: *mut u8, n: usize) -> isize;
@@ -213,8 +328,17 @@ pub mod io {
     #[cfg(not(target_os = "macos"))]
     pub const EILSEQ: i32 = 84;
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn errno() -> i32 {
         unsafe { *errno_at() }
+    }
+
+    /// There is no errno on `wasm32-unknown-unknown`, and nothing here can
+    /// fail in a way that would set one: the calls that would are all absent
+    /// on that target.
+    #[cfg(target_arch = "wasm32")]
+    pub fn errno() -> i32 {
+        0
     }
 
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -253,24 +377,43 @@ pub mod io {
         }
     }
 
+    /// The text `std` prints for an errno, which keeps error messages
+    /// identical across this conversion. `wasm32-unknown-unknown` has no
+    /// `strerror`, and no call here can set an errno on that target anyway.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn errno_text(code: i32) -> Option<&'static str> {
+        let at = unsafe { strerror(code) };
+        if at.is_null() {
+            return None;
+        }
+        core::str::from_utf8(unsafe { c_bytes(at) }).ok()
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn errno_text(_code: i32) -> Option<&'static str> {
+        None
+    }
+
     impl fmt::Display for Error {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            // `strerror` gives the same text `std` prints for an errno, which
-            // keeps error messages identical across this conversion.
-            let at = unsafe { strerror(self.0) };
-            if at.is_null() {
-                return write!(f, "os error {}", self.0);
-            }
-            let bytes = unsafe { c_bytes(at) };
-            match core::str::from_utf8(bytes) {
-                Ok(text) => f.write_str(text),
-                Err(_) => write!(f, "os error {}", self.0),
+            match errno_text(self.0) {
+                Some(text) => f.write_str(text),
+                None => write!(f, "os error {}", self.0),
             }
         }
     }
 
-    /// `write(2)` can return short or be interrupted, so neither is a failure
-    /// until the loop cannot make progress.
+    /// `wasm32-unknown-unknown` has no file descriptors. `std`'s stderr on
+    /// that target accepts and discards, which is what `eprintln!` did here
+    /// before this crate existed, so this does the same rather than
+    /// inventing a failure. A Grasm program's own output does not come this
+    /// way: the wasm engine hands it to the host through `grasm_run`.
+    #[cfg(target_arch = "wasm32")]
+    fn write_fully(_fd: i32, _bytes: &[u8]) -> Result<()> {
+        Ok(())
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     fn write_fully(fd: i32, bytes: &[u8]) -> Result<()> {
         let mut done = 0;
         while done < bytes.len() {
@@ -397,6 +540,14 @@ pub mod io {
     /// One line from stdin, newline included, as `BufRead::read_line` gives
     /// it. Unbuffered -- the runtime reads lines rarely and a buffer here
     /// would have to be shared with anything else reading fd 0.
+    /// No stdin on `wasm32-unknown-unknown`: end of input, immediately,
+    /// which is what reading fd 0 there amounts to.
+    #[cfg(target_arch = "wasm32")]
+    pub fn read_line(_into: &mut String) -> Result<usize> {
+        Ok(0)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn read_line(into: &mut String) -> Result<usize> {
         let mut got = 0;
         let mut byte = [0u8; 1];
@@ -1470,6 +1621,10 @@ pub mod fs {
     const EEXIST: i32 = 17;
     const F_OK: i32 = 0;
 
+    #[cfg(target_arch = "wasm32")]
+    use crate::absent::*;
+
+    #[cfg(not(target_arch = "wasm32"))]
     extern "C" {
         fn open(path: *const u8, flags: i32, mode: u32) -> i32;
         fn close(fd: i32) -> i32;
@@ -1492,12 +1647,12 @@ pub mod fs {
 
     // `readdir` is `readdir$INODE64` on macOS, because the original returns
     // a 32-bit inode and was versioned out.
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", not(target_arch = "wasm32")))]
     extern "C" {
         #[link_name = "readdir$INODE64"]
         fn readdir(dir: *mut u8) -> *const Dirent;
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(all(not(target_os = "macos"), not(target_arch = "wasm32")))]
     extern "C" {
         #[link_name = "readdir64"]
         fn readdir(dir: *mut u8) -> *const Dirent;
@@ -1505,7 +1660,7 @@ pub mod fs {
 
     // Laid out per platform so the compiler works out where `name` starts.
     // Hardcoding that offset is how this kind of code goes wrong.
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", not(target_arch = "wasm32")))]
     #[repr(C)]
     struct Dirent {
         ino: u64,
@@ -1515,7 +1670,7 @@ pub mod fs {
         kind: u8,
         name: [u8; 1024],
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(all(not(target_os = "macos"), not(target_arch = "wasm32")))]
     #[repr(C)]
     struct Dirent {
         ino: u64,
@@ -1797,6 +1952,13 @@ pub mod fs {
         Ok(Metadata { len: file.len()? })
     }
 
+    /// No directories on `wasm32-unknown-unknown`, as `std` also reports.
+    #[cfg(target_arch = "wasm32")]
+    pub fn read_dir(_path: &str) -> Result<Vec<String>> {
+        Err(Error::from_raw_os_error(crate::io::ENOENT))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     /// Names only, which is what the one caller wants. The directory handle
     /// is closed on every path out, including the error ones.
     pub fn read_dir(path: &str) -> Result<Vec<String>> {
@@ -1850,12 +2012,19 @@ pub mod sys {
         pub nanos: i64,
     }
 
+    #[cfg(target_arch = "wasm32")]
+    use crate::absent::{getenv, libc_exit};
+
+    #[cfg(not(target_arch = "wasm32"))]
     extern "C" {
-        fn clock_gettime(clock: i32, at: *mut TimeSpec) -> i32;
         fn getenv(name: *const u8) -> *const u8;
         #[link_name = "exit"]
         fn libc_exit(code: i32) -> !;
         pub fn abort() -> !;
+    }
+
+    extern "C" {
+        fn clock_gettime(clock: i32, at: *mut TimeSpec) -> i32;
     }
 
     /// `std` flushed stdout when the process ended; raw file descriptors do
@@ -1923,16 +2092,138 @@ pub mod sys {
 pub mod sync {
     use core::cell::UnsafeCell;
     use core::mem::MaybeUninit;
+    #[cfg(not(target_arch = "wasm32"))]
     use core::ops::{Deref, DerefMut};
     use core::sync::atomic::{AtomicU8, Ordering};
+
+    /// `wasm32-unknown-unknown` has no pthreads and one thread, so a lock
+    /// there holds no lock. It still counts, for one reason: without the
+    /// count, two live guards would be two `&mut` to the same value, which is
+    /// undefined behaviour. A pthread mutex would deadlock on that; this
+    /// panics and says so, which is the same bug reported instead of
+    /// miscompiled.
+    #[cfg(target_arch = "wasm32")]
+    mod single {
+        use core::cell::{Cell, UnsafeCell};
+        use core::ops::{Deref, DerefMut};
+
+        pub struct Mutex<T> {
+            held: Cell<bool>,
+            value: UnsafeCell<T>,
+        }
+
+    unsafe impl<T: Send> Send for Mutex<T> {}
+    unsafe impl<T: Send> Sync for Mutex<T> {}
+
+        impl<T> Mutex<T> {
+            pub const fn new(value: T) -> Mutex<T> {
+                Mutex {
+                    held: Cell::new(false),
+                    value: UnsafeCell::new(value),
+                }
+            }
+
+            pub fn lock(&self) -> Guard<'_, T> {
+                assert!(
+                    !self.held.get(),
+                    "a lock was taken twice on the one thread wasm32 has, which a pthread mutex would deadlock on"
+                );
+                self.held.set(true);
+                Guard { held: &self.held, value: self.value.get() }
+            }
+        }
+
+        pub struct Guard<'a, T> {
+            held: &'a Cell<bool>,
+            value: *mut T,
+        }
+
+    impl<T> Deref for Guard<'_, T> {
+            type Target = T;
+            fn deref(&self) -> &T {
+                unsafe { &*self.value }
+            }
+        }
+
+    impl<T> DerefMut for Guard<'_, T> {
+            fn deref_mut(&mut self) -> &mut T {
+                unsafe { &mut *self.value }
+            }
+        }
+
+    impl<T> Drop for Guard<'_, T> {
+            fn drop(&mut self) {
+                self.held.set(false);
+            }
+        }
+
+        /// Readers may overlap, so this counts them rather than forbidding a
+        /// second one.
+        pub struct RwLock<T> {
+            readers: Cell<usize>,
+            writing: Cell<bool>,
+            value: UnsafeCell<T>,
+        }
+
+    unsafe impl<T: Send> Send for RwLock<T> {}
+    unsafe impl<T: Send + Sync> Sync for RwLock<T> {}
+
+        impl<T> RwLock<T> {
+            pub const fn new(value: T) -> RwLock<T> {
+                RwLock {
+                    readers: Cell::new(0),
+                    writing: Cell::new(false),
+                    value: UnsafeCell::new(value),
+                }
+            }
+
+            pub fn read(&self) -> ReadGuard<'_, T> {
+                assert!(!self.writing.get(), "a read while writing, on one thread");
+                self.readers.set(self.readers.get() + 1);
+                ReadGuard { readers: &self.readers, value: self.value.get() }
+            }
+
+            pub fn write(&self) -> Guard<'_, T> {
+                assert!(
+                    !self.writing.get() && self.readers.get() == 0,
+                    "a write while the lock is held, on one thread"
+                );
+                self.writing.set(true);
+                Guard { held: &self.writing, value: self.value.get() }
+            }
+        }
+
+        pub struct ReadGuard<'a, T> {
+            readers: &'a Cell<usize>,
+            value: *mut T,
+        }
+
+    impl<T> Deref for ReadGuard<'_, T> {
+            type Target = T;
+            fn deref(&self) -> &T {
+                unsafe { &*self.value }
+            }
+        }
+
+    impl<T> Drop for ReadGuard<'_, T> {
+            fn drop(&mut self) {
+                self.readers.set(self.readers.get() - 1);
+            }
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub use single::{Guard, Mutex, ReadGuard, RwLock};
 
     // Opaque, and sized generously: macOS wants 64 bytes for a mutex and 200
     // for an rwlock, glibc 40 and 56. Over-sizing costs bytes in a static and
     // under-sizing corrupts the heap, so these are the larger of the two
     // plus room.
     #[repr(C, align(16))]
+    #[cfg(not(target_arch = "wasm32"))]
     struct RawLock([u8; 256]);
 
+    #[cfg(not(target_arch = "wasm32"))]
     extern "C" {
         fn pthread_mutex_init(m: *mut u8, attr: *const u8) -> i32;
         fn pthread_mutex_lock(m: *mut u8) -> i32;
@@ -1950,15 +2241,20 @@ pub mod sync {
     const SETTING: u8 = 1;
     const READY: u8 = 2;
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub struct Mutex<T> {
         raw: UnsafeCell<MaybeUninit<RawLock>>,
         state: AtomicU8,
         value: UnsafeCell<T>,
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     unsafe impl<T: Send> Send for Mutex<T> {}
+    #[cfg(not(target_arch = "wasm32"))]
     unsafe impl<T: Send> Sync for Mutex<T> {}
 
+    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(target_arch = "wasm32"))]
     impl<T> Mutex<T> {
         pub const fn new(value: T) -> Mutex<T> {
             Mutex {
@@ -1995,12 +2291,14 @@ pub mod sync {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub struct Guard<'a, T> {
         at: *mut u8,
         value: *mut T,
         _held: core::marker::PhantomData<&'a T>,
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     impl<T> Deref for Guard<'_, T> {
         type Target = T;
         fn deref(&self) -> &T {
@@ -2008,27 +2306,34 @@ pub mod sync {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     impl<T> DerefMut for Guard<'_, T> {
         fn deref_mut(&mut self) -> &mut T {
             unsafe { &mut *self.value }
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     impl<T> Drop for Guard<'_, T> {
         fn drop(&mut self) {
             unsafe { pthread_mutex_unlock(self.at) };
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub struct RwLock<T> {
         raw: UnsafeCell<MaybeUninit<RawLock>>,
         state: AtomicU8,
         value: UnsafeCell<T>,
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     unsafe impl<T: Send> Send for RwLock<T> {}
+    #[cfg(not(target_arch = "wasm32"))]
     unsafe impl<T: Send + Sync> Sync for RwLock<T> {}
 
+    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(target_arch = "wasm32"))]
     impl<T> RwLock<T> {
         pub const fn new(value: T) -> RwLock<T> {
             RwLock {
@@ -2073,12 +2378,14 @@ pub mod sync {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub struct ReadGuard<'a, T> {
         at: *mut u8,
         value: *mut T,
         _held: core::marker::PhantomData<&'a T>,
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     impl<T> Deref for ReadGuard<'_, T> {
         type Target = T;
         fn deref(&self) -> &T {
@@ -2086,6 +2393,7 @@ pub mod sync {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     impl<T> Drop for ReadGuard<'_, T> {
         fn drop(&mut self) {
             unsafe { pthread_rwlock_unlock(self.at) };
