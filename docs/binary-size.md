@@ -135,7 +135,12 @@ through, `grasm_rt_abi`, supplies the allocator and the panic handler.
 `gimli`/`addr2line`/`rust_panic` symbols. The archive itself went from 21 MB
 to 4.7 MB. The probe predicted "under 100 KB"; the measurement is 68.3.
 
-**What this does not yet say.** One program ran correctly. Roughly 2,100 lines
+**Checked so far:** all 17 `examples/` programs give byte-identical output
+compiled and interpreted (`parallel_map` needs 2m18s interpreted, so a short
+timeout makes it look like a disagreement). difftest over the full corpus has
+not completed yet.
+
+**What this does not yet say.** 17 programs ran correctly. Roughly 2,100 lines
 of new syscall code -- `fs`, `net`, `process`, `thread`, `io`, `tls`, `sync`
 -- have not been through the gates. Every hazard that code was written around
 is one that fails under load or on large input rather than at compile time, so
@@ -159,6 +164,15 @@ the number above is a measurement and not yet a result.
   halves-away-from-zero, which is what `std` did and what [L-LIB-ROUND]
   requires -- a different rule there would move every money column in the
   corpus.
+- **`rust_eh_personality` has to exist.** `core` ships precompiled with
+  `panic = "unwind"`, so a few of its paths still name the landing-pad
+  personality routine even in a build that cannot unwind -- which is what the
+  compiler's "rebuilding your crate with panic=abort may not be enough" means.
+  A no-op suffices, since no landing pad is ever entered. **Found by a
+  compiled program failing to link, not by a warning**: hello-world does not
+  reach those paths and linked fine, so 16 of the 17 examples failed to build
+  while the one measurement taken looked perfect. A single-program check was
+  not enough to notice.
 - **The allocator must honour over-aligned requests.** `malloc` promises 16
   bytes; anything stricter goes through `posix_memalign`, and a `realloc` of
   such a block copies by hand because `realloc` cannot promise the alignment.

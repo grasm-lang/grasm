@@ -96,3 +96,17 @@ fn panicked(info: &core::panic::PanicInfo<'_>) -> ! {
         exit(101)
     }
 }
+
+/// The landing-pad personality routine, which nothing here can reach.
+///
+/// `core` is distributed precompiled with `panic = "unwind"`, so a few of its
+/// code paths still name this symbol even in a build that cannot unwind --
+/// which is what the compiler means by "rebuilding your crate with
+/// panic=abort may not be enough". With `panic = "abort"` and a
+/// `#[panic_handler]` that exits, no landing pad is ever entered, so the
+/// symbol only has to exist.
+///
+/// Found by a compiled program failing to link, not by a warning: a
+/// hello-world does not reach the paths that reference it and linked fine.
+#[no_mangle]
+pub extern "C" fn rust_eh_personality() {}
