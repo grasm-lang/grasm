@@ -298,3 +298,50 @@ like a backend that stopped early.
 SIGKILL with empty output, at load average 23 with a `cargo-fuzz` run holding
 the machine. Three runs alone, all identical. Both failure modes are recorded
 in memory for the next person; neither was a defect.
+
+## The conversion cost 31% of `tree`, and the cause was one instruction (2026-10-11)
+
+G5 was met; the question was what it cost G2. Against master, A/B with
+alternating runs and processor time rather than wall:
+
+| | baseline | candidate | |
+|---|---:|---:|---|
+| `tree`, before the fix | 18.1 ms | **23.9 ms** | 1.31x slower |
+| `tree`, after | 18.1 ms | 18.0 ms | parity |
+
+Confirmed three ways before being believed: `abbench` three times running,
+an independent `getrusage` harness (18.15 ms best against 23.99), and the
+same ratio at 60x the workload.
+
+### What it was not
+
+`GRASM_ALLOC_STATS` gave **196,820 allocations on both sides** -- identical
+work, so the cost was per operation rather than extra operations.
+
+Thread-local storage was the obvious candidate: `docs/mining.md` records
+`tree`'s release walk making two reaches for thread state per node, and
+`_tlv_get_addr` at 48 samples. Priced by removing -- a single-threaded
+pointer cache, bypassing `pthread_getspecific` entirely -- it moved 1.31x to
+**1.26x**. A sixth of the problem. The obvious candidate was mostly wrong,
+which is what [[measure-ceiling-before-building]] says to expect.
+
+### What it was
+
+`sample` on a 60x run, then `otool` on the hottest address:
+
+    0000000100007460    casalb  w9, w8, [x10]        279 samples of ~1,600
+
+`Mutex::raw`, `RwLock::raw` and `OnceLock::get_or_init` each ran a
+**compare-exchange** to check their own three-state initialiser -- on every
+call, for the life of the process. On arm64 that is `casalb`, a
+read-modify-write with full barrier semantics, where the question ("is this
+made yet?") is answered by a load.
+
+They now load first and branch, with the compare-exchange moved to an
+`#[inline(never)]` cold path that runs once. `tree`'s hottest instruction
+was a lock asking whether it had been created, several hundred thousand
+times.
+
+After: `tree` 1.01x, `wordfreq` 1.07x, `sort` 1.02x, `sieve` 1.02x, `fib`
+1.03x, `matmul` 1.01x -- all nominally faster, all within the +/-10% this
+machine swings, and none slower.

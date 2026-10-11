@@ -129,6 +129,7 @@ pub mod tls {
             }
         }
 
+        #[inline(always)]
         pub fn with<R>(&self, f: impl FnOnce(&T) -> R) -> R {
             match self.try_with(f) {
                 Ok(r) => r,
@@ -191,8 +192,13 @@ pub mod tls {
         /// The key, made once. Two threads racing both make one; the loser
         /// deletes its own and takes the winner's, so no key leaks and every
         /// thread agrees which one holds the value.
+        #[inline(always)]
         fn key(&self) -> Key {
-            let seen = self.key.load(Ordering::Acquire);
+            // Relaxed on the fast path: the only thing shared here is the
+            // key's own value, and the `Slot` it names is reachable by one
+            // thread, so there is nothing for an Acquire to order against.
+            // Acquire stays on the path that makes the key.
+            let seen = self.key.load(Ordering::Relaxed);
             if seen != 0 {
                 return (seen - 1) as Key;
             }
@@ -225,7 +231,26 @@ pub mod tls {
         /// while the thread is ending. A caller that runs then -- returning a
         /// stack to a pool, say -- has to know the pool is gone rather than
         /// quietly building a new one that nothing will ever free.
+        #[inline(always)]
         pub fn try_with<R>(&self, f: impl FnOnce(&T) -> R) -> Result<R, Gone> {
+            let k = self.key();
+            let at = unsafe { pthread_getspecific(k) } as *mut Slot<T>;
+            if !at.is_null() {
+                // Safety: made by this thread, and only this thread reaches
+                // it.
+                let slot = unsafe { &*at };
+                if slot.alive {
+                    return Ok(f(&slot.value));
+                }
+                return Err(Gone);
+            }
+            self.first_touch(f)
+        }
+
+        /// The once-per-thread path, kept out of line so the hot one above is
+        /// a load, a call and two branches.
+        #[inline(never)]
+        fn first_touch<R>(&self, f: impl FnOnce(&T) -> R) -> Result<R, Gone> {
             let k = self.key();
             let mut at = unsafe { pthread_getspecific(k) } as *mut Slot<T>;
             if at.is_null() {
@@ -2331,8 +2356,22 @@ pub mod sync {
             }
         }
 
+        /// A **load** first. The lock is made once and read for the rest of
+        /// the process, so the common case has to be an acquire load and a
+        /// branch -- not a compare-exchange, which is what this was. On
+        /// arm64 that compiles to `casalb`, a full barrier, and it was the
+        /// single hottest instruction in `tree`: 279 samples of about 1,600.
+        #[inline(always)]
         fn raw(&self) -> *mut u8 {
             let at = self.raw.get() as *mut u8;
+            if self.state.load(Ordering::Acquire) == READY {
+                return at;
+            }
+            self.make(at)
+        }
+
+        #[inline(never)]
+        fn make(&self, at: *mut u8) -> *mut u8 {
             loop {
                 match self.state.compare_exchange(
                     UNSET,
@@ -2410,8 +2449,18 @@ pub mod sync {
             }
         }
 
+        /// A load first, as in `Mutex::raw` above and for the same reason.
+        #[inline(always)]
         fn raw(&self) -> *mut u8 {
             let at = self.raw.get() as *mut u8;
+            if self.state.load(Ordering::Acquire) == READY {
+                return at;
+            }
+            self.make(at)
+        }
+
+        #[inline(never)]
+        fn make(&self, at: *mut u8) -> *mut u8 {
             loop {
                 match self.state.compare_exchange(
                     UNSET,
@@ -2529,7 +2578,18 @@ pub mod sync {
             }
         }
 
+        #[inline(always)]
         pub fn get_or_init(&self, make: impl FnOnce() -> T) -> &T {
+            // The same point as `Mutex::raw`: once written, every later call
+            // only has to load.
+            if self.state.load(Ordering::Acquire) == READY {
+                return unsafe { (*self.value.get()).assume_init_ref() };
+            }
+            self.init_once(make)
+        }
+
+        #[inline(never)]
+        fn init_once(&self, make: impl FnOnce() -> T) -> &T {
             loop {
                 match self.state.compare_exchange(
                     UNSET,
