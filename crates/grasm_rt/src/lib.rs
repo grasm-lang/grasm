@@ -15,6 +15,13 @@ extern crate grasm_sys;
 
 use crate::io::Write;
 // `core` has no float maths; these come from libm (grasm_sys::math).
+//
+// Unused in a *test* build, and the reason is worth knowing: a test target
+// links `std` for the harness, and `std`'s inherent `f64::sqrt` then shadows
+// this trait. That is also why the missing float methods only appeared once
+// the staticlib was built -- every earlier check had `std` somewhere in the
+// graph, quietly supplying them.
+#[cfg_attr(test, allow(unused_imports))]
 use grasm_sys::math::Float as _;
 
 // What `std`'s prelude gave for free. `alloc` owns the growable types; `core`
@@ -4176,8 +4183,7 @@ pub unsafe extern "C" fn grasm_net_workers(
                 // Unlike a `par_map`, there is nothing to fall back to: the
                 // workers already started may never return, so running this
                 // one later on the calling thread could mean never.
-                if let Err(e) = spawned {
-                    let _ = e;
+                if spawned.is_err() {
                     rt_panic(&format!("net_workers: cannot start worker {x}"));
                 }
             }
@@ -8935,7 +8941,7 @@ unsafe fn grasm_tcp_read_now(handle: *mut RtVal) -> *mut RtVal {
     };
     let read = socket_with(h, |s| match s {
         Socket::Stream(stream) => {
-            match read_sized(|b| (&mut &*stream).read(b).map(|n| (n, ()))) {
+            match read_sized(|b| stream.read(b).map(|n| (n, ()))) {
                 Ok((buf, ())) => {
                     // Lossy, because a socket carries bytes and a Grasm `str`
                     // is text: a client that sends invalid UTF-8 gets its bytes
@@ -9034,7 +9040,7 @@ unsafe fn grasm_tcp_read_bytes_now(handle: *mut RtVal) -> *mut RtVal {
     };
     let read = socket_with(h, |s| match s {
         Socket::Stream(stream) => {
-            match read_sized(|b| (&mut &*stream).read(b).map(|n| (n, ()))) {
+            match read_sized(|b| stream.read(b).map(|n| (n, ()))) {
                 Ok((buf, ())) => Ok(buf),
                 Err(e) => Err(e.to_string()),
             }
@@ -9061,7 +9067,6 @@ pub unsafe extern "C" fn grasm_tcp_write_bytes(handle: *mut RtVal, data: *mut Rt
 }
 
 unsafe fn grasm_tcp_write_bytes_now(handle: *mut RtVal, data: *mut RtVal) -> *mut RtVal {
-    use crate::io::Write;
     let h = match &(*handle).payload {
         RtPayload::I64(n) => *n,
         _ => return err_of(io_err("IoFailed", "handle must be an integer".to_string())),
@@ -9104,7 +9109,6 @@ pub unsafe extern "C" fn grasm_tcp_write(handle: *mut RtVal, data: *mut RtVal) -
 }
 
 unsafe fn grasm_tcp_write_now(handle: *mut RtVal, data: *mut RtVal) -> *mut RtVal {
-    use crate::io::Write;
     let h = match &(*handle).payload {
         RtPayload::I64(n) => *n,
         _ => return err_of(io_err("IoFailed", "handle must be an integer".to_string())),
@@ -9149,7 +9153,6 @@ pub unsafe extern "C" fn grasm_proc_pipeline(stages: *mut RtVal, input: *mut RtV
 }
 
 unsafe fn grasm_proc_pipeline_now(stages: *mut RtVal, input: *mut RtVal) -> *mut RtVal {
-    use crate::io::Write;
 
     let RtPayload::List(items) = &(*stages).payload else {
         return err_of(io_err(
@@ -9193,7 +9196,7 @@ unsafe fn grasm_proc_pipeline_now(stages: *mut RtVal, input: *mut RtVal) -> *mut
     for (i, (program, argv)) in plan.iter().enumerate() {
         let is_last = i + 1 == plan.len();
 
-        let mut give_up = |message: String,
+        let give_up = |message: String,
                            pids: Vec<i32>,
                            open: &[i32]|
          -> *mut RtVal {
@@ -9955,7 +9958,7 @@ unsafe fn grasm_read_bytes_at_now(
     }
     match crate::fs::File::open(&p) {
         Ok(mut f) => {
-            if let Err(e) = f.seek(crate::fs::SEEK_SET, off as i64) {
+            if let Err(e) = f.seek(crate::fs::SEEK_SET, off) {
                 return err_of(io_err("IoFailed", e.to_string()));
             }
             let mut buf = vec![0u8; want as usize];
@@ -10004,7 +10007,6 @@ pub unsafe extern "C" fn grasm_append_bytes(path: *mut RtVal, data: *mut RtVal) 
 }
 
 unsafe fn grasm_append_bytes_now(path: *mut RtVal, data: *mut RtVal) -> *mut RtVal {
-    use crate::io::Write;
     let p = as_str(path).to_string();
     let done = crate::fs::OpenOptions::new()
         .create(true)
@@ -10543,6 +10545,9 @@ unsafe fn journaled(name: &str, body: impl FnOnce() -> *mut RtVal) -> *mut RtVal
 
 #[cfg(test)]
 mod small_string_tests {
+    // `std`'s prelude is gone; tests need `alloc`'s names explicitly.
+    #[allow(unused_imports)]
+    use alloc::{format, string::String, string::ToString, vec, vec::Vec};
     use crate::RtStr;
 
     /// The inline and heap paths must be indistinguishable to every reader.
@@ -10744,6 +10749,9 @@ pub unsafe extern "C" fn grasm_range_inclusive(r: *mut RtVal) -> i8 {
 
 #[cfg(test)]
 mod scalar_kind_tests {
+    // `std`'s prelude is gone; tests need `alloc`'s names explicitly.
+    #[allow(unused_imports)]
+    use alloc::{format, string::String, string::ToString, vec, vec::Vec};
     use super::ScalarKind;
 
     /// The two directions agree. They are read by different sides of the ABI —
@@ -10877,6 +10885,9 @@ pub unsafe extern "C" fn grasm_handler_install(h: *mut RtVal) {
 
 #[cfg(test)]
 mod maphash_tests {
+    // `std`'s prelude is gone; tests need `alloc`'s names explicitly.
+    #[allow(unused_imports)]
+    use alloc::{format, string::String, string::ToString, vec, vec::Vec};
     use super::maphash::MapHash;
     use hashbrown::HashSet;
     use core::hash::{BuildHasher, Hash};
@@ -11011,6 +11022,9 @@ mod poison_tests {
 
 #[cfg(test)]
 mod layout_tests {
+    // `std`'s prelude is gone; tests need `alloc`'s names explicitly.
+    #[allow(unused_imports)]
+    use alloc::{format, string::String, string::ToString, vec, vec::Vec};
     use super::*;
 
     /// The offsets in `layout`, measured on real values: a reordering of a
@@ -11071,6 +11085,9 @@ mod layout_tests {
 
 #[cfg(test)]
 mod value_list_tests {
+    // `std`'s prelude is gone; tests need `alloc`'s names explicitly.
+    #[allow(unused_imports)]
+    use alloc::{format, string::String, string::ToString, vec, vec::Vec};
     use super::*;
 
     fn live() -> i64 {

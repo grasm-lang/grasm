@@ -14,7 +14,6 @@
 
 // `std`'s prelude is gone with `#![no_std]`; `alloc` owns the growable types.
 use alloc::format;
-use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use alloc::collections::VecDeque;

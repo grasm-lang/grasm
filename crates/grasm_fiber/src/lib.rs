@@ -421,6 +421,9 @@ mod arch {
 
 #[cfg(all(test, unix, any(target_arch = "aarch64", target_arch = "x86_64")))]
 mod tests {
+    // `std`'s prelude is gone; tests need `alloc`'s names explicitly.
+    #[allow(unused_imports)]
+    use alloc::{format, string::String, string::ToString, vec, vec::Vec};
     use super::*;
     use alloc::rc::Rc;
 
@@ -501,13 +504,19 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_panic_comes_back_to_the_resumer() {
-        let mut f = Fiber::new(64 * 1024, || panic!("inside"));
-        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f.resume()));
-        let msg = r.unwrap_err();
-        assert_eq!(msg.downcast_ref::<&str>(), Some(&"inside"));
-    }
+    // `a_panic_comes_back_to_the_resumer` was here, and is gone with the
+    // mechanism it tested. It asserted that a panic inside a fiber body
+    // arrived at `resume` as a caught payload, which is what `catch_unwind`
+    // and `resume_unwind` were for.
+    //
+    // A `no_std` crate cannot unwind -- `#[panic_handler]` returns `!` -- so
+    // a panic in a fiber body now prints and exits the process where it
+    // happens ([E-PANIC-EXIT]). There is nothing left to come back.
+    //
+    // What that leaves uncovered, stated rather than quietly dropped: no test
+    // here checks what a panicking fiber body does. Checking it would mean
+    // running a program that exits 101 and reading its output, which belongs
+    // in the gate scripts rather than a unit test.
 
     #[test]
     fn deep_recursion_fits_a_big_stack() {

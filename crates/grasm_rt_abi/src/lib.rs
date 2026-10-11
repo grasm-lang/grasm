@@ -9,6 +9,12 @@
 //! `grasm build --native` links this archive; every `#[no_mangle]` entry point
 //! Cranelift calls comes through it from `grasm_rt`.
 #![no_std]
+// Empty in a test build, and that is the whole crate rather than item by
+// item. A test target links `std`, which supplies the allocator, the panic
+// handler and the personality routine already -- every item here would be a
+// duplicate lang item. There are no tests to lose: what this crate does is
+// get linked into a compiled program, which is what the gates exercise.
+#![cfg(not(test))]
 
 extern crate alloc;
 // Linked for its `#[no_mangle]` entry points, which is the whole archive's

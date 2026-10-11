@@ -11,12 +11,21 @@
 #![allow(clippy::missing_safety_doc)]
 extern crate alloc;
 
-use alloc::borrow::ToOwned;
-use alloc::boxed::Box;
-use alloc::format;
-use alloc::string::{String, ToString};
-use alloc::vec;
-use alloc::vec::Vec;
+/// The bytes of a NUL-terminated C string, not counting the NUL.
+///
+/// Declaring `strlen` is flagged as shadowing the one `std` itself links, and
+/// the loop is four lines.
+///
+/// # Safety
+/// `at` must be non-null and point at a NUL within the allocation it belongs
+/// to.
+pub unsafe fn c_bytes(at: *const u8) -> &'static [u8] {
+    let mut len = 0;
+    while *at.add(len) != 0 {
+        len += 1;
+    }
+    core::slice::from_raw_parts(at, len)
+}
 
 /// `thread_local!` without `std`.
 ///
@@ -170,6 +179,7 @@ pub mod tls {
 /// rather than a compile error. So: buffered here too, and `sys::exit` flushes
 /// before it exits, which is what `std` was doing for us.
 pub mod io {
+    use crate::c_bytes;
     use crate::sync::{Guard, Mutex};
     use alloc::string::String;
     use alloc::vec::Vec;
@@ -190,7 +200,6 @@ pub mod io {
         fn write(fd: i32, buf: *const u8, n: usize) -> isize;
         fn read(fd: i32, buf: *mut u8, n: usize) -> isize;
         fn strerror(code: i32) -> *const u8;
-        fn strlen(s: *const u8) -> usize;
     }
 
     pub const EINTR: i32 = 4;
@@ -252,8 +261,7 @@ pub mod io {
             if at.is_null() {
                 return write!(f, "os error {}", self.0);
             }
-            let len = unsafe { strlen(at) };
-            let bytes = unsafe { core::slice::from_raw_parts(at, len) };
+            let bytes = unsafe { c_bytes(at) };
             match core::str::from_utf8(bytes) {
                 Ok(text) => f.write_str(text),
                 Err(_) => write!(f, "os error {}", self.0),
@@ -827,14 +835,21 @@ pub mod thread {
         joined: bool,
     }
 
+    /// Why a thread could not be made or joined, as pthreads reported it.
+    /// `Result<_, ()>` would say only that something went wrong, and the
+    /// caller has a message to write.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct ThreadError(pub i32);
+
     impl JoinHandle {
-        pub fn join(mut self) -> Result<(), ()> {
+        pub fn join(mut self) -> Result<(), ThreadError> {
             self.joined = true;
             let mut out = core::ptr::null_mut();
-            if unsafe { pthread_join(self.handle, &mut out) } == 0 {
+            let r = unsafe { pthread_join(self.handle, &mut out) };
+            if r == 0 {
                 Ok(())
             } else {
-                Err(())
+                Err(ThreadError(r))
             }
         }
     }
@@ -972,11 +987,13 @@ pub mod thread {
             self,
             scope: &'scope Scope<'scope>,
             body: F,
-        ) -> Result<(), ()> {
+        ) -> Result<(), ThreadError> {
             if scope.spawn_named(body, self.name, self.stack) {
                 Ok(())
             } else {
-                Err(())
+                // `pthread_create`'s own code, which `spawn_raw` does not
+                // keep; errno carries the same reason.
+                Err(ThreadError(crate::io::errno()))
             }
         }
     }
@@ -1620,6 +1637,10 @@ pub mod fs {
             }
         }
 
+        pub fn is_empty(&mut self) -> Result<bool> {
+            Ok(self.len()? == 0)
+        }
+
         pub fn len(&mut self) -> Result<u64> {
             let here = self.seek(SEEK_CUR, 0)?;
             let end = self.seek(SEEK_END, 0)?;
@@ -1752,6 +1773,10 @@ pub mod fs {
         pub fn len(&self) -> u64 {
             self.len
         }
+
+        pub fn is_empty(&self) -> bool {
+            self.len == 0
+        }
     }
 
     /// Size by `lseek` on an opened file rather than `stat`. `struct stat`'s
@@ -1801,6 +1826,7 @@ pub mod fs {
 /// them can be had without asking the kernel. It does have
 /// `core::time::Duration`, so that stays.
 pub mod sys {
+    use crate::c_bytes;
     use core::time::Duration;
 
     pub const CLOCK_REALTIME: i32 = 0;
@@ -1819,7 +1845,6 @@ pub mod sys {
     extern "C" {
         fn clock_gettime(clock: i32, at: *mut TimeSpec) -> i32;
         fn getenv(name: *const u8) -> *const u8;
-        fn strlen(s: *const u8) -> usize;
         #[link_name = "exit"]
         fn libc_exit(code: i32) -> !;
         pub fn abort() -> !;
@@ -1876,8 +1901,7 @@ pub mod sys {
         if at.is_null() {
             return None;
         }
-        let len = unsafe { strlen(at) };
-        let bytes = unsafe { core::slice::from_raw_parts(at, len) };
+        let bytes = unsafe { c_bytes(at) };
         core::str::from_utf8(bytes).ok().map(alloc::borrow::ToOwned::to_owned)
     }
 }
@@ -2150,10 +2174,6 @@ macro_rules! thread_local {
         $($(#[$m])* $v static $N: $crate::tls::Local<$T> = $crate::tls::Local::new(|| $e);)+
     };
 }
-
-
-use crate::io::Write;
-
 
 /// Floating-point maths, from libm.
 ///

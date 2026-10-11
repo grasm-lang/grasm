@@ -15,10 +15,10 @@
 #   scripts/abbench.sh <baseline grasm> [<candidate grasm>] [programs...]
 #
 # The candidate defaults to ./target/release/grasm — the build in the tree.
-# A baseline is a *directory's worth*: `grasm` needs `libgrasm_rt.a` beside it
+# A baseline is a *directory's worth*: `grasm` needs `libgrasm_rt_abi.a` beside it
 # to link anything, so snapshot both —
 #
-#   mkdir -p /tmp/base && cp target/release/grasm target/release/libgrasm_rt.a /tmp/base/
+#   mkdir -p /tmp/base && cp target/release/grasm target/release/libgrasm_rt_abi.a /tmp/base/
 # Each program is run `BENCH_REPS` times per side, alternating A B A B, and
 # the *best* time of each side is compared: the fastest run is the one least
 # interrupted, which is the closest thing to an idle machine a busy one has.

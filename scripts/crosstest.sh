@@ -17,7 +17,7 @@ cd "$(dirname "$0")/.."
 TARGET="${1:-x86_64-apple-darwin}"
 ARCH="${TARGET%%-*}"
 GRASM=./target/release/grasm
-RT="target/$TARGET/release/libgrasm_rt.a"
+RT="target/$TARGET/release/libgrasm_rt_abi.a"
 WORK="${TMPDIR:-/tmp}/grasm_crosstest_$$"
 mkdir -p "$WORK"
 trap 'rm -rf "$WORK"' EXIT
@@ -34,7 +34,7 @@ fi
 # its own source is the same failure more quietly, linking against yesterday's
 # symbol set so every program using anything added since fails to link.
 if [ "${GRASM_NO_BUILD:-}" != 1 ]; then
-    if ! cargo build --release -q -p grasm_rt --target "$TARGET"; then
+    if ! cargo build --release -q -p grasm_rt_abi --target "$TARGET"; then
         echo "error: the runtime for $TARGET does not build. If the target is"
         echo "       not installed: rustup target add $TARGET"
         exit 1
@@ -42,7 +42,7 @@ if [ "${GRASM_NO_BUILD:-}" != 1 ]; then
 fi
 if [ ! -f "$RT" ]; then
     echo "error: runtime for $TARGET missing — run:"
-    echo "  rustup target add $TARGET && cargo build --release -p grasm_rt --target $TARGET"
+    echo "  rustup target add $TARGET && cargo build --release -p grasm_rt_abi --target $TARGET"
     exit 1
 fi
 

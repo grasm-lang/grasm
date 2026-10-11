@@ -558,6 +558,9 @@ extern crate std;
 
 #[cfg(test)]
 mod tests {
+    // `std`'s prelude is gone; tests need `alloc`'s names explicitly.
+    #[allow(unused_imports)]
+    use alloc::{format, string::String, string::ToString, vec, vec::Vec};
     use super::Wire;
 
     /// Every shape survives a round trip, including the awkward ones: an empty
@@ -602,11 +605,18 @@ mod tests {
             ),
         ];
         let raw = super::framed(&records);
-        let dir = std::env::temp_dir().join(format!("grasm_journal_{}", std::process::id()));
+        // Paths as strings, because `grasm_sys::fs` takes `&str`: it has no
+        // `Path`, which is a `std` type. The test still uses `std` for
+        // `temp_dir` and the cleanup.
+        let dir = format!(
+            "{}/grasm_journal_{}",
+            std::env::temp_dir().display(),
+            std::process::id()
+        );
         grasm_sys::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("j");
+        let path = format!("{dir}/j");
         grasm_sys::fs::write(&path, &raw).unwrap();
-        let back = super::read(path.as_os_str()).expect("reads");
+        let back = super::read(&path).expect("reads");
         assert_eq!(back.len(), 2);
         assert_eq!(back[0].0, "now_millis");
         assert_eq!(
