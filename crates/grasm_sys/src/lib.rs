@@ -710,12 +710,28 @@ pub mod process {
     ) -> Result<i32> {
         // Before the fork, while allocating is still safe.
         let argv = argv_of(program, args);
+
+        // A pipe whose only job is to say whether `execvp` ran, because
+        // `fork` cannot. The fork succeeds even for a program that does not
+        // exist; the failure happens in the child, where the parent cannot
+        // see it. Without this, "could not be started" and "ran and failed"
+        // are the same answer -- and [L-LIB-PROC] requires them to differ.
+        //
+        // Both ends are close-on-exec, so a *successful* exec closes the
+        // writer and the parent reads end-of-file. A failed one writes its
+        // errno first.
+        let tell = new_pipe()?;
+
         let pid = unsafe { fork() };
         if pid < 0 {
-            return Err(Error::last_os_error());
+            let e = Error::last_os_error();
+            shut(tell.reader);
+            shut(tell.writer);
+            return Err(e);
         }
         if pid == 0 {
             unsafe {
+                close(tell.reader);
                 if let Some(fd) = stdin {
                     dup2(fd, 0);
                 }
@@ -726,10 +742,34 @@ pub mod process {
                     dup2(fd, 2);
                 }
                 execvp(argv.pointers[0], argv.pointers.as_ptr());
-                // Only reached if `execvp` failed. 127 is what a shell
-                // reports for a command it could not run.
+                // Only reached if `execvp` failed. Tell the parent why, then
+                // exit 127, which is what a shell reports for a command it
+                // could not run.
+                let why = errno();
+                sys_write(
+                    tell.writer,
+                    &why as *const i32 as *const core::ffi::c_void,
+                    core::mem::size_of::<i32>(),
+                );
                 _exit(127)
             }
+        }
+
+        shut(tell.writer);
+        let mut why = [0u8; 4];
+        let got = unsafe {
+            sys_read(
+                tell.reader,
+                why.as_mut_ptr() as *mut core::ffi::c_void,
+                why.len(),
+            )
+        };
+        shut(tell.reader);
+        if got == why.len() as isize {
+            // The child never became the program. Reap it so it is not left
+            // a zombie, and report what stopped it.
+            let _ = wait_for(pid);
+            return Err(Error::from_raw_os_error(i32::from_ne_bytes(why)));
         }
         Ok(pid)
     }
@@ -2208,6 +2248,8 @@ pub mod sync {
                 ReadGuard { readers: &self.readers, value: self.value.get() }
             }
 
+            /// Correct with `Guard` here, unlike the pthread version: this
+            /// guard clears a flag, and `writing` is the flag it set.
             pub fn write(&self) -> Guard<'_, T> {
                 assert!(
                     !self.writing.get() && self.readers.get() == 0,
@@ -2238,7 +2280,7 @@ pub mod sync {
     }
 
     #[cfg(target_arch = "wasm32")]
-    pub use single::{Guard, Mutex, ReadGuard, RwLock};
+    pub use single::{Guard, Guard as WriteGuard, Mutex, ReadGuard, RwLock};
 
     // Opaque, and sized generously: macOS wants 64 bytes for a mutex and 200
     // for an rwlock, glibc 40 and 56. Over-sizing costs bytes in a static and
@@ -2394,12 +2436,45 @@ pub mod sync {
             ReadGuard { at, value: self.value.get(), _held: core::marker::PhantomData }
         }
 
-        pub fn write(&self) -> Guard<'_, T> {
+        pub fn write(&self) -> WriteGuard<'_, T> {
             let at = self.raw();
             unsafe { pthread_rwlock_wrlock(at) };
-            // A write guard unlocks an rwlock, not a mutex, so it cannot be
-            // the `Guard` above: that one calls `pthread_mutex_unlock`.
-            Guard { at, value: self.value.get(), _held: core::marker::PhantomData }
+            WriteGuard { at, value: self.value.get(), _held: core::marker::PhantomData }
+        }
+    }
+
+    /// Unlocks an **rwlock**, which is why it is not `Guard`: that one calls
+    /// `pthread_mutex_unlock`, and calling it on a `pthread_rwlock_t` does
+    /// not release it. `RwLock::write` returned a `Guard` when this was first
+    /// written, so the lock was never released and the second writer blocked
+    /// for ever -- a worker thread in `L-LIB-NET-WORKERS` hanging on its own
+    /// socket table.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub struct WriteGuard<'a, T> {
+        at: *mut u8,
+        value: *mut T,
+        _held: core::marker::PhantomData<&'a T>,
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    impl<T> Deref for WriteGuard<'_, T> {
+        type Target = T;
+        fn deref(&self) -> &T {
+            unsafe { &*self.value }
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    impl<T> DerefMut for WriteGuard<'_, T> {
+        fn deref_mut(&mut self) -> &mut T {
+            unsafe { &mut *self.value }
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    impl<T> Drop for WriteGuard<'_, T> {
+        fn drop(&mut self) {
+            unsafe { pthread_rwlock_unlock(self.at) };
         }
     }
 
@@ -2795,11 +2870,39 @@ mod tests {
         }
     }
 
+    /// A round trip, not just a non-zero port. `!= 0` was the first version
+    /// of this test and it is far too weak: a port read in the wrong byte
+    /// order is non-zero too, and a worker connecting to it would hang on
+    /// `accept` for ever rather than fail.
     #[test]
-    fn a_listener_reports_the_port_it_was_given() {
-        let sock = crate::net::listen_on("127.0.0.1", 0).unwrap();
-        let port = sock.local_addr().unwrap().port();
-        assert_ne!(port, 0, "port 0 means the kernel chose one and we read it");
+    fn a_listener_can_be_connected_to_on_the_port_it_reports() {
+        let server = crate::net::listen_on("127.0.0.1", 0).unwrap();
+        let port = server.local_addr().unwrap().port();
+        assert_ne!(port, 0);
+
+        let client = crate::net::connect_to("127.0.0.1", port).unwrap();
+        let taken = server.accept().unwrap();
+        client.write_all(b"ping").unwrap();
+        let mut into = [0u8; 4];
+        let n = taken.read(&mut into).unwrap();
+        assert_eq!(&into[..n], b"ping");
+    }
+
+    /// The port a listener is *told* to use is the port it reports, which a
+    /// wrong byte order breaks without the kernel ever complaining.
+    #[test]
+    fn a_fixed_port_reads_back_as_itself() {
+        // High enough to need both bytes, so a swap is visible: 9999 is
+        // 0x270F, and swapped it is 0x0F27 -- 3879.
+        for want in [9999u16, 0x1234] {
+            match crate::net::listen_on("127.0.0.1", want) {
+                Ok(sock) => {
+                    assert_eq!(sock.local_addr().unwrap().port(), want);
+                }
+                // Something else holds it; that is not this test's business.
+                Err(_) => continue,
+            }
+        }
     }
 
     #[test]
@@ -2864,6 +2967,42 @@ mod tests {
         });
         assert_eq!(*MADE.get().unwrap(), 42);
         assert_eq!(TIMES.load(core::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// An `RwLock` whose write guard does not release it hangs the *second*
+    /// writer, not the first, so one write looks fine. `RwLock::write`
+    /// returned a guard that called `pthread_mutex_unlock` on a
+    /// `pthread_rwlock_t`, which does not release it -- and a worker thread
+    /// in `L-LIB-NET-WORKERS` hung on its own socket table.
+    #[test]
+    fn an_rwlock_can_be_written_more_than_once() {
+        static TABLE: crate::sync::RwLock<i64> = crate::sync::RwLock::new(0);
+        for _ in 0..100 {
+            *TABLE.write() += 1;
+        }
+        assert_eq!(*TABLE.read(), 100);
+
+        // And from more than one thread, which is what actually hung.
+        crate::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    for _ in 0..200 {
+                        *TABLE.write() += 1;
+                    }
+                });
+            }
+        });
+        assert_eq!(*TABLE.read(), 100 + 8 * 200);
+    }
+
+    /// Readers may overlap; a second one must not wait for the first.
+    #[test]
+    fn two_readers_can_hold_an_rwlock_at_once() {
+        static TABLE: crate::sync::RwLock<i64> = crate::sync::RwLock::new(7);
+        let first = TABLE.read();
+        let second = TABLE.read();
+        assert_eq!(*first, 7);
+        assert_eq!(*second, 7);
     }
 
     /// `scope` has to join every thread before it returns, because the
@@ -2951,12 +3090,25 @@ mod tests {
         assert_eq!(err, b"theirs\n");
     }
 
-    /// 127 is what a shell reports for a command it could not run, and what
-    /// `_exit` is given when `execvp` fails.
+    /// A program that could not be started is an **error**, not a run that
+    /// exited 127 -- [L-LIB-PROC] requires those to be distinguishable, and
+    /// `fork` succeeding for a program that does not exist is what makes
+    /// that hard. The errno comes back through the close-on-exec pipe.
+    ///
+    /// This test asserted `code == 127` when it was first written, which is
+    /// what the code did and not what the spec says.
     #[test]
-    fn a_command_that_does_not_exist_gives_127() {
+    fn a_program_that_cannot_start_is_an_error() {
+        let e = crate::process::run("grasm_sys_no_such_program", &[]).unwrap_err();
+        assert_eq!(e.kind(), crate::io::ErrorKind::NotFound);
+    }
+
+    /// And a program that *did* start and failed is not an error: its status
+    /// is the answer.
+    #[test]
+    fn a_program_that_ran_and_failed_is_not_an_error() {
         let (code, _out, _err) =
-            crate::process::run("grasm_sys_no_such_program", &[]).unwrap();
-        assert_eq!(code, 127);
+            crate::process::run("sh", &["-c".to_string(), "exit 7".to_string()]).unwrap();
+        assert_eq!(code, 7);
     }
 }

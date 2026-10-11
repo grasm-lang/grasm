@@ -8208,7 +8208,7 @@ static SOCKETS: crate::sync::RwLock<SocketTable> = crate::sync::RwLock::new(Sock
 /// The table, locked for a change. A panic while holding it ends the process
 /// ([E-PANIC-EXIT]) before anything could observe a half-made change, so a
 /// poisoned lock holds a table that is still whole.
-fn sockets() -> crate::sync::Guard<'static, SocketTable> {
+fn sockets() -> crate::sync::WriteGuard<'static, SocketTable> {
     SOCKETS.write()
 }
 
