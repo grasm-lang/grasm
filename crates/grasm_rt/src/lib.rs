@@ -383,6 +383,295 @@ mod io {
     }
 }
 
+/// `std::thread`, over pthreads.
+///
+/// The piece that matters is `scope`. `par_map` spawns closures holding `&mut`
+/// into slices on the caller's stack, so **every thread must be joined before
+/// `scope` returns** or those borrows outlive the frame they point into. The
+/// joining lives in a `Drop`, not at the end of the function body, so it also
+/// happens on a path out that is not the normal one.
+///
+/// A `no_std` crate cannot unwind -- `#[panic_handler]` returns `!` -- so
+/// there is no such path today. The guard does not depend on that staying
+/// true.
+mod thread {
+    use alloc::boxed::Box;
+    use alloc::string::String;
+    use alloc::vec::Vec;
+    use core::cell::UnsafeCell;
+    use core::marker::PhantomData;
+    use core::num::NonZeroUsize;
+    use core::time::Duration;
+
+    #[cfg(target_os = "macos")]
+    pub type Handle = *mut u8;
+    #[cfg(not(target_os = "macos"))]
+    pub type Handle = usize;
+
+    #[repr(C, align(16))]
+    struct RawAttr([u8; 128]);
+
+    #[repr(C)]
+    struct TimeSpec {
+        secs: i64,
+        nanos: i64,
+    }
+
+    extern "C" {
+        fn pthread_create(
+            out: *mut Handle,
+            attr: *const u8,
+            body: extern "C" fn(*mut u8) -> *mut u8,
+            arg: *mut u8,
+        ) -> i32;
+        fn pthread_join(handle: Handle, out: *mut *mut u8) -> i32;
+        fn pthread_detach(handle: Handle) -> i32;
+        fn pthread_attr_init(attr: *mut u8) -> i32;
+        fn pthread_attr_destroy(attr: *mut u8) -> i32;
+        fn pthread_attr_setstacksize(attr: *mut u8, size: usize) -> i32;
+        fn nanosleep(wait: *const TimeSpec, left: *mut TimeSpec) -> i32;
+        fn sysconf(name: i32) -> i64;
+    }
+
+    #[cfg(target_os = "macos")]
+    extern "C" {
+        fn pthread_setname_np(name: *const u8) -> i32;
+    }
+    #[cfg(not(target_os = "macos"))]
+    extern "C" {
+        fn pthread_self() -> Handle;
+        fn pthread_setname_np(who: Handle, name: *const u8) -> i32;
+    }
+
+    #[cfg(target_os = "macos")]
+    const SC_NPROCESSORS_ONLN: i32 = 58;
+    #[cfg(not(target_os = "macos"))]
+    const SC_NPROCESSORS_ONLN: i32 = 84;
+
+    /// What `pthread_create` is given: the closure, plus the name to set from
+    /// inside the new thread. The name is set there because macOS's
+    /// `pthread_setname_np` only names the calling thread.
+    struct Start {
+        body: Box<dyn FnOnce() + Send>,
+        name: Option<String>,
+    }
+
+    extern "C" fn run(arg: *mut u8) -> *mut u8 {
+        // Safety: `arg` is the `Box<Start>` leaked by `spawn_raw`, handed to
+        // exactly one thread, and taken back here exactly once.
+        let start = unsafe { Box::from_raw(arg as *mut Start) };
+        if let Some(name) = &start.name {
+            let mut owned = Vec::with_capacity(name.len() + 1);
+            owned.extend_from_slice(name.as_bytes());
+            owned.push(0);
+            #[cfg(target_os = "macos")]
+            unsafe {
+                pthread_setname_np(owned.as_ptr())
+            };
+            #[cfg(not(target_os = "macos"))]
+            unsafe {
+                pthread_setname_np(pthread_self(), owned.as_ptr())
+            };
+        }
+        (start.body)();
+        core::ptr::null_mut()
+    }
+
+    fn spawn_raw(
+        body: Box<dyn FnOnce() + Send>,
+        name: Option<String>,
+        stack: Option<usize>,
+    ) -> Option<Handle> {
+        let start = Box::into_raw(Box::new(Start { body, name })) as *mut u8;
+        let mut handle: Handle = unsafe { core::mem::zeroed() };
+        let made = match stack {
+            Some(size) => unsafe {
+                let mut attr = RawAttr([0; 128]);
+                let at = &mut attr as *mut RawAttr as *mut u8;
+                pthread_attr_init(at);
+                pthread_attr_setstacksize(at, size);
+                let r = pthread_create(&mut handle, at, run, start);
+                pthread_attr_destroy(at);
+                r
+            },
+            None => unsafe {
+                pthread_create(&mut handle, core::ptr::null(), run, start)
+            },
+        };
+        if made != 0 {
+            // The thread was never made, so nothing will take the box back.
+            drop(unsafe { Box::from_raw(start as *mut Start) });
+            return None;
+        }
+        Some(handle)
+    }
+
+    pub struct JoinHandle {
+        handle: Handle,
+        joined: bool,
+    }
+
+    impl JoinHandle {
+        pub fn join(mut self) -> Result<(), ()> {
+            self.joined = true;
+            let mut out = core::ptr::null_mut();
+            if unsafe { pthread_join(self.handle, &mut out) } == 0 {
+                Ok(())
+            } else {
+                Err(())
+            }
+        }
+    }
+
+    /// An unjoined thread is detached rather than leaked, so the system can
+    /// reclaim its stack when it ends.
+    impl Drop for JoinHandle {
+        fn drop(&mut self) {
+            if !self.joined {
+                unsafe { pthread_detach(self.handle) };
+            }
+        }
+    }
+
+    pub fn spawn<F: FnOnce() + Send + 'static>(body: F) -> Option<JoinHandle> {
+        spawn_raw(Box::new(body), None, None).map(|handle| JoinHandle {
+            handle,
+            joined: false,
+        })
+    }
+
+    pub fn sleep(how_long: Duration) {
+        let wait = TimeSpec {
+            secs: how_long.as_secs() as i64,
+            nanos: how_long.subsec_nanos() as i64,
+        };
+        // A signal can cut the sleep short; `left` says how much remains, so
+        // the loop finishes the wait rather than returning early.
+        let mut left = TimeSpec { secs: 0, nanos: 0 };
+        let mut at = &wait as *const TimeSpec;
+        while unsafe { nanosleep(at, &mut left) } != 0 {
+            if crate::io::errno() != crate::io::EINTR {
+                return;
+            }
+            at = &left as *const TimeSpec;
+        }
+    }
+
+    pub fn available_parallelism() -> Option<NonZeroUsize> {
+        let n = unsafe { sysconf(SC_NPROCESSORS_ONLN) };
+        if n > 0 {
+            NonZeroUsize::new(n as usize)
+        } else {
+            None
+        }
+    }
+
+    /// `PhantomData<&'scope mut &'scope ()>` makes `'scope` invariant, which
+    /// is what stops a borrow taken inside the closure from being passed out
+    /// of it. A covariant marker would let the lifetime shrink and the
+    /// guarantee with it.
+    pub struct Scope<'scope> {
+        running: UnsafeCell<Vec<Handle>>,
+        _scope: PhantomData<&'scope mut &'scope ()>,
+    }
+
+    impl<'scope> Scope<'scope> {
+        pub fn spawn<F: FnOnce() + Send + 'scope>(&'scope self, body: F) {
+            self.spawn_named(body, None, None);
+        }
+
+        fn spawn_named<F: FnOnce() + Send + 'scope>(
+            &'scope self,
+            body: F,
+            name: Option<String>,
+            stack: Option<usize>,
+        ) -> bool {
+            // Safety: the closure borrows for `'scope`, and `scope` joins
+            // every thread before `'scope` ends, so the borrow cannot outlive
+            // what it points at. Erasing the lifetime is what `pthread_create`
+            // needs and what that join pays for.
+            let erased: Box<dyn FnOnce() + Send> =
+                unsafe { core::mem::transmute(Box::new(body) as Box<dyn FnOnce() + Send + 'scope>) };
+            match spawn_raw(erased, name, stack) {
+                Some(handle) => {
+                    // Safety: `Scope` is not `Sync`, so only the thread that
+                    // made it reaches this.
+                    unsafe { (*self.running.get()).push(handle) };
+                    true
+                }
+                None => false,
+            }
+        }
+    }
+
+    /// Joins in `Drop` so it happens on every path out of `scope`, not only
+    /// the one that reaches the end of the body.
+    struct JoinAtEnd<'a, 'scope>(&'a Scope<'scope>);
+
+    impl Drop for JoinAtEnd<'_, '_> {
+        fn drop(&mut self) {
+            let running = unsafe { &mut *self.0.running.get() };
+            for handle in running.drain(..) {
+                let mut out = core::ptr::null_mut();
+                unsafe { pthread_join(handle, &mut out) };
+            }
+        }
+    }
+
+    pub fn scope<'env, R>(body: impl FnOnce(&'env Scope<'env>) -> R) -> R {
+        let held = Scope {
+            running: UnsafeCell::new(Vec::new()),
+            _scope: PhantomData,
+        };
+        // Safety: `held` outlives `join`, which outlives the call below, so
+        // the reference handed to the body is valid for as long as the body
+        // can use it -- and every thread it spawned is joined when `join` is
+        // dropped, before this function returns.
+        let borrowed: &'env Scope<'env> = unsafe { core::mem::transmute(&held) };
+        let _join = JoinAtEnd(&held);
+        body(borrowed)
+    }
+
+    pub struct Builder {
+        name: Option<String>,
+        stack: Option<usize>,
+    }
+
+    impl Builder {
+        pub fn new() -> Builder {
+            Builder { name: None, stack: None }
+        }
+
+        pub fn name(mut self, name: String) -> Builder {
+            self.name = Some(name);
+            self
+        }
+
+        pub fn stack_size(mut self, size: usize) -> Builder {
+            self.stack = Some(size);
+            self
+        }
+
+        pub fn spawn_scoped<'scope, F: FnOnce() + Send + 'scope>(
+            self,
+            scope: &'scope Scope<'scope>,
+            body: F,
+        ) -> Result<(), ()> {
+            if scope.spawn_named(body, self.name, self.stack) {
+                Ok(())
+            } else {
+                Err(())
+            }
+        }
+    }
+
+    impl Default for Builder {
+        fn default() -> Builder {
+            Builder::new()
+        }
+    }
+}
+
 /// `std::net`, narrowed to the TCP and UDP this runtime offers.
 ///
 /// Addresses are resolved with `getaddrinfo`, because the host comes from
@@ -5220,7 +5509,7 @@ fn workers_for(n: usize, one: core::time::Duration) -> usize {
     if !worth_it {
         return 1;
     }
-    std::thread::available_parallelism()
+    crate::thread::available_parallelism()
         .map(|p| p.get())
         .unwrap_or(1)
         .min(n)
@@ -5356,7 +5645,7 @@ unsafe fn par_words(
         // One scoped thread per task, each writing its own slot, so the
         // result is the one any order would give -- the checker proved the
         // tasks independent and effect-free.
-        std::thread::scope(|scope| {
+        crate::thread::scope(|scope| {
             for (o, &x) in out.iter_mut().zip(words.iter()) {
                 let env_ref = env_owned;
                 scope.spawn(move || {
@@ -5392,7 +5681,7 @@ unsafe fn par_words(
         let chunk = input.len().div_ceil(workers * 16).max(1);
         let pieces: crate::sync::Mutex<Vec<(usize, &mut [i64])>> =
             crate::sync::Mutex::new(rest.chunks_mut(chunk).enumerate().collect());
-        std::thread::scope(|scope| {
+        crate::thread::scope(|scope| {
             let queue = &pieces;
             let env_ref = env_owned;
             let drain = move || {
@@ -5413,7 +5702,7 @@ unsafe fn par_words(
                 // someone else. The calling thread drains the remainder below,
                 // which is why this result can be dropped and why the answer is
                 // complete even if every spawn fails.
-                let _ = std::thread::Builder::new()
+                let _ = crate::thread::Builder::new()
                     .stack_size(WORKER_STACK)
                     .spawn_scoped(scope, move || {
                         drain();
@@ -5555,10 +5844,10 @@ pub unsafe extern "C" fn grasm_net_workers(
             *o = code(env_owned.as_ptr(), x);
         }
     } else {
-        std::thread::scope(|scope| {
+        crate::thread::scope(|scope| {
             let env_ref: &[i64] = &env_owned;
             for (o, &x) in out.iter_mut().zip(words.iter()) {
-                let spawned = std::thread::Builder::new()
+                let spawned = crate::thread::Builder::new()
                     .name(format!("net-worker-{x}"))
                     .stack_size(WORKER_STACK)
                     .spawn_scoped(scope, move || {
@@ -5853,7 +6142,7 @@ pub unsafe extern "C" fn grasm_par_filter_scalar(
         let chunk = input.len().div_ceil(workers * 16).max(1);
         let pieces: crate::sync::Mutex<Vec<(usize, &mut [u8])>> =
             crate::sync::Mutex::new(rest.chunks_mut(chunk).enumerate().collect());
-        std::thread::scope(|scope| {
+        crate::thread::scope(|scope| {
             let queue = &pieces;
             let env_ref = &env_owned;
             let drain = move || {
@@ -5872,7 +6161,7 @@ pub unsafe extern "C" fn grasm_par_filter_scalar(
                 // See the note in `par_map`: the calling thread drains the
                 // remainder, so a failed spawn costs parallelism and never
                 // correctness.
-                let _ = std::thread::Builder::new()
+                let _ = crate::thread::Builder::new()
                     .stack_size(WORKER_STACK)
                     .spawn_scoped(scope, drain);
             }
@@ -10617,7 +10906,7 @@ unsafe fn grasm_proc_pipeline_now(stages: *mut RtVal, input: *mut RtVal) -> *mut
 
             if let Some(mut sink) = child.stdin.take() {
                 let text = stdin_text.clone();
-                std::thread::spawn(move || {
+                crate::thread::spawn(move || {
                     let _ = sink.write_all(text.as_bytes());
                 });
             }
@@ -11611,7 +11900,7 @@ pub unsafe extern "C" fn grasm_sleep_millis(ms: *mut RtVal) -> *mut RtVal {
         return alloc(RtPayload::Unit);
     }
     if n > 0 {
-        std::thread::sleep(core::time::Duration::from_millis(n as u64));
+        crate::thread::sleep(core::time::Duration::from_millis(n as u64));
     }
     if replay::recording() {
         replay::put("sleep_millis", &replay::Wire::Unit);
