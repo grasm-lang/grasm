@@ -345,3 +345,25 @@ times.
 After: `tree` 1.01x, `wordfreq` 1.07x, `sort` 1.02x, `sieve` 1.02x, `fib`
 1.03x, `matmul` 1.01x -- all nominally faster, all within the +/-10% this
 machine swings, and none slower.
+
+### Re-verified after the lock change
+
+The CAS-to-load fix is in lock initialisation, on the path every boxed value
+takes, so the corpus was compared again rather than assumed: `spec/conformance`
+197 agree / 0 differ / 60 declined, `packages` 257 / 0 / 581, `examples` 24 of
+24 identical across all four engines under difftest. The same numbers as
+before the fix.
+
+### G3 could not be measured
+
+Compile speed was the next metric to check, since `panic = "abort"` now
+applies to the compiler too. It is not measurable on this machine at present:
+two Android NDK `clang++` processes at 99% each, plus a macOS storage scan,
+put the load average at 40. The run that was attempted returned 25,061 lines
+"taking" 824 ms against 175,056 lines in 742 ms, which is not a slow result
+but a meaningless one, and it was discarded rather than recorded.
+
+The generator for those files is worth keeping either way: structs, generics,
+interpolation and cross-file calls at 5k, 25k, 75k and 175k lines, all four
+checking clean. `as f64` is not Grasm's cast -- `.as_f64()` is -- and the
+first version measured 1,430 parse errors instead of a typecheck.
