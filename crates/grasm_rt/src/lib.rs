@@ -115,6 +115,274 @@ mod tls {
     }
 }
 
+/// `std::io`, as much of it as this runtime uses.
+///
+/// The shapes are deliberately the ones `std` has -- `stdout().lock()`, a
+/// `Write` trait, `Error::last_os_error()`, `ErrorKind` -- so that converting
+/// the runtime is a change of import and not a rewrite of every call site.
+///
+/// **Buffering is the part that matters.** `std`'s stdout is buffered and
+/// flushed when the process ends. Raw `write(2)` is neither, and Grasm's four
+/// engines have to agree byte for byte, so dropping the buffer would change
+/// how output interleaves with stderr and show up as a difftest failure
+/// rather than a compile error. So: buffered here too, and `sys::exit` flushes
+/// before it exits, which is what `std` was doing for us.
+mod io {
+    use crate::sync::{Guard, Mutex};
+    use alloc::string::String;
+    use alloc::vec::Vec;
+    use core::fmt;
+
+    #[cfg(target_os = "macos")]
+    extern "C" {
+        #[link_name = "__error"]
+        fn errno_at() -> *mut i32;
+    }
+    #[cfg(not(target_os = "macos"))]
+    extern "C" {
+        #[link_name = "__errno_location"]
+        fn errno_at() -> *mut i32;
+    }
+
+    extern "C" {
+        fn write(fd: i32, buf: *const u8, n: usize) -> isize;
+        fn read(fd: i32, buf: *mut u8, n: usize) -> isize;
+        fn strerror(code: i32) -> *const u8;
+        fn strlen(s: *const u8) -> usize;
+    }
+
+    pub const EINTR: i32 = 4;
+    #[cfg(target_os = "macos")]
+    pub const EAGAIN: i32 = 35;
+    #[cfg(not(target_os = "macos"))]
+    pub const EAGAIN: i32 = 11;
+    pub const ENOENT: i32 = 2;
+    #[cfg(target_os = "macos")]
+    pub const EILSEQ: i32 = 92;
+    #[cfg(not(target_os = "macos"))]
+    pub const EILSEQ: i32 = 84;
+
+    pub fn errno() -> i32 {
+        unsafe { *errno_at() }
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub enum ErrorKind {
+        NotFound,
+        Interrupted,
+        WouldBlock,
+        Other,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    pub struct Error(i32);
+
+    pub type Result<T> = core::result::Result<T, Error>;
+
+    impl Error {
+        pub fn last_os_error() -> Error {
+            Error(errno())
+        }
+
+        pub fn from_raw_os_error(code: i32) -> Error {
+            Error(code)
+        }
+
+        pub fn raw_os_error(&self) -> Option<i32> {
+            Some(self.0)
+        }
+
+        pub fn kind(&self) -> ErrorKind {
+            match self.0 {
+                ENOENT => ErrorKind::NotFound,
+                EINTR => ErrorKind::Interrupted,
+                EAGAIN => ErrorKind::WouldBlock,
+                _ => ErrorKind::Other,
+            }
+        }
+    }
+
+    impl fmt::Display for Error {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            // `strerror` gives the same text `std` prints for an errno, which
+            // keeps error messages identical across this conversion.
+            let at = unsafe { strerror(self.0) };
+            if at.is_null() {
+                return write!(f, "os error {}", self.0);
+            }
+            let len = unsafe { strlen(at) };
+            let bytes = unsafe { core::slice::from_raw_parts(at, len) };
+            match core::str::from_utf8(bytes) {
+                Ok(text) => f.write_str(text),
+                Err(_) => write!(f, "os error {}", self.0),
+            }
+        }
+    }
+
+    /// `write(2)` can return short or be interrupted, so neither is a failure
+    /// until the loop cannot make progress.
+    fn write_fully(fd: i32, bytes: &[u8]) -> Result<()> {
+        let mut done = 0;
+        while done < bytes.len() {
+            let n = unsafe { write(fd, bytes[done..].as_ptr(), bytes.len() - done) };
+            if n > 0 {
+                done += n as usize;
+            } else if n < 0 && errno() == EINTR {
+                continue;
+            } else {
+                return Err(Error::last_os_error());
+            }
+        }
+        Ok(())
+    }
+
+    pub trait Write {
+        fn write_all(&mut self, bytes: &[u8]) -> Result<()>;
+        fn flush(&mut self) -> Result<()>;
+
+        /// What `write!` and `writeln!` call.
+        fn write_fmt(&mut self, args: fmt::Arguments<'_>) -> Result<()> {
+            // `core::fmt` hands out `&str` pieces and reports only that
+            // something failed, so the errno is carried out of the adapter by
+            // hand rather than lost.
+            struct Adapt<'a, W: Write + ?Sized>(&'a mut W, Result<()>);
+            impl<W: Write + ?Sized> fmt::Write for Adapt<'_, W> {
+                fn write_str(&mut self, piece: &str) -> fmt::Result {
+                    match self.0.write_all(piece.as_bytes()) {
+                        Ok(()) => Ok(()),
+                        Err(e) => {
+                            self.1 = Err(e);
+                            Err(fmt::Error)
+                        }
+                    }
+                }
+            }
+            let mut adapt = Adapt(self, Ok(()));
+            match fmt::write(&mut adapt, args) {
+                Ok(()) => Ok(()),
+                Err(_) => adapt.1,
+            }
+        }
+    }
+
+    /// 8 KiB, which is what `std` uses for a `BufWriter`.
+    const BUF: usize = 8192;
+
+    static OUT: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+    static ERR: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+
+    pub struct Stream {
+        fd: i32,
+        held: Guard<'static, Vec<u8>>,
+    }
+
+    impl Write for Stream {
+        fn write_all(&mut self, bytes: &[u8]) -> Result<()> {
+            // A write larger than the buffer goes straight out rather than
+            // growing the buffer to hold it.
+            if self.held.len() + bytes.len() > BUF {
+                let pending = core::mem::take(&mut *self.held);
+                if !pending.is_empty() {
+                    write_fully(self.fd, &pending)?;
+                }
+                if bytes.len() >= BUF {
+                    return write_fully(self.fd, bytes);
+                }
+            }
+            self.held.extend_from_slice(bytes);
+            Ok(())
+        }
+
+        fn flush(&mut self) -> Result<()> {
+            if self.held.is_empty() {
+                return Ok(());
+            }
+            let pending = core::mem::take(&mut *self.held);
+            write_fully(self.fd, &pending)
+        }
+    }
+
+    /// Stderr is unbuffered in `std`, and is here too: a message written just
+    /// before a crash has to be out before the crash.
+    impl Drop for Stream {
+        fn drop(&mut self) {
+            if self.fd == 2 {
+                let _ = self.flush();
+            }
+        }
+    }
+
+    pub struct Handle {
+        fd: i32,
+    }
+
+    impl Handle {
+        pub fn lock(&self) -> Stream {
+            Stream {
+                fd: self.fd,
+                held: if self.fd == 1 { OUT.lock() } else { ERR.lock() },
+            }
+        }
+
+        pub fn flush(&self) -> Result<()> {
+            self.lock().flush()
+        }
+    }
+
+    pub fn stdout() -> Handle {
+        Handle { fd: 1 }
+    }
+
+    pub fn stderr() -> Handle {
+        Handle { fd: 2 }
+    }
+
+    /// Called by `sys::exit`, because nothing else will: `std` flushed stdout
+    /// when the process ended and raw file descriptors do not.
+    pub fn flush_all() {
+        let _ = stdout().flush();
+        let _ = stderr().flush();
+    }
+
+    /// One line from stdin, newline included, as `BufRead::read_line` gives
+    /// it. Unbuffered -- the runtime reads lines rarely and a buffer here
+    /// would have to be shared with anything else reading fd 0.
+    pub fn read_line(into: &mut String) -> Result<usize> {
+        let mut got = 0;
+        let mut byte = [0u8; 1];
+        // Bytes first, then one UTF-8 check. Pushing `byte as char` would
+        // read each byte as a codepoint, which turns every multi-byte
+        // character into mojibake -- and would only show up as a difftest
+        // failure on non-ASCII input.
+        let mut held: Vec<u8> = Vec::new();
+        loop {
+            let n = unsafe { read(0, byte.as_mut_ptr(), 1) };
+            if n == 0 {
+                break;
+            }
+            if n < 0 {
+                if errno() == EINTR {
+                    continue;
+                }
+                return Err(Error::last_os_error());
+            }
+            got += 1;
+            held.push(byte[0]);
+            if byte[0] == b'\n' {
+                break;
+            }
+        }
+        match core::str::from_utf8(&held) {
+            Ok(text) => {
+                into.push_str(text);
+                Ok(got)
+            }
+            // Invalid UTF-8, which `std` reports as `InvalidData`.
+            Err(_) => Err(Error::from_raw_os_error(EILSEQ)),
+        }
+    }
+}
+
 /// The operating system, called directly.
 ///
 /// `core` has no `Instant`, no `exit` and no environment, because none of
@@ -140,8 +408,17 @@ mod sys {
         fn clock_gettime(clock: i32, at: *mut TimeSpec) -> i32;
         fn getenv(name: *const u8) -> *const u8;
         fn strlen(s: *const u8) -> usize;
-        pub fn exit(code: i32) -> !;
+        #[link_name = "exit"]
+        fn libc_exit(code: i32) -> !;
         pub fn abort() -> !;
+    }
+
+    /// `std` flushed stdout when the process ended; raw file descriptors do
+    /// not, so anything still in the buffer would be lost. Every exit in this
+    /// runtime goes through here for that reason.
+    pub unsafe fn exit(code: i32) -> ! {
+        crate::io::flush_all();
+        libc_exit(code)
     }
 
     fn now(clock: i32) -> Duration {
@@ -461,7 +738,7 @@ macro_rules! thread_local {
 }
 
 
-use std::io::Write;
+use crate::io::Write;
 
 /// The record-and-replay journal.
 ///
@@ -508,10 +785,10 @@ pub extern "C" fn grasm_out_to_stderr(on: i8) {
 /// Writes to whichever stream is currently selected.
 fn emit(f: impl Fn(&mut dyn Write)) {
     if sink::on() {
-        let mut out = std::io::stderr().lock();
+        let mut out = crate::io::stderr().lock();
         f(&mut out);
     } else {
-        let mut out = std::io::stdout().lock();
+        let mut out = crate::io::stdout().lock();
         f(&mut out);
     }
 }
@@ -582,8 +859,8 @@ fn rt_panic(msg: &str) -> ! {
     // stdout is the program's output; a panic printed into it corrupts
     // whatever is reading ([E-PANIC-EXIT]). Flush stdout first so anything
     // already produced is not lost behind the exit.
-    let _ = std::io::stdout().flush();
-    let mut out = std::io::stderr().lock();
+    let _ = crate::io::stdout().flush();
+    let mut out = crate::io::stderr().lock();
     let _ = writeln!(out, "panic: {msg}");
     let _ = out.flush();
     crate::sys::exit(101);
@@ -3123,8 +3400,8 @@ pub extern "C" fn grasm_check_leaks() {
     if live == 0 && copies == 0 {
         return;
     }
-    let _ = std::io::stdout().flush();
-    let mut err = std::io::stderr().lock();
+    let _ = crate::io::stdout().flush();
+    let mut err = crate::io::stderr().lock();
     if live != 0 {
         let _ = writeln!(err, "leak: {live} allocation(s) still live at exit");
     }
@@ -6441,8 +6718,8 @@ pub unsafe extern "C" fn grasm_report_main_err(v: *mut RtVal) {
         rt_panic("bad main error value");
     };
     // stderr, for the same reason a panic goes there ([E-MAIN-ERR]).
-    let _ = std::io::stdout().flush();
-    let mut out = std::io::stderr().lock();
+    let _ = crate::io::stdout().flush();
+    let mut out = crate::io::stderr().lock();
     let _ = writeln!(
         out,
         "error: unhandled error from main: {}",
@@ -8535,7 +8812,7 @@ pub extern "C" fn grasm_input() -> *mut RtVal {
 
 unsafe fn grasm_input_now() -> *mut RtVal {
     let mut line = String::new();
-    let _ = std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut line);
+    let _ = crate::io::read_line(&mut line);
     while line.ends_with('\n') || line.ends_with('\r') {
         line.pop();
     }
@@ -8641,7 +8918,7 @@ thread_local! {
 
 /// Reads once through the thread's read buffer, answering with the bytes read
 /// in a buffer of exactly their size.
-fn read_sized<T>(read: impl FnOnce(&mut [u8]) -> std::io::Result<(usize, T)>) -> std::io::Result<(Vec<u8>, T)> {
+fn read_sized<T>(read: impl FnOnce(&mut [u8]) -> crate::io::Result<(usize, T)>) -> crate::io::Result<(Vec<u8>, T)> {
     READ_BUF.with(|b| {
         let mut b = b.borrow_mut();
         if b.len() < 65536 {
@@ -8701,7 +8978,7 @@ fn socket_with<T>(h: i64, f: impl FnOnce(&Socket) -> Result<T, String>) -> Resul
 /// `poll(2)` when it is asked to wait. Toggling the mode per call instead would
 /// race: one worker switching it back to blocking while another is about to
 /// make its single attempt leaves the second stuck in `accept`.
-fn listener_put(l: std::net::TcpListener) -> std::io::Result<i64> {
+fn listener_put(l: std::net::TcpListener) -> crate::io::Result<i64> {
     l.set_nonblocking(true)?;
     Ok(socket_put(Socket::Listener(l)))
 }
@@ -8718,13 +8995,13 @@ fn accept_from(l: &std::net::TcpListener, ready: bool) -> Result<std::net::TcpSt
                 stream.set_nonblocking(false).map_err(|e| e.to_string())?;
                 return Ok(without_nagle(stream));
             }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            Err(e) if e.kind() == crate::io::ErrorKind::WouldBlock => {
                 if ready {
                     return Err("no connection is waiting".to_string());
                 }
                 wait_readable(&[l.as_raw_fd()], -1)?;
             }
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) if e.kind() == crate::io::ErrorKind::Interrupted => {}
             Err(e) => return Err(e.to_string()),
         }
     }
@@ -8791,11 +9068,11 @@ fn wait_readable(fds: &[i32], timeout_ms: i32) -> Result<Vec<bool>, String> {
                 .map(|p| p.revents & (POLLIN | POLLHUP | POLLNVAL) != 0)
                 .collect());
         }
-        let e = std::io::Error::last_os_error();
+        let e = crate::io::Error::last_os_error();
         // A signal arriving is not a failure — it is a delivery that happened to
         // land mid-wait, and the caller asked to wait. Retrying here is what
         // stops an ordinary `SIGWINCH` from looking like a network error.
-        if e.kind() != std::io::ErrorKind::Interrupted {
+        if e.kind() != crate::io::ErrorKind::Interrupted {
             return Err(e.to_string());
         }
     }
@@ -8993,7 +9270,7 @@ fn kq_wait(wanted: &[i64], timeout_ms: i32) -> Option<Waited> {
                     )
                 };
                 if n < 0 {
-                    return Some(Err(std::io::Error::last_os_error().to_string()));
+                    return Some(Err(crate::io::Error::last_os_error().to_string()));
                 }
                 // A delete that finds nothing is fine; an add that fails is not.
                 for r in &receipts[..n as usize] {
@@ -9004,7 +9281,7 @@ fn kq_wait(wanted: &[i64], timeout_ms: i32) -> Option<Waited> {
                         w.kq = unsafe { kqueue() };
                         w.handles.clear();
                         w.registered.clear();
-                        return Some(Err(std::io::Error::from_raw_os_error(r.data as i32).to_string()));
+                        return Some(Err(crate::io::Error::from_raw_os_error(r.data as i32).to_string()));
                     }
                 }
             }
@@ -9039,9 +9316,9 @@ fn kq_wait(wanted: &[i64], timeout_ms: i32) -> Option<Waited> {
                 }
                 return Some(Ok((ready, w.listener.clone())));
             }
-            let e = std::io::Error::last_os_error();
+            let e = crate::io::Error::last_os_error();
             // As in `wait_readable`: a signal is not a failure.
-            if e.kind() != std::io::ErrorKind::Interrupted {
+            if e.kind() != crate::io::ErrorKind::Interrupted {
                 return Some(Err(e.to_string()));
             }
         }
@@ -9481,7 +9758,7 @@ pub unsafe extern "C" fn grasm_tcp_write_bytes(handle: *mut RtVal, data: *mut Rt
 }
 
 unsafe fn grasm_tcp_write_bytes_now(handle: *mut RtVal, data: *mut RtVal) -> *mut RtVal {
-    use std::io::Write;
+    use crate::io::Write;
     let h = match &(*handle).payload {
         RtPayload::I64(n) => *n,
         _ => return err_of(io_err("IoFailed", "handle must be an integer".to_string())),
@@ -9523,7 +9800,7 @@ pub unsafe extern "C" fn grasm_tcp_write(handle: *mut RtVal, data: *mut RtVal) -
 }
 
 unsafe fn grasm_tcp_write_now(handle: *mut RtVal, data: *mut RtVal) -> *mut RtVal {
-    use std::io::Write;
+    use crate::io::Write;
     let h = match &(*handle).payload {
         RtPayload::I64(n) => *n,
         _ => return err_of(io_err("IoFailed", "handle must be an integer".to_string())),
@@ -9568,7 +9845,7 @@ pub unsafe extern "C" fn grasm_proc_pipeline(stages: *mut RtVal, input: *mut RtV
 }
 
 unsafe fn grasm_proc_pipeline_now(stages: *mut RtVal, input: *mut RtVal) -> *mut RtVal {
-    use std::io::Write;
+    use crate::io::Write;
     use std::process::{Command, Stdio};
 
     let RtPayload::List(items) = &(*stages).payload else {
@@ -10041,7 +10318,7 @@ unsafe fn grasm_read_file_now(path: *mut RtVal) -> *mut RtVal {
     let p = as_str(path).to_string();
     match std::fs::read_to_string(&p) {
         Ok(s) => ok_of(alloc(RtPayload::Str(RtStr::new(s)))),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => err_of(io_err("NotFound", p)),
+        Err(e) if e.kind() == crate::io::ErrorKind::NotFound => err_of(io_err("NotFound", p)),
         Err(e) => err_of(io_err("IoFailed", e.to_string())),
     }
 }
@@ -10268,7 +10545,7 @@ unsafe fn grasm_read_bytes_now(path: *mut RtVal) -> *mut RtVal {
     let p = as_str(path).to_string();
     match std::fs::read(&p) {
         Ok(b) => ok_of(alloc(RtPayload::Bytes(RtBytes::new(b)))),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => err_of(io_err("NotFound", p)),
+        Err(e) if e.kind() == crate::io::ErrorKind::NotFound => err_of(io_err("NotFound", p)),
         Err(e) => err_of(io_err("IoFailed", e.to_string())),
     }
 }
@@ -10334,7 +10611,7 @@ unsafe fn grasm_read_bytes_at_now(
             buf.truncate(filled);
             ok_of(alloc(RtPayload::Bytes(RtBytes::new(buf))))
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => err_of(io_err("NotFound", p)),
+        Err(e) if e.kind() == crate::io::ErrorKind::NotFound => err_of(io_err("NotFound", p)),
         Err(e) => err_of(io_err("IoFailed", e.to_string())),
     }
 }
@@ -10351,7 +10628,7 @@ unsafe fn grasm_file_size_now(path: *mut RtVal) -> *mut RtVal {
     let p = as_str(path).to_string();
     match std::fs::metadata(&p) {
         Ok(m) => ok_of(alloc(RtPayload::I64(m.len() as i64))),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => err_of(io_err("NotFound", p)),
+        Err(e) if e.kind() == crate::io::ErrorKind::NotFound => err_of(io_err("NotFound", p)),
         Err(e) => err_of(io_err("IoFailed", e.to_string())),
     }
 }
@@ -10368,7 +10645,7 @@ pub unsafe extern "C" fn grasm_append_bytes(path: *mut RtVal, data: *mut RtVal) 
 }
 
 unsafe fn grasm_append_bytes_now(path: *mut RtVal, data: *mut RtVal) -> *mut RtVal {
-    use std::io::Write;
+    use crate::io::Write;
     let p = as_str(path).to_string();
     let done = std::fs::OpenOptions::new()
         .create(true)
@@ -10400,7 +10677,7 @@ unsafe fn grasm_sync_file_now(path: *mut RtVal) -> *mut RtVal {
         .and_then(|f| f.sync_all());
     match done {
         Ok(()) => ok_of(alloc(RtPayload::Unit)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => err_of(io_err("NotFound", p)),
+        Err(e) if e.kind() == crate::io::ErrorKind::NotFound => err_of(io_err("NotFound", p)),
         Err(e) => err_of(io_err("IoFailed", e.to_string())),
     }
 }
@@ -10423,7 +10700,7 @@ unsafe fn grasm_rename_file_now(from: *mut RtVal, to: *mut RtVal) -> *mut RtVal 
     let b = as_str(to).to_string();
     match std::fs::rename(&a, &b) {
         Ok(()) => ok_of(alloc(RtPayload::Unit)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => err_of(io_err("NotFound", a)),
+        Err(e) if e.kind() == crate::io::ErrorKind::NotFound => err_of(io_err("NotFound", a)),
         Err(e) => err_of(io_err("IoFailed", e.to_string())),
     }
 }
@@ -10482,7 +10759,7 @@ unsafe fn grasm_remove_file_now(path: *mut RtVal) -> *mut RtVal {
         // the value is written to a journal and handed to another engine, which
         // printed `0` where every direct run prints `()` (F37).
         Ok(()) => ok_of(alloc(RtPayload::Unit)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => err_of(io_err("NotFound", p)),
+        Err(e) if e.kind() == crate::io::ErrorKind::NotFound => err_of(io_err("NotFound", p)),
         Err(e) => err_of(io_err("IoFailed", e.to_string())),
     }
 }
@@ -10515,7 +10792,7 @@ unsafe fn grasm_list_dir_now(path: *mut RtVal) -> *mut RtVal {
                 .collect();
             ok_of(alloc(RtPayload::List(items.into())))
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => err_of(io_err("NotFound", p)),
+        Err(e) if e.kind() == crate::io::ErrorKind::NotFound => err_of(io_err("NotFound", p)),
         Err(e) => err_of(io_err("IoFailed", e.to_string())),
     }
 }
@@ -10660,7 +10937,7 @@ unsafe fn grasm_env_now(name: *mut RtVal) -> *mut RtVal {
 #[no_mangle]
 pub extern "C" fn grasm_exit(code: i64) {
     use std::io::Write as _;
-    let _ = std::io::stdout().flush();
+    let _ = crate::io::stdout().flush();
     // The low eight bits, which is what an operating system reports and what
     // C's `exit` does with the same number. Clamping to 0..=255 instead made
     // `exit(-1)` — the most common spelling of "fail" in a script — report
