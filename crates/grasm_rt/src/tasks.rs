@@ -12,6 +12,11 @@
 //! and handing it back. The table is a root, like the `ref` slab, and is
 //! released before the leak check counts.
 
+// `std`'s prelude is gone with `#![no_std]`; `alloc` owns the growable types.
+use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
+
 use alloc::collections::VecDeque;
 use crate::sync::Mutex;
 

@@ -93,3 +93,28 @@ gated by 511 differential programs, which is the right way to attempt it.
 
 Anything aimed at the 16.5 KB that is ours. It is 7% of the binary, and the
 target is 51 KB away.
+
+## The conversion landed, and the binary did not move (2026-10-11)
+
+`grasm_rt` compiles under `#![no_std]`: 793 errors down to zero, and the whole
+workspace builds. A hello-world built with it:
+
+    350.0 KB      against 351.1 before
+
+**No change.** The reason, found by looking rather than guessing: `nm` still
+shows eleven `gimli`/`addr2line`/`rust_panic` symbols in the binary.
+`grasm_rt` depends on `grasm_journal` and `grasm_fiber`, both of which are
+still `std` crates, so `std` is still linked and brings its symboliser with
+it. Converting one crate of three cannot drop a dependency all three share.
+
+So the 32.8 KB the probe measured remains the right target and the work so far
+remains necessary, but it was not sufficient, and the honest reading is that
+the payoff is still unrealised.
+
+What is left is much smaller than what is done: the two crates are 1,144 lines
+with 37 `std` uses between them, against `grasm_rt`'s 11,030 and 295. Most are
+`cell`, `ptr`, `mem`, `hint`, `any`, `ffi` and `rc`, which move to `core` and
+`alloc`. The real work is `process` 6, `fs` 6, `env` 3 and `io` 1 -- all of
+which now have a `no_std` implementation in `grasm_rt` to call -- plus
+`std::panic` 5, which is the one thing with no `no_std` equivalent and needs
+reading before it is replaced.

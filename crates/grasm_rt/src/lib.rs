@@ -1413,6 +1413,7 @@ mod fs {
         #[link_name = "write"]
         fn sys_write(fd: i32, buf: *const u8, n: usize) -> isize;
         fn lseek(fd: i32, at: i64, whence: i32) -> i64;
+        fn fsync(fd: i32) -> i32;
         #[link_name = "rename"]
         fn sys_rename(from: *const u8, to: *const u8) -> i32;
         fn unlink(path: *const u8) -> i32;
@@ -1561,6 +1562,11 @@ mod fs {
                 }
             }
             Ok(())
+        }
+
+        /// `sync_all`: the bytes are on the device, not merely accepted.
+        pub fn sync(&mut self) -> Result<()> {
+            check(unsafe { fsync(self.fd) })
         }
 
         pub fn seek(&mut self, whence: i32, at: i64) -> Result<u64> {
@@ -1780,9 +1786,9 @@ mod sys {
     /// `std` flushed stdout when the process ended; raw file descriptors do
     /// not, so anything still in the buffer would be lost. Every exit in this
     /// runtime goes through here for that reason.
-    pub unsafe fn exit(code: i32) -> ! {
+    pub fn exit(code: i32) -> ! {
         crate::io::flush_all();
-        libc_exit(code)
+        unsafe { libc_exit(code) }
     }
 
     fn now(clock: i32) -> Duration {
@@ -4743,7 +4749,10 @@ pub extern "C" fn grasm_live_allocations() -> i64 {
 pub extern "C" fn grasm_check_leaks() {
     if crate::sys::env_var("GRASM_ALLOC_STATS").is_some() {
         let made = LOCAL.with(|l| l.allocated.get()) + ESCAPED_ALLOCS.load(Relaxed);
-        eprintln!("allocations: {made}");
+        // `eprintln!` needs `std`; this is the same thing through the
+        // runtime's own buffered stderr.
+        let mut err = crate::io::stderr().lock();
+        let _ = writeln!(err, "allocations: {made}");
     }
     if crate::sys::env_var("GRASM_LEAK_CHECK").is_none() {
         return;
@@ -10367,7 +10376,7 @@ fn accept_from(l: &crate::net::Socket, ready: bool) -> Result<crate::net::Socket
             // Accepted from a non-blocking listener, a stream inherits the
             // mode on the BSDs, macOS included; every read and write here
             // expects to block.
-            Ok((stream, _)) => {
+            Ok(stream) => {
                 stream.set_nonblocking(false).map_err(|e| e.to_string())?;
                 return Ok(without_nagle(stream));
             }
@@ -11143,9 +11152,10 @@ unsafe fn grasm_tcp_write_bytes_now(handle: *mut RtVal, data: *mut RtVal) -> *mu
     };
     let payload = payload.owner.clone();
     let wrote = socket_with(h, |s| match s {
-        Socket::Stream(stream) => (&mut &*stream)
+        // Unbuffered, so there is nothing to flush after the write: `send`
+        // has already handed the bytes to the kernel.
+        Socket::Stream(stream) => stream
             .write_all(&payload)
-            .and_then(|()| (&mut &*stream).flush())
             .map_err(|e| e.to_string()),
         Socket::Listener(_) => Err(format!("socket {h} is a listener, not a connection")),
         Socket::Datagram(_) => Err(format!(
@@ -11179,9 +11189,9 @@ unsafe fn grasm_tcp_write_now(handle: *mut RtVal, data: *mut RtVal) -> *mut RtVa
     };
     let text = as_str(data).to_string();
     let wrote = socket_with(h, |s| match s {
-        Socket::Stream(stream) => (&mut &*stream)
+        // Unbuffered, as in `tcp_send_bytes` above.
+        Socket::Stream(stream) => stream
             .write_all(text.as_bytes())
-            .and_then(|()| (&mut &*stream).flush())
             .map_err(|e| e.to_string()),
         Socket::Listener(_) => Err(format!("socket {h} is a listener, not a connection")),
         Socket::Datagram(_) => Err(format!(
@@ -11572,8 +11582,8 @@ unsafe fn grasm_udp_send_now(
         _ => return err_of(io_err("IoFailed", "udp_send takes bytes".to_string())),
     };
     let sent = socket_with(h, |s| match s {
-        Socket::Datagram(d) => d
-            .send_to(&payload, (host.as_str(), port as u16))
+        Socket::Datagram(d) => crate::net::resolve(host.as_str(), port as u16)
+            .and_then(|to| d.send_to(&payload, &to))
             .map(|n| n as i64)
             .map_err(|e| e.to_string()),
         _ => Err(format!("socket {h} is not a datagram socket")),
@@ -11642,7 +11652,7 @@ unsafe fn grasm_udp_recv_from_now(handle: *mut RtVal) -> *mut RtVal {
     let got = socket_with(h, |s| match s {
         Socket::Datagram(d) => {
             match read_sized(|b| d.recv_from(b)) {
-                Ok((buf, from)) => Ok((buf, from.ip().to_string(), i64::from(from.port()))),
+                Ok((buf, from)) => Ok((buf, from.ip_text(), i64::from(from.port()))),
                 Err(e) => Err(e.to_string()),
             }
         }
@@ -11759,7 +11769,7 @@ pub unsafe extern "C" fn grasm_write_file(path: *mut RtVal, content: *mut RtVal)
 unsafe fn grasm_write_file_now(path: *mut RtVal, content: *mut RtVal) -> *mut RtVal {
     let p = as_str(path).to_string();
     let c = as_str(content).to_string();
-    match crate::fs::write(&p, c) {
+    match crate::fs::write(&p, c.as_bytes()) {
         // `Unit`, not `I64(0)`. The two are indistinguishable to a compiled
         // build — the static type is `()` and the backend prints it from the
         // type rather than the value — but they are not indistinguishable once
@@ -12101,7 +12111,7 @@ unsafe fn grasm_sync_file_now(path: *mut RtVal) -> *mut RtVal {
     let done = crate::fs::OpenOptions::new()
         .append(true)
         .open(&p)
-        .and_then(|f| f.sync_all());
+        .and_then(|mut f| f.sync());
     match done {
         Ok(()) => ok_of(alloc(RtPayload::Unit)),
         Err(e) if e.kind() == crate::io::ErrorKind::NotFound => err_of(io_err("NotFound", p)),
@@ -12208,10 +12218,7 @@ unsafe fn grasm_list_dir_now(path: *mut RtVal) -> *mut RtVal {
     let p = as_str(path).to_string();
     match crate::fs::read_dir(&p) {
         Ok(entries) => {
-            let mut names: Vec<String> = entries
-                .filter_map(|e| e.ok())
-                .map(|e| e.file_name().to_string_lossy().into_owned())
-                .collect();
+            let mut names: Vec<String> = entries;
             names.sort();
             let items: Vec<*mut RtVal> = names
                 .into_iter()
@@ -12523,8 +12530,7 @@ fn interned(text: &str) -> &'static str {
     static NAMES: OnceLock<Mutex<HashMap<String, &'static str>>> = OnceLock::new();
     let mut map = NAMES
         .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+        .lock();
     if let Some(s) = map.get(text) {
         return s;
     }
