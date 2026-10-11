@@ -264,3 +264,37 @@ today, when `readdir$INODE64` took three apps out and difftest called them
 Two defects came out of this comparison and are fixed: `RwLock::write`
 returning a mutex guard, and exec failure being indistinguishable from exit
 127. Both are in the commit log with their own regression tests.
+
+## The whole corpus (2026-10-11)
+
+| set | programs | agree | disagree | not runnable | fail natively only |
+|---|---:|---:|---:|---:|---:|
+| `spec/conformance` | 257 | 197 | 0 | 60 | **0** |
+| `packages` | 838 | 257 | 0 | 581 | **0** |
+| `apps`, `projects`, `benchmarks/grasm`, `examples` (difftest, four engines) | 57 | 57 | 0 | 0 | **0** |
+| | **1,152** | **511** | **0** | 641 | **0** |
+
+511 is the number of runnable programs the corpus is documented to have, which
+is the check that this is the whole of it rather than most of it.
+
+Every one of the 641 that the native backend declines was re-run under
+`grasm run` and fails there too -- a library without a `main`, or one of the
+suite's deliberate error tests. Zero programs compile interpreted and fail
+natively. That last column is the one that matters: it is where a regression
+hides as a capability limit, and it did exactly that this morning, when
+`readdir$INODE64` took three apps out and difftest called them "unsupported".
+
+### Four apparent disagreements that were not
+
+`accounts-demo`, `crypto_hash-demo`, `observe-demo`, `password-demo`,
+`postgres-demo` and `examples/parallel_map` each looked like a mismatch and
+were the interpreter running out of time. `crypto_hash-demo` takes **8m15s**
+interpreted against well under a second compiled; `accounts-demo` 81s;
+`parallel_map` 2m18s. A 90-second cap is not generous for a corpus with
+crypto in it, and a timeout presents as missing output -- which looks exactly
+like a backend that stopped early.
+
+`examples/concurrency` was a seventh, and a different cause: `exit 0 vs 137`,
+SIGKILL with empty output, at load average 23 with a `cargo-fuzz` run holding
+the machine. Three runs alone, all identical. Both failure modes are recorded
+in memory for the next person; neither was a defect.
