@@ -405,3 +405,40 @@ membership is an index rather than a tree walk -- **O(1) rather than
 O(log n)**, and no BTree code at all. It was not the 17.8 KB (that was the
 page), but it is the better structure on both counts, and 1,000,000 tasks
 still answer correctly.
+
+## The gates that can run on this machine (2026-10-12)
+
+| gate | scope | result |
+|---|---|---|
+| `leakcheck` | 226 programs | **0 leaks** |
+| `usecheck` (the `poison` build) | 197 programs | **0 differences** |
+| `crosstest` x86_64 | 224 programs | **195 pass, 0 real failures, 60 declined** |
+| `clippy --all-targets` | native and wasm32 | 0 |
+| unit tests | every crate | 609 pass |
+| `wasmtest` | — | pass |
+| difftest / corpus comparison | 511 programs | 0 differences |
+
+`leakcheck` and `usecheck` are the two that matter most for a rewritten
+allocator, and no other check can replace either: a leaking program produces
+exactly the right output, and a premature free makes a value *less* live, not
+more. The `poison` feature also still compiles under `no_std`, which had not
+been checked.
+
+`crosstest` is more than a second compile. It builds for
+`x86_64-apple-darwin`, links with `cc -arch x86_64` and **runs the result
+under Rosetta**, so it exercises paths the arm64 build never reaches --
+`readdir$INODE64` exists only there, and variadic arguments go in registers
+on x86_64 SysV where arm64 puts them on the stack. The `open`/`fcntl` fix
+earlier today was for an arm64-only defect; this confirms it did not break
+the architecture that was already working.
+
+**Two reported failures that are not.** `E-NOT-PARALLEL` and
+`E-RECURSION-PARALLEL` differed during a run taken at load 38 rising to 134.
+Both agree on re-run -- 3 of 3 and 2 of 2 -- and both are *parallel* tests,
+which is what starves first on a saturated machine. Recorded as load
+artefacts rather than quietly dropped, and the whole crosstest figure should
+be taken again on a quiet machine before anyone calls it green.
+
+Still unrun: `replaytest`, the fuzzers, and anything on Linux -- no Linux
+target is installed here, so roughly 2,100 lines of `cfg(not(macos))` have
+never been compiled, let alone run.
