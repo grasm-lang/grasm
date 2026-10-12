@@ -229,6 +229,9 @@ dependencies = [
 [[package]]
 name = "grasm_fiber"
 version = "1.0.0"
+dependencies = [
+ "grasm_sys",
+]
 
 [[package]]
 name = "grasm_interp"
@@ -243,6 +246,9 @@ dependencies = [
 [[package]]
 name = "grasm_journal"
 version = "1.0.0"
+dependencies = [
+ "grasm_sys",
+]
 
 [[package]]
 name = "grasm_lsp"
@@ -281,6 +287,16 @@ version = "1.0.0"
 dependencies = [
  "grasm_fiber",
  "grasm_journal",
+ "grasm_sys",
+ "hashbrown 0.15.5",
+]
+
+[[package]]
+name = "grasm_rt_abi"
+version = "1.0.0"
+dependencies = [
+ "grasm_rt",
+ "grasm_sys",
 ]
 
 [[package]]
@@ -301,6 +317,10 @@ dependencies = [
 
 [[package]]
 name = "grasm_syntax"
+version = "1.0.0"
+
+[[package]]
+name = "grasm_sys"
 version = "1.0.0"
 
 [[package]]
