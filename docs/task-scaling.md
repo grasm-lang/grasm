@@ -205,3 +205,35 @@ So 1M tasks is a property of the compiled build, which is what a node runs,
 and the spec already says the two engines stop at different depths. Both
 honour the 10,000 the spec guarantees -- checked, in a task and on the main
 stack, in both engines.
+
+## What had to be re-verified, and what did not (2026-10-12)
+
+Both schedulers changed, so the question was what could observe it. Counted
+across `apps`, `examples`, `packages`, `projects`, `spec` and `benchmarks`,
+ignoring comments, the programs that call `concurrent`, `go` or any
+`chan_*` are:
+
+| program | uses |
+|---|---:|
+| `spec/conformance/E-CHANNEL.gr` | 12 |
+| `spec/conformance/E-DEADLOCK.gr` | 9 |
+| `spec/conformance/E-SCHEDULE.gr` | 9 |
+| `spec/conformance/E-CONCURRENT.gr` | 7 |
+| `spec/conformance/T-EFFECT-BUILTIN.gr` | 4 |
+| `spec/conformance/E-ACTOR.gr` | 2 |
+
+**Six, and all six are conformance tests.** Nothing in `apps`, `packages`,
+`projects` or `benchmarks` reaches the scheduler, in a `main` or in library
+code. The twelve files a plain `grep` finds include six whose only mention is
+a comment -- `bcrypt` says "thousands of concurrent hashes", the chat server
+describes the shape it would use -- and a count that includes those is what
+made this look like a corpus-wide risk.
+
+All six were verified after each change: interpreter before against
+interpreter after (unchanged), and interpreter against native (identical).
+The whole 257-program conformance suite was compared after each change as
+well.
+
+So re-running 838 packages against a scheduler change would have cost hours
+and tested nothing, which is what three stopped background sweeps were
+spending the afternoon on before this was counted.
