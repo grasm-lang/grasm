@@ -2671,6 +2671,23 @@ pub mod sync {
             OnceLock::new()
         }
     }
+
+    /// Drops the value if one was ever written, as `std`'s `OnceLock` does.
+    ///
+    /// Every use in this tree today is either a `static`, which never drops,
+    /// or holds a `usize`, which has nothing to drop -- so this changes
+    /// nothing now. Without it, the first `OnceLock<String>` put in a struct
+    /// would leak its contents silently, and that is a trap to leave in a
+    /// type that is otherwise `std`'s shape.
+    impl<T> Drop for OnceLock<T> {
+        fn drop(&mut self) {
+            if self.state.load(Ordering::Acquire) == READY {
+                // Safety: READY is only stored after the value is written,
+                // and `&mut self` means nothing else can reach it.
+                unsafe { (*self.value.get()).assume_init_drop() };
+            }
+        }
+    }
 }
 
 /// The shape `std`'s macro accepts, over `tls::Local`. The `const { … }` form
@@ -3091,6 +3108,35 @@ mod tests {
     }
 
     /// Readers may overlap; a second one must not wait for the first.
+    /// A `OnceLock` holding something with a `Drop` must run it. Every use
+    /// in this tree is a `static` or holds a `usize`, so nothing exercised
+    /// this until here.
+    #[test]
+    fn a_oncelock_drops_what_it_holds() {
+        use core::sync::atomic::{AtomicI64, Ordering};
+        static DROPPED: AtomicI64 = AtomicI64::new(0);
+        struct Noisy;
+        impl Drop for Noisy {
+            fn drop(&mut self) {
+                DROPPED.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        {
+            let held: crate::sync::OnceLock<Noisy> = crate::sync::OnceLock::new();
+            held.get_or_init(|| Noisy);
+            assert_eq!(DROPPED.load(Ordering::SeqCst), 0);
+        }
+        assert_eq!(DROPPED.load(Ordering::SeqCst), 1, "the value leaked");
+
+        // And one never written drops nothing.
+        {
+            let empty: crate::sync::OnceLock<Noisy> = crate::sync::OnceLock::new();
+            assert!(empty.get().is_none());
+        }
+        assert_eq!(DROPPED.load(Ordering::SeqCst), 1);
+    }
+
     #[test]
     fn two_readers_can_hold_an_rwlock_at_once() {
         static TABLE: crate::sync::RwLock<i64> = crate::sync::RwLock::new(7);
@@ -3157,6 +3203,13 @@ mod tests {
         // Both streams are written, and stdout is far more than a pipe
         // buffer (64 KiB on Linux), so reading one to the end before the
         // other would stall here rather than fail.
+        //
+        // This and `a_child_reports_its_status_and_its_stderr` assert a
+        // child's exact output, so they are load-sensitive: both failed once
+        // at load 146, where a child can be killed outright, and pass 24 of
+        // 24 three times over at load 63. Kept strict -- a test that tolerates
+        // a killed child tolerates a lost one -- so read a failure here
+        // against the machine's load before believing it.
         let (code, out, err) = crate::process::run(
             "sh",
             &[
