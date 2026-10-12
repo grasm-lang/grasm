@@ -540,3 +540,39 @@ which is why five rounds of gates had not found any.
 That is the honest reading of an audit: it finds what tests cannot, and the
 tests passing afterwards is evidence the fixes were correct rather than
 evidence the defects were imaginary.
+
+## The fuzzers, which were the last gate this machine can run (2026-10-13)
+
+| fuzzer | programs | result |
+|---|---:|---|
+| `fuzz_differential` | 200 (seed 7), 120 (seed 1) | **0 mismatched, 0 rejected** |
+| `fuzz_exits` | 85 | **0 disagreed**, 5 refused by the checker |
+| `fuzz_captures` | 240 | **0 disagreed** |
+
+`fuzz_captures` first reported **7 disagreements**, every one of them
+`native=('', -9)` -- empty output and `SIGKILL`. That is the signature already
+recorded for this machine, and all seven were gone on a rerun: 240 of 240
+agreed. Five of the seven were `par`, `spawn-reads` and `two-spawns`, which
+are the programs that stress the machine hardest, which is why they are the
+ones that get killed.
+
+Worth stating plainly: had those been read as real, the afternoon would have
+gone on debugging a defect that does not exist. The rule is to rerun that
+signature before believing it, and it earned its keep again.
+
+### Every gate this machine can run, run
+
+    leakcheck          226 programs    0 leaks
+    usecheck (poison)  197 programs    0 differences
+    crosstest x86_64   224 programs    195 pass, 0 real failures
+    replaytest          39 builtins    0 unhooked (after fixing the gate)
+    wasmtest                 --        pass
+    difftest / corpus  511 programs    0 differences
+    clippy --all-targets     --        0, native and wasm32
+    unit tests         every crate     609 pass
+    fuzzers            525 programs    0 real disagreements
+
+What cannot be run here: anything on Linux. No Linux target is installed, so
+about 2,100 lines of `cfg(not(macos))` have never been compiled. CI's ubuntu
+runner would catch what does not compile; it would not catch a wrong constant,
+which is how `AF_INET6` survived to be found by reading headers.
