@@ -42,6 +42,25 @@ pub struct Chans {
     /// How many `concurrent` blocks have run tasks, so the test runner can
     /// tell a test that has a schedule to vary from one that has none.
     pub(crate) blocks_run: u64,
+    /// Which task slot is running, so a channel operation that has to wait
+    /// knows whom to enqueue. Set by the scheduler around each resume.
+    pub(crate) running: usize,
+    /// For the slot that just gave way: the channels it waits on. A `select`
+    /// waits on several, and is woken by whichever moves first.
+    pub(crate) blocked_on: Vec<usize>,
+    /// Whether each slot is currently in some channel's wait queue.
+    ///
+    /// A blocked operation retries in a loop, so a task re-joins a queue
+    /// every time it gives way, and a queue accumulates entries for slots
+    /// that have since been woken or finished. Without this, `wake_one`
+    /// spends its wake on a stale entry and the task that was actually
+    /// waiting is never resumed -- which reports a deadlock on a program
+    /// that has none.
+    pub(crate) waiting: Vec<bool>,
+    /// Slots a channel operation has woken and the scheduler has not yet
+    /// taken. Draining this rather than resuming every live task is what
+    /// makes a round O(runnable) instead of O(live) ([E-SCHEDULE]).
+    pub(crate) ready: VecDeque<usize>,
     /// Tier 2's slab, while it is in transit between interpreters. A `ref`
     /// (an actor's state is one) names a slot in *the* slab, so there can be
     /// only one; each task's interpreter holds it while it runs and puts it
@@ -65,6 +84,35 @@ fn next(state: &mut u64) -> u64 {
 
 impl Chans {
     /// The order this round visits `n` tasks in.
+    /// Wakes the longest-waiting task on `id`, if any, by moving it to the
+    /// ready list. Exactly one: a value, or a space for one, serves one
+    /// waiter, and waking the rest only to have them wait again is the
+    /// O(live) round this replaces ([E-SCHEDULE]).
+    ///
+    /// A `select` sits in several queues, so a slot can be woken twice. The
+    /// scheduler takes each slot once per round, which makes the second
+    /// wake-up a no-op rather than a double resume.
+    fn wake_one(&mut self, id: usize, side: Side) {
+        let Some(c) = self.chans.get_mut(id) else {
+            return;
+        };
+        let queue = match side {
+            Side::Room => &mut c.want_room,
+            Side::Value => &mut c.want_value,
+        };
+        while let Some(slot) = queue.pop_front() {
+            if self.waiting.get(slot).copied().unwrap_or(false) {
+                self.waiting[slot] = false;
+                self.ready.push_back(slot);
+                return;
+            }
+            // Stale: that slot was woken by another channel, or has
+            // finished. Keep looking rather than spending the wake on it.
+        }
+    }
+
+    /// The order a round visits what is runnable: as given, unless
+    /// `--schedules` has a seed to draw a permutation from.
     fn round_order(&mut self, n: usize) -> Vec<usize> {
         let mut order: Vec<usize> = (0..n).collect();
         if let Some(state) = self.schedule.as_mut() {
@@ -78,6 +126,16 @@ impl Chans {
 }
 
 struct Chan {
+    /// Slots waiting for room to send, and slots waiting for a value to
+    /// receive, longest-waiting first in each ([E-SCHEDULE]).
+    ///
+    /// Two queues and not one. With a single queue a send wakes whichever
+    /// slot waited longest, which may be another *sender* -- it finds the
+    /// buffer just as full, waits again, and the receiver that could have
+    /// gone on is never reached. That reports a deadlock on a program that
+    /// has none, which is what one queue did here.
+    want_room: VecDeque<usize>,
+    want_value: VecDeque<usize>,
     buf: VecDeque<Value>,
     /// How many values it holds before a send waits; 0 is a rendezvous.
     cap: usize,
@@ -86,6 +144,14 @@ struct Chan {
     /// returns once its own value has been taken.
     sent: u64,
     taken: u64,
+}
+
+/// Which queue of a channel a wake-up is for: a sender wants room, a
+/// receiver wants a value.
+#[derive(Clone, Copy)]
+pub(crate) enum Side {
+    Room,
+    Value,
 }
 
 /// What a channel operation that cannot go ahead does next.
@@ -100,6 +166,8 @@ pub(crate) enum Wait {
 impl Chans {
     pub(crate) fn make(&mut self, cap: i64) -> Value {
         self.chans.push(Chan {
+            want_room: VecDeque::new(),
+            want_value: VecDeque::new(),
             buf: VecDeque::new(),
             cap: cap.max(0) as usize,
             closed: false,
@@ -164,9 +232,31 @@ impl<'a, W: Write> Interp<'a, W> {
         }
     }
 
-    fn wait(&mut self) -> Result<(), Flow> {
+    /// Gives way until one of `on` moves.
+    ///
+    /// The slot joins each channel's wait queue before suspending, so a send
+    /// or receive can wake exactly it rather than the scheduler resuming
+    /// every live task to find out who can go on ([E-SCHEDULE]).
+    fn wait(&mut self, on: &[usize], side: Side) -> Result<(), Flow> {
         match if self.in_task { Wait::Yield } else { Wait::Deadlock } {
             Wait::Yield => {
+                {
+                    let mut guard = self.chans.borrow_mut();
+                    let me = guard.running;
+                    guard.blocked_on.clear();
+                    if me < guard.waiting.len() {
+                        guard.waiting[me] = true;
+                    }
+                    for &id in on {
+                        if let Some(c) = guard.chans.get_mut(id) {
+                            match side {
+                                Side::Room => c.want_room.push_back(me),
+                                Side::Value => c.want_value.push_back(me),
+                            }
+                        }
+                    }
+                    guard.blocked_on.extend_from_slice(on);
+                }
                 self.park_slab();
                 grasm_fiber::suspend();
                 self.take_slab();
@@ -203,15 +293,22 @@ impl<'a, W: Write> Interp<'a, W> {
                         c.buf.push_back(v.take().expect("sent once"));
                         c.sent += 1;
                         *progress += 1;
-                        if c.cap > 0 {
+                        let full = c.cap > 0;
+                        let next_ticket = c.sent - 1;
+                        drop(guard);
+                        // A value arrived, so one receiver can go on. Woken
+                        // outside the borrow, because `wake_one` needs the
+                        // whole `Chans` and this held one channel of it.
+                        self.chans.borrow_mut().wake_one(id, Side::Value);
+                        if full {
                             return Ok(Value::Unit);
                         }
-                        ticket = Some(c.sent - 1);
+                        ticket = Some(next_ticket);
                         continue;
                     }
                 }
             }
-            self.wait()?;
+            self.wait(&[id], Side::Room)?;
         }
     }
 
@@ -228,13 +325,17 @@ impl<'a, W: Write> Interp<'a, W> {
                 if let Some(v) = c.buf.pop_front() {
                     c.taken += 1;
                     *progress += 1;
+                    drop(guard);
+                    // A space opened, and a rendezvous sender is waiting for
+                    // its own value to be taken.
+                    self.chans.borrow_mut().wake_one(id, Side::Room);
                     return Ok(crate::interp::some(v));
                 }
                 if c.closed {
                     return Ok(crate::interp::none());
                 }
             }
-            self.wait()?;
+            self.wait(&[id], Side::Value)?;
         }
     }
 
@@ -262,7 +363,9 @@ impl<'a, W: Write> Interp<'a, W> {
                     }
                 }
             }
-            self.wait()?;
+            // A select waits on all of them and is woken by whichever moves
+            // first, so it joins every queue.
+            self.wait(&ids, Side::Value)?;
         }
     }
 
@@ -279,6 +382,16 @@ impl<'a, W: Write> Interp<'a, W> {
         }
         c.closed = true;
         *progress += 1;
+        // Closing is the one case that wakes *all* of them: every waiter's
+        // answer changes, and none will wait on this channel again.
+        let mut woken: VecDeque<usize> = core::mem::take(&mut c.want_room);
+        woken.extend(core::mem::take(&mut c.want_value));
+        for slot in woken {
+            if guard.waiting.get(slot).copied().unwrap_or(false) {
+                guard.waiting[slot] = false;
+                guard.ready.push_back(slot);
+            }
+        }
         Ok(Value::Unit)
     }
 
@@ -323,18 +436,46 @@ impl<'a, W: Write> Interp<'a, W> {
             });
             live.push((Run::Pending(Some(body)), ending, out));
         }
+        // Every task starts runnable, in the order its `go` ran. After that a
+        // task is runnable only when a channel operation wakes it, so a round
+        // costs O(runnable) and not O(live) -- which is what lets the task
+        // count grow ([E-SCHEDULE]).
+        let mut slots: Vec<Option<_>> = live.drain(..).map(Some).collect();
+        let mut runnable: VecDeque<usize> = (0..slots.len()).collect();
+        let mut alive = slots.len();
+        {
+            let mut guard = self.chans.borrow_mut();
+            guard.ready.clear();
+            guard.waiting.clear();
+            guard.waiting.resize(slots.len(), false);
+        }
+
         let result = loop {
-            let before = self.chans.borrow().progress;
-            let mut finished_any = false;
             let mut failed: Option<Flow> = None;
-            let order = self.chans.borrow_mut().round_order(live.len());
-            // Each round takes the tasks out and puts back the ones still
-            // waiting, in the order they ran. Removing finished ones from the
-            // middle of the list cost a shift of everything after each, which
-            // is quadratic in the number of tasks.
-            let mut slots: Vec<Option<_>> = live.drain(..).map(Some).collect();
-            for i in order {
-                let mut entry = slots[i].take().expect("each index once");
+            // One round is whatever is runnable at its start. Anything woken
+            // during it is taken by the next, which keeps the order a task
+            // sees independent of where in the round it happened to be.
+            let mut this_round: Vec<usize> = runnable.drain(..).collect();
+            // `--schedules` reorders the round, as it always has. The queue
+            // decides who is *in* a round; the seed decides their order
+            // within it.
+            let order = self.chans.borrow_mut().round_order(this_round.len());
+            this_round = order.into_iter().map(|i| this_round[i]).collect();
+
+            for i in this_round {
+                // `None` means it finished earlier, or a `select` woke it
+                // twice and this is the second: either way, nothing to run.
+                let Some(mut entry) = slots[i].take() else {
+                    continue;
+                };
+                {
+                    let mut guard = self.chans.borrow_mut();
+                    guard.running = i;
+                    guard.blocked_on.clear();
+                    // About to run, so not waiting -- whatever queues still
+                    // hold its slot are stale from here on.
+                    guard.waiting[i] = false;
+                }
                 // The depth check measures the stack it runs on, and that is
                 // now this task's -- not the thread's, whose floor lies far
                 // below it and would call every task's first call too deep.
@@ -361,7 +502,7 @@ impl<'a, W: Write> Interp<'a, W> {
                     let _ = self.out.write_all(&bytes);
                 }
                 if ended {
-                    finished_any = true;
+                    alive -= 1;
                     let ended_with = entry.1.borrow_mut().take();
                     // Safety: the task's interpreter was dropped at the end of
                     // its fiber, so nothing refers to this box any more.
@@ -371,21 +512,31 @@ impl<'a, W: Write> Interp<'a, W> {
                         break;
                     }
                 } else {
-                    live.push(entry);
+                    // It gave way. If it joined a channel's queue, that queue
+                    // will wake it; if it gave way without blocking, it is
+                    // still runnable.
+                    if self.chans.borrow().blocked_on.is_empty() {
+                        runnable.push_back(i);
+                    }
+                    slots[i] = Some(entry);
                 }
             }
-            // Tasks a failure cut the round short before: abandoned below.
-            live.extend(slots.into_iter().flatten());
+
             if let Some(e) = failed {
                 break Err(e);
             }
-            if live.is_empty() {
+            if alive == 0 {
                 break Ok(Value::Unit);
             }
-            if !finished_any && self.chans.borrow().progress == before {
+            runnable.extend(self.chans.borrow_mut().ready.drain(..));
+            if runnable.is_empty() {
+                // Every live task is in a wait queue and no channel can move:
+                // nothing will ever wake them ([E-DEADLOCK]).
                 break Err(Flow::Panic(DEADLOCK.to_string()));
             }
         };
+        let mut live: Vec<_> = slots.into_iter().flatten().collect();
+
         // A task still suspended here is abandoned with the block: its fiber
         // and stack go, and so does its output box.
         for (run, _, out) in live.drain(..) {

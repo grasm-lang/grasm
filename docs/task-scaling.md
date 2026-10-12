@@ -77,3 +77,61 @@ about what `[E-SCHEDULE]` promises, not a local fix.
 So G6 is reachable, and it is a scheduler redesign with a spec change attached
 rather than an optimisation. 16 KB a task also puts 1M at 16 GB, so the stack
 would want shrinking in the same pass.
+
+## Built, 2026-10-12: the queue, and what it moved
+
+Per-channel wait queues, approved as a change to `[E-SCHEDULE]`. Interpreter
+first, since it is the engine the others are diffed against.
+
+| tasks | before | after | before, per doubling | after |
+|---:|---:|---:|---:|---:|
+| 1,000 | 0.12 s | 0.03 s | — | — |
+| 2,000 | 0.41 s | 0.05 s | 3.4x | 1.8x |
+| 4,000 | 1.78 s | 0.10 s | 4.4x | 2.1x |
+| 10,000 | 15.65 s | 0.28 s | 8.8x | 2.9x |
+| 40,000 | >240 s | 0.98 s | — | 3.5x |
+| 100,000 | >240 s | 2.33 s | — | 2.4x |
+| 200,000 | — | 6.53 s | — | 2.8x |
+
+Quadratic to linear, and every row's answer checked, not just its clock.
+**56x at 10,000 tasks**, and 200,000 now runs where 40,000 did not finish.
+
+### Two queues, not one
+
+The first version had one queue per channel and reported a **deadlock on a
+program that has none**. A send woke whichever slot had waited longest, which
+could be another *sender*: it found the buffer just as full, waited again, and
+the receiver that could have gone on was never reached.
+
+So a channel has two queues -- tasks wanting room, tasks wanting a value. A
+send wakes a receiver, a receive wakes a sender, and closing wakes both.
+
+A second defect in the same first version: a blocked operation retries in a
+loop, so a task re-joins a queue every time it gives way, and queues fill with
+entries for slots since woken or finished. A wake spent on one of those is a
+wake nobody gets. `waiting[slot]` now says whether a slot is really in a
+queue, and `wake_one` skips the stale ones rather than stopping at the first.
+
+### What the corpus did
+
+Nothing. All 257 conformance programs give the same output as before, with one
+exception that is not one: `E-PANIC-TRACE` elides 53,950 frames where it
+elided 67,165, and its own comment records that depth as
+implementation-defined ([E-RECURSION-DEPTH]). The three tests predicted to
+change -- `E-SCHEDULE`, `E-DEADLOCK`, `E-CONCURRENT` -- did not, because at
+most one task waits per channel in them, so arrival order and `go` order
+coincide.
+
+### The limit is now memory, and it is not 1M yet
+
+400,000 tasks fails, and not on time: `could not map a fiber stack of
+470827008 bytes`. `TASK_STACK` is `STACK_BUDGET + 1 MB`, so **449 MB of
+address space is reserved per task**, and 400,000 of those exceeds the
+128 TB a process gets. Pages stay untouched, so the resident cost is about
+15 KB a task -- 2.97 GB at 200,000, which matches the 16 KB this document
+measured at the start.
+
+So G6 is no longer blocked by the scheduler. Reaching 1M needs the per-task
+stack reservation cut by roughly 4x for the address space, and 1M x 15 KB is
+15 GB resident, which is a machine question rather than a code one. Both are
+separate from the quadratic, which is fixed.
