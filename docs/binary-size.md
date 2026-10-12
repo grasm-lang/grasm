@@ -516,3 +516,27 @@ the escape is rejected:
 
 Checked after: `par_map` answers `[1, 4, 9]`, 100,000 tasks still run, clippy
 and wasm32 clean, 25 tests pass.
+
+### The audit's five fixes, re-verified (2026-10-13)
+
+All of them touch the runtime every compiled program links, so the corpus was
+compared again rather than reasoned about:
+
+| | |
+|---|---|
+| `spec/conformance` | **197 agree, 0 differ**, 60 declined |
+| `leakcheck` | 29 programs, **0 leaks** |
+| `par_map` | `[1, 4, 9]` |
+| 100,000 tasks | correct |
+| clippy, native and wasm32 | 0 |
+| `grasm_sys` tests | 25 pass |
+
+The same numbers as before the fixes, which is what should happen: four of the
+five were latent -- a signal inside `fsync` or `sendto`, an address family
+wider than 128 bytes, a non-static `OnceLock` -- and the fifth needed someone
+to write a line nobody had written. None of them was reachable by the corpus,
+which is why five rounds of gates had not found any.
+
+That is the honest reading of an audit: it finds what tests cannot, and the
+tests passing afterwards is evidence the fixes were correct rather than
+evidence the defects were imaginary.
