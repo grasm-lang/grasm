@@ -367,3 +367,41 @@ The generator for those files is worth keeping either way: structs, generics,
 interpolation and cross-file calls at 5k, 25k, 75k and 175k lines, all four
 checking clean. `as f64` is not Grasm's cast -- `.as_f64()` is -- and the
 first version measured 1,430 parse errors instead of a typecheck.
+
+## 85.7 KB, not 68.3, and the reason is a page boundary (2026-10-12)
+
+The 68.3 KB above was measured at `0ed1d88` and is no longer the number. A
+hello-world built from the branch head is **85.7 KB**. Bisected:
+
+| commit | file | `__text` |
+|---|---:|---:|
+| `bd50c5a` | 69,896 | 27,808 |
+| `6ddcb5a` (the CAS-to-load fix) | 87,720 | 29,712 |
+| branch head | 87,808 | 29,648 |
+
+**The code grew 1,904 bytes. The file grew 17,824.** `__TEXT`'s sections now
+total 32,504 bytes, which with the Mach-O header and load commands is just
+past 32,768 -- so the segment takes three 16 KB pages where it took two. The
+whole 17.8 KB is page quantisation around a few hundred bytes.
+
+Two things follow. The file size is **not** a linear measure of code at this
+scale: a 500-byte change can move it 16 KB either way, so a reading taken
+once is a reading of which side of a cliff the build happens to be on.
+And G5 is still met with room -- 85.7 KB against 300 KB, 3.5x inside -- so
+trimming the few hundred bytes to fall back under the boundary is cosmetic
+and was not done.
+
+What was tested and did **not** explain it: `#[inline(always)]` on the lock
+fast paths, relaxed to `#[inline]`, left the file byte-identical and `tree`
+still at parity. The 31% that fix bought costs 1.9 KB of code and nothing in
+speed to make it polite.
+
+### A smaller structure, found while looking for the 16 KB
+
+`grasm_rt`'s scheduler tracked which waiters were really queued in a
+`BTreeSet<(block, slot)>`, which pulled 29 BTree symbols out of `alloc`. It
+is now one `Vec<bool>` per block: slots are dense and blocks are few, so
+membership is an index rather than a tree walk -- **O(1) rather than
+O(log n)**, and no BTree code at all. It was not the 17.8 KB (that was the
+page), but it is the better structure on both counts, and 1,000,000 tasks
+still answer correctly.

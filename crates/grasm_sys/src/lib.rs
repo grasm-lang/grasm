@@ -129,7 +129,7 @@ pub mod tls {
             }
         }
 
-        #[inline(always)]
+        #[inline]
         pub fn with<R>(&self, f: impl FnOnce(&T) -> R) -> R {
             match self.try_with(f) {
                 Ok(r) => r,
@@ -192,7 +192,7 @@ pub mod tls {
         /// The key, made once. Two threads racing both make one; the loser
         /// deletes its own and takes the winner's, so no key leaks and every
         /// thread agrees which one holds the value.
-        #[inline(always)]
+        #[inline]
         fn key(&self) -> Key {
             // Relaxed on the fast path: the only thing shared here is the
             // key's own value, and the `Slot` it names is reachable by one
@@ -231,7 +231,7 @@ pub mod tls {
         /// while the thread is ending. A caller that runs then -- returning a
         /// stack to a pool, say -- has to know the pool is gone rather than
         /// quietly building a new one that nothing will ever free.
-        #[inline(always)]
+        #[inline]
         pub fn try_with<R>(&self, f: impl FnOnce(&T) -> R) -> Result<R, Gone> {
             let k = self.key();
             let at = unsafe { pthread_getspecific(k) } as *mut Slot<T>;
@@ -2361,7 +2361,7 @@ pub mod sync {
         /// branch -- not a compare-exchange, which is what this was. On
         /// arm64 that compiles to `casalb`, a full barrier, and it was the
         /// single hottest instruction in `tree`: 279 samples of about 1,600.
-        #[inline(always)]
+        #[inline]
         fn raw(&self) -> *mut u8 {
             let at = self.raw.get() as *mut u8;
             if self.state.load(Ordering::Acquire) == READY {
@@ -2450,7 +2450,7 @@ pub mod sync {
         }
 
         /// A load first, as in `Mutex::raw` above and for the same reason.
-        #[inline(always)]
+        #[inline]
         fn raw(&self) -> *mut u8 {
             let at = self.raw.get() as *mut u8;
             if self.state.load(Ordering::Acquire) == READY {
@@ -2578,7 +2578,7 @@ pub mod sync {
             }
         }
 
-        #[inline(always)]
+        #[inline]
         pub fn get_or_init(&self, make: impl FnOnce() -> T) -> &T {
             // The same point as `Mutex::raw`: once written, every later call
             // only has to load.

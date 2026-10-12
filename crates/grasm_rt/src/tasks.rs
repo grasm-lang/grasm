@@ -16,7 +16,6 @@
 use alloc::format;
 use alloc::vec::Vec;
 
-use alloc::collections::BTreeSet;
 use alloc::collections::VecDeque;
 use crate::sync::Mutex;
 
@@ -64,11 +63,18 @@ struct Chans {
     /// each. A scheduler takes the entries that are its own and leaves the
     /// rest, so a wake crossing threads is delivered rather than dropped.
     ready: VecDeque<Waiter>,
-    /// Which waiters are really in a queue. A blocked operation retries in a
-    /// loop, so a task re-joins a queue every time it gives way and the
-    /// queues fill with entries for tasks since woken or finished; a wake
-    /// spent on one of those is a wake nobody gets.
-    waiting: BTreeSet<Waiter>,
+    /// Which waiters are really in a queue, as one flag per slot per block.
+    ///
+    /// A blocked operation retries in a loop, so a task re-joins a queue
+    /// every time it gives way and the queues fill with entries for tasks
+    /// since woken or finished; a wake spent on one of those is a wake
+    /// nobody gets.
+    ///
+    /// A `Vec` per block and not a `BTreeSet<(block, slot)>`: slots are dense
+    /// and blocks are few, so membership is an index rather than a tree walk,
+    /// and `alloc`'s BTree code -- 29 symbols, 16 KB in every compiled
+    /// program, measured -- stays out of the binary.
+    waiting: Vec<(u64, Vec<bool>)>,
     /// Ids handed to `concurrent` blocks, so two on different threads cannot
     /// collide.
     next_block: u64,
@@ -82,7 +88,7 @@ static CHANS: Mutex<Chans> = Mutex::new(Chans {
     chans: Vec::new(),
     progress: 0,
     ready: VecDeque::new(),
-    waiting: BTreeSet::new(),
+    waiting: Vec::new(),
     next_block: 0,
 });
 
@@ -103,6 +109,47 @@ enum Side {
 }
 
 impl Chans {
+    /// Makes room for a block's slots, so marking one is an index.
+    fn open_block(&mut self, block: u64, slots: usize) {
+        self.waiting.push((block, alloc::vec![false; slots]));
+    }
+
+    /// Forgets a block, which a `concurrent` block does when it returns.
+    fn close_block(&mut self, block: u64) {
+        self.waiting.retain(|(b, _)| *b != block);
+        self.ready.retain(|(b, _)| *b != block);
+    }
+
+    fn mark_waiting(&mut self, who: Waiter) {
+        if let Some((_, flags)) = self.waiting.iter_mut().find(|(b, _)| *b == who.0) {
+            if let Some(f) = flags.get_mut(who.1) {
+                *f = true;
+            }
+        }
+    }
+
+    /// True if that waiter was really waiting, and clears it. False for an
+    /// entry a retry left behind.
+    fn take_waiting(&mut self, who: Waiter) -> bool {
+        if let Some((_, flags)) = self.waiting.iter_mut().find(|(b, _)| *b == who.0) {
+            if let Some(f) = flags.get_mut(who.1) {
+                if *f {
+                    *f = false;
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn is_waiting(&self, who: Waiter) -> bool {
+        self.waiting
+            .iter()
+            .find(|(b, _)| *b == who.0)
+            .and_then(|(_, flags)| flags.get(who.1).copied())
+            .unwrap_or(false)
+    }
+
     /// Wakes the longest-waiting task on one side of `id`, skipping entries
     /// left behind by a retry. Exactly one: a value, or room for one, serves
     /// one task, and waking the rest only to have them wait again is the
@@ -115,11 +162,22 @@ impl Chans {
             Side::Room => &mut c.want_room,
             Side::Value => &mut c.want_value,
         };
+        let mut taken = None;
         while let Some(who) = queue.pop_front() {
-            if self.waiting.remove(&who) {
-                self.ready.push_back(who);
-                return;
+            if self
+                .waiting
+                .iter()
+                .find(|(b, _)| *b == who.0)
+                .and_then(|(_, f)| f.get(who.1).copied())
+                .unwrap_or(false)
+            {
+                taken = Some(who);
+                break;
             }
+        }
+        if let Some(who) = taken {
+            self.take_waiting(who);
+            self.ready.push_back(who);
         }
     }
 
@@ -131,7 +189,7 @@ impl Chans {
         let mut woken: VecDeque<Waiter> = core::mem::take(&mut c.want_room);
         woken.extend(core::mem::take(&mut c.want_value));
         for who in woken {
-            if self.waiting.remove(&who) {
+            if self.take_waiting(who) {
                 self.ready.push_back(who);
             }
         }
@@ -154,7 +212,7 @@ fn wait(on: &[usize], side: Side) {
         {
             let me = HERE.with(|h| h.get());
             let mut guard = chans();
-            guard.waiting.insert(me);
+            guard.mark_waiting(me);
             for &id in on {
                 if let Some(c) = guard.chans.get_mut(id) {
                     match side {
@@ -378,7 +436,9 @@ pub unsafe extern "C" fn grasm_conc_run(tasks: *mut RtVal) {
     let block = {
         let mut guard = chans();
         guard.next_block += 1;
-        guard.next_block
+        let block = guard.next_block;
+        guard.open_block(block, slots.len());
+        block
     };
     let outer_here = HERE.with(|h| h.get());
 
@@ -410,7 +470,7 @@ pub unsafe extern "C" fn grasm_conc_run(tasks: *mut RtVal) {
                 // It gave way. If it joined a channel's queue, that queue
                 // will wake it; if it gave way without blocking, it is still
                 // runnable.
-                if !chans().waiting.contains(&(block, i)) {
+                if !chans().is_waiting((block, i)) {
                     runnable.push_back(i);
                 }
                 slots[i] = Some((f, fiber));
@@ -441,4 +501,5 @@ pub unsafe extern "C" fn grasm_conc_run(tasks: *mut RtVal) {
         }
     }
     HERE.with(|h| h.set(outer_here));
+    chans().close_block(block);
 }
