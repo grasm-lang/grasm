@@ -135,3 +135,32 @@ So G6 is no longer blocked by the scheduler. Reaching 1M needs the per-task
 stack reservation cut by roughly 4x for the address space, and 1M x 15 KB is
 15 GB resident, which is a machine question rather than a code one. Both are
 separate from the quadratic, which is fixed.
+
+## The native runtime too (2026-10-12)
+
+The interpreter alone would have left the engines agreeing on output while
+disagreeing on scale, and diverging outright on any program with two waiters
+on one channel. So `grasm_rt` has the same two queues:
+
+| tasks | master, native | queue, native | |
+|---:|---:|---:|---|
+| 4,000 | 2.24 s | 0.61 s | 3.7x |
+| 10,000 | 12.90 s | 0.56 s | 23x |
+| 40,000 | 199.10 s | 1.80 s | **111x** |
+| 100,000 | — | 2.39 s | master did not finish 40,000 in 200 s |
+
+### One thing the interpreter did not have to solve
+
+`CHANS` is one table for the whole process, where the interpreter's channels
+belong to one interpreter. A `par_map` worker may run a `concurrent` block of
+its own, and a channel can reach both, so a wake may have to find a scheduler
+on **another thread**.
+
+A waiter is therefore `(block, slot)` rather than a slot, blocks take ids from
+a counter, and the ready list lives in `CHANS`: each scheduler takes the
+entries that are its own and **puts the rest back** rather than dropping them.
+No corpus program nests the two, so none of this is exercised today -- it is
+there because the runtime permits it and a dropped wake would be a hang.
+
+Which task is running is a thread-local, because a fiber never moves between
+threads.
