@@ -1557,21 +1557,26 @@ pub mod net {
             }
         }
 
+        /// Retries on `EINTR`, as every other call here does: a signal
+        /// arriving before the datagram left is not a failure to send it.
         pub fn send_to(&self, bytes: &[u8], to: &Addr) -> Result<usize> {
-            let n = unsafe {
-                sendto(
-                    self.fd,
-                    bytes.as_ptr(),
-                    bytes.len(),
-                    0,
-                    to.bytes.as_ptr(),
-                    to.bytes.len() as u32,
-                )
-            };
-            if n < 0 {
-                Err(Error::last_os_error())
-            } else {
-                Ok(n as usize)
+            loop {
+                let n = unsafe {
+                    sendto(
+                        self.fd,
+                        bytes.as_ptr(),
+                        bytes.len(),
+                        0,
+                        to.bytes.as_ptr(),
+                        to.bytes.len() as u32,
+                    )
+                };
+                if n >= 0 {
+                    return Ok(n as usize);
+                }
+                if errno() != EINTR {
+                    return Err(Error::last_os_error());
+                }
             }
         }
 
@@ -1877,8 +1882,20 @@ pub mod fs {
         }
 
         /// `sync_all`: the bytes are on the device, not merely accepted.
+        ///
+        /// Retries on `EINTR`. A signal arriving mid-sync is not a failed
+        /// sync, and reporting one would tell a caller its data is not on the
+        /// disk when it is about to be -- the opposite of what this call is
+        /// for.
         pub fn sync(&mut self) -> Result<()> {
-            check(unsafe { fsync(self.fd) })
+            loop {
+                if unsafe { fsync(self.fd) } == 0 {
+                    return Ok(());
+                }
+                if errno() != EINTR {
+                    return Err(Error::last_os_error());
+                }
+            }
         }
 
         pub fn seek(&mut self, whence: i32, at: i64) -> Result<u64> {

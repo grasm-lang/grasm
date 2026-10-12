@@ -442,3 +442,30 @@ be taken again on a quiet machine before anyone calls it green.
 Still unrun: `replaytest`, the fuzzers, and anything on Linux -- no Linux
 target is installed here, so roughly 2,100 lines of `cfg(not(macos))` have
 never been compiled, let alone run.
+
+## An audit of the syscall code, since the machine was too busy to measure on
+
+Three defect classes, each checked against every call rather than spot-read.
+
+**Variadic declarations.** Of the 40-odd libc functions `grasm_sys` declares,
+exactly two are variadic in C -- `open` and `fcntl` -- and both now carry
+`...`. Nothing else in the list (`ioctl`, `openat`, the `printf` family) is
+declared at all, so the class that cost a morning is closed rather than
+patched.
+
+**`EINTR`.** Nine wrappers retry. Two did not and should have:
+
+- `File::sync` is `fsync`, which a signal can interrupt. Reporting a failure
+  there tells a caller its data is not on the disk when it is about to be,
+  which is the opposite of what the call is for.
+- `Socket::send_to` is a single `sendto`. A signal arriving before the
+  datagram left is not a failure to send it.
+
+Both now loop, like every other call here. `close` is deliberately *not*
+retried: POSIX leaves the descriptor's state unspecified after an interrupted
+`close`, so retrying may close something else.
+
+**Descriptor leaks on error paths.** None. `File` and `Socket` are RAII types
+whose `Drop` closes, so `listen_on`'s `?` on `set_opt`, `bind` or `listen`
+closes the socket on the way out; `process::run` shuts both pipe ends on every
+error path; `read_dir` closes the directory on all of them.
