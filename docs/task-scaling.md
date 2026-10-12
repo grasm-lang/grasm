@@ -164,3 +164,44 @@ there because the runtime permits it and a dropped wake would be a hang.
 
 Which task is running is a thread-local, because a fiber never moves between
 threads.
+
+## G6, met: 1,000,000 tasks in 22 seconds (2026-10-12)
+
+`grasm build --native`, the same program as every row above:
+
+| tasks | wall | user | sys | peak RSS | answer |
+|---:|---:|---:|---:|---:|---|
+| 400,000 | 9.1 s | 1.1 s | 4.7 s | 1.30 GB | got 400000 |
+| 1,000,000 | 18.5 s | 2.9 s | 11.7 s | 1.37 GB | got 1000000 |
+| 1,000,000 again | 22.1 s | 2.9 s | 12.2 s | 2.41 GB | got 1000000 |
+| 2,000,000 | 97.0 s | 6.4 s | 31.1 s | 2.27 GB | got 2000000 |
+
+**G6 asks for 1M+ tasks per node, and that is met** -- with the answer
+checked, not just the clock, and 1M run twice.
+
+System time dominates, which says the remaining cost is the kernel mapping
+and unmapping a stack per task rather than anything the scheduler does. 2M
+takes 4.4x of 1M's time for 2x the tasks, so something is superlinear again
+up there; it is not the round, which is why 1M is comfortable.
+
+### Why the number differs between engines, and that it is allowed to
+
+The interpreter stops around 285,000. The two engines reserve very different
+per-task stacks:
+
+| | `STACK_BUDGET` | per-task reservation | tasks before the address space runs out |
+|---|---:|---:|---:|
+| interpreter | 448 MB | 449 MB | ~285,000 |
+| native runtime | 6 MB | 7 MB | far past 1M |
+
+That is not an oversight in either. An interpreter frame measured here costs
+about **10 KB** -- a task handles 40,000 nested calls in 449 MB and not 50,000
+-- where a compiled frame costs about **30 bytes**, 200,000 calls in 6 MB.
+[E-RECURSION-DEPTH] guarantees 10,000 nested calls, so the interpreter cannot
+go below roughly 100 MB a task without breaking that, and 1M of those is
+100 TB against the 128 TB a process gets.
+
+So 1M tasks is a property of the compiled build, which is what a node runs,
+and the spec already says the two engines stop at different depths. Both
+honour the 10,000 the spec guarantees -- checked, in a task and on the main
+stack, in both engines.
