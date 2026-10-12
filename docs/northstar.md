@@ -112,6 +112,40 @@ wrong way and was reverted: replacing `sort`'s push loop with a
 map-then-overwrite made it eleven tokens longer, and Python writes that one as a
 push loop too.
 
+### Two candidates for the last 4%, priced before building (2026-10-12)
+
+`sieve` is one of the worst rows at 1.13x, and reading it against
+`benchmarks/python/sieve.py` shows two things Python has and Grasm does not:
+list repetition (`[True] * (limit + 1)`) and a stepped range
+(`range(i * i, limit + 1, i)`, against a `while` loop with a manual `j += i`).
+
+Both look like real gaps. `grasm tokens` only lexes, so both were priced
+without implementing either -- the hypothetical syntax lexes fine even though
+it would not typecheck:
+
+| sieve | tokens | vs Python's 80 |
+|---|---:|---|
+| as written | 90 | 1.125x |
+| with `[true].repeat(limit + 1)` | 87 | 1.088x |
+| with that **and** `(i * i..=limit).step(i)` | 87 | 1.088x |
+
+**The stepped range is worth nothing.** `for j in (i * i..=limit).step(i) {`
+costs exactly what `var j = i * i` plus `while j <= limit {` plus `j += i`
+costs; the parenthesised range and the method call spend what the loop header
+and the increment spent. It was the more attractive of the two ideas and it
+does not move the metric at all.
+
+List repetition is worth **3 tokens on one program**, which takes `sieve`
+from 1.13x to 1.09x. Across six programs that is perhaps a point of the
+geomean, against the four needed.
+
+So the remaining 4% is not closable by stdlib additions of this shape, and
+this is recorded so the next reader does not build `step` for this reason.
+A list `repeat` is still defensible on its own merits -- Python, Go and Rust
+all have it, and `str.repeat(n)` already exists, so the asymmetry is odd --
+but it is a language change across four engines for about a point, and it
+should be wanted for itself rather than for the number.
+
 Per program, by each language's own lexer:
 
 | | fib | sieve | matmul | wordfreq | sort | parmap |
