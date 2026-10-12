@@ -64,7 +64,25 @@ prog() {
   esac
 }
 
-NAMES=$(sed -n 's/.*Builtin { name: "\([a-z_0-9]*\)".*Journal::Recorded.*/\1/p' crates/grasm_sema/src/builtins.rs)
+# Every `Builtin` whose `journal:` is `Journal::Recorded`, by name.
+#
+# This was one `sed` expecting `Builtin { name: "x" ... Journal::Recorded` on a
+# single line. `builtins.rs` writes the struct across four lines, so the
+# expression matched **nothing**: the loop below ran zero times and this gate
+# reported "journaled: 0 unhooked: 0" and exited 0 — passing while checking
+# none of the 39. A gate that tests nothing and says so quietly is worse than
+# no gate, so the count is asserted against the file further down.
+NAMES=$(awk '/name: "/ { n = $0; sub(/.*name: "/, "", n); sub(/".*/, "", n) }
+             /journal: Journal::Recorded/ { if (n != "") { print n; n = "" } }' \
+        crates/grasm_sema/src/builtins.rs)
+WANT=$(grep -c 'journal: Journal::Recorded' crates/grasm_sema/src/builtins.rs)
+GOT=$(printf '%s\n' "$NAMES" | grep -c .)
+if [ "$GOT" -ne "$WANT" ]; then
+    echo "error: found $GOT recorded builtins but the table declares $WANT."
+    echo "       the extractor above and crates/grasm_sema/src/builtins.rs have"
+    echo "       drifted apart; fix the extractor rather than this message."
+    exit 1
+fi
 hooked=0; unhooked=0; unwritten=0
 
 for n in $NAMES; do
