@@ -479,3 +479,40 @@ perfectly ordinary call.
 whose `Drop` closes, so `listen_on`'s `?` on `set_opt`, `bind` or `listen`
 closes the socket on the way out; `process::run` shuts both pipe ends on every
 error path; `read_dir` closes the directory on all of them.
+
+### A soundness hole in `thread::scope`, closed (2026-10-12)
+
+The signature was:
+
+    pub fn scope<'env, R>(body: impl FnOnce(&'env Scope<'env>) -> R) -> R
+
+`'env` is a free parameter, so **the caller chooses it**, and `'static` is a
+legal choice:
+
+    let leaked: &'static Scope<'static> = scope(|s| s);
+
+That compiled, and handed back a reference to a local `scope` was about to
+drop. The `transmute` inside was doing exactly what the caller asked for.
+
+`std::thread::scope` takes `F: for<'scope> FnOnce(&'scope Scope<'scope, 'env>)`,
+and both halves of that matter:
+
+- **`for<'scope>`** makes the closure work for *every* lifetime, so it cannot
+  name one to return. Adding it alone broke `par_map`: with a single
+  universally-quantified lifetime, a task can borrow nothing.
+- **two lifetimes.** `'scope` is the scope's own region, quantified; `'env` is
+  the environment tasks borrow from, and stays the caller's to choose. That is
+  what lets `par_map` give each task a `&mut` into a `Vec` on its own frame.
+
+Collapsing them into one compiles either way and is wrong either way: the
+reference escapes, or nothing can be borrowed. `Scope` now has both, the
+`transmute` is gone -- with the bound, borrowing the local is enough -- and
+the escape is rejected:
+
+    error: lifetime may not live long enough
+      |         grasm_sys::thread::scope(|s| s);
+      |                                   -- ^ returning this value requires
+      |                                        that `'1` must outlive `'2`
+
+Checked after: `par_map` answers `[1, 4, 9]`, 100,000 tasks still run, clippy
+and wasm32 clean, 25 tests pass.

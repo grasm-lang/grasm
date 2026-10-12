@@ -1122,12 +1122,24 @@ pub mod thread {
     /// is what stops a borrow taken inside the closure from being passed out
     /// of it. A covariant marker would let the lifetime shrink and the
     /// guarantee with it.
-    pub struct Scope<'scope> {
+    /// Two lifetimes, as `std::thread::Scope` has, and both are needed.
+    ///
+    /// `'scope` is the scope's own region: a spawned closure must live at
+    /// least that long, and `scope` quantifies over it so the `&Scope` cannot
+    /// be returned. `'env` is the environment those closures borrow from, and
+    /// it stays a free parameter chosen by the caller -- which is what lets
+    /// `par_map` hand each task a `&mut` into a `Vec` on its own frame.
+    ///
+    /// Collapsing the two into one lifetime compiles, and then either the
+    /// reference escapes (if the caller picks it) or nothing can be borrowed
+    /// (if it is higher-ranked). The first version here had the former.
+    pub struct Scope<'scope, 'env: 'scope> {
         running: UnsafeCell<Vec<Handle>>,
         _scope: PhantomData<&'scope mut &'scope ()>,
+        _env: PhantomData<&'env mut &'env ()>,
     }
 
-    impl<'scope> Scope<'scope> {
+    impl<'scope, 'env> Scope<'scope, 'env> {
         pub fn spawn<F: FnOnce() + Send + 'scope>(&'scope self, body: F) {
             self.spawn_named(body, None, None);
         }
@@ -1158,9 +1170,9 @@ pub mod thread {
 
     /// Joins in `Drop` so it happens on every path out of `scope`, not only
     /// the one that reaches the end of the body.
-    struct JoinAtEnd<'a, 'scope>(&'a Scope<'scope>);
+    struct JoinAtEnd<'a, 'scope, 'env: 'scope>(&'a Scope<'scope, 'env>);
 
-    impl Drop for JoinAtEnd<'_, '_> {
+    impl Drop for JoinAtEnd<'_, '_, '_> {
         fn drop(&mut self) {
             let running = unsafe { &mut *self.0.running.get() };
             for handle in running.drain(..) {
@@ -1170,18 +1182,30 @@ pub mod thread {
         }
     }
 
-    pub fn scope<'env, R>(body: impl FnOnce(&'env Scope<'env>) -> R) -> R {
-        let held = Scope {
+    /// Runs `body` with a scope its tasks may borrow for.
+    ///
+    /// The bound is **higher-ranked** on purpose. Written as
+    /// `scope<'env, R>(body: impl FnOnce(&'env Scope<'env>) -> R)` the caller
+    /// chooses `'env`, `'static` is a legal choice, and
+    /// `let leaked: &'static Scope<'static> = scope(|s| s)` compiles -- a
+    /// reference to a local this function is about to drop. `for<'scope>`
+    /// makes the closure work for *every* lifetime, so it cannot name one to
+    /// return. `std::thread::scope` is bounded the same way for the same
+    /// reason.
+    ///
+    /// It also removes the `transmute` the first version needed: with the
+    /// bound, borrowing the local is enough.
+    pub fn scope<'env, R>(
+        body: impl for<'scope> FnOnce(&'scope Scope<'scope, 'env>) -> R,
+    ) -> R {
+        let held: Scope<'_, 'env> = Scope {
             running: UnsafeCell::new(Vec::new()),
             _scope: PhantomData,
+            _env: PhantomData,
         };
-        // Safety: `held` outlives `join`, which outlives the call below, so
-        // the reference handed to the body is valid for as long as the body
-        // can use it -- and every thread it spawned is joined when `join` is
-        // dropped, before this function returns.
-        let borrowed: &'env Scope<'env> = unsafe { core::mem::transmute(&held) };
+        // Joined when this is dropped, before the borrow ends.
         let _join = JoinAtEnd(&held);
-        body(borrowed)
+        body(&held)
     }
 
     pub struct Builder {
@@ -1204,9 +1228,9 @@ pub mod thread {
             self
         }
 
-        pub fn spawn_scoped<'scope, F: FnOnce() + Send + 'scope>(
+        pub fn spawn_scoped<'scope, 'env, F: FnOnce() + Send + 'scope>(
             self,
-            scope: &'scope Scope<'scope>,
+            scope: &'scope Scope<'scope, 'env>,
             body: F,
         ) -> Result<(), ThreadError> {
             if scope.spawn_named(body, self.name, self.stack) {
@@ -3135,6 +3159,30 @@ mod tests {
             assert!(empty.get().is_none());
         }
         assert_eq!(DROPPED.load(Ordering::SeqCst), 1);
+    }
+
+    /// `scope` must not let its `&Scope` escape. With `scope<'env, R>(body:
+    /// impl FnOnce(&'env Scope<'env>) -> R)` the caller chooses `'env`, so
+    /// `'static` is a legal choice and this compiles -- handing back a
+    /// reference to a local that has been dropped.
+    ///
+    /// It does not compile with the higher-ranked bound, which is why the
+    /// bound is there. Left as a comment rather than a `compile_fail` doctest
+    /// because this crate has no doctests.
+    ///
+    /// ```ignore
+    /// let leaked: &'static Scope<'static> = crate::thread::scope(|s| s);
+    /// ```
+    #[test]
+    fn scope_does_not_let_its_reference_escape() {
+        // What the bound permits: using the scope, returning data.
+        let n = crate::thread::scope(|scope| {
+            let mut seen = 0i64;
+            scope.spawn(|| {});
+            seen += 1;
+            seen
+        });
+        assert_eq!(n, 1);
     }
 
     #[test]
