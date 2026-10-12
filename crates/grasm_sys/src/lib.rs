@@ -1322,7 +1322,15 @@ pub mod net {
     pub const AF_INET6: i32 = 10;
 
     impl Addr {
-        /// The port, and the address as text.
+        /// A sender's address, clamped to the buffer it was read into.
+    ///
+    /// `recvfrom`, `getsockname` and `getpeername` all report the address's
+    /// *actual* size rather than how much they stored, and POSIX allows that
+    /// to exceed the buffer. Slicing to the reported length panics on any
+    /// address family wider than the 128 bytes here, so both call sites take
+    /// the smaller of the two.
+    ///
+    /// The port, and the address as text.
         ///
         /// `sin_port` sits at offset 2 in network byte order for IPv4 and
         /// IPv6 alike, and on both platforms -- macOS splits the family field
@@ -1394,8 +1402,14 @@ pub mod net {
         if r < 0 {
             return Err(Error::last_os_error());
         }
+        // Clamped, not trusted. `getsockname` and `getpeername` write back
+        // the address's **actual** size, and POSIX says that may exceed the
+        // buffer given -- the address is then truncated and the length still
+        // reports what it would have needed. Slicing to the reported length
+        // would panic on any address family larger than 128 bytes.
+        let got = (len as usize).min(bytes.len());
         Ok(Addr {
-            bytes: bytes[..len as usize].to_vec(),
+            bytes: bytes[..got].to_vec(),
             family: 0,
         })
     }
@@ -1598,10 +1612,14 @@ pub mod net {
                     )
                 };
                 if n >= 0 {
+                    // Clamped for the same reason as `name_of`: `recvfrom`
+                    // reports the sender address's actual size, which POSIX
+                    // allows to exceed the buffer it was given.
+                    let got = (flen as usize).min(from.len());
                     return Ok((
                         n as usize,
                         Addr {
-                            bytes: from[..flen as usize].to_vec(),
+                            bytes: from[..got].to_vec(),
                             family: 0,
                         },
                     ));

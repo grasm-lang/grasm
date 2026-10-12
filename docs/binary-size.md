@@ -465,6 +465,16 @@ Both now loop, like every other call here. `close` is deliberately *not*
 retried: POSIX leaves the descriptor's state unspecified after an interrupted
 `close`, so retrying may close something else.
 
+**A reported length that may exceed its buffer.** `recvfrom`,
+`getsockname` and `getpeername` write back the address's *actual* size, not
+how much they stored, and POSIX allows that to be larger than the buffer
+given -- the address is truncated and the length still says what it would
+have needed. Both call sites sliced to the reported length, which **panics**
+on any address family wider than the 128 bytes reserved. Both now take the
+smaller of the two. Nothing in the corpus reaches it, because nothing uses an
+address family that large; a program that did would have aborted on a
+perfectly ordinary call.
+
 **Descriptor leaks on error paths.** None. `File` and `Socket` are RAII types
 whose `Drop` closes, so `listen_on`'s `?` on `set_opt`, `bind` or `listen`
 closes the socket on the way out; `process::run` shuts both pipe ends on every
