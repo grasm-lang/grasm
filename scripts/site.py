@@ -594,6 +594,21 @@ def main():
         print("run scripts/allgates.sh, which writes site/facts.json when green")
         sys.exit(1)
 
+    # A figure with no date is how a September number sat on an October page.
+    # Both writers record one now, so one arriving without a date means a
+    # writer regressed rather than that the date is unknowable.
+    record = os.path.join(OUT, "facts.json")
+    if args.check and os.path.exists(record):
+        taken = json.load(open(record)).get("taken", {})
+        undated = [k for k in MEASURED if k not in taken]
+        if undated:
+            print("site/facts.json states a figure with no date:")
+            print("  " + " ".join(undated))
+            print("the pages say which run wrote each figure, so a figure")
+            print("without one cannot be stated honestly. site_facts() in")
+            print("scripts/allgates.sh records the date; it has stopped.")
+            sys.exit(1)
+
     # The animations are generated too, for the same reason the counts are:
     # a hand-edited JSON blob nobody can read is a thing that rots.
     if not args.check:
