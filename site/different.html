@@ -114,11 +114,13 @@ output change". Grasm has four engines — interpreter, bundle, ahead-of-time
 native, and wasm — and the interpreter is <em>normative</em>: the specification
 is written against it and the other three have to match it byte for byte on
 stdout, exit code and diagnostics.</p>
-<p>That turns a test suite into an oracle. 511 corpus programs run
-through the interpreter, the bundle and the native build and are compared on
-every build. 394 of them also run in the browser engine
+<p>That turns a test suite into an oracle. All 511 standalone
+programs in the corpus run through the interpreter, the bundle and the native
+build and are compared on every build; the last recorded run of that gate
+covered 511 of them. 394 also run in the browser engine
 — 84 are skipped, because they want a filesystem, a socket, a
-process or threads — and 224 are compiled for x86_64, linked
+process or threads, and both figures are from a run on 13 September 2026 — and
+224 are compiled for x86_64, linked
 with <code>cc -arch x86_64</code> and <strong>run under Rosetta</strong>, which
 reaches code the arm64 build never does: <code>readdir$INODE64</code> exists
 only there, and x86_64 passes variadic arguments in registers where arm64 puts

@@ -74,11 +74,20 @@ one stands.</p>
   <div class="fig"><b>15</b><span>fuzz generators</span></div>
 </div>
 <p>Interpreter, bundle and native builds agree byte for byte on stdout, exit
-code and diagnostics. A wasm build agrees on the 394 programs that do not
-need a filesystem, a socket, a process or threads; 84 are skipped
-because they do. 224 are also compiled for x86_64 and run under
+code and diagnostics. 224 are also compiled for x86_64 and run under
 Rosetta, 195 of them agreeing and the rest declined. Every generated
 program is checked for what it keeps as well as for what it prints.</p>
+<p class="note"><b>Which run each of these came from, because they are not all
+from one.</b> The corpus is <b>511</b> standalone programs, counted as
+this page was written and by difftest's own filter — so a program added today
+is in that number today. The last recorded difftest run covered
+<b>511</b> of them. The wasm, cross-compile, law and whole-program
+figures are written into <code>site/facts.json</code> by
+<code>scripts/allgates.sh</code>, and these are from <b>a run on 13 September 2026</b>, when
+the corpus held <b>478</b>. That file used to carry no date at all,
+which is how a September figure sat on this page under a sentence claiming
+every number came from the run that proved it. It carries one per figure
+now.</p>
 
 <h2>What does not work</h2>
 <div class="scroll"><table>

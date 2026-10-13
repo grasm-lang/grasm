@@ -3,6 +3,14 @@
   "corpus": 478,
   "cross": 478,
   "laws": 197,
+  "taken": {
+    "agreeing": "2026-09-13",
+    "corpus": "2026-09-13",
+    "cross": "2026-09-13",
+    "laws": "2026-09-13",
+    "wasm_ok": "2026-09-13",
+    "wasm_skip": "2026-09-13"
+  },
   "wasm_ok": 394,
   "wasm_skip": 84
 }

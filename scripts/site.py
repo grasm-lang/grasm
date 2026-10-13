@@ -16,6 +16,7 @@ and renders under a strict content policy.
 
 import argparse
 import glob
+import datetime
 import json
 import os
 import re
@@ -118,6 +119,7 @@ def facts():
         r'^version = "([^"]+)"', open(os.path.join(ROOT, "Cargo.toml")).read(), re.M).group(1)
 
     f["conformance"] = len(glob.glob(os.path.join(ROOT, "spec", "conformance", "*.gr")))
+    f["programs"] = corpus_programs()
     # The examples page names three programs by their size, and one of them had
     # grown thirty lines since somebody typed it.
     for key, where in (("lines_http", "21-http-server"),
@@ -138,12 +140,18 @@ def facts():
 
     measured = os.path.join(OUT, "facts.json")
     if os.path.exists(measured):
-        f.update(json.load(open(measured)))
+        record = json.load(open(measured))
+        # `taken` is a date per figure, not a figure. A gate is recorded the
+        # moment it passes, so two figures in one file can be months apart.
+        taken = record.pop("taken", {})
+        f.update(record)
     else:
         # No green run recorded. Rather than print a number nobody measured,
         # the page says so, and `--check` fails until a run supplies it.
+        taken = {}
         for k in MEASURED:
-            f.setdefault(k, "—")
+            f.setdefault(k, "\u2014")
+    f.update(vintage(f, taken))
     return f
 
 
@@ -251,6 +259,84 @@ def scorecard():
             blocked += 1
     return {"goals_total": len(rows), "goals_met": met,
             "goals_over": over, "goals_blocked": blocked}
+
+
+def corpus_programs():
+    """How many standalone programs the corpus holds, counted now.
+
+    This was read out of `docs/binary-size.md`, which is where difftest's last
+    run recorded it, and that made the size of the corpus a measurement -- so
+    a program added today did not appear in the denominator until somebody ran
+    a two-hour gate suite. It is a count: the filter below is difftest's own,
+    and the directory list is read from the file difftest sources rather than
+    repeated here, because a copied corpus definition is the exact mistake
+    `scripts/lib/corpus.sh` exists to prevent.
+
+    What still needs a run is the *agreement*, and that is `corpus` below.
+    """
+    lib = open(os.path.join(ROOT, "scripts", "lib", "corpus.sh")).read()
+    dirs = re.search(r'CORPUS_DIRS=\$\{CORPUS_DIRS:-"([^"]+)"\}', lib)
+    if not dirs:
+        raise SystemExit(
+            "scripts/lib/corpus.sh no longer sets CORPUS_DIRS the way the site "
+            "reads it. The corpus size on every page comes from that list; "
+            "fix the pattern in scripts/site.py rather than guessing the list."
+        )
+    n = 0
+    for d in dirs.group(1).split():
+        for root, _, names in os.walk(os.path.join(ROOT, d)):
+            for name in names:
+                if not name.endswith(".gr"):
+                    continue
+                text = open(os.path.join(root, name)).read()
+                # difftest skips library modules and the conformance programs
+                # that are meant not to compile.
+                if not re.search(r"^\s*(pub )?fn main\(", text, re.M):
+                    continue
+                if re.search(r"^//! expect: error$", text, re.M):
+                    continue
+                n += 1
+    return n
+
+
+def vintage(f, taken):
+    """When the gate-written figures were written, and what they describe.
+
+    A figure in `site/facts.json` is as current as the run that wrote it and
+    no more, and the file carried no date -- so the one written in September
+    was still being read in October, under a heading that said every number
+    came from the run that proved it. The page now states the date and the
+    corpus that run saw, which is the smallest thing that makes the gap
+    between `corpus` and `programs` visible instead of invisible.
+    """
+    out = {}
+    try:
+        out["facts_corpus"] = "{:,}".format(int(f["wasm_ok"]) + int(f["wasm_skip"]))
+    except (KeyError, TypeError, ValueError):
+        out["facts_corpus"] = "\u2014"
+    have = [k for k in MEASURED if f.get(k) != "\u2014"]
+    dates = sorted({taken[k] for k in have if k in taken})
+    if not dates:
+        out["facts_when"] = "a run that did not record its date"
+    elif len(dates) == 1 and len(have) == len([k for k in have if k in taken]):
+        out["facts_when"] = "a run on " + pretty(dates[0])
+    else:
+        # Mixed, and the mixture is the point: the gates are recorded one at a
+        # time as each passes, so a run that is killed halfway leaves figures
+        # from two months in one file. A single date over that set would be
+        # the same lie the file told by carrying no date at all.
+        span = "runs between %s and %s" % (pretty(dates[0]), pretty(dates[-1]))
+        if len(dates) == 1:
+            span = "a run on " + pretty(dates[0])
+        if any(k not in taken for k in have):
+            span += ", and at least one from a run that recorded no date"
+        out["facts_when"] = span
+    return out
+
+
+def pretty(iso):
+    """2026-09-13 -> 13 September 2026."""
+    return datetime.date.fromisoformat(iso).strftime("%-d %B %Y")
 
 
 # What only a run can know. `scripts/allgates.sh` writes these.

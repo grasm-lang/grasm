@@ -422,9 +422,11 @@ this way — a SPA router, a markdown editor, a collaborative todo list, a
 realtime analytics dashboard.</p>
 
 <h2>What the browser build can and cannot do</h2>
-<p>«wasm_ok» of the «corpus» corpus programs produce identical output in wasm. The other «wasm_skip»
-are skipped for a reason the host cannot supply, and each names it: a
-filesystem, a socket, a process, threads, or a stack deep enough for the
+<p>«wasm_ok» programs produce identical output in wasm, out of the
+«facts_corpus» the corpus held when this gate last ran — it holds
+«programs» today, and both figures below come from «facts_when». The other
+«wasm_skip» are skipped for a reason the host cannot supply, and each names
+it: a filesystem, a socket, a process, threads, or a stack deep enough for the
 recursion limit the specification promises.</p>
 
 <p>In this page the missing facilities refuse the same way: a program that
@@ -1210,11 +1212,20 @@ one stands.</p>
   <div class="fig"><b>«generators»</b><span>fuzz generators</span></div>
 </div>
 <p>Interpreter, bundle and native builds agree byte for byte on stdout, exit
-code and diagnostics. A wasm build agrees on the «wasm_ok» programs that do not
-need a filesystem, a socket, a process or threads; «wasm_skip» are skipped
-because they do. «cross_total» are also compiled for x86_64 and run under
+code and diagnostics. «cross_total» are also compiled for x86_64 and run under
 Rosetta, «cross_pass» of them agreeing and the rest declined. Every generated
 program is checked for what it keeps as well as for what it prints.</p>
+<p class="note"><b>Which run each of these came from, because they are not all
+from one.</b> The corpus is <b>«programs»</b> standalone programs, counted as
+this page was written and by difftest's own filter — so a program added today
+is in that number today. The last recorded difftest run covered
+<b>«difftest»</b> of them. The wasm, cross-compile, law and whole-program
+figures are written into <code>site/facts.json</code> by
+<code>scripts/allgates.sh</code>, and these are from <b>«facts_when»</b>, when
+the corpus held <b>«facts_corpus»</b>. That file used to carry no date at all,
+which is how a September figure sat on this page under a sentence claiming
+every number came from the run that proved it. It carries one per figure
+now.</p>
 
 <h2>What does not work</h2>
 <div class="scroll"><table>
@@ -1945,11 +1956,13 @@ output change". Grasm has four engines — interpreter, bundle, ahead-of-time
 native, and wasm — and the interpreter is <em>normative</em>: the specification
 is written against it and the other three have to match it byte for byte on
 stdout, exit code and diagnostics.</p>
-<p>That turns a test suite into an oracle. «difftest» corpus programs run
-through the interpreter, the bundle and the native build and are compared on
-every build. «wasm_ok» of them also run in the browser engine
+<p>That turns a test suite into an oracle. All «programs» standalone
+programs in the corpus run through the interpreter, the bundle and the native
+build and are compared on every build; the last recorded run of that gate
+covered «difftest» of them. «wasm_ok» also run in the browser engine
 — «wasm_skip» are skipped, because they want a filesystem, a socket, a
-process or threads — and «cross_total» are compiled for x86_64, linked
+process or threads, and both figures are from «facts_when» — and
+«cross_total» are compiled for x86_64, linked
 with <code>cc -arch x86_64</code> and <strong>run under Rosetta</strong>, which
 reaches code the arm64 build never does: <code>readdir$INODE64</code> exists
 only there, and x86_64 passes variadic arguments in registers where arm64 puts
