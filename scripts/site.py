@@ -15,6 +15,7 @@ and renders under a strict content policy.
 """
 
 import argparse
+import ast
 import glob
 import datetime
 import json
@@ -120,6 +121,7 @@ def facts():
 
     f["conformance"] = len(glob.glob(os.path.join(ROOT, "spec", "conformance", "*.gr")))
     f["programs"] = corpus_programs()
+    f["law_defs"] = law_count()
     # The examples page names three programs by their size, and one of them had
     # grown thirty lines since somebody typed it.
     for key, where in (("lines_http", "21-http-server"),
@@ -297,6 +299,34 @@ def corpus_programs():
                     continue
                 n += 1
     return n
+
+
+def law_count():
+    """How many laws `scripts/fuzz_laws.py` defines, counted here.
+
+    This had the same shape of mistake as the corpus size: the site read the
+    figure out of the gate's log, so the page said 197 while the file defined
+    205 -- eight laws added since the last recorded run, none of them on the
+    page that exists to say how many there are. A green run of that gate
+    checks every law it defines (`sys.exit(1 if broken or rejected else 0)`),
+    so the count is the definition and only the *holding* needs a run.
+
+    Parsed rather than imported, because a site generator should not execute
+    a fuzzer to count a dict.
+    """
+    path = os.path.join(ROOT, "scripts", "fuzz_laws.py")
+    tree = ast.parse(open(path).read())
+    for node in tree.body:
+        if (isinstance(node, ast.Assign)
+                and any(getattr(t, "id", None) == "LAWS" for t in node.targets)
+                and isinstance(node.value, ast.Dict)):
+            return len(node.value.keys)
+    raise SystemExit(
+        "scripts/fuzz_laws.py no longer assigns a literal LAWS dict at the "
+        "top level, so the site cannot count the laws it states. Fix the "
+        "reader in scripts/site.py rather than retyping the number: a typed "
+        "one was eight short for a month."
+    )
 
 
 def vintage(f, taken):

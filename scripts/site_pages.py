@@ -1101,7 +1101,7 @@ change.</p>
 <div class="figures">
   <div class="fig"><b>«clauses»</b><span>clauses</span></div>
   <div class="fig"><b>70</b><span>pages, the cap</span></div>
-  <div class="fig"><b>«laws»</b><span>laws checked against arithmetic</span></div>
+  <div class="fig"><b>«law_defs»</b><span>laws checked against arithmetic</span></div>
 </div>
 
 <h2>How a clause works</h2>
@@ -1124,11 +1124,13 @@ under a stability heading that disagrees with its own level.</p>
 clause and the implementation were written together — which, for a young
 language, is most of them — both can be wrong together, and the program agrees
 with them.</p>
-<p>So the behavioural clauses in scope also have a <em>law</em>: one of «laws» relations checked against
+<p>So the behavioural clauses in scope also have a <em>law</em>: one of
+«law_defs» relations checked against
 arithmetic, not against a recorded string. <code>rev</code> puts the last
 element first. <code>a / b * b + a % b == a</code>. A released slot is dead
 through every reference to it. A clause in scope with no law fails the gate by
 name.</p>
+<p class="note">How many laws there are is a count, taken from <code>scripts/fuzz_laws.py</code> as this page is written. Whether they <em>hold</em> needs a run, and the last recorded one checked <b>«laws»</b> of them with none broken, in «facts_when» — a green run of that gate checks every law it defines, so the gap between the two figures is laws added since. The page used to show only the run's figure, which is how it said 197 while the file defined 205.</p>
 
 <h2>The page budget</h2>
 <p>The specification is capped at seventy pages and the test suite enforces it.
@@ -1510,7 +1512,7 @@ which was true, while failing three lines further down.</p>
   WebAssembly, clang\u2019s assembler.</p></div>
   <div class="card"><h3>Generated</h3><p>«generators» generators build programs
   nobody wrote, then require every engine to agree on them too.</p></div>
-  <div class="card"><h3>Laws</h3><p>«laws» properties that must hold. A law a
+  <div class="card"><h3>Laws</h3><p>«law_defs» properties that must hold. A law a
   degenerate implementation satisfies is not a law, and each one here is chosen
   so that it is not.</p></div>
 </div>
