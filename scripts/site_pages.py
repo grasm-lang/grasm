@@ -1583,10 +1583,14 @@ incompatibly before 2.0; «provisional» are <code>provisional</code> and
 clause moves when it passes the five-part test, one at a time, on its own
 evidence.</p>
 
-<p class="note">Every number on this site is computed from the repository when
-the site is written, or read from the last green gate run. None of them is a
-figure somebody remembered. If a gate has not run, the page says so rather than
-printing a number nobody measured.</p>
+<p class="note">A count on this site — clauses, libraries, programs,
+gates — is computed from the repository as the page is written. A
+<em>measurement</em> is read out of the document that recorded it, so the page
+and the record cannot disagree and a record that changes shape fails the build
+rather than leaving a stale number here. If a gate has not run, the page says
+so rather than printing a figure nobody took. That is not a claim that nothing
+here is typed: a target, and a number quoted from a story about how something
+was found, are both typed, and both say where they came from.</p>
 """
 )
 

@@ -320,10 +320,11 @@ PAGE = """<!doctype html>
   <a class="brand" href="index.html">{markicon}<span>grasm</span></a>
   <span class="ver">v{version}</span>
   <nav>
+    <a href="different.html">Why</a>
     <a href="start.html">Docs</a>
     <a href="syntax.html">Syntax</a>
     <a href="security.html">Security</a>
-    <a href="packages.html">Packages</a>
+    <a href="achieved.html">Scorecard</a>
     <a href="status.html">Status</a>
   </nav>
 </header>
@@ -334,8 +335,11 @@ PAGE = """<!doctype html>
 <main>
 {body}
 <footer>
-Grasm — four engines, one answer. Every figure on this site is computed,
-not typed.
+Grasm — four engines, one answer. Counts here are computed from the
+repository as the page is written; measurements are read from the document
+that recorded them.
+<a href="achieved.html">Scorecard</a> ·
+<a href="performance.html">Performance</a> ·
 <a href="status.html">Status</a> ·
 <a href="spec.html">Specification</a> ·
 <a href="roadmap.html">Roadmap</a>
