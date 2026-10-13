@@ -139,7 +139,7 @@ done
 # gates above have finished.
 site_facts() {
     python3 - "$LOGS" <<'FACTS'
-import json, os, re, sys
+import datetime, json, os, re, sys
 
 logs = sys.argv[1]
 # gate log -> (the site's name for it, the count that gate's summary prints)
@@ -164,11 +164,16 @@ for gate, wants in sorted(WANT.items()):
             print("site from this run would state a figure nobody measured.")
             sys.exit(1)
         out[key] = int(hit[-1])
+        # The date this figure was taken, because the file carried none and
+        # the one written in September was still being read in October --
+        # under a page claiming every number came from the run that proved
+        # it. `scripts/site.py` prints this beside the figure.
+        out.setdefault("taken", {})[key] = datetime.date.today().isoformat()
 os.makedirs("site", exist_ok=True)
 with open("site/facts.json", "w") as f:
     json.dump(out, f, indent=2, sort_keys=True)
     f.write("\n")
-print("   ".join(f"{k}: {v}" for k, v in sorted(out.items())))
+print("   ".join(f"{k}: {v}" for k, v in sorted(out.items()) if k != "taken"))
 FACTS
 }
 
