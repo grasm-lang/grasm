@@ -20,6 +20,35 @@ def markdown_file(rel):
 PAGES = {}
 
 
+def doc_table(rel, after):
+    """The markdown table that follows `after` in a document, as HTML.
+
+    A benchmark table copied onto a page is a benchmark table that stops being
+    the measurement -- the 21 ms harness artefact lived on in two published
+    copies after the one in the scorecard was fixed. So the page renders the
+    record, and a record whose shape changes fails the build here rather than
+    going stale quietly.
+    """
+    with open(os.path.join(_ROOT, rel)) as f:
+        lines = f.read().splitlines()
+    try:
+        at = next(i for i, line in enumerate(lines) if after in line)
+    except StopIteration:
+        raise SystemExit(
+            f"{rel} no longer has the line the site anchors a table to: "
+            f"{after!r}. Either the record moved or the table went; the page "
+            "that renders it has to follow."
+        )
+    # The anchor may be the header row itself, or a sentence above the table.
+    start = at if lines[at].startswith("|") else next(
+        i for i in range(at + 1, len(lines)) if lines[i].startswith("|"))
+    end = start
+    while end < len(lines) and lines[end].startswith("|"):
+        end += 1
+    return site_markdown._table(lines[start:end])
+
+
+
 def verdicts():
     """The supply-chain verdicts, as a table each row of which resolves in turn.
 
@@ -184,6 +213,7 @@ rather than underneath it.</p>
 <div class="actions">
   <a class="btn ghost" href="achieved.html">The scorecard, all \u00abgoals_total\u00bb rows</a>
   <a class="btn ghost" href="different.html">What makes it different</a>
+  <a class="btn ghost" href="performance.html">Every benchmark</a>
 </div>
 
 <h2 class="reveal">Start here</h2>
@@ -1192,7 +1222,7 @@ program is checked for what it keeps as well as for what it prints.</p>
 <tr><td>«packages» libraries, all first-party</td><td>See <a href="packages.html">Packages</a>; the plan for the rest is in <code>docs/packages-plan.md</code>. Anything else you need, you write, or bind to C with <code>extern fn</code>.</td></tr>
 <tr><td>No remote registry</td><td>Path and local-registry dependencies work. Nothing fetches or publishes.</td></tr>
 <tr><td>No release binaries</td><td>Build from source with a Rust toolchain.</td></tr>
-<tr><td>Not faster than Rust</td><td>The geomean is «geomean»× of it, «geomean_floor»× with the harness floor taken out of both sides, against a 0.95× target — so the goal is met and the claim is not available. <code>tree</code> at «tree_ratio»× is the worst row. On the systems suite Grasm loses <code>etl</code> by «etl_ratio»×, and wins memory everywhere — «chat_mem_ratio»× on <code>chat</code>.</td></tr>
+<tr><td>Not faster than Rust</td><td>The geomean is «geomean»× of it, «geomean_floor»× with the harness floor taken out of both sides, against a 0.95× target — so the goal is met and the claim is not available. <code>tree</code> at «tree_ratio»× is the worst row. On the systems suite Grasm loses <code>etl</code> by «etl_ratio»×, and wins memory everywhere — «chat_mem_ratio»× on <code>chat</code>. <a href="performance.html">Every row →</a></td></tr>
 <tr><td>Polymorphic recursion</td><td>Refused by name at build time. It is what monomorphization is; no work removes it.</td></tr>
 <tr><td>Small standard library</td><td>«methods» methods. Enough for «gold» whole programs and «apps» applications; you will find gaps in something larger.</td></tr>
 <tr><td>Linux never compiled here</td><td>About «linux_lines» lines of the operating-system layer are written for Linux and no target is installed on this machine. CI compiles it. A compile does not catch a wrong constant, which is how <code>AF_INET6</code> was 30 on Linux for four commits.</td></tr>
@@ -1974,7 +2004,7 @@ above and not only at the end of the site.</p>
 <div class="scroll"><table>
 <tr><th>If you need</th><th>Then</th></tr>
 <tr><td>Libraries</td><td>There are «packages», and every one was written inside this repository. Python has hundreds of thousands.</td></tr>
-<tr><td>To be faster than Rust</td><td>You will not be. The geomean is «geomean»× of Rust on the benchmark suite, and <em>no benchmark here claims a win over it</em>. On the systems suite Grasm loses <code>etl</code> by «etl_ratio»×, is at throughput parity on <code>proxy</code> and last on its tail, and wins memory everywhere — «chat_mem_ratio»× on <code>chat</code>, which is «chat_rss» MB against Rust's «chat_rss_rust».</td></tr>
+<tr><td>To be faster than Rust</td><td>You will not be. The geomean is «geomean»× of Rust on the benchmark suite, and <em>no benchmark here claims a win over it</em>. On the systems suite Grasm loses <code>etl</code> by «etl_ratio»×, is at throughput parity on <code>proxy</code> and last on its tail, and wins memory everywhere — «chat_mem_ratio»× on <code>chat</code>, which is «chat_rss» MB against Rust's «chat_rss_rust». <a href="performance.html">Every row →</a></td></tr>
 <tr><td>To hire</td><td>Nobody outside this repository has written Grasm.</td></tr>
 <tr><td>A native debugger</td><td>There is a DAP server and it works against the interpreter. The Cranelift backend emits no DWARF, so GDB and LLDB cannot meaningfully inspect a compiled binary.</td></tr>
 <tr><td>async/await</td><td>There are threads, channels, structured concurrency and non-blocking I/O on one thread. There is no async/await, and tasks still refuse every effect.</td></tr>
@@ -2139,7 +2169,9 @@ it was made.</strong> It is «geomean»× today, or «geomean_floor»× with the
 harness's own floor subtracted from both sides, with five of eight programs at
 or above parity. <code>tree</code> at «tree_ratio»× is what the geomean still carries:
 a box per node in tree-shaped data. Storing those inline was built, measured at
-<em>1.33× slower</em>, and not kept.</p>
+<em>1.33× slower</em>, and not kept.
+<a href="performance.html">Every benchmark row, and the measurement rules each
+mistake bought →</a></p>
 
 <h2>What is still open</h2>
 <div class="scroll"><table>
@@ -2166,5 +2198,136 @@ this page, and no number here moves it: zero known defects, every gate green,
 and two consecutive independent review rounds finding nothing new — each
 conducted by somebody who has seen only the language pack and not this
 repository's history. Those rounds have not run.</p>
+""",
+)
+
+
+# ------------------------------------------------------------- performance
+
+PAGES["performance.html"] = (
+    "Every benchmark, the ones Grasm loses, and the measurement rules each mistake bought.",
+    """
+<p class="eyebrow">More</p>
+<h1>Where the time goes.</h1>
+<p class="lede">Grasm does not beat Rust. The geometric mean over the
+microbenchmark suite is <strong>«geomean»×</strong> of it —
+«geomean_floor»× with the harness's own floor taken out of both sides
+— which clears the 0.95× goal and is not the same as a win, and the
+systems suite below loses a benchmark by «etl_ratio»×. Both tables
+here are rendered from the files the runs wrote, not copied onto the page.</p>
+
+<h2>The microbenchmark suite</h2>
+<p>Eight programs, against Rust, C, Zig and Go. Five are at or above parity:
+<code>wordfreq</code> 1.67×, <code>sort</code> 1.12×, <code>sieve</code>
+1.03×, <code>fib</code> 1.01× (also ahead of Zig) and
+<code>parwords</code> 1.01×. <code>matmul</code> at 0.92× is behind Rust
+and ahead of Zig and Go.</p>
+<p><code>tree</code> at <strong>«tree_ratio»×</strong> is what the
+geomean carries, and the cause is the representation rather than any operation:
+a list of value structs is held as a box per node. Rust written <em>the way
+Grasm represents it</em> — an <code>Rc</code> per node — runs 2.4×
+slower than Grasm, so the gap to idiomatic Rust is the boxes and nothing else.
+Storing those nodes inline was built and measured at <em>1.33× slower</em>:
+a node's release becomes a runtime call where it was one inlined decrement,
+which costs more than the box it removes. The release has to get cheaper
+first.</p>
+<p class="note">The eighth program, <code>parmap</code>, has no ratio here on
+purpose. Parallel rows on this machine swing about ±10% run to run, so a
+single number for one would be a number about the machine. A serial proxy is
+used instead when a change needs measuring.</p>
+
+<h2>The systems suite</h2>
+<p>Five realistic workloads — a chat fan-out, an ECS update loop, a
+pointer-heavy graph build and drop, a 1 GiB ETL decode, and a TCP proxy —
+against Rust and Go. This is the recorded table:</p>
+"""
+    + doc_table("benchmarks/systems/RESULTS.md", "| benchmark | metric |")
+    + """
+<p><strong>Grasm wins memory everywhere</strong> — «chat_mem_ratio»×
+on <code>chat</code>, «chat_rss» MB against Rust's
+«chat_rss_rust», and <code>dirtyheap</code> now uses less than Rust's
+arena while dropping faster than it. It loses <code>etl</code>,
+<code>dirtyheap</code>, <code>ecs</code> and <code>chat</code> on time, and the
+<code>proxy</code> tail to both.</p>
+<p>What is behind each loss, measured rather than guessed. <code>etl</code>:
+Grasm makes a value per string field and validates UTF-8 per slice where
+Rust's decoder borrows from the line — borrowed string and bytes views are
+the next lever, and that row is «etl_grasm_ms» ms against
+«etl_rust_ms». <code>dirtyheap</code>: the URL is built as a string and
+then copied into the field, where Rust formats it into place.
+<code>ecs</code>: the update loop is at parity and the setup loop is behind on
+instructions retired. The <code>proxy</code> tail is
+<strong>unexplained</strong>, which is the honest state of it — see
+below.</p>
+
+<h3>Two published conclusions that a better measurement removed</h3>
+<p>The <code>proxy</code> row was first taken as the median of three
+<em>sequential</em> runs, and this machine drifts further than that between
+them: the same binary, five times in a row, gave 52,157 down to 35,893 requests
+a second. Re-run <em>interleaved</em> — grasm, go, rust, grasm, go, rust,
+five rounds — two recorded conclusions did not survive:</p>
+"""
+    + doc_table("benchmarks/systems/RESULTS.md", "40,000 requests each, medians:")
+    + """
+<p>Throughput is <strong>parity</strong>, not 12% behind Go. <strong>Rust leads
+the tail</strong>, where the recorded row had it behind Grasm. What stands is
+that Grasm's tail is last — 1.18× Go's and 1.30× Rust's, a real gap
+and a much smaller one than the 1.57× that was published.</p>
+<p>And the explanation that had been given for that tail is <em>wrong</em>.
+<code>proxy/README.md</code> attributed it to connection affinity: a worker
+owns the clients it accepted, so a busy worker stalls them while others idle.
+That predicts the tail improves as workers are added, and it is disprovable
+without building a work-stealing scheduler, because <strong>one worker per
+connection is perfect distribution by construction</strong>. 32 workers against
+256, for 256 connections: 28.7 ms and 27.1 ms at the p99. No change. So work
+stealing would have bought nothing, and the cause is now unknown rather than
+known-and-unfixed — which is a worse-sounding and more useful place to
+be.</p>
+
+<h2>Compile speed</h2>
+<p><strong>«locs_low»–«locs_high»k lines a second</strong>
+through parse and typecheck, against a 500k goal, and
+<strong>p50 «incr_p50» ms / p95 «incr_p95» ms</strong>
+edit-to-diagnostic through <code>grasm lsp</code> on the largest program here.
+Four things got it there, all found by measuring: three superlinear defects
+(a field chain that was exponential, a method chain that was exponential, a
+nested tuple literal that was cubic); memoized inference, added for those
+chains and worth <strong>2.2× on ordinary code too</strong>; <em>not</em>
+freeing the syntax tree at exit, which was a third of <code>grasm check</code>
+walking a tree node by node immediately before the operating system reclaimed
+the whole address space in one step; and a non-cryptographic hasher for tables
+keyed by byte offsets in a file the compiler is already reading.</p>
+<p>The incremental figure is met at this repository's scale and the goal is
+written for a million lines. There is no query engine: the server re-checks the
+whole program on every change, and at 3,500 lines that is fast enough to hide
+the problem.</p>
+
+<h2>Binary size and task scaling</h2>
+<p>A hello-world went <strong>«hello_was» KB →
+«hello_kb» KB</strong>, and the scheduler went
+<strong>«tasks_was» tasks in «tasks_was_s» s →
+«tasks» in «tasks_s» s</strong>.
+<a href="achieved.html">Both are on the scorecard with what moved them →</a></p>
+
+<h2>How any of this is measured</h2>
+<p>Every rule below exists because of a specific mistake, and the mistake is
+worth more than the rule.</p>
+<div class="scroll"><table>
+<tr><th>Rule</th><th>The mistake that bought it</th></tr>
+<tr><td><b>Interleave the A and B runs</b></td><td>Sequential runs drift about 2% on this machine. Alternating the two binaries turned a reported 1.036× and 0.982× into 1.010× and 1.001× — both of the original readings were the drift.</td></tr>
+<tr><td><b>Refuse to benchmark a busy machine</b></td><td><code>bench.sh</code> stops above a third of the cores being busy. The same build measured 478k LOC/s at load 9 and 571k at load 3; a number without its load is not a number.</td></tr>
+<tr><td><b>Price the ceiling before building</b></td><td>Counting instructions overestimated three optimisations by 6–20×. The way to bound a gain is to <em>break</em> the thing — remove the work and measure what is left — not to model it.</td></tr>
+<tr><td><b>A profiler's leaves lie about cost</b></td><td>A leaf worth 28% of <code>sample</code>'s samples was worth 1% of the clock, twice. Price a symbol by removing it, not by its share of samples.</td></tr>
+<tr><td><b>Static frequency is not cost</b></td><td>Reference counting is 43% of every runtime call the compiler emits — 210,661 call sites to <code>grasm_val_dec</code> across 256 programs — and it does not appear in a profile at all. Those sites are cold. Allocation and thread-local lookups are the real cost, which is the same answer every measurement gives.</td></tr>
+<tr><td><b>Subtract the harness</b></td><td>A constant added to every cell compresses every ratio toward 1. A 21 ms one made a losing suite read as parity, and it was published in three places before it was found in one.</td></tr>
+<tr><td><b>macOS charges for a new executable</b></td><td>About 450 ms the first time a freshly built binary runs, flat with its size. Reuse the inode or measure that tax instead of the program.</td></tr>
+</table></div>
+<p class="note"><strong>And a load artefact looks exactly like a defect.</strong>
+A native run killed under load exits <code>-9</code> with empty output, which
+reads as a mismatch. Seven fuzzer disagreements, two cross-compile failures and
+a hung concurrency test were all that, and all passed on re-run. The rule is to
+re-run before debugging — which is also why the <code>crosstest</code> figure
+on the <a href="achieved.html">scorecard</a> is annotated with the load it was
+taken at.</p>
 """,
 )

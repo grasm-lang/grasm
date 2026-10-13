@@ -46,6 +46,7 @@
 <h2>More</h2>
 <a href="examples.html">Examples</a>
 <a href="achieved.html">Scorecard</a>
+<a href="performance.html">Performance</a>
 <a href="about.html">About</a>
 <a href="status.html" aria-current="page">Status</a>
 <a href="roadmap.html">Roadmap</a>
@@ -84,7 +85,7 @@ program is checked for what it keeps as well as for what it prints.</p>
 <tr><td>651 libraries, all first-party</td><td>See <a href="packages.html">Packages</a>; the plan for the rest is in <code>docs/packages-plan.md</code>. Anything else you need, you write, or bind to C with <code>extern fn</code>.</td></tr>
 <tr><td>No remote registry</td><td>Path and local-registry dependencies work. Nothing fetches or publishes.</td></tr>
 <tr><td>No release binaries</td><td>Build from source with a Rust toolchain.</td></tr>
-<tr><td>Not faster than Rust</td><td>The geomean is 0.965× of it, 0.955× with the harness floor taken out of both sides, against a 0.95× target — so the goal is met and the claim is not available. <code>tree</code> at 0.51× is the worst row. On the systems suite Grasm loses <code>etl</code> by 3.6×, and wins memory everywhere — 8× on <code>chat</code>.</td></tr>
+<tr><td>Not faster than Rust</td><td>The geomean is 0.965× of it, 0.955× with the harness floor taken out of both sides, against a 0.95× target — so the goal is met and the claim is not available. <code>tree</code> at 0.51× is the worst row. On the systems suite Grasm loses <code>etl</code> by 3.6×, and wins memory everywhere — 8× on <code>chat</code>. <a href="performance.html">Every row →</a></td></tr>
 <tr><td>Polymorphic recursion</td><td>Refused by name at build time. It is what monomorphization is; no work removes it.</td></tr>
 <tr><td>Small standard library</td><td>82 methods. Enough for 44 whole programs and 12 applications; you will find gaps in something larger.</td></tr>
 <tr><td>Linux never compiled here</td><td>About 2,100 lines of the operating-system layer are written for Linux and no target is installed on this machine. CI compiles it. A compile does not catch a wrong constant, which is how <code>AF_INET6</code> was 30 on Linux for four commits.</td></tr>

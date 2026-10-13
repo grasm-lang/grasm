@@ -46,6 +46,7 @@
 <h2>More</h2>
 <a href="examples.html">Examples</a>
 <a href="achieved.html">Scorecard</a>
+<a href="performance.html">Performance</a>
 <a href="about.html">About</a>
 <a href="status.html">Status</a>
 <a href="roadmap.html">Roadmap</a>
@@ -175,7 +176,7 @@ above and not only at the end of the site.</p>
 <div class="scroll"><table>
 <tr><th>If you need</th><th>Then</th></tr>
 <tr><td>Libraries</td><td>There are 651, and every one was written inside this repository. Python has hundreds of thousands.</td></tr>
-<tr><td>To be faster than Rust</td><td>You will not be. The geomean is 0.965× of Rust on the benchmark suite, and <em>no benchmark here claims a win over it</em>. On the systems suite Grasm loses <code>etl</code> by 3.6×, is at throughput parity on <code>proxy</code> and last on its tail, and wins memory everywhere — 8× on <code>chat</code>, which is 8.4 MB against Rust's 69.4.</td></tr>
+<tr><td>To be faster than Rust</td><td>You will not be. The geomean is 0.965× of Rust on the benchmark suite, and <em>no benchmark here claims a win over it</em>. On the systems suite Grasm loses <code>etl</code> by 3.6×, is at throughput parity on <code>proxy</code> and last on its tail, and wins memory everywhere — 8× on <code>chat</code>, which is 8.4 MB against Rust's 69.4. <a href="performance.html">Every row →</a></td></tr>
 <tr><td>To hire</td><td>Nobody outside this repository has written Grasm.</td></tr>
 <tr><td>A native debugger</td><td>There is a DAP server and it works against the interpreter. The Cranelift backend emits no DWARF, so GDB and LLDB cannot meaningfully inspect a compiled binary.</td></tr>
 <tr><td>async/await</td><td>There are threads, channels, structured concurrency and non-blocking I/O on one thread. There is no async/await, and tasks still refuse every effect.</td></tr>

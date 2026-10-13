@@ -46,6 +46,7 @@ NAV = [
     ("architecture.html", "How it is built", "Reference", "Architecture"),
     ("examples.html", "Examples", "More", "Examples"),
     ("achieved.html", "How far it got", "More", "Scorecard"),
+    ("performance.html", "Where the time goes", "More", "Performance"),
     ("about.html", "About", "More", "About"),
     ("status.html", "Status", "More", "Status"),
     ("roadmap.html", "Roadmap", "More", "Roadmap"),
