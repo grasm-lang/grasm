@@ -117,7 +117,7 @@ def verdicts():
     ]
     out = ['<div class="verdicts">']
     for name, state, verdict, why in rows:
-        mark = "\u00abicon_check\u00bb" if state == "refused" else "\u00abicon_x\u00bb"
+        mark = "«icon_check»" if state == "refused" else "«icon_x»"
         out.append(
             f'<div class="verdict-row" data-result="{state}">'
             f'<span class="lang">{mark}{name}</span>'
@@ -136,7 +136,7 @@ PAGES["index.html"] = (
     "Grasm is a systems language where a dependency cannot reach further than its manifest allows.",
     """
 <div class="hero">
-  <p class="eyebrow">Systems language \u00b7 v\u00abversion\u00bb</p>
+  <p class="eyebrow">Systems language · v«version»</p>
   <h1>Your dependencies can read every file you can.</h1>
   <p class="lede">In Python, Go, Rust and Zig, a library that claims to do
   arithmetic can open your files and your sockets, and nothing in the toolchain
@@ -152,7 +152,7 @@ PAGES["index.html"] = (
   <div>
     <h3>The manifest is the ceiling</h3>
     <p>A package declares what it may reach. The compiler infers what it
-    actually does \u2014 through every call, into every dependency \u2014 and
+    actually does — through every call, into every dependency — and
     refuses to build when the two disagree.</p>
 """
     + code(
@@ -166,18 +166,18 @@ capabilities = []          # reaches nothing at all""",
   </div>
   <div>
     <h3>A patch release tries to grow teeth</h3>
-    <p>Same name, same signature, same result \u2014 and one new line that reads
+    <p>Same name, same signature, same result — and one new line that reads
     a file. This is the whole build:</p>
     <div class="term">
       <div class="chrome"><span class="dot"></span><span class="dot"></span><span class="dot"></span>
-        <span>app \u2014 grasm build</span></div>
+        <span>app — grasm build</span></div>
       <div class="body"></div>
     </div>
   </div>
 </div>
 
 <h2 class="reveal">The same attack, four toolchains</h2>
-<p class="reveal">A trusted pure library\u2019s 1.0.1 starts reading
+<p class="reveal">A trusted pure library’s 1.0.1 starts reading
 <code>/etc/passwd</code>. <code>scripts/security_bench.sh</code> runs it against
 four toolchains on every green build. Three of them ship it.</p>
 """
@@ -191,14 +191,14 @@ Here it is a type error.</p>
 <h2 class="reveal">Three ideas, and they compose</h2>
 <div class="grid three reveal">
   <div class="card">
-    <span class="ico">\u00abicon_lock\u00bb</span>
+    <span class="ico">«icon_lock»</span>
     <h3>Capabilities</h3>
     <p>A package states the effects it may perform. Exceeding it fails the
-    build in every consumer \u2014 not in a review, not at run time.</p>
+    build in every consumer — not in a review, not at run time.</p>
     <div class="lottie" data-lottie="ceiling"></div>
   </div>
   <div class="card">
-    <span class="ico">\u00abicon_layers\u00bb</span>
+    <span class="ico">«icon_layers»</span>
     <h3>Ownership in tiers</h3>
     <p>Value semantics by default, a region when a scope should own its
     allocations, a generational reference when a graph needs one. No lifetime
@@ -206,7 +206,7 @@ Here it is a type error.</p>
     <div class="lottie" data-lottie="tiers"></div>
   </div>
   <div class="card">
-    <span class="ico">\u00abicon_flow\u00bb</span>
+    <span class="ico">«icon_flow»</span>
     <h3>Four engines, one answer</h3>
     <p>Interpreter, bundle, ahead-of-time native, and wasm. Develop against
     instant feedback, ship a binary, run the same program in a browser.</p>
@@ -217,7 +217,7 @@ Here it is a type error.</p>
 <h2 class="reveal">Effects are in the type, and inferred</h2>
 <p class="reveal">You do not write the row. The compiler works it out from the
 body and checks it against what you declared, so a function that starts
-touching the network stops compiling \u2014 and so does every caller that was
+touching the network stops compiling — and so does every caller that was
 not given the same permission.</p>
 """
     + code(
@@ -238,48 +238,48 @@ fn load(path: str) -> str ! IoError / {io} {
 <p class="reveal">The interpreter is normative and the other three have to match
 it. Every gate here exists to hold them to the same bytes.</p>
 <div class="viz reveal">
-  <canvas id="engines" data-programs="\u00abdifftest\u00bb"
+  <canvas id="engines" data-programs="«difftest»"
     aria-label="Programs flowing through four engines to one answer"></canvas>
-  <div class="cap">difftest \u00b7 crosstest \u00b7 wasmtest \u2014 \u00abdifftest\u00bb programs, 0 mismatched</div>
+  <div class="cap">difftest · crosstest · wasmtest — «difftest» programs, 0 mismatched</div>
 </div>
 
 <div class="figures reveal">
-  <div class="fig"><b>\u00abdifftest\u00bb</b><span>programs, engines identical</span></div>
-  <div class="fig"><b>\u00abpackages\u00bb</b><span>libraries, all written in Grasm</span></div>
-  <div class="fig"><b>\u00abclauses\u00bb</b><span>normative clauses, each with a conformance program</span></div>
-  <div class="fig"><b>\u00abgates\u00bb</b><span>gates, judged by exit code alone</span></div>
+  <div class="fig"><b>«difftest»</b><span>programs, engines identical</span></div>
+  <div class="fig"><b>«packages»</b><span>libraries, all written in Grasm</span></div>
+  <div class="fig"><b>«clauses»</b><span>normative clauses, each with a conformance program</span></div>
+  <div class="fig"><b>«gates»</b><span>gates, judged by exit code alone</span></div>
 </div>
 
 <h2 class="reveal">Where it actually stands</h2>
-<p class="reveal">Eleven measurable goals, \u00abgoals_total\u00bb rows once two of
-them split in half. <strong>\u00abgoals_met\u00bb are met</strong>,
-\u00abgoals_over\u00bb are over by 4% and 2%, and \u00abgoals_blocked\u00bb cannot
+<p class="reveal">«goals_distinct» measurable goals, «goals_total» rows
+once «goals_split» of them split in half. <strong>«goals_met» are met</strong>,
+«goals_over» are over by 4% and 2%, and «goals_blocked» cannot
 be read at all without users. Three of the met rows carry a qualification, and
 <a href="achieved.html">the scorecard</a> states each one beside its number
 rather than underneath it.</p>
 <div class="figures reveal">
-  <div class="fig"><b>\u00abhello_kb\u00bb KB</b><span>hello-world, static, down from \u00abhello_was\u00bb KB</span></div>
-  <div class="fig"><b>\u00abtasks\u00bb</b><span>tasks in \u00abtasks_s\u00bb s, natively</span></div>
-  <div class="fig"><b>\u00abgeomean\u00bb\u00d7</b><span>of Rust, geomean \u2014 not ahead of it</span></div>
-  <div class="fig"><b>\u00ablocs_low\u00bbk</b><span>lines a second, front end</span></div>
+  <div class="fig"><b>«hello_kb» KB</b><span>hello-world, static, down from «hello_was» KB</span></div>
+  <div class="fig"><b>«tasks»</b><span>tasks in «tasks_s» s, natively</span></div>
+  <div class="fig"><b>«geomean»×</b><span>of Rust, geomean — not ahead of it</span></div>
+  <div class="fig"><b>«locs_low»k</b><span>lines a second, front end</span></div>
 </div>
 <div class="actions">
-  <a class="btn ghost" href="achieved.html">The scorecard, all \u00abgoals_total\u00bb rows</a>
+  <a class="btn ghost" href="achieved.html">The scorecard, all «goals_total» rows</a>
   <a class="btn ghost" href="different.html">What makes it different</a>
   <a class="btn ghost" href="performance.html">Every benchmark</a>
 </div>
 
 <h2 class="reveal">Start here</h2>
 <div class="grid three reveal">
-  <div class="card"><span class="ico">\u00abicon_shield\u00bb</span><h3>Why Grasm</h3>
+  <div class="card"><span class="ico">«icon_shield»</span><h3>Why Grasm</h3>
     <p>The seven things the other four toolchains do not give you.
-    <a href="different.html">Read it \u2192</a></p></div>
-  <div class="card"><span class="ico">\u00abicon_terminal\u00bb</span><h3>Getting started</h3>
+    <a href="different.html">Read it →</a></p></div>
+  <div class="card"><span class="ico">«icon_terminal»</span><h3>Getting started</h3>
     <p>Install, first program, first package.
-    <a href="start.html">Begin \u2192</a></p></div>
-  <div class="card"><span class="ico">\u00abicon_gauge\u00bb</span><h3>Scorecard</h3>
-    <p>Eleven goals, every measurement, and what is still open.
-    <a href="achieved.html">See it \u2192</a></p></div>
+    <a href="start.html">Begin →</a></p></div>
+  <div class="card"><span class="ico">«icon_gauge»</span><h3>Scorecard</h3>
+    <p>«goals_distinct» goals, every measurement, and what is still open.
+    <a href="achieved.html">See it →</a></p></div>
 </div>
 """
 )
@@ -1145,7 +1145,7 @@ thing standing between this language and ordinary use.</div>
 # ---------------------------------------------------------------- spec
 
 PAGES["spec.html"] = (
-    "\u00abclauses\u00bb numbered clauses, each with a conformance program.",
+    "«clauses» numbered clauses, each with a conformance program.",
     """
 <p class="eyebrow">Reference</p>
 <h1>Specification</h1>
@@ -1215,7 +1215,7 @@ is one nobody checks the implementation against.</p>
 # ---------------------------------------------------------------- examples
 
 PAGES["examples.html"] = (
-    "\u00abgold\u00bb whole programs, each running identically on three engines.",
+    "«gold» whole programs, each running identically on three engines.",
     """
 <p class="eyebrow">More</p>
 <h1>Examples</h1>
@@ -1252,8 +1252,8 @@ checked on three engines for identical output, exit code and diagnostics.</p>
 <h2>In a browser</h2>
 """
     + "<p>%d programs compiled to wasm and run in a tab with no server: %s."
-      " Both the count and the list come from the tree \u2014 a program runs in"
-      " a tab when there is a page beside it \u2014 because this sentence said"
+      " Both the count and the list come from the tree — a program runs in"
+      " a tab when there is a page beside it — because this sentence said"
       " <em>twelve</em> while naming three that have none.</p>" % browser_apps()
     + """
 
@@ -1274,8 +1274,8 @@ written, or out of the document that recorded the measurement. Five figures
 here used to be typed by hand instead. Four of them were wrong by the time
 anybody looked — the worst by a factor of two — and the fifth, &ldquo;0 open
 defects&rdquo;, was a claim no gate on this page makes.
-<a href="achieved.html">The scorecard</a> has the eleven goals and where each
-one stands.</p>
+<a href="achieved.html">The scorecard</a> has all «goals_distinct» goals and
+where each one stands.</p>
 
 <h2>What holds</h2>
 <div class="figures">
@@ -1424,22 +1424,22 @@ exceeded.</p>
 
 <h2>The attack</h2>
 <p>A trusted, pure library ships a patch release. Same name, same signature,
-same return value \u2014 and it now reads <code>/etc/passwd</code> and writes it
+same return value — and it now reads <code>/etc/passwd</code> and writes it
 out. Nothing about the call site changes. This is not hypothetical; it is the
 shape of every dependency compromise of the last decade.</p>
 
 <div class="term">
   <div class="chrome"><span class="dot"></span><span class="dot"></span><span class="dot"></span>
-    <span>app \u2014 grasm build</span></div>
+    <span>app — grasm build</span></div>
   <div class="body"></div>
 </div>
 """
     + verdicts()
     + """
 
-<p>Only Grasm\u2019s toolchain refuses. Everywhere else the tampered code builds,
+<p>Only Grasm’s toolchain refuses. Everywhere else the tampered code builds,
 ships and runs; detection is left to runtime sandboxing or to a reviewer
-noticing \u2014 neither of which the toolchain does.</p>
+noticing — neither of which the toolchain does.</p>
 
 <h2>How it works</h2>
 <p>Two halves. The first is the effect row, which is <em>inferred</em>, so it
@@ -1478,7 +1478,7 @@ error: package `mathlib` performs `io` but its manifest only permits nothing
 """
     )
     + """
-<p>The maintainer <em>can</em> raise the ceiling \u2014 but the manifest is in the
+<p>The maintainer <em>can</em> raise the ceiling — but the manifest is in the
 diff, and a package that used to declare <code>[]</code> and now declares
 <code>["io"]</code> is one line a consumer can see, refuse, or gate in CI.
 That is the whole design: make the change visible where a human is already
@@ -1494,7 +1494,7 @@ operating system.</p>
   <li><code>unsafe</code> and <code>extern fn</code> reach C, and C is outside
   this. That is why the tier is called Tier 3, why every call must sit inside an
   <code>unsafe</code> block, <em>and</em> why the package must additionally
-  declare the <code>unsafe</code> capability \u2014 so a consumer can refuse the
+  declare the <code>unsafe</code> capability — so a consumer can refuse the
   whole package by reading one line.</li>
   <li><code>exit</code> performs no effect and can still end the process. So
   can a panic and an endless loop. A ceiling bounds what a dependency can
@@ -1504,7 +1504,7 @@ operating system.</p>
 <h2>Prior art</h2>
 <p>None of this is invented here. <a href="about.html">Austral</a> pioneered
 capability-secure modules, Wyvern did capability-safe modules before that, and
-the effect row is <a href="about.html">Koka</a>\u2019s. What is uncommon is
+the effect row is <a href="about.html">Koka</a>’s. What is uncommon is
 shipping the combination with a gate that proves it: <code>security_bench.sh</code>
 runs the attack on every green build.</p>
 """
@@ -1525,7 +1525,7 @@ three have to match it.</p>
 <table>
   <tr><th>Stage</th><th>Crate</th><th>What it produces</th></tr>
   <tr><td>Lexer and parser</td><td><code>grasm_syntax</code></td><td>Tokens, then a tree. Also the formatter.</td></tr>
-  <tr><td>Checker</td><td><code>grasm_sema</code></td><td>Types, effect rows, ownership, exhaustiveness \u2014 and an <code>Analysis</code> the backend reads.</td></tr>
+  <tr><td>Checker</td><td><code>grasm_sema</code></td><td>Types, effect rows, ownership, exhaustiveness — and an <code>Analysis</code> the backend reads.</td></tr>
   <tr><td>Interpreter</td><td><code>grasm_interp</code></td><td>The normative answer.</td></tr>
   <tr><td>Native backend</td><td><code>grasm_native</code></td><td>Cranelift IR, then an object file.</td></tr>
   <tr><td>Runtime</td><td><code>grasm_rt</code></td><td>Reference-counted boxed values with copy-on-write.</td></tr>
@@ -1553,24 +1553,24 @@ code this project owns and must get right: the conversion found nine defects,
 page would have caught none.</p>
 
 <h2>Why the checker hands types to the backend</h2>
-<p>It did not, once. The backend re-derived them \u2014 roughly 950 lines of a
-<em>second</em> type inference \u2014 and nine of twelve findings in one period
-traced to the two disagreeing. The checker now exports every expression\u2019s
-resolved type; it answers 94% of the backend\u2019s questions on real code and
+<p>It did not, once. The backend re-derived them — roughly 950 lines of a
+<em>second</em> type inference — and nine of twelve findings in one period
+traced to the two disagreeing. The checker now exports every expression’s
+resolved type; it answers 94% of the backend’s questions on real code and
 87% on generated code. Where it answers, the two <em>cannot</em> disagree,
 because there is only one answer.</p>
 <p>Nothing was deleted on the strength of that, and the reason is recorded:
 an arm the corpus never reaches is not an arm nothing reaches.</p>
 
 <h2>The memory model, plainly</h2>
-<p>Boxed values \u2014 strings, lists \u2014 are reference-counted with
+<p>Boxed values — strings, lists — are reference-counted with
 copy-on-write. The count is atomic so a value may cross a thread, and that cost
 was measured rather than assumed: 4.3% on the most reference-count-heavy
 program here, no movement at all on three others, about half a percent on the
 geometric mean.</p>
 <p>Effects, capabilities, ownership modes and exhaustiveness are erased before
 codegen and cost nothing at run time. <code>ref T</code> costs a generation
-check. <code>region</code> is checked but does not yet free in bulk \u2014 the
+check. <code>region</code> is checked but does not yet free in bulk — the
 specification says so in the clause itself rather than implying otherwise.</p>
 
 <h2>The gates</h2>
@@ -1581,8 +1581,8 @@ which was true, while failing three lines further down.</p>
   <div class="card"><h3>Agreement</h3><p>difftest, crosstest, wasmtest and
   agreetest run the corpus through every engine and require identical bytes.</p></div>
   <div class="card"><h3>Differential</h3><p>Against things outside this project:
-  OpenSSL for certificates, real zlib, git\u2019s own object store, V8 for
-  WebAssembly, clang\u2019s assembler.</p></div>
+  OpenSSL for certificates, real zlib, git’s own object store, V8 for
+  WebAssembly, clang’s assembler.</p></div>
   <div class="card"><h3>Generated</h3><p>«generators» generators build programs
   nobody wrote, then require every engine to agree on them too.</p></div>
   <div class="card"><h3>Laws</h3><p>«law_defs» properties that must hold. A law a
@@ -1593,7 +1593,7 @@ which was true, while failing three lines further down.</p>
 <h2>Record and replay</h2>
 <p>Every builtin that touches the world is journaled. A recorded run replays
 deterministically, and the gate requires each journaled builtin to
-<em>refuse</em> under an empty journal \u2014 so a replay cannot quietly reach
+<em>refuse</em> under an empty journal — so a replay cannot quietly reach
 the real world instead.</p>
 """
 )
@@ -1619,9 +1619,9 @@ first and usually with more research behind it.</p>
   <tr><td><code>let</code> / <code>inout</code> / <code>own</code>, value semantics, no lifetimes</td>
       <td><b>Hylo</b> (formerly Val) has <code>let</code>/<code>inout</code>/<code>sink</code>. <b>Swift</b> has exclusivity, ARC and copy-on-write.</td></tr>
   <tr><td>Effect rows, inferred and unified</td>
-      <td><b>Koka</b> \u2014 row-based effect types with inference. Also <b>OCaml 5</b>, <b>Unison</b>, <b>Eff</b>, <b>Frank</b>.</td></tr>
+      <td><b>Koka</b> — row-based effect types with inference. Also <b>OCaml 5</b>, <b>Unison</b>, <b>Eff</b>, <b>Frank</b>.</td></tr>
   <tr><td>Capability ceiling per module</td>
-      <td><b>Austral</b> \u2014 capability-secure, no ambient I/O. <b>Wyvern</b>, and the <b>E</b> language before it.</td></tr>
+      <td><b>Austral</b> — capability-secure, no ambient I/O. <b>Wyvern</b>, and the <b>E</b> language before it.</td></tr>
   <tr><td>Reference counting with copy-on-write</td>
       <td><b>Swift</b>, <b>Nim</b>.</td></tr>
   <tr><td>Generational references</td>
@@ -1662,7 +1662,7 @@ else.</p>
 
 <h2>How it is built</h2>
 <p>«clauses» normative clauses in «spec_lines» lines of specification, under a
-hard ceiling \u2014 every addition since has been paid for by compressing prose
+hard ceiling — every addition since has been paid for by compressing prose
 already written. «stable» clauses are <code>stable</code> and will not change
 incompatibly before 2.0; «provisional» are <code>provisional</code> and
 «experimental» are <code>experimental</code>. Version 1.0 promoted nothing: a
@@ -2120,7 +2120,7 @@ def _goal(name, target, pct, measured, hit, note):
     num = "num" if hit else "num miss"
     return (
         f'<div class="bar-row"><span class="what">{name}<br>'
-        f'<span class="goal">{note} \u00b7 {target}</span></span>'
+        f'<span class="goal">{note} · {target}</span></span>'
         f'<span class="bar-track"><span class="bar-fill {cls}" '
         f'data-pct="{pct}"></span></span>'
         f'<span class="{num}">{measured}</span></div>'

@@ -275,7 +275,12 @@ def scorecard():
         else:
             blocked += 1
     return {"goals_total": len(rows), "goals_met": met,
-            "goals_over": over, "goals_blocked": blocked}
+            "goals_over": over, "goals_blocked": blocked,
+            # Eleven goals in thirteen rows, because G3 and G11 each split in
+            # half. Both numbers were typed on the index; a twelfth goal would
+            # have moved one and not the other.
+            "goals_distinct": len({r[0] for r in rows}),
+            "goals_split": len(rows) - len({r[0] for r in rows})}
 
 
 def corpus_programs():
