@@ -20,6 +20,59 @@ def markdown_file(rel):
 PAGES = {}
 
 
+# The ProjectGold programs that run in a browser, and the phrase the page uses
+# for each. A page beside the program is the evidence: a program with no HTML
+# does not run in a tab, whatever its directory is called.
+WEB_APPS = {
+    "32-fullstack-counter": "a fullstack counter",
+    "33-user-registration": "user registration",
+    "34-voting-app": "a voting app",
+    "35-blog-dashboard": "a blog dashboard",
+    "36-markdown-editor": "a markdown editor",
+    "38-upload-gallery": "an upload gallery",
+    "39-chat-router": "a chat router",
+    "40-collaborative-todo": "a collaborative todo list",
+    "41-spa-router": "a SPA router",
+    "42-realtime-analytics": "realtime analytics",
+}
+
+
+def browser_apps():
+    """How many ProjectGold programs run in a tab, and which ones.
+
+    The page said twelve and named twelve, and three of the names do not run
+    in a browser: `43-weather-mashup` and `44-ecommerce-cart` have no page
+    beside them, and neither does `37-user-auth`, which the sentence folded
+    into the registration one. A hand-written list of examples drifts exactly
+    the way a hand-written count does, so the number and the names both come
+    from the tree, and a directory this map does not know about fails the
+    build rather than going quietly missing from the sentence.
+    """
+    root = os.path.join(_ROOT, "ProjectGold")
+    found = sorted(
+        d for d in os.listdir(root)
+        if os.path.isdir(os.path.join(root, d))
+        # A `main.gr` is what makes it a program rather than the playground's
+        # own host directory, which also holds a page. Not a manifest: five of
+        # these ten have no grasm.toml.
+        and os.path.exists(os.path.join(root, d, "main.gr"))
+        and any(f.endswith(".html") for f in os.listdir(os.path.join(root, d)))
+    )
+    unknown = [d for d in found if d not in WEB_APPS]
+    gone = [d for d in WEB_APPS if d not in found]
+    if unknown or gone:
+        raise SystemExit(
+            "the browser applications the site names no longer match the tree.\n"
+            + "".join(f"  ships a page, unnamed here: {d}\n" for d in unknown)
+            + "".join(f"  named here, ships no page: {d}\n" for d in gone)
+            + "Fix WEB_APPS in scripts/site_pages.py. The count on the page "
+            "comes from this list, so a stale list is a wrong number."
+        )
+    names = [WEB_APPS[d] for d in found]
+    return len(found), ", ".join(names[:-1]) + " and " + names[-1]
+
+
+
 def doc_table(rel, after):
     """The markdown table that follows `after` in a document, as HTML.
 
@@ -416,10 +469,12 @@ python3 -m http.server -d ProjectGold/web
 """
     )
     + """
-<p>That page runs the corpus: pick a program, and it executes in the tab. Twelve
-of the programs under <code>ProjectGold/</code> are browser applications built
-this way — a SPA router, a markdown editor, a collaborative todo list, a
-realtime analytics dashboard.</p>
+<p>That page runs the corpus: pick a program, and it executes in the tab.</p>
+"""
+    + "<p>%d of the programs under <code>ProjectGold/</code> are browser"
+      " applications built this way, and they are the ones with a page beside"
+      " them: %s.</p>\n" % browser_apps()
+    + """
 
 <h2>What the browser build can and cannot do</h2>
 <p>«wasm_ok» programs produce identical output in wasm, out of the
@@ -1100,7 +1155,7 @@ change.</p>
 
 <div class="figures">
   <div class="fig"><b>«clauses»</b><span>clauses</span></div>
-  <div class="fig"><b>70</b><span>pages, the cap</span></div>
+  <div class="fig"><b>«spec_pages»</b><span>pages, against a «spec_cap»-page cap</span></div>
   <div class="fig"><b>«law_defs»</b><span>laws checked against arithmetic</span></div>
 </div>
 
@@ -1118,6 +1173,23 @@ under a stability heading that disagrees with its own level.</p>
 <tr><td>Provisional</td><td>It works and it may still move.</td></tr>
 <tr><td>Experimental</td><td>Expect it to change.</td></tr>
 </table></div>
+
+<h2>Three budgets the specification sets itself, and misses</h2>
+<p>§19.2 of the specification states a budget for its own size and for the
+size of the reference interpreter, and records what each one is today. None of
+the three is met, and the site had never shown any of them — the page led
+with <b>«spec_pages»</b> labelled <em>the cap</em>, when «spec_cap» is the
+cap and «spec_pages» is «spec_over»% past it. This is the table as
+<code>spec/core.md</code> records it:</p>
+"""
+    + doc_table("spec/core.md", "| Budget | §19.2 target | Today |")
+    + """
+<p>The specification's own note on them is the useful part: <em>the
+specification's is the binding one — a new clause is paid for out of
+prose.</em> A language that cannot be read is not specified by having been
+written down, and «spec_constructs» core constructs against a budget of
+«spec_constructs_cap» is the number that decides whether the next feature gets
+one.</p>
 
 <h2>Why there is also a law for most of them</h2>
 <p>A conformance program records what a clause says the output is. Where the
@@ -1178,11 +1250,12 @@ checked on three engines for identical output, exit code and diagnostics.</p>
 </div>
 
 <h2>In a browser</h2>
-<p>Twelve programs compiled to wasm and run in a tab with no server: a SPA
-router, a markdown editor, a collaborative todo list, realtime analytics, user
-registration and authentication, an upload gallery, a chat router, a voting
-app, a blog dashboard, a weather mashup, an e-commerce cart, a fullstack
-counter.</p>
+"""
+    + "<p>%d programs compiled to wasm and run in a tab with no server: %s."
+      " Both the count and the list come from the tree \u2014 a program runs in"
+      " a tab when there is a page beside it \u2014 because this sentence said"
+      " <em>twelve</em> while naming three that have none.</p>" % browser_apps()
+    + """
 
 <p>All of them live under <code>ProjectGold/</code> in the repository, with the
 expected output recorded beside each.</p>

@@ -188,6 +188,16 @@ CITED = [
     ("cross_pass", "docs/binary-size.md", r"\*\*([0-9]+) pass, 0 real failures"),
     ("unittests", "docs/binary-size.md", r"\| unit tests \| every crate \| ([0-9]+) pass"),
     ("difftest", "docs/binary-size.md", r"\| difftest / corpus comparison \| ([0-9]+) programs"),
+    # The spec page showed "70 -- pages, the cap". 70 is not the cap: the cap
+    # is 50 and the specification is 40% over it, which is the opposite claim.
+    ("spec_pages", "spec/core.md",
+     r"\| Specification \| \u2264 [0-9]+ pages \| \*\*~([0-9]+) pages\*\* \|"),
+    ("spec_cap", "spec/core.md",
+     r"\| Specification \| \u2264 ([0-9]+) pages \|"),
+    ("spec_constructs", "spec/core.md",
+     r"\| Core constructs \| \u2264 [0-9]+ \| \*\*([0-9]+)\*\* \|"),
+    ("spec_constructs_cap", "spec/core.md",
+     r"\| Core constructs \| \u2264 ([0-9]+) \|"),
     ("linux_lines", "docs/binary-size.md", r"roughly ([0-9,]+) lines of .cfg\(not\(macos\)\)."),
     ("tree_ratio", "docs/northstar.md", r"`tree` at ([0-9.]+)\u00d7 is what the geomean"),
     ("geomean_was", "docs/northstar.md", r"geometric mean is ([0-9.]+)\u00d7 behind"),
@@ -216,6 +226,11 @@ def derived(f):
     return {
         "etl_ratio": "{:.1f}".format(num("etl_grasm_ms") / num("etl_rust_ms")),
         "chat_mem_ratio": "{:.0f}".format(num("chat_rss_rust") / num("chat_rss")),
+        # How far past its own page budget the specification is. Typed as
+        # "40%" first, which is a quotient of two cited figures and so the
+        # exact thing that outlives them.
+        "spec_over": "{:.0f}".format(
+            (num("spec_pages") / num("spec_cap") - 1) * 100),
     }
 
 

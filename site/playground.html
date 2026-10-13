@@ -91,10 +91,9 @@ and open it:</p><pre><code>cargo build <span class="op">-</span><span class="op"
 cp target<span class="op">/</span>wasm32<span class="op">-</span>unknown<span class="op">-</span>unknown<span class="op">/</span>release<span class="op">/</span>grasm_wasm<span class="op">.</span>wasm <span class="ty">ProjectGold</span><span class="op">/</span>web<span class="op">/</span>grasm<span class="op">.</span>wasm
 
 python3 <span class="op">-</span>m http<span class="op">.</span>server <span class="op">-</span>d <span class="ty">ProjectGold</span><span class="op">/</span>web</code></pre>
-<p>That page runs the corpus: pick a program, and it executes in the tab. Twelve
-of the programs under <code>ProjectGold/</code> are browser applications built
-this way — a SPA router, a markdown editor, a collaborative todo list, a
-realtime analytics dashboard.</p>
+<p>That page runs the corpus: pick a program, and it executes in the tab.</p>
+<p>10 of the programs under <code>ProjectGold/</code> are browser applications built this way, and they are the ones with a page beside them: a fullstack counter, user registration, a voting app, a blog dashboard, a markdown editor, an upload gallery, a chat router, a collaborative todo list, a SPA router and realtime analytics.</p>
+
 
 <h2>What the browser build can and cannot do</h2>
 <p>394 programs produce identical output in wasm, out of the
