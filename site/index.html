@@ -24,6 +24,7 @@
 <nav class="rail">
 <a class="mark" href="index.html"><b>grasm</b><span>a systems language</span></a>
 <h2>Start</h2>
+<a href="different.html">Why Grasm</a>
 <a href="start.html">Getting started</a>
 <a href="install.html">Install</a>
 <a href="playground.html">Playground</a>
@@ -44,6 +45,7 @@
 <a href="architecture.html">Architecture</a>
 <h2>More</h2>
 <a href="examples.html">Examples</a>
+<a href="achieved.html">Scorecard</a>
 <a href="about.html">About</a>
 <a href="status.html">Status</a>
 <a href="roadmap.html">Roadmap</a>
@@ -141,29 +143,47 @@ not given the same permission.</p>
 <p class="reveal">The interpreter is normative and the other three have to match
 it. Every gate here exists to hold them to the same bytes.</p>
 <div class="viz reveal">
-  <canvas id="engines" data-programs="478"
+  <canvas id="engines" data-programs="511"
     aria-label="Programs flowing through four engines to one answer"></canvas>
-  <div class="cap">difftest · crosstest · wasmtest — 478 programs, 0 mismatched</div>
+  <div class="cap">difftest · crosstest · wasmtest — 511 programs, 0 mismatched</div>
 </div>
 
 <div class="figures reveal">
-  <div class="fig"><b>478</b><span>programs, engines identical</span></div>
-  <div class="fig"><b>650</b><span>libraries, all written in Grasm</span></div>
-  <div class="fig"><b>250</b><span>normative clauses, each with a conformance program</span></div>
+  <div class="fig"><b>511</b><span>programs, engines identical</span></div>
+  <div class="fig"><b>651</b><span>libraries, all written in Grasm</span></div>
+  <div class="fig"><b>253</b><span>normative clauses, each with a conformance program</span></div>
   <div class="fig"><b>86</b><span>gates, judged by exit code alone</span></div>
+</div>
+
+<h2 class="reveal">Where it actually stands</h2>
+<p class="reveal">Eleven measurable goals, 13 rows once two of
+them split in half. <strong>9 are met</strong>,
+2 are over by 4% and 2%, and 2 cannot
+be read at all without users. Three of the met rows carry a qualification, and
+<a href="achieved.html">the scorecard</a> states each one beside its number
+rather than underneath it.</p>
+<div class="figures reveal">
+  <div class="fig"><b>85.7 KB</b><span>hello-world, static, down from 351.1 KB</span></div>
+  <div class="fig"><b>1,000,000</b><span>tasks in 22 s, natively</span></div>
+  <div class="fig"><b>0.965×</b><span>of Rust, geomean — not ahead of it</span></div>
+  <div class="fig"><b>535k</b><span>lines a second, front end</span></div>
+</div>
+<div class="actions">
+  <a class="btn ghost" href="achieved.html">The scorecard, all 13 rows</a>
+  <a class="btn ghost" href="different.html">What makes it different</a>
 </div>
 
 <h2 class="reveal">Start here</h2>
 <div class="grid three reveal">
+  <div class="card"><span class="ico"><svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3 5 6v6c0 4 3 6.5 7 9 4-2.5 7-5 7-9V6l-7-3Z"/><path d="m9 12 2 2 4-4"/></svg></span><h3>Why Grasm</h3>
+    <p>The seven things the other four toolchains do not give you.
+    <a href="different.html">Read it →</a></p></div>
   <div class="card"><span class="ico"><svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 8 4 4-4 4M13 16h5"/><rect x="2" y="4" width="20" height="16" rx="2"/></svg></span><h3>Getting started</h3>
     <p>Install, first program, first package.
     <a href="start.html">Begin →</a></p></div>
-  <div class="card"><span class="ico"><svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2V5Z"/><path d="M8 7h7M8 11h7"/></svg></span><h3>Syntax</h3>
-    <p>The whole language on one page, every form with an example.
-    <a href="syntax.html">Read it →</a></p></div>
-  <div class="card"><span class="ico"><svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 14 16 9"/><path d="M4 18a9 9 0 1 1 16 0"/></svg></span><h3>Status</h3>
-    <p>What works, what is measured, and what is still missing.
-    <a href="status.html">See it →</a></p></div>
+  <div class="card"><span class="ico"><svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 14 16 9"/><path d="M4 18a9 9 0 1 1 16 0"/></svg></span><h3>Scorecard</h3>
+    <p>Eleven goals, every measurement, and what is still open.
+    <a href="achieved.html">See it →</a></p></div>
 </div>
 
 <footer>

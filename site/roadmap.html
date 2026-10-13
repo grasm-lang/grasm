@@ -24,6 +24,7 @@
 <nav class="rail">
 <a class="mark" href="index.html"><b>grasm</b><span>a systems language</span></a>
 <h2>Start</h2>
+<a href="different.html">Why Grasm</a>
 <a href="start.html">Getting started</a>
 <a href="install.html">Install</a>
 <a href="playground.html">Playground</a>
@@ -44,6 +45,7 @@
 <a href="architecture.html">Architecture</a>
 <h2>More</h2>
 <a href="examples.html">Examples</a>
+<a href="achieved.html">Scorecard</a>
 <a href="about.html">About</a>
 <a href="status.html">Status</a>
 <a href="roadmap.html" aria-current="page">Roadmap</a>
@@ -63,28 +65,40 @@ other engines, and the <a href="tutorial.html">tutorial</a> and
 rendered when the site is written rather than summarised here.</p>
 
 <h2>2. Speed</h2>
-<p>0.45× native Rust today against a 0.95× target, computed by
-<code>scripts/bench.sh</code> from the numbers it prints. The costs worth
-attacking, in order: a box per node in tree-shaped data, binary size (350 KB
-against a 300 KB target), and the atomic reference count every boxed value
-carries because a <code>parallel</code> body may hold one.</p>
+<p>0.965× of native Rust against a 0.95× target, computed by
+<code>scripts/bench.sh</code> from the numbers it prints, so the goal is met and
+the suite still has a worst row at 0.51×: <code>tree</code>, which pays a box
+per node in tree-shaped data. Storing those nodes inline was built and measured
+at <em>1.33× slower</em> — a node's release turns into a runtime call — so the
+release has to get cheaper before the representation can change. Binary size is
+no longer on this list: 85.7 KB against a 300 KB target. What is left, in
+order: the release path, the atomic reference count every boxed value carries
+because a <code>parallel</code> body may hold one, and borrowed string views,
+which is what the <code>etl</code> benchmark loses 3.6× to.</p>
 
 <h2>3. Packages and libraries</h2>
 <p>The mechanism is built: manifests, resolution, lockfiles, path and local
-registry dependencies, and the capability ceiling. The first two libraries are
-written. What is missing is a remote registry and the rest of them.</p>
+registry dependencies, and the capability ceiling. 651 libraries are
+written, all of them inside this repository. What is missing is a remote
+registry — nothing fetches and nothing publishes, so nobody else can write the
+next one.</p>
+<p>This table used to list six libraries as not started —
+<code>testing</code>, <code>log</code>, <code>time</code>, <code>uuid</code>,
+<code>base64</code> and <code>regex</code>. All six exist. What it tracks now is
+the shape of the set rather than a checklist of names:</p>
 <div class="scroll"><table>
-<tr><th>Library</th><th>State</th></tr>
-<tr><td><b>http</b> — server</td><td><b>Built.</b> <code>packages/http</code> parses and routes and declares no capability; <code>packages/http_server</code> owns the socket. Both in the corpus, both agreeing on three engines.</td></tr>
-<tr><td><b>http</b> — client</td><td><b>Built.</b> <code>packages/http_client</code>. Its demo talks to <code>http_server</code> over a real socket — a Grasm client and a Grasm server.</td></tr>
-<tr><td><b>json</b></td><td><b>Built.</b> <code>packages/json</code>: parse, render, reach in (<code>get</code>, <code>at</code>, <code>path</code>, <code>as_str</code>…), build up (<code>object</code>, <code>list</code>, <code>with_key</code>…). Declares no capability. The six ProjectGold programs that used it point here.</td></tr>
-<tr><td><b>async</b> — timers, channels, select</td><td>Not started. <code>parallel</code> and <code>spawn</code> are in the language; the library above them is not.</td></tr>
-<tr><td><b>testing</b>, <b>log</b>, <b>time</b>, <b>uuid</b>, <b>base64</b>, <b>regex</b></td><td>Not started.</td></tr>
+<tr><th>Area</th><th>State</th></tr>
+<tr><td><b>http</b> — server and client</td><td><b>Built.</b> <code>packages/http</code> parses and routes and declares no capability; <code>http_server</code> owns the socket; <code>http_client</code>'s demo talks to <code>http_server</code> over a real one. There is <code>http2frame</code>, <code>http2client</code> and <code>https_client</code> besides.</td></tr>
+<tr><td><b>json</b></td><td><b>Built</b>, and so are <code>jsonschema</code>, <code>jsonpath</code>, <code>jsonpatch</code>, <code>jsonpointer</code> and <code>jsonmergepatch</code>. All declare no capability.</td></tr>
+<tr><td><b>Concurrency</b></td><td><b>In the language rather than a library.</b> Channels, <code>concurrent</code>/<code>go</code>, actors and <code>chan_select</code> are in, 1,000,000 tasks run in 22 s on a compiled build, and <code>net_wait</code> holds many connections on one thread. A task still refuses every effect, which is the half of G6 that is open, and there is no timer library above any of it.</td></tr>
+<tr><td><b>Everything else</b></td><td>651 libraries, the six that were listed as missing among them. See <a href="packages.html">Packages</a>.</td></tr>
+<tr><td><b>A registry</b></td><td><b>The one that matters, and it is not built.</b> Nothing fetches and nothing publishes, so every library here had to be written here — which is also why there are 651 of them.</td></tr>
 </table></div>
 <p>The comparison to hyper, axum, tokio, gin and fiber is a comparison against
-years of work by thousands of people. The honest target for a first release is
-one good HTTP library, one JSON library, one async library, and the packaging to
-publish them — so that the second and third can be written by somebody else.</p>
+years of work by thousands of people, and a count does not close it: these are
+651 libraries with one set of eyes on them and no production use
+behind any of them. The honest target for a first release is the packaging to
+publish them — so that the next one can be written by somebody else.</p>
 
 <h2>4. Is the compiler ready</h2>
 <p>Yes, with the limits on the <a href="status.html">status page</a> stated

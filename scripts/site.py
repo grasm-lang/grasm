@@ -27,6 +27,7 @@ OUT = os.path.join(ROOT, "site")
 # (file, title, rail section, rail label)
 NAV = [
     ("index.html", "Grasm", None, None),
+    ("different.html", "What makes it different", "Start", "Why Grasm"),
     ("start.html", "Getting started", "Start", "Getting started"),
     ("install.html", "Install", "Start", "Install"),
     ("playground.html", "Playground", "Start", "Playground"),
@@ -44,6 +45,7 @@ NAV = [
     ("spec.html", "Specification", "Reference", "Specification"),
     ("architecture.html", "How it is built", "Reference", "Architecture"),
     ("examples.html", "Examples", "More", "Examples"),
+    ("achieved.html", "How far it got", "More", "Scorecard"),
     ("about.html", "About", "More", "About"),
     ("status.html", "Status", "More", "Status"),
     ("roadmap.html", "Roadmap", "More", "Roadmap"),
@@ -80,19 +82,53 @@ def facts():
     stab = open(os.path.join(ROOT, "spec", "stability.md")).read()
     for level in ("stable", "provisional", "experimental"):
         f[level] = len(re.findall(r"^- `[A-Z][A-Z0-9-]+` \u2014 " + level + r"$", stab, re.M))
-    f["spec_lines"] = sum(
+    f["spec_lines"] = "{:,}".format(sum(
         open(q).read().count("\n") for q in glob.glob(os.path.join(ROOT, "spec", "*.md"))
-    )
+    ))
     # Packages a consumer could depend on: the `-demo` directories exist to be
     # run by the gates, not to be imported.
     f["packages"] = len([
         d for d in glob.glob(os.path.join(ROOT, "packages", "*", "grasm.toml"))
         if not os.path.basename(os.path.dirname(d)).endswith("-demo")
     ])
+    # How many of those declare nothing at all. The site's whole argument is
+    # that reach is separable from computation, and this is the one number that
+    # says whether the library set actually does that or only could.
+    f["packages_pure"] = len([
+        d for d in glob.glob(os.path.join(ROOT, "packages", "*", "grasm.toml"))
+        if not os.path.basename(os.path.dirname(d)).endswith("-demo")
+        and (lambda m: bool(m) and not m.group(1).strip())(
+            re.search(r"^capabilities\s*=\s*\[(.*?)\]", open(d).read(), re.M | re.S))
+    ])
+    f["packages_reaching"] = f["packages"] - f["packages_pure"]
+    # And which capability the rest ask for, because "96 reach something" and
+    # "one of 651 may call into C" are different facts about the same set.
+    for cap in ("io", "net", "unsafe"):
+        f["cap_" + cap] = len([
+            d for d in glob.glob(os.path.join(ROOT, "packages", "*", "grasm.toml"))
+            if not os.path.basename(os.path.dirname(d)).endswith("-demo")
+            and (lambda m: bool(m) and ('"%s"' % cap) in m.group(1))(
+                re.search(r"^capabilities\s*=\s*\[(.*?)\]",
+                          open(d).read(), re.M | re.S))
+        ])
     f["gates"] = len(re.findall(
         r"^run_gate ", open(os.path.join(ROOT, "scripts", "allgates.sh")).read(), re.M))
     f["version"] = re.search(
         r'^version = "([^"]+)"', open(os.path.join(ROOT, "Cargo.toml")).read(), re.M).group(1)
+
+    f["conformance"] = len(glob.glob(os.path.join(ROOT, "spec", "conformance", "*.gr")))
+    # The examples page names three programs by their size, and one of them had
+    # grown thirty lines since somebody typed it.
+    for key, where in (("lines_http", "21-http-server"),
+                       ("lines_sql", "28-sql-engine"),
+                       ("lines_json", "13-json-parser")):
+        with open(os.path.join(ROOT, "ProjectGold", where, "main.gr")) as fh:
+            f[key] = fh.read().count("\n")
+    f["apps"] = len(glob.glob(os.path.join(ROOT, "apps", "*", "grasm.toml")))
+    f["examples"] = len(glob.glob(os.path.join(ROOT, "examples", "*.gr")))
+    f.update(cited())
+    f.update(derived(f))
+    f.update(scorecard())
 
     # Icons travel the same substitution path as the figures, so a page can
     # name one and the build fails if it does not exist.
@@ -108,6 +144,112 @@ def facts():
         for k in MEASURED:
             f.setdefault(k, "—")
     return f
+
+
+# A figure some document in this repository recorded, read out of that document
+# rather than retyped here. A measurement belongs where it was taken -- the
+# north-star scorecard and the size record are written by whoever took the
+# reading -- and the site reads it from there. If a record changes shape the
+# pattern stops matching and the build fails naming it, which is the failure
+# mode a retyped number does not have: that one just goes quietly stale.
+CITED = [
+    ("geomean", "docs/northstar.md", r"\| G2 \|[^|]*\|[^|]*\| \*\*([0-9.]+)×\*\*"),
+    ("geomean_floor", "docs/northstar.md", r"and \*\*([0-9.]+)×\*\* with the process floor"),
+    ("locs_low", "docs/northstar.md", r"\*\*([0-9]+)–[0-9]+k\*\* across consecutive runs"),
+    ("locs_high", "docs/northstar.md", r"\*\*[0-9]+–([0-9]+)k\*\* across consecutive runs"),
+    ("incr_p50", "docs/northstar.md", r"\*\*p50 ([0-9]+) ms, p95 [0-9]+ ms\*\*"),
+    ("incr_p95", "docs/northstar.md", r"\*\*p50 [0-9]+ ms, p95 ([0-9]+) ms\*\*"),
+    ("hello_kb", "docs/northstar.md", r"\*\*met, ([0-9.]+) KB on [0-9-]+\*\*"),
+    ("hello_date", "docs/northstar.md", r"\*\*met, [0-9.]+ KB on ([0-9-]+)\*\*"),
+    ("hello_was", "docs/northstar.md", r"It was ([0-9.]+) KB, of which"),
+    ("tasks", "docs/northstar.md", r"\*\*([0-9,]+) tasks run in [0-9]+ s\*\*"),
+    ("tasks_s", "docs/northstar.md", r"\*\*[0-9,]+ tasks run in ([0-9]+) s\*\*"),
+    ("tasks_was", "docs/northstar.md", r"([0-9,]+) tasks took [0-9]+ s"),
+    ("tasks_was_s", "docs/northstar.md", r"[0-9,]+ tasks took ([0-9]+) s"),
+    ("interp_tasks", "docs/northstar.md",
+     r"interpreter stops near ([0-9]{1,3}(?:,[0-9]{3})*)"),
+    ("tokens_py", "docs/northstar.md", r"\| Tokens vs Python \|[^|]*\| \*\*([0-9.]+)×\*\*"),
+    ("tokens_go", "docs/northstar.md", r"\| Tokens vs Go \|[^|]*\| \*\*([0-9.]+)×\*\*"),
+    ("replay_builtins", "docs/northstar.md", r"All \*\*([0-9]+)\*\* journaled builtins"),
+    ("leak_programs", "docs/binary-size.md", r"\| .leakcheck. \| ([0-9]+) programs"),
+    ("use_programs", "docs/binary-size.md", r"\| .usecheck.[^|]*\| ([0-9]+) programs"),
+    ("cross_total", "docs/binary-size.md", r"\| .crosstest. x86_64 \| ([0-9]+) programs"),
+    ("cross_pass", "docs/binary-size.md", r"\*\*([0-9]+) pass, 0 real failures"),
+    ("unittests", "docs/binary-size.md", r"\| unit tests \| every crate \| ([0-9]+) pass"),
+    ("difftest", "docs/binary-size.md", r"\| difftest / corpus comparison \| ([0-9]+) programs"),
+    ("linux_lines", "docs/binary-size.md", r"roughly ([0-9,]+) lines of .cfg\(not\(macos\)\)."),
+    ("tree_ratio", "docs/northstar.md", r"`tree` at ([0-9.]+)\u00d7 is what the geomean"),
+    ("geomean_was", "docs/northstar.md", r"geometric mean is ([0-9.]+)\u00d7 behind"),
+    ("symbolizer_kb", "docs/northstar.md", r"about ([0-9]+) KB was Rust's own backtrace"),
+    ("etl_grasm_ms", "benchmarks/systems/RESULTS.md",
+     r"\| etl \(1 GiB\) \| wall ms \| ([0-9,]+)"),
+    ("etl_rust_ms", "benchmarks/systems/RESULTS.md",
+     r"\| etl \(1 GiB\) \| wall ms \| [0-9,]+ \| \*\*([0-9,]+)\*\*"),
+    ("chat_rss", "benchmarks/systems/RESULTS.md",
+     r"\| chat \| peak RSS MB \| \*\*([0-9.]+)\*\*"),
+    ("chat_rss_rust", "benchmarks/systems/RESULTS.md",
+     r"\| chat \| peak RSS MB \| \*\*[0-9.]+\*\* \| ([0-9.]+)"),
+]
+
+
+def derived(f):
+    """Ratios the site states, divided here rather than on the page.
+
+    A ratio typed into prose outlives the two numbers it came from -- that is
+    what happened to the 21 ms benchmark artefact, which was published in three
+    places and corrected in one. These are computed from the cited figures, so
+    re-measuring either side moves the sentence.
+    """
+    def num(key):
+        return float(f[key].replace(",", ""))
+    return {
+        "etl_ratio": "{:.1f}".format(num("etl_grasm_ms") / num("etl_rust_ms")),
+        "chat_mem_ratio": "{:.0f}".format(num("chat_rss_rust") / num("chat_rss")),
+    }
+
+
+def cited():
+    """Each CITED figure, read from the document that recorded it."""
+    out = {}
+    for key, doc, pattern in CITED:
+        text = open(os.path.join(ROOT, doc)).read()
+        hit = re.search(pattern, text)
+        if not hit:
+            raise SystemExit(
+                f"{doc} no longer states the figure the site calls "
+                f"«{key}»: nothing matches {pattern!r}.\n"
+                "Either the record moved, and the pattern in scripts/site.py "
+                "wants fixing, or the measurement was dropped -- in which case "
+                "the page that states it has to go too."
+            )
+        out[key] = hit.group(1)
+    return out
+
+
+def scorecard():
+    """The scorecard's shape, counted from its own table.
+
+    A row is met, narrowly missed, or waiting on something no gate can supply.
+    "Nine of thirteen" is then a count of that table rather than a claim about
+    it, and a row that moves moves the summary with it.
+    """
+    rows = re.findall(
+        r"^\| (G[0-9]+) \| ([^|]+?) \| ([^|]+?) \| .* \| (.+?) \|$",
+        open(os.path.join(ROOT, "docs", "northstar.md")).read(), re.M)
+    if len(rows) < 10:
+        raise SystemExit("docs/northstar.md no longer has a scorecard table the "
+                         f"site can read: found {len(rows)} rows, expected 13")
+    met = over = blocked = 0
+    for _id, _goal, _target, verdict in rows:
+        plain = verdict.replace("*", "").strip().lower()
+        if plain.startswith("met") or plain.startswith("strongest"):
+            met += 1
+        elif "over" in plain:
+            over += 1
+        else:
+            blocked += 1
+    return {"goals_total": len(rows), "goals_met": met,
+            "goals_over": over, "goals_blocked": blocked}
 
 
 # What only a run can know. `scripts/allgates.sh` writes these.
@@ -216,12 +358,20 @@ def write(pages, check):
                 unknown.add(key)
                 return m.group(0)
             return str(known[key])
-        return re.sub(r"\u00ab([a-z_]+)\u00bb", one, text)
+        # Anything between the marks, not just a well-formed name. Twice now a
+        # placeholder has gone out unsubstituted because it fell outside a
+        # narrower class -- `incr_p95` for its digit, then a stray `\u00d7`
+        # inside the marks -- and in both cases the guard below said nothing,
+        # because it only ever saw the names this pattern had matched.
+        return re.sub(r"\u00ab([^\u00bb\n]{1,48})\u00bb", one, text)
 
     for href, title, _sec, _label in NAV:
         desc, body = pages[href]
+        # The description is substituted too. It was not, and a page's
+        # own `<meta>` sat two dozen clauses out of date where the body it
+        # described was right.
         html = PAGE.format(
-            title=title, desc=desc, page=href.replace(".html", ""),
+            title=title, desc=fill(desc), page=href.replace(".html", ""),
             markicon=icon("mark", 19), version=known.get("version", ""),
             rail=rail(href), body=fill(body)
         )

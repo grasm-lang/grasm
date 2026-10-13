@@ -3,7 +3,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Concurrency</title>
-<meta name="description" content="Deterministic task ordering, and effects that cross thread boundaries.">
+<meta name="description" content="Deterministic tasks, channels, actors, and the half of the goal that is still open.">
 <link rel="stylesheet" href="style.css">
 <script src="vendor/motion.js" defer></script>
 <script src="vendor/lottie.js" defer></script>
@@ -24,6 +24,7 @@
 <nav class="rail">
 <a class="mark" href="index.html"><b>grasm</b><span>a systems language</span></a>
 <h2>Start</h2>
+<a href="different.html">Why Grasm</a>
 <a href="start.html">Getting started</a>
 <a href="install.html">Install</a>
 <a href="playground.html">Playground</a>
@@ -44,6 +45,7 @@
 <a href="architecture.html">Architecture</a>
 <h2>More</h2>
 <a href="examples.html">Examples</a>
+<a href="achieved.html">Scorecard</a>
 <a href="about.html">About</a>
 <a href="status.html">Status</a>
 <a href="roadmap.html">Roadmap</a>
@@ -52,8 +54,12 @@
 
 <p class="eyebrow">Learn</p>
 <h1>Concurrency</h1>
-<p class="lede">Tasks run in the order they were spawned, the block joins before
-the line after it, and the effect row crosses the boundary with them.</p>
+<p class="lede">Two shapes, and they answer different questions.
+<code>parallel</code> runs a fixed set of jobs and joins; <code>concurrent</code>
+runs tasks that talk over channels, and 1,000,000 of them run in
+22 s on a compiled build. Both are deterministic: the same program
+prints the same bytes on every run and on every engine, which is the property
+the whole gate suite is built on.</p>
 
 <h2>parallel and spawn</h2><pre><code><span class="kw">fn</span> <span class="fn">main</span><span class="op">(</span><span class="op">)</span> <span class="op">/</span> <span class="op">{</span>io<span class="op">,</span> async<span class="op">}</span> <span class="op">{</span>
     <span class="kw">var</span> log <span class="op">=</span> <span class="st">""</span>
@@ -68,16 +74,100 @@ bodies run afterwards — which is what makes the order deterministic and the
 scope joined. A <code>spawn</code> body <em>sees</em> the enclosing scope rather
 than capturing it, which is the opposite of how a closure behaves and is
 documented as such.</p>
+<p>A compiled build uses several cores here only where that cannot be observed
+(<code>[E-NOT-PARALLEL]</code>): every task has to be <code>v = e</code> with
+<code>e</code> pure, each <code>v</code> its own and read by no other task. Four
+<code>fib(36)</code> tasks run on four workers; anything that could tell the
+difference runs in order instead. The language does not have a rule saying
+&ldquo;this is parallel&rdquo; — it has a rule saying parallelism may never
+change an answer.</p>
+
+<h2>concurrent, go and channels</h2><pre><code><span class="kw">fn</span> <span class="fn">main</span><span class="op">(</span><span class="op">)</span> <span class="op">/</span> <span class="op">{</span>io<span class="op">,</span> async<span class="op">}</span> <span class="op">{</span>
+    <span class="kw">let</span> ch <span class="op">=</span> <span class="fn">chan_new</span><span class="op">(</span><span class="nu">0</span><span class="op">)</span>            <span class="cm">// unbuffered: a send waits for a receive</span>
+    concurrent <span class="op">{</span>
+        go <span class="op">{</span>
+            <span class="kw">for</span> i <span class="kw">in</span> <span class="nu">0</span><span class="op">..</span><span class="nu">1000</span> <span class="op">{</span>
+                <span class="fn">chan_send</span><span class="op">(</span>ch<span class="op">,</span> i<span class="op">)</span>
+            <span class="op">}</span>
+            <span class="fn">chan_close</span><span class="op">(</span>ch<span class="op">)</span>
+        <span class="op">}</span>
+        go <span class="op">{</span>
+            <span class="kw">var</span> total <span class="op">=</span> <span class="nu">0</span>
+            <span class="kw">while</span> <span class="kw">true</span> <span class="op">{</span>
+                <span class="kw">match</span> <span class="fn">chan_recv</span><span class="op">(</span>ch<span class="op">)</span> <span class="op">{</span>
+                    <span class="ty">Some</span><span class="op">(</span>v<span class="op">)</span> <span class="op">-&gt;</span> total <span class="op">+=</span> v
+                    <span class="ty">None</span> <span class="op">-&gt;</span> <span class="kw">break</span>   <span class="cm">// drained, and closed</span>
+                <span class="op">}</span>
+            <span class="op">}</span>
+            <span class="fn">print</span><span class="op">(</span><span class="st">"{total}"</span><span class="op">)</span>
+        <span class="op">}</span>
+    <span class="op">}</span>
+<span class="op">}</span></code></pre>
+<p>A task sees its surroundings by value, as a closure does, and may not write a
+binding outside it or reach a <code>ref</code> from outside: <strong>tasks share
+nothing mutable</strong>. <code>chan_select(chs)</code> gives the index of the
+first channel a receive would not wait on, and waits until there is one.</p>
+
+<h3>Why the ordering is fixed, and what it cost to make it cheap</h3>
+<p>A task runs alone until it ends or a channel operation has to wait; then the
+next <em>runnable</em> task takes over. A send wakes the task that has waited
+longest for room, a receive wakes the one that has waited longest for a value,
+and closing wakes everything waiting on that channel
+(<code>[E-SCHEDULE]</code>). That is a total order, so the output is the same on
+every run.</p>
+<p>It was also quadratic until recently: the scheduler resumed every live task
+every round, so 40,000 tasks took 199 s. A wait
+queue per channel <em>and per side</em> — so a send wakes a receiver rather
+than another sender — made a round cost what is runnable rather than what is
+alive, and 1,000,000 tasks now run in 22 s.
+<a href="achieved.html">The measurement, and the fix that looked obvious and was
+worth nothing →</a></p>
+<p>The interpreter stops near 285,000 tasks and is allowed to: an
+interpreter frame costs about 10 KB where a compiled one costs 30 bytes, and
+<code>[E-RECURSION-DEPTH]</code> guarantees 10,000 nested calls to every frame
+it reserves.</p>
+
+<h2>Actors: shared state without a lock</h2><pre><code>actor <span class="ty">Counter</span><span class="op">(</span>start<span class="op">:</span> <span class="ty">i64</span><span class="op">)</span> <span class="op">{</span>
+    <span class="kw">var</span> n<span class="op">:</span> <span class="ty">i64</span> <span class="op">=</span> start
+    <span class="kw">fn</span> <span class="fn">bump</span><span class="op">(</span><span class="kw">inout</span> self<span class="op">)</span> <span class="op">{</span> self<span class="op">.</span>n <span class="op">+=</span> <span class="nu">1</span> <span class="op">}</span>
+    <span class="kw">fn</span> <span class="fn">read</span><span class="op">(</span><span class="kw">inout</span> self<span class="op">)</span> <span class="op">-&gt;</span> <span class="ty">i64</span> <span class="op">{</span> self<span class="op">.</span>n <span class="op">}</span>
+<span class="op">}</span></code></pre>
+<p>An actor is the one thing tasks may share. Every copy of the handle reaches
+the same state, which only its methods reach. A method may not perform
+<code>async</code>, so it runs to its end before another task runs —
+<strong>exclusive without a lock</strong>, by the effect row rather than by a
+mutex somebody has to remember to take.</p>
+
+<h2>Many conversations on one thread</h2>
+<p><code>net_wait(handles, ms)</code> returns the handles that can be read
+without waiting, which is what lets one thread hold many connections. Every
+other network call blocks, and a task does not carry <code>net</code>, so
+without it a server serves one client at a time.</p>
 
 <h2>Data-parallel methods</h2><pre><code><span class="kw">let</span> doubled <span class="op">=</span> xs<span class="op">.</span><span class="fn">par_map</span><span class="op">(</span><span class="op">|</span>v<span class="op">|</span> v <span class="op">*</span> <span class="nu">2</span><span class="op">)</span>
 <span class="kw">let</span> evens   <span class="op">=</span> xs<span class="op">.</span><span class="fn">par_filter</span><span class="op">(</span><span class="op">|</span>v<span class="op">|</span> v <span class="op">%</span> <span class="nu">2</span> <span class="op">==</span> <span class="nu">0</span><span class="op">)</span></code></pre>
-<p>Both preserve order, and both require the closure to be pure — which the
-effect system can prove rather than assume. A closure that prints will not
-typecheck here.</p>
+<p>Both keep input order, and both require the closure to be pure — which the
+effect system can <em>prove</em> rather than assume. A closure that prints will
+not typecheck here. Order-preserving means a <code>par_map</code> is
+interchangeable with a <code>map</code> in every observable way, including on
+one core, so the number of cores is never part of an answer. Measured at 3.68×
+on eight cores over boxed strings.</p>
 
-<div class="note"><b>What is missing.</b> There is no timer, channel or select
-library above these primitives yet. That is the async workstream on the
-<a href="roadmap.html">roadmap</a>.</div>
+<h2>Testing a schedule other than the one you got</h2>
+<p>A deterministic scheduler means the order you see is the order you always
+see, which is a problem of its own: a race that another order would expose
+never runs. <code>grasm test --schedules N</code> reruns a test under
+<em>N</em> other orders, each named by a seed that
+<code>--schedule-seed</code> replays, so a failure found that way is a failure
+you can get back.</p>
+
+<div class="note"><b>What is missing, and it is half of a north-star goal.</b>
+A task <strong>refuses every effect</strong>: it cannot read a file, open a
+socket or print. 1,000,000 tasks run, which is the count G6 asks for, and
+<em>uncolored</em> is the word in the goal that is not met — concurrency that
+cannot do I/O is not the thing the goal is about. There is also no async/await
+and no timer library. <a href="achieved.html">Where that sits on the
+scorecard →</a></div>
 
 <footer>
 Grasm — four engines, one answer. Every figure on this site is computed,

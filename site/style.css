@@ -443,6 +443,15 @@ footer a { color: var(--ink-2); }
 .bar-fill.hit { background: var(--forest); }
 .bar-fill.miss { background: #c9a227; }
 .bar-row .num { font-family: var(--mono); font-size: 12.4px; color: var(--ink-3); white-space: nowrap; }
+/* The scorecard's second line: which goal this is, and what it asks for. */
+.bar-row .goal {
+  display: block;
+  margin-top: 3px;
+  font-family: var(--mono);
+  font-size: 11.4px;
+  color: var(--ink-3);
+  letter-spacing: 0;
+}
 .bar-row .num.miss { color: var(--amber); }
 
 /* --------------------------------------------------------------- syntax page */

@@ -24,6 +24,7 @@
 <nav class="rail">
 <a class="mark" href="index.html"><b>grasm</b><span>a systems language</span></a>
 <h2>Start</h2>
+<a href="different.html">Why Grasm</a>
 <a href="start.html">Getting started</a>
 <a href="install.html">Install</a>
 <a href="playground.html">Playground</a>
@@ -44,6 +45,7 @@
 <a href="architecture.html">Architecture</a>
 <h2>More</h2>
 <a href="examples.html">Examples</a>
+<a href="achieved.html">Scorecard</a>
 <a href="about.html" aria-current="page">About</a>
 <a href="status.html">Status</a>
 <a href="roadmap.html">Roadmap</a>
@@ -54,7 +56,7 @@
 <h1>What this is, and what it is not.</h1>
 <p class="lede">Grasm is a systems language with an effect system, capability
 ceilings on packages, and tiered ownership without lifetime annotations. It is
-version 1.0.0, it has 650 libraries, and every one of them was
+version 1.0.0, it has 651 libraries, and every one of them was
 written inside this repository.</p>
 
 <h2>Nothing here was invented</h2>
@@ -83,17 +85,21 @@ together with gates that prove the combination holds.</p>
 <h2>Who should not use this</h2>
 <p>Most people, today. Specifically:</p>
 <ul>
-  <li><b>If you need libraries.</b> There are 650, all written here.
+  <li><b>If you need libraries.</b> There are 651, all written here.
   Python has hundreds of thousands.</li>
   <li><b>If you need speed.</b> Rust and Zig are faster, and
-  <a href="status.html">the numbers here</a> say by how much.</li>
+  <a href="achieved.html">the numbers here</a> say by how much: 0.965× of
+  Rust on the benchmark geomean, and a systems suite Grasm loses on time and
+  wins on memory.</li>
   <li><b>If you need to hire.</b> Nobody outside this repository has written
   Grasm.</li>
   <li><b>If you need a native debugger.</b> There is a Debug Adapter Protocol
   server, and it works against the interpreter. The Cranelift backend emits no
   DWARF, so GDB and LLDB cannot meaningfully inspect a compiled binary.</li>
-  <li><b>If you need async I/O.</b> There are threads and structured
-  concurrency, and no async/await.</li>
+  <li><b>If you need async I/O.</b> There are threads, channels, structured
+  concurrency and non-blocking I/O on a single thread — 1,000,000 tasks in
+  22 s — and no async/await. A task also refuses every effect, so the
+  concurrency you have is not the concurrency the plan asks for.</li>
 </ul>
 
 <h2>Who might</h2>
@@ -104,11 +110,11 @@ Python, and it is the one thing here that is not catching up to somebody
 else.</p>
 
 <h2>How it is built</h2>
-<p>250 normative clauses in 3546 lines of specification, under a
+<p>253 normative clauses in 3,556 lines of specification, under a
 hard ceiling — every addition since has been paid for by compressing prose
 already written. 167 clauses are <code>stable</code> and will not change
 incompatibly before 2.0; 26 are <code>provisional</code> and
-61 are <code>experimental</code>. Version 1.0 promoted nothing: a
+64 are <code>experimental</code>. Version 1.0 promoted nothing: a
 clause moves when it passes the five-part test, one at a time, on its own
 evidence.</p>
 

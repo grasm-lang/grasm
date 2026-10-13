@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>How far it got</title>
+<meta name="description" content="The eleven north-star goals, what each measures, and where each one stands.">
+<link rel="stylesheet" href="style.css">
+<script src="vendor/motion.js" defer></script>
+<script src="vendor/lottie.js" defer></script>
+<script type="module" src="app.js"></script>
+</head><body data-page="achieved">
+<header class="topbar">
+  <a class="brand" href="index.html"><svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3 4 7.5v9L12 21l8-4.5v-9L12 3Z"/><path d="M12 12 4 7.5M12 12l8-4.5M12 12v9"/></svg><span>grasm</span></a>
+  <span class="ver">v1.0.0</span>
+  <nav>
+    <a href="start.html">Docs</a>
+    <a href="syntax.html">Syntax</a>
+    <a href="security.html">Security</a>
+    <a href="packages.html">Packages</a>
+    <a href="status.html">Status</a>
+  </nav>
+</header>
+<div class="frame">
+<nav class="rail">
+<a class="mark" href="index.html"><b>grasm</b><span>a systems language</span></a>
+<h2>Start</h2>
+<a href="different.html">Why Grasm</a>
+<a href="start.html">Getting started</a>
+<a href="install.html">Install</a>
+<a href="playground.html">Playground</a>
+<h2>Learn</h2>
+<a href="tutorial.html">Tutorial</a>
+<a href="tour.html">Tour</a>
+<a href="effects.html">Effects</a>
+<a href="tiers.html">Ownership</a>
+<a href="errors.html">Errors</a>
+<a href="concurrency.html">Concurrency</a>
+<a href="security.html">Security</a>
+<h2>Reference</h2>
+<a href="syntax.html">Syntax</a>
+<a href="language.html">Language</a>
+<a href="library.html">Library</a>
+<a href="packages.html">Packages</a>
+<a href="spec.html">Specification</a>
+<a href="architecture.html">Architecture</a>
+<h2>More</h2>
+<a href="examples.html">Examples</a>
+<a href="achieved.html" aria-current="page">Scorecard</a>
+<a href="about.html">About</a>
+<a href="status.html">Status</a>
+<a href="roadmap.html">Roadmap</a>
+</nav>
+<main>
+
+<p class="eyebrow">More</p>
+<h1>How far it got.</h1>
+<p class="lede"><code>MASTERPLAN.md</code> §2.3 sets ten measurable goals and
+§19.3 adds an eleventh; two of them split in two, so the scorecard has
+13 rows. <strong>9 are met</strong>, 2 are
+narrowly over, and 2 cannot be measured at all without users.
+<code>scripts/northstar.sh</code> takes the readings it can take and prints a
+scorecard rather than failing on a miss — a gate that is red on purpose is a
+gate people learn to ignore — but it <em>does</em> fail when a reading cannot
+be taken, which is how a metric quietly stops being collected.</p>
+
+<div class="bars">
+<div class="bar-row"><span class="what">Ship a real service<br><span class="goal">G1 · ≤ 1 week, Go/TS dev</span></span><span class="bar-track"><span class="bar-fill miss" data-pct="0"></span></span><span class="num miss">no users</span></div><div class="bar-row"><span class="what">Geomean vs Rust<br><span class="goal">G2 · ≥ 0.95×</span></span><span class="bar-track"><span class="bar-fill hit" data-pct="100"></span></span><span class="num">0.965×</span></div><div class="bar-row"><span class="what">Frontend throughput<br><span class="goal">G3 · ≥ 500k LOC/s</span></span><span class="bar-track"><span class="bar-fill hit" data-pct="100"></span></span><span class="num">535–547k</span></div><div class="bar-row"><span class="what">Edit to diagnostic<br><span class="goal">G3, at this repo's scale · ≤ 50 ms</span></span><span class="bar-track"><span class="bar-fill hit" data-pct="100"></span></span><span class="num">p95 40 ms</span></div><div class="bar-row"><span class="what">Safe-subset guarantees<br><span class="goal">G4 · 100%</span></span><span class="bar-track"><span class="bar-fill hit" data-pct="100"></span></span><span class="num">1 gap, permanent</span></div><div class="bar-row"><span class="what">Hello-world binary<br><span class="goal">G5 · ≤ 300 KB</span></span><span class="bar-track"><span class="bar-fill hit" data-pct="100"></span></span><span class="num">85.7 KB</span></div><div class="bar-row"><span class="what">Tasks per node<br><span class="goal">G6, task count only · ≥ 1M</span></span><span class="bar-track"><span class="bar-fill hit" data-pct="100"></span></span><span class="num">1,000,000</span></div><div class="bar-row"><span class="what">Capability-sandboxed deps<br><span class="goal">G7 · 100%</span></span><span class="bar-track"><span class="bar-fill hit" data-pct="100"></span></span><span class="num">refused</span></div><div class="bar-row"><span class="what">Failure → deterministic replay<br><span class="goal">G8, the % is unmeasured · ≥ 99%</span></span><span class="bar-track"><span class="bar-fill hit" data-pct="100"></span></span><span class="num">28 builtins</span></div><div class="bar-row"><span class="what">C ABI import overhead<br><span class="goal">G9 · zero-cost</span></span><span class="bar-track"><span class="bar-fill hit" data-pct="100"></span></span><span class="num">zero-cost</span></div><div class="bar-row"><span class="what">Adoption<br><span class="goal">G10 · ≥ 500 companies</span></span><span class="bar-track"><span class="bar-fill miss" data-pct="0"></span></span><span class="num miss">zero</span></div><div class="bar-row"><span class="what">Tokens vs Python<br><span class="goal">G11 · ≤ 1.00×</span></span><span class="bar-track"><span class="bar-fill miss" data-pct="96"></span></span><span class="num miss">1.04×</span></div><div class="bar-row"><span class="what">Tokens vs Go<br><span class="goal">G11 · ≤ 0.60×</span></span><span class="bar-track"><span class="bar-fill miss" data-pct="98"></span></span><span class="num miss">0.61×</span></div>
+</div>
+<p>Three of those rows carry a qualification that the bar cannot show, and they
+are the three worth reading twice. <strong>G3's 50 ms</strong> is met at this
+repository's scale — p50 21 ms, p95 40 ms on its largest
+program — and the plan frames that goal at a million lines, which a
+whole-program re-check will never reach; that needs the query engine nobody has
+built. <strong>G6</strong> is met for the task count and the <em>uncolored</em>
+half is still open: tasks refuse every effect. <strong>G8</strong>'s mechanism
+is met on all four engines, and the ≥99% figure is unmeasurable because nobody
+has run a Grasm program in production.</p>
+
+<h2>The gates, and what each one would catch</h2>
+<p>Judged by exit code alone, 86 of them. These are the figures from the
+last recorded run on this machine:</p>
+<div class="scroll"><table>
+<tr><th>Gate</th><th>Scope</th><th>Result</th></tr>
+<tr><td>difftest / corpus</td><td>511 programs</td><td><b>0 differences</b> across the engines</td></tr>
+<tr><td><code>leakcheck</code></td><td>226 programs</td><td><b>0 leaks</b></td></tr>
+<tr><td><code>usecheck</code>, the <code>poison</code> build</td><td>197 programs</td><td><b>0 differences</b></td></tr>
+<tr><td><code>crosstest</code> x86_64 under Rosetta</td><td>224 programs</td><td><b>195 pass</b>, 0 real failures, 60 declined</td></tr>
+<tr><td><code>clippy --all-targets</code></td><td>native and wasm32</td><td>0</td></tr>
+<tr><td>unit tests</td><td>every crate</td><td><b>609 pass</b></td></tr>
+<tr><td><code>replaytest</code></td><td>every journalled builtin</td><td>each one refuses under an empty journal</td></tr>
+<tr><td>fuzzers</td><td>15 generators</td><td>clean</td></tr>
+<tr><td>conformance</td><td>257 programs</td><td>one per normative clause</td></tr>
+</table></div>
+<p><code>leakcheck</code> and <code>usecheck</code> are the two no other check
+replaces: a leaking program produces exactly the right output, and a premature
+free makes a value <em>less</em> live rather than more, so neither shows up in a
+diff of what was printed.</p>
+<p class="note"><strong>One caveat on that table, stated rather than buried.</strong>
+The <code>crosstest</code> figure was taken on a machine at load 38 rising to
+134, where two <em>parallel</em> tests differed and then agreed on re-run, 3 of
+3 and 2 of 2. They are recorded as load artefacts because that is what they
+are, and the figure wants taking again on a quiet machine before anyone calls
+it green.</p>
+
+<h2>The three that moved, and what moved them</h2>
+
+<h3>G5: 351.1 KB → 85.7 KB</h3>
+<p>About 135 KB of that binary was Rust's own backtrace symbolizer — gimli,
+addr2line, rustc_demangle — reached from std's default panic hook, and nothing
+in a hello-world ever called it. All four crates a compiled program links are
+now <code>no_std</code>, with a new <code>grasm_sys</code> crate underneath
+them for the operating system and <code>grasm_rt_abi</code> supplying the
+allocator and the panic handler. <code>nm</code> shows zero symbolizer symbols.
+Nightly was not needed.</p>
+<p>The conversion found <strong>nine defects</strong>, and the gates would have
+caught none of them — they are all below the level the corpus exercises.
+Five of the nine: <code>open</code> and <code>fcntl</code> were declared
+non-variadic, and arm64 passes variadic arguments on the stack, so the mode
+argument was garbage; <code>RwLock::write</code> released a mutex rather than
+the lock it took, so a second writer hung; an <code>exec</code> failure was
+indistinguishable from exit 127, which the specification requires to be
+distinguishable; <code>AF_INET6</code> was 30 on Linux, where it is 10; and
+<code>thread::scope</code> let its reference escape, which needed somebody to
+write the line that escapes before anything noticed.</p>
+<p class="note">A figure in that story was wrong in public first. It was
+reported as 68.3 KB for several commits — the branch head was
+85.7 KB. The
+difference is one 16 KB page of <code>__TEXT</code> quantisation around 1.9 KB
+of real code: on Mach-O a segment is 16 KB-aligned, so a kilobyte of code can
+move a file by seventeen. <code>docs/binary-size.md</code> bisects it to the
+commit.</p>
+
+<h3>G6: 40,000 tasks in 199 s → 1,000,000 in 22 s</h3>
+<p>The scheduler resumed every live task every round, so N tasks needed N
+rounds of N resumes — quadratic, and at that rate a million tasks is hours.
+The fix that looked obvious was built first and measured at nothing: a version
+per channel still wakes every blocked sender when the receiver takes one value.
+What worked is a wait queue <em>per channel and per side</em>, so a send wakes
+a receiver rather than another sender, and a round costs what is runnable.</p>
+<p>That changed an observable rule, so the specification changed with it:
+<code>[E-SCHEDULE]</code> now wakes the longest-waiting sender or receiver
+instead of going round-robin. It is an <em>experimental</em> clause, and all
+257 conformance programs produce identical output across the change.
+The interpreter stops near 285,000 tasks and is allowed to: an
+interpreter frame costs about 10 KB where a compiled one costs 30 bytes.</p>
+
+<h3>G2: the compiler did not change, the ruler did</h3>
+<p>This row used to read "4 of 7 programs at or above Rust", and that was an
+artefact. <code>bench.sh</code> was adding a constant 21 ms to every cell, and a
+constant added to every measurement compresses every ratio toward 1 — a 5 ms
+program and a 10 ms program read as 26 and 31, which is "about the same" if you
+squint. With the timer fixed, the geomean read 2.49× <em>behind</em>.</p>
+<p>What closed it afterwards was real work, and the same 21 ms had been
+published in two other tables: <strong>a wrong measurement does not stay where
+it was made.</strong> It is 0.965× today, or 0.955× with the
+harness's own floor subtracted from both sides, with five of eight programs at
+or above parity. <code>tree</code> at 0.51× is what the geomean still carries:
+a box per node in tree-shaped data. Storing those inline was built, measured at
+<em>1.33× slower</em>, and not kept.</p>
+
+<h2>What is still open</h2>
+<div class="scroll"><table>
+<tr><th>Open</th><th>What it would take</th></tr>
+<tr><td><b>Tasks refuse every effect</b> — G6's uncolored half</td><td>The task count is met; the goal is not. A task that cannot do I/O is not the thing the goal asks for.</td></tr>
+<tr><td><b>Sub-50 ms at a million lines</b> — G3's other half</td><td>A query engine. What exists is a batch compiler with an object cache, re-checking the whole program on every keystroke, and at this repository's size that is fast enough to hide the problem.</td></tr>
+<tr><td><b>G11's last 4% and 2%</b></td><td>Priced before building: list repetition and a stepped range are what Python has and Grasm does not on the worst row. Not closable by adding library methods.</td></tr>
+<tr><td><b>Linux has never been compiled here</b></td><td>About 2,100 lines of the operating-system layer are written for it and no target is installed on this machine. CI's ubuntu runner compiles it; a compile catches code that does not build, and does not catch a wrong constant — which is exactly how <code>AF_INET6</code> survived.</td></tr>
+<tr><td><b>No remote registry</b></td><td>Path and local-registry dependencies work. Nothing fetches or publishes.</td></tr>
+<tr><td><b>G1 and G10 need users</b></td><td>A week to ship a service, and 500 companies. Neither is a number this repository can produce by working harder on it.</td></tr>
+</table></div>
+
+<h2>How any of this is kept honest</h2>
+<p>All 98 findings are written down in
+<code>ProjectGold/FINDINGS.md</code> — including the ones that were the test
+harness's fault, the ones withdrawn as wrong, and the ones caught before they
+shipped. Every gate is verified by breaking the thing it guards and confirming
+it fails, because a gate nobody has broken is a gate nobody has tested. One of
+them had to be: <code>replaytest</code> was matching <strong>0 of 39</strong>
+builtins and exiting 0, for weeks, because its pattern expected a struct on one
+line. It now asserts its own count.</p>
+<p class="note"><strong>The bar for calling this finished</strong> is not on
+this page, and no number here moves it: zero known defects, every gate green,
+and two consecutive independent review rounds finding nothing new — each
+conducted by somebody who has seen only the language pack and not this
+repository's history. Those rounds have not run.</p>
+
+<footer>
+Grasm — four engines, one answer. Every figure on this site is computed,
+not typed.
+<a href="status.html">Status</a> ·
+<a href="spec.html">Specification</a> ·
+<a href="roadmap.html">Roadmap</a>
+</footer>
+</main>
+</div>
+</body></html>

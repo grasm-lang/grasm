@@ -24,6 +24,7 @@
 <nav class="rail">
 <a class="mark" href="index.html"><b>grasm</b><span>a systems language</span></a>
 <h2>Start</h2>
+<a href="different.html">Why Grasm</a>
 <a href="start.html">Getting started</a>
 <a href="install.html">Install</a>
 <a href="playground.html">Playground</a>
@@ -44,6 +45,7 @@
 <a href="architecture.html" aria-current="page">Architecture</a>
 <h2>More</h2>
 <a href="examples.html">Examples</a>
+<a href="achieved.html">Scorecard</a>
 <a href="about.html">About</a>
 <a href="status.html">Status</a>
 <a href="roadmap.html">Roadmap</a>
@@ -64,8 +66,28 @@ three have to match it.</p>
   <tr><td>Interpreter</td><td><code>grasm_interp</code></td><td>The normative answer.</td></tr>
   <tr><td>Native backend</td><td><code>grasm_native</code></td><td>Cranelift IR, then an object file.</td></tr>
   <tr><td>Runtime</td><td><code>grasm_rt</code></td><td>Reference-counted boxed values with copy-on-write.</td></tr>
+  <tr><td>Operating system</td><td><code>grasm_sys</code></td><td>Threads, thread-locals, locks, files, sockets, subprocesses, float maths. Raw syscalls and libc; no <code>std</code>.</td></tr>
+  <tr><td>Program ABI</td><td><code>grasm_rt_abi</code></td><td>The <code>#[global_allocator]</code> and <code>#[panic_handler]</code> a linked program needs, and nothing else.</td></tr>
+  <tr><td>Fibers</td><td><code>grasm_fiber</code></td><td>The stack switch a lightweight task runs on.</td></tr>
   <tr><td>Wasm</td><td><code>grasm_wasm</code></td><td>The interpreter, compiled for <code>wasm32</code>.</td></tr>
 </table>
+
+<h2>Why a compiled program links no standard library</h2>
+<p>A hello-world was 351.1 KB, and about 135 KB of it was
+Rust's own backtrace symbolizer — a DWARF reader, pulled in by
+<code>std</code>'s default panic hook, which a hello-world never calls. All four
+crates a compiled program links are <code>no_std</code> now, which is what
+<code>grasm_sys</code> exists for: every operating-system facility the runtime
+needs, over raw syscalls and libc rather than over <code>std</code>. A
+hello-world is 85.7 KB, and <code>nm</code> shows zero symbolizer
+symbols.</p>
+<p>Two consequences worth stating, because they are constraints rather than
+wins. A <code>#[panic_handler]</code> returns <code>!</code>, so a
+<code>no_std</code> crate cannot unwind — <code>panic = "abort"</code> is not a
+preference here, it is the only option. And the operating-system layer is now
+code this project owns and must get right: the conversion found nine defects,
+<a href="achieved.html">listed on the scorecard</a>, of which the gates on this
+page would have caught none.</p>
 
 <h2>Why the checker hands types to the backend</h2>
 <p>It did not, once. The backend re-derived them — roughly 950 lines of a

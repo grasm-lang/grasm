@@ -24,6 +24,7 @@
 <nav class="rail">
 <a class="mark" href="index.html"><b>grasm</b><span>a systems language</span></a>
 <h2>Start</h2>
+<a href="different.html">Why Grasm</a>
 <a href="start.html">Getting started</a>
 <a href="install.html">Install</a>
 <a href="playground.html">Playground</a>
@@ -44,6 +45,7 @@
 <a href="architecture.html">Architecture</a>
 <h2>More</h2>
 <a href="examples.html">Examples</a>
+<a href="achieved.html">Scorecard</a>
 <a href="about.html">About</a>
 <a href="status.html">Status</a>
 <a href="roadmap.html">Roadmap</a>
@@ -194,7 +196,45 @@
 <span class="op">}</span></code></pre>
 <p><code>self</code> is the value the method is called on, and <code>Self</code> in an interface means "the implementing type". The method is chosen by the receiver's type, so <code>Point</code> and <code>i64</code> can each have a <code>show</code>.</p>
 <p>The bound is checked where the function is written, not where it is used: <code>x.show()</code> in a function declared <code>[T]</code> rather than <code>[T: Show]</code> is an error even if every caller happens to pass something showable. And a call with a type that has no <code>impl</code> is refused at that call, by name — "<code>Dog</code> does not implement <code>Show</code>" — rather than somewhere inside the generic function.</p>
-<p>Two limits for now, both refused with a message: an <code>impl</code> is for a declared non-generic type or for <code>i64</code>, <code>f64</code>, <code>bool</code> or <code>str</code>; and an interface method performs no effects, so an <code>impl</code> method cannot print. The second is what lets a generic function's own effect row stay honest without knowing which <code>impl</code> it will reach.</p>
+<p>An interface method may declare an effect row, and then its implementations may perform it:</p>
+<pre><code><span class="kw">interface</span> <span class="ty">Sink</span> <span class="op">{</span>
+    <span class="kw">fn</span> <span class="fn">emit</span><span class="op">(</span>self<span class="op">,</span> line<span class="op">:</span> <span class="ty">str</span><span class="op">)</span> <span class="op">/</span> <span class="op">{</span>io<span class="op">}</span>
+<span class="op">}</span>
+
+<span class="kw">fn</span> send_all<span class="op">[</span><span class="ty">T</span><span class="op">:</span> <span class="ty">Sink</span><span class="op">]</span><span class="op">(</span>s<span class="op">:</span> <span class="ty">T</span><span class="op">,</span> xs<span class="op">:</span> <span class="op">[</span><span class="ty">str</span><span class="op">]</span><span class="op">)</span> <span class="op">/</span> <span class="op">{</span>io<span class="op">}</span> <span class="op">{</span>
+    <span class="kw">for</span> x <span class="kw">in</span> xs <span class="op">{</span>
+        s<span class="op">.</span><span class="fn">emit</span><span class="op">(</span>x<span class="op">)</span>
+    <span class="op">}</span>
+<span class="op">}</span></code></pre>
+<p><code>send_all</code> has to declare <code>io</code> itself, because a call through a bound performs whatever the <em>interface</em> said — which is how a generic function's row stays honest without knowing which <code>impl</code> it will reach. An <code>impl</code> may not declare more than its interface does, so nothing can smuggle an effect past a package's capabilities. An interface method with no row performs nothing.</p>
+<p>An <code>impl</code> is for a <em>shape</em>, and may introduce its own bounded parameters:</p>
+<pre><code><span class="kw">interface</span> <span class="ty">Show</span> <span class="op">{</span>
+    <span class="kw">fn</span> <span class="fn">show</span><span class="op">(</span>self<span class="op">)</span> <span class="op">-&gt;</span> <span class="ty">str</span>
+<span class="op">}</span>
+
+<span class="kw">impl</span> <span class="ty">Show</span> <span class="kw">for</span> <span class="ty">i64</span> <span class="op">{</span>
+    <span class="kw">fn</span> <span class="fn">show</span><span class="op">(</span>self<span class="op">)</span> <span class="op">-&gt;</span> <span class="ty">str</span> <span class="op">{</span>
+        <span class="st">"{self}"</span>
+    <span class="op">}</span>
+<span class="op">}</span>
+
+<span class="kw">impl</span><span class="op">[</span><span class="ty">T</span><span class="op">:</span> <span class="ty">Show</span><span class="op">]</span> <span class="ty">Show</span> <span class="kw">for</span> <span class="op">[</span><span class="ty">T</span><span class="op">]</span> <span class="op">{</span>
+    <span class="kw">fn</span> <span class="fn">show</span><span class="op">(</span>self<span class="op">)</span> <span class="op">-&gt;</span> <span class="ty">str</span> <span class="op">{</span>
+        <span class="kw">var</span> out <span class="op">=</span> <span class="st">"["</span>
+        <span class="kw">var</span> first <span class="op">=</span> <span class="kw">true</span>
+        <span class="kw">for</span> v <span class="kw">in</span> self <span class="op">{</span>
+            <span class="kw">if</span> <span class="kw">not</span> first <span class="op">{</span> out <span class="op">=</span> out <span class="op">+</span> <span class="st">", "</span> <span class="op">}</span>
+            out <span class="op">=</span> out <span class="op">+</span> v<span class="op">.</span><span class="fn">show</span><span class="op">(</span><span class="op">)</span>
+            first <span class="op">=</span> <span class="kw">false</span>
+        <span class="op">}</span>
+        out <span class="op">+</span> <span class="st">"]"</span>
+    <span class="op">}</span>
+<span class="op">}</span>
+
+<span class="kw">fn</span> <span class="fn">main</span><span class="op">(</span><span class="op">)</span> <span class="op">/</span> <span class="op">{</span>io<span class="op">}</span> <span class="op">{</span>
+    <span class="fn">print</span><span class="op">(</span><span class="op">[</span><span class="op">[</span><span class="nu">1</span><span class="op">,</span> <span class="nu">2</span><span class="op">]</span><span class="op">,</span> <span class="op">[</span><span class="nu">3</span><span class="op">]</span><span class="op">]</span><span class="op">.</span><span class="fn">show</span><span class="op">(</span><span class="op">)</span><span class="op">)</span>
+<span class="op">}</span></code></pre>
+<p>One <code>impl</code> then serves <code>[i64]</code>, <code>[Point]</code> and <code>[[i64]]</code> alike -- the last satisfies the bound through this very <code>impl</code>. A declared generic type is a shape too (<code>impl[A: Show] Show for Pair[A]</code>), and takes the parameters it was declared with. Each shape has one <code>impl</code> of each interface, so no two can overlap and there is never a question of which one runs.</p>
 <h2 id="4-errors-are-values">4. Errors are values</h2>
 <p>There are no exceptions. A function that can fail says so in its type with <code>! E</code>, raises with <code>fail</code>, and callers propagate with <code>try</code>.</p>
 <pre><code><span class="kw">fn</span> <span class="fn">divide</span><span class="op">(</span>a<span class="op">:</span> <span class="ty">i64</span><span class="op">,</span> b<span class="op">:</span> <span class="ty">i64</span><span class="op">)</span> <span class="op">-&gt;</span> <span class="ty">i64</span> <span class="op">!</span> <span class="ty">str</span> <span class="op">{</span>

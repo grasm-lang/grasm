@@ -1,0 +1,199 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>What makes it different</title>
+<meta name="description" content="What Grasm does that Python, Go, Rust and Zig do not.">
+<link rel="stylesheet" href="style.css">
+<script src="vendor/motion.js" defer></script>
+<script src="vendor/lottie.js" defer></script>
+<script type="module" src="app.js"></script>
+</head><body data-page="different">
+<header class="topbar">
+  <a class="brand" href="index.html"><svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3 4 7.5v9L12 21l8-4.5v-9L12 3Z"/><path d="M12 12 4 7.5M12 12l8-4.5M12 12v9"/></svg><span>grasm</span></a>
+  <span class="ver">v1.0.0</span>
+  <nav>
+    <a href="start.html">Docs</a>
+    <a href="syntax.html">Syntax</a>
+    <a href="security.html">Security</a>
+    <a href="packages.html">Packages</a>
+    <a href="status.html">Status</a>
+  </nav>
+</header>
+<div class="frame">
+<nav class="rail">
+<a class="mark" href="index.html"><b>grasm</b><span>a systems language</span></a>
+<h2>Start</h2>
+<a href="different.html" aria-current="page">Why Grasm</a>
+<a href="start.html">Getting started</a>
+<a href="install.html">Install</a>
+<a href="playground.html">Playground</a>
+<h2>Learn</h2>
+<a href="tutorial.html">Tutorial</a>
+<a href="tour.html">Tour</a>
+<a href="effects.html">Effects</a>
+<a href="tiers.html">Ownership</a>
+<a href="errors.html">Errors</a>
+<a href="concurrency.html">Concurrency</a>
+<a href="security.html">Security</a>
+<h2>Reference</h2>
+<a href="syntax.html">Syntax</a>
+<a href="language.html">Language</a>
+<a href="library.html">Library</a>
+<a href="packages.html">Packages</a>
+<a href="spec.html">Specification</a>
+<a href="architecture.html">Architecture</a>
+<h2>More</h2>
+<a href="examples.html">Examples</a>
+<a href="achieved.html">Scorecard</a>
+<a href="about.html">About</a>
+<a href="status.html">Status</a>
+<a href="roadmap.html">Roadmap</a>
+</nav>
+<main>
+
+<p class="eyebrow">Start</p>
+<h1>One of these is not catching up to anybody.</h1>
+<p class="lede">Most of Grasm is a careful assembly of ideas that already
+exist — <a href="about.html">the table on the About page names every one and
+where it came from</a>. This page is the short list of things you cannot get
+from the four languages a working programmer would otherwise reach for, and
+each entry says what checks it.</p>
+
+<h2>1. A dependency cannot reach further than its manifest</h2>
+<p>This is the reason the language exists, and it is the only entry here that
+is not available elsewhere in some form. A package writes down the effects it
+may perform. The compiler infers what the code <em>actually</em> does, through
+every call and into every dependency, and refuses to build when the two
+disagree — in the package, and in every consumer of it.</p>
+<figure class="code"><pre><code><span class="op">[</span>package<span class="op">]</span>
+name <span class="op">=</span> <span class="st">"mathlib"</span>
+
+capabilities <span class="op">=</span> <span class="op">[</span><span class="op">]</span>          # reaches nothing at all</code></pre><figcaption>mathlib/grasm.toml — the ceiling, in one line a reviewer can see.</figcaption></figure>
+<p>A trusted pure library ships a patch release that starts reading
+<code>/etc/passwd</code>. Same name, same signature, same return value.
+<code>scripts/security_bench.sh</code> runs that tamper against four toolchains
+on every green build:</p>
+<div class="verdicts"><div class="verdict-row" data-result="refused"><span class="lang"><svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m4 12 5 5L20 6"/></svg>Grasm</span><span class="out">COMPILE ERROR</span><span class="why">inferred effects (io) exceed the declared ceiling ([])</span></div><div class="verdict-row" data-result="clean"><span class="lang"><svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg>Rust</span><span class="out">builds clean</span><span class="why">std::fs is ambient; no capability is recorded</span></div><div class="verdict-row" data-result="clean"><span class="lang"><svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg>Go</span><span class="out">builds clean</span><span class="why">os.ReadFile is importable by any package</span></div><div class="verdict-row" data-result="clean"><span class="lang"><svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg>Python</span><span class="out">compiles clean</span><span class="why">open() needs no import and no declaration</span></div></div><div class="actions"><button class="btn ghost" data-run-verdicts>Run it again</button></div>
+<p>Three of them ship it. Everywhere else the answer is a runtime sandbox or a
+human reading the diff; here it is a type error, before anything runs.</p>
+<p>The test of whether that is a real design or only a mechanism is how much of
+the library set can live under it. Of 651 libraries,
+<strong>555 declare no capability at all</strong> — they
+compute and nothing else — and only 96 ask for any.
+A library that joins paths, formats a date, parses JSON, hashes a password or
+validates a schema acquires no reach by doing so. Of the ones that do ask,
+87 ask for <code>io</code> and 17 for <code>net</code>
+— some for both — and <strong>1 for
+<code>unsafe</code></strong>: one
+library in 651 may call into C at all, and which one is a line in
+a manifest rather than a thing you have to go and find out.
+<a href="security.html">How it works →</a></p>
+
+<h2>2. The effect row is inferred, so a signature cannot lie</h2>
+<p>You do not write the row after <code>/</code>. The compiler works it out
+from the body and checks it against whatever was declared, so a function that
+starts touching the network stops compiling — and so does every caller that
+was not given the same permission. A declaration you have to maintain by hand
+is a declaration that drifts; this one cannot.</p>
+<figure class="code"><pre><code><span class="kw">fn</span> <span class="fn">safe_div</span><span class="op">(</span>a<span class="op">:</span> <span class="ty">i64</span><span class="op">,</span> b<span class="op">:</span> <span class="ty">i64</span><span class="op">)</span> <span class="op">-&gt;</span> <span class="ty">i64</span> <span class="op">!</span> <span class="ty">MathError</span> <span class="op">{</span>
+    <span class="kw">if</span> b <span class="op">==</span> <span class="nu">0</span> <span class="op">{</span>
+        <span class="fn">fail</span><span class="op">(</span><span class="ty">DivByZero</span><span class="op">)</span>
+    <span class="op">}</span>
+    a <span class="op">/</span> b
+<span class="op">}</span>
+
+<span class="kw">fn</span> <span class="fn">load</span><span class="op">(</span>path<span class="op">:</span> <span class="ty">str</span><span class="op">)</span> <span class="op">-&gt;</span> <span class="ty">str</span> <span class="op">!</span> <span class="ty">IoError</span> <span class="op">/</span> <span class="op">{</span>io<span class="op">}</span> <span class="op">{</span>
+    <span class="kw">try</span> <span class="fn">read_file</span><span class="op">(</span>path<span class="op">)</span>
+<span class="op">}</span></code></pre><figcaption>! MathError is a failure the caller must handle. / {io} is a permission the caller must have.</figcaption></figure>
+<h2>3. Four engines, and one of them is the referee</h2>
+<p>A language with one implementation and a test suite can only ask "did the
+output change". Grasm has four engines — interpreter, bundle, ahead-of-time
+native, and wasm — and the interpreter is <em>normative</em>: the specification
+is written against it and the other three have to match it byte for byte on
+stdout, exit code and diagnostics.</p>
+<p>That turns a test suite into an oracle. 511 corpus programs run
+through the interpreter, the bundle and the native build and are compared on
+every build. 394 of them also run in the browser engine
+— 84 are skipped, because they want a filesystem, a socket, a
+process or threads — and 224 are compiled for x86_64, linked
+with <code>cc -arch x86_64</code> and <strong>run under Rosetta</strong>, which
+reaches code the arm64 build never does: <code>readdir$INODE64</code> exists
+only there, and x86_64 passes variadic arguments in registers where arm64 puts
+them on the stack. A defect does not have to be predicted to be caught — it
+only has to make two engines disagree.</p>
+<div class="viz">
+  <canvas id="engines" data-programs="511"
+    aria-label="Programs flowing through four engines to one answer"></canvas>
+  <div class="cap">difftest · crosstest · wasmtest — 511 programs, 0 mismatched</div>
+</div>
+
+<h2>4. A run recorded in production replays in a browser</h2>
+<p><code>GRASM_RECORD</code> writes a journal of everything a run read from
+outside itself. <code>GRASM_REPLAY</code> hands it back, and the replaying run
+reaches outside itself for <strong>nothing</strong> — not the reads, and not
+the writes. All 28 journalled builtins, on all four engines:
+the whole <code>io</code>, <code>net</code> and <code>proc</code> surface bar
+<code>print</code>, which is repeated on purpose.</p>
+<p>The part that is unusual: a journal recorded by the <em>native</em> build
+replays byte-identically <em>inside a wasm module that has no sockets, no
+processes and no filesystem</em> — TCP session and child process included.
+<code>scripts/replaytest.sh</code> additionally runs each of those builtins
+under an empty journal and requires it to refuse, so a builtin that quietly
+stopped being recorded fails the build.</p>
+
+<h2>5. Ownership in tiers, and no lifetime annotations anywhere</h2>
+<p>Four ways to own a value, chosen per value rather than per language. Value
+semantics by default; <code>region</code> when a scope should own its
+allocations; <code>ref</code> — a generational reference — when a graph needs
+one; <code>unsafe</code> where the guarantees stop, named in the source so a
+grep finds every place they do.</p>
+<p>No <code>'a</code>, no borrow checker to argue with, and no garbage
+collector either. <a href="tiers.html">The four tiers →</a></p>
+
+<h2>6. The specification is normative, and every clause has a program</h2>
+<p>253 normative clauses in 3,556 lines, under a hard ceiling —
+every addition since has been paid for by compressing prose already written —
+and 257 programs in <code>spec/conformance</code>, so a clause is
+not a sentence about intent but a file that fails. 167 clauses are
+<code>stable</code> and will not change incompatibly before 2.0;
+26 are <code>provisional</code> and 64 are
+<code>experimental</code>, and a clause moves between those levels one at a
+time, on its own evidence.</p>
+
+<h2>7. A hello-world is 85.7 KB, on a stable toolchain</h2>
+<p>It was 351.1 KB, of which about 135 KB was Rust's own backtrace
+symbolizer, reached from the default panic hook. All four crates a compiled
+program links are now <code>no_std</code>; <code>nm</code> shows zero
+symbolizer symbols; no nightly compiler is involved.
+<a href="achieved.html">The nine defects that came out of that conversion →</a></p>
+
+<h2>What this does not buy you</h2>
+<p>The same list is on the <a href="about.html">About</a> and
+<a href="status.html">Status</a> pages, because it belongs next to every claim
+above and not only at the end of the site.</p>
+<div class="scroll"><table>
+<tr><th>If you need</th><th>Then</th></tr>
+<tr><td>Libraries</td><td>There are 651, and every one was written inside this repository. Python has hundreds of thousands.</td></tr>
+<tr><td>To be faster than Rust</td><td>You will not be. The geomean is 0.965× of Rust on the benchmark suite, and <em>no benchmark here claims a win over it</em>. On the systems suite Grasm loses <code>etl</code> by 3.6×, is at throughput parity on <code>proxy</code> and last on its tail, and wins memory everywhere — 8× on <code>chat</code>, which is 8.4 MB against Rust's 69.4.</td></tr>
+<tr><td>To hire</td><td>Nobody outside this repository has written Grasm.</td></tr>
+<tr><td>A native debugger</td><td>There is a DAP server and it works against the interpreter. The Cranelift backend emits no DWARF, so GDB and LLDB cannot meaningfully inspect a compiled binary.</td></tr>
+<tr><td>async/await</td><td>There are threads, channels, structured concurrency and non-blocking I/O on one thread. There is no async/await, and tasks still refuse every effect.</td></tr>
+<tr><td>Linux, today</td><td>CI compiles it. This machine never has: about 2,100 lines of the operating-system layer are written for Linux and have not been built here, let alone run.</td></tr>
+</table></div>
+
+<p class="note"><strong>The one-line version.</strong> Everywhere else, the
+boundary between your code and a dependency you did not read is enforced at run
+time, by a sandbox, or not at all. Here it is enforced by the type checker, and
+there are four engines that agree on what that means.</p>
+
+<footer>
+Grasm — four engines, one answer. Every figure on this site is computed,
+not typed.
+<a href="status.html">Status</a> ·
+<a href="spec.html">Specification</a> ·
+<a href="roadmap.html">Roadmap</a>
+</footer>
+</main>
+</div>
+</body></html>

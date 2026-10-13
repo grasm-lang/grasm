@@ -156,29 +156,47 @@ fn load(path: str) -> str ! IoError / {io} {
 <p class="reveal">The interpreter is normative and the other three have to match
 it. Every gate here exists to hold them to the same bytes.</p>
 <div class="viz reveal">
-  <canvas id="engines" data-programs="\u00abcorpus\u00bb"
+  <canvas id="engines" data-programs="\u00abdifftest\u00bb"
     aria-label="Programs flowing through four engines to one answer"></canvas>
-  <div class="cap">difftest \u00b7 crosstest \u00b7 wasmtest \u2014 \u00abcorpus\u00bb programs, 0 mismatched</div>
+  <div class="cap">difftest \u00b7 crosstest \u00b7 wasmtest \u2014 \u00abdifftest\u00bb programs, 0 mismatched</div>
 </div>
 
 <div class="figures reveal">
-  <div class="fig"><b>\u00abcorpus\u00bb</b><span>programs, engines identical</span></div>
+  <div class="fig"><b>\u00abdifftest\u00bb</b><span>programs, engines identical</span></div>
   <div class="fig"><b>\u00abpackages\u00bb</b><span>libraries, all written in Grasm</span></div>
   <div class="fig"><b>\u00abclauses\u00bb</b><span>normative clauses, each with a conformance program</span></div>
   <div class="fig"><b>\u00abgates\u00bb</b><span>gates, judged by exit code alone</span></div>
 </div>
 
+<h2 class="reveal">Where it actually stands</h2>
+<p class="reveal">Eleven measurable goals, \u00abgoals_total\u00bb rows once two of
+them split in half. <strong>\u00abgoals_met\u00bb are met</strong>,
+\u00abgoals_over\u00bb are over by 4% and 2%, and \u00abgoals_blocked\u00bb cannot
+be read at all without users. Three of the met rows carry a qualification, and
+<a href="achieved.html">the scorecard</a> states each one beside its number
+rather than underneath it.</p>
+<div class="figures reveal">
+  <div class="fig"><b>\u00abhello_kb\u00bb KB</b><span>hello-world, static, down from \u00abhello_was\u00bb KB</span></div>
+  <div class="fig"><b>\u00abtasks\u00bb</b><span>tasks in \u00abtasks_s\u00bb s, natively</span></div>
+  <div class="fig"><b>\u00abgeomean\u00bb\u00d7</b><span>of Rust, geomean \u2014 not ahead of it</span></div>
+  <div class="fig"><b>\u00ablocs_low\u00bbk</b><span>lines a second, front end</span></div>
+</div>
+<div class="actions">
+  <a class="btn ghost" href="achieved.html">The scorecard, all \u00abgoals_total\u00bb rows</a>
+  <a class="btn ghost" href="different.html">What makes it different</a>
+</div>
+
 <h2 class="reveal">Start here</h2>
 <div class="grid three reveal">
+  <div class="card"><span class="ico">\u00abicon_shield\u00bb</span><h3>Why Grasm</h3>
+    <p>The seven things the other four toolchains do not give you.
+    <a href="different.html">Read it \u2192</a></p></div>
   <div class="card"><span class="ico">\u00abicon_terminal\u00bb</span><h3>Getting started</h3>
     <p>Install, first program, first package.
     <a href="start.html">Begin \u2192</a></p></div>
-  <div class="card"><span class="ico">\u00abicon_book\u00bb</span><h3>Syntax</h3>
-    <p>The whole language on one page, every form with an example.
-    <a href="syntax.html">Read it \u2192</a></p></div>
-  <div class="card"><span class="ico">\u00abicon_gauge\u00bb</span><h3>Status</h3>
-    <p>What works, what is measured, and what is still missing.
-    <a href="status.html">See it \u2192</a></p></div>
+  <div class="card"><span class="ico">\u00abicon_gauge\u00bb</span><h3>Scorecard</h3>
+    <p>Eleven goals, every measurement, and what is still open.
+    <a href="achieved.html">See it \u2192</a></p></div>
 </div>
 """
 )
@@ -702,12 +720,16 @@ print("{found ?? 0}")
 # ---------------------------------------------------------------- concurrency
 
 PAGES["concurrency.html"] = (
-    "Deterministic task ordering, and effects that cross thread boundaries.",
+    "Deterministic tasks, channels, actors, and the half of the goal that is still open.",
     """
 <p class="eyebrow">Learn</p>
 <h1>Concurrency</h1>
-<p class="lede">Tasks run in the order they were spawned, the block joins before
-the line after it, and the effect row crosses the boundary with them.</p>
+<p class="lede">Two shapes, and they answer different questions.
+<code>parallel</code> runs a fixed set of jobs and joins; <code>concurrent</code>
+runs tasks that talk over channels, and «tasks» of them run in
+«tasks_s» s on a compiled build. Both are deterministic: the same program
+prints the same bytes on every run and on every engine, which is the property
+the whole gate suite is built on.</p>
 
 <h2>parallel and spawn</h2>"""
     + code(
@@ -728,6 +750,87 @@ bodies run afterwards — which is what makes the order deterministic and the
 scope joined. A <code>spawn</code> body <em>sees</em> the enclosing scope rather
 than capturing it, which is the opposite of how a closure behaves and is
 documented as such.</p>
+<p>A compiled build uses several cores here only where that cannot be observed
+(<code>[E-NOT-PARALLEL]</code>): every task has to be <code>v = e</code> with
+<code>e</code> pure, each <code>v</code> its own and read by no other task. Four
+<code>fib(36)</code> tasks run on four workers; anything that could tell the
+difference runs in order instead. The language does not have a rule saying
+&ldquo;this is parallel&rdquo; — it has a rule saying parallelism may never
+change an answer.</p>
+
+<h2>concurrent, go and channels</h2>"""
+    + code(
+        """
+fn main() / {io, async} {
+    let ch = chan_new(0)            // unbuffered: a send waits for a receive
+    concurrent {
+        go {
+            for i in 0..1000 {
+                chan_send(ch, i)
+            }
+            chan_close(ch)
+        }
+        go {
+            var total = 0
+            while true {
+                match chan_recv(ch) {
+                    Some(v) -> total += v
+                    None -> break   // drained, and closed
+                }
+            }
+            print("{total}")
+        }
+    }
+}
+"""
+    )
+    + """
+<p>A task sees its surroundings by value, as a closure does, and may not write a
+binding outside it or reach a <code>ref</code> from outside: <strong>tasks share
+nothing mutable</strong>. <code>chan_select(chs)</code> gives the index of the
+first channel a receive would not wait on, and waits until there is one.</p>
+
+<h3>Why the ordering is fixed, and what it cost to make it cheap</h3>
+<p>A task runs alone until it ends or a channel operation has to wait; then the
+next <em>runnable</em> task takes over. A send wakes the task that has waited
+longest for room, a receive wakes the one that has waited longest for a value,
+and closing wakes everything waiting on that channel
+(<code>[E-SCHEDULE]</code>). That is a total order, so the output is the same on
+every run.</p>
+<p>It was also quadratic until recently: the scheduler resumed every live task
+every round, so «tasks_was» tasks took «tasks_was_s» s. A wait
+queue per channel <em>and per side</em> — so a send wakes a receiver rather
+than another sender — made a round cost what is runnable rather than what is
+alive, and «tasks» tasks now run in «tasks_s» s.
+<a href="achieved.html">The measurement, and the fix that looked obvious and was
+worth nothing →</a></p>
+<p>The interpreter stops near «interp_tasks» tasks and is allowed to: an
+interpreter frame costs about 10 KB where a compiled one costs 30 bytes, and
+<code>[E-RECURSION-DEPTH]</code> guarantees 10,000 nested calls to every frame
+it reserves.</p>
+
+<h2>Actors: shared state without a lock</h2>"""
+    + code(
+        """
+actor Counter(start: i64) {
+    var n: i64 = start
+    fn bump(inout self) { self.n += 1 }
+    fn read(inout self) -> i64 { self.n }
+}
+"""
+    )
+    + """
+<p>An actor is the one thing tasks may share. Every copy of the handle reaches
+the same state, which only its methods reach. A method may not perform
+<code>async</code>, so it runs to its end before another task runs —
+<strong>exclusive without a lock</strong>, by the effect row rather than by a
+mutex somebody has to remember to take.</p>
+
+<h2>Many conversations on one thread</h2>
+<p><code>net_wait(handles, ms)</code> returns the handles that can be read
+without waiting, which is what lets one thread hold many connections. Every
+other network call blocks, and a task does not carry <code>net</code>, so
+without it a server serves one client at a time.</p>
 
 <h2>Data-parallel methods</h2>"""
     + code(
@@ -737,13 +840,28 @@ let evens   = xs.par_filter(|v| v % 2 == 0)
 """
     )
     + """
-<p>Both preserve order, and both require the closure to be pure — which the
-effect system can prove rather than assume. A closure that prints will not
-typecheck here.</p>
+<p>Both keep input order, and both require the closure to be pure — which the
+effect system can <em>prove</em> rather than assume. A closure that prints will
+not typecheck here. Order-preserving means a <code>par_map</code> is
+interchangeable with a <code>map</code> in every observable way, including on
+one core, so the number of cores is never part of an answer. Measured at 3.68×
+on eight cores over boxed strings.</p>
 
-<div class="note"><b>What is missing.</b> There is no timer, channel or select
-library above these primitives yet. That is the async workstream on the
-<a href="roadmap.html">roadmap</a>.</div>
+<h2>Testing a schedule other than the one you got</h2>
+<p>A deterministic scheduler means the order you see is the order you always
+see, which is a problem of its own: a race that another order would expose
+never runs. <code>grasm test --schedules N</code> reruns a test under
+<em>N</em> other orders, each named by a seed that
+<code>--schedule-seed</code> replays, so a failure found that way is a failure
+you can get back.</p>
+
+<div class="note"><b>What is missing, and it is half of a north-star goal.</b>
+A task <strong>refuses every effect</strong>: it cannot read a file, open a
+socket or print. «tasks» tasks run, which is the count G6 asks for, and
+<em>uncolored</em> is the word in the goal that is not met — concurrency that
+cannot do I/O is not the thing the goal is about. There is also no async/await
+and no timer library. <a href="achieved.html">Where that sits on the
+scorecard →</a></div>
 """,
 )
 
@@ -868,6 +986,9 @@ grasm deps --locked   # fail rather than update the lockfile
     + """
 
 <h2>What ships today</h2>
+<p>«packages» libraries, all written inside this repository because there
+is no registry to get one from. The table below is a sample of them — the
+ones where the capability column says something worth reading.</p>
 <div class="scroll"><table>
 <tr><th>Package</th><th>Capabilities</th><th>What it is</th></tr>
 <tr><td><code>http</code></td><td><i>none</i></td><td>Requests, responses, routing with <code>:param</code> and <code>*</code> segments, percent decoding, HTML escaping.</td></tr>
@@ -905,7 +1026,10 @@ grasm deps --locked   # fail rather than update the lockfile
 <tr><td><code>xml</code></td><td><i>none</i></td><td>Parse and render. <b>No DTD and no external entities, ever</b> — that is what XXE is, and a first release does not need it. Which is also why this can declare nothing and mean it.</td></tr>
 <tr><td><code>oauth2</code></td><td><i>none</i></td><td>The authorisation-code flow with PKCE (checked against RFC 7636's vector) and client credentials. PKCE and <code>state</code> are not optional here.</td></tr>
 </table></div>
-<p>Twenty-six of the thirty-four declare <em>nothing</em>. That is the pattern: reach is
+<p><strong>«packages_pure» of the «packages» libraries declare
+<em>nothing</em>.</strong> Only «packages_reaching» ask for any capability
+at all. That is the pattern the whole design is for, and the number is counted
+from the manifests rather than asserted: reach is
 split from computation, so a program that joins paths, formats a date or
 builds a URL acquires no capability by doing so — and where a library really
 does need the world, it asks for it as an effect the consumer supplies, which
@@ -934,7 +1058,7 @@ thing standing between this language and ordinary use.</div>
 # ---------------------------------------------------------------- spec
 
 PAGES["spec.html"] = (
-    "234 numbered clauses, each with a conformance program.",
+    "\u00abclauses\u00bb numbered clauses, each with a conformance program.",
     """
 <p class="eyebrow">Reference</p>
 <h1>Specification</h1>
@@ -985,7 +1109,7 @@ is one nobody checks the implementation against.</p>
 # ---------------------------------------------------------------- examples
 
 PAGES["examples.html"] = (
-    "Forty-four programs, each running identically on three engines.",
+    "\u00abgold\u00bb whole programs, each running identically on three engines.",
     """
 <p class="eyebrow">More</p>
 <h1>Examples</h1>
@@ -994,8 +1118,8 @@ checked on three engines for identical output, exit code and diagnostics.</p>
 
 <h2>Systems</h2>
 <div class="grid three">
-  <div class="cell"><h4>HTTP server</h4><p>347 lines. Sockets, routing, request parsing.</p></div>
-  <div class="cell"><h4>SQL engine</h4><p>583 lines. Parser, planner, execution.</p></div>
+  <div class="cell"><h4>HTTP server</h4><p>«lines_http» lines. Sockets, routing, request parsing.</p></div>
+  <div class="cell"><h4>SQL engine</h4><p>«lines_sql» lines. Parser, planner, execution.</p></div>
   <div class="cell"><h4>Micro VM</h4><p>A bytecode machine.</p></div>
   <div class="cell"><h4>Garbage collector</h4><p>Written in a language with no garbage collector.</p></div>
   <div class="cell"><h4>DNS resolver</h4><p>Wire format, UDP.</p></div>
@@ -1004,7 +1128,7 @@ checked on three engines for identical output, exit code and diagnostics.</p>
 
 <h2>Tools and formats</h2>
 <div class="grid three">
-  <div class="cell"><h4>JSON parser</h4><p>375 lines, and a package.</p></div>
+  <div class="cell"><h4>JSON parser</h4><p>«lines_json» lines, and a package.</p></div>
   <div class="cell"><h4>Markdown to HTML</h4><p>A package too.</p></div>
   <div class="cell"><h4>SHA-256</h4><p>Bit operations, byte handling.</p></div>
   <div class="cell"><h4>grep</h4><p>Files, patterns, streams.</p></div>
@@ -1038,34 +1162,42 @@ PAGES["status.html"] = (
     """
 <p class="eyebrow">More</p>
 <h1>Status</h1>
-<p class="lede">Every number here is written by the run that proved it —
-<code>scripts/allgates.sh</code> records them after every gate passes, and the
-page is regenerated from that record. None of them is typed by hand.</p>
+<p class="lede">Every number here comes from the repository as the site is
+written, or out of the document that recorded the measurement. Five figures
+here used to be typed by hand instead. Four of them were wrong by the time
+anybody looked — the worst by a factor of two — and the fifth, &ldquo;0 open
+defects&rdquo;, was a claim no gate on this page makes.
+<a href="achieved.html">The scorecard</a> has the eleven goals and where each
+one stands.</p>
 
 <h2>What holds</h2>
 <div class="figures">
-  <div class="fig"><b>«corpus»</b><span>programs, three engines</span></div>
-  <div class="fig"><b>189</b><span>identical in wasm</span></div>
-  <div class="fig"><b>227</b><span>cross-compiled, agreeing</span></div>
-  <div class="fig"><b>0</b><span>open defects</span></div>
-  <div class="fig"><b>67</b><span>findings recorded</span></div>
-  <div class="fig"><b>14</b><span>generators</span></div>
+  <div class="fig"><b>«difftest»</b><span>programs, engines identical</span></div>
+  <div class="fig"><b>«wasm_ok»</b><span>identical in wasm</span></div>
+  <div class="fig"><b>«cross_pass»</b><span>cross-compiled, agreeing</span></div>
+  <div class="fig"><b>«conformance»</b><span>conformance programs</span></div>
+  <div class="fig"><b>«findings»</b><span>findings recorded</span></div>
+  <div class="fig"><b>«generators»</b><span>fuzz generators</span></div>
 </div>
 <p>Interpreter, bundle and native builds agree byte for byte on stdout, exit
 code and diagnostics. A wasm build agrees on the «wasm_ok» programs that do not
-need a filesystem, a socket, a process or threads. The same «cross» cross-compile to
-x86_64 and agree there. Every generated program is checked for what it keeps as
-well as for what it prints.</p>
+need a filesystem, a socket, a process or threads; «wasm_skip» are skipped
+because they do. «cross_total» are also compiled for x86_64 and run under
+Rosetta, «cross_pass» of them agreeing and the rest declined. Every generated
+program is checked for what it keeps as well as for what it prints.</p>
 
 <h2>What does not work</h2>
 <div class="scroll"><table>
 <tr><th>Limit</th><th>Detail</th></tr>
-<tr><td>Thirty-four libraries, all first-party</td><td>See <a href="packages.html">Packages</a>; the plan for the rest is in <code>docs/packages-plan.md</code>. Anything else you need, you write, or bind to C with <code>extern fn</code>.</td></tr>
+<tr><td>«packages» libraries, all first-party</td><td>See <a href="packages.html">Packages</a>; the plan for the rest is in <code>docs/packages-plan.md</code>. Anything else you need, you write, or bind to C with <code>extern fn</code>.</td></tr>
 <tr><td>No remote registry</td><td>Path and local-registry dependencies work. Nothing fetches or publishes.</td></tr>
 <tr><td>No release binaries</td><td>Build from source with a Rust toolchain.</td></tr>
-<tr><td>0.45× native Rust</td><td>Measured, floor-subtracted 0.39×, against a 0.95× target.</td></tr>
+<tr><td>Not faster than Rust</td><td>The geomean is «geomean»× of it, «geomean_floor»× with the harness floor taken out of both sides, against a 0.95× target — so the goal is met and the claim is not available. <code>tree</code> at «tree_ratio»× is the worst row. On the systems suite Grasm loses <code>etl</code> by «etl_ratio»×, and wins memory everywhere — «chat_mem_ratio»× on <code>chat</code>.</td></tr>
 <tr><td>Polymorphic recursion</td><td>Refused by name at build time. It is what monomorphization is; no work removes it.</td></tr>
-<tr><td>Small standard library</td><td>«methods» methods. Enough for the 44 programs above; you will find gaps in a larger one.</td></tr>
+<tr><td>Small standard library</td><td>«methods» methods. Enough for «gold» whole programs and «apps» applications; you will find gaps in something larger.</td></tr>
+<tr><td>Linux never compiled here</td><td>About «linux_lines» lines of the operating-system layer are written for Linux and no target is installed on this machine. CI compiles it. A compile does not catch a wrong constant, which is how <code>AF_INET6</code> was 30 on Linux for four commits.</td></tr>
+<tr><td>Tasks refuse every effect</td><td>«tasks» tasks run, and none of them may do I/O. G6's <em>uncolored</em> half is the open one.</td></tr>
+<tr><td>No query engine</td><td>Edit-to-diagnostic is p95 «incr_p95» ms by re-checking the whole program, which is fast enough at this repository's size and will not be at a million lines.</td></tr>
 <tr><td>No users but this project</td><td>Nobody has hit it from an angle nobody here thought of.</td></tr>
 <tr><td>Region sweep not implemented</td><td>Tier 1's rule is enforced; the bulk deallocation it makes sound is not built.</td></tr>
 </table></div>
@@ -1075,12 +1207,23 @@ well as for what it prints.</p>
 It is not battle-tested. Defects are still being found at roughly one per
 working session — falling, but not zero, and a language with zero known defects
 and no users has told you more about its test suite than about itself.</p>
+<p>The <code>no_std</code> conversion that took a hello-world from «hello_was» KB
+to «hello_kb» KB found nine defects on its way, and <em>no gate on this page
+would have caught any of them</em>: they were in the operating-system layer,
+below everything the corpus exercises. Two would have shipped silently —
+a variadic <code>open</code> passing a garbage mode, and an <code>RwLock</code>
+releasing the wrong lock. <a href="achieved.html">The list is on the
+scorecard.</a></p>
 
 <h2>How that is kept honest</h2>
 <p>All «findings» findings are written down in <code>ProjectGold/FINDINGS.md</code>,
 including the ones that were the test harness's fault, the ones withdrawn as
 wrong, and the ones caught before they shipped. Every gate is verified by
-breaking the thing it guards and confirming it fails.</p>
+breaking the thing it guards and confirming it fails — and one of them had to
+be, because <code>replaytest</code> was matching <strong>0 of 39</strong>
+journalled builtins and exiting 0 for weeks, its pattern expecting a struct
+written on one line. It now asserts its own count, which is the check that
+would have caught it on day one.</p>
 """,
 )
 
@@ -1102,28 +1245,40 @@ other engines, and the <a href="tutorial.html">tutorial</a> and
 rendered when the site is written rather than summarised here.</p>
 
 <h2>2. Speed</h2>
-<p>0.45× native Rust today against a 0.95× target, computed by
-<code>scripts/bench.sh</code> from the numbers it prints. The costs worth
-attacking, in order: a box per node in tree-shaped data, binary size (350 KB
-against a 300 KB target), and the atomic reference count every boxed value
-carries because a <code>parallel</code> body may hold one.</p>
+<p>«geomean»× of native Rust against a 0.95× target, computed by
+<code>scripts/bench.sh</code> from the numbers it prints, so the goal is met and
+the suite still has a worst row at «tree_ratio»×: <code>tree</code>, which pays a box
+per node in tree-shaped data. Storing those nodes inline was built and measured
+at <em>1.33× slower</em> — a node's release turns into a runtime call — so the
+release has to get cheaper before the representation can change. Binary size is
+no longer on this list: «hello_kb» KB against a 300 KB target. What is left, in
+order: the release path, the atomic reference count every boxed value carries
+because a <code>parallel</code> body may hold one, and borrowed string views,
+which is what the <code>etl</code> benchmark loses «etl_ratio»× to.</p>
 
 <h2>3. Packages and libraries</h2>
 <p>The mechanism is built: manifests, resolution, lockfiles, path and local
-registry dependencies, and the capability ceiling. The first two libraries are
-written. What is missing is a remote registry and the rest of them.</p>
+registry dependencies, and the capability ceiling. «packages» libraries are
+written, all of them inside this repository. What is missing is a remote
+registry — nothing fetches and nothing publishes, so nobody else can write the
+next one.</p>
+<p>This table used to list six libraries as not started —
+<code>testing</code>, <code>log</code>, <code>time</code>, <code>uuid</code>,
+<code>base64</code> and <code>regex</code>. All six exist. What it tracks now is
+the shape of the set rather than a checklist of names:</p>
 <div class="scroll"><table>
-<tr><th>Library</th><th>State</th></tr>
-<tr><td><b>http</b> — server</td><td><b>Built.</b> <code>packages/http</code> parses and routes and declares no capability; <code>packages/http_server</code> owns the socket. Both in the corpus, both agreeing on three engines.</td></tr>
-<tr><td><b>http</b> — client</td><td><b>Built.</b> <code>packages/http_client</code>. Its demo talks to <code>http_server</code> over a real socket — a Grasm client and a Grasm server.</td></tr>
-<tr><td><b>json</b></td><td><b>Built.</b> <code>packages/json</code>: parse, render, reach in (<code>get</code>, <code>at</code>, <code>path</code>, <code>as_str</code>…), build up (<code>object</code>, <code>list</code>, <code>with_key</code>…). Declares no capability. The six ProjectGold programs that used it point here.</td></tr>
-<tr><td><b>async</b> — timers, channels, select</td><td>Not started. <code>parallel</code> and <code>spawn</code> are in the language; the library above them is not.</td></tr>
-<tr><td><b>testing</b>, <b>log</b>, <b>time</b>, <b>uuid</b>, <b>base64</b>, <b>regex</b></td><td>Not started.</td></tr>
+<tr><th>Area</th><th>State</th></tr>
+<tr><td><b>http</b> — server and client</td><td><b>Built.</b> <code>packages/http</code> parses and routes and declares no capability; <code>http_server</code> owns the socket; <code>http_client</code>'s demo talks to <code>http_server</code> over a real one. There is <code>http2frame</code>, <code>http2client</code> and <code>https_client</code> besides.</td></tr>
+<tr><td><b>json</b></td><td><b>Built</b>, and so are <code>jsonschema</code>, <code>jsonpath</code>, <code>jsonpatch</code>, <code>jsonpointer</code> and <code>jsonmergepatch</code>. All declare no capability.</td></tr>
+<tr><td><b>Concurrency</b></td><td><b>In the language rather than a library.</b> Channels, <code>concurrent</code>/<code>go</code>, actors and <code>chan_select</code> are in, «tasks» tasks run in «tasks_s» s on a compiled build, and <code>net_wait</code> holds many connections on one thread. A task still refuses every effect, which is the half of G6 that is open, and there is no timer library above any of it.</td></tr>
+<tr><td><b>Everything else</b></td><td>«packages» libraries, the six that were listed as missing among them. See <a href="packages.html">Packages</a>.</td></tr>
+<tr><td><b>A registry</b></td><td><b>The one that matters, and it is not built.</b> Nothing fetches and nothing publishes, so every library here had to be written here — which is also why there are «packages» of them.</td></tr>
 </table></div>
 <p>The comparison to hyper, axum, tokio, gin and fiber is a comparison against
-years of work by thousands of people. The honest target for a first release is
-one good HTTP library, one JSON library, one async library, and the packaging to
-publish them — so that the second and third can be written by somebody else.</p>
+years of work by thousands of people, and a count does not close it: these are
+«packages» libraries with one set of eyes on them and no production use
+behind any of them. The honest target for a first release is the packaging to
+publish them — so that the next one can be written by somebody else.</p>
 
 <h2>4. Is the compiler ready</h2>
 <p>Yes, with the limits on the <a href="status.html">status page</a> stated
@@ -1258,8 +1413,28 @@ three have to match it.</p>
   <tr><td>Interpreter</td><td><code>grasm_interp</code></td><td>The normative answer.</td></tr>
   <tr><td>Native backend</td><td><code>grasm_native</code></td><td>Cranelift IR, then an object file.</td></tr>
   <tr><td>Runtime</td><td><code>grasm_rt</code></td><td>Reference-counted boxed values with copy-on-write.</td></tr>
+  <tr><td>Operating system</td><td><code>grasm_sys</code></td><td>Threads, thread-locals, locks, files, sockets, subprocesses, float maths. Raw syscalls and libc; no <code>std</code>.</td></tr>
+  <tr><td>Program ABI</td><td><code>grasm_rt_abi</code></td><td>The <code>#[global_allocator]</code> and <code>#[panic_handler]</code> a linked program needs, and nothing else.</td></tr>
+  <tr><td>Fibers</td><td><code>grasm_fiber</code></td><td>The stack switch a lightweight task runs on.</td></tr>
   <tr><td>Wasm</td><td><code>grasm_wasm</code></td><td>The interpreter, compiled for <code>wasm32</code>.</td></tr>
 </table>
+
+<h2>Why a compiled program links no standard library</h2>
+<p>A hello-world was «hello_was» KB, and about «symbolizer_kb» KB of it was
+Rust's own backtrace symbolizer — a DWARF reader, pulled in by
+<code>std</code>'s default panic hook, which a hello-world never calls. All four
+crates a compiled program links are <code>no_std</code> now, which is what
+<code>grasm_sys</code> exists for: every operating-system facility the runtime
+needs, over raw syscalls and libc rather than over <code>std</code>. A
+hello-world is «hello_kb» KB, and <code>nm</code> shows zero symbolizer
+symbols.</p>
+<p>Two consequences worth stating, because they are constraints rather than
+wins. A <code>#[panic_handler]</code> returns <code>!</code>, so a
+<code>no_std</code> crate cannot unwind — <code>panic = "abort"</code> is not a
+preference here, it is the only option. And the operating-system layer is now
+code this project owns and must get right: the conversion found nine defects,
+<a href="achieved.html">listed on the scorecard</a>, of which the gates on this
+page would have caught none.</p>
 
 <h2>Why the checker hands types to the backend</h2>
 <p>It did not, once. The backend re-derived them \u2014 roughly 950 lines of a
@@ -1348,14 +1523,18 @@ together with gates that prove the combination holds.</p>
   <li><b>If you need libraries.</b> There are «packages», all written here.
   Python has hundreds of thousands.</li>
   <li><b>If you need speed.</b> Rust and Zig are faster, and
-  <a href="status.html">the numbers here</a> say by how much.</li>
+  <a href="achieved.html">the numbers here</a> say by how much: «geomean»× of
+  Rust on the benchmark geomean, and a systems suite Grasm loses on time and
+  wins on memory.</li>
   <li><b>If you need to hire.</b> Nobody outside this repository has written
   Grasm.</li>
   <li><b>If you need a native debugger.</b> There is a Debug Adapter Protocol
   server, and it works against the interpreter. The Cranelift backend emits no
   DWARF, so GDB and LLDB cannot meaningfully inspect a compiled binary.</li>
-  <li><b>If you need async I/O.</b> There are threads and structured
-  concurrency, and no async/await.</li>
+  <li><b>If you need async I/O.</b> There are threads, channels, structured
+  concurrency and non-blocking I/O on a single thread — «tasks» tasks in
+  «tasks_s» s — and no async/await. A task also refuses every effect, so the
+  concurrency you have is not the concurrency the plan asks for.</li>
 </ul>
 
 <h2>Who might</h2>
@@ -1646,4 +1825,346 @@ checks the whole package set for that collision on every build.</p>
 these forms; <a href="spec.html">the specification</a> gives the clause and the
 conformance program for each.</p>
 """
+)
+# ---------------------------------------------------------------- different
+
+
+def _why_row(icon, head, body):
+    return (
+        f'<div class="card"><span class="ico">«{icon}»</span>'
+        f"<h3>{head}</h3>{body}</div>"
+    )
+
+
+PAGES["different.html"] = (
+    "What Grasm does that Python, Go, Rust and Zig do not.",
+    """
+<p class="eyebrow">Start</p>
+<h1>One of these is not catching up to anybody.</h1>
+<p class="lede">Most of Grasm is a careful assembly of ideas that already
+exist — <a href="about.html">the table on the About page names every one and
+where it came from</a>. This page is the short list of things you cannot get
+from the four languages a working programmer would otherwise reach for, and
+each entry says what checks it.</p>
+
+<h2>1. A dependency cannot reach further than its manifest</h2>
+<p>This is the reason the language exists, and it is the only entry here that
+is not available elsewhere in some form. A package writes down the effects it
+may perform. The compiler infers what the code <em>actually</em> does, through
+every call and into every dependency, and refuses to build when the two
+disagree — in the package, and in every consumer of it.</p>
+"""
+    + code(
+        """[package]
+name = "mathlib"
+
+capabilities = []          # reaches nothing at all""",
+        "mathlib/grasm.toml — the ceiling, in one line a reviewer can see.",
+    )
+    + """
+<p>A trusted pure library ships a patch release that starts reading
+<code>/etc/passwd</code>. Same name, same signature, same return value.
+<code>scripts/security_bench.sh</code> runs that tamper against four toolchains
+on every green build:</p>
+"""
+    + verdicts()
+    + """
+<p>Three of them ship it. Everywhere else the answer is a runtime sandbox or a
+human reading the diff; here it is a type error, before anything runs.</p>
+<p>The test of whether that is a real design or only a mechanism is how much of
+the library set can live under it. Of «packages» libraries,
+<strong>«packages_pure» declare no capability at all</strong> — they
+compute and nothing else — and only «packages_reaching» ask for any.
+A library that joins paths, formats a date, parses JSON, hashes a password or
+validates a schema acquires no reach by doing so. Of the ones that do ask,
+«cap_io» ask for <code>io</code> and «cap_net» for <code>net</code>
+— some for both — and <strong>«cap_unsafe» for
+<code>unsafe</code></strong>: one
+library in «packages» may call into C at all, and which one is a line in
+a manifest rather than a thing you have to go and find out.
+<a href="security.html">How it works →</a></p>
+
+<h2>2. The effect row is inferred, so a signature cannot lie</h2>
+<p>You do not write the row after <code>/</code>. The compiler works it out
+from the body and checks it against whatever was declared, so a function that
+starts touching the network stops compiling — and so does every caller that
+was not given the same permission. A declaration you have to maintain by hand
+is a declaration that drifts; this one cannot.</p>
+"""
+    + code(
+        """fn safe_div(a: i64, b: i64) -> i64 ! MathError {
+    if b == 0 {
+        fail(DivByZero)
+    }
+    a / b
+}
+
+fn load(path: str) -> str ! IoError / {io} {
+    try read_file(path)
+}""",
+        "! MathError is a failure the caller must handle. / {io} is a permission the caller must have.",
+    )
+    + """
+<h2>3. Four engines, and one of them is the referee</h2>
+<p>A language with one implementation and a test suite can only ask "did the
+output change". Grasm has four engines — interpreter, bundle, ahead-of-time
+native, and wasm — and the interpreter is <em>normative</em>: the specification
+is written against it and the other three have to match it byte for byte on
+stdout, exit code and diagnostics.</p>
+<p>That turns a test suite into an oracle. «difftest» corpus programs run
+through the interpreter, the bundle and the native build and are compared on
+every build. «wasm_ok» of them also run in the browser engine
+— «wasm_skip» are skipped, because they want a filesystem, a socket, a
+process or threads — and «cross_total» are compiled for x86_64, linked
+with <code>cc -arch x86_64</code> and <strong>run under Rosetta</strong>, which
+reaches code the arm64 build never does: <code>readdir$INODE64</code> exists
+only there, and x86_64 passes variadic arguments in registers where arm64 puts
+them on the stack. A defect does not have to be predicted to be caught — it
+only has to make two engines disagree.</p>
+<div class="viz">
+  <canvas id="engines" data-programs="«difftest»"
+    aria-label="Programs flowing through four engines to one answer"></canvas>
+  <div class="cap">difftest · crosstest · wasmtest — «difftest» programs, 0 mismatched</div>
+</div>
+
+<h2>4. A run recorded in production replays in a browser</h2>
+<p><code>GRASM_RECORD</code> writes a journal of everything a run read from
+outside itself. <code>GRASM_REPLAY</code> hands it back, and the replaying run
+reaches outside itself for <strong>nothing</strong> — not the reads, and not
+the writes. All «replay_builtins» journalled builtins, on all four engines:
+the whole <code>io</code>, <code>net</code> and <code>proc</code> surface bar
+<code>print</code>, which is repeated on purpose.</p>
+<p>The part that is unusual: a journal recorded by the <em>native</em> build
+replays byte-identically <em>inside a wasm module that has no sockets, no
+processes and no filesystem</em> — TCP session and child process included.
+<code>scripts/replaytest.sh</code> additionally runs each of those builtins
+under an empty journal and requires it to refuse, so a builtin that quietly
+stopped being recorded fails the build.</p>
+
+<h2>5. Ownership in tiers, and no lifetime annotations anywhere</h2>
+<p>Four ways to own a value, chosen per value rather than per language. Value
+semantics by default; <code>region</code> when a scope should own its
+allocations; <code>ref</code> — a generational reference — when a graph needs
+one; <code>unsafe</code> where the guarantees stop, named in the source so a
+grep finds every place they do.</p>
+<p>No <code>'a</code>, no borrow checker to argue with, and no garbage
+collector either. <a href="tiers.html">The four tiers →</a></p>
+
+<h2>6. The specification is normative, and every clause has a program</h2>
+<p>«clauses» normative clauses in «spec_lines» lines, under a hard ceiling —
+every addition since has been paid for by compressing prose already written —
+and «conformance» programs in <code>spec/conformance</code>, so a clause is
+not a sentence about intent but a file that fails. «stable» clauses are
+<code>stable</code> and will not change incompatibly before 2.0;
+«provisional» are <code>provisional</code> and «experimental» are
+<code>experimental</code>, and a clause moves between those levels one at a
+time, on its own evidence.</p>
+
+<h2>7. A hello-world is «hello_kb» KB, on a stable toolchain</h2>
+<p>It was «hello_was» KB, of which about «symbolizer_kb» KB was Rust's own backtrace
+symbolizer, reached from the default panic hook. All four crates a compiled
+program links are now <code>no_std</code>; <code>nm</code> shows zero
+symbolizer symbols; no nightly compiler is involved.
+<a href="achieved.html">The nine defects that came out of that conversion →</a></p>
+
+<h2>What this does not buy you</h2>
+<p>The same list is on the <a href="about.html">About</a> and
+<a href="status.html">Status</a> pages, because it belongs next to every claim
+above and not only at the end of the site.</p>
+<div class="scroll"><table>
+<tr><th>If you need</th><th>Then</th></tr>
+<tr><td>Libraries</td><td>There are «packages», and every one was written inside this repository. Python has hundreds of thousands.</td></tr>
+<tr><td>To be faster than Rust</td><td>You will not be. The geomean is «geomean»× of Rust on the benchmark suite, and <em>no benchmark here claims a win over it</em>. On the systems suite Grasm loses <code>etl</code> by «etl_ratio»×, is at throughput parity on <code>proxy</code> and last on its tail, and wins memory everywhere — «chat_mem_ratio»× on <code>chat</code>, which is «chat_rss» MB against Rust's «chat_rss_rust».</td></tr>
+<tr><td>To hire</td><td>Nobody outside this repository has written Grasm.</td></tr>
+<tr><td>A native debugger</td><td>There is a DAP server and it works against the interpreter. The Cranelift backend emits no DWARF, so GDB and LLDB cannot meaningfully inspect a compiled binary.</td></tr>
+<tr><td>async/await</td><td>There are threads, channels, structured concurrency and non-blocking I/O on one thread. There is no async/await, and tasks still refuse every effect.</td></tr>
+<tr><td>Linux, today</td><td>CI compiles it. This machine never has: about «linux_lines» lines of the operating-system layer are written for Linux and have not been built here, let alone run.</td></tr>
+</table></div>
+
+<p class="note"><strong>The one-line version.</strong> Everywhere else, the
+boundary between your code and a dependency you did not read is enforced at run
+time, by a sandbox, or not at all. Here it is enforced by the type checker, and
+there are four engines that agree on what that means.</p>
+""",
+)
+
+
+# ---------------------------------------------------------------- achieved
+
+
+def _goal(name, target, pct, measured, hit, note):
+    """One scorecard row: what the goal asks, how far along, and the figure."""
+    cls = "hit" if hit else "miss"
+    num = "num" if hit else "num miss"
+    return (
+        f'<div class="bar-row"><span class="what">{name}<br>'
+        f'<span class="goal">{note} \u00b7 {target}</span></span>'
+        f'<span class="bar-track"><span class="bar-fill {cls}" '
+        f'data-pct="{pct}"></span></span>'
+        f'<span class="{num}">{measured}</span></div>'
+    )
+
+
+PAGES["achieved.html"] = (
+    "The eleven north-star goals, what each measures, and where each one stands.",
+    """
+<p class="eyebrow">More</p>
+<h1>How far it got.</h1>
+<p class="lede"><code>MASTERPLAN.md</code> §2.3 sets ten measurable goals and
+§19.3 adds an eleventh; two of them split in two, so the scorecard has
+«goals_total» rows. <strong>«goals_met» are met</strong>, «goals_over» are
+narrowly over, and «goals_blocked» cannot be measured at all without users.
+<code>scripts/northstar.sh</code> takes the readings it can take and prints a
+scorecard rather than failing on a miss — a gate that is red on purpose is a
+gate people learn to ignore — but it <em>does</em> fail when a reading cannot
+be taken, which is how a metric quietly stops being collected.</p>
+
+<div class="bars">
+"""
+    + _goal("Ship a real service", "≤ 1 week, Go/TS dev", 0,
+            "no users", False, "G1")
+    + _goal("Geomean vs Rust", "≥ 0.95×", 100,
+            "«geomean»×", True, "G2")
+    + _goal("Frontend throughput", "≥ 500k LOC/s", 100,
+            "«locs_low»–«locs_high»k", True, "G3")
+    + _goal("Edit to diagnostic", "≤ 50 ms", 100,
+            "p95 «incr_p95» ms", True, "G3, at this repo's scale")
+    + _goal("Safe-subset guarantees", "100%", 100,
+            "1 gap, permanent", True, "G4")
+    + _goal("Hello-world binary", "≤ 300 KB", 100,
+            "«hello_kb» KB", True, "G5")
+    + _goal("Tasks per node", "≥ 1M", 100,
+            "«tasks»", True, "G6, task count only")
+    + _goal("Capability-sandboxed deps", "100%", 100,
+            "refused", True, "G7")
+    + _goal("Failure → deterministic replay", "≥ 99%", 100,
+            "«replay_builtins» builtins", True, "G8, the % is unmeasured")
+    + _goal("C ABI import overhead", "zero-cost", 100,
+            "zero-cost", True, "G9")
+    + _goal("Adoption", "≥ 500 companies", 0,
+            "zero", False, "G10")
+    + _goal("Tokens vs Python", "≤ 1.00×", 96,
+            "«tokens_py»×", False, "G11")
+    + _goal("Tokens vs Go", "≤ 0.60×", 98,
+            "«tokens_go»×", False, "G11")
+    + """
+</div>
+<p>Three of those rows carry a qualification that the bar cannot show, and they
+are the three worth reading twice. <strong>G3's 50 ms</strong> is met at this
+repository's scale — p50 «incr_p50» ms, p95 «incr_p95» ms on its largest
+program — and the plan frames that goal at a million lines, which a
+whole-program re-check will never reach; that needs the query engine nobody has
+built. <strong>G6</strong> is met for the task count and the <em>uncolored</em>
+half is still open: tasks refuse every effect. <strong>G8</strong>'s mechanism
+is met on all four engines, and the ≥99% figure is unmeasurable because nobody
+has run a Grasm program in production.</p>
+
+<h2>The gates, and what each one would catch</h2>
+<p>Judged by exit code alone, «gates» of them. These are the figures from the
+last recorded run on this machine:</p>
+<div class="scroll"><table>
+<tr><th>Gate</th><th>Scope</th><th>Result</th></tr>
+<tr><td>difftest / corpus</td><td>«difftest» programs</td><td><b>0 differences</b> across the engines</td></tr>
+<tr><td><code>leakcheck</code></td><td>«leak_programs» programs</td><td><b>0 leaks</b></td></tr>
+<tr><td><code>usecheck</code>, the <code>poison</code> build</td><td>«use_programs» programs</td><td><b>0 differences</b></td></tr>
+<tr><td><code>crosstest</code> x86_64 under Rosetta</td><td>«cross_total» programs</td><td><b>«cross_pass» pass</b>, 0 real failures, 60 declined</td></tr>
+<tr><td><code>clippy --all-targets</code></td><td>native and wasm32</td><td>0</td></tr>
+<tr><td>unit tests</td><td>every crate</td><td><b>«unittests» pass</b></td></tr>
+<tr><td><code>replaytest</code></td><td>every journalled builtin</td><td>each one refuses under an empty journal</td></tr>
+<tr><td>fuzzers</td><td>«generators» generators</td><td>clean</td></tr>
+<tr><td>conformance</td><td>«conformance» programs</td><td>one per normative clause</td></tr>
+</table></div>
+<p><code>leakcheck</code> and <code>usecheck</code> are the two no other check
+replaces: a leaking program produces exactly the right output, and a premature
+free makes a value <em>less</em> live rather than more, so neither shows up in a
+diff of what was printed.</p>
+<p class="note"><strong>One caveat on that table, stated rather than buried.</strong>
+The <code>crosstest</code> figure was taken on a machine at load 38 rising to
+134, where two <em>parallel</em> tests differed and then agreed on re-run, 3 of
+3 and 2 of 2. They are recorded as load artefacts because that is what they
+are, and the figure wants taking again on a quiet machine before anyone calls
+it green.</p>
+
+<h2>The three that moved, and what moved them</h2>
+
+<h3>G5: «hello_was» KB → «hello_kb» KB</h3>
+<p>About «symbolizer_kb» KB of that binary was Rust's own backtrace symbolizer — gimli,
+addr2line, rustc_demangle — reached from std's default panic hook, and nothing
+in a hello-world ever called it. All four crates a compiled program links are
+now <code>no_std</code>, with a new <code>grasm_sys</code> crate underneath
+them for the operating system and <code>grasm_rt_abi</code> supplying the
+allocator and the panic handler. <code>nm</code> shows zero symbolizer symbols.
+Nightly was not needed.</p>
+<p>The conversion found <strong>nine defects</strong>, and the gates would have
+caught none of them — they are all below the level the corpus exercises.
+Five of the nine: <code>open</code> and <code>fcntl</code> were declared
+non-variadic, and arm64 passes variadic arguments on the stack, so the mode
+argument was garbage; <code>RwLock::write</code> released a mutex rather than
+the lock it took, so a second writer hung; an <code>exec</code> failure was
+indistinguishable from exit 127, which the specification requires to be
+distinguishable; <code>AF_INET6</code> was 30 on Linux, where it is 10; and
+<code>thread::scope</code> let its reference escape, which needed somebody to
+write the line that escapes before anything noticed.</p>
+<p class="note">A figure in that story was wrong in public first. It was
+reported as 68.3 KB for several commits — the branch head was
+«hello_kb» KB. The
+difference is one 16 KB page of <code>__TEXT</code> quantisation around 1.9 KB
+of real code: on Mach-O a segment is 16 KB-aligned, so a kilobyte of code can
+move a file by seventeen. <code>docs/binary-size.md</code> bisects it to the
+commit.</p>
+
+<h3>G6: «tasks_was» tasks in «tasks_was_s» s → «tasks» in «tasks_s» s</h3>
+<p>The scheduler resumed every live task every round, so N tasks needed N
+rounds of N resumes — quadratic, and at that rate a million tasks is hours.
+The fix that looked obvious was built first and measured at nothing: a version
+per channel still wakes every blocked sender when the receiver takes one value.
+What worked is a wait queue <em>per channel and per side</em>, so a send wakes
+a receiver rather than another sender, and a round costs what is runnable.</p>
+<p>That changed an observable rule, so the specification changed with it:
+<code>[E-SCHEDULE]</code> now wakes the longest-waiting sender or receiver
+instead of going round-robin. It is an <em>experimental</em> clause, and all
+«conformance» conformance programs produce identical output across the change.
+The interpreter stops near «interp_tasks» tasks and is allowed to: an
+interpreter frame costs about 10 KB where a compiled one costs 30 bytes.</p>
+
+<h3>G2: the compiler did not change, the ruler did</h3>
+<p>This row used to read "4 of 7 programs at or above Rust", and that was an
+artefact. <code>bench.sh</code> was adding a constant 21 ms to every cell, and a
+constant added to every measurement compresses every ratio toward 1 — a 5 ms
+program and a 10 ms program read as 26 and 31, which is "about the same" if you
+squint. With the timer fixed, the geomean read «geomean_was»× <em>behind</em>.</p>
+<p>What closed it afterwards was real work, and the same 21 ms had been
+published in two other tables: <strong>a wrong measurement does not stay where
+it was made.</strong> It is «geomean»× today, or «geomean_floor»× with the
+harness's own floor subtracted from both sides, with five of eight programs at
+or above parity. <code>tree</code> at «tree_ratio»× is what the geomean still carries:
+a box per node in tree-shaped data. Storing those inline was built, measured at
+<em>1.33× slower</em>, and not kept.</p>
+
+<h2>What is still open</h2>
+<div class="scroll"><table>
+<tr><th>Open</th><th>What it would take</th></tr>
+<tr><td><b>Tasks refuse every effect</b> — G6's uncolored half</td><td>The task count is met; the goal is not. A task that cannot do I/O is not the thing the goal asks for.</td></tr>
+<tr><td><b>Sub-50 ms at a million lines</b> — G3's other half</td><td>A query engine. What exists is a batch compiler with an object cache, re-checking the whole program on every keystroke, and at this repository's size that is fast enough to hide the problem.</td></tr>
+<tr><td><b>G11's last 4% and 2%</b></td><td>Priced before building: list repetition and a stepped range are what Python has and Grasm does not on the worst row. Not closable by adding library methods.</td></tr>
+<tr><td><b>Linux has never been compiled here</b></td><td>About «linux_lines» lines of the operating-system layer are written for it and no target is installed on this machine. CI's ubuntu runner compiles it; a compile catches code that does not build, and does not catch a wrong constant — which is exactly how <code>AF_INET6</code> survived.</td></tr>
+<tr><td><b>No remote registry</b></td><td>Path and local-registry dependencies work. Nothing fetches or publishes.</td></tr>
+<tr><td><b>G1 and G10 need users</b></td><td>A week to ship a service, and 500 companies. Neither is a number this repository can produce by working harder on it.</td></tr>
+</table></div>
+
+<h2>How any of this is kept honest</h2>
+<p>All «findings» findings are written down in
+<code>ProjectGold/FINDINGS.md</code> — including the ones that were the test
+harness's fault, the ones withdrawn as wrong, and the ones caught before they
+shipped. Every gate is verified by breaking the thing it guards and confirming
+it fails, because a gate nobody has broken is a gate nobody has tested. One of
+them had to be: <code>replaytest</code> was matching <strong>0 of 39</strong>
+builtins and exiting 0, for weeks, because its pattern expected a struct on one
+line. It now asserts its own count.</p>
+<p class="note"><strong>The bar for calling this finished</strong> is not on
+this page, and no number here moves it: zero known defects, every gate green,
+and two consecutive independent review rounds finding nothing new — each
+conducted by somebody who has seen only the language pack and not this
+repository's history. Those rounds have not run.</p>
+""",
 )

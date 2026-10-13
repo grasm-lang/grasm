@@ -24,6 +24,7 @@
 <nav class="rail">
 <a class="mark" href="index.html"><b>grasm</b><span>a systems language</span></a>
 <h2>Start</h2>
+<a href="different.html">Why Grasm</a>
 <a href="start.html">Getting started</a>
 <a href="install.html">Install</a>
 <a href="playground.html">Playground</a>
@@ -44,6 +45,7 @@
 <a href="architecture.html">Architecture</a>
 <h2>More</h2>
 <a href="examples.html">Examples</a>
+<a href="achieved.html">Scorecard</a>
 <a href="about.html">About</a>
 <a href="status.html" aria-current="page">Status</a>
 <a href="roadmap.html">Roadmap</a>
@@ -52,34 +54,42 @@
 
 <p class="eyebrow">More</p>
 <h1>Status</h1>
-<p class="lede">Every number here is written by the run that proved it —
-<code>scripts/allgates.sh</code> records them after every gate passes, and the
-page is regenerated from that record. None of them is typed by hand.</p>
+<p class="lede">Every number here comes from the repository as the site is
+written, or out of the document that recorded the measurement. Five figures
+here used to be typed by hand instead. Four of them were wrong by the time
+anybody looked — the worst by a factor of two — and the fifth, &ldquo;0 open
+defects&rdquo;, was a claim no gate on this page makes.
+<a href="achieved.html">The scorecard</a> has the eleven goals and where each
+one stands.</p>
 
 <h2>What holds</h2>
 <div class="figures">
-  <div class="fig"><b>478</b><span>programs, three engines</span></div>
-  <div class="fig"><b>189</b><span>identical in wasm</span></div>
-  <div class="fig"><b>227</b><span>cross-compiled, agreeing</span></div>
-  <div class="fig"><b>0</b><span>open defects</span></div>
-  <div class="fig"><b>67</b><span>findings recorded</span></div>
-  <div class="fig"><b>14</b><span>generators</span></div>
+  <div class="fig"><b>511</b><span>programs, engines identical</span></div>
+  <div class="fig"><b>394</b><span>identical in wasm</span></div>
+  <div class="fig"><b>195</b><span>cross-compiled, agreeing</span></div>
+  <div class="fig"><b>257</b><span>conformance programs</span></div>
+  <div class="fig"><b>98</b><span>findings recorded</span></div>
+  <div class="fig"><b>15</b><span>fuzz generators</span></div>
 </div>
 <p>Interpreter, bundle and native builds agree byte for byte on stdout, exit
 code and diagnostics. A wasm build agrees on the 394 programs that do not
-need a filesystem, a socket, a process or threads. The same 478 cross-compile to
-x86_64 and agree there. Every generated program is checked for what it keeps as
-well as for what it prints.</p>
+need a filesystem, a socket, a process or threads; 84 are skipped
+because they do. 224 are also compiled for x86_64 and run under
+Rosetta, 195 of them agreeing and the rest declined. Every generated
+program is checked for what it keeps as well as for what it prints.</p>
 
 <h2>What does not work</h2>
 <div class="scroll"><table>
 <tr><th>Limit</th><th>Detail</th></tr>
-<tr><td>Thirty-four libraries, all first-party</td><td>See <a href="packages.html">Packages</a>; the plan for the rest is in <code>docs/packages-plan.md</code>. Anything else you need, you write, or bind to C with <code>extern fn</code>.</td></tr>
+<tr><td>651 libraries, all first-party</td><td>See <a href="packages.html">Packages</a>; the plan for the rest is in <code>docs/packages-plan.md</code>. Anything else you need, you write, or bind to C with <code>extern fn</code>.</td></tr>
 <tr><td>No remote registry</td><td>Path and local-registry dependencies work. Nothing fetches or publishes.</td></tr>
 <tr><td>No release binaries</td><td>Build from source with a Rust toolchain.</td></tr>
-<tr><td>0.45× native Rust</td><td>Measured, floor-subtracted 0.39×, against a 0.95× target.</td></tr>
+<tr><td>Not faster than Rust</td><td>The geomean is 0.965× of it, 0.955× with the harness floor taken out of both sides, against a 0.95× target — so the goal is met and the claim is not available. <code>tree</code> at 0.51× is the worst row. On the systems suite Grasm loses <code>etl</code> by 3.6×, and wins memory everywhere — 8× on <code>chat</code>.</td></tr>
 <tr><td>Polymorphic recursion</td><td>Refused by name at build time. It is what monomorphization is; no work removes it.</td></tr>
-<tr><td>Small standard library</td><td>82 methods. Enough for the 44 programs above; you will find gaps in a larger one.</td></tr>
+<tr><td>Small standard library</td><td>82 methods. Enough for 44 whole programs and 12 applications; you will find gaps in something larger.</td></tr>
+<tr><td>Linux never compiled here</td><td>About 2,100 lines of the operating-system layer are written for Linux and no target is installed on this machine. CI compiles it. A compile does not catch a wrong constant, which is how <code>AF_INET6</code> was 30 on Linux for four commits.</td></tr>
+<tr><td>Tasks refuse every effect</td><td>1,000,000 tasks run, and none of them may do I/O. G6's <em>uncolored</em> half is the open one.</td></tr>
+<tr><td>No query engine</td><td>Edit-to-diagnostic is p95 40 ms by re-checking the whole program, which is fast enough at this repository's size and will not be at a million lines.</td></tr>
 <tr><td>No users but this project</td><td>Nobody has hit it from an angle nobody here thought of.</td></tr>
 <tr><td>Region sweep not implemented</td><td>Tier 1's rule is enforced; the bulk deallocation it makes sound is not built.</td></tr>
 </table></div>
@@ -89,12 +99,23 @@ well as for what it prints.</p>
 It is not battle-tested. Defects are still being found at roughly one per
 working session — falling, but not zero, and a language with zero known defects
 and no users has told you more about its test suite than about itself.</p>
+<p>The <code>no_std</code> conversion that took a hello-world from 351.1 KB
+to 85.7 KB found nine defects on its way, and <em>no gate on this page
+would have caught any of them</em>: they were in the operating-system layer,
+below everything the corpus exercises. Two would have shipped silently —
+a variadic <code>open</code> passing a garbage mode, and an <code>RwLock</code>
+releasing the wrong lock. <a href="achieved.html">The list is on the
+scorecard.</a></p>
 
 <h2>How that is kept honest</h2>
 <p>All 98 findings are written down in <code>ProjectGold/FINDINGS.md</code>,
 including the ones that were the test harness's fault, the ones withdrawn as
 wrong, and the ones caught before they shipped. Every gate is verified by
-breaking the thing it guards and confirming it fails.</p>
+breaking the thing it guards and confirming it fails — and one of them had to
+be, because <code>replaytest</code> was matching <strong>0 of 39</strong>
+journalled builtins and exiting 0 for weeks, its pattern expecting a struct
+written on one line. It now asserts its own count, which is the check that
+would have caught it on day one.</p>
 
 <footer>
 Grasm — four engines, one answer. Every figure on this site is computed,
