@@ -4258,13 +4258,32 @@ and says in a comment why not more, pointing at
 bound. A test may assert the contract; it may not assert an implementation's
 headroom.
 
-**What is not fixed, and is the more interesting half.** Nothing measures the
-interpreter's frame. The capacity fell by at least 15% with no gate noticing,
-because the only thing that depended on it was one program's expectation, and
-when that broke it looked like an engine disagreement. A frame that doubles
-again takes the guaranteed 10,000 with it, and the first sign would be the
-same misleading failure. Worth a gate that asserts the guarantee with margin
-and reports the measured bound.
+**The half that was open is now closed: `scripts/depthtest.sh`, gate `depth`.**
+Nothing measured the interpreter's frame, which is why the capacity could fall
+by at least 15% with no gate noticing -- the only thing depending on it was one
+program's expectation, and when that broke it looked like an engine
+disagreement. The gate checks two different things:
+
+* **The contract.** 10,000 nested calls on the interpreter, the bundle and the
+  native build, and through mutual recursion as well, since that counts
+  against the same bound.
+* **The margin.** It bisects the interpreter's real capacity and fails below
+  twice the guarantee. Twice is not a spec number: it is the smallest margin
+  in which a frame doubling is caught by this gate instead of by
+  [E-RECURSION-DEPTH] failing. It also checks that *past* capacity the program
+  panics with exit 101 rather than taking a signal, which is the property the
+  clause actually specifies.
+
+It prints bytes per frame, because that is the thing that moves -- capacity is
+`STACK_BUDGET` divided by it and the budget is a constant. First run:
+**~31,400 calls, ~14.9 KB a frame, 3x the guarantee**, in 6 seconds.
+
+That figure is not comparable with the 42,000 above, and the gate says so in
+its header: capacity is a property of a *shape*, because a frame holds that
+function's locals. `08-fibonacci`'s `depth` and the gate's `down` measure
+different numbers on the same build, so the gate pins one shape and asks not
+to have it tidied -- changing the body moves the number with nothing else
+changing.
 
 **Found by** refreshing the figures on the site, which is also how the stale
 playground module turned up. Neither was found by looking for it.

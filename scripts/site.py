@@ -114,8 +114,7 @@ def facts():
                 re.search(r"^capabilities\s*=\s*\[(.*?)\]",
                           open(d).read(), re.M | re.S))
         ])
-    f["gates"] = len(re.findall(
-        r"^run_gate ", open(os.path.join(ROOT, "scripts", "allgates.sh")).read(), re.M))
+    f["gates"] = gate_count()
     f["version"] = re.search(
         r'^version = "([^"]+)"', open(os.path.join(ROOT, "Cargo.toml")).read(), re.M).group(1)
 
@@ -284,6 +283,33 @@ def scorecard():
             # have moved one and not the other.
             "goals_distinct": len({r[0] for r in rows}),
             "goals_split": len(rows) - len({r[0] for r in rows})}
+
+
+def gate_count():
+    """Every gate a green `allgates.sh` run executes.
+
+    Counting lines that start with `run_gate` understated this by seventeen.
+    Three `run_gate` calls are indented, and an indented one is not a smaller
+    gate: fifteen fuzzers are *one* line expanded from a glob, and `sitefacts`
+    and `site` sit behind the "nothing failed" branch, which is exactly the
+    branch a figure on the site was written during.
+    """
+    src = open(os.path.join(ROOT, "scripts", "allgates.sh")).read()
+    calls = len(re.findall(r"^\s*run_gate ", src, re.M))
+    loop = re.search(r"^for f in (scripts/fuzz_\*\.py); do\n\s*run_gate ", src, re.M)
+    if not loop:
+        raise SystemExit(
+            "scripts/allgates.sh no longer expands the fuzzers from a glob the "
+            "way the site counts them. Every page that states a gate count "
+            "reads this; fix the pattern in scripts/site.py rather than "
+            "letting the count quietly drop fifteen gates.")
+    fuzzers = glob.glob(os.path.join(ROOT, loop.group(1)))
+    if not fuzzers:
+        raise SystemExit(
+            "scripts/allgates.sh globs %s and nothing matches, so the gate "
+            "count would silently lose the fuzzers." % loop.group(1))
+    # The loop's own `run_gate` line is one call and len(fuzzers) gates.
+    return calls - 1 + len(fuzzers)
 
 
 def corpus_programs():

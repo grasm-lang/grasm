@@ -219,7 +219,7 @@ spelling that works — `"hi" |> print`, which was always there and is charged
 the same row a call is. The old help offered UFCS for `print`, which is the
 call it had just refused.
 
-## `ProjectGold/30-async-chat` crashed under the native backend — *gone, undiagnosed*
+## `ProjectGold/30-async-chat` crashed under the native backend — *not the compiler*
 
 Recorded by `scripts/allgates.sh`'s `gold` gate on 2026-10-07: the interpreter
 ran it to completion (21 lines); the native build stopped after three and
@@ -236,13 +236,29 @@ it has, interpreter against bundle against native. `ProjectGold/30-async-chat/`
 has not been touched since 2026-08-18, so what changed is the compiler, not
 the program.
 
-**What fixed it is not known**, and that is the honest state of this entry
-rather than a closure. Nothing between 2026-10-07 and today was aimed at it.
-The candidates are the five audit fixes of 2026-10-12 (`76513ea` two missing
-EINTR retries, `547e6e2` a reported address length exceeding its buffer,
-`4bc0235` `OnceLock` with no `Drop`, `8e9ef20` `thread::scope` letting its
-reference escape into a `transmute`) and the scheduler rewrite `03b8aad`.
-A bisect would name it; none has been run.
+**No commit fixed it, because no commit broke it.** The bisect was run on
+2026-10-15 and stopped at its first step, which is the step that tests the
+endpoint rather than assuming it: the compiler built from `411812f`, the last
+commit before the failing gate run, builds this program and runs it **16
+times out of 16** clean. Whatever happened on 2026-10-07 was not a property
+of that compiler, so there is no fixing commit to name and the five audit
+fixes of 2026-10-12 are not what closed it.
+
+Two hypotheses survive, and the evidence separates them:
+
+* **CPU load alone: ruled out.** HEAD runs it 16 of 16 clean at load average
+  70-112 on eight cores, and the 2026-10-07 commit does the same.
+* **Memory pressure, or something about running inside the full suite:
+  untested.** The failure was seen while `allgates.sh` was running the whole
+  corpus, in the week a commit message records the machine reaching load 146
+  and another records seven fuzzer failures that were "the machine again".
+  Under swap thrash macOS can deliver SIGBUS on a page-in and SIGSEGV where a
+  stack cannot grow, which fits a signal that changes between runs better
+  than a code-generation defect does. Nothing here reproduces that state on
+  purpose, so this stays a hypothesis.
+
+The one condition not retested is the original one: this program running
+*inside* a full gate suite rather than alone.
 
 Two things in the original entry were wrong, and both pointed the next reader
 away from the defect:
