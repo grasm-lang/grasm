@@ -219,15 +219,41 @@ spelling that works — `"hi" |> print`, which was always there and is charged
 the same row a call is. The old help offered UFCS for `print`, which is the
 call it had just refused.
 
-## `ProjectGold/30-async-chat` crashes under the native backend
+## `ProjectGold/30-async-chat` crashed under the native backend — *gone, undiagnosed*
 
-Found by `scripts/allgates.sh`'s `gold` gate on 2026-10-07. The interpreter
-runs it to completion (21 lines); the native build stops after three and exits
-with a varying signal -- SIGSEGV, SIGBUS, SIGTRAP, and once `panic: expected a
-list`. A signal that changes between runs on the same binary is memory
-corruption rather than a logic error.
+Recorded by `scripts/allgates.sh`'s `gold` gate on 2026-10-07: the interpreter
+ran it to completion (21 lines); the native build stopped after three and
+exited with a varying signal -- SIGSEGV, SIGBUS, SIGTRAP, and once `panic:
+expected a list`. A signal that changes between runs of the same binary is
+memory corruption rather than a logic error. It failed three times out of
+three, and the compiler built from the commit before that day's compile-speed
+fix failed identically, so it was not a regression from that fix.
 
-It is **not** a regression from the compile-speed fix of the same day: the
-compiler built from the commit before it fails identically, three times out of
-three. It is the only failure among 101 gates, and it is the only program in
-the corpus that combines sockets with `concurrent`, which is where to look.
+**It no longer reproduces.** On 2026-10-15 the program built native and ran
+**eight times out of eight** at exit 0, byte-identical to `expected.txt`, and
+the `gold` gate reports **44 agreeing, 0 failing, 0 blocked** -- every project
+it has, interpreter against bundle against native. `ProjectGold/30-async-chat/`
+has not been touched since 2026-08-18, so what changed is the compiler, not
+the program.
+
+**What fixed it is not known**, and that is the honest state of this entry
+rather than a closure. Nothing between 2026-10-07 and today was aimed at it.
+The candidates are the five audit fixes of 2026-10-12 (`76513ea` two missing
+EINTR retries, `547e6e2` a reported address length exceeding its buffer,
+`4bc0235` `OnceLock` with no `Drop`, `8e9ef20` `thread::scope` letting its
+reference escape into a `transmute`) and the scheduler rewrite `03b8aad`.
+A bisect would name it; none has been run.
+
+Two things in the original entry were wrong, and both pointed the next reader
+away from the defect:
+
+* It said the program "combines sockets with `concurrent`". The word
+  `concurrent` does not appear in `main.gr` and never has. The program is
+  explicitly **single-threaded** -- "one thread, three clients" -- and
+  multiplexes with `net_wait`, because `spawn` carries no `net` capability.
+* It therefore named the wrong place to look. The socket layer under
+  `net_wait` is the place; threads are not involved.
+
+An intermittent memory corruption that disappears without a diagnosis is not
+the same as one that was fixed. Until a bisect names the commit, the bug class
+cannot be called gone -- only this reproducer can.
