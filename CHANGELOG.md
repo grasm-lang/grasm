@@ -9,6 +9,104 @@ migration note here; anything `experimental` may change in any release. See
 
 ### Added
 
+- **Value structs, and fields stored inline.** A struct field of scalar type
+  holds its bits rather than a pointer to a box, and a list or string field
+  can live inside the struct too. Eligible structs were chosen by analysis and
+  turned on by default. The backend refuses the two ways an inline field could
+  be mishandled rather than trusting itself, and a field is addressed by its
+  offset instead of its index times eight.
+- **Concurrency that runs, not only type-checks.** `grasm_fiber` supplies
+  stacks and a context switch; tasks get a run queue, fibers made on first
+  turn and a pool of stacks; channels and `chan_select` work in both engines;
+  `grasm test --schedules` runs a program under more than one interleaving.
+  Actors hold state several tasks may use, exclusive without a lock.
+  **1,000,000 tasks run in 22 seconds** on a compiled build and 2,000,000 in
+  97, checked by their answer rather than only by the clock.
+- **Interfaces.** An `impl` is for a shape and may bring its own parameters,
+  and a method may declare an effect row.
+- **`bindgen`: C headers into `extern fn` declarations**, with `--link` so the
+  result actually links.
+- **A pull reader for JSON**, so a program decodes into its own types without
+  building a tree first, matching keys as bytes.
+- **`net_workers`, and `net_wait` on kqueue**, so concurrent I/O on one thread
+  does not poll.
+- **A gate for the recursion margin.** `scripts/depthtest.sh` checks the
+  10,000 nested calls [E-RECURSION-DEPTH] guarantees on every engine, bisects
+  the interpreter's real capacity, and fails if the margin falls under twice
+  the guarantee. Nothing had ever measured it, which is how capacity fell at
+  least 15% unnoticed.
+- **A generated website in `site/`.** Twenty-four pages, no build step for a
+  reader and no external request. Every figure is either counted from the
+  repository as the page is written or read from the document that recorded
+  it, with the date it was taken; an unknown figure name fails the build
+  rather than printing blank.
+
+### Changed
+
+- **Speed: the geomean against Rust is 0.965x**, or 0.955x with the harness
+  floor taken out of both sides, measured 2026-10-02 on an idle machine at
+  load 2.09 against a 0.95x target. Five of eight programs are at or above
+  parity; `tree` at 0.51x is what the mean still carries. **No benchmark here
+  claims a win over Rust.** What moved it: value structs, inline list and
+  string fields, a proved scan that reads its buffer without a bounds check
+  per byte, a counted loop running four iterations at a time, small functions
+  spliced into their callers, a constant power-of-two divisor becoming shifts,
+  a parameter the callee only reads being lent rather than given, interned
+  integers in one block, strings built in one buffer, and a map that hashes
+  the way Zig's does. Many more optimisations were **measured and not built**,
+  which is recorded in `docs/performance.md` so the next person starts from
+  evidence.
+- **A hello-world static binary is 85.7 KB**, down from 351.1 KB and 3.5x
+  inside the 300 KB target, on a **stable** toolchain. All four crates a
+  compiled program links are `no_std` and `grasm_rt_abi` supplies the
+  allocator and panic handler; `nm` shows no trace of Rust's backtrace
+  symbolizer, which was about 135 KB of the old figure. Nine defects came out
+  of that work, two of which would have shipped silently.
+- **The task scheduler is linear, not quadratic.** A round used to resume every
+  live task, so 40,000 tasks took 199 seconds. Per-channel wait queues make a
+  round cost what is runnable, and `[E-SCHEDULE]` now wakes the longest-waiting
+  sender or receiver instead of going round-robin. That is a change to an
+  *experimental* clause and left all 257 conformance programs' output
+  identical.
+- **The native build compiles 6.9x faster.** One line was making the backend
+  quadratic. Compile speed had never been measured before that, which is why a
+  superlinear backend could sit there.
+- **`publish` requires a `capabilities` key**, and all 838 manifests declare
+  one.
+
+### Fixed
+
+- **Two S1 crashes with one cause: spans are not unique across modules.** A
+  table keyed by a byte offset collided between files.
+- **The compiler was not in its own cache key.** `build_native_incremental`
+  keyed a cached object on the module's name, its source and the program's
+  signature surface, and on nothing about the compiler doing the compiling, so
+  a session spent changing code generation linked yesterday's objects. It
+  presented as two programs releasing a value twice and segfaulting natively
+  while running correctly under the interpreter, and the output path mattered,
+  because the cache lives beside the output.
+- **A value struct returned as a tail was released before it was read** — one
+  decrement too many, narrowed to nineteen lines, with a silent wrong answer
+  on the way to the crash.
+- **`replaytest` checked none of the 39 builtins it reported on, and exited 0.**
+  Its grep found zero and said so in a message nobody read. It now runs each
+  builtin under an empty journal and requires it to refuse, which is what the
+  gate was always supposed to mean.
+- **Five defects found by auditing rather than by a failure**: two missing
+  `EINTR` retries, a reported address length that may exceed its buffer,
+  `OnceLock` with no `Drop` where std's has one, and `thread::scope` letting
+  its reference escape into a `transmute` — the signature quantified one
+  lifetime where std quantifies two.
+- **The backend's internal-compiler-error diagnostic was dead in every release
+  build.** `[profile.release] panic = "abort"` — required, because the `no_std`
+  runtime staticlib cannot unwind — stops the process at the panic site, so the
+  `catch_unwind` that turns a Cranelift assertion into an `error:` line never
+  ran. The text is now printed from a panic hook, which does run before the
+  abort. The process still aborts; a hook can print, it cannot resume.
+
+
+### Added
+
 - **Five formats a program speaks to sit between other programs.** `shlex`
   splits a command line the way a shell does and quotes so a filename with a
   space in it survives being one. `querystring` is Node's: a key with no `=`,
