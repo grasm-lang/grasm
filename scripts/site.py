@@ -350,37 +350,46 @@ def law_count():
 
 
 def vintage(f, taken):
-    """When the gate-written figures were written, and what they describe.
+    """What each gate-written figure is, and when it was taken.
 
     A figure in `site/facts.json` is as current as the run that wrote it and
     no more, and the file carried no date -- so the one written in September
-    was still being read in October, under a heading that said every number
-    came from the run that proved it. The page now states the date and the
-    corpus that run saw, which is the smallest thing that makes the gap
-    between `corpus` and `programs` visible instead of invisible.
+    was still being read in October under a heading saying every number came
+    from the run that proved it.
+
+    This produced a prose span over the set as well ("runs between X and Y,
+    when the corpus held N"). A span is right for the six together and wrong
+    for any one of them, and the corpus clause was right only while every
+    figure shared a run -- which stopped being true the moment the gates began
+    recording one at a time. A row per figure needs no such sentence, so the
+    span is gone and nothing names it.
     """
     out = {}
+    for k in MEASURED:
+        out["when_" + k] = (pretty(taken[k]) if k in taken
+                            else "a run that recorded no date")
+
+    # Whether the wasm run covered the corpus as it stands, as a clause rather
+    # than two numbers the reader has to compare. It read "out of the 478 the
+    # corpus held then -- it holds 511 today" when that was true, and would
+    # have gone on reading that way with both numbers equal.
     try:
-        out["facts_corpus"] = "{:,}".format(int(f["wasm_ok"]) + int(f["wasm_skip"]))
+        then = int(f["wasm_ok"]) + int(f["wasm_skip"])
+        covered = then == int(f["programs"])
     except (KeyError, TypeError, ValueError):
-        out["facts_corpus"] = "\u2014"
-    have = [k for k in MEASURED if f.get(k) != "\u2014"]
-    dates = sorted({taken[k] for k in have if k in taken})
-    if not dates:
-        out["facts_when"] = "a run that did not record its date"
-    elif len(dates) == 1 and len(have) == len([k for k in have if k in taken]):
-        out["facts_when"] = "a run on " + pretty(dates[0])
-    else:
-        # Mixed, and the mixture is the point: the gates are recorded one at a
-        # time as each passes, so a run that is killed halfway leaves figures
-        # from two months in one file. A single date over that set would be
-        # the same lie the file told by carrying no date at all.
-        span = "runs between %s and %s" % (pretty(dates[0]), pretty(dates[-1]))
-        if len(dates) == 1:
-            span = "a run on " + pretty(dates[0])
-        if any(k not in taken for k in have):
-            span += ", and at least one from a run that recorded no date"
-        out["facts_when"] = span
+        then, covered = None, False
+    out["wasm_of"] = (
+        "which is every program in the corpus" if covered else
+        "out of the %s the corpus held then, against %s today"
+        % ("{:,}".format(then) if then else "\u2014",
+           "{:,}".format(f["programs"])))
+
+    out["facts_rows"] = "\n".join(
+        "<tr><td><code>%s</code></td><td>%s</td><td>%s</td><td>%s</td></tr>"
+        % (gate, label, "{:,}".format(f[k]) if isinstance(f.get(k), int)
+           else f.get(k, "\u2014"),
+           pretty(taken[k]) if k in taken else "not recorded")
+        for k, gate, label in FIGURE_ROWS)
     return out
 
 
@@ -391,6 +400,17 @@ def pretty(iso):
 
 # What only a run can know. `scripts/allgates.sh` writes these.
 MEASURED = ["corpus", "wasm_ok", "wasm_skip", "cross", "agreeing", "laws"]
+
+# The same six, with the gate that writes each and what it means, for the
+# table on the status page.
+FIGURE_ROWS = [
+    ("corpus", "difftest", "interpreter, bundle and native identical"),
+    ("wasm_ok", "wasmtest", "identical in the browser engine"),
+    ("wasm_skip", "wasmtest", "skipped: no filesystem, socket, process or thread"),
+    ("cross", "crosstest", "cross-compiled to x86_64, identical under Rosetta"),
+    ("agreeing", "ProjectGold", "whole programs agreeing on every engine"),
+    ("laws", "fuzz_laws", "laws that held against arithmetic"),
+]
 
 
 

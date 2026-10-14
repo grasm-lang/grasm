@@ -477,9 +477,8 @@ python3 -m http.server -d ProjectGold/web
     + """
 
 <h2>What the browser build can and cannot do</h2>
-<p>«wasm_ok» programs produce identical output in wasm, out of the
-«facts_corpus» the corpus held when this gate last ran — it holds
-«programs» today, and both figures below come from «facts_when». The other
+<p>«wasm_ok» programs produce identical output in wasm, «wasm_of», and both
+figures below come from a run on «when_wasm_ok». The other
 «wasm_skip» are skipped for a reason the host cannot supply, and each names
 it: a filesystem, a socket, a process, threads, or a stack deep enough for the
 recursion limit the specification promises.</p>
@@ -1202,7 +1201,7 @@ arithmetic, not against a recorded string. <code>rev</code> puts the last
 element first. <code>a / b * b + a % b == a</code>. A released slot is dead
 through every reference to it. A clause in scope with no law fails the gate by
 name.</p>
-<p class="note">How many laws there are is a count, taken from <code>scripts/fuzz_laws.py</code> as this page is written. Whether they <em>hold</em> needs a run, and the last recorded one checked <b>«laws»</b> of them with none broken, in «facts_when» — a green run of that gate checks every law it defines, so the gap between the two figures is laws added since. The page used to show only the run's figure, which is how it said 197 while the file defined 205.</p>
+<p class="note">How many laws there are is a count, taken from <code>scripts/fuzz_laws.py</code> as this page is written. Whether they <em>hold</em> needs a run, and the last recorded one checked <b>«laws»</b> of them with none broken, on «when_laws» — a green run of that gate checks every law it defines, so the gap between the two figures is laws added since. The page used to show only the run's figure, which is how it said 197 while the file defined 205.</p>
 
 <h2>The page budget</h2>
 <p>The specification is capped at seventy pages and the test suite enforces it.
@@ -1290,17 +1289,29 @@ where each one stands.</p>
 code and diagnostics. «cross_total» are also compiled for x86_64 and run under
 Rosetta, «cross_pass» of them agreeing and the rest declined. Every generated
 program is checked for what it keeps as well as for what it prints.</p>
-<p class="note"><b>Which run each of these came from, because they are not all
-from one.</b> The corpus is <b>«programs»</b> standalone programs, counted as
-this page was written and by difftest's own filter — so a program added today
-is in that number today. The last recorded difftest run covered
-<b>«difftest»</b> of them. The wasm, cross-compile, law and whole-program
-figures are written into <code>site/facts.json</code> by
-<code>scripts/allgates.sh</code>, and these are from <b>«facts_when»</b>, when
-the corpus held <b>«facts_corpus»</b>. That file used to carry no date at all,
-which is how a September figure sat on this page under a sentence claiming
-every number came from the run that proved it. It carries one per figure
-now.</p>
+<h2>Which run wrote which figure</h2>
+<p>The corpus is <b>«programs»</b> standalone programs, counted as this page is
+written and by difftest's own filter — so a program added today is in that
+number today. Everything below it needs a run, and these are not all from one
+run. <code>site/facts.json</code> used to carry no date at all, which is how a
+September figure sat on this page under a sentence claiming every number came
+from the run that proved it; it carries one per figure now, and this is the
+whole record:</p>
+<div class="scroll"><table>
+<tr><th>Gate</th><th>What it compared</th><th>Figure</th><th>Taken</th></tr>
+«facts_rows»
+</table></div>
+<p class="note"><b>Two of these want reading carefully.</b> The
+<code>crosstest</code> figure above is a clean run over the corpus as it stood
+in September: every program cross-compiled and every one agreed, which is what
+that gate demands — it fails on a program it could not build. The figure the
+<a href="achieved.html">scorecard</a> cites instead is from October, attempted
+<b>«cross_total»</b> programs, and was taken on a machine at load 38 rising to
+134; <code>docs/binary-size.md</code> says in as many words that it should be
+taken again on a quiet machine before anybody calls it green. So the current
+figure is the worse one and the clean figure is the older one, and neither is
+the sentence anybody wants. The other is <code>difftest</code>: its figure
+describes a 478-program corpus that now holds «programs».</p>
 
 <h2>What does not work</h2>
 <div class="scroll"><table>
@@ -2042,7 +2053,7 @@ programs in the corpus run through the interpreter, the bundle and the native
 build and are compared on every build; the last recorded run of that gate
 covered «difftest» of them. «wasm_ok» also run in the browser engine
 — «wasm_skip» are skipped, because they want a filesystem, a socket, a
-process or threads, and both figures are from «facts_when» — and
+process or threads, and both figures are from a run on «when_wasm_ok» — and
 «cross_total» are compiled for x86_64, linked
 with <code>cc -arch x86_64</code> and <strong>run under Rosetta</strong>, which
 reaches code the arm64 build never does: <code>readdir$INODE64</code> exists

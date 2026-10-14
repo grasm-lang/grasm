@@ -67,7 +67,7 @@ where each one stands.</p>
 <h2>What holds</h2>
 <div class="figures">
   <div class="fig"><b>511</b><span>programs, engines identical</span></div>
-  <div class="fig"><b>394</b><span>identical in wasm</span></div>
+  <div class="fig"><b>415</b><span>identical in wasm</span></div>
   <div class="fig"><b>195</b><span>cross-compiled, agreeing</span></div>
   <div class="fig"><b>257</b><span>conformance programs</span></div>
   <div class="fig"><b>98</b><span>findings recorded</span></div>
@@ -77,17 +77,34 @@ where each one stands.</p>
 code and diagnostics. 224 are also compiled for x86_64 and run under
 Rosetta, 195 of them agreeing and the rest declined. Every generated
 program is checked for what it keeps as well as for what it prints.</p>
-<p class="note"><b>Which run each of these came from, because they are not all
-from one.</b> The corpus is <b>511</b> standalone programs, counted as
-this page was written and by difftest's own filter — so a program added today
-is in that number today. The last recorded difftest run covered
-<b>511</b> of them. The wasm, cross-compile, law and whole-program
-figures are written into <code>site/facts.json</code> by
-<code>scripts/allgates.sh</code>, and these are from <b>a run on 13 September 2026</b>, when
-the corpus held <b>478</b>. That file used to carry no date at all,
-which is how a September figure sat on this page under a sentence claiming
-every number came from the run that proved it. It carries one per figure
-now.</p>
+<h2>Which run wrote which figure</h2>
+<p>The corpus is <b>511</b> standalone programs, counted as this page is
+written and by difftest's own filter — so a program added today is in that
+number today. Everything below it needs a run, and these are not all from one
+run. <code>site/facts.json</code> used to carry no date at all, which is how a
+September figure sat on this page under a sentence claiming every number came
+from the run that proved it; it carries one per figure now, and this is the
+whole record:</p>
+<div class="scroll"><table>
+<tr><th>Gate</th><th>What it compared</th><th>Figure</th><th>Taken</th></tr>
+<tr><td><code>difftest</code></td><td>interpreter, bundle and native identical</td><td>478</td><td>13 September 2026</td></tr>
+<tr><td><code>wasmtest</code></td><td>identical in the browser engine</td><td>415</td><td>14 October 2026</td></tr>
+<tr><td><code>wasmtest</code></td><td>skipped: no filesystem, socket, process or thread</td><td>96</td><td>14 October 2026</td></tr>
+<tr><td><code>crosstest</code></td><td>cross-compiled to x86_64, identical under Rosetta</td><td>478</td><td>13 September 2026</td></tr>
+<tr><td><code>ProjectGold</code></td><td>whole programs agreeing on every engine</td><td>44</td><td>13 September 2026</td></tr>
+<tr><td><code>fuzz_laws</code></td><td>laws that held against arithmetic</td><td>197</td><td>13 September 2026</td></tr>
+</table></div>
+<p class="note"><b>Two of these want reading carefully.</b> The
+<code>crosstest</code> figure above is a clean run over the corpus as it stood
+in September: every program cross-compiled and every one agreed, which is what
+that gate demands — it fails on a program it could not build. The figure the
+<a href="achieved.html">scorecard</a> cites instead is from October, attempted
+<b>224</b> programs, and was taken on a machine at load 38 rising to
+134; <code>docs/binary-size.md</code> says in as many words that it should be
+taken again on a quiet machine before anybody calls it green. So the current
+figure is the worse one and the clean figure is the older one, and neither is
+the sentence anybody wants. The other is <code>difftest</code>: its figure
+describes a 478-program corpus that now holds 511.</p>
 
 <h2>What does not work</h2>
 <div class="scroll"><table>
