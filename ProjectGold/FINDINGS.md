@@ -113,6 +113,7 @@ and the entries disagree.
 | [F95](#f95) | two packages, one variant name, and the backend picked the wrong payload | S1, backend | **fixed** |
 | [F96](#f96) | the wasm engine stopped linking, and nothing said so | S2, build | **fixed** |
 | [F97](#f97) | one method name, two meanings: `bytes.slice` took a length where `list.slice` takes an end | S2, library | **fixed** |
+| [F100](#f100) | the backend's internal-compiler-error diagnostic was dead in every release build | S4, diagnostics | **fixed** |
 | [F99](#f99) | a ProjectGold program asserted a recursion depth no engine promises | S2, tests | **fixed** |
 | [F98](#f98) | a function returning `()` could not say so out loud | S3, backend | **fixed** |
 
@@ -4223,6 +4224,68 @@ by grep, so nothing was missed by grep.
 pairs, and separately that the clamping difference is the one that remains.
 That is the invariant the old signature broke, stated in a program that runs
 under all four engines.
+
+## F100 — the backend's internal-compiler-error diagnostic was dead in every release build (S4, diagnostics) — **fixed**
+
+`grasm_native` wraps code generation in `catch_unwind`, and the comment beside
+it says why: a Cranelift assertion used to reach the user as raw Rust text with
+an absolute path from the machine that built the compiler, and no `error:` line
+of grasm's own. The handler returns a diagnostic instead.
+
+**`[profile.release] panic = "abort"` makes that handler unreachable**, and
+release is the only build a user gets. Under `abort` the process stops at the
+panic site, so nothing after it runs — not the `catch_unwind`, not the `Err`
+arm, not the message. The raw Rust text the handler exists to replace is
+exactly what a release user still sees, followed by `SIGABRT`.
+
+Measured rather than reasoned about, with six lines:
+
+    fn main() {
+        let r = std::panic::catch_unwind(|| panic!("backend assertion"));
+        println!("caught: {}", r.is_err());
+    }
+
+`panic = "unwind"`: prints `caught: true`, exit 0. `panic = "abort"`: prints
+the panic and exits **134**. The handler never ran.
+
+**The setting is not the defect and is not revertible.** `grasm_rt_abi` is a
+`no_std` staticlib and rustc refuses to build one that could unwind — "unwinding
+panics are not supported without std". That crate is what supplies the
+allocator and panic handler to a compiled program, and it is why G5's 85.7 KB
+hello-world exists. So the compiler and the runtime want opposite panic
+strategies out of the same profile, and Cargo has no per-package `panic`
+setting.
+
+**The fix.** A panic *hook* does still run before the abort, so the same text
+is printed from a hook, installed only `#[cfg(panic = "abort")]` so an
+unwinding build keeps the `Err` arm and does not report it twice. The previous
+hook is restored after the call, so a later panic elsewhere is not blamed on
+the backend. Verified by forcing a panic inside the code generator, building
+release, and reading what a user would read:
+
+    error: internal compiler error — the backend panicked while generating code.
+      This is a bug in the backend, not a limitation of the language.
+      `grasm run` will still work. Please report it with this program.
+      The panic was `forced backend panic, for verification` at ...lib.rs:446:73.
+
+and `grasm run` on the same program answers, which is what the message
+promises. The forced panic was reverted and the binary rebuilt from the
+reverted source, because the build left on disk was the forced one.
+
+**What is still lost in release, and is not a defect to hide:** the process
+still aborts with 134. A hook can print, it cannot resume. The `Err` path that
+lets the rest of compilation report normally only exists in an unwinding build.
+
+**Why no gate caught it.** No gate makes the backend panic, so the handler had
+never run in either profile. The two cargo gates are `clippy --release` and
+`test --release`, and neither exercises a path that only a panic reaches.
+
+**Found by** compiling the workspace for Linux for the first time on this
+machine. The Linux check failed on `grasm_rt_abi` with the unwinding error,
+which is a debug-profile property and not a Linux one — and reading why it
+could not unwind is what exposed that the compiler's own handler could not
+either. See [[grasm-debug-gates]] for the other half of this: debug catches
+what release accepts, and here release *hides* what debug reports.
 
 ## F99 — a ProjectGold program asserted a recursion depth no engine promises (S2, tests) — **fixed**
 

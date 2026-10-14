@@ -404,8 +404,48 @@ fn compile_object_scoped(
     // fired in, and an absolute path from the machine that built the
     // compiler, with no `error:` line of grasm's own. Caught here so it
     // arrives as a diagnostic that says what happened and what still works.
+    // `[profile.release] panic = "abort"` makes the `catch_unwind` below dead
+    // in every release build -- which is every build a user gets. The process
+    // aborts at the panic site and nothing after it runs, so the diagnostic
+    // above was unreachable exactly where it was needed. The setting is not a
+    // choice to revert: `grasm_rt_abi` is a `no_std` staticlib and rustc
+    // refuses to build one that could unwind.
+    //
+    // Measured rather than assumed: the same six-line program prints
+    // "caught: true" and exits 0 under unwind, and exits 134 having printed
+    // nothing under abort.
+    //
+    // A panic *hook* does still run before the abort, so under abort the same
+    // text is printed from there. Gated on the strategy so an unwinding build
+    // keeps the `Err` arm below and does not report it twice, and the previous
+    // hook is put back so a later panic elsewhere is not blamed on the backend.
+    #[cfg(panic = "abort")]
+    let previous_hook = {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|info| {
+            let at = info
+                .location()
+                .map(|l| l.to_string())
+                .unwrap_or_else(|| "an unknown location".to_string());
+            let what = info
+                .payload()
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| info.payload().downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "no message".to_string());
+            eprintln!(
+                "error: internal compiler error \u{2014} the backend panicked while generating code.
+  This is a bug in the backend, not a limitation of the language.
+  `grasm run` will still work. Please report it with this program.
+  The panic was `{what}` at {at}."
+            );
+        }));
+        previous
+    };
     let compiled =
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cg.compile_program(&views)));
+    #[cfg(panic = "abort")]
+    std::panic::set_hook(previous_hook);
     let compiled = match compiled {
         Ok(r) => r,
         Err(_) => {

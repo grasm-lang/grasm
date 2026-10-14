@@ -183,7 +183,7 @@ above and not only at the end of the site.</p>
 <tr><td>To hire</td><td>Nobody outside this repository has written Grasm.</td></tr>
 <tr><td>A native debugger</td><td>There is a DAP server and it works against the interpreter. The Cranelift backend emits no DWARF, so GDB and LLDB cannot meaningfully inspect a compiled binary.</td></tr>
 <tr><td>async/await</td><td>There are threads, channels, structured concurrency and non-blocking I/O on one thread. There is no async/await, and tasks still refuse every effect.</td></tr>
-<tr><td>Linux, today</td><td>CI compiles it. This machine never has: about 2,100 lines of the operating-system layer are written for Linux and have not been built here, let alone run.</td></tr>
+<tr><td>Linux, today</td><td>CI compiles it. This machine type-checked it for the first time on 15 October 2026, which is the first time the 2,100 lines of <code>cfg(not(macos))</code> went through a compiler here: <code>cargo check --release --target x86_64-unknown-linux-gnu --workspace</code> passes for the whole workspace, every crate. In a debug profile one crate does not build — the runtime's <code>no_std</code> staticlib, which rustc refuses to compile under unwinding panics on any platform, and release is the only profile it is ever built in. Nothing has been <em>linked</em> or <em>run</em> on Linux, and a type-check is not a working binary.</td></tr>
 </table></div>
 
 <p class="note"><strong>The one-line version.</strong> Everywhere else, the
