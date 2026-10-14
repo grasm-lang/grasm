@@ -547,6 +547,15 @@ pub mod io {
         pub fn flush(&self) -> Result<()> {
             self.lock().flush()
         }
+
+        /// Flush unless the lock is held, for `flush_all` on the way out.
+        pub fn flush_if_free(&self) -> Result<()> {
+            let held = if self.fd == 1 { OUT.try_lock() } else { ERR.try_lock() };
+            match held {
+                Some(held) => Stream { fd: self.fd, held }.flush(),
+                None => Ok(()),
+            }
+        }
     }
 
     pub fn stdout() -> Handle {
@@ -560,8 +569,12 @@ pub mod io {
     /// Called by `sys::exit`, because nothing else will: `std` flushed stdout
     /// when the process ended and raw file descriptors do not.
     pub fn flush_all() {
-        let _ = stdout().flush();
-        let _ = stderr().flush();
+        // `flush_if_free`, not `flush`: this is called by `sys::exit`, which
+        // is reached from paths that are *holding* a stream lock -- and a
+        // pthread mutex waiting on itself ends the process rather than the
+        // flush. See F101.
+        let _ = stdout().flush_if_free();
+        let _ = stderr().flush_if_free();
     }
 
     /// One line from stdin, newline included, as `BufRead::read_line` gives
@@ -2272,6 +2285,18 @@ pub mod sync {
                 }
             }
 
+            /// `None` when it is already held, where `lock` would assert.
+            /// `flush_all` needs this: it runs from `exit`, which may be
+            /// reached with a stream lock held, and refusing to flush is the
+            /// right answer there where stopping the process is not.
+            pub fn try_lock(&self) -> Option<Guard<'_, T>> {
+                if self.held.get() {
+                    return None;
+                }
+                self.held.set(true);
+                Some(Guard { held: &self.held, value: self.value.get() })
+            }
+
             pub fn lock(&self) -> Guard<'_, T> {
                 assert!(
                     !self.held.get(),
@@ -2378,6 +2403,7 @@ pub mod sync {
     extern "C" {
         fn pthread_mutex_init(m: *mut u8, attr: *const u8) -> i32;
         fn pthread_mutex_lock(m: *mut u8) -> i32;
+        fn pthread_mutex_trylock(m: *mut u8) -> i32;
         fn pthread_mutex_unlock(m: *mut u8) -> i32;
         fn pthread_rwlock_init(l: *mut u8, attr: *const u8) -> i32;
         fn pthread_rwlock_rdlock(l: *mut u8) -> i32;
@@ -2453,6 +2479,22 @@ pub mod sync {
             let at = self.raw();
             unsafe { pthread_mutex_lock(at) };
             Guard { at, value: self.value.get(), _held: core::marker::PhantomData }
+        }
+
+        /// `None` when the lock is already held, rather than waiting for it.
+        ///
+        /// This exists for `flush_all`, which runs from `exit`. A pthread
+        /// mutex is not reentrant, so a stream lock held by the code on its
+        /// way out -- a panic, an unhandled error from main, the leak report
+        /// -- made the flush wait for a lock only it could release. Every one
+        /// of those paths writes and flushes before it exits, so skipping a
+        /// held stream loses nothing, where waiting lost the process (F101).
+        pub fn try_lock(&self) -> Option<Guard<'_, T>> {
+            let at = self.raw();
+            if unsafe { pthread_mutex_trylock(at) } != 0 {
+                return None;
+            }
+            Some(Guard { at, value: self.value.get(), _held: core::marker::PhantomData })
         }
     }
 

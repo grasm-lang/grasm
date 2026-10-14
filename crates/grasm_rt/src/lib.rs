@@ -2724,17 +2724,23 @@ pub extern "C" fn grasm_check_leaks() {
         return;
     }
     let _ = crate::io::stdout().flush();
-    let mut err = crate::io::stderr().lock();
-    if live != 0 {
-        let _ = writeln!(err, "leak: {live} allocation(s) still live at exit");
+    // Scoped for the same reason as the panic and main-error paths: holding
+    // this across `sys::exit` deadlocked after printing (F101). It mattered
+    // least here and was the hardest to notice, because the leak check only
+    // runs under GRASM_LEAK_CHECK=1.
+    {
+        let mut err = crate::io::stderr().lock();
+        if live != 0 {
+            let _ = writeln!(err, "leak: {live} allocation(s) still live at exit");
+        }
+        if copies != 0 {
+            let _ = writeln!(
+                err,
+                "leak: {copies} string copy/copies handed to C and never freed"
+            );
+        }
+        let _ = err.flush();
     }
-    if copies != 0 {
-        let _ = writeln!(
-            err,
-            "leak: {copies} string copy/copies handed to C and never freed"
-        );
-    }
-    let _ = err.flush();
     crate::sys::exit(7);
 }
 
@@ -6042,13 +6048,19 @@ pub unsafe extern "C" fn grasm_report_main_err(v: *mut RtVal) {
     };
     // stderr, for the same reason a panic goes there ([E-MAIN-ERR]).
     let _ = crate::io::stdout().flush();
-    let mut out = crate::io::stderr().lock();
-    let _ = writeln!(
-        out,
-        "error: unhandled error from main: {}",
-        display(fields[0])
-    );
-    let _ = out.flush();
+    // Scoped, so the guard is gone before the exit: `sys::exit` flushes, and
+    // this lock held across it deadlocked the process after printing the line
+    // (F101). `flush_all` skips a held stream now, so this is the second of
+    // two defences rather than the only one.
+    {
+        let mut out = crate::io::stderr().lock();
+        let _ = writeln!(
+            out,
+            "error: unhandled error from main: {}",
+            display(fields[0])
+        );
+        let _ = out.flush();
+    }
     crate::sys::exit(1);
 }
 

@@ -4275,13 +4275,37 @@ that fails, because a failure is a result and a hang is nothing at all. It was
 noticed only because the suite was still running long after it should have
 finished.
 
+**It was three paths, not one, and the first fix found only one of them.**
+Scoping the guard in `rt_panic` fixed three of the four hanging tests. The
+fourth, `mainerr`, still hung — `grasm_report_main_err` holds the same lock
+across `crate::sys::exit(1)`, and so does the leak report across `exit(7)`.
+Every path in the runtime that prints and then leaves had the same shape, and
+only the panic one had a test that reached it.
+
+So the fix is at the sink as well as at the sites. `grasm_sys` gained
+`Mutex::try_lock`, and `io::flush_all` — which is what `sys::exit` calls — now
+skips a stream whose lock is held instead of waiting for it. Each of those
+paths writes and flushes before it exits, so skipping loses nothing where
+waiting lost the process. The three guards are scoped too, which is the second
+defence rather than the only one.
+
+The wasm32 build had been saying so all along: its single-threaded lock
+`assert!`s on a second take, with the message "a lock was taken twice on the
+one thread wasm32 has, which a pthread mutex would deadlock on". The condition
+was written down, next to the code, by whoever wrote that lock.
+
 **The fix includes the gate**, `scripts/panictest.sh`, registered as `panics`.
 Every run in it has a 20-second limit and **a timeout is a failure**, which is
 as much the point as the exit code: four programs across interpreter, bundle
 and native, each required to exit 101, to say `panic: ` on stderr, and to
 leave stdout holding exactly what was printed before the panic and nothing
 else. Verified by restoring the defect, watching the gate go red on the native
-engine for all four programs, and putting the fix back.
+engine for all four programs, and putting the fix back. Fifteen runs now: five
+programs across three engines, with `mainerr` carrying its own exit code of 1
+because the gate is about the exit happening at all rather than about 101. The
+leak path is the one of the three it does not reach, and the gate's header says
+why: that needs a program that leaks on purpose, and a deliberate leak is a
+defect rather than a fixture.
 
 **Found by** running `cargo test --release --workspace` after an unrelated
 change, noticing it had been running for ninety minutes, and looking at what

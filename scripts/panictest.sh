@@ -8,6 +8,13 @@
 # `cargo test`, and when the path broke that suite did not go red: it **hung**,
 # for an hour and a half, which is not a result anybody reads.
 #
+# Three runtime paths print and then exit while holding that lock: a panic, an
+# unhandled error from main, and the leak report. The first two are exercised
+# below. The third is not, and cannot be from here: it needs a program that
+# actually leaks under GRASM_LEAK_CHECK=1, and a leak that exists on purpose is
+# a defect, not a fixture. Its guard is scoped and `flush_all` skips a held
+# stream, which is the cover it has.
+#
 # So every run here has a timeout, and a timeout is a failure. That is the
 # point of the gate as much as the exit code is: `rt_panic` held the stderr
 # lock across `crate::sys::exit`, which flushes stderr again, so every panic in
@@ -32,6 +39,7 @@ prog() {
     divzero)  printf 'fn main() {\n    let n = input().len()\n    print("{10 / n}")\n}\n' ;;
     assert)   printf 'fn main() {\n    assert(input().len() > 100)\n    print("unreached")\n}\n' ;;
     after)    printf 'fn main() {\n    print("before")\n    assert(input().len() > 100)\n}\n' ;;
+    mainerr)  printf 'fn main() {\n    print("before")\n    write_file("/no/such/dir/x.txt", "data")\n}\n' ;;
   esac
 }
 
@@ -61,15 +69,28 @@ limited() {
   wait "$pid"; echo "exit:$?"
 }
 
+# What each program must leave behind. The three runtime paths that print and
+# then exit do not share an exit code -- a panic is 101, an unhandled error
+# from main is 1 -- and the gate is about the exit happening at all.
+expected() {
+  case "$1" in
+    mainerr) echo "1|error: unhandled error from main" ;;
+    *)       echo "101|panic: " ;;
+  esac
+}
+
 fail=0
 checked=0
-for name in message divzero assert after; do
+for name in message divzero assert after mainerr; do
     src="$WORK/$name.gr"
     prog "$name" > "$src"
     : > "$WORK/in.txt"
     # What stdout is allowed to hold: a panic must not corrupt the program's
     # output, and `after` is here because something was printed before it.
-    case "$name" in after) want_out="before" ;; *) want_out="" ;; esac
+    case "$name" in after|mainerr) want_out="before" ;; *) want_out="" ;; esac
+    want=$(expected "$name")
+    want_code=${want%%|*}
+    want_err=${want#*|}
 
     if ! "$GRASM" build "$src" -o "$WORK/$name.bundle" >/dev/null 2>&1; then
         echo "$name: the bundle did not build"; fail=1; continue
@@ -96,8 +117,8 @@ for name in message divzero assert after; do
         fi
         code=${verdict#exit:}
         problems=""
-        [ "$code" = "101" ] || problems="$problems exit=$code(want 101)"
-        case "$got_err" in *"panic: "*) ;; *) problems="$problems no-panic-line" ;; esac
+        [ "$code" = "$want_code" ] || problems="$problems exit=$code(want $want_code)"
+        case "$got_err" in *"$want_err"*) ;; *) problems="$problems stderr-missing-[$want_err]" ;; esac
         [ "$got_out" = "$want_out" ] || problems="$problems stdout=[$got_out](want [$want_out])"
         if [ -n "$problems" ]; then
             echo "$name on the $engine:$problems"; fail=1
@@ -106,7 +127,7 @@ for name in message divzero assert after; do
 done
 
 if [ "$fail" -eq 0 ]; then
-    echo "panics: $checked runs, every one 101 with a panic line and clean stdout"
+    echo "panics: $checked runs, every one left with its own code, its line and clean stdout"
 else
     echo "panics: FAILED"
 fi
