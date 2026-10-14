@@ -100,7 +100,8 @@ echo "the margin: bisecting the interpreter's capacity"
 lo=$GUARANTEED
 hi=100000
 if reaches "$hi"; then
-    echo "    reaches MAX_DEPTH ($hi) -- the depth guard stops it, not the stack"
+    echo "    reaches MAX_DEPTH -- the depth guard stops it, not the stack"
+    echo "    capacity: $hi nested calls (the guard's own ceiling)"
     cap=$hi
 else
     while [ $((hi - lo)) -gt 500 ]; do
@@ -110,7 +111,7 @@ else
     cap=$lo
 fi
 bytes=$(( BUDGET_MB * 1024 * 1024 / cap ))
-echo "    capacity:  ~$cap nested calls"
+echo "    capacity: $cap nested calls (bisected to within 500)"
 echo "    per frame: ~$bytes bytes of the ${BUDGET_MB} MB budget"
 echo "    margin:    $(( cap / GUARANTEED ))x the guarantee (floor is $(( FLOOR / GUARANTEED ))x)"
 

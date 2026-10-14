@@ -150,6 +150,7 @@ WANT = {
     "crosstest": [("cross", "identical")],
     "gold":      [("agreeing", "agreeing")],
     "fuzz_laws": [("laws", "laws")],
+    "depth":     [("depth_cap", "capacity")],
 }
 out = {}
 for gate, wants in sorted(WANT.items()):

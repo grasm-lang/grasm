@@ -428,9 +428,10 @@ def pretty(iso):
 
 
 # What only a run can know. `scripts/allgates.sh` writes these.
-MEASURED = ["corpus", "wasm_ok", "wasm_skip", "cross", "agreeing", "laws"]
+MEASURED = ["corpus", "wasm_ok", "wasm_skip", "cross", "agreeing", "laws",
+            "depth_cap"]
 
-# The same six, with the gate that writes each and what it means, for the
+# The same seven, with the gate that writes each and what it means, for the
 # table on the status page.
 FIGURE_ROWS = [
     ("corpus", "difftest", "interpreter, bundle and native identical"),
@@ -439,6 +440,7 @@ FIGURE_ROWS = [
     ("cross", "crosstest", "cross-compiled to x86_64, identical under Rosetta"),
     ("agreeing", "ProjectGold", "whole programs agreeing on every engine"),
     ("laws", "fuzz_laws", "laws that held against arithmetic"),
+    ("depth_cap", "depth", "nested calls the interpreter reaches, against 10,000 promised"),
 ]
 
 

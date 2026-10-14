@@ -81,6 +81,17 @@ fn on_deep_stack<T: Send>(f: impl FnOnce() -> T + Send) -> T {
         match spawned {
             Ok(handle) => match handle.join() {
                 Ok(v) => v,
+                // Dead in a release build, and kept because it is correct
+                // where it is live. `[profile.release] panic = "abort"` --
+                // required by `grasm_rt_abi`, which cannot unwind -- stops the
+                // process at the panic site, so a panic here never arrives as
+                // a payload to re-raise. The reachable difference is an exit
+                // code on an internal error: 134 rather than 101. It is not
+                // the depth contract, which does not come through here: a
+                // Grasm fault is returned as text (`run_src_capturing_fault`),
+                // which is why [E-RECURSION-DEPTH] still exits 101 in release
+                // and `scripts/depthtest.sh` checks that it does. See F100 for
+                // the handler where this same setting did cost a diagnostic.
                 Err(payload) => std::panic::resume_unwind(payload),
             },
             // No thread available. The closure went with the failed spawn, so

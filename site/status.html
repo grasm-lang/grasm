@@ -93,6 +93,7 @@ whole record:</p>
 <tr><td><code>crosstest</code></td><td>cross-compiled to x86_64, identical under Rosetta</td><td>478</td><td>13 September 2026</td></tr>
 <tr><td><code>ProjectGold</code></td><td>whole programs agreeing on every engine</td><td>44</td><td>14 October 2026</td></tr>
 <tr><td><code>fuzz_laws</code></td><td>laws that held against arithmetic</td><td>205</td><td>14 October 2026</td></tr>
+<tr><td><code>depth</code></td><td>nested calls the interpreter reaches, against 10,000 promised</td><td>31,444</td><td>15 October 2026</td></tr>
 </table></div>
 <p class="note"><b>Two of these want reading carefully.</b> The
 <code>crosstest</code> figure above is a clean run over the corpus as it stood
@@ -109,6 +110,18 @@ has two records: the row above is what the September run wrote into
 511 programs. This table is that file and nothing else, so the older
 record is the one in it.</p>
 
+<p class="note">The <code>depth</code> figure is a capacity, not a limit, and
+it is only comparable with itself. A frame holds the locals of whatever
+function is recursing, so the number moves with the <em>shape</em> of the
+program measuring it: the gate's own function reaches 31444, where the
+one in <code>ProjectGold/08-fibonacci</code> reached about 42,000 on the same
+build. That is why the gate pins one shape and asks not to have it tidied.
+What the specification promises is <b>10,000</b>, and what the gate fails on is
+the margin falling under twice that — the smallest margin in which a frame
+doubling is caught here rather than by the guarantee breaking. It is in the
+table because the margin moved once already with nothing noticing: see
+<code>F99</code>.</p>
+
 <h2>What does not work</h2>
 <div class="scroll"><table>
 <tr><th>Limit</th><th>Detail</th></tr>
@@ -118,7 +131,7 @@ record is the one in it.</p>
 <tr><td>Not faster than Rust</td><td>The geomean is 0.965× of it, 0.955× with the harness floor taken out of both sides, against a 0.95× target — so the goal is met and the claim is not available. <code>tree</code> at 0.51× is the worst row. On the systems suite Grasm loses <code>etl</code> by 3.6×, and wins memory everywhere — 8× on <code>chat</code>. <a href="performance.html">Every row →</a></td></tr>
 <tr><td>Polymorphic recursion</td><td>Refused by name at build time. It is what monomorphization is; no work removes it.</td></tr>
 <tr><td>Small standard library</td><td>82 methods. Enough for 44 whole programs and 12 applications; you will find gaps in something larger.</td></tr>
-<tr><td>Linux never compiled here</td><td>About 2,100 lines of the operating-system layer are written for Linux and no target is installed on this machine. CI compiles it. A compile does not catch a wrong constant, which is how <code>AF_INET6</code> was 30 on Linux for four commits.</td></tr>
+<tr><td>Linux never linked or run here</td><td>The 2,100 lines of the operating-system layer written for Linux went through a compiler on this machine for the first time on 15 October 2026: <code>cargo check --release --target x86_64-unknown-linux-gnu --workspace</code> passes for every crate. Nothing has been linked or run, and a type-check does not catch a wrong constant — which is how <code>AF_INET6</code> was 30 on Linux for four commits. CI compiles it properly.</td></tr>
 <tr><td>Tasks refuse every effect</td><td>1,000,000 tasks run, and none of them may do I/O. G6's <em>uncolored</em> half is the open one.</td></tr>
 <tr><td>No query engine</td><td>Edit-to-diagnostic is p95 40 ms by re-checking the whole program, which is fast enough at this repository's size and will not be at a million lines.</td></tr>
 <tr><td>No users but this project</td><td>Nobody has hit it from an angle nobody here thought of.</td></tr>
