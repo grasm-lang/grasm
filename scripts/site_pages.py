@@ -1301,7 +1301,7 @@ whole record:</p>
 <tr><th>Gate</th><th>What it compared</th><th>Figure</th><th>Taken</th></tr>
 «facts_rows»
 </table></div>
-<p class="note"><b>Two of these want reading carefully.</b> The
+<p class="note"><b>One of these wants reading carefully.</b> The
 <code>crosstest</code> figure above is a clean run over the corpus as it stood
 in September: every program cross-compiled and every one agreed, which is what
 that gate demands — it fails on a program it could not build. The figure the
@@ -1310,11 +1310,16 @@ that gate demands — it fails on a program it could not build. The figure the
 134; <code>docs/binary-size.md</code> says in as many words that it should be
 taken again on a quiet machine before anybody calls it green. So the current
 figure is the worse one and the clean figure is the older one, and neither is
-the sentence anybody wants. The other is <code>difftest</code>, which also
-has two records: the row above is what the September run wrote into
-<code>site/facts.json</code>, and the October one cited earlier covers all
-«difftest» programs. This table is that file and nothing else, so the older
-record is the one in it.</p>
+the sentence anybody wants.</p>
+
+<p class="note"><code>difftest</code> used to be the other one, and is not any
+more: its row is a run of today over all <b>«difftest»</b> programs, which is
+every program the corpus holds, and it agrees exactly with the count this page
+takes from the tree. Three earlier attempts at it were stopped at a two-hour
+limit, which read as the gate being too big for the window — and was not. The
+run that finished took <b>nineteen minutes</b> on a machine at load 13. The
+same work had not finished in two hours at load 100, so what those attempts
+measured was the load, not the gate.</p>
 
 <p class="note">The <code>depth</code> figure is a capacity, not a limit, and
 it is only comparable with itself. A frame holds the locals of whatever
