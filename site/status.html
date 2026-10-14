@@ -70,7 +70,7 @@ where each one stands.</p>
   <div class="fig"><b>415</b><span>identical in wasm</span></div>
   <div class="fig"><b>195</b><span>cross-compiled, agreeing</span></div>
   <div class="fig"><b>257</b><span>conformance programs</span></div>
-  <div class="fig"><b>98</b><span>findings recorded</span></div>
+  <div class="fig"><b>99</b><span>findings recorded</span></div>
   <div class="fig"><b>15</b><span>fuzz generators</span></div>
 </div>
 <p>Interpreter, bundle and native builds agree byte for byte on stdout, exit
@@ -91,8 +91,8 @@ whole record:</p>
 <tr><td><code>wasmtest</code></td><td>identical in the browser engine</td><td>415</td><td>14 October 2026</td></tr>
 <tr><td><code>wasmtest</code></td><td>skipped: no filesystem, socket, process or thread</td><td>96</td><td>14 October 2026</td></tr>
 <tr><td><code>crosstest</code></td><td>cross-compiled to x86_64, identical under Rosetta</td><td>478</td><td>13 September 2026</td></tr>
-<tr><td><code>ProjectGold</code></td><td>whole programs agreeing on every engine</td><td>44</td><td>13 September 2026</td></tr>
-<tr><td><code>fuzz_laws</code></td><td>laws that held against arithmetic</td><td>197</td><td>13 September 2026</td></tr>
+<tr><td><code>ProjectGold</code></td><td>whole programs agreeing on every engine</td><td>44</td><td>14 October 2026</td></tr>
+<tr><td><code>fuzz_laws</code></td><td>laws that held against arithmetic</td><td>205</td><td>14 October 2026</td></tr>
 </table></div>
 <p class="note"><b>Two of these want reading carefully.</b> The
 <code>crosstest</code> figure above is a clean run over the corpus as it stood
@@ -103,8 +103,11 @@ that gate demands — it fails on a program it could not build. The figure the
 134; <code>docs/binary-size.md</code> says in as many words that it should be
 taken again on a quiet machine before anybody calls it green. So the current
 figure is the worse one and the clean figure is the older one, and neither is
-the sentence anybody wants. The other is <code>difftest</code>: its figure
-describes a 478-program corpus that now holds 511.</p>
+the sentence anybody wants. The other is <code>difftest</code>, which also
+has two records: the row above is what the September run wrote into
+<code>site/facts.json</code>, and the October one cited earlier covers all
+511 programs. This table is that file and nothing else, so the older
+record is the one in it.</p>
 
 <h2>What does not work</h2>
 <div class="scroll"><table>
@@ -136,7 +139,7 @@ releasing the wrong lock. <a href="achieved.html">The list is on the
 scorecard.</a></p>
 
 <h2>How that is kept honest</h2>
-<p>All 98 findings are written down in <code>ProjectGold/FINDINGS.md</code>,
+<p>All 99 findings are written down in <code>ProjectGold/FINDINGS.md</code>,
 including the ones that were the test harness's fault, the ones withdrawn as
 wrong, and the ones caught before they shipped. Every gate is verified by
 breaking the thing it guards and confirming it fails — and one of them had to

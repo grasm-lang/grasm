@@ -1310,8 +1310,11 @@ that gate demands — it fails on a program it could not build. The figure the
 134; <code>docs/binary-size.md</code> says in as many words that it should be
 taken again on a quiet machine before anybody calls it green. So the current
 figure is the worse one and the clean figure is the older one, and neither is
-the sentence anybody wants. The other is <code>difftest</code>: its figure
-describes a 478-program corpus that now holds «programs».</p>
+the sentence anybody wants. The other is <code>difftest</code>, which also
+has two records: the row above is what the September run wrote into
+<code>site/facts.json</code>, and the October one cited earlier covers all
+«difftest» programs. This table is that file and nothing else, so the older
+record is the one in it.</p>
 
 <h2>What does not work</h2>
 <div class="scroll"><table>

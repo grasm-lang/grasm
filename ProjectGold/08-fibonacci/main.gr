@@ -51,6 +51,19 @@ fn fib_memo(n: i64, inout seen: Map[i64, i64]) -> i64 {
 /// Deep recursion, to show the stack actually goes where [E-RECURSION-DEPTH]
 /// says it does. Not Fibonacci — a plain countdown, so the only thing measured
 /// is depth.
+///
+/// 10,000 is the number the clause guarantees, and this asked for 50,000 for
+/// a year because both engines happened to reach it. They stopped: the
+/// interpreter's own bound is between 42,000 and 43,000 frames now, the
+/// budget constant never changed, so a frame got fatter. The clause licenses
+/// exactly that — "past an implementation's own bound the program panics",
+/// and §0 says the engines stop in different places — so a program asserting
+/// 50,000 was asserting something no engine promises, and the interpreter
+/// says as much in a comment beside its own limit: naming the number
+/// advertises a bound no program should depend on. The guaranteed depth is
+/// what a test may assert; `spec/conformance/E-RECURSION-DEPTH.gr` holds the
+/// property that matters past it, which is that overflow panics instead of
+/// aborting.
 fn depth(n: i64) -> i64 {
     if n == 0 {
         return 0
@@ -115,5 +128,5 @@ fn main() {
 
     print("--- recursion depth ---")
     print("depth(1000)   = {depth(1000)}")
-    print("depth(50000)  = {depth(50000)}")
+    print("depth(10000)  = {depth(10000)}")
 }

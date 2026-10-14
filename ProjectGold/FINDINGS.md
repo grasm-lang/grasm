@@ -113,6 +113,7 @@ and the entries disagree.
 | [F95](#f95) | two packages, one variant name, and the backend picked the wrong payload | S1, backend | **fixed** |
 | [F96](#f96) | the wasm engine stopped linking, and nothing said so | S2, build | **fixed** |
 | [F97](#f97) | one method name, two meanings: `bytes.slice` took a length where `list.slice` takes an end | S2, library | **fixed** |
+| [F99](#f99) | a ProjectGold program asserted a recursion depth no engine promises | S2, tests | **fixed** |
 | [F98](#f98) | a function returning `()` could not say so out loud | S3, backend | **fixed** |
 
 <!-- end index -->
@@ -4222,6 +4223,51 @@ by grep, so nothing was missed by grep.
 pairs, and separately that the clamping difference is the one that remains.
 That is the invariant the old signature broke, stated in a program that runs
 under all four engines.
+
+## F99 — a ProjectGold program asserted a recursion depth no engine promises (S2, tests) — **fixed**
+
+`ProjectGold/run.sh` went red on `08-fibonacci`: the interpreter panicked with
+`stack overflow: recursion too deep` where the native build returned an
+answer. That reads like an S1 engine disagreement and is not one.
+
+**What the clause says.** [E-RECURSION-DEPTH] guarantees **at least 10,000**
+nested calls and then says *past an implementation's own bound* the program
+panics with a stack-overflow message and exit 101 — it does not abort or
+corrupt the process. §0 of `spec/semantics.md` says the two engines "stop in
+different places" in as many words. So differing beyond 10,000 is licensed,
+and the specified property past the bound is the *manner* of failure, not the
+depth.
+
+The program asserted `depth(50000) = 50000`. That is five times the guarantee,
+on a number the interpreter's own source warns against depending on: beside its
+limit, `crates/grasm_interp/src/interp.rs` says naming the bound "advertised a
+limit no program should depend on and made the same failure read as two
+different failures". This program was depending on it.
+
+**What changed.** The interpreter's bound is now between 42,000 and 43,000
+frames — `depth(42000)` answers and `depth(43000)` panics. `STACK_BUDGET` has
+been 448 MB since it was introduced and `STACK_BYTES` 512 MB; neither value
+moved, only its visibility. So the budget buys fewer frames than it did, which
+means a frame got fatter — about 10.4 KB of stack per Grasm call. The suite
+recorded 44 agreeing on 13 September with the same assertion, so the capacity
+crossed 50,000 downward somewhere between then and now.
+
+**The fix.** `08-fibonacci` asks for `depth(10000)` — the guaranteed depth —
+and says in a comment why not more, pointing at
+`spec/conformance/E-RECURSION-DEPTH.gr` for the property that matters past the
+bound. A test may assert the contract; it may not assert an implementation's
+headroom.
+
+**What is not fixed, and is the more interesting half.** Nothing measures the
+interpreter's frame. The capacity fell by at least 15% with no gate noticing,
+because the only thing that depended on it was one program's expectation, and
+when that broke it looked like an engine disagreement. A frame that doubles
+again takes the guaranteed 10,000 with it, and the first sign would be the
+same misleading failure. Worth a gate that asserts the guarantee with margin
+and reports the measured bound.
+
+**Found by** refreshing the figures on the site, which is also how the stale
+playground module turned up. Neither was found by looking for it.
 
 ## F98 — a function returning `()` could not say so out loud (S3, backend) — **fixed**
 

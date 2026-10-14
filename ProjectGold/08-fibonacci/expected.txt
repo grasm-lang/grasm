@@ -16,4 +16,4 @@ F(80) iterative = 23416728348467685
 memo table holds 79 entries
 --- recursion depth ---
 depth(1000)   = 1000
-depth(50000)  = 50000
+depth(10000)  = 10000
