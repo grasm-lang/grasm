@@ -2925,6 +2925,27 @@ mod tests {
         at
     }
 
+    /// `try_lock` reports a held lock rather than waiting for it.
+    ///
+    /// The defect behind it (F101): every runtime path that prints and then
+    /// exits held a stream lock across `sys::exit`, which flushes, which locks
+    /// the same stream. A pthread mutex is not reentrant, so a natively
+    /// compiled program printed its panic and then deadlocked. `flush_all`
+    /// skips a held stream now, and this is what makes that possible -- so it
+    /// is tested on the lock rather than only through a compiled program,
+    /// because the gate that would have caught the deadlock did not fail, it
+    /// hung.
+    #[test]
+    fn try_lock_reports_a_held_lock_instead_of_waiting() {
+        static M: crate::sync::Mutex<i32> = crate::sync::Mutex::new(7);
+        let held = M.lock();
+        assert!(M.try_lock().is_none(), "a held lock must report, not wait");
+        assert_eq!(*held, 7);
+        drop(held);
+        let now = M.try_lock().expect("free again once the guard is gone");
+        assert_eq!(*now, 7);
+    }
+
     /// The defect this exists for: `open`'s mode is a **variadic** argument,
     /// and declaring it as a fixed parameter sent it to a register on arm64
     /// where `open` reads the stack. The file was then created with a garbage

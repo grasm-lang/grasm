@@ -7,6 +7,53 @@ makes shipping them honest rather than quiet.
 
 **Open S1: none. Open S2: none. Open S3: none. Open S4: none.**
 
+**One gate is red, and it is right to be: the specification is over the budget
+it binds itself to.** `unittests` fails on
+`the_kernel_budgets_do_not_regress`. That is not one of the severities above --
+nothing is wrong with the implementation -- but `docs/release-scope.md` asks
+for every gate green, so it is open and it is here.
+
+    the specification is ~71 pages against a §19.2 budget of 50. It has grown
+    past the point where the gap is worth recording rather than closing.
+
+MASTERPLAN §19.2 binds Grasm-Core to a formal spec of 50 pages, and
+`spec/core.md` explains why that one is binding rather than aspirational: the
+claim that Core fits in one context window is the thing no competitor can copy
+quickly, and it is worth nothing unless the split is real and checked. The test
+allows up to 70 pages -- 3,550 lines at the 50-lines-a-page conversion
+`spec/core.md` states -- and the tripwire is there to say when recording the
+gap stops being enough.
+
+**It crossed on 2026-10-12, at `03b8aad`**, from 3,549 lines to 3,556: the
+per-channel wait queue rewrote [E-SCHEDULE] and added seven lines. Counted at
+each commit in the range rather than guessed.
+
+Three of those seven are gone now, because they were performance rationale in a
+normative document and `docs/task-scaling.md` already makes the same
+O(runnable) point. That leaves 3,553 lines, still 71 pages, **and the gate is
+still red** -- which is the honest outcome. The remaining four lines are the
+wake rules themselves, and they are normative: a send wakes the longest-waiting
+sender, a receive the longest-waiting receiver, closing wakes every waiter.
+
+**What it would take to close, and why it is not done here.** 71 to 50 is
+twenty-one pages, and `spec/core.md`'s own §"What would have to move" already
+names the seven forms that would take Core from 37 constructs to 30 and what
+each costs. That is a design decision about what Grasm-Core *is*, not an
+editing job, and it belongs to whoever owns that decision. What must not happen
+is the alternative: `spec/core.md` says it in as many words --
+
+> A number that is met by redefining what counts is not a number.
+
+so the tripwire is not being raised to 71, and the metric is not being
+re-scoped to exclude `spec/README.md` (59 lines, which would buy exactly the
+page needed). Either the spec gets smaller or the commitment gets re-stated
+deliberately.
+
+**Why it sat unseen for three days.** The gate that reports it is `unittests`,
+and from 2026-10-12 that suite did not fail -- it **hung**, on F101's panic
+deadlock, which landed the same day. Two defects from one day, and the first
+one hid the second.
+
 Closed on 2026-09-22: a second `var` of a name already bound in the same block
 leaked what the first binding owned. `FnCx::bind` inserted into the innermost
 scope map and dropped whatever entry was there, and `pop_scope_with_decs`

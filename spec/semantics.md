@@ -421,10 +421,7 @@ among those that have never waited, and otherwise in the order they were
 woken. A send wakes the task that has waited longest for room to send;
 a receive wakes the one that has waited longest for a value; closing wakes
 every task waiting on that channel. So output is the same on every run.
-
-A task that is waiting is not reached until something wakes it, which is what
-lets the task count grow: a turn costs what is runnable and not what is
-alive. A channel operation outside every task that has to wait
+A channel operation outside every task that has to wait
 panics, since there is nothing to wait for. `grasm test --schedules N` reruns a
 test under `N` other orders, each named by a seed `--schedule-seed` replays.
 
