@@ -160,9 +160,18 @@ fn rt_panic(msg: &str) -> ! {
     // whatever is reading ([E-PANIC-EXIT]). Flush stdout first so anything
     // already produced is not lost behind the exit.
     let _ = crate::io::stdout().flush();
-    let mut out = crate::io::stderr().lock();
-    let _ = writeln!(out, "panic: {msg}");
-    let _ = out.flush();
+    // The guard is scoped so it is released before `exit`, and that is not a
+    // tidiness: `crate::sys::exit` calls `flush_all`, which locks stderr
+    // again. Held across the exit, a compiled program printed its panic and
+    // then deadlocked in `pthread_mutex_lock` instead of leaving with 101 --
+    // for every panic, in every natively compiled program. `std`'s stderr
+    // lock is reentrant, so this was invisible until the `no_std` runtime
+    // replaced it with a plain pthread mutex, which is not.
+    {
+        let mut out = crate::io::stderr().lock();
+        let _ = writeln!(out, "panic: {msg}");
+        let _ = out.flush();
+    }
     crate::sys::exit(101);
 }
 

@@ -124,6 +124,7 @@ run_gate asminterop    scripts/asm_interop.sh
 run_gate gitinterop    scripts/git_interop.sh
 run_gate northstar     scripts/northstar.sh
 run_gate depth         scripts/depthtest.sh
+run_gate panics        scripts/panictest.sh
 run_gate gold          ProjectGold/run.sh
 run_gate findings      scripts/findings_index.sh --check
 run_gate clippy        cargo clippy --release --workspace --all-targets -- -D warnings

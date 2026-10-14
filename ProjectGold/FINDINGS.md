@@ -113,6 +113,7 @@ and the entries disagree.
 | [F95](#f95) | two packages, one variant name, and the backend picked the wrong payload | S1, backend | **fixed** |
 | [F96](#f96) | the wasm engine stopped linking, and nothing said so | S2, build | **fixed** |
 | [F97](#f97) | one method name, two meanings: `bytes.slice` took a length where `list.slice` takes an end | S2, library | **fixed** |
+| [F101](#f101) | every panic in every natively compiled program deadlocked instead of exiting | S1, runtime | **fixed** |
 | [F100](#f100) | the backend's internal-compiler-error diagnostic was dead in every release build | S4, diagnostics | **fixed** |
 | [F99](#f99) | a ProjectGold program asserted a recursion depth no engine promises | S2, tests | **fixed** |
 | [F98](#f98) | a function returning `()` could not say so out loud | S3, backend | **fixed** |
@@ -4224,6 +4225,69 @@ by grep, so nothing was missed by grep.
 pairs, and separately that the clamping difference is the one that remains.
 That is the invariant the old signature broke, stated in a program that runs
 under all four engines.
+
+## F101 — every panic in every natively compiled program deadlocked instead of exiting (S1, runtime) — **fixed**
+
+A compiled program that panics printed its message and then **hung for ever**.
+Not slowly: `panic: mid` reached stderr, and the process sat in
+`__psynch_mutexwait` until killed. Reproduced in four lines:
+
+    fn boom() -> i64 { panic("mid") }
+    fn main() { print("{boom()}") }
+
+`grasm build --native`, run it, and it never leaves. [E-PANIC-EXIT] says it
+must exit 101.
+
+**The cause is two correct lines in the wrong order.** `rt_panic` held the
+stderr lock across the exit:
+
+    let mut out = crate::io::stderr().lock();
+    let _ = writeln!(out, "panic: {msg}");
+    let _ = out.flush();
+    crate::sys::exit(101);          // guard still alive
+
+and `crate::sys::exit` calls `crate::io::flush_all()`, which locks stderr
+again. The guard is released at the end of the function, which the function
+never reaches. Scoping the guard so it drops before the exit is the whole fix.
+
+**Why it appeared when it did.** `std`'s stderr lock is reentrant, so the same
+code was harmless for as long as the runtime used it. The `no_std` runtime of
+2026-10-12 — the work that took a hello-world from 351.1 KB to 85.7 KB and
+moved G5 to met — replaced it with a plain pthread mutex, which is not
+reentrant. The binary-size win shipped a hang on the panic path. Dated by
+building the same program with the compiler from 2026-10-07, which answers
+`panic: mid` and exits 101.
+
+**Only the native build was affected**, and that is the diagnosis confirmed
+from the other side: the interpreter and the bundle run the same programs and
+exit 101 even with the defect restored, because they are `std` processes. The
+gate below shows exactly that shape — four programs, three engines, red on
+`native` twelve times out of twelve and green everywhere else.
+
+**Why no gate caught it, and the part that is worse than a gap.** `difftest`
+skips the conformance programs tagged `expect: error`; the one tagged
+E-PANIC-EXIT *catches* its panic and exits 0, so it never reaches the exit
+path; no ProjectGold program panics. The only cover was `cargo test`, one of
+the two gates that are cargo commands rather than scripts — and when this
+broke, that suite **did not go red. It hung**, for an hour and a half, with
+four test processes asleep at 0% CPU. A gate that hangs is worse than a gate
+that fails, because a failure is a result and a hang is nothing at all. It was
+noticed only because the suite was still running long after it should have
+finished.
+
+**The fix includes the gate**, `scripts/panictest.sh`, registered as `panics`.
+Every run in it has a 20-second limit and **a timeout is a failure**, which is
+as much the point as the exit code: four programs across interpreter, bundle
+and native, each required to exit 101, to say `panic: ` on stderr, and to
+leave stdout holding exactly what was printed before the panic and nothing
+else. Verified by restoring the defect, watching the gate go red on the native
+engine for all four programs, and putting the fix back.
+
+**Found by** running `cargo test --release --workspace` after an unrelated
+change, noticing it had been running for ninety minutes, and looking at what
+its children were doing instead of waiting for it. See
+[[grasm-gate-subset-blind-spot]]: clippy stayed red for 32 commits for the same
+reason this hang sat unnoticed.
 
 ## F100 — the backend's internal-compiler-error diagnostic was dead in every release build (S4, diagnostics) — **fixed**
 
