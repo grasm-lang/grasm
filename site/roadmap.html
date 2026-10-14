@@ -61,8 +61,14 @@ defect loop rather than instead of it.</p>
 
 <h2>1. This site</h2>
 <p>In progress — you are reading it. The <a href="playground.html">playground</a>
-now runs programs in the page, on the same wasm module the gates hold to the
-other engines, and the <a href="tutorial.html">tutorial</a> and
+now runs programs in the page, on the wasm module <code>wasmtest</code>
+compares against a fresh build of the compiler — which is a gate, so that
+module is only as current as the last time anybody ran it. It has been wrong
+twice: the copy this site serves was five days behind the committed one, and
+the committed one was then nine days behind the compiler, so every page under
+<code>ProjectGold/</code> was running an older language than the pages
+describing it. Both found by checking rather than by noticing. The
+<a href="tutorial.html">tutorial</a> and
 <a href="library.html">library reference</a> are the documents themselves,
 rendered when the site is written rather than summarised here.</p>
 
