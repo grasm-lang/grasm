@@ -200,7 +200,10 @@ CITED = [
      r"\| Core constructs \| \u2264 ([0-9]+) \|"),
     ("linux_lines", "docs/binary-size.md", r"roughly ([0-9,]+) lines of .cfg\(not\(macos\)\)."),
     ("tree_ratio", "docs/northstar.md", r"`tree` at ([0-9.]+)\u00d7 is what the geomean"),
-    ("geomean_was", "docs/northstar.md", r"geometric mean is ([0-9.]+)\u00d7 behind"),
+    # Past tense on purpose: the sentence is dated 2026-08-19 and sits under
+    # a row recording 0.965x, so a pattern demanding "is" would pin the
+    # document to the wrong tense just to keep the citation alive.
+    ("geomean_was", "docs/northstar.md", r"geometric mean was ([0-9.]+)\u00d7 behind"),
     ("symbolizer_kb", "docs/northstar.md", r"about ([0-9]+) KB was Rust's own backtrace"),
     ("etl_grasm_ms", "benchmarks/systems/RESULTS.md",
      r"\| etl \(1 GiB\) \| wall ms \| ([0-9,]+)"),

@@ -32,15 +32,18 @@ the scorecard takes the best of five runs and subtracts the process floor.
 | G11 | Tokens vs Python | ≤ 1.00× | **1.04×** | **4% over** |
 | G11 | Tokens vs Go | ≤ 0.60× | **0.61×** | **2% over** |
 
-### G2 moved because the measurement was wrong, not the compiler
+### G2 read 2.49x behind in August, because the measurement was wrong
 
 This row used to read "4 of 7 programs at or above" Rust. That was an artifact.
 `bench.sh` was adding a constant 21 ms to every cell (ProjectGold F27), and a
 constant added to every measurement compresses every ratio toward 1 — so a
 5 ms program and a 10 ms program read as 26 and 31, which is "at or above" if
-you squint. With the timer fixed, **no program is at or above Rust** and the
-geometric mean is 2.49× behind, or 2.92× once the harness's own 2 ms floor is
-taken out of both sides.
+you squint. With the timer fixed, **on 2026-08-19 no program was at or above
+Rust** and the geometric mean was 2.49× behind, or 2.92× once the harness's own
+2 ms floor was taken out of both sides. The row above is a later run: what
+closed that gap between August and October is listed in `docs/performance.md`
+under "The standing gap" — value structs, inline list and string fields, and a
+scan that reads its buffer without a bounds check per byte.
 
 Nothing got slower. Every performance change this session moved a number the
 right way — `wordfreq` 117 → 53 ms, `tree` 175 → 97, `sieve` 17 → 15. The
@@ -61,7 +64,7 @@ does not run.
 
 ## What the numbers say
 
-**G3 is met: 571k LOC/s against 500k.** It got there in four steps, all of them
+**G3 is met: 535–547k LOC/s against 500k.** It got there in four steps, all of them
 found by measuring rather than guessing:
 
 1. Three superlinear defects fixed — a field chain that was exponential, a
