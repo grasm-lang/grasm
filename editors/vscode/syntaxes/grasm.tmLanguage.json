@@ -2,6 +2,7 @@
   "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
   "name": "Grasm",
   "scopeName": "source.grasm",
+  "_generated": "scripts/grammar.py \u2014 derived from the compiler; edit that, not this",
   "patterns": [
     {
       "include": "#comments"
@@ -35,26 +36,40 @@
         {
           "name": "comment.block.grasm",
           "begin": "/\\*",
-          "end": "\\*/"
+          "end": "\\*/",
+          "patterns": [
+            {
+              "include": "#comments"
+            }
+          ]
         }
       ]
     },
     "strings": {
-      "name": "string.quoted.double.grasm",
-      "begin": "\"",
-      "end": "\"",
       "patterns": [
         {
-          "name": "constant.character.escape.grasm",
-          "match": "\\\\."
+          "name": "string.quoted.triple.grasm",
+          "begin": "\"\"\"",
+          "end": "\"\"\""
         },
         {
-          "name": "meta.embedded.grasm",
-          "begin": "(?<!\\\\)\\{",
-          "end": "\\}",
+          "name": "string.quoted.double.grasm",
+          "begin": "\"",
+          "end": "\"",
           "patterns": [
             {
-              "include": "$self"
+              "name": "constant.character.escape.grasm",
+              "match": "\\\\."
+            },
+            {
+              "name": "meta.embedded.grasm",
+              "begin": "(?<!\\\\)\\{",
+              "end": "\\}",
+              "patterns": [
+                {
+                  "include": "$self"
+                }
+              ]
             }
           ]
         }
@@ -64,7 +79,19 @@
       "patterns": [
         {
           "name": "keyword.control.grasm",
-          "match": "\\b(fn|pub|let|var|own|inout|type|effect|with|handled_by|match|if|else|for|while|in|return|try|break|continue|and|or|not|import|test)\\b"
+          "match": "\\b(handled_by|continue|return|break|match|while|else|with|for|try|if|in)\\b"
+        },
+        {
+          "name": "keyword.declaration.grasm",
+          "match": "\\b(interface|effect|import|impl|test|type|fn)\\b"
+        },
+        {
+          "name": "keyword.operator.word.grasm",
+          "match": "\\b(and|not|or)\\b"
+        },
+        {
+          "name": "storage.modifier.grasm",
+          "match": "\\b(unsafe|inout|let|own|pub|ref|var)\\b"
         }
       ]
     },
@@ -72,7 +99,7 @@
       "patterns": [
         {
           "name": "constant.language.grasm",
-          "match": "\\b(true|false|None|Some|Ok|Err)\\b"
+          "match": "\\b(false|None|Some|true|Err|Ok)\\b"
         }
       ]
     },
@@ -80,7 +107,7 @@
       "patterns": [
         {
           "name": "support.type.grasm",
-          "match": "\\b(i8|i16|i32|i64|u8|u16|u32|u64|usize|int|f32|f64|float|bool|str|Option|Map|IoError)\\b"
+          "match": "\\b(bytes|float|range|usize|bool|f32|f64|i16|i32|i64|int|str|u16|u32|u64|i8|u8)\\b"
         },
         {
           "name": "entity.name.type.grasm",
@@ -96,7 +123,7 @@
         },
         {
           "name": "support.function.grasm",
-          "match": "\\b(print|assert|assert_eq|panic|fail|map|args|input|read_file|write_file|file_exists)\\b(?=\\s*\\()"
+          "match": "\\b(monotonic_millis|monotonic_nanos|tcp_write_bytes|tcp_read_bytes|proc_pipeline|read_bytes_at|tcp_listen_on|udp_recv_from|append_bytes|random_bytes|sleep_millis|chan_select|file_exists|net_workers|remove_file|rename_file|tcp_connect|write_bytes|chan_close|now_millis|read_bytes|tcp_accept|tcp_listen|write_file|assert_eq|chan_recv|chan_send|file_size|net_close|read_file|sync_file|tcp_write|bytes_of|chan_new|list_dir|make_dir|net_port|net_wait|proc_run|tcp_peer|tcp_read|udp_bind|udp_recv|udp_send|assert|eprint|input|panic|print|args|exit|env)\\b(?=\\s*\\()"
         }
       ]
     },

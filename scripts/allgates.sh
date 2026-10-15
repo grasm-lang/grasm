@@ -58,6 +58,7 @@ run_gate crosstest     scripts/crosstest.sh
 run_gate fmttest       scripts/fmttest.sh
 run_gate linttest      scripts/linttest.sh
 run_gate gfmttest      scripts/gfmttest.sh
+run_gate grammar       python3 scripts/grammar.py --check
 run_gate grasmwire     scripts/grasmwire_e2e.sh
 run_gate cryptodiff    scripts/crypto_diff.sh
 run_gate certdiff      scripts/cert_diff.sh

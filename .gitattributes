@@ -41,3 +41,6 @@ ProjectGold/web/**     linguist-generated
 
 # Grasm source, for the day the extension is recognised.
 *.gr                   linguist-detectable
+
+# Written by scripts/grammar.py from the compiler, and gated with --check.
+editors/vscode/syntaxes/grasm.tmLanguage.json linguist-generated
