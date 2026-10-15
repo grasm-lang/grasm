@@ -449,7 +449,6 @@ FIGURE_ROWS = [
 # "no external request" property and every glyph is 16 lines of SVG anybody can
 # read. 1.6px stroke on a 24 grid, `currentColor` so CSS decides the colour.
 ICON = {
-    "mark": '<path d="M12 3 4 7.5v9L12 21l8-4.5v-9L12 3Z"/><path d="M12 12 4 7.5M12 12l8-4.5M12 12v9"/>',
     "shield": '<path d="M12 3 5 6v6c0 4 3 6.5 7 9 4-2.5 7-5 7-9V6l-7-3Z"/><path d="m9 12 2 2 4-4"/>',
     "layers": '<path d="m12 3 9 5-9 5-9-5 9-5Z"/><path d="m3 13 9 5 9-5"/>',
     "cpu": '<rect x="8" y="8" width="8" height="8" rx="1"/><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M9 2v2M15 2v2M9 20v2M15 20v2M2 9h2M2 15h2M20 9h2M20 15h2"/>',
@@ -462,6 +461,22 @@ ICON = {
     "gauge": '<path d="M12 14 16 9"/><path d="M4 18a9 9 0 1 1 16 0"/>',
     "package": '<path d="m12 3 8 4.5v9L12 21l-8-4.5v-9L12 3Z"/><path d="M4 7.5 12 12l8-4.5M12 12v9"/>',
 }
+
+
+# The mark: a hard bar, and the letter sitting under it. The bar is the
+# ceiling a package declares and the compiler enforces, which is the one idea
+# everything else here is built on -- so the logo is that idea and not a cube.
+MARK = '<path d="M9 6H39"/><path d="M24 14A13 13 0 1 0 37 27H26"/>'
+
+
+def mark(size=20, stroke=6):
+    """The logo, inline. Its own viewBox: the UI icons are drawn on 24 and
+    hairline, the mark on 48 and heavy, and sharing one helper made it thin."""
+    return (
+        f'<svg viewBox="0 0 48 48" width="{size}" height="{size}" fill="none" '
+        f'stroke="currentColor" stroke-width="{stroke}" stroke-linecap="round" '
+        f'stroke-linejoin="round" aria-hidden="true">{MARK}</svg>'
+    )
 
 
 def icon(name, size=17):
@@ -477,7 +492,7 @@ def icon(name, size=17):
 
 def rail(current):
     out = [
-        '<a class="mark" href="index.html"><b>grasm</b>'
+        '<a class="mark" href="index.html">' + mark(18, 6) + '<b>grasm</b>'
         "<span>a systems language</span></a>"
     ]
     section = None
@@ -492,12 +507,30 @@ def rail(current):
     return "\n".join(out)
 
 
+def foot():
+    """The footer's link columns. Same source as the rail, so a page added to
+    one is in the other and neither can quietly fall behind."""
+    cols, section = [], None
+    for href, _title, sec, label in NAV:
+        if sec is None:
+            continue
+        if sec != section:
+            cols.append((sec, []))
+            section = sec
+        cols[-1][1].append(f'<a href="{href}">{label}</a>')
+    out = []
+    for head, links in cols:
+        out.append(f'<div><span>{head}</span>' + "".join(links) + "</div>")
+    return "\n".join(out)
+
+
 PAGE = """<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{title}</title>
 <meta name="description" content="{desc}">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
 <link rel="preload" href="vendor/fonts/figtree.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="preload" href="vendor/fonts/sora.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="stylesheet" href="style.css">
@@ -523,18 +556,23 @@ PAGE = """<!doctype html>
 </nav>
 <main>
 {body}
-<footer>
-Grasm — four engines, one answer. Counts here are computed from the
-repository as the page is written; measurements are read from the document
-that recorded them.
-<a href="achieved.html">Scorecard</a> ·
-<a href="performance.html">Performance</a> ·
-<a href="status.html">Status</a> ·
-<a href="spec.html">Specification</a> ·
-<a href="roadmap.html">Roadmap</a>
-</footer>
 </main>
 </div>
+<footer class="sitefoot">
+  <div class="inner">
+    <div class="cols">
+      <div class="brandcol">
+        <a class="brand" href="index.html">{markicon}<span>Grasm</span></a>
+        <span>Four engines, one answer.</span>
+      </div>
+      <div class="links">
+{foot}
+      </div>
+    </div>
+    <p>Counts here are computed from the repository as the page is written;
+    measurements are read from the document that recorded them.</p>
+  </div>
+</footer>
 </body></html>
 """
 
@@ -566,8 +604,8 @@ def write(pages, check):
         # described was right.
         html = PAGE.format(
             title=title, desc=fill(desc), page=href.replace(".html", ""),
-            markicon=icon("mark", 19), version=known.get("version", ""),
-            rail=rail(href), body=fill(body)
+            markicon=mark(20, 6), version=known.get("version", ""),
+            rail=rail(href), foot=foot(), body=fill(body)
         )
         path = os.path.join(OUT, href)
         if check:

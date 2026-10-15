@@ -257,28 +257,55 @@ capabilities = []          # reaches nothing at all""",
 
 <section class="lp-sec lp-dark">
   <div class="lp-wrap lp-center">
-    <h2>Four engines. One answer.</h2>
-    <p class="sub">The interpreter is normative. The other three have to match
-    it, byte for byte, on every green build.</p>
+    <span class="lp-badge"><i></i>Checked on every green build</span>
+    <h2>Four engines.<br><span class="sheen">One answer.</span></h2>
+    <p class="sub">Develop against the interpreter, ship a native binary, run
+    the same program in a browser. The interpreter is normative; the other
+    three have to match it byte for byte.</p>
   </div>
   <div class="lp-wrap">
-    <div class="lp-engines reveal">
-      <div><b>Interpreter</b><span>the reference, and the specification’s own
-        executable form</span></div>
-      <div><b>Bundle</b><span>one file, run anywhere the runtime goes</span></div>
-      <div><b>Native</b><span>Cranelift, ahead of time, no standard library
-        linked</span></div>
-      <div><b>Wasm</b><span>the same program in a browser, with no operating
-        system underneath</span></div>
+    <div class="lp-three reveal">
+      <div class="lp-prog">
+        <div class="head"><b>One program</b><span>hello.gr</span></div>
+        <pre><span class="kw">fn</span> <span class="fn">main</span>() {
+    <span class="fn">print</span>(<span class="st">"hello from grasm"</span>)
+}</pre>
+        <div class="foot">+ «difftest» more in the corpus, every run</div>
+      </div>
+      <div class="lp-rows">
+        <div class="lp-row ref">
+          <span class="ic">«icon_terminal»</span>
+          <span class="who"><b>Interpreter</b><span>grasm run hello.gr</span></span>
+          <span class="tag">normative</span>
+        </div>
+        <div class="lp-row">
+          <span class="ic">«icon_package»</span>
+          <span class="who"><b>Bundle</b><span>grasm build hello.gr</span></span>
+          <span class="tag">one file</span>
+        </div>
+        <div class="lp-row">
+          <span class="ic">«icon_cpu»</span>
+          <span class="who"><b>Native</b><span>grasm build --native</span></span>
+          <span class="tag">«hello_kb» KB</span>
+        </div>
+        <div class="lp-row">
+          <span class="ic">«icon_flow»</span>
+          <span class="who"><b>Wasm</b><span>--target wasm32</span></span>
+          <span class="tag">no OS</span>
+        </div>
+      </div>
+      <div class="lp-answer">
+        <b>One answer</b>
+        <div class="out"><span class="dim">$ stdout &#215;4</span>hello from grasm</div>
+        <div class="big">0<span>mismatches, across every<br>engine and both architectures</span></div>
+        <div class="gates"><span>difftest</span><span>crosstest</span><span>wasmtest</span></div>
+      </div>
     </div>
-    <div class="lp-center">
-      <span class="lp-verdict"><i>0</i><span><b>mismatches</b>
-        <span>difftest · crosstest · wasmtest</span></span></span>
-    </div>
-    <div class="viz reveal">
-      <canvas id="engines" data-programs="«difftest»"
-        aria-label="Programs flowing through four engines to one answer"></canvas>
-      <div class="cap">difftest · crosstest · wasmtest — «difftest» programs, 0 mismatched</div>
+    <div class="lp-tiles reveal">
+      <div><b>«difftest»</b><span>programs, interpreter and native and bundle identical</span></div>
+      <div><b>«cross»</b><span>of them again, cross-compiled to x86_64</span></div>
+      <div><b>«wasm_ok»</b><span>identical in the browser engine</span></div>
+      <div><b>«gold»</b><span>whole applications, agreeing on every engine</span></div>
     </div>
   </div>
 </section>
@@ -451,14 +478,22 @@ test "division works" {
 # ---------------------------------------------------------------- install
 
 PAGES["install.html"] = (
-    "Build Grasm from source.",
+    "One command builds the whole Grasm toolchain.",
     """
 <p class="eyebrow">Start</p>
 <h1>Install</h1>
-<p class="lede">Grasm builds from source with a Rust toolchain. There are no
-prebuilt binaries yet.</p>
+<p class="lede">One command, and you have the entire toolchain: a single
+binary, every subcommand inside it, and no runtime to install beside it.</p>
 
-<h2>From source</h2>"""
+<p>A Rust toolchain bootstraps the compiler the first time, the way every
+language starts — and <strong>none of it survives into what you ship</strong>.
+All four crates a compiled Grasm program links are <code>no_std</code>: the
+runtime reaches the operating system through <code>grasm_sys</code>, over raw
+syscalls and libc, never over Rust's standard library. A hello-world is
+«hello_kb» KB and <code>nm</code> finds nothing of Rust's in it.
+<a href="architecture.html">How that was done →</a></p>
+
+<h2>Build it</h2>"""
     + code(
         """
 git clone <repository>
@@ -1414,7 +1449,7 @@ table because the margin moved once already with nothing noticing: see
 <tr><th>Limit</th><th>Detail</th></tr>
 <tr><td>«packages» libraries, all first-party</td><td>See <a href="packages.html">Packages</a>; the plan for the rest is in <code>docs/packages-plan.md</code>. Anything else you need, you write, or bind to C with <code>extern fn</code>.</td></tr>
 <tr><td>No remote registry</td><td>Path and local-registry dependencies work. Nothing fetches or publishes.</td></tr>
-<tr><td>No release binaries</td><td>Build from source with a Rust toolchain.</td></tr>
+<tr><td>No signed downloads yet</td><td>One <code>cargo build</code> bootstraps the compiler, and after that the binary it produced is the whole toolchain. Packaging and signing are release work, not language work.</td></tr>
 <tr><td>Not faster than Rust</td><td>The geomean is «geomean»× of it, «geomean_floor»× with the harness floor taken out of both sides, against a 0.95× target — so the goal is met and the claim is not available. <code>tree</code> at «tree_ratio»× is the worst row. On the systems suite Grasm loses <code>etl</code> by «etl_ratio»×, and wins memory everywhere — «chat_mem_ratio»× on <code>chat</code>. <a href="performance.html">Every row →</a></td></tr>
 <tr><td>Polymorphic recursion</td><td>Refused by name at build time. It is what monomorphization is; no work removes it.</td></tr>
 <tr><td>Small standard library</td><td>«methods» methods. Enough for «gold» whole programs and «apps» applications; you will find gaps in something larger.</td></tr>

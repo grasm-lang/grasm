@@ -4,6 +4,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Library reference</title>
 <meta name="description" content="The standard library, rendered from spec/library.md.">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
 <link rel="preload" href="vendor/fonts/figtree.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="preload" href="vendor/fonts/sora.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="stylesheet" href="style.css">
@@ -12,7 +13,7 @@
 <script type="module" src="app.js"></script>
 </head><body data-page="library">
 <header class="topbar">
-  <a class="brand" href="index.html"><svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3 4 7.5v9L12 21l8-4.5v-9L12 3Z"/><path d="M12 12 4 7.5M12 12l8-4.5M12 12v9"/></svg><span>Grasm</span></a>
+  <a class="brand" href="index.html"><svg viewBox="0 0 48 48" width="20" height="20" fill="none" stroke="currentColor" stroke-width="6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 6H39"/><path d="M24 14A13 13 0 1 0 37 27H26"/></svg><span>Grasm</span></a>
   <span class="ver">v1.0.0</span>
   <nav>
     <a href="different.html">Why Grasm</a>
@@ -25,7 +26,7 @@
 </header>
 <div class="frame">
 <nav class="rail">
-<a class="mark" href="index.html"><b>grasm</b><span>a systems language</span></a>
+<a class="mark" href="index.html"><svg viewBox="0 0 48 48" width="18" height="18" fill="none" stroke="currentColor" stroke-width="6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 6H39"/><path d="M24 14A13 13 0 1 0 37 27H26"/></svg><b>grasm</b><span>a systems language</span></a>
 <h2>Start</h2>
 <a href="different.html">Why Grasm</a>
 <a href="start.html">Getting started</a>
@@ -203,16 +204,24 @@ of it.</p>
 <div class="scroll"><table><thead><tr><th></th><th>type</th><th></th></tr></thead><tbody><tr><td><code>bytes_of(list)</code></td><td><code>([i64]) -&gt; bytes</code></td><td>every element must be in <code>0..255</code></td></tr><tr><td><code>s.to_bytes()</code></td><td><code>(str) -&gt; bytes</code></td><td>the UTF-8 encoding of the text</td></tr><tr><td><code>b.to_str()</code></td><td><code>(bytes) -&gt; str</code></td><td>lossy, as <code>tcp_read</code> is</td></tr><tr><td><code>b.len()</code></td><td><code>(bytes) -&gt; i64</code></td><td>count of bytes</td></tr><tr><td><code>b.is_empty()</code></td><td><code>(bytes) -&gt; bool</code></td><td></td></tr><tr><td><code>b.at(i)</code></td><td><code>(bytes, i64) -&gt; i64</code></td><td>one byte, <code>0..255</code>; out of range panics</td></tr><tr><td><code>b.slice(from, end)</code></td><td><code>(bytes, i64, i64) -&gt; bytes</code></td><td><code>end</code> exclusive, as <code>list.slice</code>; out of range panics rather than clamping</td></tr><tr><td><code>b.index_of(byte, from)</code></td><td><code>(bytes, i64, i64) -&gt; Option[i64]</code></td><td>first position <code>&gt;= from</code> holding <code>byte</code>; <code>None</code> when absent or <code>byte</code> is outside <code>0..255</code>; <code>from</code> outside <code>0..=len</code> panics</td></tr><tr><td><code>b.concat(other)</code></td><td><code>(bytes, bytes) -&gt; bytes</code></td><td></td></tr><tr><td><code>b.to_list()</code></td><td><code>(bytes) -&gt; [i64]</code></td><td></td></tr><tr><td><code>read_bytes(path)</code></td><td><code>(str) -&gt; bytes ! IoError</code></td><td>the whole file</td></tr><tr><td><code>write_bytes(path, b)</code></td><td><code>(str, bytes) -&gt; () ! IoError</code></td><td>replaces it</td></tr><tr><td><code>read_bytes_at(path, off, n)</code></td><td><code>(str, i64, i64) -&gt; bytes ! IoError</code></td><td>a range; short at the end, empty past it</td></tr><tr><td><code>append_bytes(path, b)</code></td><td><code>(str, bytes) -&gt; () ! IoError</code></td><td>adds to the end, creating the file</td></tr><tr><td><code>file_size(path)</code></td><td><code>(str) -&gt; i64 ! IoError</code></td><td>without reading it</td></tr><tr><td><code>sync_file(path)</code></td><td><code>(str) -&gt; () ! IoError</code></td><td>on the disk before answering</td></tr><tr><td><code>rename_file(a, b)</code></td><td><code>(str, str) -&gt; () ! IoError</code></td><td>atomic where the platform allows</td></tr></tbody></table></div>
 <p><strong>The last five exist because whole-file calls cannot express data</strong>: a table larger than memory is unreadable, a log rewritten per record is quadratic, and a crash-safe commit is write-beside, <code>sync_file</code>, <code>rename_file</code>.</p>
 <p><strong><code>bytes</code> is distinct from <code>[i64]</code> on purpose.</strong> A list of integers cannot promise its elements are bytes, stores eight per element, and cannot be handed to a buffer — the promise is the type. <code>at</code> gives <code>0..255</code>; one integer type is the trade. It <strong>prints as hex</strong>, and <code>to_str</code> is lossy for <code>tcp_read</code>'s reason.</p>
-<footer>
-Grasm — four engines, one answer. Counts here are computed from the
-repository as the page is written; measurements are read from the document
-that recorded them.
-<a href="achieved.html">Scorecard</a> ·
-<a href="performance.html">Performance</a> ·
-<a href="status.html">Status</a> ·
-<a href="spec.html">Specification</a> ·
-<a href="roadmap.html">Roadmap</a>
-</footer>
 </main>
 </div>
+<footer class="sitefoot">
+  <div class="inner">
+    <div class="cols">
+      <div class="brandcol">
+        <a class="brand" href="index.html"><svg viewBox="0 0 48 48" width="20" height="20" fill="none" stroke="currentColor" stroke-width="6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 6H39"/><path d="M24 14A13 13 0 1 0 37 27H26"/></svg><span>Grasm</span></a>
+        <span>Four engines, one answer.</span>
+      </div>
+      <div class="links">
+<div><span>Start</span><a href="different.html">Why Grasm</a><a href="start.html">Getting started</a><a href="install.html">Install</a><a href="playground.html">Playground</a></div>
+<div><span>Learn</span><a href="tutorial.html">Tutorial</a><a href="tour.html">Tour</a><a href="effects.html">Effects</a><a href="tiers.html">Ownership</a><a href="errors.html">Errors</a><a href="concurrency.html">Concurrency</a><a href="security.html">Security</a></div>
+<div><span>Reference</span><a href="syntax.html">Syntax</a><a href="language.html">Language</a><a href="library.html">Library</a><a href="packages.html">Packages</a><a href="spec.html">Specification</a><a href="architecture.html">Architecture</a></div>
+<div><span>More</span><a href="examples.html">Examples</a><a href="achieved.html">Scorecard</a><a href="performance.html">Performance</a><a href="about.html">About</a><a href="status.html">Status</a><a href="roadmap.html">Roadmap</a></div>
+      </div>
+    </div>
+    <p>Counts here are computed from the repository as the page is written;
+    measurements are read from the document that recorded them.</p>
+  </div>
+</footer>
 </body></html>

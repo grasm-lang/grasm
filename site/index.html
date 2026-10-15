@@ -4,6 +4,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Grasm</title>
 <meta name="description" content="Grasm is a systems language where a dependency cannot reach further than its manifest allows.">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
 <link rel="preload" href="vendor/fonts/figtree.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="preload" href="vendor/fonts/sora.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="stylesheet" href="style.css">
@@ -12,7 +13,7 @@
 <script type="module" src="app.js"></script>
 </head><body data-page="index">
 <header class="topbar">
-  <a class="brand" href="index.html"><svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3 4 7.5v9L12 21l8-4.5v-9L12 3Z"/><path d="M12 12 4 7.5M12 12l8-4.5M12 12v9"/></svg><span>Grasm</span></a>
+  <a class="brand" href="index.html"><svg viewBox="0 0 48 48" width="20" height="20" fill="none" stroke="currentColor" stroke-width="6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 6H39"/><path d="M24 14A13 13 0 1 0 37 27H26"/></svg><span>Grasm</span></a>
   <span class="ver">v1.0.0</span>
   <nav>
     <a href="different.html">Why Grasm</a>
@@ -25,7 +26,7 @@
 </header>
 <div class="frame">
 <nav class="rail">
-<a class="mark" href="index.html"><b>grasm</b><span>a systems language</span></a>
+<a class="mark" href="index.html"><svg viewBox="0 0 48 48" width="18" height="18" fill="none" stroke="currentColor" stroke-width="6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 6H39"/><path d="M24 14A13 13 0 1 0 37 27H26"/></svg><b>grasm</b><span>a systems language</span></a>
 <h2>Start</h2>
 <a href="different.html">Why Grasm</a>
 <a href="start.html">Getting started</a>
@@ -171,28 +172,55 @@ capabilities <span class="op">=</span> <span class="op">[</span><span class="op"
 
 <section class="lp-sec lp-dark">
   <div class="lp-wrap lp-center">
-    <h2>Four engines. One answer.</h2>
-    <p class="sub">The interpreter is normative. The other three have to match
-    it, byte for byte, on every green build.</p>
+    <span class="lp-badge"><i></i>Checked on every green build</span>
+    <h2>Four engines.<br><span class="sheen">One answer.</span></h2>
+    <p class="sub">Develop against the interpreter, ship a native binary, run
+    the same program in a browser. The interpreter is normative; the other
+    three have to match it byte for byte.</p>
   </div>
   <div class="lp-wrap">
-    <div class="lp-engines reveal">
-      <div><b>Interpreter</b><span>the reference, and the specification’s own
-        executable form</span></div>
-      <div><b>Bundle</b><span>one file, run anywhere the runtime goes</span></div>
-      <div><b>Native</b><span>Cranelift, ahead of time, no standard library
-        linked</span></div>
-      <div><b>Wasm</b><span>the same program in a browser, with no operating
-        system underneath</span></div>
+    <div class="lp-three reveal">
+      <div class="lp-prog">
+        <div class="head"><b>One program</b><span>hello.gr</span></div>
+        <pre><span class="kw">fn</span> <span class="fn">main</span>() {
+    <span class="fn">print</span>(<span class="st">"hello from grasm"</span>)
+}</pre>
+        <div class="foot">+ 511 more in the corpus, every run</div>
+      </div>
+      <div class="lp-rows">
+        <div class="lp-row ref">
+          <span class="ic"><svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 8 4 4-4 4M13 16h5"/><rect x="2" y="4" width="20" height="16" rx="2"/></svg></span>
+          <span class="who"><b>Interpreter</b><span>grasm run hello.gr</span></span>
+          <span class="tag">normative</span>
+        </div>
+        <div class="lp-row">
+          <span class="ic"><svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m12 3 8 4.5v9L12 21l-8-4.5v-9L12 3Z"/><path d="M4 7.5 12 12l8-4.5M12 12v9"/></svg></span>
+          <span class="who"><b>Bundle</b><span>grasm build hello.gr</span></span>
+          <span class="tag">one file</span>
+        </div>
+        <div class="lp-row">
+          <span class="ic"><svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="8" y="8" width="8" height="8" rx="1"/><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M9 2v2M15 2v2M9 20v2M15 20v2M2 9h2M2 15h2M20 9h2M20 15h2"/></svg></span>
+          <span class="who"><b>Native</b><span>grasm build --native</span></span>
+          <span class="tag">85.7 KB</span>
+        </div>
+        <div class="lp-row">
+          <span class="ic"><svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 6h6M4 12h9M4 18h6"/><circle cx="18" cy="6" r="2"/><circle cx="18" cy="18" r="2"/><circle cx="19" cy="12" r="2"/></svg></span>
+          <span class="who"><b>Wasm</b><span>--target wasm32</span></span>
+          <span class="tag">no OS</span>
+        </div>
+      </div>
+      <div class="lp-answer">
+        <b>One answer</b>
+        <div class="out"><span class="dim">$ stdout &#215;4</span>hello from grasm</div>
+        <div class="big">0<span>mismatches, across every<br>engine and both architectures</span></div>
+        <div class="gates"><span>difftest</span><span>crosstest</span><span>wasmtest</span></div>
+      </div>
     </div>
-    <div class="lp-center">
-      <span class="lp-verdict"><i>0</i><span><b>mismatches</b>
-        <span>difftest · crosstest · wasmtest</span></span></span>
-    </div>
-    <div class="viz reveal">
-      <canvas id="engines" data-programs="511"
-        aria-label="Programs flowing through four engines to one answer"></canvas>
-      <div class="cap">difftest · crosstest · wasmtest — 511 programs, 0 mismatched</div>
+    <div class="lp-tiles reveal">
+      <div><b>511</b><span>programs, interpreter and native and bundle identical</span></div>
+      <div><b>511</b><span>of them again, cross-compiled to x86_64</span></div>
+      <div><b>415</b><span>identical in the browser engine</span></div>
+      <div><b>44</b><span>whole applications, agreeing on every engine</span></div>
     </div>
   </div>
 </section>
@@ -267,16 +295,24 @@ $ ./target/release/grasm run examples/hello.gr
   </div>
 </section>
 
-<footer>
-Grasm — four engines, one answer. Counts here are computed from the
-repository as the page is written; measurements are read from the document
-that recorded them.
-<a href="achieved.html">Scorecard</a> ·
-<a href="performance.html">Performance</a> ·
-<a href="status.html">Status</a> ·
-<a href="spec.html">Specification</a> ·
-<a href="roadmap.html">Roadmap</a>
-</footer>
 </main>
 </div>
+<footer class="sitefoot">
+  <div class="inner">
+    <div class="cols">
+      <div class="brandcol">
+        <a class="brand" href="index.html"><svg viewBox="0 0 48 48" width="20" height="20" fill="none" stroke="currentColor" stroke-width="6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 6H39"/><path d="M24 14A13 13 0 1 0 37 27H26"/></svg><span>Grasm</span></a>
+        <span>Four engines, one answer.</span>
+      </div>
+      <div class="links">
+<div><span>Start</span><a href="different.html">Why Grasm</a><a href="start.html">Getting started</a><a href="install.html">Install</a><a href="playground.html">Playground</a></div>
+<div><span>Learn</span><a href="tutorial.html">Tutorial</a><a href="tour.html">Tour</a><a href="effects.html">Effects</a><a href="tiers.html">Ownership</a><a href="errors.html">Errors</a><a href="concurrency.html">Concurrency</a><a href="security.html">Security</a></div>
+<div><span>Reference</span><a href="syntax.html">Syntax</a><a href="language.html">Language</a><a href="library.html">Library</a><a href="packages.html">Packages</a><a href="spec.html">Specification</a><a href="architecture.html">Architecture</a></div>
+<div><span>More</span><a href="examples.html">Examples</a><a href="achieved.html">Scorecard</a><a href="performance.html">Performance</a><a href="about.html">About</a><a href="status.html">Status</a><a href="roadmap.html">Roadmap</a></div>
+      </div>
+    </div>
+    <p>Counts here are computed from the repository as the page is written;
+    measurements are read from the document that recorded them.</p>
+  </div>
+</footer>
 </body></html>
