@@ -1,0 +1,6 @@
+[package]
+name = "ron"
+version = "1.0.0"
+
+# Parses text the caller supplies. Reaches nothing.
+capabilities = []

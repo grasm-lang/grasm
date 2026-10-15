@@ -1,0 +1,18 @@
+// Every shape in one document, for the cases a config does not reach.
+(
+    unit: (),
+    empty_seq: [],
+    empty_map: {},
+    deep: (a: (b: (c: (d: 1)))),
+    tuples_in_seq: [(1, 2), (3, 4)],
+    seq_in_tuple: ([1, 2], [3, 4]),
+    chars: ('a', '\n', '\''),
+    escaped: "a\"b\\c\nd\te",
+    raw_plain: r"plain",
+    raw_hashed: r##"with "# inside"##,
+    signs: (-1, +2, -3.5, 1e3, 1E-3),
+    nested_opt: Some(Some(1)),
+    unit_variant: Red,
+    tuple_variant: Rgb(1, 2, 3),
+    trailing: [1, 2, 3,],
+)

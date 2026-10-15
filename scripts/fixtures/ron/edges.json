@@ -1,0 +1,1 @@
+{"chars":["a","\n","'"],"deep":{"a":{"b":{"c":{"d":1}}}},"empty_map":{},"empty_seq":[],"escaped":"a\"b\\c\nd\te","nested_opt":1,"raw_hashed":"with \"# inside","raw_plain":"plain","seq_in_tuple":[[1,2],[3,4]],"signs":[-1,2,-3.5,1000.0,0.001],"trailing":[1,2,3],"tuple_variant":[1,2,3],"tuples_in_seq":[[1,2],[3,4]],"unit":null,"unit_variant":null}

@@ -1,0 +1,745 @@
+// RON: Rusty Object Notation.
+//
+// A configuration format that reads like the data structures it describes --
+// named structs with named fields, tuples, enums with payloads, and
+// comments, which is what JSON users keep asking for.
+//
+//     Config(
+//         // a window, in pixels
+//         size: (1280, 720),
+//         title: "Grasm",
+//         layers: [Fill(colour: "#1A4DFF"), Text(size: 12)],
+//         cache: None,
+//     )
+//
+// ## What is parsed
+//
+// Unit, booleans, integers in four bases with `_` separators, floats with
+// exponents, strings with escapes and raw strings, chars, sequences, tuples,
+// maps, named structs, tuple structs, unit variants, `Some`/`None`, line and
+// nested block comments, and trailing commas anywhere a list ends.
+//
+// Not parsed, and refused by name: the `#![enable(...)]` extension header,
+// and the extensions it turns on. A file asking for an extension is asking
+// for different syntax, and guessing at it would be worse than stopping.
+//
+// ## Checked against the reference
+//
+// `scripts/rontest.sh` parses each fixture here and with the Rust `ron`
+// crate, renders both as canonical JSON, and compares the bytes. The
+// rendering has to match what `ron::Value` does through serde, which is its
+// own set of decisions: a tuple becomes an array, `Some(x)` becomes `x`,
+// `None` becomes null, a struct's name is dropped and its fields sort. Those
+// are the reference's conventions rather than this parser's, and `to_json`
+// exists to mirror them so the comparison is byte for byte.
+
+type Ron =
+    | RUnit
+    | RBool(b: bool)
+    | RInt(n: i64)
+    | RFloat(f: f64)
+    | RStr(s: str)
+    | RSeq(items: [Ron])
+    | RMap(entries: [RonEntry])
+    | RStruct(name: str, fields: [RonEntry])
+    | RTuple(name: str, items: [Ron])
+    | RUnitVariant(name: str)
+
+type RonEntry = {
+    key: str,
+    value: Ron,
+}
+
+type RonError =
+    | Unexpected(what: str, at: i64)
+    | Unterminated(what: str, at: i64)
+    | BadNumber(text: str, at: i64)
+    | Extension(at: i64)
+    | TrailingInput(at: i64)
+    | Empty
+
+/// Where the parser is: the characters, and how far along.
+type Cur = {
+    cs: [str],
+    at: i64,
+}
+
+fn here(c: Cur) -> str {
+    c.cs.get(c.at).unwrap_or("")
+}
+
+fn ahead(c: Cur, n: i64) -> str {
+    c.cs.get(c.at + n).unwrap_or("")
+}
+
+fn done(c: Cur) -> bool {
+    c.at >= c.cs.len()
+}
+
+fn is_space(ch: str) -> bool {
+    ch == " " or ch == "\t" or ch == "\n" or ch == "\r"
+}
+
+fn is_digit(ch: str) -> bool {
+    ch >= "0" and ch <= "9"
+}
+
+/// A character that may start or continue an identifier.
+fn is_ident(ch: str) -> bool {
+    (ch >= "a" and ch <= "z") or (ch >= "A" and ch <= "Z") or is_digit(ch) or ch == "_"
+}
+
+/// Skip whitespace and comments.
+///
+/// Block comments nest, which a `/* */` scanner written the obvious way gets
+/// wrong: the first `*/` inside closes the outer comment and the rest of the
+/// file becomes code.
+fn skip_ws(inout c: Cur) -> () ! RonError {
+    var going = true
+    while going {
+        going = false
+        while not done(c) and is_space(here(c)) {
+            c.at = c.at + 1
+            going = true
+        }
+        if here(c) == "/" and ahead(c, 1) == "/" {
+            while not done(c) and here(c) != "\n" {
+                c.at = c.at + 1
+            }
+            going = true
+        } else if here(c) == "/" and ahead(c, 1) == "*" {
+            let start = c.at
+            var depth = 0
+            var closed = false
+            while not done(c) and not closed {
+                if here(c) == "/" and ahead(c, 1) == "*" {
+                    depth = depth + 1
+                    c.at = c.at + 2
+                } else if here(c) == "*" and ahead(c, 1) == "/" {
+                    depth = depth - 1
+                    c.at = c.at + 2
+                    if depth == 0 {
+                        closed = true
+                    }
+                } else {
+                    c.at = c.at + 1
+                }
+            }
+            if not closed {
+                fail(Unterminated("a block comment", start))
+            }
+            // Round again rather than returning: whatever follows the
+            // comment is usually whitespace, and leaving the cursor on it
+            // makes the next token look like a missing one.
+            going = true
+        }
+    }
+}
+
+/// One escape, after the backslash.
+fn escape_char(ch: str) -> str {
+    if ch == "n" {
+        return "\n"
+    }
+    if ch == "t" {
+        return "\t"
+    }
+    if ch == "r" {
+        return "\r"
+    }
+    if ch == "0" {
+        return "\0"
+    }
+    ch
+}
+
+/// A quoted string, with escapes.
+fn parse_quoted(inout c: Cur) -> str ! RonError {
+    let start = c.at
+    c.at = c.at + 1
+    var parts: [str] = []
+    while not done(c) and here(c) != "\"" {
+        if here(c) == "\\" {
+            c.at = c.at + 1
+            if done(c) {
+                fail(Unterminated("a string escape", start))
+            }
+            parts.push(escape_char(here(c)))
+            c.at = c.at + 1
+        } else {
+            parts.push(here(c))
+            c.at = c.at + 1
+        }
+    }
+    if done(c) {
+        fail(Unterminated("a string", start))
+    }
+    c.at = c.at + 1
+    parts.join("")
+}
+
+/// A raw string: `r"..."` or `r#"..."#` with any number of hashes.
+///
+/// The hashes exist so the content may contain a quote. The closing sequence
+/// is a quote followed by exactly as many hashes as opened it.
+fn parse_raw(inout c: Cur) -> str ! RonError {
+    let start = c.at
+    c.at = c.at + 1
+    var hashes = 0
+    while here(c) == "#" {
+        hashes = hashes + 1
+        c.at = c.at + 1
+    }
+    if here(c) != "\"" {
+        fail(Unexpected("a raw string without a quote", c.at))
+    }
+    c.at = c.at + 1
+    var parts: [str] = []
+    var closed = false
+    while not done(c) and not closed {
+        if here(c) == "\"" {
+            var k = 0
+            while k < hashes and ahead(c, 1 + k) == "#" {
+                k = k + 1
+            }
+            if k == hashes {
+                c.at = c.at + 1 + hashes
+                closed = true
+            } else {
+                parts.push(here(c))
+                c.at = c.at + 1
+            }
+        } else {
+            parts.push(here(c))
+            c.at = c.at + 1
+        }
+    }
+    if not closed {
+        fail(Unterminated("a raw string", start))
+    }
+    parts.join("")
+}
+
+/// A character literal, which this represents as a one-character string
+/// because the reference renders it as one.
+fn parse_char(inout c: Cur) -> str ! RonError {
+    let start = c.at
+    c.at = c.at + 1
+    var out = ""
+    if here(c) == "\\" {
+        c.at = c.at + 1
+        out = escape_char(here(c))
+        c.at = c.at + 1
+    } else {
+        out = here(c)
+        c.at = c.at + 1
+    }
+    if here(c) != "'" {
+        fail(Unterminated("a character", start))
+    }
+    c.at = c.at + 1
+    out
+}
+
+/// An identifier or keyword.
+fn parse_ident(inout c: Cur) -> str {
+    var parts: [str] = []
+    while not done(c) and is_ident(here(c)) {
+        parts.push(here(c))
+        c.at = c.at + 1
+    }
+    parts.join("")
+}
+
+/// The digits of a number in a given base, ignoring `_`.
+fn digits_of(ch: str) -> i64 {
+    if is_digit(ch) {
+        return ch.codes().get(0).unwrap_or(48) - 48
+    }
+    if ch >= "a" and ch <= "f" {
+        return ch.codes().get(0).unwrap_or(97) - 97 + 10
+    }
+    if ch >= "A" and ch <= "F" {
+        return ch.codes().get(0).unwrap_or(65) - 65 + 10
+    }
+    0 - 1
+}
+
+/// A number: an integer in base 2, 8, 10 or 16, or a float.
+fn parse_number(inout c: Cur) -> Ron ! RonError {
+    let start = c.at
+    var neg = false
+    if here(c) == "-" {
+        neg = true
+        c.at = c.at + 1
+    } else if here(c) == "+" {
+        c.at = c.at + 1
+    }
+    var base = 10
+    if here(c) == "0" and (ahead(c, 1) == "x" or ahead(c, 1) == "b" or ahead(c, 1) == "o") {
+        let kind = ahead(c, 1)
+        base = if kind == "x" { 16 } else if kind == "b" { 2 } else { 8 }
+        c.at = c.at + 2
+    }
+    var int_part = 0
+    var saw = false
+    while not done(c) {
+        if here(c) == "_" {
+            c.at = c.at + 1
+        } else {
+            let d = digits_of(here(c))
+            if d < 0 or d >= base {
+                // A `.` or an `e` after decimal digits means this is a float.
+                if base == 10 and (here(c) == "." or here(c) == "e" or here(c) == "E") {
+                    return try parse_float_tail(c, start, neg)
+                }
+                if not saw {
+                    fail(BadNumber("a number with no digits", start))
+                }
+                return RInt(if neg { 0 - int_part } else { int_part })
+            }
+            int_part = int_part * base + d
+            saw = true
+            c.at = c.at + 1
+        }
+    }
+    if not saw {
+        fail(BadNumber("a number with no digits", start))
+    }
+    RInt(if neg { 0 - int_part } else { int_part })
+}
+
+/// A float, re-read from the start so the fraction and exponent are one
+/// conversion rather than three.
+fn parse_float_tail(inout c: Cur, start: i64, _neg: bool) -> Ron ! RonError {
+    var at = start
+    var parts: [str] = []
+    var running = true
+    while running and at < c.cs.len() {
+        let ch = c.cs.get(at).unwrap_or("")
+        if is_digit(ch) or ch == "." or ch == "e" or ch == "E" {
+            parts.push(ch)
+            at = at + 1
+        } else if ch == "_" {
+            at = at + 1
+        } else if (ch == "-" or ch == "+") and (at == start or is_exponent(c, at)) {
+            // A sign belongs to the number only at the front or right after
+            // an exponent marker. Anywhere else it is the next token, and
+            // eating it swallows the comma-separated value after this one.
+            parts.push(ch)
+            at = at + 1
+        } else {
+            running = false
+        }
+    }
+    c.at = at
+    let text = parts.join("")
+    match text.parse_float() {
+        Some(f) -> RFloat(f)
+        None -> fail(BadNumber(text, start))
+    }
+}
+
+/// Whether the character before `at` is an exponent marker.
+fn is_exponent(c: Cur, at: i64) -> bool {
+    let prev = c.cs.get(at - 1).unwrap_or("")
+    prev == "e" or prev == "E"
+}
+
+/// A comma-separated run ending in `close`, allowing a trailing comma.
+fn parse_items(inout c: Cur, close: str) -> [Ron] ! RonError {
+    var out: [Ron] = []
+    try skip_ws(c)
+    while not done(c) and here(c) != close {
+        out.push(try parse_value(c))
+        try skip_ws(c)
+        if here(c) == "," {
+            c.at = c.at + 1
+            try skip_ws(c)
+        }
+    }
+    if done(c) {
+        fail(Unterminated("a list", c.at))
+    }
+    c.at = c.at + 1
+    out
+}
+
+/// `key: value` pairs ending in `close`.
+fn parse_fields(inout c: Cur, close: str) -> [RonEntry] ! RonError {
+    var out: [RonEntry] = []
+    try skip_ws(c)
+    while not done(c) and here(c) != close {
+        var key = ""
+        if here(c) == "\"" {
+            key = try parse_quoted(c)
+        } else {
+            key = parse_ident(c)
+        }
+        if key == "" {
+            fail(Unexpected("a field name", c.at))
+        }
+        try skip_ws(c)
+        if here(c) != ":" {
+            fail(Unexpected("a colon after a field name", c.at))
+        }
+        c.at = c.at + 1
+        try skip_ws(c)
+        out.push(RonEntry{ key: key, value: try parse_value(c) })
+        try skip_ws(c)
+        if here(c) == "," {
+            c.at = c.at + 1
+            try skip_ws(c)
+        }
+    }
+    if done(c) {
+        fail(Unterminated("a field list", c.at))
+    }
+    c.at = c.at + 1
+    out
+}
+
+/// Whether a parenthesised run is `key: value` pairs or bare values.
+///
+/// RON spells a struct and a tuple struct the same way up to the first
+/// colon, so this looks ahead for one before deciding -- stopping at a
+/// bracket so a nested `(a: 1)` inside a tuple does not fool it.
+fn looks_like_fields(c: Cur) -> bool {
+    var at = c.at
+    var depth = 0
+    while at < c.cs.len() {
+        let ch = c.cs.get(at).unwrap_or("")
+        if ch == "(" or ch == "[" or ch == "\{" {
+            depth = depth + 1
+        } else if ch == ")" or ch == "]" or ch == "\}" {
+            if depth == 0 {
+                return false
+            }
+            depth = depth - 1
+        } else if ch == "," and depth == 0 {
+            return false
+        } else if ch == ":" and depth == 0 {
+            return true
+        } else if ch == "\"" {
+            return false
+        }
+        at = at + 1
+    }
+    false
+}
+
+/// Parse one value.
+pub fn parse_value(inout c: Cur) -> Ron ! RonError {
+    try skip_ws(c)
+    if done(c) {
+        fail(Empty)
+    }
+    let ch = here(c)
+    if ch == "#" {
+        fail(Extension(c.at))
+    }
+    if ch == "\"" {
+        return RStr(try parse_quoted(c))
+    }
+    if ch == "'" {
+        return RStr(try parse_char(c))
+    }
+    if ch == "r" and (ahead(c, 1) == "\"" or ahead(c, 1) == "#") {
+        return RStr(try parse_raw(c))
+    }
+    if ch == "[" {
+        c.at = c.at + 1
+        return RSeq(try parse_items(c, "]"))
+    }
+    if ch == "\{" {
+        c.at = c.at + 1
+        return RMap(try parse_fields(c, "\}"))
+    }
+    if ch == "(" {
+        c.at = c.at + 1
+        try skip_ws(c)
+        if here(c) == ")" {
+            c.at = c.at + 1
+            return RUnit
+        }
+        if looks_like_fields(c) {
+            return RStruct("", try parse_fields(c, ")"))
+        }
+        return RTuple("", try parse_items(c, ")"))
+    }
+    if is_digit(ch) or ch == "-" or ch == "+" {
+        return try parse_number(c)
+    }
+    if is_ident(ch) {
+        let name = parse_ident(c)
+        if name == "true" {
+            return RBool(true)
+        }
+        if name == "false" {
+            return RBool(false)
+        }
+        if name == "None" {
+            return RUnit
+        }
+        if name == "inf" {
+            return RFloat(1.0 / 0.0)
+        }
+        if name == "NaN" {
+            return RFloat(0.0 / 0.0)
+        }
+        try skip_ws(c)
+        if here(c) == "(" {
+            c.at = c.at + 1
+            try skip_ws(c)
+            if here(c) == ")" {
+                c.at = c.at + 1
+                return RTuple(name, [])
+            }
+            if looks_like_fields(c) {
+                return RStruct(name, try parse_fields(c, ")"))
+            }
+            return RTuple(name, try parse_items(c, ")"))
+        }
+        return RUnitVariant(name)
+    }
+    fail(Unexpected("a value", c.at))
+}
+
+/// Parse a whole document, which must hold exactly one value.
+pub fn parse(text: str) -> Ron ! RonError {
+    var c = Cur{ cs: text.chars(), at: 0 }
+    try skip_ws(c)
+    if done(c) {
+        fail(Empty)
+    }
+    let v = try parse_value(c)
+    try skip_ws(c)
+    if not done(c) {
+        fail(TrailingInput(c.at))
+    }
+    return v
+}
+
+/// A float the way serde_json writes one: a whole number keeps a `.0`.
+fn json_float(f: f64) -> str {
+    let n = f.floor()
+    if f == n and f.abs() < 1000000000000000.0 {
+        return "{n.as_i64()}.0"
+    }
+    "{f}"
+}
+
+fn json_string(s: str) -> str {
+    var parts: [str] = ["\""]
+    for ch in s.chars() {
+        if ch == "\"" {
+            parts.push("\\\"")
+        } else if ch == "\\" {
+            parts.push("\\\\")
+        } else if ch == "\n" {
+            parts.push("\\n")
+        } else if ch == "\t" {
+            parts.push("\\t")
+        } else if ch == "\r" {
+            parts.push("\\r")
+        } else {
+            parts.push(ch)
+        }
+    }
+    parts.push("\"")
+    parts.join("")
+}
+
+/// Entries sorted by key, which is the order the reference emits.
+fn sorted_entries(entries: [RonEntry]) -> [RonEntry] {
+    var keys: [str] = []
+    for e in entries {
+        keys.push(e.key)
+    }
+    keys.sort()
+    var out: [RonEntry] = []
+    for k in keys {
+        for e in entries {
+            if e.key == k and out.len() < entries.len() {
+                var already = false
+                for o in out {
+                    if o.key == k {
+                        already = true
+                    }
+                }
+                if not already {
+                    out.push(e)
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Render as the JSON the Rust `ron` crate produces through serde.
+///
+/// The conventions are the reference's, not this parser's: a tuple becomes an
+/// array, a struct's name is dropped and its fields sort, `Some(x)` is just
+/// `x` and `None` is null. `scripts/rontest.sh` compares these bytes against
+/// the reference's, so matching them is the whole point of this function --
+/// a prettier rendering would make the comparison impossible.
+pub fn to_json(v: Ron) -> str {
+    match v {
+        RUnit -> "null"
+        RBool(b) -> if b { "true" } else { "false" }
+        RInt(n) -> "{n}"
+        RFloat(f) -> json_float(f)
+        RStr(s) -> json_string(s)
+        RSeq(items) -> json_array(items)
+        RTuple(name, items) -> {
+            // `Some(x)` carries one value and renders as that value.
+            if name == "Some" and items.len() == 1 {
+                to_json(items.get(0).unwrap_or(RUnit))
+            } else {
+                json_array(items)
+            }
+        }
+        RMap(entries) -> json_object(entries)
+        RStruct(_name, fields) -> json_object(fields)
+        // A unit struct or variant keeps its name in the tree above, and the
+        // reference drops it: `ron::Value` has nowhere to put it, so it
+        // renders as null. Keeping the name here would be prettier and would
+        // make the comparison impossible.
+        RUnitVariant(_name) -> "null"
+    }
+}
+
+fn json_array(items: [Ron]) -> str {
+    var parts: [str] = []
+    for it in items {
+        parts.push(to_json(it))
+    }
+    "[" + parts.join(",") + "]"
+}
+
+fn json_object(entries: [RonEntry]) -> str {
+    var parts: [str] = []
+    for e in sorted_entries(entries) {
+        parts.push(json_string(e.key) + ":" + to_json(e.value))
+    }
+    "\{" + parts.join(",") + "\}"
+}
+
+test "the shapes a config is made of" {
+    for pair in [
+        ["42", "42"],
+        ["true", "true"],
+        ["\"hi\"", "\"hi\""],
+        ["()", "null"],
+        ["None", "null"],
+        ["Some(5)", "5"],
+        ["[1,2,3]", "[1,2,3]"],
+        ["(1,\"a\")", "[1,\"a\"]"],
+        ["Point(x:1,y:2)", "\{\"x\":1,\"y\":2\}"],
+    ] {
+        let src = pair.get(0).unwrap_or("")
+        let want = pair.get(1).unwrap_or("")
+        match parse(src) {
+            Ok(v) -> assert_eq(to_json(v), want)
+            // a value the format allows did not parse
+            Err(_e) -> assert(false)
+        }
+    }
+}
+
+test "integers come in four bases and may carry underscores" {
+    let srcs = ["0x1f", "0b101", "0o17", "1_000", "-42"]
+    let wants = [31, 5, 15, 1000, 0 - 42]
+    var i = 0
+    while i < srcs.len() {
+        match parse(srcs.get(i).unwrap_or("")) {
+            Ok(RInt(n)) -> assert_eq(n, wants.get(i).unwrap_or(0))
+            // a base the format allows did not parse as an integer
+            _ -> assert(false)
+        }
+        i = i + 1
+    }
+}
+
+test "a sign belongs to its own number and not the next one" {
+    // The float scanner used to eat a following `-`, which turned a list of
+    // three into a list of two with a wrong last element.
+    match parse("[1.5,-2.5]") {
+        Ok(RSeq(items)) -> assert_eq(items.len(), 2)
+        _ -> assert(false)
+    }
+    match parse("(a:-1,b:-2)") {
+        Ok(RStruct(_n, fs)) -> assert_eq(fs.len(), 2)
+        _ -> assert(false)
+    }
+}
+
+test "block comments nest" {
+    // The obvious scanner stops at the first `*/` and treats the rest of the
+    // file as code.
+    match parse("/* a /* b */ c */ 7") {
+        Ok(RInt(n)) -> assert_eq(n, 7)
+        _ -> assert(false)
+    }
+}
+
+test "whitespace after a comment is still whitespace" {
+    // Returning from the skipper as soon as a comment closes leaves the
+    // cursor on a newline, and the next field name looks missing.
+    match parse("(\n  // note\n  a: 1,\n)") {
+        Ok(RStruct(_n, fs)) -> assert_eq(fs.len(), 1)
+        _ -> assert(false)
+    }
+}
+
+test "a raw string keeps its backslashes" {
+    match parse("r\"a\\nb\"") {
+        Ok(RStr(s)) -> assert_eq(s.len(), 4)
+        _ -> assert(false)
+    }
+}
+
+test "a struct and a tuple struct are told apart by the first colon" {
+    match parse("A(1,2)") {
+        Ok(RTuple(n, items)) -> {
+            assert_eq(n, "A")
+            assert_eq(items.len(), 2)
+        }
+        _ -> assert(false)
+    }
+    match parse("A(x:1)") {
+        Ok(RStruct(n, fs)) -> {
+            assert_eq(n, "A")
+            assert_eq(fs.len(), 1)
+        }
+        _ -> assert(false)
+    }
+}
+
+test "an extension header is refused rather than ignored" {
+    // A file asking for an extension is asking for different syntax.
+    match parse("#![enable(implicit_some)] 1") {
+        Err(_e) -> assert(true)
+        Ok(_v) -> assert(false)
+    }
+}
+
+test "input after the value is refused" {
+    match parse("1 2") {
+        Err(_e) -> assert(true)
+        Ok(_v) -> assert(false)
+    }
+    match parse("") {
+        Err(_e) -> assert(true)
+        Ok(_v) -> assert(false)
+    }
+}
+
+test "an unterminated string or comment is refused" {
+    for src in ["\"abc", "/* abc", "[1,2"] {
+        match parse(src) {
+            Err(_e) -> assert(true)
+            Ok(_v) -> assert(false)
+        }
+    }
+}

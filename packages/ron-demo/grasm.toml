@@ -1,0 +1,8 @@
+[package]
+name = "ron_demo"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.ron]
+path = "../ron"
+version = "^1.0.0"

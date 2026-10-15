@@ -1,0 +1,23 @@
+// A configuration the way RON is actually written: named fields, comments,
+// nested structs, enums with payloads, and trailing commas.
+Config(
+    name: "Grasm",
+    /* The window, in pixels. Block comments /* nest */, which a scanner
+       written the obvious way gets wrong. */
+    size: (1280, 720),
+    scale: 1.5,
+    layers: [
+        Fill(colour: "#1A4DFF", alpha: 255),
+        Text(size: 12, font: "Sora"),
+        Image(path: r"C:\textures\no \n escapes here"),
+    ],
+    cache: None,
+    budget: Some(4096),
+    flags: {
+        "vsync": true,
+        "debug": false,
+    },
+    limits: (0, 1_000, 0x10, 0b1010, 0o17),
+    tolerance: -2.5e-3,
+    mode: Fast,
+)

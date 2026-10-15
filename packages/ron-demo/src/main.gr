@@ -1,0 +1,10 @@
+// Parse RON from a file and print it as JSON, for `scripts/rontest.sh` to
+// compare against the Rust `ron` crate.
+import ron
+
+fn main() -> () ! RonError / {io} {
+    let path = args().get(0) ?? ""
+    let text = read_file(path) ?? ""
+    let v = try ron.parse(text)
+    print(ron.to_json(v))
+}

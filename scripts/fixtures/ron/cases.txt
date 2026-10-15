@@ -1,0 +1,44 @@
+# One RON value a line, checked against the Rust `ron` crate when it is
+# available and against the recorded JSON beside it otherwise.
+#
+# A line is `<ron>` TAB `<json>`. The JSON is what the reference produces, not
+# what this parser produces, so the file is a record of the reference rather
+# than a snapshot of ourselves.
+42	42
+-17	-17
+true	true
+false	false
+"hi"	"hi"
+3.5	3.5
+()	null
+[1,2,3]	[1,2,3]
+[1,2,3,]	[1,2,3]
+(1,"a")	[1,"a"]
+Some(5)	5
+None	null
+Point(x:1,y:2)	{"x":1,"y":2}
+'c'	"c"
+0x1f	31
+0b101	5
+0o17	15
+1_000	1000
+Config(name:"a",vals:[1,2],on:true)	{"name":"a","on":true,"vals":[1,2]}
+{"k":1,"a":2}	{"a":2,"k":1}
+(a:(b:(c:1)))	{"a":{"b":{"c":1}}}
+[[1,2],[3,4]]	[[1,2],[3,4]]
+[(1,2),(3,4)]	[[1,2],[3,4]]
+Outer(inner:Inner(x:[Some(1),None]))	{"inner":{"x":[1,null]}}
+r"raw \n not escaped"	"raw \\n not escaped"
+[true,false,(),"s",1,2.5]	[true,false,null,"s",1,2.5]
+Rgb(255,128,0)	[255,128,0]
+Unit	null
+(x:1,)	{"x":1}
+[]	[]
+{}	{}
+1.5e3	1500.0
+-2.5	-2.5
+0.0	0.0
+A(b:[C(d:1),C(d:2)])	{"b":[{"d":1},{"d":2}]}
+[1.5,2.5,-3.5]	[1.5,2.5,-3.5]
+[1e2,2E3]	[100.0,2000.0]
+(a:-1,b:-2)	{"a":-1,"b":-2}
