@@ -1,0 +1,48 @@
+name: Release
+
+# Builds a downloadable archive per platform. `grasm build --native` links
+# libgrasm_rt_abi.a, so the archive ships both and the binary finds the runtime
+# beside itself — a download that cannot compile is not a release.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  archive:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux-x86_64
+          - os: macos-latest
+            name: macos-arm64
+          - os: macos-13
+            name: macos-x86_64
+    runs-on: ${{ matrix.os }}
+    name: ${{ matrix.name }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release --workspace
+      - name: Verify the archive actually works
+        # Build a program from a scratch directory using only what ships, so a
+        # broken archive fails here rather than for whoever downloads it.
+        run: |
+          mkdir -p dist/grasm-${{ matrix.name }}
+          cp target/release/grasm dist/grasm-${{ matrix.name }}/
+          cp target/release/libgrasm_rt_abi.a dist/grasm-${{ matrix.name }}/
+          cp README.md LICENSE NOTICE dist/grasm-${{ matrix.name }}/
+          cp dist/grasm-language-pack.md dist/grasm-${{ matrix.name }}/
+          mkdir -p /tmp/verify && cd /tmp/verify
+          printf 'fn main() {\n    print("release ok")\n}\n' > check.gr
+          "$GITHUB_WORKSPACE/dist/grasm-${{ matrix.name }}/grasm" run check.gr
+          "$GITHUB_WORKSPACE/dist/grasm-${{ matrix.name }}/grasm" build check.gr --native -o check
+          ./check | grep -q "release ok"
+      - name: Package
+        run: tar -czf grasm-${{ matrix.name }}.tar.gz -C dist grasm-${{ matrix.name }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: grasm-${{ matrix.name }}
+          path: grasm-${{ matrix.name }}.tar.gz

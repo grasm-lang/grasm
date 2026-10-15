@@ -13,3 +13,8 @@ __pycache__/
 # The security benchmark builds a throwaway Rust project to prove `std::fs` is
 # ambient there. Its lock file is an artifact of running the gate, not source.
 /benchmarks/security/rust/app/Cargo.lock
+
+# Local editor and tooling state is never source. Whatever your tools write
+# into the working tree -- caches, session files, automation logs -- belongs
+# in your own global ignore file rather than this one, which describes the
+# project and not the machine it is built on.

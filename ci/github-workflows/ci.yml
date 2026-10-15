@@ -1,0 +1,135 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux-x86_64
+          - os: macos-latest
+            name: macos-arm64
+          - os: macos-13
+            name: macos-x86_64
+    runs-on: ${{ matrix.os }}
+    name: ${{ matrix.name }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Build
+        run: cargo build --release --workspace
+      - name: Unit + integration tests
+        run: cargo test --workspace
+      - name: Lints (deny warnings)
+        # --all-targets so test files are linted too; a lint that only fires in
+        # a test still fires on someone's machine.
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Differential test (native vs interpreter)
+        run: ./scripts/difftest.sh
+      - name: Specification conformance
+        run: cargo test -p grasm_spec
+      - name: ProjectGold — thirty-one whole programs, three engines
+        # These are programs written to somebody else's list rather than to the
+        # compiler's shape, which is why they found most of the gaps in
+        # ProjectGold/FINDINGS.md. Each is compared across all three engines
+        # against a recorded transcript.
+        run: ./ProjectGold/run.sh
+      - name: The kernel split holds
+        # MASTERPLAN §19.2 makes Grasm-Core binding. This fails when a new
+        # syntactic form is neither Core nor given a rewrite into Core, and
+        # when the reference interpreter grows away from its 5,000-line budget.
+        run: cargo test -p grasm_spec --test core
+      - name: North-star scorecard
+        # Prints §2.3's measurable goals rather than failing on a miss — three
+        # are missed today. It fails when a measurement cannot be *taken*,
+        # which is how a metric quietly stops being collected.
+        run: ./scripts/northstar.sh
+      - name: The site is what its generator would write
+        # Catches two things no other job does: a page edited without
+        # regenerating, and a figure the site reads out of a document whose
+        # shape has changed -- which previously showed up as a stale number on
+        # a page claiming every number was computed.
+        run: python3 scripts/site.py --check
+      - name: Three engines agree
+        # The interpreter is normative, so a bundle or a native binary that
+        # answers differently is a defect in the compiler, not a variation.
+        run: ./scripts/agreetest.sh
+      - name: Native gap list matches the compiler
+        # Bidirectional: a shape the table lists must still be refused, and a
+        # shape it does not list must still compile. A stale table is how a
+        # documented gap becomes a silent miscompile.
+        run: ./scripts/nativegaps.sh
+      - name: Soundness of effect rows, both directions
+        # An effectful function value must be refused inside a `/ {}` body and
+        # inside a `capabilities = []` package; a pure one must be accepted.
+        # Refusing a correct program is as much a defect as accepting a wrong
+        # one, so the gate checks both.
+        run: python3 scripts/fuzz_rows.py --packages
+      - name: Every spelling that reaches a C function costs the same row
+        run: python3 scripts/fuzz_extern.py
+      - name: Lockfile is current and capabilities hold
+        # --locked fails on a changed checksum, an added or removed package, or
+        # a widened capability ceiling, rather than rewriting grasm.lock into
+        # agreement with whatever is checked out.
+        run: ./target/release/grasm deps examples/workspace/app --locked
+      - name: Supply-chain benchmark (Grasm must catch the tamper)
+        # The demo proves the headline security claim; assert its Grasm row
+        # stays COMPILE ERROR so it cannot silently start passing.
+        run: |
+          ./scripts/security_bench.sh | tee /tmp/secout.txt
+          grep -Eq 'Grasm +COMPILE ERROR' /tmp/secout.txt
+
+  soundness:
+    runs-on: ubuntu-latest
+    name: generated programs
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release --workspace
+      # These generate programs rather than reading a fixed corpus, so they are
+      # the gate that finds what nobody thought to write down. They are slower
+      # than the fixed gates, which is why they run in a job of their own.
+      - name: No build leaves a scratch directory behind
+        run: ./scripts/leakcheck.sh
+      - name: Effect handlers and pattern binders
+        run: python3 scripts/fuzz_handlers.py --count 120
+      - name: Differential — generated programs, three engines
+        run: python3 scripts/fuzz_differential.py --count 150
+      - name: Fallible values
+        run: python3 scripts/fuzz_fallible.py 100
+      - name: Generic instantiation
+        run: python3 scripts/fuzz_generics.py --count 100
+      # Three grids rather than random programs. Each enumerates an axis along
+      # which the native backend has more than one implementation site, which
+      # is where every one of F17, F22, F23, F24 and F26 lived.
+      - name: Places — read, write, and mutate through every shape
+        run: python3 scripts/fuzz_places.py
+      - name: Methods — every builtin, on every shape of receiver
+        run: python3 scripts/fuzz_methods.py
+      - name: Fusions — the compiled shortcuts against the interpreter
+        run: python3 scripts/fuzz_fusions.py
+
+  cross-emit:
+    runs-on: ubuntu-latest
+    name: cross-target object emission
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release --workspace
+      - name: Emit objects for every supported architecture
+        run: |
+          for t in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu \
+                   riscv64gc-unknown-linux-gnu s390x-unknown-linux-gnu \
+                   x86_64-apple-darwin; do
+            ./target/release/grasm build examples/hello.gr --native \
+              --target "$t" -o "/tmp/hello_$t"
+            file "/tmp/hello_$t.o"
+          done
