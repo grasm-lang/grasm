@@ -1,0 +1,8 @@
+[package]
+name = "sdl"
+version = "1.0.0"
+
+# A window, a renderer and a streaming texture, by calling SDL2 directly.
+# That is C, so it is Tier 3 and says so here as well as in the source -- a
+# consumer can refuse this package by reading one line.
+capabilities = ["io", "unsafe"]

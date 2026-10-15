@@ -85,7 +85,7 @@ compile-time fact is not.</p>
 grasm deps <span class="op">-</span><span class="op">-</span>locked   # fail rather than update the lockfile</code></pre>
 
 <h2>What ships today</h2>
-<p>651 libraries, all written inside this repository because there
+<p>653 libraries, all written inside this repository because there
 is no registry to get one from. The table below is a sample of them — the
 ones where the capability column says something worth reading.</p>
 <div class="scroll"><table>
@@ -125,8 +125,8 @@ ones where the capability column says something worth reading.</p>
 <tr><td><code>xml</code></td><td><i>none</i></td><td>Parse and render. <b>No DTD and no external entities, ever</b> — that is what XXE is, and a first release does not need it. Which is also why this can declare nothing and mean it.</td></tr>
 <tr><td><code>oauth2</code></td><td><i>none</i></td><td>The authorisation-code flow with PKCE (checked against RFC 7636's vector) and client credentials. PKCE and <code>state</code> are not optional here.</td></tr>
 </table></div>
-<p><strong>555 of the 651 libraries declare
-<em>nothing</em>.</strong> Only 96 ask for any capability
+<p><strong>556 of the 653 libraries declare
+<em>nothing</em>.</strong> Only 97 ask for any capability
 at all. That is the pattern the whole design is for, and the number is counted
 from the manifests rather than asserted: reach is
 split from computation, so a program that joins paths, formats a date or

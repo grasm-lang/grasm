@@ -1,0 +1,177 @@
+// The 56 bytes `SDL_PollEvent` wrote, as something worth matching on.
+//
+// `SDL_Event` is a union, so the bytes mean different things depending on the
+// first four of them. Decoding it in Grasm rather than adding accessors to
+// the binding keeps the C surface at "fill this buffer" -- the one shape the
+// boundary allows -- and puts the layout knowledge in a package that can be
+// read, tested and corrected without touching an `extern fn`.
+//
+// Every offset below was printed by `offsetof` in a C program compiled
+// against SDL2 2.32.10's own headers. They are stable across SDL2 but they
+// are not guessable, and a union field read at the wrong offset is a bug that
+// looks like bad input.
+//
+//     type              0   Uint32
+//     button.button    16   Uint8
+//     key.keysym.sym   20   Sint32
+//     motion.x         20   Sint32    button.x  20
+//     motion.y         24   Sint32    button.y  24
+
+/// What a poll produced. `Other` carries the raw type so a program can log an
+/// event this package does not decode rather than lose it.
+type Event =
+    | Quit
+    | KeyDown(sym: i64)
+    | MouseDown(button: i64, x: i64, y: i64)
+    | MouseMotion(x: i64, y: i64)
+    | WindowChanged
+    | Other(kind: i64)
+
+pub let TYPE_QUIT = 256
+pub let TYPE_WINDOWEVENT = 512
+pub let TYPE_KEYDOWN = 768
+pub let TYPE_MOUSEMOTION = 1024
+pub let TYPE_MOUSEBUTTONDOWN = 1025
+
+/// `SDLK_ESCAPE`, the one key a demo needs by name.
+pub let KEY_ESCAPE = 27
+
+/// Four bytes little-endian, unsigned.
+pub fn u32_at(buf: bytes, off: i64) -> i64 {
+    buf.at(off) +
+    buf.at(off + 1) * 256 +
+    buf.at(off + 2) * 65536 +
+    buf.at(off + 3) * 16777216
+}
+
+/// Four bytes little-endian, signed — a window can report a negative
+/// coordinate, and read as unsigned that is 4 294 967 2xx rather than -N.
+pub fn i32_at(buf: bytes, off: i64) -> i64 {
+    let raw = u32_at(buf, off)
+    if raw >= 2147483648 {
+        return raw - 4294967296
+    }
+    return raw
+}
+
+/// The event type, which says how to read the rest.
+pub fn kind_of(buf: bytes) -> i64 {
+    u32_at(buf, 0)
+}
+
+/// Decode one event.
+pub fn decode(buf: bytes) -> Event {
+    let kind = kind_of(buf)
+    if kind == TYPE_QUIT {
+        return Quit
+    }
+    if kind == TYPE_KEYDOWN {
+        return KeyDown(i32_at(buf, 20))
+    }
+    if kind == TYPE_MOUSEBUTTONDOWN {
+        return MouseDown(buf.at(16), i32_at(buf, 20), i32_at(buf, 24))
+    }
+    if kind == TYPE_MOUSEMOTION {
+        return MouseMotion(i32_at(buf, 20), i32_at(buf, 24))
+    }
+    if kind == TYPE_WINDOWEVENT {
+        return WindowChanged
+    }
+    return Other(kind)
+}
+
+/// Whether this event should end the program: the window closed, or Escape.
+pub fn is_exit(e: Event) -> bool {
+    match e {
+        Quit -> true
+        KeyDown(sym) -> sym == KEY_ESCAPE
+        _ -> false
+    }
+}
+
+// The byte sequences below are not invented. They were produced by a C
+// program compiled against SDL2's headers, which built each event through
+// SDL's own structures and dumped the 56 bytes -- so these tests check the
+// decoder against SDL's encoding rather than against a second copy of my
+// assumptions about it. `motion` is the one that matters most: SDL wrote
+// 251,255,255,255 for x, which is -5 signed and 4294967291 unsigned.
+
+test "a quit event" {
+    let buf = bytes_of([
+        0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0,
+    ])
+    assert_eq(kind_of(buf), TYPE_QUIT)
+    match decode(buf) {
+        Quit -> assert(is_exit(Quit))
+        // a quit event did not decode as Quit
+        _ -> assert(false)
+    }
+}
+
+test "escape is an exit" {
+    let buf = bytes_of([
+        0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 27, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0,
+    ])
+    match decode(buf) {
+        KeyDown(sym) -> {
+            assert_eq(sym, KEY_ESCAPE)
+            assert(is_exit(KeyDown(sym)))
+        }
+        // a keydown did not decode as KeyDown
+        _ -> assert(false)
+    }
+}
+
+test "a click carries its button and position" {
+    let buf = bytes_of([
+        1, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        1, 0, 0, 0, 44, 1, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0,
+    ])
+    match decode(buf) {
+        MouseDown(button, x, y) -> {
+            assert_eq(button, 1)
+            assert_eq(x, 300)
+            assert_eq(y, 7)
+        }
+        // a mouse button did not decode as MouseDown
+        _ -> assert(false)
+    }
+}
+
+test "a negative coordinate stays negative" {
+    let buf = bytes_of([
+        0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 251, 255, 255, 255, 232, 3, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0,
+    ])
+    match decode(buf) {
+        MouseMotion(x, y) -> {
+            assert_eq(x, -5)
+            assert_eq(y, 1000)
+            assert(not is_exit(MouseMotion(x, y)))
+        }
+        // a motion event did not decode as MouseMotion
+        _ -> assert(false)
+    }
+}
+
+test "an event this package does not decode keeps its type" {
+    var buf = bytes_filled(56, 0)
+    // 1026 is SDL_MOUSEBUTTONUP, which nothing above claims.
+    buf.set(0, 2)
+    buf.set(1, 4)
+    match decode(buf) {
+        Other(kind) -> assert_eq(kind, 1026)
+        // an unknown event was swallowed
+        _ -> assert(false)
+    }
+}

@@ -255,11 +255,22 @@ which overstates it -- the boundary exists and declaring it is how a package
 admits to crossing it -- but the narrow type set is the real limit behind that
 complaint.
 
-**No GUI, no GPU, no DOM.** There is no windowing or toolkit binding, no FFI
-shaped to bind one, nothing addressing the GPU in any package, and the wasm
-build ships the interpreter without reach into the DOM. Platform input devices
-are likewise absent. An application whose shell is any of those has no target
-here, whatever its core is written in.
+**No widget toolkit. A window, as of 2026-10-15.** The windowing half of this
+entry is closed: `packages/sdl` binds SDL2 and `packages/sdlevent` decodes its
+events, with `scripts/sdltest.sh` creating a real window, renderer and
+streaming texture under `SDL_VIDEODRIVER=dummy` and measuring **0.4 ms a
+frame** for generate-upload-clear-copy-present at 256x256 RGBA. The entry
+claimed there was "no FFI shaped to bind one", and that was the part worth
+retracting -- handles as `i64` and out-params as `bytes` were enough, and no
+builtin was added.
+
+What is still missing is everything above the window: no buttons, sliders,
+text fields, menus or layout, and no glyph rasteriser, so text means binding
+SDL2_ttf or writing one over the font tables that already exist (`sfnt`,
+`glyf`, `cmap`, `fontmetrics`). Nothing addresses the GPU in any package, and
+the wasm build ships the interpreter without reach into the DOM. A library
+that passes structures by value or wants a callback -- raylib, Cocoa through
+`objc_msgSend` -- still cannot cross the boundary at all.
 
 ## Nothing open
 

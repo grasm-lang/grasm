@@ -1,0 +1,7 @@
+[package]
+name = "sdlevent"
+version = "1.0.0"
+
+# Reads a buffer SDL filled. No C call of its own, so no `unsafe` -- the
+# `bytes` it decodes arrived from `packages/sdl`, which declares it.
+capabilities = []

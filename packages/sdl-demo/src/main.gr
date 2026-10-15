@@ -1,0 +1,74 @@
+// A window, a frame generated into a `bytes` buffer, and an event loop.
+//
+// This is the whole GUI path end to end: pixels live in a mutable byte buffer
+// ([L-LIB-BYTES-WRITE]) at one byte a channel, go to a streaming texture
+// through a raw pointer, and events come back through another one. Nothing
+// here is a new builtin.
+//
+// It runs with no display when `SDL_VIDEODRIVER=dummy` is set, which is how
+// `scripts/sdltest.sh` checks it. With a display it opens a window and
+// animates until the window is closed or a key is pressed.
+import sdl
+import sdlevent
+
+let W = 256
+let H = 256
+
+/// A gradient with a moving diagonal band, written a byte at a time.
+///
+/// `set` rather than a list of integers: at one byte a channel this frame is
+/// 256 KiB, where `[i64]` would make it 2 MiB for the same pixels.
+fn draw(inout px: bytes, t: i64) {
+    var y = 0
+    while y < H {
+        var x = 0
+        while x < W {
+            let i = (y * W + x) * 4
+            let band = (x + y + t * 4) % 256
+            px.set(i, x)
+            px.set(i + 1, y)
+            px.set(i + 2, band)
+            px.set(i + 3, 255)
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+fn main() -> () ! SdlError / {io, unsafe} {
+    let frames = match args().get(0) {
+        Some(n) -> n.parse_int() ?? 120
+        None -> 120
+    }
+
+    try sdl.init_video()
+    let win = try sdl.create_window("Grasm", W, H)
+    let ren = try sdl.create_renderer(win)
+    let tex = try sdl.create_texture(ren, W, H)
+
+    var px = bytes_filled(W * H * 4, 0)
+    var ev = sdl.event_buffer()
+    var t = 0
+    var running = true
+    while running and t < frames {
+        while sdl.poll_event(ev) {
+            // The decoding lives in `sdlevent`, against offsets taken from
+            // SDL's own headers, so this loop reads as what it means.
+            if sdlevent.is_exit(sdlevent.decode(ev)) {
+                running = false
+            }
+        }
+        draw(px, t)
+        try sdl.update_texture(tex, px, W * 4)
+        try sdl.render_clear(ren)
+        try sdl.render_copy(ren, tex)
+        sdl.render_present(ren)
+        t = t + 1
+    }
+
+    sdl.destroy_texture(tex)
+    sdl.destroy_renderer(ren)
+    sdl.destroy_window(win)
+    sdl.quit()
+    print("drew {t} frames of {W}x{H} RGBA")
+}

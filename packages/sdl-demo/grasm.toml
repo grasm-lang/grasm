@@ -1,0 +1,12 @@
+[package]
+name = "sdl_demo"
+version = "1.0.0"
+capabilities = ["io", "unsafe"]
+
+[dependencies.sdl]
+path = "../sdl"
+version = "^1.0.0"
+
+[dependencies.sdlevent]
+path = "../sdlevent"
+version = "^1.0.0"

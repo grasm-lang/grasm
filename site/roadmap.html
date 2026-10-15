@@ -99,7 +99,7 @@ which is what the <code>etl</code> benchmark loses 3.6× to.</p>
 
 <h2>3. Packages and libraries</h2>
 <p>The mechanism is built: manifests, resolution, lockfiles, path and local
-registry dependencies, and the capability ceiling. 651 libraries are
+registry dependencies, and the capability ceiling. 653 libraries are
 written, all of them inside this repository. What is missing is a remote
 registry — nothing fetches and nothing publishes, so nobody else can write the
 next one.</p>
@@ -112,12 +112,12 @@ the shape of the set rather than a checklist of names:</p>
 <tr><td><b>http</b> — server and client</td><td><b>Built.</b> <code>packages/http</code> parses and routes and declares no capability; <code>http_server</code> owns the socket; <code>http_client</code>'s demo talks to <code>http_server</code> over a real one. There is <code>http2frame</code>, <code>http2client</code> and <code>https_client</code> besides.</td></tr>
 <tr><td><b>json</b></td><td><b>Built</b>, and so are <code>jsonschema</code>, <code>jsonpath</code>, <code>jsonpatch</code>, <code>jsonpointer</code> and <code>jsonmergepatch</code>. All declare no capability.</td></tr>
 <tr><td><b>Concurrency</b></td><td><b>In the language rather than a library.</b> Channels, <code>concurrent</code>/<code>go</code>, actors and <code>chan_select</code> are in, 1,000,000 tasks run in 22 s on a compiled build, and <code>net_wait</code> holds many connections on one thread. A task still refuses every effect, which is the half of G6 that is open, and there is no timer library above any of it.</td></tr>
-<tr><td><b>Everything else</b></td><td>651 libraries, the six that were listed as missing among them. See <a href="packages.html">Packages</a>.</td></tr>
-<tr><td><b>A registry</b></td><td><b>The one that matters, and it is not built.</b> Nothing fetches and nothing publishes, so every library here had to be written here — which is also why there are 651 of them.</td></tr>
+<tr><td><b>Everything else</b></td><td>653 libraries, the six that were listed as missing among them. See <a href="packages.html">Packages</a>.</td></tr>
+<tr><td><b>A registry</b></td><td><b>The one that matters, and it is not built.</b> Nothing fetches and nothing publishes, so every library here had to be written here — which is also why there are 653 of them.</td></tr>
 </table></div>
 <p>The comparison to hyper, axum, tokio, gin and fiber is a comparison against
 years of work by thousands of people, and a count does not close it: these are
-651 libraries with one set of eyes on them and no production use
+653 libraries with one set of eyes on them and no production use
 behind any of them. The honest target for a first release is the packaging to
 publish them — so that the next one can be written by somebody else.</p>
 

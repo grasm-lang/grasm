@@ -1,0 +1,188 @@
+// A window on the screen, in Grasm, with no new builtin.
+//
+// SDL2 is the right first binding and raylib and GLFW are not, for one
+// reason: every SDL2 call this package needs takes and returns handles and
+// integers. [T-EXTERN-POINTER] allows an `extern fn` parameter to be `i64`,
+// `f64`, `str` or `bytes` and nothing else, and an `extern fn` returns `i64`,
+// `f64` or nothing. A library that passes a structure by value -- raylib's
+// `Color`, `Rectangle` -- cannot cross that boundary at all, and one that
+// wants a function pointer cannot either, because C cannot call back into
+// Grasm. SDL2 asks for neither.
+//
+// Two things the boundary gives for free here:
+//
+//   * a `SDL_Window *` comes back as an `i64` and goes back in as one, so a
+//     handle needs no representation in the language;
+//   * a `bytes` crosses as a raw pointer and C writes through it, which is
+//     what `SDL_PollEvent` and `SDL_GetErrorMsg` need -- the same mechanism
+//     `packages/termios` uses for `struct termios`.
+//
+// What it does not give: `SDL_GetError` returns `const char *`, and an
+// `extern fn` cannot return one. `SDL_GetErrorMsg` takes a buffer instead,
+// which is why `last_error` exists and reads a `bytes`.
+//
+// Every number below was printed by a C program compiled against
+// SDL2 2.32.10's own headers rather than copied from documentation, because a
+// constant that is a computed macro -- `SDL_PIXELFORMAT_ABGR8888` is four
+// bytes packed into a word -- is exactly the kind a person guesses wrong.
+
+extern fn SDL_Init(flags: i64) -> i64
+extern fn SDL_Quit()
+extern fn SDL_GetErrorMsg(buf: bytes, maxlen: i64) -> i64
+extern fn SDL_CreateWindow(title: str, x: i64, y: i64, w: i64, h: i64, flags: i64) -> i64
+extern fn SDL_DestroyWindow(win: i64)
+extern fn SDL_CreateRenderer(win: i64, index: i64, flags: i64) -> i64
+extern fn SDL_DestroyRenderer(ren: i64)
+extern fn SDL_CreateTexture(ren: i64, format: i64, access: i64, w: i64, h: i64) -> i64
+extern fn SDL_DestroyTexture(tex: i64)
+extern fn SDL_UpdateTexture(tex: i64, rect: i64, pixels: bytes, pitch: i64) -> i64
+extern fn SDL_RenderClear(ren: i64) -> i64
+extern fn SDL_RenderCopy(ren: i64, tex: i64, src: i64, dst: i64) -> i64
+extern fn SDL_RenderPresent(ren: i64)
+extern fn SDL_PollEvent(ev: bytes) -> i64
+extern fn SDL_Delay(ms: i64)
+
+/// `SDL_INIT_VIDEO`, which implies `SDL_INIT_EVENTS`.
+pub let INIT_VIDEO = 32
+/// `SDL_WINDOWPOS_CENTERED`. Not a small number: it is a sentinel.
+pub let WINDOWPOS_CENTERED = 805240832
+pub let WINDOW_SHOWN = 4
+pub let WINDOW_ALLOW_HIGHDPI = 8192
+/// `SDL_PIXELFORMAT_ABGR8888` — four bytes per pixel in memory order R, G, B,
+/// A on a little-endian machine, which is what a Grasm `bytes` of RGBA holds.
+pub let PIXELFORMAT_ABGR8888 = 376840196
+/// `SDL_TEXTUREACCESS_STREAMING` — uploaded again every frame, which is what
+/// a `bytes` buffer re-passed each frame is.
+pub let TEXTUREACCESS_STREAMING = 1
+/// `sizeof(SDL_Event)` on a 64-bit target. The union is padded to this, and
+/// the header asserts it, so a buffer of this size is the whole event.
+pub let EVENT_SIZE = 56
+
+type SdlError =
+    | InitFailed(detail: str)
+    | WindowFailed(detail: str)
+    | RendererFailed(detail: str)
+    | TextureFailed(detail: str)
+    | CallFailed(call: str, code: i64, detail: str)
+
+/// What SDL says went wrong.
+///
+/// `SDL_GetError` returns `const char *` and an `extern fn` cannot return
+/// one, so this calls `SDL_GetErrorMsg`, which fills a caller's buffer. The
+/// text is NUL-terminated, and the buffer is read rather than written
+/// afterwards -- a `bytes` handed to C must not be written from Grasm while
+/// anything else holds a window on it ([L-LIB-BYTES-WRITE]).
+pub fn last_error() -> str / {io, unsafe} {
+    var buf = bytes_filled(256, 0)
+    let _ = unsafe { SDL_GetErrorMsg(buf, 256) }
+    let end = buf.index_of(0, 0) ?? buf.len()
+    buf.slice(0, end).to_str()
+}
+
+/// Start the video subsystem. `SDL_VIDEODRIVER=dummy` in the environment
+/// makes every call below work with no display, which is how this package is
+/// tested without one.
+pub fn init_video() -> () ! SdlError / {io, unsafe} {
+    let rc = unsafe { SDL_Init(INIT_VIDEO) }
+    if rc != 0 {
+        fail(InitFailed(last_error()))
+    }
+}
+
+pub fn quit() / {io, unsafe} {
+    unsafe { SDL_Quit() }
+}
+
+/// A centred, shown window. The handle is C's pointer as an integer; zero is
+/// failure, which is how every SDL constructor reports it.
+pub fn create_window(title: str, w: i64, h: i64) -> i64 ! SdlError / {io, unsafe} {
+    let win = unsafe {
+        SDL_CreateWindow(title, WINDOWPOS_CENTERED, WINDOWPOS_CENTERED, w, h, WINDOW_SHOWN)
+    }
+    if win == 0 {
+        fail(WindowFailed(last_error()))
+    }
+    return win
+}
+
+pub fn destroy_window(win: i64) / {io, unsafe} {
+    unsafe { SDL_DestroyWindow(win) }
+}
+
+/// The first renderer SDL will give for this window, with no flags: `-1` asks
+/// it to choose, which is what a program that does not care should pass.
+pub fn create_renderer(win: i64) -> i64 ! SdlError / {io, unsafe} {
+    let ren = unsafe { SDL_CreateRenderer(win, -1, 0) }
+    if ren == 0 {
+        fail(RendererFailed(last_error()))
+    }
+    return ren
+}
+
+pub fn destroy_renderer(ren: i64) / {io, unsafe} {
+    unsafe { SDL_DestroyRenderer(ren) }
+}
+
+/// A streaming RGBA texture to upload a `bytes` buffer into each frame.
+pub fn create_texture(ren: i64, w: i64, h: i64) -> i64 ! SdlError / {io, unsafe} {
+    let tex = unsafe {
+        SDL_CreateTexture(ren, PIXELFORMAT_ABGR8888, TEXTUREACCESS_STREAMING, w, h)
+    }
+    if tex == 0 {
+        fail(TextureFailed(last_error()))
+    }
+    return tex
+}
+
+pub fn destroy_texture(tex: i64) / {io, unsafe} {
+    unsafe { SDL_DestroyTexture(tex) }
+}
+
+/// Upload a whole RGBA buffer. `pitch` is the bytes in one row, `width * 4`
+/// here, and the buffer must hold `pitch * height` of them.
+///
+/// The pointer SDL receives is valid for this call only, which is why the
+/// buffer is passed again every frame rather than handed over once.
+pub fn update_texture(tex: i64, pixels: bytes, pitch: i64) -> () ! SdlError / {io, unsafe} {
+    let rc = unsafe { SDL_UpdateTexture(tex, 0, pixels, pitch) }
+    if rc != 0 {
+        fail(CallFailed("SDL_UpdateTexture", rc, last_error()))
+    }
+}
+
+pub fn render_clear(ren: i64) -> () ! SdlError / {io, unsafe} {
+    let rc = unsafe { SDL_RenderClear(ren) }
+    if rc != 0 {
+        fail(CallFailed("SDL_RenderClear", rc, last_error()))
+    }
+}
+
+/// Draw the whole texture over the whole window: both rectangles are `NULL`.
+pub fn render_copy(ren: i64, tex: i64) -> () ! SdlError / {io, unsafe} {
+    let rc = unsafe { SDL_RenderCopy(ren, tex, 0, 0) }
+    if rc != 0 {
+        fail(CallFailed("SDL_RenderCopy", rc, last_error()))
+    }
+}
+
+pub fn render_present(ren: i64) / {io, unsafe} {
+    unsafe { SDL_RenderPresent(ren) }
+}
+
+pub fn delay(ms: i64) / {io, unsafe} {
+    unsafe { SDL_Delay(ms) }
+}
+
+/// A buffer the size of one `SDL_Event`, for `poll_event` to fill.
+pub fn event_buffer() -> bytes {
+    bytes_filled(EVENT_SIZE, 0)
+}
+
+/// Take one event, if there is one, into `buf`.
+///
+/// There is no callback here and there cannot be: C cannot call into Grasm.
+/// That is not a limitation for SDL, because SDL already polls -- the loop
+/// belongs to the program either way.
+pub fn poll_event(buf: bytes) -> bool / {io, unsafe} {
+    unsafe { SDL_PollEvent(buf) == 1 }
+}
