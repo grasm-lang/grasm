@@ -12,9 +12,22 @@ set -eu
 cd "$(dirname "$0")/.."
 
 GRASM=${GRASM:-./target/release/grasm}
-GFMT=${GFMT:-/tmp/gfmt}
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
+
+# Built here rather than taken from a path, so the gate cannot pass or fail
+# because of a stale binary somebody left lying around -- and cannot fail on a
+# fresh machine for the unrelated reason that nobody had built it yet. The
+# formatter is 209 KB and compiles in under a second; there is no reason to
+# cache it.
+GFMT=${GFMT:-$work/gfmt}
+if [ ! -x "$GFMT" ]; then
+    "$GRASM" build tools/gfmt/src/main.gr --native -o "$GFMT" >"$work/buildlog" 2>&1 || {
+        echo "    gfmt did not build:"
+        sed 's/^/      /' "$work/buildlog"
+        exit 1
+    }
+fi
 
 checked=0
 differ=0

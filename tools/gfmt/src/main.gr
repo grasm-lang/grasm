@@ -51,6 +51,177 @@ fn peek2(cs: [str], i: i64) -> str {
     out
 }
 
+/// A block comment and a raw string hold their own indentation: the lines
+/// inside them are content, not code, and reindenting them would change what
+/// the program says.
+fn holds_own_indent(m: Mode) -> bool {
+    match m {
+        BlockComment(_) -> true
+        RawStr -> true
+        _ -> false
+    }
+}
+
+/// A blank line inside a raw string is part of the string.
+fn is_raw(m: Mode) -> bool {
+    match m {
+        RawStr -> true
+        _ -> false
+    }
+}
+
+/// Closing brackets at the head of a line close levels the line above opened,
+/// so they are paid for before the line is indented rather than after.
+fn lead_closers(cs: [str]) -> i64 {
+    var n = 0
+    var k = 0
+    var stop = false
+    while k < cs.len() and not stop {
+        let c = cs.get(k).unwrap_or("")
+        if c == "}" or c == ")" or c == "]" {
+            n = n + 1
+            k = k + 1
+        } else {
+            stop = true
+        }
+    }
+    n
+}
+
+/// A comment takes the level of the next line that is neither blank nor a
+/// comment, so a doc comment above a declaration does not inherit the
+/// indentation of a sum type above it.
+fn comment_target_extra(parts: [str], from: i64, last: i64) -> i64 {
+    var j = from
+    var found = false
+    var extra = 0
+    while j <= last and not found {
+        let nxt = parts.get(j).unwrap_or("").trim()
+        if nxt != "" and not nxt.starts_with("//") {
+            found = true
+            if continues(nxt) { extra = 1 }
+        }
+        j = j + 1
+    }
+    extra
+}
+
+/// How many recorded levels are still open once this line's leading closers
+/// have been paid for.
+fn open_levels(levels: [i64], after_closers: i64) -> i64 {
+    var n = 0
+    for d in levels {
+        if d <= after_closers { n = n + 1 }
+    }
+    n
+}
+
+/// Walk the line a character at a time, tracking bracket depth and the mode
+/// stack. This is the state machine: everything else decides indentation from
+/// what this leaves behind.
+fn scan_line(cs: [str], inout stack: [Mode], inout depth: i64) {
+    var i = 0
+    while i < cs.len() {
+        let ch = cs.get(i).unwrap_or("")
+        let m = stack.last().unwrap_or(Code)
+        match m {
+            Code -> {
+                if ch == "\"" and peek2(cs, i + 1) == "\"\"" {
+                    i = i + 2
+                    stack.push(RawStr)
+                } else if ch == "\"" {
+                    stack.push(Str)
+                } else if ch == "/" and peek2(cs, i + 1).starts_with("/") {
+                    stack.push(LineComment)
+                    i = i + 1
+                } else if ch == "/" and peek2(cs, i + 1).starts_with("*") {
+                    stack.push(BlockComment(1))
+                    i = i + 1
+                } else if ch == "\{" or ch == "(" or ch == "[" {
+                    depth = depth + 1
+                } else if ch == "}" or ch == ")" or ch == "]" {
+                    depth = depth - 1
+                }
+            }
+            Interp(n) -> {
+                if ch == "\"" and peek2(cs, i + 1) == "\"\"" {
+                    i = i + 2
+                    stack.push(RawStr)
+                } else if ch == "\"" {
+                    stack.push(Str)
+                } else if ch == "\{" {
+                    stack.pop()
+                    stack.push(Interp(n + 1))
+                } else if ch == "}" {
+                    stack.pop()
+                    if n != 0 { stack.push(Interp(n - 1)) }
+                }
+            }
+            Str -> {
+                if ch == "\\" {
+                    i = i + 1
+                } else if ch == "\"" {
+                    let _ = stack.pop()
+                } else if ch == "\{" {
+                    stack.push(Interp(0))
+                }
+            }
+            RawStr -> {
+                if ch == "\"" and peek2(cs, i + 1) == "\"\"" {
+                    i = i + 2
+                    stack.pop()
+                }
+            }
+            LineComment -> {}
+            BlockComment(n) -> {
+                if ch == "*" and peek2(cs, i + 1).starts_with("/") {
+                    i = i + 1
+                    stack.pop()
+                    if n != 1 { stack.push(BlockComment(n - 1)) }
+                } else if ch == "/" and peek2(cs, i + 1).starts_with("*") {
+                    i = i + 1
+                    stack.pop()
+                    stack.push(BlockComment(n + 1))
+                }
+            }
+        }
+        i = i + 1
+    }
+}
+
+/// A line comment, a string and an interpolation all end with the line.
+fn pop_transient(inout stack: [Mode]) {
+    var popping = true
+    while popping {
+        let t = stack.last().unwrap_or(Code)
+        let transient = match t {
+            LineComment -> true
+            Str -> true
+            Interp(_) -> true
+            _ -> false
+        }
+        if transient and stack.len() > 1 { stack.pop() } else { popping = false }
+    }
+}
+
+/// Record the depth this line reached, and forget the levels it closed.
+fn trim_levels(inout levels: [i64], depth: i64) {
+    var trimming = true
+    while trimming {
+        match levels.last() {
+            Some(d) -> {
+                if d > depth {
+                    let _ = levels.pop()
+                } else {
+                    trimming = false
+                }
+            }
+            None -> trimming = false
+        }
+    }
+    if levels.last().unwrap_or(0) < depth { levels.push(depth) }
+}
+
 fn format_src(src: str) -> str {
     // Collected and joined at the end: `str` is immutable, so appending in a
     // loop is quadratic. The Rust side reserves a String and pushes into it.
@@ -67,166 +238,32 @@ fn format_src(src: str) -> str {
         let content = parts.get(index).unwrap_or("")
         let newline = if index == last { "" } else { "\n" }
         let trimmed = content.trim_start()
+        let cs = trimmed.chars()
 
         let top = stack.last().unwrap_or(Code)
-        let in_block = match top {
-            BlockComment(_) -> true
-            RawStr -> true
-            _ -> false
-        }
+        let in_block = holds_own_indent(top)
+        let closers = if in_block { 0 } else { lead_closers(cs) }
 
-        let cs = trimmed.chars()
-        var lead_closers = 0
-        if not in_block {
-            var k = 0
-            var stop = false
-            while k < cs.len() and not stop {
-                let c = cs.get(k).unwrap_or("")
-                if c == "}" or c == ")" or c == "]" {
-                    lead_closers = lead_closers + 1
-                    k = k + 1
-                } else {
-                    stop = true
-                }
-            }
-        }
-
-        let raw_now = match top {
-            RawStr -> true
-            _ -> false
-        }
-        if trimmed == "" and not raw_now {
+        if trimmed == "" and not is_raw(top) {
             out.push(newline)
         } else if in_block {
             out.push(content + newline)
         } else {
-            // A comment takes the level of the next line that is neither
-            // blank nor a comment, so a doc comment above a declaration does
-            // not inherit the indentation of a sum type above it.
-            var pipe_extra = 0
-            if trimmed.starts_with("//") {
-                var j = index + 1
-                var found = false
-                while j <= last and not found {
-                    let nxt = parts.get(j).unwrap_or("").trim()
-                    if nxt != "" and not nxt.starts_with("//") {
-                        found = true
-                        if continues(nxt) { pipe_extra = 1 }
-                    }
-                    j = j + 1
-                }
+            let extra = if trimmed.starts_with("//") {
+                comment_target_extra(parts, index + 1, last)
             } else if continues(trimmed) {
-                pipe_extra = 1
+                1
+            } else {
+                0
             }
-
-            let after_closers = depth - lead_closers
-            var open_levels = 0
-            for d in levels {
-                if d <= after_closers { open_levels = open_levels + 1 }
-            }
-            var this_indent = open_levels + pipe_extra
+            var this_indent = open_levels(levels, depth - closers) + extra
             if this_indent < 0 { this_indent = 0 }
             out.push("    ".repeat(this_indent) + trimmed + newline)
         }
 
-        // Scan the line for brackets and mode changes.
-        var i = 0
-        while i < cs.len() {
-            let ch = cs.get(i).unwrap_or("")
-            let m = stack.last().unwrap_or(Code)
-            match m {
-                Code -> {
-                    if ch == "\"" and peek2(cs, i + 1) == "\"\"" {
-                        i = i + 2
-                        stack.push(RawStr)
-                    } else if ch == "\"" {
-                        stack.push(Str)
-                    } else if ch == "/" and peek2(cs, i + 1).starts_with("/") {
-                        stack.push(LineComment)
-                        i = i + 1
-                    } else if ch == "/" and peek2(cs, i + 1).starts_with("*") {
-                        stack.push(BlockComment(1))
-                        i = i + 1
-                    } else if ch == "\{" or ch == "(" or ch == "[" {
-                        depth = depth + 1
-                    } else if ch == "}" or ch == ")" or ch == "]" {
-                        depth = depth - 1
-                    }
-                }
-                Interp(n) -> {
-                    if ch == "\"" and peek2(cs, i + 1) == "\"\"" {
-                        i = i + 2
-                        stack.push(RawStr)
-                    } else if ch == "\"" {
-                        stack.push(Str)
-                    } else if ch == "\{" {
-                        stack.pop()
-                        stack.push(Interp(n + 1))
-                    } else if ch == "}" {
-                        stack.pop()
-                        if n != 0 { stack.push(Interp(n - 1)) }
-                    }
-                }
-                Str -> {
-                    if ch == "\\" {
-                        i = i + 1
-                    } else if ch == "\"" {
-                        let _ = stack.pop()
-                    } else if ch == "\{" {
-                        stack.push(Interp(0))
-                    }
-                }
-                RawStr -> {
-                    if ch == "\"" and peek2(cs, i + 1) == "\"\"" {
-                        i = i + 2
-                        stack.pop()
-                    }
-                }
-                LineComment -> {}
-                BlockComment(n) -> {
-                    if ch == "*" and peek2(cs, i + 1).starts_with("/") {
-                        i = i + 1
-                        stack.pop()
-                        if n != 1 { stack.push(BlockComment(n - 1)) }
-                    } else if ch == "/" and peek2(cs, i + 1).starts_with("*") {
-                        i = i + 1
-                        stack.pop()
-                        stack.push(BlockComment(n + 1))
-                    }
-                }
-            }
-            i = i + 1
-        }
-
-        // A line comment, a string and an interpolation all end with the line.
-        var popping = true
-        while popping {
-            let t = stack.last().unwrap_or(Code)
-            let transient = match t {
-                LineComment -> true
-                Str -> true
-                Interp(_) -> true
-                _ -> false
-            }
-            if transient and stack.len() > 1 { stack.pop() } else { popping = false }
-        }
-
-        if not in_block {
-            var trimming = true
-            while trimming {
-                match levels.last() {
-                    Some(d) -> {
-                        if d > depth {
-                            let _ = levels.pop()
-                        } else {
-                            trimming = false
-                        }
-                    }
-                    None -> trimming = false
-                }
-            }
-            if levels.last().unwrap_or(0) < depth { levels.push(depth) }
-        }
+        scan_line(cs, stack, depth)
+        pop_transient(stack)
+        if not in_block { trim_levels(levels, depth) }
         if depth < 0 { depth = 0 }
         index = index + 1
     }
