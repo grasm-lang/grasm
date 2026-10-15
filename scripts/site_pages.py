@@ -1280,15 +1280,15 @@ where each one stands.</p>
 <div class="figures">
   <div class="fig"><b>«difftest»</b><span>programs, engines identical</span></div>
   <div class="fig"><b>«wasm_ok»</b><span>identical in wasm</span></div>
-  <div class="fig"><b>«cross_pass»</b><span>cross-compiled, agreeing</span></div>
+  <div class="fig"><b>«cross»</b><span>cross-compiled, agreeing</span></div>
   <div class="fig"><b>«conformance»</b><span>conformance programs</span></div>
   <div class="fig"><b>«findings»</b><span>findings recorded</span></div>
   <div class="fig"><b>«generators»</b><span>fuzz generators</span></div>
 </div>
 <p>Interpreter, bundle and native builds agree byte for byte on stdout, exit
-code and diagnostics. «cross_total» are also compiled for x86_64 and run under
-Rosetta, «cross_pass» of them agreeing and the rest declined. Every generated
-program is checked for what it keeps as well as for what it prints.</p>
+code and diagnostics. All «cross» are also compiled for x86_64 and run under
+Rosetta, every one of them agreeing, on «when_cross». Every generated program
+is checked for what it keeps as well as for what it prints.</p>
 <h2>Which run wrote which figure</h2>
 <p>The corpus is <b>«programs»</b> standalone programs, counted as this page is
 written and by difftest's own filter — so a program added today is in that
@@ -1301,16 +1301,16 @@ whole record:</p>
 <tr><th>Gate</th><th>What it compared</th><th>Figure</th><th>Taken</th></tr>
 «facts_rows»
 </table></div>
-<p class="note"><b>One of these wants reading carefully.</b> The
-<code>crosstest</code> figure above is a clean run over the corpus as it stood
-in September: every program cross-compiled and every one agreed, which is what
-that gate demands — it fails on a program it could not build. The figure the
-<a href="achieved.html">scorecard</a> cites instead is from October, attempted
-<b>«cross_total»</b> programs, and was taken on a machine at load 38 rising to
-134; <code>docs/binary-size.md</code> says in as many words that it should be
-taken again on a quiet machine before anybody calls it green. So the current
-figure is the worse one and the clean figure is the older one, and neither is
-the sentence anybody wants.</p>
+<p class="note"><b>Every figure in this table was taken today</b>, which has
+not been true before and is the only reason the paragraphs that used to sit
+here are gone. <code>crosstest</code> had two records and neither was the
+sentence anybody wants: a clean run over the corpus as it stood in September,
+against an October one that attempted <b>«cross_total»</b> of the corpus on a
+machine at load 38 rising to 134, which <code>docs/binary-size.md</code> asked
+to have retaken on a quiet machine. It has been — at load 12.4, the whole
+corpus, nothing declined, in twenty-four minutes. The October row stays in that
+document as the record of what a machine under that load could measure at all,
+which was always its point.</p>
 
 <p class="note"><code>difftest</code> used to be the other one, and is not any
 more: its row is a run of today over all <b>«difftest»</b> programs, which is
@@ -2075,7 +2075,7 @@ build and are compared on every build; the last recorded run of that gate
 covered «difftest» of them. «wasm_ok» also run in the browser engine
 — «wasm_skip» are skipped, because they want a filesystem, a socket, a
 process or threads, and both figures are from a run on «when_wasm_ok» — and
-«cross_total» are compiled for x86_64, linked
+all «cross» are compiled for x86_64, linked
 with <code>cc -arch x86_64</code> and <strong>run under Rosetta</strong>, which
 reaches code the arm64 build never does: <code>readdir$INODE64</code> exists
 only there, and x86_64 passes variadic arguments in registers where arm64 puts
@@ -2227,7 +2227,7 @@ last recorded run on this machine:</p>
 <tr><td>difftest / corpus</td><td>«difftest» programs</td><td><b>0 differences</b> across the engines</td></tr>
 <tr><td><code>leakcheck</code></td><td>«leak_programs» programs</td><td><b>0 leaks</b></td></tr>
 <tr><td><code>usecheck</code>, the <code>poison</code> build</td><td>«use_programs» programs</td><td><b>0 differences</b></td></tr>
-<tr><td><code>crosstest</code> x86_64 under Rosetta</td><td>«cross_total» programs</td><td><b>«cross_pass» pass</b>, 0 real failures, 60 declined</td></tr>
+<tr><td><code>crosstest</code> x86_64 under Rosetta</td><td>«cross_total» programs</td><td><b>«cross_pass» pass</b>, 0 real failures, 60 declined — <em>retaken on a quiet machine on «when_cross»: all «cross», nothing declined</em></td></tr>
 <tr><td><code>clippy --all-targets</code></td><td>native and wasm32</td><td>0</td></tr>
 <tr><td>unit tests</td><td>every crate</td><td><b>«unittests» pass</b></td></tr>
 <tr><td><code>replaytest</code></td><td>every journalled builtin</td><td>each one refuses under an empty journal</td></tr>

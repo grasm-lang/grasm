@@ -418,6 +418,22 @@ still answer correctly.
 | `wasmtest` | — | pass |
 | difftest / corpus comparison | 511 programs | 0 differences |
 
+### The crosstest row was retaken on a quiet machine (2026-10-15)
+
+That row is what this file asked to have redone: 224 programs attempted of the
+511 the corpus holds, 60 declined, taken while the machine went to load 38 and
+on to 134. Redone at load 12.4, it is **511 identical, 0 mismatched, 0
+unsupported** in twenty-four minutes — the whole corpus, nothing declined. The
+figure in `site/facts.json` is that run, dated.
+
+The row above stays as the record of what 2026-10-12 could measure, because
+the point of it was never the number: it was which gates a machine under that
+load could run at all. Three earlier attempts at this gate were stopped at a
+two-hour limit, which looked like the gate being too large for the window and
+was not — `difftest` ran the same 511 programs in nineteen minutes at load 13
+after failing to finish in two hours at load 100. Those attempts measured the
+machine.
+
 `leakcheck` and `usecheck` are the two that matter most for a rewritten
 allocator, and no other check can replace either: a leaking program produces
 exactly the right output, and a premature free makes a value *less* live, not
