@@ -486,21 +486,35 @@ PAGES["install.html"] = (
     """
 <p class="eyebrow">Start</p>
 <h1>Install</h1>
-<p class="lede">One command, and you have the entire toolchain: a single
-binary, every subcommand inside it, and no runtime to install beside it.</p>
+<p class="lede">Download one binary. Every subcommand is inside it, and there
+is no runtime to install beside it.</p>
 
-<p>A Rust toolchain bootstraps the compiler the first time, the way every
-language starts — and <strong>none of it survives into what you ship</strong>.
+<h2>Download</h2>"""
+    + code(
+        """curl -fLO https://github.com/grasm-lang/grasm/releases/latest/download/grasm-aarch64-apple-darwin
+chmod +x grasm-aarch64-apple-darwin && mv grasm-aarch64-apple-darwin grasm
+
+./grasm run hello.gr""",
+        "One binary, eighteen subcommands, nothing beside it.",
+    )
+    + """
+<p>Apple silicon. On an Intel Mac take <code>grasm-x86_64-apple-darwin</code>
+instead. <a href="https://github.com/grasm-lang/grasm/releases/latest">Every
+download and its checksum →</a></p>
+
+<h2>Or build it</h2>
+<p>A Rust toolchain bootstraps the compiler, the way every language starts —
+and <strong>none of it survives into what you ship</strong>.
 All four crates a compiled Grasm program links are <code>no_std</code>: the
 runtime reaches the operating system through <code>grasm_sys</code>, over raw
 syscalls and libc, never over Rust's standard library. A hello-world is
 «hello_kb» KB and <code>nm</code> finds nothing of Rust's in it.
 <a href="architecture.html">How that was done →</a></p>
 
-<h2>Build it</h2>"""
+<h3>From source</h3>"""
     + code(
         """
-git clone <repository>
+git clone https://github.com/grasm-lang/grasm.git
 cd grasm
 cargo build --release --workspace
 
@@ -1453,7 +1467,7 @@ table because the margin moved once already with nothing noticing: see
 <tr><th>Limit</th><th>Detail</th></tr>
 <tr><td>«packages» libraries, all first-party</td><td>See <a href="packages.html">Packages</a>; the plan for the rest is in <code>docs/packages-plan.md</code>. Anything else you need, you write, or bind to C with <code>extern fn</code>.</td></tr>
 <tr><td>No remote registry</td><td>Path and local-registry dependencies work. Nothing fetches or publishes.</td></tr>
-<tr><td>No signed downloads yet</td><td>One <code>cargo build</code> bootstraps the compiler, and after that the binary it produced is the whole toolchain. Packaging and signing are release work, not language work.</td></tr>
+<tr><td>Downloads are not code-signed</td><td>macOS binaries for both architectures are published on the <a href="https://github.com/grasm-lang/grasm/releases/latest">releases page</a> with SHA-256 sums, but they carry no Apple Developer signature, so Gatekeeper will ask before the first run. Notarisation is release work, not language work.</td></tr>
 <tr><td>Not faster than Rust</td><td>The geomean is «geomean»× of it, «geomean_floor»× with the harness floor taken out of both sides, against a 0.95× target — so the goal is met and the claim is not available. <code>tree</code> at «tree_ratio»× is the worst row. On the systems suite Grasm loses <code>etl</code> by «etl_ratio»×, and wins memory everywhere — «chat_mem_ratio»× on <code>chat</code>. <a href="performance.html">Every row →</a></td></tr>
 <tr><td>One integer width, one float width</td><td><code>i8</code>…<code>u64</code>, <code>usize</code> and <code>int</code> are aliases for <code>i64</code>; <code>f32</code> is an alias for <code>f64</code> (<code>spec/types.md</code> [T-INT-ALIAS]). No unsigned and no wrapping arithmetic.</td></tr>
 <tr><td>No mutable byte buffer</td><td><code>bytes</code> is immutable, so a sample buffer is <code>[i64]</code> at eight bytes a sample. An 8-bit RGBA tile costs <strong>2 MiB</strong> against 256 KiB packed. An image editor built on copy-on-write byte tiles cannot be written against this today.</td></tr>

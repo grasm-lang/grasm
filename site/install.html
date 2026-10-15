@@ -59,18 +59,27 @@
 
 <p class="eyebrow">Start</p>
 <h1>Install</h1>
-<p class="lede">One command, and you have the entire toolchain: a single
-binary, every subcommand inside it, and no runtime to install beside it.</p>
+<p class="lede">Download one binary. Every subcommand is inside it, and there
+is no runtime to install beside it.</p>
 
-<p>A Rust toolchain bootstraps the compiler the first time, the way every
-language starts — and <strong>none of it survives into what you ship</strong>.
+<h2>Download</h2><figure class="code"><pre><code>curl <span class="op">-</span>fLO https<span class="op">:</span><span class="cm">//github.com/grasm-lang/grasm/releases/latest/download/grasm-aarch64-apple-darwin</span>
+chmod <span class="op">+</span>x grasm<span class="op">-</span>aarch64<span class="op">-</span>apple<span class="op">-</span>darwin <span class="op">&amp;</span><span class="op">&amp;</span> mv grasm<span class="op">-</span>aarch64<span class="op">-</span>apple<span class="op">-</span>darwin grasm
+
+<span class="op">.</span><span class="op">/</span>grasm run hello<span class="op">.</span>gr</code></pre><figcaption>One binary, eighteen subcommands, nothing beside it.</figcaption></figure>
+<p>Apple silicon. On an Intel Mac take <code>grasm-x86_64-apple-darwin</code>
+instead. <a href="https://github.com/grasm-lang/grasm/releases/latest">Every
+download and its checksum →</a></p>
+
+<h2>Or build it</h2>
+<p>A Rust toolchain bootstraps the compiler, the way every language starts —
+and <strong>none of it survives into what you ship</strong>.
 All four crates a compiled Grasm program links are <code>no_std</code>: the
 runtime reaches the operating system through <code>grasm_sys</code>, over raw
 syscalls and libc, never over Rust's standard library. A hello-world is
 85.7 KB and <code>nm</code> finds nothing of Rust's in it.
 <a href="architecture.html">How that was done →</a></p>
 
-<h2>Build it</h2><pre><code>git clone <span class="op">&lt;</span>repository<span class="op">&gt;</span>
+<h3>From source</h3><pre><code>git clone https<span class="op">:</span><span class="cm">//github.com/grasm-lang/grasm.git</span>
 cd grasm
 cargo build <span class="op">-</span><span class="op">-</span>release <span class="op">-</span><span class="op">-</span>workspace
 

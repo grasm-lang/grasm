@@ -196,10 +196,19 @@ Randomness and time arrive as arguments. → [`docs/grasmwire.md`](docs/grasmwir
 ## Start
 
 ```sh
-cargo build --release --workspace          # the runtime needs --workspace
-./target/release/grasm run examples/hello.gr
-./scripts/allgates.sh                      # 104 gates, ~2 h
+curl -fLO https://github.com/grasm-lang/grasm/releases/latest/download/grasm-aarch64-apple-darwin
+chmod +x grasm-aarch64-apple-darwin && mv grasm-aarch64-apple-darwin grasm
+./grasm run hello.gr
 ```
+
+**One binary, eighteen subcommands, nothing to install beside it** — no runtime,
+no package manager to bootstrap. Intel Macs take `grasm-x86_64-apple-darwin`;
+checksums are in `SHA256SUMS` beside them.
+[All downloads →](https://github.com/grasm-lang/grasm/releases/latest)
+
+Building from source needs a Rust toolchain to bootstrap the compiler, the way
+every language starts — [`docs/overview.md`](docs/overview.md) has it, and
+nothing of that toolchain reaches what you ship.
 
 | What | Where |
 |---|---|
