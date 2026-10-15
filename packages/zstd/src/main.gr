@@ -16,6 +16,46 @@
 // never do -- a wrong answer from a decompressor is indistinguishable from a
 // right one until something downstream fails.
 //
+// ## What an attempt at FSE learned, and where it stopped
+//
+// An FSE decoder was written and then removed, because it produced 15,985
+// bytes where the frame declares 4,000. Writing down where it broke is worth
+// more than that code was: the arithmetic is unambiguous, and the next
+// attempt should not have to redo it.
+//
+// `scripts/fixtures/zstd/zeros.zst` holds one block of nine bytes:
+//
+//     10 00 00 01 00 9b f7 01 16
+//     ~~ raw literals, size format 0, regenerated size 2
+//           ~~ ~~ the two literal bytes
+//                 ~~ nbSeq = 1
+//                    ~~ all three tables predefined
+//                       ~~~~~~~~~~~ the bitstream, four bytes
+//
+// The last byte is 0x16, whose highest set bit is bit 4, so three padding
+// bits and a marker leave **28 data bits**. One sequence over two literals
+// has to produce 4,000 bytes, so it is literals length 2 and match length
+// 3,998 at offset 1 -- and those decompose exactly:
+//
+//     6 + 5 + 6 = 17 bits of initial state (LL, OF, ML)
+//     match length 3,998 is code 47: base 2,051 and 11 extra bits
+//     literals length 2 is code 2 and offset 1 is code 0, neither with extra
+//     17 + 11 = 28
+//
+// So the stream is being read correctly. The three states come out 24, 0 and
+// 62; 24 and 0 give literals code 2 and offset code 0, which the budget
+// confirms. **The match-length state does not.** Slot 62 has to yield code
+// 47, and building the predefined distribution the way the reference
+// describes -- the five `-1` symbols laid at the top of the table, then the
+// rest spread by `(size >> 1) + (size >> 3) + 3` -- puts code **49** there,
+// whose base of 8,195 is already past the whole frame.
+//
+// Every bit-order model and every ordering of the state and extra-bit reads
+// was tried against those three constraints and none fits, so the error is in
+// a table rather than in the stream reading. Either the match-length
+// distribution written here is wrong, or the table is not indexed by the
+// state the way that attempt assumed.
+//
 // ## The checksum is parsed and not verified
 //
 // A frame may end with the low four bytes of the content's XXH64. There is no
