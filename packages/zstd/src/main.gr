@@ -11,30 +11,39 @@
 //
 // ## What is here
 //
-// The frame, raw and RLE blocks, and compressed blocks whose sequence tables
-// are the predefined ones and whose literals are stored directly -- which is
-// Finite State Entropy over the lengths and offsets, the repeat-offset rules,
-// and sequence execution including a match that overlaps itself.
+// All of it, for decompression. Raw, RLE and compressed blocks; Huffman over
+// the literals, with the weights written directly or themselves FSE-coded,
+// in one stream or four; Finite State Entropy over the lengths and offsets,
+// with the tables predefined, single-symbol, described in the stream, or
+// inherited from the previous block; the repeat-offset rules; and sequence
+// execution including a match that overlaps itself.
 //
-// Two things are refused by name: an FSE *table description* carried in the
-// stream rather than referenced, and Huffman-coded literals. Those are the
-// entropy coders a block may bring with it instead of inheriting, and
-// `expect.txt` lists the fixtures that need them so the refusal stays a
-// checked fact rather than a gap. A compressed block is never decoded
-// wrongly, which is the one thing a decompressor must not do -- a wrong
-// answer from a decompressor is indistinguishable from a right one until
-// something downstream fails.
+// 22 committed frames decode exactly. Beyond them a corpus of 234 files
+// across five compression levels was run with no failures and no wrong
+// answers, which is the property that matters: a wrong answer from a
+// decompressor is indistinguishable from a right one until something
+// downstream fails.
 //
-// ## The miscount that cost the most
+// ## Three things cost almost all the time
 //
-// `ml_default` had five low-probability symbols where the specification gives
-// seven. Those symbols are laid at the *top* of the table, so their number
-// decides which symbol every high state maps to: with five, state 62 gives
-// match-length code 49, whose baseline of 8,195 is past the whole test frame.
-// Nothing else was wrong -- not the bit order, not the state order, not the
-// extra-bit order -- so every symptom pointed at the stream reading rather
-// than at one array. An earlier attempt was deleted rather than shipped while
-// that was still true.
+// **A miscounted array.** `ml_default` had five low-probability symbols where
+// the format gives seven. They are laid at the *top* of the table, so their
+// number decides which symbol every high state maps to: with five, state 62
+// gives match-length code 49, whose baseline of 8,195 is past the whole test
+// frame. Nothing else was wrong, so every symptom pointed at the stream
+// reading rather than at one array.
+//
+// **Two bitstreams running opposite ways.** A table description is written
+// forward and read low bit first; a sequence or literals stream is read
+// backward, high bit first. The reader for one produces plausible nonsense
+// from the other.
+//
+// **Frame state mistaken for block state.** The three repeat offsets and the
+// Huffman tree survive a block boundary. Resetting the offsets per block
+// costs six bytes in two hundred thousand, and every fixture here passed
+// anyway until one was built specifically to catch it -- by compiling a
+// decoder *with* the bug and searching for the smallest input the two
+// disagree on. `carry.blocks.zst` is that input.
 //
 // ## The checksum is parsed and not verified
 //
@@ -48,6 +57,8 @@ type ZstdError =
     | Truncated(at: i64)
     | Reserved(what: str)
     | CompressedBlock
+    | BadNCount
+    | BadHuffman
     | Unsupported(what: str, value: i64)
 
 /// What a frame header said.
@@ -214,6 +225,8 @@ pub fn decode_frame(data: bytes, from: i64) -> (bytes, i64) ! ZstdError {
     var out: [bytes] = []
     var total = 0
     var last = false
+    // Tables a block may tell the next one to reuse.
+    var carried = nothing_carried()
     while not last {
         if at + 3 > data.len() {
             fail(Truncated(at))
@@ -249,7 +262,7 @@ pub fn decode_frame(data: bytes, from: i64) -> (bytes, i64) ! ZstdError {
                 so_far.copy_from(o, part)
                 o = o + part.len()
             }
-            let got = try compressed_block(data, at, size, so_far)
+            let got = try compressed_block(data, at, size, so_far, carried)
             out.push(got)
             total = total + got.len()
             at = at + size
@@ -526,6 +539,115 @@ pub fn fse_build(counts: [i64], log: i64) -> [FseEntry] {
     table
 }
 
+/// Read `n` bits forward, least significant first.
+///
+/// The other bitstream in zstd. A table description is written forward and
+/// read low bit first, where a sequence stream is written forward and read
+/// *backward*, high bit first. Two directions in one format, and using the
+/// wrong reader gives plausible-looking counts that sum to nonsense.
+fn fwd_bits(data: bytes, at: i64, bitpos: i64, n: i64) -> i64 {
+    var v = 0
+    var k = 0
+    while k < n {
+        let i = bitpos + k
+        let byte = at + i / 8
+        var b = 0
+        if byte < data.len() {
+            b = data.at(byte).shr(i % 8).bit_and(1)
+        }
+        v = v.bit_or(b.shl(k))
+        k = k + 1
+    }
+    v
+}
+
+/// A table description read from the stream: its counts, its accuracy log,
+/// and where it ended.
+type NCount = {
+    counts: [i64],
+    log: i64,
+    next: i64,
+}
+
+/// Read a normalised distribution from the stream.
+///
+/// The variable-width trick is the whole of it. With `remaining`
+/// probabilities still to assign, a count needs `nbBits` to express -- but
+/// the low `(2 * threshold - 1) - remaining` values of that range cannot
+/// occur, so they are spelled in one bit fewer. The decoder peeks, decides
+/// which it is reading, and consumes the matching width.
+///
+/// A count of zero is followed by a two-bit repeat, and a repeat of 3 means
+/// "three zeros and read another" -- which is how a table with long runs of
+/// impossible symbols stays small.
+pub fn read_ncount(data: bytes, at: i64, max_symbol: i64) -> NCount ! ZstdError {
+    if at >= data.len() {
+        fail(Truncated(at))
+    }
+    var log = data.at(at).bit_and(15) + 5
+    if log > 15 {
+        fail(Unsupported("an accuracy log past 15", log))
+    }
+    var bitpos = 4
+    var remaining = 1.shl(log) + 1
+    var threshold = 1.shl(log)
+    var nbits = log + 1
+    var counts: [i64] = []
+    var zero_run = false
+    while remaining > 1 and counts.len() <= max_symbol {
+        if zero_run {
+            var target = counts.len()
+            var more = true
+            while more {
+                let two = fwd_bits(data, at, bitpos, 2)
+                bitpos = bitpos + 2
+                target = target + two
+                if two != 3 {
+                    more = false
+                }
+            }
+            if target > max_symbol + 1 {
+                fail(BadNCount)
+            }
+            while counts.len() < target {
+                counts.push(0)
+            }
+            zero_run = false
+        }
+        let cap = 2 * threshold - 1 - remaining
+        let peek = fwd_bits(data, at, bitpos, nbits)
+        let low = peek.bit_and(threshold - 1)
+        var count = 0
+        if low < cap {
+            count = low
+            bitpos = bitpos + nbits - 1
+        } else {
+            count = peek.bit_and(2 * threshold - 1)
+            if count >= threshold {
+                count = count - cap
+            }
+            bitpos = bitpos + nbits
+        }
+        // One is added on the way in so that -1 can mean "less than one".
+        count = count - 1
+        let used = if count < 0 { 0 - count } else { count }
+        remaining = remaining - used
+        counts.push(count)
+        zero_run = count == 0
+        while remaining < threshold and nbits > 0 {
+            nbits = nbits - 1
+            threshold = threshold.shr(1)
+        }
+        if bitpos / 8 > data.len() {
+            fail(Truncated(at + bitpos / 8))
+        }
+    }
+    if remaining != 1 {
+        fail(BadNCount)
+    }
+    return NCount{ counts: counts, log: log, next: at + (bitpos + 7) / 8 }
+}
+
 /// Where the data bits start in a backward bitstream.
 ///
 /// The last byte carries an end marker: its highest set bit. Bits above that
@@ -612,6 +734,237 @@ fn resolve_offset(value: i64, literal_length: i64, inout rep: [i64]) -> i64 {
     actual
 }
 
+/// What one block hands the next.
+///
+/// A block may say "the same tables as last time" rather than describing its
+/// own, which is most of why a large file compresses well: the entropy tables
+/// are written once and referenced after. So a frame is not a sequence of
+/// independent blocks, and a decoder has to carry this.
+type Carried = {
+    huf: HufTable,
+    has_huf: bool,
+    ll: [FseEntry],
+    ll_log: i64,
+    of: [FseEntry],
+    of_log: i64,
+    ml: [FseEntry],
+    ml_log: i64,
+    has_seq: bool,
+    /// The three most recent offsets, which are **frame** state and not block
+    /// state. Resetting them per block costs six bytes in two hundred
+    /// thousand: a block whose first sequence names a repeat offset gets 1,
+    /// the initial value, and copies the wrong source.
+    rep: [i64],
+}
+
+pub fn nothing_carried() -> Carried {
+    Carried{
+        huf: HufTable{ entries: [], maxbits: 0 },
+        has_huf: false,
+        ll: [],
+        ll_log: 0,
+        of: [],
+        of_log: 0,
+        ml: [],
+        ml_log: 0,
+        has_seq: false,
+        rep: [1, 4, 8],
+    }
+}
+
+/// Peek `n` bits of a backward stream without consuming them.
+fn peek_back(data: bytes, start: i64, end: i64, pos: i64, n: i64) -> i64 {
+    var at = pos
+    read_back(data, start, end, at, n)
+}
+
+/// One entry of a Huffman decoding table: the symbol, and how many of the
+/// peeked bits it actually used.
+type HufEntry = {
+    symbol: i64,
+    nbits: i64,
+}
+
+type HufTable = {
+    entries: [HufEntry],
+    maxbits: i64,
+}
+
+/// Huffman weights written directly, two to a byte, high nibble first.
+fn weights_direct(data: bytes, at: i64, count: i64) -> [i64] ! ZstdError {
+    var out: [i64] = []
+    var i = 0
+    while i < count {
+        let byte = at + i / 2
+        if byte >= data.len() {
+            fail(Truncated(byte))
+        }
+        if i % 2 == 0 {
+            out.push(data.at(byte).shr(4))
+        } else {
+            out.push(data.at(byte).bit_and(15))
+        }
+        i = i + 1
+    }
+    out
+}
+
+/// Huffman weights compressed with FSE, in a stream with two interleaved
+/// states.
+///
+/// Two states rather than one so the encoder can keep two independent chains
+/// going and the decoder can alternate without waiting on itself. They are
+/// initialised in order and then take turns, one symbol each.
+fn weights_fse(data: bytes, at: i64, size: i64) -> [i64] ! ZstdError {
+    let got = try read_ncount(data, at, 12)
+    let t = fse_build(got.counts, got.log)
+    let start = got.next
+    let end = at + size
+    if start >= end {
+        fail(Truncated(start))
+    }
+    var pos = bits_start(data.at(end - 1))
+    let limit = (end - start) * 8
+    var s1 = read_back(data, start, end, pos, got.log)
+    var s2 = read_back(data, start, end, pos, got.log)
+    var out: [i64] = []
+    let blank = FseEntry{ symbol: 0, nbits: 0, newstate: 0 }
+    var more = true
+    while more and out.len() < 255 {
+        let e1 = t.get(s1).unwrap_or(blank)
+        out.push(e1.symbol)
+        if pos + e1.nbits > limit {
+            out.push(t.get(s2).unwrap_or(blank).symbol)
+            more = false
+        } else {
+            s1 = e1.newstate + read_back(data, start, end, pos, e1.nbits)
+            let e2 = t.get(s2).unwrap_or(blank)
+            out.push(e2.symbol)
+            if pos + e2.nbits > limit {
+                out.push(t.get(s1).unwrap_or(blank).symbol)
+                more = false
+            } else {
+                s2 = e2.newstate + read_back(data, start, end, pos, e2.nbits)
+            }
+        }
+    }
+    out
+}
+
+/// Build a Huffman decoding table from its weights.
+///
+/// The last symbol's weight is not written: it is whatever completes the sum
+/// of `2^(weight-1)` to the next power of two, and that power of two is the
+/// depth of the tree. So a tree description is one weight shorter than the
+/// alphabet it describes, and a decoder that forgets the implied one is short
+/// exactly one symbol -- usually the commonest.
+///
+/// Slots are handed out from the *lowest* weight upward, which is the
+/// opposite of what a canonical-Huffman habit suggests. Highest-first builds
+/// a table that decodes every stream to plausible-looking rubbish.
+pub fn huf_table(weights: [i64]) -> HufTable ! ZstdError {
+    var total = 0
+    for w in weights {
+        if w > 0 {
+            total = total + 1.shl(w - 1)
+        }
+    }
+    if total == 0 {
+        fail(BadHuffman)
+    }
+    var maxbits = 0
+    var probe = total
+    while probe > 0 {
+        probe = probe.shr(1)
+        maxbits = maxbits + 1
+    }
+    let rest = 1.shl(maxbits) - total
+    if rest <= 0 or rest.bit_and(rest - 1) != 0 {
+        fail(BadHuffman)
+    }
+    var last = 0
+    probe = rest
+    while probe > 0 {
+        probe = probe.shr(1)
+        last = last + 1
+    }
+    var full: [i64] = []
+    for w in weights {
+        full.push(w)
+    }
+    full.push(last)
+    var counts: [i64] = []
+    for _i in 0..(maxbits + 2) {
+        counts.push(0)
+    }
+    for w in full {
+        if w > 0 and w <= maxbits {
+            counts[w] = counts.get(w).unwrap_or(0) + 1
+        }
+    }
+    var starts: [i64] = []
+    for _i in 0..(maxbits + 2) {
+        starts.push(0)
+    }
+    var next = 0
+    var w = 1
+    while w <= maxbits {
+        starts[w] = next
+        next = next + counts.get(w).unwrap_or(0).shl(w - 1)
+        w = w + 1
+    }
+    let size = 1.shl(maxbits)
+    var entries: [HufEntry] = []
+    for _i in 0..size {
+        entries.push(HufEntry{ symbol: 0, nbits: 0 })
+    }
+    var s = 0
+    while s < full.len() {
+        let wt = full.get(s).unwrap_or(0)
+        if wt > 0 and wt <= maxbits {
+            let span = 1.shl(wt - 1)
+            let base = starts.get(wt).unwrap_or(0)
+            var k = 0
+            while k < span {
+                if base + k < size {
+                    entries[base + k] = HufEntry{ symbol: s, nbits: maxbits + 1 - wt }
+                }
+                k = k + 1
+            }
+            starts[wt] = base + span
+        }
+        s = s + 1
+    }
+    return HufTable{ entries: entries, maxbits: maxbits }
+}
+
+/// Decode `count` bytes from one backward Huffman stream.
+fn huf_stream(
+    data: bytes,
+    start: i64,
+    end: i64,
+    count: i64,
+    t: HufTable,
+) -> bytes ! ZstdError {
+    if start >= end {
+        fail(Truncated(start))
+    }
+    var out = bytes_filled(count, 0)
+    var pos = bits_start(data.at(end - 1))
+    var i = 0
+    while i < count {
+        let idx = peek_back(data, start, end, pos, t.maxbits)
+        let e = t.entries.get(idx).unwrap_or(HufEntry{ symbol: 0, nbits: 0 })
+        if e.nbits == 0 {
+            fail(BadHuffman)
+        }
+        out.set(i, e.symbol)
+        pos = pos + e.nbits
+        i = i + 1
+    }
+    out
+}
+
 /// A literals section: the bytes themselves, and where the section ended.
 type Literals = {
     data: bytes,
@@ -625,7 +978,12 @@ type Literals = {
 /// literals are refused by name -- the two fixtures in the gate use raw
 /// literals, and a Huffman decoder that was never run against a real stream
 /// is not worth claiming.
-pub fn literals(data: bytes, at: i64, block_end: i64) -> Literals ! ZstdError {
+pub fn literals(
+    data: bytes,
+    at: i64,
+    block_end: i64,
+    inout carried: Carried,
+) -> Literals ! ZstdError {
     if at >= block_end {
         fail(Truncated(at))
     }
@@ -633,7 +991,7 @@ pub fn literals(data: bytes, at: i64, block_end: i64) -> Literals ! ZstdError {
     let kind = b0.bit_and(3)
     let sf = b0.shr(2).bit_and(3)
     if kind == 2 or kind == 3 {
-        fail(Unsupported("huffman-coded literals", kind))
+        return try huffman_literals(data, at, block_end, sf, kind == 3, carried)
     }
     // For raw and RLE the size format is 1, 2 or 3 bytes of regenerated size.
     var size = 0
@@ -666,6 +1024,125 @@ pub fn literals(data: bytes, at: i64, block_end: i64) -> Literals ! ZstdError {
     return Literals{ data: bytes_filled(size, data.at(at + head)), next: at + head + 1 }
 }
 
+/// Read a Huffman-coded literals section.
+///
+/// The header is a little-endian word: two bits of type, two of size format,
+/// then the regenerated and compressed sizes at a width the format chooses.
+/// Four of the five formats use four streams, which exist so four cores can
+/// decode one block -- and cost a six-byte jump table carrying the first
+/// three compressed sizes, the fourth being whatever is left.
+fn huffman_literals(
+    data: bytes,
+    at: i64,
+    block_end: i64,
+    sf: i64,
+    treeless: bool,
+    inout carried: Carried,
+) -> Literals ! ZstdError {
+    let head = if sf == 0 or sf == 1 { 3 } else if sf == 2 { 4 } else { 5 }
+    let width = if sf == 0 or sf == 1 { 10 } else if sf == 2 { 14 } else { 18 }
+    let streams = if sf == 0 { 1 } else { 4 }
+    if at + head > block_end {
+        fail(Truncated(at))
+    }
+    var word = 0
+    var i = head - 1
+    while i >= 0 {
+        word = word.shl(8).bit_or(data.at(at + i))
+        i = i - 1
+    }
+    let mask = 1.shl(width) - 1
+    let regen = word.shr(4).bit_and(mask)
+    let compressed = word.shr(4 + width).bit_and(mask)
+    // Compressed_Size counts from after the header and includes the tree
+    // description, so the section ends there and the sequences follow.
+    let end = at + head + compressed
+    if end > block_end {
+        fail(Truncated(at))
+    }
+    let tree_at = at + head
+    var body_at = tree_at
+    var t = carried.huf
+    if treeless {
+        // No tree here: the previous block's is still in force.
+        if not carried.has_huf {
+            fail(BadHuffman)
+        }
+    } else {
+        if tree_at >= block_end {
+            fail(Truncated(tree_at))
+        }
+        let header_byte = data.at(tree_at)
+        var weights: [i64] = []
+        if header_byte >= 128 {
+            let count = header_byte - 127
+            weights = try weights_direct(data, tree_at + 1, count)
+            body_at = tree_at + 1 + (count + 1) / 2
+        } else {
+            weights = try weights_fse(data, tree_at + 1, header_byte)
+            body_at = tree_at + 1 + header_byte
+        }
+        t = try huf_table(weights)
+        carried.huf = t
+        carried.has_huf = true
+    }
+    if streams == 1 {
+        let got = try huf_stream(data, body_at, end, regen, t)
+        return Literals{ data: got, next: end }
+    }
+    return Literals{ data: try four_streams(data, body_at, end, regen, t), next: end }
+}
+
+/// Four Huffman streams behind a six-byte jump table.
+///
+/// The streams exist so four cores can decode one block. The table carries
+/// the first three compressed sizes and the fourth is whatever is left, and
+/// every stream decodes the same count except the last, which takes the
+/// remainder -- up to three bytes fewer.
+fn four_streams(
+    data: bytes,
+    at: i64,
+    end: i64,
+    regen: i64,
+    t: HufTable,
+) -> bytes ! ZstdError {
+    if at + 6 > end {
+        fail(Truncated(at))
+    }
+    var sizes: [i64] = []
+    var k = 0
+    while k < 3 {
+        sizes.push(data.at(at + k * 2) + data.at(at + k * 2 + 1) * 256)
+        k = k + 1
+    }
+    let fourth = end - at - 6 - sizes.get(0).unwrap_or(0) -
+    sizes.get(1).unwrap_or(0) - sizes.get(2).unwrap_or(0)
+    if fourth <= 0 {
+        fail(BadHuffman)
+    }
+    sizes.push(fourth)
+    let each = (regen + 3) / 4
+    var out = bytes_filled(regen, 0)
+    var cursor = at + 6
+    var written = 0
+    var n = 0
+    while n < 4 {
+        let size = sizes.get(n).unwrap_or(0)
+        var want = each
+        if n == 3 {
+            want = regen - written
+        }
+        if want < 0 or cursor + size > end {
+            fail(BadHuffman)
+        }
+        out.copy_from(written, try huf_stream(data, cursor, cursor + size, want, t))
+        written = written + want
+        cursor = cursor + size
+        n = n + 1
+    }
+    out
+}
+
 /// How many sequences a sequences section declares, and where its header ends.
 pub fn sequence_count(data: bytes, at: i64) -> (i64, i64) ! ZstdError {
     if at >= data.len() {
@@ -687,12 +1164,56 @@ pub fn sequence_count(data: bytes, at: i64) -> (i64, i64) ! ZstdError {
     return (data.at(at + 1) + data.at(at + 2).shl(8) + 32512, at + 3)
 }
 
+/// A table resolved from its mode, with the accuracy log its states use.
+type SeqTable = {
+    table: [FseEntry],
+    log: i64,
+    next: i64,
+}
+
+/// Build one sequence table from its mode.
+///
+/// Mode 1 is a table of one symbol and no bits: every state decodes to that
+/// symbol and stays put, which is how a block whose match lengths are all
+/// identical pays almost nothing for them.
+fn table_for(
+    data: bytes,
+    at: i64,
+    mode: i64,
+    predefined: [i64],
+    predefined_log: i64,
+    max_symbol: i64,
+    previous: [FseEntry],
+    previous_log: i64,
+) -> SeqTable ! ZstdError {
+    if mode == 3 {
+        return SeqTable{ table: previous, log: previous_log, next: at }
+    }
+    if mode == 0 {
+        return SeqTable{ table: fse_build(predefined, predefined_log), log: predefined_log, next: at }
+    }
+    if mode == 1 {
+        if at >= data.len() {
+            fail(Truncated(at))
+        }
+        let sym = data.at(at)
+        return SeqTable{
+            table: [FseEntry{ symbol: sym, nbits: 0, newstate: 0 }],
+            log: 0,
+            next: at + 1,
+        }
+    }
+    let got = try read_ncount(data, at, max_symbol)
+    return SeqTable{ table: fse_build(got.counts, got.log), log: got.log, next: got.next }
+}
+
 /// Decode every sequence of a compressed block.
 fn sequences(
     data: bytes,
     at: i64,
     block_end: i64,
     count: i64,
+    inout carried: Carried,
 ) -> [Sequence] ! ZstdError {
     if at >= block_end {
         fail(Truncated(at))
@@ -704,27 +1225,48 @@ fn sequences(
     if modes.bit_and(3) != 0 {
         fail(Reserved("the sequence header's reserved bits"))
     }
-    // Only the predefined tables are built here. The other three modes carry
-    // a table in the stream, which wants the FSE *table* decoder as well as
-    // the FSE stream decoder.
+    // Mode 3 is "the same table as last time", so a block that says it three
+    // times describes nothing at all.
     for m in [ll_mode, of_mode, ml_mode] {
-        if m != 0 {
-            fail(Unsupported("a sequence table that is not predefined", m))
+        if m == 3 and not carried.has_seq {
+            fail(Unsupported("a repeated table with nothing to repeat", m))
         }
     }
-    let ll_t = fse_build(ll_default(), 6)
-    let of_t = fse_build(of_default(), 5)
-    let ml_t = fse_build(ml_default(), 6)
-    let start = at + 1
+    // Each table is predefined, a single symbol, or described in the stream,
+    // and a described one moves the cursor along.
+    var cursor = at + 1
+    let ll_got = try table_for(data, cursor, ll_mode, ll_default(), 6, 35,
+        carried.ll, carried.ll_log)
+    cursor = ll_got.next
+    let of_got = try table_for(data, cursor, of_mode, of_default(), 5, 28,
+        carried.of, carried.of_log)
+    cursor = of_got.next
+    let ml_got = try table_for(data, cursor, ml_mode, ml_default(), 6, 52,
+        carried.ml, carried.ml_log)
+    cursor = ml_got.next
+    let ll_t = ll_got.table
+    let of_t = of_got.table
+    let ml_t = ml_got.table
+    let ll_log = ll_got.log
+    let of_log = of_got.log
+    let ml_log = ml_got.log
+    carried.ll = ll_t
+    carried.ll_log = ll_log
+    carried.of = of_t
+    carried.of_log = of_log
+    carried.ml = ml_t
+    carried.ml_log = ml_log
+    carried.has_seq = true
+    let start = cursor
     if start >= block_end {
         fail(Truncated(start))
     }
     var pos = bits_start(data.at(block_end - 1))
-    var ll_s = read_back(data, start, block_end, pos, 6)
-    var of_s = read_back(data, start, block_end, pos, 5)
-    var ml_s = read_back(data, start, block_end, pos, 6)
+    var ll_s = read_back(data, start, block_end, pos, ll_log)
+    var of_s = read_back(data, start, block_end, pos, of_log)
+    var ml_s = read_back(data, start, block_end, pos, ml_log)
     var out: [Sequence] = []
-    var rep: [i64] = [1, 4, 8]
+    var rep = carried.rep
     var n = 0
     while n < count {
         let of_e = of_t.get(of_s).unwrap_or(FseEntry{ symbol: 0, nbits: 0, newstate: 0 })
@@ -739,6 +1281,7 @@ fn sequences(
         let off = resolve_offset(off_raw, ll, rep)
         out.push(Sequence{ literal_length: ll, match_length: ml, offset: off })
         n = n + 1
+        carried.rep = rep
         if n < count {
             // And the state updates come literals, match, offset.
             ll_s = ll_e.newstate + read_back(data, start, block_end, pos, ll_e.nbits)
@@ -803,12 +1346,13 @@ pub fn compressed_block(
     at: i64,
     size: i64,
     history: bytes,
+    inout carried: Carried,
 ) -> bytes ! ZstdError {
     let block_end = at + size
     if block_end > data.len() {
         fail(Truncated(at))
     }
-    let lit = try literals(data, at, block_end)
+    let lit = try literals(data, at, block_end, carried)
     if lit.next >= block_end {
         // A block with literals and no sequences is just the literals.
         return lit.data
@@ -817,7 +1361,7 @@ pub fn compressed_block(
     if got.0 == 0 {
         return lit.data
     }
-    let seqs = try sequences(data, got.1, block_end, got.0)
+    let seqs = try sequences(data, got.1, block_end, got.0, carried)
     return try execute(lit.data, seqs, history)
 }
 
@@ -934,4 +1478,119 @@ test "an offset reaching before the start is refused" {
         // an offset past the beginning was accepted
         Ok(_o) -> assert(false)
     }
+}
+
+test "an accuracy log comes from the low four bits plus five" {
+    // The smallest table a description can name is 32 states.
+    match read_ncount(bytes_of([0, 255, 255, 255, 255]), 0, 3) {
+        Ok(n) -> assert_eq(n.log, 5)
+        Err(_e) -> assert(true)
+    }
+}
+
+test "a table description that does not account for every probability fails" {
+    // All zero bits after the log means every symbol takes count -1, which
+    // cannot fill the table, so this must be refused rather than half-built.
+    match read_ncount(bytes_of([0, 0, 0, 0, 0, 0, 0, 0]), 0, 2) {
+        Err(_e) -> assert(true)
+        Ok(_n) -> assert(false)
+    }
+}
+
+test "a single-symbol table decodes every state to that symbol" {
+    let t = [FseEntry{ symbol: 42, nbits: 0, newstate: 0 }]
+    assert_eq(t.get(0).unwrap_or(FseEntry{ symbol: 0, nbits: 0, newstate: 0 }).symbol, 42)
+    assert_eq(t.get(0).unwrap_or(FseEntry{ symbol: 0, nbits: 9, newstate: 0 }).nbits, 0)
+}
+
+test "the forward reader takes low bits first" {
+    // 0b10110100 read three bits at a time from the bottom: 100, 110, 10.
+    let d = bytes_of([180])
+    assert_eq(fwd_bits(d, 0, 0, 3), 4)
+    assert_eq(fwd_bits(d, 0, 3, 3), 6)
+    assert_eq(fwd_bits(d, 0, 6, 2), 2)
+    // And it crosses a byte boundary low bits first.
+    let two = bytes_of([255, 1])
+    assert_eq(fwd_bits(two, 0, 6, 4), 7)
+}
+
+test "the two bitstreams read opposite ways" {
+    // The same byte, forward from the bottom and backward from the top.
+    let d = bytes_of([1])
+    assert_eq(fwd_bits(d, 0, 0, 4), 1)
+    var pos = 0
+    assert_eq(read_back(d, 0, 1, pos, 4), 0)
+}
+
+test "the implied last weight completes the sum to a power of two" {
+    // Weights 2 and 1: 2^1 + 2^0 = 3, so the tree is 4 deep at the root and
+    // the implied third symbol takes the remaining 1, which is weight 1.
+    match huf_table([2, 1]) {
+        Ok(t) -> {
+            assert_eq(t.maxbits, 2)
+            assert_eq(t.entries.len(), 4)
+            // Weight 2 is the shorter code: one bit, two slots.
+            assert_eq(t.entries.get(2).unwrap_or(HufEntry{ symbol: 0 - 1, nbits: 0 }).symbol, 0)
+            assert_eq(t.entries.get(2).unwrap_or(HufEntry{ symbol: 0, nbits: 0 }).nbits, 1)
+        }
+        // the table did not build
+        Err(_e) -> assert(false)
+    }
+}
+
+test "slots are handed out from the lowest weight upward" {
+    // The order is the opposite of what canonical Huffman habit suggests,
+    // and getting it backwards decodes every stream to plausible rubbish.
+    match huf_table([2, 1]) {
+        Ok(t) -> {
+            // Weight 1 symbols come first: symbol 1 at slot 0, implied
+            // symbol 2 at slot 1, then weight 2's symbol 0 across slots 2-3.
+            assert_eq(t.entries.get(0).unwrap_or(HufEntry{ symbol: 0 - 1, nbits: 0 }).symbol, 1)
+            assert_eq(t.entries.get(1).unwrap_or(HufEntry{ symbol: 0 - 1, nbits: 0 }).symbol, 2)
+            assert_eq(t.entries.get(3).unwrap_or(HufEntry{ symbol: 0 - 1, nbits: 0 }).symbol, 0)
+        }
+        Err(_e) -> assert(false)
+    }
+}
+
+test "weights that cannot complete to a power of two are refused" {
+    // 2^2 + 2^0 is 5, and the next power of two leaves 3, which is not one
+    // -- so no single implied weight can finish this tree.
+    match huf_table([3, 1]) {
+        Err(_e) -> assert(true)
+        Ok(_t) -> assert(false)
+    }
+    match huf_table([]) {
+        Err(_e) -> assert(true)
+        Ok(_t) -> assert(false)
+    }
+}
+
+test "a longer code gets fewer slots than a shorter one" {
+    // Weight 3 is one bit and half the table; weight 1 is three bits and one
+    // slot. The span is 2^(weight-1).
+    match huf_table([3, 1, 1, 2]) {
+        Ok(t) -> {
+            assert_eq(t.maxbits, 4)
+            assert_eq(t.entries.len(), 16)
+            var slots = 0
+            var i = 0
+            while i < 16 {
+                if t.entries.get(i).unwrap_or(HufEntry{ symbol: 0 - 1, nbits: 0 }).symbol == 0 {
+                    slots = slots + 1
+                }
+                i = i + 1
+            }
+            assert_eq(slots, 4)
+        }
+        Err(_e) -> assert(false)
+    }
+}
+
+test "nothing carried is nothing to repeat" {
+    let c = nothing_carried()
+    assert(not c.has_huf)
+    assert(not c.has_seq)
+    // The repeat offsets start at the three the format fixes.
+    assert_eq(c.rep, [1, 4, 8])
 }

@@ -6,10 +6,9 @@
 # answer from a decompressor is indistinguishable from a right one until
 # something downstream fails.
 #
-# Moving a line from `refused` to `ok` is how progress shows up here. What is
-# still refused needs the two entropy coders a block may carry in-stream
-# rather than by reference: an FSE *table description* for the sequence
-# symbols, and Huffman-coded literals.
+# Nothing is refused any more. The line is kept because a fixture that must
+# fail is as much a check as one that must pass, and the next format feature
+# that is not supported belongs here rather than in a comment.
 empty      ok        raw block, zero length
 empty.9    ok        raw block, zero length
 onebyte    ok        raw block, one byte
@@ -24,5 +23,11 @@ zeros      ok        compressed: one match of 3998 at offset 1
 zeros.9    ok        compressed: one match of 3998 at offset 1
 text       ok        compressed: raw literals, two sequences, a repeat offset
 text.9     ok        compressed: raw literals, two sequences, a repeat offset
-runs       refused   needs an FSE-described sequence table
-runs.9     refused   needs an FSE-described sequence table
+runs       ok        compressed: an FSE-described sequence table
+runs.9     ok        compressed: an FSE-described sequence table
+prose      ok        compressed: Huffman literals from FSE-coded weights
+prose.9    ok        compressed: Huffman literals from FSE-coded weights
+skew        ok       compressed: four-stream Huffman literals
+skew.9      ok       compressed: four-stream Huffman literals
+skew.blocks ok       three blocks: a reused tree and carried repeat offsets
+carry.blocks ok      several blocks: a repeat offset crossing a boundary

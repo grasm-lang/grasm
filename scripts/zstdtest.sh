@@ -60,4 +60,4 @@ done < "$FIX/expect.txt"
 
 echo "    frames: $ok exact   $refused refused as declared"
 # A manifest that shrank is a gate that stopped checking (F76).
-[ "$ok" -ge 14 ] && [ "$refused" -ge 2 ]
+[ "$ok" -ge 22 ]
