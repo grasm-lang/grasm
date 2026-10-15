@@ -1,0 +1,28 @@
+[package]
+name = "pcedit_demo"
+version = "1.0.0"
+capabilities = ["io", "unsafe"]
+
+[dependencies.jpeg]
+path = "../jpeg"
+version = "^1.0.0"
+
+[dependencies.pcframe]
+path = "../pcframe"
+version = "^1.0.0"
+
+[dependencies.pcfont]
+path = "../pcfont"
+version = "^1.0.0"
+
+[dependencies.pcui]
+path = "../pcui"
+version = "^1.0.0"
+
+[dependencies.sdl]
+path = "../sdl"
+version = "^1.0.0"
+
+[dependencies.sdlevent]
+path = "../sdlevent"
+version = "^1.0.0"

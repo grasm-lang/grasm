@@ -7,6 +7,10 @@ capabilities = ["io"]
 path = "../pcfont"
 version = "^1.0.0"
 
+[dependencies.pcframe]
+path = "../pcframe"
+version = "^1.0.0"
+
 [dependencies.sfnt]
 path = "../sfnt"
 version = "^1.0.0"
@@ -17,4 +21,8 @@ version = "^1.0.0"
 
 [dependencies.glyf]
 path = "../glyf"
+version = "^1.0.0"
+
+[dependencies.fontmetrics]
+path = "../fontmetrics"
 version = "^1.0.0"

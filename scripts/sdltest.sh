@@ -93,14 +93,34 @@ if [ "$view" != "32x24 3ch, 30 frames" ]; then
 fi
 echo "    jpeg -> pcframe -> texture: $view"
 
+# The editor shell: seven packages, and a check that the palette *drew*
+# rather than only that the loop ran. See scripts/lib/checkframe.py.
+if ! "$GRASM" build packages/pcedit-demo/src/main.gr --native --link SDL2 \
+    -o "$work/pcedit" >"$work/pcedit.log" 2>&1; then
+    echo "    the editor did not build:"
+    sed 's/^/      /' "$work/pcedit.log"
+    exit 1
+fi
+edit=$(SDL_VIDEODRIVER=dummy "$work/pcedit" scripts/fixtures/jpeg/g80_ui.jpg \
+    scripts/fixtures/font/shapes.ttf 5 "$work/frame.raw" 2>&1) || {
+    echo "    the editor did not run:"
+    echo "$edit" | sed 's/^/      /'
+    exit 1
+}
+python3 scripts/lib/checkframe.py "$work/frame.raw" 80 240 150 || exit 1
+echo "    editor shell: $edit"
+
 # A frame budget rather than a bare timing, so this fails if the path becomes
-# too slow to drive a window rather than merely getting slower. Generous
-# against the ~0.4 ms measured, because this shares a machine with the other
-# gates.
+# too slow to drive a window rather than merely getting slower.
+#
+# 10 ms against the ~0.4 ms measured idle. The margin is not politeness: this
+# shares a machine with the other gates and read 4.55 ms under load, so a 5 ms
+# budget would have failed for the load rather than for the code. A gate that
+# flakes is a gate people learn to rerun.
 python3 -c "
 import sys
 per = $per
-if per > 5.0:
-    print(f'    {per:.2f} ms a frame is past the 5 ms this gate allows')
+if per > 10.0:
+    print(f'    {per:.2f} ms a frame is past the 10 ms this gate allows')
     sys.exit(1)
 "

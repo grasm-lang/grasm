@@ -377,3 +377,92 @@ test "a damage list collapses to one rectangle" {
     assert_eq(r.h, 12)
     assert(is_empty(cover([])))
 }
+
+/// Paint one colour through an alpha mask.
+///
+/// The primitive text needs: a rasterised glyph is coverage, not pixels, and
+/// what goes on the surface is the ink colour weighted by it. Also what a
+/// soft brush and a selection feather are, which is why it lives here rather
+/// than in the font package.
+pub fn draw_mask(
+    inout s: Surface,
+    mask: bytes,
+    mw: i64,
+    mh: i64,
+    dx: i64,
+    dy: i64,
+    red: i64,
+    green: i64,
+    blue: i64,
+) {
+    var y = 0
+    while y < mh {
+        let ty = dy + y
+        if ty >= 0 and ty < s.height {
+            var x = 0
+            while x < mw {
+                let tx = dx + x
+                if tx >= 0 and tx < s.width {
+                    let a = mask.at(y * mw + x)
+                    if a > 0 {
+                        let i = (ty * s.width + tx) * 4
+                        if a == 255 {
+                            s.px.set(i, red)
+                            s.px.set(i + 1, green)
+                            s.px.set(i + 2, blue)
+                        } else {
+                            let inv = 255 - a
+                            s.px.set(i, (red * a + s.px.at(i) * inv + 127) / 255)
+                            s.px.set(i + 1, (green * a + s.px.at(i + 1) * inv + 127) / 255)
+                            s.px.set(i + 2, (blue * a + s.px.at(i + 2) * inv + 127) / 255)
+                        }
+                    }
+                }
+                x = x + 1
+            }
+        }
+        y = y + 1
+    }
+}
+
+test "a mask paints its colour where it is opaque and blends where it is not" {
+    var s = filled(3, 1, 0, 0, 0)
+    draw_mask(s, bytes_of([255, 128, 0]), 3, 1, 0, 0, 200, 100, 50)
+    assert_eq(pixel(s, 0, 0), [200, 100, 50, 255])
+    // 200*128 rounded over black is 100.
+    assert_eq(pixel(s, 1, 0).get(0).unwrap_or(0), 100)
+    assert_eq(pixel(s, 2, 0), [0, 0, 0, 255])
+}
+
+test "a mask landing off the edge paints only what lands" {
+    var s = filled(2, 1, 0, 0, 0)
+    draw_mask(s, bytes_of([255, 255, 255]), 3, 1, 1, 0, 9, 9, 9)
+    assert_eq(pixel(s, 0, 0).get(0).unwrap_or(9), 0)
+    assert_eq(pixel(s, 1, 0).get(0).unwrap_or(0), 9)
+}
+
+/// Replace a surface's pixels with a buffer the caller computed.
+///
+/// `pixels` hands back a value, so writing through it changes nothing -- the
+/// compiler refuses it, which is how this function came to exist. A filter
+/// that computes a whole frame wants to hand the frame over, not set a pixel
+/// at a time through a function call.
+///
+/// A buffer of the wrong size is ignored rather than accepted: a surface
+/// whose pixel count stops matching its dimensions reads every later row at
+/// the wrong offset.
+pub fn set_pixels(inout s: Surface, px: bytes) -> bool {
+    if px.len() != s.width * s.height * 4 {
+        return false
+    }
+    s.px = px
+    true
+}
+
+test "pixels of the wrong size are refused rather than accepted" {
+    var s = filled(2, 2, 1, 1, 1)
+    assert(not set_pixels(s, bytes_filled(4, 9)))
+    assert_eq(pixel(s, 0, 0).get(0).unwrap_or(0), 1)
+    assert(set_pixels(s, bytes_filled(16, 7)))
+    assert_eq(pixel(s, 1, 1).get(0).unwrap_or(0), 7)
+}

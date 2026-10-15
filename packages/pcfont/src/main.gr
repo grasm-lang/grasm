@@ -16,6 +16,10 @@
 // ([L-LIB-BYTES-WRITE]). A 64-pixel glyph is 4 KB; as `[i64]` it would be
 // 32 KB, and a page of text holds hundreds of them.
 import glyf
+import sfnt
+import cmap
+import fontmetrics
+import pcframe
 
 /// An alpha bitmap: `cov` is one byte a pixel, row by row.
 type Raster = {
@@ -354,4 +358,118 @@ test "a degenerate size or em is refused rather than guessed" {
     for r in [raster_glyph(g, 0, 16), raster_glyph(g, 1000, 0), raster_glyph(g, 1000, 0 - 5)] {
         assert_eq(width_of(r), 0)
     }
+}
+
+/// A font with its tables found once.
+///
+/// Held as slices of the file rather than re-parsed per glyph: a label draws
+/// a dozen glyphs and a list draws hundreds, and `sfnt.table_named` walks the
+/// table directory every time it is asked.
+type Font = {
+    glyf: bytes,
+    loca: bytes,
+    cmap: bytes,
+    hmtx: bytes,
+    hmetrics: i64,
+    upm: i64,
+    long_loca: bool,
+    ascent: i64,
+    line_h: i64,
+}
+
+fn slice_table(data: bytes, font: SfntFont, tag: str) -> bytes ! SfntError {
+    let t = try sfnt.table_named(font, tag)
+    return data.slice(t.offset, t.offset + t.length)
+}
+
+/// Find a font's tables. Everything after this is arithmetic.
+pub fn load(data: bytes) -> Font ! (SfntError | MetricsError) {
+    let f = try sfnt.parse(data)
+    let head = try slice_table(data, f, "head")
+    let hhea = try slice_table(data, f, "hhea")
+    let line = try fontmetrics.parse_hhea(hhea)
+    return Font{
+        glyf: try slice_table(data, f, "glyf"),
+        loca: try slice_table(data, f, "loca"),
+        cmap: try slice_table(data, f, "cmap"),
+        hmtx: try slice_table(data, f, "hmtx"),
+        hmetrics: fontmetrics.number_of_h_metrics(hhea),
+        upm: head.at(18) * 256 + head.at(19),
+        long_loca: head.at(51) == 1,
+        ascent: line.ascender,
+        line_h: fontmetrics.line_height(line),
+    }
+}
+
+pub fn units_per_em(f: Font) -> i64 {
+    f.upm
+}
+
+/// The baseline-to-baseline distance at a pixel size.
+pub fn line_height(f: Font, size: i64) -> i64 {
+    f.line_h * size / f.upm
+}
+
+/// Where the baseline sits below the top of a line.
+pub fn baseline(f: Font, size: i64) -> i64 {
+    f.ascent * size / f.upm
+}
+
+/// The glyph a character maps to, or 0 when the font has none.
+pub fn glyph_of(f: Font, code: i64) -> i64 {
+    match cmap.glyph_of(f.cmap, code) {
+        Ok(g) -> g
+        Err(_e) -> 0
+    }
+}
+
+/// Every glyph a string needs, in order.
+pub fn glyphs_for(f: Font, text: str) -> [i64] {
+    var out: [i64] = []
+    for c in text.codes() {
+        out.push(glyph_of(f, c))
+    }
+    out
+}
+
+/// How wide a string is at a pixel size, in pixels.
+pub fn text_width(f: Font, text: str, size: i64) -> i64 {
+    fontmetrics.run_width(f.hmtx, f.hmetrics, glyphs_for(f, text)) * size / f.upm
+}
+
+/// Draw a string with its baseline at `(x, y)`.
+///
+/// Returns the pen position after the last glyph, so a caller can keep
+/// writing -- a label followed by a value is two calls, not a concatenation.
+pub fn draw_text(
+    inout s: Surface,
+    f: Font,
+    text: str,
+    x: i64,
+    y: i64,
+    size: i64,
+    red: i64,
+    green: i64,
+    blue: i64,
+) -> i64 {
+    var pen = x
+    for code in text.codes() {
+        let gid = glyph_of(f, code)
+        let adv = (fontmetrics.advance_width(f.hmtx, f.hmetrics, gid) ?? 0) * size / f.upm
+        match glyf.parse_glyph(f.glyf, f.loca, f.long_loca, gid) {
+            Err(_e) -> pen = pen + adv
+            Ok(g) -> {
+                let r = raster_glyph(g, f.upm, size)
+                if width_of(r) > 0 {
+                    pcframe.draw_mask(
+                        s, coverage(r), width_of(r), height_of(r),
+                        pen + r.left, y - r.top,
+                        red, green, blue,
+                    )
+                }
+                pen = pen + adv
+            }
+        }
+    }
+    pen
 }

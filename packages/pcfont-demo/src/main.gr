@@ -4,14 +4,19 @@ import pcfont
 import sfnt
 import cmap
 import glyf
+import pcframe
 
 fn table(data: bytes, font: SfntFont, tag: str) -> bytes ! SfntError {
     let t = try sfnt.table_named(font, tag)
     return data.slice(t.offset, t.offset + t.length)
 }
 
-fn main() -> () ! (SfntError | CmapError | GlyfError) / {io} {
+fn main() -> () ! (SfntError | CmapError | GlyfError | MetricsError) / {io} {
     let a = args()
+    if (a.get(3) ?? "") == "text" {
+        try show_text(a.get(0) ?? "", a.get(1) ?? "A", (a.get(2) ?? "16").parse_int() ?? 16)
+        return
+    }
     let path = a.get(0) ?? ""
     let ch = (a.get(1) ?? "A").chars().get(0) ?? "A"
     let size = (a.get(2) ?? "16").parse_int() ?? 16
@@ -35,6 +40,30 @@ fn main() -> () ! (SfntError | CmapError | GlyfError) / {io} {
         var x = 0
         while x < pcfont.width_of(r) {
             let v = pcfont.at(r, x, y)
+            line = line + if v > 200 { "#" } else if v > 100 { "+" } else if v > 20 { "." } else { " " }
+            x = x + 1
+        }
+        print("|{line}|")
+        y = y + 1
+    }
+}
+
+/// Draw a string into a surface and print it, so text layout can be read.
+pub fn show_text(path: str, text: str, size: i64) -> () ! (SfntError | MetricsError) / {io} {
+    let data = read_bytes(path) ?? bytes_of([])
+    let f = try pcfont.load(data)
+    let w = pcfont.text_width(f, text, size) + 4
+    let h = pcfont.line_height(f, size) + 4
+    var s = pcframe.filled(w, h, 0, 0, 0)
+    let end = pcfont.draw_text(s, f, text, 2, 2 + pcfont.baseline(f, size), size, 255, 255, 255)
+    print("{w}x{h} advance {end - 2} line {pcfont.line_height(f, size)}")
+    var y = 0
+    while y < h {
+        var line = ""
+        var x = 0
+        while x < w {
+            let p = pcframe.pixel(s, x, y)
+            let v = p.get(0).unwrap_or(0)
             line = line + if v > 200 { "#" } else if v > 100 { "+" } else if v > 20 { "." } else { " " }
             x = x + 1
         }

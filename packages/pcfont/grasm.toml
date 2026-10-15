@@ -16,3 +16,11 @@ version = "^1.0.0"
 [dependencies.glyf]
 path = "../glyf"
 version = "^1.0.0"
+
+[dependencies.fontmetrics]
+path = "../fontmetrics"
+version = "^1.0.0"
+
+[dependencies.pcframe]
+path = "../pcframe"
+version = "^1.0.0"

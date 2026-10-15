@@ -23,6 +23,7 @@ type Event =
     | Quit
     | KeyDown(sym: i64)
     | MouseDown(button: i64, x: i64, y: i64)
+    | MouseUp(button: i64, x: i64, y: i64)
     | MouseMotion(x: i64, y: i64)
     | WindowChanged
     | Other(kind: i64)
@@ -32,6 +33,7 @@ pub let TYPE_WINDOWEVENT = 512
 pub let TYPE_KEYDOWN = 768
 pub let TYPE_MOUSEMOTION = 1024
 pub let TYPE_MOUSEBUTTONDOWN = 1025
+pub let TYPE_MOUSEBUTTONUP = 1026
 
 /// `SDLK_ESCAPE`, the one key a demo needs by name.
 pub let KEY_ESCAPE = 27
@@ -70,6 +72,9 @@ pub fn decode(buf: bytes) -> Event {
     }
     if kind == TYPE_MOUSEBUTTONDOWN {
         return MouseDown(buf.at(16), i32_at(buf, 20), i32_at(buf, 24))
+    }
+    if kind == TYPE_MOUSEBUTTONUP {
+        return MouseUp(buf.at(16), i32_at(buf, 20), i32_at(buf, 24))
     }
     if kind == TYPE_MOUSEMOTION {
         return MouseMotion(i32_at(buf, 20), i32_at(buf, 24))
@@ -164,13 +169,30 @@ test "a negative coordinate stays negative" {
     }
 }
 
-test "an event this package does not decode keeps its type" {
+test "a release carries its button and position" {
     var buf = bytes_filled(56, 0)
-    // 1026 is SDL_MOUSEBUTTONUP, which nothing above claims.
     buf.set(0, 2)
     buf.set(1, 4)
+    buf.set(16, 1)
+    buf.set(20, 44)
+    buf.set(21, 1)
     match decode(buf) {
-        Other(kind) -> assert_eq(kind, 1026)
+        MouseUp(button, x, _y) -> {
+            assert_eq(button, 1)
+            assert_eq(x, 300)
+        }
+        // a mouse release did not decode as MouseUp
+        _ -> assert(false)
+    }
+}
+
+test "an event this package does not decode keeps its type" {
+    var buf = bytes_filled(56, 0)
+    // 4096 is SDL_JOYAXISMOTION, which nothing above claims.
+    buf.set(0, 0)
+    buf.set(1, 16)
+    match decode(buf) {
+        Other(kind) -> assert_eq(kind, 4096)
         // an unknown event was swallowed
         _ -> assert(false)
     }

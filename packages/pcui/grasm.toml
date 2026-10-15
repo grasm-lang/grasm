@@ -1,0 +1,15 @@
+[package]
+name = "pcui"
+version = "1.0.0"
+
+# Draws widgets into a surface. No files, no C, no window: the caller owns
+# the window and hands the input in.
+capabilities = []
+
+[dependencies.pcframe]
+path = "../pcframe"
+version = "^1.0.0"
+
+[dependencies.pcfont]
+path = "../pcfont"
+version = "^1.0.0"
